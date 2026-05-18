@@ -130,6 +130,91 @@ impl TrackRegistry {
         self.map.get(&TrackKey::Hart(hart)).map(|e| e.uuid)
     }
 
+    /// Ensure a per-process track exists; returns UUID + optional descriptor.
+    ///
+    /// `pid` is the kernel PID (low 32 bits of `process.pid.0`). Process
+    /// tracks are top-level (no `parent_uuid`) so Perfetto can show
+    /// each process as its own swimlane with thread tracks nested
+    /// underneath. `pid = 0` is the reserved "kernel actor" sentinel
+    /// — callers may either skip the call or render those tracks
+    /// directly under the harts swimlane.
+    ///
+    /// Uses a namespaced `KernelTrackId` (`0xF000_0000_0000_0000 | pid`)
+    /// so process tracks never collide with the per-hart task tracks
+    /// (which embed the hart in their high half) or with the harts
+    /// process track at UUID 1.
+    pub fn ensure_process_track(&mut self, pid: u32) -> (u64, Option<TrackDescriptor>) {
+        let track_id = 0xF000_0000_0000_0000u64 | pid as u64;
+        let key = TrackKey::KernelTrackId(track_id);
+        if let Some(e) = self.map.get(&key) {
+            return (e.uuid, None);
+        }
+        let uuid = self.alloc_uuid();
+        let name = format!("pid-{pid}");
+        self.map.insert(
+            key,
+            TrackEntry { uuid, parent_uuid: 0, name: name.clone() },
+        );
+        let desc = TrackDescriptor {
+            uuid: Some(uuid),
+            parent_uuid: None,
+            name: Some(name.clone()),
+            process: Some(ProcessDescriptor {
+                pid: Some(pid as i32),
+                process_name: Some(name),
+            }),
+            thread: None,
+        };
+        (uuid, Some(desc))
+    }
+
+    /// Ensure a per-task (thread-shaped) track parented under a
+    /// process track. Returns UUID + optional descriptor.
+    ///
+    /// Combines [`Self::ensure_process_track`] and a thread-shaped
+    /// inner track keyed by `(pid, hart, tid)` so two harts running
+    /// the same TID still get distinct task tracks (rare but legal
+    /// during migrations). The thread descriptor carries `pid = pid`
+    /// and `tid = tid` so Perfetto's slice details show real
+    /// process/thread IDs instead of the synthetic `hart0[0]
+    /// txKernel[1]` placeholders.
+    pub fn ensure_thread_track_under_process(
+        &mut self,
+        pid: u32,
+        hart: u16,
+        tid: u32,
+    ) -> (u64, Option<TrackDescriptor>, Option<TrackDescriptor>) {
+        let (process_uuid, process_desc) = self.ensure_process_track(pid);
+        // Namespace thread tracks distinct from raw `ensure_kernel_track`
+        // task tracks (which use `(hart<<32) | tid` directly) by setting
+        // the top bit. Embedding `hart` keeps two harts' views of the
+        // same TID distinct.
+        let track_id =
+            0x8000_0000_0000_0000u64 | ((hart as u64) << 32) | tid as u64;
+        let key = TrackKey::KernelTrackId(track_id);
+        if let Some(e) = self.map.get(&key) {
+            return (e.uuid, process_desc, None);
+        }
+        let uuid = self.alloc_uuid();
+        let name = format!("tid-{tid}");
+        self.map.insert(
+            key,
+            TrackEntry { uuid, parent_uuid: process_uuid, name: name.clone() },
+        );
+        let desc = TrackDescriptor {
+            uuid: Some(uuid),
+            parent_uuid: Some(process_uuid),
+            name: Some(name.clone()),
+            thread: Some(ThreadDescriptor {
+                pid: Some(pid as i32),
+                tid: Some(tid as i32),
+                thread_name: Some(name),
+            }),
+            process: None,
+        };
+        (uuid, process_desc, Some(desc))
+    }
+
     /// Build the "harts process" TrackDescriptor — call once at trace start.
     pub fn harts_process_descriptor(&self) -> TrackDescriptor {
         TrackDescriptor {

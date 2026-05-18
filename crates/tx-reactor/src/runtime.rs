@@ -264,14 +264,19 @@ impl Reactor {
 
     /// Submit a task with explicit scheduler metadata.
     ///
-    /// `initial_meta.task_id_low` is threaded into the task's
-    /// `TaskMailbox` via `TaskTable::submit_with_task_id`; the scheduler
-    /// also sees the full meta for fairness/affinity bookkeeping.
+    /// `initial_meta.task_id_low` and `initial_meta.process_id_low` are
+    /// threaded into the task's `TaskMailbox` via
+    /// `TaskTable::submit_with_ids`; the scheduler also sees the full
+    /// meta for fairness/affinity bookkeeping.
     pub fn submit_task_with_meta<F>(&mut self, future: F, initial_meta: InitialSchedMeta) -> TaskKey
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let key = self.tasks.submit_with_task_id(future, initial_meta.task_id_low);
+        let key = self.tasks.submit_with_ids(
+            future,
+            initial_meta.task_id_low,
+            initial_meta.process_id_low,
+        );
         self.scheduler
             .task_submitted(key.id(), TaskHandle::new(key.id()), initial_meta);
         key
@@ -412,17 +417,17 @@ impl Reactor {
             // can pair the SpanBegin/SpanEnd records by the same identity
             // even if the task structure has rotated by the time we
             // close the span.
-            let task_id_low = self
+            let (task_id_low, process_id_low) = self
                 .tasks
                 .task(key)
                 .ok()
-                .map(|t| t.mailbox.task_id_low())
-                .unwrap_or(0);
-            let sched_span = emit_sched_begin(hart, task_id_low);
+                .map(|t| (t.mailbox.task_id_low(), t.mailbox.process_id_low()))
+                .unwrap_or((0, 0));
+            let sched_span = emit_sched_begin(hart, task_id_low, process_id_low);
 
             let poll = {
                 let Ok(task) = self.tasks.task_mut(key) else {
-                    emit_sched_end(sched_span, hart, task_id_low, tx_observe_types::SchedReason::None);
+                    emit_sched_end(sched_span, hart, task_id_low, process_id_low, tx_observe_types::SchedReason::None);
                     continue;
                 };
                 debug_assert_eq!(task.id, key.id());
@@ -449,7 +454,7 @@ impl Reactor {
                     crate::task::set_current_mailbox(None);
                     crate::task::set_current_timer_wheel(None);
                     crate::task::set_current_delegate_registry(None);
-                    emit_sched_end(sched_span, hart, task_id_low, tx_observe_types::SchedReason::None);
+                    emit_sched_end(sched_span, hart, task_id_low, process_id_low, tx_observe_types::SchedReason::None);
                     continue;
                 };
 
@@ -469,7 +474,7 @@ impl Reactor {
                         self.scheduler.task_dropped(key.id());
                         stats.completed += 1;
                     }
-                    emit_sched_end(sched_span, hart, task_id_low, tx_observe_types::SchedReason::Completed);
+                    emit_sched_end(sched_span, hart, task_id_low, process_id_low, tx_observe_types::SchedReason::Completed);
                 }
                 Poll::Pending => {
                     let woke_during_poll = self
@@ -483,6 +488,7 @@ impl Reactor {
                             sched_span,
                             hart,
                             task_id_low,
+                            process_id_low,
                             tx_observe_types::SchedReason::WokeDuringPoll,
                         );
                     } else if let Ok(task) = self.tasks.task_mut(key) {
@@ -490,9 +496,9 @@ impl Reactor {
                         task.last_stop_reason = Some(StopReason::Blocked);
                         self.scheduler
                             .task_stopped(key.id(), StopReason::Blocked, 0, hart);
-                        emit_sched_end(sched_span, hart, task_id_low, tx_observe_types::SchedReason::Parked);
+                        emit_sched_end(sched_span, hart, task_id_low, process_id_low, tx_observe_types::SchedReason::Parked);
                     } else {
-                        emit_sched_end(sched_span, hart, task_id_low, tx_observe_types::SchedReason::None);
+                        emit_sched_end(sched_span, hart, task_id_low, process_id_low, tx_observe_types::SchedReason::None);
                     }
                 }
             }
@@ -649,7 +655,7 @@ impl Default for Reactor {
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn emit_sched_begin(hart: HartId, task_id_low: u32) -> tx_observe::SpanId {
+fn emit_sched_begin(hart: HartId, task_id_low: u32, process_id_low: u32) -> tx_observe::SpanId {
     use tx_observe::encode::{encode_sched_switch, sched_switch_tag};
     use tx_observe::{EventNameId, TxTraceLevel};
     use tx_observe_types::{PayloadSchedSwitch, SchedKind, SchedReason};
@@ -658,10 +664,11 @@ fn emit_sched_begin(hart: HartId, task_id_low: u32) -> tx_observe::SpanId {
     };
     let payload = PayloadSchedSwitch {
         task_id_low,
+        process_id_low,
         hart_id: hart.0 as u8,
         kind: SchedKind::Dispatch as u8,
         reason: SchedReason::None as u8,
-        _pad: [0; 9],
+        _pad: [0; 5],
     };
     let (enc, len) = encode_sched_switch(&payload);
     em.span_begin(
@@ -691,6 +698,7 @@ fn emit_sched_end(
     span: tx_observe::SpanId,
     hart: HartId,
     task_id_low: u32,
+    process_id_low: u32,
     reason: tx_observe_types::SchedReason,
 ) {
     use tx_observe::encode::{encode_sched_switch, sched_switch_tag};
@@ -703,10 +711,11 @@ fn emit_sched_end(
     };
     let payload = PayloadSchedSwitch {
         task_id_low,
+        process_id_low,
         hart_id: hart.0 as u8,
         kind: SchedKind::Yield as u8,
         reason: reason as u8,
-        _pad: [0; 9],
+        _pad: [0; 5],
     };
     let (enc, len) = encode_sched_switch(&payload);
     em.span_end(span, sched_switch_tag(), &enc[..len as usize]);

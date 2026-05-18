@@ -347,20 +347,22 @@ pub const fn phase_transition_tag() -> TxPayloadTag {
 ///
 /// Wire layout (`08_OBSERVATION_v1.md` §15.6 OBS-9):
 /// ```text
-/// offset 0:  task_id_low  u32
-/// offset 4:  hart_id      u8
-/// offset 5:  kind         u8   (0 = Dispatch, 1 = Yield)
-/// offset 6:  reason       u8   (0..3, see SchedReason)
-/// offset 7:  _pad         [u8; 9]
+/// offset 0:  task_id_low     u32
+/// offset 4:  process_id_low  u32
+/// offset 8:  hart_id         u8
+/// offset 9:  kind            u8   (0 = Dispatch, 1 = Yield)
+/// offset 10: reason          u8   (0..3, see SchedReason)
+/// offset 11: _pad            [u8; 5]
 /// total = 16
 /// ```
 #[inline]
 pub fn encode_sched_switch(p: &PayloadSchedSwitch) -> ([u8; 16], u16) {
     let mut buf = [0u8; 16];
     write_u32_le(&mut buf, 0, p.task_id_low);
-    write_u8(&mut buf, 4, p.hart_id);
-    write_u8(&mut buf, 5, p.kind);
-    write_u8(&mut buf, 6, p.reason);
+    write_u32_le(&mut buf, 4, p.process_id_low);
+    write_u8(&mut buf, 8, p.hart_id);
+    write_u8(&mut buf, 9, p.kind);
+    write_u8(&mut buf, 10, p.reason);
     // _pad bytes stay 0
     let len = core::mem::size_of::<PayloadSchedSwitch>() as u16;
     (buf, len)

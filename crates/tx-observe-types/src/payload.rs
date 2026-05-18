@@ -448,6 +448,12 @@ pub struct PayloadSchedSwitch {
     /// other observation payloads so the daemon can build per-task
     /// Perfetto tracks.
     pub task_id_low: u32,
+    /// `TaskMailbox::process_id_low()` — the thread-group leader's PID.
+    /// For user threads this is the process's TGID; for kernel-only
+    /// tasks it is `0`. Lets the daemon parent each `task.<tid>`
+    /// thread track under the right `process.<pid>` Perfetto process
+    /// track instead of the single kernel-wide `txKernel` aggregate.
+    pub process_id_low: u32,
     /// Hart the switch is happening on.  Mirrors `TxTraceRecord.hart`
     /// for grep-stability — the wire carries it twice intentionally so
     /// the daemon's per-hart track lifecycle stays self-contained even
@@ -459,7 +465,7 @@ pub struct PayloadSchedSwitch {
     /// One of [`SchedReason`] — populated on `Yield` SpanEnd records;
     /// `0` (None) on Dispatch SpanBegin.
     pub reason: u8,
-    pub _pad: [u8; 9],
+    pub _pad: [u8; 5],
 }
 
 /// Sched-switch direction tag for [`PayloadSchedSwitch::kind`].

@@ -56,6 +56,15 @@ pub struct PftraceWriter {
     /// on this hart" — slices fall back to the hart track (matches
     /// the boot-time pre-Sched behaviour).
     current_task_per_hart: HashMap<u16, u32>,
+    /// Currently-dispatched process id (`PayloadSchedSwitch.process_id_low`)
+    /// per hart, paired with `current_task_per_hart`. Used so the
+    /// daemon can emit per-process `ProcessDescriptor` tracks that
+    /// parent the per-thread (`tid-<N>`) tracks, surfacing real
+    /// `pid=<N> tid=<M>` in Perfetto slice details instead of the
+    /// synthetic `hart0[0] txKernel[1]` placeholders. `0` is the
+    /// "no PID known" sentinel; the writer falls back to the
+    /// hart-flat task track in that case.
+    current_pid_per_hart: HashMap<u16, u32>,
 }
 
 impl PftraceWriter {
@@ -77,6 +86,7 @@ impl PftraceWriter {
             last_ts: 0,
             first_sequence_packet: true,
             current_task_per_hart: HashMap::new(),
+            current_pid_per_hart: HashMap::new(),
         };
 
         // Emit the "harts process" track descriptor first.
@@ -204,40 +214,66 @@ impl PftraceWriter {
         // the sched_switch-equivalent timeline) while all subsequent
         // non-Sched slices route to the task track.
         if r.payload_tag == TxPayloadTag::SchedSwitch as u16 {
-            if let Some(tid) = extract_sched_task_id(r) {
+            if let Some((tid, pid)) = extract_sched_ids(r) {
                 if kind_byte == TxTraceKind::SpanBegin as u8 {
                     self.current_task_per_hart.insert(r.hart, tid);
+                    self.current_pid_per_hart.insert(r.hart, pid);
                 } else if kind_byte == TxTraceKind::SpanEnd as u8 {
                     self.current_task_per_hart.remove(&r.hart);
+                    self.current_pid_per_hart.remove(&r.hart);
                 }
             }
         }
 
-        // Choose the slice track: the per-task track when a task is
-        // currently dispatched on this hart, otherwise the hart track.
-        // Sched-level records intentionally stay on the hart track so
-        // the sched timeline reads "which task held this CPU" at a
-        // glance — like the Linux sched_switch view in Perfetto.
+        // Choose the slice track: the per-thread track parented under
+        // a per-process track when both PID and TID are known for the
+        // current hart; the hart-flat task track when only TID is
+        // known (older traces, kernel actors with pid=0); the hart
+        // track otherwise. Sched-level records intentionally stay on
+        // the hart track so the sched timeline reads "which task
+        // held this CPU" at a glance — like the Linux sched_switch
+        // view in Perfetto.
         let slice_track_uuid = if r.level == "Sched" {
             hart_uuid
         } else if let Some(&tid) = self.current_task_per_hart.get(&r.hart) {
-            let task_track_name = format!("task.{tid}");
-            let (uuid, desc) = self.tracks.ensure_kernel_track(
-                // Embed the hart in the high half to keep two harts'
-                // task.<N> tracks distinct when SMP-aware emits land.
-                ((r.hart as u64) << 32) | tid as u64,
-                task_track_name,
-                /* track_kind = Thread (1) */ 1,
-                Some(r.hart),
-            );
-            if let Some(d) = desc {
-                self.packets.push(TracePacket {
-                    trusted_packet_sequence_id: Some(SEQ_ID),
-                    track_descriptor: Some(d),
-                    ..Default::default()
-                });
+            let pid = self.current_pid_per_hart.get(&r.hart).copied().unwrap_or(0);
+            if pid != 0 {
+                let (uuid, proc_desc, thread_desc) =
+                    self.tracks.ensure_thread_track_under_process(pid, r.hart, tid);
+                if let Some(d) = proc_desc {
+                    self.packets.push(TracePacket {
+                        trusted_packet_sequence_id: Some(SEQ_ID),
+                        track_descriptor: Some(d),
+                        ..Default::default()
+                    });
+                }
+                if let Some(d) = thread_desc {
+                    self.packets.push(TracePacket {
+                        trusted_packet_sequence_id: Some(SEQ_ID),
+                        track_descriptor: Some(d),
+                        ..Default::default()
+                    });
+                }
+                uuid
+            } else {
+                // No PID known — keep the legacy hart-flat task track
+                // so the slice still routes off the hart-global track.
+                let task_track_name = format!("task.{tid}");
+                let (uuid, desc) = self.tracks.ensure_kernel_track(
+                    ((r.hart as u64) << 32) | tid as u64,
+                    task_track_name,
+                    /* track_kind = Thread (1) */ 1,
+                    Some(r.hart),
+                );
+                if let Some(d) = desc {
+                    self.packets.push(TracePacket {
+                        trusted_packet_sequence_id: Some(SEQ_ID),
+                        track_descriptor: Some(d),
+                        ..Default::default()
+                    });
+                }
+                uuid
             }
-            uuid
         } else {
             hart_uuid
         };
@@ -708,15 +744,19 @@ fn extract_arg_value_field(r: &DecodedRecord) -> u64 {
         .unwrap_or(0)
 }
 
-/// Extract `task_id_low: u32` from a decoded `SchedSwitch` payload JSON.
+/// Extract `(task_id_low, process_id_low)` from a `SchedSwitch` payload JSON.
 ///
 /// Used by the writer's sched-switch state machine to keep
-/// `current_task_per_hart` in sync with the kernel's per-hart
-/// dispatch decisions. Returns `None` for malformed payloads — the
-/// caller leaves the slot at its previous value (safer than blindly
-/// resetting to 0, which would mis-route subsequent slices to the
-/// hart track instead of the previously-dispatched task track).
-fn extract_sched_task_id(r: &DecodedRecord) -> Option<u32> {
+/// `current_task_per_hart` and `current_pid_per_hart` in sync with
+/// the kernel's per-hart dispatch decisions. `process_id_low`
+/// defaults to `0` for older traces that pre-date the PID-plumbing
+/// rev — those slices still route to the hart-flat task track via
+/// the `pid == 0` fallback path. Returns `None` only when the
+/// payload is missing or `task_id_low` is unreadable; the caller
+/// leaves slots unchanged in that case.
+fn extract_sched_ids(r: &DecodedRecord) -> Option<(u32, u32)> {
     let p = r.payload.as_ref()?;
-    p["task_id_low"].as_u64().map(|v| v as u32)
+    let tid = p["task_id_low"].as_u64()? as u32;
+    let pid = p["process_id_low"].as_u64().unwrap_or(0) as u32;
+    Some((tid, pid))
 }
