@@ -1,3 +1,32 @@
+- 2026-05-18 **All 32 basic-musl OSComp tests now pass on rv64-qemu.**
+  Three sessions of work on `cc/great-ptolemy-982e05` brought the count
+  from ~27 to 32/32. Final blocker was a v3 WaitSource registration gap
+  causing pipe reads via `drive()` to park forever.
+
+  **Root cause (pipe hang):** `pipe/adapter.rs::new_wait_source` (and
+  eventfd, timerfd, process adapters) called `new_source()` without
+  `register_source()`. The `drive()` resolver calls `lookup_source()` to
+  subscribe the task mailbox to the object's WaitSource before parking;
+  with an unregistered source `lookup_source` returned `None`, no
+  subscription was made, and no one ever posted a wakeup event to the
+  parked task. Fix: add `register_source(Arc::clone(&source))` in all
+  four adapters (matching vfs/adapter.rs and futex/adapter.rs), plus
+  `unregister_source` in `PipePayload::drop`.
+
+  **Other fixes in this session set (merged from cc/flamboyant-ramanujan-801c0b):**
+  - `sys_clone` honours non-zero `newsp` (libc clone shape)
+  - `mount_ext4_read_write` replaces read-only sdcard mount (enables mmap/munmap)
+  - `sys_mount("vfat", ...)` aliases to tmpfs (enables mount/umount test)
+  - umount dentry lookup fixed to scan by root rnode
+  - `sys_openat` dirfd resolution via `open_file.opendir_dentry()`
+
+  **Verification:** `cargo xtask oscomp qemu --target rv64-qemu` shows all
+  32 basic-musl tests completing with correct output. busybox-musl continues
+  past without QEMU kill signal. Commit: `39084d8`.
+
+  **Next:** busybox-musl pass rate (currently some fail: df/dmesg/ps/free/touch
+  due to missing /proc and utimensat). No blocker on basic-musl.
+
 - 2026-05-18 **oscomp basic `test_clone` + `test_mount` unblocked.**
   Two narrow fixes targeting two of the four reported failures in the
   oscomp basic-musl suite. The other two (`test_mmap` segfault,
