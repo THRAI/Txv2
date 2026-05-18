@@ -14,6 +14,8 @@ use prost::Message;
 
 use crate::decode::{DecodedEvent, DecodedRecord, RepairRecord};
 use crate::perfetto::interned::InternTable;
+use std::collections::HashMap;
+
 use crate::perfetto::proto::{
     Clock, ClockSnapshot, DebugAnnotation, DebugAnnotationName, EventName, InternedData, Trace,
     TracePacket, TrackEvent, TrackEventType, CLOCK_BOOTTIME, CLOCK_CUSTOM_TXTRACE_BASE,
@@ -22,7 +24,7 @@ use crate::perfetto::proto::{
 use crate::perfetto::span::{SpanEntry, SpanTable};
 use crate::perfetto::track::TrackRegistry;
 
-use tx_observe_types::{TxPayloadTag, TxTraceKind};
+use tx_observe_types::{TxPayloadTag, TxTraceKind, TxTraceLevel};
 
 /// The single trusted packet sequence id for this producer.
 const SEQ_ID: u32 = TRUSTED_SEQ_ID;
@@ -46,6 +48,14 @@ pub struct PftraceWriter {
     /// Whether the first sequence packet has been emitted (needs
     /// SEQ_INCREMENTAL_STATE_CLEARED on the first packet carrying interned data).
     first_sequence_packet: bool,
+    /// OBS-9 sched-switch state: which task is currently dispatched on
+    /// each hart. Updated by `SpanBegin(Sched)` / `SpanEnd(Sched)`
+    /// records; consulted by every non-Sched slice emit so the slice
+    /// lands on the per-task Perfetto track instead of the
+    /// hart-global track. `None` means "no task currently dispatched
+    /// on this hart" — slices fall back to the hart track (matches
+    /// the boot-time pre-Sched behaviour).
+    current_task_per_hart: HashMap<u16, u32>,
 }
 
 impl PftraceWriter {
@@ -66,6 +76,7 @@ impl PftraceWriter {
             emitted_clock_snapshot: false,
             last_ts: 0,
             first_sequence_packet: true,
+            current_task_per_hart: HashMap::new(),
         };
 
         // Emit the "harts process" track descriptor first.
@@ -186,6 +197,51 @@ impl PftraceWriter {
             });
         }
 
+        // OBS-9 sched-switch state: SpanBegin(Sched) installs the
+        // current task for this hart; SpanEnd(Sched) clears it. Done
+        // BEFORE we choose a track for the record, so the Sched span
+        // itself still lands on the hart track (which is what gives us
+        // the sched_switch-equivalent timeline) while all subsequent
+        // non-Sched slices route to the task track.
+        if r.payload_tag == TxPayloadTag::SchedSwitch as u16 {
+            if let Some(tid) = extract_sched_task_id(r) {
+                if kind_byte == TxTraceKind::SpanBegin as u8 {
+                    self.current_task_per_hart.insert(r.hart, tid);
+                } else if kind_byte == TxTraceKind::SpanEnd as u8 {
+                    self.current_task_per_hart.remove(&r.hart);
+                }
+            }
+        }
+
+        // Choose the slice track: the per-task track when a task is
+        // currently dispatched on this hart, otherwise the hart track.
+        // Sched-level records intentionally stay on the hart track so
+        // the sched timeline reads "which task held this CPU" at a
+        // glance — like the Linux sched_switch view in Perfetto.
+        let slice_track_uuid = if r.level == "Sched" {
+            hart_uuid
+        } else if let Some(&tid) = self.current_task_per_hart.get(&r.hart) {
+            let task_track_name = format!("task.{tid}");
+            let (uuid, desc) = self.tracks.ensure_kernel_track(
+                // Embed the hart in the high half to keep two harts'
+                // task.<N> tracks distinct when SMP-aware emits land.
+                ((r.hart as u64) << 32) | tid as u64,
+                task_track_name,
+                /* track_kind = Thread (1) */ 1,
+                Some(r.hart),
+            );
+            if let Some(d) = desc {
+                self.packets.push(TracePacket {
+                    trusted_packet_sequence_id: Some(SEQ_ID),
+                    track_descriptor: Some(d),
+                    ..Default::default()
+                });
+            }
+            uuid
+        } else {
+            hart_uuid
+        };
+
         match kind_byte {
             k if k == TxTraceKind::TrackDescriptor as u8 => {
                 self.handle_track_descriptor(r, r.hart);
@@ -194,7 +250,7 @@ impl PftraceWriter {
                 let span_id = parse_hex_u64(&r.span);
                 let name_id = parse_hex_u32(&r.name_id);
                 let (iid, new_name) = self.names.intern(name_id);
-                let entry = SpanEntry { name_iid: iid, begin_ts: r.ts, track_uuid: hart_uuid };
+                let entry = SpanEntry { name_iid: iid, begin_ts: r.ts, track_uuid: slice_track_uuid };
                 self.spans.begin(r.hart, span_id, entry);
                 // Emit the begin event; we'll emit the end when SpanEnd arrives.
                 // Per Perfetto convention we emit TYPE_SLICE_BEGIN now and TYPE_SLICE_END on End.
@@ -207,7 +263,7 @@ impl PftraceWriter {
                     timestamp_clock_id: Some(self.perfetto_clock_id()),
                     trusted_packet_sequence_id: Some(SEQ_ID),
                     track_event: Some(TrackEvent {
-                        track_uuid: Some(hart_uuid),
+                        track_uuid: Some(slice_track_uuid),
                         r#type: Some(TrackEventType::SliceBegin as i32),
                         name_iid: Some(iid),
                         ..Default::default()
@@ -327,7 +383,7 @@ impl PftraceWriter {
                         timestamp_clock_id: Some(self.perfetto_clock_id()),
                         trusted_packet_sequence_id: Some(SEQ_ID),
                         track_event: Some(TrackEvent {
-                            track_uuid: Some(hart_uuid),
+                            track_uuid: Some(slice_track_uuid),
                             r#type: Some(TrackEventType::Instant as i32),
                             name_iid: Some(iid),
                             debug_annotations,
@@ -650,4 +706,17 @@ fn extract_arg_value_field(r: &DecodedRecord) -> u64 {
         .as_ref()
         .and_then(|p| p["value0"].as_u64())
         .unwrap_or(0)
+}
+
+/// Extract `task_id_low: u32` from a decoded `SchedSwitch` payload JSON.
+///
+/// Used by the writer's sched-switch state machine to keep
+/// `current_task_per_hart` in sync with the kernel's per-hart
+/// dispatch decisions. Returns `None` for malformed payloads — the
+/// caller leaves the slot at its previous value (safer than blindly
+/// resetting to 0, which would mis-route subsequent slices to the
+/// hart track instead of the previously-dispatched task track).
+fn extract_sched_task_id(r: &DecodedRecord) -> Option<u32> {
+    let p = r.payload.as_ref()?;
+    p["task_id_low"].as_u64().map(|v| v as u32)
 }
