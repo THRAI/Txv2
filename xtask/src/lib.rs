@@ -88,7 +88,7 @@ fn print_usage() {
            cargo xtask ci-slow\n\
            cargo xtask check\n\
            cargo xtask build --target rv64-qemu|rv64-m1dock-mock|la64-qemu|all\n\
-           cargo xtask qemu --target rv64-qemu|rv64-m1dock-mock|la64-qemu --profile smoke|busybox [--dry-run] [--expect-sentinel] [--timeout-ms N] [--no-block] [--interactive]\n\
+           cargo xtask qemu --target rv64-qemu|rv64-m1dock-mock|la64-qemu --profile smoke|busybox [--dry-run] [--expect-sentinel] [--timeout-ms N] [--smp N] [--no-block] [--interactive]\n\
            cargo xtask test [smoke|busybox-boot] [--target rv64-qemu] [--timeout-ms N] [--dry-run] [--trap-trace]\n\
            cargo xtask fault-decode --target rv64-qemu [--elf PATH] [--serial PATH [--all] | --scause HEX --sepc HEX --stval HEX | --addr HEX]\n\
            cargo xtask trap-trace --serial PATH [--syscalls | --raw]\n\
@@ -97,6 +97,9 @@ fn print_usage() {
            cargo xtask image ext4 --profile busybox [--target rv64-qemu|la64-qemu] [--size 64M]\n\
            cargo xtask image m1dock-sd --profile busybox [--target rv64-m1dock-mock] [--size 64M]\n\
            cargo xtask oscomp doctor|prepare|submit|run|qemu\n\
+           cargo xtask oscomp score [--target rv64-qemu|la64-qemu] [--input FILE] [--suite SUITE] [--data DIR] [--dry-run]\n\
+           cargo xtask oscomp list-suites [--target rv64-qemu|la64-qemu] [--data DIR]\n\
+           cargo xtask oscomp test --target rv64-qemu|la64-qemu [--suite SUITE] [--skip-build] [--data DIR] [--dry-run]\n\
            cargo xtask submit k210 [--out target/submit/k210]\n\
            cargo xtask syscall status|list|info|sync|pick — query/maintain the syscall map (SSoT: numbers.rs + mod.rs)\n\
            cargo xtask progress validate\n\

@@ -323,7 +323,8 @@ pub async fn run_thread<P: TxPlatform>(
                     let old_mask = payload.signal_mask();
 
                     // Build the signal frame write descriptor.
-                    let stack_top = tx_hal::UserPtr::<u8>::new(orig_ctx.regs[2]); // sp
+                    let stack_top =
+                        tx_hal::UserPtr::<u8>::new(user_sp_from_context::<P>(&orig_ctx));
                     let setup = tx_hal::SignalFrameWrite {
                         stack_top,
                         sig_no: sig.raw() as u32,
@@ -342,7 +343,7 @@ pub async fn run_thread<P: TxPlatform>(
                         <P as tx_hal::SignalFrameIf>::prepare_signal_frame(&orig_ctx, &setup);
                     match prepared {
                         Ok((handler_ctx, frame_bytes)) => {
-                            let frame_addr = handler_ctx.regs[2];
+                            let frame_addr = user_sp_from_context::<P>(&handler_ctx);
                             // Check that the full frame (including the
                             // sigreturn trampoline at its tail) actually
                             // landed on the user stack. The previous
@@ -539,15 +540,12 @@ pub async fn run_thread<P: TxPlatform>(
                         // `make_initial_user_trap_context`).
                     }
                     tx_shims::linux_syscall::SyscallResult::SigreturnRestored => {
-                        // Phase B: rt_sigreturn restored the signal
-                        // frame into saved_user_context.  Same
-                        // fall-through semantics as ExecCommitted:
-                        // MUST NOT drain pending_syscall_return;
-                        // re-enters userspace with the restored
-                        // context.  The actual SignalFrameIf restore
-                        // (read_signal_frame + restore_signal_frame)
-                        // lands in Phase D.
-                        // Fall through to AST drain + re-entry.
+                        // `sys_rt_sigreturn` already consumed the parked
+                        // pre-handler context and restored it into
+                        // `saved_user_context`.  Do not take it again here:
+                        // this branch only preserves the ExecCommitted shape
+                        // of skipping normal pending-syscall-return writeback
+                        // and re-entering with the restored context.
                     }
                 }
             }
@@ -602,6 +600,13 @@ pub async fn run_thread<P: TxPlatform>(
         // Fall through to the top of the loop — next iteration
         // re-opens the entry-side wait, re-runs the AST checkpoint,
         // and re-dives into userspace with the merged context.
+    }
+}
+
+fn user_sp_from_context<P: TxPlatform>(ctx: &tx_hal::UserTrapContext) -> usize {
+    match P::ARCH {
+        tx_hal::Arch::Riscv64 => ctx.regs[2],
+        tx_hal::Arch::LoongArch64 => ctx.regs[3],
     }
 }
 

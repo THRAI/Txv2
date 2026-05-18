@@ -214,11 +214,11 @@ impl AddressSpace {
                 if snapshot.prot.permits(kind.required_prot()) {
                     continue;
                 }
-                // Insufficient protection on the existing mapping.
-                // The caller's intent (Read/Write) cannot be satisfied
-                // by the cached frame; surface as EFAULT (matches the
-                // recipe-permission fast path in `resolve_user_page_addr`).
-                return V3::err(Errno::EFAULT.into());
+                // Insufficient cached protection is not a hard fault:
+                // fork CoW deliberately leaves parent private pages
+                // mapped read-only. If the recipe permits the requested
+                // access, fall through and materialise/publish the
+                // writable private page below.
             }
             // Build a synthetic fault, observe the recipe, materialise,
             // and publish synchronously.

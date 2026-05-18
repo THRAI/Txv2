@@ -199,8 +199,10 @@ pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
 /// - `args[0]` (`flags`) **must** equal [`SIGCHLD`] — anything else
 ///   (including `SIGCHLD | CLONE_VM`, `CLONE_VFORK`, the
 ///   pthread_create flag set, or zero flags) returns `-EINVAL`.
-/// - `args[1]` (`stack`) **must** be `0` — non-zero stack is the
-///   posix_spawn / pthread_create path, deferred.
+/// - `args[1]` (`stack`) may be non-zero. libc's `clone(fn, arg,
+///   stack, stack_size, SIGCHLD)` wrapper places `fn` and `arg` at
+///   that stack pointer before issuing the raw syscall; the child must
+///   resume with `sp = stack` so the wrapper can tail-call `fn(arg)`.
 /// - `args[2..5]` (`parent_tidptr`, `tls`, `child_tidptr`) are
 ///   ignored (they're only meaningful with the CLONE flags we
 ///   reject).

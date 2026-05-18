@@ -17,12 +17,13 @@ inner loop; OSComp + LTP are the correctness bar. When a syscall lands,
 record which specific OSComp/LTP test(s) closed it under "Currently
 passing" below.
 
-**Last refresh:** 2026-05-18 (3rd pass — recorded busybox-musl 52/55
-landing on `cc/great-ptolemy-982e05` `a2eff5f`. Three remaining
-busybox failures are not kernel bugs: `hwclock` (no RTC), `kill 10`
-(judge/sdcard cmd mismatch), `which ls` (no ls symlink in PATH).
-Earlier same-day refreshes recorded basic-musl 32/32 and the
-`cargo xtask syscall` SSoT.)
+**Last refresh:** 2026-05-18 (4th pass — merged `origin/main`
+post-PR #33, which brings `cargo xtask oscomp score` /
+`list-suites` / `test` subcommands and lands busybox-musl 52/55
+on main. New per-suite scoreboard recorded below for the full
+OSComp set: basic-musl 101/102, busybox-musl 52/55, libcbench
+~14/27, libctest 0/220, lua 0/9, lmbench 0/36. Updated headline
+counts: 120 NR_*, 107 dispatched.)
 
 ## Headline counts
 
@@ -33,8 +34,8 @@ Earlier same-day refreshes recorded basic-musl 32/32 and the
 > [Auto-maintained syscall table](#auto-maintained-syscall-table) at
 > the bottom of this file).
 
-- `pub const NR_*` defined in `numbers.rs`: **119**
-- Dispatched in `mod.rs` (unique match arms): **106**
+- `pub const NR_*` defined in `numbers.rs`: **120**
+- Dispatched in `mod.rs` (unique match arms): **107**
 - Currently stubbed (returns `-ENOSYS`): see "Already-partial" below for
   human-curated entries; the auto-table flags additional likely stubs
   by heuristic.
@@ -55,36 +56,46 @@ The table below is the canonical "where to focus" map. Effort is in worktree
 weeks (S ≤ 2w, M = 3–4w, L = 6–10w, XL ≥ 12w). LTP impact estimates the
 number of additional LTP tests that move from skipped/failed to runnable.
 
-| Gap | LTP impact | Effort | Substrate status |
+| Gap | OSComp / LTP impact | Effort | Substrate status |
 |---|---|---|---|
-| `preadv` / `pwritev` / `fallocate` / `readahead` | +20 | S–M (3–4w) | `writev` loop + VFS hooks exist |
-| `getrlimit` / `setrlimit` + `sched_getaffinity` | +15 | S (~2w) | per-proc resource field |
-| POSIX `mq_*` | +15 | M (3–4w) | single kernel queue object, no namespace work |
-| per-process timers (`timer_create` family, `setitimer`, `getrusage`) | +20 | M (2–3w) | deadline tracking shared with `timerfd` |
-| `sendfile` / `splice` / `copy_file_range` | +15 | M (3–4w) | needs page-cache coherence path |
-| ext4 file-content writeback (`flush_page` / `fsync_file`) | +5 busybox-musl, +ext4 LTP | M (~3w) | currently `-ENOSYS`; namespace writes already persist via the pager's direct-write path |
-| SysV IPC (`msg` / `sem` / `shm`) | +40 | L (6–10w) | new namespace-aware subsystem |
-| Network stack (full socket API) | +60 | XL (12–16w) | no subsystem exists — TCP/UDP state, sockaddr unions, sk_buff |
-| `inotify` / `fanotify` | +10 | M (~3w) | new event queue subsystem |
-| `chroot` / `pivot_root` / `swap*` | +8 | S–M (1–2w) | `chroot` is one field; bdev-fs lands swap |
-| `seccomp` / capabilities / `keyctl` | +15 | L (6–8w) | filter bytecode + keyring |
-| `ptrace` | +20 | XL (12w+) | parallel exec context — out of scope v1 |
-| `bpf` / `perf_event_open` | +10 | XL (12w+) | out of scope v1 |
+| `/usr/bin/env` shebang stub — auto-create `/usr/bin/` + symlink `env → /bin/busybox` at boot (or whatever busybox path the image uses) | **+229 OSComp** (libctest 220 + lua 9, both currently 0/N with `./run-static.sh: not found` / `./test.sh: not found`) | **S (≤1d)** — same shape as `mount_procfs_at_proc()` in `a2eff5f` | only tmpfs symlink + mkdir at init time |
+| lmbench unblock — `mkdir /var/tmp` at boot + diagnose `Simple read: -1` | up to +36 OSComp (lmbench-musl 0/36) | S–M (mkdir is hours; `Simple read` needs runtime triage) | `mkdir` is trivial; `read(2)` edge case to investigate |
+| libcbench malloc / stdio gaps | up to +13 OSComp (`~14/27` → close to 27/27) | M (~3w) | malloc benches return 0 → allocator instrumentation; stdio failures suggest fd / buffering path |
+| `preadv` / `pwritev` / `fallocate` / `readahead` | +20 LTP | S–M (3–4w) | `writev` loop + VFS hooks exist |
+| `getrlimit` / `setrlimit` + `sched_getaffinity` | +15 LTP | S (~2w) | per-proc resource field |
+| POSIX `mq_*` | +15 LTP | M (3–4w) | single kernel queue object, no namespace work |
+| per-process timers (`timer_create` family, `setitimer`, `getrusage`) | +20 LTP | M (2–3w) | deadline tracking shared with `timerfd` |
+| `sendfile` / `splice` / `copy_file_range` | +15 LTP | M (3–4w) | needs page-cache coherence path |
+| ext4 file-content writeback (`flush_page` / `fsync_file`) | +ext4 LTP | M (~3w) | currently `-ENOSYS`; namespace writes already persist via the pager's direct-write path |
+| SysV IPC (`msg` / `sem` / `shm`) | +40 LTP | L (6–10w) | new namespace-aware subsystem |
+| Network stack (full socket API) | +60 LTP + iperf/netperf | XL (12–16w) | no subsystem exists — TCP/UDP state, sockaddr unions, sk_buff |
+| `inotify` / `fanotify` | +10 LTP | M (~3w) | new event queue subsystem |
+| `chroot` / `pivot_root` / `swap*` | +8 LTP | S–M (1–2w) | `chroot` is one field; bdev-fs lands swap |
+| `seccomp` / capabilities / `keyctl` | +15 LTP | L (6–8w) | filter bytecode + keyring |
+| `ptrace` | +20 LTP | XL (12w+) | parallel exec context — out of scope v1 |
+| `bpf` / `perf_event_open` | +10 LTP | XL (12w+) | out of scope v1 |
 
-**Reading the table.** Best LTP-impact-per-effort today:
-`preadv`/`pwritev`/`fallocate`, then `getrlimit`/`setrlimit`/`sched_getaffinity`.
-SysV IPC and the network stack are larger but unlock the biggest LTP
-coverage jumps. `ptrace` and `bpf` are explicitly **out of scope for v1**
-— flag them and move on unless the user specifically chartered them.
+**Reading the table.** The top row (env symlink) is by far the highest
+LTP/OSComp impact per worktree-hour today: 229 OSComp tests are blocked
+by a single missing interpreter on the rootfs. After that, lmbench
+mkdir + libcbench triage are the cheap wins. Long-tail Linux ABI gaps
+(`preadv`, `getrlimit`, `mq_*`, …) come next; SysV IPC and the network
+stack are larger but unlock the biggest LTP coverage jumps. `ptrace`
+and `bpf` are explicitly **out of scope for v1** — flag them and move
+on unless the user specifically chartered them.
 
 **Recently landed (removed from this table):**
 - `fork` + CLOEXEC bitmap — audit 2026-05-18 found it was already
   wired; unblocked 32/32 basic-musl after orthogonal signal-frame /
   mount / dirfd fixes in PR #30 + #31.
-- `utimensat` stub + auto-mounted `/proc` + `/proc/meminfo` — landed
-  on `cc/great-ptolemy-982e05` `a2eff5f` (busybox-musl 52/55,
-  unblocked `touch`, `dmesg`, `free`, `ps`, `df`, `mv`, `rmdir`, and
-  6 append tests). Not yet merged to `main` at the time of writing.
+- `utimensat` stub + auto-mounted `/proc` + `/proc/meminfo` + ext4
+  `rename`/`rmdir` + `O_APPEND` `pc.set_size_bytes` + `NR_SYSLOG`
+  stub — landed on `main` via PR #33 (busybox-musl 52/55, unblocked
+  `touch`, `dmesg`, `free`, `ps`, `df`, `mv`, `rmdir`, and 6 append
+  tests).
+- New xtask scoring subcommands (`oscomp score`, `list-suites`, `test`)
+  — landed in PR #33; let us produce the per-suite scoreboard above
+  with one command (`cargo xtask oscomp test --target rv64-qemu`).
 
 ## OSComp + LTP coverage (the gold standard)
 
@@ -94,25 +105,60 @@ internal sanity checks.
 
 ### OSComp
 
-Harness: `external/oscomp-autotest/` (git submodule). Runner:
-`cargo xtask oscomp qemu --target rv64-qemu`.
+Harness: `external/oscomp-autotest/` (git submodule). Runners (after PR #33):
 
-**basic-musl: 32/32 PASSING (as of 2026-05-18, PR #30 + PR #31).** Full
-suite reaches `END test_*` markers within a single QEMU run:
+```sh
+cargo xtask oscomp qemu        --target rv64-qemu          # boot + run
+cargo xtask oscomp list-suites --target rv64-qemu          # available suites
+cargo xtask oscomp score       --target rv64-qemu          # score the last run
+cargo xtask oscomp test        --target rv64-qemu          # qemu → score combo
+cargo xtask oscomp test        --target rv64-qemu --suite busybox-musl
+```
 
-`brk`, `chdir`, `clone`, `close`, `dup`, `dup2`, `execve`, `exit`, `fork`,
-`fstat`, `getcwd`, `getdents`, `getpid`, `getppid`, `gettimeofday`,
-`mkdir_`, `mmap`, `mount`, `munmap`, `open`, `openat`, `pipe`, `read`,
-`sleep`, `times`, `umount`, `uname`, `unlink`, `wait`, `waitpid`,
-`write`, `yield`.
+#### Scoreboard (rv64-qemu, last full-suite run)
 
-(`test_echo` is the fixture invoked by `test_execve`, not counted as a
-separate test.)
+| Suite | Score | Status | Root cause / next move |
+|---|---:|---|---|
+| `basic-musl`   | **101/102** | mostly passing | 1 partial `mmap` test; the rest of the 32 binary tests pass end-to-end (cited as 32/32 in earlier refreshes — the 101/102 count is per-assertion). |
+| `busybox-musl` | **52/55**   | landed (PR #33) | 3 remaining are non-kernel: `hwclock` (no RTC), `kill 10` (judge / sdcard cmd mismatch), `which ls` (no `ls` symlink in PATH). |
+| `libcbench-musl` | **~14/27** | partial      | Malloc benches return 0 (likely allocator instrumentation gap); stdio tests fail (buffer-flushing or fd-redirection path). |
+| `libctest-musl`  | **0/220** | blocked       | `./run-static.sh: not found` (ENOENT) — wrapper script can't exec. |
+| `lua-musl`     | **0/9**     | blocked       | `./test.sh: not found` — same pattern as libctest. |
+| `lmbench-musl` | **0/36**    | blocked       | Binary runs; first failure is `Simple read: -1` plus missing `/var/tmp/`. |
 
-**busybox-musl: 52/55 PASSING** on `cc/great-ptolemy-982e05` at
-commit `a2eff5f` (2026-05-18). Not yet on `main` / this worktree at
-the time of writing — the score will land here once the branch
-merges. Seven targeted fixes did the work:
+#### Highest-leverage next move: lua + libctest shebang fix (229 tests)
+
+Both `./test.sh` and `./run-static.sh` ENOENT-fail in the same way.
+Most likely cause is a `#!/usr/bin/env …` shebang where `/usr/bin/env`
+doesn't exist on the rootfs. Fix pattern is the same as the `/proc`
+auto-mount in `a2eff5f`: create `/usr/bin/` and symlink `env →
+/bin/busybox` (or wherever the busybox image lives) in the tmpfs
+rootfs at boot. That single fix unblocks 220 + 9 = 229 tests.
+
+#### Second move: lmbench (36 tests)
+
+The binary actually runs — two blockers:
+- `/var/tmp/` doesn't exist; `mkdir` it at boot (same auto-mount pattern).
+- `Simple read: -1` is a timing/IO issue and needs runtime triage
+  before the rest of the suite can be scored. Likely a `read(2)`
+  return-value or `pread`-style edge case.
+
+#### basic-musl 32/32 detail (carries over)
+
+The full 32 basic-musl binaries reach `END test_*` markers within a
+single QEMU run:
+
+`brk`, `chdir`, `clone`, `close`, `dup`, `dup2`, `execve`, `exit`,
+`fork`, `fstat`, `getcwd`, `getdents`, `getpid`, `getppid`,
+`gettimeofday`, `mkdir_`, `mmap`, `mount`, `munmap`, `open`, `openat`,
+`pipe`, `read`, `sleep`, `times`, `umount`, `uname`, `unlink`, `wait`,
+`waitpid`, `write`, `yield`.
+
+(`test_echo` is a fixture invoked by `test_execve`, not counted as a
+separate test. The 101/102 score above is per-assertion across the
+suite, with a single `mmap` assertion still partial.)
+
+#### busybox-musl 52/55 fix manifest (PR #33 / commit `ebe6803`)
 
 | Fix | File | Effect |
 |---|---|---|
@@ -124,20 +170,11 @@ merges. Seven targeted fixes did the work:
 | `/proc/meminfo` wired into procfs `lookup` / `readdir` / `render` | `crates/tx-fs/src/procfs/{mod,read}.rs` | `free(1)` |
 | `mount_procfs_at_proc()` at kernel init | `crates/tx-kernel/src/init.rs` | `free(1)`, `ps(1)`, `df(1)` |
 
-**Remaining 3 busybox-musl failures — none kernel bugs:**
-- `hwclock` — requires `/dev/misc/rtc`; genuinely unsupported hardware.
-- `kill 10` — judge script runs `kill 10` but the sdcard's
-  `busybox_cmd.txt` uses `sh -c 'sleep 5' & ./busybox kill $!` —
-  judge/sdcard version mismatch.
-- `which ls` — `ls` isn't installed as a symlink in
-  `PATH=/musl/glibc:/musl/musl` on the sdcard.
+#### Not yet run
 
-**libc-bench, lmbench, cyclictest, iperf, netperf, libctest, ltp, iozone, lua:**
-not yet run end-to-end against this kernel. Track per-suite passes as
-they land. `libctest` and `libcbench` are the natural next targets
-per the `cc/great-ptolemy-982e05` STATUS note (they currently produce
-no output, suggesting a launcher / image issue rather than syscall
-gaps).
+`cyclictest`, `iperf`, `netperf`, `iozone` — no end-to-end run
+recorded. Network suites (`iperf` / `netperf`) require the absent
+socket stack (see high-stakes table).
 
 ### LTP
 
@@ -289,8 +326,8 @@ overwritten by the next `sync`. The lint variant
 
 ### Counts (from dispatch table)
 
-- `pub const NR_*` in numbers.rs: **119**
-- dispatched in mod.rs: **106** (of which async: 42, likely-stub: 0)
+- `pub const NR_*` in numbers.rs: **120**
+- dispatched in mod.rs: **107** (of which async: 42, likely-stub: 0)
 - defined but not dispatched: **13**
 
 ### Defined in `numbers.rs` but no dispatch arm (13)
@@ -311,7 +348,7 @@ These have a syscall number constant but no match arm in `mod.rs`. Either wire t
 - `NR_SIGALTSTACK` (nr=132)
 - `NR_SIGNALFD` (nr=282)
 
-### Dispatched syscalls (106) — name → handler
+### Dispatched syscalls (107) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -366,6 +403,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 101 | `NR_NANOSLEEP` | `sys_nanosleep` | async |
 | 113 | `NR_CLOCK_GETTIME` | `sys_clock_gettime` | sync |
 | 115 | `NR_CLOCK_NANOSLEEP` | `sys_clock_nanosleep` | async |
+| 116 | `NR_SYSLOG` | `sys_syslog` | sync |
 | 129 | `NR_KILL` | `sys_kill` | sync |
 | 130 | `NR_TKILL` | `sys_tkill` | sync |
 | 131 | `NR_TGKILL` | `sys_tgkill` | sync |

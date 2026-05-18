@@ -1258,6 +1258,54 @@ fn vm_aspace_reserve_user_range_for_access_skips_already_published() {
 }
 
 #[test]
+fn vm_aspace_reserve_user_range_for_access_upgrades_readonly_private_cow_page() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let user_va = 0x26000usize;
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(user_va, 1),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("anon map");
+
+    let read_reserve =
+        aspace.reserve_user_range_for_access(range(user_va, 1), crate::vm::UserAccessKind::Read);
+    assert!(matches!(
+        read_reserve,
+        crate::vm::adapter::step_engine::StepOutcome::Done(())
+    ));
+    assert_eq!(
+        aspace
+            .pmap()
+            .lookup(UserPage(user_va / crate::vm::USER_PAGE_SIZE))
+            .expect("read reserve published page")
+            .prot,
+        Prot::READ
+    );
+
+    let write_reserve =
+        aspace.reserve_user_range_for_access(range(user_va, 1), crate::vm::UserAccessKind::Write);
+    assert!(matches!(
+        write_reserve,
+        crate::vm::adapter::step_engine::StepOutcome::Done(())
+    ));
+    assert_eq!(
+        aspace
+            .pmap()
+            .lookup(UserPage(user_va / crate::vm::USER_PAGE_SIZE))
+            .expect("write reserve upgraded page")
+            .prot,
+        Prot::READ_WRITE
+    );
+}
+
+#[test]
 fn vm_aspace_reserve_user_range_for_access_returns_efault_for_unmapped() {
     setup_host_substrate();
     let aspace = AddressSpace::new();

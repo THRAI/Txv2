@@ -18,8 +18,12 @@ def main():
     serial_file = sys.argv[1]
     testdata_dir = sys.argv[2]
 
-    with open(serial_file, "r", encoding="utf-8", errors="ignore") as f:
-        lines = f.readlines()
+    with open(serial_file, "rb") as f:
+        serial_text = f.read().decode("utf-8", errors="ignore")
+    # QEMU/OpenSBI serial streams can contain NUL bytes and RV64 may emit
+    # CRCRLF after tty ONLCR plus firmware-side newline handling.  Normalize
+    # before feeding strict line-position judges such as basic-musl.
+    lines = serial_text.replace("\0", "").replace("\r", "").splitlines(keepends=True)
 
     judges = {}
     for name in os.listdir(testdata_dir):
