@@ -147,11 +147,17 @@ where
                         let yield_span =
                             emit_yield_begin(drive_span, ctx.task_id_low(), shape_kind);
 
-                        let resume =
+                        let (resume, wait_gen) =
                             resolve_yield(&shape, mailbox, delegate_registry, timer_wheel).await;
 
-                        // L3: resume instant + yield span close.
-                        emit_resume_end(yield_span, &resume);
+                        // L3: resume instant + yield span close. The
+                        // `wait_gen` returned by `resolve_yield` matches
+                        // the `WaitGeneration` minted on the mailbox; the
+                        // producer side's `notify_emit` carried the same
+                        // value in `PayloadWaitSourceNotify`, so the
+                        // daemon's flow-id hash converges and Perfetto
+                        // draws the wake.notify → Resume arrow.
+                        emit_resume_end(yield_span, &resume, wait_gen);
 
                         // D9-A: translate Aborted(Interrupted/Killed) to
                         // the appropriate errno without calling
@@ -339,7 +345,7 @@ fn emit_yield_begin(drive_span: SpanId, task_id_low: u32, shape_kind: u8) -> Spa
 }
 
 #[inline]
-fn emit_resume_end(yield_span: SpanId, resume: &ResumeOutcome) {
+fn emit_resume_end(yield_span: SpanId, resume: &ResumeOutcome, wait_gen: u64) {
     let Some(em) = current_if_active(yield_span) else {
         return;
     };
@@ -349,7 +355,11 @@ fn emit_resume_end(yield_span: SpanId, resume: &ResumeOutcome) {
         abort_reason,
         _pad: [0; 2],
         object_id_low: 0,
-        wait_generation: 0,
+        // `wait_gen` is the `WaitGeneration::raw()` minted by
+        // `resolve_yield`; matches `PayloadWaitSourceNotify.wait_generation_low`
+        // on the producer side so the daemon's flow-id hash matches
+        // both ends.
+        wait_generation: wait_gen,
     };
     let (enc, len) = encode_resume(&payload);
     em.instant(
@@ -424,7 +434,18 @@ fn resume_wire_fields(resume: &ResumeOutcome) -> (u8, u8) {
 }
 
 /// Resolve a yield shape. Returns the [`ResumeOutcome`] to pass to
-/// [`StepOp::apply_resume`].
+/// [`StepOp::apply_resume`] paired with the `WaitGeneration::raw()` the
+/// resolver minted on this task's mailbox (`0` when no parking happened
+/// — e.g. fallback global-registry path on `OnWaitSource` without a
+/// mailbox, or `OnAgent`/`OnTimer` synchronous early returns).
+///
+/// The generation is threaded back so `drive` can populate
+/// `PayloadResume.wait_generation`, matching the value emitted on the
+/// producer side via `WaitSource::notify_emit` →
+/// `PayloadWaitSourceNotify.wait_generation_low`. Identical material on
+/// both sides lets the host daemon hash `(task_id, wait_gen, kind)` to
+/// the same Perfetto flow id, drawing the wake.notify ↔ Resume arrows
+/// the spec's §6 worked example describes.
 ///
 /// When the required runtime is not provided (`None`), falls back
 /// gracefully: `OnWaitSource` uses the global channel registry;
@@ -436,7 +457,7 @@ async fn resolve_yield(
     mailbox: Option<&Arc<TaskMailbox>>,
     delegate_registry: Option<&DelegateRegistry>,
     timer_wheel: Option<&TimerWheel>,
-) -> ResumeOutcome {
+) -> (ResumeOutcome, u64) {
     match shape {
         YieldShape::OnWaitSource { source, interests } => {
             resolve_on_wait_source(*source, *interests, mailbox).await
@@ -453,7 +474,10 @@ async fn resolve_yield(
             deadline,
             cancel,
         } => {
-            resolve_on_agent(
+            // `OnAgent` parks on the delegate registry; no `WaitGeneration`
+            // mints here (the delegate-token-id substitutes for it on the
+            // wire today). Reserved for OBS-9 follow-up.
+            let outcome = resolve_on_agent(
                 endpoint,
                 request,
                 token,
@@ -463,11 +487,15 @@ async fn resolve_yield(
                 delegate_registry,
                 timer_wheel,
             )
-            .await
+            .await;
+            (outcome, 0)
         }
 
         YieldShape::OnTimer { token, deadline } => {
-            resolve_on_timer(*token, *deadline, mailbox, timer_wheel).await
+            // `OnTimer` parks on the timer wheel via a `TimerToken`; the
+            // wheel's token-id is the matching discriminant on the wire.
+            let outcome = resolve_on_timer(*token, *deadline, mailbox, timer_wheel).await;
+            (outcome, 0)
         }
     }
 }
@@ -480,7 +508,7 @@ async fn resolve_on_wait_source(
     source: crate::adapter::step_engine::WaitSourceId,
     interests: crate::adapter::step_engine::InterestMask,
     mailbox: Option<&Arc<TaskMailbox>>,
-) -> ResumeOutcome {
+) -> (ResumeOutcome, u64) {
     if let Some(mbox) = mailbox {
         let gen = mbox.next_generation();
         let active = ActiveWait::new(gen, source, interests);
@@ -500,17 +528,28 @@ async fn resolve_on_wait_source(
             ws.unregister(id);
         }
 
-        // D9-A: signal interrupt during blocked wait.
+        // D9-A: signal interrupt during blocked wait. The generation we
+        // minted is still the right discriminant for the flow id — the
+        // wake came from the interruptible-signal path, which fires
+        // through the same mailbox with the same generation tag.
         if interrupted {
-            return ResumeOutcome::Aborted(AbortReason::Interrupted);
+            return (
+                ResumeOutcome::Aborted(AbortReason::Interrupted),
+                gen.raw(),
+            );
         }
+        (ResumeOutcome::Retry, gen.raw())
     } else {
+        // Fallback path: no per-task mailbox, so no `WaitGeneration` is
+        // minted. The global registry path doesn't have flow-id material
+        // beyond the `WaitToken`; return 0 (the "no-gen" sentinel the
+        // daemon's flow-hash treats as a never-matches placeholder).
         let token = WaitToken::new(source.raw(), interests.raw());
         if let Some(future) = wait_source::wait_on_token(token) {
             future.await;
         }
+        (ResumeOutcome::Retry, 0)
     }
-    ResumeOutcome::Retry
 }
 
 // ---------------------------------------------------------------------------
