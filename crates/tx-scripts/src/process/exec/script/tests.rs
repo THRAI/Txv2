@@ -591,9 +591,16 @@ fn exec_script_resets_brk_base_from_image_plan() {
 }
 
 #[test]
-fn exec_script_invalid_elf_returns_not_executable() {
+fn exec_script_non_elf_non_shebang_falls_back_to_bin_sh() {
     let _setup = setup();
-    // 4 KiB of zeroes — fails ELF magic check immediately.
+    // 4 KiB of zeroes — fails ELF magic check immediately. Pre-2026-05-18
+    // this returned `ExecError::NotExecutable`; the new behaviour matches
+    // every userspace shell's ENOEXEC fallback — kernel-side treat the
+    // file as a `/bin/sh` script. The test fixture has no `/bin/sh`, so
+    // the second exec attempt fails the walker — but with `PathNotFound`,
+    // not `NotExecutable`. The shape of the failure proves the
+    // kernel-side fallback is firing (cf. STATUS.md 2026-05-18 — libctest
+    // unblock).
     let bytes = vec![0u8; 4096];
     let (process, thread, _fs) = bootstrap_with_file(b"bad", &bytes);
 
@@ -607,7 +614,14 @@ fn exec_script_invalid_elf_returns_not_executable() {
         &[],
         &cred,
     ));
-    assert_eq!(result, Err(ExecError::NotExecutable));
+    assert_eq!(
+        result,
+        Err(ExecError::PathNotFound),
+        "kernel-side ENOEXEC fallback should re-exec via /bin/sh; in the \
+         test fixture /bin/sh doesn't exist, so the second-level walker \
+         returns PathNotFound — but NOT NotExecutable, which would mean \
+         the fallback never fired."
+    );
 
     // Pre-PoNR error path must leave the process aspace untouched.
     let aspace_after = process.aspace_cap().expect("alive aspace post-fail");
