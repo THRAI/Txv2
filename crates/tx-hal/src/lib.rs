@@ -949,16 +949,30 @@ pub struct SignalFramePlacement {
 /// Raw bytes of a signal frame (platform-specific layout).
 /// Carried from `prepare_signal_frame` to the caller, who writes
 /// them to the user stack via `AddressSpace::copy_to_user`.
+///
+/// The buffer must be at least as large as the platform-specific
+/// `*SignalFrame` struct (RV64 ~720 bytes including UserTrapContext +
+/// FpContext + trampoline). The previous 512-byte buffer silently
+/// truncated `from_slice`, dropping the trailing fields — most
+/// catastrophically the on-stack `rt_sigreturn` trampoline at
+/// `offset_of!(SignalFrame, trampoline) = 712` — so the handler
+/// returned through `ra = frame_addr + 712` and the CPU fetched
+/// uninitialised stack bytes instead of the trampoline. Bump to
+/// 1024 to cover RV64 and LA64 layouts with comfortable headroom.
 pub struct SignalFrameBytes {
-    pub data: [u8; 512],
+    pub data: [u8; 1024],
     pub len: usize,
 }
 
 impl SignalFrameBytes {
     pub fn from_slice(bytes: &[u8]) -> Self {
-        let len = bytes.len().min(512);
-        let mut data = [0u8; 512];
-        data[..len].copy_from_slice(&bytes[..len]);
+        let len = bytes.len();
+        assert!(
+            len <= 1024,
+            "signal frame layout ({len} bytes) exceeds SignalFrameBytes buffer (1024)",
+        );
+        let mut data = [0u8; 1024];
+        data[..len].copy_from_slice(bytes);
         Self { data, len }
     }
 

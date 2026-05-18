@@ -340,13 +340,38 @@ pub async fn run_thread<P: TxPlatform>(
                     match prepared {
                         Ok((handler_ctx, frame_bytes)) => {
                             let frame_addr = handler_ctx.regs[2];
-                            {
+                            // Check that the full frame (including the
+                            // sigreturn trampoline at its tail) actually
+                            // landed on the user stack. The previous
+                            // `let _ =` ignored every non-Done outcome —
+                            // including `Yield`/short copy — which left
+                            // the trampoline slot uninitialised, so the
+                            // handler returned to garbage / zeros and
+                            // the next instruction fetch faulted
+                            // (observed end-to-end as the basic-musl
+                            // crash with `lPF pc=trampoline_pc`). If the
+                            // copy doesn't complete fully, fall back to
+                            // the default action (terminate by sig) per
+                            // SIGNAL_v1 §15.1 — handler delivery cannot
+                            // proceed without a valid trampoline.
+                            use crate::adapter::step_engine::StepOutcome as V3;
+                            let copy_outcome = {
                                 let guard = crate::adapter::step_engine::guard();
-                                let _ = aspace.copy_to_user(
+                                aspace.copy_to_user(
                                     tx_hal::UserPtr::<u8>::new(frame_addr),
                                     frame_bytes.as_slice(),
                                     &guard,
+                                )
+                            };
+                            let fully_written = match copy_outcome {
+                                V3::Done(n) => n == frame_bytes.as_slice().len(),
+                                _ => false,
+                            };
+                            if !fully_written {
+                                tx_subsystems::process::execution::step_exit_group_with_signal(
+                                    &process, sig,
                                 );
+                                return;
                             }
                             payload.store_saved_user_context(Some(handler_ctx));
                         }
