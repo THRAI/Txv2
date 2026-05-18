@@ -18,9 +18,13 @@ pub fn step_bind(
         Err(errno) => return StepOutcome::Err(errno),
     };
 
+    let Some(payload) = socket.acquire_operational() else {
+        return StepOutcome::Err(Errno::ENOTCONN);
+    };
+
     let table_result = match witness.identity.kind {
         SocketKind::Tcp => SOCKET_TABLE.bind_tcp(witness.local, socket.clone()),
-        SocketKind::Udp => SOCKET_TABLE.bind_udp(witness.local, socket.clone()),
+        SocketKind::Udp => bind_udp_maybe_reuseaddr(socket, witness.local, guard),
         SocketKind::RawIcmp => Ok(()),
     };
     let _requested_addr = witness.addr;
@@ -28,9 +32,6 @@ pub fn step_bind(
         return StepOutcome::Err(table_error_to_errno(error));
     }
 
-    let Some(payload) = socket.acquire_operational() else {
-        return StepOutcome::Err(Errno::ENOTCONN);
-    };
     let bound = payload.with_protocol_mut(|protocol| match protocol {
         SocketProtocol::Tcp(TcpState::Init) => {
             *protocol = SocketProtocol::Tcp(TcpState::Bound {
@@ -55,6 +56,35 @@ pub fn step_bind(
     } else {
         StepOutcome::Err(Errno::EINVAL)
     }
+}
+
+fn bind_udp_maybe_reuseaddr(
+    socket: &Cap<SocketIdentity>,
+    local: crate::net::structure::IpEndpoint,
+    guard: &Guard<'_>,
+) -> Result<(), IndexError> {
+    match SOCKET_TABLE.bind_udp(local, socket.clone()) {
+        Ok(()) => Ok(()),
+        Err(IndexError::Duplicate) if socket_reuse_addr(socket) => {
+            let Some(existing) = SOCKET_TABLE.lookup_udp_bound_exact(local, guard) else {
+                return Err(IndexError::Duplicate);
+            };
+            if !socket_reuse_addr(&existing) {
+                return Err(IndexError::Duplicate);
+            }
+            SOCKET_TABLE
+                .withdraw_udp_bound(local)
+                .map_err(|_| IndexError::Busy)?;
+            SOCKET_TABLE.bind_udp(local, socket.clone())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn socket_reuse_addr(socket: &Cap<SocketIdentity>) -> bool {
+    socket
+        .acquire_operational()
+        .is_some_and(|payload| payload.with_options(|options| options.socket.reuse_addr))
 }
 
 pub(crate) fn table_error_to_errno(error: IndexError) -> Errno {

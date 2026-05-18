@@ -81,7 +81,8 @@ impl PollContext {
         if drain.datagram.dst.port == 0 {
             drain.datagram.dst = connected_remote?;
         }
-        let packet = drain.datagram.emit_ipv4_packet(local)?;
+        let packet_src = select_udp_packet_source(local, drain.datagram.dst, iface);
+        let packet = drain.datagram.emit_ipv4_packet(packet_src)?;
         if !iface.dispatch_ip(packet) {
             return None;
         }
@@ -238,7 +239,8 @@ impl PollContext {
                 continue;
             };
             let payload_len = datagram.payload.len();
-            let Some(target) = SOCKET_TABLE.lookup_udp_bound(datagram.dst, guard) else {
+            let Some(target) = SOCKET_TABLE.lookup_udp_ingress(datagram.src, datagram.dst, guard)
+            else {
                 continue;
             };
             let Some(target_payload) = target.acquire_operational() else {
@@ -458,6 +460,18 @@ fn udp_endpoints(protocol: &SocketProtocol) -> Option<(IpEndpoint, Option<IpEndp
         SocketProtocol::Udp(UdpInner::Bound { local }) => Some((*local, None)),
         SocketProtocol::Udp(UdpInner::Connected { local, remote }) => Some((*local, Some(*remote))),
         _ => None,
+    }
+}
+
+fn select_udp_packet_source(
+    local: IpEndpoint,
+    dst: IpEndpoint,
+    iface: &LoopbackIface,
+) -> IpEndpoint {
+    if local.addr == Ipv4Address::UNSPECIFIED && dst.addr == iface.local_ipv4() {
+        IpEndpoint::new(iface.local_ipv4(), local.port)
+    } else {
+        local
     }
 }
 

@@ -4,9 +4,10 @@ use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
 use crate::net::checks::require::require_socket_connect_target;
 use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::yield_on_token;
+use crate::net::structure::table::SOCKET_TABLE;
 use crate::net::structure::{
-    IpEndpoint, Ipv4Address, KernelSockAddr, SendWireSet, SocketIdentity, SocketProtocol, TcpState,
-    UdpInner,
+    ConnectionKey, IpEndpoint, Ipv4Address, KernelSockAddr, SendWireSet, SocketIdentity,
+    SocketProtocol, TcpState, UdpInner,
 };
 
 pub fn step_connect(
@@ -22,6 +23,12 @@ pub fn step_connect(
         return StepOutcome::Err(Errno::ENOTCONN);
     };
     debug_assert_eq!(witness.identity.raw(), socket.raw());
+
+    if let Err(errno) =
+        update_udp_connection_index(socket, &payload.protocol_snapshot(), witness.remote, guard)
+    {
+        return StepOutcome::Err(errno);
+    }
 
     let mut advanced = false;
     let blocked = payload.with_protocol_mut(|protocol| match protocol {
@@ -85,6 +92,68 @@ pub fn step_connect(
 
 const fn unspecified_endpoint() -> IpEndpoint {
     IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0)
+}
+
+fn update_udp_connection_index(
+    socket: &Cap<SocketIdentity>,
+    protocol: &SocketProtocol,
+    remote: IpEndpoint,
+    guard: &Guard<'_>,
+) -> Result<(), Errno> {
+    let (old_key, new_key) = match protocol {
+        SocketProtocol::Udp(UdpInner::Unbound) => (None, None),
+        SocketProtocol::Udp(UdpInner::Bound { local }) => {
+            (None, udp_connection_key(*local, remote))
+        }
+        SocketProtocol::Udp(UdpInner::Connected {
+            local,
+            remote: old_remote,
+        }) => (
+            udp_connection_key(*local, *old_remote),
+            udp_connection_key(*local, remote),
+        ),
+        _ => return Ok(()),
+    };
+
+    if old_key == new_key {
+        return Ok(());
+    }
+
+    if let Some(key) = new_key {
+        if let Some(existing) = SOCKET_TABLE.lookup_udp_connection(key, guard) {
+            if existing.raw() != socket.raw() {
+                return Err(Errno::EADDRINUSE);
+            }
+        }
+    }
+
+    if let Some(key) = old_key {
+        let _ = SOCKET_TABLE.withdraw_udp_connection(key);
+    }
+
+    if let Some(key) = new_key {
+        SOCKET_TABLE
+            .insert_udp_connection(key, socket.clone())
+            .map_err(udp_table_error_to_errno)?;
+    }
+
+    Ok(())
+}
+
+fn udp_connection_key(local: IpEndpoint, remote: IpEndpoint) -> Option<ConnectionKey> {
+    if local.port == 0 || remote.port == 0 {
+        return None;
+    }
+    Some(ConnectionKey::new(local, remote))
+}
+
+fn udp_table_error_to_errno(error: tx_substrate::index::IndexError) -> Errno {
+    match error {
+        tx_substrate::index::IndexError::Duplicate => Errno::EADDRINUSE,
+        tx_substrate::index::IndexError::Full => Errno::ENOMEM,
+        tx_substrate::index::IndexError::Busy => Errno::EBUSY,
+        tx_substrate::index::IndexError::Missing => Errno::EINVAL,
+    }
 }
 
 fn select_tcp_connect_local(local: IpEndpoint, remote: IpEndpoint) -> IpEndpoint {

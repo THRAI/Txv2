@@ -120,6 +120,7 @@ pub fn step_process_device_tx_pending_at(
     for socket in SOCKET_TABLE
         .snapshot_udp_bound(guard)
         .into_iter()
+        .chain(SOCKET_TABLE.snapshot_udp_connections(guard))
         .filter(is_udp_bound_or_connected)
     {
         if !remember_socket(&mut udp_bound_seen, &socket) {

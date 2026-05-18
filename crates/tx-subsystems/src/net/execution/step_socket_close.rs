@@ -49,8 +49,14 @@ pub fn step_socket_close(
             bindings_withdrawn += withdraw_ok(SOCKET_TABLE.withdraw_tcp_bound(local));
         }
         SocketProtocol::Tcp(TcpState::Init | TcpState::Closed) => {}
-        SocketProtocol::Udp(UdpInner::Bound { local } | UdpInner::Connected { local, .. }) => {
-            bindings_withdrawn += withdraw_ok(SOCKET_TABLE.withdraw_udp_bound(local));
+        SocketProtocol::Udp(UdpInner::Bound { local }) => {
+            bindings_withdrawn += withdraw_udp_bound_if_owner(socket, local, guard);
+        }
+        SocketProtocol::Udp(UdpInner::Connected { local, remote }) => {
+            bindings_withdrawn += withdraw_ok(
+                SOCKET_TABLE.withdraw_udp_connection(ConnectionKey::new(local, remote)),
+            );
+            bindings_withdrawn += withdraw_udp_bound_if_owner(socket, local, guard);
         }
         SocketProtocol::Udp(UdpInner::Unbound | UdpInner::Closed) => {}
         SocketProtocol::RawIcmp(_) => {
@@ -93,4 +99,18 @@ fn mark_tcp_peer_broken(peer: &Cap<SocketIdentity>) {
 
 fn withdraw_ok<T>(result: Result<T, tx_substrate::mutation::MutationError>) -> usize {
     usize::from(result.is_ok())
+}
+
+fn withdraw_udp_bound_if_owner(
+    socket: &Cap<SocketIdentity>,
+    local: crate::net::structure::IpEndpoint,
+    guard: &Guard<'_>,
+) -> usize {
+    let Some(bound) = SOCKET_TABLE.lookup_udp_bound_exact(local, guard) else {
+        return 0;
+    };
+    if bound.raw() != socket.raw() {
+        return 0;
+    }
+    withdraw_ok(SOCKET_TABLE.withdraw_udp_bound(local))
 }
