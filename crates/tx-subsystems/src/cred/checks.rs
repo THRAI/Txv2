@@ -373,6 +373,134 @@ pub fn require_chown<'g>(
     Ok(ChownAuthorized::new())
 }
 
+// ----- authorize_* combinators for the FS family -----
+//
+// Mirror the shape of `authorize_signal_send` for every FS-mutator
+// witness. Each combinator takes its own epoch guard, runs the
+// underlying `require_*` predicate, drops the witness, and returns
+// `Result<(), Errno>`.
+//
+// **Why the second layer.** The `require_*` predicates produce a
+// guard-bound, `must_use` witness — that shape is correct for sites
+// that thread the witness through a composite step (e.g. an op that
+// takes `OpenAuthorized<'g>` as a token). The 7 syscall arms wired
+// in tx-shims today all drop the witness immediately, so they were
+// repeating 5+ lines of guard-scope-and-match boilerplate per site:
+//
+// ```text
+// let guard = step_engine::guard();
+// let _auth = match cred::checks::require_X(snapshot, ..., &guard) {
+//     Ok(w) => w,
+//     Err(e) => return SyscallResult::error_from(e),
+// };
+// ```
+//
+// The combinator collapses that to:
+//
+// ```text
+// if let Err(e) = cred::checks::authorize_X(snapshot, ...) {
+//     return SyscallResult::error_from(e);
+// }
+// ```
+//
+// The guard discipline (must drop before commit; cannot nest with
+// downstream commit-side guards) becomes a property of the
+// combinator rather than a hidden contract at every call site.
+//
+// New cred-checked syscall arms should prefer the `authorize_*`
+// shape; sites that need the typed witness (e.g. to consume it
+// inside a step body that gates on its presence) keep using
+// `require_*` directly.
+
+/// Authorise a path-traversal step against the directory described
+/// by `meta`. Convenience wrapper over [`require_path_search`] —
+/// takes + drops its own guard, discards the witness.
+pub fn authorize_path_search(
+    source: &CredSnapshot,
+    meta: &InodeMeta,
+) -> Result<(), Errno> {
+    let guard = fresh_guard();
+    require_path_search(source, meta, &guard).map(drop)
+}
+
+/// Authorise an `open(2)` against `meta` with the requested
+/// `flags`. Convenience wrapper over [`require_open`].
+pub fn authorize_open(
+    source: &CredSnapshot,
+    meta: &InodeMeta,
+    flags: OpenFileFlags,
+) -> Result<(), Errno> {
+    let guard = fresh_guard();
+    require_open(source, meta, flags, &guard).map(drop)
+}
+
+/// Authorise an `unlink(2)` / `rmdir(2)` against `(parent_meta,
+/// child_meta)`. Convenience wrapper over [`require_unlink`].
+pub fn authorize_unlink(
+    source: &CredSnapshot,
+    parent_meta: &InodeMeta,
+    child_meta: &InodeMeta,
+) -> Result<(), Errno> {
+    let guard = fresh_guard();
+    require_unlink(source, parent_meta, child_meta, &guard).map(drop)
+}
+
+/// Authorise creation of a new name in `new_parent_meta`. Convenience
+/// wrapper over [`require_link`]. Use for `link(2)`, `mkdir(2)`,
+/// `symlink(2)` — all share the W+X-on-new-parent rule.
+pub fn authorize_link(
+    source: &CredSnapshot,
+    new_parent_meta: &InodeMeta,
+) -> Result<(), Errno> {
+    let guard = fresh_guard();
+    require_link(source, new_parent_meta, &guard).map(drop)
+}
+
+/// Authorise a `rename(2)` from `(old_parent, old_child)` to
+/// `new_parent`, optionally displacing `displaced_child`. Convenience
+/// wrapper over [`require_rename`].
+pub fn authorize_rename(
+    source: &CredSnapshot,
+    old_parent_meta: &InodeMeta,
+    old_child_meta: &InodeMeta,
+    new_parent_meta: &InodeMeta,
+    displaced_child: Option<&InodeMeta>,
+) -> Result<(), Errno> {
+    let guard = fresh_guard();
+    require_rename(
+        source,
+        old_parent_meta,
+        old_child_meta,
+        new_parent_meta,
+        displaced_child,
+        &guard,
+    )
+    .map(drop)
+}
+
+/// Authorise a `chmod(2)` against `target_meta`. Convenience wrapper
+/// over [`require_chmod`].
+pub fn authorize_chmod(
+    source: &CredSnapshot,
+    target_meta: &InodeMeta,
+    new_mode: u16,
+) -> Result<(), Errno> {
+    let guard = fresh_guard();
+    require_chmod(source, target_meta, new_mode, &guard).map(drop)
+}
+
+/// Authorise a `chown(2)` against `target_meta` with the requested
+/// uid/gid change. Convenience wrapper over [`require_chown`].
+pub fn authorize_chown(
+    source: &CredSnapshot,
+    target_meta: &InodeMeta,
+    new_uid: Option<u32>,
+    new_gid: Option<u32>,
+) -> Result<(), Errno> {
+    let guard = fresh_guard();
+    require_chown(source, target_meta, new_uid, new_gid, &guard).map(drop)
+}
+
 // Re-export the existing signal-send check so the cred::checks::* surface
 // is the single discovery point for authorization predicates.
 pub use super::{require_signal_send, signal_permitted, SignalAuthorized};

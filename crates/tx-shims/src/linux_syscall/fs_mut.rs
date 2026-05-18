@@ -199,20 +199,17 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     // search-on-ancestors; without this, any user that could
     // search the parent could create a directory there.
     let parent_meta = parent_dentry.rnode().meta();
+    if let Err(e) =
+        tx_subsystems::cred::checks::authorize_link(ctx.cred_snapshot(), &parent_meta)
+    {
+        return SyscallResult::error_from(e);
+    }
     // Apply umask: effective_mode = mode & !umask. Linux semantics
     // (umask is the bottom 9 bits — `rwxrwxrwx`).
     let umask = ctx.process.umask();
     let effective_mode = mode & !umask & 0o7777;
     let outcome = {
         let guard = step_engine::guard();
-        let _auth = match tx_subsystems::cred::checks::require_link(
-            ctx.cred_snapshot(),
-            &parent_meta,
-            &guard,
-        ) {
-            Ok(w) => w,
-            Err(e) => return SyscallResult::error_from(e),
-        };
         fs_ops.mkdir(parent_id, basename, effective_mode, &cred, &guard)
     };
     match outcome {
@@ -285,21 +282,18 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     // POSIX unlink/rmdir permission check (W+X on parent + S_ISVTX
     // ownership rule). The walker only enforced search-on-ancestors
     // — write-on-parent and the sticky-bit rule were unguarded before
-    // this check; routes through cred::checks::require_unlink so the
-    // witness chain is intact at the FsOps mint site.
+    // this check.
     let parent_meta = parent_dentry.rnode().meta();
     let child_meta = target_dentry.rnode().meta();
+    if let Err(e) = tx_subsystems::cred::checks::authorize_unlink(
+        ctx.cred_snapshot(),
+        &parent_meta,
+        &child_meta,
+    ) {
+        return SyscallResult::error_from(e);
+    }
     let outcome = {
         let guard = step_engine::guard();
-        let _auth = match tx_subsystems::cred::checks::require_unlink(
-            ctx.cred_snapshot(),
-            &parent_meta,
-            &child_meta,
-            &guard,
-        ) {
-            Ok(w) => w,
-            Err(e) => return SyscallResult::error_from(e),
-        };
         if want_rmdir {
             fs_ops.rmdir(parent_id, basename, target_id, &guard)
         } else {
@@ -368,16 +362,13 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     // as link / mkdir — sticky not consulted because symlink only
     // creates an entry).
     let parent_meta = parent_dentry.rnode().meta();
+    if let Err(e) =
+        tx_subsystems::cred::checks::authorize_link(ctx.cred_snapshot(), &parent_meta)
+    {
+        return SyscallResult::error_from(e);
+    }
     let outcome = {
         let guard = step_engine::guard();
-        let _auth = match tx_subsystems::cred::checks::require_link(
-            ctx.cred_snapshot(),
-            &parent_meta,
-            &guard,
-        ) {
-            Ok(w) => w,
-            Err(e) => return SyscallResult::error_from(e),
-        };
         fs_ops.symlink(parent_id, basename, &target, &cred, &guard)
     };
     match outcome {
@@ -461,16 +452,13 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     // there. Routes through cred::checks::require_link so the
     // witness chain is intact at the FsOps mint site.
     let new_parent_meta = new_parent_dentry.rnode().meta();
+    if let Err(e) =
+        tx_subsystems::cred::checks::authorize_link(ctx.cred_snapshot(), &new_parent_meta)
+    {
+        return SyscallResult::error_from(e);
+    }
     let outcome = {
         let guard = step_engine::guard();
-        let _auth = match tx_subsystems::cred::checks::require_link(
-            ctx.cred_snapshot(),
-            &new_parent_meta,
-            &guard,
-        ) {
-            Ok(w) => w,
-            Err(e) => return SyscallResult::error_from(e),
-        };
         fs_ops.link(new_parent_id, new_basename, source_id, &guard)
     };
     match outcome {
@@ -1115,21 +1103,17 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let new_parent_meta = new_parent_dentry.rnode().meta();
     let displaced_meta = displaced_dentry.as_ref().map(|d| d.rnode().meta());
 
+    if let Err(e) = tx_subsystems::cred::checks::authorize_rename(
+        ctx.cred_snapshot(),
+        &old_parent_meta,
+        &old_child_meta,
+        &new_parent_meta,
+        displaced_meta.as_ref(),
+    ) {
+        return SyscallResult::error_from(e);
+    }
     let result = {
         let mut script_ctx = build_subject_script_ctx(ctx);
-        let guard = step_engine::guard();
-        let _auth = match tx_subsystems::cred::checks::require_rename(
-            ctx.cred_snapshot(),
-            &old_parent_meta,
-            &old_child_meta,
-            &new_parent_meta,
-            displaced_meta.as_ref(),
-            &guard,
-        ) {
-            Ok(w) => w,
-            Err(e) => return SyscallResult::error_from(e),
-        };
-        drop(guard);
         let mut op = RenameOp {
             rooted_at: &cwd,
             oldpath: &oldpath,
