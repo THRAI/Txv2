@@ -205,6 +205,30 @@ pub fn require_path_search<'g>(
     Ok(SearchAuthorized::new())
 }
 
+/// Walker-cred variant of [`require_path_search`].
+///
+/// Identical rule, but accepts the walker-side
+/// [`Credential`](crate::vfs::structure::Credential) projection
+/// directly rather than projecting from a [`CredSnapshot`]. Used by
+/// [`crate::vfs::walker`] and other VFS-layer callers that already
+/// own a `Credential` (the syscall arm's `walker_cred()`) and would
+/// otherwise call `vfs::predicates::check_descend_perm` directly,
+/// bypassing the witness chain.
+///
+/// All new tx-shims code paths should prefer the
+/// `&CredSnapshot`-shaped [`require_path_search`]. The walker-cred
+/// variant exists to keep the witness chain intact at FS-internal
+/// mint sites without churning the walker's `&Credential` plumbing.
+pub fn require_path_search_with_walker_cred<'g>(
+    walker_cred: &Credential,
+    meta: &InodeMeta,
+    guard: &'g Guard<'_>,
+) -> Result<SearchAuthorized<'g>, Errno> {
+    let _ = guard;
+    crate::vfs::predicates::check_descend_perm(meta, walker_cred)?;
+    Ok(SearchAuthorized::new())
+}
+
 /// May the caller carrying `source` open the inode described by
 /// `meta` with the requested `flags`?
 ///
@@ -224,6 +248,19 @@ pub fn require_open<'g>(
     let _ = guard;
     let projection = Credential::from(source);
     crate::vfs::predicates::check_open_perm(meta, flags, &projection)?;
+    Ok(OpenAuthorized::new())
+}
+
+/// Walker-cred variant of [`require_open`]. See
+/// [`require_path_search_with_walker_cred`] for the role rationale.
+pub fn require_open_with_walker_cred<'g>(
+    walker_cred: &Credential,
+    meta: &InodeMeta,
+    flags: OpenFileFlags,
+    guard: &'g Guard<'_>,
+) -> Result<OpenAuthorized<'g>, Errno> {
+    let _ = guard;
+    crate::vfs::predicates::check_open_perm(meta, flags, walker_cred)?;
     Ok(OpenAuthorized::new())
 }
 

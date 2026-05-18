@@ -1432,6 +1432,53 @@ fn authorize_path_search_and_open_agree_with_require() {
 }
 
 #[test]
+fn walker_cred_variants_agree_with_snapshot_variants() {
+    // The _with_walker_cred overloads must produce the same verdict
+    // as their snapshot-shaped siblings when the walker projection
+    // is derived from the same Cred. Pins the equivalence so the
+    // walker mint sites and the syscall-arm gate stay in lockstep.
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::{
+        require_open, require_open_with_walker_cred, require_path_search,
+        require_path_search_with_walker_cred,
+    };
+    use crate::vfs::structure::{Credential as WalkerCred, InodeMeta, OpenFileFlags};
+
+    let _g = setup();
+    let cred = Cred {
+        uid: Uid(2000),
+        euid: Uid(2000),
+        suid: Uid(2000),
+        gid: Gid(2000),
+        egid: Gid(2000),
+        sgid: Gid(2000),
+        effective_caps: CapabilitySet::EMPTY,
+        permitted_caps: CapabilitySet::EMPTY,
+    };
+    let snap = CredSnapshot::from_cred(cred);
+    let walker_cred = WalkerCred::from(&snap);
+
+    let dir = fresh_dir_meta(0o755, 1000, 1000);
+    let g = guard();
+    assert_eq!(
+        require_path_search(&snap, &dir, &g).is_ok(),
+        require_path_search_with_walker_cred(&walker_cred, &dir, &g).is_ok(),
+    );
+
+    let mut file = InodeMeta::new(crate::vfs::structure::InodeKind::Regular, 0o400);
+    file.uid = 1000;
+    file.gid = 1000;
+    let flags = OpenFileFlags {
+        read: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        require_open(&snap, &file, flags, &g).is_ok(),
+        require_open_with_walker_cred(&walker_cred, &file, flags, &g).is_ok(),
+    );
+}
+
+#[test]
 fn step_apply_suid_for_exec_at_secure_false_when_no_change() {
     let _g = setup();
     let proc_cap = bootstrap();
