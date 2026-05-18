@@ -1,8 +1,16 @@
-//! OBS-7: `observe-discipline` lint — enforces anti-pattern OBS-A-1.
+//! OBS-7: `observe-discipline` lint — enforces anti-patterns OBS-A-1
+//! and OBS-A-2.
 //!
 //! Scans every `.rs` file in `crates/` and `boards/` (excluding the
 //! observation crates themselves, the trace daemon, and `xtask`) and
-//! fails if any `StepOp::step` body directly calls `tx_observe::*` APIs.
+//! fails if:
+//!
+//! - **OBS-A-1**: any `StepOp::step` body directly calls
+//!   `tx_observe::*` APIs (move the emit to the `drive` wrapper or use
+//!   `RawTrace<P>` from BUS_v1).
+//! - **OBS-A-2**: any module marked `#[platform_adapter(...)]` contains
+//!   a `tx_observe::*` emit (adapter verbs must delegate; substrate
+//!   verbs emit — `OBS-V1-HOOK-SCOPE` in `08_OBSERVATION_v1.md` §6).
 //!
 //! ## Scanning approach
 //!
@@ -82,6 +90,7 @@ pub(crate) fn observe_discipline(root: &Path) -> Result<()> {
 
     let mut files_scanned = 0usize;
     let mut step_op_impls = 0usize;
+    let mut adapter_blocks = 0usize;
     let mut violations: Vec<String> = Vec::new();
 
     for path in &files {
@@ -106,12 +115,20 @@ pub(crate) fn observe_discipline(root: &Path) -> Result<()> {
         };
 
         files_scanned += 1;
-        scan_file(&rel, path, &text, &mut step_op_impls, &mut violations);
+        scan_file(
+            &rel,
+            path,
+            &text,
+            &mut step_op_impls,
+            &mut adapter_blocks,
+            &mut violations,
+        );
     }
 
     if violations.is_empty() {
         println!(
-            "observe-discipline: clean ({files_scanned} files scanned, {step_op_impls} StepOp impls)"
+            "observe-discipline: clean ({files_scanned} files scanned, \
+             {step_op_impls} StepOp impls, {adapter_blocks} adapter blocks)"
         );
         Ok(())
     } else {
@@ -143,6 +160,7 @@ fn scan_file(
     _path: &Path,
     text: &str,
     step_op_impls: &mut usize,
+    adapter_blocks: &mut usize,
     violations: &mut Vec<String>,
 ) {
     let mut brace_depth: i32 = 0;
@@ -150,6 +168,11 @@ fn scan_file(
     let mut step_depth: Option<i32> = None; // depth after `fn step(` opens
     let mut awaiting_impl_brace = false;
     let mut awaiting_step_brace = false;
+    // OBS-A-2: `#[platform_adapter(...)]` mod scope. Track the brace
+    // depth at which the adapter module's `{` opened. Any emit pattern
+    // appearing between that brace and its matching close is flagged.
+    let mut adapter_depth: Option<i32> = None;
+    let mut awaiting_adapter_brace = false;
 
     for (idx, line) in text.lines().enumerate() {
         let line_no = idx + 1;
@@ -179,6 +202,20 @@ fn scan_file(
             awaiting_step_brace = true;
         }
 
+        // OBS-A-2: `#[platform_adapter(...)]` mod body. The attribute can
+        // sit on its own line and the `mod NAME {` opener follows up to a
+        // few lines later (the attribute supports multi-line `(platform
+        // = "…", domain = "…", reason = "…")` argument lists). We set the
+        // pending flag as soon as we see the attribute and clear it when
+        // the next `{` opens at any depth.
+        if adapter_depth.is_none()
+            && !awaiting_adapter_brace
+            && is_platform_adapter_header(stripped)
+        {
+            awaiting_adapter_brace = true;
+            *adapter_blocks += 1;
+        }
+
         // ── Brace scanning ───────────────────────────────────────────────────
 
         // Walk every character for brace depth updates and transition triggers.
@@ -194,6 +231,9 @@ fn scan_file(
                     } else if awaiting_step_brace {
                         awaiting_step_brace = false;
                         step_depth = Some(brace_depth);
+                    } else if awaiting_adapter_brace {
+                        awaiting_adapter_brace = false;
+                        adapter_depth = Some(brace_depth);
                     }
                 }
                 b'}' => {
@@ -213,6 +253,13 @@ fn scan_file(
                             awaiting_impl_brace = false;
                         }
                     }
+                    // Close adapter mod block.
+                    if let Some(ad) = adapter_depth {
+                        if brace_depth == ad {
+                            adapter_depth = None;
+                            awaiting_adapter_brace = false;
+                        }
+                    }
                     brace_depth -= 1;
                 }
                 _ => {}
@@ -220,12 +267,27 @@ fn scan_file(
             i += 1;
         }
 
-        // ── Pattern checking (inside step body only) ─────────────────────────
+        // ── Pattern checking ─────────────────────────────────────────────────
 
-        if step_depth.is_none() {
+        if has_allow {
             continue;
         }
-        if has_allow {
+        // Inside an adapter mod: OBS-A-2.
+        if adapter_depth.is_some() {
+            for pattern in FORBIDDEN {
+                if stripped.contains(pattern) {
+                    violations.push(format!(
+                        "{display}:{line_no}: OBS-A-2 violation — `{pattern}` inside #[platform_adapter] module (adapters delegate; substrate emits — `08_OBSERVATION_v1.md` §6 OBS-V1-HOOK-SCOPE)"
+                    ));
+                    break;
+                }
+            }
+            // An adapter mod is by definition not also a step body; skip
+            // the OBS-A-1 path below.
+            continue;
+        }
+        // Inside a StepOp::step body: OBS-A-1.
+        if step_depth.is_none() {
             continue;
         }
         for pattern in FORBIDDEN {
@@ -286,6 +348,16 @@ fn is_fn_step_header(line: &str) -> bool {
     line.contains("fn step(")
 }
 
+/// Returns true if `line` (stripped of comment) opens a
+/// `#[platform_adapter(...)]` attribute. The macro accepts both
+/// single-line and multi-line argument forms, but it always begins with
+/// `#[platform_adapter(` — the substring is sufficient to start
+/// tracking; the brace scanner advances state to the next `{` regardless
+/// of how many lines the attribute spans.
+fn is_platform_adapter_header(line: &str) -> bool {
+    line.contains("#[platform_adapter(")
+}
+
 /// Strip the `//`-introduced line comment from `line`, returning only the
 /// code portion. Block comments are not stripped (they are uncommon in
 /// this codebase and the patterns being searched are unlikely to appear
@@ -311,12 +383,14 @@ mod tests {
 
     fn run_scan(source: &str) -> (usize, Vec<String>) {
         let mut impls = 0;
+        let mut adapters = 0;
         let mut violations = Vec::new();
         scan_file(
             "test.rs",
             std::path::Path::new("test.rs"),
             source,
             &mut impls,
+            &mut adapters,
             &mut violations,
         );
         (impls, violations)
@@ -499,6 +573,132 @@ impl<I: SubjectIdentity> StepOp<I> for GenericOp {
         assert!(
             violations.iter().any(|v| v.contains("tx_observe::current")),
             "generic impl StepOp violation must be detected: {violations:?}"
+        );
+    }
+
+    // ── OBS-A-2 (no emit inside #[platform_adapter] modules) ──────────
+
+    fn run_scan_with_adapters(source: &str) -> (usize, usize, Vec<String>) {
+        let mut impls = 0;
+        let mut adapters = 0;
+        let mut violations = Vec::new();
+        scan_file(
+            "test.rs",
+            std::path::Path::new("test.rs"),
+            source,
+            &mut impls,
+            &mut adapters,
+            &mut violations,
+        );
+        (impls, adapters, violations)
+    }
+
+    /// Adapter mod with a forbidden emit is flagged as OBS-A-2.
+    #[test]
+    fn violation_emit_inside_platform_adapter() {
+        let source = r#"
+#[platform_adapter(platform = "substrate", domain = "step_engine", reason = "expose step types")]
+pub mod step_engine {
+    pub fn helper() {
+        if let Some(em) = tx_observe::current::<Plat>() {
+            em.span_begin(TxTraceLevel::Drive, name, SpanId::NONE, TxPayloadTag::None, &[]);
+        }
+    }
+}
+"#;
+        let (_impls, adapters, violations) = run_scan_with_adapters(source);
+        assert_eq!(adapters, 1);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("OBS-A-2") && v.contains("tx_observe::current")),
+            "expected OBS-A-2 violation for tx_observe::current, got {violations:?}"
+        );
+    }
+
+    /// `.span_begin(` inside an adapter mod also trips OBS-A-2.
+    #[test]
+    fn violation_span_begin_inside_platform_adapter() {
+        let source = r#"
+#[platform_adapter(platform = "reactor", domain = "wait", reason = "wait verbs")]
+pub mod wait {
+    fn inside(em: &HartEmitter) {
+        em.span_begin(TxTraceLevel::Yield, name, SpanId::NONE, TxPayloadTag::None, &[]);
+    }
+}
+"#;
+        let (_impls, _adapters, violations) = run_scan_with_adapters(source);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("OBS-A-2") && v.contains(".span_begin(")),
+            "expected OBS-A-2 violation for .span_begin(, got {violations:?}"
+        );
+    }
+
+    /// Multi-line `#[platform_adapter(...)]` attribute still tracked: the
+    /// scanner sets the pending flag when it sees `#[platform_adapter(`
+    /// and clears it on the next `{`, regardless of where the closing
+    /// `)]` lands.
+    #[test]
+    fn detects_multi_line_platform_adapter_header() {
+        let source = r#"
+#[platform_adapter(
+    platform = "substrate",
+    domain = "vfs",
+    reason = "expose vfs verbs",
+)]
+pub mod vfs {
+    fn bad() {
+        em.instant(TxTraceLevel::Yield, name, SpanId::NONE, tag, &[]);
+    }
+}
+"#;
+        let (_impls, adapters, violations) = run_scan_with_adapters(source);
+        assert_eq!(adapters, 1);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("OBS-A-2") && v.contains(".instant(")),
+            "multi-line platform_adapter header must still gate OBS-A-2, got {violations:?}"
+        );
+    }
+
+    /// Adapter mods that don't emit are clean. Adapter mods *can* call
+    /// substrate verbs that themselves emit — but the adapter file
+    /// itself must not contain the forbidden patterns.
+    #[test]
+    fn clean_adapter_mod_with_only_reexports() {
+        let source = r#"
+#[platform_adapter(platform = "substrate", domain = "step_engine", reason = "re-exports")]
+pub mod step_engine {
+    pub use tx_substrate::step::{StepOp, StepOutcome};
+    pub use tx_substrate::epoch::guard;
+}
+"#;
+        let (_impls, adapters, violations) = run_scan_with_adapters(source);
+        assert_eq!(adapters, 1);
+        assert!(
+            violations.is_empty(),
+            "clean adapter mod must not be flagged: {violations:?}"
+        );
+    }
+
+    /// Allow annotation also suppresses OBS-A-2 (parallel to OBS-A-1).
+    #[test]
+    fn allow_annotation_suppresses_obs_a_2() {
+        let source = r#"
+#[platform_adapter(platform = "substrate", domain = "x", reason = "r")]
+pub mod x {
+    fn experimental() {
+        em.instant(level, name, span, tag, &[]); // observe-discipline: allow temporary scaffold for OBS-9 prototyping
+    }
+}
+"#;
+        let (_impls, _adapters, violations) = run_scan_with_adapters(source);
+        assert!(
+            violations.is_empty(),
+            "allow annotation must suppress OBS-A-2, got {violations:?}"
         );
     }
 }
