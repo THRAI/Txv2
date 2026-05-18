@@ -236,6 +236,7 @@ fn decode_payload(tag: u16, bytes: &[u8]) -> Result<Option<serde_json::Value>, (
         t if t == TxPayloadTag::MutationIndexCommit as u16 => TxPayloadTag::MutationIndexCommit,
         t if t == TxPayloadTag::PhaseTransition as u16 => TxPayloadTag::PhaseTransition,
         t if t == TxPayloadTag::SchedSwitch as u16 => TxPayloadTag::SchedSwitch,
+        t if t == TxPayloadTag::ProcessLabel as u16 => TxPayloadTag::ProcessLabel,
         t if t == TxPayloadTag::Panic as u16 => TxPayloadTag::Panic,
         // Unknown tag with valid payload_len: skip payload bytes but keep record.
         _ => return Ok(None),
@@ -279,6 +280,8 @@ fn read_payload(tag: TxPayloadTag, bytes: &[u8]) -> Result<serde_json::Value, ()
         TxPayloadTag::PhaseTransition => read_as!(PayloadPhaseTransition),
         // OBS-9: L7 Sched switch payload (reactor scheduler track).
         TxPayloadTag::SchedSwitch => read_as!(PayloadSchedSwitch),
+        // OBS-9 §15.7: one-shot PCB `comm` mapping.
+        TxPayloadTag::ProcessLabel => read_as!(PayloadProcessLabel),
         TxPayloadTag::Panic => read_as!(PayloadPanic),
         TxPayloadTag::None => Ok(serde_json::Value::Null),
     }

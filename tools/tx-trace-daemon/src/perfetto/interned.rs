@@ -55,6 +55,23 @@ impl InternTable {
         self.map.get(&name_id).map(|(iid, _)| *iid)
     }
 
+    /// Resolve `name_id` to its registered name string, consulting the
+    /// in-memory intern map first and then the external `names.json`
+    /// table. Returns `None` when the id has neither been interned
+    /// yet nor pre-registered — callers should fall back to the
+    /// `name_0x<hex>` synthetic form.
+    ///
+    /// Used by the writer when it needs a *readable* base name to
+    /// compose a formatted label (e.g. `a0=0x1234`) without mutating
+    /// the intern table — the actual interning of the composite label
+    /// happens separately via [`Self::intern_str`].
+    pub fn get_resolved_name(&self, name_id: u32) -> Option<String> {
+        if let Some((_, name)) = self.map.get(&name_id) {
+            return Some(name.clone());
+        }
+        self.external.get(&name_id).cloned()
+    }
+
     /// Intern an ASCII literal string (e.g. `"value"`) by hashing it with
     /// FNV-1a 32, the same scheme the kernel uses for stable
     /// `EventNameId`s. Returns `(iid, Some(name))` on first call and
