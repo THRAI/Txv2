@@ -1,3 +1,83 @@
+- 2026-05-18 **cred hygiene pass — three follow-ups complete: lint
+  alias support, per-FS rule consolidation, and VFS walker witness
+  adoption. The cred subsystem is now the single canonical
+  authorisation seam — every DAC check site in the kernel routes
+  through `cred::checks::*`.**
+
+  Three small commits, each independently verified by `xtask unit` +
+  `lint invariants cred-check` + (where relevant) `progress validate`:
+
+  **Pass 3 — `cred::checks` aliasing** (`6864ded`)
+  Adds `use tx_subsystems::cred::checks as cred_checks;` to
+  `linux_syscall/fs_mut.rs` and `fs_path.rs`; the 7 FS cred-check
+  sites collapse from 36-char path prefix to 12. The lint's
+  `CRED_CHECK_SIGNALS` list now matches `cred_checks::require_` /
+  `cred_checks::authorize_` in addition to the fully-qualified and
+  partially-qualified forms. The alias name `cred_checks` is
+  canonical — other aliases would silently bypass the gate, with a
+  rationale comment at each use site and in the lint source.
+
+  **Pass 1 — per-FS chmod/chown rule consolidation** (`f2b9dde`)
+  The DAC rule for chmod/chown previously lived in three places:
+  `cred::checks::require_chmod` / `require_chown`,
+  `vfs::predicates::check_chmod_perm` / `check_chown_perm`, and
+  inline duplicates in `tmpfs::step_chmod` / `step_chown`. (The
+  read-only backends — `devfs`, `bdevfs`, `procfs` — all return
+  EROFS unconditionally and have no rule to consolidate.) The tmpfs
+  inline rule now delegates to `vfs::predicates::check_chmod_perm` /
+  `check_chown_perm`; same behaviour, single source of truth.
+  Defense-in-depth role preserved: if a future caller bypasses the
+  `sys_fchmodat` / `sys_fchownat` arm and reaches
+  `tmpfs::step_chmod` / `step_chown` directly, the check still
+  fires.
+
+  **Pass 2 — VFS walker mints witnesses** (`2f12b06`)
+  Adds `require_path_search_with_walker_cred(&Credential, …, &Guard)`
+  and `require_open_with_walker_cred(&Credential, …, &Guard)`
+  variants to `cred::checks` so the walker's `&Credential` (walker
+  projection) flows into the witness surface without changing the
+  walker's signature. `vfs/walker.rs::step_open` and
+  `vfs/resolution/step.rs` (per-component descend) replace their
+  direct `predicates::check_*` calls with the new variants. The
+  witness is currently dropped — the publication sites
+  (`OpenFile::new_cap_with_dentry`, etc.) don't yet consume an
+  `OpenAuthorized<'g>` token at the type level; future work threads
+  it through. But after this commit, every DAC check in the kernel
+  flows through `cred::checks::*` — `vfs::predicates::check_*` have
+  no callers outside `cred::checks` itself and the defense-in-depth
+  tmpfs layer.
+
+  **Final state of the canonical authorisation seam:**
+
+  | Site | Route |
+  |---|---|
+  | `sys_kill` / `sys_tkill` family | `signal::script_*` → `cred::require_signal_send` |
+  | `sys_unlinkat` / `sys_linkat` / `sys_mkdirat` / `sys_symlinkat` / `sys_renameat2` | `cred_checks::authorize_*` |
+  | `sys_fchmodat` / `sys_fchownat` | `cred_checks::authorize_*` (+ tmpfs defense-in-depth via `vfs::predicates::*`) |
+  | VFS walker (search) | `cred::checks::require_path_search_with_walker_cred` |
+  | VFS walker (`step_open`) | `cred::checks::require_open_with_walker_cred` |
+
+  **Verification:** `cargo -q xtask unit` — tx-shims 233, tx-kernel
+  44, tx-ext4 8, tx-scripts 50 (335 total). `cargo test
+  -p tx-subsystems --lib` — **686** (+1 walker-variant agreement
+  test). `cargo xtask lint invariants cred-check` — 9 audited, 3
+  allow-listed, 0 violations.
+
+  Commits:
+  - `6864ded` cred: alias cred::checks → cred_checks at tx-shims call sites
+  - `f2b9dde` tmpfs: consolidate step_chmod / step_chown rule into vfs::predicates
+  - `2f12b06` cred: walker mints SearchAuthorized / OpenAuthorized via require_*_with_walker_cred
+
+  **Open follow-up:** `OpenFile::new_cap_with_dentry` (and similar
+  publication sites) could consume an `OpenAuthorized<'g>` token as
+  a type-level witness of "the cred check ran before publication".
+  Not a security gap; purely an architectural alignment item per
+  `cred_service_v_1` §"Minting rule" (cred authorises; subsystems
+  publish). Today the witness is minted at the walker and dropped;
+  threading it to the publication site adds a type-system anchor
+  but no behavioural change. Defer until the next cred-touched
+  feature has a natural reason to lift it.
+
 - 2026-05-18 **cred hygiene: extend `authorize_*` combinator family to
   the FS surface. Seven syscall arms collapse from 5–7 line guard-
   scope-and-match blocks to uniform 3-line `if let Err(e) =
