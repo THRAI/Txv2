@@ -1521,7 +1521,8 @@ async fn sys_write_socket(
                 }
 
                 match shape {
-                    tx_substrate::step::YieldShape::OnWaitSource { source, interests } => {
+                    tx_substrate::step::YieldShape::OnWaitSource { source, interests }
+                    | tx_substrate::step::YieldShape::OnEdge { source, interests } => {
                         let token =
                             tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
                         if let Some(future) = wait_source::wait_on_token(token) {
@@ -2344,7 +2345,8 @@ async fn sys_read_socket<'a>(
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 match shape {
-                    tx_substrate::step::YieldShape::OnWaitSource { source, interests } => {
+                    tx_substrate::step::YieldShape::OnWaitSource { source, interests }
+                    | tx_substrate::step::YieldShape::OnEdge { source, interests } => {
                         let token =
                             tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
                         if let Some(future) = wait_source::wait_on_token(token) {

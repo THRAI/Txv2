@@ -4,10 +4,10 @@
 use super::*;
 
 use crate::linux_syscall::{
-    AF_INET, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_UDP, NR_BIND, NR_CLOSE, NR_CONNECT, NR_FCNTL,
-    NR_GETSOCKNAME, NR_GETSOCKOPT, NR_LISTEN, NR_PPOLL, NR_RECVFROM, NR_RECVMSG, NR_SENDMSG,
-    NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET, O_CLOEXEC, O_NONBLOCK, O_RDWR, SOL_SOCKET, SO_ERROR,
-    SO_RCVTIMEO, SO_REUSEADDR, SO_TYPE,
+    AF_INET, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_UDP, IP_RECVERR, NR_BIND,
+    NR_CLOSE, NR_CONNECT, NR_FCNTL, NR_GETSOCKNAME, NR_GETSOCKOPT, NR_LISTEN, NR_PPOLL,
+    NR_RECVFROM, NR_RECVMSG, NR_SENDMSG, NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET, O_CLOEXEC,
+    O_NONBLOCK, O_RDWR, SOL_SOCKET, SO_DONTROUTE, SO_ERROR, SO_RCVTIMEO, SO_REUSEADDR, SO_TYPE,
 };
 use alloc::vec;
 use tx_subsystems::net::execution::{step_process_loopback_pending, LoopbackPollBudget};
@@ -252,6 +252,94 @@ fn dispatch_setsockopt_getsockopt_round_trips_reuseaddr() {
                 fd as u64,
                 SOL_SOCKET as u64,
                 SO_REUSEADDR as u64,
+                (&mut out as *mut i32) as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out, 1);
+    assert_eq!(out_len, core::mem::size_of::<i32>() as u32);
+}
+
+#[test]
+fn dispatch_setsockopt_getsockopt_round_trips_dontroute() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_dgram(&ctx, SOCK_DGRAM);
+
+    let one: i32 = 1;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_DONTROUTE as u64,
+                (&one as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out: i32 = 0;
+    let mut out_len: u32 = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_DONTROUTE as u64,
+                (&mut out as *mut i32) as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out, 1);
+    assert_eq!(out_len, core::mem::size_of::<i32>() as u32);
+}
+
+#[test]
+fn dispatch_setsockopt_getsockopt_round_trips_ip_recverr() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_dgram(&ctx, SOCK_DGRAM);
+
+    let one: i32 = 1;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IP_RECVERR as u64,
+                (&one as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out: i32 = 0;
+    let mut out_len: u32 = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IP_RECVERR as u64,
                 (&mut out as *mut i32) as u64,
                 (&mut out_len as *mut u32) as u64,
                 0,

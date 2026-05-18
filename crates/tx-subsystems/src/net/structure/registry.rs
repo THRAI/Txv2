@@ -1,5 +1,5 @@
 use tx_substrate::zone::{self, Cap, PayloadCap};
-use tx_substrate::zone::{register_zone_for, Zone, ZoneAllocated, ZoneError};
+use tx_substrate::zone::{register_zone_for, PayloadPolicy, Zone, ZoneAllocated, ZoneError};
 
 use super::identity::SocketIdentity;
 use super::payload::{SocketPayload, SocketProtocol};
@@ -19,6 +19,8 @@ unsafe impl ZoneAllocated for SocketIdentity {
 // SAFETY: `SOCKET_PAYLOAD_ZONE` is the single process-wide zone for
 // `SocketPayload`; operational evidence is retained through this zone.
 unsafe impl ZoneAllocated for SocketPayload {
+    type Policy = PayloadPolicy<Self>;
+
     fn zone() -> &'static Zone<Self> {
         &SOCKET_PAYLOAD_ZONE
     }

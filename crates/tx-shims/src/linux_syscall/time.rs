@@ -11,6 +11,8 @@ use tx_subsystems::process::ProcessIdentity;
 use core::mem::{offset_of, size_of};
 
 use tx_hal::{UserSaFlagsAbi, UserSigInfoAbi, UserSignalMaskAbi, UserTrapContext};
+use tx_subsystems::signal::step_kill_process;
+use tx_subsystems::thread_runtime::ThreadIdentity;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -601,6 +603,13 @@ pub(super) async fn sleep_until_deadline<'a, P: TimeIf>(
     SyscallResult::Return(0)
 }
 
+pub(super) fn itimer_real_deadline_ns(pid: u32) -> Option<u64> {
+    with_interval_timers(|timers| {
+        timers
+            .get(&(pid, ITIMER_REAL))
+            .and_then(|timer| (timer.deadline_ns != 0).then_some(timer.deadline_ns))
+    })
+}
 pub fn maybe_deliver_itimer_signal<P: TimeIf>(
     mut ctx: UserTrapContext,
     process: &Cap<ProcessIdentity>,
@@ -631,7 +640,7 @@ pub fn maybe_deliver_itimer_signal<P: TimeIf>(
         return ctx;
     };
     let Some(SigDisposition::Handler(handler)) = process.sig_disposition(sig) else {
-        let _ = step_kill_process(process, sig);
+        let _ = step_kill_process(process, sig, None);
         return ctx;
     };
     let Some(thread_payload) = thread.payload_cap() else {
