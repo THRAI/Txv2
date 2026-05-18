@@ -636,7 +636,10 @@ mod tests {
         assert_eq!(recipes.len(), 1);
         let stack = &recipes[0];
         assert_eq!(stack.flags, VmEntryFlags::PRIVATE);
-        assert_eq!(stack.prot, Prot::READ_WRITE);
+        // RWX because the signal-trampoline lives on the user stack
+        // until vDSO mapping lands; see the long comment in
+        // `build_aspace_from_image`.
+        assert_eq!(stack.prot, Prot::new(true, true, true));
         assert!(matches!(stack.backing, VmBacking::PrivateAnon));
         assert_eq!(
             stack.range.start().as_usize() as u64,

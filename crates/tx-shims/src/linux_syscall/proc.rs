@@ -331,7 +331,12 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     // Seed the child's leader trap context with the parent's GPRs
     // (a0 := 0, tp := tls when CLONE_SETTLS, sp := stack when non-zero,
     // pc := pc + 4). Infallible.
-    seed_child_leader_context(&child_thread, &parent_user_ctx, tls as usize, stack as usize);
+    seed_child_leader_context(
+        &child_thread,
+        &parent_user_ctx,
+        tls as usize,
+        stack as usize,
+    );
 
     // Hand the child's leader thread to the reactor. Panics with
     // `:clone:no-reactor-seam` if the boot path didn't install the
