@@ -78,7 +78,13 @@ impl TrackRegistry {
             parent_uuid: Some(self.harts_process_uuid),
             name: Some(name.clone()),
             thread: Some(ThreadDescriptor {
-                pid: Some(1), // synthetic pid for the "kernel harts" process
+                // Use a synthetic pid OUTSIDE the kernel's real
+                // 32-bit Pid range so Perfetto doesn't merge the
+                // hart container with init (pid=1) or any other
+                // user process. `0x7FFF_FFFE` is comfortably
+                // distant from any production pid we'd ever
+                // emit and stays inside `i32::MAX`.
+                pid: Some(0x7FFF_FFFE),
                 tid: Some(hart as i32),
                 thread_name: Some(name),
             }),
@@ -128,6 +134,56 @@ impl TrackRegistry {
     #[cfg(test)]
     pub fn hart_uuid(&self, hart: u16) -> Option<u64> {
         self.map.get(&TrackKey::Hart(hart)).map(|e| e.uuid)
+    }
+
+    /// Re-parent an existing process track under a (possibly
+    /// freshly-created) pgrp swimlane. Returns `(maybe_pgrp_desc,
+    /// maybe_process_desc)` — the caller emits whichever
+    /// descriptors are `Some` so Perfetto picks up the updated
+    /// hierarchy.
+    ///
+    /// Used by the writer when a `PayloadProcessGroup` record
+    /// arrives AFTER the process track was already materialised by
+    /// an earlier slice — the pgrp parent uuid couldn't be set at
+    /// creation time. Without this retroactive fix the per-process
+    /// track would remain top-level (Perfetto's "System" fallback)
+    /// even though the kernel knows the right pgrp.
+    pub fn reparent_process_track(
+        &mut self,
+        pid: u32,
+        pgid: u32,
+        sid: u32,
+    ) -> (Option<TrackDescriptor>, Option<TrackDescriptor>) {
+        // Allocate the pgrp swimlane first (may already exist).
+        let pgrp_desc = self.ensure_pgrp_track(pgid, sid);
+        let pgrp_uuid = self
+            .map
+            .get(&TrackKey::KernelTrackId(pgrp_track_id(pgid)))
+            .map(|e| e.uuid)
+            .unwrap_or(0);
+        // Update the process track's parent_uuid in-place.
+        let process_key = TrackKey::KernelTrackId(0xF000_0000_0000_0000u64 | pid as u64);
+        let Some(entry) = self.map.get_mut(&process_key) else {
+            return (pgrp_desc, None);
+        };
+        if entry.parent_uuid == pgrp_uuid {
+            // Already nested correctly; skip the re-emit.
+            return (pgrp_desc, None);
+        }
+        entry.parent_uuid = pgrp_uuid;
+        let display_name = entry.name.clone();
+        let uuid = entry.uuid;
+        let process_desc = TrackDescriptor {
+            uuid: Some(uuid),
+            parent_uuid: if pgrp_uuid != 0 { Some(pgrp_uuid) } else { None },
+            name: Some(display_name.clone()),
+            process: Some(ProcessDescriptor {
+                pid: Some(pid as i32),
+                process_name: Some(display_name),
+            }),
+            thread: None,
+        };
+        (pgrp_desc, Some(process_desc))
     }
 
     /// Rename an existing process track, emitting a fresh
@@ -252,24 +308,24 @@ impl TrackRegistry {
             return None;
         }
         let uuid = self.alloc_uuid();
-        let name = format!("pgroup-{pgid}");
+        let name = format!("pgroup-{pgid} (sid={sid})");
         self.map.insert(
             key,
             TrackEntry { uuid, parent_uuid: 0, name: name.clone() },
         );
+        // Render the pgrp as a generic top-level NAMED track — no
+        // `ProcessDescriptor` and no `ThreadDescriptor`. Setting
+        // either pulls Perfetto's process/thread merging logic in,
+        // which collapses the pgrp container into whichever real
+        // process happens to share its pid (e.g. init at pid=1).
+        // A bare named track stays its own swimlane and lets the
+        // per-process tracks beneath it nest cleanly via
+        // `parent_uuid`.
         Some(TrackDescriptor {
             uuid: Some(uuid),
             parent_uuid: None,
-            name: Some(name.clone()),
-            // Render the pgrp as a process with `pid=pgid` so
-            // Perfetto's process-grouped thread view treats it as
-            // its own container. We expose the session id in the
-            // name suffix so eyeballing the trace still shows the
-            // SID without a second nesting level.
-            process: Some(ProcessDescriptor {
-                pid: Some(pgid as i32),
-                process_name: Some(format!("{name} (sid={sid})")),
-            }),
+            name: Some(name),
+            process: None,
             thread: None,
         })
     }
@@ -330,7 +386,12 @@ impl TrackRegistry {
             parent_uuid: None,
             name: Some("txKernel harts".to_string()),
             process: Some(ProcessDescriptor {
-                pid: Some(1),
+                // Synthetic pid distant from any real PID so Perfetto
+                // doesn't merge the harts container with init
+                // (the user's real pid=1 process). Matches the
+                // synthetic pid set on each hart's `ThreadDescriptor`
+                // in `ensure_hart`.
+                pid: Some(0x7FFF_FFFE),
                 process_name: Some("txKernel".to_string()),
             }),
             thread: None,
