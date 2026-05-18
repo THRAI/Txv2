@@ -30,7 +30,7 @@ const AUTHORED_HOST_PACKAGES: &[&str] = &[
 
 pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {
-        return Err("lint command needs `arch`, `docs`, `unused`, or `boundary`".into());
+        return Err("lint command needs `arch`, `docs`, `unused`, `boundary`, `invariants`, or `syscall-status`".into());
     };
     match kind.as_str() {
         "arch" => lint_arch(root),
@@ -41,8 +41,15 @@ pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
             let sub = args.get(1).map(|s| s.as_str()).unwrap_or("all");
             lint_invariants(root, sub)
         }
+        "syscall-status" => {
+            // The dispatch table at `crates/tx-shims/src/linux_syscall/{numbers,mod}.rs`
+            // is the SSoT for syscall progress; this gate fails if the
+            // auto-maintained section of `docs/progress/SYSCALL_STATUS.md`
+            // is stale. Fix with `cargo xtask syscall sync`.
+            crate::syscall::syscall(root, vec!["sync".into(), "--check".into()])
+        }
         other => Err(format!(
-            "unknown lint kind '{other}', expected arch, docs, unused, boundary, or invariants"
+            "unknown lint kind '{other}', expected arch, docs, unused, boundary, invariants, or syscall-status"
         )),
     }
 }
