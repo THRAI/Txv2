@@ -73,7 +73,9 @@ pub mod wait_routing {
     pub use tx_substrate::wake::WaitSource;
 
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
-        tx_substrate::wake::new_source(source_id)
+        let source = tx_substrate::wake::new_source(source_id);
+        tx_substrate::wake::register_source(Arc::clone(&source));
+        source
     }
 
     pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) -> usize {

@@ -143,8 +143,8 @@ impl<'a, P: tx_hal::PmapIf, I: step_engine::SubjectIdentity> StepOp<I> for Clone
                 seed_child_leader_context(
                     &child_thread,
                     &self.parent_ctx,
-                    self.stack as usize,
                     self.tls as usize,
+                    self.stack as usize,
                 );
                 reactor_submit::submit_child_thread(child.clone(), child_thread.clone());
 

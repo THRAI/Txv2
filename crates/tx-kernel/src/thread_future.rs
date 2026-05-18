@@ -79,7 +79,6 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use crate::adapter::boot_runtime;
-use crate::adapter::step_engine::StepOutcome;
 use crate::adapter::step_engine::{Cap, PayloadCap};
 use boot_runtime::ast::AstBatch;
 use boot_runtime::userspace::{
@@ -273,7 +272,7 @@ pub async fn run_thread<P: TxPlatform>(
                 // the modified context for the next userspace entry.
                 //
                 // See: `txdoc:SIGNAL-V1-S15-HANDLER-DELIVERY`.
-                if let Some(orig_ctx) = payload.saved_user_context() {
+                if let Some(mut orig_ctx) = payload.saved_user_context() {
                     // Resolve owning process for aspace + fallback exit.
                     let Some(process) = thread.upgrade_owner_proc() else {
                         return;
@@ -282,7 +281,42 @@ pub async fn run_thread<P: TxPlatform>(
                         return;
                     };
 
-                    // Save pre-handler context for sigreturn.
+                    // If a syscall return is pending (e.g. wait4 just
+                    // resolved, child exit raised SIGCHLD, and the AST
+                    // is now delivering the handler), apply that return
+                    // value to the parked pre-signal context's `a0` and
+                    // clear the pending slot.
+                    //
+                    // Without this, `prepare_userspace_entry_payload`
+                    // below would overlay `pending_syscall_return` onto
+                    // the freshly-built `handler_ctx.a0`, clobbering the
+                    // POSIX-required `sig_no` argument. Apply-and-clear
+                    // moves the syscall return into the place it should
+                    // surface — the post-`rt_sigreturn` userspace context
+                    // — while keeping the handler's `a0` equal to `sig_no`.
+                    //
+                    // The canonical `a0` register index lives in
+                    // `tx_subsystems::thread_runtime::execution::USER_CONTEXT_A0_INDEX`
+                    // and is the same index `prepare_userspace_entry_payload`
+                    // uses for the overlay we're pre-empting here. Source it
+                    // through that re-export so tx-kernel doesn't carry an
+                    // arch cfg (CI gate `CI-GATE-ARCH-LINT`).
+                    if let Some(result) =
+                        tx_subsystems::thread_runtime::structure::drain_pending_syscall_return(
+                            &payload,
+                        )
+                    {
+                        let encoded = match result {
+                            Ok(v) => v as u64,
+                            Err(errno) => (-i64::from(errno)) as u64,
+                        };
+                        orig_ctx.regs
+                            [tx_subsystems::thread_runtime::execution::USER_CONTEXT_A0_INDEX] =
+                            encoded as usize;
+                    }
+
+                    // Save pre-handler context for sigreturn (now
+                    // carrying the applied syscall return in a0).
                     payload.store_saved_signal_context(Some(orig_ctx));
 
                     // Read current mask to pass to the handler.
@@ -310,7 +344,22 @@ pub async fn run_thread<P: TxPlatform>(
                     match prepared {
                         Ok((handler_ctx, frame_bytes)) => {
                             let frame_addr = user_sp_from_context::<P>(&handler_ctx);
-                            let copied = {
+                            // Check that the full frame (including the
+                            // sigreturn trampoline at its tail) actually
+                            // landed on the user stack. The previous
+                            // `let _ =` ignored every non-Done outcome —
+                            // including `Yield`/short copy — which left
+                            // the trampoline slot uninitialised, so the
+                            // handler returned to garbage / zeros and
+                            // the next instruction fetch faulted
+                            // (observed end-to-end as the basic-musl
+                            // crash with `lPF pc=trampoline_pc`). If the
+                            // copy doesn't complete fully, fall back to
+                            // the default action (terminate by sig) per
+                            // SIGNAL_v1 §15.1 — handler delivery cannot
+                            // proceed without a valid trampoline.
+                            use crate::adapter::step_engine::StepOutcome as V3;
+                            let copy_outcome = {
                                 let guard = crate::adapter::step_engine::guard();
                                 aspace.copy_to_user(
                                     tx_hal::UserPtr::<u8>::new(frame_addr),
@@ -318,15 +367,17 @@ pub async fn run_thread<P: TxPlatform>(
                                     &guard,
                                 )
                             };
-                            if matches!(copied, StepOutcome::Done(n) if n == frame_bytes.as_slice().len())
-                            {
-                                payload.store_saved_user_context(Some(handler_ctx));
-                            } else {
+                            let fully_written = match copy_outcome {
+                                V3::Done(n) => n == frame_bytes.as_slice().len(),
+                                _ => false,
+                            };
+                            if !fully_written {
                                 tx_subsystems::process::execution::step_exit_group_with_signal(
                                     &process, sig,
                                 );
                                 return;
                             }
+                            payload.store_saved_user_context(Some(handler_ctx));
                         }
                         Err(_) => {
                             // Signal frame write failed (bad stack).

@@ -791,7 +791,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
     pub(crate) fn mount_sdcard_at_musl() {
-        use tx_fs::tx_ext4::{mount_ext4_read_only, BlockDeviceImage};
+        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
         use tx_subsystems::device::block_device_by_name;
 
         let Some(reg) = block_device_by_name(b"vda") else {
@@ -799,7 +799,16 @@ impl<P: TxPlatform> CoreInit<P> {
         };
 
         let image = BlockDeviceImage::new(reg.ops);
-        let mount_output = match mount_ext4_read_only(image) {
+        // Mount read-write so test binaries that create or write to
+        // files under `/musl/musl/basic/` (test_mmap, test_munmap,
+        // test_mkdir, test_openat with O_CREAT, …) don't fall to
+        // -EROFS at every mutation. The ext4 backend's RW path is
+        // wired (`create_inode`/`mkdir`/`unlink` go through the
+        // pager's direct-write path per the 2026-05-13 trail); the
+        // only RW gap is `flush_page` (returns -ENOSYS), which
+        // affects long-running persistence but not the per-syscall
+        // contract these basic tests check.
+        let mount_output = match mount_ext4_read_write(image) {
             Ok(out) => out,
             Err(_) => {
                 Self::write_board_sentinel_prefix();

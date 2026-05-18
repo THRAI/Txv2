@@ -160,14 +160,6 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     mode: u32,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
-    // Wave 2 slice: AT_FDCWD only. Real dirfd-relative resolution
-    // requires directory file descriptors — the slice's fd table
-    // doesn't carry them yet. (TODO(phase-dirfd): mirror Wave 4
-    // Part 4's `resolve_path_at` once dirfds land.)
-    if dirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
-
     // Bounded inline copy of the user path. Same `EXECVE_PATH_MAX = 4096`
     // budget as the existing `execve` / `fchmodat` arms (and matches
     // Linux's `PATH_MAX`). Empty paths surface as `-ENOENT` from the
@@ -196,14 +188,26 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         nonblocking: flags & O_NONBLOCK != 0,
     };
 
-    // Resolve the cwd anchor. Zombies + uninitialised init pre-rootfs
-    // both surface `cwd() == None`; the alive caller of `openat` always
-    // has a cwd installed by `step_chdir` / bootstrap. No-cwd is a
-    // defensive `-ENOENT` (matches Linux's "no such directory" shape
-    // for an unreachable cwd).
-    let cwd: Cap<DEntry> = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
+    // Resolve the dirfd anchor. AT_FDCWD → process cwd; a real dirfd
+    // → the `opendir_dentry` of its OpenFile (an O_DIRECTORY open of
+    // that directory). Invalid / non-directory fds surface as EBADF /
+    // ENOTDIR.
+    let cwd: Cap<DEntry> = if dirfd == AT_FDCWD {
+        match ctx.process.cwd() {
+            Some(d) => d,
+            None => return SyscallResult::Error(ENOENT_VALUE),
+        }
+    } else if dirfd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    } else {
+        let open_file = match ctx.process.fd(dirfd as u32) {
+            Some(f) => f,
+            None => return SyscallResult::Error(EBADF_VALUE),
+        };
+        match open_file.opendir_dentry() {
+            Some(d) => d,
+            None => return SyscallResult::Error(ENOTDIR_VALUE),
+        }
     };
 
     let walker_cred = ctx.walker_cred();
@@ -996,8 +1000,32 @@ pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     };
 
     let rnode = file.rnode();
-    let meta = rnode.meta();
-    let ino = rnode.fs_object_id().as_u64();
+    let fs_object_id = rnode.fs_object_id();
+    // Live size resolution: cached `rnode.meta()` is the snapshot at
+    // materialisation time and doesn't see in-place writes. For a
+    // page-backed regular file the in-memory `PageContainer.size_bytes`
+    // is the authoritative live size (`step_write_from_*` calls
+    // `pc.grow_size_to` on every write). Fall back to
+    // `fs_ops.load_inode_meta` for other rnode kinds, then to the
+    // cached meta. Without this, oscomp basic test_mmap/test_munmap
+    // print `file len: 0` and crash on the 0-length mmap because
+    // tmpfs/ext4's on-disk inode metadata is never refreshed after
+    // the page-cache write.
+    let mut meta = match fs_ops_for_rnode(rnode) {
+        Some(fs_ops) => {
+            let guard = step_engine::guard();
+            match fs_ops.load_inode_meta(fs_object_id, &guard) {
+                StepOutcome::Done(m) => m,
+                _ => rnode.meta(),
+            }
+        }
+        None => rnode.meta(),
+    };
+    let pc_size = crate::linux_syscall::vm::extract_page_container(&file).map(|pc| pc.size_bytes());
+    if let Some(sz) = pc_size {
+        meta.size = sz;
+    }
+    let ino = fs_object_id.as_u64();
     let stat = inode_meta_to_stat(&meta, ino, 0);
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
