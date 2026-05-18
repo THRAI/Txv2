@@ -248,28 +248,40 @@ where
 /// human name from a build-emitted `names.json` per OBS-V1-OPNAME.
 #[inline]
 fn op_name_id<S: ?Sized>() -> EventNameId {
-    let name = core::any::type_name::<S>();
-    // FNV-1a 32-bit hash — fast, no_std-friendly, stable per build.
-    let mut hash: u32 = 0x811c_9dc5;
-    for &b in name.as_bytes() {
-        hash ^= b as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    EventNameId::from_raw(hash)
+    EventNameId::from_raw(tx_observe::fnv1a32(
+        core::any::type_name::<S>().as_bytes(),
+    ))
 }
 
+// Stable event names for the records that have no per-instance
+// discriminant. Computed at compile time via `tx_observe::fnv1a32` so the
+// trace carries the hash and the host-side `names.json` carries the
+// string. Reuses the same FNV-1a 32 hash that `op_name_id::<S>()` uses
+// for drive-level type-name hashes — single hash space for every
+// `EventNameId` source so any name collision is visible at the daemon.
+const RESUME_NAME: EventNameId = EventNameId::from_raw(tx_observe::fnv1a32(b"resume"));
+const STEP_NAME: EventNameId = EventNameId::from_raw(tx_observe::fnv1a32(b"step"));
+const YIELD_ON_WAIT_SOURCE_NAME: EventNameId =
+    EventNameId::from_raw(tx_observe::fnv1a32(b"yield.OnWaitSource"));
+const YIELD_ON_AGENT_NAME: EventNameId =
+    EventNameId::from_raw(tx_observe::fnv1a32(b"yield.OnAgent"));
+const YIELD_ON_TIMER_NAME: EventNameId =
+    EventNameId::from_raw(tx_observe::fnv1a32(b"yield.OnTimer"));
+
 #[inline]
-fn emit_step_begin(iteration: u32, parent: SpanId) -> SpanId {
+fn emit_step_begin(_iteration: u32, parent: SpanId) -> SpanId {
+    // Step spans share a single stable name (`step`); the per-iteration
+    // index is implicit in the begin-end timing relative to the parent
+    // drive span. Embedding iteration in the EventNameId was tried but
+    // produced 1k+ distinct hashes per drive (one per iteration), which
+    // both flooded the Perfetto name interner and rendered as
+    // `name_0xN` chips that were hard to read. The iteration count is
+    // still recoverable from the position of the step span within the
+    // drive span when needed.
     let Some(em) = tx_observe::current() else {
         return SpanId::NONE;
     };
-    em.span_begin(
-        TxTraceLevel::Step,
-        EventNameId::from_raw(iteration),
-        parent,
-        TxPayloadTag::None,
-        &[],
-    )
+    em.span_begin(TxTraceLevel::Step, STEP_NAME, parent, TxPayloadTag::None, &[])
 }
 
 #[inline]
@@ -311,9 +323,15 @@ fn emit_yield_begin(drive_span: SpanId, task_id_low: u32, shape_kind: u8) -> Spa
         wait_generation: 0,
     };
     let (enc, len) = encode_yield_begin(&payload);
+    let name = match shape_kind {
+        1 => YIELD_ON_WAIT_SOURCE_NAME,
+        2 => YIELD_ON_AGENT_NAME,
+        3 => YIELD_ON_TIMER_NAME,
+        _ => YIELD_ON_WAIT_SOURCE_NAME,
+    };
     em.span_begin(
         TxTraceLevel::Yield,
-        EventNameId::from_raw(shape_kind as u32),
+        name,
         drive_span,
         yield_begin_tag(),
         &enc[..len as usize],
@@ -336,7 +354,7 @@ fn emit_resume_end(yield_span: SpanId, resume: &ResumeOutcome) {
     let (enc, len) = encode_resume(&payload);
     em.instant(
         TxTraceLevel::Yield,
-        EventNameId::from_raw(0),
+        RESUME_NAME,
         yield_span,
         resume_tag(),
         &enc[..len as usize],

@@ -50,11 +50,18 @@ fn oscomp_doctor(root: &Path) -> Result<()> {
         }
     }
     let data = oscomp_data_dir(root, &[]);
-    for image in ["sdcard-rv.img.gz", "sdcard-la.img.gz"] {
-        if data.join(image).exists() {
-            println!("ok: {}", data.join(image).display());
+    for stem in ["sdcard-rv.img", "sdcard-la.img"] {
+        let img = data.join(stem);
+        let xz = data.join(format!("{stem}.xz"));
+        let gz = data.join(format!("{stem}.gz"));
+        if img.exists() {
+            println!("ok: {}", img.display());
+        } else if xz.exists() {
+            println!("ok: {} (compressed; will decompress on prepare)", xz.display());
+        } else if gz.exists() {
+            println!("ok: {} (compressed; will decompress on prepare)", gz.display());
         } else {
-            println!("warn: missing {}", data.join(image).display());
+            println!("warn: missing {} (also looked for .xz / .gz)", img.display());
         }
     }
     if missing.is_empty() {
@@ -95,17 +102,72 @@ fn oscomp_prepare(root: &Path, args: &[String]) -> Result<()> {
 
     println!("prepared OSComp judge data at {}", data.display());
     println!("prepared OSComp kernel zip at {}", kernel_zip.display());
-    for (image, url) in [
-        ("sdcard-rv.img.gz", OSCOMP_SDCARD_RV_URL),
-        ("sdcard-la.img.gz", OSCOMP_SDCARD_LA_URL),
+
+    // Sdcard images. The qemu launch reads `.img` (uncompressed); the GitHub
+    // release ships `.xz`. We tolerate any of `.img`, `.img.xz`, `.img.gz`
+    // present locally and decompress to `.img` if needed so a downstream
+    // `cargo xtask oscomp qemu` run finds what it expects.
+    for (stem, url) in [
+        ("sdcard-rv.img", OSCOMP_SDCARD_RV_URL),
+        ("sdcard-la.img", OSCOMP_SDCARD_LA_URL),
     ] {
-        if !data.join(image).exists() {
-            println!(
-                "missing {image}; download and place it at {}",
-                data.join(image).display()
-            );
-            println!("  {url}");
+        let img = data.join(stem);
+        if img.exists() {
+            println!("ok: {}", img.display());
+            continue;
         }
+        match ensure_sdcard_image(&data, stem) {
+            Ok(()) => println!("ok: {}", img.display()),
+            Err(why) => {
+                println!(
+                    "missing {stem}; download {url} into {} (any of {stem}, {stem}.xz, {stem}.gz) \
+                     and re-run prepare ({why})",
+                    data.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Locate a compressed sdcard image next to `data` and decompress it
+/// in-place to `<stem>`.
+///
+/// Probes `<stem>.xz` then `<stem>.gz`. Returns `Err` when neither is
+/// present (signals "missing — user must download"). Decompression uses
+/// the host `xz` / `gunzip` binaries; both are common on the macOS dev
+/// machines we run from.
+fn ensure_sdcard_image(data: &Path, stem: &str) -> Result<()> {
+    let xz_path = data.join(format!("{stem}.xz"));
+    let gz_path = data.join(format!("{stem}.gz"));
+    let out_path = data.join(stem);
+    let (src, tool, args): (PathBuf, &str, Vec<String>) = if xz_path.exists() {
+        (
+            xz_path,
+            "xz",
+            vec!["--decompress".into(), "--keep".into(), "--force".into()],
+        )
+    } else if gz_path.exists() {
+        (
+            gz_path,
+            "gunzip",
+            vec!["--keep".into(), "--force".into()],
+        )
+    } else {
+        return Err("no .xz or .gz archive present".into());
+    };
+    if !command_exists(tool) {
+        return Err(format!("{tool} not found; install via Homebrew or apt"));
+    }
+    println!("decompressing {} → {}", src.display(), out_path.display());
+    let mut full_args = args;
+    full_args.push(src.display().to_string());
+    run_cmd_owned_in(data, tool, &full_args)?;
+    if !out_path.exists() {
+        return Err(format!(
+            "{tool} ran but {} was not produced",
+            out_path.display()
+        ));
     }
     Ok(())
 }

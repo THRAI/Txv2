@@ -32,7 +32,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tx_hal::{CpuId, ObserverIf, PercpuIf, TimeIf};
+use tx_hal::{ConsoleIf, CpuId, ObserverIf, PercpuIf, TimeIf};
 use tx_observe_types::{
     PayloadCounterValue, TxPayloadTag, TxTraceHartRing, TxTraceKind, TxTraceRecord,
 };
@@ -66,6 +66,23 @@ pub use tx_observe_types::{PayloadSyscallEnter, PayloadSyscallExit};
 /// Opaque newtype so callers cannot fabricate one.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct SpanId(u64);
+
+/// FNV-1a 32-bit hash over a byte slice. `const fn` so emit call sites
+/// build stable `EventNameId`s for fixed event names (e.g. `"resume"`,
+/// `"wake.notify"`, `"mutation.zone_sign"`) at compile time. Matches the
+/// kernel-side `op_name_id::<S>()` hash used in `tx_scripts::drive` so a
+/// single hash space covers every `EventNameId` source.
+#[inline]
+pub const fn fnv1a32(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+        i += 1;
+    }
+    hash
+}
 
 impl SpanId {
     /// The zero sentinel ("no span / orphan").
@@ -527,6 +544,13 @@ impl HartEmitter {
 
         // Doorbell: v0 uses polling; no write needed.
         let _ = slot.ring_desc.doorbell;
+
+        // Step 6: tick the global emit counter; the kernel's syscall
+        // dispatcher polls `should_dump_now()` after each return and, on a
+        // threshold crossing, dumps the ring + halts. Off when the
+        // threshold is 0 (the default), so production / smoke runs pay
+        // only a Relaxed atomic load per emit.
+        check_dump_threshold();
     }
 }
 
@@ -623,6 +647,237 @@ pub fn current() -> Option<&'static HartEmitter> {
 // ---------------------------------------------------------------------------
 // Per-hart init
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Threshold-based dump trigger
+//
+// rv64-qemu's static-buffer ring is 4 MiB / 52428 slots. A typical oscomp
+// run emits records over many test groups (basic-musl, busybox-musl,
+// libctest, cyclictest, LTP…) and init never naturally exits until all
+// groups finish — which can take hours. To get a finite trace covering the
+// basic-musl group only (~10k records), the kernel watches an "emitted
+// records since boot" counter and, once it crosses a configurable
+// threshold, sets a flag the syscall dispatcher checks on every return.
+// On flag set, the dispatcher dumps the ring over the console and triggers
+// an SBI shutdown so the run terminates cleanly with a captured trace.
+//
+// Threshold of 0 = disabled (the default). Boards/platforms that want
+// bounded-dump runs install a non-zero value at boot.
+// ---------------------------------------------------------------------------
+
+static EMITTED_COUNT: AtomicU64 = AtomicU64::new(0);
+static DUMP_THRESHOLD: AtomicU64 = AtomicU64::new(0);
+static DUMP_REQUESTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Configure a "bounded dump" threshold for the current run.
+///
+/// Once the global emitted-record counter exceeds `n`, the next call to
+/// [`should_dump_now`] returns `true` exactly once. The dispatcher (or
+/// any other code with `P` in scope) is expected to react by calling
+/// [`dump_console_hex`] and triggering shutdown.
+///
+/// Passing `0` disables the trigger.
+#[inline]
+pub fn set_dump_threshold(n: u64) {
+    DUMP_THRESHOLD.store(n, Ordering::Relaxed);
+}
+
+/// Test-and-clear the "dump requested" flag. Returns `true` exactly once
+/// per threshold crossing.
+#[inline]
+pub fn should_dump_now() -> bool {
+    DUMP_REQUESTED
+        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+}
+
+#[inline]
+fn check_dump_threshold() {
+    let threshold = DUMP_THRESHOLD.load(Ordering::Relaxed);
+    if threshold == 0 {
+        return;
+    }
+    let count = EMITTED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count >= threshold {
+        DUMP_REQUESTED.store(true, Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serial-console hex dump (host extraction path)
+//
+// rv64-qemu (and other boards that back observation with a static buffer
+// rather than a live HOST-shared transport) can call this helper at
+// shutdown to emit the entire ring region — including a synthesised
+// `TxTraceHeader` — over the console as hex bytes framed with
+// `TXTRACE-BEGIN`/`TXTRACE-END` sentinels. `cargo xtask observe extract`
+// recovers the framed blob from the serial log and writes a standalone
+// `.txtrace` file the daemon can decode.
+//
+// The synthesised header carries the same fields the daemon would expect
+// from a live transport: magic, version, hart_count, ring_order,
+// boot_id (always 0 here — single-run captures don't need a unique boot
+// id), clock_id (RiscvTime), and clock_freq_hz (from `TimeIf`).
+//
+// This path is `unsafe` only at the FFI boundary (raw ring pointer
+// access); the visible surface stays no_std/safe.
+// ---------------------------------------------------------------------------
+
+/// Dump hart `hart`'s observation ring as a hex-framed blob over the
+/// platform console.
+///
+/// The output is framed by ASCII sentinels so a host-side extractor
+/// can recover the bytes from a serial log:
+///
+/// ```text
+/// TXTRACE-BEGIN bytes=<N> hart=<H> clock_hz=<F>
+/// <2*N hex nibbles, no whitespace>
+/// TXTRACE-END
+/// ```
+///
+/// `ring` is the raw backing buffer of the per-hart ring (typically
+/// obtained from the board's `obs_ring_bytes(hart)`); `hart` is the
+/// hart id used to keep cross-hart dumps disambiguated.
+///
+/// The 72-byte `TxTraceHeader` is emitted first (synthesised here from
+/// `P`'s `clock_shared`/`TimeIf::clock_freq_hz` and the buffer size),
+/// followed by the ring bytes. The combined hex stream is exactly the
+/// shape `cargo xtask observe validate / replay / pftrace` expect for
+/// a normal `.txtrace` file — so post-extraction the file is a regular
+/// member of the observation pipeline.
+pub fn dump_console_hex<P>(hart: CpuId)
+where
+    P: ConsoleIf + ObserverIf + TimeIf,
+{
+    let Some(desc) = P::observation_ring(hart) else {
+        // No ring backing on this board → nothing to dump.
+        return;
+    };
+    // SAFETY: `desc` came from `P::observation_ring(hart)`. The board's
+    // contract is that the region is valid for the kernel's lifetime
+    // and exclusively owned by hart `hart` on the producer side. By the
+    // time the dump is invoked, the producer has quiesced (init has
+    // zombified), so a read of the full region is sound.
+    let ring: &[u8] = unsafe { core::slice::from_raw_parts(desc.base.as_ptr(), desc.size) };
+    use tx_observe_types::{TxTraceClockId, TxTraceHeader, TxTraceHeaderFlags, TX_TRACE_MAGIC};
+
+    // `ring_order` is `log2(slot_count)`. The ring slot count is
+    // `(ring.len() - 208) / 80` where 208 is `size_of::<TxTraceHartRing>()`
+    // and 80 is `size_of::<TxTraceRecord>()`. For the rv64-qemu 64 KiB
+    // backing, `(65536 - 208) / 80 = 816` slots — round down to the
+    // nearest power of two = 512 = 2^9.
+    const TX_TRACE_HART_RING_BYTES: usize = 208;
+    const TX_TRACE_RECORD_BYTES: usize = 80;
+    let usable = ring.len().saturating_sub(TX_TRACE_HART_RING_BYTES);
+    let slot_count_max = usable / TX_TRACE_RECORD_BYTES;
+    // Largest power-of-two ≤ slot_count_max:
+    let ring_order = if slot_count_max == 0 {
+        0u8
+    } else {
+        (usize::BITS - 1 - slot_count_max.leading_zeros()) as u8
+    };
+
+    let header = TxTraceHeader {
+        magic: TX_TRACE_MAGIC,
+        version: 0,
+        header_len: core::mem::size_of::<TxTraceHeader>() as u16,
+        endian: 1,
+        ptr_width: 8,
+        record_size: TX_TRACE_RECORD_BYTES as u16,
+        hart_count: 1,
+        ring_order,
+        flags: if P::clock_shared() {
+            TxTraceHeaderFlags::CLOCK_SHARED.0
+        } else {
+            0
+        },
+        _pad0: 0,
+        boot_id: 0,
+        // `init_ts(P::read_ns)` (see `init::<P>`) installs the platform's
+        // nanosecond-resolution monotonic clock as the `TS_FN` source,
+        // so the `ts` field on every record is already in absolute
+        // nanoseconds. The header advertises `clock_id = HostNanos` +
+        // `clock_freq_hz = 1 GHz` so the daemon's unit-multiplier
+        // calculation (`1e9 / clock_freq_hz`) yields `1 ns/tick` and the
+        // wire ts values pass through unscaled.  Reporting the raw
+        // hardware `frequency_hz` here (e.g. 10 MHz for QEMU virt) would
+        // cause a 100× temporal inflation in Perfetto.
+        clock_id: TxTraceClockId::HostNanos as u32,
+        _pad1: 0,
+        clock_freq_hz: 1_000_000_000,
+        string_table_off: 0,
+        string_table_len: 0,
+        rings_off: core::mem::size_of::<TxTraceHeader>() as u64,
+    };
+
+    // SAFETY: `TxTraceHeader` is `#[repr(C)]`, `Pod`-marked, no padding
+    // beyond the explicit `_padN` fields. Transmuting to a byte slice
+    // is a sound read of the static representation.
+    let header_bytes: [u8; core::mem::size_of::<TxTraceHeader>()] = unsafe {
+        core::mem::transmute::<TxTraceHeader, [u8; core::mem::size_of::<TxTraceHeader>()]>(header)
+    };
+
+    // ── Frame begin ───────────────────────────────────────────────────────
+    let total_bytes = header_bytes.len() + ring.len();
+    tx_hal::console_write_str::<P>("TXTRACE-BEGIN bytes=");
+    write_u64_decimal::<P>(total_bytes as u64);
+    tx_hal::console_write_str::<P>(" hart=");
+    write_u64_decimal::<P>(hart.0 as u64);
+    tx_hal::console_write_str::<P>(" clock_hz=");
+    write_u64_decimal::<P>(P::frequency_hz());
+    tx_hal::console_write_str::<P>("\n");
+
+    // ── Hex bytes ─────────────────────────────────────────────────────────
+    // 64-byte chunks per console line keep extraction robust even when the
+    // serial driver inserts CR/LF padding.
+    const CHUNK: usize = 64;
+    let mut emitted = 0;
+    let mut emit_bytes = |bytes: &[u8]| {
+        for &b in bytes {
+            write_hex_byte::<P>(b);
+            emitted += 1;
+            if emitted % CHUNK == 0 {
+                tx_hal::console_write_str::<P>("\n");
+            }
+        }
+    };
+    emit_bytes(&header_bytes);
+    emit_bytes(ring);
+    if emitted % CHUNK != 0 {
+        tx_hal::console_write_str::<P>("\n");
+    }
+
+    // ── Frame end ─────────────────────────────────────────────────────────
+    tx_hal::console_write_str::<P>("TXTRACE-END\n");
+}
+
+#[inline]
+fn write_hex_byte<P: ConsoleIf>(b: u8) {
+    const NIBBLE: [u8; 16] = *b"0123456789abcdef";
+    let buf = [NIBBLE[(b >> 4) as usize], NIBBLE[(b & 0x0f) as usize]];
+    // Two-byte slice; ASCII, so utf-8 is trivially valid.
+    let s = unsafe { core::str::from_utf8_unchecked(&buf) };
+    tx_hal::console_write_str::<P>(s);
+}
+
+#[inline]
+fn write_u64_decimal<P: ConsoleIf>(mut v: u64) {
+    let mut buf = [0u8; 20];
+    let mut idx = buf.len();
+    if v == 0 {
+        idx -= 1;
+        buf[idx] = b'0';
+    } else {
+        while v > 0 {
+            idx -= 1;
+            buf[idx] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+    }
+    let s = unsafe { core::str::from_utf8_unchecked(&buf[idx..]) };
+    tx_hal::console_write_str::<P>(s);
+}
 
 /// One-time per-hart initialisation.
 ///

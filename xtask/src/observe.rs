@@ -19,12 +19,13 @@ type DemoRecord = (u8, u8, u32, u64, u64, u16, u16, [u8; 16]);
 pub(crate) fn observe(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(subcmd) = args.first() else {
         return Err(
-            "observe command needs replay, pftrace, validate, or demo\n\
+            "observe command needs replay, pftrace, validate, demo, or extract\n\
              usage:\n\
              \tcargo xtask observe replay --file <path> [--out json|pftrace] [--output <out>] [--filter level=N]\n\
              \tcargo xtask observe pftrace --file <path> --output <pftrace>\n\
              \tcargo xtask observe validate --file <path>\n\
-             \tcargo xtask observe demo --output <path> [--records N] [--with-yields]"
+             \tcargo xtask observe demo --output <path> [--records N] [--with-yields]\n\
+             \tcargo xtask observe extract --serial <log> --output <txtrace>"
                 .into(),
         );
     };
@@ -33,10 +34,100 @@ pub(crate) fn observe(root: &Path, args: Vec<String>) -> Result<()> {
         "pftrace" => observe_pftrace(root, &args[1..]),
         "validate" => observe_validate(&args[1..]),
         "demo" => observe_demo(&args[1..]),
+        "extract" => observe_extract(&args[1..]),
         other => Err(format!(
-            "unknown observe subcommand '{other}'; expected replay, pftrace, validate, or demo"
+            "unknown observe subcommand '{other}'; \
+             expected replay, pftrace, validate, demo, or extract"
         )),
     }
+}
+
+// ── extract ───────────────────────────────────────────────────────────────────
+
+/// Recover a `.txtrace` blob from a kernel serial log.
+///
+/// The kernel-side `tx_observe::dump_console_hex::<P>` helper emits the
+/// full observation ring (plus a synthesised `TxTraceHeader`) over the
+/// console as hex bytes framed by `TXTRACE-BEGIN ... TXTRACE-END`
+/// sentinels right before `:userspace:exited:`. This subcommand greps
+/// the framed hex out of the captured serial log, hex-decodes it, and
+/// writes a standalone `.txtrace` file the rest of the pipeline
+/// (`validate` / `replay` / `pftrace`) consumes unchanged.
+///
+/// Usage: `cargo xtask observe extract --serial <log> --output <txtrace>`
+fn observe_extract(args: &[String]) -> Result<()> {
+    let serial = optional_option_value(args, "--serial")
+        .ok_or("--serial is required for extract subcommand")?;
+    let output = optional_option_value(args, "--output")
+        .ok_or("--output is required for extract subcommand")?;
+
+    let log_path = PathBuf::from(&serial);
+    let raw = fs::read_to_string(&log_path)
+        .map_err(|e| format!("cannot read serial log {}: {e}", log_path.display()))?;
+
+    // ── Locate framing markers ────────────────────────────────────────────────
+    let begin_marker = "TXTRACE-BEGIN ";
+    let end_marker = "TXTRACE-END";
+    let begin_idx = raw
+        .find(begin_marker)
+        .ok_or_else(|| "no TXTRACE-BEGIN marker in serial log".to_string())?;
+    let end_idx = raw[begin_idx..]
+        .find(end_marker)
+        .map(|off| begin_idx + off)
+        .ok_or_else(|| "TXTRACE-BEGIN present but no matching TXTRACE-END".to_string())?;
+
+    // The header line carries metadata (`bytes=`, `hart=`, `clock_hz=`) —
+    // skip past the newline that terminates it.
+    let after_header = raw[begin_idx..end_idx]
+        .find('\n')
+        .map(|off| begin_idx + off + 1)
+        .ok_or_else(|| "malformed TXTRACE-BEGIN header line".to_string())?;
+    let hex_block = &raw[after_header..end_idx];
+    let header_line = raw[begin_idx..raw[begin_idx..].find('\n').map(|o| begin_idx + o).unwrap()]
+        .strip_prefix(begin_marker)
+        .unwrap_or("");
+
+    // ── Hex-decode (skipping whitespace) ──────────────────────────────────────
+    let mut bytes = Vec::with_capacity(hex_block.len() / 2);
+    let mut nibble: Option<u8> = None;
+    for c in hex_block.chars() {
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = match c {
+            '0'..='9' => c as u8 - b'0',
+            'a'..='f' => c as u8 - b'a' + 10,
+            'A'..='F' => c as u8 - b'A' + 10,
+            _ => {
+                return Err(format!(
+                    "unexpected non-hex character '{}' inside TXTRACE frame",
+                    c
+                ));
+            }
+        };
+        nibble = match nibble {
+            None => Some(v),
+            Some(hi) => {
+                bytes.push((hi << 4) | v);
+                None
+            }
+        };
+    }
+    if nibble.is_some() {
+        return Err("hex stream has an odd nibble count".into());
+    }
+
+    let output_path = PathBuf::from(&output);
+    fs::write(&output_path, &bytes)
+        .map_err(|e| format!("failed to write {}: {e}", output_path.display()))?;
+    eprintln!(
+        "observe: extracted {} bytes from {} (header: {}) → {}",
+        bytes.len(),
+        log_path.display(),
+        header_line.trim(),
+        output_path.display(),
+    );
+    Ok(())
 }
 
 // ── Daemon binary helpers ─────────────────────────────────────────────────────

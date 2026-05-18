@@ -362,6 +362,11 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
     // installed via [`tx_observe::set_current_parent_span`] so the L2
     // record in `tx_scripts::drive` picks it up implicitly without
     // every syscall arm having to thread it through `ScriptCtx`.
+    //
+    // The threshold-based observation dump trigger is handled one level
+    // up in `tx_kernel::thread_future::run_thread` so the dispatch
+    // signature stays free of `ConsoleIf + PowerIf` bounds that would
+    // ripple into every test-stub platform.
     let l0_span = emit_syscall_enter(&req);
     let prev = tx_observe::set_current_parent_span(l0_span);
     let result = dispatch_inner::<P>(req, ctx).await;

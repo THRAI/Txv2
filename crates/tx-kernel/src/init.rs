@@ -233,6 +233,21 @@ impl<P: TxPlatform> CoreInit<P> {
     fn init_substrate_if_ready(handoff: BootHandoff) {
         if P::SUBSTRATE_BOOT_READY {
             init::<P>();
+            // Install the per-hart observation emitter on the BSP. Must run
+            // BEFORE the first `tx_observe::current()` caller so the
+            // CPU_ID_FN / TS_FN function pointers and the BSP's
+            // `HartEmitter` are in place. `Err(NoRing)` is benign — boards
+            // without an `observation_ring` impl get a runtime no-op.
+            let _ = tx_observe::init::<P>(<P as tx_hal::SmpIf>::current_cpu_id());
+            // Bounded-trace threshold: when set to N > 0, the kernel
+            // dumps the ring and powers off after N records have been
+            // emitted. Lets oscomp-style runs (where init runs many test
+            // groups back-to-back and never naturally exits in a useful
+            // wall clock) capture a finite trace covering the early
+            // stages. The value lives next to the board's other tuning
+            // constants in `tx-kernel/src/init.rs` so it can be flipped
+            // without redoing the observation contract.
+            tx_observe::set_dump_threshold(crate::OBSERVE_DUMP_THRESHOLD);
             crate::zones::register_all().expect("tx_kernel zone registration failed");
             Self::init_later(handoff);
             Self::install_kernel_trap_vector();
@@ -1261,6 +1276,10 @@ impl<P: TxPlatform> CoreInit<P> {
         P::install_early_percpu(cpu_id);
         P::init_early_secondary(cpu_id);
         init_on_ap(cpu_id).expect("tx_kernel AP substrate initialization failed");
+        // Install this AP's observation emitter. Errors are benign —
+        // boards that allocate fewer rings than harts get a runtime
+        // no-op on the over-cap harts.
+        let _ = tx_observe::init::<P>(cpu_id);
         P::init_later_secondary(cpu_id);
         P::install_kernel_trap_vector();
         P::mark_cpu_online(cpu_id);

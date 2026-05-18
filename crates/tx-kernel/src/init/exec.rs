@@ -762,7 +762,13 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         }
 
-        // init zombified — emit the exit sentinel.
+        // init zombified — dump the observation ring over the console
+        // before emitting the exit sentinel so `cargo xtask observe
+        // extract --serial <log>` can recover the full `.txtrace` blob
+        // from the captured serial output. Boards without an
+        // `observation_ring` impl (returning `None`) yield a no-op dump.
+        tx_observe::dump_console_hex::<P>(<P as tx_hal::SmpIf>::current_cpu_id());
+
         let status_word = init
             .exit_status()
             .map(|s| s.wait_status_word())
