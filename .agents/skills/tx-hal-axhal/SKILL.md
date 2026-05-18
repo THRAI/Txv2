@@ -12,7 +12,8 @@ Use this skill for HAL/substrate boundary work.
 - `docs/design/01_substrate/HAL_v1.md`
 - `docs/design/01_substrate/PAGE_SUBSTRATE_v1.md`
 - `docs/design/00_meta-framework/MODULE_MAP_v1.md`
-- `docs/design/00_meta-framework/INVARIANTS_v4.md` MAP-2A and HAL rules
+- `docs/design/00_meta-framework/INVARIANTS_v4.md` — MAP-2A and HAL rows (v5 carries these forward; cite v4 anchors since the other substrate docs do too).
+- `docs/Txv3/02_INVARIANTS_v5.md` — read only if your change adds or rewords an enforceable rule; v5 is where new rows belong.
 
 ## Preserve
 

@@ -1,3 +1,98 @@
+- 2026-05-18 **`tx-ltp-syscall`: OSComp + LTP elevated to gold-standard correctness bar.**
+  Edited [.agents/skills/tx-ltp-syscall/SKILL.md](../../.agents/skills/tx-ltp-syscall/SKILL.md)
+  and [SYSCALL_STATUS.md](SYSCALL_STATUS.md) so OSComp + LTP are first-class:
+  - Skill description now leads with "OSComp and LTP are the gold-standard correctness
+    bar"; new "Gold standard" section explains why (OSComp = competitive scoreboard
+    + realistic-program harness; LTP = ABI-edge-case suite) and that host unit tests
+    are sanity checks, not substitutes.
+  - "Verification" split into inner loop (host) and gold-standard outer loop
+    (`cargo xtask oscomp run --target rv64-qemu` + LTP-in-QEMU); outer loop is no
+    longer optional.
+  - "Done Means" now requires naming at least one specific OSComp/LTP test that newly
+    passes; if neither can run for unrelated reasons, the blocker itself is a
+    high-priority follow-up rather than a silent substitution.
+  - SYSCALL_STATUS.md grew an "OSComp + LTP coverage (the gold standard)" section with
+    subsections for OSComp (passing/partial) and LTP, and the "How to update this
+    file" checklist now requires recording the OSComp/LTP test(s) that closed the
+    work — with date, commit, and exercised syscall — on every landing.
+  **Verified:** `cargo xtask lint docs` → ok; `cargo xtask progress validate` → 24
+  records ok. **Next step:** when the first syscall lands under the new rule (likely
+  fork+CLOEXEC or getrlimit/setrlimit), exercise the OSComp/LTP completion entry shape
+  end-to-end.
+
+- 2026-05-18 **New skill `tx-ltp-syscall` + seed `docs/progress/SYSCALL_STATUS.md`.**
+  Added [.agents/skills/tx-ltp-syscall/SKILL.md](../../.agents/skills/tx-ltp-syscall/SKILL.md)
+  (planning/tracking layer that wraps `tx-syscall-dispatch`, `tx-step-migration`,
+  `tx-shell-syscall-fixup`) and the living [SYSCALL_STATUS.md](SYSCALL_STATUS.md)
+  it owns. Status doc seeded with headline counts (119 NR_* defined, ~96 dispatched,
+  ~116 unwired), high-stakes prioritization table, unwired-by-topic breakdown, LTP
+  coverage estimate (~25 tests runnable today), and the recount discipline (grep
+  commands so eyeball counts don't drift). The skill enforces a tight workflow:
+  identify scope → read design contract → classify lane (defer to tx-syscall-dispatch)
+  → implement (defer to tx-step-migration / tx-shell-syscall-fixup) → **update
+  SYSCALL_STATUS.md** → STATUS.md catch-up. Registered in the skill manifest.
+  **Verified:** 3-eval benchmark (sibling workspace at
+  [`tx-ltp-syscall-workspace/iteration-1/review.html`](../../.agents/skills/tx-ltp-syscall-workspace/iteration-1/review.html)) —
+  with-skill 93% pass, baseline 87%; **−26s** and **−2.6k tokens** vs no-skill baseline.
+  `cargo xtask lint docs` → ok; `cargo xtask progress validate` → 24 records ok.
+  **Next step:** when fork+CLOEXEC or getrlimit/setrlimit lands, run through the
+  skill's catch-up workflow as the first real exercise. One iteration-1 finding
+  worth noting: a stale "Pipe StructBacked deferred" note still lives in
+  `crates/tx-subsystems/src/page_backed/cross_variant.rs:24` even though the Pipe
+  StructPayload landed; the SYSCALL_STATUS.md sendfile row's "page-cache coherence
+  path" framing echoes that older view. Worth a code+doc cleanup pass when sendfile
+  is picked up.
+
+- 2026-05-18 **`tx-design-reference` gets an IPC topic cluster (scattered-doc pointer).**
+  No dedicated IPC design doc exists in the repo (verified across main, all branches,
+  all stashes, and unreachable blobs). Added an IPC entry under "Topic Clusters" in
+  [.agents/skills/tx-design-reference/SKILL.md](../../.agents/skills/tx-design-reference/SKILL.md)
+  that points agents at the real scattered locations and explicitly says no canonical
+  spec exists yet: `Txv3/00_PREFACE.md` (no-IPC-boundary positioning), `TTY.md` (the
+  IPC-producer-serialization pattern — canonical write-up for buffer-based primitives),
+  `SIGNAL_ATTACHMENTS_v1.md` (SysV/POSIX IPC catalog entries explicitly deferred),
+  `SIGNAL_v1.md` + `PROCESS_v1.md` (signal as fundamental IPC primitive),
+  `PAGE_BACKED_v1.md` (shm/memfd backing), code under
+  `crates/tx-subsystems/src/{pipe,eventfd,signalfd,futex,signal,io_uring,userfaultfd,epoll}/`,
+  and the pipe-pilot decision note. Skill flags itself as needing replacement when a
+  real `IPC_v1.md` lands. Manifest sources updated accordingly.
+  **Verified:** `cargo xtask lint docs` → ok; `cargo xtask progress validate` → 24 records ok.
+  **Next step:** if/when a canonical IPC design doc is written, replace the bullet with
+  its path and update the manifest.
+
+- 2026-05-18 **Skills audit: v4→v5 supersession + dead-path fix.**
+  Audited all 19 entries in `.agents/skills/` against canonical docs. Two classes of fix:
+  1. **Dead path** — `tx-tty-subsystem` cited `docs/ljs/TTY_DESIGN_PLAN.md` (directory does not
+     exist); replaced with the live `docs/progress/decisions/2026-05-05-*.md` and
+     `2026-05-06-tty-vmin-and-vfs-ioctl-status.md` TTY decision notes.
+  2. **Superseded doc as primary** — 8 skills (`tx-design-reference`, `tx-meta-alignment`,
+     `tx-ebr-zone`, `tx-hal-axhal`, `tx-implementation-readiness`, `tx-subsystem-manifest`,
+     `tx-vm-pagebacked`, `tx-docs-cleanup`) cited only `INVARIANTS_v4.md` / `CONCEPTS_v4.md` /
+     `STEP_MODEL_v1.md`. Added pointers to `docs/Txv3/{INDEX,01_CONCEPTS_v5,02_INVARIANTS_v5,03_STEP_MODEL_v2}.md`
+     per the v4 docs' own SUPERSEDED banners, with prose explaining when to read which (v5 for new
+     prose; v4 anchors retained because subsystem docs still resolve against them). Manifest entries
+     updated to match.
+  Audit also confirmed: humanlayer-reference paths are valid submodule paths (not dead, just
+  not checked out locally); no manifest drift (every dir has an entry, every entry has a dir);
+  4-skill meta-cluster overlap is intentional (different triggers).
+  **Verified:** `cargo xtask lint docs` → ok (the 2 pre-existing stale-vocab warnings are unchanged
+  — confirmed not from my changes); `cargo xtask progress validate` → 24 records ok.
+  **Next step:** none planned — revisit when v4 subsystem docs are migrated to v5 anchors.
+
+- 2026-05-18 **New skill `tx-ci-triage` for diagnosing failing CI gates.**
+  Adds [.agents/skills/tx-ci-triage/SKILL.md](../../.agents/skills/tx-ci-triage/SKILL.md)
+  and registers it in [.agents/skills/skill_manifest.yaml](../../.agents/skills/skill_manifest.yaml).
+  Anchors on `CI_REPORTING_v1.md` + `xtask/src/ci.rs`; per-gate triage table keyed
+  by `txdoc:CI-GATE-*` tag (fmt, clippy, retired-vocab, host-check, unit-tests, arch,
+  docs, unused, boundary-ratchet, invariants, progress-json, observe-smoke, RV64,
+  M1Dock-mock, LA64, qemu-smoke, busybox-boot); explains ratchet discipline (one-way
+  down; raising requires a dated decision note); enumerates wrong-fixes
+  (`#[allow(dead_code)]`, `MAX_*` bumps, weakening `--expect-sentinel`, `--no-verify`).
+  **Verified:** small benchmark with 3 realistic CI-failure prompts; with-skill 100%
+  pass rate, baseline 93%; **−29s** and **−15.5k tokens** vs no-skill baseline. Artifacts
+  in `.agents/skills/tx-ci-triage-workspace/iteration-1/` (review.html, benchmark.json).
+  **Next step:** none planned — skill is iteration-1 final; revisit if new CI gates land.
+
 - 2026-05-13 **ext4 write support + brk page-alignment fix: 5 more OSComp tests pass.**
   Implemented ext4 write operations across three layers:
   1. `tx-ext4-format/pager.rs`: added `allocate_inode`, `write_inode`, `allocate_block`,

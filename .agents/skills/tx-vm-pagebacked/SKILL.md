@@ -14,8 +14,10 @@ the contract; code may stage toward them, but must name any incomplete seam.
 - `docs/design/03_memory-vm/PAGE_BACKED_v1.md`
 - `docs/design/01_substrate/PAGE_SUBSTRATE_v1.md`
 - `docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md`
-- `docs/design/00_meta-framework/INVARIANTS_v4.md` ARCH, BIF, ZONE, EBR rules
-- `docs/design/02_execution/STEP_MODEL_v1.md`
+- `docs/Txv3/02_INVARIANTS_v5.md` — canonical for invariants; ARCH/BIF/ZONE/EBR rows are carried forward from v4. New SUBJ-*/YIELD-*/SCOPE-* families touch VM fault dispatch and page-fault subject context.
+- `docs/design/00_meta-framework/INVARIANTS_v4.md` — section anchors for ARCH/BIF/ZONE/EBR still referenced by VM/PageBacked docs.
+- `docs/Txv3/03_STEP_MODEL_v2.md` — supersedes `02_execution/STEP_MODEL_v1.md`. VM fault materialization steps follow the four-variant `StepOutcome` discipline.
+- `docs/design/02_execution/STEP_MODEL_v1.md` — read only when reconciling with prose that still cites v1 anchors.
 - relevant `docs/progress/worktrees/` and `docs/progress/research/` notes
 
 ## Preserve

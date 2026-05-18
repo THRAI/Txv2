@@ -1,0 +1,26 @@
+{
+  "skill_name": "tx-ltp-syscall",
+  "evals": [
+    {
+      "id": 0,
+      "name": "high-stakes-recommendation",
+      "prompt": "I'm picking what syscall work to do this week. We've got ~25 LTP tests passing today and a lot of `-ENOSYS` returns blocking the rest. What's the best LTP-coverage-per-effort win to chase, and what would be a bad use of two weeks?",
+      "expected_output": "Names fork+CLOEXEC and the small wins (getrlimit/setrlimit, preadv/pwritev/fallocate) as best ROI. Flags ptrace/bpf/perf_event_open as out of scope v1 and a bad use of two weeks. Cites SYSCALL_STATUS.md's high-stakes table. Lists the substrate prerequisite for the top recommendation.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "specific-syscall-status-check",
+      "prompt": "What's the current state of `sendfile` in tx-shims? I need to know if it's wired, stubbed, or missing entirely — and whether starting it now is reasonable or blocked on something else.",
+      "expected_output": "Identifies sendfile as fully unwired (in the 'File I/O & VFS extras (18)' topic section), names its high-stakes-table row (LTP impact +15, effort M 3-4w), and flags the substrate prerequisite (page-cache coherence path). Tells the user where to find the dispatch arm pattern (`mod.rs`) and which lane it likely belongs in (full async drive), and points at tx-syscall-dispatch for the migration mechanics.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "completion-progress-update",
+      "prompt": "I just finished wiring `getrlimit` and `setrlimit` end-to-end — they were both on the unwired list, now they route through OneShotStepOp into a new per-process resource field and pass the corresponding LTP tests. `cargo xtask ci` is green. What's the catch-up I need to do before declaring this complete?",
+      "expected_output": "Lists the SYSCALL_STATUS.md updates required (decrement Process/sched/limits section from 22 to 20, remove getrlimit/setrlimit from that list, remove or annotate the row in the high-stakes table since it landed, bump headline 'dispatched' count, update Last refresh date). Names the STATUS.md catch-up entry obligation. Points at tx-progress-memory for the catch-up shape. Mentions running the recount grep commands rather than eyeballing.",
+      "files": []
+    }
+  ]
+}
