@@ -203,3 +203,15 @@ skills:
       - xtask/src/lint_invariants_syscall.rs
       - xtask/src/lint.rs
     purpose: Classify syscalls into Immediate/OneShotStepOp/FullAsync lanes, manage dispatch-lane migration, and run syscall lint ratchets (adhoc-loop, no-await, ctx-bridge).
+
+  tx-ltp-syscall:
+    sources:
+      - docs/progress/SYSCALL_STATUS.md
+      - docs/Txv3/04_SYSCALL_SHAPE_v1.md
+      - docs/Txv3/03_STEP_MODEL_v2.md
+      - docs/Txv3/02_INVARIANTS_v5.md
+      - crates/tx-shims/src/linux_syscall/numbers.rs
+      - crates/tx-shims/src/linux_syscall/mod.rs
+      - external/oscomp-autotest
+      - xtask/src/oscomp.rs
+    purpose: Plan and prioritise Linux syscall implementation for OSComp + LTP coverage; maintain the SYSCALL_STATUS.md living record; wrap tx-syscall-dispatch / tx-step-migration / tx-shell-syscall-fixup with the planning + bookkeeping layer.

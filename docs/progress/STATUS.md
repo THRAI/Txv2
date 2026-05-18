@@ -1,3 +1,29 @@
+- 2026-05-18 **`SYSCALL_STATUS.md` + `tx-ltp-syscall` skill brought into
+  this worktree and refreshed.** Copied from `cc/brave-brown-d46827`
+  (where they were originally drafted), then updated to today's state:
+  - Headline counts recounted: NR_* still 119; dispatched arms 96 → 109
+    (grew through PRs #30 + #31 plus the merge train).
+  - `rt_sigreturn`, `sys_clone` `newsp` rejection, and the
+    pipe/eventfd/timerfd/process adapter `register_source` gaps moved
+    from **Already-partial** to a new "Recently closed" subsection.
+  - OSComp "Currently passing (basic-musl)" rewritten to enumerate the
+    full 32/32 set by name (was "brk, chdir, close, mkdir, unlink,
+    sleep" at seed).
+  - High-stakes table: `fork` + CLOEXEC row removed (audit found it was
+    already wired); added a `utimensat` + `/proc` row reflecting the
+    busybox-musl gap; reordered by current LTP-impact-per-effort.
+  - LTP section reframed: today's coverage is the *shape* implied by
+    syscall wiring, not a named-test list — recording a TODO to run an
+    actual LTP image inside QEMU and enumerate passing tests by name.
+
+  **Verification:** doc renders; `cargo xtask progress validate` —
+  records ok; no syscall code changed in this catch-up. Reference:
+  [`docs/progress/SYSCALL_STATUS.md`](SYSCALL_STATUS.md).
+
+  **Next:** capture an LTP-in-QEMU run and populate `Currently passing
+  (LTP)`. Then start work on the top high-stakes row
+  (`preadv`/`pwritev`/`fallocate`).
+
 - 2026-05-18 **All 32 basic-musl OSComp tests now pass on rv64-qemu.**
   Three sessions of work on `cc/great-ptolemy-982e05` brought the count
   from ~27 to 32/32. Final blocker was a v3 WaitSource registration gap
