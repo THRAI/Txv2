@@ -12,10 +12,8 @@ use crate::tty::project::{
 };
 use crate::vfs::{Credential, DirCursor, FsObjectId, FsOps, InodeKind, InodeMeta};
 
+use crate::tty::adapter::step_engine::{guard, Errno as V3Errno, NoProgress, StepOutcome as V3};
 use tx_hal::Ppn;
-use crate::tty::adapter::step_engine::{
-    guard, Errno as V3Errno, NoProgress, StepOutcome as V3,
-};
 
 /// Register every kernel zone (matching `legacy_phase_a::init_zones`)
 /// because `open_ptmx` allocates PTY identity / payload / open-file
@@ -289,7 +287,7 @@ fn devpts_v3_fs_page_backing_returns_enosys() {
         V3::<(), NoProgress>::err(V3Errno::ENOSYS)
     );
     assert_eq!(
-        <DevptsInstance as FsPageBacking>::fsync(&devpts, DEVPTS_PTMX_OBJECT_ID, &guard),
+        <DevptsInstance as FsPageBacking>::fsync_file(&devpts, DEVPTS_PTMX_OBJECT_ID, &guard),
         V3::<(), NoProgress>::err(V3Errno::ENOSYS)
     );
 }

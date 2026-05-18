@@ -1,4 +1,6 @@
 #![no_std]
 
 pub mod adapter;
-pub use adapter::step_engine::{init_host, drain_to_quiescence, drain_once_unbounded, EpochSummary};
+pub use adapter::step_engine::{
+    drain_once_unbounded, drain_to_quiescence, init_host, EpochSummary,
+};

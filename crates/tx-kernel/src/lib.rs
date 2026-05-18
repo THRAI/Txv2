@@ -13,6 +13,7 @@ pub mod irq;
 pub mod thread_future;
 pub mod trap;
 pub mod trap_handoff;
+pub mod vdso;
 
 use tx_hal::{BootHandoff, TxPlatform};
 

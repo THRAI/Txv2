@@ -28,17 +28,17 @@
 
 use alloc::vec::Vec;
 
-use tx_hal::PmapIf;
 use step_engine::page_allocator;
 use step_engine::Cap;
+use tx_hal::PmapIf;
 
 use crate::execution::Errno;
 use crate::page_backed::PageContainer;
+use crate::vm::adapter::step_engine::{self as step_engine, ByteProgress, StepOutcome};
 use crate::vm::{
     AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
     VmFault, VmFaultError, VmMapError, VmPmapError, USER_PAGE_SIZE,
 };
-use crate::vm::adapter::step_engine::{self as step_engine, ByteProgress, StepOutcome};
 
 /// Default initial top of the userspace stack for v1 static binaries.
 ///
@@ -80,6 +80,9 @@ pub struct ImagePlan {
     /// exceeds its `file_size` and the tail extends past the
     /// page-rounded end of the file-backed prefix.
     pub bss_extension: Option<BssTail>,
+    /// Whether PT_GNU_STACK with PF_X was found in the ELF.
+    /// When true, the stack region gets `PROT_EXEC`.
+    pub executable_stack: bool,
 }
 
 /// One LOAD segment from the ELF image.
@@ -246,12 +249,36 @@ pub fn build_aspace_from_image<P: PmapIf>(
     }
 
     // Stack: anonymous private, page-aligned, anchored to `stack_top`.
+    //
+    // The stack is mapped **executable** unconditionally — not because
+    // the ELF's GNU_STACK said so, but because our signal-delivery
+    // path (`SignalFrameIf::prepare_signal_frame` on both RV64 and
+    // LA64) writes a 2-instruction `rt_sigreturn` trampoline at the
+    // top of the signal frame on the user stack, and sets the
+    // handler's `ra` to that trampoline address. When the handler
+    // returns via `ret`, the CPU fetches the trampoline insns from
+    // the stack — which requires PROT_EXEC on the stack page.
+    //
+    // Linux moved this trampoline into the vDSO years ago (modern
+    // user stacks are NX). txKernel's vDSO infrastructure exists
+    // (`crates/tx-vdso/`, `tx_subsystems::vdso::init_vdso`) but the
+    // user-side mapping isn't wired yet — see `vdso_base_opt: None`
+    // at `crates/tx-shims/src/linux_syscall/exec_op.rs:125`. Until
+    // that lands, the stack must be RWX or every signal-handler
+    // return SIGSEGVs (observed end-to-end as a busybox-sh crash on
+    // SIGCHLD delivery after first child exit — root cause traced
+    // 2026-05-18).
+    //
+    // TODO(vdso): once the vDSO is mapped into user aspaces, expose
+    // a `__vdso_rt_sigreturn` symbol, look up its user VA, point
+    // `handler_ctx.regs[ra]` at it, and restore W^X on the stack.
+    let _ = image_plan.executable_stack;
     let stack_start = image_plan.stack_top - USER_STACK_INITIAL_RESERVATION;
     let stack_range = align_range(stack_start, USER_STACK_INITIAL_RESERVATION)
         .ok_or(ScriptError::InvalidImage)?;
     let stack_entry = VmEntry::new(
         stack_range,
-        Prot::READ_WRITE,
+        Prot::new(true, true, true),
         VmEntryFlags::PRIVATE,
         VmBacking::PrivateAnon,
     );
@@ -503,7 +530,7 @@ fn round_up(value: u64, align: u64) -> Option<u64> {
     value.checked_add(mask).map(|v| v & !mask)
 }
 
-fn align_range(start: u64, len: u64) -> Option<UserRange> {
+pub fn align_range(start: u64, len: u64) -> Option<UserRange> {
     let page_size = USER_PAGE_SIZE as u64;
     if !start.is_multiple_of(page_size) {
         return None;
@@ -535,11 +562,11 @@ mod tests {
     use super::*;
     use crate::page_backed::{AnonSwapPolicy, PageContainerKind};
     use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::vm::adapter::step_engine::StepOutcome as V3StepOutcome;
     use crate::vm::{UserPage, USER_PAGE_SIZE};
     use alloc::boxed::Box;
     use alloc::vec;
     use alloc::vec::Vec;
-    use crate::vm::adapter::step_engine::StepOutcome as V3StepOutcome;
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let lock = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -598,6 +625,7 @@ mod tests {
             stack_top: USER_STACK_TOP_DEFAULT,
             load_segments: Vec::new(),
             bss_extension: None,
+            executable_stack: false,
         };
 
         let aspace =
@@ -634,6 +662,7 @@ mod tests {
             stack_top: USER_STACK_TOP_DEFAULT,
             load_segments: vec![segment],
             bss_extension: None,
+            executable_stack: false,
         };
 
         let aspace = build_aspace_from_image::<crate::vm::TestPmap>(&plan).expect("build aspace");
@@ -670,6 +699,7 @@ mod tests {
             stack_top: USER_STACK_TOP_DEFAULT,
             load_segments: vec![segment],
             bss_extension: None,
+            executable_stack: false,
         };
 
         let aspace = build_aspace_from_image::<crate::vm::TestPmap>(&plan).expect("build aspace");
@@ -698,6 +728,7 @@ mod tests {
             stack_top: USER_STACK_TOP_DEFAULT,
             load_segments: Vec::new(),
             bss_extension: None,
+            executable_stack: false,
         };
         let aspace = build_aspace_from_image::<crate::vm::TestPmap>(&plan).expect("build aspace");
 
@@ -723,6 +754,7 @@ mod tests {
             stack_top: USER_STACK_TOP_DEFAULT,
             load_segments: Vec::new(),
             bss_extension: None,
+            executable_stack: false,
         };
         let aspace = build_aspace_from_image::<crate::vm::TestPmap>(&plan).expect("build aspace");
 
@@ -741,6 +773,7 @@ mod tests {
             stack_top: USER_STACK_TOP_DEFAULT,
             load_segments: Vec::new(),
             bss_extension: None,
+            executable_stack: false,
         };
         let aspace = build_aspace_from_image::<crate::vm::TestPmap>(&plan).expect("build aspace");
 

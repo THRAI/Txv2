@@ -49,6 +49,7 @@ impl IoVecProgress {
 }
 
 impl StepProgress for IoVecProgress {
+    type Output = ();
     const EMPTY: Self = IoVecProgress {
         iovecs_complete: 0,
         partial_bytes_in_current: 0,
@@ -56,6 +57,10 @@ impl StepProgress for IoVecProgress {
 
     fn is_empty(&self) -> bool {
         self.iovecs_complete == 0 && self.partial_bytes_in_current == 0
+    }
+
+    fn into_output(self) -> Option<()> {
+        None
     }
 
     fn extend(&mut self, other: Self) {

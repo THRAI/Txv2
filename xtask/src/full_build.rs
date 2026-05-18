@@ -77,7 +77,7 @@ mod tests {
     fn skip_doctor_flag_parsed() {
         // Just verify the flag string is detected; full_build itself calls
         // doctor which requires a real toolchain, so we test flag parsing only.
-        let args = vec!["--skip-doctor".to_string(), "--no-image".to_string()];
+        let args = ["--skip-doctor".to_string(), "--no-image".to_string()];
         assert!(args.iter().any(|a| a == "--skip-doctor"));
         assert!(args.iter().any(|a| a == "--no-image"));
     }

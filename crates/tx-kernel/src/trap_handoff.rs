@@ -31,12 +31,14 @@
 //!   `aspace.fault_script`. The trap shell itself does not call
 //!   `fault_script` (cannot `.await`).
 
-use tx_hal::{FaultInfo, TrapAction, TrapFrameMut, TrapFrameView, TxPlatform};
 use boot_runtime::userspace::{
     PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, UserAddr, UserspaceRunError,
     UserspaceRunSlot, UserspaceTrapInfo,
 };
+use tx_hal::{FaultInfo, TrapAction, TrapFrameMut, TrapFrameView, TxPlatform};
 
+use crate::adapter::boot_runtime;
+use crate::adapter::step_engine::PayloadCap;
 /// Re-export of the reactor's `SyscallRequest` so downstream crates
 /// (notably `tx-shims::linux_syscall::dispatch`) consume it through
 /// the kernel-level seam rather than reaching into the reactor crate
@@ -46,8 +48,6 @@ use boot_runtime::userspace::{
 /// reactor.
 pub use boot_runtime::userspace::SyscallRequest;
 use tx_subsystems::thread_runtime::{current_thread_payload, ThreadPayload};
-use crate::adapter::step_engine::PayloadCap;
-use crate::adapter::boot_runtime;
 
 /// Re-export of the reactor's [`PageFaultAccess`] for the trap-shell
 /// surface. Phase 1 uses the reactor enum unchanged; the plan's

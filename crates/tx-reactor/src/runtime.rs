@@ -6,6 +6,11 @@ use core::{
     task::{Context, Poll},
 };
 
+use crate::adapter::bus_wire::{
+    DeclaredPort, DeclaredQueue, WireDeclaration, WireDeclarationError, WireEventSet,
+};
+use tx_substrate::wake::mailbox::TaskMailbox;
+
 use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect},
     dispatch::{DispatchState, NoopRescheduleSignal, RescheduleSignal, WakeDispatchReport},
@@ -23,9 +28,6 @@ use crate::{
     },
     wait,
     waker::task_waker,
-};
-use crate::adapter::bus_wire::{
-    DeclaredPort, DeclaredQueue, WireDeclaration, WireDeclarationError, WireEventSet,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +105,8 @@ pub struct Reactor {
     scheduler: Phase1Scheduler,
     dispatch: DispatchState,
     timers: TimerQueue,
+    timer_wheel: tx_substrate::wake::timer::TimerWheel,
+    delegate_registry: Arc<tx_substrate::step::DelegateRegistry>,
     userspace: UserspaceRunSlot,
 }
 
@@ -144,6 +148,8 @@ impl Reactor {
             scheduler: Phase1Scheduler::new(),
             dispatch: DispatchState::new(),
             timers: TimerQueue::new(),
+            timer_wheel: tx_substrate::wake::timer::TimerWheel::new(),
+            delegate_registry: Arc::new(tx_substrate::step::DelegateRegistry::new()),
             userspace: UserspaceRunSlot::new(),
         }
     }
@@ -196,6 +202,7 @@ impl Reactor {
 
     /// Advances the reactor-owned absolute nanosecond clock and wakes expired timers.
     pub fn advance_time_to(&mut self, now_ns: u64) -> usize {
+        self.timer_wheel.fire_due(now_ns);
         self.timers.advance_time_to(now_ns)
     }
 
@@ -405,12 +412,34 @@ impl Reactor {
                 task.wake_state.clear();
                 task.consume_ast_markers();
 
+                // drive-taskmb: expose the task's mailbox so the trampoline
+                // can inject it into SyscallCtx (and from there into ScriptCtx
+                // for drive() yield resolution).
+                crate::task::set_current_mailbox(Some(Arc::clone(&task.mailbox)));
+
+                // drive-taskmb: expose the reactor's timer wheel for OnTimer
+                // yield resolution.
+                crate::task::set_current_timer_wheel(Some(self.timer_wheel.clone()));
+
+                // drive-taskmb: expose the reactor's delegate registry
+                // for OnAgent yield resolution.
+                crate::task::set_current_delegate_registry(Some(Arc::clone(
+                    &self.delegate_registry,
+                )));
+
                 let Some(future) = task.future.as_mut() else {
+                    crate::task::set_current_mailbox(None);
+                    crate::task::set_current_timer_wheel(None);
+                    crate::task::set_current_delegate_registry(None);
                     continue;
                 };
 
                 stats.polled += 1;
-                future.as_mut().poll(&mut cx)
+                let result = future.as_mut().poll(&mut cx);
+                crate::task::set_current_mailbox(None);
+                crate::task::set_current_timer_wheel(None);
+                crate::task::set_current_delegate_registry(None);
+                result
             };
 
             match poll {
@@ -492,6 +521,11 @@ impl Reactor {
 
     pub fn last_stop_reason(&self, task: TaskId) -> Option<StopReason> {
         self.tasks.last_stop_reason_by_id(task)
+    }
+
+    /// Returns the task's `TaskMailbox` for yield resolution (drive-taskmb).
+    pub fn task_mailbox(&self, task: TaskKey) -> Result<Arc<TaskMailbox>, TaskLifecycleError> {
+        self.tasks.mailbox(task)
     }
 
     pub fn next_scheduled_task(&mut self, hart: HartId) -> Option<(TaskHandle, SliceConfig)> {

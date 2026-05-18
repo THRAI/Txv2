@@ -7,6 +7,7 @@
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
 use crate::process::{bootstrap_init_process, step_exit_group, step_fork, ExitStatus};
+use crate::signal::adapter::step_engine::Cap;
 use crate::signal::{
     step_kill_pgrp, step_kill_process, step_sigaction, KillOutcome, PendingSignalQueue,
     SigDisposition, SigDispositionChange, SignalMask, Signum,
@@ -16,7 +17,6 @@ use crate::thread_runtime::execution::{step_sigprocmask, SigmaskHow, Sigprocmask
 use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentity};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
-use crate::signal::adapter::step_engine::Cap;
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -40,7 +40,7 @@ fn bootstrap() -> Cap<ProcessIdentity> {
 fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
     let payload_guard = proc_cap.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");
-    let threads = payload.threads.lock();
+    let threads = payload.threads.snapshot();
     threads[0].clone()
 }
 
@@ -99,7 +99,7 @@ fn kill_process_routes_signal_to_first_live_thread() {
     let proc_cap = bootstrap();
     let leader = first_thread(&proc_cap);
 
-    let outcome = step_kill_process(&proc_cap, Signum::SIGTERM);
+    let outcome = step_kill_process(&proc_cap, Signum::SIGTERM, None);
     assert_eq!(outcome, KillOutcome::Delivered);
 
     let pending = leader
@@ -116,7 +116,7 @@ fn kill_zombie_process_returns_no_live_thread() {
     let proc_cap = bootstrap();
     step_exit_group(&proc_cap, ExitStatus::Exited(0));
 
-    let outcome = step_kill_process(&proc_cap, Signum::SIGTERM);
+    let outcome = step_kill_process(&proc_cap, Signum::SIGTERM, None);
     assert_eq!(outcome, KillOutcome::NoLiveThread);
 }
 
@@ -124,8 +124,8 @@ fn kill_zombie_process_returns_no_live_thread() {
 fn kill_pgrp_fans_out_to_every_live_member() {
     let _g = setup();
     let parent = bootstrap();
-    let child_a = step_fork::<TestPmap>(&parent).expect("fork a");
-    let child_b = step_fork::<TestPmap>(&parent).expect("fork b");
+    let child_a = step_fork::<TestPmap>(&parent, false).expect("fork a");
+    let child_b = step_fork::<TestPmap>(&parent, false).expect("fork b");
     let pgrp = parent.pgrp_cap();
 
     let delivered = step_kill_pgrp(&pgrp, Signum::SIGINT);
@@ -146,7 +146,7 @@ fn kill_pgrp_fans_out_to_every_live_member() {
 fn kill_pgrp_skips_zombie_members_in_count() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     step_exit_group(&child, ExitStatus::Exited(0));
 
     let pgrp = parent.pgrp_cap();
@@ -267,8 +267,8 @@ fn deliverable_bits_filter_blocked_pending_correctly() {
     block.block(Signum::SIGTERM);
     let _ = step_sigprocmask(&leader, SigmaskHow::Block, block);
 
-    step_kill_process(&proc_cap, Signum::SIGTERM);
-    step_kill_process(&proc_cap, Signum::SIGINT);
+    step_kill_process(&proc_cap, Signum::SIGTERM, None);
+    step_kill_process(&proc_cap, Signum::SIGINT, None);
 
     let payload_guard = leader.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");

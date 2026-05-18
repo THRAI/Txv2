@@ -10,8 +10,7 @@
 //! `WouldBlock` outcome into an awaitable wait via `WouldBlock::wait_token`.
 
 use crate::vm::adapter::step_engine::{
-    InterestMask, NoProgress, SpinMutex, StepOp, StepOutcome as V3StepOutcome, SubjectIdentity, WaitSourceId,
-    YieldShape,
+    InterestMask, NoProgress, SpinMutex, StepOutcome as V3StepOutcome, WaitSourceId, YieldShape,
 };
 use crate::vm::adapter::wait_routing::{Channel, Mask};
 

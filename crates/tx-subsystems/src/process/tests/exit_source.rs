@@ -33,7 +33,7 @@ fn post_sigchld_to_parent_fires_exit_source() {
     use crate::process::adapter::wait_routing::Mask;
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     // Park a wait future on the parent's exit_source BEFORE the
     // child zombifies so the fire site has an awaiter to release.
@@ -77,7 +77,7 @@ fn post_sigchld_to_parent_fires_exit_source() {
 fn step_fork_clones_init_with_fresh_exit_source() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     let parent_id = parent.exit_source_id().expect("parent live");
     let child_id = child.exit_source_id().expect("child live");

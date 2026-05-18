@@ -10,6 +10,7 @@ use crate::tty::adapter::step_engine::StepOutcome as V3Out;
 use crate::tty::adapter::step_engine::{self as step_engine, Cap};
 
 use crate::execution::{Errno, Guard};
+use crate::mount::MountPayload;
 use crate::tty::execution;
 use crate::tty::structure::registry;
 use crate::tty::structure::TtyIdentity;
@@ -298,8 +299,8 @@ impl PtyIndexName {
 // other helpers, per the wave-4/6/7/9a trait-impl convention.
 
 use crate::page_backed::{Frame, FsPageBacking, PageContainer};
-use crate::vfs::FsOps;
 use crate::tty::adapter::step_engine::{NoProgress, StepOutcome};
+use crate::vfs::FsOps;
 
 impl FsOps for DevptsInstance {
     fn lookup(
@@ -332,23 +333,14 @@ impl FsOps for DevptsInstance {
         _guard: &Guard<'_>,
     ) -> StepOutcome<InodeMeta, NoProgress> {
         if fs_object_id == DEVPTS_ROOT_OBJECT_ID {
-            return StepOutcome::done(InodeMeta::new(
-                InodeKind::Directory,
-                0o040755,
-            ));
+            return StepOutcome::done(InodeMeta::new(InodeKind::Directory, 0o040755));
         }
         if fs_object_id == DEVPTS_PTMX_OBJECT_ID {
-            return StepOutcome::done(InodeMeta::new(
-                InodeKind::CharDevice,
-                0o020666,
-            ));
+            return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, 0o020666));
         }
         if let Some(index) = pty_index_from_devpts_object_id(fs_object_id) {
             if registry::contains_pty_slave(index) {
-                return StepOutcome::done(InodeMeta::new(
-                    InodeKind::CharDevice,
-                    0o020620,
-                ));
+                return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, 0o020620));
             }
         }
         StepOutcome::err(Errno::ENOENT.into())
@@ -370,10 +362,7 @@ impl FsOps for DevptsInstance {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::EROFS.into())
     }
 
@@ -415,10 +404,7 @@ impl FsOps for DevptsInstance {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::EROFS.into())
     }
 
@@ -439,10 +425,7 @@ impl FsOps for DevptsInstance {
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::EROFS.into())
     }
 
@@ -451,10 +434,7 @@ impl FsOps for DevptsInstance {
         fs_object_id: FsObjectId,
         cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        Option<(DirEntry, DirCursor)>,
-        NoProgress,
-    > {
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
         if fs_object_id != DEVPTS_ROOT_OBJECT_ID {
             return StepOutcome::err(Errno::ENOTDIR.into());
         }
@@ -467,10 +447,7 @@ impl FsOps for DevptsInstance {
         let Some(entry) = entries.get(index).copied() else {
             return StepOutcome::done(None);
         };
-        StepOutcome::done(Some((
-            entry,
-            DirCursor::from_u64(cursor.as_u64() + 1),
-        )))
+        StepOutcome::done(Some((entry, DirCursor::from_u64(cursor.as_u64() + 1))))
     }
 
     fn destroy_inode(
@@ -489,9 +466,51 @@ impl FsOps for DevptsInstance {
         StepOutcome::err(Errno::ENOENT.into())
     }
 
-    // `read_link`, `materialise_rnode`, `step_chmod`, `step_chown`:
-    // devpts does not override these. The v3 trait defaults return
-    // `ENOSYS`, so leave them unimplemented here.
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        mount: &Cap<MountPayload>,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<Cap<RNode>, NoProgress> {
+        if fs_object_id == DEVPTS_PTMX_OBJECT_ID {
+            // Opening /dev/ptmx creates a fresh pty pair.  The
+            // master side is materialised as an RNode backed by
+            // the master TtyIdentity; the slave is registered in
+            // the pty-slave table so subsequent lookups under
+            // /dev/pts/<N> can resolve it.
+            let outcome = match execution::step_openpty(guard) {
+                StepOutcome::Done(o) => o,
+                StepOutcome::Err(e) => return StepOutcome::err(e),
+                StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                    return StepOutcome::err(Errno::EIO.into());
+                }
+            };
+            match RNode::new_cap_in_mount(
+                fs_object_id,
+                meta,
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::Tty(outcome.master),
+                },
+                mount,
+            ) {
+                Ok(rnode) => StepOutcome::done(rnode),
+                Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
+            }
+        } else if let Some(index) = pty_index_from_devpts_object_id(fs_object_id) {
+            // The devpts pty-slave path still resolves via the
+            // process-wide registry; it constructs its own RNode
+            // without a mount stamp because devpts inodes are not
+            // page-backed and have no FsOps-side operations.
+            let _ = mount;
+            devpts_rnode_by_index(index, guard)
+        } else {
+            StepOutcome::err(Errno::ENOSYS.into())
+        }
+    }
+
+    // `read_link`, `step_chmod`, `step_chown`: devpts does not
+    // override these. The v3 trait defaults return `ENOSYS`.
 }
 
 impl FsPageBacking for DevptsInstance {
@@ -528,7 +547,7 @@ impl FsPageBacking for DevptsInstance {
         StepOutcome::err(step_engine::Errno::ENOSYS)
     }
 
-    fn fsync(
+    fn fsync_file(
         &self,
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,

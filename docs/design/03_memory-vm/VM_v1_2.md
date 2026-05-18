@@ -1064,12 +1064,12 @@ Range operations often split existing VmEntries. The substrate mutation primitiv
 
 **Eventual fix.** hugetlbfs-style explicit huge pages first; THP is post-v1.
 
-### 9.3 No userfaultfd
+### 9.3 userfaultfd — Phase 1 landed
 <!-- txdoc:VM-9-3-NO-USERFAULTFD -->
 
-**Consequence.** Userspace cannot participate in page-fault handling (used by CRIU, post-copy live migration, userspace garbage collectors).
+**Status.** Phase 1 (PR-10) implemented. `UFFDIO_REGISTER` tags VMAs with a `UfdRegistration` key; the fault path dispatches to a userfaultfd agent via `UfdDispatch`, yielding `OnAgent` for page-backed and private-anon fault targets. `UFFDIO_COPY` byte-move materialises agent-provided pages under the Materializer lock. `NullUfdDispatch` is the default no-op dispatcher for the non-UFD path.
 
-**Eventual fix.** Add if a concrete consumer emerges.
+**Deferred.** `UFFDIO_ZEROPAGE`, `UFFDIO_WAKE`, `UFFDIO_WRITEPROTECT`, `UFFDIO_CONTINUE`, and non-PageBacked/PrivateAnon backing support are not yet implemented. Range-registration partial-VMA splitting is out of scope for phase 3.
 
 ### 9.4 mlock as observation only
 <!-- txdoc:VM-9-4-MLOCK-AS-OBSERVATION-ONLY -->

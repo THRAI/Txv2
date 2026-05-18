@@ -56,7 +56,7 @@ use tx_subsystems::vfs::OpenFile;
 
 use super::ENOMEM_VALUE;
 use super::{SyscallCtx, SyscallResult};
-use crate::adapter::step_engine::{SpinMutex, StepOp, SubjectIdentity};
+use crate::adapter::step_engine::SpinMutex;
 
 /// Build the owner's `SubjectContext` from the syscall ctx. Mirrors
 /// the helper used by `linux_syscall::aio::sys_io_setup` — see that

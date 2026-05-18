@@ -53,6 +53,7 @@ fn step_outcome_has_exactly_four_variants_via_exhaustive_match() {
                     }
                     YieldShape::OnAgent { .. } => {}
                     YieldShape::OnTimer { .. } => {}
+                    YieldShape::OnEdge { .. } => {}
                 }
             }
             StepOutcome::Done(v) => assert_eq!(v, 42),
@@ -75,7 +76,7 @@ fn step_outcome_continue_carries_progress() {
 
 #[test]
 fn errno_mirrors_v4_catalog() {
-    // The `step_v3::Errno` catalog mirrors `tx_subsystems::execution
+    // The `step::Errno` catalog mirrors `tx_subsystems::execution
     // ::Errno` byte-for-byte (27 variants). Closed-catalog discipline:
     // an exhaustive match with no wildcard arm so adding a variant
     // later requires mirroring it here.
@@ -138,7 +139,8 @@ fn errno_mirrors_v4_catalog() {
             | Errno::EROFS
             | Errno::ESPIPE
             | Errno::ESRCH
-            | Errno::ESTALE => {}
+            | Errno::ESTALE
+            | Errno::EINTR => {}
         }
     }
 }
@@ -161,6 +163,7 @@ fn step_outcome_yield_carries_progress_and_shape() {
             }
             YieldShape::OnAgent { .. } => panic!("expected OnWaitSource, got OnAgent"),
             YieldShape::OnTimer { .. } => panic!("expected OnWaitSource, got OnTimer"),
+            YieldShape::OnEdge { .. } => panic!("expected OnWaitSource, got OnEdge"),
         }
     } else {
         panic!("expected Yield");
@@ -184,6 +187,7 @@ fn yield_shape_has_onwaitsource_variant_with_source_and_interests() {
         }
         YieldShape::OnAgent { .. } => panic!("expected OnWaitSource, got OnAgent"),
         YieldShape::OnTimer { .. } => panic!("expected OnWaitSource, got OnTimer"),
+        YieldShape::OnEdge { .. } => panic!("expected OnWaitSource, got OnEdge"),
     }
 }
 

@@ -1,7 +1,7 @@
 //! Phase 3b boot-wiring tests.
 //!
 //! Exercises the new ordered steps `register_console_hardware` →
-//! `mount_rootfs_tmpfs` → `mount_devfs_at_dev` →
+//! `mount_rootfs_from_boot_media` → `mount_devfs_at_dev` →
 //! `register_devfs_console_alias` → `bind_init_cwd_and_root`. The
 //! tests bypass `init_substrate_if_ready` (which depends on the full
 //! HAL `BootHandoff` shape) and call each method on a stub
@@ -20,8 +20,8 @@ use std::sync::Mutex;
 
 use tx_hal::{
     AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
-    PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PtNode,
+    ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PtNode,
 };
 
 /// Page size used to fabricate distinct test pmap roots. tx-hal
@@ -32,14 +32,13 @@ const TEST_PAGE_SIZE: usize = 4096;
 
 use crate::init::{console_tty, dev_mount, root_mount, CoreInit};
 
+use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, StepOutcome};
 /// Serialise every test in this module against the rest of tx-kernel's
 /// test set: they all touch the global `INIT_PROCESS` / mount / TTY
 /// slots plus the per-CPU epoch domain (which forbids guard nesting
 /// on the same CPU). One lock keeps the kernel test set
 /// deterministic; same shape `tx-fs` uses.
 use crate::test_serialise::KERNEL_TEST_LOCK as INIT_TEST_LOCK;
-use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, StepOutcome};
-use crate::adapter::boot_runtime::userspace::SyscallRequest;
 
 /// Test-only platform satisfying every `TxPlatform` super-trait. The
 /// pmap surface uses a host-side `Mutex`-guarded `BTreeMap` mirroring
@@ -149,8 +148,8 @@ impl tx_hal::TrapIf for TestPlatform {
     ///    assert Plan B writeback discipline produced the right
     ///    merged value.
     /// 2. Return.
-    fn enter_userspace_with_context(ctx: tx_hal::UserTrapContext) {
-        *LAST_USERSPACE_CTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctx);
+    fn enter_userspace_with_context(ctx: &tx_hal::UserTrapContext, _root: &tx_hal::PmapRoot) {
+        *LAST_USERSPACE_CTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(*ctx);
         USERSPACE_A0_LOG
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -177,6 +176,7 @@ impl tx_hal::DmaIf for TestPlatform {}
 impl tx_hal::SmpIf for TestPlatform {}
 
 impl tx_hal::EntropyIf for TestPlatform {}
+impl ObserverIf for TestPlatform {}
 
 impl tx_hal::PowerIf for TestPlatform {
     fn system_off() -> ! {
@@ -283,9 +283,10 @@ fn drive_boot_wiring() {
     // platform-publication path in the boot-wiring smoke.
     CoreInit::<TestPlatform>::install_irq_handlers();
     CoreInit::<TestPlatform>::init_block_devices();
-    CoreInit::<TestPlatform>::mount_rootfs_tmpfs();
+    CoreInit::<TestPlatform>::mount_rootfs_from_boot_media();
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
     CoreInit::<TestPlatform>::register_devfs_console_alias();
+    CoreInit::<TestPlatform>::mount_bdevfs_at_dev_block();
     CoreInit::<TestPlatform>::bind_init_cwd_and_root();
 }
 
@@ -373,7 +374,7 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
     let cred = Credential::root();
     let guard = guard();
     use step_engine::StepOutcome as V3;
-    let outcome = block_on(walker::step_walk(cwd, b"/dev/console", &cred, &guard));
+    let outcome = walker::step_walk(cwd, b"/dev/console", &cred, &guard);
     drop(guard);
 
     let dentry = match outcome {
@@ -397,6 +398,49 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
         }
         other => panic!("expected StructBacked Tty backing, got {other:?}"),
     }
+}
+
+/// Post-`mount_bdevfs_at_dev_block`, the VFS walker must resolve
+/// `/dev/block` to the bdev-fs root directory (not the synthetic
+/// devfs stub). On the TestPlatform host, no virtio block device
+/// initialises, so bdev-fs's namespace is empty — but the *mount
+/// crossing itself* must publish, otherwise nothing else in the
+/// boot is exercising the bdev-fs design contract
+/// (`docs/design/05_filesystem/BDEV_FS.md` §7.1).
+#[test]
+fn boot_smoke_walker_resolves_dev_block_after_bdevfs_mount() {
+    use tx_subsystems::vfs::{walker, Credential, RNodeBacking};
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let cwd = init.cwd().expect("init cwd must be bound");
+    let cred = Credential::root();
+    let guard = guard();
+    use step_engine::StepOutcome as V3;
+    let outcome = walker::step_walk(cwd, b"/dev/block", &cred, &guard);
+    drop(guard);
+
+    let dentry = match outcome {
+        V3::Done(d) => d,
+        other => panic!("step_walk(/dev/block) must succeed after bdev-fs mount, got {other:?}"),
+    };
+
+    // The walker must have crossed the devfs → bdev-fs boundary:
+    // the resolved RNode is bdev-fs's root, not devfs's `/block`
+    // mountpoint stub. The fs_object_id is BDEVFS_ROOT_ID.
+    assert_eq!(
+        dentry.rnode().fs_object_id(),
+        tx_fs::bdevfs::BDEVFS_ROOT_ID,
+        "/dev/block must resolve to bdev-fs's root (BDEVFS_ROOT_ID), \
+         not devfs's synthetic stub"
+    );
+    assert!(
+        matches!(dentry.rnode().backing(), RNodeBacking::Directory),
+        "/dev/block is a Directory"
+    );
 }
 
 #[test]
@@ -572,10 +616,10 @@ fn boot_smoke_init_fds_preopened_to_console() {
 /// per the inverted loop's enter-then-await shape.
 #[test]
 fn boot_smoke_production_userspace_loop_writes_console_then_exits() {
+    use crate::adapter::boot_runtime::userspace::{SyscallRequest, UserspaceTrapInfo};
     use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll, Waker};
-    use crate::adapter::boot_runtime::userspace::{SyscallRequest, UserspaceTrapInfo};
     use tx_shims::linux_syscall::{NR_EXIT_GROUP, NR_WRITE};
     use tx_subsystems::process::ExitStatus;
 
@@ -834,16 +878,23 @@ fn boot_smoke_bootstrap_exec_seeds_init_user_context_from_fixture() {
         "saved pc matches fixture's hand-encoded e_entry"
     );
     // sp lives at regs[2] per RV64 SysV ABI; should be the
-    // 16-byte-aligned initial_sp from build_initial_user_stack
-    // (somewhere in the [USER_STACK_TOP_DEFAULT - 16 KiB,
-    // USER_STACK_TOP_DEFAULT) range).
+    // 16-byte-aligned initial_sp from build_initial_user_stack.
+    // `exec_script` applies stack-top ASLR (commit 500bf17:
+    // "VDSO + dynamic linking + AUXV completeness + security
+    // hardening"): the effective stack top is
+    // `USER_STACK_TOP_DEFAULT + r` where `r` is a page-aligned
+    // random offset in `[0, 0x80_0000)`. Initial sp lands inside
+    // `[effective_top - 16 KiB, effective_top]`.
     use tx_subsystems::vm::scripts::{USER_STACK_INITIAL_RESERVATION, USER_STACK_TOP_DEFAULT};
+    const MAX_STACK_TOP_ASLR_OFFSET: u64 = 0x80_0000;
     let sp = saved.regs[2] as u64;
+    let max_top = USER_STACK_TOP_DEFAULT + MAX_STACK_TOP_ASLR_OFFSET;
+    let min_sp = USER_STACK_TOP_DEFAULT - USER_STACK_INITIAL_RESERVATION;
     assert!(
-        sp <= USER_STACK_TOP_DEFAULT
-            && sp > USER_STACK_TOP_DEFAULT - USER_STACK_INITIAL_RESERVATION,
-        "saved sp {sp:#x} lands inside the initial 16 KiB stack reservation \
-         (USER_STACK_TOP_DEFAULT={USER_STACK_TOP_DEFAULT:#x})"
+        sp <= max_top && sp > min_sp,
+        "saved sp {sp:#x} lands inside the ASLR-widened stack \
+         reservation window (USER_STACK_TOP_DEFAULT={USER_STACK_TOP_DEFAULT:#x}, \
+         max_top={max_top:#x}, min_sp={min_sp:#x})"
     );
     assert_eq!(sp & 0xF, 0, "saved sp is 16-byte aligned per SysV ABI");
 
@@ -921,7 +972,7 @@ fn reactor_submission_seam_submits_child_thread_smoke() {
     // the call is a clean no-op (no panic, no submission).
     let init = tx_subsystems::process::execution::init_process()
         .expect("INIT_PROCESS populated by bootstrap_init");
-    let child = tx_subsystems::process::step_fork::<TestPlatform>(&init).expect("fork");
+    let child = tx_subsystems::process::step_fork::<TestPlatform>(&init, false).expect("fork");
     let leader = child
         .nth_thread(0)
         .expect("fresh child has a leader thread");
@@ -1312,18 +1363,12 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
 
     let root_mount =
         crate::init::root_mount().expect("register_setuid_fixture: ROOT_MOUNT must be populated");
-    let fs_ops = root_mount
+    let payload = root_mount
         .payload_cap()
         .expect("rootfs payload alive in test")
-        .into_cap()
-        .fs_ops
-        .clone();
-    let fs_page_backing = root_mount
-        .payload_cap()
-        .expect("rootfs payload alive in test")
-        .into_cap()
-        .fs_page_backing
-        .clone();
+        .into_cap();
+    let fs_ops = payload.fs_ops.clone();
+    let fs_page_backing = payload.fs_page_backing.clone();
     let root_object_id = root_mount.root().fs_object_id();
 
     let bytes = &crate::init::init_setuid_fixture::INIT_SETUID_FIXTURE_BYTES[..];
@@ -1347,7 +1392,7 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     // contents — same shape as register_init_fixture_into_tmpfs.
     let pc = {
         let guard = guard();
-        let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
+        let outcome = fs_ops.materialise_rnode(file_id, file_meta, &payload, &guard);
         let rnode = match outcome {
             StepOutcome::Done(rnode) => rnode,
             other => panic!("register_setuid_fixture: materialise_rnode: {other:?}"),

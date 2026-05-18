@@ -12,7 +12,11 @@
 
 pub mod adapter;
 pub mod checks;
+pub mod composite;
 pub mod execution;
+pub mod predicates;
+pub mod require;
+pub mod resolution;
 pub mod structure;
 pub mod walker;
 
@@ -21,7 +25,10 @@ mod tests;
 
 pub use crate::cred::CapabilitySet;
 pub use checks::{DirectoryAtPath, EntityAtPath, ParentAndName, ResolveCtx, RootCtx};
-pub use execution::{FsOps, MountOutput};
+pub use execution::{
+    FileFsyncOp, FlockOp, FsOps, InodeStatOp, MountOutput, OpenFileGetFlOp, OpenFileIoctlOp,
+    OpenFileLseekOp, OpenFileSetFlOp, OpenOp, PathWalkOp,
+};
 pub use structure::{
     render_dentry_path, Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind,
     InodeMeta, OpenFile, OpenFileFlags, OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult,

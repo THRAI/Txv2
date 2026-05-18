@@ -100,9 +100,9 @@ use core::task::{Context, Poll};
 pub mod adapter;
 
 use adapter::step_engine::{
-    sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, InterestMask,
-    OnBehalfOfAbort, ScriptCtx, SpinMutex, SubjectContext, SubjectIdentity, WaitSource,
-    WaitSourceId, Zone, ZoneAllocated, ZoneError,
+    sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, InterestMask, OnBehalfOfAbort,
+    ScriptCtx, SpinMutex, SubjectContext, SubjectIdentity, WaitSource, WaitSourceId, Zone,
+    ZoneAllocated, ZoneError,
 };
 use adapter::wait_routing::Channel;
 
@@ -479,7 +479,7 @@ impl AioContext {
         drop(queue);
         // Wake any parked worker. Mirrors the pipe push path.
         self.iocb_arrived
-            .notify(InterestMask::new(IOCB_ARRIVED_MASK));
+            .notify_emit(InterestMask::new(IOCB_ARRIVED_MASK));
         Ok(())
     }
 
@@ -539,7 +539,7 @@ impl AioContext {
         self.completion_queue.lock().push_back(event);
         // Notify any parked io_getevents waiters.
         self.events_available
-            .notify(InterestMask::new(EVENTS_AVAILABLE_MASK));
+            .notify_emit(InterestMask::new(EVENTS_AVAILABLE_MASK));
     }
 
     /// Pop one completion event off the queue, if any. Used by
@@ -985,9 +985,7 @@ mod tests {
         assert!(
             matches!(
                 reason,
-                OnBehalfOfAbort::CooperativeCancel(
-                    CancelReason::OwnerRequested
-                )
+                OnBehalfOfAbort::CooperativeCancel(CancelReason::OwnerRequested)
             ),
             "cancel_worker trips OwnerRequested, got {reason:?}"
         );

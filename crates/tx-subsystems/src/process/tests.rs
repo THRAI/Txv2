@@ -7,6 +7,7 @@
 //! identity/payload split is the primary subject under test: zombies
 //! retain identity but drop payload.
 
+use crate::process::adapter::step_engine::{guard as ebr_guard, sign, Cap};
 use crate::process::execution::{
     init_process, reset_init_process_for_test, step_exit_group_with_signal, BootstrapError,
 };
@@ -24,7 +25,6 @@ use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentit
 use crate::vfs::{DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
-use crate::process::adapter::step_engine::{guard as ebr_guard, sign, Cap};
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -48,7 +48,7 @@ fn bootstrap() -> Cap<ProcessIdentity> {
 fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
     let payload_guard = proc_cap.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");
-    let threads = payload.threads.lock();
+    let threads = payload.threads.snapshot();
     threads[0].clone()
 }
 
@@ -75,7 +75,7 @@ fn fork_creates_child_with_leader_thread_and_inherits_pgrp() {
     let _g = setup();
     let parent = bootstrap();
 
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     assert_ne!(child.pid, parent.pid);
     assert_eq!(child.parent_pid(), parent.pid);
@@ -93,7 +93,7 @@ fn fork_clones_address_space_into_distinct_cap() {
     let parent = bootstrap();
     let parent_aspace = parent.aspace_cap().expect("parent live");
 
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     let child_aspace = child.aspace_cap().expect("child live");
 
     // The Cap keys must differ — child has its own address space slot.
@@ -107,7 +107,7 @@ fn fork_registers_child_in_parent_pgrp_member_list() {
     let pgrp = parent.pgrp_cap();
     let before = pgrp.member_slot_count();
 
-    let _child = step_fork::<TestPmap>(&parent).expect("fork");
+    let _child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     assert_eq!(pgrp.member_slot_count(), before + 1);
 }
@@ -119,7 +119,7 @@ fn fork_on_zombie_parent_returns_parent_zombie() {
     step_exit_group(&parent, ExitStatus::Exited(0));
     assert!(parent.is_zombie());
 
-    let result = step_fork::<TestPmap>(&parent);
+    let result = step_fork::<TestPmap>(&parent, false);
     assert!(matches!(result, Err(ForkError::ParentZombie)));
 }
 
@@ -152,7 +152,7 @@ fn exit_group_zombifies_process_at_once_and_records_status() {
 fn setpgid_to_target_pid_creates_new_group_in_same_session() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     let original_session = child.pgrp_cap().session_cap();
     let original_session_id = original_session.sid;
@@ -169,7 +169,7 @@ fn setpgid_to_target_pid_creates_new_group_in_same_session() {
 fn setpgid_with_existing_group_id_is_unimplemented() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     // child.pgid != child.pid, and we don't yet support joining an
     // existing group by id (would require session-walk).
@@ -181,7 +181,7 @@ fn setpgid_with_existing_group_id_is_unimplemented() {
 fn setsid_creates_fresh_session_and_pgrp_at_target_pid() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     let parent_session_id = parent.pgrp_cap().session_cap().sid;
 
     let new_sid = step_setsid(&child).expect("setsid");
@@ -211,7 +211,7 @@ fn pid_pgid_sid_share_value_space_but_are_distinct_types() {
 fn pgrp_member_weak_observation_returns_live_process_until_identity_drops() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     let pgrp = parent.pgrp_cap();
 
     // The pgrp has two members: parent and child.
@@ -220,6 +220,7 @@ fn pgrp_member_weak_observation_returns_live_process_until_identity_drops() {
     let guard = ebr_guard();
     let live: usize = pgrp
         .members
+        .inner
         .lock()
         .iter()
         .filter(|w| w.upgrade(&guard).is_some())
@@ -245,6 +246,7 @@ fn pgrp_member_weak_observation_returns_live_process_until_identity_drops() {
     let guard = ebr_guard();
     let live_after: usize = pgrp
         .members
+        .inner
         .lock()
         .iter()
         .filter(|w| w.upgrade(&guard).is_some())
@@ -311,7 +313,7 @@ fn waitpid_with_no_children_returns_no_children() {
 fn waitpid_with_live_child_returns_none_ready() {
     let _g = setup();
     let parent = bootstrap();
-    let _child = step_fork::<TestPmap>(&parent).expect("fork");
+    let _child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     let result = step_waitpid_nohang(&parent, WaitTarget::Any);
     assert_eq!(
@@ -325,7 +327,7 @@ fn waitpid_with_live_child_returns_none_ready() {
 fn waitpid_any_reaps_zombie_child_and_returns_status() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     let child_pid = child.pid;
     drop(child);
     let payload_was_dropped = |proc_cap: &Cap<ProcessIdentity>| proc_cap.payload.lock().is_none();
@@ -345,8 +347,8 @@ fn waitpid_any_reaps_zombie_child_and_returns_status() {
 fn waitpid_specific_pid_reaps_only_that_child() {
     let _g = setup();
     let parent = bootstrap();
-    let c1 = step_fork::<TestPmap>(&parent).expect("c1");
-    let c2 = step_fork::<TestPmap>(&parent).expect("c2");
+    let c1 = step_fork::<TestPmap>(&parent, false).expect("c1");
+    let c2 = step_fork::<TestPmap>(&parent, false).expect("c2");
 
     step_exit_group(&c1, ExitStatus::Exited(1));
     step_exit_group(&c2, ExitStatus::Exited(2));
@@ -364,7 +366,7 @@ fn waitpid_specific_pid_reaps_only_that_child() {
 fn waitpid_specific_pid_with_no_match_returns_no_children() {
     let _g = setup();
     let parent = bootstrap();
-    let _child = step_fork::<TestPmap>(&parent).expect("fork");
+    let _child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     // Selector targeting a pid we never forked.
     let result = step_waitpid_nohang(&parent, WaitTarget::Pid(Pid(9999)));
@@ -375,7 +377,7 @@ fn waitpid_specific_pid_with_no_match_returns_no_children() {
 fn waitpid_specific_pid_with_live_match_returns_none_ready() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     // Match the live child by pid — selector matches but child isn't
     // a zombie yet, so WNOHANG gives NoneReady.
@@ -387,7 +389,7 @@ fn waitpid_specific_pid_with_live_match_returns_none_ready() {
 fn waitpid_reap_withdraws_from_parent_children_list() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     let child_pid = child.pid;
 
     assert_eq!(parent.child_count(), 1);
@@ -407,7 +409,7 @@ fn waitpid_reap_withdraws_from_pgrp_members_list() {
     let _g = setup();
     let parent = bootstrap();
     let pgrp = parent.pgrp_cap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     assert_eq!(pgrp.member_slot_count(), 2); // parent + child
 
     step_exit_group(&child, ExitStatus::Exited(0));
@@ -429,7 +431,7 @@ fn waitpid_reap_withdraws_from_pgrp_members_list() {
 fn waitpid_reap_returns_signaled_status() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     let child_pid = child.pid;
 
     // Child exits via signal — recorded as ExitStatus::Signaled.
@@ -450,7 +452,7 @@ fn waitpid_reap_returns_signaled_status() {
 fn waitpid_after_reaping_all_children_returns_no_children() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     step_exit_group(&child, ExitStatus::Exited(0));
     let child_pid = child.pid;
     drop(child);
@@ -575,7 +577,7 @@ fn fork_inherits_parent_cwd() {
     let usr = fresh_dentry_under(&root, b"usr", 300);
     step_chdir(&parent, usr.clone());
 
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     // Child's cwd renders to the same path as parent's.
     let parent_path = step_getcwd(&parent).expect("parent path");
@@ -593,7 +595,7 @@ fn parent_chdir_after_fork_does_not_affect_child() {
     let var = fresh_dentry_under(&root, b"var", 401);
 
     step_chdir(&parent, usr);
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     // Parent moves to /var; child's cwd should still be /usr (it
     // got its own Cap<DEntry> at fork time pointing at /usr).
@@ -609,7 +611,7 @@ fn parent_chdir_after_fork_does_not_affect_child() {
 fn waitpid_caller_pgrp_reaps_zombie_in_callers_pgroup() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     // Child inherits parent's pgrp at fork. Both share parent.pgrp.
 
     step_exit_group(&child, ExitStatus::Exited(5));
@@ -624,7 +626,7 @@ fn waitpid_caller_pgrp_reaps_zombie_in_callers_pgroup() {
 fn waitpid_caller_pgrp_skips_child_in_other_pgroup() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     // Move child out of parent's pgrp into its own.
     step_setpgid(&child, Pgid(child.pid.0)).expect("setpgid");
@@ -642,8 +644,8 @@ fn waitpid_caller_pgrp_skips_child_in_other_pgroup() {
 fn waitpid_pgrp_selector_matches_specific_pgid() {
     let _g = setup();
     let parent = bootstrap();
-    let c1 = step_fork::<TestPmap>(&parent).expect("c1");
-    let c2 = step_fork::<TestPmap>(&parent).expect("c2");
+    let c1 = step_fork::<TestPmap>(&parent, false).expect("c1");
+    let c2 = step_fork::<TestPmap>(&parent, false).expect("c2");
 
     // Move c2 to its own pgrp.
     step_setpgid(&c2, Pgid(c2.pid.0)).expect("setpgid");
@@ -668,7 +670,7 @@ fn waitpid_pgrp_selector_matches_specific_pgid() {
 fn waitpid_pgrp_selector_with_no_matching_pgid_returns_no_children() {
     let _g = setup();
     let parent = bootstrap();
-    let _child = step_fork::<TestPmap>(&parent).expect("fork");
+    let _child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     // Pgid that no child belongs to.
     let result = step_waitpid_nohang(&parent, WaitTarget::Pgrp(Pgid(9999)));
@@ -679,7 +681,7 @@ fn waitpid_pgrp_selector_with_no_matching_pgid_returns_no_children() {
 fn waitpid_pgrp_selector_with_live_match_returns_none_ready() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     let child_pgid = child.pgrp_cap().pgid;
 
     // Live child in target pgrp — selector matches but no zombie.
@@ -691,7 +693,7 @@ fn waitpid_pgrp_selector_with_live_match_returns_none_ready() {
 
 fn leader_has_sigchld_pending(proc_cap: &Cap<ProcessIdentity>) -> bool {
     let payload = proc_cap.payload.lock();
-    let leader = payload.as_ref().expect("alive").threads.lock()[0].clone();
+    let leader = payload.as_ref().expect("alive").threads.nth(0).unwrap();
     drop(payload);
     let leader_payload = leader.payload.lock();
     leader_payload
@@ -705,7 +707,7 @@ fn leader_has_sigchld_pending(proc_cap: &Cap<ProcessIdentity>) -> bool {
 fn child_exit_via_step_exit_group_posts_sigchld_to_parent() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     assert!(!leader_has_sigchld_pending(&parent));
 
@@ -721,7 +723,7 @@ fn child_exit_via_step_exit_group_posts_sigchld_to_parent() {
 fn child_exit_via_last_thread_cascade_posts_sigchld_to_parent() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     let child_leader = first_thread(&child);
 
     step_thread_exit(child_leader, 7);
@@ -749,7 +751,7 @@ fn orphaned_child_exit_does_not_post_sigchld() {
     // parent slot to upgrade, the SIGCHLD producer skips silently.
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     step_exit_group(&parent, ExitStatus::Exited(0));
     assert!(child.parent_cap().is_none(), "severed by parent's exit");
@@ -774,10 +776,10 @@ fn zombie_parent_does_not_receive_sigchld() {
     // upgrades to a zombie identity.
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     // Manually clear parent.children so sever doesn't run on the child.
-    parent.children.lock().clear();
+    parent.children.clear();
     step_exit_group(&parent, ExitStatus::Exited(0));
     assert!(parent.is_zombie());
     // child still has parent slot pointing at the (now zombie) parent.
@@ -826,8 +828,8 @@ fn non_init_parent_exit_reparents_children_to_init() {
     // should reparent to init.
     let _g = setup();
     let init = bootstrap();
-    let middle = step_fork::<TestPmap>(&init).expect("fork middle");
-    let leaf = step_fork::<TestPmap>(&middle).expect("fork leaf");
+    let middle = step_fork::<TestPmap>(&init, false).expect("fork middle");
+    let leaf = step_fork::<TestPmap>(&middle, false).expect("fork leaf");
 
     assert_eq!(leaf.parent_pid(), middle.pid);
     let init_children_before = init.child_count();
@@ -850,7 +852,7 @@ fn init_exit_severs_children_without_reparent_target() {
     // being reparented to themselves.
     let _g = setup();
     let init = bootstrap();
-    let child = step_fork::<TestPmap>(&init).expect("fork");
+    let child = step_fork::<TestPmap>(&init, false).expect("fork");
 
     step_exit_group(&init, ExitStatus::Exited(0));
 
@@ -875,7 +877,7 @@ fn fork_pushes_child_into_parent_children_list() {
     let parent = bootstrap();
     assert_eq!(parent.child_count(), 0);
 
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     assert_eq!(parent.child_count(), 1);
     let live = parent.children();
@@ -888,9 +890,9 @@ fn multiple_forks_accumulate_in_parent_children_list() {
     let _g = setup();
     let parent = bootstrap();
 
-    let c1 = step_fork::<TestPmap>(&parent).expect("fork 1");
-    let c2 = step_fork::<TestPmap>(&parent).expect("fork 2");
-    let c3 = step_fork::<TestPmap>(&parent).expect("fork 3");
+    let c1 = step_fork::<TestPmap>(&parent, false).expect("fork 1");
+    let c2 = step_fork::<TestPmap>(&parent, false).expect("fork 2");
+    let c3 = step_fork::<TestPmap>(&parent, false).expect("fork 3");
 
     assert_eq!(parent.child_count(), 3);
     let live_pids: alloc::collections::BTreeSet<_> =
@@ -910,8 +912,8 @@ fn dropping_test_child_cap_leaves_parent_children_list_intact() {
     // when the parent itself reclaims.
     let _g = setup();
     let parent = bootstrap();
-    let c1 = step_fork::<TestPmap>(&parent).expect("fork 1");
-    let _c2 = step_fork::<TestPmap>(&parent).expect("fork 2");
+    let c1 = step_fork::<TestPmap>(&parent, false).expect("fork 1");
+    let _c2 = step_fork::<TestPmap>(&parent, false).expect("fork 2");
 
     assert_eq!(parent.child_count(), 2);
 
@@ -931,7 +933,7 @@ fn dropping_test_child_cap_leaves_parent_children_list_intact() {
 fn parent_exit_via_step_exit_group_severs_children_parent_slot() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     assert_eq!(child.parent_pid(), parent.pid);
 
     step_exit_group(&parent, ExitStatus::Exited(0));
@@ -950,7 +952,7 @@ fn parent_exit_via_last_thread_cascade_severs_children_parent_slot() {
     // sever children.
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     let parent_leader = first_thread(&parent);
 
     step_thread_exit(parent_leader, 7);
@@ -967,8 +969,8 @@ fn child_severance_does_not_affect_grandchildren() {
     // child).
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
-    let grandchild = step_fork::<TestPmap>(&child).expect("fork-of-child");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+    let grandchild = step_fork::<TestPmap>(&child, false).expect("fork-of-child");
 
     assert_eq!(grandchild.parent_pid(), child.pid);
 
@@ -1206,7 +1208,7 @@ fn process_payload_step_fork_clones_sparse_fd_table() {
     parent.set_fd(2, Some(fresh_open_file()));
     parent.set_fd(100, Some(fresh_open_file()));
 
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     // Child inherits the entire sparse map.
     assert!(child.fd(0).is_some(), "child inherits fd 0");
@@ -1253,7 +1255,7 @@ fn step_fork_clones_fd_cloexec_bits() {
     parent.set_fd_cloexec(1, true);
     parent.set_fd_cloexec(4, true);
 
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     // Child inherits parent's snapshot at fork time.
     assert!(child.fd_cloexec(1));

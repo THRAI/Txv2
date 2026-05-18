@@ -545,8 +545,8 @@ fn pagebacked_step_fallocate_is_noop_when_target_size_does_not_grow() {
 // identity-side queries / mutations; page accounting belongs to
 // `FsPageBacking`.
 
-use crate::vfs::FsOps;
 use crate::page_backed::adapter::step_engine::Errno as V3Errno;
+use crate::vfs::FsOps;
 
 impl FsOps for LifecycleFs {
     fn lookup(
@@ -717,7 +717,11 @@ impl crate::page_backed::FsPageBacking for LifecycleFs {
         self.truncate_outcome
     }
 
-    fn fsync(&self, fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Outcome<(), NoProgress> {
+    fn fsync_file(
+        &self,
+        fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(), NoProgress> {
         self.fsyncs.fetch_add(1, Ordering::AcqRel);
         self.last_object
             .store(fs_object_id.as_u64(), Ordering::Release);
@@ -745,6 +749,9 @@ impl crate::page_backed::FsPageBacking for LifecycleFs {
 
 #[test]
 fn fsopsv3_load_inode_meta_returns_done_with_default_meta() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
     setup_host_substrate();
     let guard = step_engine::guard();
     let fs = LifecycleFs::new();
@@ -755,6 +762,9 @@ fn fsopsv3_load_inode_meta_returns_done_with_default_meta() {
 
 #[test]
 fn fsopsv3_create_inode_returns_err_erofs_on_readonly_fixture() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
     setup_host_substrate();
     let guard = step_engine::guard();
     let fs = LifecycleFs::new();
@@ -774,6 +784,9 @@ fn fsopsv3_create_inode_returns_err_erofs_on_readonly_fixture() {
 
 #[test]
 fn fsopsv3_readdir_done_none_for_empty_directory() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
     setup_host_substrate();
     let guard = step_engine::guard();
     let fs = LifecycleFs::new();
@@ -784,6 +797,9 @@ fn fsopsv3_readdir_done_none_for_empty_directory() {
 
 #[test]
 fn fsopsv3_lookup_returns_err_enosys() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
     setup_host_substrate();
     let guard = step_engine::guard();
     let fs = LifecycleFs::new();

@@ -1,11 +1,11 @@
-use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use step_engine::Guard;
+use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::vfs::structure::FsObjectId;
 
-use crate::read_backend::{inode_no, Ext4FsInstance};
 use crate::adapter::step_engine::{self as step_engine, page_allocator, NoProgress, StepOutcome};
+use crate::read_backend::{inode_no, Ext4FsInstance};
 
 use page_allocator::ZeroPolicy;
 
@@ -20,9 +20,7 @@ use page_allocator::ZeroPolicy;
 /// are written via the testing helper. Non-test contexts require a real
 /// kernel direct-map, which is HAL-side follow-up work — `Errno::ENOSYS`
 /// for now in production builds.
-fn materialize_frame(
-    page: &Page4K,
-) -> StepOutcome<Frame, NoProgress> {
+fn materialize_frame(page: &Page4K) -> StepOutcome<Frame, NoProgress> {
     let owned = match page_allocator::reserve_frame(ZeroPolicy::Zeroed) {
         Ok(reservation) => reservation.commit(),
         Err(_) => return StepOutcome::err(Errno::EBUSY.into()),
@@ -123,7 +121,7 @@ where
         StepOutcome::err(Errno::ENOSYS.into())
     }
 
-    fn fsync(
+    fn fsync_file(
         &self,
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,

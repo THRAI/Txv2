@@ -1,7 +1,8 @@
-use tx_ext4_format::pager::{BlockImage, DirEntryLite};
 use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOutcome};
 use step_engine::Guard;
+use tx_ext4_format::pager::{BlockImage, DirEntryLite};
 use tx_subsystems::execution::Errno;
+use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::{PageContainer, PageContainerKind};
 use tx_subsystems::vfs::structure::{
     Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
@@ -107,10 +108,10 @@ where
         mode: u16,
         cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
@@ -136,6 +137,9 @@ where
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
@@ -174,10 +178,10 @@ where
         mode: u16,
         cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
@@ -213,10 +217,7 @@ where
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::ENOSYS.into())
     }
 
@@ -225,10 +226,7 @@ where
         fs_object_id: FsObjectId,
         cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        Option<(DirEntry, DirCursor)>,
-        NoProgress,
-    > {
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
@@ -277,6 +275,7 @@ where
         &self,
         fs_object_id: FsObjectId,
         meta: InodeMeta,
+        mount: &Cap<MountPayload>,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
         let pin = match self.mount_pin.lock().clone() {
@@ -297,7 +296,7 @@ where
             Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
         };
 
-        match RNode::new_cap(fs_object_id, meta, RNodeBacking::PageBacked { pc }) {
+        match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::PageBacked { pc }, mount) {
             Ok(rnode) => StepOutcome::done(rnode),
             Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
         }
@@ -307,10 +306,7 @@ where
         &self,
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        alloc::boxed::Box<[u8]>,
-        NoProgress,
-    > {
+    ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),

@@ -233,7 +233,10 @@ pub fn platform_adapter(attr: TokenStream, item: TokenStream) -> TokenStream {
     // attributes for the same platform on the same module would still
     // collide, which is the intent — that's a duplicate declaration.
     let const_ident = syn::Ident::new(
-        &format!("__PLATFORM_ADAPTER_{}", args.platform.value().to_uppercase()),
+        &format!(
+            "__PLATFORM_ADAPTER_{}",
+            args.platform.value().to_uppercase()
+        ),
         Span::call_site(),
     );
     let manifest_const: syn::Item = syn::parse_quote! {
@@ -291,16 +294,18 @@ mod tests {
 
     #[test]
     fn rejects_unknown_platform() {
-        let msg = err(
-            "platform = \"hal\", domain = \"vfs\", reason = \"some sufficiently long reason\"",
-        );
+        let msg =
+            err("platform = \"hal\", domain = \"vfs\", reason = \"some sufficiently long reason\"");
         assert!(msg.contains("unknown platform"), "got: {msg}");
     }
 
     #[test]
     fn rejects_missing_platform() {
         let msg = err("domain = \"vfs\", reason = \"some sufficiently long reason\"");
-        assert!(msg.contains("missing required") && msg.contains("platform"), "got: {msg}");
+        assert!(
+            msg.contains("missing required") && msg.contains("platform"),
+            "got: {msg}"
+        );
     }
 
     #[test]

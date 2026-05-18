@@ -1,0 +1,438 @@
+//! Payload tag enum and all inline payload structs.
+//!
+//! Every payload struct must fit in 16 bytes (the inline buffer in
+//! [`TxTraceRecord`](crate::TxTraceRecord)).  Sizes are enforced by
+//! compile-time assertions in `lib.rs`.
+//!
+//! Layout spec: `08_OBSERVATION_SERIALIZATION_v0.md` §8.
+
+// ---------------------------------------------------------------------------
+// Payload tag
+// ---------------------------------------------------------------------------
+
+/// Identifies the schema of the bytes in
+/// [`TxTraceRecord::payload`](crate::TxTraceRecord::payload).
+#[repr(u16)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub enum TxPayloadTag {
+    None = 0,
+
+    // ── L0 boundary ──────────────────────────────────────────────────────
+    SyscallEnter = 1,
+    SyscallExit = 2,
+
+    // ── L2 drive / L4 step ───────────────────────────────────────────────
+    DriveBegin = 10,
+    DriveEnd = 11,
+    StepOutcome = 12,
+
+    // ── L3 yield/resume / wake ───────────────────────────────────────────
+    YieldBegin = 20,
+    Resume = 21,
+    WaitSourceNotify = 22,
+    AgentStateChange = 23,
+
+    // ── Track / metadata ─────────────────────────────────────────────────
+    TrackDescriptor = 30,
+    CounterValue = 31,
+    StringDescriptor = 32,
+    ClockSnapshot = 33,
+
+    // ── Argument continuation ─────────────────────────────────────────────
+    ArgValue = 40,
+
+    // ── Mutation (L6) ─────────────────────────────────────────────────────
+    MutationZoneSign = 50,
+    MutationIndexCommit = 51,
+
+    // ── Phase (L5) ────────────────────────────────────────────────────────
+    /// Kernel boot phase transition (OBS-8).
+    ///
+    /// Carried on `SpanBegin` / `SpanEnd` records at the substrate-level
+    /// phase boundaries: BSP `init` and per-AP `init_on_ap`.  Payload:
+    /// [`PayloadPhaseTransition`].
+    ///
+    /// Layout spec: `08_OBSERVATION_SERIALIZATION_v0.md` §8 (OBS-8, added).
+    PhaseTransition = 52,
+
+    // ── Panic (special) ───────────────────────────────────────────────────
+    Panic = 60,
+}
+
+// ---------------------------------------------------------------------------
+// §8.1 Syscall payloads
+// ---------------------------------------------------------------------------
+
+/// Payload for `SpanBegin` at the syscall entry boundary (L0).
+/// size = 8
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadSyscallEnter {
+    /// Linux syscall number.
+    pub sysno: u32,
+    /// ABI identifier: 0 = LinuxRv64, 1 = LinuxLa64.
+    pub abi: u16,
+    /// Number of `ArgValue` continuation records that follow.
+    pub argc: u16,
+}
+
+/// Payload for `SpanEnd` at the syscall exit boundary (L0).
+///
+/// Field order chosen so the largest field (`i64`) lands on its natural
+/// alignment without internal padding.
+/// size = 16
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadSyscallExit {
+    /// Syscall return value (or partial count).
+    pub ret: i64,
+    /// Errno.  0 if Ok.
+    pub errno: i32,
+    /// 0=Ok, 1=Err, 2=Restart, 3=Fatal, 4=NoReturn
+    pub result_kind: u8,
+    pub _pad: [u8; 3],
+}
+
+// ---------------------------------------------------------------------------
+// §8.2 Drive payloads
+// ---------------------------------------------------------------------------
+
+/// Payload for `SpanBegin` at drive-loop entry (L2).
+/// size = 12
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadDriveBegin {
+    /// `EventNameId` from `TypeId::of::<O>()` truncated to `u32`.
+    pub op_type: u32,
+    /// 0=Nonblocking, 1=Waiting, 2=Selecting
+    pub mode: u8,
+    /// 0=Uninterruptible, 1=Interruptible, 2=Killable
+    pub interrupt: u8,
+    pub has_deadline: u8,
+    pub _pad: u8,
+    /// `task_id_low` (32-bit truncation).
+    pub task_id_low: u32,
+}
+
+/// Payload for `SpanEnd` at drive-loop exit (L2).
+///
+/// Mirrors [`PayloadSyscallExit`] shape for symmetric reading.
+/// size = 16
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadDriveEnd {
+    /// Final `Output` for `Done`; 0 for `Err`.
+    pub ret: i64,
+    /// Final errno for `Err`; 0 for `Done`.
+    pub errno: i32,
+    /// 0=Done, 1=Err
+    pub result_kind: u8,
+    pub _pad: [u8; 3],
+}
+
+// ---------------------------------------------------------------------------
+// §8.3 Step outcome payload
+// ---------------------------------------------------------------------------
+
+/// Payload carried on the `SpanEnd(step.iteration)` record (L4).
+/// size = 16
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadStepOutcome {
+    /// 0=Continue, 1=Yield, 2=Done, 3=Err
+    pub variant: u8,
+    /// 0 = progress is EMPTY; 1 = progress has data.
+    pub progress_empty: u8,
+    /// One of [`TxProgressKind`].
+    pub progress_kind: u8,
+    /// One of [`YieldShapeKind`] (valid iff `variant == 1`).
+    pub shape_kind: u8,
+    /// Errno (valid iff `variant == 3`).
+    pub errno: i32,
+    /// Numeric progress count (bytes / pages / entries / iovecs done).
+    pub progress_value: u32,
+    pub _pad: u32,
+}
+
+/// Progress kind for [`PayloadStepOutcome`].
+#[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub enum TxProgressKind {
+    NoProgress = 0,
+    ByteProgress = 1,
+    PageProgress = 2,
+    EntryProgress = 3,
+    IoVecProgress = 4,
+}
+
+/// Compact wire encoding of `YieldShape` variant for trace records.
+#[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub enum YieldShapeKind {
+    OnWaitSource = 1,
+    OnAgent = 2,
+    OnTimer = 3,
+    // Future: OnEdge = 4, OnHandoff = 5.
+}
+
+// ---------------------------------------------------------------------------
+// §8.4 Yield/resume payloads
+// ---------------------------------------------------------------------------
+
+/// Payload for `SpanBegin(yield.<shape>)` record (L3).
+/// size = 16
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadYieldBegin {
+    /// [`YieldShapeKind`]
+    pub shape_kind: u8,
+    pub _pad: [u8; 3],
+    pub task_id_low: u32,
+    pub wait_generation: u64,
+}
+
+/// Payload for `Instant(resume)` record (L3).
+/// size = 16
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadResume {
+    /// 0=Retry, 1=WithReply, 2=TimerExpired, 3=Aborted
+    pub resume_kind: u8,
+    /// 0=Signal, 1=Canceled, 2=TimedOut, 3=AgentDied, 4=BorrowerExited
+    pub abort_reason: u8,
+    pub _pad: [u8; 2],
+    /// Compact source/token/timer id (lower 32 bits).
+    pub object_id_low: u32,
+    pub wait_generation: u64,
+}
+
+/// Payload for `Instant(wake.notify)` record (L3, producer side).
+///
+/// `wait_generation_high` lives in the `seq` field of the record; there is no
+/// room for it in the 16-byte inline buffer.
+/// size = 16
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadWaitSourceNotify {
+    pub source_id_low: u32,
+    pub mask_bits: u32,
+    /// Material for flow-id reconstruction.  Daemon hashes
+    /// `(task_id, wait_gen, flow_kind)` to produce Perfetto flow ids.
+    pub task_id_low: u32,
+    pub wait_generation_low: u32,
+}
+
+// ---------------------------------------------------------------------------
+// §8.5 Track / metadata payloads
+// ---------------------------------------------------------------------------
+
+/// Payload for `TrackDescriptor` records.
+/// size = 16
+///
+/// Field order: `track_id` (u64) followed by `name` (u32) followed by
+/// `track_kind` (u8) followed by `_pad` ([u8; 3]).  This ordering avoids
+/// implicit padding that the spec's original listing (`track_kind` before
+/// `name`) would produce (an implicit 3-byte gap between the u8 and u32 would
+/// push the struct to 24 bytes, exceeding the 16-byte payload budget).  The
+/// reordering is a spec clarification, not an ABI divergence, because no
+/// producer/consumer existed prior to OBS-1.
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadTrackDescriptor {
+    pub track_id: u64,
+    /// `EventNameId`; daemon resolves human name.
+    pub name: u32,
+    /// 0=Hart, 1=Task, 2=Process, 3=Scope, 4=Endpoint, 5=Timer
+    pub track_kind: u8,
+    pub _pad: [u8; 3],
+}
+
+/// Payload for `Counter` records.
+/// size = 16
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadCounterValue {
+    pub counter_id: u32,
+    pub _pad: u32,
+    /// `i64` reinterpretation is OK for signed counters.
+    pub value: u64,
+}
+
+/// Payload for `ClockSnapshot` records.
+/// size = 16
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadClockSnapshot {
+    /// Trace-clock value at snapshot.
+    pub trace_ns: u64,
+    /// Approximate wall-time (host-injected before run).
+    pub wall_ns: u64,
+}
+
+// ---------------------------------------------------------------------------
+// §8.6 Argument continuation
+// ---------------------------------------------------------------------------
+
+/// Payload for `ArgContinuation` records.
+/// size = 16
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadArgValue {
+    /// `DebugAnnotationNameId` (e.g. "fd", "buf", "len", "errno").
+    pub key: u32,
+    /// [`TxValueKind`]
+    pub value_kind: u8,
+    pub _pad: [u8; 3],
+    /// Numeric value, or low-64 of `TraceObjectId`.
+    pub value0: u64,
+}
+
+/// Value kind for [`PayloadArgValue`].
+#[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub enum TxValueKind {
+    None = 0,
+    U64 = 1,
+    I64 = 2,
+    Bool = 3,
+    /// Raw user VA, opaque.
+    Ptr = 4,
+    Errno = 5,
+    /// Reference to interned string table.
+    NameId = 6,
+    /// Packed `(kind, generation, slot)` — see `08_OBSERVATION_v1.md §12`.
+    ObjectId = 7,
+    FlowId = 8,
+}
+
+// ---------------------------------------------------------------------------
+// §8.7 Mutation payloads (L6, deferred from MVP — schemas reserved)
+// ---------------------------------------------------------------------------
+
+/// Payload for `Instant(mutation.zone_sign)` records (L6).
+/// size = 16
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadMutationZoneSign {
+    /// `TraceObjectId` packed form.
+    pub object_id: u64,
+    /// `ZoneKindTag`
+    pub kind: u8,
+    pub _pad: [u8; 7],
+}
+
+/// Payload for `Instant(mutation.index_commit)` records (L6).
+/// size = 16
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadMutationIndexCommit {
+    pub index_id: u32,
+    pub key_low: u32,
+    /// The `Cap<T>` committed under the key.
+    pub value_object_id: u64,
+}
+
+// ---------------------------------------------------------------------------
+// §8.8 Panic payload (reserved for post-MVP OBS-3a panic path)
+// ---------------------------------------------------------------------------
+
+/// Payload for `PanicMarker` records.
+/// size = 16
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadPanic {
+    /// `EventNameId` for the panic site (often the file:line interned
+    /// location id).
+    pub site_name: u32,
+    pub _pad: u32,
+    /// The panic handler's `hart_id`.
+    pub panic_hart: u16,
+    /// bit 0: kernel halted; bit 1: ring truncated.
+    pub flags: u16,
+    pub _pad2: u32,
+}
+
+// ---------------------------------------------------------------------------
+// §8.9 Phase transition payload (L5, OBS-8)
+// ---------------------------------------------------------------------------
+
+/// Boot-phase discriminant for [`PayloadPhaseTransition`].
+///
+/// Identifies the substrate or kernel subsystem phase that is beginning
+/// or ending.  The numeric values are stable wire ABI.
+///
+/// Layout spec: `08_OBSERVATION_SERIALIZATION_v0.md` §8 (OBS-8, added).
+#[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub enum BootPhaseKind {
+    /// Kernel BSP init (`tx_hal::init_early`).
+    SubstrateBsp = 0,
+    /// Kernel AP init (`tx_hal::init_later`).
+    SubstrateAp = 1,
+}
+
+/// Payload for `SpanBegin(phase.<name>)` / `SpanEnd` at kernel boot
+/// phase boundaries (L5, OBS-8).
+///
+/// Wire layout (OBS-8):
+/// ```text
+/// offset 0: phase_kind  u8   — one of BootPhaseKind
+/// offset 1: hart_id     u8   — hart index (lower 8 bits of CpuId)
+/// offset 2: _pad        [u8; 14]
+/// total = 16
+/// ```
+///
+/// `_pad` is explicit to make every byte named and avoid implicit compiler
+/// padding (OBS-SER-V0-PAYLOADS-1 discipline).
+///
+/// size = 16
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadPhaseTransition {
+    /// One of [`BootPhaseKind`].
+    pub phase_kind: u8,
+    /// Hart index (`CpuId.0` truncated to u8).
+    pub hart_id: u8,
+    pub _pad: [u8; 14],
+}
+
+// ---------------------------------------------------------------------------
+// §13.2 FlowKind (shared between host and kernel wire material)
+// ---------------------------------------------------------------------------
+
+/// Flow-id computation discriminant.  The kernel emits the *material*
+/// (`task_id_low`, `wait_generation`, `shape_kind`/`resume_kind`); the daemon
+/// computes the Perfetto `flow_id` by hashing `(task_id, wait_gen, FlowKind)`.
+///
+/// Lives in the shared types crate so the daemon can refer to the same enum
+/// the spec defines.
+#[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub enum FlowKind {
+    SourceWake = 1,    // WaitSource::notify → resume
+    AgentReply = 2,    // DelegateToken::reply → resume
+    TimerExpire = 3,   // TimerToken expiry → resume
+    AbortDelivery = 4, // generationless abort → resume
+}

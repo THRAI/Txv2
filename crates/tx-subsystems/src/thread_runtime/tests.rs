@@ -15,6 +15,8 @@ use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
 use crate::process::{bootstrap_init_process, step_fork, ExitStatus};
 use crate::test_support::EPOCH_TEST_LOCK;
+use crate::thread_runtime::adapter::reactor_entry::{SyscallRequest, UserspaceTrapInfo};
+use crate::thread_runtime::adapter::step_engine::{Cap, PayloadCap};
 use crate::thread_runtime::execution::prepare_userspace_entry_payload;
 use crate::thread_runtime::step_thread_exit;
 use crate::thread_runtime::structure::{
@@ -23,8 +25,6 @@ use crate::thread_runtime::structure::{
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
 use tx_hal::UserTrapContext;
-use crate::thread_runtime::adapter::reactor_entry::{SyscallRequest, UserspaceTrapInfo};
-use crate::thread_runtime::adapter::step_engine::{Cap, PayloadCap};
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -48,7 +48,7 @@ fn bootstrap() -> Cap<ProcessIdentity> {
 fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
     let payload_guard = proc_cap.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");
-    let threads = payload.threads.lock();
+    let threads = payload.threads.snapshot();
     threads[0].clone()
 }
 
@@ -143,7 +143,7 @@ fn fork_assigns_distinct_tids_to_parent_and_child_leader_threads() {
     let parent = bootstrap();
     let parent_leader = first_thread(&parent);
 
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     let child_leader = first_thread(&child);
 
     assert_ne!(parent_leader.tid, child_leader.tid);

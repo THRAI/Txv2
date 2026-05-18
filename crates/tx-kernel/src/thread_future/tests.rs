@@ -14,16 +14,16 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use tx_hal::{
-    AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
-    PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PtNode,
-};
-use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult, NR_EXIT_GROUP, NR_WRITE};
-use crate::adapter::step_engine::PayloadCap;
 use crate::adapter::boot_runtime::userspace::{
     PageFaultAccess, PageFaultInfo, SyscallRequest, UserAddr, UserspaceTrapInfo,
 };
+use crate::adapter::step_engine::PayloadCap;
+use tx_hal::{
+    AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
+    ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PtNode,
+};
+use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult, NR_EXIT_GROUP, NR_WRITE};
 use tx_subsystems::process::ExitStatus;
 use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::{
@@ -107,6 +107,7 @@ impl tx_hal::CacheIf for TestPlatform {}
 impl tx_hal::DmaIf for TestPlatform {}
 impl tx_hal::SmpIf for TestPlatform {}
 impl tx_hal::EntropyIf for TestPlatform {}
+impl ObserverIf for TestPlatform {}
 
 impl tx_hal::PowerIf for TestPlatform {
     fn system_off() -> ! {
@@ -577,8 +578,10 @@ fn thread_future_pf_err_routes_sigsegv_and_zombifies() {
         "fault on unmapped address must surface NoRecipe"
     );
 
-    // What run_thread does on Err: route default-action SIGSEGV and
-    // return.
+    // Phase B: run_thread routes VM-fault Err through
+    // deliver_synchronous_fault per SIGNAL_v1 §20. The default-action
+    // path in deliver_synchronous_fault calls step_exit_group_with_signal,
+    // which is what this test exercises directly.
     tx_subsystems::process::execution::step_exit_group_with_signal(&init, Signum::SIGSEGV);
 
     assert!(init.is_zombie(), "SIGSEGV routing zombifies process");
@@ -664,6 +667,7 @@ fn thread_future_execve_continues_loop_without_writing_pending_return() {
         }
         SyscallResult::NoReturn => true,
         SyscallResult::ExecCommitted => false,
+        SyscallResult::SigreturnRestored => false,
     };
 
     assert!(

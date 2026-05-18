@@ -326,8 +326,10 @@ mod step_op_wraps {
     //! coverage lives in the integration tests under
     //! `tests/hart_loop.rs`.
     use super::*;
+    use crate::adapter::step_engine::{
+        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome as V3,
+    };
     use crate::dispatch::NoopRescheduleSignal;
-    use crate::adapter::step_engine::{ScriptCtx, StepOp, StepOutcome as V3, PlaceholderProcessSubject};
 
     #[derive(Debug)]
     struct FakeHartRuntime {

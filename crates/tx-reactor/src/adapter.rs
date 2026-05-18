@@ -22,8 +22,8 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     pub use tx_substrate::step::{
         AbortReason, AgentCancelPolicy, Deadline, DelegateRegistry, DelegateReply, DelegateRequest,
-        DelegateState, DelegateTokenId, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
-        TokenDropPolicy, TransitionOutcome,
+        DelegateState, DelegateTokenId, NoProgress, ScriptCtx, StepOp, StepOutcome,
+        SubjectIdentity, TokenDropPolicy, TransitionOutcome,
     };
     // ProcessIdentity is used as a placeholder subject in tests.
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;

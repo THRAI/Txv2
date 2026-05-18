@@ -37,19 +37,11 @@ use crate::vfs::{Credential, DirCursor, FsOps, InodeKind};
 struct NoopOps;
 
 impl CharDeviceOps for NoopOps {
-    fn read(
-        &self,
-        _out: &mut [u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::Done(0)
     }
 
-    fn write(
-        &self,
-        bytes: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::Done(bytes.len())
     }
 }
@@ -80,11 +72,7 @@ impl ScriptedReadOps {
 }
 
 impl CharDeviceOps for ScriptedReadOps {
-    fn read(
-        &self,
-        out: &mut [u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    fn read(&self, out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         let mut script = self.script.lock().expect("script lock");
         let copied = out.len().min(script.len());
         out[..copied].copy_from_slice(&script[..copied]);
@@ -92,11 +80,7 @@ impl CharDeviceOps for ScriptedReadOps {
         StepOutcome::Done(copied)
     }
 
-    fn write(
-        &self,
-        bytes: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         self.writes
             .lock()
             .expect("writes lock")

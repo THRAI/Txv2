@@ -88,7 +88,8 @@ fn vm_fault_materializes_pagebacked_anon_page_from_recipe_offset() {
 #[test]
 fn vm_fault_private_anon_read_uses_zero_frame_read_only() {
     setup_host_substrate();
-    let zero_ppn = crate::vm::adapter::step_engine::page_allocator::zero_frame_ppn().expect("zero frame");
+    let zero_ppn =
+        crate::vm::adapter::step_engine::page_allocator::zero_frame_ppn().expect("zero frame");
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x5000, 1),
@@ -128,7 +129,8 @@ fn vm_fault_private_anon_read_uses_zero_frame_read_only() {
 #[test]
 fn vm_fault_private_anon_write_uses_fresh_private_frame() {
     setup_host_substrate();
-    let zero_ppn = crate::vm::adapter::step_engine::page_allocator::zero_frame_ppn().expect("zero frame");
+    let zero_ppn =
+        crate::vm::adapter::step_engine::page_allocator::zero_frame_ppn().expect("zero frame");
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x6000, 1),
@@ -291,12 +293,20 @@ fn vm_fault_map_private_write_copies_source_page_contents() {
         .expect("write CoW materializes private page");
     let private_ppn = write_materialized.page.ppn;
     let mut copied = [0u8; 8];
-    crate::vm::adapter::step_engine::page_allocator::testing::read_frame_bytes_for_test(private_ppn, 128, &mut copied);
+    crate::vm::adapter::step_engine::page_allocator::testing::read_frame_bytes_for_test(
+        private_ppn,
+        128,
+        &mut copied,
+    );
 
     assert_ne!(private_ppn, shared_ppn);
     assert_eq!(copied, source_pattern);
 
-    crate::vm::adapter::step_engine::page_allocator::testing::write_frame_bytes_for_test(private_ppn, 128, &[0x55; 8]);
+    crate::vm::adapter::step_engine::page_allocator::testing::write_frame_bytes_for_test(
+        private_ppn,
+        128,
+        &[0x55; 8],
+    );
     let mut source_after_private_write = [0u8; 8];
     crate::vm::adapter::step_engine::page_allocator::testing::read_frame_bytes_for_test(
         shared_ppn,
@@ -313,6 +323,7 @@ fn vm_fault_map_private_write_copies_source_page_contents() {
 
 #[test]
 fn vm_fault_materialization_rejects_non_pagebacked_recipe() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x4000, 1),

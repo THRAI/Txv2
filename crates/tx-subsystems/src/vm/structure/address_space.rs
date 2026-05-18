@@ -1,8 +1,8 @@
 //! AddressSpace identity and read accessors.
 
+use crate::vm::adapter::step_engine::{epoch_mod as epoch, Cap, Zone, ZoneAllocated};
 use alloc::vec::Vec;
 use tx_hal::PmapIf;
-use crate::vm::adapter::step_engine::{epoch_mod as epoch, Cap, Zone, ZoneAllocated};
 
 #[cfg(test)]
 use crate::vm::pmap::TestPmap;
@@ -55,7 +55,10 @@ impl AddressSpace {
 
     pub fn new_cap_for_platform<P: PmapIf>() -> Result<Cap<AddressSpace>, VmPmapError> {
         let reservation = step_engine::reserve_for::<AddressSpace>()?;
-        Ok(step_engine::sign_for(reservation, Self::new_for_platform::<P>()?))
+        Ok(step_engine::sign_for(
+            reservation,
+            Self::new_for_platform::<P>()?,
+        ))
     }
 
     #[cfg(test)]

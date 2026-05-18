@@ -5,7 +5,7 @@
 //! into execution-side step bodies; they prove that observed state was
 //! re-predicated under an epoch guard. No mutation lives here.
 
-use crate::vfs::adapter::step_engine::Cap;
+use crate::vfs::adapter::step_engine::{Cap, IdentRef};
 
 use crate::mount::MountNamespace;
 
@@ -24,20 +24,63 @@ pub struct ResolveCtx {
     pub credential: Credential,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EntityAtPath {
-    pub dentry: Cap<DEntry>,
-    pub rnode: Cap<RNode>,
+// --- Witness types: lifetime-parameterized, IdentRef-carried observations ---
+
+#[derive(Debug)]
+pub struct EntityAtPath<'g> {
+    pub dentry: IdentRef<'g, DEntry>,
+    pub rnode: IdentRef<'g, RNode>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DirectoryAtPath {
-    pub dentry: Cap<DEntry>,
-    pub rnode: Cap<RNode>,
+#[derive(Debug)]
+pub struct DirectoryAtPath<'g> {
+    pub dentry: IdentRef<'g, DEntry>,
+    pub rnode: IdentRef<'g, RNode>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ParentAndName {
-    pub parent: Cap<DEntry>,
+#[derive(Debug)]
+pub struct ParentAndName<'g> {
+    pub parent: IdentRef<'g, DEntry>,
     pub name: InlineName,
+}
+
+// --- Construction helpers ---
+
+impl<'g> EntityAtPath<'g> {
+    pub fn from_caps(
+        dentry: &Cap<DEntry>,
+        rnode: &Cap<RNode>,
+        guard: &'g crate::execution::Guard<'_>,
+    ) -> Self {
+        Self {
+            dentry: dentry.ident_ref(guard),
+            rnode: rnode.ident_ref(guard),
+        }
+    }
+}
+
+impl<'g> DirectoryAtPath<'g> {
+    pub fn from_caps(
+        dentry: &Cap<DEntry>,
+        rnode: &Cap<RNode>,
+        guard: &'g crate::execution::Guard<'_>,
+    ) -> Self {
+        Self {
+            dentry: dentry.ident_ref(guard),
+            rnode: rnode.ident_ref(guard),
+        }
+    }
+}
+
+impl<'g> ParentAndName<'g> {
+    pub fn from_cap(
+        parent: &Cap<DEntry>,
+        name: InlineName,
+        guard: &'g crate::execution::Guard<'_>,
+    ) -> Self {
+        Self {
+            parent: parent.ident_ref(guard),
+            name,
+        }
+    }
 }

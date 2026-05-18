@@ -137,10 +137,7 @@ fn register<'a>(
     source: &'a Arc<WaitSource>,
     mailbox: &Arc<TaskMailbox>,
     interests: u64,
-) -> (
-    WaitRegistrationGuard<'a>,
-    WaitGeneration,
-) {
+) -> (WaitRegistrationGuard<'a>, WaitGeneration) {
     let gen = mailbox.next_generation();
     let prep = source.prepare(Arc::downgrade(mailbox), gen, InterestMask::new(interests));
     let guard = prep.install_if(|| true).expect("registration installed");
@@ -208,7 +205,7 @@ fn exit_wait_source_invariants_round_trip() {
     let (_reg_guard, gen) = register(&parent_source, &mailbox, EXIT_SOURCE_CHILD_ZOMBIFIED);
     assert!(mailbox.is_empty(), "no events before any child zombifies");
 
-    let child = step_fork::<StubPmap>(&parent).expect("fork");
+    let child = step_fork::<StubPmap>(&parent, false).expect("fork");
 
     // Pin the child's own exit_wait_source (used in invariant 2 to
     // observe the post-zombify "unreachable through identity"
@@ -249,9 +246,7 @@ fn exit_wait_source_invariants_round_trip() {
 
     let legacy_channel = tx_subsystems::wait_source::lookup_wait_channel(parent_source_id)
         .expect("legacy resolver still has the carrier");
-    let mut legacy_wait = legacy_channel.wait(Mask::from_bits(
-        EXIT_SOURCE_CHILD_ZOMBIFIED,
-    ));
+    let mut legacy_wait = legacy_channel.wait(Mask::from_bits(EXIT_SOURCE_CHILD_ZOMBIFIED));
     let pre_legacy = Pin::new(&mut legacy_wait).poll(&mut cx);
     assert!(
         matches!(pre_legacy, Poll::Pending),

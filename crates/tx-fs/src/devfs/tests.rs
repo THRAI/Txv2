@@ -11,7 +11,9 @@ use alloc::vec::Vec;
 
 use std::sync::Mutex;
 
-use super::adapter::step_engine::{self as step_engine, guard, ByteProgress, Errno as V3Errno, StepOutcome as V3Outcome};
+use super::adapter::step_engine::{
+    self as step_engine, guard, ByteProgress, Errno as V3Errno, StepOutcome as V3Outcome,
+};
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
@@ -55,19 +57,11 @@ impl CapturingOps {
 }
 
 impl CharDeviceOps for CapturingOps {
-    fn read(
-        &self,
-        _out: &mut [u8],
-        _guard: &Guard<'_>,
-    ) -> V3Outcome<usize, ByteProgress> {
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> V3Outcome<usize, ByteProgress> {
         V3Outcome::Done(0)
     }
 
-    fn write(
-        &self,
-        bytes: &[u8],
-        _guard: &Guard<'_>,
-    ) -> V3Outcome<usize, ByteProgress> {
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> V3Outcome<usize, ByteProgress> {
         self.captured
             .lock()
             .expect("capture lock")

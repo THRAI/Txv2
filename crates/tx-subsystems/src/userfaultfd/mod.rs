@@ -388,7 +388,8 @@ impl UserfaultFd {
         //   consumers,
         // - new `WaitSource::notify` for v3 mailbox-based consumers.
         self.wait_channel.fire(Mask::from_bits(UFD_READABLE));
-        self.wait_source.notify(InterestMask::new(UFD_READABLE));
+        self.wait_source
+            .notify_emit(InterestMask::new(UFD_READABLE));
     }
 
     /// PR-10 phase 5: snapshot the pending-fault queue depth. Tests
@@ -450,6 +451,11 @@ pub fn step_ufd_read(
     out: &mut [u8],
     nonblocking: bool,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if out.is_empty() {
         return StepOutcome::done(0);
     }

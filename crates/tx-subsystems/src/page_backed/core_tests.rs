@@ -83,10 +83,7 @@ impl crate::vfs::FsOps for RecordingFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
         V3Out::err(V3Errno::EROFS)
     }
 
@@ -128,10 +125,7 @@ impl crate::vfs::FsOps for RecordingFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
         V3Out::err(V3Errno::EROFS)
     }
 
@@ -152,10 +146,7 @@ impl crate::vfs::FsOps for RecordingFs {
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
         V3Out::err(V3Errno::EROFS)
     }
 
@@ -164,10 +155,7 @@ impl crate::vfs::FsOps for RecordingFs {
         _fs_object_id: FsObjectId,
         _cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        Option<(DirEntry, DirCursor)>,
-        NoProgress,
-    > {
+    ) -> V3Out<Option<(DirEntry, DirCursor)>, NoProgress> {
         V3Out::done(None)
     }
 
@@ -215,11 +203,7 @@ impl FsPageBacking for RecordingFs {
         V3Out::done(())
     }
 
-    fn fsync(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> V3Out<(), NoProgress> {
+    fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Out<(), NoProgress> {
         V3Out::done(())
     }
 }
@@ -269,10 +253,7 @@ impl crate::vfs::FsOps for BlockingFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
         V3Out::err(V3Errno::EROFS)
     }
 
@@ -314,10 +295,7 @@ impl crate::vfs::FsOps for BlockingFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
         V3Out::err(V3Errno::EROFS)
     }
 
@@ -338,10 +316,7 @@ impl crate::vfs::FsOps for BlockingFs {
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
         V3Out::err(V3Errno::EROFS)
     }
 
@@ -350,10 +325,7 @@ impl crate::vfs::FsOps for BlockingFs {
         _fs_object_id: FsObjectId,
         _cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        Option<(DirEntry, DirCursor)>,
-        NoProgress,
-    > {
+    ) -> V3Out<Option<(DirEntry, DirCursor)>, NoProgress> {
         V3Out::done(None)
     }
 
@@ -376,11 +348,7 @@ impl FsPageBacking for BlockingFs {
         // Yield on `WaitToken(9, 0x44)` so production fns routing
         // through this trait (e.g. `materialize_file_page`)
         // observe a yield rather than `Err(EAGAIN)`.
-        V3Out::yield_on_wait_source(
-            NoProgress,
-            9,
-            0x44,
-        )
+        V3Out::yield_on_wait_source(NoProgress, 9, 0x44)
     }
 
     fn flush_page(
@@ -402,11 +370,7 @@ impl FsPageBacking for BlockingFs {
         V3Out::done(())
     }
 
-    fn fsync(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> V3Out<(), NoProgress> {
+    fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Out<(), NoProgress> {
         V3Out::done(())
     }
 }
@@ -794,7 +758,6 @@ mod step_op_wraps {
     fn read_op_advances_offset_through_step() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -807,7 +770,6 @@ mod step_op_wraps {
             pc: &pc,
             of: &of,
             len: 32,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(32));
@@ -818,7 +780,6 @@ mod step_op_wraps {
     fn read_op_eof_returns_done_zero() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -831,7 +792,6 @@ mod step_op_wraps {
             pc: &pc,
             of: &of,
             len: 16,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(0));
@@ -842,7 +802,6 @@ mod step_op_wraps {
     fn write_op_marks_dirty_and_advances_offset() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -855,7 +814,6 @@ mod step_op_wraps {
             pc: &pc,
             of: &of,
             len,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(len));
@@ -868,7 +826,6 @@ mod step_op_wraps {
     fn write_op_rejects_device_backing() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Device {
                 base_ppn: Ppn(0xface_0000),
@@ -881,7 +838,6 @@ mod step_op_wraps {
             pc: &pc,
             of: &of,
             len: 8,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Err(Errno::EINVAL.into()));

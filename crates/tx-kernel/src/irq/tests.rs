@@ -21,8 +21,8 @@ use std::sync::Mutex;
 
 use tx_hal::{
     AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
-    IrqDispatchTable, IrqHandled, IrqIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError,
-    PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot, PtNode,
+    IrqDispatchTable, IrqHandled, IrqIf, ObserverIf, PhysAddr, PlatformConfig, PlatformInfo,
+    PmapError, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot, PtNode,
 };
 
 use crate::init::{console_tty, CoreInit};
@@ -148,6 +148,7 @@ impl tx_hal::DmaIf for IrqTestPlatform {}
 impl tx_hal::SmpIf for IrqTestPlatform {}
 
 impl tx_hal::EntropyIf for IrqTestPlatform {}
+impl ObserverIf for IrqTestPlatform {}
 
 impl tx_hal::PowerIf for IrqTestPlatform {
     fn system_off() -> ! {
@@ -208,6 +209,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     tx_subsystems::cross_crate_test_support::reset_dev_id_counter();
     crate::init::reset_boot_state_for_test();
     crate::irq::reset_dispatch_table_for_test();
+    crate::irq::reset_pending_uart_rx_for_test();
     IRQ_TEST_RX_QUEUE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -257,9 +259,8 @@ fn register_irq_handler_populates_dispatch_table_slot() {
 }
 
 /// `install_irq_handlers::<P>()` registers the UART RX handler under
-/// `<P as IrqIf>::UART_IRQ`, publishes the dispatch table to the
-/// platform via `install_dispatch_table`, sets the priority, and
-/// unmasks the IRQ.
+/// `<P as IrqIf>::UART_IRQ` and publishes the dispatch table to the
+/// platform via `install_dispatch_table`.
 ///
 /// Asserts Open Q #6's late-binding shape: tx-kernel reads the IRQ
 /// number through `<P as IrqIf>::UART_IRQ` only — no `pub const
@@ -288,11 +289,11 @@ fn install_irq_handlers_publishes_table_to_platform() {
     assert_eq!(
         IRQ_TEST_LAST_PRIORITY.load(Ordering::Acquire),
         1,
-        "set_priority should run with priority 1 for the UART IRQ",
+        "UART IRQ should be made deliverable once the IRQ-safe handler is installed",
     );
     assert!(
         IRQ_TEST_UART_UNMASKED.load(Ordering::Acquire),
-        "UART IRQ must be unmasked after install_irq_handlers",
+        "UART IRQ should be unmasked so console input wakes the reactor",
     );
 }
 
@@ -300,8 +301,9 @@ fn install_irq_handlers_publishes_table_to_platform() {
 /// registered, queue a byte through the fake platform's RX source,
 /// invoke the handler directly (the same code path
 /// `Platform::dispatch_irq` walks through the installed table), and
-/// observe the byte landing in the registered console TTY's input
-/// queue.
+/// observe that the handler only requests a reactor wake. The actual
+/// TTY ingest must run later in normal kernel context, where creating
+/// an epoch guard is legal.
 #[test]
 fn dispatch_irq_routes_uart_rx_to_tty_step_ingest() {
     let _setup = setup();
@@ -334,16 +336,30 @@ fn dispatch_irq_routes_uart_rx_to_tty_step_ingest() {
         "buffered bytes should request a reactor wake",
     );
 
-    // Drain the deferred buffer the way the reactor loop does on every
-    // WFI return.
-    let drained = crate::irq::drain_uart_rx_pending();
-    assert_eq!(drained, 2, "drain_uart_rx_pending should consume X\\n");
-
-    // Console TTY input queue should now contain the committed line.
     let tty = console_tty().expect("CONSOLE_TTY populated by register_console_hardware");
     let payload = tty
         .live_payload()
-        .expect("console TTY payload alive after ingest");
+        .expect("console TTY payload alive before deferred ingest");
+    assert!(
+        IRQ_TEST_RX_QUEUE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty(),
+        "IRQ handler should drain platform RX into the IRQ-safe pending buffer",
+    );
+    let before: std::vec::Vec<u8> = payload.with_input_queue(|queue| {
+        let mut tmp = [0u8; 64];
+        let n = queue.drain_to_slice(&mut tmp);
+        tmp[..n].to_vec()
+    });
+    assert!(before.is_empty(), "IRQ handler must not ingest into TTY");
+
+    // Drain the deferred buffer the way the reactor loop does on every
+    // WFI return.
+    let drained = CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty();
+    assert_eq!(drained, 2, "drain_uart_rx_pending should consume X\\n");
+
+    // Normal-context drain should now contain the committed line.
     let snapshot: std::vec::Vec<u8> = payload.with_input_queue(|queue| {
         let mut tmp = [0u8; 64];
         let n = queue.drain_to_slice(&mut tmp);

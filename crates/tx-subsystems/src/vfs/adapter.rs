@@ -26,11 +26,15 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::{
-        ByteProgress, Errno, InterestMask, NoProgress, ProcessIdentity, ScriptCtx, StepOp,
-        StepOutcome, StepProgress, SubjectIdentity, WaitSourceId,
+        drive_oneshot, ByteProgress, Deadline, Errno, InterestMask, NoProgress, OneShotStepOp,
+        ProcessIdentity, ResumeOutcome, ScriptCtx, StepOp, StepOutcome, StepProgress,
+        SubjectIdentity, TimerId, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        reserve_for, sign, sign_for, Cap, PayloadCap, Weak, Zone, ZoneAllocated, ZoneError,
+        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
+        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
+        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
+        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
     pub use tx_substrate::SpinMutex;
 }
@@ -50,11 +54,17 @@ pub mod wait_routing {
     use alloc::sync::Arc;
 
     pub use tx_reactor::wait::{Channel, Mask};
-    pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};
+    pub use tx_substrate::wake::{
+        MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+    };
 
-    /// Delegates to `tx_substrate::wake::new_source`.
+    /// Delegates to `tx_substrate::wake::new_source`. Also registers
+    /// the source in the global registry so the driver can look it up
+    /// by [`WaitSourceId`] during yield resolution.
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
-        tx_substrate::wake::new_source(source_id)
+        let source = tx_substrate::wake::new_source(source_id);
+        tx_substrate::wake::register_source(Arc::clone(&source));
+        source
     }
 
     /// Delegates to `tx_reactor::wait::fire_legacy`.

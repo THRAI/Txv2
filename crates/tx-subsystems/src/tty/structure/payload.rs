@@ -321,8 +321,8 @@ mod tests {
     use super::*;
     use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
     use crate::execution::Guard;
-    use crate::tty::structure::termios::{ICANON, ISIG};
     use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3};
+    use crate::tty::structure::termios::{ICANON, ISIG};
 
     struct NoopOps;
 

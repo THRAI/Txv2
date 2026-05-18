@@ -1,10 +1,13 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
+use crate::adapter::step_engine::{
+    self as step_engine, guard as ebr_guard, page_allocator, reserve_for, sign_for, Cap,
+    StepOutcome,
+};
 use alloc::sync::Arc;
 use alloc::vec;
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
-use crate::adapter::step_engine::{self as step_engine, guard as ebr_guard, page_allocator, reserve_for, sign_for, Cap, StepOutcome};
 use tx_subsystems::cred::{step_setresuid, CapabilitySet, Uid};
 use tx_subsystems::cross_crate_test_support::clear_caps_for_test;
 use tx_subsystems::mount::{

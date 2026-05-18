@@ -78,21 +78,22 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use tx_hal::{PercpuIf, PmapIf, TrapIf, TxPlatform};
+use crate::adapter::boot_runtime;
+use crate::adapter::step_engine::{Cap, PayloadCap};
 use boot_runtime::ast::AstBatch;
 use boot_runtime::userspace::{
     PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, UserspaceEntryDecision,
     UserspaceTrapInfo,
 };
-use tx_subsystems::process::execution::step_exit_group_with_signal;
+use tx_hal::{PercpuIf, TrapIf, TxPlatform};
+use tx_subsystems::signal::deliver_synchronous_fault;
 use tx_subsystems::signal::Signum;
-use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload;
+use tx_subsystems::signal::{ast_dispatch, AstOutcome};
+use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload_into;
 use tx_subsystems::thread_runtime::{
     clear_current_thread_payload, set_current_thread_payload, ThreadIdentity, ThreadPayload,
 };
 use tx_subsystems::vm::{AccessMode, UserVirtAddr, VmFault};
-use crate::adapter::step_engine::{Cap, PayloadCap};
-use crate::adapter::boot_runtime;
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's
 /// `AccessMode`, which is what `VmFault` consumes. The two enums do
@@ -147,6 +148,15 @@ pub struct PerHartSlotted<P: TxPlatform, F: Future> {
     inner: F,
     _platform: core::marker::PhantomData<fn() -> P>,
 }
+
+// SAFETY: `PerHartSlotted` owns a `PayloadCap<ThreadPayload>` (Send)
+// and an `F: Future`. The EBR `Guard` held transiently inside `F`'s
+// async state machine is created and dropped within a single poll
+// boundary — it never crosses an `.await` point. The `Send` bound on
+// `F` is the caller's responsibility; `submit_task_with_meta` already
+// requires `F: Send`.
+unsafe impl<P: TxPlatform, F: Future> Send for PerHartSlotted<P, F> where F: Send {}
+unsafe impl<P: TxPlatform, F: Future> Sync for PerHartSlotted<P, F> where F: Sync {}
 
 impl<P: TxPlatform, F: Future> PerHartSlotted<P, F> {
     pub fn new(payload: PayloadCap<ThreadPayload>, inner: F) -> Self {
@@ -226,6 +236,160 @@ pub async fn run_thread<P: TxPlatform>(
         };
         let entry_token = entry_wait.request();
         payload.set_active_userspace_request(Some(entry_token));
+
+        // Phase E (stop-state): before entering userspace, check
+        // whether the thread is stopped (SIGSTOP / default-Stop
+        // disposition). A stopped thread must park until SIGCONT
+        // clears the flag.
+        while payload.is_stopped() {
+            // Busy-wait placeholder.  On real hardware this spins
+            // until route_gewalt(SIGCONT) clears the flag.  TODO:
+            // replace with a reactor-managed wait-source woken by
+            // SIGCONT's mailbox post.
+            core::hint::spin_loop();
+        }
+
+        // Phase D (AST checkpoint): run ast_dispatch *before* entering
+        // userspace. This is the entry-side AST checkpoint — it drains
+        // pending signals and, for handler-disposition signals, modifies
+        // `saved_user_context` so the thread enters the handler instead
+        // of its original code on next `enter_userspace_with_context`.
+        //
+        // Per SIGNAL_v1 §15.1: AST checkpoint runs on every kernel→user
+        // transition. Pending signals are selected by signum priority
+        // (lowest first), disposition is consulted, and outcomes that
+        // need materialisation (DefaultTerminate, DeliverHandler) are
+        // handled inline.
+        let ast_outcome = ast_dispatch(&thread);
+        match ast_outcome {
+            AstOutcome::DeliverHandler { sig, handler } => {
+                // Phase D: full signal-frame delivery via
+                // SignalFrameIf::prepare_signal_frame (added in the
+                // HAL for this purpose).  The HAL builds the
+                // platform-specific frame bytes + handler-entry
+                // UserTrapContext; we write the bytes to the user
+                // stack via the process AddressSpace, then store
+                // the modified context for the next userspace entry.
+                //
+                // See: `txdoc:SIGNAL-V1-S15-HANDLER-DELIVERY`.
+                if let Some(mut orig_ctx) = payload.saved_user_context() {
+                    // Resolve owning process for aspace + fallback exit.
+                    let Some(process) = thread.upgrade_owner_proc() else {
+                        return;
+                    };
+                    let Some(aspace) = process.aspace_cap() else {
+                        return;
+                    };
+
+                    // If a syscall return is pending (e.g. wait4 just
+                    // resolved, child exit raised SIGCHLD, and the AST
+                    // is now delivering the handler), apply that return
+                    // value to the parked pre-signal context's `a0` and
+                    // clear the pending slot.
+                    //
+                    // Without this, `prepare_userspace_entry_payload`
+                    // below would overlay `pending_syscall_return` onto
+                    // the freshly-built `handler_ctx.a0`, clobbering the
+                    // POSIX-required `sig_no` argument. Apply-and-clear
+                    // moves the syscall return into the place it should
+                    // surface — the post-`rt_sigreturn` userspace context
+                    // — while keeping the handler's `a0` equal to `sig_no`.
+                    //
+                    // RV64 a0 = regs[10]; LA64 a0 = regs[4]; see
+                    // `crate::adapter::step_engine::execution::USER_CONTEXT_A0_INDEX`
+                    // for the canonical constant, but `prepare_*` accesses
+                    // it through this same index so the values are pinned
+                    // here for the apply path.
+                    #[cfg(target_arch = "loongarch64")]
+                    const A0_INDEX: usize = 4;
+                    #[cfg(not(target_arch = "loongarch64"))]
+                    const A0_INDEX: usize = 10;
+                    if let Some(result) = tx_subsystems::thread_runtime::structure::drain_pending_syscall_return(&payload) {
+                        let encoded = match result {
+                            Ok(v) => v as u64,
+                            Err(errno) => (-i64::from(errno)) as u64,
+                        };
+                        orig_ctx.regs[A0_INDEX] = encoded as usize;
+                    }
+
+                    // Save pre-handler context for sigreturn (now
+                    // carrying the applied syscall return in a0).
+                    payload.store_saved_signal_context(Some(orig_ctx));
+
+                    // Read current mask to pass to the handler.
+                    let old_mask = payload.signal_mask();
+
+                    // Build the signal frame write descriptor.
+                    let stack_top = tx_hal::UserPtr::<u8>::new(orig_ctx.regs[2]); // sp
+                    let setup = tx_hal::SignalFrameWrite {
+                        stack_top,
+                        sig_no: sig.raw() as u32,
+                        siginfo: tx_hal::UserSigInfoAbi::ZERO,
+                        old_mask: tx_hal::UserSignalMaskAbi {
+                            bits: old_mask.raw_bits(),
+                        },
+                        flags: tx_hal::UserSaFlagsAbi { bits: 0 },
+                        handler_pc: tx_hal::UserPtr::<()>::new(handler),
+                    };
+
+                    // Guard is scoped inside this block so it does not
+                    // straddle the next `.await` further down in
+                    // `run_thread` (the spawned future must be `Send`).
+                    let prepared =
+                        <P as tx_hal::SignalFrameIf>::prepare_signal_frame(&orig_ctx, &setup);
+                    match prepared {
+                        Ok((handler_ctx, frame_bytes)) => {
+                            let frame_addr = handler_ctx.regs[2];
+                            // Check that the full frame (including the
+                            // sigreturn trampoline at its tail) actually
+                            // landed on the user stack. The previous
+                            // `let _ =` ignored every non-Done outcome —
+                            // including `Yield`/short copy — which left
+                            // the trampoline slot uninitialised, so the
+                            // handler returned to garbage / zeros and
+                            // the next instruction fetch faulted
+                            // (observed end-to-end as the basic-musl
+                            // crash with `lPF pc=trampoline_pc`). If the
+                            // copy doesn't complete fully, fall back to
+                            // the default action (terminate by sig) per
+                            // SIGNAL_v1 §15.1 — handler delivery cannot
+                            // proceed without a valid trampoline.
+                            use crate::adapter::step_engine::StepOutcome as V3;
+                            let copy_outcome = {
+                                let guard = crate::adapter::step_engine::guard();
+                                aspace.copy_to_user(
+                                    tx_hal::UserPtr::<u8>::new(frame_addr),
+                                    frame_bytes.as_slice(),
+                                    &guard,
+                                )
+                            };
+                            let fully_written = match copy_outcome {
+                                V3::Done(n) => n == frame_bytes.as_slice().len(),
+                                _ => false,
+                            };
+                            if !fully_written {
+                                tx_subsystems::process::execution::step_exit_group_with_signal(
+                                    &process, sig,
+                                );
+                                return;
+                            }
+                            payload.store_saved_user_context(Some(handler_ctx));
+                        }
+                        Err(_) => {
+                            // Signal frame write failed (bad stack).
+                            // Take default action: terminate.
+                            tx_subsystems::process::execution::step_exit_group_with_signal(
+                                &process, sig,
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+            AstOutcome::InitiateTermination => return,
+            _ => {}
+        }
+
         let decision = payload.userspace_slot().checkpoint_userspace_entry_batch(
             entry_token,
             AstBatch::default(),
@@ -236,7 +400,6 @@ pub async fn run_thread<P: TxPlatform>(
             "checkpoint_userspace_entry_batch must succeed with the freshly-started \
              entry-side request"
         );
-
         // ----------------------------------------------------------------
         // (2) BUILD MERGED CONTEXT AND DIVE INTO USERSPACE.
         //
@@ -261,13 +424,9 @@ pub async fn run_thread<P: TxPlatform>(
         // recording no-op + Pending fallthrough so `run_thread` can
         // be exercised end-to-end.
         // ----------------------------------------------------------------
-        let ctx = prepare_userspace_entry_payload(&payload);
-        payload.set_active_userspace_request(Some(entry_token));
-
-        // Activate the user process's pmap right before sret. Without
-        // this satp keeps pointing at the kernel bootstrap root from
-        // the boot trampoline, which has no user mappings, and every
-        // user-mode instruction fetch faults forever.
+        // Resolve the user process's pmap right before userspace
+        // entry. The HAL copies `ctx` into an architecture trapframe
+        // and activates the root at the final machine handoff point.
         //
         // We re-resolve `process` and `aspace` per iteration rather
         // than caching across the await: the owning process may
@@ -276,15 +435,17 @@ pub async fn run_thread<P: TxPlatform>(
         // stale Cap.
         if let Some(process) = thread.upgrade_owner_proc() {
             if let Some(aspace) = process.aspace_cap() {
-                <P as PmapIf>::activate_user_pmap(aspace.pmap().root_handle());
+                let root = aspace.pmap().root_handle();
+                let mut ctx = tx_hal::UserTrapContext::empty();
+                prepare_userspace_entry_payload_into(&payload, &mut ctx);
+                payload.set_active_userspace_request(Some(entry_token));
+                <P as TrapIf>::enter_userspace_with_context(&ctx, root);
             } else {
                 return;
             }
         } else {
             return;
         }
-
-        <P as TrapIf>::enter_userspace_with_context(ctx);
 
         // ----------------------------------------------------------------
         // (3) AWAIT THE RESOLVED WAIT.
@@ -313,11 +474,26 @@ pub async fn run_thread<P: TxPlatform>(
                     // Process zombified concurrently; stop.
                     return;
                 };
-                let ctx = tx_shims::linux_syscall::SyscallCtx::new(
+                let mut ctx = tx_shims::linux_syscall::SyscallCtx::new(
                     process.clone(),
                     thread.clone(),
                     aspace,
                 );
+                // drive-taskmb: inject the current task's mailbox so
+                // drive() can park on it for yield resolution.
+                if let Some(mailbox) = tx_reactor::current_task_mailbox() {
+                    ctx = ctx.with_mailbox(mailbox);
+                }
+                // drive-taskmb: inject the reactor's timer wheel for
+                // OnTimer yield resolution.
+                if let Some(tw) = tx_reactor::current_timer_wheel() {
+                    ctx = ctx.with_timer_wheel(tw);
+                }
+                // drive-taskmb: inject the reactor's delegate registry
+                // for OnAgent yield resolution.
+                if let Some(dr) = tx_reactor::current_delegate_registry() {
+                    ctx = ctx.with_delegate_registry(dr);
+                }
                 let result = tx_shims::linux_syscall::dispatch::<P>(req, &ctx).await;
 
                 match result {
@@ -359,6 +535,17 @@ pub async fn run_thread<P: TxPlatform>(
                         // `UserTrapContext`, per
                         // `make_initial_user_trap_context`).
                     }
+                    tx_shims::linux_syscall::SyscallResult::SigreturnRestored => {
+                        // Phase B: rt_sigreturn restored the signal
+                        // frame into saved_user_context.  Same
+                        // fall-through semantics as ExecCommitted:
+                        // MUST NOT drain pending_syscall_return;
+                        // re-enters userspace with the restored
+                        // context.  The actual SignalFrameIf restore
+                        // (read_signal_frame + restore_signal_frame)
+                        // lands in Phase D.
+                        // Fall through to AST drain + re-entry.
+                    }
                 }
             }
             UserspaceTrapInfo::PageFault(info) => {
@@ -397,18 +584,15 @@ pub async fn run_thread<P: TxPlatform>(
                         // `pending_syscall_return` write).
                     }
                     Err(_e) => {
-                        step_exit_group_with_signal(&process, Signum::SIGSEGV);
+                        deliver_synchronous_fault(&thread, Signum::SIGSEGV);
                         return;
                     }
                 }
             }
             UserspaceTrapInfo::Fatal(_info) => {
-                // Out-of-scope for Phase 2; terminate the future
-                // rather than entering a divergent state we can't
-                // express yet.
-                if let Some(process) = thread.upgrade_owner_proc() {
-                    step_exit_group_with_signal(&process, Signum::SIGSEGV);
-                }
+                // Phase B: route fatal trap through canonical
+                // synchronous-fault entry per SIGNAL_v1 §20.
+                deliver_synchronous_fault(&thread, Signum::SIGSEGV);
                 return;
             }
         }

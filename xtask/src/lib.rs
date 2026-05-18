@@ -11,6 +11,19 @@ mod fault_decode;
 mod full_build;
 mod image;
 mod lint;
+mod lint_invariants_checks;
+mod lint_invariants_drive;
+mod lint_invariants_script;
+mod lint_invariants_signal;
+mod lint_invariants_step;
+mod lint_invariants_step_v3;
+mod lint_invariants_subj;
+mod lint_invariants_syscall;
+mod lint_invariants_witness;
+#[path = "lint_step_guard.rs"]
+mod lint_step_guard;
+mod observe;
+mod observe_discipline;
 mod oscomp;
 mod progress;
 mod qemu;
@@ -53,6 +66,8 @@ pub fn run() -> Result<()> {
         "lint" => lint::lint(&root, args.collect()),
         "boundary-report" => boundary_report::boundary_report(&root, args.collect()),
         "unit" => unit::unit(&root),
+        "observe" => observe::observe(&root, args.collect()),
+        "observe-discipline" => observe_discipline::observe_discipline(&root),
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
@@ -86,7 +101,7 @@ fn print_usage() {
            cargo xtask progress new plan|handoff|worktree --id ID --title TITLE [...]\n\
            cargo xtask progress claim plan|worktree --id ID --owner NAME --scope PATH [--scope PATH]\n\
            cargo xtask progress close plan|handoff|worktree --id ID --status STATUS\n\
-           cargo xtask lint arch|docs|unused|boundary\n\
+           cargo xtask lint arch|docs|unused|boundary|invariants [rule|all]\n\
            cargo xtask boundary-report [--top N] [--json]\n\
            cargo xtask unit\n"
     );

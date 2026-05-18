@@ -82,9 +82,9 @@ use core::task::{Context, Poll};
 pub mod adapter;
 
 use adapter::step_engine::{
-    sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, InterestMask,
-    OnBehalfOfAbort, ScriptCtx, SpinMutex, SubjectContext, SubjectIdentity, WaitSource,
-    WaitSourceId, Zone, ZoneAllocated, ZoneError,
+    sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, InterestMask, OnBehalfOfAbort,
+    ScriptCtx, SpinMutex, SubjectContext, SubjectIdentity, WaitSource, WaitSourceId, Zone,
+    ZoneAllocated, ZoneError,
 };
 use adapter::wait_routing::Channel;
 
@@ -363,7 +363,8 @@ impl IoUring {
         ring.push_back(sqe);
         drop(ring);
         // Wake any parked SQPOLL kthread. Mirrors the AIO push path.
-        self.sqe_arrived.notify(InterestMask::new(SQE_ARRIVED_MASK));
+        self.sqe_arrived
+            .notify_emit(InterestMask::new(SQE_ARRIVED_MASK));
         Ok(())
     }
 
@@ -379,7 +380,7 @@ impl IoUring {
     pub fn push_cqe(&self, cqe: CqeStub) {
         self.cq_ring.lock().push_back(cqe);
         self.cqe_available
-            .notify(InterestMask::new(CQE_AVAILABLE_MASK));
+            .notify_emit(InterestMask::new(CQE_AVAILABLE_MASK));
     }
 
     /// Pop one CQE off the ring, if any. Future `io_uring_enter(2)`
@@ -731,9 +732,7 @@ mod tests {
         assert!(
             matches!(
                 reason,
-                OnBehalfOfAbort::CooperativeCancel(
-                    CancelReason::OwnerRequested
-                )
+                OnBehalfOfAbort::CooperativeCancel(CancelReason::OwnerRequested)
             ),
             "cancel_worker trips OwnerRequested, got {reason:?}"
         );

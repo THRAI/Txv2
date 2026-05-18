@@ -23,11 +23,13 @@ use alloc::vec::Vec;
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use tx_hal::{
-    Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
+use crate::adapter::step_engine::{
+    self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, SpinMutex, StepOutcome,
 };
-use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, SpinMutex, StepOutcome};
+use tx_hal::{
+    Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
+};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
@@ -59,6 +61,11 @@ use super::{exec_script, ExecError};
 // ---------------------------------------------------------------------------
 
 struct ScriptsTestPmap;
+
+impl PlatformConfig for ScriptsTestPmap {
+    const ARCH: Arch = Arch::Riscv64;
+    const BOARD: &'static str = "scripts-test";
+}
 
 #[derive(Default)]
 struct ScriptsTestPmapState {
@@ -138,6 +145,8 @@ impl PmapIf for ScriptsTestPmap {
 // xorshift, which is exactly what test sites want — non-zero,
 // reproducible, no hardware dependency.
 impl EntropyIf for ScriptsTestPmap {}
+
+impl tx_hal::AuxvIf for ScriptsTestPmap {}
 
 // ---------------------------------------------------------------------------
 // Minimal in-test FS that knows how to materialise regular files as
@@ -246,8 +255,7 @@ impl ExecTestFs {
         // than reaching into `set_size_bytes` (pub(crate)).
         let guard = guard();
         match tx_subsystems::page_backed::step_truncate(&pc, size, &guard) {
-            StepOutcome::Done(())
-            | StepOutcome::Continue { .. } => {}
+            StepOutcome::Done(()) | StepOutcome::Continue { .. } => {}
             other => panic!("step_truncate(pc, {size}) failed: {other:?}"),
         }
         drop(guard);
@@ -548,6 +556,16 @@ fn exec_script_loads_minimal_elf_seeds_saved_user_context() {
 }
 
 #[test]
+fn initial_user_context_uses_arch_specific_stack_register() {
+    assert_eq!(super::initial_user_sp_reg_for_arch(Arch::Riscv64), 2);
+    assert_eq!(super::initial_user_sp_reg_for_arch(Arch::LoongArch64), 3);
+
+    let ctx = super::make_initial_user_trap_context(Arch::LoongArch64, 0x1000, 0x4000);
+    assert_eq!(ctx.regs[3], 0x4000);
+    assert_eq!(ctx.regs[2], 0);
+}
+
+#[test]
 fn exec_script_resets_brk_base_from_image_plan() {
     let _setup = setup();
     let bytes = minimal_elf_bytes();
@@ -687,7 +705,7 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
         let cred = Credential::root();
         let cwd = process.cwd().expect("cwd bound");
         let guard = guard();
-        let outcome = block_on(tx_subsystems::vfs::walker::step_open(
+        let outcome = tx_subsystems::vfs::walker::step_open(
             cwd,
             name,
             OpenFileFlags {
@@ -700,7 +718,7 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
             0,
             &cred,
             &guard,
-        ));
+        );
         drop(guard);
         match outcome {
             V3::Done(file) => file,

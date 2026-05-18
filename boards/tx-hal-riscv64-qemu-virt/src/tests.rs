@@ -716,7 +716,10 @@ fn trap_frame_fp_context_empty_when_fs_off() {
 
     let ctx = frame.view_mut().capture_user_context();
 
-    assert!(!ctx.fp.is_valid(), "FP context must not be valid when FS=Off");
+    assert!(
+        !ctx.fp.is_valid(),
+        "FP context must not be valid when FS=Off"
+    );
     assert_eq!(ctx.fp.flags, 0);
 }
 
@@ -739,6 +742,9 @@ fn trap_frame_fp_context_zeroed_when_restored_without_valid_fp() {
     }
     frame2.view_mut().restore_user_context(&ctx);
 
-    assert_eq!(frame2.f, [0u64; 32], "FP regs must be zeroed when fp not valid");
+    assert_eq!(
+        frame2.f, [0u64; 32],
+        "FP regs must be zeroed when fp not valid"
+    );
     assert_eq!(frame2.fcsr, 0, "fcsr must be zeroed when fp not valid");
 }

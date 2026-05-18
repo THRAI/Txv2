@@ -110,18 +110,12 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let root_mount =
             root_mount().expect("register_busybox_into_tmpfs: ROOT_MOUNT must be populated");
-        let fs_ops = root_mount
+        let payload = root_mount
             .payload_cap()
             .expect("rootfs payload alive during boot")
-            .into_cap()
-            .fs_ops
-            .clone();
-        let fs_page_backing = root_mount
-            .payload_cap()
-            .expect("rootfs payload alive during boot")
-            .into_cap()
-            .fs_page_backing
-            .clone();
+            .into_cap();
+        let fs_ops = payload.fs_ops.clone();
+        let fs_page_backing = payload.fs_page_backing.clone();
         let root_object_id = root_mount.root().fs_object_id();
 
         let cred = Credential::root();
@@ -162,7 +156,7 @@ impl<P: TxPlatform> CoreInit<P> {
         //    `Cap<PageContainer>`.
         let pc = {
             let guard = step_engine::guard();
-            let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
+            let outcome = fs_ops.materialise_rnode(file_id, file_meta, &payload, &guard);
             let rnode = match outcome {
                 V3::Done(rnode) => rnode,
                 other => panic!("register_busybox_into_tmpfs: materialise_rnode: {other:?}"),
@@ -229,18 +223,12 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let root_mount =
             root_mount().expect("register_init_fixture_into_tmpfs: ROOT_MOUNT must be populated");
-        let fs_ops = root_mount
+        let payload = root_mount
             .payload_cap()
             .expect("rootfs payload alive during boot")
-            .into_cap()
-            .fs_ops
-            .clone();
-        let fs_page_backing = root_mount
-            .payload_cap()
-            .expect("rootfs payload alive during boot")
-            .into_cap()
-            .fs_page_backing
-            .clone();
+            .into_cap();
+        let fs_ops = payload.fs_ops.clone();
+        let fs_page_backing = payload.fs_page_backing.clone();
         let root_object_id = root_mount.root().fs_object_id();
 
         let bytes = &init_fixture::INIT_FIXTURE_BYTES[..];
@@ -256,6 +244,15 @@ impl<P: TxPlatform> CoreInit<P> {
             let outcome = fs_ops.create_inode(root_object_id, b"init", 0o100755, &cred, &guard);
             match outcome {
                 V3::Done(out) => out,
+                V3::Err(step_engine::Errno::EROFS)
+                | V3::Err(step_engine::Errno::ENOSYS)
+                | V3::Err(step_engine::Errno::EEXIST) => {
+                    // Rootfs is read-only (e.g. ext4 mounted from vda).
+                    // The fixture is not needed; the real binary lives on disk.
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":init:fixture:skip:ro\n");
+                    return;
+                }
                 other => panic!("register_init_fixture_into_tmpfs: create_inode(/init): {other:?}"),
             }
         };
@@ -265,7 +262,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // `RNodeBacking::PageBacked { pc }` for regular files.
         let pc = {
             let guard = step_engine::guard();
-            let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
+            let outcome = fs_ops.materialise_rnode(file_id, file_meta, &payload, &guard);
             let rnode = match outcome {
                 V3::Done(rnode) => rnode,
                 other => panic!("register_init_fixture_into_tmpfs: materialise_rnode: {other:?}"),
@@ -355,28 +352,71 @@ impl<P: TxPlatform> CoreInit<P> {
         // DIAGNOSTIC: emit epoch state right before the sdcard exec to
         // identify whether a guard leak pre-dates drive_bootstrap_exec.
         {
-            let es = tx_substrate::epoch::summary();
-            let cpu0 = tx_substrate::epoch::cpu_summary(tx_hal::CpuId(0));
+            let es = crate::adapter::step_engine::epoch::summary();
+            let cpu0 = crate::adapter::step_engine::epoch::cpu_summary(tx_hal::CpuId(0));
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":diag:pre-sdcard-exec:guards=");
             Self::write_decimal_unsigned(es.active_guards);
             tx_hal::console_write_str::<P>(":epoch=");
             Self::write_decimal_unsigned(es.global_epoch as usize);
             tx_hal::console_write_str::<P>(":cpu0-local=");
-            Self::write_decimal_unsigned(
-                cpu0.map(|c| c.local_epoch as usize).unwrap_or(999),
-            );
+            Self::write_decimal_unsigned(cpu0.map(|c| c.local_epoch as usize).unwrap_or(999));
             tx_hal::console_write_str::<P>("\n");
         }
 
-        if super::MUSL_MOUNT.lock().is_some() {
-            let sdcard_envp: &[&[u8]] = &[b"PATH=/musl/musl:/musl/musl/basic"];
-            let sdcard_argv: &[&[u8]] =
-                &[b"sh", b"-c", b"cd /musl/musl && ./busybox sh basic_testcode.sh"];
+        let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
+        let sdcard_boot = boot_info.initrd.is_none() && boot_info.cmdline.is_none();
+
+        if super::MUSL_MOUNT.lock().is_some() && sdcard_boot {
+            // Per-arch busybox path and test-script chain.
+            //
+            // la64 sdcard has both glibc/ and musl/ test directories;
+            // run both.  rv64 sdcard is musl-only (old code confirmed
+            // this: "cd /musl/musl && ./busybox sh basic_testcode.sh").
+            //
+            // All testcode.sh scripts expect CWD = their own directory
+            // and use `./busybox` for echo/cat etc., so we `cd` first.
+            let (sdcard_bin, sdcard_cmd): (&[u8], &[u8]) = match P::ARCH {
+                tx_hal::Arch::LoongArch64 => (
+                    // la64 sdcard has both glibc/ (dynamic) and musl/
+                    // (static). Use the musl static busybox; the kernel
+                    // does not yet support PT_INTERP (dynamic linker).
+                    b"/musl/musl/busybox",
+                    b"cd /musl/musl \
+                      && ./busybox sh basic_testcode.sh \
+                      && ./busybox sh busybox_testcode.sh \
+                      && ./busybox sh libctest_testcode.sh \
+                      && ./busybox sh libcbench_testcode.sh \
+                      && ./busybox sh lua_testcode.sh \
+                      && ./busybox sh lmbench_testcode.sh \
+                      && ./busybox sh iozone_testcode.sh \
+                      && ./busybox sh netperf_testcode.sh \
+                      && ./busybox sh iperf_testcode.sh \
+                      && ./busybox sh cyclictest_testcode.sh \
+                      && ./busybox sh ltp_testcode.sh",
+                ),
+                tx_hal::Arch::Riscv64 => (
+                    b"/musl/musl/busybox",
+                    b"cd /musl/musl \
+                      && ./busybox sh basic_testcode.sh \
+                      && ./busybox sh busybox_testcode.sh \
+                      && ./busybox sh libctest_testcode.sh \
+                      && ./busybox sh libcbench_testcode.sh \
+                      && ./busybox sh lua_testcode.sh \
+                      && ./busybox sh lmbench_testcode.sh \
+                      && ./busybox sh iozone_testcode.sh \
+                      && ./busybox sh netperf_testcode.sh \
+                      && ./busybox sh iperf_testcode.sh \
+                      && ./busybox sh cyclictest_testcode.sh \
+                      && ./busybox sh ltp_testcode.sh",
+                ),
+            };
+            let sdcard_envp: &[&[u8]] = &[b"PATH=/musl/glibc:/musl/musl"];
+            let sdcard_argv: &[&[u8]] = &[b"sh", b"-c", sdcard_cmd];
             let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
                 &init,
                 &thread,
-                b"/musl/musl/busybox",
+                sdcard_bin,
                 sdcard_argv,
                 sdcard_envp,
                 &cred,
@@ -410,6 +450,10 @@ impl<P: TxPlatform> CoreInit<P> {
         //   `tx.profile=busybox` (no init=) -> /bin/sh argv=[sh]
         //   default -> bake-in /init fixture, argv=[init]
         let (init_path, argv0) = parse_init_from_cmdline::<P>();
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":bootstrap-exec:path:");
+        tx_hal::console_write_bytes::<P>(init_path);
+        tx_hal::console_write_str::<P>("\n");
 
         // `exec_script` opens its own fresh epoch guards inside V1
         // (`build_aspace_from_image`) and V2
@@ -532,7 +576,11 @@ impl<P: TxPlatform> CoreInit<P> {
     ///
     /// Cheap when no bytes are pending (`read_bytes` returns 0,
     /// the rest is skipped).
-    pub(super) fn drain_sbi_console_into_tty() {
+    pub(crate) fn drain_pending_uart_rx_into_tty() -> usize {
+        crate::irq::drain_uart_rx_pending()
+    }
+
+    pub(super) fn drain_sbi_console_into_tty() -> usize {
         // 2026-05-13: bumped from 64 to 512 bytes to swallow whole shell
         // command lines in a single SBI poll. The 64-byte cap left the
         // 17-byte tail of an 81-character `ln -s` line stranded in the
@@ -548,11 +596,12 @@ impl<P: TxPlatform> CoreInit<P> {
         let mut buf = [0u8; 512];
         let n = <P as tx_hal::ConsoleIf>::read_bytes(&mut buf);
         if n == 0 {
-            return;
+            return 0;
         }
-        let Some(tty) = console_tty() else { return };
+        let Some(tty) = console_tty() else { return 0 };
         let guard = step_engine::guard();
         let _ = tx_subsystems::tty::execution::step_ingest(&tty, &buf[..n], &guard);
+        n
     }
 
     pub(super) fn run_userspace_reactor_loop() {
@@ -578,20 +627,27 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         };
 
-        let task_payload = payload.clone();
+        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        let wrapper_payload = payload.clone();
+        let future_payload = payload.clone();
         let submit_thread = thread.clone();
         let submitted = BOOT_REACTOR.with(|reactor| {
-            reactor.submit_task(crate::thread_future::PerHartSlotted::<P, _>::new(
-                task_payload.clone(),
-                crate::thread_future::run_thread::<P>(submit_thread, task_payload),
-            ));
+            reactor.submit_task_with_meta(
+                crate::thread_future::PerHartSlotted::<P, _>::new(
+                    wrapper_payload,
+                    crate::thread_future::run_thread::<P>(submit_thread, future_payload),
+                ),
+                boot_runtime::InitialSchedMeta::kernel()
+                    .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
+            )
         });
         if submitted.is_none() {
             // Boot reactor not initialised; nothing to drive.
             return;
         }
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":userspace:submitted\n");
 
-        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
         P::enable_timer_wakeups();
 
         // Drive the BSP reactor loop until init zombifies. Each
@@ -603,6 +659,18 @@ impl<P: TxPlatform> CoreInit<P> {
         loop {
             if init.is_zombie() {
                 break;
+            }
+
+            // UART IRQ handlers cannot touch TTY state directly
+            // because epoch guards are forbidden in IRQ context.
+            // They queue bytes in an IRQ-safe buffer and request a
+            // reactor wake; consume that buffer here in normal
+            // context before deciding whether there is runnable work.
+            if Self::drain_pending_uart_rx_into_tty() != 0 {
+                continue;
+            }
+            if Self::drain_sbi_console_into_tty() != 0 {
+                continue;
             }
 
             // Drain any pending child-thread submits posted from

@@ -9,8 +9,11 @@
 
 use alloc::boxed::Box;
 
-use crate::adapter::step_engine::{self as step_engine, guard, Cap, Errno as V3Errno, NoProgress, StepOutcome as V3Outcome};
+use crate::adapter::step_engine::{
+    self as step_engine, guard, Cap, Errno as V3Errno, NoProgress, StepOutcome as V3Outcome,
+};
 use tx_subsystems::execution::{Errno, Guard};
+use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::{Frame, MaterializeAccess, PageIndex};
 use tx_subsystems::vfs::structure::{
     Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta, RNode, RNodeBacking,
@@ -177,6 +180,7 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
         &self,
         fs_object_id: FsObjectId,
         meta: InodeMeta,
+        mount: &Cap<MountPayload>,
         _guard: &Guard<'_>,
     ) -> V3Outcome<Cap<RNode>, NoProgress> {
         let inner = self.inner.lock();
@@ -185,12 +189,13 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
         };
         match inode {
             ExecTestInode::Regular { container, .. } => {
-                match RNode::new_cap(
+                match RNode::new_cap_in_mount(
                     fs_object_id,
                     meta,
                     RNodeBacking::PageBacked {
                         pc: container.clone(),
                     },
+                    mount,
                 ) {
                     Ok(rnode) => V3Outcome::done(rnode),
                     Err(_) => V3Outcome::err(Errno::ENOMEM.into()),
@@ -248,7 +253,11 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecTestFs {
         V3Outcome::done(())
     }
 
-    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Outcome<(), NoProgress> {
+    fn fsync_file(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(), NoProgress> {
         V3Outcome::done(())
     }
 }
@@ -338,7 +347,7 @@ fn exec_testfs_v3_fsync_returns_done() {
 
     let guard = guard();
     assert_eq!(
-        <ExecTestFs as FsPageBacking>::fsync(&*fs, FsObjectId::new(2), &guard),
+        <ExecTestFs as FsPageBacking>::fsync_file(&*fs, FsObjectId::new(2), &guard),
         V3::<(), NoProgress>::done(())
     );
 }

@@ -5,6 +5,7 @@ use crate::ondisk::{
 };
 use crate::ondisk::{read_u16_le, write_u16_le};
 use crate::{Ext4FormatError, Result};
+use alloc::vec;
 use alloc::vec::Vec;
 
 pub const BLOCK_SIZE: usize = 4096;
@@ -241,6 +242,27 @@ impl<I: BlockImage> Ext4Pager<I> {
         out: &mut [DirEntryLite],
     ) -> Result<usize> {
         self.read_dir_entries_from(directory, 0, out)
+    }
+
+    pub fn read_link(&mut self, inode: InodeNo) -> Result<Vec<u8>> {
+        let disk_inode = self.read_inode(inode)?;
+        if !disk_inode.is_symlink() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        if let Some(target) = disk_inode.inline_symlink_target()? {
+            return Ok(target.to_vec());
+        }
+        let mut out = vec![0; disk_inode.size as usize];
+        for (idx, chunk) in out.chunks_mut(BLOCK_SIZE).enumerate() {
+            let mut page = [0u8; BLOCK_SIZE];
+            match self.resolve_inode_block(&disk_inode, logical_block(idx as u64)?)? {
+                BlockMapping::Data(block) => self.image.read_block(block, &mut page)?,
+                BlockMapping::Hole => page.fill(0),
+                BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
+            }
+            chunk.copy_from_slice(&page[..chunk.len()]);
+        }
+        Ok(out)
     }
 
     pub fn write_inode_meta_journaled(
@@ -544,7 +566,13 @@ impl<I: BlockImage> Ext4Pager<I> {
         let data_block = self.allocate_block()?;
 
         let mut dir_data = [0u8; BLOCK_SIZE];
-        encode_dir_entry(new_ino.get(), 12, 2 /* dir */, b".", &mut dir_data[0..12])?;
+        encode_dir_entry(
+            new_ino.get(),
+            12,
+            2, /* dir */
+            b".",
+            &mut dir_data[0..12],
+        )?;
         encode_dir_entry(
             parent_ino.get(),
             (BLOCK_SIZE - 12) as u16,

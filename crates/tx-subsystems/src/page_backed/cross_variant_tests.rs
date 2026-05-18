@@ -1,9 +1,9 @@
 use super::*;
-use alloc::vec;
-use alloc::vec::Vec;
 use crate::page_backed::adapter::step_engine::{
     self as step_engine, Errno as V3Errno, StepOutcome as V3Out,
 };
+use alloc::vec;
+use alloc::vec::Vec;
 
 fn setup_host_substrate() {
     tx_test_support::init_host();

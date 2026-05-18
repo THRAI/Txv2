@@ -33,7 +33,7 @@ pub struct ZoneId(pub usize);
 ///
 /// `slot_id` is derived from the current slab layout:
 /// `(slab_id - 1) * SLOTS_PER_SLAB + slot_index`.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 #[repr(transparent)]
 pub struct SlotKey(u32);
 
@@ -257,8 +257,7 @@ impl ZoneRegistry {
         if zone_id.0 == 0 || zone_id.0 > MAX_REGISTERED_ZONES {
             return None;
         }
-        let _guard = self.lock.lock();
-        let entry = unsafe { *self.entries[zone_id.0 - 1].get() }?;
+        let entry = self.entry_at(zone_id.0 - 1)?;
         Some((entry.refresh_info)(entry.erased))
     }
 
@@ -274,13 +273,12 @@ impl ZoneRegistry {
     }
 
     fn snapshot(&self, out: &mut [Option<ZoneInfo>]) -> usize {
-        let _guard = self.lock.lock();
         let mut written = 0;
-        for entry in &self.entries {
+        for index in 0..MAX_REGISTERED_ZONES {
             if written == out.len() {
                 break;
             }
-            let Some(entry) = (unsafe { *entry.get() }) else {
+            let Some(entry) = self.entry_at(index) else {
                 continue;
             };
             out[written] = Some((entry.refresh_info)(entry.erased));
@@ -290,9 +288,8 @@ impl ZoneRegistry {
     }
 
     fn init_cpu_buckets(&self, cpu: CpuId) -> Result<(), ZoneError> {
-        let _guard = self.lock.lock();
-        for entry in &self.entries {
-            let Some(entry) = (unsafe { *entry.get() }) else {
+        for index in 0..MAX_REGISTERED_ZONES {
+            let Some(entry) = self.entry_at(index) else {
                 continue;
             };
             (entry.init_cpu_bucket)(entry.erased, cpu)?;
@@ -301,9 +298,8 @@ impl ZoneRegistry {
     }
 
     fn flush_current_cpu_buckets(&self) -> Result<(), ZoneError> {
-        let _guard = self.lock.lock();
-        for entry in &self.entries {
-            let Some(entry) = (unsafe { *entry.get() }) else {
+        for index in 0..MAX_REGISTERED_ZONES {
+            let Some(entry) = self.entry_at(index) else {
                 continue;
             };
             (entry.flush_current_cpu_bucket)(entry.erased)?;
@@ -312,12 +308,11 @@ impl ZoneRegistry {
     }
 
     fn trim_empty_slabs(&self, limit: usize) -> EmptySlabTrimStats {
-        let _guard = self.lock.lock();
         let mut stats = EmptySlabTrimStats::default();
         let mut remaining = limit;
 
-        for entry in &self.entries {
-            let Some(entry) = (unsafe { *entry.get() }) else {
+        for index in 0..MAX_REGISTERED_ZONES {
+            let Some(entry) = self.entry_at(index) else {
                 continue;
             };
             stats.scanned_zones += 1;
@@ -338,8 +333,7 @@ impl ZoneRegistry {
             return None;
         }
 
-        let _guard = self.lock.lock();
-        let entry = unsafe { *self.entries[zone_id.0 - 1].get() }?;
+        let entry = self.entry_at(zone_id.0 - 1)?;
         // A stale or forged key must not resolve across zone/type boundaries.
         if entry.zone_id != zone_id || entry.type_id != TypeId::of::<T>() {
             return None;
@@ -347,6 +341,14 @@ impl ZoneRegistry {
 
         let ptr = (entry.slot_from_key)(entry.erased, key)?;
         NonNull::new(ptr.cast::<Slot<T>>())
+    }
+
+    fn entry_at(&self, index: usize) -> Option<RegisteredZone> {
+        if index >= MAX_REGISTERED_ZONES {
+            return None;
+        }
+        let _guard = self.lock.lock();
+        unsafe { *self.entries[index].get() }
     }
 
     fn clear(&self) {

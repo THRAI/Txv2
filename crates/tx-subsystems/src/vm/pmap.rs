@@ -1,3 +1,7 @@
+use crate::vm::adapter::step_engine::{
+    page_allocator::BitmapPageAllocator, AddressSpaceShootdownBatch, ShootdownError, SpinMutex,
+    ZoneError,
+};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 #[cfg(test)]
@@ -5,10 +9,6 @@ use std::sync::{LazyLock, Mutex};
 use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot,
     Ppn, VirtAddr,
-};
-use crate::vm::adapter::step_engine::{
-    page_allocator::BitmapPageAllocator, AddressSpaceShootdownBatch, ShootdownError, SpinMutex,
-    ZoneError,
 };
 
 use crate::page_backed::MaterializedPagePin;
@@ -25,6 +25,12 @@ type ReserveMappingFn = fn(
 ) -> Result<Option<PmapReservation>, PmapError>;
 type UnmapMappingFn =
     fn(&PmapRoot, VirtAddr, PmapReserveKind) -> Result<Option<tx_hal::PmapUnmapResult>, PmapError>;
+type ProtectMappingFn = fn(
+    &PmapRoot,
+    VirtAddr,
+    PmapReserveKind,
+    PmapPermissions,
+) -> Result<Option<tx_hal::PmapInvalidation>, PmapError>;
 
 #[derive(Clone, Copy)]
 struct VmPmapOps {
@@ -33,6 +39,7 @@ struct VmPmapOps {
     reserve_mapping: ReserveMappingFn,
     commit_mapping: fn(&PmapRoot, PmapReservation, PmapPermissions),
     unmap_mapping: UnmapMappingFn,
+    protect_mapping: ProtectMappingFn,
     shootdown_mappings: fn(Asid, &[tx_hal::PmapInvalidation]),
 }
 
@@ -44,6 +51,7 @@ impl VmPmapOps {
             reserve_mapping: P::reserve_mapping,
             commit_mapping: P::commit_mapping,
             unmap_mapping: P::unmap_mapping,
+            protect_mapping: P::protect_mapping,
             shootdown_mappings: P::shootdown_mappings,
         }
     }
@@ -337,6 +345,53 @@ impl VmPmap {
             self.issue_batch(batch);
         }
         Ok(removed)
+    }
+
+    /// Demote existing tracked mappings in `range` to `prot`.
+    ///
+    /// Used by fork CoW: parent private mappings must stop being writable,
+    /// but keeping them mapped read-only preserves the parent's hot code,
+    /// stack, and data bytes. The next write faults through the recipe and
+    /// materializes an exclusive private frame.
+    pub fn protect_range(&self, range: UserRange, prot: Prot) -> Result<usize, VmPmapError> {
+        let permissions = permissions_for_prot(prot);
+        let mut protected = 0;
+
+        for page in range.iter_pages() {
+            let Some(current) = self
+                .state
+                .lock()
+                .mappings
+                .get(&page)
+                .map(PmapMapping::snapshot)
+            else {
+                continue;
+            };
+            if current.prot == prot {
+                continue;
+            }
+
+            let virt = virt_for_page(page)?;
+            let invalidation = match (self.ops.protect_mapping)(
+                self.root(),
+                virt,
+                PmapReserveKind::Page4K,
+                permissions,
+            ) {
+                Ok(Some(invalidation)) => invalidation,
+                Ok(None) => return Err(VmPmapError::MappingMismatch),
+                Err(error) => return Err(VmPmapError::Pmap(error)),
+            };
+
+            if let Some(mapping) = self.state.lock().mappings.get_mut(&page) {
+                mapping.prot = prot;
+            }
+            (self.ops.shootdown_mappings)(self.asid(), &[invalidation]);
+            self.state.lock().shootdowns += 1;
+            protected += 1;
+        }
+
+        Ok(protected)
     }
 
     fn root(&self) -> &PmapRoot {

@@ -24,7 +24,7 @@ use crate::tty::adapter::wait_routing::{Channel, WaitSource};
 use crate::wait_source;
 
 use super::payload::TtyPayload;
-use crate::tty::adapter::step_engine::{self as step_engine, StepOp, SubjectIdentity, WaitSourceId};
+use crate::tty::adapter::step_engine::{self as step_engine, WaitSourceId};
 
 // ---------------------------------------------------------------------------
 // Staging: FixedName<N>
@@ -141,9 +141,7 @@ impl SessionPgrp {
     /// the binding was constructed from a real session and that
     /// session is still alive. Returns `None` for legacy raw-id
     /// bindings or when the session has been dropped.
-    pub fn upgrade_session(
-        &self,
-    ) -> Option<Cap<crate::process::structure::Session>> {
+    pub fn upgrade_session(&self) -> Option<Cap<crate::process::structure::Session>> {
         let weak = self.session.as_ref()?;
         let guard = step_engine::guard();
         weak.upgrade(&guard)
@@ -152,9 +150,7 @@ impl SessionPgrp {
     /// Upgrade the typed `Weak<ProcessGroup>` for the foreground pgrp
     /// to a strong `Cap<ProcessGroup>` if alive. Returns `None` for
     /// legacy raw-id bindings or when the pgrp has been dropped.
-    pub fn upgrade_foreground_pgrp(
-        &self,
-    ) -> Option<Cap<crate::process::structure::ProcessGroup>> {
+    pub fn upgrade_foreground_pgrp(&self) -> Option<Cap<crate::process::structure::ProcessGroup>> {
         let weak = self.foreground_pgrp.as_ref()?;
         let guard = step_engine::guard();
         weak.upgrade(&guard)
@@ -357,9 +353,7 @@ impl TtyIdentity {
     ///
     /// Used by signal-fanout paths that want to call
     /// `signal::step_kill_pgrp` against the foreground pgrp.
-    pub fn foreground_pgrp_cap(
-        &self,
-    ) -> Option<Cap<crate::process::structure::ProcessGroup>> {
+    pub fn foreground_pgrp_cap(&self) -> Option<Cap<crate::process::structure::ProcessGroup>> {
         self.session_pgrp.snapshot()?.upgrade_foreground_pgrp()
     }
 
@@ -371,9 +365,7 @@ impl TtyIdentity {
 impl Entity for TtyIdentity {
     type OperationalEvidence = PayloadCap<TtyPayload>;
 
-    fn upgrade_operational(
-        identity: &Cap<Self>,
-    ) -> Result<Self::OperationalEvidence, Dead> {
+    fn upgrade_operational(identity: &Cap<Self>) -> Result<Self::OperationalEvidence, Dead> {
         identity.live_payload().ok_or(Dead)
     }
 }
@@ -418,7 +410,8 @@ mod tests {
         let _g = setup();
 
         let id_res = step_engine::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res = step_engine::reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload_res =
+            step_engine::reserve_for::<TtyPayload>().expect("tty payload reservation");
 
         let tty = step_engine::sign_for(
             id_res,

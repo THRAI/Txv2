@@ -4,15 +4,15 @@ use crate::page_backed::{
     MaterializeAccess, MaterializedPage, MaterializedPagePin, PageCacheError, PageContainer,
     PageIndex,
 };
-use step_engine::page_allocator::{self, ZeroPolicy};
 use crate::vm::adapter::step_engine::Cap;
+use step_engine::page_allocator::{self, ZeroPolicy};
 
 use super::private::{
     PrivateFrame, PrivateFrameIdentity, PrivateFrameSnapshot, PrivateFrameState, PrivatePageError,
     PrivatePageSet, VmPageOff,
 };
-use crate::vm::VmPmapError;
 use crate::vm::adapter::step_engine::{self as step_engine};
+use crate::vm::VmPmapError;
 
 pub const USER_PAGE_SIZE: usize = 4096;
 
@@ -374,6 +374,14 @@ impl VmEntry {
     /// by `fork_aspace` when populating the child.
     pub fn with_private(mut self, set: Option<Cap<PrivatePageSet>>) -> Self {
         self.private = set;
+        self
+    }
+
+    /// Builder helper: return a clone of `self` with the `locked`
+    /// flag set. Used by the mlock/munlock path to tag VMAs without
+    /// bypassing the EBR-published recipe-tree contract.
+    pub fn with_locked(mut self, locked: bool) -> Self {
+        self.flags.locked = locked;
         self
     }
 

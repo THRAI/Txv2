@@ -57,12 +57,17 @@ use super::{
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use tx_hal::{
-    Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
+    Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
 use tx_subsystems::vm::USER_PAGE_SIZE;
 
 struct ShimsTestPmap;
+
+impl PlatformConfig for ShimsTestPmap {
+    const ARCH: Arch = Arch::Riscv64;
+    const BOARD: &'static str = "shims-test";
+}
 
 #[derive(Default)]
 struct ShimsTestPmapState {
@@ -143,6 +148,8 @@ impl PmapIf for ShimsTestPmap {
 // xorshift, which is what test sites want — non-zero,
 // reproducible, no hardware dependency.
 impl EntropyIf for ShimsTestPmap {}
+
+impl tx_hal::AuxvIf for ShimsTestPmap {}
 
 // Slice 4 of the shell-prompt roadmap (2026-05-07) added a `TimeIf`
 // bound to `dispatch::<P>` so the time-syscall arms can read the

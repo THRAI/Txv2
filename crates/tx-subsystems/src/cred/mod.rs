@@ -34,8 +34,8 @@ use core::marker::PhantomData;
 pub mod adapter;
 
 use adapter::step_engine::{
-    self, Cap, CredentialView, Guard, NoProgress, RestrictionStackHandle, ScriptCtx, StepOp,
-    StepOutcome, SubjectIdentity, Zone, ZoneAllocated, ZoneError,
+    self, Cap, CredentialView, Guard, NoProgress, OneShotStepOp, RestrictionStackHandle, ScriptCtx,
+    StepOp, StepOutcome, SubjectIdentity, Zone, ZoneAllocated, ZoneError,
 };
 
 use crate::execution::Errno;
@@ -276,6 +276,11 @@ pub enum CredChange {
 /// `PermissionDenied`. Non-privileged calls preserve `suid` (Linux
 /// semantics: only privileged callers update the saved-set).
 pub fn step_setuid(target: &Cap<ProcessIdentity>, new_uid: Uid) -> CredChange {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let payload_guard = target.payload.lock();
     let Some(payload) = payload_guard.as_ref() else {
         return CredChange::Zombie;
@@ -323,6 +328,11 @@ pub fn step_setuid(target: &Cap<ProcessIdentity>, new_uid: Uid) -> CredChange {
 /// `sgid` to `new_gid`. Non-privileged callers may swap `egid`
 /// among `(gid, egid, sgid)`; `sgid` is preserved.
 pub fn step_setgid(target: &Cap<ProcessIdentity>, new_gid: Gid) -> CredChange {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let payload_guard = target.payload.lock();
     let Some(payload) = payload_guard.as_ref() else {
         return CredChange::Zombie;
@@ -364,6 +374,11 @@ pub fn step_setresuid(
     euid: Option<Uid>,
     suid: Option<Uid>,
 ) -> CredChange {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let payload_guard = target.payload.lock();
     let Some(payload) = payload_guard.as_ref() else {
         return CredChange::Zombie;
@@ -421,6 +436,11 @@ pub fn step_setresgid(
     egid: Option<Gid>,
     sgid: Option<Gid>,
 ) -> CredChange {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let payload_guard = target.payload.lock();
     let Some(payload) = payload_guard.as_ref() else {
         return CredChange::Zombie;
@@ -483,6 +503,11 @@ pub fn step_setreuid(
     ruid: Option<Uid>,
     euid: Option<Uid>,
 ) -> CredChange {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let payload_guard = target.payload.lock();
     let Some(payload) = payload_guard.as_ref() else {
         return CredChange::Zombie;
@@ -537,6 +562,11 @@ pub fn step_setregid(
     rgid: Option<Gid>,
     egid: Option<Gid>,
 ) -> CredChange {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let payload_guard = target.payload.lock();
     let Some(payload) = payload_guard.as_ref() else {
         return CredChange::Zombie;
@@ -652,6 +682,11 @@ pub fn step_apply_suid_for_exec(
     file_gid: Gid,
     file_mode: u16,
 ) -> Option<ExecCredOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let payload_guard = target.payload.lock();
     let payload = payload_guard.as_ref()?;
     let prev_cap = payload.cred_cap();
@@ -875,13 +910,17 @@ pub struct SetuidOp {
 impl<I: SubjectIdentity> StepOp<I> for SetuidOp {
     type Output = CredChange;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_setuid(&self.target, self.new_uid))
     }
 }
+
+// PR-3: OneShotStepOp marker — setuid is a one-shot transition
+// (observe → commit → publish, never yields).
+// Use the concrete ProcessIdentity type matching KernelScriptCtx
+// (tx_subsystems::process::ProcessIdentity).
+impl OneShotStepOp<crate::process::ProcessIdentity> for SetuidOp {}
 
 /// StepOp wrap for [`step_setgid`]. PR-2 pilot.
 pub struct SetgidOp {
@@ -892,13 +931,12 @@ pub struct SetgidOp {
 impl<I: SubjectIdentity> StepOp<I> for SetgidOp {
     type Output = CredChange;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_setgid(&self.target, self.new_gid))
     }
 }
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for SetgidOp {}
 
 /// StepOp wrap for [`step_setreuid`]. PR-2 pilot. Demonstrates the
 /// `Option<_>`-pair arg shape; the wrap stores each option by value
@@ -912,13 +950,12 @@ pub struct SetreuidOp {
 impl<I: SubjectIdentity> StepOp<I> for SetreuidOp {
     type Output = CredChange;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_setreuid(&self.target, self.ruid, self.euid))
     }
 }
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for SetreuidOp {}
 
 /// StepOp wrap for [`step_setresuid`].
 pub struct SetresuidOp {
@@ -931,10 +968,7 @@ pub struct SetresuidOp {
 impl<I: SubjectIdentity> StepOp<I> for SetresuidOp {
     type Output = CredChange;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_setresuid(
             &self.target,
             self.ruid,
@@ -943,6 +977,8 @@ impl<I: SubjectIdentity> StepOp<I> for SetresuidOp {
         ))
     }
 }
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for SetresuidOp {}
 
 /// StepOp wrap for [`step_setresgid`].
 pub struct SetresgidOp {
@@ -955,10 +991,7 @@ pub struct SetresgidOp {
 impl<I: SubjectIdentity> StepOp<I> for SetresgidOp {
     type Output = CredChange;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_setresgid(
             &self.target,
             self.rgid,
@@ -967,6 +1000,8 @@ impl<I: SubjectIdentity> StepOp<I> for SetresgidOp {
         ))
     }
 }
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for SetresgidOp {}
 
 /// StepOp wrap for [`step_setregid`].
 pub struct SetregidOp {
@@ -978,13 +1013,12 @@ pub struct SetregidOp {
 impl<I: SubjectIdentity> StepOp<I> for SetregidOp {
     type Output = CredChange;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_setregid(&self.target, self.rgid, self.egid))
     }
 }
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for SetregidOp {}
 
 /// StepOp wrap for [`step_apply_suid_for_exec`]. The free fn returns
 /// `Option<ExecCredOutcome>` (no `Result`, no `StepOutcome`), so the
@@ -996,15 +1030,10 @@ pub struct ApplySuidForExecOp {
     pub file_mode: u16,
 }
 
-impl<I: SubjectIdentity> StepOp<I>
-    for ApplySuidForExecOp
-{
+impl<I: SubjectIdentity> StepOp<I> for ApplySuidForExecOp {
     type Output = Option<ExecCredOutcome>;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_apply_suid_for_exec(
             &self.target,
             self.file_uid,
@@ -1023,13 +1052,13 @@ mod step_op_wraps {
     //! the privilege/permission rules themselves lives in the
     //! existing `cred::tests` module against the free fns.
     use super::*;
+    use crate::cred::adapter::step_engine::{
+        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
+    };
     use crate::process::bootstrap_init_process;
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vm::{AddressSpace, TestPmap};
     use crate::zones;
-    use crate::cred::adapter::step_engine::{
-        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
-    };
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         tx_test_support::init_host();

@@ -1,6 +1,6 @@
 //! Tests for the ELF parser binding (Phase 4).
 //!
-//! Fixtures are hand-crafted byte-by-byte minimal RV64 ET_EXEC ELF
+//! Fixtures are hand-crafted byte-by-byte minimal ELF64 ET_EXEC
 //! images (we don't ship a checked-in binary; goblin doesn't bundle
 //! one either). Each test mutates the base image to produce the
 //! desired rejection. Layout reference: `Elf64_Ehdr` (64 bytes) +
@@ -29,6 +29,7 @@ const EV_CURRENT_BYTE: u8 = 1;
 const ET_EXEC_U16: u16 = 2;
 const ET_DYN_U16: u16 = 3;
 const EM_RISCV_U16: u16 = 243;
+const EM_LOONGARCH_U16: u16 = 258;
 const EM_X86_64_U16: u16 = 62;
 
 const PT_LOAD_U32: u32 = 1;
@@ -257,7 +258,7 @@ fn parse_image_plan_et_dyn_static_pie() {
     let mut cfg = FixtureCfg::minimal();
     cfg.e_type = ET_DYN_U16;
     cfg.e_entry = 0x80; // relative entry (offset from load base)
-    // PT_LOAD with relative vaddr 0x0 (covers file bytes 0..176).
+                        // PT_LOAD with relative vaddr 0x0 (covers file bytes 0..176).
     cfg.phdrs[0].p_vaddr = 0x0;
     cfg.phdrs[0].p_paddr = 0x0;
     // PT_PHDR vaddr is set by the fixture builder to
@@ -311,7 +312,11 @@ fn parse_image_plan_rejects_pt_interp() {
         p_align: 1,
     });
     let bytes = cfg.build();
-    assert_eq!(parse_image_plan(&bytes).unwrap_err(), ParseError::HasInterp);
+    let plan = parse_image_plan(&bytes).expect("PT_INTERP should be accepted");
+    assert!(
+        plan.interpreter_path.is_some(),
+        "interpreter path should be extracted"
+    );
 }
 
 #[test]
@@ -337,6 +342,15 @@ fn parse_image_plan_rejects_non_riscv_arch() {
     cfg.e_machine = EM_X86_64_U16;
     let bytes = cfg.build();
     assert_eq!(parse_image_plan(&bytes).unwrap_err(), ParseError::Arch);
+}
+
+#[test]
+fn parse_image_plan_accepts_loongarch64_arch() {
+    let mut cfg = FixtureCfg::minimal();
+    cfg.e_machine = EM_LOONGARCH_U16;
+    let bytes = cfg.build();
+    let plan = parse_image_plan(&bytes).expect("loongarch64 ELF should parse");
+    assert_eq!(plan.entry, 0x10080);
 }
 
 #[test]
@@ -522,9 +536,11 @@ fn parse_image_plan_rejects_filesz_gt_memsz() {
 }
 
 #[test]
-fn parse_image_plan_rejects_multi_bss() {
-    // Two writable LOADs each with `memsz > filesz` → unsupported
-    // for the slice (TODO: handle multi-BSS later).
+fn parse_image_plan_accepts_multi_bss_and_records_last_tail() {
+    // Two writable LOADs each with `memsz > filesz` is legal ELF:
+    // LA64 busybox uses this shape for .relro padding plus .data/.bss.
+    // The VM mapping path handles BSS per LOAD segment; the summary
+    // bss_extension keeps the last tail for auxv/debug consumers.
     let mut cfg = FixtureCfg::minimal();
     // Make the existing LOAD writable with a BSS tail.
     cfg.phdrs[0] = PhdrSpec::load(
@@ -542,8 +558,11 @@ fn parse_image_plan_rejects_multi_bss() {
         PF_R_BIT | PF_W_BIT,
     ));
     let bytes = cfg.build();
-    assert_eq!(
-        parse_image_plan(&bytes).unwrap_err(),
-        ParseError::LoadSegment
-    );
+    let plan = parse_image_plan(&bytes).expect("multi-BSS LOADs should parse");
+    assert_eq!(plan.load_segments.len(), 2);
+    let bss = plan
+        .bss_extension
+        .expect("last BSS-extending LOAD should be recorded");
+    assert_eq!(bss.vaddr, 0x20000 + 0x100);
+    assert_eq!(bss.size, 0x800 - 0x100);
 }
