@@ -305,6 +305,14 @@ impl ThreadPayload {
         *self.saved_signal_context.lock() = ctx;
     }
 
+    /// Take (consume) the saved signal context. Called by
+    /// `rt_sigreturn` to retrieve the pre-handler context for
+    /// restoration into `saved_user_context`. Returns `None` if no
+    /// signal frame is in flight (stray `rt_sigreturn` call).
+    pub fn take_saved_signal_context(&self) -> Option<UserTrapContext> {
+        self.saved_signal_context.lock().take()
+    }
+
     /// Push a pending syscall return into the per-thread slot. The
     /// userspace-entry shim drains this and writes it into the fresh
     /// trap frame via `set_syscall_return`/`set_syscall_error` before
