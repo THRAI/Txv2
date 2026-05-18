@@ -1,3 +1,47 @@
+- 2026-05-18 **`cargo xtask syscall` introduced; dispatch table is now
+  the SSoT for syscall progress.** New xtask module
+  ([`xtask/src/syscall.rs`](../../xtask/src/syscall.rs)) parses
+  `crates/tx-shims/src/linux_syscall/{numbers,mod}.rs` and exposes five
+  subcommands:
+  - `status` — counts (NR_* defined, dispatched, async, likely stubs,
+    defined-no-arm).
+  - `list [--filter wired|stub|defined|async|all] [--json]` — per-syscall
+    rows (NR, name, status, handler).
+  - `info <name>` — single-syscall details (e.g. `cargo xtask syscall
+    info openat`).
+  - `sync` — regenerates the `<!-- BEGIN syscall-auto-table -->` block
+    in [`SYSCALL_STATUS.md`](SYSCALL_STATUS.md), including a
+    machine-built counts summary, the likely-stub heuristic catalog,
+    the defined-but-no-arm list, and a per-syscall dispatched table.
+  - `pick` — prints the high-stakes table from `SYSCALL_STATUS.md` so a
+    new task can be scoped without re-reading the doc.
+
+  **CI gate added:** `cargo xtask lint syscall-status` (alias for
+  `syscall sync --check`) wired into `cargo xtask ci` as
+  `txdoc:CI-GATE-SYSCALL-STATUS`. Fails if the auto section drifts from
+  the dispatch table; fix with `cargo xtask syscall sync`.
+
+  **Pre-existing drift caught on first run:** 13 `NR_*` constants exist
+  in `numbers.rs` but have no dispatch arm in `mod.rs`:
+  - `NR_EPOLL_CREATE1` / `NR_EPOLL_CTL` / `NR_EPOLL_WAIT` /
+    `NR_EPOLL_PWAIT` (handler `sys_epoll_ctl` is even defined in
+    `epoll.rs` but never wired)
+  - `NR_IO_URING_ENTER`
+  - `NR_PIDFD_OPEN` / `NR_PIDFD_SEND_SIGNAL`
+  - `NR_RT_SIGPENDING` / `NR_RT_SIGQUEUEINFO` / `NR_RT_SIGSUSPEND` /
+    `NR_RT_SIGTIMEDWAIT` (all have handler functions defined in
+    `signal.rs` but no match arm)
+  - `NR_SIGALTSTACK` (`sys_sigaltstack` defined but not wired)
+  - `NR_SIGNALFD` (the older signum-no-flags variant; `NR_SIGNALFD4` is
+    wired)
+
+  These are now visible as a TODO list in the auto-table — they're
+  candidates for cleanup or wiring without any new subsystem work.
+
+  **Verified:** `cargo xtask ci` — 17/17 gates pass (added gate
+  recorded as `syscall-status doc sync`); `cargo xtask ci-slow` — 2/2
+  pass. Reference: [`docs/progress/SYSCALL_STATUS.md`](SYSCALL_STATUS.md).
+
 - 2026-05-18 **`SYSCALL_STATUS.md` + `tx-ltp-syscall` skill brought into
   this worktree and refreshed.** Copied from `cc/brave-brown-d46827`
   (where they were originally drafted), then updated to today's state:

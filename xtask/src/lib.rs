@@ -29,6 +29,7 @@ mod progress;
 mod qemu;
 mod shell_test;
 mod submit;
+mod syscall;
 mod target;
 mod test;
 mod trap_trace;
@@ -62,6 +63,7 @@ pub fn run() -> Result<()> {
         "image" => image::image(&root, args.collect()),
         "oscomp" => oscomp::oscomp(&root, args.collect()),
         "submit" => submit::submit(&root, args.collect()),
+        "syscall" => syscall::syscall(&root, args.collect()),
         "progress" => progress::progress(&root, args.collect()),
         "lint" => lint::lint(&root, args.collect()),
         "boundary-report" => boundary_report::boundary_report(&root, args.collect()),
@@ -96,12 +98,13 @@ fn print_usage() {
            cargo xtask image m1dock-sd --profile busybox [--target rv64-m1dock-mock] [--size 64M]\n\
            cargo xtask oscomp doctor|prepare|submit|run|qemu\n\
            cargo xtask submit k210 [--out target/submit/k210]\n\
+           cargo xtask syscall status|list|info|sync|pick — query/maintain the syscall map (SSoT: numbers.rs + mod.rs)\n\
            cargo xtask progress validate\n\
            cargo xtask progress list plans|handoffs|worktrees|all [--json]\n\
            cargo xtask progress new plan|handoff|worktree --id ID --title TITLE [...]\n\
            cargo xtask progress claim plan|worktree --id ID --owner NAME --scope PATH [--scope PATH]\n\
            cargo xtask progress close plan|handoff|worktree --id ID --status STATUS\n\
-           cargo xtask lint arch|docs|unused|boundary|invariants [rule|all]\n\
+           cargo xtask lint arch|docs|unused|boundary|invariants [rule|all]|syscall-status\n\
            cargo xtask boundary-report [--top N] [--json]\n\
            cargo xtask unit\n"
     );
