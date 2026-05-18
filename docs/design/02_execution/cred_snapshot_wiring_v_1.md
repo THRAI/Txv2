@@ -376,8 +376,10 @@ take + drop their own auth guard internally.
 | `sys_mkdirat` | `cred::checks::require_link(...)` (W+X on parent, same rule as link/symlink) | `LinkAuthorized<'g>` | ✅ wired |
 | `sys_symlinkat` | `cred::checks::require_link(...)` | `LinkAuthorized<'g>` | ✅ wired |
 | `sys_renameat2` | `cred::checks::require_rename(snapshot, old_parent, old_child, new_parent, displaced, &guard)` | `RenameAuthorized<'g>` | ✅ wired |
-| `sys_fchmodat` | `cred::checks::require_chmod(snapshot, target_meta, mode, &guard)` at arm + per-FS `step_chmod` (defense-in-depth) | `ChmodAuthorized<'g>` | ✅ wired at cred seam; per-FS rule retained as belt-and-braces (consolidation deferred) |
-| `sys_fchownat` | `cred::checks::require_chown(snapshot, target_meta, new_uid, new_gid, &guard)` at arm + per-FS `step_chown` | `ChownAuthorized<'g>` | ✅ wired at cred seam; per-FS rule retained |
+| `sys_fchmodat` | `cred_checks::authorize_chmod(snapshot, target_meta, mode)` at arm; `tmpfs::step_chmod` delegates to `vfs::predicates::check_chmod_perm` as defense-in-depth | `ChmodAuthorized<'g>` | ✅ wired at cred seam; per-FS layer consolidated to single source of truth |
+| `sys_fchownat` | `cred_checks::authorize_chown(snapshot, target_meta, new_uid, new_gid)` at arm; `tmpfs::step_chown` delegates similarly | `ChownAuthorized<'g>` | ✅ wired at cred seam; per-FS layer consolidated |
+| VFS walker (search) | `cred::checks::require_path_search_with_walker_cred(walker_cred, parent_meta, &guard)` at every component descend | `SearchAuthorized<'g>` (currently discarded) | ✅ wired; witness chain reaches the walker mint site |
+| VFS walker (`step_open`) | `cred::checks::require_open_with_walker_cred(walker_cred, terminal_meta, flags, &guard)` at terminal open | `OpenAuthorized<'g>` (currently discarded) | ✅ wired; the publication site (`OpenFile::new_cap_with_dentry`) doesn't yet consume the witness as a type token — follow-up |
 | `sys_openat` | Walker `check_open_perm` via VFS predicates | inline in walker | ⚠️ uses walker projection directly; could consume `OpenAuthorized` for witness chain |
 | Path-walk syscalls (stat, chdir, access, …) | Walker `check_descend_perm` via VFS predicates | inline in walker | ⚠️ uses walker projection directly; could consume `SearchAuthorized` for witness chain |
 
@@ -494,38 +496,28 @@ signal entry, every authorisation seam earns a check entry.
 ## Open follow-ups (not security gaps)
 <!-- txdoc:CSW-OPEN-FOLLOW-UPS -->
 
-### Per-FS chmod / chown rule consolidation
-<!-- txdoc:CSW-OPEN-PER-FS-CHMOD-CHOWN-CONSOLIDATION -->
+### Witness consumption at publication sites
+<!-- txdoc:CSW-OPEN-WITNESS-CONSUMPTION -->
 
-`sys_fchmodat` and `sys_fchownat` run the rule at the cred seam
-(`require_chmod` / `require_chown`). The per-FS `step_chmod` / `step_chown`
-in `tmpfs`, `devfs`, `bdevfs`, `procfs`, and (where applicable) `ext4`
-still enforce the rule internally as defense-in-depth.
+The walker now mints `SearchAuthorized<'g>` / `OpenAuthorized<'g>`
+via `cred::checks::require_*_with_walker_cred` (pass 2 of the hygiene
+batch), but the publication sites (`OpenFile::new_cap_with_dentry`,
+the per-component lookup result, etc.) don't yet *consume* the
+witness as a type-level token. Today the witness is dropped at the
+walker — same behaviour as before, but the witness chain isn't
+load-bearing.
 
-Consolidation step: thread a `&CredSnapshot` (or equivalent) through
-`FsOps::step_chmod` / `step_chown` and let those bodies *consume* the
-witness rather than re-deriving the rule. Then delete the per-FS check.
-Touches every FS implementation; deferred.
+Migration: thread `OpenAuthorized<'g>` into
+`OpenFile::new_cap_with_dentry`'s signature so the type system
+demands the cred check ran before publication. Same for the per-
+component `SearchAuthorized<'g>` (would need to land on the resolved
+DEntry's construction site). Adds a small amount of API verbosity
+in exchange for a compile-time anchor of the
+`cred_service_v_1` §"Minting rule" invariant (cred authorises;
+subsystems publish only when the auth witness is in scope).
 
-### Walker-side `require_path_search` / `require_open` adoption
-<!-- txdoc:CSW-OPEN-WALKER-ADOPTION -->
-
-`require_path_search` and `require_open` are landed and tested, but the
-VFS walker (`vfs::walker::step_walk`) and `step_open` still call the
-inline `vfs::predicates::check_descend_perm` / `check_open_perm` directly
-rather than going through the cred witness. The bit math is shared, so
-behaviour is identical; the difference is that the witness chain is not
-intact at the walker mint sites.
-
-Migration: the walker takes `&Credential` (walker projection) today and
-would need either:
-- the same projection-shaped overload of `require_*` (lossy — loses the
-  full `Cred` info that some future predicate might need), or
-- the syscall arm to pre-walk + check + thread the witness into the
-  composite op (the pattern this batch used for unlink / link /
-  rename / chmod / chown / mkdir / symlink).
-
-Deferred. Not a security gap; an architectural alignment item.
+Defer until a feature naturally lifts it. Not security-relevant;
+the runtime check still fires.
 
 ### `sys_tgkill` (vacuous today, future site)
 <!-- txdoc:CSW-OPEN-TGKILL -->
@@ -608,12 +600,19 @@ Verification after the full batch:
 <!-- txdoc:CSW-SHORT-VERSION -->
 
 > Snapshot captured once at `SyscallCtx::new`; cred consumed via
-> `cred::checks::require_*` witnesses + `authorize_*` combinators;
+> `cred::checks::require_*` witnesses + `authorize_*` combinators
+> (snapshot-shaped) or `require_*_with_walker_cred` (walker-shaped);
 > auth-phase guard scoped to drop before commit; eight real
 > permission bypasses closed (`sys_kill` pid>0 / pgrp, `sys_tkill`,
 > `sys_unlinkat`, `sys_linkat`, `sys_renameat2`, `sys_mkdirat`,
-> `sys_symlinkat`); `sys_fchmodat` / `sys_fchownat` route through the
-> cred seam at the syscall arm with the per-FS rule remaining as
-> defense-in-depth; `cargo xtask lint invariants cred-check` is the
-> static CI gate that fails on any new mutator syscall arm without an
+> `sys_symlinkat`); `sys_fchmodat` / `sys_fchownat` route through
+> the cred seam at the syscall arm with `tmpfs::step_chmod` /
+> `step_chown` delegating to `vfs::predicates` for the
+> defense-in-depth layer; VFS walker mints `SearchAuthorized` /
+> `OpenAuthorized` via the walker-cred variants at every component
+> descend and at terminal open. **Every DAC check site in the
+> kernel flows through `cred::checks::*` — the cred subsystem is
+> the single canonical authorisation seam.**
+> `cargo xtask lint invariants cred-check` is the static CI gate
+> that fails on any new mutator syscall arm without an
 > authorisation gate.
