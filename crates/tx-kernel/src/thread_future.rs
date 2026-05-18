@@ -272,7 +272,7 @@ pub async fn run_thread<P: TxPlatform>(
                 // the modified context for the next userspace entry.
                 //
                 // See: `txdoc:SIGNAL-V1-S15-HANDLER-DELIVERY`.
-                if let Some(orig_ctx) = payload.saved_user_context() {
+                if let Some(mut orig_ctx) = payload.saved_user_context() {
                     // Resolve owning process for aspace + fallback exit.
                     let Some(process) = thread.upgrade_owner_proc() else {
                         return;
@@ -281,7 +281,39 @@ pub async fn run_thread<P: TxPlatform>(
                         return;
                     };
 
-                    // Save pre-handler context for sigreturn.
+                    // If a syscall return is pending (e.g. wait4 just
+                    // resolved, child exit raised SIGCHLD, and the AST
+                    // is now delivering the handler), apply that return
+                    // value to the parked pre-signal context's `a0` and
+                    // clear the pending slot.
+                    //
+                    // Without this, `prepare_userspace_entry_payload`
+                    // below would overlay `pending_syscall_return` onto
+                    // the freshly-built `handler_ctx.a0`, clobbering the
+                    // POSIX-required `sig_no` argument. Apply-and-clear
+                    // moves the syscall return into the place it should
+                    // surface — the post-`rt_sigreturn` userspace context
+                    // — while keeping the handler's `a0` equal to `sig_no`.
+                    //
+                    // RV64 a0 = regs[10]; LA64 a0 = regs[4]; see
+                    // `crate::adapter::step_engine::execution::USER_CONTEXT_A0_INDEX`
+                    // for the canonical constant, but `prepare_*` accesses
+                    // it through this same index so the values are pinned
+                    // here for the apply path.
+                    #[cfg(target_arch = "loongarch64")]
+                    const A0_INDEX: usize = 4;
+                    #[cfg(not(target_arch = "loongarch64"))]
+                    const A0_INDEX: usize = 10;
+                    if let Some(result) = tx_subsystems::thread_runtime::structure::drain_pending_syscall_return(&payload) {
+                        let encoded = match result {
+                            Ok(v) => v as u64,
+                            Err(errno) => (-i64::from(errno)) as u64,
+                        };
+                        orig_ctx.regs[A0_INDEX] = encoded as usize;
+                    }
+
+                    // Save pre-handler context for sigreturn (now
+                    // carrying the applied syscall return in a0).
                     payload.store_saved_signal_context(Some(orig_ctx));
 
                     // Read current mask to pass to the handler.
