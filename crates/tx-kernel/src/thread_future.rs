@@ -540,23 +540,12 @@ pub async fn run_thread<P: TxPlatform>(
                         // `make_initial_user_trap_context`).
                     }
                     tx_shims::linux_syscall::SyscallResult::SigreturnRestored => {
-                        // Restore the pre-handler context captured
-                        // when AST delivered the signal. The live
-                        // trap shell has already saved the trampoline
-                        // syscall context; replace it with the
-                        // interrupted context and re-enter userspace
-                        // without writing a syscall return value.
-                        if let Some(restored_ctx) = payload.take_saved_signal_context() {
-                            payload.store_saved_user_context(Some(restored_ctx));
-                        } else if let Some(process) = thread.upgrade_owner_proc() {
-                            tx_subsystems::process::execution::step_exit_group_with_signal(
-                                &process,
-                                Signum::SIGSEGV,
-                            );
-                            return;
-                        } else {
-                            return;
-                        }
+                        // `sys_rt_sigreturn` already consumed the parked
+                        // pre-handler context and restored it into
+                        // `saved_user_context`.  Do not take it again here:
+                        // this branch only preserves the ExecCommitted shape
+                        // of skipping normal pending-syscall-return writeback
+                        // and re-entering with the restored context.
                     }
                 }
             }
