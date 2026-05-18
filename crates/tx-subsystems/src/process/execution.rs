@@ -471,7 +471,8 @@ pub fn step_fork<P: PmapIf>(
 ///
 /// 1. Clone `parent_user_ctx` into a fresh `UserTrapContext`.
 /// 2. Overwrite the child-return register (`a0`) with 0.
-/// 3. Overwrite `pc = parent_user_ctx.pc + 4` (skip past `ecall`).
+/// 3. If the clone syscall supplied a non-zero child stack, overwrite
+///    the architecture-specific stack-pointer register with it.
 /// 4. `store_saved_user_context(Some(child_ctx))` on the child
 ///    thread's payload.
 ///
@@ -508,22 +509,36 @@ const TLS_REG_INDEX: usize = 2;
 #[cfg(not(target_arch = "loongarch64"))]
 const TLS_REG_INDEX: usize = 4;
 
+/// Stack pointer register index (`sp` on both supported ports, but
+/// the GPR slot differs).
+#[cfg(target_arch = "loongarch64")]
+const CLONE_STACK_POINTER_REG_INDEX: usize = 3;
+#[cfg(not(target_arch = "loongarch64"))]
+const CLONE_STACK_POINTER_REG_INDEX: usize = 2;
+
 pub fn seed_child_leader_context(
     child_thread: &Cap<ThreadIdentity>,
     parent_user_ctx: &UserTrapContext,
+    stack: usize,
     tls: usize,
 ) {
     // (1) Clone the parent context.
     let mut child_ctx = *parent_user_ctx;
     // (2) a0 = 0: child's clone-syscall return value.
     child_ctx.regs[CLONE_CHILD_RETURN_REG_INDEX] = 0;
-    // (3) tp = tls: seed the thread pointer for TLS access.
+    // (3) sp = stack: libc's clone wrapper uses a user-provided
+    // stack to hand off fn/arg to the child. A zero stack means fork-
+    // shaped clone and inherits the parent's stack pointer.
+    if stack != 0 {
+        child_ctx.regs[CLONE_STACK_POINTER_REG_INDEX] = stack;
+    }
+    // (4) tp = tls: seed the thread pointer for TLS access.
     //     When CLONE_SETTLS is not set, the caller passes 0 and tp
     //     inherits the parent's value (preserved from the clone).
     if tls != 0 {
         child_ctx.regs[TLS_REG_INDEX] = tls;
     }
-    // (4) PC already points past `ecall`: the trap shell
+    // (5) PC already points past `ecall`: the trap shell
     // (`tx-kernel::trap_handoff::hand_off_syscall`) added the 4-byte
     // RV64 `ecall` insn width to `pc` at trap-capture time before
     // storing into `saved_user_context`. Adding another 4 here would
@@ -538,7 +553,7 @@ pub fn seed_child_leader_context(
     // for an applet) place a `mv` or load between the ecall and the
     // branch, and the +4 turns into a wild PC.
 
-    // (5) Store on the leader thread's payload. payload_cap == None
+    // (6) Store on the leader thread's payload. payload_cap == None
     // here means a freshly forked thread already lost its payload,
     // which is a kernel-invariant violation: step_fork's post-condition
     // is exactly that the child leader is live-with-payload.
@@ -570,11 +585,13 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
 
     let mut payload_guard = process.payload.lock();
     if let Some(payload) = payload_guard.as_ref() {
+        let _closed_fds = payload.drain_fds();
         let drained: Vec<Cap<ThreadIdentity>> = payload.threads.drain();
         for thread in &drained {
             set_thread_zombie(thread, status.wait_status_word());
         }
-        // `drained` drops here, releasing the strong refs on each thread.
+        // `_closed_fds` and `drained` drop here, releasing open-file and
+        // thread refs before the payload is detached below.
     }
     *payload_guard = None;
     drop(payload_guard);
@@ -610,7 +627,11 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
     session_leader_hangup_cascade(process);
     sever_children(process);
     *process.exit_status.lock() = Some(status);
-    *process.payload.lock() = None;
+    let mut payload_guard = process.payload.lock();
+    if let Some(payload) = payload_guard.as_ref() {
+        let _closed_fds = payload.drain_fds();
+    }
+    *payload_guard = None;
     post_sigchld_to_parent(process);
 }
 

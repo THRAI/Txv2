@@ -80,11 +80,11 @@ const QEMU_LA64_KERNEL_LOAD_BASE: usize = 0x0020_0000;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 const QEMU_LA64_PCH_PIC_BASE: usize = 0x1000_0000;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
-const QEMU_LA64_ACPI_BASE: usize = 0x100d_0000;
+const QEMU_LA64_GED_REG_BASE: usize = 0x100e_001c;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
-const QEMU_LA64_PM1_CNT: usize = QEMU_LA64_ACPI_BASE + 0x14;
+const QEMU_LA64_GED_SLEEP_CTL: usize = QEMU_LA64_GED_REG_BASE;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
-const QEMU_LA64_PM1_CNT_S5: u16 = (7 << 10) | (1 << 13);
+const QEMU_LA64_GED_SLEEP_VALUE_S5: u8 = (5 << 2) | (1 << 5);
 const QEMU_LA64_GSI_BASE: u32 = 64;
 const QEMU_LA64_PCH_PIC_IRQS: u32 = 64;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -798,6 +798,10 @@ unsafe impl Pod for La64SignalFrame {}
 
 impl La64SignalFrame {
     fn new(tf: &TrapFrameMut<'_>, setup: &SignalFrameWrite) -> Self {
+        Self::new_from_context(&tf.capture_user_context(), setup)
+    }
+
+    fn new_from_context(context: &UserTrapContext, setup: &SignalFrameWrite) -> Self {
         Self {
             magic: LA64_SIGFRAME_MAGIC,
             version: LA64_SIGFRAME_VERSION,
@@ -807,7 +811,7 @@ impl La64SignalFrame {
             flags: setup.flags.bits,
             siginfo: setup.siginfo,
             saved_mask: setup.old_mask,
-            user_context: tf.capture_user_context(),
+            user_context: *context,
             trampoline: LA64_SIGRETURN_TRAMPOLINE,
         }
     }

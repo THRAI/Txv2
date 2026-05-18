@@ -529,6 +529,37 @@ fn la64_signal_frame_layout_and_trampoline_are_stable() {
 }
 
 #[test]
+fn la64_prepare_signal_frame_keeps_complete_frame_bytes() {
+    let mut context = UserTrapContext::empty();
+    context.pc = 0x4000;
+    context.regs[LA64_R_SP] = 0x8000;
+
+    let setup = SignalFrameWrite {
+        stack_top: UserPtr::new(context.regs[LA64_R_SP]),
+        sig_no: 17,
+        siginfo: tx_hal::UserSigInfoAbi::ZERO,
+        old_mask: UserSignalMaskAbi::EMPTY,
+        flags: tx_hal::UserSaFlagsAbi::EMPTY,
+        handler_pc: UserPtr::new(0x5000),
+    };
+
+    let (handler_ctx, frame_bytes) =
+        <Platform as SignalFrameIf>::prepare_signal_frame(&context, &setup).expect("prepare");
+    let frame_size = core::mem::size_of::<La64SignalFrame>();
+    let trampoline_offset = core::mem::offset_of!(La64SignalFrame, trampoline);
+
+    assert_eq!(frame_bytes.as_slice().len(), frame_size);
+    assert!(frame_size <= tx_hal::SignalFrameBytes::CAPACITY);
+    assert!(trampoline_offset + core::mem::size_of_val(&LA64_SIGRETURN_TRAMPOLINE) <= frame_size);
+    assert_eq!(handler_ctx.pc, setup.handler_pc.addr());
+    assert_eq!(handler_ctx.regs[LA64_R_SP], 0x8000 - frame_size);
+    assert_eq!(
+        handler_ctx.regs[LA64_R_RA],
+        handler_ctx.regs[LA64_R_SP] + trampoline_offset
+    );
+}
+
+#[test]
 fn la64_signal_frame_restore_uses_saved_user_context() {
     la64_test_reset_restored_fp_context();
     let mut frame = La64TrapFrame {

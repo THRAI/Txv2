@@ -1188,6 +1188,17 @@ impl ProcessPayload {
         }
     }
 
+    /// Remove every fd from this payload and return the detached table.
+    ///
+    /// Process exit must close all open file descriptions before the
+    /// payload itself becomes unreachable. In particular, pipe EOF/EPIPE
+    /// publication is driven from `OpenFile` drop hooks, so exit paths
+    /// need a concrete fd-table drain rather than waiting for the whole
+    /// payload to disappear later through EBR.
+    pub(crate) fn drain_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
+        core::mem::take(&mut *self.fds.lock())
+    }
+
     /// Snapshot the entire fd table as a fresh `BTreeMap`. Each
     /// populated entry's `Cap<OpenFile>` is `.clone()`'d so the
     /// snapshot does not borrow the lock; callers can drop the result

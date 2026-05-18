@@ -39,7 +39,7 @@ fn seed_child_leader_context_zeroes_a0() {
     let leader = child_leader(&child);
 
     let parent_ctx = synthetic_parent_ctx();
-    seed_child_leader_context(&leader, &parent_ctx, 0);
+    seed_child_leader_context(&leader, &parent_ctx, 0, 0);
 
     let saved = leader
         .payload_cap()
@@ -66,7 +66,7 @@ fn seed_child_leader_context_inherits_pc() {
     let leader = child_leader(&child);
 
     let parent_ctx = synthetic_parent_ctx();
-    seed_child_leader_context(&leader, &parent_ctx, 0);
+    seed_child_leader_context(&leader, &parent_ctx, 0, 0);
 
     let saved = leader
         .payload_cap()
@@ -90,7 +90,7 @@ fn seed_child_leader_context_preserves_other_gprs_and_sp() {
     let leader = child_leader(&child);
 
     let parent_ctx = synthetic_parent_ctx();
-    seed_child_leader_context(&leader, &parent_ctx, 0);
+    seed_child_leader_context(&leader, &parent_ctx, 0, 0);
 
     let saved = leader
         .payload_cap()
@@ -118,4 +118,23 @@ fn seed_child_leader_context_preserves_other_gprs_and_sp() {
     // status word is also preserved verbatim — the child re-enters
     // userspace under the same supervisor-status snapshot.
     assert_eq!(saved.status, parent_ctx.status);
+}
+
+#[test]
+fn seed_child_leader_context_uses_nonzero_child_stack() {
+    let _g = setup();
+    let parent = bootstrap();
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+    let leader = child_leader(&child);
+
+    let parent_ctx = synthetic_parent_ctx();
+    let child_stack = 0x7000_1230;
+    seed_child_leader_context(&leader, &parent_ctx, child_stack, 0);
+
+    let saved = leader
+        .payload_cap()
+        .expect("fresh child leader has payload")
+        .saved_user_context()
+        .expect("seed installs Some");
+    assert_eq!(saved.regs[2], child_stack);
 }

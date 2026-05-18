@@ -391,6 +391,43 @@ impl SignalFrameIf for Platform {
         tf.restore_user_context(&frame.user_context);
     }
 
+    fn prepare_signal_frame(
+        ctx: &UserTrapContext,
+        setup: &SignalFrameWrite,
+    ) -> Result<(UserTrapContext, tx_hal::SignalFrameBytes), FaultInfo> {
+        let frame_size = core::mem::size_of::<La64SignalFrame>();
+        let Some(unrounded_frame_addr) = setup.stack_top.addr().checked_sub(frame_size) else {
+            return Err(FaultInfo {
+                address: VirtAddr(setup.stack_top.addr()),
+                write: true,
+                instruction: false,
+                from_user: false,
+            });
+        };
+        let frame_addr = align_down(unrounded_frame_addr, LA64_SIGFRAME_ALIGN);
+        let frame = La64SignalFrame::new_from_context(ctx, setup);
+        let frame_bytes = unsafe {
+            core::slice::from_raw_parts(&frame as *const La64SignalFrame as *const u8, frame_size)
+        };
+
+        let siginfo_addr = frame_addr + core::mem::offset_of!(La64SignalFrame, siginfo);
+        let ucontext_addr = frame_addr + core::mem::offset_of!(La64SignalFrame, user_context);
+        let trampoline_pc = frame_addr + core::mem::offset_of!(La64SignalFrame, trampoline);
+
+        let mut handler_ctx = *ctx;
+        handler_ctx.pc = setup.handler_pc.addr();
+        handler_ctx.regs[LA64_R_SP] = frame_addr;
+        handler_ctx.regs[LA64_R_RA] = trampoline_pc;
+        handler_ctx.regs[LA64_R_A0] = setup.sig_no as usize;
+        handler_ctx.regs[LA64_R_A1] = siginfo_addr;
+        handler_ctx.regs[LA64_R_A2] = ucontext_addr;
+
+        Ok((
+            handler_ctx,
+            tx_hal::SignalFrameBytes::from_slice(frame_bytes),
+        ))
+    }
+
     fn rewind_syscall_pc(mut tf: TrapFrameMut<'_>) {
         tf.rewind_pc(4);
     }
@@ -620,10 +657,10 @@ impl PowerIf for Platform {
     fn system_off() -> ! {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
-            // QEMU loongson3-virt wires LS7A PM1_CNT. Writing S5 sleep type
-            // plus sleep-enable requests host poweroff.
-            let pm1_cnt = la64_uncached_virt(QEMU_LA64_PM1_CNT) as *mut u16;
-            core::ptr::write_volatile(pm1_cnt, QEMU_LA64_PM1_CNT_S5);
+            // QEMU loongarch virt exposes poweroff via the ACPI GED sleep
+            // control byte in direct-kernel/FDT boots.
+            let sleep_ctl = la64_uncached_virt(QEMU_LA64_GED_SLEEP_CTL) as *mut u8;
+            core::ptr::write_volatile(sleep_ctl, QEMU_LA64_GED_SLEEP_VALUE_S5);
         }
 
         loop {

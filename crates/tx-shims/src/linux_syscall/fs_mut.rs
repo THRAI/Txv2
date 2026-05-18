@@ -641,8 +641,6 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     };
     let cred = ctx.walker_cred();
 
-    let guard = step_engine::guard();
-
     let target_dentry = match walk_from(cwd.clone(), &target, &cred) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
@@ -663,6 +661,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         };
+        let guard = step_engine::guard();
         match mount::bind_mount(source_dentry, target_dentry, &parent_payload, &guard) {
             Ok(_) => return SyscallResult::Return(0),
             Err(e) => return SyscallResult::Error(errno_to_i32(e)),
@@ -867,12 +866,9 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     };
     let cred = ctx.walker_cred();
 
-    let guard = step_engine::guard();
-    use StepOutcome as V3;
-    let target_dentry = match step_walk(cwd.clone(), &target, &cred, &guard) {
-        V3::Done(d) => d,
-        V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
-        _ => return SyscallResult::Error(EIO_VALUE),
+    let target_dentry = match walk_from(cwd.clone(), &target, &cred) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
     };
     let parent_payload = match mount_payload_for_dentry(&target_dentry) {
         Some(p) => p,

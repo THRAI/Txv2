@@ -249,16 +249,17 @@ pub fn build_aspace_from_image<P: PmapIf>(
     }
 
     // Stack: anonymous private, page-aligned, anchored to `stack_top`.
+    //
+    // The current signal ABI writes the rt_sigreturn trampoline into
+    // the user signal frame, which lives on this stack. Until that
+    // trampoline moves to a vDSO/restorer mapping, signal handlers
+    // need an executable stack to return correctly.
     let stack_start = image_plan.stack_top - USER_STACK_INITIAL_RESERVATION;
     let stack_range = align_range(stack_start, USER_STACK_INITIAL_RESERVATION)
         .ok_or(ScriptError::InvalidImage)?;
     let stack_entry = VmEntry::new(
         stack_range,
-        if image_plan.executable_stack {
-            Prot::new(true, true, true)
-        } else {
-            Prot::READ_WRITE
-        },
+        Prot::new(true, true, true),
         VmEntryFlags::PRIVATE,
         VmBacking::PrivateAnon,
     );
@@ -616,7 +617,7 @@ mod tests {
         assert_eq!(recipes.len(), 1);
         let stack = &recipes[0];
         assert_eq!(stack.flags, VmEntryFlags::PRIVATE);
-        assert_eq!(stack.prot, Prot::READ_WRITE);
+        assert_eq!(stack.prot, Prot::new(true, true, true));
         assert!(matches!(stack.backing, VmBacking::PrivateAnon));
         assert_eq!(
             stack.range.start().as_usize() as u64,
