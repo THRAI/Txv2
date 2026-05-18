@@ -89,9 +89,18 @@ const MUTATOR_SIGNALS: &[&str] = &[
 /// the primitives — calling them is equivalent to running a cred
 /// check.
 const CRED_CHECK_SIGNALS: &[&str] = &[
-    // cred::checks::* witness predicates and combinators.
+    // cred::checks::* witness predicates and combinators. Matches
+    // both fully-qualified (`tx_subsystems::cred::checks::X`) and
+    // partially-qualified (`cred::checks::X` after `use
+    // tx_subsystems::cred;`) call sites.
     "cred::checks::require_",
     "cred::checks::authorize_",
+    // Aliased prefix (`use tx_subsystems::cred::checks as cred_checks;`).
+    // The alias-name MUST be `cred_checks` to remain lint-recognisable.
+    // Other aliases (e.g. `use ... as checks`) would silently bypass
+    // the gate — keep the alias canonical.
+    "cred_checks::require_",
+    "cred_checks::authorize_",
     // Direct cred-root re-exports (legacy call sites; the migration
     // pulled most through cred::checks but a few keep the old path).
     "cred::require_signal_send(",

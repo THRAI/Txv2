@@ -5,6 +5,10 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+// The alias-name `cred_checks` is required by
+// `xtask lint invariants cred-check` — see CRED_CHECK_SIGNALS in
+// xtask/src/lint_invariants_cred_check.rs.
+use tx_subsystems::cred::checks as cred_checks;
 use tx_subsystems::mount::MountPayload;
 
 // =====================================================================
@@ -225,7 +229,7 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let target_meta = target_dentry.rnode().meta();
-    if let Err(e) = tx_subsystems::cred::checks::authorize_chmod(
+    if let Err(e) = cred_checks::authorize_chmod(
         ctx.cred_snapshot(),
         &target_meta,
         new_mode,
@@ -286,7 +290,7 @@ pub(super) fn sys_fchownat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let target_meta = target_dentry.rnode().meta();
-    if let Err(e) = tx_subsystems::cred::checks::authorize_chown(
+    if let Err(e) = cred_checks::authorize_chown(
         ctx.cred_snapshot(),
         &target_meta,
         uid,

@@ -6,6 +6,11 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 use tx_fs;
+// The alias-name `cred_checks` is required by
+// `xtask lint invariants cred-check` — see CRED_CHECK_SIGNALS in
+// xtask/src/lint_invariants_cred_check.rs. Other aliases would
+// silently bypass the gate.
+use tx_subsystems::cred::checks as cred_checks;
 use tx_subsystems::mount::{self};
 
 /// Split a path into `(parent, basename)` for the `O_CREAT`-on-missing
@@ -200,7 +205,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     // search the parent could create a directory there.
     let parent_meta = parent_dentry.rnode().meta();
     if let Err(e) =
-        tx_subsystems::cred::checks::authorize_link(ctx.cred_snapshot(), &parent_meta)
+        cred_checks::authorize_link(ctx.cred_snapshot(), &parent_meta)
     {
         return SyscallResult::error_from(e);
     }
@@ -285,7 +290,7 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     // this check.
     let parent_meta = parent_dentry.rnode().meta();
     let child_meta = target_dentry.rnode().meta();
-    if let Err(e) = tx_subsystems::cred::checks::authorize_unlink(
+    if let Err(e) = cred_checks::authorize_unlink(
         ctx.cred_snapshot(),
         &parent_meta,
         &child_meta,
@@ -363,7 +368,7 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     // creates an entry).
     let parent_meta = parent_dentry.rnode().meta();
     if let Err(e) =
-        tx_subsystems::cred::checks::authorize_link(ctx.cred_snapshot(), &parent_meta)
+        cred_checks::authorize_link(ctx.cred_snapshot(), &parent_meta)
     {
         return SyscallResult::error_from(e);
     }
@@ -453,7 +458,7 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     // witness chain is intact at the FsOps mint site.
     let new_parent_meta = new_parent_dentry.rnode().meta();
     if let Err(e) =
-        tx_subsystems::cred::checks::authorize_link(ctx.cred_snapshot(), &new_parent_meta)
+        cred_checks::authorize_link(ctx.cred_snapshot(), &new_parent_meta)
     {
         return SyscallResult::error_from(e);
     }
@@ -1103,7 +1108,7 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let new_parent_meta = new_parent_dentry.rnode().meta();
     let displaced_meta = displaced_dentry.as_ref().map(|d| d.rnode().meta());
 
-    if let Err(e) = tx_subsystems::cred::checks::authorize_rename(
+    if let Err(e) = cred_checks::authorize_rename(
         ctx.cred_snapshot(),
         &old_parent_meta,
         &old_child_meta,
