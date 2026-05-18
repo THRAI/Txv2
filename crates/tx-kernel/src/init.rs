@@ -283,6 +283,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_rootfs_from_boot_media();
             Self::mount_devfs_at_dev();
             Self::register_devfs_console_alias();
+            Self::mount_bdevfs_at_dev_block();
             Self::mount_sdcard_at_musl();
             Self::bind_init_cwd_and_root();
 
@@ -450,6 +451,18 @@ impl<P: TxPlatform> CoreInit<P> {
     /// `mount_sdcard_at_musl`.
     pub(crate) fn mount_rootfs_from_boot_media() {
         Self::mount_rootfs_tmpfs();
+        // Initialise the vDSO image and high-res clock parameters.
+        // Must run after the substrate page allocator is ready.
+        if let Err(e) = crate::vdso::init::<P>() {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":vdso:init:fail:");
+            tx_hal::console_write_str::<P>(match e {
+                tx_subsystems::vdso::VdsoInitError::ImageNotAvailable => "stub",
+                tx_subsystems::vdso::VdsoInitError::Alloc => "alloc",
+                tx_subsystems::vdso::VdsoInitError::DirectMap => "dmap",
+            });
+            tx_hal::console_write_str::<P>("\n");
+        }
     }
 
     /// Mount tmpfs as the rootfs.
@@ -645,6 +658,126 @@ impl<P: TxPlatform> CoreInit<P> {
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:devfs:ok\n");
+    }
+
+    /// Mount bdev-fs on `/dev/block`.
+    ///
+    /// Per `docs/design/05_filesystem/BDEV_FS.md` §7.1: "Exactly one
+    /// bdev-fs instance exists per system, mounted at `/dev/block`."
+    /// After this runs, every registered block device shows up as a
+    /// page-backed file at `/dev/block/<name>` (e.g. `/dev/block/vda`).
+    /// The bdev-fs `FsPageBacking` impl translates page-cache I/O to
+    /// `BlockDeviceOps::step_read_blocks`/`step_write_blocks`, with a
+    /// per-devt coherence index so multiple opens share the same
+    /// `PageContainer` (§5).
+    ///
+    /// The mountpoint is a synthetic read-only directory entry on
+    /// devfs (`DEVFS_BLOCK_DIR_OBJECT_ID`); without devfs's `block`
+    /// stub there would be no path for bdev-fs to attach to (devfs
+    /// rejects `mkdir`).
+    ///
+    /// **Order invariant:** runs after `mount_devfs_at_dev` (devfs
+    /// must be live and `/dev/block` resolvable) and after
+    /// `init_block_devices` (the `vda` registration is what
+    /// populates bdev-fs's lookup/readdir). Precedes
+    /// `mount_sdcard_at_musl` — currently ext4 reads through the
+    /// driver's `BlockDeviceOps` directly (per BDEV_FS §8.3, ext4
+    /// metadata PCs are separate from bdev-fs PCs), so the order
+    /// relative to the ext4 mount is informational rather than
+    /// causal, but keeping bdev-fs first matches the design's
+    /// "block-device file API comes up before filesystems mount on
+    /// it" expectation.
+    pub(crate) fn mount_bdevfs_at_dev_block() {
+        use alloc::sync::Arc;
+
+        let root_mount = ROOT_MOUNT
+            .lock()
+            .clone()
+            .expect("mount_bdevfs_at_dev_block: ROOT_MOUNT must be populated");
+        let dev_mount = DEV_MOUNT
+            .lock()
+            .clone()
+            .expect("mount_bdevfs_at_dev_block: DEV_MOUNT must be populated");
+
+        // The mountpoint dentry: synthetic `/dev/block` directory
+        // owned by devfs (see `DEVFS_BLOCK_DIR_OBJECT_ID`).
+        let dev_block_meta = InodeMeta::new(
+            tx_subsystems::vfs::InodeKind::Directory,
+            tx_fs::devfs::DEVFS_BLOCK_DIR_MODE,
+        );
+        let dev_block_rnode_in_devfs = RNode::new_cap(
+            tx_fs::devfs::DEVFS_BLOCK_DIR_OBJECT_ID,
+            dev_block_meta,
+            RNodeBacking::Directory,
+        )
+        .expect("mount_bdevfs_at_dev_block: /dev/block rnode-on-devfs reservation");
+        let dev_block_dentry_on_devfs = DEntry::new_cap(
+            InlineName::new(b"block").expect("mount_bdevfs_at_dev_block: /block inline name"),
+            dev_block_rnode_in_devfs,
+        )
+        .expect("mount_bdevfs_at_dev_block: /dev/block dentry-on-devfs reservation");
+
+        // Build the bdev-fs MountPayload.
+        let bdevfs_payload_inner = Arc::new(tx_fs::bdevfs::BdevFsMountPayload::new());
+        let bdevfs_fs_ops = bdevfs_payload_inner.fs_ops_arc();
+        let bdevfs_fs_page_backing = bdevfs_payload_inner.fs_page_backing_arc();
+
+        let bdevfs_payload = MountPayload::new_cap(
+            bdevfs_fs_ops,
+            bdevfs_fs_page_backing,
+            None,
+            mount::allocate_dev_id(),
+            MountOptions::default(),
+            "bdev",
+            SourceLabel::Static("bdevfs"),
+        )
+        .expect("mount_bdevfs_at_dev_block: payload reservation");
+
+        let bdevfs_root_rnode = {
+            let raw = RNode::new(
+                tx_fs::bdevfs::BDEVFS_ROOT_ID,
+                InodeMeta::new(
+                    tx_subsystems::vfs::InodeKind::Directory,
+                    tx_fs::bdevfs::BDEVFS_ROOT_MODE,
+                ),
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&bdevfs_payload);
+            let res = step_engine::reserve_for::<RNode>()
+                .expect("mount_bdevfs_at_dev_block: bdev-fs root rnode reservation");
+            step_engine::sign_for(res, raw)
+        };
+
+        // Snapshot the devfs payload before consuming `dev_mount`
+        // into the new mount's parent slot. `register_mount` keys
+        // on the devfs payload + `block`'s FsObjectId.
+        let devfs_payload = dev_mount
+            .payload_cap()
+            .expect("devfs payload alive during boot")
+            .into_cap();
+
+        let bdev_mount = MountIdentity::new_cap(
+            mount::allocate_mount_id(),
+            Some(dev_block_dentry_on_devfs),
+            bdevfs_root_rnode,
+            Some(dev_mount),
+            bdevfs_payload,
+            MountFlags::empty(),
+        )
+        .expect("mount_bdevfs_at_dev_block: mount identity reservation");
+
+        mount::register_mount(
+            &devfs_payload,
+            tx_fs::devfs::DEVFS_BLOCK_DIR_OBJECT_ID,
+            bdev_mount,
+        );
+
+        // rootfs ownership of the chain holds: devfs is mounted on
+        // rootfs, bdev-fs is mounted on devfs.
+        let _ = root_mount;
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:bdevfs:ok\n");
     }
 
     /// Mount the sdcard ext4 image at `/musl` on the rootfs tmpfs.
@@ -904,6 +1037,22 @@ impl<P: TxPlatform> CoreInit<P> {
     ///    `thread.payload().saved_user_context` with the fixture's
     ///    entry-point + initial stack pointer.
     pub(crate) fn run_bootstrap_exec_for_init() {
+        // Try to install the embedded fork/wait `/init` fixture
+        // unconditionally. `register_init_fixture_into_tmpfs` is
+        // idempotent: `FsOps::create_inode(/init)` returns `EEXIST`
+        // when initramfs already supplied a `/init`, in which case
+        // the helper logs `:init:fixture:skip:ro` and returns
+        // without overwriting. On a clean tmpfs (no initramfs, CI
+        // smoke tests, host unit tests) it installs the bake-in
+        // fixture so `exec_script("/init", …)` can proceed.
+        //
+        // Removed: an `if !has_initramfs` short-circuit that hard-
+        // coded `has_initramfs = true`. The `boot_info().initrd`
+        // probe is unreliable at this point in boot (initrd may
+        // not be published yet), and `register_initramfs_if_present`
+        // already overlays its own /init on top of the fixture
+        // when present — so the EEXIST-tolerant idempotent call is
+        // both correct and simpler.
         Self::register_init_fixture_into_tmpfs();
         // Shell-prompt roadmap Slice 10 (2026-05-08): when the build
         // script bakes a busybox binary via `TX_BUSYBOX`, also

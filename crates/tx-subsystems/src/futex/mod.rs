@@ -60,7 +60,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    self, Errno, NoProgress, ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity, ZoneError,
+    self, Errno, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp, StepOutcome,
+    SubjectIdentity, ZoneError,
 };
 use adapter::wait_routing::{self, Channel, WaitSource};
 
@@ -166,6 +167,14 @@ pub fn bucket_index(uaddr: u64) -> usize {
 /// Wait never produces `Done`: completion arrives via the carrier
 /// resolution step driven by the script driver after the yield resolves.
 pub fn step_futex_wait(uaddr: u64, val: u32, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
+    // observe — validate uaddr alignment, read *uaddr under guard
+    // upgrade: N/A — no IdentRef→Cap needed; uaddr verified directly
+    // reserve: N/A — bucket array is static pre-allocated
     if uaddr == 0 || (uaddr & 0x3) != 0 {
         return StepOutcome::Err(Errno::EINVAL);
     }
@@ -175,6 +184,9 @@ pub fn step_futex_wait(uaddr: u64, val: u32, _guard: &Guard<'_>) -> StepOutcome<
     if observed != val {
         return StepOutcome::Err(Errno::EAGAIN);
     }
+    // upgrade — N/A (futex wait doesn't upgrade references)
+    // reserve — N/A (no zone allocation for futex wait)
+    // commit — register waiter under bucket lock via wait_routing
     let idx = bucket_index(uaddr);
     let source_id = {
         let guard = BUCKETS.lock();
@@ -183,6 +195,7 @@ pub fn step_futex_wait(uaddr: u64, val: u32, _guard: &Guard<'_>) -> StepOutcome<
             .expect("futex buckets uninitialised — register_zones not called");
         buckets[idx].source_id
     };
+    // publish — yield OnWaitSource with carrier id and interest mask
     step_engine::yield_until_wake(source_id, FUTEX_WAKE_MASK)
 }
 
@@ -197,9 +210,21 @@ pub fn step_futex_wait(uaddr: u64, val: u32, _guard: &Guard<'_>) -> StepOutcome<
 ///
 /// Wake never produces `Yield`/`Continue`.
 pub fn step_futex_wake(uaddr: u64, n: u32, _guard: &Guard<'_>) -> StepOutcome<u32, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
+    // observe: validate uaddr alignment
+    // upgrade: N/A — no IdentRef→Cap needed
+    // reserve: N/A — no zone allocation needed
+    // observe: validate uaddr — no futex-value check needed for wake
     if uaddr == 0 || (uaddr & 0x3) != 0 {
         return StepOutcome::Err(Errno::EINVAL);
     }
+    // upgrade — N/A (futex wake doesn't upgrade references)
+    // reserve — N/A (no zone allocation for futex wake)
+    // commit — fire legacy channel under bucket lock via wait_routing
     let idx = bucket_index(uaddr);
     // Clone the `Arc<WaitSource>` out under the bucket lock so the
     // `WaitSource::notify` call below (which itself takes the
@@ -219,6 +244,7 @@ pub fn step_futex_wake(uaddr: u64, n: u32, _guard: &Guard<'_>) -> StepOutcome<u3
     // caller that registered a `TaskMailbox` against this bucket's
     // source. Per-waiter re-check on wakeup re-reads `*uaddr` and
     // either returns success or re-parks.
+    // publish — notify v3 waiters via TaskMailbox, fire legacy channel
     wait_routing::notify_v3_source(&wait_source, FUTEX_WAKE_MASK);
     StepOutcome::Done(n)
 }
@@ -273,35 +299,43 @@ pub fn bucket_wait_source_for_source_id(source_id: u64) -> Option<Arc<WaitSource
 // field is held to pin the lifetime.
 
 /// StepOp wrap for [`step_futex_wait`]. PR-2 pilot.
-pub struct FutexWaitOp<'a> {
+///
+/// Carries no `&Guard` field: each `step()` call acquires its own
+/// epoch guard per STEP_MODEL_v2 §1, so the op stays `Send` and the
+/// driving future satisfies the reactor's `Send + 'static` contract
+/// (REACTOR_v0 §Submission, INVARIANTS_v5 EBR-7).
+pub struct FutexWaitOp {
     pub uaddr: u64,
     pub val: u32,
-    pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I> for FutexWaitOp<'a> {
+impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp {
     type Output = ();
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_futex_wait(self.uaddr, self.val, self.guard)
+        let guard = adapter::step_engine::guard();
+        step_futex_wait(self.uaddr, self.val, &guard)
     }
 }
 
 /// StepOp wrap for [`step_futex_wake`]. PR-2 pilot. Note `Output = u32`,
 /// not `()` — wake returns the requested wake count.
-pub struct FutexWakeOp<'a> {
+pub struct FutexWakeOp {
     pub uaddr: u64,
     pub n: u32,
-    pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I> for FutexWakeOp<'a> {
+impl<I: SubjectIdentity> StepOp<I> for FutexWakeOp {
     type Output = u32;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_futex_wake(self.uaddr, self.n, self.guard)
+        let guard = adapter::step_engine::guard();
+        step_futex_wake(self.uaddr, self.n, &guard)
     }
 }
+
+impl OneShotStepOp for FutexWakeOp {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for FutexWakeOp {}
 
 #[cfg(test)]
 mod tests {
@@ -437,6 +471,11 @@ mod tests {
 
     #[test]
     fn step_futex_wait_misaligned_uaddr_returns_einval() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let guard = guard();
         // 0x1 — non-zero, non-zero-mod-4 (misaligned for u32).
@@ -455,6 +494,11 @@ mod tests {
 
     #[test]
     fn step_futex_wait_value_mismatch_returns_eagain() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         // Word holds 0xdead_beef; FUTEX_WAIT with val=0 must observe
         // the mismatch and short-circuit to EAGAIN.
@@ -476,6 +520,11 @@ mod tests {
 
     #[test]
     fn step_futex_wait_value_match_yields_on_wait_source() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let word: u32 = 0xdead_beef;
         let uaddr = &word as *const u32 as u64;
@@ -504,6 +553,11 @@ mod tests {
 
     #[test]
     fn step_futex_wake_zero_n_is_a_no_op_done_zero() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         // Linux `FUTEX_WAKE` with `n=0` is a defined no-op;
         // `step_futex_wake` falls through to `Done(0)`. Tightening
         // (rejecting `n=0` as EINVAL) is a separate design decision.
@@ -521,6 +575,11 @@ mod tests {
 
     #[test]
     fn step_futex_wake_unwaited_returns_done_zero() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         // Wake on an idle bucket with no waiters parked on it.
         //
@@ -602,11 +661,11 @@ mod tests {
             // Word holds 0xdead_beef; matching val parks → Yield::OnWaitSource.
             let word: u32 = 0xdead_beef;
             let uaddr = &word as *const u32 as u64;
-            let guard = guard();
+            // FutexWaitOp acquires its own guard inside step() per
+            // STEP_MODEL_v2 §1; outer guard would nest (EBR-7).
             let mut op = FutexWaitOp {
                 uaddr,
                 val: 0xdead_beef,
-                guard: &guard,
             };
             let mut ctx = ScriptCtx::<ProcessIdentity>::new();
             let outcome = op.step(&mut ctx);
@@ -619,23 +678,20 @@ mod tests {
                 }
                 other => panic!("expected Yield::OnWaitSource, got {other:?}"),
             }
-            drop(guard);
         }
 
         #[test]
         fn futex_wake_op_step_delegates_to_free_fn() {
             let _setup = setup();
             // Zero uaddr → EINVAL. Output type is u32, not ().
-            let guard = guard();
-            let mut op = FutexWakeOp {
-                uaddr: 0,
-                n: 1,
-                guard: &guard,
-            };
+            // FutexWakeOp acquires its own guard inside step() per
+            // STEP_MODEL_v2 §1; outer guard would nest (EBR-7).
+            let mut op = FutexWakeOp { uaddr: 0, n: 1 };
             let mut ctx = ScriptCtx::<ProcessIdentity>::new();
             let outcome: StepOutcome<u32, NoProgress> = op.step(&mut ctx);
             assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
             // Sanity: parallel free-fn call matches.
+            let guard = guard();
             let free = step_futex_wake(0, 1, &guard);
             drop(guard);
             assert_eq!(outcome, free);

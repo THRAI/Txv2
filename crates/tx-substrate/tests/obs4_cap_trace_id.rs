@@ -152,7 +152,7 @@ fn cap_trace_id_properties() {
 
     // ── Property 6: PayloadCap::trace_id delegates to Cap::trace_id ─────────
     let id_from_cap = a1.trace_id();
-    let payload_cap = PayloadCap::from_cap(a1);
+    let payload_cap = PayloadCap::from_cap_unchecked(a1);
     assert_eq!(
         id_from_cap,
         payload_cap.trace_id(),

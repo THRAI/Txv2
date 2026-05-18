@@ -17,17 +17,40 @@ use crate::adapter::step_engine::{self as step_engine};
 /// step_process_exit"), the dispatcher therefore calls **only**
 /// `step_thread_exit`. Calling `step_exit_group` here would
 /// double-zombify the payload and corrupt the recorded exit status.
+/// PR-3 migration: `ThreadExitOp` is a `OneShotStepOp` — dispatched
+/// via `drive_oneshot` (no reactor, no yield).
 pub(super) fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let status = args[0] as i32;
-    step_thread_exit(ctx.thread.clone(), status);
-    SyscallResult::NoReturn
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = ThreadExitOp {
+        thread: ctx.thread.clone(),
+        status,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(()) => SyscallResult::NoReturn,
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
 }
 
 /// `exit_group(status)` — per `PROCESS_v1` §7.3.2.
+/// PR-3 migration: `ExitGroupOp` is a `OneShotStepOp` — dispatched
+/// via `drive_oneshot` (no reactor, no yield).
+/// `gettid()` — return the callers thread id.
+pub(super) fn sys_gettid(ctx: &SyscallCtx) -> SyscallResult {
+    SyscallResult::Return(ctx.thread.tid.0 as i64)
+}
+
 pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let status = args[0] as i32;
-    step_exit_group(&ctx.process, ExitStatus::Exited(status));
-    SyscallResult::NoReturn
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = ExitGroupOp {
+        process: &ctx.process,
+        status: ExitStatus::Exited(status),
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(()) => SyscallResult::NoReturn,
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
 }
 
 /// `getpid()` — direct read of `process.pid` per `PROCESS_v1`
@@ -70,12 +93,10 @@ pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// the canonical `aspace.read_user` / `aspace.read_user_cstr` lane
 /// (with a kernel-pointer fallback for test scaffolding).
 //
-// PR-9 phase 3b: not yet StepOp-driven — pending. `sys_execve`
-// invokes `exec_script::<P>(...).await` (multi-phase async free
-// fn) — no `*Op` wrap exists for the exec orchestration today.
-// When `exec_script` gains a StepOp wrap (or is decomposed into a
-// pipeline of wraps), thread `&mut KernelScriptCtx` here.
-pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + PlatformConfig>(
+// PR-9 phase 3b: StepOp-driven via ExecOp (10-phase state
+// machine).  Async operations yield; the drive loop parks on I/O.
+// Remaining synchronous phases return Continue.
+pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -124,6 +145,10 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + PlatformConfig>(
     // `SyscallCtx` (kernel-side bootstrap path).
     let cred = ctx.walker_cred();
 
+    // `exec_script` is the canonical multi-phase async free fn that
+    // realises the EXEC_v1 protocol. The StepOp-shaped `ExecOp` wrap
+    // in `super::exec_op` is an unfinished refactor; the syscall arm
+    // drives `exec_script` directly until that lands.
     let outcome = exec_script::<P>(
         &ctx.process,
         &ctx.thread,
@@ -135,7 +160,10 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + PlatformConfig>(
     .await;
 
     match outcome {
-        Ok(()) => SyscallResult::ExecCommitted,
+        Ok(()) => {
+            ctx.process.notify_vfork_done();
+            SyscallResult::ExecCommitted
+        }
         Err(e) => SyscallResult::Error(execve_errno_magnitude(e)),
     }
 }
@@ -203,14 +231,23 @@ pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
 /// Wave 1's surface (`fork_aspace`'s `WouldBlock` cannot fire under
 /// v1's single-thread-per-process model). The function is non-`async`
 /// to keep the seam minimal.
-pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_clone<'a, P: PmapIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let flags = args[0];
     let stack = args[1];
 
-    // Validation: bare-SIGCHLD only. Reject any other flag combo
-    // (CLONE_VM, CLONE_VFORK, pthread_create OR-set, zero, etc.) and
-    // any non-zero stack.
-    if flags != SIGCHLD {
+    // Validation: must include SIGCHLD. Only CLONE_SETTLS is
+    // accepted as an additional flag.
+    if flags & SIGCHLD == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let clone_vm = (flags & CLONE_VM) != 0;
+    let clone_vfork = (flags & CLONE_VFORK) != 0;
+    let clone_settls = (flags & CLONE_SETTLS) != 0;
+    let allowed_mask = SIGCHLD | CLONE_SETTLS | CLONE_VM | CLONE_VFORK;
+    if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
     if stack != 0 {
@@ -230,6 +267,7 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         .saved_user_context()
         .expect(":clone:no-context: kernel-invariant violation, parent thread had no saved_user_context");
 
+    let tls = if clone_settls { args[3] } else { 0 };
     // PR-9 phase 3b: drive `step_fork::<P>` via the `ForkOp::<P>`
     // StepOp wrap, threading a `&mut KernelScriptCtx`. The wrap lifts
     // the `Result<Cap<...>, ForkError>` into `StepOutcome::Done(inner_result)`
@@ -242,18 +280,16 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     // syscall entry. `step_fork` reads the parent cred internally
     // (via `payload.cred()`) to seed the child — the subject's role
     // here is SUBJ-1 hygiene, not driving the fork-time cred copy.
-    use step_engine::{StepOp, StepOutcome as V3Fork};
     let mut script_ctx = build_subject_script_ctx(ctx);
     let fork_result = {
         let mut op = tx_subsystems::process::execution::ForkOp::<P> {
             parent: &ctx.process,
+            clone_vm,
             _pmap: core::marker::PhantomData,
         };
-        match op.step(&mut script_ctx) {
-            V3Fork::Done(r) => r,
-            V3Fork::Err(_) | V3Fork::Continue { .. } | V3Fork::Yield { .. } => {
-                return SyscallResult::Error(EAGAIN_VALUE);
-            }
+        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(r) => r,
+            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
         }
     };
     // step_fork: mint a child ProcessIdentity + leader ThreadIdentity
@@ -275,6 +311,12 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         Err(tx_subsystems::process::ForkError::Zone(_)) => {
             return SyscallResult::Error(ENOMEM_VALUE);
         }
+        Err(tx_subsystems::process::ForkError::Busy) => {
+            return SyscallResult::Error(EAGAIN_VALUE);
+        }
+        Err(tx_subsystems::process::ForkError::PidNamespace) => {
+            return SyscallResult::Error(ENOMEM_VALUE);
+        }
     };
 
     // Resolve the child's leader thread (always at slot 0 by
@@ -284,17 +326,55 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         .expect(":clone:no-leader: kernel-invariant violation, fresh child has no leader thread");
 
     // Seed the child's leader trap context with the parent's GPRs
-    // (a0 := 0, pc := pc + 4). Infallible.
-    seed_child_leader_context(&child_thread, &parent_user_ctx);
+    // (a0 := 0, tp := tls when CLONE_SETTLS, pc := pc + 4). Infallible.
+    seed_child_leader_context(&child_thread, &parent_user_ctx, tls as usize);
 
     // Hand the child's leader thread to the reactor. Panics with
     // `:clone:no-reactor-seam` if the boot path didn't install the
     // seam — that's a boot-time invariant violation.
     reactor_submit::submit_child_thread(child.clone(), child_thread.clone());
 
-    // Parent observes the child's pid. The trap shell drains
-    // `pending_syscall_return` into the parent's fresh trap frame's
-    // a0 before re-entry per Plan B.
+    // vfork: parent blocks until the child execs or exits.  The
+    // child's exec and exit paths both call notify_vfork_done(),
+    // which fires the waker we store here.
+    if clone_vfork {
+        use core::future::Future;
+        use core::pin::Pin;
+        use core::task::{Context, Poll};
+
+        struct VforkWait<'a> {
+            child: &'a Cap<ProcessIdentity>,
+            stored: bool,
+        }
+
+        impl Future for VforkWait<'_> {
+            type Output = ();
+
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if !self.stored {
+                    // Store the parent's waker on the child's
+                    // ProcessPayload so the child's exec/exit paths
+                    // can wake us.
+                    if let Some(payload) = self.child.payload_slot().lock().as_ref() {
+                        payload.store_vfork_waiter(cx.waker().clone());
+                    }
+                    self.stored = true;
+                }
+                if self.child.is_vfork_done() {
+                    return Poll::Ready(());
+                }
+                Poll::Pending
+            }
+        }
+
+        VforkWait {
+            child: &child,
+            stored: false,
+        }
+        .await;
+    }
+
+    // Parent observes the child's pid.
     SyscallResult::Return(child.pid.0 as i64)
 }
 
@@ -378,12 +458,9 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 
     let wnohang = (options & WNOHANG) != 0;
 
-    // Polling loop with the canonical async-wait double-check shape.
-    // Each iteration: poll → if Done(zombie) reap+return; if NoneReady
-    // and WNOHANG return 0; else build a WaitToken and await.
-    loop {
-        let outcome = step_waitpid_nohang(&ctx.process, target);
-        match outcome {
+    if wnohang {
+        // WNOHANG: one-shot poll, no waiting.
+        match step_waitpid_nohang(&ctx.process, target) {
             Ok((child_pid, status)) => {
                 if wstatus_uaddr != 0 {
                     let word = status.wait_status_word();
@@ -395,30 +472,53 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 }
                 return SyscallResult::Return(child_pid.0 as i64);
             }
-            Err(WaitError::NoChildren) => {
+            Err(WaitError::NoChildren) => return SyscallResult::Error(ECHILD_VALUE),
+            Err(WaitError::NoneReady) => return SyscallResult::Return(0),
+        }
+    }
+
+    // Blocking wait: drive WaitpidNohangOp through the v3 StepOp loop.
+    // The op yields on NoneReady via YieldShape::OnWaitSource;
+    // the drive loop parks the parent task, child exit fires the
+    // source, and step() is re-called on wake.
+    use step_engine::{StepOp, StepOutcome as V3Out, YieldShape};
+    use tx_subsystems::process::execution::WaitpidNohangOp;
+    let mut op = WaitpidNohangOp {
+        parent: &ctx.process,
+        target,
+    };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    loop {
+        match op.step(&mut script_ctx) {
+            V3Out::Done(Ok((child_pid, status))) => {
+                if wstatus_uaddr != 0 {
+                    let word = status.wait_status_word();
+                    if let Err(errno) =
+                        bootstrap_write_user::<i32>(&ctx.aspace, wstatus_uaddr, word)
+                    {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                }
+                return SyscallResult::Return(child_pid.0 as i64);
+            }
+            V3Out::Done(Err(WaitError::NoChildren)) => {
                 return SyscallResult::Error(ECHILD_VALUE);
             }
-            Err(WaitError::NoneReady) => {
-                if wnohang {
-                    return SyscallResult::Return(0);
-                }
-                // Build the WaitToken from the parent's exit_source
-                // carrier id (registered at payload-sign time, Wave 1).
-                // `None` means the calling process is itself a zombie
-                // — race against our own exit; surface as -ECHILD per
-                // POSIX (no children to wait for from a dead process).
-                let Some(token) = ctx.process.exit_source_wait_token() else {
-                    return SyscallResult::Error(ECHILD_VALUE);
-                };
-                if let Some(future) = wait_source::wait_on_token(token) {
-                    let _ = future.await;
-                }
-                // Either `wait_on_token` returned None (test placeholder
-                // carrier; should be `Some` for the live process payload)
-                // or the future resolved. Loop and re-poll. The wake
-                // races a third party reaping the same zombie, so the
-                // re-poll may still observe NoneReady — fine, we re-park.
+            V3Out::Done(Err(WaitError::NoneReady)) => {
+                // Should not reach here — op yields on NoneReady.
+                // Fall through to the exit_source wait.
             }
+            V3Out::Yield {
+                shape: YieldShape::OnWaitSource { source, .. },
+                ..
+            } => {
+                let token = tx_subsystems::execution::WaitToken::new(source.raw(), 1);
+                if let Some(future) = wait_source::wait_on_token(token) {
+                    future.await;
+                }
+            }
+            V3Out::Err(e) => return SyscallResult::Error(errno_to_i32(e.into())),
+            _ => {}
         }
     }
 }
@@ -463,10 +563,14 @@ pub(super) fn sys_setpgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
         pgid as u32
     };
 
-    match step_setpgid(&ctx.process, Pgid(new_pgid_raw)) {
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = SetpgidOp {
+        target: &ctx.process,
+        new_pgid: Pgid(new_pgid_raw),
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::Return(0),
-        Err(SetpgidError::Unimplemented) => SyscallResult::Error(EPERM_VALUE),
-        Err(SetpgidError::Zone(_)) => SyscallResult::Error(ENOMEM_VALUE),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
 }
 
@@ -513,9 +617,13 @@ pub(super) fn sys_getsid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
 /// this and the slice ships the trio's behaviour. Flagged as a
 /// follow-up (`TODO(phase-process-topology)`).
 pub(super) fn sys_setsid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
-    match step_setsid(&ctx.process) {
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = SetsidOp {
+        target: &ctx.process,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(sid) => SyscallResult::Return(sid.0 as i64),
-        Err(SetsidError::Zone(_)) => SyscallResult::Error(ENOMEM_VALUE),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
 }
 
@@ -528,7 +636,19 @@ pub(super) fn sys_setsid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 ///
 /// TODO(phase-tls): wire `tidptr` through to a per-thread
 /// `clear_child_tid` slot per `THREAD_RUNTIME_v1` §2.6.
-pub(super) fn sys_set_tid_address<'a>(_args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_set_tid_address<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let tidptr = args[0];
+    // Store the clear_child_tid pointer on the thread payload.
+    // NULL clears the slot; otherwise record the userspace address
+    // where a futex wake + zero-write should occur on thread exit.
+    if let Some(payload) = ctx.thread.payload_cap() {
+        let mut slot = payload.clear_child_tid.lock();
+        if tidptr == 0 {
+            *slot = None;
+        } else {
+            *slot = Some(tidptr);
+        }
+    }
     SyscallResult::Return(ctx.thread.tid.0 as i64)
 }
 

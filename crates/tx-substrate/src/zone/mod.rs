@@ -8,6 +8,7 @@
 mod bucket;
 mod cap;
 mod error;
+mod identity_slot;
 mod keg;
 mod meta;
 mod payload;
@@ -29,9 +30,13 @@ use tx_hal::{CpuId, TxPlatform};
 pub use bucket::{ZoneBucket, DEFAULT_BUCKET_CAPACITY};
 pub use cap::{Cap, IdentRef, PayloadCap, Weak};
 pub use error::{Dead, ZoneError};
+pub use identity_slot::IdentitySlot;
 pub use meta::{SlotState, SlotWord};
 pub use payload::{CoLocatedEntity, Entity, OperationalCapExt, OperationalRefExt, PayloadBinding};
-pub use policy::{ObserverNodePolicy, PayloadPolicy, RetainedEntityPolicy};
+pub use policy::{
+    CapProducingPolicy, IsPayloadPolicy, ObserverNodePolicy, PayloadPolicy, RetainedEntityPolicy,
+    ZonePolicy,
+};
 pub use registry::{
     lookup, register_static_zone, registered_zone_count, snapshot, EmptySlabTrimStats, SlotKey,
     ZoneId, ZoneInfo,
@@ -211,6 +216,15 @@ impl<T: 'static> Default for Zone<T> {
 /// resolve through the wrong registry entry and break `Cap`/`Weak` generation
 /// safety.
 pub unsafe trait ZoneAllocated: Sized + 'static {
+    /// Slot lifecycle policy for this zone-backed type.
+    ///
+    /// Defaults to `RetainedEntityPolicy<Self>` so existing impls compile
+    /// unchanged.  Payload types in split-entity layouts should declare
+    /// `type Policy = PayloadPolicy<Self>` for audit visibility.
+    /// Observer nodes use `ObserverNodePolicy<Self>`, which rejects
+    /// `zone::sign` / `sign_for` at compile time.
+    type Policy: ZonePolicy = RetainedEntityPolicy<Self>;
+
     /// Return the single static zone that stores values of this type.
     fn zone() -> &'static Zone<Self>;
 }
@@ -223,7 +237,10 @@ pub fn register_zone_for<T: ZoneAllocated>() -> Result<ZoneInfo, ZoneError> {
     registry::register_static_zone(T::zone())
 }
 
-pub fn sign_for<T: ZoneAllocated>(reservation: ZoneReservation<T>, value: T) -> Cap<T> {
+pub fn sign_for<T: ZoneAllocated>(reservation: ZoneReservation<T>, value: T) -> Cap<T>
+where
+    T::Policy: CapProducingPolicy,
+{
     reservation::sign(reservation, value)
 }
 
@@ -233,7 +250,10 @@ pub fn sign_for<T: ZoneAllocated>(reservation: ZoneReservation<T>, value: T) -> 
 /// `reserve_for::<T>()? → sign_for(res, value)`.
 /// Used by 2+ adapters; defined here so per-adapter wrappers can be
 /// replaced with a direct call to `zone::sign`.
-pub fn sign<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
+pub fn sign<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError>
+where
+    T::Policy: CapProducingPolicy,
+{
     let res = reserve_for::<T>()?;
     Ok(sign_for(res, value))
 }

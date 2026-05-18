@@ -110,18 +110,12 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let root_mount =
             root_mount().expect("register_busybox_into_tmpfs: ROOT_MOUNT must be populated");
-        let fs_ops = root_mount
+        let payload = root_mount
             .payload_cap()
             .expect("rootfs payload alive during boot")
-            .into_cap()
-            .fs_ops
-            .clone();
-        let fs_page_backing = root_mount
-            .payload_cap()
-            .expect("rootfs payload alive during boot")
-            .into_cap()
-            .fs_page_backing
-            .clone();
+            .into_cap();
+        let fs_ops = payload.fs_ops.clone();
+        let fs_page_backing = payload.fs_page_backing.clone();
         let root_object_id = root_mount.root().fs_object_id();
 
         let cred = Credential::root();
@@ -162,7 +156,7 @@ impl<P: TxPlatform> CoreInit<P> {
         //    `Cap<PageContainer>`.
         let pc = {
             let guard = step_engine::guard();
-            let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
+            let outcome = fs_ops.materialise_rnode(file_id, file_meta, &payload, &guard);
             let rnode = match outcome {
                 V3::Done(rnode) => rnode,
                 other => panic!("register_busybox_into_tmpfs: materialise_rnode: {other:?}"),
@@ -229,18 +223,12 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let root_mount =
             root_mount().expect("register_init_fixture_into_tmpfs: ROOT_MOUNT must be populated");
-        let fs_ops = root_mount
+        let payload = root_mount
             .payload_cap()
             .expect("rootfs payload alive during boot")
-            .into_cap()
-            .fs_ops
-            .clone();
-        let fs_page_backing = root_mount
-            .payload_cap()
-            .expect("rootfs payload alive during boot")
-            .into_cap()
-            .fs_page_backing
-            .clone();
+            .into_cap();
+        let fs_ops = payload.fs_ops.clone();
+        let fs_page_backing = payload.fs_page_backing.clone();
         let root_object_id = root_mount.root().fs_object_id();
 
         let bytes = &init_fixture::INIT_FIXTURE_BYTES[..];
@@ -274,7 +262,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // `RNodeBacking::PageBacked { pc }` for regular files.
         let pc = {
             let guard = step_engine::guard();
-            let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
+            let outcome = fs_ops.materialise_rnode(file_id, file_meta, &payload, &guard);
             let rnode = match outcome {
                 V3::Done(rnode) => rnode,
                 other => panic!("register_init_fixture_into_tmpfs: materialise_rnode: {other:?}"),

@@ -33,7 +33,7 @@ pub struct ZoneId(pub usize);
 ///
 /// `slot_id` is derived from the current slab layout:
 /// `(slab_id - 1) * SLOTS_PER_SLAB + slot_index`.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 #[repr(transparent)]
 pub struct SlotKey(u32);
 

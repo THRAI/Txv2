@@ -112,7 +112,7 @@ fn fork_inherits_parent_cred_unchanged() {
     };
     set_cred(&parent, custom);
 
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     assert_eq!(cred_of(&child), custom);
     // Still equal to parent (no aliasing — they're independent Copies).
     assert_eq!(cred_of(&child), cred_of(&parent));

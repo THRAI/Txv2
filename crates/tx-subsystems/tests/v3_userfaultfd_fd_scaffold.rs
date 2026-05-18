@@ -172,7 +172,10 @@ fn userfaultfd_phase0_fd_scaffold_invariants_round_trip() {
         OpenFileBacking::Rnode { .. }
         | OpenFileBacking::AioContext { .. }
         | OpenFileBacking::SignalFd { .. }
-        | OpenFileBacking::IoUring { .. } => {
+        | OpenFileBacking::IoUring { .. }
+        | OpenFileBacking::Epoll { .. }
+        | OpenFileBacking::Eventfd { .. }
+        | OpenFileBacking::Timerfd { .. } => {
             panic!("expected OpenFileBacking::Ufd")
         }
     }

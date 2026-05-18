@@ -57,6 +57,7 @@ impl EntryProgress {
 }
 
 impl StepProgress for EntryProgress {
+    type Output = ();
     const EMPTY: Self = EntryProgress {
         count: 0,
         cursor: DirCursor(0),
@@ -66,6 +67,10 @@ impl StepProgress for EntryProgress {
         // Cursor is irrelevant for emptiness: only the running count
         // determines whether any progress has been made.
         self.count == 0
+    }
+
+    fn into_output(self) -> Option<()> {
+        None
     }
 
     fn extend(&mut self, other: Self) {

@@ -312,7 +312,11 @@ fn parse_image_plan_rejects_pt_interp() {
         p_align: 1,
     });
     let bytes = cfg.build();
-    assert_eq!(parse_image_plan(&bytes).unwrap_err(), ParseError::HasInterp);
+    let plan = parse_image_plan(&bytes).expect("PT_INTERP should be accepted");
+    assert!(
+        plan.interpreter_path.is_some(),
+        "interpreter path should be extracted"
+    );
 }
 
 #[test]

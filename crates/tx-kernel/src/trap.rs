@@ -42,6 +42,17 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
     fn on_timer_interrupt(_cpu: CpuId) -> TrapAction {
         P::cancel_deadline();
         crate::zones::try_bounded_maintenance_tick();
+        // Update the global VVAR page with current time, but only if the
+        // vDSO image was successfully mapped during boot. Without this
+        // guard a timer fires before `init_vdso()` runs (or after it
+        // failed silently) and `vvar_page()` dereferences the still-null
+        // `VVAR_PTR`, panicking with a store/AMO page fault at scause=15.
+        if tx_subsystems::vdso::vdso_available() {
+            let mono_ns = P::read_ns();
+            let sec = mono_ns / 1_000_000_000;
+            let nsec = mono_ns % 1_000_000_000;
+            tx_subsystems::vdso::vvar_page().update((sec, nsec), (sec, nsec));
+        }
         TrapAction::Resume
     }
 

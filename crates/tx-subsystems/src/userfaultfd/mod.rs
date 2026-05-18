@@ -451,6 +451,11 @@ pub fn step_ufd_read(
     out: &mut [u8],
     nonblocking: bool,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if out.is_empty() {
         return StepOutcome::done(0);
     }

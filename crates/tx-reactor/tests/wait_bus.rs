@@ -17,6 +17,7 @@ use tx_reactor::wait::{
     Channel, DeclaredChannel, DeclaredReadinessChannel, Mask, WaitOutcome, WaitProtocol,
 };
 use tx_reactor::{Reactor, RunStats, TaskStatus};
+use tx_substrate::wake::mailbox::TaskMailbox;
 
 struct CountWake {
     wakes: Arc<AtomicUsize>,
@@ -481,14 +482,16 @@ fn reactor_declared_readiness_channel_uses_timer_queue_for_timeouts() {
 fn raw_port_coalesces_fires_until_subscription_observes_ready() {
     let port = RawPort::new();
     let wakes = Arc::new(AtomicUsize::new(0));
-    let waker = counting_waker(Arc::clone(&wakes));
-    let mut sub = port.subscribe(0x1, waker);
+    let mailbox = Arc::new(TaskMailbox::new());
+    mailbox.register_waker(counting_waker(Arc::clone(&wakes)));
+    let gen = mailbox.next_generation();
+    let sub = port.subscribe(0x1, Arc::downgrade(&mailbox), gen);
 
     assert_eq!(port.fire(0x1), 1);
     assert_eq!(port.fire(0x1), 0);
     assert_eq!(wakes.load(Ordering::SeqCst), 1);
-    assert!(sub.take_ready());
-    assert!(!sub.take_ready());
+    assert!(mailbox.poll().is_some());
+    assert!(mailbox.poll().is_none());
 
     assert_eq!(port.fire(0x1), 1);
     assert_eq!(wakes.load(Ordering::SeqCst), 2);
@@ -500,15 +503,17 @@ fn raw_port_coalesces_fires_until_subscription_observes_ready() {
 fn raw_queue_fires_new_bits_and_drop_removes_subscription() {
     let queue = RawQueue::new();
     let wakes = Arc::new(AtomicUsize::new(0));
-    let waker = counting_waker(Arc::clone(&wakes));
-    let mut sub = queue.subscribe(0x1, waker);
+    let mailbox = Arc::new(TaskMailbox::new());
+    mailbox.register_waker(counting_waker(Arc::clone(&wakes)));
+    let gen = mailbox.next_generation();
+    let sub = queue.subscribe(0x1, Arc::downgrade(&mailbox), gen);
 
     assert_eq!(queue.peek(), 0);
     assert_eq!(queue.fire(0x1), 1);
     assert_eq!(queue.peek(), 0x1);
     assert_eq!(queue.fire(0x1), 0);
     assert_eq!(wakes.load(Ordering::SeqCst), 1);
-    assert!(sub.take_ready());
+    assert!(mailbox.poll().is_some());
     assert_eq!(queue.fire(0x1), 0);
 
     queue.clear(0x1);

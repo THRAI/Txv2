@@ -48,7 +48,7 @@ fn bootstrap() -> Cap<ProcessIdentity> {
 fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
     let payload_guard = proc_cap.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");
-    let threads = payload.threads.lock();
+    let threads = payload.threads.snapshot();
     threads[0].clone()
 }
 
@@ -143,7 +143,7 @@ fn fork_assigns_distinct_tids_to_parent_and_child_leader_threads() {
     let parent = bootstrap();
     let parent_leader = first_thread(&parent);
 
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     let child_leader = first_thread(&child);
 
     assert_ne!(parent_leader.tid, child_leader.tid);

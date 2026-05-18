@@ -76,6 +76,11 @@ fn first_page_after_size(size: u64) -> Option<PageIndex> {
 }
 
 pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), PageProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::page_backed::adapter::step_engine::{StepOutcome as V3, YieldShape};
 
     let PageContainerKind::File {
@@ -131,6 +136,12 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
                 return V3::err(step_engine::Errno::EIO);
             }
             V3::Yield {
+                shape: YieldShape::OnEdge { .. },
+                ..
+            } => {
+                return V3::err(step_engine::Errno::EIO);
+            }
+            V3::Yield {
                 shape: YieldShape::OnTimer { .. },
                 ..
             } => {
@@ -140,7 +151,11 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         }
     }
 
-    match mount.payload().fs_page_backing.fsync(*fs_object_id, guard) {
+    match mount
+        .payload()
+        .fs_page_backing
+        .fsync_file(*fs_object_id, guard)
+    {
         V3::Done(()) => V3::done(()),
         V3::Continue { progress: _ } => {
             let progress = if pages_so_far == 0 {
@@ -167,6 +182,10 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         }
         V3::Yield {
             shape: YieldShape::OnAgent { .. },
+            ..
+        } => V3::err(step_engine::Errno::EIO),
+        V3::Yield {
+            shape: YieldShape::OnEdge { .. },
             ..
         } => V3::err(step_engine::Errno::EIO),
         V3::Yield {
@@ -201,6 +220,11 @@ pub fn step_truncate(
     new_size: u64,
     guard: &Guard<'_>,
 ) -> StepOutcome<(), PageProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::page_backed::adapter::step_engine::{StepOutcome as V3, YieldShape};
 
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
@@ -244,13 +268,18 @@ pub fn step_truncate(
                 ..
             } => return V3::err(step_engine::Errno::EIO),
             V3::Yield {
+                shape: YieldShape::OnEdge { .. },
+                ..
+            } => return V3::err(step_engine::Errno::EIO),
+            V3::Yield {
                 shape: YieldShape::OnTimer { .. },
                 ..
             } => return V3::err(step_engine::Errno::EIO),
             V3::Err(v3_errno) => return V3::err(v3_errno),
         },
         PageContainerKind::Anon { .. } => false,
-        PageContainerKind::Device { .. } => unreachable!(),
+        // Device PC is rejected above; fall through safely.
+        PageContainerKind::Device { .. } => false,
     };
 
     let old_size = pc.size_bytes();
@@ -276,6 +305,11 @@ pub fn step_fallocate(
     new_size: u64,
     guard: &Guard<'_>,
 ) -> StepOutcome<(), PageProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::page_backed::adapter::step_engine::{StepOutcome as V3, YieldShape};
 
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
@@ -323,13 +357,18 @@ pub fn step_fallocate(
                 ..
             } => return V3::err(step_engine::Errno::EIO),
             V3::Yield {
+                shape: YieldShape::OnEdge { .. },
+                ..
+            } => return V3::err(step_engine::Errno::EIO),
+            V3::Yield {
                 shape: YieldShape::OnTimer { .. },
                 ..
             } => return V3::err(step_engine::Errno::EIO),
             V3::Err(v3_errno) => return V3::err(v3_errno),
         },
         PageContainerKind::Anon { .. } => false,
-        PageContainerKind::Device { .. } => unreachable!(),
+        // Device PC is rejected above; fall through safely.
+        PageContainerKind::Device { .. } => false,
     };
 
     pc.set_size_bytes(new_size);
@@ -355,30 +394,33 @@ pub fn step_fallocate(
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct FsyncOp<'a> {
     pub pc: &'a PageContainer,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for FsyncOp<'a> {
     type Output = ();
     type Progress = PageProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_fsync(self.pc, self.guard)
+        let __guard = step_engine::guard();
+        step_fsync(self.pc, &__guard)
     }
 }
 
 /// `StepOp` wrap of [`step_truncate`].
+///
+/// Each `step()` call acquires its own epoch guard per STEP_MODEL_v2
+/// §1; the op stays `Send` (REACTOR_v0, INVARIANTS_v5 EBR-7).
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct TruncateOp<'a> {
     pub pc: &'a PageContainer,
     pub new_size: u64,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for TruncateOp<'a> {
     type Output = ();
     type Progress = PageProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_truncate(self.pc, self.new_size, self.guard)
+        let guard = step_engine::guard();
+        step_truncate(self.pc, self.new_size, &guard)
     }
 }
 
@@ -387,14 +429,14 @@ impl<'a, I: SubjectIdentity> StepOp<I> for TruncateOp<'a> {
 pub struct FallocateOp<'a> {
     pub pc: &'a PageContainer,
     pub new_size: u64,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for FallocateOp<'a> {
     type Output = ();
     type Progress = PageProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_fallocate(self.pc, self.new_size, self.guard)
+        let __guard = step_engine::guard();
+        step_fallocate(self.pc, self.new_size, &__guard)
     }
 }
 
@@ -651,7 +693,11 @@ mod v3_tests {
             self.truncate_outcome
         }
 
-        fn fsync(&self, fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Outcome<(), NoProgress> {
+        fn fsync_file(
+            &self,
+            fs_object_id: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<(), NoProgress> {
             self.fsyncs.fetch_add(1, Ordering::AcqRel);
             self.last_object
                 .store(fs_object_id.as_u64(), Ordering::Release);
@@ -955,12 +1001,8 @@ mod step_op_wraps {
     fn fsync_op_anon_returns_done() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup();
-        let guard = step_engine::guard();
         let pc = anon_pc(1);
-        let mut op = FsyncOp {
-            pc: &pc,
-            guard: &guard,
-        };
+        let mut op = FsyncOp { pc: &pc };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Outcome::done(()));
     }
@@ -969,14 +1011,11 @@ mod step_op_wraps {
     fn truncate_op_anon_shrink_returns_done() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup();
-        let guard = step_engine::guard();
-        let pc = anon_pc(4);
+        let pc = { anon_pc(4) };
         let new_size = crate::vm::USER_PAGE_SIZE as u64;
-        let mut op = TruncateOp {
-            pc: &pc,
-            new_size,
-            guard: &guard,
-        };
+        // No outer epoch guard — `TruncateOp::step` acquires its own,
+        // per STEP_MODEL_v2 §1.
+        let mut op = TruncateOp { pc: &pc, new_size };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Outcome::done(()));
     }
@@ -985,16 +1024,11 @@ mod step_op_wraps {
     fn fallocate_op_anon_grow_returns_done() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup();
-        let guard = step_engine::guard();
         let pc = anon_pc(4);
         // pc.size_bytes() starts at 0 for a fresh Anon container, so growing
         // to one page exercises the fs_advanced = false → Done(()) arm.
         let new_size = crate::vm::USER_PAGE_SIZE as u64;
-        let mut op = FallocateOp {
-            pc: &pc,
-            new_size,
-            guard: &guard,
-        };
+        let mut op = FallocateOp { pc: &pc, new_size };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Outcome::done(()));
     }

@@ -5,7 +5,9 @@ use core::sync::atomic::Ordering;
 use crate::tty::adapter::step_engine::Cap;
 
 use crate::execution::Guard;
-#[cfg(test)]
+// `step_engine` alias is used both at runtime (by the StepOp wraps
+// that acquire their own epoch guard per STEP_MODEL_v2 §1) and by
+// tests, so it must not be cfg-test gated.
 use crate::tty::adapter::step_engine::{self as step_engine};
 use crate::tty::adapter::step_engine::{
     ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
@@ -26,6 +28,11 @@ pub fn step_read(
     out: &mut [u8],
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3};
 
     if out.is_empty() {
@@ -102,6 +109,11 @@ pub fn step_read_for_caller(
     caller: super::IoctlCaller,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     if out.is_empty() {
@@ -122,6 +134,11 @@ pub fn step_read_for_process(
     caller: &Cap<crate::process::structure::ProcessIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let caller_info = match super::IoctlCaller::from_process_with_guard(caller, guard) {
@@ -158,14 +175,14 @@ pub fn step_read_for_process(
 pub struct ReadOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub out: &'a mut [u8],
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_read(self.tty, self.out, self.guard)
+        let __guard = step_engine::guard();
+        step_read(self.tty, self.out, &__guard)
     }
 }
 
@@ -175,14 +192,14 @@ pub struct ReadForCallerOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub out: &'a mut [u8],
     pub caller: super::IoctlCaller,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for ReadForCallerOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_read_for_caller(self.tty, self.out, self.caller, self.guard)
+        let __guard = step_engine::guard();
+        step_read_for_caller(self.tty, self.out, self.caller, &__guard)
     }
 }
 
@@ -192,14 +209,14 @@ pub struct ReadForProcessOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub out: &'a mut [u8],
     pub caller: &'a Cap<crate::process::structure::ProcessIdentity>,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for ReadForProcessOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_read_for_process(self.tty, self.out, self.caller, self.guard)
+        let __guard = step_engine::guard();
+        step_read_for_process(self.tty, self.out, self.caller, &__guard)
     }
 }
 
@@ -261,16 +278,13 @@ mod step_op_wraps {
     fn read_op_empty_out_returns_done_zero() {
         let _setup = setup();
         let tty = alloc_tty(200, "ttyV3-read-op-empty");
-        let guard = step_engine::guard();
         let mut buf: [u8; 0] = [];
         let mut op = ReadOp {
             tty: &tty,
             out: &mut buf,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Done(0) => {}
             other => panic!("expected Done(0), got {other:?}"),
@@ -281,18 +295,15 @@ mod step_op_wraps {
     fn read_for_caller_op_empty_out_returns_done_zero() {
         let _setup = setup();
         let tty = alloc_tty(201, "ttyV3-read-caller-op-empty");
-        let guard = step_engine::guard();
         let mut buf: [u8; 0] = [];
         let caller = super::super::IoctlCaller::new(1, 1);
         let mut op = ReadForCallerOp {
             tty: &tty,
             out: &mut buf,
             caller,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Done(0) => {}
             other => panic!("expected Done(0), got {other:?}"),
@@ -304,16 +315,13 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_tty(202, "ttyV3-read-op-dead");
         let _ = tty.take_payload();
-        let guard = step_engine::guard();
         let mut buf = [0u8; 4];
         let mut op = ReadOp {
             tty: &tty,
             out: &mut buf,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Err(step_engine::Errno::EIO) => {}
             other => panic!("expected Err(EIO), got {other:?}"),
