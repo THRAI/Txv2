@@ -15,6 +15,7 @@ const DEFAULT_SENTINEL_TIMEOUT: Duration = Duration::from_secs(10);
 struct QemuOptions {
     expect_sentinel: bool,
     timeout: Duration,
+    smp: Option<usize>,
     /// Skip the busybox-profile virtio-blk drive wiring. Used by smoke
     /// runs that only need the initramfs to come up; it sidesteps the
     /// `mkfs.ext4` host-tool dependency.
@@ -81,10 +82,25 @@ fn qemu_options(args: &[String]) -> Result<QemuOptions> {
         })
         .transpose()?
         .unwrap_or(DEFAULT_SENTINEL_TIMEOUT);
+    let smp = optional_option_value(args, "--smp")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|err| format!("invalid --smp value '{value}': {err}"))
+                .and_then(|value| {
+                    if value == 0 {
+                        Err("--smp must be greater than zero".into())
+                    } else {
+                        Ok(value)
+                    }
+                })
+        })
+        .transpose()?;
 
     Ok(QemuOptions {
         expect_sentinel: args.iter().any(|arg| arg == "--expect-sentinel"),
         timeout,
+        smp,
         no_block: args.iter().any(|arg| arg == "--no-block"),
         interactive: args.iter().any(|arg| arg == "--interactive"),
     })
@@ -113,17 +129,7 @@ fn qemu_command(
         "-m".to_string(),
         qemu_memory(target).to_string(),
         "-smp".to_string(),
-        match target {
-            TxTarget::Rv64Qemu => "4",
-            TxTarget::La64Qemu => {
-                // LA64's current boot path expects the QEMU virt SMP
-                // shape; Debian QEMU 8.2.2 can SIGSEGV with this kernel
-                // under `-smp 1`, including interactive runs.
-                "4"
-            }
-            TxTarget::Rv64M1DockMock => "1",
-        }
-        .to_string(),
+        qemu_smp(target, options).to_string(),
         // Force multi-threaded TCG: vCPUs run on parallel host threads
         // instead of round-robin time-slicing on one host thread. Without
         // this, the boot smoke's BSP busy-spin for AP reactor task
@@ -172,20 +178,32 @@ fn qemu_command(
             .join("target")
             .join("images")
             .join(busybox_initramfs_name(target));
+        let cmdline = if target == TxTarget::Rv64M1DockMock {
+            "tx.profile=busybox tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0"
+        } else {
+            "tx.profile=busybox console=ttyS0"
+        };
         args.push("-initrd".into());
         args.push(initramfs.display().to_string());
         args.push("-append".into());
-        if target == TxTarget::Rv64M1DockMock {
-            args.push("tx.profile=busybox tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0".into());
-        } else {
-            args.push("tx.profile=busybox console=ttyS0".into());
+        args.push(cmdline.into());
+        if target == TxTarget::La64Qemu {
+            args.push("-fw_cfg".into());
+            args.push(format!("name=opt/tx.cmdline,string={cmdline}"));
+            args.push("-fw_cfg".into());
+            args.push(format!("name=opt/tx.initrd,file={}", initramfs.display()));
         }
     } else {
-        args.push("-append".into());
-        if target == TxTarget::Rv64M1DockMock {
-            args.push("tx.profile=smoke tx.board=m1dock-mock console=ttyS0".into());
+        let cmdline = if target == TxTarget::Rv64M1DockMock {
+            "tx.profile=smoke tx.board=m1dock-mock console=ttyS0"
         } else {
-            args.push("tx.profile=smoke console=ttyS0".into());
+            "tx.profile=smoke console=ttyS0"
+        };
+        args.push("-append".into());
+        args.push(cmdline.into());
+        if target == TxTarget::La64Qemu {
+            args.push("-fw_cfg".into());
+            args.push(format!("name=opt/tx.cmdline,string={cmdline}"));
         }
     }
 
@@ -226,6 +244,17 @@ fn qemu_command(
         profile.name()
     ));
     Ok(args)
+}
+
+fn qemu_smp(target: TxTarget, options: &QemuOptions) -> usize {
+    if let Some(smp) = options.smp {
+        return smp;
+    }
+
+    match target {
+        TxTarget::Rv64Qemu | TxTarget::La64Qemu => 4,
+        TxTarget::Rv64M1DockMock => 1,
+    }
 }
 
 fn qemu_cpu(target: TxTarget) -> Option<&'static str> {
@@ -591,6 +620,7 @@ mod tests {
         let options = QemuOptions {
             expect_sentinel: true,
             timeout: Duration::from_secs(10),
+            smp: None,
             no_block: false,
             interactive: false,
         };
@@ -617,6 +647,7 @@ mod tests {
         let options = QemuOptions {
             expect_sentinel: true,
             timeout: Duration::from_secs(10),
+            smp: None,
             no_block: false,
             interactive: false,
         };
@@ -635,7 +666,30 @@ mod tests {
         assert!(rendered.contains("-m 1152M"));
         assert!(rendered.contains("-smp 4"));
         assert!(rendered.contains("-serial file:target/qemu-la64-qemu-smoke.serial.log"));
+        assert!(
+            rendered.contains("-fw_cfg name=opt/tx.cmdline,string=tx.profile=smoke console=ttyS0")
+        );
         assert!(rendered.contains("tx-kernel-loongarch64-qemu-virt"));
+    }
+
+    #[test]
+    fn la64_qemu_command_accepts_smp_override() {
+        let options = QemuOptions {
+            expect_sentinel: true,
+            timeout: Duration::from_secs(10),
+            smp: Some(1),
+            no_block: false,
+            interactive: false,
+        };
+        let command = qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::La64Qemu,
+            Profile::Smoke,
+            &options,
+        )
+        .unwrap();
+
+        assert!(command.join(" ").contains("-smp 1"));
     }
 
     #[test]
@@ -643,6 +697,7 @@ mod tests {
         let options = QemuOptions {
             expect_sentinel: false,
             timeout: Duration::from_secs(10),
+            smp: None,
             no_block: false,
             interactive: false,
         };
@@ -657,6 +712,9 @@ mod tests {
 
         assert!(rendered.contains("-device virtio-blk-pci-non-transitional,drive=txblk0,rombar=0"));
         assert!(!rendered.contains("virtio-blk-device,drive=txblk0"));
+        assert!(rendered
+            .contains("-fw_cfg name=opt/tx.cmdline,string=tx.profile=busybox console=ttyS0"));
+        assert!(rendered.contains("-fw_cfg name=opt/tx.initrd,file=/tmp/tx/target/images/busybox-initramfs-la64-qemu.cpio"));
         assert!(rendered.contains(
             "-drive driver=raw,file.driver=file,file.filename=target/images/busybox-root-la64-qemu.ext4,file.locking=off,if=none,id=txblk0,read-only=on"
         ));

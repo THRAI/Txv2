@@ -34,17 +34,14 @@ pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
-        YieldShape,
-        Errno, InterestMask, NoProgress, OneShotStepOp, RestrictionStackHandle, ScriptCtx,
-        StepOp, StepOutcome, SubjectIdentity, WaitSourceId, drive_oneshot,
+        drive_oneshot, Errno, InterestMask, NoProgress, OneShotStepOp, RestrictionStackHandle,
+        ScriptCtx, StepOp, StepOutcome, SubjectIdentity, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        sign, sign_for, reserve_for, register_zone_for,
-        Cap, PayloadCap, Weak, IdentRef,
-        Dead, ZoneError,
-        Entity, CoLocatedEntity, OperationalCapExt, OperationalRefExt, PayloadBinding,
-        Zone, ZoneAllocated,
-        IdentitySlot, IsPayloadPolicy, CapProducingPolicy, ObserverNodePolicy, PayloadPolicy, RetainedEntityPolicy, ZonePolicy,
+        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
+        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
+        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
+        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
     pub use tx_substrate::{AtomicSlot, SpinMutex};
 }
@@ -68,9 +65,13 @@ pub mod wait_routing {
         MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
     };
 
-    /// Delegates to `tx_substrate::wake::new_source`.
+    /// Delegates to `tx_substrate::wake::new_source`. Also registers
+    /// the source in the global registry so the driver can look it up
+    /// by [`WaitSourceId`] during yield resolution.
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
-        tx_substrate::wake::new_source(source_id)
+        let source = tx_substrate::wake::new_source(source_id);
+        tx_substrate::wake::register_source(Arc::clone(&source));
+        source
     }
 
     /// Delegates to `tx_reactor::wait::fire_legacy`.

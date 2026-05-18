@@ -104,7 +104,14 @@ fn on_agent_shape() -> YieldShape {
 fn drive_done_immediately_returns_value() {
     let op = MockStepOp::new([StepOutcome::Done(42u32)]);
     let mut ctx = empty_ctx();
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, None, None, None));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Waiting,
+        None,
+        None,
+        None,
+    ));
     assert_eq!(result, Ok(42u32));
 }
 
@@ -116,7 +123,14 @@ fn drive_done_immediately_returns_value() {
 fn drive_err_surfaces_error() {
     let op = MockStepOp::new([StepOutcome::Err(Errno::ENOENT)]);
     let mut ctx = empty_ctx();
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, None, None, None));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Waiting,
+        None,
+        None,
+        None,
+    ));
     assert_eq!(result, Err(Errno::ENOENT));
 }
 
@@ -124,7 +138,14 @@ fn drive_err_surfaces_error() {
 fn drive_err_surfaces_einval() {
     let op = MockStepOp::new([StepOutcome::Err(Errno::EINVAL)]);
     let mut ctx = empty_ctx();
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Nonblocking, None, None, None));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Nonblocking,
+        None,
+        None,
+        None,
+    ));
     assert_eq!(result, Err(Errno::EINVAL));
 }
 
@@ -143,7 +164,14 @@ fn drive_yield_on_wait_source_nonblocking_no_progress_returns_eagain() {
     }]);
     let mut ctx = empty_ctx();
     // Nonblocking + no progress → Translate(Eagain) → Err(EAGAIN)
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Nonblocking, None, None, None));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Nonblocking,
+        None,
+        None,
+        None,
+    ));
     assert_eq!(result, Err(Errno::EAGAIN));
 }
 
@@ -160,7 +188,14 @@ fn drive_yield_on_agent_nonblocking_returns_eagain() {
     }]);
     let mut ctx = empty_ctx();
     // Nonblocking + no progress → Translate(Eagain) → Err(EAGAIN)
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Nonblocking, None, None, None));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Nonblocking,
+        None,
+        None,
+        None,
+    ));
     assert_eq!(result, Err(Errno::EAGAIN));
 }
 
@@ -181,7 +216,14 @@ fn drive_continue_then_done_retries_loop() {
         StepOutcome::Done(99u32),
     ]);
     let mut ctx = empty_ctx();
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, None, None, None));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Waiting,
+        None,
+        None,
+        None,
+    ));
     assert_eq!(result, Ok(99u32));
 }
 
@@ -235,7 +277,14 @@ fn drive_selecting_on_agent_returns_enosys() {
     }]);
     let mut ctx = empty_ctx();
     // Selecting + OnAgent → Translate(UnsupportedShape) → Err(ENOSYS)
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Selecting, None, None, None));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Selecting,
+        None,
+        None,
+        None,
+    ));
     assert_eq!(result, Err(Errno::ENOSYS));
 }
 
@@ -257,7 +306,14 @@ fn drive_waiting_on_wait_source_unregistered_token_retries() {
         StepOutcome::Done(42),
     ]);
     let mut ctx = empty_ctx();
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, None, None, None));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Waiting,
+        None,
+        None,
+        None,
+    ));
     assert_eq!(result, Ok(42));
 }
 
@@ -351,5 +407,3 @@ fn drive_yield_on_wait_source_with_mailbox_resolves_on_pre_posted_event() {
     ));
     assert_eq!(result, Ok(99u32));
 }
-
-

@@ -16,10 +16,10 @@ pub mod step_engine {
     };
     pub use tx_substrate::wake::WaitSource;
     pub use tx_substrate::zone::{
-        sign, sign_for, reserve_for, Cap, PayloadCap, Weak, IdentRef, Dead, ZoneError, Entity,
-        CoLocatedEntity, OperationalCapExt, OperationalRefExt, PayloadBinding, Zone, ZoneAllocated,
-        IdentitySlot, IsPayloadPolicy, CapProducingPolicy, ObserverNodePolicy, PayloadPolicy,
-        RetainedEntityPolicy, ZonePolicy,
+        reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity, Dead, Entity,
+        IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy, OperationalCapExt,
+        OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy, RetainedEntityPolicy, Weak,
+        Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
     pub use tx_substrate::SpinMutex;
 

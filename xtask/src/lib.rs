@@ -20,6 +20,8 @@ mod lint_invariants_step_v3;
 mod lint_invariants_subj;
 mod lint_invariants_syscall;
 mod lint_invariants_witness;
+#[path = "lint_step_guard.rs"]
+mod lint_step_guard;
 mod observe;
 mod observe_discipline;
 mod oscomp;
@@ -84,7 +86,7 @@ fn print_usage() {
            cargo xtask ci-slow\n\
            cargo xtask check\n\
            cargo xtask build --target rv64-qemu|rv64-m1dock-mock|la64-qemu|all\n\
-           cargo xtask qemu --target rv64-qemu|rv64-m1dock-mock|la64-qemu --profile smoke|busybox [--dry-run] [--expect-sentinel] [--timeout-ms N] [--no-block] [--interactive]\n\
+           cargo xtask qemu --target rv64-qemu|rv64-m1dock-mock|la64-qemu --profile smoke|busybox [--dry-run] [--expect-sentinel] [--timeout-ms N] [--smp N] [--no-block] [--interactive]\n\
            cargo xtask test [smoke|busybox-boot] [--target rv64-qemu] [--timeout-ms N] [--dry-run] [--trap-trace]\n\
            cargo xtask fault-decode --target rv64-qemu [--elf PATH] [--serial PATH [--all] | --scause HEX --sepc HEX --stval HEX | --addr HEX]\n\
            cargo xtask trap-trace --serial PATH [--syscalls | --raw]\n\

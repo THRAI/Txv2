@@ -37,11 +37,39 @@ where
 /// type without depending on the full `tx_ext4` lib.
 pub type Ext4MountWire = MountedExt4<tx_ext4_format::pager::Page4K>;
 
+/// Mount an ext4 image read-only.
+///
+/// Every mutating `FsOps` call against the returned `MountedExt4`
+/// returns `EROFS`, mirroring Linux `MS_RDONLY`. Use this for media
+/// that must not be modified (initramfs overlays, sealed boot
+/// images, recovery partitions).
 pub fn mount_ext4_read_only<I>(image: I) -> Result<MountedExt4<I>, Errno>
 where
     I: BlockImage + Send + 'static,
 {
-    let backend = Ext4FsInstance::open(image)?;
+    open_ext4(image, true)
+}
+
+/// Mount an ext4 image read-write.
+///
+/// `FsOps::create_inode` / `mkdir` / `unlink` / `rename` / `link`
+/// flow through the existing pager surface
+/// (`tx_ext4_format::pager::create_regular_file` etc.) and persist
+/// via `BlockImage::write_block`. Crash-consistency guarantees match
+/// the format crate's current journaling story — sufficient for a
+/// graceful unmount but not against a hard power loss.
+pub fn mount_ext4_read_write<I>(image: I) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    open_ext4(image, false)
+}
+
+fn open_ext4<I>(image: I, read_only: bool) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    let backend = Ext4FsInstance::open(image, read_only)?;
     let root_fs_object_id = FsObjectId::new(EXT4_ROOT_INODE as u64);
     let root_inode_meta = backend
         .with_pager(|pager| pager.inode_meta(tx_ext4_format::pager::InodeNo::new(EXT4_ROOT_INODE)))

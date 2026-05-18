@@ -70,6 +70,15 @@ pub struct RawPortSubscription {
     port: RawPort,
     id: Option<SubscriptionId>,
     terminal_snapshot: bool,
+    /// Retain the mailbox built by `subscribe_with_waker` for legacy
+    /// tests so its `Weak` reference stays upgradeable for the lifetime
+    /// of the subscription.
+    _waker_mailbox: Option<Arc<TaskMailbox>>,
+    /// Has the deprecated `take_ready` already consumed the
+    /// terminal-state edge? Tracks the one-shot "subscription became
+    /// terminal" signal so legacy callers see a single `true` on the
+    /// first `take_ready` after the wire retires.
+    terminal_observed: bool,
 }
 
 impl RawPort {
@@ -100,7 +109,9 @@ impl RawPort {
         let mailbox = Arc::new(TaskMailbox::new());
         mailbox.register_waker(waker);
         let gen = mailbox.next_generation();
-        self.subscribe(interest, Arc::downgrade(&mailbox), gen)
+        let mut sub = self.subscribe(interest, Arc::downgrade(&mailbox), gen);
+        sub._waker_mailbox = Some(mailbox);
+        sub
     }
 
     /// Compatibility bridge: see [`RawQueue::try_subscribe_with_waker`].
@@ -112,14 +123,21 @@ impl RawPort {
         let mailbox = Arc::new(TaskMailbox::new());
         mailbox.register_waker(waker);
         let gen = mailbox.next_generation();
-        self.try_subscribe(interest, Arc::downgrade(&mailbox), gen)
+        let mut sub = self.try_subscribe(interest, Arc::downgrade(&mailbox), gen)?;
+        sub._waker_mailbox = Some(mailbox);
+        Ok(sub)
     }
 
     pub const fn from_static(storage: &'static StaticRawPort) -> Self {
         storage.raw()
     }
 
-    pub fn subscribe(&self, interest: u64, mailbox: Weak<TaskMailbox>, generation: WaitGeneration) -> RawPortSubscription {
+    pub fn subscribe(
+        &self,
+        interest: u64,
+        mailbox: Weak<TaskMailbox>,
+        generation: WaitGeneration,
+    ) -> RawPortSubscription {
         let mut state = self.state.lock();
         if state.terminal {
             drop(state);
@@ -134,6 +152,8 @@ impl RawPort {
                 port: self.clone(),
                 id: None,
                 terminal_snapshot: true,
+                _waker_mailbox: None,
+                terminal_observed: false,
             };
         }
 
@@ -173,6 +193,8 @@ impl RawPort {
             port: self.clone(),
             id: Some(id),
             terminal_snapshot: false,
+            _waker_mailbox: None,
+            terminal_observed: false,
         }
     }
 
@@ -195,10 +217,10 @@ impl RawPort {
 
             let interests = InterestMask::new(event);
             for subscriber in &mut state.subscribers {
-                if subscriber.interest & event != 0 {
-                    if post_source_fired(subscriber, source, interests) {
-                        woke += 1;
-                    }
+                if subscriber.interest & event != 0
+                    && post_source_fired(subscriber, source, interests)
+                {
+                    woke += 1;
                 }
             }
         }
@@ -303,6 +325,7 @@ impl RawPort {
         }
     }
 
+    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
     fn take_ready(&self, id: SubscriptionId) -> Result<bool, RawSubscriptionError> {
         let state = self.state.lock();
         if state.terminal {
@@ -397,7 +420,12 @@ impl<E: WireEventSet> DeclaredPort<E> {
         })
     }
 
-    pub fn subscribe(&self, interest: E, mailbox: Weak<TaskMailbox>, generation: WaitGeneration) -> DeclaredPortSubscription<E> {
+    pub fn subscribe(
+        &self,
+        interest: E,
+        mailbox: Weak<TaskMailbox>,
+        generation: WaitGeneration,
+    ) -> DeclaredPortSubscription<E> {
         let bits = self
             .validated_bits(interest)
             .expect("typed bus port subscription must use declared bits");
@@ -516,7 +544,7 @@ impl<E: WireEventSet> DeclaredPortSubscription<E> {
     pub fn update_with_waker(&mut self, interest: E, waker: Waker) {
         let bits = interest.bits();
         let _ = self.declaration.validate_bits(bits);
-        let _ = self.raw.update_with_waker(bits, waker);
+        self.raw.update_with_waker(bits, waker);
     }
 
     pub fn try_update(
@@ -579,7 +607,12 @@ impl RawPortSubscription {
         }
     }
 
-    pub fn update(&mut self, interest: u64, mailbox: Weak<TaskMailbox>, generation: WaitGeneration) {
+    pub fn update(
+        &mut self,
+        interest: u64,
+        mailbox: Weak<TaskMailbox>,
+        generation: WaitGeneration,
+    ) {
         let _ = self.try_update(interest, mailbox, generation);
     }
 
@@ -597,12 +630,22 @@ impl RawPortSubscription {
         let mailbox = Arc::new(TaskMailbox::new());
         mailbox.register_waker(waker);
         let gen = mailbox.next_generation();
-        self.try_update(interest, Arc::downgrade(&mailbox), gen)
+        self.try_update(interest, Arc::downgrade(&mailbox), gen)?;
+        self._waker_mailbox = Some(mailbox);
+        self.terminal_observed = false;
+        Ok(())
     }
 
-    pub fn try_update(&mut self, interest: u64, mailbox: Weak<TaskMailbox>, generation: WaitGeneration) -> Result<(), RawSubscriptionError> {
+    pub fn try_update(
+        &mut self,
+        interest: u64,
+        mailbox: Weak<TaskMailbox>,
+        generation: WaitGeneration,
+    ) -> Result<(), RawSubscriptionError> {
         match self.id {
-            Some(id) => self.port.update_subscription(id, interest, mailbox, generation),
+            Some(id) => self
+                .port
+                .update_subscription(id, interest, mailbox, generation),
             None if self.terminal_snapshot => Err(RawSubscriptionError::Terminal),
             None => Err(RawSubscriptionError::Unsubscribed),
         }
@@ -610,15 +653,35 @@ impl RawPortSubscription {
 
     #[deprecated(note = "use TaskMailbox::poll() + ActiveWait::matches() instead")]
     pub fn take_ready(&mut self) -> bool {
+        if let Some(mb) = self._waker_mailbox.as_ref() {
+            while let Some(event) = mb.poll() {
+                if matches!(
+                    event,
+                    crate::wake::mailbox::MailboxEvent::SourceFired { .. }
+                ) {
+                    return true;
+                }
+            }
+        }
+        // Legacy one-shot terminal edge: if the wire has retired
+        // since we last observed, surface a `true` once.
+        if !self.terminal_observed && self.state() == RawSubscriptionState::Terminal {
+            self.terminal_observed = true;
+            return true;
+        }
         false
     }
 
     #[deprecated(note = "see take_ready")]
     pub fn try_take_ready(&mut self) -> Result<bool, RawSubscriptionError> {
-        match self.id {
-            Some(_) => Ok(false),
-            None if self.terminal_snapshot => Err(RawSubscriptionError::Terminal),
-            None => Err(RawSubscriptionError::Unsubscribed),
+        match self.state() {
+            RawSubscriptionState::Subscribed =>
+            {
+                #[allow(deprecated)]
+                Ok(self.take_ready())
+            }
+            RawSubscriptionState::Terminal => Err(RawSubscriptionError::Terminal),
+            RawSubscriptionState::Unsubscribed => Err(RawSubscriptionError::Unsubscribed),
         }
     }
 }

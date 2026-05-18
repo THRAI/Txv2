@@ -115,9 +115,25 @@ fn oscomp_submit(root: &Path, args: &[String]) -> Result<()> {
         .map(PathBuf::from)
         .map(|path| resolve_path(root, path))
         .unwrap_or_else(|| root.join("target").join("oscomp").join("submit"));
+    let target = optional_option_value(args, "--target")
+        .map(|value| TxTarget::parse(&value))
+        .transpose()?;
     fs::create_dir_all(&submit).map_err(|err| err.to_string())?;
-    copy_kernel_for_oscomp(root, TxTarget::Rv64Qemu, &submit.join("kernel-rv"))?;
-    copy_kernel_for_oscomp(root, TxTarget::La64Qemu, &submit.join("kernel-la"))?;
+    match target {
+        Some(TxTarget::Rv64Qemu) => {
+            copy_kernel_for_oscomp(root, TxTarget::Rv64Qemu, &submit.join("kernel-rv"))?;
+        }
+        Some(TxTarget::La64Qemu) => {
+            copy_kernel_for_oscomp(root, TxTarget::La64Qemu, &submit.join("kernel-la"))?;
+        }
+        Some(TxTarget::Rv64M1DockMock) => {
+            return Err("OSComp submit supports rv64-qemu and la64-qemu".into());
+        }
+        None => {
+            copy_kernel_for_oscomp(root, TxTarget::Rv64Qemu, &submit.join("kernel-rv"))?;
+            copy_kernel_for_oscomp(root, TxTarget::La64Qemu, &submit.join("kernel-la"))?;
+        }
+    }
     println!("prepared OSComp submit dir at {}", submit.display());
     Ok(())
 }
@@ -197,7 +213,7 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
                 "default".into(),
                 "-drive".into(),
                 format!(
-                    "file={},if=none,format=raw,id=x0",
+                    "file={},if=none,format=raw,id=x0,file.locking=off",
                     data.join("sdcard-rv.img").display()
                 ),
                 "-device".into(),
@@ -228,7 +244,7 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
                 "1".into(),
                 "-drive".into(),
                 format!(
-                    "file={},if=none,format=raw,id=x0",
+                    "file={},if=none,format=raw,id=x0,file.locking=off",
                     data.join("sdcard-la.img").display()
                 ),
                 "-device".into(),

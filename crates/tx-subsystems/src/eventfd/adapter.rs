@@ -15,18 +15,16 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::{
-        ByteProgress, Errno as V3Errno, InterestMask, NoProgress, OneShotStepOp,
+        drive_oneshot, ByteProgress, Errno as V3Errno, InterestMask, NoProgress, OneShotStepOp,
         ProcessIdentity, ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity,
-        WaitSourceId, YieldShape, drive_oneshot,
+        WaitSourceId, YieldShape,
     };
     pub use tx_substrate::wake::WaitSource;
     pub use tx_substrate::zone::{
-        sign, sign_for, reserve_for,
-        Cap, PayloadCap, Weak, IdentRef,
-        Dead, ZoneError,
-        Entity, CoLocatedEntity, OperationalCapExt, OperationalRefExt, PayloadBinding,
-        Zone, ZoneAllocated,
-        IdentitySlot, IsPayloadPolicy, CapProducingPolicy, ObserverNodePolicy, PayloadPolicy, RetainedEntityPolicy, ZonePolicy,
+        reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity, Dead, Entity,
+        IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy, OperationalCapExt,
+        OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy, RetainedEntityPolicy, Weak,
+        Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
     pub use tx_substrate::SpinMutex;
 
@@ -75,7 +73,9 @@ pub mod wait_routing {
     pub use tx_substrate::wake::WaitSource;
 
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
-        tx_substrate::wake::new_source(source_id)
+        let source = tx_substrate::wake::new_source(source_id);
+        tx_substrate::wake::register_source(Arc::clone(&source));
+        source
     }
 
     pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) -> usize {

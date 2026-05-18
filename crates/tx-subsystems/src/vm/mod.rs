@@ -11,9 +11,9 @@ pub mod adapter;
 pub mod checks;
 pub mod execution;
 mod pmap;
-pub mod step_ops;
 pub mod project;
 pub mod scripts;
+pub mod step_ops;
 mod structure;
 mod user_access;
 

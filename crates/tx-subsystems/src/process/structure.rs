@@ -27,7 +27,6 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::process::adapter::step_engine::{
@@ -38,10 +37,12 @@ use crate::process::adapter::wait_routing::{self, Channel, Mask, WaitSource};
 
 use crate::cred::{Cred, Gid, Uid};
 use crate::execution::WaitToken;
+use crate::process::topology::{
+    ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers,
+};
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::thread_runtime::ThreadIdentity;
 use crate::tty::structure::identity::TtyIdentity;
-use crate::process::topology::{ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers};
 use crate::vfs::{DEntry, OpenFile};
 use crate::vm::AddressSpace;
 
@@ -286,7 +287,11 @@ impl ProcessIdentity {
 
     /// Process state char for /proc/<pid>/stat.
     pub fn state_char(&self) -> u8 {
-        if self.is_zombie() { b'Z' } else { b'R' }
+        if self.is_zombie() {
+            b'Z'
+        } else {
+            b'R'
+        }
     }
 
     /// Process command-line (delegates to payload).
@@ -363,16 +368,13 @@ impl ProcessIdentity {
             .lock()
             .as_ref()
             .map(|p| p.comm())
-            .unwrap_or([b'?', 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0])
+            .unwrap_or([b'?', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
     }
 
     /// Process command-line (for `/proc/<pid>/cmdline`). Returns
     /// `None` for zombies (no payload) or when no cmdline was set.
     pub fn cmdline(&self) -> Option<alloc::vec::Vec<u8>> {
-        self.payload
-            .lock()
-            .as_ref()
-            .and_then(|p| p.cmdline())
+        self.payload.lock().as_ref().and_then(|p| p.cmdline())
     }
 
     /// Process executable file DEntry (for `/proc/<pid>/exe`).
@@ -643,8 +645,8 @@ impl ProcessIdentity {
     pub fn nth_thread(&self, idx: usize) -> Option<Cap<ThreadIdentity>> {
         let payload_guard = self.payload.lock();
         let payload = payload_guard.as_ref()?;
-        let result = payload.threads.nth(idx);
-        result
+
+        payload.threads.nth(idx)
     }
 
     /// Carrier id under which this process's `exit_source` channel is
@@ -675,7 +677,7 @@ impl ProcessIdentity {
         self.payload
             .lock()
             .as_ref()
-            .map_or(true, |p| p.vfork_done.load(Ordering::Acquire))
+            .is_none_or(|p| p.vfork_done.load(Ordering::Acquire))
     }
 
     /// Build the `WaitToken` an awaiter parks on while waiting for any
@@ -811,7 +813,9 @@ pub struct TargetProcCred {
 /// Group-exit coordination state (PROCESS_v1 §5).
 #[derive(Debug)]
 pub(crate) struct GroupExitState {
+    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
     pub status: ExitStatus,
+    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
     pub is_exec: bool,
     pub remaining_threads: AtomicU32,
 }
@@ -1074,6 +1078,13 @@ impl ProcessPayload {
         }
     }
 
+    /// Register a [`core::task::Waker`] to be fired when this process
+    /// next reaches `notify_vfork_done`. Overwrites any prior waker.
+    /// Used by the `CLONE_VFORK` parent-park loop in the syscall arm.
+    pub fn store_vfork_waiter(&self, waker: core::task::Waker) {
+        *self.vfork_waiter.lock() = Some(waker);
+    }
+
     /// Snapshot the current address-space `Cap` out of the
     /// `AtomicSlot<Cap<AddressSpace>>` slot. Panics if the slot is
     /// empty — by construction the initial state is always populated
@@ -1177,6 +1188,17 @@ impl ProcessPayload {
         }
     }
 
+    /// Remove every fd from this payload and return the detached table.
+    ///
+    /// Process exit must close all open file descriptions before the
+    /// payload itself becomes unreachable. In particular, pipe EOF/EPIPE
+    /// publication is driven from `OpenFile` drop hooks, so exit paths
+    /// need a concrete fd-table drain rather than waiting for the whole
+    /// payload to disappear later through EBR.
+    pub(crate) fn drain_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
+        core::mem::take(&mut *self.fds.lock())
+    }
+
     /// Snapshot the entire fd table as a fresh `BTreeMap`. Each
     /// populated entry's `Cap<OpenFile>` is `.clone()`'d so the
     /// snapshot does not borrow the lock; callers can drop the result
@@ -1199,6 +1221,27 @@ impl ProcessPayload {
     /// Executable DEntry (for `/proc/<pid>/exe` symlink target).
     pub fn exe_file(&self) -> Option<Cap<DEntry>> {
         self._exe_file.lock().clone()
+    }
+
+    /// EXEC Phase 5 — install the group-exit state that collapses every
+    /// sibling thread of the calling process. Returns `true` if more
+    /// than one thread was live and the group_exit slot was populated;
+    /// `false` if the process was single-threaded and no collapse is
+    /// needed. `txdoc:EXEC-10-COLLAPSE-OLD-AS-WORK`.
+    pub fn install_exec_group_exit(&self) -> bool {
+        let n = self
+            .thread_count
+            .load(core::sync::atomic::Ordering::Acquire);
+        if n > 1 {
+            *self.group_exit.lock() = Some(GroupExitState {
+                status: ExitStatus::Exited(0),
+                is_exec: true,
+                remaining_threads: AtomicU32::new(n - 1),
+            });
+            true
+        } else {
+            false
+        }
     }
 
     /// Process short name comm (for `/proc/<pid>/stat`).
@@ -1431,12 +1474,10 @@ impl Session {
         guard: &step_engine::Guard<'_>,
     ) -> Option<Cap<ProcessGroup>> {
         let leader_pgid = Pgid(self.sid.0);
-        for pgrp in self.members.snapshot_live(guard) {
-            if pgrp.pgid == leader_pgid {
-                return Some(pgrp);
-            }
-        }
-        None
+        self.members
+            .snapshot_live(guard)
+            .into_iter()
+            .find(|pgrp| pgrp.pgid == leader_pgid)
     }
 }
 
@@ -1470,7 +1511,7 @@ unsafe impl ZoneAllocated for Session {
     }
 }
 
-/// Simple atomic PID allocator. PID 1 is reserved for init; allocator
+// Simple atomic PID allocator. PID 1 is reserved for init; allocator
 // PID/TID allocation moved to `crate::process::numbers`.
 
 #[cfg(any(test, feature = "test-support"))]

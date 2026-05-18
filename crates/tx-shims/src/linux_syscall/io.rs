@@ -6,7 +6,6 @@
 use super::*;
 use crate::adapter::reactor_entry;
 use crate::adapter::step_engine::Cap;
-use crate::adapter::step_engine::{self as step_engine};
 
 fn tty_readable_level(tty: &Cap<tx_subsystems::tty::structure::TtyIdentity>) -> bool {
     use tx_subsystems::tty::execution::TTY_READABLE;
@@ -102,7 +101,10 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
 }
 
 /// `readv(fd, iov, iovcnt)` — scatter-read counterpart of `sys_writev`.
-pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let iov_ptr = args[1];
     let iovcnt = args[2] as i32;
 
@@ -131,7 +133,7 @@ pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(args: [u64; 6], ctx: &Sysca
         }
 
         let read_args = [args[0], base, len, 0, 0, 0];
-        match sys_read(read_args, ctx).await {
+        match sys_read::<P>(read_args, ctx).await {
             SyscallResult::Return(n) => {
                 total += n;
                 if (n as u64) < len {
@@ -247,10 +249,8 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                             if tty_readable_level(tty) {
                                 revents |= POLLIN;
                             } else if park_source.is_none() {
-                                park_source = Some((
-                                    file.rnode().read_wait_source_id(),
-                                    POLLIN as u64,
-                                ));
+                                park_source =
+                                    Some((file.rnode().read_wait_source_id(), POLLIN as u64));
                             }
                         } else {
                             revents |= POLLIN;
@@ -287,18 +287,17 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         // drive-taskmb: park on the fd's WaitSource via drive() +
         // PpollOp. The driver registers the task mailbox with the
         // WaitSource, parks, and wakes when the fd fires.
-        use crate::adapter::step_engine as step_engine;
+        use crate::adapter::step_engine;
         use step_engine::{InterestMask, WaitSourceId};
-        use tx_substrate::step::DriveMode;
         use tx_scripts::drive;
+        use tx_substrate::step::DriveMode;
 
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mailbox_arc = script_ctx.mailbox().cloned();
         let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-        let guard = step_engine::guard();
-        let mut op = tx_subsystems::vfs::composite::PpollOp {
-            guard: &guard,
+        let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+        // PpollOp does not need an epoch guard (`yield → park` only).
+        let op = tx_subsystems::vfs::composite::PpollOp {
             wait_source_id: WaitSourceId::new(source_id),
             interests: InterestMask::new(interests),
             timeout_ms: None,
@@ -374,12 +373,14 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // `step()` calls (cursor tracked internally by
     // `OpenFileWriteOp`). After `drive()` returns, the return
     // value is the total bytes written.
-    use step_engine::StepOp;
+
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
     use tx_subsystems::vfs::execution::OpenFileWriteOp;
     let mut script_ctx = build_subject_script_ctx(ctx);
-    let guard = step_engine::guard();
+    // The op acquires its own epoch guard inside `step()` per
+    // STEP_MODEL_v2 §1; the syscall handler must not hold a guard
+    // across `drive(...).await` (INVARIANTS_v5 YIELD-5 / EBR-7).
     let mode = if file.flags().nonblocking {
         DriveMode::Nonblocking
     } else {
@@ -388,13 +389,21 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    let mut op = OpenFileWriteOp {
+    let op = OpenFileWriteOp {
         file: &file,
         bytes: &bytes,
-        guard: &guard,
         cursor: 0,
     };
-    match drive(op, &mut script_ctx, mode, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
+    match drive(
+        op,
+        &mut script_ctx,
+        mode,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
         Ok(total) => SyscallResult::Return(total as i64),
         Err(v3errno) => {
             let errno: tx_subsystems::execution::Errno = v3errno.into();
@@ -403,7 +412,8 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             // `-EPIPE` to userspace.
             if errno == tx_subsystems::execution::Errno::EPIPE {
                 let _ = tx_subsystems::signal::step_kill_process(
-                    &ctx.process, tx_subsystems::signal::Signum::SIGPIPE,
+                    &ctx.process,
+                    tx_subsystems::signal::Signum::SIGPIPE,
                     None,
                 );
             }
@@ -427,7 +437,10 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// TTY's wait `Channel`. On any partial progress (`total > 0`)
 /// the dispatcher returns what it has rather than block again,
 /// matching `sys_write`'s partial-success policy.
-pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let fd = args[0] as i32;
     let buf_ptr = args[1] as usize;
     let len = args[2] as usize;
@@ -486,12 +499,13 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(args: [u64; 6], ctx: &Syscal
     // in `OpenFileReadOp` tracks the fill position across successive
     // `step()` calls; after drive() returns, copy the accumulated
     // bytes to userspace in a single pass.
-    use step_engine::StepOp;
+
+    use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
     use tx_subsystems::vfs::execution::OpenFileReadOp;
-    use tx_scripts::drive;
     let mut script_ctx = build_subject_script_ctx(ctx);
-    let guard = step_engine::guard();
+    // The op acquires its own epoch guard inside `step()` (STEP_MODEL_v2
+    // §1, INVARIANTS_v5 YIELD-5 / EBR-7); no guard crosses `.await`.
     let mode = if file.flags().nonblocking {
         DriveMode::Nonblocking
     } else {
@@ -500,20 +514,26 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(args: [u64; 6], ctx: &Syscal
     let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    let mut op = OpenFileReadOp {
+    let op = OpenFileReadOp {
         file: &file,
         out: &mut staging,
-        guard: &guard,
         cursor: 0,
     };
-    match drive(op, &mut script_ctx, mode, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
+    match drive(
+        op,
+        &mut script_ctx,
+        mode,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
         Ok(total) => {
             if total > 0 {
-                if let Err(errno) = bootstrap_copy_to_user(
-                    &ctx.aspace,
-                    buf_ptr as u64,
-                    &staging[..total],
-                ) {
+                if let Err(errno) =
+                    bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..total])
+                {
                     return SyscallResult::Error(errno_to_i32(errno));
                 }
             }
@@ -522,6 +542,6 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(args: [u64; 6], ctx: &Syscal
         Err(v3errno) => {
             let errno: tx_subsystems::execution::Errno = v3errno.into();
             SyscallResult::Error(errno_to_i32(errno))
-        },
+        }
     }
 }

@@ -13,15 +13,12 @@ use crate::Result;
 
 /// Ratchet ceiling: number of `_ctx: &mut ScriptCtx` occurrences.
 /// Will be set to measured baseline after first run.
-const MAX_IGNORED_SCRIPTCTX: usize = 118; // 79→80: InodeStatOp VFS StepOp wrap
+const MAX_IGNORED_SCRIPTCTX: usize = 120; // 118→120: vfs-full-bringup merge added bdev-fs/ext4 StepOp wraps
 
 pub(crate) fn lint_invariants_subject_context(root: &Path) -> Result<()> {
     let mut ignored: Vec<String> = Vec::new();
 
-    let target_dirs = [
-        "crates/tx-subsystems/src",
-        "crates/tx-shims/src",
-    ];
+    let target_dirs = ["crates/tx-subsystems/src", "crates/tx-shims/src"];
 
     for dir in &target_dirs {
         let dir_path = root.join(dir);
@@ -45,7 +42,8 @@ pub(crate) fn lint_invariants_subject_context(root: &Path) -> Result<()> {
                 }
 
                 // Also catch: free functions that take `_ctx` parameter
-                if line.contains("fn step_") && line.contains("_ctx") && line.contains("ScriptCtx") {
+                if line.contains("fn step_") && line.contains("_ctx") && line.contains("ScriptCtx")
+                {
                     ignored.push(format!(
                         "{rel}:{} — step_* fn with _ctx: ScriptCtx (SUBJ-1)",
                         line_num + 1
@@ -60,7 +58,11 @@ pub(crate) fn lint_invariants_subject_context(root: &Path) -> Result<()> {
     println!("Invariants Lint — subject-context (SUBJ-1)");
     println!("===========================================");
 
-    let status = if count > MAX_IGNORED_SCRIPTCTX { "OVER" } else { "ok" };
+    let status = if count > MAX_IGNORED_SCRIPTCTX {
+        "OVER"
+    } else {
+        "ok"
+    };
     println!(
         "_ctx: &mut ScriptCtx occurrences: {:>4}  (ceiling {})  {}",
         count, MAX_IGNORED_SCRIPTCTX, status

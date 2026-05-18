@@ -28,8 +28,8 @@ extern crate alloc;
 use std::sync::{LazyLock, Mutex};
 
 use tx_hal::{
-    Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
+    Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
 use tx_shims::adapter::step_engine::Cap;
 use tx_subsystems::cross_crate_test_support::{
@@ -45,6 +45,11 @@ use tx_shims::linux_syscall::{build_subject_script_ctx, SyscallCtx};
 // -------- Stub pmap (lifted from tx-shims tests.rs) ----------------
 
 struct StubPmap;
+
+impl PlatformConfig for StubPmap {
+    const ARCH: Arch = Arch::Riscv64;
+    const BOARD: &'static str = "shims-v3-test";
+}
 
 #[derive(Default)]
 struct StubPmapState {
@@ -95,6 +100,7 @@ impl PmapIf for StubPmap {
 }
 
 impl EntropyIf for StubPmap {}
+impl tx_hal::AuxvIf for StubPmap {}
 
 // -------- Setup -----------------------------------------------------
 

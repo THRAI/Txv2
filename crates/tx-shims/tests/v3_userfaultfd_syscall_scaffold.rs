@@ -28,8 +28,8 @@ use core::task::{Context, Poll, Waker};
 use std::sync::{LazyLock, Mutex};
 
 use tx_hal::{
-    Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
+    Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
 };
 use tx_shims::adapter::reactor_entry::SyscallRequest;
 use tx_shims::adapter::step_engine::Cap;
@@ -49,6 +49,11 @@ use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult};
 // -------- Stub PMAP (mirrors v3_subject_population.rs) --------------
 
 struct StubPmap;
+
+impl PlatformConfig for StubPmap {
+    const ARCH: Arch = Arch::Riscv64;
+    const BOARD: &'static str = "shims-v3-test";
+}
 
 #[derive(Default)]
 struct StubPmapState {
@@ -94,6 +99,7 @@ impl PmapIf for StubPmap {
 }
 
 impl EntropyIf for StubPmap {}
+impl tx_hal::AuxvIf for StubPmap {}
 
 impl TimeIf for StubPmap {
     fn read_ns() -> u64 {

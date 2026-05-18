@@ -19,8 +19,9 @@ use crate::vm::adapter::step_engine::{
     WaitSourceId, YieldShape,
 };
 use crate::vm::{
-    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmMapCommit,
-    VmMapError, VmMapOutcome, VmMapRequest, VmRemapOutcome, VmRemapRequest, RANGE_LOCK_RELEASE_MASK,
+    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags,
+    VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmRemapOutcome, VmRemapRequest,
+    RANGE_LOCK_RELEASE_MASK,
 };
 
 /// Translate a [`VmMapError`] into a substrate [`Errno`] for
@@ -144,7 +145,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for VmRemapOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        match self.aspace.try_mremap(self.request.clone()) {
+        match self.aspace.try_mremap(self.request) {
             Ok(outcome) => StepOutcome::Done(outcome),
             Err(VmMapError::WouldBlock) => range_lock_blocked(self.aspace),
             Err(error) => StepOutcome::Err(vmmap_error_to_errno(error)),
@@ -306,8 +307,13 @@ impl<'a, I: SubjectIdentity> StepOp<I> for VmMsyncOp<'a> {
         match self.aspace.msync(self.range, &guard) {
             V3::Done(()) => V3::Done(()),
             V3::Err(e) => V3::Err(e),
-            V3::Continue { .. } => V3::Continue { progress: NoProgress },
-            V3::Yield { shape, .. } => V3::Yield { progress: NoProgress, shape },
+            V3::Continue { .. } => V3::Continue {
+                progress: NoProgress,
+            },
+            V3::Yield { shape, .. } => V3::Yield {
+                progress: NoProgress,
+                shape,
+            },
         }
     }
 }

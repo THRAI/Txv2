@@ -11,8 +11,8 @@ use crate::user_access::{board_copy_from_user, board_copy_to_user};
 use crate::Platform;
 use tx_hal::{
     FaultInfo, Pod, SavedSignalFrame, SignalFrameBytes, SignalFrameIf, SignalFramePlacement,
-    SignalFrameWrite, SignalHandlerRegs, TrapFrameMut, UserPtr, UserSignalMaskAbi,
-    UserTrapContext, VirtAddr,
+    SignalFrameWrite, SignalHandlerRegs, TrapFrameMut, UserPtr, UserSignalMaskAbi, UserTrapContext,
+    VirtAddr,
 };
 
 const RV64_SIGFRAME_ALIGN: usize = 16;
@@ -190,10 +190,7 @@ impl SignalFrameIf for Platform {
 
         // SAFETY: Rv64SignalFrame is Pod.
         let frame_bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(
-                &frame as *const Rv64SignalFrame as *const u8,
-                frame_size,
-            )
+            core::slice::from_raw_parts(&frame as *const Rv64SignalFrame as *const u8, frame_size)
         };
 
         let trampoline_pc = frame_addr + offset_of!(Rv64SignalFrame, trampoline);
@@ -206,8 +203,8 @@ impl SignalFrameIf for Platform {
         let siginfo_addr = frame_addr + offset_of!(Rv64SignalFrame, siginfo);
         let ucontext_addr = frame_addr + offset_of!(Rv64SignalFrame, user_context);
         handler_ctx.regs[10] = setup.sig_no as usize; // a0
-        handler_ctx.regs[11] = siginfo_addr;           // a1
-        handler_ctx.regs[12] = ucontext_addr;          // a2
+        handler_ctx.regs[11] = siginfo_addr; // a1
+        handler_ctx.regs[12] = ucontext_addr; // a2
 
         Ok((handler_ctx, SignalFrameBytes::from_slice(frame_bytes)))
     }
