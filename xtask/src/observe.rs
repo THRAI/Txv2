@@ -110,6 +110,17 @@ fn observe_names(args: &[String]) -> Result<()> {
             .or_insert(format!("task.{tid}"));
     }
 
+    // Syscall `ArgValue` continuation keys — `tx_shims::linux_syscall::dispatch`
+    // emits one `Instant(ArgValue)` per register-shaped syscall arg
+    // (`a0`..`a5`) right after `SpanBegin(SyscallEnter)`. The daemon
+    // surfaces these as debug annotations on the `sys_*` slice; the
+    // name lookup goes through this same `names.json` table.
+    for name in ["a0", "a1", "a2", "a3", "a4", "a5"] {
+        table
+            .entry(fnv1a32(name.as_bytes()))
+            .or_insert(name.to_string());
+    }
+
     // ── 2. Symbol-table walk for `op_name_id::<S>` monomorphizations ────
     //
     // Per OBS-V1-OPNAME-1 and OBS-HOST-V0-NAMES-GENERATION: the

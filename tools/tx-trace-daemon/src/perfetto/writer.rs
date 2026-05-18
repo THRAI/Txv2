@@ -15,9 +15,9 @@ use prost::Message;
 use crate::decode::{DecodedEvent, DecodedRecord, RepairRecord};
 use crate::perfetto::interned::InternTable;
 use crate::perfetto::proto::{
-    Clock, ClockSnapshot, DebugAnnotation, EventName, InternedData, Trace,
-    TracePacket, TrackEvent, TrackEventType, CLOCK_BOOTTIME,
-    CLOCK_CUSTOM_TXTRACE_BASE, SEQ_INCREMENTAL_STATE_CLEARED, TRUSTED_SEQ_ID,
+    Clock, ClockSnapshot, DebugAnnotation, DebugAnnotationName, EventName, InternedData, Trace,
+    TracePacket, TrackEvent, TrackEventType, CLOCK_BOOTTIME, CLOCK_CUSTOM_TXTRACE_BASE,
+    SEQ_INCREMENTAL_STATE_CLEARED, TRUSTED_SEQ_ID,
 };
 use crate::perfetto::span::{SpanEntry, SpanTable};
 use crate::perfetto::track::TrackRegistry;
@@ -275,10 +275,53 @@ impl PftraceWriter {
                 } else {
                     let name_id = parse_hex_u32(&r.name_id);
                     let (iid, new_name) = self.names.intern(name_id);
-                    let interned_data = new_name.map(|n| InternedData {
-                        event_names: vec![EventName { iid: Some(iid), name: Some(n) }],
-                        debug_annotation_names: vec![],
-                    });
+
+                    // OBS-V1 §8.6: `ArgValue` continuation records carry the
+                    // raw syscall arg (or other annotation) as the
+                    // payload's `value0` field. Surface that value as a
+                    // debug annotation on the instant so the Perfetto
+                    // "Current Selection" panel shows the actual u64 next
+                    // to the arg name (`a0`, `a1`, …) instead of just an
+                    // anonymous anchor.
+                    let arg_value =
+                        (r.payload_tag == TxPayloadTag::ArgValue as u16)
+                            .then(|| extract_arg_value_field(r));
+
+                    let mut debug_annotation_names = vec![];
+                    let mut debug_annotations = vec![];
+                    if let Some(v) = arg_value {
+                        // Reuse the same intern table for the annotation
+                        // key ("value"); cheap and keeps the wire packets
+                        // small.
+                        let (value_iid, value_new_name) = self.names.intern_str("value");
+                        if let Some(n) = value_new_name {
+                            debug_annotation_names.push(DebugAnnotationName {
+                                iid: Some(value_iid),
+                                name: Some(n),
+                            });
+                        }
+                        debug_annotations.push(DebugAnnotation {
+                            name_iid: Some(value_iid),
+                            uint_value: Some(v),
+                            ..Default::default()
+                        });
+                    }
+
+                    let interned_data = if new_name.is_some()
+                        || !debug_annotation_names.is_empty()
+                    {
+                        Some(InternedData {
+                            event_names: new_name
+                                .map(|n| {
+                                    vec![EventName { iid: Some(iid), name: Some(n) }]
+                                })
+                                .unwrap_or_default(),
+                            debug_annotation_names,
+                        })
+                    } else {
+                        None
+                    };
+
                     let pkt = TracePacket {
                         timestamp: Some(r.ts),
                         timestamp_clock_id: Some(self.perfetto_clock_id()),
@@ -287,6 +330,7 @@ impl PftraceWriter {
                             track_uuid: Some(hart_uuid),
                             r#type: Some(TrackEventType::Instant as i32),
                             name_iid: Some(iid),
+                            debug_annotations,
                             ..Default::default()
                         }),
                         interned_data,
@@ -593,4 +637,17 @@ fn extract_resume_fields(r: &DecodedRecord) -> (u32, u64) {
     } else {
         (0, 0)
     }
+}
+
+/// Extract `value0: u64` from a decoded `ArgValue` payload JSON.
+///
+/// Each syscall arg (and other annotation continuation) carries its
+/// numeric u64 in this field. Returns `0` when the payload is missing
+/// or malformed — safe fallback that surfaces as a `value=0` annotation
+/// rather than dropping the chip.
+fn extract_arg_value_field(r: &DecodedRecord) -> u64 {
+    r.payload
+        .as_ref()
+        .and_then(|p| p["value0"].as_u64())
+        .unwrap_or(0)
 }

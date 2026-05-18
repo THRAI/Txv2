@@ -12,10 +12,10 @@
 //! Spec ref: `08_OBSERVATION_SERIALIZATION_v0.md` §8.
 
 use tx_observe_types::{
-    PayloadDriveBegin, PayloadDriveEnd, PayloadMutationIndexCommit, PayloadMutationZoneSign,
-    PayloadPhaseTransition, PayloadResume, PayloadSchedSwitch, PayloadStepOutcome,
-    PayloadSyscallEnter, PayloadSyscallExit, PayloadWaitSourceNotify, PayloadYieldBegin,
-    TxPayloadTag,
+    PayloadArgValue, PayloadDriveBegin, PayloadDriveEnd, PayloadMutationIndexCommit,
+    PayloadMutationZoneSign, PayloadPhaseTransition, PayloadResume, PayloadSchedSwitch,
+    PayloadStepOutcome, PayloadSyscallEnter, PayloadSyscallExit, PayloadWaitSourceNotify,
+    PayloadYieldBegin, TxPayloadTag,
 };
 
 // ---------------------------------------------------------------------------
@@ -370,6 +370,37 @@ pub fn encode_sched_switch(p: &PayloadSchedSwitch) -> ([u8; 16], u16) {
 #[inline]
 pub const fn sched_switch_tag() -> TxPayloadTag {
     TxPayloadTag::SchedSwitch
+}
+
+// ---------------------------------------------------------------------------
+// ArgValue (continuation records — `08_OBSERVATION_v1.md` §8.6)
+// ---------------------------------------------------------------------------
+
+/// Encode a [`PayloadArgValue`] into a 16-byte buffer.
+///
+/// Wire layout (§8.6):
+/// ```text
+/// offset 0:  key         u32   (DebugAnnotationNameId; daemon → "fd", "buf", …)
+/// offset 4:  value_kind  u8    (TxValueKind: 1=U64, 2=I64, 4=Ptr, 5=Errno, …)
+/// offset 5:  _pad        [u8; 3]
+/// offset 8:  value0      u64   (numeric value, low-64 of object id, etc.)
+/// total = 16
+/// ```
+#[inline]
+pub fn encode_arg_value(p: &PayloadArgValue) -> ([u8; 16], u16) {
+    let mut buf = [0u8; 16];
+    write_u32_le(&mut buf, 0, p.key);
+    write_u8(&mut buf, 4, p.value_kind);
+    // _pad bytes stay 0
+    write_u64_le(&mut buf, 8, p.value0);
+    let len = core::mem::size_of::<PayloadArgValue>() as u16;
+    (buf, len)
+}
+
+/// Return the correct [`TxPayloadTag`] for a [`PayloadArgValue`].
+#[inline]
+pub const fn arg_value_tag() -> TxPayloadTag {
+    TxPayloadTag::ArgValue
 }
 
 // ---------------------------------------------------------------------------
