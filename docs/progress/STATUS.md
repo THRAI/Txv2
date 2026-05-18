@@ -1,3 +1,32 @@
+- 2026-05-18 **busybox-musl 52/55 on `cc/great-ptolemy-982e05` `a2eff5f`
+  — recorded in SYSCALL_STATUS.md.** The commit lives on the
+  great-ptolemy branch (not yet merged to `main`), so this is a
+  forward-looking record: the 7 fixes that produced the score are
+  enumerated in `SYSCALL_STATUS.md` so the doc reflects where the
+  project actually stands across worktrees.
+  - ext4 `O_APPEND` (`pc.set_size_bytes(meta.size)` after
+    `PageContainer::new_cap()`) — 6 append tests.
+  - `utimensat` stub returns 0 — `touch(1)`.
+  - `NR_SYSLOG=116` dispatch returning 0 — `dmesg(1)`.
+  - ext4 `rename` / `rmdir` implementations — `mv(1)` / `rmdir(1)`.
+  - `/proc/meminfo` wired into procfs lookup/readdir/render — `free(1)`.
+  - Auto-mount `/proc` at kernel init (`mount_procfs_at_proc()`) —
+    `free(1)`, `ps(1)`, `df(1)`.
+
+  **Three remaining busybox-musl failures, all non-kernel:** `hwclock`
+  (no RTC), `kill 10` (judge script vs sdcard `busybox_cmd.txt`
+  mismatch), `which ls` (no `ls` symlink in
+  `PATH=/musl/glibc:/musl/musl`). Not blocking further work.
+
+  **Doc changes in this worktree (no code changes):** removed the
+  `utimensat`+`/proc` row from the high-stakes table (now landed);
+  added an `ext4 file-content writeback` row (next gap surfaced by
+  the 52/55 work — `flush_page`/`fsync_file` still return `-ENOSYS`);
+  bumped **Last refresh**.
+
+  **Verification:** `cargo xtask lint syscall-status` passes (no
+  auto-table drift); `cargo xtask progress validate` ok.
+
 - 2026-05-18 **`cargo xtask syscall` introduced; dispatch table is now
   the SSoT for syscall progress.** New xtask module
   ([`xtask/src/syscall.rs`](../../xtask/src/syscall.rs)) parses
