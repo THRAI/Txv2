@@ -1,3 +1,59 @@
+- 2026-05-18 **cred hygiene: extend `authorize_*` combinator family to
+  the FS surface. Seven syscall arms collapse from 5–7 line guard-
+  scope-and-match blocks to uniform 3-line `if let Err(e) =
+  authorize_X(...) { return error_from(e); }`. Saves ~37 lines of
+  boilerplate; eliminates one error-style divergence (`if let Err`
+  vs `let _auth = match`).**
+
+  Before: two of the seven cred-checked FS arms used
+  `if let Err(e) = require_chmod(...)` while the other five used
+  `let _auth = match require_X(...) { Ok(w) => w, Err(e) => return ...; }`.
+  Same intent, divergent style. The guard scope was open at every
+  call site, leaving the no-nested-guard discipline as a hidden
+  contract reviewers had to remember.
+
+  After: every `require_*` (FS family) gets a sibling `authorize_*`
+  combinator that takes its own guard, runs the predicate, drops the
+  witness, and returns `Result<(), Errno>`. Matches the established
+  shape of `authorize_signal_send`.
+
+  New in [cred/checks.rs](../../crates/tx-subsystems/src/cred/checks.rs):
+
+  ```rust
+  authorize_path_search(snapshot, meta)                                   -> Result<(), Errno>
+  authorize_open(snapshot, meta, flags)                                   -> Result<(), Errno>
+  authorize_unlink(snapshot, parent, child)                               -> Result<(), Errno>
+  authorize_link(snapshot, new_parent)                                    -> Result<(), Errno>
+  authorize_rename(snapshot, op, oc, np, displaced)                       -> Result<(), Errno>
+  authorize_chmod(snapshot, target, new_mode)                             -> Result<(), Errno>
+  authorize_chown(snapshot, target, new_uid, new_gid)                     -> Result<(), Errno>
+  ```
+
+  The 7 FS arms (`sys_unlinkat`, `sys_linkat`, `sys_mkdirat`,
+  `sys_symlinkat`, `sys_renameat2`, `sys_fchmodat`, `sys_fchownat`)
+  refactored to the uniform shape. `require_*` predicates stay
+  available unchanged for sites that genuinely want to hold the typed
+  `*Authorized<'g>` witness across a separate commit step.
+
+  6 new unit tests pin the `authorize_*` / `require_*` agreement
+  contract (each combinator agrees with its predicate on both
+  permit and deny). Lint unaffected — `cred::checks::authorize_`
+  was already a CRED_CHECK_SIGNAL prefix for the signal-side
+  combinator; FS sites now match the same prefix.
+
+  **Verification:** `cargo -q xtask unit` — tx-shims **233/233**,
+  tx-kernel 44, tx-ext4 8, tx-scripts 50. `cargo test
+  -p tx-subsystems --lib` — **685/685** (+6 new authorize_*
+  agreement tests). `cargo xtask lint invariants cred-check` —
+  9 audited, 3 allow-listed, 0 violations.
+
+  Commit: `02af0f3` cred: hygiene — extend authorize_* combinator family to the FS surface
+
+  **Next step:** Per-FS `step_chmod` / `step_chown` rule consolidation
+  (delete the redundant per-FS check, have the step body consume the
+  witness or trust the syscall-arm gate). Touches `tmpfs`, `devfs`,
+  `bdevfs`, `procfs`, possibly ext4.
+
 - 2026-05-18 **Cred migration complete: `require_rename` / `require_chmod` /
   `require_chown` land, the new `xtask lint invariants cred-check`
   CI gate enforces the floor, and two more bypasses

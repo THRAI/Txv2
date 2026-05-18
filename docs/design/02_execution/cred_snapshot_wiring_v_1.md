@@ -225,6 +225,12 @@ owns the structure that consumes it.
 ### Combinators (snapshot + facts + check)
 <!-- txdoc:CSW-COMBINATORS -->
 
+Two flavours: a 3-state signal-side combinator family and a 2-state
+FS-side family.
+
+#### Signal-side: `authorize_signal_send`
+<!-- txdoc:CSW-COMBINATORS-SIGNAL -->
+
 ```rust
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use = "authorization outcomes must drive a commit-or-skip decision"]
@@ -245,16 +251,51 @@ pub fn authorize_signal_send_under_guard(
 ) -> Result<AuthOutcome, Errno>;
 ```
 
-The bare form takes its own epoch guard and drops it before returning, so
-the caller's commit phase can take downstream guards (e.g. `post_signal`
-for SigInfo storage, `upgrade_owner_proc` for thread→process resolution)
-without nesting. The `_under_guard` variant lets fanout loops
+`AuthOutcome` is 3-state (Authorized / NoLiveTarget / Err(Errno)) because
+POSIX kill's distinct outcomes — "delivered", "no live target", "denied"
+— each map to a different `SyscallResult` branch with no type-level
+ambiguity. The `_under_guard` variant lets fanout loops
 (`script_kill_pgrp`) reuse one snapshot + outer guard across N iterations.
 
-`AuthOutcome` is a 3-state enum (Authorized / NoLiveTarget / Err(Errno))
-so POSIX kill's distinct outcomes — "delivered", "no live target",
-"denied" — each map to a different `SyscallResult` branch with no
-type-level ambiguity.
+#### FS-side: `authorize_unlink` / `_link` / `_rename` / `_chmod` / `_chown` / `_open` / `_path_search`
+<!-- txdoc:CSW-COMBINATORS-FS -->
+
+```rust
+pub fn authorize_path_search(source: &CredSnapshot, meta: &InodeMeta) -> Result<(), Errno>;
+pub fn authorize_open(source: &CredSnapshot, meta: &InodeMeta, flags: OpenFileFlags) -> Result<(), Errno>;
+pub fn authorize_unlink(source: &CredSnapshot, parent: &InodeMeta, child: &InodeMeta) -> Result<(), Errno>;
+pub fn authorize_link(source: &CredSnapshot, new_parent: &InodeMeta) -> Result<(), Errno>;
+pub fn authorize_rename(source: &CredSnapshot, op: &InodeMeta, oc: &InodeMeta, np: &InodeMeta, displaced: Option<&InodeMeta>) -> Result<(), Errno>;
+pub fn authorize_chmod(source: &CredSnapshot, target: &InodeMeta, new_mode: u16) -> Result<(), Errno>;
+pub fn authorize_chown(source: &CredSnapshot, target: &InodeMeta, new_uid: Option<u32>, new_gid: Option<u32>) -> Result<(), Errno>;
+```
+
+Each is a thin `{ let guard = fresh_guard(); require_X(..., &guard).map(drop) }`
+wrapper. Returns `Result<(), Errno>` — the FS-side rules have no
+"NoLiveTarget" branch (the walker resolved the target before the cred
+check), so the simpler 2-state outcome fits.
+
+#### When to use which
+<!-- txdoc:CSW-COMBINATORS-WHEN-TO-USE -->
+
+- **`require_*`** — when the call site genuinely needs to hold the
+  typed `*Authorized<'g>` witness across a separate commit step that
+  consumes it as a token (today: no in-tree consumer; reserved for
+  composite ops that gate on the witness's type).
+- **`authorize_*`** — every other consumer. Hides the guard scope,
+  unifies the call-site shape:
+  ```rust
+  if let Err(e) = cred::checks::authorize_X(ctx.cred_snapshot(), …) {
+      return SyscallResult::error_from(e);
+  }
+  ```
+  The 7 cred-checked FS syscall arms in tx-shims all use this form.
+  Saved ~37 lines of guard-scope boilerplate.
+
+The bare form takes its own epoch guard and drops it before returning,
+so the caller's commit phase can take downstream guards (e.g. fs_ops
+internals, `post_signal` for SigInfo storage, `upgrade_owner_proc` for
+thread→process resolution) without nesting.
 
 ---
 
