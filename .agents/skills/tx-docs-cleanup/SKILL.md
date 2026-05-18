@@ -10,9 +10,10 @@ Use this skill for cleanup walks across active docs. Keep the parent context sma
 ## Read First
 
 - `AGENTS.md`
-- `docs/design/INDEX.md`
+- `docs/design/INDEX.md` and `docs/Txv3/INDEX.md`
+- `docs/Txv3/01_CONCEPTS_v5.md` and `docs/Txv3/02_INVARIANTS_v5.md` — the v3 spine that supersedes parts of v4.
 - `docs/design/00_meta-framework/CONCEPTS_v4.md`
-- `docs/design/00_meta-framework/INVARIANTS_v4.md`
+- `docs/design/00_meta-framework/INVARIANTS_v4.md` — still authoritative for sections v5 didn't touch; do not rewrite as superseded unless v5 actually superseded that row.
 - `docs/design/00_meta-framework/CI_REPORTING_v1.md`
 - `docs/design/00_meta-framework/MODULE_MAP_v1.md`
 
