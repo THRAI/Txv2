@@ -40,7 +40,9 @@ pub mod header;
 pub mod payload;
 pub mod record;
 
-pub use header::{TxTraceClockId, TxTraceHartRing, TxTraceHeader, TxTraceHeaderFlags};
+pub use header::{
+    TxTraceClockId, TxTraceHartRing, TxTraceHeader, TxTraceHeaderFlags, TX_TRACE_MAGIC,
+};
 pub use payload::{
     BootPhaseKind, FlowKind, PayloadArgValue, PayloadClockSnapshot, PayloadCounterValue,
     PayloadDriveBegin, PayloadDriveEnd, PayloadMutationIndexCommit, PayloadMutationZoneSign,

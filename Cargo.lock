@@ -467,6 +467,7 @@ dependencies = [
  "tx-ext4-format",
  "tx-fs",
  "tx-hal",
+ "tx-observe",
  "tx-platform-adapter",
  "tx-reactor",
  "tx-scripts",
