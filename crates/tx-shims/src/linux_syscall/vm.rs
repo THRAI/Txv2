@@ -215,7 +215,18 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
         };
         VmMapRequest::fixed(range, placement, prot, entry_flags, backing)
     } else {
-        let window = UserRange::full_user_v1();
+        // Linux mmap(addr=NULL, !MAP_FIXED) returns a chosen mapping
+        // address, and user programs commonly treat NULL as failure or
+        // a sentinel. Keep page 0 unmapped for syscall-allocated
+        // mappings while leaving the lower VM layer's full-user range
+        // semantics unchanged for fixed/exec paths.
+        let window = match UserRange::new_aligned(
+            UserVirtAddr(USER_PAGE_SIZE),
+            UserRange::full_user_v1().len() - USER_PAGE_SIZE,
+        ) {
+            Ok(range) => range,
+            Err(_) => return SyscallResult::Error(EINVAL_VALUE),
+        };
         let page_count = length / USER_PAGE_SIZE;
         VmMapRequest::anywhere(window, page_count, prot, entry_flags, backing)
     };
