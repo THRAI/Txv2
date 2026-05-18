@@ -666,14 +666,25 @@ fn emit_sched_begin(hart: HartId, task_id_low: u32) -> tx_observe::SpanId {
     let (enc, len) = encode_sched_switch(&payload);
     em.span_begin(
         TxTraceLevel::Sched,
-        // EventNameId carries the task_id_low so the daemon can render
-        // per-task labels without a separate names.json lookup.
-        EventNameId::from_raw(task_id_low),
+        // Encode the task_id_low into the EventNameId so the daemon
+        // renders per-task slice labels via the standard `names.json`
+        // path. High-bit prefix `0x8000_0000` namespaces these out of
+        // the syscall-number range (0..512) and the FNV-1a-derived
+        // type-name hash range (uniform across u32 — collision in any
+        // 64k window is ~1 / 65536 per registered type, so the high
+        // 32k window we reserve here is effectively private to Sched).
+        EventNameId::from_raw(SCHED_NAME_BASE | task_id_low),
         tx_observe::SpanId::NONE,
         sched_switch_tag(),
         &enc[..len as usize],
     )
 }
+
+/// Reserved `EventNameId` prefix for Sched span labels — see
+/// `emit_sched_begin`. `observe names` pre-populates `task.<N>` entries
+/// in this range so Perfetto renders sched slices as `task.<tid>` instead
+/// of the raw `name_0xN` fallback.
+pub(crate) const SCHED_NAME_BASE: u32 = 0x8000_0000;
 
 #[inline]
 fn emit_sched_end(

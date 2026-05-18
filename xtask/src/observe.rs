@@ -98,6 +98,18 @@ fn observe_names(args: &[String]) -> Result<()> {
         .entry(0x4d494358)
         .or_insert("mutation.index_commit".into());
 
+    // OBS-9 Sched span labels — namespaced under `SCHED_NAME_BASE`
+    // (0x8000_0000) by `tx_reactor::runtime::emit_sched_begin`. Pre-
+    // populate `task.<N>` for the first 1024 TIDs so Perfetto renders
+    // sched slices as `task.<tid>` instead of falling back to
+    // `name_0x8…`.
+    const SCHED_NAME_BASE: u32 = 0x8000_0000;
+    for tid in 0..1024u32 {
+        table
+            .entry(SCHED_NAME_BASE | tid)
+            .or_insert(format!("task.{tid}"));
+    }
+
     // ── 2. Symbol-table walk for `op_name_id::<S>` monomorphizations ────
     //
     // Per OBS-V1-OPNAME-1 and OBS-HOST-V0-NAMES-GENERATION: the
