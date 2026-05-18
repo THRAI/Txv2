@@ -225,16 +225,12 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let target_meta = target_dentry.rnode().meta();
-    {
-        let guard = step_engine::guard();
-        if let Err(e) = tx_subsystems::cred::checks::require_chmod(
-            ctx.cred_snapshot(),
-            &target_meta,
-            new_mode,
-            &guard,
-        ) {
-            return SyscallResult::error_from(e);
-        }
+    if let Err(e) = tx_subsystems::cred::checks::authorize_chmod(
+        ctx.cred_snapshot(),
+        &target_meta,
+        new_mode,
+    ) {
+        return SyscallResult::error_from(e);
     }
 
     let result = {
@@ -290,17 +286,13 @@ pub(super) fn sys_fchownat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let target_meta = target_dentry.rnode().meta();
-    {
-        let guard = step_engine::guard();
-        if let Err(e) = tx_subsystems::cred::checks::require_chown(
-            ctx.cred_snapshot(),
-            &target_meta,
-            uid,
-            gid,
-            &guard,
-        ) {
-            return SyscallResult::error_from(e);
-        }
+    if let Err(e) = tx_subsystems::cred::checks::authorize_chown(
+        ctx.cred_snapshot(),
+        &target_meta,
+        uid,
+        gid,
+    ) {
+        return SyscallResult::error_from(e);
     }
 
     let result = {

@@ -1265,6 +1265,172 @@ fn require_chown_cap_fowner_permits_arbitrary_uid_gid() {
         .expect("CAP_FOWNER bypass");
 }
 
+// ---------- authorize_* combinators ----------
+//
+// Each combinator wraps a `require_*` predicate: takes its own
+// fresh epoch guard, runs the predicate, drops the witness, returns
+// Result<(), Errno>. The unit tests below pin the contract that
+// the combinator agrees with the underlying predicate for both the
+// permitted and denied cases, end-to-end without a caller-managed
+// guard.
+
+#[test]
+fn authorize_unlink_agrees_with_require_unlink() {
+    use crate::cred::checks::{authorize_unlink, require_unlink};
+    use crate::cred::adapter::step_engine::guard;
+    use crate::execution::Errno;
+    use crate::vfs::structure::S_ISVTX;
+
+    let _g = setup();
+    // Permitted: owner with W+X, no sticky.
+    let parent_ok = fresh_dir_meta(0o700, 1000, 1000);
+    let child_ok = fresh_file_meta(0o600, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    assert_eq!(authorize_unlink(&snap, &parent_ok, &child_ok), Ok(()));
+    {
+        let g = guard();
+        assert!(require_unlink(&snap, &parent_ok, &child_ok, &g).is_ok());
+    }
+    // Denied: sticky on parent, non-owner caller.
+    let parent_sticky = fresh_dir_meta(S_ISVTX | 0o1777, 0, 0);
+    let child_other = fresh_file_meta(0o644, 2000, 2000);
+    assert_eq!(
+        authorize_unlink(&snap, &parent_sticky, &child_other),
+        Err(Errno::EPERM)
+    );
+}
+
+#[test]
+fn authorize_link_agrees_with_require_link() {
+    use crate::cred::checks::{authorize_link, require_link};
+    use crate::cred::adapter::step_engine::guard;
+    use crate::execution::Errno;
+
+    let _g = setup();
+    let parent_ok = fresh_dir_meta(0o700, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    assert_eq!(authorize_link(&snap, &parent_ok), Ok(()));
+    {
+        let g = guard();
+        assert!(require_link(&snap, &parent_ok, &g).is_ok());
+    }
+    let parent_ro = fresh_dir_meta(0o555, 1000, 1000);
+    assert_eq!(authorize_link(&snap, &parent_ro), Err(Errno::EACCES));
+}
+
+#[test]
+fn authorize_rename_agrees_with_require_rename() {
+    use crate::cred::checks::{authorize_rename, require_rename};
+    use crate::cred::adapter::step_engine::guard;
+    use crate::execution::Errno;
+    use crate::vfs::structure::S_ISVTX;
+
+    let _g = setup();
+    let op_meta = fresh_dir_meta(0o700, 1000, 1000);
+    let oc_meta = fresh_file_meta(0o600, 1000, 1000);
+    let np_meta = fresh_dir_meta(0o700, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    assert_eq!(
+        authorize_rename(&snap, &op_meta, &oc_meta, &np_meta, None),
+        Ok(())
+    );
+    {
+        let g = guard();
+        assert!(require_rename(&snap, &op_meta, &oc_meta, &np_meta, None, &g).is_ok());
+    }
+    // Sticky on old parent + non-owner of child → EPERM.
+    let op_sticky = fresh_dir_meta(S_ISVTX | 0o1777, 0, 0);
+    let oc_other = fresh_file_meta(0o644, 2000, 2000);
+    assert_eq!(
+        authorize_rename(&snap, &op_sticky, &oc_other, &np_meta, None),
+        Err(Errno::EPERM)
+    );
+}
+
+#[test]
+fn authorize_chmod_agrees_with_require_chmod() {
+    use crate::cred::checks::{authorize_chmod, require_chmod};
+    use crate::cred::adapter::step_engine::guard;
+    use crate::execution::Errno;
+
+    let _g = setup();
+    let target = fresh_file_meta(0o644, 1000, 1000);
+    let snap_owner = unprivileged_snap(1000, 1000);
+    let snap_other = unprivileged_snap(2000, 2000);
+    assert_eq!(authorize_chmod(&snap_owner, &target, 0o755), Ok(()));
+    {
+        let g = guard();
+        assert!(require_chmod(&snap_owner, &target, 0o755, &g).is_ok());
+    }
+    assert_eq!(
+        authorize_chmod(&snap_other, &target, 0o755),
+        Err(Errno::EPERM)
+    );
+}
+
+#[test]
+fn authorize_chown_agrees_with_require_chown() {
+    use crate::cred::checks::{authorize_chown, require_chown};
+    use crate::cred::adapter::step_engine::guard;
+    use crate::execution::Errno;
+
+    let _g = setup();
+    let target = fresh_file_meta(0o644, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    // Self-uid → permitted.
+    assert_eq!(authorize_chown(&snap, &target, Some(1000), None), Ok(()));
+    {
+        let g = guard();
+        assert!(require_chown(&snap, &target, Some(1000), None, &g).is_ok());
+    }
+    // Foreign uid for non-privileged → EPERM.
+    assert_eq!(
+        authorize_chown(&snap, &target, Some(2000), None),
+        Err(Errno::EPERM)
+    );
+}
+
+#[test]
+fn authorize_path_search_and_open_agree_with_require() {
+    use crate::cred::checks::{
+        authorize_open, authorize_path_search, require_open, require_path_search,
+    };
+    use crate::cred::adapter::step_engine::guard;
+    use crate::execution::Errno;
+    use crate::vfs::structure::{InodeMeta, OpenFileFlags};
+
+    let _g = setup();
+    let dir = fresh_dir_meta(0o755, 1000, 1000);
+    let snap = unprivileged_snap(2000, 2000);
+    // Other gets r-x — search ok.
+    assert_eq!(authorize_path_search(&snap, &dir), Ok(()));
+    {
+        let g = guard();
+        assert!(require_path_search(&snap, &dir, &g).is_ok());
+    }
+
+    // Open: a regular file mode 0o400 owned by uid 1000. Caller is
+    // uid 2000 → falls into "other" triplet → no R bit.
+    let mut file = InodeMeta::new(crate::vfs::structure::InodeKind::Regular, 0o400);
+    file.uid = 1000;
+    file.gid = 1000;
+    let flags_r = OpenFileFlags {
+        read: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        authorize_open(&snap, &file, flags_r),
+        Err(Errno::EACCES)
+    );
+    {
+        let g = guard();
+        assert!(matches!(
+            require_open(&snap, &file, flags_r, &g),
+            Err(Errno::EACCES)
+        ));
+    }
+}
+
 #[test]
 fn step_apply_suid_for_exec_at_secure_false_when_no_change() {
     let _g = setup();
