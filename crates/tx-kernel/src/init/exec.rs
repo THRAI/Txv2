@@ -640,6 +640,12 @@ impl<P: TxPlatform> CoreInit<P> {
         let tid_low = thread.tid.0;
         let pid_low = init.pid.0;
         let comm = init.comm();
+        // Resolve pgid + sid via the process's pgrp link. Init runs
+        // as session leader so sid == pid == pgid in production; we
+        // still pull through the live cap to avoid hard-coding that.
+        let init_pgrp = init.pgrp_cap();
+        let pgid_low = init_pgrp.pgid.0;
+        let sid_low = init_pgrp.session_cap().sid.0;
         let submitted = BOOT_REACTOR.with(|reactor| {
             reactor.submit_task_with_meta(
                 crate::thread_future::PerHartSlotted::<P, _>::new(
@@ -656,11 +662,13 @@ impl<P: TxPlatform> CoreInit<P> {
             // Boot reactor not initialised; nothing to drive.
             return;
         }
-        // OBS-V1 §15.7: emit a one-shot ProcessLabel Instant so the
-        // daemon can surface the real PCB `comm` (`init`, `busybox`,
-        // …) on the per-process Perfetto track instead of the
-        // synthetic `pid-<N>` fallback.
+        // OBS-V1 §15.7 + §15.8: emit the one-shot PCB identity bundle
+        // so the daemon can surface the real `comm` on the per-process
+        // Perfetto track AND nest that track under a per-pgrp / per-
+        // session swimlane (avoids scattered top-level lanes when one
+        // test driver fork()s many children).
         emit_process_label::<P>(pid_low, &comm);
+        emit_process_group::<P>(pid_low, pgid_low, sid_low);
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:submitted\n");
 

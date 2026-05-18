@@ -117,6 +117,35 @@ fn emit_process_label_for(pid_low: u32, comm: &[u8; 16]) {
     );
 }
 
+/// Companion to [`emit_process_label_for`] — emits the OBS-V1 §15.8
+/// PCB-group bundle (`pid → pgid + sid`) so the daemon can parent
+/// the per-process Perfetto track under a pgrp swimlane. Called
+/// from exec_script's post-PoNR `comm` commit alongside the
+/// re-emit of [`PayloadProcessLabel`]; the kernel submit-time
+/// site emits both via the `tx-kernel::init::emit_process_group`
+/// twin.
+fn emit_process_group_for(pid_low: u32, pgid_low: u32, sid_low: u32) {
+    let Some(em) = tx_observe::current() else {
+        return;
+    };
+    let payload = tx_observe::PayloadProcessGroup {
+        process_id_low: pid_low,
+        pgid_low,
+        sid_low,
+        _pad: 0,
+    };
+    let (enc, len) = tx_observe::encode::encode_process_group(&payload);
+    em.instant(
+        tx_observe::TxTraceLevel::Sched,
+        // Same `0xA000_0000 | pid` namespace as
+        // `tx-kernel::init::emit_process_group`.
+        tx_observe::EventNameId::from_raw(0xA000_0000 | pid_low),
+        tx_observe::current_parent_span(),
+        tx_observe::encode::process_group_tag(),
+        &enc[..len as usize],
+    );
+}
+
 /// Initial-read window over the ELF image used to cover the header and
 /// program-header table. Sized at one page (4 KiB) which is well over
 /// `Elf64_Ehdr` (64 bytes) + `MAX_PHDRS=64 * Elf64_Phdr=56` ≈ 3.6 KiB.
@@ -913,6 +942,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // process lifetime, and lets OBS-V1 §15.7 ProcessLabel emits read
     // a meaningful name back from `process.comm()` (so Perfetto
     // shows e.g. `busybox` / `basic_exec` instead of `pid-<N>`).
+    let mut committed_comm: Option<[u8; 16]> = None;
     if let Some(payload) = process.payload_slot().lock().as_ref() {
         if let Some(dentry) = openfile.opendir_dentry() {
             *payload._exe_file.lock() = Some(dentry.clone());
@@ -929,14 +959,20 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         *payload._comm.lock() = comm_buf;
         let cmdline_bytes = argv0.to_vec();
         *payload._cmdline.lock() = Some(cmdline_bytes);
-        // OBS-V1 §15.7: re-emit a ProcessLabel mapping the now-committed
-        // `comm` to the owning PID so the daemon picks up the new
-        // program name for the rest of this process's lifetime.
-        // Without this re-emit, the per-process Perfetto track would
-        // keep the comm captured at submit-time (typically the
-        // parent's name across `fork` + `execve`) instead of the
-        // newly-loaded binary.
+        committed_comm = Some(comm_buf);
+    }
+    // OBS-V1 §15.7 + §15.8: re-emit the PCB identity bundle once
+    // the payload-slot lock has been dropped — `pgrp_cap()` takes
+    // its own spin lock and the observation emit path may itself
+    // touch unrelated process state, so doing it inside the
+    // payload-lock scope risks lock-order surprises (we previously
+    // hung under busybox here). Splitting the emit out keeps each
+    // lock acquisition flat and short.
+    if let Some(comm_buf) = committed_comm {
         emit_process_label_for(process.pid.0, &comm_buf);
+        let pgrp = process.pgrp_cap();
+        let sid = pgrp.session_cap().sid.0;
+        emit_process_group_for(process.pid.0, pgrp.pgid.0, sid);
     }
     // vfork completion: if the parent is waiting on CLONE_VFORK,
     // unblock it now that exec has completed.

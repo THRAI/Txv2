@@ -13,8 +13,8 @@
 
 use tx_observe_types::{
     PayloadArgValue, PayloadDriveBegin, PayloadDriveEnd, PayloadMutationIndexCommit,
-    PayloadMutationZoneSign, PayloadPhaseTransition, PayloadProcessLabel, PayloadResume,
-    PayloadSchedSwitch,
+    PayloadMutationZoneSign, PayloadPhaseTransition, PayloadProcessFork, PayloadProcessGroup,
+    PayloadProcessLabel, PayloadResume, PayloadSchedSwitch,
     PayloadStepOutcome, PayloadSyscallEnter, PayloadSyscallExit, PayloadWaitSourceNotify,
     PayloadYieldBegin, TxPayloadTag,
 };
@@ -404,6 +404,60 @@ pub fn encode_process_label(p: &PayloadProcessLabel) -> ([u8; 16], u16) {
 #[inline]
 pub const fn process_label_tag() -> TxPayloadTag {
     TxPayloadTag::ProcessLabel
+}
+
+/// Encode a [`PayloadProcessGroup`] into a 16-byte buffer.
+///
+/// Wire layout (`08_OBSERVATION_v1.md` §15.8 OBS-9 process groups):
+/// ```text
+/// offset 0:  process_id_low  u32
+/// offset 4:  pgid_low        u32
+/// offset 8:  sid_low         u32
+/// offset 12: _pad            u32
+/// total = 16
+/// ```
+#[inline]
+pub fn encode_process_group(p: &PayloadProcessGroup) -> ([u8; 16], u16) {
+    let mut buf = [0u8; 16];
+    write_u32_le(&mut buf, 0, p.process_id_low);
+    write_u32_le(&mut buf, 4, p.pgid_low);
+    write_u32_le(&mut buf, 8, p.sid_low);
+    // _pad bytes stay 0
+    let len = core::mem::size_of::<PayloadProcessGroup>() as u16;
+    (buf, len)
+}
+
+/// Return the correct [`TxPayloadTag`] for a [`PayloadProcessGroup`].
+#[inline]
+pub const fn process_group_tag() -> TxPayloadTag {
+    TxPayloadTag::ProcessGroup
+}
+
+/// Encode a [`PayloadProcessFork`] into a 16-byte buffer.
+///
+/// Wire layout (`08_OBSERVATION_v1.md` §15.9 OBS-9 fork edges):
+/// ```text
+/// offset 0:  parent_pid_low  u32
+/// offset 4:  child_pid_low   u32
+/// offset 8:  _flags          u32   (reserved for CLONE_*)
+/// offset 12: _pad            u32
+/// total = 16
+/// ```
+#[inline]
+pub fn encode_process_fork(p: &PayloadProcessFork) -> ([u8; 16], u16) {
+    let mut buf = [0u8; 16];
+    write_u32_le(&mut buf, 0, p.parent_pid_low);
+    write_u32_le(&mut buf, 4, p.child_pid_low);
+    write_u32_le(&mut buf, 8, p._flags);
+    // _pad stays 0
+    let len = core::mem::size_of::<PayloadProcessFork>() as u16;
+    (buf, len)
+}
+
+/// Return the correct [`TxPayloadTag`] for a [`PayloadProcessFork`].
+#[inline]
+pub const fn process_fork_tag() -> TxPayloadTag {
+    TxPayloadTag::ProcessFork
 }
 
 // ---------------------------------------------------------------------------
