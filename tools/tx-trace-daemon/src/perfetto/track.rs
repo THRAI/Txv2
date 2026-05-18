@@ -130,6 +130,43 @@ impl TrackRegistry {
         self.map.get(&TrackKey::Hart(hart)).map(|e| e.uuid)
     }
 
+    /// Rename an existing process track, emitting a fresh
+    /// `TrackDescriptor` keyed by the same UUID so Perfetto picks up
+    /// the new `ProcessDescriptor.process_name` retroactively. Returns
+    /// the descriptor to emit, or `None` if the PID has no track yet
+    /// (caller falls through to `ensure_process_track` at first slice
+    /// time) or if `comm` matches the cached name (idempotent).
+    ///
+    /// Used by the writer when a `PayloadProcessLabel` arrives after
+    /// the process track has already been materialised by an earlier
+    /// slice — typically when `fork` + `execve` straddle the first
+    /// poll of the child. Without this the track would keep the
+    /// pre-execve `comm` (often the parent's name) for the rest of
+    /// the trace.
+    pub fn rename_process_track(
+        &mut self,
+        pid: u32,
+        comm: &str,
+    ) -> Option<TrackDescriptor> {
+        let track_id = 0xF000_0000_0000_0000u64 | pid as u64;
+        let key = TrackKey::KernelTrackId(track_id);
+        let entry = self.map.get_mut(&key)?;
+        if entry.name == comm {
+            return None;
+        }
+        entry.name = comm.to_string();
+        Some(TrackDescriptor {
+            uuid: Some(entry.uuid),
+            parent_uuid: None,
+            name: Some(comm.to_string()),
+            process: Some(ProcessDescriptor {
+                pid: Some(pid as i32),
+                process_name: Some(comm.to_string()),
+            }),
+            thread: None,
+        })
+    }
+
     /// Ensure a per-process track exists; returns UUID + optional descriptor.
     ///
     /// `pid` is the kernel PID (low 32 bits of `process.pid.0`). Process
@@ -143,25 +180,40 @@ impl TrackRegistry {
     /// so process tracks never collide with the per-hart task tracks
     /// (which embed the hart in their high half) or with the harts
     /// process track at UUID 1.
-    pub fn ensure_process_track(&mut self, pid: u32) -> (u64, Option<TrackDescriptor>) {
+    ///
+    /// `comm` (when `Some`) carries the PCB short name read from
+    /// `PayloadProcessLabel`; we use it as the
+    /// `ProcessDescriptor.process_name` so the Perfetto track header
+    /// reads e.g. `busybox` instead of `pid-12`. Track-allocation is
+    /// one-shot: subsequent calls with a different `comm` are
+    /// ignored (first writer wins). If the daemon sees the
+    /// ProcessLabel before any slice on that PID — the kernel emits
+    /// it right after submit — this is the common case and the
+    /// rendered name is correct.
+    pub fn ensure_process_track(
+        &mut self,
+        pid: u32,
+        comm: Option<&str>,
+    ) -> (u64, Option<TrackDescriptor>) {
         let track_id = 0xF000_0000_0000_0000u64 | pid as u64;
         let key = TrackKey::KernelTrackId(track_id);
         if let Some(e) = self.map.get(&key) {
             return (e.uuid, None);
         }
         let uuid = self.alloc_uuid();
-        let name = format!("pid-{pid}");
+        let synthetic = format!("pid-{pid}");
+        let display_name = comm.map(|c| c.to_string()).unwrap_or_else(|| synthetic.clone());
         self.map.insert(
             key,
-            TrackEntry { uuid, parent_uuid: 0, name: name.clone() },
+            TrackEntry { uuid, parent_uuid: 0, name: display_name.clone() },
         );
         let desc = TrackDescriptor {
             uuid: Some(uuid),
             parent_uuid: None,
-            name: Some(name.clone()),
+            name: Some(display_name.clone()),
             process: Some(ProcessDescriptor {
                 pid: Some(pid as i32),
-                process_name: Some(name),
+                process_name: Some(display_name),
             }),
             thread: None,
         };
@@ -183,8 +235,9 @@ impl TrackRegistry {
         pid: u32,
         hart: u16,
         tid: u32,
+        comm: Option<&str>,
     ) -> (u64, Option<TrackDescriptor>, Option<TrackDescriptor>) {
-        let (process_uuid, process_desc) = self.ensure_process_track(pid);
+        let (process_uuid, process_desc) = self.ensure_process_track(pid, comm);
         // Namespace thread tracks distinct from raw `ensure_kernel_track`
         // task tracks (which use `(hart<<32) | tid` directly) by setting
         // the top bit. Embedding `hart` keeps two harts' views of the

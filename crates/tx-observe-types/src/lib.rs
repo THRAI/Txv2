@@ -46,7 +46,8 @@ pub use header::{
 pub use payload::{
     BootPhaseKind, FlowKind, PayloadArgValue, PayloadClockSnapshot, PayloadCounterValue,
     PayloadDriveBegin, PayloadDriveEnd, PayloadMutationIndexCommit, PayloadMutationZoneSign,
-    PayloadPanic, PayloadPhaseTransition, PayloadResume, PayloadSchedSwitch, PayloadStepOutcome,
+    PayloadPanic, PayloadPhaseTransition, PayloadProcessLabel, PayloadResume, PayloadSchedSwitch,
+    PayloadStepOutcome,
     PayloadSyscallEnter, PayloadSyscallExit, PayloadTrackDescriptor, PayloadWaitSourceNotify,
     PayloadYieldBegin, SchedKind, SchedReason, TxPayloadTag, TxProgressKind, TxValueKind,
     YieldShapeKind,
@@ -77,6 +78,7 @@ unsafe impl Pod for PayloadMutationZoneSign {}
 unsafe impl Pod for PayloadMutationIndexCommit {}
 unsafe impl Pod for PayloadPhaseTransition {}
 unsafe impl Pod for PayloadSchedSwitch {}
+unsafe impl Pod for PayloadProcessLabel {}
 unsafe impl Pod for PayloadPanic {}
 
 // ---------------------------------------------------------------------------
@@ -117,6 +119,7 @@ const _: () = {
     assert!(size_of::<PayloadMutationIndexCommit>() == 16);
     assert!(size_of::<PayloadPhaseTransition>() == 16);
     assert!(size_of::<PayloadSchedSwitch>() == 16);
+    assert!(size_of::<PayloadProcessLabel>() == 16);
     assert!(size_of::<PayloadPanic>() == 16);
 
     // Belt-and-suspenders: all payloads ≤ 16 (redundant given exact checks

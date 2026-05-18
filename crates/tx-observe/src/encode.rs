@@ -13,7 +13,8 @@
 
 use tx_observe_types::{
     PayloadArgValue, PayloadDriveBegin, PayloadDriveEnd, PayloadMutationIndexCommit,
-    PayloadMutationZoneSign, PayloadPhaseTransition, PayloadResume, PayloadSchedSwitch,
+    PayloadMutationZoneSign, PayloadPhaseTransition, PayloadProcessLabel, PayloadResume,
+    PayloadSchedSwitch,
     PayloadStepOutcome, PayloadSyscallEnter, PayloadSyscallExit, PayloadWaitSourceNotify,
     PayloadYieldBegin, TxPayloadTag,
 };
@@ -372,6 +373,37 @@ pub fn encode_sched_switch(p: &PayloadSchedSwitch) -> ([u8; 16], u16) {
 #[inline]
 pub const fn sched_switch_tag() -> TxPayloadTag {
     TxPayloadTag::SchedSwitch
+}
+
+// ---------------------------------------------------------------------------
+// L7 — ProcessLabel (OBS-9 §15.7 PCB-name mapping)
+// ---------------------------------------------------------------------------
+
+/// Encode a [`PayloadProcessLabel`] into a 16-byte buffer.
+///
+/// Wire layout (`08_OBSERVATION_v1.md` §15.7 OBS-9 process labels):
+/// ```text
+/// offset 0:  process_id_low  u32
+/// offset 4:  comm            [u8; 12]   PCB short name (NUL-padded ASCII)
+/// total = 16
+/// ```
+#[inline]
+pub fn encode_process_label(p: &PayloadProcessLabel) -> ([u8; 16], u16) {
+    let mut buf = [0u8; 16];
+    write_u32_le(&mut buf, 0, p.process_id_low);
+    let mut i = 0;
+    while i < 12 {
+        buf[4 + i] = p.comm[i];
+        i += 1;
+    }
+    let len = core::mem::size_of::<PayloadProcessLabel>() as u16;
+    (buf, len)
+}
+
+/// Return the correct [`TxPayloadTag`] for a [`PayloadProcessLabel`].
+#[inline]
+pub const fn process_label_tag() -> TxPayloadTag {
+    TxPayloadTag::ProcessLabel
 }
 
 // ---------------------------------------------------------------------------

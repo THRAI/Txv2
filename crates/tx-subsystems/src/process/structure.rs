@@ -1052,7 +1052,7 @@ pub struct ProcessPayload {
     /// Process short name (comm). Up to 15 bytes + NUL. Initialised
     /// from the executable basename at `execve`; can be changed via
     /// `prctl(PR_SET_NAME)`. Read by procfs `/proc/<pid>/stat`.
-    pub(crate) _comm: SpinMutex<[u8; 16]>,
+    pub _comm: SpinMutex<[u8; 16]>,
     pub(crate) thread_count: AtomicU32,
     pub(crate) group_exit: SpinMutex<Option<GroupExitState>>,
     pub vfork_done: AtomicBool,

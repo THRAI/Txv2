@@ -52,7 +52,7 @@ pub mod testing;
 // Re-exports used by the `traced_syscall!` macro so crates that use the macro
 // do not need to directly depend on `tx-observe-types`.
 #[doc(hidden)]
-pub use tx_observe_types::{PayloadSyscallEnter, PayloadSyscallExit};
+pub use tx_observe_types::{PayloadProcessLabel, PayloadSyscallEnter, PayloadSyscallExit};
 
 // ---------------------------------------------------------------------------
 // Public newtypes

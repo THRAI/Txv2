@@ -62,6 +62,17 @@ pub enum TxPayloadTag {
     /// Payload: [`PayloadSchedSwitch`].
     SchedSwitch = 53,
 
+    // ── Process identity label (OBS-V1 §15.7) ────────────────────────────
+    /// One-shot mapping from `process_id_low` → human-readable
+    /// program name (PCB `comm` — short 16-byte Linux-style identity).
+    ///
+    /// Emitted as an `Instant` once per process at submit time so the
+    /// trace daemon can build a `ProcessDescriptor.process_name` from
+    /// the actual program identity (e.g. `busybox`, `basic_exec`)
+    /// instead of falling back to the synthetic `pid-<N>` label.
+    /// Payload: [`PayloadProcessLabel`].
+    ProcessLabel = 54,
+
     // ── Panic (special) ───────────────────────────────────────────────────
     Panic = 60,
 }
@@ -495,6 +506,33 @@ pub enum SchedReason {
     /// was already set during the poll itself, so the reactor will
     /// re-dispatch immediately.  (`mark_runnable_from_hart` path.)
     WokeDuringPoll = 3,
+}
+
+/// One-shot mapping from `process_id_low` to a 12-byte slice of the
+/// PCB short program name.  Emitted as an `Instant` once per process,
+/// immediately after submit.  The daemon caches `pid → name` and
+/// uses it as the `ProcessDescriptor.process_name` when first
+/// materialising the per-process Perfetto track, so the timeline
+/// shows real program names (`busybox`, `basic_exec`) instead of the
+/// synthetic `pid-<N>` fallback.
+///
+/// `comm` is truncated to 12 bytes (vs Linux's 16) so the whole
+/// payload fits in `TxTraceRecord.payload` (16 bytes inline). Names
+/// longer than 11 chars + NUL are truncated; this is fine for the
+/// oscomp + busybox workloads where `comm` is typically ≤ 8 bytes.
+///
+/// Layout spec: `08_OBSERVATION_v1.md` §15.7 (OBS-9 process labels).
+/// size = 16.
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadProcessLabel {
+    /// PCB PID low 32 bits — keyed against `PayloadSchedSwitch.process_id_low`.
+    pub process_id_low: u32,
+    /// First 12 bytes of `ProcessIdentity::comm()` (NUL-padded ASCII).
+    /// Truncated from the full 16-byte `TASK_COMM_LEN`-style buffer to
+    /// fit the inline payload size.
+    pub comm: [u8; 12],
 }
 
 // ---------------------------------------------------------------------------

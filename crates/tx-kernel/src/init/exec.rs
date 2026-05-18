@@ -639,6 +639,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // parent the per-thread tracks.
         let tid_low = thread.tid.0;
         let pid_low = init.pid.0;
+        let comm = init.comm();
         let submitted = BOOT_REACTOR.with(|reactor| {
             reactor.submit_task_with_meta(
                 crate::thread_future::PerHartSlotted::<P, _>::new(
@@ -655,6 +656,11 @@ impl<P: TxPlatform> CoreInit<P> {
             // Boot reactor not initialised; nothing to drive.
             return;
         }
+        // OBS-V1 §15.7: emit a one-shot ProcessLabel Instant so the
+        // daemon can surface the real PCB `comm` (`init`, `busybox`,
+        // …) on the per-process Perfetto track instead of the
+        // synthetic `pid-<N>` fallback.
+        emit_process_label::<P>(pid_low, &comm);
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:submitted\n");
 

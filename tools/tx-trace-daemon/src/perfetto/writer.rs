@@ -65,6 +65,14 @@ pub struct PftraceWriter {
     /// "no PID known" sentinel; the writer falls back to the
     /// hart-flat task track in that case.
     current_pid_per_hart: HashMap<u16, u32>,
+    /// Cached `pid → comm` mapping seeded by `PayloadProcessLabel`
+    /// Instants. Consulted when first materialising a process track
+    /// so the `ProcessDescriptor.process_name` reflects the real PCB
+    /// short name (`busybox`, `basic_exec`) instead of the synthetic
+    /// `pid-<N>` fallback. Unset PIDs fall through to the synthetic
+    /// name (graceful degrade for traces captured before the OBS-9
+    /// §15.7 wire format landed).
+    process_comm: HashMap<u32, String>,
 }
 
 impl PftraceWriter {
@@ -87,6 +95,7 @@ impl PftraceWriter {
             first_sequence_packet: true,
             current_task_per_hart: HashMap::new(),
             current_pid_per_hart: HashMap::new(),
+            process_comm: HashMap::new(),
         };
 
         // Emit the "harts process" track descriptor first.
@@ -225,6 +234,37 @@ impl PftraceWriter {
             }
         }
 
+        // OBS-V1 §15.7: process-label Instants seed `pid → comm`.
+        // Cache it now so the next non-Sched slice for this PID picks
+        // up the real PCB name when it first materialises the process
+        // track. We don't render the label itself as a slice — it's a
+        // metadata pulse, consumed by the daemon.
+        if r.payload_tag == TxPayloadTag::ProcessLabel as u16
+            && kind_byte == TxTraceKind::Instant as u8
+        {
+            if let Some((pid, comm)) = extract_process_label(r) {
+                self.process_comm.insert(pid, comm.clone());
+                // If the process track was already created (e.g. with
+                // `pid-<N>` or the parent's pre-execve comm), emit a
+                // fresh TrackDescriptor with the same UUID so Perfetto
+                // updates the track header to the new name. Skipped
+                // when no track exists yet — first slice for this PID
+                // will pick the name up from `process_comm` at
+                // `ensure_thread_track_under_process` time.
+                if let Some(desc) = self.tracks.rename_process_track(pid, &comm) {
+                    self.packets.push(TracePacket {
+                        trusted_packet_sequence_id: Some(SEQ_ID),
+                        track_descriptor: Some(desc),
+                        ..Default::default()
+                    });
+                }
+            }
+            // Skip emitting a Perfetto packet for the bare label
+            // itself — its only job is to seed the cache and
+            // (optionally) rename the existing track above.
+            return;
+        }
+
         // Choose the slice track: the per-thread track parented under
         // a per-process track when both PID and TID are known for the
         // current hart; the hart-flat task track when only TID is
@@ -238,8 +278,13 @@ impl PftraceWriter {
         } else if let Some(&tid) = self.current_task_per_hart.get(&r.hart) {
             let pid = self.current_pid_per_hart.get(&r.hart).copied().unwrap_or(0);
             if pid != 0 {
-                let (uuid, proc_desc, thread_desc) =
-                    self.tracks.ensure_thread_track_under_process(pid, r.hart, tid);
+                // Use the cached PCB `comm` as the process track name
+                // when we've seen a ProcessLabel for this PID; fall
+                // through to the synthetic `pid-<N>` otherwise.
+                let proc_name = self.process_comm.get(&pid).cloned();
+                let (uuid, proc_desc, thread_desc) = self
+                    .tracks
+                    .ensure_thread_track_under_process(pid, r.hart, tid, proc_name.as_deref());
                 if let Some(d) = proc_desc {
                     self.packets.push(TracePacket {
                         trusted_packet_sequence_id: Some(SEQ_ID),
@@ -366,25 +411,44 @@ impl PftraceWriter {
                     self.push_resume(r.ts, hart_uuid, task_id_low, wait_gen);
                 } else {
                     let name_id = parse_hex_u32(&r.name_id);
-                    let (iid, new_name) = self.names.intern(name_id);
 
                     // OBS-V1 §8.6: `ArgValue` continuation records carry the
                     // raw syscall arg (or other annotation) as the
-                    // payload's `value0` field. Surface that value as a
-                    // debug annotation on the instant so the Perfetto
-                    // "Current Selection" panel shows the actual u64 next
-                    // to the arg name (`a0`, `a1`, …) instead of just an
-                    // anonymous anchor.
+                    // payload's `value0` field. We surface that value in
+                    // TWO complementary ways:
+                    //   1. As the `TrackEvent.name` itself — formatted as
+                    //      e.g. `a0=0x1234`. Perfetto renders Instants as
+                    //      vertical markers labeled by the event name, so
+                    //      this puts the register value directly on the
+                    //      timeline next to the syscall slice (no click
+                    //      needed). We intern the formatted string fresh
+                    //      per (arg_name, value) pair via `intern_str`.
+                    //   2. As a `DebugAnnotation` named "value" — keeps
+                    //      the structured value reachable from the
+                    //      "Current Selection" panel so tooling can
+                    //      diff/filter on it without parsing the label.
                     let arg_value =
                         (r.payload_tag == TxPayloadTag::ArgValue as u16)
                             .then(|| extract_arg_value_field(r));
 
+                    let (iid, new_name) = if let Some(v) = arg_value {
+                        // Resolve the arg's base name (`a0`, `a1`, …)
+                        // through the regular names.json path, then
+                        // format `name=0x<hex>` and intern THAT as the
+                        // Instant's visible label.
+                        let base = self
+                            .names
+                            .get_resolved_name(name_id)
+                            .unwrap_or_else(|| format!("arg_0x{name_id:08x}"));
+                        let label = format!("{base}=0x{v:x}");
+                        self.names.intern_str(&label)
+                    } else {
+                        self.names.intern(name_id)
+                    };
+
                     let mut debug_annotation_names = vec![];
                     let mut debug_annotations = vec![];
                     if let Some(v) = arg_value {
-                        // Reuse the same intern table for the annotation
-                        // key ("value"); cheap and keeps the wire packets
-                        // small.
                         let (value_iid, value_new_name) = self.names.intern_str("value");
                         if let Some(n) = value_new_name {
                             debug_annotation_names.push(DebugAnnotationName {
@@ -742,6 +806,33 @@ fn extract_arg_value_field(r: &DecodedRecord) -> u64 {
         .as_ref()
         .and_then(|p| p["value0"].as_u64())
         .unwrap_or(0)
+}
+
+/// Extract `(process_id_low, comm_string)` from a `ProcessLabel`
+/// payload JSON. `comm` is rendered from the wire `[u8; 12]` by
+/// stopping at the first NUL or non-printable byte; if no printable
+/// bytes precede the NUL we drop the label (graceful degrade so a
+/// corrupt name doesn't replace a synthetic `pid-<N>` with the empty
+/// string).
+fn extract_process_label(r: &DecodedRecord) -> Option<(u32, String)> {
+    let p = r.payload.as_ref()?;
+    let pid = p["process_id_low"].as_u64()? as u32;
+    let bytes = p["comm"].as_array()?;
+    let mut s = String::new();
+    for b in bytes {
+        let byte = b.as_u64()? as u8;
+        if byte == 0 {
+            break;
+        }
+        if !(0x20..=0x7e).contains(&byte) {
+            return None;
+        }
+        s.push(byte as char);
+    }
+    if s.is_empty() {
+        return None;
+    }
+    Some((pid, s))
 }
 
 /// Extract `(task_id_low, process_id_low)` from a `SchedSwitch` payload JSON.

@@ -1535,10 +1535,11 @@ impl<P: TxPlatform> CoreInit<P> {
             // daemon can build a ProcessDescriptor parent track for the
             // per-thread tracks.
             let tid_low = child_thread.tid.0;
-            let pid_low = child_thread
-                .upgrade_owner_proc()
-                .map(|p| p.pid.0)
-                .unwrap_or(0);
+            let owner = child_thread.upgrade_owner_proc();
+            let pid_low = owner.as_ref().map(|p| p.pid.0).unwrap_or(0);
+            // Snapshot PCB `comm` before moving `child_thread` into the
+            // future. None for orphan threads with no owner_proc.
+            let comm = owner.as_ref().map(|p| p.comm());
             let _ = BOOT_REACTOR.with(|reactor| {
                 reactor.submit_task_with_meta(
                     crate::thread_future::PerHartSlotted::<P, _>::new(
@@ -1551,6 +1552,14 @@ impl<P: TxPlatform> CoreInit<P> {
                         .with_process_id(pid_low),
                 );
             });
+            // OBS-V1 §15.7: emit a one-shot ProcessLabel Instant so the
+            // daemon can surface the real PCB `comm` (e.g. `basic_exec`)
+            // on the per-process Perfetto track. Skipped if the parent
+            // process identity was already dropped (defensive — `comm`
+            // would be the `?` sentinel and add no information).
+            if let Some(ref c) = comm {
+                emit_process_label::<P>(pid_low, c);
+            }
         }
     }
 }
@@ -1568,6 +1577,50 @@ static PENDING_CHILD_SUBMITS: SpinMutex<
 /// Used by `CoreInit::drive_bootstrap_exec` to drive `exec_script`'s
 /// future without spinning up the reactor: the boot path runs before
 /// the BSP reactor loop is entered, and `exec_script` only awaits on
+/// Emit a one-shot `PayloadProcessLabel` Instant mapping `pid_low` to
+/// the PCB `comm` (Linux-style short program name). Surfaces the
+/// real program name on the per-process Perfetto track instead of
+/// the synthetic `pid-<N>` fallback (OBS-V1 §15.7).
+///
+/// The Instant rides on the current parent span slot (the active
+/// Sched span when called from `submit_task_with_meta`'s caller) so
+/// the daemon can hang it off the right hart. Truncates `comm` to 12
+/// bytes to fit the inline payload buffer — the prefix is enough to
+/// disambiguate basic-musl test binaries and busybox.
+///
+/// No-op when no `HartEmitter` is installed (host tests, boards
+/// without an observation ring).
+pub(crate) fn emit_process_label<P: tx_hal::TxPlatform>(pid_low: u32, comm: &[u8; 16]) {
+    let _ = (pid_low, comm);
+    let Some(em) = tx_observe::current() else {
+        return;
+    };
+    let mut truncated = [0u8; 12];
+    let n = core::cmp::min(comm.len(), truncated.len());
+    truncated[..n].copy_from_slice(&comm[..n]);
+    // Force NUL termination of the truncated buffer if it lost one.
+    if !truncated.iter().any(|&b| b == 0) {
+        truncated[truncated.len() - 1] = 0;
+    }
+    let payload = tx_observe::PayloadProcessLabel {
+        process_id_low: pid_low,
+        comm: truncated,
+    };
+    let (enc, len) = tx_observe::encode::encode_process_label(&payload);
+    em.instant(
+        tx_observe::TxTraceLevel::Sched,
+        // Encode the PID into the EventNameId so the daemon can pair
+        // the label to a specific process even if it sees records
+        // out of order. The `0x9000_0000` prefix namespaces this away
+        // from both the kernel's FNV-1a-hashed op_name_id range and
+        // the `0x8000_0000` Sched-task range used by `emit_sched_*`.
+        tx_observe::EventNameId::from_raw(0x9000_0000 | pid_low),
+        tx_observe::current_parent_span(),
+        tx_observe::encode::process_label_tag(),
+        &enc[..len as usize],
+    );
+}
+
 /// page-pull operations that resolve immediately under tmpfs.
 ///
 /// The bound `1024` polls is chosen to mirror the matching pattern in
