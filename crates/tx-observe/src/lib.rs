@@ -704,6 +704,62 @@ fn check_dump_threshold() {
     }
 }
 
+/// Reset the observation ring for the calling hart: clear
+/// producer/consumer/seq/lost on the ring header and the per-hart
+/// span counter, and zero the global `EMITTED_COUNT`. Useful for
+/// debug runs where the workload runs many phases before the
+/// interesting one and the ring fills with uninteresting records:
+/// call this at the phase boundary (e.g. just before launching the
+/// libctest test suite) so the next `OBSERVE_DUMP_THRESHOLD`
+/// crossing captures the interesting phase rather than the early
+/// noise.
+///
+/// SPSC discipline: must be called on the hart that owns the ring,
+/// while the producer is otherwise quiescent (i.e. not mid-emit).
+/// In practice the syscall dispatcher path is the only legitimate
+/// caller — between syscalls, the producer is quiescent by
+/// construction.
+///
+/// No-op if the hart has no initialised ring slot.
+pub fn reset_ring_and_arm(threshold: u64) {
+    // Auto-detect the calling hart via the `PercpuIf`-installed
+    // function pointer (same path `check_dump_threshold` /
+    // `set_current_parent_span` use). Avoids forcing every caller
+    // to take an `SmpIf` bound — debug callers like the
+    // exec-marker hook stay generic-free.
+    let Some(cpu) = read_current_cpu_id() else {
+        return;
+    };
+    let idx = cpu.0;
+    if idx >= MAX_HARTS {
+        return;
+    }
+    // Guard against pre-init by checking the parallel EMITTERS
+    // option-array first. `init` writes EMITTERS *after*
+    // initialising HART_SLOTS, so `EMITTERS.get(idx).is_some()` is
+    // the safe gate that the slot is fully constructed.
+    if EMITTERS.get(idx).is_none() {
+        return;
+    }
+    // SAFETY: EMITTERS gate above proves init ran for this hart;
+    // per the doc-comment contract the caller is on the owning
+    // hart and the producer is quiescent.
+    let slot = HART_SLOTS.get(idx);
+    let ring = unsafe { &*slot.ring_hdr };
+    ring.producer.store(0, Ordering::Relaxed);
+    ring.consumer.store(0, Ordering::Relaxed);
+    ring.seq.store(0, Ordering::Relaxed);
+    ring.lost.store(0, Ordering::Relaxed);
+    slot.span_counter.store(0, Ordering::Relaxed);
+    EMITTED_COUNT.store(0, Ordering::Relaxed);
+    // Re-arm the threshold trigger: clear the `DUMP_REQUESTED`
+    // flag so a stale signal from before the reset doesn't fire on
+    // the very next emit, then install the configured threshold.
+    // Passing `0` keeps the threshold disabled across the reset.
+    DUMP_REQUESTED.store(false, Ordering::Relaxed);
+    DUMP_THRESHOLD.store(threshold, Ordering::Relaxed);
+}
+
 // ---------------------------------------------------------------------------
 // Serial-console hex dump (host extraction path)
 //
@@ -759,7 +815,43 @@ where
     // and exclusively owned by hart `hart` on the producer side. By the
     // time the dump is invoked, the producer has quiesced (init has
     // zombified), so a read of the full region is sound.
-    let ring: &[u8] = unsafe { core::slice::from_raw_parts(desc.base.as_ptr(), desc.size) };
+    let ring_full: &[u8] = unsafe { core::slice::from_raw_parts(desc.base.as_ptr(), desc.size) };
+    // For partial-ring dumps (e.g. when triggered by the bounded-trace
+    // threshold), reading the producer cursor lets us emit only the
+    // populated slots instead of the entire ring. The 4 MiB rv64
+    // backing produces an ~8 MiB hex stream that takes ~25 minutes
+    // at 115 200 baud; trimming to the filled portion cuts that to
+    // seconds for early-phase dumps. The records past `producer` are
+    // either zeros or stale pre-reset data — neither is wanted in
+    // the trace.
+    let ring: &[u8] = {
+        const TX_TRACE_HART_RING_BYTES: usize = 208;
+        const TX_TRACE_RECORD_BYTES: usize = 80;
+        if ring_full.len() < TX_TRACE_HART_RING_BYTES {
+            ring_full
+        } else {
+            // SAFETY: header layout matches `TxTraceHartRing`. The
+            // first AtomicU64 field is `producer` at offset 0 of the
+            // header.
+            let ring_hdr_ptr = desc.base.as_ptr() as *const TxTraceHartRing;
+            let producer = unsafe { (*ring_hdr_ptr).producer.load(Ordering::Acquire) };
+            let slot_capacity_max =
+                (ring_full.len() - TX_TRACE_HART_RING_BYTES) / TX_TRACE_RECORD_BYTES;
+            // prev power of two
+            let slot_capacity = if slot_capacity_max == 0 {
+                0
+            } else {
+                1usize << (usize::BITS - 1 - slot_capacity_max.leading_zeros())
+            };
+            let used_slots = if (producer as usize) >= slot_capacity {
+                slot_capacity
+            } else {
+                producer as usize
+            };
+            let used_bytes = TX_TRACE_HART_RING_BYTES + used_slots * TX_TRACE_RECORD_BYTES;
+            &ring_full[..used_bytes.min(ring_full.len())]
+        }
+    };
     use tx_observe_types::{TxTraceClockId, TxTraceHeader, TxTraceHeaderFlags, TX_TRACE_MAGIC};
 
     // `ring_order` is `log2(slot_count)`. The ring slot count is

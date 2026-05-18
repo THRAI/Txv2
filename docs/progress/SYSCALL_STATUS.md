@@ -154,7 +154,7 @@ cargo xtask oscomp test        --target rv64-qemu --suite busybox-musl
 | `basic-musl`   | **102/102** | +1 | full pass |
 | `busybox-musl` | **52/55**   | 0  | landed; 3 non-kernel (`hwclock`, `kill 10`, `which ls`) |
 | `libcbench-musl` | **~13.9/27** | 0 | partial; malloc benches + stdio tests fail |
-| `libctest-musl`  | **0/220** | 0 (now `[timed out]` not `[signal Killed]`) | parent now blocks correctly in `sys_rt_sigtimedwait`; children wedge before exiting — root cause under investigation |
+| `libctest-musl`  | **14/220 (and counting)** | **+14** | TimerToken-mismatch fix in `tx_scripts::drive::resolve_on_timer` lets parent's `OnTimer` yield resume correctly; argv/basename/clocale_mbfuncs/clock_gettime/dirname/env/fdopen/fnmatch/fscanf/fwscanf/iconv_open/inet_pton/mbc/memstream all pass. Next FAIL is `pthread_cancel_points` (SIGSEGV — expected without pthread support); kernel then trapped on a user-pointer `read_volatile` during `pthread_cancel` (separate kernel-side EFAULT bug, pre-existing) |
 | `lua-musl`     | **9/9**     | +9 | full pass |
 | `lmbench-musl` | **0/36**    | 0  | needs `/var/tmp` + `Simple read: -1` triage |
 

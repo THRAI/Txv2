@@ -110,6 +110,11 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
 
+    // (Debug execve-marker observe-reset hook removed once
+    // `basename` was traced — the wedge was the TimerId/TimerToken
+    // mismatch in `tx_scripts::drive::resolve_on_timer`. See that
+    // function for the fix.)
+
     // ----- Step 2 + 3: bounded reads of argv and envp -----
     //
     // The byte budget is shared across argv and envp per Linux's

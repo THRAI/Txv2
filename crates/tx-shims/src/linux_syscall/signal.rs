@@ -8,6 +8,31 @@ use tx_subsystems::process::numbers::{resolve_pid_number, PidName};
 use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
 use tx_subsystems::signal::{KillOutcome, SignalTarget};
 
+/// Drain `SignalDelivered` events from a thread mailbox.
+///
+/// The `tx-scripts::drive` inner mailbox-await re-posts any
+/// `SignalDelivered` event it consumes so the calling syscall's
+/// outer loop can re-observe the signal. For `sys_rt_sigtimedwait`,
+/// we consume signals directly from `payload.pending()` — the
+/// re-posted mailbox event is stale information that would otherwise
+/// trap every subsequent `drive(NanosleepOp)` call into returning
+/// immediately, degenerating the 5 ms poll cadence to a no-op spin.
+/// This helper drains every queued `SignalDelivered` (preserving any
+/// other events like `TimerFired` or `SourceFired` that are still
+/// genuinely informative for the next park).
+fn drain_stale_signal_events(mailbox: &crate::adapter::reactor_entry::TaskMailbox) {
+    use crate::adapter::reactor_entry::MailboxEvent;
+    let mut keep = alloc::vec::Vec::new();
+    while let Some(event) = mailbox.poll() {
+        if !matches!(event, MailboxEvent::SignalDelivered { .. }) {
+            keep.push(event);
+        }
+    }
+    for event in keep {
+        let _ = mailbox.post(event);
+    }
+}
+
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)` per `SIGNAL_v1` §3.
 ///
 /// `sigsetsize` is rejected with `-EINVAL` for any value other than
@@ -197,6 +222,22 @@ pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
     let start_ns = <P as tx_hal::TimeIf>::read_ns();
     let deadline_ns = start_ns.saturating_add(timeout_ns);
 
+    // `await_mailbox_event` (in `tx-scripts::drive::resolve_on_timer`)
+    // RE-POSTS any `SignalDelivered` event it consumes back to the
+    // mailbox so the caller's main loop can observe it. For
+    // sigtimedwait, the "main loop" IS this loop, and we consume
+    // signals directly from `payload.pending()` — so the re-posted
+    // event is stale information. If left in the queue it traps every
+    // subsequent `drive(NanosleepOp)` call into returning Ready(true)
+    // immediately, creating a no-actual-sleep tight loop. Drain any
+    // pre-existing `SignalDelivered` events left over from a previous
+    // sigtimedwait call on this same thread before the poll loop
+    // starts; the per-iteration drain below handles new arrivals.
+    let mailbox_for_drain = crate::adapter::reactor_entry::current_task_mailbox();
+    if let Some(ref mbox) = mailbox_for_drain {
+        drain_stale_signal_events(mbox);
+    }
+
     // Poll-and-yield loop. 5 ms chunks: long enough that we don't
     // spin-burn the reactor, short enough that libctest tests with
     // sub-second test bodies (most of them) react promptly to a
@@ -231,12 +272,18 @@ pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
 
         // Async-friendly chunk wait. Reuse the `NanosleepOp`
         // machinery so we yield on the timer wheel; the next reactor
-        // poll re-enters this loop.
+        // poll re-enters this loop. **Critically**, pass the calling
+        // task's mailbox to `drive()` — without it,
+        // `resolve_on_timer` short-circuits to `Retry` immediately
+        // and the "5 ms sleep" becomes a no-op spin (parent then
+        // hogs the reactor so the child never runs).
         let chunk = CHUNK_NS.min(deadline_ns.saturating_sub(now_ns));
+        use crate::adapter::reactor_entry::current_task_mailbox;
         use crate::adapter::step_engine::DriveMode;
         use tx_scripts::drive;
         let mut script_ctx = build_subject_script_ctx(ctx);
         let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+        let mailbox = current_task_mailbox();
         let op = super::NanosleepOp {
             nanos: chunk,
             deadline_ns: now_ns.saturating_add(chunk),
@@ -246,11 +293,21 @@ pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
             op,
             &mut script_ctx,
             DriveMode::Waiting,
-            None,
+            mailbox.as_ref(),
             None,
             timer_wheel_arc.as_ref(),
         )
         .await;
+
+        // After drive returns, drain any `SignalDelivered` events
+        // the inner mailbox-await re-posted. See the matching
+        // comment at the top of this function — without this
+        // drain, a single stale SignalDelivered traps every
+        // subsequent drive iteration into a tight loop and the
+        // 5 ms sleep degenerates to a no-op spin.
+        if let Some(ref mbox) = mailbox {
+            drain_stale_signal_events(mbox);
+        }
     }
 }
 
