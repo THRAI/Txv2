@@ -42,11 +42,6 @@ pub(super) fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
 /// `exit_group(status)` — per `PROCESS_v1` §7.3.2.
 /// PR-3 migration: `ExitGroupOp` is a `OneShotStepOp` — dispatched
 /// via `drive_oneshot` (no reactor, no yield).
-/// `gettid()` — return the callers thread id.
-pub(super) fn sys_gettid(ctx: &SyscallCtx) -> SyscallResult {
-    SyscallResult::Return(ctx.thread.tid.0 as i64)
-}
-
 pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let status = args[0] as i32;
     let mut script_ctx = build_subject_script_ctx(ctx);

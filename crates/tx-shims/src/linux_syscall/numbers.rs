@@ -333,9 +333,11 @@ pub const IPPROTO_IP: i32 = 0;
 pub const IPPROTO_ICMP: i32 = 1;
 pub const IPPROTO_TCP: i32 = 6;
 pub const IPPROTO_UDP: i32 = 17;
+pub const IP_RECVERR: i32 = 11;
 pub const SO_REUSEADDR: i32 = 2;
 pub const SO_TYPE: i32 = 3;
 pub const SO_ERROR: i32 = 4;
+pub const SO_DONTROUTE: i32 = 5;
 pub const SO_KEEPALIVE: i32 = 9;
 pub const SO_BROADCAST: i32 = 6;
 pub const SO_LINGER: i32 = 13;
@@ -413,8 +415,6 @@ pub const CLONE_NEWIPC: u64 = 0x8000000;
 /// init when init is registered, so under normal flows the difference
 /// is invisible.
 pub const NR_GETPPID: u64 = 173;
-pub const NR_GETTID: u64 = 178;
-
 /// `setpgid(pid, pgid)`. Linux generic ABI `__NR_setpgid`. Wraps
 /// `step_setpgid`. The trio's day-1 step only supports
 /// `pid == self` and `pgid == self.pid` (creates a fresh process

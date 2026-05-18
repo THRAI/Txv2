@@ -47,7 +47,8 @@ pub async fn drive_socket_connect_waiting(
 
 fn wait_on_yield_shape(shape: YieldShape) -> Option<crate::wait_source::RegisteredWaitFuture> {
     match shape {
-        YieldShape::OnWaitSource { source, interests } => {
+        YieldShape::OnWaitSource { source, interests }
+        | YieldShape::OnEdge { source, interests } => {
             let token = crate::execution::WaitToken::new(source.raw(), interests.raw());
             crate::wait_source::wait_on_token(token)
         }

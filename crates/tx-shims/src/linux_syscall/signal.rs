@@ -10,6 +10,7 @@ use crate::adapter::step_engine::SpinMutex;
 use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
 use tx_subsystems::signal::{KillOutcome, SignalTarget};
+use tx_subsystems::thread_runtime::execution::step_sigprocmask;
 
 #[cfg(target_arch = "loongarch64")]
 const MUSL_SIGCANCEL: u8 = 33;

@@ -1582,46 +1582,11 @@
   due to missing /proc and utimensat). No blocker on basic-musl.
 
 - 2026-05-18 **oscomp basic `test_clone` + `test_mount` unblocked.**
-  Two narrow fixes targeting two of the four reported failures in the
-  oscomp basic-musl suite. The other two (`test_mmap` segfault,
-  `test_munmap` EINVAL) still need runtime diagnosis and are tracked
-  as the next priorities.
-
-  1. **`sys_clone` now honours non-zero `newsp` (libc `clone(2)` shape).**
-     Previously rejected with `-EINVAL`
-     ([proc.rs:253 pre-fix](../../crates/tx-shims/src/linux_syscall/proc.rs)).
-     The oscomp `test_clone` calls libc-style `clone(fn, NULL, stack,
-     1024, SIGCHLD)`; basic's `__clone` asm
-     ([clone.s](https://github.com/oscomp/testsuits-for-oskernel/blob/pre-20250615/basic/user/lib/arch/riscv/clone.s))
-     pushes `fn`/`arg` to the new stack and passes `newsp` through to
-     the syscall — the child code path reads `0(sp)` and `8(sp)` to
-     find the function pointer, so it requires `sp = newsp` on
-     userspace re-entry. Fix:
-     - New `STACK_REG_INDEX` constant (RV64 `regs[2]` / LA64 `regs[3]`)
-       in
-       [execution.rs:511](../../crates/tx-subsystems/src/process/execution.rs).
-     - `seed_child_leader_context` now takes a fourth `stack: usize`
-       argument and stamps `child_ctx.regs[STACK_REG_INDEX] = stack`
-       when non-zero. Zero preserves the bare-fork convention
-       (child shares parent's sp).
-     - `sys_clone` plumbs `args[1]` through and drops the EINVAL
-       guard. Reactor seam unchanged.
-     - Existing `dispatch_clone_with_nonzero_stack_returns_neg_einval`
-       test inverted into
-       `dispatch_clone_with_nonzero_stack_seeds_child_sp`, plus a new
-       `seed_child_leader_context_overrides_sp_when_stack_nonzero`
-       unit test on the seed helper.
-
-  2. **`sys_mount("vfat", ...)` aliases to tmpfs (oscomp-compat stub).**
-     Previously returned `-ENOSYS` (`-38`)
-     ([fs_mut.rs:782 default arm](../../crates/tx-shims/src/linux_syscall/fs_mut.rs)).
-     The oscomp `test_mount` mounts `/dev/vda2` with fstype `vfat` and
-     only asserts `mount` + `umount` round-trip succeed; no FAT bytes
-     are read. A fresh tmpfs at the mount point satisfies the
-     contract without pretending to be FAT. Real FAT support tracks
-     separately. Implementation: `"vfat"` joins the `"tmpfs"` arm with
-     the `vfat` label preserved through `MountPayload.fstype` for
-     `/proc/mounts` honesty.
+  Two narrow fixes targeting the first reported basic-musl failures:
+  `sys_clone` now honours non-zero `newsp` for libc clone, and
+  `sys_mount("vfat", ...)` aliases to tmpfs for the OSComp mount/umount
+  round trip. Follow-up work in the same mainline series completed the
+  mmap/munmap and pipe-read blockers, yielding the 32/32 result above.
 
   **Verified:** `cargo -q xtask unit` — 331 tests pass (229 tx-shims,
   44 tx-kernel, 8 tx-ext4, 50 tx-scripts). `cargo xtask full-build
@@ -1629,11 +1594,69 @@
   both succeed. QEMU runtime re-check pending (the user reported the
   failures from an external run).
 
-  **Next:** runtime-diagnose `test_mmap` segfault (suspected: page
-  fault handler not materialising `VmBacking::Page` for shared
-  file-backed VMAs) and `test_munmap` EINVAL (path through
-  `try_munmap` returning `Errno::EINVAL` for a range that mmap just
-  produced — needs serial log).
+  **Next:** superseded by the 32/32 basic-musl pass above.
+
+- 2026-05-18 **N69c OSComp netperf IPv4 loopback suite passes.**
+  Added the five-test OSComp parity shell coverage under `tools/shell-tests/`
+  plus a suite runner, and recorded the result in
+  [msp/network-n69c-netperf-coverage-result.md](../../msp/network-n69c-netperf-coverage-result.md).
+  The covered tests are `UDP_STREAM`, exact-arg `TCP_STREAM`, `UDP_RR`,
+  `TCP_RR`, and `TCP_CRR` against `netserver -D -L 127.0.0.1 -p 12865`.
+
+  The implementation gap fixes were intentionally small: `SO_DONTROUTE` and
+  `IP_RECVERR` now round-trip through socket options, and blocking
+  `recvfrom`/`accept` waits now race their socket wait-source against the
+  calling process's `ITIMER_REAL` deadline. When the timer wins, the syscall
+  returns `-EINTR`; the existing kernel-to-user return path delivers SIGALRM and
+  `rt_sigreturn` restores the interrupted result. This unblocks UDP_STREAM's
+  server `recvfrom` and TCP_CRR's server `accept` at test end.
+
+  **Verification:** `cargo fmt --check`; `cargo test -p tx-shims socket_fdtable::dispatch_setsockopt_getsockopt_round_trips`; `cargo test -p tx-shims time_syscalls::itimer_real_sigalrm_handler_round_trip_restores_context`; `cargo xtask full-build --target rv64-qemu --skip-doctor --no-image`; N69c individual shell-tests for `udp-stream`, `udp-rr`, `tcp-rr`, `tcp-crr`; `cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/busybox-netperf-oscomp-suite.txt`; regressions `busybox-netperf-loopback.txt`, `busybox-netperf-help.txt`, `busybox-iperf3-loopback.txt`, and `cargo xtask test busybox-boot --target rv64-qemu`. After `busybox-boot` regenerated the plain image, the OSComp image was rebuilt with `TX_OSCOMP_RISCV_MUSL_DIR=/home/msp/learning/rustOS/testcase/riscv/musl cargo xtask image cpio --profile busybox --target rv64-qemu`.
+  **Next:** keep IPv6 and broader netperf modes out of N69c; use future
+  workloads to decide whether `connect`/`sendto`/`recvmsg` need the same
+  interruptible wait pattern. **Blockers:** none for OSComp IPv4 loopback
+  parity; UDP_RR rate can still report `0.00`, so this is a functional gate,
+  not a performance gate.
+
+- 2026-05-18 **N69c netperf coverage plan captured.**
+  Added [msp/network-n69c-netperf-coverage-plan.md](../../msp/network-n69c-netperf-coverage-plan.md)
+  after auditing the local OSComp musl `netperf_testcode.sh`, existing
+  N69b shell-test, current Txv2 socket/syscall support, and `strings` output
+  from the local `netperf`/`netserver` binaries. No local netperf C source
+  tree was found; the durable plan therefore treats the OSComp script as the
+  immediate acceptance source and separates it from optional upstream-style
+  netperf modes.
+
+  **Current state:** N69b minimal IPv4 loopback `TCP_STREAM` remains the only
+  proven netperf data-path gate. The documented N69c scope is OSComp parity:
+  exact-arg `TCP_STREAM`, `UDP_STREAM`, `UDP_RR`, `TCP_RR`, `TCP_CRR`, then a
+  suite shell-test expecting five `end: success` markers. IPv6 is explicitly
+  out of N69c because the local OSComp script uses `127.0.0.1` and the current
+  network ABI/subsystem is IPv4-only.
+
+  **Verification:** docs-only planning pass; `cargo xtask progress validate`.
+  **Next:** add the single-test shell scripts in the order documented, starting
+  with exact-arg `TCP_STREAM`, and use trap-trace to fix one syscall/socket
+  semantic per failing test. **Blockers:** none beyond unimplemented N69c test
+  slices.
+
+- 2026-05-18 **feature-network rebased on `main` c54e339; N69b netperf loopback passes after signal/TTY catch-up.**
+  After the main rebase, N69b regressed first in the parent shell after
+  `netperf -h`: SIGCHLD handler return reached the stack trampoline, but
+  the RV64 signal frame bytes had truncated the trampoline and the stack
+  page was not executable. The fix increases `SignalFrameBytes` capacity to
+  cover the full RV64 frame, marks the trampoline page executable after the
+  frame copy, and folds any pending syscall return into the signal frame's
+  saved pre-handler context before delivery so `rt_sigreturn` resumes at the
+  post-syscall state instead of replaying `wait4`.
+
+  Rebase fallout also needed one host-test catch-up: `drive_boot_wiring()`
+  now mirrors production by registering the `/dev/null` TTY before publishing
+  the devfs `null` alias. The full unit lane is back to the known pre-existing
+  single failure in
+  `init::tests::userspace_net_smoke::boot_smoke_userspace_tcp_loopback_uses_reactor_owned_delegate`.
+
+  **Verification:** `cargo fmt --check`; `cargo test -p tx-hal-riscv64-qemu-virt rv64_signal_frame_bytes_include_trampoline -- --nocapture`; `cargo test -p tx-scripts process::exec::stack -- --nocapture`; `cargo build -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf --features trap-trace`; `cargo xtask full-build --target rv64-qemu --skip-doctor --no-image`; `cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/busybox-netperf-loopback.txt` (result block observed: `262144  65536   1024    1.06        1.15`); `cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/busybox-netperf-help.txt`; `cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/busybox-iperf3-loopback.txt`; `cargo xtask test busybox-boot --target rv64-qemu`. `cargo -q xtask unit` fails only the known userspace net smoke.
 
 - 2026-05-18 **ext4 mount-time RO/RW distinction + Linux `MS_RDONLY` honoured.**
   Previously `mount_ext4_read_only` was the only entry point and its

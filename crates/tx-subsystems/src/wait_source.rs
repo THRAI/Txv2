@@ -171,13 +171,16 @@ impl Future for RawQueueWaitFuture {
             if subscription.take_ready() {
                 true
             } else {
-                subscription.update(this.mask.bits(), cx.waker().clone());
+                subscription.update_with_waker(this.mask.bits(), cx.waker().clone());
                 false
             }
         } else if this.queue.peek() & this.mask.bits() != 0 {
             true
         } else {
-            this.subscription = Some(this.queue.subscribe(this.mask.bits(), cx.waker().clone()));
+            this.subscription = Some(
+                this.queue
+                    .subscribe_with_waker(this.mask.bits(), cx.waker().clone()),
+            );
             if this.queue.peek() & this.mask.bits() != 0 {
                 this.subscription = None;
                 true
@@ -208,11 +211,14 @@ impl Future for RawPortWaitFuture {
             if subscription.take_ready() {
                 true
             } else {
-                subscription.update(this.mask.bits(), cx.waker().clone());
+                subscription.update_with_waker(this.mask.bits(), cx.waker().clone());
                 false
             }
         } else {
-            this.subscription = Some(this.port.subscribe(this.mask.bits(), cx.waker().clone()));
+            this.subscription = Some(
+                this.port
+                    .subscribe_with_waker(this.mask.bits(), cx.waker().clone()),
+            );
             false
         };
 

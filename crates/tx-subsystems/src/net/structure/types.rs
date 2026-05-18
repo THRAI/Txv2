@@ -287,6 +287,7 @@ pub struct SocketOptionSet {
 pub struct SocketLevelOptions {
     pub reuse_addr: bool,
     pub reuse_port: bool,
+    pub dont_route: bool,
     pub keep_alive: bool,
     pub broadcast: bool,
     pub linger: LingerOption,
@@ -301,6 +302,7 @@ pub struct IpLevelOptions {
     pub tos: u8,
     pub ttl: u8,
     pub multicast_ttl: u8,
+    pub recv_err: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -320,6 +322,7 @@ impl SocketOptionSet {
             socket: SocketLevelOptions {
                 reuse_addr: false,
                 reuse_port: false,
+                dont_route: false,
                 keep_alive: false,
                 broadcast: false,
                 linger: LingerOption::disabled(),
@@ -332,6 +335,7 @@ impl SocketOptionSet {
                 tos: 0,
                 ttl: 64,
                 multicast_ttl: 1,
+                recv_err: false,
             },
             tcp: TcpLevelOptions {
                 nodelay: false,
@@ -350,6 +354,7 @@ impl SocketOptionSet {
             socket: SocketLevelOptions {
                 reuse_addr: false,
                 reuse_port: false,
+                dont_route: false,
                 keep_alive: false,
                 broadcast: false,
                 linger: LingerOption::disabled(),
@@ -362,6 +367,7 @@ impl SocketOptionSet {
                 tos: 0,
                 ttl: 64,
                 multicast_ttl: 1,
+                recv_err: false,
             },
             tcp: TcpLevelOptions {
                 nodelay: false,

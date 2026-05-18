@@ -16,6 +16,7 @@ use tx_subsystems::net::{
     SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol, TcpState,
     UdpInner,
 };
+use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::wait_source;
 
 const SOCKADDR_IN_BYTES: u32 = 16;
@@ -108,19 +109,25 @@ pub(super) fn sys_listen<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     step_unit_result(outcome)
 }
 
-pub(super) async fn sys_accept<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    sys_accept_impl(args[0] as i32, args[1], args[2], 0, ctx).await
+pub(super) async fn sys_accept<'a, P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    sys_accept_impl::<P>(args[0] as i32, args[1], args[2], 0, ctx).await
 }
 
-pub(super) async fn sys_accept4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_accept4<'a, P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let flags = args[3] as u32;
     if flags & !ACCEPT4_KNOWN_FLAGS != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    sys_accept_impl(args[0] as i32, args[1], args[2], flags, ctx).await
+    sys_accept_impl::<P>(args[0] as i32, args[1], args[2], flags, ctx).await
 }
 
-async fn sys_accept_impl<'a>(
+async fn sys_accept_impl<'a, P: TimeIf>(
     fd: i32,
     addr_ptr: u64,
     addrlen_ptr: u64,
@@ -164,7 +171,12 @@ async fn sys_accept_impl<'a>(
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
-                    let _ = future.await;
+                    if matches!(
+                        wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0).await,
+                        SocketWaitWake::ItimerExpired
+                    ) {
+                        return SyscallResult::Error(EINTR_VALUE);
+                    }
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
                 }
@@ -425,7 +437,10 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     }
 }
 
-pub(super) async fn sys_recvfrom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_recvfrom<'a, P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let (file, socket) = match resolve_socket_fd(ctx, args[0] as i32) {
         Ok(pair) => pair,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
@@ -470,7 +485,12 @@ pub(super) async fn sys_recvfrom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
-                    let _ = future.await;
+                    if matches!(
+                        wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0).await,
+                        SocketWaitWake::ItimerExpired
+                    ) {
+                        return SyscallResult::Error(EINTR_VALUE);
+                    }
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
                 }
@@ -688,6 +708,14 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.socket.reuse_port = on);
             Ok(())
         }
+        (SOL_SOCKET, SO_DONTROUTE) => {
+            let on = match read_sockopt_bool(ctx, optval, optlen) {
+                Ok(on) => on,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            payload.with_options_mut(|opts| opts.socket.dont_route = on);
+            Ok(())
+        }
         (SOL_SOCKET, SO_KEEPALIVE) => {
             let on = match read_sockopt_bool(ctx, optval, optlen) {
                 Ok(on) => on,
@@ -744,6 +772,14 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.socket.send_timeout = timeout);
             Ok(())
         }
+        (IPPROTO_IP, IP_RECVERR) => {
+            let on = match read_sockopt_bool(ctx, optval, optlen) {
+                Ok(on) => on,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            payload.with_options_mut(|opts| opts.ip.recv_err = on);
+            Ok(())
+        }
         (IPPROTO_TCP, TCP_NODELAY) => {
             let on = match read_sockopt_bool(ctx, optval, optlen) {
                 Ok(on) => on,
@@ -796,6 +832,12 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             optlen_ptr,
             payload.with_options(|o| o.socket.reuse_port as i32),
         ),
+        (SOL_SOCKET, SO_DONTROUTE) => write_sockopt_i32(
+            ctx,
+            optval,
+            optlen_ptr,
+            payload.with_options(|o| o.socket.dont_route as i32),
+        ),
         (SOL_SOCKET, SO_KEEPALIVE) => write_sockopt_i32(
             ctx,
             optval,
@@ -841,6 +883,12 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             optval,
             optlen_ptr,
             payload.with_options(|o| o.socket.send_timeout),
+        ),
+        (IPPROTO_IP, IP_RECVERR) => write_sockopt_i32(
+            ctx,
+            optval,
+            optlen_ptr,
+            payload.with_options(|o| o.ip.recv_err as i32),
         ),
         (IPPROTO_TCP, TCP_NODELAY) => write_sockopt_i32(
             ctx,
@@ -1331,7 +1379,8 @@ fn step_unit_result(outcome: StepOutcome<(), NoProgress>) -> SyscallResult {
 
 fn wait_on_yield_shape(shape: YieldShape) -> Option<wait_source::RegisteredWaitFuture> {
     match shape {
-        YieldShape::OnWaitSource { source, interests } => {
+        YieldShape::OnWaitSource { source, interests }
+        | YieldShape::OnEdge { source, interests } => {
             let token = tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
             wait_source::wait_on_token(token)
         }
@@ -1339,8 +1388,42 @@ fn wait_on_yield_shape(shape: YieldShape) -> Option<wait_source::RegisteredWaitF
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SocketWaitWake {
+    SocketReady,
+    ItimerExpired,
+}
+
+async fn wait_on_socket_or_itimer<P: TimeIf>(
+    mut socket_future: wait_source::RegisteredWaitFuture,
+    pid: u32,
+) -> SocketWaitWake {
+    let Some(deadline_ns) = super::time::itimer_real_deadline_ns(pid) else {
+        let _ = socket_future.await;
+        return SocketWaitWake::SocketReady;
+    };
+    if <P as TimeIf>::read_ns() >= deadline_ns {
+        return SocketWaitWake::ItimerExpired;
+    }
+    let Some(mut timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) else {
+        let _ = socket_future.await;
+        return SocketWaitWake::SocketReady;
+    };
+
+    core::future::poll_fn(|cx| {
+        if core::future::Future::poll(core::pin::Pin::new(&mut socket_future), cx).is_ready() {
+            return core::task::Poll::Ready(SocketWaitWake::SocketReady);
+        }
+        if core::future::Future::poll(core::pin::Pin::new(&mut timer_future), cx).is_ready() {
+            return core::task::Poll::Ready(SocketWaitWake::ItimerExpired);
+        }
+        core::task::Poll::Pending
+    })
+    .await
+}
+
 fn maybe_raise_sigpipe<'a>(ctx: &SyscallCtx<'a>, errno: Errno, flags: SendRecvFlags) {
     if errno == Errno::EPIPE && !flags.contains(SendRecvFlags::MSG_NOSIGNAL) {
-        let _ = step_kill_process(&ctx.process, Signum::SIGPIPE);
+        let _ = step_kill_process(&ctx.process, Signum::SIGPIPE, None);
     }
 }
