@@ -538,6 +538,8 @@ version = "0.1.0"
 name = "tx-reactor"
 version = "0.1.0"
 dependencies = [
+ "tx-observe",
+ "tx-observe-types",
  "tx-platform-adapter",
  "tx-substrate",
 ]
