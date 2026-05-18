@@ -906,13 +906,13 @@ impl<P: TxPlatform> CoreInit<P> {
 
         *MUSL_MOUNT.lock() = Some(musl_mount);
 
-        // Seed /bin/sh → the busybox binary in the rootfs tmpfs so
-        // that shebang scripts (e.g. run-all.sh #!/bin/sh) resolve
-        // correctly when no initramfs is loaded. RV64 OSComp images
-        // place busybox under /musl/musl; the LA64 busybox-root image
-        // built by xtask places it under /bin inside the mounted image.
-        // Both steps tolerate EEXIST so a baked initramfs or
-        // busybox_baked path that ran first wins.
+        // Seed /bin/sh and /bin/busybox → the busybox binary in the
+        // rootfs tmpfs so that shebang scripts (e.g. #!/bin/sh and
+        // #!/bin/busybox sh) resolve correctly when no initramfs is
+        // loaded.  RV64 OSComp images place busybox under /musl/musl;
+        // the LA64 busybox-root image built by xtask places it under
+        // /bin inside the mounted image.  Both steps tolerate EEXIST
+        // so a baked initramfs or busybox_baked path that ran first wins.
         {
             let guard = step_engine::guard();
             let bin_id = match rootfs_payload.fs_ops.mkdir(
@@ -941,6 +941,13 @@ impl<P: TxPlatform> CoreInit<P> {
                 rootfs_payload
                     .fs_ops
                     .symlink(bin_id, b"sh", b"/musl/musl/busybox", &cred, &guard);
+            // OSComp lua test.sh uses #!/bin/busybox sh — seed the
+            // /bin/busybox symlink so the shebang handler can resolve
+            // the interpreter.
+            let _ =
+                rootfs_payload
+                    .fs_ops
+                    .symlink(bin_id, b"busybox", b"/musl/musl/busybox", &cred, &guard);
         }
 
         Self::write_board_sentinel_prefix();
