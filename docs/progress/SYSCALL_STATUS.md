@@ -22,13 +22,17 @@ defined-no-arm RT_SIG entries: `sys_rt_sigtimedwait` is a real
 async poll-and-yield loop on `payload.pending()`; `sigaltstack`
 returns 0 instead of `-ENOSYS`; `sigpending`, `sigsuspend`, and
 `sigqueueinfo` are now reachable. Headline counts:
-dispatched 107 → **112**, defined-no-arm 13 → **8**. Scoreboard:
-libctest no longer dies on `sigtimedwait: ENOSYS` — every test
-now reaches the test body but most still time out because the
-child `entry-static.exe` invocations don't post `SIGCHLD` back to
-the parent in time (next investigation). basic-musl 102/102,
-lua-musl 9/9, busybox-musl 52/55, libcbench ~14/27, lmbench 0/36
-unchanged.)
+dispatched 107 → **112**, defined-no-arm 13 → **8**. Plus
+`populate_rootfs_tmp_dirs()` at boot creates `/tmp`, `/var`,
+`/var/tmp` in the rootfs tmpfs — closes the first of two
+lmbench blockers. Scoreboard: libctest no longer dies on
+`sigtimedwait: ENOSYS` — every test now reaches the test body
+but most still time out because the child `entry-static.exe`
+invocations don't post `SIGCHLD` back to the parent in time
+(next investigation). basic-musl 102/102, lua-musl 9/9,
+busybox-musl 52/55, libcbench ~14/27, lmbench 0/36 unchanged in
+the last recorded run; the `/var/tmp` change isn't end-to-end
+verified yet in this worktree.)
 
 ## Headline counts
 
@@ -105,6 +109,13 @@ on unless the user specifically chartered them.
   kernel-side ENOEXEC fallback to `/bin/sh` — landed on this branch
   2026-05-18 (lua 0/9 → 9/9, basic 101/102 → 102/102, libctest now
   executes — see "Top-of-table fix landed" below).
+- `populate_rootfs_tmp_dirs()` at boot — auto-create `/tmp`,
+  `/var`, `/var/tmp` in the rootfs tmpfs. Closes the first of
+  two lmbench blockers (the `/var/tmp` ENOENT during suite
+  setup). The second blocker — `Simple read: -1` — is a runtime
+  `read(2)` edge case and remains open. Landed on this branch
+  2026-05-18 alongside the RT_SIG wiring. End-to-end OSComp QEMU
+  verification pending (cpio image requires vendored busybox).
 - 5 RT_SIG dispatch arms wired (`sys_rt_sigpending`,
   `sys_rt_sigsuspend`, `sys_rt_sigqueueinfo`, `sys_rt_sigtimedwait`,
   `sys_sigaltstack`) — landed on this branch 2026-05-18. The
@@ -186,8 +197,15 @@ investigation.
 
 #### Second move: lmbench (36 tests)
 
-The binary actually runs — two blockers:
-- `/var/tmp/` doesn't exist; `mkdir` it at boot (same auto-mount pattern).
+Two blockers; (1) **landed this branch 2026-05-18** via
+`populate_rootfs_tmp_dirs()` (see Recently landed), (2) **still
+open**:
+
+- ~~`/var/tmp/` doesn't exist; `mkdir` it at boot.~~ Landed:
+  `populate_rootfs_tmp_dirs()` in
+  [`crates/tx-kernel/src/init/rootfs_shims.rs`](../../crates/tx-kernel/src/init/rootfs_shims.rs)
+  now creates `/tmp` (0o777), `/var` (0o755), and `/var/tmp`
+  (0o777) in the rootfs tmpfs at boot.
 - `Simple read: -1` is a timing/IO issue and needs runtime triage
   before the rest of the suite can be scored. Likely a `read(2)`
   return-value or `pread`-style edge case.

@@ -1,3 +1,44 @@
+- 2026-05-18 **Boot-time `mkdir /tmp`, `/var`, `/var/tmp` in the
+  rootfs tmpfs — closes the first of the two lmbench blockers
+  (`/var/tmp` ENOENT).** Per the SYSCALL_STATUS.md "second move"
+  row, lmbench-musl 0/36 has two blockers: (1) `/var/tmp` doesn't
+  exist so the setup `open(O_CREAT, "/var/tmp/…")` returns
+  -ENOENT before the suite can run any benchmark; (2) a deeper
+  `Simple read: -1` runtime issue that needs `read(2)` triage.
+  This pass closes (1).
+
+  Change: new `populate_rootfs_tmp_dirs()` helper in
+  [`crates/tx-kernel/src/init/rootfs_shims.rs`](../../crates/tx-kernel/src/init/rootfs_shims.rs)
+  (sibling to the existing `populate_rootfs_shebang_shims`).
+  Uses the same `mkdir_or_find` + per-call epoch-guard scoping
+  pattern so a re-boot is idempotent and the helper never nests
+  guards (the same discipline that fixed the original shebang
+  shim panic). Creates `/tmp` and `/var/tmp` at mode 0o777
+  (sticky-style — the slice doesn't honour the sticky bit yet),
+  and `/var` at mode 0o755. Failures emit a board sentinel and
+  return non-fatally.
+
+  Invocation: added between `populate_rootfs_shebang_shims()`
+  and `bind_init_cwd_and_root()` in `init.rs`'s boot sequence.
+
+  Verification:
+  - `cargo -q xtask unit` — 334 tests pass
+  - `cargo xtask ci`      — 17/17 gates green
+  - `cargo xtask full-build --target rv64-qemu --no-image` — kernel ELF builds clean
+  - End-to-end OSComp QEMU run is **pending** in this worktree
+    (cpio image generation requires `TX_BUSYBOX` / vendored
+    busybox-riscv64-musl which isn't fetched in this worktree;
+    `tools/images/fetch-busybox.sh` is the standard way to
+    populate it).
+
+  Blocker (2) — `Simple read: -1` — remains. That's a runtime
+  `read(2)` edge case in the lmbench `lat_fs` / `bw_file_rd`
+  paths and needs trap-trace investigation; carving it into its
+  own commit so the kernel-side dir setup lands first.
+
+  Doc updates:
+  - `SYSCALL_STATUS.md` second-move section + Recently-landed.
+
 - 2026-05-18 **Wire 5 RT_SIG dispatch arms; `sys_rt_sigtimedwait`
   becomes a real async poll loop.** Following the shebang/exec
   unblock, the next-highest row in `SYSCALL_STATUS.md` was wiring

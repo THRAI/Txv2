@@ -288,6 +288,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_bdevfs_at_dev_block();
             Self::mount_sdcard_at_musl();
             Self::populate_rootfs_shebang_shims();
+            Self::populate_rootfs_tmp_dirs();
             Self::bind_init_cwd_and_root();
 
             // Deferred H4 spine slots:
