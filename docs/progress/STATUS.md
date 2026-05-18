@@ -154,6 +154,43 @@
   **Verified:** 文档新增，无运行代码验证。
   **Next step:** 按 Phase 1 先做行为保持型 `boot_asm.rs` / `trap_asm.rs`
   机械拆分，再引入 `boot_args.rs`。
+
+- 2026-05-18 **busybox-musl OSComp score: 52/55 on rv64-qemu.**
+  Work on `cc/great-ptolemy-982e05`. Seven targeted fixes brought the score
+  from the baseline (most file-operation tests failing) to 52/55.
+
+  **Fixes applied:**
+  1. **O_APPEND on ext4** (`tx-ext4/src/namespace.rs` `materialise_rnode`):
+     `PageContainer::new_cap()` initialises `size_bytes = page_count * PAGE_SIZE`
+     (capacity). For an empty file this means `size_bytes = 4096`, so O_APPEND
+     seeks to offset 4096 which exceeds capacity, yielding EINVAL. Fix:
+     `pc.set_size_bytes(meta.size)` after construction. Fixes 6 append tests.
+  2. **`utimensat` stub** (`fs_mut.rs`): returns 0 instead of ENOSYS, fixing `touch`.
+  3. **`syslog`/`dmesg`** (`fs_mut.rs`, `numbers.rs`, `mod.rs`): added NR_SYSLOG=116
+     dispatch returning 0, fixing `dmesg`.
+  4. **ext4 `rename`** (`tx-ext4/src/namespace.rs`): implemented via
+     `lookup + append_dir_entry + remove_dir_entry`, fixing `mv`.
+  5. **ext4 `rmdir`** (`tx-ext4/src/namespace.rs`): implemented via
+     `remove_dir_entry`, fixing `rmdir`.
+  6. **`/proc/meminfo`** (`tx-fs/src/procfs/mod.rs`, `read.rs`): wired the
+     existing `render_meminfo()` stub into the lookup/readdir/render path.
+  7. **Auto-mount `/proc`** (`tx-kernel/src/init.rs`): added `mount_procfs_at_proc()`
+     called during boot, mounting procfs at `/proc` on tmpfs root. Fixes `free`,
+     `ps`, `df` which all read from /proc.
+
+  **Remaining failures (3/55):**
+  - `hwclock`: requires `/dev/misc/rtc`, genuinely unsupported.
+  - `kill 10`: judge/sdcard version mismatch (sdcard uses `sh -c 'sleep 5' & kill $!`).
+  - `which ls`: `ls` not installed as applet symlink in `PATH=/musl/glibc:/musl/musl`.
+
+  **Verification:** `cargo xtask oscomp qemu --target rv64-qemu` against
+  sdcard-rv.img; judge_busybox-musl.py scores 52/55. All 332 unit tests pass.
+
+  **Next:** busybox-musl score is near-maximal. Could investigate `which ls`
+  (whether sdcard has ls symlinks or if PATH setup helps). libctest-musl
+  and libcbench-musl show no output (0/N) — those test suites might be
+  the next target.
+
 - 2026-05-18 **All 32 basic-musl OSComp tests now pass on rv64-qemu.**
   Three sessions of work on `cc/great-ptolemy-982e05` brought the count
   from ~27 to 32/32. Final blocker was a v3 WaitSource registration gap

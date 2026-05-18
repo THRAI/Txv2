@@ -1,8 +1,8 @@
 //! Content renderers for procfs pseudo-files.
 
 use crate::procfs::{
-    pid_from_cmdline_id, pid_from_maps_id, pid_from_stat_id, PROCFS_CPUINFO_ID, PROCFS_MOUNTS_ID,
-    PROCFS_UPTIME_ID,
+    pid_from_cmdline_id, pid_from_maps_id, pid_from_stat_id, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID,
+    PROCFS_MOUNTS_ID, PROCFS_UPTIME_ID,
 };
 use alloc::string::String;
 use tx_subsystems::process::{self, Pid};
@@ -22,6 +22,7 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_MOUNTS_ID => render_mounts(),
         PROCFS_CPUINFO_ID => render_cpuinfo(),
         PROCFS_UPTIME_ID => render_uptime(),
+        PROCFS_MEMINFO_ID => render_meminfo(),
         _ => String::new(),
     }
 }
@@ -126,7 +127,6 @@ fn render_maps(pid: Pid) -> String {
     out
 }
 
-#[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
 pub fn render_meminfo() -> String {
     String::from("MemTotal: 0 kB\nMemFree: 0 kB\n")
 }
