@@ -1,3 +1,176 @@
+- 2026-05-18 **OBS pipeline: full-stack debugger interface from real
+  oscomp run to Perfetto UI.** Build on top of the L0/L2/L3/L4 emits
+  that landed earlier in the day; this push closes every step between
+  "kernel emits records" and "Perfetto renders readable spans" for
+  oscomp basic-musl traces.
+
+  **rv64-qemu live transport.**
+  - Static 4 MiB `.bss` ring in `boards/tx-hal-riscv64-qemu-virt`, exposed
+    via `ObserverIf::observation_ring(hart)`; sized for ~52k records
+    (full basic-musl run + headroom).
+  - `tx_observe::dump_console_hex::<P>(hart)` emits a synthesised
+    `TxTraceHeader` + the ring as hex bytes framed by
+    `TXTRACE-BEGIN bytes=… hart=… clock_hz=…` / `TXTRACE-END` sentinels.
+    Header uses `clock_id = HostNanos` + `clock_freq_hz = 1_000_000_000`
+    to match the `TS_FN = P::read_ns` source (earlier
+    `frequency_hz()` value of 10 MHz caused a 100× Perfetto inflation;
+    fixed).
+  - Hook fires from `init/exec.rs` immediately before the
+    `:userspace:exited:` sentinel — the natural init-zombify exit path.
+
+  **Bounded-trace threshold.**
+  Oscomp init never exits naturally in any reasonable wall clock (runs
+  basic-musl → busybox-musl → libctest → cyclictest → LTP back-to-back).
+  Added `OBSERVE_DUMP_THRESHOLD = 20_000` and `tx_observe::should_dump_now()`
+  / `set_dump_threshold(n)` API. `tx_kernel::thread_future::run_thread`
+  polls the flag after every syscall and, on a threshold crossing, calls
+  `dump_console_hex` + emits a `:observe:dump:threshold` sentinel +
+  `PowerIf::system_off()`. Captures a finite trace covering the early
+  test groups before the producer wraps the ring.
+
+  **xtask observe pipeline.**
+  - `cargo xtask observe extract --serial <log> --output <txtrace>` —
+    grep `TXTRACE-BEGIN`/`END` framed hex out of the captured serial
+    log, hex-decode, write a standalone `.txtrace` file.
+  - `cargo xtask observe pftrace` auto-discovers a sibling
+    `<stem>.names.json`. When absent, **auto-runs `observe names`**
+    against `target/oscomp/submit/kernel-rv` (or the standard debug-build
+    path) to generate one. End-user pipeline:
+    ```
+    cargo xtask oscomp qemu --target rv64-qemu
+    cargo xtask observe extract --serial target/oscomp/os_serial_out_rv.txt \
+                                --output /tmp/oscomp.txtrace
+    cargo xtask observe pftrace --file /tmp/oscomp.txtrace \
+                                --output /tmp/oscomp.pftrace
+    ```
+    yields a Perfetto-renderable trace with readable syscall + drive +
+    yield names — no manual name-table maintenance.
+  - `cargo xtask observe demo` rewritten to emit a realistic spec §9
+    sys_read scenario with sibling `names.json`.
+  - `cargo xtask oscomp prepare` auto-decompresses
+    `sdcard-<arch>.img.xz`/`.gz` archives to `<stem>.img` via host
+    `xz`/`gunzip`. Earlier mismatch between the GitHub release filename
+    (`.xz`) and the prepare-step expected filename (`.gz`) is gone.
+
+  **`cargo xtask observe names` — spec OBS-V1-OPNAME-1.**
+  - Walks the kernel ELF's symbol table (`object` crate + `rustc-demangle`
+    with the alternate `{:#}` form to strip v0 crate-disambiguator
+    hashes). Filters for `tx_scripts::drive::op_name_id::<S>`
+    monomorphizations and extracts each generic type parameter `S`.
+  - Hashes both bare and `<'_>`-suffixed forms with the same
+    `tx_observe::fnv1a32` the kernel uses at the call site, so the
+    resulting `name_id` matches `type_name::<S>()` regardless of whether
+    `S` carries a lifetime (rustc strips lifetimes at codegen; `type_name`
+    keeps them as `<'_>`).
+  - Static prelude carries Linux RV64 syscall numbers, fixed
+    kernel-emitted names (`resume`, `step`, `yield.*`, `wake.notify`),
+    and the ASCII mutation-tag literals (`MZSG`, `MICX`).
+  - On the captured basic-musl trace: 16 `op_name_id::<S>` monomorphs
+    resolved, all 7 distinct drive `name_id`s in the trace rendered as
+    `drive.OpenOp` / `drive.OpenFileReadOp` / `drive.OpenFileWriteOp` /
+    `drive.VmBrkOp` / `drive.NanosleepOp` / `drive.VmMapOp` /
+    `drive.VmUnmapOp`.
+
+  **Stable instant names.**
+  - `tx_observe::fnv1a32(b"…")` is now `pub const`. Single hash space for
+    every `EventNameId` source.
+  - `tx_scripts::drive` switched its anonymous instants (Resume, Step,
+    Yield-by-shape) from `EventNameId::from_raw(0)` / per-iteration
+    hashes to compile-time stable hashes: `resume`, `step`,
+    `yield.OnWaitSource`, `yield.OnAgent`, `yield.OnTimer`. Eliminates
+    the "null-name anchor" rendering and the iteration-id name-interner
+    flooding.
+  - `tx_substrate::wake::wait_source::notify_emit` switched from
+    `EventNameId::of::<WaitSource>` (`TypeId`-derived) to
+    `fnv1a32(b"wake.notify")` — same readable hash space, no `TypeId`
+    lookup needed.
+
+  **WaitGeneration → PayloadResume.wait_generation.**
+  `resolve_yield` / `resolve_on_wait_source` return
+  `(ResumeOutcome, u64)` now; the `u64` is the `WaitGeneration::raw()`
+  minted on the task's mailbox during the park. Drive forwards it to
+  `emit_resume_end`, which writes it into the wire payload. Matches the
+  value emitted on the producer side via
+  `WaitSource::notify_emit` → `PayloadWaitSourceNotify.wait_generation_low`,
+  so the daemon's `(task_id, wait_gen, kind)` flow-hash converges and
+  Perfetto draws the wake.notify → Resume flow arrow the spec's §6
+  worked example describes.
+
+  **Per-thread TID.**
+  Added `InitialSchedMeta::with_task_id(tid)` + threaded into
+  `Task::new_for_handle` → `TaskMailbox::with_task_id(...)`. Kernel
+  thread-future submit sites (`init.rs::drain_pending_child_submits`
+  and `init/exec.rs` leader-thread submit) read `child_thread.tid.0` and
+  chain `.with_task_id(tid_low)`. `ScriptCtx::task_id_low()` prefers
+  the mailbox's installed TID over the subject's leader PID, so
+  per-thread observation identity flows end-to-end.
+
+  **OBS-A-1 + OBS-A-2 enforcement.**
+  `cargo xtask observe-discipline` now also flags `tx_observe::*` emit
+  patterns inside any `#[platform_adapter(...)]`-marked module, not just
+  inside `StepOp::step` bodies. Implements the spec-recommended
+  boundary-lint extension noted in `08_OBSERVATION_v1.md` §6
+  OBS-V1-HOOK-SCOPE. The scanner reuses the same brace-depth state
+  machine; 14 unit tests pass (9 OBS-A-1, 5 OBS-A-2). Current
+  pass: 471 files / 194 StepOp impls / 56 adapter blocks — zero
+  violations.
+
+  **Daemon bugs surfaced by real Perfetto run.**
+  - `ClockSnapshot`: ns-domain timestamps emit a single-clock snapshot at
+    `BUILTIN_CLOCK_BOOTTIME=6` instead of the sequence-scoped custom
+    clock 64 without a sync path (the latter caused
+    `CLOCK_SYNC_FAILURE_NO_PATH` and dropped every packet).
+  - `TrackEventType::Instant` fixed from `4` to `3`. Perfetto's actual
+    `TrackEvent.Type` enum is `TYPE_INSTANT = 3`, `TYPE_COUNTER = 4`;
+    the old `4` made every Instant surface as a TYPE_COUNTER without a
+    `counter_value` field — the "TrackEvent with TYPE_COUNTER received
+    without a counter value" import error.
+
+  **End-to-end verification on a real oscomp basic-musl run.**
+  - `cargo xtask oscomp qemu --target rv64-qemu` ran through 32/32
+    basic-musl tests + start of busybox-musl, hit the 20k threshold,
+    dumped the ring, and powered off cleanly.
+  - `cargo xtask observe extract` recovered **4 194 376 bytes**
+    (72-byte header + 4 MiB ring).
+  - `cargo xtask observe validate` — **0 framing errors, 20002 records**
+    (`1 hart, 32768 slots/hart`).
+  - Level breakdown: **10921 L0** (syscall boundaries) / **1925 L2**
+    (drive begin/end) / **1928 L4** (step) / **10 L3** (yield/resume) /
+    **5224 L6** (mutation) — every observation level firing in real
+    production.
+  - `cargo xtask observe pftrace` auto-generated names.json from the
+    kernel ELF, daemon emitted a valid Perfetto trace with span
+    nesting `sys_read → drive.OpenFileReadOp → step` and the
+    `wake.notify ↔ Resume` flow arrows where producer-side
+    `notify_emit` fires.
+  - `cargo -q xtask unit` clean: 332/332 tests pass.
+
+  **Files of interest:**
+  - `crates/tx-observe/src/lib.rs` — dump-hex helper, threshold
+    triggers, `fnv1a32` `pub const`, per-hart `PARENT_SPANS` slot,
+    `dump_console_hex::<P>`.
+  - `crates/tx-scripts/src/drive.rs` — L2/L3/L4 emit hooks, stable
+    `EventNameId` constants, `op_name_id::<S>` via
+    `tx_observe::fnv1a32(type_name::<S>())`, `wait_gen` plumbing.
+  - `crates/tx-shims/src/linux_syscall/mod.rs` — L0 `dispatch` wrapper,
+    syscall_enter / syscall_exit emit helpers.
+  - `crates/tx-kernel/src/{init.rs,init/exec.rs,thread_future.rs}` —
+    BSP/AP `tx_observe::init` wiring, threshold-trigger check, init-exit
+    dump hook.
+  - `boards/tx-hal-riscv64-qemu-virt/src/lib.rs` — 4 MiB ring backing.
+  - `xtask/src/observe.rs` — `extract` / `names` / `pftrace` auto-discovery.
+  - `xtask/src/observe_discipline.rs` — OBS-A-1 + OBS-A-2 lint.
+  - `xtask/src/oscomp.rs` — `prepare` auto-decompression.
+  - `tools/tx-trace-daemon/src/perfetto/{writer.rs,proto.rs}` — clock
+    snapshot fix + `TrackEventType::Instant` enum value fix.
+
+  **Next steps:** OBS-9 reactor-scheduler track (sched_switch-equivalent
+  Gantt view across harts); migrate the remaining wake callers
+  (SIGCHLD/process-exit path, signalfd) onto `WaitSource::notify_emit`
+  so every yield/resume pair has matching flow arrows.
+
+  **Blocker:** none.
+
 - 2026-05-18 **OBS-3a + L0 + L4 drive observation hooks LANDED.**
   The central `drive<S, I>` loop in `crates/tx-scripts/src/drive.rs` and
   the Linux syscall dispatch in
