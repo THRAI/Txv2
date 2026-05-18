@@ -62,6 +62,13 @@ pub struct InitialSchedMeta {
     pub rt_priority: u8,
     pub affinity: u64,
     pub kernel_only: bool,
+    /// Low 32 bits of the task's trace identity (TID for user threads,
+    /// 0 for kernel-internal tasks). Threaded through
+    /// [`TaskTable::submit`] → [`Task::new_for_handle`] →
+    /// [`TaskMailbox::with_task_id`] so `notify_emit` and
+    /// `PayloadDriveBegin` carry per-thread identity in observation
+    /// records (OBS-V1 §13.2 flow-id material).
+    pub task_id_low: u32,
 }
 
 impl InitialSchedMeta {
@@ -72,6 +79,7 @@ impl InitialSchedMeta {
             rt_priority: 0,
             affinity: u64::MAX,
             kernel_only: false,
+            task_id_low: 0,
         }
     }
 
@@ -82,11 +90,23 @@ impl InitialSchedMeta {
             rt_priority: 0,
             affinity: u64::MAX,
             kernel_only: true,
+            task_id_low: 0,
         }
     }
 
     pub const fn with_affinity(mut self, affinity: u64) -> Self {
         self.affinity = affinity;
+        self
+    }
+
+    /// Install the task's trace identity (TID low 32 bits).
+    ///
+    /// Production call sites: `tx-kernel`'s thread-future submit path
+    /// reads `child_thread.tid.0` from the `Cap<ThreadIdentity>` and
+    /// chains this builder so the resulting `TaskMailbox` carries TID
+    /// and `WaitSource::notify_emit` emits per-thread `task_id_low`.
+    pub const fn with_task_id(mut self, task_id_low: u32) -> Self {
+        self.task_id_low = task_id_low;
         self
     }
 }

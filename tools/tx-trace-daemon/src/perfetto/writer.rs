@@ -80,37 +80,71 @@ impl PftraceWriter {
     }
 
     /// Emit the opening ClockSnapshot once (§G).
+    ///
+    /// Perfetto's trace processor cannot resolve a sequence-scoped custom
+    /// clock (id ≥ 64) to trace time unless the `ClockSnapshot` packet
+    /// pairs it with a builtin clock at the same instant — otherwise the
+    /// processor emits `CLOCK_SYNC_FAILURE_NO_PATH` and drops every
+    /// referencing packet.  Two cases:
+    ///
+    /// 1. Header clock_id is RiscvTime/ArmCntvct/HostNanos/Unknown
+    ///    (`unit_multiplier_ns == 1`): timestamps are already absolute
+    ///    nanoseconds — equivalent to `BUILTIN_CLOCK_BOOTTIME`. Emit a
+    ///    single-clock snapshot at clock 6 and tag every packet with
+    ///    `timestamp_clock_id = 6`. No sync needed because the trace
+    ///    processor's default trace clock IS BOOTTIME.
+    /// 2. Header carries a non-trivial unit multiplier (e.g. RV64
+    ///    `time` CSR ticks @ 1 GHz silicon → 1 ns/tick is still fine,
+    ///    but a 1 MHz board produces 1000 ns/tick): emit a two-clock
+    ///    snapshot pairing the custom clock (64) at timestamp 0 with
+    ///    BOOTTIME at timestamp 0 in ns. This gives the trace processor
+    ///    the sync path it needs (both clocks fire at the same instant)
+    ///    and lets it scale future custom-clock timestamps by
+    ///    `unit_multiplier_ns`.
     fn ensure_clock_snapshot(&mut self) {
         if self.emitted_clock_snapshot {
             return;
         }
         self.emitted_clock_snapshot = true;
 
-        // Map TxTraceClockId to a Perfetto clock_id:
-        //   Unknown(0)     → custom clock (CLOCK_CUSTOM_TXTRACE_BASE + 0)
-        //   RiscvTime(1)   → BOOTTIME (6) — RISC-V `time` CSR tracks boot time
-        //   ArmCntvct(2)   → BOOTTIME (6)
-        //   X86TscInv(3)   → custom (not directly BOOTTIME without calibration)
-        //   HostNanos(4)   → BOOTTIME (6) — std monotonic ns is BOOTTIME equivalent
-        let perfetto_clock_id = match self.clock_id {
-            1 | 2 | 4 => CLOCK_BOOTTIME,
-            _ => CLOCK_CUSTOM_TXTRACE_BASE,
-        };
-
-        // unit_multiplier_ns: 1e9 / freq_hz.  If freq unknown, emit 1 (treat as ns).
+        // unit_multiplier_ns: 1e9 / freq_hz.  If freq unknown, emit 1 (ns/tick).
         let unit_multiplier_ns = if self.clock_freq_hz == 0 {
             1
         } else {
             (1_000_000_000u64).saturating_div(self.clock_freq_hz)
         };
 
-        let snap = ClockSnapshot {
-            clocks: vec![Clock {
-                clock_id: Some(perfetto_clock_id),
-                timestamp: Some(0), // reference point: ts=0 in trace = time=0
-                is_incremental: Some(false),
-                unit_multiplier_ns: Some(unit_multiplier_ns),
-            }],
+        let snap = if unit_multiplier_ns == 1 {
+            // ns-domain clocks (Unknown / RiscvTime@1GHz / ArmCntvct@1GHz /
+            // HostNanos): announce a single BOOTTIME clock; every packet
+            // tags `timestamp_clock_id = 6` and resolves directly.
+            ClockSnapshot {
+                clocks: vec![Clock {
+                    clock_id: Some(CLOCK_BOOTTIME),
+                    timestamp: Some(0),
+                    is_incremental: Some(false),
+                    unit_multiplier_ns: Some(1),
+                }],
+            }
+        } else {
+            // Custom-rate clock: emit a sync pair so the processor can
+            // compute trace-time from custom ticks.
+            ClockSnapshot {
+                clocks: vec![
+                    Clock {
+                        clock_id: Some(CLOCK_CUSTOM_TXTRACE_BASE),
+                        timestamp: Some(0),
+                        is_incremental: Some(false),
+                        unit_multiplier_ns: Some(unit_multiplier_ns),
+                    },
+                    Clock {
+                        clock_id: Some(CLOCK_BOOTTIME),
+                        timestamp: Some(0),
+                        is_incremental: Some(false),
+                        unit_multiplier_ns: Some(1),
+                    },
+                ],
+            }
         };
 
         self.packets.push(TracePacket {
@@ -442,10 +476,23 @@ impl PftraceWriter {
         }
     }
 
+    /// The clock_id tagged on every record's `timestamp_clock_id` field.
+    ///
+    /// Must match the snapshot emitted by `ensure_clock_snapshot`:
+    /// - `unit_multiplier_ns == 1` ⇒ `CLOCK_BOOTTIME` (single-clock
+    ///   snapshot path).
+    /// - Otherwise the custom clock id, sync'd to BOOTTIME at trace
+    ///   start by the two-clock snapshot pair.
     fn perfetto_clock_id(&self) -> u32 {
-        match self.clock_id {
-            1 | 2 | 4 => CLOCK_BOOTTIME,
-            _ => CLOCK_CUSTOM_TXTRACE_BASE,
+        let unit_multiplier_ns = if self.clock_freq_hz == 0 {
+            1
+        } else {
+            (1_000_000_000u64).saturating_div(self.clock_freq_hz)
+        };
+        if unit_multiplier_ns == 1 {
+            CLOCK_BOOTTIME
+        } else {
+            CLOCK_CUSTOM_TXTRACE_BASE
         }
     }
 

@@ -631,6 +631,10 @@ impl<P: TxPlatform> CoreInit<P> {
         let wrapper_payload = payload.clone();
         let future_payload = payload.clone();
         let submit_thread = thread.clone();
+        // OBS-V1 §13.2: install init's TID on the task's mailbox so
+        // observation records for the leader thread carry a non-zero
+        // `task_id_low` (read by `notify_emit` and `PayloadDriveBegin`).
+        let tid_low = thread.tid.0;
         let submitted = BOOT_REACTOR.with(|reactor| {
             reactor.submit_task_with_meta(
                 crate::thread_future::PerHartSlotted::<P, _>::new(
@@ -638,7 +642,8 @@ impl<P: TxPlatform> CoreInit<P> {
                     crate::thread_future::run_thread::<P>(submit_thread, future_payload),
                 ),
                 boot_runtime::InitialSchedMeta::kernel()
-                    .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
+                    .with_affinity(tx_hal::CpuMask::single(current_cpu).bits())
+                    .with_task_id(tid_low),
             )
         });
         if submitted.is_none() {
