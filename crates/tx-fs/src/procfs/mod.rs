@@ -483,7 +483,6 @@ impl FsOps for Procfs {
         let idx = raw[1] as usize;
 
         if let Some(pid) = pid_from_dir(id) {
-            // PID directory: dots + stat + cmdline
             if state_byte < 2 {
                 return finish_dots(state_byte, idx, id);
             }

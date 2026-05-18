@@ -76,6 +76,11 @@ static DEV_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
 /// shm/named-sem paths have a live tmpfs payload for the kernel lifetime.
 static DEV_SHM_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
 
+/// Global procfs mount at `/proc`. Populated by `mount_procfs_at_proc`
+/// so OSComp/busybox status tools can discover process and mount
+/// projections through their usual Linux paths.
+static PROC_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
+
 /// Global sdcard ext4 mount at `/musl`. Populated by
 /// `mount_sdcard_at_musl` when a `vda` block device is registered.
 /// Boards without a block device silently leave this `None`.
@@ -134,6 +139,7 @@ pub fn reset_boot_state_for_test() {
     *DEV_MOUNT.lock() = None;
     *DEV_SHM_MOUNT.lock() = None;
     *MUSL_MOUNT.lock() = None;
+    *PROC_MOUNT.lock() = None;
     *CONSOLE_TTY.lock() = None;
     *ROOT_DENTRY.lock() = None;
     *NULL_TTY.lock() = None;
@@ -759,36 +765,59 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":mount:devfs:ok\n");
     }
 
-    /// Mount procfs on `/proc`.
+    /// Mount procfs at `/proc`.
     ///
-    /// Creates `/proc` on the rootfs (tmpfs) and mounts procfs there so
-    /// that userspace tools like `free`, `ps`, and `df` can read
-    /// `/proc/meminfo`, `/proc/<pid>/stat`, and `/proc/mounts`.
+    /// OSComp's busybox `df`, `ps`, and `free` commands expect the
+    /// usual Linux procfs entry points (`/proc/mounts`,
+    /// `/proc/<pid>/stat`, `/proc/meminfo`). The procfs backend is
+    /// read-only and projected from kernel state, so boot simply
+    /// creates the tmpfs mountpoint and publishes a procfs payload.
     ///
-    /// **Order invariant:** runs after `mount_rootfs_from_boot_media`.
+    /// **Order invariant:** must follow `mount_rootfs_tmpfs` and
+    /// precede `bind_init_cwd_and_root` so init sees `/proc` through
+    /// its initial root.
     pub(crate) fn mount_procfs_at_proc() {
         let root_mount = ROOT_MOUNT
             .lock()
             .clone()
             .expect("mount_procfs_at_proc: ROOT_MOUNT must be populated");
 
+        let rootfs_payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .clone();
+
         let guard = step_engine::guard();
         let cred = Credential::root();
         use StepOutcome as V3;
         let root_fs_object_id = root_mount.root().fs_object_id();
-        let (proc_object_id, proc_meta) = match root_mount
-            .payload_cap()
-            .expect("rootfs payload alive during boot")
-            .into_cap()
-            .fs_ops
-            .mkdir(root_fs_object_id, b"proc", 0o555, &cred, &guard)
-        {
-            V3::Done(out) => out,
-            V3::Err(step_engine::Errno::ENOSYS) | V3::Err(step_engine::Errno::EROFS) => {
-                (root_fs_object_id, root_mount.root().meta())
-            }
-            other => panic!("mount_procfs_at_proc: mkdir(/proc) failed: {other:?}"),
-        };
+        let (proc_object_id, proc_meta) =
+            match rootfs_payload
+                .fs_ops
+                .mkdir(root_fs_object_id, b"proc", 0o555, &cred, &guard)
+            {
+                V3::Done(out) => out,
+                V3::Err(step_engine::Errno::EEXIST) => {
+                    let id = match rootfs_payload
+                        .fs_ops
+                        .lookup(root_fs_object_id, b"proc", &guard)
+                    {
+                        V3::Done(id) => id,
+                        other => {
+                            panic!("mount_procfs_at_proc: /proc lookup after EEXIST: {other:?}")
+                        }
+                    };
+                    let meta = match rootfs_payload.fs_ops.load_inode_meta(id, &guard) {
+                        V3::Done(meta) => meta,
+                        other => {
+                            panic!("mount_procfs_at_proc: /proc meta after EEXIST: {other:?}")
+                        }
+                    };
+                    (id, meta)
+                }
+                other => panic!("mount_procfs_at_proc: mkdir(/proc) failed: {other:?}"),
+            };
         drop(guard);
 
         let proc_rnode_in_root = RNode::new_cap(proc_object_id, proc_meta, RNodeBacking::Directory)
@@ -799,13 +828,10 @@ impl<P: TxPlatform> CoreInit<P> {
         )
         .expect("mount_procfs_at_proc: /proc dentry-on-rootfs reservation");
 
-        let procfs_fs_ops = tx_fs::procfs::Procfs::fs_ops_arc();
-        let procfs_fs_page_backing = alloc::sync::Arc::new(tx_fs::procfs::Procfs)
-            as alloc::sync::Arc<dyn tx_subsystems::page_backed::FsPageBacking>;
-
         let procfs_payload = MountPayload::new_cap(
-            procfs_fs_ops,
-            procfs_fs_page_backing,
+            tx_fs::procfs::Procfs::fs_ops_arc(),
+            alloc::sync::Arc::new(tx_fs::procfs::Procfs)
+                as alloc::sync::Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
             None,
             mount::allocate_dev_id(),
             MountOptions::default(),
@@ -829,12 +855,6 @@ impl<P: TxPlatform> CoreInit<P> {
             step_engine::sign_for(res, raw)
         };
 
-        let rootfs_payload = root_mount
-            .payload_cap()
-            .expect("rootfs payload alive during boot")
-            .into_cap()
-            .clone();
-
         let proc_mount = MountIdentity::new_cap(
             mount::allocate_mount_id(),
             Some(proc_dentry_on_root),
@@ -847,8 +867,10 @@ impl<P: TxPlatform> CoreInit<P> {
 
         mount::register_mount(&rootfs_payload, proc_object_id, proc_mount.clone());
         if let Some(mnt_ns) = init_mount_namespace() {
-            mnt_ns.register_mount(&rootfs_payload, proc_object_id, proc_mount);
+            mnt_ns.register_mount(&rootfs_payload, proc_object_id, proc_mount.clone());
         }
+
+        *PROC_MOUNT.lock() = Some(proc_mount);
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:procfs:ok\n");
@@ -1234,6 +1256,43 @@ impl<P: TxPlatform> CoreInit<P> {
                 rootfs_payload
                     .fs_ops
                     .symlink(bin_id, b"sh", b"/musl/musl/busybox", &cred, &guard);
+
+            let lib_id = match rootfs_payload.fs_ops.mkdir(
+                tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
+                b"lib",
+                0o755,
+                &cred,
+                &guard,
+            ) {
+                V3::Done((id, _)) => id,
+                V3::Err(step_engine::Errno::EEXIST) => {
+                    match rootfs_payload.fs_ops.lookup(
+                        tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
+                        b"lib",
+                        &guard,
+                    ) {
+                        V3::Done(id) => id,
+                        other => {
+                            panic!("mount_sdcard_at_musl: /lib lookup after EEXIST: {other:?}")
+                        }
+                    }
+                }
+                other => panic!("mount_sdcard_at_musl: mkdir /lib: {other:?}"),
+            };
+            let _ = rootfs_payload.fs_ops.symlink(
+                lib_id,
+                b"ld-musl-riscv64-sf.so.1",
+                b"/musl/musl/lib/libc.so",
+                &cred,
+                &guard,
+            );
+            let _ = rootfs_payload.fs_ops.symlink(
+                lib_id,
+                b"libc.so",
+                b"/musl/musl/lib/libc.so",
+                &cred,
+                &guard,
+            );
         }
 
         Self::write_board_sentinel_prefix();

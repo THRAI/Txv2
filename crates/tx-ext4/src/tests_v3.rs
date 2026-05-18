@@ -26,7 +26,7 @@ use crate::adapter::step_engine::{
 use tx_ext4_format::ondisk::{Extent, GroupDesc, Inode, Superblock};
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_subsystems::page_backed::FsPageBacking;
-use tx_subsystems::vfs::structure::{DirCursor, FsObjectId};
+use tx_subsystems::vfs::structure::{DirCursor, FsObjectId, Timespec};
 use tx_subsystems::vfs::FsOps;
 
 use crate::read_backend::Ext4FsInstance;
@@ -255,8 +255,8 @@ fn ext4_v3_load_inode_meta_returns_done_for_real_inode() {
 #[test]
 fn ext4_v3_mutation_methods_create_and_mkdir_succeed() {
     // create_inode and mkdir are now implemented; they succeed on the
-    // in-memory image.  destroy_inode, rename, link, symlink, and
-    // serialize_inode_meta still surface ENOSYS.
+    // in-memory image.  destroy_inode, rename, link, and symlink
+    // still surface ENOSYS.
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
@@ -294,6 +294,48 @@ fn ext4_v3_mutation_methods_create_and_mkdir_succeed() {
         <Ext4FsInstance<MemImage> as FsOps>::destroy_inode(&*fs, FsObjectId::new(12), &guard),
         V3::<(), NoProgress>::err(V3Errno::ENOSYS)
     );
+}
+
+#[test]
+fn ext4_v3_serialize_inode_meta_updates_times() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = open_fs();
+    let guard = epoch::guard();
+
+    let mut meta = match <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(
+        &*fs,
+        FsObjectId::new(12),
+        &guard,
+    ) {
+        V3::Done(meta) => meta,
+        other => panic!("load_inode_meta before serialize: {other:?}"),
+    };
+    meta.atime = Timespec::new(7, 0);
+    meta.mtime = Timespec::new(8, 0);
+    meta.ctime = Timespec::new(9, 0);
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::serialize_inode_meta(
+            &*fs,
+            FsObjectId::new(12),
+            &meta,
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+
+    let updated = match <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(
+        &*fs,
+        FsObjectId::new(12),
+        &guard,
+    ) {
+        V3::Done(meta) => meta,
+        other => panic!("load_inode_meta after serialize: {other:?}"),
+    };
+    assert_eq!(updated.atime.sec, 7);
+    assert_eq!(updated.mtime.sec, 8);
+    assert_eq!(updated.ctime.sec, 9);
 }
 
 #[test]
@@ -345,6 +387,25 @@ fn ext4_v3_mutation_methods_rejected_on_read_only_mount_with_erofs() {
         ),
         V3::<(), NoProgress>::err(V3Errno::EROFS),
         "unlink on RO mount must return EROFS",
+    );
+
+    let meta = match <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(
+        &*fs,
+        FsObjectId::new(12),
+        &guard,
+    ) {
+        V3::Done(meta) => meta,
+        other => panic!("load_inode_meta on RO mount: {other:?}"),
+    };
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::serialize_inode_meta(
+            &*fs,
+            FsObjectId::new(12),
+            &meta,
+            &guard,
+        ),
+        V3::<(), NoProgress>::err(V3Errno::EROFS),
+        "serialize_inode_meta on RO mount must return EROFS",
     );
 
     // Read-side lookup still works — RO doesn't break observation.

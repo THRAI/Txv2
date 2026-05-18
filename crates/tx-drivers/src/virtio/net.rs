@@ -21,6 +21,8 @@ use super::{pci, TxVirtioHal};
 
 const DEFAULT_MTU: u16 = 1500;
 const RX_BUFFER_LEN: usize = 2048;
+const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
+const VIRTIO_MMIO_DEVICE_ID_OFFSET: usize = 0x08;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VirtioNetError {
@@ -103,6 +105,12 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize> VirtioMmioNet<P, QUEUE_SIZE> {
             .copied()
             .find(|region| region.name == self.mmio_region_name)
             .ok_or(VirtioNetError::MissingMmioRegion(self.mmio_region_name))?;
+        // Do not construct MmioTransport for a non-net device: dropping it
+        // resets the underlying virtio device, including the boot block disk.
+        let device_type = peek_mmio_device_type(region)?;
+        if device_type != DeviceType::Network {
+            return Err(VirtioNetError::WrongDeviceType(device_type));
+        }
         let header = NonNull::new(region.virt.start.0 as *mut VirtIOHeader)
             .ok_or(VirtioNetError::MissingMmioRegion(self.mmio_region_name))?;
         let transport = unsafe { MmioTransport::new(header, region.virt.size) }
@@ -276,6 +284,19 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize>
     fn mtu(&self) -> &AtomicU16 {
         &self.mtu
     }
+}
+
+fn peek_mmio_device_type(region: tx_hal::MmioRegion) -> Result<DeviceType, VirtioNetError> {
+    let base = region.virt.start.0 as *const u8;
+    let magic = unsafe { core::ptr::read_volatile(base.cast::<u32>()) };
+    if magic != VIRTIO_MMIO_MAGIC {
+        return Err(VirtioNetError::Mmio(MmioError::BadMagic(magic)));
+    }
+
+    let device_id =
+        unsafe { core::ptr::read_volatile(base.add(VIRTIO_MMIO_DEVICE_ID_OFFSET).cast::<u32>()) };
+    DeviceType::try_from(device_id)
+        .map_err(|err| VirtioNetError::Mmio(MmioError::InvalidDeviceID(err)))
 }
 
 fn init_raw_device<P, T, S, const QUEUE_SIZE: usize>(
