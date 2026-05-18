@@ -118,10 +118,13 @@ fn dispatch_clone_with_clone_vm_flag_returns_child_pid() {
     }
 }
 
-/// flags = bare SIGCHLD, stack = `0x4000_0000` → -EINVAL. Non-zero
-/// stack is the posix_spawn / pthread_create path, deferred.
+/// flags = bare SIGCHLD, stack = `0x4000_0000` → success; the child's
+/// sp register is seeded with the supplied stack. Linux semantic:
+/// non-zero `newsp` means the libc `__clone` wrapper has staged the
+/// child stack (typically with `fn`/`arg` pushed) and the child must
+/// enter userspace with `sp = newsp`.
 #[test]
-fn dispatch_clone_with_nonzero_stack_returns_neg_einval() {
+fn dispatch_clone_with_nonzero_stack_seeds_child_sp() {
     let _setup = setup();
     install_capturing_seam_and_reset();
 
@@ -130,9 +133,30 @@ fn dispatch_clone_with_nonzero_stack_returns_neg_einval() {
     let _ = seed_parent_trap_context(&thread);
     let ctx = make_ctx(proc_cap, thread);
 
-    let req = SyscallRequest::new(NR_CLONE, [SIGCHLD, 0x4000_0000, 0, 0, 0, 0]);
+    const NEWSP: u64 = 0x4000_0000;
+    let req = SyscallRequest::new(NR_CLONE, [SIGCHLD, NEWSP, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(22));
+    let child_pid = match result {
+        SyscallResult::Return(pid) => {
+            assert!(pid > 0);
+            pid
+        }
+        other => panic!("expected Return(pid), got {other:?}"),
+    };
+    let child = tx_subsystems::process::process_by_pid(tx_subsystems::process::structure::Pid(
+        child_pid as u32,
+    ))
+    .expect("child process is registered after clone");
+    let child_leader = child.nth_thread(0).expect("child has leader thread");
+    let saved = child_leader
+        .payload_cap()
+        .expect("child leader has payload")
+        .saved_user_context()
+        .expect("seed_child_leader_context stored a saved_user_context");
+    #[cfg(not(target_arch = "loongarch64"))]
+    assert_eq!(saved.regs[2] as u64, NEWSP, "RV64 sp must equal newsp");
+    #[cfg(target_arch = "loongarch64")]
+    assert_eq!(saved.regs[3] as u64, NEWSP, "LA64 sp must equal newsp");
 }
 
 /// flags = 0 (no SIGCHLD, no CLONE_*) → -EINVAL. Bare-SIGCHLD only.

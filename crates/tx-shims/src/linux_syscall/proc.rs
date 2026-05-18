@@ -250,9 +250,12 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    if stack != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
+    // `stack` (newsp) — Linux semantic: zero means the child shares the
+    // parent's sp (bare fork). Non-zero means the libc clone wrapper has
+    // staged the child stack (typically with `fn`/`arg` pushed by
+    // `__clone`) and wants the child to enter userspace with sp = stack.
+    // Seeded into `regs[STACK_REG_INDEX]` by `seed_child_leader_context`
+    // below.
 
     // Snapshot parent's saved trap context. Plan B discipline: the
     // trap shell stored this at trap entry. `None` here means the
@@ -326,8 +329,14 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         .expect(":clone:no-leader: kernel-invariant violation, fresh child has no leader thread");
 
     // Seed the child's leader trap context with the parent's GPRs
-    // (a0 := 0, tp := tls when CLONE_SETTLS, pc := pc + 4). Infallible.
-    seed_child_leader_context(&child_thread, &parent_user_ctx, tls as usize);
+    // (a0 := 0, tp := tls when CLONE_SETTLS, sp := stack when non-zero,
+    // pc := pc + 4). Infallible.
+    seed_child_leader_context(
+        &child_thread,
+        &parent_user_ctx,
+        tls as usize,
+        stack as usize,
+    );
 
     // Hand the child's leader thread to the reactor. Panics with
     // `:clone:no-reactor-seam` if the boot path didn't install the
