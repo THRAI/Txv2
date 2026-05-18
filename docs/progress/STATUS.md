@@ -1,3 +1,30 @@
+- 2026-05-18 **`cargo xtask syscall-status` + lint-maintained autogen in `SYSCALL_STATUS.md`.**
+  New xtask command that reads `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}`
+  as the single source of truth for syscall implementation state. Replaces hand-edited
+  counts (which had drifted — the doc said "~96 dispatched" but the SSOT shows
+  **107 / 119 with 12 undispatched**).
+  Modes:
+  - `cargo xtask syscall-status` — brief: counts + detail-command menu.
+  - `cargo xtask syscall-status <NAME>` — info for one syscall: numbered? dispatched?
+    summary? what to load next.
+  - `cargo xtask syscall-status --list-missing` — defined but no dispatch arm.
+  - `cargo xtask syscall-status --regen` — refresh autogen section in `SYSCALL_STATUS.md`
+    (between `BEGIN/END AUTOGEN: syscall-table` markers).
+  - `cargo xtask syscall-status --check` — lint mode, exits non-zero on drift with a
+    one-line regen instruction.
+  New CI gate `txdoc:CI-GATE-SYSCALL-STATUS` added to `cargo xtask ci`; documented in
+  [CI_REPORTING_v1.md](../design/00_meta-framework/CI_REPORTING_v1.md). Surfaced in
+  [tx-ci-triage](../../.agents/skills/tx-ci-triage/SKILL.md) per-gate table and
+  rewritten into [tx-ltp-syscall](../../.agents/skills/tx-ltp-syscall/SKILL.md)
+  Identify-the-target and Update-on-completion steps. The autogen section is bounded —
+  human-curated content (high-stakes table, OSComp/LTP coverage, topic categorization,
+  Already-partial) stays untouched.
+  **Verified:** `cargo xtask syscall-status --check` → ok; drift smoke test (forced
+  119→999 mutation) → exit 1 with regen instruction → restored → ok. `cargo xtask lint docs`
+  → ok; `cargo xtask progress validate` → 24 records ok.
+  **Next step:** next syscall change exercises the full loop (edit dispatch → `--regen` →
+  commit both files).
+
 - 2026-05-17 **LA64 QEMU SMP shape made explicit.**
   Added a `--smp N` override to `cargo xtask qemu`, keeping the default LA64
   smoke lane at `-smp 4` while making `-smp 1` directly reproducible when
