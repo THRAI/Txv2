@@ -10,6 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use object::{Object, ObjectSymbol};
+
 use crate::util::optional_option_value;
 use crate::Result;
 
@@ -25,7 +27,8 @@ pub(crate) fn observe(root: &Path, args: Vec<String>) -> Result<()> {
              \tcargo xtask observe pftrace --file <path> --output <pftrace>\n\
              \tcargo xtask observe validate --file <path>\n\
              \tcargo xtask observe demo --output <path> [--records N] [--with-yields]\n\
-             \tcargo xtask observe extract --serial <log> --output <txtrace>"
+             \tcargo xtask observe extract --serial <log> --output <txtrace>\n\
+             \tcargo xtask observe names --kernel <elf> [--output <names.json>]"
                 .into(),
         );
     };
@@ -35,11 +38,264 @@ pub(crate) fn observe(root: &Path, args: Vec<String>) -> Result<()> {
         "validate" => observe_validate(&args[1..]),
         "demo" => observe_demo(&args[1..]),
         "extract" => observe_extract(&args[1..]),
+        "names" => observe_names(&args[1..]),
         other => Err(format!(
             "unknown observe subcommand '{other}'; \
-             expected replay, pftrace, validate, demo, or extract"
+             expected replay, pftrace, validate, demo, extract, or names"
         )),
     }
+}
+
+// ── names ─────────────────────────────────────────────────────────────────────
+
+/// Build a `names.json` from a kernel ELF.
+///
+/// The kernel's `tx_observe::fnv1a32` and `tx_scripts::drive::op_name_id<S>`
+/// compute every observation `EventNameId` as `fnv1a32(literal_bytes)` —
+/// either a fixed string (`b"resume"`, `b"wake.notify"`, …) or the result
+/// of `core::any::type_name::<S>().as_bytes()`. Both forms produce string
+/// literals that `rustc` embeds in the binary's read-only data — the
+/// type-name strings live in `.rodata.cst*` / `.rodata` as `\0`-free byte
+/// runs prefixed/suffixed by binary padding.
+///
+/// This scanner reads the kernel ELF, walks every read-only section, and
+/// extracts every plausibly-Rust-type-name byte run (containing `::` and
+/// composed of identifier-safe + a small punctuation alphabet). Each
+/// extracted string is FNV-1a 32 hashed and added to a `name_table`. A
+/// static prelude carries the well-known mappings (Linux RV64 syscall
+/// numbers, kernel-emitted stable names like `resume` / `step` /
+/// `yield.*` / `wake.notify`, mutation ASCII tags) that aren't
+/// recoverable from the ELF alone.
+///
+/// Usage: `cargo xtask observe names --kernel <elf> [--output <json>]`.
+/// With `--output` omitted, prints the JSON on stdout.
+fn observe_names(args: &[String]) -> Result<()> {
+    let kernel = optional_option_value(args, "--kernel")
+        .map(PathBuf::from)
+        .ok_or("--kernel <elf> is required for names subcommand")?;
+    let bytes = fs::read(&kernel)
+        .map_err(|e| format!("cannot read kernel ELF {}: {e}", kernel.display()))?;
+    let file = object::File::parse(bytes.as_slice())
+        .map_err(|e| format!("ELF parse failed for {}: {e}", kernel.display()))?;
+
+    let mut table = std::collections::BTreeMap::<u32, String>::new();
+
+    // ── 1. Static prelude ───────────────────────────────────────────────
+    for (nr, name) in linux_rv64_syscalls().iter().copied() {
+        table.entry(u32::from(nr)).or_insert(format!("sys_{name}"));
+    }
+    for &(s, label) in KERNEL_FNV1A_STABLE_NAMES.iter() {
+        table
+            .entry(fnv1a32(s.as_bytes()))
+            .or_insert(label.to_string());
+    }
+    // Mutation tag literals — packed `u32` of the ASCII bytes, emitted in
+    // `tx_substrate::zone` / `index` and NOT routed through `fnv1a32`.
+    table
+        .entry(0x4d5a5347)
+        .or_insert("mutation.zone_sign".into());
+    table
+        .entry(0x4d494358)
+        .or_insert("mutation.index_commit".into());
+
+    // ── 2. Symbol-table walk for `op_name_id::<S>` monomorphizations ────
+    //
+    // Per OBS-V1-OPNAME-1 and OBS-HOST-V0-NAMES-GENERATION: the
+    // names.json file is produced by an xtask in the kernel build that
+    // walks the ELF's symbol table.
+    //
+    // rustc emits one `tx_scripts::drive::op_name_id` symbol per
+    // concrete `S` reached by `drive::<S, _>`. Demangling each symbol
+    // reveals `tx_scripts::drive::op_name_id::<S>` where `S` is the
+    // exact `type_name::<S>()` the kernel will hash at the call site.
+    // We extract `S`, hash with `fnv1a32` (matching `tx_observe::fnv1a32`
+    // bit-for-bit), and register `drive.<LastSegment>` as the readable
+    // label — short names keep Perfetto chip widths usable; the full
+    // path is recoverable from the symbol table if needed.
+    // For each `op_name_id::<S>` symbol we register two `EventNameId`
+    // candidates because rustc symbol mangling erases lifetimes while
+    // `core::any::type_name::<S>()` keeps them as `<'_>`:
+    //
+    //   symbol           : tx_subsystems::vfs::execution::OpenFileReadOp
+    //   type_name output : tx_subsystems::vfs::execution::OpenFileReadOp<'_>
+    //
+    // Both hash to different `u32`s; the trace carries whichever the kernel
+    // emitted at the call site (bare for lifetime-free types like
+    // `OpenOp`, `<'_>` for lifetime-parameterised types like
+    // `OpenFileReadOp<'a>`). Registering both keeps the daemon resolution
+    // independent of whether the source type has a lifetime parameter,
+    // which is not recoverable from the v0 symbol alone.
+    let mut drives_found = 0usize;
+    for sym in file.symbols() {
+        let Ok(raw) = sym.name() else { continue };
+        let demangled = demangle_symbol(raw);
+        if let Some(s) = extract_op_name_id_type_param(&demangled) {
+            let short = short_type(s);
+            let label = format!("drive.{short}");
+            table.entry(fnv1a32(s.as_bytes())).or_insert(label.clone());
+            let with_lifetime = format!("{s}<'_>");
+            table
+                .entry(fnv1a32(with_lifetime.as_bytes()))
+                .or_insert(label);
+            drives_found += 1;
+        }
+    }
+
+    // ── 3. Render JSON ──────────────────────────────────────────────────
+    let mut json = String::from("{\n  \"name_table\": {\n");
+    let n = table.len();
+    for (i, (k, v)) in table.iter().enumerate() {
+        let sep = if i + 1 == n { "" } else { "," };
+        json.push_str(&format!("    \"{k}\": \"{v}\"{sep}\n"));
+    }
+    json.push_str("  }\n}\n");
+
+    match optional_option_value(args, "--output") {
+        Some(out) => {
+            let p = PathBuf::from(&out);
+            fs::write(&p, json.as_bytes())
+                .map_err(|e| format!("failed to write {}: {e}", p.display()))?;
+            eprintln!(
+                "observe: names.json written to {} ({} entries, \
+                 {} `op_name_id::<S>` monomorphizations resolved from symbol table)",
+                p.display(),
+                table.len(),
+                drives_found,
+            );
+        }
+        None => {
+            print!("{json}");
+        }
+    }
+    Ok(())
+}
+
+/// Demangle to the alternate (`{:#}`) form, which strips the `[hashhex]`
+/// crate disambiguator that v0 symbol mangling carries on every
+/// crate-qualified path. Without `{:#}` the output reads as
+/// `tx_scripts[b63d…]::drive::op_name_id::<tx_subsystems[c8d9…]::…::X>`
+/// and the substring pivot in `extract_op_name_id_type_param` fails to
+/// match. With `{:#}` it reads as plain `tx_scripts::drive::op_name_id::<…>`,
+/// which is the exact byte sequence the kernel-side `type_name::<X>()`
+/// produces and FNV-1a hashes.
+/// Locate a kernel ELF for `observe names` to scan, in this order:
+///
+/// 1. Explicit `--kernel <elf>` argument on the caller's command line.
+/// 2. `target/oscomp/submit/kernel-rv` — what `cargo xtask oscomp submit`
+///    drops; the natural shape for an oscomp trace pipeline.
+/// 3. `target/riscv64gc-unknown-none-elf/debug/tx-kernel-riscv64-qemu-virt`
+///    — the direct cargo build output, used when running smoke / qemu
+///    profiles without going through `oscomp`.
+///
+/// Returns `None` when none of these exist; the caller proceeds without
+/// `--names` and the daemon falls back to `name_0xNN` hex labels.
+fn resolve_names_kernel_elf(root: &Path, args: &[String]) -> Option<PathBuf> {
+    if let Some(k) = optional_option_value(args, "--kernel") {
+        let p = PathBuf::from(k);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for rel in [
+        "target/oscomp/submit/kernel-rv",
+        "target/riscv64gc-unknown-none-elf/debug/tx-kernel-riscv64-qemu-virt",
+    ] {
+        let p = root.join(rel);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn demangle_symbol(name: &str) -> String {
+    match rustc_demangle::try_demangle(name) {
+        Ok(d) => format!("{d:#}"),
+        Err(_) => name.to_string(),
+    }
+}
+
+/// Pull `S` out of a demangled `…::op_name_id::<S>` symbol, taking
+/// `<>` nesting into account so generic-with-generic types like
+/// `Cap<ProcessIdentity>` survive intact. Returns `None` when the
+/// symbol is anything else (most symbols).
+///
+/// rustc emits `op_name_id` as either:
+///   * `tx_scripts::drive::op_name_id::<X>`
+///   * `tx_scripts::drive::op_name_id::<X>::ha34b1d6e23bf99c0`
+///     (legacy mangling appends a per-crate-version hash trailer)
+/// Both forms are handled — we read up to the first balanced `>` and
+/// stop, leaving any trailer untouched.
+fn extract_op_name_id_type_param(demangled: &str) -> Option<&str> {
+    const PIVOT: &str = "tx_scripts::drive::op_name_id::<";
+    let start = demangled.find(PIVOT)? + PIVOT.len();
+    let rest = &demangled[start..];
+    let mut depth = 1usize;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&rest[..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// FNV-1a 32 — matches `tx_observe::fnv1a32` exactly.
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// Last segment after `::` (e.g. `OpenFileReadOp<'_>` → `OpenFileReadOp`).
+fn short_type(full: &str) -> String {
+    let last = full.rsplit("::").next().unwrap_or(full);
+    last.trim_end_matches("<'_>").to_string()
+}
+
+
+const KERNEL_FNV1A_STABLE_NAMES: &[(&str, &str)] = &[
+    ("resume", "resume"),
+    ("step", "step"),
+    ("yield.OnWaitSource", "yield.OnWaitSource"),
+    ("yield.OnAgent", "yield.OnAgent"),
+    ("yield.OnTimer", "yield.OnTimer"),
+    ("wake.notify", "wake.notify"),
+];
+
+/// Linux RV64 generic ABI syscall number → kernel-name table. Picked from
+/// `asm-generic/unistd.h` constrained to numbers tx-shims actually wires
+/// (so the trace daemon doesn't show every kernel ABI it might call).
+fn linux_rv64_syscalls() -> &'static [(u16, &'static str)] {
+    &[
+        (17, "getcwd"), (23, "dup"), (24, "dup3"), (25, "fcntl"), (29, "ioctl"),
+        (32, "flock"), (34, "mkdirat"), (35, "unlinkat"), (38, "renameat"),
+        (39, "umount2"), (40, "mount"), (45, "truncate"), (46, "ftruncate"),
+        (48, "faccessat"), (49, "chdir"), (56, "openat"), (57, "close"),
+        (59, "pipe2"), (61, "getdents64"), (62, "lseek"), (63, "read"),
+        (64, "write"), (66, "writev"), (73, "ppoll"), (78, "readlinkat"),
+        (79, "fstatat"), (80, "fstat"), (88, "utimensat"), (93, "exit"),
+        (94, "exit_group"), (96, "set_tid_address"), (98, "futex"),
+        (99, "set_robust_list"), (101, "nanosleep"), (113, "clock_gettime"),
+        (122, "sched_getaffinity"), (129, "kill"), (133, "rt_sigsuspend"),
+        (134, "rt_sigaction"), (135, "rt_sigprocmask"), (139, "rt_sigreturn"),
+        (153, "times"), (154, "setpgid"), (155, "getpgid"), (156, "getsid"),
+        (157, "setsid"), (160, "uname"), (165, "getrusage"), (166, "umask"),
+        (167, "prctl"), (169, "gettimeofday"), (172, "getpid"), (173, "getppid"),
+        (174, "getuid"), (175, "geteuid"), (176, "getgid"), (177, "getegid"),
+        (178, "gettid"), (179, "sysinfo"), (214, "brk"), (215, "munmap"),
+        (220, "clone"), (221, "execve"), (222, "mmap"), (226, "mprotect"),
+        (233, "madvise"), (260, "wait4"), (261, "prlimit64"), (278, "getrandom"),
+    ]
 }
 
 // ── extract ───────────────────────────────────────────────────────────────────
@@ -237,14 +493,39 @@ fn observe_pftrace(root: &Path, args: &[String]) -> Result<()> {
 
     ensure_daemon_built(root)?;
 
-    // Auto-discover sibling `<stem>.names.json` next to the .txtrace so the
-    // daemon can resolve EventNameId → human name without an explicit flag.
-    // Explicit `--names` overrides the discovery.
+    // Resolve a names.json with this precedence (per OBS-V1-OPNAME-1):
+    //   1. explicit `--names <path>`
+    //   2. sibling `<txtrace_stem>.names.json` next to the input
+    //   3. auto-generate next to the input via `observe names` if
+    //      `--kernel <elf>` is supplied (or sibling kernel-rv exists)
+    //
+    // Each fallback keeps the same `--names` shape so the daemon doesn't
+    // see the difference.
     let explicit_names = optional_option_value(args, "--names");
     let sibling_names = file.with_extension("names.json");
-    let names_path = explicit_names
-        .map(PathBuf::from)
-        .or_else(|| sibling_names.exists().then_some(sibling_names));
+    let names_path = if let Some(p) = explicit_names {
+        Some(PathBuf::from(p))
+    } else if sibling_names.exists() {
+        Some(sibling_names.clone())
+    } else if let Some(kernel) = resolve_names_kernel_elf(root, args) {
+        // Auto-generate the sibling names.json from the kernel ELF's
+        // symbol table. Cheap (<100 ms on rv64-qemu's 42 MiB ELF).
+        eprintln!(
+            "observe: auto-generating names.json from {} -> {}",
+            kernel.display(),
+            sibling_names.display(),
+        );
+        let gen_args = vec![
+            "--kernel".to_string(),
+            kernel.display().to_string(),
+            "--output".to_string(),
+            sibling_names.display().to_string(),
+        ];
+        observe_names(&gen_args)?;
+        Some(sibling_names)
+    } else {
+        None
+    };
 
     eprintln!(
         "observe: tx-trace-daemon replay --file {} --out pftrace --output {}{} ...",
