@@ -1,3 +1,122 @@
+- 2026-05-18 **Cred snapshot lifted to first-class type; cred → signal
+  authorization fully rewired through it.**
+
+  Per `cred_service_v_1` §"In flight", the script-side credential
+  is supposed to be a by-value metadata copy captured *once* at
+  syscall entry, not a live re-read of `ProcessPayload.cred` on every
+  check. The slot for it on `SyscallCtx` had been reserved (the
+  `_lifetime` field's comment at
+  [ctx.rs:31](../../crates/tx-shims/src/linux_syscall/ctx.rs)
+  literally said "future cred snapshot field"); the actual type
+  + capture + threading didn't exist. This batch lands it and
+  rewires every cred-consuming subsystem boundary through it.
+
+  **New core types** ([cred/mod.rs](../../crates/tx-subsystems/src/cred/mod.rs)):
+  - `CredSnapshot` — `Copy` `must_use` wrapper around `Cred` with
+    `from_cred` / `root` / `cred` / `as_cred` / `is_privileged_for`.
+    `From<Cred>` + `AsRef<Cred>`. Future fields (generation tag for
+    racing-setuid, NOSUID hint, retained `Cap<Cred>`) land here
+    without touching call sites.
+  - `ProcessIdentity::cred_snapshot()` → `Option<CredSnapshot>`
+    (`None` for zombies). `ProcessPayload::cred_snapshot()` →
+    `CredSnapshot` (one `AtomicSlot` load + cap deref + value-copy).
+  - `SyscallCtx.cred_snapshot: CredSnapshot` field, captured once
+    in `SyscallCtx::new`. `ctx.cred()` reads from the cached
+    snapshot; `ctx.cred_snapshot()` borrows it; `ctx.walker_cred()`
+    projects directly via the new `From<&CredSnapshot> for
+    vfs::Credential` bridge — every VFS DAC entry traces back to the
+    single syscall-entry snapshot.
+
+  **`cred::checks::*` module** ([cred/checks.rs](../../crates/tx-subsystems/src/cred/checks.rs))
+  — the canonical authorization surface per `cred_service_v_1`
+  §"Checks surface" + §"Cred witnesses":
+  - Witness predicates (zero-sized, guard-bound, `must_use`):
+    `SearchAuthorized<'g>`, `OpenAuthorized<'g>`, plus re-export of
+    the existing `SignalAuthorized<'g>`.
+  - `require_path_search(&CredSnapshot, &InodeMeta, &Guard)` /
+    `require_open(.., OpenFileFlags, &Guard)` — delegate the bit-
+    level DAC math to `vfs::predicates` and wrap the result.
+  - `authorize_signal_send(source, target, sig) -> Result<AuthOutcome,
+    Errno>` + `_under_guard` fanout variant — combinators that
+    fold the repeating snapshot+facts+require sequence into one
+    call, take and drop the auth guard internally so the no-nested-
+    guard discipline is a property of the function (not a hidden
+    contract).
+
+  **`signal::script_*` reworks** ([signal/mod.rs](../../crates/tx-subsystems/src/signal/mod.rs)):
+  - `script_kill_process` / `script_kill_probe` /
+    `script_kill_pgrp_with_guard` rewired through the combinator;
+    `info: Option<SigInfo>` added to `script_kill_process` so the
+    SI_USER block sys_kill builds is preserved.
+  - New `script_deliver_signal(source, target, sig)` —
+    cred-checked counterpart to `deliver_posix_signal`. Resolves
+    Thread→Process before the auth guard scope (`upgrade_owner_proc`
+    takes its own guard).
+
+  **Closed three real cred-bypasses** in
+  [tx-shims/linux_syscall/signal.rs](../../crates/tx-shims/src/linux_syscall/signal.rs):
+  1. `sys_kill` (pid > 0) drove `KillProcessOp` →
+     `step_kill_process` directly, skipping `cred::require_signal_send`.
+     Now routes through `script_kill_process`.
+  2. `sys_kill` (pid == 0 pgrp fanout) called `step_kill_pgrp` —
+     no per-member cred check. Now `script_kill_pgrp`. POSIX-correct
+     behaviour change: returns `-EPERM` when no member was both live
+     AND permitted (was `-ESRCH`).
+  3. `sys_tkill` (thread tid resolved via PidName) drove
+     `DeliverSignalOp` without cred check. Now `script_deliver_signal`.
+  4. `sys_tgkill` left unchanged: tgid==caller-pid constraint means
+     check trivially permitted; comment notes the future migration
+     site for cross-process tgkill.
+
+  **`SyscallResult` / `Errno` bridge**
+  ([result.rs](../../crates/tx-shims/src/linux_syscall/result.rs)):
+  - `SyscallResult::error_from(errno)` + `impl From<Errno> for
+    SyscallResult` — collapses `errno_to_i32` translation at error paths.
+  - `dispatch_errno(Result<T, Errno>, FnOnce(T) -> SyscallResult)`
+    — folds the recurring `match script(...) { Ok(_) => map, Err(e)
+    => Error(errno_to_i32(e)) }` boilerplate.
+  - Mechanical sweep: 164 sites across 14 arm files collapsed from
+    `SyscallResult::Error(errno_to_i32(X))` to
+    `SyscallResult::error_from(X)`.
+
+  **Tests added (8 new):** `cred_snapshot_freezes_value_against_later_mutation`,
+  `cred_snapshot_root_constructor_matches_root_cred`,
+  `cred_snapshot_returns_none_for_zombie`,
+  `require_path_search_passes_for_dac_override`,
+  `require_path_search_denies_without_x_bit`,
+  `require_open_honors_read_and_write_bits`,
+  `script_deliver_signal_to_thread_{denied_for_mismatched_uid,
+  delivers_when_authorized}`, `authorize_signal_send_yields_three_state_outcome`,
+  `dispatch_kill_different_uid_returns_neg_eperm`.
+
+  **Verification:** `cargo -q xtask unit`: tx-shims **230/230** (+1
+  EPERM dispatch test), tx-kernel 44/44, tx-ext4 8/8,
+  tx-scripts 50/50. `cargo test -p tx-subsystems --lib` —
+  **655/655** (+6 cred/signal tests, 11 ignored).
+
+  Commits:
+  - `68c5499` cred: lift syscall-entry CredSnapshot to first-class type
+  - `0b45030` cred: thread CredSnapshot through signal authorization checks
+  - `446b553` cred: project CredSnapshot directly into VFS walker Credential
+  - `a2dbf80` cred: land cred::checks witness API per cred_service_v_1
+  - `32769d4` cred: enforce kill permission at sys_kill via script_kill_process
+  - `6d27c78` cred: close remaining kill-family permission bypasses
+  - `b737739` cred: extract authorize_signal_send combinator (snapshot + facts + check)
+  - `4ac80d8` tx-shims: land SyscallResult::error_from + dispatch_errno bridges
+
+  **Scope gaps (deferred, not regressed):** Supplementary group list,
+  `fsuid`/`fsgid`, capability bounding/inheritable/ambient sets, full
+  `capset` semantics — all still day-1 elisions per the original
+  `cred_service_v_1` deferred list. `RestrictionStackHandle` remains
+  a placeholder zone (PR-K territory). `cred::checks::*` covers
+  path_search / open / signal_send; `require_unlink` / `require_chmod`
+  / `require_setuid` land alongside the syscall arms that need them.
+
+  **Next step:** Either write the `docs/progress/decisions/` deep
+  dive (this STATUS entry is the summary), or pick up the next
+  cred-adjacent gap — `cred::checks::require_unlink` + migration of
+  one VFS execution call site to consume the witness end-to-end.
+
 - 2026-05-18 **ext4 mount-time RO/RW distinction + Linux `MS_RDONLY` honoured.**
   Previously `mount_ext4_read_only` was the only entry point and its
   name was a misnomer — the underlying `Ext4FsInstance` and its
