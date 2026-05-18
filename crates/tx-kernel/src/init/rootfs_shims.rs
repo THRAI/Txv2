@@ -93,6 +93,68 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":shebang-shims:ok\n");
     }
+
+    /// Populate the rootfs tmpfs with the writable scratch
+    /// directories that POSIX-shaped userspace expects to exist.
+    /// Today this covers `/tmp/`, `/var/`, and `/var/tmp/`.
+    ///
+    /// **Why this exists.** The OSComp `lmbench-musl` suite (and
+    /// many libc/libctest tests) `open(O_RDWR|O_CREAT, "/var/tmp/…")`
+    /// during setup. Without these directories `open` returns
+    /// `-ENOENT` and the entire suite scores 0/N. The kernel does
+    /// not auto-create them at boot the way Linux's initrd would —
+    /// the rootfs is a fresh tmpfs.
+    ///
+    /// **Order invariant:** must run after
+    /// [`Self::populate_rootfs_shebang_shims`] so the
+    /// `:shebang-shims:ok` sentinel comes first in the boot log
+    /// (purely for grep-stability — there is no functional
+    /// dependency between the two helpers).
+    ///
+    /// Failures are non-fatal — the helper logs a sentinel and
+    /// returns. The kernel boots; the affected suites stay at 0/N
+    /// until the scratch dirs are populated.
+    pub(crate) fn populate_rootfs_tmp_dirs() {
+        let root_mount = ROOT_MOUNT
+            .lock()
+            .clone()
+            .expect("populate_rootfs_tmp_dirs: ROOT_MOUNT must be populated");
+        let rootfs_payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .clone();
+        let cred = Credential::root();
+        let root_fs_object_id = root_mount.root().fs_object_id();
+        let fs_ops = &rootfs_payload.fs_ops;
+
+        // /tmp (world-writable, sticky-style — the slice doesn't
+        // honour the sticky bit yet so 0o777 is the practical
+        // equivalent).
+        if mkdir_or_find(fs_ops, root_fs_object_id, b"tmp", 0o777, &cred).is_none() {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":tmp-dirs:err:mkdir-tmp\n");
+            return;
+        }
+
+        // /var and /var/tmp
+        let var_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"var", 0o755, &cred) {
+            Some(id) => id,
+            None => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":tmp-dirs:err:mkdir-var\n");
+                return;
+            }
+        };
+        if mkdir_or_find(fs_ops, var_id, b"tmp", 0o777, &cred).is_none() {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":tmp-dirs:err:mkdir-var-tmp\n");
+            return;
+        }
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":tmp-dirs:ok\n");
+    }
 }
 
 /// Create-or-find a directory under `parent`. Treats EEXIST as
