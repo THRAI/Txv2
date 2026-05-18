@@ -392,6 +392,66 @@ fn dispatch_newfstatat_at_empty_path_stats_cwd() {
     drop(path);
 }
 
+/// `newfstatat(fd, "", &statbuf, AT_EMPTY_PATH)` mirrors
+/// `fstat(fd)`. LA64 musl uses this shape for its public
+/// `fstat(2)` wrapper.
+#[test]
+fn dispatch_newfstatat_at_empty_path_stats_fd() {
+    let _setup = stat_setup();
+    let (root_dentry, tmpfs, _root_rnode) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let (file_id, _meta) = {
+        let guard = guard();
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard) {
+            StepOutcome::Done(pair) => pair,
+            other => panic!("create_inode: {other:?}"),
+        }
+    };
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+
+    let path = nul_terminate(b"/f");
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let open_req = SyscallRequest::new(
+        crate::linux_syscall::NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            crate::linux_syscall::O_RDONLY as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(open_req, &ctx)) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("openat /f: {other:?}"),
+    };
+    drop(path);
+
+    let empty = nul_terminate(b"");
+    let mut statbuf = vec![0u8; STAT_BYTES];
+    let stat_req = SyscallRequest::new(
+        NR_NEWFSTATAT,
+        [
+            fd as u64,
+            empty.as_ptr() as u64,
+            statbuf.as_mut_ptr() as u64,
+            AT_EMPTY_PATH as u64,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(stat_req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(read_u64_at(&statbuf, STAT_INO_OFF), file_id.as_u64());
+    assert_eq!(read_u32_at(&statbuf, STAT_MODE_OFF), 0o100644);
+    drop(empty);
+}
+
 /// `statx(AT_FDCWD, "/", 0, STATX_BASIC_STATS, statxbuf)` follows
 /// the same cwd-relative walker path as `newfstatat` and writes the
 /// Linux `struct statx` byte image used by LA64 busybox `ls`.
@@ -431,6 +491,66 @@ fn dispatch_statx_on_root_writes_statx_struct() {
     );
     assert_eq!(read_u64_at(&statxbuf, STATX_SIZE_OFF), 0);
     drop(path);
+}
+
+/// `statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, statxbuf)`
+/// mirrors `fstat(fd)`. LA64 musl may use this fd form for its public
+/// `fstat(2)` wrapper.
+#[test]
+fn dispatch_statx_at_empty_path_stats_fd() {
+    let _setup = stat_setup();
+    let (root_dentry, tmpfs, _root_rnode) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let (file_id, _meta) = {
+        let guard = guard();
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard) {
+            StepOutcome::Done(pair) => pair,
+            other => panic!("create_inode: {other:?}"),
+        }
+    };
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+
+    let path = nul_terminate(b"/f");
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let open_req = SyscallRequest::new(
+        crate::linux_syscall::NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            crate::linux_syscall::O_RDONLY as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(open_req, &ctx)) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("openat /f: {other:?}"),
+    };
+    drop(path);
+
+    let empty = nul_terminate(b"");
+    let mut statxbuf = vec![0u8; STATX_BYTES];
+    let statx_req = SyscallRequest::new(
+        NR_STATX,
+        [
+            fd as u64,
+            empty.as_ptr() as u64,
+            AT_EMPTY_PATH as u64,
+            crate::linux_syscall::numbers::STATX_BASIC_STATS as u64,
+            statxbuf.as_mut_ptr() as u64,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(statx_req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(read_u64_at(&statxbuf, STATX_INO_OFF), file_id.as_u64());
+    assert_eq!(read_u16_at(&statxbuf, STATX_MODE_OFF), 0o100644);
+    drop(empty);
 }
 
 // -----------------------------------------------------------------

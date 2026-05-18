@@ -974,6 +974,37 @@ fn inode_meta_to_statx(meta: &InodeMeta, ino: u64) -> StatxLayout {
     }
 }
 
+fn stat_meta_for_open_file(file: &Cap<OpenFile>) -> InodeMeta {
+    let rnode = file.rnode();
+    let fs_object_id = rnode.fs_object_id();
+    // Live size resolution: cached `rnode.meta()` is the snapshot at
+    // materialisation time and doesn't see in-place writes. For a
+    // page-backed regular file the in-memory `PageContainer.size_bytes`
+    // is the authoritative live size (`step_write_from_*` calls
+    // `pc.grow_size_to` on every write). Fall back to
+    // `fs_ops.load_inode_meta` for other rnode kinds, then to the
+    // cached meta. Without this, oscomp basic test_mmap/test_munmap
+    // print `file len: 0` and crash on the 0-length mmap because
+    // tmpfs/ext4's on-disk inode metadata is never refreshed after
+    // the page-cache write.
+    let mut meta = match fs_ops_for_rnode(rnode) {
+        Some(fs_ops) => {
+            let guard = step_engine::guard();
+            match fs_ops.load_inode_meta(fs_object_id, &guard) {
+                StepOutcome::Done(m) => m,
+                _ => rnode.meta(),
+            }
+        }
+        None => rnode.meta(),
+    };
+    if let Some(sz) =
+        crate::linux_syscall::vm::extract_page_container(file).map(|pc| pc.size_bytes())
+    {
+        meta.size = sz;
+    }
+    meta
+}
+
 /// `fstat(fd, statbuf)`. Linux RV64 generic ABI `__NR_fstat = 80`.
 ///
 /// Reads `OpenFile.rnode().meta()` for the fd and writes the Linux
@@ -1001,30 +1032,7 @@ pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 
     let rnode = file.rnode();
     let fs_object_id = rnode.fs_object_id();
-    // Live size resolution: cached `rnode.meta()` is the snapshot at
-    // materialisation time and doesn't see in-place writes. For a
-    // page-backed regular file the in-memory `PageContainer.size_bytes`
-    // is the authoritative live size (`step_write_from_*` calls
-    // `pc.grow_size_to` on every write). Fall back to
-    // `fs_ops.load_inode_meta` for other rnode kinds, then to the
-    // cached meta. Without this, oscomp basic test_mmap/test_munmap
-    // print `file len: 0` and crash on the 0-length mmap because
-    // tmpfs/ext4's on-disk inode metadata is never refreshed after
-    // the page-cache write.
-    let mut meta = match fs_ops_for_rnode(rnode) {
-        Some(fs_ops) => {
-            let guard = step_engine::guard();
-            match fs_ops.load_inode_meta(fs_object_id, &guard) {
-                StepOutcome::Done(m) => m,
-                _ => rnode.meta(),
-            }
-        }
-        None => rnode.meta(),
-    };
-    let pc_size = crate::linux_syscall::vm::extract_page_container(&file).map(|pc| pc.size_bytes());
-    if let Some(sz) = pc_size {
-        meta.size = sz;
-    }
+    let meta = stat_meta_for_open_file(&file);
     let ino = fs_object_id.as_u64();
     let stat = inode_meta_to_stat(&meta, ino, 0);
 
@@ -1056,10 +1064,11 @@ pub(super) async fn sys_fchdir<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
 /// `__NR_statx = 291`.
 ///
 /// This is the metadata probe LA64 musl/busybox uses before `ls`
-/// opens a directory. Txv2 reports the same inode metadata already
-/// used by `newfstatat`; unsupported sync policy bits are accepted
-/// because there is no cache coherency distinction in the current VFS
-/// layer.
+/// opens a directory and, on LA64 musl, for some `fstat(fd)` wrappers
+/// via `statx(fd, "", AT_EMPTY_PATH, ...)`. Txv2 reports the same
+/// inode metadata already used by `newfstatat`; unsupported sync
+/// policy bits are accepted because there is no cache coherency
+/// distinction in the current VFS layer.
 pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
@@ -1067,9 +1076,6 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let _mask = args[3] as u32;
     let statxbuf_uaddr = args[4];
 
-    if dirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
     if path_uaddr == 0 || statxbuf_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
@@ -1092,13 +1098,34 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         None => return SyscallResult::Error(ENOENT_VALUE),
     };
     let (statx_result, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
-        (
-            StatxResult {
-                meta: cwd.rnode().meta(),
-            },
-            cwd.rnode().fs_object_id(),
-        )
+        if dirfd == AT_FDCWD {
+            (
+                StatxResult {
+                    meta: cwd.rnode().meta(),
+                },
+                cwd.rnode().fs_object_id(),
+            )
+        } else {
+            let fd = dirfd;
+            if fd < 0 {
+                return SyscallResult::Error(EBADF_VALUE);
+            }
+            let file = match resolve_fd(&ctx.process, fd as u32) {
+                Some(f) => f,
+                None => return SyscallResult::Error(EBADF_VALUE),
+            };
+            let rnode = file.rnode();
+            (
+                StatxResult {
+                    meta: stat_meta_for_open_file(&file),
+                },
+                rnode.fs_object_id(),
+            )
+        }
     } else {
+        if dirfd != AT_FDCWD {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
         let walker_cred = ctx.walker_cred();
         let result = {
             let mut script_ctx = build_subject_script_ctx(ctx);
@@ -1127,9 +1154,10 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// `__NR_newfstatat = 79`.
 ///
 /// Slice 6 surface:
-/// - `dirfd == AT_FDCWD` only; non-cwd dirfds → `-EBADF`.
-/// - `flags & AT_EMPTY_PATH` paired with empty path stats the cwd
-///   directly (no walker invocation).
+/// - `dirfd == AT_FDCWD` for path walks; non-cwd dirfds → `-EBADF`.
+/// - `flags & AT_EMPTY_PATH` paired with empty path stats either the
+///   cwd (`AT_FDCWD`) or the supplied fd. LA64 musl uses this fd form
+///   to implement `fstat(fd)`.
 /// - `flags & AT_SYMLINK_NOFOLLOW` is accepted but ignored (the
 ///   walker always follows symlinks today; documented carryover).
 /// - `flags & AT_NO_AUTOMOUNT` is accepted but ignored (no
@@ -1144,9 +1172,6 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     let statbuf_uaddr = args[2];
     let flags = args[3] as u32;
 
-    if dirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
     if statbuf_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
@@ -1169,15 +1194,24 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 
     let walker_cred = ctx.walker_cred();
 
-    // AT_EMPTY_PATH + empty path: stat the cwd itself directly,
-    // bypassing the walker. Otherwise use StatOp + drive_oneshot.
+    // AT_EMPTY_PATH + empty path: stat the cwd itself for AT_FDCWD,
+    // or mirror fstat(fd) for a real fd. Otherwise use StatOp +
+    // drive_oneshot from cwd; directory-fd path walks remain out of
+    // scope for this slice.
     let cwd = match ctx.process.cwd() {
         Some(d) => d,
         None => return SyscallResult::Error(ENOENT_VALUE),
     };
     let (meta, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
-        (cwd.rnode().meta(), cwd.rnode().fs_object_id())
+        if dirfd == AT_FDCWD {
+            (cwd.rnode().meta(), cwd.rnode().fs_object_id())
+        } else {
+            return sys_fstat([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx);
+        }
     } else {
+        if dirfd != AT_FDCWD {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
         let result = {
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = StatOp {
