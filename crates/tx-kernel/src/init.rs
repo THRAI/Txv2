@@ -1540,6 +1540,23 @@ impl<P: TxPlatform> CoreInit<P> {
             // Snapshot PCB `comm` before moving `child_thread` into the
             // future. None for orphan threads with no owner_proc.
             let comm = owner.as_ref().map(|p| p.comm());
+            // Snapshot pgid + sid for the OBS-V1 §15.8 group label.
+            // Read via `pgrp_cap` which clones the live `Cap<ProcessGroup>`
+            // under the per-process spin lock; the inner `session_cap`
+            // hop is a second clone — both are cheap (refcount bump).
+            let (pgid_low, sid_low) = owner
+                .as_ref()
+                .map(|p| {
+                    let pgrp = p.pgrp_cap();
+                    (pgrp.pgid.0, pgrp.session_cap().sid.0)
+                })
+                .unwrap_or((0, 0));
+            // Snapshot the parent's PID for the OBS-V1 §15.9 fork
+            // edge — `parent_pid()` returns `Pid::RESERVED` when the
+            // parent has been reaped, which the daemon treats the
+            // same as "no edge" (the fork emit dispatch elides any
+            // parent_pid == 0 record).
+            let parent_pid_low = owner.as_ref().map(|p| p.parent_pid().0).unwrap_or(0);
             let _ = BOOT_REACTOR.with(|reactor| {
                 reactor.submit_task_with_meta(
                     crate::thread_future::PerHartSlotted::<P, _>::new(
@@ -1552,13 +1569,19 @@ impl<P: TxPlatform> CoreInit<P> {
                         .with_process_id(pid_low),
                 );
             });
-            // OBS-V1 §15.7: emit a one-shot ProcessLabel Instant so the
-            // daemon can surface the real PCB `comm` (e.g. `basic_exec`)
-            // on the per-process Perfetto track. Skipped if the parent
-            // process identity was already dropped (defensive — `comm`
-            // would be the `?` sentinel and add no information).
+            // OBS-V1 §15.7 + §15.8: emit ProcessLabel + ProcessGroup so
+            // the daemon can surface the real PCB `comm` AND nest the
+            // per-process track under its pgrp/session swimlane.
+            // Skipped if the parent process identity was already
+            // dropped (defensive — `comm` would be the `?` sentinel
+            // and pgid_low/sid_low both zero, adding no information).
             if let Some(ref c) = comm {
                 emit_process_label::<P>(pid_low, c);
+                emit_process_group::<P>(pid_low, pgid_low, sid_low);
+                // OBS-V1 §15.9: parent → child fork edge so Perfetto
+                // can draw a flow arrow from the parent's clone()
+                // syscall slice to this child's first dispatch.
+                emit_process_fork::<P>(parent_pid_low, pid_low);
             }
         }
     }
@@ -1617,6 +1640,73 @@ pub(crate) fn emit_process_label<P: tx_hal::TxPlatform>(pid_low: u32, comm: &[u8
         tx_observe::EventNameId::from_raw(0x9000_0000 | pid_low),
         tx_observe::current_parent_span(),
         tx_observe::encode::process_label_tag(),
+        &enc[..len as usize],
+    );
+}
+
+/// Emit a one-shot `PayloadProcessFork` Instant carrying the
+/// parent → child PID edge. The daemon hashes
+/// `(parent_pid, child_pid)` into a Perfetto `flow_id` and draws an
+/// arrow from the parent's most recent `clone()` slice to the
+/// child's first `Sched` dispatch (OBS-V1 §15.9). Skipped when
+/// `parent_pid` is zero (kernel-internal or pre-init contexts).
+pub(crate) fn emit_process_fork<P: tx_hal::TxPlatform>(parent_pid: u32, child_pid: u32) {
+    if parent_pid == 0 || child_pid == 0 {
+        return;
+    }
+    let Some(em) = tx_observe::current() else {
+        return;
+    };
+    let payload = tx_observe::PayloadProcessFork {
+        parent_pid_low: parent_pid,
+        child_pid_low: child_pid,
+        _flags: 0,
+        _pad: 0,
+    };
+    let (enc, len) = tx_observe::encode::encode_process_fork(&payload);
+    em.instant(
+        tx_observe::TxTraceLevel::Sched,
+        // `0xB000_0000 | child_pid` namespace — disjoint from
+        // ProcessLabel (`0x9000_…`) and ProcessGroup (`0xA000_…`).
+        tx_observe::EventNameId::from_raw(0xB000_0000 | child_pid),
+        tx_observe::current_parent_span(),
+        tx_observe::encode::process_fork_tag(),
+        &enc[..len as usize],
+    );
+}
+
+/// Emit a one-shot `PayloadProcessGroup` Instant mapping `pid_low`
+/// to its owning `pgid` + `sid`. Lets the daemon parent per-process
+/// Perfetto tracks under a per-pgrp swimlane (a test driver + its
+/// fork()ed children render together) and a per-session container
+/// above that (OBS-V1 §15.8).
+///
+/// Emitted alongside `emit_process_label` at the same kernel sites.
+/// No-op when no `HartEmitter` is installed.
+pub(crate) fn emit_process_group<P: tx_hal::TxPlatform>(
+    pid_low: u32,
+    pgid_low: u32,
+    sid_low: u32,
+) {
+    let Some(em) = tx_observe::current() else {
+        return;
+    };
+    let payload = tx_observe::PayloadProcessGroup {
+        process_id_low: pid_low,
+        pgid_low,
+        sid_low,
+        _pad: 0,
+    };
+    let (enc, len) = tx_observe::encode::encode_process_group(&payload);
+    em.instant(
+        tx_observe::TxTraceLevel::Sched,
+        // Namespace `0xA000_0000 | pid` — disjoint from the
+        // ProcessLabel `0x9000_0000` range so the daemon can
+        // dispatch on EventNameId alone without consulting the
+        // payload tag.
+        tx_observe::EventNameId::from_raw(0xA000_0000 | pid_low),
+        tx_observe::current_parent_span(),
+        tx_observe::encode::process_group_tag(),
         &enc[..len as usize],
     );
 }
