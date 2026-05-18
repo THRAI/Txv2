@@ -312,19 +312,32 @@ fn dispatch_execve_path_not_found_returns_neg_enoent() {
 }
 
 /// `execve` of a non-ELF file returns `-ENOEXEC` (positive 8) via
-/// `ExecError::NotExecutable → -8`.
+/// Non-ELF / non-shebang file → kernel-side fallback to `/bin/sh`.
+/// Pre-2026-05-18 returned `-ENOEXEC (8)`; the new behaviour matches
+/// every userspace shell's ENOEXEC fallback. The test fixture has no
+/// `/bin/sh`, so the second exec attempt fails the walker with
+/// `-ENOENT (2)`. The shape of the failure proves the fallback fires
+/// (the libctest 0/220 unblock relies on this — see STATUS.md
+/// 2026-05-18).
 #[test]
-fn dispatch_execve_invalid_elf_returns_neg_enoexec() {
+fn dispatch_execve_non_elf_non_shebang_falls_back_to_bin_sh() {
     let _setup = execve_setup();
 
-    let bytes = vec![0u8; 4096]; // 4 KiB of zeroes — fails magic check.
+    let bytes = vec![0u8; 4096]; // 4 KiB of zeroes — fails ELF magic.
     let (process, thread, _fs) = bootstrap_with_file(b"bad", &bytes);
     let ctx = make_ctx(process, thread);
 
     let path: &[u8] = b"/bad\0";
     let req = SyscallRequest::new(NR_EXECVE, [path.as_ptr() as u64, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(8));
+    assert_eq!(
+        result,
+        SyscallResult::Error(2),
+        "kernel-side ENOEXEC fallback should re-exec via /bin/sh; \
+         the fixture has no /bin/sh so the second walker returns \
+         -ENOENT (2) — not -ENOEXEC (8), which would mean the \
+         fallback never fired."
+    );
 }
 
 /// A path with no NUL terminator within `EXECVE_PATH_MAX = 4096`

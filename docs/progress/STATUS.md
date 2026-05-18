@@ -1,3 +1,52 @@
+- 2026-05-18 **Shebang shims + ENOEXEC `/bin/sh` fallback land:
+  basic-musl 102/102, lua-musl 9/9, libctest now executes all 220
+  tests.** Two cooperating changes unblock the top-of-table fix in
+  SYSCALL_STATUS.md (the 229-OSComp-test shebang gap):
+
+  1. **`populate_rootfs_shebang_shims()`** — new init helper in
+     [`crates/tx-kernel/src/init/rootfs_shims.rs`](../../crates/tx-kernel/src/init/rootfs_shims.rs).
+     Auto-creates `/bin/`, `/usr/`, `/usr/bin/` in the tmpfs rootfs
+     and symlinks `/bin/sh`, `/bin/busybox`, `/usr/bin/env` →
+     `/musl/musl/busybox`. Carved into its own file so init.rs
+     stays under the 1800-line arch-lint cap.
+
+  2. **Kernel-side ENOEXEC fallback to `/bin/sh`** — when
+     `exec_script` sees a file that's neither ELF nor `#!`, it now
+     synthesizes `#!/bin/sh <path>` instead of returning
+     `ExecError::NotExecutable`. Matches every userspace shell's
+     standard ENOEXEC behaviour but is needed at the kernel layer
+     because busybox ash's fallback only fires for files whose first
+     character looks "script-like" — and the libctest wrappers
+     `run-static.sh` / `run-dynamic.sh` start with `./runtest.exe …`
+     (no shebang), which ash gives up on.
+
+  Two unit tests inverted to assert the new behaviour:
+  `exec_script_non_elf_non_shebang_falls_back_to_bin_sh` and
+  `dispatch_execve_non_elf_non_shebang_falls_back_to_bin_sh`.
+
+  Verified by `cargo xtask oscomp qemu --target rv64-qemu` +
+  per-suite `cargo xtask oscomp score`:
+  - `basic-musl`: 101/102 → **102/102** (full pass).
+  - `lua-musl`: 0/9 → **9/9** (full pass).
+  - `libctest-musl`: 0/220 (now executes; every test fails on
+    `sigtimedwait: Function not implemented` — the next move is
+    wiring `sys_rt_sigtimedwait` (handler exists in `signal.rs`,
+    just needs the dispatch arm; it's one of the 13
+    defined-no-arm entries flagged by `cargo xtask syscall list
+    --filter defined`)).
+  - `busybox-musl`, `libcbench-musl`, `lmbench-musl` unchanged.
+
+  Two side fixes to keep CI green:
+  - Carved the helper into a sibling file so `init.rs` stays under
+    the 1800-line arch-lint cap.
+  - SYSCALL_STATUS.md: scoreboard updated; high-stakes-table top
+    row swapped from "shebang shim" (landed) to "wire
+    `sys_rt_sigtimedwait`" (next +220 OSComp impact); **Last
+    refresh** bumped to 5th pass.
+
+  `cargo xtask ci` — 17/17 gates pass.
+  `cargo -q xtask unit` — 334 tests pass.
+
 - 2026-05-18 **Merged `origin/main` (post-PR #33) + recorded full
   per-suite OSComp scoreboard in `SYSCALL_STATUS.md`.** PR #33 brings
   `cargo xtask oscomp score`, `list-suites`, and `test` subcommands —

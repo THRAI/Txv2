@@ -176,6 +176,7 @@ pub struct CoreInit<P: TxPlatform> {
 }
 
 mod exec;
+mod rootfs_shims;
 
 impl<P: TxPlatform> CoreInit<P> {
     pub fn boot(handoff: BootHandoff) -> ! {
@@ -286,6 +287,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_procfs_at_proc();
             Self::mount_bdevfs_at_dev_block();
             Self::mount_sdcard_at_musl();
+            Self::populate_rootfs_shebang_shims();
             Self::bind_init_cwd_and_root();
 
             // Deferred H4 spine slots:

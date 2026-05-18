@@ -17,13 +17,13 @@ inner loop; OSComp + LTP are the correctness bar. When a syscall lands,
 record which specific OSComp/LTP test(s) closed it under "Currently
 passing" below.
 
-**Last refresh:** 2026-05-18 (4th pass — merged `origin/main`
-post-PR #33, which brings `cargo xtask oscomp score` /
-`list-suites` / `test` subcommands and lands busybox-musl 52/55
-on main. New per-suite scoreboard recorded below for the full
-OSComp set: basic-musl 101/102, busybox-musl 52/55, libcbench
-~14/27, libctest 0/220, lua 0/9, lmbench 0/36. Updated headline
-counts: 120 NR_*, 107 dispatched.)
+**Last refresh:** 2026-05-18 (5th pass — landed the
+top-of-table shebang/exec fix on this branch. Scoreboard delta:
+basic-musl 101/102 → 102/102 (full pass), lua-musl 0/9 → 9/9
+(full pass), libctest now executes all 220 tests but each fails
+on `sigtimedwait: ENOSYS` (next move: wire
+`sys_rt_sigtimedwait`). busybox-musl, libcbench, lmbench
+unchanged.)
 
 ## Headline counts
 
@@ -58,7 +58,7 @@ number of additional LTP tests that move from skipped/failed to runnable.
 
 | Gap | OSComp / LTP impact | Effort | Substrate status |
 |---|---|---|---|
-| `/usr/bin/env` shebang stub — auto-create `/usr/bin/` + symlink `env → /bin/busybox` at boot (or whatever busybox path the image uses) | **+229 OSComp** (libctest 220 + lua 9, both currently 0/N with `./run-static.sh: not found` / `./test.sh: not found`) | **S (≤1d)** — same shape as `mount_procfs_at_proc()` in `a2eff5f` | only tmpfs symlink + mkdir at init time |
+| Wire `sys_rt_sigtimedwait` (+ the other defined-no-arm RT_SIG entries) | **+220 OSComp** (libctest now runs all 220 tests; every one fails on `sigtimedwait: ENOSYS` in `runtest.c`) | **S (≤1d)** — handlers exist in `signal.rs`, just need match arms | trivial dispatch wiring; risk surface small |
 | lmbench unblock — `mkdir /var/tmp` at boot + diagnose `Simple read: -1` | up to +36 OSComp (lmbench-musl 0/36) | S–M (mkdir is hours; `Simple read` needs runtime triage) | `mkdir` is trivial; `read(2)` edge case to investigate |
 | libcbench malloc / stdio gaps | up to +13 OSComp (`~14/27` → close to 27/27) | M (~3w) | malloc benches return 0 → allocator instrumentation; stdio failures suggest fd / buffering path |
 | `preadv` / `pwritev` / `fallocate` / `readahead` | +20 LTP | S–M (3–4w) | `writev` loop + VFS hooks exist |
@@ -96,6 +96,10 @@ on unless the user specifically chartered them.
 - New xtask scoring subcommands (`oscomp score`, `list-suites`, `test`)
   — landed in PR #33; let us produce the per-suite scoreboard above
   with one command (`cargo xtask oscomp test --target rv64-qemu`).
+- Shebang shims (`/bin/sh`, `/bin/busybox`, `/usr/bin/env`) +
+  kernel-side ENOEXEC fallback to `/bin/sh` — landed on this branch
+  2026-05-18 (lua 0/9 → 9/9, basic 101/102 → 102/102, libctest now
+  executes — see "Top-of-table fix landed" below).
 
 ## OSComp + LTP coverage (the gold standard)
 
@@ -117,23 +121,51 @@ cargo xtask oscomp test        --target rv64-qemu --suite busybox-musl
 
 #### Scoreboard (rv64-qemu, last full-suite run)
 
-| Suite | Score | Status | Root cause / next move |
-|---|---:|---|---|
-| `basic-musl`   | **101/102** | mostly passing | 1 partial `mmap` test; the rest of the 32 binary tests pass end-to-end (cited as 32/32 in earlier refreshes — the 101/102 count is per-assertion). |
-| `busybox-musl` | **52/55**   | landed (PR #33) | 3 remaining are non-kernel: `hwclock` (no RTC), `kill 10` (judge / sdcard cmd mismatch), `which ls` (no `ls` symlink in PATH). |
-| `libcbench-musl` | **~14/27** | partial      | Malloc benches return 0 (likely allocator instrumentation gap); stdio tests fail (buffer-flushing or fd-redirection path). |
-| `libctest-musl`  | **0/220** | blocked       | `./run-static.sh: not found` (ENOENT) — wrapper script can't exec. |
-| `lua-musl`     | **0/9**     | blocked       | `./test.sh: not found` — same pattern as libctest. |
-| `lmbench-musl` | **0/36**    | blocked       | Binary runs; first failure is `Simple read: -1` plus missing `/var/tmp/`. |
+| Suite | Score | Δ | Status |
+|---|---:|---:|---|
+| `basic-musl`   | **102/102** | +1 | full pass |
+| `busybox-musl` | **52/55**   | 0  | landed; 3 non-kernel (`hwclock`, `kill 10`, `which ls`) |
+| `libcbench-musl` | **~13.9/27** | 0 | partial; malloc benches + stdio tests fail |
+| `libctest-musl`  | **0/220** | 0 (but now executes) | every test fails on `sigtimedwait: ENOSYS`; shebang/exec wrapper now resolves |
+| `lua-musl`     | **9/9**     | +9 | full pass |
+| `lmbench-musl` | **0/36**    | 0  | needs `/var/tmp` + `Simple read: -1` triage |
 
-#### Highest-leverage next move: lua + libctest shebang fix (229 tests)
+#### Top-of-table fix landed (2026-05-18, this branch)
 
-Both `./test.sh` and `./run-static.sh` ENOENT-fail in the same way.
-Most likely cause is a `#!/usr/bin/env …` shebang where `/usr/bin/env`
-doesn't exist on the rootfs. Fix pattern is the same as the `/proc`
-auto-mount in `a2eff5f`: create `/usr/bin/` and symlink `env →
-/bin/busybox` (or wherever the busybox image lives) in the tmpfs
-rootfs at boot. That single fix unblocks 220 + 9 = 229 tests.
+Two cooperating changes unblocked the shebang/exec wrapper failures
+that had been blocking 229 OSComp tests:
+
+1. **`populate_rootfs_shebang_shims()`** at kernel boot — auto-create
+   `/bin/`, `/usr/`, `/usr/bin/` in the tmpfs rootfs and symlink:
+   - `/bin/busybox` → `/musl/musl/busybox`
+   - `/bin/sh`      → `/musl/musl/busybox`
+   - `/usr/bin/env` → `/musl/musl/busybox`
+
+   Carved into [`crates/tx-kernel/src/init/rootfs_shims.rs`](../../crates/tx-kernel/src/init/rootfs_shims.rs).
+   Invoked from the boot sequence between `mount_sdcard_at_musl()`
+   and `bind_init_cwd_and_root()`.
+
+2. **Kernel-side ENOEXEC fallback** in
+   [`crates/tx-scripts/src/process/exec/script.rs`](../../crates/tx-scripts/src/process/exec/script.rs) —
+   when a file is **not** ELF and does **not** start with `#!`,
+   exec_script now synthesizes `#!/bin/sh <path> [argv…]` instead of
+   returning `ExecError::NotExecutable`. This matches every userspace
+   shell's standard ENOEXEC fallback, but is needed at the kernel
+   layer because busybox ash's fallback only fires for files whose
+   first character looks "script-like" — and the libctest wrappers
+   `run-static.sh` / `run-dynamic.sh` start with `./runtest.exe …`
+   (no shebang) which ash gives up on.
+
+   Two unit tests were inverted to assert the new behaviour:
+   `exec_script_non_elf_non_shebang_falls_back_to_bin_sh` and
+   `dispatch_execve_non_elf_non_shebang_falls_back_to_bin_sh`.
+
+Result: **lua-musl 0/9 → 9/9**, **basic-musl 101/102 → 102/102**,
+and **libctest now actually runs all 220 tests** (the score is still
+0/220 because every test fails on `sigtimedwait: Function not
+implemented` — `NR_RT_SIGTIMEDWAIT=137` is in the defined-no-arm
+list. The next move is wiring `sys_rt_sigtimedwait` and the other
+defined-no-arm RT_SIG entries).
 
 #### Second move: lmbench (36 tests)
 
@@ -142,6 +174,14 @@ The binary actually runs — two blockers:
 - `Simple read: -1` is a timing/IO issue and needs runtime triage
   before the rest of the suite can be scored. Likely a `read(2)`
   return-value or `pread`-style edge case.
+
+#### Third move: wire `sys_rt_sigtimedwait` for libctest
+
+`NR_RT_SIGTIMEDWAIT=137` is one of the 13 entries in
+`defined-but-no-arm` (the handler `sys_rt_sigtimedwait` already exists
+in `signal.rs` but no match arm wires it). Adding the dispatch arm
+should unblock most of libctest's 220 tests, since `runtest.c` uses
+sigtimedwait to manage child process timeouts.
 
 #### basic-musl 32/32 detail (carries over)
 

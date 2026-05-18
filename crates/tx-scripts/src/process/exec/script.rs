@@ -400,14 +400,29 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         result?;
     }
 
-    // ===== Phase 2.5 — shebang (#!) dispatch ===========================
+    // ===== Phase 2.5 — shebang (#!) + no-shebang script dispatch =====
     //
     // If the file starts with "#!" treat it as a script: parse the
     // interpreter path (and optional single argument) from the first
     // line, then re-invoke exec_script with the interpreter as the new
     // target.  Mirrors Linux binfmt_script.  One level of recursion is
     // sufficient (the interpreter itself must be a real ELF binary).
-    if header_bytes.starts_with(b"#!") {
+    //
+    // If the file does NOT start with "#!" AND does NOT start with the
+    // ELF magic `0x7f 'E' 'L' 'F'`, treat it as a `/bin/sh` script.
+    // Linux's kernel doesn't do this — it returns -ENOEXEC and lets the
+    // shell decide whether to interpret the file as a script. busybox
+    // ash's ENOEXEC fallback only fires for files whose first character
+    // looks "script-like"; oscomp's `run-static.sh` / `run-dynamic.sh`
+    // begin with `./runtest.exe …` (no shebang) and ash gives up,
+    // leaving libctest's 220 tests at 0/220 even though the scripts
+    // are perfectly valid shell. Kernel-side fallback to `/bin/sh`
+    // matches what every userspace shell *would* do if it dared, and
+    // unblocks libctest end-to-end. (cf. STATUS.md 2026-05-18 — top
+    // of the high-stakes table.)
+    let is_shebang = header_bytes.starts_with(b"#!");
+    let is_elf = header_bytes.len() >= 4 && &header_bytes[..4] == b"\x7fELF";
+    if is_shebang {
         if let Some((interp, opt_arg)) = shebang_parse(&header_bytes) {
             EXEC_SHEBANG_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             // Build new argv: [interp, opt_arg?, script_path, argv[1..]...]
@@ -433,6 +448,29 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             ))
             .await;
         }
+    } else if !is_elf {
+        // No `#!` and no ELF magic — synthesize `/bin/sh <path> [argv…]`.
+        // Depth guard: don't recurse forever if `/bin/sh` itself is
+        // somehow a non-ELF / non-shebang file (the recursion limit
+        // upstream caps this; we lean on `depth + 1 < MAX_DEPTH`).
+        const DEFAULT_SHELL: &[u8] = b"/bin/sh";
+        let mut new_argv: Vec<Vec<u8>> = Vec::new();
+        new_argv.push(DEFAULT_SHELL.to_vec());
+        new_argv.push(path.to_vec());
+        for &a in argv.iter().skip(1) {
+            new_argv.push(a.to_vec());
+        }
+        let new_argv_refs: Vec<&[u8]> = new_argv.iter().map(|v| v.as_slice()).collect();
+        return alloc::boxed::Box::pin(exec_script_inner::<P>(
+            depth + 1,
+            process,
+            thread,
+            DEFAULT_SHELL,
+            &new_argv_refs,
+            envp,
+            cred,
+        ))
+        .await;
     }
 
     // ===== Phase 3 — parse + validate (pure CPU) =====================
