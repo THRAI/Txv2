@@ -56,6 +56,12 @@ pub enum TxPayloadTag {
     /// Layout spec: `08_OBSERVATION_SERIALIZATION_v0.md` §8 (OBS-8, added).
     PhaseTransition = 52,
 
+    // ── Sched (L7 — OBS-9) ────────────────────────────────────────────────
+    /// Reactor task-on-hart slice payload, paired across
+    /// `SpanBegin(Sched)` (dispatch) and `SpanEnd(Sched)` (yield).
+    /// Payload: [`PayloadSchedSwitch`].
+    SchedSwitch = 53,
+
     // ── Panic (special) ───────────────────────────────────────────────────
     Panic = 60,
 }
@@ -415,6 +421,80 @@ pub struct PayloadPhaseTransition {
     /// Hart index (`CpuId.0` truncated to u8).
     pub hart_id: u8,
     pub _pad: [u8; 14],
+}
+
+// ---------------------------------------------------------------------------
+// §8.10 Sched payload (L7 — OBS-9)
+// ---------------------------------------------------------------------------
+
+/// Reactor task-on-hart slice payload.
+///
+/// Carried twice per task-poll cycle:
+/// - on `SpanBegin(Sched)` with `kind = SchedKind::Dispatch (0)` and
+///   `reason = 0` when the reactor picks the task off its hart's
+///   runqueue and is about to call `Future::poll`;
+/// - on `SpanEnd(Sched)` with `kind = SchedKind::Yield (1)` and
+///   `reason` populated from [`SchedReason`] after the poll returns.
+///
+/// Layout spec: `08_OBSERVATION_v1.md` §15.6 (OBS-9 reactor scheduler
+/// track).  size = 8 bytes used, 16 bytes total (matches the inline
+/// payload buffer in `TxTraceRecord`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadSchedSwitch {
+    /// `TaskMailbox::task_id_low()` of the task gaining (Dispatch) or
+    /// releasing (Yield) the hart.  Matches the `task_id_low` field on
+    /// other observation payloads so the daemon can build per-task
+    /// Perfetto tracks.
+    pub task_id_low: u32,
+    /// `TaskMailbox::process_id_low()` — the thread-group leader's PID.
+    /// For user threads this is the process's TGID; for kernel-only
+    /// tasks it is `0`. Lets the daemon parent each `task.<tid>`
+    /// thread track under the right `process.<pid>` Perfetto process
+    /// track instead of the single kernel-wide `txKernel` aggregate.
+    pub process_id_low: u32,
+    /// Hart the switch is happening on.  Mirrors `TxTraceRecord.hart`
+    /// for grep-stability — the wire carries it twice intentionally so
+    /// the daemon's per-hart track lifecycle stays self-contained even
+    /// if the per-record hart field is filtered.
+    pub hart_id: u8,
+    /// One of [`SchedKind`] — `Dispatch` (0) on SpanBegin, `Yield` (1)
+    /// on SpanEnd.
+    pub kind: u8,
+    /// One of [`SchedReason`] — populated on `Yield` SpanEnd records;
+    /// `0` (None) on Dispatch SpanBegin.
+    pub reason: u8,
+    pub _pad: [u8; 5],
+}
+
+/// Sched-switch direction tag for [`PayloadSchedSwitch::kind`].
+#[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub enum SchedKind {
+    /// Reactor is about to call `Future::poll` on the task.  Opens the
+    /// task-on-hart slice.
+    Dispatch = 0,
+    /// `Future::poll` returned.  Closes the task-on-hart slice.
+    Yield = 1,
+}
+
+/// Why a task released the hart (set on `Yield` records).
+#[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub enum SchedReason {
+    /// No reason recorded (Dispatch records and synthetic fallbacks).
+    None = 0,
+    /// `Future::poll` returned `Poll::Pending` — the task parked.
+    Parked = 1,
+    /// `Future::poll` returned `Poll::Ready(())` — the task completed.
+    Completed = 2,
+    /// `Future::poll` returned `Poll::Pending` but the task's wake bit
+    /// was already set during the poll itself, so the reactor will
+    /// re-dispatch immediately.  (`mark_runnable_from_hart` path.)
+    WokeDuringPoll = 3,
 }
 
 // ---------------------------------------------------------------------------

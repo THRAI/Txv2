@@ -13,3 +13,9 @@ doctest = false
 [dependencies]
 tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-substrate = { path = "../tx-substrate" }
+# OBS-9 reactor scheduler track (`08_OBSERVATION_v1.md` §15.6):
+# `Reactor::run_until_idle_on_hart_with_reschedule` wraps each
+# `Future::poll` call in `SpanBegin/SpanEnd(Sched)` so the daemon can
+# render a sched_switch-equivalent Gantt timeline of task-on-hart slices.
+tx-observe = { path = "../tx-observe" }
+tx-observe-types = { path = "../tx-observe-types" }
