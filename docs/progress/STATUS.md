@@ -1,3 +1,74 @@
+- 2026-05-18 **`require_unlink` + `require_link` close the two
+  remaining cred-bypass paths in the VFS mutator surface.**
+
+  Follow-up to the snapshot-wiring batch. The end-to-end witness
+  audit on `sys_unlinkat` and `sys_linkat` found that neither
+  enforced any POSIX permission rule beyond what the walker checked
+  (search-on-ancestors only). Anyone with X on a directory could
+  `rm` or hard-link files inside it regardless of the directory's W
+  bit or sticky-bit ownership rule.
+
+  **New cred::checks predicates** ([cred/checks.rs](../../crates/tx-subsystems/src/cred/checks.rs)):
+  - `UnlinkAuthorized<'g>` + `require_unlink(snapshot,
+    parent_meta, child_meta, &guard)` — POSIX rule: W+X on parent
+    (EACCES), plus S_ISVTX → owner-of-child / owner-of-parent /
+    CAP_FOWNER / euid 0 (EPERM). CAP_DAC_OVERRIDE bypasses the
+    W bit but NOT sticky (POSIX-correct).
+  - `LinkAuthorized<'g>` + `require_link(snapshot, new_parent_meta,
+    &guard)` — POSIX rule: W+X on new parent (EACCES). Sticky NOT
+    consulted (sticky governs *removal*, not name creation).
+
+  **New vfs::predicates** ([vfs/predicates.rs](../../crates/tx-subsystems/src/vfs/predicates.rs)):
+  - `check_unlink_perm(parent, child, cred)` — bit-level body
+    (W+X check + sticky-bit ownership rule).
+  - `check_link_perm(new_parent, cred)` — W+X only.
+
+  **Two `sys_*` arms rewired**
+  ([tx-shims/.../fs_mut.rs](../../crates/tx-shims/src/linux_syscall/fs_mut.rs)):
+  - `sys_unlinkat` consumes `UnlinkAuthorized<'g>` inside the commit
+    guard scope, before `FsOps::unlink` / `FsOps::rmdir`. Cred check
+    fires *before* any FS mutation.
+  - `sys_linkat` consumes `LinkAuthorized<'g>` similarly.
+
+  **Tests:** 11 new (7 + 4). `cred/tests.rs` covers all unlink
+  branches (owner-passes, no-W-EACCES, DAC_OVERRIDE bypass for W,
+  sticky-EPERM, sticky-permits-child-owner, sticky-not-bypassed-
+  by-DAC_OVERRIDE, sticky-CAP_FOWNER-bypass) and link branches
+  (owner-passes, no-W-EACCES, DAC_OVERRIDE bypass, sticky-irrelevant).
+  `file_mutation.rs` adds two dispatch regressions:
+  `dispatch_unlinkat_without_parent_write_returns_neg_eacces` and
+  `dispatch_linkat_without_new_parent_write_returns_neg_eacces` —
+  non-root caller in tmpfs-root (mode 0o755 owned by root) gets
+  -EACCES and the file/link is not minted.
+
+  **Verification:** `cargo -q xtask unit`: tx-shims **232/232**
+  (+2 EACCES dispatch tests over the snapshot-batch baseline of
+  230), tx-kernel 44/44, tx-ext4 8/8, tx-scripts 50/50.
+  `cargo test -p tx-subsystems --lib`: **666/666** (+11 unit tests
+  over the 655 baseline).
+
+  Commits:
+  - `a70a61f` cred: add require_unlink + close sys_unlinkat permission bypass
+  - `<this commit>` cred: add require_link + close sys_linkat permission bypass
+
+  **Audit summary across the cred-snapshot batch + these
+  follow-ups:** five real cred-bypass paths closed (`sys_kill`
+  pid > 0, `sys_kill` pgrp, `sys_tkill`, `sys_unlinkat`,
+  `sys_linkat`); `sys_tgkill` left intentionally
+  unmodified (tgid==caller-pid constraint trivially permits);
+  `sys_fchmodat` / `sys_fchownat` already cred-checked but the
+  rule lives in each FS impl rather than at the canonical
+  `cred::checks::*` seam (consolidation deferred —
+  `require_chmod` / `require_chown` would be the canonical site
+  and FS impls delegate); `sys_renameat2` is the remaining
+  open audit item (write-on-both-parents + sticky-on-old-parent
+  not enforced).
+
+  **Next step:** Either `require_rename` to close the last
+  identified bypass, or consolidate the per-FS chmod/chown
+  cred checks into `require_chmod` / `require_chown` at the
+  canonical seam.
+
 - 2026-05-18 **Cred snapshot lifted to first-class type; cred → signal
   authorization fully rewired through it.**
 

@@ -80,6 +80,25 @@ impl OpenAuthorized<'_> {
     }
 }
 
+/// Witness produced by [`require_link`].
+///
+/// Proves the caller may create a new name in the parent directory
+/// whose metadata was checked, under the bound guard.
+#[must_use = "the witness is the authorization receipt — drop it explicitly only if you really intend to throw away the proof"]
+pub struct LinkAuthorized<'g> {
+    _guard: PhantomData<&'g ()>,
+    _priv: (),
+}
+
+impl LinkAuthorized<'_> {
+    const fn new() -> Self {
+        Self {
+            _guard: PhantomData,
+            _priv: (),
+        }
+    }
+}
+
 /// Witness produced by [`require_unlink`].
 ///
 /// Proves the caller may remove the entry whose parent + child
@@ -173,6 +192,28 @@ pub fn require_unlink<'g>(
     let projection = Credential::from(source);
     crate::vfs::predicates::check_unlink_perm(parent_meta, child_meta, &projection)?;
     Ok(UnlinkAuthorized::new())
+}
+
+/// May the caller carrying `source` create a new name in the parent
+/// directory described by `new_parent_meta`?
+///
+/// POSIX `link(2)` / `linkat(2)` rule: write + search bits on the new
+/// parent's appropriate triplet. `CAP_DAC_OVERRIDE` bypasses.
+///
+/// Sticky (`S_ISVTX`) is *not* consulted — sticky governs *removal*
+/// (unlink/rmdir/rename's source side), not name creation.
+///
+/// Returns [`LinkAuthorized`] on success — consumed at the
+/// `FsOps::link` commit site.
+pub fn require_link<'g>(
+    source: &CredSnapshot,
+    new_parent_meta: &InodeMeta,
+    guard: &'g Guard<'_>,
+) -> Result<LinkAuthorized<'g>, Errno> {
+    let _ = guard;
+    let projection = Credential::from(source);
+    crate::vfs::predicates::check_link_perm(new_parent_meta, &projection)?;
+    Ok(LinkAuthorized::new())
 }
 
 // Re-export the existing signal-send check so the cred::checks::* surface
