@@ -42,4 +42,10 @@ impl StepProgress for PageProgress {
     fn into_output(self) -> Option<()> {
         None
     }
+    fn trace_kind(&self) -> u8 {
+        2
+    }
+    fn trace_value(&self) -> u32 {
+        self.pages
+    }
 }

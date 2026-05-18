@@ -276,3 +276,27 @@ skills:
       - docs/progress/decisions/2026-05-12-d10-vocabulary-retire-audit.md
       - docs/progress/decisions/2026-05-12-d13-tdd-retirement-via-clippy.md
     purpose: Triage failing txKernel CI gates — identify the gate by txdoc tag, reproduce locally, classify regression vs. ratchet vs. environment, and avoid silencing the invariant the gate guards.
+
+  tx-xtask:
+    sources:
+      - xtask/src/lib.rs
+      - xtask/src/unit.rs
+      - xtask/src/full_build.rs
+      - xtask/src/qemu.rs
+      - xtask/src/test.rs
+      - xtask/src/fault_decode.rs
+      - xtask/src/trap_trace.rs
+      - xtask/src/shell_test.rs
+      - xtask/src/image.rs
+      - xtask/src/lint.rs
+      - xtask/src/boundary_report.rs
+      - xtask/src/check_build.rs
+      - xtask/src/ci.rs
+      - xtask/src/doctor.rs
+      - xtask/src/observe.rs
+      - xtask/src/observe_discipline.rs
+      - xtask/src/oscomp.rs
+      - xtask/src/submit.rs
+      - xtask/src/progress
+      - xtask/src/syscall.rs
+    purpose: Reference for every `cargo xtask` subcommand — fast feedback (unit, check, lint, boundary-report), build & image (doctor, full-build, build, image), run (qemu, test, shell-test), diagnose (fault-decode, trap-trace), syscall progress (syscall), and progress/observation tooling.

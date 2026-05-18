@@ -54,6 +54,41 @@ impl InternTable {
     pub fn get_iid(&self, name_id: u32) -> Option<u64> {
         self.map.get(&name_id).map(|(iid, _)| *iid)
     }
+
+    /// Intern an ASCII literal string (e.g. `"value"`) by hashing it with
+    /// FNV-1a 32, the same scheme the kernel uses for stable
+    /// `EventNameId`s. Returns `(iid, Some(name))` on first call and
+    /// `(iid, None)` on subsequent calls — matches `intern`'s shape.
+    ///
+    /// Used by the writer when it needs to surface a debug-annotation
+    /// field name that wasn't pre-allocated by the kernel (e.g.,
+    /// `"value"` on `ArgValue` instants).
+    pub fn intern_str(&mut self, s: &str) -> (u64, Option<String>) {
+        let name_id = fnv1a32(s.as_bytes());
+        // Mirror `intern` but use the literal `s` as the registered name
+        // even if no external table entry exists — the `name_0x…`
+        // fallback would discard the readable form we already have on
+        // hand here.
+        if let Some((iid, _)) = self.map.get(&name_id) {
+            return (*iid, None);
+        }
+        let iid = self.next_iid;
+        self.next_iid += 1;
+        let name = s.to_string();
+        self.map.insert(name_id, (iid, name.clone()));
+        (iid, Some(name))
+    }
+}
+
+/// FNV-1a 32 — matches `tx_observe::fnv1a32` exactly.
+#[inline]
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
 }
 
 #[cfg(test)]

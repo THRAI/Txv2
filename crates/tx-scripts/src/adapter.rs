@@ -36,6 +36,7 @@ pub mod step_engine {
 )]
 pub mod wake {
     pub use tx_substrate::wake::timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
+    pub use tx_substrate::wake::wait_source::lookup_source;
     pub use tx_substrate::wake::{
         agent_event_matches, ActiveWait, MailboxEvent, TaskMailbox, WaitGeneration,
     };

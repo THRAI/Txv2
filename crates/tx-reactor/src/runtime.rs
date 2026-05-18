@@ -263,11 +263,20 @@ impl Reactor {
     }
 
     /// Submit a task with explicit scheduler metadata.
+    ///
+    /// `initial_meta.task_id_low` and `initial_meta.process_id_low` are
+    /// threaded into the task's `TaskMailbox` via
+    /// `TaskTable::submit_with_ids`; the scheduler also sees the full
+    /// meta for fairness/affinity bookkeeping.
     pub fn submit_task_with_meta<F>(&mut self, future: F, initial_meta: InitialSchedMeta) -> TaskKey
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let key = self.tasks.submit(future);
+        let key = self.tasks.submit_with_ids(
+            future,
+            initial_meta.task_id_low,
+            initial_meta.process_id_low,
+        );
         self.scheduler
             .task_submitted(key.id(), TaskHandle::new(key.id()), initial_meta);
         key
@@ -403,8 +412,28 @@ impl Reactor {
             let waker = task_waker(wake_state);
             let mut cx = Context::from_waker(&waker);
 
+            // OBS-9 reactor scheduler track: capture the task's
+            // `task_id_low` (mailbox-installed TID) before the poll so we
+            // can pair the SpanBegin/SpanEnd records by the same identity
+            // even if the task structure has rotated by the time we
+            // close the span.
+            let (task_id_low, process_id_low) = self
+                .tasks
+                .task(key)
+                .ok()
+                .map(|t| (t.mailbox.task_id_low(), t.mailbox.process_id_low()))
+                .unwrap_or((0, 0));
+            let sched_span = emit_sched_begin(hart, task_id_low, process_id_low);
+
             let poll = {
                 let Ok(task) = self.tasks.task_mut(key) else {
+                    emit_sched_end(
+                        sched_span,
+                        hart,
+                        task_id_low,
+                        process_id_low,
+                        tx_observe_types::SchedReason::None,
+                    );
                     continue;
                 };
                 debug_assert_eq!(task.id, key.id());
@@ -431,6 +460,13 @@ impl Reactor {
                     crate::task::set_current_mailbox(None);
                     crate::task::set_current_timer_wheel(None);
                     crate::task::set_current_delegate_registry(None);
+                    emit_sched_end(
+                        sched_span,
+                        hart,
+                        task_id_low,
+                        process_id_low,
+                        tx_observe_types::SchedReason::None,
+                    );
                     continue;
                 };
 
@@ -450,6 +486,13 @@ impl Reactor {
                         self.scheduler.task_dropped(key.id());
                         stats.completed += 1;
                     }
+                    emit_sched_end(
+                        sched_span,
+                        hart,
+                        task_id_low,
+                        process_id_low,
+                        tx_observe_types::SchedReason::Completed,
+                    );
                 }
                 Poll::Pending => {
                     let woke_during_poll = self
@@ -459,11 +502,33 @@ impl Reactor {
                         .unwrap_or(false);
                     if woke_during_poll {
                         self.mark_runnable_from_hart(key, WakeHint::Normal, hart, signal);
+                        emit_sched_end(
+                            sched_span,
+                            hart,
+                            task_id_low,
+                            process_id_low,
+                            tx_observe_types::SchedReason::WokeDuringPoll,
+                        );
                     } else if let Ok(task) = self.tasks.task_mut(key) {
                         task.status = TaskStatus::Parked;
                         task.last_stop_reason = Some(StopReason::Blocked);
                         self.scheduler
                             .task_stopped(key.id(), StopReason::Blocked, 0, hart);
+                        emit_sched_end(
+                            sched_span,
+                            hart,
+                            task_id_low,
+                            process_id_low,
+                            tx_observe_types::SchedReason::Parked,
+                        );
+                    } else {
+                        emit_sched_end(
+                            sched_span,
+                            hart,
+                            task_id_low,
+                            process_id_low,
+                            tx_observe_types::SchedReason::None,
+                        );
                     }
                 }
             }
@@ -602,4 +667,86 @@ impl Default for Reactor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// OBS-9 reactor scheduler track — `08_OBSERVATION_v1.md` §15.6.
+//
+// Each `Future::poll` call in `run_until_idle_on_hart_with_reschedule`
+// is wrapped in `SpanBegin(Sched)` / `SpanEnd(Sched)` so the daemon can
+// render a sched_switch-equivalent Gantt timeline of which reactor task
+// held each hart over time. The payload carries `(task_id_low, hart_id,
+// kind, reason)` per OBS-V1-§8.10. SpanBegin uses `kind=Dispatch,
+// reason=None`; SpanEnd uses `kind=Yield` with one of `Parked` /
+// `Completed` / `WokeDuringPoll` / `None`.
+//
+// No-op when no `HartEmitter` is installed on this hart (test
+// scaffolds, boards without an observation ring).
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn emit_sched_begin(hart: HartId, task_id_low: u32, process_id_low: u32) -> tx_observe::SpanId {
+    use tx_observe::encode::{encode_sched_switch, sched_switch_tag};
+    use tx_observe::{EventNameId, TxTraceLevel};
+    use tx_observe_types::{PayloadSchedSwitch, SchedKind, SchedReason};
+    let Some(em) = tx_observe::current() else {
+        return tx_observe::SpanId::NONE;
+    };
+    let payload = PayloadSchedSwitch {
+        task_id_low,
+        process_id_low,
+        hart_id: hart.0 as u8,
+        kind: SchedKind::Dispatch as u8,
+        reason: SchedReason::None as u8,
+        _pad: [0; 5],
+    };
+    let (enc, len) = encode_sched_switch(&payload);
+    em.span_begin(
+        TxTraceLevel::Sched,
+        // Encode the task_id_low into the EventNameId so the daemon
+        // renders per-task slice labels via the standard `names.json`
+        // path. High-bit prefix `0x8000_0000` namespaces these out of
+        // the syscall-number range (0..512) and the FNV-1a-derived
+        // type-name hash range (uniform across u32 — collision in any
+        // 64k window is ~1 / 65536 per registered type, so the high
+        // 32k window we reserve here is effectively private to Sched).
+        EventNameId::from_raw(SCHED_NAME_BASE | task_id_low),
+        tx_observe::SpanId::NONE,
+        sched_switch_tag(),
+        &enc[..len as usize],
+    )
+}
+
+/// Reserved `EventNameId` prefix for Sched span labels — see
+/// `emit_sched_begin`. `observe names` pre-populates `task.<N>` entries
+/// in this range so Perfetto renders sched slices as `task.<tid>` instead
+/// of the raw `name_0xN` fallback.
+pub(crate) const SCHED_NAME_BASE: u32 = 0x8000_0000;
+
+#[inline]
+fn emit_sched_end(
+    span: tx_observe::SpanId,
+    hart: HartId,
+    task_id_low: u32,
+    process_id_low: u32,
+    reason: tx_observe_types::SchedReason,
+) {
+    use tx_observe::encode::{encode_sched_switch, sched_switch_tag};
+    use tx_observe_types::{PayloadSchedSwitch, SchedKind};
+    if span == tx_observe::SpanId::NONE {
+        return;
+    }
+    let Some(em) = tx_observe::current() else {
+        return;
+    };
+    let payload = PayloadSchedSwitch {
+        task_id_low,
+        process_id_low,
+        hart_id: hart.0 as u8,
+        kind: SchedKind::Yield as u8,
+        reason: reason as u8,
+        _pad: [0; 5],
+    };
+    let (enc, len) = encode_sched_switch(&payload);
+    em.span_end(span, sched_switch_tag(), &enc[..len as usize]);
 }

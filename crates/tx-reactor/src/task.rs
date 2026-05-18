@@ -109,7 +109,7 @@ pub(crate) struct Task {
 }
 
 impl Task {
-    fn new_for_handle<F>(handle: TaskKey, future: F) -> Self
+    fn new_for_handle<F>(handle: TaskKey, future: F, task_id_low: u32, process_id_low: u32) -> Self
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -120,7 +120,19 @@ impl Task {
             status: TaskStatus::Runnable,
             wake_state: Arc::new(TaskWakeState::new()),
             ast: AstSlot::new(),
-            mailbox: Arc::new(TaskMailbox::new()),
+            // OBS-V1 §13.2 flow-id material: per-thread TID rides on
+            // the task's mailbox so `WaitSource::notify_emit` and
+            // `PayloadDriveBegin` carry the right identity. `0` is
+            // the documented sentinel for "no TID known" (kernel
+            // tasks, test contexts, pre-thread-runtime contexts).
+            // OBS-V1 §15.6 sched_switch view: `process_id_low` carries
+            // the owning process PID so the daemon can build per-PID
+            // ProcessDescriptor tracks parenting per-thread tracks.
+            mailbox: Arc::new(
+                TaskMailbox::new()
+                    .with_task_id(task_id_low)
+                    .with_process_id(process_id_low),
+            ),
             last_ast_batch: AstBatch::default(),
             last_stop_reason: None,
         }
@@ -159,11 +171,46 @@ impl TaskTable {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.submit_with_ids(future, 0, 0)
+    }
+
+    /// Submit a task with an explicit observation TID.
+    ///
+    /// Backwards-compatible wrapper around [`Self::submit_with_ids`];
+    /// kept for callers that only know the TID (PID defaults to 0).
+    pub fn submit_with_task_id<F>(&mut self, future: F, task_id_low: u32) -> TaskKey
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.submit_with_ids(future, task_id_low, 0)
+    }
+
+    /// Submit a task with explicit observation TID and PID.
+    ///
+    /// Plumbed by [`Reactor::submit_task_with_meta`] so per-thread
+    /// (`task_id_low`) and per-process (`process_id_low`) trace
+    /// identities thread into the task's [`TaskMailbox`] at
+    /// construction time. Kernel-only tasks pass `0` for both (the
+    /// documented "no identity" sentinel).
+    pub fn submit_with_ids<F>(
+        &mut self,
+        future: F,
+        task_id_low: u32,
+        process_id_low: u32,
+    ) -> TaskKey
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         let (id, generation) = self
             .take_reusable_slot()
             .unwrap_or_else(|| self.push_fresh_slot());
         let handle = TaskKey::new(id, generation);
-        self.slots[id.index()].task = Some(Task::new_for_handle(handle, future));
+        self.slots[id.index()].task = Some(Task::new_for_handle(
+            handle,
+            future,
+            task_id_low,
+            process_id_low,
+        ));
         handle
     }
 

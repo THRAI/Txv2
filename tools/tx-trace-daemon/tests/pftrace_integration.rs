@@ -371,7 +371,7 @@ fn pftrace_synthetic_roundtrip() {
     let orphan_instants: Vec<_> = trace.packet.iter()
         .filter(|p| {
             p.track_event.as_ref().map(|e| {
-                e.r#type == Some(4) // TYPE_INSTANT
+                e.r#type == Some(3) // TYPE_INSTANT
                     && e.categories.iter().any(|c| c == "txtrace.repair.orphan_end")
             }).unwrap_or(false)
         })
@@ -382,7 +382,7 @@ fn pftrace_synthetic_roundtrip() {
     let bad_magic_instants: Vec<_> = trace.packet.iter()
         .filter(|p| {
             p.track_event.as_ref().map(|e| {
-                e.r#type == Some(4)
+                e.r#type == Some(3)
                     && e.categories.iter().any(|c| c == "txtrace.repair.bad_magic")
             }).unwrap_or(false)
         })
@@ -403,7 +403,7 @@ fn pftrace_synthetic_roundtrip() {
     // Additionally assert total TYPE_INSTANT count includes the orphan_end + bad_magic
     // + instant record + at least the bad_magic repair.
     let instants: Vec<_> = trace.packet.iter()
-        .filter(|p| p.track_event.as_ref().map(|e| e.r#type == Some(4)).unwrap_or(false))
+        .filter(|p| p.track_event.as_ref().map(|e| e.r#type == Some(3)).unwrap_or(false))
         .collect();
     // At minimum: orphan_end, bad_magic, the actual Instant record = 3.
     assert!(instants.len() >= 3,
@@ -475,9 +475,9 @@ fn pftrace_resume_flow_reconstruction() {
     assert!(trace.packet.len() >= 4,
         "expected at least 4 packets (clock, track, wsn, resume), got {}", trace.packet.len());
 
-    // Count TYPE_INSTANT (4) packets. There should be at least 2 (WaitSourceNotify + Resume).
+    // Count TYPE_INSTANT (3) packets. There should be at least 2 (WaitSourceNotify + Resume).
     let instants: Vec<_> = trace.packet.iter()
-        .filter(|p| p.track_event.as_ref().map(|e| e.r#type == Some(4)).unwrap_or(false))
+        .filter(|p| p.track_event.as_ref().map(|e| e.r#type == Some(3)).unwrap_or(false))
         .collect();
     assert!(instants.len() >= 2,
         "expected at least 2 TYPE_INSTANT packets (WaitSourceNotify + Resume), got {}",

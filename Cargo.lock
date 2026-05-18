@@ -467,6 +467,7 @@ dependencies = [
  "tx-ext4-format",
  "tx-fs",
  "tx-hal",
+ "tx-observe",
  "tx-platform-adapter",
  "tx-reactor",
  "tx-scripts",
@@ -537,6 +538,8 @@ version = "0.1.0"
 name = "tx-reactor"
 version = "0.1.0"
 dependencies = [
+ "tx-observe",
+ "tx-observe-types",
  "tx-platform-adapter",
  "tx-substrate",
 ]
@@ -547,6 +550,8 @@ version = "0.1.0"
 dependencies = [
  "goblin",
  "tx-hal",
+ "tx-observe",
+ "tx-observe-types",
  "tx-platform-adapter",
  "tx-substrate",
  "tx-subsystems",
@@ -563,6 +568,8 @@ version = "0.1.0"
 dependencies = [
  "tx-fs",
  "tx-hal",
+ "tx-observe",
+ "tx-observe-types",
  "tx-platform-adapter",
  "tx-reactor",
  "tx-scripts",

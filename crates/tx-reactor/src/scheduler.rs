@@ -62,6 +62,19 @@ pub struct InitialSchedMeta {
     pub rt_priority: u8,
     pub affinity: u64,
     pub kernel_only: bool,
+    /// Low 32 bits of the task's trace identity (TID for user threads,
+    /// 0 for kernel-internal tasks). Threaded through
+    /// [`TaskTable::submit`] → [`Task::new_for_handle`] →
+    /// [`TaskMailbox::with_task_id`] so `notify_emit` and
+    /// `PayloadDriveBegin` carry per-thread identity in observation
+    /// records (OBS-V1 §13.2 flow-id material).
+    pub task_id_low: u32,
+    /// Low 32 bits of the owning process's trace identity (PID for
+    /// user threads, 0 for kernel-internal tasks). Threaded through
+    /// [`TaskTable::submit_with_ids`] → [`TaskMailbox::with_process_id`]
+    /// so `emit_sched_*` records carry PID for per-process
+    /// ProcessDescriptor track routing (OBS-V1 §15.6 sched_switch view).
+    pub process_id_low: u32,
 }
 
 impl InitialSchedMeta {
@@ -72,6 +85,8 @@ impl InitialSchedMeta {
             rt_priority: 0,
             affinity: u64::MAX,
             kernel_only: false,
+            task_id_low: 0,
+            process_id_low: 0,
         }
     }
 
@@ -82,11 +97,36 @@ impl InitialSchedMeta {
             rt_priority: 0,
             affinity: u64::MAX,
             kernel_only: true,
+            task_id_low: 0,
+            process_id_low: 0,
         }
     }
 
     pub const fn with_affinity(mut self, affinity: u64) -> Self {
         self.affinity = affinity;
+        self
+    }
+
+    /// Install the task's trace identity (TID low 32 bits).
+    ///
+    /// Production call sites: `tx-kernel`'s thread-future submit path
+    /// reads `child_thread.tid.0` from the `Cap<ThreadIdentity>` and
+    /// chains this builder so the resulting `TaskMailbox` carries TID
+    /// and `WaitSource::notify_emit` emits per-thread `task_id_low`.
+    pub const fn with_task_id(mut self, task_id_low: u32) -> Self {
+        self.task_id_low = task_id_low;
+        self
+    }
+
+    /// Install the owning process's trace identity (PID low 32 bits).
+    ///
+    /// Production call sites: `tx-kernel`'s thread-future submit path
+    /// reads `child_process.pid.0` and chains this builder alongside
+    /// [`Self::with_task_id`] so the daemon can build per-process
+    /// ProcessDescriptor tracks parenting per-thread tracks
+    /// (OBS-V1 §15.6).
+    pub const fn with_process_id(mut self, process_id_low: u32) -> Self {
+        self.process_id_low = process_id_low;
         self
     }
 }

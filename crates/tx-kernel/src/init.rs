@@ -176,6 +176,7 @@ pub struct CoreInit<P: TxPlatform> {
 }
 
 mod exec;
+mod procfs_mount;
 mod rootfs_shims;
 
 impl<P: TxPlatform> CoreInit<P> {
@@ -235,6 +236,21 @@ impl<P: TxPlatform> CoreInit<P> {
     fn init_substrate_if_ready(handoff: BootHandoff) {
         if P::SUBSTRATE_BOOT_READY {
             init::<P>();
+            // Install the per-hart observation emitter on the BSP. Must run
+            // BEFORE the first `tx_observe::current()` caller so the
+            // CPU_ID_FN / TS_FN function pointers and the BSP's
+            // `HartEmitter` are in place. `Err(NoRing)` is benign — boards
+            // without an `observation_ring` impl get a runtime no-op.
+            let _ = tx_observe::init::<P>(<P as tx_hal::SmpIf>::current_cpu_id());
+            // Bounded-trace threshold: when set to N > 0, the kernel
+            // dumps the ring and powers off after N records have been
+            // emitted. Lets oscomp-style runs (where init runs many test
+            // groups back-to-back and never naturally exits in a useful
+            // wall clock) capture a finite trace covering the early
+            // stages. The value lives next to the board's other tuning
+            // constants in `tx-kernel/src/init.rs` so it can be flipped
+            // without redoing the observation contract.
+            tx_observe::set_dump_threshold(crate::OBSERVE_DUMP_THRESHOLD);
             crate::zones::register_all().expect("tx_kernel zone registration failed");
             Self::init_later(handoff);
             Self::install_kernel_trap_vector();
@@ -664,97 +680,8 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":mount:devfs:ok\n");
     }
 
-    /// Mount procfs on `/proc`.
-    ///
-    /// Creates `/proc` on the rootfs (tmpfs) and mounts procfs there so
-    /// that userspace tools like `free`, `ps`, and `df` can read
-    /// `/proc/meminfo`, `/proc/<pid>/stat`, and `/proc/mounts`.
-    ///
-    /// **Order invariant:** runs after `mount_rootfs_from_boot_media`.
-    pub(crate) fn mount_procfs_at_proc() {
-        let root_mount = ROOT_MOUNT
-            .lock()
-            .clone()
-            .expect("mount_procfs_at_proc: ROOT_MOUNT must be populated");
-
-        let guard = step_engine::guard();
-        let cred = Credential::root();
-        use StepOutcome as V3;
-        let root_fs_object_id = root_mount.root().fs_object_id();
-        let (proc_object_id, proc_meta) = match root_mount
-            .payload_cap()
-            .expect("rootfs payload alive during boot")
-            .into_cap()
-            .fs_ops
-            .mkdir(root_fs_object_id, b"proc", 0o555, &cred, &guard)
-        {
-            V3::Done(out) => out,
-            V3::Err(step_engine::Errno::ENOSYS) | V3::Err(step_engine::Errno::EROFS) => {
-                (root_fs_object_id, root_mount.root().meta())
-            }
-            other => panic!("mount_procfs_at_proc: mkdir(/proc) failed: {other:?}"),
-        };
-        drop(guard);
-
-        let proc_rnode_in_root = RNode::new_cap(proc_object_id, proc_meta, RNodeBacking::Directory)
-            .expect("mount_procfs_at_proc: /proc rnode-on-rootfs reservation");
-        let proc_dentry_on_root = DEntry::new_cap(
-            InlineName::new(b"proc").expect("mount_procfs_at_proc: /proc inline name"),
-            proc_rnode_in_root,
-        )
-        .expect("mount_procfs_at_proc: /proc dentry-on-rootfs reservation");
-
-        let procfs_fs_ops = tx_fs::procfs::Procfs::fs_ops_arc();
-        let procfs_fs_page_backing = alloc::sync::Arc::new(tx_fs::procfs::Procfs)
-            as alloc::sync::Arc<dyn tx_subsystems::page_backed::FsPageBacking>;
-
-        let procfs_payload = MountPayload::new_cap(
-            procfs_fs_ops,
-            procfs_fs_page_backing,
-            None,
-            mount::allocate_dev_id(),
-            MountOptions::default(),
-            "proc",
-            SourceLabel::Static("proc"),
-        )
-        .expect("mount_procfs_at_proc: payload reservation");
-
-        let procfs_root_rnode = {
-            let raw = RNode::new(
-                tx_fs::procfs::PROCFS_ROOT_ID,
-                InodeMeta::new(
-                    tx_subsystems::vfs::InodeKind::Directory,
-                    tx_fs::procfs::PROCFS_DIR_MODE,
-                ),
-                RNodeBacking::Directory,
-            )
-            .with_containing_mount(&procfs_payload);
-            let res = step_engine::reserve_for::<RNode>()
-                .expect("mount_procfs_at_proc: procfs root rnode reservation");
-            step_engine::sign_for(res, raw)
-        };
-
-        let rootfs_payload = root_mount
-            .payload_cap()
-            .expect("rootfs payload alive during boot")
-            .into_cap()
-            .clone();
-
-        let proc_mount = MountIdentity::new_cap(
-            mount::allocate_mount_id(),
-            Some(proc_dentry_on_root),
-            procfs_root_rnode,
-            Some(root_mount),
-            procfs_payload,
-            MountFlags::empty(),
-        )
-        .expect("mount_procfs_at_proc: mount identity reservation");
-
-        mount::register_mount(&rootfs_payload, proc_object_id, proc_mount);
-
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":mount:procfs:ok\n");
-    }
+    // `mount_procfs_at_proc` moved to `init/procfs_mount.rs` to keep
+    // `init.rs` under the 1800-line arch-lint cap.
 
     /// Mount bdev-fs on `/dev/block`.
     ///
@@ -1358,6 +1285,10 @@ impl<P: TxPlatform> CoreInit<P> {
         P::install_early_percpu(cpu_id);
         P::init_early_secondary(cpu_id);
         init_on_ap(cpu_id).expect("tx_kernel AP substrate initialization failed");
+        // Install this AP's observation emitter. Errors are benign —
+        // boards that allocate fewer rings than harts get a runtime
+        // no-op on the over-cap harts.
+        let _ = tx_observe::init::<P>(cpu_id);
         P::init_later_secondary(cpu_id);
         P::install_kernel_trap_vector();
         P::mark_cpu_online(cpu_id);
@@ -1604,6 +1535,19 @@ impl<P: TxPlatform> CoreInit<P> {
             };
             let task_payload = payload.clone();
             let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+            // OBS-V1 §13.2: thread the user-thread TID into the task's
+            // `TaskMailbox` so `WaitSource::notify_emit` and
+            // `PayloadDriveBegin` emit per-thread identity rather than
+            // 0. The TID is read from `child_thread` while we still have
+            // the cap; once the future moves it, the cap is consumed.
+            // OBS-V1 §15.6: also resolve the owning process PID so the
+            // daemon can build a ProcessDescriptor parent track for the
+            // per-thread tracks.
+            let tid_low = child_thread.tid.0;
+            let pid_low = child_thread
+                .upgrade_owner_proc()
+                .map(|p| p.pid.0)
+                .unwrap_or(0);
             let _ = BOOT_REACTOR.with(|reactor| {
                 reactor.submit_task_with_meta(
                     crate::thread_future::PerHartSlotted::<P, _>::new(
@@ -1611,7 +1555,9 @@ impl<P: TxPlatform> CoreInit<P> {
                         crate::thread_future::run_thread::<P>(child_thread, task_payload),
                     ),
                     boot_runtime::InitialSchedMeta::kernel()
-                        .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
+                        .with_affinity(tx_hal::CpuMask::single(current_cpu).bits())
+                        .with_task_id(tid_low)
+                        .with_process_id(pid_low),
                 );
             });
         }
