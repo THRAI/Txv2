@@ -1043,8 +1043,67 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     // internally; the flag acts as a post-resolution collision check
     // inside the op. RENAME_EXCHANGE was rejected above.
     let cred = ctx.walker_cred();
+
+    // POSIX rename(2) permission check. Pre-walk old child, old
+    // parent, new parent (and new child if it exists) so the cred
+    // gate fires before RenameOp re-walks + commits. The composite
+    // op currently performs no cred check; without this gate any
+    // non-root caller with X on both parents could rename arbitrary
+    // entries. Witness chain: ctx.cred_snapshot() →
+    // cred::checks::require_rename → consumed inside the commit
+    // guard scope wrapping RenameOp drive.
+    let (old_parent_path, old_basename) = split_path(&oldpath);
+    if old_basename.is_empty() {
+        return SyscallResult::Error(EISDIR_VALUE);
+    }
+    let (new_parent_path, new_basename) = split_path(&newpath);
+    if new_basename.is_empty() {
+        return SyscallResult::Error(EISDIR_VALUE);
+    }
+    let old_parent_dentry = if old_parent_path.is_empty() {
+        cwd.clone()
+    } else {
+        match walk_from(cwd.clone(), old_parent_path, &cred) {
+            Ok(d) => d,
+            Err(e) => return SyscallResult::Error(e),
+        }
+    };
+    let old_child_dentry = match walk_from(cwd.clone(), &oldpath, &cred) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
+    let new_parent_dentry = if new_parent_path.is_empty() {
+        cwd.clone()
+    } else {
+        match walk_from(cwd.clone(), new_parent_path, &cred) {
+            Ok(d) => d,
+            Err(e) => return SyscallResult::Error(e),
+        }
+    };
+    // Displaced inode is optional — walk_from returns Err(ENOENT)
+    // when the new path doesn't exist, which is the normal case
+    // for a rename that creates rather than overwrites.
+    let displaced_dentry = walk_from(cwd.clone(), &newpath, &cred).ok();
+    let old_parent_meta = old_parent_dentry.rnode().meta();
+    let old_child_meta = old_child_dentry.rnode().meta();
+    let new_parent_meta = new_parent_dentry.rnode().meta();
+    let displaced_meta = displaced_dentry.as_ref().map(|d| d.rnode().meta());
+
     let result = {
         let mut script_ctx = build_subject_script_ctx(ctx);
+        let guard = step_engine::guard();
+        let _auth = match tx_subsystems::cred::checks::require_rename(
+            ctx.cred_snapshot(),
+            &old_parent_meta,
+            &old_child_meta,
+            &new_parent_meta,
+            displaced_meta.as_ref(),
+            &guard,
+        ) {
+            Ok(w) => w,
+            Err(e) => return SyscallResult::error_from(e),
+        };
+        drop(guard);
         let mut op = RenameOp {
             rooted_at: &cwd,
             oldpath: &oldpath,

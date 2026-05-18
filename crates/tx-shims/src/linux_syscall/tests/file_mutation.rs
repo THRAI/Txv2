@@ -728,6 +728,54 @@ fn dispatch_readlinkat_missing_returns_neg_enoent() {
 // renameat2
 // -----------------------------------------------------------------
 
+/// `renameat2` from a non-privileged caller whose parents lack the
+/// write bit returns `-EACCES`. Locks in the `require_rename` wiring:
+/// previously the composite `RenameOp` did no cred check and any
+/// caller with X on both parents could rename arbitrary entries.
+#[test]
+fn dispatch_renameat2_without_parent_write_returns_neg_eacces() {
+    use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
+
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    create_regular(&tmpfs, b"a");
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    // Tmpfs root is mode 0o755 owned by root. Caller is uid=2000 →
+    // falls into "other" → no W. Both parents resolve to root,
+    // so the unlink-side check fires first.
+    set_cred_ids_for_test(&proc_cap, 2000, 2000, 2000, 2000, 2000, 2000);
+    clear_caps_for_test(&proc_cap);
+
+    let ctx = make_ctx(proc_cap, thread);
+
+    let oldpath = nul_terminate(b"/a");
+    let newpath = nul_terminate(b"/b");
+    let req = SyscallRequest::new(
+        NR_RENAMEAT2,
+        [
+            AT_FDCWD as i64 as u64,
+            oldpath.as_ptr() as u64,
+            AT_FDCWD as i64 as u64,
+            newpath.as_ptr() as u64,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_ACCES));
+    assert!(
+        lookup_exists(&tmpfs, b"a"),
+        "/a must survive a denied rename"
+    );
+    assert!(
+        !lookup_exists(&tmpfs, b"b"),
+        "/b must not appear after a denied rename"
+    );
+    drop(oldpath);
+    drop(newpath);
+}
+
 /// Same-directory rename succeeds: `/a` becomes `/b`.
 #[test]
 fn dispatch_renameat2_same_directory_succeeds() {

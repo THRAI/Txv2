@@ -213,6 +213,30 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
     };
     let walker_cred = ctx.walker_cred();
     let new_mode = (mode & 0o7777) as u16;
+
+    // Cred check at the syscall arm using ctx.cred_snapshot().
+    // Per-FS step_chmod impls (tmpfs / devfs / bdevfs / procfs)
+    // also enforce the rule internally; this is defense-in-depth at
+    // the canonical cred::checks::* seam per cred_service_v_1 §"Cred
+    // owns credential semantics". When the per-FS check is removed
+    // in a follow-up, this remains the single enforcement site.
+    let target_dentry = match walk_from(rooted_at.clone(), &path, &walker_cred) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
+    let target_meta = target_dentry.rnode().meta();
+    {
+        let guard = step_engine::guard();
+        if let Err(e) = tx_subsystems::cred::checks::require_chmod(
+            ctx.cred_snapshot(),
+            &target_meta,
+            new_mode,
+            &guard,
+        ) {
+            return SyscallResult::error_from(e);
+        }
+    }
+
     let result = {
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = ChmodOp {
@@ -220,7 +244,7 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
             path: &path,
             mode: new_mode,
             cred: &walker_cred,
-            target: None,
+            target: Some(target_dentry),
         };
         step_engine::drive_oneshot(&mut op, &mut script_ctx)
     };
@@ -257,6 +281,28 @@ pub(super) fn sys_fchownat<P: PmapIf>(
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
+
+    // Cred check at the syscall arm using ctx.cred_snapshot(). Same
+    // defense-in-depth role as sys_fchmodat — per-FS step_chown
+    // impls also enforce the rule.
+    let target_dentry = match walk_from(rooted_at.clone(), &path, &walker_cred) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
+    let target_meta = target_dentry.rnode().meta();
+    {
+        let guard = step_engine::guard();
+        if let Err(e) = tx_subsystems::cred::checks::require_chown(
+            ctx.cred_snapshot(),
+            &target_meta,
+            uid,
+            gid,
+            &guard,
+        ) {
+            return SyscallResult::error_from(e);
+        }
+    }
+
     let result = {
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = ChownOp {
@@ -265,7 +311,7 @@ pub(super) fn sys_fchownat<P: PmapIf>(
             uid,
             gid,
             cred: &walker_cred,
-            target: None,
+            target: Some(target_dentry),
         };
         step_engine::drive_oneshot(&mut op, &mut script_ctx)
     };
