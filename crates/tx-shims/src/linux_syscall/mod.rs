@@ -48,10 +48,13 @@ use alloc::vec::Vec;
 use reactor_entry::userspace::SyscallRequest;
 use tx_hal::{AuxvIf, EntropyIf, PmapIf, TimeIf};
 use tx_observe::encode::{
-    encode_syscall_enter, encode_syscall_exit, syscall_enter_tag, syscall_exit_tag,
+    arg_value_tag, encode_arg_value, encode_syscall_enter, encode_syscall_exit, syscall_enter_tag,
+    syscall_exit_tag,
 };
 use tx_observe::{EventNameId, SpanId, TxTraceLevel};
-use tx_observe_types::{PayloadSyscallEnter, PayloadSyscallExit, TxPayloadTag};
+use tx_observe_types::{
+    PayloadArgValue, PayloadSyscallEnter, PayloadSyscallExit, TxPayloadTag, TxValueKind,
+};
 use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_subsystems::cred::{
     Capability, CredChange, Gid, SetgidOp, SetregidOp, SetresgidOp, SetresuidOp, SetreuidOp,
@@ -744,19 +747,56 @@ fn emit_syscall_enter(req: &SyscallRequest) -> SpanId {
         // work; emitting 0 is correct for the only board currently emitting.
         abi: 0,
         // argc reflects the register-shaped arg slots — `req.args` is `[u64; 6]`
-        // for the Linux generic ABI. The daemon decodes this as the upper bound
-        // on `ArgValue` continuations (none emitted in MVP per OBS-V1-MVP).
+        // for the Linux generic ABI. The daemon walks `argc` `ArgValue`
+        // continuation records after this `SpanBegin`.
         argc: 6,
     };
     let (enc, len) = encode_syscall_enter(&payload);
-    em.span_begin(
+    let syscall_span = em.span_begin(
         TxTraceLevel::Boundary,
         EventNameId::from_raw(req.nr as u32),
         SpanId::NONE,
         syscall_enter_tag(),
         &enc[..len as usize],
-    )
+    );
+
+    // Per OBS-V1 §6 / `08_OBSERVATION_SERIALIZATION_v0.md §8.6`: emit one
+    // `ArgValue` `Instant` per register-shaped syscall arg right after
+    // `SpanBegin(SyscallEnter)`. The daemon attaches them as debug
+    // annotations on the syscall slice so each `sys_*` chip in Perfetto
+    // shows `a0`/`a1`/…/`a5` with the raw u64 the userspace process
+    // passed in. OBS-2 compliance: the wire carries the raw register
+    // bits as `TxValueKind::U64`; no `UserPtr<T>` deref. The shim's
+    // arg-parsing code later decodes individual args as `Ptr` /
+    // `ObjectId` / etc. via separate `ArgValue` records once the
+    // higher-fidelity arg-classification pass lands.
+    if syscall_span != SpanId::NONE {
+        for (i, &raw) in req.args.iter().enumerate().take(6) {
+            let arg_payload = PayloadArgValue {
+                key: tx_observe::fnv1a32(SYSCALL_ARG_NAMES[i].as_bytes()),
+                value_kind: TxValueKind::U64 as u8,
+                _pad: [0; 3],
+                value0: raw,
+            };
+            let (enc, len) = encode_arg_value(&arg_payload);
+            em.instant(
+                TxTraceLevel::Boundary,
+                EventNameId::from_raw(tx_observe::fnv1a32(SYSCALL_ARG_NAMES[i].as_bytes())),
+                syscall_span,
+                arg_value_tag(),
+                &enc[..len as usize],
+            );
+        }
+    }
+
+    syscall_span
 }
+
+/// Stable register-position labels used as the `key` for syscall
+/// `ArgValue` continuations. Matches the Linux ABI's call-clobbered
+/// register names (a0..a5 on rv64, $a0..$a7 on la64, %rdi..%r9 on x86_64);
+/// using the position-agnostic `aN` form keeps the names ABI-portable.
+const SYSCALL_ARG_NAMES: [&str; 6] = ["a0", "a1", "a2", "a3", "a4", "a5"];
 
 #[inline]
 fn emit_syscall_exit(span: SpanId, result: &SyscallResult) {
