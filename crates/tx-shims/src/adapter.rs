@@ -21,10 +21,10 @@ pub mod step_engine {
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
         drive_oneshot, AgentCancelPolicy, ByteProgress, CancelReason, DelegateReply,
-        DelegateRequest, DelegateState, DelegateTokenId, Errno, InterestMask, NoProgress,
-        OnBehalfOfAbort, OneShotStepOp, ScriptCtx, StepOp, StepOutcome, SubjectAuthority,
-        SubjectContext, SubjectIdentity, TokenDropPolicy, TransitionOutcome, UfdAccessKind,
-        UfdReply, UfdRequest, WaitSourceId, YieldShape,
+        DelegateRequest, DelegateState, DelegateTokenId, DriveMode, Errno, InterestMask,
+        NoProgress, OnBehalfOfAbort, OneShotStepOp, ScriptCtx, StepOp, StepOutcome,
+        SubjectAuthority, SubjectContext, SubjectIdentity, TokenDropPolicy, TransitionOutcome,
+        UfdAccessKind, UfdReply, UfdRequest, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
         register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,

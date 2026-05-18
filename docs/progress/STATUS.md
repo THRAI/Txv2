@@ -1,3 +1,66 @@
+- 2026-05-18 **Wire 5 RT_SIG dispatch arms; `sys_rt_sigtimedwait`
+  becomes a real async poll loop.** Following the shebang/exec
+  unblock, the next-highest row in `SYSCALL_STATUS.md` was wiring
+  `sys_rt_sigtimedwait` (every libctest test was failing on
+  `sigtimedwait: ENOSYS` because `runtest.c` uses it to wait on
+  child exits). Done in this pass:
+
+  1. **`sys_rt_sigtimedwait` (137)** — new async body in
+     [`crates/tx-shims/src/linux_syscall/signal.rs`](../../crates/tx-shims/src/linux_syscall/signal.rs).
+     Reads the 8-byte sigset and (optional) `timespec`, then
+     poll-and-yield-loops on `payload.pending().snapshot() & set`.
+     On a hit, clears the bit and returns the signum (writing a
+     zeroed siginfo to `info_uaddr` if non-null). On timeout,
+     returns `-EAGAIN`. Between polls it `await`s a 5 ms
+     `NanosleepOp` via `tx_scripts::drive(.., DriveMode::Waiting, ..)`
+     so the reactor can run the sibling task that posts SIGCHLD.
+
+  2. **`sys_sigaltstack` returns 0** instead of `-ENOSYS`. The
+     slice doesn't honour an alternate signal stack yet (signal
+     frames always sit on the thread's current sp), but POSIX
+     permits a no-op and most callers just register the alt stack
+     during setup without actually relying on it during the test
+     body.
+
+  3. **4 cooperating dispatch arms wired** in `mod.rs` for
+     `sys_rt_sigpending`, `sys_rt_sigsuspend`, `sys_rt_sigqueueinfo`,
+     `sys_rt_sigtimedwait`, and `sys_sigaltstack` (the handlers
+     all existed; only the match arms were missing — they were
+     among the 13 `defined-but-no-arm` entries flagged by
+     `cargo xtask syscall list --filter defined`).
+
+  Headline counts after this pass (`cargo xtask syscall status`):
+  - NR_* defined: 120 (unchanged)
+  - Dispatched: 107 → **112**
+  - Defined-but-no-arm: 13 → **8**
+
+  Effect on OSComp:
+  - `libctest-musl`: every test now reaches the test body — no
+    more `sigtimedwait: ENOSYS`. Status moves from `[signal Killed]`
+    to `[timed out]`. Score still **0/220** because child
+    `entry-static.exe` processes don't appear to exit (and post
+    `SIGCHLD`) in time. The gap shifted from the wait-side (now
+    correct) to the child-exit / signal-post lane.
+  - `basic-musl`, `busybox-musl`, `libcbench-musl`, `lua-musl`,
+    `lmbench-musl`: unchanged.
+
+  Doc updates:
+  - `SYSCALL_STATUS.md`: headline counts refreshed; high-stakes
+    table top row swapped to "diagnose libctest child wedge"
+    (the `sigtimedwait` row is recorded under Recently landed);
+    auto-table re-synced via `cargo xtask syscall sync`;
+    Last refresh bumped to 6th pass.
+
+  Next step: diagnose why child `entry-static.exe` invocations
+  don't exit. Initial trap-trace showed lots of iPF/lPF/SY
+  syscalls in the child's sp=0x4037xxxx region but no obvious
+  wedge point — last visible was an iPF at `pc=0x11c1f8` before
+  the QEMU run timed out. Likely either a missing handler-return
+  path or a child-side syscall returning the wrong value and
+  spinning the test harness.
+
+  `cargo -q xtask unit` — **334 tests pass**.
+
 - 2026-05-18 **Shebang shims + ENOEXEC `/bin/sh` fallback land:
   basic-musl 102/102, lua-musl 9/9, libctest now executes all 220
   tests.** Two cooperating changes unblock the top-of-table fix in
