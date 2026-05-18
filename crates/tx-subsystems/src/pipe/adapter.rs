@@ -114,8 +114,9 @@ pub mod wait_routing {
     /// (PR-3D-1 / D2 coexistence).
     ///
     /// Delegates to `tx_substrate::wake::new_source`. Also registers
-    /// the source in the global registry so the v3 driver can look it
-    /// up by `WaitSourceId` while resolving pipe read/write waits.
+    /// the source in the global registry so the driver can look it up
+    /// by [`WaitSourceId`] during yield resolution (mirrors
+    /// `vfs::adapter::wait_routing::new_wait_source`).
     pub fn new_wait_source(side_id: u64) -> Arc<WaitSource> {
         let source = tx_substrate::wake::new_source(side_id);
         tx_substrate::wake::register_source(Arc::clone(&source));
@@ -128,6 +129,16 @@ pub mod wait_routing {
     /// Delegates to `tx_reactor::wait::fire_legacy`.
     pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) -> usize {
         tx_reactor::wait::fire_legacy(channel, mask_bits)
+    }
+
+    /// Remove a source from the global registry. Companion of
+    /// `new_wait_source`; called from `PipePayload::drop` so the
+    /// registry does not hold stale entries after the pipe is gone.
+    ///
+    /// Delegates to `tx_substrate::wake::unregister_source`.
+    pub fn unregister_source(id: u64) {
+        use tx_substrate::step::WaitSourceId;
+        tx_substrate::wake::unregister_source(WaitSourceId::new(id));
     }
 
     /// Notify the v3 `WaitSource` for one side of a pipe — the

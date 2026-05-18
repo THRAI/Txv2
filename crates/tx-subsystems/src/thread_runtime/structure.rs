@@ -305,9 +305,10 @@ impl ThreadPayload {
         *self.saved_signal_context.lock() = ctx;
     }
 
-    /// Take the pre-handler signal context, leaving the slot empty.
-    /// Used by `rt_sigreturn` handling after a signal trampoline
-    /// returns to the kernel.
+    /// Take (consume) the saved signal context. Called by
+    /// `rt_sigreturn` to retrieve the pre-handler context for
+    /// restoration into `saved_user_context`. Returns `None` if no
+    /// signal frame is in flight (stray `rt_sigreturn` call).
     pub fn take_saved_signal_context(&self) -> Option<UserTrapContext> {
         self.saved_signal_context.lock().take()
     }
