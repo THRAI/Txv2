@@ -249,16 +249,36 @@ pub fn build_aspace_from_image<P: PmapIf>(
     }
 
     // Stack: anonymous private, page-aligned, anchored to `stack_top`.
+    //
+    // The stack is mapped **executable** unconditionally — not because
+    // the ELF's GNU_STACK said so, but because our signal-delivery
+    // path (`SignalFrameIf::prepare_signal_frame` on both RV64 and
+    // LA64) writes a 2-instruction `rt_sigreturn` trampoline at the
+    // top of the signal frame on the user stack, and sets the
+    // handler's `ra` to that trampoline address. When the handler
+    // returns via `ret`, the CPU fetches the trampoline insns from
+    // the stack — which requires PROT_EXEC on the stack page.
+    //
+    // Linux moved this trampoline into the vDSO years ago (modern
+    // user stacks are NX). txKernel's vDSO infrastructure exists
+    // (`crates/tx-vdso/`, `tx_subsystems::vdso::init_vdso`) but the
+    // user-side mapping isn't wired yet — see `vdso_base_opt: None`
+    // at `crates/tx-shims/src/linux_syscall/exec_op.rs:125`. Until
+    // that lands, the stack must be RWX or every signal-handler
+    // return SIGSEGVs (observed end-to-end as a busybox-sh crash on
+    // SIGCHLD delivery after first child exit — root cause traced
+    // 2026-05-18).
+    //
+    // TODO(vdso): once the vDSO is mapped into user aspaces, expose
+    // a `__vdso_rt_sigreturn` symbol, look up its user VA, point
+    // `handler_ctx.regs[ra]` at it, and restore W^X on the stack.
+    let _ = image_plan.executable_stack;
     let stack_start = image_plan.stack_top - USER_STACK_INITIAL_RESERVATION;
     let stack_range = align_range(stack_start, USER_STACK_INITIAL_RESERVATION)
         .ok_or(ScriptError::InvalidImage)?;
     let stack_entry = VmEntry::new(
         stack_range,
-        if image_plan.executable_stack {
-            Prot::new(true, true, true)
-        } else {
-            Prot::READ_WRITE
-        },
+        Prot::new(true, true, true),
         VmEntryFlags::PRIVATE,
         VmBacking::PrivateAnon,
     );
