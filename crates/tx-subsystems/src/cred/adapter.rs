@@ -21,8 +21,13 @@ pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
-        CredentialView, NoProgress, RestrictionStackHandle, ScriptCtx, StepOp, StepOutcome,
-        SubjectIdentity,
+        drive_oneshot, CredentialView, NoProgress, OneShotStepOp, RestrictionStackHandle,
+        ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
     };
-    pub use tx_substrate::zone::{sign, Cap, Zone, ZoneAllocated, ZoneError};
+    pub use tx_substrate::zone::{
+        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
+        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
+        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
+        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
+    };
 }

@@ -31,11 +31,15 @@ impl PageProgress {
 }
 
 impl StepProgress for PageProgress {
+    type Output = ();
     const EMPTY: Self = PageProgress { pages: 0 };
     fn is_empty(&self) -> bool {
         self.pages == 0
     }
     fn extend(&mut self, other: Self) {
         self.pages = self.pages.saturating_add(other.pages);
+    }
+    fn into_output(self) -> Option<()> {
+        None
     }
 }

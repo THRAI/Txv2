@@ -817,6 +817,15 @@ fn install_early_percpu(cpu_id: CpuId) {
         let trap_stack_top = trap_stack_top_for_cpu(cpu_id);
         core::arch::asm!("csrw sscratch, {top}", top = in(reg) trap_stack_top);
     }
+
+    // Enable user-mode access to the `time` CSR via `scounteren`.
+    // Required for the high-resolution vDSO clock: user-space needs
+    // to be able to `rdtime` without trapping into the kernel.
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        const SCOUNTEN_TM: usize = 1 << 1; // TM = Time enable
+        core::arch::asm!("csrw scounteren, {val}", val = in(reg) SCOUNTEN_TM);
+    }
 }
 
 fn read_kernel_tls() -> usize {

@@ -25,6 +25,11 @@ pub struct OpenPtyOutcome {
 /// Create master/slave TTY identities, install peer-linked payloads, publish
 /// the slave into the devpts registry, and return OpenFiles for both sides.
 pub fn step_openpty(guard: &Guard<'_>) -> StepOutcome<OpenPtyOutcome, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let index = match registry::allocate_pty_index() {
@@ -150,15 +155,14 @@ impl PtsName {
 
 /// `StepOp` wrap of [`step_openpty`].
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
-pub struct OpenPtyOp<'a> {
-    pub guard: &'a Guard<'a>,
-}
+pub struct OpenPtyOp;
 
-impl<'a, I: SubjectIdentity> StepOp<I> for OpenPtyOp<'a> {
+impl<I: SubjectIdentity> StepOp<I> for OpenPtyOp {
     type Output = OpenPtyOutcome;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_openpty(self.guard)
+        let __guard = step_engine::guard();
+        step_openpty(&__guard)
     }
 }
 
@@ -182,11 +186,9 @@ mod step_op_wraps {
     #[test]
     fn openpty_op_returns_done_with_pair() {
         let _setup = setup();
-        let guard = step_engine::guard();
-        let mut op = OpenPtyOp { guard: &guard };
+        let mut op = OpenPtyOp;
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Done(_) => {}
             other => panic!("expected Done(OpenPtyOutcome), got {other:?}"),

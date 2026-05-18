@@ -109,7 +109,7 @@ fn deliver_tty_dispatch_with_no_typed_pgrp_returns_no_typed_pgrp() {
 fn typed_tty_vintr_routes_sigint_to_foreground_pgrp() {
     let _g = setup();
     let parent = fresh_init();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     // Bind the TTY's foreground pgrp typed-style to parent's pgrp
     // (which has both parent and child as members).
@@ -139,7 +139,7 @@ fn typed_tty_vintr_routes_sigint_to_foreground_pgrp() {
     // pending queue.
     for proc_cap in [&parent, &child] {
         let payload = proc_cap.payload.lock();
-        let leader = payload.as_ref().unwrap().threads.lock()[0].clone();
+        let leader = payload.as_ref().unwrap().threads.nth(0).unwrap();
         let leader_payload = leader.payload.lock();
         assert!(leader_payload
             .as_ref()
@@ -153,7 +153,7 @@ fn typed_tty_vintr_routes_sigint_to_foreground_pgrp() {
 fn deliver_tty_dispatch_skips_members_when_source_lacks_permission() {
     let _g = setup();
     let parent = fresh_init();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
 
     // Make parent unprivileged and at uid=1000; child stays root.
     // parent attempts SIGINT to its own pgrp via the typed dispatch;
@@ -200,13 +200,13 @@ fn deliver_tty_dispatch_skips_members_when_source_lacks_permission() {
 
     let parent_pending = {
         let p = parent.payload.lock();
-        let leader = p.as_ref().unwrap().threads.lock()[0].clone();
+        let leader = p.as_ref().unwrap().threads.nth(0).unwrap();
         let lp = leader.payload.lock();
         lp.as_ref().unwrap().pending().is_pending(Signum::SIGINT)
     };
     let child_pending = {
         let p = child.payload.lock();
-        let leader = p.as_ref().unwrap().threads.lock()[0].clone();
+        let leader = p.as_ref().unwrap().threads.nth(0).unwrap();
         let lp = leader.payload.lock();
         lp.as_ref().unwrap().pending().is_pending(Signum::SIGINT)
     };

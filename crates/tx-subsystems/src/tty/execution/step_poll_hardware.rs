@@ -12,7 +12,6 @@ use crate::tty::adapter::step_engine::Cap;
 use crate::execution::{Errno, Guard};
 #[cfg(test)]
 use crate::tty::adapter::step_engine::ByteProgress;
-#[cfg(test)]
 use crate::tty::adapter::step_engine::{self as step_engine};
 use crate::tty::adapter::step_engine::{
     NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
@@ -42,6 +41,11 @@ pub fn step_poll_hardware_input(
     max_bytes: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<HardwarePollOutcome, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::{NoProgress, StepOutcome as V3, YieldShape};
 
     if max_bytes == 0 {
@@ -151,14 +155,14 @@ pub fn step_poll_hardware_input(
 pub struct PollHardwareInputOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub max_bytes: usize,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for PollHardwareInputOp<'a> {
     type Output = HardwarePollOutcome;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_poll_hardware_input(self.tty, self.max_bytes, self.guard)
+        let __guard = step_engine::guard();
+        step_poll_hardware_input(self.tty, self.max_bytes, &__guard)
     }
 }
 
@@ -220,15 +224,12 @@ mod step_op_wraps {
     fn poll_hardware_input_op_zero_max_bytes_returns_done_default() {
         let _setup = setup();
         let tty = alloc_tty(300, "ttyV3-poll-op-zero");
-        let guard = step_engine::guard();
         let mut op = PollHardwareInputOp {
             tty: &tty,
             max_bytes: 0,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Done(out) => {
                 assert_eq!(out.bytes_read, 0);
@@ -242,15 +243,12 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_tty(301, "ttyV3-poll-op-dead");
         let _ = tty.take_payload();
-        let guard = step_engine::guard();
         let mut op = PollHardwareInputOp {
             tty: &tty,
             max_bytes: 8,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Err(_) => {}
             other => panic!("expected Err, got {other:?}"),

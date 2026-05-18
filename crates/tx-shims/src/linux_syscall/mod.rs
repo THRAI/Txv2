@@ -46,35 +46,43 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use reactor_entry::userspace::SyscallRequest;
-use tx_hal::{EntropyIf, PlatformConfig, PmapIf, TimeIf, UserPtr};
+use tx_hal::{AuxvIf, EntropyIf, PmapIf, TimeIf};
 use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_subsystems::cred::{
-    step_setgid, step_setregid, step_setresgid, step_setresuid, step_setreuid, step_setuid,
-    Capability, Cred, CredChange, Gid, Uid,
+    Capability, CredChange, Gid, SetgidOp, SetregidOp, SetresgidOp, SetresuidOp, SetreuidOp,
+    SetuidOp, Uid,
 };
 use tx_subsystems::execution::Errno;
+use tx_subsystems::futex::FutexWakeOp;
+use tx_subsystems::page_backed::TruncateOp as FdTruncateOp;
 use tx_subsystems::process::{
-    process_by_pid, seed_child_leader_context, step_chdir, step_exit_group, step_getcwd,
-    step_setpgid, step_setsid, step_waitpid_nohang, ChdirOutcome, ExitStatus, Pgid, Pid,
-    ProcessIdentity, SetpgidError, SetsidError, WaitError, WaitTarget,
+    process_by_pid, seed_child_leader_context, step_waitpid_nohang, ChdirOp, ChdirOutcome, CloseOp,
+    Dup3Op, DupOp, ExitGroupOp, ExitStatus, FcntlDupFdOp, FcntlFdOp, GetcwdOp, Pgid, Pid,
+    ProcessIdentity, SetpgidOp, SetsidOp, WaitError, WaitTarget,
 };
 use tx_subsystems::reactor_submit;
 use tx_subsystems::signal::{
-    step_kill_process, step_sigaction, KillOutcome, SigDisposition, SigDispositionChange,
-    SignalMask, Signum,
+    DeliverSignalOp, KillProcessOp, SigDisposition, SigDispositionChange, SigactionOp, SignalMask,
+    Signum,
 };
-use tx_subsystems::thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange};
-use tx_subsystems::thread_runtime::{step_thread_exit, ThreadIdentity};
+use tx_subsystems::thread_runtime::execution::{SigmaskHow, SigprocmaskChange};
+use tx_subsystems::thread_runtime::{SigprocmaskOp, ThreadExitOp, ThreadKillOp};
 use tx_subsystems::tty::execution::{
     step_ioctl_tcgets, step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz,
     step_ioctl_tiocnotty, step_ioctl_tiocsctty_for_process, step_ioctl_tiocspgrp,
     step_ioctl_tiocswinsz, IoctlCaller,
 };
 use tx_subsystems::tty::structure::{Termios, Winsize};
+use tx_subsystems::vfs::composite::{
+    AccessOp, ChmodOp, ChownOp, MknodOp, NanosleepOp, RenameOp, StatOp, StatxOp, StatxResult,
+};
 use tx_subsystems::vfs::structure::{
     Credential, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking, StructPayload,
 };
-use tx_subsystems::vfs::{step_open, step_walk, DEntry, OpenFile};
+use tx_subsystems::vfs::{
+    step_open, step_walk, DEntry, FileFsyncOp, FlockOp, OpenFile, OpenFileGetFlOp, OpenFileSetFlOp,
+    OpenOp,
+};
 use tx_subsystems::vm::{
     AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking,
     VmEntryFlags, VmMapError, VmMapRequest, VmRemapRequest, USER_PAGE_SIZE,
@@ -105,13 +113,34 @@ mod misc;
 use misc::*;
 mod userfaultfd;
 use userfaultfd::*;
+// `clone_op` and `exec_op` are unfinished StepOp-shaped refactors —
+// both target an older API surface (Credential::euid/egid,
+// SegmentFlags readable/writable, UserTrapContext::set_sepc, struct-
+// variant StepOutcome::Yield(...) tuple form, etc.) that no longer
+// exists. `sys_clone` and `sys_execve` drive their underlying step
+// functions directly until these wrappers land.
+// pub mod clone_op;
+// pub mod exec_op;
 pub mod aio;
 use aio::*;
 pub mod io_uring;
 use io_uring::*;
 mod signalfd;
-use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine, Cap};
 use signalfd::*;
+mod eventfd;
+use eventfd::*;
+mod timerfd;
+use timerfd::*;
+
+mod ctx;
+pub use ctx::*;
+mod result;
+pub use result::*;
+mod user_copy;
+pub(super) use user_copy::*;
+mod helpers;
+pub(super) use helpers::*;
 
 #[cfg(test)]
 mod tests;
@@ -120,35 +149,41 @@ pub use numbers::{
     AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW,
     CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW,
     CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID,
-    DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, DT_UNKNOWN, FD_CLOEXEC,
-    FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG,
-    FUTEX_REQUEUE, FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE,
-    FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_OK, F_SETFD,
-    F_SETFL, GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, MADV_DONTNEED, MADV_FREE, MADV_NORMAL,
-    MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE,
-    MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK,
-    MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_STACK, MAP_SYNC, NR_BRK, NR_CHDIR,
-    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EXECVE, NR_EXIT,
-    NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHDIR, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL,
-    NR_FSTAT, NR_FTRUNCATE, NR_FUTEX, NR_GETCWD, NR_GETDENTS64, NR_GETEGID, NR_GETEUID, NR_GETGID,
-    NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID, NR_GETRESUID,
-    NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_IO_DESTROY, NR_IO_GETEVENTS, NR_IO_SETUP,
-    NR_IO_SUBMIT, NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_KILL, NR_LINKAT, NR_LSEEK, NR_MADVISE,
-    NR_MKDIRAT, NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT,
-    NR_OPENAT, NR_PIPE2, NR_PPOLL, NR_PRLIMIT64, NR_READ, NR_READLINKAT, NR_READV, NR_RENAMEAT2,
-    NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGRETURN, NR_SETGID, NR_SETPGID, NR_SETREGID,
-    NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST,
-    NR_SET_TID_ADDRESS, NR_SIGNALFD, NR_SIGNALFD4, NR_STATX, NR_SYMLINKAT, NR_TGKILL, NR_TIMES,
-    NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UNAME, NR_UNLINKAT, NR_USERFAULTFD, NR_UTIMENSAT, NR_WAIT4,
-    NR_WRITE, NR_WRITEV, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK,
-    O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE,
-    PROT_READ, PROT_WRITE, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, RLIMIT_AS,
-    RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS, RLIMIT_MEMLOCK,
-    RLIMIT_MSGQUEUE, RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_RSS, RLIMIT_RTPRIO,
-    RLIMIT_RTTIME, RLIMIT_SIGPENDING, RLIMIT_STACK, RLIM_INFINITY, R_OK, SEEK_CUR, SEEK_END,
-    SEEK_SET, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW, TIMER_ABSTIME, TIMES_NS_PER_TICK,
-    TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ, UTIME_NOW, UTIME_OMIT,
-    WNOHANG, W_OK, X_OK,
+    CLONE_CHILD_CLEARTID, CLONE_FILES, CLONE_FS, CLONE_PARENT, CLONE_PARENT_SETTID, CLONE_SETTLS,
+    CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK,
+    DT_REG, DT_SOCK, DT_UNKNOWN, FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK,
+    FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_TRYLOCK_PI,
+    FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP,
+    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_OK, F_SETFD, F_SETFL, GRND_INSECURE,
+    GRND_NONBLOCK, GRND_RANDOM, MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM,
+    MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED,
+    MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE,
+    MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_STACK, MAP_SYNC, NR_BRK, NR_CHDIR, NR_CLOCK_GETTIME,
+    NR_CLOCK_NANOSLEEP, NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EPOLL_CREATE1, NR_EPOLL_CTL,
+    NR_EPOLL_PWAIT, NR_EPOLL_WAIT, NR_EVENTFD2, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT,
+    NR_FACCESSAT2, NR_FCHDIR, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_FDATASYNC, NR_FLOCK, NR_FSTAT,
+    NR_FSTATFS, NR_FSYNC, NR_FTRUNCATE, NR_FUTEX, NR_GETCWD, NR_GETDENTS64, NR_GETEGID, NR_GETEUID,
+    NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID,
+    NR_GETRESUID, NR_GETSID, NR_GETTID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_IO_DESTROY,
+    NR_IO_GETEVENTS, NR_IO_SETUP, NR_IO_SUBMIT, NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_KILL,
+    NR_LINKAT, NR_LSEEK, NR_MADVISE, NR_MKDIRAT, NR_MKNODAT, NR_MLOCK, NR_MMAP, NR_MOUNT,
+    NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNLOCK, NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT,
+    NR_OPENAT, NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL, NR_PIPE2, NR_PPOLL, NR_PRLIMIT64, NR_READ,
+    NR_READLINKAT, NR_READV, NR_RENAMEAT2, NR_RT_SIGACTION, NR_RT_SIGPENDING, NR_RT_SIGPROCMASK,
+    NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN, NR_RT_SIGSUSPEND, NR_RT_SIGTIMEDWAIT, NR_SETGID,
+    NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID,
+    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SIGALTSTACK, NR_SIGNALFD, NR_SIGNALFD4, NR_STATFS,
+    NR_STATX, NR_SYMLINKAT, NR_SYNC, NR_SYNCFS, NR_TGKILL, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME,
+    NR_TIMERFD_SETTIME, NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UMOUNT2, NR_UNAME,
+    NR_UNLINKAT, NR_USERFAULTFD, NR_UTIMENSAT, NR_WAIT4, NR_WRITE, NR_WRITEV, O_ACCMODE, O_APPEND,
+    O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+    PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, RENAME_EXCHANGE,
+    RENAME_NOREPLACE, RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA,
+    RLIMIT_FSIZE, RLIMIT_LOCKS, RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE, RLIMIT_NICE, RLIMIT_NOFILE,
+    RLIMIT_NPROC, RLIMIT_RSS, RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIMIT_SIGPENDING, RLIMIT_STACK,
+    RLIM_INFINITY, R_OK, SEEK_CUR, SEEK_END, SEEK_SET, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW,
+    TIMER_ABSTIME, TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP,
+    TIOCSWINSZ, UTIME_NOW, UTIME_OMIT, WNOHANG, W_OK, X_OK,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -185,6 +220,7 @@ pub const EXECVE_VEC_MAX: usize = 256;
 /// Used as the `-ENOSYS` magnitude returned from `dispatch` for every
 /// syscall number not handled by Phase 2a / 2b.
 pub(super) const ENOSYS_VALUE: i32 = 38;
+pub(super) const ENODEV_VALUE: i32 = 19;
 /// Linux generic ABI errno value for "bad file descriptor" (`EBADF`).
 pub(super) const EBADF_VALUE: i32 = 9;
 /// Linux generic ABI errno value for "bad address" (`EFAULT`).
@@ -252,6 +288,8 @@ pub(super) const EIO_VALUE: i32 = 5;
 /// internal representation). `rt_sigprocmask` / `rt_sigaction`
 /// reject any other value with `-EINVAL`.
 pub(super) const SIGSETSIZE_BYTES: u64 = 8;
+/// Minimum alternate signal stack size (Linux: MINSIGSTKSZ = 2048).
+pub(super) const MINSIGSTKSZ: u64 = 2048;
 /// Size of the kernel `struct sigaction` exchanged via `rt_sigaction`
 /// on RV64 generic ABI.
 ///
@@ -293,158 +331,7 @@ pub(super) const SIGACTION_BYTES: usize = 32;
 /// the surface today so the Phase 2b additions (`brk`, `read`) can
 /// land without a context-shape break; the field is intentionally
 /// unused by the four current arms.
-pub struct SyscallCtx<'a> {
-    pub process: Cap<ProcessIdentity>,
-    pub thread: Cap<ThreadIdentity>,
-    pub aspace: Cap<AddressSpace>,
-    /// Sliced lifetime so future fields (signal-mask snapshot, cred
-    /// snapshot) can be added without ripping every call site.
-    pub _lifetime: core::marker::PhantomData<&'a ()>,
-}
-
-impl<'a> SyscallCtx<'a> {
-    /// Construct a fresh context. Phase 2a callers (the syscall
-    /// dispatch tests; the future trap-shell wrapper in Phase 6) take
-    /// the three Caps from the resolved per-thread payload and pass
-    /// them in.
-    pub fn new(
-        process: Cap<ProcessIdentity>,
-        thread: Cap<ThreadIdentity>,
-        aspace: Cap<AddressSpace>,
-    ) -> Self {
-        Self {
-            process,
-            thread,
-            aspace,
-            _lifetime: core::marker::PhantomData,
-        }
-    }
-
-    /// Snapshot the current process's full credential.
-    ///
-    /// Returns a fresh [`Cred`] value (`Copy`); the payload's
-    /// `AtomicSlot<Cap<Cred>>` is loaded once (PR-9 phase 5 / D5 Path
-    /// A — was `SpinMutex<Cred>`), the resulting cap is derefed to
-    /// `&Cred`, and the value is copied out; the cap clone drops
-    /// before return, so the snapshot is independent of the slot and
-    /// safe to hold across `.await` points. Holding a reference
-    /// through the cap would still be sound (the cap retain-count
-    /// keeps the slab entry live), but callers that need the
-    /// long-lived cap shape should use [`Self::cred_cap`] instead.
-    ///
-    /// Falls back to [`Cred::root`] for zombies (impossible in
-    /// practice from inside a live syscall arm — the caller is by
-    /// definition alive). The defensive default keeps every
-    /// downstream arm's signature noise-free; callers that need to
-    /// distinguish zombie vs. alive use `ctx.process.is_zombie()`
-    /// directly.
-    ///
-    /// Companion to [`Self::walker_cred`] (the walker-side
-    /// projection consumed by VFS path resolution).
-    pub fn cred(&self) -> Cred {
-        self.process.cred().unwrap_or_else(Cred::root)
-    }
-
-    /// Walker-side projection of the current cred. Builds a fresh
-    /// [`Credential`] from `self.cred()` via the
-    /// `From<&Cred> for Credential` bridge (Wave 1) — uses **euid**
-    /// and **egid** (the POSIX rule for DAC checks), and forwards
-    /// `effective_caps` so the walker can short-circuit on
-    /// `CAP_DAC_OVERRIDE` without re-locking the per-process cred.
-    ///
-    /// Returned by value (never as a reference into the lock) so the
-    /// snapshot can be held across `.await` points in callers like
-    /// `sys_execve` that drive the multi-phase `exec_script`.
-    pub fn walker_cred(&self) -> Credential {
-        Credential::from(&self.cred())
-    }
-
-    /// Snapshot the current process's `Cap<Cred>`. Returns a cloned
-    /// strong cap; the slab entry stays live until the cap drops.
-    ///
-    /// PR-9 phase 5 (D5 Path A): the cred-mutators
-    /// (`step_setuid` / `step_setgid` / ...) replace the slot's
-    /// inhabitant per call; this accessor reads whichever cap is
-    /// current. Concurrent mutators between this read and the
-    /// `SubjectContext` construction yield a cap pointing at the
-    /// pre-mutation cred — the syscall arm sees a coherent snapshot
-    /// for the duration of its script frame.
-    ///
-    /// Defensive fallback: zombies have no payload, so no cred-cap.
-    /// In that case we mint a fresh `Cap<Cred>` from `Cred::root()`.
-    /// Reaching this fallback inside a live syscall is impossible by
-    /// construction (the calling process is by definition alive).
-    pub fn cred_cap(&self) -> Cap<Cred> {
-        self.process.cred_cap().unwrap_or_else(|| {
-            tx_subsystems::cred::sign_cred(Cred::root())
-                .expect("zone slab has capacity for defensive root cred")
-        })
-    }
-}
-
-/// PR-9 phase 5 (D5 Path A) — build a `KernelScriptCtx` whose subject
-/// is populated from `SyscallCtx`. The four wired arms (sys_read,
-/// sys_write, sys_pipe2, sys_clone) call this at script entry so the
-/// step body receives `ctx.subject()` rather than `None`.
 ///
-/// Restrictions cap is a fresh placeholder per call until PR-K lands
-/// the real append-only stack (D5 §7). Each call mints one
-/// `Cap<RestrictionStackHandle>` from the substrate placeholder zone;
-/// the cap drops at script-frame exit (EBR retires the slab).
-///
-/// **Failure mode**: zone-slab exhaustion mints a defensive
-/// placeholder cap from `Cred::root()` and panics on
-/// restrictions-cap failure (the placeholder zone is sized for one
-/// cap per concurrent syscall — exhaustion is a kernel-wide pressure
-/// event PR-K will revisit). Production callers should not hit this
-/// path; for now the conservative-panic matches today's
-/// `expect("zone slab has capacity")` discipline elsewhere in this
-/// module.
-pub fn build_subject_script_ctx(ctx: &SyscallCtx<'_>) -> crate::KernelScriptCtx {
-    let cred_cap = ctx.cred_cap();
-    let restrictions_cap = tx_subsystems::cred::placeholder_restrictions_cap()
-        .expect("placeholder restrictions zone has capacity per syscall entry");
-    let authority = crate::KernelSubjectAuthority::new(cred_cap, restrictions_cap);
-    let subject = crate::KernelSubjectContext::from_thread(
-        ctx.process.clone(),
-        ctx.thread.clone(),
-        authority,
-    );
-    crate::KernelScriptCtx::new().with_subject(subject)
-}
-
-/// Outcome of a syscall dispatch.
-///
-/// Plan B (`txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`): the dispatcher
-/// reports its outcome to the caller; the userspace-entry shim writes
-/// the encoded `i64`/`-i32` value into a fresh trap frame's `a0` slot
-/// just before `sret`. Phase 2a only ever produces these three
-/// variants — `Blocked` from a step is awaited internally and never
-/// surfaces to the caller.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SyscallResult {
-    /// Success — encode `value` into `a0` (positive return path).
-    Return(i64),
-    /// Failure — encode `-errno` into `a0`. `errno` is the positive
-    /// magnitude (e.g. 38 for `ENOSYS`); the userspace-entry shim is
-    /// responsible for negating before writing.
-    Error(i32),
-    /// Thread (or process) ended; the future driving this syscall does
-    /// not return to userspace. Used by `NR_EXIT` and `NR_EXIT_GROUP`.
-    NoReturn,
-    /// `execve` succeeded and the process's `AddressSpace` plus the
-    /// thread's `saved_user_context` have been replaced. The syscall
-    /// arm returned this; the thread future MUST NOT drain
-    /// `pending_syscall_return` for this iteration — the next
-    /// userspace re-entry runs the new image via the new
-    /// `saved_user_context`. The previous trap frame's `a0` is
-    /// effectively discarded (the new image's `_start` expects a
-    /// fresh stack and zero-initialised gprs).
-    ///
-    /// Cites: `txdoc:EXEC-12-1-INSTALL-USER-TRAP-CONTEXT`.
-    ExecCommitted,
-}
-
 /// Dispatch a Phase 2a syscall.
 ///
 /// This is the single entry point that maps a `SyscallRequest` to a
@@ -456,49 +343,72 @@ pub enum SyscallResult {
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
-pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + PlatformConfig>(
+pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
+    // ── Lane 1: ImmediateSyscall (pure ABI queries, never yield) ──
+    // Per `docs/Txv3/04_SYSCALL_SHAPE_v1.md §6.1`: these syscalls
+    // do not call drive(), do not enter StepOp, do not construct
+    // YieldShape, and do not access VFS/VM/reactor/timer.
+    match req.nr {
+        NR_GETPID => return sys_getpid(ctx),
+        NR_GETTID => return sys_gettid(ctx),
+        nr if nr == NR_GETPPID => return sys_getppid(ctx),
+        nr if nr == NR_GETPGRP => return sys_getpgrp(ctx),
+        nr if nr == NR_GETPGID => return sys_getpgid(req.args, ctx),
+        nr if nr == NR_GETSID => return sys_getsid(req.args, ctx),
+        nr if nr == NR_GETUID => return sys_getuid(ctx),
+        nr if nr == NR_GETEUID => return sys_geteuid(ctx),
+        nr if nr == NR_GETGID => return sys_getgid(ctx),
+        nr if nr == NR_GETEGID => return sys_getegid(ctx),
+        nr if nr == NR_GETRESUID => return sys_getresuid(req.args, ctx),
+        nr if nr == NR_GETRESGID => return sys_getresgid(req.args, ctx),
+        nr if nr == NR_TIMES => return sys_times::<P>(req.args, ctx),
+        nr if nr == NR_GETTIMEOFDAY => return sys_gettimeofday::<P>(req.args, ctx),
+        nr if nr == NR_UMASK => return sys_umask(req.args, ctx),
+        nr if nr == NR_UNAME => return sys_uname(req.args, ctx),
+        nr if nr == NR_GETRANDOM => return sys_getrandom::<P>(req.args, ctx),
+        nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
+        nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
+        nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
+        nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args),
+        nr if nr == NR_MADVISE => return sys_madvise(req.args, ctx),
+        nr if nr == NR_MLOCK => return sys_mlock(req.args, ctx).await,
+        nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx).await,
+        nr if nr == NR_UTIMENSAT => return sys_utimensat(req.args, ctx),
+        _ => {} // fall through to script lanes
+    }
+
+    // ── Lanes 2+3: Script-based (OneShotStepOp + Full async drive) ──
     match req.nr {
         NR_WRITE => sys_write(req.args, ctx).await,
         NR_WRITEV => sys_writev(req.args, ctx).await,
-        NR_READ => sys_read(req.args, ctx).await,
-        NR_READV => sys_readv(req.args, ctx).await,
+        NR_READ => sys_read::<P>(req.args, ctx).await,
+        NR_READV => sys_readv::<P>(req.args, ctx).await,
         NR_PPOLL => sys_ppoll(req.args, ctx).await,
         NR_EXIT => sys_exit(req.args, ctx),
         NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
-        NR_GETPID => sys_getpid(ctx),
         NR_BRK => sys_brk(req.args, ctx).await,
         NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
         NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx),
         NR_FCNTL => sys_fcntl(req.args, ctx),
         nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
-        nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx),
+        nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx).await,
         nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
-        nr if nr == NR_GETPPID => sys_getppid(ctx),
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
-        nr if nr == NR_GETPGID => sys_getpgid(req.args, ctx),
-        nr if nr == NR_GETPGRP => sys_getpgrp(ctx),
-        nr if nr == NR_GETSID => sys_getsid(req.args, ctx),
         nr if nr == NR_SETSID => sys_setsid(ctx),
         nr if nr == NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
         nr if nr == NR_SET_ROBUST_LIST => sys_set_robust_list(req.args),
         // Wave 2 of the DAC + setuid slice — Part 3 (cred-mutation /
         // cred-reading arms). Each wraps a Wave 1 `cred::step_*`
         // helper through the new `ctx.cred()` accessor.
-        nr if nr == NR_GETUID => sys_getuid(ctx),
-        nr if nr == NR_GETEUID => sys_geteuid(ctx),
-        nr if nr == NR_GETGID => sys_getgid(ctx),
-        nr if nr == NR_GETEGID => sys_getegid(ctx),
         nr if nr == NR_SETUID => sys_setuid(req.args, ctx),
         nr if nr == NR_SETGID => sys_setgid(req.args, ctx),
         nr if nr == NR_SETREUID => sys_setreuid(req.args, ctx),
         nr if nr == NR_SETREGID => sys_setregid(req.args, ctx),
         nr if nr == NR_SETRESUID => sys_setresuid(req.args, ctx),
         nr if nr == NR_SETRESGID => sys_setresgid(req.args, ctx),
-        nr if nr == NR_GETRESUID => sys_getresuid(req.args, ctx),
-        nr if nr == NR_GETRESGID => sys_getresgid(req.args, ctx),
         // Wave 4 Part 4 of the DAC + setuid slice — file-mode syscall
         // arms. Each wraps the FsOps surface Wave 3 Part 2 landed
         // (`step_chmod` / `step_chown`) plus a walker-side `access(2)`
@@ -563,17 +473,14 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + PlatformConfig>(
             req.args[2] as u32,
             ctx,
         ),
-        // Slice 2 of the shell-prompt roadmap — VM syscalls. Pure
-        // plumbing on top of `vm::execution::*` primitives. mmap /
-        // munmap / mprotect / mremap / madvise are synchronous (the
-        // underlying `try_*` step variants never `.await`); msync
-        // calls into `step_fsync` for File-backed page containers and
-        // is the only one that may block.
-        nr if nr == NR_MMAP => sys_mmap(req.args, ctx),
-        nr if nr == NR_MUNMAP => sys_munmap(req.args, ctx),
-        nr if nr == NR_MPROTECT => sys_mprotect(req.args, ctx),
-        nr if nr == NR_MREMAP => sys_mremap(req.args, ctx),
-        nr if nr == NR_MADVISE => sys_madvise(req.args, ctx),
+        // Slice 2 of the shell-prompt roadmap — VM syscalls. mmap /
+        // munmap / mprotect / mremap / madvise use StepOp wrappers
+        // (VmMapOp / VmUnmapOp etc.) that yield on RangeLock
+        // conflicts; the drive loop parks on WaitSource and retries.
+        nr if nr == NR_MMAP => sys_mmap(req.args, ctx).await,
+        nr if nr == NR_MUNMAP => sys_munmap(req.args, ctx).await,
+        nr if nr == NR_MPROTECT => sys_mprotect(req.args, ctx).await,
+        nr if nr == NR_MREMAP => sys_mremap(req.args, ctx).await,
         nr if nr == NR_MSYNC => sys_msync(req.args, ctx).await,
         // Slice 3 of the shell-prompt roadmap — `futex(2)`. v1 honours
         // `FUTEX_WAIT` / `FUTEX_WAKE` against a 256-bucket hash table;
@@ -590,8 +497,6 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + PlatformConfig>(
         // timer queue for real-duration sleeps; zero-duration and
         // past-deadline cases short-circuit immediately.
         nr if nr == NR_CLOCK_GETTIME => sys_clock_gettime::<P>(req.args, ctx),
-        nr if nr == NR_GETTIMEOFDAY => sys_gettimeofday::<P>(req.args, ctx),
-        nr if nr == NR_TIMES => sys_times::<P>(req.args, ctx),
         nr if nr == NR_NANOSLEEP => sys_nanosleep::<P>(req.args, ctx).await,
         nr if nr == NR_CLOCK_NANOSLEEP => sys_clock_nanosleep::<P>(req.args, ctx).await,
         // Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY
@@ -610,25 +515,30 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + PlatformConfig>(
         nr if nr == NR_NEWFSTATAT => sys_newfstatat(req.args, ctx).await,
         nr if nr == NR_GETCWD => sys_getcwd(req.args, ctx),
         nr if nr == NR_CHDIR => sys_chdir(req.args, ctx).await,
-        nr if nr == NR_FCHDIR => SyscallResult::Error(ENOSYS_VALUE),
+        nr if nr == NR_FCHDIR => sys_fchdir::<P>(req.args, ctx).await,
+        nr if nr == NR_STATFS => sys_statfs::<P>(req.args, ctx).await,
+        nr if nr == NR_FSTATFS => sys_fstatfs::<P>(req.args, ctx).await,
+        nr if nr == NR_SYNC => sys_sync::<P>(req.args, ctx).await,
+        nr if nr == NR_SYNCFS => sys_syncfs::<P>(req.args, ctx).await,
+        nr if nr == NR_FSYNC => sys_fsync::<P>(req.args, ctx).await,
+        nr if nr == NR_FDATASYNC => sys_fdatasync::<P>(req.args, ctx).await,
+        nr if nr == NR_FLOCK => sys_flock::<P>(req.args, ctx).await,
+        nr if nr == NR_MOUNT => sys_mount::<P>(req.args, ctx).await,
+        nr if nr == NR_UMOUNT2 => sys_umount2::<P>(req.args, ctx).await,
+        nr if nr == NR_MKNODAT => sys_mknodat::<P>(req.args, ctx).await,
         nr if nr == NR_GETDENTS64 => sys_getdents64(req.args, ctx).await,
         nr if nr == NR_STATX => sys_statx(req.args, ctx).await,
-        nr if nr == NR_UMASK => sys_umask(req.args, ctx),
         // Slice 7 of the shell-prompt roadmap — fcntl extension +
         // day-1 misc syscalls. None individually heavy; each unblocks
         // a specific shell-startup path.
-        nr if nr == NR_KILL => sys_kill(req.args),
-        nr if nr == NR_TKILL => sys_tkill(req.args),
-        nr if nr == NR_TGKILL => sys_tgkill(req.args),
-        nr if nr == NR_GETRANDOM => sys_getrandom::<P>(req.args, ctx),
-        nr if nr == NR_UNAME => sys_uname(req.args, ctx),
-        nr if nr == NR_PRLIMIT64 => sys_prlimit64(req.args, ctx),
+        nr if nr == NR_KILL => sys_kill(req.args, ctx),
+        nr if nr == NR_TKILL => sys_tkill(req.args, ctx),
+        nr if nr == NR_TGKILL => sys_tgkill(req.args, ctx),
         // rt_sigreturn: deferred. Returns -ENOSYS — the
         // SignalFrameIf::restore_signal_frame surface needs the trap
         // frame which the dispatcher does not yet pass through. The
         // dispatcher ENOSYS path matches; arm explicitly written for
         // grep-stability and future wiring.
-        nr if nr == NR_RT_SIGRETURN => sys_rt_sigreturn(),
         // Slice 8 of the shell-prompt roadmap — file-mutation syscalls.
         // Each arm wraps an in-tree `FsOps::*` step body
         // (`mkdir`/`rmdir`/`unlink`/`rename`/`link`/`symlink`/
@@ -646,9 +556,8 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + PlatformConfig>(
         nr if nr == NR_SYMLINKAT => sys_symlinkat(req.args, ctx).await,
         nr if nr == NR_LINKAT => sys_linkat(req.args, ctx).await,
         nr if nr == NR_TRUNCATE => sys_truncate(req.args, ctx).await,
-        nr if nr == NR_FTRUNCATE => sys_ftruncate(req.args, ctx),
+        nr if nr == NR_FTRUNCATE => sys_ftruncate(req.args, ctx).await,
         nr if nr == NR_READLINKAT => sys_readlinkat(req.args, ctx).await,
-        nr if nr == NR_UTIMENSAT => sys_utimensat(req.args, ctx),
         nr if nr == NR_RENAMEAT2 => sys_renameat2(req.args, ctx).await,
         // PR-10 phase 2 — `userfaultfd(2)` scaffold. Mints a fresh
         // `Cap<UserfaultFd>` (W-Q phase 0 zone), wraps in an
@@ -717,303 +626,24 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + PlatformConfig>(
             req.args[3] as u32,
             ctx,
         ),
+        // eventfd2(init_val, flags) — mints an eventfd.
+        nr if nr == NR_EVENTFD2 => sys_eventfd2(req.args[0], req.args[1] as u32, ctx),
+        // timerfd_create(clockid, flags) — mints a timerfd.
+        nr if nr == NR_TIMERFD_CREATE => {
+            sys_timerfd_create(req.args[0] as u32, req.args[1] as u32, ctx)
+        }
+        // timerfd_settime(fd, flags, new_value, old_value).
+        nr if nr == NR_TIMERFD_SETTIME => sys_timerfd_settime::<P>(
+            req.args[0] as u32,
+            req.args[1] as u32,
+            req.args[2],
+            req.args[3],
+            ctx,
+        ),
+        // timerfd_gettime(fd, curr_value).
+        nr if nr == NR_TIMERFD_GETTIME => sys_timerfd_gettime(req.args[0] as u32, req.args[2], ctx),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
-}
-
-/// Outcome of `read_user_cstr` — distinguishes "no NUL within budget"
-/// from a successful copy. The successful arm yields the bytes up to
-/// (not including) the NUL terminator, allocated as a kernel-owned
-/// `Vec<u8>`.
-pub(super) enum ReadCStrError {
-    /// No NUL within `max_len` — surface as `-ENAMETOOLONG`.
-    TooLong,
-}
-
-/// Outcome of `read_user_cstr_vec`. `TooBig` covers both
-/// pointer-array overflow and aggregate-byte overflow; both surface
-/// as `-E2BIG` per the Phase 6 plan.
-pub(super) enum ReadVecError {
-    TooBig,
-}
-
-/// Bounded copy of a NUL-terminated user string into a kernel-owned
-/// `Vec<u8>` (NUL terminator stripped). `uaddr == 0` produces an empty
-/// vector — matches Linux's "execve(NULL, ...)" lenience for path =
-/// NULL (which would actually surface as `EFAULT` in real Linux; the
-/// trio Phase 2a bootstrap exemption pre-dates the EFAULT plumbing,
-/// so we treat NULL as "empty").
-///
-/// Bridges through `bootstrap_read_user_cstr` (which delegates to
-/// `aspace.read_user_cstr` and falls back to a kernel-pointer scan on
-/// `EFAULT`).
-pub(super) fn read_user_cstr(
-    aspace: &AddressSpace,
-    uaddr: u64,
-    max_len: usize,
-) -> Result<Vec<u8>, ReadCStrError> {
-    match bootstrap_read_user_cstr(aspace, uaddr, max_len) {
-        Ok(v) => Ok(v),
-        Err(Errno::ENAMETOOLONG) => Err(ReadCStrError::TooLong),
-        // Other errnos collapse to TooLong defensively — the caller's
-        // Result shape only carries the "too long" axis. Production
-        // paths surface clean Done; the EFAULT fallback inside
-        // `bootstrap_read_user_cstr` covers test scaffolding pointers.
-        Err(_) => Err(ReadCStrError::TooLong),
-    }
-}
-
-/// Bounded copy of a NULL-terminated array of `*const u8` user
-/// pointers into a kernel-owned `Vec<Vec<u8>>`. Each non-NULL entry
-/// resolves to its own NUL-terminated string. The aggregate-byte
-/// budget shared across argv + envp is passed in through
-/// `byte_budget` (decremented in place).
-///
-/// `uaddr == 0` produces an empty vector — matches Linux's lenience
-/// for `execve(path, NULL, NULL)` per the Phase 6 plan.
-///
-/// Each pointer slot and each string read bridges through the
-/// canonical user-VA lane (`bootstrap_read_user` /
-/// `bootstrap_read_user_cstr`), falling back to the kernel-pointer
-/// dance on EFAULT for test scaffolding.
-pub(super) fn read_user_cstr_vec(
-    aspace: &AddressSpace,
-    uaddr: u64,
-    max_slots: usize,
-    byte_budget: &mut usize,
-) -> Result<Vec<Vec<u8>>, ReadVecError> {
-    if uaddr == 0 {
-        return Ok(Vec::new());
-    }
-    let mut out: Vec<Vec<u8>> = Vec::new();
-    for slot in 0..max_slots {
-        let slot_addr = uaddr.wrapping_add((slot * core::mem::size_of::<u64>()) as u64);
-        let ptr = match bootstrap_read_user::<u64>(aspace, slot_addr) {
-            Ok(p) => p,
-            Err(_) => return Err(ReadVecError::TooBig),
-        };
-        if ptr == 0 {
-            return Ok(out);
-        }
-        // Read the string at `ptr`, capped at the remaining byte
-        // budget. We need at least one byte for the NUL terminator;
-        // when `*byte_budget == 0` any non-empty string is `TooBig`.
-        let cap = *byte_budget;
-        let s = match read_user_cstr(aspace, ptr, cap) {
-            Ok(s) => s,
-            Err(ReadCStrError::TooLong) => return Err(ReadVecError::TooBig),
-        };
-        // Account `s.len() + 1` for the implicit NUL byte we read but
-        // did not store, matching Linux's `ARG_MAX` accounting.
-        let charged = s.len().saturating_add(1);
-        if charged > *byte_budget {
-            return Err(ReadVecError::TooBig);
-        }
-        *byte_budget -= charged;
-        out.push(s);
-    }
-    // Hit the slot cap without observing a NULL terminator — treat
-    // as oversized argv per the plan.
-    Err(ReadVecError::TooBig)
-}
-
-// =====================================================================
-// User-VA bridging helpers.
-//
-// Phase userva-sweep: every syscall arm that previously dereferenced a
-// userspace pointer through the bootstrap `core::ptr::read_volatile` /
-// `write_volatile` exemption now routes through one of the bridging
-// helpers below. Each helper:
-//
-// 1. Calls the canonical `aspace.copy_*_user` / `read_user` /
-//    `write_user` / `read_user_cstr` lane which walks the AddressSpace's
-//    recipes, materialises every covered page through its
-//    `VmBacking`, publishes the page to pmap (so subsequent calls see
-//    the same frame — see `vm/user_access.rs` module header), and
-//    copies through the kernel direct-map view. This is the "real"
-//    user-VA path that exec'd processes (and the bake-in fixture
-//    after exec) follow.
-// 2. On `Errno::EFAULT` (no recipe covers the address — typical for
-//    unit-test scaffolding that passes kernel stack/heap pointers
-//    directly), falls back to the bootstrap kernel-pointer dance
-//    (`core::ptr::read_volatile` / `write_volatile`) the previous
-//    user-VA-deferred sites used inline before the userva sweep.
-//
-// The fallback exists because the existing dispatch tests pass kernel
-// pointers (e.g. `buf.as_ptr() as u64`, `&mut set as *mut u64 as u64`)
-// directly: a fresh `AddressSpace` has no recipes covering them, so a
-// pure `aspace.copy_*_user` call would EFAULT. The fallback is a
-// bridge until those tests migrate to user-VA-shaped fixtures
-// (`map_user_buffer + seed`); for the bake-in `init` fixture (which
-// runs through `exec_script`) the user-VA path always succeeds and
-// the fallback is never exercised.
-//
-// `Blocked` outcomes from the canonical path are awaited inside the
-// bridge for sync helpers; async-context helpers surface the token to
-// the caller. Today no in-tree backend produces `Blocked` from a
-// user-buffer copy on the synchronous path (anon page-cache
-// materialisation is sync, file-backed reads await up at the file's
-// `step_read` lane), so the awaiting code is a defensive scaffold for
-// future async-aware backings.
-// =====================================================================
-
-/// Read a `T: Copy` value from `uaddr` through the canonical
-/// `aspace.read_user` lane, falling back to the bootstrap
-/// kernel-pointer dance on `EFAULT`.
-pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) -> Result<T, Errno> {
-    use step_engine::{Errno as V3Errno, StepOutcome as V3};
-    let guard = step_engine::guard();
-    match aspace.read_user(UserPtr::<T>::new(uaddr as usize), &guard) {
-        V3::Done(v) => Ok(v),
-        V3::Err(V3Errno::EFAULT) => {
-            drop(guard);
-            // Fallback: kernel-pointer bootstrap exemption.
-            // SAFETY: existing dispatch tests pass kernel-side pointers
-            // directly. The fallback is a bridge until tests migrate.
-            Ok(unsafe { core::ptr::read_volatile(uaddr as *const T) })
-        }
-        V3::Err(e) => Err(e.into()),
-        V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
-    }
-}
-
-/// Write a `T: Copy` value to `uaddr` through the canonical
-/// `aspace.write_user` lane, falling back to the bootstrap
-/// kernel-pointer dance on `EFAULT`.
-pub(super) fn bootstrap_write_user<T: Copy>(
-    aspace: &AddressSpace,
-    uaddr: u64,
-    value: T,
-) -> Result<(), Errno> {
-    use StepOutcome as V3;
-    let guard = step_engine::guard();
-    match aspace.write_user(UserPtr::<T>::new(uaddr as usize), value, &guard) {
-        V3::Done(()) | V3::Continue { .. } => Ok(()),
-        V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
-            drop(guard);
-            // SAFETY: see `bootstrap_read_user`.
-            unsafe {
-                core::ptr::write_volatile(uaddr as *mut T, value);
-            }
-            Ok(())
-        }
-        V3::Err(e) => Err(Errno::from(e)),
-        V3::Yield { .. } => Err(Errno::EIO),
-    }
-}
-
-/// Copy `dst.len()` bytes from user-space `uaddr` into the kernel-side
-/// buffer `dst`. Bridges through `aspace.copy_from_user`, falling back
-/// to a kernel-pointer memcpy on `EFAULT`.
-pub(super) fn bootstrap_copy_from_user(
-    aspace: &AddressSpace,
-    dst: &mut [u8],
-    uaddr: u64,
-) -> Result<(), Errno> {
-    use StepOutcome as V3;
-    if dst.is_empty() {
-        return Ok(());
-    }
-    let guard = step_engine::guard();
-    match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
-        V3::Done(_) | V3::Continue { .. } => Ok(()),
-        V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
-            drop(guard);
-            // SAFETY: see `bootstrap_read_user`.
-            unsafe {
-                core::ptr::copy_nonoverlapping(uaddr as *const u8, dst.as_mut_ptr(), dst.len());
-            }
-            Ok(())
-        }
-        V3::Err(e) => Err(Errno::from(e)),
-        V3::Yield { .. } => Err(Errno::EIO),
-    }
-}
-
-/// Copy `src.len()` bytes from the kernel-side buffer `src` to
-/// user-space `uaddr`. Bridges through `aspace.copy_to_user`, falling
-/// back to a kernel-pointer memcpy on `EFAULT`.
-pub(super) fn bootstrap_copy_to_user(
-    aspace: &AddressSpace,
-    uaddr: u64,
-    src: &[u8],
-) -> Result<(), Errno> {
-    use StepOutcome as V3;
-    if src.is_empty() {
-        return Ok(());
-    }
-    let guard = step_engine::guard();
-    match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
-        V3::Done(_) | V3::Continue { .. } => Ok(()),
-        V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
-            drop(guard);
-            // SAFETY: see `bootstrap_read_user`.
-            unsafe {
-                core::ptr::copy_nonoverlapping(src.as_ptr(), uaddr as *mut u8, src.len());
-            }
-            Ok(())
-        }
-        V3::Err(e) => Err(Errno::from(e)),
-        V3::Yield { .. } => Err(Errno::EIO),
-    }
-}
-
-/// Read a NUL-terminated user string at `uaddr`, capped at `max_len`
-/// bytes. Bridges through `aspace.read_user_cstr`, falling back to the
-/// bootstrap byte-by-byte scan on `EFAULT`.
-///
-/// Returns `Ok(bytes)` (without the NUL terminator). `Err(Errno)`
-/// surfaces other errors; `Errno::ENAMETOOLONG` indicates `max_len`
-/// bytes were walked without finding a NUL.
-pub(super) fn bootstrap_read_user_cstr(
-    aspace: &AddressSpace,
-    uaddr: u64,
-    max_len: usize,
-) -> Result<Vec<u8>, Errno> {
-    use step_engine::{Errno as V3Errno, StepOutcome as V3};
-    if uaddr == 0 || max_len == 0 {
-        return Ok(Vec::new());
-    }
-    let guard = step_engine::guard();
-    match aspace.read_user_cstr(UserPtr::<u8>::new(uaddr as usize), max_len, &guard) {
-        V3::Done(v) => Ok(v),
-        V3::Err(V3Errno::EFAULT) => {
-            drop(guard);
-            // Fallback bootstrap scan — matches the previous inline
-            // helper.
-            let mut out: Vec<u8> = Vec::with_capacity(core::cmp::min(max_len, 256));
-            for offset in 0..max_len {
-                // SAFETY: see `bootstrap_read_user`.
-                let byte =
-                    unsafe { core::ptr::read_volatile((uaddr as usize + offset) as *const u8) };
-                if byte == 0 {
-                    return Ok(out);
-                }
-                out.push(byte);
-            }
-            Err(Errno::ENAMETOOLONG)
-        }
-        V3::Err(e) => Err(e.into()),
-        V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
-    }
-}
-
-/// Read 8 little-endian bytes from a slice as a `u64`. Used by
-/// `sys_rt_sigaction`'s `struct sigaction` decode.
-fn read_u64_le(bytes: &[u8]) -> u64 {
-    debug_assert!(bytes.len() >= 8);
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&bytes[..8]);
-    u64::from_le_bytes(buf)
-}
-
-/// Resolve fd `idx` against the process payload's fd table. Returns
-/// `None` if the process is a zombie or the slot is empty.
-///
-/// Per fd-ops Wave 1 the table is a sparse `BTreeMap<u32, Cap<OpenFile>>`;
-/// any `u32` fd value is a valid key.
-fn resolve_fd(process: &Cap<ProcessIdentity>, idx: u32) -> Option<Cap<OpenFile>> {
-    process.fd(idx)
 }
 
 /// Translate the subsystem-shared `Errno` enum into the Linux RV64
@@ -1052,61 +682,9 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
         Errno::ESPIPE => 29,
         Errno::ESRCH => 3,
         Errno::ESTALE => 116,
+        Errno::EINTR => 4,
     }
 }
-
-// =====================================================================
-// Wave 2 of the DAC + setuid slice — Part 3 (process-side cred-mutation
-// / cred-reading syscall arms). Each arm reads the caller's cred via
-// `ctx.cred()` (Part 7) for the privilege check; setters wrap the
-// already-shipping `tx_subsystems::cred::step_set*` family (Wave 1) and
-// translate the Linux `(u32) -1` ("leave unchanged") sentinel to
-// `Option::None` before calling.
-//
-// The translation `u32::MAX → None` is overflow-safe: userspace passes
-// a `uid_t` (`u32`) sign-extended from the i32 sentinel, so `(u32) -1`
-// arrives in our `args[i]` as `u32::MAX = 0xFFFF_FFFF`. The pattern
-// `if v == u32::MAX { None } else { Some(Uid::new(v)) }` never reaches
-// `Uid::new(u32::MAX)` for the sentinel branch and never wraps.
-//
-// See `docs/progress/plans/2026-05-06-dac-and-setuid.md` Part 3 and
-// `txdoc:PROCESS-CREDENTIAL-SERVICE-DRAFT-1`.
-// =====================================================================
-
-/// Translate the Linux `(u32) -1 == u32::MAX` "leave unchanged"
-/// sentinel into `Option::None`. Used by every two- and three-arg
-/// setter (`setre{u,g}id`, `setres{u,g}id`).
-///
-/// Userspace passes `uid_t` (an unsigned 32-bit type), so the
-/// `setresuid(-1, -1, -1)` call shape arrives in the kernel with each
-/// arg holding `0xFFFF_FFFF`. Decoding to `Option::None` lets the
-/// `cred::step_set*` family receive a clean "leave the corresponding
-/// field alone" signal without any further sign-extension dance.
-pub(super) const UID_LEAVE_UNCHANGED: u32 = u32::MAX;
-
-// =====================================================================
-// Wave 2 of the fd-ops slice — fd-management syscall arms.
-//
-// Coverage:
-//   - `sys_openat` (NR_OPENAT = 56). Wave 2's slice surface only
-//     supports `dirfd == AT_FDCWD`; non-cwd dirfds map to `-EBADF`. The
-//     walker resolves the path via `vfs::step_open` using the caller's
-//     `walker_cred()` (effective ids per POSIX). On `O_CREAT` against a
-//     missing file, the syscall arm walks to the parent directory,
-//     calls `FsOps::create_inode`, and re-runs `step_open` (the
-//     create-on-open path is implemented at the syscall arm rather
-//     than baked into the walker — keeps the walker resolve-only per
-//     the slice plan §"Cross-cutting risks #6").
-//   - `sys_close` (NR_CLOSE = 57). Removes the `Cap<OpenFile>` from
-//     the fd table; EBR-deferred reclamation fires the `OpenFile`'s
-//     `Drop`.
-//   - `sys_dup` (NR_DUP = 23) and `sys_dup3` (NR_DUP3 = 24). `NR_DUP2`
-//     is absent on the RV64 generic ABI; musl emits `dup3(.., 0)` for
-//     the legacy `dup2(oldfd, newfd)` shape.
-//
-// See `docs/progress/plans/2026-05-07-fd-ops-and-drift-cleanup.md`
-// Parts 2–4 and `txdoc:VFS-CHECKS-OPEN-FLAGS-1`.
-// =====================================================================
 
 /// Linux generic ABI errno value for "no such file or directory"
 /// (`ENOENT`). Used by `sys_openat` when the walker reports the file
@@ -1124,100 +702,10 @@ pub(super) const EISDIR_VALUE: i32 = 21;
 /// Used by Slice 6's `sys_chdir` when the resolved path is not a
 /// directory and by `sys_getdents64` for a non-directory fd.
 pub(super) const ENOTDIR_VALUE: i32 = 20;
+/// Linux generic ABI errno value for "interrupted system call" (`EINTR`).
+/// Used by `sys_rt_sigsuspend`.
+pub(super) const EINTR_VALUE: i32 = 4;
 /// Linux generic ABI errno value for "result out of range" (`ERANGE`).
 /// Used by Slice 6's `sys_getcwd` when the user buffer is too small
 /// for the rendered cwd path (NUL terminator inclusive).
 pub(super) const ERANGE_VALUE: i32 = 34;
-
-// ===========================================================================
-// Slice 4 of the shell-prompt roadmap (2026-05-07) — time syscalls.
-//
-// `clock_gettime`, `gettimeofday`, `times` ship the read-side surface
-// against `<P as TimeIf>::read_ns()`. All four POSIX clocks
-// (`CLOCK_REALTIME` / `CLOCK_MONOTONIC` / `CLOCK_PROCESS_CPUTIME_ID`
-// / `CLOCK_THREAD_CPUTIME_ID`) and their `*_RAW` / `*_COARSE` /
-// `BOOTTIME` aliases route to the platform monotonic — no boot-time
-// RTC offset and no per-process CPU-time accounting yet (TODOs at the
-// constant declarations).
-//
-// `nanosleep` / `clock_nanosleep` ship the zero-duration / past-
-// deadline short-circuit only. Real-duration sleeps need a per-task
-// timer-fire wait source (i.e. a Channel attached to the reactor's
-// TimerQueue, fired when `step_hart_loop_at`'s `advance_time_to` walks
-// past the parked deadline). That wiring requires either exposing
-// `Reactor::channel()` through `wait_source` (a tx-kernel ↔
-// tx-subsystems plumbing change, since the BSP reactor lives in
-// tx-kernel) or adding a global timer queue to tx-subsystems and
-// driving it from the BSP loop. Both are out of scope for Slice 4 —
-// busybox sh's syscall trace barely uses `nanosleep` and Slice 11's
-// QEMU shell smoke can land without it. The deferred follow-up is
-// tracked in `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md`.
-//
-// Per the dispatch convention, all writes flow through the
-// `bootstrap_*` user-VA bridges (`bootstrap_write_user::<T>` for
-// fixed-size structs, `bootstrap_copy_to_user` for byte buffers),
-// which delegate to the canonical `aspace.write_user` /
-// `aspace.copy_to_user` lane.
-// ===========================================================================
-
-// =====================================================================
-// Slice 6 of the shell-prompt roadmap — stat family
-// (`fstat` / `newfstatat` / `getdents64` / `getcwd` / `chdir` /
-// `fchdir` / `umask`).
-//
-// These arms unblock four shell-startup-blocking surfaces:
-//   - `ls` calls `getdents64(fd)` to enumerate directory contents.
-//   - `pwd` calls `getcwd(buf, size)` to render the cwd.
-//   - `cd` calls `chdir(path)` to change the cwd.
-//   - musl's shell startup calls `fstat(0)` / `fstat(1)` / `fstat(2)`
-//     to decide interactive mode.
-//
-// Carryovers documented at the constants in `numbers.rs`:
-//   - `fchdir` returns `-ENOSYS` (OpenFile carries `Cap<RNode>`, not
-//     `Cap<DEntry>` — no path-edge to install via `step_chdir`).
-//   - `AT_SYMLINK_NOFOLLOW` accepted but ignored (the walker always
-//     follows symlinks at resolution time today).
-//
-// User-VA discipline: buffer pointers flow through the `bootstrap_*`
-// user-VA bridges (`bootstrap_write_user::<StatLayout>` for `fstat` /
-// `newfstatat`; `bootstrap_copy_to_user` for `getcwd` /
-// `getdents64` byte streams), which delegate to the canonical
-// `aspace.write_user` / `aspace.copy_to_user` lane.
-// =====================================================================
-
-/// Fixed header byte size of `linux_dirent64`. Used by `sys_getdents64`
-/// to compute the trailing name-and-pad offset.
-pub(super) const LINUX_DIRENT64_HEADER_BYTES: usize = 19;
-
-/// Default `st_blksize` reported by Slice 6's stat arms. Linux's
-/// page-backed filesystems all report 4096; txKernel has no
-/// per-FS blocksize hint to override this with today.
-pub(super) const STAT_BLKSIZE: i32 = 4096;
-
-/// Round `x` up to the nearest multiple of 8. Used by `getdents64` to
-/// pad records to the 8-byte boundary the ABI requires.
-const fn align_up_8(x: usize) -> usize {
-    (x + 7) & !7
-}
-
-/// Project an `InodeKind` onto the `linux_dirent64` `d_type` byte. The
-/// match exhausts every variant of the enum (verified from
-/// `vfs::structure::InodeKind`).
-const fn inode_kind_to_dt(kind: InodeKind) -> u8 {
-    match kind {
-        InodeKind::Regular => DT_REG,
-        InodeKind::Directory => DT_DIR,
-        InodeKind::Symlink => DT_LNK,
-        InodeKind::CharDevice => DT_CHR,
-        InodeKind::BlockDevice => DT_BLK,
-        InodeKind::Fifo => DT_FIFO,
-        InodeKind::Socket => DT_SOCK,
-    }
-}
-
-// ---------------------------------------------------------------------
-// Layout structs for Slice 7 syscall arms.
-// ---------------------------------------------------------------------
-
-/// Linux uapi `struct utsname` field width (`__NEW_UTS_LEN + 1 = 65`).
-pub(super) const UTSNAME_FIELD: usize = 65;

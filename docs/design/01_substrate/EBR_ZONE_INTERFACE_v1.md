@@ -36,7 +36,7 @@ Upper subsystems should speak only the object-model interface:
 ```rust
 epoch::guard() -> Guard
 
-zone::reserve<T>(&Zone<T>) -> Result<ZoneReservation<T>, Errno>
+zone::reserve<T>(&Zone<T>) -> Result<ZoneReservation<T>, ZoneError>
 zone::sign<T>(ZoneReservation<T>, T) -> Cap<T>
 
 Weak<T>
@@ -567,7 +567,7 @@ The substrate zone API remains:
 pub struct Zone<T> { /* policy hidden */ }
 pub struct ZoneReservation<T> { /* linear */ }
 
-pub fn reserve<T>(zone: &Zone<T>) -> Result<ZoneReservation<T>, Errno>;
+pub fn reserve<T>(zone: &Zone<T>) -> Result<ZoneReservation<T>, ZoneError>;
 pub fn sign<T>(reservation: ZoneReservation<T>, value: T) -> Cap<T>;
 ```
 

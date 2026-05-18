@@ -22,7 +22,7 @@ use crate::vfs::structure::{
 use crate::vfs::walker::{step_open, step_walk};
 use crate::vfs::FsOps;
 
-use super::{block_on, init_zones, TestFs};
+use super::{init_zones, TestFs};
 
 // === fixture: rootfs over TestFs ===================================
 
@@ -92,7 +92,7 @@ fn step_walk_resolves_simple_name() {
 
     let cred = Credential::root();
     let guard = guard();
-    let outcome = block_on(step_walk(topo.root_dentry.clone(), b"foo", &cred, &guard));
+    let outcome = step_walk(topo.root_dentry.clone(), b"foo", &cred, &guard);
     drop(guard);
     let dentry = match outcome {
         V3::Done(d) => d,
@@ -119,12 +119,7 @@ fn step_walk_resolves_multi_component_path() {
 
     let cred = Credential::root();
     let guard = guard();
-    let outcome = block_on(step_walk(
-        topo.root_dentry.clone(),
-        b"/foo/bar/baz",
-        &cred,
-        &guard,
-    ));
+    let outcome = step_walk(topo.root_dentry.clone(), b"/foo/bar/baz", &cred, &guard);
     drop(guard);
     match outcome {
         V3::Done(d) => {
@@ -152,7 +147,7 @@ fn step_walk_returns_enoent_on_missing() {
 
     let cred = Credential::root();
     let guard = guard();
-    let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/nope", &cred, &guard));
+    let outcome = step_walk(topo.root_dentry.clone(), b"/nope", &cred, &guard);
     drop(guard);
     match outcome {
         V3::Err(V3Errno::ENOENT) => {}
@@ -184,12 +179,7 @@ fn step_walk_eacces_when_descend_perm_denied() {
         effective_caps: crate::cred::CapabilitySet::EMPTY,
     };
     let guard = guard();
-    let outcome = block_on(step_walk(
-        topo.root_dentry.clone(),
-        b"/ownerdir/leaf",
-        &cred,
-        &guard,
-    ));
+    let outcome = step_walk(topo.root_dentry.clone(), b"/ownerdir/leaf", &cred, &guard);
     drop(guard);
     match outcome {
         V3::Err(V3Errno::EACCES) => {}
@@ -214,12 +204,7 @@ fn step_walk_chases_relative_symlink() {
 
     let cred = Credential::root();
     let guard = guard();
-    let outcome = block_on(step_walk(
-        topo.root_dentry.clone(),
-        b"/alias",
-        &cred,
-        &guard,
-    ));
+    let outcome = step_walk(topo.root_dentry.clone(), b"/alias", &cred, &guard);
     drop(guard);
     match outcome {
         V3::Done(d) => {
@@ -245,7 +230,7 @@ fn step_open_round_trips_to_directory() {
 
     let cred = Credential::root();
     let guard = guard();
-    let outcome = block_on(step_open(
+    let outcome = step_open(
         topo.root_dentry.clone(),
         b"/opendir",
         OpenFileFlags {
@@ -258,7 +243,7 @@ fn step_open_round_trips_to_directory() {
         0,
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     match outcome {
         V3::Done(_open) => {}
@@ -290,7 +275,7 @@ fn step_open_eacces_without_read_bit() {
         effective_caps: crate::cred::CapabilitySet::EMPTY,
     };
     let guard = guard();
-    let outcome = block_on(step_open(
+    let outcome = step_open(
         topo.root_dentry.clone(),
         b"/locked",
         OpenFileFlags {
@@ -303,7 +288,7 @@ fn step_open_eacces_without_read_bit() {
         0,
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     match outcome {
         V3::Err(V3Errno::EACCES) => {}

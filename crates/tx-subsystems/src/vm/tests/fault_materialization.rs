@@ -323,6 +323,7 @@ fn vm_fault_map_private_write_copies_source_page_contents() {
 
 #[test]
 fn vm_fault_materialization_rejects_non_pagebacked_recipe() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x4000, 1),

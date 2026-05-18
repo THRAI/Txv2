@@ -135,7 +135,7 @@ fn fresh_init() -> Cap<crate::process::ProcessIdentity> {
 fn script_kill_process_same_uid_delivers() {
     let _g = setup();
     let parent = fresh_init();
-    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent).expect("fork");
+    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
     // Both inherit root cred; same euid.
 
     let outcome = script_kill_process(&parent, &child, Signum::SIGTERM);
@@ -146,7 +146,7 @@ fn script_kill_process_same_uid_delivers() {
 fn script_kill_process_different_uid_returns_eperm() {
     let _g = setup();
     let parent = fresh_init();
-    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent).expect("fork");
+    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
 
     // Drop both to non-privileged uids that don't share. We set
     // creds directly because day-1 `step_setuid` retains caps
@@ -164,7 +164,7 @@ fn script_kill_process_different_uid_returns_eperm() {
 fn script_kill_process_zombie_target_returns_no_live_thread() {
     let _g = setup();
     let parent = fresh_init();
-    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent).expect("fork");
+    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
     crate::process::step_exit_group(&child, ExitStatus::Exited(0));
 
     // Even without permission, target_proc_cred returns None for
@@ -177,7 +177,7 @@ fn script_kill_process_zombie_target_returns_no_live_thread() {
 fn script_kill_process_zombie_source_returns_esrch() {
     let _g = setup();
     let parent = fresh_init();
-    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent).expect("fork");
+    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
     crate::process::step_exit_group(&parent, ExitStatus::Exited(0));
 
     let outcome = script_kill_process(&parent, &child, Signum::SIGTERM);
@@ -188,8 +188,8 @@ fn script_kill_process_zombie_source_returns_esrch() {
 fn script_kill_pgrp_partial_permission_returns_count_of_permitted() {
     let _g = setup();
     let parent = fresh_init();
-    let child_a = crate::process::step_fork::<crate::vm::TestPmap>(&parent).expect("fork a");
-    let child_b = crate::process::step_fork::<crate::vm::TestPmap>(&parent).expect("fork b");
+    let child_a = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork a");
+    let child_b = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork b");
 
     // Set up a partial-permission scenario:
     //   parent (sender):    uid=1000, no caps
@@ -209,7 +209,7 @@ fn script_kill_pgrp_partial_permission_returns_count_of_permitted() {
         let payload = proc.payload.lock();
         payload
             .as_ref()
-            .map(|p| p.threads.lock()[0].clone())
+            .map(|p| p.threads.nth(0).unwrap())
             .unwrap()
             .payload
             .lock()
@@ -226,7 +226,7 @@ fn script_kill_pgrp_partial_permission_returns_count_of_permitted() {
 fn signal_zero_is_permission_probe_no_delivery() {
     let _g = setup();
     let parent = fresh_init();
-    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent).expect("fork");
+    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
 
     // Same uid — probe should succeed without delivery.
     let outcome = script_kill_probe(&parent, &child).expect("probe");
@@ -236,7 +236,7 @@ fn signal_zero_is_permission_probe_no_delivery() {
     let leader_pending = {
         let payload = child.payload.lock();
         let payload = payload.as_ref().unwrap();
-        let leader = payload.threads.lock()[0].clone();
+        let leader = payload.threads.nth(0).unwrap();
         let lp = leader.payload.lock();
         lp.as_ref().unwrap().pending().is_pending(Signum::SIGTERM)
     };

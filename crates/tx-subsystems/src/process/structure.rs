@@ -27,16 +27,19 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
-use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::process::adapter::step_engine::{
-    self, AtomicSlot, Cap, Dead, Entity, PayloadCap, SpinMutex, Weak, Zone, ZoneAllocated,
+    self, AtomicSlot, Cap, Dead, Entity, PayloadCap, PayloadPolicy, RawPort, RawQueue, SpinMutex,
+    Weak, Zone, ZoneAllocated,
 };
 use crate::process::adapter::wait_routing::{self, Channel, Mask, WaitSource};
 
 use crate::cred::{Cred, Gid, Uid};
 use crate::execution::WaitToken;
+use crate::process::topology::{
+    ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers,
+};
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::thread_runtime::ThreadIdentity;
 use crate::tty::structure::identity::TtyIdentity;
@@ -51,6 +54,17 @@ use crate::vm::AddressSpace;
 /// (`docs/design/04_process-signals/PROCESS_v1.md` §7.4); plan
 /// `docs/progress/plans/2026-05-06-fork-clone-wait4.md` Open Q #1.
 pub const EXIT_SOURCE_CHILD_ZOMBIFIED: u64 = 0x1;
+
+/// Event bit for `signal_port` (RawPort) fire.
+///
+/// Fired each time a catchable signal is delivered to this process.
+/// All bus subscribers (signalfd, future pidfd/timerfd) wake on this
+/// single bit; the subscribers then re-read their respective pending
+/// state to determine which signal(s) arrived. Single-bit design per
+/// `SIGNAL_ATTACHMENTS_v1` §2 (Carrier = RawPort, Polarity = fire).
+///
+/// See: `txdoc:SIGNAL-ATTACHMENTS-CATALOG-SCHEMA-1`.
+pub const SIGNAL_GENERATED: u64 = 0x1;
 
 /// Per-process exit disposition, populated by `step_exit_group` /
 /// `step_exit_group_with_signal` / the last-thread cascade. Spec
@@ -156,7 +170,7 @@ pub struct ProcessIdentity {
     /// Pushed by `step_fork`; walked by `step_process_exit` (sever
     /// child's parent slot) and `step_waitpid_nohang` (reap —
     /// withdraws the Cap, releasing retention).
-    pub(crate) children: SpinMutex<Vec<Cap<ProcessIdentity>>>,
+    pub(crate) children: ProcessChildren,
     pub(crate) pgrp: SpinMutex<Cap<ProcessGroup>>,
     /// Process-visible exit disposition. `Some` once the process has
     /// run `step_exit_group` / `step_exit_group_with_signal` (or the
@@ -205,6 +219,12 @@ impl step_engine::SubjectIdentity for ProcessIdentity {
 }
 
 impl ProcessIdentity {
+    /// Access the process payload slot.  Returns `None` when the
+    /// process is a zombie (payload dropped).
+    pub fn payload_slot(&self) -> &SpinMutex<Option<PayloadCap<ProcessPayload>>> {
+        &self.payload
+    }
+
     /// Snapshot the current process-group `Cap`. The returned `Cap` is a
     /// strong reference; it remains valid until dropped even if the
     /// target rebinds via `setpgid`.
@@ -234,7 +254,7 @@ impl ProcessIdentity {
     /// Children leave this list only via `step_waitpid_nohang`'s
     /// reap step or when this process itself reclaims.
     pub fn child_count(&self) -> usize {
-        self.children.lock().len()
+        self.children.len()
     }
 
     /// Snapshot the children list as owned `Cap`s. The returned
@@ -242,7 +262,7 @@ impl ProcessIdentity {
     /// released before return. Includes zombie children (callers
     /// that need to skip zombies should `is_zombie()`-filter).
     pub fn children(&self) -> alloc::vec::Vec<Cap<ProcessIdentity>> {
-        self.children.lock().clone()
+        self.children.snapshot()
     }
 
     /// Read the recorded exit status. `Some` once `step_exit_group`
@@ -263,6 +283,37 @@ impl ProcessIdentity {
     /// but cheaper.
     pub fn is_zombie(&self) -> bool {
         self.payload.lock().is_none()
+    }
+
+    /// Process state char for /proc/<pid>/stat.
+    pub fn state_char(&self) -> u8 {
+        if self.is_zombie() {
+            b'Z'
+        } else {
+            b'R'
+        }
+    }
+
+    /// Process command-line (delegates to payload).
+    pub fn ident_cmdline(&self) -> Option<alloc::vec::Vec<u8>> {
+        self.payload.lock().as_ref()?.cmdline()
+    }
+
+    /// Process short name comm (delegates to payload).
+    pub fn ident_comm(&self) -> Option<[u8; 16]> {
+        Some(self.payload.lock().as_ref()?.comm())
+    }
+
+    /// Store siginfo for a delivered signal (delegates to payload).
+    pub fn siginfo_store(&self, sig: crate::signal::Signum, info: crate::signal::SigInfo) {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.siginfo_slots.store(sig, info);
+        }
+    }
+
+    /// Find a thread by its tid within this process.
+    pub fn thread_by_tid(&self, tid: u32) -> Option<Cap<ThreadIdentity>> {
+        self.payload.lock().as_ref()?.threads.find_by_tid(tid)
     }
 
     /// Snapshot the current address space `Cap`, if the process is
@@ -308,6 +359,28 @@ impl ProcessIdentity {
     /// the v3 subject-population helpers.
     pub fn cred_cap(&self) -> Option<Cap<Cred>> {
         self.payload.lock().as_ref().map(|p| p.cred_cap())
+    }
+
+    /// Process short name (for `/proc/<pid>/stat`). Returns `"?"` for
+    /// zombies (no payload).
+    pub fn comm(&self) -> [u8; 16] {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.comm())
+            .unwrap_or([b'?', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    }
+
+    /// Process command-line (for `/proc/<pid>/cmdline`). Returns
+    /// `None` for zombies (no payload) or when no cmdline was set.
+    pub fn cmdline(&self) -> Option<alloc::vec::Vec<u8>> {
+        self.payload.lock().as_ref().and_then(|p| p.cmdline())
+    }
+
+    /// Process executable file DEntry (for `/proc/<pid>/exe`).
+    /// Returns `None` for zombies (no payload).
+    pub fn exe_file(&self) -> Option<Cap<DEntry>> {
+        self.payload.lock().as_ref().and_then(|p| p.exe_file())
     }
 
     /// Replace this process's address space with `new` and return the
@@ -555,7 +628,7 @@ impl ProcessIdentity {
         self.payload
             .lock()
             .as_ref()
-            .map(|p| p.threads.lock().len())
+            .map(|p| p.threads.count())
             .unwrap_or(0)
     }
 
@@ -572,8 +645,8 @@ impl ProcessIdentity {
     pub fn nth_thread(&self, idx: usize) -> Option<Cap<ThreadIdentity>> {
         let payload_guard = self.payload.lock();
         let payload = payload_guard.as_ref()?;
-        let result = payload.threads.lock().get(idx).cloned();
-        result
+
+        payload.threads.nth(idx)
     }
 
     /// Carrier id under which this process's `exit_source` channel is
@@ -586,6 +659,25 @@ impl ProcessIdentity {
     /// awaits via [`crate::wait_source::wait_on_token`].
     pub fn exit_source_id(&self) -> Option<u64> {
         self.payload.lock().as_ref().map(|p| p.exit_source_id())
+    }
+
+    /// Notify a vfork-parent that this child process has exec'd or
+    /// exited.  Forwards to [`ProcessPayload::notify_vfork_done`].
+    /// No-op for zombie processes (no payload).
+    pub fn notify_vfork_done(&self) {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.notify_vfork_done();
+        }
+    }
+
+    /// Check whether the child has exec'd or exited (vfork_done).
+    /// Returns `true` for zombie processes (payload dropped → process
+    /// has exited).
+    pub fn is_vfork_done(&self) -> bool {
+        self.payload
+            .lock()
+            .as_ref()
+            .is_none_or(|p| p.vfork_done.load(Ordering::Acquire))
     }
 
     /// Build the `WaitToken` an awaiter parks on while waiting for any
@@ -632,6 +724,14 @@ impl ProcessIdentity {
                 // (`EXIT_SOURCE_CHILD_ZOMBIFIED` and future stop/cont
                 // bits land in both).
                 wait_routing::notify_v3_source(p.exit_wait_source(), mask.bits());
+                // Phase A (bus wire alignment): set the same mask on
+                // the RawQueue readiness wire so native bus subscribers
+                // (future signalfd, pidfd) wake without going through
+                // the legacy Channel. Level-triggered semantics
+                // (`set` is idempotent); consumers re-read the queue
+                // state via `subscribe` + `try_take_ready`.
+                // See: `txdoc:SIGNAL-ATTACHMENTS-CATALOG-SCHEMA-2`.
+                p.exit_source_bus.fire(mask.bits());
                 released
             })
             .unwrap_or(0)
@@ -710,6 +810,16 @@ pub struct TargetProcCred {
 /// Holds the address space and the live thread list. Future fields
 /// (`rlimits`, `fd_table`) land in follow-up passes without changing
 /// the existing surface.
+/// Group-exit coordination state (PROCESS_v1 §5).
+#[derive(Debug)]
+pub(crate) struct GroupExitState {
+    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
+    pub status: ExitStatus,
+    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
+    pub is_exec: bool,
+    pub remaining_threads: AtomicU32,
+}
+
 pub struct ProcessPayload {
     /// Authoritative address-space slot for this process. Per Open Q #2
     /// (DECIDED 2026-05-06, `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`),
@@ -724,7 +834,7 @@ pub struct ProcessPayload {
     /// driver) snapshot via `process.aspace_cap()` which clones the
     /// inner `Cap` out of the slot.
     pub(crate) aspace: AtomicSlot<Cap<AddressSpace>>,
-    pub(crate) threads: SpinMutex<Vec<Cap<ThreadIdentity>>>,
+    pub(crate) threads: ProcessThreads,
     /// Per-process signal-action table. Day-1 records dispositions
     /// installed via `step_sigaction`; the delivery step that consults
     /// these lands with the AST/scripts pass.
@@ -734,6 +844,26 @@ pub struct ProcessPayload {
     /// whose mask permits the signal will sweep it on its next
     /// delivery point.
     pub(crate) group_pending: PendingSignalQueue,
+    /// Per-signum siginfo slots. Written by signal producers
+    /// (post_signal via step_kill_process), read by signalfd
+    /// and the future handler-delivery path. Phase I.
+    pub(crate) siginfo_slots: crate::signal::SigInfoSlots,
+    /// Per-process bus wire for signal-generated lifecycle events.
+    ///
+    /// `RawPort` (edge-triggered) per `SIGNAL_ATTACHMENTS_v1`:
+    /// fires `SIGNAL_GENERATED` each time a catchable signal is
+    /// delivered to this process. Native consumers (signalfd, pidfd,
+    /// future timerfd) subscribe here; the signal shim also consumes
+    /// this wire internally for handler-vs-default routing.
+    ///
+    /// Phase A (bus wire alignment): declared on ProcessPayload per
+    /// spec; fired in `step_kill_process` after thread-eligibility
+    /// post and signalfd notification. Signalfd migration from
+    /// private subscription table to bus-subscriber is TODO.
+    ///
+    /// See: `txdoc:SIGNAL-ATTACHMENTS-CATALOG-SCHEMA-1`,
+    /// `docs/design/04_process-signals/SIGNAL_ATTACHMENTS_v1.md`.
+    pub(crate) signal_port: RawPort,
     /// Per-process credential **cap slot**. Mutated via
     /// `cred::step_setuid` / `cred::step_setgid` / ...; readers clone
     /// the cap via [`Self::cred_cap`] or snapshot the value via
@@ -890,9 +1020,71 @@ pub struct ProcessPayload {
     /// last fire was already issued under the live-payload guard
     /// inside `fire_exit_source`.
     pub(crate) exit_wait_source: Arc<WaitSource>,
+    /// Bus-aligned readiness wire for process lifecycle events.
+    ///
+    /// `RawQueue` (level-triggered) per `SIGNAL_ATTACHMENTS_v1`:
+    /// sets bits for zombie-children (`EXIT_SOURCE_CHILD_ZOMBIFIED`),
+    /// future thread-stop events, and group-continue events. Native
+    /// consumers (future signalfd, pidfd) subscribe to this wire;
+    /// `wait4`/`waitid` consume the legacy `exit_source` Channel
+    /// until the Channel → RawQueue migration completes.
+    ///
+    /// Phase A: declared alongside the legacy `exit_source` Channel.
+    /// `fire_exit_source` sets bits on both mechanisms; native
+    /// subscribers poll this wire, while the wait4 path still drains
+    /// the Channel. Once all consumers migrate, the Channel is
+    /// removed.
+    ///
+    /// Event bits use the same constants as the Channel
+    /// (`EXIT_SOURCE_CHILD_ZOMBIFIED`).  See the top-level
+    /// constant doc for how the wait4 arm builds its `WaitToken`.
+    /// See: `txdoc:SIGNAL-ATTACHMENTS-CATALOG-SCHEMA-2`.
+    pub(crate) exit_source_bus: RawQueue,
+    /// Process command-line snapshot. Populated by `execve` at the
+    /// point-of-no-return commit; read by procfs `/proc/<pid>/cmdline`.
+    /// `None` for kernel threads and pre-exec processes.
+    pub _cmdline: SpinMutex<Option<alloc::vec::Vec<u8>>>,
+    /// Canonical executable DEntry. Set by `execve` to the resolved
+    /// path of the loaded binary. Read by procfs `/proc/<pid>/exe`
+    /// (symlink target) and `/proc/<pid>/stat`.
+    /// `None` for kernel threads and pre-exec processes.
+    pub _exe_file: SpinMutex<Option<Cap<DEntry>>>,
+    /// Process short name (comm). Up to 15 bytes + NUL. Initialised
+    /// from the executable basename at `execve`; can be changed via
+    /// `prctl(PR_SET_NAME)`. Read by procfs `/proc/<pid>/stat`.
+    pub(crate) _comm: SpinMutex<[u8; 16]>,
+    pub(crate) thread_count: AtomicU32,
+    pub(crate) group_exit: SpinMutex<Option<GroupExitState>>,
+    pub vfork_done: AtomicBool,
+    /// Waker for a vfork-parent that is parked in `sys_clone` waiting
+    /// for this process to exec or exit.  Set by the parent before
+    /// parking; taken and fired by the child's exec and exit paths.
+    pub(crate) vfork_waiter: SpinMutex<Option<core::task::Waker>>,
 }
 
 impl ProcessPayload {
+    /// Snapshot the current address-space `Cap` out of the
+    /// `AtomicSlot<Cap<AddressSpace>>` slot. Panics if the slot is
+    /// empty — by construction the initial state is always populated
+    /// (`bootstrap_init_process` / `step_fork`) and the only mutator
+    /// is exec's phase 6 store, which atomically swaps to a fresh
+    /// `Cap` and never leaves the slot empty.
+    /// Notify a vfork-parent that this child process has exec'd or
+    /// exited.  Sets `vfork_done` and fires the stored waker (if any).
+    pub fn notify_vfork_done(&self) {
+        self.vfork_done.store(true, Ordering::Release);
+        if let Some(waker) = self.vfork_waiter.lock().take() {
+            waker.wake();
+        }
+    }
+
+    /// Register a [`core::task::Waker`] to be fired when this process
+    /// next reaches `notify_vfork_done`. Overwrites any prior waker.
+    /// Used by the `CLONE_VFORK` parent-park loop in the syscall arm.
+    pub fn store_vfork_waiter(&self, waker: core::task::Waker) {
+        *self.vfork_waiter.lock() = Some(waker);
+    }
+
     /// Snapshot the current address-space `Cap` out of the
     /// `AtomicSlot<Cap<AddressSpace>>` slot. Panics if the slot is
     /// empty — by construction the initial state is always populated
@@ -1003,6 +1195,47 @@ impl ProcessPayload {
     /// `step_fork` to clone the parent's fd table into the child.
     pub(crate) fn snapshot_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
         self.fds.lock().clone()
+    }
+
+    /// Public fd-table snapshot (for procfs `/proc/<pid>/fd/`).
+    pub fn open_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
+        self.snapshot_fds()
+    }
+
+    /// Process command-line (for `/proc/<pid>/cmdline`).
+    pub fn cmdline(&self) -> Option<alloc::vec::Vec<u8>> {
+        self._cmdline.lock().clone()
+    }
+
+    /// Executable DEntry (for `/proc/<pid>/exe` symlink target).
+    pub fn exe_file(&self) -> Option<Cap<DEntry>> {
+        self._exe_file.lock().clone()
+    }
+
+    /// EXEC Phase 5 — install the group-exit state that collapses every
+    /// sibling thread of the calling process. Returns `true` if more
+    /// than one thread was live and the group_exit slot was populated;
+    /// `false` if the process was single-threaded and no collapse is
+    /// needed. `txdoc:EXEC-10-COLLAPSE-OLD-AS-WORK`.
+    pub fn install_exec_group_exit(&self) -> bool {
+        let n = self
+            .thread_count
+            .load(core::sync::atomic::Ordering::Acquire);
+        if n > 1 {
+            *self.group_exit.lock() = Some(GroupExitState {
+                status: ExitStatus::Exited(0),
+                is_exec: true,
+                remaining_threads: AtomicU32::new(n - 1),
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Process short name comm (for `/proc/<pid>/stat`).
+    pub fn comm(&self) -> [u8; 16] {
+        *self._comm.lock()
     }
 
     /// Allocate the lowest unused fd ≥ `min` without installing
@@ -1145,7 +1378,7 @@ impl ProcessPayload {
 pub struct ProcessGroup {
     pub pgid: Pgid,
     pub(crate) session: Cap<Session>,
-    pub(crate) members: SpinMutex<Vec<Weak<ProcessIdentity>>>,
+    pub(crate) members: ProcessGroupMembers,
 }
 
 impl ProcessGroup {
@@ -1158,7 +1391,7 @@ impl ProcessGroup {
     /// Includes entries pointing to dropped processes — callers that
     /// need the live count should walk and `upgrade` under a guard.
     pub fn member_slot_count(&self) -> usize {
-        self.members.lock().len()
+        self.members.len()
     }
 }
 
@@ -1172,7 +1405,7 @@ pub struct Session {
     /// Per `PROCESS_v1` §2.4 (the spec calls this DLL `members`); we
     /// hold weak refs because retention is held by each pgrp's
     /// session binding.
-    pub(crate) members: SpinMutex<Vec<Weak<ProcessGroup>>>,
+    pub(crate) members: SessionMembers,
 }
 
 impl Session {
@@ -1184,7 +1417,7 @@ impl Session {
     /// Number of `Weak` member-pgrp slots currently held. Includes
     /// stale entries pointing to dropped groups.
     pub fn member_slot_count(&self) -> usize {
-        self.members.lock().len()
+        self.members.len()
     }
 
     /// Snapshot the controlling TTY's `Cap` if it's still live. `None`
@@ -1230,15 +1463,10 @@ impl Session {
         guard: &step_engine::Guard<'_>,
     ) -> Option<Cap<ProcessGroup>> {
         let leader_pgid = Pgid(self.sid.0);
-        for weak in self.members.lock().iter() {
-            let Some(pgrp) = weak.upgrade(guard) else {
-                continue;
-            };
-            if pgrp.pgid == leader_pgid {
-                return Some(pgrp);
-            }
-        }
-        None
+        self.members
+            .snapshot_live(guard)
+            .into_iter()
+            .find(|pgrp| pgrp.pgid == leader_pgid)
     }
 }
 
@@ -1254,6 +1482,7 @@ unsafe impl ZoneAllocated for ProcessIdentity {
 }
 
 unsafe impl ZoneAllocated for ProcessPayload {
+    type Policy = PayloadPolicy<Self>;
     fn zone() -> &'static Zone<Self> {
         &PROCESS_PAYLOAD_ZONE
     }
@@ -1271,18 +1500,11 @@ unsafe impl ZoneAllocated for Session {
     }
 }
 
-/// Simple atomic PID allocator. PID 1 is reserved for init; allocator
-/// starts at 2. PidNamespace and reuse-after-reap policy land later.
-static NEXT_PID: AtomicU32 = AtomicU32::new(2);
-
-pub fn allocate_pid() -> Pid {
-    Pid(NEXT_PID.fetch_add(1, Ordering::Relaxed))
-}
+// Simple atomic PID allocator. PID 1 is reserved for init; allocator
+// PID/TID allocation moved to `crate::process::numbers`.
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn reset_pid_counter_for_test() {
-    NEXT_PID.store(2, Ordering::Relaxed);
-}
+pub use crate::process::numbers::reset_pid_counter_for_test;
 
 #[cfg(test)]
 mod subject_identity_tests {

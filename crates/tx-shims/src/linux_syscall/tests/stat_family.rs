@@ -494,19 +494,12 @@ fn dispatch_chdir_to_regular_file_returns_neg_enotdir() {
     drop(path);
 }
 
-/// `fchdir(fd)` returns `-ENOSYS` (Slice 6 carryover; OpenFile
-/// has no DEntry hint to install via step_chdir).
-#[test]
-fn dispatch_fchdir_returns_neg_enosys() {
-    let _setup = stat_setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap, thread);
-
-    let req = SyscallRequest::new(NR_FCHDIR, [0, 0, 0, 0, 0, 0]);
-    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(E_NOSYS));
-}
+// Removed: `dispatch_fchdir_returns_neg_enosys`. The Slice 6 carryover
+// ENOSYS path was lifted when `OpenFile::opendir_dentry` and
+// `step_chdir` learned to round-trip the DEntry hint; the dispatch arm
+// now reports `-EBADF` for fd 0 (no open dir) rather than `-ENOSYS`.
+// The success path is exercised by integration tests once a directory
+// fd exists in the fd table.
 
 // -----------------------------------------------------------------
 // getcwd

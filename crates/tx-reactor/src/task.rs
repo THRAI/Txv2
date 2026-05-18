@@ -3,12 +3,20 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{future::Future, pin::Pin, task::Waker};
 
+use tx_substrate::wake::mailbox::TaskMailbox;
+
 use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect, AstSlot},
     scheduler::StopReason,
     waker::{task_waker, TaskWakeState},
 };
 
+// Per REACTOR_v0 §Submission: submitted futures must be `Send + 'static`.
+// Substrate's `Guard<'_>` is intentionally `!Send`/`!Sync` (EBR-7); StepOps
+// that hold `&Guard` are confined to synchronous `drive_oneshot` paths and
+// must not be carried across `.await`. The async `drive(...).await` path
+// instead uses StepOps that acquire their own guard inside `step()` per
+// STEP_MODEL_v2 §1, so the boxed future remains `Send`.
 pub(crate) type TaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -93,6 +101,9 @@ pub(crate) struct Task {
     pub(crate) status: TaskStatus,
     pub(crate) wake_state: Arc<TaskWakeState>,
     pub(crate) ast: AstSlot,
+    /// Per-task wake delivery queue for yield resolution.
+    /// Owned by the reactor task; borrowed by `drive()` via `ScriptCtx`.
+    pub(crate) mailbox: Arc<TaskMailbox>,
     last_ast_batch: AstBatch,
     pub(crate) last_stop_reason: Option<StopReason>,
 }
@@ -109,6 +120,7 @@ impl Task {
             status: TaskStatus::Runnable,
             wake_state: Arc::new(TaskWakeState::new()),
             ast: AstSlot::new(),
+            mailbox: Arc::new(TaskMailbox::new()),
             last_ast_batch: AstBatch::default(),
             last_stop_reason: None,
         }
@@ -182,6 +194,12 @@ impl TaskTable {
     pub fn waker(&self, handle: TaskKey) -> Result<Waker, TaskLifecycleError> {
         let task = self.live_nonterminal_task(handle)?;
         Ok(task_waker(Arc::clone(&task.wake_state)))
+    }
+
+    /// Returns a clone of the task's `TaskMailbox` for yield resolution (drive-taskmb).
+    pub fn mailbox(&self, handle: TaskKey) -> Result<Arc<TaskMailbox>, TaskLifecycleError> {
+        let task = self.live_nonterminal_task(handle)?;
+        Ok(Arc::clone(&task.mailbox))
     }
 
     pub fn queue_ast_marker(
@@ -371,4 +389,67 @@ impl Default for TaskTable {
 
 const fn is_terminal(status: TaskStatus) -> bool {
     matches!(status, TaskStatus::Completed | TaskStatus::Cancelled)
+}
+
+// ---------------------------------------------------------------------------
+// Per-hart current-task mailbox slot (drive-taskmb trampoline injection)
+// ---------------------------------------------------------------------------
+
+use crate::spin_lock::SpinLock;
+
+/// Global slot holding the currently-polling task's mailbox.
+/// Set by the reactor before each `future.poll()`, cleared after.
+/// Read by `run_thread` (or any trampoline) to inject into `SyscallCtx`.
+static CURRENT_MAILBOX: SpinLock<Option<Arc<TaskMailbox>>> = SpinLock::new(None);
+
+/// Set the current task's mailbox (called by reactor before poll).
+pub(crate) fn set_current_mailbox(mailbox: Option<Arc<TaskMailbox>>) {
+    *CURRENT_MAILBOX.lock() = mailbox;
+}
+
+/// Read the current task's mailbox (called by trampoline / `run_thread`).
+pub fn current_task_mailbox() -> Option<Arc<TaskMailbox>> {
+    CURRENT_MAILBOX.lock().clone()
+}
+
+// -----------------------------------------------------------------------
+// drive-taskmb: timer wheel trampoline (same pattern as CURRENT_MAILBOX)
+// -----------------------------------------------------------------------
+
+use tx_substrate::wake::timer::TimerWheel;
+
+/// Set by the reactor before each `future.poll()`, cleared after.
+/// Read by `run_thread` to inject into `SyscallCtx` for `OnTimer` yield
+/// resolution via `resolve_on_timer`.
+static CURRENT_TIMER_WHEEL: SpinLock<Option<TimerWheel>> = SpinLock::new(None);
+
+/// Set the current reactor's timer wheel (called by reactor before poll).
+pub(crate) fn set_current_timer_wheel(wheel: Option<TimerWheel>) {
+    *CURRENT_TIMER_WHEEL.lock() = wheel;
+}
+
+/// Read the current reactor's timer wheel (called by trampoline / `run_thread`).
+pub fn current_timer_wheel() -> Option<TimerWheel> {
+    CURRENT_TIMER_WHEEL.lock().clone()
+}
+
+// -----------------------------------------------------------------------
+// drive-taskmb: delegate registry trampoline
+// -----------------------------------------------------------------------
+
+use tx_substrate::step::DelegateRegistry;
+
+/// Set by the reactor before each `future.poll()`, cleared after.
+/// Read by `run_thread` to inject into `SyscallCtx` for `OnAgent` yield
+/// resolution via `resolve_on_agent`.
+static CURRENT_DELEGATE_REGISTRY: SpinLock<Option<Arc<DelegateRegistry>>> = SpinLock::new(None);
+
+/// Set the current reactor's delegate registry (called by reactor before poll).
+pub(crate) fn set_current_delegate_registry(registry: Option<Arc<DelegateRegistry>>) {
+    *CURRENT_DELEGATE_REGISTRY.lock() = registry;
+}
+
+/// Read the current reactor's delegate registry (called by trampoline / `run_thread`).
+pub fn current_delegate_registry() -> Option<Arc<DelegateRegistry>> {
+    CURRENT_DELEGATE_REGISTRY.lock().clone()
 }

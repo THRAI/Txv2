@@ -26,19 +26,22 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step", "zone", "epoch"],
-    reason = "expose substrate step engine (StepOp/StepOutcome, RestrictionStackHandle, SubjectIdentity), EBR guard, zone role types (Cap/PayloadCap/Weak/IdentRef/Entity), and lock primitives (SpinMutex/AtomicSlot) used by process identity, payload, group, session, and the seven fork/exit/wait/chdir/getcwd/setpgid/setsid step ops"
+    apis = ["step", "zone", "epoch", "bus"],
+    reason = "expose substrate step engine (StepOp/StepOutcome, RestrictionStackHandle, SubjectIdentity), EBR guard, zone role types (Cap/PayloadCap/Weak/IdentRef/Entity), bus primitives (RawPort/RawQueue for signal_port/exit_source wires), and lock primitives (SpinMutex/AtomicSlot) used by process identity, payload, group, session, and the seven fork/exit/wait/chdir/getcwd/setpgid/setsid step ops"
 )]
 pub mod step_engine {
+    pub use tx_substrate::bus::{RawPort, RawQueue};
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
-        InterestMask, NoProgress, RestrictionStackHandle, ScriptCtx, StepOp, StepOutcome,
-        SubjectIdentity, WaitSourceId,
+        drive_oneshot, Errno, InterestMask, NoProgress, OneShotStepOp, RestrictionStackHandle,
+        ScriptCtx, StepOp, StepOutcome, SubjectIdentity, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        sign, Cap, Dead, Entity, IdentRef, OperationalCapExt, PayloadCap, Weak, Zone,
-        ZoneAllocated, ZoneError,
+        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
+        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
+        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
+        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
     pub use tx_substrate::{AtomicSlot, SpinMutex};
 }

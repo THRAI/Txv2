@@ -149,6 +149,10 @@ STEP-4. **Mutating steps follow the five-stage discipline:** observe → upgrade
 
 STEP-5 through STEP-10. **Preserved from v4** with mechanical rephrase to refer to the four-variant outcome and the typed StepOp trait. See `03_STEP_MODEL_v2 §10` for the antipattern catalog (A-1 through A-15) that operationalizes them.
 
+STEP-11. **A OneShotStepOp terminates on its first step invocation.** The first call to `step()` must return `Done(T)` or `Err(Errno)`. Returning `Continue` or `Yield` is a kernel invariant violation, not a user-visible `EAGAIN`. This is stronger than the `Nonblocking` driver mode (which translates unexpected yields to `EAGAIN`). Detail in `03_STEP_MODEL_v2 §5.3`.
+
+STEP-12. **A OneShotStepOp has no resume protocol.** A `OneShotStepOp` must not depend on `apply_resume`, `WaitProtocol`, `ActiveWait`, or `DriverMode` translation. It does not register on a `WaitSource` or `DelegateEndpoint`. Its `step()` body must be a single synchronous guard-scoped region that terminates without external notification.
+
 ---
 
 ## SCRIPT — extended with upper/lower split
@@ -162,6 +166,10 @@ SCRIPT-V5-1. **A script's upper half does signifier resolution / authority check
 SCRIPT-V5-2. **The upper half terminates with one of: a successful `Cap<T>` for the resolved object, a typed errno, or a yield.** Lower-half StepOps consume the upper half's output as their constructor input.
 
 SCRIPT-V5-3. **A point-of-no-return (e.g., execve PoNR) marks where authority replacement (SUBJ-3) crosses, after which lower-half failure must be fatal-only or explicitly deferred.**
+
+SCRIPT-V5-4. **Every syscall entry is classified into exactly one dispatch lane.** The three lanes are `ImmediateSyscall` (no StepOp, no drive, non-yielding by construction), `OneShotStepOp` (StepOp with drive_oneshot, terminates on first step), and `FullDriveScript` (async drive, may yield). The classification is explicit at the dispatch site. Detail in `04_SYSCALL_SHAPE_v1 §6`.
+
+SCRIPT-V5-5. **An ImmediateSyscall body must not call drive, drive_oneshot, construct a StepOutcome or YieldShape, or enter any helper that may yield.** An `ImmediateSyscall` may acquire short-lived guards for reading subject/process state; the guard must be dropped before return and no guard handle may escape the call. Lint rule: `ImmediateSyscall::call()` bodies flagged for `.await`, `drive(`, `drive_oneshot(`, `StepOutcome`, `YieldShape`, `WaitSource`, `DelegateEndpoint`, or VFS/VM resolution calls.
 
 ---
 

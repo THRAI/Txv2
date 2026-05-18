@@ -9,7 +9,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::vfs::adapter::step_engine::{self, Cap, Weak, Zone, ZoneAllocated, ZoneError};
 use crate::vfs::adapter::wait_routing::{self, Channel, WaitSource};
@@ -17,12 +17,15 @@ use crate::vfs::adapter::wait_routing::{self, Channel, WaitSource};
 use crate::aio::AioContext;
 use crate::cred::{CapabilitySet, Cred};
 use crate::device::{BlockDeviceRegistration, CharDeviceBinding};
+use crate::epoll::Epoll;
+use crate::eventfd::EventFd;
 use crate::execution::Errno;
 use crate::io_uring::IoUring;
 use crate::mount::{MountIdentity, MountPayload};
 use crate::page_backed::PageContainer;
 use crate::process::{ProcessGroup, ProcessIdentity};
 use crate::signalfd::SignalFd;
+use crate::timerfd::TimerFd;
 use crate::tty::execution::IoctlSideEffect;
 use crate::tty::structure::TtyIdentity;
 use crate::tty::structure::{Termios, Winsize};
@@ -886,6 +889,23 @@ pub enum OpenFileBacking {
     /// borrow body observes the cooperative-cancel reason and the
     /// kthread aborts.
     IoUring { ring: Cap<IoUring> },
+    /// `epoll_create1(2)` open file (Phase B.1). The cap is the
+    /// substrate-side [`Epoll`] identity used to route readiness
+    /// notifications via `YieldShape::OnEdge`.
+    Epoll { ep: Cap<Epoll> },
+    /// `eventfd(2)` open file. The cap is the substrate-side
+    /// [`EventFd`] identity carrying a 64-bit counter.  Read drains
+    /// the counter; write adds to it.  Drop semantics: when the last
+    /// `Cap<OpenFile>` for an eventfd is released and EBR retires
+    /// this slot, the inner `Cap<EventFd>` drops too — no side
+    /// effects (eventfd has no external registrations to clean up).
+    Eventfd { efd: Cap<EventFd> },
+    /// `timerfd_create(2)` open file. The cap is the substrate-side
+    /// [`TimerFd`] identity carrying a deadline and expiration
+    /// counter.  Read returns the number of expirations since the
+    /// last read.  Drop semantics: same as eventfd — the inner
+    /// `Cap<TimerFd>` drops via EBR with no external cleanup needed.
+    Timerfd { tfd: Cap<TimerFd> },
 }
 
 /// Per-fd file-position carrier.
@@ -921,6 +941,15 @@ pub struct OpenFile {
     /// directory streams.
     readdir_cursor: AtomicU64,
     pub(crate) flags: OpenFileFlags,
+    /// Runtime `O_NONBLOCK` override set via `fcntl(F_SETFL)`.
+    nonblocking_override: AtomicBool,
+    /// Best-effort DEntry hint set by `step_open`. `None` for
+    /// non-VFS shapes (ufd, aio, etc.). Used by `fchdir`.
+    opendir_dentry: Option<Cap<DEntry>>,
+
+    /// Advisory file lock state: 0 = unlocked, non-zero = exclusive-locked.
+    /// Per open-file-description, not per-inode (POSIX flock semantics).
+    flock_state: core::sync::atomic::AtomicU64,
 }
 
 impl OpenFile {
@@ -929,12 +958,27 @@ impl OpenFile {
             backing: OpenFileBacking::Rnode { rnode },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
             flags,
+            opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
     pub fn new_cap(rnode: Cap<RNode>, flags: OpenFileFlags) -> Result<Cap<Self>, ZoneError> {
         step_engine::sign(Self::new(rnode, flags))
+    }
+
+    /// Like [`Self::new_cap`] but also records the DEntry that
+    /// `step_open` resolved so `fchdir` can recover it later.
+    pub fn new_cap_with_dentry(
+        rnode: Cap<RNode>,
+        flags: OpenFileFlags,
+        dentry: Cap<DEntry>,
+    ) -> Result<Cap<Self>, ZoneError> {
+        let mut file = Self::new(rnode, flags);
+        file.opendir_dentry = Some(dentry);
+        step_engine::sign(file)
     }
 
     /// Construct a userfaultfd-backed `OpenFile` (PR-10 phase 0). The
@@ -948,7 +992,10 @@ impl OpenFile {
             backing: OpenFileBacking::Ufd { ufd },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
             flags,
+            opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -965,6 +1012,7 @@ impl OpenFile {
     /// Construct an AIO-context-backed `OpenFile` (PR-11 phase 1). The
     /// resulting value carries `OpenFileBacking::AioContext { ctx }`
     /// and no `Cap<RNode>` — AIO contexts are a non-VFS fd kind
+    #[allow(clippy::too_many_arguments)]
     /// (joining ufd in the OpenFileBacking enum, see D8 §4.1).
     /// Existing VFS-only paths (`step_read` / `step_write` /
     /// `step_lseek` / etc.) must not be called against this shape;
@@ -974,7 +1022,10 @@ impl OpenFile {
             backing: OpenFileBacking::AioContext { ctx },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
             flags,
+            opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -997,7 +1048,10 @@ impl OpenFile {
             backing: OpenFileBacking::SignalFd { sfd },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
             flags,
+            opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1007,6 +1061,72 @@ impl OpenFile {
         flags: OpenFileFlags,
     ) -> Result<Cap<Self>, ZoneError> {
         step_engine::sign(Self::new_signalfd(sfd, flags))
+    }
+
+    /// Construct an epoll-backed `OpenFile` (Phase B.1).
+    /// The resulting value carries `OpenFileBacking::Epoll { ep }`
+    /// and no `Cap<RNode>` — epoll instances are a non-VFS fd kind.
+    pub fn new_epoll(ep: Cap<Epoll>, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::Epoll { ep },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
+            flags,
+            opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Zone-sign a fresh epoll-backed `OpenFile` (Phase B.1).
+    pub fn new_epoll_cap(ep: Cap<Epoll>, flags: OpenFileFlags) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_epoll(ep, flags))
+    }
+
+    /// Construct an eventfd-backed `OpenFile`.
+    /// The resulting value carries `OpenFileBacking::Eventfd { efd }`
+    /// and no `Cap<RNode>`.
+    pub fn new_eventfd(efd: Cap<EventFd>, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::Eventfd { efd },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
+            flags,
+            opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Zone-sign a fresh eventfd-backed `OpenFile`.
+    pub fn new_eventfd_cap(
+        efd: Cap<EventFd>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_eventfd(efd, flags))
+    }
+
+    /// Construct a timerfd-backed `OpenFile`.
+    /// The resulting value carries `OpenFileBacking::Timerfd { tfd }`
+    /// and no `Cap<RNode>`.
+    pub fn new_timerfd(tfd: Cap<TimerFd>, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::Timerfd { tfd },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
+            flags,
+            opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Zone-sign a fresh timerfd-backed `OpenFile`.
+    pub fn new_timerfd_cap(
+        tfd: Cap<TimerFd>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_timerfd(tfd, flags))
     }
 
     /// Construct an io_uring-backed `OpenFile` (future PR-12 phase 0 —
@@ -1020,7 +1140,10 @@ impl OpenFile {
             backing: OpenFileBacking::IoUring { ring },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
             flags,
+            opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1065,11 +1188,76 @@ impl OpenFile {
                 "OpenFile::rnode() called on a signalfd-backed OpenFile; \
                  dispatch via OpenFile::backing() / OpenFile::signalfd() first",
             ),
+            OpenFileBacking::Epoll { .. } => panic!(
+                "OpenFile::rnode() called on an epoll-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::epoll() first",
+            ),
             OpenFileBacking::IoUring { .. } => panic!(
                 "OpenFile::rnode() called on an io_uring-backed OpenFile; \
                  dispatch via OpenFile::backing() / OpenFile::io_uring() first",
             ),
+            OpenFileBacking::Eventfd { .. } => panic!(
+                "OpenFile::rnode() called on an eventfd-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::eventfd() first",
+            ),
+            OpenFileBacking::Timerfd { .. } => panic!(
+                "OpenFile::rnode() called on a timerfd-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::timerfd() first",
+            ),
         }
+    }
+
+    /// Return the DEntry hint set by step_open.  Used by fchdir.
+    pub fn opendir_dentry(&self) -> Option<Cap<DEntry>> {
+        self.opendir_dentry.clone()
+    }
+
+    /// Acquire an advisory file lock (POSIX flock).
+    ///
+    /// Returns `Ok(())` on success, `Err(EWOULDBLOCK)` if
+    /// non-blocking and another holder has the lock.
+    /// `lock_type`: `LOCK_SH` (1) or `LOCK_EX` (2).
+    /// `blocking`: `false` = `LOCK_NB`.
+    pub fn flock_acquire(
+        &self,
+        _lock_type: u32,
+        blocking: bool,
+    ) -> Result<(), crate::execution::Errno> {
+        // v1: exclusive-only, per-open-file-description.
+        // Any shared lock maps to exclusive.
+        if blocking {
+            // Simple spin-wait for v1.
+            loop {
+                if self
+                    .flock_state
+                    .compare_exchange(
+                        0,
+                        1,
+                        core::sync::atomic::Ordering::Acquire,
+                        core::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+        } else {
+            self.flock_state
+                .compare_exchange(
+                    0,
+                    1,
+                    core::sync::atomic::Ordering::Acquire,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .map_err(|_| crate::execution::Errno::EAGAIN)?;
+            Ok(())
+        }
+    }
+
+    /// Release a held advisory lock.
+    pub fn flock_release(&self) {
+        self.flock_state
+            .store(0, core::sync::atomic::Ordering::Release);
     }
 
     /// `Some(&Cap<UserfaultFd>)` iff this `OpenFile` is the
@@ -1084,7 +1272,10 @@ impl OpenFile {
             OpenFileBacking::Rnode { .. }
             | OpenFileBacking::AioContext { .. }
             | OpenFileBacking::SignalFd { .. }
-            | OpenFileBacking::IoUring { .. } => None,
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. } => None,
         }
     }
 
@@ -1101,7 +1292,10 @@ impl OpenFile {
             OpenFileBacking::Rnode { .. }
             | OpenFileBacking::Ufd { .. }
             | OpenFileBacking::SignalFd { .. }
-            | OpenFileBacking::IoUring { .. } => None,
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. } => None,
         }
     }
 
@@ -1117,7 +1311,40 @@ impl OpenFile {
             OpenFileBacking::Rnode { .. }
             | OpenFileBacking::Ufd { .. }
             | OpenFileBacking::AioContext { .. }
-            | OpenFileBacking::IoUring { .. } => None,
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. } => None,
+        }
+    }
+
+    /// `Some(&Cap<EventFd>)` iff this `OpenFile` is the eventfd-backed
+    /// shape.  Returns `None` for every non-eventfd `OpenFile`.
+    pub fn eventfd(&self) -> Option<&Cap<EventFd>> {
+        match &self.backing {
+            OpenFileBacking::Eventfd { efd } => Some(efd),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::Ufd { .. }
+            | OpenFileBacking::AioContext { .. }
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Timerfd { .. } => None,
+        }
+    }
+
+    /// `Some(&Cap<TimerFd>)` iff this `OpenFile` is the timerfd-backed
+    /// shape.  Returns `None` for every non-timerfd `OpenFile`.
+    pub fn timerfd(&self) -> Option<&Cap<TimerFd>> {
+        match &self.backing {
+            OpenFileBacking::Timerfd { tfd } => Some(tfd),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::Ufd { .. }
+            | OpenFileBacking::AioContext { .. }
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. } => None,
         }
     }
 
@@ -1134,7 +1361,10 @@ impl OpenFile {
             OpenFileBacking::Rnode { .. }
             | OpenFileBacking::Ufd { .. }
             | OpenFileBacking::AioContext { .. }
-            | OpenFileBacking::SignalFd { .. } => None,
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. } => None,
         }
     }
 
@@ -1166,8 +1396,16 @@ impl OpenFile {
         self.offset.fetch_add(delta, Ordering::AcqRel) + delta
     }
 
-    pub const fn flags(&self) -> OpenFileFlags {
-        self.flags
+    pub fn flags(&self) -> OpenFileFlags {
+        let mut f = self.flags;
+        if self.nonblocking_override.load(Ordering::Acquire) {
+            f.nonblocking = true;
+        }
+        f
+    }
+
+    pub fn set_nonblocking(&self, val: bool) {
+        self.nonblocking_override.store(val, Ordering::Release);
     }
 
     /// Snapshot the per-fd readdir cursor.

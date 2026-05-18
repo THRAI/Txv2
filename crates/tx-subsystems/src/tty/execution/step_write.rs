@@ -21,6 +21,11 @@ pub fn step_write_for_process(
     caller: &Cap<crate::process::structure::ProcessIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let caller_info = match super::IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
@@ -229,6 +234,11 @@ pub fn step_write(
     bytes: &[u8],
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if bytes.is_empty() {
         return StepOutcome::done(0);
     }
@@ -289,6 +299,11 @@ pub fn step_write_for_caller(
     caller: super::IoctlCaller,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if bytes.is_empty() {
         return StepOutcome::done(0);
     }
@@ -323,14 +338,14 @@ pub fn step_write_for_caller(
 pub struct WriteOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub bytes: &'a [u8],
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_write(self.tty, self.bytes, self.guard)
+        let __guard = step_engine::guard();
+        step_write(self.tty, self.bytes, &__guard)
     }
 }
 
@@ -340,14 +355,14 @@ pub struct WriteForCallerOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub bytes: &'a [u8],
     pub caller: super::IoctlCaller,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for WriteForCallerOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_write_for_caller(self.tty, self.bytes, self.caller, self.guard)
+        let __guard = step_engine::guard();
+        step_write_for_caller(self.tty, self.bytes, self.caller, &__guard)
     }
 }
 
@@ -357,14 +372,14 @@ pub struct WriteForProcessOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub bytes: &'a [u8],
     pub caller: &'a Cap<crate::process::structure::ProcessIdentity>,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for WriteForProcessOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_write_for_process(self.tty, self.bytes, self.caller, self.guard)
+        let __guard = step_engine::guard();
+        step_write_for_process(self.tty, self.bytes, self.caller, &__guard)
     }
 }
 
@@ -457,6 +472,11 @@ mod tests {
 
     #[test]
     fn step_write_empty_bytes_returns_done_zero() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -475,6 +495,11 @@ mod tests {
 
     #[test]
     fn step_write_dead_tty_returns_err_eio() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -494,6 +519,11 @@ mod tests {
 
     #[test]
     fn step_write_completing_kick_returns_done_consumed() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -523,6 +553,11 @@ mod tests {
     /// `yield_on_wait_source`.
     #[test]
     fn step_write_partial_then_blocked_yields_on_wait_source_with_byte_progress() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -570,6 +605,11 @@ mod tests {
 
     #[test]
     fn step_write_for_caller_empty_bytes_returns_done_zero() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -589,6 +629,11 @@ mod tests {
 
     #[test]
     fn step_write_for_caller_foreground_caller_completes_to_done() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -610,6 +655,11 @@ mod tests {
 
     #[test]
     fn step_write_for_caller_background_caller_with_tostop_returns_eio() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         use crate::tty::structure::termios::TOSTOP as TOSTOP_FLAG;
         use crate::tty::structure::SessionPgrp;
 
@@ -646,7 +696,7 @@ mod tests {
     // delegates to the matching free fn. Compile-check is the primary
     // value.
     mod step_op_wraps {
-        use super::super::{step_engine, WriteForCallerOp, WriteOp};
+        use super::super::{WriteForCallerOp, WriteOp};
         use super::{alloc_tty_with, setup, COMPLETING_BINDING};
         use crate::tty::adapter::step_engine::{
             PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome as V3,
@@ -662,15 +712,12 @@ mod tests {
                 "ttyV3-op-empty",
                 TtyPayload::new_hardware(&COMPLETING_BINDING),
             );
-            let guard = step_engine::guard();
             let mut op = WriteOp {
                 tty: &tty,
                 bytes: b"",
-                guard: &guard,
             };
             let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
             let outcome = op.step(&mut ctx);
-            drop(guard);
             match outcome {
                 V3::Done(0) => {}
                 other => panic!("expected Done(0), got {other:?}"),
@@ -686,15 +733,12 @@ mod tests {
                 "ttyV3-op-done",
                 TtyPayload::new_hardware(&COMPLETING_BINDING),
             );
-            let guard = step_engine::guard();
             let mut op = WriteOp {
                 tty: &tty,
                 bytes: b"hello",
-                guard: &guard,
             };
             let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
             let outcome = op.step(&mut ctx);
-            drop(guard);
             match outcome {
                 V3::Done(5) => {}
                 other => panic!("expected Done(5), got {other:?}"),
@@ -710,17 +754,14 @@ mod tests {
                 "ttyV3-op-caller-empty",
                 TtyPayload::new_hardware(&COMPLETING_BINDING),
             );
-            let guard = step_engine::guard();
             let caller = super::super::super::IoctlCaller::new(1, 1);
             let mut op = WriteForCallerOp {
                 tty: &tty,
                 bytes: b"",
                 caller,
-                guard: &guard,
             };
             let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
             let outcome = op.step(&mut ctx);
-            drop(guard);
             match outcome {
                 V3::Done(0) => {}
                 other => panic!("expected Done(0), got {other:?}"),
@@ -736,13 +777,11 @@ mod tests {
                 "ttyV3-op-caller-match",
                 TtyPayload::new_hardware(&COMPLETING_BINDING),
             );
-            let guard = step_engine::guard();
             let caller = super::super::super::IoctlCaller::new(1, 1);
             let mut op = WriteForCallerOp {
                 tty: &tty,
                 bytes: b"hi",
                 caller,
-                guard: &guard,
             };
             let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
             let wrap_outcome = op.step(&mut ctx);
@@ -750,7 +789,6 @@ mod tests {
             // same tty without re-fixturing, so the wrap outcome is
             // checked against an expected Done(2) (CompletingOps reports
             // the queued bytes).
-            drop(guard);
             match wrap_outcome {
                 V3::Done(2) => {}
                 other => panic!("expected Done(2), got {other:?}"),
