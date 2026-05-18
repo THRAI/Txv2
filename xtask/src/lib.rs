@@ -95,6 +95,9 @@ fn print_usage() {
            cargo xtask image ext4 --profile busybox [--target rv64-qemu|la64-qemu] [--size 64M]\n\
            cargo xtask image m1dock-sd --profile busybox [--target rv64-m1dock-mock] [--size 64M]\n\
            cargo xtask oscomp doctor|prepare|submit|run|qemu\n\
+           cargo xtask oscomp score [--target rv64-qemu|la64-qemu] [--input FILE] [--suite SUITE] [--data DIR] [--dry-run]\n\
+           cargo xtask oscomp list-suites [--target rv64-qemu|la64-qemu] [--data DIR]\n\
+           cargo xtask oscomp test --target rv64-qemu|la64-qemu [--suite SUITE] [--skip-build] [--data DIR] [--dry-run]\n\
            cargo xtask submit k210 [--out target/submit/k210]\n\
            cargo xtask progress validate\n\
            cargo xtask progress list plans|handoffs|worktrees|all [--json]\n\

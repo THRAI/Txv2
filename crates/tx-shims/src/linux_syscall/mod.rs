@@ -175,7 +175,8 @@ pub use numbers::{
     NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SIGALTSTACK, NR_SIGNALFD, NR_SIGNALFD4, NR_STATFS,
     NR_STATX, NR_SYMLINKAT, NR_SYNC, NR_SYNCFS, NR_TGKILL, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME,
     NR_TIMERFD_SETTIME, NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UMOUNT2, NR_UNAME,
-    NR_UNLINKAT, NR_USERFAULTFD, NR_UTIMENSAT, NR_WAIT4, NR_WRITE, NR_WRITEV, O_ACCMODE, O_APPEND,
+    NR_UNLINKAT, NR_USERFAULTFD, NR_UTIMENSAT, NR_WAIT4, NR_WRITE, NR_WRITEV, NR_SYSLOG,
+    O_ACCMODE, O_APPEND,
     O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
     PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, RENAME_EXCHANGE,
     RENAME_NOREPLACE, RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA,
@@ -559,6 +560,9 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         nr if nr == NR_FTRUNCATE => sys_ftruncate(req.args, ctx).await,
         nr if nr == NR_READLINKAT => sys_readlinkat(req.args, ctx).await,
         nr if nr == NR_RENAMEAT2 => sys_renameat2(req.args, ctx).await,
+        // syslog(2) / klogctl — kernel ring-buffer read/control.
+        // Stubbed: type 2 (READ) returns 0 bytes so `dmesg(1)` exits 0.
+        nr if nr == NR_SYSLOG => sys_syslog(req.args, ctx),
         // PR-10 phase 2 — `userfaultfd(2)` scaffold. Mints a fresh
         // `Cap<UserfaultFd>` (W-Q phase 0 zone), wraps in an
         // `OpenFile` with `OpenFileBacking::Ufd`, installs in the fd

@@ -19,7 +19,10 @@ const OSCOMP_SDCARD_LA_URL: &str =
 
 pub(crate) fn oscomp(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {
-        return Err("oscomp command needs doctor, prepare, submit, run, or qemu".into());
+        return Err(
+            "oscomp command needs doctor, prepare, submit, run, qemu, score, list-suites, or test"
+                .into(),
+        );
     };
     match kind.as_str() {
         "doctor" => oscomp_doctor(root),
@@ -27,8 +30,11 @@ pub(crate) fn oscomp(root: &Path, args: Vec<String>) -> Result<()> {
         "submit" => oscomp_submit(root, &args[1..]),
         "run" => oscomp_run(root, &args[1..]),
         "qemu" => oscomp_qemu(root, &args[1..]),
+        "score" => oscomp_score(root, &args[1..]),
+        "list-suites" => oscomp_list_suites(root, &args[1..]),
+        "test" => oscomp_test(root, &args[1..]),
         other => Err(format!(
-            "unknown oscomp command '{other}', expected doctor, prepare, submit, run, or qemu"
+            "unknown oscomp command '{other}', expected doctor, prepare, submit, run, qemu, score, list-suites, or test"
         )),
     }
 }
@@ -292,6 +298,227 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
     } else {
         Err(format!("OSComp qemu exited with {status}"))
     }
+}
+
+/// Score an existing serial output file with the OSComp judge scripts.
+///
+/// Options:
+///   `--target rv64-qemu|la64-qemu`  Selects the default input file (default: rv64).
+///   `--input FILE`                  Override the input serial-output file.
+///   `--suite SUITE`                 Filter output to a single test suite.
+///   `--data DIR`                    Override the judge-scripts directory.
+///   `--dry-run`                     Print what would be scored and exit.
+fn oscomp_score(root: &Path, args: &[String]) -> Result<()> {
+    let data = oscomp_data_dir(root, args);
+    let suite_filter = optional_option_value(args, "--suite");
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+
+    let input = optional_option_value(args, "--input")
+        .map(PathBuf::from)
+        .map(|p| resolve_path(root, p))
+        .unwrap_or_else(|| {
+            let suffix = optional_option_value(args, "--target")
+                .map(|t| if t.starts_with("la") { "la" } else { "rv" })
+                .unwrap_or("rv");
+            root.join("target")
+                .join("oscomp")
+                .join(format!("os_serial_out_{suffix}.txt"))
+        });
+
+    let judge_py = root.join("tools").join("oscomp-judge.py");
+
+    println!("score: {} vs {}", input.display(), data.display());
+    if let Some(s) = &suite_filter {
+        println!("suite:  {s}");
+    }
+    if dry_run {
+        return Ok(());
+    }
+
+    if !judge_py.exists() {
+        return Err(format!(
+            "missing {}; ensure tools/oscomp-judge.py exists",
+            judge_py.display()
+        ));
+    }
+    if !input.exists() {
+        return Err(format!(
+            "missing serial output {}; run `cargo xtask oscomp qemu --target ...` first",
+            input.display()
+        ));
+    }
+    if !data.exists() {
+        return Err(format!(
+            "testdata dir {} not found; run `cargo xtask oscomp prepare` first",
+            data.display()
+        ));
+    }
+
+    let output = Command::new("python3")
+        .arg(&judge_py)
+        .arg(&input)
+        .arg(&data)
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("failed to run python3 {}: {e}", judge_py.display()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        eprint!("{stderr}");
+    }
+
+    if let Some(suite) = &suite_filter {
+        print_score_suite(&stdout, suite);
+    } else {
+        print!("{stdout}");
+    }
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!("judge exited with {}", output.status))
+    }
+}
+
+/// Print only the output block for `suite` plus the final total line.
+///
+/// The judge emits lines like:
+/// ```text
+/// [busybox-musl] 52/55
+///   ✓ ls  1/1
+///   ...
+///
+/// 总分: 62/65
+/// ```
+/// We capture just the requested group's block and the 总分 line.
+fn print_score_suite(output: &str, suite: &str) {
+    let mut in_suite = false;
+    let mut total_line: Option<&str> = None;
+
+    for line in output.lines() {
+        if line.starts_with('[') {
+            let group_end = line.find(']').unwrap_or(0);
+            in_suite = &line[1..group_end] == suite;
+            if in_suite {
+                println!("{line}");
+            }
+        } else if line.contains("总分") {
+            total_line = Some(line);
+        } else if in_suite {
+            println!("{line}");
+        }
+    }
+
+    if let Some(total) = total_line {
+        println!();
+        println!("{total}");
+    }
+}
+
+/// List available test suites found in the judge-scripts directory.
+///
+/// Options:
+///   `--target rv64-qemu|la64-qemu`  Hint which variant is primary for that platform.
+///   `--data DIR`                    Override the judge-scripts directory.
+fn oscomp_list_suites(root: &Path, args: &[String]) -> Result<()> {
+    let data = oscomp_data_dir(root, args);
+    let target_filter = optional_option_value(args, "--target");
+
+    if !data.exists() {
+        return Err(format!(
+            "testdata dir {} not found; run `cargo xtask oscomp prepare` first",
+            data.display()
+        ));
+    }
+
+    let mut suites: Vec<String> = fs::read_dir(&data)
+        .map_err(|e| e.to_string())?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().into_string().ok()?;
+            if name.starts_with("judge_") && name.ends_with(".py") {
+                Some(name["judge_".len()..name.len() - 3].to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    suites.sort();
+
+    if let Some(target) = &target_filter {
+        let hint = if target.starts_with("la") { "-glibc" } else { "-musl" };
+        println!(
+            "Suites in {} (primary variant for {target}: {hint}*):",
+            data.display()
+        );
+    } else {
+        println!("Suites in {}:", data.display());
+    }
+    for suite in &suites {
+        println!("  {suite}");
+    }
+    Ok(())
+}
+
+/// Build the kernel, run it against the OSComp sdcard, and score the results.
+///
+/// Options:
+///   `--target rv64-qemu|la64-qemu`  Required.
+///   `--suite SUITE`                 Filter the final score display to one suite.
+///   `--skip-build`                  Skip the full-build step.
+///   `--data DIR`                    Override the judge-scripts / sdcard directory.
+///   `--submit DIR`                  Override the submit directory.
+///   `--dry-run`                     Print commands without executing them.
+fn oscomp_test(root: &Path, args: &[String]) -> Result<()> {
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    let skip_build = args.iter().any(|a| a == "--skip-build");
+    let target_str = option_value(args, "--target")?;
+    let target = TxTarget::parse(&target_str)?;
+
+    if matches!(target, TxTarget::Rv64M1DockMock) {
+        return Err("oscomp test supports rv64-qemu and la64-qemu only".into());
+    }
+
+    let submit = optional_option_value(args, "--submit")
+        .map(PathBuf::from)
+        .map(|p| resolve_path(root, p))
+        .unwrap_or_else(|| root.join("target").join("oscomp").join("submit"));
+    let kernel_dest_name = match target {
+        TxTarget::Rv64Qemu => "kernel-rv",
+        TxTarget::La64Qemu => "kernel-la",
+        TxTarget::Rv64M1DockMock => unreachable!(),
+    };
+
+    // Step 1: full-build
+    if skip_build {
+        println!("==> [skip] full-build --target {target_str}");
+    } else {
+        println!("==> full-build --target {target_str}");
+        if !dry_run {
+            crate::full_build::full_build(
+                root,
+                vec!["--target".into(), target_str.clone(), "--skip-doctor".into()],
+            )?;
+        }
+    }
+
+    // Step 2: copy kernel to submit dir
+    println!("==> copy kernel → {}", submit.join(kernel_dest_name).display());
+    if !dry_run {
+        fs::create_dir_all(&submit).map_err(|e| e.to_string())?;
+        copy_kernel_for_oscomp(root, target, &submit.join(kernel_dest_name))?;
+    }
+
+    // Step 3: run QEMU (all suites from sdcard)
+    println!("==> oscomp qemu --target {target_str}");
+    oscomp_qemu(root, args)?;
+
+    // Step 4: score
+    println!("==> oscomp score --target {target_str}");
+    oscomp_score(root, args)?;
+
+    Ok(())
 }
 
 fn oscomp_data_dir(root: &Path, args: &[String]) -> PathBuf {
