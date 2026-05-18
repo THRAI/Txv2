@@ -155,6 +155,27 @@
   **Next step:** 按 Phase 1 先做行为保持型 `boot_asm.rs` / `trap_asm.rs`
   机械拆分，再引入 `boot_args.rs`。
 
+- 2026-05-18 **New xtask subcommands: `oscomp score`, `oscomp list-suites`, `oscomp test`.**
+  Added to `xtask/src/oscomp.rs`:
+  - `cargo xtask oscomp list-suites [--target rv64-qemu|la64-qemu] [--data DIR]` —
+    lists all 22 judge scripts (11 suites × musl/glibc) from the testdata directory.
+  - `cargo xtask oscomp score [--target rv64-qemu|la64-qemu] [--input FILE]
+    [--suite SUITE] [--data DIR] [--dry-run]` — runs `tools/oscomp-judge.py` against
+    an existing serial-output file; `--suite` filters display to one group.
+  - `cargo xtask oscomp test --target rv64-qemu|la64-qemu [--suite SUITE]
+    [--skip-build] [--data DIR] [--dry-run]` — chains full-build → kernel copy →
+    oscomp qemu → oscomp score in one command.
+  Updated `print_usage()` in `xtask/src/lib.rs` to document the new subcommands.
+
+  **Verification:** `cargo build -p xtask` clean; `cargo xtask oscomp list-suites`
+  shows 22 suites; `cargo xtask oscomp score --suite busybox-musl` correctly filters
+  output to busybox-musl block + 总分; `cargo xtask oscomp test --target rv64-qemu
+  --dry-run` prints all four step commands and exits.
+
+  **Next:** run `cargo xtask oscomp test --target rv64-qemu` for a fresh end-to-end
+  score using the new command; investigate libctest-musl / libcbench-musl (currently
+  0/N — may need syscall stubs or mount fixes similar to busybox-musl work).
+
 - 2026-05-18 **busybox-musl OSComp score: 52/55 on rv64-qemu.**
   Work on `cc/great-ptolemy-982e05`. Seven targeted fixes brought the score
   from the baseline (most file-operation tests failing) to 52/55.
