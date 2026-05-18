@@ -343,6 +343,11 @@ impl Drop for PipePayload {
     fn drop(&mut self) {
         wait_source::release_wait_channel(self.reader_wait_source_id);
         wait_source::release_wait_channel(self.writer_wait_source_id);
+        // Deregister the v3 WaitSources so the global registry does not
+        // hold stale entries after the pipe is gone (mirrors the legacy
+        // channel cleanup above).
+        wait_routing::unregister_source(self.reader_wait_source_id);
+        wait_routing::unregister_source(self.writer_wait_source_id);
     }
 }
 
