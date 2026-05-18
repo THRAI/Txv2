@@ -119,7 +119,10 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     // private-anon read fallback; mirror the vm-tests setup so the
     // tail of fault_script can complete.
     match tx_subsystems::vm::adapter::step_engine::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_subsystems::vm::adapter::step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
+        Ok(_)
+        | Err(
+            tx_subsystems::vm::adapter::step_engine::page_allocator::AllocError::AlreadyInstalled,
+        ) => {}
         Err(error) => panic!("claim zero frame: {error:?}"),
     }
     tx_test_support::drain_to_quiescence();

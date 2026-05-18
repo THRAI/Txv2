@@ -24,10 +24,15 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::{
-        Errno, InterestMask, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
-        StepProgress, SubjectIdentity, WaitSourceId, YieldShape,
+        Errno, InterestMask, NoProgress, OneShotStepOp, ProcessIdentity, ScriptCtx, StepOp,
+        StepOutcome, StepProgress, SubjectIdentity, WaitSourceId, YieldShape,
     };
-    pub use tx_substrate::zone::ZoneError;
+    pub use tx_substrate::zone::{
+        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
+        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
+        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
+        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
+    };
     pub use tx_substrate::SpinMutex;
 
     /// `futex(uaddr, FUTEX_WAIT, val, ...)` matched the value: park on
@@ -60,7 +65,9 @@ pub mod wait_routing {
     use alloc::sync::Arc;
 
     pub use tx_reactor::wait::{Channel, Mask};
-    pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};
+    pub use tx_substrate::wake::{
+        MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+    };
 
     /// Mint a `WaitSource` for one futex bucket, keyed by the
     /// bucket's `source_id` so the legacy `Channel` resolver and the
@@ -69,7 +76,9 @@ pub mod wait_routing {
     ///
     /// Delegates to `tx_substrate::wake::new_source`.
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
-        tx_substrate::wake::new_source(source_id)
+        let source = tx_substrate::wake::new_source(source_id);
+        tx_substrate::wake::register_source(Arc::clone(&source));
+        source
     }
 
     /// Fire the legacy `Channel` for one futex bucket — D2

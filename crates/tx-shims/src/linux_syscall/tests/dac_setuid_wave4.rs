@@ -1,10 +1,13 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
+use crate::adapter::step_engine::{
+    self as step_engine, guard as ebr_guard, page_allocator, reserve_for, sign_for, Cap,
+    StepOutcome,
+};
 use alloc::sync::Arc;
 use alloc::vec;
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
-use crate::adapter::step_engine::{self as step_engine, guard as ebr_guard, page_allocator, reserve_for, sign_for, Cap, StepOutcome};
 use tx_subsystems::cred::{step_setresuid, Capability, CapabilitySet, Uid};
 use tx_subsystems::cross_crate_test_support::{
     clear_caps_for_test, install_caps_for_test, set_cred_ids_for_test,
@@ -51,11 +54,20 @@ fn wave4_setup() -> TestSetup {
     setup
 }
 
+/// Holder returned by `build_tmpfs_root` — keeps the `MountIdentity`
+/// (and through it the `MountPayload`) alive for the duration of the
+/// test. The walker's `containing_mount_weak().upgrade(guard)` would
+/// otherwise observe a dropped payload and surface as a
+/// `"NoFsOps for ChmodOp"` panic from `vfs::composite`.
+struct TmpfsRoot {
+    dentry: Cap<DEntry>,
+    tmpfs: Arc<Tmpfs>,
+    _mount: Cap<MountIdentity>,
+}
+
 /// Build a fresh tmpfs-backed mount and a root `Cap<DEntry>`
-/// pointing at the tmpfs root inode. Returns the dentry plus the
-/// `Arc<Tmpfs>` so callers can mint files with specific
-/// `(uid, gid, mode)` directly through the FsOps surface.
-fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
+/// pointing at the tmpfs root inode.
+fn build_tmpfs_root() -> TmpfsRoot {
     let tmpfs = Arc::new(Tmpfs::new());
     let payload = MountPayload::new_cap(
         tmpfs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
@@ -79,7 +91,7 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
         sign_for(res, raw)
     };
 
-    let _mount = MountIdentity::new_cap(
+    let mount = MountIdentity::new_cap(
         MountId::new(11),
         None,
         root_rnode.clone(),
@@ -90,7 +102,11 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
     .expect("mount identity");
 
     let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
-    (root_dentry, tmpfs)
+    TmpfsRoot {
+        dentry: root_dentry,
+        tmpfs,
+        _mount: mount,
+    }
 }
 
 /// Devfs analog of `build_tmpfs_root`. Mounts the shipping
@@ -180,7 +196,9 @@ fn nul_terminate(path: &[u8]) -> Vec<u8> {
 #[test]
 fn dispatch_fchmodat_owner_succeeds() {
     let _setup = wave4_setup();
-    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let root = build_tmpfs_root();
+    let root_dentry = root.dentry.clone();
+    let tmpfs = root.tmpfs.clone();
     let owner_cred = Credential {
         uid: 1000,
         gid: 0,
@@ -223,7 +241,9 @@ fn dispatch_fchmodat_owner_succeeds() {
 #[test]
 fn dispatch_fchmodat_non_owner_returns_neg_eperm() {
     let _setup = wave4_setup();
-    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let root = build_tmpfs_root();
+    let root_dentry = root.dentry.clone();
+    let tmpfs = root.tmpfs.clone();
     // File owned by uid 1000.
     let owner_cred = Credential {
         uid: 1000,
@@ -278,7 +298,8 @@ fn dispatch_fchmodat_devfs_returns_neg_erofs() {
 #[test]
 fn dispatch_fchmodat_invalid_dirfd_returns_neg_ebadf() {
     let _setup = wave4_setup();
-    let (root_dentry, _tmpfs) = build_tmpfs_root();
+    let root = build_tmpfs_root();
+    let root_dentry = root.dentry.clone();
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
     let ctx = make_ctx(proc_cap, thread);
 
@@ -295,7 +316,8 @@ fn dispatch_fchmodat_invalid_dirfd_returns_neg_ebadf() {
 #[test]
 fn dispatch_fchmodat_path_too_long_returns_neg_enametoolong() {
     let _setup = wave4_setup();
-    let (root_dentry, _tmpfs) = build_tmpfs_root();
+    let root = build_tmpfs_root();
+    let root_dentry = root.dentry.clone();
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
     let ctx = make_ctx(proc_cap, thread);
 
@@ -321,7 +343,9 @@ fn dispatch_fchmodat_path_too_long_returns_neg_enametoolong() {
 #[test]
 fn dispatch_fchownat_unprivileged_to_self_succeeds() {
     let _setup = wave4_setup();
-    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let root = build_tmpfs_root();
+    let root_dentry = root.dentry.clone();
+    let tmpfs = root.tmpfs.clone();
     let owner_cred = Credential {
         uid: 1000,
         gid: 200,
@@ -376,7 +400,9 @@ fn dispatch_fchownat_unprivileged_to_self_succeeds() {
 #[test]
 fn dispatch_fchownat_unprivileged_to_other_returns_neg_eperm() {
     let _setup = wave4_setup();
-    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let root = build_tmpfs_root();
+    let root_dentry = root.dentry.clone();
+    let tmpfs = root.tmpfs.clone();
     let owner_cred = Credential {
         uid: 1000,
         gid: 0,
@@ -414,7 +440,9 @@ fn dispatch_fchownat_unprivileged_to_other_returns_neg_eperm() {
 #[test]
 fn dispatch_fchownat_minus_one_leaves_unchanged() {
     let _setup = wave4_setup();
-    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let root = build_tmpfs_root();
+    let root_dentry = root.dentry.clone();
+    let tmpfs = root.tmpfs.clone();
     let owner_cred = Credential {
         uid: 1000,
         gid: 200,
@@ -469,7 +497,9 @@ fn dispatch_fchownat_minus_one_leaves_unchanged() {
 #[test]
 fn dispatch_faccessat_existing_file_f_ok_returns_zero() {
     let _setup = wave4_setup();
-    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let root = build_tmpfs_root();
+    let root_dentry = root.dentry.clone();
+    let tmpfs = root.tmpfs.clone();
     let owner_cred = Credential {
         uid: 0,
         gid: 0,
@@ -505,7 +535,9 @@ fn dispatch_faccessat_existing_file_f_ok_returns_zero() {
 #[test]
 fn dispatch_faccessat_no_read_bit_returns_neg_eacces() {
     let _setup = wave4_setup();
-    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let root = build_tmpfs_root();
+    let root_dentry = root.dentry.clone();
+    let tmpfs = root.tmpfs.clone();
     // File owned by uid 1000, mode 0o000 (no perms anywhere).
     let owner_cred = Credential {
         uid: 1000,
@@ -544,7 +576,9 @@ fn dispatch_faccessat_no_read_bit_returns_neg_eacces() {
 #[test]
 fn dispatch_faccessat_dac_override_bypasses() {
     let _setup = wave4_setup();
-    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let root = build_tmpfs_root();
+    let root_dentry = root.dentry.clone();
+    let tmpfs = root.tmpfs.clone();
     // File owned by uid 1000, mode 0o000.
     let owner_cred = Credential {
         uid: 1000,
@@ -588,7 +622,9 @@ fn dispatch_faccessat_dac_override_bypasses() {
 #[test]
 fn dispatch_faccessat2_at_eaccess_uses_effective_uid() {
     let _setup = wave4_setup();
-    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let root = build_tmpfs_root();
+    let root_dentry = root.dentry.clone();
+    let tmpfs = root.tmpfs.clone();
     // File owned by uid 1000, mode 0o400 (owner-read only).
     let owner_cred = Credential {
         uid: 1000,
@@ -653,7 +689,9 @@ fn dispatch_faccessat2_at_eaccess_uses_effective_uid() {
 #[test]
 fn dispatch_faccessat2_no_x_bit_returns_neg_eacces_even_with_dac_override() {
     let _setup = wave4_setup();
-    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let root = build_tmpfs_root();
+    let root_dentry = root.dentry.clone();
+    let tmpfs = root.tmpfs.clone();
     // File mode 0o644 — no execute bit anywhere.
     let owner_cred = Credential {
         uid: 0,

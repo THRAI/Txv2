@@ -3,12 +3,12 @@ use core::convert::TryFrom;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::adapter::step_engine::{Cap, PayloadCap, SpinMutex};
 use alloc::sync::Arc;
 use tx_ext4_format::pager::{BlockImage, Ext4Pager, InodeMetaLite, InodeNo};
 use tx_ext4_format::Ext4FormatError;
-use tx_substrate::SpinMutex;
 use tx_subsystems::execution::Errno;
-use tx_subsystems::mount::MountPayloadPin;
+use tx_subsystems::mount::{MountPayload, MountPayloadPin};
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
@@ -18,18 +18,34 @@ pub(crate) const READDIR_WINDOW_ENTRIES: usize = 64;
 pub(crate) struct Ext4FsInstance<I> {
     pager: Ext4PagerCell<I>,
     pub(crate) mount_pin: SpinMutex<Option<MountPayloadPin>>,
+    /// Per-mount read-only flag. When `true`, every mutating
+    /// `FsOps` method (`create_inode`, `mkdir`, `unlink`, …) and
+    /// every page-cache writeback rejects with `EROFS`. The flag is
+    /// set at mount time by `mount_ext4_read_only`; the public
+    /// `mount_ext4_read_write` entry point clears it. Matches
+    /// Linux's `MS_RDONLY` semantics.
+    read_only: AtomicBool,
 }
 
 impl<I: BlockImage> Ext4FsInstance<I> {
-    pub(crate) fn open(image: I) -> Result<Arc<Self>, Errno> {
+    pub(crate) fn open(image: I, read_only: bool) -> Result<Arc<Self>, Errno> {
         Ok(Arc::new(Self {
             pager: Ext4PagerCell::new(Ext4Pager::open(image).map_err(map_format_error)?),
             mount_pin: SpinMutex::new(None),
+            read_only: AtomicBool::new(read_only),
         }))
     }
 
-    pub(crate) fn register_mount_pin(&self, pin: MountPayloadPin) {
-        *self.mount_pin.lock() = Some(pin);
+    pub(crate) fn bind_mount_payload(&self, payload: &Cap<MountPayload>) {
+        let payload = PayloadCap::from_cap(payload.clone());
+        *self.mount_pin.lock() = Some(MountPayloadPin::acquire(&payload));
+    }
+
+    /// Returns `true` when this mount was opened with `MS_RDONLY`
+    /// (or via `mount_ext4_read_only`). Mutating `FsOps` methods
+    /// consult this and short-circuit with `EROFS`.
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::Acquire)
     }
 
     pub(crate) fn with_pager<T>(

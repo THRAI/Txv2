@@ -47,8 +47,8 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use crate::adapter::step_engine::{AbortReason, DelegateRegistry, DelegateReply, DelegateTokenId};
 use crate::adapter::bus_wire::{agent_event_matches, MailboxEvent, TaskMailbox};
+use crate::adapter::step_engine::{AbortReason, DelegateRegistry, DelegateReply, DelegateTokenId};
 
 /// Outcome of [`await_agent_reply`]. Mirrors the `Replied` /
 /// non-`Replied` terminal split in the registry state machine: on
@@ -150,7 +150,9 @@ impl<'a> Future for AwaitAgentReply<'a> {
                     // `agent_event_matches` filtered these out above,
                     // but the exhaustive match keeps the compiler
                     // honest if a new variant lands later.
-                    MailboxEvent::SourceFired { .. } | MailboxEvent::SignalDelivered { .. } => {
+                    MailboxEvent::SourceFired { .. }
+                    | MailboxEvent::SignalDelivered { .. }
+                    | MailboxEvent::TimerFired { .. } => {
                         unreachable!(
                             "agent_event_matches must not return true for non-agent events"
                         )

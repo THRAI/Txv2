@@ -2,9 +2,9 @@
 
 use super::*;
 use crate::execution::Errno;
+use crate::page_backed::adapter::step_engine::{self as step_engine, StepOutcome as V3StepOutcome};
 use alloc::vec;
 use alloc::vec::Vec;
-use crate::page_backed::adapter::step_engine::{self as step_engine, StepOutcome as V3StepOutcome};
 
 fn setup_host_substrate() {
     tx_test_support::init_host();

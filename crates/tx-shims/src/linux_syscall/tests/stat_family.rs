@@ -1,10 +1,12 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
+use crate::adapter::step_engine::{
+    self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, StepOutcome,
+};
 use alloc::sync::Arc;
 use alloc::vec;
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
-use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, StepOutcome};
 use tx_subsystems::cred::CapabilitySet;
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
@@ -20,7 +22,7 @@ use tx_subsystems::vfs::{FsOps, OpenFile};
 
 use crate::linux_syscall::{
     AT_EMPTY_PATH, AT_FDCWD, NR_CHDIR, NR_FCHDIR, NR_FSTAT, NR_GETCWD, NR_GETDENTS64,
-    NR_NEWFSTATAT, NR_UMASK,
+    NR_NEWFSTATAT, NR_STATX, NR_UMASK,
 };
 
 /// errno magnitudes the tests check against (positive Linux RV64
@@ -47,6 +49,13 @@ const STAT_BLKSIZE_OFF: usize = 56;
 /// Total `struct stat` byte size on RV64 generic ABI: matches
 /// `size_of::<StatLayout>` per the field layout in `mod.rs`.
 const STAT_BYTES: usize = 128;
+const STATX_MASK_OFF: usize = 0;
+const STATX_BLKSIZE_OFF: usize = 4;
+const STATX_NLINK_OFF: usize = 16;
+const STATX_MODE_OFF: usize = 28;
+const STATX_INO_OFF: usize = 32;
+const STATX_SIZE_OFF: usize = 40;
+const STATX_BYTES: usize = 256;
 
 /// `linux_dirent64` fixed header byte size (8 + 8 + 2 + 1 = 19).
 const DIRENT_HEADER_BYTES: usize = 19;
@@ -383,6 +392,47 @@ fn dispatch_newfstatat_at_empty_path_stats_cwd() {
     drop(path);
 }
 
+/// `statx(AT_FDCWD, "/", 0, STATX_BASIC_STATS, statxbuf)` follows
+/// the same cwd-relative walker path as `newfstatat` and writes the
+/// Linux `struct statx` byte image used by LA64 busybox `ls`.
+#[test]
+fn dispatch_statx_on_root_writes_statx_struct() {
+    let _setup = stat_setup();
+    let (root_dentry, _tmpfs, root_rnode) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/");
+    let mut statxbuf = vec![0u8; STATX_BYTES];
+    let req = SyscallRequest::new(
+        NR_STATX,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            0,
+            crate::linux_syscall::numbers::STATX_BASIC_STATS as u64,
+            statxbuf.as_mut_ptr() as u64,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(
+        read_u32_at(&statxbuf, STATX_MASK_OFF),
+        crate::linux_syscall::numbers::STATX_BASIC_STATS
+    );
+    assert_eq!(read_u32_at(&statxbuf, STATX_BLKSIZE_OFF), 4096);
+    assert_eq!(read_u32_at(&statxbuf, STATX_NLINK_OFF), 1);
+    let mode = read_u16_at(&statxbuf, STATX_MODE_OFF);
+    assert_eq!(mode & 0o170000, 0o040000, "expected S_IFDIR; got {mode:#o}");
+    assert_eq!(
+        read_u64_at(&statxbuf, STATX_INO_OFF),
+        root_rnode.fs_object_id().as_u64()
+    );
+    assert_eq!(read_u64_at(&statxbuf, STATX_SIZE_OFF), 0);
+    drop(path);
+}
+
 // -----------------------------------------------------------------
 // chdir / fchdir
 // -----------------------------------------------------------------
@@ -444,19 +494,12 @@ fn dispatch_chdir_to_regular_file_returns_neg_enotdir() {
     drop(path);
 }
 
-/// `fchdir(fd)` returns `-ENOSYS` (Slice 6 carryover; OpenFile
-/// has no DEntry hint to install via step_chdir).
-#[test]
-fn dispatch_fchdir_returns_neg_enosys() {
-    let _setup = stat_setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap, thread);
-
-    let req = SyscallRequest::new(NR_FCHDIR, [0, 0, 0, 0, 0, 0]);
-    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(E_NOSYS));
-}
+// Removed: `dispatch_fchdir_returns_neg_enosys`. The Slice 6 carryover
+// ENOSYS path was lifted when `OpenFile::opendir_dentry` and
+// `step_chdir` learned to round-trip the DEntry hint; the dispatch arm
+// now reports `-EBADF` for fd 0 (no open dir) rather than `-ENOSYS`.
+// The success path is exercised by integration tests once a directory
+// fd exists in the fd table.
 
 // -----------------------------------------------------------------
 // getcwd

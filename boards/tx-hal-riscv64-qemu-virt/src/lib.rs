@@ -34,7 +34,7 @@ use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask, DmaAddr,
     DmaDirection, DmaIf, EntropyIf, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf,
-    MemoryRegion, MemoryRegionKind, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo,
+    MemoryRegion, MemoryRegionKind, ObserverIf, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo,
     PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SecondaryEntry,
     SmpIf, TimeIf, VirtAddr,
@@ -219,6 +219,26 @@ pub fn trap_stack_top_for_cpu(cpu: CpuId) -> usize {
     base + RV64_TRAP_STACK_SIZE
 }
 
+/// Rebuild the kernel TLS value for a trap that landed on `trap_stack_top`.
+///
+/// From-user traps arrive with `tp` holding the user register x4, so the trap
+/// vector cannot call Rust until it has restored kernel TLS. `sscratch` tells
+/// the vector which per-hart trap stack it swapped onto; matching that stack
+/// top back to a CPU gives the correct per-CPU area pointer for `tp`.
+#[cfg(target_arch = "riscv64")]
+#[no_mangle]
+pub extern "C" fn tx_rv64_kernel_tls_from_trap_stack_top(trap_stack_top: usize) -> usize {
+    let mut cpu = 0;
+    while cpu < MAX_BOOT_CPUS {
+        let cpu_id = CpuId(cpu);
+        if trap_stack_top_for_cpu(cpu_id) == trap_stack_top {
+            return percpu_tls_for_cpu(cpu_id).unwrap_or(cpu);
+        }
+        cpu += 1;
+    }
+    0
+}
+
 /// Pointer to the local hart's [`KernelResumeCtx`]. Asm helpers
 /// load/store at the documented field offsets; Rust callers in
 /// `apply_trap_action` use the pointer directly.
@@ -242,7 +262,7 @@ impl PlatformConfig for Platform {
     const USER_TOP: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::SV39_USER_TOP);
     const USER_RESERVED_TOP_SIZE: usize = pmap_topology::USER_RESERVED_TOP_SIZE;
     const USER_ALLOC_TOP: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::SV39_USER_ALLOC_TOP);
-    const KERNEL_STACK_SIZE: usize = 64 * 1024;
+    const KERNEL_STACK_SIZE: usize = 128 * 1024;
     const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE;
     const PAGE_TABLE_LEVELS: u8 = 3;
     const ASID_BITS: u8 = 16;
@@ -739,6 +759,8 @@ impl EntropyIf for Platform {
     }
 }
 
+impl ObserverIf for Platform {}
+
 #[cfg(target_arch = "riscv64")]
 fn read_rdtime_ticks() -> u64 {
     let ticks: u64;
@@ -794,6 +816,15 @@ fn install_early_percpu(cpu_id: CpuId) {
     unsafe {
         let trap_stack_top = trap_stack_top_for_cpu(cpu_id);
         core::arch::asm!("csrw sscratch, {top}", top = in(reg) trap_stack_top);
+    }
+
+    // Enable user-mode access to the `time` CSR via `scounteren`.
+    // Required for the high-resolution vDSO clock: user-space needs
+    // to be able to `rdtime` without trapping into the kernel.
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        const SCOUNTEN_TM: usize = 1 << 1; // TM = Time enable
+        core::arch::asm!("csrw scounteren, {val}", val = in(reg) SCOUNTEN_TM);
     }
 }
 

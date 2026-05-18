@@ -33,12 +33,18 @@ use alloc::vec::Vec;
 use goblin::container::{Container, Ctx, Endian};
 use goblin::elf::header::header64;
 use goblin::elf::header::{
-    Header, EI_CLASS, EI_DATA, EI_VERSION, ELFCLASS64, ELFDATA2LSB, EM_RISCV, ET_DYN, ET_EXEC,
-    EV_CURRENT,
+    Header, EI_CLASS, EI_DATA, EI_VERSION, ELFCLASS64, ELFDATA2LSB, ET_DYN, ET_EXEC, EV_CURRENT,
 };
 use goblin::elf::program_header::{
     ProgramHeader, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD, PT_PHDR,
 };
+
+/// PT_GNU_STACK program header type (not in goblin's constants).
+const PT_GNU_STACK: u32 = 0x6474_e551;
+
+/// PT_GNU_RELRO program header type.
+#[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
+const PT_GNU_RELRO: u32 = 0x6474_e552;
 
 /// ELF64 program-header size, in bytes. (Elf64_Phdr is 56 bytes.)
 pub const ELF64_PHENT: u64 = 56;
@@ -60,6 +66,9 @@ const MAX_PHDRS: u16 = 64;
 /// (`p_vaddr % p_align == p_offset % p_align`) is preserved after bias.
 pub(crate) const ET_DYN_LOAD_BIAS: u64 = 0x10000;
 
+const EM_RISCV: u16 = 243;
+const EM_LOONGARCH: u16 = 258;
+
 /// Minimum ELF64 header size (`Elf64_Ehdr`), in bytes.
 const ELF64_EHDR_SIZE: usize = 64;
 
@@ -69,8 +78,7 @@ pub enum ParseError {
     /// ELF magic missing or wrong architecture class / endianness /
     /// version.
     Magic,
-    /// `e_machine` is not `EM_RISCV` (only RV64 is supported in the
-    /// slice).
+    /// `e_machine` is not an architecture txKernel can enter.
     Arch,
     /// `e_type` is neither `ET_EXEC` nor `ET_DYN`.
     Type,
@@ -128,6 +136,24 @@ pub struct BssTail {
     pub size: u64,
 }
 
+/// Interpreter image plan.  Built from a separate ELF parse when
+/// the main binary carries PT_INTERP.  Unlike ExecImagePlan
+/// (main + interpreter), this is just the interpreter's image.
+#[derive(Debug, Clone)]
+pub struct InterpreterPlan {
+    /// Load bias computed from the interpreter's first LOAD segment
+    /// (`INTERP_BASE - lowest_load_vaddr`).
+    pub load_bias: u64,
+    /// Interpreter entry point, already bias-adjusted.
+    pub entry: u64,
+    /// LOAD segments, already bias-adjusted.
+    pub load_segments: Vec<LoadSegment>,
+    /// Optional BSS tail.
+    pub bss_extension: Option<BssTail>,
+    /// Whether PT_GNU_STACK requests an executable stack.
+    pub executable_stack: bool,
+}
+
 /// txKernel-owned image plan produced from a parsed ELF. The output
 /// is pure data — no kernel handles, no caps, no async machinery.
 #[derive(Debug, Clone)]
@@ -152,12 +178,18 @@ pub struct ExecImagePlan {
     /// All `vaddr` fields in `load_segments`, `entry`, and `at_phdr`
     /// already have this value added — callers see final in-memory VAs.
     pub load_bias: u64,
+    /// Whether PT_GNU_STACK requests an executable stack.
+    /// Default false; true only when the binary explicitly adds PF_X.
+    pub executable_stack: bool,
+    /// Interpreter plan (from PT_INTERP).  None for static binaries.
+    pub interpreter_path: Option<Vec<u8>>,
 }
 
 /// Parse the ELF header + program headers and produce an image plan.
 ///
-/// Validates: ELFCLASS64, ELFDATA2LSB, EV_CURRENT, EM_RISCV, ET_EXEC,
-/// no PT_INTERP, no PT_DYNAMIC, ≥ 1 PT_LOAD. Walks PT_LOAD segments;
+/// Validates: ELFCLASS64, ELFDATA2LSB, EV_CURRENT, supported machine,
+/// ET_EXEC or static-PIE ET_DYN, no unsupported interpreter handoff, ≥ 1 PT_LOAD.
+/// Walks PT_LOAD segments;
 /// rejects overlap, bad alignment, congruence violations, multiple
 /// BSS-extending LOADs.
 ///
@@ -186,7 +218,7 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
     {
         return Err(ParseError::Magic);
     }
-    if header.e_machine != EM_RISCV {
+    if !matches!(header.e_machine, EM_RISCV | EM_LOONGARCH) {
         return Err(ParseError::Arch);
     }
     // Accept both ET_EXEC (static, absolute VAs) and ET_DYN (static-PIE,
@@ -217,21 +249,41 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
     }
 
     // ----- Program headers ----------------------------------------
-    // RV64 ELF64 little-endian. The slice is a single arch.
+    // Supported ELF64 little-endian machines share the same program-header layout.
     let ctx = Ctx::new(Container::Big, Endian::Little);
     let phdrs = ProgramHeader::parse(elf_bytes, phoff as usize, phnum as usize, ctx)
         .map_err(|_| ParseError::Phdr)?;
 
     let mut load_segments: Vec<LoadSegment> = Vec::new();
     let mut pt_phdr_vaddr: Option<u64> = None;
+    let mut exec_stack: bool = false;
+    let mut interp_path: Option<Vec<u8>> = None;
 
     for phdr in &phdrs {
         match phdr.p_type {
-            PT_INTERP | PT_DYNAMIC => {
-                if !is_dyn {
-                    // ET_EXEC must not have PT_INTERP or PT_DYNAMIC.
+            PT_INTERP | PT_DYNAMIC if !is_dyn => {
+                if phdr.p_type == PT_INTERP {
+                    // Extract interpreter path from ELF bytes.
+                    let off = phdr.p_offset as usize;
+                    let len = (phdr.p_filesz as usize).min(4096);
+                    if off + len <= elf_bytes.len() {
+                        let path = elf_bytes[off..off + len]
+                            .split(|&b| b == 0)
+                            .next()
+                            .unwrap_or(&[])
+                            .to_vec();
+                        interp_path = Some(path);
+                    }
+                }
+                // PT_DYNAMIC in ET_EXEC: reject (no dynamic linking in
+                // static executables; only PT_INTERP-interpreted
+                // binaries are accepted).
+                if phdr.p_type == PT_DYNAMIC {
                     return Err(ParseError::HasInterp);
                 }
+                // PT_INTERP path was extracted above; fall through.
+            }
+            PT_INTERP | PT_DYNAMIC => {
                 // ET_DYN static-PIE: PT_INTERP / PT_DYNAMIC present but
                 // the kernel runs the binary directly at entry + load_bias.
                 // No interpreter is loaded; the segments are silently skipped.
@@ -242,13 +294,17 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
             PT_LOAD => {
                 load_segments.push(translate_load(phdr, is_dyn)?);
             }
-            // PT_TLS, PT_NOTE, PT_GNU_STACK, PT_GNU_RELRO,
-            // PT_GNU_EH_FRAME, ... ignored at parse time. Phase 5
-            // can revisit if/when LTP coverage demands TLS or stack
-            // executability checks.
-            _ => {}
+            // PT_TLS, PT_NOTE, PT_GNU_RELRO, PT_GNU_EH_FRAME, ...
+            // ignored at parse time.
+            _ => {
+                if phdr.p_type == PT_GNU_STACK && (phdr.p_flags & PF_X) != 0 {
+                    exec_stack = true;
+                }
+            }
         }
     }
+
+    let _executable_stack = exec_stack;
 
     if load_segments.is_empty() {
         return Err(ParseError::NoLoad);
@@ -298,6 +354,8 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
         load_segments,
         bss_extension,
         load_bias,
+        executable_stack: exec_stack,
+        interpreter_path: interp_path,
     })
 }
 
@@ -426,10 +484,11 @@ fn compute_at_phdr(
     Err(ParseError::Phdr)
 }
 
-/// Returns the BSS extension for the unique LOAD segment whose
-/// `memsz > filesz`. Returns `Err(ParseError::LoadSegment)` if
-/// multiple LOADs have such a tail (TODO: handle multi-BSS in a
-/// future slice).
+/// Returns the BSS extension for the last LOAD segment whose
+/// `memsz > filesz`. Multiple BSS-extending LOADs are legal ELF
+/// (e.g. LA64 busybox has two: .relro_padding and .data/.bss).
+/// The VM mapper handles BSS per-segment; this keeps the last tail
+/// for auxv / debug consumers.
 fn compute_bss_extension(load_segments: &[LoadSegment]) -> Result<Option<BssTail>, ParseError> {
     let mut found: Option<BssTail> = None;
     for seg in load_segments {
@@ -441,12 +500,11 @@ fn compute_bss_extension(load_segments: &[LoadSegment]) -> Result<Option<BssTail
                 .checked_add(seg.filesz)
                 .ok_or(ParseError::LoadSegment)?;
             let tail_size = seg.memsz - seg.filesz;
-            if found.is_some() {
-                // TODO(multi-bss): handle multiple BSS-extending
-                // LOADs. The slice's design only needs one (the
-                // last writable LOAD for static binaries).
-                return Err(ParseError::LoadSegment);
-            }
+            // Multiple BSS-extending LOADs are legal (e.g. LA64
+            // busybox has two: .relro_padding and .data/.bss).
+            // `vm/scripts.rs` ignores `bss_extension` for actual
+            // mapping (handled per-segment by `register_load_segment`);
+            // keep the last one for auxv / debug consumers.
             found = Some(BssTail {
                 vaddr: tail_vaddr,
                 size: tail_size,

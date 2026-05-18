@@ -35,11 +35,11 @@ fn child_leader(child: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
 fn seed_child_leader_context_zeroes_a0() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     let leader = child_leader(&child);
 
     let parent_ctx = synthetic_parent_ctx();
-    seed_child_leader_context(&leader, &parent_ctx);
+    seed_child_leader_context(&leader, &parent_ctx, 0, 0);
 
     let saved = leader
         .payload_cap()
@@ -51,17 +51,22 @@ fn seed_child_leader_context_zeroes_a0() {
         "RV64 a0 (regs[10]) must be 0 in the child — Linux fork-clone ABI: \
          child's syscall return value is 0",
     );
+    // With tls=0 (no CLONE_SETTLS), tp inherits the parent's value.
+    assert_eq!(
+        saved.regs[4], parent_ctx.regs[4],
+        "RV64 tp (regs[4]) must match parent when tls=0",
+    );
 }
 
 #[test]
 fn seed_child_leader_context_inherits_pc() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     let leader = child_leader(&child);
 
     let parent_ctx = synthetic_parent_ctx();
-    seed_child_leader_context(&leader, &parent_ctx);
+    seed_child_leader_context(&leader, &parent_ctx, 0, 0);
 
     let saved = leader
         .payload_cap()
@@ -81,11 +86,11 @@ fn seed_child_leader_context_inherits_pc() {
 fn seed_child_leader_context_preserves_other_gprs_and_sp() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     let leader = child_leader(&child);
 
     let parent_ctx = synthetic_parent_ctx();
-    seed_child_leader_context(&leader, &parent_ctx);
+    seed_child_leader_context(&leader, &parent_ctx, 0, 0);
 
     let saved = leader
         .payload_cap()
@@ -113,4 +118,33 @@ fn seed_child_leader_context_preserves_other_gprs_and_sp() {
     // status word is also preserved verbatim — the child re-enters
     // userspace under the same supervisor-status snapshot.
     assert_eq!(saved.status, parent_ctx.status);
+}
+
+/// When `clone(2)` is called with a non-zero `newsp`, the libc
+/// `__clone` wrapper has staged the child stack (typically with the
+/// user-supplied `fn`/`arg` pushed on it). The kernel must seed the
+/// child leader's sp register with that value so the child enters
+/// userspace ready to load fn/arg and call into the user function.
+#[test]
+fn seed_child_leader_context_overrides_sp_when_stack_nonzero() {
+    let _g = setup();
+    let parent = bootstrap();
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+    let leader = child_leader(&child);
+
+    let parent_ctx = synthetic_parent_ctx();
+    let stack: usize = 0xdead_beef_0000;
+    seed_child_leader_context(&leader, &parent_ctx, 0, stack);
+
+    let saved = leader
+        .payload_cap()
+        .expect("fresh child leader has payload")
+        .saved_user_context()
+        .expect("seed installs Some");
+    // sp index is arch-specific: RV64 = 2, LA64 = 3. Tests build for
+    // the host arch (RV64-shaped on the CI host), so regs[2] is sp.
+    #[cfg(not(target_arch = "loongarch64"))]
+    assert_eq!(saved.regs[2], stack);
+    #[cfg(target_arch = "loongarch64")]
+    assert_eq!(saved.regs[3], stack);
 }

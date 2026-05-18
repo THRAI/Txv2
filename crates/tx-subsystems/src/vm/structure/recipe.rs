@@ -196,6 +196,18 @@ impl RecipeIndex {
         Ok(VmMapCommit { changed_pages })
     }
 
+    pub(in crate::vm) fn set_locked(
+        &self,
+        range: UserRange,
+        locked: bool,
+    ) -> Result<VmMapCommit, VmMapError> {
+        let _writer = self.mutation.lock();
+        let current = unsafe { self.under_writer_lock() };
+        let (rewritten, changed_pages) = rewrite_locked(current, range, locked)?;
+        self.publish(rewritten);
+        Ok(VmMapCommit { changed_pages })
+    }
+
     pub(in crate::vm) fn remap_disjoint(
         &self,
         old_range: UserRange,
@@ -366,6 +378,29 @@ fn rewrite_protect(
         }
     }
 
+    Ok((rewritten, changed_pages))
+}
+
+fn rewrite_locked(
+    entries: &RecipeTree,
+    range: UserRange,
+    locked: bool,
+) -> Result<(RecipeTree, usize), VmMapError> {
+    if !range_is_fully_mapped(entries, range) {
+        return Err(VmMapError::MissingMapping);
+    }
+
+    let mut rewritten = RecipeTree::new();
+    let mut changed_pages = 0;
+
+    for existing in entries.values().cloned() {
+        if existing.range.overlaps(range) {
+            changed_pages += existing.range.page_count();
+            push_entry(&mut rewritten, existing.with_locked(locked));
+        } else {
+            push_entry(&mut rewritten, existing);
+        }
+    }
     Ok((rewritten, changed_pages))
 }
 

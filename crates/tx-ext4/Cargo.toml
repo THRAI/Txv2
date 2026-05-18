@@ -10,6 +10,7 @@ default = []
 # Enable the async host-side adapter (uses std::sync::Mutex, BTreeMap).
 # Off by default so the crate compiles for no_std kernel targets.
 host-async = []
+std = []
 
 [dependencies]
 tx-ext4-format = { path = "../tx-ext4-format" }
@@ -24,4 +25,5 @@ tokio = { version = "1", features = ["macros", "rt", "sync"] }
 
 [[test]]
 name = "async_adapter"
+path = "tests/async_adapter.rs"
 required-features = ["host-async"]

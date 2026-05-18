@@ -10,9 +10,21 @@
 //! in `TimerQueue::advance_time_to` share only the TimerQueue's own
 //! internal SpinLock (not the reactor's top-level lock), so no deadlock.
 
+use tx_platform_adapter::platform_adapter;
+
+#[platform_adapter(
+    platform = "reactor",
+    domain = "timer_ops",
+    apis = ["timer"],
+    reason = "wrap reactor TimerQueue and DeadlineFuture used by nanosleep/clock_nanosleep syscall layer"
+)]
+mod timer_ops {
+    pub use tx_reactor::timer::TimerQueue;
+    pub use tx_reactor::DeadlineFuture;
+}
+
 use crate::adapter::step_engine::SpinMutex;
-use tx_reactor::timer::TimerQueue;
-pub use tx_reactor::DeadlineFuture;
+use timer_ops::{DeadlineFuture, TimerQueue};
 
 static TIMER_QUEUE: SpinMutex<Option<TimerQueue>> = SpinMutex::new(None);
 
@@ -28,5 +40,8 @@ pub fn install_timer_queue(tq: TimerQueue) {
 /// installed (unit-test context without a reactor — callers should
 /// return success immediately).
 pub fn sleep_until_ns(deadline_ns: u64) -> Option<DeadlineFuture> {
-    TIMER_QUEUE.lock().as_ref().map(|tq| tq.wait_until(deadline_ns))
+    TIMER_QUEUE
+        .lock()
+        .as_ref()
+        .map(|tq| tq.wait_until(deadline_ns))
 }

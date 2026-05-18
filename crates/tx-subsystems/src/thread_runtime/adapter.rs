@@ -32,12 +32,15 @@ pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
-        NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+        drive_oneshot, Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome,
+        SubjectIdentity,
     };
     pub use tx_substrate::wake::{MailboxEvent, SignalRouting, TaskMailbox};
     pub use tx_substrate::zone::{
-        sign, Cap, Dead, Entity, OperationalCapExt, PayloadCap, Weak, Zone, ZoneAllocated,
-        ZoneError,
+        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
+        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
+        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
+        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
     pub use tx_substrate::SpinMutex;
 }
@@ -48,6 +51,8 @@ pub mod step_engine {
     reason = "wrap reactor::userspace (UserspaceRunSlot, UserspaceRunRequest, SyscallRequest, UserspaceTrapInfo) and TaskKey used by ThreadPayload trap-shell handoff fields and tests"
 )]
 pub mod reactor_entry {
-    pub use tx_reactor::userspace::{SyscallRequest, UserspaceTrapInfo, UserspaceRunRequest, UserspaceRunSlot};
+    pub use tx_reactor::userspace::{
+        SyscallRequest, UserspaceRunRequest, UserspaceRunSlot, UserspaceTrapInfo,
+    };
     pub use tx_reactor::TaskKey;
 }

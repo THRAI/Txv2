@@ -1,9 +1,9 @@
 //! TTY execution hardware polling step tests.
 
-use alloc::boxed::Box;
 use crate::tty::adapter::step_engine::{
     guard, ByteProgress, Errno as V3Errno, StepOutcome, StepOutcome as V3Out, YieldShape,
 };
+use alloc::boxed::Box;
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::Guard;
@@ -15,19 +15,11 @@ use super::support::{alloc_tty, init_zones, NOOP_BINDING, TTY_ZONE_TEST_LOCK};
 struct BlockingReadOps;
 
 impl CharDeviceOps for BlockingReadOps {
-    fn read(
-        &self,
-        _out: &mut [u8],
-        _guard: &Guard<'_>,
-    ) -> V3Out<usize, ByteProgress> {
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> V3Out<usize, ByteProgress> {
         V3Out::yield_on_wait_source(ByteProgress::EMPTY, 0x55, 0x0f)
     }
 
-    fn write(
-        &self,
-        bytes: &[u8],
-        _guard: &Guard<'_>,
-    ) -> V3Out<usize, ByteProgress> {
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> V3Out<usize, ByteProgress> {
         V3Out::Done(bytes.len())
     }
 }

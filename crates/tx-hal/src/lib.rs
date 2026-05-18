@@ -1,5 +1,8 @@
 #![no_std]
 
+#[cfg_attr(not(test), allow(unused_extern_crates))]
+extern crate alloc;
+
 pub mod hart_local;
 pub mod time;
 
@@ -795,6 +798,8 @@ pub trait PmapIf {
     }
 }
 
+pub mod observer;
+pub use observer::{ObserverIf, RingDescriptor};
 pub mod pmap;
 pub mod trap;
 pub use trap::{
@@ -941,6 +946,41 @@ pub struct SignalFramePlacement {
     pub trampoline_pc: UserPtr<()>,
 }
 
+/// Raw bytes of a signal frame (platform-specific layout).
+/// Carried from `prepare_signal_frame` to the caller, who writes
+/// them to the user stack via `AddressSpace::copy_to_user`.
+///
+/// The buffer must be at least as large as the platform-specific
+/// `*SignalFrame` struct (RV64 ~720 bytes including UserTrapContext +
+/// FpContext + trampoline). The previous 512-byte buffer silently
+/// truncated `from_slice`, dropping the trailing fields — most
+/// catastrophically the on-stack `rt_sigreturn` trampoline at
+/// `offset_of!(SignalFrame, trampoline) = 712` — so the handler
+/// returned through `ra = frame_addr + 712` and the CPU fetched
+/// uninitialised stack bytes instead of the trampoline. Bump to
+/// 1024 to cover RV64 and LA64 layouts with comfortable headroom.
+pub struct SignalFrameBytes {
+    pub data: [u8; 1024],
+    pub len: usize,
+}
+
+impl SignalFrameBytes {
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        let len = bytes.len();
+        assert!(
+            len <= 1024,
+            "signal frame layout ({len} bytes) exceeds SignalFrameBytes buffer (1024)",
+        );
+        let mut data = [0u8; 1024];
+        data[..len].copy_from_slice(bytes);
+        Self { data, len }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SavedSignalFrame {
@@ -977,6 +1017,30 @@ pub trait SignalFrameIf: TrapIf {
 
     fn rewind_syscall_pc(mut tf: TrapFrameMut<'_>) {
         tf.rewind_pc(4);
+    }
+
+    /// Build a signal-handler entry context and frame bytes
+    /// WITHOUT accessing a live TrapFrameMut. Returns the modified
+    /// `UserTrapContext` (sepc=handler, sp=frame_addr, ra=trampoline)
+    /// and the raw signal frame bytes to write to the user stack.
+    ///
+    /// Used by the thread-future AST checkpoint, which runs before
+    /// `enter_userspace_with_context` (where TrapFrameMut is
+    /// available). The caller writes `frame_bytes` to user memory
+    /// via `AddressSpace::copy_to_user`, then stores the modified
+    /// context as `saved_user_context`.
+    ///
+    /// Default: returns `ENOSYS`-shaped fallback.
+    fn prepare_signal_frame(
+        _ctx: &UserTrapContext,
+        _setup: &SignalFrameWrite,
+    ) -> Result<(UserTrapContext, SignalFrameBytes), FaultInfo> {
+        Err(FaultInfo {
+            address: VirtAddr(0),
+            write: true,
+            instruction: false,
+            from_user: false,
+        })
     }
 }
 
@@ -1304,6 +1368,7 @@ pub trait TxPlatform:
     + SmpIf
     + PowerIf
     + EntropyIf
+    + ObserverIf
     + 'static
 {
 }
@@ -1327,6 +1392,7 @@ impl<T> TxPlatform for T where
         + SmpIf
         + PowerIf
         + EntropyIf
+        + ObserverIf
         + 'static
 {
 }

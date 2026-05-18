@@ -49,7 +49,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    self, ByteProgress, Cap, NoProgress, ScriptCtx, SpinMutex, StepOp, StepOutcome,
+    self, ByteProgress, Cap, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp, StepOutcome,
     SubjectIdentity, Zone, ZoneAllocated, ZoneError,
 };
 use adapter::wait_routing::{self, Channel, WaitSource};
@@ -372,10 +372,18 @@ fn allocate_pipe_fs_object_id() -> FsObjectId {
 /// `process.install_fd(fd, cap)` and applies `O_CLOEXEC` per the
 /// flags.
 pub fn step_pipe2(flags: PipeFlags) -> Result<(Cap<OpenFile>, Cap<OpenFile>), Errno> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
+    // observe: N/A — pure allocation, no guard needed
+    // upgrade: N/A
     // 1. Mint the shared payload + cap.
+    // reserve: allocate zone slots for payload, reader, writer
     let payload_value = PipePayload::new().map_err(|_| Errno::ENOMEM)?;
-    let payload_cap: Cap<PipePayload> =
-        step_engine::sign(payload_value).map_err(|_| Errno::ENOMEM)?;
+    // commit — sign payload cap and mint reader/writer OpenFile caps
+    let payload_cap = step_engine::sign(payload_value).map_err(|_| Errno::ENOMEM)?;
 
     // 2. Build per-side RNodes. Each carries
     //    `StructPayload::Pipe { payload, side }` so dispatch in
@@ -435,6 +443,7 @@ pub fn step_pipe2(flags: PipeFlags) -> Result<(Cap<OpenFile>, Cap<OpenFile>), Er
     let reader_open = OpenFile::new_cap(reader_rnode, reader_flags).map_err(|_| Errno::ENOMEM)?;
     let writer_open = OpenFile::new_cap(writer_rnode, writer_flags).map_err(|_| Errno::ENOMEM)?;
 
+    // publish — N/A (pipes do not publish bus signals)
     Ok((reader_open, writer_open))
 }
 
@@ -453,13 +462,23 @@ pub fn step_read(
     _guard: &Guard<'_>,
     nonblocking: bool,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
+    // ① observe — empty out is a no-op
     if out.is_empty() {
         return step_engine::done_bytes(0);
     }
+    // ② upgrade — N/A (PayloadCap already held by caller)
+    // ③ reserve — acquire ring lock
     let mut ring = payload.ring.lock();
     if !ring.is_empty() {
         let copied = ring.drain_to_slice(out);
         drop(ring);
+        // ④ commit — drain bytes into caller buffer, release lock
+        // ⑤ publish — wake writers parked on space-available
         // Wake any writer parked on space-available — both paths
         // (D2 coexistence): legacy `Channel` waker AND the new
         // `WaitSource` mailbox path.
@@ -475,6 +494,7 @@ pub fn step_read(
     if nonblocking {
         return step_engine::eagain();
     }
+    // Yield: wait for readable — publish (N/A) precedes yield, ok per A-14
     step_engine::yield_until_readable(payload.reader_wait_source_id, PIPE_READABLE)
 }
 
@@ -492,16 +512,27 @@ pub fn step_write(
     _guard: &Guard<'_>,
     nonblocking: bool,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
+    // ① observe — empty bytes is a no-op
     if bytes.is_empty() {
         return step_engine::done_bytes(0);
     }
+    // ① observe — check reader count for EPIPE
     if payload.reader_count.load(Ordering::Acquire) == 0 {
         return step_engine::epipe();
     }
+    // ② upgrade — N/A (PayloadCap already held by caller)
+    // ③ reserve — acquire ring lock
     let mut ring = payload.ring.lock();
     if !ring.is_full() {
         let copied = ring.fill_from_slice(bytes);
         drop(ring);
+        // ④ commit — fill bytes into ring, release lock
+        // ⑤ publish — wake readers parked on bytes-available
         // Wake any reader parked on bytes-available — both paths
         // (D2 coexistence).
         wait_routing::fire_legacy_channel(&payload.reader_wait_channel, PIPE_READABLE);
@@ -512,6 +543,7 @@ pub fn step_write(
     if nonblocking {
         return step_engine::eagain();
     }
+    // Yield: wait for writable — publish (N/A) precedes yield
     step_engine::yield_until_writable(payload.writer_wait_source_id, PIPE_WRITABLE)
 }
 
@@ -537,10 +569,7 @@ pub struct Pipe2Op {
 impl<I: SubjectIdentity> StepOp<I> for Pipe2Op {
     type Output = (Cap<OpenFile>, Cap<OpenFile>);
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         match step_pipe2(self.flags) {
             Ok(pair) => StepOutcome::Done(pair),
             Err(e) => StepOutcome::Err(e.into()),
@@ -548,22 +577,22 @@ impl<I: SubjectIdentity> StepOp<I> for Pipe2Op {
     }
 }
 
+impl OneShotStepOp for Pipe2Op {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for Pipe2Op {}
+
 /// `StepOp` wrap of [`step_read`].
 pub struct ReadOp<'a> {
     pub payload: &'a Cap<PipePayload>,
     pub out: &'a mut [u8],
-    pub guard: &'a Guard<'a>,
     pub nonblocking: bool,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
-        step_read(self.payload, self.out, self.guard, self.nonblocking)
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let __guard = step_engine::guard();
+        step_read(self.payload, self.out, &__guard, self.nonblocking)
     }
 }
 
@@ -571,27 +600,22 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
 pub struct WriteOp<'a> {
     pub payload: &'a Cap<PipePayload>,
     pub bytes: &'a [u8],
-    pub guard: &'a Guard<'a>,
     pub nonblocking: bool,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
-        step_write(self.payload, self.bytes, self.guard, self.nonblocking)
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let __guard = step_engine::guard();
+        step_write(self.payload, self.bytes, &__guard, self.nonblocking)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::adapter::step_engine::{guard, Errno as V3Errno, StepOutcome as V3Out, YieldShape};
     use super::*;
-    use super::adapter::step_engine::{
-        guard, Errno as V3Errno, StepOutcome as V3Out, YieldShape,
-    };
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vfs::structure::{RNodeBacking, StructPayload};
     use crate::zones;
@@ -893,9 +917,15 @@ mod tests {
 
     #[test]
     fn step_pipe2_returns_done_with_reader_writer_pair() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let outcome = step_pipe2(PipeFlags::default());
         match outcome {
+            // publish: N/A — pipe creation doesn't publish signals
             Ok((reader, writer)) => {
                 assert_eq!(side_of(&reader), PipeSide::Reader);
                 assert_eq!(side_of(&writer), PipeSide::Writer);
@@ -908,12 +938,18 @@ mod tests {
 
     #[test]
     fn step_pipe2_honors_cloexec_and_nonblocking() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let outcome = step_pipe2(PipeFlags {
             cloexec: true,
             nonblocking: true,
         });
         match outcome {
+            // publish: N/A — pipe creation doesn't publish signals
             Ok((reader, writer)) => {
                 assert!(reader.flags().cloexec);
                 assert!(reader.flags().nonblocking);
@@ -926,6 +962,11 @@ mod tests {
 
     #[test]
     fn step_read_drains_ring_returns_done_byte_count() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
@@ -947,6 +988,11 @@ mod tests {
 
     #[test]
     fn step_read_empty_buf_returns_done_zero() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
@@ -962,6 +1008,11 @@ mod tests {
 
     #[test]
     fn step_read_empty_ring_nonblocking_returns_eagain() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
@@ -977,6 +1028,11 @@ mod tests {
 
     #[test]
     fn step_read_empty_ring_blocking_yields_on_wait_source_with_empty_progress() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
@@ -1006,6 +1062,11 @@ mod tests {
 
     #[test]
     fn step_read_empty_ring_writer_closed_returns_done_zero_eof() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
@@ -1032,6 +1093,11 @@ mod tests {
 
     #[test]
     fn step_write_returns_done_for_partial_drain() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
@@ -1049,6 +1115,11 @@ mod tests {
 
     #[test]
     fn step_write_returns_err_epipe_when_all_readers_gone() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
@@ -1069,6 +1140,11 @@ mod tests {
 
     #[test]
     fn step_write_yields_on_wait_source_when_full_and_blocking() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
@@ -1102,6 +1178,11 @@ mod tests {
 
     #[test]
     fn step_write_returns_eagain_when_full_and_nonblocking() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
@@ -1125,11 +1206,11 @@ mod step_op_wraps {
     //! the outcome shape is preserved. The free-fn tests above remain
     //! the source of truth for the semantic surface; these tests pin
     //! the wrap layer.
-    use super::*;
     use super::adapter::step_engine::{
         guard, ByteProgress, Errno as V3Errno, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
         StepProgress, YieldShape,
     };
+    use super::*;
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vfs::structure::{RNodeBacking, StructPayload};
     use crate::zones;
@@ -1197,16 +1278,13 @@ mod step_op_wraps {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        let guard = guard();
         let mut empty: [u8; 0] = [];
         let mut op = ReadOp {
             payload: &payload,
             out: &mut empty,
-            guard: &guard,
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
-        drop(guard);
         match outcome {
             StepOutcome::Done(0) => {}
             other => panic!("expected Done(0), got {other:?}"),
@@ -1218,16 +1296,13 @@ mod step_op_wraps {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        let guard = guard();
         let mut buf = [0u8; 4];
         let mut op = ReadOp {
             payload: &payload,
             out: &mut buf,
-            guard: &guard,
             nonblocking: true,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
-        drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::EAGAIN) => {}
             other => panic!("expected Err(EAGAIN), got {other:?}"),
@@ -1240,18 +1315,19 @@ mod step_op_wraps {
         let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let _ = writer; // hold writer alive so step_read sees writer_count > 0
-        let guard = guard();
-        // Seed via the free fn.
-        let _ = step_write(&payload, b"hello", &guard, false);
+                        // Seed via the free fn (its own guard scope so the StepOp wrap
+                        // below acquires its own per STEP_MODEL §1).
+        {
+            let guard = guard();
+            let _ = step_write(&payload, b"hello", &guard, false);
+        }
         let mut buf = [0u8; 8];
         let mut op = ReadOp {
             payload: &payload,
             out: &mut buf,
-            guard: &guard,
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
-        drop(guard);
         match outcome {
             StepOutcome::Done(n) => {
                 assert_eq!(n, 5);
@@ -1266,16 +1342,13 @@ mod step_op_wraps {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        let guard = guard();
         let mut buf = [0u8; 4];
         let mut op = ReadOp {
             payload: &payload,
             out: &mut buf,
-            guard: &guard,
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
-        drop(guard);
         match outcome {
             StepOutcome::Yield {
                 progress,
@@ -1298,16 +1371,13 @@ mod step_op_wraps {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        let guard = guard();
         let bytes: &[u8] = &[];
         let mut op = WriteOp {
             payload: &payload,
             bytes,
-            guard: &guard,
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
-        drop(guard);
         match outcome {
             StepOutcome::Done(0) => {}
             other => panic!("expected Done(0), got {other:?}"),
@@ -1321,16 +1391,13 @@ mod step_op_wraps {
         let payload = payload_of(&reader);
         let _ = writer; // hold writer alive
         let _ = reader; // hold reader alive
-        let guard = guard();
         let bytes: &[u8] = b"hello";
         let mut op = WriteOp {
             payload: &payload,
             bytes,
-            guard: &guard,
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
-        drop(guard);
         match outcome {
             StepOutcome::Done(n) => assert_eq!(n, 5),
             other => panic!("expected Done(5), got {other:?}"),
@@ -1345,16 +1412,13 @@ mod step_op_wraps {
         drop(reader);
         tx_test_support::drain_to_quiescence();
         assert_eq!(payload.reader_count_snapshot(), 0);
-        let guard = guard();
         let bytes: &[u8] = b"x";
         let mut op = WriteOp {
             payload: &payload,
             bytes,
-            guard: &guard,
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
-        drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::EPIPE) => {}
             other => panic!("expected Err(EPIPE), got {other:?}"),

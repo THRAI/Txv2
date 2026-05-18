@@ -12,3 +12,5 @@ __pycache__/
 
 # generated vendor snapshot
 /third_party/
+.claude/worktrees/
+librust_out.rlib

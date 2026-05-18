@@ -1,5 +1,5 @@
-use tx_hal::{console_write_str, TxPlatform};
 use crate::adapter::step_engine::{epoch, zone, Zone, ZoneAllocated, ZoneError};
+use tx_hal::{console_write_str, TxPlatform};
 
 use crate::{
     mount::{MountIdentity, MountNamespace, MountPayload},
@@ -36,6 +36,9 @@ pub fn register_all() -> Result<(), ZoneError> {
     aio::register_zones()?;
     io_uring::register_zones()?;
     signalfd::register_zones()?;
+    epoll::register_zones()?;
+    eventfd::register_zones()?;
+    timerfd::register_zones()?;
     subject_placeholders::register_zones()?;
     Ok(())
 }
@@ -303,6 +306,31 @@ mod signalfd {
     }
 }
 
+mod epoll {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        // TODO: epoll not yet landed
+        Ok(())
+    }
+}
+
+mod eventfd {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        crate::eventfd::register_zones()
+    }
+}
+
+mod timerfd {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        crate::timerfd::register_zones()
+    }
+}
+
 /// Register the `step_v3` placeholder zones used by PR-9 phase 5 to
 /// satisfy `SubjectAuthority`'s `Cap<RestrictionStackHandle>` slot.
 ///
@@ -314,7 +342,8 @@ mod subject_placeholders {
     use super::*;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
-        zone::register_zone_for::<crate::adapter::step_engine::RestrictionStackHandle>().map(|_| ())?;
+        zone::register_zone_for::<crate::adapter::step_engine::RestrictionStackHandle>()
+            .map(|_| ())?;
         Ok(())
     }
 }

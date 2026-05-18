@@ -23,11 +23,11 @@
 //! the underlying `Frame` keeps each entry alive while the set retains
 //! it; pmap `MapPin`s are acquired separately on PTE install.
 
-use alloc::collections::BTreeMap;
-use tx_hal::Ppn;
-use step_engine::page_allocator::{self, BitmapPageAllocator, CachePin};
-use crate::vm::adapter::step_engine::{Cap, SpinMutex, Zone, ZoneAllocated, ZoneError};
 use crate::vm::adapter::step_engine::{self as step_engine};
+use crate::vm::adapter::step_engine::{Cap, SpinMutex, Zone, ZoneAllocated, ZoneError};
+use alloc::collections::BTreeMap;
+use step_engine::page_allocator::{self, BitmapPageAllocator, CachePin};
+use tx_hal::Ppn;
 
 /// Page offset within a `VmEntry`'s range. `VmPageOff(0)` is the first
 /// page of the entry; offsets are relative to the entry's `range.start`

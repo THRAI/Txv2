@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::image::{busybox_initramfs_name, busybox_root_ext4_name};
 use crate::target::{Profile, TxTarget};
 use crate::util::{option_value, optional_option_value, shell_join, tail_lines};
 use crate::Result;
@@ -123,6 +124,16 @@ fn qemu_command(
             TxTarget::Rv64M1DockMock => "1",
         }
         .to_string(),
+        // Force multi-threaded TCG: vCPUs run on parallel host threads
+        // instead of round-robin time-slicing on one host thread. Without
+        // this, the boot smoke's BSP busy-spin for AP reactor task
+        // completion (init.rs `wait_for_ap_reactor_task_done`) starves
+        // the AP — the AP never gets CPU time to mark the task done,
+        // which manifests as a smoke panic on the slow GitHub Actions
+        // emulated runner (passes on Apple-silicon TCG because its
+        // round-robin is much faster).
+        "-accel".to_string(),
+        "tcg,thread=multi".to_string(),
         "-display".to_string(),
         "none".to_string(),
     ]);
@@ -160,21 +171,33 @@ fn qemu_command(
         let initramfs = root
             .join("target")
             .join("images")
-            .join("busybox-initramfs.cpio");
+            .join(busybox_initramfs_name(target));
+        let cmdline = if target == TxTarget::Rv64M1DockMock {
+            "tx.profile=busybox tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0"
+        } else {
+            "tx.profile=busybox console=ttyS0"
+        };
         args.push("-initrd".into());
         args.push(initramfs.display().to_string());
         args.push("-append".into());
-        if target == TxTarget::Rv64M1DockMock {
-            args.push("tx.profile=busybox tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0".into());
-        } else {
-            args.push("tx.profile=busybox console=ttyS0".into());
+        args.push(cmdline.into());
+        if target == TxTarget::La64Qemu {
+            args.push("-fw_cfg".into());
+            args.push(format!("name=opt/tx.cmdline,string={cmdline}"));
+            args.push("-fw_cfg".into());
+            args.push(format!("name=opt/tx.initrd,file={}", initramfs.display()));
         }
     } else {
-        args.push("-append".into());
-        if target == TxTarget::Rv64M1DockMock {
-            args.push("tx.profile=smoke tx.board=m1dock-mock console=ttyS0".into());
+        let cmdline = if target == TxTarget::Rv64M1DockMock {
+            "tx.profile=smoke tx.board=m1dock-mock console=ttyS0"
         } else {
-            args.push("tx.profile=smoke console=ttyS0".into());
+            "tx.profile=smoke console=ttyS0"
+        };
+        args.push("-append".into());
+        args.push(cmdline.into());
+        if target == TxTarget::La64Qemu {
+            args.push("-fw_cfg".into());
+            args.push(format!("name=opt/tx.cmdline,string={cmdline}"));
         }
     }
 
@@ -185,7 +208,7 @@ fn qemu_command(
                 args.push("virtio-blk-device,drive=m1sd,bus=virtio-mmio-bus.0".into());
             }
             TxTarget::La64Qemu => {
-                args.push("virtio-blk-pci,drive=txblk0".into());
+                args.push("virtio-blk-pci-non-transitional,drive=txblk0,rombar=0".into());
             }
             TxTarget::Rv64Qemu => {
                 args.push("virtio-blk-device,drive=txblk0".into());
@@ -194,8 +217,16 @@ fn qemu_command(
         args.push("-drive".into());
         if target == TxTarget::Rv64M1DockMock {
             args.push("file=target/images/m1dock-sd.img,format=raw,if=none,id=m1sd".into());
+        } else if target == TxTarget::La64Qemu {
+            args.push(format!(
+                "driver=raw,file.driver=file,file.filename=target/images/{},file.locking=off,if=none,id=txblk0,read-only=on",
+                busybox_root_ext4_name(target)
+            ));
         } else {
-            args.push("file=target/images/busybox-root.ext4,format=raw,if=none,id=txblk0".into());
+            args.push(format!(
+                "file=target/images/{},format=raw,if=none,id=txblk0",
+                busybox_root_ext4_name(target)
+            ));
         }
     }
     args.push("-d".into());
@@ -616,6 +647,9 @@ mod tests {
         assert!(rendered.contains("-m 1152M"));
         assert!(rendered.contains("-smp 4"));
         assert!(rendered.contains("-serial file:target/qemu-la64-qemu-smoke.serial.log"));
+        assert!(
+            rendered.contains("-fw_cfg name=opt/tx.cmdline,string=tx.profile=smoke console=ttyS0")
+        );
         assert!(rendered.contains("tx-kernel-loongarch64-qemu-virt"));
     }
 
@@ -636,9 +670,13 @@ mod tests {
         .unwrap();
         let rendered = command.join(" ");
 
-        assert!(rendered.contains("-device virtio-blk-pci,drive=txblk0"));
+        assert!(rendered.contains("-device virtio-blk-pci-non-transitional,drive=txblk0,rombar=0"));
         assert!(!rendered.contains("virtio-blk-device,drive=txblk0"));
         assert!(rendered
-            .contains("-drive file=target/images/busybox-root.ext4,format=raw,if=none,id=txblk0"));
+            .contains("-fw_cfg name=opt/tx.cmdline,string=tx.profile=busybox console=ttyS0"));
+        assert!(rendered.contains("-fw_cfg name=opt/tx.initrd,file=/tmp/tx/target/images/busybox-initramfs-la64-qemu.cpio"));
+        assert!(rendered.contains(
+            "-drive driver=raw,file.driver=file,file.filename=target/images/busybox-root-la64-qemu.ext4,file.locking=off,if=none,id=txblk0,read-only=on"
+        ));
     }
 }

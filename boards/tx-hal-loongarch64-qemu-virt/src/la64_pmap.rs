@@ -1,8 +1,10 @@
-use super::la64_irq_trap::{read_la64_csr, write_la64_csr};
+use super::la64_irq_trap::{
+    align_up, console_write_hex, console_write_literal, linked_kernel_image, write_la64_csr,
+};
 use super::*;
 
 pub(crate) fn uart_put_byte(byte: u8) {
-    let base = QEMU_LA64_UART0_BASE as *mut u8;
+    let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *mut u8;
 
     unsafe {
         while core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_THRE == 0 {
@@ -15,7 +17,7 @@ pub(crate) fn uart_put_byte(byte: u8) {
 pub(crate) fn uart_try_get_byte() -> Option<u8> {
     #[cfg(target_arch = "loongarch64")]
     unsafe {
-        let base = QEMU_LA64_UART0_BASE as *const u8;
+        let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *const u8;
         if core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_DR == 0 {
             return None;
         }
@@ -124,21 +126,62 @@ pub(crate) fn free_la64_asid(asid: Asid) {
 }
 
 pub(crate) fn activate_la64_pmap(root: &PmapRoot) -> Result<(), PmapError> {
+    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:activate:start\n");
     let pgdh = ensure_la64_kernel_pgdh_root()?;
+    ensure_la64_low_kernel_identity_mapped(root)?;
+    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:pgdh=0x");
+    console_write_hex(pgdh.0);
+    console_write_literal(b"\n");
     configure_la64_page_walk_csrs();
+    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:pwcl:ok\n");
 
     let asid = root.asid().0 as usize & LA64_ASID_MASK;
+    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:root=0x");
+    console_write_hex(root.phys().0);
+    console_write_literal(b":asid=0x");
+    console_write_hex(asid);
+    console_write_literal(b"\n");
     write_la64_csr(LA64_CSR_ASID, asid);
+    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:asid:ok\n");
     write_la64_csr(LA64_CSR_PGDL, root.phys().0);
+    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:pgdl:ok\n");
     write_la64_csr(LA64_CSR_PGDH, pgdh.0);
+    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:pgdh-write:ok\n");
 
-    let crmd = (read_la64_csr(LA64_CSR_CRMD) | LA64_CRMD_PG) & !LA64_CRMD_DA;
+    let crmd = LA64_CRMD_PG | LA64_CRMD_DATF_CC | LA64_CRMD_DATM_CC;
+    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:crmd-new=0x00000000000000b0\n");
     write_la64_csr(LA64_CSR_CRMD, crmd);
+    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:crmd:ok\n");
     la64_invtlb_all();
+    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:invtlb:ok\n");
 
     LA64_ACTIVE_ASID.store(asid, Ordering::Release);
     LA64_ACTIVE_PGDL.store(root.phys().0, Ordering::Release);
     LA64_ACTIVE_PGDH.store(pgdh.0, Ordering::Release);
+    Ok(())
+}
+
+pub(crate) fn ensure_la64_low_kernel_identity_mapped(root: &PmapRoot) -> Result<(), PmapError> {
+    let image = linked_kernel_image();
+    let start = align_down(image.start.0, <Platform as PlatformConfig>::PAGE_SIZE);
+    let end = align_up(image.end().0, <Platform as PlatformConfig>::PAGE_SIZE);
+    let mut phys = start;
+    while phys < end {
+        let virt = VirtAddr(phys);
+        let reservation = reserve_la64_mapping_in_root(
+            root.phys(),
+            virt,
+            PhysAddr(phys),
+            PmapReserveKind::Page4K,
+        )?;
+        if let Some(reservation) = reservation {
+            register_la64_committed_intermediates(reservation.intermediates());
+            let permissions = PmapPermissions::KERNEL_RW.union(PmapPermissions::EXECUTE);
+            let leaf = encode_la64_leaf_pte(PhysAddr(phys), permissions);
+            write_la64_leaf(root.phys(), virt, PmapReserveKind::Page4K, leaf)?;
+        }
+        phys = phys.saturating_add(<Platform as PlatformConfig>::PAGE_SIZE);
+    }
     Ok(())
 }
 
@@ -1044,10 +1087,25 @@ pub(crate) fn la64_read_stable_counter() -> u64 {
 }
 
 pub(crate) fn la64_current_cpu_id() -> CpuId {
-    let kernel_tls = la64_read_kernel_tls();
-    if kernel_tls < LA64_MAX_BOOT_CPUS {
-        CpuId(kernel_tls)
-    } else {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let cpu: usize;
+        unsafe {
+            core::arch::asm!(
+                "csrrd {cpu}, 0x20",
+                cpu = out(reg) cpu,
+                options(nomem, nostack)
+            );
+        }
+        return CpuId(cpu.min(LA64_MAX_BOOT_CPUS - 1));
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        let kernel_tls = la64_read_kernel_tls();
+        if kernel_tls < LA64_MAX_BOOT_CPUS {
+            return CpuId(kernel_tls);
+        }
         CpuId(0)
     }
 }

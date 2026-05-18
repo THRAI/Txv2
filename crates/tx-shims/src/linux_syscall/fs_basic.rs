@@ -4,8 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOp, StepOutcome};
-use tx_subsystems::vfs::InlineName;
+use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOutcome};
 
 /// `fcntl(fd, cmd, arg)` per the Wave 2 ELF-loader plan §"Part 2 —
 /// Per-fd CLOEXEC bitmap + fcntl(F_SETFD) + O_CLOEXEC" plus Slice 7 of
@@ -39,53 +38,49 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         None => return SyscallResult::Error(EBADF_VALUE),
     };
 
+    // PR-3: F_GETFD/F_SETFD go through FcntlFdOp + drive_oneshot.
+    if cmd == F_GETFD || cmd == F_SETFD {
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let set_on = if cmd == F_SETFD {
+            Some((arg & FD_CLOEXEC as u64) != 0)
+        } else {
+            None
+        };
+        let mut op = FcntlFdOp {
+            process: ctx.process.clone(),
+            fd,
+            set_on,
+        };
+        return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(Some(cloexec)) => SyscallResult::Return(if cloexec { FD_CLOEXEC as i64 } else { 0 }),
+            Ok(None) => SyscallResult::Return(0),
+            Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        };
+    }
+
     match cmd {
-        F_GETFD => {
-            // POSIX: return `FD_CLOEXEC` if bit set, `0` otherwise.
-            let value = if ctx.process.fd_cloexec(fd) {
-                FD_CLOEXEC as i64
-            } else {
-                0
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = FcntlDupFdOp {
+                process: ctx.process.clone(),
+                fd,
+                min: arg as u32,
+                cloexec: cmd == F_DUPFD_CLOEXEC,
             };
-            SyscallResult::Return(value)
-        }
-        F_SETFD => {
-            // POSIX: set the close-on-exec bit from `arg & FD_CLOEXEC`.
-            // Other bits in `arg` are silently ignored (this matches
-            // Linux's behaviour — `FD_CLOEXEC` is the only bit
-            // defined on this command's `arg`).
-            let on = (arg & FD_CLOEXEC as u64) != 0;
-            ctx.process.set_fd_cloexec(fd, on);
-            SyscallResult::Return(0)
-        }
-        F_DUPFD => {
-            // Duplicate `fd` into the lowest-numbered slot ≥ `arg`.
-            // Per POSIX: the result clears the cloexec bit
-            // (`F_DUPFD_CLOEXEC` is the variant that sets it).
-            let min = arg as u32;
-            let new_fd = ctx.process.allocate_fd_at_least(min);
-            // install_fd returns the previous occupant, if any (in
-            // practice always None because allocate_fd_at_least
-            // returns the lowest *unused* slot). Drop it under the
-            // caller's EBR if it surfaces.
-            let _previous = ctx.process.install_fd(new_fd, file);
-            ctx.process.set_fd_cloexec(new_fd, false);
-            SyscallResult::Return(new_fd as i64)
-        }
-        F_DUPFD_CLOEXEC => {
-            // Like F_DUPFD but sets the cloexec bit on the new fd.
-            let min = arg as u32;
-            let new_fd = ctx.process.allocate_fd_at_least(min);
-            let _previous = ctx.process.install_fd(new_fd, file);
-            ctx.process.set_fd_cloexec(new_fd, true);
-            SyscallResult::Return(new_fd as i64)
+            return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(new_fd) => SyscallResult::Return(new_fd as i64),
+                Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            };
         }
         F_GETFL => {
-            // Compose access-mode + per-OpenFile open-flag bits.
-            // `O_CLOEXEC` is **not** included — Linux's F_GETFL only
-            // reports the per-OpenFile bits, while CLOEXEC is per-fd
-            // (read via F_GETFD).
-            let f = file.flags();
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = OpenFileGetFlOp { file: &file };
+            let f = match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(flags) => flags,
+                Err(v3errno) => {
+                    return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
+                }
+            };
             let mut bits: u64 = match (f.read, f.write) {
                 (true, false) => O_RDONLY as u64,
                 (false, true) => O_WRONLY as u64,
@@ -101,11 +96,16 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             SyscallResult::Return(bits as i64)
         }
         F_SETFL => {
-            // TODO(phase-fcntl-setfl): F_SETFL needs interior-mutable
-            // OpenFileFlags. Future slice owns this — the plain
-            // `Copy`-struct field on OpenFile cannot be mutated
-            // atomically without a structural change.
-            SyscallResult::Error(ENOSYS_VALUE)
+            let arg = args[2] as u64;
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = OpenFileSetFlOp {
+                file: &file,
+                nonblocking: (arg & O_NONBLOCK as u64) != 0,
+            };
+            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            }
         }
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
@@ -188,50 +188,68 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         nonblocking: flags & O_NONBLOCK != 0,
     };
 
-    // Resolve the base-directory anchor.
-    //
-    // AT_FDCWD (-100): use the process cwd. Zombies + uninitialised init
-    // pre-rootfs both surface `cwd() == None`; the alive caller of `openat`
-    // always has a cwd installed by `step_chdir` / bootstrap. No-cwd is a
-    // defensive `-ENOENT`.
-    //
-    // Real dirfd (>= 0): look up the fd, verify it is a directory, and
-    // build a synthetic `Cap<DEntry>` wrapping its rnode. The rnode carries
-    // `containing_mount_weak()` (set by `materialise_child_rnode_v3` via
-    // `RNode::new_cap_in_mount` during the original directory open), so the
-    // walker's `fs_ops_for` finds the in-scope `FsOps` immediately.
-    //
-    // Any negative value other than AT_FDCWD: -EBADF (matches Linux).
+    // Resolve the dirfd anchor. AT_FDCWD → process cwd; a real dirfd
+    // → the `opendir_dentry` of its OpenFile (an O_DIRECTORY open of
+    // that directory). Invalid / non-directory fds surface as EBADF /
+    // ENOTDIR.
     let cwd: Cap<DEntry> = if dirfd == AT_FDCWD {
         match ctx.process.cwd() {
             Some(d) => d,
             None => return SyscallResult::Error(ENOENT_VALUE),
         }
-    } else if dirfd >= 0 {
-        let file = match ctx.process.fd(dirfd as u32) {
+    } else if dirfd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    } else {
+        let open_file = match ctx.process.fd(dirfd as u32) {
             Some(f) => f,
             None => return SyscallResult::Error(EBADF_VALUE),
         };
-        // Only directory fds are valid as a base for openat. Non-directory
-        // fds (regular files, pipes, TTYs) return -ENOTDIR per Linux.
-        match file.rnode().backing() {
-            RNodeBacking::Directory => {}
-            _ => return SyscallResult::Error(ENOTDIR_VALUE),
+        match open_file.opendir_dentry() {
+            Some(d) => d,
+            None => return SyscallResult::Error(ENOTDIR_VALUE),
         }
-        let rnode = file.rnode().clone();
-        // Mint a synthetic dentry anchored at the directory rnode. No
-        // parent-hint chain is set (the rnode's containing_mount_weak
-        // provides the FsOps link the walker needs). ROOT name so the
-        // dentry is treated as a resolution anchor (not a named child).
-        match DEntry::new_cap(InlineName::ROOT, rnode) {
-            Ok(d) => d,
-            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
-        }
-    } else {
-        return SyscallResult::Error(EBADF_VALUE);
     };
 
     let walker_cred = ctx.walker_cred();
+
+    // PR async migration: non-O_CREAT, non-O_TRUNC simple open
+    // goes through `OpenOp + drive()` — no manual step loop.
+    if !want_create && !want_trunc {
+        use tx_scripts::drive;
+        use tx_substrate::step::DriveMode;
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let op = OpenOp {
+            rooted_at: cwd.clone(),
+            path: path.clone(),
+            flags: open_flags,
+            mode: mode as u16,
+            cred: ctx.walker_cred(),
+        };
+        let mailbox_arc = script_ctx.mailbox().cloned();
+        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+        let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+        let openfile = match drive(
+            op,
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox_arc.as_ref(),
+            delegate_registry_arc.as_deref(),
+            timer_wheel_arc.as_ref(),
+        )
+        .await
+        {
+            Ok(file) => file,
+            Err(v3errno) => {
+                return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
+            }
+        };
+        let fd = ctx.process.allocate_fd();
+        let _ = ctx.process.set_fd(fd, Some(openfile));
+        if want_cloexec {
+            ctx.process.set_fd_cloexec(fd, true);
+        }
+        return SyscallResult::Return(fd as i64);
+    }
 
     // Step 1: walk the path to a terminal dentry. Three outcomes:
     //   - success: the file exists. Handle O_EXCL collision; otherwise
@@ -257,8 +275,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     use step_engine::{Errno as V3Errno, StepOutcome as V3};
     let walk_first = {
         let guard = step_engine::guard();
-        let outcome =
-            poll_walker_synchronously(step_walk(cwd.clone(), &path, &walker_cred, &guard));
+        let outcome = step_walk(cwd.clone(), &path, &walker_cred, &guard);
         drop(guard);
         outcome
     };
@@ -323,14 +340,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // Same Send-future discipline as Step 1: poll_walker_synchronously.
     let openfile: Cap<OpenFile> = {
         let guard = step_engine::guard();
-        let outcome = poll_walker_synchronously(step_open(
-            cwd,
-            &path,
-            open_flags,
-            mode as u16,
-            &walker_cred,
-            &guard,
-        ));
+        let outcome = step_open(cwd, &path, open_flags, mode as u16, &walker_cred, &guard);
         drop(guard);
         match outcome {
             V3::Done(file) => file,
@@ -368,18 +378,18 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
 // the process fd-table via `Cap<ProcessIdentity>` accessors
 // (`fd`, `set_fd`, `set_fd_cloexec`). When fd-table mutation gains a
 // StepOp wrap, thread `&mut KernelScriptCtx` here.
+/// PR-3 migration: `CloseOp` is a `OneShotStepOp` — dispatched via
+/// `drive_oneshot` (no reactor, no yield).
 pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
-    if ctx.process.fd(fd).is_none() {
-        return SyscallResult::Error(EBADF_VALUE);
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = CloseOp {
+        process: ctx.process.clone(),
+        fd,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
-    let _previous = ctx.process.set_fd(fd, None);
-    // Clear the cloexec bit defensively. The bitmap is a sibling of
-    // the fd-table BTreeMap (not folded into OpenFile.flags), so the
-    // close arm explicitly clears it even though the fd-table entry
-    // is gone — matches Linux's `close(2)` "cloexec disposition is
-    // forgotten" semantic.
-    ctx.process.set_fd_cloexec(fd, false);
-    SyscallResult::Return(0)
 }
 
 /// `dup(oldfd)`. Linux RV64 generic ABI `__NR_dup = 23`.
@@ -391,18 +401,15 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// (we clone the `Cap<OpenFile>`); both fds reference the same
 /// epoch-managed identity.
 pub(super) fn sys_dup<'a>(oldfd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
-    let file = match ctx.process.fd(oldfd) {
-        Some(f) => f,
-        None => return SyscallResult::Error(EBADF_VALUE),
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = DupOp {
+        process: ctx.process.clone(),
+        oldfd,
     };
-    let newfd = ctx.process.allocate_fd();
-    let _ = ctx.process.set_fd(newfd, Some(file));
-    // POSIX: the duplicate fd has its cloexec bit cleared. Defensively
-    // clear it (allocate_fd returned an unused slot, so the bit
-    // should already be clear, but `BTreeSet<u32>::remove` is cheap
-    // and guards against a stale bit from a previous lifecycle).
-    ctx.process.set_fd_cloexec(newfd, false);
-    SyscallResult::Return(newfd as i64)
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(newfd) => SyscallResult::Return(newfd as i64),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
 }
 
 /// `dup3(oldfd, newfd, flags)`. Linux RV64 generic ABI
@@ -427,26 +434,17 @@ pub(super) fn sys_dup3<'a>(
     flags: u32,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
-    if oldfd == newfd {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    // Validate flags: only O_CLOEXEC is meaningful. Other bits =
-    // -EINVAL. (Linux dup3 specifically rejects junk flags rather
-    // than ignoring them, unlike open().)
-    if flags & !O_CLOEXEC != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    let file = match ctx.process.fd(oldfd) {
-        Some(f) => f,
-        None => return SyscallResult::Error(EBADF_VALUE),
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = Dup3Op {
+        process: ctx.process.clone(),
+        oldfd,
+        newfd,
+        flags,
     };
-    // install_fd returns the previous occupant. We drop it
-    // immediately — the Cap goes through EBR-deferred reclamation,
-    // matching `sys_close`'s semantic.
-    let _previous = ctx.process.install_fd(newfd, file);
-    let want_cloexec = flags & O_CLOEXEC != 0;
-    ctx.process.set_fd_cloexec(newfd, want_cloexec);
-    SyscallResult::Return(newfd as i64)
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(fd) => SyscallResult::Return(fd as i64),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
 }
 
 /// `pipe2(int pipefd[2], int flags)`. Linux RV64 generic ABI
@@ -491,21 +489,14 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
     // not (yet) read authority receive the same context shape so
     // future authority-bearing arms compose. Restrictions cap is a
     // fresh placeholder until PR-K (D5 §7).
-    use step_engine::{StepOp, StepOutcome as V3Pipe};
     use tx_subsystems::pipe::Pipe2Op;
     let mut script_ctx = build_subject_script_ctx(ctx);
     let (reader_cap, writer_cap) = {
         let mut op = Pipe2Op { flags: pipe_flags };
-        match op.step(&mut script_ctx) {
-            V3Pipe::Done(pair) => pair,
-            V3Pipe::Err(v3errno) => {
-                let errno: Errno = v3errno.into();
-                return SyscallResult::Error(errno_to_i32(errno));
-            }
-            V3Pipe::Continue { .. } | V3Pipe::Yield { .. } => {
-                // `step_pipe2` is allocation-only; Continue/Yield
-                // are unreachable. Surface as -EIO defensively.
-                return SyscallResult::Error(EIO_VALUE);
+        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(pair) => pair,
+            Err(v3errno) => {
+                return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
             }
         }
     };
@@ -560,19 +551,15 @@ pub(super) fn sys_lseek<'a>(
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    let guard = step_engine::guard();
-    use StepOutcome as V3Out;
-    match file.step_lseek(offset, whence, &guard) {
-        V3Out::Done(new_offset) => SyscallResult::Return(new_offset as i64),
-        V3Out::Continue { .. } | V3Out::Yield { .. } => {
-            // Unreachable in practice — see the comment on the
-            // function header.
-            SyscallResult::Error(errno_to_i32(Errno::EIO))
-        }
-        V3Out::Err(v3errno) => {
-            let errno: Errno = v3errno.into();
-            SyscallResult::Error(errno_to_i32(errno))
-        }
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = tx_subsystems::vfs::OpenFileLseekOp {
+        file: &file,
+        offset,
+        whence,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(new_offset) => SyscallResult::Return(new_offset as i64),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
 }
 
@@ -875,6 +862,46 @@ pub(super) struct StatLayout {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct StatxTimestamp {
+    tv_sec: i64,
+    tv_nsec: u32,
+    __reserved: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StatxLayout {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    __spare0: u16,
+    stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
+    stx_attributes_mask: u64,
+    stx_atime: StatxTimestamp,
+    stx_btime: StatxTimestamp,
+    stx_ctime: StatxTimestamp,
+    stx_mtime: StatxTimestamp,
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
+    stx_mnt_id: u64,
+    stx_dio_mem_align: u32,
+    stx_dio_offset_align: u32,
+    __spare3: [u64; 12],
+}
+
+const _: () = assert!(core::mem::size_of::<StatxTimestamp>() == 16);
+const _: () = assert!(core::mem::size_of::<StatxLayout>() == 256);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct LinuxDirent64Header {
     d_ino: u64,
     d_off: i64,
@@ -912,6 +939,41 @@ pub(super) fn inode_meta_to_stat(meta: &InodeMeta, ino: u64, rdev: u64) -> StatL
     }
 }
 
+fn inode_meta_to_statx(meta: &InodeMeta, ino: u64) -> StatxLayout {
+    let ts = |sec, nsec| StatxTimestamp {
+        tv_sec: sec,
+        tv_nsec: nsec as u32,
+        __reserved: 0,
+    };
+
+    StatxLayout {
+        stx_mask: numbers::STATX_BASIC_STATS,
+        stx_blksize: STAT_BLKSIZE as u32,
+        stx_attributes: 0,
+        stx_nlink: meta.nlinks,
+        stx_uid: meta.uid,
+        stx_gid: meta.gid,
+        stx_mode: meta.mode,
+        __spare0: 0,
+        stx_ino: ino,
+        stx_size: meta.size,
+        stx_blocks: meta.blocks,
+        stx_attributes_mask: 0,
+        stx_atime: ts(meta.atime.sec, meta.atime.nsec),
+        stx_btime: ts(0, 0),
+        stx_ctime: ts(meta.ctime.sec, meta.ctime.nsec),
+        stx_mtime: ts(meta.mtime.sec, meta.mtime.nsec),
+        stx_rdev_major: 0,
+        stx_rdev_minor: 0,
+        stx_dev_major: 0,
+        stx_dev_minor: 0,
+        stx_mnt_id: 0,
+        stx_dio_mem_align: 0,
+        stx_dio_offset_align: 0,
+        __spare3: [0; 12],
+    }
+}
+
 /// `fstat(fd, statbuf)`. Linux RV64 generic ABI `__NR_fstat = 80`.
 ///
 /// Reads `OpenFile.rnode().meta()` for the fd and writes the Linux
@@ -938,11 +1000,124 @@ pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     };
 
     let rnode = file.rnode();
-    let meta = rnode.meta();
-    let ino = rnode.fs_object_id().as_u64();
+    let fs_object_id = rnode.fs_object_id();
+    // Live size resolution: cached `rnode.meta()` is the snapshot at
+    // materialisation time and doesn't see in-place writes. For a
+    // page-backed regular file the in-memory `PageContainer.size_bytes`
+    // is the authoritative live size (`step_write_from_*` calls
+    // `pc.grow_size_to` on every write). Fall back to
+    // `fs_ops.load_inode_meta` for other rnode kinds, then to the
+    // cached meta. Without this, oscomp basic test_mmap/test_munmap
+    // print `file len: 0` and crash on the 0-length mmap because
+    // tmpfs/ext4's on-disk inode metadata is never refreshed after
+    // the page-cache write.
+    let mut meta = match fs_ops_for_rnode(rnode) {
+        Some(fs_ops) => {
+            let guard = step_engine::guard();
+            match fs_ops.load_inode_meta(fs_object_id, &guard) {
+                StepOutcome::Done(m) => m,
+                _ => rnode.meta(),
+            }
+        }
+        None => rnode.meta(),
+    };
+    let pc_size = crate::linux_syscall::vm::extract_page_container(&file).map(|pc| pc.size_bytes());
+    if let Some(sz) = pc_size {
+        meta.size = sz;
+    }
+    let ino = fs_object_id.as_u64();
     let stat = inode_meta_to_stat(&meta, ino, 0);
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+    SyscallResult::Return(0)
+}
+
+/// `fchdir(fd)`. Linux RV64 ABI `__NR_fchdir = 50`.
+pub(super) async fn sys_fchdir<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    let fd = args[0] as u32;
+    let open_file = match ctx.process.fd(fd) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let dentry = match open_file.opendir_dentry() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOTDIR_VALUE),
+    };
+    match tx_subsystems::process::step_chdir(&ctx.process, dentry) {
+        tx_subsystems::process::ChdirOutcome::Replaced { .. } => SyscallResult::Return(0),
+        tx_subsystems::process::ChdirOutcome::ZombieIgnored => SyscallResult::Error(EACCES_VALUE),
+    }
+}
+
+/// `statx/// `statx(dirfd, path, flags, mask, statxbuf)`. Linux generic ABI
+/// `__NR_statx = 291`.
+///
+/// This is the metadata probe LA64 musl/busybox uses before `ls`
+/// opens a directory. Txv2 reports the same inode metadata already
+/// used by `newfstatat`; unsupported sync policy bits are accepted
+/// because there is no cache coherency distinction in the current VFS
+/// layer.
+pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let dirfd = args[0] as i32;
+    let path_uaddr = args[1];
+    let flags = args[2] as u32;
+    let _mask = args[3] as u32;
+    let statxbuf_uaddr = args[4];
+
+    if dirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if path_uaddr == 0 || statxbuf_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    let known_flags = AT_EMPTY_PATH
+        | AT_NO_AUTOMOUNT
+        | numbers::AT_STATX_SYNC_TYPE
+        | (AT_SYMLINK_NOFOLLOW as u32);
+    if flags & !known_flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    let (statx_result, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
+        (
+            StatxResult {
+                meta: cwd.rnode().meta(),
+            },
+            cwd.rnode().fs_object_id(),
+        )
+    } else {
+        let walker_cred = ctx.walker_cred();
+        let result = {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = StatxOp {
+                rooted_at: &cwd,
+                path: &path,
+                cred: &walker_cred,
+                target: None,
+            };
+            step_engine::drive_oneshot(&mut op, &mut script_ctx)
+        };
+        match result {
+            Ok((sr, id)) => (sr, id),
+            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        }
+    };
+
+    let statx = inode_meta_to_statx(&statx_result.meta, ino.as_u64());
+    if let Err(errno) = bootstrap_write_user::<StatxLayout>(&ctx.aspace, statxbuf_uaddr, statx) {
         return SyscallResult::Error(errno_to_i32(errno));
     }
     SyscallResult::Return(0)
@@ -994,36 +1169,32 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 
     let walker_cred = ctx.walker_cred();
 
-    // AT_EMPTY_PATH + empty path: stat the cwd itself. No walker
-    // invocation — the cwd dentry's rnode meta is the answer.
-    let dentry: Cap<DEntry> = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
-        match ctx.process.cwd() {
-            Some(d) => d,
-            None => return SyscallResult::Error(ENOENT_VALUE),
-        }
+    // AT_EMPTY_PATH + empty path: stat the cwd itself directly,
+    // bypassing the walker. Otherwise use StatOp + drive_oneshot.
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    let (meta, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
+        (cwd.rnode().meta(), cwd.rnode().fs_object_id())
     } else {
-        let cwd = match ctx.process.cwd() {
-            Some(d) => d,
-            None => return SyscallResult::Error(ENOENT_VALUE),
+        let result = {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = StatOp {
+                rooted_at: &cwd,
+                path: &path,
+                cred: &walker_cred,
+                target: None,
+            };
+            step_engine::drive_oneshot(&mut op, &mut script_ctx)
         };
-        use StepOutcome as V3;
-        let outcome = {
-            let guard = step_engine::guard();
-            poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard))
-        };
-        match outcome {
-            V3::Done(d) => d,
-            V3::Continue { .. } | V3::Yield { .. } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        match result {
+            Ok((m, id)) => (m, id),
+            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
         }
     };
 
-    let rnode = dentry.rnode();
-    let meta = rnode.meta();
-    let ino = rnode.fs_object_id().as_u64();
-    let stat = inode_meta_to_stat(&meta, ino, 0);
+    let stat = inode_meta_to_stat(&meta, ino.as_u64(), 0);
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
         return SyscallResult::Error(errno_to_i32(errno));
@@ -1210,4 +1381,164 @@ pub(super) fn fs_ops_for_rnode(
     let weak = rnode.containing_mount_weak()?;
     let payload = weak.upgrade(&guard)?;
     Some(payload.fs_ops.clone())
+}
+
+/// `statfs(path, buf)`. Linux RV64 ABI `__NR_statfs = 43`.
+pub(super) async fn sys_statfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    let buf_uaddr = args[1];
+    let mut buf = [0u8; 120];
+    buf[0..8].copy_from_slice(&0x01021994u64.to_le_bytes());
+    buf[8..16].copy_from_slice(&4096u64.to_le_bytes());
+    buf[88..96].copy_from_slice(&255u64.to_le_bytes());
+    buf[96..104].copy_from_slice(&4096u64.to_le_bytes());
+    if let Err(e) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &buf) {
+        return SyscallResult::Error(errno_to_i32(e));
+    }
+    SyscallResult::Return(0)
+}
+
+/// `fstatfs(fd, buf)`. Linux RV64 ABI `__NR_fstatfs = 44`.
+pub(super) async fn sys_fstatfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    let fd = args[0] as u32;
+    if ctx.process.fd(fd).is_none() {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    sys_statfs::<P>(args, ctx).await
+}
+
+/// `sync()`. Linux RV64 ABI `__NR_sync = 81`.
+pub(super) async fn sys_sync<P: PmapIf>(_args: [u64; 6], _ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    SyscallResult::Return(0)
+}
+
+/// `syncfs(fd)`. Linux RV64 ABI `__NR_syncfs = 267`.
+/// Syncs the filesystem containing the given fd.
+pub(super) async fn sys_syncfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    let fd = args[0] as u32;
+    let open_file = match ctx.process.fd(fd) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let guard = step_engine::guard();
+    let rnode = open_file.rnode();
+    let page_backing = match rnode
+        .containing_mount_weak()
+        .and_then(|w| w.upgrade(&guard))
+    {
+        Some(mp) => mp.fs_page_backing().clone(),
+        None => return SyscallResult::Error(ENODEV_VALUE),
+    };
+    // syncfs: flush the entire filesystem. The default impl falls back
+    // to `fsync_file(ROOT)`; journaling filesystems can override.
+    match page_backing.sync_filesystem(&guard) {
+        StepOutcome::Done(()) => SyscallResult::Return(0),
+        StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(Errno::from(e))),
+        _ => SyscallResult::Error(EIO_VALUE),
+    }
+}
+
+/// `fsync(fd)`. Linux RV64 ABI `__NR_fsync = 82`.
+/// Syncs the specific file referenced by `fd` (data + metadata).
+pub(super) async fn sys_fsync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    let fd = args[0] as u32;
+    let open_file = match ctx.process.fd(fd) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let rnode = open_file.rnode();
+    let fs_object_id = rnode.fs_object_id();
+    // The mount-weak upgrade and the page-backing clone are done inside
+    // a scoped guard so no guard crosses the subsequent
+    // `drive(...).await` (INVARIANTS_v5 EBR-7).
+    let page_backing = {
+        let guard = step_engine::guard();
+        match rnode
+            .containing_mount_weak()
+            .and_then(|w| w.upgrade(&guard))
+        {
+            Some(mp) => mp.fs_page_backing().clone(),
+            None => return SyscallResult::Error(ENODEV_VALUE),
+        }
+    };
+    // fsync: sync the specific file via FileFsyncOp + drive().
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let op = FileFsyncOp {
+        page_backing,
+        fs_object_id,
+    };
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        None,
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
+}
+
+/// `fdatasync(fd)`. Linux RV64 ABI `__NR_fdatasync = 83`.
+/// Syncs file data (not metadata).  v1: delegates to fsync.
+pub(super) async fn sys_fdatasync<P: PmapIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
+    sys_fsync::<P>(args, ctx).await
+}
+
+/// `flock(fd, operation)`. Linux RV64 ABI `__NR_flock = 32`.
+///
+/// v1: exclusive-lock only per open-file-description.  LOCK_SH
+/// maps to LOCK_EX.  No deadlock detection.  Per POSIX flock
+/// semantics (advisory, not enforced on I/O).
+pub(super) async fn sys_flock<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    let fd = args[0] as u32;
+    let operation = args[1] as u32;
+
+    const LOCK_SH: u32 = 1;
+    const LOCK_EX: u32 = 2;
+    const LOCK_UN: u32 = 8;
+    const LOCK_NB: u32 = 4;
+
+    let open_file = match ctx.process.fd(fd) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+
+    if (operation & LOCK_UN) != 0 {
+        open_file.flock_release();
+        return SyscallResult::Return(0);
+    }
+
+    let lock_type = operation & 3; // LOCK_SH=1 or LOCK_EX=2
+    if lock_type != LOCK_SH && lock_type != LOCK_EX {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let blocking = (operation & LOCK_NB) == 0;
+
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = FlockOp {
+        file: &open_file,
+        lock_type,
+        blocking,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
 }

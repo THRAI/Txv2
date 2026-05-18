@@ -1,6 +1,8 @@
 use super::*;
+use crate::page_backed::adapter::step_engine::{
+    self as step_engine, ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
 use crate::vm::AddressSpace;
-use crate::page_backed::adapter::step_engine::{self as step_engine, ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 /// Read up to `len` bytes from `pc` at `of.offset()` into the user buffer at
 /// `dst`, returning the number of bytes actually copied.
@@ -18,6 +20,11 @@ pub fn step_read_to_user(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::page_backed::adapter::step_engine::StepOutcome as V3;
     if len == 0 {
         return V3::done(0);
@@ -57,6 +64,11 @@ pub fn step_write_from_user(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::page_backed::adapter::step_engine::StepOutcome as V3;
     if len == 0 {
         return V3::done(0);
@@ -134,7 +146,7 @@ fn step_range_with_user_buffer(
         //   if no progress yet, else partial `Done`.
         // - `Err(errno)` with `advanced == 0` → v3 `Err(errno)`.
         //   Otherwise return v3 `Done(advanced)` (partial-success).
-use crate::page_backed::adapter::step_engine::YieldShape;
+        use crate::page_backed::adapter::step_engine::YieldShape;
         match pc.materialize_page(page_index, access, guard) {
             StepOutcome::Done(materialized) => {
                 match copy_chunk_user(
@@ -301,6 +313,11 @@ pub fn step_read_to_kernel(
     dst: &mut [u8],
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::page_backed::adapter::step_engine::StepOutcome as V3;
     let len = dst.len();
     if len == 0 {
@@ -330,6 +347,11 @@ pub fn step_write_from_kernel(
     src: &[u8],
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::page_backed::adapter::step_engine::StepOutcome as V3;
     let len = src.len();
     if len == 0 {
@@ -526,26 +548,14 @@ pub struct ReadToUserOp<'a> {
     pub aspace: &'a AddressSpace,
     pub dst: UserPtr<u8>,
     pub len: usize,
-    pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for ReadToUserOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for ReadToUserOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
-        step_read_to_user(
-            self.pc,
-            self.of,
-            self.aspace,
-            self.dst,
-            self.len,
-            self.guard,
-        )
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let __guard = step_engine::guard();
+        step_read_to_user(self.pc, self.of, self.aspace, self.dst, self.len, &__guard)
     }
 }
 
@@ -556,25 +566,13 @@ pub struct WriteFromUserOp<'a> {
     pub aspace: &'a AddressSpace,
     pub src: UserPtr<u8>,
     pub len: usize,
-    pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for WriteFromUserOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for WriteFromUserOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
-        step_write_from_user(
-            self.pc,
-            self.of,
-            self.aspace,
-            self.src,
-            self.len,
-            self.guard,
-        )
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let __guard = step_engine::guard();
+        step_write_from_user(self.pc, self.of, self.aspace, self.src, self.len, &__guard)
     }
 }

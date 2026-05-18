@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use core::{ptr::NonNull, task::Waker};
 use std::{
     sync::{
@@ -211,7 +213,7 @@ fn static_raw_queue_storage_produces_cloneable_raw_handles_without_arc_allocatio
     let queue = STATIC_TEST_QUEUE.raw();
     let queue_from_static = RawQueue::from_static(&STATIC_TEST_QUEUE);
     let wakes = Arc::new(AtomicUsize::new(0));
-    let mut subscription = queue.subscribe(0x1, counting_waker(Arc::clone(&wakes)));
+    let mut subscription = queue.subscribe_with_waker(0x1, counting_waker(Arc::clone(&wakes)));
 
     assert_eq!(queue_from_static.fire(0x1), 1);
     assert_eq!(wakes.load(Ordering::SeqCst), 1);
@@ -228,7 +230,7 @@ fn static_raw_port_storage_produces_cloneable_raw_handles_without_arc_allocation
     let port = STATIC_TEST_PORT.raw();
     let port_from_static = RawPort::from_static(&STATIC_TEST_PORT);
     let wakes = Arc::new(AtomicUsize::new(0));
-    let mut subscription = port.subscribe(0x1, counting_waker(Arc::clone(&wakes)));
+    let mut subscription = port.subscribe_with_waker(0x1, counting_waker(Arc::clone(&wakes)));
 
     assert_eq!(port_from_static.fire(0x1), 1);
     assert_eq!(wakes.load(Ordering::SeqCst), 1);
@@ -252,12 +254,12 @@ fn declared_static_queue_and_port_validate_events_over_static_storage() {
     .expect("valid static port declaration");
     let queue_wakes = Arc::new(AtomicUsize::new(0));
     let port_wakes = Arc::new(AtomicUsize::new(0));
-    let mut queue_subscription = queue.subscribe(
+    let mut queue_subscription = queue.subscribe_with_waker(
         Readiness::HAS_DATA,
         counting_waker(Arc::clone(&queue_wakes)),
     );
     let mut port_subscription =
-        port.subscribe(Lifecycle::EXITED, counting_waker(Arc::clone(&port_wakes)));
+        port.subscribe_with_waker(Lifecycle::EXITED, counting_waker(Arc::clone(&port_wakes)));
 
     assert_eq!(queue.fire(Readiness::HAS_DATA), 1);
     assert_eq!(port.fire(Lifecycle::EXITED), 1);
@@ -289,7 +291,7 @@ fn declared_queue_exposes_metadata_and_rejects_undeclared_bits() {
     let queue = DeclaredQueue::new(declaration).expect("valid queue declaration");
     let wakes = Arc::new(AtomicUsize::new(0));
     let mut subscription = queue
-        .try_subscribe(Readiness::HAS_DATA, counting_waker(Arc::clone(&wakes)))
+        .try_subscribe_with_waker(Readiness::HAS_DATA, counting_waker(Arc::clone(&wakes)))
         .expect("declared interest");
 
     assert_eq!(queue.declaration().name(), "pipe.read_source");
@@ -306,7 +308,7 @@ fn declared_queue_exposes_metadata_and_rejects_undeclared_bits() {
     assert_eq!(wakes.load(Ordering::SeqCst), 1);
     assert!(subscription.take_ready());
     assert_eq!(
-        subscription.try_update(
+        subscription.try_update_with_waker(
             Readiness::INVALID,
             counting_waker(Arc::new(AtomicUsize::new(0)))
         ),
@@ -328,7 +330,7 @@ fn declared_port_wraps_edge_delivery_and_terminal_state() {
     let wakes = Arc::new(AtomicUsize::new(0));
     let late_wakes = Arc::new(AtomicUsize::new(0));
     let mut subscription = port
-        .try_subscribe(Lifecycle::EXITED, counting_waker(Arc::clone(&wakes)))
+        .try_subscribe_with_waker(Lifecycle::EXITED, counting_waker(Arc::clone(&wakes)))
         .expect("declared interest");
 
     assert_eq!(port.declaration().kind(), WireKind::Port);
@@ -346,14 +348,14 @@ fn declared_port_wraps_edge_delivery_and_terminal_state() {
     assert_eq!(port.terminate(Lifecycle::GONE), 1);
     assert_eq!(subscription.state(), RawSubscriptionState::Terminal);
     assert_eq!(
-        port.try_subscribe(Lifecycle::EXITED, counting_waker(Arc::clone(&late_wakes)))
+        port.try_subscribe_with_waker(Lifecycle::EXITED, counting_waker(Arc::clone(&late_wakes)))
             .err(),
         Some(DeclaredWireError::Raw(RawWireError::Terminal))
     );
     assert_eq!(late_wakes.load(Ordering::SeqCst), 0);
 
     let terminal_subscription =
-        port.subscribe(Lifecycle::EXITED, counting_waker(Arc::clone(&late_wakes)));
+        port.subscribe_with_waker(Lifecycle::EXITED, counting_waker(Arc::clone(&late_wakes)));
     assert_eq!(
         terminal_subscription.state(),
         RawSubscriptionState::Terminal
@@ -385,13 +387,13 @@ fn declaration_macros_generate_typed_queue_and_port_event_sets() {
     let queue_wakes = Arc::new(AtomicUsize::new(0));
     let port_wakes = Arc::new(AtomicUsize::new(0));
     let mut queue_subscription = queue
-        .try_subscribe(
+        .try_subscribe_with_waker(
             MacroReadiness::HAS_DATA,
             counting_waker(Arc::clone(&queue_wakes)),
         )
         .expect("macro queue subscription");
     let mut port_subscription = port
-        .try_subscribe(
+        .try_subscribe_with_waker(
             MacroLifecycle::EXITED,
             counting_waker(Arc::clone(&port_wakes)),
         )
@@ -459,7 +461,8 @@ fn declared_queue_retire_records_epoch_terminal_handshake() {
     let queue = DeclaredQueue::new(WireDeclaration::<Readiness>::queue("pipe.read_source"))
         .expect("valid queue declaration");
     let wakes = Arc::new(AtomicUsize::new(0));
-    let mut subscription = queue.subscribe(Readiness::HAS_DATA, counting_waker(Arc::clone(&wakes)));
+    let mut subscription =
+        queue.subscribe_with_waker(Readiness::HAS_DATA, counting_waker(Arc::clone(&wakes)));
     let guard = epoch::guard();
 
     let retirement = queue.retire(Readiness::BROKEN, &guard);
@@ -484,7 +487,7 @@ fn raw_port_silent_retire_drains_without_waking_and_records_epoch() {
     let _epoch = reset_epoch();
     let port = RawPort::new();
     let wakes = Arc::new(AtomicUsize::new(0));
-    let mut subscription = port.subscribe(0x1, counting_waker(Arc::clone(&wakes)));
+    let mut subscription = port.subscribe_with_waker(0x1, counting_waker(Arc::clone(&wakes)));
     let guard = epoch::guard();
 
     let retirement = port.retire_silently(&guard);
@@ -507,8 +510,10 @@ fn owner_retire_fence_queues_storage_reclaim_after_embedded_wire_retire() {
     let port = RawPort::new();
     let queue_wakes = Arc::new(AtomicUsize::new(0));
     let port_wakes = Arc::new(AtomicUsize::new(0));
-    let mut queue_subscription = queue.subscribe(0x1, counting_waker(Arc::clone(&queue_wakes)));
-    let mut port_subscription = port.subscribe(0x2, counting_waker(Arc::clone(&port_wakes)));
+    let mut queue_subscription =
+        queue.subscribe_with_waker(0x1, counting_waker(Arc::clone(&queue_wakes)));
+    let mut port_subscription =
+        port.subscribe_with_waker(0x2, counting_waker(Arc::clone(&port_wakes)));
     let guard = epoch::guard();
 
     let mut fence =
@@ -590,8 +595,10 @@ fn typed_owner_manifest_retires_wires_and_queues_typed_reclaim() {
     let port = owner_ref.port.clone();
     let queue_wakes = Arc::new(AtomicUsize::new(0));
     let port_wakes = Arc::new(AtomicUsize::new(0));
-    let mut queue_subscription = queue.subscribe(0x1, counting_waker(Arc::clone(&queue_wakes)));
-    let mut port_subscription = port.subscribe(0x2, counting_waker(Arc::clone(&port_wakes)));
+    let mut queue_subscription =
+        queue.subscribe_with_waker(0x1, counting_waker(Arc::clone(&queue_wakes)));
+    let mut port_subscription =
+        port.subscribe_with_waker(0x2, counting_waker(Arc::clone(&port_wakes)));
     let guard = epoch::guard();
 
     let reclaim = unsafe { retire_wire_owner(owner, &guard) }.expect("typed owner retire");
@@ -635,12 +642,12 @@ fn owner_manifest_macro_retires_declared_wires_and_queues_typed_reclaim() {
     let port = owner_ref.port.clone();
     let queue_wakes = Arc::new(AtomicUsize::new(0));
     let port_wakes = Arc::new(AtomicUsize::new(0));
-    let mut queue_subscription = queue.subscribe(
+    let mut queue_subscription = queue.subscribe_with_waker(
         Readiness::HAS_DATA,
         counting_waker(Arc::clone(&queue_wakes)),
     );
     let mut port_subscription =
-        port.subscribe(Lifecycle::EXITED, counting_waker(Arc::clone(&port_wakes)));
+        port.subscribe_with_waker(Lifecycle::EXITED, counting_waker(Arc::clone(&port_wakes)));
     let guard = epoch::guard();
 
     let reclaim = unsafe { retire_wire_owner(owner, &guard) }.expect("macro owner retire");
@@ -678,10 +685,10 @@ fn subscription_graph_owns_long_lived_queue_and_port_subscriptions() {
     let mut graph = SubscriptionGraph::<4>::new();
 
     let queue_key = graph
-        .subscribe_queue(&queue, 0x1, counting_waker(Arc::clone(&queue_wakes)))
+        .subscribe_queue_with_waker(&queue, 0x1, counting_waker(Arc::clone(&queue_wakes)))
         .expect("queue graph subscription");
     let port_key = graph
-        .subscribe_port(&port, 0x2, counting_waker(Arc::clone(&port_wakes)))
+        .subscribe_port_with_waker(&port, 0x2, counting_waker(Arc::clone(&port_wakes)))
         .expect("port graph subscription");
 
     assert_eq!(graph.capacity(), 4);
@@ -725,7 +732,7 @@ fn subscription_graph_accepts_declared_queue_and_port_helpers() {
     let mut graph = SubscriptionGraph::<4>::new();
 
     assert_eq!(
-        graph.subscribe_declared_queue(
+        graph.subscribe_declared_queue_with_waker(
             &queue,
             Readiness::INVALID,
             counting_waker(Arc::clone(&queue_wakes)),
@@ -736,14 +743,14 @@ fn subscription_graph_accepts_declared_queue_and_port_helpers() {
     );
 
     let queue_key = graph
-        .subscribe_declared_queue(
+        .subscribe_declared_queue_with_waker(
             &queue,
             Readiness::HAS_DATA,
             counting_waker(Arc::clone(&queue_wakes)),
         )
         .expect("declared queue graph subscription");
     let port_key = graph
-        .subscribe_declared_port(
+        .subscribe_declared_port_with_waker(
             &port,
             Lifecycle::EXITED,
             counting_waker(Arc::clone(&port_wakes)),
@@ -770,7 +777,7 @@ fn subscription_graph_accepts_declared_queue_and_port_helpers() {
     assert_eq!(graph.take_declared_ready(queue_key), Ok(false));
 
     assert_eq!(
-        graph.update_declared_queue(
+        graph.update_declared_queue_with_waker(
             queue_key,
             Readiness::INVALID,
             counting_waker(Arc::clone(&replacement_wakes)),
@@ -780,7 +787,7 @@ fn subscription_graph_accepts_declared_queue_and_port_helpers() {
         ))
     );
     graph
-        .update_declared_queue(
+        .update_declared_queue_with_waker(
             queue_key,
             Readiness::BROKEN,
             counting_waker(Arc::clone(&replacement_wakes)),
@@ -814,10 +821,10 @@ fn subscription_graph_collects_ready_and_terminal_entries_for_epoll_scan() {
     let mut graph = SubscriptionGraph::<4>::new();
 
     let queue_key = graph
-        .subscribe_queue(&queue, 0x1, counting_waker(Arc::clone(&queue_wakes)))
+        .subscribe_queue_with_waker(&queue, 0x1, counting_waker(Arc::clone(&queue_wakes)))
         .expect("queue graph subscription");
     let port_key = graph
-        .subscribe_port(&port, 0x2, counting_waker(Arc::clone(&port_wakes)))
+        .subscribe_port_with_waker(&port, 0x2, counting_waker(Arc::clone(&port_wakes)))
         .expect("port graph subscription");
     let mut ready = [SubscriptionGraphReady::default(); 1];
 
@@ -863,10 +870,10 @@ fn subscription_graph_clear_tears_down_all_entries_and_stales_keys() {
     let mut graph = SubscriptionGraph::<4>::new();
 
     let queue_key = graph
-        .subscribe_queue(&queue, 0x1, counting_waker(Arc::clone(&queue_wakes)))
+        .subscribe_queue_with_waker(&queue, 0x1, counting_waker(Arc::clone(&queue_wakes)))
         .expect("queue graph subscription");
     let port_key = graph
-        .subscribe_port(&port, 0x2, counting_waker(Arc::clone(&port_wakes)))
+        .subscribe_port_with_waker(&port, 0x2, counting_waker(Arc::clone(&port_wakes)))
         .expect("port graph subscription");
 
     assert_eq!(graph.len(), 2);
@@ -899,28 +906,28 @@ fn subscription_graph_rejects_full_stale_empty_and_wrong_kind_operations() {
     let mut graph = SubscriptionGraph::<1>::new();
 
     assert_eq!(
-        graph.subscribe_queue(&queue, 0, counting_waker(Arc::clone(&wakes))),
+        graph.subscribe_queue_with_waker(&queue, 0, counting_waker(Arc::clone(&wakes))),
         Err(SubscriptionGraphError::EmptyInterest)
     );
 
     let key = graph
-        .subscribe_queue(&queue, 0x1, counting_waker(Arc::clone(&wakes)))
+        .subscribe_queue_with_waker(&queue, 0x1, counting_waker(Arc::clone(&wakes)))
         .expect("queue graph subscription");
     assert_eq!(
-        graph.subscribe_port(&port, 0x1, counting_waker(Arc::clone(&wakes))),
+        graph.subscribe_port_with_waker(&port, 0x1, counting_waker(Arc::clone(&wakes))),
         Err(SubscriptionGraphError::Full)
     );
     assert_eq!(
-        graph.update_port(key, 0x1, counting_waker(Arc::clone(&replacement_wakes))),
+        graph.update_port_with_waker(key, 0x1, counting_waker(Arc::clone(&replacement_wakes))),
         Err(SubscriptionGraphError::KindMismatch)
     );
     assert_eq!(
-        graph.update_queue(key, 0, counting_waker(Arc::clone(&replacement_wakes))),
+        graph.update_queue_with_waker(key, 0, counting_waker(Arc::clone(&replacement_wakes))),
         Err(SubscriptionGraphError::EmptyInterest)
     );
 
     graph
-        .update_queue(key, 0x2, counting_waker(Arc::clone(&replacement_wakes)))
+        .update_queue_with_waker(key, 0x2, counting_waker(Arc::clone(&replacement_wakes)))
         .expect("update queue graph subscription");
     assert_eq!(queue.fire(0x1), 0);
     queue.clear(0x1);
@@ -930,7 +937,7 @@ fn subscription_graph_rejects_full_stale_empty_and_wrong_kind_operations() {
 
     graph.remove(key).expect("remove graph entry");
     let reused = graph
-        .subscribe_queue(&queue, 0x1, counting_waker(Arc::clone(&wakes)))
+        .subscribe_queue_with_waker(&queue, 0x1, counting_waker(Arc::clone(&wakes)))
         .expect("reused slot has new generation");
     assert_eq!(reused.index(), key.index());
     assert_ne!(reused.generation(), key.generation());
@@ -949,7 +956,7 @@ fn subscription_graph_reports_terminal_raw_wire_errors() {
     let wakes = Arc::new(AtomicUsize::new(0));
 
     assert_eq!(
-        graph.subscribe_queue(&queue, 0x1, counting_waker(Arc::clone(&wakes))),
+        graph.subscribe_queue_with_waker(&queue, 0x1, counting_waker(Arc::clone(&wakes))),
         Err(SubscriptionGraphError::RawWire(RawWireError::Terminal))
     );
 }
@@ -959,7 +966,7 @@ fn raw_queue_subscription_reports_unsubscribed_after_explicit_unsubscribe() {
     let queue = RawQueue::new();
     let wakes = Arc::new(AtomicUsize::new(0));
     let replacement_wakes = Arc::new(AtomicUsize::new(0));
-    let mut subscription = queue.subscribe(0x1, counting_waker(Arc::clone(&wakes)));
+    let mut subscription = queue.subscribe_with_waker(0x1, counting_waker(Arc::clone(&wakes)));
 
     assert_eq!(subscription.state(), RawSubscriptionState::Subscribed);
     assert!(subscription.is_subscribed());
@@ -974,7 +981,7 @@ fn raw_queue_subscription_reports_unsubscribed_after_explicit_unsubscribe() {
         Err(RawSubscriptionError::Unsubscribed)
     );
     assert_eq!(
-        subscription.try_update(0x2, counting_waker(Arc::clone(&replacement_wakes))),
+        subscription.try_update_with_waker(0x2, counting_waker(Arc::clone(&replacement_wakes))),
         Err(RawSubscriptionError::Unsubscribed)
     );
     assert!(!subscription.unsubscribe());
@@ -989,7 +996,7 @@ fn raw_port_subscription_reports_unsubscribed_after_explicit_unsubscribe() {
     let port = RawPort::new();
     let wakes = Arc::new(AtomicUsize::new(0));
     let replacement_wakes = Arc::new(AtomicUsize::new(0));
-    let mut subscription = port.subscribe(0x1, counting_waker(Arc::clone(&wakes)));
+    let mut subscription = port.subscribe_with_waker(0x1, counting_waker(Arc::clone(&wakes)));
 
     assert_eq!(subscription.state(), RawSubscriptionState::Subscribed);
     assert!(subscription.is_subscribed());
@@ -1004,7 +1011,7 @@ fn raw_port_subscription_reports_unsubscribed_after_explicit_unsubscribe() {
         Err(RawSubscriptionError::Unsubscribed)
     );
     assert_eq!(
-        subscription.try_update(0x2, counting_waker(Arc::clone(&replacement_wakes))),
+        subscription.try_update_with_waker(0x2, counting_waker(Arc::clone(&replacement_wakes))),
         Err(RawSubscriptionError::Unsubscribed)
     );
     assert!(!subscription.unsubscribe());
@@ -1020,8 +1027,8 @@ fn raw_queue_terminal_mask_wakes_drains_and_reports_terminal_state() {
     let first_wakes = Arc::new(AtomicUsize::new(0));
     let second_wakes = Arc::new(AtomicUsize::new(0));
     let late_wakes = Arc::new(AtomicUsize::new(0));
-    let mut first = queue.subscribe(0x1, counting_waker(Arc::clone(&first_wakes)));
-    let mut second = queue.subscribe(0x4, counting_waker(Arc::clone(&second_wakes)));
+    let mut first = queue.subscribe_with_waker(0x1, counting_waker(Arc::clone(&first_wakes)));
+    let mut second = queue.subscribe_with_waker(0x4, counting_waker(Arc::clone(&second_wakes)));
 
     assert_eq!(queue.subscriber_count(), 2);
     assert_eq!(queue.terminate(0x8), 2);
@@ -1036,7 +1043,7 @@ fn raw_queue_terminal_mask_wakes_drains_and_reports_terminal_state() {
     assert_eq!(first.try_take_ready(), Err(RawSubscriptionError::Terminal));
     assert!(first.take_ready());
     assert_eq!(
-        second.try_update(0x8, counting_waker(Arc::clone(&late_wakes))),
+        second.try_update_with_waker(0x8, counting_waker(Arc::clone(&late_wakes))),
         Err(RawSubscriptionError::Terminal)
     );
 
@@ -1046,11 +1053,11 @@ fn raw_queue_terminal_mask_wakes_drains_and_reports_terminal_state() {
     queue.clear(0x8);
     assert_eq!(queue.peek(), 0x8);
 
-    let mut late = queue.subscribe(0x1, counting_waker(Arc::clone(&late_wakes)));
+    let mut late = queue.subscribe_with_waker(0x1, counting_waker(Arc::clone(&late_wakes)));
     assert_eq!(late.state(), RawSubscriptionState::Terminal);
     assert_eq!(
         queue
-            .try_subscribe(0x1, counting_waker(Arc::clone(&late_wakes)))
+            .try_subscribe_with_waker(0x1, counting_waker(Arc::clone(&late_wakes)))
             .err(),
         Some(RawWireError::Terminal)
     );
@@ -1065,8 +1072,8 @@ fn raw_port_terminal_event_wakes_drains_and_reports_terminal_state() {
     let first_wakes = Arc::new(AtomicUsize::new(0));
     let second_wakes = Arc::new(AtomicUsize::new(0));
     let late_wakes = Arc::new(AtomicUsize::new(0));
-    let mut first = port.subscribe(0x1, counting_waker(Arc::clone(&first_wakes)));
-    let mut second = port.subscribe(0x4, counting_waker(Arc::clone(&second_wakes)));
+    let mut first = port.subscribe_with_waker(0x1, counting_waker(Arc::clone(&first_wakes)));
+    let mut second = port.subscribe_with_waker(0x4, counting_waker(Arc::clone(&second_wakes)));
 
     assert_eq!(port.subscriber_count(), 2);
     assert_eq!(port.terminate(0x80), 2);
@@ -1080,17 +1087,17 @@ fn raw_port_terminal_event_wakes_drains_and_reports_terminal_state() {
     assert_eq!(first.try_take_ready(), Err(RawSubscriptionError::Terminal));
     assert!(first.take_ready());
     assert_eq!(
-        second.try_update(0x80, counting_waker(Arc::clone(&late_wakes))),
+        second.try_update_with_waker(0x80, counting_waker(Arc::clone(&late_wakes))),
         Err(RawSubscriptionError::Terminal)
     );
 
     assert_eq!(port.try_fire(0x1), Err(RawWireError::Terminal));
     assert_eq!(port.fire(0x1), 0);
 
-    let mut late = port.subscribe(0x1, counting_waker(Arc::clone(&late_wakes)));
+    let mut late = port.subscribe_with_waker(0x1, counting_waker(Arc::clone(&late_wakes)));
     assert_eq!(late.state(), RawSubscriptionState::Terminal);
     assert_eq!(
-        port.try_subscribe(0x1, counting_waker(Arc::clone(&late_wakes)))
+        port.try_subscribe_with_waker(0x1, counting_waker(Arc::clone(&late_wakes)))
             .err(),
         Some(RawWireError::Terminal)
     );
@@ -1103,7 +1110,7 @@ fn raw_port_terminal_event_wakes_drains_and_reports_terminal_state() {
 fn raw_port_terminal_without_gone_event_drains_silently() {
     let port = RawPort::new();
     let wakes = Arc::new(AtomicUsize::new(0));
-    let mut subscription = port.subscribe(0x1, counting_waker(Arc::clone(&wakes)));
+    let mut subscription = port.subscribe_with_waker(0x1, counting_waker(Arc::clone(&wakes)));
 
     assert_eq!(port.terminate(0), 0);
 

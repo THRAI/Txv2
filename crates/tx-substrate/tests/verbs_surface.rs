@@ -5,49 +5,49 @@
 
 #[allow(unused_imports)]
 use tx_substrate::verbs::{
-    // Step execution
-    ByteProgress,
-    Deadline,
-    Errno,
-    InterestMask,
-    NoProgress,
-    ScriptCtx,
-    StepOp,
-    StepOutcome,
-    StepProgress,
-    SubjectIdentity,
-    WaitSourceId,
-    YieldShape,
+    // EBR
+    drain_with_budget,
+    guard,
     // Zone allocation
     reserve_for,
     sign,
     sign_for,
+    // Sync
+    AtomicSlot,
+    // Step execution
+    ByteProgress,
     Cap,
     Dead,
+    Deadline,
     Entity,
-    OperationalCapExt,
-    PayloadCap,
-    Weak,
-    Zone,
-    ZoneAllocated,
-    ZoneError,
-    // EBR
-    drain_with_budget,
-    guard,
+    Errno,
     Guard,
+    InterestMask,
     // Wake / mailbox
     MailboxEvent,
+    NoProgress,
+    OperationalCapExt,
+    PayloadCap,
+    // Bus wire
+    RawPort,
+    RawQueue,
+    ScriptCtx,
     SignalRouting,
+    SpinMutex,
+    StepOp,
+    StepOutcome,
+    StepProgress,
+    SubjectIdentity,
     TaskMailbox,
     WaitGeneration,
     WaitRegistrationGuard,
     WaitSource,
-    // Bus wire
-    RawPort,
-    RawQueue,
-    // Sync
-    AtomicSlot,
-    SpinMutex,
+    WaitSourceId,
+    Weak,
+    YieldShape,
+    Zone,
+    ZoneAllocated,
+    ZoneError,
 };
 
 #[test]

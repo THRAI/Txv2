@@ -8,6 +8,8 @@ pub mod adapter;
 pub mod aio;
 pub mod cred;
 pub mod device;
+pub mod epoll;
+pub mod eventfd;
 pub mod execution;
 pub mod futex;
 pub mod initramfs;
@@ -17,13 +19,15 @@ pub mod page_backed;
 pub mod pipe;
 pub mod process;
 pub mod reactor_submit;
-pub mod timer_sleep;
 pub mod signal;
 pub mod signalfd;
 mod sync;
 pub mod thread_runtime;
+pub mod timer_sleep;
+pub mod timerfd;
 pub mod tty;
 pub mod userfaultfd;
+pub mod vdso;
 pub mod vfs;
 pub mod vm;
 pub mod wait_source;
@@ -110,7 +114,9 @@ pub mod cross_crate_test_support {
     /// This helper closes that gap for unit tests; production callers
     /// drop capabilities through file-cap / `prctl` slices that the
     /// DAC + setuid slice does not ship.
-    pub fn clear_caps_for_test(process: &crate::adapter::step_engine::Cap<crate::process::ProcessIdentity>) {
+    pub fn clear_caps_for_test(
+        process: &crate::adapter::step_engine::Cap<crate::process::ProcessIdentity>,
+    ) {
         crate::cred::clear_caps_for_test(process);
     }
 

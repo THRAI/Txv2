@@ -249,6 +249,16 @@ Both halves use `StepOp` / `StepOutcome` / `YieldShape` / `drive` identically. T
 
 A script's `SubjectContext` is established at entry and remains constant for the script's duration except via authorized authority replacement (cred service transitions). See `04_SYSCALL_SHAPE_v1` for worked examples.
 
+### Dispatch lanes
+
+Not all syscalls are scripts. A syscall enters one of three dispatch lanes after the trampoline materializes the `SubjectContext`:
+
+- **ImmediateSyscall** — pure ABI query (getpid, getuid, umask, times). No `StepOp`, no `drive`, no yield. The call chain is statically non-yielding.
+- **OneShotStepOp** — semantic transition (setuid, sigaction, setsid, close). Enters `StepOp` with `drive_oneshot()`; terminates on first `step()` with `Done` or `Err`. Never yields. Benefits from the five-stage discipline without async overhead.
+- **Full async script** — progressive or blocking operation (read, write, open, futex_wait, poll). Enters `async drive()`; may `Continue`, `Yield` any `YieldShape`, and requires the complete driver/reactor stack with `ActiveWait` and `apply_resume`.
+
+Detailed classification and dispatch rules in `04_SYSCALL_SHAPE_v1 §6`. Invariants in `02_INVARIANTS_v5.md` (SCRIPT-V5-4/5, STEP-11/12).
+
 ## 11. Yield-adapt phase class (renamed from Wait-adapt)
 
 <!-- txdoc:CONCEPTS-V5-YIELD-ADAPT-1 -->

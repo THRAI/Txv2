@@ -2,8 +2,8 @@
 //!
 //! tx-kernel owns one global `IrqDispatchTable`. Boot-time
 //! `install_irq_handlers::<P>()` populates the UART slot with
-//! `uart_rx_irq_handler::<P>`, publishes the table to the platform via
-//! `<P as IrqIf>::install_dispatch_table`, then unmasks the IRQ.
+//! `uart_rx_irq_handler::<P>` and publishes the table to the platform via
+//! `<P as IrqIf>::install_dispatch_table`.
 //!
 //! Per Open Q #4 (`docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`)
 //! registration is explicit, not linkme: tests can build a controlled
@@ -29,11 +29,11 @@
 //! that draining runs with irq_depth=0 and is free to create epoch
 //! guards and call `step_ingest`.
 
+use crate::adapter::step_engine::{self as step_engine, SpinMutex, StepOutcome};
 use tx_hal::{
     ConsoleIf, IrqDispatchTable, IrqHandled, IrqHandlerFn, IrqIf, IRQ_DISPATCH_TABLE_SIZE,
 };
 use tx_subsystems::tty::execution::step_ingest;
-use crate::adapter::step_engine::{self as step_engine, SpinMutex, StepOutcome};
 
 /// The single global IRQ dispatch table tx-kernel publishes to the
 /// platform. The platform crate stores a raw `&'static
@@ -103,6 +103,13 @@ pub fn register_irq_handler(irq: u32, handler: IrqHandlerFn) {
 pub fn reset_dispatch_table_for_test() {
     let mut table = IRQ_DISPATCH_TABLE.lock();
     *table = IrqDispatchTable::new();
+}
+
+/// Test-only: clear the deferred UART RX buffer.
+#[cfg(test)]
+pub fn reset_pending_uart_rx_for_test() {
+    let mut pending = UART_RX_PENDING.lock();
+    pending.len = 0;
 }
 
 /// Snapshot the handler currently registered for `irq`, if any.

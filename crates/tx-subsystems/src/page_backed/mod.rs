@@ -12,9 +12,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    self as step_engine, page_allocator, AllocError, BitmapPageAllocator, ByteProgress, Cap,
-    CachePin, DeviceFrame, MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
-    YieldShape, Zone, ZoneAllocated, ZoneError, ZeroPolicy,
+    self as step_engine, page_allocator, AllocError, BitmapPageAllocator, ByteProgress, CachePin,
+    Cap, DeviceFrame, MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+    YieldShape, ZeroPolicy, Zone, ZoneAllocated, ZoneError,
 };
 
 use crate::execution::{Errno, Guard};
@@ -31,7 +31,7 @@ mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
 pub use fs_page_backing::FsPageBacking;
-pub use lifecycle::{step_fallocate, step_fsync, step_truncate};
+pub use lifecycle::{step_fallocate, step_fsync, step_truncate, TruncateOp};
 pub use reflink::{cow_replace_into_private, install_shared_page};
 pub use targeted_read::read_exact_at;
 pub use user_buffer::{
@@ -144,6 +144,7 @@ pub enum PageCacheError {
     MismatchedFrame { current: Ppn },
     OutOfBounds,
     UnsupportedKind,
+    Backend(Errno),
     Alloc(AllocError),
 }
 
@@ -313,6 +314,28 @@ impl PageContainer {
         step_engine::sign(Self::new(kind, page_count))
     }
 
+    pub fn new_file_cap(
+        mount: MountPayloadPin,
+        fs_object_id: FsObjectId,
+        size_bytes: u64,
+    ) -> Result<Cap<PageContainer>, ZoneError> {
+        let page_size = crate::vm::USER_PAGE_SIZE as u64;
+        let page_count = if size_bytes == 0 {
+            0
+        } else {
+            1 + (size_bytes - 1) / page_size
+        };
+        let container = Self::new_cap(
+            PageContainerKind::File {
+                mount,
+                fs_object_id,
+            },
+            page_count,
+        )?;
+        container.set_size_bytes(size_bytes);
+        Ok(container)
+    }
+
     pub const fn kind(&self) -> &PageContainerKind {
         &self.kind
     }
@@ -388,9 +411,12 @@ impl PageContainer {
     ) -> Result<MaterializedPage, PageCacheError> {
         match &self.kind {
             PageContainerKind::Anon { .. } => self.materialize_anon(page, access),
-            PageContainerKind::File { mount, fs_object_id } => {
+            PageContainerKind::File {
+                mount,
+                fs_object_id,
+            } => {
                 use StepOutcome as V3;
-                let borrowed = tx_substrate::epoch::borrow_current_guard();
+                let borrowed = adapter::step_engine::epoch::borrow_current_guard();
                 let fresh;
                 let guard: &Guard<'_> = match &borrowed {
                     Some(g) => g,
@@ -420,8 +446,7 @@ impl PageContainer {
         page: PageIndex,
         access: MaterializeAccess,
         guard: &Guard<'_>,
-    ) -> StepOutcome<MaterializedPage, NoProgress>
-    {
+    ) -> StepOutcome<MaterializedPage, NoProgress> {
         if let Err(error) = self.check_bounds(page) {
             return StepOutcome::Err(page_cache_error_to_errno(error).into());
         }
@@ -442,6 +467,25 @@ impl PageContainer {
         }
     }
 
+    pub fn materialize_page_now(
+        &self,
+        page: PageIndex,
+        access: MaterializeAccess,
+        guard: &Guard<'_>,
+    ) -> Result<MaterializedPage, PageCacheError> {
+        use adapter::step_engine::{StepOutcome as V3, YieldShape};
+        match self.materialize_page(page, access, guard) {
+            V3::Done(page) => Ok(page),
+            V3::Err(errno) => Err(PageCacheError::Backend(errno.into())),
+            V3::Continue { .. } => Err(PageCacheError::Backend(Errno::EAGAIN)),
+            V3::Yield {
+                shape: YieldShape::OnWaitSource { .. },
+                ..
+            } => Err(PageCacheError::Backend(Errno::EAGAIN)),
+            V3::Yield { .. } => Err(PageCacheError::Backend(Errno::EIO)),
+        }
+    }
+
     fn materialize_file_page(
         &self,
         page: PageIndex,
@@ -449,8 +493,7 @@ impl PageContainer {
         mount: &MountPayloadPin,
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
-    ) -> StepOutcome<MaterializedPage, NoProgress>
-    {
+    ) -> StepOutcome<MaterializedPage, NoProgress> {
         use adapter::step_engine::Errno as V3Errno;
         if let Some(materialized) = self.materialize_cached_page(page, access) {
             return match materialized {
@@ -492,6 +535,10 @@ impl PageContainer {
                 ..
             } => StepOutcome::Err(V3Errno::EIO),
             StepOutcome::Yield {
+                shape: YieldShape::OnEdge { .. },
+                ..
+            } => StepOutcome::Err(V3Errno::EIO),
+            StepOutcome::Yield {
                 shape: YieldShape::OnTimer { .. },
                 ..
             } => StepOutcome::Err(V3Errno::EIO),
@@ -505,8 +552,7 @@ impl PageContainer {
         access: MaterializeAccess,
         frame: Frame,
         newly_installed: bool,
-    ) -> StepOutcome<MaterializedPage, NoProgress>
-    {
+    ) -> StepOutcome<MaterializedPage, NoProgress> {
         let frame = match cached_frame_from_frame(frame) {
             Ok(frame) => frame,
             Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
@@ -536,8 +582,7 @@ impl PageContainer {
         page: PageIndex,
         base_ppn: Ppn,
         page_count: u64,
-    ) -> StepOutcome<MaterializedPage, NoProgress>
-    {
+    ) -> StepOutcome<MaterializedPage, NoProgress> {
         use adapter::step_engine::Errno as V3Errno;
         if page.as_u64() >= page_count {
             return StepOutcome::Err(V3Errno::EINVAL);
@@ -625,6 +670,11 @@ pub fn step_read(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if len == 0 {
         return StepOutcome::done(0);
     }
@@ -646,6 +696,11 @@ pub fn step_write(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if len == 0 {
         return StepOutcome::done(0);
     }
@@ -709,8 +764,7 @@ fn step_range(
         //   were swallowed into a successful partial step).
         use adapter::step_engine::Errno as V3Errno;
         match pc.materialize_page(page_index, access, guard) {
-            StepOutcome::Done(_)
-            | StepOutcome::Continue { .. } => {
+            StepOutcome::Done(_) | StepOutcome::Continue { .. } => {
                 advanced += chunk;
                 offset += chunk as u64;
             }
@@ -772,19 +826,14 @@ pub struct ReadOp<'a> {
     pub pc: &'a PageContainer,
     pub of: &'a OpenFile,
     pub len: usize,
-    pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for ReadOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
-        step_read(self.pc, self.of, self.len, self.guard)
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let __guard = step_engine::guard();
+        step_read(self.pc, self.of, self.len, &__guard)
     }
 }
 
@@ -793,19 +842,14 @@ pub struct WriteOp<'a> {
     pub pc: &'a PageContainer,
     pub of: &'a OpenFile,
     pub len: usize,
-    pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for WriteOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
-        step_write(self.pc, self.of, self.len, self.guard)
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let __guard = step_engine::guard();
+        step_write(self.pc, self.of, self.len, &__guard)
     }
 }
 
@@ -864,6 +908,7 @@ const fn page_cache_error_to_errno(error: PageCacheError) -> Errno {
         | PageCacheError::MissingPage
         | PageCacheError::MismatchedFrame { .. } => Errno::ESTALE,
         PageCacheError::OutOfBounds | PageCacheError::UnsupportedKind => Errno::EINVAL,
+        PageCacheError::Backend(errno) => errno,
         PageCacheError::Alloc(_) => Errno::ENOMEM,
     }
 }

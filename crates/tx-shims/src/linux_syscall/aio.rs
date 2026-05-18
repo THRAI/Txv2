@@ -84,8 +84,8 @@ use tx_subsystems::wait_source;
 
 use super::{bootstrap_copy_from_user, bootstrap_copy_to_user, SyscallCtx, SyscallResult};
 use super::{EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENOMEM_VALUE};
-use crate::adapter::step_engine::{self as step_engine, Cap, SpinMutex, StepOp, SubjectIdentity};
 use crate::adapter::step_engine::StepOutcome as V3Out;
+use crate::adapter::step_engine::{self as step_engine, Cap, SpinMutex, StepOp};
 
 // === Linux negative-errno values used by the dispatcher =============
 //
@@ -217,12 +217,10 @@ fn dispatch_pwrite(
 /// defensive against unexpected Yield/Err shapes.
 fn run_lseek_set(file: &Cap<OpenFile>, offset: i64) -> bool {
     let mut script_ctx = crate::KernelScriptCtx::new();
-    let guard = step_engine::guard();
     let mut op = OpenFileLseekOp {
         file,
         offset,
         whence: 0, // SEEK_SET
-        guard: &guard,
     };
     matches!(
         op.step(&mut script_ctx),
@@ -241,11 +239,11 @@ fn run_read(file: &Cap<OpenFile>, out: &mut [u8]) -> Result<usize, i64> {
     let total_len = out.len();
     loop {
         let outcome = {
-            let guard = step_engine::guard();
+            // Op acquires its own guard inside `step()` (STEP_MODEL_v2 §1).
             let mut op = OpenFileReadOp {
                 file,
                 out: &mut out[total..],
-                guard: &guard,
+                cursor: 0,
             };
             op.step(&mut script_ctx)
         };
@@ -288,11 +286,10 @@ fn run_write(file: &Cap<OpenFile>, bytes: &[u8]) -> Result<usize, i64> {
     let mut remaining = bytes;
     loop {
         let outcome = {
-            let guard = step_engine::guard();
             let mut op = OpenFileWriteOp {
                 file,
                 bytes: remaining,
-                guard: &guard,
+                cursor: 0,
             };
             op.step(&mut script_ctx)
         };

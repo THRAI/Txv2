@@ -1,5 +1,7 @@
 use super::*;
-use crate::page_backed::adapter::step_engine::{self as step_engine, ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::page_backed::adapter::step_engine::{
+    self as step_engine, ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
 
 /// Copy up to `len` bytes from `in_pc` at `in_offset` into `out_pc` at
 /// `out_offset` page-by-page.
@@ -29,6 +31,11 @@ pub fn step_copy_file_range(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::page_backed::adapter::step_engine::{ByteProgress, StepOutcome as V3};
     if len == 0 {
         return V3::done(0);
@@ -82,7 +89,7 @@ pub fn step_copy_file_range(
         //   byte progress (or `EMPTY` when `advanced == 0`).
         // - `Yield { OnAgent .. }` → unsupported, surface `EIO`/partial.
         // - `Err(errno)` → `Err(errno)` (no progress yet) or partial `Done`.
-use crate::page_backed::adapter::step_engine::YieldShape;
+        use crate::page_backed::adapter::step_engine::YieldShape;
         let in_materialized = match in_pc.materialize_page(in_page, MaterializeAccess::Read, guard)
         {
             StepOutcome::Done(m) => m,
@@ -231,25 +238,20 @@ pub struct CopyFileRangeOp<'a> {
     pub out_pc: &'a PageContainer,
     pub out_offset: u64,
     pub len: usize,
-    pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for CopyFileRangeOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for CopyFileRangeOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let __guard = step_engine::guard();
         step_copy_file_range(
             self.in_pc,
             self.in_offset,
             self.out_pc,
             self.out_offset,
             self.len,
-            self.guard,
+            &__guard,
         )
     }
 }
@@ -284,7 +286,6 @@ mod step_op_wraps {
             .lock()
             .expect("page-backed cross-variant op test lock");
         setup_host_substrate();
-        let guard = step_engine::guard();
         let src = anon_pc(1);
         let dst = anon_pc(1);
         let mut op = CopyFileRangeOp {
@@ -293,7 +294,6 @@ mod step_op_wraps {
             out_pc: &dst,
             out_offset: 0,
             len: 0,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3::done(0));

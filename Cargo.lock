@@ -424,6 +424,7 @@ version = "0.1.0"
 dependencies = [
  "tx-ext4",
  "tx-ext4-format",
+ "tx-hal",
  "tx-platform-adapter",
  "tx-substrate",
  "tx-subsystems",
@@ -462,6 +463,8 @@ name = "tx-kernel"
 version = "0.1.0"
 dependencies = [
  "tx-drivers",
+ "tx-ext4",
+ "tx-ext4-format",
  "tx-fs",
  "tx-hal",
  "tx-platform-adapter",
@@ -498,6 +501,23 @@ dependencies = [
  "tx-hal",
  "tx-hal-riscv64-qemu-virt",
  "tx-kernel",
+]
+
+[[package]]
+name = "tx-observe"
+version = "0.1.0"
+dependencies = [
+ "tx-hal",
+ "tx-observe",
+ "tx-observe-types",
+]
+
+[[package]]
+name = "tx-observe-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tx-hal",
 ]
 
 [[package]]
@@ -556,6 +576,8 @@ name = "tx-substrate"
 version = "0.1.0"
 dependencies = [
  "tx-hal",
+ "tx-observe",
+ "tx-observe-types",
 ]
 
 [[package]]
@@ -569,6 +591,7 @@ dependencies = [
  "tx-substrate",
  "tx-subsystems",
  "tx-test-support",
+ "tx-vdso",
 ]
 
 [[package]]
@@ -578,6 +601,10 @@ dependencies = [
  "tx-platform-adapter",
  "tx-substrate",
 ]
+
+[[package]]
+name = "tx-vdso"
+version = "0.1.0"
 
 [[package]]
 name = "typed-arena"

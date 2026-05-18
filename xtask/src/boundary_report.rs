@@ -83,9 +83,7 @@ fn adapter_verb_stats(text: &str) -> AdapterVerbStats {
                 match ch {
                     '{' => brace_depth += 1,
                     '}' => {
-                        if brace_depth > 0 {
-                            brace_depth -= 1;
-                        }
+                        brace_depth = brace_depth.saturating_sub(1);
                         if brace_depth == 0 {
                             in_pub_use_group = false;
                         }
@@ -132,9 +130,7 @@ fn adapter_verb_stats(text: &str) -> AdapterVerbStats {
                     match ch {
                         '{' => brace_depth += 1,
                         '}' => {
-                            if brace_depth > 0 {
-                                brace_depth -= 1;
-                            }
+                            brace_depth = brace_depth.saturating_sub(1);
                             if brace_depth == 0 {
                                 in_pub_use_group = false;
                             }
@@ -187,8 +183,8 @@ fn is_pub_fn(trimmed: &str) -> bool {
         let rest = rest.trim_start();
         // Skip optional qualifiers: async, unsafe, const, extern.
         for prefix in &["async ", "unsafe ", "const ", "extern "] {
-            if rest.starts_with(prefix) {
-                let inner = rest[prefix.len()..].trim_start();
+            if let Some(inner) = rest.strip_prefix(prefix) {
+                let inner = inner.trim_start();
                 if inner.starts_with("fn ") || inner.starts_with("fn(") {
                     return true;
                 }
@@ -231,8 +227,15 @@ fn is_other_pub_item(trimmed: &str) -> bool {
     };
     let rest = rest.trim_start();
     for kw in &[
-        "const ", "static ", "type ", "struct ", "enum ", "trait ",
-        "macro ", "macro_rules", "extern ",
+        "const ",
+        "static ",
+        "type ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "macro ",
+        "macro_rules",
+        "extern ",
     ] {
         if rest.starts_with(kw) {
             return true;
@@ -308,9 +311,7 @@ pub(crate) fn outside_adapter_totals(root: &Path) -> Result<(usize, usize)> {
     Ok((s.raw_lines_outside_adapter, r.raw_lines_outside_adapter))
 }
 
-fn scan_workspace(
-    root: &Path,
-) -> Result<(PlatformStats, PlatformStats, Vec<AdapterDecl>)> {
+fn scan_workspace(root: &Path) -> Result<(PlatformStats, PlatformStats, Vec<AdapterDecl>)> {
     let files = collect_files(root, &["rs"]).map_err(|err| err.to_string())?;
     let mut stats_substrate = PlatformStats::default();
     let mut stats_reactor = PlatformStats::default();
@@ -357,9 +358,7 @@ fn accumulate(p: &Platform, rel: &str, scan: &FileScan, stats: &mut PlatformStat
     } else {
         stats.raw_lines_outside_adapter += lines;
         stats.files_outside_adapter += 1;
-        stats
-            .per_file_lines_outside
-            .insert(rel.to_string(), lines);
+        stats.per_file_lines_outside.insert(rel.to_string(), lines);
     }
     let needle = format!("{}::", p.import_root);
     for (sub_root, count) in &scan.sub_api_counts {
@@ -448,15 +447,12 @@ fn extract_kv(body: &str, key: &str) -> String {
     let Some(rest) = after.strip_prefix('"') else {
         return String::new();
     };
-    rest.find('"').map(|end| rest[..end].to_string()).unwrap_or_default()
+    rest.find('"')
+        .map(|end| rest[..end].to_string())
+        .unwrap_or_default()
 }
 
-fn emit_human(
-    s: &PlatformStats,
-    r: &PlatformStats,
-    adapters: &[AdapterDecl],
-    top_n: usize,
-) {
+fn emit_human(s: &PlatformStats, r: &PlatformStats, adapters: &[AdapterDecl], top_n: usize) {
     println!("Architecture Boundary Report");
     println!("============================");
     println!();
@@ -476,7 +472,10 @@ fn emit_human(
         "Raw reactor   calls inside  adapters: {:>5} lines / {:>3} files",
         r.raw_lines_inside_adapter, r.files_inside_adapter
     );
-    println!("Platform adapters declared:           {:>5}", adapters.len());
+    println!(
+        "Platform adapters declared:           {:>5}",
+        adapters.len()
+    );
     println!();
     print_sub_api(
         "substrate sub-API fan-in (lines, outside-adapter occurrences):",
@@ -569,10 +568,7 @@ fn print_verb_ratio_table(adapters: &[AdapterDecl]) {
             .then(a.0.cmp(b.0))
     });
 
-    println!(
-        "  {:<6}  {:<10}  {}",
-        "ratio", "fns/total", "file"
-    );
+    println!("  {:<6}  {:<10}  file", "ratio", "fns/total");
     for (file, stats) in &rows {
         println!(
             "  {:<6.2}  {:>2}/{:<7}  {}",
@@ -584,11 +580,7 @@ fn print_verb_ratio_table(adapters: &[AdapterDecl]) {
     }
 }
 
-fn emit_json(
-    s: &PlatformStats,
-    r: &PlatformStats,
-    adapters: &[AdapterDecl],
-) {
+fn emit_json(s: &PlatformStats, r: &PlatformStats, adapters: &[AdapterDecl]) {
     let value = serde_json::json!({
         "substrate": platform_json(s),
         "reactor": platform_json(r),
@@ -607,7 +599,10 @@ fn emit_json(
             }))
             .collect::<Vec<_>>(),
     });
-    println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).unwrap_or_default()
+    );
 }
 
 fn platform_json(s: &PlatformStats) -> serde_json::Value {

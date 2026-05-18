@@ -103,10 +103,7 @@ fn register<'a>(
     source: &'a Arc<WaitSource>,
     mailbox: &Arc<TaskMailbox>,
     interests: u64,
-) -> (
-    WaitRegistrationGuard<'a>,
-    WaitGeneration,
-) {
+) -> (WaitRegistrationGuard<'a>, WaitGeneration) {
     let gen = mailbox.next_generation();
     let prep = source.prepare(Arc::downgrade(mailbox), gen, InterestMask::new(interests));
     let guard = prep.install_if(|| true).expect("registration installed");
@@ -196,8 +193,7 @@ fn vfs_wait_source_invariants_round_trip() {
 
     let legacy_read_channel = legacy_wait_source::lookup_wait_channel(read_id)
         .expect("legacy resolver still has the read carrier");
-    let mut legacy_read_wait =
-        legacy_read_channel.wait(Mask::from_bits(VFS_READABLE));
+    let mut legacy_read_wait = legacy_read_channel.wait(Mask::from_bits(VFS_READABLE));
     let pre_legacy_read = Pin::new(&mut legacy_read_wait).poll(&mut cx);
     assert!(
         matches!(pre_legacy_read, Poll::Pending),

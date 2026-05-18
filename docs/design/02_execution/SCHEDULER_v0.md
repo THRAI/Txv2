@@ -5,7 +5,12 @@
 ## Status
 <!-- txdoc:SCHED-STATUS -->
 
-Draft v0.4.
+Draft v0.4. [deprecated by v5]
+
+> **[deprecated by v5]** — v4 step vocabulary (`Blocked`) is retired
+> from code. The scheduler's `StopReason::Blocked` references the
+> old step model; v5 uses `YieldShape`-based wait delivery via
+> `TaskMailbox`. Retained for historical reference.
 
 This document pins the **scheduler policy boundary** that REACTOR_v0 explicitly defers and THREAD_RUNTIME_v1 / PROCESS_v1 implicitly depend on. It is a policy-and-interface document, not an exhaustive algorithmic specification:
 

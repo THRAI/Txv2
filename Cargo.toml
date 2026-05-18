@@ -17,6 +17,7 @@ members = [
     "crates/tx-ext4-format",
     "crates/tx-scripts",
     "crates/tx-shims",
+    "crates/tx-vdso",
     "boards/tx-hal-riscv64-qemu-virt",
     "boards/tx-hal-riscv64-m1dock-mock",
     "boards/tx-hal-loongarch64-qemu-virt",

@@ -15,12 +15,42 @@ pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::{
         AcceptOutcome, AgentCancelPolicy, ByteProgress, Deadline, DelegateEndpoint,
-        DelegateRequest, DelegateToken, DriveMode, Errno, InterestMask, NoProgress, ProcessIdentity,
-        ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity, Translation, WaitSourceId,
-        YieldShape,
+        DelegateRequest, DelegateToken, DriveMode, Errno, InterestMask, NoProgress,
+        ProcessIdentity, ResumeOutcome, ScriptCtx, StepOp, StepOutcome, StepProgress,
+        SubjectIdentity, TimerId, Translation, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        reserve_for, sign, sign_for, Cap, Zone, ZoneAllocated, ZoneError,
+        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
+        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
+        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
+        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
     pub use tx_substrate::{page_allocator, SpinMutex};
+}
+
+#[platform_adapter(
+    platform = "substrate",
+    domain = "wake",
+    apis = ["wake"],
+    reason = "expose substrate wake primitives (TaskMailbox, ActiveWait, MailboxEvent) for drive() reactor integration"
+)]
+pub mod wake {
+    pub use tx_substrate::wake::timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
+    pub use tx_substrate::wake::{
+        agent_event_matches, ActiveWait, MailboxEvent, TaskMailbox, WaitGeneration,
+    };
+}
+
+#[platform_adapter(
+    platform = "substrate",
+    domain = "delegate_runtime",
+    apis = ["step"],
+    reason = "expose delegate runtime types (DelegateRegistry, DelegateReply, DelegateState, TransitionOutcome) for drive() OnAgent resolution"
+)]
+pub mod delegate_runtime {
+    pub use tx_substrate::step::agent::{
+        AbortReason, AgentTokenGuard, DelegateRegistry, DelegateReply, DelegateState,
+        DelegateTokenId, TokenDropPolicy, TransitionOutcome,
+    };
+    pub use tx_substrate::step::{DelegateEndpoint, DelegateRequest, DelegateToken};
 }

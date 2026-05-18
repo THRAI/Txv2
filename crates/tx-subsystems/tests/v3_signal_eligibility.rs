@@ -152,7 +152,7 @@ fn signal_eligibility_pins() {
     let leader_mb = Arc::new(TaskMailbox::new());
     bind_mailbox(&leader, &leader_mb);
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGTERM),
+        step_kill_process(&proc_cap, Signum::SIGTERM, None),
         KillOutcome::Delivered
     );
     assert!(
@@ -196,7 +196,7 @@ fn signal_eligibility_pins() {
     // T2 keeps the empty mask.
 
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGTERM),
+        step_kill_process(&proc_cap, Signum::SIGTERM, None),
         KillOutcome::Delivered
     );
     assert_eq!(
@@ -242,7 +242,7 @@ fn signal_eligibility_pins() {
     step_sigprocmask(&t2, SigmaskHow::SetMask, block_term);
 
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGTERM),
+        step_kill_process(&proc_cap, Signum::SIGTERM, None),
         KillOutcome::Delivered
     );
     assert!(
@@ -296,11 +296,11 @@ fn signal_eligibility_pins() {
     while t3_mb.poll().is_some() {}
 
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGTERM),
+        step_kill_process(&proc_cap, Signum::SIGTERM, None),
         KillOutcome::Delivered
     );
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGTERM),
+        step_kill_process(&proc_cap, Signum::SIGTERM, None),
         KillOutcome::Delivered
     );
     assert!(
@@ -342,7 +342,7 @@ fn signal_eligibility_pins() {
         .pending()
         .clear(Signum::SIGTERM);
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGTERM),
+        step_kill_process(&proc_cap, Signum::SIGTERM, None),
         KillOutcome::Delivered
     );
     assert!(
@@ -378,7 +378,7 @@ fn signal_eligibility_pins() {
     assert!(t3.is_zombie());
 
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGINT),
+        step_kill_process(&proc_cap, Signum::SIGINT, None),
         KillOutcome::NoLiveThread,
         "all-zombie process returns NoLiveThread, not panic"
     );

@@ -36,7 +36,9 @@ use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
-use tx_subsystems::userfaultfd::adapter::step_engine::{guard as ebr_guard, Cap, Errno, StepOutcome};
+use tx_subsystems::userfaultfd::adapter::step_engine::{
+    guard as ebr_guard, Cap, Errno, StepOutcome,
+};
 
 use tx_subsystems::process::{bootstrap_init_process, ProcessIdentity};
 use tx_subsystems::userfaultfd::UserfaultFd;
@@ -170,7 +172,10 @@ fn userfaultfd_phase0_fd_scaffold_invariants_round_trip() {
         OpenFileBacking::Rnode { .. }
         | OpenFileBacking::AioContext { .. }
         | OpenFileBacking::SignalFd { .. }
-        | OpenFileBacking::IoUring { .. } => {
+        | OpenFileBacking::IoUring { .. }
+        | OpenFileBacking::Epoll { .. }
+        | OpenFileBacking::Eventfd { .. }
+        | OpenFileBacking::Timerfd { .. } => {
             panic!("expected OpenFileBacking::Ufd")
         }
     }
