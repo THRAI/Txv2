@@ -67,7 +67,7 @@ number of additional LTP tests that move from skipped/failed to runnable.
 
 | Gap | OSComp / LTP impact | Effort | Substrate status |
 |---|---|---|---|
-| Diagnose why libctest children don't post SIGCHLD in time after `sys_rt_sigtimedwait` wiring (parent now blocks, child wedges) | **+~220 OSComp** (libctest hangs in child rather than `ENOSYS`-killed) | M — needs trap-trace of `entry-static.exe` and `wait4` / SIGCHLD-post path audit | RT_SIG dispatch arms wired (this pass); the gap is now in the child exit / signal-post lane, not the wait-side |
+| Diagnose why libctest children don't reach `exit_group` within the 10 s libctest internal timeout (parent's `sigtimedwait` is **verified correct** by the new `sigtimedwait_dispatch.rs` test module; the wedge is upstream of the SIGCHLD post) | **+~220 OSComp** | M–L — needs trap-trace of `entry-static.exe` under QEMU; suspects: fork-without-execve COW path slowness, missing handler-return path, or per-test syscall hangs | wait-side **proven correct** end-to-end (`sigtimedwait_observes_sigchld_posted_by_child_exit` test exercises fork → `step_exit_group` → `post_sigchld_to_parent` → `sigtimedwait` returning SIGCHLD with the bit cleared) |
 | lmbench unblock — `mkdir /var/tmp` at boot + diagnose `Simple read: -1` | up to +36 OSComp (lmbench-musl 0/36) | S–M (mkdir is hours; `Simple read` needs runtime triage) | `mkdir` is trivial; `read(2)` edge case to investigate |
 | libcbench malloc / stdio gaps | up to +13 OSComp (`~14/27` → close to 27/27) | M (~3w) | malloc benches return 0 → allocator instrumentation; stdio failures suggest fd / buffering path |
 | `preadv` / `pwritev` / `fallocate` / `readahead` | +20 LTP | S–M (3–4w) | `writev` loop + VFS hooks exist |
@@ -238,6 +238,59 @@ correctly blocks in `sigtimedwait` but the child doesn't appear
 to exit / post `SIGCHLD` in the allotted window. This is the new
 top high-stakes row: the gap shifted from the wait-side to the
 child-exit / signal-post path.
+
+**Wait-side proven correct.** Five new host tests in
+`crates/tx-shims/src/linux_syscall/tests/sigtimedwait_dispatch.rs`
+exercise the dispatch arm directly:
+
+| Test | What it asserts |
+|---|---|
+| `sigtimedwait_returns_pending_signum_and_clears_bit` | A pre-loaded SIGCHLD on the calling thread's `payload.pending()` is observed and cleared; `Return(17)` |
+| `sigtimedwait_wrong_sigsetsize_returns_neg_einval` | musl-style 8 byte sigset is required (glibc-style 16 → -EINVAL) |
+| `sigtimedwait_null_set_returns_neg_efault` | NULL `set` returns -EFAULT, not -EINVAL or panic |
+| `sigtimedwait_ignores_signals_outside_set_returns_neg_eagain` | Pending SIGTERM with a `set = {SIGCHLD}` doesn't get confused; -EAGAIN and SIGTERM remains pending |
+| `sigtimedwait_observes_sigchld_posted_by_child_exit` | End-to-end: fork → `step_exit_group(child)` → `post_sigchld_to_parent` → `sigtimedwait` returns SIGCHLD with the parent's pending bit cleared |
+
+The last test is the load-bearing one — it exercises the **exact**
+kernel-side post → read path libctest relies on, including
+`step_exit_group`'s call into `post_sigchld_to_parent` →
+`step_kill_process(parent, SIGCHLD)` → `post_signal(thread,
+SIGCHLD)` → `payload.pending().post(SIGCHLD)`. All five pass on
+host. So:
+
+- The bit encoding is right (`Signum(17).bit() == 1 << 16`).
+- The sigset_t / timespec userspace pointers decode correctly.
+- The `payload.pending().snapshot() & set_bits` poll observes
+  bits posted by the canonical SIGCHLD-post path.
+- The clear-bit-on-consume path works.
+- The 8 byte sigsetsize check matches musl's RV64 ABI.
+
+The libctest `[timed out]` therefore cannot be the
+`sys_rt_sigtimedwait` wait body. The wedge is **upstream** of
+the SIGCHLD post — most likely:
+
+1. The child takes longer than libctest's 10 s internal
+   timeout to reach `exit_group` (fork-without-execve COW path,
+   demand-paging, or scheduler artefacts).
+2. The child hangs on a syscall the kernel responds to with the
+   wrong value or never resumes (futex, pthread, or a
+   conditional branch).
+3. The kernel doesn't schedule the child between the parent's
+   `NanosleepOp` chunks (single-task reactor starvation —
+   unlikely given the test harness has been running multi-task
+   workloads in QEMU for months, but worth ruling out under
+   trap-trace).
+
+**Next step.** Run `cargo xtask qemu --target rv64-qemu` with a
+`/bin/sh -c "./run-static.sh argv"` invocation isolated to one
+libctest test, capture the trap log, then `cargo xtask
+fault-decode --target rv64-qemu --serial <log> --user-elf
+.../entry-static.exe --summary` to see where the child is
+spending its time. The 10 s internal timeout means we should
+see plenty of forward progress before the deadline if the child
+is genuinely slow; if the child wedges on one specific syscall,
+the log will show many repeats of that syscall just before the
+parent's `SIGKILL`.
 
 #### basic-musl 32/32 detail (carries over)
 

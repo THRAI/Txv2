@@ -1,3 +1,51 @@
+- 2026-05-18 **libctest wedge investigation: prove the
+  `sys_rt_sigtimedwait` wait-side is correct, isolate the gap
+  to the child-exit / SIGCHLD-post upstream.** Five new host
+  tests in
+  [`crates/tx-shims/src/linux_syscall/tests/sigtimedwait_dispatch.rs`](../../crates/tx-shims/src/linux_syscall/tests/sigtimedwait_dispatch.rs)
+  exercise the dispatch arm directly and prove the kernel-side
+  signal-wait path matches libctest's `runtest.c` shape exactly.
+
+  Tests added (all pass):
+  1. `sigtimedwait_returns_pending_signum_and_clears_bit` —
+     pre-loaded SIGCHLD observed; `Return(17)` + bit cleared.
+  2. `sigtimedwait_wrong_sigsetsize_returns_neg_einval` —
+     musl-style 8-byte enforcement (glibc-style 16 rejected).
+  3. `sigtimedwait_null_set_returns_neg_efault` — NULL set
+     returns -EFAULT.
+  4. `sigtimedwait_ignores_signals_outside_set_returns_neg_eagain` —
+     pending SIGTERM with `set = {SIGCHLD}` doesn't get confused;
+     -EAGAIN and SIGTERM stays pending.
+  5. `sigtimedwait_observes_sigchld_posted_by_child_exit` —
+     end-to-end fork → `step_exit_group(child)` → kernel's
+     `post_sigchld_to_parent` → `step_kill_process(parent,
+     SIGCHLD)` → `post_signal(thread, SIGCHLD)` →
+     `payload.pending().post(SIGCHLD)` → `sigtimedwait`
+     returns SIGCHLD with bit cleared. **Load-bearing test:**
+     this is the exact kernel-side post → read path libctest
+     uses.
+
+  All five pass on host. So the `[timed out]` from libctest
+  cannot come from the `sys_rt_sigtimedwait` body. The wedge is
+  **upstream** of the SIGCHLD post — most likely the child takes
+  >10s to reach `exit_group` (fork-without-execve COW path,
+  demand-paging, or a wedge on a syscall the kernel responds to
+  with the wrong value). The next investigation step is a
+  trap-trace of a single libctest test (`./run-static.sh argv`)
+  under QEMU, decoded with `cargo xtask fault-decode --target
+  rv64-qemu --serial <log> --user-elf .../entry-static.exe
+  --summary`, which will show whether the child is genuinely
+  slow or wedging on one specific syscall.
+
+  Doc updates:
+  - `SYSCALL_STATUS.md` top high-stakes row refined: the wait
+    side is "**proven correct**" with the test table as
+    evidence; the upstream-of-post hypothesis is now spelled
+    out with the three sub-cases.
+
+  `cargo -q xtask unit` — **334 → 339 tests pass** (5 new sigtimedwait tests).
+  `cargo xtask ci`      — 17/17 gates green.
+
 - 2026-05-18 **Boot-time `mkdir /tmp`, `/var`, `/var/tmp` in the
   rootfs tmpfs — closes the first of the two lmbench blockers
   (`/var/tmp` ENOENT).** Per the SYSCALL_STATUS.md "second move"

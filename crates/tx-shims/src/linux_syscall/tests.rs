@@ -1150,3 +1150,10 @@ mod fcntl_misc;
 // =====================================================================
 
 mod file_mutation;
+
+// =====================================================================
+// `sys_rt_sigtimedwait` — verify the bit-encoding and post→read
+// round-trip used by libctest's `runtest.c`.
+// =====================================================================
+
+mod sigtimedwait_dispatch;
