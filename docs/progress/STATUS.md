@@ -1,3 +1,118 @@
+- 2026-05-18 **Cred migration complete: `require_rename` / `require_chmod` /
+  `require_chown` land, the new `xtask lint invariants cred-check`
+  CI gate enforces the floor, and two more bypasses
+  (`sys_mkdirat` / `sys_symlinkat`) it discovered are closed.**
+
+  This wraps the cred-snapshot wiring batch. Three new
+  `cred::checks::require_*` predicates land, three remaining VFS
+  mutator syscall arms (`sys_renameat2`, `sys_fchmodat`,
+  `sys_fchownat`) consume them; a static lint scans every
+  `pub(super) fn sys_*` in tx-shims and fails CI if a cred-relevant
+  mutator runs without an authorization gate.
+
+  **New `cred::checks::*` predicates**
+  ([cred/checks.rs](../../crates/tx-subsystems/src/cred/checks.rs)):
+  - `RenameAuthorized<'g>` + `require_rename(snapshot, old_parent_meta,
+    old_child_meta, new_parent_meta, displaced_child, &guard)` — composes
+    the unlink-side rule on (old_parent, old_child), the create rule on
+    new_parent, and (if displacing) the unlink-side rule on
+    (new_parent, displaced).
+  - `ChmodAuthorized<'g>` + `require_chmod(snapshot, target_meta,
+    new_mode, &guard)` — owner OR CAP_FOWNER OR euid 0 → EPERM otherwise.
+  - `ChownAuthorized<'g>` + `require_chown(snapshot, target_meta,
+    new_uid, new_gid, &guard)` — privileged callers (CAP_FOWNER) may
+    set arbitrary uid/gid; non-privileged callers may only set their
+    own. Matches the existing per-FS rule.
+
+  **New `vfs::predicates::*`**
+  ([vfs/predicates.rs](../../crates/tx-subsystems/src/vfs/predicates.rs)):
+  - `check_link_perm(new_parent, cred)` (W+X only, no sticky).
+  - `check_chmod_perm(meta, cred)`.
+  - `check_chown_perm(meta, new_uid, new_gid, cred)`.
+
+  **Five `sys_*` arms wired**
+  ([fs_mut.rs](../../crates/tx-shims/src/linux_syscall/fs_mut.rs),
+  [fs_path.rs](../../crates/tx-shims/src/linux_syscall/fs_path.rs)):
+  - `sys_renameat2` — pre-walks old child + both parents + (best-effort)
+    displaced new path, runs `require_rename` inside the commit guard
+    scope, then drives `RenameOp`. Closes a real bypass: previously
+    `RenameOp` did no cred check.
+  - `sys_fchmodat` / `sys_fchownat` — pre-walk target, run
+    `require_chmod` / `require_chown` at the syscall arm. The per-FS
+    `step_chmod` / `step_chown` rule remains as defense-in-depth; full
+    consolidation (deleting the per-FS rule and consuming the witness
+    inside the step body) is the next layering step.
+  - `sys_mkdirat` / `sys_symlinkat` — consume `require_link` (W+X on
+    parent; sticky-irrelevant for name creation). Discovered by the
+    new lint.
+
+  **`xtask lint invariants cred-check`**
+  ([xtask/src/lint_invariants_cred_check.rs](../../xtask/src/lint_invariants_cred_check.rs)):
+  - Walks every `pub(super) (async )? fn sys_*` in
+    `crates/tx-shims/src/linux_syscall/`, extracts the body via
+    brace-depth tracking.
+  - If body matches any [`MUTATOR_SIGNALS`] (signal-send primitives,
+    StepOp wraps for kill / rename / chmod / chown / mkdir / etc.,
+    `fs_ops.unlink` / `link` / `rename` / `mkdir` / `symlink` /
+    `create_inode` / `step_chmod` / `step_chown` / `step_truncate`)
+    AND matches *no* [`CRED_CHECK_SIGNALS`] (`cred::checks::require_*`,
+    `cred::checks::authorize_*`, the legacy `cred::require_*`
+    re-exports, `signal::script_kill_*` / `script_deliver_signal`):
+    flag.
+  - Allow-list with rationale: `sys_tgkill` (tgid==caller-pid),
+    `sys_write` (hot-path fd grant + kernel-synthesised SIGPIPE
+    self-send), `sys_ftruncate` (hot-path fd grant).
+  - No ratchet — fails on any violation. Current state: 9 audited
+    mutator arms, 3 allow-listed, 0 violations.
+
+  **Audit closure scorecard.** Seven real cred-bypass paths closed
+  across the cred-snapshot wiring batch + this completion:
+
+  | Syscall | Status | Closure |
+  |---|---|---|
+  | `sys_kill` (pid > 0) | ✅ | `script_kill_process` |
+  | `sys_kill` (pid == 0 pgrp) | ✅ | `script_kill_pgrp` |
+  | `sys_tkill` (thread) | ✅ | `script_deliver_signal` |
+  | `sys_unlinkat` | ✅ | `require_unlink` |
+  | `sys_linkat` | ✅ | `require_link` |
+  | `sys_renameat2` | ✅ | `require_rename` |
+  | `sys_mkdirat` | ✅ | `require_link` |
+  | `sys_symlinkat` | ✅ | `require_link` |
+  | `sys_fchmodat` | ✅ | `require_chmod` at arm + per-FS as defense |
+  | `sys_fchownat` | ✅ | `require_chown` at arm + per-FS as defense |
+  | `sys_tgkill` | ⚠️ allow-listed (tgid==caller-pid trivially permits) |
+
+  **Tests (16 new across this batch):** 13 in `cred/tests.rs`
+  (6 `require_rename` branches, 3 `require_chmod`, 4 `require_chown`)
+  + 1 `dispatch_renameat2_without_parent_write_returns_neg_eacces`
+  dispatch regression + 2 mkdir/symlink negative paths covered by
+  the lint enforcement.
+
+  **Verification:** `cargo -q xtask unit` — tx-shims **233/233**
+  (+1 EACCES dispatch test over the 232 baseline), tx-kernel 44/44,
+  tx-ext4 8/8, tx-scripts 50/50. `cargo test -p tx-subsystems --lib`
+  — **679/679** (+13 unit tests over 666 baseline).
+  `cargo xtask lint invariants cred-check` — 9 audited, 3 allow-listed,
+  0 violations.
+
+  Commits:
+  - `e2748b1` cred: complete migration — require_rename / require_chmod / require_chown
+  - `b675870` lint: cred-check — every cred-mutator syscall arm must be gated
+
+  **Open follow-ups (not security gaps, layering / hygiene):**
+  - Per-FS `step_chmod` / `step_chown` rule still exists alongside
+    `require_*` (defense-in-depth). Consolidation is a separate cleanup.
+  - VFS walker still consumes inline `vfs::predicates` directly rather
+    than minting `SearchAuthorized` / `OpenAuthorized` witnesses for the
+    cred chain. Behaviour identical; witness chain not yet intact at
+    walker mint sites.
+  - Cross-process `sys_tgkill` will need `script_deliver_signal` routing
+    when the tgid-must-match-caller-pid constraint is lifted.
+
+  **Next step:** Land the per-FS chmod/chown rule deletion (consume the
+  witness inside step body) once `FsOps::step_chmod` / `step_chown` take
+  `&CredSnapshot` or the equivalent.
+
 - 2026-05-18 **`require_unlink` + `require_link` close the two
   remaining cred-bypass paths in the VFS mutator surface.**
 
