@@ -646,6 +646,15 @@ impl<P: TxPlatform> CoreInit<P> {
         let init_pgrp = init.pgrp_cap();
         let pgid_low = init_pgrp.pgid.0;
         let sid_low = init_pgrp.session_cap().sid.0;
+        // OBS-V1 §15.7 + §15.8: emit the one-shot PCB identity bundle
+        // BEFORE submitting the leader so the daemon caches
+        // `(comm, pgid, sid)` before the next reactor poll
+        // materialises the per-process track on first slice.
+        // Perfetto rejects later TrackDescriptors that change a
+        // track's `parent_uuid`, so the metadata must arrive ahead
+        // of the first dispatch.
+        emit_process_label::<P>(pid_low, &comm);
+        emit_process_group::<P>(pid_low, pgid_low, sid_low);
         let submitted = BOOT_REACTOR.with(|reactor| {
             reactor.submit_task_with_meta(
                 crate::thread_future::PerHartSlotted::<P, _>::new(
@@ -662,13 +671,6 @@ impl<P: TxPlatform> CoreInit<P> {
             // Boot reactor not initialised; nothing to drive.
             return;
         }
-        // OBS-V1 §15.7 + §15.8: emit the one-shot PCB identity bundle
-        // so the daemon can surface the real `comm` on the per-process
-        // Perfetto track AND nest that track under a per-pgrp / per-
-        // session swimlane (avoids scattered top-level lanes when one
-        // test driver fork()s many children).
-        emit_process_label::<P>(pid_low, &comm);
-        emit_process_group::<P>(pid_low, pgid_low, sid_low);
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:submitted\n");
 
