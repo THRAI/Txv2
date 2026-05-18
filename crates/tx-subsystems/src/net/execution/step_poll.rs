@@ -54,10 +54,17 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. }) => {
-            if witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0 {
+            let io = payload.io_snapshot();
+            if io.recv_len > 0
+                || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
+            {
                 mask |= PollMask::IN;
             }
-            mask |= PollMask::OUT;
+            if io.send_space > 0
+                || witness.identity.readiness.send_wq.peek() & SendWireSet::SPACE.bits() != 0
+            {
+                mask |= PollMask::OUT;
+            }
         }
         SocketProtocol::RawIcmp(_) => {
             let io = payload.io_snapshot();

@@ -100,12 +100,10 @@ impl RawUdpSocket {
         let mut rx = self.rx_datagrams.lock();
         let was_empty = rx.is_empty();
         let available = self.recv_capacity.saturating_sub(rx_payload_len(&rx));
-        if available == 0 {
+        if payload.len() > available {
             return false;
         }
 
-        let mut payload = payload;
-        payload.truncate(available);
         rx.push_back(UdpRxDatagram { src, dst, payload });
         was_empty
     }
@@ -172,22 +170,17 @@ impl RawUdpSocket {
         self.enqueue_tx_datagram(dst, bytes)
     }
 
-    pub fn enqueue_tx_datagram(
-        &self,
-        dst: IpEndpoint,
-        mut payload: Vec<u8>,
-    ) -> Option<(usize, bool)> {
+    pub fn enqueue_tx_datagram(&self, dst: IpEndpoint, payload: Vec<u8>) -> Option<(usize, bool)> {
         if payload.is_empty() {
             return Some((0, false));
         }
 
         let mut tx = self.tx_datagrams.lock();
         let available = self.send_capacity.saturating_sub(tx_payload_len(&tx));
-        if available == 0 {
+        if payload.len() > available {
             return None;
         }
 
-        payload.truncate(available);
         let bytes = payload.len();
         tx.push_back(UdpTxDatagram { dst, payload });
         Some((bytes, tx_payload_len(&tx) == self.send_capacity))
@@ -203,11 +196,10 @@ impl RawUdpSocket {
 
     pub fn pop_tx_datagram(&self) -> Option<UdpTxDatagramDrain> {
         let mut tx = self.tx_datagrams.lock();
-        let had_no_space = tx_payload_len(&tx) == self.send_capacity;
         let datagram = tx.pop_front()?;
         Some(UdpTxDatagramDrain {
             datagram,
-            became_available: had_no_space,
+            became_available: true,
         })
     }
 

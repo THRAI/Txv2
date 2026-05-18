@@ -1410,6 +1410,46 @@ fn step_send_blocks_when_no_space() {
 }
 
 #[test]
+fn raw_udp_send_queue_preserves_datagram_atomicity() {
+    let mut options = SocketOptionSet::default_udp();
+    options.socket.send_buf_size = 8;
+    let udp = RawUdpSocket::new(&options);
+    let dst = IpEndpoint::new(Ipv4Address::LOOPBACK, 40_138);
+
+    assert_eq!(udp.enqueue_tx_bytes_to(dst, b"12345"), Some((5, false)));
+    assert_eq!(udp.send_available(), 3);
+    assert_eq!(udp.enqueue_tx_bytes_to(dst, b"abcd"), None);
+    assert_eq!(udp.send_available(), 3);
+
+    let drain = udp.pop_tx_datagram().expect("queued datagram");
+    assert_eq!(drain.datagram.payload, b"12345");
+    assert!(drain.became_available);
+    assert_eq!(udp.enqueue_tx_bytes_to(dst, b"abcd"), Some((4, false)));
+}
+
+#[test]
+fn raw_udp_recv_queue_drops_when_datagram_would_not_fit() {
+    let mut options = SocketOptionSet::default_udp();
+    options.socket.recv_buf_size = 8;
+    let udp = RawUdpSocket::new(&options);
+    let src = IpEndpoint::new(Ipv4Address::LOOPBACK, 50_138);
+    let dst = IpEndpoint::new(Ipv4Address::LOOPBACK, 40_138);
+
+    assert!(udp.ingest_rx_datagram(src, dst, b"123456".to_vec()));
+    assert!(!udp.ingest_rx_datagram(src, dst, b"abcd".to_vec()));
+    assert_eq!(udp.recv_available(), 6);
+
+    let mut out = [0u8; 8];
+    let drain = udp
+        .recv_datagram_bytes(&mut out, false)
+        .expect("first datagram");
+    assert_eq!(drain.bytes, 6);
+    assert_eq!(&out[..drain.bytes], b"123456");
+    assert!(drain.became_empty);
+    assert!(udp.ingest_rx_datagram(src, dst, b"abcd".to_vec()));
+}
+
+#[test]
 fn step_accept_returns_child_socket_and_clears_when_empty() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -1552,4 +1592,38 @@ fn execution_poll_reports_socket_readiness() {
     };
     assert!(mask.contains(PollMask::HUP));
     assert!(mask.contains(PollMask::ERR));
+}
+
+#[test]
+fn execution_poll_udp_readiness_tracks_io_snapshot() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let udp = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("udp socket");
+    let local = endpoint(40_016);
+
+    assert_eq!(
+        step_bind(&udp, inet(local.port), &guard),
+        StepOutcome::Done(())
+    );
+    let payload = udp.acquire_operational().expect("udp payload");
+    assert!(payload.record_recv_payload(endpoint(50_016), local, b"ready".to_vec()));
+    assert_eq!(
+        udp.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits(),
+        0,
+        "recording bytes alone must be enough for poll readiness"
+    );
+
+    let mask = match step_poll_ready(&udp, &guard) {
+        StepOutcome::Done(mask) => mask,
+        other => panic!("unexpected poll outcome: {other:?}"),
+    };
+    assert!(mask.contains(PollMask::IN));
+    assert!(mask.contains(PollMask::OUT));
 }

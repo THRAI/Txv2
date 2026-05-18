@@ -573,7 +573,10 @@ pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(
 /// Finite non-zero timeouts validate the timespec and then park on the
 /// first socket/TTY wait token when no fd is immediately ready. The
 /// exact deadline is not enforced yet; `{0,0}` remains a true poll.
-pub(super) async fn sys_pselect6<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
 
     let nfds = args[0];
@@ -593,16 +596,31 @@ pub(super) async fn sys_pselect6<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         Ok(wait) => wait,
         Err(errno) => return SyscallResult::Error(errno),
     };
+    let timeout_deadline_ns = match timeout {
+        PselectTimeout::FiniteWait(duration_ns) => {
+            Some(<P as tx_hal::TimeIf>::read_ns().saturating_add(duration_ns))
+        }
+        PselectTimeout::Infinite | PselectTimeout::Poll => None,
+    };
     let word_count = fdset_word_count(nfds);
     let (read_ready, write_ready, except_ready, ready_count) = loop {
         drive_loopback_pending();
+        if let Some(deadline_ns) = timeout_deadline_ns {
+            if <P as tx_hal::TimeIf>::read_ns() >= deadline_ns {
+                break (
+                    alloc::vec![0u64; word_count as usize],
+                    alloc::vec![0u64; word_count as usize],
+                    alloc::vec![0u64; word_count as usize],
+                    0,
+                );
+            }
+        }
         let mut read_ready = alloc::vec![0u64; word_count as usize];
         let mut write_ready = alloc::vec![0u64; word_count as usize];
         let mut except_ready = alloc::vec![0u64; word_count as usize];
         let mut ready_count: i64 = 0;
         let mut wait_token = None;
         let mut wait_token_is_socket = false;
-        let mixed_read_interest = readfds != 0;
         let mut read_interest_count = 0usize;
 
         for fd in 0..nfds {
@@ -649,7 +667,7 @@ pub(super) async fn sys_pselect6<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                     fdset_set(&mut read_ready, fd);
                     fd_ready = true;
                 }
-                if pselect_socket_write_ready(&file, mixed_read_interest, want_write, mask) {
+                if pselect_socket_write_ready(want_write, mask) {
                     fdset_set(&mut write_ready, fd);
                     fd_ready = true;
                 }
@@ -730,16 +748,31 @@ pub(super) async fn sys_pselect6<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
             continue;
         }
         let Some(token) = wait_token else {
+            if let Some(deadline_ns) = timeout_deadline_ns {
+                wait_until_pselect_deadline::<P>(deadline_ns).await;
+            }
             break (read_ready, write_ready, except_ready, ready_count);
         };
         if let Some(future) = wait_source::wait_on_token(token) {
-            let _ = future.await;
+            if let Some(deadline_ns) = timeout_deadline_ns {
+                match wait_on_token_or_pselect_deadline::<P>(future, deadline_ns).await {
+                    PselectWaitWake::FdReady => {}
+                    PselectWaitWake::TimedOut => {
+                        break (read_ready, write_ready, except_ready, ready_count);
+                    }
+                }
+            } else {
+                let _ = future.await;
+            }
         } else {
+            if let Some(deadline_ns) = timeout_deadline_ns {
+                wait_until_pselect_deadline::<P>(deadline_ns).await;
+            }
             break (read_ready, write_ready, except_ready, ready_count);
         }
     };
 
-    if ready_count != 0 {
+    if ready_count != 0 || timeout != PselectTimeout::Infinite {
         tx_reactor::yield_now().await;
     }
 
@@ -759,7 +792,7 @@ pub(super) async fn sys_pselect6<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PselectTimeout {
     Infinite,
-    FiniteWait,
+    FiniteWait(u64),
     Poll,
 }
 
@@ -781,8 +814,50 @@ fn pselect_timeout_policy<'a>(
     if sec == 0 && nsec == 0 {
         Ok(PselectTimeout::Poll)
     } else {
-        Ok(PselectTimeout::FiniteWait)
+        let sec_ns = (sec as u64).saturating_mul(1_000_000_000);
+        Ok(PselectTimeout::FiniteWait(
+            sec_ns.saturating_add(nsec as u64),
+        ))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PselectWaitWake {
+    FdReady,
+    TimedOut,
+}
+
+async fn wait_on_token_or_pselect_deadline<P: tx_hal::TimeIf>(
+    mut fd_future: wait_source::RegisteredWaitFuture,
+    deadline_ns: u64,
+) -> PselectWaitWake {
+    if <P as tx_hal::TimeIf>::read_ns() >= deadline_ns {
+        return PselectWaitWake::TimedOut;
+    }
+    let Some(mut timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) else {
+        return PselectWaitWake::TimedOut;
+    };
+
+    core::future::poll_fn(|cx| {
+        if core::future::Future::poll(core::pin::Pin::new(&mut fd_future), cx).is_ready() {
+            return core::task::Poll::Ready(PselectWaitWake::FdReady);
+        }
+        if core::future::Future::poll(core::pin::Pin::new(&mut timer_future), cx).is_ready() {
+            return core::task::Poll::Ready(PselectWaitWake::TimedOut);
+        }
+        core::task::Poll::Pending
+    })
+    .await
+}
+
+async fn wait_until_pselect_deadline<P: tx_hal::TimeIf>(deadline_ns: u64) {
+    if <P as tx_hal::TimeIf>::read_ns() >= deadline_ns {
+        return;
+    }
+    let Some(timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) else {
+        return;
+    };
+    let _ = timer_future.await;
 }
 
 fn fdset_word_count(nfds: u64) -> u64 {
@@ -819,27 +894,8 @@ fn fdset_write<'a>(ctx: &SyscallCtx<'a>, set_ptr: u64, words: &[u64]) -> Result<
     Ok(())
 }
 
-fn pselect_socket_write_ready(
-    file: &Cap<OpenFile>,
-    mixed_read_interest: bool,
-    want_write: bool,
-    mask: tx_subsystems::net::PollMask,
-) -> bool {
-    if !want_write || !mask.intersects(tx_subsystems::net::PollMask::OUT) {
-        return false;
-    }
-    if !mixed_read_interest || mask.intersects(tx_subsystems::net::PollMask::IN) {
-        return true;
-    }
-
-    let tx_subsystems::vfs::structure::RNodeBacking::StructBacked {
-        payload: tx_subsystems::vfs::structure::StructPayload::Socket { identity: socket },
-    } = file.rnode().backing()
-    else {
-        return true;
-    };
-
-    socket.readiness.send_wq.peek() & tx_subsystems::net::structure::SendWireSet::SPACE.bits() != 0
+fn pselect_socket_write_ready(want_write: bool, mask: tx_subsystems::net::PollMask) -> bool {
+    want_write && mask.intersects(tx_subsystems::net::PollMask::OUT)
 }
 
 pub(super) fn pselect_socket_read_ready(
@@ -1518,6 +1574,8 @@ async fn sys_write_socket(
                         return SyscallResult::Return(total as i64);
                     }
                     return SyscallResult::Error(EAGAIN_VALUE);
+                } else {
+                    drive_loopback_pending();
                 }
 
                 match shape {

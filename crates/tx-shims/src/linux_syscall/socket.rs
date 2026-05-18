@@ -196,7 +196,7 @@ pub(super) async fn sys_connect<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         Ok(remote) => remote,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
-    if let Err(errno) = maybe_autobind_tcp_client(&socket, remote) {
+    if let Err(errno) = maybe_autobind_connect_client(&socket, remote) {
         return SyscallResult::Error(errno_to_i32(errno));
     }
     let nonblocking = file.flags().nonblocking;
@@ -235,11 +235,11 @@ pub(super) async fn sys_connect<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     }
 }
 
-fn maybe_autobind_tcp_client(
+fn maybe_autobind_connect_client(
     socket: &Cap<SocketIdentity>,
     remote: KernelSockAddr,
 ) -> Result<(), Errno> {
-    if socket.kind != SocketKind::Tcp {
+    if socket.kind != SocketKind::Tcp && socket.kind != SocketKind::Udp {
         return Ok(());
     }
 

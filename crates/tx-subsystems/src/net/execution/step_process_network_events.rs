@@ -263,7 +263,7 @@ fn process_udp_event(
     event: UdpPacketEvent,
     guard: &Guard<'_>,
 ) -> Option<(Cap<SocketIdentity>, NetworkPublish)> {
-    let socket = SOCKET_TABLE.lookup_udp_bound(event.dst, guard)?;
+    let socket = SOCKET_TABLE.lookup_udp_ingress(event.src, event.dst, guard)?;
     let payload = socket.acquire_operational()?;
     let mut publish = NetworkPublish::none();
     if payload.record_recv_payload(event.src, event.dst, event.payload) {

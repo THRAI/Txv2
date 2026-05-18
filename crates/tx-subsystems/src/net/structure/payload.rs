@@ -57,7 +57,7 @@ impl SocketPayload {
                 Some(RawIcmpSocket::new(&options)),
             ),
         };
-        Self {
+        let payload = Self {
             protocol: SpinMutex::new(protocol),
             options: SpinMutex::new(options),
             raw_tcp,
@@ -67,7 +67,9 @@ impl SocketPayload {
             tcp_backlog: SpinMutex::new(TcpBacklog::new()),
             shutdown_rd: AtomicBool::new(false),
             shutdown_wr: AtomicBool::new(false),
-        }
+        };
+        payload.refresh_io_from_raw();
+        payload
     }
 
     pub fn shutdown_rd(&self) -> bool {

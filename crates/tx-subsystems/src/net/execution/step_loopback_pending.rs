@@ -146,6 +146,7 @@ pub fn step_process_loopback_pending(
     for socket in SOCKET_TABLE
         .snapshot_udp_bound(guard)
         .into_iter()
+        .chain(SOCKET_TABLE.snapshot_udp_connections(guard))
         .filter(|socket| has_udp_loopback_tx_pending(socket, iface))
     {
         if !remember_socket(&mut udp_bound_seen, &socket) {

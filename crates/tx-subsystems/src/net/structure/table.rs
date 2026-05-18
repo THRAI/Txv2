@@ -82,6 +82,7 @@ pub struct SocketTable {
     tcp_listeners: Index<ListenerKey, Cap<SocketIdentity>, LISTENER_SLOTS>,
     tcp_connections: Index<ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>,
     udp_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
+    udp_connections: Index<ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>,
     raw_icmp: Index<RawIcmpSocketKey, Cap<SocketIdentity>, RAW_ICMP_SLOTS>,
 }
 
@@ -92,6 +93,7 @@ impl SocketTable {
             tcp_listeners: Index::new(),
             tcp_connections: Index::new(),
             udp_bound: Index::new(),
+            udp_connections: Index::new(),
             raw_icmp: Index::new(),
         }
     }
@@ -135,6 +137,15 @@ impl SocketTable {
         socket: Cap<SocketIdentity>,
     ) -> Result<(), IndexError> {
         self.tcp_connections.reserve(key)?.commit(socket);
+        Ok(())
+    }
+
+    pub fn insert_udp_connection(
+        &self,
+        key: ConnectionKey,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.udp_connections.reserve(key)?.commit(socket);
         Ok(())
     }
 
@@ -189,6 +200,13 @@ impl SocketTable {
         mutation::withdraw(&self.udp_bound, &LocalEndpointKey::new(endpoint))
     }
 
+    pub fn withdraw_udp_connection(
+        &self,
+        key: ConnectionKey,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        mutation::withdraw(&self.udp_connections, &key)
+    }
+
     pub fn withdraw_raw_icmp(&self, socket_raw: u32) -> Result<Cap<SocketIdentity>, MutationError> {
         mutation::withdraw(&self.raw_icmp, &RawIcmpSocketKey { socket_raw })
     }
@@ -237,6 +255,36 @@ impl SocketTable {
             .map(|entry| entry.value().clone())
     }
 
+    pub fn lookup_udp_connection(
+        &self,
+        key: ConnectionKey,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.udp_connections
+            .lookup(&key, guard)
+            .map(|entry| entry.value().clone())
+    }
+
+    pub fn lookup_udp_ingress(
+        &self,
+        src: IpEndpoint,
+        dst: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        let exact = ConnectionKey::new(dst, src);
+        if let Some(socket) = self.lookup_udp_connection(exact, guard) {
+            return Some(socket);
+        }
+
+        let wildcard_local =
+            ConnectionKey::new(IpEndpoint::new(Ipv4Address::UNSPECIFIED, dst.port), src);
+        if let Some(socket) = self.lookup_udp_connection(wildcard_local, guard) {
+            return Some(socket);
+        }
+
+        self.lookup_udp_bound(dst, guard)
+    }
+
     pub fn snapshot_tcp_listeners(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
         self.tcp_listeners.snapshot_values(guard)
     }
@@ -249,13 +297,44 @@ impl SocketTable {
         self.tcp_connections.snapshot_values(guard)
     }
 
+    pub fn snapshot_udp_connections(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.udp_connections.snapshot_values(guard)
+    }
+
     pub fn lookup_udp_bound(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        if let Some(socket) = self.lookup_udp_bound_exact(endpoint, guard) {
+            return Some(socket);
+        }
+        self.lookup_udp_bound_wildcard(endpoint, guard)
+    }
+
+    pub fn lookup_udp_bound_exact(
         &self,
         endpoint: IpEndpoint,
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
         self.udp_bound
             .lookup(&LocalEndpointKey::new(endpoint), guard)
+            .map(|entry| entry.value().clone())
+    }
+
+    pub fn lookup_udp_bound_wildcard(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.udp_bound
+            .lookup(
+                &LocalEndpointKey {
+                    addr: Ipv4Address::UNSPECIFIED,
+                    port: endpoint.port,
+                },
+                guard,
+            )
             .map(|entry| entry.value().clone())
     }
 
