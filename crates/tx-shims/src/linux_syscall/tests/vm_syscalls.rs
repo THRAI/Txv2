@@ -100,11 +100,9 @@ fn dispatch_mmap_anonymous_private_returns_aligned_user_va() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     match result {
         SyscallResult::Return(addr) => {
-            // The returned VA may be 0 — `find_free_range` over a
-            // fresh aspace's full V1 user window starts at addr 0
-            // and that's a valid page-aligned result. The
-            // structural assertion is page-alignment.
-            assert!(addr >= 0, "mmap returned non-negative VA");
+            // Syscall-level non-fixed mmap keeps page 0 unmapped so
+            // libc/user code never observes a successful NULL mapping.
+            assert!(addr > 0, "mmap returned non-null VA");
             assert_eq!(
                 (addr as usize) % USER_PAGE_SIZE,
                 0,
@@ -177,9 +175,7 @@ fn dispatch_mmap_file_backed_against_pagebacked_fd_returns_va() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     match result {
         SyscallResult::Return(addr) => {
-            // Page-aligned non-negative VA — see comment in the
-            // anonymous-private test.
-            assert!(addr >= 0);
+            assert!(addr > 0);
             assert_eq!((addr as usize) % USER_PAGE_SIZE, 0);
         }
         other => panic!("expected Return, got {other:?}"),

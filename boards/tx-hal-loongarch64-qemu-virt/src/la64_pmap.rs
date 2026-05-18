@@ -1,6 +1,7 @@
-use super::la64_irq_trap::{
-    align_up, console_write_hex, console_write_literal, linked_kernel_image, write_la64_csr,
-};
+use super::boot_facts::linked_kernel_image;
+use super::la64_irq_trap::{align_up, write_la64_csr};
+#[cfg(feature = "la64-boot-trace")]
+use super::la64_irq_trap::{console_write_hex, console_write_literal};
 use super::*;
 
 pub(crate) fn uart_put_byte(byte: u8) {
@@ -37,6 +38,20 @@ pub(crate) const fn la64_cached_virt(phys: usize) -> usize {
 
 pub(crate) const fn la64_uncached_virt(phys: usize) -> usize {
     LA64_DMW_UNCACHED_BASE | phys
+}
+
+pub(crate) const fn la64_dmw_direct_map() -> VirtRange {
+    VirtRange {
+        start: VirtAddr(LA64_DMW_CACHED_BASE),
+        size: QEMU_LA64_RAM_SIZE,
+    }
+}
+
+pub(crate) const fn la64_dmw_mapped_phys() -> PhysRange {
+    PhysRange {
+        start: PhysAddr(QEMU_LA64_RAM_BASE),
+        size: QEMU_LA64_RAM_SIZE,
+    }
 }
 
 pub(crate) fn la64_pt_node_ptr(phys: PhysAddr) -> *mut u8 {
@@ -125,67 +140,123 @@ pub(crate) fn free_la64_asid(asid: Asid) {
     LA64_ALLOCATED_ASIDS.fetch_and(!(1u64 << asid.0), Ordering::AcqRel);
 }
 
-pub(crate) fn activate_la64_pmap(root: &PmapRoot) -> Result<(), PmapError> {
-    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:activate:start\n");
-    let pgdh = ensure_la64_kernel_pgdh_root()?;
-    ensure_la64_low_kernel_identity_mapped(root)?;
-    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:pgdh=0x");
-    console_write_hex(pgdh.0);
-    console_write_literal(b"\n");
-    configure_la64_page_walk_csrs();
-    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:pwcl:ok\n");
+#[cfg(feature = "la64-boot-trace")]
+fn trace_pmap_literal(bytes: &[u8]) {
+    console_write_literal(bytes);
+}
 
+#[cfg(not(feature = "la64-boot-trace"))]
+fn trace_pmap_literal(_bytes: &[u8]) {}
+
+#[cfg(feature = "la64-boot-trace")]
+fn trace_pmap_hex(value: usize) {
+    console_write_hex(value);
+}
+
+#[cfg(not(feature = "la64-boot-trace"))]
+fn trace_pmap_hex(_value: usize) {}
+
+pub(crate) struct La64PmapSwitch {
+    pub(crate) asid: usize,
+    pub(crate) pgdl: usize,
+    pub(crate) pgdh: usize,
+    pub(crate) switch_required: bool,
+}
+
+pub(crate) fn prepare_la64_pmap_switch(root: &PmapRoot) -> Result<La64PmapSwitch, PmapError> {
+    let pgdh = ensure_la64_kernel_pgdh_bootstrap_mapped()?;
     let asid = root.asid().0 as usize & LA64_ASID_MASK;
-    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:root=0x");
-    console_write_hex(root.phys().0);
-    console_write_literal(b":asid=0x");
-    console_write_hex(asid);
-    console_write_literal(b"\n");
-    write_la64_csr(LA64_CSR_ASID, asid);
-    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:asid:ok\n");
-    write_la64_csr(LA64_CSR_PGDL, root.phys().0);
-    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:pgdl:ok\n");
-    write_la64_csr(LA64_CSR_PGDH, pgdh.0);
-    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:pgdh-write:ok\n");
+    let pgdl = root.phys().0;
+    let switch_required = LA64_ACTIVE_ASID.load(Ordering::Acquire) != asid
+        || LA64_ACTIVE_PGDL.load(Ordering::Acquire) != pgdl
+        || LA64_ACTIVE_PGDH.load(Ordering::Acquire) != pgdh.0;
+
+    if switch_required {
+        configure_la64_page_walk_csrs();
+    }
+
+    Ok(La64PmapSwitch {
+        asid,
+        pgdl,
+        pgdh: pgdh.0,
+        switch_required,
+    })
+}
+
+pub(crate) fn record_la64_pmap_switch(switch: &La64PmapSwitch) {
+    LA64_ACTIVE_ASID.store(switch.asid, Ordering::Release);
+    LA64_ACTIVE_PGDL.store(switch.pgdl, Ordering::Release);
+    LA64_ACTIVE_PGDH.store(switch.pgdh, Ordering::Release);
+}
+
+pub(crate) fn activate_la64_pmap(root: &PmapRoot) -> Result<(), PmapError> {
+    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:activate:start\n");
+    let switch = prepare_la64_pmap_switch(root)?;
+    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:pgdh=0x");
+    trace_pmap_hex(switch.pgdh);
+    trace_pmap_literal(b"\n");
+    if !switch.switch_required {
+        trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:switch:skip\n");
+        return Ok(());
+    }
+    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:pwcl:ok\n");
+
+    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:root=0x");
+    trace_pmap_hex(switch.pgdl);
+    trace_pmap_literal(b":asid=0x");
+    trace_pmap_hex(switch.asid);
+    trace_pmap_literal(b"\n");
+    write_la64_csr(LA64_CSR_ASID, switch.asid);
+    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:asid:ok\n");
+    write_la64_csr(LA64_CSR_PGDL, switch.pgdl);
+    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:pgdl:ok\n");
+    write_la64_csr(LA64_CSR_PGDH, switch.pgdh);
+    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:pgdh-write:ok\n");
 
     let crmd = LA64_CRMD_PG | LA64_CRMD_DATF_CC | LA64_CRMD_DATM_CC;
-    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:crmd-new=0x00000000000000b0\n");
+    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:crmd-new=0x00000000000000b0\n");
     write_la64_csr(LA64_CSR_CRMD, crmd);
-    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:crmd:ok\n");
+    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:crmd:ok\n");
     la64_invtlb_all();
-    console_write_literal(b"txkernel:qemu-loongarch64-virt:pmap:invtlb:ok\n");
+    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:invtlb:ok\n");
 
-    LA64_ACTIVE_ASID.store(asid, Ordering::Release);
-    LA64_ACTIVE_PGDL.store(root.phys().0, Ordering::Release);
-    LA64_ACTIVE_PGDH.store(pgdh.0, Ordering::Release);
+    record_la64_pmap_switch(&switch);
     Ok(())
 }
 
-pub(crate) fn ensure_la64_low_kernel_identity_mapped(root: &PmapRoot) -> Result<(), PmapError> {
+pub(crate) fn ensure_la64_kernel_pgdh_bootstrap_mapped() -> Result<PhysAddr, PmapError> {
+    let root = ensure_la64_kernel_pgdh_root()?;
+    if LA64_KERNEL_PGDH_BOOTSTRAP_MAPPED.load(Ordering::Acquire) {
+        return Ok(root);
+    }
+
     let image = linked_kernel_image();
     let start = align_down(image.start.0, <Platform as PlatformConfig>::PAGE_SIZE);
     let end = align_up(image.end().0, <Platform as PlatformConfig>::PAGE_SIZE);
     let mut phys = start;
     while phys < end {
-        let virt = VirtAddr(phys);
-        let reservation = reserve_la64_mapping_in_root(
-            root.phys(),
-            virt,
-            PhysAddr(phys),
-            PmapReserveKind::Page4K,
-        )?;
+        let virt = VirtAddr(la64_cached_virt(phys));
+        let reservation =
+            reserve_la64_mapping_in_root(root, virt, PhysAddr(phys), PmapReserveKind::Page4K)?;
         if let Some(reservation) = reservation {
             register_la64_committed_intermediates(reservation.intermediates());
-            let permissions = PmapPermissions::KERNEL_RW.union(PmapPermissions::EXECUTE);
+            let permissions = PmapPermissions::KERNEL_RW
+                .union(PmapPermissions::EXECUTE)
+                .union(PmapPermissions::GLOBAL);
             let leaf = encode_la64_leaf_pte(PhysAddr(phys), permissions);
-            write_la64_leaf(root.phys(), virt, PmapReserveKind::Page4K, leaf)?;
+            write_la64_leaf(root, virt, PmapReserveKind::Page4K, leaf)?;
         }
         phys = phys.saturating_add(<Platform as PlatformConfig>::PAGE_SIZE);
     }
-    Ok(())
+
+    LA64_KERNEL_PGDH_BOOTSTRAP_MAPPED.store(true, Ordering::Release);
+    Ok(root)
 }
 
 pub(crate) fn ensure_la64_kernel_pgdh_root() -> Result<PhysAddr, PmapError> {
+    // This is the steady-state high-half kernel page-table root. LA64 early
+    // boot reaches `CoreInit` through DMW, so this root is deliberately not the
+    // `BootstrapPmapInfo::root` published by `boot_facts`.
     let existing = LA64_KERNEL_PGDH_PHYS.load(Ordering::Acquire);
     if existing != 0 {
         return Ok(PhysAddr(existing));

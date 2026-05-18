@@ -24,6 +24,7 @@ pub const PROCFS_SELF_ID: FsObjectId = FsObjectId::new(0x7072_6F01);
 pub const PROCFS_MOUNTS_ID: FsObjectId = FsObjectId::new(0x7072_6F02);
 pub const PROCFS_CPUINFO_ID: FsObjectId = FsObjectId::new(0x7072_6F03);
 pub const PROCFS_UPTIME_ID: FsObjectId = FsObjectId::new(0x7072_6F04);
+pub const PROCFS_MEMINFO_ID: FsObjectId = FsObjectId::new(0x7072_6F05);
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 const PROCFS_STAT_OFFSET: u64 = 0x10000;
 const PROCFS_MEM_OFFSET: u64 = 0x10002;
@@ -171,6 +172,9 @@ impl FsOps for Procfs {
             if name == b"uptime" {
                 return StepOutcome::done(PROCFS_UPTIME_ID);
             }
+            if name == b"meminfo" {
+                return StepOutcome::done(PROCFS_MEMINFO_ID);
+            }
             if let Ok(n) = core::str::from_utf8(name).unwrap_or("").parse::<u32>() {
                 if n > 0 && process::process_by_pid(Pid(n)).is_some() {
                     return StepOutcome::done(pid_dir_id(Pid(n)));
@@ -214,7 +218,7 @@ impl FsOps for Procfs {
             PROCFS_SELF_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Symlink, PROCFS_SYMLINK_MODE))
             }
-            PROCFS_MOUNTS_ID | PROCFS_CPUINFO_ID | PROCFS_UPTIME_ID => {
+            PROCFS_MOUNTS_ID | PROCFS_CPUINFO_ID | PROCFS_UPTIME_ID | PROCFS_MEMINFO_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             id if pid_from_dir(id).is_some() => {
@@ -292,6 +296,7 @@ impl FsOps for Procfs {
             (b"mounts", PROCFS_MOUNTS_ID, InodeKind::Regular),
             (b"cpuinfo", PROCFS_CPUINFO_ID, InodeKind::Regular),
             (b"uptime", PROCFS_UPTIME_ID, InodeKind::Regular),
+            (b"meminfo", PROCFS_MEMINFO_ID, InodeKind::Regular),
         ];
         let si = idx.saturating_sub(2);
         if state_byte == 2 && si < statics.len() {
