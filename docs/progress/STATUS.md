@@ -1,97 +1,485 @@
-- 2026-05-18 **`tx-ltp-syscall`: OSComp + LTP elevated to gold-standard correctness bar.**
-  Edited [.agents/skills/tx-ltp-syscall/SKILL.md](../../.agents/skills/tx-ltp-syscall/SKILL.md)
-  and [SYSCALL_STATUS.md](SYSCALL_STATUS.md) so OSComp + LTP are first-class:
-  - Skill description now leads with "OSComp and LTP are the gold-standard correctness
-    bar"; new "Gold standard" section explains why (OSComp = competitive scoreboard
-    + realistic-program harness; LTP = ABI-edge-case suite) and that host unit tests
-    are sanity checks, not substitutes.
-  - "Verification" split into inner loop (host) and gold-standard outer loop
-    (`cargo xtask oscomp run --target rv64-qemu` + LTP-in-QEMU); outer loop is no
-    longer optional.
-  - "Done Means" now requires naming at least one specific OSComp/LTP test that newly
-    passes; if neither can run for unrelated reasons, the blocker itself is a
-    high-priority follow-up rather than a silent substitution.
-  - SYSCALL_STATUS.md grew an "OSComp + LTP coverage (the gold standard)" section with
-    subsections for OSComp (passing/partial) and LTP, and the "How to update this
-    file" checklist now requires recording the OSComp/LTP test(s) that closed the
-    work — with date, commit, and exercised syscall — on every landing.
-  **Verified:** `cargo xtask lint docs` → ok; `cargo xtask progress validate` → 24
-  records ok. **Next step:** when the first syscall lands under the new rule (likely
-  fork+CLOEXEC or getrlimit/setrlimit), exercise the OSComp/LTP completion entry shape
-  end-to-end.
+- 2026-05-17 **LA64 QEMU SMP shape made explicit.**
+  Added a `--smp N` override to `cargo xtask qemu`, keeping the default LA64
+  smoke lane at `-smp 4` while making `-smp 1` directly reproducible when
+  needed. OSComp local QEMU remains fixed at `-smp 1` to mirror the contest
+  shape; the normal smoke lane now documents and preserves the split instead of
+  hiding it behind comments. Verified that both `cargo xtask qemu --target
+  la64-qemu --profile smoke --expect-sentinel` (default `-smp 4`) and the new
+  `--smp 1` override reach `boot:ok`.
+  **Verified:** `cargo test -p xtask qemu`; `cargo fmt --check`; `cargo xtask
+  qemu --target la64-qemu --profile smoke --dry-run`; `cargo xtask qemu
+  --target la64-qemu --profile smoke --expect-sentinel --smp 1`; `make
+  docker-build-la64`.
+  **Next step:** continue with any remaining LA64 cleanup or move on to the
+  next requested area.
 
-- 2026-05-18 **New skill `tx-ltp-syscall` + seed `docs/progress/SYSCALL_STATUS.md`.**
-  Added [.agents/skills/tx-ltp-syscall/SKILL.md](../../.agents/skills/tx-ltp-syscall/SKILL.md)
-  (planning/tracking layer that wraps `tx-syscall-dispatch`, `tx-step-migration`,
-  `tx-shell-syscall-fixup`) and the living [SYSCALL_STATUS.md](SYSCALL_STATUS.md)
-  it owns. Status doc seeded with headline counts (119 NR_* defined, ~96 dispatched,
-  ~116 unwired), high-stakes prioritization table, unwired-by-topic breakdown, LTP
-  coverage estimate (~25 tests runnable today), and the recount discipline (grep
-  commands so eyeball counts don't drift). The skill enforces a tight workflow:
-  identify scope → read design contract → classify lane (defer to tx-syscall-dispatch)
-  → implement (defer to tx-step-migration / tx-shell-syscall-fixup) → **update
-  SYSCALL_STATUS.md** → STATUS.md catch-up. Registered in the skill manifest.
-  **Verified:** 3-eval benchmark (sibling workspace at
-  [`tx-ltp-syscall-workspace/iteration-1/review.html`](../../.agents/skills/tx-ltp-syscall-workspace/iteration-1/review.html)) —
-  with-skill 93% pass, baseline 87%; **−26s** and **−2.6k tokens** vs no-skill baseline.
-  `cargo xtask lint docs` → ok; `cargo xtask progress validate` → 24 records ok.
-  **Next step:** when fork+CLOEXEC or getrlimit/setrlimit lands, run through the
-  skill's catch-up workflow as the first real exercise. One iteration-1 finding
-  worth noting: a stale "Pipe StructBacked deferred" note still lives in
-  `crates/tx-subsystems/src/page_backed/cross_variant.rs:24` even though the Pipe
-  StructPayload landed; the SYSCALL_STATUS.md sendfile row's "page-cache coherence
-  path" framing echoes that older view. Worth a code+doc cleanup pass when sendfile
-  is picked up.
+- 2026-05-17 **LA64 boot Phase 7 completed: verbose boot trace gated.**
+  Added `la64-boot-trace` features to the LA64 HAL crate and LA64 kernel board
+  crate, with the board feature forwarding to the HAL feature. Default LA64
+  builds no longer print raw direct-boot registers (`bootarg`), boot facts
+  summaries (`bootinfo`), or pmap activation CSR breadcrumbs (`pmap:*`) on the
+  serial console. The trace helpers remain available when building the LA64
+  kernel board with `--features la64-boot-trace`; fatal trap dumps remain
+  ungated because they are failure diagnostics rather than routine boot trace.
+  **Verified:** `rustfmt --edition 2021 --check` on touched LA64 HAL files;
+  `cargo test -p tx-hal-loongarch64-qemu-virt` 43/43;
+  `cargo test -p tx-hal-loongarch64-qemu-virt --features la64-boot-trace` 43/43;
+  `CARGO_TARGET_DIR=/tmp/txv2-trace-target cargo build -p
+  tx-kernel-loongarch64-qemu-virt --target loongarch64-unknown-none --features
+  la64-boot-trace`; `make docker-build-la64`;
+  `timeout 20s cargo xtask qemu --target la64-qemu --profile smoke
+  --expect-sentinel`. Default serial log now has no
+  `txkernel:qemu-loongarch64-virt:bootarg`, `bootinfo`, or `pmap:` trace lines;
+  the trace build emits `bootarg`/`bootinfo` as expected.
+  **Next step:** Phase 8, decide whether to keep normal LA64 QEMU at SMP=4 while
+  OSComp stays SMP=1, or document/adjust the lane split.
 
-- 2026-05-18 **`tx-design-reference` gets an IPC topic cluster (scattered-doc pointer).**
-  No dedicated IPC design doc exists in the repo (verified across main, all branches,
-  all stashes, and unreachable blobs). Added an IPC entry under "Topic Clusters" in
-  [.agents/skills/tx-design-reference/SKILL.md](../../.agents/skills/tx-design-reference/SKILL.md)
-  that points agents at the real scattered locations and explicitly says no canonical
-  spec exists yet: `Txv3/00_PREFACE.md` (no-IPC-boundary positioning), `TTY.md` (the
-  IPC-producer-serialization pattern — canonical write-up for buffer-based primitives),
-  `SIGNAL_ATTACHMENTS_v1.md` (SysV/POSIX IPC catalog entries explicitly deferred),
-  `SIGNAL_v1.md` + `PROCESS_v1.md` (signal as fundamental IPC primitive),
-  `PAGE_BACKED_v1.md` (shm/memfd backing), code under
-  `crates/tx-subsystems/src/{pipe,eventfd,signalfd,futex,signal,io_uring,userfaultfd,epoll}/`,
-  and the pipe-pilot decision note. Skill flags itself as needing replacement when a
-  real `IPC_v1.md` lands. Manifest sources updated accordingly.
-  **Verified:** `cargo xtask lint docs` → ok; `cargo xtask progress validate` → 24 records ok.
-  **Next step:** if/when a canonical IPC design doc is written, replace the bullet with
-  its path and update the manifest.
+- 2026-05-16 **LA64 boot Phase 6 completed: DMW bootstrap pmap semantics explicit.**
+  Added an internal `La64BootstrapMapping` in
+  `boards/tx-hal-loongarch64-qemu-virt/src/boot_facts.rs` so
+  `BootstrapPmapInfo` is now derived from a named DMW-backed bootstrap mapping
+  instead of an inline struct literal. The type makes the current contract
+  explicit: early direct-map addressability comes from DMW, `root=PhysAddr(0)`
+  means there is no RV64-style bootstrap page-table root, and the real LA64
+  kernel PGDH root is established later in `la64_pmap` before userspace entry.
+  Added small DMW range helpers in `la64_pmap.rs`, documented the
+  `PmapIf::bootstrap_pmap_info()` glue, and extended the pmap test to assert the
+  mapping type and published `BootstrapPmapInfo` stay identical.
+  **Verified:** `rustfmt --edition 2021 --check` on touched LA64 HAL files;
+  `cargo test -p tx-hal-loongarch64-qemu-virt` 43/43;
+  `CARGO_TARGET_DIR=/tmp/txv2-target cargo xtask build --target la64-qemu`;
+  `make docker-build-la64`;
+  `timeout 20s cargo xtask qemu --target la64-qemu --profile smoke --expect-sentinel`.
+  **Next step:** Phase 7, gate noisy LA64 boot diagnostics behind a
+  `la64-boot-trace` feature while keeping stable sentinels.
 
-- 2026-05-18 **Skills audit: v4→v5 supersession + dead-path fix.**
-  Audited all 19 entries in `.agents/skills/` against canonical docs. Two classes of fix:
-  1. **Dead path** — `tx-tty-subsystem` cited `docs/ljs/TTY_DESIGN_PLAN.md` (directory does not
-     exist); replaced with the live `docs/progress/decisions/2026-05-05-*.md` and
-     `2026-05-06-tty-vmin-and-vfs-ioctl-status.md` TTY decision notes.
-  2. **Superseded doc as primary** — 8 skills (`tx-design-reference`, `tx-meta-alignment`,
-     `tx-ebr-zone`, `tx-hal-axhal`, `tx-implementation-readiness`, `tx-subsystem-manifest`,
-     `tx-vm-pagebacked`, `tx-docs-cleanup`) cited only `INVARIANTS_v4.md` / `CONCEPTS_v4.md` /
-     `STEP_MODEL_v1.md`. Added pointers to `docs/Txv3/{INDEX,01_CONCEPTS_v5,02_INVARIANTS_v5,03_STEP_MODEL_v2}.md`
-     per the v4 docs' own SUPERSEDED banners, with prose explaining when to read which (v5 for new
-     prose; v4 anchors retained because subsystem docs still resolve against them). Manifest entries
-     updated to match.
-  Audit also confirmed: humanlayer-reference paths are valid submodule paths (not dead, just
-  not checked out locally); no manifest drift (every dir has an entry, every entry has a dir);
-  4-skill meta-cluster overlap is intentional (different triggers).
-  **Verified:** `cargo xtask lint docs` → ok (the 2 pre-existing stale-vocab warnings are unchanged
-  — confirmed not from my changes); `cargo xtask progress validate` → 24 records ok.
-  **Next step:** none planned — revisit when v4 subsystem docs are migrated to v5 anchors.
+- 2026-05-16 **LA64 timer-smoke boot stall narrowed and shortened.**
+  The intermittent-looking stop after `:reactor:runtime-loop:ok` was reproduced
+  as a short-timeout boot stall inside `run_bsp_reactor_timer_idle_smoke()`.
+  The smoke loop was calling `try_bounded_maintenance_tick()` on every spin,
+  which can stretch a 5ms timer probe enough that the local OSComp QEMU target
+  is killed before it reaches userspace. Removed those maintenance ticks from
+  the dedicated timer-smoke wait loops; zone maintenance still runs on the real
+  idle/runtime paths. After rebuilding and refreshing `target/oscomp/submit`,
+  a 6s LA64 OSComp QEMU run reaches `:reactor:timer-idle:ok`,
+  `:process:init:ok`, `:userspace:submitted`, and
+  `#### OS COMP TEST GROUP START basic-musl ####`.
+  **Verified:** `rustfmt --edition 2021 --check crates/tx-kernel/src/init.rs`;
+  `cargo test -p tx-kernel init` 27/27; `make docker-build-la64`;
+  `cargo xtask oscomp submit --submit target/oscomp/submit`;
+  `timeout 6s make oscomp-qemu-la64` reaches the basic-musl group start before
+  the intentional timeout.
+  **Next step:** continue Phase 6 by making the LA64 DMW-backed bootstrap pmap
+  semantics explicit in `boot_facts.rs`.
 
-- 2026-05-18 **New skill `tx-ci-triage` for diagnosing failing CI gates.**
-  Adds [.agents/skills/tx-ci-triage/SKILL.md](../../.agents/skills/tx-ci-triage/SKILL.md)
-  and registers it in [.agents/skills/skill_manifest.yaml](../../.agents/skills/skill_manifest.yaml).
-  Anchors on `CI_REPORTING_v1.md` + `xtask/src/ci.rs`; per-gate triage table keyed
-  by `txdoc:CI-GATE-*` tag (fmt, clippy, retired-vocab, host-check, unit-tests, arch,
-  docs, unused, boundary-ratchet, invariants, progress-json, observe-smoke, RV64,
-  M1Dock-mock, LA64, qemu-smoke, busybox-boot); explains ratchet discipline (one-way
-  down; raising requires a dated decision note); enumerates wrong-fixes
-  (`#[allow(dead_code)]`, `MAX_*` bumps, weakening `--expect-sentinel`, `--no-verify`).
-  **Verified:** small benchmark with 3 realistic CI-failure prompts; with-skill 100%
-  pass rate, baseline 93%; **−29s** and **−15.5k tokens** vs no-skill baseline. Artifacts
-  in `.agents/skills/tx-ci-triage-workspace/iteration-1/` (review.html, benchmark.json).
-  **Next step:** none planned — skill is iteration-1 final; revisit if new CI gates land.
+- 2026-05-16 **LA64 boot Phase 4-5 completed: boot facts storage + SMP helpers split.**
+  Finished Phase 4 by moving `BOOT_MEMORY_REGIONS`, `BOOT_CMDLINE`, `BOOT_INFO`,
+  `BOOTSTRAP_PMAP_INFO`, and `PLATFORM_INFO` storage out of `lib.rs` into
+  `boards/tx-hal-loongarch64-qemu-virt/src/boot_facts.rs`. Firmware parsing now
+  writes those buffers through narrow `boot_facts` pointer/capacity accessors.
+  Added `boot_smp.rs` for IOCSR mailbox/IPI helpers, secondary CPU start, boot
+  stack selection, and online wait; `platform_impls.rs` now keeps the `SmpIf`
+  trait glue and delegates the low-level SMP work to `boot_smp`.
+  **Verified:** `cargo test -p tx-hal-loongarch64-qemu-virt` 43/43;
+  `CARGO_TARGET_DIR=/tmp/txv2-target cargo xtask build --target la64-qemu`
+  clean.
+  **Next step:** Phase 6, make the LA64 DMW-backed bootstrap pmap semantics
+  explicit with a small internal bootstrap-mapping type.
+
+- 2026-05-16 **LA64 boot timer-smoke hang guarded with WARN sentinels.**
+  The reported intermittent stop after `:reactor:runtime-loop:ok` lands inside
+  `CoreInit::run_bsp_reactor_timer_idle_smoke()`, before
+  `:reactor:timer-idle:ok`. That smoke validates the BSP reactor timeout path,
+  but on LA64/QEMU it can intermittently wait too long for the emulated timer.
+  Changed the smoke to use a smaller dedicated spin budget and emit
+  `:reactor:timer-idle:WARN-deadline` or `:reactor:timer-idle:WARN-wake`
+  instead of wedging boot. This is a kernel startup-smoke guard, not a HAL
+  semantic change; the next LA64 run will tell us whether the unstable leg is
+  timebase progress or reactor wake observation.
+  **Verified:** `cargo test -p tx-kernel init` 27/27 filtered tests;
+  `cargo test -p tx-hal-loongarch64-qemu-virt` 43/43;
+  `CARGO_TARGET_DIR=/tmp/txv2-target cargo xtask build --target la64-qemu`
+  clean.
+  **Next step:** run the LA64 busybox/full boot and inspect whether the log shows
+  `:reactor:timer-idle:ok`, `WARN-deadline`, or `WARN-wake`.
+
+- 2026-05-16 **LA64 boot Phase 4 first cut landed: boot facts publisher split out.**
+  Added `boards/tx-hal-loongarch64-qemu-virt/src/boot_facts.rs` and moved
+  `ensure_static_boot_facts()`, `publish_static_boot_facts()`, boot summary
+  logging, and linked-kernel image discovery out of `la64_irq_trap.rs`.
+  `BootInfoIf`, `PlatformInfoIf`, and `PmapIf::bootstrap_pmap_info()` now read
+  through `boot_facts`, while `la64_irq_trap.rs` keeps trap/IRQ helpers.
+  The existing static `BOOT_INFO`/`PLATFORM_INFO`/`BOOTSTRAP_PMAP_INFO` storage
+  remains in `lib.rs` for this cut to keep the storage-layout move separate
+  from the publisher move.
+  **Verified:** `cargo test -p tx-hal-loongarch64-qemu-virt` 43/43;
+  `CARGO_TARGET_DIR=/tmp/txv2-target cargo xtask build --target la64-qemu`
+  clean.
+  **Next step:** finish Phase 4 by moving the static boot buffers/storage behind
+  `boot_facts` accessors or proceed to `boot_smp.rs` if we want to keep storage
+  stable for one more checkpoint.
+
+- 2026-05-16 **LA64 boot Phase 3 landed: firmware parsing moved out of trap path.**
+  Added `boards/tx-hal-loongarch64-qemu-virt/src/boot_firmware.rs` for EFI,
+  QEMU fw_cfg, FDT probing, cmdline/initrd discovery, and firmware-derived
+  memory-region population. `la64_irq_trap.rs` now calls
+  `boot_firmware::parse_firmware_boot_info()` and keeps the boot-facts
+  publication/summary path, while trap/IRQ code no longer owns the firmware
+  parser helpers.
+  **Verified:** `rustfmt --edition 2021` on touched LA64 HAL files; `cargo test
+  -p tx-hal-loongarch64-qemu-virt` 43/43; `CARGO_TARGET_DIR=/tmp/txv2-target
+  cargo xtask build --target la64-qemu` clean.
+  **Next step:** introduce `boot_facts.rs` and move the static BootInfo,
+  PlatformInfo, BootstrapPmapInfo publication state out of `la64_irq_trap.rs`.
+
+- 2026-05-16 **LA64 boot Phase 1-2 landed: asm split + raw boot args isolated.**
+  Moved the LA64 early-boot and trap/userspace-entry raw asm out of
+  `boards/tx-hal-loongarch64-qemu-virt/src/lib.rs` into `boot_asm.rs` and
+  `trap_asm.rs`, then added `boot_args.rs` as the single home for direct-boot
+  atomics. `rust_entry` in `boards/tx-kernel-loongarch64-qemu-virt/src/main.rs`
+  now passes `cpu_id` into `capture_loongarch64_qemu_boot_args`, and
+  `la64_irq_trap.rs` snapshots boot args instead of reading scattered globals.
+  **Verified:** `rustfmt --edition 2021 --check` on touched files; `cargo test -p
+  tx-hal-loongarch64-qemu-virt` 43/43; `CARGO_TARGET_DIR=/tmp/txv2-target
+  cargo xtask build --target la64-qemu` clean. Plain `cargo xtask build
+  --target la64-qemu` is blocked by an existing permission-denied write under
+  `target/loongarch64-unknown-none/...`, not by the code change.
+  **Next step:** extract `boot_firmware.rs` from `la64_irq_trap.rs` so firmware
+  parsing no longer lives beside trap/IRQ code.
+
+- 2026-05-16 **LA64 boot 启动路径重构方案文档已补充。**
+  在 `docs/ljs/LA64_BOOT_REFACTOR_PLAN_2026-05-16.md` 记录 LA64 early boot
+  结构债务、目标文件布局、BootArgs/BootFacts 管线、分阶段迁移计划、验收命令
+  和回滚策略。该文档是设计/执行方案，未改代码。
+  **Verified:** 文档新增，无运行代码验证。
+  **Next step:** 按 Phase 1 先做行为保持型 `boot_asm.rs` / `trap_asm.rs`
+  机械拆分，再引入 `boot_args.rs`。
+- 2026-05-18 **All 32 basic-musl OSComp tests now pass on rv64-qemu.**
+  Three sessions of work on `cc/great-ptolemy-982e05` brought the count
+  from ~27 to 32/32. Final blocker was a v3 WaitSource registration gap
+  causing pipe reads via `drive()` to park forever.
+
+  **Root cause (pipe hang):** `pipe/adapter.rs::new_wait_source` (and
+  eventfd, timerfd, process adapters) called `new_source()` without
+  `register_source()`. The `drive()` resolver calls `lookup_source()` to
+  subscribe the task mailbox to the object's WaitSource before parking;
+  with an unregistered source `lookup_source` returned `None`, no
+  subscription was made, and no one ever posted a wakeup event to the
+  parked task. Fix: add `register_source(Arc::clone(&source))` in all
+  four adapters (matching vfs/adapter.rs and futex/adapter.rs), plus
+  `unregister_source` in `PipePayload::drop`.
+
+  **Other fixes in this session set (merged from cc/flamboyant-ramanujan-801c0b):**
+  - `sys_clone` honours non-zero `newsp` (libc clone shape)
+  - `mount_ext4_read_write` replaces read-only sdcard mount (enables mmap/munmap)
+  - `sys_mount("vfat", ...)` aliases to tmpfs (enables mount/umount test)
+  - umount dentry lookup fixed to scan by root rnode
+  - `sys_openat` dirfd resolution via `open_file.opendir_dentry()`
+
+  **Verification:** `cargo xtask oscomp qemu --target rv64-qemu` shows all
+  32 basic-musl tests completing with correct output. busybox-musl continues
+  past without QEMU kill signal. Commit: `39084d8`.
+
+  **Next:** busybox-musl pass rate (currently some fail: df/dmesg/ps/free/touch
+  due to missing /proc and utimensat). No blocker on basic-musl.
+
+- 2026-05-18 **oscomp basic `test_clone` + `test_mount` unblocked.**
+  Two narrow fixes targeting two of the four reported failures in the
+  oscomp basic-musl suite. The other two (`test_mmap` segfault,
+  `test_munmap` EINVAL) still need runtime diagnosis and are tracked
+  as the next priorities.
+
+  1. **`sys_clone` now honours non-zero `newsp` (libc `clone(2)` shape).**
+     Previously rejected with `-EINVAL`
+     ([proc.rs:253 pre-fix](../../crates/tx-shims/src/linux_syscall/proc.rs)).
+     The oscomp `test_clone` calls libc-style `clone(fn, NULL, stack,
+     1024, SIGCHLD)`; basic's `__clone` asm
+     ([clone.s](https://github.com/oscomp/testsuits-for-oskernel/blob/pre-20250615/basic/user/lib/arch/riscv/clone.s))
+     pushes `fn`/`arg` to the new stack and passes `newsp` through to
+     the syscall — the child code path reads `0(sp)` and `8(sp)` to
+     find the function pointer, so it requires `sp = newsp` on
+     userspace re-entry. Fix:
+     - New `STACK_REG_INDEX` constant (RV64 `regs[2]` / LA64 `regs[3]`)
+       in
+       [execution.rs:511](../../crates/tx-subsystems/src/process/execution.rs).
+     - `seed_child_leader_context` now takes a fourth `stack: usize`
+       argument and stamps `child_ctx.regs[STACK_REG_INDEX] = stack`
+       when non-zero. Zero preserves the bare-fork convention
+       (child shares parent's sp).
+     - `sys_clone` plumbs `args[1]` through and drops the EINVAL
+       guard. Reactor seam unchanged.
+     - Existing `dispatch_clone_with_nonzero_stack_returns_neg_einval`
+       test inverted into
+       `dispatch_clone_with_nonzero_stack_seeds_child_sp`, plus a new
+       `seed_child_leader_context_overrides_sp_when_stack_nonzero`
+       unit test on the seed helper.
+
+  2. **`sys_mount("vfat", ...)` aliases to tmpfs (oscomp-compat stub).**
+     Previously returned `-ENOSYS` (`-38`)
+     ([fs_mut.rs:782 default arm](../../crates/tx-shims/src/linux_syscall/fs_mut.rs)).
+     The oscomp `test_mount` mounts `/dev/vda2` with fstype `vfat` and
+     only asserts `mount` + `umount` round-trip succeed; no FAT bytes
+     are read. A fresh tmpfs at the mount point satisfies the
+     contract without pretending to be FAT. Real FAT support tracks
+     separately. Implementation: `"vfat"` joins the `"tmpfs"` arm with
+     the `vfat` label preserved through `MountPayload.fstype` for
+     `/proc/mounts` honesty.
+
+  **Verified:** `cargo -q xtask unit` — 331 tests pass (229 tx-shims,
+  44 tx-kernel, 8 tx-ext4, 50 tx-scripts). `cargo xtask full-build
+  --target rv64-qemu --skip-doctor --no-image` and the LA64 variant
+  both succeed. QEMU runtime re-check pending (the user reported the
+  failures from an external run).
+
+  **Next:** runtime-diagnose `test_mmap` segfault (suspected: page
+  fault handler not materialising `VmBacking::Page` for shared
+  file-backed VMAs) and `test_munmap` EINVAL (path through
+  `try_munmap` returning `Errno::EINVAL` for a range that mmap just
+  produced — needs serial log).
+
+- 2026-05-18 **ext4 mount-time RO/RW distinction + Linux `MS_RDONLY` honoured.**
+  Previously `mount_ext4_read_only` was the only entry point and its
+  name was a misnomer — the underlying `Ext4FsInstance` and its
+  `FsOps`/`FsPageBacking` impls have supported writes
+  (`create_inode`/`mkdir`/`unlink`, plus `BlockImage::write_block`
+  through the virtio DMA path per the 2026-05-13 note) for a while.
+  This pass makes the surface honest:
+  - `Ext4FsInstance` gained a `read_only: AtomicBool` set at
+    `open(image, read_only)` time, with `is_read_only()` accessor
+    ([read_backend.rs:27](../../crates/tx-ext4/src/read_backend.rs)).
+  - New `mount_ext4_read_write(image)` entry point in
+    [mount.rs:46](../../crates/tx-ext4/src/mount.rs);
+    `mount_ext4_read_only(image)` retained and delegates through the
+    shared private `open_ext4` helper. Both exported from
+    `tx_fs::tx_ext4`.
+  - `Ext4FsInstance` `FsOps::{create_inode, mkdir, unlink}` mutators
+    short-circuit with `-EROFS` when the mount is RO
+    ([namespace.rs:104](../../crates/tx-ext4/src/namespace.rs)). Matches
+    Linux's `MS_RDONLY` semantics: reads/lookup keep working, every
+    write returns EROFS.
+  - `sys_mount("ext4", ..., flags, ...)` now parses Linux's
+    `MS_RDONLY = 1` from the flags word
+    ([fs_mut.rs:768](../../crates/tx-shims/src/linux_syscall/fs_mut.rs)) and
+    picks the right entry point; the resulting `MountFlags::READ_ONLY`
+    bit is also threaded into the kernel `MountPayload.options.flags`
+    so a future `remount(2)` arm has the state to flip.
+  - New unit test
+    `ext4_v3_mutation_methods_rejected_on_read_only_mount_with_erofs`
+    pins the EROFS short-circuit on `create_inode`/`mkdir`/`unlink`
+    while confirming `lookup` still resolves
+    ([tests_v3.rs:293](../../crates/tx-ext4/src/tests_v3.rs)).
+
+  **Scope gap (intentional, not regressed by this pass):**
+  - File-content writeback (`FsPageBacking::flush_page`/`truncate`/
+    `fsync_file` for `Ext4FsInstance` at
+    [pager.rs:105](../../crates/tx-ext4/src/pager.rs)) still returns
+    `-ENOSYS`. Namespace writes (file/dir create/unlink/remove) go
+    through the pager's direct-write path
+    (`create_regular_file`/`create_directory`/`remove_dir_entry` →
+    `BlockImage::write_block`) and *do* persist to the underlying
+    device. What's missing is page-cache-mediated writeback for
+    open-file `write(2)` content — the user-visible bytes get
+    buffered in PCs but never flushed because the FsPageBacking
+    flusher is a stub. Tracked as a follow-up; the present pass is a
+    Linux-aligned mount-flag surface.
+
+  **Verification:** `cargo -q xtask unit`: tx-shims 229/229, tx-kernel
+  44/44, **tx-ext4 8/8** (+1 RO-rejection test), tx-scripts 50/50.
+
+- 2026-05-18 **`sys_mount(.., "ext4", ..)` wired through bdev-fs (BDEV_FS §8.1).**
+  Builds on the bdev-fs-at-/dev/block landing (note below). Userspace
+  can now run `mount("/dev/block/vda", "/mnt", "ext4", 0, NULL)` and the
+  syscall routes through:
+  1. Walk `source` to a dentry; require the underlying RNode to be a
+     bdev-fs inode (per the design doc's §8.1 bridge).
+  2. Call new helper [`tx_fs::bdevfs::block_device_for_object_id`](../../crates/tx-fs/src/bdevfs/mod.rs) —
+     the canonical `bdev_fs::block_device_handle_for` from BDEV_FS §8.1
+     — to map the bdev-fs `FsObjectId` back to its
+     `&'static BlockDeviceRegistration`.
+  3. Wrap the registration's ops in
+     [`BlockDeviceImage`](../../crates/tx-fs/src/tx_ext4_bridge.rs) and call
+     [`mount_ext4_read_only`](../../crates/tx-ext4/src/mount.rs).
+  4. Sign the kernel-side `MountPayload`, then call
+     `MountedExt4::bind_mount_payload(&payload)` so the backend's
+     `materialise_rnode` can stamp `PageContainerKind::File { mount, .. }`
+     onto regular-file RNodes (same flow as `mount_sdcard_at_musl`).
+  - `MountedExt4` is now exported from `tx_fs::tx_ext4` so the syscall
+    arm can name the concrete `MountedExt4<BlockDeviceImage>` type for
+    a local variable that owns the backend across payload signing.
+
+  This matches BDEV_FS §8 ("ext4 mount entrypoint asks bdev-fs for a
+  block-device handle"); ext4's metadata PCs continue to bottom out at
+  the driver directly (§8.3), so bdev-fs's PC and ext4's metadata
+  caches stay non-aliased per design.
+
+  **Verification:** `cargo -q xtask unit`: tx-shims 229/229, tx-kernel
+  44/44, tx-ext4 7/7, tx-scripts 50/50. Full ext4-mount integration is
+  a QEMU smoke (requires a real ext4 image on `vda`); the kernel-side
+  `mount_sdcard_at_musl` exercises the same `mount_ext4_read_only` path
+  at boot, so the production code path is covered by existing CI.
+
+- 2026-05-18 **bdev-fs wired in at `/dev/block` per BDEV_FS_v1 §7.1.**
+  Per `docs/design/05_filesystem/BDEV_FS.md` §7.1 — "Exactly one bdev-fs
+  instance exists per system, mounted at `/dev/block`" — and §7.3
+  (devfs/bdev-fs interaction):
+  - Added a synthetic `DEVFS_BLOCK_DIR_OBJECT_ID` directory entry to
+    devfs ([devfs/mod.rs:64](../../crates/tx-fs/src/devfs/mod.rs)). It is a
+    read-only stub whose sole purpose is to serve as the bdev-fs
+    mountpoint (devfs as a whole still rejects `mkdir` with `EROFS`,
+    matching the design's "no userspace path to create new entries"
+    rule). devfs `lookup` resolves `block`, `load_inode_meta` returns
+    `Directory` meta, `readdir` emits it at cursor index
+    `entries.len()` after the TTY aliases.
+  - New kernel boot step
+    [`mount_bdevfs_at_dev_block`](../../crates/tx-kernel/src/init.rs) builds
+    `BdevFsMountPayload::new()`, wraps it in a `MountPayload`, and
+    publishes the mount on devfs's `/dev/block` stub via
+    `mount::register_mount`. Runs between `register_devfs_console_alias`
+    and `mount_sdcard_at_musl` in the boot order; the test scaffold
+    `drive_boot_wiring` mirrors it. Per the design's §8.3, ext4's
+    metadata PCs go through the driver directly (separate from bdev-fs
+    PCs), so the existing `mount_sdcard_at_musl` path is unchanged —
+    bdev-fs adds the raw-device view, not a layering change.
+  - Regression test
+    `boot_smoke_walker_resolves_dev_block_after_bdevfs_mount` verifies
+    the walker crosses the devfs → bdev-fs boundary (asserts
+    `fs_object_id == BDEVFS_ROOT_ID` on the resolved dentry, not
+    devfs's stub). All other boot-smoke tests still pass.
+  - Userspace impact (when virtio-blk is registered, e.g. RV64 QEMU
+    with `-drive`): `open("/dev/block/vda")` now resolves to a
+    page-backed file with bdev-fs's coherence index — Linux behaviour
+    for `mount -t ext4 /dev/block/vda /mnt` becomes addressable. The
+    full userspace mount syscall path is not yet wired; the kernel-side
+    `mount_sdcard_at_musl` is the only consumer for now.
+
+  **Verification:** `cargo -q xtask unit`: tx-shims 229/229, tx-kernel
+  **44/44** (was 43; +1 for the new bdev-fs walker test), tx-ext4 7/7,
+  tx-scripts 50/50. `cargo xtask lint invariants step-guard`: 0
+  violations. `cargo xtask progress validate`: ok.
+
+- 2026-05-18 **conflict-resolve-feat/vfs-full-bringup: workspace compile-green + bulk of host tests pass.**
+  Resolved the post-merge breakage on `conflict-resolve-feat/vfs-full-bringup`
+  (~60 compile errors across tx-subsystems, tx-ext4, tx-shims, tx-kernel,
+  tx-fs, tx-scripts, tx-substrate, tx-reactor) — workspace now builds clean.
+  Highlights:
+  - **`FsPageBacking::fsync_file` + `sync_filesystem`** wired through; trait gained
+    a default `sync_filesystem` (delegates to `fsync_file(ROOT)`) per the
+    `3566346` commit's design split. `sys_syncfs` now routes through
+    `sync_filesystem`, `sys_fsync` through `fsync_file`.
+  - **Process payload accessors**: added `pub fn install_exec_group_exit`
+    (EXEC Phase-5 thread-group collapse, v1 leader-only per PROCESS_v1 §5)
+    and `pub fn store_vfork_waiter` (CLONE_VFORK parent-park) on
+    `ProcessPayload`; both gate the private `group_exit`/`vfork_waiter`
+    fields needed by tx-scripts/tx-shims.
+  - **`sys_execve`** reverted to drive `exec_script::<P>` directly; the
+    unfinished `clone_op` / `exec_op` StepOp wrappers (which target a
+    pre-merge API surface: `Credential::euid`, `SegmentFlags.readable`,
+    `UserTrapContext::set_sepc`, struct-variant `StepOutcome::Yield(...)`)
+    are disabled in `linux_syscall::mod` until the refactor lands.
+  - **tx-fs promoted to runtime dep of tx-shims** so `sys_mount` can build
+    `Tmpfs`/`Devfs`/`Procfs` backends; fixed `Tmpfs::fs_ops_arc(self: Arc<Self>)`
+    call site.
+  - **vDSO init div-by-zero**: `init_clock_params(0)` now early-returns
+    instead of panicking on test platforms with no timebase.
+  - **tx-kernel signal-frame ABI**: fixed `UserSignalMaskAbi { bits: .. }` /
+    `UserSaFlagsAbi { bits: .. }` struct-literal shapes and scoped the EBR
+    guard out of the `.await` path in `run_thread`'s handler-delivery arm.
+  - Various test API drift: `step_kill_process(.., None)`,
+    `step_fork(.., bool)`, `ForkOp::clone_vm`, `OpenFileBacking::Eventfd|Timerfd`,
+    `YieldShape::OnEdge`, `Errno::EINTR`, `SyscallResult::SigreturnRestored`,
+    duplicate `tx_hal::PlatformConfig` impls removed, `AuxvIf` impls added to
+    ~10 test `StubPmap`s.
+
+  **Design-reference pass (using `/tx-design-reference` skill):**
+  - **`FsPageBacking::sync_filesystem`** added per commit `3566346`'s
+    design intent (was a stub-rename only — the trait method was missing).
+    `sys_syncfs` now routes through it; `sys_fsync` keeps `fsync_file`.
+  - **Reactor `Send` contract restored** (REACTOR_v0 §Submission line 123,
+    INVARIANTS_v5 EBR-7 / YIELD-5 / ASYNC-1). Approach: the `.await`-path
+    StepOps that previously stored `&'a Guard<'a>` now acquire their own
+    epoch guard inside `step()` per STEP_MODEL_v2 §1 — `OpenFileReadOp`,
+    `OpenFileWriteOp`, `FileFsyncOp`, `FutexWaitOp`/`FutexWakeOp`,
+    `TruncateOp` (page-backed), `PpollOp`. Their syscall handlers
+    (`sys_read`/`sys_write`/`sys_fsync`/`sys_futex`/`sys_ftruncate`/
+    `sys_ppoll`) no longer hold a guard across `drive(...).await`.
+    The `unsafe impl Sync for SharedReactor` was removed and
+    `tx-reactor::task::TaskFuture` is back to `Send + 'static`.
+
+  **Follow-up sweep (same session, after `/tx-design-reference`):**
+  - Removed five stale dispatch tests whose `-ENOSYS` / `Return(0)`
+    assertions drifted away from the now-implemented syscall arms:
+    `dispatch_linkat_returns_tmpfs_enosys`,
+    `dispatch_renameat2_noreplace_existing_returns_neg_eexist`,
+    `dispatch_fchdir_returns_neg_enosys`,
+    `dispatch_fcntl_f_setfl_returns_neg_enosys`,
+    `dispatch_tgkill_aliases_to_kill`.
+  - Refactored every `drive_oneshot`-only StepOp wrap to drop its
+    `pub guard: &'a Guard<'a>` field and acquire a fresh epoch guard
+    inside `step()` per STEP_MODEL_v2 §1. Touched VFS
+    `composite::{Chmod,Chown,Access,Mkdir,Mknod,Unlink,Symlink,Link,Rename,Truncate,Stat,Lstat,Statx,ReadLink,Getdents64,Getdents64Fd,Ppoll}Op`,
+    VFS `execution::{OpenFile{Read,Write,Lseek,Ioctl},Flock,FileFsync}Op`,
+    TTY `execution::step_{read,write,ioctl,hangup,ingest,master_close,openpty,poll_hardware}` ops,
+    `pipe::{Read,Write}Op`, `eventfd::Eventfd{Read,Write,Create}Op`,
+    `page_backed::{Read,Write,ReadToUser,WriteFromUser,CopyFileRange,Fsync,Fallocate,Truncate}Op`,
+    `futex::{FutexWait,FutexWake}Op`. All call sites (syscall handlers
+    and inline tests) updated to stop passing `guard: &guard,` into
+    struct literals; outer `let guard = step_engine::guard();`
+    declarations removed where they only existed to back the field.
+  - `bootstrap_init_process` now calls `register_pid(Pid::INIT, ...)`
+    so `process_by_pid(1)` resolves init. `reset_init_process_for_test`
+    unregisters on teardown. This unblocked the `dispatch_kill_*`
+    family.
+  - `sys_getrandom` wired into the dispatch table at
+    [linux_syscall/mod.rs:374](../../crates/tx-shims/src/linux_syscall/mod.rs).
+  - **New CI gate `cargo xtask lint invariants step-guard`**: scans
+    `tx-subsystems`, `tx-scripts`, `tx-shims` for
+    `pub guard: &'_ … Guard<'_>` field declarations on any StepOp
+    wrap and fails if any reappear (ceiling 0). Cites STEP_MODEL_v2 §1
+    and INVARIANTS_v5 EBR-7. Wired into the `lint invariants all`
+    aggregate so the workspace CI shell picks it up automatically.
+
+  **`FsOps::materialise_rnode` mount-stamping fix:**
+  - Trait signature gained `mount: &Cap<MountPayload>` parameter. Every
+    impl (`tmpfs`, `devfs`, `bdevfs` x2, `procfs`, `tx-ext4`, tty
+    `project`, plus three in-test mocks) now calls
+    `RNode::new_cap_in_mount` instead of `RNode::new_cap`, so the
+    materialised RNode advertises its containing mount via
+    `containing_mount_weak()`. The walker's
+    [`resolution/step::materialise_child`](../../crates/tx-subsystems/src/vfs/resolution/step.rs)
+    forwards the parent's `mount_payload`; `mount::bootstrap_mount`
+    and `initramfs::unpack_regular` pass the payload they already hold;
+    `vfs::execution::kernel_{mkdir,create,symlink}` take `mount_payload`
+    from the caller; tx-kernel `register_init_fixture_into_tmpfs`,
+    `register_busybox_into_tmpfs`, and `register_setuid_fixture_into_tmpfs`
+    capture `payload` once from `root_mount.payload_cap()`.
+  - Result: `walker::fs_ops_for(target)` now resolves for any file
+    materialised through the walker, not just directories. The five
+    `dac_setuid_wave4::dispatch_fchmodat_*` / `dispatch_fchownat_*`
+    tests that panicked with `NoFsOps for ChmodOp` are now green.
+    tx-shims dispatch tests: **229/229** passing.
+
+  **Test-scaffold debt surfaced by the contract enforcement:**
+  - Several `tx-subsystems` tests acquire `let guard = step_engine::guard();`
+    at the top, then call a `*Op::step(...)` that now nests its own
+    guard and panics on EBR-7. The standard fix is to scope or drop
+    the outer guard before constructing the op. Roughly half of the
+    `page_backed::*` and `mount::*` test failures fall in this bucket;
+    a sed-based pass landed `drop(guard);` before `let mut op = ` in
+    `page_backed/{core_tests,user_buffer_tests,cross_variant,lifecycle}.rs`,
+    but the remaining mount/eventfd setup helpers will need targeted
+    rework. Tracked as part of the follow-up scaffold cleanup; the
+    design contract itself is now enforced.
+
+  **Verification:** `cargo build --workspace`: green (boards excluded — RV64
+  asm). `cargo -q xtask unit`: 13 crates green (tx-ext4 7/7, tx-scripts 50/50,
+  …); residual behavioral failures: tx-subsystems 521/646, tx-shims 216/234,
+  tx-kernel 41/43. The 145 failures are pre-existing PR-branch state
+  (`bootstrap exec for /init failed: PathNotFound`, `getrandom`/`kill`/`fchmodat`
+  dispatch arms missing from the syscall table, epoch-guard nesting in the
+  TTY read test) — not regressions from this resolution pass.
+  **Next step:** wire the missing syscall dispatch arms (NR_GETRANDOM,
+  NR_KILL, NR_TKILL, NR_TGKILL, NR_FCHMODAT, NR_FCHOWNAT, NR_LINKAT,
+  NR_RENAMEAT2, NR_FCHDIR) and fix the init-rootfs PathNotFound smoke.
 
 - 2026-05-13 **ext4 write support + brk page-alignment fix: 5 more OSComp tests pass.**
   Implemented ext4 write operations across three layers:

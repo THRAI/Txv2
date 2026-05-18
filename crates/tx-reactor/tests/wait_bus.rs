@@ -9,7 +9,6 @@ use std::{
     task::Wake,
 };
 
-use tx_substrate::wake::mailbox::TaskMailbox;
 use tx_reactor::adapter::bus_wire::{
     bus_lifecycle, bus_readiness, DeclaredPort, DeclaredQueue, DeclaredWireError, RawPort,
     RawQueue, WireDeclaration, WireDeclarationError,
@@ -18,6 +17,7 @@ use tx_reactor::wait::{
     Channel, DeclaredChannel, DeclaredReadinessChannel, Mask, WaitOutcome, WaitProtocol,
 };
 use tx_reactor::{Reactor, RunStats, TaskStatus};
+use tx_substrate::wake::mailbox::TaskMailbox;
 
 struct CountWake {
     wakes: Arc<AtomicUsize>,
@@ -485,7 +485,7 @@ fn raw_port_coalesces_fires_until_subscription_observes_ready() {
     let mailbox = Arc::new(TaskMailbox::new());
     mailbox.register_waker(counting_waker(Arc::clone(&wakes)));
     let gen = mailbox.next_generation();
-    let mut sub = port.subscribe(0x1, Arc::downgrade(&mailbox), gen);
+    let sub = port.subscribe(0x1, Arc::downgrade(&mailbox), gen);
 
     assert_eq!(port.fire(0x1), 1);
     assert_eq!(port.fire(0x1), 0);
@@ -506,7 +506,7 @@ fn raw_queue_fires_new_bits_and_drop_removes_subscription() {
     let mailbox = Arc::new(TaskMailbox::new());
     mailbox.register_waker(counting_waker(Arc::clone(&wakes)));
     let gen = mailbox.next_generation();
-    let mut sub = queue.subscribe(0x1, Arc::downgrade(&mailbox), gen);
+    let sub = queue.subscribe(0x1, Arc::downgrade(&mailbox), gen);
 
     assert_eq!(queue.peek(), 0);
     assert_eq!(queue.fire(0x1), 1);

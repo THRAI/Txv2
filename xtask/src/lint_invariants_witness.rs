@@ -27,10 +27,7 @@ pub(crate) fn lint_invariants_witness_scope(root: &Path) -> Result<()> {
     let mut struct_violations: Vec<String> = Vec::new();
     let mut outcome_violations: Vec<String> = Vec::new();
 
-    let target_dirs = [
-        "crates/tx-subsystems/src",
-        "crates/tx-kernel/src",
-    ];
+    let target_dirs = ["crates/tx-subsystems/src", "crates/tx-kernel/src"];
 
     for dir in &target_dirs {
         let dir_path = root.join(dir);
@@ -125,13 +122,21 @@ pub(crate) fn lint_invariants_witness_scope(root: &Path) -> Result<()> {
     println!("Invariants Lint — witness-scope (WIT-4)");
     println!("=========================================");
 
-    let struct_status = if struct_count > MAX_IDENTREF_IN_STRUCTS { "OVER" } else { "ok" };
+    let struct_status = if struct_count > MAX_IDENTREF_IN_STRUCTS {
+        "OVER"
+    } else {
+        "ok"
+    };
     println!(
         "IdentRef in struct fields: {:>4}  (ceiling {})  {}",
         struct_count, MAX_IDENTREF_IN_STRUCTS, struct_status
     );
 
-    let outcome_status = if outcome_count > MAX_IDENTREF_IN_STEP_OUTCOME { "OVER" } else { "ok" };
+    let outcome_status = if outcome_count > MAX_IDENTREF_IN_STEP_OUTCOME {
+        "OVER"
+    } else {
+        "ok"
+    };
     println!(
         "IdentRef in StepOutcome:   {:>4}  (ceiling {})  {}",
         outcome_count, MAX_IDENTREF_IN_STEP_OUTCOME, outcome_status

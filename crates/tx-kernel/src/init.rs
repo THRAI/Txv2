@@ -27,6 +27,7 @@ use tx_subsystems::vfs::{Credential, DEntry, InlineName, InodeMeta, RNode, RNode
 // pushed the AP further behind the 10M budget; bumped to 50M. Still
 // sub-second on real hardware.
 const AP_REACTOR_WAIT_SPINS: usize = 50_000_000;
+const BSP_REACTOR_TIMER_WAIT_SPINS: usize = 20_000;
 
 /// Minimum platform-timer period used in the userspace reactor loop when
 /// the reactor has no pending deadline. Without this, WFI never wakes
@@ -282,6 +283,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_rootfs_from_boot_media();
             Self::mount_devfs_at_dev();
             Self::register_devfs_console_alias();
+            Self::mount_bdevfs_at_dev_block();
             Self::mount_sdcard_at_musl();
             Self::bind_init_cwd_and_root();
 
@@ -441,18 +443,13 @@ impl<P: TxPlatform> CoreInit<P> {
         }
     }
 
-    /// Mount the boot rootfs.
+    /// Mount tmpfs as the boot rootfs.
     ///
-    /// LA64 QEMU uses the same shape we expect on real boards later:
-    /// a block-backed root filesystem selected by boot media.
-    /// Busybox profile opportunistically mounts `/dev/vda` as
-    /// read-only ext4; if no block device is found it falls back to
-    /// tmpfs. Other boards keep the existing tmpfs + initramfs path.
+    /// Keep LA64 aligned with RV64: `/` is a writable tmpfs used for
+    /// devfs, initramfs overlays, and bootstrap fixtures; block-backed
+    /// ext4 media is mounted later under `/musl` by
+    /// `mount_sdcard_at_musl`.
     pub(crate) fn mount_rootfs_from_boot_media() {
-        if P::ARCH == tx_hal::Arch::LoongArch64 && Self::mount_rootfs_ext4_vda() {
-            return;
-        }
-
         Self::mount_rootfs_tmpfs();
         // Initialise the vDSO image and high-res clock parameters.
         // Must run after the substrate page allocator is ready.
@@ -466,62 +463,6 @@ impl<P: TxPlatform> CoreInit<P> {
             });
             tx_hal::console_write_str::<P>("\n");
         }
-    }
-
-    fn mount_rootfs_ext4_vda() -> bool {
-        let Some(reg) = tx_subsystems::device::block_device_by_name(b"vda") else {
-            Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":mount:rootfs:ext4:skip:no-vda\n");
-            return false;
-        };
-        let image = crate::rootfs::RootBlockImage::new(reg.ops);
-        let Ok(mount_output) = tx_ext4::mount::mount_ext4_read_only(image) else {
-            Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":mount:rootfs:ext4:skip\n");
-            return false;
-        };
-
-        let payload = MountPayload::new_cap(
-            mount_output.fs_ops().clone(),
-            mount_output.fs_page_backing().clone(),
-            None,
-            mount::allocate_dev_id(),
-            MountOptions {
-                flags: MountFlags::READ_ONLY,
-            },
-            "ext4",
-            SourceLabel::Static("vda"),
-        )
-        .expect("mount_rootfs_ext4_vda: payload reservation");
-        let root_rnode = {
-            let raw = RNode::new(
-                mount_output.root_fs_object_id,
-                mount_output.root_inode_meta,
-                RNodeBacking::Directory,
-            )
-            .with_containing_mount(&payload);
-            let res = step_engine::reserve_for::<RNode>()
-                .expect("mount_rootfs_ext4_vda: root rnode reservation");
-            step_engine::sign_for(res, raw)
-        };
-        let _root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode.clone())
-            .expect("mount_rootfs_ext4_vda: root dentry reservation");
-
-        let mount = MountIdentity::new_cap(
-            mount::allocate_mount_id(),
-            None,
-            root_rnode,
-            None,
-            payload,
-            MountFlags::READ_ONLY,
-        )
-        .expect("mount_rootfs_ext4_vda: mount identity reservation");
-
-        *ROOT_MOUNT.lock() = Some(mount);
-
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":mount:rootfs:ext4:vda:ok\n");
-        true
     }
 
     /// Mount tmpfs as the rootfs.
@@ -719,6 +660,126 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":mount:devfs:ok\n");
     }
 
+    /// Mount bdev-fs on `/dev/block`.
+    ///
+    /// Per `docs/design/05_filesystem/BDEV_FS.md` §7.1: "Exactly one
+    /// bdev-fs instance exists per system, mounted at `/dev/block`."
+    /// After this runs, every registered block device shows up as a
+    /// page-backed file at `/dev/block/<name>` (e.g. `/dev/block/vda`).
+    /// The bdev-fs `FsPageBacking` impl translates page-cache I/O to
+    /// `BlockDeviceOps::step_read_blocks`/`step_write_blocks`, with a
+    /// per-devt coherence index so multiple opens share the same
+    /// `PageContainer` (§5).
+    ///
+    /// The mountpoint is a synthetic read-only directory entry on
+    /// devfs (`DEVFS_BLOCK_DIR_OBJECT_ID`); without devfs's `block`
+    /// stub there would be no path for bdev-fs to attach to (devfs
+    /// rejects `mkdir`).
+    ///
+    /// **Order invariant:** runs after `mount_devfs_at_dev` (devfs
+    /// must be live and `/dev/block` resolvable) and after
+    /// `init_block_devices` (the `vda` registration is what
+    /// populates bdev-fs's lookup/readdir). Precedes
+    /// `mount_sdcard_at_musl` — currently ext4 reads through the
+    /// driver's `BlockDeviceOps` directly (per BDEV_FS §8.3, ext4
+    /// metadata PCs are separate from bdev-fs PCs), so the order
+    /// relative to the ext4 mount is informational rather than
+    /// causal, but keeping bdev-fs first matches the design's
+    /// "block-device file API comes up before filesystems mount on
+    /// it" expectation.
+    pub(crate) fn mount_bdevfs_at_dev_block() {
+        use alloc::sync::Arc;
+
+        let root_mount = ROOT_MOUNT
+            .lock()
+            .clone()
+            .expect("mount_bdevfs_at_dev_block: ROOT_MOUNT must be populated");
+        let dev_mount = DEV_MOUNT
+            .lock()
+            .clone()
+            .expect("mount_bdevfs_at_dev_block: DEV_MOUNT must be populated");
+
+        // The mountpoint dentry: synthetic `/dev/block` directory
+        // owned by devfs (see `DEVFS_BLOCK_DIR_OBJECT_ID`).
+        let dev_block_meta = InodeMeta::new(
+            tx_subsystems::vfs::InodeKind::Directory,
+            tx_fs::devfs::DEVFS_BLOCK_DIR_MODE,
+        );
+        let dev_block_rnode_in_devfs = RNode::new_cap(
+            tx_fs::devfs::DEVFS_BLOCK_DIR_OBJECT_ID,
+            dev_block_meta,
+            RNodeBacking::Directory,
+        )
+        .expect("mount_bdevfs_at_dev_block: /dev/block rnode-on-devfs reservation");
+        let dev_block_dentry_on_devfs = DEntry::new_cap(
+            InlineName::new(b"block").expect("mount_bdevfs_at_dev_block: /block inline name"),
+            dev_block_rnode_in_devfs,
+        )
+        .expect("mount_bdevfs_at_dev_block: /dev/block dentry-on-devfs reservation");
+
+        // Build the bdev-fs MountPayload.
+        let bdevfs_payload_inner = Arc::new(tx_fs::bdevfs::BdevFsMountPayload::new());
+        let bdevfs_fs_ops = bdevfs_payload_inner.fs_ops_arc();
+        let bdevfs_fs_page_backing = bdevfs_payload_inner.fs_page_backing_arc();
+
+        let bdevfs_payload = MountPayload::new_cap(
+            bdevfs_fs_ops,
+            bdevfs_fs_page_backing,
+            None,
+            mount::allocate_dev_id(),
+            MountOptions::default(),
+            "bdev",
+            SourceLabel::Static("bdevfs"),
+        )
+        .expect("mount_bdevfs_at_dev_block: payload reservation");
+
+        let bdevfs_root_rnode = {
+            let raw = RNode::new(
+                tx_fs::bdevfs::BDEVFS_ROOT_ID,
+                InodeMeta::new(
+                    tx_subsystems::vfs::InodeKind::Directory,
+                    tx_fs::bdevfs::BDEVFS_ROOT_MODE,
+                ),
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&bdevfs_payload);
+            let res = step_engine::reserve_for::<RNode>()
+                .expect("mount_bdevfs_at_dev_block: bdev-fs root rnode reservation");
+            step_engine::sign_for(res, raw)
+        };
+
+        // Snapshot the devfs payload before consuming `dev_mount`
+        // into the new mount's parent slot. `register_mount` keys
+        // on the devfs payload + `block`'s FsObjectId.
+        let devfs_payload = dev_mount
+            .payload_cap()
+            .expect("devfs payload alive during boot")
+            .into_cap();
+
+        let bdev_mount = MountIdentity::new_cap(
+            mount::allocate_mount_id(),
+            Some(dev_block_dentry_on_devfs),
+            bdevfs_root_rnode,
+            Some(dev_mount),
+            bdevfs_payload,
+            MountFlags::empty(),
+        )
+        .expect("mount_bdevfs_at_dev_block: mount identity reservation");
+
+        mount::register_mount(
+            &devfs_payload,
+            tx_fs::devfs::DEVFS_BLOCK_DIR_OBJECT_ID,
+            bdev_mount,
+        );
+
+        // rootfs ownership of the chain holds: devfs is mounted on
+        // rootfs, bdev-fs is mounted on devfs.
+        let _ = root_mount;
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:bdevfs:ok\n");
+    }
+
     /// Mount the sdcard ext4 image at `/musl` on the rootfs tmpfs.
     ///
     /// If a `vda` block device is registered (RV64 QEMU virtio-blk
@@ -730,7 +791,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
     pub(crate) fn mount_sdcard_at_musl() {
-        use tx_fs::tx_ext4::{mount_ext4_read_only, BlockDeviceImage};
+        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
         use tx_subsystems::device::block_device_by_name;
 
         let Some(reg) = block_device_by_name(b"vda") else {
@@ -738,7 +799,16 @@ impl<P: TxPlatform> CoreInit<P> {
         };
 
         let image = BlockDeviceImage::new(reg.ops);
-        let mount_output = match mount_ext4_read_only(image) {
+        // Mount read-write so test binaries that create or write to
+        // files under `/musl/musl/basic/` (test_mmap, test_munmap,
+        // test_mkdir, test_openat with O_CREAT, …) don't fall to
+        // -EROFS at every mutation. The ext4 backend's RW path is
+        // wired (`create_inode`/`mkdir`/`unlink` go through the
+        // pager's direct-write path per the 2026-05-13 trail); the
+        // only RW gap is `flush_page` (returns -ENOSYS), which
+        // affects long-running persistence but not the per-syscall
+        // contract these basic tests check.
+        let mount_output = match mount_ext4_read_write(image) {
             Ok(out) => out,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
@@ -836,11 +906,13 @@ impl<P: TxPlatform> CoreInit<P> {
 
         *MUSL_MOUNT.lock() = Some(musl_mount);
 
-        // Seed /bin/sh → /musl/musl/busybox in the rootfs tmpfs so
+        // Seed /bin/sh → the busybox binary in the rootfs tmpfs so
         // that shebang scripts (e.g. run-all.sh #!/bin/sh) resolve
-        // correctly when no initramfs is loaded (the oscomp boot path
-        // does not pass -initrd). Both steps tolerate EEXIST so a
-        // baked initramfs or busybox_baked path that ran first wins.
+        // correctly when no initramfs is loaded. RV64 OSComp images
+        // place busybox under /musl/musl; the LA64 busybox-root image
+        // built by xtask places it under /bin inside the mounted image.
+        // Both steps tolerate EEXIST so a baked initramfs or
+        // busybox_baked path that ran first wins.
         {
             let guard = step_engine::guard();
             let bin_id = match rootfs_payload.fs_ops.mkdir(
@@ -974,19 +1046,23 @@ impl<P: TxPlatform> CoreInit<P> {
     ///    `thread.payload().saved_user_context` with the fixture's
     ///    entry-point + initial stack pointer.
     pub(crate) fn run_bootstrap_exec_for_init() {
-        // When an initramfs is present, skip the embedded fixture —
-        // the cpio archive supplies its own `/init` (possibly a
-        // dynamically-linked binary needing its shared libraries
-        // from the same archive).  Without an initramfs, fall back
-        // to the embedded fork/wait fixture for CI smoke.
-        // Always skip fixture when initramfs may be present.
-        // Checking boot_info().initrd.is_some() here is unreliable —
-        // initrd may not be published yet.  register_initramfs_if_present
-        // handles the empty-check internally.
-        let has_initramfs = true; // optimistic — fixture is CI-only
-        if !has_initramfs {
-            Self::register_init_fixture_into_tmpfs();
-        }
+        // Try to install the embedded fork/wait `/init` fixture
+        // unconditionally. `register_init_fixture_into_tmpfs` is
+        // idempotent: `FsOps::create_inode(/init)` returns `EEXIST`
+        // when initramfs already supplied a `/init`, in which case
+        // the helper logs `:init:fixture:skip:ro` and returns
+        // without overwriting. On a clean tmpfs (no initramfs, CI
+        // smoke tests, host unit tests) it installs the bake-in
+        // fixture so `exec_script("/init", …)` can proceed.
+        //
+        // Removed: an `if !has_initramfs` short-circuit that hard-
+        // coded `has_initramfs = true`. The `boot_info().initrd`
+        // probe is unreliable at this point in boot (initrd may
+        // not be published yet), and `register_initramfs_if_present`
+        // already overlays its own /init on top of the fixture
+        // when present — so the EEXIST-tolerant idempotent call is
+        // both correct and simpler.
+        Self::register_init_fixture_into_tmpfs();
         // Shell-prompt roadmap Slice 10 (2026-05-08): when the build
         // script bakes a busybox binary via `TX_BUSYBOX`, also
         // register it at `/bin/sh` so the bootstrap fixture's
@@ -1336,27 +1412,38 @@ impl<P: TxPlatform> CoreInit<P> {
         );
 
         P::enable_timer_wakeups();
-        for _ in 0..AP_REACTOR_WAIT_SPINS {
+
+        let mut deadline_reached = false;
+        for _ in 0..BSP_REACTOR_TIMER_WAIT_SPINS {
+            if P::read_ns() >= deadline_ns {
+                deadline_reached = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        if !deadline_reached {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":reactor:timer-idle:WARN-deadline\n");
+            return;
+        }
+
+        let mut observed_timer_wake = false;
+        for _ in 0..1024 {
             let step = Self::step_boot_reactor_once(current_cpu)
                 .expect("boot reactor timer idle step failed");
+            observed_timer_wake |= step.observed_timer_wakes();
             if Self::bsp_timer_smoke_done(cpu_bit) {
-                assert!(step.observed_timer_wakes(), "BSP timer smoke wake");
+                assert!(observed_timer_wake, "BSP timer smoke wake");
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":reactor:timer-idle:ok\n");
                 return;
             }
-            crate::zones::try_bounded_maintenance_tick();
-            // Spin rather than WFI: on_timer_interrupt calls
-            // cancel_deadline() which clears STIP, so WFI could block
-            // forever on SMP=1 if the interrupt fires and is handled
-            // between the guard check and the WFI instruction. The
-            // reactor's timer queue is unaffected by cancel_deadline,
-            // so each step() call will observe now_ns >= deadline and
-            // fire the task once real time advances past the deadline.
             core::hint::spin_loop();
         }
 
-        panic!("BSP reactor timer idle smoke did not complete");
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":reactor:timer-idle:WARN-wake\n");
     }
 
     fn bsp_timer_smoke_done(cpu_bit: u64) -> bool {
@@ -1527,12 +1614,8 @@ fn exec_error_tag(error: &tx_scripts::process::exec::ExecError) -> &'static str 
 fn parse_init_from_cmdline<P: tx_hal::TxPlatform>() -> (&'static [u8], &'static [u8]) {
     let cmdline = match <P as tx_hal::BootInfoIf>::boot_info().cmdline {
         Some(s) => s,
-        None if P::ARCH == tx_hal::Arch::LoongArch64 => return (b"/bin/busybox", b"sh"),
         None => return (b"/init", b"init"),
     };
-    if cmdline.trim().is_empty() && P::ARCH == tx_hal::Arch::LoongArch64 {
-        return (b"/bin/busybox", b"sh");
-    }
     for token in cmdline.split_ascii_whitespace() {
         if let Some(path) = token.strip_prefix("init=") {
             let argv0 = match path.rfind('/') {

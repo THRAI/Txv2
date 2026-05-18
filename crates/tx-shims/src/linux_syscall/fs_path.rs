@@ -70,12 +70,20 @@ use tx_subsystems::mount::MountPayload;
 #[cfg_attr(not(test), allow(clippy::extra_unused_type_parameters))]
 #[cfg_attr(test, allow(clippy::extra_unused_type_parameters))]
 /// Translate a dirfd into the root dentry for path resolution.
-/// Returns `EBADF` for non-`AT_FDCWD` dirfds (dirfd support TBD).
+/// `AT_FDCWD` resolves to the process's cwd; any other dirfd is
+/// looked up in the fd table and must reference a directory
+/// (`OpenFile::opendir_dentry()` carries the dentry for fds opened
+/// with `O_DIRECTORY`). Returns `EBADF` for closed/invalid fds and
+/// `ENOTDIR` for fds that aren't directories.
 fn resolve_cwd(dirfd: i32, ctx: &SyscallCtx) -> Result<Cap<DEntry>, i32> {
-    if dirfd != AT_FDCWD {
+    if dirfd == AT_FDCWD {
+        return ctx.process.cwd().ok_or(ENOENT_VALUE);
+    }
+    if dirfd < 0 {
         return Err(EBADF_VALUE);
     }
-    ctx.process.cwd().ok_or(ENOENT_VALUE)
+    let open_file = ctx.process.fd(dirfd as u32).ok_or(EBADF_VALUE)?;
+    open_file.opendir_dentry().ok_or(ENOTDIR_VALUE)
 }
 
 fn resolve_path_at<P: PmapIf>(
@@ -84,15 +92,7 @@ fn resolve_path_at<P: PmapIf>(
     cred: &Credential,
     ctx: &SyscallCtx<'_>,
 ) -> Result<Cap<DEntry>, i32> {
-    if dirfd != AT_FDCWD {
-        // TODO(phase-dirfd): real dirfd-relative paths once the fd
-        // table grows directory-fd semantics.
-        return Err(EBADF_VALUE);
-    }
-    let cwd: Cap<DEntry> = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return Err(EBADF_VALUE),
-    };
+    let cwd: Cap<DEntry> = resolve_cwd(dirfd, ctx)?;
     let guard = step_engine::guard();
     // Uses `step_walk` (consuming `FsOps` via the direct
     // `MountPayload::fs_ops` field) and matches the four-variant
@@ -214,14 +214,12 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
     let walker_cred = ctx.walker_cred();
     let new_mode = (mode & 0o7777) as u16;
     let result = {
-        let guard = step_engine::guard();
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = ChmodOp {
             rooted_at: &rooted_at,
             path: &path,
             mode: new_mode,
             cred: &walker_cred,
-            guard: &guard,
             target: None,
         };
         step_engine::drive_oneshot(&mut op, &mut script_ctx)
@@ -260,7 +258,6 @@ pub(super) fn sys_fchownat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let result = {
-        let guard = step_engine::guard();
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = ChownOp {
             rooted_at: &rooted_at,
@@ -268,7 +265,6 @@ pub(super) fn sys_fchownat<P: PmapIf>(
             uid,
             gid,
             cred: &walker_cred,
-            guard: &guard,
             target: None,
         };
         step_engine::drive_oneshot(&mut op, &mut script_ctx)
@@ -278,7 +274,6 @@ pub(super) fn sys_fchownat<P: PmapIf>(
         Err(v3errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(v3errno))),
     }
 }
-
 
 /// `faccessat(dirfd, path, mode)`. Linux RV64 generic ABI. POSIX
 /// `access(2)` shape: the access check uses the caller's **real**
@@ -357,13 +352,11 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let inode_meta = {
-        let guard = step_engine::guard();
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = AccessOp {
             rooted_at: &rooted_at,
             path: &path,
             cred: &walker_cred,
-            guard: &guard,
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(m) => m,
@@ -522,7 +515,9 @@ pub(super) fn sys_getcwd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     }
 
     let mut script_ctx = build_subject_script_ctx(ctx);
-    let mut op = GetcwdOp { target: &ctx.process };
+    let mut op = GetcwdOp {
+        target: &ctx.process,
+    };
     let path = match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(Some(p)) => p,
         Ok(None) => return SyscallResult::Error(ENOENT_VALUE),

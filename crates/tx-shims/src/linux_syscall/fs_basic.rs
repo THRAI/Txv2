@@ -104,9 +104,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(()) => SyscallResult::Return(0),
-                Err(v3errno) => {
-                    SyscallResult::Error(errno_to_i32(Errno::from(v3errno)))
-                }
+                Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
             }
         }
         _ => SyscallResult::Error(ENOSYS_VALUE),
@@ -162,14 +160,6 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     mode: u32,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
-    // Wave 2 slice: AT_FDCWD only. Real dirfd-relative resolution
-    // requires directory file descriptors — the slice's fd table
-    // doesn't carry them yet. (TODO(phase-dirfd): mirror Wave 4
-    // Part 4's `resolve_path_at` once dirfds land.)
-    if dirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
-
     // Bounded inline copy of the user path. Same `EXECVE_PATH_MAX = 4096`
     // budget as the existing `execve` / `fchmodat` arms (and matches
     // Linux's `PATH_MAX`). Empty paths surface as `-ENOENT` from the
@@ -198,14 +188,26 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         nonblocking: flags & O_NONBLOCK != 0,
     };
 
-    // Resolve the cwd anchor. Zombies + uninitialised init pre-rootfs
-    // both surface `cwd() == None`; the alive caller of `openat` always
-    // has a cwd installed by `step_chdir` / bootstrap. No-cwd is a
-    // defensive `-ENOENT` (matches Linux's "no such directory" shape
-    // for an unreachable cwd).
-    let cwd: Cap<DEntry> = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
+    // Resolve the dirfd anchor. AT_FDCWD → process cwd; a real dirfd
+    // → the `opendir_dentry` of its OpenFile (an O_DIRECTORY open of
+    // that directory). Invalid / non-directory fds surface as EBADF /
+    // ENOTDIR.
+    let cwd: Cap<DEntry> = if dirfd == AT_FDCWD {
+        match ctx.process.cwd() {
+            Some(d) => d,
+            None => return SyscallResult::Error(ENOENT_VALUE),
+        }
+    } else if dirfd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    } else {
+        let open_file = match ctx.process.fd(dirfd as u32) {
+            Some(f) => f,
+            None => return SyscallResult::Error(EBADF_VALUE),
+        };
+        match open_file.opendir_dentry() {
+            Some(d) => d,
+            None => return SyscallResult::Error(ENOTDIR_VALUE),
+        }
     };
 
     let walker_cred = ctx.walker_cred();
@@ -216,7 +218,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         use tx_scripts::drive;
         use tx_substrate::step::DriveMode;
         let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = OpenOp {
+        let op = OpenOp {
             rooted_at: cwd.clone(),
             path: path.clone(),
             flags: open_flags,
@@ -225,8 +227,16 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         };
         let mailbox_arc = script_ctx.mailbox().cloned();
         let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-        let openfile = match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await
+        let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+        let openfile = match drive(
+            op,
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox_arc.as_ref(),
+            delegate_registry_arc.as_deref(),
+            timer_wheel_arc.as_ref(),
+        )
+        .await
         {
             Ok(file) => file,
             Err(v3errno) => {
@@ -542,12 +552,10 @@ pub(super) fn sys_lseek<'a>(
         None => return SyscallResult::Error(EBADF_VALUE),
     };
     let mut script_ctx = build_subject_script_ctx(ctx);
-    let guard = step_engine::guard();
     let mut op = tx_subsystems::vfs::OpenFileLseekOp {
         file: &file,
         offset,
         whence,
-        guard: &guard,
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(new_offset) => SyscallResult::Return(new_offset as i64),
@@ -679,18 +687,22 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 
     match request {
         TCGETS => {
-            let guard = step_engine::guard();
-            let op = tx_subsystems::tty::execution::IoctlTcgetsOp { tty: &tty, guard: &guard };
-            match crate::adapter::step_engine::drive_oneshot(op, &PlaceholderProcessSubject, &mut NoProgress) {
-                StepOutcome::Done(termios) => {
-                    if argp == 0 { return SyscallResult::Error(EFAULT_VALUE); }
-                    if let Err(errno) = bootstrap_write_user::<Termios>(&ctx.aspace, argp, termios) {
+            let outcome = {
+                let guard = step_engine::guard();
+                step_ioctl_tcgets(&tty, &guard)
+            };
+            match unwrap_v3(outcome) {
+                Ok(termios) => {
+                    if argp == 0 {
+                        return SyscallResult::Error(EFAULT_VALUE);
+                    }
+                    if let Err(errno) = bootstrap_write_user::<Termios>(&ctx.aspace, argp, termios)
+                    {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
                     SyscallResult::Return(0)
                 }
-                StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(Errno::from(e))),
-                _ => SyscallResult::Error(EIO_VALUE),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TCSETS | TCSETSW | TCSETSF => {
@@ -962,6 +974,37 @@ fn inode_meta_to_statx(meta: &InodeMeta, ino: u64) -> StatxLayout {
     }
 }
 
+fn stat_meta_for_open_file(file: &Cap<OpenFile>) -> InodeMeta {
+    let rnode = file.rnode();
+    let fs_object_id = rnode.fs_object_id();
+    // Live size resolution: cached `rnode.meta()` is the snapshot at
+    // materialisation time and doesn't see in-place writes. For a
+    // page-backed regular file the in-memory `PageContainer.size_bytes`
+    // is the authoritative live size (`step_write_from_*` calls
+    // `pc.grow_size_to` on every write). Fall back to
+    // `fs_ops.load_inode_meta` for other rnode kinds, then to the
+    // cached meta. Without this, oscomp basic test_mmap/test_munmap
+    // print `file len: 0` and crash on the 0-length mmap because
+    // tmpfs/ext4's on-disk inode metadata is never refreshed after
+    // the page-cache write.
+    let mut meta = match fs_ops_for_rnode(rnode) {
+        Some(fs_ops) => {
+            let guard = step_engine::guard();
+            match fs_ops.load_inode_meta(fs_object_id, &guard) {
+                StepOutcome::Done(m) => m,
+                _ => rnode.meta(),
+            }
+        }
+        None => rnode.meta(),
+    };
+    if let Some(sz) =
+        crate::linux_syscall::vm::extract_page_container(file).map(|pc| pc.size_bytes())
+    {
+        meta.size = sz;
+    }
+    meta
+}
+
 /// `fstat(fd, statbuf)`. Linux RV64 generic ABI `__NR_fstat = 80`.
 ///
 /// Reads `OpenFile.rnode().meta()` for the fd and writes the Linux
@@ -988,8 +1031,9 @@ pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     };
 
     let rnode = file.rnode();
-    let meta = rnode.meta();
-    let ino = rnode.fs_object_id().as_u64();
+    let fs_object_id = rnode.fs_object_id();
+    let meta = stat_meta_for_open_file(&file);
+    let ino = fs_object_id.as_u64();
     let stat = inode_meta_to_stat(&meta, ino, 0);
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
@@ -998,12 +1042,8 @@ pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     SyscallResult::Return(0)
 }
 
-
 /// `fchdir(fd)`. Linux RV64 ABI `__NR_fchdir = 50`.
-pub(super) async fn sys_fchdir<P: PmapIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
+pub(super) async fn sys_fchdir<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let fd = args[0] as u32;
     let open_file = match ctx.process.fd(fd) {
@@ -1024,10 +1064,11 @@ pub(super) async fn sys_fchdir<P: PmapIf>(
 /// `__NR_statx = 291`.
 ///
 /// This is the metadata probe LA64 musl/busybox uses before `ls`
-/// opens a directory. Txv2 reports the same inode metadata already
-/// used by `newfstatat`; unsupported sync policy bits are accepted
-/// because there is no cache coherency distinction in the current VFS
-/// layer.
+/// opens a directory and, on LA64 musl, for some `fstat(fd)` wrappers
+/// via `statx(fd, "", AT_EMPTY_PATH, ...)`. Txv2 reports the same
+/// inode metadata already used by `newfstatat`; unsupported sync
+/// policy bits are accepted because there is no cache coherency
+/// distinction in the current VFS layer.
 pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
@@ -1035,9 +1076,6 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let _mask = args[3] as u32;
     let statxbuf_uaddr = args[4];
 
-    if dirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
     if path_uaddr == 0 || statxbuf_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
@@ -1060,17 +1098,41 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         None => return SyscallResult::Error(ENOENT_VALUE),
     };
     let (statx_result, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
-        (StatxResult { meta: cwd.rnode().meta() }, cwd.rnode().fs_object_id())
+        if dirfd == AT_FDCWD {
+            (
+                StatxResult {
+                    meta: cwd.rnode().meta(),
+                },
+                cwd.rnode().fs_object_id(),
+            )
+        } else {
+            let fd = dirfd;
+            if fd < 0 {
+                return SyscallResult::Error(EBADF_VALUE);
+            }
+            let file = match resolve_fd(&ctx.process, fd as u32) {
+                Some(f) => f,
+                None => return SyscallResult::Error(EBADF_VALUE),
+            };
+            let rnode = file.rnode();
+            (
+                StatxResult {
+                    meta: stat_meta_for_open_file(&file),
+                },
+                rnode.fs_object_id(),
+            )
+        }
     } else {
+        if dirfd != AT_FDCWD {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
         let walker_cred = ctx.walker_cred();
         let result = {
-            let guard = step_engine::guard();
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = StatxOp {
                 rooted_at: &cwd,
                 path: &path,
                 cred: &walker_cred,
-                guard: &guard,
                 target: None,
             };
             step_engine::drive_oneshot(&mut op, &mut script_ctx)
@@ -1092,9 +1154,10 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// `__NR_newfstatat = 79`.
 ///
 /// Slice 6 surface:
-/// - `dirfd == AT_FDCWD` only; non-cwd dirfds → `-EBADF`.
-/// - `flags & AT_EMPTY_PATH` paired with empty path stats the cwd
-///   directly (no walker invocation).
+/// - `dirfd == AT_FDCWD` for path walks; non-cwd dirfds → `-EBADF`.
+/// - `flags & AT_EMPTY_PATH` paired with empty path stats either the
+///   cwd (`AT_FDCWD`) or the supplied fd. LA64 musl uses this fd form
+///   to implement `fstat(fd)`.
 /// - `flags & AT_SYMLINK_NOFOLLOW` is accepted but ignored (the
 ///   walker always follows symlinks today; documented carryover).
 /// - `flags & AT_NO_AUTOMOUNT` is accepted but ignored (no
@@ -1109,9 +1172,6 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     let statbuf_uaddr = args[2];
     let flags = args[3] as u32;
 
-    if dirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
     if statbuf_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
@@ -1134,23 +1194,30 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 
     let walker_cred = ctx.walker_cred();
 
-    // AT_EMPTY_PATH + empty path: stat the cwd itself directly,
-    // bypassing the walker. Otherwise use StatOp + drive_oneshot.
+    // AT_EMPTY_PATH + empty path: stat the cwd itself for AT_FDCWD,
+    // or mirror fstat(fd) for a real fd. Otherwise use StatOp +
+    // drive_oneshot from cwd; directory-fd path walks remain out of
+    // scope for this slice.
     let cwd = match ctx.process.cwd() {
         Some(d) => d,
         None => return SyscallResult::Error(ENOENT_VALUE),
     };
     let (meta, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
-        (cwd.rnode().meta(), cwd.rnode().fs_object_id())
+        if dirfd == AT_FDCWD {
+            (cwd.rnode().meta(), cwd.rnode().fs_object_id())
+        } else {
+            return sys_fstat([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx);
+        }
     } else {
+        if dirfd != AT_FDCWD {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
         let result = {
-            let guard = step_engine::guard();
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = StatOp {
                 rooted_at: &cwd,
                 path: &path,
                 cred: &walker_cred,
-                guard: &guard,
                 target: None,
             };
             step_engine::drive_oneshot(&mut op, &mut script_ctx)
@@ -1359,7 +1426,9 @@ pub(super) async fn sys_statfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
     buf[8..16].copy_from_slice(&4096u64.to_le_bytes());
     buf[88..96].copy_from_slice(&255u64.to_le_bytes());
     buf[96..104].copy_from_slice(&4096u64.to_le_bytes());
-    if let Err(e) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &buf) { return SyscallResult::Error(errno_to_i32(e)); }
+    if let Err(e) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &buf) {
+        return SyscallResult::Error(errno_to_i32(e));
+    }
     SyscallResult::Return(0)
 }
 
@@ -1367,7 +1436,9 @@ pub(super) async fn sys_statfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
 pub(super) async fn sys_fstatfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let fd = args[0] as u32;
-    if ctx.process.fd(fd).is_none() { return SyscallResult::Error(EBADF_VALUE); }
+    if ctx.process.fd(fd).is_none() {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
     sys_statfs::<P>(args, ctx).await
 }
 
@@ -1382,15 +1453,22 @@ pub(super) async fn sys_sync<P: PmapIf>(_args: [u64; 6], _ctx: &SyscallCtx<'_>) 
 pub(super) async fn sys_syncfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let fd = args[0] as u32;
-    let open_file = match ctx.process.fd(fd) { Some(f) => f, None => return SyscallResult::Error(EBADF_VALUE) };
+    let open_file = match ctx.process.fd(fd) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
     let guard = step_engine::guard();
     let rnode = open_file.rnode();
-    let page_backing = match rnode.containing_mount_weak().and_then(|w| w.upgrade(&guard)) {
+    let page_backing = match rnode
+        .containing_mount_weak()
+        .and_then(|w| w.upgrade(&guard))
+    {
         Some(mp) => mp.fs_page_backing().clone(),
         None => return SyscallResult::Error(ENODEV_VALUE),
     };
-    // syncfs: flush the entire filesystem through its root inode.
-    match page_backing.fsync(tx_subsystems::vfs::FsObjectId::ROOT, &guard) {
+    // syncfs: flush the entire filesystem. The default impl falls back
+    // to `fsync_file(ROOT)`; journaling filesystems can override.
+    match page_backing.sync_filesystem(&guard) {
         StepOutcome::Done(()) => SyscallResult::Return(0),
         StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(Errno::from(e))),
         _ => SyscallResult::Error(EIO_VALUE),
@@ -1402,13 +1480,24 @@ pub(super) async fn sys_syncfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
 pub(super) async fn sys_fsync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let fd = args[0] as u32;
-    let open_file = match ctx.process.fd(fd) { Some(f) => f, None => return SyscallResult::Error(EBADF_VALUE) };
-    let guard = step_engine::guard();
+    let open_file = match ctx.process.fd(fd) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
     let rnode = open_file.rnode();
     let fs_object_id = rnode.fs_object_id();
-    let page_backing = match rnode.containing_mount_weak().and_then(|w| w.upgrade(&guard)) {
-        Some(mp) => mp.fs_page_backing().clone(),
-        None => return SyscallResult::Error(ENODEV_VALUE),
+    // The mount-weak upgrade and the page-backing clone are done inside
+    // a scoped guard so no guard crosses the subsequent
+    // `drive(...).await` (INVARIANTS_v5 EBR-7).
+    let page_backing = {
+        let guard = step_engine::guard();
+        match rnode
+            .containing_mount_weak()
+            .and_then(|w| w.upgrade(&guard))
+        {
+            Some(mp) => mp.fs_page_backing().clone(),
+            None => return SyscallResult::Error(ENODEV_VALUE),
+        }
     };
     // fsync: sync the specific file via FileFsyncOp + drive().
     use tx_scripts::drive;
@@ -1416,10 +1505,9 @@ pub(super) async fn sys_fsync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let mut op = FileFsyncOp {
+    let op = FileFsyncOp {
         page_backing,
         fs_object_id,
-        guard: &guard,
     };
     match drive(
         op,
@@ -1438,7 +1526,10 @@ pub(super) async fn sys_fsync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
 
 /// `fdatasync(fd)`. Linux RV64 ABI `__NR_fdatasync = 83`.
 /// Syncs file data (not metadata).  v1: delegates to fsync.
-pub(super) async fn sys_fdatasync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+pub(super) async fn sys_fdatasync<P: PmapIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
     sys_fsync::<P>(args, ctx).await
 }
 

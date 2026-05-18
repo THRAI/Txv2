@@ -9,12 +9,12 @@
 //! The DAC traversal and open-permission checks live here too — they
 //! are the predicates the walker consumes at each component.
 
-use crate::execution::{Errno, Guard};
-use crate::vfs::adapter::step_engine::{Cap, IdentRef};
+use crate::execution::Errno;
+use crate::vfs::adapter::step_engine::IdentRef;
 
-use crate::cred::{Capability, CapabilitySet};
 use super::checks::RootCtx;
-use super::structure::{Credential, DEntry, InodeMeta, InodeKind, OpenFileFlags, RNode};
+use super::structure::{Credential, DEntry, InodeKind, InodeMeta, OpenFileFlags, RNode};
+use crate::cred::Capability;
 
 // ---------------------------------------------------------------------------
 // Structural predicates (spec §12)
@@ -111,7 +111,11 @@ pub fn check_descend_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), Err
 ///
 /// Slice simplification: exec permission is NOT enforced here — that
 /// lives in `exec_script` (Wave 4). Per `txdoc:VFS-CHECKS-PERMISSIONS-1`.
-pub fn check_open_perm(meta: &InodeMeta, flags: OpenFileFlags, cred: &Credential) -> Result<(), Errno> {
+pub fn check_open_perm(
+    meta: &InodeMeta,
+    flags: OpenFileFlags,
+    cred: &Credential,
+) -> Result<(), Errno> {
     if cred.effective_caps.contains(Capability::DAC_OVERRIDE) {
         return Ok(());
     }

@@ -396,7 +396,6 @@ mod step_op_wraps {
             2,
         );
         let fixture = UserBufferFixture::new(0x70_0000, 1);
-        let guard = step_engine::guard();
 
         let payload: Vec<u8> = (0u8..200).collect();
         fixture.seed_user_bytes(&payload);
@@ -407,7 +406,6 @@ mod step_op_wraps {
             aspace: &fixture.aspace,
             src: fixture.user_ptr(),
             len: payload.len(),
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(payload.len()));
@@ -450,13 +448,13 @@ mod step_op_wraps {
         let zeros = vec![0u8; payload.len()];
         fixture.seed_user_bytes(&zeros);
         let reader = open_file_for_pc(&pc);
+        drop(guard);
         let mut op = ReadToUserOp {
             pc: &pc,
             of: &reader,
             aspace: &fixture.aspace,
             dst: fixture.user_ptr(),
             len: payload.len(),
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(payload.len()));
@@ -477,7 +475,6 @@ mod step_op_wraps {
             1,
         );
         let fixture = UserBufferFixture::new(0x90_0000, 1);
-        let guard = step_engine::guard();
         let reader = open_file_for_pc(&pc);
         let mut op = ReadToUserOp {
             pc: &pc,
@@ -485,7 +482,6 @@ mod step_op_wraps {
             aspace: &fixture.aspace,
             dst: fixture.user_ptr(),
             len: 0,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(0));
@@ -505,7 +501,6 @@ mod step_op_wraps {
             1,
         );
         let empty_aspace = AddressSpace::new();
-        let guard = step_engine::guard();
         let dangling = UserPtr::<u8>::new(0xA0_0000);
         let writer = open_file_for_pc(&pc);
         let mut op = WriteFromUserOp {
@@ -514,7 +509,6 @@ mod step_op_wraps {
             aspace: &empty_aspace,
             src: dangling,
             len: 8,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Err(V3Errno::EFAULT));

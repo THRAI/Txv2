@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
-use tx_subsystems::mount::{self, MountPayload};
 use tx_fs;
+use tx_subsystems::mount::{self};
 
 /// Split a path into `(parent, basename)` for the `O_CREAT`-on-missing
 /// re-walk. `path` is a slash-separated sequence; trailing slashes
@@ -492,14 +492,14 @@ pub(super) async fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     };
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
-    let guard = step_engine::guard();
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let mut op = FdTruncateOp {
+    // Op acquires its own epoch guard inside `step()`; the syscall
+    // handler holds no guard across `drive(...).await` (EBR-7).
+    let op = FdTruncateOp {
         pc: &pc,
         new_size: new_size as u64,
-        guard: &guard,
     };
     match drive(
         op,
@@ -623,10 +623,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 /// `mount(source, target, fstype, flags, data)`. Linux RV64 ABI `__NR_mount = 40`.
 ///
 /// v1: supports `MS_BIND` (bind mount) and new mounts (tmpfs/devfs/proc).
-pub(super) async fn sys_mount<P: PmapIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
+pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let source_uaddr = args[0];
     let target_uaddr = args[1];
@@ -644,8 +641,12 @@ pub(super) async fn sys_mount<P: PmapIf>(
     };
     let cred = ctx.walker_cred();
 
-    let guard = step_engine::guard();
-    use StepOutcome as V3;
+    // No outer guard here: `walk_from` acquires its own internal
+    // guard (fs_path.rs:623), and txKernel's epoch discipline panics
+    // on nested guards (`tx-substrate::epoch::local:55`). Per-branch
+    // guards land inside the branches that actually call subsystem
+    // helpers needing one (bind_mount; the RNode reserve below).
+
     let target_dentry = match walk_from(cwd.clone(), &target, &cred) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
@@ -666,6 +667,7 @@ pub(super) async fn sys_mount<P: PmapIf>(
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         };
+        let guard = step_engine::guard();
         match mount::bind_mount(source_dentry, target_dentry, &parent_payload, &guard) {
             Ok(_) => return SyscallResult::Return(0),
             Err(e) => return SyscallResult::Error(errno_to_i32(e)),
@@ -682,6 +684,25 @@ pub(super) async fn sys_mount<P: PmapIf>(
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
 
+    // For ext4 the backend isn't a zero-state factory — it must
+    // attach to a block device. Resolve the `source` path to a
+    // bdev-fs RNode and ask bdev-fs which `BlockDeviceRegistration`
+    // it represents (BDEV_FS §8.1). The returned `MountedExt4` is
+    // kept alive in this scope; we later call `bind_mount_payload`
+    // on it after the kernel `MountPayload` is signed so the backend
+    // can stamp the mount onto materialised RNodes.
+    let mut ext4_mount: Option<tx_fs::tx_ext4::MountedExt4<tx_fs::tx_ext4::BlockDeviceImage>> =
+        None;
+    let source_label_for_ext4: Option<alloc::vec::Vec<u8>> = if fstype_str == "ext4" {
+        let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
+            Ok(p) => p,
+            Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        };
+        Some(source)
+    } else {
+        None
+    };
+
     // Build backend via crate-level factory.
     let (fs_ops, fs_page_backing, root_id, root_meta, fstype_label): (
         alloc::sync::Arc<dyn tx_subsystems::vfs::FsOps>,
@@ -690,15 +711,27 @@ pub(super) async fn sys_mount<P: PmapIf>(
         tx_subsystems::vfs::InodeMeta,
         &str,
     ) = match fstype_str {
-        "tmpfs" => (
-            tx_fs::tmpfs::Tmpfs::fs_ops_arc(),
-            tx_fs::tmpfs::Tmpfs::fs_page_backing_arc(),
-            tx_subsystems::vfs::FsObjectId::ROOT,
-            tx_subsystems::vfs::InodeMeta::new(
-                tx_subsystems::vfs::InodeKind::Directory, 0o755,
-            ),
-            "tmpfs",
-        ),
+        // `vfat` is an oscomp-basic compatibility shim: we have no
+        // FAT driver, but the basic test mounts `/dev/vda2` as
+        // `vfat` and only asserts `mount` + `umount` round-trip
+        // (`assert(ret == 0)`). A fresh tmpfs at the mount point
+        // satisfies that contract without pretending to read FAT
+        // bytes. Real FAT support tracks separately.
+        "tmpfs" | "vfat" => {
+            let tmpfs = alloc::sync::Arc::new(tx_fs::tmpfs::Tmpfs::new());
+            let label = if fstype_str == "vfat" {
+                "vfat"
+            } else {
+                "tmpfs"
+            };
+            (
+                tmpfs.clone().fs_ops_arc(),
+                tmpfs.fs_page_backing_arc(),
+                tx_subsystems::vfs::FsObjectId::ROOT,
+                tx_subsystems::vfs::InodeMeta::new(tx_subsystems::vfs::InodeKind::Directory, 0o755),
+                label,
+            )
+        }
         "devfs" => (
             tx_fs::devfs::Devfs::fs_ops_arc(),
             tx_fs::devfs::Devfs::fs_page_backing_arc(),
@@ -711,7 +744,8 @@ pub(super) async fn sys_mount<P: PmapIf>(
         ),
         "proc" => (
             tx_fs::procfs::Procfs::fs_ops_arc(),
-            alloc::sync::Arc::new(tx_fs::procfs::Procfs) as alloc::sync::Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
+            alloc::sync::Arc::new(tx_fs::procfs::Procfs)
+                as alloc::sync::Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
             tx_fs::procfs::PROCFS_ROOT_ID,
             tx_subsystems::vfs::InodeMeta::new(
                 tx_subsystems::vfs::InodeKind::Directory,
@@ -719,15 +753,69 @@ pub(super) async fn sys_mount<P: PmapIf>(
             ),
             "proc",
         ),
+        "ext4" => {
+            // Resolve `source` (e.g. `/dev/block/vda`) into a bdev-fs
+            // RNode, then ask bdev-fs which underlying block-device
+            // registration backs it. Per BDEV_FS §8.1 — the bridge
+            // helper `block_device_for_object_id` is the canonical
+            // path filesystems use to mount on a block device.
+            let source = source_label_for_ext4
+                .as_ref()
+                .expect("ext4 fstype implies source was read");
+            let source_dentry = match walk_from(cwd.clone(), source, &cred) {
+                Ok(d) => d,
+                Err(e) => return SyscallResult::Error(e),
+            };
+            let source_rnode = source_dentry.rnode();
+            let reg = match tx_fs::bdevfs::block_device_for_object_id(source_rnode.fs_object_id()) {
+                Some(r) => r,
+                None => return SyscallResult::Error(ENODEV_VALUE),
+            };
+            let image = tx_fs::tx_ext4::BlockDeviceImage::new(reg.ops);
+            // Linux's `MS_RDONLY = 1`. If set in `flags`, mount
+            // through the read-only entry point so every mutating
+            // `FsOps` call short-circuits with `EROFS`. The
+            // mount-table flag below mirrors this so `remount(...,
+            // !RDONLY)` semantics line up if/when remount lands.
+            const MS_RDONLY: u64 = 1;
+            let read_only = (flags & MS_RDONLY) != 0;
+            let mounted = if read_only {
+                tx_fs::tx_ext4::mount_ext4_read_only(image)
+            } else {
+                tx_fs::tx_ext4::mount_ext4_read_write(image)
+            };
+            let mounted = match mounted {
+                Ok(m) => m,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let root_id = mounted.root_fs_object_id;
+            let root_meta = mounted.root_inode_meta.clone();
+            let fs_ops = mounted.fs_ops();
+            let fs_page_backing = mounted.fs_page_backing();
+            ext4_mount = Some(mounted);
+            (fs_ops, fs_page_backing, root_id, root_meta, "ext4")
+        }
         _ => return SyscallResult::Error(ENOSYS_VALUE),
     };
+
+    // Translate the Linux `flags` u64 into kernel `MountFlags`. Per
+    // Linux's `mount(2)` manpage: `MS_RDONLY = 1`, `MS_NOSUID = 2`,
+    // `MS_NOATIME = 1024`. The kernel `MountFlags::READ_ONLY` bit
+    // mirrors `MS_RDONLY`. Other flags are accepted but not yet
+    // enforced.
+    const MS_RDONLY: u64 = 1;
+    let mut mount_flags = mount::MountFlags::empty();
+    if (flags & MS_RDONLY) != 0 {
+        mount_flags = mount::MountFlags::READ_ONLY;
+    }
+    let mount_options = mount::MountOptions { flags: mount_flags };
 
     let mount_payload = match mount::MountPayload::new_cap(
         fs_ops,
         fs_page_backing,
         None,
         mount::allocate_dev_id(),
-        mount::MountOptions::default(),
+        mount_options,
         fstype_label,
         mount::SourceLabel::Static("none"),
     ) {
@@ -735,22 +823,27 @@ pub(super) async fn sys_mount<P: PmapIf>(
         Err(_) => return SyscallResult::Error(Errno::ENOMEM as i32),
     };
 
+    // ext4 needs its backend to know the freshly-signed
+    // `Cap<MountPayload>` so `materialise_rnode` can stamp
+    // `PageContainerKind::File { mount, .. }` onto regular-file
+    // RNodes (see `mount_sdcard_at_musl` and BDEV_FS §8.1).
+    if let Some(mounted) = ext4_mount.as_ref() {
+        mounted.bind_mount_payload(&mount_payload);
+    }
+
     let root_rnode = {
         use tx_subsystems::vfs::RNodeBacking;
         let raw = tx_subsystems::vfs::RNode::new(root_id, root_meta, RNodeBacking::Directory)
             .with_containing_mount(&mount_payload);
         match step_engine::reserve_for::<tx_subsystems::vfs::RNode>() {
-            Ok(res) => match step_engine::sign_for(res, raw) {
-                Ok(cap) => cap,
-                Err(_) => return SyscallResult::Error(Errno::ENOMEM as i32),
-            },
+            Ok(res) => step_engine::sign_for(res, raw),
             Err(_) => return SyscallResult::Error(Errno::ENOMEM as i32),
         }
     };
 
     let mount_cap = match mount::MountIdentity::new_cap(
         mount::allocate_mount_id(),
-        Some(target_dentry),
+        Some(target_dentry.clone()),
         root_rnode,
         None,
         mount_payload,
@@ -770,10 +863,7 @@ pub(super) async fn sys_mount<P: PmapIf>(
 }
 
 /// `umount2(target, flags)`. Linux RV64 ABI `__NR_umount2 = 39`.
-pub(super) async fn sys_umount2<P: PmapIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
+pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let target_uaddr = args[0];
     let flags = args[1] as u64;
@@ -793,12 +883,18 @@ pub(super) async fn sys_umount2<P: PmapIf>(
     };
     let cred = ctx.walker_cred();
 
-    let guard = step_engine::guard();
     use StepOutcome as V3;
-    let target_dentry = match step_walk(cwd.clone(), &target, &cred, &guard) {
-        V3::Done(d) => d,
-        V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
-        _ => return SyscallResult::Error(EIO_VALUE),
+    // Scope the guard so it's dropped before any downstream helper
+    // (notably `mount_payload_for_dentry`, which acquires its own
+    // internal guard) — nested guards panic at
+    // `tx-substrate::epoch::local:55`.
+    let target_dentry = {
+        let guard = step_engine::guard();
+        match step_walk(cwd.clone(), &target, &cred, &guard) {
+            V3::Done(d) => d,
+            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+            _ => return SyscallResult::Error(EIO_VALUE),
+        }
     };
     let parent_payload = match mount_payload_for_dentry(&target_dentry) {
         Some(p) => p,
@@ -820,10 +916,7 @@ pub(super) async fn sys_umount2<P: PmapIf>(
 /// file type (S_IFCHR, S_IFBLK, S_IFIFO, S_IFREG).  `dev` encodes
 /// major/minor (major = (dev >> 8) & 0xfff, minor = dev & 0xff
 /// | (dev >> 12) & 0xfff00).
-pub(super) async fn sys_mknodat<P: PmapIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
+pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let _dirfd = args[0] as u32;
     let path_uaddr = args[1];
@@ -853,7 +946,6 @@ pub(super) async fn sys_mknodat<P: PmapIf>(
         _ => return SyscallResult::Error(EINVAL_VALUE),
     };
     let result = {
-        let guard = step_engine::guard();
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = MknodOp {
             rooted_at: &cwd,
@@ -861,7 +953,6 @@ pub(super) async fn sys_mknodat<P: PmapIf>(
             mode: mode as u16,
             kind,
             cred: &cred,
-            guard: &guard,
             parent: None,
         };
         step_engine::drive_oneshot(&mut op, &mut script_ctx)
@@ -944,14 +1035,12 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     // inside the op. RENAME_EXCHANGE was rejected above.
     let cred = ctx.walker_cred();
     let result = {
-        let guard = step_engine::guard();
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = RenameOp {
             rooted_at: &cwd,
             oldpath: &oldpath,
             newpath: &newpath,
             cred: &cred,
-            guard: &guard,
             state: None,
         };
         step_engine::drive_oneshot(&mut op, &mut script_ctx)

@@ -758,7 +758,6 @@ mod step_op_wraps {
     fn read_op_advances_offset_through_step() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -771,7 +770,6 @@ mod step_op_wraps {
             pc: &pc,
             of: &of,
             len: 32,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(32));
@@ -782,7 +780,6 @@ mod step_op_wraps {
     fn read_op_eof_returns_done_zero() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -795,7 +792,6 @@ mod step_op_wraps {
             pc: &pc,
             of: &of,
             len: 16,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(0));
@@ -806,7 +802,6 @@ mod step_op_wraps {
     fn write_op_marks_dirty_and_advances_offset() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -819,7 +814,6 @@ mod step_op_wraps {
             pc: &pc,
             of: &of,
             len,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(len));
@@ -832,7 +826,6 @@ mod step_op_wraps {
     fn write_op_rejects_device_backing() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Device {
                 base_ppn: Ppn(0xface_0000),
@@ -845,7 +838,6 @@ mod step_op_wraps {
             pc: &pc,
             of: &of,
             len: 8,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Err(Errno::EINVAL.into()));

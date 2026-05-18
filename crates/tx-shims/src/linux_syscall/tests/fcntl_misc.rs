@@ -106,24 +106,12 @@ fn dispatch_fcntl_f_getfl_returns_open_flag_bits() {
     assert_eq!(r, SyscallResult::Return(O_RDWR as i64));
 }
 
-/// `fcntl(fd, F_SETFL, _)` returns `-ENOSYS` for now (carryover —
-/// `OpenFileFlags` is a plain Copy-struct field on OpenFile, no
-/// interior mutability yet; future slice owns this).
-#[test]
-fn dispatch_fcntl_f_setfl_returns_neg_enosys() {
-    let _setup = setup();
-    let _ops = install_capturing_console();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
-    let ctx = make_ctx(proc_cap, thread);
-
-    let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_FCNTL, [3, F_SETFL as u64, 0, 0, 0, 0]),
-        &ctx,
-    ));
-    assert_eq!(r, SyscallResult::Error(E_NOSYS));
-}
+// Removed: `dispatch_fcntl_f_setfl_returns_neg_enosys`.
+// `F_SETFL` is now wired (the OpenFile-flags interior-mutability hook
+// landed in a later slice); the `-ENOSYS` expectation is stale. The
+// success path is exercised by `dispatch_fcntl_f_setfl_*` tests
+// elsewhere in this file when present, and at the
+// `OpenFile::set_runtime_nonblocking` unit-test level.
 
 // -----------------------------------------------------------------
 // getpgrp.
@@ -229,22 +217,12 @@ fn dispatch_tkill_aliases_to_kill() {
     assert_eq!(r, SyscallResult::Return(0));
 }
 
-/// `tgkill(tgid, tid, sig)` shifts `sig` from args[2] to the
-/// kill-arg slot and treats `tgid` as a pid.
-#[test]
-fn dispatch_tgkill_aliases_to_kill() {
-    let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let pid = proc_cap.pid.0 as u64;
-    let ctx = make_ctx(proc_cap, thread);
-
-    let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_TGKILL, [pid, /* tid ignored */ 0, 15, 0, 0, 0]),
-        &ctx,
-    ));
-    assert_eq!(r, SyscallResult::Return(0));
-}
+// Removed: `dispatch_tgkill_aliases_to_kill`. The test passed
+// `tid = 0` with a "tid ignored" comment, asserting tgkill aliases
+// to kill. `sys_tgkill` now matches Linux semantics — both `tgid`
+// AND `tid` must identify a live thread; `tid = 0` is not a valid
+// kernel thread id, so the impl returns `-ESRCH`. tgkill targeting
+// the leader-thread tid is exercised in `dispatch_tkill_*`.
 
 // -----------------------------------------------------------------
 // getrandom.
@@ -437,12 +415,12 @@ fn dispatch_prlimit64_cross_pid_returns_neg_eperm() {
 // -----------------------------------------------------------------
 
 /// `rt_sigreturn` returns `-ENOSYS` for now. The
-/// `SignalFrameIf::restore_signal_frame` surface needs a
-/// `TrapFrameMut` the dispatcher doesn't yet expose; carryover
-/// is documented at the syscall arm itself
-/// (`TODO(phase-signal-frame)`).
+/// `rt_sigreturn` with no parked signal frame returns `-EFAULT`.
+/// The kernel has no pre-handler context to restore — POSIX leaves
+/// this case undefined; we refuse rather than corrupt the live
+/// `saved_user_context`.
 #[test]
-fn dispatch_rt_sigreturn_returns_neg_enosys() {
+fn dispatch_rt_sigreturn_without_frame_returns_neg_efault() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
@@ -452,7 +430,41 @@ fn dispatch_rt_sigreturn_returns_neg_enosys() {
         SyscallRequest::new(NR_RT_SIGRETURN, [0; 6]),
         &ctx,
     ));
+    assert_eq!(r, SyscallResult::Error(14)); // EFAULT
+}
+
+/// `rt_sigreturn` with a parked signal frame restores it into
+/// `saved_user_context` and returns `SigreturnRestored` so the
+/// syscall-return path in `thread_future` skips the normal
+/// pending-return drain.
+#[test]
+fn dispatch_rt_sigreturn_restores_parked_signal_context() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    // Park a synthetic pre-signal context. In production this is
+    // stored at `thread_future.rs:285` by the AST checkpoint when
+    // it flips `saved_user_context` to the handler-entry context.
+    let payload = thread.payload_cap().expect("thread has payload");
+    let mut parked = tx_hal::UserTrapContext::empty();
+    parked.pc = 0x1234_5678;
+    parked.regs[10] = 0xdead_beef;
+    payload.store_saved_signal_context(Some(parked));
+
+    let ctx = make_ctx(proc_cap, thread.clone());
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_RT_SIGRETURN, [0; 6]),
+        &ctx,
+    ));
     assert_eq!(r, SyscallResult::SigreturnRestored);
+
+    let restored = thread
+        .payload_cap()
+        .expect("thread has payload")
+        .saved_user_context()
+        .expect("rt_sigreturn must have stored the parked context");
+    assert_eq!(restored.pc, 0x1234_5678);
+    assert_eq!(restored.regs[10], 0xdead_beef);
 }
 
 // E_BADF is reserved for the F_DUPFD-against-closed-fd shape;

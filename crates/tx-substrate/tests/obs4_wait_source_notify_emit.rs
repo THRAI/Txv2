@@ -34,7 +34,10 @@ use tx_substrate::{
 // ── Backing ring storage ──────────────────────────────────────────────────────
 
 const RING_BYTES: usize = 2048;
-static mut RING_STORAGE: [u8; RING_BYTES] = [0u8; RING_BYTES];
+#[repr(align(8))]
+struct AlignedRingStorage([u8; RING_BYTES]);
+
+static mut RING_STORAGE: AlignedRingStorage = AlignedRingStorage([0u8; RING_BYTES]);
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static CURRENT_CPU: AtomicUsize = AtomicUsize::new(0);
 static TS_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -129,7 +132,7 @@ impl ObserverIf for TestPlatform {
         if hart.0 != 0 {
             return None;
         }
-        let ptr = core::ptr::addr_of_mut!(RING_STORAGE) as *mut u8;
+        let ptr = unsafe { core::ptr::addr_of_mut!(RING_STORAGE.0) as *mut u8 };
         Some(RingDescriptor {
             base: unsafe { NonNull::new_unchecked(ptr) },
             size: RING_BYTES,
@@ -143,7 +146,7 @@ impl ObserverIf for TestPlatform {
 fn reset_ring() {
     unsafe {
         core::ptr::write_bytes(
-            core::ptr::addr_of_mut!(RING_STORAGE) as *mut u8,
+            core::ptr::addr_of_mut!(RING_STORAGE.0) as *mut u8,
             0,
             RING_BYTES,
         );
@@ -156,7 +159,7 @@ fn reset_ring() {
 ///
 /// SAFETY: must hold `TEST_LOCK`; no concurrent producer.
 unsafe fn read_ring(n: usize) -> (TxTraceHartRing, std::vec::Vec<TxTraceRecord>) {
-    let base = core::ptr::addr_of!(RING_STORAGE) as *const u8;
+    let base = core::ptr::addr_of!(RING_STORAGE.0) as *const u8;
     let hdr = core::ptr::read(base as *const TxTraceHartRing);
     let slots_ptr = base.add(core::mem::size_of::<TxTraceHartRing>()) as *const TxTraceRecord;
     let mut slots = std::vec::Vec::with_capacity(n);
@@ -389,9 +392,7 @@ fn notify_emit_falls_back_gracefully_when_no_ring() {
     reset_ring();
     CURRENT_CPU.store(1, Ordering::Release);
 
-    tx_observe::init::<TestPlatform>(CpuId(1))
-        .err()
-        .expect("CPU 1 should have no ring");
+    tx_observe::init::<TestPlatform>(CpuId(1)).expect_err("CPU 1 should have no ring");
 
     let src = WaitSource::new(WaitSourceId::new(7));
     let m = Arc::new(TaskMailbox::new());

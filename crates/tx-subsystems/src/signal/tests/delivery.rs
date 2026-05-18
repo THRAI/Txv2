@@ -653,10 +653,7 @@ fn signal_generated_constant_is_defined() {
 
 #[test]
 fn exit_source_child_zombified_constant_is_defined() {
-    assert_eq!(
-        crate::process::structure::EXIT_SOURCE_CHILD_ZOMBIFIED,
-        0x1
-    );
+    assert_eq!(crate::process::structure::EXIT_SOURCE_CHILD_ZOMBIFIED, 0x1);
 }
 
 #[test]

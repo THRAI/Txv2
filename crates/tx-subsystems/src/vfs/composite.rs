@@ -24,14 +24,12 @@
 
 use alloc::boxed::Box;
 
-use crate::execution::Guard;
-use crate::page_backed::FsPageBacking;
 use crate::vfs::adapter::step_engine::{
     self, Cap, Deadline, InterestMask, NoProgress, OneShotStepOp, ProcessIdentity, ResumeOutcome,
-    ScriptCtx, StepOp, StepOutcome, SubjectIdentity, TimerId, WaitSourceId, YieldShape,
+    ScriptCtx, StepOp, StepOutcome, SubjectIdentity, WaitSourceId, YieldShape,
 };
-use crate::vfs::{Credential, DEntry, FsObjectId, FsOps, InlineName, InodeMeta};
 use crate::vfs::walker;
+use crate::vfs::{Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta};
 
 // ============================================================================
 // ChmodOp — fchmodat
@@ -42,7 +40,6 @@ pub struct ChmodOp<'a> {
     pub path: &'a [u8],
     pub mode: u16,
     pub cred: &'a Credential,
-    pub guard: &'a Guard<'a>,
     pub target: Option<Cap<DEntry>>,
 }
 
@@ -51,11 +48,12 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChmodOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        let __guard = step_engine::guard();
         let target = match self.target.take() {
             Some(d) => d,
             None => {
                 let rooted_at = self.rooted_at.clone();
-                let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
+                let d = match walker::step_walk(rooted_at, self.path, self.cred, &__guard) {
                     StepOutcome::Done(d) => d,
                     StepOutcome::Err(e) => return StepOutcome::err(e),
                     _ => return StepOutcome::err(step_engine::Errno::EIO),
@@ -64,9 +62,13 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChmodOp<'a> {
                 d
             }
         };
-        let fs_ops =
-            walker::fs_ops_for(&target, self.guard).expect("NoFsOps for ChmodOp");
-        fs_ops.step_chmod(target.rnode().fs_object_id(), self.mode, self.cred, self.guard)
+        let fs_ops = walker::fs_ops_for(&target, &__guard).expect("NoFsOps for ChmodOp");
+        fs_ops.step_chmod(
+            target.rnode().fs_object_id(),
+            self.mode,
+            self.cred,
+            &__guard,
+        )
     }
 }
 
@@ -83,7 +85,6 @@ pub struct ChownOp<'a> {
     pub uid: Option<u32>,
     pub gid: Option<u32>,
     pub cred: &'a Credential,
-    pub guard: &'a Guard<'a>,
     pub target: Option<Cap<DEntry>>,
 }
 
@@ -92,11 +93,12 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChownOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        let __guard = step_engine::guard();
         let target = match self.target.take() {
             Some(d) => d,
             None => {
                 let rooted_at = self.rooted_at.clone();
-                let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
+                let d = match walker::step_walk(rooted_at, self.path, self.cred, &__guard) {
                     StepOutcome::Done(d) => d,
                     StepOutcome::Err(e) => return StepOutcome::err(e),
                     _ => return StepOutcome::err(step_engine::Errno::EIO),
@@ -105,14 +107,13 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChownOp<'a> {
                 d
             }
         };
-        let fs_ops =
-            walker::fs_ops_for(&target, self.guard).expect("NoFsOps for ChownOp");
+        let fs_ops = walker::fs_ops_for(&target, &__guard).expect("NoFsOps for ChownOp");
         fs_ops.step_chown(
             target.rnode().fs_object_id(),
             self.uid,
             self.gid,
             self.cred,
-            self.guard,
+            &__guard,
         )
     }
 }
@@ -128,7 +129,6 @@ pub struct AccessOp<'a> {
     pub rooted_at: &'a Cap<DEntry>,
     pub path: &'a [u8],
     pub cred: &'a Credential,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for AccessOp<'a> {
@@ -136,8 +136,9 @@ impl<'a, I: SubjectIdentity> StepOp<I> for AccessOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<InodeMeta, NoProgress> {
+        let __guard = step_engine::guard();
         let rooted_at = self.rooted_at.clone();
-        match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
+        match walker::step_walk(rooted_at, self.path, self.cred, &__guard) {
             StepOutcome::Done(d) => StepOutcome::done(d.rnode().meta()),
             StepOutcome::Err(e) => StepOutcome::err(e),
             _ => StepOutcome::err(step_engine::Errno::EIO),
@@ -157,7 +158,6 @@ pub struct MkdirOp<'a> {
     pub path: &'a [u8],
     pub mode: u16,
     pub cred: &'a Credential,
-    pub guard: &'a Guard<'a>,
     pub parent: Option<(Cap<DEntry>, InlineName)>,
 }
 
@@ -166,6 +166,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for MkdirOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        let __guard = step_engine::guard();
         // observe
         // upgrade — N/A: path-walk read-only
         // reserve — create_inode reserves zone slot
@@ -179,7 +180,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for MkdirOp<'a> {
                 let parent_dentry = if parent_path.is_empty() {
                     rooted_at
                 } else {
-                    match walker::step_walk(rooted_at, parent_path, self.cred, self.guard) {
+                    match walker::step_walk(rooted_at, parent_path, self.cred, &__guard) {
                         StepOutcome::Done(d) => d,
                         StepOutcome::Err(e) => return StepOutcome::err(e),
                         _ => return StepOutcome::err(step_engine::Errno::EIO),
@@ -189,23 +190,27 @@ impl<'a, I: SubjectIdentity> StepOp<I> for MkdirOp<'a> {
                     Ok(n) => n,
                     Err(_) => return StepOutcome::err(step_engine::Errno::ENAMETOOLONG),
                 };
-                self.parent = Some((parent_dentry.clone(), name.clone()));
+                self.parent = Some((parent_dentry.clone(), name));
                 (parent_dentry, name)
             }
         };
-        let fs_ops =
-            walker::fs_ops_for(&parent, self.guard).expect("NoFsOps for MkdirOp");
+        let fs_ops = walker::fs_ops_for(&parent, &__guard).expect("NoFsOps for MkdirOp");
         match fs_ops.mkdir(
             parent.rnode().fs_object_id(),
             name.as_bytes(),
             self.mode,
             self.cred,
-            self.guard,
+            &__guard,
         ) {
             StepOutcome::Done(_id) => StepOutcome::Done(()),
             StepOutcome::Err(e) => StepOutcome::Err(e),
-            StepOutcome::Continue { progress: _ } => StepOutcome::Continue { progress: NoProgress },
-            StepOutcome::Yield { progress: _, shape } => StepOutcome::Yield { progress: NoProgress, shape },
+            StepOutcome::Continue { progress: _ } => StepOutcome::Continue {
+                progress: NoProgress,
+            },
+            StepOutcome::Yield { progress: _, shape } => StepOutcome::Yield {
+                progress: NoProgress,
+                shape,
+            },
         }
     }
 }
@@ -221,7 +226,6 @@ pub struct MknodOp<'a> {
     pub mode: u16,
     pub kind: InodeKind,
     pub cred: &'a Credential,
-    pub guard: &'a Guard<'a>,
     pub parent: Option<(Cap<DEntry>, InlineName)>,
 }
 
@@ -230,6 +234,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for MknodOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        let __guard = step_engine::guard();
         // observe
         // upgrade — N/A: path-walk read-only
         // reserve — create_inode reserves zone slot
@@ -243,7 +248,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for MknodOp<'a> {
                 let parent_dentry = if parent_path.is_empty() {
                     rooted_at
                 } else {
-                    match walker::step_walk(rooted_at, parent_path, self.cred, self.guard) {
+                    match walker::step_walk(rooted_at, parent_path, self.cred, &__guard) {
                         StepOutcome::Done(d) => d,
                         StepOutcome::Err(e) => return StepOutcome::err(e),
                         _ => return StepOutcome::err(step_engine::Errno::EIO),
@@ -253,23 +258,31 @@ impl<'a, I: SubjectIdentity> StepOp<I> for MknodOp<'a> {
                     Ok(n) => n,
                     Err(_) => return StepOutcome::err(step_engine::Errno::ENAMETOOLONG),
                 };
-                self.parent = Some((parent_dentry.clone(), name.clone()));
+                self.parent = Some((parent_dentry.clone(), name));
                 (parent_dentry, name)
             }
         };
-        let fs_ops =
-            walker::fs_ops_for(&parent, self.guard).expect("NoFsOps for MknodOp");
+        let fs_ops = walker::fs_ops_for(&parent, &__guard).expect("NoFsOps for MknodOp");
+        // `create_inode` takes a single packed `mode` whose S_IFMT bits
+        // encode the inode kind (Linux convention); `self.kind` is held
+        // only for callers that want a typed accessor.
+        let _ = self.kind;
         match fs_ops.create_inode(
             parent.rnode().fs_object_id(),
-            name,
-            self.kind,
+            name.as_bytes(),
             self.mode,
             self.cred,
-            self.guard,
+            &__guard,
         ) {
             StepOutcome::Done(_) => StepOutcome::Done(()),
             StepOutcome::Err(e) => StepOutcome::Err(e),
-            other => other,
+            StepOutcome::Continue { progress: _ } => StepOutcome::Continue {
+                progress: NoProgress,
+            },
+            StepOutcome::Yield { progress: _, shape } => StepOutcome::Yield {
+                progress: NoProgress,
+                shape,
+            },
         }
     }
 }
@@ -285,7 +298,6 @@ pub struct UnlinkOp<'a> {
     pub rooted_at: &'a Cap<DEntry>,
     pub path: &'a [u8],
     pub cred: &'a Credential,
-    pub guard: &'a Guard<'a>,
     pub parent_and_child: Option<(Cap<DEntry>, InlineName, FsObjectId)>,
 }
 
@@ -294,12 +306,13 @@ impl<'a, I: SubjectIdentity> StepOp<I> for UnlinkOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        let __guard = step_engine::guard();
         let (parent, name, child_id) = match self.parent_and_child.take() {
             Some(p) => p,
             None => {
                 let rooted_at = self.rooted_at.clone();
                 let child_dentry =
-                    match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
+                    match walker::step_walk(rooted_at, self.path, self.cred, &__guard) {
                         StepOutcome::Done(d) => d,
                         StepOutcome::Err(e) => return StepOutcome::err(e),
                         _ => return StepOutcome::err(step_engine::Errno::EIO),
@@ -307,20 +320,18 @@ impl<'a, I: SubjectIdentity> StepOp<I> for UnlinkOp<'a> {
                 let parent_dentry = child_dentry
                     .parent_hint()
                     .unwrap_or_else(|| child_dentry.clone());
-                let child_name = child_dentry.name().clone();
+                let child_name = child_dentry.name();
                 let child_id = child_dentry.rnode().fs_object_id();
-                self.parent_and_child =
-                    Some((parent_dentry.clone(), child_name.clone(), child_id));
+                self.parent_and_child = Some((parent_dentry.clone(), child_name, child_id));
                 (parent_dentry, child_name, child_id)
             }
         };
-        let fs_ops =
-            walker::fs_ops_for(&parent, self.guard).expect("NoFsOps for UnlinkOp");
+        let fs_ops = walker::fs_ops_for(&parent, &__guard).expect("NoFsOps for UnlinkOp");
         fs_ops.unlink(
             parent.rnode().fs_object_id(),
             name.as_bytes(),
             child_id,
-            self.guard,
+            &__guard,
         )
     }
 }
@@ -337,7 +348,6 @@ pub struct SymlinkOp<'a> {
     pub target: &'a [u8],
     pub linkpath: &'a [u8],
     pub cred: &'a Credential,
-    pub guard: &'a Guard<'a>,
     parent_and_name: Option<(Cap<DEntry>, InlineName)>,
 }
 
@@ -346,6 +356,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for SymlinkOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        let __guard = step_engine::guard();
         let (parent, name) = match self.parent_and_name.take() {
             Some(p) => p,
             None => {
@@ -354,7 +365,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for SymlinkOp<'a> {
                 let parent_dentry = if parent_path.is_empty() {
                     rooted_at
                 } else {
-                    match walker::step_walk(rooted_at, parent_path, self.cred, self.guard) {
+                    match walker::step_walk(rooted_at, parent_path, self.cred, &__guard) {
                         StepOutcome::Done(d) => d,
                         StepOutcome::Err(e) => return StepOutcome::err(e),
                         _ => return StepOutcome::err(step_engine::Errno::EIO),
@@ -364,23 +375,27 @@ impl<'a, I: SubjectIdentity> StepOp<I> for SymlinkOp<'a> {
                     Ok(n) => n,
                     Err(_) => return StepOutcome::err(step_engine::Errno::ENAMETOOLONG),
                 };
-                self.parent_and_name = Some((parent_dentry.clone(), name.clone()));
+                self.parent_and_name = Some((parent_dentry.clone(), name));
                 (parent_dentry, name)
             }
         };
-        let fs_ops =
-            walker::fs_ops_for(&parent, self.guard).expect("NoFsOps for SymlinkOp");
+        let fs_ops = walker::fs_ops_for(&parent, &__guard).expect("NoFsOps for SymlinkOp");
         match fs_ops.symlink(
             parent.rnode().fs_object_id(),
             name.as_bytes(),
             self.target,
             self.cred,
-            self.guard,
+            &__guard,
         ) {
             StepOutcome::Done(_id) => StepOutcome::Done(()),
             StepOutcome::Err(e) => StepOutcome::Err(e),
-            StepOutcome::Continue { progress: _ } => StepOutcome::Continue { progress: NoProgress },
-            StepOutcome::Yield { progress: _, shape } => StepOutcome::Yield { progress: NoProgress, shape },
+            StepOutcome::Continue { progress: _ } => StepOutcome::Continue {
+                progress: NoProgress,
+            },
+            StepOutcome::Yield { progress: _, shape } => StepOutcome::Yield {
+                progress: NoProgress,
+                shape,
+            },
         }
     }
 }
@@ -397,7 +412,6 @@ pub struct LinkOp<'a> {
     pub oldpath: &'a [u8],
     pub newpath: &'a [u8],
     pub cred: &'a Credential,
-    pub guard: &'a Guard<'a>,
     pub state: Option<(FsObjectId, Cap<DEntry>, InlineName)>,
 }
 
@@ -406,26 +420,23 @@ impl<'a, I: SubjectIdentity> StepOp<I> for LinkOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        let __guard = step_engine::guard();
         let (target_id, new_parent, new_name) = match self.state.take() {
             Some(p) => p,
             None => {
                 let rooted_at = self.rooted_at.clone();
-                let old_dentry = match walker::step_walk(
-                    rooted_at.clone(),
-                    self.oldpath,
-                    self.cred,
-                    self.guard,
-                ) {
-                    StepOutcome::Done(d) => d,
-                    StepOutcome::Err(e) => return StepOutcome::err(e),
-                    _ => return StepOutcome::err(step_engine::Errno::EIO),
-                };
+                let old_dentry =
+                    match walker::step_walk(rooted_at.clone(), self.oldpath, self.cred, &__guard) {
+                        StepOutcome::Done(d) => d,
+                        StepOutcome::Err(e) => return StepOutcome::err(e),
+                        _ => return StepOutcome::err(step_engine::Errno::EIO),
+                    };
                 let target_id = old_dentry.rnode().fs_object_id();
                 let (new_parent_path, new_name_bytes) = split_parent_and_name(self.newpath);
                 let new_parent = if new_parent_path.is_empty() {
                     rooted_at
                 } else {
-                    match walker::step_walk(rooted_at, new_parent_path, self.cred, self.guard) {
+                    match walker::step_walk(rooted_at, new_parent_path, self.cred, &__guard) {
                         StepOutcome::Done(d) => d,
                         StepOutcome::Err(e) => return StepOutcome::err(e),
                         _ => return StepOutcome::err(step_engine::Errno::EIO),
@@ -435,17 +446,16 @@ impl<'a, I: SubjectIdentity> StepOp<I> for LinkOp<'a> {
                     Ok(n) => n,
                     Err(_) => return StepOutcome::err(step_engine::Errno::ENAMETOOLONG),
                 };
-                self.state = Some((target_id, new_parent.clone(), new_name.clone()));
+                self.state = Some((target_id, new_parent.clone(), new_name));
                 (target_id, new_parent, new_name)
             }
         };
-        let fs_ops =
-            walker::fs_ops_for(&new_parent, self.guard).expect("NoFsOps for LinkOp");
+        let fs_ops = walker::fs_ops_for(&new_parent, &__guard).expect("NoFsOps for LinkOp");
         fs_ops.link(
             new_parent.rnode().fs_object_id(),
             new_name.as_bytes(),
             target_id,
-            self.guard,
+            &__guard,
         )
     }
 }
@@ -462,7 +472,6 @@ pub struct RenameOp<'a> {
     pub oldpath: &'a [u8],
     pub newpath: &'a [u8],
     pub cred: &'a Credential,
-    pub guard: &'a Guard<'a>,
     pub state: Option<(Cap<DEntry>, InlineName, Cap<DEntry>, InlineName)>,
 }
 
@@ -471,6 +480,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for RenameOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        let __guard = step_engine::guard();
         // observe
         // upgrade — N/A: path-walk read-only
         // reserve — N/A: rename reserves zone slots via FsOps
@@ -484,12 +494,8 @@ impl<'a, I: SubjectIdentity> StepOp<I> for RenameOp<'a> {
                 let old_parent = if old_parent_path.is_empty() {
                     rooted_at.clone()
                 } else {
-                    match walker::step_walk(
-                        rooted_at.clone(),
-                        old_parent_path,
-                        self.cred,
-                        self.guard,
-                    ) {
+                    match walker::step_walk(rooted_at.clone(), old_parent_path, self.cred, &__guard)
+                    {
                         StepOutcome::Done(d) => d,
                         StepOutcome::Err(e) => return StepOutcome::err(e),
                         _ => return StepOutcome::err(step_engine::Errno::EIO),
@@ -503,7 +509,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for RenameOp<'a> {
                 let new_parent = if new_parent_path.is_empty() {
                     rooted_at
                 } else {
-                    match walker::step_walk(rooted_at, new_parent_path, self.cred, self.guard) {
+                    match walker::step_walk(rooted_at, new_parent_path, self.cred, &__guard) {
                         StepOutcome::Done(d) => d,
                         StepOutcome::Err(e) => return StepOutcome::err(e),
                         _ => return StepOutcome::err(step_engine::Errno::EIO),
@@ -513,23 +519,17 @@ impl<'a, I: SubjectIdentity> StepOp<I> for RenameOp<'a> {
                     Ok(n) => n,
                     Err(_) => return StepOutcome::err(step_engine::Errno::ENAMETOOLONG),
                 };
-                self.state = Some((
-                    old_parent.clone(),
-                    old_name.clone(),
-                    new_parent.clone(),
-                    new_name.clone(),
-                ));
+                self.state = Some((old_parent.clone(), old_name, new_parent.clone(), new_name));
                 (old_parent, old_name, new_parent, new_name)
             }
         };
-        let fs_ops =
-            walker::fs_ops_for(&old_parent, self.guard).expect("NoFsOps for RenameOp");
+        let fs_ops = walker::fs_ops_for(&old_parent, &__guard).expect("NoFsOps for RenameOp");
         fs_ops.rename(
             old_parent.rnode().fs_object_id(),
             old_name.as_bytes(),
             new_parent.rnode().fs_object_id(),
             new_name.as_bytes(),
-            self.guard,
+            &__guard,
         )
     }
 }
@@ -546,7 +546,6 @@ pub struct TruncateOp<'a> {
     pub path: &'a [u8],
     pub length: u64,
     pub cred: &'a Credential,
-    pub guard: &'a Guard<'a>,
     pub target: Option<Cap<DEntry>>,
 }
 
@@ -555,11 +554,12 @@ impl<'a, I: SubjectIdentity> StepOp<I> for TruncateOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        let __guard = step_engine::guard();
         let target = match self.target.take() {
             Some(d) => d,
             None => {
                 let rooted_at = self.rooted_at.clone();
-                let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
+                let d = match walker::step_walk(rooted_at, self.path, self.cred, &__guard) {
                     StepOutcome::Done(d) => d,
                     StepOutcome::Err(e) => return StepOutcome::err(e),
                     _ => return StepOutcome::err(step_engine::Errno::EIO),
@@ -570,17 +570,16 @@ impl<'a, I: SubjectIdentity> StepOp<I> for TruncateOp<'a> {
         };
         let page_backing = {
             let weak = target.rnode().containing_mount_weak();
-            match weak.and_then(|w| w.upgrade(self.guard)) {
+            match weak.and_then(|w| w.upgrade(&__guard)) {
                 Some(mp) => mp.fs_page_backing().clone(),
                 None => return StepOutcome::err(step_engine::Errno::ENODEV),
             }
         };
-        page_backing.truncate(target.rnode().fs_object_id(), self.length, self.guard)
+        page_backing.truncate(target.rnode().fs_object_id(), self.length, &__guard)
     }
 }
 impl OneShotStepOp<ProcessIdentity> for TruncateOp<'_> {}
 impl OneShotStepOp<crate::process::ProcessIdentity> for TruncateOp<'_> {}
-
 
 // ============================================================================
 // StatOp — newfstatat / fstat
@@ -590,7 +589,6 @@ pub struct StatOp<'a> {
     pub rooted_at: &'a Cap<DEntry>,
     pub path: &'a [u8],
     pub cred: &'a Credential,
-    pub guard: &'a Guard<'a>,
     pub target: Option<Cap<DEntry>>,
 }
 
@@ -598,12 +596,16 @@ impl<'a, I: SubjectIdentity> StepOp<I> for StatOp<'a> {
     type Output = (InodeMeta, FsObjectId);
     type Progress = NoProgress;
 
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(InodeMeta, FsObjectId), NoProgress> {
+    fn step(
+        &mut self,
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<(InodeMeta, FsObjectId), NoProgress> {
+        let __guard = step_engine::guard();
         let target = match self.target.take() {
             Some(d) => d,
             None => {
                 let rooted_at = self.rooted_at.clone();
-                let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
+                let d = match walker::step_walk(rooted_at, self.path, self.cred, &__guard) {
                     StepOutcome::Done(d) => d,
                     StepOutcome::Err(e) => return StepOutcome::err(e),
                     _ => return StepOutcome::err(step_engine::Errno::EIO),
@@ -612,8 +614,22 @@ impl<'a, I: SubjectIdentity> StepOp<I> for StatOp<'a> {
                 d
             }
         };
-        let meta = target.rnode().meta();
+        // Prefer the FS's live metadata so writes that grow a file
+        // (`pc.grow_size_to` inside `step_write_from_*`) surface as
+        // the correct `st_size`. The cached `target.rnode().meta()`
+        // is the snapshot from materialisation time and doesn't see
+        // in-place writes.
         let ino = target.rnode().fs_object_id();
+        let meta = match target.rnode().containing_mount_weak() {
+            Some(weak) => match weak.upgrade(&__guard) {
+                Some(payload) => match payload.fs_ops().load_inode_meta(ino, &__guard) {
+                    StepOutcome::Done(m) => m,
+                    _ => target.rnode().meta(),
+                },
+                None => target.rnode().meta(),
+            },
+            None => target.rnode().meta(),
+        };
         StepOutcome::done((meta, ino))
     }
 }
@@ -629,7 +645,6 @@ pub struct LstatOp<'a> {
     pub rooted_at: &'a Cap<DEntry>,
     pub path: &'a [u8],
     pub cred: &'a Credential,
-    pub guard: &'a Guard<'a>,
     pub target: Option<Cap<DEntry>>,
 }
 
@@ -638,6 +653,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for LstatOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<InodeMeta, NoProgress> {
+        let __guard = step_engine::guard();
         let target = match self.target.take() {
             Some(d) => d,
             None => {
@@ -648,7 +664,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for LstatOp<'a> {
                     super::resolution::state::WalkMode::EntityUnfollowed,
                     super::resolution::state::FinalSymlinkPolicy::NoFollow,
                     self.cred,
-                    self.guard,
+                    &__guard,
                 ) {
                     Ok(resolved) => resolved.dentry,
                     Err(e) => return StepOutcome::err(e.into()),
@@ -672,7 +688,6 @@ pub struct StatxOp<'a> {
     pub rooted_at: &'a Cap<DEntry>,
     pub path: &'a [u8],
     pub cred: &'a Credential,
-    pub guard: &'a Guard<'a>,
     pub target: Option<Cap<DEntry>>,
 }
 
@@ -685,12 +700,16 @@ impl<'a, I: SubjectIdentity> StepOp<I> for StatxOp<'a> {
     type Output = (StatxResult, FsObjectId);
     type Progress = NoProgress;
 
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(StatxResult, FsObjectId), NoProgress> {
+    fn step(
+        &mut self,
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<(StatxResult, FsObjectId), NoProgress> {
+        let __guard = step_engine::guard();
         let target = match self.target.take() {
             Some(d) => d,
             None => {
                 let rooted_at = self.rooted_at.clone();
-                let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
+                let d = match walker::step_walk(rooted_at, self.path, self.cred, &__guard) {
                     StepOutcome::Done(d) => d,
                     StepOutcome::Err(e) => return StepOutcome::err(e),
                     _ => return StepOutcome::err(step_engine::Errno::EIO),
@@ -716,7 +735,6 @@ pub struct ReadLinkOp<'a> {
     pub rooted_at: &'a Cap<DEntry>,
     pub path: &'a [u8],
     pub cred: &'a Credential,
-    pub guard: &'a Guard<'a>,
     pub target: Option<Cap<DEntry>>,
 }
 
@@ -725,11 +743,12 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ReadLinkOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Box<[u8]>, NoProgress> {
+        let __guard = step_engine::guard();
         let target = match self.target.take() {
             Some(d) => d,
             None => {
                 let rooted_at = self.rooted_at.clone();
-                let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
+                let d = match walker::step_walk(rooted_at, self.path, self.cred, &__guard) {
                     StepOutcome::Done(d) => d,
                     StepOutcome::Err(e) => return StepOutcome::err(e),
                     _ => return StepOutcome::err(step_engine::Errno::EIO),
@@ -738,9 +757,8 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ReadLinkOp<'a> {
                 d
             }
         };
-        let fs_ops =
-            walker::fs_ops_for(&target, self.guard).expect("NoFsOps for ReadLinkOp");
-        fs_ops.read_link(target.rnode().fs_object_id(), self.guard)
+        let fs_ops = walker::fs_ops_for(&target, &__guard).expect("NoFsOps for ReadLinkOp");
+        fs_ops.read_link(target.rnode().fs_object_id(), &__guard)
     }
 }
 
@@ -761,7 +779,6 @@ pub struct Getdents64Op<'a> {
     pub rooted_at: &'a Cap<DEntry>,
     pub path: &'a [u8],
     pub cred: &'a Credential,
-    pub guard: &'a Guard<'a>,
     /// Output buffer — caller provides.
     pub buf: &'a mut [u8],
     // Internal state
@@ -778,6 +795,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for Getdents64Op<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<usize, NoProgress> {
+        let __guard = step_engine::guard();
         let target = match self.target.take() {
             Some(d) => {
                 self.target = Some(d.clone());
@@ -785,7 +803,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for Getdents64Op<'a> {
             }
             None => {
                 let rooted_at = self.rooted_at.clone();
-                let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
+                let d = match walker::step_walk(rooted_at, self.path, self.cred, &__guard) {
                     StepOutcome::Done(d) => d,
                     StepOutcome::Err(e) => return StepOutcome::err(e),
                     _ => return StepOutcome::err(step_engine::Errno::EIO),
@@ -795,13 +813,12 @@ impl<'a, I: SubjectIdentity> StepOp<I> for Getdents64Op<'a> {
             }
         };
 
-        let fs_ops =
-            walker::fs_ops_for(&target, self.guard).expect("NoFsOps for Getdents64Op");
+        let fs_ops = walker::fs_ops_for(&target, &__guard).expect("NoFsOps for Getdents64Op");
         let fs_object_id = target.rnode().fs_object_id();
 
         let cursor = crate::vfs::structure::DirCursor::from_u64(self.cursor);
 
-        match fs_ops.readdir(fs_object_id, cursor, self.guard) {
+        match fs_ops.readdir(fs_object_id, cursor, &__guard) {
             StepOutcome::Done(Some((entry, next_cursor))) => {
                 let name_bytes = entry.name.as_bytes();
                 let reclen = DIRENT64_HEADER_SIZE + name_bytes.len() + 1; // +1 for null terminator
@@ -823,13 +840,13 @@ impl<'a, I: SubjectIdentity> StepOp<I> for Getdents64Op<'a> {
                 buf[16..18].copy_from_slice(&(aligned as u16).to_le_bytes());
                 // d_type
                 buf[18] = match entry.kind {
-                    crate::vfs::structure::InodeKind::Regular => 8u8,  // DT_REG
+                    crate::vfs::structure::InodeKind::Regular => 8u8, // DT_REG
                     crate::vfs::structure::InodeKind::Directory => 4u8, // DT_DIR
                     crate::vfs::structure::InodeKind::Symlink => 10u8, // DT_LNK
                     crate::vfs::structure::InodeKind::CharDevice => 2u8, // DT_CHR
                     crate::vfs::structure::InodeKind::BlockDevice => 6u8, // DT_BLK
-                    crate::vfs::structure::InodeKind::Fifo => 1u8,     // DT_FIFO
-                    crate::vfs::structure::InodeKind::Socket => 12u8,  // DT_SOCK
+                    crate::vfs::structure::InodeKind::Fifo => 1u8,    // DT_FIFO
+                    crate::vfs::structure::InodeKind::Socket => 12u8, // DT_SOCK
                 };
                 // d_name
                 buf[19..19 + name_bytes.len()].copy_from_slice(name_bytes);
@@ -866,7 +883,6 @@ impl<'a, I: SubjectIdentity> StepOp<I> for Getdents64Op<'a> {
 /// syscall layer).  Each `step()` fills one entry; EOF returns 0.
 pub struct Getdents64FdOp<'a> {
     pub file: &'a Cap<crate::vfs::structure::OpenFile>,
-    pub guard: &'a Guard<'a>,
     pub buf: &'a mut [u8],
     cursor: u64,
     pos: usize,
@@ -877,14 +893,14 @@ impl<'a, I: SubjectIdentity> StepOp<I> for Getdents64FdOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<usize, NoProgress> {
+        let __guard = step_engine::guard();
         let rnode = self.file.rnode();
         let fs_object_id = rnode.fs_object_id();
-        let fs_ops = walker::fs_ops_for_rnode(rnode, self.guard)
-            .expect("NoFsOps for Getdents64FdOp");
+        let fs_ops = walker::fs_ops_for_rnode(rnode, &__guard).expect("NoFsOps for Getdents64FdOp");
 
         let cursor = crate::vfs::structure::DirCursor::from_u64(self.cursor);
 
-        match fs_ops.readdir(fs_object_id, cursor, self.guard) {
+        match fs_ops.readdir(fs_object_id, cursor, &__guard) {
             StepOutcome::Done(Some((entry, next_cursor))) => {
                 let name_bytes = entry.name.as_bytes();
                 let reclen = 19 + name_bytes.len() + 1;
@@ -940,8 +956,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for Getdents64FdOp<'a> {
 /// v1: single fd only.  Yields [`YieldShape::OnWaitSource`] with the
 /// fd's wait-source id; `drive()` parks on the reactor mailbox until
 /// the fd's `WaitSource` fires, then returns `Done(1)` (ready).
-pub struct PpollOp<'a> {
-    pub guard: &'a Guard<'a>,
+pub struct PpollOp {
     /// `WaitSourceId` of the fd to park on.
     pub wait_source_id: WaitSourceId,
     /// Interest mask for the wait registration.
@@ -952,7 +967,7 @@ pub struct PpollOp<'a> {
     pub started: bool,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I> for PpollOp<'a> {
+impl<I: SubjectIdentity> StepOp<I> for PpollOp {
     type Output = usize;
     type Progress = NoProgress;
 

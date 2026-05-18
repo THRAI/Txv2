@@ -17,11 +17,10 @@ use crate::vfs::adapter::step_engine::{
 };
 
 use super::structure::{
-    Credential, DEntry, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFile,
-    OpenFileBacking, OpenFileFlags, OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult, RNode,
-    RNodeBacking, StructPayload,
+    Credential, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileBacking, OpenFileIoctl,
+    OpenFileIoctlCaller, OpenFileIoctlResult, RNodeBacking, StructPayload,
 };
-use crate::mount::{MountIdentity, MountPayload};
+use crate::mount::MountPayload;
 
 // === FsOps — emits step_v3 outcomes ==================================
 //
@@ -173,15 +172,24 @@ pub trait FsOps: Send + Sync + 'static {
     }
 
     /// Backend hook for materialising an `RNode` for a non-directory,
-    /// non-symlink inode. Default returns `ENOSYS` (parity with
-    /// [`FsOps::materialise_rnode`]).
+    /// non-symlink inode. Implementations MUST stamp the returned
+    /// `Cap<RNode>` with `mount` so the walker can resolve the
+    /// in-scope `FsOps` for the resulting dentry via
+    /// `containing_mount_weak()`. Use
+    /// [`RNode::new_cap_in_mount`] (not `RNode::new_cap`).
+    ///
+    /// Without this stamp, `walker::fs_ops_for(target)` returns
+    /// `None` and any subsequent op against the file (chmod, chown,
+    /// statx, etc.) panics with `NoFsOps for ChmodOp`. Default
+    /// returns `ENOSYS`.
     fn materialise_rnode(
         &self,
         fs_object_id: FsObjectId,
         meta: InodeMeta,
+        mount: &Cap<MountPayload>,
         guard: &Guard<'_>,
     ) -> StepOutcome<Cap<crate::vfs::structure::RNode>, NoProgress> {
-        let _ = (fs_object_id, meta, guard);
+        let _ = (fs_object_id, meta, mount, guard);
         StepOutcome::err(Errno::ENOSYS)
     }
 
@@ -315,17 +323,19 @@ impl OpenFile {
             RNodeBacking::PageBacked { pc } => {
                 crate::page_backed::step_read_to_kernel(pc, self, out, guard)
             }
-            RNodeBacking::Symlink { .. } => {
-                StepOutcome::Err(Errno::ENOSYS)
-            }
+            RNodeBacking::Symlink { .. } => StepOutcome::Err(Errno::ENOSYS),
             RNodeBacking::Projected => {
                 let rnode = self.rnode();
                 let off = self.offset();
-                match rnode.containing_mount_weak().and_then(|mw| mw.upgrade(guard)) {
+                match rnode
+                    .containing_mount_weak()
+                    .and_then(|mw| mw.upgrade(guard))
+                {
                     Some(mp) => {
-                        match mp.fs_ops().step_read_projected(
-                            rnode.fs_object_id(), off, out, guard,
-                        ) {
+                        match mp
+                            .fs_ops()
+                            .step_read_projected(rnode.fs_object_id(), off, out, guard)
+                        {
                             StepOutcome::Done(n) => {
                                 self.set_offset(off + n);
                                 StepOutcome::Done(n as usize)
@@ -634,10 +644,14 @@ fn step_tty_ioctl(
 // step_read::ReadOp`).
 
 /// `StepOp` wrap of [`OpenFile::step_read`].
+///
+/// Per `STEP_MODEL_v2` §1 + `INVARIANTS_v5` YIELD-5/EBR-7, each `step()`
+/// call acquires its own epoch guard; the op carries no `&Guard` field
+/// so the wrapping future is `Send` (the reactor contract) and the
+/// guard never crosses `.await`.
 pub struct OpenFileReadOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub out: &'a mut [u8],
-    pub guard: &'a Guard<'a>,
     /// Internal write cursor: each `step()` call fills bytes starting
     /// at `out[cursor..]` and advances `cursor` by the amount returned
     /// in the outcome. This allows `drive()` to call `step()` multiple
@@ -650,14 +664,15 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        let result = self.file.step_read(&mut self.out[self.cursor..], self.guard);
+        let guard = step_engine::guard();
+        let result = self.file.step_read(&mut self.out[self.cursor..], &guard);
         // Advance cursor by the bytes read in this step. The
         // `StepProgress` accumulator (ByteProgress) carries the same
         // value, so `drive()`'s `accumulated` stays in sync with the
         // actual fill position.
         match &result {
             StepOutcome::Done(n) => {
-                self.cursor += *n as usize;
+                self.cursor += *n;
             }
             StepOutcome::Continue { progress } => {
                 self.cursor += progress.bytes();
@@ -677,14 +692,14 @@ pub struct OpenFileLseekOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub offset: i64,
     pub whence: u32,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileLseekOp<'a> {
     type Output = u64;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        self.file.step_lseek(self.offset, self.whence, self.guard)
+        let __guard = step_engine::guard();
+        self.file.step_lseek(self.offset, self.whence, &__guard)
     }
 }
 
@@ -692,10 +707,11 @@ impl OneShotStepOp for OpenFileLseekOp<'_> {}
 impl OneShotStepOp<crate::process::ProcessIdentity> for OpenFileLseekOp<'_> {}
 
 /// `StepOp` wrap of [`OpenFile::step_write`].
+///
+/// Each `step()` call acquires its own epoch guard (STEP_MODEL_v2 §1).
 pub struct OpenFileWriteOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub bytes: &'a [u8],
-    pub guard: &'a Guard<'a>,
     /// Internal write cursor: each `step()` call consumes bytes starting
     /// at `bytes[cursor..]`. Mirrors `OpenFileReadOp::cursor`.
     pub cursor: usize,
@@ -705,10 +721,11 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        let result = self.file.step_write(&self.bytes[self.cursor..], self.guard);
+        let guard = step_engine::guard();
+        let result = self.file.step_write(&self.bytes[self.cursor..], &guard);
         match &result {
             StepOutcome::Done(n) => {
-                self.cursor += *n as usize;
+                self.cursor += *n;
             }
             StepOutcome::Continue { progress } => {
                 self.cursor += progress.bytes();
@@ -728,14 +745,14 @@ pub struct OpenFileIoctlOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub caller: OpenFileIoctlCaller<'a>,
     pub request: OpenFileIoctl<'a>,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileIoctlOp<'a> {
     type Output = OpenFileIoctlResult;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        self.file.step_ioctl(self.caller, self.request, self.guard)
+        let __guard = step_engine::guard();
+        self.file.step_ioctl(self.caller, self.request, &__guard)
     }
 }
 
@@ -857,7 +874,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FlockOp<'a> {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         match self.file.flock_acquire(self.lock_type, self.blocking) {
             Ok(()) => StepOutcome::Done(()),
-            Err(e) => StepOutcome::Err(e),
+            Err(e) => StepOutcome::Err(e.into()),
         }
     }
 }
@@ -865,23 +882,32 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FlockOp<'a> {
 impl OneShotStepOp for FlockOp<'_> {}
 impl OneShotStepOp<crate::process::ProcessIdentity> for FlockOp<'_> {}
 
-/// `StepOp` wrap for per-file `fsync` via `PageBacking::fsync`.
-pub struct FileFsyncOp<'a> {
+/// `StepOp` wrap for per-file `fsync` via `FsPageBacking::fsync_file`.
+///
+/// Each `step()` acquires its own epoch guard (STEP_MODEL_v2 §1) so
+/// the op is `Send` and the driving future satisfies the reactor's
+/// `Send + 'static` bound (REACTOR_v0, INVARIANTS_v5 EBR-7).
+pub struct FileFsyncOp {
     pub page_backing: alloc::sync::Arc<dyn crate::page_backed::FsPageBacking>,
     pub fs_object_id: super::structure::FsObjectId,
-    pub guard: &'a crate::execution::Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I> for FileFsyncOp<'a> {
+impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
     type Output = ();
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         use StepOutcome as V3;
-        match self.page_backing.fsync(self.fs_object_id, self.guard) {
+        let guard = step_engine::guard();
+        match self.page_backing.fsync_file(self.fs_object_id, &guard) {
             V3::Done(()) => V3::Done(()),
             V3::Err(e) => V3::Err(e),
-            V3::Continue { .. } => V3::Continue { progress: NoProgress },
-            V3::Yield { shape, .. } => V3::Yield { progress: NoProgress, shape },
+            V3::Continue { .. } => V3::Continue {
+                progress: NoProgress,
+            },
+            V3::Yield { shape, .. } => V3::Yield {
+                progress: NoProgress,
+                shape,
+            },
         }
     }
 }
@@ -898,12 +924,13 @@ mod step_op_wraps {
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
     use crate::vfs::adapter::step_engine::{
-        guard, reserve_for, sign_for, Cap, PayloadCap, ProcessIdentity, ScriptCtx, StepOp,
+        reserve_for, sign_for, Cap, PayloadCap, ProcessIdentity, ScriptCtx, StepOp,
         StepOutcome as V3,
     };
     use crate::vfs::structure::{
-        FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, OpenFileIoctl,
-        OpenFileIoctlCaller, OpenFileIoctlResult, RNode, RNodeBacking, StructPayload,
+        DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFile, OpenFileFlags,
+        OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult, RNode, RNodeBacking,
+        StructPayload,
     };
     use crate::zones;
 
@@ -1022,13 +1049,11 @@ mod step_op_wraps {
     #[test]
     fn read_op_delegates_to_step_read() {
         let _g = setup();
-        let guard = guard();
         let file = make_char_open_file(true, false);
         let mut buf = [0u8; 4];
         let mut op = OpenFileReadOp {
             file: &file,
             out: &mut buf,
-            guard: &guard,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1044,13 +1069,11 @@ mod step_op_wraps {
     #[test]
     fn read_op_propagates_einval_when_not_readable() {
         let _g = setup();
-        let guard = guard();
         let file = make_char_open_file(false, true);
         let mut buf = [0u8; 4];
         let mut op = OpenFileReadOp {
             file: &file,
             out: &mut buf,
-            guard: &guard,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1063,12 +1086,10 @@ mod step_op_wraps {
     #[test]
     fn write_op_delegates_to_step_write() {
         let _g = setup();
-        let guard = guard();
         let file = make_char_open_file(false, true);
         let mut op = OpenFileWriteOp {
             file: &file,
             bytes: b"hello",
-            guard: &guard,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1081,12 +1102,10 @@ mod step_op_wraps {
     #[test]
     fn write_op_propagates_einval_when_not_writable() {
         let _g = setup();
-        let guard = guard();
         let file = make_char_open_file(true, false);
         let mut op = OpenFileWriteOp {
             file: &file,
             bytes: b"hi",
-            guard: &guard,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1099,13 +1118,11 @@ mod step_op_wraps {
     #[test]
     fn lseek_op_on_non_seekable_returns_espipe() {
         let _g = setup();
-        let guard = guard();
         let file = make_char_open_file(true, false);
         let mut op = OpenFileLseekOp {
             file: &file,
             offset: 0,
             whence: 0,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
@@ -1117,13 +1134,11 @@ mod step_op_wraps {
     #[test]
     fn lseek_op_on_directory_returns_eisdir() {
         let _g = setup();
-        let guard = guard();
         let file = make_dir_open_file(true);
         let mut op = OpenFileLseekOp {
             file: &file,
             offset: 0,
             whence: 0,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
@@ -1135,7 +1150,6 @@ mod step_op_wraps {
     #[test]
     fn ioctl_op_on_chardev_returns_enosys() {
         let _g = setup();
-        let guard = guard();
         let file = make_char_open_file(true, true);
         // Construct an OpenFileIoctlCaller that does not require a real
         // process — `step_ioctl` short-circuits on chardev backings
@@ -1153,7 +1167,6 @@ mod step_op_wraps {
             file: &file,
             caller,
             request: OpenFileIoctl::Tcgets,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
@@ -1162,120 +1175,126 @@ mod step_op_wraps {
         }
     }
 
-// === Bootstrap helpers (initramfs unpack) =============================
-//
-// Synchronous helpers that call `FsOps` and materialise `DEntry` /
-// `RNode` / `OpenFile` without going through the VFS walker. Used
-// by the initramfs cpio unpacker and other boot-time VFS population.
-// These are NOT step ops — they drive FsOps calls to completion
-// synchronously (bootstrap-only; production uses the walker).
+    // === Bootstrap helpers (initramfs unpack) =============================
+    //
+    // Synchronous helpers that call `FsOps` and materialise `DEntry` /
+    // `RNode` / `OpenFile` without going through the VFS walker. Used
+    // by the initramfs cpio unpacker and other boot-time VFS population.
+    // These are NOT step ops — they drive FsOps calls to completion
+    // synchronously (bootstrap-only; production uses the walker).
 
-/// Create a directory under `parent_dentry`.
-/// Returns the new `Cap<DEntry>`.
-pub fn kernel_mkdir(
-    parent_dentry: &Cap<DEntry>,
-    mount_payload: &Cap<MountPayload>,
-    name: &[u8],
-    mode: u16,
-    guard: &Guard<'_>,
-) -> Result<Cap<DEntry>, Errno> {
-    let fs_ops = mount_payload.fs_ops();
-    let parent_fs_id = parent_dentry.rnode().fs_object_id();
-    let cred = Credential::root();
+    /// Create a directory under `parent_dentry`.
+    /// Returns the new `Cap<DEntry>`.
+    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
+    pub fn kernel_mkdir(
+        parent_dentry: &Cap<DEntry>,
+        mount_payload: &Cap<MountPayload>,
+        name: &[u8],
+        mode: u16,
+        guard: &Guard<'_>,
+    ) -> Result<Cap<DEntry>, Errno> {
+        let fs_ops = mount_payload.fs_ops();
+        let parent_fs_id = parent_dentry.rnode().fs_object_id();
+        let cred = Credential::root();
 
-    let (child_fs_id, meta) = match fs_ops.mkdir(parent_fs_id, name, mode, &cred, guard) {
-        StepOutcome::Done(v) => v,
-        StepOutcome::Err(e) => return Err(e),
-        _ => return Err(Errno::EIO),
-    };
+        let (child_fs_id, meta) = match fs_ops.mkdir(parent_fs_id, name, mode, &cred, guard) {
+            StepOutcome::Done(v) => v,
+            StepOutcome::Err(e) => return Err(e),
+            _ => return Err(Errno::EIO),
+        };
 
-    let rnode = match fs_ops.materialise_rnode(child_fs_id, meta, guard) {
-        StepOutcome::Done(r) => r,
-        StepOutcome::Err(e) => return Err(e),
-        _ => return Err(Errno::EIO),
-    };
+        let rnode = match fs_ops.materialise_rnode(child_fs_id, meta, mount_payload, guard) {
+            StepOutcome::Done(r) => r,
+            StepOutcome::Err(e) => return Err(e),
+            _ => return Err(Errno::EIO),
+        };
 
-    let iname = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
-    let dentry = DEntry::new(iname, rnode);
-    step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)
-}
+        let iname = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
+        let dentry = DEntry::new(iname, rnode);
+        step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)
+    }
 
-/// Create a regular file under `parent_dentry` and open it.
-/// Returns `(DEntry, OpenFile)`.
-pub fn kernel_create(
-    parent_dentry: &Cap<DEntry>,
-    mount_payload: &Cap<MountPayload>,
-    name: &[u8],
-    mode: u16,
-    guard: &Guard<'_>,
-) -> Result<(Cap<DEntry>, Cap<OpenFile>), Errno> {
-    let fs_ops = mount_payload.fs_ops();
-    let parent_fs_id = parent_dentry.rnode().fs_object_id();
-    let cred = Credential::root();
+    /// Create a regular file under `parent_dentry` and open it.
+    /// Returns `(DEntry, OpenFile)`.
+    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
+    pub fn kernel_create(
+        parent_dentry: &Cap<DEntry>,
+        mount_payload: &Cap<MountPayload>,
+        name: &[u8],
+        mode: u16,
+        guard: &Guard<'_>,
+    ) -> Result<(Cap<DEntry>, Cap<OpenFile>), Errno> {
+        let fs_ops = mount_payload.fs_ops();
+        let parent_fs_id = parent_dentry.rnode().fs_object_id();
+        let cred = Credential::root();
 
-    let (child_fs_id, meta) = match fs_ops.create_inode(parent_fs_id, name, mode, &cred, guard) {
-        StepOutcome::Done(v) => v,
-        StepOutcome::Err(e) => return Err(e),
-        _ => return Err(Errno::EIO),
-    };
+        let (child_fs_id, meta) = match fs_ops.create_inode(parent_fs_id, name, mode, &cred, guard)
+        {
+            StepOutcome::Done(v) => v,
+            StepOutcome::Err(e) => return Err(e),
+            _ => return Err(Errno::EIO),
+        };
 
-    let rnode = match fs_ops.materialise_rnode(child_fs_id, meta, guard) {
-        StepOutcome::Done(r) => r,
-        StepOutcome::Err(e) => return Err(e),
-        _ => return Err(Errno::EIO),
-    };
+        let rnode = match fs_ops.materialise_rnode(child_fs_id, meta, mount_payload, guard) {
+            StepOutcome::Done(r) => r,
+            StepOutcome::Err(e) => return Err(e),
+            _ => return Err(Errno::EIO),
+        };
 
-    let iname = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
-    let dentry = DEntry::new(iname, rnode.clone());
-    let dentry_cap = step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)?;
+        let iname = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
+        let dentry = DEntry::new(iname, rnode.clone());
+        let dentry_cap = step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)?;
 
-    let open_file = OpenFile::new_cap(rnode, OpenFileFlags {
-        read: false,
-        write: true,
-        append: false,
-        cloexec: false,
-        nonblocking: false,
-    })
+        let open_file = OpenFile::new_cap(
+            rnode,
+            OpenFileFlags {
+                read: false,
+                write: true,
+                append: false,
+                cloexec: false,
+                nonblocking: false,
+            },
+        )
         .map_err(|_| Errno::ENOMEM)?;
 
-    Ok((dentry_cap, open_file))
-}
+        Ok((dentry_cap, open_file))
+    }
 
-/// Create a symlink under `parent_dentry`.
-pub fn kernel_symlink(
-    parent_dentry: &Cap<DEntry>,
-    mount_payload: &Cap<MountPayload>,
-    name: &[u8],
-    target: &[u8],
-    guard: &Guard<'_>,
-) -> Result<Cap<DEntry>, Errno> {
-    let fs_ops = mount_payload.fs_ops();
-    let parent_fs_id = parent_dentry.rnode().fs_object_id();
-    let cred = Credential::root();
+    /// Create a symlink under `parent_dentry`.
+    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
+    pub fn kernel_symlink(
+        parent_dentry: &Cap<DEntry>,
+        mount_payload: &Cap<MountPayload>,
+        name: &[u8],
+        target: &[u8],
+        guard: &Guard<'_>,
+    ) -> Result<Cap<DEntry>, Errno> {
+        let fs_ops = mount_payload.fs_ops();
+        let parent_fs_id = parent_dentry.rnode().fs_object_id();
+        let cred = Credential::root();
 
-    let (child_fs_id, meta) = match fs_ops.symlink(parent_fs_id, name, target, &cred, guard) {
-        StepOutcome::Done(v) => v,
-        StepOutcome::Err(e) => return Err(e),
-        _ => return Err(Errno::EIO),
-    };
+        let (child_fs_id, meta) = match fs_ops.symlink(parent_fs_id, name, target, &cred, guard) {
+            StepOutcome::Done(v) => v,
+            StepOutcome::Err(e) => return Err(e),
+            _ => return Err(Errno::EIO),
+        };
 
-    let rnode = match fs_ops.materialise_rnode(child_fs_id, meta, guard) {
-        StepOutcome::Done(r) => r,
-        StepOutcome::Err(e) => return Err(e),
-        _ => return Err(Errno::EIO),
-    };
+        let rnode = match fs_ops.materialise_rnode(child_fs_id, meta, mount_payload, guard) {
+            StepOutcome::Done(r) => r,
+            StepOutcome::Err(e) => return Err(e),
+            _ => return Err(Errno::EIO),
+        };
 
-    let iname = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
-    let dentry = DEntry::new(iname, rnode);
-    step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)
-}
+        let iname = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
+        let dentry = DEntry::new(iname, rnode);
+        step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)
+    }
 
-// === tests =============================================================
+    // === tests =============================================================
 
     #[test]
     fn ioctl_op_on_tty_returns_termios() {
         let _g = setup();
-        let guard = guard();
         let file = make_tty_open_file(true, true, 7, "ttyS7-wraptest");
         crate::process::execution::reset_init_process_for_test();
         crate::process::structure::reset_pid_counter_for_test();
@@ -1289,7 +1308,6 @@ pub fn kernel_symlink(
             file: &file,
             caller,
             request: OpenFileIoctl::Tcgets,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {

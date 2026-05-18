@@ -1,12 +1,11 @@
 //! Content renderers for procfs pseudo-files.
 
-use alloc::string::String;
-use tx_subsystems::mount;
-use tx_subsystems::process::{self, Pid};
 use crate::procfs::{
-    pid_from_cmdline_id, pid_from_maps_id, pid_from_stat_id, PROCFS_CPUINFO_ID,
-    PROCFS_MOUNTS_ID, PROCFS_UPTIME_ID,
+    pid_from_cmdline_id, pid_from_maps_id, pid_from_stat_id, PROCFS_CPUINFO_ID, PROCFS_MOUNTS_ID,
+    PROCFS_UPTIME_ID,
 };
+use alloc::string::String;
+use tx_subsystems::process::{self, Pid};
 use tx_subsystems::vfs::FsObjectId;
 
 pub fn render(fs_object_id: FsObjectId) -> String {
@@ -36,15 +35,19 @@ fn render_stat(pid: Pid) -> String {
     let session = proc.pgrp_cap().session_cap().sid;
 
     let buf = proc.comm();
-    let comm = core::str::from_utf8(
-        &buf[..buf.iter().position(|&b| b == 0).unwrap_or(16)]
-    ).unwrap_or("?");
+    let comm =
+        core::str::from_utf8(&buf[..buf.iter().position(|&b| b == 0).unwrap_or(16)]).unwrap_or("?");
 
     let state = proc.state_char() as char;
 
     alloc::format!(
         "{} ({}) {} {} {} {}\n",
-        pid.0, comm, state, ppid.0, pgrp.0, session.0
+        pid.0,
+        comm,
+        state,
+        ppid.0,
+        pgrp.0,
+        session.0
     )
 }
 
@@ -123,6 +126,7 @@ fn render_maps(pid: Pid) -> String {
     out
 }
 
+#[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
 pub fn render_meminfo() -> String {
     String::from("MemTotal: 0 kB\nMemFree: 0 kB\n")
 }

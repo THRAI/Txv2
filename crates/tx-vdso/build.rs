@@ -10,7 +10,7 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -33,11 +33,13 @@ fn main() {
 
     // 2. Extract .text bytes
     let text_bin = out_dir.join("text.bin");
-    let objcopy = find_tool("riscv64-linux-musl-objcopy")
-        .expect("objcopy not found alongside assembler");
+    let objcopy =
+        find_tool("riscv64-linux-musl-objcopy").expect("objcopy not found alongside assembler");
     run(Command::new(&objcopy)
-        .arg("-O").arg("binary")
-        .arg("-j").arg(".text")
+        .arg("-O")
+        .arg("binary")
+        .arg("-j")
+        .arg(".text")
         .arg(&obj)
         .arg(&text_bin));
 
@@ -50,8 +52,11 @@ fn main() {
     let elf = build_vdso_elf(&text_bytes, &syms);
     fs::write(&vdso_so, &elf).expect("write vdso.so");
 
-    println!("cargo:warning=[tx-vdso] {:.1} KiB vDSO ({sym_count} symbols)",
-             elf.len() as f64 / 1024.0, sym_count = syms.len());
+    println!(
+        "cargo:warning=[tx-vdso] {:.1} KiB vDSO ({sym_count} symbols)",
+        elf.len() as f64 / 1024.0,
+        sym_count = syms.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -59,21 +64,17 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 fn find_tool(name: &str) -> Option<String> {
-    Command::new("which")
-        .arg(name)
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                let s = String::from_utf8_lossy(&o.stdout);
-                Some(s.trim().to_string())
-            } else {
-                None
-            }
-        })
+    Command::new("which").arg(name).output().ok().and_then(|o| {
+        if o.status.success() {
+            let s = String::from_utf8_lossy(&o.stdout);
+            Some(s.trim().to_string())
+        } else {
+            None
+        }
+    })
 }
 
-fn emit_stub(out_dir: &PathBuf) {
+fn emit_stub(out_dir: &Path) {
     println!("cargo:warning=[tx-vdso] RISC-V assembler not found; stub");
     fs::write(out_dir.join("vdso.so"), []).unwrap();
     println!("cargo:rustc-cfg=vdso_stub");
@@ -88,8 +89,7 @@ fn run(cmd: &mut Command) {
 }
 
 fn parse_symbols(obj: &PathBuf) -> Vec<(String, u64)> {
-    let objdump = find_tool("riscv64-linux-musl-objdump")
-        .expect("objdump not found");
+    let objdump = find_tool("riscv64-linux-musl-objdump").expect("objdump not found");
     let out = Command::new(&objdump)
         .arg("-t")
         .arg(obj)
@@ -229,33 +229,33 @@ fn build_vdso_elf(text: &[u8], symbols: &[(String, u64)]) -> Vec<u8> {
     dyn_entry(0, 0, &mut dynamic);
 
     let total = dynamic_off + dynamic_sz;
-    let padded = ((total + page_size - 1) / page_size) * page_size;
+    let padded = total.div_ceil(page_size) * page_size;
     let mut out = Vec::with_capacity(padded as usize);
 
     // ELF header
     out.extend_from_slice(b"\x7fELF"); // magic
-    out.push(2);                         // ELFCLASS64
-    out.push(1);                         // little-endian
-    out.push(1);                         // version
-    out.push(3);                         // ELFOSABI_LINUX
-    out.extend_from_slice(&[0u8; 8]);   // padding
-    out.extend_from_slice(&3u16.to_le_bytes());   // ET_DYN
+    out.push(2); // ELFCLASS64
+    out.push(1); // little-endian
+    out.push(1); // version
+    out.push(3); // ELFOSABI_LINUX
+    out.extend_from_slice(&[0u8; 8]); // padding
+    out.extend_from_slice(&3u16.to_le_bytes()); // ET_DYN
     out.extend_from_slice(&243u16.to_le_bytes()); // EM_RISCV
-    out.extend_from_slice(&1u32.to_le_bytes());   // version
-    out.extend_from_slice(&0u64.to_le_bytes());   // entry
-    out.extend_from_slice(&64u64.to_le_bytes());  // phoff
-    out.extend_from_slice(&0u64.to_le_bytes());   // shoff
-    out.extend_from_slice(&0u32.to_le_bytes());   // flags
-    out.extend_from_slice(&64u16.to_le_bytes());  // ehsize
-    out.extend_from_slice(&56u16.to_le_bytes());  // phentsize
-    out.extend_from_slice(&2u16.to_le_bytes());   // phnum
-    out.extend_from_slice(&0u16.to_le_bytes());   // shentsize
-    out.extend_from_slice(&0u16.to_le_bytes());   // shnum
-    out.extend_from_slice(&0u16.to_le_bytes());   // shstrndx
+    out.extend_from_slice(&1u32.to_le_bytes()); // version
+    out.extend_from_slice(&0u64.to_le_bytes()); // entry
+    out.extend_from_slice(&64u64.to_le_bytes()); // phoff
+    out.extend_from_slice(&0u64.to_le_bytes()); // shoff
+    out.extend_from_slice(&0u32.to_le_bytes()); // flags
+    out.extend_from_slice(&64u16.to_le_bytes()); // ehsize
+    out.extend_from_slice(&56u16.to_le_bytes()); // phentsize
+    out.extend_from_slice(&2u16.to_le_bytes()); // phnum
+    out.extend_from_slice(&0u16.to_le_bytes()); // shentsize
+    out.extend_from_slice(&0u16.to_le_bytes()); // shnum
+    out.extend_from_slice(&0u16.to_le_bytes()); // shstrndx
 
     // PT_LOAD
     out.extend_from_slice(&1u32.to_le_bytes());
-    out.extend_from_slice(&5u32.to_le_bytes());   // R|X
+    out.extend_from_slice(&5u32.to_le_bytes()); // R|X
     out.extend_from_slice(&0u64.to_le_bytes());
     out.extend_from_slice(&0u64.to_le_bytes());
     out.extend_from_slice(&0u64.to_le_bytes());
@@ -265,7 +265,7 @@ fn build_vdso_elf(text: &[u8], symbols: &[(String, u64)]) -> Vec<u8> {
 
     // PT_DYNAMIC
     out.extend_from_slice(&2u32.to_le_bytes());
-    out.extend_from_slice(&4u32.to_le_bytes());   // R
+    out.extend_from_slice(&4u32.to_le_bytes()); // R
     out.extend_from_slice(&dynamic_off.to_le_bytes());
     out.extend_from_slice(&dynamic_off.to_le_bytes());
     out.extend_from_slice(&dynamic_off.to_le_bytes());

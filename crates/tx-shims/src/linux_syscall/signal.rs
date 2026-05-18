@@ -6,7 +6,7 @@
 use super::*;
 use tx_subsystems::process::numbers::{resolve_pid_number, PidName};
 use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
-use tx_subsystems::signal::{KillOutcome, SignalTarget, deliver_posix_signal};
+use tx_subsystems::signal::{KillOutcome, SignalTarget};
 
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)` per `SIGNAL_v1` §3.
 ///
@@ -407,22 +407,36 @@ pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
 /// `rt_sigreturn(...)` — Linux RV64 generic ABI
 /// `__NR_rt_sigreturn = 139`.
 ///
-/// **Slice 7 carryover.** Returns `-ENOSYS` for now. The
-/// `SignalFrameIf::restore_signal_frame` / `read_signal_frame`
-/// surface in `tx-hal` requires a `TrapFrameMut<'_>` on the live
-/// trap frame and the user-stack pointer the kernel parked at
-/// signal-frame setup time; the `SyscallCtx` shape does not yet
-/// expose either. End-to-end wiring requires the trap-shell to invoke
-/// `SignalFrameIf` directly (bypassing this dispatcher) or pass the
-/// trap-frame pointer through the syscall context — both are out of
-/// scope for Slice 7. Real signal handlers are also not yet wired
-/// (no userspace handler trampoline path), so the carryover does not
-/// block any day-1 shell flow. `TODO(phase-signal-frame)`.
-/// Phase B: returns `SigreturnRestored` to wire the dispatch path
-/// without actual frame mechanics (TODO phase-signal-frame / Phase D).
-pub(super) fn sys_rt_sigreturn(_ctx: &SyscallCtx) -> SyscallResult {
-    // Phase B: dispatch plumbing only — actual SignalFrameIf restore
-    // (read_signal_frame + restore_signal_frame) lands in Phase D.
+/// Restore the pre-handler trap context that signal delivery parked
+/// in `payload.saved_signal_context` before flipping
+/// `saved_user_context` to the handler-entry context. After the
+/// handler `ret`s through the stack trampoline (`addi a7, 0, 139;
+/// ecall`), this syscall fires; we move the parked context back into
+/// `saved_user_context` so the thread re-enters userspace exactly
+/// where the signal interrupted it.
+///
+/// `SigreturnRestored` tells the syscall-return path in
+/// `thread_future` to skip its normal `pending_syscall_return` drain
+/// — the merged context's `a0` and `pc` come from the restored
+/// pre-signal snapshot, not the syscall's nominal return value.
+///
+/// Without this restore, the handler's "post-`ret`" path stays in
+/// the trampoline / signal-frame memory and the thread reads garbage
+/// off the signal stack — observed end-to-end as the busybox-sh
+/// SIGCHLD-handler crash on 2026-05-18 (root cause traced through
+/// the trap-trace serial log).
+///
+/// If no signal frame is in flight, the kernel has no parked
+/// context to restore. POSIX leaves this case undefined; we return
+/// `-EFAULT` defensively rather than corrupt the current context.
+pub(super) fn sys_rt_sigreturn(ctx: &SyscallCtx) -> SyscallResult {
+    let Some(payload) = ctx.thread.payload_cap() else {
+        return SyscallResult::Error(EFAULT_VALUE);
+    };
+    let Some(saved) = payload.take_saved_signal_context() else {
+        return SyscallResult::Error(EFAULT_VALUE);
+    };
+    payload.store_saved_user_context(Some(saved));
     SyscallResult::SigreturnRestored
 }
 

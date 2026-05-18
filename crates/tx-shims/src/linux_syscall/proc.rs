@@ -145,37 +145,26 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
     // `SyscallCtx` (kernel-side bootstrap path).
     let cred = ctx.walker_cred();
 
-    // Drive ExecOp through the v3 StepOp loop.
-    // Phases that need I/O (step_open, read_exact_at) yield;
-    // the drive loop parks the task and resumes on I/O completion.
-    use step_engine::{StepOp, StepOutcome as V3Out, YieldShape};
-    use super::exec_op::ExecOp;
-    let mut op = ExecOp::<P>::new(
+    // `exec_script` is the canonical multi-phase async free fn that
+    // realises the EXEC_v1 protocol. The StepOp-shaped `ExecOp` wrap
+    // in `super::exec_op` is an unfinished refactor; the syscall arm
+    // drives `exec_script` directly until that lands.
+    let outcome = exec_script::<P>(
         &ctx.process,
         &ctx.thread,
         &path_buf,
         &argv_slices,
         &envp_slices,
         &cred,
-    );
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    loop {
-        match op.step(&mut script_ctx) {
-            V3Out::Done(()) => return SyscallResult::ExecCommitted,
-            V3Out::Err(e) => return SyscallResult::Error(errno_to_i32(e)),
-            V3Out::Yield(YieldShape::OnWaitSource { source, .. }) => {
-                use tx_subsystems::execution::WaitToken;
-                let token = WaitToken::new(source.raw(), 1);
-                if let Some(future) = super::wait_source::wait_on_token(token) {
-                    future.await;
-                }
-            }
-            V3Out::Continue { .. } => {
-                // ExecOp::step returns Continue between phases.
-                // Loop back immediately — no I/O wait needed.
-            }
-            _ => return SyscallResult::Error(EIO_VALUE),
+    )
+    .await;
+
+    match outcome {
+        Ok(()) => {
+            ctx.process.notify_vfork_done();
+            SyscallResult::ExecCommitted
         }
+        Err(e) => SyscallResult::Error(execve_errno_magnitude(e)),
     }
 }
 
@@ -210,8 +199,10 @@ pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
 /// - `args[0]` (`flags`) **must** equal [`SIGCHLD`] — anything else
 ///   (including `SIGCHLD | CLONE_VM`, `CLONE_VFORK`, the
 ///   pthread_create flag set, or zero flags) returns `-EINVAL`.
-/// - `args[1]` (`stack`) **must** be `0` — non-zero stack is the
-///   posix_spawn / pthread_create path, deferred.
+/// - `args[1]` (`stack`) may be non-zero. libc's `clone(fn, arg,
+///   stack, stack_size, SIGCHLD)` wrapper places `fn` and `arg` at
+///   that stack pointer before issuing the raw syscall; the child must
+///   resume with `sp = stack` so the wrapper can tail-call `fn(arg)`.
 /// - `args[2..5]` (`parent_tidptr`, `tls`, `child_tidptr`) are
 ///   ignored (they're only meaningful with the CLONE flags we
 ///   reject).
@@ -261,9 +252,12 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    if stack != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
+    // `stack` (newsp) — Linux semantic: zero means the child shares the
+    // parent's sp (bare fork). Non-zero means the libc clone wrapper has
+    // staged the child stack (typically with `fn`/`arg` pushed by
+    // `__clone`) and wants the child to enter userspace with sp = stack.
+    // Seeded into `regs[STACK_REG_INDEX]` by `seed_child_leader_context`
+    // below.
 
     // Snapshot parent's saved trap context. Plan B discipline: the
     // trap shell stored this at trap entry. `None` here means the
@@ -322,6 +316,12 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         Err(tx_subsystems::process::ForkError::Zone(_)) => {
             return SyscallResult::Error(ENOMEM_VALUE);
         }
+        Err(tx_subsystems::process::ForkError::Busy) => {
+            return SyscallResult::Error(EAGAIN_VALUE);
+        }
+        Err(tx_subsystems::process::ForkError::PidNamespace) => {
+            return SyscallResult::Error(ENOMEM_VALUE);
+        }
     };
 
     // Resolve the child's leader thread (always at slot 0 by
@@ -331,8 +331,14 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         .expect(":clone:no-leader: kernel-invariant violation, fresh child has no leader thread");
 
     // Seed the child's leader trap context with the parent's GPRs
-    // (a0 := 0, tp := tls when CLONE_SETTLS, pc := pc + 4). Infallible.
-    seed_child_leader_context(&child_thread, &parent_user_ctx, tls as usize);
+    // (a0 := 0, tp := tls when CLONE_SETTLS, sp := stack when non-zero,
+    // pc := pc + 4). Infallible.
+    seed_child_leader_context(
+        &child_thread,
+        &parent_user_ctx,
+        tls as usize,
+        stack as usize,
+    );
 
     // Hand the child's leader thread to the reactor. Panics with
     // `:clone:no-reactor-seam` if the boot path didn't install the
@@ -361,7 +367,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
                     // ProcessPayload so the child's exec/exit paths
                     // can wake us.
                     if let Some(payload) = self.child.payload_slot().lock().as_ref() {
-                        *payload.vfork_waiter.lock() = Some(cx.waker().clone());
+                        payload.store_vfork_waiter(cx.waker().clone());
                     }
                     self.stored = true;
                 }
@@ -513,7 +519,10 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 // Should not reach here — op yields on NoneReady.
                 // Fall through to the exit_source wait.
             }
-            V3Out::Yield(YieldShape::OnWaitSource { source, .. }) => {
+            V3Out::Yield {
+                shape: YieldShape::OnWaitSource { source, .. },
+                ..
+            } => {
                 let token = tx_subsystems::execution::WaitToken::new(source.raw(), 1);
                 if let Some(future) = wait_source::wait_on_token(token) {
                     future.await;
@@ -620,7 +629,9 @@ pub(super) fn sys_getsid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
 /// follow-up (`TODO(phase-process-topology)`).
 pub(super) fn sys_setsid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     let mut script_ctx = build_subject_script_ctx(ctx);
-    let mut op = SetsidOp { target: &ctx.process };
+    let mut op = SetsidOp {
+        target: &ctx.process,
+    };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(sid) => SyscallResult::Return(sid.0 as i64),
         Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),

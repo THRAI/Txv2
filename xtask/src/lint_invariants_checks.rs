@@ -82,7 +82,11 @@ pub(crate) fn lint_invariants_checks_purity(root: &Path) -> Result<()> {
     println!("Invariants Lint — checks-purity (PRED-1)");
     println!("=========================================");
 
-    let status = if count > MAX_MUTATIONS_IN_CHECKS { "OVER" } else { "ok" };
+    let status = if count > MAX_MUTATIONS_IN_CHECKS {
+        "OVER"
+    } else {
+        "ok"
+    };
     println!(
         "mutation calls in checks/ files: {:>4}  (ceiling {})  {}",
         count, MAX_MUTATIONS_IN_CHECKS, status

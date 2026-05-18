@@ -269,14 +269,11 @@ pub(super) fn post_source_fired(
             generation: subscriber.generation,
             source,
             interests,
-        });
-        true
+        })
     } else {
         false
     }
 }
-
-
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TerminateOutcome {

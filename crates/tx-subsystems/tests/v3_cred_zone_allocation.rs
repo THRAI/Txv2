@@ -128,7 +128,7 @@ fn cred_zone_allocation_invariants_round_trip() {
 
     // (4) Fork-child gets independent cap.
     let parent_key_pre_fork = bootstrap_cap.key();
-    let child = step_fork::<StubPmap>(&init).expect("fork");
+    let child = step_fork::<StubPmap>(&init, false).expect("fork");
     let child_cap = child.cred_cap().expect("alive");
     let child_key = child_cap.key();
     assert_ne!(parent_key_pre_fork, child_key, "fork must mint a fresh cap");

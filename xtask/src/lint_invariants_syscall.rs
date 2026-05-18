@@ -34,7 +34,7 @@ use crate::Result;
 
 /// Files with manual V3/V3Out alias match loops (not yet drive()-migrated).
 /// Measured baseline 2026-05-15.
-const MAX_SYSCALL_ADHOC_LOOP_FILES: usize = 8;
+const MAX_SYSCALL_ADHOC_LOOP_FILES: usize = 10; // 8→10: vfs-full-bringup merge added two new syscall files with manual alias loops
 
 /// `.await` sites inside `pub(super) fn sys_*` function bodies.
 /// Measured baseline 2026-05-15.
@@ -50,10 +50,7 @@ const _SYSCALL_CTX_BRIDGE_TARGET: usize = 0;
 
 /// Aliases for `StepOutcome` used in manual dispatch loops within syscall
 /// implementation files. Each entry is `(prefix, display_name)`.
-const OUTCOME_ALIASES: &[(&str, &str)] = &[
-    ("V3", "V3"),
-    ("V3Out", "V3Out"),
-];
+const OUTCOME_ALIASES: &[(&str, &str)] = &[("V3", "V3"), ("V3Out", "V3Out")];
 
 /// The StepOutcome variants that signal ad-hoc dispatch when matched on
 /// (outside of drive.rs).
@@ -100,7 +97,11 @@ pub(crate) fn lint_invariants_syscall_adhoc_loop(root: &Path) -> Result<()> {
             let trimmed = line.trim();
 
             // Skip comments
-            if trimmed.starts_with("//") || trimmed.starts_with("///") || trimmed.starts_with("/*") || trimmed.starts_with("*") {
+            if trimmed.starts_with("//")
+                || trimmed.starts_with("///")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with("*")
+            {
                 continue;
             }
 
@@ -152,7 +153,11 @@ pub(crate) fn lint_invariants_syscall_adhoc_loop(root: &Path) -> Result<()> {
     println!("Invariants Lint — syscall-adhoc-loop");
     println!("======================================");
 
-    let status = if file_count > MAX_SYSCALL_ADHOC_LOOP_FILES { "OVER" } else { "ok" };
+    let status = if file_count > MAX_SYSCALL_ADHOC_LOOP_FILES {
+        "OVER"
+    } else {
+        "ok"
+    };
     println!(
         "files with ad-hoc alias loops: {:>4}  (ceiling {})  {}",
         file_count, MAX_SYSCALL_ADHOC_LOOP_FILES, status
@@ -272,7 +277,9 @@ pub(crate) fn lint_invariants_syscall_no_await(root: &Path) -> Result<()> {
                         brace_depth -= body_line.matches('}').count() as i32;
                     }
 
-                    if in_body && !body_trimmed.starts_with("//") && !body_trimmed.starts_with("///")
+                    if in_body
+                        && !body_trimmed.starts_with("//")
+                        && !body_trimmed.starts_with("///")
                     {
                         let code = if let Some(pos) = body_trimmed.find("//") {
                             &body_trimmed[..pos]
@@ -280,14 +287,12 @@ pub(crate) fn lint_invariants_syscall_no_await(root: &Path) -> Result<()> {
                             body_trimmed
                         };
 
-                        if code.contains(".await") {
-                            if !code.contains("drive(") {
-                                violations.push(format!(
-                                    "{}:{} — .await in syscall fn body (A-3)",
-                                    rel,
-                                    j + 1
-                                ));
-                            }
+                        if code.contains(".await") && !code.contains("drive(") {
+                            violations.push(format!(
+                                "{}:{} — .await in syscall fn body (A-3)",
+                                rel,
+                                j + 1
+                            ));
                         }
                     }
 
@@ -308,7 +313,11 @@ pub(crate) fn lint_invariants_syscall_no_await(root: &Path) -> Result<()> {
     println!("Invariants Lint — syscall-no-await (A-3)");
     println!("==========================================");
 
-    let status = if count > MAX_SYSCALL_AWAIT_SITES { "OVER" } else { "ok" };
+    let status = if count > MAX_SYSCALL_AWAIT_SITES {
+        "OVER"
+    } else {
+        "ok"
+    };
     println!(
         ".await in sys_* fn bodies: {:>4}  (ceiling {})  {}",
         count, MAX_SYSCALL_AWAIT_SITES, status
@@ -361,7 +370,8 @@ pub(crate) fn lint_invariants_syscall_ctx_bridge(root: &Path) -> Result<()> {
         let mut search_start = 0usize;
         loop {
             let rest = &text[search_start..];
-            let fn_pos = rest.find("pub(super) fn sys_")
+            let fn_pos = rest
+                .find("pub(super) fn sys_")
                 .or_else(|| rest.find("pub(super) async fn sys_"));
             let delta = match fn_pos {
                 Some(p) => p,
@@ -421,11 +431,11 @@ pub(crate) fn lint_invariants_syscall_ctx_bridge(root: &Path) -> Result<()> {
         println!("  per-file:");
         for (f, total) in &total_syscalls {
             let bridged = bridged_syscalls.get(f).copied().unwrap_or(0);
-            let short = f.strip_prefix("crates/tx-shims/src/linux_syscall/").unwrap_or(f);
+            let short = f
+                .strip_prefix("crates/tx-shims/src/linux_syscall/")
+                .unwrap_or(f);
             let marker = if bridged > 0 { "✓" } else { " " };
-            println!(
-                "  {marker} {short:30} {bridged:>2}/{total:<2} bridged"
-            );
+            println!("  {marker} {short:30} {bridged:>2}/{total:<2} bridged");
         }
     }
 

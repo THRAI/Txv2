@@ -12,12 +12,12 @@ use adapter::runtime::{
 };
 
 use crate::device::BlockDevice;
+use crate::execution::Errno;
 use crate::execution::KernelResult;
 use crate::page_backed::{FsPageBacking, PageContainer};
-use crate::execution::Errno;
 use crate::vfs::{
-    adapter::step_engine::{self as vfs_step_engine, Guard, NoProgress, StepOutcome},
-    render_dentry_path, DEntry, FsObjectId, FsOps, InlineName, InodeMeta, RNode,
+    adapter::step_engine::{Guard, NoProgress, StepOutcome},
+    render_dentry_path, DEntry, FsObjectId, FsOps, InodeMeta, RNode,
 };
 
 static MOUNT_IDENTITY_ZONE: Zone<MountIdentity> = Zone::const_new();
@@ -313,27 +313,46 @@ pub struct MountNamespace {
 
 impl MountNamespace {
     pub fn new(root: Cap<MountIdentity>) -> Self {
-        Self { root, mounts: SpinMutex::new(Vec::new()) }
+        Self {
+            root,
+            mounts: SpinMutex::new(Vec::new()),
+        }
     }
 
     pub fn new_cap(root: Cap<MountIdentity>) -> Result<Cap<Self>, ZoneError> {
         runtime::sign(Self::new(root))
     }
 
-    pub fn root(&self) -> &Cap<MountIdentity> { &self.root }
+    pub fn root(&self) -> &Cap<MountIdentity> {
+        &self.root
+    }
 
-    pub fn register_mount(&self, parent_payload: &Cap<MountPayload>, child_fs_object_id: FsObjectId, mount: Cap<MountIdentity>) {
+    pub fn register_mount(
+        &self,
+        parent_payload: &Cap<MountPayload>,
+        child_fs_object_id: FsObjectId,
+        mount: Cap<MountIdentity>,
+    ) {
         let ptr = cap_payload_ptr(parent_payload);
         let mut t = self.mounts.lock();
         for e in t.iter_mut() {
             if e.parent_payload_ptr == ptr && e.child_fs_object_id == child_fs_object_id {
-                e.mount = IdentitySlot::from_cap(mount); return;
+                e.mount = IdentitySlot::from_cap(mount);
+                return;
             }
         }
-        t.push(MountTableEntry { parent_payload_ptr: ptr, child_fs_object_id, mount: IdentitySlot::from_cap(mount) });
+        t.push(MountTableEntry {
+            parent_payload_ptr: ptr,
+            child_fs_object_id,
+            mount: IdentitySlot::from_cap(mount),
+        });
     }
 
-    pub fn mount_for(&self, parent_payload: &Cap<MountPayload>, child_fs_object_id: FsObjectId) -> Option<Cap<MountIdentity>> {
+    pub fn mount_for(
+        &self,
+        parent_payload: &Cap<MountPayload>,
+        child_fs_object_id: FsObjectId,
+    ) -> Option<Cap<MountIdentity>> {
         let ptr = cap_payload_ptr(parent_payload);
         for e in self.mounts.lock().iter() {
             if e.parent_payload_ptr == ptr && e.child_fs_object_id == child_fs_object_id {
@@ -344,32 +363,55 @@ impl MountNamespace {
     }
 
     pub fn snapshot_mounts(&self) -> alloc::vec::Vec<MountSnapshot> {
-        let guard = crate::vfs::adapter::step_engine::guard();
-        self.mounts.lock().iter().filter_map(|e| {
-            let m = e.mount.clone_cap();
-            let d = m.mountpoint()?;
-            let path = render_dentry_path(d).unwrap_or_else(|| b"/?".to_vec());
-            let p = m.payload_cap().ok()?;
-            Some(MountSnapshot { source: p.source_label, mountpoint_path: path, fstype: p.fstype, flags: p.options.flags })
-        }).collect()
+        let _guard = crate::vfs::adapter::step_engine::guard();
+        self.mounts
+            .lock()
+            .iter()
+            .filter_map(|e| {
+                let m = e.mount.clone_cap();
+                let d = m.mountpoint()?;
+                let path = render_dentry_path(d).unwrap_or_else(|| b"/?".to_vec());
+                let p = m.payload_cap().ok()?;
+                Some(MountSnapshot {
+                    source: p.source_label,
+                    mountpoint_path: path,
+                    fstype: p.fstype,
+                    flags: p.options.flags,
+                })
+            })
+            .collect()
     }
 
     pub fn umount(&self, target: &Cap<DEntry>, pp: &Cap<MountPayload>) -> Result<(), Errno> {
         let ptr = cap_payload_ptr(pp);
         let id = target.rnode().fs_object_id();
         let mut t = self.mounts.lock();
-        if let Some(i) = t.iter().position(|e| e.parent_payload_ptr == ptr && e.child_fs_object_id == id) {
-            t.remove(i); Ok(())
-        } else { Err(Errno::EINVAL) }
+        if let Some(i) = t
+            .iter()
+            .position(|e| e.parent_payload_ptr == ptr && e.child_fs_object_id == id)
+        {
+            t.remove(i);
+            Ok(())
+        } else {
+            Err(Errno::EINVAL)
+        }
     }
 
     pub fn clone_ns(&self) -> Result<Cap<Self>, ZoneError> {
-        let cloned: Vec<MountTableEntry> = self.mounts.lock().iter().map(|e| MountTableEntry {
-            parent_payload_ptr: e.parent_payload_ptr,
-            child_fs_object_id: e.child_fs_object_id,
-            mount: e.mount.clone(),
-        }).collect();
-        runtime::sign(Self { root: self.root.clone(), mounts: SpinMutex::new(cloned) })
+        let cloned: Vec<MountTableEntry> = self
+            .mounts
+            .lock()
+            .iter()
+            .map(|e| MountTableEntry {
+                parent_payload_ptr: e.parent_payload_ptr,
+                child_fs_object_id: e.child_fs_object_id,
+                mount: e.mount.clone(),
+            })
+            .collect();
+        runtime::sign(Self {
+            root: self.root.clone(),
+            mounts: SpinMutex::new(cloned),
+        })
     }
 }
 
@@ -532,16 +574,16 @@ pub struct BindMountOutput {
 /// `target` as a mountpoint and traverses into `source`'s subtree.
 ///
 /// v1: non-recursive, no propagation.
-pub fn bind_mount<'g>(
+pub fn bind_mount(
     source_dentry: Cap<DEntry>,
     target_dentry: Cap<DEntry>,
     target_parent_payload: &Cap<MountPayload>,
-    guard: &'g Guard<'_>,
+    guard: &Guard<'_>,
 ) -> Result<BindMountOutput, crate::execution::Errno> {
     use crate::execution::Errno;
 
-    let source_payload = crate::vfs::walker::mount_payload_for(&source_dentry, guard)
-        .ok_or(Errno::ENODEV)?;
+    let source_payload =
+        crate::vfs::walker::mount_payload_for(&source_dentry, guard).ok_or(Errno::ENODEV)?;
 
     let source_rnode = source_dentry.rnode().clone();
     let target_fs_object_id = target_dentry.rnode().fs_object_id();
@@ -557,7 +599,11 @@ pub fn bind_mount<'g>(
     )
     .map_err(|_| Errno::ENOMEM)?;
 
-    register_mount(target_parent_payload, target_fs_object_id, mount_cap.clone());
+    register_mount(
+        target_parent_payload,
+        target_fs_object_id,
+        mount_cap.clone(),
+    );
 
     Ok(BindMountOutput { mount: mount_cap })
 }
@@ -571,6 +617,17 @@ pub fn bind_mount<'g>(
 ///
 /// v1: synchronous detach only.  Returns `EINVAL` if the path is
 /// not a registered mountpoint.
+///
+/// `umount` accepts either of two dentry shapes for `target_dentry`:
+///
+/// 1. The mountpoint dentry on the parent filesystem — matches the
+///    registration key directly. Rare in practice since the walker
+///    crosses mount boundaries.
+/// 2. The mounted filesystem's root dentry — what the walker returns
+///    when the user resolves the mount path. We detect this by
+///    comparing every entry's `mount.root()` against
+///    `target_dentry.rnode()`; on a hit we remove the entry without
+///    requiring `parent_payload` to match.
 pub fn umount(
     target_dentry: &Cap<DEntry>,
     parent_payload: &Cap<MountPayload>,
@@ -579,11 +636,24 @@ pub fn umount(
 
     let parent_payload_ptr = cap_payload_ptr(parent_payload);
     let child_fs_object_id = target_dentry.rnode().fs_object_id();
+    let target_rnode_id = target_dentry.rnode().fs_object_id();
+    let target_rnode_cap_addr = cap_raw_addr(target_dentry.rnode());
 
     let mut table = MOUNT_TABLE.lock();
+    // First try the registration key. If the user passed the
+    // mountpoint dentry (matches the parent FS) the key is sound.
     let pos = table.iter().position(|entry| {
         entry.parent_payload_ptr == parent_payload_ptr
             && entry.child_fs_object_id == child_fs_object_id
+    });
+    // Fallback: the walker resolved the user path through the mount
+    // and handed us the mounted FS's root dentry. Scan for an entry
+    // whose registered mount has this rnode as its root.
+    let pos = pos.or_else(|| {
+        table.iter().position(|entry| {
+            let root = entry.mount.root();
+            cap_raw_addr(root) == target_rnode_cap_addr || root.fs_object_id() == target_rnode_id
+        })
     });
 
     match pos {
@@ -639,7 +709,7 @@ pub fn create_filesystem(_fstype: &str) -> Option<FsOutput> {
 /// source label, mount-point path (computed via `render_dentry_path`),
 /// filesystem type, and mount flags.
 pub fn snapshot_mounts() -> alloc::vec::Vec<MountSnapshot> {
-    let guard = crate::vfs::adapter::step_engine::guard();
+    let _guard = crate::vfs::adapter::step_engine::guard();
     let table = MOUNT_TABLE.lock();
     table
         .iter()
@@ -683,22 +753,13 @@ pub fn bootstrap_mount(
     let root_id = FsObjectId::ROOT;
 
     // Drive load_inode_meta to completion.
-    let root_meta = match drive_step_outcome_to_done(
-        || fs_ops.load_inode_meta(root_id, guard),
-        guard,
-    ) {
-        Ok(meta) => meta,
-        Err(e) => return Err(e.into()),
-    };
+    let root_meta = drive_step_outcome_to_done(|| fs_ops.load_inode_meta(root_id, guard), guard)?;
 
     // Drive materialise_rnode to completion.
-    let root_rnode = match drive_step_outcome_to_done(
-        || fs_ops.materialise_rnode(root_id, root_meta, guard),
+    let root_rnode = drive_step_outcome_to_done(
+        || fs_ops.materialise_rnode(root_id, root_meta, &source_payload, guard),
         guard,
-    ) {
-        Ok(rnode) => rnode,
-        Err(e) => return Err(e.into()),
-    };
+    )?;
 
     // Sign MountIdentity.
     let id = allocate_mount_id();
@@ -723,7 +784,7 @@ pub fn bootstrap_mount(
 /// spinning on `Yield` until `Done` or `Err`.
 fn drive_step_outcome_to_done<T>(
     mut step_fn: impl FnMut() -> StepOutcome<T, NoProgress>,
-    guard: &Guard<'_>,
+    _guard: &Guard<'_>,
 ) -> Result<T, crate::execution::Errno> {
     loop {
         match step_fn() {
@@ -978,7 +1039,7 @@ mod tests {
             StepOutcome::err(V3Errno::EROFS)
         }
 
-        fn fsync(
+        fn fsync_file(
             &self,
             _fs_object_id: FsObjectId,
             _guard: &Guard<'_>,

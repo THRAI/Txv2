@@ -140,7 +140,12 @@ impl<'a, P: tx_hal::PmapIf, I: step_engine::SubjectIdentity> StepOp<I> for Clone
                     .nth_thread(0)
                     .expect(":clone:no-leader");
 
-                seed_child_leader_context(&child_thread, &self.parent_ctx, self.tls as usize);
+                seed_child_leader_context(
+                    &child_thread,
+                    &self.parent_ctx,
+                    self.tls as usize,
+                    self.stack as usize,
+                );
                 reactor_submit::submit_child_thread(child.clone(), child_thread.clone());
 
                 let child_pid = child.pid.0 as u64;

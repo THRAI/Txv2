@@ -219,7 +219,9 @@ fn pgrp_member_weak_observation_returns_live_process_until_identity_drops() {
 
     let guard = ebr_guard();
     let live: usize = pgrp
-        .members.inner.lock()
+        .members
+        .inner
+        .lock()
         .iter()
         .filter(|w| w.upgrade(&guard).is_some())
         .count();
@@ -243,7 +245,9 @@ fn pgrp_member_weak_observation_returns_live_process_until_identity_drops() {
 
     let guard = ebr_guard();
     let live_after: usize = pgrp
-        .members.inner.lock()
+        .members
+        .inner
+        .lock()
         .iter()
         .filter(|w| w.upgrade(&guard).is_some())
         .count();
