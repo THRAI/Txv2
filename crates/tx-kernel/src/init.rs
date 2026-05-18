@@ -1557,6 +1557,26 @@ impl<P: TxPlatform> CoreInit<P> {
             // same as "no edge" (the fork emit dispatch elides any
             // parent_pid == 0 record).
             let parent_pid_low = owner.as_ref().map(|p| p.parent_pid().0).unwrap_or(0);
+            // OBS-V1 §15.7 + §15.8 + §15.9: emit ProcessLabel +
+            // ProcessGroup + ProcessFork BEFORE submitting the child
+            // task. Perfetto's TrackDescriptor compatibility rules
+            // reject any later descriptor that changes a track's
+            // `parent_uuid` — so the daemon MUST know the child's
+            // pgid by the time it materialises the per-process
+            // track, which happens on first slice. Emitting
+            // metadata first guarantees the daemon caches
+            // `(comm, pgid, sid)` before the next reactor poll
+            // dispatches the new task and fires its first Sched
+            // SpanBegin. Skipped if the parent process identity
+            // was already dropped (defensive — `comm` would be the
+            // `?` sentinel and pgid_low/sid_low both zero, adding
+            // no information).
+            if let Some(ref c) = comm {
+                emit_process_label::<P>(pid_low, c);
+                emit_process_group::<P>(pid_low, pgid_low, sid_low);
+                // Fork edge: parent → child arrow on the timeline.
+                emit_process_fork::<P>(parent_pid_low, pid_low);
+            }
             let _ = BOOT_REACTOR.with(|reactor| {
                 reactor.submit_task_with_meta(
                     crate::thread_future::PerHartSlotted::<P, _>::new(
@@ -1569,20 +1589,6 @@ impl<P: TxPlatform> CoreInit<P> {
                         .with_process_id(pid_low),
                 );
             });
-            // OBS-V1 §15.7 + §15.8: emit ProcessLabel + ProcessGroup so
-            // the daemon can surface the real PCB `comm` AND nest the
-            // per-process track under its pgrp/session swimlane.
-            // Skipped if the parent process identity was already
-            // dropped (defensive — `comm` would be the `?` sentinel
-            // and pgid_low/sid_low both zero, adding no information).
-            if let Some(ref c) = comm {
-                emit_process_label::<P>(pid_low, c);
-                emit_process_group::<P>(pid_low, pgid_low, sid_low);
-                // OBS-V1 §15.9: parent → child fork edge so Perfetto
-                // can draw a flow arrow from the parent's clone()
-                // syscall slice to this child's first dispatch.
-                emit_process_fork::<P>(parent_pid_low, pid_low);
-            }
         }
     }
 }
