@@ -10,7 +10,8 @@ Use this skill when the work touches zone allocation, EBR, reference layering, r
 ## Read First
 
 - `docs/design/00_meta-framework/object_model_v2.md`
-- `docs/design/00_meta-framework/INVARIANTS_v4.md` §4A
+- `docs/Txv3/02_INVARIANTS_v5.md` — canonical invariants. ZONE-*/EBR-*/OBL-*/WIT-* families are carried forward from v4; SUBJ-*/SCOPE-* are new and touch identity-slot reasoning.
+- `docs/design/00_meta-framework/INVARIANTS_v4.md` §4A — still the section anchor other v4 subsystem docs cite for zone/EBR rows.
 - `docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md`
 - `docs/ebr-zone/02_EBR_design.en-US.md`
 - `docs/ebr-zone/03_Zone_Cap_object_storage_design.en-US.md`

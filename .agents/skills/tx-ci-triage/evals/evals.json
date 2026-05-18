@@ -1,0 +1,26 @@
+{
+  "skill_name": "tx-ci-triage",
+  "evals": [
+    {
+      "id": 0,
+      "name": "boundary-ratchet-regression",
+      "prompt": "CI failed on the txKernel `check` job. The failing step printed:\n\n```\n✗ architecture boundary ratchet — failed (docs/design/00_meta-framework/CI_REPORTING_v1.md txdoc:CI-GATE-BOUNDARY-RATCHET)\n  command: cargo xtask lint boundary\n  status: exit status: 1\n  details:\n    Architecture Boundary Ratchet\n    =============================\n    substrate outside adapters:    3 lines  (ceiling 0)  OVER\n    reactor   outside adapters:    0 lines  (ceiling 0)  ok\n    error: boundary ratchet regression — substrate: 3 > 0. Run `cargo xtask boundary-report` to see the new outside-adapter call sites, then either route them through an existing `#[platform_adapter]` module or add a new one. Do not raise the ceiling constants without a decision note.\n```\n\nI'm about to land a refactor of `crates/tx-subsystems/src/process/exec.rs` that calls `tx_substrate::zone::sign` directly. What should I do to make CI green? Be specific about the steps and commands. Don't just paraphrase the error.",
+      "expected_output": "Names the txdoc:CI-GATE-BOUNDARY-RATCHET tag, runs `cargo xtask boundary-report` to find the call sites, recommends routing through a `#[platform_adapter]` module rather than raising the ceiling, and explicitly warns against raising MAX_SUBSTRATE_OUTSIDE_ADAPTER without a decision note in docs/progress/decisions/.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "arch-lint-unused-allowance",
+      "prompt": "txKernel CI is failing. The report says:\n\n```\n✗ architecture lint — failed (docs/design/00_meta-framework/CI_REPORTING_v1.md txdoc:CI-GATE-ARCH-LINT)\n  command: cargo xtask lint arch\n  status: exit status: 1\n  details:\n    crates/tx-subsystems/src/eventfd/mod.rs:42: unused/dead-code allowances hide stale boot and API surfaces; remove the item or gate it behind cfg(test)\n    crates/tx-subsystems/src/timerfd/mod.rs:18: unused/dead-code allowances hide stale boot and API surfaces; remove the item or gate it behind cfg(test)\n    arch lint found 2 issue(s)\n```\n\nI added `#[allow(dead_code)]` on a struct that isn't called yet because I'm staging the implementation across several commits. Why is CI rejecting this and what's the right move? Can I just add a clippy allow at the top of the file?",
+      "expected_output": "Explains that the arch lint specifically rejects `#[allow(dead_code/unused/unused_imports/unused_variables)]` because they hide stale surfaces, names the txdoc:pr2-step-op-scaffold exemption marker, advises deleting the item or gating behind cfg(test) (or staging the consumer in the same commit) instead of suppressing.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "qemu-smoke-sentinel-timeout",
+      "prompt": "`cargo xtask ci-slow` is failing on the qemu-smoke job. The report ends with:\n\n```\n✗ rv64 qemu smoke sentinel — failed (docs/design/00_meta-framework/CI_REPORTING_v1.md txdoc:CI-GATE-QEMU-SMOKE)\n  command: cargo xtask qemu --target rv64-qemu --profile smoke --expect-sentinel --timeout-ms 30000\n  status: exit status: 2\n  details:\n    [serial] txkernel: boot stage 3\n    [serial] [trap] scause=0x000000000000000d sepc=0xffffffc080123abc stval=0x0000000000004fff\n    [serial] [trap] (no sentinel observed before timeout)\n    error: ci-slow failed with 1 failing check(s)\n```\n\nWhat's the fastest way to figure out where the kernel actually trapped? Walk me through the right tooling.",
+      "expected_output": "Recommends running `cargo xtask fault-decode --target rv64-qemu --serial <log>` (mentioning useful flags like --summary, --all, --user-elf) before hand-decoding scause/sepc/stval, notes that the expected sentinel is `txkernel:qemu-riscv64-virt:boot:ok`, and explains the local reproduce loop: `cargo xtask full-build` then `cargo xtask qemu`.",
+      "files": []
+    }
+  ]
+}

@@ -1553,3 +1553,7 @@ pub const TFD_NONBLOCK_FLAG: u32 = O_NONBLOCK;
 
 /// `TFD_TIMER_ABSTIME` — interpret `it_value` as an absolute time.
 pub const TFD_TIMER_ABSTIME_FLAG: u32 = 1;
+
+/// `syslog(type, bufp, len)` — Linux kernel ring-buffer read / control.
+/// Linux generic uapi `__NR_syslog = 116`.  Called by `dmesg(1)`.
+pub const NR_SYSLOG: u64 = 116;
