@@ -106,7 +106,8 @@ docker-oscomp-qemu:
 # 本地评测（不需要 docker 评测镜像）
 OSCOMP_OUT_RV ?= target/oscomp/os_serial_out_rv.txt
 OSCOMP_OUT_LA ?= target/oscomp/os_serial_out_la.txt
-OSCOMP_CONSOLE_FILTER = stdbuf -o0 tr -d '\000' | sed -u '/^[[:space:]]*$$/d'
+OSCOMP_SERIAL_NORMALIZE = stdbuf -o0 tr -d '\000\r'
+OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'
 
 .PHONY: oscomp-submit oscomp-qemu-rv64 oscomp-qemu-la64 oscomp-judge-rv64 oscomp-judge-la64 oscomp-local-rv64 oscomp-local-la64
 
@@ -117,23 +118,23 @@ oscomp-qemu-rv64:
 	qemu-system-riscv64 -machine virt \
 		-kernel $(OSCOMP_SUBMIT)/kernel-rv \
 		-m 1G -nographic -smp 1 -bios default \
-		-drive file=$(OSCOMP_DATA)/sdcard-rv.img,if=none,format=raw,id=x0 \
+		-drive file=$(OSCOMP_DATA)/sdcard-rv.img,if=none,format=raw,id=x0,file.locking=off \
 		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
 		-no-reboot \
 		-device virtio-net-device,netdev=net -netdev user,id=net \
 		-rtc base=utc \
-		2>&1 | tee $(OSCOMP_OUT_RV) | $(OSCOMP_CONSOLE_FILTER)
+		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_RV) | $(OSCOMP_CONSOLE_FILTER)
 
 oscomp-qemu-la64:
 	qemu-system-loongarch64 \
 		-kernel $(OSCOMP_SUBMIT)/kernel-la \
 		-m 1G -nographic -smp 1 \
-		-drive file=$(OSCOMP_DATA)/sdcard-la.img,if=none,format=raw,id=x0 \
+		-drive file=$(OSCOMP_DATA)/sdcard-la.img,if=none,format=raw,id=x0,file.locking=off \
 		-device virtio-blk-pci,drive=x0 \
 		-no-reboot \
 		-device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
 		-rtc base=utc \
-		2>&1 | tee $(OSCOMP_OUT_LA) | $(OSCOMP_CONSOLE_FILTER)
+		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_LA) | $(OSCOMP_CONSOLE_FILTER)
 
 oscomp-judge-rv64:
 	python3 tools/oscomp-judge.py $(OSCOMP_OUT_RV) $(OSCOMP_DATA)
