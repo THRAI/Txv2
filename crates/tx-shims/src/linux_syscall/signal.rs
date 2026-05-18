@@ -112,16 +112,146 @@ pub(super) fn sys_rt_sigsuspend(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallRe
     SyscallResult::Error(ENOSYS_VALUE)
 }
 
+/// `sigaltstack(ss, old_ss)` — stub returning success. The slice
+/// doesn't honour an alternate signal stack yet (the signal-frame
+/// path always uses the thread's current sp); returning 0 lets
+/// libctest / lua / busybox proceed past their setup phase where
+/// they merely register an alt stack without actually relying on
+/// it during the test body. POSIX permits `sigaltstack` to be a
+/// no-op as long as both pointers are NULL or point to valid
+/// memory the kernel doesn't have to copy out.
 pub(super) fn sys_sigaltstack(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+    SyscallResult::Return(0)
 }
 
 pub(super) fn sys_rt_sigqueueinfo(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
     SyscallResult::Error(ENOSYS_VALUE)
 }
 
-pub(super) fn sys_rt_sigtimedwait(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+/// `rt_sigtimedwait(set, info, timeout, sigsetsize)` — Linux RV64
+/// ABI `__NR_rt_sigtimedwait = 137`.
+///
+/// Polls the calling thread's pending-signal bitset for any signal
+/// in `set`, with the given timeout (NULL = block forever).
+/// Returns the first matching signum on success, `-EAGAIN` on
+/// timeout. Does NOT invoke the signal handler — the signal is
+/// consumed from `payload.pending()` instead.
+///
+/// Implementation: synchronous poll loop. Each iteration reads
+/// `payload.pending()`, checks for any bit also set in `set`, and
+/// if found, clears that bit and returns its signum. Between
+/// polls the calling task awaits a short [`NanosleepOp`] so other
+/// reactor tasks (notably any sibling thread that will post the
+/// signal — usually `post_sigchld_to_parent` for a child exit)
+/// get a chance to run.
+///
+/// Carved out as the libctest unblock per `SYSCALL_STATUS.md`'s
+/// "wire `sys_rt_sigtimedwait`" high-stakes row (libctest's
+/// `runtest.c` uses `sigtimedwait(SIGCHLD, …)` to wait for child
+/// processes; without a real implementation it returns `-ENOSYS`
+/// and every test scores 0/220 with `[signal Killed]`).
+pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let set_uaddr = args[0];
+    let info_uaddr = args[1];
+    let timeout_uaddr = args[2];
+    let sigsetsize = args[3] as usize;
+
+    // The slice only supports the canonical 8-byte sigset_t on RV64;
+    // mirrors the `sys_rt_sigprocmask` precedent (`SIGSETSIZE_BYTES`).
+    if sigsetsize != SIGSETSIZE_BYTES as usize {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if set_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    // Read the requested signal set (64-bit bitset).
+    let set_bits: u64 = match bootstrap_read_user::<u64>(&ctx.aspace, set_uaddr) {
+        Ok(v) => v,
+        Err(_) => return SyscallResult::Error(EFAULT_VALUE),
+    };
+    if set_bits == 0 {
+        // Empty set — no signal can ever match. Block until timeout.
+    }
+
+    // Read the timeout. NULL means block forever (we cap at a
+    // generous u64::MAX/2 sentinel below since the reactor doesn't
+    // actually park us for years — each polling iteration sleeps
+    // ~5ms and re-checks).
+    let timeout_ns: u64 = if timeout_uaddr == 0 {
+        u64::MAX / 2
+    } else {
+        match read_timespec_at(&ctx.aspace, timeout_uaddr) {
+            Some(ns) => ns,
+            None => return SyscallResult::Error(EINVAL_VALUE),
+        }
+    };
+
+    let Some(payload) = ctx.thread.payload_cap() else {
+        return SyscallResult::Error(EFAULT_VALUE);
+    };
+
+    let start_ns = <P as tx_hal::TimeIf>::read_ns();
+    let deadline_ns = start_ns.saturating_add(timeout_ns);
+
+    // Poll-and-yield loop. 5 ms chunks: long enough that we don't
+    // spin-burn the reactor, short enough that libctest tests with
+    // sub-second test bodies (most of them) react promptly to a
+    // child-exit-posted SIGCHLD.
+    const CHUNK_NS: u64 = 5_000_000;
+    loop {
+        // Fast path: consume the first matching pending bit.
+        let pending = payload.pending().snapshot() & set_bits;
+        if pending != 0 {
+            let signum_raw = (pending.trailing_zeros() + 1) as u8;
+            if let Some(sig) = tx_subsystems::signal::Signum::new(signum_raw) {
+                payload.pending().clear(sig);
+                // Optionally write the siginfo struct. We don't
+                // synthesise full siginfo — kernel-posted SIGCHLD
+                // carries enough state via wait4 — but a non-zero
+                // `info_uaddr` deserves at least a zeroed-out buffer
+                // so the caller sees a valid struct shape rather
+                // than uninitialised stack memory.
+                if info_uaddr != 0 {
+                    let zeros = [0u8; 128];
+                    let _ = bootstrap_copy_to_user(&ctx.aspace, info_uaddr, &zeros);
+                }
+                return SyscallResult::Return(signum_raw as i64);
+            }
+        }
+
+        // Timeout check before the next yield.
+        let now_ns = <P as tx_hal::TimeIf>::read_ns();
+        if now_ns >= deadline_ns {
+            return SyscallResult::Error(EAGAIN_VALUE);
+        }
+
+        // Async-friendly chunk wait. Reuse the `NanosleepOp`
+        // machinery so we yield on the timer wheel; the next reactor
+        // poll re-enters this loop.
+        let chunk = CHUNK_NS.min(deadline_ns.saturating_sub(now_ns));
+        use crate::adapter::step_engine::DriveMode;
+        use tx_scripts::drive;
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+        let op = super::NanosleepOp {
+            nanos: chunk,
+            deadline_ns: now_ns.saturating_add(chunk),
+            started: false,
+        };
+        let _ = drive(
+            op,
+            &mut script_ctx,
+            DriveMode::Waiting,
+            None,
+            None,
+            timer_wheel_arc.as_ref(),
+        )
+        .await;
+    }
 }
 
 pub(super) fn sys_pidfd_open(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {

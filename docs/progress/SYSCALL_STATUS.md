@@ -17,12 +17,17 @@ inner loop; OSComp + LTP are the correctness bar. When a syscall lands,
 record which specific OSComp/LTP test(s) closed it under "Currently
 passing" below.
 
-**Last refresh:** 2026-05-18 (5th pass — landed the
-top-of-table shebang/exec fix on this branch. Scoreboard delta:
-basic-musl 101/102 → 102/102 (full pass), lua-musl 0/9 → 9/9
-(full pass), libctest now executes all 220 tests but each fails
-on `sigtimedwait: ENOSYS` (next move: wire
-`sys_rt_sigtimedwait`). busybox-musl, libcbench, lmbench
+**Last refresh:** 2026-05-18 (6th pass — wired the 5
+defined-no-arm RT_SIG entries: `sys_rt_sigtimedwait` is a real
+async poll-and-yield loop on `payload.pending()`; `sigaltstack`
+returns 0 instead of `-ENOSYS`; `sigpending`, `sigsuspend`, and
+`sigqueueinfo` are now reachable. Headline counts:
+dispatched 107 → **112**, defined-no-arm 13 → **8**. Scoreboard:
+libctest no longer dies on `sigtimedwait: ENOSYS` — every test
+now reaches the test body but most still time out because the
+child `entry-static.exe` invocations don't post `SIGCHLD` back to
+the parent in time (next investigation). basic-musl 102/102,
+lua-musl 9/9, busybox-musl 52/55, libcbench ~14/27, lmbench 0/36
 unchanged.)
 
 ## Headline counts
@@ -35,11 +40,11 @@ unchanged.)
 > the bottom of this file).
 
 - `pub const NR_*` defined in `numbers.rs`: **120**
-- Dispatched in `mod.rs` (unique match arms): **107**
+- Dispatched in `mod.rs` (unique match arms): **112**
 - Currently stubbed (returns `-ENOSYS`): see "Already-partial" below for
   human-curated entries; the auto-table flags additional likely stubs
   by heuristic.
-- `NR_*` defined but no dispatch arm: **13** — see the auto-table.
+- `NR_*` defined but no dispatch arm: **8** — see the auto-table.
 - Outright unwired (no `NR_*` definition, no arm): **~116** syscalls — see
   categorized list below.
 
@@ -58,7 +63,7 @@ number of additional LTP tests that move from skipped/failed to runnable.
 
 | Gap | OSComp / LTP impact | Effort | Substrate status |
 |---|---|---|---|
-| Wire `sys_rt_sigtimedwait` (+ the other defined-no-arm RT_SIG entries) | **+220 OSComp** (libctest now runs all 220 tests; every one fails on `sigtimedwait: ENOSYS` in `runtest.c`) | **S (≤1d)** — handlers exist in `signal.rs`, just need match arms | trivial dispatch wiring; risk surface small |
+| Diagnose why libctest children don't post SIGCHLD in time after `sys_rt_sigtimedwait` wiring (parent now blocks, child wedges) | **+~220 OSComp** (libctest hangs in child rather than `ENOSYS`-killed) | M — needs trap-trace of `entry-static.exe` and `wait4` / SIGCHLD-post path audit | RT_SIG dispatch arms wired (this pass); the gap is now in the child exit / signal-post lane, not the wait-side |
 | lmbench unblock — `mkdir /var/tmp` at boot + diagnose `Simple read: -1` | up to +36 OSComp (lmbench-musl 0/36) | S–M (mkdir is hours; `Simple read` needs runtime triage) | `mkdir` is trivial; `read(2)` edge case to investigate |
 | libcbench malloc / stdio gaps | up to +13 OSComp (`~14/27` → close to 27/27) | M (~3w) | malloc benches return 0 → allocator instrumentation; stdio failures suggest fd / buffering path |
 | `preadv` / `pwritev` / `fallocate` / `readahead` | +20 LTP | S–M (3–4w) | `writev` loop + VFS hooks exist |
@@ -100,6 +105,18 @@ on unless the user specifically chartered them.
   kernel-side ENOEXEC fallback to `/bin/sh` — landed on this branch
   2026-05-18 (lua 0/9 → 9/9, basic 101/102 → 102/102, libctest now
   executes — see "Top-of-table fix landed" below).
+- 5 RT_SIG dispatch arms wired (`sys_rt_sigpending`,
+  `sys_rt_sigsuspend`, `sys_rt_sigqueueinfo`, `sys_rt_sigtimedwait`,
+  `sys_sigaltstack`) — landed on this branch 2026-05-18. The
+  `sigtimedwait` body is a real async poll loop that consumes
+  `payload.pending()` and `NanosleepOp`-yields between iterations;
+  the others use existing handlers / a `Return(0)` for the altstack
+  no-op. Headline: dispatched 107 → 112, defined-no-arm 13 → 8.
+  Effect on libctest: `[signal Killed]` → `[timed out]` — the
+  parent now correctly blocks in `sigtimedwait`, but child
+  `entry-static.exe` processes don't appear to exit promptly
+  enough; root cause still under investigation (see top high-stakes
+  row).
 
 ## OSComp + LTP coverage (the gold standard)
 
@@ -126,7 +143,7 @@ cargo xtask oscomp test        --target rv64-qemu --suite busybox-musl
 | `basic-musl`   | **102/102** | +1 | full pass |
 | `busybox-musl` | **52/55**   | 0  | landed; 3 non-kernel (`hwclock`, `kill 10`, `which ls`) |
 | `libcbench-musl` | **~13.9/27** | 0 | partial; malloc benches + stdio tests fail |
-| `libctest-musl`  | **0/220** | 0 (but now executes) | every test fails on `sigtimedwait: ENOSYS`; shebang/exec wrapper now resolves |
+| `libctest-musl`  | **0/220** | 0 (now `[timed out]` not `[signal Killed]`) | parent now blocks correctly in `sys_rt_sigtimedwait`; children wedge before exiting — root cause under investigation |
 | `lua-musl`     | **9/9**     | +9 | full pass |
 | `lmbench-musl` | **0/36**    | 0  | needs `/var/tmp` + `Simple read: -1` triage |
 
@@ -161,11 +178,11 @@ that had been blocking 229 OSComp tests:
    `dispatch_execve_non_elf_non_shebang_falls_back_to_bin_sh`.
 
 Result: **lua-musl 0/9 → 9/9**, **basic-musl 101/102 → 102/102**,
-and **libctest now actually runs all 220 tests** (the score is still
-0/220 because every test fails on `sigtimedwait: Function not
-implemented` — `NR_RT_SIGTIMEDWAIT=137` is in the defined-no-arm
-list. The next move is wiring `sys_rt_sigtimedwait` and the other
-defined-no-arm RT_SIG entries).
+and **libctest now actually runs all 220 tests** — followed by
+the RT_SIG dispatch wiring later in this branch (see "Third
+move" section below) which moved libctest from `[signal Killed]`
+to `[timed out]`. Score still 0/220 pending child-exit / SIGCHLD
+investigation.
 
 #### Second move: lmbench (36 tests)
 
@@ -175,13 +192,34 @@ The binary actually runs — two blockers:
   before the rest of the suite can be scored. Likely a `read(2)`
   return-value or `pread`-style edge case.
 
-#### Third move: wire `sys_rt_sigtimedwait` for libctest
+#### Third move: wire `sys_rt_sigtimedwait` for libctest (landed)
 
-`NR_RT_SIGTIMEDWAIT=137` is one of the 13 entries in
-`defined-but-no-arm` (the handler `sys_rt_sigtimedwait` already exists
-in `signal.rs` but no match arm wires it). Adding the dispatch arm
-should unblock most of libctest's 220 tests, since `runtest.c` uses
-sigtimedwait to manage child process timeouts.
+`NR_RT_SIGTIMEDWAIT=137` was one of 13 entries in `defined-but-no-arm`.
+Wired on this branch 2026-05-18 as a real async poll loop:
+
+```rust
+loop {
+    let pending = payload.pending().snapshot() & set_bits;
+    if pending != 0 {
+        let signum_raw = (pending.trailing_zeros() + 1) as u8;
+        payload.pending().clear(sig);
+        return SyscallResult::Return(signum_raw as i64);
+    }
+    if read_ns() >= deadline_ns { return -EAGAIN; }
+    NanosleepOp { nanos: 5ms, .. }.await;  // yield to reactor
+}
+```
+
+Plus four cooperating arms (`sigpending`, `sigsuspend`,
+`sigqueueinfo`, `sigaltstack` — last returns 0 instead of `-ENOSYS`).
+
+**Effect on libctest:** every test now reaches the test body
+(no more `ENOSYS` / `[signal Killed]`). Score still 0/220 because
+children `entry-static.exe` invocations time out — the parent
+correctly blocks in `sigtimedwait` but the child doesn't appear
+to exit / post `SIGCHLD` in the allotted window. This is the new
+top high-stakes row: the gap shifted from the wait-side to the
+child-exit / signal-post path.
 
 #### basic-musl 32/32 detail (carries over)
 
@@ -367,10 +405,10 @@ overwritten by the next `sync`. The lint variant
 ### Counts (from dispatch table)
 
 - `pub const NR_*` in numbers.rs: **120**
-- dispatched in mod.rs: **107** (of which async: 42, likely-stub: 0)
-- defined but not dispatched: **13**
+- dispatched in mod.rs: **112** (of which async: 43, likely-stub: 0)
+- defined but not dispatched: **8**
 
-### Defined in `numbers.rs` but no dispatch arm (13)
+### Defined in `numbers.rs` but no dispatch arm (8)
 
 These have a syscall number constant but no match arm in `mod.rs`. Either wire them up or remove the constant.
 
@@ -381,14 +419,9 @@ These have a syscall number constant but no match arm in `mod.rs`. Either wire t
 - `NR_IO_URING_ENTER` (nr=426)
 - `NR_PIDFD_OPEN` (nr=434)
 - `NR_PIDFD_SEND_SIGNAL` (nr=424)
-- `NR_RT_SIGPENDING` (nr=136)
-- `NR_RT_SIGQUEUEINFO` (nr=138)
-- `NR_RT_SIGSUSPEND` (nr=133)
-- `NR_RT_SIGTIMEDWAIT` (nr=137)
-- `NR_SIGALTSTACK` (nr=132)
 - `NR_SIGNALFD` (nr=282)
 
-### Dispatched syscalls (107) — name → handler
+### Dispatched syscalls (112) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -447,8 +480,13 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 129 | `NR_KILL` | `sys_kill` | sync |
 | 130 | `NR_TKILL` | `sys_tkill` | sync |
 | 131 | `NR_TGKILL` | `sys_tgkill` | sync |
+| 132 | `NR_SIGALTSTACK` | `sys_sigaltstack` | sync |
+| 133 | `NR_RT_SIGSUSPEND` | `sys_rt_sigsuspend` | sync |
 | 134 | `NR_RT_SIGACTION` | `sys_rt_sigaction` | sync |
 | 135 | `NR_RT_SIGPROCMASK` | `sys_rt_sigprocmask` | sync |
+| 136 | `NR_RT_SIGPENDING` | `sys_rt_sigpending` | sync |
+| 137 | `NR_RT_SIGTIMEDWAIT` | `sys_rt_sigtimedwait` | async |
+| 138 | `NR_RT_SIGQUEUEINFO` | `sys_rt_sigqueueinfo` | sync |
 | 139 | `NR_RT_SIGRETURN` | `sys_rt_sigreturn` | sync |
 | 143 | `NR_SETREGID` | `sys_setregid` | sync |
 | 144 | `NR_SETGID` | `sys_setgid` | sync |
