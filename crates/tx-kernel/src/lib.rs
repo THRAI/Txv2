@@ -34,7 +34,7 @@ use tx_hal::{BootHandoff, TxPlatform};
 /// The threshold is installed once at BSP substrate-init time
 /// (`init.rs::init_substrate_if_ready`) via
 /// `tx_observe::set_dump_threshold`.
-pub const OBSERVE_DUMP_THRESHOLD: u64 = 20_000;
+pub const OBSERVE_DUMP_THRESHOLD: u64 = 0;
 
 #[cfg(all(not(target_os = "none"), not(test)))]
 mod host_check_allocator {

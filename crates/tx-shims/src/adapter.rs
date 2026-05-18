@@ -41,7 +41,9 @@ pub mod step_engine {
     reason = "wrap reactor userspace and wait re-exports used by tx-shims syscall and test scaffolding"
 )]
 pub mod reactor_entry {
+    pub use tx_reactor::current_task_mailbox;
     pub use tx_reactor::userspace;
     pub use tx_reactor::userspace::SyscallRequest;
     pub use tx_reactor::wait::{Mask, WaitProtocol};
+    pub use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 }

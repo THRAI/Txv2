@@ -34,8 +34,7 @@ use crate::adapter::step_engine::{
 };
 use crate::adapter::wake::lookup_source;
 use crate::adapter::wake::{
-    agent_event_matches, ActiveWait, MailboxEvent, TaskMailbox, TimerGuardRole, TimerToken,
-    TimerWheel,
+    agent_event_matches, ActiveWait, MailboxEvent, TaskMailbox, TimerGuardRole, TimerWheel,
 };
 use alloc::sync::{Arc, Weak};
 use tx_observe::encode::{
@@ -639,12 +638,23 @@ async fn resolve_on_timer(
         return ResumeOutcome::Retry;
     };
 
-    // Convert TimerId → TimerToken (From impl added in PR-7).
-    let timer_token = TimerToken::from(token);
-
     // PR-8B: Install the timer with a weak mailbox reference so
     // the reactor's clock tick can post TimerFired on expiry.
+    // `install_for_task` allocates a fresh wheel-internal
+    // `TimerToken` (from the wheel's `next_token` counter) — that
+    // is the token the reactor's `fire_due` posts in
+    // `MailboxEvent::TimerFired`, so the predicate below must
+    // compare against the GUARD'S token, NOT the caller-passed
+    // `TimerId` (which is opaque-to-the-wheel and frequently a
+    // hard-coded constant like `TimerId::new(1)` from
+    // `NanosleepOp::step`). Using the constant token caused
+    // every `OnTimer` yield to wait forever for a token-1 event
+    // that never matched the wheel-allocated token; sigtimedwait
+    // bodies appeared to spin via the unrelated `SignalDelivered`
+    // wake path (which doesn't check the token) when the child
+    // exited fast, but hung outright when the child was slower.
     let _guard = tw.install_for_task(deadline, TimerGuardRole::PrimarySleep, Arc::downgrade(mbox));
+    let timer_token = _guard.token();
 
     // Park on mailbox until the reactor's timer-tick fires the
     // wheel and posts a TimerFired event for our token.

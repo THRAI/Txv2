@@ -1,3 +1,91 @@
+- 2026-05-19 **libctest-musl 0/220 → 14/220+ on rv64-qemu.** Two
+  cooperating fixes unblocked libctest's parent-side
+  `sys_rt_sigtimedwait` poll loop and identified the actual wedge
+  bug after the prior unit-test analysis proved the kernel-side
+  signal post→read path was correct:
+
+  1. **`sys_rt_sigtimedwait` mailbox + stale `SignalDelivered`
+     drain.** The poll loop was calling
+     `drive(NanosleepOp, …)` with `mailbox = None`, which made
+     `resolve_on_timer` short-circuit to `ResumeOutcome::Retry`
+     immediately (no actual park, no actual sleep) — the parent
+     spun fast and starved the reactor so child tasks never ran.
+     Fix: wire `tx_reactor::current_task_mailbox()` into the
+     drive call. Plus a drain of stale `MailboxEvent::SignalDelivered`
+     events between iterations (the inner `await_mailbox_event`
+     re-posts SignalDelivered for caller observation, but
+     sigtimedwait reads the canonical pending bitmap directly —
+     the re-post becomes a stale trap that returns `Ready(true)`
+     immediately on the next iteration).
+
+  2. **`TimerToken` / `TimerId` mismatch in
+     `tx_scripts::drive::resolve_on_timer`.** With (1) in place,
+     `argv` passed but `basename` hung. Trace investigation
+     showed `NanosleepOp::step` yields
+     `OnTimer { token: TimerId::new(1), … }` — a hard-coded
+     constant — while `TimerWheel::install_for_task` allocates a
+     fresh internal `TimerToken` from its monotonic
+     `next_token` counter. `resolve_on_timer` was comparing the
+     fired event against the caller-passed `TimerId(1)` instead
+     of the wheel-allocated guard token, so the predicate NEVER
+     matched a `TimerFired` event. The wait only ever unblocked
+     via the unrelated `SignalDelivered` wake path — which
+     happened fast enough for `argv` (child completes in ms) but
+     not for slower tests. Fix: use `_guard.token()` (the
+     wheel-allocated token) in the predicate.
+     ([`crates/tx-scripts/src/drive.rs`](../../crates/tx-scripts/src/drive.rs))
+
+  **Scoreboard after fix (this rv64-qemu run):**
+  - basic-musl: 102/102 (unchanged).
+  - busybox-musl: 52/55 (unchanged).
+  - libcbench-musl: ~14/27 (unchanged).
+  - **libctest-musl: 14/220+** — argv, basename,
+    clocale_mbfuncs, clock_gettime, dirname, env, fdopen,
+    fnmatch, fscanf, fwscanf, iconv_open, inet_pton, mbc,
+    memstream all pass. 15th test
+    (`pthread_cancel_points`) fails with `[signal
+    Segmentation fault]` because pthread support isn't wired
+    (`pthread_create` returns `EAGAIN`/`Resource temporarily
+    unavailable`). Then the kernel itself trapped on
+    `core::ptr::read_volatile::<u32>` of a user pointer
+    `0x40112da0` during `pthread_cancel` (separate
+    pre-existing bug: a syscall arm uses raw
+    `read_volatile` instead of the safe `aspace.read_user`
+    lane — needs follow-up). The trap aborts the suite
+    before the rest of libctest can score.
+  - lua-musl: 9/9 (unchanged).
+  - lmbench-musl: 0/36 (unchanged).
+
+  Doc updates:
+  - `SYSCALL_STATUS.md` scoreboard `libctest-musl` row
+    refreshed; auto-table re-synced.
+  - Next high-stakes row to swap in: identify and fix the
+    user-pointer `read_volatile` EFAULT crash so the kernel
+    survives pthread tests gracefully (returning -EFAULT
+    instead of trapping) — that should let libctest score
+    every non-pthread test (~150+ more) before any
+    real-pthread implementation work is needed.
+
+  Verification:
+  - `cargo -q xtask unit` — **339 host unit tests pass.**
+  - `cargo xtask ci` — **17/17 gates green.**
+  - `cargo xtask fault-decode --target rv64-qemu --serial …`
+    decoded the post-libctest trap to
+    `core::ptr::read_volatile::<u32>+0x1e` (kernel-internal
+    raw user-pointer read).
+
+  Files touched:
+  - `crates/tx-scripts/src/drive.rs` — `_guard.token()` fix.
+  - `crates/tx-shims/src/linux_syscall/signal.rs` — sys_rt_sigtimedwait
+    mailbox wiring + drain helper.
+  - `crates/tx-shims/src/adapter.rs` — re-export
+    `current_task_mailbox`, `TaskMailbox`, `MailboxEvent`.
+  - `crates/tx-kernel/src/lib.rs` — `OBSERVE_DUMP_THRESHOLD = 0`
+    (disabled at boot so long libctest runs aren't truncated;
+    investigation-only dump knobs flipped back).
+  - `crates/tx-shims/src/linux_syscall/proc.rs` — debug
+    execve-marker hook reverted.
+
 - 2026-05-18 **libctest wedge investigation: prove the
   `sys_rt_sigtimedwait` wait-side is correct, isolate the gap
   to the child-exit / SIGCHLD-post upstream.** Five new host
