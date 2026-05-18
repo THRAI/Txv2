@@ -1014,6 +1014,257 @@ fn require_link_sticky_bit_irrelevant() {
     let _w = require_link(&snap, &parent, &g).expect("sticky doesn't gate creation");
 }
 
+// ---------- require_rename ----------
+
+#[test]
+fn require_rename_passes_for_owner_of_both_parents() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_rename;
+
+    let _g = setup();
+    let old_parent = fresh_dir_meta(0o700, 1000, 1000);
+    let old_child = fresh_file_meta(0o600, 1000, 1000);
+    let new_parent = fresh_dir_meta(0o700, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let _w = require_rename(&snap, &old_parent, &old_child, &new_parent, None, &g)
+        .expect("owner with W+X on both");
+}
+
+#[test]
+fn require_rename_denies_when_old_parent_lacks_write() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_rename;
+    use crate::execution::Errno;
+
+    let _g = setup();
+    // Old parent r-x for owner — can search but not remove → EACCES
+    // from the unlink-side rule.
+    let old_parent = fresh_dir_meta(0o500, 1000, 1000);
+    let old_child = fresh_file_meta(0o600, 1000, 1000);
+    let new_parent = fresh_dir_meta(0o700, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let err = require_rename(&snap, &old_parent, &old_child, &new_parent, None, &g)
+        .err()
+        .expect("denied at old side");
+    assert_eq!(err, Errno::EACCES);
+}
+
+#[test]
+fn require_rename_denies_when_new_parent_lacks_write() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_rename;
+    use crate::execution::Errno;
+
+    let _g = setup();
+    // Old side fine, new parent has no W for caller → EACCES from
+    // the link-side rule.
+    let old_parent = fresh_dir_meta(0o700, 1000, 1000);
+    let old_child = fresh_file_meta(0o600, 1000, 1000);
+    let new_parent = fresh_dir_meta(0o500, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let err = require_rename(&snap, &old_parent, &old_child, &new_parent, None, &g)
+        .err()
+        .expect("denied at new side");
+    assert_eq!(err, Errno::EACCES);
+}
+
+#[test]
+fn require_rename_sticky_on_old_parent_denies_non_owner() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_rename;
+    use crate::execution::Errno;
+    use crate::vfs::structure::S_ISVTX;
+
+    let _g = setup();
+    // /tmp-style: sticky-protected old parent. Caller has W+X but
+    // owns neither the child nor the parent → EPERM (rename can't
+    // remove a sticky-protected entry).
+    let old_parent = fresh_dir_meta(S_ISVTX | 0o1777, 0, 0);
+    let old_child = fresh_file_meta(0o644, 2000, 2000);
+    let new_parent = fresh_dir_meta(0o700, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let err = require_rename(&snap, &old_parent, &old_child, &new_parent, None, &g)
+        .err()
+        .expect("sticky on old parent");
+    assert_eq!(err, Errno::EPERM);
+}
+
+#[test]
+fn require_rename_sticky_on_new_parent_denies_displaced_non_owner() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_rename;
+    use crate::execution::Errno;
+    use crate::vfs::structure::S_ISVTX;
+
+    let _g = setup();
+    // Both parents OK; new path has a displaced entry under a
+    // sticky parent. Caller owns the displaced child's *parent*?
+    // No — uid 1000 ≠ 0 (parent owner) and ≠ 2000 (displaced
+    // owner) → EPERM.
+    let old_parent = fresh_dir_meta(0o700, 1000, 1000);
+    let old_child = fresh_file_meta(0o600, 1000, 1000);
+    let new_parent = fresh_dir_meta(S_ISVTX | 0o1777, 0, 0);
+    let displaced = fresh_file_meta(0o644, 2000, 2000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let err = require_rename(
+        &snap,
+        &old_parent,
+        &old_child,
+        &new_parent,
+        Some(&displaced),
+        &g,
+    )
+    .err()
+    .expect("sticky on new parent + displacement");
+    assert_eq!(err, Errno::EPERM);
+}
+
+#[test]
+fn require_rename_displaced_none_skips_displaced_check() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_rename;
+    use crate::vfs::structure::S_ISVTX;
+
+    let _g = setup();
+    // Same setup as the previous test but with displaced=None
+    // (the common case: rename creates, not overwrites). The
+    // sticky-on-new-parent rule does *not* fire when no
+    // displacement is happening; W+X on new parent is all that's
+    // needed.
+    let old_parent = fresh_dir_meta(0o700, 1000, 1000);
+    let old_child = fresh_file_meta(0o600, 1000, 1000);
+    let new_parent = fresh_dir_meta(S_ISVTX | 0o1777, 0, 0);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let _w = require_rename(&snap, &old_parent, &old_child, &new_parent, None, &g)
+        .expect("displaced=None bypasses sticky on new parent");
+}
+
+// ---------- require_chmod / require_chown ----------
+
+#[test]
+fn require_chmod_passes_for_owner() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_chmod;
+
+    let _g = setup();
+    let target = fresh_file_meta(0o644, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let _w = require_chmod(&snap, &target, 0o755, &g).expect("owner");
+}
+
+#[test]
+fn require_chmod_denies_non_owner_without_cap_fowner() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_chmod;
+    use crate::execution::Errno;
+
+    let _g = setup();
+    let target = fresh_file_meta(0o644, 2000, 2000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let err = require_chmod(&snap, &target, 0o755, &g).err().expect("denied");
+    assert_eq!(err, Errno::EPERM);
+}
+
+#[test]
+fn require_chmod_cap_fowner_bypasses_ownership() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_chmod;
+
+    let _g = setup();
+    let target = fresh_file_meta(0o644, 2000, 2000);
+    let mut caps = CapabilitySet::EMPTY;
+    caps.add(Capability::FOWNER);
+    let snap = CredSnapshot::from_cred(Cred {
+        uid: Uid(1000),
+        euid: Uid(1000),
+        suid: Uid(1000),
+        gid: Gid(1000),
+        egid: Gid(1000),
+        sgid: Gid(1000),
+        effective_caps: caps,
+        permitted_caps: CapabilitySet::EMPTY,
+    });
+    let g = guard();
+    let _w = require_chmod(&snap, &target, 0o755, &g).expect("CAP_FOWNER bypass");
+}
+
+#[test]
+fn require_chown_passes_for_self_uid_and_gid() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_chown;
+
+    let _g = setup();
+    let target = fresh_file_meta(0o644, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let _w = require_chown(&snap, &target, Some(1000), Some(1000), &g)
+        .expect("self uid/gid permitted");
+}
+
+#[test]
+fn require_chown_denies_foreign_uid_for_non_privileged() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_chown;
+    use crate::execution::Errno;
+
+    let _g = setup();
+    let target = fresh_file_meta(0o644, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let err = require_chown(&snap, &target, Some(2000), None, &g)
+        .err()
+        .expect("foreign uid");
+    assert_eq!(err, Errno::EPERM);
+}
+
+#[test]
+fn require_chown_denies_foreign_gid_for_non_privileged() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_chown;
+    use crate::execution::Errno;
+
+    let _g = setup();
+    let target = fresh_file_meta(0o644, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let err = require_chown(&snap, &target, None, Some(999), &g)
+        .err()
+        .expect("foreign gid");
+    assert_eq!(err, Errno::EPERM);
+}
+
+#[test]
+fn require_chown_cap_fowner_permits_arbitrary_uid_gid() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_chown;
+
+    let _g = setup();
+    let target = fresh_file_meta(0o644, 1000, 1000);
+    let mut caps = CapabilitySet::EMPTY;
+    caps.add(Capability::FOWNER);
+    let snap = CredSnapshot::from_cred(Cred {
+        uid: Uid(2000),
+        euid: Uid(2000),
+        suid: Uid(2000),
+        gid: Gid(2000),
+        egid: Gid(2000),
+        sgid: Gid(2000),
+        effective_caps: caps,
+        permitted_caps: CapabilitySet::EMPTY,
+    });
+    let g = guard();
+    let _w = require_chown(&snap, &target, Some(3000), Some(3000), &g)
+        .expect("CAP_FOWNER bypass");
+}
+
 #[test]
 fn step_apply_suid_for_exec_at_secure_false_when_no_change() {
     let _g = setup();

@@ -99,6 +99,66 @@ impl LinkAuthorized<'_> {
     }
 }
 
+/// Witness produced by [`require_chmod`].
+///
+/// Proves the caller may change the mode of the inode whose metadata
+/// was checked, under the bound guard.
+#[must_use = "the witness is the authorization receipt — drop it explicitly only if you really intend to throw away the proof"]
+pub struct ChmodAuthorized<'g> {
+    _guard: PhantomData<&'g ()>,
+    _priv: (),
+}
+
+impl ChmodAuthorized<'_> {
+    const fn new() -> Self {
+        Self {
+            _guard: PhantomData,
+            _priv: (),
+        }
+    }
+}
+
+/// Witness produced by [`require_chown`].
+///
+/// Proves the caller may change the ownership of the inode whose
+/// metadata was checked, to the requested uid/gid pair, under the
+/// bound guard.
+#[must_use = "the witness is the authorization receipt — drop it explicitly only if you really intend to throw away the proof"]
+pub struct ChownAuthorized<'g> {
+    _guard: PhantomData<&'g ()>,
+    _priv: (),
+}
+
+impl ChownAuthorized<'_> {
+    const fn new() -> Self {
+        Self {
+            _guard: PhantomData,
+            _priv: (),
+        }
+    }
+}
+
+/// Witness produced by [`require_rename`].
+///
+/// Proves the caller may rename the entry whose old-side parent +
+/// child, and new-side parent metadata, were checked. Optionally the
+/// witness also covers a displaced new-side child (when the rename
+/// overwrites an existing entry).
+#[must_use = "the witness is the authorization receipt — drop it explicitly only if you really intend to throw away the proof"]
+pub struct RenameAuthorized<'g> {
+    _guard: PhantomData<&'g ()>,
+    _priv: (),
+}
+
+impl RenameAuthorized<'_> {
+    const fn new() -> Self {
+        Self {
+            _guard: PhantomData,
+            _priv: (),
+        }
+    }
+}
+
 /// Witness produced by [`require_unlink`].
 ///
 /// Proves the caller may remove the entry whose parent + child
@@ -214,6 +274,103 @@ pub fn require_link<'g>(
     let projection = Credential::from(source);
     crate::vfs::predicates::check_link_perm(new_parent_meta, &projection)?;
     Ok(LinkAuthorized::new())
+}
+
+/// May the caller carrying `source` rename `old_child` (under
+/// `old_parent_meta`) to a new name under `new_parent_meta`,
+/// optionally displacing `displaced_child`?
+///
+/// Composes the POSIX `rename(2)` rule, which is "unlink at the old
+/// name + create at the new name + (if displacing) unlink at the new
+/// name":
+///
+/// - **Old side**: full unlink rule on `(old_parent, old_child)`
+///   — W+X on old parent (EACCES) and sticky-bit ownership rule
+///   (EPERM).
+/// - **New side**: create rule on `new_parent` — W+X (EACCES).
+/// - **Displaced side** (if `displaced_child = Some(_)`): unlink
+///   rule on `(new_parent, displaced_child)` — same EACCES / EPERM
+///   discipline as the old side.
+///
+/// Returns [`RenameAuthorized`] on success — consumed at the
+/// `FsOps::rename` commit site.
+///
+/// **v1 limitation:** call sites that cannot cheaply pre-lookup the
+/// displaced inode metadata may pass `None` for `displaced_child`;
+/// the displaced side's sticky-bit rule is then unenforced. This is
+/// acceptable today because the only FS supporting rename
+/// (`tmpfs::rename`) doesn't yet preserve POSIX collision semantics
+/// for sticky-bit-protected destinations; closing the gap requires
+/// pre-resolving the displaced inode at the syscall arm.
+pub fn require_rename<'g>(
+    source: &CredSnapshot,
+    old_parent_meta: &InodeMeta,
+    old_child_meta: &InodeMeta,
+    new_parent_meta: &InodeMeta,
+    displaced_child: Option<&InodeMeta>,
+    guard: &'g Guard<'_>,
+) -> Result<RenameAuthorized<'g>, Errno> {
+    let _ = guard;
+    let projection = Credential::from(source);
+    crate::vfs::predicates::check_unlink_perm(old_parent_meta, old_child_meta, &projection)?;
+    crate::vfs::predicates::check_link_perm(new_parent_meta, &projection)?;
+    if let Some(displaced) = displaced_child {
+        crate::vfs::predicates::check_unlink_perm(new_parent_meta, displaced, &projection)?;
+    }
+    Ok(RenameAuthorized::new())
+}
+
+/// May the caller carrying `source` change the mode bits of the
+/// inode described by `target_meta`?
+///
+/// POSIX `chmod(2)` rule: owner (`cred.uid == meta.uid`) or
+/// `CAP_FOWNER` (or `euid 0`). Mode bits themselves are
+/// unrestricted in v1 — Linux's `CAP_FSETID` rule for setuid/setgid
+/// bits is not yet modelled.
+///
+/// The `new_mode` argument is accepted for API symmetry with
+/// `step_chmod` and for future privilege-on-mode-bit rules; v1
+/// does not consult it.
+///
+/// Returns [`ChmodAuthorized`] on success — consumed at the
+/// `FsOps::step_chmod` commit site.
+pub fn require_chmod<'g>(
+    source: &CredSnapshot,
+    target_meta: &InodeMeta,
+    new_mode: u16,
+    guard: &'g Guard<'_>,
+) -> Result<ChmodAuthorized<'g>, Errno> {
+    let _ = guard;
+    let _ = new_mode;
+    let projection = Credential::from(source);
+    crate::vfs::predicates::check_chmod_perm(target_meta, &projection)?;
+    Ok(ChmodAuthorized::new())
+}
+
+/// May the caller carrying `source` change the owner / group of
+/// the inode described by `target_meta` to `(new_uid, new_gid)`?
+///
+/// Rule: privileged callers (`CAP_FOWNER` or `euid 0`) may set any
+/// uid/gid. Non-privileged callers may set the uid only to their
+/// own (`cred.uid`) and the gid only to their primary
+/// (`cred.gid`); `None` for either side means "leave unchanged".
+///
+/// Matches the rule the per-FS `step_chown` impls enforce today
+/// (`tmpfs`, `devfs`, `bdevfs`, `procfs`); the cred-side seam is
+/// not stricter — it is the canonical place for the rule to live.
+///
+/// Returns [`ChownAuthorized`] on success.
+pub fn require_chown<'g>(
+    source: &CredSnapshot,
+    target_meta: &InodeMeta,
+    new_uid: Option<u32>,
+    new_gid: Option<u32>,
+    guard: &'g Guard<'_>,
+) -> Result<ChownAuthorized<'g>, Errno> {
+    let _ = guard;
+    let projection = Credential::from(source);
+    crate::vfs::predicates::check_chown_perm(target_meta, new_uid, new_gid, &projection)?;
+    Ok(ChownAuthorized::new())
 }
 
 // Re-export the existing signal-send check so the cred::checks::* surface

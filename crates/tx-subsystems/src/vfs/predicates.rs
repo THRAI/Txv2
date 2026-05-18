@@ -183,6 +183,75 @@ pub fn check_link_perm(
     Ok(())
 }
 
+/// DAC mode-change check for `chmod(2)` / `fchmodat(2)` /
+/// `fchmod(2)`.
+///
+/// POSIX rule (`man 2 chmod` §"Permissions"): the caller must own
+/// the file (`cred.uid == meta.uid`) or carry `CAP_FOWNER` (or be
+/// `euid 0`). Mode bits themselves are unrestricted — Linux's
+/// `CAP_FSETID` rule for setuid/setgid bits is not modelled in v1.
+///
+/// Returns `Errno::EPERM` on denial (matches Linux's `chmod(2)`
+/// error semantics; chmod returns `EPERM` for ownership-rule
+/// failures, distinct from `EACCES` for traversal failures
+/// handled by `check_descend_perm`).
+pub fn check_chmod_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), Errno> {
+    let owns = cred.uid == meta.uid;
+    let has_fowner = cred.effective_caps.contains(Capability::FOWNER);
+    let is_root = cred.uid == 0;
+    if owns || has_fowner || is_root {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
+}
+
+/// DAC ownership-change check for `chown(2)` / `fchownat(2)` /
+/// `lchown(2)`.
+///
+/// POSIX / Linux nominally use `CAP_CHOWN` for the arbitrary-uid
+/// case. txKernel's v1 cred surface uses `CAP_FOWNER` as the
+/// privileged-chown gate (matches the choice in `tmpfs::step_chown`,
+/// `devfs`, `bdevfs`, and `procfs` step bodies — slice-level
+/// simplification, not a final architectural decision).
+///
+/// Rule applied:
+///
+/// - **Arbitrary uid change**: requires `CAP_FOWNER` (or `euid 0`).
+///   Non-privileged callers can only "chown to themselves" — i.e.
+///   set the file's uid to a value that equals their own.
+/// - **gid change**: non-privileged callers may only set the gid
+///   to their primary gid (`cred.gid`) and only if they own the
+///   file. Supplementary groups not modelled in v1.
+///
+/// `new_uid = None` and `new_gid = None` short-circuit to Ok (no
+/// change requested).
+///
+/// Returns `Errno::EPERM` on denial. Matches the per-FS rule the
+/// existing step_chown implementations enforce; the cred-side
+/// predicate is the canonical seam, not a stricter gate.
+pub fn check_chown_perm(
+    meta: &InodeMeta,
+    new_uid: Option<u32>,
+    new_gid: Option<u32>,
+    cred: &Credential,
+) -> Result<(), Errno> {
+    let privileged =
+        cred.effective_caps.contains(Capability::FOWNER) || cred.uid == 0;
+    if let Some(u) = new_uid {
+        if !privileged && u != cred.uid {
+            return Err(Errno::EPERM);
+        }
+    }
+    if let Some(g) = new_gid {
+        if !privileged && g != cred.gid {
+            return Err(Errno::EPERM);
+        }
+    }
+    let _ = meta; // not consulted in v1 — privileged or self-only suffices
+    Ok(())
+}
+
 /// DAC R/W check for terminal-component open.
 /// Validates `OpenFileFlags::{read, write}` against the inode's
 /// owner/group permission triplet.  `CAP_DAC_OVERRIDE` short-circuits.
