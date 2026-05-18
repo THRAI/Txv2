@@ -281,6 +281,30 @@ impl PftraceWriter {
         {
             if let Some((pid, pgid, sid)) = extract_process_group(r) {
                 self.process_pgrp.insert(pid, (pgid, sid));
+                // Re-parent the process track under the pgrp swimlane
+                // RIGHT NOW. If the process track was already created
+                // by an earlier slice (race against the first
+                // SchedSwitch), this re-emits the TrackDescriptor with
+                // an updated `parent_uuid`. If the track doesn't exist
+                // yet — common case, metadata before first dispatch —
+                // we still allocate the pgrp swimlane eagerly so the
+                // next `ensure_thread_track_under_process` finds it.
+                let (pgrp_desc, proc_desc) =
+                    self.tracks.reparent_process_track(pid, pgid, sid);
+                if let Some(d) = pgrp_desc {
+                    self.packets.push(TracePacket {
+                        trusted_packet_sequence_id: Some(SEQ_ID),
+                        track_descriptor: Some(d),
+                        ..Default::default()
+                    });
+                }
+                if let Some(d) = proc_desc {
+                    self.packets.push(TracePacket {
+                        trusted_packet_sequence_id: Some(SEQ_ID),
+                        track_descriptor: Some(d),
+                        ..Default::default()
+                    });
+                }
             }
             return;
         }
