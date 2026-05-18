@@ -958,15 +958,21 @@ pub struct SignalFramePlacement {
 /// Carried from `prepare_signal_frame` to the caller, who writes
 /// them to the user stack via `AddressSpace::copy_to_user`.
 pub struct SignalFrameBytes {
-    pub data: [u8; 512],
+    pub data: [u8; Self::CAPACITY],
     pub len: usize,
 }
 
 impl SignalFrameBytes {
+    pub const CAPACITY: usize = 4096;
+
     pub fn from_slice(bytes: &[u8]) -> Self {
-        let len = bytes.len().min(512);
-        let mut data = [0u8; 512];
-        data[..len].copy_from_slice(&bytes[..len]);
+        assert!(
+            bytes.len() <= Self::CAPACITY,
+            "signal frame exceeds SignalFrameBytes capacity"
+        );
+        let len = bytes.len();
+        let mut data = [0u8; Self::CAPACITY];
+        data[..len].copy_from_slice(bytes);
         Self { data, len }
     }
 

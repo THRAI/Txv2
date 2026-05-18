@@ -113,9 +113,13 @@ pub mod wait_routing {
     /// (`Channel`) and v3 (`WaitSource`) paths share an id namespace
     /// (PR-3D-1 / D2 coexistence).
     ///
-    /// Delegates to `tx_substrate::wake::new_source`.
+    /// Delegates to `tx_substrate::wake::new_source`. Also registers
+    /// the source in the global registry so the v3 driver can look it
+    /// up by `WaitSourceId` while resolving pipe read/write waits.
     pub fn new_wait_source(side_id: u64) -> Arc<WaitSource> {
-        tx_substrate::wake::new_source(side_id)
+        let source = tx_substrate::wake::new_source(side_id);
+        tx_substrate::wake::register_source(Arc::clone(&source));
+        source
     }
 
     /// Fire the legacy `Channel` for one side of a pipe — the D2

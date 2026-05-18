@@ -199,8 +199,10 @@ pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
 /// - `args[0]` (`flags`) **must** equal [`SIGCHLD`] — anything else
 ///   (including `SIGCHLD | CLONE_VM`, `CLONE_VFORK`, the
 ///   pthread_create flag set, or zero flags) returns `-EINVAL`.
-/// - `args[1]` (`stack`) **must** be `0` — non-zero stack is the
-///   posix_spawn / pthread_create path, deferred.
+/// - `args[1]` (`stack`) may be non-zero. libc's `clone(fn, arg,
+///   stack, stack_size, SIGCHLD)` wrapper places `fn` and `arg` at
+///   that stack pointer before issuing the raw syscall; the child must
+///   resume with `sp = stack` so the wrapper can tail-call `fn(arg)`.
 /// - `args[2..5]` (`parent_tidptr`, `tls`, `child_tidptr`) are
 ///   ignored (they're only meaningful with the CLONE flags we
 ///   reject).
@@ -250,10 +252,6 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    if stack != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-
     // Snapshot parent's saved trap context. Plan B discipline: the
     // trap shell stored this at trap entry. `None` here means the
     // shell never stored it — a kernel-invariant violation. Panic
@@ -326,8 +324,14 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         .expect(":clone:no-leader: kernel-invariant violation, fresh child has no leader thread");
 
     // Seed the child's leader trap context with the parent's GPRs
-    // (a0 := 0, tp := tls when CLONE_SETTLS, pc := pc + 4). Infallible.
-    seed_child_leader_context(&child_thread, &parent_user_ctx, tls as usize);
+    // (a0 := 0, sp := stack when non-zero, tp := tls when
+    // CLONE_SETTLS). Infallible.
+    seed_child_leader_context(
+        &child_thread,
+        &parent_user_ctx,
+        stack as usize,
+        tls as usize,
+    );
 
     // Hand the child's leader thread to the reactor. Panics with
     // `:clone:no-reactor-seam` if the boot path didn't install the

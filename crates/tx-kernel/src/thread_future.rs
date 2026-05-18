@@ -79,6 +79,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use crate::adapter::boot_runtime;
+use crate::adapter::step_engine::StepOutcome;
 use crate::adapter::step_engine::{Cap, PayloadCap};
 use boot_runtime::ast::AstBatch;
 use boot_runtime::userspace::{
@@ -288,7 +289,8 @@ pub async fn run_thread<P: TxPlatform>(
                     let old_mask = payload.signal_mask();
 
                     // Build the signal frame write descriptor.
-                    let stack_top = tx_hal::UserPtr::<u8>::new(orig_ctx.regs[2]); // sp
+                    let stack_top =
+                        tx_hal::UserPtr::<u8>::new(user_sp_from_context::<P>(&orig_ctx));
                     let setup = tx_hal::SignalFrameWrite {
                         stack_top,
                         sig_no: sig.raw() as u32,
@@ -307,16 +309,24 @@ pub async fn run_thread<P: TxPlatform>(
                         <P as tx_hal::SignalFrameIf>::prepare_signal_frame(&orig_ctx, &setup);
                     match prepared {
                         Ok((handler_ctx, frame_bytes)) => {
-                            let frame_addr = handler_ctx.regs[2];
-                            {
+                            let frame_addr = user_sp_from_context::<P>(&handler_ctx);
+                            let copied = {
                                 let guard = crate::adapter::step_engine::guard();
-                                let _ = aspace.copy_to_user(
+                                aspace.copy_to_user(
                                     tx_hal::UserPtr::<u8>::new(frame_addr),
                                     frame_bytes.as_slice(),
                                     &guard,
+                                )
+                            };
+                            if matches!(copied, StepOutcome::Done(n) if n == frame_bytes.as_slice().len())
+                            {
+                                payload.store_saved_user_context(Some(handler_ctx));
+                            } else {
+                                tx_subsystems::process::execution::step_exit_group_with_signal(
+                                    &process, sig,
                                 );
+                                return;
                             }
-                            payload.store_saved_user_context(Some(handler_ctx));
                         }
                         Err(_) => {
                             // Signal frame write failed (bad stack).
@@ -479,15 +489,23 @@ pub async fn run_thread<P: TxPlatform>(
                         // `make_initial_user_trap_context`).
                     }
                     tx_shims::linux_syscall::SyscallResult::SigreturnRestored => {
-                        // Phase B: rt_sigreturn restored the signal
-                        // frame into saved_user_context.  Same
-                        // fall-through semantics as ExecCommitted:
-                        // MUST NOT drain pending_syscall_return;
-                        // re-enters userspace with the restored
-                        // context.  The actual SignalFrameIf restore
-                        // (read_signal_frame + restore_signal_frame)
-                        // lands in Phase D.
-                        // Fall through to AST drain + re-entry.
+                        // Restore the pre-handler context captured
+                        // when AST delivered the signal. The live
+                        // trap shell has already saved the trampoline
+                        // syscall context; replace it with the
+                        // interrupted context and re-enter userspace
+                        // without writing a syscall return value.
+                        if let Some(restored_ctx) = payload.take_saved_signal_context() {
+                            payload.store_saved_user_context(Some(restored_ctx));
+                        } else if let Some(process) = thread.upgrade_owner_proc() {
+                            tx_subsystems::process::execution::step_exit_group_with_signal(
+                                &process,
+                                Signum::SIGSEGV,
+                            );
+                            return;
+                        } else {
+                            return;
+                        }
                     }
                 }
             }
@@ -542,6 +560,13 @@ pub async fn run_thread<P: TxPlatform>(
         // Fall through to the top of the loop — next iteration
         // re-opens the entry-side wait, re-runs the AST checkpoint,
         // and re-dives into userspace with the merged context.
+    }
+}
+
+fn user_sp_from_context<P: TxPlatform>(ctx: &tx_hal::UserTrapContext) -> usize {
+    match P::ARCH {
+        tx_hal::Arch::Riscv64 => ctx.regs[2],
+        tx_hal::Arch::LoongArch64 => ctx.regs[3],
     }
 }
 
