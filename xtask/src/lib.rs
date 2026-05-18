@@ -12,6 +12,7 @@ mod full_build;
 mod image;
 mod lint;
 mod lint_invariants_checks;
+mod lint_invariants_cred_check;
 mod lint_invariants_drive;
 mod lint_invariants_script;
 mod lint_invariants_signal;

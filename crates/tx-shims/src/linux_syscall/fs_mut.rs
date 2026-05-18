@@ -193,12 +193,26 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
+    // POSIX mkdir(2) permission: write + search on the parent.
+    // Same rule as link/create — sticky is *not* consulted (mkdir
+    // only adds an entry, doesn't remove). Walker only enforced
+    // search-on-ancestors; without this, any user that could
+    // search the parent could create a directory there.
+    let parent_meta = parent_dentry.rnode().meta();
     // Apply umask: effective_mode = mode & !umask. Linux semantics
     // (umask is the bottom 9 bits — `rwxrwxrwx`).
     let umask = ctx.process.umask();
     let effective_mode = mode & !umask & 0o7777;
     let outcome = {
         let guard = step_engine::guard();
+        let _auth = match tx_subsystems::cred::checks::require_link(
+            ctx.cred_snapshot(),
+            &parent_meta,
+            &guard,
+        ) {
+            Ok(w) => w,
+            Err(e) => return SyscallResult::error_from(e),
+        };
         fs_ops.mkdir(parent_id, basename, effective_mode, &cred, &guard)
     };
     match outcome {
@@ -350,8 +364,20 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
+    // POSIX symlink(2) permission: write + search on parent (same
+    // as link / mkdir — sticky not consulted because symlink only
+    // creates an entry).
+    let parent_meta = parent_dentry.rnode().meta();
     let outcome = {
         let guard = step_engine::guard();
+        let _auth = match tx_subsystems::cred::checks::require_link(
+            ctx.cred_snapshot(),
+            &parent_meta,
+            &guard,
+        ) {
+            Ok(w) => w,
+            Err(e) => return SyscallResult::error_from(e),
+        };
         fs_ops.symlink(parent_id, basename, &target, &cred, &guard)
     };
     match outcome {
