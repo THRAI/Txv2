@@ -11,7 +11,10 @@ Use this skill for subsystem docs under execution, VM, process/signals, filesyst
 
 - `docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md`
 - `docs/design/00_meta-framework/object_model_v2.md`
-- `docs/design/00_meta-framework/INVARIANTS_v4.md` ZONE, BIF, OBL, WIT, STEP rules
+- `docs/Txv3/02_INVARIANTS_v5.md` — canonical for STEP-* (updated for four-variant outcome) and the new SUBJ-*, YIELD-*, DELEGATE-*, SCOPE-* families.
+- `docs/design/00_meta-framework/INVARIANTS_v4.md` — ZONE, BIF, OBL, WIT rows are carried forward unchanged; cite v4 anchors when restating them since other subsystem docs do.
+- `docs/Txv3/03_STEP_MODEL_v2.md` — current step algebra; supersedes `02_execution/STEP_MODEL_v1.md`.
+- `docs/Txv3/04_SYSCALL_SHAPE_v1.md` — upper/lower split discipline if your subsystem owns syscall entry points.
 - The owning subsystem spec
 
 ## Required Section
