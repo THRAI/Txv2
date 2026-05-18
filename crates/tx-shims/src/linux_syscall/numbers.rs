@@ -1416,8 +1416,8 @@ pub const NR_READLINKAT: u64 = 78;
 /// `__NR_sync_file_range`.
 pub const NR_SYNC_FILE_RANGE: u64 = 84;
 /// `NR_UTIMENSAT = 88` — Linux RV64 generic ABI `__NR_utimensat`.
-/// Slice 8 returns `-ENOSYS` (no `FsOps::set_times` hook yet); see
-/// the slice plan §"Out of scope".
+/// Updates `InodeMeta` timestamps through `FsOps::serialize_inode_meta`
+/// for the bringup path used by busybox `touch`.
 pub const NR_UTIMENSAT: u64 = 88;
 /// `NR_RENAMEAT2 = 276` — Linux RV64 generic ABI `__NR_renameat2`.
 /// Slice 8: `RENAME_NOREPLACE` honoured via a pre-walk existence
@@ -1444,8 +1444,7 @@ pub const RENAME_EXCHANGE: u32 = 2;
 pub const RENAME_WHITEOUT: u32 = 4;
 
 /// `UTIME_NOW = (1 << 30) - 1` — `utimensat(2)` "use current time"
-/// sentinel. Slice 8 carries the constant for grep-stability;
-/// `sys_utimensat` returns `-ENOSYS` regardless.
+/// sentinel.
 pub const UTIME_NOW: i64 = (1 << 30) - 1;
 /// `UTIME_OMIT = (1 << 30) - 2` — `utimensat(2)` "leave unchanged"
 /// sentinel.

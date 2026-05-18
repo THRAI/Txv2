@@ -684,8 +684,8 @@ pub(super) fn sys_umask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 //   - `sys_readlinkat` (NR_READLINKAT = 78) — walks parent directory
 //     and calls `FsOps::lookup` + `FsOps::read_link` so the symlink
 //     itself is returned (not its target).
-//   - `sys_utimensat` (NR_UTIMENSAT = 88) — returns `-ENOSYS` (no
-//     `FsOps::set_times` hook yet; deferred per slice plan).
+//   - `sys_utimensat` (NR_UTIMENSAT = 88) — updates inode timestamps
+//     through `FsOps::serialize_inode_meta`.
 //   - `sys_renameat2` (NR_RENAMEAT2 = 276) — `RENAME_NOREPLACE`
 //     honoured via pre-walk; `RENAME_EXCHANGE` / `RENAME_WHITEOUT`
 //     return `-ENOSYS` / `-EINVAL`.

@@ -1,0 +1,15 @@
+# busybox-touch-utimensat.txt — busybox touch via utimensat.
+#
+# Mirrors the OSComp busybox `touch test.txt` failure mode: busybox
+# creates the file, then calls `utimensat(..., NULL, 0)` to stamp the
+# current time.
+
+wait "/ # " within 30000
+sleep 500
+
+send "name=tx_touch_ok; /bin/busybox rm -f /tmp/$name; /bin/busybox touch /tmp/$name && /bin/busybox ls /tmp/$name\n"
+expect "/tmp/tx_touch_ok" within 8000
+expect "/ # " within 5000
+
+sleep 500
+quit

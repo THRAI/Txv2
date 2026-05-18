@@ -13,6 +13,7 @@ use crate::read_backend::{
     cursor_from_index, cursor_index, fs_object_id as inode_fs_object_id, inode_no, map_inode_meta,
     Ext4FsInstance, READDIR_WINDOW_ENTRIES,
 };
+use tx_ext4_format::pager::InodeMetaLite;
 
 // ext4 dir-entry file_type codes (POSIX-shaped). Maps the on-disk byte
 // code into the canonical `InodeKind` enum surfaced by `tx-subsystems`.
@@ -105,11 +106,21 @@ where
 
     fn serialize_inode_meta(
         &self,
-        _fs_object_id: FsObjectId,
-        _meta: &InodeMeta,
+        fs_object_id: FsObjectId,
+        meta: &InodeMeta,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match self.with_pager(|pager| pager.write_inode_meta(inode, inode_meta_lite(meta))) {
+            Ok(()) => StepOutcome::done(()),
+            Err(err) => StepOutcome::err(err.into()),
+        }
     }
 
     fn create_inode(
@@ -409,4 +420,27 @@ where
     }
 
     // `step_chmod`, `step_chown` inherit the trait-default `ENOSYS`.
+}
+
+fn inode_meta_lite(meta: &InodeMeta) -> InodeMetaLite {
+    fn sec_to_u32(sec: i64) -> u32 {
+        if sec <= 0 {
+            0
+        } else {
+            sec.min(u32::MAX as i64) as u32
+        }
+    }
+
+    InodeMetaLite {
+        mode: meta.mode,
+        uid: meta.uid,
+        gid: meta.gid,
+        size: meta.size,
+        nlinks: meta.nlinks,
+        blocks_512: meta.blocks,
+        flags: meta.flags,
+        atime: sec_to_u32(meta.atime.sec),
+        ctime: sec_to_u32(meta.ctime.sec),
+        mtime: sec_to_u32(meta.mtime.sec),
+    }
 }
