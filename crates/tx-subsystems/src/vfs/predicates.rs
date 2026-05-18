@@ -13,7 +13,7 @@ use crate::execution::Errno;
 use crate::vfs::adapter::step_engine::IdentRef;
 
 use super::checks::RootCtx;
-use super::structure::{Credential, DEntry, InodeKind, InodeMeta, OpenFileFlags, RNode};
+use super::structure::{Credential, DEntry, InodeKind, InodeMeta, OpenFileFlags, RNode, S_ISVTX};
 use crate::cred::Capability;
 
 // ---------------------------------------------------------------------------
@@ -101,6 +101,58 @@ pub fn check_descend_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), Err
     let bits = select_perm_triplet(meta, cred);
     if bits & 0o1 == 0 {
         return Err(Errno::EACCES);
+    }
+    Ok(())
+}
+
+/// DAC remove-entry check for `unlink(2)` / `unlinkat(2)` /
+/// `rmdir(2)`. Pure POSIX rule, applied against the *parent* directory:
+///
+/// 1. **Write** bit on parent's appropriate triplet must be set
+///    (writing to a directory means modifying its entry list).
+///    `CAP_DAC_OVERRIDE` bypasses.
+/// 2. **Search** bit must also be set (the entry's name is being
+///    addressed). `CAP_DAC_OVERRIDE` bypasses. Note: most callers
+///    have already exercised this through `check_descend_perm`
+///    during path resolution; we re-check defensively because
+///    `unlinkat(AT_REMOVEDIR=0, ".")` and similar shapes can land
+///    here without a prior descend.
+/// 3. **Sticky bit** (`S_ISVTX`) on parent: when set, only the
+///    file's owner, the parent's owner, or a caller with
+///    `CAP_FOWNER` (or `euid == 0` per the standard
+///    is_privileged_for shortcut) may remove the entry. This is
+///    the "/tmp protection rule" — POSIX `man 2 unlink`,
+///    `man 7 inode` §"sticky bit".
+///
+/// Maps to the standard `Errno::EACCES` (rules 1–2) and
+/// `Errno::EPERM` (rule 3) — matching Linux's `unlink(2)`
+/// distinction: write-bit failure is EACCES, sticky-bit ownership
+/// failure is EPERM.
+pub fn check_unlink_perm(
+    parent_meta: &InodeMeta,
+    child_meta: &InodeMeta,
+    cred: &Credential,
+) -> Result<(), Errno> {
+    let has_dac_override = cred.effective_caps.contains(Capability::DAC_OVERRIDE);
+    if !has_dac_override {
+        let bits = select_perm_triplet(parent_meta, cred);
+        // Write + search are both needed to remove an entry by name.
+        if bits & 0o3 != 0o3 {
+            return Err(Errno::EACCES);
+        }
+    }
+    // Sticky-bit rule. CAP_DAC_OVERRIDE does NOT bypass sticky —
+    // POSIX requires either ownership match or CAP_FOWNER.
+    if (parent_meta.mode & S_ISVTX) != 0 {
+        let owns_child = cred.uid == child_meta.uid;
+        let owns_parent = cred.uid == parent_meta.uid;
+        let has_fowner = cred.effective_caps.contains(Capability::FOWNER);
+        // Privileged shortcut: euid 0 short-circuits, consistent with
+        // Cred::is_privileged_for's POSIX-style behaviour.
+        let is_root = cred.uid == 0;
+        if !(owns_child || owns_parent || has_fowner || is_root) {
+            return Err(Errno::EPERM);
+        }
     }
     Ok(())
 }

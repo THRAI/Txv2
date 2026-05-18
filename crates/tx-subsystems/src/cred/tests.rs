@@ -755,6 +755,193 @@ fn require_open_honors_read_and_write_bits() {
     assert_eq!(err, Errno::EACCES);
 }
 
+// ---------- require_unlink ----------
+
+fn fresh_dir_meta(mode: u16, uid: u32, gid: u32) -> crate::vfs::structure::InodeMeta {
+    let mut m = crate::vfs::structure::InodeMeta::new(
+        crate::vfs::structure::InodeKind::Directory,
+        mode,
+    );
+    m.uid = uid;
+    m.gid = gid;
+    m
+}
+
+fn fresh_file_meta(mode: u16, uid: u32, gid: u32) -> crate::vfs::structure::InodeMeta {
+    let mut m =
+        crate::vfs::structure::InodeMeta::new(crate::vfs::structure::InodeKind::Regular, mode);
+    m.uid = uid;
+    m.gid = gid;
+    m
+}
+
+fn unprivileged_snap(uid: u32, gid: u32) -> CredSnapshot {
+    CredSnapshot::from_cred(Cred {
+        uid: Uid(uid),
+        euid: Uid(uid),
+        suid: Uid(uid),
+        gid: Gid(gid),
+        egid: Gid(gid),
+        sgid: Gid(gid),
+        effective_caps: CapabilitySet::EMPTY,
+        permitted_caps: CapabilitySet::EMPTY,
+    })
+}
+
+#[test]
+fn require_unlink_passes_for_writable_parent_owner() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_unlink;
+
+    let _g = setup();
+    // Owner of parent has rwx (0o700). Sticky not set. Owns parent
+    // and child. Permitted.
+    let parent = fresh_dir_meta(0o700, 1000, 1000);
+    let child = fresh_file_meta(0o600, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let _w = require_unlink(&snap, &parent, &child, &g).expect("owner with W+X");
+}
+
+#[test]
+fn require_unlink_denies_eacces_when_parent_lacks_write_bit() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_unlink;
+    use crate::execution::Errno;
+
+    let _g = setup();
+    // Parent mode 0o555 (r-xr-xr-x) — owner has no W. Sticky off.
+    let parent = fresh_dir_meta(0o555, 1000, 1000);
+    let child = fresh_file_meta(0o600, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let err = require_unlink(&snap, &parent, &child, &g)
+        .err()
+        .expect("denied");
+    assert_eq!(err, Errno::EACCES);
+}
+
+#[test]
+fn require_unlink_cap_dac_override_bypasses_write_bit() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_unlink;
+
+    let _g = setup();
+    // Parent denies write to everyone (0o555), but caller carries
+    // CAP_DAC_OVERRIDE → unlink permitted.
+    let parent = fresh_dir_meta(0o555, 0, 0);
+    let child = fresh_file_meta(0o600, 0, 0);
+    let mut caps = CapabilitySet::EMPTY;
+    caps.add(Capability::DAC_OVERRIDE);
+    let snap = CredSnapshot::from_cred(Cred {
+        uid: Uid(1000),
+        euid: Uid(1000),
+        suid: Uid(1000),
+        gid: Gid(1000),
+        egid: Gid(1000),
+        sgid: Gid(1000),
+        effective_caps: caps,
+        permitted_caps: CapabilitySet::EMPTY,
+    });
+    let g = guard();
+    let _w = require_unlink(&snap, &parent, &child, &g).expect("DAC_OVERRIDE bypass");
+}
+
+#[test]
+fn require_unlink_sticky_bit_denies_eperm_for_non_owner() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_unlink;
+    use crate::execution::Errno;
+    use crate::vfs::structure::S_ISVTX;
+
+    let _g = setup();
+    // /tmp-style: parent has sticky + world-writable. Caller has
+    // write+search bits, but owns neither parent nor child →
+    // EPERM (the /tmp protection rule).
+    let parent = fresh_dir_meta(S_ISVTX | 0o1777, 0, 0);
+    let child = fresh_file_meta(0o644, 2000, 2000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let err = require_unlink(&snap, &parent, &child, &g)
+        .err()
+        .expect("sticky denies");
+    assert_eq!(err, Errno::EPERM);
+}
+
+#[test]
+fn require_unlink_sticky_bit_permits_child_owner() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_unlink;
+    use crate::vfs::structure::S_ISVTX;
+
+    let _g = setup();
+    // Owns child but not parent. Sticky still permits — POSIX:
+    // sticky requires owner-of-child OR owner-of-parent.
+    let parent = fresh_dir_meta(S_ISVTX | 0o1777, 0, 0);
+    let child = fresh_file_meta(0o644, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let _w = require_unlink(&snap, &parent, &child, &g).expect("child owner");
+}
+
+#[test]
+fn require_unlink_sticky_bit_not_bypassed_by_dac_override() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_unlink;
+    use crate::execution::Errno;
+    use crate::vfs::structure::S_ISVTX;
+
+    let _g = setup();
+    // CAP_DAC_OVERRIDE handles the W bit but NOT the sticky-bit
+    // ownership rule — POSIX requires CAP_FOWNER (or owner match)
+    // to override sticky.
+    let parent = fresh_dir_meta(S_ISVTX | 0o1755, 0, 0);
+    let child = fresh_file_meta(0o644, 2000, 2000);
+    let mut caps = CapabilitySet::EMPTY;
+    caps.add(Capability::DAC_OVERRIDE);
+    let snap = CredSnapshot::from_cred(Cred {
+        uid: Uid(1000),
+        euid: Uid(1000),
+        suid: Uid(1000),
+        gid: Gid(1000),
+        egid: Gid(1000),
+        sgid: Gid(1000),
+        effective_caps: caps,
+        permitted_caps: CapabilitySet::EMPTY,
+    });
+    let g = guard();
+    let err = require_unlink(&snap, &parent, &child, &g)
+        .err()
+        .expect("DAC_OVERRIDE doesn't bypass sticky");
+    assert_eq!(err, Errno::EPERM);
+}
+
+#[test]
+fn require_unlink_sticky_bit_permits_cap_fowner() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_unlink;
+    use crate::vfs::structure::S_ISVTX;
+
+    let _g = setup();
+    // CAP_FOWNER is the POSIX bypass for sticky-bit ownership rule.
+    let parent = fresh_dir_meta(S_ISVTX | 0o1777, 0, 0);
+    let child = fresh_file_meta(0o644, 2000, 2000);
+    let mut caps = CapabilitySet::EMPTY;
+    caps.add(Capability::FOWNER);
+    let snap = CredSnapshot::from_cred(Cred {
+        uid: Uid(1000),
+        euid: Uid(1000),
+        suid: Uid(1000),
+        gid: Gid(1000),
+        egid: Gid(1000),
+        sgid: Gid(1000),
+        effective_caps: caps,
+        permitted_caps: CapabilitySet::EMPTY,
+    });
+    let g = guard();
+    let _w = require_unlink(&snap, &parent, &child, &g).expect("CAP_FOWNER bypass");
+}
+
 #[test]
 fn step_apply_suid_for_exec_at_secure_false_when_no_change() {
     let _g = setup();

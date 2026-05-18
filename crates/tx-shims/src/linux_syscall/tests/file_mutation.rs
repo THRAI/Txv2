@@ -33,6 +33,7 @@ const E_NOTDIR: i32 = 20;
 const E_ISDIR: i32 = 21;
 const E_INVAL: i32 = 22;
 const E_PERM: i32 = 1;
+const E_ACCES: i32 = 13;
 const E_NOSYS: i32 = 38;
 
 fn ensure_zero_frame_claimed() {
@@ -307,6 +308,46 @@ fn dispatch_unlinkat_at_removedir_on_file_returns_neg_enotdir() {
     );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_NOTDIR));
+    drop(path);
+}
+
+/// `unlinkat` from a non-privileged caller whose parent triplet
+/// lacks the write bit returns `-EACCES`. Locks in the
+/// `require_unlink` wiring: previously `sys_unlinkat` did no W-on-
+/// parent check and removed the file regardless of mode. Now the
+/// dispatch path runs `cred::checks::require_unlink` against the
+/// caller's syscall-entry `CredSnapshot` before invoking
+/// `FsOps::unlink`.
+#[test]
+fn dispatch_unlinkat_without_parent_write_returns_neg_eacces() {
+    use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
+
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    create_regular(&tmpfs, b"f");
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    // Drop caller to unprivileged uid/gid with no caps. Tmpfs root
+    // was minted under root_cred with `mode 0o755` (rwxr-xr-x) —
+    // owner has write, "other" doesn't. Caller is uid=2000, gid=2000
+    // → falls into the "other" triplet → no write bit → EACCES.
+    set_cred_ids_for_test(&proc_cap, 2000, 2000, 2000, 2000, 2000, 2000);
+    clear_caps_for_test(&proc_cap);
+
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/f");
+    let req = SyscallRequest::new(
+        NR_UNLINKAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_ACCES));
+    // File must remain — cred check ran *before* the FsOps unlink.
+    assert!(
+        lookup_exists(&tmpfs, b"f"),
+        "/f must survive a denied unlinkat"
+    );
     drop(path);
 }
 

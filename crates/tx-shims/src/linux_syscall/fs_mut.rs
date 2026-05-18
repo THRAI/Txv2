@@ -268,8 +268,24 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     if !want_rmdir && target_kind == InodeKind::Directory {
         return SyscallResult::Error(EISDIR_VALUE);
     }
+    // POSIX unlink/rmdir permission check (W+X on parent + S_ISVTX
+    // ownership rule). The walker only enforced search-on-ancestors
+    // — write-on-parent and the sticky-bit rule were unguarded before
+    // this check; routes through cred::checks::require_unlink so the
+    // witness chain is intact at the FsOps mint site.
+    let parent_meta = parent_dentry.rnode().meta();
+    let child_meta = target_dentry.rnode().meta();
     let outcome = {
         let guard = step_engine::guard();
+        let _auth = match tx_subsystems::cred::checks::require_unlink(
+            ctx.cred_snapshot(),
+            &parent_meta,
+            &child_meta,
+            &guard,
+        ) {
+            Ok(w) => w,
+            Err(e) => return SyscallResult::error_from(e),
+        };
         if want_rmdir {
             fs_ops.rmdir(parent_id, basename, target_id, &guard)
         } else {

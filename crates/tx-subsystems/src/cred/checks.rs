@@ -80,6 +80,28 @@ impl OpenAuthorized<'_> {
     }
 }
 
+/// Witness produced by [`require_unlink`].
+///
+/// Proves the caller may remove the entry whose parent + child
+/// metadata were checked, under the bound guard. The witness is
+/// consumed at the `FsOps::unlink` / `FsOps::rmdir` commit site;
+/// cred mints no reusable grant for unlink (§"Not every operation
+/// is tokenized").
+#[must_use = "the witness is the authorization receipt — drop it explicitly only if you really intend to throw away the proof"]
+pub struct UnlinkAuthorized<'g> {
+    _guard: PhantomData<&'g ()>,
+    _priv: (),
+}
+
+impl UnlinkAuthorized<'_> {
+    const fn new() -> Self {
+        Self {
+            _guard: PhantomData,
+            _priv: (),
+        }
+    }
+}
+
 // ----- require_* functions -----
 
 /// May the caller carrying `source` traverse the directory described
@@ -124,6 +146,33 @@ pub fn require_open<'g>(
     let projection = Credential::from(source);
     crate::vfs::predicates::check_open_perm(meta, flags, &projection)?;
     Ok(OpenAuthorized::new())
+}
+
+/// May the caller carrying `source` remove the entry whose parent
+/// and child are described by the supplied metadata?
+///
+/// Composes the POSIX rule for `unlink(2)` / `unlinkat(2)` /
+/// `rmdir(2)`:
+///
+/// - **Write + Search** on parent — `Errno::EACCES` on failure
+///   (`CAP_DAC_OVERRIDE` bypasses).
+/// - **Sticky bit** (`S_ISVTX`) on parent — caller must own the
+///   child OR own the parent OR carry `CAP_FOWNER` (or be euid 0).
+///   `Errno::EPERM` on failure (sticky doesn't yield to
+///   `CAP_DAC_OVERRIDE`).
+///
+/// Returns [`UnlinkAuthorized`] on success — consumed at the
+/// `FsOps::unlink` / `FsOps::rmdir` commit site.
+pub fn require_unlink<'g>(
+    source: &CredSnapshot,
+    parent_meta: &InodeMeta,
+    child_meta: &InodeMeta,
+    guard: &'g Guard<'_>,
+) -> Result<UnlinkAuthorized<'g>, Errno> {
+    let _ = guard;
+    let projection = Credential::from(source);
+    crate::vfs::predicates::check_unlink_perm(parent_meta, child_meta, &projection)?;
+    Ok(UnlinkAuthorized::new())
 }
 
 // Re-export the existing signal-send check so the cred::checks::* surface
