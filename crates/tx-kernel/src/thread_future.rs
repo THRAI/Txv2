@@ -295,21 +295,24 @@ pub async fn run_thread<P: TxPlatform>(
                     // surface — the post-`rt_sigreturn` userspace context
                     // — while keeping the handler's `a0` equal to `sig_no`.
                     //
-                    // RV64 a0 = regs[10]; LA64 a0 = regs[4]; see
-                    // `crate::adapter::step_engine::execution::USER_CONTEXT_A0_INDEX`
-                    // for the canonical constant, but `prepare_*` accesses
-                    // it through this same index so the values are pinned
-                    // here for the apply path.
-                    #[cfg(target_arch = "loongarch64")]
-                    const A0_INDEX: usize = 4;
-                    #[cfg(not(target_arch = "loongarch64"))]
-                    const A0_INDEX: usize = 10;
-                    if let Some(result) = tx_subsystems::thread_runtime::structure::drain_pending_syscall_return(&payload) {
+                    // The canonical `a0` register index lives in
+                    // `tx_subsystems::thread_runtime::execution::USER_CONTEXT_A0_INDEX`
+                    // and is the same index `prepare_userspace_entry_payload`
+                    // uses for the overlay we're pre-empting here. Source it
+                    // through that re-export so tx-kernel doesn't carry an
+                    // arch cfg (CI gate `CI-GATE-ARCH-LINT`).
+                    if let Some(result) =
+                        tx_subsystems::thread_runtime::structure::drain_pending_syscall_return(
+                            &payload,
+                        )
+                    {
                         let encoded = match result {
                             Ok(v) => v as u64,
                             Err(errno) => (-i64::from(errno)) as u64,
                         };
-                        orig_ctx.regs[A0_INDEX] = encoded as usize;
+                        orig_ctx.regs
+                            [tx_subsystems::thread_runtime::execution::USER_CONTEXT_A0_INDEX] =
+                            encoded as usize;
                     }
 
                     // Save pre-handler context for sigreturn (now

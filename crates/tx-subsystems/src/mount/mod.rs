@@ -652,8 +652,7 @@ pub fn umount(
     let pos = pos.or_else(|| {
         table.iter().position(|entry| {
             let root = entry.mount.root();
-            cap_raw_addr(root) == target_rnode_cap_addr
-                || root.fs_object_id() == target_rnode_id
+            cap_raw_addr(root) == target_rnode_cap_addr || root.fs_object_id() == target_rnode_id
         })
     });
 

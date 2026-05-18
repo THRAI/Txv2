@@ -719,7 +719,11 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         // bytes. Real FAT support tracks separately.
         "tmpfs" | "vfat" => {
             let tmpfs = alloc::sync::Arc::new(tx_fs::tmpfs::Tmpfs::new());
-            let label = if fstype_str == "vfat" { "vfat" } else { "tmpfs" };
+            let label = if fstype_str == "vfat" {
+                "vfat"
+            } else {
+                "tmpfs"
+            };
             (
                 tmpfs.clone().fs_ops_arc(),
                 tmpfs.fs_page_backing_arc(),

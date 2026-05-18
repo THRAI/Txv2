@@ -143,9 +143,9 @@ fn dispatch_clone_with_nonzero_stack_seeds_child_sp() {
         }
         other => panic!("expected Return(pid), got {other:?}"),
     };
-    let child = tx_subsystems::process::process_by_pid(
-        tx_subsystems::process::structure::Pid(child_pid as u32),
-    )
+    let child = tx_subsystems::process::process_by_pid(tx_subsystems::process::structure::Pid(
+        child_pid as u32,
+    ))
     .expect("child process is registered after clone");
     let child_leader = child.nth_thread(0).expect("child has leader thread");
     let saved = child_leader
