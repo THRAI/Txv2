@@ -428,8 +428,23 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
+    // POSIX link(2) permission: write + search on the new parent
+    // (sticky is NOT consulted — link only adds, doesn't remove).
+    // Walker only enforced search-on-ancestors; without this, any
+    // user that could search the new parent could create a name
+    // there. Routes through cred::checks::require_link so the
+    // witness chain is intact at the FsOps mint site.
+    let new_parent_meta = new_parent_dentry.rnode().meta();
     let outcome = {
         let guard = step_engine::guard();
+        let _auth = match tx_subsystems::cred::checks::require_link(
+            ctx.cred_snapshot(),
+            &new_parent_meta,
+            &guard,
+        ) {
+            Ok(w) => w,
+            Err(e) => return SyscallResult::error_from(e),
+        };
         fs_ops.link(new_parent_id, new_basename, source_id, &guard)
     };
     match outcome {

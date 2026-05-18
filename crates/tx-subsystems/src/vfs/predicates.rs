@@ -157,6 +157,32 @@ pub fn check_unlink_perm(
     Ok(())
 }
 
+/// DAC create-entry check for `link(2)` / `linkat(2)` (and any other
+/// "add a name to a directory" operation that doesn't remove). The
+/// rule is simpler than `check_unlink_perm`:
+///
+/// - **Write + Search** on the *new* parent: `EACCES` on failure
+///   (`CAP_DAC_OVERRIDE` bypasses).
+///
+/// Sticky (`S_ISVTX`) is *not* checked here — sticky's "only owner
+/// can remove" rule applies to operations that delete entries
+/// (`unlink` / `rmdir` / `rename` of the source). Adding a name
+/// doesn't touch any existing entry. Per POSIX `man 2 link` and
+/// `man 7 inode` §"sticky bit".
+pub fn check_link_perm(
+    new_parent_meta: &InodeMeta,
+    cred: &Credential,
+) -> Result<(), Errno> {
+    if cred.effective_caps.contains(Capability::DAC_OVERRIDE) {
+        return Ok(());
+    }
+    let bits = select_perm_triplet(new_parent_meta, cred);
+    if bits & 0o3 != 0o3 {
+        return Err(Errno::EACCES);
+    }
+    Ok(())
+}
+
 /// DAC R/W check for terminal-component open.
 /// Validates `OpenFileFlags::{read, write}` against the inode's
 /// owner/group permission triplet.  `CAP_DAC_OVERRIDE` short-circuits.

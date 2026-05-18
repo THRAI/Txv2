@@ -942,6 +942,78 @@ fn require_unlink_sticky_bit_permits_cap_fowner() {
     let _w = require_unlink(&snap, &parent, &child, &g).expect("CAP_FOWNER bypass");
 }
 
+// ---------- require_link ----------
+
+#[test]
+fn require_link_passes_for_writable_parent_owner() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_link;
+
+    let _g = setup();
+    let parent = fresh_dir_meta(0o700, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let _w = require_link(&snap, &parent, &g).expect("owner with W+X");
+}
+
+#[test]
+fn require_link_denies_eacces_when_parent_lacks_write_bit() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_link;
+    use crate::execution::Errno;
+
+    let _g = setup();
+    // Owner has r-xr-xr-x (0o555) — no write for anyone. Caller is owner.
+    let parent = fresh_dir_meta(0o555, 1000, 1000);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let err = require_link(&snap, &parent, &g)
+        .err()
+        .expect("denied");
+    assert_eq!(err, Errno::EACCES);
+}
+
+#[test]
+fn require_link_cap_dac_override_bypasses() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_link;
+
+    let _g = setup();
+    // World-unwritable but caller carries CAP_DAC_OVERRIDE.
+    let parent = fresh_dir_meta(0o555, 0, 0);
+    let mut caps = CapabilitySet::EMPTY;
+    caps.add(Capability::DAC_OVERRIDE);
+    let snap = CredSnapshot::from_cred(Cred {
+        uid: Uid(1000),
+        euid: Uid(1000),
+        suid: Uid(1000),
+        gid: Gid(1000),
+        egid: Gid(1000),
+        sgid: Gid(1000),
+        effective_caps: caps,
+        permitted_caps: CapabilitySet::EMPTY,
+    });
+    let g = guard();
+    let _w = require_link(&snap, &parent, &g).expect("DAC_OVERRIDE bypass");
+}
+
+#[test]
+fn require_link_sticky_bit_irrelevant() {
+    use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_link;
+    use crate::vfs::structure::S_ISVTX;
+
+    let _g = setup();
+    // Sticky set + world-writable. Sticky is *only* a removal-time
+    // rule (unlink / rmdir / rename source). Adding a name doesn't
+    // touch any existing entry, so sticky is silent here — non-owner
+    // with W+X passes.
+    let parent = fresh_dir_meta(S_ISVTX | 0o1777, 0, 0);
+    let snap = unprivileged_snap(1000, 1000);
+    let g = guard();
+    let _w = require_link(&snap, &parent, &g).expect("sticky doesn't gate creation");
+}
+
 #[test]
 fn step_apply_suid_for_exec_at_secure_false_when_no_change() {
     let _g = setup();
