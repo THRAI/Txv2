@@ -5,9 +5,16 @@
 ## Status
 <!-- txdoc:CSW-STATUS -->
 
-Draft v1. Companion to [`cred_service_v_1`](<cred_service_v_1_draft (2).md>) — documents
-how that contract is realised in the current code, the API surfaces that
-landed, the bypasses the audit closed, and the open items.
+Draft v1.1. Companion to [`cred_service_v_1`](<cred_service_v_1_draft (2).md>) —
+documents how that contract is realised in the current code, the API
+surfaces that landed, the bypasses the audit closed, and the open items.
+
+v1.1 update: closes the migration (`require_rename`, `require_chmod`,
+`require_chown` land; `sys_renameat2`, `sys_fchmodat`, `sys_fchownat`
+wired; lint-discovered `sys_mkdirat` / `sys_symlinkat` bypasses closed
+via `require_link`). New `xtask lint invariants cred-check` static gate
+enforces "every cred-relevant mutator syscall arm is authorised" with
+no ratchet.
 
 Read this when planning new cred-consuming syscalls, auditing existing arms
 for permission bypasses, or extending `cred::checks::*`. Read
@@ -160,13 +167,42 @@ pub fn require_unlink<'g>(
     guard: &'g Guard<'_>,
 ) -> Result<UnlinkAuthorized<'g>, Errno>;
 
-// Link
+// Link / mkdir / symlink (all share the W+X-on-new-parent rule)
 pub struct LinkAuthorized<'g>;
 pub fn require_link<'g>(
     source: &CredSnapshot,
     new_parent_meta: &InodeMeta,
     guard: &'g Guard<'_>,
 ) -> Result<LinkAuthorized<'g>, Errno>;
+
+// Rename — composes unlink + link rules, optional displaced-side check
+pub struct RenameAuthorized<'g>;
+pub fn require_rename<'g>(
+    source: &CredSnapshot,
+    old_parent_meta: &InodeMeta,
+    old_child_meta: &InodeMeta,
+    new_parent_meta: &InodeMeta,
+    displaced_child: Option<&InodeMeta>,
+    guard: &'g Guard<'_>,
+) -> Result<RenameAuthorized<'g>, Errno>;
+
+// Chmod / chown
+pub struct ChmodAuthorized<'g>;
+pub fn require_chmod<'g>(
+    source: &CredSnapshot,
+    target_meta: &InodeMeta,
+    new_mode: u16,
+    guard: &'g Guard<'_>,
+) -> Result<ChmodAuthorized<'g>, Errno>;
+
+pub struct ChownAuthorized<'g>;
+pub fn require_chown<'g>(
+    source: &CredSnapshot,
+    target_meta: &InodeMeta,
+    new_uid: Option<u32>,
+    new_gid: Option<u32>,
+    guard: &'g Guard<'_>,
+) -> Result<ChownAuthorized<'g>, Errno>;
 
 // Signal (re-exported from cred root for discoverability)
 pub struct SignalAuthorized<'g>;
@@ -296,9 +332,11 @@ take + drop their own auth guard internally.
 | `sys_tgkill` | `ThreadKillOp` direct drive (no cred check) | n/a | ⚠️ tgid==caller-pid constraint trivially permits; comment notes future migration site |
 | `sys_unlinkat` | `cred::checks::require_unlink(ctx.cred_snapshot(), parent_meta, child_meta, &guard)` | `UnlinkAuthorized<'g>` | ✅ wired |
 | `sys_linkat` | `cred::checks::require_link(ctx.cred_snapshot(), new_parent_meta, &guard)` | `LinkAuthorized<'g>` | ✅ wired |
-| `sys_renameat2` | `RenameOp` direct drive (no cred check) | n/a | ❌ **open audit item** — write-on-both-parents + sticky-on-old-parent not enforced |
-| `sys_fchmodat` | `ChmodOp` → per-FS `step_chmod(cred)` (e.g. `tmpfs::step_chmod`) | owner/CAP_FOWNER check inline in each FS | ⚠️ checked but **wrong layer** — rule lives in each FS impl rather than at `cred::checks::require_chmod` |
-| `sys_fchownat` | `ChownOp` → per-FS `step_chown(cred)` (e.g. `tmpfs::step_chown`) | privileged/own-uid+gid check inline in each FS | ⚠️ checked but **wrong layer** — same as chmod |
+| `sys_mkdirat` | `cred::checks::require_link(...)` (W+X on parent, same rule as link/symlink) | `LinkAuthorized<'g>` | ✅ wired |
+| `sys_symlinkat` | `cred::checks::require_link(...)` | `LinkAuthorized<'g>` | ✅ wired |
+| `sys_renameat2` | `cred::checks::require_rename(snapshot, old_parent, old_child, new_parent, displaced, &guard)` | `RenameAuthorized<'g>` | ✅ wired |
+| `sys_fchmodat` | `cred::checks::require_chmod(snapshot, target_meta, mode, &guard)` at arm + per-FS `step_chmod` (defense-in-depth) | `ChmodAuthorized<'g>` | ✅ wired at cred seam; per-FS rule retained as belt-and-braces (consolidation deferred) |
+| `sys_fchownat` | `cred::checks::require_chown(snapshot, target_meta, new_uid, new_gid, &guard)` at arm + per-FS `step_chown` | `ChownAuthorized<'g>` | ✅ wired at cred seam; per-FS rule retained |
 | `sys_openat` | Walker `check_open_perm` via VFS predicates | inline in walker | ⚠️ uses walker projection directly; could consume `OpenAuthorized` for witness chain |
 | Path-walk syscalls (stat, chdir, access, …) | Walker `check_descend_perm` via VFS predicates | inline in walker | ⚠️ uses walker projection directly; could consume `SearchAuthorized` for witness chain |
 
@@ -311,7 +349,7 @@ take + drop their own auth guard internally.
 ## Closed bypass audit
 <!-- txdoc:CSW-CLOSED-BYPASS-AUDIT -->
 
-Five real cred-bypass paths existed before this batch. All five closed:
+Eight real cred-bypass paths existed before this batch. All eight closed:
 
 | # | Syscall | What was missing | Closure commit |
 |---|---|---|---|
@@ -320,100 +358,113 @@ Five real cred-bypass paths existed before this batch. All five closed:
 | 3 | `sys_tkill` (thread) | `DeliverSignalOp` drove `deliver_posix_signal` without cred check | `6d27c78` |
 | 4 | `sys_unlinkat` | No write-on-parent enforcement; no `S_ISVTX` sticky-bit ownership rule | `a70a61f` |
 | 5 | `sys_linkat` | No write-on-new-parent enforcement | `68a005b` |
+| 6 | `sys_renameat2` | No write-on-both-parents; no sticky-bit ownership rule on old or displaced new | `e2748b1` |
+| 7 | `sys_mkdirat` | No write-on-parent enforcement (discovered by the cred-check lint) | `b675870` |
+| 8 | `sys_symlinkat` | No write-on-parent enforcement (discovered by the cred-check lint) | `b675870` |
 
-Each closure is regression-locked by a dispatch test in
+Each of #1–#6 is regression-locked by a dispatch test in
 [`tx-shims/.../tests/fcntl_misc.rs`](../../../crates/tx-shims/src/linux_syscall/tests/fcntl_misc.rs)
 or
 [`tx-shims/.../tests/file_mutation.rs`](../../../crates/tx-shims/src/linux_syscall/tests/file_mutation.rs)
 that exercises the syscall as a non-root caller and asserts the cred check
-fires before the commit primitive.
+fires before the commit primitive. #7 and #8 are gate-locked by the
+[`cred-check` lint](#static-ci-lint-cargo-xtask-lint-invariants-cred-check) — they remain in scope of
+the static gate which fails CI on any new untouched-mutator regression.
 
 ---
 
-## Open audit items
-<!-- txdoc:CSW-OPEN-AUDIT-ITEMS -->
+## Static CI lint: `cargo xtask lint invariants cred-check`
+<!-- txdoc:CSW-STATIC-CI-LINT-CARGO-XTASK-LINT-INVARIANTS-CRED-CHECK -->
 
-### `sys_renameat2` (real bypass)
-<!-- txdoc:CSW-OPEN-RENAMEAT2 -->
+Lives at
+[`xtask/src/lint_invariants_cred_check.rs`](../../../xtask/src/lint_invariants_cred_check.rs).
 
-POSIX rename rule is "unlink from old parent + create in new parent":
+**What it does.** Walks every `pub(super) (async )? fn sys_*` in
+`crates/tx-shims/src/linux_syscall/` (excluding `mod.rs`, `numbers.rs`,
+`tests/`). For each function, extracts the body via brace-depth
+tracking. If the body matches any of the [`MUTATOR_SIGNALS`] strings
+(signal-send primitives, StepOp wraps for kill / rename / chmod /
+chown / mkdir / etc., or `fs_ops.{unlink,link,rename,mkdir,symlink,
+create_inode,step_chmod,step_chown,step_truncate}`) AND matches *none*
+of the [`CRED_CHECK_SIGNALS`] strings (`cred::checks::require_*`,
+`cred::checks::authorize_*`, the legacy `cred::require_*` re-exports,
+`signal::script_kill_*` / `signal::script_deliver_signal`), it flags
+the function.
 
-- W+X on **old** parent (to remove the entry).
-- W+X on **new** parent (to add the entry).
-- `S_ISVTX` on old parent → caller must own old child, or own old parent,
-  or carry `CAP_FOWNER` (or be euid 0). EPERM otherwise.
-- If the rename **displaces** an existing entry at the new path
-  (POSIX-permitted same-type collision), `S_ISVTX` on new parent triggers
-  the same ownership rule against the displaced child.
+**Allow-list with rationale** (each entry's exception is documented
+inline in the lint source):
 
-Today's `tmpfs::rename` enforces none of these. `sys_renameat2` and the
-composite `RenameOp` walk paths but do no cred check.
+- `sys_tgkill` — tgid==caller-pid constraint makes source == target;
+  cred check trivially permitted. Future cross-process tgkill must
+  remove this entry and route through `script_deliver_signal`.
+- `sys_write` — hot-path: write reuses the access grant minted at
+  `open()`, per `cred_service_v_1` §"Hot path: use". The body also
+  synthesises a SIGPIPE self-send on broken-pipe writes, which is a
+  kernel-internal signal not subject to `require_signal_send`.
+- `sys_ftruncate` — hot-path: operates on an already-open fd whose
+  write grant was minted at `open()`.
 
-Proposed shape:
+**Failure mode.** No ratchet — the lint fails CI on any violation. The
+floor is zero from day one because the audit landed cred-check wiring
+for every flagged mutator before the lint did.
 
-```rust
-pub struct RenameAuthorized<'g>;
-pub fn require_rename<'g>(
-    source: &CredSnapshot,
-    old_parent_meta: &InodeMeta,
-    old_child_meta: &InodeMeta,
-    new_parent_meta: &InodeMeta,
-    new_child_meta: Option<&InodeMeta>,   // Some if displacing
-    guard: &'g Guard<'_>,
-) -> Result<RenameAuthorized<'g>, Errno>;
+**Run manually:**
+
+```
+cargo xtask lint invariants cred-check
 ```
 
-Body: `check_unlink_perm(old_parent, old_child)` + `check_link_perm(new_parent)`
-+ optional `check_unlink_perm(new_parent, new_child)` for the displaced
-side.
+**Sample output** (current state):
 
-### `sys_fchmodat` / `sys_fchownat` (layering, not security)
-<!-- txdoc:CSW-OPEN-CHMOD-CHOWN-LAYERING -->
-
-Cred is enforced — but the rule lives in each filesystem's `step_chmod` /
-`step_chown` implementation (`tmpfs::step_chmod`, `devfs::step_chmod`,
-`bdevfs::step_chmod`, `procfs::step_chmod`, and ext4-side equivalents).
-
-Per `cred_service_v_1` §"Cred owns credential semantics" the rule belongs
-in cred. The current FS-layer placement is a leftover from the
-DAC + setuid slice (Wave 3).
-
-Proposed shape:
-
-```rust
-pub struct ChmodAuthorized<'g>;
-pub fn require_chmod<'g>(
-    source: &CredSnapshot,
-    target_meta: &InodeMeta,
-    new_mode: u16,
-    guard: &'g Guard<'_>,
-) -> Result<ChmodAuthorized<'g>, Errno>;
-// Rule: owner OR CAP_FOWNER OR euid 0.
-
-pub struct ChownAuthorized<'g>;
-pub fn require_chown<'g>(
-    source: &CredSnapshot,
-    target_meta: &InodeMeta,
-    new_uid: Option<u32>,
-    new_gid: Option<u32>,
-    guard: &'g Guard<'_>,
-) -> Result<ChownAuthorized<'g>, Errno>;
-// Rule: arbitrary uid/gid → CAP_CHOWN / CAP_FOWNER / euid 0;
-//       otherwise non-privileged → only own uid/gid.
+```
+Invariants Lint — cred-check (every cred-mutator is gated)
+===========================================================
+audited mutator syscall arms: 9, allow-listed: 3
+  allow-listed (audit out-of-scope):
+    sys_ftruncate
+    sys_tgkill
+    sys_write
+violations: 0  ok
 ```
 
-Migration touches `FsOps::step_chmod` / `step_chown` signatures — those
-take `&Credential` (walker projection) today and would need to either
-keep that signature (and have `require_chmod` accept walker projection
-too) or shift to `&CredSnapshot`. The shift broadens because
-`Credential` is lossy (no suid/sgid/permitted_caps), so the FS-layer can't
-recover the snapshot from what it currently receives.
+**Adding a new syscall.** When a new `sys_*` arm in tx-shims drives a
+mutator primitive (FS rename / unlink / link / chmod / chown / signal-
+send / thread-kill / mkdir / symlink), the lint will flag it on first
+build. Resolution paths:
 
-Cleanest path: thread `CredSnapshot` through `FsOps::step_chmod` /
-`step_chown` (and other ops that take cred), delete the per-FS cred check,
-and add `require_chmod` / `require_chown` consumption at the syscall arm
-(or composite op). Until that lands, the per-FS check is defence-in-depth
-and not a security gap.
+1. **Add a cred check.** Route the mutation through a
+   `cred::checks::require_*` predicate or a cred-checked
+   `signal::script_*` script before the FsOps / signal primitive
+   dispatch. This is the expected path for almost every new arm.
+2. **Allow-list with rationale.** If the mutation is architecturally
+   self-only or otherwise outside cred's scope, add the function name
+   to `ALLOW_LIST` in the lint source with a comment explaining why.
+   Reviewers will scrutinise.
+
+**Adding a new mutator primitive.** When a new mutator (a new `FsOps`
+method, a new `step_*` function in signal/process, a new `StepOp` wrap)
+is introduced, add a matching string to `MUTATOR_SIGNALS`. Forgetting
+to do so leaves a hole — the lint won't flag arms that drive the new
+primitive. The convention is: every cred-mutating primitive earns a
+signal entry, every authorisation seam earns a check entry.
+
+---
+
+## Open follow-ups (not security gaps)
+<!-- txdoc:CSW-OPEN-FOLLOW-UPS -->
+
+### Per-FS chmod / chown rule consolidation
+<!-- txdoc:CSW-OPEN-PER-FS-CHMOD-CHOWN-CONSOLIDATION -->
+
+`sys_fchmodat` and `sys_fchownat` run the rule at the cred seam
+(`require_chmod` / `require_chown`). The per-FS `step_chmod` / `step_chown`
+in `tmpfs`, `devfs`, `bdevfs`, `procfs`, and (where applicable) `ext4`
+still enforce the rule internally as defense-in-depth.
+
+Consolidation step: thread a `&CredSnapshot` (or equivalent) through
+`FsOps::step_chmod` / `step_chown` and let those bodies *consume* the
+witness rather than re-deriving the rule. Then delete the per-FS check.
+Touches every FS implementation; deferred.
 
 ### Walker-side `require_path_search` / `require_open` adoption
 <!-- txdoc:CSW-OPEN-WALKER-ADOPTION -->
@@ -427,10 +478,11 @@ intact at the walker mint sites.
 
 Migration: the walker takes `&Credential` (walker projection) today and
 would need either:
-- the same projection-shaped overload of `require_*` (lossy → loses the
+- the same projection-shaped overload of `require_*` (lossy — loses the
   full `Cred` info that some future predicate might need), or
 - the syscall arm to pre-walk + check + thread the witness into the
-  composite op.
+  composite op (the pattern this batch used for unlink / link /
+  rename / chmod / chown / mkdir / symlink).
 
 Deferred. Not a security gap; an architectural alignment item.
 
@@ -439,8 +491,9 @@ Deferred. Not a security gap; an architectural alignment item.
 
 The `tgid != caller.pid → -ESRCH` short-circuit in `sys_tgkill`
 guarantees source == target, so the cred check trivially passes. When
-cross-process tgkill lands, route through `script_deliver_signal` like
-`sys_tkill` does. A comment at the syscall arm marks the migration site.
+cross-process tgkill lands, remove `sys_tgkill` from the lint allow-
+list and route through `script_deliver_signal` like `sys_tkill` does.
+A comment at the syscall arm marks the migration site.
 
 ---
 
@@ -515,9 +568,11 @@ Verification after the full batch:
 
 > Snapshot captured once at `SyscallCtx::new`; cred consumed via
 > `cred::checks::require_*` witnesses + `authorize_*` combinators;
-> auth-phase guard scoped to drop before commit; five real
+> auth-phase guard scoped to drop before commit; eight real
 > permission bypasses closed (`sys_kill` pid>0 / pgrp, `sys_tkill`,
-> `sys_unlinkat`, `sys_linkat`); `sys_renameat2` and chmod/chown
-> layering remain as open audit items; the witness chain is intact
-> at four FS / signal commit sites and the API is ready for further
-> adoption.
+> `sys_unlinkat`, `sys_linkat`, `sys_renameat2`, `sys_mkdirat`,
+> `sys_symlinkat`); `sys_fchmodat` / `sys_fchownat` route through the
+> cred seam at the syscall arm with the per-FS rule remaining as
+> defense-in-depth; `cargo xtask lint invariants cred-check` is the
+> static CI gate that fails on any new mutator syscall arm without an
+> authorisation gate.
