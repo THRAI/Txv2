@@ -8,6 +8,7 @@ pub use crate::adapter::step_engine::Guard;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Errno {
+    E2BIG,
     EACCES,
     /// Resource temporarily unavailable. Surfaced by `O_NONBLOCK` I/O
     /// paths (e.g. fd-ops Wave 3 `pipe::step_read` / `step_write` with
@@ -24,6 +25,12 @@ pub enum Errno {
     EBUSY,
     EDQUOT,
     EEXIST,
+    /// File too large — sem_num >= nsems in semop.
+    EFBIG,
+    /// Identifier removed — an IPC object (shm, sem, msg) was
+    /// removed (IPC_RMID) while the caller was blocked on it.
+    /// Linux value: 43.
+    EIDRM,
     EFAULT,
     EINVAL,
     /// Interrupted system call (EINTR path — D9-A signal delivery
@@ -73,12 +80,15 @@ pub enum Errno {
 impl From<Errno> for crate::adapter::step_engine::V3Errno {
     fn from(value: Errno) -> Self {
         match value {
+            Errno::E2BIG => Self::E2BIG,
             Errno::EACCES => Self::EACCES,
             Errno::EAGAIN => Self::EAGAIN,
             Errno::EBADF => Self::EBADF,
             Errno::EBUSY => Self::EBUSY,
             Errno::EDQUOT => Self::EDQUOT,
             Errno::EEXIST => Self::EEXIST,
+            Errno::EFBIG => Self::EFBIG,
+            Errno::EIDRM => Self::EIDRM,
             Errno::EFAULT => Self::EFAULT,
             Errno::EINVAL => Self::EINVAL,
             Errno::EINTR => Self::EINTR,
@@ -116,12 +126,15 @@ impl From<crate::adapter::step_engine::V3Errno> for Errno {
     fn from(value: crate::adapter::step_engine::V3Errno) -> Self {
         use crate::adapter::step_engine::V3Errno as V3;
         match value {
+            V3::E2BIG => Errno::E2BIG,
             V3::EACCES => Errno::EACCES,
             V3::EAGAIN => Errno::EAGAIN,
             V3::EBADF => Errno::EBADF,
             V3::EBUSY => Errno::EBUSY,
             V3::EDQUOT => Errno::EDQUOT,
             V3::EEXIST => Errno::EEXIST,
+            V3::EFBIG => Errno::EFBIG,
+            V3::EIDRM => Errno::EIDRM,
             V3::EFAULT => Errno::EFAULT,
             V3::EINVAL => Errno::EINVAL,
             V3::EINTR => Errno::EINTR,
