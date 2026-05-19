@@ -24,6 +24,12 @@ pub enum FlowKind {
     AgentReply    = 2,
     TimerExpire   = 3,
     AbortDelivery = 4,
+    /// Parent → child fork edge (OBS-V1 §15.9). `task_id` carries
+    /// the parent's PID and `wait_gen` carries the child's PID — the
+    /// pair uniquely identifies the spawn event so both producer
+    /// (anchored on parent track) and consumer (anchored on child
+    /// track) hash to the same `flow_id`.
+    Fork          = 5,
 }
 
 /// Compute the Perfetto flow_id for a producer/consumer pair.

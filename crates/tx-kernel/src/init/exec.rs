@@ -639,6 +639,22 @@ impl<P: TxPlatform> CoreInit<P> {
         // parent the per-thread tracks.
         let tid_low = thread.tid.0;
         let pid_low = init.pid.0;
+        let comm = init.comm();
+        // Resolve pgid + sid via the process's pgrp link. Init runs
+        // as session leader so sid == pid == pgid in production; we
+        // still pull through the live cap to avoid hard-coding that.
+        let init_pgrp = init.pgrp_cap();
+        let pgid_low = init_pgrp.pgid.0;
+        let sid_low = init_pgrp.session_cap().sid.0;
+        // OBS-V1 §15.7 + §15.8: emit the one-shot PCB identity bundle
+        // BEFORE submitting the leader so the daemon caches
+        // `(comm, pgid, sid)` before the next reactor poll
+        // materialises the per-process track on first slice.
+        // Perfetto rejects later TrackDescriptors that change a
+        // track's `parent_uuid`, so the metadata must arrive ahead
+        // of the first dispatch.
+        emit_process_label::<P>(pid_low, &comm);
+        emit_process_group::<P>(pid_low, pgid_low, sid_low);
         let submitted = BOOT_REACTOR.with(|reactor| {
             reactor.submit_task_with_meta(
                 crate::thread_future::PerHartSlotted::<P, _>::new(

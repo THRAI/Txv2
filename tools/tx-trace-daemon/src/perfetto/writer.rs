@@ -65,6 +65,20 @@ pub struct PftraceWriter {
     /// "no PID known" sentinel; the writer falls back to the
     /// hart-flat task track in that case.
     current_pid_per_hart: HashMap<u16, u32>,
+    /// Cached `pid → comm` mapping seeded by `PayloadProcessLabel`
+    /// Instants. Consulted when first materialising a process track
+    /// so the `ProcessDescriptor.process_name` reflects the real PCB
+    /// short name (`busybox`, `basic_exec`) instead of the synthetic
+    /// `pid-<N>` fallback. Unset PIDs fall through to the synthetic
+    /// name (graceful degrade for traces captured before the OBS-9
+    /// §15.7 wire format landed).
+    process_comm: HashMap<u32, String>,
+    /// Cached `pid → (pgid, sid)` mapping seeded by
+    /// `PayloadProcessGroup` Instants. Used to parent per-process
+    /// tracks under per-pgrp swimlanes (OBS-V1 §15.8). A missing
+    /// entry routes the process track to the top level — same shape
+    /// as the pre-§15.8 layout.
+    process_pgrp: HashMap<u32, (u32, u32)>,
 }
 
 impl PftraceWriter {
@@ -87,6 +101,8 @@ impl PftraceWriter {
             first_sequence_packet: true,
             current_task_per_hart: HashMap::new(),
             current_pid_per_hart: HashMap::new(),
+            process_comm: HashMap::new(),
+            process_pgrp: HashMap::new(),
         };
 
         // Emit the "harts process" track descriptor first.
@@ -225,6 +241,85 @@ impl PftraceWriter {
             }
         }
 
+        // OBS-V1 §15.7: process-label Instants seed `pid → comm`.
+        // Cache it now so the next non-Sched slice for this PID picks
+        // up the real PCB name when it first materialises the process
+        // track. We don't render the label itself as a slice — it's a
+        // metadata pulse, consumed by the daemon.
+        if r.payload_tag == TxPayloadTag::ProcessLabel as u16
+            && kind_byte == TxTraceKind::Instant as u8
+        {
+            if let Some((pid, comm)) = extract_process_label(r) {
+                self.process_comm.insert(pid, comm.clone());
+                // If the process track was already created (e.g. with
+                // `pid-<N>` or the parent's pre-execve comm), emit a
+                // fresh TrackDescriptor with the same UUID so Perfetto
+                // updates the track header to the new name. Skipped
+                // when no track exists yet — first slice for this PID
+                // will pick the name up from `process_comm` at
+                // `ensure_thread_track_under_process` time.
+                if let Some(desc) = self.tracks.rename_process_track(pid, &comm) {
+                    self.packets.push(TracePacket {
+                        trusted_packet_sequence_id: Some(SEQ_ID),
+                        track_descriptor: Some(desc),
+                        ..Default::default()
+                    });
+                }
+            }
+            // Skip emitting a Perfetto packet for the bare label
+            // itself — its only job is to seed the cache and
+            // (optionally) rename the existing track above.
+            return;
+        }
+
+        // OBS-V1 §15.8: process-group Instants seed `pid → (pgid, sid)`.
+        // We don't render the label as a slice — it's metadata only,
+        // consumed when the per-process track is first allocated so
+        // it can be parented under the right pgrp swimlane.
+        if r.payload_tag == TxPayloadTag::ProcessGroup as u16
+            && kind_byte == TxTraceKind::Instant as u8
+        {
+            if let Some((pid, pgid, sid)) = extract_process_group(r) {
+                self.process_pgrp.insert(pid, (pgid, sid));
+                // Eagerly allocate the pgrp swimlane so the next
+                // `ensure_thread_track_under_process` finds it via
+                // `parent_uuid` lookup. We do NOT re-emit the
+                // process track here — Perfetto's TrackDescriptor
+                // compatibility rules reject any later descriptor
+                // that changes a track's `parent_uuid`, and the
+                // kernel guarantees ProcessGroup arrives before
+                // the first slice for the same PID (emit order:
+                // metadata then submit_task_with_meta). Traces
+                // that race ahead of that ordering accept the
+                // unparented fallback rather than emit a
+                // conflicting descriptor.
+                if let Some(pgrp_desc) = self.tracks.ensure_pgrp_track(pgid, sid) {
+                    self.packets.push(TracePacket {
+                        trusted_packet_sequence_id: Some(SEQ_ID),
+                        track_descriptor: Some(pgrp_desc),
+                        ..Default::default()
+                    });
+                }
+            }
+            return;
+        }
+
+        // OBS-V1 §15.9: parent → child fork edges. Emit a paired
+        // pair of TrackEvents with the same `flow_id` so Perfetto
+        // draws an arrow from the parent's track (where clone()
+        // happened) to the child's track (where the new dispatch
+        // begins). Both anchors share the fork record's timestamp;
+        // the child's first Sched dispatch follows shortly after and
+        // the arrow ends up pointing at it.
+        if r.payload_tag == TxPayloadTag::ProcessFork as u16
+            && kind_byte == TxTraceKind::Instant as u8
+        {
+            if let Some((parent_pid, child_pid)) = extract_process_fork(r) {
+                self.emit_fork_flow(parent_pid, child_pid, r.ts, r.hart);
+            }
+            return;
+        }
+
         // Choose the slice track: the per-thread track parented under
         // a per-process track when both PID and TID are known for the
         // current hart; the hart-flat task track when only TID is
@@ -238,8 +333,33 @@ impl PftraceWriter {
         } else if let Some(&tid) = self.current_task_per_hart.get(&r.hart) {
             let pid = self.current_pid_per_hart.get(&r.hart).copied().unwrap_or(0);
             if pid != 0 {
-                let (uuid, proc_desc, thread_desc) =
-                    self.tracks.ensure_thread_track_under_process(pid, r.hart, tid);
+                // Use the cached PCB `comm` as the process track name
+                // when we've seen a ProcessLabel for this PID; fall
+                // through to the synthetic `pid-<N>` otherwise.
+                let proc_name = self.process_comm.get(&pid).cloned();
+                let pgrp = self.process_pgrp.get(&pid).copied();
+                // If we know the (pgid, sid), make sure the per-pgrp
+                // swimlane exists FIRST so subsequent ensure_thread_*
+                // can parent under it. Emit the descriptor inline so
+                // Perfetto picks up the hierarchy.
+                if let Some((pgid, sid)) = pgrp {
+                    if let Some(pgrp_desc) = self.tracks.ensure_pgrp_track(pgid, sid) {
+                        self.packets.push(TracePacket {
+                            trusted_packet_sequence_id: Some(SEQ_ID),
+                            track_descriptor: Some(pgrp_desc),
+                            ..Default::default()
+                        });
+                    }
+                }
+                let (uuid, proc_desc, thread_desc) = self
+                    .tracks
+                    .ensure_thread_track_under_process(
+                        pid,
+                        r.hart,
+                        tid,
+                        proc_name.as_deref(),
+                        pgrp.map(|(pgid, _)| pgid),
+                    );
                 if let Some(d) = proc_desc {
                     self.packets.push(TracePacket {
                         trusted_packet_sequence_id: Some(SEQ_ID),
@@ -366,25 +486,44 @@ impl PftraceWriter {
                     self.push_resume(r.ts, hart_uuid, task_id_low, wait_gen);
                 } else {
                     let name_id = parse_hex_u32(&r.name_id);
-                    let (iid, new_name) = self.names.intern(name_id);
 
                     // OBS-V1 §8.6: `ArgValue` continuation records carry the
                     // raw syscall arg (or other annotation) as the
-                    // payload's `value0` field. Surface that value as a
-                    // debug annotation on the instant so the Perfetto
-                    // "Current Selection" panel shows the actual u64 next
-                    // to the arg name (`a0`, `a1`, …) instead of just an
-                    // anonymous anchor.
+                    // payload's `value0` field. We surface that value in
+                    // TWO complementary ways:
+                    //   1. As the `TrackEvent.name` itself — formatted as
+                    //      e.g. `a0=0x1234`. Perfetto renders Instants as
+                    //      vertical markers labeled by the event name, so
+                    //      this puts the register value directly on the
+                    //      timeline next to the syscall slice (no click
+                    //      needed). We intern the formatted string fresh
+                    //      per (arg_name, value) pair via `intern_str`.
+                    //   2. As a `DebugAnnotation` named "value" — keeps
+                    //      the structured value reachable from the
+                    //      "Current Selection" panel so tooling can
+                    //      diff/filter on it without parsing the label.
                     let arg_value =
                         (r.payload_tag == TxPayloadTag::ArgValue as u16)
                             .then(|| extract_arg_value_field(r));
 
+                    let (iid, new_name) = if let Some(v) = arg_value {
+                        // Resolve the arg's base name (`a0`, `a1`, …)
+                        // through the regular names.json path, then
+                        // format `name=0x<hex>` and intern THAT as the
+                        // Instant's visible label.
+                        let base = self
+                            .names
+                            .get_resolved_name(name_id)
+                            .unwrap_or_else(|| format!("arg_0x{name_id:08x}"));
+                        let label = format!("{base}=0x{v:x}");
+                        self.names.intern_str(&label)
+                    } else {
+                        self.names.intern(name_id)
+                    };
+
                     let mut debug_annotation_names = vec![];
                     let mut debug_annotations = vec![];
                     if let Some(v) = arg_value {
-                        // Reuse the same intern table for the annotation
-                        // key ("value"); cheap and keeps the wire packets
-                        // small.
                         let (value_iid, value_new_name) = self.names.intern_str("value");
                         if let Some(n) = value_new_name {
                             debug_annotation_names.push(DebugAnnotationName {
@@ -451,6 +590,116 @@ impl PftraceWriter {
             );
             self.packets.push(pkt);
         }
+    }
+
+    /// Emit a paired-arrow flow connecting the parent's track to the
+    /// child's track for a fork/clone edge (OBS-V1 §15.9).
+    ///
+    /// Materialises both processes' Perfetto tracks first (using
+    /// cached `comm` + `pgid` if known) so each anchor has a real
+    /// `track_uuid`. Then emits two Instant TrackEvents sharing the
+    /// same `flow_id`; Perfetto's flow-arrow renderer pairs them
+    /// across tracks. The fork record's timestamp anchors both ends
+    /// — the child's first Sched dispatch arrives shortly after, so
+    /// the arrow's downstream end ends up pointing at the new
+    /// process's first run.
+    fn emit_fork_flow(&mut self, parent_pid: u32, child_pid: u32, ts: u64, hart: u16) {
+        use crate::perfetto::flow::{compute_flow_id, FlowKind};
+        let fid = compute_flow_id(
+            parent_pid,
+            child_pid as u64,
+            FlowKind::Fork,
+            self.boot_id,
+        );
+
+        // Resolve parent's process track. Materialise it under the
+        // right pgrp swimlane if we have the cached metadata.
+        let parent_comm = self.process_comm.get(&parent_pid).cloned();
+        let parent_pgrp = self.process_pgrp.get(&parent_pid).copied();
+        if let Some((pgid, sid)) = parent_pgrp {
+            if let Some(d) = self.tracks.ensure_pgrp_track(pgid, sid) {
+                self.packets.push(TracePacket {
+                    trusted_packet_sequence_id: Some(SEQ_ID),
+                    track_descriptor: Some(d),
+                    ..Default::default()
+                });
+            }
+        }
+        let (parent_uuid, parent_desc) = self.tracks.ensure_process_track(
+            parent_pid,
+            parent_comm.as_deref(),
+            parent_pgrp.map(|(pgid, _)| pgid),
+        );
+        if let Some(d) = parent_desc {
+            self.packets.push(TracePacket {
+                trusted_packet_sequence_id: Some(SEQ_ID),
+                track_descriptor: Some(d),
+                ..Default::default()
+            });
+        }
+
+        // Resolve / materialise the child's process track the same
+        // way. The child may not yet have any slices — we still
+        // create the descriptor now so the flow's downstream anchor
+        // has a track to land on.
+        let child_comm = self.process_comm.get(&child_pid).cloned();
+        let child_pgrp = self.process_pgrp.get(&child_pid).copied();
+        if let Some((pgid, sid)) = child_pgrp {
+            if let Some(d) = self.tracks.ensure_pgrp_track(pgid, sid) {
+                self.packets.push(TracePacket {
+                    trusted_packet_sequence_id: Some(SEQ_ID),
+                    track_descriptor: Some(d),
+                    ..Default::default()
+                });
+            }
+        }
+        let (child_uuid, child_desc) = self.tracks.ensure_process_track(
+            child_pid,
+            child_comm.as_deref(),
+            child_pgrp.map(|(pgid, _)| pgid),
+        );
+        if let Some(d) = child_desc {
+            self.packets.push(TracePacket {
+                trusted_packet_sequence_id: Some(SEQ_ID),
+                track_descriptor: Some(d),
+                ..Default::default()
+            });
+        }
+
+        // Producer side — anchored on parent's track at fork ts.
+        self.packets.push(TracePacket {
+            timestamp: Some(ts),
+            timestamp_clock_id: Some(self.perfetto_clock_id()),
+            trusted_packet_sequence_id: Some(SEQ_ID),
+            track_event: Some(TrackEvent {
+                track_uuid: Some(parent_uuid),
+                r#type: Some(TrackEventType::Instant as i32),
+                name: Some(format!("fork→{child_pid}")),
+                flow_ids: vec![fid],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        // Consumer side — anchored on child's track at the same ts;
+        // the actual `Sched` dispatch arrives a few hundred
+        // nanoseconds later but Perfetto resolves the arrow head to
+        // whichever side carries the matching `terminating_flow_id`.
+        self.packets.push(TracePacket {
+            timestamp: Some(ts),
+            timestamp_clock_id: Some(self.perfetto_clock_id()),
+            trusted_packet_sequence_id: Some(SEQ_ID),
+            track_event: Some(TrackEvent {
+                track_uuid: Some(child_uuid),
+                r#type: Some(TrackEventType::Instant as i32),
+                name: Some(format!("forked←{parent_pid}")),
+                terminating_flow_ids: vec![fid],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let _ = hart; // currently unused; reserved for per-hart
+                      // anchoring tweaks if the simple ts-pair flow
+                      // proves too noisy under SMP.
     }
 
     /// Handle a WaitSourceNotify record — compute flow_id and attach it.
@@ -742,6 +991,52 @@ fn extract_arg_value_field(r: &DecodedRecord) -> u64 {
         .as_ref()
         .and_then(|p| p["value0"].as_u64())
         .unwrap_or(0)
+}
+
+/// Extract `(process_id_low, comm_string)` from a `ProcessLabel`
+/// payload JSON. `comm` is rendered from the wire `[u8; 12]` by
+/// stopping at the first NUL or non-printable byte; if no printable
+/// bytes precede the NUL we drop the label (graceful degrade so a
+/// corrupt name doesn't replace a synthetic `pid-<N>` with the empty
+/// string).
+fn extract_process_label(r: &DecodedRecord) -> Option<(u32, String)> {
+    let p = r.payload.as_ref()?;
+    let pid = p["process_id_low"].as_u64()? as u32;
+    let bytes = p["comm"].as_array()?;
+    let mut s = String::new();
+    for b in bytes {
+        let byte = b.as_u64()? as u8;
+        if byte == 0 {
+            break;
+        }
+        if !(0x20..=0x7e).contains(&byte) {
+            return None;
+        }
+        s.push(byte as char);
+    }
+    if s.is_empty() {
+        return None;
+    }
+    Some((pid, s))
+}
+
+/// Extract `(parent_pid, child_pid)` from a `ProcessFork` payload JSON.
+fn extract_process_fork(r: &DecodedRecord) -> Option<(u32, u32)> {
+    let p = r.payload.as_ref()?;
+    let parent = p["parent_pid_low"].as_u64()? as u32;
+    let child = p["child_pid_low"].as_u64()? as u32;
+    Some((parent, child))
+}
+
+/// Extract `(pid, pgid, sid)` from a `ProcessGroup` payload JSON.
+/// Returns `None` if the payload is malformed; callers leave the
+/// `process_pgrp` cache unchanged (graceful degrade).
+fn extract_process_group(r: &DecodedRecord) -> Option<(u32, u32, u32)> {
+    let p = r.payload.as_ref()?;
+    let pid = p["process_id_low"].as_u64()? as u32;
+    let pgid = p["pgid_low"].as_u64()? as u32;
+    let sid = p["sid_low"].as_u64()? as u32;
+    Some((pid, pgid, sid))
 }
 
 /// Extract `(task_id_low, process_id_low)` from a `SchedSwitch` payload JSON.

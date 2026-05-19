@@ -62,6 +62,34 @@ pub enum TxPayloadTag {
     /// Payload: [`PayloadSchedSwitch`].
     SchedSwitch = 53,
 
+    // ── Process identity label (OBS-V1 §15.7) ────────────────────────────
+    /// One-shot mapping from `process_id_low` → human-readable
+    /// program name (PCB `comm` — short 16-byte Linux-style identity).
+    ///
+    /// Emitted as an `Instant` once per process at submit time so the
+    /// trace daemon can build a `ProcessDescriptor.process_name` from
+    /// the actual program identity (e.g. `busybox`, `basic_exec`)
+    /// instead of falling back to the synthetic `pid-<N>` label.
+    /// Payload: [`PayloadProcessLabel`].
+    ProcessLabel = 54,
+
+    /// One-shot mapping from `process_id_low` → owning process-group
+    /// id + session id (PCB `pgid` / `sid`). Lets the daemon nest
+    /// per-process Perfetto tracks under per-pgrp / per-session
+    /// swimlanes so test runners + their fork()ed children render as
+    /// a coherent group rather than scattered top-level lanes.
+    /// Emitted alongside [`Self::ProcessLabel`]. Payload:
+    /// [`PayloadProcessGroup`].
+    ProcessGroup = 55,
+
+    /// One-shot parent → child fork edge. Emitted once on the child's
+    /// submission so the daemon can draw a control-flow arrow from
+    /// the parent's `clone()` syscall slice to the child's first
+    /// `Sched` dispatch — making process-tree spawning visible on
+    /// the timeline instead of just appearing as a new top-level
+    /// track out of nowhere. Payload: [`PayloadProcessFork`].
+    ProcessFork = 56,
+
     // ── Panic (special) ───────────────────────────────────────────────────
     Panic = 60,
 }
@@ -495,6 +523,79 @@ pub enum SchedReason {
     /// was already set during the poll itself, so the reactor will
     /// re-dispatch immediately.  (`mark_runnable_from_hart` path.)
     WokeDuringPoll = 3,
+}
+
+/// One-shot mapping from `process_id_low` to a 12-byte slice of the
+/// PCB short program name.  Emitted as an `Instant` once per process,
+/// immediately after submit.  The daemon caches `pid → name` and
+/// uses it as the `ProcessDescriptor.process_name` when first
+/// materialising the per-process Perfetto track, so the timeline
+/// shows real program names (`busybox`, `basic_exec`) instead of the
+/// synthetic `pid-<N>` fallback.
+///
+/// `comm` is truncated to 12 bytes (vs Linux's 16) so the whole
+/// payload fits in `TxTraceRecord.payload` (16 bytes inline). Names
+/// longer than 11 chars + NUL are truncated; this is fine for the
+/// oscomp + busybox workloads where `comm` is typically ≤ 8 bytes.
+///
+/// Layout spec: `08_OBSERVATION_v1.md` §15.7 (OBS-9 process labels).
+/// size = 16.
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadProcessLabel {
+    /// PCB PID low 32 bits — keyed against `PayloadSchedSwitch.process_id_low`.
+    pub process_id_low: u32,
+    /// First 12 bytes of `ProcessIdentity::comm()` (NUL-padded ASCII).
+    /// Truncated from the full 16-byte `TASK_COMM_LEN`-style buffer to
+    /// fit the inline payload size.
+    pub comm: [u8; 12],
+}
+
+/// One-shot mapping from `process_id_low` → owning `pgid` + `sid`.
+/// Emitted as an `Instant` alongside [`PayloadProcessLabel`] at
+/// submit / post-exec time. The daemon caches `pid → (pgid, sid)`
+/// and parents each per-process Perfetto track under a per-pgrp
+/// swimlane so a shell + its fork()ed children render together.
+///
+/// Layout spec: `08_OBSERVATION_v1.md` §15.8 (OBS-9 process groups).
+/// size = 16.
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadProcessGroup {
+    /// PCB PID low 32 bits.
+    pub process_id_low: u32,
+    /// PCB `Pgid` (process-group id) low 32 bits.
+    pub pgid_low: u32,
+    /// PCB `Sid` (session id) low 32 bits.
+    pub sid_low: u32,
+    /// Reserved (kept zero).
+    pub _pad: u32,
+}
+
+/// Parent → child fork edge. Emitted as an Instant once per
+/// new process at submit time. The daemon hashes
+/// `(parent_pid, child_pid)` into a Perfetto `flow_id` and emits
+/// two `FlowEvent`s — one anchored to the parent's most recent
+/// `clone()` slice, one anchored to the child's first Sched
+/// dispatch — so the timeline shows an arrow from the parent's
+/// fork-point to the child's first run.
+///
+/// Layout spec: `08_OBSERVATION_v1.md` §15.9 (OBS-9 fork edges).
+/// size = 16.
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
+pub struct PayloadProcessFork {
+    /// Forking parent's PID low 32 bits.
+    pub parent_pid_low: u32,
+    /// Newly-spawned child's PID low 32 bits.
+    pub child_pid_low: u32,
+    /// Reserved for `flags` (CLONE_*) on a future revision.
+    pub _flags: u32,
+    /// Reserved for alignment / future fields.
+    pub _pad: u32,
 }
 
 // ---------------------------------------------------------------------------

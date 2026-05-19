@@ -79,6 +79,73 @@ const INTERP_BASE: u64 = 0x3F_F000_0000;
 
 // ASLR functions moved inline to exec_script_inner
 
+/// Emit a OBS-V1 §15.7 ProcessLabel Instant mapping `pid` to the PCB
+/// `comm` just committed by `step_store_exec_identity`-equivalent
+/// logic above. The daemon caches `pid → comm` and uses it as the
+/// per-process Perfetto track's `ProcessDescriptor.process_name`, so
+/// the timeline shows real program names (`busybox`, `basic_exec`)
+/// for processes that exec'd into a new binary mid-trace.
+///
+/// No-op when no `HartEmitter` is installed on this hart (host
+/// tests, boards without an observation ring) — same fallback
+/// shape as the kernel's `init.rs::emit_process_label`.
+fn emit_process_label_for(pid_low: u32, comm: &[u8; 16]) {
+    let Some(em) = tx_observe::current() else {
+        return;
+    };
+    let mut truncated = [0u8; 12];
+    let n = core::cmp::min(comm.len(), truncated.len());
+    truncated[..n].copy_from_slice(&comm[..n]);
+    if !truncated.iter().any(|&b| b == 0) {
+        truncated[truncated.len() - 1] = 0;
+    }
+    let payload = tx_observe::PayloadProcessLabel {
+        process_id_low: pid_low,
+        comm: truncated,
+    };
+    let (enc, len) = tx_observe::encode::encode_process_label(&payload);
+    em.instant(
+        tx_observe::TxTraceLevel::Sched,
+        // Same `0x9000_0000 | pid` namespace as
+        // `tx-kernel::init::emit_process_label` so the daemon's
+        // dedupe sees both submit-time and post-exec re-emits as the
+        // same logical event.
+        tx_observe::EventNameId::from_raw(0x9000_0000 | pid_low),
+        tx_observe::current_parent_span(),
+        tx_observe::encode::process_label_tag(),
+        &enc[..len as usize],
+    );
+}
+
+/// Companion to [`emit_process_label_for`] — emits the OBS-V1 §15.8
+/// PCB-group bundle (`pid → pgid + sid`) so the daemon can parent
+/// the per-process Perfetto track under a pgrp swimlane. Called
+/// from exec_script's post-PoNR `comm` commit alongside the
+/// re-emit of [`PayloadProcessLabel`]; the kernel submit-time
+/// site emits both via the `tx-kernel::init::emit_process_group`
+/// twin.
+fn emit_process_group_for(pid_low: u32, pgid_low: u32, sid_low: u32) {
+    let Some(em) = tx_observe::current() else {
+        return;
+    };
+    let payload = tx_observe::PayloadProcessGroup {
+        process_id_low: pid_low,
+        pgid_low,
+        sid_low,
+        _pad: 0,
+    };
+    let (enc, len) = tx_observe::encode::encode_process_group(&payload);
+    em.instant(
+        tx_observe::TxTraceLevel::Sched,
+        // Same `0xA000_0000 | pid` namespace as
+        // `tx-kernel::init::emit_process_group`.
+        tx_observe::EventNameId::from_raw(0xA000_0000 | pid_low),
+        tx_observe::current_parent_span(),
+        tx_observe::encode::process_group_tag(),
+        &enc[..len as usize],
+    );
+}
+
 /// Initial-read window over the ELF image used to cover the header and
 /// program-header table. Sized at one page (4 KiB) which is well over
 /// `Elf64_Ehdr` (64 bytes) + `MAX_PHDRS=64 * Elf64_Phdr=56` ≈ 3.6 KiB.
@@ -905,13 +972,45 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     step_close_cloexec_fds(process);
     step_reset_signal_dispositions_for_exec(process);
     step_install_brk_for_exec(process, new_brk_base);
-    // Store executable reference and cmdline for procfs (§EXEC_v1 §3.7).
+    // Store executable reference, cmdline, AND comm for procfs and
+    // observation (§EXEC_v1 §3.7). The PCB short name (`comm`) is the
+    // basename of argv[0] truncated to 15 bytes + NUL — Linux
+    // `TASK_COMM_LEN`. Populating it here closes the gap where the
+    // process payload's `_comm` slot stayed `[0; 16]` for the entire
+    // process lifetime, and lets OBS-V1 §15.7 ProcessLabel emits read
+    // a meaningful name back from `process.comm()` (so Perfetto
+    // shows e.g. `busybox` / `basic_exec` instead of `pid-<N>`).
+    let mut committed_comm: Option<[u8; 16]> = None;
     if let Some(payload) = process.payload_slot().lock().as_ref() {
         if let Some(dentry) = openfile.opendir_dentry() {
             *payload._exe_file.lock() = Some(dentry.clone());
         }
-        let cmdline_bytes = argv.first().map(|s| s.to_vec()).unwrap_or_default();
+        let argv0 = argv.first().copied().unwrap_or(b"");
+        // basename(argv[0]) — strip everything up to the last `/`.
+        let comm_src = match argv0.iter().rposition(|&b| b == b'/') {
+            Some(i) => &argv0[i + 1..],
+            None => argv0,
+        };
+        let mut comm_buf = [0u8; 16];
+        let n = core::cmp::min(comm_src.len(), 15);
+        comm_buf[..n].copy_from_slice(&comm_src[..n]);
+        *payload._comm.lock() = comm_buf;
+        let cmdline_bytes = argv0.to_vec();
         *payload._cmdline.lock() = Some(cmdline_bytes);
+        committed_comm = Some(comm_buf);
+    }
+    // OBS-V1 §15.7 + §15.8: re-emit the PCB identity bundle once
+    // the payload-slot lock has been dropped — `pgrp_cap()` takes
+    // its own spin lock and the observation emit path may itself
+    // touch unrelated process state, so doing it inside the
+    // payload-lock scope risks lock-order surprises (we previously
+    // hung under busybox here). Splitting the emit out keeps each
+    // lock acquisition flat and short.
+    if let Some(comm_buf) = committed_comm {
+        emit_process_label_for(process.pid.0, &comm_buf);
+        let pgrp = process.pgrp_cap();
+        let sid = pgrp.session_cap().sid.0;
+        emit_process_group_for(process.pid.0, pgrp.pgid.0, sid);
     }
     // vfork completion: if the parent is waiting on CLONE_VFORK,
     // unblock it now that exec has completed.
