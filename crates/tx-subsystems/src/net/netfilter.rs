@@ -7,11 +7,14 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use smoltcp::wire::{IpProtocol, Ipv4Address as SmoltcpIpv4Address, Ipv4Packet};
+use smoltcp::wire::{
+    IpAddress, IpProtocol, Ipv4Address as SmoltcpIpv4Address, Ipv4Packet, TcpPacket, UdpPacket,
+};
 
 use crate::execution::Errno;
 use crate::net::protocol::{parse_icmpv4_payload, Icmpv4Event};
 use crate::net::structure::Ipv4Address;
+use crate::net::NetNamespacePayload;
 use crate::sync::SpinMutex;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,10 +69,21 @@ pub struct NetfilterRule {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetfilterConntrackProtocol {
+    Icmp,
+    Tcp,
+    Udp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NetfilterConntrackSnapshot {
+    pub protocol: NetfilterConntrackProtocol,
     pub original_src: Ipv4Address,
+    pub original_src_port: u16,
     pub masquerade_src: Ipv4Address,
+    pub masquerade_src_port: u16,
     pub external_dst: Ipv4Address,
+    pub external_dst_port: u16,
     pub icmp_ident: u16,
 }
 
@@ -92,14 +106,24 @@ struct NetfilterStats {
 
 static NETFILTER_STATS: NetfilterStats = NetfilterStats::new();
 static NETFILTER_RULES: SpinMutex<Vec<NetfilterRule>> = SpinMutex::new(Vec::new());
-static NETFILTER_CONNTRACK: SpinMutex<Vec<IcmpMasqueradeConntrack>> = SpinMutex::new(Vec::new());
+static NETFILTER_CONNTRACK: SpinMutex<Vec<MasqueradeConntrack>> = SpinMutex::new(Vec::new());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct IcmpMasqueradeConntrack {
+struct MasqueradeConntrack {
+    protocol: NetfilterConntrackProtocol,
     original_src: Ipv4Address,
+    original_src_port: u16,
     masquerade_src: Ipv4Address,
+    masquerade_src_port: u16,
     external_dst: Ipv4Address,
-    icmp_ident: u16,
+    external_dst_port: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct L4Tuple {
+    protocol: NetfilterConntrackProtocol,
+    src_port: u16,
+    dst_port: u16,
 }
 
 impl NetfilterStats {
@@ -185,6 +209,20 @@ pub fn add_masquerade_rule_for_test_or_bootstrap(
     })
 }
 
+pub fn remove_netfilter_rule_for_test_or_bootstrap(index: usize) -> Result<(), Errno> {
+    let mut rules = NETFILTER_RULES.lock();
+    if index >= rules.len() {
+        return Err(Errno::ENOENT);
+    }
+    rules.remove(index);
+    Ok(())
+}
+
+pub fn flush_netfilter_rules_and_conntrack_for_test_or_bootstrap() {
+    NETFILTER_RULES.lock().clear();
+    NETFILTER_CONNTRACK.lock().clear();
+}
+
 pub fn netfilter_rules_snapshot() -> Vec<NetfilterRule> {
     NETFILTER_RULES.lock().clone()
 }
@@ -195,12 +233,77 @@ pub fn netfilter_conntrack_snapshot() -> Vec<NetfilterConntrackSnapshot> {
         .iter()
         .copied()
         .map(|entry| NetfilterConntrackSnapshot {
+            protocol: entry.protocol,
             original_src: entry.original_src,
+            original_src_port: entry.original_src_port,
             masquerade_src: entry.masquerade_src,
+            masquerade_src_port: entry.masquerade_src_port,
             external_dst: entry.external_dst,
-            icmp_ident: entry.icmp_ident,
+            external_dst_port: entry.external_dst_port,
+            icmp_ident: if entry.protocol == NetfilterConntrackProtocol::Icmp {
+                entry.original_src_port
+            } else {
+                0
+            },
         })
         .collect()
+}
+
+pub fn apply_netfilter_control_command(
+    netns: &NetNamespacePayload,
+    bytes: &[u8],
+) -> Result<(), Errno> {
+    let command = core::str::from_utf8(bytes)
+        .map_err(|_| Errno::EINVAL)?
+        .trim_matches(|ch: char| ch.is_ascii_whitespace());
+    if command.is_empty() {
+        return Ok(());
+    }
+
+    let mut parts = command.split_ascii_whitespace();
+    match parts.next().ok_or(Errno::EINVAL)? {
+        "flush" => {
+            if parts.next().is_some() {
+                return Err(Errno::EINVAL);
+            }
+            flush_netfilter_rules_and_conntrack_for_test_or_bootstrap();
+            Ok(())
+        }
+        "delete" => {
+            let index = parse_usize(parts.next().ok_or(Errno::EINVAL)?)?;
+            if parts.next().is_some() {
+                return Err(Errno::EINVAL);
+            }
+            remove_netfilter_rule_for_test_or_bootstrap(index)
+        }
+        "masquerade" => {
+            let cidr = parse_ipv4_cidr(parts.next().ok_or(Errno::EINVAL)?)?;
+            let out_iface = resolve_iface_name(netns, parts.next().ok_or(Errno::EINVAL)?)?;
+            if parts.next().is_some() {
+                return Err(Errno::EINVAL);
+            }
+            add_masquerade_rule_for_test_or_bootstrap(cidr, out_iface)
+        }
+        "filter" => {
+            let hook = parse_hook(parts.next().ok_or(Errno::EINVAL)?)?;
+            let target = parse_target(parts.next().ok_or(Errno::EINVAL)?)?;
+            let mut out_iface = None;
+            for part in parts {
+                let Some(name) = part.strip_prefix("out=") else {
+                    return Err(Errno::EINVAL);
+                };
+                out_iface = Some(resolve_iface_name(netns, name)?);
+            }
+            add_netfilter_rule_for_test_or_bootstrap(NetfilterRule {
+                table: NetfilterTable::Filter,
+                hook,
+                src: None,
+                out_iface,
+                target,
+            })
+        }
+        _ => Err(Errno::EINVAL),
+    }
 }
 
 pub fn apply_postrouting_nat_ipv4(
@@ -211,7 +314,7 @@ pub fn apply_postrouting_nat_ipv4(
     let ipv4 = Ipv4Packet::new_checked(packet).ok()?;
     let src = from_smoltcp_ipv4(ipv4.src_addr());
     let dst = from_smoltcp_ipv4(ipv4.dst_addr());
-    let ident = icmp_echo_ident(ipv4.next_header(), src, dst, ipv4.payload())?;
+    let tuple = l4_tuple(ipv4.next_header(), src, dst, ipv4.payload())?;
     if !NETFILTER_RULES.lock().iter().copied().any(|rule| {
         rule.table == NetfilterTable::Nat
             && rule.hook == NetfilterHook::Postrouting
@@ -222,13 +325,22 @@ pub fn apply_postrouting_nat_ipv4(
         return None;
     }
 
-    remember_icmp_masquerade(IcmpMasqueradeConntrack {
+    remember_masquerade(MasqueradeConntrack {
+        protocol: tuple.protocol,
         original_src: src,
+        original_src_port: tuple.src_port,
         masquerade_src,
+        masquerade_src_port: tuple.src_port,
         external_dst: dst,
-        icmp_ident: ident,
+        external_dst_port: tuple.dst_port,
     });
-    Some(rewrite_ipv4_addr(packet, Some(masquerade_src), None)?)
+    Some(rewrite_ipv4_nat(
+        packet,
+        Some(masquerade_src),
+        None,
+        None,
+        None,
+    )?)
 }
 
 pub fn apply_prerouting_nat_ipv4(ctx: NetfilterFrameContext, packet: &[u8]) -> Option<Vec<u8>> {
@@ -236,15 +348,30 @@ pub fn apply_prerouting_nat_ipv4(ctx: NetfilterFrameContext, packet: &[u8]) -> O
     let ipv4 = Ipv4Packet::new_checked(packet).ok()?;
     let src = from_smoltcp_ipv4(ipv4.src_addr());
     let dst = from_smoltcp_ipv4(ipv4.dst_addr());
-    let ident = icmp_echo_ident(ipv4.next_header(), src, dst, ipv4.payload())?;
-    let original_dst = NETFILTER_CONNTRACK
+    let tuple = l4_tuple(ipv4.next_header(), src, dst, ipv4.payload())?;
+    let entry = NETFILTER_CONNTRACK
         .lock()
         .iter()
         .find(|entry| {
-            entry.external_dst == src && entry.masquerade_src == dst && entry.icmp_ident == ident
+            entry.protocol == tuple.protocol
+                && entry.external_dst == src
+                && entry.masquerade_src == dst
+                && entry_matches_reply_tuple(**entry, tuple)
         })
-        .map(|entry| entry.original_src)?;
-    Some(rewrite_ipv4_addr(packet, None, Some(original_dst))?)
+        .copied()?;
+    let dst_port = match entry.protocol {
+        NetfilterConntrackProtocol::Icmp => None,
+        NetfilterConntrackProtocol::Tcp | NetfilterConntrackProtocol::Udp => {
+            Some(entry.original_src_port)
+        }
+    };
+    Some(rewrite_ipv4_nat(
+        packet,
+        None,
+        Some(entry.original_src),
+        None,
+        dst_port,
+    )?)
 }
 
 pub fn netfilter_stats_snapshot() -> NetfilterStatsSnapshot {
@@ -254,8 +381,7 @@ pub fn netfilter_stats_snapshot() -> NetfilterStatsSnapshot {
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_netfilter_for_test() {
     NETFILTER_STATS.reset();
-    NETFILTER_RULES.lock().clear();
-    NETFILTER_CONNTRACK.lock().clear();
+    flush_netfilter_rules_and_conntrack_for_test_or_bootstrap();
 }
 
 fn rule_matches_context(rule: NetfilterRule, ctx: NetfilterFrameContext) -> bool {
@@ -267,13 +393,16 @@ fn rule_matches_context(rule: NetfilterRule, ctx: NetfilterFrameContext) -> bool
     true
 }
 
-fn remember_icmp_masquerade(entry: IcmpMasqueradeConntrack) {
+fn remember_masquerade(entry: MasqueradeConntrack) {
     let mut conntrack = NETFILTER_CONNTRACK.lock();
     if let Some(existing) = conntrack.iter_mut().find(|existing| {
-        existing.original_src == entry.original_src
+        existing.protocol == entry.protocol
+            && existing.original_src == entry.original_src
+            && existing.original_src_port == entry.original_src_port
             && existing.masquerade_src == entry.masquerade_src
+            && existing.masquerade_src_port == entry.masquerade_src_port
             && existing.external_dst == entry.external_dst
-            && existing.icmp_ident == entry.icmp_ident
+            && existing.external_dst_port == entry.external_dst_port
     }) {
         *existing = entry;
         return;
@@ -281,36 +410,191 @@ fn remember_icmp_masquerade(entry: IcmpMasqueradeConntrack) {
     conntrack.push(entry);
 }
 
-fn icmp_echo_ident(
+fn entry_matches_reply_tuple(entry: MasqueradeConntrack, tuple: L4Tuple) -> bool {
+    match entry.protocol {
+        NetfilterConntrackProtocol::Icmp => entry.masquerade_src_port == tuple.src_port,
+        NetfilterConntrackProtocol::Tcp | NetfilterConntrackProtocol::Udp => {
+            entry.external_dst_port == tuple.src_port && entry.masquerade_src_port == tuple.dst_port
+        }
+    }
+}
+
+fn l4_tuple(
     protocol: IpProtocol,
     src: Ipv4Address,
     dst: Ipv4Address,
     payload: &[u8],
-) -> Option<u16> {
-    if protocol != IpProtocol::Icmp {
-        return None;
-    }
-    match parse_icmpv4_payload(src, dst, payload) {
-        Icmpv4Event::EchoRequest(packet) | Icmpv4Event::EchoReply(packet) => Some(packet.ident),
-        Icmpv4Event::Malformed | Icmpv4Event::Unsupported => None,
+) -> Option<L4Tuple> {
+    match protocol {
+        IpProtocol::Icmp => match parse_icmpv4_payload(src, dst, payload) {
+            Icmpv4Event::EchoRequest(packet) | Icmpv4Event::EchoReply(packet) => Some(L4Tuple {
+                protocol: NetfilterConntrackProtocol::Icmp,
+                src_port: packet.ident,
+                dst_port: 0,
+            }),
+            Icmpv4Event::Malformed | Icmpv4Event::Unsupported => None,
+        },
+        IpProtocol::Tcp => {
+            let packet = TcpPacket::new_checked(payload).ok()?;
+            Some(L4Tuple {
+                protocol: NetfilterConntrackProtocol::Tcp,
+                src_port: packet.src_port(),
+                dst_port: packet.dst_port(),
+            })
+        }
+        IpProtocol::Udp => {
+            let packet = UdpPacket::new_checked(payload).ok()?;
+            Some(L4Tuple {
+                protocol: NetfilterConntrackProtocol::Udp,
+                src_port: packet.src_port(),
+                dst_port: packet.dst_port(),
+            })
+        }
+        _ => None,
     }
 }
 
-fn rewrite_ipv4_addr(
+fn rewrite_ipv4_nat(
     packet: &[u8],
     src: Option<Ipv4Address>,
     dst: Option<Ipv4Address>,
+    src_port: Option<u16>,
+    dst_port: Option<u16>,
 ) -> Option<Vec<u8>> {
     let mut out = Vec::from(packet);
-    let mut ipv4 = Ipv4Packet::new_checked(out.as_mut_slice()).ok()?;
-    if let Some(src) = src {
-        ipv4.set_src_addr(to_smoltcp_ipv4(src));
+    let (header_len, total_len, protocol, old_src, old_dst) = {
+        let ipv4 = Ipv4Packet::new_checked(out.as_slice()).ok()?;
+        (
+            ipv4.header_len() as usize,
+            ipv4.total_len() as usize,
+            ipv4.next_header(),
+            from_smoltcp_ipv4(ipv4.src_addr()),
+            from_smoltcp_ipv4(ipv4.dst_addr()),
+        )
+    };
+    if total_len > out.len() || header_len > total_len {
+        return None;
     }
-    if let Some(dst) = dst {
-        ipv4.set_dst_addr(to_smoltcp_ipv4(dst));
+    let new_src = src.unwrap_or(old_src);
+    let new_dst = dst.unwrap_or(old_dst);
+    {
+        let mut ipv4 = Ipv4Packet::new_checked(out.as_mut_slice()).ok()?;
+        if src.is_some() {
+            ipv4.set_src_addr(to_smoltcp_ipv4(new_src));
+        }
+        if dst.is_some() {
+            ipv4.set_dst_addr(to_smoltcp_ipv4(new_dst));
+        }
+        ipv4.fill_checksum();
     }
-    ipv4.fill_checksum();
+
+    let src_addr = IpAddress::Ipv4(to_smoltcp_ipv4(new_src));
+    let dst_addr = IpAddress::Ipv4(to_smoltcp_ipv4(new_dst));
+    let payload = &mut out[header_len..total_len];
+    match protocol {
+        IpProtocol::Tcp => {
+            let mut tcp = TcpPacket::new_checked(payload).ok()?;
+            if let Some(port) = src_port {
+                tcp.set_src_port(port);
+            }
+            if let Some(port) = dst_port {
+                tcp.set_dst_port(port);
+            }
+            tcp.fill_checksum(&src_addr, &dst_addr);
+        }
+        IpProtocol::Udp => {
+            let mut udp = UdpPacket::new_checked(payload).ok()?;
+            if let Some(port) = src_port {
+                udp.set_src_port(port);
+            }
+            if let Some(port) = dst_port {
+                udp.set_dst_port(port);
+            }
+            udp.fill_checksum(&src_addr, &dst_addr);
+        }
+        IpProtocol::Icmp => {}
+        _ => return None,
+    }
     Some(out)
+}
+
+fn resolve_iface_name(netns: &NetNamespacePayload, name: &str) -> Result<&'static str, Errno> {
+    netns
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.name == name)
+        .map(|link| link.name)
+        .ok_or(Errno::ENODEV)
+}
+
+fn parse_hook(name: &str) -> Result<NetfilterHook, Errno> {
+    match name {
+        "PREROUTING" | "prerouting" => Ok(NetfilterHook::Prerouting),
+        "INPUT" | "input" => Ok(NetfilterHook::Input),
+        "FORWARD" | "forward" => Ok(NetfilterHook::Forward),
+        "OUTPUT" | "output" => Ok(NetfilterHook::Output),
+        "POSTROUTING" | "postrouting" => Ok(NetfilterHook::Postrouting),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn parse_target(name: &str) -> Result<NetfilterTarget, Errno> {
+    match name {
+        "ACCEPT" | "accept" => Ok(NetfilterTarget::Accept),
+        "DROP" | "drop" => Ok(NetfilterTarget::Drop),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn parse_ipv4_cidr(input: &str) -> Result<NetfilterIpv4Cidr, Errno> {
+    let (addr, prefix_len) = match input.split_once('/') {
+        Some((addr, prefix)) => (addr, parse_u8(prefix)?),
+        None => (input, 32),
+    };
+    if prefix_len > 32 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(NetfilterIpv4Cidr {
+        addr: parse_ipv4(addr)?,
+        prefix_len,
+    })
+}
+
+fn parse_ipv4(input: &str) -> Result<Ipv4Address, Errno> {
+    let mut octets = [0u8; 4];
+    let mut parts = input.split('.');
+    for octet in &mut octets {
+        *octet = parse_u8(parts.next().ok_or(Errno::EINVAL)?)?;
+    }
+    if parts.next().is_some() {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Ipv4Address::new(octets))
+}
+
+fn parse_u8(input: &str) -> Result<u8, Errno> {
+    let value = parse_usize(input)?;
+    if value > u8::MAX as usize {
+        return Err(Errno::EINVAL);
+    }
+    Ok(value as u8)
+}
+
+fn parse_usize(input: &str) -> Result<usize, Errno> {
+    if input.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    let mut value = 0usize;
+    for &byte in input.as_bytes() {
+        if !byte.is_ascii_digit() {
+            return Err(Errno::EINVAL);
+        }
+        value = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add((byte - b'0') as usize))
+            .ok_or(Errno::EINVAL)?;
+    }
+    Ok(value)
 }
 
 fn ipv4_in_cidr(addr: Ipv4Address, cidr: NetfilterIpv4Cidr) -> bool {

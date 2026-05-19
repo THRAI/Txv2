@@ -3,8 +3,9 @@
 use crate::procfs::{
     pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_stat_id, task_from_stat_id,
     PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID, PROCFS_NET_ARP_ID,
-    PROCFS_NET_DEV_ID, PROCFS_NET_ROUTE_ID, PROCFS_SYSVIPC_MSG_ID, PROCFS_SYSVIPC_SEM_ID,
-    PROCFS_SYSVIPC_SHM_ID, PROCFS_SYS_FS_LEASE_BREAK_TIME_ID, PROCFS_SYS_FS_PIPE_MAX_SIZE_ID,
+    PROCFS_NET_DEV_ID, PROCFS_NET_NF_CONNTRACK_ID, PROCFS_NET_ROUTE_ID, PROCFS_NET_TX_NF_RULES_ID,
+    PROCFS_SYSVIPC_MSG_ID, PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID,
+    PROCFS_SYS_FS_LEASE_BREAK_TIME_ID, PROCFS_SYS_FS_PIPE_MAX_SIZE_ID,
     PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID, PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID,
     PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYS_NET_IPV4_IP_FORWARD_ID, PROCFS_UPTIME_ID,
 };
@@ -48,6 +49,8 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_NET_ROUTE_ID => render_net_route(),
         PROCFS_NET_ARP_ID => render_net_arp(),
         PROCFS_NET_DEV_ID => render_net_dev(),
+        PROCFS_NET_TX_NF_RULES_ID => render_netfilter_rules(),
+        PROCFS_NET_NF_CONNTRACK_ID => render_nf_conntrack(),
         PROCFS_SYS_NET_IPV4_IP_FORWARD_ID => render_ip_forward(),
         _ => String::new(),
     }
@@ -326,6 +329,14 @@ fn render_net_dev() -> String {
     tx_subsystems::net::proc_net_dev_snapshot_text(
         &tx_subsystems::net::initial_net_namespace_payload().ether_ifaces_snapshot(),
     )
+}
+
+fn render_netfilter_rules() -> String {
+    tx_subsystems::net::proc_net_netfilter_rules_text()
+}
+
+fn render_nf_conntrack() -> String {
+    tx_subsystems::net::proc_net_nf_conntrack_text()
 }
 
 fn render_ip_forward() -> String {

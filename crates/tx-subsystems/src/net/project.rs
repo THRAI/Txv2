@@ -6,6 +6,10 @@ use core::fmt::Write;
 use smoltcp::time::Instant;
 
 use crate::net::device::EthernetAddress;
+use crate::net::netfilter::{
+    netfilter_conntrack_snapshot, netfilter_rules_snapshot, NetfilterConntrackProtocol,
+    NetfilterHook, NetfilterIpv4Cidr, NetfilterTable, NetfilterTarget,
+};
 use crate::net::protocol::{ArpSnapshotState, EtherIface};
 use crate::net::structure::Ipv4Address;
 use crate::net::{NetNamespacePayload, NetNamespaceRouteInfo};
@@ -101,6 +105,50 @@ pub fn proc_net_route_snapshot_text(netns: &NetNamespacePayload) -> String {
     out
 }
 
+pub fn proc_net_netfilter_rules_text() -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "idx\ttable\thook\ttarget\tsrc\tout");
+
+    for (idx, rule) in netfilter_rules_snapshot().into_iter().enumerate() {
+        let src = rule
+            .src
+            .map(format_cidr)
+            .unwrap_or_else(|| String::from("*"));
+        let out_iface = rule.out_iface.unwrap_or("*");
+        let _ = writeln!(
+            out,
+            "{idx}\t{}\t{}\t{}\t{}\t{}",
+            table_name(rule.table),
+            hook_name(rule.hook),
+            target_name(rule.target),
+            src,
+            out_iface,
+        );
+    }
+
+    out
+}
+
+pub fn proc_net_nf_conntrack_text() -> String {
+    let mut out = String::new();
+
+    for entry in netfilter_conntrack_snapshot() {
+        let proto = conntrack_protocol_name(entry.protocol);
+        let _ = writeln!(
+            out,
+            "{proto} original={} sport={} dst={} dport={} masquerade={} mport={}",
+            format_ipv4(entry.original_src),
+            entry.original_src_port,
+            format_ipv4(entry.external_dst),
+            entry.external_dst_port,
+            format_ipv4(entry.masquerade_src),
+            entry.masquerade_src_port,
+        );
+    }
+
+    out
+}
+
 fn arp_state_name(state: ArpSnapshotState) -> &'static str {
     match state {
         ArpSnapshotState::Resolved => "resolved",
@@ -114,6 +162,45 @@ fn format_ipv4(addr: Ipv4Address) -> String {
     let mut out = String::new();
     let _ = write!(out, "{a}.{b}.{c}.{d}");
     out
+}
+
+fn format_cidr(cidr: NetfilterIpv4Cidr) -> String {
+    let mut out = format_ipv4(cidr.addr);
+    let _ = write!(out, "/{}", cidr.prefix_len);
+    out
+}
+
+fn table_name(table: NetfilterTable) -> &'static str {
+    match table {
+        NetfilterTable::Filter => "filter",
+        NetfilterTable::Nat => "nat",
+    }
+}
+
+fn hook_name(hook: NetfilterHook) -> &'static str {
+    match hook {
+        NetfilterHook::Prerouting => "PREROUTING",
+        NetfilterHook::Input => "INPUT",
+        NetfilterHook::Forward => "FORWARD",
+        NetfilterHook::Output => "OUTPUT",
+        NetfilterHook::Postrouting => "POSTROUTING",
+    }
+}
+
+fn target_name(target: NetfilterTarget) -> &'static str {
+    match target {
+        NetfilterTarget::Accept => "ACCEPT",
+        NetfilterTarget::Drop => "DROP",
+        NetfilterTarget::Masquerade => "MASQUERADE",
+    }
+}
+
+fn conntrack_protocol_name(protocol: NetfilterConntrackProtocol) -> &'static str {
+    match protocol {
+        NetfilterConntrackProtocol::Icmp => "icmp",
+        NetfilterConntrackProtocol::Tcp => "tcp",
+        NetfilterConntrackProtocol::Udp => "udp",
+    }
 }
 
 fn format_mac(addr: EthernetAddress) -> String {

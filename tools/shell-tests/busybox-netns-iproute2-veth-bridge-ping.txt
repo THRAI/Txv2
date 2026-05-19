@@ -36,6 +36,19 @@ send "if /bin/busybox ip link set docker0 up; then echo ${m}_BRIDGE_UP; else ech
 expect "N72C_BRIDGE_UP" within 15000
 expect "/ # " within 10000
 
+send "if echo 'masquerade 172.17.0.0/16 docker0' > /proc/net/tx_nf_rules; then echo ${m}_NF_MASQ_ADDED; else echo ${m}_FAIL_NF_MASQ_ADD; fi\n"
+expect "N72C_NF_MASQ_ADDED" within 10000
+expect "/ # " within 10000
+
+send "cat /proc/net/tx_nf_rules\n"
+expect "MASQUERADE" within 10000
+expect "docker0" within 10000
+expect "/ # " within 10000
+
+send "if echo 'delete 0' > /proc/net/tx_nf_rules; then echo ${m}_NF_MASQ_DELETED; else echo ${m}_FAIL_NF_MASQ_DELETE; fi\n"
+expect "N72C_NF_MASQ_DELETED" within 10000
+expect "/ # " within 10000
+
 send "if /bin/busybox ip link add veth0 type veth peer name eth0; then echo ${m}_VETH_A_CREATED; else echo ${m}_FAIL_VETH_A_CREATE; fi\n"
 expect "N72C_VETH_A_CREATED" within 15000
 expect "/ # " within 10000

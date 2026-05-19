@@ -47,6 +47,8 @@ pub const PROCFS_NET_DEV_ID: FsObjectId = FsObjectId::new(0x7072_6F16);
 pub const PROCFS_SYS_NET_ID: FsObjectId = FsObjectId::new(0x7072_6F17);
 pub const PROCFS_SYS_NET_IPV4_ID: FsObjectId = FsObjectId::new(0x7072_6F18);
 pub const PROCFS_SYS_NET_IPV4_IP_FORWARD_ID: FsObjectId = FsObjectId::new(0x7072_6F19);
+pub const PROCFS_NET_TX_NF_RULES_ID: FsObjectId = FsObjectId::new(0x7072_6F1a);
+pub const PROCFS_NET_NF_CONNTRACK_ID: FsObjectId = FsObjectId::new(0x7072_6F1b);
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 const PROCFS_PID_OBJECT_STRIDE: u64 = 0x100;
 const PROCFS_PID_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x10000;
@@ -392,6 +394,8 @@ impl FsOps for Procfs {
                 b"route" => StepOutcome::done(PROCFS_NET_ROUTE_ID),
                 b"arp" => StepOutcome::done(PROCFS_NET_ARP_ID),
                 b"dev" => StepOutcome::done(PROCFS_NET_DEV_ID),
+                b"tx_nf_rules" => StepOutcome::done(PROCFS_NET_TX_NF_RULES_ID),
+                b"nf_conntrack" => StepOutcome::done(PROCFS_NET_NF_CONNTRACK_ID),
                 _ => StepOutcome::err(Errno::ENOENT.into()),
             };
         }
@@ -514,7 +518,8 @@ impl FsOps for Procfs {
             | PROCFS_SYS_KERNEL_TAINTED_ID
             | PROCFS_NET_ROUTE_ID
             | PROCFS_NET_ARP_ID
-            | PROCFS_NET_DEV_ID => {
+            | PROCFS_NET_DEV_ID
+            | PROCFS_NET_NF_CONNTRACK_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             PROCFS_SYS_FS_PIPE_MAX_SIZE_ID
@@ -526,7 +531,7 @@ impl FsOps for Procfs {
             PROCFS_SYSVIPC_MSG_ID | PROCFS_SYSVIPC_SEM_ID | PROCFS_SYSVIPC_SHM_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
-            PROCFS_SYS_NET_IPV4_IP_FORWARD_ID => {
+            PROCFS_SYS_NET_IPV4_IP_FORWARD_ID | PROCFS_NET_TX_NF_RULES_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_RW_MODE))
             }
             id if pid_from_dir(id).is_some() => {
@@ -593,6 +598,16 @@ impl FsOps for Procfs {
                 (b"route", PROCFS_NET_ROUTE_ID, InodeKind::Regular),
                 (b"arp", PROCFS_NET_ARP_ID, InodeKind::Regular),
                 (b"dev", PROCFS_NET_DEV_ID, InodeKind::Regular),
+                (
+                    b"tx_nf_rules",
+                    PROCFS_NET_TX_NF_RULES_ID,
+                    InodeKind::Regular,
+                ),
+                (
+                    b"nf_conntrack",
+                    PROCFS_NET_NF_CONNTRACK_ID,
+                    InodeKind::Regular,
+                ),
             ];
             if idx < files.len() {
                 let (name, oid, kind) = files[idx];
@@ -1086,10 +1101,19 @@ impl FsOps for Procfs {
         bytes: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
+        if fs_object_id == PROCFS_NET_TX_NF_RULES_ID {
+            return match tx_subsystems::net::apply_netfilter_control_command(
+                &tx_subsystems::net::initial_net_namespace_payload(),
+                bytes,
+            ) {
+                Ok(()) => StepOutcome::done(bytes.len() as u64),
+                Err(errno) => StepOutcome::err(errno.into()),
+            };
+        }
+
         if fs_object_id != PROCFS_SYS_NET_IPV4_IP_FORWARD_ID {
             return StepOutcome::err(Errno::EROFS.into());
         }
-
         let trimmed = trim_ascii_space(bytes);
         let enabled = match trimmed {
             b"0" => false,
@@ -1282,6 +1306,7 @@ mod tests {
         tx_subsystems::cross_crate_test_support::reset_tid_counter();
         let _ = zones::register_all();
         tx_subsystems::net::reset_initial_net_namespace_for_test();
+        tx_subsystems::net::reset_netfilter_for_test();
         tx_test_support::drain_to_quiescence();
         guard
     }
@@ -1396,5 +1421,53 @@ mod tests {
             StepOutcome::Done(2)
         );
         assert!(!netns.ipv4_forwarding_enabled());
+    }
+
+    #[test]
+    fn procfs_netfilter_rules_file_adds_lists_and_deletes_masquerade_rule() {
+        let _setup = setup();
+        let guard = adapter::step_engine::guard();
+        let procfs = Procfs::new();
+        let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+            left: VethEndpointConfig {
+                name: "proc-nf0",
+                devt: DevT::new(99, 1),
+                mac: EthernetAddress::new([0x02, 0, 0, 0x72, 1, 1]),
+            },
+            right: VethEndpointConfig {
+                name: "proc-nf-peer0",
+                devt: DevT::new(99, 2),
+                mac: EthernetAddress::new([0x02, 0, 0, 0x72, 1, 2]),
+            },
+            mtu: VETH_DEFAULT_MTU,
+        });
+        let netns = tx_subsystems::net::initial_net_namespace_payload();
+        netns
+            .attach_device_for_test_or_bootstrap(pair.left, None)
+            .expect("attach proc-nf0");
+
+        let command = b"masquerade 172.17.0.0/16 proc-nf0\n";
+        assert_eq!(
+            procfs.step_write_projected(PROCFS_NET_TX_NF_RULES_ID, 0, command, &guard),
+            StepOutcome::Done(command.len() as u64)
+        );
+
+        let mut out = [0u8; 512];
+        let read = match procfs.step_read_projected(PROCFS_NET_TX_NF_RULES_ID, 0, &mut out, &guard)
+        {
+            StepOutcome::Done(read) => read as usize,
+            other => panic!("netfilter rules read failed: {other:?}"),
+        };
+        let text = core::str::from_utf8(&out[..read]).expect("netfilter rules text utf8");
+        assert!(text.contains("nat"));
+        assert!(text.contains("MASQUERADE"));
+        assert!(text.contains("172.17.0.0/16"));
+        assert!(text.contains("proc-nf0"));
+
+        assert_eq!(
+            procfs.step_write_projected(PROCFS_NET_TX_NF_RULES_ID, 0, b"delete 0\n", &guard),
+            StepOutcome::Done(9)
+        );
+        assert!(tx_subsystems::net::netfilter_rules_snapshot().is_empty());
     }
 }

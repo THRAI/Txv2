@@ -947,6 +947,258 @@ fn namespace_runtime_masquerades_icmp_and_conntrack_dnat_reply() {
 }
 
 #[test]
+fn namespace_runtime_masquerades_udp_and_conntrack_dnat_reply() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    reset_netfilter_for_test();
+
+    let guard = tx_substrate::epoch::guard();
+    let now = smoltcp::time::Instant::ZERO;
+    let host = crate::net::create_isolated_net_namespace_for_test("runtime-udp-nat-host")
+        .expect("host namespace")
+        .payload_cap()
+        .expect("host payload");
+    let container = crate::net::create_isolated_net_namespace_for_test("runtime-udp-nat-container")
+        .expect("container namespace")
+        .payload_cap()
+        .expect("container payload");
+    let bridge = new_test_bridge("docker-udp-nat0", 103);
+    let container_pair = new_bridge_veth_pair("eth-udp-nat0", "veth-udp-nat0", 103);
+    let uplink_pair = new_bridge_veth_pair("uplink-udp-nat0", "gw-udp-nat0", 104);
+
+    bridge
+        .device
+        .add_port_for_test_or_bootstrap(container_pair.right)
+        .expect("bridge port");
+    host.attach_device_for_test_or_bootstrap(bridge.registration, None)
+        .expect("attach docker0");
+    host.attach_device_for_test_or_bootstrap(container_pair.right, None)
+        .expect("attach host veth");
+    host.attach_device_for_test_or_bootstrap(uplink_pair.left, None)
+        .expect("attach uplink");
+    container
+        .attach_device_for_test_or_bootstrap(container_pair.left, None)
+        .expect("attach container eth");
+
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    let docker_ip = Ipv4Address::new([172, 17, 0, 1]);
+    let container_ip = Ipv4Address::new([172, 17, 0, 2]);
+    let uplink_ip = Ipv4Address::new([10, 0, 2, 15]);
+    let uplink_gw = Ipv4Address::new([10, 0, 2, 2]);
+    let external_ip = Ipv4Address::new([8, 8, 8, 8]);
+    let local_port = 41_172;
+    let remote_port = 53;
+
+    let docker_ifindex = bridge_ifindex_for(&host.link_snapshot(), "docker-udp-nat0");
+    host.set_device_ipv4_addr_by_ifindex(auth, docker_ifindex, Some(docker_ip), Some(16))
+        .expect("set docker0 addr");
+    let uplink_ifindex = bridge_ifindex_for(&host.link_snapshot(), "uplink-udp-nat0");
+    host.set_device_ipv4_addr_by_ifindex(auth, uplink_ifindex, Some(uplink_ip), Some(24))
+        .expect("set uplink addr");
+    host.add_ipv4_route(
+        auth,
+        crate::net::NetNamespaceRouteConfig {
+            dst: Ipv4Address::UNSPECIFIED,
+            prefix_len: 0,
+            gateway: Some(uplink_gw),
+            oif_name: Some("uplink-udp-nat0"),
+            preferred_src: Some(uplink_ip),
+            table: 254,
+            protocol: 4,
+            scope: 0,
+            route_type: 1,
+        },
+    )
+    .expect("host default route");
+    host.set_ipv4_forwarding_for_test_or_bootstrap(true);
+    host.ether_ifaces_snapshot()
+        .into_iter()
+        .find(|iface| iface.name == "uplink-udp-nat0")
+        .expect("uplink iface")
+        .install_arp_for_test_or_bootstrap(
+            uplink_gw,
+            uplink_pair.right.ops.mac_addr(),
+            smoltcp::time::Instant::from_secs(60),
+        );
+    add_masquerade_rule_for_test_or_bootstrap(
+        NetfilterIpv4Cidr {
+            addr: Ipv4Address::new([172, 17, 0, 0]),
+            prefix_len: 16,
+        },
+        "uplink-udp-nat0",
+    )
+    .expect("masquerade rule");
+
+    let eth_ifindex = bridge_ifindex_for(&container.link_snapshot(), "eth-udp-nat0");
+    container
+        .set_device_ipv4_addr_by_ifindex(auth, eth_ifindex, Some(container_ip), Some(16))
+        .expect("set container addr");
+    container
+        .add_ipv4_route(
+            auth,
+            crate::net::NetNamespaceRouteConfig {
+                dst: Ipv4Address::UNSPECIFIED,
+                prefix_len: 0,
+                gateway: Some(docker_ip),
+                oif_name: Some("eth-udp-nat0"),
+                preferred_src: Some(container_ip),
+                table: 254,
+                protocol: 4,
+                scope: 0,
+                route_type: 1,
+            },
+        )
+        .expect("container default route");
+
+    let udp = registry::create_socket_in_namespace(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+        container.clone(),
+    )
+    .expect("udp socket");
+    assert_eq!(
+        step_bind(&udp, bridge_inet_at(container_ip, local_port), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &udp,
+            Some(IpEndpoint::new(external_ip, remote_port)),
+            b"dns-query",
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(9)
+    );
+
+    let mut outbound = None;
+    for _ in 0..12 {
+        let _ = crate::net::drive_all_net_namespace_runtimes_at(now, &guard);
+        if let Some(frame) = uplink_pair.right.ops.receive() {
+            outbound = Some(frame);
+            break;
+        }
+    }
+    let outbound = outbound.expect("uplink should receive masqueraded UDP");
+    let ethernet =
+        smoltcp::wire::EthernetFrame::new_checked(outbound.as_bytes()).expect("ethernet frame");
+    let ipv4 = smoltcp::wire::Ipv4Packet::new_checked(ethernet.payload()).expect("ipv4 packet");
+    assert_eq!(Ipv4Address::new(ipv4.src_addr().octets()), uplink_ip);
+    let udp_packet = smoltcp::wire::UdpPacket::new_checked(ipv4.payload()).expect("udp packet");
+    assert_eq!(udp_packet.src_port(), local_port);
+    assert_eq!(udp_packet.dst_port(), remote_port);
+    let entry = netfilter_conntrack_snapshot()
+        .into_iter()
+        .find(|entry| entry.protocol == NetfilterConntrackProtocol::Udp)
+        .expect("udp conntrack entry");
+    assert_eq!(entry.original_src, container_ip);
+    assert_eq!(entry.original_src_port, local_port);
+    assert_eq!(entry.external_dst_port, remote_port);
+
+    let reply_packet = udp_ipv4_packet(
+        IpEndpoint::new(external_ip, remote_port),
+        IpEndpoint::new(uplink_ip, local_port),
+        b"dns-reply",
+    );
+    let reply_frame = ethernet_frame(
+        uplink_pair.left.ops.mac_addr(),
+        uplink_pair.right.ops.mac_addr(),
+        reply_packet.as_slice(),
+    );
+    assert_eq!(
+        uplink_pair.right.ops.transmit(&reply_frame, &guard),
+        StepOutcome::Done(())
+    );
+
+    let mut reply_buf = [0u8; 32];
+    let mut received = None;
+    for _ in 0..12 {
+        let _ = crate::net::drive_all_net_namespace_runtimes_at(now, &guard);
+        if let StepOutcome::Done(recv) =
+            step_recv_kernel_bytes(&udp, &mut reply_buf, SendRecvFlags::empty(), &guard)
+        {
+            received = Some(recv.bytes);
+            break;
+        }
+    }
+
+    assert_eq!(received, Some(9));
+    assert_eq!(&reply_buf[..9], b"dns-reply");
+}
+
+#[test]
+fn netfilter_masquerades_tcp_tuple_and_rewrites_reply_checksum() {
+    reset_netfilter_for_test();
+    add_masquerade_rule_for_test_or_bootstrap(
+        NetfilterIpv4Cidr {
+            addr: Ipv4Address::new([172, 17, 0, 0]),
+            prefix_len: 16,
+        },
+        "uplink-tcp-nat0",
+    )
+    .expect("masquerade rule");
+
+    let container_ip = Ipv4Address::new([172, 17, 0, 2]);
+    let uplink_ip = Ipv4Address::new([10, 0, 2, 15]);
+    let external_ip = Ipv4Address::new([93, 184, 216, 34]);
+    let syn = tcp_ipv4_packet(
+        IpEndpoint::new(container_ip, 40_180),
+        IpEndpoint::new(external_ip, 80),
+        smoltcp::wire::TcpControl::Syn,
+        None,
+    );
+
+    let masqueraded = apply_postrouting_nat_ipv4(
+        NetfilterFrameContext {
+            hook: NetfilterHook::Postrouting,
+            bridge: None,
+            ingress: Some("docker-tcp-nat0"),
+            egress: Some("uplink-tcp-nat0"),
+        },
+        syn.as_slice(),
+        uplink_ip,
+    )
+    .expect("tcp masquerade");
+    let ipv4 = smoltcp::wire::Ipv4Packet::new_checked(masqueraded.as_slice()).expect("masq ipv4");
+    assert_eq!(Ipv4Address::new(ipv4.src_addr().octets()), uplink_ip);
+    let tcp = smoltcp::wire::TcpPacket::new_checked(ipv4.payload()).expect("masq tcp");
+    assert_eq!(tcp.src_port(), 40_180);
+    assert_eq!(tcp.dst_port(), 80);
+    assert!(tcp.verify_checksum(
+        &smoltcp::wire::IpAddress::Ipv4(ipv4.src_addr()),
+        &smoltcp::wire::IpAddress::Ipv4(ipv4.dst_addr()),
+    ));
+
+    let syn_ack = tcp_ipv4_packet(
+        IpEndpoint::new(external_ip, 80),
+        IpEndpoint::new(uplink_ip, 40_180),
+        smoltcp::wire::TcpControl::Syn,
+        Some(1),
+    );
+    let restored = apply_prerouting_nat_ipv4(
+        NetfilterFrameContext {
+            hook: NetfilterHook::Prerouting,
+            bridge: None,
+            ingress: Some("uplink-tcp-nat0"),
+            egress: None,
+        },
+        syn_ack.as_slice(),
+    )
+    .expect("tcp reverse nat");
+    let ipv4 = smoltcp::wire::Ipv4Packet::new_checked(restored.as_slice()).expect("restored ipv4");
+    assert_eq!(Ipv4Address::new(ipv4.dst_addr().octets()), container_ip);
+    let tcp = smoltcp::wire::TcpPacket::new_checked(ipv4.payload()).expect("restored tcp");
+    assert_eq!(tcp.dst_port(), 40_180);
+    assert!(tcp.verify_checksum(
+        &smoltcp::wire::IpAddress::Ipv4(ipv4.src_addr()),
+        &smoltcp::wire::IpAddress::Ipv4(ipv4.dst_addr()),
+    ));
+}
+
+#[test]
 fn bridge_add_port_requires_cap_net_admin_authority() {
     let bridge = new_test_bridge("docker2", 86);
     let pair = new_bridge_veth_pair("ct-a2", "veth-a2", 86);
@@ -1055,6 +1307,85 @@ fn ethernet_frame(dst: EthernetAddress, src: EthernetAddress, payload: &[u8]) ->
     frame.extend_from_slice(&[0x08, 0x00]);
     frame.extend_from_slice(payload);
     frame
+}
+
+fn udp_ipv4_packet(src: IpEndpoint, dst: IpEndpoint, payload: &[u8]) -> std::vec::Vec<u8> {
+    let udp_repr = smoltcp::wire::UdpRepr {
+        src_port: src.port,
+        dst_port: dst.port,
+    };
+    let udp_len = udp_repr.header_len() + payload.len();
+    let ip_repr = smoltcp::wire::IpRepr::Ipv4(smoltcp::wire::Ipv4Repr {
+        src_addr: smoltcp_ipv4(src.addr),
+        dst_addr: smoltcp_ipv4(dst.addr),
+        next_header: smoltcp::wire::IpProtocol::Udp,
+        payload_len: udp_len,
+        hop_limit: 64,
+    });
+    let ip_header_len = ip_repr.header_len();
+    let mut bytes = std::vec![0u8; ip_header_len + udp_len];
+    let checksum_caps = smoltcp::phy::ChecksumCapabilities::default();
+    ip_repr.emit(&mut bytes[..ip_header_len], &checksum_caps);
+
+    let src_addr = smoltcp::wire::IpAddress::Ipv4(smoltcp_ipv4(src.addr));
+    let dst_addr = smoltcp::wire::IpAddress::Ipv4(smoltcp_ipv4(dst.addr));
+    let mut udp_packet = smoltcp::wire::UdpPacket::new_unchecked(&mut bytes[ip_header_len..]);
+    udp_repr.emit(
+        &mut udp_packet,
+        &src_addr,
+        &dst_addr,
+        payload.len(),
+        |out| out.copy_from_slice(payload),
+        &checksum_caps,
+    );
+    bytes
+}
+
+fn tcp_ipv4_packet(
+    src: IpEndpoint,
+    dst: IpEndpoint,
+    control: smoltcp::wire::TcpControl,
+    ack: Option<i32>,
+) -> std::vec::Vec<u8> {
+    let tcp_repr = smoltcp::wire::TcpRepr {
+        src_port: src.port,
+        dst_port: dst.port,
+        control,
+        seq_number: smoltcp::wire::TcpSeqNumber(1),
+        ack_number: ack.map(smoltcp::wire::TcpSeqNumber),
+        window_len: 4096,
+        window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        timestamp: None,
+        payload: &[],
+    };
+    let tcp_len = tcp_repr.buffer_len();
+    let ip_repr = smoltcp::wire::IpRepr::Ipv4(smoltcp::wire::Ipv4Repr {
+        src_addr: smoltcp_ipv4(src.addr),
+        dst_addr: smoltcp_ipv4(dst.addr),
+        next_header: smoltcp::wire::IpProtocol::Tcp,
+        payload_len: tcp_len,
+        hop_limit: 64,
+    });
+    let ip_header_len = ip_repr.header_len();
+    let mut bytes = std::vec![0u8; ip_header_len + tcp_len];
+    let checksum_caps = smoltcp::phy::ChecksumCapabilities::default();
+    ip_repr.emit(&mut bytes[..ip_header_len], &checksum_caps);
+    let mut tcp_packet = smoltcp::wire::TcpPacket::new_unchecked(&mut bytes[ip_header_len..]);
+    tcp_repr.emit(
+        &mut tcp_packet,
+        &smoltcp::wire::IpAddress::Ipv4(smoltcp_ipv4(src.addr)),
+        &smoltcp::wire::IpAddress::Ipv4(smoltcp_ipv4(dst.addr)),
+        &checksum_caps,
+    );
+    bytes
+}
+
+fn smoltcp_ipv4(addr: Ipv4Address) -> smoltcp::wire::Ipv4Address {
+    let [a, b, c, d] = addr.octets();
+    smoltcp::wire::Ipv4Address::new(a, b, c, d)
 }
 
 fn bridge_inet_at(addr: Ipv4Address, port: u16) -> KernelSockAddr {
