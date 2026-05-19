@@ -671,6 +671,16 @@ impl<P: TxPlatform> CoreInit<P> {
             // Boot reactor not initialised; nothing to drive.
             return;
         }
+        {
+            let es = crate::adapter::step_engine::epoch::summary();
+            let cpu0 = crate::adapter::step_engine::epoch::cpu_summary(tx_hal::CpuId(0));
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":diag:pre-userspace:guards=");
+            Self::write_decimal_unsigned(es.active_guards);
+            tx_hal::console_write_str::<P>(":cpu0-local=");
+            Self::write_decimal_unsigned(cpu0.map(|c| c.local_epoch as usize).unwrap_or(999));
+            tx_hal::console_write_str::<P>("\n");
+        }
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:submitted\n");
 

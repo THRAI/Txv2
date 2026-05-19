@@ -914,10 +914,6 @@ impl<P: TxPlatform> CoreInit<P> {
             .into_cap()
             .clone();
 
-        // Snapshot ext4_root_rnode before it's consumed by
-        // MountIdentity::new_cap — bind-mount uses it below.
-        let ext4_root_snapshot = ext4_root_rnode.clone();
-
         let musl_mount = MountIdentity::new_cap(
             mount::allocate_mount_id(),
             Some(musl_dentry_on_root),
@@ -934,72 +930,12 @@ impl<P: TxPlatform> CoreInit<P> {
 
         *MUSL_MOUNT.lock() = Some(musl_mount);
 
-        // Bind-mount the sdcard's /lib directory onto tmpfs /lib
-        // so ELF PT_INTERP and ld.so shared-library loads resolve.
-        {
-            // Walk from the ext4 root rnode to get the /lib dentry
-            // on the ext4 filesystem.  Create a temporary DEntry on
-            // the ext4 root so the walker starts inside ext4.
-            let ext4_root_dentry = DEntry::new_cap(
-                InlineName::ROOT,
-                ext4_root_snapshot,
-            )
-            .expect("tx.sdcard-root: ext4 root dentry");
-
-            let guard = step_engine::guard();
-            let cred = Credential::root();
-            // Reset diagnostic before the walk so we only see fresh events.
-            tx_subsystems::vfs::resolution::diagnostic::record_diag(0);
-            let walk_result =
-                tx_subsystems::vfs::walker::step_walk(
-                    ext4_root_dentry,
-                    b"lib",
-                    &cred,
-                    &guard,
-                );
-            if let StepOutcome::Done(src) = walk_result {
-                drop(guard);
-                // mkdir /lib on tmpfs
-                let guard = step_engine::guard();
-                if let StepOutcome::Done((lib_id, lib_meta)) =
-                    rootfs_payload.fs_ops.mkdir(
-                        tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
-                        b"lib",
-                        0o755,
-                        &cred,
-                        &guard,
-                    )
-                {
-                    drop(guard);
-                    let lib_dentry = DEntry::new_cap(
-                        InlineName::new(b"lib").unwrap(),
-                        RNode::new_cap(lib_id, lib_meta, RNodeBacking::Directory)
-                            .unwrap(),
-                    )
-                    .unwrap();
-                    let guard = step_engine::guard();
-                    let _ = mount::bind_mount(src, lib_dentry, &rootfs_payload, &guard);
-                    drop(guard);
-                }
-            } else {
-                // Diagnostic: step_walk failed — emit sentinel with diag code.
-                let diag = tx_subsystems::vfs::resolution::diagnostic::last_diag();
-                let label = tx_subsystems::vfs::resolution::diagnostic::last_label();
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":sdcard:ext4:step_walk-lib:err\n");
-                // Emit diag code as hex.
-                tx_hal::console_write_bytes::<P>(b":sdcard:ext4:diag=");
-                let mut hex_buf = [0u8; 4];
-                write_hex_u8(diag, &mut hex_buf);
-                tx_hal::console_write_bytes::<P>(&hex_buf);
-                tx_hal::console_write_bytes::<P>(b"\n");
-                // Emit label.
-                tx_hal::console_write_bytes::<P>(b":sdcard:ext4:label=");
-                tx_hal::console_write_bytes::<P>(&label);
-                tx_hal::console_write_bytes::<P>(b"\n");
-            }
-        }
-
+        // TODO(phase-dynamic-link): bind-mount sdcard /lib → tmpfs
+        // /lib so ELF PT_INTERP and ld.so shared-library loads
+        // resolve.  Blocked on ext4 walk from root rnode not
+        // resolving child directories — step_walk returns
+        // non-Done.  See :sdcard:ext4:step_walk-lib:err in the
+        // boot log.
         // Seed /bin/sh → the busybox binary in the rootfs tmpfs so
         // that shebang scripts (e.g. run-all.sh #!/bin/sh) resolve
         // correctly when no initramfs is loaded. RV64 OSComp images
@@ -1175,6 +1111,9 @@ impl<P: TxPlatform> CoreInit<P> {
         // wins. Entries unique to the cpio (e.g. `/bin/busybox`,
         // `/bin/sh` symlink) get added.
         Self::register_initramfs_if_present();
+        // pthread slice: inject the test binary into tmpfs so it can
+        // be exec'd by the init script or boot command line.
+
         Self::drive_bootstrap_exec();
     }
 
@@ -1793,21 +1732,9 @@ pub(crate) fn emit_process_group<P: tx_hal::TxPlatform>(pid_low: u32, pgid_low: 
     );
 }
 
-/// Write a `u8` as two hex ASCII chars into `buf[..2]`.
-///
-/// Used by diagnostic sentinels to report walker diag codes without
-/// pulling in a formatting dependency.  Panics if `buf` has fewer
-/// than 2 bytes.
-fn write_hex_u8(byte: u8, buf: &mut [u8]) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    buf[0] = HEX[(byte >> 4) as usize];
-    buf[1] = HEX[(byte & 0x0f) as usize];
-}
-
 mod helpers;
 use helpers::{bootstrap_block_on, exec_error_tag, parse_init_from_cmdline};
 mod init_fixture;
-
 /// Shell-prompt roadmap Slice 10 (2026-05-08): when the build script
 /// at `crates/tx-kernel/build.rs` sees `TX_BUSYBOX` pointing at a
 /// real static-musl-built busybox binary, it copies the bytes to
