@@ -913,6 +913,10 @@ impl<P: TxPlatform> CoreInit<P> {
             .into_cap()
             .clone();
 
+        // Snapshot ext4_root_rnode before it's consumed by
+        // MountIdentity::new_cap — bind-mount uses it below.
+        let ext4_root_snapshot = ext4_root_rnode.clone();
+
         let musl_mount = MountIdentity::new_cap(
             mount::allocate_mount_id(),
             Some(musl_dentry_on_root),
@@ -928,6 +932,54 @@ impl<P: TxPlatform> CoreInit<P> {
         mount::register_mount(&rootfs_payload, musl_object_id, musl_mount.clone());
 
         *MUSL_MOUNT.lock() = Some(musl_mount);
+
+        // Bind-mount the sdcard's /lib directory onto tmpfs /lib
+        // so ELF PT_INTERP and ld.so shared-library loads resolve.
+        {
+            // Walk from the ext4 root rnode to get the /lib dentry
+            // on the ext4 filesystem.  Create a temporary DEntry on
+            // the ext4 root so the walker starts inside ext4.
+            let ext4_root_dentry = DEntry::new_cap(
+                InlineName::ROOT,
+                ext4_root_snapshot,
+            )
+            .expect("tx.sdcard-root: ext4 root dentry");
+
+            let guard = step_engine::guard();
+            let cred = Credential::root();
+            if let StepOutcome::Done(src) =
+                tx_subsystems::vfs::walker::step_walk(
+                    ext4_root_dentry,
+                    b"lib",
+                    &cred,
+                    &guard,
+                )
+            {
+                drop(guard);
+                // mkdir /lib on tmpfs
+                let guard = step_engine::guard();
+                if let StepOutcome::Done((lib_id, lib_meta)) =
+                    rootfs_payload.fs_ops.mkdir(
+                        tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
+                        b"lib",
+                        0o755,
+                        &cred,
+                        &guard,
+                    )
+                {
+                    drop(guard);
+                    let lib_dentry = DEntry::new_cap(
+                        InlineName::new(b"lib").unwrap(),
+                        RNode::new_cap(lib_id, lib_meta, RNodeBacking::Directory)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let guard = step_engine::guard();
+                    let _ = mount::bind_mount(src, lib_dentry, &rootfs_payload, &guard);
+                    drop(guard);
+                }
+            }
+        }
 
         // Seed /bin/sh → the busybox binary in the rootfs tmpfs so
         // that shebang scripts (e.g. run-all.sh #!/bin/sh) resolve
