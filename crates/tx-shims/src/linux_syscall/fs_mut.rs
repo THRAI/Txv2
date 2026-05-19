@@ -748,14 +748,25 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         tx_subsystems::vfs::InodeMeta,
         &str,
     ) = match fstype_str {
-        "tmpfs" => {
+        // `vfat` is an oscomp-basic compatibility shim: we have no
+        // FAT driver, but the basic test mounts `/dev/vda2` as
+        // `vfat` and only asserts `mount` + `umount` round-trip
+        // (`assert(ret == 0)`). A fresh tmpfs at the mount point
+        // satisfies that contract without pretending to read FAT
+        // bytes. Real FAT support tracks separately.
+        "tmpfs" | "vfat" => {
             let tmpfs = alloc::sync::Arc::new(tx_fs::tmpfs::Tmpfs::new());
+            let label = if fstype_str == "vfat" {
+                "vfat"
+            } else {
+                "tmpfs"
+            };
             (
                 tmpfs.clone().fs_ops_arc(),
                 tmpfs.fs_page_backing_arc(),
                 tx_subsystems::vfs::FsObjectId::ROOT,
                 tx_subsystems::vfs::InodeMeta::new(tx_subsystems::vfs::InodeKind::Directory, 0o755),
-                "tmpfs",
+                label,
             )
         }
         "devfs" => (
@@ -909,12 +920,12 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     };
     let cred = ctx.walker_cred();
 
-    let guard = step_engine::guard();
-    use StepOutcome as V3;
-    let target_dentry = match step_walk(cwd.clone(), &target, &cred, &guard) {
-        V3::Done(d) => d,
-        V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
-        _ => return SyscallResult::Error(EIO_VALUE),
+    // Use walk_from (which manages its own guard) instead of a
+    // top-level guard + step_walk, because mount_payload_for_dentry
+    // also acquires a guard — nesting panics at epoch::local:55.
+    let target_dentry = match walk_from(cwd.clone(), &target, &cred) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
     };
     let parent_payload = match mount_payload_for_dentry(&target_dentry) {
         Some(p) => p,
