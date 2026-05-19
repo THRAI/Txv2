@@ -35,6 +35,7 @@ tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-substrate = { path = "../tx-substrate" }
 tx-test-support = { path = "../tx-test-support" }
 tx-subsystems = { path = "../tx-subsystems" }
+tx-services = { path = "../tx-services" }
 
 [dev-dependencies]
 # Cross-crate test helpers (zone reset / pid counter reset / init slot

@@ -114,6 +114,15 @@ impl<P: TxPlatform> CoreInit<P> {
     /// Failures are non-fatal — the helper logs a sentinel and
     /// returns. The kernel boots; the affected suites stay at 0/N
     /// until the scratch dirs are populated.
+    /// Seed the kernel CSPRNG from platform entropy before userspace
+    /// starts.  Must run after rootfs is mounted (the CSPRNG owns no
+    /// filesystem state, but the ordering convention keeps all Phase
+    /// 3b boot wiring in one place).
+    pub(crate) fn init_csprng() {
+        let seed = tx_services::random::platform_seed();
+        tx_services::random::init(&seed);
+    }
+
     pub(crate) fn populate_rootfs_tmp_dirs() {
         let root_mount = ROOT_MOUNT
             .lock()

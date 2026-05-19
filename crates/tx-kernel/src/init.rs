@@ -305,6 +305,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_sdcard_at_musl();
             Self::populate_rootfs_shebang_shims();
             Self::populate_rootfs_tmp_dirs();
+            Self::init_csprng();
             Self::bind_init_cwd_and_root();
 
             // Deferred H4 spine slots:
@@ -947,14 +948,16 @@ impl<P: TxPlatform> CoreInit<P> {
 
             let guard = step_engine::guard();
             let cred = Credential::root();
-            if let StepOutcome::Done(src) =
+            // Reset diagnostic before the walk so we only see fresh events.
+            tx_subsystems::vfs::resolution::diagnostic::record_diag(0);
+            let walk_result =
                 tx_subsystems::vfs::walker::step_walk(
                     ext4_root_dentry,
                     b"lib",
                     &cred,
                     &guard,
-                )
-            {
+                );
+            if let StepOutcome::Done(src) = walk_result {
                 drop(guard);
                 // mkdir /lib on tmpfs
                 let guard = step_engine::guard();
@@ -978,6 +981,22 @@ impl<P: TxPlatform> CoreInit<P> {
                     let _ = mount::bind_mount(src, lib_dentry, &rootfs_payload, &guard);
                     drop(guard);
                 }
+            } else {
+                // Diagnostic: step_walk failed — emit sentinel with diag code.
+                let diag = tx_subsystems::vfs::resolution::diagnostic::last_diag();
+                let label = tx_subsystems::vfs::resolution::diagnostic::last_label();
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":sdcard:ext4:step_walk-lib:err\n");
+                // Emit diag code as hex.
+                tx_hal::console_write_bytes::<P>(b":sdcard:ext4:diag=");
+                let mut hex_buf = [0u8; 4];
+                write_hex_u8(diag, &mut hex_buf);
+                tx_hal::console_write_bytes::<P>(&hex_buf);
+                tx_hal::console_write_bytes::<P>(b"\n");
+                // Emit label.
+                tx_hal::console_write_bytes::<P>(b":sdcard:ext4:label=");
+                tx_hal::console_write_bytes::<P>(&label);
+                tx_hal::console_write_bytes::<P>(b"\n");
             }
         }
 
@@ -1772,6 +1791,17 @@ pub(crate) fn emit_process_group<P: tx_hal::TxPlatform>(pid_low: u32, pgid_low: 
         tx_observe::encode::process_group_tag(),
         &enc[..len as usize],
     );
+}
+
+/// Write a `u8` as two hex ASCII chars into `buf[..2]`.
+///
+/// Used by diagnostic sentinels to report walker diag codes without
+/// pulling in a formatting dependency.  Panics if `buf` has fewer
+/// than 2 bytes.
+fn write_hex_u8(byte: u8, buf: &mut [u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    buf[0] = HEX[(byte >> 4) as usize];
+    buf[1] = HEX[(byte & 0x0f) as usize];
 }
 
 mod helpers;

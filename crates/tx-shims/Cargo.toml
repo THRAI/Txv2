@@ -30,6 +30,7 @@ tx-observe = { path = "../tx-observe" }
 tx-observe-types = { path = "../tx-observe-types" }
 tx-scripts = { path = "../tx-scripts" }
 tx-fs = { path = "../tx-fs" }
+tx-services = { path = "../tx-services" }
 
 [dev-dependencies]
 tx-subsystems = { path = "../tx-subsystems", features = ["test-support"] }

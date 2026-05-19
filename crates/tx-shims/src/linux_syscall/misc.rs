@@ -17,7 +17,7 @@ use super::*;
 /// (canonical `aspace.copy_to_user` lane with kernel-pointer fallback
 /// for test scaffolding). Null `buf` with non-zero `buflen` returns
 /// `-EFAULT`; `buflen == 0` is a successful no-op (`Return(0)`).
-pub(super) fn sys_getrandom<'a, P: EntropyIf>(
+pub(super) fn sys_getrandom<'a>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -32,10 +32,10 @@ pub(super) fn sys_getrandom<'a, P: EntropyIf>(
         return SyscallResult::Error(EFAULT_VALUE);
     }
 
-    // Fill into a temporary kernel buffer, then copy out through the
+    // Fill from the kernel CSPRNG, then copy out through the
     // canonical user-VA lane.
     let mut tmp = alloc::vec![0u8; buf_len];
-    <P as EntropyIf>::fill_random(&mut tmp);
+    tx_services::random::fill_bytes(&mut tmp);
     if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &tmp) {
         return SyscallResult::error_from(errno);
     }
