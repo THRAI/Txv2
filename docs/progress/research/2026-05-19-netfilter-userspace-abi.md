@@ -80,3 +80,30 @@ commands:
 - MASQUERADE for a source CIDR and output iface.
 - DNAT for protocol, public destination/port, and private destination/port.
 - FORWARD filter ACCEPT/DROP by input/output iface.
+
+## N72N2 Probe Update
+
+The repository's current `tools/images/vendor/busybox-riscv64-musl` image does
+not appear to include `iptables`, `ip6tables`, or `nft` applets (`strings`
+found no matching applet names), so the in-tree BusyBox shell-test image cannot
+yet drive the real command-line tools for this ABI.
+
+The host environment has `/usr/sbin/nft` and `/usr/sbin/iptables`, and the
+local UAPI headers are present at:
+
+- `/usr/include/linux/netfilter/nf_tables.h`
+- `/usr/include/linux/netfilter/nfnetlink.h`
+- `/usr/include/linux/netfilter_ipv4/ip_tables.h`
+- `/usr/include/linux/netfilter/x_tables.h`
+
+Trying to use `nft --check --debug=netlink ...` as the unprivileged user fails
+before command serialization with `Operation not permitted` while initializing
+the netlink cache, even when run outside the workspace sandbox. Because of
+that, N72O0/O1 used fixtures shaped directly from the local nf_tables UAPI
+instead of captured `nft --debug=netlink` byte streams.
+
+The minimal mutation subset implemented next should therefore be treated as
+UAPI-compatible staging coverage, not as proof that Alpine's exact `nft` or
+`iptables-nft` binaries already run end to end. The next empirical step is to
+add real Alpine/iptables/nft userspace binaries to an image and record the
+first failing syscall/netlink message against txKernel.

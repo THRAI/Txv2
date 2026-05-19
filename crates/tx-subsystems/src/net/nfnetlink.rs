@@ -1,21 +1,27 @@
 //! Minimal NETLINK_NETFILTER / nfnetlink surface.
 //!
-//! This is a read-only adapter over the staging netfilter rule model. It gives
-//! nftables-aware userspace a real protocol endpoint before full nf_tables
-//! expression parsing and mutation support exists.
+//! This is a small adapter over the staging netfilter rule model. It gives
+//! nftables-aware userspace a real protocol endpoint, read-only dumps, and a
+//! tiny mutation subset before full nf_tables expression compatibility exists.
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use tx_substrate::zone::Cap;
 
 use crate::cred::Cred;
 use crate::execution::Errno;
+use crate::net::admin::require_net_admin;
 use crate::net::netfilter::{
-    netfilter_rules_snapshot, NetfilterConntrackProtocol, NetfilterHook, NetfilterIpv4Cidr,
-    NetfilterRule, NetfilterTable, NetfilterTarget,
+    add_netfilter_rule_for_test_or_bootstrap, netfilter_rules_snapshot,
+    remove_netfilter_rule_for_test_or_bootstrap,
+    remove_netfilter_rules_for_chain_for_test_or_bootstrap,
+    remove_netfilter_rules_for_table_for_test_or_bootstrap, NetfilterConntrackProtocol,
+    NetfilterHook, NetfilterIpv4Cidr, NetfilterRule, NetfilterTable, NetfilterTarget,
 };
 use crate::net::structure::{Ipv4Address, RecvWireSet, SendRecvFlags, SocketIdentity, SocketKind};
 use crate::sync::SpinMutex;
@@ -41,16 +47,20 @@ pub const NFNL_MSG_BATCH_END: u16 = NLMSG_MIN_TYPE + 1;
 
 pub const NFT_MSG_NEWTABLE: u16 = 0;
 pub const NFT_MSG_GETTABLE: u16 = 1;
+pub const NFT_MSG_DELTABLE: u16 = 2;
 pub const NFT_MSG_NEWCHAIN: u16 = 3;
 pub const NFT_MSG_GETCHAIN: u16 = 4;
+pub const NFT_MSG_DELCHAIN: u16 = 5;
 pub const NFT_MSG_NEWRULE: u16 = 6;
 pub const NFT_MSG_GETRULE: u16 = 7;
+pub const NFT_MSG_DELRULE: u16 = 8;
 pub const NFT_MSG_NEWGEN: u16 = 15;
 pub const NFT_MSG_GETGEN: u16 = 16;
 
 const NLMSG_HDR_LEN: usize = 16;
 const NFGENMSG_LEN: usize = 4;
 const NLA_HDR_LEN: usize = 4;
+const NLA_TYPE_MASK: u16 = 0x3fff;
 const NLA_F_NESTED: u16 = 0x8000;
 
 const NFTA_TABLE_NAME: u16 = 1;
@@ -76,11 +86,63 @@ const NFTA_RULE_USERDATA: u16 = 7;
 
 const NFTA_GEN_ID: u16 = 1;
 
+const NFTA_DATA_VALUE: u16 = 1;
+const NFTA_DATA_VERDICT: u16 = 2;
+const NFTA_VERDICT_CODE: u16 = 1;
+
+const NFTA_EXPR_NAME: u16 = 1;
+const NFTA_EXPR_DATA: u16 = 2;
+
+const NFTA_IMMEDIATE_DREG: u16 = 1;
+const NFTA_IMMEDIATE_DATA: u16 = 2;
+
+const NFTA_BITWISE_SREG: u16 = 1;
+const NFTA_BITWISE_DREG: u16 = 2;
+const NFTA_BITWISE_LEN: u16 = 3;
+const NFTA_BITWISE_MASK: u16 = 4;
+const NFTA_BITWISE_XOR: u16 = 5;
+
+const NFTA_CMP_SREG: u16 = 1;
+const NFTA_CMP_OP: u16 = 2;
+const NFTA_CMP_DATA: u16 = 3;
+
+const NFTA_PAYLOAD_DREG: u16 = 1;
+const NFTA_PAYLOAD_BASE: u16 = 2;
+const NFTA_PAYLOAD_OFFSET: u16 = 3;
+const NFTA_PAYLOAD_LEN: u16 = 4;
+
+const NFTA_META_DREG: u16 = 1;
+const NFTA_META_KEY: u16 = 2;
+
+const NFTA_NAT_TYPE: u16 = 1;
+const NFTA_NAT_FAMILY: u16 = 2;
+const NFTA_NAT_REG_ADDR_MIN: u16 = 3;
+const NFTA_NAT_REG_PROTO_MIN: u16 = 5;
+
+const NFT_REG_VERDICT: u32 = 0;
+const NFT_CMP_EQ: u32 = 0;
+const NFT_PAYLOAD_NETWORK_HEADER: u32 = 1;
+const NFT_PAYLOAD_TRANSPORT_HEADER: u32 = 2;
+const NFT_META_IIFNAME: u32 = 6;
+const NFT_META_OIFNAME: u32 = 7;
+const NFT_META_L4PROTO: u32 = 16;
+const NFT_NAT_DNAT: u32 = 1;
+
 const NFT_CHAIN_BASE: u32 = 1;
+const NF_DROP: u32 = 0;
 const NF_ACCEPT: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NetlinkNetfilterState;
+
+static NFT_TABLES: SpinMutex<Vec<NftTableObject>> = SpinMutex::new(Vec::new());
+static NFT_CHAINS: SpinMutex<Vec<NftChainObject>> = SpinMutex::new(Vec::new());
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_nfnetlink_for_test() {
+    NFT_TABLES.lock().clear();
+    NFT_CHAINS.lock().clear();
+}
 
 pub struct RawNetlinkNetfilterSocket {
     rx: SpinMutex<VecDeque<Vec<u8>>>,
@@ -128,7 +190,7 @@ impl RawNetlinkNetfilterSocket {
 pub fn netlink_netfilter_send(
     socket: &Cap<SocketIdentity>,
     bytes: &[u8],
-    _cred: Cred,
+    cred: Cred,
 ) -> Result<usize, Errno> {
     if socket.kind != SocketKind::NetlinkNetfilter {
         return Err(Errno::EOPNOTSUPP);
@@ -138,7 +200,7 @@ pub fn netlink_netfilter_send(
         .raw_netlink_netfilter_socket()
         .ok_or(Errno::EOPNOTSUPP)?;
 
-    for response in nfnetlink_handle_request(bytes) {
+    for response in nfnetlink_handle_request_with_cred(bytes, cred) {
         raw.queue_response(response);
     }
     payload.refresh_io_from_raw();
@@ -172,6 +234,10 @@ pub fn netlink_netfilter_recv(
 }
 
 pub fn nfnetlink_handle_request(request: &[u8]) -> Vec<Vec<u8>> {
+    nfnetlink_handle_request_with_cred(request, Cred::root())
+}
+
+pub fn nfnetlink_handle_request_with_cred(request: &[u8], cred: Cred) -> Vec<Vec<u8>> {
     let mut responses = Vec::new();
     let mut offset = 0usize;
     while offset < request.len() {
@@ -189,13 +255,18 @@ pub fn nfnetlink_handle_request(request: &[u8]) -> Vec<Vec<u8>> {
             break;
         }
         let payload = &request[offset + NLMSG_HDR_LEN..offset + msg_len];
-        handle_one_message(header, payload, &mut responses);
+        handle_one_message(cred, header, payload, &mut responses);
         offset += align4(msg_len);
     }
     responses
 }
 
-fn handle_one_message(header: NlMsgHeader, payload: &[u8], responses: &mut Vec<Vec<u8>>) {
+fn handle_one_message(
+    cred: Cred,
+    header: NlMsgHeader,
+    payload: &[u8],
+    responses: &mut Vec<Vec<u8>>,
+) {
     if header.kind == NFNL_MSG_BATCH_BEGIN || header.kind == NFNL_MSG_BATCH_END {
         responses.push(build_ack_response(header));
         return;
@@ -231,6 +302,22 @@ fn handle_one_message(header: NlMsgHeader, payload: &[u8], responses: &mut Vec<V
             responses.push(build_generation_message(header, family));
             responses.push(build_done_message(header.seq, header.pid));
         }
+        NFT_MSG_NEWTABLE => {
+            responses.push(ack_or_error(header, handle_newtable(cred, family, payload)))
+        }
+        NFT_MSG_DELTABLE => {
+            responses.push(ack_or_error(header, handle_deltable(cred, family, payload)))
+        }
+        NFT_MSG_NEWCHAIN => {
+            responses.push(ack_or_error(header, handle_newchain(cred, family, payload)))
+        }
+        NFT_MSG_DELCHAIN => {
+            responses.push(ack_or_error(header, handle_delchain(cred, family, payload)))
+        }
+        NFT_MSG_NEWRULE => {
+            responses.push(ack_or_error(header, handle_newrule(cred, family, payload)))
+        }
+        NFT_MSG_DELRULE => responses.push(ack_or_error(header, handle_delrule(cred, payload))),
         _ => responses.push(build_error_response(Some(header), Errno::EOPNOTSUPP)),
     }
 }
@@ -238,6 +325,15 @@ fn handle_one_message(header: NlMsgHeader, payload: &[u8], responses: &mut Vec<V
 fn render_table_dump(header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
     let rules = netfilter_rules_snapshot();
     let mut tables = Vec::<TableSummary>::new();
+    for table in NFT_TABLES.lock().iter() {
+        if table.family == family {
+            tables.push(TableSummary {
+                family,
+                name: table.name.clone(),
+                chains: 0,
+            });
+        }
+    }
     for rule in &rules {
         let summary = table_for_rule(*rule);
         if let Some(existing) = tables
@@ -259,6 +355,18 @@ fn render_table_dump(header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
 
 fn render_chain_dump(header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
     let mut chains = Vec::<ChainSummary>::new();
+    for chain in NFT_CHAINS.lock().iter() {
+        if chain.family == family {
+            chains.push(ChainSummary {
+                family,
+                table: chain.table.clone(),
+                name: chain.name.clone(),
+                hooknum: hooknum(chain.hook),
+                priority: chain.priority,
+                chain_type: chain.chain_type.clone(),
+            });
+        }
+    }
     for rule in netfilter_rules_snapshot() {
         let chain = chain_for_rule(rule, family);
         if chains.iter().all(|seen| {
@@ -296,9 +404,140 @@ fn render_rule_dump(header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
     out
 }
 
+fn handle_newtable(cred: Cred, family: u8, payload: &[u8]) -> Result<(), Errno> {
+    let _auth = require_net_admin(cred)?;
+    let attrs = parse_nfmsg_attrs(payload)?;
+    let name = attr_string(&attrs, NFTA_TABLE_NAME).ok_or(Errno::EINVAL)?;
+    let mut tables = NFT_TABLES.lock();
+    if tables
+        .iter()
+        .any(|table| table.family == family && table.name == name)
+    {
+        return Ok(());
+    }
+    tables.push(NftTableObject {
+        family,
+        name: name.to_string(),
+    });
+    Ok(())
+}
+
+fn handle_deltable(cred: Cred, family: u8, payload: &[u8]) -> Result<(), Errno> {
+    let _auth = require_net_admin(cred)?;
+    let attrs = parse_nfmsg_attrs(payload)?;
+    let name = attr_string(&attrs, NFTA_TABLE_NAME).ok_or(Errno::EINVAL)?;
+    if let Ok(table) = netfilter_table_from_name(name) {
+        remove_netfilter_rules_for_table_for_test_or_bootstrap(table);
+    }
+    NFT_TABLES
+        .lock()
+        .retain(|table| !(table.family == family && table.name == name));
+    NFT_CHAINS
+        .lock()
+        .retain(|chain| !(chain.family == family && chain.table == name));
+    Ok(())
+}
+
+fn handle_newchain(cred: Cred, family: u8, payload: &[u8]) -> Result<(), Errno> {
+    let _auth = require_net_admin(cred)?;
+    let attrs = parse_nfmsg_attrs(payload)?;
+    let table = attr_string(&attrs, NFTA_CHAIN_TABLE).ok_or(Errno::EINVAL)?;
+    let name = attr_string(&attrs, NFTA_CHAIN_NAME).ok_or(Errno::EINVAL)?;
+    let (hook, priority) = attr_payload(&attrs, NFTA_CHAIN_HOOK)
+        .map(parse_chain_hook)
+        .transpose()?
+        .unwrap_or((hook_from_name(name)?, default_chain_priority(table, name)));
+    let chain_type = attr_string(&attrs, NFTA_CHAIN_TYPE).unwrap_or_else(|| table_type_name(table));
+
+    handle_newtable(cred, family, &table_message_payload(family, table))?;
+
+    let mut chains = NFT_CHAINS.lock();
+    if let Some(existing) = chains
+        .iter_mut()
+        .find(|chain| chain.family == family && chain.table == table && chain.name == name)
+    {
+        existing.hook = hook;
+        existing.priority = priority;
+        existing.chain_type = chain_type.to_string();
+        return Ok(());
+    }
+    chains.push(NftChainObject {
+        family,
+        table: table.to_string(),
+        name: name.to_string(),
+        hook,
+        priority,
+        chain_type: chain_type.to_string(),
+    });
+    Ok(())
+}
+
+fn handle_delchain(cred: Cred, family: u8, payload: &[u8]) -> Result<(), Errno> {
+    let _auth = require_net_admin(cred)?;
+    let attrs = parse_nfmsg_attrs(payload)?;
+    let table = attr_string(&attrs, NFTA_CHAIN_TABLE).ok_or(Errno::EINVAL)?;
+    let name = attr_string(&attrs, NFTA_CHAIN_NAME).ok_or(Errno::EINVAL)?;
+    if let (Ok(table_kind), Ok(hook)) = (
+        netfilter_table_from_name(table),
+        hook_from_chain(table, name),
+    ) {
+        remove_netfilter_rules_for_chain_for_test_or_bootstrap(table_kind, hook);
+    }
+    NFT_CHAINS
+        .lock()
+        .retain(|chain| !(chain.family == family && chain.table == table && chain.name == name));
+    Ok(())
+}
+
+fn handle_newrule(cred: Cred, family: u8, payload: &[u8]) -> Result<(), Errno> {
+    let _auth = require_net_admin(cred)?;
+    let attrs = parse_nfmsg_attrs(payload)?;
+    let table_name = attr_string(&attrs, NFTA_RULE_TABLE).ok_or(Errno::EINVAL)?;
+    let chain_name = attr_string(&attrs, NFTA_RULE_CHAIN).ok_or(Errno::EINVAL)?;
+    let table = netfilter_table_from_name(table_name)?;
+    let hook = hook_from_chain(table_name, chain_name)?;
+    let mut parsed = NftRuleParse::default();
+    if let Some(exprs) = attr_payload(&attrs, NFTA_RULE_EXPRESSIONS) {
+        parsed = parse_rule_expressions(exprs)?;
+    }
+    if parsed.target.is_none() {
+        if let Some(userdata) = attr_payload(&attrs, NFTA_RULE_USERDATA) {
+            parsed = parse_rule_userdata(userdata)?;
+        }
+    }
+    let target = parsed.target.ok_or(Errno::EOPNOTSUPP)?;
+    add_netfilter_rule_for_test_or_bootstrap(NetfilterRule {
+        table,
+        hook,
+        protocol: parsed.protocol,
+        src: parsed.src,
+        dst: parsed.dst,
+        dst_port: parsed.dst_port,
+        in_iface: parsed.in_iface,
+        out_iface: parsed.out_iface,
+        target,
+        to_addr: parsed.to_addr,
+        to_port: parsed.to_port,
+    })?;
+
+    handle_newchain(
+        cred,
+        family,
+        &chain_message_payload(family, table_name, chain_name, hook),
+    )
+}
+
+fn handle_delrule(cred: Cred, payload: &[u8]) -> Result<(), Errno> {
+    let _auth = require_net_admin(cred)?;
+    let attrs = parse_nfmsg_attrs(payload)?;
+    let handle = attr_u64(&attrs, NFTA_RULE_HANDLE).ok_or(Errno::EINVAL)?;
+    let index = handle.checked_sub(1).ok_or(Errno::EINVAL)? as usize;
+    remove_netfilter_rule_for_test_or_bootstrap(index)
+}
+
 fn build_table_message(seq: u32, pid: u32, family: u8, table: TableSummary) -> Vec<u8> {
     let mut payload = nfgenmsg(family);
-    push_attr_string(&mut payload, NFTA_TABLE_NAME, table.name);
+    push_attr_string(&mut payload, NFTA_TABLE_NAME, &table.name);
     push_attr_u32(&mut payload, NFTA_TABLE_FLAGS, 0);
     push_attr_u32(&mut payload, NFTA_TABLE_USE, table.chains);
     build_nlmsg(nft_msg(NFT_MSG_NEWTABLE), NLM_F_MULTI, seq, pid, &payload)
@@ -312,15 +551,15 @@ fn build_chain_message(
     handle: u64,
 ) -> Vec<u8> {
     let mut payload = nfgenmsg(family);
-    push_attr_string(&mut payload, NFTA_CHAIN_TABLE, chain.table);
+    push_attr_string(&mut payload, NFTA_CHAIN_TABLE, &chain.table);
     push_attr_u64(&mut payload, NFTA_CHAIN_HANDLE, handle);
-    push_attr_string(&mut payload, NFTA_CHAIN_NAME, chain.name);
+    push_attr_string(&mut payload, NFTA_CHAIN_NAME, &chain.name);
     push_nested_attr(&mut payload, NFTA_CHAIN_HOOK, |nested| {
         push_attr_u32(nested, NFTA_HOOK_HOOKNUM, chain.hooknum);
         push_attr_u32(nested, NFTA_HOOK_PRIORITY, chain.priority as u32);
     });
     push_attr_u32(&mut payload, NFTA_CHAIN_POLICY, NF_ACCEPT);
-    push_attr_string(&mut payload, NFTA_CHAIN_TYPE, chain.chain_type);
+    push_attr_string(&mut payload, NFTA_CHAIN_TYPE, &chain.chain_type);
     push_attr_u32(&mut payload, NFTA_CHAIN_FLAGS, NFT_CHAIN_BASE);
     build_nlmsg(nft_msg(NFT_MSG_NEWCHAIN), NLM_F_MULTI, seq, pid, &payload)
 }
@@ -328,8 +567,8 @@ fn build_chain_message(
 fn build_rule_message(seq: u32, pid: u32, family: u8, rule: NetfilterRule, handle: u64) -> Vec<u8> {
     let chain = chain_for_rule(rule, family);
     let mut payload = nfgenmsg(family);
-    push_attr_string(&mut payload, NFTA_RULE_TABLE, chain.table);
-    push_attr_string(&mut payload, NFTA_RULE_CHAIN, chain.name);
+    push_attr_string(&mut payload, NFTA_RULE_TABLE, &chain.table);
+    push_attr_string(&mut payload, NFTA_RULE_CHAIN, &chain.name);
     push_attr_u64(&mut payload, NFTA_RULE_HANDLE, handle);
     push_nested_attr(&mut payload, NFTA_RULE_EXPRESSIONS, |_| {});
     let summary = rule_summary(rule);
@@ -353,8 +592,8 @@ fn table_for_rule(rule: NetfilterRule) -> TableSummary {
     TableSummary {
         family: NFPROTO_IPV4,
         name: match rule.table {
-            NetfilterTable::Filter => "filter",
-            NetfilterTable::Nat => "nat",
+            NetfilterTable::Filter => String::from("filter"),
+            NetfilterTable::Nat => String::from("nat"),
         },
         chains: 1,
     }
@@ -362,13 +601,13 @@ fn table_for_rule(rule: NetfilterRule) -> TableSummary {
 
 fn chain_for_rule(rule: NetfilterRule, family: u8) -> ChainSummary {
     let table = match rule.table {
-        NetfilterTable::Filter => "filter",
-        NetfilterTable::Nat => "nat",
+        NetfilterTable::Filter => String::from("filter"),
+        NetfilterTable::Nat => String::from("nat"),
     };
     ChainSummary {
         family,
         table,
-        name: hook_name(rule.hook),
+        name: hook_name(rule.hook).to_string(),
         hooknum: hooknum(rule.hook),
         priority: match rule.table {
             NetfilterTable::Filter => 0,
@@ -379,8 +618,8 @@ fn chain_for_rule(rule: NetfilterRule, family: u8) -> ChainSummary {
             },
         },
         chain_type: match rule.table {
-            NetfilterTable::Filter => "filter",
-            NetfilterTable::Nat => "nat",
+            NetfilterTable::Filter => String::from("filter"),
+            NetfilterTable::Nat => String::from("nat"),
         },
     }
 }
@@ -464,6 +703,235 @@ fn protocol_name(protocol: NetfilterConntrackProtocol) -> &'static str {
     }
 }
 
+fn parse_rule_expressions(bytes: &[u8]) -> Result<NftRuleParse, Errno> {
+    let mut parsed = NftRuleParse::default();
+    let mut regs = Vec::<RegisterBinding>::new();
+    for expr in parse_attrs(bytes)? {
+        let expr_attrs = parse_attrs(expr.payload)?;
+        let name = attr_string(&expr_attrs, NFTA_EXPR_NAME).ok_or(Errno::EINVAL)?;
+        let data = attr_payload(&expr_attrs, NFTA_EXPR_DATA).unwrap_or(&[]);
+        match name {
+            "meta" => parse_meta_expr(data, &mut regs)?,
+            "payload" => parse_payload_expr(data, &mut regs)?,
+            "bitwise" => parse_bitwise_expr(data, &mut regs)?,
+            "cmp" => parse_cmp_expr(data, &regs, &mut parsed)?,
+            "immediate" => parse_immediate_expr(data, &mut regs, &mut parsed)?,
+            "masq" => parsed.target = Some(NetfilterTarget::Masquerade),
+            "nat" => parse_nat_expr(data, &regs, &mut parsed)?,
+            "counter" => {}
+            _ => return Err(Errno::EOPNOTSUPP),
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_meta_expr(data: &[u8], regs: &mut Vec<RegisterBinding>) -> Result<(), Errno> {
+    let attrs = parse_attrs(data)?;
+    let dreg = attr_u32(&attrs, NFTA_META_DREG).ok_or(Errno::EINVAL)?;
+    let key = attr_u32(&attrs, NFTA_META_KEY).ok_or(Errno::EINVAL)?;
+    bind_register(regs, dreg, RegisterBindingKind::Meta(key));
+    Ok(())
+}
+
+fn parse_payload_expr(data: &[u8], regs: &mut Vec<RegisterBinding>) -> Result<(), Errno> {
+    let attrs = parse_attrs(data)?;
+    let dreg = attr_u32(&attrs, NFTA_PAYLOAD_DREG).ok_or(Errno::EINVAL)?;
+    let base = attr_u32(&attrs, NFTA_PAYLOAD_BASE).ok_or(Errno::EINVAL)?;
+    let offset = attr_u32(&attrs, NFTA_PAYLOAD_OFFSET).ok_or(Errno::EINVAL)?;
+    let len = attr_u32(&attrs, NFTA_PAYLOAD_LEN).ok_or(Errno::EINVAL)?;
+    bind_register(
+        regs,
+        dreg,
+        RegisterBindingKind::Payload {
+            base,
+            offset,
+            len,
+            prefix_len: None,
+        },
+    );
+    Ok(())
+}
+
+fn parse_bitwise_expr(data: &[u8], regs: &mut Vec<RegisterBinding>) -> Result<(), Errno> {
+    let attrs = parse_attrs(data)?;
+    let sreg = attr_u32(&attrs, NFTA_BITWISE_SREG).ok_or(Errno::EINVAL)?;
+    let dreg = attr_u32(&attrs, NFTA_BITWISE_DREG).ok_or(Errno::EINVAL)?;
+    let len = attr_u32(&attrs, NFTA_BITWISE_LEN).ok_or(Errno::EINVAL)?;
+    let mask = attr_nested_data_value(&attrs, NFTA_BITWISE_MASK).ok_or(Errno::EINVAL)?;
+    let xor = attr_nested_data_value(&attrs, NFTA_BITWISE_XOR).unwrap_or(&[]);
+    if !xor.iter().all(|byte| *byte == 0) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let Some(RegisterBindingKind::Payload {
+        base,
+        offset,
+        len: source_len,
+        ..
+    }) = register_binding(regs, sreg)
+    else {
+        return Err(Errno::EOPNOTSUPP);
+    };
+    if len != source_len || mask.len() != len as usize {
+        return Err(Errno::EINVAL);
+    }
+    bind_register(
+        regs,
+        dreg,
+        RegisterBindingKind::Payload {
+            base,
+            offset,
+            len,
+            prefix_len: ipv4_mask_prefix_len(mask),
+        },
+    );
+    Ok(())
+}
+
+fn parse_cmp_expr(
+    data: &[u8],
+    regs: &[RegisterBinding],
+    parsed: &mut NftRuleParse,
+) -> Result<(), Errno> {
+    let attrs = parse_attrs(data)?;
+    let sreg = attr_u32(&attrs, NFTA_CMP_SREG).ok_or(Errno::EINVAL)?;
+    let op = attr_u32(&attrs, NFTA_CMP_OP).ok_or(Errno::EINVAL)?;
+    if op != NFT_CMP_EQ {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let value = attr_nested_data_value(&attrs, NFTA_CMP_DATA).ok_or(Errno::EINVAL)?;
+    match register_binding(regs, sreg).ok_or(Errno::EINVAL)? {
+        RegisterBindingKind::Meta(NFT_META_IIFNAME) => {
+            parsed.in_iface = Some(leak_ascii_nul_string(value)?);
+        }
+        RegisterBindingKind::Meta(NFT_META_OIFNAME) => {
+            parsed.out_iface = Some(leak_ascii_nul_string(value)?);
+        }
+        RegisterBindingKind::Meta(NFT_META_L4PROTO) => {
+            parsed.protocol = Some(protocol_from_data(value)?);
+        }
+        RegisterBindingKind::Payload {
+            base,
+            offset,
+            len,
+            prefix_len: _,
+        } if base == NFT_PAYLOAD_NETWORK_HEADER && offset == 9 && len == 1 => {
+            parsed.protocol = Some(protocol_from_data(value)?);
+        }
+        RegisterBindingKind::Payload {
+            base,
+            offset,
+            len,
+            prefix_len,
+        } if base == NFT_PAYLOAD_NETWORK_HEADER && offset == 12 && len == 4 => {
+            parsed.src = Some(NetfilterIpv4Cidr {
+                addr: ipv4_from_data(value)?,
+                prefix_len: prefix_len.unwrap_or(32),
+            });
+        }
+        RegisterBindingKind::Payload {
+            base,
+            offset,
+            len,
+            prefix_len,
+        } if base == NFT_PAYLOAD_NETWORK_HEADER && offset == 16 && len == 4 => {
+            parsed.dst = Some(NetfilterIpv4Cidr {
+                addr: ipv4_from_data(value)?,
+                prefix_len: prefix_len.unwrap_or(32),
+            });
+        }
+        RegisterBindingKind::Payload {
+            base, offset, len, ..
+        } if base == NFT_PAYLOAD_TRANSPORT_HEADER && offset == 2 && len == 2 => {
+            parsed.dst_port = Some(u16_from_be_data(value)?);
+        }
+        _ => return Err(Errno::EOPNOTSUPP),
+    }
+    Ok(())
+}
+
+fn parse_immediate_expr(
+    data: &[u8],
+    regs: &mut Vec<RegisterBinding>,
+    parsed: &mut NftRuleParse,
+) -> Result<(), Errno> {
+    let attrs = parse_attrs(data)?;
+    let dreg = attr_u32(&attrs, NFTA_IMMEDIATE_DREG).ok_or(Errno::EINVAL)?;
+    let data_attrs = parse_attrs(attr_payload(&attrs, NFTA_IMMEDIATE_DATA).ok_or(Errno::EINVAL)?)?;
+    if dreg == NFT_REG_VERDICT {
+        let verdict = attr_payload(&data_attrs, NFTA_DATA_VERDICT).ok_or(Errno::EINVAL)?;
+        let verdict_attrs = parse_attrs(verdict)?;
+        let code = attr_u32(&verdict_attrs, NFTA_VERDICT_CODE).ok_or(Errno::EINVAL)?;
+        parsed.target = match code {
+            NF_ACCEPT => Some(NetfilterTarget::Accept),
+            NF_DROP => Some(NetfilterTarget::Drop),
+            _ => return Err(Errno::EOPNOTSUPP),
+        };
+        return Ok(());
+    }
+    let value = attr_payload(&data_attrs, NFTA_DATA_VALUE)
+        .ok_or(Errno::EINVAL)?
+        .to_vec();
+    bind_register(regs, dreg, RegisterBindingKind::Value(value));
+    Ok(())
+}
+
+fn parse_nat_expr(
+    data: &[u8],
+    regs: &[RegisterBinding],
+    parsed: &mut NftRuleParse,
+) -> Result<(), Errno> {
+    let attrs = parse_attrs(data)?;
+    let nat_type = attr_u32(&attrs, NFTA_NAT_TYPE).ok_or(Errno::EINVAL)?;
+    let family = attr_u32(&attrs, NFTA_NAT_FAMILY).unwrap_or(NFPROTO_IPV4 as u32);
+    if nat_type != NFT_NAT_DNAT || family as u8 != NFPROTO_IPV4 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let addr_reg = attr_u32(&attrs, NFTA_NAT_REG_ADDR_MIN).ok_or(Errno::EINVAL)?;
+    let port_reg = attr_u32(&attrs, NFTA_NAT_REG_PROTO_MIN);
+    parsed.target = Some(NetfilterTarget::Dnat);
+    parsed.to_addr = Some(ipv4_from_data(
+        register_value(regs, addr_reg).ok_or(Errno::EINVAL)?,
+    )?);
+    if let Some(port_reg) = port_reg {
+        parsed.to_port = Some(u16_from_be_data(
+            register_value(regs, port_reg).ok_or(Errno::EINVAL)?,
+        )?);
+    }
+    Ok(())
+}
+
+fn parse_rule_userdata(bytes: &[u8]) -> Result<NftRuleParse, Errno> {
+    let text = core::str::from_utf8(bytes)
+        .map_err(|_| Errno::EINVAL)?
+        .trim_matches(char::from(0))
+        .trim();
+    let mut parsed = NftRuleParse::default();
+    for field in text.split_ascii_whitespace() {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        match key {
+            "target" => parsed.target = Some(target_from_name(value)?),
+            "proto" if value != "*" => parsed.protocol = Some(protocol_from_name(value)?),
+            "src" if value != "*" => parsed.src = Some(cidr_from_text(value)?),
+            "dst" if value != "*" => parsed.dst = Some(cidr_from_text(value)?),
+            "dport" if value != "*" => parsed.dst_port = Some(parse_u16_text(value)?),
+            "in" if value != "*" => parsed.in_iface = Some(leak_str(value)),
+            "out" if value != "*" => parsed.out_iface = Some(leak_str(value)),
+            "to" if value != "*" => {
+                if let Some((addr, port)) = value.split_once(':') {
+                    parsed.to_addr = Some(ipv4_from_text(addr)?);
+                    parsed.to_port = Some(parse_u16_text(port)?);
+                } else {
+                    parsed.to_addr = Some(ipv4_from_text(value)?);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(parsed)
+}
+
 fn nfgenmsg(family: u8) -> Vec<u8> {
     let mut out = Vec::with_capacity(NFGENMSG_LEN);
     out.push(family);
@@ -499,6 +967,13 @@ fn build_nlmsg(kind: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) -> Vec
 
 fn build_done_message(seq: u32, pid: u32) -> Vec<u8> {
     build_nlmsg(NLMSG_DONE, NLM_F_MULTI, seq, pid, &0i32.to_le_bytes())
+}
+
+fn ack_or_error(header: NlMsgHeader, result: Result<(), Errno>) -> Vec<u8> {
+    match result {
+        Ok(()) => build_ack_response(header),
+        Err(errno) => build_error_response(Some(header), errno),
+    }
 }
 
 fn build_ack_response(header: NlMsgHeader) -> Vec<u8> {
@@ -556,6 +1031,328 @@ fn push_attr_u64(out: &mut Vec<u8>, kind: u16, value: u64) {
     push_attr(out, kind, &value.to_le_bytes());
 }
 
+fn parse_nfmsg_attrs(payload: &[u8]) -> Result<Vec<NlAttr<'_>>, Errno> {
+    if payload.len() < NFGENMSG_LEN {
+        return Err(Errno::EINVAL);
+    }
+    parse_attrs(&payload[NFGENMSG_LEN..])
+}
+
+fn parse_attrs(bytes: &[u8]) -> Result<Vec<NlAttr<'_>>, Errno> {
+    let mut attrs = Vec::new();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        if bytes.len() - offset < NLA_HDR_LEN {
+            return Err(Errno::EINVAL);
+        }
+        let len = read_u16(bytes, offset) as usize;
+        if len < NLA_HDR_LEN || offset.saturating_add(len) > bytes.len() {
+            return Err(Errno::EINVAL);
+        }
+        attrs.push(NlAttr {
+            kind: read_u16(bytes, offset + 2) & NLA_TYPE_MASK,
+            payload: &bytes[offset + NLA_HDR_LEN..offset + len],
+        });
+        offset += align4(len);
+    }
+    Ok(attrs)
+}
+
+fn attr_payload<'a>(attrs: &'a [NlAttr<'a>], kind: u16) -> Option<&'a [u8]> {
+    attrs
+        .iter()
+        .find(|attr| attr.kind == kind)
+        .map(|attr| attr.payload)
+}
+
+fn attr_string<'a>(attrs: &'a [NlAttr<'a>], kind: u16) -> Option<&'a str> {
+    let bytes = attr_payload(attrs, kind)?;
+    core::str::from_utf8(trim_nul(bytes)).ok()
+}
+
+fn attr_u32(attrs: &[NlAttr<'_>], kind: u16) -> Option<u32> {
+    let payload = attr_payload(attrs, kind)?;
+    (payload.len() >= 4).then(|| read_u32(payload, 0))
+}
+
+fn attr_u64(attrs: &[NlAttr<'_>], kind: u16) -> Option<u64> {
+    let payload = attr_payload(attrs, kind)?;
+    (payload.len() >= 8).then(|| {
+        u64::from_le_bytes([
+            payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+            payload[7],
+        ])
+    })
+}
+
+fn attr_nested_data_value<'a>(attrs: &'a [NlAttr<'a>], kind: u16) -> Option<&'a [u8]> {
+    let bytes = attr_payload(attrs, kind)?;
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        if bytes.len() - offset < NLA_HDR_LEN {
+            return None;
+        }
+        let len = read_u16(bytes, offset) as usize;
+        if len < NLA_HDR_LEN || offset.saturating_add(len) > bytes.len() {
+            return None;
+        }
+        let nested_kind = read_u16(bytes, offset + 2) & NLA_TYPE_MASK;
+        if nested_kind == NFTA_DATA_VALUE {
+            return Some(&bytes[offset + NLA_HDR_LEN..offset + len]);
+        }
+        offset += align4(len);
+    }
+    None
+}
+
+fn table_message_payload(family: u8, name: &str) -> Vec<u8> {
+    let mut payload = nfgenmsg(family);
+    push_attr_string(&mut payload, NFTA_TABLE_NAME, name);
+    payload
+}
+
+fn chain_message_payload(family: u8, table: &str, name: &str, hook: NetfilterHook) -> Vec<u8> {
+    let mut payload = nfgenmsg(family);
+    push_attr_string(&mut payload, NFTA_CHAIN_TABLE, table);
+    push_attr_string(&mut payload, NFTA_CHAIN_NAME, name);
+    push_attr_string(&mut payload, NFTA_CHAIN_TYPE, table_type_name(table));
+    push_nested_attr(&mut payload, NFTA_CHAIN_HOOK, |nested| {
+        push_attr_u32(nested, NFTA_HOOK_HOOKNUM, hooknum(hook));
+        push_attr_u32(
+            nested,
+            NFTA_HOOK_PRIORITY,
+            default_chain_priority(table, name) as u32,
+        );
+    });
+    payload
+}
+
+fn parse_chain_hook(payload: &[u8]) -> Result<(NetfilterHook, i32), Errno> {
+    let attrs = parse_attrs(payload)?;
+    let hooknum = attr_u32(&attrs, NFTA_HOOK_HOOKNUM).ok_or(Errno::EINVAL)?;
+    let priority = attr_u32(&attrs, NFTA_HOOK_PRIORITY)
+        .map(|value| value as i32)
+        .unwrap_or(0);
+    Ok((hook_from_hooknum(hooknum)?, priority))
+}
+
+fn bind_register(regs: &mut Vec<RegisterBinding>, reg: u32, kind: RegisterBindingKind) {
+    if let Some(existing) = regs.iter_mut().find(|binding| binding.reg == reg) {
+        existing.kind = kind;
+        return;
+    }
+    regs.push(RegisterBinding { reg, kind });
+}
+
+fn register_binding(regs: &[RegisterBinding], reg: u32) -> Option<RegisterBindingKind> {
+    regs.iter()
+        .find(|binding| binding.reg == reg)
+        .map(|binding| binding.kind.clone())
+}
+
+fn register_value(regs: &[RegisterBinding], reg: u32) -> Option<&[u8]> {
+    regs.iter()
+        .find(|binding| binding.reg == reg)
+        .and_then(|binding| match &binding.kind {
+            RegisterBindingKind::Value(bytes) => Some(bytes.as_slice()),
+            _ => None,
+        })
+}
+
+fn protocol_from_data(value: &[u8]) -> Result<NetfilterConntrackProtocol, Errno> {
+    match value.first().copied().ok_or(Errno::EINVAL)? {
+        1 => Ok(NetfilterConntrackProtocol::Icmp),
+        6 => Ok(NetfilterConntrackProtocol::Tcp),
+        17 => Ok(NetfilterConntrackProtocol::Udp),
+        _ => Err(Errno::EOPNOTSUPP),
+    }
+}
+
+fn protocol_from_name(value: &str) -> Result<NetfilterConntrackProtocol, Errno> {
+    match value {
+        "icmp" | "ICMP" => Ok(NetfilterConntrackProtocol::Icmp),
+        "tcp" | "TCP" => Ok(NetfilterConntrackProtocol::Tcp),
+        "udp" | "UDP" => Ok(NetfilterConntrackProtocol::Udp),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn target_from_name(value: &str) -> Result<NetfilterTarget, Errno> {
+    match value {
+        "accept" | "ACCEPT" => Ok(NetfilterTarget::Accept),
+        "drop" | "DROP" => Ok(NetfilterTarget::Drop),
+        "masquerade" | "MASQUERADE" => Ok(NetfilterTarget::Masquerade),
+        "dnat" | "DNAT" => Ok(NetfilterTarget::Dnat),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn ipv4_from_data(value: &[u8]) -> Result<Ipv4Address, Errno> {
+    if value.len() < 4 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Ipv4Address::new([value[0], value[1], value[2], value[3]]))
+}
+
+fn u16_from_be_data(value: &[u8]) -> Result<u16, Errno> {
+    if value.len() < 2 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(u16::from_be_bytes([value[0], value[1]]))
+}
+
+fn ipv4_mask_prefix_len(mask: &[u8]) -> Option<u8> {
+    if mask.len() != 4 {
+        return None;
+    }
+    let mut prefix = 0u8;
+    let mut saw_zero = false;
+    for byte in mask {
+        for bit in (0..8).rev() {
+            let set = (*byte & (1 << bit)) != 0;
+            if set && saw_zero {
+                return None;
+            }
+            if set {
+                prefix += 1;
+            } else {
+                saw_zero = true;
+            }
+        }
+    }
+    Some(prefix)
+}
+
+fn leak_ascii_nul_string(value: &[u8]) -> Result<&'static str, Errno> {
+    let text = core::str::from_utf8(trim_nul(value)).map_err(|_| Errno::EINVAL)?;
+    Ok(leak_str(text))
+}
+
+fn leak_str(value: &str) -> &'static str {
+    Box::leak(value.to_string().into_boxed_str())
+}
+
+fn trim_nul(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().position(|byte| *byte == 0) {
+        Some(idx) => &bytes[..idx],
+        None => bytes,
+    }
+}
+
+fn netfilter_table_from_name(name: &str) -> Result<NetfilterTable, Errno> {
+    match name {
+        "filter" | "FILTER" => Ok(NetfilterTable::Filter),
+        "nat" | "NAT" => Ok(NetfilterTable::Nat),
+        _ => Err(Errno::EOPNOTSUPP),
+    }
+}
+
+fn hook_from_chain(table: &str, chain: &str) -> Result<NetfilterHook, Errno> {
+    if let Some(stored) = NFT_CHAINS
+        .lock()
+        .iter()
+        .find(|stored| stored.table == table && stored.name == chain)
+        .map(|stored| stored.hook)
+    {
+        return Ok(stored);
+    }
+    hook_from_name(chain)
+}
+
+fn hook_from_name(name: &str) -> Result<NetfilterHook, Errno> {
+    match name {
+        "PREROUTING" | "prerouting" => Ok(NetfilterHook::Prerouting),
+        "INPUT" | "input" => Ok(NetfilterHook::Input),
+        "FORWARD" | "forward" => Ok(NetfilterHook::Forward),
+        "OUTPUT" | "output" => Ok(NetfilterHook::Output),
+        "POSTROUTING" | "postrouting" => Ok(NetfilterHook::Postrouting),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn hook_from_hooknum(value: u32) -> Result<NetfilterHook, Errno> {
+    match value {
+        0 => Ok(NetfilterHook::Prerouting),
+        1 => Ok(NetfilterHook::Input),
+        2 => Ok(NetfilterHook::Forward),
+        3 => Ok(NetfilterHook::Output),
+        4 => Ok(NetfilterHook::Postrouting),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn default_chain_priority(table: &str, chain: &str) -> i32 {
+    match (table, chain) {
+        ("nat", "PREROUTING") | ("nat", "prerouting") => -100,
+        ("nat", "POSTROUTING") | ("nat", "postrouting") => 100,
+        _ => 0,
+    }
+}
+
+fn table_type_name(table: &str) -> &'static str {
+    match table {
+        "nat" | "NAT" => "nat",
+        _ => "filter",
+    }
+}
+
+fn cidr_from_text(value: &str) -> Result<NetfilterIpv4Cidr, Errno> {
+    let (addr, prefix) = value.split_once('/').unwrap_or((value, "32"));
+    let prefix_len = parse_u8_text(prefix)?;
+    if prefix_len > 32 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(NetfilterIpv4Cidr {
+        addr: ipv4_from_text(addr)?,
+        prefix_len,
+    })
+}
+
+fn ipv4_from_text(value: &str) -> Result<Ipv4Address, Errno> {
+    let mut octets = [0u8; 4];
+    let mut parts = value.split('.');
+    for octet in &mut octets {
+        *octet = parse_u8_text(parts.next().ok_or(Errno::EINVAL)?)?;
+    }
+    if parts.next().is_some() {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Ipv4Address::new(octets))
+}
+
+fn parse_u8_text(value: &str) -> Result<u8, Errno> {
+    let parsed = parse_usize_text(value)?;
+    if parsed > u8::MAX as usize {
+        return Err(Errno::EINVAL);
+    }
+    Ok(parsed as u8)
+}
+
+fn parse_u16_text(value: &str) -> Result<u16, Errno> {
+    let parsed = parse_usize_text(value)?;
+    if parsed > u16::MAX as usize {
+        return Err(Errno::EINVAL);
+    }
+    Ok(parsed as u16)
+}
+
+fn parse_usize_text(value: &str) -> Result<usize, Errno> {
+    let mut out = 0usize;
+    if value.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    for byte in value.bytes() {
+        if !byte.is_ascii_digit() {
+            return Err(Errno::EINVAL);
+        }
+        out = out
+            .checked_mul(10)
+            .and_then(|cur| cur.checked_add((byte - b'0') as usize))
+            .ok_or(Errno::EINVAL)?;
+    }
+    Ok(out)
+}
+
 fn parse_nlmsg_header(bytes: &[u8]) -> Option<NlMsgHeader> {
     if bytes.len() < NLMSG_HDR_LEN {
         return None;
@@ -611,18 +1408,71 @@ struct NlMsgHeader {
 }
 
 #[derive(Clone, Copy)]
+struct NlAttr<'a> {
+    kind: u16,
+    payload: &'a [u8],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NftTableObject {
+    family: u8,
+    name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NftChainObject {
+    family: u8,
+    table: String,
+    name: String,
+    hook: NetfilterHook,
+    priority: i32,
+    chain_type: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct NftRuleParse {
+    protocol: Option<NetfilterConntrackProtocol>,
+    src: Option<NetfilterIpv4Cidr>,
+    dst: Option<NetfilterIpv4Cidr>,
+    dst_port: Option<u16>,
+    in_iface: Option<&'static str>,
+    out_iface: Option<&'static str>,
+    target: Option<NetfilterTarget>,
+    to_addr: Option<Ipv4Address>,
+    to_port: Option<u16>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RegisterBinding {
+    reg: u32,
+    kind: RegisterBindingKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RegisterBindingKind {
+    Meta(u32),
+    Payload {
+        base: u32,
+        offset: u32,
+        len: u32,
+        prefix_len: Option<u8>,
+    },
+    Value(Vec<u8>),
+}
+
+#[derive(Clone)]
 struct TableSummary {
     family: u8,
-    name: &'static str,
+    name: String,
     chains: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ChainSummary {
     family: u8,
-    table: &'static str,
-    name: &'static str,
+    table: String,
+    name: String,
     hooknum: u32,
     priority: i32,
-    chain_type: &'static str,
+    chain_type: String,
 }
