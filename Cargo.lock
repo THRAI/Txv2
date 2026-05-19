@@ -419,11 +419,27 @@ name = "tx-ext4-format"
 version = "0.1.0"
 
 [[package]]
+name = "tx-fat"
+version = "0.1.0"
+dependencies = [
+ "tx-fat-format",
+ "tx-platform-adapter",
+ "tx-substrate",
+ "tx-subsystems",
+]
+
+[[package]]
+name = "tx-fat-format"
+version = "0.1.0"
+
+[[package]]
 name = "tx-fs"
 version = "0.1.0"
 dependencies = [
  "tx-ext4",
  "tx-ext4-format",
+ "tx-fat",
+ "tx-fat-format",
  "tx-hal",
  "tx-platform-adapter",
  "tx-substrate",
