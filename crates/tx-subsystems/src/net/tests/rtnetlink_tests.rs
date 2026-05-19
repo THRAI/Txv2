@@ -598,7 +598,8 @@ fn rtnetlink_dellink_removes_dynamic_device_routes_and_netfilter_rules() {
         &newroute_payload(0, None, Some([172, 17, 0, 1]), eth_ifindex),
     );
     assert_ack_ok(&rtnetlink_handle_request(&ns, root, &route_req)[0]);
-    add_masquerade_rule_for_test_or_bootstrap(
+    crate::net::netfilter::add_masquerade_rule_in_namespace_for_test_or_bootstrap(
+        &ns,
         NetfilterIpv4Cidr {
             addr: Ipv4Address::new([172, 17, 0, 0]),
             prefix_len: 16,
@@ -606,7 +607,8 @@ fn rtnetlink_dellink_removes_dynamic_device_routes_and_netfilter_rules() {
         "eth-del0",
     )
     .expect("masquerade rule");
-    add_dnat_rule_for_test_or_bootstrap(
+    crate::net::netfilter::add_dnat_rule_in_namespace_for_test_or_bootstrap(
+        &ns,
         NetfilterConntrackProtocol::Tcp,
         Ipv4Address::new([10, 0, 2, 15]),
         8080,
@@ -614,7 +616,10 @@ fn rtnetlink_dellink_removes_dynamic_device_routes_and_netfilter_rules() {
         80,
     )
     .expect("dnat rule");
-    assert_eq!(netfilter_rules_snapshot().len(), 2);
+    assert_eq!(
+        crate::net::netfilter_rules_snapshot_for_namespace(&ns).len(),
+        2
+    );
     assert!(ns
         .route_snapshot()
         .iter()
@@ -635,7 +640,7 @@ fn rtnetlink_dellink_removes_dynamic_device_routes_and_netfilter_rules() {
         .route_snapshot()
         .iter()
         .all(|route| route.oif_name != Some("eth-del0")));
-    assert!(netfilter_rules_snapshot().is_empty());
+    assert!(crate::net::netfilter_rules_snapshot_for_namespace(&ns).is_empty());
 }
 
 #[test]

@@ -3,7 +3,7 @@ use super::*;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::net::{NetfilterTable, NetfilterTarget};
+use crate::net::{NetfilterRule, NetfilterTable, NetfilterTarget, NetfilterVerdict};
 
 const NLM_F_REQUEST: u16 = 0x0001;
 const NLM_F_DUMP: u16 = 0x0300;
@@ -284,6 +284,102 @@ fn nfnetlink_newrule_adds_forward_accept_filter_rule() {
     assert_eq!(rules[0].table, NetfilterTable::Filter);
     assert_eq!(rules[0].hook, NetfilterHook::Forward);
     assert_eq!(rules[0].target, NetfilterTarget::Accept);
+}
+
+#[test]
+fn netfilter_rule_counters_increment_on_filter_match() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    reset_netfilter_for_test();
+
+    crate::net::add_netfilter_rule_for_test_or_bootstrap(NetfilterRule {
+        table: NetfilterTable::Filter,
+        hook: NetfilterHook::Forward,
+        protocol: None,
+        src: None,
+        dst: None,
+        dst_port: None,
+        in_iface: Some("docker0"),
+        out_iface: Some("uplink0"),
+        target: NetfilterTarget::Drop,
+        to_addr: None,
+        to_port: None,
+    })
+    .expect("filter rule");
+
+    let verdict = crate::net::run_frame_hook(
+        NetfilterFrameContext {
+            hook: NetfilterHook::Forward,
+            bridge: None,
+            ingress: Some("docker0"),
+            egress: Some("uplink0"),
+        },
+        b"payload",
+    );
+    assert_eq!(verdict, NetfilterVerdict::Drop);
+
+    let snapshots = crate::net::netfilter_rule_snapshots();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].counters.packets, 1);
+    assert_eq!(snapshots[0].counters.bytes, 7);
+    assert!(crate::net::proc_net_netfilter_rules_text().contains("0\t1\t7\tfilter"));
+}
+
+#[test]
+fn nfnetlink_rules_are_scoped_to_target_network_namespace() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    reset_netfilter_for_test();
+    crate::net::nfnetlink::reset_nfnetlink_for_test();
+
+    let isolated =
+        crate::net::create_isolated_net_namespace_for_test("nft-ns").expect("isolated namespace");
+    let isolated = isolated.payload_cap().expect("isolated payload");
+
+    assert_ack_ok(
+        &crate::net::nfnetlink_handle_request_in_namespace(
+            &isolated,
+            &nlmsg(
+                nft_msg(NFT_MSG_NEWCHAIN),
+                0x51,
+                chain_payload("filter", "forward", 2, 0),
+            ),
+        )[0],
+    );
+    assert_ack_ok(
+        &crate::net::nfnetlink_handle_request_in_namespace(
+            &isolated,
+            &nlmsg(
+                nft_msg(NFT_MSG_NEWRULE),
+                0x52,
+                rule_payload("filter", "forward", vec![expr_immediate_accept()]),
+            ),
+        )[0],
+    );
+
+    assert!(crate::net::netfilter_rules_snapshot().is_empty());
+    let isolated_rules = crate::net::netfilter_rules_snapshot_for_namespace(&isolated);
+    assert_eq!(isolated_rules.len(), 1);
+    assert_eq!(isolated_rules[0].target, NetfilterTarget::Accept);
+
+    let initial_dump =
+        crate::net::nfnetlink_handle_request(&nlmsg(nft_msg(NFT_MSG_GETRULE), 0x53, nfgenmsg()));
+    assert!(!initial_dump.iter().any(|msg| {
+        nlmsg_type(msg) == nft_msg(NFT_MSG_NEWRULE) && contains_bytes(msg, b"accept")
+    }));
+
+    let isolated_dump = crate::net::nfnetlink_handle_request_in_namespace(
+        &isolated,
+        &nlmsg(nft_msg(NFT_MSG_GETRULE), 0x54, nfgenmsg()),
+    );
+    assert!(isolated_dump.iter().any(|msg| {
+        nlmsg_type(msg) == nft_msg(NFT_MSG_NEWRULE) && contains_bytes(msg, b"accept")
+    }));
 }
 
 fn nfgenmsg() -> Vec<u8> {

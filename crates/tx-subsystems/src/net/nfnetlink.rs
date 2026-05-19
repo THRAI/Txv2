@@ -16,12 +16,14 @@ use tx_substrate::zone::Cap;
 use crate::cred::Cred;
 use crate::execution::Errno;
 use crate::net::admin::require_net_admin;
+use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::netfilter::{
-    add_netfilter_rule_for_test_or_bootstrap, netfilter_rules_snapshot,
-    remove_netfilter_rule_for_test_or_bootstrap,
-    remove_netfilter_rules_for_chain_for_test_or_bootstrap,
-    remove_netfilter_rules_for_table_for_test_or_bootstrap, NetfilterConntrackProtocol,
-    NetfilterHook, NetfilterIpv4Cidr, NetfilterRule, NetfilterTable, NetfilterTarget,
+    add_netfilter_rule_in_namespace_for_test_or_bootstrap, netfilter_rules_snapshot_for_namespace,
+    remove_netfilter_rule_in_namespace_for_test_or_bootstrap,
+    remove_netfilter_rules_for_chain_in_namespace_for_test_or_bootstrap,
+    remove_netfilter_rules_for_table_in_namespace_for_test_or_bootstrap,
+    NetfilterConntrackProtocol, NetfilterHook, NetfilterIpv4Cidr, NetfilterRule, NetfilterTable,
+    NetfilterTarget,
 };
 use crate::net::structure::{Ipv4Address, RecvWireSet, SendRecvFlags, SocketIdentity, SocketKind};
 use crate::sync::SpinMutex;
@@ -135,13 +137,43 @@ const NF_ACCEPT: u32 = 1;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NetlinkNetfilterState;
 
-static NFT_TABLES: SpinMutex<Vec<NftTableObject>> = SpinMutex::new(Vec::new());
-static NFT_CHAINS: SpinMutex<Vec<NftChainObject>> = SpinMutex::new(Vec::new());
+static NFT_NAMESPACES: SpinMutex<Vec<NftNamespaceState>> = SpinMutex::new(Vec::new());
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_nfnetlink_for_test() {
-    NFT_TABLES.lock().clear();
-    NFT_CHAINS.lock().clear();
+    NFT_NAMESPACES.lock().clear();
+}
+
+fn nft_namespace_key(netns: &NetNamespacePayload) -> usize {
+    core::ptr::addr_of!(*netns) as usize
+}
+
+fn nft_state_snapshot(netns: &NetNamespacePayload) -> (Vec<NftTableObject>, Vec<NftChainObject>) {
+    let key = nft_namespace_key(netns);
+    NFT_NAMESPACES
+        .lock()
+        .iter()
+        .find(|state| state.namespace_key == key)
+        .map(|state| (state.tables.clone(), state.chains.clone()))
+        .unwrap_or_default()
+}
+
+fn with_nft_state_mut<T>(
+    netns: &NetNamespacePayload,
+    mutate: impl FnOnce(&mut NftNamespaceState) -> T,
+) -> T {
+    let key = nft_namespace_key(netns);
+    let mut namespaces = NFT_NAMESPACES.lock();
+    let index = if let Some(index) = namespaces
+        .iter()
+        .position(|state| state.namespace_key == key)
+    {
+        index
+    } else {
+        namespaces.push(NftNamespaceState::new(key));
+        namespaces.len() - 1
+    };
+    mutate(&mut namespaces[index])
 }
 
 pub struct RawNetlinkNetfilterSocket {
@@ -200,7 +232,9 @@ pub fn netlink_netfilter_send(
         .raw_netlink_netfilter_socket()
         .ok_or(Errno::EOPNOTSUPP)?;
 
-    for response in nfnetlink_handle_request_with_cred(bytes, cred) {
+    for response in
+        nfnetlink_handle_request_in_namespace_with_cred(&payload.net_namespace(), bytes, cred)
+    {
         raw.queue_response(response);
     }
     payload.refresh_io_from_raw();
@@ -238,6 +272,22 @@ pub fn nfnetlink_handle_request(request: &[u8]) -> Vec<Vec<u8>> {
 }
 
 pub fn nfnetlink_handle_request_with_cred(request: &[u8], cred: Cred) -> Vec<Vec<u8>> {
+    let netns = initial_net_namespace_payload();
+    nfnetlink_handle_request_in_namespace_with_cred(&netns, request, cred)
+}
+
+pub fn nfnetlink_handle_request_in_namespace(
+    netns: &NetNamespacePayload,
+    request: &[u8],
+) -> Vec<Vec<u8>> {
+    nfnetlink_handle_request_in_namespace_with_cred(netns, request, Cred::root())
+}
+
+pub fn nfnetlink_handle_request_in_namespace_with_cred(
+    netns: &NetNamespacePayload,
+    request: &[u8],
+    cred: Cred,
+) -> Vec<Vec<u8>> {
     let mut responses = Vec::new();
     let mut offset = 0usize;
     while offset < request.len() {
@@ -255,13 +305,14 @@ pub fn nfnetlink_handle_request_with_cred(request: &[u8], cred: Cred) -> Vec<Vec
             break;
         }
         let payload = &request[offset + NLMSG_HDR_LEN..offset + msg_len];
-        handle_one_message(cred, header, payload, &mut responses);
+        handle_one_message(netns, cred, header, payload, &mut responses);
         offset += align4(msg_len);
     }
     responses
 }
 
 fn handle_one_message(
+    netns: &NetNamespacePayload,
     cred: Cred,
     header: NlMsgHeader,
     payload: &[u8],
@@ -284,17 +335,17 @@ fn handle_one_message(
         .unwrap_or(NFPROTO_IPV4);
     match nfnl_msg_type(header.kind) {
         NFT_MSG_GETTABLE => {
-            for msg in render_table_dump(header, family) {
+            for msg in render_table_dump(netns, header, family) {
                 responses.push(msg);
             }
         }
         NFT_MSG_GETCHAIN => {
-            for msg in render_chain_dump(header, family) {
+            for msg in render_chain_dump(netns, header, family) {
                 responses.push(msg);
             }
         }
         NFT_MSG_GETRULE => {
-            for msg in render_rule_dump(header, family) {
+            for msg in render_rule_dump(netns, header, family) {
                 responses.push(msg);
             }
         }
@@ -302,30 +353,38 @@ fn handle_one_message(
             responses.push(build_generation_message(header, family));
             responses.push(build_done_message(header.seq, header.pid));
         }
-        NFT_MSG_NEWTABLE => {
-            responses.push(ack_or_error(header, handle_newtable(cred, family, payload)))
+        NFT_MSG_NEWTABLE => responses.push(ack_or_error(
+            header,
+            handle_newtable(netns, cred, family, payload),
+        )),
+        NFT_MSG_DELTABLE => responses.push(ack_or_error(
+            header,
+            handle_deltable(netns, cred, family, payload),
+        )),
+        NFT_MSG_NEWCHAIN => responses.push(ack_or_error(
+            header,
+            handle_newchain(netns, cred, family, payload),
+        )),
+        NFT_MSG_DELCHAIN => responses.push(ack_or_error(
+            header,
+            handle_delchain(netns, cred, family, payload),
+        )),
+        NFT_MSG_NEWRULE => responses.push(ack_or_error(
+            header,
+            handle_newrule(netns, cred, family, payload),
+        )),
+        NFT_MSG_DELRULE => {
+            responses.push(ack_or_error(header, handle_delrule(netns, cred, payload)))
         }
-        NFT_MSG_DELTABLE => {
-            responses.push(ack_or_error(header, handle_deltable(cred, family, payload)))
-        }
-        NFT_MSG_NEWCHAIN => {
-            responses.push(ack_or_error(header, handle_newchain(cred, family, payload)))
-        }
-        NFT_MSG_DELCHAIN => {
-            responses.push(ack_or_error(header, handle_delchain(cred, family, payload)))
-        }
-        NFT_MSG_NEWRULE => {
-            responses.push(ack_or_error(header, handle_newrule(cred, family, payload)))
-        }
-        NFT_MSG_DELRULE => responses.push(ack_or_error(header, handle_delrule(cred, payload))),
         _ => responses.push(build_error_response(Some(header), Errno::EOPNOTSUPP)),
     }
 }
 
-fn render_table_dump(header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
-    let rules = netfilter_rules_snapshot();
+fn render_table_dump(netns: &NetNamespacePayload, header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
+    let rules = netfilter_rules_snapshot_for_namespace(netns);
+    let (nft_tables, _) = nft_state_snapshot(netns);
     let mut tables = Vec::<TableSummary>::new();
-    for table in NFT_TABLES.lock().iter() {
+    for table in nft_tables.iter() {
         if table.family == family {
             tables.push(TableSummary {
                 family,
@@ -353,9 +412,10 @@ fn render_table_dump(header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
     out
 }
 
-fn render_chain_dump(header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
+fn render_chain_dump(netns: &NetNamespacePayload, header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
+    let (_, nft_chains) = nft_state_snapshot(netns);
     let mut chains = Vec::<ChainSummary>::new();
-    for chain in NFT_CHAINS.lock().iter() {
+    for chain in nft_chains.iter() {
         if chain.family == family {
             chains.push(ChainSummary {
                 family,
@@ -367,7 +427,7 @@ fn render_chain_dump(header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
             });
         }
     }
-    for rule in netfilter_rules_snapshot() {
+    for rule in netfilter_rules_snapshot_for_namespace(netns) {
         let chain = chain_for_rule(rule, family);
         if chains.iter().all(|seen| {
             seen.table != chain.table || seen.name != chain.name || seen.family != chain.family
@@ -389,9 +449,12 @@ fn render_chain_dump(header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
     out
 }
 
-fn render_rule_dump(header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
+fn render_rule_dump(netns: &NetNamespacePayload, header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    for (idx, rule) in netfilter_rules_snapshot().into_iter().enumerate() {
+    for (idx, rule) in netfilter_rules_snapshot_for_namespace(netns)
+        .into_iter()
+        .enumerate()
+    {
         out.push(build_rule_message(
             header.seq,
             header.pid,
@@ -404,41 +467,60 @@ fn render_rule_dump(header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
     out
 }
 
-fn handle_newtable(cred: Cred, family: u8, payload: &[u8]) -> Result<(), Errno> {
+fn handle_newtable(
+    netns: &NetNamespacePayload,
+    cred: Cred,
+    family: u8,
+    payload: &[u8],
+) -> Result<(), Errno> {
     let _auth = require_net_admin(cred)?;
     let attrs = parse_nfmsg_attrs(payload)?;
     let name = attr_string(&attrs, NFTA_TABLE_NAME).ok_or(Errno::EINVAL)?;
-    let mut tables = NFT_TABLES.lock();
-    if tables
-        .iter()
-        .any(|table| table.family == family && table.name == name)
-    {
-        return Ok(());
-    }
-    tables.push(NftTableObject {
-        family,
-        name: name.to_string(),
+    with_nft_state_mut(netns, |state| {
+        if state
+            .tables
+            .iter()
+            .any(|table| table.family == family && table.name == name)
+        {
+            return;
+        }
+        state.tables.push(NftTableObject {
+            family,
+            name: name.to_string(),
+        });
     });
     Ok(())
 }
 
-fn handle_deltable(cred: Cred, family: u8, payload: &[u8]) -> Result<(), Errno> {
+fn handle_deltable(
+    netns: &NetNamespacePayload,
+    cred: Cred,
+    family: u8,
+    payload: &[u8],
+) -> Result<(), Errno> {
     let _auth = require_net_admin(cred)?;
     let attrs = parse_nfmsg_attrs(payload)?;
     let name = attr_string(&attrs, NFTA_TABLE_NAME).ok_or(Errno::EINVAL)?;
     if let Ok(table) = netfilter_table_from_name(name) {
-        remove_netfilter_rules_for_table_for_test_or_bootstrap(table);
+        remove_netfilter_rules_for_table_in_namespace_for_test_or_bootstrap(netns, table);
     }
-    NFT_TABLES
-        .lock()
-        .retain(|table| !(table.family == family && table.name == name));
-    NFT_CHAINS
-        .lock()
-        .retain(|chain| !(chain.family == family && chain.table == name));
+    with_nft_state_mut(netns, |state| {
+        state
+            .tables
+            .retain(|table| !(table.family == family && table.name == name));
+        state
+            .chains
+            .retain(|chain| !(chain.family == family && chain.table == name));
+    });
     Ok(())
 }
 
-fn handle_newchain(cred: Cred, family: u8, payload: &[u8]) -> Result<(), Errno> {
+fn handle_newchain(
+    netns: &NetNamespacePayload,
+    cred: Cred,
+    family: u8,
+    payload: &[u8],
+) -> Result<(), Errno> {
     let _auth = require_net_admin(cred)?;
     let attrs = parse_nfmsg_attrs(payload)?;
     let table = attr_string(&attrs, NFTA_CHAIN_TABLE).ok_or(Errno::EINVAL)?;
@@ -449,53 +531,69 @@ fn handle_newchain(cred: Cred, family: u8, payload: &[u8]) -> Result<(), Errno> 
         .unwrap_or((hook_from_name(name)?, default_chain_priority(table, name)));
     let chain_type = attr_string(&attrs, NFTA_CHAIN_TYPE).unwrap_or_else(|| table_type_name(table));
 
-    handle_newtable(cred, family, &table_message_payload(family, table))?;
+    handle_newtable(netns, cred, family, &table_message_payload(family, table))?;
 
-    let mut chains = NFT_CHAINS.lock();
-    if let Some(existing) = chains
-        .iter_mut()
-        .find(|chain| chain.family == family && chain.table == table && chain.name == name)
-    {
-        existing.hook = hook;
-        existing.priority = priority;
-        existing.chain_type = chain_type.to_string();
-        return Ok(());
-    }
-    chains.push(NftChainObject {
-        family,
-        table: table.to_string(),
-        name: name.to_string(),
-        hook,
-        priority,
-        chain_type: chain_type.to_string(),
+    with_nft_state_mut(netns, |state| {
+        if let Some(existing) = state
+            .chains
+            .iter_mut()
+            .find(|chain| chain.family == family && chain.table == table && chain.name == name)
+        {
+            existing.hook = hook;
+            existing.priority = priority;
+            existing.chain_type = chain_type.to_string();
+            return;
+        }
+        state.chains.push(NftChainObject {
+            family,
+            table: table.to_string(),
+            name: name.to_string(),
+            hook,
+            priority,
+            chain_type: chain_type.to_string(),
+        });
     });
     Ok(())
 }
 
-fn handle_delchain(cred: Cred, family: u8, payload: &[u8]) -> Result<(), Errno> {
+fn handle_delchain(
+    netns: &NetNamespacePayload,
+    cred: Cred,
+    family: u8,
+    payload: &[u8],
+) -> Result<(), Errno> {
     let _auth = require_net_admin(cred)?;
     let attrs = parse_nfmsg_attrs(payload)?;
     let table = attr_string(&attrs, NFTA_CHAIN_TABLE).ok_or(Errno::EINVAL)?;
     let name = attr_string(&attrs, NFTA_CHAIN_NAME).ok_or(Errno::EINVAL)?;
     if let (Ok(table_kind), Ok(hook)) = (
         netfilter_table_from_name(table),
-        hook_from_chain(table, name),
+        hook_from_chain(netns, table, name),
     ) {
-        remove_netfilter_rules_for_chain_for_test_or_bootstrap(table_kind, hook);
+        remove_netfilter_rules_for_chain_in_namespace_for_test_or_bootstrap(
+            netns, table_kind, hook,
+        );
     }
-    NFT_CHAINS
-        .lock()
-        .retain(|chain| !(chain.family == family && chain.table == table && chain.name == name));
+    with_nft_state_mut(netns, |state| {
+        state.chains.retain(|chain| {
+            !(chain.family == family && chain.table == table && chain.name == name)
+        });
+    });
     Ok(())
 }
 
-fn handle_newrule(cred: Cred, family: u8, payload: &[u8]) -> Result<(), Errno> {
+fn handle_newrule(
+    netns: &NetNamespacePayload,
+    cred: Cred,
+    family: u8,
+    payload: &[u8],
+) -> Result<(), Errno> {
     let _auth = require_net_admin(cred)?;
     let attrs = parse_nfmsg_attrs(payload)?;
     let table_name = attr_string(&attrs, NFTA_RULE_TABLE).ok_or(Errno::EINVAL)?;
     let chain_name = attr_string(&attrs, NFTA_RULE_CHAIN).ok_or(Errno::EINVAL)?;
     let table = netfilter_table_from_name(table_name)?;
-    let hook = hook_from_chain(table_name, chain_name)?;
+    let hook = hook_from_chain(netns, table_name, chain_name)?;
     let mut parsed = NftRuleParse::default();
     if let Some(exprs) = attr_payload(&attrs, NFTA_RULE_EXPRESSIONS) {
         parsed = parse_rule_expressions(exprs)?;
@@ -506,33 +604,37 @@ fn handle_newrule(cred: Cred, family: u8, payload: &[u8]) -> Result<(), Errno> {
         }
     }
     let target = parsed.target.ok_or(Errno::EOPNOTSUPP)?;
-    add_netfilter_rule_for_test_or_bootstrap(NetfilterRule {
-        table,
-        hook,
-        protocol: parsed.protocol,
-        src: parsed.src,
-        dst: parsed.dst,
-        dst_port: parsed.dst_port,
-        in_iface: parsed.in_iface,
-        out_iface: parsed.out_iface,
-        target,
-        to_addr: parsed.to_addr,
-        to_port: parsed.to_port,
-    })?;
+    add_netfilter_rule_in_namespace_for_test_or_bootstrap(
+        netns,
+        NetfilterRule {
+            table,
+            hook,
+            protocol: parsed.protocol,
+            src: parsed.src,
+            dst: parsed.dst,
+            dst_port: parsed.dst_port,
+            in_iface: parsed.in_iface,
+            out_iface: parsed.out_iface,
+            target,
+            to_addr: parsed.to_addr,
+            to_port: parsed.to_port,
+        },
+    )?;
 
     handle_newchain(
+        netns,
         cred,
         family,
         &chain_message_payload(family, table_name, chain_name, hook),
     )
 }
 
-fn handle_delrule(cred: Cred, payload: &[u8]) -> Result<(), Errno> {
+fn handle_delrule(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Result<(), Errno> {
     let _auth = require_net_admin(cred)?;
     let attrs = parse_nfmsg_attrs(payload)?;
     let handle = attr_u64(&attrs, NFTA_RULE_HANDLE).ok_or(Errno::EINVAL)?;
     let index = handle.checked_sub(1).ok_or(Errno::EINVAL)? as usize;
-    remove_netfilter_rule_for_test_or_bootstrap(index)
+    remove_netfilter_rule_in_namespace_for_test_or_bootstrap(netns, index)
 }
 
 fn build_table_message(seq: u32, pid: u32, family: u8, table: TableSummary) -> Vec<u8> {
@@ -1247,9 +1349,13 @@ fn netfilter_table_from_name(name: &str) -> Result<NetfilterTable, Errno> {
     }
 }
 
-fn hook_from_chain(table: &str, chain: &str) -> Result<NetfilterHook, Errno> {
-    if let Some(stored) = NFT_CHAINS
-        .lock()
+fn hook_from_chain(
+    netns: &NetNamespacePayload,
+    table: &str,
+    chain: &str,
+) -> Result<NetfilterHook, Errno> {
+    if let Some(stored) = nft_state_snapshot(netns)
+        .1
         .iter()
         .find(|stored| stored.table == table && stored.name == chain)
         .map(|stored| stored.hook)
@@ -1411,6 +1517,23 @@ struct NlMsgHeader {
 struct NlAttr<'a> {
     kind: u16,
     payload: &'a [u8],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NftNamespaceState {
+    namespace_key: usize,
+    tables: Vec<NftTableObject>,
+    chains: Vec<NftChainObject>,
+}
+
+impl NftNamespaceState {
+    fn new(namespace_key: usize) -> Self {
+        Self {
+            namespace_key,
+            tables: Vec::new(),
+            chains: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
