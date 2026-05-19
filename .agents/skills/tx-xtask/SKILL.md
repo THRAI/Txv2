@@ -24,6 +24,8 @@ binary disagree, the binary wins.
 | Run guest shell scenarios | `cargo xtask shell-test --target rv64-qemu --script PATH` |
 | Validate progress JSON records | `cargo xtask progress validate` |
 | Run an architecture / docs / boundary lint | `cargo xtask lint arch\|docs\|unused\|boundary\|invariants` |
+| Decode a `.txtrace` file → JSON | `cargo xtask observe replay --file PATH` |
+| Decode a `.txtrace` file → Perfetto | `cargo xtask observe pftrace --file PATH --output OUT` |
 
 ## Command chains
 
@@ -206,21 +208,124 @@ See `tx-progress-memory` for the writing discipline.
 
 ## Observation
 
-### `cargo xtask observe <subcmd>`
+The observation pipeline reconstructs a passive timeline of kernel
+events. Three on-disk layers, owned by separate crates:
 
-Trace pipeline tooling (not surfaced in `xtask --help` — see
-[`xtask/src/observe.rs`](../../../xtask/src/observe.rs)). Subcommands:
+1. **Kernel-side emit** — `tx-observe` (in-tree, no-std) writes packed
+   80-byte records into per-hart MPSC rings exposed by the board's
+   `ObserverIf::ring_descriptor()`. Wire format and ABI:
+   [`docs/Txv3/08_OBSERVATION_v1.md`](../../../docs/Txv3/08_OBSERVATION_v1.md),
+   [`08_OBSERVATION_SERIALIZATION_v0.md`](../../../docs/Txv3/08_OBSERVATION_SERIALIZATION_v0.md).
+2. **Capture** — guest writes the ring to a `.txtrace` file (`txtrace
+   v0`, magic `TXTR` = `0x5254_5854`). Header 72 B, ring header 208 B,
+   record 80 B, `ring_order` ∈ [2, 24].
+3. **Host decode** — `tools/tx-trace-daemon` reads the `.txtrace`,
+   reconstructs span/instant/counter events, and emits NDJSON or a
+   Perfetto-compatible trace. Spec:
+   [`08_OBSERVATION_HOST_v0.md`](../../../docs/Txv3/08_OBSERVATION_HOST_v0.md).
 
-- `replay` — decode a `.txtrace` file → NDJSON (default) or Perfetto.
-- `pftrace` — alias for `replay --out pftrace --output <path>`.
-- `validate` — parse the trace header + walk slots, print a one-line
-  summary.
-- `demo` — generate a small synthetic `.txtrace` for testing.
+The xtask shells `tx-trace-daemon`. **It auto-builds the daemon on
+first use** (one-time `cargo build` in `tools/tx-trace-daemon/`),
+then reuses the cached binary at `target/debug/tx-trace-daemon`.
+
+### `cargo xtask observe replay --file PATH [flags]`
+
+Decode the trace and stream events. Flags:
+
+- `--out json` *(default)* — NDJSON, one event per line. Suitable
+  for `jq`/`grep` pipelines.
+- `--out pftrace --output OUT` — Perfetto-format binary. `--output`
+  is required when `--out pftrace`. Open the file at
+  <https://ui.perfetto.dev>.
+- `--filter level=N` — host-side drop of records below the named
+  level byte. Levels (per `tx-observe-types`):
+
+  | N | Name | Where it fires |
+  |---|---|---|
+  | 0 | Boundary | trap entry/exit, syscall edges, scheduler ticks |
+  | 1 | Script | (deferred — multi-drive wrapper) |
+  | 2 | Drive | per-`StepOp::step` invocation; SpanBegin/SpanEnd |
+  | 3 | Yield | `YieldShape` begin/resume pairs |
+  | 4 | WaitSource | wait notify/wake events |
+  | 5 | Phase | in-step phase boundaries (via `RawTrace<P>`) |
+  | 6 | Substrate | substrate-internal hooks |
+
+### `cargo xtask observe pftrace --file PATH --output OUT`
+
+Convenience alias for `replay --out pftrace --output OUT`. Useful in
+shell history because the two flags are easy to forget.
+
+### `cargo xtask observe validate --file PATH`
+
+Parse header + walk every slot without emitting. Output is one line:
+
+```
+txtrace v0: 1 hart, 16 slots/hart, 4 records, 0 framing errors
+```
+
+Use this to confirm a capture is well-formed *before* shipping it
+upstream or attaching it to a bug report. Detects bad magic,
+unsupported `record_size`, ring-order out of range, file-too-small
+for the declared layout, and per-slot framing errors (bad record
+magic). Pure host-side parse — does not invoke the daemon.
+
+### `cargo xtask observe demo --output PATH [flags]`
+
+Generate a synthetic `.txtrace v0` for testing the decode path
+without booting QEMU. Default contents (in slot order):
+
+```
+1. SpanBegin  level=Drive    name=0x0001 span=0x0001
+2. Instant    level=Boundary name=0x0002 payload=WaitSourceNotify
+3. Counter    level=Boundary name=0x0003 payload=CounterValue(42)
+4. SpanEnd    level=Boundary name=0x0000 span=0x0001
+```
+
+Flags:
+
+- `--records N` — truncate to N records, or pad to N with neutral
+  Instant records (capped at slot count = 16).
+- `--with-yields` — append a YieldBegin/Resume pair (records 5–6),
+  both at `level=Yield`.
+
+Round-trips through `observe validate` and `observe replay --out
+json`. Use it to smoke-test the daemon after editing `tx-observe-types`
+or the replay code.
 
 ### `cargo xtask observe-discipline`
 
-OBS-7 lint: fails if any `StepOp::step` body calls `tx_observe::*`
-directly. Also not in `--help`; safe to run.
+OBS-7 lint enforcing the **anti-pattern OBS-A-1**: no
+`StepOp::step()` body may call `tx_observe::*` APIs directly. Spans
+are wrapped by the driver, not the step body — phase-level events
+inside a step go through `RawTrace<P>` from
+[`BUS_v1.md`](../../../docs/design/01_substrate/BUS_v1.md). Reads
+the source rule from
+[`docs/Txv3/08_OBSERVATION_v1.md`](../../../docs/Txv3/08_OBSERVATION_v1.md)
+§OBS-V1-NO-STEP-BODY. Run before sending an instrumentation PR.
+
+Neither `observe` nor `observe-discipline` is surfaced in `cargo
+xtask --help` (dispatched but undocumented at the binary entry —
+[`xtask/src/lib.rs`](../../../xtask/src/lib.rs)). They are
+nonetheless first-class subcommands.
+
+### Pipeline cheatsheet
+
+```
+guest                               host
+─────                               ────
+tx-observe::emit_*()  →  per-hart ring  →  .txtrace file
+                                              │
+                                              ▼
+                              cargo xtask observe validate   (well-formed?)
+                                              │
+                                              ▼
+                              cargo xtask observe replay     (NDJSON or pftrace)
+```
+
+Convergence-only rule (OBS-V1-CONVERGENCE): instrumentation lives at
+convergence points — **adapter modules (`*/adapter.rs`) never
+emit**. The boundary report covers this; the discipline lint is the
+backstop.
 
 ## OS-comp / submission
 
