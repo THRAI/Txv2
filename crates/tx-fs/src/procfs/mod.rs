@@ -40,6 +40,13 @@ pub const PROCFS_SYSVIPC_ID: FsObjectId = FsObjectId::new(0x7072_6F0f);
 pub const PROCFS_SYSVIPC_MSG_ID: FsObjectId = FsObjectId::new(0x7072_6F10);
 pub const PROCFS_SYSVIPC_SEM_ID: FsObjectId = FsObjectId::new(0x7072_6F11);
 pub const PROCFS_SYSVIPC_SHM_ID: FsObjectId = FsObjectId::new(0x7072_6F12);
+pub const PROCFS_NET_ID: FsObjectId = FsObjectId::new(0x7072_6F13);
+pub const PROCFS_NET_ROUTE_ID: FsObjectId = FsObjectId::new(0x7072_6F14);
+pub const PROCFS_NET_ARP_ID: FsObjectId = FsObjectId::new(0x7072_6F15);
+pub const PROCFS_NET_DEV_ID: FsObjectId = FsObjectId::new(0x7072_6F16);
+pub const PROCFS_SYS_NET_ID: FsObjectId = FsObjectId::new(0x7072_6F17);
+pub const PROCFS_SYS_NET_IPV4_ID: FsObjectId = FsObjectId::new(0x7072_6F18);
+pub const PROCFS_SYS_NET_IPV4_IP_FORWARD_ID: FsObjectId = FsObjectId::new(0x7072_6F19);
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 const PROCFS_PID_OBJECT_STRIDE: u64 = 0x100;
 const PROCFS_PID_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x10000;
@@ -266,8 +273,19 @@ fn dir_entry(id: FsObjectId, kind: InodeKind, name: &[u8]) -> DirEntry {
     DirEntry::new(id, kind, name).expect("procfs dir entry name")
 }
 
+fn trim_ascii_space(mut bytes: &[u8]) -> &[u8] {
+    while matches!(bytes.first(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        bytes = &bytes[1..];
+    }
+    while matches!(bytes.last(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
 pub const PROCFS_DIR_MODE: u16 = S_IFDIR | 0o555;
 pub const PROCFS_FILE_MODE: u16 = S_IFREG | 0o444;
+pub const PROCFS_FILE_RW_MODE: u16 = S_IFREG | 0o644;
 pub const PROCFS_SYMLINK_MODE: u16 = S_IFLNK | 0o777;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -313,6 +331,12 @@ impl FsOps for Procfs {
             }
             if name == b"sysvipc" {
                 return StepOutcome::done(PROCFS_SYSVIPC_ID);
+            }
+            if name == b"net" {
+                return StepOutcome::done(PROCFS_NET_ID);
+            }
+            if name == b"sys" {
+                return StepOutcome::done(PROCFS_SYS_ID);
             }
             if let Ok(n) = core::str::from_utf8(name).unwrap_or("").parse::<u32>() {
                 if n > 0 && procfs_number_exists(n) {
@@ -362,6 +386,32 @@ impl FsOps for Procfs {
                 return StepOutcome::done(PROCFS_SYSVIPC_SHM_ID);
             }
             return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if parent == PROCFS_NET_ID {
+            return match name {
+                b"route" => StepOutcome::done(PROCFS_NET_ROUTE_ID),
+                b"arp" => StepOutcome::done(PROCFS_NET_ARP_ID),
+                b"dev" => StepOutcome::done(PROCFS_NET_DEV_ID),
+                _ => StepOutcome::err(Errno::ENOENT.into()),
+            };
+        }
+        if parent == PROCFS_SYS_ID {
+            return match name {
+                b"net" => StepOutcome::done(PROCFS_SYS_NET_ID),
+                _ => StepOutcome::err(Errno::ENOENT.into()),
+            };
+        }
+        if parent == PROCFS_SYS_NET_ID {
+            return match name {
+                b"ipv4" => StepOutcome::done(PROCFS_SYS_NET_IPV4_ID),
+                _ => StepOutcome::err(Errno::ENOENT.into()),
+            };
+        }
+        if parent == PROCFS_SYS_NET_IPV4_ID {
+            return match name {
+                b"ip_forward" => StepOutcome::done(PROCFS_SYS_NET_IPV4_IP_FORWARD_ID),
+                _ => StepOutcome::err(Errno::ENOENT.into()),
+            };
         }
         if let Some(pid) = pid_from_dir(parent) {
             if name == b"stat" && process_for_procfs_number(pid.0).is_some() {
@@ -444,7 +494,13 @@ impl FsOps for Procfs {
             PROCFS_ROOT_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
-            PROCFS_SYS_ID | PROCFS_SYS_KERNEL_ID | PROCFS_SYS_FS_ID | PROCFS_SYSVIPC_ID => {
+            PROCFS_SYS_ID
+            | PROCFS_SYS_KERNEL_ID
+            | PROCFS_SYS_FS_ID
+            | PROCFS_SYSVIPC_ID
+            | PROCFS_NET_ID
+            | PROCFS_SYS_NET_ID
+            | PROCFS_SYS_NET_IPV4_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
             PROCFS_SELF_ID => {
@@ -455,7 +511,10 @@ impl FsOps for Procfs {
             | PROCFS_UPTIME_ID
             | PROCFS_MEMINFO_ID
             | PROCFS_CONFIG_ID
-            | PROCFS_SYS_KERNEL_TAINTED_ID => {
+            | PROCFS_SYS_KERNEL_TAINTED_ID
+            | PROCFS_NET_ROUTE_ID
+            | PROCFS_NET_ARP_ID
+            | PROCFS_NET_DEV_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             PROCFS_SYS_FS_PIPE_MAX_SIZE_ID
@@ -466,6 +525,9 @@ impl FsOps for Procfs {
             }
             PROCFS_SYSVIPC_MSG_ID | PROCFS_SYSVIPC_SEM_ID | PROCFS_SYSVIPC_SHM_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            }
+            PROCFS_SYS_NET_IPV4_IP_FORWARD_ID => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_RW_MODE))
             }
             id if pid_from_dir(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
@@ -525,6 +587,64 @@ impl FsOps for Procfs {
         let raw = cursor.0;
         let state_byte = raw[0];
         let idx = raw[1] as usize;
+
+        if id == PROCFS_NET_ID {
+            let files: &[(&[u8], FsObjectId, InodeKind)] = &[
+                (b"route", PROCFS_NET_ROUTE_ID, InodeKind::Regular),
+                (b"arp", PROCFS_NET_ARP_ID, InodeKind::Regular),
+                (b"dev", PROCFS_NET_DEV_ID, InodeKind::Regular),
+            ];
+            if idx < files.len() {
+                let (name, oid, kind) = files[idx];
+                return StepOutcome::done(Some((
+                    dir_entry(oid, kind, name),
+                    DirCursor::from_u64((idx + 1) as u64),
+                )));
+            }
+            return StepOutcome::done(None);
+        }
+
+        if id == PROCFS_SYS_ID {
+            let files: &[(&[u8], FsObjectId, InodeKind)] =
+                &[(b"net", PROCFS_SYS_NET_ID, InodeKind::Directory)];
+            if idx < files.len() {
+                let (name, oid, kind) = files[idx];
+                return StepOutcome::done(Some((
+                    dir_entry(oid, kind, name),
+                    DirCursor::from_u64((idx + 1) as u64),
+                )));
+            }
+            return StepOutcome::done(None);
+        }
+
+        if id == PROCFS_SYS_NET_ID {
+            let files: &[(&[u8], FsObjectId, InodeKind)] =
+                &[(b"ipv4", PROCFS_SYS_NET_IPV4_ID, InodeKind::Directory)];
+            if idx < files.len() {
+                let (name, oid, kind) = files[idx];
+                return StepOutcome::done(Some((
+                    dir_entry(oid, kind, name),
+                    DirCursor::from_u64((idx + 1) as u64),
+                )));
+            }
+            return StepOutcome::done(None);
+        }
+
+        if id == PROCFS_SYS_NET_IPV4_ID {
+            let files: &[(&[u8], FsObjectId, InodeKind)] = &[(
+                b"ip_forward",
+                PROCFS_SYS_NET_IPV4_IP_FORWARD_ID,
+                InodeKind::Regular,
+            )];
+            if idx < files.len() {
+                let (name, oid, kind) = files[idx];
+                return StepOutcome::done(Some((
+                    dir_entry(oid, kind, name),
+                    DirCursor::from_u64((idx + 1) as u64),
+                )));
+            }
+            return StepOutcome::done(None);
+        }
 
         if let Some(pid) = pid_from_dir(id) {
             if state_byte < 2 {
@@ -737,6 +857,8 @@ impl FsOps for Procfs {
             (b"config", PROCFS_CONFIG_ID, InodeKind::Regular),
             (b"sys", PROCFS_SYS_ID, InodeKind::Directory),
             (b"sysvipc", PROCFS_SYSVIPC_ID, InodeKind::Directory),
+            (b"net", PROCFS_NET_ID, InodeKind::Directory),
+            (b"sys", PROCFS_SYS_ID, InodeKind::Directory),
         ];
         let si = idx.saturating_sub(2);
         if state_byte == 2 && si < statics.len() {
@@ -956,6 +1078,28 @@ impl FsOps for Procfs {
             StepOutcome::done(len as u64)
         }
     }
+
+    fn step_write_projected(
+        &self,
+        fs_object_id: FsObjectId,
+        _offset: u64,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<u64, NoProgress> {
+        if fs_object_id != PROCFS_SYS_NET_IPV4_IP_FORWARD_ID {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+
+        let trimmed = trim_ascii_space(bytes);
+        let enabled = match trimmed {
+            b"0" => false,
+            b"1" => true,
+            _ => return StepOutcome::err(Errno::EINVAL.into()),
+        };
+        tx_subsystems::net::initial_net_namespace_payload()
+            .set_ipv4_forwarding_for_test_or_bootstrap(enabled);
+        StepOutcome::done(bytes.len() as u64)
+    }
     fn step_chmod(
         &self,
         _: FsObjectId,
@@ -1035,6 +1179,116 @@ impl FsPageBacking for Procfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{LazyLock, Mutex};
+    use tx_hal::{
+        Arch, Asid, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapReservation, PmapReserveKind,
+        PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
+    };
+    use tx_subsystems::cred::{sign_cred, Cred};
+    use tx_subsystems::device::DevT;
+    use tx_subsystems::ipc::{sysv_msg, sysv_sem, sysv_shm};
+    use tx_subsystems::net::{
+        create_veth_pair_for_test_or_bootstrap, EthernetAddress, Ipv4Address, NetAdminAuthority,
+        VethEndpointConfig, VethPairConfig, VETH_DEFAULT_MTU,
+    };
+    use tx_subsystems::process::nsproxy::sign_init_nsproxy;
+    use tx_subsystems::vm::USER_PAGE_SIZE;
+    use tx_subsystems::zones;
+
+    struct ProcfsTestPmap;
+
+    impl PlatformConfig for ProcfsTestPmap {
+        const ARCH: Arch = Arch::Riscv64;
+        const BOARD: &'static str = "procfs-test";
+    }
+
+    #[derive(Default)]
+    struct ProcfsTestPmapState {
+        next_root: usize,
+        mappings: BTreeMap<(usize, usize), PhysAddr>,
+    }
+
+    static PROCFS_TEST_PMAP_STATE: LazyLock<Mutex<ProcfsTestPmapState>> =
+        LazyLock::new(|| Mutex::new(ProcfsTestPmapState::default()));
+
+    fn root_key(root: &PmapRoot) -> usize {
+        root.phys().0
+    }
+
+    impl PmapIf for ProcfsTestPmap {
+        fn create_pmap_root() -> Result<PmapRoot, PmapError> {
+            let mut state = PROCFS_TEST_PMAP_STATE.lock().expect("procfs pmap lock");
+            let root_id = state.next_root.max(1);
+            state.next_root = root_id + 1;
+            Ok(PmapRoot::new(
+                PtNode::boot_pool(PhysAddr(root_id * USER_PAGE_SIZE)),
+                Asid(root_id as u16),
+            ))
+        }
+
+        fn destroy_pmap_root(root: PmapRoot) {
+            let mut state = PROCFS_TEST_PMAP_STATE.lock().expect("procfs pmap lock");
+            let key = root.phys().0;
+            state.mappings.retain(|(r, _), _| *r != key);
+        }
+
+        fn reserve_mapping(
+            root: &PmapRoot,
+            virt: VirtAddr,
+            phys: PhysAddr,
+            kind: PmapReserveKind,
+        ) -> Result<Option<PmapReservation>, PmapError> {
+            let state = PROCFS_TEST_PMAP_STATE.lock().expect("procfs pmap lock");
+            if state.mappings.contains_key(&(root_key(root), virt.0)) {
+                return Err(PmapError::AlreadyMapped);
+            }
+            Ok(Some(PmapReservation::new(virt, phys, kind)))
+        }
+
+        fn rollback_mapping(_root: &PmapRoot, _reservation: PmapReservation) {}
+
+        fn commit_mapping(
+            root: &PmapRoot,
+            reservation: PmapReservation,
+            _permissions: tx_hal::PmapPermissions,
+        ) {
+            let mut state = PROCFS_TEST_PMAP_STATE.lock().expect("procfs pmap lock");
+            state
+                .mappings
+                .insert((root_key(root), reservation.virt().0), reservation.phys());
+        }
+
+        fn unmap_mapping(
+            root: &PmapRoot,
+            virt: VirtAddr,
+            kind: PmapReserveKind,
+        ) -> Result<Option<PmapUnmapResult>, PmapError> {
+            let mut state = PROCFS_TEST_PMAP_STATE.lock().expect("procfs pmap lock");
+            let Some(phys) = state.mappings.remove(&(root_key(root), virt.0)) else {
+                return Ok(None);
+            };
+            Ok(Some(PmapUnmapResult::new(virt, phys, kind)))
+        }
+    }
+
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        tx_test_support::init_host();
+        tx_subsystems::cross_crate_test_support::reset_init_process();
+        tx_subsystems::cross_crate_test_support::reset_pid_counter();
+        tx_subsystems::cross_crate_test_support::reset_tid_counter();
+        let _ = zones::register_all();
+        tx_subsystems::net::reset_initial_net_namespace_for_test();
+        tx_test_support::drain_to_quiescence();
+        guard
+    }
+
+    fn root_cred() -> adapter::step_engine::Cap<Cred> {
+        sign_cred(Cred::root()).expect("root cred cap")
+    }
 
     fn read_one(fs: &Procfs, id: FsObjectId, cursor: DirCursor) -> (DirEntry, DirCursor) {
         let guard = adapter::step_engine::guard();
@@ -1058,5 +1312,89 @@ mod tests {
         assert_eq!(mounts_entry.name.as_bytes(), b"mounts");
         let (cpuinfo_entry, _) = read_one(&fs, PROCFS_ROOT_ID, cursor);
         assert_eq!(cpuinfo_entry.name.as_bytes(), b"cpuinfo");
+    }
+
+    #[test]
+    fn procfs_net_route_renders_initial_namespace_routes() {
+        let _setup = setup();
+        let guard = adapter::step_engine::guard();
+        let procfs = Procfs::new();
+        let auth = NetAdminAuthority::for_test_or_bootstrap();
+        let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+            left: VethEndpointConfig {
+                name: "proc-route0",
+                devt: DevT::new(98, 1),
+                mac: EthernetAddress::new([0x02, 0, 0, 0x72, 0, 1]),
+            },
+            right: VethEndpointConfig {
+                name: "proc-peer0",
+                devt: DevT::new(98, 2),
+                mac: EthernetAddress::new([0x02, 0, 0, 0x72, 0, 2]),
+            },
+            mtu: VETH_DEFAULT_MTU,
+        });
+        let netns = tx_subsystems::net::initial_net_namespace_payload();
+        netns
+            .attach_device_for_test_or_bootstrap(pair.left, None)
+            .expect("attach proc-route0");
+        let ifindex = netns
+            .link_snapshot()
+            .into_iter()
+            .find(|link| link.name == "proc-route0")
+            .expect("proc-route0 link")
+            .ifindex;
+        netns
+            .set_device_ipv4_addr_by_ifindex(
+                auth,
+                ifindex,
+                Some(Ipv4Address::new([172, 17, 0, 1])),
+                Some(16),
+            )
+            .expect("set proc-route0 addr");
+
+        let mut out = [0u8; 512];
+        let read = match procfs.step_read_projected(PROCFS_NET_ROUTE_ID, 0, &mut out, &guard) {
+            StepOutcome::Done(read) => read as usize,
+            other => panic!("route read failed: {other:?}"),
+        };
+        let text = core::str::from_utf8(&out[..read]).expect("route text utf8");
+
+        assert!(text.contains("Iface"));
+        assert!(text.contains("proc-route0"));
+        assert!(text.contains("000011AC"));
+        assert!(text.contains("0000FFFF"));
+    }
+
+    #[test]
+    fn procfs_ip_forward_read_write_toggles_initial_namespace_forwarding() {
+        let _setup = setup();
+        let guard = adapter::step_engine::guard();
+        let procfs = Procfs::new();
+        let netns = tx_subsystems::net::initial_net_namespace_payload();
+        assert!(!netns.ipv4_forwarding_enabled());
+
+        assert_eq!(
+            procfs.step_write_projected(PROCFS_SYS_NET_IPV4_IP_FORWARD_ID, 0, b"1\n", &guard,),
+            StepOutcome::Done(2)
+        );
+        assert!(netns.ipv4_forwarding_enabled());
+
+        let mut out = [0u8; 8];
+        let read = match procfs.step_read_projected(
+            PROCFS_SYS_NET_IPV4_IP_FORWARD_ID,
+            0,
+            &mut out,
+            &guard,
+        ) {
+            StepOutcome::Done(read) => read as usize,
+            other => panic!("ip_forward read failed: {other:?}"),
+        };
+        assert_eq!(&out[..read], b"1\n");
+
+        assert_eq!(
+            procfs.step_write_projected(PROCFS_SYS_NET_IPV4_IP_FORWARD_ID, 0, b"0\n", &guard,),
+            StepOutcome::Done(2)
+        );
+        assert!(!netns.ipv4_forwarding_enabled());
     }
 }

@@ -72,14 +72,20 @@ pub use namespace::{create_isolated_net_namespace_for_test, reset_initial_net_na
 #[cfg(any(test, feature = "test-support"))]
 pub use netfilter::reset_netfilter_for_test;
 pub use netfilter::{
-    netfilter_stats_snapshot, run_frame_hook, NetfilterFrameContext, NetfilterHook,
-    NetfilterStatsSnapshot, NetfilterVerdict,
+    add_masquerade_rule_for_test_or_bootstrap, add_netfilter_rule_for_test_or_bootstrap,
+    apply_postrouting_nat_ipv4, apply_prerouting_nat_ipv4, netfilter_conntrack_snapshot,
+    netfilter_rules_snapshot, netfilter_stats_snapshot, run_frame_hook, NetfilterConntrackSnapshot,
+    NetfilterFrameContext, NetfilterHook, NetfilterIpv4Cidr, NetfilterRule, NetfilterStatsSnapshot,
+    NetfilterTable, NetfilterTarget, NetfilterVerdict,
 };
 pub use packet::{
     demux_rx_frame_with_smoltcp, NetworkPublish, PacketDispatch, PacketSource, PacketTxReadiness,
     PacketTxResult, PacketTxSink, RxFrame, TcpPacketEvent, TcpPacketFlags, UdpPacketEvent,
 };
-pub use project::{proc_net_arp_snapshot_text, proc_net_dev_snapshot_text};
+pub use project::{
+    proc_net_arp_snapshot_text, proc_net_arp_snapshot_zero_text, proc_net_dev_snapshot_text,
+    proc_net_route_snapshot_text,
+};
 pub use protocol::{
     ArpEntry, EtherIface, EtherPacketSource, EtherPacketTxSink, Icmpv4EchoPacket, Icmpv4Event,
     NetStats, RawIcmpSocket, RawTcpSocket, RawUdpSocket, SmoltcpAdapter, SmoltcpAdapterConfig,
