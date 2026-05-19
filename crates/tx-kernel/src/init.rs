@@ -1034,13 +1034,6 @@ impl<P: TxPlatform> CoreInit<P> {
                 rootfs_payload
                     .fs_ops
                     .symlink(bin_id, b"sh", b"/musl/musl/busybox", &cred, &guard);
-            // OSComp lua test.sh uses #!/bin/busybox sh — seed the
-            // /bin/busybox symlink so the shebang handler can resolve
-            // the interpreter.
-            let _ =
-                rootfs_payload
-                    .fs_ops
-                    .symlink(bin_id, b"busybox", b"/musl/musl/busybox", &cred, &guard);
         }
 
         Self::write_board_sentinel_prefix();

@@ -591,9 +591,12 @@ fn exec_script_resets_brk_base_from_image_plan() {
 }
 
 #[test]
-fn exec_script_invalid_elf_returns_not_executable() {
+fn exec_script_invalid_elf_falls_back_to_bin_sh() {
     let _setup = setup();
     // 4 KiB of zeroes — fails ELF magic check immediately.
+    // The kernel now falls back to /bin/sh for ENOEXEC; /bin/sh
+    // does not exist in this test fixture, so the result is
+    // PathNotFound.
     let bytes = vec![0u8; 4096];
     let (process, thread, _fs) = bootstrap_with_file(b"bad", &bytes);
 
@@ -607,7 +610,7 @@ fn exec_script_invalid_elf_returns_not_executable() {
         &[],
         &cred,
     ));
-    assert_eq!(result, Err(ExecError::NotExecutable));
+    assert_eq!(result, Err(ExecError::PathNotFound));
 
     // Pre-PoNR error path must leave the process aspace untouched.
     let aspace_after = process.aspace_cap().expect("alive aspace post-fail");

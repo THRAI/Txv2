@@ -249,8 +249,7 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                             if tty_readable_level(tty) {
                                 revents |= POLLIN;
                             } else if park_source.is_none() {
-                                park_source =
-                                    Some((file.rnode().read_wait_source_id(), POLLIN as u64));
+                                park_source = Some((tty.wait_source_id(), POLLIN as u64));
                             }
                         } else {
                             revents |= POLLIN;

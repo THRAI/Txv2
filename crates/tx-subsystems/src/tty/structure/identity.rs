@@ -19,12 +19,12 @@ use alloc::sync::Arc;
 use crate::tty::adapter::step_engine::{
     AtomicSlot, Cap, Dead, Entity, PayloadCap, RawPort, RawQueue, SpinMutex, Weak,
 };
-use crate::tty::adapter::wait_routing::{Channel, WaitSource};
+use crate::tty::adapter::wait_routing::{self, Channel, WaitSource};
 
 use crate::wait_source;
 
 use super::payload::TtyPayload;
-use crate::tty::adapter::step_engine::{self as step_engine, WaitSourceId};
+use crate::tty::adapter::step_engine::{self as step_engine};
 
 // ---------------------------------------------------------------------------
 // Staging: FixedName<N>
@@ -262,7 +262,7 @@ impl TtyIdentity {
         // shares the legacy `wait_source_id` namespace so a v3
         // caller using the `WaitSourceId` stamped into
         // `YieldShape::OnWaitSource` lands on this same source.
-        let wait_source = Arc::new(WaitSource::new(WaitSourceId::new(wait_source_id)));
+        let wait_source = wait_routing::new_wait_source(wait_source_id);
         Self {
             kind,
             index,
@@ -359,6 +359,13 @@ impl TtyIdentity {
 
     pub fn clear_session_pgrp(&self) -> Option<SessionPgrp> {
         self.session_pgrp.swap(None)
+    }
+}
+
+impl Drop for TtyIdentity {
+    fn drop(&mut self) {
+        wait_source::release_wait_channel(self.wait_source_id);
+        wait_routing::unregister_source(self.wait_source_id);
     }
 }
 
