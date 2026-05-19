@@ -147,6 +147,52 @@ fn dispatch_kill_self_with_sigterm_succeeds() {
     assert_eq!(r, SyscallResult::Return(0));
 }
 
+/// `kill(target, sig)` from a non-privileged caller whose uid does
+/// not match the target's returns `-EPERM`. Locks in the
+/// cred-check wiring: `sys_kill` must route through
+/// `script_kill_process` (which runs `cred::require_signal_send`
+/// against the caller's syscall-entry `CredSnapshot`), **not** the
+/// primitive `step_kill_process` that bypasses authorization.
+#[test]
+fn dispatch_kill_different_uid_returns_neg_eperm() {
+    use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
+
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+
+    // Fork a child so its pid is registered in the global lookup
+    // (`process_by_pid`) that `sys_kill` consults. The child
+    // inherits the parent's root cred at fork time; we override
+    // both creds below.
+    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false).expect("fork");
+    let child_pid = child.pid.0 as u64;
+
+    // Drop the caller to (uid=1000, gid=1000) with empty caps so
+    // CAP_KILL no longer bypasses the uid match.
+    clear_caps_for_test(&parent);
+    set_cred_ids_for_test(&parent, 1000, 1000, 1000, 1000, 1000, 1000);
+
+    // Drop the target to (uid=2000, gid=2000), non-overlapping
+    // with the caller's (uid, euid). signal_permitted's day-1 rule
+    // collapses to (source.uid|euid) × (target.uid|euid); no match.
+    clear_caps_for_test(&child);
+    set_cred_ids_for_test(&child, 2000, 2000, 2000, 2000, 2000, 2000);
+
+    // Construct ctx AFTER cred manipulation so the snapshot
+    // SyscallCtx::new captures reflects the deprivileged state.
+    let ctx = make_ctx(parent.clone(), parent_thread);
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [child_pid, 15, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(E_PERM));
+    // Target must remain live — the cred check blocked before any
+    // post happened.
+    assert!(!child.is_zombie());
+}
+
 /// `kill(unknown_pid, sig)` returns `-ESRCH`.
 #[test]
 fn dispatch_kill_unknown_pid_returns_neg_esrch() {

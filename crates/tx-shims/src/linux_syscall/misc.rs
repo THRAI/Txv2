@@ -37,7 +37,7 @@ pub(super) fn sys_getrandom<'a, P: EntropyIf>(
     let mut tmp = alloc::vec![0u8; buf_len];
     <P as EntropyIf>::fill_random(&mut tmp);
     if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &tmp) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(buf_len as i64)
 }
@@ -63,7 +63,7 @@ pub(super) fn sys_uname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     }
     let utsname = build_utsname();
     if let Err(errno) = bootstrap_write_user::<UtsnameLayout>(&ctx.aspace, buf_uaddr, utsname) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
 }
@@ -118,7 +118,7 @@ pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
 
     if old_uaddr != 0 {
         if let Err(errno) = bootstrap_write_user::<RlimitLayout>(&ctx.aspace, old_uaddr, limit) {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
     SyscallResult::Return(0)

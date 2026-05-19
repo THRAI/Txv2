@@ -16,7 +16,6 @@ use alloc::vec::Vec;
 use crate::execution::Guard;
 use crate::mount::MountPayload;
 use crate::vfs::adapter::step_engine::{self, Cap, StepOutcome};
-use crate::vfs::predicates;
 use crate::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking,
 };
@@ -121,8 +120,14 @@ pub fn kernel_step(
     }
 
     // --- POSIX search permission ---
+    // Routes through cred::checks for a single source of truth at
+    // the cred seam; the witness is discarded because the per-
+    // component walk does not yet thread a SearchAuthorized<'g>
+    // token to a downstream publication site.
     let parent_meta = current.rnode().meta();
-    if let Err(_err) = predicates::check_descend_perm(&parent_meta, cred) {
+    if let Err(_err) =
+        crate::cred::checks::require_path_search_with_walker_cred(cred, &parent_meta, guard)
+    {
         return KernelStep::Error(WalkCause::Permission(
             super::state::NonTerminalDenial::SearchDenied,
         ));

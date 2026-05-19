@@ -6,6 +6,11 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 use tx_fs;
+// The alias-name `cred_checks` is required by
+// `xtask lint invariants cred-check` — see CRED_CHECK_SIGNALS in
+// xtask/src/lint_invariants_cred_check.rs. Other aliases would
+// silently bypass the gate.
+use tx_subsystems::cred::checks as cred_checks;
 use tx_subsystems::mount::{self};
 
 /// Split a path into `(parent, basename)` for the `O_CREAT`-on-missing
@@ -193,6 +198,17 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
+    // POSIX mkdir(2) permission: write + search on the parent.
+    // Same rule as link/create — sticky is *not* consulted (mkdir
+    // only adds an entry, doesn't remove). Walker only enforced
+    // search-on-ancestors; without this, any user that could
+    // search the parent could create a directory there.
+    let parent_meta = parent_dentry.rnode().meta();
+    if let Err(e) =
+        cred_checks::authorize_link(ctx.cred_snapshot(), &parent_meta)
+    {
+        return SyscallResult::error_from(e);
+    }
     // Apply umask: effective_mode = mode & !umask. Linux semantics
     // (umask is the bottom 9 bits — `rwxrwxrwx`).
     let umask = ctx.process.umask();
@@ -204,7 +220,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     match outcome {
         V3::Done(_) => SyscallResult::Return(0),
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -268,6 +284,19 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     if !want_rmdir && target_kind == InodeKind::Directory {
         return SyscallResult::Error(EISDIR_VALUE);
     }
+    // POSIX unlink/rmdir permission check (W+X on parent + S_ISVTX
+    // ownership rule). The walker only enforced search-on-ancestors
+    // — write-on-parent and the sticky-bit rule were unguarded before
+    // this check.
+    let parent_meta = parent_dentry.rnode().meta();
+    let child_meta = target_dentry.rnode().meta();
+    if let Err(e) = cred_checks::authorize_unlink(
+        ctx.cred_snapshot(),
+        &parent_meta,
+        &child_meta,
+    ) {
+        return SyscallResult::error_from(e);
+    }
     let outcome = {
         let guard = step_engine::guard();
         if want_rmdir {
@@ -279,7 +308,7 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     match outcome {
         V3::Done(()) => SyscallResult::Return(0),
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -334,6 +363,15 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
+    // POSIX symlink(2) permission: write + search on parent (same
+    // as link / mkdir — sticky not consulted because symlink only
+    // creates an entry).
+    let parent_meta = parent_dentry.rnode().meta();
+    if let Err(e) =
+        cred_checks::authorize_link(ctx.cred_snapshot(), &parent_meta)
+    {
+        return SyscallResult::error_from(e);
+    }
     let outcome = {
         let guard = step_engine::guard();
         fs_ops.symlink(parent_id, basename, &target, &cred, &guard)
@@ -341,7 +379,7 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     match outcome {
         V3::Done(_) => SyscallResult::Return(0),
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -412,6 +450,18 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
+    // POSIX link(2) permission: write + search on the new parent
+    // (sticky is NOT consulted — link only adds, doesn't remove).
+    // Walker only enforced search-on-ancestors; without this, any
+    // user that could search the new parent could create a name
+    // there. Routes through cred::checks::require_link so the
+    // witness chain is intact at the FsOps mint site.
+    let new_parent_meta = new_parent_dentry.rnode().meta();
+    if let Err(e) =
+        cred_checks::authorize_link(ctx.cred_snapshot(), &new_parent_meta)
+    {
+        return SyscallResult::error_from(e);
+    }
     let outcome = {
         let guard = step_engine::guard();
         fs_ops.link(new_parent_id, new_basename, source_id, &guard)
@@ -419,7 +469,7 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     match outcome {
         V3::Done(()) => SyscallResult::Return(0),
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -463,7 +513,7 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     match outcome {
         V3::Done(()) | V3::Continue { .. } => SyscallResult::Return(0),
         V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(v3_errno) => SyscallResult::Error(errno_to_i32(v3_errno.into())),
+        V3::Err(v3_errno) => SyscallResult::error_from(v3_errno.into()),
     }
 }
 
@@ -512,7 +562,7 @@ pub(super) async fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -585,7 +635,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
     let target_meta = {
@@ -595,7 +645,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
     if target_meta.kind() != InodeKind::Symlink {
@@ -608,13 +658,13 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
     let to_copy = core::cmp::min(link_bytes.len(), buf_len);
     if to_copy > 0 {
         if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &link_bytes[..to_copy]) {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
     SyscallResult::Return(to_copy as i64)
@@ -641,11 +691,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     };
     let cred = ctx.walker_cred();
 
-    // No outer guard here: `walk_from` acquires its own internal
-    // guard (fs_path.rs:623), and txKernel's epoch discipline panics
-    // on nested guards (`tx-substrate::epoch::local:55`). Per-branch
-    // guards land inside the branches that actually call subsystem
-    // helpers needing one (bind_mount; the RNode reserve below).
+    let guard = step_engine::guard();
 
     let target_dentry = match walk_from(cwd.clone(), &target, &cred) {
         Ok(d) => d,
@@ -667,10 +713,9 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         };
-        let guard = step_engine::guard();
         match mount::bind_mount(source_dentry, target_dentry, &parent_payload, &guard) {
             Ok(_) => return SyscallResult::Return(0),
-            Err(e) => return SyscallResult::Error(errno_to_i32(e)),
+            Err(e) => return SyscallResult::error_from(e),
         }
     }
 
@@ -711,25 +756,14 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         tx_subsystems::vfs::InodeMeta,
         &str,
     ) = match fstype_str {
-        // `vfat` is an oscomp-basic compatibility shim: we have no
-        // FAT driver, but the basic test mounts `/dev/vda2` as
-        // `vfat` and only asserts `mount` + `umount` round-trip
-        // (`assert(ret == 0)`). A fresh tmpfs at the mount point
-        // satisfies that contract without pretending to read FAT
-        // bytes. Real FAT support tracks separately.
-        "tmpfs" | "vfat" => {
+        "tmpfs" => {
             let tmpfs = alloc::sync::Arc::new(tx_fs::tmpfs::Tmpfs::new());
-            let label = if fstype_str == "vfat" {
-                "vfat"
-            } else {
-                "tmpfs"
-            };
             (
                 tmpfs.clone().fs_ops_arc(),
                 tmpfs.fs_page_backing_arc(),
                 tx_subsystems::vfs::FsObjectId::ROOT,
                 tx_subsystems::vfs::InodeMeta::new(tx_subsystems::vfs::InodeKind::Directory, 0o755),
-                label,
+                "tmpfs",
             )
         }
         "devfs" => (
@@ -786,7 +820,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
             };
             let mounted = match mounted {
                 Ok(m) => m,
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => return SyscallResult::error_from(errno),
             };
             let root_id = mounted.root_fs_object_id;
             let root_meta = mounted.root_inode_meta.clone();
@@ -883,18 +917,12 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     };
     let cred = ctx.walker_cred();
 
+    let guard = step_engine::guard();
     use StepOutcome as V3;
-    // Scope the guard so it's dropped before any downstream helper
-    // (notably `mount_payload_for_dentry`, which acquires its own
-    // internal guard) — nested guards panic at
-    // `tx-substrate::epoch::local:55`.
-    let target_dentry = {
-        let guard = step_engine::guard();
-        match step_walk(cwd.clone(), &target, &cred, &guard) {
-            V3::Done(d) => d,
-            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
-            _ => return SyscallResult::Error(EIO_VALUE),
-        }
+    let target_dentry = match step_walk(cwd.clone(), &target, &cred, &guard) {
+        V3::Done(d) => d,
+        V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        _ => return SyscallResult::Error(EIO_VALUE),
     };
     let parent_payload = match mount_payload_for_dentry(&target_dentry) {
         Some(p) => p,
@@ -903,7 +931,7 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
 
     match mount::umount(&target_dentry, &parent_payload) {
         Ok(()) => SyscallResult::Return(0),
-        Err(e) => SyscallResult::Error(errno_to_i32(e)),
+        Err(e) => SyscallResult::error_from(e),
     }
 }
 
@@ -959,21 +987,21 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     };
     match result {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
 /// `utimensat(dirfd, pathname, times, flags)`. Linux RV64 generic ABI
 /// `__NR_utimensat = 88`.
 ///
-/// Returns 0 (success) without actually mutating inode timestamps.
-/// The `FsOps` surface does not yet expose a `set_times` hook, so
-/// timestamps stay unchanged, but the syscall itself succeeds.
-/// This makes `touch(1)` exit 0, which the busybox-musl test suite
-/// requires (`touch test.txt` is scored as a test case).
-/// TODO(phase-vfs-utimens): wire to a real backend set_times method.
+/// Slice 8: returns `-ENOSYS`. The `FsOps` surface does not yet expose
+/// a `set_times` hook (`InodeMeta` carries `atime`/`mtime`/`ctime`
+/// fields, but the backend trait has no method to mutate them).
+/// Most shells ignore `utimensat` failures — the deferred
+/// implementation is documented under
+/// `TODO(phase-vfs-utimens)` in the slice plan.
 pub(super) fn sys_utimensat<'a>(_args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
-    SyscallResult::Return(0)
+    SyscallResult::Error(ENOSYS_VALUE)
 }
 
 /// `renameat2(olddirfd, oldpath, newdirfd, newpath, flags)`. Linux RV64
@@ -1034,6 +1062,61 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     // internally; the flag acts as a post-resolution collision check
     // inside the op. RENAME_EXCHANGE was rejected above.
     let cred = ctx.walker_cred();
+
+    // POSIX rename(2) permission check. Pre-walk old child, old
+    // parent, new parent (and new child if it exists) so the cred
+    // gate fires before RenameOp re-walks + commits. The composite
+    // op currently performs no cred check; without this gate any
+    // non-root caller with X on both parents could rename arbitrary
+    // entries. Witness chain: ctx.cred_snapshot() →
+    // cred::checks::require_rename → consumed inside the commit
+    // guard scope wrapping RenameOp drive.
+    let (old_parent_path, old_basename) = split_path(&oldpath);
+    if old_basename.is_empty() {
+        return SyscallResult::Error(EISDIR_VALUE);
+    }
+    let (new_parent_path, new_basename) = split_path(&newpath);
+    if new_basename.is_empty() {
+        return SyscallResult::Error(EISDIR_VALUE);
+    }
+    let old_parent_dentry = if old_parent_path.is_empty() {
+        cwd.clone()
+    } else {
+        match walk_from(cwd.clone(), old_parent_path, &cred) {
+            Ok(d) => d,
+            Err(e) => return SyscallResult::Error(e),
+        }
+    };
+    let old_child_dentry = match walk_from(cwd.clone(), &oldpath, &cred) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
+    let new_parent_dentry = if new_parent_path.is_empty() {
+        cwd.clone()
+    } else {
+        match walk_from(cwd.clone(), new_parent_path, &cred) {
+            Ok(d) => d,
+            Err(e) => return SyscallResult::Error(e),
+        }
+    };
+    // Displaced inode is optional — walk_from returns Err(ENOENT)
+    // when the new path doesn't exist, which is the normal case
+    // for a rename that creates rather than overwrites.
+    let displaced_dentry = walk_from(cwd.clone(), &newpath, &cred).ok();
+    let old_parent_meta = old_parent_dentry.rnode().meta();
+    let old_child_meta = old_child_dentry.rnode().meta();
+    let new_parent_meta = new_parent_dentry.rnode().meta();
+    let displaced_meta = displaced_dentry.as_ref().map(|d| d.rnode().meta());
+
+    if let Err(e) = cred_checks::authorize_rename(
+        ctx.cred_snapshot(),
+        &old_parent_meta,
+        &old_child_meta,
+        &new_parent_meta,
+        displaced_meta.as_ref(),
+    ) {
+        return SyscallResult::error_from(e);
+    }
     let result = {
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = RenameOp {
@@ -1047,17 +1130,6 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     };
     match result {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
-}
-
-/// `syslog(type, bufp, len)` — kernel ring-buffer read/control.
-/// Linux RV64 generic ABI `__NR_syslog = 116`. Called by `dmesg(1)`.
-///
-/// Stub: all type variants return 0 (success / zero bytes read).
-/// This is sufficient for `dmesg` to exit 0 so the busybox-musl
-/// `dmesg` test case passes.
-pub(super) fn sys_syslog<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
-    let _log_type = args[0] as u32;
-    SyscallResult::Return(0)
 }

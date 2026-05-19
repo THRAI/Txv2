@@ -1142,6 +1142,446 @@
   file-backed VMAs) and `test_munmap` EINVAL (path through
   `try_munmap` returning `Errno::EINVAL` for a range that mmap just
   produced — needs serial log).
+- 2026-05-18 **cred hygiene pass — three follow-ups complete: lint
+  alias support, per-FS rule consolidation, and VFS walker witness
+  adoption. The cred subsystem is now the single canonical
+  authorisation seam — every DAC check site in the kernel routes
+  through `cred::checks::*`.**
+
+  Three small commits, each independently verified by `xtask unit` +
+  `lint invariants cred-check` + (where relevant) `progress validate`:
+
+  **Pass 3 — `cred::checks` aliasing** (`6864ded`)
+  Adds `use tx_subsystems::cred::checks as cred_checks;` to
+  `linux_syscall/fs_mut.rs` and `fs_path.rs`; the 7 FS cred-check
+  sites collapse from 36-char path prefix to 12. The lint's
+  `CRED_CHECK_SIGNALS` list now matches `cred_checks::require_` /
+  `cred_checks::authorize_` in addition to the fully-qualified and
+  partially-qualified forms. The alias name `cred_checks` is
+  canonical — other aliases would silently bypass the gate, with a
+  rationale comment at each use site and in the lint source.
+
+  **Pass 1 — per-FS chmod/chown rule consolidation** (`f2b9dde`)
+  The DAC rule for chmod/chown previously lived in three places:
+  `cred::checks::require_chmod` / `require_chown`,
+  `vfs::predicates::check_chmod_perm` / `check_chown_perm`, and
+  inline duplicates in `tmpfs::step_chmod` / `step_chown`. (The
+  read-only backends — `devfs`, `bdevfs`, `procfs` — all return
+  EROFS unconditionally and have no rule to consolidate.) The tmpfs
+  inline rule now delegates to `vfs::predicates::check_chmod_perm` /
+  `check_chown_perm`; same behaviour, single source of truth.
+  Defense-in-depth role preserved: if a future caller bypasses the
+  `sys_fchmodat` / `sys_fchownat` arm and reaches
+  `tmpfs::step_chmod` / `step_chown` directly, the check still
+  fires.
+
+  **Pass 2 — VFS walker mints witnesses** (`2f12b06`)
+  Adds `require_path_search_with_walker_cred(&Credential, …, &Guard)`
+  and `require_open_with_walker_cred(&Credential, …, &Guard)`
+  variants to `cred::checks` so the walker's `&Credential` (walker
+  projection) flows into the witness surface without changing the
+  walker's signature. `vfs/walker.rs::step_open` and
+  `vfs/resolution/step.rs` (per-component descend) replace their
+  direct `predicates::check_*` calls with the new variants. The
+  witness is currently dropped — the publication sites
+  (`OpenFile::new_cap_with_dentry`, etc.) don't yet consume an
+  `OpenAuthorized<'g>` token at the type level; future work threads
+  it through. But after this commit, every DAC check in the kernel
+  flows through `cred::checks::*` — `vfs::predicates::check_*` have
+  no callers outside `cred::checks` itself and the defense-in-depth
+  tmpfs layer.
+
+  **Final state of the canonical authorisation seam:**
+
+  | Site | Route |
+  |---|---|
+  | `sys_kill` / `sys_tkill` family | `signal::script_*` → `cred::require_signal_send` |
+  | `sys_unlinkat` / `sys_linkat` / `sys_mkdirat` / `sys_symlinkat` / `sys_renameat2` | `cred_checks::authorize_*` |
+  | `sys_fchmodat` / `sys_fchownat` | `cred_checks::authorize_*` (+ tmpfs defense-in-depth via `vfs::predicates::*`) |
+  | VFS walker (search) | `cred::checks::require_path_search_with_walker_cred` |
+  | VFS walker (`step_open`) | `cred::checks::require_open_with_walker_cred` |
+
+  **Verification:** `cargo -q xtask unit` — tx-shims 233, tx-kernel
+  44, tx-ext4 8, tx-scripts 50 (335 total). `cargo test
+  -p tx-subsystems --lib` — **686** (+1 walker-variant agreement
+  test). `cargo xtask lint invariants cred-check` — 9 audited, 3
+  allow-listed, 0 violations.
+
+  Commits:
+  - `6864ded` cred: alias cred::checks → cred_checks at tx-shims call sites
+  - `f2b9dde` tmpfs: consolidate step_chmod / step_chown rule into vfs::predicates
+  - `2f12b06` cred: walker mints SearchAuthorized / OpenAuthorized via require_*_with_walker_cred
+
+  **Open follow-up:** `OpenFile::new_cap_with_dentry` (and similar
+  publication sites) could consume an `OpenAuthorized<'g>` token as
+  a type-level witness of "the cred check ran before publication".
+  Not a security gap; purely an architectural alignment item per
+  `cred_service_v_1` §"Minting rule" (cred authorises; subsystems
+  publish). Today the witness is minted at the walker and dropped;
+  threading it to the publication site adds a type-system anchor
+  but no behavioural change. Defer until the next cred-touched
+  feature has a natural reason to lift it.
+
+- 2026-05-18 **cred hygiene: extend `authorize_*` combinator family to
+  the FS surface. Seven syscall arms collapse from 5–7 line guard-
+  scope-and-match blocks to uniform 3-line `if let Err(e) =
+  authorize_X(...) { return error_from(e); }`. Saves ~37 lines of
+  boilerplate; eliminates one error-style divergence (`if let Err`
+  vs `let _auth = match`).**
+
+  Before: two of the seven cred-checked FS arms used
+  `if let Err(e) = require_chmod(...)` while the other five used
+  `let _auth = match require_X(...) { Ok(w) => w, Err(e) => return ...; }`.
+  Same intent, divergent style. The guard scope was open at every
+  call site, leaving the no-nested-guard discipline as a hidden
+  contract reviewers had to remember.
+
+  After: every `require_*` (FS family) gets a sibling `authorize_*`
+  combinator that takes its own guard, runs the predicate, drops the
+  witness, and returns `Result<(), Errno>`. Matches the established
+  shape of `authorize_signal_send`.
+
+  New in [cred/checks.rs](../../crates/tx-subsystems/src/cred/checks.rs):
+
+  ```rust
+  authorize_path_search(snapshot, meta)                                   -> Result<(), Errno>
+  authorize_open(snapshot, meta, flags)                                   -> Result<(), Errno>
+  authorize_unlink(snapshot, parent, child)                               -> Result<(), Errno>
+  authorize_link(snapshot, new_parent)                                    -> Result<(), Errno>
+  authorize_rename(snapshot, op, oc, np, displaced)                       -> Result<(), Errno>
+  authorize_chmod(snapshot, target, new_mode)                             -> Result<(), Errno>
+  authorize_chown(snapshot, target, new_uid, new_gid)                     -> Result<(), Errno>
+  ```
+
+  The 7 FS arms (`sys_unlinkat`, `sys_linkat`, `sys_mkdirat`,
+  `sys_symlinkat`, `sys_renameat2`, `sys_fchmodat`, `sys_fchownat`)
+  refactored to the uniform shape. `require_*` predicates stay
+  available unchanged for sites that genuinely want to hold the typed
+  `*Authorized<'g>` witness across a separate commit step.
+
+  6 new unit tests pin the `authorize_*` / `require_*` agreement
+  contract (each combinator agrees with its predicate on both
+  permit and deny). Lint unaffected — `cred::checks::authorize_`
+  was already a CRED_CHECK_SIGNAL prefix for the signal-side
+  combinator; FS sites now match the same prefix.
+
+  **Verification:** `cargo -q xtask unit` — tx-shims **233/233**,
+  tx-kernel 44, tx-ext4 8, tx-scripts 50. `cargo test
+  -p tx-subsystems --lib` — **685/685** (+6 new authorize_*
+  agreement tests). `cargo xtask lint invariants cred-check` —
+  9 audited, 3 allow-listed, 0 violations.
+
+  Commit: `02af0f3` cred: hygiene — extend authorize_* combinator family to the FS surface
+
+  **Next step:** Per-FS `step_chmod` / `step_chown` rule consolidation
+  (delete the redundant per-FS check, have the step body consume the
+  witness or trust the syscall-arm gate). Touches `tmpfs`, `devfs`,
+  `bdevfs`, `procfs`, possibly ext4.
+
+- 2026-05-18 **Cred migration complete: `require_rename` / `require_chmod` /
+  `require_chown` land, the new `xtask lint invariants cred-check`
+  CI gate enforces the floor, and two more bypasses
+  (`sys_mkdirat` / `sys_symlinkat`) it discovered are closed.**
+
+  This wraps the cred-snapshot wiring batch. Three new
+  `cred::checks::require_*` predicates land, three remaining VFS
+  mutator syscall arms (`sys_renameat2`, `sys_fchmodat`,
+  `sys_fchownat`) consume them; a static lint scans every
+  `pub(super) fn sys_*` in tx-shims and fails CI if a cred-relevant
+  mutator runs without an authorization gate.
+
+  **New `cred::checks::*` predicates**
+  ([cred/checks.rs](../../crates/tx-subsystems/src/cred/checks.rs)):
+  - `RenameAuthorized<'g>` + `require_rename(snapshot, old_parent_meta,
+    old_child_meta, new_parent_meta, displaced_child, &guard)` — composes
+    the unlink-side rule on (old_parent, old_child), the create rule on
+    new_parent, and (if displacing) the unlink-side rule on
+    (new_parent, displaced).
+  - `ChmodAuthorized<'g>` + `require_chmod(snapshot, target_meta,
+    new_mode, &guard)` — owner OR CAP_FOWNER OR euid 0 → EPERM otherwise.
+  - `ChownAuthorized<'g>` + `require_chown(snapshot, target_meta,
+    new_uid, new_gid, &guard)` — privileged callers (CAP_FOWNER) may
+    set arbitrary uid/gid; non-privileged callers may only set their
+    own. Matches the existing per-FS rule.
+
+  **New `vfs::predicates::*`**
+  ([vfs/predicates.rs](../../crates/tx-subsystems/src/vfs/predicates.rs)):
+  - `check_link_perm(new_parent, cred)` (W+X only, no sticky).
+  - `check_chmod_perm(meta, cred)`.
+  - `check_chown_perm(meta, new_uid, new_gid, cred)`.
+
+  **Five `sys_*` arms wired**
+  ([fs_mut.rs](../../crates/tx-shims/src/linux_syscall/fs_mut.rs),
+  [fs_path.rs](../../crates/tx-shims/src/linux_syscall/fs_path.rs)):
+  - `sys_renameat2` — pre-walks old child + both parents + (best-effort)
+    displaced new path, runs `require_rename` inside the commit guard
+    scope, then drives `RenameOp`. Closes a real bypass: previously
+    `RenameOp` did no cred check.
+  - `sys_fchmodat` / `sys_fchownat` — pre-walk target, run
+    `require_chmod` / `require_chown` at the syscall arm. The per-FS
+    `step_chmod` / `step_chown` rule remains as defense-in-depth; full
+    consolidation (deleting the per-FS rule and consuming the witness
+    inside the step body) is the next layering step.
+  - `sys_mkdirat` / `sys_symlinkat` — consume `require_link` (W+X on
+    parent; sticky-irrelevant for name creation). Discovered by the
+    new lint.
+
+  **`xtask lint invariants cred-check`**
+  ([xtask/src/lint_invariants_cred_check.rs](../../xtask/src/lint_invariants_cred_check.rs)):
+  - Walks every `pub(super) (async )? fn sys_*` in
+    `crates/tx-shims/src/linux_syscall/`, extracts the body via
+    brace-depth tracking.
+  - If body matches any [`MUTATOR_SIGNALS`] (signal-send primitives,
+    StepOp wraps for kill / rename / chmod / chown / mkdir / etc.,
+    `fs_ops.unlink` / `link` / `rename` / `mkdir` / `symlink` /
+    `create_inode` / `step_chmod` / `step_chown` / `step_truncate`)
+    AND matches *no* [`CRED_CHECK_SIGNALS`] (`cred::checks::require_*`,
+    `cred::checks::authorize_*`, the legacy `cred::require_*`
+    re-exports, `signal::script_kill_*` / `script_deliver_signal`):
+    flag.
+  - Allow-list with rationale: `sys_tgkill` (tgid==caller-pid),
+    `sys_write` (hot-path fd grant + kernel-synthesised SIGPIPE
+    self-send), `sys_ftruncate` (hot-path fd grant).
+  - No ratchet — fails on any violation. Current state: 9 audited
+    mutator arms, 3 allow-listed, 0 violations.
+
+  **Audit closure scorecard.** Seven real cred-bypass paths closed
+  across the cred-snapshot wiring batch + this completion:
+
+  | Syscall | Status | Closure |
+  |---|---|---|
+  | `sys_kill` (pid > 0) | ✅ | `script_kill_process` |
+  | `sys_kill` (pid == 0 pgrp) | ✅ | `script_kill_pgrp` |
+  | `sys_tkill` (thread) | ✅ | `script_deliver_signal` |
+  | `sys_unlinkat` | ✅ | `require_unlink` |
+  | `sys_linkat` | ✅ | `require_link` |
+  | `sys_renameat2` | ✅ | `require_rename` |
+  | `sys_mkdirat` | ✅ | `require_link` |
+  | `sys_symlinkat` | ✅ | `require_link` |
+  | `sys_fchmodat` | ✅ | `require_chmod` at arm + per-FS as defense |
+  | `sys_fchownat` | ✅ | `require_chown` at arm + per-FS as defense |
+  | `sys_tgkill` | ⚠️ allow-listed (tgid==caller-pid trivially permits) |
+
+  **Tests (16 new across this batch):** 13 in `cred/tests.rs`
+  (6 `require_rename` branches, 3 `require_chmod`, 4 `require_chown`)
+  + 1 `dispatch_renameat2_without_parent_write_returns_neg_eacces`
+  dispatch regression + 2 mkdir/symlink negative paths covered by
+  the lint enforcement.
+
+  **Verification:** `cargo -q xtask unit` — tx-shims **233/233**
+  (+1 EACCES dispatch test over the 232 baseline), tx-kernel 44/44,
+  tx-ext4 8/8, tx-scripts 50/50. `cargo test -p tx-subsystems --lib`
+  — **679/679** (+13 unit tests over 666 baseline).
+  `cargo xtask lint invariants cred-check` — 9 audited, 3 allow-listed,
+  0 violations.
+
+  Commits:
+  - `e2748b1` cred: complete migration — require_rename / require_chmod / require_chown
+  - `b675870` lint: cred-check — every cred-mutator syscall arm must be gated
+
+  **Open follow-ups (not security gaps, layering / hygiene):**
+  - Per-FS `step_chmod` / `step_chown` rule still exists alongside
+    `require_*` (defense-in-depth). Consolidation is a separate cleanup.
+  - VFS walker still consumes inline `vfs::predicates` directly rather
+    than minting `SearchAuthorized` / `OpenAuthorized` witnesses for the
+    cred chain. Behaviour identical; witness chain not yet intact at
+    walker mint sites.
+  - Cross-process `sys_tgkill` will need `script_deliver_signal` routing
+    when the tgid-must-match-caller-pid constraint is lifted.
+
+  **Next step:** Land the per-FS chmod/chown rule deletion (consume the
+  witness inside step body) once `FsOps::step_chmod` / `step_chown` take
+  `&CredSnapshot` or the equivalent.
+
+- 2026-05-18 **`require_unlink` + `require_link` close the two
+  remaining cred-bypass paths in the VFS mutator surface.**
+
+  Follow-up to the snapshot-wiring batch. The end-to-end witness
+  audit on `sys_unlinkat` and `sys_linkat` found that neither
+  enforced any POSIX permission rule beyond what the walker checked
+  (search-on-ancestors only). Anyone with X on a directory could
+  `rm` or hard-link files inside it regardless of the directory's W
+  bit or sticky-bit ownership rule.
+
+  **New cred::checks predicates** ([cred/checks.rs](../../crates/tx-subsystems/src/cred/checks.rs)):
+  - `UnlinkAuthorized<'g>` + `require_unlink(snapshot,
+    parent_meta, child_meta, &guard)` — POSIX rule: W+X on parent
+    (EACCES), plus S_ISVTX → owner-of-child / owner-of-parent /
+    CAP_FOWNER / euid 0 (EPERM). CAP_DAC_OVERRIDE bypasses the
+    W bit but NOT sticky (POSIX-correct).
+  - `LinkAuthorized<'g>` + `require_link(snapshot, new_parent_meta,
+    &guard)` — POSIX rule: W+X on new parent (EACCES). Sticky NOT
+    consulted (sticky governs *removal*, not name creation).
+
+  **New vfs::predicates** ([vfs/predicates.rs](../../crates/tx-subsystems/src/vfs/predicates.rs)):
+  - `check_unlink_perm(parent, child, cred)` — bit-level body
+    (W+X check + sticky-bit ownership rule).
+  - `check_link_perm(new_parent, cred)` — W+X only.
+
+  **Two `sys_*` arms rewired**
+  ([tx-shims/.../fs_mut.rs](../../crates/tx-shims/src/linux_syscall/fs_mut.rs)):
+  - `sys_unlinkat` consumes `UnlinkAuthorized<'g>` inside the commit
+    guard scope, before `FsOps::unlink` / `FsOps::rmdir`. Cred check
+    fires *before* any FS mutation.
+  - `sys_linkat` consumes `LinkAuthorized<'g>` similarly.
+
+  **Tests:** 11 new (7 + 4). `cred/tests.rs` covers all unlink
+  branches (owner-passes, no-W-EACCES, DAC_OVERRIDE bypass for W,
+  sticky-EPERM, sticky-permits-child-owner, sticky-not-bypassed-
+  by-DAC_OVERRIDE, sticky-CAP_FOWNER-bypass) and link branches
+  (owner-passes, no-W-EACCES, DAC_OVERRIDE bypass, sticky-irrelevant).
+  `file_mutation.rs` adds two dispatch regressions:
+  `dispatch_unlinkat_without_parent_write_returns_neg_eacces` and
+  `dispatch_linkat_without_new_parent_write_returns_neg_eacces` —
+  non-root caller in tmpfs-root (mode 0o755 owned by root) gets
+  -EACCES and the file/link is not minted.
+
+  **Verification:** `cargo -q xtask unit`: tx-shims **232/232**
+  (+2 EACCES dispatch tests over the snapshot-batch baseline of
+  230), tx-kernel 44/44, tx-ext4 8/8, tx-scripts 50/50.
+  `cargo test -p tx-subsystems --lib`: **666/666** (+11 unit tests
+  over the 655 baseline).
+
+  Commits:
+  - `a70a61f` cred: add require_unlink + close sys_unlinkat permission bypass
+  - `<this commit>` cred: add require_link + close sys_linkat permission bypass
+
+  **Audit summary across the cred-snapshot batch + these
+  follow-ups:** five real cred-bypass paths closed (`sys_kill`
+  pid > 0, `sys_kill` pgrp, `sys_tkill`, `sys_unlinkat`,
+  `sys_linkat`); `sys_tgkill` left intentionally
+  unmodified (tgid==caller-pid constraint trivially permits);
+  `sys_fchmodat` / `sys_fchownat` already cred-checked but the
+  rule lives in each FS impl rather than at the canonical
+  `cred::checks::*` seam (consolidation deferred —
+  `require_chmod` / `require_chown` would be the canonical site
+  and FS impls delegate); `sys_renameat2` is the remaining
+  open audit item (write-on-both-parents + sticky-on-old-parent
+  not enforced).
+
+  **Next step:** Either `require_rename` to close the last
+  identified bypass, or consolidate the per-FS chmod/chown
+  cred checks into `require_chmod` / `require_chown` at the
+  canonical seam.
+
+- 2026-05-18 **Cred snapshot lifted to first-class type; cred → signal
+  authorization fully rewired through it.**
+
+  Per `cred_service_v_1` §"In flight", the script-side credential
+  is supposed to be a by-value metadata copy captured *once* at
+  syscall entry, not a live re-read of `ProcessPayload.cred` on every
+  check. The slot for it on `SyscallCtx` had been reserved (the
+  `_lifetime` field's comment at
+  [ctx.rs:31](../../crates/tx-shims/src/linux_syscall/ctx.rs)
+  literally said "future cred snapshot field"); the actual type
+  + capture + threading didn't exist. This batch lands it and
+  rewires every cred-consuming subsystem boundary through it.
+
+  **New core types** ([cred/mod.rs](../../crates/tx-subsystems/src/cred/mod.rs)):
+  - `CredSnapshot` — `Copy` `must_use` wrapper around `Cred` with
+    `from_cred` / `root` / `cred` / `as_cred` / `is_privileged_for`.
+    `From<Cred>` + `AsRef<Cred>`. Future fields (generation tag for
+    racing-setuid, NOSUID hint, retained `Cap<Cred>`) land here
+    without touching call sites.
+  - `ProcessIdentity::cred_snapshot()` → `Option<CredSnapshot>`
+    (`None` for zombies). `ProcessPayload::cred_snapshot()` →
+    `CredSnapshot` (one `AtomicSlot` load + cap deref + value-copy).
+  - `SyscallCtx.cred_snapshot: CredSnapshot` field, captured once
+    in `SyscallCtx::new`. `ctx.cred()` reads from the cached
+    snapshot; `ctx.cred_snapshot()` borrows it; `ctx.walker_cred()`
+    projects directly via the new `From<&CredSnapshot> for
+    vfs::Credential` bridge — every VFS DAC entry traces back to the
+    single syscall-entry snapshot.
+
+  **`cred::checks::*` module** ([cred/checks.rs](../../crates/tx-subsystems/src/cred/checks.rs))
+  — the canonical authorization surface per `cred_service_v_1`
+  §"Checks surface" + §"Cred witnesses":
+  - Witness predicates (zero-sized, guard-bound, `must_use`):
+    `SearchAuthorized<'g>`, `OpenAuthorized<'g>`, plus re-export of
+    the existing `SignalAuthorized<'g>`.
+  - `require_path_search(&CredSnapshot, &InodeMeta, &Guard)` /
+    `require_open(.., OpenFileFlags, &Guard)` — delegate the bit-
+    level DAC math to `vfs::predicates` and wrap the result.
+  - `authorize_signal_send(source, target, sig) -> Result<AuthOutcome,
+    Errno>` + `_under_guard` fanout variant — combinators that
+    fold the repeating snapshot+facts+require sequence into one
+    call, take and drop the auth guard internally so the no-nested-
+    guard discipline is a property of the function (not a hidden
+    contract).
+
+  **`signal::script_*` reworks** ([signal/mod.rs](../../crates/tx-subsystems/src/signal/mod.rs)):
+  - `script_kill_process` / `script_kill_probe` /
+    `script_kill_pgrp_with_guard` rewired through the combinator;
+    `info: Option<SigInfo>` added to `script_kill_process` so the
+    SI_USER block sys_kill builds is preserved.
+  - New `script_deliver_signal(source, target, sig)` —
+    cred-checked counterpart to `deliver_posix_signal`. Resolves
+    Thread→Process before the auth guard scope (`upgrade_owner_proc`
+    takes its own guard).
+
+  **Closed three real cred-bypasses** in
+  [tx-shims/linux_syscall/signal.rs](../../crates/tx-shims/src/linux_syscall/signal.rs):
+  1. `sys_kill` (pid > 0) drove `KillProcessOp` →
+     `step_kill_process` directly, skipping `cred::require_signal_send`.
+     Now routes through `script_kill_process`.
+  2. `sys_kill` (pid == 0 pgrp fanout) called `step_kill_pgrp` —
+     no per-member cred check. Now `script_kill_pgrp`. POSIX-correct
+     behaviour change: returns `-EPERM` when no member was both live
+     AND permitted (was `-ESRCH`).
+  3. `sys_tkill` (thread tid resolved via PidName) drove
+     `DeliverSignalOp` without cred check. Now `script_deliver_signal`.
+  4. `sys_tgkill` left unchanged: tgid==caller-pid constraint means
+     check trivially permitted; comment notes the future migration
+     site for cross-process tgkill.
+
+  **`SyscallResult` / `Errno` bridge**
+  ([result.rs](../../crates/tx-shims/src/linux_syscall/result.rs)):
+  - `SyscallResult::error_from(errno)` + `impl From<Errno> for
+    SyscallResult` — collapses `errno_to_i32` translation at error paths.
+  - `dispatch_errno(Result<T, Errno>, FnOnce(T) -> SyscallResult)`
+    — folds the recurring `match script(...) { Ok(_) => map, Err(e)
+    => Error(errno_to_i32(e)) }` boilerplate.
+  - Mechanical sweep: 164 sites across 14 arm files collapsed from
+    `SyscallResult::Error(errno_to_i32(X))` to
+    `SyscallResult::error_from(X)`.
+
+  **Tests added (8 new):** `cred_snapshot_freezes_value_against_later_mutation`,
+  `cred_snapshot_root_constructor_matches_root_cred`,
+  `cred_snapshot_returns_none_for_zombie`,
+  `require_path_search_passes_for_dac_override`,
+  `require_path_search_denies_without_x_bit`,
+  `require_open_honors_read_and_write_bits`,
+  `script_deliver_signal_to_thread_{denied_for_mismatched_uid,
+  delivers_when_authorized}`, `authorize_signal_send_yields_three_state_outcome`,
+  `dispatch_kill_different_uid_returns_neg_eperm`.
+
+  **Verification:** `cargo -q xtask unit`: tx-shims **230/230** (+1
+  EPERM dispatch test), tx-kernel 44/44, tx-ext4 8/8,
+  tx-scripts 50/50. `cargo test -p tx-subsystems --lib` —
+  **655/655** (+6 cred/signal tests, 11 ignored).
+
+  Commits:
+  - `68c5499` cred: lift syscall-entry CredSnapshot to first-class type
+  - `0b45030` cred: thread CredSnapshot through signal authorization checks
+  - `446b553` cred: project CredSnapshot directly into VFS walker Credential
+  - `a2dbf80` cred: land cred::checks witness API per cred_service_v_1
+  - `32769d4` cred: enforce kill permission at sys_kill via script_kill_process
+  - `6d27c78` cred: close remaining kill-family permission bypasses
+  - `b737739` cred: extract authorize_signal_send combinator (snapshot + facts + check)
+  - `4ac80d8` tx-shims: land SyscallResult::error_from + dispatch_errno bridges
+
+  **Scope gaps (deferred, not regressed):** Supplementary group list,
+  `fsuid`/`fsgid`, capability bounding/inheritable/ambient sets, full
+  `capset` semantics — all still day-1 elisions per the original
+  `cred_service_v_1` deferred list. `RestrictionStackHandle` remains
+  a placeholder zone (PR-K territory). `cred::checks::*` covers
+  path_search / open / signal_send; `require_unlink` / `require_chmod`
+  / `require_setuid` land alongside the syscall arms that need them.
+
+  **Next step:** Either write the `docs/progress/decisions/` deep
+  dive (this STATUS entry is the summary), or pick up the next
+  cred-adjacent gap — `cred::checks::require_unlink` + migration of
+  one VFS execution call site to consume the witness end-to-end.
 
 - 2026-05-18 **ext4 mount-time RO/RW distinction + Linux `MS_RDONLY` honoured.**
   Previously `mount_ext4_read_only` was the only entry point and its
