@@ -1535,7 +1535,11 @@ async fn sys_write_socket(
         flags |= tx_subsystems::net::SendRecvFlags::MSG_DONTWAIT;
     }
 
-    if socket.kind == tx_subsystems::net::SocketKind::NetlinkRoute {
+    if matches!(
+        socket.kind,
+        tx_subsystems::net::SocketKind::NetlinkRoute
+            | tx_subsystems::net::SocketKind::NetlinkNetfilter
+    ) {
         let mut resolve_netns_fd = |fd: i32| {
             if fd < 0 {
                 return None;
@@ -1547,13 +1551,22 @@ async fn sys_write_socket(
             let process = process_by_pid(Pid(pid))?;
             process.net_namespace()
         };
-        return match tx_subsystems::net::netlink_route_send_with_netns_resolvers(
-            &socket,
-            bytes,
-            ctx.cred(),
-            &mut resolve_netns_fd,
-            &mut resolve_netns_pid,
-        ) {
+        let result = match socket.kind {
+            tx_subsystems::net::SocketKind::NetlinkRoute => {
+                tx_subsystems::net::netlink_route_send_with_netns_resolvers(
+                    &socket,
+                    bytes,
+                    ctx.cred(),
+                    &mut resolve_netns_fd,
+                    &mut resolve_netns_pid,
+                )
+            }
+            tx_subsystems::net::SocketKind::NetlinkNetfilter => {
+                tx_subsystems::net::netlink_netfilter_send(&socket, bytes, ctx.cred())
+            }
+            _ => unreachable!(),
+        };
+        return match result {
             Ok(sent) => SyscallResult::Return(sent as i64),
             Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
         };
@@ -2403,9 +2416,22 @@ async fn sys_read_socket<'a>(
     }
     let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len.min(TTY_WRITE_MAX_INLINE)];
 
-    if socket.kind == tx_subsystems::net::SocketKind::NetlinkRoute {
+    if matches!(
+        socket.kind,
+        tx_subsystems::net::SocketKind::NetlinkRoute
+            | tx_subsystems::net::SocketKind::NetlinkNetfilter
+    ) {
         loop {
-            match tx_subsystems::net::netlink_route_recv(&socket, &mut staging, flags) {
+            let result = match socket.kind {
+                tx_subsystems::net::SocketKind::NetlinkRoute => {
+                    tx_subsystems::net::netlink_route_recv(&socket, &mut staging, flags)
+                }
+                tx_subsystems::net::SocketKind::NetlinkNetfilter => {
+                    tx_subsystems::net::netlink_netfilter_recv(&socket, &mut staging, flags)
+                }
+                _ => unreachable!(),
+            };
+            match result {
                 Ok(recv) => {
                     if recv > 0 {
                         if let Err(errno) =

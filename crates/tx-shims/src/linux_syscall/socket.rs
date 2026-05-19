@@ -9,13 +9,13 @@ use super::*;
 
 use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
 use tx_subsystems::net::{
-    net_namespace_payload_from_file, netlink_route_recv, netlink_route_send_with_netns_resolvers,
-    socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
-    step_poll_ready, step_poll_wait_token, step_recv_kernel_bytes, step_send_to_kernel_bytes,
-    step_shutdown, step_socket_close, step_socket_open_file_in_namespace,
-    step_tcp_loopback_transfer, IpEndpoint, Ipv4Address, KernelSockAddr, LingerOption, PollMask,
-    SendRecvFlags, SockAddrIn, SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind,
-    SocketProtocol, TcpState, UdpInner,
+    net_namespace_payload_from_file, netlink_netfilter_recv, netlink_netfilter_send,
+    netlink_route_recv, netlink_route_send_with_netns_resolvers, socket_open_file_from_identity,
+    step_accept, step_bind, step_connect, step_listen, step_poll_ready, step_poll_wait_token,
+    step_recv_kernel_bytes, step_send_to_kernel_bytes, step_shutdown, step_socket_close,
+    step_socket_open_file_in_namespace, step_tcp_loopback_transfer, IpEndpoint, Ipv4Address,
+    KernelSockAddr, LingerOption, PollMask, SendRecvFlags, SockAddrIn, SockShutdownCmd,
+    SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol, TcpState, UdpInner,
 };
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::wait_source;
@@ -91,7 +91,10 @@ pub(super) fn sys_bind<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
         Ok((_, socket)) => socket,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
-    if socket.kind == SocketKind::NetlinkRoute {
+    if matches!(
+        socket.kind,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
+    ) {
         return match read_sockaddr_nl(ctx, args[1], args[2]) {
             Ok(()) => SyscallResult::Return(0),
             Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
@@ -374,7 +377,10 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         flags |= SendRecvFlags::MSG_DONTWAIT;
     }
 
-    if socket.kind == SocketKind::NetlinkRoute {
+    if matches!(
+        socket.kind,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
+    ) {
         if args[4] != 0 {
             if let Err(errno) = read_sockaddr_nl(ctx, args[4], args[5]) {
                 return SyscallResult::Error(errno_to_i32(errno));
@@ -395,13 +401,18 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             let process = process_by_pid(Pid(pid))?;
             process.net_namespace()
         };
-        return match netlink_route_send_with_netns_resolvers(
-            &socket,
-            &bytes,
-            ctx.cred(),
-            &mut resolve_netns_fd,
-            &mut resolve_netns_pid,
-        ) {
+        let result = match socket.kind {
+            SocketKind::NetlinkRoute => netlink_route_send_with_netns_resolvers(
+                &socket,
+                &bytes,
+                ctx.cred(),
+                &mut resolve_netns_fd,
+                &mut resolve_netns_pid,
+            ),
+            SocketKind::NetlinkNetfilter => netlink_netfilter_send(&socket, &bytes, ctx.cred()),
+            _ => unreachable!(),
+        };
+        return match result {
             Ok(sent) => SyscallResult::Return(sent as i64),
             Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
         };
@@ -505,9 +516,17 @@ pub(super) async fn sys_recvfrom<'a, P: TimeIf>(
         return SyscallResult::Return(0);
     }
 
-    if socket.kind == SocketKind::NetlinkRoute {
+    if matches!(
+        socket.kind,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
+    ) {
         let mut staging = alloc::vec![0; len.min(TTY_WRITE_MAX_INLINE)];
-        let recv = match netlink_route_recv(&socket, &mut staging, flags) {
+        let result = match socket.kind {
+            SocketKind::NetlinkRoute => netlink_route_recv(&socket, &mut staging, flags),
+            SocketKind::NetlinkNetfilter => netlink_netfilter_recv(&socket, &mut staging, flags),
+            _ => unreachable!(),
+        };
+        let recv = match result {
             Ok(recv) => recv,
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         };
@@ -583,7 +602,10 @@ pub(super) async fn sys_sendmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         flags |= SendRecvFlags::MSG_DONTWAIT;
     }
 
-    if socket.kind == SocketKind::NetlinkRoute {
+    if matches!(
+        socket.kind,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
+    ) {
         if header.name != 0 {
             if let Err(errno) = read_sockaddr_nl(ctx, header.name, header.namelen as u64) {
                 return SyscallResult::Error(errno_to_i32(errno));
@@ -623,13 +645,18 @@ pub(super) async fn sys_sendmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
             let process = process_by_pid(Pid(pid))?;
             process.net_namespace()
         };
-        return match netlink_route_send_with_netns_resolvers(
-            &socket,
-            &bytes,
-            ctx.cred(),
-            &mut resolve_netns_fd,
-            &mut resolve_netns_pid,
-        ) {
+        let result = match socket.kind {
+            SocketKind::NetlinkRoute => netlink_route_send_with_netns_resolvers(
+                &socket,
+                &bytes,
+                ctx.cred(),
+                &mut resolve_netns_fd,
+                &mut resolve_netns_pid,
+            ),
+            SocketKind::NetlinkNetfilter => netlink_netfilter_send(&socket, &bytes, ctx.cred()),
+            _ => unreachable!(),
+        };
+        return match result {
             Ok(sent) => SyscallResult::Return(sent as i64),
             Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
         };
@@ -648,7 +675,10 @@ pub(super) async fn sys_sendmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         Ok(iovecs) => iovecs,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
-    let total_len = match if socket.kind == SocketKind::NetlinkRoute {
+    let total_len = match if matches!(
+        socket.kind,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
+    ) {
         iov_total_len_with_limit(&iovecs, NETLINK_RECVMSG_MAX)
     } else {
         iov_total_len(&iovecs)
@@ -747,7 +777,10 @@ pub(super) async fn sys_recvmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         Ok(iovecs) => iovecs,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
-    let total_len = match if socket.kind == SocketKind::NetlinkRoute {
+    let total_len = match if matches!(
+        socket.kind,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
+    ) {
         iov_total_len_with_limit(&iovecs, NETLINK_RECVMSG_MAX)
     } else {
         iov_total_len(&iovecs)
@@ -765,9 +798,17 @@ pub(super) async fn sys_recvmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         return SyscallResult::Return(0);
     }
 
-    if socket.kind == SocketKind::NetlinkRoute {
+    if matches!(
+        socket.kind,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
+    ) {
         let mut staging = alloc::vec![0; total_len];
-        let recv = match netlink_route_recv(&socket, &mut staging, flags) {
+        let result = match socket.kind {
+            SocketKind::NetlinkRoute => netlink_route_recv(&socket, &mut staging, flags),
+            SocketKind::NetlinkNetfilter => netlink_netfilter_recv(&socket, &mut staging, flags),
+            _ => unreachable!(),
+        };
+        let recv = match result {
             Ok(recv) => recv,
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         };
@@ -1399,9 +1440,9 @@ fn socket_local_endpoint(socket: &Cap<SocketIdentity>) -> Result<IpEndpoint, Err
         SocketProtocol::Tcp(TcpState::Init) | SocketProtocol::Udp(UdpInner::Unbound) => {
             Ok(IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0))
         }
-        SocketProtocol::UnixDatagram | SocketProtocol::NetlinkRoute(_) => {
-            Ok(IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0))
-        }
+        SocketProtocol::UnixDatagram
+        | SocketProtocol::NetlinkRoute(_)
+        | SocketProtocol::NetlinkNetfilter(_) => Ok(IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0)),
         SocketProtocol::Tcp(TcpState::Closed) | SocketProtocol::Udp(UdpInner::Closed) => {
             Err(Errno::ENOTCONN)
         }
@@ -1589,7 +1630,7 @@ fn socket_type_i32(socket: &Cap<SocketIdentity>) -> i32 {
         SocketKind::Tcp => 1,
         SocketKind::Udp => 2,
         SocketKind::RawIcmp => 3,
-        SocketKind::NetlinkRoute => 3,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter => 3,
     }
 }
 
