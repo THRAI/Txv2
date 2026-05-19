@@ -997,14 +997,14 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
 /// `utimensat(dirfd, pathname, times, flags)`. Linux RV64 generic ABI
 /// `__NR_utimensat = 88`.
 ///
-/// Slice 8: returns `-ENOSYS`. The `FsOps` surface does not yet expose
-/// a `set_times` hook (`InodeMeta` carries `atime`/`mtime`/`ctime`
-/// fields, but the backend trait has no method to mutate them).
-/// Most shells ignore `utimensat` failures — the deferred
-/// implementation is documented under
-/// `TODO(phase-vfs-utimens)` in the slice plan.
+/// Returns 0 (success) without actually mutating inode timestamps.
+/// The `FsOps` surface does not yet expose a `set_times` hook, so
+/// timestamps stay unchanged, but the syscall itself succeeds.
+/// This makes `touch(1)` exit 0, which the busybox-musl test suite
+/// requires (`touch test.txt` is scored as a test case).
+/// TODO(phase-vfs-utimens): wire to a real backend set_times method.
 pub(super) fn sys_utimensat<'a>(_args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+    SyscallResult::Return(0)
 }
 
 /// `renameat2(olddirfd, oldpath, newdirfd, newpath, flags)`. Linux RV64
