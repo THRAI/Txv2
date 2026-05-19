@@ -204,9 +204,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     // search-on-ancestors; without this, any user that could
     // search the parent could create a directory there.
     let parent_meta = parent_dentry.rnode().meta();
-    if let Err(e) =
-        cred_checks::authorize_link(ctx.cred_snapshot(), &parent_meta)
-    {
+    if let Err(e) = cred_checks::authorize_link(ctx.cred_snapshot(), &parent_meta) {
         return SyscallResult::error_from(e);
     }
     // Apply umask: effective_mode = mode & !umask. Linux semantics
@@ -290,11 +288,7 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     // this check.
     let parent_meta = parent_dentry.rnode().meta();
     let child_meta = target_dentry.rnode().meta();
-    if let Err(e) = cred_checks::authorize_unlink(
-        ctx.cred_snapshot(),
-        &parent_meta,
-        &child_meta,
-    ) {
+    if let Err(e) = cred_checks::authorize_unlink(ctx.cred_snapshot(), &parent_meta, &child_meta) {
         return SyscallResult::error_from(e);
     }
     let outcome = {
@@ -367,9 +361,7 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     // as link / mkdir — sticky not consulted because symlink only
     // creates an entry).
     let parent_meta = parent_dentry.rnode().meta();
-    if let Err(e) =
-        cred_checks::authorize_link(ctx.cred_snapshot(), &parent_meta)
-    {
+    if let Err(e) = cred_checks::authorize_link(ctx.cred_snapshot(), &parent_meta) {
         return SyscallResult::error_from(e);
     }
     let outcome = {
@@ -457,9 +449,7 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     // there. Routes through cred::checks::require_link so the
     // witness chain is intact at the FsOps mint site.
     let new_parent_meta = new_parent_dentry.rnode().meta();
-    if let Err(e) =
-        cred_checks::authorize_link(ctx.cred_snapshot(), &new_parent_meta)
-    {
+    if let Err(e) = cred_checks::authorize_link(ctx.cred_snapshot(), &new_parent_meta) {
         return SyscallResult::error_from(e);
     }
     let outcome = {
@@ -691,8 +681,9 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     };
     let cred = ctx.walker_cred();
 
-    let guard = step_engine::guard();
-
+    // No outer guard here: `walk_from` acquires its own internal
+    // guard (fs_path.rs), and txKernel's epoch discipline panics
+    // on nested guards (`tx-substrate::epoch::local:55`).
     let target_dentry = match walk_from(cwd.clone(), &target, &cred) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
@@ -713,6 +704,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         };
+        let guard = step_engine::guard();
         match mount::bind_mount(source_dentry, target_dentry, &parent_payload, &guard) {
             Ok(_) => return SyscallResult::Return(0),
             Err(e) => return SyscallResult::error_from(e),
