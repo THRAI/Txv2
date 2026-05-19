@@ -5,11 +5,11 @@ use super::*;
 
 use crate::linux_syscall::{
     AF_INET, AF_NETLINK, AF_UNIX, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_UDP,
-    IP_RECVERR, NETLINK_ROUTE, NR_BIND, NR_CLOSE, NR_CONNECT, NR_FCNTL, NR_GETSOCKNAME,
-    NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PPOLL, NR_PSELECT6, NR_RECVFROM, NR_RECVMSG, NR_SENDMSG,
-    NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET, O_CLOEXEC, O_NONBLOCK, O_RDWR, SIOCGIFFLAGS, SIOCGIFINDEX,
-    SIOCGIFTXQLEN, SIOCSIFFLAGS, SOL_SOCKET, SO_DONTROUTE, SO_ERROR, SO_RCVTIMEO, SO_REUSEADDR,
-    SO_TYPE,
+    IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO, IPT_SO_SET_REPLACE, IP_RECVERR, NETLINK_ROUTE, NR_BIND,
+    NR_CLOSE, NR_CONNECT, NR_FCNTL, NR_GETSOCKNAME, NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PPOLL,
+    NR_PSELECT6, NR_RECVFROM, NR_RECVMSG, NR_SENDMSG, NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET,
+    O_CLOEXEC, O_NONBLOCK, O_RDWR, SIOCGIFFLAGS, SIOCGIFINDEX, SIOCGIFTXQLEN, SIOCSIFFLAGS,
+    SOL_SOCKET, SO_DONTROUTE, SO_ERROR, SO_RCVTIMEO, SO_REUSEADDR, SO_TYPE,
 };
 use alloc::vec;
 use alloc::vec::Vec;
@@ -31,6 +31,8 @@ const NLM_F_REQUEST: u16 = 0x0001;
 const NLM_F_DUMP: u16 = 0x0300;
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
+const IPT_GETINFO_BYTES: usize = 84;
+const IPT_GET_ENTRIES_EMPTY_BYTES: usize = 36;
 
 #[repr(C)]
 struct TestIovec {
@@ -768,6 +770,67 @@ fn dispatch_setsockopt_getsockopt_round_trips_ip_recverr() {
     );
     assert_eq!(out, 1);
     assert_eq!(out_len, core::mem::size_of::<i32>() as u32);
+}
+
+#[test]
+fn dispatch_iptables_legacy_sockopt_reports_empty_tables() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_dgram(&ctx, SOCK_DGRAM);
+
+    let mut info = [0xaa; IPT_GETINFO_BYTES];
+    let mut info_len: u32 = info.len() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IPT_SO_GET_INFO as u64,
+                info.as_mut_ptr() as u64,
+                (&mut info_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(info_len, IPT_GETINFO_BYTES as u32);
+
+    let mut entries = [0xaa; IPT_GET_ENTRIES_EMPTY_BYTES];
+    let mut entries_len: u32 = entries.len() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IPT_SO_GET_ENTRIES as u64,
+                entries.as_mut_ptr() as u64,
+                (&mut entries_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(entries_len, IPT_GET_ENTRIES_EMPTY_BYTES as u32);
+
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IPT_SO_SET_REPLACE as u64,
+                info.as_ptr() as u64,
+                info.len() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(95)
+    );
 }
 
 #[test]

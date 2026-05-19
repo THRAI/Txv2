@@ -1199,6 +1199,88 @@ fn netfilter_masquerades_tcp_tuple_and_rewrites_reply_checksum() {
 }
 
 #[test]
+fn netfilter_dnat_published_tcp_port_and_rewrites_reply_checksum() {
+    reset_netfilter_for_test();
+    let public_ip = Ipv4Address::new([10, 0, 2, 15]);
+    let private_ip = Ipv4Address::new([172, 17, 0, 2]);
+    let client_ip = Ipv4Address::new([198, 51, 100, 8]);
+    add_dnat_rule_for_test_or_bootstrap(
+        NetfilterConntrackProtocol::Tcp,
+        public_ip,
+        8080,
+        private_ip,
+        80,
+    )
+    .expect("dnat rule");
+
+    let syn = tcp_ipv4_packet(
+        IpEndpoint::new(client_ip, 40_000),
+        IpEndpoint::new(public_ip, 8080),
+        smoltcp::wire::TcpControl::Syn,
+        None,
+    );
+    let forwarded = apply_prerouting_nat_ipv4(
+        NetfilterFrameContext {
+            hook: NetfilterHook::Prerouting,
+            bridge: None,
+            ingress: Some("uplink-dnat0"),
+            egress: None,
+        },
+        syn.as_slice(),
+    )
+    .expect("published port dnat");
+    let ipv4 = smoltcp::wire::Ipv4Packet::new_checked(forwarded.as_slice()).expect("dnat ipv4");
+    assert_eq!(Ipv4Address::new(ipv4.src_addr().octets()), client_ip);
+    assert_eq!(Ipv4Address::new(ipv4.dst_addr().octets()), private_ip);
+    let tcp = smoltcp::wire::TcpPacket::new_checked(ipv4.payload()).expect("dnat tcp");
+    assert_eq!(tcp.src_port(), 40_000);
+    assert_eq!(tcp.dst_port(), 80);
+    assert!(tcp.verify_checksum(
+        &smoltcp::wire::IpAddress::Ipv4(ipv4.src_addr()),
+        &smoltcp::wire::IpAddress::Ipv4(ipv4.dst_addr()),
+    ));
+
+    let entry = netfilter_conntrack_snapshot()
+        .into_iter()
+        .find(|entry| entry.kind == NetfilterNatKind::Dnat)
+        .expect("dnat conntrack");
+    assert_eq!(entry.original_src, private_ip);
+    assert_eq!(entry.original_src_port, 80);
+    assert_eq!(entry.masquerade_src, public_ip);
+    assert_eq!(entry.masquerade_src_port, 8080);
+    assert_eq!(entry.external_dst, client_ip);
+    assert_eq!(entry.external_dst_port, 40_000);
+
+    let syn_ack = tcp_ipv4_packet(
+        IpEndpoint::new(private_ip, 80),
+        IpEndpoint::new(client_ip, 40_000),
+        smoltcp::wire::TcpControl::Syn,
+        Some(2),
+    );
+    let reply = apply_postrouting_nat_ipv4(
+        NetfilterFrameContext {
+            hook: NetfilterHook::Postrouting,
+            bridge: None,
+            ingress: Some("docker-dnat0"),
+            egress: Some("uplink-dnat0"),
+        },
+        syn_ack.as_slice(),
+        public_ip,
+    )
+    .expect("published port reply rewrite");
+    let ipv4 = smoltcp::wire::Ipv4Packet::new_checked(reply.as_slice()).expect("reply ipv4");
+    assert_eq!(Ipv4Address::new(ipv4.src_addr().octets()), public_ip);
+    assert_eq!(Ipv4Address::new(ipv4.dst_addr().octets()), client_ip);
+    let tcp = smoltcp::wire::TcpPacket::new_checked(ipv4.payload()).expect("reply tcp");
+    assert_eq!(tcp.src_port(), 8080);
+    assert_eq!(tcp.dst_port(), 40_000);
+    assert!(tcp.verify_checksum(
+        &smoltcp::wire::IpAddress::Ipv4(ipv4.src_addr()),
+        &smoltcp::wire::IpAddress::Ipv4(ipv4.dst_addr()),
+    ));
+}
+
+#[test]
 fn bridge_add_port_requires_cap_net_admin_authority() {
     let bridge = new_test_bridge("docker2", 86);
     let pair = new_bridge_veth_pair("ct-a2", "veth-a2", 86);

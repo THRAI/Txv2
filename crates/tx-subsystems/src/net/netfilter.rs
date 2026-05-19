@@ -51,6 +51,7 @@ pub enum NetfilterTarget {
     Accept,
     Drop,
     Masquerade,
+    Dnat,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,9 +64,15 @@ pub struct NetfilterIpv4Cidr {
 pub struct NetfilterRule {
     pub table: NetfilterTable,
     pub hook: NetfilterHook,
+    pub protocol: Option<NetfilterConntrackProtocol>,
     pub src: Option<NetfilterIpv4Cidr>,
+    pub dst: Option<NetfilterIpv4Cidr>,
+    pub dst_port: Option<u16>,
+    pub in_iface: Option<&'static str>,
     pub out_iface: Option<&'static str>,
     pub target: NetfilterTarget,
+    pub to_addr: Option<Ipv4Address>,
+    pub to_port: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +84,7 @@ pub enum NetfilterConntrackProtocol {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NetfilterConntrackSnapshot {
+    pub kind: NetfilterNatKind,
     pub protocol: NetfilterConntrackProtocol,
     pub original_src: Ipv4Address,
     pub original_src_port: u16,
@@ -85,6 +93,12 @@ pub struct NetfilterConntrackSnapshot {
     pub external_dst: Ipv4Address,
     pub external_dst_port: u16,
     pub icmp_ident: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetfilterNatKind {
+    Masquerade,
+    Dnat,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -107,6 +121,7 @@ struct NetfilterStats {
 static NETFILTER_STATS: NetfilterStats = NetfilterStats::new();
 static NETFILTER_RULES: SpinMutex<Vec<NetfilterRule>> = SpinMutex::new(Vec::new());
 static NETFILTER_CONNTRACK: SpinMutex<Vec<MasqueradeConntrack>> = SpinMutex::new(Vec::new());
+static NETFILTER_DNAT_CONNTRACK: SpinMutex<Vec<DnatConntrack>> = SpinMutex::new(Vec::new());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MasqueradeConntrack {
@@ -117,6 +132,17 @@ struct MasqueradeConntrack {
     masquerade_src_port: u16,
     external_dst: Ipv4Address,
     external_dst_port: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DnatConntrack {
+    protocol: NetfilterConntrackProtocol,
+    client_src: Ipv4Address,
+    client_src_port: u16,
+    public_dst: Ipv4Address,
+    public_dst_port: u16,
+    private_dst: Ipv4Address,
+    private_dst_port: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -180,7 +206,9 @@ pub fn run_frame_hook(ctx: NetfilterFrameContext, _frame: &[u8]) -> NetfilterVer
         }
         return match rule.target {
             NetfilterTarget::Drop => NetfilterVerdict::Drop,
-            NetfilterTarget::Accept | NetfilterTarget::Masquerade => NetfilterVerdict::Accept,
+            NetfilterTarget::Accept | NetfilterTarget::Masquerade | NetfilterTarget::Dnat => {
+                NetfilterVerdict::Accept
+            }
         };
     }
     NetfilterVerdict::Accept
@@ -191,6 +219,14 @@ pub fn add_netfilter_rule_for_test_or_bootstrap(rule: NetfilterRule) -> Result<(
         if src.prefix_len > 32 {
             return Err(Errno::EINVAL);
         }
+    }
+    if let Some(dst) = rule.dst {
+        if dst.prefix_len > 32 {
+            return Err(Errno::EINVAL);
+        }
+    }
+    if rule.target == NetfilterTarget::Dnat && rule.to_addr.is_none() {
+        return Err(Errno::EINVAL);
     }
     NETFILTER_RULES.lock().push(rule);
     Ok(())
@@ -203,9 +239,40 @@ pub fn add_masquerade_rule_for_test_or_bootstrap(
     add_netfilter_rule_for_test_or_bootstrap(NetfilterRule {
         table: NetfilterTable::Nat,
         hook: NetfilterHook::Postrouting,
+        protocol: None,
         src: Some(src),
+        dst: None,
+        dst_port: None,
+        in_iface: None,
         out_iface: Some(out_iface),
         target: NetfilterTarget::Masquerade,
+        to_addr: None,
+        to_port: None,
+    })
+}
+
+pub fn add_dnat_rule_for_test_or_bootstrap(
+    protocol: NetfilterConntrackProtocol,
+    public_dst: Ipv4Address,
+    public_port: u16,
+    private_dst: Ipv4Address,
+    private_port: u16,
+) -> Result<(), Errno> {
+    add_netfilter_rule_for_test_or_bootstrap(NetfilterRule {
+        table: NetfilterTable::Nat,
+        hook: NetfilterHook::Prerouting,
+        protocol: Some(protocol),
+        src: None,
+        dst: Some(NetfilterIpv4Cidr {
+            addr: public_dst,
+            prefix_len: 32,
+        }),
+        dst_port: Some(public_port),
+        in_iface: None,
+        out_iface: None,
+        target: NetfilterTarget::Dnat,
+        to_addr: Some(private_dst),
+        to_port: Some(private_port),
     })
 }
 
@@ -221,6 +288,34 @@ pub fn remove_netfilter_rule_for_test_or_bootstrap(index: usize) -> Result<(), E
 pub fn flush_netfilter_rules_and_conntrack_for_test_or_bootstrap() {
     NETFILTER_RULES.lock().clear();
     NETFILTER_CONNTRACK.lock().clear();
+    NETFILTER_DNAT_CONNTRACK.lock().clear();
+}
+
+pub fn cleanup_netfilter_device_state_for_test_or_bootstrap(
+    iface_name: &'static str,
+    ipv4_addr: Option<Ipv4Address>,
+) {
+    NETFILTER_RULES.lock().retain(|rule| {
+        let touches_iface = rule.in_iface == Some(iface_name) || rule.out_iface == Some(iface_name);
+        let touches_addr = ipv4_addr.is_some_and(|addr| {
+            rule.to_addr == Some(addr)
+                || rule
+                    .src
+                    .is_some_and(|cidr| cidr.prefix_len == 32 && cidr.addr == addr)
+                || rule
+                    .dst
+                    .is_some_and(|cidr| cidr.prefix_len == 32 && cidr.addr == addr)
+        });
+        !touches_iface && !touches_addr
+    });
+    if let Some(addr) = ipv4_addr {
+        NETFILTER_CONNTRACK.lock().retain(|entry| {
+            entry.original_src != addr && entry.masquerade_src != addr && entry.external_dst != addr
+        });
+        NETFILTER_DNAT_CONNTRACK.lock().retain(|entry| {
+            entry.client_src != addr && entry.public_dst != addr && entry.private_dst != addr
+        });
+    }
 }
 
 pub fn netfilter_rules_snapshot() -> Vec<NetfilterRule> {
@@ -228,11 +323,12 @@ pub fn netfilter_rules_snapshot() -> Vec<NetfilterRule> {
 }
 
 pub fn netfilter_conntrack_snapshot() -> Vec<NetfilterConntrackSnapshot> {
-    NETFILTER_CONNTRACK
+    let mut out: Vec<_> = NETFILTER_CONNTRACK
         .lock()
         .iter()
         .copied()
         .map(|entry| NetfilterConntrackSnapshot {
+            kind: NetfilterNatKind::Masquerade,
             protocol: entry.protocol,
             original_src: entry.original_src,
             original_src_port: entry.original_src_port,
@@ -246,7 +342,25 @@ pub fn netfilter_conntrack_snapshot() -> Vec<NetfilterConntrackSnapshot> {
                 0
             },
         })
-        .collect()
+        .collect();
+    out.extend(
+        NETFILTER_DNAT_CONNTRACK
+            .lock()
+            .iter()
+            .copied()
+            .map(|entry| NetfilterConntrackSnapshot {
+                kind: NetfilterNatKind::Dnat,
+                protocol: entry.protocol,
+                original_src: entry.private_dst,
+                original_src_port: entry.private_dst_port,
+                masquerade_src: entry.public_dst,
+                masquerade_src_port: entry.public_dst_port,
+                external_dst: entry.client_src,
+                external_dst_port: entry.client_src_port,
+                icmp_ident: 0,
+            }),
+    );
+    out
 }
 
 pub fn apply_netfilter_control_command(
@@ -284,22 +398,53 @@ pub fn apply_netfilter_control_command(
             }
             add_masquerade_rule_for_test_or_bootstrap(cidr, out_iface)
         }
+        "dnat" => {
+            let protocol = parse_protocol(parts.next().ok_or(Errno::EINVAL)?)?;
+            let public_dst = parse_ipv4(parts.next().ok_or(Errno::EINVAL)?)?;
+            let public_port = parse_u16(parts.next().ok_or(Errno::EINVAL)?)?;
+            let private_dst = parse_ipv4(parts.next().ok_or(Errno::EINVAL)?)?;
+            let private_port = parse_u16(parts.next().ok_or(Errno::EINVAL)?)?;
+            if parts.next().is_some() {
+                return Err(Errno::EINVAL);
+            }
+            add_dnat_rule_for_test_or_bootstrap(
+                protocol,
+                public_dst,
+                public_port,
+                private_dst,
+                private_port,
+            )
+        }
         "filter" => {
             let hook = parse_hook(parts.next().ok_or(Errno::EINVAL)?)?;
             let target = parse_target(parts.next().ok_or(Errno::EINVAL)?)?;
             let mut out_iface = None;
+            let mut in_iface = None;
             for part in parts {
-                let Some(name) = part.strip_prefix("out=") else {
+                if let Some(name) = part.strip_prefix("out=") {
+                    out_iface = Some(resolve_iface_name(netns, name)?);
+                    continue;
+                }
+                if let Some(name) = part.strip_prefix("in=") {
+                    in_iface = Some(resolve_iface_name(netns, name)?);
+                    continue;
+                }
+                {
                     return Err(Errno::EINVAL);
-                };
-                out_iface = Some(resolve_iface_name(netns, name)?);
+                }
             }
             add_netfilter_rule_for_test_or_bootstrap(NetfilterRule {
                 table: NetfilterTable::Filter,
                 hook,
+                protocol: None,
                 src: None,
+                dst: None,
+                dst_port: None,
+                in_iface,
                 out_iface,
                 target,
+                to_addr: None,
+                to_port: None,
             })
         }
         _ => Err(Errno::EINVAL),
@@ -315,12 +460,24 @@ pub fn apply_postrouting_nat_ipv4(
     let src = from_smoltcp_ipv4(ipv4.src_addr());
     let dst = from_smoltcp_ipv4(ipv4.dst_addr());
     let tuple = l4_tuple(ipv4.next_header(), src, dst, ipv4.payload())?;
+    if let Some(entry) = find_dnat_reply(src, dst, tuple) {
+        return rewrite_ipv4_nat(
+            packet,
+            Some(entry.public_dst),
+            None,
+            Some(entry.public_dst_port),
+            None,
+        );
+    }
     if !NETFILTER_RULES.lock().iter().copied().any(|rule| {
         rule.table == NetfilterTable::Nat
             && rule.hook == NetfilterHook::Postrouting
             && rule.target == NetfilterTarget::Masquerade
             && rule_matches_context(rule, ctx)
+            && rule_matches_l4(rule, tuple)
             && rule.src.map_or(true, |cidr| ipv4_in_cidr(src, cidr))
+            && rule.dst.map_or(true, |cidr| ipv4_in_cidr(dst, cidr))
+            && rule.dst_port.map_or(true, |port| tuple.dst_port == port)
     }) {
         return None;
     }
@@ -344,11 +501,26 @@ pub fn apply_postrouting_nat_ipv4(
 }
 
 pub fn apply_prerouting_nat_ipv4(ctx: NetfilterFrameContext, packet: &[u8]) -> Option<Vec<u8>> {
-    let _ctx = ctx;
     let ipv4 = Ipv4Packet::new_checked(packet).ok()?;
     let src = from_smoltcp_ipv4(ipv4.src_addr());
     let dst = from_smoltcp_ipv4(ipv4.dst_addr());
     let tuple = l4_tuple(ipv4.next_header(), src, dst, ipv4.payload())?;
+
+    if let Some(rule) = find_dnat_rule(ctx, src, dst, tuple) {
+        let private_dst = rule.to_addr?;
+        let private_port = rule.to_port.unwrap_or(tuple.dst_port);
+        remember_dnat(DnatConntrack {
+            protocol: tuple.protocol,
+            client_src: src,
+            client_src_port: tuple.src_port,
+            public_dst: dst,
+            public_dst_port: tuple.dst_port,
+            private_dst,
+            private_dst_port: private_port,
+        });
+        return rewrite_ipv4_nat(packet, None, Some(private_dst), None, Some(private_port));
+    }
+
     let entry = NETFILTER_CONNTRACK
         .lock()
         .iter()
@@ -385,12 +557,44 @@ pub fn reset_netfilter_for_test() {
 }
 
 fn rule_matches_context(rule: NetfilterRule, ctx: NetfilterFrameContext) -> bool {
+    if let Some(in_iface) = rule.in_iface {
+        if ctx.ingress != Some(in_iface) {
+            return false;
+        }
+    }
     if let Some(out_iface) = rule.out_iface {
         if ctx.egress != Some(out_iface) {
             return false;
         }
     }
     true
+}
+
+fn rule_matches_l4(rule: NetfilterRule, tuple: L4Tuple) -> bool {
+    if let Some(protocol) = rule.protocol {
+        if protocol != tuple.protocol {
+            return false;
+        }
+    }
+    true
+}
+
+fn find_dnat_rule(
+    ctx: NetfilterFrameContext,
+    src: Ipv4Address,
+    dst: Ipv4Address,
+    tuple: L4Tuple,
+) -> Option<NetfilterRule> {
+    NETFILTER_RULES.lock().iter().copied().find(|rule| {
+        rule.table == NetfilterTable::Nat
+            && rule.hook == NetfilterHook::Prerouting
+            && rule.target == NetfilterTarget::Dnat
+            && rule_matches_context(*rule, ctx)
+            && rule_matches_l4(*rule, tuple)
+            && rule.src.map_or(true, |cidr| ipv4_in_cidr(src, cidr))
+            && rule.dst.map_or(true, |cidr| ipv4_in_cidr(dst, cidr))
+            && rule.dst_port.map_or(true, |port| tuple.dst_port == port)
+    })
 }
 
 fn remember_masquerade(entry: MasqueradeConntrack) {
@@ -408,6 +612,37 @@ fn remember_masquerade(entry: MasqueradeConntrack) {
         return;
     }
     conntrack.push(entry);
+}
+
+fn remember_dnat(entry: DnatConntrack) {
+    let mut conntrack = NETFILTER_DNAT_CONNTRACK.lock();
+    if let Some(existing) = conntrack.iter_mut().find(|existing| {
+        existing.protocol == entry.protocol
+            && existing.client_src == entry.client_src
+            && existing.client_src_port == entry.client_src_port
+            && existing.public_dst == entry.public_dst
+            && existing.public_dst_port == entry.public_dst_port
+            && existing.private_dst == entry.private_dst
+            && existing.private_dst_port == entry.private_dst_port
+    }) {
+        *existing = entry;
+        return;
+    }
+    conntrack.push(entry);
+}
+
+fn find_dnat_reply(src: Ipv4Address, dst: Ipv4Address, tuple: L4Tuple) -> Option<DnatConntrack> {
+    NETFILTER_DNAT_CONNTRACK
+        .lock()
+        .iter()
+        .copied()
+        .find(|entry| {
+            entry.protocol == tuple.protocol
+                && entry.private_dst == src
+                && entry.private_dst_port == tuple.src_port
+                && entry.client_src == dst
+                && entry.client_src_port == tuple.dst_port
+        })
 }
 
 fn entry_matches_reply_tuple(entry: MasqueradeConntrack, tuple: L4Tuple) -> bool {
@@ -542,6 +777,17 @@ fn parse_target(name: &str) -> Result<NetfilterTarget, Errno> {
     match name {
         "ACCEPT" | "accept" => Ok(NetfilterTarget::Accept),
         "DROP" | "drop" => Ok(NetfilterTarget::Drop),
+        "DNAT" | "dnat" => Ok(NetfilterTarget::Dnat),
+        "MASQUERADE" | "masquerade" => Ok(NetfilterTarget::Masquerade),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn parse_protocol(name: &str) -> Result<NetfilterConntrackProtocol, Errno> {
+    match name {
+        "icmp" | "ICMP" => Ok(NetfilterConntrackProtocol::Icmp),
+        "tcp" | "TCP" => Ok(NetfilterConntrackProtocol::Tcp),
+        "udp" | "UDP" => Ok(NetfilterConntrackProtocol::Udp),
         _ => Err(Errno::EINVAL),
     }
 }
@@ -578,6 +824,14 @@ fn parse_u8(input: &str) -> Result<u8, Errno> {
         return Err(Errno::EINVAL);
     }
     Ok(value as u8)
+}
+
+fn parse_u16(input: &str) -> Result<u16, Errno> {
+    let value = parse_usize(input)?;
+    if value > u16::MAX as usize {
+        return Err(Errno::EINVAL);
+    }
+    Ok(value as u16)
 }
 
 fn parse_usize(input: &str) -> Result<usize, Errno> {

@@ -331,6 +331,7 @@ pub const AF_UNIX: u16 = 1;
 pub const AF_INET: u16 = 2;
 pub const AF_NETLINK: u16 = 16;
 pub const NETLINK_ROUTE: i32 = 0;
+pub const NETLINK_NETFILTER: i32 = 12;
 pub const SOL_SOCKET: i32 = 1;
 pub const IPPROTO_IP: i32 = 0;
 pub const IPPROTO_ICMP: i32 = 1;
@@ -353,6 +354,10 @@ pub const TCP_NODELAY: i32 = 1;
 pub const TCP_MAXSEG: i32 = 2;
 pub const TCP_INFO: i32 = 11;
 pub const TCP_CONGESTION: i32 = 13;
+pub const IPT_SO_SET_REPLACE: i32 = 64;
+pub const IPT_SO_SET_ADD_COUNTERS: i32 = 65;
+pub const IPT_SO_GET_INFO: i32 = 64;
+pub const IPT_SO_GET_ENTRIES: i32 = 65;
 
 /// `lseek` whence: set the offset to the absolute value `offset`.
 /// Linux uapi `<unistd.h>` `SEEK_SET`.
