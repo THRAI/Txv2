@@ -61,7 +61,7 @@ pub(super) fn sys_timerfd_create<'a>(
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(Ok(cap)) => cap,
             Ok(Err(_)) => return SyscallResult::Error(ENOMEM_VALUE),
-            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
 
@@ -119,7 +119,7 @@ pub(super) fn sys_timerfd_settime<'a, P: super::TimeIf>(
     // Read new_value from userspace.
     let new_bytes = [0u8; ITIMERSPEC_BYTES];
     if let Err(errno) = bootstrap_read_user::<[u8; ITIMERSPEC_BYTES]>(&ctx.aspace, new_value_ptr) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     let new_value = ItimerSpec::from_bytes(&new_bytes);
 
@@ -141,7 +141,7 @@ pub(super) fn sys_timerfd_settime<'a, P: super::TimeIf>(
         if let Err(errno) =
             bootstrap_write_user::<[u8; ITIMERSPEC_BYTES]>(&ctx.aspace, old_value_ptr, old_bytes)
         {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
 
@@ -181,7 +181,7 @@ pub(super) fn sys_timerfd_gettime<'a>(
     if let Err(errno) =
         bootstrap_write_user::<[u8; ITIMERSPEC_BYTES]>(&ctx.aspace, curr_value_ptr, bytes)
     {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
 }
@@ -225,7 +225,7 @@ pub(super) async fn sys_timerfd_read<P: super::TimeIf>(
         match outcome {
             V3Out::Done(n) => {
                 if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..n]) {
-                    return SyscallResult::Error(errno_to_i32(errno));
+                    return SyscallResult::error_from(errno);
                 }
                 return SyscallResult::Return(n as i64);
             }
@@ -234,7 +234,7 @@ pub(super) async fn sys_timerfd_read<P: super::TimeIf>(
                 if errno == Errno::EAGAIN {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
-                return SyscallResult::Error(errno_to_i32(errno));
+                return SyscallResult::error_from(errno);
             }
             V3Out::Yield {
                 shape:
@@ -264,7 +264,7 @@ pub(super) async fn sys_timerfd_read<P: super::TimeIf>(
                 }
             }
             V3Out::Continue { .. } | V3Out::Yield { .. } => {
-                return SyscallResult::Error(errno_to_i32(Errno::EIO));
+                return SyscallResult::error_from(Errno::EIO);
             }
         }
     }

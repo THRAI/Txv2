@@ -55,7 +55,7 @@ pub(super) fn sys_eventfd2<'a>(init_val: u64, flags: u32, ctx: &SyscallCtx<'a>) 
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(Ok(cap)) => cap,
             Ok(Err(_)) => return SyscallResult::Error(ENOMEM_VALUE),
-            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
 
@@ -114,7 +114,7 @@ pub(super) async fn sys_eventfd_read(
         match outcome {
             V3Out::Done(n) => {
                 if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..n]) {
-                    return SyscallResult::Error(errno_to_i32(errno));
+                    return SyscallResult::error_from(errno);
                 }
                 return SyscallResult::Return(n as i64);
             }
@@ -123,7 +123,7 @@ pub(super) async fn sys_eventfd_read(
                 if errno == Errno::EAGAIN {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
-                return SyscallResult::Error(errno_to_i32(errno));
+                return SyscallResult::error_from(errno);
             }
             V3Out::Yield {
                 shape:
@@ -139,7 +139,7 @@ pub(super) async fn sys_eventfd_read(
                 }
             }
             V3Out::Continue { .. } | V3Out::Yield { .. } => {
-                return SyscallResult::Error(errno_to_i32(Errno::EIO));
+                return SyscallResult::error_from(Errno::EIO);
             }
         }
     }
@@ -172,7 +172,7 @@ pub(super) async fn sys_eventfd_write(
     // Read the 8-byte value from userspace.
     let val: u64 = match bootstrap_read_user::<u64>(&ctx.aspace, buf_ptr) {
         Ok(v) => v,
-        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        Err(errno) => return SyscallResult::error_from(errno),
     };
 
     let nonblocking = file.flags().nonblocking;
@@ -190,7 +190,7 @@ pub(super) async fn sys_eventfd_write(
                 if errno == Errno::EAGAIN {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
-                return SyscallResult::Error(errno_to_i32(errno));
+                return SyscallResult::error_from(errno);
             }
             V3Out::Yield {
                 shape:
@@ -206,7 +206,7 @@ pub(super) async fn sys_eventfd_write(
                 }
             }
             V3Out::Continue { .. } | V3Out::Yield { .. } => {
-                return SyscallResult::Error(errno_to_i32(Errno::EIO));
+                return SyscallResult::error_from(Errno::EIO);
             }
         }
     }

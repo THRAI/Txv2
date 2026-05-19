@@ -203,13 +203,13 @@ pub(super) fn step_uffdio_api(file: &OpenFile, argp: u64, ctx: &SyscallCtx<'_>) 
     };
 
     if argp == 0 {
-        return SyscallResult::Error(errno_to_i32(Errno::EFAULT));
+        return SyscallResult::error_from(Errno::EFAULT);
     }
 
     // Read the uffdio_api struct from userspace.
     let mut api_struct: UffdioApi = match bootstrap_read_user::<UffdioApi>(&ctx.aspace, argp) {
         Ok(s) => s,
-        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        Err(errno) => return SyscallResult::error_from(errno),
     };
 
     // Validate the api version + features mask. Phase 2 only knows
@@ -236,7 +236,7 @@ pub(super) fn step_uffdio_api(file: &OpenFile, argp: u64, ctx: &SyscallCtx<'_>) 
     api_struct.features = 0;
     api_struct.ioctls = 0;
     if let Err(errno) = bootstrap_write_user::<UffdioApi>(&ctx.aspace, argp, api_struct) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
 
     SyscallResult::Return(0)
@@ -302,12 +302,12 @@ pub(super) fn step_uffdio_register(
     }
 
     if argp == 0 {
-        return SyscallResult::Error(errno_to_i32(Errno::EFAULT));
+        return SyscallResult::error_from(Errno::EFAULT);
     }
 
     let mut reg: UffdioRegister = match bootstrap_read_user::<UffdioRegister>(&ctx.aspace, argp) {
         Ok(s) => s,
-        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        Err(errno) => return SyscallResult::error_from(errno),
     };
 
     // Validate mode bits. Phase 3 accepts MISSING only; any unknown
@@ -387,7 +387,7 @@ pub(super) fn step_uffdio_register(
     // Phase 5 ships `UFFDIO_COPY | UFFDIO_ZEROPAGE | UFFDIO_CONTINUE`.
     reg.ioctls = UFFDIO_REGISTER_REPLY_IOCTLS;
     if let Err(errno) = bootstrap_write_user::<UffdioRegister>(&ctx.aspace, argp, reg) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
 
     SyscallResult::Return(0)
@@ -574,11 +574,11 @@ pub(super) fn step_uffdio_copy(file: &OpenFile, argp: u64, ctx: &SyscallCtx<'_>)
         None => return SyscallResult::Error(EBADF_VALUE),
     };
     if argp == 0 {
-        return SyscallResult::Error(errno_to_i32(Errno::EFAULT));
+        return SyscallResult::error_from(Errno::EFAULT);
     }
     let mut req: UffdioCopy = match bootstrap_read_user::<UffdioCopy>(&ctx.aspace, argp) {
         Ok(s) => s,
-        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        Err(errno) => return SyscallResult::error_from(errno),
     };
 
     let token_id = match validate_and_match_pending(ufd_cap, req.dst, req.len) {
@@ -603,7 +603,7 @@ pub(super) fn step_uffdio_copy(file: &OpenFile, argp: u64, ctx: &SyscallCtx<'_>)
     // Whole-range success — phase 5 does not support partial copy.
     req.copy = req.len;
     if let Err(errno) = bootstrap_write_user::<UffdioCopy>(&ctx.aspace, argp, req) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
 }
@@ -620,11 +620,11 @@ pub(super) fn step_uffdio_zeropage(
         None => return SyscallResult::Error(EBADF_VALUE),
     };
     if argp == 0 {
-        return SyscallResult::Error(errno_to_i32(Errno::EFAULT));
+        return SyscallResult::error_from(Errno::EFAULT);
     }
     let mut req: UffdioZeropage = match bootstrap_read_user::<UffdioZeropage>(&ctx.aspace, argp) {
         Ok(s) => s,
-        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        Err(errno) => return SyscallResult::error_from(errno),
     };
 
     let token_id = match validate_and_match_pending(ufd_cap, req.range.start, req.range.len) {
@@ -643,7 +643,7 @@ pub(super) fn step_uffdio_zeropage(
 
     req.zeropage = req.range.len;
     if let Err(errno) = bootstrap_write_user::<UffdioZeropage>(&ctx.aspace, argp, req) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
 }
@@ -660,11 +660,11 @@ pub(super) fn step_uffdio_continue(
         None => return SyscallResult::Error(EBADF_VALUE),
     };
     if argp == 0 {
-        return SyscallResult::Error(errno_to_i32(Errno::EFAULT));
+        return SyscallResult::error_from(Errno::EFAULT);
     }
     let mut req: UffdioContinue = match bootstrap_read_user::<UffdioContinue>(&ctx.aspace, argp) {
         Ok(s) => s,
-        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        Err(errno) => return SyscallResult::error_from(errno),
     };
 
     let token_id = match validate_and_match_pending(ufd_cap, req.range.start, req.range.len) {
@@ -683,7 +683,7 @@ pub(super) fn step_uffdio_continue(
 
     req.mapped = req.range.len;
     if let Err(errno) = bootstrap_write_user::<UffdioContinue>(&ctx.aspace, argp, req) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
 }
@@ -741,7 +741,7 @@ pub(super) async fn sys_ufd_read(
                 if let Err(errno) =
                     super::bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &outcome.1[..read])
                 {
-                    return SyscallResult::Error(errno_to_i32(errno));
+                    return SyscallResult::error_from(errno);
                 }
                 return SyscallResult::Return(read as i64);
             }
@@ -750,7 +750,7 @@ pub(super) async fn sys_ufd_read(
                 if errno == Errno::EAGAIN {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
-                return SyscallResult::Error(errno_to_i32(errno));
+                return SyscallResult::error_from(errno);
             }
             V3Out::Yield {
                 shape:
@@ -768,7 +768,7 @@ pub(super) async fn sys_ufd_read(
             }
             // Other shapes are unreachable for the ufd read path.
             V3Out::Continue { .. } | V3Out::Yield { .. } => {
-                return SyscallResult::Error(errno_to_i32(Errno::EIO));
+                return SyscallResult::error_from(Errno::EIO);
             }
         }
     }

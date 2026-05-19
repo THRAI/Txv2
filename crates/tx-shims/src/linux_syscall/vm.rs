@@ -193,7 +193,7 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
         };
         match extract_page_container(&file) {
             Some(pc) => VmBacking::Page { pc, offset },
-            None => return SyscallResult::Error(errno_to_i32(Errno::ENODEV)),
+            None => return SyscallResult::error_from(Errno::ENODEV),
         }
     };
 
@@ -305,7 +305,7 @@ pub(super) async fn sys_munmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
     .await
     {
         Ok(_commit) => SyscallResult::Return(0),
-        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
+        Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
     }
 }
 
@@ -353,7 +353,7 @@ pub(super) async fn sys_mlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
     .await
     {
         Ok(_commit) => SyscallResult::Return(0),
-        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
+        Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
     }
 }
 
@@ -395,7 +395,7 @@ pub(super) async fn sys_munlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscall
     .await
     {
         Ok(_commit) => SyscallResult::Return(0),
-        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
+        Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
     }
 }
 
@@ -457,7 +457,7 @@ pub(super) async fn sys_mprotect(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscal
     .await
     {
         Ok(_commit) => SyscallResult::Return(0),
-        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
+        Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
     }
 }
 
@@ -521,7 +521,7 @@ pub(super) async fn sys_mremap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
     .await
     {
         Ok(outcome) => SyscallResult::Return(outcome.new_range.start().as_usize() as i64),
-        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
+        Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
     }
 }
 
@@ -615,7 +615,7 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -727,10 +727,10 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 let outcome = tx_subsystems::futex::step_futex_wait(uaddr, val, &guard);
                 match outcome {
                     StepOutcome::Err(e) if e == V3Errno::EAGAIN => {
-                        return SyscallResult::Error(errno_to_i32(Errno::EAGAIN));
+                        return SyscallResult::error_from(Errno::EAGAIN);
                     }
                     StepOutcome::Err(e) => {
-                        return SyscallResult::Error(errno_to_i32(Errno::from(e)));
+                        return SyscallResult::error_from(Errno::from(e));
                     }
                     // Yield / Continue / Done: fall through to drive().
                     _ => {}
@@ -763,7 +763,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     if errno == Errno::EAGAIN {
                         SyscallResult::Return(0)
                     } else {
-                        SyscallResult::Error(errno_to_i32(errno))
+                        SyscallResult::error_from(errno)
                     }
                 }
             }
@@ -773,7 +773,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             let mut op = FutexWakeOp { uaddr, n: val };
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(woken) => SyscallResult::Return(woken as i64),
-                Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+                Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
             }
         }
         // FUTEX_REQUEUE / CMP_REQUEUE / WAKE_OP / LOCK_PI /

@@ -69,7 +69,7 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             if total > 0 {
                 return SyscallResult::Return(total);
             }
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
         let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
         let len = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap());
@@ -124,7 +124,7 @@ pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(
             if total > 0 {
                 return SyscallResult::Return(total);
             }
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
         let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
         let len = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap());
@@ -234,7 +234,7 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
             let mut ent_bytes = [0u8; POLLFD_BYTES as usize];
             if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
-                return SyscallResult::Error(errno_to_i32(errno));
+                return SyscallResult::error_from(errno);
             }
             let fd = i32::from_le_bytes(ent_bytes[0..4].try_into().unwrap());
             let events = i16::from_le_bytes(ent_bytes[4..6].try_into().unwrap());
@@ -270,7 +270,7 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             }
             ent_bytes[6..8].copy_from_slice(&revents.to_le_bytes());
             if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, ent_ptr, &ent_bytes) {
-                return SyscallResult::Error(errno_to_i32(errno));
+                return SyscallResult::error_from(errno);
             }
         }
 
@@ -361,7 +361,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
     if len > 0 {
         if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
 
@@ -417,7 +417,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     None,
                 );
             }
-            SyscallResult::Error(errno_to_i32(errno))
+            SyscallResult::error_from(errno)
         }
     }
 }
@@ -534,14 +534,14 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
                 if let Err(errno) =
                     bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..total])
                 {
-                    return SyscallResult::Error(errno_to_i32(errno));
+                    return SyscallResult::error_from(errno);
                 }
             }
             SyscallResult::Return(total as i64)
         }
         Err(v3errno) => {
             let errno: tx_subsystems::execution::Errno = v3errno.into();
-            SyscallResult::Error(errno_to_i32(errno))
+            SyscallResult::error_from(errno)
         }
     }
 }

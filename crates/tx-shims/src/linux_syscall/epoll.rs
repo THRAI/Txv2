@@ -72,7 +72,7 @@ pub(super) fn sys_epoll_create1(flags: u32, ctx: &SyscallCtx<'_>) -> SyscallResu
         None, // no specific target fd — kernel picks
     ) {
         Ok(fd) => fd,
-        Err(e) => return SyscallResult::Error(errno_to_i32(e)),
+        Err(e) => return SyscallResult::error_from(e),
     };
 
     SyscallResult::Return(fd as i64)
@@ -102,7 +102,7 @@ pub(super) fn sys_epoll_ctl(
         // epoll_event.events is the first 4 bytes.
         match bootstrap_read_user::<u32>(&ctx.aspace, event_ptr) {
             Ok(v) => v,
-            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            Err(errno) => return SyscallResult::error_from(errno),
         }
     } else {
         0
@@ -134,7 +134,7 @@ pub(super) fn sys_epoll_ctl(
 
     match outcome {
         execution::StepOutcome::Done(()) => SyscallResult::Return(0),
-        execution::StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(e.into())),
+        execution::StepOutcome::Err(e) => SyscallResult::error_from(e.into()),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -183,12 +183,12 @@ pub(super) fn sys_epoll_wait(
                     events_ptr,
                     &zeros,
                 ) {
-                    return SyscallResult::Error(errno_to_i32(errno));
+                    return SyscallResult::error_from(errno);
                 }
             }
             SyscallResult::Return(count as i64)
         }
-        execution::StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(e.into())),
+        execution::StepOutcome::Err(e) => SyscallResult::error_from(e.into()),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }

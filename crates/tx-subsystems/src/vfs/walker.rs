@@ -87,8 +87,6 @@ use crate::mount::{MountIdentity, MountPayload};
 use crate::vfs::structure::{Credential, DEntry, InlineName, OpenFile, OpenFileFlags, RNode};
 use crate::vfs::FsOps;
 
-use super::predicates;
-
 /// POSIX symlink-loop budget. Matches Linux's `MAXSYMLINKS = 40`.
 /// The 41st observed symlink (after 40 hops have already been
 /// substituted into the path) returns `Errno::ELOOP`.
@@ -204,11 +202,22 @@ pub fn step_open<'g>(
     };
 
     // Validate the requested open mode against the terminal inode's
-    // R/W permission bits.
+    // R/W permission bits. Routes through the cred::checks witness
+    // surface rather than calling vfs::predicates directly — same
+    // bit math, intact witness chain. The _w witness is dropped
+    // because the publication site (OpenFile::new_cap_with_dentry
+    // below) does not yet consume an OpenAuthorized<'g> token; when
+    // it does, this is the mint point.
     let terminal_meta = dentry.rnode().meta();
-    if let Err(err) = predicates::check_open_perm(&terminal_meta, flags, cred) {
-        return V3::err(err.into());
-    }
+    let _w = match crate::cred::checks::require_open_with_walker_cred(
+        cred,
+        &terminal_meta,
+        flags,
+        guard,
+    ) {
+        Ok(w) => w,
+        Err(err) => return V3::err(err.into()),
+    };
 
     let rnode = dentry.rnode().clone();
     match OpenFile::new_cap_with_dentry(rnode, flags, dentry) {
