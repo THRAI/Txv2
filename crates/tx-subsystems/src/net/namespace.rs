@@ -20,9 +20,9 @@ use crate::net::execution::{
     step_process_network_events_in_namespace_at, ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome,
 };
 use crate::net::netfilter::{
-    apply_postrouting_nat_ipv4, apply_prerouting_nat_ipv4,
-    cleanup_netfilter_device_state_for_test_or_bootstrap, run_frame_hook, NetfilterFrameContext,
-    NetfilterHook, NetfilterVerdict,
+    apply_postrouting_nat_ipv4_in_namespace, apply_prerouting_nat_ipv4_in_namespace,
+    cleanup_netfilter_device_state_in_namespace_for_test_or_bootstrap, run_frame_hook_in_namespace,
+    NetfilterFrameContext, NetfilterHook, NetfilterState, NetfilterVerdict,
 };
 use crate::net::packet::{PacketDispatch, PacketSource, PacketTxResult};
 use crate::net::protocol::{
@@ -60,6 +60,7 @@ pub struct NetNamespacePayload {
     namespace_devices: SpinMutex<Vec<NetNamespaceDeviceLink>>,
     routes: SpinMutex<Vec<NetNamespaceRouteEntry>>,
     iface_runtime: SpinMutex<Vec<NetNamespaceIfaceRuntime>>,
+    netfilter: SpinMutex<NetfilterState>,
     ipv4_forwarding: AtomicBool,
 }
 
@@ -265,6 +266,7 @@ impl NetNamespacePayload {
             namespace_devices: SpinMutex::new(Vec::new()),
             routes: SpinMutex::new(Vec::new()),
             iface_runtime: SpinMutex::new(Vec::new()),
+            netfilter: SpinMutex::new(NetfilterState::new()),
             ipv4_forwarding: AtomicBool::new(false),
         }
     }
@@ -275,6 +277,10 @@ impl NetNamespacePayload {
 
     pub fn loopback_iface(&self) -> &'static LoopbackIface {
         self.loopback_iface
+    }
+
+    pub(crate) fn netfilter_state(&self) -> &SpinMutex<NetfilterState> {
+        &self.netfilter
     }
 
     pub fn attach_device(
@@ -366,7 +372,11 @@ impl NetNamespacePayload {
         self.iface_runtime
             .lock()
             .retain(|entry| entry.registration.devt != registration.devt);
-        cleanup_netfilter_device_state_for_test_or_bootstrap(registration.name, removed.ipv4_addr);
+        cleanup_netfilter_device_state_in_namespace_for_test_or_bootstrap(
+            self,
+            registration.name,
+            removed.ipv4_addr,
+        );
         Ok(())
     }
 
@@ -982,7 +992,8 @@ impl NetNamespacePayload {
         if ethernet.ethertype() != EthernetProtocol::Ipv4 {
             return None;
         }
-        if run_frame_hook(
+        if run_frame_hook_in_namespace(
+            self,
             NetfilterFrameContext {
                 hook: NetfilterHook::Prerouting,
                 bridge: None,
@@ -998,7 +1009,8 @@ impl NetNamespacePayload {
             });
         }
 
-        let prerouting = apply_prerouting_nat_ipv4(
+        let prerouting = apply_prerouting_nat_ipv4_in_namespace(
+            self,
             NetfilterFrameContext {
                 hook: NetfilterHook::Prerouting,
                 bridge: None,
@@ -1053,7 +1065,8 @@ impl NetNamespacePayload {
             };
         };
 
-        if run_frame_hook(
+        if run_frame_hook_in_namespace(
+            self,
             NetfilterFrameContext {
                 hook: NetfilterHook::Forward,
                 bridge: None,
@@ -1069,7 +1082,8 @@ impl NetNamespacePayload {
             };
         }
 
-        let postrouting = apply_postrouting_nat_ipv4(
+        let postrouting = apply_postrouting_nat_ipv4_in_namespace(
+            self,
             NetfilterFrameContext {
                 hook: NetfilterHook::Postrouting,
                 bridge: None,
@@ -1081,7 +1095,8 @@ impl NetNamespacePayload {
         );
         let packet = postrouting.as_deref().unwrap_or(packet);
 
-        if run_frame_hook(
+        if run_frame_hook_in_namespace(
+            self,
             NetfilterFrameContext {
                 hook: NetfilterHook::Postrouting,
                 bridge: None,

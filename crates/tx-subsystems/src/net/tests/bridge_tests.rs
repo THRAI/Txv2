@@ -7,6 +7,10 @@ const BRIDGE_NS_B_IP: Ipv4Address = Ipv4Address::new([172, 17, 0, 3]);
 
 #[test]
 fn bridge_floods_broadcast_and_learns_source_mac() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
     let guard = tx_substrate::epoch::guard();
     reset_netfilter_for_test();
     let bridge = new_test_bridge("docker0", 80);
@@ -56,6 +60,10 @@ fn bridge_floods_broadcast_and_learns_source_mac() {
 
 #[test]
 fn bridge_uses_learned_unicast_instead_of_flooding() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
     let guard = tx_substrate::epoch::guard();
     reset_netfilter_for_test();
     let bridge = new_test_bridge("docker1", 82);
@@ -112,6 +120,10 @@ fn bridge_uses_learned_unicast_instead_of_flooding() {
 
 #[test]
 fn bridge_delivers_unicast_to_local_without_flooding() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
     let guard = tx_substrate::epoch::guard();
     reset_netfilter_for_test();
     let bridge = new_test_bridge("docker-local0", 90);
@@ -155,6 +167,10 @@ fn bridge_delivers_unicast_to_local_without_flooding() {
 
 #[test]
 fn bridge_local_transmit_uses_learned_port() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
     let guard = tx_substrate::epoch::guard();
     reset_netfilter_for_test();
     let bridge = new_test_bridge("docker-local1", 91);
@@ -327,6 +343,10 @@ fn bridge_carries_udp_between_two_veth_namespaces() {
 
 #[test]
 fn bridge_l3_iface_allows_container_ping_host_gateway() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
     let guard = tx_substrate::epoch::guard();
     reset_netfilter_for_test();
     let bridge = new_test_bridge("docker-gw0", 95);
@@ -833,7 +853,8 @@ fn namespace_runtime_masquerades_icmp_and_conntrack_dnat_reply() {
             uplink_pair.right.ops.mac_addr(),
             smoltcp::time::Instant::from_secs(60),
         );
-    add_masquerade_rule_for_test_or_bootstrap(
+    crate::net::netfilter::add_masquerade_rule_in_namespace_for_test_or_bootstrap(
+        &host,
         NetfilterIpv4Cidr {
             addr: Ipv4Address::new([172, 17, 0, 0]),
             prefix_len: 16,
@@ -841,7 +862,10 @@ fn namespace_runtime_masquerades_icmp_and_conntrack_dnat_reply() {
         "uplink-nat0",
     )
     .expect("masquerade rule");
-    assert_eq!(netfilter_rules_snapshot().len(), 1);
+    assert_eq!(
+        crate::net::netfilter_rules_snapshot_for_namespace(&host).len(),
+        1
+    );
 
     let eth_ifindex = bridge_ifindex_for(&container.link_snapshot(), "eth-nat0");
     container
@@ -908,8 +932,14 @@ fn namespace_runtime_masquerades_icmp_and_conntrack_dnat_reply() {
     let ipv4 = smoltcp::wire::Ipv4Packet::new_checked(ethernet.payload()).expect("ipv4 packet");
     assert_eq!(Ipv4Address::new(ipv4.src_addr().octets()), uplink_ip);
     assert_eq!(Ipv4Address::new(ipv4.dst_addr().octets()), external_ip);
-    assert_eq!(netfilter_conntrack_snapshot().len(), 1);
-    assert_eq!(netfilter_conntrack_snapshot()[0].original_src, container_ip);
+    assert_eq!(
+        crate::net::netfilter_conntrack_snapshot_for_namespace(&host).len(),
+        1
+    );
+    assert_eq!(
+        crate::net::netfilter_conntrack_snapshot_for_namespace(&host)[0].original_src,
+        container_ip
+    );
 
     let reply = Icmpv4EchoPacket {
         src: external_ip,
@@ -1023,7 +1053,8 @@ fn namespace_runtime_masquerades_udp_and_conntrack_dnat_reply() {
             uplink_pair.right.ops.mac_addr(),
             smoltcp::time::Instant::from_secs(60),
         );
-    add_masquerade_rule_for_test_or_bootstrap(
+    crate::net::netfilter::add_masquerade_rule_in_namespace_for_test_or_bootstrap(
+        &host,
         NetfilterIpv4Cidr {
             addr: Ipv4Address::new([172, 17, 0, 0]),
             prefix_len: 16,
@@ -1090,7 +1121,7 @@ fn namespace_runtime_masquerades_udp_and_conntrack_dnat_reply() {
     let udp_packet = smoltcp::wire::UdpPacket::new_checked(ipv4.payload()).expect("udp packet");
     assert_eq!(udp_packet.src_port(), local_port);
     assert_eq!(udp_packet.dst_port(), remote_port);
-    let entry = netfilter_conntrack_snapshot()
+    let entry = crate::net::netfilter_conntrack_snapshot_for_namespace(&host)
         .into_iter()
         .find(|entry| entry.protocol == NetfilterConntrackProtocol::Udp)
         .expect("udp conntrack entry");
@@ -1131,6 +1162,10 @@ fn namespace_runtime_masquerades_udp_and_conntrack_dnat_reply() {
 
 #[test]
 fn netfilter_masquerades_tcp_tuple_and_rewrites_reply_checksum() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
     reset_netfilter_for_test();
     add_masquerade_rule_for_test_or_bootstrap(
         NetfilterIpv4Cidr {
@@ -1200,6 +1235,10 @@ fn netfilter_masquerades_tcp_tuple_and_rewrites_reply_checksum() {
 
 #[test]
 fn netfilter_dnat_published_tcp_port_and_rewrites_reply_checksum() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
     reset_netfilter_for_test();
     let public_ip = Ipv4Address::new([10, 0, 2, 15]);
     let private_ip = Ipv4Address::new([172, 17, 0, 2]);
