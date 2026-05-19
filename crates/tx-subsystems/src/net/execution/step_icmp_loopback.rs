@@ -1,7 +1,8 @@
 use tx_substrate::zone::Cap;
 
 use crate::execution::{Guard, StepOutcome};
-use crate::net::protocol::{loopback_iface, LoopbackIface, PollContext};
+use crate::net::namespace::initial_loopback_iface;
+use crate::net::protocol::{LoopbackIface, PollContext};
 use crate::net::structure::SocketIdentity;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -19,7 +20,7 @@ pub fn step_process_loopback_icmp(
     budget: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackIcmpTransferOutcome> {
-    step_process_loopback_icmp_on_iface(source, budget, loopback_iface(), guard)
+    step_process_loopback_icmp_on_iface(source, budget, initial_loopback_iface(), guard)
 }
 
 pub fn step_process_loopback_icmp_on_iface(
@@ -28,7 +29,11 @@ pub fn step_process_loopback_icmp_on_iface(
     iface: &LoopbackIface,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackIcmpTransferOutcome> {
-    let mut ctx = PollContext::new(smoltcp::time::Instant::ZERO);
+    let Some(source_payload) = source.acquire_operational() else {
+        return StepOutcome::Done(LoopbackIcmpTransferOutcome::default());
+    };
+    let mut ctx =
+        PollContext::new_with_table(smoltcp::time::Instant::ZERO, source_payload.socket_table());
     let mut source_wake_fired = false;
 
     if let Some(publish) = ctx.poll_icmp_egress_one(source, iface, guard) {

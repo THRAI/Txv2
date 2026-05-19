@@ -362,6 +362,7 @@ impl OpenFile {
                         StepOutcome::Err(errno) => StepOutcome::Err(errno),
                     }
                 }
+                StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::ENOSYS),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             // PR-11 follow-up (W-KK, closing the ENOSYS gap W-JJ flagged
@@ -460,7 +461,8 @@ impl OpenFile {
                 | StructPayload::CharDevice(_)
                 | StructPayload::BlockDevice(_)
                 | StructPayload::Pipe { .. }
-                | StructPayload::Socket { .. } => return StepOutcome::Err(Errno::ESPIPE),
+                | StructPayload::Socket { .. }
+                | StructPayload::NetNamespace { .. } => return StepOutcome::Err(Errno::ESPIPE),
             },
             RNodeBacking::Directory => return StepOutcome::Err(Errno::EISDIR),
             RNodeBacking::Symlink { .. } | RNodeBacking::Projected { .. } => {
@@ -565,6 +567,7 @@ impl OpenFile {
                         StepOutcome::Err(errno) => StepOutcome::Err(errno),
                     }
                 }
+                StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::ENOSYS),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             // Symmetric to the PageBacked step_read arm above — route
@@ -646,9 +649,9 @@ impl OpenFile {
                 StructPayload::BlockDevice(_) => StepOutcome::Err(Errno::ENOSYS),
                 // Pipe was added on main; ioctl on a pipe returns
                 // ENOTTY (matches Linux behaviour).
-                StructPayload::Pipe { .. } | StructPayload::Socket { .. } => {
-                    StepOutcome::Err(Errno::ENOTTY)
-                }
+                StructPayload::Pipe { .. }
+                | StructPayload::Socket { .. }
+                | StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::ENOTTY),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             RNodeBacking::PageBacked { .. }

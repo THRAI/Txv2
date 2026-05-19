@@ -17,7 +17,8 @@ use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKin
 use tx_subsystems::process::{self, Pid};
 use tx_subsystems::vfs::{
     render_dentry_path, Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta,
-    ProjectionKey, ProjectionSchemaId, RNode, RNodeBacking, S_IFDIR, S_IFLNK, S_IFREG,
+    ProjectionKey, ProjectionSchemaId, RNode, RNodeBacking, StructPayload, S_IFDIR, S_IFLNK,
+    S_IFREG,
 };
 
 pub const PROCFS_ROOT_ID: FsObjectId = FsObjectId::new(0x7072_6F00);
@@ -47,6 +48,8 @@ const PROCFS_FD_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x0100_0000;
 const PROCFS_FDINFO_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x0200_0000;
 const PROCFS_TASK_OBJECT_BASE: u64 = 0x7073_0000_0000;
 const PROCFS_TASK_OBJECT_TAG_MASK: u64 = 0xff;
+const PROCFS_NS_OBJECT_BASE: u64 = 0x7074_0000_0000;
+const PROCFS_NS_OBJECT_STRIDE: u64 = 0x100;
 const PROCFS_TASK_TAG_TID_DIR: u64 = 0;
 const PROCFS_TASK_TAG_STAT: u64 = 1;
 const PROCFS_TAG_STAT: u64 = 0;
@@ -57,7 +60,7 @@ const PROCFS_TAG_EXE: u64 = 4;
 const PROCFS_TAG_FD_DIR: u64 = 5;
 const PROCFS_TAG_TASK_DIR: u64 = 6;
 const PROCFS_TAG_FDINFO_DIR: u64 = 7;
-
+const PROCFS_NS_TAG_NET: u64 = 1;
 const fn pid_dir_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64)
 }
@@ -106,6 +109,14 @@ const fn task_tid_stat_id(pid: Pid, tid: u32) -> FsObjectId {
 const fn pid_fd_id(pid: Pid, fd: u32) -> FsObjectId {
     FsObjectId::new(PROCFS_FD_OBJECT_BASE + pid.0 as u64 * PROCFS_FD_OBJECT_STRIDE + fd as u64)
 }
+const fn pid_ns_dir_id(pid: Pid) -> FsObjectId {
+    FsObjectId::new(PROCFS_NS_OBJECT_BASE + pid.0 as u64 * PROCFS_NS_OBJECT_STRIDE)
+}
+const fn pid_netns_id(pid: Pid) -> FsObjectId {
+    FsObjectId::new(
+        PROCFS_NS_OBJECT_BASE + pid.0 as u64 * PROCFS_NS_OBJECT_STRIDE + PROCFS_NS_TAG_NET,
+    )
+}
 fn pid_from_object_id(id: FsObjectId, tag: u64) -> Option<Pid> {
     let r = id.as_u64();
     if r < PROCFS_PID_OBJECT_BASE || r >= PROCFS_FD_OBJECT_BASE {
@@ -139,6 +150,24 @@ fn pid_from_fd_id(id: FsObjectId) -> Option<(Pid, u32)> {
     let pid = Pid((offset / PROCFS_FD_OBJECT_STRIDE) as u32);
     let fd = (offset % PROCFS_FD_OBJECT_STRIDE) as u32;
     Some((pid, fd))
+}
+fn pid_from_ns_object_id(id: FsObjectId, tag: u64) -> Option<Pid> {
+    let r = id.as_u64();
+    if r < PROCFS_NS_OBJECT_BASE || r >= PROCFS_NS_OBJECT_BASE + 0x0100_0000 {
+        return None;
+    }
+    let offset = r - PROCFS_NS_OBJECT_BASE;
+    if offset % PROCFS_NS_OBJECT_STRIDE == tag {
+        Some(Pid((offset / PROCFS_NS_OBJECT_STRIDE) as u32))
+    } else {
+        None
+    }
+}
+fn pid_from_ns_dir(id: FsObjectId) -> Option<Pid> {
+    pid_from_ns_object_id(id, 0)
+}
+fn pid_from_netns_id(id: FsObjectId) -> Option<Pid> {
+    pid_from_ns_object_id(id, PROCFS_NS_TAG_NET)
 }
 fn pid_from_fdinfo_dir(id: FsObjectId) -> Option<Pid> {
     pid_from_object_id(id, PROCFS_TAG_FDINFO_DIR)
@@ -359,6 +388,9 @@ impl FsOps for Procfs {
             if name == b"fdinfo" && process_for_procfs_number(pid.0).is_some() {
                 return StepOutcome::done(pid_fdinfo_dir_id(pid));
             }
+            if name == b"ns" && process::process_by_pid(pid).is_some() {
+                return StepOutcome::done(pid_ns_dir_id(pid));
+            }
             return StepOutcome::err(Errno::ENOENT.into());
         }
         if let Some(pid) = pid_from_fdinfo_dir(parent) {
@@ -391,6 +423,12 @@ impl FsOps for Procfs {
                     .is_some()
             {
                 return StepOutcome::done(task_tid_stat_id(pid, tid));
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if let Some(pid) = pid_from_ns_dir(parent) {
+            if name == b"net" && process::process_by_pid(pid).is_some() {
+                return StepOutcome::done(pid_netns_id(pid));
             }
             return StepOutcome::err(Errno::ENOENT.into());
         }
@@ -468,6 +506,12 @@ impl FsOps for Procfs {
             id if task_from_stat_id(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
+            id if pid_from_ns_dir(id).is_some() => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
+            }
+            id if pid_from_netns_id(id).is_some() => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            }
             _ => StepOutcome::err(Errno::ENOENT.into()),
         }
     }
@@ -495,6 +539,7 @@ impl FsOps for Procfs {
                 (b"fd", pid_fd_dir_id(pid), InodeKind::Directory),
                 (b"task", pid_task_dir_id(pid), InodeKind::Directory),
                 (b"fdinfo", pid_fdinfo_dir_id(pid), InodeKind::Directory),
+                (b"ns", pid_ns_dir_id(pid), InodeKind::Directory),
             ];
             let fi = idx.saturating_sub(2);
             if fi < files.len() {
@@ -657,6 +702,19 @@ impl FsOps for Procfs {
                 return StepOutcome::done(Some((
                     dir_entry(oid, kind, name),
                     DirCursor([2, (fi + 3) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                )));
+            }
+            return StepOutcome::done(None);
+        }
+
+        if let Some(pid) = pid_from_ns_dir(id) {
+            let files: &[(&[u8], FsObjectId, InodeKind)] =
+                &[(b"net", pid_netns_id(pid), InodeKind::Regular)];
+            if idx < files.len() {
+                let (name, oid, kind) = files[idx];
+                return StepOutcome::done(Some((
+                    dir_entry(oid, kind, name),
+                    DirCursor::from_u64((idx + 1) as u64),
                 )));
             }
             return StepOutcome::done(None);
@@ -826,6 +884,26 @@ impl FsOps for Procfs {
         mount: &Cap<MountPayload>,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
+        if let Some(pid) = pid_from_netns_id(id) {
+            let Some(proc) = process::process_by_pid(pid) else {
+                return StepOutcome::err(Errno::ENOENT.into());
+            };
+            let Some(payload) = proc.net_namespace() else {
+                return StepOutcome::err(Errno::ESRCH.into());
+            };
+            return match RNode::new_cap_in_mount(
+                id,
+                meta,
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::NetNamespace { payload },
+                },
+                mount,
+            ) {
+                Ok(cap) => StepOutcome::done(cap),
+                Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
+            };
+        }
+
         match RNode::new_cap_in_mount(
             id,
             meta,

@@ -1,11 +1,11 @@
 use alloc::vec::Vec;
 use smoltcp::time::Instant;
-use tx_substrate::zone::Cap;
+use tx_substrate::zone::{Cap, PayloadCap};
 
 use crate::execution::{Guard, StepOutcome};
+use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::packet::{PacketTxReadiness, PacketTxResult, PacketTxSink};
 use crate::net::protocol::build_icmpv4_echo_request;
-use crate::net::structure::table::SOCKET_TABLE;
 use crate::net::structure::{
     IpEndpoint, Ipv4Address, SendWireSet, SocketIdentity, SocketProtocol, TcpState, UdpInner,
 };
@@ -81,7 +81,13 @@ pub fn step_process_device_tx_pending(
     budget: DeviceTxBudget,
     guard: &Guard<'_>,
 ) -> StepOutcome<DeviceTxOutcome> {
-    step_process_device_tx_pending_at(sink, Instant::ZERO, budget, guard)
+    step_process_device_tx_pending_in_namespace_at(
+        sink,
+        initial_net_namespace_payload(),
+        Instant::ZERO,
+        budget,
+        guard,
+    )
 }
 
 pub fn step_process_device_tx_pending_at(
@@ -90,9 +96,26 @@ pub fn step_process_device_tx_pending_at(
     budget: DeviceTxBudget,
     guard: &Guard<'_>,
 ) -> StepOutcome<DeviceTxOutcome> {
-    let mut outcome = DeviceTxOutcome::default();
+    step_process_device_tx_pending_in_namespace_at(
+        sink,
+        initial_net_namespace_payload(),
+        now,
+        budget,
+        guard,
+    )
+}
 
-    for socket in SOCKET_TABLE
+pub fn step_process_device_tx_pending_in_namespace_at(
+    sink: &dyn PacketTxSink,
+    net_namespace: PayloadCap<NetNamespacePayload>,
+    now: Instant,
+    budget: DeviceTxBudget,
+    guard: &Guard<'_>,
+) -> StepOutcome<DeviceTxOutcome> {
+    let mut outcome = DeviceTxOutcome::default();
+    let table = net_namespace.socket_table();
+
+    for socket in table
         .snapshot_tcp_bound(guard)
         .into_iter()
         .filter(is_tcp_connecting)
@@ -102,7 +125,7 @@ pub fn step_process_device_tx_pending_at(
     }
 
     let mut tcp_connections_seen = Vec::new();
-    for socket in SOCKET_TABLE
+    for socket in table
         .snapshot_tcp_connections(guard)
         .into_iter()
         .filter(is_tcp_connected)
@@ -117,10 +140,10 @@ pub fn step_process_device_tx_pending_at(
     }
 
     let mut udp_bound_seen = Vec::new();
-    for socket in SOCKET_TABLE
+    for socket in table
         .snapshot_udp_bound(guard)
         .into_iter()
-        .chain(SOCKET_TABLE.snapshot_udp_connections(guard))
+        .chain(table.snapshot_udp_connections(guard))
         .filter(is_udp_bound_or_connected)
     {
         if !remember_socket(&mut udp_bound_seen, &socket) {
@@ -133,7 +156,7 @@ pub fn step_process_device_tx_pending_at(
     }
 
     let mut raw_icmp_seen = Vec::new();
-    for socket in SOCKET_TABLE
+    for socket in table
         .snapshot_raw_icmp(guard)
         .into_iter()
         .filter(is_raw_icmp)

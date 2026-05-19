@@ -18,9 +18,12 @@ pub use ops::{
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::execution::{
     step_accept, step_bind, step_connect, step_listen, step_poll_ready, step_recv, step_send,
-    step_shutdown, step_socket_create, ByteStepOutcome, ShutdownOutcome, SocketAcceptOutcome,
+    step_shutdown, step_socket_create, step_socket_create_in_namespace, ByteStepOutcome,
+    ShutdownOutcome, SocketAcceptOutcome,
 };
-use crate::net::structure::{PollMask, ValidSocketType};
+use crate::net::namespace::NetNamespacePayload;
+use crate::net::structure::{PollMask, SocketIdentity, ValidSocketType};
+use tx_substrate::zone::{Cap, PayloadCap};
 
 pub fn socket_create_facade(
     domain: i32,
@@ -28,13 +31,35 @@ pub fn socket_create_facade(
     protocol: i32,
     guard: &Guard<'_>,
 ) -> StepOutcome<SocketCreateOutput> {
+    socket_create_facade_with_step(domain, type_, protocol, guard, step_socket_create)
+}
+
+pub fn socket_create_facade_in_namespace(
+    domain: i32,
+    type_: i32,
+    protocol: i32,
+    net_namespace: PayloadCap<NetNamespacePayload>,
+    guard: &Guard<'_>,
+) -> StepOutcome<SocketCreateOutput> {
+    socket_create_facade_with_step(domain, type_, protocol, guard, |valid, guard| {
+        step_socket_create_in_namespace(valid, net_namespace, guard)
+    })
+}
+
+fn socket_create_facade_with_step(
+    domain: i32,
+    type_: i32,
+    protocol: i32,
+    guard: &Guard<'_>,
+    create: impl FnOnce(ValidSocketType, &Guard<'_>) -> StepOutcome<Cap<SocketIdentity>>,
+) -> StepOutcome<SocketCreateOutput> {
     let valid = match ValidSocketType::validate(domain, type_, protocol) {
         Ok(valid) => valid,
         Err(errno) => return StepOutcome::Err(errno),
     };
     let flags = SocketHandleFlags::from_sock_flags(valid.flags);
 
-    match step_socket_create(valid, guard) {
+    match create(valid, guard) {
         StepOutcome::Done(identity) => StepOutcome::Done(SocketCreateOutput {
             handle: SocketHandle::new(identity, flags),
         }),

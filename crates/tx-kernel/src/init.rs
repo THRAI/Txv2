@@ -147,6 +147,7 @@ pub fn reset_boot_state_for_test() {
     BSP_REACTOR_TIMER_DONE_CPUS.store(0, Ordering::Release);
     BOOT_REACTOR.reset_for_test();
     net::reset_boot_net_runtime_for_test();
+    tx_subsystems::net::reset_initial_net_namespace_for_test();
     tx_subsystems::net::device::reset_net_registry_for_test();
 }
 

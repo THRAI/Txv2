@@ -3,7 +3,7 @@ use tx_substrate::zone::Cap;
 
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_bind_target;
-use crate::net::structure::table::SOCKET_TABLE;
+use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
     KernelSockAddr, SocketIdentity, SocketKind, SocketProtocol, TcpState, UdpInner,
 };
@@ -21,11 +21,14 @@ pub fn step_bind(
     let Some(payload) = socket.acquire_operational() else {
         return StepOutcome::Err(Errno::ENOTCONN);
     };
+    let table = payload.socket_table();
 
     let table_result = match witness.identity.kind {
-        SocketKind::Tcp => SOCKET_TABLE.bind_tcp(witness.local, socket.clone()),
-        SocketKind::Udp => bind_udp_maybe_reuseaddr(socket, witness.local, guard),
+        SocketKind::UnixDatagram => Ok(()),
+        SocketKind::Tcp => table.bind_tcp(witness.local, socket.clone()),
+        SocketKind::Udp => bind_udp_maybe_reuseaddr(table, socket, witness.local, guard),
         SocketKind::RawIcmp => Ok(()),
+        SocketKind::NetlinkRoute => Ok(()),
     };
     let _requested_addr = witness.addr;
     if let Err(error) = table_result {
@@ -59,23 +62,24 @@ pub fn step_bind(
 }
 
 fn bind_udp_maybe_reuseaddr(
+    table: &SocketTable,
     socket: &Cap<SocketIdentity>,
     local: crate::net::structure::IpEndpoint,
     guard: &Guard<'_>,
 ) -> Result<(), IndexError> {
-    match SOCKET_TABLE.bind_udp(local, socket.clone()) {
+    match table.bind_udp(local, socket.clone()) {
         Ok(()) => Ok(()),
         Err(IndexError::Duplicate) if socket_reuse_addr(socket) => {
-            let Some(existing) = SOCKET_TABLE.lookup_udp_bound_exact(local, guard) else {
+            let Some(existing) = table.lookup_udp_bound_exact(local, guard) else {
                 return Err(IndexError::Duplicate);
             };
             if !socket_reuse_addr(&existing) {
                 return Err(IndexError::Duplicate);
             }
-            SOCKET_TABLE
+            table
                 .withdraw_udp_bound(local)
                 .map_err(|_| IndexError::Busy)?;
-            SOCKET_TABLE.bind_udp(local, socket.clone())
+            table.bind_udp(local, socket.clone())
         }
         Err(error) => Err(error),
     }

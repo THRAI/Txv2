@@ -20,10 +20,11 @@ use tx_subsystems::net::device::{
     net_device_by_name, net_device_snapshot, VIRTIO_NET0_REGISTRATION,
 };
 use tx_subsystems::net::execution::{DeviceTxBudget, LoopbackPollBudget};
+use tx_subsystems::net::initial_loopback_iface;
 use tx_subsystems::net::packet::{
     PacketDispatch, PacketSource, PacketTxReadiness, PacketTxResult, PacketTxSink,
 };
-use tx_subsystems::net::protocol::{loopback_iface, EtherIface, IfaceCommon, LoopbackIface};
+use tx_subsystems::net::protocol::{EtherIface, IfaceCommon, LoopbackIface};
 use tx_subsystems::net::structure::Ipv4Address;
 
 use super::{CoreInit, BOOT_REACTOR};
@@ -221,7 +222,7 @@ impl<P: TxPlatform> NetDelegateDriver for BootNetDelegateDriver<P> {
     }
 
     fn loopback_iface(&self) -> Option<&LoopbackIface> {
-        Some(loopback_iface())
+        Some(initial_loopback_iface())
     }
 
     fn loopback_budget(&self) -> LoopbackPollBudget {

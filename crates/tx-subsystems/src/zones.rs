@@ -236,7 +236,7 @@ mod net {
     use super::*;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
-        crate::net::structure::registry::register_zones()
+        crate::net::register_zones()
     }
 }
 

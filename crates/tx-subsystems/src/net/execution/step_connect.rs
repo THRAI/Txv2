@@ -4,7 +4,7 @@ use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
 use crate::net::checks::require::require_socket_connect_target;
 use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::yield_on_token;
-use crate::net::structure::table::SOCKET_TABLE;
+use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
     ConnectionKey, IpEndpoint, Ipv4Address, KernelSockAddr, SendWireSet, SocketIdentity,
     SocketProtocol, TcpState, UdpInner,
@@ -24,9 +24,13 @@ pub fn step_connect(
     };
     debug_assert_eq!(witness.identity.raw(), socket.raw());
 
-    if let Err(errno) =
-        update_udp_connection_index(socket, &payload.protocol_snapshot(), witness.remote, guard)
-    {
+    if let Err(errno) = update_udp_connection_index(
+        payload.socket_table(),
+        socket,
+        &payload.protocol_snapshot(),
+        witness.remote,
+        guard,
+    ) {
         return StepOutcome::Err(errno);
     }
 
@@ -95,6 +99,7 @@ const fn unspecified_endpoint() -> IpEndpoint {
 }
 
 fn update_udp_connection_index(
+    table: &SocketTable,
     socket: &Cap<SocketIdentity>,
     protocol: &SocketProtocol,
     remote: IpEndpoint,
@@ -120,7 +125,7 @@ fn update_udp_connection_index(
     }
 
     if let Some(key) = new_key {
-        if let Some(existing) = SOCKET_TABLE.lookup_udp_connection(key, guard) {
+        if let Some(existing) = table.lookup_udp_connection(key, guard) {
             if existing.raw() != socket.raw() {
                 return Err(Errno::EADDRINUSE);
             }
@@ -128,11 +133,11 @@ fn update_udp_connection_index(
     }
 
     if let Some(key) = old_key {
-        let _ = SOCKET_TABLE.withdraw_udp_connection(key);
+        let _ = table.withdraw_udp_connection(key);
     }
 
     if let Some(key) = new_key {
-        SOCKET_TABLE
+        table
             .insert_udp_connection(key, socket.clone())
             .map_err(udp_table_error_to_errno)?;
     }

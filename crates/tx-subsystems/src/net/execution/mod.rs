@@ -31,8 +31,9 @@ pub use step_accept::{step_accept, SocketAcceptOutcome};
 pub use step_bind::step_bind;
 pub use step_connect::step_connect;
 pub use step_device_tx::{
-    step_process_device_tx_pending, step_process_device_tx_pending_at, DeviceTxBudget,
-    DeviceTxOutcome, DEVICE_TX_BUDGET_DEFAULT,
+    step_process_device_tx_pending, step_process_device_tx_pending_at,
+    step_process_device_tx_pending_in_namespace_at, DeviceTxBudget, DeviceTxOutcome,
+    DEVICE_TX_BUDGET_DEFAULT,
 };
 pub use step_flush_pending_arp::{
     step_flush_pending_arp, ArpFlushOutcome, ARP_FLUSH_BUDGET_DEFAULT,
@@ -42,22 +43,26 @@ pub use step_icmp_loopback::{
 };
 pub use step_listen::step_listen;
 pub use step_loopback_pending::{
-    step_process_loopback_pending, step_process_loopback_pending_zero, LoopbackPendingOutcome,
-    LoopbackPollBudget, LOOPBACK_POLL_BUDGET_DEFAULT,
+    step_process_loopback_pending, step_process_loopback_pending_in_namespace,
+    step_process_loopback_pending_zero, LoopbackPendingOutcome, LoopbackPollBudget,
+    LOOPBACK_POLL_BUDGET_DEFAULT,
 };
 pub use step_poll::{step_poll_ready, step_poll_wait_token};
 pub use step_process_network_events::{
-    step_process_network_events, step_process_network_events_at, step_process_network_tick,
-    step_process_network_tick_loopback, NetworkBacklogTickOutcome, NetworkStepOutcome,
+    step_process_network_events, step_process_network_events_at,
+    step_process_network_events_in_namespace_at, step_process_network_tick,
+    step_process_network_tick_in_namespace, step_process_network_tick_loopback,
+    step_process_network_tick_loopback_in_namespace, NetworkBacklogTickOutcome, NetworkStepOutcome,
     NET_BACKLOG_SCAN_BUDGET, NET_EVENT_BUDGET,
 };
 pub use step_recv::{step_recv, step_recv_kernel_bytes};
 pub use step_send::{step_send, step_send_kernel_bytes, step_send_to_kernel_bytes};
 pub use step_shutdown::{step_shutdown, ShutdownOutcome};
 pub use step_socket_close::{step_socket_close, SocketCloseOutcome};
-pub use step_socket_create::step_socket_create;
+pub use step_socket_create::{step_socket_create, step_socket_create_in_namespace};
 pub use step_socket_open_file::{
-    socket_open_file_from_identity, step_socket_open_file, SocketOpenFileOutput,
+    socket_open_file_from_identity, step_socket_open_file, step_socket_open_file_in_namespace,
+    SocketOpenFileOutput,
 };
 pub use step_tcp_backlog_cleanup::{
     step_tcp_backlog_cleanup, TcpBacklogCleanupOutcome, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,

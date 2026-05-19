@@ -1,7 +1,7 @@
 use tx_substrate::zone::Cap;
 
 use crate::execution::{Guard, StepOutcome};
-use crate::net::structure::table::SOCKET_TABLE;
+use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
     AcceptWireSet, ConnectionKey, RecvWireSet, SendWireSet, SockShutdownCmd, SocketIdentity,
     SocketProtocol, TcpState, UdpInner,
@@ -25,43 +25,43 @@ pub fn step_socket_close(
     };
 
     let mut bindings_withdrawn = 0;
+    let table = payload.socket_table();
     match payload.protocol_snapshot() {
         SocketProtocol::Tcp(TcpState::Bound { local }) => {
-            bindings_withdrawn += withdraw_ok(SOCKET_TABLE.withdraw_tcp_bound(local));
+            bindings_withdrawn += withdraw_ok(table.withdraw_tcp_bound(local));
         }
         SocketProtocol::Tcp(TcpState::Listening { local, .. }) => {
-            bindings_withdrawn += withdraw_ok(SOCKET_TABLE.withdraw_tcp_listener(local));
-            bindings_withdrawn += withdraw_ok(SOCKET_TABLE.withdraw_tcp_bound(local));
+            bindings_withdrawn += withdraw_ok(table.withdraw_tcp_listener(local));
+            bindings_withdrawn += withdraw_ok(table.withdraw_tcp_bound(local));
         }
         SocketProtocol::Tcp(TcpState::Connecting { local, remote })
         | SocketProtocol::Tcp(TcpState::Connected { local, remote }) => {
             if let Some(peer) =
-                SOCKET_TABLE.lookup_tcp_connection(ConnectionKey::new(remote, local), guard)
+                table.lookup_tcp_connection(ConnectionKey::new(remote, local), guard)
             {
                 mark_tcp_peer_broken(&peer);
             }
-            bindings_withdrawn += withdraw_ok(
-                SOCKET_TABLE.withdraw_tcp_connection(ConnectionKey::new(local, remote)),
-            );
-            bindings_withdrawn += withdraw_ok(
-                SOCKET_TABLE.withdraw_tcp_connection(ConnectionKey::new(remote, local)),
-            );
-            bindings_withdrawn += withdraw_ok(SOCKET_TABLE.withdraw_tcp_bound(local));
+            bindings_withdrawn +=
+                withdraw_ok(table.withdraw_tcp_connection(ConnectionKey::new(local, remote)));
+            bindings_withdrawn +=
+                withdraw_ok(table.withdraw_tcp_connection(ConnectionKey::new(remote, local)));
+            bindings_withdrawn += withdraw_ok(table.withdraw_tcp_bound(local));
         }
         SocketProtocol::Tcp(TcpState::Init | TcpState::Closed) => {}
         SocketProtocol::Udp(UdpInner::Bound { local }) => {
-            bindings_withdrawn += withdraw_udp_bound_if_owner(socket, local, guard);
+            bindings_withdrawn += withdraw_udp_bound_if_owner(table, socket, local, guard);
         }
         SocketProtocol::Udp(UdpInner::Connected { local, remote }) => {
-            bindings_withdrawn += withdraw_ok(
-                SOCKET_TABLE.withdraw_udp_connection(ConnectionKey::new(local, remote)),
-            );
-            bindings_withdrawn += withdraw_udp_bound_if_owner(socket, local, guard);
+            bindings_withdrawn +=
+                withdraw_ok(table.withdraw_udp_connection(ConnectionKey::new(local, remote)));
+            bindings_withdrawn += withdraw_udp_bound_if_owner(table, socket, local, guard);
         }
         SocketProtocol::Udp(UdpInner::Unbound | UdpInner::Closed) => {}
         SocketProtocol::RawIcmp(_) => {
-            bindings_withdrawn += withdraw_ok(SOCKET_TABLE.withdraw_raw_icmp(socket.raw()));
+            bindings_withdrawn += withdraw_ok(table.withdraw_raw_icmp(socket.raw()));
         }
+        SocketProtocol::UnixDatagram => {}
+        SocketProtocol::NetlinkRoute(_) => {}
     }
 
     if let Some(raw_tcp) = payload.raw_tcp_socket() {
@@ -102,15 +102,16 @@ fn withdraw_ok<T>(result: Result<T, tx_substrate::mutation::MutationError>) -> u
 }
 
 fn withdraw_udp_bound_if_owner(
+    table: &SocketTable,
     socket: &Cap<SocketIdentity>,
     local: crate::net::structure::IpEndpoint,
     guard: &Guard<'_>,
 ) -> usize {
-    let Some(bound) = SOCKET_TABLE.lookup_udp_bound_exact(local, guard) else {
+    let Some(bound) = table.lookup_udp_bound_exact(local, guard) else {
         return 0;
     };
     if bound.raw() != socket.raw() {
         return 0;
     }
-    withdraw_ok(SOCKET_TABLE.withdraw_udp_bound(local))
+    withdraw_ok(table.withdraw_udp_bound(local))
 }

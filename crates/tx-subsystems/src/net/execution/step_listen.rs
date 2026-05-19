@@ -4,7 +4,6 @@ use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_listen_target;
 use crate::net::execution::step_bind::table_error_to_errno;
 use crate::net::execution::SOMAXCONN_STAGING;
-use crate::net::structure::table::SOCKET_TABLE;
 use crate::net::structure::{SocketIdentity, SocketProtocol, TcpState};
 
 pub fn step_listen(
@@ -19,13 +18,16 @@ pub fn step_listen(
     };
     debug_assert_eq!(witness.identity.raw(), socket.raw());
 
-    if let Err(error) = SOCKET_TABLE.listen_tcp(witness.local, socket.clone()) {
-        return StepOutcome::Err(table_error_to_errno(error));
-    }
-
     let Some(payload) = socket.acquire_operational() else {
         return StepOutcome::Err(Errno::ENOTCONN);
     };
+    if let Err(error) = payload
+        .socket_table()
+        .listen_tcp(witness.local, socket.clone())
+    {
+        return StepOutcome::Err(table_error_to_errno(error));
+    }
+
     let listening = payload.with_protocol_mut(|protocol| match protocol {
         SocketProtocol::Tcp(TcpState::Bound { local }) if *local == witness.local => {
             *protocol = SocketProtocol::Tcp(TcpState::Listening {

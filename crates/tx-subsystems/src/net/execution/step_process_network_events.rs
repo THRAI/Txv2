@@ -1,12 +1,14 @@
 use smoltcp::time::Instant;
+use tx_substrate::zone::PayloadCap;
 
 use crate::execution::{Guard, StepOutcome};
+use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::packet::{
     NetworkPublish, PacketDispatch, PacketSource, TcpPacketEvent, UdpPacketEvent,
 };
 use crate::net::protocol::{Icmpv4Event, LoopbackIface};
 use crate::net::structure::registry;
-use crate::net::structure::table::SOCKET_TABLE;
+use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
     ConnectionKey, Ipv4Address, RawIcmpState, SocketAcceptEntry, SocketIdentity, SocketProtocol,
     TcpBacklogRetransmitOutcome,
@@ -43,7 +45,12 @@ pub fn step_process_network_events(
     source: &dyn PacketSource,
     guard: &Guard<'_>,
 ) -> StepOutcome<NetworkStepOutcome> {
-    step_process_network_events_at(source, Instant::ZERO, guard)
+    step_process_network_events_in_namespace_at(
+        source,
+        initial_net_namespace_payload(),
+        Instant::ZERO,
+        guard,
+    )
 }
 
 pub fn step_process_network_events_at(
@@ -51,7 +58,17 @@ pub fn step_process_network_events_at(
     now: Instant,
     guard: &Guard<'_>,
 ) -> StepOutcome<NetworkStepOutcome> {
+    step_process_network_events_in_namespace_at(source, initial_net_namespace_payload(), now, guard)
+}
+
+pub fn step_process_network_events_in_namespace_at(
+    source: &dyn PacketSource,
+    net_namespace: PayloadCap<NetNamespacePayload>,
+    now: Instant,
+    guard: &Guard<'_>,
+) -> StepOutcome<NetworkStepOutcome> {
     let mut outcome = NetworkStepOutcome::default();
+    let table = net_namespace.socket_table();
 
     for _ in 0..NET_EVENT_BUDGET {
         let Some(packet) = source.next_packet_at(now, guard) else {
@@ -61,19 +78,21 @@ pub fn step_process_network_events_at(
 
         match packet {
             PacketDispatch::Tcp(event) => {
-                if let Some((socket, publish)) = process_tcp_event(event, guard) {
+                if let Some((socket, publish)) =
+                    process_tcp_event(table, &net_namespace, event, guard)
+                {
                     outcome.sockets_touched += 1;
                     outcome.wakes_fired += publish.publish_to(&socket);
                 }
             }
             PacketDispatch::Udp(event) => {
-                if let Some((socket, publish)) = process_udp_event(event, guard) {
+                if let Some((socket, publish)) = process_udp_event(table, event, guard) {
                     outcome.sockets_touched += 1;
                     outcome.wakes_fired += publish.publish_to(&socket);
                 }
             }
             PacketDispatch::Icmp(event) => {
-                if let Some((socket, publish)) = process_icmp_event(event, guard) {
+                if let Some((socket, publish)) = process_icmp_event(table, event, guard) {
                     outcome.sockets_touched += 1;
                     outcome.wakes_fired += publish.publish_to(&socket);
                 }
@@ -82,7 +101,7 @@ pub fn step_process_network_events_at(
         }
     }
 
-    outcome.backlog = process_tcp_backlog_tick(now, guard);
+    outcome.backlog = process_tcp_backlog_tick_in_namespace(now, table, guard);
     StepOutcome::Done(outcome)
 }
 
@@ -90,7 +109,23 @@ pub fn step_process_network_tick(
     now: Instant,
     guard: &Guard<'_>,
 ) -> StepOutcome<NetworkBacklogTickOutcome> {
-    StepOutcome::Done(process_tcp_backlog_tick(now, guard))
+    StepOutcome::Done(process_tcp_backlog_tick_in_namespace(
+        now,
+        initial_net_namespace_payload().socket_table(),
+        guard,
+    ))
+}
+
+pub fn step_process_network_tick_in_namespace(
+    now: Instant,
+    net_namespace: PayloadCap<NetNamespacePayload>,
+    guard: &Guard<'_>,
+) -> StepOutcome<NetworkBacklogTickOutcome> {
+    StepOutcome::Done(process_tcp_backlog_tick_in_namespace(
+        now,
+        net_namespace.socket_table(),
+        guard,
+    ))
 }
 
 pub fn step_process_network_tick_loopback(
@@ -98,12 +133,35 @@ pub fn step_process_network_tick_loopback(
     iface: &LoopbackIface,
     guard: &Guard<'_>,
 ) -> StepOutcome<NetworkBacklogTickOutcome> {
-    StepOutcome::Done(process_tcp_backlog_tick_loopback(now, iface, guard))
+    StepOutcome::Done(process_tcp_backlog_tick_loopback_in_namespace(
+        now,
+        initial_net_namespace_payload().socket_table(),
+        iface,
+        guard,
+    ))
 }
 
-fn process_tcp_backlog_tick(now: Instant, guard: &Guard<'_>) -> NetworkBacklogTickOutcome {
+pub fn step_process_network_tick_loopback_in_namespace(
+    now: Instant,
+    net_namespace: PayloadCap<NetNamespacePayload>,
+    iface: &LoopbackIface,
+    guard: &Guard<'_>,
+) -> StepOutcome<NetworkBacklogTickOutcome> {
+    StepOutcome::Done(process_tcp_backlog_tick_loopback_in_namespace(
+        now,
+        net_namespace.socket_table(),
+        iface,
+        guard,
+    ))
+}
+
+fn process_tcp_backlog_tick_in_namespace(
+    now: Instant,
+    table: &SocketTable,
+    guard: &Guard<'_>,
+) -> NetworkBacklogTickOutcome {
     let mut outcome = NetworkBacklogTickOutcome::default();
-    let listeners = SOCKET_TABLE.snapshot_tcp_listeners(guard);
+    let listeners = table.snapshot_tcp_listeners(guard);
 
     for listener in listeners.into_iter().take(NET_BACKLOG_SCAN_BUDGET) {
         outcome.listeners_seen += 1;
@@ -124,13 +182,14 @@ fn process_tcp_backlog_tick(now: Instant, guard: &Guard<'_>) -> NetworkBacklogTi
     outcome
 }
 
-fn process_tcp_backlog_tick_loopback(
+fn process_tcp_backlog_tick_loopback_in_namespace(
     now: Instant,
+    table: &SocketTable,
     iface: &LoopbackIface,
     guard: &Guard<'_>,
 ) -> NetworkBacklogTickOutcome {
     let mut outcome = NetworkBacklogTickOutcome::default();
-    let listeners = SOCKET_TABLE.snapshot_tcp_listeners(guard);
+    let listeners = table.snapshot_tcp_listeners(guard);
 
     for listener in listeners.into_iter().take(NET_BACKLOG_SCAN_BUDGET) {
         outcome.listeners_seen += 1;
@@ -179,11 +238,13 @@ fn earliest_deadline(current: Option<Instant>, candidate: Instant) -> Option<Ins
 }
 
 fn process_tcp_event(
+    table: &SocketTable,
+    net_namespace: &PayloadCap<NetNamespacePayload>,
     event: TcpPacketEvent,
     guard: &Guard<'_>,
 ) -> Option<(Cap<SocketIdentity>, NetworkPublish)> {
     let key = ConnectionKey::new(event.dst, event.src);
-    if let Some(socket) = SOCKET_TABLE.lookup_tcp_connection(key, guard) {
+    if let Some(socket) = table.lookup_tcp_connection(key, guard) {
         let payload = socket.acquire_operational()?;
         let mut publish = NetworkPublish::none();
         let flags = event.flags;
@@ -200,15 +261,17 @@ fn process_tcp_event(
     }
 
     if event.flags.syn && !event.flags.ack {
-        let socket =
-            SOCKET_TABLE.lookup_tcp_listener_addr(event.dst.addr, event.dst.port, guard)?;
+        let socket = table.lookup_tcp_listener_addr(event.dst.addr, event.dst.port, guard)?;
         let payload = socket.acquire_operational()?;
         let options = payload.with_options(Clone::clone);
-        let child =
-            registry::create_connected_stream_for_accept(event.dst, event.src, options).ok()?;
-        SOCKET_TABLE
-            .insert_tcp_connection(key, child.clone())
-            .ok()?;
+        let child = registry::create_connected_stream_for_accept_in_namespace(
+            event.dst,
+            event.src,
+            options,
+            net_namespace.clone(),
+        )
+        .ok()?;
+        table.insert_tcp_connection(key, child.clone()).ok()?;
         let entry = SocketAcceptEntry {
             child,
             local: event.dst,
@@ -225,6 +288,7 @@ fn process_tcp_event(
 }
 
 fn process_icmp_event(
+    table: &SocketTable,
     event: Icmpv4Event,
     guard: &Guard<'_>,
 ) -> Option<(Cap<SocketIdentity>, NetworkPublish)> {
@@ -232,7 +296,7 @@ fn process_icmp_event(
         return None;
     };
 
-    for socket in SOCKET_TABLE.snapshot_raw_icmp(guard) {
+    for socket in table.snapshot_raw_icmp(guard) {
         let payload = socket.acquire_operational()?;
         if !raw_icmp_accepts_reply(&payload.protocol_snapshot(), reply.dst) {
             continue;
@@ -260,10 +324,11 @@ fn raw_icmp_accepts_reply(protocol: &SocketProtocol, dst: Ipv4Address) -> bool {
 }
 
 fn process_udp_event(
+    table: &SocketTable,
     event: UdpPacketEvent,
     guard: &Guard<'_>,
 ) -> Option<(Cap<SocketIdentity>, NetworkPublish)> {
-    let socket = SOCKET_TABLE.lookup_udp_ingress(event.src, event.dst, guard)?;
+    let socket = table.lookup_udp_ingress(event.src, event.dst, guard)?;
     let payload = socket.acquire_operational()?;
     let mut publish = NetworkPublish::none();
     if payload.record_recv_payload(event.src, event.dst, event.payload) {

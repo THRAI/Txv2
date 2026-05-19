@@ -1,12 +1,17 @@
 use smoltcp::time::Instant;
 use tx_reactor::wait::WaitOutcome;
+use tx_substrate::zone::PayloadCap;
 
 use crate::execution::{Guard, StepOutcome};
 use crate::net::execution::{
-    step_flush_pending_arp, step_process_device_tx_pending_at, step_process_loopback_pending,
-    step_process_network_events_at, step_process_network_tick, step_process_network_tick_loopback,
+    step_flush_pending_arp, step_process_device_tx_pending_in_namespace_at,
+    step_process_loopback_pending_in_namespace, step_process_network_events_in_namespace_at,
+    step_process_network_tick_in_namespace, step_process_network_tick_loopback_in_namespace,
     ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome, LoopbackPendingOutcome, LoopbackPollBudget,
     ARP_FLUSH_BUDGET_DEFAULT,
+};
+use crate::net::namespace::{
+    drive_all_net_namespace_runtimes_at, initial_net_namespace_payload, NetNamespacePayload,
 };
 use crate::net::packet::{PacketSource, PacketTxSink};
 use crate::net::protocol::{EtherIface, LoopbackIface};
@@ -20,6 +25,10 @@ use super::{
 pub trait NetDelegateDriver {
     fn now(&self) -> Instant;
     fn packet_source(&self) -> &dyn PacketSource;
+
+    fn net_namespace(&self) -> PayloadCap<NetNamespacePayload> {
+        initial_net_namespace_payload()
+    }
 
     fn packet_tx_sink(&self) -> Option<&dyn PacketTxSink> {
         None
@@ -59,6 +68,7 @@ pub struct NetDelegateRuntimeOutcome {
     pub device_tx: DeviceTxOutcome,
     pub arp_flush: ArpFlushOutcome,
     pub loopback: LoopbackPendingOutcome,
+    pub namespace_runtime: crate::net::namespace::NetNamespaceRuntimeOutcome,
     pub next_deadline: Option<Instant>,
 }
 
@@ -187,11 +197,15 @@ pub fn net_delegate_step_once(
         tick_seen,
         ..NetDelegateRuntimeOutcome::default()
     };
+    let net_namespace = driver.net_namespace();
 
     if poll_seen {
-        let StepOutcome::Done(events) =
-            step_process_network_events_at(driver.packet_source(), driver.now(), guard)
-        else {
+        let StepOutcome::Done(events) = step_process_network_events_in_namespace_at(
+            driver.packet_source(),
+            net_namespace.clone(),
+            driver.now(),
+            guard,
+        ) else {
             return outcome;
         };
         outcome.packets_seen += events.packets_seen;
@@ -203,9 +217,13 @@ pub fn net_delegate_step_once(
             earliest_deadline(outcome.next_deadline, events.backlog.next_deadline);
 
         if let Some(iface) = driver.loopback_iface() {
-            let StepOutcome::Done(loopback) =
-                step_process_loopback_pending(driver.now(), iface, driver.loopback_budget(), guard)
-            else {
+            let StepOutcome::Done(loopback) = step_process_loopback_pending_in_namespace(
+                driver.now(),
+                net_namespace.clone(),
+                iface,
+                driver.loopback_budget(),
+                guard,
+            ) else {
                 return outcome;
             };
             outcome.loopback.merge(loopback);
@@ -215,8 +233,9 @@ pub fn net_delegate_step_once(
         }
 
         if let Some(sink) = driver.packet_tx_sink() {
-            let StepOutcome::Done(device_tx) = step_process_device_tx_pending_at(
+            let StepOutcome::Done(device_tx) = step_process_device_tx_pending_in_namespace_at(
                 sink,
+                net_namespace.clone(),
                 driver.now(),
                 driver.device_tx_budget(),
                 guard,
@@ -245,12 +264,25 @@ pub fn net_delegate_step_once(
                 outcome.wakes_fired += net_delegate_kick_poll();
             }
         }
+
+        let namespace_runtime = drive_all_net_namespace_runtimes_at(driver.now(), guard);
+        if namespace_runtime.made_progress() {
+            outcome.wakes_fired += net_delegate_kick_poll();
+        }
+        outcome.sockets_touched += namespace_runtime.sockets_touched;
+        outcome.wakes_fired += namespace_runtime.wakes_fired;
+        outcome.namespace_runtime.merge(namespace_runtime);
     }
 
     if tick_seen {
         let tick = match driver.loopback_iface() {
-            Some(iface) => step_process_network_tick_loopback(driver.now(), iface, guard),
-            None => step_process_network_tick(driver.now(), guard),
+            Some(iface) => step_process_network_tick_loopback_in_namespace(
+                driver.now(),
+                net_namespace,
+                iface,
+                guard,
+            ),
+            None => step_process_network_tick_in_namespace(driver.now(), net_namespace, guard),
         };
         let StepOutcome::Done(tick) = tick else {
             return outcome;
@@ -282,6 +314,7 @@ impl NetDelegateRuntimeOutcome {
         self.arp_flush.tx_bytes += other.arp_flush.tx_bytes;
         self.arp_flush.remaining = other.arp_flush.remaining;
         self.loopback.merge(other.loopback);
+        self.namespace_runtime.merge(other.namespace_runtime);
         self.next_deadline = earliest_deadline(self.next_deadline, other.next_deadline);
     }
 }

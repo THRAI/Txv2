@@ -1,13 +1,21 @@
 use tx_substrate::zone::{self, Cap, PayloadCap};
 
 use crate::execution::{Errno, Guard, StepOutcome};
-use crate::net::structure::table::SOCKET_TABLE;
+use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::structure::{
     SocketIdentity, SocketKind, SocketOptionSet, SocketPayload, ValidSocketType,
 };
 
 pub fn step_socket_create(
     valid: ValidSocketType,
+    guard: &Guard<'_>,
+) -> StepOutcome<Cap<SocketIdentity>> {
+    step_socket_create_in_namespace(valid, initial_net_namespace_payload(), guard)
+}
+
+pub fn step_socket_create_in_namespace(
+    valid: ValidSocketType,
+    net_namespace: PayloadCap<NetNamespacePayload>,
     _guard: &Guard<'_>,
 ) -> StepOutcome<Cap<SocketIdentity>> {
     let kind = match SocketKind::from_valid_socket_type(valid) {
@@ -26,11 +34,19 @@ pub fn step_socket_create(
     let identity = zone::sign_for(identity_res, SocketIdentity::new(kind));
     let payload = PayloadCap::from_cap(zone::sign_for(
         payload_res,
-        SocketPayload::new(kind, SocketOptionSet::for_kind(kind)),
+        SocketPayload::new_in_namespace(kind, SocketOptionSet::for_kind(kind), net_namespace),
     ));
     identity.install_payload(payload);
 
-    if kind == SocketKind::RawIcmp && SOCKET_TABLE.register_raw_icmp(identity.clone()).is_err() {
+    let Some(payload) = identity.live_payload() else {
+        return StepOutcome::Err(Errno::ENOMEM);
+    };
+    if kind == SocketKind::RawIcmp
+        && payload
+            .socket_table()
+            .register_raw_icmp(identity.clone())
+            .is_err()
+    {
         return StepOutcome::Err(Errno::ENOMEM);
     }
 

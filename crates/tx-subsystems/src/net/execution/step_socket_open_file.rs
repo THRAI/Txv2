@@ -1,16 +1,18 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use tx_substrate::zone::Cap;
+use tx_substrate::zone::PayloadCap;
 
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::facade::SocketHandleFlags;
+use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::structure::{SocketIdentity, ValidSocketType};
 use crate::vfs::structure::{
     FsObjectId, InodeKind, InodeMeta, OpenFileFlags, RNode, RNodeBacking, StructPayload,
 };
 use crate::vfs::OpenFile;
 
-use super::step_socket_create;
+use super::step_socket_create_in_namespace;
 
 const SOCKET_FS_OBJECT_ID_BASE: u64 = 0xFFFE_0000_0000_0000;
 static NEXT_SOCKET_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(SOCKET_FS_OBJECT_ID_BASE);
@@ -29,12 +31,28 @@ pub fn step_socket_open_file(
     protocol: i32,
     guard: &Guard<'_>,
 ) -> StepOutcome<SocketOpenFileOutput> {
+    step_socket_open_file_in_namespace(
+        domain,
+        type_,
+        protocol,
+        initial_net_namespace_payload(),
+        guard,
+    )
+}
+
+pub fn step_socket_open_file_in_namespace(
+    domain: i32,
+    type_: i32,
+    protocol: i32,
+    net_namespace: PayloadCap<NetNamespacePayload>,
+    guard: &Guard<'_>,
+) -> StepOutcome<SocketOpenFileOutput> {
     let valid = match ValidSocketType::validate(domain, type_, protocol) {
         Ok(valid) => valid,
         Err(errno) => return StepOutcome::Err(errno),
     };
     let flags = SocketHandleFlags::from_sock_flags(valid.flags);
-    let identity = match step_socket_create(valid, guard) {
+    let identity = match step_socket_create_in_namespace(valid, net_namespace, guard) {
         StepOutcome::Done(identity) => identity,
         StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
             return StepOutcome::Err(Errno::EIO)

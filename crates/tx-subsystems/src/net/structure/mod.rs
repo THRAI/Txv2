@@ -16,7 +16,10 @@ pub use payload::{
     TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
 };
 pub use readiness::{AcceptWireSet, RecvWireSet, SendWireSet, SocketReadiness, UrgentEvent};
-pub use table::{ConnectionKey, ListenerKey, LocalEndpointKey, RawIcmpSocketKey, SocketTable};
+pub use table::{
+    ConnectionKey, InitialSocketTableProxy, ListenerKey, LocalEndpointKey, RawIcmpSocketKey,
+    SocketTable,
+};
 pub use types::{
     AddressFamily, IpEndpoint, IpLevelOptions, Ipv4Address, KernelSockAddr, LingerOption, PollMask,
     ProtocolNumber, RawIcmpState, SendRecvFlags, SockAddrIn, SockFlags, SockShutdownCmd,

@@ -1,10 +1,10 @@
 use alloc::vec::Vec;
 use smoltcp::time::Instant;
-use tx_substrate::zone::Cap;
+use tx_substrate::zone::{Cap, PayloadCap};
 
 use crate::execution::{Guard, StepOutcome};
+use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::protocol::LoopbackIface;
-use crate::net::structure::table::SOCKET_TABLE;
 use crate::net::structure::{Ipv4Address, SocketIdentity, SocketProtocol, TcpState, UdpInner};
 
 use super::{
@@ -79,14 +79,31 @@ impl LoopbackPendingOutcome {
 }
 
 pub fn step_process_loopback_pending(
+    now: Instant,
+    iface: &LoopbackIface,
+    budget: LoopbackPollBudget,
+    guard: &Guard<'_>,
+) -> StepOutcome<LoopbackPendingOutcome> {
+    step_process_loopback_pending_in_namespace(
+        now,
+        initial_net_namespace_payload(),
+        iface,
+        budget,
+        guard,
+    )
+}
+
+pub fn step_process_loopback_pending_in_namespace(
     _now: Instant,
+    net_namespace: PayloadCap<NetNamespacePayload>,
     iface: &LoopbackIface,
     budget: LoopbackPollBudget,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackPendingOutcome> {
     let mut outcome = LoopbackPendingOutcome::default();
+    let table = net_namespace.socket_table();
 
-    for socket in SOCKET_TABLE
+    for socket in table
         .snapshot_tcp_bound(guard)
         .into_iter()
         .filter(is_tcp_connecting)
@@ -109,7 +126,7 @@ pub fn step_process_loopback_pending(
     }
 
     let mut tcp_connections_seen = Vec::new();
-    for socket in SOCKET_TABLE
+    for socket in table
         .snapshot_tcp_connections(guard)
         .into_iter()
         .filter(is_tcp_connected)
@@ -143,10 +160,10 @@ pub fn step_process_loopback_pending(
     }
 
     let mut udp_bound_seen = Vec::new();
-    for socket in SOCKET_TABLE
+    for socket in table
         .snapshot_udp_bound(guard)
         .into_iter()
-        .chain(SOCKET_TABLE.snapshot_udp_connections(guard))
+        .chain(table.snapshot_udp_connections(guard))
         .filter(|socket| has_udp_loopback_tx_pending(socket, iface))
     {
         if !remember_socket(&mut udp_bound_seen, &socket) {
@@ -174,7 +191,7 @@ pub fn step_process_loopback_pending(
     }
 
     let mut raw_icmp_seen = Vec::new();
-    for socket in SOCKET_TABLE
+    for socket in table
         .snapshot_raw_icmp(guard)
         .into_iter()
         .filter(|socket| is_raw_icmp_loopback_pending(socket, iface))

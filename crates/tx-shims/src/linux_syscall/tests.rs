@@ -1501,3 +1501,14 @@ mod kernel_user_layouts;
 // =====================================================================
 
 mod socket_fdtable;
+
+// =====================================================================
+// Network N71M3 — namespace user ABI.
+//
+// Coverage:
+// - `unshare(CLONE_NEWNET)` publishes a fresh process net namespace.
+// - `setns(fd, CLONE_NEWNET)` joins a namespace fd payload.
+// - `/proc/<pid>/ns/net` materialises as a struct-backed namespace fd.
+// =====================================================================
+
+mod netns_syscalls;

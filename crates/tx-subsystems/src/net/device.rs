@@ -5,10 +5,21 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::device::DevT;
 use crate::execution::{Errno, Guard, StepOutcome};
+use crate::net::admin::NetAdminAuthority;
 use crate::net::packet::{PacketTxReadiness, RxFrame};
 
+mod bridge;
+mod veth;
 mod virtio;
 
+pub use bridge::{
+    create_bridge_for_test_or_bootstrap, BridgeConfig, BridgeDevice, BridgeForwardOutcome,
+    BridgeInstance, BridgePortSnapshot, BridgeSnapshot, BRIDGE_FORWARD_BUDGET_DEFAULT,
+};
+pub use veth::{
+    create_veth_pair_for_test_or_bootstrap, VethDevice, VethEndpointConfig, VethPair,
+    VethPairConfig, VethStatsSnapshot, VETH_DEFAULT_MTU,
+};
 pub use virtio::{
     VirtioNetConfig, VirtioNetDevice, VirtioNetFeatureSet, VirtioNetIrqEvent, VirtioNetIrqOutcome,
     VirtioNetQueueConfig, VirtioNetRxInjectOutcome, VirtioNetStats, VirtioNetStatsSnapshot,
@@ -18,7 +29,7 @@ pub use virtio::{
 
 pub type NetDeviceIrqOutcome = VirtioNetIrqOutcome;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct EthernetAddress(pub [u8; 6]);
 
 impl EthernetAddress {
@@ -31,6 +42,22 @@ impl EthernetAddress {
     pub const fn octets(self) -> [u8; 6] {
         self.0
     }
+
+    pub const fn is_broadcast(self) -> bool {
+        matches!(self.0, [0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
+    }
+
+    pub const fn is_multicast(self) -> bool {
+        (self.0[0] & 1) != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetDeviceKind {
+    Loopback,
+    Ethernet,
+    Veth,
+    Bridge,
 }
 
 pub trait NetDeviceOps: Send + Sync + 'static {
@@ -42,6 +69,33 @@ pub trait NetDeviceOps: Send + Sync + 'static {
     }
     fn mac_addr(&self) -> EthernetAddress;
     fn mtu(&self) -> u16;
+    fn device_kind(&self) -> NetDeviceKind {
+        NetDeviceKind::Ethernet
+    }
+
+    fn bridge_snapshot(&self) -> Option<BridgeSnapshot> {
+        None
+    }
+
+    fn bridge_add_port(
+        &self,
+        _authority: NetAdminAuthority,
+        _registration: &'static NetDeviceRegistration,
+    ) -> Result<(), Errno> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    fn bridge_remove_port(
+        &self,
+        _authority: NetAdminAuthority,
+        _registration: &'static NetDeviceRegistration,
+    ) -> Result<(), Errno> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    fn bridge_poll(&self, _guard: &Guard<'_>) -> Option<BridgeForwardOutcome> {
+        None
+    }
 
     fn enable_interrupts(&self) {}
 
