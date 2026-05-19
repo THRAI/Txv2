@@ -22,6 +22,7 @@ unsafe impl ZoneAllocated for ZoneSmokeObj {
 
 pub fn register_all() -> Result<(), ZoneError> {
     smoke::register_zones()?;
+    nsproxy::register_zones()?;
     process::register_zones()?;
     thread::register_zones()?;
     vm::register_zones()?;
@@ -31,6 +32,7 @@ pub fn register_all() -> Result<(), ZoneError> {
     tty::register_zones()?;
     pipe::register_zones()?;
     futex::register_zones()?;
+    ipc::register_zones()?;
     cred::register_zones()?;
     userfaultfd::register_zones()?;
     aio::register_zones()?;
@@ -256,6 +258,14 @@ mod pipe {
     }
 }
 
+mod ipc {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        crate::ipc::register_zones()
+    }
+}
+
 mod futex {
     use super::*;
 
@@ -338,6 +348,14 @@ mod timerfd {
 /// (per D5 §7); the real append-only stack lands in PR-K. Until then,
 /// shim arms mint a fresh placeholder cap per syscall entry through
 /// [`crate::cred::placeholder_restrictions_cap`].
+mod nsproxy {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        crate::process::nsproxy::register_zones()
+    }
+}
+
 mod subject_placeholders {
     use super::*;
 

@@ -34,6 +34,7 @@ use crate::zone::Cap;
 /// similarly load-bearing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Errno {
+    E2BIG,
     EACCES,
     /// Resource temporarily unavailable. Surfaced by `O_NONBLOCK` I/O
     /// paths (e.g. fd-ops Wave 3 `pipe::step_read` / `step_write` with
@@ -50,6 +51,8 @@ pub enum Errno {
     EBUSY,
     EDQUOT,
     EEXIST,
+    EFBIG,
+    EIDRM,
     EFAULT,
     EINVAL,
     /// Interrupted system call (e.g. by signal delivery during a

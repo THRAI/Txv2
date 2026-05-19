@@ -283,9 +283,13 @@ pub fn bootstrap_init_process(
     // NOT close-on-exec by Linux convention. Per the Wave 2 plan,
     // until `sys_open` exists in the trio's syscall surface, the
     // bitmap is mutated only by `fcntl(F_SETFD)`.
+    // Create the init namespace proxy. Day-1: all namespace caps
+    // point at init-namespace stubs; mnt_ns is deferred.
+    let nsproxy = crate::process::nsproxy::sign_init_nsproxy()?;
     let payload = sign_process_payload(
         aspace,
         vec![leader],
+        nsproxy,
         Cred::root(),
         None,
         BTreeMap::new(),
@@ -373,6 +377,7 @@ pub fn step_fork<P: PmapIf>(
     // `AddressSpace::fork_aspace` below.
     let (
         parent_aspace,
+        parent_nsproxy,
         parent_cred,
         parent_cwd,
         parent_fds,
@@ -385,6 +390,7 @@ pub fn step_fork<P: PmapIf>(
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
         (
             payload.aspace_cap(),
+            payload.nsproxy_cap(),
             payload.cred(),
             payload.cwd(),
             payload.snapshot_fds(),
@@ -422,9 +428,14 @@ pub fn step_fork<P: PmapIf>(
     // copied across fork — the child sees the parent's snapshot at
     // fork time; subsequent `fcntl(F_SETFD)` calls in either parent
     // or child do not affect the other.
+    // Clone the parent's nsproxy. POSIX: fork inherits the parent's
+    // namespace bundle. CLONE_NEWIPC / CLONE_NEWPID / ... (future)
+    // will replace the nsproxy with a fresh bundle for unshared nss.
+    let child_nsproxy = crate::process::nsproxy::clone_nsproxy(&parent_nsproxy);
     let payload = sign_process_payload(
         child_aspace_cap,
         vec![leader],
+        child_nsproxy,
         parent_cred,
         parent_cwd,
         parent_fds,
@@ -1037,6 +1048,7 @@ fn sign_process_identity(
 fn sign_process_payload(
     aspace: Cap<AddressSpace>,
     threads: Vec<Cap<ThreadIdentity>>,
+    nsproxy: Cap<crate::process::nsproxy::NsProxy>,
     cred: Cred,
     cwd: Option<Cap<crate::vfs::DEntry>>,
     fds: BTreeMap<u32, Cap<OpenFile>>,
@@ -1064,6 +1076,12 @@ fn sign_process_payload(
     let cred_slot: AtomicSlot<Cap<crate::cred::Cred>> = AtomicSlot::empty();
     cred_slot.store(Some(cred_cap));
 
+    // Namespace proxy slot — the caller provides the immutable
+    // namespace bundle (init nsproxy for bootstrap, parent clone for
+    // fork, or a new bundle for unshare).
+    let nsproxy_slot: AtomicSlot<Cap<crate::process::nsproxy::NsProxy>> = AtomicSlot::empty();
+    nsproxy_slot.store(Some(nsproxy));
+
     // Allocate a fresh `exit_source` Channel per `ProcessPayload` and
     // register it with the global wait-source resolver so async
     // awaiters can `wait_on_token` against the returned id without
@@ -1090,6 +1108,7 @@ fn sign_process_payload(
         siginfo_slots: crate::signal::SigInfoSlots::new(),
         signal_port: RawPort::new(),
         cred: cred_slot,
+        nsproxy: nsproxy_slot,
         cwd: SpinMutex::new(cwd),
         fds: SpinMutex::new(fds),
         fd_cloexec: SpinMutex::new(fd_cloexec),
