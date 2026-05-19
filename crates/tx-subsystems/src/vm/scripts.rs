@@ -52,10 +52,14 @@ use crate::vm::{
 pub const USER_STACK_TOP_DEFAULT: u64 = 0x4000_0000;
 
 /// Default initial reservation for the userspace stack region. Sized
-/// at 16 KiB (4 pages) per `txdoc:EXEC-9-3-POPULATE-THE-INITIAL-USER-STACK`.
+/// at 8 MiB to match Linux's common soft `RLIMIT_STACK` default closely
+/// enough for real Alpine dynamic programs such as `nft`, while still
+/// remaining recipe-only until userspace faults pages in.
+///
 /// Stack growth via a future `expand_stack` script is out of scope for
-/// the initial slice.
-pub const USER_STACK_INITIAL_RESERVATION: u64 = 16 * 1024;
+/// the initial slice; this reservation gives real workloads enough room
+/// before that dynamic growth path exists.
+pub const USER_STACK_INITIAL_RESERVATION: u64 = 8 * 1024 * 1024;
 
 /// Default load bias for an ET_DYN interpreter (N69a).
 ///

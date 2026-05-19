@@ -319,6 +319,35 @@ fn parse_image_plan_accepts_pt_interp_segment_and_emits_ref() {
 }
 
 #[test]
+fn parse_image_plan_et_dyn_with_pt_interp_emits_ref() {
+    // Real Alpine userland tools are PIE ET_DYN binaries with PT_INTERP.
+    // They must go through the dynamic interpreter; treating them as
+    // static PIE jumps into unrelocated code.
+    let mut cfg = FixtureCfg::minimal();
+    cfg.e_type = ET_DYN_U16;
+    cfg.e_entry = 0x80;
+    cfg.phdrs[0].p_vaddr = 0x0;
+    cfg.phdrs[0].p_paddr = 0x0;
+    cfg.phdrs.push(PhdrSpec {
+        p_type: PT_INTERP_U32,
+        p_flags: PF_R_BIT,
+        p_offset: 96,
+        p_vaddr: 96,
+        p_paddr: 96,
+        p_filesz: 32,
+        p_memsz: 32,
+        p_align: 1,
+    });
+    let bytes = cfg.build();
+    let plan = parse_image_plan(&bytes).expect("ET_DYN PT_INTERP is accepted");
+    assert_eq!(plan.load_bias, 0x10000);
+    assert_eq!(plan.entry, 0x10080);
+    let interp = plan.interp.expect("interp ref recorded for PIE");
+    assert_eq!(interp.file_offset, 96);
+    assert_eq!(interp.filesz, 32);
+}
+
+#[test]
 fn parse_image_plan_rejects_empty_pt_interp() {
     // Zero `p_filesz` is malformed — the toolchain never emits this
     // for a real interpreter path. Surface it loudly.

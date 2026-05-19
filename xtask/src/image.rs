@@ -19,12 +19,16 @@ pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
     let target = image_target(&args[1..])?;
     match (kind.as_str(), profile) {
         ("cpio" | "initramfs", Profile::Busybox) => image_cpio_busybox(root, target),
+        ("cpio" | "initramfs", Profile::Alpine) => image_cpio_alpine(root, &args[1..], target),
         ("ext4", Profile::Busybox) => {
             let name = busybox_root_ext4_name(target);
             image_ext4_busybox(root, &args[1..], target, &name)
         }
         ("m1dock-sd", Profile::Busybox) => {
             image_ext4_busybox(root, &args[1..], target, "m1dock-sd.img")
+        }
+        ("ext4" | "m1dock-sd", Profile::Alpine) => {
+            Err("image alpine profile currently supports cpio/initramfs only".into())
         }
         ("cpio" | "initramfs" | "ext4" | "m1dock-sd", Profile::Smoke) => {
             Err("image smoke profile is not defined; use --profile busybox".into())
@@ -37,6 +41,10 @@ pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
 
 pub(crate) fn busybox_initramfs_name(target: TxTarget) -> String {
     format!("busybox-initramfs-{}.cpio", target.name())
+}
+
+pub(crate) fn alpine_initramfs_name(target: TxTarget) -> String {
+    format!("alpine-initramfs-{}.cpio", target.name())
 }
 
 pub(crate) fn busybox_root_ext4_name(target: TxTarget) -> String {
@@ -59,6 +67,32 @@ fn image_cpio_busybox(root: &Path, target: TxTarget) -> Result<()> {
         .join("target")
         .join("images")
         .join(busybox_initramfs_name(target));
+    fs::create_dir_all(out.parent().expect("image path has parent"))
+        .map_err(|err| err.to_string())?;
+    remove_existing_image(&out)?;
+
+    let script = format!(
+        "cd '{}' && find . -print | cpio -o -H newc > '{}'",
+        shell_escape(&layout.display().to_string()),
+        shell_escape(&out.display().to_string())
+    );
+    run_shell(root, &script)?;
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
+fn image_cpio_alpine(root: &Path, args: &[String], target: TxTarget) -> Result<()> {
+    if target != TxTarget::Rv64Qemu {
+        return Err("alpine image profile is currently supported only for rv64-qemu".into());
+    }
+    if !command_exists("cpio") {
+        return Err("cpio is required to create the alpine initramfs".into());
+    }
+    let layout = prepare_alpine_rootfs(root, args, target)?;
+    let out = root
+        .join("target")
+        .join("images")
+        .join(alpine_initramfs_name(target));
     fs::create_dir_all(out.parent().expect("image path has parent"))
         .map_err(|err| err.to_string())?;
     remove_existing_image(&out)?;
@@ -250,6 +284,96 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
     }
 
     Ok(layout)
+}
+
+fn prepare_alpine_rootfs(root: &Path, args: &[String], target: TxTarget) -> Result<PathBuf> {
+    let source = resolve_alpine_rootfs(root, args, target)?;
+    if !source.is_dir() {
+        return Err(format!(
+            "alpine rootfs source must be a directory, got {}",
+            source.display()
+        ));
+    }
+
+    let layout = root
+        .join("target")
+        .join("rootfs")
+        .join(format!("alpine-stage-{}", target.name()));
+    if layout.exists() {
+        fs::remove_dir_all(&layout).map_err(|err| err.to_string())?;
+    }
+    fs::create_dir_all(&layout).map_err(|err| err.to_string())?;
+
+    let script = format!(
+        "cp -a '{}'/'.' '{}'",
+        shell_escape(&source.display().to_string()),
+        shell_escape(&layout.display().to_string())
+    );
+    run_shell(root, &script)?;
+
+    for dir in ["dev", "proc", "sys", "tmp", "run", "var/run"] {
+        fs::create_dir_all(layout.join(dir)).map_err(|err| err.to_string())?;
+    }
+    install_alpine_bootstrap_busybox(root, target, args, &layout)?;
+    Ok(layout)
+}
+
+fn resolve_alpine_rootfs(root: &Path, args: &[String], target: TxTarget) -> Result<PathBuf> {
+    if let Some(value) = optional_option_value(args, "--rootfs") {
+        return Ok(resolve_root_path(root, &value));
+    }
+    if let Ok(value) = env::var("TX_ALPINE_ROOTFS") {
+        return Ok(resolve_root_path(root, &value));
+    }
+    Ok(root
+        .join("target")
+        .join("rootfs")
+        .join(format!("alpine-{}", target.name())))
+}
+
+fn resolve_root_path(root: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+fn install_alpine_bootstrap_busybox(
+    root: &Path,
+    target: TxTarget,
+    args: &[String],
+    layout: &Path,
+) -> Result<()> {
+    if target != TxTarget::Rv64Qemu {
+        return Ok(());
+    }
+    if args.iter().any(|arg| arg == "--no-bootstrap-busybox")
+        || env::var("TX_ALPINE_BOOTSTRAP_BUSYBOX").as_deref() == Ok("0")
+    {
+        return Ok(());
+    }
+
+    let busybox = resolve_busybox(root, target)?;
+    let bin = layout.join("bin");
+    fs::create_dir_all(&bin).map_err(|err| err.to_string())?;
+    fs::copy(&busybox, bin.join("busybox")).map_err(|err| err.to_string())?;
+
+    #[cfg(unix)]
+    {
+        let sh = bin.join("sh");
+        if sh.exists() {
+            fs::remove_file(&sh).map_err(|err| err.to_string())?;
+        }
+        unix_fs::symlink("busybox", sh).map_err(|err| err.to_string())?;
+    }
+
+    println!(
+        "alpine: installed static bootstrap busybox from {}",
+        busybox.display()
+    );
+    Ok(())
 }
 
 /// Optionally install OSComp/RustOS network benchmark binaries into

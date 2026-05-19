@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::image::{busybox_initramfs_name, busybox_root_ext4_name};
+use crate::image::{alpine_initramfs_name, busybox_initramfs_name, busybox_root_ext4_name};
 use crate::target::{Profile, TxTarget};
 use crate::util::{option_value, optional_option_value, shell_join, tail_lines};
 use crate::Result;
@@ -260,7 +260,7 @@ fn qemu_command(
 
     args.extend([
         "-m".to_string(),
-        qemu_memory(target).to_string(),
+        qemu_memory(target, profile).to_string(),
         "-smp".to_string(),
         qemu_smp(target, options).to_string(),
         // Force multi-threaded TCG: vCPUs run on parallel host threads
@@ -306,15 +306,20 @@ fn qemu_command(
         args.push("-no-shutdown".into());
     }
 
-    if profile == Profile::Busybox {
-        let initramfs = root
-            .join("target")
-            .join("images")
-            .join(busybox_initramfs_name(target));
-        let cmdline = if target == TxTarget::Rv64M1DockMock {
-            "tx.profile=busybox tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0"
-        } else {
-            "tx.profile=busybox console=ttyS0"
+    if matches!(profile, Profile::Busybox | Profile::Alpine) {
+        let initramfs_name = match profile {
+            Profile::Busybox => busybox_initramfs_name(target),
+            Profile::Alpine => alpine_initramfs_name(target),
+            Profile::Smoke => unreachable!("handled by outer profile match"),
+        };
+        let initramfs = root.join("target").join("images").join(initramfs_name);
+        let cmdline = match (profile, target) {
+            (Profile::Busybox, TxTarget::Rv64M1DockMock) => {
+                "tx.profile=busybox tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0"
+            }
+            (Profile::Busybox, _) => "tx.profile=busybox console=ttyS0",
+            (Profile::Alpine, _) => "tx.profile=alpine init=/bin/sh console=ttyS0",
+            (Profile::Smoke, _) => unreachable!("handled by outer profile match"),
         };
         args.push("-initrd".into());
         args.push(initramfs.display().to_string());
@@ -433,10 +438,11 @@ fn qemu_cpu(target: TxTarget) -> Option<&'static str> {
     }
 }
 
-fn qemu_memory(target: TxTarget) -> &'static str {
-    match target {
-        TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => "256M",
-        TxTarget::La64Qemu => "1152M",
+fn qemu_memory(target: TxTarget, profile: Profile) -> &'static str {
+    match (target, profile) {
+        (TxTarget::Rv64Qemu, Profile::Alpine) => "512M",
+        (TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock, _) => "256M",
+        (TxTarget::La64Qemu, _) => "1152M",
     }
 }
 

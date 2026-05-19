@@ -211,7 +211,8 @@ pub struct ExecImagePlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParseMode {
     /// Top-level executable. Accepts `ET_EXEC` and `ET_DYN`; records
-    /// `PT_INTERP` only for `ET_EXEC` dynamic-linker handoff.
+    /// `PT_INTERP` for either executable shape. An `ET_DYN` image without
+    /// `PT_INTERP` remains a static PIE and runs directly at load bias.
     MainProgram,
     /// Dynamic interpreter (musl `libc.so`). Requires `ET_DYN`;
     /// rejects `PT_INTERP` (defensive: an interp may not have an
@@ -322,12 +323,6 @@ fn parse_with_mode(elf_bytes: &[u8], mode: ParseMode) -> Result<ExecImagePlan, P
         match phdr.p_type {
             PT_INTERP => match mode {
                 ParseMode::MainProgram => {
-                    if is_dyn {
-                        // Preserve the static-PIE main-program behavior:
-                        // run it directly at entry+load_bias and do not
-                        // recursively load another interpreter.
-                        continue;
-                    }
                     // At most one PT_INTERP per image; reject duplicates
                     // and zero-size shapes loudly. The orchestrator
                     // tolerates a single trailing NUL inside `filesz`.

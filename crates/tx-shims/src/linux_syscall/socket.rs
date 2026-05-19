@@ -31,7 +31,7 @@ const MSGHDR_NAMELEN_OFFSET: u64 = 8;
 const MSGHDR_CONTROLLEN_OFFSET: u64 = 40;
 const MSGHDR_FLAGS_OFFSET: u64 = 48;
 const MAX_MSG_IOV: u64 = 1024;
-const NETLINK_RECVMSG_MAX: usize = 64 * 1024;
+const NETLINK_RECVMSG_MAX: usize = 1024 * 1024;
 const IPT_GETINFO_BYTES: usize = 84;
 const IPT_GET_ENTRIES_EMPTY_BYTES: usize = 36;
 
@@ -520,7 +520,7 @@ pub(super) async fn sys_recvfrom<'a, P: TimeIf>(
         socket.kind,
         SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
     ) {
-        let mut staging = alloc::vec![0; len.min(TTY_WRITE_MAX_INLINE)];
+        let mut staging = alloc::vec![0; len.min(NETLINK_RECVMSG_MAX)];
         let result = match socket.kind {
             SocketKind::NetlinkRoute => netlink_route_recv(&socket, &mut staging, flags),
             SocketKind::NetlinkNetfilter => netlink_netfilter_recv(&socket, &mut staging, flags),
@@ -615,7 +615,7 @@ pub(super) async fn sys_sendmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
             Ok(iovecs) => iovecs,
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         };
-        let total_len = match iov_total_len(&iovecs) {
+        let total_len = match iov_total_len_with_limit(&iovecs, NETLINK_RECVMSG_MAX) {
             Ok(total_len) => total_len,
             Err(errno_value) => return SyscallResult::Error(errno_value),
         };
@@ -977,6 +977,18 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             };
             Ok(())
         }
+        (SOL_NETLINK, NETLINK_EXT_ACK)
+            if matches!(
+                socket.kind,
+                SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
+            ) =>
+        {
+            let _ = match read_sockopt_bool(ctx, optval, optlen) {
+                Ok(on) => on,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            Ok(())
+        }
         (IPPROTO_IP, IPT_SO_SET_REPLACE) | (IPPROTO_IP, IPT_SO_SET_ADD_COUNTERS) => {
             Err(Errno::EOPNOTSUPP)
         }
@@ -1084,6 +1096,14 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         (IPPROTO_TCP, TCP_MAXSEG) => write_sockopt_i32(ctx, optval, optlen_ptr, 1460),
         (IPPROTO_TCP, TCP_INFO) => write_sockopt_bytes(ctx, optval, optlen_ptr, &[0u8; 104]),
         (IPPROTO_TCP, TCP_CONGESTION) => write_sockopt_bytes(ctx, optval, optlen_ptr, b"reno\0"),
+        (SOL_NETLINK, NETLINK_EXT_ACK)
+            if matches!(
+                socket.kind,
+                SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
+            ) =>
+        {
+            write_sockopt_i32(ctx, optval, optlen_ptr, 1)
+        }
         (IPPROTO_IP, IPT_SO_GET_INFO) => {
             write_sockopt_bytes(ctx, optval, optlen_ptr, &[0u8; IPT_GETINFO_BYTES])
         }

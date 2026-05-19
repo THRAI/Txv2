@@ -18,6 +18,9 @@ const NFT_MSG_NEWTABLE: u16 = 0;
 const NFT_MSG_NEWCHAIN: u16 = 3;
 const NFT_MSG_NEWRULE: u16 = 6;
 const NFT_MSG_DELRULE: u16 = 8;
+const NFT_MSG_GETSET: u16 = 10;
+const NFT_MSG_GETOBJ: u16 = 19;
+const NFT_MSG_GETFLOWTABLE: u16 = 23;
 const NFNL_MSG_BATCH_BEGIN: u16 = 0x10;
 const NFNL_MSG_BATCH_END: u16 = 0x11;
 const NFTA_TABLE_NAME: u16 = 1;
@@ -196,6 +199,80 @@ fn nfnetlink_newtable_newchain_and_newrule_add_masquerade_rule() {
     assert!(dump.iter().any(|msg| {
         nlmsg_type(msg) == nft_msg(NFT_MSG_NEWRULE) && contains_bytes(msg, b"masquerade")
     }));
+    assert!(dump
+        .iter()
+        .any(|msg| nlmsg_type(msg) == nft_msg(NFT_MSG_NEWRULE) && contains_bytes(msg, b"masq\0")));
+}
+
+#[test]
+fn nfnetlink_accepts_network_order_nft_numeric_attrs() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    reset_netfilter_for_test();
+    crate::net::nfnetlink::reset_nfnetlink_for_test();
+
+    assert_ack_ok(
+        &crate::net::nfnetlink_handle_request(&nlmsg(
+            nft_msg(NFT_MSG_NEWTABLE),
+            0x29,
+            table_payload("nat"),
+        ))[0],
+    );
+    assert_ack_ok(
+        &crate::net::nfnetlink_handle_request(&nlmsg(
+            nft_msg(NFT_MSG_NEWCHAIN),
+            0x2a,
+            chain_payload_be("nat", "postrouting", 4, 100),
+        ))[0],
+    );
+
+    let rule = crate::net::nfnetlink_handle_request(&nlmsg(
+        nft_msg(NFT_MSG_NEWRULE),
+        0x2b,
+        rule_payload(
+            "nat",
+            "postrouting",
+            vec![
+                expr_payload_be(NFT_REG32_00, NFT_PAYLOAD_NETWORK_HEADER, 12, 2),
+                expr_cmp_be(NFT_REG32_00, &[172, 17]),
+                expr_empty("masq"),
+            ],
+        ),
+    ));
+    assert_ack_ok(&rule[0]);
+
+    let rules = netfilter_rules_snapshot();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].target, NetfilterTarget::Masquerade);
+    assert_eq!(
+        rules[0].src,
+        Some(NetfilterIpv4Cidr {
+            addr: Ipv4Address::new([172, 17, 0, 0]),
+            prefix_len: 16,
+        })
+    );
+}
+
+#[test]
+fn nfnetlink_empty_ancillary_dumps_return_done() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    reset_netfilter_for_test();
+    crate::net::nfnetlink::reset_nfnetlink_for_test();
+
+    for (msg, seq) in [
+        (NFT_MSG_GETSET, 0x2c),
+        (NFT_MSG_GETOBJ, 0x2d),
+        (NFT_MSG_GETFLOWTABLE, 0x2e),
+    ] {
+        let responses = crate::net::nfnetlink_handle_request(&nlmsg(nft_msg(msg), seq, nfgenmsg()));
+        assert_eq!(responses.len(), 1);
+        assert_eq!(nlmsg_type(&responses[0]), NLMSG_DONE);
+    }
 }
 
 #[test]
@@ -360,6 +437,9 @@ fn nfnetlink_batch_create_dump_and_delete_masquerade_rule() {
     assert!(dump_responses.iter().any(|msg| {
         nlmsg_type(msg) == nft_msg(NFT_MSG_NEWRULE) && contains_bytes(msg, b"masquerade")
     }));
+    assert!(dump_responses
+        .iter()
+        .any(|msg| nlmsg_type(msg) == nft_msg(NFT_MSG_NEWRULE) && contains_bytes(msg, b"masq\0")));
 
     let mut delete = Vec::new();
     delete.extend_from_slice(&batch_marker(NFNL_MSG_BATCH_BEGIN, 0x69));
@@ -508,6 +588,18 @@ fn chain_payload(table: &str, name: &str, hook: u32, priority: i32) -> Vec<u8> {
     out
 }
 
+fn chain_payload_be(table: &str, name: &str, hook: u32, priority: i32) -> Vec<u8> {
+    let mut out = nfgenmsg();
+    push_attr_string(&mut out, NFTA_CHAIN_TABLE, table);
+    push_attr_string(&mut out, NFTA_CHAIN_NAME, name);
+    push_attr_string(&mut out, NFTA_CHAIN_TYPE, table);
+    push_nested_attr(&mut out, NFTA_CHAIN_HOOK, |nested| {
+        push_attr_u32_be(nested, NFTA_HOOK_HOOKNUM, hook);
+        push_attr_u32_be(nested, NFTA_HOOK_PRIORITY, priority as u32);
+    });
+    out
+}
+
 fn rule_payload(table: &str, chain: &str, expressions: Vec<Vec<u8>>) -> Vec<u8> {
     let mut out = nfgenmsg();
     push_attr_string(&mut out, NFTA_RULE_TABLE, table);
@@ -563,6 +655,15 @@ fn expr_payload(dreg: u32, base: u32, offset: u32, len: u32) -> Vec<u8> {
     })
 }
 
+fn expr_payload_be(dreg: u32, base: u32, offset: u32, len: u32) -> Vec<u8> {
+    expr_with_data("payload", |data| {
+        push_attr_u32_be(data, NFTA_PAYLOAD_DREG, dreg);
+        push_attr_u32_be(data, NFTA_PAYLOAD_BASE, base);
+        push_attr_u32_be(data, NFTA_PAYLOAD_OFFSET, offset);
+        push_attr_u32_be(data, NFTA_PAYLOAD_LEN, len);
+    })
+}
+
 fn expr_bitwise_ipv4_mask(sreg: u32, dreg: u32, mask: [u8; 4]) -> Vec<u8> {
     expr_with_data("bitwise", |data| {
         push_attr_u32(data, NFTA_BITWISE_SREG, sreg);
@@ -581,6 +682,16 @@ fn expr_cmp(sreg: u32, value: &[u8]) -> Vec<u8> {
     expr_with_data("cmp", |data| {
         push_attr_u32(data, NFTA_CMP_SREG, sreg);
         push_attr_u32(data, NFTA_CMP_OP, NFT_CMP_EQ);
+        push_nested_attr(data, NFTA_CMP_DATA, |nested| {
+            push_attr(nested, NFTA_DATA_VALUE, value);
+        });
+    })
+}
+
+fn expr_cmp_be(sreg: u32, value: &[u8]) -> Vec<u8> {
+    expr_with_data("cmp", |data| {
+        push_attr_u32_be(data, NFTA_CMP_SREG, sreg);
+        push_attr_u32_be(data, NFTA_CMP_OP, NFT_CMP_EQ);
         push_nested_attr(data, NFTA_CMP_DATA, |nested| {
             push_attr(nested, NFTA_DATA_VALUE, value);
         });
@@ -675,6 +786,10 @@ fn push_attr_string(out: &mut Vec<u8>, kind: u16, value: &str) {
 
 fn push_attr_u32(out: &mut Vec<u8>, kind: u16, value: u32) {
     push_attr(out, kind, &value.to_le_bytes());
+}
+
+fn push_attr_u32_be(out: &mut Vec<u8>, kind: u16, value: u32) {
+    push_attr(out, kind, &value.to_be_bytes());
 }
 
 fn push_attr_u64(out: &mut Vec<u8>, kind: u16, value: u64) {
