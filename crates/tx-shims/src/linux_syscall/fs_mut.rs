@@ -1133,3 +1133,12 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
+
+/// sys_syslog(2). Minimal stub — returns success for all log types.
+/// Does not actually read or write the kernel log buffer. Busybox
+/// `syslogd` calls this to open/read the log; the stub prevents
+/// busybox from blocking on ENOSYS while acknowledging that no real
+/// kernel log is available.
+pub(super) fn sys_syslog<'a>(_args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SyscallResult::Return(0)
+}
