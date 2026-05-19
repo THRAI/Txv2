@@ -26,25 +26,15 @@ skills:
   tx-design-reference:
     sources:
       - docs/design/INDEX.md
-      - docs/Txv3/INDEX.md
-      - docs/Txv3/00_PREFACE.md
-      - docs/Txv3/01_CONCEPTS_v5.md
-      - docs/Txv3/02_INVARIANTS_v5.md
-      - docs/Txv3/03_STEP_MODEL_v2.md
       - docs/design/00_meta-framework/CONCEPTS_v4.md
       - docs/design/00_meta-framework/INVARIANTS_v4.md
       - docs/design/00_meta-framework/CI_REPORTING_v1.md
       - docs/design/00_meta-framework/MODULE_MAP_v1.md
       - docs/design/00_meta-framework/object_model_v2.md
       - docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md
-      - docs/design/04_process-signals/SIGNAL_v1.md
-      - docs/design/04_process-signals/SIGNAL_ATTACHMENTS_v1.md
-      - docs/design/04_process-signals/PROCESS_v1.md
-      - docs/design/06_devices/TTY.md
-      - docs/design/03_memory-vm/PAGE_BACKED_v1.md
       - docs/ebr-zone/02_EBR_design.en-US.md
       - docs/ebr-zone/03_Zone_Cap_object_storage_design.en-US.md
-    purpose: Gather the relevant active design docs for an implementation, audit, or planning task. Knows the v4/v5 supersession map and the scattered-IPC reading order (no canonical IPC doc exists yet).
+    purpose: Gather the relevant active design docs for an implementation, audit, or planning task.
 
   tx-code-reorganization:
     sources:
@@ -59,14 +49,11 @@ skills:
   tx-docs-cleanup:
     sources:
       - docs/design/INDEX.md
-      - docs/Txv3/INDEX.md
-      - docs/Txv3/01_CONCEPTS_v5.md
-      - docs/Txv3/02_INVARIANTS_v5.md
       - docs/design/00_meta-framework/CONCEPTS_v4.md
       - docs/design/00_meta-framework/INVARIANTS_v4.md
       - docs/design/00_meta-framework/CI_REPORTING_v1.md
       - docs/design/00_meta-framework/MODULE_MAP_v1.md
-    purpose: Broad active-doc cleanup, link checking, stale-term scans (aware of v4→v5 supersession boundary).
+    purpose: Broad active-doc cleanup, link checking, stale-term scans.
 
   tx-docs-skill-maintenance:
     sources:
@@ -80,22 +67,17 @@ skills:
 
   tx-meta-alignment:
     sources:
-      - docs/Txv3/INDEX.md
-      - docs/Txv3/01_CONCEPTS_v5.md
-      - docs/Txv3/02_INVARIANTS_v5.md
-      - docs/Txv3/03_STEP_MODEL_v2.md
       - docs/design/00_meta-framework/CONCEPTS_v4.md
       - docs/design/00_meta-framework/INVARIANTS_v4.md
       - docs/design/00_meta-framework/object_model_v2.md
       - docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md
       - docs/design/00_meta-framework/MODULE_MAP_v1.md
       - docs/design/00_meta-framework/CI_REPORTING_v1.md
-    purpose: Keep the canonical meta framework coherent across the v3 spine and the v4 docs still cited by subsystem prose.
+    purpose: Keep the canonical meta framework coherent.
 
   tx-ebr-zone:
     sources:
       - docs/design/00_meta-framework/object_model_v2.md
-      - docs/Txv3/02_INVARIANTS_v5.md
       - docs/design/00_meta-framework/INVARIANTS_v4.md
       - docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md
       - docs/ebr-zone/02_EBR_design.en-US.md
@@ -107,7 +89,6 @@ skills:
       - docs/design/01_substrate/HAL_v1.md
       - docs/design/01_substrate/PAGE_SUBSTRATE_v1.md
       - docs/design/00_meta-framework/MODULE_MAP_v1.md
-      - docs/Txv3/02_INVARIANTS_v5.md
       - docs/design/00_meta-framework/INVARIANTS_v4.md
     purpose: Keep HAL and page substrate aligned with axHal-style static platform selection.
 
@@ -115,19 +96,12 @@ skills:
     sources:
       - docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md
       - docs/design/00_meta-framework/object_model_v2.md
-      - docs/Txv3/02_INVARIANTS_v5.md
-      - docs/Txv3/03_STEP_MODEL_v2.md
-      - docs/Txv3/04_SYSCALL_SHAPE_v1.md
       - docs/design/00_meta-framework/INVARIANTS_v4.md
     purpose: Add or audit zone-derived type policy sections in subsystem specs.
 
   tx-implementation-readiness:
     sources:
       - docs/design/INDEX.md
-      - docs/Txv3/INDEX.md
-      - docs/Txv3/02_INVARIANTS_v5.md
-      - docs/Txv3/03_STEP_MODEL_v2.md
-      - docs/Txv3/07_BLAST_RADIUS.md
       - docs/design/00_meta-framework/INVARIANTS_v4.md
       - docs/design/00_meta-framework/object_model_v2.md
       - docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md
@@ -155,8 +129,6 @@ skills:
       - docs/design/03_memory-vm/PAGE_BACKED_v1.md
       - docs/design/01_substrate/PAGE_SUBSTRATE_v1.md
       - docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md
-      - docs/Txv3/02_INVARIANTS_v5.md
-      - docs/Txv3/03_STEP_MODEL_v2.md
       - docs/design/00_meta-framework/INVARIANTS_v4.md
       - docs/design/02_execution/STEP_MODEL_v1.md
     purpose: Guide VM, AddressSpace, RangeLock, recipes, PageBacked, and fault-materialization implementation from canonical docs.
@@ -177,13 +149,8 @@ skills:
       - docs/design/06_devices/TTY.md
       - docs/design/06_devices/DEVICE.md
       - docs/design/03_memory-vm/PAGE_BACKED_v1.md
+      - docs/ljs/TTY_DESIGN_PLAN.md
       - docs/progress/research/2026-05-04-tty-implementation-status.md
-      - docs/progress/decisions/2026-05-05-tty-process-aware-helpers.md
-      - docs/progress/decisions/2026-05-05-tty-signal-end-to-end-typed-dispatch.md
-      - docs/progress/decisions/2026-05-05-tty-pgrp-typed-rebinding.md
-      - docs/progress/decisions/2026-05-05-foreground-pgrp-tty-owned.md
-      - docs/progress/decisions/2026-05-06-tty-vmin-and-vfs-ioctl-status.md
-      - docs/progress/decisions/2026-05-12-d20-phase3-tty-adapter.md
     purpose: Guide TTY implementation and integration work, including the canonical design docs, current tty code layout, and staged follow-up seams.
 
   tx-process-threadruntime:
@@ -237,46 +204,6 @@ skills:
       - xtask/src/lint.rs
     purpose: Classify syscalls into Immediate/OneShotStepOp/FullAsync lanes, manage dispatch-lane migration, and run syscall lint ratchets (adhoc-loop, no-await, ctx-bridge).
 
-  tx-ltp-syscall:
-    sources:
-      - docs/progress/SYSCALL_STATUS.md
-      - docs/Txv3/04_SYSCALL_SHAPE_v1.md
-      - docs/Txv3/03_STEP_MODEL_v2.md
-      - docs/Txv3/02_INVARIANTS_v5.md
-      - docs/progress/plans/2026-05-05-trio-trap-syscall-tmpfs-devfs.md
-      - docs/progress/research/2026-05-06-musl-ltp-execve-coverage.md
-      - crates/tx-shims/src/linux_syscall/numbers.rs
-      - crates/tx-shims/src/linux_syscall/mod.rs
-      - external/oscomp-autotest
-      - xtask/src/oscomp.rs
-      - xtask/src/syscall.rs
-      - .agents/skills/tx-syscall-dispatch/SKILL.md
-      - .agents/skills/tx-step-migration/SKILL.md
-      - .agents/skills/tx-shell-syscall-fixup/SKILL.md
-    purpose: Plan, prioritize, and book-keep Linux syscall implementation for OSComp + LTP coverage. Owns the living `docs/progress/SYSCALL_STATUS.md` record (with the auto-table maintained by `cargo xtask syscall sync`); defers implementation mechanics to the three sibling syscall skills.
-
-  tx-ci-triage:
-    sources:
-      - .github/workflows/check.yml
-      - xtask/src/ci.rs
-      - xtask/src/lint.rs
-      - xtask/src/lint_invariants_checks.rs
-      - xtask/src/lint_invariants_drive.rs
-      - xtask/src/lint_invariants_script.rs
-      - xtask/src/lint_invariants_signal.rs
-      - xtask/src/lint_invariants_step.rs
-      - xtask/src/lint_invariants_step_v3.rs
-      - xtask/src/lint_invariants_subj.rs
-      - xtask/src/lint_invariants_syscall.rs
-      - xtask/src/lint_invariants_witness.rs
-      - xtask/src/fault_decode.rs
-      - clippy.toml
-      - docs/design/00_meta-framework/CI_REPORTING_v1.md
-      - docs/progress/decisions/2026-05-13-d49-phase8-boundary-ratchet.md
-      - docs/progress/decisions/2026-05-12-d10-vocabulary-retire-audit.md
-      - docs/progress/decisions/2026-05-12-d13-tdd-retirement-via-clippy.md
-    purpose: Triage failing txKernel CI gates — identify the gate by txdoc tag, reproduce locally, classify regression vs. ratchet vs. environment, and avoid silencing the invariant the gate guards.
-
   tx-xtask:
     sources:
       - xtask/src/lib.rs
@@ -298,5 +225,9 @@ skills:
       - xtask/src/oscomp.rs
       - xtask/src/submit.rs
       - xtask/src/progress
-      - xtask/src/syscall.rs
-    purpose: Reference for every `cargo xtask` subcommand — fast feedback (unit, check, lint, boundary-report), build & image (doctor, full-build, build, image), run (qemu, test, shell-test), diagnose (fault-decode, trap-trace), syscall progress (syscall), and progress/observation tooling.
+      - tools/tx-trace-daemon/src/main.rs
+      - tools/tx-trace-daemon/src/replay.rs
+      - docs/Txv3/08_OBSERVATION_v1.md
+      - docs/Txv3/08_OBSERVATION_SERIALIZATION_v0.md
+      - docs/Txv3/08_OBSERVATION_HOST_v0.md
+    purpose: Reference for every `cargo xtask` subcommand — fast feedback (unit, check, lint, boundary-report), build & image (doctor, full-build, build, image), run (qemu, test, shell-test), diagnose (fault-decode, trap-trace), progress, and the observation pipeline (replay/pftrace/validate/demo/discipline against tx-trace-daemon).
