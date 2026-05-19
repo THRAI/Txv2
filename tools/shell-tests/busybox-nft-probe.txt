@@ -1,0 +1,20 @@
+# busybox-nft-probe.txt - N72R/S NETLINK_NETFILTER userspace probe.
+#
+# This is a small riscv64 user program, not the final Alpine nft binary. It
+# still exercises the production syscall path: socket(AF_NETLINK,
+# NETLINK_NETFILTER), sendto(), recvfrom(), nf_tables batch create, dump, and
+# delete.
+
+wait "/ # " within 30000
+sleep 500
+
+send "/bin/nft-probe\n"
+expect "nft-probe-start" within 10000
+expect "nft-probe-create-ok" within 10000
+expect "nft-probe-dump-ok" within 10000
+expect "nft-probe-delete-ok" within 10000
+expect "nft-probe-success" within 10000
+expect "/ # " within 10000
+
+sleep 500
+quit
