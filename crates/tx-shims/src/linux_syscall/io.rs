@@ -1384,7 +1384,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         payload: tx_subsystems::vfs::structure::StructPayload::Socket { identity: socket },
     } = file.rnode().backing()
     {
-        return sys_write_socket(&file, socket.clone(), &bytes).await;
+        return sys_write_socket(&file, socket.clone(), &bytes, ctx).await;
     }
 
     // PR-9 phase 3b: drive `OpenFile::step_write` via the
@@ -1524,6 +1524,7 @@ async fn sys_write_socket(
     file: &Cap<OpenFile>,
     socket: Cap<tx_subsystems::net::SocketIdentity>,
     bytes: &[u8],
+    ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
     if bytes.is_empty() {
         return SyscallResult::Return(0);
@@ -1533,6 +1534,31 @@ async fn sys_write_socket(
     if file.flags().nonblocking {
         flags |= tx_subsystems::net::SendRecvFlags::MSG_DONTWAIT;
     }
+
+    if socket.kind == tx_subsystems::net::SocketKind::NetlinkRoute {
+        let mut resolve_netns_fd = |fd: i32| {
+            if fd < 0 {
+                return None;
+            }
+            let file = resolve_fd(&ctx.process, fd as u32)?;
+            tx_subsystems::net::net_namespace_payload_from_file(&file)
+        };
+        let mut resolve_netns_pid = |pid: u32| {
+            let process = process_by_pid(Pid(pid))?;
+            process.net_namespace()
+        };
+        return match tx_subsystems::net::netlink_route_send_with_netns_resolvers(
+            &socket,
+            bytes,
+            ctx.cred(),
+            &mut resolve_netns_fd,
+            &mut resolve_netns_pid,
+        ) {
+            Ok(sent) => SyscallResult::Return(sent as i64),
+            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        };
+    }
+
     let mut total = 0usize;
     let mut remaining = bytes;
 
@@ -2376,6 +2402,45 @@ async fn sys_read_socket<'a>(
         flags |= tx_subsystems::net::SendRecvFlags::MSG_DONTWAIT;
     }
     let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len.min(TTY_WRITE_MAX_INLINE)];
+
+    if socket.kind == tx_subsystems::net::SocketKind::NetlinkRoute {
+        loop {
+            match tx_subsystems::net::netlink_route_recv(&socket, &mut staging, flags) {
+                Ok(recv) => {
+                    if recv > 0 {
+                        if let Err(errno) =
+                            bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..recv])
+                        {
+                            return SyscallResult::Error(errno_to_i32(errno));
+                        }
+                    }
+                    return SyscallResult::Return(recv as i64);
+                }
+                Err(tx_subsystems::execution::Errno::EAGAIN) if !flags.is_nonblocking() => {
+                    let wait_token = {
+                        let guard = tx_substrate::epoch::guard();
+                        socket_poll_wait_token_from_file(
+                            file,
+                            tx_subsystems::net::PollMask::IN,
+                            &guard,
+                        )
+                    };
+                    match wait_token {
+                        Some(Ok(Some(token))) => {
+                            if let Some(future) = wait_source::wait_on_token(token) {
+                                let _ = future.await;
+                            } else {
+                                return SyscallResult::Error(EIO_VALUE);
+                            }
+                        }
+                        Some(Ok(None)) | None => return SyscallResult::Error(EAGAIN_VALUE),
+                        Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
+                    }
+                }
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+    }
 
     loop {
         let outcome = {

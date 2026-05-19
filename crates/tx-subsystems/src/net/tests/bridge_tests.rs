@@ -1,0 +1,745 @@
+use super::*;
+use std::boxed::Box;
+
+const BRIDGE_MAC: EthernetAddress = EthernetAddress::new([0x02, 0, 0, 0, 0xaa, 0x01]);
+const BRIDGE_NS_A_IP: Ipv4Address = Ipv4Address::new([172, 17, 0, 2]);
+const BRIDGE_NS_B_IP: Ipv4Address = Ipv4Address::new([172, 17, 0, 3]);
+
+#[test]
+fn bridge_floods_broadcast_and_learns_source_mac() {
+    let guard = tx_substrate::epoch::guard();
+    reset_netfilter_for_test();
+    let bridge = new_test_bridge("docker0", 80);
+    let pair_a = new_bridge_veth_pair("ct-a0", "veth-a0", 80);
+    let pair_b = new_bridge_veth_pair("ct-b0", "veth-b0", 81);
+
+    bridge
+        .device
+        .add_port_for_test_or_bootstrap(pair_a.right)
+        .expect("bridge port a");
+    bridge
+        .device
+        .add_port_for_test_or_bootstrap(pair_b.right)
+        .expect("bridge port b");
+
+    let src = pair_a.left.ops.mac_addr();
+    let frame = ethernet_frame(EthernetAddress::BROADCAST, src, b"hello");
+    assert_eq!(
+        pair_a.left.ops.transmit(&frame, &guard),
+        StepOutcome::Done(())
+    );
+
+    let outcome = bridge.device.poll_once(&guard);
+    assert_eq!(outcome.frames_seen, 1);
+    assert_eq!(outcome.learned, 1);
+    assert_eq!(outcome.local_delivered, 1);
+    assert_eq!(outcome.forwarded, 1);
+    assert_eq!(outcome.flooded, 1);
+    assert_eq!(bridge.device.learned_port_name(src), Some("veth-a0"));
+
+    let received = pair_b.left.ops.receive().expect("peer b received flood");
+    assert_eq!(received.as_bytes(), frame.as_slice());
+    let local = bridge
+        .registration
+        .ops
+        .receive()
+        .expect("bridge local received broadcast");
+    assert_eq!(local.as_bytes(), frame.as_slice());
+    assert!(pair_a.left.ops.receive().is_none());
+
+    let nf = netfilter_stats_snapshot();
+    assert_eq!(nf.prerouting, 1);
+    assert_eq!(nf.input, 1);
+    assert_eq!(nf.forward, 1);
+    assert_eq!(nf.postrouting, 1);
+}
+
+#[test]
+fn bridge_uses_learned_unicast_instead_of_flooding() {
+    let guard = tx_substrate::epoch::guard();
+    reset_netfilter_for_test();
+    let bridge = new_test_bridge("docker1", 82);
+    let pair_a = new_bridge_veth_pair("ct-a1", "veth-a1", 82);
+    let pair_b = new_bridge_veth_pair("ct-b1", "veth-b1", 83);
+    let pair_c = new_bridge_veth_pair("ct-c1", "veth-c1", 84);
+
+    for port in [pair_a.right, pair_b.right, pair_c.right] {
+        bridge
+            .device
+            .add_port_for_test_or_bootstrap(port)
+            .expect("bridge port");
+    }
+
+    let mac_a = pair_a.left.ops.mac_addr();
+    let mac_b = pair_b.left.ops.mac_addr();
+    let learn_a = ethernet_frame(EthernetAddress::BROADCAST, mac_a, b"learn-a");
+    assert_eq!(
+        pair_a.left.ops.transmit(&learn_a, &guard),
+        StepOutcome::Done(())
+    );
+    let first = bridge.device.poll_once(&guard);
+    assert_eq!(first.forwarded, 2);
+    assert_eq!(
+        pair_b.left.ops.receive().expect("b flood").as_bytes(),
+        learn_a.as_slice()
+    );
+    assert_eq!(
+        pair_c.left.ops.receive().expect("c flood").as_bytes(),
+        learn_a.as_slice()
+    );
+
+    let unicast = ethernet_frame(mac_a, mac_b, b"unicast");
+    assert_eq!(
+        pair_b.left.ops.transmit(&unicast, &guard),
+        StepOutcome::Done(())
+    );
+    let second = bridge.device.poll_once(&guard);
+    assert_eq!(second.frames_seen, 1);
+    assert_eq!(second.forwarded, 1);
+    assert_eq!(second.flooded, 0);
+    assert_eq!(bridge.device.learned_port_name(mac_b), Some("veth-b1"));
+    assert_eq!(
+        pair_a
+            .left
+            .ops
+            .receive()
+            .expect("a learned unicast")
+            .as_bytes(),
+        unicast.as_slice()
+    );
+    assert!(pair_c.left.ops.receive().is_none());
+}
+
+#[test]
+fn bridge_delivers_unicast_to_local_without_flooding() {
+    let guard = tx_substrate::epoch::guard();
+    reset_netfilter_for_test();
+    let bridge = new_test_bridge("docker-local0", 90);
+    let pair = new_bridge_veth_pair("ct-local0", "veth-local0", 90);
+
+    bridge
+        .device
+        .add_port_for_test_or_bootstrap(pair.right)
+        .expect("bridge port");
+
+    let src = pair.left.ops.mac_addr();
+    let frame = ethernet_frame(BRIDGE_MAC, src, b"to-docker0");
+    assert_eq!(
+        pair.left.ops.transmit(&frame, &guard),
+        StepOutcome::Done(())
+    );
+
+    let outcome = bridge.device.poll_once(&guard);
+    assert_eq!(outcome.frames_seen, 1);
+    assert_eq!(outcome.learned, 1);
+    assert_eq!(outcome.local_delivered, 1);
+    assert_eq!(outcome.forwarded, 0);
+    assert_eq!(outcome.flooded, 0);
+    assert_eq!(outcome.dropped, 0);
+    assert_eq!(bridge.device.learned_port_name(src), Some("veth-local0"));
+
+    let local = bridge
+        .registration
+        .ops
+        .receive()
+        .expect("bridge local received unicast");
+    assert_eq!(local.as_bytes(), frame.as_slice());
+    assert!(pair.left.ops.receive().is_none());
+
+    let nf = netfilter_stats_snapshot();
+    assert_eq!(nf.prerouting, 1);
+    assert_eq!(nf.input, 1);
+    assert_eq!(nf.forward, 0);
+    assert_eq!(nf.postrouting, 0);
+}
+
+#[test]
+fn bridge_local_transmit_uses_learned_port() {
+    let guard = tx_substrate::epoch::guard();
+    reset_netfilter_for_test();
+    let bridge = new_test_bridge("docker-local1", 91);
+    let pair_a = new_bridge_veth_pair("ct-local1a", "veth-local1a", 91);
+    let pair_b = new_bridge_veth_pair("ct-local1b", "veth-local1b", 92);
+
+    for port in [pair_a.right, pair_b.right] {
+        bridge
+            .device
+            .add_port_for_test_or_bootstrap(port)
+            .expect("bridge port");
+    }
+
+    let mac_a = pair_a.left.ops.mac_addr();
+    let learn = ethernet_frame(BRIDGE_MAC, mac_a, b"learn-a");
+    assert_eq!(
+        pair_a.left.ops.transmit(&learn, &guard),
+        StepOutcome::Done(())
+    );
+    let learned = bridge.device.poll_once(&guard);
+    assert_eq!(learned.local_delivered, 1);
+    assert_eq!(bridge.device.learned_port_name(mac_a), Some("veth-local1a"));
+    assert!(bridge.registration.ops.receive().is_some());
+
+    reset_netfilter_for_test();
+    let frame = ethernet_frame(mac_a, BRIDGE_MAC, b"from-docker0");
+    assert_eq!(
+        bridge.registration.ops.transmit(&frame, &guard),
+        StepOutcome::Done(())
+    );
+
+    let received = pair_a
+        .left
+        .ops
+        .receive()
+        .expect("learned port received bridge-local tx");
+    assert_eq!(received.as_bytes(), frame.as_slice());
+    assert!(pair_b.left.ops.receive().is_none());
+
+    let nf = netfilter_stats_snapshot();
+    assert_eq!(nf.output, 1);
+    assert_eq!(nf.postrouting, 1);
+    assert_eq!(nf.forward, 0);
+}
+
+#[test]
+fn bridge_carries_udp_between_two_veth_namespaces() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+
+    let ns_a_identity =
+        crate::net::create_isolated_net_namespace_for_test("bridge-data-a").expect("namespace a");
+    let ns_b_identity =
+        crate::net::create_isolated_net_namespace_for_test("bridge-data-b").expect("namespace b");
+    let ns_a = ns_a_identity.payload_cap().expect("namespace a payload");
+    let ns_b = ns_b_identity.payload_cap().expect("namespace b payload");
+    let bridge = new_test_bridge("docker-data0", 93);
+    let pair_a = new_bridge_veth_pair("eth-data-a", "veth-data-a", 93);
+    let pair_b = new_bridge_veth_pair("eth-data-b", "veth-data-b", 94);
+
+    bridge
+        .device
+        .add_port_for_test_or_bootstrap(pair_a.right)
+        .expect("bridge port a");
+    bridge
+        .device
+        .add_port_for_test_or_bootstrap(pair_b.right)
+        .expect("bridge port b");
+    ns_a.attach_device_for_test_or_bootstrap(pair_a.left, Some(BRIDGE_NS_A_IP))
+        .expect("attach namespace a veth");
+    ns_b.attach_device_for_test_or_bootstrap(pair_b.left, Some(BRIDGE_NS_B_IP))
+        .expect("attach namespace b veth");
+
+    let guard = tx_substrate::epoch::guard();
+    let server = registry::create_socket_in_namespace(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+        ns_b.clone(),
+    )
+    .expect("server socket");
+    assert_eq!(
+        step_bind(&server, bridge_inet_at(BRIDGE_NS_B_IP, 40_172), &guard),
+        StepOutcome::Done(())
+    );
+
+    let client = registry::create_socket_in_namespace(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+        ns_a.clone(),
+    )
+    .expect("client socket");
+    assert_eq!(
+        step_bind(&client, bridge_inet_at(BRIDGE_NS_A_IP, 50_172), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_connect(&client, bridge_inet_at(BRIDGE_NS_B_IP, 40_172), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_kernel_bytes(&client, b"via-bridge", SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(10)
+    );
+
+    let adapter_a = SmoltcpAdapter::new(SmoltcpAdapterConfig {
+        local_mac: pair_a.left.ops.mac_addr(),
+        local_ipv4: BRIDGE_NS_A_IP,
+        mtu: pair_a.left.ops.mtu(),
+    });
+    let sink_a = SmoltcpPacketTxSink {
+        adapter: &adapter_a,
+        device: pair_a.left,
+    };
+    let StepOutcome::Done(tx) = step_process_device_tx_pending_in_namespace_at(
+        &sink_a,
+        ns_a,
+        smoltcp::time::Instant::ZERO,
+        DeviceTxBudget {
+            tcp_connecting: 0,
+            tcp_connected: 0,
+            udp_bound: 1,
+            raw_icmp: 0,
+        },
+        &guard,
+    ) else {
+        panic!("device tx step should complete");
+    };
+    assert_eq!(tx.udp_packets, 1);
+
+    let bridge_outcome = bridge.device.poll_once(&guard);
+    assert_eq!(bridge_outcome.frames_seen, 1);
+    assert_eq!(bridge_outcome.forwarded, 1);
+    assert_eq!(bridge_outcome.flooded, 1);
+    assert_eq!(pair_b.left_device.pending_rx(), 1);
+
+    let adapter_b = SmoltcpAdapter::new(SmoltcpAdapterConfig {
+        local_mac: pair_b.left.ops.mac_addr(),
+        local_ipv4: BRIDGE_NS_B_IP,
+        mtu: pair_b.left.ops.mtu(),
+    });
+    let source_b = SmoltcpPacketSource {
+        adapter: &adapter_b,
+        device: pair_b.left,
+    };
+    let StepOutcome::Done(rx) = step_process_network_events_in_namespace_at(
+        &source_b,
+        ns_b,
+        smoltcp::time::Instant::ZERO,
+        &guard,
+    ) else {
+        panic!("network rx step should complete");
+    };
+    assert_eq!(rx.packets_seen, 1);
+    assert_eq!(
+        server
+            .acquire_operational()
+            .expect("server payload")
+            .io_snapshot()
+            .recv_len,
+        10
+    );
+    assert_eq!(
+        step_recv(&server, 10, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(10)
+    );
+}
+
+#[test]
+fn bridge_l3_iface_allows_container_ping_host_gateway() {
+    let guard = tx_substrate::epoch::guard();
+    reset_netfilter_for_test();
+    let bridge = new_test_bridge("docker-gw0", 95);
+    let pair = new_bridge_veth_pair("eth-gw0", "veth-gw0", 95);
+
+    bridge
+        .device
+        .add_port_for_test_or_bootstrap(pair.right)
+        .expect("bridge port");
+
+    let now = smoltcp::time::Instant::ZERO;
+    let host_ip = Ipv4Address::new([172, 17, 0, 1]);
+    let container_ip = Ipv4Address::new([172, 17, 0, 2]);
+    let host_iface = new_bridge_ether_iface(
+        bridge.registration,
+        host_ip,
+        bridge.registration.ops.mac_addr(),
+        "docker-gw0",
+    );
+    let container_iface =
+        new_bridge_ether_iface(pair.left, container_ip, pair.left.ops.mac_addr(), "eth-gw0");
+
+    let echo = Icmpv4EchoPacket {
+        src: container_ip,
+        dst: host_ip,
+        ident: 0x720b,
+        seq_no: 1,
+        payload: b"n72b".to_vec(),
+    };
+    let echo_packet = crate::net::protocol::build_icmpv4_echo_request(&echo);
+    assert!(matches!(
+        container_iface.dispatch_ip_at(echo_packet.as_bytes(), now, &guard),
+        PacketTxResult::PendingResolution { next_hop } if next_hop == host_ip
+    ));
+    let arp = container_iface.flush_pending_arp_at(now, 8, &guard);
+    assert_eq!(arp.sent, 1);
+
+    let arp_to_host = bridge.device.poll_once(&guard);
+    assert_eq!(arp_to_host.frames_seen, 1);
+    assert_eq!(arp_to_host.local_delivered, 1);
+    assert_eq!(arp_to_host.forwarded, 0);
+
+    let host_source = EtherPacketSource { iface: host_iface };
+    assert_eq!(
+        host_source.next_packet_at(now, &guard),
+        Some(PacketDispatch::Unsupported)
+    );
+
+    let arp_reply = pair
+        .left
+        .ops
+        .receive()
+        .expect("container received ARP reply");
+    assert_eq!(
+        container_iface.process_frame_at(arp_reply, now, Some(&guard)),
+        PacketDispatch::Unsupported
+    );
+    assert!(container_iface.arp_entry(host_ip, now).is_some());
+
+    assert!(matches!(
+        container_iface.dispatch_ip_at(echo_packet.as_bytes(), now, &guard),
+        PacketTxResult::Accepted { .. }
+    ));
+    let icmp_to_host = bridge.device.poll_once(&guard);
+    assert_eq!(icmp_to_host.frames_seen, 1);
+    assert_eq!(icmp_to_host.local_delivered, 1);
+    assert_eq!(icmp_to_host.forwarded, 0);
+
+    assert_eq!(
+        host_source.next_packet_at(now, &guard),
+        Some(PacketDispatch::Icmp(Icmpv4Event::EchoRequest(echo.clone())))
+    );
+
+    let echo_reply = pair
+        .left
+        .ops
+        .receive()
+        .expect("container received ICMP reply");
+    assert_eq!(
+        container_iface.process_frame_at(echo_reply, now, Some(&guard)),
+        PacketDispatch::Icmp(Icmpv4Event::EchoReply(echo.reply_packet()))
+    );
+}
+
+#[test]
+fn namespace_runtime_drives_container_ping_host_gateway() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+
+    let guard = tx_substrate::epoch::guard();
+    let now = smoltcp::time::Instant::ZERO;
+    let host_ip = Ipv4Address::new([172, 17, 0, 1]);
+    let container_ip = Ipv4Address::new([172, 17, 0, 2]);
+    let host = crate::net::initial_net_namespace_payload();
+    let container = crate::net::create_isolated_net_namespace_for_test("runtime-ping-container")
+        .expect("container namespace")
+        .payload_cap()
+        .expect("container payload");
+    let bridge = new_test_bridge("docker-runtime0", 96);
+    let pair = new_bridge_veth_pair("eth-runtime0", "veth-runtime0", 96);
+
+    bridge
+        .device
+        .add_port_for_test_or_bootstrap(pair.right)
+        .expect("bridge port");
+    host.attach_device_for_test_or_bootstrap(bridge.registration, None)
+        .expect("attach docker0");
+    host.attach_device_for_test_or_bootstrap(pair.right, None)
+        .expect("attach host veth");
+    container
+        .attach_device_for_test_or_bootstrap(pair.left, None)
+        .expect("attach container eth0");
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    let docker_ifindex = bridge_ifindex_for(&host.link_snapshot(), "docker-runtime0");
+    host.set_device_ipv4_addr_by_ifindex(auth, docker_ifindex, Some(host_ip), Some(16))
+        .expect("set docker0 addr");
+    let eth_ifindex = bridge_ifindex_for(&container.link_snapshot(), "eth-runtime0");
+    container
+        .set_device_ipv4_addr_by_ifindex(auth, eth_ifindex, Some(container_ip), Some(16))
+        .expect("set container eth addr");
+
+    assert_eq!(host.ether_ifaces_snapshot().len(), 1);
+    assert_eq!(container.ether_ifaces_snapshot().len(), 1);
+
+    let raw = match crate::net::step_socket_create_in_namespace(
+        ValidSocketType::validate(2, 3, 1).expect("AF_INET SOCK_RAW ICMP"),
+        container.clone(),
+        &guard,
+    ) {
+        StepOutcome::Done(socket) => socket,
+        other => panic!("raw icmp socket create failed: {other:?}"),
+    };
+    let echo = Icmpv4EchoPacket {
+        src: container_ip,
+        dst: host_ip,
+        ident: 0x72c0,
+        seq_no: 1,
+        payload: b"runtime".to_vec(),
+    };
+    let message = crate::net::protocol::build_icmpv4_echo_request_message(&echo);
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &raw,
+            Some(IpEndpoint::new(host_ip, 0)),
+            &message,
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(message.len())
+    );
+
+    let mut total = crate::net::NetNamespaceRuntimeOutcome::default();
+    let mut reply = [0u8; 64];
+    let mut received = None;
+    for _ in 0..8 {
+        let outcome = crate::net::drive_all_net_namespace_runtimes_at(now, &guard);
+        total.merge(outcome);
+        if let StepOutcome::Done(recv) =
+            step_recv_kernel_bytes(&raw, &mut reply, SendRecvFlags::empty(), &guard)
+        {
+            received = Some(recv.bytes);
+            break;
+        }
+    }
+
+    assert_eq!(received, Some(message.len()), "runtime outcome: {total:?}");
+    assert!(total.ifaces_seen >= 2);
+    assert!(total.bridge_frames_seen >= 2);
+    assert!(total.bridge_local_delivered >= 1);
+    assert!(total.device_tx_packets >= 1);
+    assert!(total.arp_sent >= 1);
+}
+
+#[test]
+fn namespace_runtime_drives_container_ping_container_through_bridge() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+
+    let guard = tx_substrate::epoch::guard();
+    let now = smoltcp::time::Instant::ZERO;
+    let host = crate::net::initial_net_namespace_payload();
+    let ns_a = crate::net::create_isolated_net_namespace_for_test("runtime-ping-a")
+        .expect("namespace a")
+        .payload_cap()
+        .expect("namespace a payload");
+    let ns_b = crate::net::create_isolated_net_namespace_for_test("runtime-ping-b")
+        .expect("namespace b")
+        .payload_cap()
+        .expect("namespace b payload");
+    let bridge = new_test_bridge("docker-runtime1", 97);
+    let pair_a = new_bridge_veth_pair("eth-runtime1a", "veth-runtime1a", 97);
+    let pair_b = new_bridge_veth_pair("eth-runtime1b", "veth-runtime1b", 98);
+
+    bridge
+        .device
+        .add_port_for_test_or_bootstrap(pair_a.right)
+        .expect("bridge port a");
+    bridge
+        .device
+        .add_port_for_test_or_bootstrap(pair_b.right)
+        .expect("bridge port b");
+    host.attach_device_for_test_or_bootstrap(bridge.registration, None)
+        .expect("attach docker0");
+    host.attach_device_for_test_or_bootstrap(pair_a.right, None)
+        .expect("attach host veth a");
+    host.attach_device_for_test_or_bootstrap(pair_b.right, None)
+        .expect("attach host veth b");
+    ns_a.attach_device_for_test_or_bootstrap(pair_a.left, None)
+        .expect("attach namespace a eth");
+    ns_b.attach_device_for_test_or_bootstrap(pair_b.left, None)
+        .expect("attach namespace b eth");
+
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    let eth_a_ifindex = bridge_ifindex_for(&ns_a.link_snapshot(), "eth-runtime1a");
+    ns_a.set_device_ipv4_addr_by_ifindex(auth, eth_a_ifindex, Some(BRIDGE_NS_A_IP), Some(16))
+        .expect("set namespace a addr");
+    let eth_b_ifindex = bridge_ifindex_for(&ns_b.link_snapshot(), "eth-runtime1b");
+    ns_b.set_device_ipv4_addr_by_ifindex(auth, eth_b_ifindex, Some(BRIDGE_NS_B_IP), Some(16))
+        .expect("set namespace b addr");
+
+    let raw = match crate::net::step_socket_create_in_namespace(
+        ValidSocketType::validate(2, 3, 1).expect("AF_INET SOCK_RAW ICMP"),
+        ns_a.clone(),
+        &guard,
+    ) {
+        StepOutcome::Done(socket) => socket,
+        other => panic!("raw icmp socket create failed: {other:?}"),
+    };
+    let echo = Icmpv4EchoPacket {
+        src: BRIDGE_NS_A_IP,
+        dst: BRIDGE_NS_B_IP,
+        ident: 0x72c1,
+        seq_no: 1,
+        payload: b"peer-runtime".to_vec(),
+    };
+    let message = crate::net::protocol::build_icmpv4_echo_request_message(&echo);
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &raw,
+            Some(IpEndpoint::new(BRIDGE_NS_B_IP, 0)),
+            &message,
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(message.len())
+    );
+
+    let mut total = crate::net::NetNamespaceRuntimeOutcome::default();
+    let mut reply = [0u8; 96];
+    let mut received = None;
+    for _ in 0..16 {
+        let outcome = crate::net::drive_all_net_namespace_runtimes_at(now, &guard);
+        total.merge(outcome);
+        if let StepOutcome::Done(recv) =
+            step_recv_kernel_bytes(&raw, &mut reply, SendRecvFlags::empty(), &guard)
+        {
+            received = Some(recv.bytes);
+            break;
+        }
+    }
+
+    assert_eq!(
+        received,
+        Some(message.len()),
+        "runtime outcome: {total:?}; a arp: {:?}; b arp: {:?}; learned a: {:?}; learned b: {:?}",
+        ns_a.ether_ifaces_snapshot()[0].arp_snapshot(now),
+        ns_b.ether_ifaces_snapshot()[0].arp_snapshot(now),
+        bridge.device.learned_port_name(pair_a.left.ops.mac_addr()),
+        bridge.device.learned_port_name(pair_b.left.ops.mac_addr()),
+    );
+    assert!(total.bridge_forwarded >= 2);
+    assert!(total.device_tx_packets >= 1);
+    assert!(total.arp_sent >= 1);
+}
+
+#[test]
+fn bridge_add_port_requires_cap_net_admin_authority() {
+    let bridge = new_test_bridge("docker2", 86);
+    let pair = new_bridge_veth_pair("ct-a2", "veth-a2", 86);
+
+    let denied = require_net_admin(unprivileged_cred());
+    assert_eq!(denied, Err(Errno::EPERM));
+
+    let authority = require_net_admin(crate::cred::Cred::root()).expect("root net admin");
+    assert_eq!(bridge.device.add_port(authority, pair.right), Ok(()));
+}
+
+#[test]
+fn namespace_snapshot_reports_bridge_and_port_membership() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+
+    let ns = crate::net::create_isolated_net_namespace_for_test("bridge-ns")
+        .expect("namespace")
+        .payload_cap()
+        .expect("namespace payload");
+    let bridge = new_test_bridge("docker3", 88);
+    let pair_a = new_bridge_veth_pair("ct-a3", "veth-a3", 88);
+    let pair_b = new_bridge_veth_pair("ct-b3", "veth-b3", 89);
+    let authority = NetAdminAuthority::for_test_or_bootstrap();
+
+    bridge
+        .device
+        .add_port(authority, pair_a.right)
+        .expect("bridge port a");
+    bridge
+        .device
+        .add_port(authority, pair_b.right)
+        .expect("bridge port b");
+    ns.attach_device(authority, bridge.registration, None)
+        .expect("attach bridge");
+    ns.attach_device(authority, pair_a.right, None)
+        .expect("attach bridge port a");
+    ns.attach_device(authority, pair_b.right, None)
+        .expect("attach bridge port b");
+
+    let snapshot = ns.network_snapshot();
+    let bridge_info = snapshot
+        .bridges
+        .iter()
+        .find(|bridge| bridge.name == "docker3")
+        .expect("bridge info");
+    assert_eq!(bridge_info.ports, std::vec!["veth-a3", "veth-b3"]);
+    assert!(snapshot.links.iter().any(|link| {
+        link.name == "docker3" && link.kind == NetDeviceKind::Bridge && link.master.is_none()
+    }));
+    assert!(snapshot.links.iter().any(|link| {
+        link.name == "veth-a3" && link.kind == NetDeviceKind::Veth && link.master == Some("docker3")
+    }));
+}
+
+fn new_test_bridge(name: &'static str, minor: u32) -> BridgeInstance {
+    create_bridge_for_test_or_bootstrap(BridgeConfig {
+        name,
+        devt: DevT::new(92, minor),
+        mac: BRIDGE_MAC,
+        mtu: VETH_DEFAULT_MTU,
+    })
+}
+
+fn new_bridge_veth_pair(left_name: &'static str, right_name: &'static str, minor: u32) -> VethPair {
+    create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+        left: VethEndpointConfig {
+            name: left_name,
+            devt: DevT::new(93, minor * 2),
+            mac: EthernetAddress::new([0x02, 0, 0, 1, 0, minor as u8]),
+        },
+        right: VethEndpointConfig {
+            name: right_name,
+            devt: DevT::new(93, minor * 2 + 1),
+            mac: EthernetAddress::new([0x02, 0, 0, 2, 0, minor as u8]),
+        },
+        mtu: VETH_DEFAULT_MTU,
+    })
+}
+
+fn new_bridge_ether_iface(
+    registration: &'static NetDeviceRegistration,
+    local_ip: Ipv4Address,
+    local_mac: EthernetAddress,
+    name: &'static str,
+) -> &'static EtherIface {
+    Box::leak(Box::new(EtherIface::new(
+        registration,
+        IfaceCommon::new(
+            local_ip,
+            Ipv4Address::new([255, 255, 0, 0]),
+            VETH_DEFAULT_MTU,
+        ),
+        local_mac,
+        name,
+    )))
+}
+
+fn ethernet_frame(dst: EthernetAddress, src: EthernetAddress, payload: &[u8]) -> std::vec::Vec<u8> {
+    let mut frame = std::vec::Vec::new();
+    frame.extend_from_slice(&dst.octets());
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&[0x08, 0x00]);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn bridge_inet_at(addr: Ipv4Address, port: u16) -> KernelSockAddr {
+    KernelSockAddr::V4(SockAddrIn::new(port, addr))
+}
+
+fn bridge_ifindex_for(links: &[NetNamespaceLinkInfo], name: &str) -> u32 {
+    links
+        .iter()
+        .find(|link| link.name == name)
+        .map(|link| link.ifindex)
+        .expect("link ifindex")
+}
+
+fn unprivileged_cred() -> crate::cred::Cred {
+    crate::cred::Cred {
+        uid: crate::cred::Uid(1000),
+        euid: crate::cred::Uid(1000),
+        suid: crate::cred::Uid(1000),
+        gid: crate::cred::Gid(1000),
+        egid: crate::cred::Gid(1000),
+        sgid: crate::cred::Gid(1000),
+        effective_caps: crate::cred::CapabilitySet::EMPTY,
+        permitted_caps: crate::cred::CapabilitySet::EMPTY,
+    }
+}

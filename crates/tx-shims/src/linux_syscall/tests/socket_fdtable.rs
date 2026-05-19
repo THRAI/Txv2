@@ -4,13 +4,15 @@
 use super::*;
 
 use crate::linux_syscall::{
-    AF_INET, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_UDP, IP_RECVERR, NR_BIND,
-    NR_CLOSE, NR_CONNECT, NR_FCNTL, NR_GETSOCKNAME, NR_GETSOCKOPT, NR_LISTEN, NR_PPOLL,
-    NR_PSELECT6, NR_RECVFROM, NR_RECVMSG, NR_SENDMSG, NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET,
-    O_CLOEXEC, O_NONBLOCK, O_RDWR, SOL_SOCKET, SO_DONTROUTE, SO_ERROR, SO_RCVTIMEO, SO_REUSEADDR,
+    AF_INET, AF_NETLINK, AF_UNIX, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_UDP,
+    IP_RECVERR, NETLINK_ROUTE, NR_BIND, NR_CLOSE, NR_CONNECT, NR_FCNTL, NR_GETSOCKNAME,
+    NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PPOLL, NR_PSELECT6, NR_RECVFROM, NR_RECVMSG, NR_SENDMSG,
+    NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET, O_CLOEXEC, O_NONBLOCK, O_RDWR, SIOCGIFFLAGS, SIOCGIFINDEX,
+    SIOCGIFTXQLEN, SIOCSIFFLAGS, SOL_SOCKET, SO_DONTROUTE, SO_ERROR, SO_RCVTIMEO, SO_REUSEADDR,
     SO_TYPE,
 };
 use alloc::vec;
+use alloc::vec::Vec;
 use tx_subsystems::net::execution::{step_process_loopback_pending, LoopbackPollBudget};
 use tx_subsystems::net::protocol::{
     build_icmpv4_echo_request_message, loopback_iface, parse_icmpv4_payload,
@@ -21,8 +23,14 @@ use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
 
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
+const SOCK_RAW: u64 = 3;
 const SOCKADDR_IN_BYTES: u32 = 16;
+const SOCKADDR_NL_BYTES: u32 = 12;
 const TEST_POLLIN: i16 = 0x0001;
+const NLM_F_REQUEST: u16 = 0x0001;
+const NLM_F_DUMP: u16 = 0x0300;
+const RTM_NEWLINK: u16 = 16;
+const RTM_GETLINK: u16 = 18;
 
 #[repr(C)]
 struct TestIovec {
@@ -76,6 +84,41 @@ fn sockaddr_in(addr: [u8; 4], port: u16) -> [u8; SOCKADDR_IN_BYTES as usize] {
     bytes
 }
 
+fn sockaddr_nl() -> [u8; SOCKADDR_NL_BYTES as usize] {
+    let mut bytes = [0u8; SOCKADDR_NL_BYTES as usize];
+    bytes[0..2].copy_from_slice(&AF_NETLINK.to_le_bytes());
+    bytes
+}
+
+fn rtnl_getlink_request(seq: u32) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(0);
+    payload.push(0);
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+
+    let len = 16 + payload.len();
+    let mut out = Vec::new();
+    out.extend_from_slice(&(len as u32).to_le_bytes());
+    out.extend_from_slice(&RTM_GETLINK.to_le_bytes());
+    out.extend_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_le_bytes());
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&payload);
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    out
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
 fn socket_stream(ctx: &SyscallCtx<'static>, type_flags: u64) -> i64 {
     match socket_req(NR_SOCKET, [AF_INET as u64, type_flags, 0, 0, 0, 0], ctx) {
         SyscallResult::Return(fd) => fd,
@@ -105,6 +148,35 @@ fn socket_icmp(ctx: &SyscallCtx<'static>, type_flags: u64) -> i64 {
     }
 }
 
+fn socket_netlink(ctx: &SyscallCtx<'static>) -> i64 {
+    match socket_req(
+        NR_SOCKET,
+        [
+            AF_NETLINK as u64,
+            SOCK_RAW | O_CLOEXEC as u64,
+            NETLINK_ROUTE as u64,
+            0,
+            0,
+            0,
+        ],
+        ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_NETLINK, RAW, NETLINK_ROUTE) failed: {other:?}"),
+    }
+}
+
+fn socket_unix_dgram(ctx: &SyscallCtx<'static>) -> i64 {
+    match socket_req(
+        NR_SOCKET,
+        [AF_UNIX as u64, SOCK_DGRAM | O_CLOEXEC as u64, 0, 0, 0, 0],
+        ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_UNIX, DGRAM) failed: {other:?}"),
+    }
+}
+
 #[test]
 fn dispatch_socket_installs_struct_backed_socket_fd() {
     let _setup = socket_setup();
@@ -123,6 +195,351 @@ fn dispatch_socket_installs_struct_backed_socket_fd() {
             payload: StructPayload::Socket { .. }
         }
     ));
+}
+
+#[test]
+fn dispatch_netlink_route_bind_accepts_sockaddr_nl() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_netlink(&ctx);
+    let nladdr = sockaddr_nl();
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                fd as u64,
+                nladdr.as_ptr() as u64,
+                SOCKADDR_NL_BYTES as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+}
+
+#[test]
+fn dispatch_netlink_route_sendto_recvfrom_returns_dump() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_netlink(&ctx);
+    let nladdr = sockaddr_nl();
+    let request = rtnl_getlink_request(0x55);
+    let mut recv_buf = [0u8; 512];
+    let mut recv_addr = [0u8; SOCKADDR_NL_BYTES as usize];
+    let mut recv_addr_len = SOCKADDR_NL_BYTES;
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                fd as u64,
+                nladdr.as_ptr() as u64,
+                SOCKADDR_NL_BYTES as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                fd as u64,
+                request.as_ptr() as u64,
+                request.len() as u64,
+                0,
+                nladdr.as_ptr() as u64,
+                SOCKADDR_NL_BYTES as u64
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(request.len() as i64)
+    );
+
+    let recv = socket_req(
+        NR_RECVFROM,
+        [
+            fd as u64,
+            recv_buf.as_mut_ptr() as u64,
+            recv_buf.len() as u64,
+            0,
+            recv_addr.as_mut_ptr() as u64,
+            (&mut recv_addr_len as *mut u32) as u64,
+        ],
+        &ctx,
+    );
+
+    assert!(matches!(recv, SyscallResult::Return(n) if n > 0));
+    assert_eq!(
+        u16::from_le_bytes([recv_addr[0], recv_addr[1]]),
+        AF_NETLINK as u16
+    );
+    assert_eq!(recv_addr_len, SOCKADDR_NL_BYTES);
+}
+
+#[test]
+fn dispatch_netlink_route_write_read_returns_dump() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_netlink(&ctx);
+    let nladdr = sockaddr_nl();
+    let request = rtnl_getlink_request(0x66);
+    let mut recv_buf = [0u8; 512];
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                fd as u64,
+                nladdr.as_ptr() as u64,
+                SOCKADDR_NL_BYTES as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_WRITE,
+            [
+                fd as u64,
+                request.as_ptr() as u64,
+                request.len() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(request.len() as i64)
+    );
+
+    let recv = socket_req(
+        NR_READ,
+        [
+            fd as u64,
+            recv_buf.as_mut_ptr() as u64,
+            recv_buf.len() as u64,
+            0,
+            0,
+            0,
+        ],
+        &ctx,
+    );
+
+    assert!(matches!(recv, SyscallResult::Return(n) if n > 0));
+    assert!(
+        contains_bytes(&recv_buf, b"lo\0"),
+        "read(2) should return the rtnetlink dump bytes"
+    );
+}
+
+#[test]
+fn dispatch_socket_ioctl_resolves_loopback_ifindex_and_txqlen() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let mut ifreq = [0u8; 40];
+    ifreq[0..2].copy_from_slice(b"lo");
+
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCGIFINDEX as u64,
+                ifreq.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(i32::from_le_bytes(ifreq[16..20].try_into().unwrap()), 1);
+
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCGIFTXQLEN as u64,
+                ifreq.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(i32::from_le_bytes(ifreq[16..20].try_into().unwrap()), 0);
+}
+
+#[test]
+fn dispatch_socket_ioctl_reads_and_writes_interface_flags() {
+    const IFF_UP: i16 = 0x0001;
+    const IFF_LOOPBACK: i16 = 0x0008;
+
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let mut ifreq = [0u8; 40];
+    ifreq[0..2].copy_from_slice(b"lo");
+
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCGIFFLAGS as u64,
+                ifreq.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    let flags = i16::from_le_bytes(ifreq[16..18].try_into().unwrap());
+    assert_ne!(flags & IFF_UP, 0);
+    assert_ne!(flags & IFF_LOOPBACK, 0);
+
+    ifreq[16..18].copy_from_slice(&(flags | IFF_UP).to_le_bytes());
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCSIFFLAGS as u64,
+                ifreq.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+}
+
+#[test]
+fn dispatch_unix_dgram_socket_ioctl_resolves_loopback_ifindex() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_unix_dgram(&ctx);
+    let mut ifreq = [0u8; 40];
+    ifreq[0..2].copy_from_slice(b"lo");
+
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCGIFINDEX as u64,
+                ifreq.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(i32::from_le_bytes(ifreq[16..20].try_into().unwrap()), 1);
+}
+
+#[test]
+fn dispatch_netlink_route_getlink_sendmsg_recvmsg_returns_dump() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_netlink(&ctx);
+    let nladdr = sockaddr_nl();
+    let request = rtnl_getlink_request(0x44);
+    let send_iov = [TestIovec {
+        base: request.as_ptr() as u64,
+        len: request.len() as u64,
+    }];
+    let mut send_hdr = TestMsghdr {
+        name: nladdr.as_ptr() as u64,
+        namelen: SOCKADDR_NL_BYTES,
+        _pad0: 0,
+        iov: send_iov.as_ptr() as u64,
+        iovlen: send_iov.len() as u64,
+        control: 0,
+        controllen: 0,
+        flags: 0,
+        _pad1: 0,
+    };
+
+    assert_eq!(
+        socket_req(
+            NR_SENDMSG,
+            [
+                fd as u64,
+                (&mut send_hdr as *mut TestMsghdr) as u64,
+                0,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(request.len() as i64)
+    );
+
+    let mut response = [0u8; 8192];
+    let recv_iov = [TestIovec {
+        base: response.as_mut_ptr() as u64,
+        len: response.len() as u64,
+    }];
+    let mut source = [0u8; SOCKADDR_NL_BYTES as usize];
+    let mut recv_hdr = TestMsghdr {
+        name: source.as_mut_ptr() as u64,
+        namelen: SOCKADDR_NL_BYTES,
+        _pad0: 0,
+        iov: recv_iov.as_ptr() as u64,
+        iovlen: recv_iov.len() as u64,
+        control: 0,
+        controllen: 0,
+        flags: 0xFFFF_FFFF,
+        _pad1: 0,
+    };
+
+    let recv = match socket_req(
+        NR_RECVMSG,
+        [
+            fd as u64,
+            (&mut recv_hdr as *mut TestMsghdr) as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
+        &ctx,
+    ) {
+        SyscallResult::Return(recv) => recv as usize,
+        other => panic!("recvmsg netlink failed: {other:?}"),
+    };
+
+    assert!(recv >= 20);
+    assert_eq!(recv_hdr.namelen, SOCKADDR_NL_BYTES);
+    assert_eq!(recv_hdr.flags, 0);
+    assert_eq!(u16::from_le_bytes([source[0], source[1]]), AF_NETLINK);
+    assert_eq!(u16::from_le_bytes([response[4], response[5]]), RTM_NEWLINK);
+    assert!(response[..recv].windows(3).any(|window| window == b"lo\0"));
 }
 
 #[test]

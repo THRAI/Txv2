@@ -327,7 +327,10 @@ pub const NR_SENDMSG: u64 = 211;
 pub const NR_RECVMSG: u64 = 212;
 pub const NR_ACCEPT4: u64 = 242;
 
+pub const AF_UNIX: u16 = 1;
 pub const AF_INET: u16 = 2;
+pub const AF_NETLINK: u16 = 16;
+pub const NETLINK_ROUTE: i32 = 0;
 pub const SOL_SOCKET: i32 = 1;
 pub const IPPROTO_IP: i32 = 0;
 pub const IPPROTO_ICMP: i32 = 1;
@@ -402,11 +405,20 @@ pub const CLONE_DETACHED: u64 = 0x400000;
 /// System-V semaphore undo on exit; musl sets this in pthread_create.
 pub const CLONE_SYSVSEM: u64 = 0x40000;
 /// Namespace flags. `CLONE_NEWIPC` is wired to the process nsproxy
-/// clone path; the others are still silently accepted by pthread_create
+/// clone path; `CLONE_NEWNET` is wired to network namespace syscalls.
+/// The others are still silently accepted by pthread_create
 /// compatibility paths and remain namespace stubs.
 pub const CLONE_NEWCGROUP: u64 = 0x2000000;
 pub const CLONE_NEWUTS: u64 = 0x4000000;
 pub const CLONE_NEWIPC: u64 = 0x8000000;
+/// `CLONE_NEWNET` — create or join a network namespace via
+/// `unshare(2)` / `setns(2)`.
+pub const CLONE_NEWNET: u64 = 0x4000_0000;
+
+/// `unshare(flags)`. Linux RV64 generic ABI `__NR_unshare`.
+pub const NR_UNSHARE: u64 = 97;
+/// `setns(fd, nstype)`. Linux RV64 generic ABI `__NR_setns`.
+pub const NR_SETNS: u64 = 268;
 
 /// `getppid()`. Linux generic ABI `__NR_getppid`. Wraps
 /// `ProcessIdentity::parent_pid()`. Returns `0` (`Pid::RESERVED`)
@@ -1012,6 +1024,14 @@ pub const TIOCSWINSZ: u32 = 0x5414;
 /// `TIOCNOTTY = 0x5422` — detach this TTY as the calling session's
 /// controlling terminal.
 pub const TIOCNOTTY: u32 = 0x5422;
+/// `SIOCGIFFLAGS = 0x8913` — read `struct ifreq.ifr_flags`.
+pub const SIOCGIFFLAGS: u32 = 0x8913;
+/// `SIOCSIFFLAGS = 0x8914` — write `struct ifreq.ifr_flags`.
+pub const SIOCSIFFLAGS: u32 = 0x8914;
+/// `SIOCGIFINDEX = 0x8933` — resolve `struct ifreq.ifr_name` to ifindex.
+pub const SIOCGIFINDEX: u32 = 0x8933;
+/// `SIOCGIFTXQLEN = 0x8942` — query `struct ifreq.ifr_qlen`.
+pub const SIOCGIFTXQLEN: u32 = 0x8942;
 
 // ---------------------------------------------------------------------
 // Slice 6 of the shell-prompt roadmap — stat family syscalls.

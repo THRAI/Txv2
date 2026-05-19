@@ -9,17 +9,19 @@ use super::*;
 
 use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
 use tx_subsystems::net::{
+    net_namespace_payload_from_file, netlink_route_recv, netlink_route_send_with_netns_resolvers,
     socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
     step_poll_ready, step_poll_wait_token, step_recv_kernel_bytes, step_send_to_kernel_bytes,
-    step_shutdown, step_socket_close, step_socket_open_file, step_tcp_loopback_transfer,
-    IpEndpoint, Ipv4Address, KernelSockAddr, LingerOption, PollMask, SendRecvFlags, SockAddrIn,
-    SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol, TcpState,
-    UdpInner,
+    step_shutdown, step_socket_close, step_socket_open_file_in_namespace,
+    step_tcp_loopback_transfer, IpEndpoint, Ipv4Address, KernelSockAddr, LingerOption, PollMask,
+    SendRecvFlags, SockAddrIn, SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind,
+    SocketProtocol, TcpState, UdpInner,
 };
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::wait_source;
 
 const SOCKADDR_IN_BYTES: u32 = 16;
+const SOCKADDR_NL_BYTES: u32 = 12;
 const ACCEPT4_KNOWN_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
 const EPHEMERAL_PORT_START: u16 = 49_152;
 const EPHEMERAL_PORT_END: u16 = 49_216;
@@ -29,6 +31,7 @@ const MSGHDR_NAMELEN_OFFSET: u64 = 8;
 const MSGHDR_CONTROLLEN_OFFSET: u64 = 40;
 const MSGHDR_FLAGS_OFFSET: u64 = 48;
 const MAX_MSG_IOV: u64 = 1024;
+const NETLINK_RECVMSG_MAX: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
 struct UserIovec {
@@ -53,7 +56,10 @@ pub(super) fn sys_socket<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
 
     let outcome = {
         let guard = tx_substrate::epoch::guard();
-        step_socket_open_file(domain, type_, protocol, &guard)
+        let Some(net_namespace) = ctx.process.net_namespace() else {
+            return SyscallResult::Error(ESRCH_VALUE);
+        };
+        step_socket_open_file_in_namespace(domain, type_, protocol, net_namespace, &guard)
     };
 
     let opened = match outcome {
@@ -83,6 +89,12 @@ pub(super) fn sys_bind<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
         Ok((_, socket)) => socket,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
+    if socket.kind == SocketKind::NetlinkRoute {
+        return match read_sockaddr_nl(ctx, args[1], args[2]) {
+            Ok(()) => SyscallResult::Return(0),
+            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        };
+    }
     let addr = match read_sockaddr_in(ctx, args[1], args[2]) {
         Ok(addr) => addr,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
@@ -360,6 +372,39 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         flags |= SendRecvFlags::MSG_DONTWAIT;
     }
 
+    if socket.kind == SocketKind::NetlinkRoute {
+        if args[4] != 0 {
+            if let Err(errno) = read_sockaddr_nl(ctx, args[4], args[5]) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
+        let mut bytes = alloc::vec![0; len];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, args[1]) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+        let mut resolve_netns_fd = |fd: i32| {
+            if fd < 0 {
+                return None;
+            }
+            let file = resolve_fd(&ctx.process, fd as u32)?;
+            net_namespace_payload_from_file(&file)
+        };
+        let mut resolve_netns_pid = |pid: u32| {
+            let process = process_by_pid(Pid(pid))?;
+            process.net_namespace()
+        };
+        return match netlink_route_send_with_netns_resolvers(
+            &socket,
+            &bytes,
+            ctx.cred(),
+            &mut resolve_netns_fd,
+            &mut resolve_netns_pid,
+        ) {
+            Ok(sent) => SyscallResult::Return(sent as i64),
+            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        };
+    }
+
     let dst = if args[4] != 0 {
         match read_sockaddr_in(ctx, args[4], args[5]) {
             Ok(addr) => Some(addr.as_ip_endpoint()),
@@ -458,6 +503,23 @@ pub(super) async fn sys_recvfrom<'a, P: TimeIf>(
         return SyscallResult::Return(0);
     }
 
+    if socket.kind == SocketKind::NetlinkRoute {
+        let mut staging = alloc::vec![0; len.min(TTY_WRITE_MAX_INLINE)];
+        let recv = match netlink_route_recv(&socket, &mut staging, flags) {
+            Ok(recv) => recv,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        };
+        if recv > 0 {
+            if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, args[1], &staging[..recv]) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
+        if let Err(errno) = write_sockaddr_nl(ctx, args[4], args[5]) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+        return SyscallResult::Return(recv as i64);
+    }
+
     let mut staging = alloc::vec![0; len.min(TTY_WRITE_MAX_INLINE)];
     loop {
         let outcome = {
@@ -519,6 +581,58 @@ pub(super) async fn sys_sendmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         flags |= SendRecvFlags::MSG_DONTWAIT;
     }
 
+    if socket.kind == SocketKind::NetlinkRoute {
+        if header.name != 0 {
+            if let Err(errno) = read_sockaddr_nl(ctx, header.name, header.namelen as u64) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
+        let iovecs = match read_iovecs(ctx, header.iov, header.iovlen) {
+            Ok(iovecs) => iovecs,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        };
+        let total_len = match iov_total_len(&iovecs) {
+            Ok(total_len) => total_len,
+            Err(errno_value) => return SyscallResult::Error(errno_value),
+        };
+        if total_len == 0 {
+            return SyscallResult::Return(0);
+        }
+        let mut bytes = alloc::vec::Vec::with_capacity(total_len);
+        for iov in &iovecs {
+            if iov.len == 0 {
+                continue;
+            }
+            let start = bytes.len();
+            bytes.resize(start + iov.len, 0);
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes[start..], iov.base)
+            {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
+        let mut resolve_netns_fd = |fd: i32| {
+            if fd < 0 {
+                return None;
+            }
+            let file = resolve_fd(&ctx.process, fd as u32)?;
+            net_namespace_payload_from_file(&file)
+        };
+        let mut resolve_netns_pid = |pid: u32| {
+            let process = process_by_pid(Pid(pid))?;
+            process.net_namespace()
+        };
+        return match netlink_route_send_with_netns_resolvers(
+            &socket,
+            &bytes,
+            ctx.cred(),
+            &mut resolve_netns_fd,
+            &mut resolve_netns_pid,
+        ) {
+            Ok(sent) => SyscallResult::Return(sent as i64),
+            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        };
+    }
+
     let dst = if header.name != 0 {
         match read_sockaddr_in(ctx, header.name, header.namelen as u64) {
             Ok(addr) => Some(addr.as_ip_endpoint()),
@@ -532,7 +646,11 @@ pub(super) async fn sys_sendmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         Ok(iovecs) => iovecs,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
-    let total_len = match iov_total_len(&iovecs) {
+    let total_len = match if socket.kind == SocketKind::NetlinkRoute {
+        iov_total_len_with_limit(&iovecs, NETLINK_RECVMSG_MAX)
+    } else {
+        iov_total_len(&iovecs)
+    } {
         Ok(total_len) => total_len,
         Err(errno_value) => return SyscallResult::Error(errno_value),
     };
@@ -627,7 +745,11 @@ pub(super) async fn sys_recvmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         Ok(iovecs) => iovecs,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
-    let total_len = match iov_total_len(&iovecs) {
+    let total_len = match if socket.kind == SocketKind::NetlinkRoute {
+        iov_total_len_with_limit(&iovecs, NETLINK_RECVMSG_MAX)
+    } else {
+        iov_total_len(&iovecs)
+    } {
         Ok(total_len) => total_len,
         Err(errno_value) => return SyscallResult::Error(errno_value),
     };
@@ -639,6 +761,23 @@ pub(super) async fn sys_recvmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     }
     if total_len == 0 {
         return SyscallResult::Return(0);
+    }
+
+    if socket.kind == SocketKind::NetlinkRoute {
+        let mut staging = alloc::vec![0; total_len];
+        let recv = match netlink_route_recv(&socket, &mut staging, flags) {
+            Ok(recv) => recv,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        };
+        if recv > 0 {
+            if let Err(errno) = scatter_to_iovecs(ctx, &iovecs, &staging[..recv]) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
+        if let Err(errno) = write_sockaddr_nl_into_msghdr(ctx, args[1], header) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+        return SyscallResult::Return(recv as i64);
     }
 
     let mut staging = alloc::vec![0; total_len];
@@ -1018,6 +1157,27 @@ fn read_sockaddr_in<'a>(
     Ok(KernelSockAddr::V4(SockAddrIn::new(port, addr)))
 }
 
+fn read_sockaddr_nl<'a>(
+    ctx: &SyscallCtx<'a>,
+    sockaddr_ptr: u64,
+    sockaddr_len: u64,
+) -> Result<(), Errno> {
+    if sockaddr_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if sockaddr_len < SOCKADDR_NL_BYTES as u64 {
+        return Err(Errno::EINVAL);
+    }
+
+    let mut bytes = [0u8; SOCKADDR_NL_BYTES as usize];
+    bootstrap_copy_from_user(&ctx.aspace, &mut bytes, sockaddr_ptr)?;
+    let family = u16::from_le_bytes([bytes[0], bytes[1]]);
+    if family != AF_NETLINK {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    Ok(())
+}
+
 fn read_msghdr<'a>(ctx: &SyscallCtx<'a>, msghdr_ptr: u64) -> Result<UserMsghdr, Errno> {
     if msghdr_ptr == 0 {
         return Err(Errno::EFAULT);
@@ -1063,10 +1223,14 @@ fn read_iovecs<'a>(
 }
 
 fn iov_total_len(iovecs: &[UserIovec]) -> Result<usize, i32> {
+    iov_total_len_with_limit(iovecs, TTY_WRITE_MAX_INLINE)
+}
+
+fn iov_total_len_with_limit(iovecs: &[UserIovec], limit: usize) -> Result<usize, i32> {
     let mut total = 0usize;
     for iov in iovecs {
         total = total.checked_add(iov.len).ok_or(EINVAL_VALUE)?;
-        if total > TTY_WRITE_MAX_INLINE {
+        if total > limit {
             return Err(E2BIG_VALUE);
         }
     }
@@ -1141,6 +1305,47 @@ fn write_sockaddr_into_msghdr<'a>(
     bootstrap_copy_to_user(&ctx.aspace, header.name, &bytes)
 }
 
+fn write_sockaddr_nl_into_msghdr<'a>(
+    ctx: &SyscallCtx<'a>,
+    msghdr_ptr: u64,
+    header: UserMsghdr,
+) -> Result<(), Errno> {
+    if header.name == 0 {
+        return Ok(());
+    }
+    write_msghdr_namelen(ctx, msghdr_ptr, SOCKADDR_NL_BYTES)?;
+    if header.namelen < SOCKADDR_NL_BYTES {
+        return Err(Errno::EINVAL);
+    }
+
+    let mut bytes = [0u8; SOCKADDR_NL_BYTES as usize];
+    bytes[0..2].copy_from_slice(&AF_NETLINK.to_le_bytes());
+    bootstrap_copy_to_user(&ctx.aspace, header.name, &bytes)
+}
+
+fn write_sockaddr_nl<'a>(
+    ctx: &SyscallCtx<'a>,
+    sockaddr_ptr: u64,
+    sockaddr_len_ptr: u64,
+) -> Result<(), Errno> {
+    if sockaddr_ptr == 0 && sockaddr_len_ptr == 0 {
+        return Ok(());
+    }
+    if sockaddr_ptr == 0 || sockaddr_len_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    let len: u32 = bootstrap_read_user(&ctx.aspace, sockaddr_len_ptr)?;
+    bootstrap_write_user(&ctx.aspace, sockaddr_len_ptr, SOCKADDR_NL_BYTES)?;
+    if len < SOCKADDR_NL_BYTES {
+        return Err(Errno::EINVAL);
+    }
+
+    let mut bytes = [0u8; SOCKADDR_NL_BYTES as usize];
+    bytes[0..2].copy_from_slice(&AF_NETLINK.to_le_bytes());
+    bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes)
+}
+
 fn write_sockaddr_endpoint<'a>(
     ctx: &SyscallCtx<'a>,
     sockaddr_ptr: u64,
@@ -1181,6 +1386,9 @@ fn socket_local_endpoint(socket: &Cap<SocketIdentity>) -> Result<IpEndpoint, Err
             0,
         )),
         SocketProtocol::Tcp(TcpState::Init) | SocketProtocol::Udp(UdpInner::Unbound) => {
+            Ok(IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0))
+        }
+        SocketProtocol::UnixDatagram | SocketProtocol::NetlinkRoute(_) => {
             Ok(IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0))
         }
         SocketProtocol::Tcp(TcpState::Closed) | SocketProtocol::Udp(UdpInner::Closed) => {
@@ -1363,9 +1571,11 @@ fn write_sockopt_bytes<'a>(
 
 fn socket_type_i32(socket: &Cap<SocketIdentity>) -> i32 {
     match socket.kind {
+        SocketKind::UnixDatagram => 2,
         SocketKind::Tcp => 1,
         SocketKind::Udp => 2,
         SocketKind::RawIcmp => 3,
+        SocketKind::NetlinkRoute => 3,
     }
 }
 

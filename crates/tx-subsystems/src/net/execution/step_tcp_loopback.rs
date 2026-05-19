@@ -2,9 +2,9 @@ use tx_substrate::zone::Cap;
 
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::execution::step_bind::table_error_to_errno;
+use crate::net::namespace::initial_loopback_iface;
 use crate::net::packet::{NetworkPublish, NetworkPublishTarget};
-use crate::net::protocol::{loopback_iface, LoopbackIface, PollContext};
-use crate::net::structure::table::SOCKET_TABLE;
+use crate::net::protocol::{LoopbackIface, PollContext};
 use crate::net::structure::{
     ConnectionKey, IpEndpoint, Ipv4Address, SocketIdentity, SocketProtocol, TcpState,
 };
@@ -41,7 +41,7 @@ pub fn step_tcp_loopback_handshake(
     client: &Cap<SocketIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackTcpConnectOutcome> {
-    step_tcp_loopback_handshake_on_iface(client, loopback_iface(), guard)
+    step_tcp_loopback_handshake_on_iface(client, initial_loopback_iface(), guard)
 }
 
 pub fn step_tcp_loopback_handshake_on_iface(
@@ -63,8 +63,8 @@ pub fn step_tcp_loopback_handshake_on_iface(
         return StepOutcome::Err(Errno::EOPNOTSUPP);
     }
 
-    let Some(listener) = SOCKET_TABLE.lookup_tcp_listener_addr(remote.addr, remote.port, guard)
-    else {
+    let table = client_payload.socket_table();
+    let Some(listener) = table.lookup_tcp_listener_addr(remote.addr, remote.port, guard) else {
         return StepOutcome::Err(Errno::ECONNREFUSED);
     };
     let Some(listener_payload) = listener.acquire_operational() else {
@@ -90,7 +90,7 @@ pub fn step_tcp_loopback_handshake_on_iface(
     };
 
     let client_key = ConnectionKey::new(local, remote);
-    if let Err(error) = SOCKET_TABLE.insert_tcp_connection(client_key, client.clone()) {
+    if let Err(error) = table.insert_tcp_connection(client_key, client.clone()) {
         return StepOutcome::Err(table_error_to_errno(error));
     }
 
@@ -123,7 +123,7 @@ pub fn step_tcp_loopback_transfer(
     max_bytes: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackTcpTransferOutcome> {
-    step_process_loopback_tcp(source, max_bytes, loopback_iface(), guard)
+    step_process_loopback_tcp(source, max_bytes, initial_loopback_iface(), guard)
 }
 
 pub fn step_process_loopback_tcp(
@@ -144,7 +144,10 @@ pub fn step_process_loopback_tcp(
         Err(errno) => return StepOutcome::Err(errno),
     };
     let peer_key = ConnectionKey::new(remote, local);
-    let Some(peer) = SOCKET_TABLE.lookup_tcp_connection(peer_key, guard) else {
+    let Some(peer) = source_payload
+        .socket_table()
+        .lookup_tcp_connection(peer_key, guard)
+    else {
         return StepOutcome::Err(Errno::ENOTCONN);
     };
     let Some(peer_payload) = peer.acquire_operational() else {
@@ -172,7 +175,8 @@ pub fn step_process_loopback_tcp(
         return StepOutcome::Done(LoopbackTcpTransferOutcome::default());
     }
 
-    let mut ctx = PollContext::new(smoltcp::time::Instant::ZERO);
+    let mut ctx =
+        PollContext::new_with_table(smoltcp::time::Instant::ZERO, source_payload.socket_table());
     let mut publish_targets = alloc::vec::Vec::new();
     let mut bytes_moved = 0;
     let mut peer_wake_fired = false;
@@ -300,7 +304,8 @@ fn establish_smoltcp_loopback_on_iface(
 
     client_raw.connect_endpoint(local, remote).ok()?;
 
-    let mut ctx = PollContext::new(smoltcp::time::Instant::ZERO);
+    let mut ctx =
+        PollContext::new_with_table(smoltcp::time::Instant::ZERO, client_payload.socket_table());
     let mut publishes = alloc::vec::Vec::new();
 
     publishes.push(ctx.poll_egress_one(client, iface, guard)?);
@@ -354,7 +359,10 @@ fn connecting_endpoints(protocol: &SocketProtocol) -> Result<(IpEndpoint, IpEndp
         SocketProtocol::Tcp(TcpState::Connecting { local, remote }) => Ok((*local, *remote)),
         SocketProtocol::Tcp(TcpState::Connected { .. }) => Err(Errno::EISCONN),
         SocketProtocol::Tcp(_) => Err(Errno::EINVAL),
-        SocketProtocol::Udp(_) | SocketProtocol::RawIcmp(_) => Err(Errno::EOPNOTSUPP),
+        SocketProtocol::UnixDatagram
+        | SocketProtocol::Udp(_)
+        | SocketProtocol::RawIcmp(_)
+        | SocketProtocol::NetlinkRoute(_) => Err(Errno::EOPNOTSUPP),
     }
 }
 
@@ -362,6 +370,9 @@ fn connected_endpoints(protocol: &SocketProtocol) -> Result<(IpEndpoint, IpEndpo
     match protocol {
         SocketProtocol::Tcp(TcpState::Connected { local, remote }) => Ok((*local, *remote)),
         SocketProtocol::Tcp(_) => Err(Errno::ENOTCONN),
-        SocketProtocol::Udp(_) | SocketProtocol::RawIcmp(_) => Err(Errno::EOPNOTSUPP),
+        SocketProtocol::UnixDatagram
+        | SocketProtocol::Udp(_)
+        | SocketProtocol::RawIcmp(_)
+        | SocketProtocol::NetlinkRoute(_) => Err(Errno::EOPNOTSUPP),
     }
 }

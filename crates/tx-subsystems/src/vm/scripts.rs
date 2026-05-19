@@ -869,6 +869,7 @@ mod tests {
             stack_top: USER_STACK_TOP_DEFAULT,
             load_segments: Vec::new(),
             bss_extension: None,
+            executable_stack: false,
         };
         let aspace =
             build_aspace_from_image::<crate::vm::TestPmap>(&main_plan).expect("main aspace");
@@ -889,6 +890,7 @@ mod tests {
             stack_top: 0,
             load_segments: vec![interp_seg],
             bss_extension: None,
+            executable_stack: false,
         };
 
         register_interp_image(&aspace, &interp_plan, INTERP_LOAD_BIAS_DEFAULT)
@@ -920,6 +922,7 @@ mod tests {
             stack_top: USER_STACK_TOP_DEFAULT,
             load_segments: Vec::new(),
             bss_extension: None,
+            executable_stack: false,
         };
         let aspace =
             build_aspace_from_image::<crate::vm::TestPmap>(&main_plan).expect("main aspace");
@@ -928,6 +931,7 @@ mod tests {
             stack_top: 0,
             load_segments: Vec::new(),
             bss_extension: None,
+            executable_stack: false,
         };
         // Bias of 1 is not page-aligned.
         let err = register_interp_image(&aspace, &interp_plan, 1).unwrap_err();
@@ -944,6 +948,7 @@ mod tests {
             stack_top: USER_STACK_TOP_DEFAULT,
             load_segments: Vec::new(),
             bss_extension: None,
+            executable_stack: false,
         };
         let aspace =
             build_aspace_from_image::<crate::vm::TestPmap>(&main_plan).expect("main aspace");
@@ -954,6 +959,7 @@ mod tests {
             stack_top: 0,
             load_segments: Vec::new(),
             bss_extension: None,
+            executable_stack: false,
         };
         register_interp_image(&aspace, &interp_plan, INTERP_LOAD_BIAS_DEFAULT)
             .expect("register interp without segments");

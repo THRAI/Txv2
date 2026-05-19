@@ -354,7 +354,7 @@ fn install_optional_user_smokes(root: &Path, target: TxTarget, layout: &Path) ->
         return Ok(());
     }
 
-    for name in ["udp-loopback-smoke", "tcp-loopback-smoke"] {
+    for name in ["udp-loopback-smoke", "tcp-loopback-smoke", "netns-helper"] {
         let source = root.join("tools").join("user").join(format!("{name}.c"));
         if !source.is_file() {
             continue;

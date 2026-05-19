@@ -5,7 +5,9 @@ use crate::execution::Errno;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddressFamily {
+    Unix,
     Inet,
+    Netlink,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,7 +65,9 @@ impl ValidSocketType {
         let raw_type = type_ & !SockFlags::all().bits();
 
         let domain = match domain {
+            1 => AddressFamily::Unix,
             2 => AddressFamily::Inet,
+            16 => AddressFamily::Netlink,
             _ => return Err(Errno::EAFNOSUPPORT),
         };
 
@@ -86,17 +90,24 @@ impl ValidSocketType {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketKind {
+    UnixDatagram,
     Tcp,
     Udp,
     RawIcmp,
+    NetlinkRoute,
 }
 
 impl SocketKind {
     pub fn from_valid_socket_type(valid: ValidSocketType) -> Result<Self, Errno> {
-        match (valid.sock_type, valid.protocol) {
-            (SocketType::Stream, 0 | 6) => Ok(Self::Tcp),
-            (SocketType::Dgram, 0 | 17) => Ok(Self::Udp),
-            (SocketType::Dgram, 1) | (SocketType::Raw, 1) => Ok(Self::RawIcmp),
+        match (valid.domain, valid.sock_type, valid.protocol) {
+            (AddressFamily::Unix, SocketType::Dgram, 0) => Ok(Self::UnixDatagram),
+            (AddressFamily::Inet, SocketType::Stream, 0 | 6) => Ok(Self::Tcp),
+            (AddressFamily::Inet, SocketType::Dgram, 0 | 17) => Ok(Self::Udp),
+            (AddressFamily::Inet, SocketType::Dgram, 1)
+            | (AddressFamily::Inet, SocketType::Raw, 1) => Ok(Self::RawIcmp),
+            (AddressFamily::Netlink, SocketType::Raw | SocketType::Dgram, 0) => {
+                Ok(Self::NetlinkRoute)
+            }
             _ => Err(Errno::EOPNOTSUPP),
         }
     }
@@ -384,7 +395,10 @@ impl SocketOptionSet {
     pub const fn for_kind(kind: SocketKind) -> Self {
         match kind {
             SocketKind::Tcp => Self::default_tcp(),
-            SocketKind::Udp | SocketKind::RawIcmp => Self::default_udp(),
+            SocketKind::UnixDatagram
+            | SocketKind::Udp
+            | SocketKind::RawIcmp
+            | SocketKind::NetlinkRoute => Self::default_udp(),
         }
     }
 }

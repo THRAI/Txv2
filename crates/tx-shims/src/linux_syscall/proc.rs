@@ -106,6 +106,62 @@ pub(super) fn sys_getrusage<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     }
 }
 
+/// `unshare(CLONE_NEWNET)` — move the calling process into a fresh
+/// network namespace.
+///
+/// This is intentionally the minimal Docker-control-plane ABI: only
+/// `CLONE_NEWNET` is accepted, and the operation is gated by
+/// `CAP_SYS_ADMIN` like Linux. The namespace object itself still
+/// belongs to the network subsystem; the process only swaps the
+/// payload cap it uses for socket/netlink operations.
+pub(super) fn sys_unshare<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let flags = args[0];
+    if flags == 0 {
+        return SyscallResult::Return(0);
+    }
+    if flags & !CLONE_NEWNET != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if !ctx.cred().is_privileged_for(Capability::SYS_ADMIN) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+
+    let namespace = match tx_subsystems::net::create_isolated_net_namespace("unshare") {
+        Ok(namespace) => namespace,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let Some(payload) = namespace.payload_cap() else {
+        return SyscallResult::Error(EIO_VALUE);
+    };
+    let _old = ctx.process.replace_net_namespace(payload);
+    SyscallResult::Return(0)
+}
+
+/// `setns(fd, CLONE_NEWNET)` — join a network namespace referenced by
+/// a namespace fd such as `/proc/<pid>/ns/net`.
+pub(super) fn sys_setns<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i64;
+    let nstype = args[1];
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if nstype != 0 && nstype != CLONE_NEWNET {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if !ctx.cred().is_privileged_for(Capability::SYS_ADMIN) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+
+    let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
+        return SyscallResult::Error(EBADF_VALUE);
+    };
+    let Some(payload) = tx_subsystems::net::net_namespace_payload_from_file(&file) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    let _old = ctx.process.replace_net_namespace(payload);
+    SyscallResult::Return(0)
+}
+
 /// `execve(path, argv, envp)` — Wave 4 / Phase 6 of the ELF-loader
 /// plan.
 ///

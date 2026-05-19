@@ -6,6 +6,9 @@ use smoltcp::time::{Duration, Instant};
 use tx_substrate::zone::Cap;
 use tx_substrate::zone::PayloadCap;
 
+use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
+use crate::net::rtnetlink::{NetlinkRouteState, RawNetlinkRouteSocket};
+use crate::net::structure::SocketTable;
 use crate::sync::SpinMutex;
 
 use super::super::protocol::{
@@ -24,11 +27,13 @@ pub const TCP_BACKLOG_RETRANSMIT_LIMIT_STAGING: u8 = 3;
 pub const TCP_BACKLOG_RETRANSMIT_BACKOFF_MILLIS: i64 = 1_000;
 
 pub struct SocketPayload {
+    pub(crate) net_namespace: PayloadCap<NetNamespacePayload>,
     pub(crate) protocol: SpinMutex<SocketProtocol>,
     pub(crate) options: SpinMutex<SocketOptionSet>,
     pub(crate) raw_tcp: Option<RawTcpSocket>,
     pub(crate) raw_udp: Option<RawUdpSocket>,
     pub(crate) raw_icmp: Option<RawIcmpSocket>,
+    pub(crate) raw_netlink_route: Option<RawNetlinkRouteSocket>,
     pub(crate) io: SpinMutex<SocketIoState>,
     pub(crate) tcp_backlog: SpinMutex<TcpBacklog>,
     pub shutdown_rd: AtomicBool,
@@ -37,10 +42,20 @@ pub struct SocketPayload {
 
 impl SocketPayload {
     pub fn new(kind: SocketKind, options: SocketOptionSet) -> Self {
-        let (protocol, raw_tcp, raw_udp, raw_icmp) = match kind {
+        Self::new_in_namespace(kind, options, initial_net_namespace_payload())
+    }
+
+    pub fn new_in_namespace(
+        kind: SocketKind,
+        options: SocketOptionSet,
+        net_namespace: PayloadCap<NetNamespacePayload>,
+    ) -> Self {
+        let (protocol, raw_tcp, raw_udp, raw_icmp, raw_netlink_route) = match kind {
+            SocketKind::UnixDatagram => (SocketProtocol::UnixDatagram, None, None, None, None),
             SocketKind::Tcp => (
                 SocketProtocol::Tcp(TcpState::Init),
                 Some(RawTcpSocket::new(&options)),
+                None,
                 None,
                 None,
             ),
@@ -49,20 +64,31 @@ impl SocketPayload {
                 None,
                 Some(RawUdpSocket::new(&options)),
                 None,
+                None,
             ),
             SocketKind::RawIcmp => (
                 SocketProtocol::RawIcmp(RawIcmpState::new(ProtocolNumber(1))),
                 None,
                 None,
                 Some(RawIcmpSocket::new(&options)),
+                None,
+            ),
+            SocketKind::NetlinkRoute => (
+                SocketProtocol::NetlinkRoute(NetlinkRouteState),
+                None,
+                None,
+                None,
+                Some(RawNetlinkRouteSocket::new()),
             ),
         };
         let payload = Self {
+            net_namespace,
             protocol: SpinMutex::new(protocol),
             options: SpinMutex::new(options),
             raw_tcp,
             raw_udp,
             raw_icmp,
+            raw_netlink_route,
             io: SpinMutex::new(SocketIoState::new()),
             tcp_backlog: SpinMutex::new(TcpBacklog::new()),
             shutdown_rd: AtomicBool::new(false),
@@ -70,6 +96,14 @@ impl SocketPayload {
         };
         payload.refresh_io_from_raw();
         payload
+    }
+
+    pub fn net_namespace(&self) -> PayloadCap<NetNamespacePayload> {
+        self.net_namespace.clone()
+    }
+
+    pub fn socket_table(&self) -> &'static SocketTable {
+        self.net_namespace.socket_table()
     }
 
     pub fn shutdown_rd(&self) -> bool {
@@ -137,6 +171,10 @@ impl SocketPayload {
 
     pub fn raw_icmp_socket(&self) -> Option<&RawIcmpSocket> {
         self.raw_icmp.as_ref()
+    }
+
+    pub(crate) fn raw_netlink_route_socket(&self) -> Option<&RawNetlinkRouteSocket> {
+        self.raw_netlink_route.as_ref()
     }
 
     pub fn accept_queue_len(&self) -> usize {
@@ -440,30 +478,48 @@ impl SocketPayload {
     }
 
     fn raw_recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
-        match (&self.raw_tcp, &self.raw_udp, &self.raw_icmp) {
-            (Some(raw_tcp), None, None) => raw_tcp
+        match (
+            &self.raw_tcp,
+            &self.raw_udp,
+            &self.raw_icmp,
+            &self.raw_netlink_route,
+        ) {
+            (Some(raw_tcp), None, None, None) => raw_tcp
                 .recv_len(len, peek)
                 .or_else(|| raw_tcp.is_recv_closed().then_some((0, false))),
-            (None, Some(raw_udp), None) => raw_udp.recv_len(len, peek),
-            (None, None, Some(raw_icmp)) => raw_icmp.recv_len(len, peek),
+            (None, Some(raw_udp), None, None) => raw_udp.recv_len(len, peek),
+            (None, None, Some(raw_icmp), None) => raw_icmp.recv_len(len, peek),
+            (None, None, None, Some(raw_netlink)) => raw_netlink.recv_len(len),
             _ => None,
         }
     }
 
     fn raw_recv_available(&self) -> usize {
-        match (&self.raw_tcp, &self.raw_udp, &self.raw_icmp) {
-            (Some(raw_tcp), None, None) => raw_tcp.recv_available(),
-            (None, Some(raw_udp), None) => raw_udp.recv_available(),
-            (None, None, Some(raw_icmp)) => raw_icmp.recv_available(),
+        match (
+            &self.raw_tcp,
+            &self.raw_udp,
+            &self.raw_icmp,
+            &self.raw_netlink_route,
+        ) {
+            (Some(raw_tcp), None, None, None) => raw_tcp.recv_available(),
+            (None, Some(raw_udp), None, None) => raw_udp.recv_available(),
+            (None, None, Some(raw_icmp), None) => raw_icmp.recv_available(),
+            (None, None, None, Some(raw_netlink)) => raw_netlink.recv_available(),
             _ => 0,
         }
     }
 
     fn raw_send_available(&self) -> usize {
-        match (&self.raw_tcp, &self.raw_udp, &self.raw_icmp) {
-            (Some(raw_tcp), None, None) => raw_tcp.send_available(),
-            (None, Some(raw_udp), None) => raw_udp.send_available(),
-            (None, None, Some(raw_icmp)) => raw_icmp.send_available(),
+        match (
+            &self.raw_tcp,
+            &self.raw_udp,
+            &self.raw_icmp,
+            &self.raw_netlink_route,
+        ) {
+            (Some(raw_tcp), None, None, None) => raw_tcp.send_available(),
+            (None, Some(raw_udp), None, None) => raw_udp.send_available(),
+            (None, None, Some(raw_icmp), None) => raw_icmp.send_available(),
+            (None, None, None, Some(raw_netlink)) => raw_netlink.send_available(),
             _ => 0,
         }
     }
@@ -806,9 +862,11 @@ pub(crate) struct ShutdownMark {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SocketProtocol {
+    UnixDatagram,
     Tcp(TcpState),
     Udp(UdpInner),
     RawIcmp(RawIcmpState),
+    NetlinkRoute(NetlinkRouteState),
 }
 
 pub struct Takeable<T> {

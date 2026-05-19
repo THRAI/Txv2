@@ -5,10 +5,10 @@
 
 use super::*;
 use alloc::collections::BTreeMap;
+use core::mem::{offset_of, size_of};
 
 use crate::adapter::step_engine::{Cap, SpinMutex};
 use tx_subsystems::process::ProcessIdentity;
-use core::mem::{offset_of, size_of};
 
 use tx_hal::{UserSaFlagsAbi, UserSigInfoAbi, UserSignalMaskAbi, UserTrapContext};
 use tx_subsystems::signal::step_kill_process;

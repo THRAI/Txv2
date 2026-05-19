@@ -523,6 +523,8 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_SHMAT => sys_shmat(req.args, ctx).await,
         nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
         nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx).await,
+        nr if nr == NR_UNSHARE => sys_unshare(req.args, ctx),
+        nr if nr == NR_SETNS => sys_setns(req.args, ctx),
         nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
         nr if nr == NR_GETRUSAGE => sys_getrusage(req.args, ctx),
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),

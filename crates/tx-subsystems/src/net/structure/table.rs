@@ -353,4 +353,210 @@ impl Default for SocketTable {
     }
 }
 
-pub static SOCKET_TABLE: SocketTable = SocketTable::new();
+pub struct InitialSocketTableProxy;
+
+impl InitialSocketTableProxy {
+    pub const fn as_table(&self) -> &'static SocketTable {
+        crate::net::namespace::initial_socket_table()
+    }
+
+    fn with_table<R>(&self, f: impl FnOnce(&SocketTable) -> R) -> R {
+        let namespace = crate::net::namespace::initial_net_namespace_payload();
+        f(namespace.socket_table())
+    }
+
+    pub fn bind_tcp(
+        &self,
+        endpoint: IpEndpoint,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.with_table(|table| table.bind_tcp(endpoint, socket))
+    }
+
+    pub fn bind_udp(
+        &self,
+        endpoint: IpEndpoint,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.with_table(|table| table.bind_udp(endpoint, socket))
+    }
+
+    pub fn listen_tcp(
+        &self,
+        endpoint: IpEndpoint,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.with_table(|table| table.listen_tcp(endpoint, socket))
+    }
+
+    pub fn insert_tcp_connection(
+        &self,
+        key: ConnectionKey,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.with_table(|table| table.insert_tcp_connection(key, socket))
+    }
+
+    pub fn insert_udp_connection(
+        &self,
+        key: ConnectionKey,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.with_table(|table| table.insert_udp_connection(key, socket))
+    }
+
+    pub fn register_raw_icmp(&self, socket: Cap<SocketIdentity>) -> Result<(), IndexError> {
+        self.with_table(|table| table.register_raw_icmp(socket))
+    }
+
+    pub fn insert_tcp_connection_pair(
+        &self,
+        first_key: ConnectionKey,
+        first_socket: Cap<SocketIdentity>,
+        second_key: ConnectionKey,
+        second_socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.with_table(|table| {
+            table.insert_tcp_connection_pair(first_key, first_socket, second_key, second_socket)
+        })
+    }
+
+    pub fn withdraw_tcp_connection(
+        &self,
+        key: ConnectionKey,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        self.with_table(|table| table.withdraw_tcp_connection(key))
+    }
+
+    pub fn withdraw_tcp_bound(
+        &self,
+        endpoint: IpEndpoint,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        self.with_table(|table| table.withdraw_tcp_bound(endpoint))
+    }
+
+    pub fn withdraw_tcp_listener(
+        &self,
+        endpoint: IpEndpoint,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        self.with_table(|table| table.withdraw_tcp_listener(endpoint))
+    }
+
+    pub fn withdraw_udp_bound(
+        &self,
+        endpoint: IpEndpoint,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        self.with_table(|table| table.withdraw_udp_bound(endpoint))
+    }
+
+    pub fn withdraw_udp_connection(
+        &self,
+        key: ConnectionKey,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        self.with_table(|table| table.withdraw_udp_connection(key))
+    }
+
+    pub fn withdraw_raw_icmp(&self, socket_raw: u32) -> Result<Cap<SocketIdentity>, MutationError> {
+        self.with_table(|table| table.withdraw_raw_icmp(socket_raw))
+    }
+
+    pub fn lookup_tcp_bound(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.with_table(|table| table.lookup_tcp_bound(endpoint, guard))
+    }
+
+    pub fn lookup_tcp_listener(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.with_table(|table| table.lookup_tcp_listener(endpoint, guard))
+    }
+
+    pub fn lookup_tcp_listener_addr(
+        &self,
+        addr: Ipv4Address,
+        port: u16,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.with_table(|table| table.lookup_tcp_listener_addr(addr, port, guard))
+    }
+
+    pub fn lookup_tcp_connection(
+        &self,
+        key: ConnectionKey,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.with_table(|table| table.lookup_tcp_connection(key, guard))
+    }
+
+    pub fn lookup_udp_connection(
+        &self,
+        key: ConnectionKey,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.with_table(|table| table.lookup_udp_connection(key, guard))
+    }
+
+    pub fn lookup_udp_ingress(
+        &self,
+        src: IpEndpoint,
+        dst: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.with_table(|table| table.lookup_udp_ingress(src, dst, guard))
+    }
+
+    pub fn snapshot_tcp_listeners(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.with_table(|table| table.snapshot_tcp_listeners(guard))
+    }
+
+    pub fn snapshot_tcp_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.with_table(|table| table.snapshot_tcp_bound(guard))
+    }
+
+    pub fn snapshot_tcp_connections(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.with_table(|table| table.snapshot_tcp_connections(guard))
+    }
+
+    pub fn snapshot_udp_connections(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.with_table(|table| table.snapshot_udp_connections(guard))
+    }
+
+    pub fn lookup_udp_bound(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.with_table(|table| table.lookup_udp_bound(endpoint, guard))
+    }
+
+    pub fn lookup_udp_bound_exact(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.with_table(|table| table.lookup_udp_bound_exact(endpoint, guard))
+    }
+
+    pub fn lookup_udp_bound_wildcard(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.with_table(|table| table.lookup_udp_bound_wildcard(endpoint, guard))
+    }
+
+    pub fn snapshot_udp_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.with_table(|table| table.snapshot_udp_bound(guard))
+    }
+
+    pub fn snapshot_raw_icmp(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.with_table(|table| table.snapshot_raw_icmp(guard))
+    }
+}
+
+pub static SOCKET_TABLE: InitialSocketTableProxy = InitialSocketTableProxy;

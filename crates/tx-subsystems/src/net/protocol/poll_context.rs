@@ -10,7 +10,7 @@ use crate::net::protocol::{
     parse_icmpv4_loopback_packet, Icmpv4Event, LoopbackIface, UdpRxDatagram,
 };
 use crate::net::structure::registry;
-use crate::net::structure::table::SOCKET_TABLE;
+use crate::net::structure::table::{SocketTable, SOCKET_TABLE};
 use crate::net::structure::{
     ConnectionKey, IpEndpoint, Ipv4Address, RawIcmpState, RecvWireSet, SocketIdentity, SocketKind,
     SocketProtocol, TcpBacklogEntry, TcpState, UdpInner, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
@@ -20,6 +20,7 @@ use super::SmoltcpTcpSegment;
 
 pub struct PollContext {
     timestamp: Instant,
+    socket_table: &'static SocketTable,
     packets_seen: usize,
     tx_packets: usize,
     sockets_touched: usize,
@@ -36,8 +37,13 @@ pub struct PollContextOutcome {
 
 impl PollContext {
     pub const fn new(timestamp: Instant) -> Self {
+        Self::new_with_table(timestamp, SOCKET_TABLE.as_table())
+    }
+
+    pub const fn new_with_table(timestamp: Instant, socket_table: &'static SocketTable) -> Self {
         Self {
             timestamp,
+            socket_table,
             packets_seen: 0,
             tx_packets: 0,
             sockets_touched: 0,
@@ -148,7 +154,7 @@ impl PollContext {
                 continue;
             };
             let key = ConnectionKey::new(dst, src);
-            if let Some(target) = SOCKET_TABLE.lookup_tcp_connection(key, guard) {
+            if let Some(target) = self.socket_table.lookup_tcp_connection(key, guard) {
                 let Some(target_payload) = target.acquire_operational() else {
                     continue;
                 };
@@ -239,7 +245,9 @@ impl PollContext {
                 continue;
             };
             let payload_len = datagram.payload.len();
-            let Some(target) = SOCKET_TABLE.lookup_udp_ingress(datagram.src, datagram.dst, guard)
+            let Some(target) =
+                self.socket_table
+                    .lookup_udp_ingress(datagram.src, datagram.dst, guard)
             else {
                 continue;
             };
@@ -293,7 +301,7 @@ impl PollContext {
                 }
                 Icmpv4Event::EchoReply(reply) => {
                     let moved = icmpv4_echo_message_len(&reply);
-                    for target in SOCKET_TABLE.snapshot_raw_icmp(guard) {
+                    for target in self.socket_table.snapshot_raw_icmp(guard) {
                         let Some(target_payload) = target.acquire_operational() else {
                             continue;
                         };
@@ -337,14 +345,21 @@ impl PollContext {
 
         let src = segment.src_endpoint()?;
         let dst = segment.dst_endpoint()?;
-        let listener = SOCKET_TABLE.lookup_tcp_listener_addr(dst.addr, dst.port, guard)?;
+        let listener = self
+            .socket_table
+            .lookup_tcp_listener_addr(dst.addr, dst.port, guard)?;
         let listener_payload = listener.acquire_operational()?;
         if !listener_matches_incoming(&listener_payload.protocol_snapshot(), dst) {
             return None;
         }
 
         let options = listener_payload.with_options(Clone::clone);
-        let child = registry::create_socket_for_test_or_bootstrap(SocketKind::Tcp, options).ok()?;
+        let child = registry::create_socket_in_namespace(
+            SocketKind::Tcp,
+            options,
+            listener_payload.net_namespace(),
+        )
+        .ok()?;
         let child_payload = child.acquire_operational()?;
         child_payload.with_protocol_mut(|protocol| {
             *protocol = SocketProtocol::Tcp(TcpState::Connecting {
@@ -378,7 +393,9 @@ impl PollContext {
     ) -> Option<SegmentProcessTarget> {
         let src = segment.src_endpoint()?;
         let dst = segment.dst_endpoint()?;
-        let listener = SOCKET_TABLE.lookup_tcp_listener_addr(dst.addr, dst.port, guard)?;
+        let listener = self
+            .socket_table
+            .lookup_tcp_listener_addr(dst.addr, dst.port, guard)?;
         let listener_payload = listener.acquire_operational()?;
         if !listener_matches_incoming(&listener_payload.protocol_snapshot(), dst) {
             return None;
@@ -404,9 +421,12 @@ impl PollContext {
 
         let mut publishes = Vec::new();
         if protocol_publish.connected {
-            if let Some(accept_publish) =
-                promote_connected_stream_and_publish_accept(target, target_payload, guard)
-            {
+            if let Some(accept_publish) = promote_connected_stream_and_publish_accept(
+                self.socket_table,
+                target,
+                target_payload,
+                guard,
+            ) {
                 publishes.push(accept_publish);
             }
         }
@@ -489,6 +509,7 @@ fn raw_icmp_accepts_reply(protocol: &SocketProtocol, dst: Ipv4Address) -> bool {
 }
 
 fn promote_connected_stream_and_publish_accept(
+    table: &SocketTable,
     socket: &Cap<SocketIdentity>,
     payload: &crate::net::structure::SocketOperationalEvidence,
     guard: &Guard<'_>,
@@ -507,12 +528,12 @@ fn promote_connected_stream_and_publish_accept(
     });
     let (local, remote) = connected?;
 
-    let listener = SOCKET_TABLE.lookup_tcp_listener_addr(local.addr, local.port, guard)?;
+    let listener = table.lookup_tcp_listener_addr(local.addr, local.port, guard)?;
     let listener_payload = listener.acquire_operational()?;
     if !listener_matches_incoming(&listener_payload.protocol_snapshot(), local) {
         return None;
     }
-    SOCKET_TABLE
+    table
         .insert_tcp_connection(ConnectionKey::new(local, remote), socket.clone())
         .ok()?;
     let became_ready = listener_payload.promote_connecting_to_accept(local, remote)?;

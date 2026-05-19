@@ -1,6 +1,6 @@
 use super::structure::{
-    registry, AcceptWireSet, ConnectionKey, IpEndpoint, Ipv4Address, KernelSockAddr, PollMask,
-    ProtocolNumber, RawIcmpState, RecvWireSet, SendRecvFlags, SendWireSet, SockAddrIn,
+    registry, AcceptWireSet, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, KernelSockAddr,
+    PollMask, ProtocolNumber, RawIcmpState, RecvWireSet, SendRecvFlags, SendWireSet, SockAddrIn,
     SockShutdownCmd, SocketIdentity, SocketKind, SocketOptionSet, SocketProtocol, SocketType,
     TcpState, UdpInner, ValidSocketType,
 };
@@ -17,21 +17,24 @@ use crate::net::delegate::{
     NetDelegateTaskConfig,
 };
 use crate::net::device::{
-    EthernetAddress, NetDeviceOps, NetDeviceRegistration, VirtioNetConfig, VirtioNetDevice,
-    VirtioNetFeatureSet, VirtioNetIrqEvent, VirtioNetQueueConfig, VIRTIO_NET_DEFAULT_MTU,
-    VIRTIO_NET_STAGING_MAJOR,
+    create_bridge_for_test_or_bootstrap, create_veth_pair_for_test_or_bootstrap, BridgeConfig,
+    BridgeInstance, EthernetAddress, NetDeviceKind, NetDeviceOps, NetDeviceRegistration,
+    VethEndpointConfig, VethPair, VethPairConfig, VirtioNetConfig, VirtioNetDevice,
+    VirtioNetFeatureSet, VirtioNetIrqEvent, VirtioNetQueueConfig, VETH_DEFAULT_MTU,
+    VIRTIO_NET_DEFAULT_MTU, VIRTIO_NET_STAGING_MAJOR,
 };
 use crate::net::execution::{
     socket_accept_wait_token, socket_recv_wait_token, socket_send_wait_token,
     socket_urgent_wait_token, step_accept, step_bind, step_connect, step_listen, step_poll_ready,
-    step_process_loopback_pending, step_process_loopback_tcp, step_process_loopback_udp_on_iface,
-    step_process_network_events, step_process_network_events_at, step_process_network_tick,
-    step_process_network_tick_loopback, step_recv, step_recv_kernel_bytes, step_send,
-    step_send_kernel_bytes, step_send_to_kernel_bytes, step_shutdown, step_socket_create,
-    step_tcp_backlog_cleanup, step_tcp_close_staging, step_tcp_connection_cleanup,
-    step_tcp_loopback_handshake, step_tcp_loopback_handshake_on_iface, step_tcp_loopback_transfer,
-    DeviceTxBudget, LoopbackPollBudget, NET_EVENT_BUDGET, TCP_BACKLOG_RETRANSMIT_BACKOFF_MILLIS,
-    TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
+    step_process_device_tx_pending_in_namespace_at, step_process_loopback_pending,
+    step_process_loopback_tcp, step_process_loopback_udp_on_iface, step_process_network_events,
+    step_process_network_events_at, step_process_network_events_in_namespace_at,
+    step_process_network_tick, step_process_network_tick_loopback, step_recv,
+    step_recv_kernel_bytes, step_send, step_send_kernel_bytes, step_send_to_kernel_bytes,
+    step_shutdown, step_socket_create, step_tcp_backlog_cleanup, step_tcp_close_staging,
+    step_tcp_connection_cleanup, step_tcp_loopback_handshake, step_tcp_loopback_handshake_on_iface,
+    step_tcp_loopback_transfer, DeviceTxBudget, LoopbackPollBudget, NET_EVENT_BUDGET,
+    TCP_BACKLOG_RETRANSMIT_BACKOFF_MILLIS, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
 };
 use crate::net::facade::{
     drive_socket_nonblocking, socket_create_facade, socket_listen_facade, socket_poll_ready_facade,
@@ -49,6 +52,10 @@ use crate::net::protocol::{
     UdpTxDatagram, ARP_REQUEST_RETRY_LIMIT,
 };
 use crate::net::structure::table::SOCKET_TABLE;
+use crate::net::{
+    netfilter_stats_snapshot, require_net_admin, reset_netfilter_for_test, NetAdminAuthority,
+    NetNamespaceLinkInfo,
+};
 use crate::{device::DevT, execution::Guard};
 use core::future::Future;
 use core::pin::Pin;
@@ -57,6 +64,7 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use tx_reactor::{wait::WaitOutcome, Reactor};
 use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
 
+mod bridge_tests;
 mod byte_io_tests;
 mod delegate_loopback_tests;
 mod delegate_supervisor_tests;
@@ -66,9 +74,11 @@ mod loopback_pending_tests;
 mod loopback_tests;
 mod netdevice_staging_tests;
 mod projection_tests;
+mod rtnetlink_tests;
 mod smoltcp_fork_tests;
 mod table_snapshot_tests;
 mod tcp_graceful_shutdown_tests;
+mod veth_tests;
 mod virtio_net_device_tests;
 
 struct ScriptedPacketSource {
@@ -107,7 +117,7 @@ fn noop_waker() -> Waker {
 
 fn init_zones() {
     tx_substrate::testing::init_host_for_test_once();
-    registry::register_zones().expect("net zones");
+    let _ = crate::zones::register_all();
 }
 
 fn inet(port: u16) -> KernelSockAddr {
@@ -221,6 +231,101 @@ fn ipv4_address_preserves_octets() {
 }
 
 #[test]
+fn initial_net_namespace_payload_owns_socket_table_state() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let socket = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("socket");
+    let local = endpoint(41_901);
+
+    SOCKET_TABLE
+        .bind_tcp(local, socket.clone())
+        .expect("bind in initial net namespace");
+
+    let initial_payload = crate::net::initial_net_namespace_payload();
+    let found = initial_payload
+        .socket_table()
+        .lookup_tcp_bound(local, &guard)
+        .expect("socket table lookup");
+
+    assert_eq!(found.raw(), socket.raw());
+    assert_eq!(
+        initial_payload.loopback_iface().local_ipv4(),
+        Ipv4Address::LOOPBACK
+    );
+}
+
+#[test]
+fn isolated_net_namespaces_allow_same_tcp_endpoint_bind() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let ns_a = crate::net::create_isolated_net_namespace_for_test("n71-a")
+        .expect("net namespace a")
+        .payload_cap()
+        .expect("net namespace a payload");
+    let ns_b = crate::net::create_isolated_net_namespace_for_test("n71-b")
+        .expect("net namespace b")
+        .payload_cap()
+        .expect("net namespace b payload");
+    let sock_a = registry::create_socket_in_namespace(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+        ns_a.clone(),
+    )
+    .expect("socket a");
+    let sock_b = registry::create_socket_in_namespace(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+        ns_b.clone(),
+    )
+    .expect("socket b");
+    let local = endpoint(41_902);
+
+    assert_eq!(
+        step_bind(&sock_a, inet(local.port), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_bind(&sock_b, inet(local.port), &guard),
+        StepOutcome::Done(())
+    );
+
+    let found_a = ns_a
+        .socket_table()
+        .lookup_tcp_bound(local, &guard)
+        .expect("socket a lookup");
+    let found_b = ns_b
+        .socket_table()
+        .lookup_tcp_bound(local, &guard)
+        .expect("socket b lookup");
+    assert_eq!(found_a.raw(), sock_a.raw());
+    assert_eq!(found_b.raw(), sock_b.raw());
+    assert_ne!(found_a.raw(), found_b.raw());
+}
+
+#[test]
+fn net_namespace_link_snapshot_reports_loopback_first() {
+    init_zones();
+    let payload = crate::net::initial_net_namespace_payload();
+    let links = payload.link_snapshot();
+
+    assert!(!links.is_empty());
+    assert_eq!(links[0].ifindex, 1);
+    assert_eq!(links[0].name, "lo");
+    assert!(links[0].is_loopback);
+    assert_eq!(links[0].ipv4_addr, Some(Ipv4Address::LOOPBACK));
+}
+
+#[test]
 fn endpoint_orders_by_addr_and_port() {
     let first = IpEndpoint::new(Ipv4Address::new([10, 0, 0, 1]), 80);
     let second = IpEndpoint::new(Ipv4Address::new([10, 0, 0, 1]), 443);
@@ -232,12 +337,18 @@ fn endpoint_orders_by_addr_and_port() {
 
 #[test]
 fn socket_type_validation_maps_to_kind() {
+    let unix_dgram = ValidSocketType::validate(1, 2, 0).expect("unix dgram socket");
     let stream = ValidSocketType::validate(2, 1, 6).expect("tcp socket");
     let dgram = ValidSocketType::validate(2, 2, 17).expect("udp socket");
     let dgram_icmp = ValidSocketType::validate(2, 2, 1).expect("ping socket");
     let raw_icmp = ValidSocketType::validate(2, 3, 1).expect("raw icmp socket");
     let default_stream = ValidSocketType::validate(2, 1, 0).expect("default tcp socket");
 
+    assert_eq!(unix_dgram.domain, AddressFamily::Unix);
+    assert_eq!(
+        SocketKind::from_valid_socket_type(unix_dgram),
+        Ok(SocketKind::UnixDatagram)
+    );
     assert_eq!(stream.sock_type, SocketType::Stream);
     assert_eq!(
         SocketKind::from_valid_socket_type(stream),
@@ -406,15 +517,17 @@ fn socket_payload_initial_protocol_matches_kind() {
 
     match tcp_payload.protocol_snapshot() {
         SocketProtocol::Tcp(state) => assert_eq!(state, TcpState::Init),
-        SocketProtocol::Udp(_) | SocketProtocol::RawIcmp(_) => {
-            panic!("tcp socket has wrong protocol")
-        }
+        SocketProtocol::UnixDatagram
+        | SocketProtocol::Udp(_)
+        | SocketProtocol::RawIcmp(_)
+        | SocketProtocol::NetlinkRoute(_) => panic!("tcp socket has wrong protocol"),
     }
     match udp_payload.protocol_snapshot() {
         SocketProtocol::Udp(inner) => assert_eq!(inner, UdpInner::Unbound),
-        SocketProtocol::Tcp(_) | SocketProtocol::RawIcmp(_) => {
-            panic!("udp socket has wrong protocol")
-        }
+        SocketProtocol::UnixDatagram
+        | SocketProtocol::Tcp(_)
+        | SocketProtocol::RawIcmp(_)
+        | SocketProtocol::NetlinkRoute(_) => panic!("udp socket has wrong protocol"),
     }
 }
 
