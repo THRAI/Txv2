@@ -4,8 +4,8 @@ use alloc::vec::Vec;
 
 use crate::net::rtnetlink::{
     rtnetlink_handle_request, rtnetlink_handle_request_with_netns_resolver, NLMSG_DONE,
-    NLMSG_ERROR, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST, RTM_GETADDR, RTM_GETLINK, RTM_GETNEIGH,
-    RTM_GETROUTE, RTM_NEWADDR, RTM_NEWLINK, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK,
+    NLMSG_ERROR, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST, RTM_DELROUTE, RTM_GETADDR, RTM_GETLINK,
+    RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWLINK, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK,
 };
 
 const NLM_F_CREATE: u16 = 0x0400;
@@ -21,6 +21,9 @@ const IFLA_INFO_DATA: u16 = 2;
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 const IFA_LABEL: u16 = 3;
+const RTA_DST: u16 = 1;
+const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
 const VETH_INFO_PEER: u16 = 1;
 const NLA_F_NESTED: u16 = 0x8000;
 
@@ -208,6 +211,74 @@ fn rtnetlink_getroute_and_getneigh_dump_configured_namespace_iface() {
             && contains_bytes(msg, &peer_mac.octets())
     }));
     assert!(neigh.iter().any(|msg| nlmsg_type(msg) == NLMSG_DONE));
+}
+
+#[test]
+fn rtnetlink_newroute_delroute_default_gateway_updates_namespace_routes() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-default-route")
+        .expect("namespace")
+        .payload_cap()
+        .expect("namespace payload");
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+        left: VethEndpointConfig {
+            name: "eth-default0",
+            devt: DevT::new(95, 11),
+            mac: EthernetAddress::new([0x02, 0, 0, 0x72, 0, 11]),
+        },
+        right: VethEndpointConfig {
+            name: "veth-default0",
+            devt: DevT::new(95, 12),
+            mac: EthernetAddress::new([0x02, 0, 0, 0x72, 0, 12]),
+        },
+        mtu: VETH_DEFAULT_MTU,
+    });
+    ns.attach_device_for_test_or_bootstrap(pair.left, None)
+        .expect("attach eth-default0");
+    let ifindex = ifindex_for(&ns.link_snapshot(), "eth-default0");
+    ns.set_device_ipv4_addr_by_ifindex(
+        auth,
+        ifindex,
+        Some(Ipv4Address::new([172, 17, 0, 2])),
+        Some(16),
+    )
+    .expect("set iface addr");
+
+    let route_req = nlmsg(
+        RTM_NEWROUTE,
+        NLM_F_REQUEST | NLM_F_ACK,
+        60,
+        &newroute_payload(0, None, Some([172, 17, 0, 1]), ifindex),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, crate::cred::Cred::root(), &route_req)[0]);
+
+    let iface = ns.ether_ifaces_snapshot()[0];
+    assert_eq!(
+        iface.common.gateway(),
+        Some(Ipv4Address::new([172, 17, 0, 1]))
+    );
+
+    let dump_req = nlmsg(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 61, &rtmsg());
+    let routes = rtnetlink_handle_request(&ns, crate::cred::Cred::root(), &dump_req);
+    assert!(routes.iter().any(|msg| {
+        nlmsg_type(msg) == RTM_NEWROUTE
+            && contains_bytes(msg, &[172, 17, 0, 1])
+            && contains_bytes(msg, &ifindex.to_le_bytes())
+    }));
+
+    let del_req = nlmsg(
+        RTM_DELROUTE,
+        NLM_F_REQUEST | NLM_F_ACK,
+        62,
+        &newroute_payload(0, None, Some([172, 17, 0, 1]), ifindex),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, crate::cred::Cred::root(), &del_req)[0]);
+    assert_eq!(ns.ether_ifaces_snapshot()[0].common.gateway(), None);
 }
 
 #[test]
@@ -526,6 +597,34 @@ fn rtmsg() -> Vec<u8> {
     payload.push(0);
     payload.push(0);
     payload.extend_from_slice(&0u32.to_le_bytes());
+    payload
+}
+
+fn newroute_payload(
+    prefix_len: u8,
+    dst: Option<[u8; 4]>,
+    gateway: Option<[u8; 4]>,
+    ifindex: u32,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(2);
+    payload.push(prefix_len);
+    payload.push(0);
+    payload.push(0);
+    payload.push(254);
+    payload.push(4);
+    payload.push(if gateway.is_some() { 0 } else { 253 });
+    payload.push(1);
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    if let Some(dst) = dst {
+        push_attr(&mut payload, RTA_DST, &dst);
+    }
+    if let Some(gateway) = gateway {
+        push_attr(&mut payload, RTA_GATEWAY, &gateway);
+    }
+    if ifindex != 0 {
+        push_attr_u32(&mut payload, RTA_OIF, ifindex);
+    }
     payload
 }
 
