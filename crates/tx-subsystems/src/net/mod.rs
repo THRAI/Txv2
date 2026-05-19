@@ -104,7 +104,9 @@ pub use packet::{
 };
 pub use project::{
     proc_net_arp_snapshot_text, proc_net_arp_snapshot_zero_text, proc_net_dev_snapshot_text,
-    proc_net_netfilter_rules_text, proc_net_nf_conntrack_text, proc_net_route_snapshot_text,
+    proc_net_netfilter_rules_text, proc_net_netfilter_rules_text_for_namespace,
+    proc_net_nf_conntrack_text, proc_net_nf_conntrack_text_for_namespace,
+    proc_net_route_snapshot_text,
 };
 pub use protocol::{
     ArpEntry, EtherIface, EtherPacketSource, EtherPacketTxSink, Icmpv4EchoPacket, Icmpv4Event,

@@ -11,11 +11,15 @@ use crate::procfs::{
 };
 use alloc::format;
 use alloc::string::String;
+use tx_subsystems::net::NetNamespacePayload;
 use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use tx_subsystems::process::{self, Pid};
 use tx_subsystems::vfs::FsObjectId;
 
-pub fn render(fs_object_id: FsObjectId) -> String {
+pub fn render_with_netns(
+    fs_object_id: FsObjectId,
+    caller_netns: Option<&NetNamespacePayload>,
+) -> String {
     if let Some(pid) = pid_from_stat_id(fs_object_id) {
         return render_stat(pid);
     }
@@ -46,14 +50,18 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_SYSVIPC_MSG_ID => render_sysvipc_msg(),
         PROCFS_SYSVIPC_SEM_ID => render_sysvipc_sem(),
         PROCFS_SYSVIPC_SHM_ID => render_sysvipc_shm(),
-        PROCFS_NET_ROUTE_ID => render_net_route(),
-        PROCFS_NET_ARP_ID => render_net_arp(),
-        PROCFS_NET_DEV_ID => render_net_dev(),
-        PROCFS_NET_TX_NF_RULES_ID => render_netfilter_rules(),
-        PROCFS_NET_NF_CONNTRACK_ID => render_nf_conntrack(),
-        PROCFS_SYS_NET_IPV4_IP_FORWARD_ID => render_ip_forward(),
+        PROCFS_NET_ROUTE_ID => render_net_route(caller_netns),
+        PROCFS_NET_ARP_ID => render_net_arp(caller_netns),
+        PROCFS_NET_DEV_ID => render_net_dev(caller_netns),
+        PROCFS_NET_TX_NF_RULES_ID => render_netfilter_rules(caller_netns),
+        PROCFS_NET_NF_CONNTRACK_ID => render_nf_conntrack(caller_netns),
+        PROCFS_SYS_NET_IPV4_IP_FORWARD_ID => render_ip_forward(caller_netns),
         _ => String::new(),
     }
+}
+
+pub fn render(fs_object_id: FsObjectId) -> String {
+    render_with_netns(fs_object_id, None)
 }
 
 fn render_stat(pid: Pid) -> String {
@@ -313,37 +321,57 @@ fn render_sysvipc_shm() -> String {
     out
 }
 
-fn render_net_route() -> String {
-    tx_subsystems::net::proc_net_route_snapshot_text(
-        &tx_subsystems::net::initial_net_namespace_payload(),
+fn render_net_route(caller_netns: Option<&NetNamespacePayload>) -> String {
+    with_proc_netns(
+        caller_netns,
+        tx_subsystems::net::proc_net_route_snapshot_text,
     )
 }
 
-fn render_net_arp() -> String {
-    tx_subsystems::net::proc_net_arp_snapshot_zero_text(
-        &tx_subsystems::net::initial_net_namespace_payload().ether_ifaces_snapshot(),
+fn render_net_arp(caller_netns: Option<&NetNamespacePayload>) -> String {
+    with_proc_netns(caller_netns, |netns| {
+        tx_subsystems::net::proc_net_arp_snapshot_zero_text(&netns.ether_ifaces_snapshot())
+    })
+}
+
+fn render_net_dev(caller_netns: Option<&NetNamespacePayload>) -> String {
+    with_proc_netns(caller_netns, |netns| {
+        tx_subsystems::net::proc_net_dev_snapshot_text(&netns.ether_ifaces_snapshot())
+    })
+}
+
+fn render_netfilter_rules(caller_netns: Option<&NetNamespacePayload>) -> String {
+    with_proc_netns(
+        caller_netns,
+        tx_subsystems::net::proc_net_netfilter_rules_text_for_namespace,
     )
 }
 
-fn render_net_dev() -> String {
-    tx_subsystems::net::proc_net_dev_snapshot_text(
-        &tx_subsystems::net::initial_net_namespace_payload().ether_ifaces_snapshot(),
+fn render_nf_conntrack(caller_netns: Option<&NetNamespacePayload>) -> String {
+    with_proc_netns(
+        caller_netns,
+        tx_subsystems::net::proc_net_nf_conntrack_text_for_namespace,
     )
 }
 
-fn render_netfilter_rules() -> String {
-    tx_subsystems::net::proc_net_netfilter_rules_text()
-}
-
-fn render_nf_conntrack() -> String {
-    tx_subsystems::net::proc_net_nf_conntrack_text()
-}
-
-fn render_ip_forward() -> String {
-    let enabled = tx_subsystems::net::initial_net_namespace_payload().ipv4_forwarding_enabled();
+fn render_ip_forward(caller_netns: Option<&NetNamespacePayload>) -> String {
+    let enabled = with_proc_netns(caller_netns, |netns| netns.ipv4_forwarding_enabled());
     if enabled {
         String::from("1\n")
     } else {
         String::from("0\n")
+    }
+}
+
+fn with_proc_netns<T>(
+    caller_netns: Option<&NetNamespacePayload>,
+    render: impl FnOnce(&NetNamespacePayload) -> T,
+) -> T {
+    match caller_netns {
+        Some(netns) => render(netns),
+        None => {
+            let netns = tx_subsystems::net::initial_net_namespace_payload();
+            render(&netns)
+        }
     }
 }
