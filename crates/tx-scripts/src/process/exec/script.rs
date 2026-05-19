@@ -581,8 +581,8 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             use StepOutcome as V3;
             let guard = step_engine::guard();
             let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
-            let outcome = step_open(
-                rooted_at,
+            let mut outcome = step_open(
+                rooted_at.clone(),
                 interp_path,
                 OpenFileFlags {
                     read: true,
@@ -595,6 +595,19 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 cred,
                 &guard,
             );
+            // When the sdcard is mounted at /musl (OSComp layout),
+            // PT_INTERP paths like /lib/ld-musl-riscv64.so.1 don't
+            // resolve at the tmpfs root.  Retry with a /musl prefix
+            // so the walker crosses from tmpfs into ext4.
+            if matches!(outcome, V3::Err(_)) && interp_path.starts_with(b"/") {
+                let mut musl_path = alloc::vec::Vec::with_capacity(5 + interp_path.len());
+                musl_path.extend_from_slice(b"/musl");
+                musl_path.extend_from_slice(interp_path);
+                outcome = step_open(rooted_at, &musl_path, OpenFileFlags {
+                    read: true, write: false, append: false,
+                    cloexec: false, nonblocking: false,
+                }, 0, cred, &guard);
+            }
             match outcome {
                 V3::Done(file) => file,
                 V3::Err(_) => return Err(ExecError::IoError),
