@@ -34,6 +34,7 @@ skills:
       - docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md
       - docs/ebr-zone/02_EBR_design.en-US.md
       - docs/ebr-zone/03_Zone_Cap_object_storage_design.en-US.md
+      - docs/Txv3/08_SYSV_IPC_v1.md
     purpose: Gather the relevant active design docs for an implementation, audit, or planning task.
 
   tx-code-reorganization:

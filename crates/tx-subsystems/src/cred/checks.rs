@@ -452,10 +452,7 @@ pub fn require_chown<'g>(
 /// Authorise a path-traversal step against the directory described
 /// by `meta`. Convenience wrapper over [`require_path_search`] —
 /// takes + drops its own guard, discards the witness.
-pub fn authorize_path_search(
-    source: &CredSnapshot,
-    meta: &InodeMeta,
-) -> Result<(), Errno> {
+pub fn authorize_path_search(source: &CredSnapshot, meta: &InodeMeta) -> Result<(), Errno> {
     let guard = fresh_guard();
     require_path_search(source, meta, &guard).map(drop)
 }
@@ -485,10 +482,7 @@ pub fn authorize_unlink(
 /// Authorise creation of a new name in `new_parent_meta`. Convenience
 /// wrapper over [`require_link`]. Use for `link(2)`, `mkdir(2)`,
 /// `symlink(2)` — all share the W+X-on-new-parent rule.
-pub fn authorize_link(
-    source: &CredSnapshot,
-    new_parent_meta: &InodeMeta,
-) -> Result<(), Errno> {
+pub fn authorize_link(source: &CredSnapshot, new_parent_meta: &InodeMeta) -> Result<(), Errno> {
     let guard = fresh_guard();
     require_link(source, new_parent_meta, &guard).map(drop)
 }

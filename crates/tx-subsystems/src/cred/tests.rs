@@ -653,8 +653,8 @@ fn cred_snapshot_returns_none_for_zombie() {
 
 #[test]
 fn require_path_search_passes_for_dac_override() {
-    use crate::cred::checks::require_path_search;
     use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_path_search;
     use crate::vfs::structure::InodeMeta;
 
     let _g = setup();
@@ -685,8 +685,8 @@ fn require_path_search_passes_for_dac_override() {
 
 #[test]
 fn require_path_search_denies_without_x_bit() {
-    use crate::cred::checks::require_path_search;
     use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_path_search;
     use crate::execution::Errno;
     use crate::vfs::structure::InodeMeta;
 
@@ -714,8 +714,8 @@ fn require_path_search_denies_without_x_bit() {
 
 #[test]
 fn require_open_honors_read_and_write_bits() {
-    use crate::cred::checks::require_open;
     use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::require_open;
     use crate::execution::Errno;
     use crate::vfs::structure::{InodeMeta, OpenFileFlags};
 
@@ -758,10 +758,8 @@ fn require_open_honors_read_and_write_bits() {
 // ---------- require_unlink ----------
 
 fn fresh_dir_meta(mode: u16, uid: u32, gid: u32) -> crate::vfs::structure::InodeMeta {
-    let mut m = crate::vfs::structure::InodeMeta::new(
-        crate::vfs::structure::InodeKind::Directory,
-        mode,
-    );
+    let mut m =
+        crate::vfs::structure::InodeMeta::new(crate::vfs::structure::InodeKind::Directory, mode);
     m.uid = uid;
     m.gid = gid;
     m
@@ -967,9 +965,7 @@ fn require_link_denies_eacces_when_parent_lacks_write_bit() {
     let parent = fresh_dir_meta(0o555, 1000, 1000);
     let snap = unprivileged_snap(1000, 1000);
     let g = guard();
-    let err = require_link(&snap, &parent, &g)
-        .err()
-        .expect("denied");
+    let err = require_link(&snap, &parent, &g).err().expect("denied");
     assert_eq!(err, Errno::EACCES);
 }
 
@@ -1169,7 +1165,9 @@ fn require_chmod_denies_non_owner_without_cap_fowner() {
     let target = fresh_file_meta(0o644, 2000, 2000);
     let snap = unprivileged_snap(1000, 1000);
     let g = guard();
-    let err = require_chmod(&snap, &target, 0o755, &g).err().expect("denied");
+    let err = require_chmod(&snap, &target, 0o755, &g)
+        .err()
+        .expect("denied");
     assert_eq!(err, Errno::EPERM);
 }
 
@@ -1205,8 +1203,8 @@ fn require_chown_passes_for_self_uid_and_gid() {
     let target = fresh_file_meta(0o644, 1000, 1000);
     let snap = unprivileged_snap(1000, 1000);
     let g = guard();
-    let _w = require_chown(&snap, &target, Some(1000), Some(1000), &g)
-        .expect("self uid/gid permitted");
+    let _w =
+        require_chown(&snap, &target, Some(1000), Some(1000), &g).expect("self uid/gid permitted");
 }
 
 #[test]
@@ -1261,8 +1259,7 @@ fn require_chown_cap_fowner_permits_arbitrary_uid_gid() {
         permitted_caps: CapabilitySet::EMPTY,
     });
     let g = guard();
-    let _w = require_chown(&snap, &target, Some(3000), Some(3000), &g)
-        .expect("CAP_FOWNER bypass");
+    let _w = require_chown(&snap, &target, Some(3000), Some(3000), &g).expect("CAP_FOWNER bypass");
 }
 
 // ---------- authorize_* combinators ----------
@@ -1276,8 +1273,8 @@ fn require_chown_cap_fowner_permits_arbitrary_uid_gid() {
 
 #[test]
 fn authorize_unlink_agrees_with_require_unlink() {
-    use crate::cred::checks::{authorize_unlink, require_unlink};
     use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::{authorize_unlink, require_unlink};
     use crate::execution::Errno;
     use crate::vfs::structure::S_ISVTX;
 
@@ -1302,8 +1299,8 @@ fn authorize_unlink_agrees_with_require_unlink() {
 
 #[test]
 fn authorize_link_agrees_with_require_link() {
-    use crate::cred::checks::{authorize_link, require_link};
     use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::{authorize_link, require_link};
     use crate::execution::Errno;
 
     let _g = setup();
@@ -1320,8 +1317,8 @@ fn authorize_link_agrees_with_require_link() {
 
 #[test]
 fn authorize_rename_agrees_with_require_rename() {
-    use crate::cred::checks::{authorize_rename, require_rename};
     use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::{authorize_rename, require_rename};
     use crate::execution::Errno;
     use crate::vfs::structure::S_ISVTX;
 
@@ -1349,8 +1346,8 @@ fn authorize_rename_agrees_with_require_rename() {
 
 #[test]
 fn authorize_chmod_agrees_with_require_chmod() {
-    use crate::cred::checks::{authorize_chmod, require_chmod};
     use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::{authorize_chmod, require_chmod};
     use crate::execution::Errno;
 
     let _g = setup();
@@ -1370,8 +1367,8 @@ fn authorize_chmod_agrees_with_require_chmod() {
 
 #[test]
 fn authorize_chown_agrees_with_require_chown() {
-    use crate::cred::checks::{authorize_chown, require_chown};
     use crate::cred::adapter::step_engine::guard;
+    use crate::cred::checks::{authorize_chown, require_chown};
     use crate::execution::Errno;
 
     let _g = setup();
@@ -1392,10 +1389,10 @@ fn authorize_chown_agrees_with_require_chown() {
 
 #[test]
 fn authorize_path_search_and_open_agree_with_require() {
+    use crate::cred::adapter::step_engine::guard;
     use crate::cred::checks::{
         authorize_open, authorize_path_search, require_open, require_path_search,
     };
-    use crate::cred::adapter::step_engine::guard;
     use crate::execution::Errno;
     use crate::vfs::structure::{InodeMeta, OpenFileFlags};
 
@@ -1418,10 +1415,7 @@ fn authorize_path_search_and_open_agree_with_require() {
         read: true,
         ..Default::default()
     };
-    assert_eq!(
-        authorize_open(&snap, &file, flags_r),
-        Err(Errno::EACCES)
-    );
+    assert_eq!(authorize_open(&snap, &file, flags_r), Err(Errno::EACCES));
     {
         let g = guard();
         assert!(matches!(

@@ -229,11 +229,7 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let target_meta = target_dentry.rnode().meta();
-    if let Err(e) = cred_checks::authorize_chmod(
-        ctx.cred_snapshot(),
-        &target_meta,
-        new_mode,
-    ) {
+    if let Err(e) = cred_checks::authorize_chmod(ctx.cred_snapshot(), &target_meta, new_mode) {
         return SyscallResult::error_from(e);
     }
 
@@ -290,12 +286,7 @@ pub(super) fn sys_fchownat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let target_meta = target_dentry.rnode().meta();
-    if let Err(e) = cred_checks::authorize_chown(
-        ctx.cred_snapshot(),
-        &target_meta,
-        uid,
-        gid,
-    ) {
+    if let Err(e) = cred_checks::authorize_chown(ctx.cred_snapshot(), &target_meta, uid, gid) {
         return SyscallResult::error_from(e);
     }
 

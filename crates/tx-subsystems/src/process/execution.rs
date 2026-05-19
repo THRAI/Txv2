@@ -314,41 +314,6 @@ pub fn bootstrap_init_process(
 }
 
 /// Clone a new thread into an existing process (CLONE_THREAD).
-///
-/// Five-phase protocol — PROCESS_v1 §7.1.3.
-pub fn step_clone_thread(
-    process: &Cap<ProcessIdentity>,
-    parent_ctx: &UserTrapContext,
-) -> Result<Cap<ThreadIdentity>, ForkError> {
-    use crate::process::numbers::register_tid;
-    use crate::thread_runtime::structure::allocate_tid;
-
-    // 1. Observe — check GroupExit not in progress
-    if let Some(payload) = process.payload.lock().as_ref() {
-        if payload.group_exit.lock().is_some() {
-            return Err(ForkError::ParentZombie);
-        }
-    }
-
-    // 3. Reserve — allocate new ThreadIdentity
-    let tid = allocate_tid();
-    let thread = sign_thread(process.downgrade()).map_err(|_| ForkError::PidNamespace)?;
-
-    // 4. Commit (infallible)
-    let payload_guard = process.payload.lock();
-    let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
-    payload.threads.attach(thread.clone());
-    payload.thread_count.fetch_add(1, Ordering::Relaxed);
-    register_tid(tid, thread.clone());
-
-    // Seed child's user context from parent
-    if let Some(payload_cap) = thread.payload_cap() {
-        payload_cap.store_saved_user_context(Some(*parent_ctx));
-    }
-
-    Ok(thread)
-}
-
 /// Fork a process: clones the parent's address space, allocates a new
 /// pid + leader tid, inherits the parent's pgrp/session, returns the
 /// child identity.
@@ -567,6 +532,29 @@ pub fn seed_child_leader_context(
         .payload_cap()
         .expect("seed_child_leader_context: fresh child thread missing payload");
     payload.store_saved_user_context(Some(child_ctx));
+}
+
+/// Create a new thread within an existing process (clone(2) with
+/// CLONE_THREAD).
+pub fn step_clone_thread(
+    process: &Cap<ProcessIdentity>,
+    parent_user_ctx: &UserTrapContext,
+    stack: usize,
+    tls: usize,
+    ctid_ptr: u64,
+) -> Result<Cap<ThreadIdentity>, ZoneError> {
+    let child = sign_thread(process.downgrade())?;
+    seed_child_leader_context(&child, parent_user_ctx, tls, stack);
+    if ctid_ptr != 0 {
+        let payload = child.payload_cap()
+            .expect("step_clone_thread: fresh child missing payload");
+        *payload.clear_child_tid.lock() = Some(ctid_ptr);
+    }
+    if let Some(proc_payload) = process.payload.lock().as_ref() {
+        proc_payload.threads.attach(child.clone());
+        proc_payload.thread_count.fetch_add(1, Ordering::AcqRel);
+    }
+    Ok(child)
 }
 
 /// Exit the entire thread group: zombify every thread, drop the

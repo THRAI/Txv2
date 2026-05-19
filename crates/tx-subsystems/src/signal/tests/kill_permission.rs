@@ -61,14 +61,22 @@ fn cred_with(uid: u32, euid: u32) -> Cred {
 fn same_euid_passes() {
     let src = cred_with(1000, 1000);
     let tgt = target_with(1000, 1000, false);
-    assert!(signal_permitted(&CredSnapshot::from_cred(src), &tgt, Signum::SIGTERM));
+    assert!(signal_permitted(
+        &CredSnapshot::from_cred(src),
+        &tgt,
+        Signum::SIGTERM
+    ));
 }
 
 #[test]
 fn different_euid_fails_without_capability() {
     let src = cred_with(1000, 1000);
     let tgt = target_with(2000, 2000, false);
-    assert!(!signal_permitted(&CredSnapshot::from_cred(src), &tgt, Signum::SIGTERM));
+    assert!(!signal_permitted(
+        &CredSnapshot::from_cred(src),
+        &tgt,
+        Signum::SIGTERM
+    ));
 }
 
 #[test]
@@ -86,28 +94,44 @@ fn cap_kill_overrides_euid_mismatch() {
         permitted_caps: CapabilitySet::EMPTY,
     };
     let tgt = target_with(2000, 2000, false);
-    assert!(signal_permitted(&CredSnapshot::from_cred(src), &tgt, Signum::SIGTERM));
+    assert!(signal_permitted(
+        &CredSnapshot::from_cred(src),
+        &tgt,
+        Signum::SIGTERM
+    ));
 }
 
 #[test]
 fn root_overrides_euid_mismatch() {
     let src = Cred::root();
     let tgt = target_with(2000, 2000, false);
-    assert!(signal_permitted(&CredSnapshot::from_cred(src), &tgt, Signum::SIGTERM));
+    assert!(signal_permitted(
+        &CredSnapshot::from_cred(src),
+        &tgt,
+        Signum::SIGTERM
+    ));
 }
 
 #[test]
 fn sigcont_same_session_passes_regardless_of_uid() {
     let src = cred_with(1000, 1000);
     let tgt = target_with(2000, 2000, true);
-    assert!(signal_permitted(&CredSnapshot::from_cred(src), &tgt, Signum::SIGCONT));
+    assert!(signal_permitted(
+        &CredSnapshot::from_cred(src),
+        &tgt,
+        Signum::SIGCONT
+    ));
 }
 
 #[test]
 fn sigcont_different_session_still_requires_cred_match() {
     let src = cred_with(1000, 1000);
     let tgt = target_with(2000, 2000, false);
-    assert!(!signal_permitted(&CredSnapshot::from_cred(src), &tgt, Signum::SIGCONT));
+    assert!(!signal_permitted(
+        &CredSnapshot::from_cred(src),
+        &tgt,
+        Signum::SIGCONT
+    ));
 }
 
 // ----- integration tests against real Process / PGroup graph -----

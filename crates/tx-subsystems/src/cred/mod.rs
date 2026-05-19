@@ -296,9 +296,7 @@ impl CredSnapshot {
     /// practice from inside a live syscall arm) and by tests that need
     /// a known-root subject without touching a `ProcessPayload`.
     pub const fn root() -> Self {
-        Self {
-            cred: Cred::root(),
-        }
+        Self { cred: Cred::root() }
     }
 
     /// The captured `Cred` value. `Copy`; safe to hold across `.await`.

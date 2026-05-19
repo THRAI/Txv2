@@ -245,15 +245,29 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     let flags = args[0];
     let stack = args[1];
 
-    // Validation: must include SIGCHLD. Only CLONE_SETTLS is
-    // accepted as an additional flag.
+    // Validation: must include SIGCHLD. CLONE_THREAD creates a new
+    // thread within the calling process's thread group.
     if flags & SIGCHLD == 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
+    let clone_thread = (flags & CLONE_THREAD) != 0;
     let clone_vm = (flags & CLONE_VM) != 0;
     let clone_vfork = (flags & CLONE_VFORK) != 0;
     let clone_settls = (flags & CLONE_SETTLS) != 0;
-    let allowed_mask = SIGCHLD | CLONE_SETTLS | CLONE_VM | CLONE_VFORK;
+    let clone_child_cleartid = (flags & CLONE_CHILD_CLEARTID) != 0;
+    let clone_parent_settid = (flags & CLONE_PARENT_SETTID) != 0;
+
+    let allowed_mask = if clone_thread {
+        // CLONE_THREAD requires CLONE_SIGHAND per Linux semantics.
+        if flags & CLONE_SIGHAND == 0 {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        SIGCHLD | CLONE_THREAD | CLONE_VM | CLONE_SIGHAND
+            | CLONE_SETTLS | CLONE_CHILD_CLEARTID | CLONE_PARENT_SETTID
+            | CLONE_FILES | CLONE_FS
+    } else {
+        SIGCHLD | CLONE_SETTLS | CLONE_VM | CLONE_VFORK
+    };
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
@@ -278,6 +292,46 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         .expect(":clone:no-context: kernel-invariant violation, parent thread had no saved_user_context");
 
     let tls = if clone_settls { args[3] } else { 0 };
+
+    // ── CLONE_THREAD fast path ─────────────────────────────────
+    // Create a new thread within the calling process — no new
+    // ProcessIdentity is created.
+    if clone_thread {
+        let ctid_ptr = if clone_child_cleartid { args[4] } else { 0 };
+        let child_thread =
+            tx_subsystems::process::execution::step_clone_thread(
+                &ctx.process,
+                &parent_user_ctx,
+                stack as usize,
+                tls as usize,
+                ctid_ptr,
+            );
+        let child_thread = match child_thread {
+            Ok(t) => t,
+            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+        };
+
+        // CLONE_PARENT_SETTID: write child tid to *ptid in parent's
+        // userspace. Deferred — requires aspace.copy_to_user plumbing
+        // under the step_engine guard. For the initial pthread_create
+        // bring-up, the parent's clone(2) wrapper falls through to
+        // the CLONE_CHILD_CLEARTID futex protocol regardless of this
+        // write.
+        if clone_parent_settid {
+            let _ptid_ptr = args[2]; // parent's tidptr
+            // TODO(phase-tls): aspace.copy_to_user(ptid_ptr, &child_thread.tid.0.to_ne_bytes(), &guard)
+        }
+
+        // Hand the child thread to the reactor.
+        reactor_submit::submit_child_thread(
+            ctx.process.clone(),
+            child_thread.clone(),
+        );
+
+        return SyscallResult::Return(child_thread.tid.0 as i64);
+    }
+
+    // ── Non-CLONE_THREAD (fork) path ────────────────────────────
     // PR-9 phase 3b: drive `step_fork::<P>` via the `ForkOp::<P>`
     // StepOp wrap, threading a `&mut KernelScriptCtx`. The wrap lifts
     // the `Result<Cap<...>, ForkError>` into `StepOutcome::Done(inner_result)`
