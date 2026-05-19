@@ -101,6 +101,7 @@ impl Errno {
     /// kernel-internal `Errno` without importing tx-shims.
     pub fn linux_i32(self) -> i32 {
         match self {
+            Errno::E2BIG => 7,
             Errno::EACCES => 13,
             Errno::EAGAIN => 11,
             Errno::EBADF => 9,
@@ -108,6 +109,8 @@ impl Errno {
             Errno::EDQUOT => 122,
             Errno::EEXIST => 17,
             Errno::EFAULT => 14,
+            Errno::EFBIG => 27,
+            Errno::EIDRM => 43,
             Errno::EINVAL => 22,
             Errno::EIO => 5,
             Errno::EISDIR => 21,
