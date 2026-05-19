@@ -10,12 +10,16 @@ const NLM_F_DUMP: u16 = 0x0300;
 const NLMSG_DONE: u16 = 3;
 const NFNL_SUBSYS_NFTABLES: u16 = 10;
 const NFT_MSG_GETTABLE: u16 = 1;
+const NFT_MSG_DELTABLE: u16 = 2;
 const NFT_MSG_GETCHAIN: u16 = 4;
+const NFT_MSG_DELCHAIN: u16 = 5;
 const NFT_MSG_GETRULE: u16 = 7;
 const NFT_MSG_NEWTABLE: u16 = 0;
 const NFT_MSG_NEWCHAIN: u16 = 3;
 const NFT_MSG_NEWRULE: u16 = 6;
 const NFT_MSG_DELRULE: u16 = 8;
+const NFNL_MSG_BATCH_BEGIN: u16 = 0x10;
+const NFNL_MSG_BATCH_END: u16 = 0x11;
 const NFTA_TABLE_NAME: u16 = 1;
 const NFTA_CHAIN_TABLE: u16 = 1;
 const NFTA_CHAIN_HOOK: u16 = 4;
@@ -287,6 +291,102 @@ fn nfnetlink_newrule_adds_forward_accept_filter_rule() {
 }
 
 #[test]
+fn nfnetlink_batch_create_dump_and_delete_masquerade_rule() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    reset_netfilter_for_test();
+    crate::net::nfnetlink::reset_nfnetlink_for_test();
+
+    let mut create = Vec::new();
+    create.extend_from_slice(&batch_marker(NFNL_MSG_BATCH_BEGIN, 0x61));
+    create.extend_from_slice(&nlmsg(
+        nft_msg(NFT_MSG_NEWTABLE),
+        0x62,
+        table_payload("nat"),
+    ));
+    create.extend_from_slice(&nlmsg(
+        nft_msg(NFT_MSG_NEWCHAIN),
+        0x63,
+        chain_payload("nat", "postrouting", 4, 100),
+    ));
+    create.extend_from_slice(&nlmsg(
+        nft_msg(NFT_MSG_NEWRULE),
+        0x64,
+        rule_payload(
+            "nat",
+            "postrouting",
+            vec![
+                expr_meta(NFT_REG32_00, NFT_META_OIFNAME),
+                expr_cmp(NFT_REG32_00, b"docker0\0"),
+                expr_payload(NFT_REG32_00 + 1, NFT_PAYLOAD_NETWORK_HEADER, 12, 4),
+                expr_bitwise_ipv4_mask(NFT_REG32_00 + 1, NFT_REG32_00 + 2, [255, 255, 0, 0]),
+                expr_cmp(NFT_REG32_00 + 2, &[172, 18, 0, 0]),
+                expr_empty("masq"),
+            ],
+        ),
+    ));
+    create.extend_from_slice(&batch_marker(NFNL_MSG_BATCH_END, 0x65));
+
+    let create_responses = crate::net::nfnetlink_handle_request(&create);
+    assert!(create_responses.iter().all(|msg| {
+        nlmsg_type(msg) == 2 && i32::from_le_bytes(msg[16..20].try_into().unwrap()) == 0
+    }));
+
+    let rules = netfilter_rules_snapshot();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].target, NetfilterTarget::Masquerade);
+    assert_eq!(rules[0].out_iface, Some("docker0"));
+    assert_eq!(
+        rules[0].src,
+        Some(NetfilterIpv4Cidr {
+            addr: Ipv4Address::new([172, 18, 0, 0]),
+            prefix_len: 16,
+        })
+    );
+
+    let mut dump = Vec::new();
+    dump.extend_from_slice(&nlmsg(nft_msg(NFT_MSG_GETTABLE), 0x66, nfgenmsg()));
+    dump.extend_from_slice(&nlmsg(nft_msg(NFT_MSG_GETCHAIN), 0x67, nfgenmsg()));
+    dump.extend_from_slice(&nlmsg(nft_msg(NFT_MSG_GETRULE), 0x68, nfgenmsg()));
+    let dump_responses = crate::net::nfnetlink_handle_request(&dump);
+    assert!(dump_responses
+        .iter()
+        .any(|msg| nlmsg_type(msg) == nft_msg(NFT_MSG_NEWTABLE) && contains_bytes(msg, b"nat\0")));
+    assert!(dump_responses.iter().any(|msg| {
+        nlmsg_type(msg) == nft_msg(NFT_MSG_NEWCHAIN) && contains_bytes(msg, b"postrouting\0")
+    }));
+    assert!(dump_responses.iter().any(|msg| {
+        nlmsg_type(msg) == nft_msg(NFT_MSG_NEWRULE) && contains_bytes(msg, b"masquerade")
+    }));
+
+    let mut delete = Vec::new();
+    delete.extend_from_slice(&batch_marker(NFNL_MSG_BATCH_BEGIN, 0x69));
+    delete.extend_from_slice(&nlmsg(
+        nft_msg(NFT_MSG_DELRULE),
+        0x6a,
+        delrule_payload("nat", "postrouting", 1),
+    ));
+    delete.extend_from_slice(&nlmsg(
+        nft_msg(NFT_MSG_DELCHAIN),
+        0x6b,
+        delchain_payload("nat", "postrouting"),
+    ));
+    delete.extend_from_slice(&nlmsg(
+        nft_msg(NFT_MSG_DELTABLE),
+        0x6c,
+        deltable_payload("nat"),
+    ));
+    delete.extend_from_slice(&batch_marker(NFNL_MSG_BATCH_END, 0x6d));
+    let delete_responses = crate::net::nfnetlink_handle_request(&delete);
+    assert!(delete_responses.iter().all(|msg| {
+        nlmsg_type(msg) == 2 && i32::from_le_bytes(msg[16..20].try_into().unwrap()) == 0
+    }));
+    assert!(netfilter_rules_snapshot().is_empty());
+}
+
+#[test]
 fn netfilter_rule_counters_increment_on_filter_match() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -428,6 +528,19 @@ fn delrule_payload(table: &str, chain: &str, handle: u64) -> Vec<u8> {
     out
 }
 
+fn delchain_payload(table: &str, chain: &str) -> Vec<u8> {
+    let mut out = nfgenmsg();
+    push_attr_string(&mut out, NFTA_CHAIN_TABLE, table);
+    push_attr_string(&mut out, NFTA_CHAIN_NAME, chain);
+    out
+}
+
+fn deltable_payload(table: &str) -> Vec<u8> {
+    let mut out = nfgenmsg();
+    push_attr_string(&mut out, NFTA_TABLE_NAME, table);
+    out
+}
+
 fn expr_empty(name: &str) -> Vec<u8> {
     let mut out = Vec::new();
     push_attr_string(&mut out, NFTA_EXPR_NAME, name);
@@ -523,6 +636,10 @@ fn nlmsg(kind: u16, seq: u32, payload: Vec<u8>) -> Vec<u8> {
         out.push(0);
     }
     out
+}
+
+fn batch_marker(kind: u16, seq: u32) -> Vec<u8> {
+    nlmsg(kind, seq, nfgenmsg())
 }
 
 fn nft_msg(op: u16) -> u16 {
