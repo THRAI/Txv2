@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+use tx_hal::UserPtr;
 use tx_scripts::drive;
 use tx_substrate::step::DriveMode;
 use tx_substrate::step::Errno as V3Errno;
@@ -719,7 +720,23 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             let timer_wheel_arc = script_ctx.timer_wheel().cloned();
             let delegate_registry_arc = script_ctx.delegate_registry().cloned();
 
-            // First, probe the futex word without parking. EAGAIN
+            // Validate the user address before probing — the futex
+            // subsystem reads *uaddr via `read_volatile` (bootstrap
+            // exemption), which traps the kernel on an unmapped page.
+            // A pre-check with the safe `read_user` accessor converts
+            // the trap into a graceful -EFAULT.
+            {
+                let guard = step_engine::guard();
+                let user_ptr = UserPtr::<u32>::new(uaddr as usize);
+                match ctx.aspace.read_user(user_ptr, &guard) {
+                    StepOutcome::Err(_) => {
+                        return SyscallResult::error_from(Errno::EFAULT);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Probe the futex word without parking. EAGAIN
             // here means "word != val" → return -EAGAIN immediately
             // (the predecessor equality check, per POSIX).
             {
