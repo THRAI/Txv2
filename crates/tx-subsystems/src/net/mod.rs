@@ -13,6 +13,7 @@ pub mod execution;
 pub mod facade;
 pub mod namespace;
 pub mod netfilter;
+pub mod nfnetlink;
 pub mod packet;
 pub mod project;
 pub mod protocol;
@@ -82,6 +83,13 @@ pub use netfilter::{
     NetfilterConntrackSnapshot, NetfilterFrameContext, NetfilterHook, NetfilterIpv4Cidr,
     NetfilterNatKind, NetfilterRule, NetfilterStatsSnapshot, NetfilterTable, NetfilterTarget,
     NetfilterVerdict,
+};
+pub use nfnetlink::{
+    netlink_netfilter_recv, netlink_netfilter_send, nfnetlink_handle_request,
+    NetlinkNetfilterState, RawNetlinkNetfilterSocket, NETLINK_NETFILTER, NFNL_MSG_BATCH_BEGIN,
+    NFNL_MSG_BATCH_END, NFNL_SUBSYS_NFTABLES, NFPROTO_IPV4, NFT_MSG_GETCHAIN, NFT_MSG_GETGEN,
+    NFT_MSG_GETRULE, NFT_MSG_GETTABLE, NFT_MSG_NEWCHAIN, NFT_MSG_NEWGEN, NFT_MSG_NEWRULE,
+    NFT_MSG_NEWTABLE,
 };
 pub use packet::{
     demux_rx_frame_with_smoltcp, NetworkPublish, PacketDispatch, PacketSource, PacketTxReadiness,

@@ -362,7 +362,8 @@ fn connecting_endpoints(protocol: &SocketProtocol) -> Result<(IpEndpoint, IpEndp
         SocketProtocol::UnixDatagram
         | SocketProtocol::Udp(_)
         | SocketProtocol::RawIcmp(_)
-        | SocketProtocol::NetlinkRoute(_) => Err(Errno::EOPNOTSUPP),
+        | SocketProtocol::NetlinkRoute(_)
+        | SocketProtocol::NetlinkNetfilter(_) => Err(Errno::EOPNOTSUPP),
     }
 }
 
@@ -373,6 +374,7 @@ fn connected_endpoints(protocol: &SocketProtocol) -> Result<(IpEndpoint, IpEndpo
         SocketProtocol::UnixDatagram
         | SocketProtocol::Udp(_)
         | SocketProtocol::RawIcmp(_)
-        | SocketProtocol::NetlinkRoute(_) => Err(Errno::EOPNOTSUPP),
+        | SocketProtocol::NetlinkRoute(_)
+        | SocketProtocol::NetlinkNetfilter(_) => Err(Errno::EOPNOTSUPP),
     }
 }

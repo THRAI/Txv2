@@ -95,6 +95,7 @@ pub enum SocketKind {
     Udp,
     RawIcmp,
     NetlinkRoute,
+    NetlinkNetfilter,
 }
 
 impl SocketKind {
@@ -107,6 +108,9 @@ impl SocketKind {
             | (AddressFamily::Inet, SocketType::Raw, 1) => Ok(Self::RawIcmp),
             (AddressFamily::Netlink, SocketType::Raw | SocketType::Dgram, 0) => {
                 Ok(Self::NetlinkRoute)
+            }
+            (AddressFamily::Netlink, SocketType::Raw | SocketType::Dgram, 12) => {
+                Ok(Self::NetlinkNetfilter)
             }
             _ => Err(Errno::EOPNOTSUPP),
         }
@@ -398,7 +402,8 @@ impl SocketOptionSet {
             SocketKind::UnixDatagram
             | SocketKind::Udp
             | SocketKind::RawIcmp
-            | SocketKind::NetlinkRoute => Self::default_udp(),
+            | SocketKind::NetlinkRoute
+            | SocketKind::NetlinkNetfilter => Self::default_udp(),
         }
     }
 }

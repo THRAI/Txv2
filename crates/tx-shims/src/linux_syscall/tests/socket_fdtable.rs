@@ -5,11 +5,12 @@ use super::*;
 
 use crate::linux_syscall::{
     AF_INET, AF_NETLINK, AF_UNIX, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_UDP,
-    IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO, IPT_SO_SET_REPLACE, IP_RECVERR, NETLINK_ROUTE, NR_BIND,
-    NR_CLOSE, NR_CONNECT, NR_FCNTL, NR_GETSOCKNAME, NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PPOLL,
-    NR_PSELECT6, NR_RECVFROM, NR_RECVMSG, NR_SENDMSG, NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET,
-    O_CLOEXEC, O_NONBLOCK, O_RDWR, SIOCGIFFLAGS, SIOCGIFINDEX, SIOCGIFTXQLEN, SIOCSIFFLAGS,
-    SOL_SOCKET, SO_DONTROUTE, SO_ERROR, SO_RCVTIMEO, SO_REUSEADDR, SO_TYPE,
+    IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO, IPT_SO_SET_REPLACE, IP_RECVERR, NETLINK_NETFILTER,
+    NETLINK_ROUTE, NR_BIND, NR_CLOSE, NR_CONNECT, NR_FCNTL, NR_GETSOCKNAME, NR_GETSOCKOPT,
+    NR_IOCTL, NR_LISTEN, NR_PPOLL, NR_PSELECT6, NR_RECVFROM, NR_RECVMSG, NR_SENDMSG, NR_SENDTO,
+    NR_SETSOCKOPT, NR_SOCKET, O_CLOEXEC, O_NONBLOCK, O_RDWR, SIOCGIFFLAGS, SIOCGIFINDEX,
+    SIOCGIFTXQLEN, SIOCSIFFLAGS, SOL_SOCKET, SO_DONTROUTE, SO_ERROR, SO_RCVTIMEO, SO_REUSEADDR,
+    SO_TYPE,
 };
 use alloc::vec;
 use alloc::vec::Vec;
@@ -31,6 +32,9 @@ const NLM_F_REQUEST: u16 = 0x0001;
 const NLM_F_DUMP: u16 = 0x0300;
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
+const NFNL_SUBSYS_NFTABLES: u16 = 10;
+const NFT_MSG_GETTABLE: u16 = 1;
+const NFT_MSG_NEWTABLE: u16 = 0;
 const IPT_GETINFO_BYTES: usize = 84;
 const IPT_GET_ENTRIES_EMPTY_BYTES: usize = 36;
 
@@ -115,6 +119,34 @@ fn rtnl_getlink_request(seq: u32) -> Vec<u8> {
     out
 }
 
+fn nft_gettable_request(seq: u32) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(2);
+    payload.push(0);
+    payload.extend_from_slice(&0u16.to_be_bytes());
+
+    let len = 16 + payload.len();
+    let mut out = Vec::new();
+    out.extend_from_slice(&(len as u32).to_le_bytes());
+    out.extend_from_slice(&nft_msg(NFT_MSG_GETTABLE).to_le_bytes());
+    out.extend_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_le_bytes());
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&payload);
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    out
+}
+
+fn nft_msg(op: u16) -> u16 {
+    (NFNL_SUBSYS_NFTABLES << 8) | op
+}
+
+fn nlmsg_type(msg: &[u8]) -> u16 {
+    u16::from_le_bytes([msg[4], msg[5]])
+}
+
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
@@ -165,6 +197,24 @@ fn socket_netlink(ctx: &SyscallCtx<'static>) -> i64 {
     ) {
         SyscallResult::Return(fd) => fd,
         other => panic!("socket(AF_NETLINK, RAW, NETLINK_ROUTE) failed: {other:?}"),
+    }
+}
+
+fn socket_netfilter(ctx: &SyscallCtx<'static>) -> i64 {
+    match socket_req(
+        NR_SOCKET,
+        [
+            AF_NETLINK as u64,
+            SOCK_RAW | O_CLOEXEC as u64,
+            NETLINK_NETFILTER as u64,
+            0,
+            0,
+            0,
+        ],
+        ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_NETLINK, RAW, NETLINK_NETFILTER) failed: {other:?}"),
     }
 }
 
@@ -344,6 +394,82 @@ fn dispatch_netlink_route_write_read_returns_dump() {
         contains_bytes(&recv_buf, b"lo\0"),
         "read(2) should return the rtnetlink dump bytes"
     );
+}
+
+#[test]
+fn dispatch_netlink_netfilter_sendto_recvfrom_returns_table_dump() {
+    let _setup = socket_setup();
+    tx_subsystems::net::flush_netfilter_rules_and_conntrack_for_test_or_bootstrap();
+    tx_subsystems::net::add_masquerade_rule_for_test_or_bootstrap(
+        tx_subsystems::net::NetfilterIpv4Cidr {
+            addr: Ipv4Address::new([172, 17, 0, 0]),
+            prefix_len: 16,
+        },
+        "uplink-nft-shim0",
+    )
+    .expect("masquerade rule");
+
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_netfilter(&ctx);
+    let nladdr = sockaddr_nl();
+    let request = nft_gettable_request(0x77);
+    let mut recv_buf = [0u8; 512];
+    let mut recv_addr = [0u8; SOCKADDR_NL_BYTES as usize];
+    let mut recv_addr_len = SOCKADDR_NL_BYTES;
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                fd as u64,
+                nladdr.as_ptr() as u64,
+                SOCKADDR_NL_BYTES as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                fd as u64,
+                request.as_ptr() as u64,
+                request.len() as u64,
+                0,
+                nladdr.as_ptr() as u64,
+                SOCKADDR_NL_BYTES as u64
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(request.len() as i64)
+    );
+
+    let recv = socket_req(
+        NR_RECVFROM,
+        [
+            fd as u64,
+            recv_buf.as_mut_ptr() as u64,
+            recv_buf.len() as u64,
+            0,
+            recv_addr.as_mut_ptr() as u64,
+            (&mut recv_addr_len as *mut u32) as u64,
+        ],
+        &ctx,
+    );
+
+    assert!(matches!(recv, SyscallResult::Return(n) if n > 0));
+    assert_eq!(nlmsg_type(&recv_buf), nft_msg(NFT_MSG_NEWTABLE));
+    assert!(contains_bytes(&recv_buf, b"nat\0"));
+    assert_eq!(
+        u16::from_le_bytes([recv_addr[0], recv_addr[1]]),
+        AF_NETLINK as u16
+    );
+    assert_eq!(recv_addr_len, SOCKADDR_NL_BYTES);
+    tx_subsystems::net::flush_netfilter_rules_and_conntrack_for_test_or_bootstrap();
 }
 
 #[test]

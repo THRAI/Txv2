@@ -61,7 +61,7 @@ pub fn step_socket_close(
             bindings_withdrawn += withdraw_ok(table.withdraw_raw_icmp(socket.raw()));
         }
         SocketProtocol::UnixDatagram => {}
-        SocketProtocol::NetlinkRoute(_) => {}
+        SocketProtocol::NetlinkRoute(_) | SocketProtocol::NetlinkNetfilter(_) => {}
     }
 
     if let Some(raw_tcp) = payload.raw_tcp_socket() {
