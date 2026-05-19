@@ -913,10 +913,6 @@ impl<P: TxPlatform> CoreInit<P> {
             .into_cap()
             .clone();
 
-        // Snapshot the musl dentry before it's consumed by
-        // MountIdentity::new_cap — tx.sdcard-root uses it.
-        let musl_dentry_snapshot = musl_dentry_on_root.clone();
-
         let musl_mount = MountIdentity::new_cap(
             mount::allocate_mount_id(),
             Some(musl_dentry_on_root),
@@ -932,74 +928,6 @@ impl<P: TxPlatform> CoreInit<P> {
         mount::register_mount(&rootfs_payload, musl_object_id, musl_mount.clone());
 
         *MUSL_MOUNT.lock() = Some(musl_mount);
-
-        // ── tx.sdcard-root: bind-mount /musl/lib → /lib ──────────
-        // When the kernel command line contains `tx.sdcard-root`,
-        // bind-mount the sdcard's `/lib` directory at the tmpfs root
-        // so ELF PT_INTERP paths like `/lib/ld-musl-riscv64.so.1`
-        // resolve without prefixing `/musl`.  This is the minimal
-        // change needed for dynamic-linking support under OSComp
-        // without restructuring the entire boot mount order.
-        {
-            let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline.unwrap_or("");
-            if cmdline.contains("tx.sdcard-root") {
-                // Walk the freshly-mounted ext4 to get /musl/lib.
-                let guard = step_engine::guard();
-                let cred = Credential::root();
-                let src = match tx_subsystems::vfs::walker::step_walk(
-                    musl_dentry_snapshot,
-                    b"lib",
-                    &cred,
-                    &guard,
-                ) {
-                    StepOutcome::Done(d) => d,
-                    _ => {
-                        tx_hal::console_write_str::<P>(
-                            ":mount:sdcard:tx.sdcard-root:walk-lib:err\n",
-                        );
-                        return;
-                    }
-                };
-                drop(guard);
-
-                // mkdir /lib on tmpfs.
-                let guard = step_engine::guard();
-                let (lib_id, lib_meta) = match rootfs_payload.fs_ops.mkdir(
-                    tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
-                    b"lib",
-                    0o755,
-                    &cred,
-                    &guard,
-                ) {
-                    StepOutcome::Done(out) => out,
-                    other => {
-                        tx_hal::console_write_str::<P>(
-                            ":mount:sdcard:tx.sdcard-root:mkdir-lib:err\n",
-                        );
-                        return;
-                    }
-                };
-                drop(guard);
-
-                let lib_dentry = DEntry::new_cap(
-                    InlineName::new(b"lib").expect("tx.sdcard-root: /lib name"),
-                    RNode::new_cap(lib_id, lib_meta, RNodeBacking::Directory)
-                        .expect("tx.sdcard-root: /lib rnode"),
-                )
-                .expect("tx.sdcard-root: /lib dentry");
-
-                let guard = step_engine::guard();
-                match mount::bind_mount(src, lib_dentry, &rootfs_payload, &guard) {
-                    Ok(_) => {}
-                    Err(_e) => {
-                        tx_hal::console_write_str::<P>(
-                            ":mount:sdcard:tx.sdcard-root:bind-lib:err\n",
-                        );
-                    }
-                }
-                drop(guard);
-            }
-        }
 
         // Seed /bin/sh → the busybox binary in the rootfs tmpfs so
         // that shebang scripts (e.g. run-all.sh #!/bin/sh) resolve

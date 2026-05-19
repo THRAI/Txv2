@@ -298,8 +298,6 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
                 "user,id=net".into(),
                 "-rtc".into(),
                 "base=utc".into(),
-                "-append".into(),
-                "tx.sdcard-root".into(),
             ],
         ),
         TxTarget::La64Qemu => (
