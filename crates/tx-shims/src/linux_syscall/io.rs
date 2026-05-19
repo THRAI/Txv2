@@ -545,3 +545,115 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         }
     }
 }
+
+/// `sendfile64(out_fd, in_fd, offset, count)` — page-level copy from
+/// one fd to another without an intermediate userspace buffer.
+///
+/// Linux generic ABI `__NR_sendfile64 = 71`.  Copies up to `count`
+/// bytes from `in_fd` (must be a page-backed regular file) to
+/// `out_fd`.  If `offset` is non-NULL, reads the input position from
+/// `*offset` and writes the updated position back; the input file's
+/// fd-level cursor is not touched in this case.  If `offset` is NULL,
+/// the input file's fd cursor is used and advanced.
+pub(super) async fn sys_sendfile64<'a>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    use tx_subsystems::page_backed::step_copy_file_range;
+    use tx_subsystems::vfs::structure::RNodeBacking;
+
+    let out_fd = args[0] as i32;
+    let in_fd = args[1] as i32;
+    let offset_ptr = args[2];
+    let count = args[3] as usize;
+
+    if out_fd < 0 || in_fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if count == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    let out_file = match resolve_fd(&ctx.process, out_fd as u32) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let in_file = match resolve_fd(&ctx.process, in_fd as u32) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+
+    // Input must be a regular file backed by PageContainer.
+    let in_rnode = in_file.rnode();
+    let in_pc = match in_rnode.backing() {
+        RNodeBacking::PageBacked { pc } => pc.clone(),
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+
+    // Output must be page-backed (regular file); pipes/sockets are
+    // deferred per PAGE_BACKED §9.1.
+    let out_rnode = out_file.rnode();
+    let out_pc = match out_rnode.backing() {
+        RNodeBacking::PageBacked { pc } => pc.clone(),
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+
+    // Determine input offset.
+    let in_offset: u64;
+    let needs_offset_writeback: bool;
+    if offset_ptr != 0 {
+        // Read the offset from userspace.
+        let mut off_bytes = [0u8; 8];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut off_bytes, offset_ptr) {
+            return SyscallResult::error_from(errno);
+        }
+        in_offset = u64::from_le_bytes(off_bytes);
+        needs_offset_writeback = true;
+    } else {
+        // Use the input file's current cursor.
+        in_offset = in_file.offset();
+        needs_offset_writeback = false;
+    }
+
+    // Output writes at the output file's current cursor.
+    let out_offset = out_file.offset();
+
+    // Single-shot page copy (non-blocking for v1).
+    let guard = tx_substrate::epoch::guard();
+    let outcome = step_copy_file_range(&in_pc, in_offset, &out_pc, out_offset, count, &guard);
+    drop(guard);
+
+    let transferred = match outcome {
+        tx_substrate::step::StepOutcome::Done(n) => n,
+        tx_substrate::step::StepOutcome::Err(e) => {
+            let errno: tx_subsystems::execution::Errno = e.into();
+            return SyscallResult::error_from(errno);
+        }
+        // If the operation would block, return EAGAIN (sendfile is
+        // non-blocking in this v1 implementation).
+        _ => return SyscallResult::Error(EAGAIN_VALUE),
+    };
+
+    if transferred == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    // Advance the output file's cursor.
+    out_file.advance_offset(transferred as u64);
+
+    // Update the input offset in userspace if a pointer was given.
+    if needs_offset_writeback {
+        let new_off = in_offset + transferred as u64;
+        let bytes = new_off.to_le_bytes();
+        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, offset_ptr, &bytes) {
+            // On partial success, Linux prefers to return the byte
+            // count rather than the fault error.
+            return SyscallResult::Return(transferred as i64);
+        }
+    } else {
+        // Advance the input file's cursor when offset was NULL.
+        in_file.advance_offset(transferred as u64);
+    }
+
+    SyscallResult::Return(transferred as i64)
+}

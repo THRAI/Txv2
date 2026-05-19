@@ -21,6 +21,10 @@ pub const NR_READ: u64 = 63;
 pub const NR_WRITEV: u64 = 66;
 /// `readv(fd, iov, iovcnt)`. Linux generic ABI `__NR_readv`.
 pub const NR_READV: u64 = 65;
+/// `sendfile64(out_fd, in_fd, offset, count)`. Linux generic ABI
+/// `__NR_sendfile64`. Copies data from `in_fd` to `out_fd` via
+/// page-level transfer without an intermediate userspace buffer.
+pub const NR_SENDFILE64: u64 = 71;
 /// `ppoll(fds, nfds, tmo_p, sigmask)`. Linux generic ABI
 /// `__NR_ppoll`. busybox sh's interactive read loop polls stdin
 /// before reading. The v1 implementation is a minimal stub: walk
