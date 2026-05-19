@@ -447,7 +447,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // Cmdline-driven init path (initramfs slice):
         //   `init=/some/path` -> exec that path with argv=[basename]
-        //   `tx.profile=busybox` (no init=) -> /bin/sh argv=[sh]
+        //   `tx.profile=busybox` (no init=) -> /bin/busybox argv=[sh]
         //   default -> bake-in /init fixture, argv=[init]
         let (init_path, argv0) = parse_init_from_cmdline::<P>();
         Self::write_board_sentinel_prefix();
@@ -461,9 +461,28 @@ impl<P: TxPlatform> CoreInit<P> {
         // a guard at the call site (per
         // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`).
         let argv: &[&[u8]] = &[argv0];
-        let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
-            &init, &thread, init_path, argv, envp, &cred,
-        ));
+        let mut outcome =
+            bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                &init, &thread, init_path, argv, envp, &cred,
+            ));
+        // If /bin/busybox failed, try /bin/sh (symlink → busybox).
+        // Some initramfs layouts only resolve correctly through the
+        // symlink path.
+        if outcome.is_err()
+            && init_path != b"/bin/sh"
+            && init_path != b"/init"
+        {
+            let sh_outcome =
+                bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                    &init, &thread, b"/bin/sh", &[b"sh"], envp, &cred,
+                ));
+            if sh_outcome.is_ok() {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
+                return;
+            }
+            outcome = sh_outcome;
+        }
         match outcome {
             Ok(()) => {
                 Self::write_board_sentinel_prefix();
@@ -666,10 +685,9 @@ impl<P: TxPlatform> CoreInit<P> {
             // They queue bytes in an IRQ-safe buffer and request a
             // reactor wake; consume that buffer here in normal
             // context before deciding whether there is runnable work.
-            if Self::drain_pending_uart_rx_into_tty() != 0 {
-                continue;
-            }
-            if Self::drain_sbi_console_into_tty() != 0 {
+            let had_uart = Self::drain_pending_uart_rx_into_tty() != 0;
+            let had_sbi = Self::drain_sbi_console_into_tty() != 0;
+            if had_uart || had_sbi {
                 continue;
             }
 

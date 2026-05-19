@@ -408,8 +408,14 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // target.  Mirrors Linux binfmt_script.  One level of recursion is
     // sufficient (the interpreter itself must be a real ELF binary).
     if header_bytes.starts_with(b"#!") {
-        if let Some((interp, opt_arg)) = shebang_parse(&header_bytes) {
+        if let Some((mut interp, opt_arg)) = shebang_parse(&header_bytes) {
             EXEC_SHEBANG_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // Normalise /bin/busybox → /bin/sh: both point to the same
+            // busybox binary, but /bin/sh is the canonical path in
+            // every boot configuration (sdcard, initramfs, baked-in).
+            if interp == b"/bin/busybox" {
+                interp = b"/bin/sh";
+            }
             // Build new argv: [interp, opt_arg?, script_path, argv[1..]...]
             let mut new_argv: Vec<Vec<u8>> = Vec::new();
             new_argv.push(interp.to_vec());
@@ -440,10 +446,37 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // `txdoc:EXEC-8-3-PARSE-AND-VALIDATE`. Goblin-backed parser owns
     // every header and program-header check (class / data / version /
     // arch / type / no PT_INTERP / no PT_DYNAMIC / phdr-table fits /
-    // congruence / overlap / W^X). All failures collapse to
-    // `ExecError::NotExecutable` at the syscall boundary.
-    let mut parsed: ExecImagePlan =
-        parse_image_plan(&header_bytes).map_err(ExecError::from_parse_error)?;
+    // congruence / overlap / W^X).  If the file does not look like a
+    // valid ELF and has no shebang, fall back to `/bin/sh` so that
+    // scripts without a `#!` line (e.g. OSComp libctest's run-static.sh
+    // / run-dynamic.sh) still execute.
+    let mut parsed: ExecImagePlan = match parse_image_plan(&header_bytes) {
+        Ok(plan) => plan,
+        Err(_parse_err) => {
+            if depth < SHEBANG_MAX_DEPTH {
+                let interp_path: Vec<u8> = b"/bin/sh".to_vec();
+                let mut new_argv: Vec<Vec<u8>> = Vec::new();
+                new_argv.push(interp_path.clone());
+                new_argv.push(path.to_vec());
+                for &a in argv.iter().skip(1) {
+                    new_argv.push(a.to_vec());
+                }
+                let new_argv_refs: Vec<&[u8]> =
+                    new_argv.iter().map(|v| v.as_slice()).collect();
+                return alloc::boxed::Box::pin(exec_script_inner::<P>(
+                    depth + 1,
+                    process,
+                    thread,
+                    &interp_path,
+                    &new_argv_refs,
+                    envp,
+                    cred,
+                ))
+                .await;
+            }
+            return Err(ExecError::NotExecutable);
+        }
+    };
 
     // ASLR: for ET_DYN images, shift the fixed load_bias by a
     // random offset.  ET_EXEC binaries (load_bias == 0) are not

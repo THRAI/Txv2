@@ -1,3 +1,44 @@
+- 2026-05-19 **Reactor SMP design revised around poll-lease first split.**
+  Updated `docs/ljs/REACTOR_SMP_v1_CN.md` from draft v1.0 to v1.1 after
+  reviewing it against the current `tx-reactor` implementation. The design no
+  longer treats Phase 1 as “one independent `Phase1Scheduler` per hart”.
+  Instead it defines a safer path: shared task table / scheduler metadata as
+  the fact source, per-hart queues and runtime context as shards, and a Phase
+  1a poll-lease protocol that releases the global reactor/scheduler lock before
+  `future.poll()`. Added invariants for task ownership, per-hart current
+  mailbox/timer/delegate context, wake recheck, and a corrected Phase 2
+  stealing sketch based on queue locks plus task-state ownership transfer.
+  **Verified:** documentation-only change; grepped the design for old
+  independent-scheduler wording and reviewed the updated phase gates.
+  **Next step:** implement Phase 1a in `tx-reactor`: introduce task poll lease
+  / per-hart runtime context before attempting queue shard locks or stealing.
+
+- 2026-05-19 **TTY WaitSource registry gap fixed for interactive busybox.**
+  `docker-run-rv64-busybox` / `docker-run-la64-busybox` were not losing host
+  stdin at Docker or QEMU: input reached `step_ingest`, but the userspace
+  `ppoll`/`read` waiter never woke because TTY identities created a
+  `WaitSource` without registering it in the global wake registry used by
+  `drive()`'s mailbox path. Changed TTY `wait_routing::new_wait_source()` to
+  register/unregister sources, made `TtyIdentity::new()` use that helper, and
+  pinned the registry round-trip in `v3_tty_waitsource`. `sys_ppoll` now parks
+  on the TTY wait source instead of the backing `RNode` wait source, matching
+  `step_read`.
+  **Verified:** `cargo test -p tx-subsystems --test v3_tty_waitsource
+  tty_wait_source_invariants_round_trip`; `cargo test -p tx-scripts
+  drive_waiting_on_wait_source_unregistered_token_retries`; `cargo xtask build
+  --target rv64-qemu`; `timeout 90s cargo xtask shell-test --target rv64-qemu
+  --script tools/shell-tests/busybox-prompt.txt`; Docker LA64
+  `cargo xtask build --target la64-qemu` plus
+  `cargo xtask qemu --target la64-qemu --profile busybox --interactive --smp 1`
+  manually accepted empty Enter and `echo la64-clean`.
+  **Note:** `cargo fmt --check` for the whole tree still reports unrelated
+  pre-existing formatting diffs in other dirty files; a narrow `rustfmt
+  --edition 2021 --check` over the TTY/ppoll files touched here passed. The
+  LA64 `xtask shell-test` helper still lacks the `fw_cfg` wiring that
+  `xtask qemu` uses, so it boots `/init` instead of the busybox profile.
+  **Next step:** clean up the unrelated dirty formatting / LA64 shell-test
+  harness separately if we want a full-tree green formatting gate.
+
 - 2026-05-17 **LA64 QEMU SMP shape made explicit.**
   Added a `--smp N` override to `cargo xtask qemu`, keeping the default LA64
   smoke lane at `-smp 4` while making `-smp 1` directly reproducible when
