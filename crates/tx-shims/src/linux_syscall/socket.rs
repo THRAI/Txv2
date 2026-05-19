@@ -32,6 +32,8 @@ const MSGHDR_CONTROLLEN_OFFSET: u64 = 40;
 const MSGHDR_FLAGS_OFFSET: u64 = 48;
 const MAX_MSG_IOV: u64 = 1024;
 const NETLINK_RECVMSG_MAX: usize = 64 * 1024;
+const IPT_GETINFO_BYTES: usize = 84;
+const IPT_GET_ENTRIES_EMPTY_BYTES: usize = 36;
 
 #[derive(Clone, Copy)]
 struct UserIovec {
@@ -934,6 +936,9 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             };
             Ok(())
         }
+        (IPPROTO_IP, IPT_SO_SET_REPLACE) | (IPPROTO_IP, IPT_SO_SET_ADD_COUNTERS) => {
+            Err(Errno::EOPNOTSUPP)
+        }
         _ => Err(Errno::ENOPROTOOPT),
     };
 
@@ -1038,6 +1043,12 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         (IPPROTO_TCP, TCP_MAXSEG) => write_sockopt_i32(ctx, optval, optlen_ptr, 1460),
         (IPPROTO_TCP, TCP_INFO) => write_sockopt_bytes(ctx, optval, optlen_ptr, &[0u8; 104]),
         (IPPROTO_TCP, TCP_CONGESTION) => write_sockopt_bytes(ctx, optval, optlen_ptr, b"reno\0"),
+        (IPPROTO_IP, IPT_SO_GET_INFO) => {
+            write_sockopt_bytes(ctx, optval, optlen_ptr, &[0u8; IPT_GETINFO_BYTES])
+        }
+        (IPPROTO_IP, IPT_SO_GET_ENTRIES) => {
+            write_sockopt_bytes(ctx, optval, optlen_ptr, &[0u8; IPT_GET_ENTRIES_EMPTY_BYTES])
+        }
         _ => Err(Errno::ENOPROTOOPT),
     };
 
@@ -1566,7 +1577,10 @@ fn write_sockopt_bytes<'a>(
     let optlen: u32 = bootstrap_read_user(&ctx.aspace, optlen_ptr)?;
     let bytes = core::cmp::min(optlen as usize, value.len());
     bootstrap_write_user(&ctx.aspace, optlen_ptr, bytes as u32)?;
-    bootstrap_copy_to_user(&ctx.aspace, optval, &value[..bytes])
+    for (offset, byte) in value[..bytes].iter().copied().enumerate() {
+        bootstrap_write_user(&ctx.aspace, optval + offset as u64, byte)?;
+    }
+    Ok(())
 }
 
 fn socket_type_i32(socket: &Cap<SocketIdentity>) -> i32 {

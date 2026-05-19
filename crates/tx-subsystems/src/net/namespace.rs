@@ -20,7 +20,8 @@ use crate::net::execution::{
     step_process_network_events_in_namespace_at, ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome,
 };
 use crate::net::netfilter::{
-    apply_postrouting_nat_ipv4, apply_prerouting_nat_ipv4, run_frame_hook, NetfilterFrameContext,
+    apply_postrouting_nat_ipv4, apply_prerouting_nat_ipv4,
+    cleanup_netfilter_device_state_for_test_or_bootstrap, run_frame_hook, NetfilterFrameContext,
     NetfilterHook, NetfilterVerdict,
 };
 use crate::net::packet::{PacketDispatch, PacketSource, PacketTxResult};
@@ -324,6 +325,49 @@ impl NetNamespacePayload {
 
         self.remove_device_from_local_bridges(authority, registration);
         target.attach_device_link_inner(link)
+    }
+
+    pub fn detach_device_from_bridges_by_ifindex(
+        &self,
+        authority: NetAdminAuthority,
+        ifindex: u32,
+    ) -> Result<(), Errno> {
+        if ifindex == 1 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let registration = self.find_device_by_ifindex(ifindex).ok_or(Errno::ENODEV)?;
+        self.remove_device_from_local_bridges(authority, registration);
+        Ok(())
+    }
+
+    pub fn delete_device_by_ifindex(
+        &self,
+        authority: NetAdminAuthority,
+        ifindex: u32,
+    ) -> Result<(), Errno> {
+        if ifindex == 1 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let registration = self.find_device_by_ifindex(ifindex).ok_or(Errno::ENODEV)?;
+        let removed = {
+            let mut devices = self.namespace_devices.lock();
+            let Some(idx) = devices
+                .iter()
+                .position(|link| link.registration.devt == registration.devt)
+            else {
+                return Err(Errno::EOPNOTSUPP);
+            };
+            devices.remove(idx)
+        };
+        self.remove_device_from_local_bridges(authority, registration);
+        self.routes
+            .lock()
+            .retain(|route| route.oif_name != Some(registration.name));
+        self.iface_runtime
+            .lock()
+            .retain(|entry| entry.registration.devt != registration.devt);
+        cleanup_netfilter_device_state_for_test_or_bootstrap(registration.name, removed.ipv4_addr);
+        Ok(())
     }
 
     fn attach_device_inner(

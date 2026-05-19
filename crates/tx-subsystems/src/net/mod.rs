@@ -72,13 +72,16 @@ pub use namespace::{create_isolated_net_namespace_for_test, reset_initial_net_na
 #[cfg(any(test, feature = "test-support"))]
 pub use netfilter::reset_netfilter_for_test;
 pub use netfilter::{
-    add_masquerade_rule_for_test_or_bootstrap, add_netfilter_rule_for_test_or_bootstrap,
-    apply_netfilter_control_command, apply_postrouting_nat_ipv4, apply_prerouting_nat_ipv4,
+    add_dnat_rule_for_test_or_bootstrap, add_masquerade_rule_for_test_or_bootstrap,
+    add_netfilter_rule_for_test_or_bootstrap, apply_netfilter_control_command,
+    apply_postrouting_nat_ipv4, apply_prerouting_nat_ipv4,
+    cleanup_netfilter_device_state_for_test_or_bootstrap,
     flush_netfilter_rules_and_conntrack_for_test_or_bootstrap, netfilter_conntrack_snapshot,
     netfilter_rules_snapshot, netfilter_stats_snapshot,
     remove_netfilter_rule_for_test_or_bootstrap, run_frame_hook, NetfilterConntrackProtocol,
     NetfilterConntrackSnapshot, NetfilterFrameContext, NetfilterHook, NetfilterIpv4Cidr,
-    NetfilterRule, NetfilterStatsSnapshot, NetfilterTable, NetfilterTarget, NetfilterVerdict,
+    NetfilterNatKind, NetfilterRule, NetfilterStatsSnapshot, NetfilterTable, NetfilterTarget,
+    NetfilterVerdict,
 };
 pub use packet::{
     demux_rx_frame_with_smoltcp, NetworkPublish, PacketDispatch, PacketSource, PacketTxReadiness,
@@ -98,8 +101,9 @@ pub use rtnetlink::{
     netlink_route_send_with_netns_resolvers, rtnetlink_handle_request,
     rtnetlink_handle_request_with_netns_resolver, rtnetlink_handle_request_with_netns_resolvers,
     NetlinkRouteState, RawNetlinkRouteSocket, AF_NETLINK, NETLINK_ROUTE, NLMSG_DONE, NLMSG_ERROR,
-    NLM_F_ACK, NLM_F_DUMP, NLM_F_MULTI, NLM_F_REQUEST, RTM_DELROUTE, RTM_GETADDR, RTM_GETLINK,
-    RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWLINK, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK,
+    NLM_F_ACK, NLM_F_DUMP, NLM_F_MULTI, NLM_F_REQUEST, RTM_DELLINK, RTM_DELROUTE, RTM_GETADDR,
+    RTM_GETLINK, RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWLINK, RTM_NEWNEIGH, RTM_NEWROUTE,
+    RTM_SETLINK,
 };
 pub use structure::{
     AcceptWireSet, AddressFamily, ConnectionKey, InitialSocketTableProxy, IpEndpoint,

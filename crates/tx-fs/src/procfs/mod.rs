@@ -1464,9 +1464,31 @@ mod tests {
         assert!(text.contains("172.17.0.0/16"));
         assert!(text.contains("proc-nf0"));
 
+        let dnat = b"dnat tcp 10.0.2.15 8080 172.17.0.2 80\n";
+        assert_eq!(
+            procfs.step_write_projected(PROCFS_NET_TX_NF_RULES_ID, 0, dnat, &guard),
+            StepOutcome::Done(dnat.len() as u64)
+        );
+        let read = match procfs.step_read_projected(PROCFS_NET_TX_NF_RULES_ID, 0, &mut out, &guard)
+        {
+            StepOutcome::Done(read) => read as usize,
+            other => panic!("netfilter dnat rules read failed: {other:?}"),
+        };
+        let text = core::str::from_utf8(&out[..read]).expect("netfilter dnat text utf8");
+        assert!(text.contains("DNAT"));
+        assert!(text.contains("tcp"));
+        assert!(text.contains("10.0.2.15/32"));
+        assert!(text.contains("8080"));
+        assert!(text.contains("172.17.0.2:80"));
+
         assert_eq!(
             procfs.step_write_projected(PROCFS_NET_TX_NF_RULES_ID, 0, b"delete 0\n", &guard),
             StepOutcome::Done(9)
+        );
+        assert_eq!(tx_subsystems::net::netfilter_rules_snapshot().len(), 1);
+        assert_eq!(
+            procfs.step_write_projected(PROCFS_NET_TX_NF_RULES_ID, 0, b"flush\n", &guard),
+            StepOutcome::Done(6)
         );
         assert!(tx_subsystems::net::netfilter_rules_snapshot().is_empty());
     }

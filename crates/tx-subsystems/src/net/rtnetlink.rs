@@ -45,6 +45,7 @@ pub const NLMSG_ERROR: u16 = 2;
 pub const NLMSG_DONE: u16 = 3;
 
 pub const RTM_NEWLINK: u16 = 16;
+pub const RTM_DELLINK: u16 = 17;
 pub const RTM_GETLINK: u16 = 18;
 pub const RTM_SETLINK: u16 = 19;
 pub const RTM_NEWADDR: u16 = 20;
@@ -363,6 +364,10 @@ fn handle_one_message<F>(
             let result = handle_newlink(netns, cred, payload);
             responses.push(ack_or_error(header, result));
         }
+        RTM_DELLINK => {
+            let result = handle_dellink(netns, cred, payload);
+            responses.push(ack_or_error(header, result));
+        }
         RTM_SETLINK => {
             let result = handle_setlink(netns, cred, payload, resolve_netns_fd, resolve_netns_pid);
             responses.push(ack_or_error(header, result));
@@ -477,6 +482,13 @@ fn handle_newlink(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Re
     }
 }
 
+fn handle_dellink(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Result<(), Errno> {
+    let auth = require_net_admin(cred)?;
+    let info = parse_ifinfomsg(payload)?;
+    let target = link_target_from_info_or_attrs(netns, &info, &info.attrs)?;
+    netns.delete_device_by_ifindex(auth, target.ifindex)
+}
+
 fn handle_setlink<F>(
     netns: &NetNamespacePayload,
     cred: Cred,
@@ -502,15 +514,16 @@ where
         }
         let master_ifindex = read_u32(master_attr.payload, 0);
         if master_ifindex == 0 {
-            return Err(Errno::ENOSYS);
+            netns.detach_device_from_bridges_by_ifindex(auth, target.ifindex)?;
+        } else {
+            let port = netns
+                .find_device_by_ifindex(target.ifindex)
+                .ok_or(Errno::ENODEV)?;
+            let master = netns
+                .find_device_by_ifindex(master_ifindex)
+                .ok_or(Errno::ENODEV)?;
+            master.ops.bridge_add_port(auth, port)?;
         }
-        let port = netns
-            .find_device_by_ifindex(target.ifindex)
-            .ok_or(Errno::ENODEV)?;
-        let master = netns
-            .find_device_by_ifindex(master_ifindex)
-            .ok_or(Errno::ENODEV)?;
-        master.ops.bridge_add_port(auth, port)?;
     }
 
     if let Some(netns_fd_attr) = attr_by_kind(&info.attrs, IFLA_NET_NS_FD) {

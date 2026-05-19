@@ -4,8 +4,9 @@ use alloc::vec::Vec;
 
 use crate::net::rtnetlink::{
     rtnetlink_handle_request, rtnetlink_handle_request_with_netns_resolver, NLMSG_DONE,
-    NLMSG_ERROR, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST, RTM_DELROUTE, RTM_GETADDR, RTM_GETLINK,
-    RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWLINK, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK,
+    NLMSG_ERROR, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST, RTM_DELLINK, RTM_DELROUTE, RTM_GETADDR,
+    RTM_GETLINK, RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWLINK, RTM_NEWNEIGH, RTM_NEWROUTE,
+    RTM_SETLINK,
 };
 
 const NLM_F_CREATE: u16 = 0x0400;
@@ -486,6 +487,155 @@ fn rtnetlink_setlink_netns_pid_moves_veth_peer_between_namespaces() {
         .links
         .iter()
         .any(|link| link.name == "eth0" && link.kind == NetDeviceKind::Veth));
+}
+
+#[test]
+fn rtnetlink_setlink_master_zero_detaches_bridge_port() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-detach-master")
+        .expect("namespace")
+        .payload_cap()
+        .expect("namespace payload");
+    let root = crate::cred::Cred::root();
+
+    let bridge_req = nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        70,
+        &newlink_payload("docker0", bridge_linkinfo()),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &bridge_req)[0]);
+    let veth_req = nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        71,
+        &newlink_payload("veth0", veth_linkinfo("eth0")),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &veth_req)[0]);
+
+    let snapshot = ns.network_snapshot();
+    let bridge_ifindex = ifindex_for(&snapshot.links, "docker0");
+    let veth_ifindex = ifindex_for(&snapshot.links, "veth0");
+    let mut set_master = ifinfomsg(veth_ifindex, 0, 0);
+    push_attr_u32(&mut set_master, IFLA_MASTER, bridge_ifindex);
+    assert_ack_ok(
+        &rtnetlink_handle_request(
+            &ns,
+            root,
+            &nlmsg(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 72, &set_master),
+        )[0],
+    );
+    assert!(ns
+        .network_snapshot()
+        .links
+        .iter()
+        .any(|link| link.name == "veth0" && link.master == Some("docker0")));
+
+    let mut detach_master = ifinfomsg(veth_ifindex, 0, 0);
+    push_attr_u32(&mut detach_master, IFLA_MASTER, 0);
+    assert_ack_ok(
+        &rtnetlink_handle_request(
+            &ns,
+            root,
+            &nlmsg(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 73, &detach_master),
+        )[0],
+    );
+
+    let snapshot = ns.network_snapshot();
+    assert!(snapshot
+        .links
+        .iter()
+        .any(|link| link.name == "veth0" && link.master.is_none()));
+    assert_eq!(
+        snapshot
+            .bridges
+            .iter()
+            .find(|bridge| bridge.name == "docker0")
+            .expect("docker bridge")
+            .ports,
+        Vec::<&'static str>::new()
+    );
+}
+
+#[test]
+fn rtnetlink_dellink_removes_dynamic_device_routes_and_netfilter_rules() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    reset_netfilter_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-delete-link")
+        .expect("namespace")
+        .payload_cap()
+        .expect("namespace payload");
+    let root = crate::cred::Cred::root();
+
+    let veth_req = nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        80,
+        &newlink_payload("veth-del0", veth_linkinfo("eth-del0")),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &veth_req)[0]);
+
+    let eth_ifindex = ifindex_for(&ns.network_snapshot().links, "eth-del0");
+    let addr_req = nlmsg(
+        RTM_NEWADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        81,
+        &newaddr_payload(eth_ifindex, 16, [172, 17, 0, 2]),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &addr_req)[0]);
+    let route_req = nlmsg(
+        RTM_NEWROUTE,
+        NLM_F_REQUEST | NLM_F_ACK,
+        82,
+        &newroute_payload(0, None, Some([172, 17, 0, 1]), eth_ifindex),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &route_req)[0]);
+    add_masquerade_rule_for_test_or_bootstrap(
+        NetfilterIpv4Cidr {
+            addr: Ipv4Address::new([172, 17, 0, 0]),
+            prefix_len: 16,
+        },
+        "eth-del0",
+    )
+    .expect("masquerade rule");
+    add_dnat_rule_for_test_or_bootstrap(
+        NetfilterConntrackProtocol::Tcp,
+        Ipv4Address::new([10, 0, 2, 15]),
+        8080,
+        Ipv4Address::new([172, 17, 0, 2]),
+        80,
+    )
+    .expect("dnat rule");
+    assert_eq!(netfilter_rules_snapshot().len(), 2);
+    assert!(ns
+        .route_snapshot()
+        .iter()
+        .any(|route| route.oif_name == Some("eth-del0")));
+
+    let del_req = nlmsg(
+        RTM_DELLINK,
+        NLM_F_REQUEST | NLM_F_ACK,
+        83,
+        &ifinfomsg(eth_ifindex, 0, 0),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &del_req)[0]);
+
+    let snapshot = ns.network_snapshot();
+    assert!(snapshot.links.iter().all(|link| link.name != "eth-del0"));
+    assert!(snapshot.links.iter().any(|link| link.name == "veth-del0"));
+    assert!(ns
+        .route_snapshot()
+        .iter()
+        .all(|route| route.oif_name != Some("eth-del0")));
+    assert!(netfilter_rules_snapshot().is_empty());
 }
 
 #[test]
