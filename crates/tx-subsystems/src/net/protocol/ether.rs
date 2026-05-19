@@ -352,6 +352,14 @@ impl EtherIface {
         self.pending_arp.lock().clear();
     }
 
+    pub fn accepts_ethernet_destination_addr(&self, dst: EthernetAddress) -> bool {
+        self.accepts_ethernet_destination(to_smoltcp_ether(dst))
+    }
+
+    pub fn accepts_ipv4_destination_addr(&self, dst: Ipv4Address) -> bool {
+        self.accepts_ipv4_destination(dst)
+    }
+
     fn process_arp(
         &self,
         payload: &[u8],

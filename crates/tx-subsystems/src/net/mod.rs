@@ -62,8 +62,10 @@ pub use namespace::{
     create_isolated_net_namespace, drive_all_net_namespace_runtimes_at,
     drive_net_namespace_runtime_at, initial_loopback_iface, initial_net_namespace,
     initial_net_namespace_payload, net_namespace_open_file_from_payload,
-    net_namespace_payload_from_file, NetNamespaceBridgeInfo, NetNamespaceIdentity,
-    NetNamespaceLinkInfo, NetNamespacePayload, NetNamespaceRuntimeOutcome, NetNamespaceSnapshot,
+    net_namespace_payload_from_file, NetNamespaceBridgeInfo, NetNamespaceForwardOutcome,
+    NetNamespaceIdentity, NetNamespaceLinkInfo, NetNamespacePayload, NetNamespaceRouteConfig,
+    NetNamespaceRouteDecision, NetNamespaceRouteInfo, NetNamespaceRouteKind,
+    NetNamespaceRouteSelector, NetNamespaceRuntimeOutcome, NetNamespaceSnapshot,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use namespace::{create_isolated_net_namespace_for_test, reset_initial_net_namespace_for_test};
@@ -88,8 +90,8 @@ pub use rtnetlink::{
     netlink_route_send_with_netns_resolvers, rtnetlink_handle_request,
     rtnetlink_handle_request_with_netns_resolver, rtnetlink_handle_request_with_netns_resolvers,
     NetlinkRouteState, RawNetlinkRouteSocket, AF_NETLINK, NETLINK_ROUTE, NLMSG_DONE, NLMSG_ERROR,
-    NLM_F_ACK, NLM_F_DUMP, NLM_F_MULTI, NLM_F_REQUEST, RTM_GETADDR, RTM_GETLINK, RTM_GETNEIGH,
-    RTM_GETROUTE, RTM_NEWADDR, RTM_NEWLINK, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK,
+    NLM_F_ACK, NLM_F_DUMP, NLM_F_MULTI, NLM_F_REQUEST, RTM_DELROUTE, RTM_GETADDR, RTM_GETLINK,
+    RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWLINK, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK,
 };
 pub use structure::{
     AcceptWireSet, AddressFamily, ConnectionKey, InitialSocketTableProxy, IpEndpoint,

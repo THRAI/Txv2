@@ -609,6 +609,156 @@ fn namespace_runtime_drives_container_ping_container_through_bridge() {
 }
 
 #[test]
+fn namespace_runtime_forwards_container_external_ipv4_to_uplink_route() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+
+    let guard = tx_substrate::epoch::guard();
+    let now = smoltcp::time::Instant::ZERO;
+    let host = crate::net::create_isolated_net_namespace_for_test("runtime-forward-host")
+        .expect("host namespace")
+        .payload_cap()
+        .expect("host payload");
+    let container = crate::net::create_isolated_net_namespace_for_test("runtime-forward-container")
+        .expect("container namespace")
+        .payload_cap()
+        .expect("container payload");
+    let bridge = new_test_bridge("docker-forward0", 99);
+    let container_pair = new_bridge_veth_pair("eth-forward0", "veth-forward0", 99);
+    let uplink_pair = new_bridge_veth_pair("uplink-forward0", "gw-forward0", 100);
+
+    bridge
+        .device
+        .add_port_for_test_or_bootstrap(container_pair.right)
+        .expect("bridge port");
+    host.attach_device_for_test_or_bootstrap(bridge.registration, None)
+        .expect("attach docker0");
+    host.attach_device_for_test_or_bootstrap(container_pair.right, None)
+        .expect("attach host veth");
+    host.attach_device_for_test_or_bootstrap(uplink_pair.left, None)
+        .expect("attach uplink");
+    container
+        .attach_device_for_test_or_bootstrap(container_pair.left, None)
+        .expect("attach container eth");
+
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    let docker_ip = Ipv4Address::new([172, 17, 0, 1]);
+    let container_ip = Ipv4Address::new([172, 17, 0, 2]);
+    let uplink_ip = Ipv4Address::new([10, 0, 2, 15]);
+    let uplink_gw = Ipv4Address::new([10, 0, 2, 2]);
+    let external_ip = Ipv4Address::new([8, 8, 8, 8]);
+
+    let docker_ifindex = bridge_ifindex_for(&host.link_snapshot(), "docker-forward0");
+    host.set_device_ipv4_addr_by_ifindex(auth, docker_ifindex, Some(docker_ip), Some(16))
+        .expect("set docker0 addr");
+    let uplink_ifindex = bridge_ifindex_for(&host.link_snapshot(), "uplink-forward0");
+    host.set_device_ipv4_addr_by_ifindex(auth, uplink_ifindex, Some(uplink_ip), Some(24))
+        .expect("set uplink addr");
+    host.add_ipv4_route(
+        auth,
+        crate::net::NetNamespaceRouteConfig {
+            dst: Ipv4Address::UNSPECIFIED,
+            prefix_len: 0,
+            gateway: Some(uplink_gw),
+            oif_name: Some("uplink-forward0"),
+            preferred_src: Some(uplink_ip),
+            table: 254,
+            protocol: 4,
+            scope: 0,
+            route_type: 1,
+        },
+    )
+    .expect("host default route");
+    host.set_ipv4_forwarding_for_test_or_bootstrap(true);
+    host.ether_ifaces_snapshot()
+        .into_iter()
+        .find(|iface| iface.name == "uplink-forward0")
+        .expect("uplink iface")
+        .install_arp_for_test_or_bootstrap(
+            uplink_gw,
+            uplink_pair.right.ops.mac_addr(),
+            smoltcp::time::Instant::from_secs(60),
+        );
+
+    let eth_ifindex = bridge_ifindex_for(&container.link_snapshot(), "eth-forward0");
+    container
+        .set_device_ipv4_addr_by_ifindex(auth, eth_ifindex, Some(container_ip), Some(16))
+        .expect("set container addr");
+    container
+        .add_ipv4_route(
+            auth,
+            crate::net::NetNamespaceRouteConfig {
+                dst: Ipv4Address::UNSPECIFIED,
+                prefix_len: 0,
+                gateway: Some(docker_ip),
+                oif_name: Some("eth-forward0"),
+                preferred_src: Some(container_ip),
+                table: 254,
+                protocol: 4,
+                scope: 0,
+                route_type: 1,
+            },
+        )
+        .expect("container default route");
+
+    let raw = match crate::net::step_socket_create_in_namespace(
+        ValidSocketType::validate(2, 3, 1).expect("AF_INET SOCK_RAW ICMP"),
+        container.clone(),
+        &guard,
+    ) {
+        StepOutcome::Done(socket) => socket,
+        other => panic!("raw icmp socket create failed: {other:?}"),
+    };
+    let echo = Icmpv4EchoPacket {
+        src: Ipv4Address::UNSPECIFIED,
+        dst: external_ip,
+        ident: 0x72f0,
+        seq_no: 1,
+        payload: b"forward".to_vec(),
+    };
+    let message = crate::net::protocol::build_icmpv4_echo_request_message(&echo);
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &raw,
+            Some(IpEndpoint::new(external_ip, 0)),
+            &message,
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(message.len())
+    );
+
+    let mut total = crate::net::NetNamespaceRuntimeOutcome::default();
+    let mut forwarded = None;
+    for _ in 0..12 {
+        let outcome = crate::net::drive_all_net_namespace_runtimes_at(now, &guard);
+        total.merge(outcome);
+        if let Some(frame) = uplink_pair.right.ops.receive() {
+            forwarded = Some(frame);
+            break;
+        }
+    }
+
+    let frame = forwarded.expect("external uplink should receive forwarded frame");
+    let ethernet =
+        smoltcp::wire::EthernetFrame::new_checked(frame.as_bytes()).expect("ethernet frame");
+    assert_eq!(
+        EthernetAddress::new(ethernet.dst_addr().0),
+        uplink_pair.right.ops.mac_addr()
+    );
+    let ipv4 = smoltcp::wire::Ipv4Packet::new_checked(ethernet.payload()).expect("ipv4 packet");
+    assert_eq!(Ipv4Address::new(ipv4.dst_addr().octets()), external_ip);
+    assert_eq!(Ipv4Address::new(ipv4.src_addr().octets()), container_ip);
+    assert!(
+        total.ipv4_forwarded >= 1,
+        "runtime outcome should record forwarding: {total:?}"
+    );
+}
+
+#[test]
 fn bridge_add_port_requires_cap_net_admin_authority() {
     let bridge = new_test_bridge("docker2", 86);
     let pair = new_bridge_veth_pair("ct-a2", "veth-a2", 86);

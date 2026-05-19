@@ -1,7 +1,9 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::cell::Cell;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use smoltcp::time::Instant;
+use smoltcp::wire::{EthernetFrame, EthernetProtocol, Ipv4Packet};
 use tx_substrate::zone::{
     self, register_zone_for, Cap, Dead, Entity, PayloadCap, PayloadPolicy, Zone, ZoneAllocated,
     ZoneError,
@@ -17,8 +19,9 @@ use crate::net::execution::{
     step_flush_pending_arp, step_process_device_tx_pending_in_namespace_at,
     step_process_network_events_in_namespace_at, ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome,
 };
+use crate::net::packet::{PacketDispatch, PacketSource, PacketTxResult};
 use crate::net::protocol::{
-    loopback_iface, EtherIface, EtherPacketSource, EtherPacketTxSink, IfaceCommon, LoopbackIface,
+    loopback_iface, EtherIface, EtherPacketTxSink, IfaceCommon, LoopbackIface,
 };
 use crate::net::structure::{Ipv4Address, SocketTable};
 use crate::sync::SpinMutex;
@@ -50,7 +53,9 @@ pub struct NetNamespacePayload {
     loopback_iface: &'static LoopbackIface,
     host_devices_visible: bool,
     namespace_devices: SpinMutex<Vec<NetNamespaceDeviceLink>>,
+    routes: SpinMutex<Vec<NetNamespaceRouteEntry>>,
     iface_runtime: SpinMutex<Vec<NetNamespaceIfaceRuntime>>,
+    ipv4_forwarding: AtomicBool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +85,57 @@ pub struct NetNamespaceSnapshot {
     pub bridges: Vec<NetNamespaceBridgeInfo>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetNamespaceRouteKind {
+    Connected,
+    Static,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetNamespaceRouteInfo {
+    pub kind: NetNamespaceRouteKind,
+    pub dst: Ipv4Address,
+    pub prefix_len: u8,
+    pub gateway: Option<Ipv4Address>,
+    pub oif_name: Option<&'static str>,
+    pub preferred_src: Option<Ipv4Address>,
+    pub table: u8,
+    pub protocol: u8,
+    pub scope: u8,
+    pub route_type: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetNamespaceRouteConfig {
+    pub dst: Ipv4Address,
+    pub prefix_len: u8,
+    pub gateway: Option<Ipv4Address>,
+    pub oif_name: Option<&'static str>,
+    pub preferred_src: Option<Ipv4Address>,
+    pub table: u8,
+    pub protocol: u8,
+    pub scope: u8,
+    pub route_type: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetNamespaceRouteSelector {
+    pub dst: Ipv4Address,
+    pub prefix_len: u8,
+    pub gateway: Option<Ipv4Address>,
+    pub oif_name: Option<&'static str>,
+    pub table: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetNamespaceRouteDecision {
+    pub oif_name: &'static str,
+    pub next_hop: Ipv4Address,
+    pub preferred_src: Option<Ipv4Address>,
+    pub prefix_len: u8,
+    pub kind: NetNamespaceRouteKind,
+}
+
 #[derive(Clone, Copy)]
 struct NetNamespaceDeviceLink {
     registration: &'static NetDeviceRegistration,
@@ -93,7 +149,28 @@ struct NetNamespaceIfaceRuntime {
     registration: &'static NetDeviceRegistration,
     ipv4_addr: Ipv4Address,
     ipv4_prefix_len: u8,
+    gateway: Option<Ipv4Address>,
     iface: &'static EtherIface,
+}
+
+#[derive(Clone, Copy)]
+struct NetNamespaceRouteEntry {
+    dst: Ipv4Address,
+    prefix_len: u8,
+    gateway: Option<Ipv4Address>,
+    oif_name: Option<&'static str>,
+    preferred_src: Option<Ipv4Address>,
+    table: u8,
+    protocol: u8,
+    scope: u8,
+    route_type: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NetNamespaceForwardOutcome {
+    pub forwarded: usize,
+    pub pending_resolution: usize,
+    pub dropped: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -112,6 +189,9 @@ pub struct NetNamespaceRuntimeOutcome {
     pub device_tx_pending_resolution: usize,
     pub device_tx_failed: usize,
     pub arp_sent: usize,
+    pub ipv4_forwarded: usize,
+    pub ipv4_forward_pending_resolution: usize,
+    pub ipv4_forward_dropped: usize,
 }
 
 // SAFETY: `NET_NAMESPACE_IDENTITY_ZONE` is the single process-wide
@@ -178,7 +258,9 @@ impl NetNamespacePayload {
             loopback_iface,
             host_devices_visible,
             namespace_devices: SpinMutex::new(Vec::new()),
+            routes: SpinMutex::new(Vec::new()),
             iface_runtime: SpinMutex::new(Vec::new()),
+            ipv4_forwarding: AtomicBool::new(false),
         }
     }
 
@@ -353,6 +435,101 @@ impl NetNamespacePayload {
         }
     }
 
+    pub fn route_snapshot(&self) -> Vec<NetNamespaceRouteInfo> {
+        let mut routes = Vec::new();
+        for link in self.link_snapshot() {
+            if link.is_loopback {
+                continue;
+            }
+            let Some(addr) = link.ipv4_addr else {
+                continue;
+            };
+            let prefix_len = link.ipv4_prefix_len.unwrap_or(32).min(32);
+            routes.push(NetNamespaceRouteInfo {
+                kind: NetNamespaceRouteKind::Connected,
+                dst: ipv4_network(addr, prefix_len),
+                prefix_len,
+                gateway: None,
+                oif_name: Some(link.name),
+                preferred_src: Some(addr),
+                table: 254,
+                protocol: 2,
+                scope: 253,
+                route_type: 1,
+            });
+        }
+
+        routes.extend(
+            self.routes
+                .lock()
+                .iter()
+                .map(NetNamespaceRouteEntry::as_info),
+        );
+        routes.sort_by_key(|route| {
+            (
+                core::cmp::Reverse(route.prefix_len),
+                route.dst,
+                route.gateway.unwrap_or(Ipv4Address::UNSPECIFIED),
+                route.oif_name.unwrap_or(""),
+            )
+        });
+        routes
+    }
+
+    pub fn add_ipv4_route(
+        &self,
+        _authority: NetAdminAuthority,
+        route: NetNamespaceRouteConfig,
+    ) -> Result<(), Errno> {
+        validate_route_config(route)?;
+        if let Some(name) = route.oif_name {
+            self.find_device_by_name(name).ok_or(Errno::ENODEV)?;
+        }
+
+        let entry = NetNamespaceRouteEntry::from_config(route);
+        let mut routes = self.routes.lock();
+        if routes.iter().any(|existing| existing.same_key(entry)) {
+            return Err(Errno::EEXIST);
+        }
+        routes.push(entry);
+        Ok(())
+    }
+
+    pub fn delete_ipv4_route(
+        &self,
+        _authority: NetAdminAuthority,
+        selector: NetNamespaceRouteSelector,
+    ) -> Result<(), Errno> {
+        if selector.prefix_len > 32 {
+            return Err(Errno::EINVAL);
+        }
+        let mut routes = self.routes.lock();
+        let Some(idx) = routes
+            .iter()
+            .position(|route| route.matches_selector(selector))
+        else {
+            return Err(Errno::ENOENT);
+        };
+        routes.remove(idx);
+        Ok(())
+    }
+
+    pub fn set_ipv4_forwarding_for_test_or_bootstrap(&self, enabled: bool) {
+        self.ipv4_forwarding.store(enabled, Ordering::Release);
+    }
+
+    pub fn ipv4_forwarding_enabled(&self) -> bool {
+        self.ipv4_forwarding.load(Ordering::Acquire)
+    }
+
+    pub fn best_ipv4_route(&self, dst: Ipv4Address) -> Option<NetNamespaceRouteDecision> {
+        self.route_snapshot()
+            .into_iter()
+            .filter(|route| route_matches_ipv4(*route, dst))
+            .filter_map(|route| self.route_decision_for_info(route, dst))
+            .max_by_key(|decision| decision.prefix_len)
+    }
+
     pub fn ether_ifaces_snapshot(&self) -> Vec<&'static EtherIface> {
         self.configured_ether_ifaces()
     }
@@ -370,6 +547,58 @@ impl NetNamespacePayload {
             .find(|link| link.ifindex == ifindex)?
             .name;
         self.find_device_by_name(name)
+    }
+
+    fn route_decision_for_info(
+        &self,
+        route: NetNamespaceRouteInfo,
+        dst: Ipv4Address,
+    ) -> Option<NetNamespaceRouteDecision> {
+        let oif_name = route.oif_name.or_else(|| {
+            route
+                .gateway
+                .and_then(|gateway| self.oif_for_gateway(gateway))
+        })?;
+        if !self.link_snapshot().into_iter().any(|link| {
+            link.name == oif_name && link.is_up && link.ipv4_addr.is_some() && !link.is_loopback
+        }) {
+            return None;
+        }
+        Some(NetNamespaceRouteDecision {
+            oif_name,
+            next_hop: route.gateway.unwrap_or(dst),
+            preferred_src: route.preferred_src,
+            prefix_len: route.prefix_len,
+            kind: route.kind,
+        })
+    }
+
+    fn oif_for_gateway(&self, gateway: Ipv4Address) -> Option<&'static str> {
+        self.route_snapshot()
+            .into_iter()
+            .filter(|route| route.kind == NetNamespaceRouteKind::Connected)
+            .filter(|route| route_matches_ipv4(*route, gateway))
+            .max_by_key(|route| route.prefix_len)
+            .and_then(|route| route.oif_name)
+    }
+
+    fn gateway_for_device(&self, name: &'static str) -> Option<Ipv4Address> {
+        let routes = self.routes.lock().clone();
+        routes.iter().find_map(|route| {
+            let gateway = route.gateway?;
+            if route.prefix_len == 0
+                && (route.oif_name == Some(name)
+                    || route
+                        .oif_name
+                        .is_none()
+                        .then(|| self.oif_for_gateway(gateway) == Some(name))
+                        .unwrap_or(false))
+            {
+                Some(gateway)
+            } else {
+                None
+            }
+        })
     }
 
     pub fn set_device_up_by_ifindex(
@@ -495,21 +724,24 @@ impl NetNamespacePayload {
     ) -> Option<&'static EtherIface> {
         let ipv4_addr = link.ipv4_addr?;
         let ipv4_prefix_len = link.ipv4_prefix_len.unwrap_or(32).min(32);
+        let gateway = self.gateway_for_device(link.name);
         let mut runtime = self.iface_runtime.lock();
 
         if let Some(entry) = runtime.iter().find(|entry| {
             entry.registration.devt == registration.devt
                 && entry.ipv4_addr == ipv4_addr
                 && entry.ipv4_prefix_len == ipv4_prefix_len
+                && entry.gateway == gateway
         }) {
             return Some(entry.iface);
         }
 
         let iface = Box::leak(Box::new(EtherIface::new(
             registration,
-            IfaceCommon::new(
+            IfaceCommon::with_gateway(
                 ipv4_addr,
                 prefix_len_to_netmask(ipv4_prefix_len),
+                gateway,
                 registration.ops.mtu(),
             ),
             registration.ops.mac_addr(),
@@ -524,6 +756,7 @@ impl NetNamespacePayload {
                 registration,
                 ipv4_addr,
                 ipv4_prefix_len,
+                gateway,
                 iface,
             };
         } else {
@@ -531,6 +764,7 @@ impl NetNamespacePayload {
                 registration,
                 ipv4_addr,
                 ipv4_prefix_len,
+                gateway,
                 iface,
             });
         }
@@ -566,6 +800,68 @@ fn bridge_master_for(
         .map(|bridge| bridge.name)
 }
 
+struct NamespaceEtherPacketSource<'a> {
+    namespace: &'a NetNamespacePayload,
+    iface: &'a EtherIface,
+    forwarded: Cell<usize>,
+    pending_resolution: Cell<usize>,
+    dropped: Cell<usize>,
+}
+
+impl<'a> NamespaceEtherPacketSource<'a> {
+    fn new(namespace: &'a NetNamespacePayload, iface: &'a EtherIface) -> Self {
+        Self {
+            namespace,
+            iface,
+            forwarded: Cell::new(0),
+            pending_resolution: Cell::new(0),
+            dropped: Cell::new(0),
+        }
+    }
+
+    fn record_forwarding(&self, outcome: NetNamespaceForwardOutcome) {
+        self.forwarded
+            .set(self.forwarded.get().saturating_add(outcome.forwarded));
+        self.pending_resolution.set(
+            self.pending_resolution
+                .get()
+                .saturating_add(outcome.pending_resolution),
+        );
+        self.dropped
+            .set(self.dropped.get().saturating_add(outcome.dropped));
+    }
+
+    fn forwarding_outcome(&self) -> NetNamespaceForwardOutcome {
+        NetNamespaceForwardOutcome {
+            forwarded: self.forwarded.get(),
+            pending_resolution: self.pending_resolution.get(),
+            dropped: self.dropped.get(),
+        }
+    }
+}
+
+impl PacketSource for NamespaceEtherPacketSource<'_> {
+    fn next_packet(&self) -> Option<PacketDispatch> {
+        let frame = self.iface.netdev.ops.receive()?;
+        Some(
+            self.iface
+                .process_frame_at(frame, Instant::ZERO, Option::<&Guard<'_>>::None),
+        )
+    }
+
+    fn next_packet_at(&self, now: Instant, guard: &Guard<'_>) -> Option<PacketDispatch> {
+        let frame = self.iface.netdev.ops.receive()?;
+        if let Some(outcome) = self
+            .namespace
+            .try_forward_ingress_frame(self.iface, &frame, now, guard)
+        {
+            self.record_forwarding(outcome);
+            return Some(PacketDispatch::Unsupported);
+        }
+        Some(self.iface.process_frame_at(frame, now, Some(guard)))
+    }
+}
+
 pub fn drive_all_net_namespace_runtimes_at(
     now: Instant,
     guard: &Guard<'_>,
@@ -593,7 +889,7 @@ pub fn drive_net_namespace_runtime_at(
     for iface in net_namespace.configured_ether_ifaces() {
         outcome.ifaces_seen += 1;
 
-        let source = EtherPacketSource { iface };
+        let source = NamespaceEtherPacketSource::new(&net_namespace, iface);
         if let StepOutcome::Done(events) =
             step_process_network_events_in_namespace_at(&source, net_namespace.clone(), now, guard)
         {
@@ -601,6 +897,7 @@ pub fn drive_net_namespace_runtime_at(
             outcome.sockets_touched += events.sockets_touched;
             outcome.wakes_fired += events.wakes_fired;
         }
+        outcome.merge_forwarding(source.forwarding_outcome());
 
         let sink = EtherPacketTxSink { iface };
         if let StepOutcome::Done(device_tx) = step_process_device_tx_pending_in_namespace_at(
@@ -623,6 +920,89 @@ pub fn drive_net_namespace_runtime_at(
 }
 
 impl NetNamespacePayload {
+    fn try_forward_ingress_frame(
+        &self,
+        ingress: &EtherIface,
+        frame: &crate::net::packet::RxFrame,
+        now: Instant,
+        guard: &Guard<'_>,
+    ) -> Option<NetNamespaceForwardOutcome> {
+        let ethernet = EthernetFrame::new_checked(frame.as_bytes()).ok()?;
+        if !ingress.accepts_ethernet_destination_addr(EthernetAddress::new(ethernet.dst_addr().0)) {
+            return None;
+        }
+        if ethernet.ethertype() != EthernetProtocol::Ipv4 {
+            return None;
+        }
+        let ipv4 = Ipv4Packet::new_checked(ethernet.payload()).ok()?;
+        let dst = Ipv4Address::new(ipv4.dst_addr().octets());
+        if self.is_local_ipv4_destination(dst) {
+            return None;
+        }
+        if !self.ipv4_forwarding_enabled() {
+            return Some(NetNamespaceForwardOutcome {
+                dropped: 1,
+                ..NetNamespaceForwardOutcome::default()
+            });
+        }
+        Some(self.forward_ipv4_packet_from_iface(ingress.name, ethernet.payload(), dst, now, guard))
+    }
+
+    fn forward_ipv4_packet_from_iface(
+        &self,
+        ingress_name: &'static str,
+        packet: &[u8],
+        dst: Ipv4Address,
+        now: Instant,
+        guard: &Guard<'_>,
+    ) -> NetNamespaceForwardOutcome {
+        let Some(route) = self.best_ipv4_route(dst) else {
+            return NetNamespaceForwardOutcome {
+                dropped: 1,
+                ..NetNamespaceForwardOutcome::default()
+            };
+        };
+        if route.oif_name == ingress_name {
+            return NetNamespaceForwardOutcome {
+                dropped: 1,
+                ..NetNamespaceForwardOutcome::default()
+            };
+        }
+        let Some(egress) = self
+            .configured_ether_ifaces()
+            .into_iter()
+            .find(|iface| iface.name == route.oif_name)
+        else {
+            return NetNamespaceForwardOutcome {
+                dropped: 1,
+                ..NetNamespaceForwardOutcome::default()
+            };
+        };
+
+        match egress.dispatch_ip_at(packet, now, guard) {
+            PacketTxResult::Accepted { .. } => NetNamespaceForwardOutcome {
+                forwarded: 1,
+                ..NetNamespaceForwardOutcome::default()
+            },
+            PacketTxResult::PendingResolution { .. } => NetNamespaceForwardOutcome {
+                pending_resolution: 1,
+                ..NetNamespaceForwardOutcome::default()
+            },
+            PacketTxResult::Busy | PacketTxResult::Failed { .. } => NetNamespaceForwardOutcome {
+                dropped: 1,
+                ..NetNamespaceForwardOutcome::default()
+            },
+        }
+    }
+
+    fn is_local_ipv4_destination(&self, dst: Ipv4Address) -> bool {
+        dst == Ipv4Address::BROADCAST
+            || self
+                .link_snapshot()
+                .into_iter()
+                .any(|link| link.ipv4_addr == Some(dst))
+    }
+
     fn poll_bridges(&self, guard: &Guard<'_>) -> BridgeForwardOutcome {
         let mut outcome = BridgeForwardOutcome::default();
         for registration in self.device_snapshot() {
@@ -649,6 +1029,8 @@ impl NetNamespaceRuntimeOutcome {
             || self.device_tx_packets != 0
             || self.device_tx_pending_resolution != 0
             || self.arp_sent != 0
+            || self.ipv4_forwarded != 0
+            || self.ipv4_forward_pending_resolution != 0
             || self.sockets_touched != 0
             || self.wakes_fired != 0
     }
@@ -668,6 +1050,9 @@ impl NetNamespaceRuntimeOutcome {
         self.device_tx_pending_resolution += other.device_tx_pending_resolution;
         self.device_tx_failed += other.device_tx_failed;
         self.arp_sent += other.arp_sent;
+        self.ipv4_forwarded += other.ipv4_forwarded;
+        self.ipv4_forward_pending_resolution += other.ipv4_forward_pending_resolution;
+        self.ipv4_forward_dropped += other.ipv4_forward_dropped;
     }
 
     fn merge_bridge(&mut self, bridge: BridgeForwardOutcome) {
@@ -694,6 +1079,12 @@ impl NetNamespaceRuntimeOutcome {
     fn merge_arp_flush(&mut self, arp_flush: ArpFlushOutcome) {
         self.arp_sent += arp_flush.sent;
     }
+
+    fn merge_forwarding(&mut self, forwarding: NetNamespaceForwardOutcome) {
+        self.ipv4_forwarded += forwarding.forwarded;
+        self.ipv4_forward_pending_resolution += forwarding.pending_resolution;
+        self.ipv4_forward_dropped += forwarding.dropped;
+    }
 }
 
 fn prefix_len_to_netmask(prefix_len: u8) -> Ipv4Address {
@@ -704,6 +1095,94 @@ fn prefix_len_to_netmask(prefix_len: u8) -> Ipv4Address {
         u32::MAX << (32 - u32::from(prefix_len))
     };
     Ipv4Address::new(mask.to_be_bytes())
+}
+
+fn validate_route_config(route: NetNamespaceRouteConfig) -> Result<(), Errno> {
+    if route.prefix_len > 32 {
+        return Err(Errno::EINVAL);
+    }
+    if route.gateway.is_none() && route.oif_name.is_none() {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
+fn route_matches_ipv4(route: NetNamespaceRouteInfo, dst: Ipv4Address) -> bool {
+    ipv4_prefix_matches(dst, route.dst, route.prefix_len)
+}
+
+fn ipv4_network(addr: Ipv4Address, prefix_len: u8) -> Ipv4Address {
+    let prefix_len = prefix_len.min(32);
+    let mask = prefix_mask(prefix_len);
+    Ipv4Address::new((ipv4_to_u32(addr) & mask).to_be_bytes())
+}
+
+fn ipv4_prefix_matches(addr: Ipv4Address, network: Ipv4Address, prefix_len: u8) -> bool {
+    let mask = prefix_mask(prefix_len.min(32));
+    (ipv4_to_u32(addr) & mask) == (ipv4_to_u32(network) & mask)
+}
+
+fn prefix_mask(prefix_len: u8) -> u32 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix_len))
+    }
+}
+
+fn ipv4_to_u32(addr: Ipv4Address) -> u32 {
+    u32::from_be_bytes(addr.octets())
+}
+
+impl NetNamespaceRouteEntry {
+    fn from_config(config: NetNamespaceRouteConfig) -> Self {
+        Self {
+            dst: ipv4_network(config.dst, config.prefix_len),
+            prefix_len: config.prefix_len,
+            gateway: config.gateway,
+            oif_name: config.oif_name,
+            preferred_src: config.preferred_src,
+            table: config.table,
+            protocol: config.protocol,
+            scope: config.scope,
+            route_type: config.route_type,
+        }
+    }
+
+    fn as_info(&self) -> NetNamespaceRouteInfo {
+        NetNamespaceRouteInfo {
+            kind: NetNamespaceRouteKind::Static,
+            dst: self.dst,
+            prefix_len: self.prefix_len,
+            gateway: self.gateway,
+            oif_name: self.oif_name,
+            preferred_src: self.preferred_src,
+            table: self.table,
+            protocol: self.protocol,
+            scope: self.scope,
+            route_type: self.route_type,
+        }
+    }
+
+    fn same_key(&self, other: Self) -> bool {
+        self.dst == other.dst
+            && self.prefix_len == other.prefix_len
+            && self.gateway == other.gateway
+            && self.oif_name == other.oif_name
+            && self.table == other.table
+    }
+
+    fn matches_selector(&self, selector: NetNamespaceRouteSelector) -> bool {
+        self.dst == ipv4_network(selector.dst, selector.prefix_len)
+            && self.prefix_len == selector.prefix_len
+            && self.table == selector.table
+            && selector
+                .gateway
+                .map_or(true, |gateway| self.gateway == Some(gateway))
+            && selector
+                .oif_name
+                .map_or(true, |oif_name| self.oif_name == Some(oif_name))
+    }
 }
 
 fn remember_net_namespace_payload(payload: PayloadCap<NetNamespacePayload>) {

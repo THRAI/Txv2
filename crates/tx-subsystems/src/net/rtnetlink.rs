@@ -23,7 +23,10 @@ use crate::net::device::{
     create_bridge_for_test_or_bootstrap, create_veth_pair_for_test_or_bootstrap, BridgeConfig,
     EthernetAddress, NetDeviceKind, VethEndpointConfig, VethPairConfig, VETH_DEFAULT_MTU,
 };
-use crate::net::namespace::{NetNamespaceLinkInfo, NetNamespacePayload};
+use crate::net::namespace::{
+    NetNamespaceLinkInfo, NetNamespacePayload, NetNamespaceRouteConfig, NetNamespaceRouteInfo,
+    NetNamespaceRouteSelector,
+};
 use crate::net::protocol::ArpSnapshotState;
 use crate::net::structure::{Ipv4Address, RecvWireSet, SendRecvFlags, SocketIdentity, SocketKind};
 use crate::sync::SpinMutex;
@@ -47,6 +50,7 @@ pub const RTM_SETLINK: u16 = 19;
 pub const RTM_NEWADDR: u16 = 20;
 pub const RTM_GETADDR: u16 = 22;
 pub const RTM_NEWROUTE: u16 = 24;
+pub const RTM_DELROUTE: u16 = 25;
 pub const RTM_GETROUTE: u16 = 26;
 pub const RTM_NEWNEIGH: u16 = 28;
 pub const RTM_GETNEIGH: u16 = 30;
@@ -86,13 +90,15 @@ const IFA_LABEL: u16 = 3;
 
 const RTA_DST: u16 = 1;
 const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
 const RTA_PREFSRC: u16 = 7;
 
 const NDA_DST: u16 = 1;
 const NDA_LLADDR: u16 = 2;
 
 const RT_TABLE_MAIN: u8 = 254;
-const RTPROT_KERNEL: u8 = 2;
+const RTPROT_STATIC: u8 = 4;
+const RT_SCOPE_UNIVERSE: u8 = 0;
 const RT_SCOPE_LINK: u8 = 253;
 const RTN_UNICAST: u8 = 1;
 
@@ -365,6 +371,14 @@ fn handle_one_message<F>(
             let result = handle_newaddr(netns, cred, payload);
             responses.push(ack_or_error(header, result));
         }
+        RTM_NEWROUTE => {
+            let result = handle_newroute(netns, cred, payload);
+            responses.push(ack_or_error(header, result));
+        }
+        RTM_DELROUTE => {
+            let result = handle_delroute(netns, cred, payload);
+            responses.push(ack_or_error(header, result));
+        }
         _ => responses.push(build_error_response(Some(header), Errno::EOPNOTSUPP)),
     }
 }
@@ -404,17 +418,16 @@ fn render_getaddr_dump(netns: &NetNamespacePayload, header: NlMsgHeader) -> Vec<
 }
 
 fn render_getroute_dump(netns: &NetNamespacePayload, header: NlMsgHeader) -> Vec<Vec<u8>> {
-    let snapshot = netns.network_snapshot();
+    let links = netns.link_snapshot();
     let mut out = Vec::new();
-    for link in &snapshot.links {
-        if link.ipv4_addr.is_some() && !link.is_loopback {
-            out.push(build_route_message(
-                header.seq,
-                header.pid,
-                NLM_F_MULTI,
-                link,
-            ));
-        }
+    for route in netns.route_snapshot() {
+        out.push(build_route_message(
+            header.seq,
+            header.pid,
+            NLM_F_MULTI,
+            route,
+            &links,
+        ));
     }
     out.push(build_done_message(header.seq, header.pid));
     out
@@ -560,6 +573,18 @@ fn handle_newaddr(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Re
     netns.set_device_ipv4_addr_by_ifindex(auth, ifindex, Some(addr), Some(info.prefix_len))
 }
 
+fn handle_newroute(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Result<(), Errno> {
+    let auth = require_net_admin(cred)?;
+    let route = parse_route_config(netns, payload)?;
+    netns.add_ipv4_route(auth, route)
+}
+
+fn handle_delroute(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Result<(), Errno> {
+    let auth = require_net_admin(cred)?;
+    let selector = parse_route_selector(netns, payload)?;
+    netns.delete_ipv4_route(auth, selector)
+}
+
 fn create_bridge_link(
     netns: &NetNamespacePayload,
     auth: NetAdminAuthority,
@@ -680,25 +705,37 @@ fn build_addr_message(seq: u32, pid: u32, flags: u16, link: &NetNamespaceLinkInf
     build_nlmsg(RTM_NEWADDR, flags, seq, pid, &payload)
 }
 
-fn build_route_message(seq: u32, pid: u32, flags: u16, link: &NetNamespaceLinkInfo) -> Vec<u8> {
-    let Some(addr) = link.ipv4_addr else {
-        return build_done_message(seq, pid);
-    };
-    let prefix_len = link.ipv4_prefix_len.unwrap_or(32).min(32);
-    let dst = ipv4_network(addr, prefix_len);
+fn build_route_message(
+    seq: u32,
+    pid: u32,
+    flags: u16,
+    route: NetNamespaceRouteInfo,
+    links: &[NetNamespaceLinkInfo],
+) -> Vec<u8> {
     let mut payload = Vec::with_capacity(RTMSG_LEN + 32);
     payload.push(AF_INET);
-    payload.push(prefix_len);
+    payload.push(route.prefix_len);
     payload.push(0);
     payload.push(0);
-    payload.push(RT_TABLE_MAIN);
-    payload.push(RTPROT_KERNEL);
-    payload.push(RT_SCOPE_LINK);
-    payload.push(RTN_UNICAST);
+    payload.push(route.table);
+    payload.push(route.protocol);
+    payload.push(route.scope);
+    payload.push(route.route_type);
     payload.extend_from_slice(&0u32.to_le_bytes());
-    push_attr(&mut payload, RTA_DST, &dst.octets());
-    push_attr_u32(&mut payload, RTA_OIF, link.ifindex);
-    push_attr(&mut payload, RTA_PREFSRC, &addr.octets());
+    if route.prefix_len != 0 {
+        push_attr(&mut payload, RTA_DST, &route.dst.octets());
+    }
+    if let Some(gateway) = route.gateway {
+        push_attr(&mut payload, RTA_GATEWAY, &gateway.octets());
+    }
+    if let Some(oif_name) = route.oif_name {
+        if let Some(link) = links.iter().find(|link| link.name == oif_name) {
+            push_attr_u32(&mut payload, RTA_OIF, link.ifindex);
+        }
+    }
+    if let Some(preferred_src) = route.preferred_src {
+        push_attr(&mut payload, RTA_PREFSRC, &preferred_src.octets());
+    }
     build_nlmsg(RTM_NEWROUTE, flags, seq, pid, &payload)
 }
 
@@ -745,16 +782,6 @@ fn neigh_state(state: ArpSnapshotState) -> u16 {
         ArpSnapshotState::Pending => NUD_INCOMPLETE,
         ArpSnapshotState::Failed => NUD_FAILED,
     }
-}
-
-fn ipv4_network(addr: Ipv4Address, prefix_len: u8) -> Ipv4Address {
-    let prefix_len = prefix_len.min(32);
-    let mask = if prefix_len == 0 {
-        0
-    } else {
-        u32::MAX << (32 - u32::from(prefix_len))
-    };
-    Ipv4Address::new((u32::from_be_bytes(addr.octets()) & mask).to_be_bytes())
 }
 
 fn arphrd_for_link(link: &NetNamespaceLinkInfo) -> u16 {
@@ -838,6 +865,141 @@ fn parse_ifaddrmsg(payload: &[u8]) -> Result<IfAddrMsg, Errno> {
         prefix_len: payload[1],
         index: read_u32(payload, 4),
     })
+}
+
+fn parse_rtmsg(payload: &[u8]) -> Result<RtMsg<'_>, Errno> {
+    if payload.len() < RTMSG_LEN {
+        return Err(Errno::EINVAL);
+    }
+    Ok(RtMsg {
+        family: payload[0],
+        dst_len: payload[1],
+        table: payload[4],
+        protocol: payload[5],
+        scope: payload[6],
+        route_type: payload[7],
+        attrs: parse_attrs(&payload[RTMSG_LEN..])?,
+    })
+}
+
+fn parse_route_config(
+    netns: &NetNamespacePayload,
+    payload: &[u8],
+) -> Result<NetNamespaceRouteConfig, Errno> {
+    let msg = parse_rtmsg(payload)?;
+    if msg.family != AF_INET {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    if msg.dst_len > 32 {
+        return Err(Errno::EINVAL);
+    }
+    let dst = ipv4_attr(&msg.attrs, RTA_DST)?.unwrap_or(Ipv4Address::UNSPECIFIED);
+    let gateway = ipv4_attr(&msg.attrs, RTA_GATEWAY)?;
+    let preferred_src = ipv4_attr(&msg.attrs, RTA_PREFSRC)?;
+    let oif_name = route_oif_name(netns, &msg.attrs)?;
+    Ok(NetNamespaceRouteConfig {
+        dst,
+        prefix_len: msg.dst_len,
+        gateway,
+        oif_name,
+        preferred_src,
+        table: normalize_route_table(msg.table),
+        protocol: normalize_route_protocol(msg.protocol),
+        scope: normalize_route_scope(msg.scope, gateway),
+        route_type: normalize_route_type(msg.route_type),
+    })
+}
+
+fn parse_route_selector(
+    netns: &NetNamespacePayload,
+    payload: &[u8],
+) -> Result<NetNamespaceRouteSelector, Errno> {
+    let msg = parse_rtmsg(payload)?;
+    if msg.family != AF_INET {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    if msg.dst_len > 32 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(NetNamespaceRouteSelector {
+        dst: ipv4_attr(&msg.attrs, RTA_DST)?.unwrap_or(Ipv4Address::UNSPECIFIED),
+        prefix_len: msg.dst_len,
+        gateway: ipv4_attr(&msg.attrs, RTA_GATEWAY)?,
+        oif_name: route_oif_name(netns, &msg.attrs)?,
+        table: normalize_route_table(msg.table),
+    })
+}
+
+fn ipv4_attr(attrs: &[NlAttr<'_>], kind: u16) -> Result<Option<Ipv4Address>, Errno> {
+    let Some(attr) = attr_by_kind(attrs, kind) else {
+        return Ok(None);
+    };
+    if attr.payload.len() < 4 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Some(Ipv4Address::new([
+        attr.payload[0],
+        attr.payload[1],
+        attr.payload[2],
+        attr.payload[3],
+    ])))
+}
+
+fn route_oif_name(
+    netns: &NetNamespacePayload,
+    attrs: &[NlAttr<'_>],
+) -> Result<Option<&'static str>, Errno> {
+    let Some(oif_attr) = attr_by_kind(attrs, RTA_OIF) else {
+        return Ok(None);
+    };
+    if oif_attr.payload.len() < 4 {
+        return Err(Errno::EINVAL);
+    }
+    let ifindex = read_u32(oif_attr.payload, 0);
+    if ifindex == 0 {
+        return Ok(None);
+    }
+    let name = netns
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.ifindex == ifindex)
+        .map(|link| link.name)
+        .ok_or(Errno::ENODEV)?;
+    Ok(Some(name))
+}
+
+fn normalize_route_table(table: u8) -> u8 {
+    if table == 0 {
+        RT_TABLE_MAIN
+    } else {
+        table
+    }
+}
+
+fn normalize_route_protocol(protocol: u8) -> u8 {
+    if protocol == 0 {
+        RTPROT_STATIC
+    } else {
+        protocol
+    }
+}
+
+fn normalize_route_scope(scope: u8, gateway: Option<Ipv4Address>) -> u8 {
+    if scope != 0 {
+        scope
+    } else if gateway.is_some() {
+        RT_SCOPE_UNIVERSE
+    } else {
+        RT_SCOPE_LINK
+    }
+}
+
+fn normalize_route_type(route_type: u8) -> u8 {
+    if route_type == 0 {
+        RTN_UNICAST
+    } else {
+        route_type
+    }
 }
 
 fn parse_attrs(mut bytes: &[u8]) -> Result<Vec<NlAttr<'_>>, Errno> {
@@ -1092,6 +1254,16 @@ struct IfAddrMsg {
     family: u8,
     prefix_len: u8,
     index: u32,
+}
+
+struct RtMsg<'a> {
+    family: u8,
+    dst_len: u8,
+    table: u8,
+    protocol: u8,
+    scope: u8,
+    route_type: u8,
+    attrs: Vec<NlAttr<'a>>,
 }
 
 struct LinkInfoAttrs<'a> {
