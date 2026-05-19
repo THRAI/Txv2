@@ -8,6 +8,7 @@
 pub mod adapter;
 pub mod exec_prep;
 pub mod execution;
+pub mod nsproxy;
 pub mod numbers;
 pub mod structure;
 pub mod topology;

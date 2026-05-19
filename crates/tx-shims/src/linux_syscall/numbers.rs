@@ -1525,6 +1525,65 @@ pub const NR_EPOLL_PWAIT: u64 = 281;
 // `man 2 eventfd2`, `man 2 timerfd_create`.
 // =====================================================================
 
+// =====================================================================
+// SysV IPC syscall numbers
+//
+// `man 2 shmget`, `man 2 msgget`, `man 2 semget`.
+// =====================================================================
+
+/// `shmget(key, size, shmflg)`. Linux generic uapi `__NR_shmget = 194`.
+pub const NR_SHMGET: u64 = 194;
+/// `shmat(shmid, shmaddr, shmflg)`. Linux generic uapi `__NR_shmat = 196`.
+pub const NR_SHMAT: u64 = 196;
+/// `shmdt(shmaddr)`. Linux generic uapi `__NR_shmdt = 197`.
+pub const NR_SHMDT: u64 = 197;
+/// `shmctl(shmid, cmd, buf)`. Linux generic uapi `__NR_shmctl = 195`.
+pub const NR_SHMCTL: u64 = 195;
+
+/// `msgget(key, msgflg)`. Linux generic uapi `__NR_msgget = 186`.
+pub const NR_MSGGET: u64 = 186;
+/// `msgsnd(msqid, msgp, msgsz, msgflg)`. Linux generic uapi `__NR_msgsnd = 189`.
+pub const NR_MSGSND: u64 = 189;
+/// `msgrcv(msqid, msgp, msgsz, msgtyp, msgflg)`. Linux generic uapi `__NR_msgrcv = 188`.
+pub const NR_MSGRCV: u64 = 188;
+/// `msgctl(msqid, cmd, buf)`. Linux generic uapi `__NR_msgctl = 187`.
+pub const NR_MSGCTL: u64 = 187;
+
+/// `semget(key, nsems, semflg)`. Linux generic uapi `__NR_semget = 190`.
+pub const NR_SEMGET: u64 = 190;
+/// `semop(semid, sops, nsops)`. Linux generic uapi `__NR_semop = 193`.
+pub const NR_SEMOP: u64 = 193;
+/// `semtimedop(semid, sops, nsops, timeout)`. Linux generic uapi `__NR_semtimedop = 192`.
+pub const NR_SEMTIMEDOP: u64 = 192;
+/// `semctl(semid, semnum, cmd, arg)`. Linux generic uapi `__NR_semctl = 191`.
+pub const NR_SEMCTL: u64 = 191;
+
+// =====================================================================
+// POSIX message queue syscall numbers
+//
+// `man 7 mq_overview`.
+// =====================================================================
+
+/// `mq_open(name, oflag, mode, attr)`. Linux generic uapi `__NR_mq_open = 180`.
+pub const NR_MQ_OPEN: u64 = 180;
+/// `mq_unlink(name)`. Linux generic uapi `__NR_mq_unlink = 181`.
+pub const NR_MQ_UNLINK: u64 = 181;
+/// `mq_timedsend(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout)`.
+/// Linux generic uapi `__NR_mq_timedsend = 182`.
+pub const NR_MQ_TIMEDSEND: u64 = 182;
+/// `mq_timedreceive(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout)`.
+/// Linux generic uapi `__NR_mq_timedreceive = 183`.
+pub const NR_MQ_TIMEDRECEIVE: u64 = 183;
+/// `mq_notify(mqdes, sevp)`. Linux generic uapi `__NR_mq_notify = 184`.
+pub const NR_MQ_NOTIFY: u64 = 184;
+/// `mq_getsetattr(mqdes, newattr, oldattr)`. Linux generic uapi
+/// `__NR_mq_getsetattr = 185`.
+pub const NR_MQ_GETSETATTR: u64 = 185;
+
+// =====================================================================
+// eventfd / timerfd syscall numbers
+// =====================================================================
+
 /// `eventfd2(init_val, flags)`. Linux generic uapi `__NR_eventfd2 = 290`.
 /// Mints a fresh [`tx_subsystems::eventfd::EventFd`] cap, wraps it in
 /// an `OpenFile` with `OpenFileBacking::Eventfd`, and installs it at

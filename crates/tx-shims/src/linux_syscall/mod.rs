@@ -105,6 +105,8 @@ mod time;
 use time::*;
 mod signal;
 use signal::*;
+mod ipc;
+use ipc::*;
 mod vm;
 use vm::*;
 pub mod io;
@@ -175,23 +177,26 @@ pub use numbers::{
     NR_GETRESUID, NR_GETSID, NR_GETTID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_IO_DESTROY,
     NR_IO_GETEVENTS, NR_IO_SETUP, NR_IO_SUBMIT, NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_KILL,
     NR_LINKAT, NR_LSEEK, NR_MADVISE, NR_MKDIRAT, NR_MKNODAT, NR_MLOCK, NR_MMAP, NR_MOUNT,
-    NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNLOCK, NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT,
-    NR_OPENAT, NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL, NR_PIPE2, NR_PPOLL, NR_PRLIMIT64, NR_READ,
-    NR_READLINKAT, NR_READV, NR_RENAMEAT2, NR_RT_SIGACTION, NR_RT_SIGPENDING, NR_RT_SIGPROCMASK,
-    NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN, NR_RT_SIGSUSPEND, NR_RT_SIGTIMEDWAIT, NR_SETGID,
+    NR_MPROTECT, NR_MQ_GETSETATTR, NR_MQ_NOTIFY, NR_MQ_OPEN, NR_MQ_TIMEDRECEIVE, NR_MQ_TIMEDSEND,
+    NR_MQ_UNLINK, NR_MREMAP, NR_MSGCTL, NR_MSGGET, NR_MSGRCV, NR_MSGSND, NR_MSYNC, NR_MUNLOCK,
+    NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT, NR_OPENAT, NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL,
+    NR_PIPE2, NR_PPOLL, NR_PRLIMIT64, NR_READ, NR_READLINKAT, NR_READV, NR_RENAMEAT2,
+    NR_RT_SIGACTION, NR_RT_SIGPENDING, NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN,
+    NR_RT_SIGSUSPEND, NR_RT_SIGTIMEDWAIT, NR_SEMCTL, NR_SEMGET, NR_SEMOP, NR_SEMTIMEDOP, NR_SETGID,
     NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID,
-    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SIGALTSTACK, NR_SIGNALFD, NR_SIGNALFD4, NR_STATFS,
-    NR_STATX, NR_SYMLINKAT, NR_SYNC, NR_SYNCFS, NR_SYSLOG, NR_TGKILL, NR_TIMERFD_CREATE,
-    NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME, NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UMOUNT2,
-    NR_UNAME, NR_UNLINKAT, NR_USERFAULTFD, NR_UTIMENSAT, NR_WAIT4, NR_WRITE, NR_WRITEV, O_ACCMODE,
-    O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC,
-    O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE,
-    RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU,
-    RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS, RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE, RLIMIT_NICE,
-    RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_RSS, RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIMIT_SIGPENDING,
-    RLIMIT_STACK, RLIM_INFINITY, R_OK, SEEK_CUR, SEEK_END, SEEK_SET, SIGCHLD, TCGETS, TCSETS,
-    TCSETSF, TCSETSW, TIMER_ABSTIME, TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY,
-    TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ, UTIME_NOW, UTIME_OMIT, WNOHANG, W_OK, X_OK,
+    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET,
+    NR_SIGALTSTACK, NR_SIGNALFD, NR_SIGNALFD4, NR_STATFS, NR_STATX, NR_SYMLINKAT, NR_SYNC,
+    NR_SYNCFS, NR_SYSLOG, NR_TGKILL, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME,
+    NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UMOUNT2, NR_UNAME, NR_UNLINKAT, NR_USERFAULTFD,
+    NR_UTIMENSAT, NR_WAIT4, NR_WRITE, NR_WRITEV, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT,
+    O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN,
+    PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, RENAME_EXCHANGE, RENAME_NOREPLACE,
+    RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS,
+    RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE, RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_RSS,
+    RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIMIT_SIGPENDING, RLIMIT_STACK, RLIM_INFINITY, R_OK, SEEK_CUR,
+    SEEK_END, SEEK_SET, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW, TIMER_ABSTIME,
+    TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ,
+    UTIME_NOW, UTIME_OMIT, WNOHANG, W_OK, X_OK,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -412,6 +417,12 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         nr if nr == NR_MLOCK => return sys_mlock(req.args, ctx).await,
         nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx).await,
         nr if nr == NR_UTIMENSAT => return sys_utimensat(req.args, ctx),
+        nr if nr == NR_SHMGET => return sys_shmget(req.args, ctx),
+        nr if nr == NR_SHMDT => return sys_shmdt(req.args, ctx),
+        nr if nr == NR_MSGGET => return sys_msgget(req.args, ctx),
+        nr if nr == NR_MSGSND => return sys_msgsnd(req.args, ctx),
+        nr if nr == NR_MSGRCV => return sys_msgrcv(req.args, ctx),
+        nr if nr == NR_SEMGET => return sys_semget(req.args, ctx),
         _ => {} // fall through to script lanes
     }
 
@@ -434,6 +445,14 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         nr if nr == NR_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait::<P>(req.args, ctx).await,
         nr if nr == NR_SIGALTSTACK => sys_sigaltstack(req.args, ctx),
         NR_FCNTL => sys_fcntl(req.args, ctx),
+        nr if nr == NR_SHMCTL => sys_shmctl(req.args, ctx),
+        nr if nr == NR_MSGCTL => sys_msgctl(req.args, ctx),
+        nr if nr == NR_SEMOP => sys_semop(req.args, ctx),
+        nr if nr == NR_SEMCTL => sys_semctl(req.args, ctx),
+        nr if nr == NR_MSGCTL => sys_msgctl(req.args, ctx),
+        nr if nr == NR_SEMOP => sys_semop(req.args, ctx),
+        nr if nr == NR_SEMCTL => sys_semctl(req.args, ctx),
+        nr if nr == NR_SHMAT => sys_shmat(req.args, ctx),
         nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
         nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx).await,
         nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
@@ -699,12 +718,15 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
 /// phases extend the table in lockstep with the syscall arms.
 pub(super) fn errno_to_i32(errno: Errno) -> i32 {
     match errno {
+        Errno::E2BIG => 7,
         Errno::EACCES => 13,
         Errno::EAGAIN => EAGAIN_VALUE,
         Errno::EBADF => EBADF_VALUE,
         Errno::EBUSY => 16,
         Errno::EDQUOT => 122,
         Errno::EEXIST => 17,
+        Errno::EFBIG => 27,
+        Errno::EIDRM => 43,
         Errno::EFAULT => 14,
         Errno::EINVAL => 22,
         Errno::EIO => 5,
