@@ -411,13 +411,19 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         }
 
-        // busybox sh needs at least PATH to find applet binaries
-        // (`ls`, `cat`, etc.) — without it, command lookup short-
-        // circuits to "not found" before the kernel's fork/exec path
-        // ever runs, and the prompt never returns from the failing
-        // command. `/bin` is where our cpio rootfs places every
-        // applet symlink.
-        let envp: &[&[u8]] = &[b"PATH=/bin"];
+        // Shell profiles need at least PATH so command lookup reaches
+        // userland tools before the shell reports "not found". BusyBox
+        // applets live under /bin; Alpine places administrative tools
+        // such as nft, iptables, and ip under /sbin or /usr/sbin.
+        let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline.unwrap_or("");
+        let envp: &[&[u8]] = if cmdline
+            .split_ascii_whitespace()
+            .any(|t| t == "tx.profile=alpine")
+        {
+            &[b"PATH=/bin:/sbin:/usr/bin:/usr/sbin"]
+        } else {
+            &[b"PATH=/bin"]
+        };
 
         // Cmdline-driven init path (initramfs slice):
         //   `init=/some/path` -> exec that path with argv=[basename]

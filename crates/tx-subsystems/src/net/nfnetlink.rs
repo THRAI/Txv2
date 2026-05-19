@@ -56,14 +56,21 @@ pub const NFT_MSG_DELCHAIN: u16 = 5;
 pub const NFT_MSG_NEWRULE: u16 = 6;
 pub const NFT_MSG_GETRULE: u16 = 7;
 pub const NFT_MSG_DELRULE: u16 = 8;
+pub const NFT_MSG_GETSET: u16 = 10;
+pub const NFT_MSG_GETSETELEM: u16 = 13;
 pub const NFT_MSG_NEWGEN: u16 = 15;
 pub const NFT_MSG_GETGEN: u16 = 16;
+pub const NFT_MSG_GETOBJ: u16 = 19;
+pub const NFT_MSG_GETOBJ_RESET: u16 = 21;
+pub const NFT_MSG_GETFLOWTABLE: u16 = 23;
 
 const NLMSG_HDR_LEN: usize = 16;
 const NFGENMSG_LEN: usize = 4;
 const NLA_HDR_LEN: usize = 4;
 const NLA_TYPE_MASK: u16 = 0x3fff;
 const NLA_F_NESTED: u16 = 0x8000;
+
+const NFTA_LIST_ELEM: u16 = 1;
 
 const NFTA_TABLE_NAME: u16 = 1;
 const NFTA_TABLE_FLAGS: u16 = 2;
@@ -131,6 +138,7 @@ const NFT_META_L4PROTO: u32 = 16;
 const NFT_NAT_DNAT: u32 = 1;
 
 const NFT_CHAIN_BASE: u32 = 1;
+const NFT_REG32_00: u32 = 8;
 const NF_DROP: u32 = 0;
 const NF_ACCEPT: u32 = 1;
 
@@ -348,6 +356,10 @@ fn handle_one_message(
             for msg in render_rule_dump(netns, header, family) {
                 responses.push(msg);
             }
+        }
+        NFT_MSG_GETSET | NFT_MSG_GETSETELEM | NFT_MSG_GETOBJ | NFT_MSG_GETOBJ_RESET
+        | NFT_MSG_GETFLOWTABLE => {
+            responses.push(build_done_message(header.seq, header.pid));
         }
         NFT_MSG_GETGEN => {
             responses.push(build_generation_message(header, family));
@@ -672,7 +684,9 @@ fn build_rule_message(seq: u32, pid: u32, family: u8, rule: NetfilterRule, handl
     push_attr_string(&mut payload, NFTA_RULE_TABLE, &chain.table);
     push_attr_string(&mut payload, NFTA_RULE_CHAIN, &chain.name);
     push_attr_u64(&mut payload, NFTA_RULE_HANDLE, handle);
-    push_nested_attr(&mut payload, NFTA_RULE_EXPRESSIONS, |_| {});
+    push_nested_attr(&mut payload, NFTA_RULE_EXPRESSIONS, |exprs| {
+        push_rule_expressions(exprs, rule);
+    });
     let summary = rule_summary(rule);
     push_attr(&mut payload, NFTA_RULE_USERDATA, summary.as_bytes());
     build_nlmsg(nft_msg(NFT_MSG_NEWRULE), NLM_F_MULTI, seq, pid, &payload)
@@ -827,6 +841,116 @@ fn parse_rule_expressions(bytes: &[u8]) -> Result<NftRuleParse, Errno> {
     Ok(parsed)
 }
 
+fn push_rule_expressions(out: &mut Vec<u8>, rule: NetfilterRule) {
+    let mut next = 1u16;
+    if let Some(src) = rule.src {
+        push_ipv4_cidr_match(out, &mut next, NFT_PAYLOAD_NETWORK_HEADER, 12, src);
+    }
+    if let Some(dst) = rule.dst {
+        push_ipv4_cidr_match(out, &mut next, NFT_PAYLOAD_NETWORK_HEADER, 16, dst);
+    }
+    match rule.target {
+        NetfilterTarget::Masquerade => push_empty_expr(out, &mut next, "masq"),
+        NetfilterTarget::Accept => push_immediate_verdict_expr(out, &mut next, NF_ACCEPT),
+        NetfilterTarget::Drop => push_immediate_verdict_expr(out, &mut next, NF_DROP),
+        NetfilterTarget::Dnat => push_summary_only_expr(out, &mut next),
+    }
+}
+
+fn push_ipv4_cidr_match(
+    out: &mut Vec<u8>,
+    next: &mut u16,
+    base: u32,
+    offset: u32,
+    cidr: NetfilterIpv4Cidr,
+) {
+    if cidr.prefix_len == 0 {
+        return;
+    }
+    let reg = NFT_REG32_00;
+    let octets = cidr.addr.octets();
+    if cidr.prefix_len % 8 == 0 {
+        let len = (cidr.prefix_len / 8).clamp(1, 4);
+        push_payload_expr(out, next, reg, base, offset, len as u32);
+        push_cmp_expr(out, next, reg, &octets[..len as usize]);
+        return;
+    }
+    push_payload_expr(out, next, reg, base, offset, 4);
+    push_bitwise_mask_expr(out, next, reg, reg + 1, ipv4_prefix_mask(cidr.prefix_len));
+    push_cmp_expr(out, next, reg + 1, &octets);
+}
+
+fn push_payload_expr(
+    out: &mut Vec<u8>,
+    next: &mut u16,
+    dreg: u32,
+    base: u32,
+    offset: u32,
+    len: u32,
+) {
+    push_expr(out, next, "payload", |data| {
+        push_attr_u32(data, NFTA_PAYLOAD_DREG, dreg);
+        push_attr_u32(data, NFTA_PAYLOAD_BASE, base);
+        push_attr_u32(data, NFTA_PAYLOAD_OFFSET, offset);
+        push_attr_u32(data, NFTA_PAYLOAD_LEN, len);
+    });
+}
+
+fn push_bitwise_mask_expr(out: &mut Vec<u8>, next: &mut u16, sreg: u32, dreg: u32, mask: [u8; 4]) {
+    push_expr(out, next, "bitwise", |data| {
+        push_attr_u32(data, NFTA_BITWISE_SREG, sreg);
+        push_attr_u32(data, NFTA_BITWISE_DREG, dreg);
+        push_attr_u32(data, NFTA_BITWISE_LEN, 4);
+        push_nested_attr(data, NFTA_BITWISE_MASK, |nested| {
+            push_attr(nested, NFTA_DATA_VALUE, &mask);
+        });
+        push_nested_attr(data, NFTA_BITWISE_XOR, |nested| {
+            push_attr(nested, NFTA_DATA_VALUE, &[0, 0, 0, 0]);
+        });
+    });
+}
+
+fn push_cmp_expr(out: &mut Vec<u8>, next: &mut u16, sreg: u32, value: &[u8]) {
+    push_expr(out, next, "cmp", |data| {
+        push_attr_u32(data, NFTA_CMP_SREG, sreg);
+        push_attr_u32(data, NFTA_CMP_OP, NFT_CMP_EQ);
+        push_nested_attr(data, NFTA_CMP_DATA, |nested| {
+            push_attr(nested, NFTA_DATA_VALUE, value);
+        });
+    });
+}
+
+fn push_immediate_verdict_expr(out: &mut Vec<u8>, next: &mut u16, verdict: u32) {
+    push_expr(out, next, "immediate", |data| {
+        push_attr_u32(data, NFTA_IMMEDIATE_DREG, NFT_REG_VERDICT);
+        push_nested_attr(data, NFTA_IMMEDIATE_DATA, |nested| {
+            push_nested_attr(nested, NFTA_DATA_VERDICT, |verdict_attrs| {
+                push_attr_u32(verdict_attrs, NFTA_VERDICT_CODE, verdict);
+            });
+        });
+    });
+}
+
+fn push_empty_expr(out: &mut Vec<u8>, next: &mut u16, name: &str) {
+    push_expr(out, next, name, |_| {});
+}
+
+fn push_summary_only_expr(out: &mut Vec<u8>, next: &mut u16) {
+    push_empty_expr(out, next, "counter");
+}
+
+fn push_expr(out: &mut Vec<u8>, next: &mut u16, name: &str, build_data: impl FnOnce(&mut Vec<u8>)) {
+    let mut expr = Vec::new();
+    push_attr_string(&mut expr, NFTA_EXPR_NAME, name);
+    let mut data = Vec::new();
+    build_data(&mut data);
+    if !data.is_empty() {
+        push_attr(&mut expr, NFTA_EXPR_DATA | NLA_F_NESTED, &data);
+    }
+    push_attr(out, NFTA_LIST_ELEM | NLA_F_NESTED, &expr);
+    *next = (*next).saturating_add(1);
+}
+
 fn parse_meta_expr(data: &[u8], regs: &mut Vec<RegisterBinding>) -> Result<(), Errno> {
     let attrs = parse_attrs(data)?;
     let dreg = attr_u32(&attrs, NFTA_META_DREG).ok_or(Errno::EINVAL)?;
@@ -924,22 +1048,16 @@ fn parse_cmp_expr(
             offset,
             len,
             prefix_len,
-        } if base == NFT_PAYLOAD_NETWORK_HEADER && offset == 12 && len == 4 => {
-            parsed.src = Some(NetfilterIpv4Cidr {
-                addr: ipv4_from_data(value)?,
-                prefix_len: prefix_len.unwrap_or(32),
-            });
+        } if base == NFT_PAYLOAD_NETWORK_HEADER && offset == 12 && len <= 4 => {
+            parsed.src = Some(ipv4_cidr_from_payload_data(value, len, prefix_len)?);
         }
         RegisterBindingKind::Payload {
             base,
             offset,
             len,
             prefix_len,
-        } if base == NFT_PAYLOAD_NETWORK_HEADER && offset == 16 && len == 4 => {
-            parsed.dst = Some(NetfilterIpv4Cidr {
-                addr: ipv4_from_data(value)?,
-                prefix_len: prefix_len.unwrap_or(32),
-            });
+        } if base == NFT_PAYLOAD_NETWORK_HEADER && offset == 16 && len <= 4 => {
+            parsed.dst = Some(ipv4_cidr_from_payload_data(value, len, prefix_len)?);
         }
         RegisterBindingKind::Payload {
             base, offset, len, ..
@@ -1068,7 +1186,7 @@ fn build_nlmsg(kind: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) -> Vec
 }
 
 fn build_done_message(seq: u32, pid: u32) -> Vec<u8> {
-    build_nlmsg(NLMSG_DONE, NLM_F_MULTI, seq, pid, &0i32.to_le_bytes())
+    build_nlmsg(NLMSG_DONE, 0, seq, pid, &0i32.to_le_bytes())
 }
 
 fn ack_or_error(header: NlMsgHeader, result: Result<(), Errno>) -> Vec<u8> {
@@ -1126,11 +1244,11 @@ fn push_attr_string(out: &mut Vec<u8>, kind: u16, value: &str) {
 }
 
 fn push_attr_u32(out: &mut Vec<u8>, kind: u16, value: u32) {
-    push_attr(out, kind, &value.to_le_bytes());
+    push_attr(out, kind, &value.to_be_bytes());
 }
 
 fn push_attr_u64(out: &mut Vec<u8>, kind: u16, value: u64) {
-    push_attr(out, kind, &value.to_le_bytes());
+    push_attr(out, kind, &value.to_be_bytes());
 }
 
 fn parse_nfmsg_attrs(payload: &[u8]) -> Result<Vec<NlAttr<'_>>, Errno> {
@@ -1174,17 +1292,12 @@ fn attr_string<'a>(attrs: &'a [NlAttr<'a>], kind: u16) -> Option<&'a str> {
 
 fn attr_u32(attrs: &[NlAttr<'_>], kind: u16) -> Option<u32> {
     let payload = attr_payload(attrs, kind)?;
-    (payload.len() >= 4).then(|| read_u32(payload, 0))
+    (payload.len() >= 4).then(|| decode_attr_u32(payload))
 }
 
 fn attr_u64(attrs: &[NlAttr<'_>], kind: u16) -> Option<u64> {
     let payload = attr_payload(attrs, kind)?;
-    (payload.len() >= 8).then(|| {
-        u64::from_le_bytes([
-            payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-            payload[7],
-        ])
-    })
+    (payload.len() >= 8).then(|| decode_attr_u64(payload))
 }
 
 fn attr_nested_data_value<'a>(attrs: &'a [NlAttr<'a>], kind: u16) -> Option<&'a [u8]> {
@@ -1232,9 +1345,7 @@ fn chain_message_payload(family: u8, table: &str, name: &str, hook: NetfilterHoo
 fn parse_chain_hook(payload: &[u8]) -> Result<(NetfilterHook, i32), Errno> {
     let attrs = parse_attrs(payload)?;
     let hooknum = attr_u32(&attrs, NFTA_HOOK_HOOKNUM).ok_or(Errno::EINVAL)?;
-    let priority = attr_u32(&attrs, NFTA_HOOK_PRIORITY)
-        .map(|value| value as i32)
-        .unwrap_or(0);
+    let priority = attr_i32(&attrs, NFTA_HOOK_PRIORITY).unwrap_or(0);
     Ok((hook_from_hooknum(hooknum)?, priority))
 }
 
@@ -1296,6 +1407,22 @@ fn ipv4_from_data(value: &[u8]) -> Result<Ipv4Address, Errno> {
     Ok(Ipv4Address::new([value[0], value[1], value[2], value[3]]))
 }
 
+fn ipv4_cidr_from_payload_data(
+    value: &[u8],
+    len: u32,
+    prefix_len: Option<u8>,
+) -> Result<NetfilterIpv4Cidr, Errno> {
+    if !(1..=4).contains(&len) || value.len() < len as usize {
+        return Err(Errno::EINVAL);
+    }
+    let mut octets = [0u8; 4];
+    octets[..len as usize].copy_from_slice(&value[..len as usize]);
+    Ok(NetfilterIpv4Cidr {
+        addr: Ipv4Address::new(octets),
+        prefix_len: prefix_len.unwrap_or((len as u8) * 8),
+    })
+}
+
 fn u16_from_be_data(value: &[u8]) -> Result<u16, Errno> {
     if value.len() < 2 {
         return Err(Errno::EINVAL);
@@ -1323,6 +1450,14 @@ fn ipv4_mask_prefix_len(mask: &[u8]) -> Option<u8> {
         }
     }
     Some(prefix)
+}
+
+fn ipv4_prefix_mask(prefix_len: u8) -> [u8; 4] {
+    let mut mask = [0u8; 4];
+    for bit in 0..prefix_len.min(32) {
+        mask[(bit / 8) as usize] |= 1 << (7 - (bit % 8));
+    }
+    mask
 }
 
 fn leak_ascii_nul_string(value: &[u8]) -> Result<&'static str, Errno> {
@@ -1483,6 +1618,61 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
         bytes[offset + 2],
         bytes[offset + 3],
     ])
+}
+
+fn attr_i32(attrs: &[NlAttr<'_>], kind: u16) -> Option<i32> {
+    let payload = attr_payload(attrs, kind)?;
+    (payload.len() >= 4).then(|| decode_attr_i32(payload))
+}
+
+fn decode_attr_u32(payload: &[u8]) -> u32 {
+    let le = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let be = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    prefer_small_u32(le, be)
+}
+
+fn decode_attr_i32(payload: &[u8]) -> i32 {
+    let le = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let be = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    prefer_small_i32(le, be)
+}
+
+fn decode_attr_u64(payload: &[u8]) -> u64 {
+    let le = u64::from_le_bytes([
+        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+        payload[7],
+    ]);
+    let be = u64::from_be_bytes([
+        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+        payload[7],
+    ]);
+    prefer_small_u64(le, be)
+}
+
+fn prefer_small_u32(le: u32, be: u32) -> u32 {
+    match (le <= 0xffff, be <= 0xffff) {
+        (true, false) => le,
+        (false, true) => be,
+        _ => le,
+    }
+}
+
+fn prefer_small_u64(le: u64, be: u64) -> u64 {
+    match (le <= 0xffff_ffff, be <= 0xffff_ffff) {
+        (true, false) => le,
+        (false, true) => be,
+        _ => le,
+    }
+}
+
+fn prefer_small_i32(le: i32, be: i32) -> i32 {
+    let le_small = le.abs() <= 1_000_000;
+    let be_small = be.abs() <= 1_000_000;
+    match (le_small, be_small) {
+        (true, false) => le,
+        (false, true) => be,
+        _ => le,
+    }
 }
 
 fn align4(len: usize) -> usize {

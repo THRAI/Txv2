@@ -5,12 +5,12 @@ use super::*;
 
 use crate::linux_syscall::{
     AF_INET, AF_NETLINK, AF_UNIX, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_UDP,
-    IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO, IPT_SO_SET_REPLACE, IP_RECVERR, NETLINK_NETFILTER,
-    NETLINK_ROUTE, NR_BIND, NR_CLOSE, NR_CONNECT, NR_FCNTL, NR_GETSOCKNAME, NR_GETSOCKOPT,
-    NR_IOCTL, NR_LISTEN, NR_PPOLL, NR_PSELECT6, NR_RECVFROM, NR_RECVMSG, NR_SENDMSG, NR_SENDTO,
-    NR_SETSOCKOPT, NR_SOCKET, O_CLOEXEC, O_NONBLOCK, O_RDWR, SIOCGIFFLAGS, SIOCGIFINDEX,
-    SIOCGIFTXQLEN, SIOCSIFFLAGS, SOL_SOCKET, SO_DONTROUTE, SO_ERROR, SO_RCVTIMEO, SO_REUSEADDR,
-    SO_TYPE,
+    IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO, IPT_SO_SET_REPLACE, IP_RECVERR, NETLINK_EXT_ACK,
+    NETLINK_NETFILTER, NETLINK_ROUTE, NR_BIND, NR_CLOSE, NR_CONNECT, NR_FCNTL, NR_GETSOCKNAME,
+    NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PPOLL, NR_PSELECT6, NR_RECVFROM, NR_RECVMSG, NR_SENDMSG,
+    NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET, O_CLOEXEC, O_NONBLOCK, O_RDWR, SIOCGIFFLAGS, SIOCGIFINDEX,
+    SIOCGIFTXQLEN, SIOCSIFFLAGS, SOL_NETLINK, SOL_SOCKET, SO_DONTROUTE, SO_ERROR, SO_RCVTIMEO,
+    SO_REUSEADDR, SO_TYPE, TTY_WRITE_MAX_INLINE,
 };
 use alloc::vec;
 use alloc::vec::Vec;
@@ -787,6 +787,105 @@ fn dispatch_netlink_route_getlink_sendmsg_recvmsg_returns_dump() {
 }
 
 #[test]
+fn dispatch_netlink_netfilter_sendmsg_accepts_large_batch() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_netfilter(&ctx);
+    let nladdr = sockaddr_nl();
+    let request = vec![0u8; TTY_WRITE_MAX_INLINE + 64];
+    let send_iov = [TestIovec {
+        base: request.as_ptr() as u64,
+        len: request.len() as u64,
+    }];
+    let mut send_hdr = TestMsghdr {
+        name: nladdr.as_ptr() as u64,
+        namelen: SOCKADDR_NL_BYTES,
+        _pad0: 0,
+        iov: send_iov.as_ptr() as u64,
+        iovlen: send_iov.len() as u64,
+        control: 0,
+        controllen: 0,
+        flags: 0,
+        _pad1: 0,
+    };
+
+    assert_eq!(
+        socket_req(
+            NR_SENDMSG,
+            [
+                fd as u64,
+                (&mut send_hdr as *mut TestMsghdr) as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(request.len() as i64)
+    );
+}
+
+#[test]
+fn dispatch_netlink_netfilter_recvmsg_accepts_large_user_buffer() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_netfilter(&ctx);
+    let nladdr = sockaddr_nl();
+    let request = [0u8; 20];
+
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                fd as u64,
+                request.as_ptr() as u64,
+                request.len() as u64,
+                0,
+                nladdr.as_ptr() as u64,
+                SOCKADDR_NL_BYTES as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(request.len() as i64)
+    );
+
+    let mut response = vec![0u8; 128 * 1024];
+    let recv_iov = [TestIovec {
+        base: response.as_mut_ptr() as u64,
+        len: response.len() as u64,
+    }];
+    let mut source = [0u8; SOCKADDR_NL_BYTES as usize];
+    let mut recv_hdr = TestMsghdr {
+        name: source.as_mut_ptr() as u64,
+        namelen: SOCKADDR_NL_BYTES,
+        _pad0: 0,
+        iov: recv_iov.as_ptr() as u64,
+        iovlen: recv_iov.len() as u64,
+        control: 0,
+        controllen: 0,
+        flags: 0,
+        _pad1: 0,
+    };
+
+    match socket_req(
+        NR_RECVMSG,
+        [
+            fd as u64,
+            (&mut recv_hdr as *mut TestMsghdr) as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
+        &ctx,
+    ) {
+        SyscallResult::Return(bytes) => assert!(bytes > 0),
+        other => panic!("large netlink recvmsg buffer failed: {other:?}"),
+    }
+}
+
+#[test]
 fn dispatch_bind_listen_getsockname_round_trips_inet_addr() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();
@@ -1002,6 +1101,50 @@ fn dispatch_setsockopt_getsockopt_round_trips_ip_recverr() {
                 fd as u64,
                 IPPROTO_IP as u64,
                 IP_RECVERR as u64,
+                (&mut out as *mut i32) as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out, 1);
+    assert_eq!(out_len, core::mem::size_of::<i32>() as u32);
+}
+
+#[test]
+fn dispatch_netlink_setsockopt_accepts_ext_ack() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_netfilter(&ctx);
+
+    let one: i32 = 1;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_NETLINK as u64,
+                NETLINK_EXT_ACK as u64,
+                (&one as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out: i32 = 0;
+    let mut out_len: u32 = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                SOL_NETLINK as u64,
+                NETLINK_EXT_ACK as u64,
                 (&mut out as *mut i32) as u64,
                 (&mut out_len as *mut u32) as u64,
                 0,

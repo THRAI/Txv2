@@ -1,6 +1,6 @@
 //! `cargo xtask shell-test --target rv64-qemu --script PATH`
 //!
-//! Drives an interactive `busybox sh` session under QEMU from a
+//! Drives an interactive shell session under QEMU from a
 //! line-based script. Captures all serial output for assertion;
 //! prints output to the host terminal for visibility.
 //!
@@ -75,7 +75,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::image::busybox_initramfs_name;
+use crate::image::{alpine_initramfs_name, busybox_initramfs_name};
 use crate::qemu::{append_net_args, qemu_net};
 use crate::target::{Profile, TxTarget};
 use crate::util::{option_value, optional_option_value, resolve_path};
@@ -150,8 +150,9 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     };
 
     println!(
-        "shell-test: target={} script={}",
+        "shell-test: target={} profile={} script={}",
         target.name(),
+        shell_test_profile(&args)?.name(),
         script_path.display()
     );
     let setup_count = script.setup.len();
@@ -801,18 +802,24 @@ fn build_qemu_command(root: &Path, target: TxTarget, raw_args: &[String]) -> Res
     // the command inline instead, matching the busybox profile +
     // --interactive flag.
     let kernel = target.kernel_path(root);
-    let initramfs = root
-        .join("target")
-        .join("images")
-        .join(busybox_initramfs_name(target));
+    let profile = shell_test_profile(raw_args)?;
+    if profile == Profile::Smoke {
+        return Err("shell-test supports --profile busybox or --profile alpine".into());
+    }
+    let initramfs = root.join("target").join("images").join(match profile {
+        Profile::Busybox => busybox_initramfs_name(target),
+        Profile::Alpine => alpine_initramfs_name(target),
+        Profile::Smoke => unreachable!("rejected above"),
+    });
     let mut args = vec![
         target.qemu_binary().to_string(),
         "-machine".into(),
         target.qemu_machine().to_string(),
         "-m".into(),
-        match target {
-            TxTarget::La64Qemu => "1152M",
-            TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => "256M",
+        match (target, profile) {
+            (TxTarget::Rv64Qemu, Profile::Alpine) => "512M",
+            (TxTarget::La64Qemu, _) => "1152M",
+            (TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock, _) => "256M",
         }
         .into(),
         "-smp".into(),
@@ -840,11 +847,21 @@ fn build_qemu_command(root: &Path, target: TxTarget, raw_args: &[String]) -> Res
     args.push("-initrd".into());
     args.push(initramfs.display().to_string());
     args.push("-append".into());
-    args.push("tx.profile=busybox console=ttyS0".into());
+    args.push(match profile {
+        Profile::Busybox => "tx.profile=busybox console=ttyS0".into(),
+        Profile::Alpine => "tx.profile=alpine init=/bin/sh console=ttyS0".into(),
+        Profile::Smoke => unreachable!("rejected above"),
+    });
     let net = qemu_net(raw_args)?;
     append_net_args(&mut args, target, &net);
-    let _ = Profile::Busybox; // documentation: this driver always uses busybox.
     Ok(args)
+}
+
+fn shell_test_profile(args: &[String]) -> Result<Profile> {
+    optional_option_value(args, "--profile")
+        .map(|profile| Profile::parse(&profile))
+        .transpose()
+        .map(|profile| profile.unwrap_or(Profile::Busybox))
 }
 
 #[cfg(test)]
@@ -864,5 +881,20 @@ mod tests {
         assert!(command.contains("-smp 1"));
         assert!(command.contains("-netdev user,id=net0"));
         assert!(command.contains("-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0"));
+    }
+
+    #[test]
+    fn shell_test_qemu_command_can_boot_alpine_profile() {
+        let command = build_qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            &["--profile".into(), "alpine".into()],
+        )
+        .unwrap()
+        .join(" ");
+
+        assert!(command.contains("-m 512M"));
+        assert!(command.contains("alpine-initramfs-rv64-qemu.cpio"));
+        assert!(command.contains("tx.profile=alpine init=/bin/sh console=ttyS0"));
     }
 }

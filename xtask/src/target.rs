@@ -88,6 +88,7 @@ impl TxTarget {
 pub(crate) enum Profile {
     Smoke,
     Busybox,
+    Alpine,
 }
 
 impl Profile {
@@ -95,8 +96,9 @@ impl Profile {
         match value {
             "smoke" => Ok(Self::Smoke),
             "busybox" => Ok(Self::Busybox),
+            "alpine" => Ok(Self::Alpine),
             other => Err(format!(
-                "unknown profile '{other}', expected smoke or busybox"
+                "unknown profile '{other}', expected smoke, busybox, or alpine"
             )),
         }
     }
@@ -105,6 +107,7 @@ impl Profile {
         match self {
             Self::Smoke => "smoke",
             Self::Busybox => "busybox",
+            Self::Alpine => "alpine",
         }
     }
 }
