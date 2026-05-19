@@ -14,9 +14,9 @@
 use tx_observe_types::{
     PayloadArgValue, PayloadDriveBegin, PayloadDriveEnd, PayloadMutationIndexCommit,
     PayloadMutationZoneSign, PayloadPhaseTransition, PayloadProcessFork, PayloadProcessGroup,
-    PayloadProcessLabel, PayloadResume, PayloadSchedSwitch,
-    PayloadStepOutcome, PayloadSyscallEnter, PayloadSyscallExit, PayloadWaitSourceNotify,
-    PayloadYieldBegin, TxPayloadTag,
+    PayloadProcessLabel, PayloadResume, PayloadSchedSwitch, PayloadStepOutcome,
+    PayloadSyscallEnter, PayloadSyscallExit, PayloadWaitSourceNotify, PayloadYieldBegin,
+    TxPayloadTag,
 };
 
 // ---------------------------------------------------------------------------

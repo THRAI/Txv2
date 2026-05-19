@@ -1,0 +1,172 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-05-19-sysv-ipc-implementation",
+  "title": "SysV / POSIX IPC subsystem implementation",
+  "status": "active",
+  "created": "2026-05-19",
+  "updated": "2026-05-19",
+  "owner": "agent",
+  "summary": "Implement the full SysV + POSIX IPC subsystem family (sem, shm, msg, mq) per 08_SYSV_IPC_v1.md. Four phases: shm → msg → sem → POSIX wrappers. ~4,000 LoC, zero framework changes.",
+  "scope": {
+    "in": [
+      "crates/tx-subsystems/src/ipc/ (new module)",
+      "crates/tx-subsystems/src/lib.rs (module registration)",
+      "crates/tx-subsystems/src/zones.rs (zone definitions)",
+      "crates/tx-shims/src/linux_syscall/ (syscall dispatch + number tables)",
+      "crates/tx-subsystems/src/process/ (SEM_UNDO integration)",
+      "/proc/sysvipc/ projection rows",
+      "IpcNamespace on NsProxy"
+    ],
+    "out": [
+      "No new YieldShape, ExecutionScope, AbortReason, bus primitive, RestrictionKind",
+      "No new framework cells",
+      "No SIGEV_THREAD (glibc concern)",
+      "No POSIX sem anonymous-in-shared-memory (futex territory)",
+      "No SysV sem deprecated obsolete-IPC-modes"
+    ],
+    "write_sets": [
+      {
+        "owner": "agent",
+        "paths": [
+          "crates/tx-subsystems/src/ipc/",
+          "crates/tx-subsystems/src/lib.rs",
+          "crates/tx-subsystems/src/zones.rs",
+          "crates/tx-shims/src/linux_syscall/",
+          "crates/tx-subsystems/src/process/"
+        ],
+        "notes": "Single-threaded implementation; phases are sequential with verification gates between each."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/Txv3/08_SYSV_IPC_v1.md",
+      "docs/Txv3/01_CONCEPTS_v5.md",
+      "docs/Txv3/02_INVARIANTS_v5.md",
+      "docs/Txv3/03_STEP_MODEL_v2.md",
+      "docs/design/00_meta-framework/NAMESPACE_VIEW_v1.md",
+      "docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md",
+      "docs/design/00_meta-framework/object_model_v2.md",
+      "docs/design/00_meta-framework/INVARIANTS_v4.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/design/04_process-signals/SIGNAL_ATTACHMENTS_v1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/worktrees/2026-05-19-sysv-ipc-worktree.json"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "ipc-0-setup",
+      "title": "IPC-0: Module scaffold, IpcNamespace, crate registration",
+      "status": "in_progress",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-subsystems/src/ipc/mod.rs",
+        "crates/tx-subsystems/src/ipc/namespace/",
+        "crates/tx-subsystems/src/lib.rs",
+        "crates/tx-subsystems/src/zones.rs"
+      ],
+      "verification": [
+        "cargo xtask check"
+      ],
+      "notes": "Create module tree per 08_SYSV_IPC_v1.md §3. Add IpcNamespace to NsProxy. Register in lib.rs."
+    },
+    {
+      "id": "ipc-1-shm",
+      "title": "IPC-1: SysV shared memory (shmget, shmat, shmdt, shmctl)",
+      "status": "pending",
+      "depends_on": ["ipc-0-setup"],
+      "paths": [
+        "crates/tx-subsystems/src/ipc/sysv_shm/",
+        "crates/tx-subsystems/src/ipc/namespace/"
+      ],
+      "verification": [
+        "cargo xtask check",
+        "cargo xtask unit -p tx-subsystems"
+      ],
+      "notes": "ShmSegmentIdentity / ShmSegmentPayload. IpcNamespace.sysv_shm table. step_shmget/step_shmat/step_shmdt/step_shmctl. /proc/sysvipc/shm projection. Zero new WaitSources (page-fault is existing)."
+    },
+    {
+      "id": "ipc-2-msg",
+      "title": "IPC-2: SysV message queues (msgget, msgsnd, msgrcv, msgctl)",
+      "status": "pending",
+      "depends_on": ["ipc-1-shm"],
+      "paths": [
+        "crates/tx-subsystems/src/ipc/sysv_msg/"
+      ],
+      "verification": [
+        "cargo xtask check",
+        "cargo xtask unit -p tx-subsystems"
+      ],
+      "notes": "MsgQueueIdentity / MsgQueuePayload. per-type buckets + queue_seq counter. send_source / recv_source WaitSources. step_msgget/step_msgsnd/step_msgrcv (atomic + sequenced predicates)/step_msgctl. /proc/sysvipc/msg projection."
+    },
+    {
+      "id": "ipc-3-sem",
+      "title": "IPC-3: SysV semaphores (semget, semop, semctl) + SEM_UNDO",
+      "status": "pending",
+      "depends_on": ["ipc-2-msg"],
+      "paths": [
+        "crates/tx-subsystems/src/ipc/sysv_sem/",
+        "crates/tx-subsystems/src/process/"
+      ],
+      "verification": [
+        "cargo xtask check",
+        "cargo xtask unit -p tx-subsystems"
+      ],
+      "notes": "SemArrayIdentity / SemArrayPayload. sem_changed_source WaitSource + sem_changed_seq. step_semget/step_semop (multi-op atomic/sequenced predicate)/step_semctl. SEM_UNDO: ProcessPayload.sem_undos + exit-step walk. /proc/sysvipc/sem projection."
+    },
+    {
+      "id": "ipc-4-posix",
+      "title": "IPC-4: POSIX wrappers (mq_open, mq_send, mq_receive, mq_notify, mq_unlink)",
+      "status": "pending",
+      "depends_on": ["ipc-3-sem"],
+      "paths": [
+        "crates/tx-subsystems/src/ipc/posix_mq/"
+      ],
+      "verification": [
+        "cargo xtask check",
+        "cargo xtask unit -p tx-subsystems"
+      ],
+      "notes": "PosixMqInstance fd-shaped wrapper. step_mq_open/step_mq_send/step_mq_receive/step_mq_notify/step_mq_unlink. WaitProtocol.deadline for timed variants. mq_notify SIGEV_SIGNAL attachment row. POSIX sem named: /dev/shm tmpfs file + SemArrayPayload reuse."
+    },
+    {
+      "id": "ipc-5-syscall-dispatch",
+      "title": "IPC-5: Syscall dispatch table entries for all new syscalls",
+      "status": "pending",
+      "depends_on": ["ipc-4-posix"],
+      "paths": [
+        "crates/tx-shims/src/linux_syscall/numbers.rs",
+        "crates/tx-shims/src/linux_syscall/mod.rs"
+      ],
+      "verification": [
+        "cargo xtask check",
+        "cargo xtask unit"
+      ],
+      "notes": "Register all ~30 new syscall numbers and dispatch entries. Verify no-collision with existing numbers."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask check",
+      "status": "not-run",
+      "notes": "Full workspace check after each phase"
+    },
+    {
+      "command": "cargo xtask unit -p tx-subsystems",
+      "status": "not-run",
+      "notes": "Unit tests for each IPC kind"
+    }
+  ],
+  "risks": [
+    "SEM_UNDO exit-step integration may require process-exit changes beyond the IPC module",
+    "IpcNamespace on NsProxy requires updating all NsProxy construction sites",
+    "ShmSegment requires PageBacked/RNodeBacking integration that may expose gaps in the existing PageContainer interface"
+  ],
+  "blockers": [],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

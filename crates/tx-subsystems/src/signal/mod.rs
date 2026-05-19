@@ -1209,7 +1209,10 @@ pub fn script_deliver_signal(
     // catchable signals, default-action mapping for unhandled ones,
     // and gewalt routing for SIGKILL/SIGSTOP/SIGCONT.
     drop(target);
-    Ok(deliver_posix_signal(SignalTarget::Process(target_proc), sig))
+    Ok(deliver_posix_signal(
+        SignalTarget::Process(target_proc),
+        sig,
+    ))
 }
 
 // ----- TTY job-control bridge -----

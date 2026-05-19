@@ -19,6 +19,7 @@ pub mod page_backed;
 pub mod pipe;
 pub mod process;
 pub mod reactor_submit;
+pub mod shared;
 pub mod signal;
 pub mod signalfd;
 mod sync;

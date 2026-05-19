@@ -169,10 +169,7 @@ pub fn check_unlink_perm(
 /// (`unlink` / `rmdir` / `rename` of the source). Adding a name
 /// doesn't touch any existing entry. Per POSIX `man 2 link` and
 /// `man 7 inode` §"sticky bit".
-pub fn check_link_perm(
-    new_parent_meta: &InodeMeta,
-    cred: &Credential,
-) -> Result<(), Errno> {
+pub fn check_link_perm(new_parent_meta: &InodeMeta, cred: &Credential) -> Result<(), Errno> {
     if cred.effective_caps.contains(Capability::DAC_OVERRIDE) {
         return Ok(());
     }
@@ -236,8 +233,7 @@ pub fn check_chown_perm(
     new_gid: Option<u32>,
     cred: &Credential,
 ) -> Result<(), Errno> {
-    let privileged =
-        cred.effective_caps.contains(Capability::FOWNER) || cred.uid == 0;
+    let privileged = cred.effective_caps.contains(Capability::FOWNER) || cred.uid == 0;
     if let Some(u) = new_uid {
         if !privileged && u != cred.uid {
             return Err(Errno::EPERM);

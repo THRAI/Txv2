@@ -373,10 +373,7 @@ impl ProcessIdentity {
     /// construction; `SyscallCtx` falls back to `CredSnapshot::root()`
     /// defensively at construction time.
     pub fn cred_snapshot(&self) -> Option<CredSnapshot> {
-        self.payload
-            .lock()
-            .as_ref()
-            .map(|p| p.cred_snapshot())
+        self.payload.lock().as_ref().map(|p| p.cred_snapshot())
     }
 
     /// Process short name (for `/proc/<pid>/stat`). Returns `"?"` for
