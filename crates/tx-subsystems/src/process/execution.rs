@@ -314,6 +314,41 @@ pub fn bootstrap_init_process(
 }
 
 /// Clone a new thread into an existing process (CLONE_THREAD).
+///
+/// Five-phase protocol — PROCESS_v1 §7.1.3.
+pub fn step_clone_thread(
+    process: &Cap<ProcessIdentity>,
+    parent_ctx: &UserTrapContext,
+) -> Result<Cap<ThreadIdentity>, ForkError> {
+    use crate::process::numbers::register_tid;
+    use crate::thread_runtime::structure::allocate_tid;
+
+    // 1. Observe — check GroupExit not in progress
+    if let Some(payload) = process.payload.lock().as_ref() {
+        if payload.group_exit.lock().is_some() {
+            return Err(ForkError::ParentZombie);
+        }
+    }
+
+    // 3. Reserve — allocate new ThreadIdentity
+    let tid = allocate_tid();
+    let thread = sign_thread(process.downgrade()).map_err(|_| ForkError::PidNamespace)?;
+
+    // 4. Commit (infallible)
+    let payload_guard = process.payload.lock();
+    let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
+    payload.threads.attach(thread.clone());
+    payload.thread_count.fetch_add(1, Ordering::Relaxed);
+    register_tid(tid, thread.clone());
+
+    // Seed child's user context from parent
+    if let Some(payload_cap) = thread.payload_cap() {
+        payload_cap.store_saved_user_context(Some(*parent_ctx));
+    }
+
+    Ok(thread)
+}
+
 /// Fork a process: clones the parent's address space, allocates a new
 /// pid + leader tid, inherits the parent's pgrp/session, returns the
 /// child identity.
@@ -534,53 +569,6 @@ pub fn seed_child_leader_context(
     payload.store_saved_user_context(Some(child_ctx));
 }
 
-/// Create a new thread within an existing process (clone(2) with
-/// CLONE_THREAD).
-///
-/// Allocates a fresh `ThreadIdentity` + `ThreadPayload`, attaches it
-/// to the target process's thread list, and seeds the child's saved
-/// user context with the parent's trap state adjusted for the new
-/// stack and TLS.
-///
-/// Returns the new thread's `Cap<ThreadIdentity>`. The caller is
-/// responsible for submitting the thread to the reactor via
-/// `reactor_submit::submit_thread` and for writing
-/// CLONE_PARENT_SETTID / registering the pid namespace entry.
-pub fn step_clone_thread(
-    process: &Cap<ProcessIdentity>,
-    parent_user_ctx: &UserTrapContext,
-    stack: usize,
-    tls: usize,
-    ctid_ptr: u64,
-) -> Result<Cap<ThreadIdentity>, ZoneError> {
-    // 1. Create the new ThreadIdentity anchored to this process.
-    let child = sign_thread(process.downgrade())?;
-
-    // 2. Seed the child's saved user context — clone parent trap
-    //    state, zero a0 (clone returns 0 in child), set sp/tp.
-    seed_child_leader_context(&child, parent_user_ctx, tls, stack);
-
-    // 3. Store clear_child_tid pointer if CLONE_CHILD_CLEARTID was
-    //    specified. The thread-exit path clears this futex word and
-    //    issues FUTEX_WAKE.
-    if ctid_ptr != 0 {
-        let payload = child
-            .payload_cap()
-            .expect("step_clone_thread: fresh child missing payload");
-        *payload.clear_child_tid.lock() = Some(ctid_ptr);
-    }
-
-    // 4. Attach to process thread list and bump thread count.
-    if let Some(proc_payload) = process.payload.lock().as_ref() {
-        proc_payload.threads.attach(child.clone());
-        proc_payload
-            .thread_count
-            .fetch_add(1, Ordering::AcqRel);
-    }
-
-    Ok(child)
-}
-
 /// Exit the entire thread group: zombify every thread, drop the
 /// process payload, set the process exit status. Identity persists.
 ///
@@ -590,7 +578,7 @@ pub fn step_clone_thread(
 /// "thread-side exit_status is an int" shape that `THREAD_RUNTIME_v1`
 /// §7.2 carries. (Migrated to POSIX from the day-1 shell-convention
 /// `128 + sig` encoding by Wave 1 of the fork/clone/wait4 slice;
-/// Open Q #3 DECIDED 2026-05-03.)
+/// Open Q #3 DECIDED 2026-05-06.)
 pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     // observe
     // upgrade
