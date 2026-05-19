@@ -260,7 +260,8 @@ pub trait FsOps: Send + Sync + 'static {
         StepOutcome::err(Errno::ENOSYS)
     }
 
-    /// Write content to a projected inode (procfs, sysfs, etc.).
+    /// Write content to a projected inode (procfs/sysctl style files).
+    /// Called by `OpenFile::step_write` when `RNodeBacking::Projected`.
     /// Default: `ENOSYS`.
     fn step_write_projected(
         &self,

@@ -53,8 +53,9 @@ use crate::net::protocol::{
 };
 use crate::net::structure::table::SOCKET_TABLE;
 use crate::net::{
-    netfilter_stats_snapshot, require_net_admin, reset_netfilter_for_test, NetAdminAuthority,
-    NetNamespaceLinkInfo,
+    add_masquerade_rule_for_test_or_bootstrap, netfilter_conntrack_snapshot,
+    netfilter_rules_snapshot, netfilter_stats_snapshot, require_net_admin,
+    reset_netfilter_for_test, NetAdminAuthority, NetNamespaceLinkInfo, NetfilterIpv4Cidr,
 };
 use crate::{device::DevT, execution::Guard};
 use core::future::Future;

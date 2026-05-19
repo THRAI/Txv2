@@ -759,6 +759,194 @@ fn namespace_runtime_forwards_container_external_ipv4_to_uplink_route() {
 }
 
 #[test]
+fn namespace_runtime_masquerades_icmp_and_conntrack_dnat_reply() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    reset_netfilter_for_test();
+
+    let guard = tx_substrate::epoch::guard();
+    let now = smoltcp::time::Instant::ZERO;
+    let host = crate::net::create_isolated_net_namespace_for_test("runtime-nat-host")
+        .expect("host namespace")
+        .payload_cap()
+        .expect("host payload");
+    let container = crate::net::create_isolated_net_namespace_for_test("runtime-nat-container")
+        .expect("container namespace")
+        .payload_cap()
+        .expect("container payload");
+    let bridge = new_test_bridge("docker-nat0", 101);
+    let container_pair = new_bridge_veth_pair("eth-nat0", "veth-nat0", 101);
+    let uplink_pair = new_bridge_veth_pair("uplink-nat0", "gw-nat0", 102);
+
+    bridge
+        .device
+        .add_port_for_test_or_bootstrap(container_pair.right)
+        .expect("bridge port");
+    host.attach_device_for_test_or_bootstrap(bridge.registration, None)
+        .expect("attach docker0");
+    host.attach_device_for_test_or_bootstrap(container_pair.right, None)
+        .expect("attach host veth");
+    host.attach_device_for_test_or_bootstrap(uplink_pair.left, None)
+        .expect("attach uplink");
+    container
+        .attach_device_for_test_or_bootstrap(container_pair.left, None)
+        .expect("attach container eth");
+
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    let docker_ip = Ipv4Address::new([172, 17, 0, 1]);
+    let container_ip = Ipv4Address::new([172, 17, 0, 2]);
+    let uplink_ip = Ipv4Address::new([10, 0, 2, 15]);
+    let uplink_gw = Ipv4Address::new([10, 0, 2, 2]);
+    let external_ip = Ipv4Address::new([8, 8, 8, 8]);
+
+    let docker_ifindex = bridge_ifindex_for(&host.link_snapshot(), "docker-nat0");
+    host.set_device_ipv4_addr_by_ifindex(auth, docker_ifindex, Some(docker_ip), Some(16))
+        .expect("set docker0 addr");
+    let uplink_ifindex = bridge_ifindex_for(&host.link_snapshot(), "uplink-nat0");
+    host.set_device_ipv4_addr_by_ifindex(auth, uplink_ifindex, Some(uplink_ip), Some(24))
+        .expect("set uplink addr");
+    host.add_ipv4_route(
+        auth,
+        crate::net::NetNamespaceRouteConfig {
+            dst: Ipv4Address::UNSPECIFIED,
+            prefix_len: 0,
+            gateway: Some(uplink_gw),
+            oif_name: Some("uplink-nat0"),
+            preferred_src: Some(uplink_ip),
+            table: 254,
+            protocol: 4,
+            scope: 0,
+            route_type: 1,
+        },
+    )
+    .expect("host default route");
+    host.set_ipv4_forwarding_for_test_or_bootstrap(true);
+    host.ether_ifaces_snapshot()
+        .into_iter()
+        .find(|iface| iface.name == "uplink-nat0")
+        .expect("uplink iface")
+        .install_arp_for_test_or_bootstrap(
+            uplink_gw,
+            uplink_pair.right.ops.mac_addr(),
+            smoltcp::time::Instant::from_secs(60),
+        );
+    add_masquerade_rule_for_test_or_bootstrap(
+        NetfilterIpv4Cidr {
+            addr: Ipv4Address::new([172, 17, 0, 0]),
+            prefix_len: 16,
+        },
+        "uplink-nat0",
+    )
+    .expect("masquerade rule");
+    assert_eq!(netfilter_rules_snapshot().len(), 1);
+
+    let eth_ifindex = bridge_ifindex_for(&container.link_snapshot(), "eth-nat0");
+    container
+        .set_device_ipv4_addr_by_ifindex(auth, eth_ifindex, Some(container_ip), Some(16))
+        .expect("set container addr");
+    container
+        .add_ipv4_route(
+            auth,
+            crate::net::NetNamespaceRouteConfig {
+                dst: Ipv4Address::UNSPECIFIED,
+                prefix_len: 0,
+                gateway: Some(docker_ip),
+                oif_name: Some("eth-nat0"),
+                preferred_src: Some(container_ip),
+                table: 254,
+                protocol: 4,
+                scope: 0,
+                route_type: 1,
+            },
+        )
+        .expect("container default route");
+
+    let raw = match crate::net::step_socket_create_in_namespace(
+        ValidSocketType::validate(2, 3, 1).expect("AF_INET SOCK_RAW ICMP"),
+        container.clone(),
+        &guard,
+    ) {
+        StepOutcome::Done(socket) => socket,
+        other => panic!("raw icmp socket create failed: {other:?}"),
+    };
+    let ident = 0x72f1;
+    let echo = Icmpv4EchoPacket {
+        src: Ipv4Address::UNSPECIFIED,
+        dst: external_ip,
+        ident,
+        seq_no: 1,
+        payload: b"nat-forward".to_vec(),
+    };
+    let message = crate::net::protocol::build_icmpv4_echo_request_message(&echo);
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &raw,
+            Some(IpEndpoint::new(external_ip, 0)),
+            &message,
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(message.len())
+    );
+
+    let mut total = crate::net::NetNamespaceRuntimeOutcome::default();
+    let mut outbound = None;
+    for _ in 0..12 {
+        let outcome = crate::net::drive_all_net_namespace_runtimes_at(now, &guard);
+        total.merge(outcome);
+        if let Some(frame) = uplink_pair.right.ops.receive() {
+            outbound = Some(frame);
+            break;
+        }
+    }
+    let outbound = outbound.expect("uplink should receive masqueraded frame");
+    let ethernet =
+        smoltcp::wire::EthernetFrame::new_checked(outbound.as_bytes()).expect("ethernet frame");
+    let ipv4 = smoltcp::wire::Ipv4Packet::new_checked(ethernet.payload()).expect("ipv4 packet");
+    assert_eq!(Ipv4Address::new(ipv4.src_addr().octets()), uplink_ip);
+    assert_eq!(Ipv4Address::new(ipv4.dst_addr().octets()), external_ip);
+    assert_eq!(netfilter_conntrack_snapshot().len(), 1);
+    assert_eq!(netfilter_conntrack_snapshot()[0].original_src, container_ip);
+
+    let reply = Icmpv4EchoPacket {
+        src: external_ip,
+        dst: uplink_ip,
+        ident,
+        seq_no: 1,
+        payload: b"nat-forward".to_vec(),
+    };
+    let reply_packet = crate::net::protocol::build_icmpv4_echo_reply(&reply);
+    let reply_frame = ethernet_frame(
+        uplink_pair.left.ops.mac_addr(),
+        uplink_pair.right.ops.mac_addr(),
+        reply_packet.as_bytes(),
+    );
+    assert_eq!(
+        uplink_pair.right.ops.transmit(&reply_frame, &guard),
+        StepOutcome::Done(())
+    );
+
+    let mut reply_buf = [0u8; 96];
+    let mut received = None;
+    for _ in 0..12 {
+        let outcome = crate::net::drive_all_net_namespace_runtimes_at(now, &guard);
+        total.merge(outcome);
+        if let StepOutcome::Done(recv) =
+            step_recv_kernel_bytes(&raw, &mut reply_buf, SendRecvFlags::empty(), &guard)
+        {
+            received = Some(recv.bytes);
+            break;
+        }
+    }
+
+    assert_eq!(received, Some(message.len()), "runtime outcome: {total:?}");
+    assert!(total.ipv4_forwarded >= 2);
+}
+
+#[test]
 fn bridge_add_port_requires_cap_net_admin_authority() {
     let bridge = new_test_bridge("docker2", 86);
     let pair = new_bridge_veth_pair("ct-a2", "veth-a2", 86);

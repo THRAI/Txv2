@@ -2,11 +2,11 @@
 
 use crate::procfs::{
     pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_stat_id, task_from_stat_id,
-    PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID,
-    PROCFS_SYSVIPC_MSG_ID, PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID,
-    PROCFS_SYS_FS_LEASE_BREAK_TIME_ID, PROCFS_SYS_FS_PIPE_MAX_SIZE_ID,
+    PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID, PROCFS_NET_ARP_ID,
+    PROCFS_NET_DEV_ID, PROCFS_NET_ROUTE_ID, PROCFS_SYSVIPC_MSG_ID, PROCFS_SYSVIPC_SEM_ID,
+    PROCFS_SYSVIPC_SHM_ID, PROCFS_SYS_FS_LEASE_BREAK_TIME_ID, PROCFS_SYS_FS_PIPE_MAX_SIZE_ID,
     PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID, PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID,
-    PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_UPTIME_ID,
+    PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYS_NET_IPV4_IP_FORWARD_ID, PROCFS_UPTIME_ID,
 };
 use alloc::format;
 use alloc::string::String;
@@ -45,6 +45,10 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_SYSVIPC_MSG_ID => render_sysvipc_msg(),
         PROCFS_SYSVIPC_SEM_ID => render_sysvipc_sem(),
         PROCFS_SYSVIPC_SHM_ID => render_sysvipc_shm(),
+        PROCFS_NET_ROUTE_ID => render_net_route(),
+        PROCFS_NET_ARP_ID => render_net_arp(),
+        PROCFS_NET_DEV_ID => render_net_dev(),
+        PROCFS_SYS_NET_IPV4_IP_FORWARD_ID => render_ip_forward(),
         _ => String::new(),
     }
 }
@@ -304,4 +308,31 @@ fn render_sysvipc_shm() -> String {
         ));
     }
     out
+}
+
+fn render_net_route() -> String {
+    tx_subsystems::net::proc_net_route_snapshot_text(
+        &tx_subsystems::net::initial_net_namespace_payload(),
+    )
+}
+
+fn render_net_arp() -> String {
+    tx_subsystems::net::proc_net_arp_snapshot_zero_text(
+        &tx_subsystems::net::initial_net_namespace_payload().ether_ifaces_snapshot(),
+    )
+}
+
+fn render_net_dev() -> String {
+    tx_subsystems::net::proc_net_dev_snapshot_text(
+        &tx_subsystems::net::initial_net_namespace_payload().ether_ifaces_snapshot(),
+    )
+}
+
+fn render_ip_forward() -> String {
+    let enabled = tx_subsystems::net::initial_net_namespace_payload().ipv4_forwarding_enabled();
+    if enabled {
+        String::from("1\n")
+    } else {
+        String::from("0\n")
+    }
 }

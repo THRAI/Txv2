@@ -19,6 +19,10 @@ use crate::net::execution::{
     step_flush_pending_arp, step_process_device_tx_pending_in_namespace_at,
     step_process_network_events_in_namespace_at, ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome,
 };
+use crate::net::netfilter::{
+    apply_postrouting_nat_ipv4, apply_prerouting_nat_ipv4, run_frame_hook, NetfilterFrameContext,
+    NetfilterHook, NetfilterVerdict,
+};
 use crate::net::packet::{PacketDispatch, PacketSource, PacketTxResult};
 use crate::net::protocol::{
     loopback_iface, EtherIface, EtherPacketTxSink, IfaceCommon, LoopbackIface,
@@ -934,9 +938,35 @@ impl NetNamespacePayload {
         if ethernet.ethertype() != EthernetProtocol::Ipv4 {
             return None;
         }
-        let ipv4 = Ipv4Packet::new_checked(ethernet.payload()).ok()?;
+        if run_frame_hook(
+            NetfilterFrameContext {
+                hook: NetfilterHook::Prerouting,
+                bridge: None,
+                ingress: Some(ingress.name),
+                egress: None,
+            },
+            ethernet.payload(),
+        ) == NetfilterVerdict::Drop
+        {
+            return Some(NetNamespaceForwardOutcome {
+                dropped: 1,
+                ..NetNamespaceForwardOutcome::default()
+            });
+        }
+
+        let prerouting = apply_prerouting_nat_ipv4(
+            NetfilterFrameContext {
+                hook: NetfilterHook::Prerouting,
+                bridge: None,
+                ingress: Some(ingress.name),
+                egress: None,
+            },
+            ethernet.payload(),
+        );
+        let packet = prerouting.as_deref().unwrap_or_else(|| ethernet.payload());
+        let ipv4 = Ipv4Packet::new_checked(packet).ok()?;
         let dst = Ipv4Address::new(ipv4.dst_addr().octets());
-        if self.is_local_ipv4_destination(dst) {
+        if prerouting.is_none() && self.is_local_ipv4_destination(dst) {
             return None;
         }
         if !self.ipv4_forwarding_enabled() {
@@ -945,7 +975,7 @@ impl NetNamespacePayload {
                 ..NetNamespaceForwardOutcome::default()
             });
         }
-        Some(self.forward_ipv4_packet_from_iface(ingress.name, ethernet.payload(), dst, now, guard))
+        Some(self.forward_ipv4_packet_from_iface(ingress.name, packet, dst, now, guard))
     }
 
     fn forward_ipv4_packet_from_iface(
@@ -978,6 +1008,50 @@ impl NetNamespacePayload {
                 ..NetNamespaceForwardOutcome::default()
             };
         };
+
+        if run_frame_hook(
+            NetfilterFrameContext {
+                hook: NetfilterHook::Forward,
+                bridge: None,
+                ingress: Some(ingress_name),
+                egress: Some(egress.name),
+            },
+            packet,
+        ) == NetfilterVerdict::Drop
+        {
+            return NetNamespaceForwardOutcome {
+                dropped: 1,
+                ..NetNamespaceForwardOutcome::default()
+            };
+        }
+
+        let postrouting = apply_postrouting_nat_ipv4(
+            NetfilterFrameContext {
+                hook: NetfilterHook::Postrouting,
+                bridge: None,
+                ingress: Some(ingress_name),
+                egress: Some(egress.name),
+            },
+            packet,
+            egress.common.ipv4_addr(),
+        );
+        let packet = postrouting.as_deref().unwrap_or(packet);
+
+        if run_frame_hook(
+            NetfilterFrameContext {
+                hook: NetfilterHook::Postrouting,
+                bridge: None,
+                ingress: Some(ingress_name),
+                egress: Some(egress.name),
+            },
+            packet,
+        ) == NetfilterVerdict::Drop
+        {
+            return NetNamespaceForwardOutcome {
+                dropped: 1,
+                ..NetNamespaceForwardOutcome::default()
+            };
+        }
 
         match egress.dispatch_ip_at(packet, now, guard) {
             PacketTxResult::Accepted { .. } => NetNamespaceForwardOutcome {
