@@ -35,6 +35,7 @@ const RTM_GETLINK: u16 = 18;
 const NFNL_SUBSYS_NFTABLES: u16 = 10;
 const NFT_MSG_GETTABLE: u16 = 1;
 const NFT_MSG_NEWTABLE: u16 = 0;
+const NFT_MSG_DELTABLE: u16 = 2;
 const IPT_GETINFO_BYTES: usize = 84;
 const IPT_GET_ENTRIES_EMPTY_BYTES: usize = 36;
 
@@ -139,12 +140,53 @@ fn nft_gettable_request(seq: u32) -> Vec<u8> {
     out
 }
 
+fn nft_table_request(seq: u32, op: u16, name: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(2);
+    payload.push(0);
+    payload.extend_from_slice(&0u16.to_be_bytes());
+    push_nla_string(&mut payload, 1, name);
+
+    let len = 16 + payload.len();
+    let mut out = Vec::new();
+    out.extend_from_slice(&(len as u32).to_le_bytes());
+    out.extend_from_slice(&nft_msg(op).to_le_bytes());
+    out.extend_from_slice(&NLM_F_REQUEST.to_le_bytes());
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&payload);
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    out
+}
+
 fn nft_msg(op: u16) -> u16 {
     (NFNL_SUBSYS_NFTABLES << 8) | op
 }
 
 fn nlmsg_type(msg: &[u8]) -> u16 {
     u16::from_le_bytes([msg[4], msg[5]])
+}
+
+fn nlmsg_error_code(msg: &[u8]) -> i32 {
+    i32::from_le_bytes(msg[16..20].try_into().unwrap())
+}
+
+fn push_nla_string(out: &mut Vec<u8>, kind: u16, value: &str) {
+    let mut payload = Vec::from(value.as_bytes());
+    payload.push(0);
+    push_nla(out, kind, &payload);
+}
+
+fn push_nla(out: &mut Vec<u8>, kind: u16, payload: &[u8]) {
+    let len = 4 + payload.len();
+    out.extend_from_slice(&(len as u16).to_le_bytes());
+    out.extend_from_slice(&kind.to_le_bytes());
+    out.extend_from_slice(payload);
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -470,6 +512,80 @@ fn dispatch_netlink_netfilter_sendto_recvfrom_returns_table_dump() {
     );
     assert_eq!(recv_addr_len, SOCKADDR_NL_BYTES);
     tx_subsystems::net::flush_netfilter_rules_and_conntrack_for_test_or_bootstrap();
+}
+
+#[test]
+fn dispatch_netlink_netfilter_newtable_returns_ack() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_netfilter(&ctx);
+    let nladdr = sockaddr_nl();
+    let request = nft_table_request(0x78, NFT_MSG_NEWTABLE, "txshimnft");
+    let cleanup = nft_table_request(0x79, NFT_MSG_DELTABLE, "txshimnft");
+    let mut recv_buf = [0u8; 128];
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                fd as u64,
+                nladdr.as_ptr() as u64,
+                SOCKADDR_NL_BYTES as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                fd as u64,
+                request.as_ptr() as u64,
+                request.len() as u64,
+                0,
+                nladdr.as_ptr() as u64,
+                SOCKADDR_NL_BYTES as u64
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(request.len() as i64)
+    );
+
+    let recv = socket_req(
+        NR_RECVFROM,
+        [
+            fd as u64,
+            recv_buf.as_mut_ptr() as u64,
+            recv_buf.len() as u64,
+            0,
+            0,
+            0,
+        ],
+        &ctx,
+    );
+    assert!(matches!(recv, SyscallResult::Return(n) if n > 0));
+    assert_eq!(nlmsg_type(&recv_buf), 2);
+    assert_eq!(nlmsg_error_code(&recv_buf), 0);
+
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                fd as u64,
+                cleanup.as_ptr() as u64,
+                cleanup.len() as u64,
+                0,
+                nladdr.as_ptr() as u64,
+                SOCKADDR_NL_BYTES as u64
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(cleanup.len() as i64)
+    );
 }
 
 #[test]

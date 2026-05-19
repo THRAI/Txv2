@@ -285,6 +285,19 @@ pub fn remove_netfilter_rule_for_test_or_bootstrap(index: usize) -> Result<(), E
     Ok(())
 }
 
+pub fn remove_netfilter_rules_for_table_for_test_or_bootstrap(table: NetfilterTable) {
+    NETFILTER_RULES.lock().retain(|rule| rule.table != table);
+}
+
+pub fn remove_netfilter_rules_for_chain_for_test_or_bootstrap(
+    table: NetfilterTable,
+    hook: NetfilterHook,
+) {
+    NETFILTER_RULES
+        .lock()
+        .retain(|rule| rule.table != table || rule.hook != hook);
+}
+
 pub fn flush_netfilter_rules_and_conntrack_for_test_or_bootstrap() {
     NETFILTER_RULES.lock().clear();
     NETFILTER_CONNTRACK.lock().clear();
