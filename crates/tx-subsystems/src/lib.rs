@@ -14,6 +14,7 @@ pub mod execution;
 pub mod futex;
 pub mod initramfs;
 pub mod io_uring;
+pub mod ipc;
 pub mod mount;
 pub mod page_backed;
 pub mod pipe;

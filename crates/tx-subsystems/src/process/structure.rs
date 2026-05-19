@@ -376,6 +376,12 @@ impl ProcessIdentity {
         self.payload.lock().as_ref().map(|p| p.cred_snapshot())
     }
 
+    /// Snapshot the per-process namespace proxy bundle.
+    /// Returns `None` for zombies (no payload).
+    pub fn nsproxy_cap(&self) -> Option<Cap<crate::process::nsproxy::NsProxy>> {
+        self.payload.lock().as_ref().map(|p| p.nsproxy_cap())
+    }
+
     /// Process short name (for `/proc/<pid>/stat`). Returns `"?"` for
     /// zombies (no payload).
     pub fn comm(&self) -> [u8; 16] {
@@ -900,6 +906,14 @@ pub struct ProcessPayload {
     /// Field shape mirrors the existing
     /// `aspace: AtomicSlot<Cap<AddressSpace>>` precedent above.
     pub(crate) cred: AtomicSlot<Cap<Cred>>,
+    /// Per-process namespace proxy. Immutable-after-publication bundle
+    /// of namespace references per `NAMESPACE_VIEW_v1.md` §1.
+    /// `AtomicSlot` allows clone/unshare/setns to publish a replacement
+    /// bundle. Initial state is populated by `sign_process_payload`.
+    ///
+    /// Day-1: all namespace caps point at the init namespace.
+    /// `mnt_ns` is deferred (`MountNamespace` bootstrap not yet wired).
+    pub(crate) nsproxy: AtomicSlot<Cap<crate::process::nsproxy::NsProxy>>,
     /// Current working directory as a `DEntry` `Cap`.
     ///
     /// Spec note: `PROCESS_v1` §3 declares this as `Cap<RNode>` on a
@@ -1163,6 +1177,34 @@ impl ProcessPayload {
         self.cred
             .load()
             .expect("ProcessPayload.cred slot is always populated")
+    }
+
+    /// Snapshot the per-process namespace proxy. The returned `Cap`
+    /// shares the same `NsProxy` bundle; clone/unshare/setns publish
+    /// a replacement via `replace_nsproxy`.
+    ///
+    /// Day-1: all namespace caps point at init-namespace stubs.
+    /// `mnt_ns` is deferred (`MountNamespace` bootstrap not yet wired).
+    pub fn nsproxy_cap(&self) -> Cap<crate::process::nsproxy::NsProxy> {
+        self.nsproxy
+            .load()
+            .expect("ProcessPayload.nsproxy slot is always populated")
+    }
+
+    /// Atomically install `new` as the current nsproxy cap and return
+    /// the previously installed cap. Used by `step_clone_newipc` /
+    /// `step_setns` to publish a replacement bundle.
+    #[expect(
+        dead_code,
+        reason = "txdoc:NAMESPACE-VIEW-CORE-PLACEMENT-1 — called by clone_newipc/setns (future)"
+    )]
+    pub(crate) fn replace_nsproxy(
+        &self,
+        new: Cap<crate::process::nsproxy::NsProxy>,
+    ) -> Cap<crate::process::nsproxy::NsProxy> {
+        self.nsproxy
+            .swap(Some(new))
+            .expect("ProcessPayload.nsproxy slot is always populated")
     }
 
     /// Atomically install `new` as the current cred-cap and return
