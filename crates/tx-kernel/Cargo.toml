@@ -28,6 +28,7 @@ tx-shims = { path = "../tx-shims" }
 tx-substrate = { path = "../tx-substrate" }
 tx-test-support = { path = "../tx-test-support" }
 tx-subsystems = { path = "../tx-subsystems" }
+tx-services = { path = "../tx-services" }
 # Observation ring dump — `init/exec.rs` calls `tx_observe::dump_console_hex`
 # after the leader thread zombifies so a host-side `cargo xtask observe
 # extract` can recover the captured `.txtrace` blob from the serial log.

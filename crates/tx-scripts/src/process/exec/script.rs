@@ -335,24 +335,24 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         return Err(ExecError::IoError); // maps to ELOOP
     }
 
-    // ---- ASLR helpers (inline closures, capture P) -----------------
+    // ---- ASLR helpers (inline closures) ----------------------------
     let randomize_et_dyn_base = || -> u64 {
         let mut buf = [0u8; 8];
-        <P as tx_hal::EntropyIf>::fill_random(&mut buf);
+        tx_services::random::fill_bytes(&mut buf);
         let r = u64::from_le_bytes(buf);
         let offset = r & ((1 << 24) - 1) & !(USER_PAGE_SIZE - 1);
         ET_DYN_LOAD_BIAS + offset
     };
     let randomize_interp_base = || -> u64 {
         let mut buf = [0u8; 8];
-        <P as tx_hal::EntropyIf>::fill_random(&mut buf);
+        tx_services::random::fill_bytes(&mut buf);
         let r = u64::from_le_bytes(buf);
         let offset = r & ((1 << 24) - 1) & !(USER_PAGE_SIZE - 1);
         INTERP_BASE + offset
     };
     let randomize_stack_top = || -> u64 {
         let mut buf = [0u8; 8];
-        <P as tx_hal::EntropyIf>::fill_random(&mut buf);
+        tx_services::random::fill_bytes(&mut buf);
         (USER_STACK_TOP_DEFAULT + (u64::from_le_bytes(buf) & 0x7F_FFFF)) & !(USER_PAGE_SIZE - 1)
     };
 
@@ -869,7 +869,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // static `[0; 16]` and adequate for txKernel's current trust
     // model (no ASLR, no untrusted input).
     let mut at_random_bytes = [0u8; 16];
-    <P as EntropyIf>::fill_random(&mut at_random_bytes);
+    tx_services::random::fill_bytes(&mut at_random_bytes);
     let arch = <P as tx_hal::AuxvIf>::arch_auxv_facts();
 
     let auxv_facts = AuxvFacts {

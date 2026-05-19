@@ -403,11 +403,11 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         nr if nr == NR_GETTIMEOFDAY => return sys_gettimeofday::<P>(req.args, ctx),
         nr if nr == NR_UMASK => return sys_umask(req.args, ctx),
         nr if nr == NR_UNAME => return sys_uname(req.args, ctx),
-        nr if nr == NR_GETRANDOM => return sys_getrandom::<P>(req.args, ctx),
+        nr if nr == NR_GETRANDOM => return sys_getrandom(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
         nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
         nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
-        nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args),
+        nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args, ctx),
         nr if nr == NR_MADVISE => return sys_madvise(req.args, ctx),
         nr if nr == NR_MLOCK => return sys_mlock(req.args, ctx).await,
         nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx).await,
@@ -439,7 +439,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
         nr if nr == NR_SETSID => sys_setsid(ctx),
         nr if nr == NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
-        nr if nr == NR_SET_ROBUST_LIST => sys_set_robust_list(req.args),
+        nr if nr == NR_SET_ROBUST_LIST => sys_set_robust_list(req.args, ctx),
         // Wave 2 of the DAC + setuid slice — Part 3 (cred-mutation /
         // cred-reading arms). Each wraps a Wave 1 `cred::step_*`
         // helper through the new `ctx.cred()` accessor.
