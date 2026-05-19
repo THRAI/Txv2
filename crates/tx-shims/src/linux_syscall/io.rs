@@ -1414,6 +1414,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let op = OpenFileWriteOp {
         file: &file,
         bytes: &bytes,
+        caller_netns: ctx.process.net_namespace(),
         cursor: 0,
     };
     match drive(
@@ -1791,6 +1792,7 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     let op = OpenFileReadOp {
         file: &file,
         out: &mut staging,
+        caller_netns: ctx.process.net_namespace(),
         cursor: 0,
     };
     match drive(

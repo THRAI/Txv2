@@ -17,6 +17,7 @@ use crate::vfs::adapter::step_engine::{
 };
 use crate::vm::AddressSpace;
 use tx_hal::UserPtr;
+use tx_substrate::zone::PayloadCap;
 
 use super::structure::{
     Credential, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileBacking, OpenFileIoctl,
@@ -260,6 +261,22 @@ pub trait FsOps: Send + Sync + 'static {
         StepOutcome::err(Errno::ENOSYS)
     }
 
+    /// Read projected content using the caller's network namespace
+    /// when a backend has namespace-sensitive projections such as
+    /// `/proc/net/*`. Backends without such projections inherit the
+    /// legacy projected read behavior.
+    fn step_read_projected_with_netns(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        buf: &mut [u8],
+        caller_netns: Option<&crate::net::NetNamespacePayload>,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<u64, NoProgress> {
+        let _ = caller_netns;
+        self.step_read_projected(fs_object_id, offset, buf, guard)
+    }
+
     /// Write content to a projected inode (procfs/sysctl style files).
     /// Called by `OpenFile::step_write` when `RNodeBacking::Projected`.
     /// Default: `ENOSYS`.
@@ -272,6 +289,21 @@ pub trait FsOps: Send + Sync + 'static {
     ) -> StepOutcome<u64, NoProgress> {
         let _ = (fs_object_id, offset, bytes, guard);
         StepOutcome::err(Errno::ENOSYS)
+    }
+
+    /// Write projected content using the caller's network namespace
+    /// when the projection is namespace-sensitive. The default keeps
+    /// existing backends on their legacy projected write path.
+    fn step_write_projected_with_netns(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        bytes: &[u8],
+        caller_netns: Option<&crate::net::NetNamespacePayload>,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<u64, NoProgress> {
+        let _ = caller_netns;
+        self.step_write_projected(fs_object_id, offset, bytes, guard)
     }
 }
 
@@ -301,6 +333,17 @@ pub struct MountOutput {
 impl OpenFile {
     /// Dispatch a read against this file's RNode backing.
     pub fn step_read(&self, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        self.step_read_with_netns(out, None, guard)
+    }
+
+    /// Dispatch a read with optional caller network namespace context
+    /// for namespace-sensitive projected files.
+    pub fn step_read_with_netns(
+        &self,
+        out: &mut [u8],
+        caller_netns: Option<&crate::net::NetNamespacePayload>,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<usize, ByteProgress> {
         let file_flags = self.flags();
         // observe
         // upgrade
@@ -383,10 +426,13 @@ impl OpenFile {
                     .and_then(|mw| mw.upgrade(guard))
                 {
                     Some(mp) => {
-                        match mp
-                            .fs_ops()
-                            .step_read_projected(rnode.fs_object_id(), off, out, guard)
-                        {
+                        match mp.fs_ops().step_read_projected_with_netns(
+                            rnode.fs_object_id(),
+                            off,
+                            out,
+                            caller_netns,
+                            guard,
+                        ) {
                             StepOutcome::Done(n) => {
                                 self.set_offset(off + n);
                                 StepOutcome::Done(n as usize)
@@ -510,6 +556,17 @@ impl OpenFile {
 
     /// Dispatch a write against this file's RNode backing.
     pub fn step_write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        self.step_write_with_netns(bytes, None, guard)
+    }
+
+    /// Dispatch a write with optional caller network namespace context
+    /// for namespace-sensitive projected files.
+    pub fn step_write_with_netns(
+        &self,
+        bytes: &[u8],
+        caller_netns: Option<&crate::net::NetNamespacePayload>,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<usize, ByteProgress> {
         let file_flags = self.flags();
         // observe
         // upgrade
@@ -593,10 +650,11 @@ impl OpenFile {
                     .containing_mount_weak()
                     .and_then(|mw| mw.upgrade(guard))
                 {
-                    Some(mp) => match mp.fs_ops().step_write_projected(
+                    Some(mp) => match mp.fs_ops().step_write_projected_with_netns(
                         rnode.fs_object_id(),
                         off,
                         bytes,
+                        caller_netns,
                         guard,
                     ) {
                         StepOutcome::Done(n) => {
@@ -752,6 +810,7 @@ fn step_tty_ioctl(
 pub struct OpenFileReadOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub out: &'a mut [u8],
+    pub caller_netns: Option<PayloadCap<crate::net::NetNamespacePayload>>,
     /// Internal write cursor: each `step()` call fills bytes starting
     /// at `out[cursor..]` and advances `cursor` by the amount returned
     /// in the outcome. This allows `drive()` to call `step()` multiple
@@ -765,7 +824,13 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileReadOp<'a> {
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let guard = step_engine::guard();
-        let result = self.file.step_read(&mut self.out[self.cursor..], &guard);
+        let caller_netns = self
+            .caller_netns
+            .as_ref()
+            .map(|netns| &**netns as &crate::net::NetNamespacePayload);
+        let result =
+            self.file
+                .step_read_with_netns(&mut self.out[self.cursor..], caller_netns, &guard);
         // Advance cursor by the bytes read in this step. The
         // `StepProgress` accumulator (ByteProgress) carries the same
         // value, so `drive()`'s `accumulated` stays in sync with the
@@ -812,6 +877,7 @@ impl OneShotStepOp<crate::process::ProcessIdentity> for OpenFileLseekOp<'_> {}
 pub struct OpenFileWriteOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub bytes: &'a [u8],
+    pub caller_netns: Option<PayloadCap<crate::net::NetNamespacePayload>>,
     /// Internal write cursor: each `step()` call consumes bytes starting
     /// at `bytes[cursor..]`. Mirrors `OpenFileReadOp::cursor`.
     pub cursor: usize,
@@ -822,7 +888,13 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteOp<'a> {
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let guard = step_engine::guard();
-        let result = self.file.step_write(&self.bytes[self.cursor..], &guard);
+        let caller_netns = self
+            .caller_netns
+            .as_ref()
+            .map(|netns| &**netns as &crate::net::NetNamespacePayload);
+        let result =
+            self.file
+                .step_write_with_netns(&self.bytes[self.cursor..], caller_netns, &guard);
         match &result {
             StepOutcome::Done(n) => {
                 self.cursor += *n;
@@ -1255,6 +1327,7 @@ mod step_op_wraps {
         let mut op = OpenFileReadOp {
             file: &file,
             out: &mut buf,
+            caller_netns: None,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1275,6 +1348,7 @@ mod step_op_wraps {
         let mut op = OpenFileReadOp {
             file: &file,
             out: &mut buf,
+            caller_netns: None,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1291,6 +1365,7 @@ mod step_op_wraps {
         let mut op = OpenFileWriteOp {
             file: &file,
             bytes: b"hello",
+            caller_netns: None,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1307,6 +1382,7 @@ mod step_op_wraps {
         let mut op = OpenFileWriteOp {
             file: &file,
             bytes: b"hi",
+            caller_netns: None,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();

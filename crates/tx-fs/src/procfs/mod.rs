@@ -1062,6 +1062,17 @@ impl FsOps for Procfs {
         buf: &mut [u8],
         guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
+        self.step_read_projected_with_netns(fs_object_id, offset, buf, None, guard)
+    }
+
+    fn step_read_projected_with_netns(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        buf: &mut [u8],
+        caller_netns: Option<&tx_subsystems::net::NetNamespacePayload>,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<u64, NoProgress> {
         // `/proc/<pid>/mem` — read from target process's address space.
         // `offset` is the virtual address to read from.
         if let Some(pid) = pid_from_mem_id(fs_object_id) {
@@ -1081,7 +1092,7 @@ impl FsOps for Procfs {
             }
         } else {
             // Other projected files: render content via read::render.
-            let content: Vec<u8> = read::render(fs_object_id).into_bytes();
+            let content: Vec<u8> = read::render_with_netns(fs_object_id, caller_netns).into_bytes();
             let bytes = content.as_slice();
             let off = offset as usize;
             if off >= bytes.len() {
@@ -1101,11 +1112,28 @@ impl FsOps for Procfs {
         bytes: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
+        self.step_write_projected_with_netns(fs_object_id, _offset, bytes, None, _guard)
+    }
+
+    fn step_write_projected_with_netns(
+        &self,
+        fs_object_id: FsObjectId,
+        _offset: u64,
+        bytes: &[u8],
+        caller_netns: Option<&tx_subsystems::net::NetNamespacePayload>,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<u64, NoProgress> {
+        let default_netns;
+        let netns = match caller_netns {
+            Some(netns) => netns,
+            None => {
+                default_netns = tx_subsystems::net::initial_net_namespace_payload();
+                &default_netns
+            }
+        };
+
         if fs_object_id == PROCFS_NET_TX_NF_RULES_ID {
-            return match tx_subsystems::net::apply_netfilter_control_command(
-                &tx_subsystems::net::initial_net_namespace_payload(),
-                bytes,
-            ) {
+            return match tx_subsystems::net::apply_netfilter_control_command(netns, bytes) {
                 Ok(()) => StepOutcome::done(bytes.len() as u64),
                 Err(errno) => StepOutcome::err(errno.into()),
             };
@@ -1120,8 +1148,7 @@ impl FsOps for Procfs {
             b"1" => true,
             _ => return StepOutcome::err(Errno::EINVAL.into()),
         };
-        tx_subsystems::net::initial_net_namespace_payload()
-            .set_ipv4_forwarding_for_test_or_bootstrap(enabled);
+        netns.set_ipv4_forwarding_for_test_or_bootstrap(enabled);
         StepOutcome::done(bytes.len() as u64)
     }
     fn step_chmod(
@@ -1491,5 +1518,147 @@ mod tests {
             StepOutcome::Done(6)
         );
         assert!(tx_subsystems::net::netfilter_rules_snapshot().is_empty());
+    }
+
+    #[test]
+    fn procfs_net_files_use_supplied_caller_network_namespace() {
+        let _lock = PROCFS_TEST_LOCK.lock().expect("procfs test lock");
+        init_procfs_test();
+        let guard = tx_substrate::epoch::guard();
+        let procfs = Procfs::new();
+        let auth = NetAdminAuthority::for_test_or_bootstrap();
+
+        let initial_pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+            left: VethEndpointConfig {
+                name: "proc-initial0",
+                devt: DevT::new(100, 1),
+                mac: EthernetAddress::new([0x02, 0, 0, 0x72, 2, 1]),
+            },
+            right: VethEndpointConfig {
+                name: "proc-initial-peer0",
+                devt: DevT::new(100, 2),
+                mac: EthernetAddress::new([0x02, 0, 0, 0x72, 2, 2]),
+            },
+            mtu: VETH_DEFAULT_MTU,
+        });
+        let initial = tx_subsystems::net::initial_net_namespace_payload();
+        initial
+            .attach_device_for_test_or_bootstrap(initial_pair.left, None)
+            .expect("attach initial iface");
+        let initial_ifindex = initial
+            .link_snapshot()
+            .into_iter()
+            .find(|link| link.name == "proc-initial0")
+            .expect("initial link")
+            .ifindex;
+        initial
+            .set_device_ipv4_addr_by_ifindex(
+                auth,
+                initial_ifindex,
+                Some(Ipv4Address::new([10, 99, 0, 1])),
+                Some(24),
+            )
+            .expect("set initial addr");
+
+        let isolated = tx_subsystems::net::create_isolated_net_namespace_for_test("procfs-netns")
+            .expect("isolated netns")
+            .payload_cap()
+            .expect("isolated payload");
+        let isolated_pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+            left: VethEndpointConfig {
+                name: "proc-iso0",
+                devt: DevT::new(100, 3),
+                mac: EthernetAddress::new([0x02, 0, 0, 0x72, 2, 3]),
+            },
+            right: VethEndpointConfig {
+                name: "proc-iso-peer0",
+                devt: DevT::new(100, 4),
+                mac: EthernetAddress::new([0x02, 0, 0, 0x72, 2, 4]),
+            },
+            mtu: VETH_DEFAULT_MTU,
+        });
+        isolated
+            .attach_device_for_test_or_bootstrap(isolated_pair.left, None)
+            .expect("attach isolated iface");
+        let isolated_ifindex = isolated
+            .link_snapshot()
+            .into_iter()
+            .find(|link| link.name == "proc-iso0")
+            .expect("isolated link")
+            .ifindex;
+        isolated
+            .set_device_ipv4_addr_by_ifindex(
+                auth,
+                isolated_ifindex,
+                Some(Ipv4Address::new([172, 31, 0, 2])),
+                Some(16),
+            )
+            .expect("set isolated addr");
+
+        let mut out = [0u8; 768];
+        let read = match procfs.step_read_projected_with_netns(
+            PROCFS_NET_ROUTE_ID,
+            0,
+            &mut out,
+            Some(&isolated),
+            &guard,
+        ) {
+            StepOutcome::Done(read) => read as usize,
+            other => panic!("isolated route read failed: {other:?}"),
+        };
+        let text = core::str::from_utf8(&out[..read]).expect("route text utf8");
+        assert!(text.contains("proc-iso0"));
+        assert!(!text.contains("proc-initial0"));
+
+        assert_eq!(
+            procfs.step_write_projected_with_netns(
+                PROCFS_SYS_NET_IPV4_IP_FORWARD_ID,
+                0,
+                b"1\n",
+                Some(&isolated),
+                &guard,
+            ),
+            StepOutcome::Done(2)
+        );
+        assert!(isolated.ipv4_forwarding_enabled());
+        assert!(!initial.ipv4_forwarding_enabled());
+
+        let command = b"masquerade 172.31.0.0/16 proc-iso0\n";
+        assert_eq!(
+            procfs.step_write_projected_with_netns(
+                PROCFS_NET_TX_NF_RULES_ID,
+                0,
+                command,
+                Some(&isolated),
+                &guard,
+            ),
+            StepOutcome::Done(command.len() as u64)
+        );
+        assert!(tx_subsystems::net::netfilter_rules_snapshot().is_empty());
+        assert_eq!(
+            tx_subsystems::net::netfilter_rules_snapshot_for_namespace(&isolated).len(),
+            1
+        );
+
+        let read = match procfs.step_read_projected_with_netns(
+            PROCFS_NET_TX_NF_RULES_ID,
+            0,
+            &mut out,
+            Some(&isolated),
+            &guard,
+        ) {
+            StepOutcome::Done(read) => read as usize,
+            other => panic!("isolated netfilter read failed: {other:?}"),
+        };
+        let text = core::str::from_utf8(&out[..read]).expect("netfilter text utf8");
+        assert!(text.contains("proc-iso0"));
+
+        let read = match procfs.step_read_projected(PROCFS_NET_TX_NF_RULES_ID, 0, &mut out, &guard)
+        {
+            StepOutcome::Done(read) => read as usize,
+            other => panic!("initial netfilter read failed: {other:?}"),
+        };
+        let text = core::str::from_utf8(&out[..read]).expect("initial netfilter text utf8");
+        assert!(!text.contains("proc-iso0"));
     }
 }

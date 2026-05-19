@@ -7,8 +7,9 @@ use smoltcp::time::Instant;
 
 use crate::net::device::EthernetAddress;
 use crate::net::netfilter::{
-    netfilter_conntrack_snapshot, netfilter_rule_snapshots, NetfilterConntrackProtocol,
-    NetfilterHook, NetfilterIpv4Cidr, NetfilterNatKind, NetfilterTable, NetfilterTarget,
+    netfilter_conntrack_snapshot_for_namespace, netfilter_rule_snapshots_for_namespace,
+    NetfilterConntrackProtocol, NetfilterHook, NetfilterIpv4Cidr, NetfilterNatKind, NetfilterTable,
+    NetfilterTarget,
 };
 use crate::net::protocol::{ArpSnapshotState, EtherIface};
 use crate::net::structure::Ipv4Address;
@@ -106,13 +107,21 @@ pub fn proc_net_route_snapshot_text(netns: &NetNamespacePayload) -> String {
 }
 
 pub fn proc_net_netfilter_rules_text() -> String {
+    let netns = crate::net::namespace::initial_net_namespace_payload();
+    proc_net_netfilter_rules_text_for_namespace(&netns)
+}
+
+pub fn proc_net_netfilter_rules_text_for_namespace(netns: &NetNamespacePayload) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
         "idx\tpackets\tbytes\ttable\thook\tproto\ttarget\tsrc\tdst\tdport\tin\tout\tto"
     );
 
-    for (idx, snapshot) in netfilter_rule_snapshots().into_iter().enumerate() {
+    for (idx, snapshot) in netfilter_rule_snapshots_for_namespace(netns)
+        .into_iter()
+        .enumerate()
+    {
         let rule = snapshot.rule;
         let src = rule
             .src
@@ -160,9 +169,14 @@ pub fn proc_net_netfilter_rules_text() -> String {
 }
 
 pub fn proc_net_nf_conntrack_text() -> String {
+    let netns = crate::net::namespace::initial_net_namespace_payload();
+    proc_net_nf_conntrack_text_for_namespace(&netns)
+}
+
+pub fn proc_net_nf_conntrack_text_for_namespace(netns: &NetNamespacePayload) -> String {
     let mut out = String::new();
 
-    for entry in netfilter_conntrack_snapshot() {
+    for entry in netfilter_conntrack_snapshot_for_namespace(netns) {
         let proto = conntrack_protocol_name(entry.protocol);
         let kind = nat_kind_name(entry.kind);
         let _ = writeln!(
