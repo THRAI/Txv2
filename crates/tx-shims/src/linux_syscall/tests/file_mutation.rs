@@ -847,12 +847,12 @@ fn dispatch_renameat2_exchange_returns_neg_enosys() {
 // utimensat
 // -----------------------------------------------------------------
 
-/// `utimensat` returns 0 (success-stub: timestamps are not mutated but
-/// the syscall succeeds so that `touch(1)` exits 0 in busybox-musl
-/// tests).  Real timestamp mutation is deferred under
+/// `utimensat` returns `-ENOSYS` (FsOps surface does not yet expose
+/// a `set_times` hook). `touch(1)` ignores the error and exits 0 in
+/// busybox-musl tests. Real timestamp mutation is deferred under
 /// `TODO(phase-vfs-utimens)`.
 #[test]
-fn dispatch_utimensat_returns_success_stub() {
+fn dispatch_utimensat_returns_enosys() {
     let _setup = fm_setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
@@ -860,5 +860,5 @@ fn dispatch_utimensat_returns_success_stub() {
 
     let req = SyscallRequest::new(NR_UTIMENSAT, [AT_FDCWD as i64 as u64, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(result, SyscallResult::Error(E_NOSYS));
 }
