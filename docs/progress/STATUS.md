@@ -651,6 +651,81 @@
   (whether sdcard has ls symlinks or if PATH setup helps). libctest-musl
   and libcbench-musl show no output (0/N) — those test suites might be
   the next target.
+- 2026-05-18 **OBS: PGID swimlane grouping + fork/clone flow arrows.**
+  Two layout improvements to the Perfetto rendering, addressing the
+  "scattered views" feedback:
+  - **PGID grouping** (OBS-V1 §15.8). New
+    `PayloadProcessGroup { pid, pgid, sid }` wire payload + tag
+    `ProcessGroup = 55`, emitted as a Sched-level Instant alongside
+    `PayloadProcessLabel` at each submit / post-exec site.
+    `tx-kernel` reads `ProcessIdentity::pgrp_cap()` for the live
+    `Cap<ProcessGroup>` (pgid + session). Daemon caches `pid →
+    (pgid, sid)`; `TrackRegistry::ensure_pgrp_track` materialises a
+    top-level `pgroup-<pgid> (sid=<sid>)` swimlane keyed by
+    `0xE000_0000_0000_0000 | pgid`, and `ensure_process_track` now
+    accepts an optional `pgid` so per-process tracks set
+    `parent_uuid` to the pgrp swimlane. The basic-musl trace now
+    nests all 60 test processes under a single `pgroup-1` lane
+    instead of leaving them scattered top-level.
+  - **Fork/clone flow arrows** (OBS-V1 §15.9). New
+    `PayloadProcessFork { parent_pid, child_pid }` wire payload +
+    tag `ProcessFork = 56`, emitted from
+    `drain_pending_child_submits` after the child's PCB is queried.
+    Parent's PID resolved via `Cap<ProcessIdentity>::parent_pid()`.
+    Daemon decodes the edge and emits a pair of TrackEvents sharing
+    one `compute_flow_id(parent_pid, child_pid, FlowKind::Fork)` —
+    one anchored on the parent's process track named
+    `fork→<child>`, one on the child's track named
+    `forked←<parent>`. Perfetto draws an arrow between them. The
+    captured `oscomp.pftrace` carries 59 fork edges matching the
+    test driver's children. Materialises missing process tracks on
+    demand (uses cached `comm` + `pgid` to do it right) so the
+    flow's downstream anchor always has a track to land on.
+  - **Deadlock fix.** Moved the post-exec ProcessLabel +
+    ProcessGroup emit OUT of the `payload._comm.lock()` scope in
+    `exec_script` — keeping the emit (which itself locks `pgrp_cap`
+    and writes to the per-hart observation ring) inside the
+    payload-slot lock had hung busybox under the new code path.
+    Each lock acquisition is now flat and short.
+  - **Verification.** `cargo -q xtask unit` — 332 tests pass.
+    End-to-end `cargo xtask oscomp qemu --target rv64-qemu` → reach
+    20k threshold → `observe extract` + `observe pftrace`:
+    resulting pftrace shows `pgroup-1 (sid=1)` swimlane parenting
+    `busybox`/`sh`-named process tracks parenting `tid-N` thread
+    tracks; 59 fork edges connecting parent and child tracks.
+
+- 2026-05-18 **OBS: PCB program names + readable register values.**
+  Two visible follow-ups to the PID/TID plumbing:
+  - **Process names from PCB.** New `PayloadProcessLabel { pid: u32,
+    comm: [u8; 12] }` wire payload + `TxPayloadTag::ProcessLabel`
+    (=54). Emitted as a `Sched`-level Instant once per process at
+    submit time (kernel-side: `init/exec.rs` leader,
+    `init.rs::drain_pending_child_submits` for sys_clone children)
+    and re-emitted from `tx-scripts::process::exec::exec_script`
+    immediately after the PCB `_comm` is committed — so the daemon
+    picks up the post-execve binary name, not the parent's pre-fork
+    `comm`. Closes a latent gap: `step_store_exec_identity` existed
+    but had no callers, so `_comm` was `[0; 16]` forever. Now
+    `exec_script` writes basename(argv[0]) into `_comm` + `_cmdline`
+    at the PoNR commit; visibility of `_comm` widened from
+    `pub(crate)` to `pub` so the script crate can write it directly.
+    Daemon: extracts the printable ASCII prefix from the 12-byte
+    `comm`, caches `pid → name`, uses it as
+    `ProcessDescriptor.process_name` at first track materialisation;
+    when a fresh label arrives AFTER the track is already named,
+    `TrackRegistry::rename_process_track` re-emits a `TrackDescriptor`
+    keyed by the same UUID so Perfetto renames the swimlane
+    retroactively. Verified: `oscomp.pftrace` carries 28
+    `busybox`-named process tracks alongside the synthetic `pid-<N>`
+    fallback (processes that never reached the post-exec re-emit).
+  - **Readable register values.** Daemon's ArgValue Instant
+    rendering now formats the label as `a<i>=0x<hex>` (e.g.
+    `a0=0x163c14`) via `intern_str` instead of just `a<i>`. Perfetto
+    renders Instants as vertical markers labeled by event name, so
+    the register value now reads on the timeline directly below each
+    syscall slice — no click needed. The structured `DebugAnnotation
+    { name="value", uint_value=… }` is still emitted alongside for
+    tooling that prefers the raw number.
 
 - 2026-05-18 **OBS: real PID/TID in Perfetto slice details + per-syscall
   arg annotations.** Slices in `oscomp.pftrace` no longer show the

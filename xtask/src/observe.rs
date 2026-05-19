@@ -247,7 +247,6 @@ fn demangle_symbol(name: &str) -> String {
 ///   * `tx_scripts::drive::op_name_id::<X>`
 ///   * `tx_scripts::drive::op_name_id::<X>::ha34b1d6e23bf99c0`
 ///     (legacy mangling appends a per-crate-version hash trailer)
-///
 /// Both forms are handled — we read up to the first balanced `>` and
 /// stop, leaving any trailer untouched.
 fn extract_op_name_id_type_param(demangled: &str) -> Option<&str> {
@@ -286,6 +285,7 @@ fn short_type(full: &str) -> String {
     last.trim_end_matches("<'_>").to_string()
 }
 
+
 const KERNEL_FNV1A_STABLE_NAMES: &[(&str, &str)] = &[
     ("resume", "resume"),
     ("step", "step"),
@@ -300,75 +300,27 @@ const KERNEL_FNV1A_STABLE_NAMES: &[(&str, &str)] = &[
 /// (so the trace daemon doesn't show every kernel ABI it might call).
 fn linux_rv64_syscalls() -> &'static [(u16, &'static str)] {
     &[
-        (17, "getcwd"),
-        (23, "dup"),
-        (24, "dup3"),
-        (25, "fcntl"),
-        (29, "ioctl"),
-        (32, "flock"),
-        (34, "mkdirat"),
-        (35, "unlinkat"),
-        (38, "renameat"),
-        (39, "umount2"),
-        (40, "mount"),
-        (45, "truncate"),
-        (46, "ftruncate"),
-        (48, "faccessat"),
-        (49, "chdir"),
-        (56, "openat"),
-        (57, "close"),
-        (59, "pipe2"),
-        (61, "getdents64"),
-        (62, "lseek"),
-        (63, "read"),
-        (64, "write"),
-        (66, "writev"),
-        (73, "ppoll"),
+        (17, "getcwd"), (23, "dup"), (24, "dup3"), (25, "fcntl"), (29, "ioctl"),
+        (32, "flock"), (34, "mkdirat"), (35, "unlinkat"), (38, "renameat"),
+        (39, "umount2"), (40, "mount"), (45, "truncate"), (46, "ftruncate"),
+        (48, "faccessat"), (49, "chdir"), (56, "openat"), (57, "close"),
+        (59, "pipe2"), (61, "getdents64"), (62, "lseek"), (63, "read"),
+        (64, "write"), (66, "writev"), (71, "sendfile"), (73, "ppoll"),
         (78, "readlinkat"),
-        (79, "fstatat"),
-        (80, "fstat"),
-        (88, "utimensat"),
-        (93, "exit"),
-        (94, "exit_group"),
-        (96, "set_tid_address"),
-        (98, "futex"),
-        (99, "set_robust_list"),
-        (101, "nanosleep"),
-        (113, "clock_gettime"),
-        (122, "sched_getaffinity"),
-        (129, "kill"),
-        (133, "rt_sigsuspend"),
-        (134, "rt_sigaction"),
-        (135, "rt_sigprocmask"),
-        (139, "rt_sigreturn"),
-        (153, "times"),
-        (154, "setpgid"),
-        (155, "getpgid"),
-        (156, "getsid"),
-        (157, "setsid"),
-        (160, "uname"),
-        (165, "getrusage"),
-        (166, "umask"),
-        (167, "prctl"),
-        (169, "gettimeofday"),
-        (172, "getpid"),
-        (173, "getppid"),
-        (174, "getuid"),
-        (175, "geteuid"),
-        (176, "getgid"),
-        (177, "getegid"),
-        (178, "gettid"),
-        (179, "sysinfo"),
-        (214, "brk"),
-        (215, "munmap"),
-        (220, "clone"),
-        (221, "execve"),
-        (222, "mmap"),
-        (226, "mprotect"),
-        (233, "madvise"),
-        (260, "wait4"),
-        (261, "prlimit64"),
-        (278, "getrandom"),
+        (79, "fstatat"), (80, "fstat"), (88, "utimensat"), (93, "exit"),
+        (94, "exit_group"), (96, "set_tid_address"), (98, "futex"),
+        (99, "set_robust_list"), (101, "nanosleep"), (113, "clock_gettime"),
+        (122, "sched_getaffinity"), (123, "sched_setaffinity"),
+        (124, "sched_yield"), (129, "kill"), (130, "tkill"), (131, "tgkill"),
+        (132, "sigaltstack"), (133, "rt_sigsuspend"),
+        (134, "rt_sigaction"), (135, "rt_sigprocmask"), (139, "rt_sigreturn"),
+        (153, "times"), (154, "setpgid"), (155, "getpgid"), (156, "getsid"),
+        (157, "setsid"), (160, "uname"), (165, "getrusage"), (166, "umask"),
+        (167, "prctl"), (169, "gettimeofday"), (172, "getpid"), (173, "getppid"),
+        (174, "getuid"), (175, "geteuid"), (176, "getgid"), (177, "getegid"),
+        (178, "gettid"), (179, "sysinfo"), (214, "brk"), (215, "munmap"),
+        (220, "clone"), (221, "execve"), (222, "mmap"), (226, "mprotect"),
+        (233, "madvise"), (260, "wait4"), (261, "prlimit64"), (278, "getrandom"),
     ]
 }
 
@@ -879,8 +831,8 @@ fn observe_demo(args: &[String]) -> Result<()> {
         p[1] = 1; // progress_empty
         p[2] = 1; // progress_kind=Byte
         p[3] = 1; // shape_kind=OnWaitSource
-                  // errno (4..8) = 0
-                  // progress_value (8..12) = 0
+        // errno (4..8) = 0
+        // progress_value (8..12) = 0
         p
     };
     let payload_step_done = {
@@ -926,43 +878,16 @@ fn observe_demo(args: &[String]) -> Result<()> {
     //               12=StepOutcome, 20=YieldBegin, 21=Resume, 22=WaitSourceNotify.
     let mut record_payloads: Vec<DemoRecord> = vec![
         (10, 0, n_sys_read, sys_span, 0, 1, 8, payload_syscall_enter),
-        (
-            10,
-            2,
-            n_drive,
-            drv_span,
-            sys_span,
-            10,
-            12,
-            payload_drive_begin,
-        ),
+        (10, 2, n_drive, drv_span, sys_span, 10, 12, payload_drive_begin),
         (10, 4, n_step0, step0_span, drv_span, 0, 0, [0u8; 16]),
         (11, 4, 0, step0_span, 0, 12, 16, payload_step_yield),
     ];
 
     if with_yields {
-        record_payloads.push((
-            10,
-            3,
-            n_yield,
-            yield_span,
-            drv_span,
-            20,
-            16,
-            payload_yield_begin,
-        ));
+        record_payloads.push((10, 3, n_yield, yield_span, drv_span, 20, 16, payload_yield_begin));
     }
     // Producer-side wake.notify always emits (independent of consumer state).
-    record_payloads.push((
-        12,
-        3,
-        n_wake,
-        0,
-        drv_span,
-        22,
-        16,
-        payload_wait_source_notify,
-    ));
+    record_payloads.push((12, 3, n_wake, 0, drv_span, 22, 16, payload_wait_source_notify));
     if with_yields {
         record_payloads.push((12, 3, n_resume, 0, yield_span, 21, 16, payload_resume));
         record_payloads.push((11, 3, 0, yield_span, 0, 0, 0, [0u8; 16]));
