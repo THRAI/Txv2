@@ -421,6 +421,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         NR_WRITEV => sys_writev(req.args, ctx).await,
         NR_READ => sys_read::<P>(req.args, ctx).await,
         NR_READV => sys_readv::<P>(req.args, ctx).await,
+        NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
         NR_PPOLL => sys_ppoll(req.args, ctx).await,
         NR_EXIT => sys_exit(req.args, ctx),
         NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
