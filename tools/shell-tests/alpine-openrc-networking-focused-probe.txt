@@ -28,7 +28,7 @@ expect "N72Y_RCSERVICE_PROBE_DONE" within 10000
 expect "/ # " within 10000
 
 sleep 500
-send "if [ -x /etc/init.d/networking ]; then /etc/init.d/networking status; rc=$?; echo ${m}_NETWORKING_STATUS_RC_${rc}; else echo ${m}_NON_NETWORK_BLOCKER_NO_NETWORKING_INITD; fi; echo ${m}_NETWORKING_STATUS_PROBE_DONE\n"
+send "if [ -x /etc/init.d/networking ]; then if timeout true >/dev/null 2>&1; then timeout 5 /etc/init.d/networking status; rc=$?; echo ${m}_NETWORKING_STATUS_RC_${rc}; if [ $rc -eq 124 ] || [ $rc -eq 143 ]; then echo ${m}_NON_NETWORK_BLOCKER_NETWORKING_STATUS_TIMEOUT; fi; else echo ${m}_NON_NETWORK_BLOCKER_NO_TIMEOUT_FOR_NETWORKING_STATUS; echo ${m}_NETWORKING_STATUS_RC_127; fi; else echo ${m}_NON_NETWORK_BLOCKER_NO_NETWORKING_INITD; fi; echo ${m}_NETWORKING_STATUS_PROBE_DONE\n"
 expect "N72Y_NETWORKING_STATUS_PROBE_DONE" within 10000
 expect "/ # " within 10000
 
@@ -38,7 +38,7 @@ expect "N72Y_INTERFACES_PROBE_DONE" within 10000
 expect "/ # " within 10000
 
 sleep 500
-send "if [ -x /etc/init.d/networking ] && [ -f /etc/network/interfaces ]; then /etc/init.d/networking start; rc=$?; if [ $rc -eq 0 ]; then echo ${m}_NETWORKING_START_OK; else echo ${m}_NETWORKING_START_FAILED_RC_${rc}; fi; else echo ${m}_NETWORKING_START_SKIPPED_NON_NETWORK_BLOCKER; fi; echo ${m}_NETWORKING_START_PROBE_DONE\n"
+send "if [ -x /etc/init.d/networking ] && [ -f /etc/network/interfaces ]; then if timeout true >/dev/null 2>&1; then timeout 10 /etc/init.d/networking start; rc=$?; if [ $rc -eq 0 ]; then echo ${m}_NETWORKING_START_OK; elif [ $rc -eq 124 ] || [ $rc -eq 143 ]; then echo ${m}_NON_NETWORK_BLOCKER_NETWORKING_START_TIMEOUT; else echo ${m}_NETWORKING_START_FAILED_RC_${rc}; fi; else echo ${m}_NON_NETWORK_BLOCKER_NO_TIMEOUT_FOR_NETWORKING_START; fi; else echo ${m}_NETWORKING_START_SKIPPED_NON_NETWORK_BLOCKER; fi; echo ${m}_NETWORKING_START_PROBE_DONE\n"
 expect "N72Y_NETWORKING_START_PROBE_DONE" within 20000
 expect "/ # " within 10000
 

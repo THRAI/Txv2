@@ -15,7 +15,7 @@ BRANCH="${ALPINE_BRANCH:-latest-stable}"
 MIRROR="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 ROOTFS_DIR="${TX_ALPINE_ROOTFS:-$REPO_ROOT/target/rootfs/alpine-rv64-qemu}"
 CACHE_DIR="${TX_ALPINE_CACHE:-$REPO_ROOT/target/images/alpine-cache}"
-PACKAGES="${TX_ALPINE_PACKAGES:-busybox nftables iptables iproute2}"
+PACKAGES="${TX_ALPINE_PACKAGES:-busybox openrc nftables iptables iproute2}"
 REPOS="${TX_ALPINE_REPOS:-main community}"
 MINIROOTFS_URL="${ALPINE_MINIROOTFS_URL:-}"
 
@@ -222,6 +222,18 @@ install_apk() {
     --exclude='.post-upgrade'
 }
 
+install_default_interfaces() {
+  local interfaces="$ROOTFS_DIR/etc/network/interfaces"
+  if [ -e "$interfaces" ]; then
+    return 0
+  fi
+  mkdir -p "$ROOTFS_DIR/etc/network"
+  {
+    printf 'auto lo\n'
+    printf 'iface lo inet loopback\n'
+  } > "$interfaces"
+}
+
 main() {
   [ "$ARCH" = "riscv64" ] || die "this helper is for riscv64, got $ARCH"
   mkdir -p "$CACHE_DIR"
@@ -249,6 +261,7 @@ main() {
   mkdir -p "$ROOTFS_DIR"/dev "$ROOTFS_DIR"/proc "$ROOTFS_DIR"/sys \
     "$ROOTFS_DIR"/tmp "$ROOTFS_DIR"/run "$ROOTFS_DIR"/var/run
   chmod 1777 "$ROOTFS_DIR"/tmp
+  install_default_interfaces
   mkdir -p "$ROOTFS_DIR/etc/apk" "$ROOTFS_DIR/var/lib"
   {
     for repo in $REPOS; do
