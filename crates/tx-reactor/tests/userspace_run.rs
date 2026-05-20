@@ -316,7 +316,7 @@ fn stale_entry_checkpoint_does_not_drain_ast() {
 
 #[test]
 fn reactor_entry_checkpoint_drains_task_ast_before_dispatching_userspace() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = reactor.submit_task(std::future::pending::<()>());
     let wait = reactor
         .request_userspace_run()
@@ -352,7 +352,7 @@ fn reactor_entry_checkpoint_drains_task_ast_before_dispatching_userspace() {
 
 #[test]
 fn reactor_entry_checkpoint_stale_run_does_not_drain_task_ast() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = reactor.submit_task(std::future::pending::<()>());
     let first = reactor
         .request_userspace_run()
@@ -388,7 +388,7 @@ fn reactor_entry_checkpoint_stale_run_does_not_drain_task_ast() {
 
 #[test]
 fn reactor_entry_checkpoint_terminal_task_does_not_dispatch() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = reactor.submit_task(async {});
     let wait = reactor
         .request_userspace_run()

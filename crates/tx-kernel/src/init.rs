@@ -1283,62 +1283,36 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         };
 
-        let target_hart = boot_runtime::HartId(target_cpu.0);
         let current_hart = boot_runtime::HartId(<P as tx_hal::SmpIf>::current_cpu_id().0);
-        let mask = boot_runtime::wait::Mask::from_bits(0x1);
         let targets = CpuMask::single(target_cpu);
         Self::clear_ap_reactor_task_done(targets);
-
-        let channel = BOOT_REACTOR
-            .with(|reactor| {
-                let channel = reactor.channel();
-                reactor.submit_task_with_meta(
-                    {
-                        let channel = channel.clone();
-                        async move {
-                            let _ = channel.wait(mask).await;
-                            Self::mark_ap_reactor_task_done(target_cpu);
-                        }
-                    },
-                    boot_runtime::InitialSchedMeta::kernel()
-                        .with_affinity(CpuMask::single(target_cpu).bits()),
-                );
-                channel
-            })
-            .expect("boot reactor must be initialized before AP dispatcher smoke");
-
-        let parked = BOOT_REACTOR
-            .with(|reactor| reactor.run_until_idle_on_hart(target_hart))
-            .expect("boot reactor must be initialized before AP dispatcher smoke");
-        assert!(
-            parked.polled <= 1,
-            "reactor dispatcher smoke initial poll count"
-        );
-
         P::clear_ipi_ack_cpus(IpiKind::Reschedule, targets);
-        assert_eq!(
-            channel.fire(mask),
-            1,
-            "reactor dispatcher wake registration"
-        );
 
         let mut signal = SmpRescheduleSignal::<P>::new();
         let report = BOOT_REACTOR
-            .with(|reactor| reactor.drain_wakes_for_hart(current_hart, &mut signal))
+            .with(|reactor| {
+                let (_task, report) = reactor.submit_task_with_meta_from_hart(
+                    async move {
+                        Self::mark_ap_reactor_task_done(target_cpu);
+                    },
+                    boot_runtime::InitialSchedMeta::kernel()
+                        .with_affinity(CpuMask::single(target_cpu).bits()),
+                    current_hart,
+                    &mut signal,
+                );
+                report
+            })
             .expect("boot reactor must be initialized before AP dispatcher smoke");
-        // Under multi-threaded TCG (-accel tcg,thread=multi, see
-        // xtask/src/qemu.rs), the AP may poll its own runqueue and
-        // consume the wake before the BSP gets here to drain — in
-        // which case `remote_ipis` is 0, not 1. Both 0 (AP pre-empted)
-        // and 1 (BSP drained first) are valid; only >1 would indicate
-        // a bug in the wake-routing path. Same applies to the IPI ack
-        // count below: 0 acks if no IPI was sent, else `targets.count()`.
-        assert!(
-            report.remote_ipis <= 1,
-            "reactor dispatcher remote IPI count: got {} (expected 0 or 1)",
-            report.remote_ipis,
+        assert_eq!(
+            report.remote_ipis, 1,
+            "reactor dispatcher remote submit IPI count"
         );
 
+        // Under multi-threaded TCG (-accel tcg,thread=multi, see
+        // xtask/src/qemu.rs), the AP may poll its own runqueue and
+        // finish the task before the BSP checks the ack. 0 acks means the AP
+        // consumed the work without observing the explicit IPI in this small
+        // boot window; `targets.count()` means the IPI path was observed.
         let acked = P::wait_for_ipi_ack_cpus(targets, IpiKind::Reschedule);
         assert!(
             acked == 0 || acked == targets.count(),
@@ -1424,8 +1398,8 @@ impl<P: TxPlatform> CoreInit<P> {
         let hart = boot_runtime::HartId(cpu_id.0);
         let now_ns = P::read_ns();
         let mut signal = SmpRescheduleSignal::<P>::new();
-        let step = BOOT_REACTOR.with(|reactor| {
-            boot_runtime::hart_loop::step_hart_loop_at(reactor, hart, now_ns, &mut signal)
+        let step = BOOT_REACTOR.with_hart_runtime(hart, |runtime| {
+            boot_runtime::hart_loop::step_hart_loop_at(runtime, hart, now_ns, &mut signal)
         })?;
         Self::program_hart_loop_deadline(step.deadline_action);
         Some(step)

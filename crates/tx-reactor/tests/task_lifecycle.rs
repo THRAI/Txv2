@@ -102,7 +102,7 @@ fn repeated_wakes_coalesce_before_drain() {
 
 #[test]
 fn reactor_cancel_task_uses_generation_checked_key_and_drain_reuses_slot() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let first = reactor.submit_task(pending::<()>());
 
     assert_eq!(reactor.cancel_task(first), Ok(()));
@@ -130,7 +130,7 @@ fn reactor_cancel_task_uses_generation_checked_key_and_drain_reuses_slot() {
 
 #[test]
 fn reactor_drain_completed_releases_slot_for_new_generation() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let first = reactor.submit_task(async {});
 
     assert_eq!(

@@ -46,7 +46,7 @@ fn yield_now_first_poll_wakes_and_second_poll_completes() {
 #[test]
 fn reactor_task_yields_once_then_completes() {
     let stage = Arc::new(AtomicUsize::new(0));
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = {
         let stage = Arc::clone(&stage);
         reactor.submit(async move {
@@ -70,7 +70,7 @@ fn reactor_task_yields_once_then_completes() {
 #[test]
 fn two_yielding_tasks_both_make_progress_with_existing_policy() {
     let events = Arc::new(Mutex::new(Vec::new()));
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
 
     let first = {
         let events = Arc::clone(&events);

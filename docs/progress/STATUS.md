@@ -1,3 +1,236 @@
+- 2026-05-20 **Fixed LA64 SMP IRQ-context false sharing.**
+  Diagnosed the `make oscomp-local-la64-smp4` panic during basic-musl
+  `test_yield` as LA64 HAL IRQ-depth state leaking across harts: CPU0 could be
+  in a timer interrupt while CPU1 entered a syscall, but
+  `IrqIf::in_irq_context()` read a single global `LA64_IRQ_CONTEXT_DEPTH` and
+  made CPU1 look like it was still inside IRQ context. That tripped the epoch
+  guard assertion in syscall script-context construction. Replaced the global
+  IRQ-depth counter with `LA64_IRQ_CONTEXT_DEPTHS[LA64_MAX_BOOT_CPUS]`, and made
+  the RAII guard store the exact per-CPU depth cell it incremented so drops are
+  correct even if host tests switch the simulated TLS CPU.
+  **Verified:** `cargo test -p tx-hal-loongarch64-qemu-virt
+  irq_context_depth_is_per_cpu`; `cargo test -p
+  tx-hal-loongarch64-qemu-virt dispatch_timer_trap_enters_irq_context_and_resumes`;
+  `cargo test -p tx-hal-loongarch64-qemu-virt`; `cargo fmt --check`; `cargo
+  xtask build --target la64-qemu`.
+  **Next step:** rerun `make oscomp-local-la64-smp4`; the previous epoch-guard
+  panic should be gone.
+
+- 2026-05-20 **Fixed SMP busybox pipeline pipe EOF accounting.**
+  Diagnosed the `make oscomp-local-rv64-smp4` busybox-musl stall at group
+  start as a pipe lifecycle bug: pipe reader/writer counts were tied to
+  `OpenFile::Drop`, so the last writer close could be delayed until EBR
+  reclaimed the shared open-file object. Busybox's
+  `cat ./busybox_cmd.txt | while read line` needs EOF as soon as the writer fd
+  closes or the writer process exits. Moved pipe endpoint accounting to the
+  process fd table: `close` / `exec` / process-exit drain decrement counts
+  immediately, while `dup` / `fcntl(F_DUPFD*)` / `fork` increment inherited pipe
+  fd refs. Removed the pipe-side `OpenFile` destructor hook and added process
+  tests covering immediate EOF on close, dup-held writers, fork-inherited
+  writers, and child-exit fd drain.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-subsystems pipe_`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-subsystems pipe_writer`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo
+  test -p tx-shims pipe2`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test
+  -p tx-shims fork_clone_wait4_wave3`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check
+  cargo test -p tx-kernel --no-run`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check
+  cargo xtask build --target rv64-qemu`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check
+  cargo xtask qemu --target rv64-qemu --profile smoke --expect-sentinel --smp
+  4`; `cargo fmt --check`; `git diff --check`.
+  **Next step:** rerun `make oscomp-local-rv64-smp4`; busybox should progress
+  past the `busybox-musl` group start instead of waiting forever for pipeline
+  EOF.
+
+- 2026-05-20 **Fixed SMP WaitSource lost-wake window hit by busybox pipelines.**
+  After the pipe fd-lifetime fix, `make oscomp-local-rv64-smp4` could still
+  stall immediately after `#### OS COMP TEST GROUP START busybox-musl ####`.
+  The stuck line is `./busybox cat ./busybox_cmd.txt | while read line`: the
+  reader can observe an empty pipe, return `Yield::OnWaitSource`, and only then
+  register its task mailbox. On SMP, the writer can publish `PIPE_READABLE` in
+  that gap, so the non-sticky `WaitSource` notification is lost and the reader
+  sleeps forever. Added a pending mask to `tx_substrate::wake::WaitSource`:
+  `notify` records fired bits, and a later `register` consumes matching pending
+  bits by posting a `SourceFired` event to the newly registered mailbox. This is
+  a conservative lost-wake bridge for current driver registrations; future
+  prepared-registration migration can tighten the predicate recheck path.
+  **Verified:** `CARGO_TARGET_DIR=target/codex-check cargo test -p
+  tx-substrate notify_before_register_is_delivered_as_pending_source_fire`;
+  `CARGO_TARGET_DIR=target/codex-check cargo test -p tx-scripts
+  wait_source_register_notify_delivers_to_mailbox`; `CARGO_TARGET_DIR=target/codex-check
+  cargo test -p tx-subsystems pipe`; `cargo test -p tx-kernel --no-run`;
+  `cargo xtask build --target rv64-qemu`; `cargo xtask qemu --target rv64-qemu
+  --profile smoke --expect-sentinel --smp 4`; `cargo fmt --check`; `git diff
+  --check`; a bounded `timeout 120s make oscomp-qemu-rv64-smp4` was manually
+  interrupted after reaching basic-musl.
+
+- 2026-05-20 **Fixed RV64 SMP OSComp brk-time pmap teardown trap.**
+  Diagnosed the `make oscomp-local-rv64-smp4` trap at
+  `sepc=0xffffffff8034cf82` as `VmPmap::teardown_range` stack/local
+  corruption while handling user pmap teardown during the basic-musl `brk`
+  test. The old path kept an `AddressSpaceShootdownBatch<64>` in the debug
+  kernel stack frame; RV64 disassembly showed the function reserving roughly
+  40 KiB of stack. Replaced the teardown batch path in
+  `crates/tx-subsystems/src/vm/pmap.rs` with immediate single-page
+  ASID-scoped shootdown followed by `MapPin` release, dropping the RV64 debug
+  stack frame to `0x230`. This is a conservative correctness fix; batching can
+  return later with a heap/per-CPU buffer instead of a large stack object.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-subsystems vm_pmap`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test
+  -p tx-subsystems
+  vm_aspace_reserve_user_range_for_access_publishes_private_anon_pages`;
+  `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p tx-kernel --no-run`;
+  `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo xtask build --target
+  rv64-qemu`; partial `make oscomp-local-rv64-smp4` run crossed
+  `Testing brk` and continued through clone/execve/fork before being manually
+  stopped for the user to rerun.
+
+- 2026-05-20 **Added 4-core RV64 OSComp local test target.**
+  Added `make oscomp-local-rv64-smp4` as the multi-core counterpart of the
+  existing primary `make oscomp-local-rv64` path. The new target keeps the same
+  build, data preparation, submit, and judge flow, but runs
+  `qemu-system-riscv64` with `-smp 4` and writes a separate serial log to
+  `target/oscomp/os_serial_out_rv_smp4.txt` so single-core logs remain
+  untouched. The SMP4 QEMU target creates the log directory before teeing
+  output, and the SMP4 judge target now reports a clear `make
+  oscomp-local-rv64-smp4` hint if the serial log has not been generated yet.
+  The original `oscomp-local-rv64` target remains `-smp 1`.
+  Added the matching `make oscomp-local-la64-smp4` path for LA64, with separate
+  `oscomp-qemu-la64-smp4` and `oscomp-judge-la64-smp4` targets and serial log
+  `target/oscomp/os_serial_out_la_smp4.txt`.
+  **Verified:** `make -n oscomp-local-rv64-smp4`; `make -n
+  oscomp-qemu-rv64-smp4`; `make -n oscomp-judge-rv64-smp4`; `make -n
+  oscomp-local-la64-smp4`; `make -n oscomp-qemu-la64-smp4`; `make -n
+  oscomp-judge-la64-smp4`.
+
+- 2026-05-20 **Added local SMP smoke Makefile targets.**
+  Added `make smp-smoke-rv64`, `make smp-smoke-la64`, and aggregate
+  `make smp-smoke` wrappers. They build the selected kernel in the repository
+  default `target/` directory, boot smoke under `--smp $(SMP_SMOKE_CPUS)`
+  (default `4`), and grep the serial log for SMP/IPI/reactor AP-runqueue
+  markers plus `boot:ok`. This gives the per-CPU reactor work a one-command
+  local validation path while keeping `oscomp-local-rv64` unchanged as the
+  single-core contest-style runner.
+  **Verified:** `make -n smp-smoke-rv64`; `make -n smp-smoke-la64`.
+
+- 2026-05-20 **RV64 SMP reactor dispatcher smoke made deterministic.**
+  Reworked the boot-time AP reactor dispatcher smoke in
+  `crates/tx-kernel/src/init.rs` so it validates remote submit +
+  reschedule IPI + AP runqueue execution directly instead of asserting an
+  instantaneous wait-channel waiter count. Under real `-smp 4`
+  multi-threaded TCG, the old `channel.fire(mask) == 1` assertion could race
+  the AP's first poll/subscription window and panic even though SMP, IPI, and
+  reactor scheduling were functioning. The smoke now submits a task pinned to
+  the first remote CPU via `submit_task_with_meta_from_hart`, checks the remote
+  IPI dispatch report, then waits for the AP to complete the task.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-kernel --no-run`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo xtask
+  build --target rv64-qemu`; manual QEMU using the fresh `/tmp` kernel with
+  `-smp 4` reached `txkernel:qemu-riscv64-virt:boot:ok` and printed
+  `reactor:dispatch:ipi:ok`, `reactor:ap-loop:ok`, `reactor:ap-runqueue:ok`,
+  and `reactor:sched:stats:h0=3/2:h1=1/1`.
+  **Note:** `cargo xtask qemu` currently resolves the kernel path under the
+  repository `target/` directory, not `CARGO_TARGET_DIR`; build the default
+  target dir or point QEMU at the `/tmp` kernel manually when using an
+  alternate target dir.
+
+- 2026-05-20 **Reactor per-CPU local refactor Phase 4 lock split completed.**
+  Completed the design-doc lock split for `tx-reactor`'s current reactor
+  surface. `SharedReactor` now stores a one-time initialized stable
+  `&'static Reactor`; its spinlock is only the initialization slot, and
+  `with(...)` / `with_hart_runtime(...)` no longer hold an outer reactor lock
+  while running the closure or hart loop. `ReactorShared` now protects
+  `TaskTable`, scheduler metadata/stats, timers, userspace slot, and
+  observability with narrow locks, while `TimerWheel` / delegate registry keep
+  their existing internally shared handles. `ReactorLocals` now records stable
+  per-hart local slots behind a small registry lock, and each
+  `HartSchedulerLocal` has separate locks for run queues and wake inbox plus
+  atomic markers / balance timestamp. Both concurrent and direct hart-loop
+  paths use `take_future -> poll outside reactor locks -> put/commit` so a
+  future is never polled under the task table lock. Scheduler runtime helpers
+  now operate through internally locked shared meta and no longer need
+  `&mut Phase1Scheduler`.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-reactor`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-kernel --no-run`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo xtask
+  build --target rv64-qemu`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check timeout
+  120s cargo xtask qemu --target rv64-qemu --profile smoke --expect-sentinel
+  --smp 4`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check timeout 120s cargo xtask
+  qemu --target la64-qemu --profile smoke --expect-sentinel --smp 4`.
+  **Next step:** stress/fix any AP userspace, timer, or steal edge cases that
+  appear under heavier workloads beyond the smoke sentinel path.
+
+- 2026-05-20 **Reactor per-CPU local refactor Phase 3 completed.**
+  Added `HartRuntimeView<'_>` in `crates/tx-reactor/src/runtime.rs` and
+  implemented `HartLoopRuntime` for it, so the platform-neutral hart loop can
+  run against `ReactorShared + ReactorLocals` rather than only a monolithic
+  `&mut Reactor`. `SharedReactor::with_hart_runtime()` is now the locked
+  transition entry for kernel-side stepping, and `tx-kernel`'s non-concurrent
+  `step_boot_reactor_once()` path uses it directly. The concurrent
+  `run_hart_loop_concurrent*` path now also creates a per-hart runtime view
+  inside each existing lock section, including wake draining, local stealing,
+  runnable placement, dispatch, slice/preempt handling, and stats/deadline
+  updates. `Reactor` keeps compatibility entry points, but its hart-loop
+  runtime methods delegate through `HartRuntimeView`, and the old private
+  monolithic helper copies were removed. Locking semantics remain unchanged;
+  this phase only changes the API shape needed for Phase 4 lock splitting.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-reactor`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-kernel --no-run`.
+  **Next step:** Phase 4, replace selected global reactor critical sections
+  with shared/local fine-grained locks while preserving the poll-lease
+  invariants.
+
+- 2026-05-20 **Reactor per-CPU local refactor Phase 2 compatibility checkpoint restored.**
+  Finished the scheduler compatibility bridge for the in-flight
+  `ReactorShared + ReactorLocals` split. `Phase1Scheduler` now keeps a small
+  temporary `compat_locals` set so legacy scheduler-only tests and old public
+  methods (`task_submitted`, `pick_next`, `task_stopped`, `task_runnable`,
+  `set_affinity`, `try_steal`, `rebalance_at`, `queue_depths`) continue to
+  exercise the same behavior while runtime paths use `HartReactorLocal`
+  through the new local-taking helpers. This closes the broken intermediate
+  state where `scheduler.rs` removed old methods before tests/callers were
+  migrated.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-reactor`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-kernel --no-run`.
+  **Next step:** begin Phase 3 by adding `HartRuntimeView<'_>` over
+  `&mut ReactorShared + &mut HartReactorLocal`, then move one hart-loop entry
+  at a time from `BOOT_REACTOR.with(...)` / `run_hart_loop_concurrent*` toward
+  `with_hart(...)` without changing lock semantics.
+
+- 2026-05-20 **Reactor per-CPU local refactor Phase 2 compatibility helpers started.**
+  Added local-taking scheduler bridge methods in `crates/tx-reactor/src/scheduler.rs`
+  for hart-local queue depth, wake inbox push/drain, preempt markers,
+  `peek_next`, enqueue/remove, and `pick_next`. The old `hart -> scheduler
+  internal local` methods still exist and continue to drive runtime behavior;
+  this cut is only preparing the API needed to wire `HartReactorLocal.scheduler`
+  in a later step. Temporary `dead_code` allowances mark the new bridge methods
+  that are intentionally unused until runtime is migrated.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-reactor --test scheduler`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo
+  test -p tx-reactor --test reactor_smoke`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check
+  cargo test -p tx-reactor --test hart_loop`.
+  **Next step:** continue Phase 2 by moving one runtime path at a time to call
+  the local-taking helpers through `SharedReactor::with_hart`, starting with
+  marker/wake-inbox paths before runqueue ownership is flipped.
+
+- 2026-05-20 **Reactor per-CPU local refactor Phase 1 landed.**
+  Added the first structural split in `crates/tx-reactor/src/runtime.rs`:
+  `Reactor` now contains `ReactorShared` plus `ReactorLocals`, and
+  `SharedReactor::with_hart()` can borrow shared state together with the
+  caller hart's `HartReactorLocal`. This is intentionally behavior-preserving:
+  the current global `SharedReactor` lock still protects the structure, and
+  scheduler hart queues remain inside `Phase1Scheduler` for this cut. The point
+  is to create a real code landing zone for the later shared-meta/local-queue
+  split without changing the poll/wake/steal interleavings yet.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-reactor --test scheduler`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo
+  test -p tx-reactor --test reactor_smoke`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check
+  cargo test -p tx-reactor --test hart_loop`.
+  **Next step:** Phase 2, move hart-local queues/inbox/markers out of
+  `Phase1Scheduler` into `HartReactorLocal` behind compatibility helpers before
+  attempting fine-grained lock removal.
+
 - 2026-05-19 **Reactor SMP design revised around poll-lease first split.**
   Updated `docs/ljs/REACTOR_SMP_v1_CN.md` from draft v1.0 to v1.1 after
   reviewing it against the current `tx-reactor` implementation. The design no

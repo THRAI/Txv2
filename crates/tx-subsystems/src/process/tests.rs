@@ -7,9 +7,11 @@
 //! identity/payload split is the primary subject under test: zombies
 //! retain identity but drop payload.
 
-use crate::process::adapter::step_engine::{guard as ebr_guard, sign, Cap};
+use crate::process::adapter::step_engine::{
+    guard as ebr_guard, sign, Cap, ScriptCtx, StepOp, StepOutcome,
+};
 use crate::process::execution::{
-    init_process, reset_init_process_for_test, step_exit_group_with_signal, BootstrapError,
+    init_process, reset_init_process_for_test, step_exit_group_with_signal, BootstrapError, DupOp,
 };
 use crate::process::structure::{
     reset_pid_counter_for_test, ExitStatus, Pgid, Pid, ProcessIdentity,
@@ -1052,6 +1054,28 @@ fn fresh_open_file() -> Cap<crate::vfs::OpenFile> {
     .expect("open file cap")
 }
 
+fn pipe_payload_of(file: &Cap<crate::vfs::OpenFile>) -> Cap<crate::pipe::PipePayload> {
+    file.pipe_endpoint()
+        .expect("open file must be a pipe endpoint")
+        .0
+}
+
+fn assert_pipe_read_eof(payload: &Cap<crate::pipe::PipePayload>) {
+    let mut buf = [0u8; 4];
+    let guard = ebr_guard();
+    let outcome = crate::pipe::step_read(payload, &mut buf, &guard, false);
+    drop(guard);
+    assert_eq!(outcome, StepOutcome::Done(0));
+}
+
+fn assert_pipe_read_blocks(payload: &Cap<crate::pipe::PipePayload>) {
+    let mut buf = [0u8; 4];
+    let guard = ebr_guard();
+    let outcome = crate::pipe::step_read(payload, &mut buf, &guard, false);
+    drop(guard);
+    assert!(matches!(outcome, StepOutcome::Yield { .. }));
+}
+
 #[test]
 fn process_payload_fd_cloexec_default_zero() {
     let _g = setup();
@@ -1224,6 +1248,93 @@ fn process_payload_step_fork_clones_sparse_fd_table() {
         parent.fd(100).is_some(),
         "parent's fd 100 survives the child's close"
     );
+}
+
+#[test]
+fn process_payload_close_pipe_writer_fd_publishes_eof_immediately() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let (reader, writer) =
+        crate::pipe::step_pipe2(crate::pipe::PipeFlags::default()).expect("pipe2");
+    let payload = pipe_payload_of(&reader);
+
+    proc_cap.set_fd(3, Some(reader));
+    proc_cap.set_fd(4, Some(writer));
+
+    proc_cap.set_fd(4, None);
+
+    assert_pipe_read_eof(&payload);
+    proc_cap.set_fd(3, None);
+}
+
+#[test]
+fn process_payload_dup_pipe_writer_keeps_pipe_alive_until_all_writer_fds_close() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let (reader, writer) =
+        crate::pipe::step_pipe2(crate::pipe::PipeFlags::default()).expect("pipe2");
+    let payload = pipe_payload_of(&reader);
+
+    proc_cap.set_fd(3, Some(reader));
+    proc_cap.set_fd(4, Some(writer));
+
+    let mut op = DupOp {
+        process: proc_cap.clone(),
+        oldfd: 4,
+    };
+    let mut ctx = ScriptCtx::<ProcessIdentity>::new();
+    let dupfd = match op.step(&mut ctx) {
+        StepOutcome::Done(fd) => fd,
+        other => panic!("expected dup Done(fd), got {other:?}"),
+    };
+
+    proc_cap.set_fd(4, None);
+    assert_pipe_read_blocks(&payload);
+
+    proc_cap.set_fd(dupfd, None);
+    assert_pipe_read_eof(&payload);
+    proc_cap.set_fd(3, None);
+}
+
+#[test]
+fn step_fork_accounts_inherited_pipe_writer_fd() {
+    let _g = setup();
+    let parent = bootstrap();
+    let (reader, writer) =
+        crate::pipe::step_pipe2(crate::pipe::PipeFlags::default()).expect("pipe2");
+    let payload = pipe_payload_of(&reader);
+
+    parent.set_fd(3, Some(reader));
+    parent.set_fd(4, Some(writer));
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+
+    parent.set_fd(4, None);
+    assert_pipe_read_blocks(&payload);
+
+    child.set_fd(4, None);
+    assert_pipe_read_eof(&payload);
+    parent.set_fd(3, None);
+    child.set_fd(3, None);
+}
+
+#[test]
+fn child_exit_drains_inherited_pipe_writer_fd_and_publishes_eof() {
+    let _g = setup();
+    let parent = bootstrap();
+    let (reader, writer) =
+        crate::pipe::step_pipe2(crate::pipe::PipeFlags::default()).expect("pipe2");
+    let payload = pipe_payload_of(&reader);
+
+    parent.set_fd(3, Some(reader));
+    parent.set_fd(4, Some(writer));
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+
+    parent.set_fd(4, None);
+    assert_pipe_read_blocks(&payload);
+
+    step_exit_group(&child, ExitStatus::Exited(0));
+    assert_pipe_read_eof(&payload);
+    parent.set_fd(3, None);
 }
 
 /// fd-ops Wave 1: the CLOEXEC `BTreeSet<u32>` accepts arbitrary `u32`

@@ -183,7 +183,7 @@ impl SliceClock for ScriptedSliceClock {
 fn submitted_ready_task_runs_to_completion() {
     let polls = Arc::new(AtomicUsize::new(0));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task_id = reactor.submit(CountPolls {
         polls: Arc::clone(&polls),
     });
@@ -208,7 +208,7 @@ fn submitted_ready_task_runs_to_completion() {
 fn pending_task_is_parked_after_one_poll() {
     PENDING_POLLS.store(0, Ordering::SeqCst);
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task_id = reactor.submit(ParkForever);
 
     assert_eq!(task_id, TaskId(0));
@@ -243,7 +243,7 @@ fn task_waker_marks_only_its_task_runnable() {
     let ready_b = Arc::new(AtomicUsize::new(0));
     let waker_b = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task_a = reactor.submit(ExternallyWoken {
         polls: Arc::clone(&polls_a),
         ready: Arc::clone(&ready_a),
@@ -287,7 +287,7 @@ fn repeated_wakes_enqueue_task_once_before_next_poll() {
     let ready = Arc::new(AtomicUsize::new(0));
     let waker_slot = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = reactor.submit(ExternallyWoken {
         polls: Arc::clone(&polls),
         ready: Arc::clone(&ready),
@@ -324,7 +324,7 @@ fn wait_channel_wakes_registered_task_from_another_task() {
     let waiter_done = Arc::new(AtomicUsize::new(0));
     let publisher_done = Arc::new(AtomicUsize::new(0));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let waiter = {
         let channel = channel.clone();
         let waiter_done = Arc::clone(&waiter_done);
@@ -362,7 +362,7 @@ fn wait_channel_preserves_matching_wake_across_later_nonmatching_fire() {
     let other_mask = Mask::from_bits(0x2);
     let waiter_done = Arc::new(AtomicUsize::new(0));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let waiter = {
         let channel = channel.clone();
         let waiter_done = Arc::clone(&waiter_done);
@@ -402,7 +402,7 @@ fn wait_event_rechecks_condition_after_spurious_wake() {
     let condition_ready = Arc::new(AtomicUsize::new(0));
     let waiter_done = Arc::new(AtomicUsize::new(0));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let waiter = {
         let channel = channel.clone();
         let condition_ready = Arc::clone(&condition_ready);
@@ -456,7 +456,7 @@ fn wait_event_rechecks_condition_after_spurious_wake() {
 
 #[test]
 fn wait_event_timeout_completes_only_after_deadline_is_driven() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let channel = reactor.channel();
     let mask = Mask::from_bits(0x1);
     let outcome = Arc::new(Mutex::new(None));
@@ -506,7 +506,7 @@ fn wait_event_timeout_completes_only_after_deadline_is_driven() {
 
 #[test]
 fn wait_event_ready_before_timeout_unregisters_timer() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let channel = reactor.channel();
     let mask = Mask::from_bits(0x1);
     let condition_ready = Arc::new(AtomicUsize::new(0));
@@ -550,7 +550,7 @@ fn wait_event_ready_before_timeout_unregisters_timer() {
 
 #[test]
 fn wait_event_spurious_wake_reparks_before_timeout() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let channel = reactor.channel();
     let mask = Mask::from_bits(0x1);
     let outcome = Arc::new(Mutex::new(None));
@@ -601,7 +601,7 @@ fn wait_event_spurious_wake_reparks_before_timeout() {
 fn submitted_task_uses_scheduler_backed_runnable_path() {
     let polls = Arc::new(AtomicUsize::new(0));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task_id = reactor.submit(CountPolls {
         polls: Arc::clone(&polls),
     });
@@ -627,7 +627,7 @@ fn submitted_task_uses_scheduler_backed_runnable_path() {
 
 #[test]
 fn submitted_task_with_affinity_uses_target_hart_queue() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task =
         reactor.submit_task_with_meta(async {}, InitialSchedMeta::fair().with_affinity(0b0100));
 
@@ -642,7 +642,7 @@ fn submitted_task_with_affinity_uses_target_hart_queue() {
 
 #[test]
 fn runtime_affinity_update_moves_queued_task_and_dispatches_remote_marker() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task =
         reactor.submit_task_with_meta(async {}, InitialSchedMeta::fair().with_affinity(0b0011));
 
@@ -673,7 +673,7 @@ fn runtime_affinity_update_moves_queued_task_and_dispatches_remote_marker() {
 
 #[test]
 fn submit_from_hart_dispatches_remote_ipi_for_spread_task() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let first = reactor.submit_task_with_meta(
         async {},
         InitialSchedMeta::fair()
@@ -721,7 +721,7 @@ fn remote_task_wake_dispatches_reschedule_signal() {
     let ready = Arc::new(AtomicUsize::new(0));
     let waker_slot = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = reactor.submit_task_with_meta(
         ExternallyWoken {
             polls: Arc::clone(&polls),
@@ -777,7 +777,7 @@ fn remote_wake_routes_through_target_hart_inbox() {
     let ready = Arc::new(AtomicUsize::new(0));
     let waker_slot = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = reactor.submit_task_with_meta(
         ExternallyWoken {
             polls: Arc::clone(&polls),
@@ -833,7 +833,7 @@ fn rescheduled_hart_consumes_marker_before_draining_runqueue() {
     let ready = Arc::new(AtomicUsize::new(0));
     let waker_slot = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = reactor.submit_task_with_meta(
         ExternallyWoken {
             polls: Arc::clone(&polls),
@@ -872,7 +872,7 @@ fn rescheduled_hart_consumes_marker_before_draining_runqueue() {
 
 #[test]
 fn userspace_preempt_marker_does_not_alias_normal_reschedule() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
 
     reactor.mark_userspace_preempt(HartId(1));
 
@@ -890,7 +890,7 @@ fn userspace_preempt_marker_does_not_alias_normal_reschedule() {
 #[test]
 fn userspace_preempt_marker_requeues_pending_poll() {
     let polls = Arc::new(AtomicUsize::new(0));
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = reactor.submit_task_with_meta(
         PendingThenReady {
             polls: Arc::clone(&polls),
@@ -921,7 +921,7 @@ fn userspace_preempt_marker_requeues_pending_poll() {
 fn slice_clock_accounts_consumed_time_and_requeues_expired_slice() {
     let polls = Arc::new(AtomicUsize::new(0));
     let deadlines = Arc::new(Mutex::new(Vec::new()));
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = reactor.submit_task_with_meta(
         PendingThenReady {
             polls: Arc::clone(&polls),
@@ -1041,9 +1041,50 @@ fn shared_reactor_serializes_rescheduled_hart_runqueue_drain() {
 }
 
 #[test]
+fn shared_reactor_with_hart_creates_stable_local_slot() {
+    let shared = SharedReactor::empty();
+    assert!(shared.init());
+
+    assert_eq!(
+        shared.with_hart(HartId(3), |_shared, local| local.hart()),
+        Some(HartId(3))
+    );
+    assert_eq!(
+        shared.with_hart(HartId(3), |_shared, local| local.hart()),
+        Some(HartId(3))
+    );
+}
+
+#[test]
+fn shared_reactor_with_hart_runtime_drives_hart_loop_step() {
+    let shared = SharedReactor::empty();
+    assert!(shared.init());
+
+    let task = shared
+        .with(|reactor| reactor.submit_task_with_meta(async {}, InitialSchedMeta::kernel()))
+        .expect("shared reactor initialized");
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let step = shared
+        .with_hart_runtime(HartId(0), |runtime| {
+            tx_reactor::hart_loop::step_hart_loop_at(runtime, HartId(0), 1, &mut signal)
+        })
+        .expect("shared reactor initialized");
+
+    assert_eq!(step.stats.polled, 1);
+    assert_eq!(step.stats.completed, 1);
+    assert_eq!(
+        shared
+            .with(|reactor| reactor.task_key_status(task))
+            .expect("shared reactor initialized"),
+        Some(TaskStatus::Completed)
+    );
+}
+
+#[test]
 fn per_hart_runtime_context_is_visible_only_on_polling_hart() {
     let seen = Arc::new(AtomicUsize::new(0));
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = reactor.submit_task_with_meta(
         HartContextProbe {
             hart: 2,
@@ -1119,7 +1160,7 @@ fn shared_concurrent_poll_path_sets_per_hart_runtime_context() {
 
 #[test]
 fn observability_accumulates_per_hart_poll_counts() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     reactor.submit_task_with_meta(async {}, InitialSchedMeta::kernel().with_affinity(0b0001));
     reactor.submit_task_with_meta(async {}, InitialSchedMeta::kernel().with_affinity(0b0100));
 
@@ -1152,7 +1193,7 @@ fn blocked_task_reports_stop_reason_and_waits_for_wake() {
     let ready = Arc::new(AtomicUsize::new(0));
     let waker_slot = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = reactor.submit(ExternallyWoken {
         polls: Arc::clone(&polls),
         ready: Arc::clone(&ready),
@@ -1185,7 +1226,7 @@ fn duplicate_wakes_coalesce_into_one_scheduler_notification() {
     let ready = Arc::new(AtomicUsize::new(0));
     let waker_slot = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = reactor.submit(ExternallyWoken {
         polls: Arc::clone(&polls),
         ready: Arc::clone(&ready),
@@ -1216,7 +1257,7 @@ fn duplicate_wakes_coalesce_into_one_scheduler_notification() {
 
 #[test]
 fn completed_task_reports_stop_reason() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = reactor.submit(CountOnce);
 
     assert_eq!(reactor.run_until_idle().completed, 1);
@@ -1314,7 +1355,7 @@ fn phase1_scheduler_preserves_remaining_budget_after_blocked_wake() {
 
 #[test]
 fn next_deadline_ns_reports_earliest_and_clears_after_resolution() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let first = reactor.channel();
     let second = reactor.channel();
     let mask = Mask::from_bits(0x1);
@@ -1407,7 +1448,7 @@ fn mailbox_post_wakes_parked_reactor_task() {
 
     let mailbox = Arc::new(TaskMailbox::new());
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     reactor.submit(MailboxParkFuture {
         mailbox: Arc::clone(&mailbox),
         polls: Arc::clone(&polls),
