@@ -7,10 +7,10 @@ use crate::linux_syscall::{
     AF_INET, AF_NETLINK, AF_PACKET, AF_UNIX, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_IP,
     IPPROTO_UDP, IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO, IPT_SO_SET_REPLACE, IP_RECVERR,
     NETLINK_EXT_ACK, NETLINK_NETFILTER, NETLINK_ROUTE, NR_BIND, NR_CLOSE, NR_CONNECT, NR_FCNTL,
-    NR_GETSOCKNAME, NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PPOLL, NR_PSELECT6, NR_RECVFROM,
-    NR_RECVMSG, NR_SENDMSG, NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET, O_CLOEXEC, O_NONBLOCK, O_RDWR,
-    SIOCGIFFLAGS, SIOCGIFINDEX, SIOCGIFTXQLEN, SIOCSIFFLAGS, SOL_NETLINK, SOL_SOCKET, SO_DONTROUTE,
-    SO_ERROR, SO_RCVTIMEO, SO_REUSEADDR, SO_TYPE, TTY_WRITE_MAX_INLINE,
+    NR_GETSOCKNAME, NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PIPE2, NR_PPOLL, NR_PSELECT6,
+    NR_RECVFROM, NR_RECVMSG, NR_SENDMSG, NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET, NR_WRITE, O_CLOEXEC,
+    O_NONBLOCK, O_RDWR, SIOCGIFFLAGS, SIOCGIFINDEX, SIOCGIFTXQLEN, SIOCSIFFLAGS, SOL_NETLINK,
+    SOL_SOCKET, SO_DONTROUTE, SO_ERROR, SO_RCVTIMEO, SO_REUSEADDR, SO_TYPE, TTY_WRITE_MAX_INLINE,
 };
 use alloc::vec;
 use alloc::vec::Vec;
@@ -1754,6 +1754,74 @@ fn dispatch_pselect_udp_read_timeout_returns_zero_without_reactor_timer() {
 }
 
 #[test]
+fn dispatch_pselect_pipe_read_ready_after_write() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let mut pipefd = [u32::MAX; 2];
+
+    assert_eq!(
+        socket_req(NR_PIPE2, [pipefd.as_mut_ptr() as u64, 0, 0, 0, 0, 0], &ctx,),
+        SyscallResult::Return(0)
+    );
+    let reader_fd = pipefd[0];
+    let writer_fd = pipefd[1];
+
+    let mut readfds = 1u64 << reader_fd;
+    let mut timeout = [0u64, 0u64];
+    assert_eq!(
+        socket_req(
+            NR_PSELECT6,
+            [
+                reader_fd as u64 + 1,
+                &mut readfds as *mut u64 as u64,
+                0,
+                0,
+                timeout.as_mut_ptr() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(readfds, 0);
+
+    let byte = *b"x";
+    assert_eq!(
+        socket_req(
+            NR_WRITE,
+            [
+                writer_fd as u64,
+                byte.as_ptr() as u64,
+                byte.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(byte.len() as i64)
+    );
+
+    readfds = 1u64 << reader_fd;
+    assert_eq!(
+        socket_req(
+            NR_PSELECT6,
+            [
+                reader_fd as u64 + 1,
+                &mut readfds as *mut u64 as u64,
+                0,
+                0,
+                timeout.as_mut_ptr() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(1)
+    );
+    assert_eq!(readfds, 1u64 << reader_fd);
+}
+
+#[test]
 fn dispatch_recvfrom_large_user_buffer_returns_short_read() {
     let _setup = socket_setup();
     loopback_iface().clear_for_test_or_bootstrap();
@@ -1939,7 +2007,7 @@ fn dispatch_udp_connect_autobinds_and_reaches_wildcard_bound_peer() {
             other => panic!("unexpected loopback outcome: {other:?}"),
         }
     };
-    assert_eq!(moved.udp_bytes_moved, hello.len());
+    assert_eq!(moved.udp_bytes_moved, 0);
 
     let mut inbound = [0u8; 8];
     let mut source_addr = [0u8; SOCKADDR_IN_BYTES as usize];
@@ -1994,7 +2062,7 @@ fn dispatch_udp_connect_autobinds_and_reaches_wildcard_bound_peer() {
             other => panic!("unexpected loopback outcome: {other:?}"),
         }
     };
-    assert_eq!(moved.udp_bytes_moved, pong.len());
+    assert_eq!(moved.udp_bytes_moved, 0);
 
     let mut reply = [0u8; 8];
     assert_eq!(

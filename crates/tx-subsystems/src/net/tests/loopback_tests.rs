@@ -220,6 +220,121 @@ fn udp_loopback_sendto_reaches_wildcard_bound_receiver() {
 }
 
 #[test]
+fn udp_loopback_inline_send_can_defer_delegate_poll_kick() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::delegate::net_delegate_clear(
+        crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
+    );
+    let guard = tx_substrate::epoch::guard();
+    let iface = LoopbackIface::new(IfaceCommon::new(
+        Ipv4Address::LOOPBACK,
+        Ipv4Address::new([255, 0, 0, 0]),
+        1500,
+    ));
+    let server = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("server udp");
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("client udp");
+
+    assert_eq!(
+        step_bind(&server, any_inet(40_206), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_bind(&client, inet(50_206), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_to_kernel_bytes_with_poll_kick(
+            &client,
+            Some(endpoint(40_206)),
+            b"x",
+            SendRecvFlags::empty(),
+            &guard,
+            false,
+        ),
+        StepOutcome::Done(1)
+    );
+    assert_eq!(
+        crate::net::delegate::net_delegate_queue().peek()
+            & crate::net::delegate::DelegateWireSet::POLL.bits(),
+        0
+    );
+
+    let transfer = match step_process_loopback_udp_on_iface(&client, 8, &iface, &guard) {
+        StepOutcome::Done(outcome) => outcome,
+        _ => panic!("unexpected udp loopback outcome"),
+    };
+    assert_eq!(transfer.bytes_moved, 1);
+    assert!(transfer.peer_wake_fired);
+}
+
+#[test]
+fn udp_loopback_direct_send_kernel_bytes_reaches_receiver() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    crate::net::delegate::net_delegate_clear(
+        crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
+    );
+    let guard = tx_substrate::epoch::guard();
+    let server = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("server udp");
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("client udp");
+
+    assert_eq!(
+        step_bind(&server, any_inet(40_207), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_bind(&client, inet(50_207), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_udp_loopback_kernel_bytes(
+            &client,
+            Some(endpoint(40_207)),
+            b"x",
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(1)
+    );
+    assert_eq!(
+        crate::net::delegate::net_delegate_queue().peek()
+            & crate::net::delegate::DelegateWireSet::POLL.bits(),
+        0
+    );
+    assert!(server.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0);
+    assert_eq!(
+        server
+            .acquire_operational()
+            .expect("server payload")
+            .io_snapshot()
+            .recv_len,
+        1
+    );
+}
+
+#[test]
 fn tcp_loopback_pollcontext_moves_data_through_packet_queue() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -1343,6 +1458,56 @@ fn tcp_socket_close_marks_connected_peer_broken() {
     assert_eq!(
         step_recv(&client, 1, SendRecvFlags::empty(), &guard),
         StepOutcome::Done(0)
+    );
+}
+
+#[test]
+fn tcp_socket_close_flushes_queued_bytes_to_peer_before_eof() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client, listener, _local, _remote) = prepare_loopback_connect(40_189, 50_189);
+    let guard = tx_substrate::epoch::guard();
+
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let accepted = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("expected accepted child"),
+    };
+    assert_eq!(
+        step_send_kernel_bytes(&client, b"0", SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(1)
+    );
+
+    let close = match step_socket_close(&client, &guard) {
+        StepOutcome::Done(close) => close,
+        _ => panic!("unexpected socket close outcome"),
+    };
+    assert_eq!(close.tcp_flushed_bytes, 1);
+
+    let mut out = [0u8; 1];
+    assert_eq!(
+        step_recv_kernel_bytes(&accepted, &mut out, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(crate::net::structure::SocketRecvBytesOutcome {
+            bytes: 1,
+            source: None,
+            destination: None,
+            truncated: false,
+            became_empty: true,
+        })
+    );
+    assert_eq!(&out, b"0");
+    assert_eq!(
+        step_recv(&accepted, 1, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(0)
+    );
+    assert_eq!(
+        step_send_kernel_bytes(&accepted, b"x", SendRecvFlags::empty(), &guard),
+        StepOutcome::Err(Errno::EPIPE)
     );
 }
 

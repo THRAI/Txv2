@@ -342,6 +342,14 @@ impl PipePayload {
         self.reader_count.load(Ordering::Acquire) == 0
     }
 
+    pub fn readable_level(&self) -> bool {
+        self.reader_readable_level()
+    }
+
+    pub fn writable_level(&self) -> bool {
+        self.writer_writable_level()
+    }
+
     /// A new fd now references this reader endpoint.
     pub(crate) fn incr_reader(&self) {
         self.reader_count.fetch_add(1, Ordering::AcqRel);

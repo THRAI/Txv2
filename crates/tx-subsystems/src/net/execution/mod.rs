@@ -56,7 +56,10 @@ pub use step_process_network_events::{
     NET_BACKLOG_SCAN_BUDGET, NET_EVENT_BUDGET,
 };
 pub use step_recv::{step_recv, step_recv_kernel_bytes};
-pub use step_send::{step_send, step_send_kernel_bytes, step_send_to_kernel_bytes};
+pub use step_send::{
+    step_send, step_send_kernel_bytes, step_send_to_kernel_bytes,
+    step_send_to_kernel_bytes_with_poll_kick,
+};
 pub use step_shutdown::{step_shutdown, ShutdownOutcome};
 pub use step_socket_close::{step_socket_close, SocketCloseOutcome};
 pub use step_socket_create::{step_socket_create, step_socket_create_in_namespace};
@@ -79,7 +82,9 @@ pub use step_tcp_loopback::{
     LoopbackTcpTransferOutcome,
 };
 pub use step_udp_loopback::{
-    step_process_loopback_udp, step_process_loopback_udp_on_iface, LoopbackUdpTransferOutcome,
+    step_process_loopback_udp, step_process_loopback_udp_on_iface,
+    step_send_udp_loopback_kernel_bytes, step_send_udp_loopback_kernel_bytes_on_iface,
+    LoopbackUdpTransferOutcome,
 };
 
 pub const SOMAXCONN_STAGING: usize = 128;
