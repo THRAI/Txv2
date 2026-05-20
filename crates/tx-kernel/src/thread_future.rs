@@ -513,6 +513,20 @@ pub async fn run_thread<P: TxPlatform>(
                 }
                 let result = tx_shims::linux_syscall::dispatch::<P>(req, &ctx).await;
 
+                // Threshold-based observation dump. If the boot path
+                // installed a non-zero `OBSERVE_DUMP_THRESHOLD` (see
+                // `tx_observe::set_dump_threshold`), every emit ticks
+                // a global counter; once it crosses the threshold, this
+                // syscall return dumps the ring over the console and
+                // powers off the platform. Captures a bounded trace from
+                // workloads where init never naturally exits (e.g.
+                // oscomp's continuous test-group sequence).
+                if tx_observe::should_dump_now() {
+                    tx_observe::dump_console_hex::<P>(<P as tx_hal::SmpIf>::current_cpu_id());
+                    tx_hal::console_write_str::<P>(":observe:dump:threshold\n");
+                    <P as tx_hal::PowerIf>::system_off();
+                }
+
                 match result {
                     tx_shims::linux_syscall::SyscallResult::Return(v) => {
                         payload.store_pending_syscall_return(Some(Ok(v)));

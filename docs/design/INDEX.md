@@ -63,6 +63,7 @@ How work runs: the step primitive and the runtime that drives it.
 - [`COMPLETION_v1.md`](02_execution/COMPLETION_v1.md) — Linux-inspired completion objects as reactor/wait middleware, not bus primitives or semantic truth.
 - [`EXEC_v1.md`](02_execution/EXEC_v1.md) — execve script spec: VFS/Mount/Cred/Loader/VM/Process/FD/Signal/ThreadRuntime composition and point-of-no-return discipline.
 - [`cred_service_v_1_draft (2).md`](<02_execution/cred_service_v_1_draft (2).md>) — credential service: durable identity-derived policy, authorization checks, credential-changing transitions.
+- [`cred_snapshot_wiring_v_1.md`](02_execution/cred_snapshot_wiring_v_1.md) — companion to `cred_service_v_1`: snapshot capture model, `cred::checks::*` witness surface, syscall-arm wiring map, closed-bypass audit, and open audit items as shipped.
 - [`rlimit_service_v_1_draft (1).md`](<02_execution/rlimit_service_v_1_draft (1).md>) — rlimit service: per-process resource ceilings, stable usage counters, reservation-backed consumption accounting.
 
 ## 03 · Memory / VM

@@ -1398,6 +1398,8 @@ impl<P: TxPlatform> CoreInit<P> {
         let hart = boot_runtime::HartId(cpu_id.0);
         let now_ns = P::read_ns();
         let mut signal = SmpRescheduleSignal::<P>::new();
+        // Force a guard acquire+drop to clear stale epoch state.
+        drop(step_engine::guard());
         let step = BOOT_REACTOR.with_hart_runtime(hart, |runtime| {
             boot_runtime::hart_loop::step_hart_loop_at(runtime, hart, now_ns, &mut signal)
         })?;

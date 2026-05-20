@@ -33,6 +33,7 @@ const E_NOTDIR: i32 = 20;
 const E_ISDIR: i32 = 21;
 const E_INVAL: i32 = 22;
 const E_PERM: i32 = 1;
+const E_ACCES: i32 = 13;
 const E_NOSYS: i32 = 38;
 
 fn ensure_zero_frame_claimed() {
@@ -310,6 +311,46 @@ fn dispatch_unlinkat_at_removedir_on_file_returns_neg_enotdir() {
     drop(path);
 }
 
+/// `unlinkat` from a non-privileged caller whose parent triplet
+/// lacks the write bit returns `-EACCES`. Locks in the
+/// `require_unlink` wiring: previously `sys_unlinkat` did no W-on-
+/// parent check and removed the file regardless of mode. Now the
+/// dispatch path runs `cred::checks::require_unlink` against the
+/// caller's syscall-entry `CredSnapshot` before invoking
+/// `FsOps::unlink`.
+#[test]
+fn dispatch_unlinkat_without_parent_write_returns_neg_eacces() {
+    use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
+
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    create_regular(&tmpfs, b"f");
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    // Drop caller to unprivileged uid/gid with no caps. Tmpfs root
+    // was minted under root_cred with `mode 0o755` (rwxr-xr-x) —
+    // owner has write, "other" doesn't. Caller is uid=2000, gid=2000
+    // → falls into the "other" triplet → no write bit → EACCES.
+    set_cred_ids_for_test(&proc_cap, 2000, 2000, 2000, 2000, 2000, 2000);
+    clear_caps_for_test(&proc_cap);
+
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/f");
+    let req = SyscallRequest::new(
+        NR_UNLINKAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_ACCES));
+    // File must remain — cred check ran *before* the FsOps unlink.
+    assert!(
+        lookup_exists(&tmpfs, b"f"),
+        "/f must survive a denied unlinkat"
+    );
+    drop(path);
+}
+
 /// `unlinkat` against a missing file returns `-ENOENT`.
 #[test]
 fn dispatch_unlinkat_missing_returns_neg_enoent() {
@@ -452,6 +493,53 @@ fn dispatch_linkat_directory_source_returns_neg_eperm() {
     );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_PERM));
+    drop(oldpath);
+    drop(newpath);
+}
+
+/// `linkat` from a non-privileged caller whose new-parent triplet
+/// lacks the write bit returns `-EACCES`. Locks in the
+/// `require_link` wiring: previously `sys_linkat` did no
+/// W-on-new-parent check and minted a hard link regardless of mode.
+/// Now the dispatch path runs `cred::checks::require_link` against
+/// the caller's syscall-entry `CredSnapshot` before invoking
+/// `FsOps::link`.
+#[test]
+fn dispatch_linkat_without_new_parent_write_returns_neg_eacces() {
+    use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
+
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    create_regular(&tmpfs, b"f");
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    // Tmpfs root is mode 0o755 owned by root. Caller is uid=2000 →
+    // falls into "other" triplet → no W. Linking into "/" must fail.
+    set_cred_ids_for_test(&proc_cap, 2000, 2000, 2000, 2000, 2000, 2000);
+    clear_caps_for_test(&proc_cap);
+
+    let ctx = make_ctx(proc_cap, thread);
+
+    let oldpath = nul_terminate(b"/f");
+    let newpath = nul_terminate(b"/g");
+    let req = SyscallRequest::new(
+        NR_LINKAT,
+        [
+            AT_FDCWD as i64 as u64,
+            oldpath.as_ptr() as u64,
+            AT_FDCWD as i64 as u64,
+            newpath.as_ptr() as u64,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_ACCES));
+    // /g must not have been created — cred check fires before FsOps.
+    assert!(
+        !lookup_exists(&tmpfs, b"g"),
+        "/g must not be linked after denied linkat"
+    );
     drop(oldpath);
     drop(newpath);
 }
@@ -639,6 +727,54 @@ fn dispatch_readlinkat_missing_returns_neg_enoent() {
 // -----------------------------------------------------------------
 // renameat2
 // -----------------------------------------------------------------
+
+/// `renameat2` from a non-privileged caller whose parents lack the
+/// write bit returns `-EACCES`. Locks in the `require_rename` wiring:
+/// previously the composite `RenameOp` did no cred check and any
+/// caller with X on both parents could rename arbitrary entries.
+#[test]
+fn dispatch_renameat2_without_parent_write_returns_neg_eacces() {
+    use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
+
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    create_regular(&tmpfs, b"a");
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    // Tmpfs root is mode 0o755 owned by root. Caller is uid=2000 →
+    // falls into "other" → no W. Both parents resolve to root,
+    // so the unlink-side check fires first.
+    set_cred_ids_for_test(&proc_cap, 2000, 2000, 2000, 2000, 2000, 2000);
+    clear_caps_for_test(&proc_cap);
+
+    let ctx = make_ctx(proc_cap, thread);
+
+    let oldpath = nul_terminate(b"/a");
+    let newpath = nul_terminate(b"/b");
+    let req = SyscallRequest::new(
+        NR_RENAMEAT2,
+        [
+            AT_FDCWD as i64 as u64,
+            oldpath.as_ptr() as u64,
+            AT_FDCWD as i64 as u64,
+            newpath.as_ptr() as u64,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_ACCES));
+    assert!(
+        lookup_exists(&tmpfs, b"a"),
+        "/a must survive a denied rename"
+    );
+    assert!(
+        !lookup_exists(&tmpfs, b"b"),
+        "/b must not appear after a denied rename"
+    );
+    drop(oldpath);
+    drop(newpath);
+}
 
 /// Same-directory rename succeeds: `/a` becomes `/b`.
 #[test]

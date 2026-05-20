@@ -85,7 +85,16 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
     }
 
     fn on_ipi(_cpu: CpuId) -> TrapAction {
-        P::ack_ipi(IpiKind::Reschedule);
+        if P::pending_ipi(IpiKind::Membarrier) {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            P::ack_ipi(IpiKind::Membarrier);
+        }
+        if P::pending_ipi(IpiKind::Reschedule) {
+            P::ack_ipi(IpiKind::Reschedule);
+        }
+        if P::pending_ipi(IpiKind::TlbShootdown) {
+            P::ack_ipi(IpiKind::TlbShootdown);
+        }
         TrapAction::Resume
     }
 

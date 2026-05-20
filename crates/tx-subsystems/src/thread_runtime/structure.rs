@@ -7,7 +7,7 @@
 //! fast-check atomic land alongside the delivery pass.
 
 use alloc::sync::Weak as ArcWeak;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use tx_hal::UserTrapContext;
 
@@ -217,6 +217,13 @@ pub struct ThreadPayload {
     /// `clear_child_tid` pointer from `set_tid_address`.  Written
     /// atomically to 0 on thread exit when futex wake is supported.
     pub clear_child_tid: SpinMutex<Option<u64>>,
+    /// Robust-list head pointer from `set_robust_list`. Linux's
+    /// `robust_list_head` structure: `{ list, futex_offset, pending }`.
+    /// `list` is a linked list of `robust_list` entries; each entry
+    /// carries the futex word the robust mutex protects.
+    pub robust_list_head: SpinMutex<Option<u64>>,
+    /// Length of the robust list in bytes (Linux's `len` parameter).
+    pub robust_list_len: SpinMutex<usize>,
 }
 
 impl ThreadPayload {
@@ -237,6 +244,8 @@ impl ThreadPayload {
             stopped: core::sync::atomic::AtomicBool::new(false),
             alt_stack: SpinMutex::new(None),
             clear_child_tid: SpinMutex::new(None),
+            robust_list_head: SpinMutex::new(None),
+            robust_list_len: SpinMutex::new(0),
         }
     }
 
@@ -596,15 +605,11 @@ unsafe impl ZoneAllocated for ThreadPayload {
     }
 }
 
-/// Simple atomic TID allocator. TID 1 reserved for the init leader by
-/// convention; allocator starts at 2.
-static NEXT_TID: AtomicU32 = AtomicU32::new(2);
-
 pub fn allocate_tid() -> Tid {
-    Tid(NEXT_TID.fetch_add(1, Ordering::Relaxed))
+    crate::process::numbers::allocate_tid()
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn reset_tid_counter_for_test() {
-    NEXT_TID.store(2, Ordering::Relaxed);
+    crate::process::numbers::reset_pid_counter_for_test();
 }

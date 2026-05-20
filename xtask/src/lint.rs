@@ -30,7 +30,7 @@ const AUTHORED_HOST_PACKAGES: &[&str] = &[
 
 pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {
-        return Err("lint command needs `arch`, `docs`, `unused`, or `boundary`".into());
+        return Err("lint command needs `arch`, `docs`, `unused`, `boundary`, `invariants`, or `syscall-status`".into());
     };
     match kind.as_str() {
         "arch" => lint_arch(root),
@@ -41,8 +41,15 @@ pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
             let sub = args.get(1).map(|s| s.as_str()).unwrap_or("all");
             lint_invariants(root, sub)
         }
+        "syscall-status" => {
+            // The dispatch table at `crates/tx-shims/src/linux_syscall/{numbers,mod}.rs`
+            // is the SSoT for syscall progress; this gate fails if the
+            // auto-maintained section of `docs/progress/SYSCALL_STATUS.md`
+            // is stale. Fix with `cargo xtask syscall sync`.
+            crate::syscall::syscall(root, vec!["sync".into(), "--check".into()])
+        }
         other => Err(format!(
-            "unknown lint kind '{other}', expected arch, docs, unused, boundary, or invariants"
+            "unknown lint kind '{other}', expected arch, docs, unused, boundary, invariants, or syscall-status"
         )),
     }
 }
@@ -141,6 +148,7 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
         "signal-publish" => crate::lint_invariants_signal::lint_invariants_signal_publish(root),
         "script-boundary" => crate::lint_invariants_script::lint_invariants_script_boundary(root),
         "checks-purity" => crate::lint_invariants_checks::lint_invariants_checks_purity(root),
+        "cred-check" => crate::lint_invariants_cred_check::lint_invariants_cred_check(root),
         "step-guard" => crate::lint_step_guard::lint_invariants_step_guard(root),
         "no-adhoc-drive" => crate::lint_invariants_drive::lint_invariants_no_adhoc_drive(root),
         "syscall-adhoc-loop" => crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop(root),
@@ -158,6 +166,7 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
                 ("signal-publish", crate::lint_invariants_signal::lint_invariants_signal_publish),
                 ("script-boundary", crate::lint_invariants_script::lint_invariants_script_boundary),
                 ("checks-purity", crate::lint_invariants_checks::lint_invariants_checks_purity),
+                ("cred-check", crate::lint_invariants_cred_check::lint_invariants_cred_check),
                 ("step-guard", crate::lint_step_guard::lint_invariants_step_guard),
                 ("no-adhoc-drive", crate::lint_invariants_drive::lint_invariants_no_adhoc_drive),
                 ("syscall-adhoc-loop", crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop),
@@ -178,7 +187,7 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
             }
         }
         other => Err(format!(
-            "unknown invariants sub-rule '{other}'. Expected: step-discipline, step-v4-vocabulary, step-no-await, step-sync-signature, step, subject-context, witness-scope, signal-publish, script-boundary, checks-purity, no-adhoc-drive, syscall-adhoc-loop, syscall-no-await, syscall-ctx-bridge, all"
+            "unknown invariants sub-rule '{other}'. Expected: step-discipline, step-v4-vocabulary, step-no-await, step-sync-signature, step, subject-context, witness-scope, signal-publish, script-boundary, checks-purity, cred-check, no-adhoc-drive, syscall-adhoc-loop, syscall-no-await, syscall-ctx-bridge, all"
         )),
     }
 }

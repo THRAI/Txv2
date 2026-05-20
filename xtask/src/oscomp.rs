@@ -20,7 +20,7 @@ const OSCOMP_SDCARD_LA_URL: &str =
 pub(crate) fn oscomp(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {
         return Err(
-            "oscomp command needs doctor, prepare, submit, run, qemu, score, list-suites, or test"
+            "oscomp command needs doctor, prepare, submit, run, qemu, score, list-suites, test, or slim-sdcard"
                 .into(),
         );
     };
@@ -33,8 +33,9 @@ pub(crate) fn oscomp(root: &Path, args: Vec<String>) -> Result<()> {
         "score" => oscomp_score(root, &args[1..]),
         "list-suites" => oscomp_list_suites(root, &args[1..]),
         "test" => oscomp_test(root, &args[1..]),
+        "slim-sdcard" => oscomp_slim_sdcard(root, &args[1..]),
         other => Err(format!(
-            "unknown oscomp command '{other}', expected doctor, prepare, submit, run, qemu, score, list-suites, or test"
+            "unknown oscomp command '{other}', expected doctor, prepare, submit, run, qemu, score, list-suites, test, or slim-sdcard"
         )),
     }
 }
@@ -56,11 +57,27 @@ fn oscomp_doctor(root: &Path) -> Result<()> {
         }
     }
     let data = oscomp_data_dir(root, &[]);
-    for image in ["sdcard-rv.img.gz", "sdcard-la.img.gz"] {
-        if data.join(image).exists() {
-            println!("ok: {}", data.join(image).display());
+    for stem in ["sdcard-rv.img", "sdcard-la.img"] {
+        let img = data.join(stem);
+        let xz = data.join(format!("{stem}.xz"));
+        let gz = data.join(format!("{stem}.gz"));
+        if img.exists() {
+            println!("ok: {}", img.display());
+        } else if xz.exists() {
+            println!(
+                "ok: {} (compressed; will decompress on prepare)",
+                xz.display()
+            );
+        } else if gz.exists() {
+            println!(
+                "ok: {} (compressed; will decompress on prepare)",
+                gz.display()
+            );
         } else {
-            println!("warn: missing {}", data.join(image).display());
+            println!(
+                "warn: missing {} (also looked for .xz / .gz)",
+                img.display()
+            );
         }
     }
     if missing.is_empty() {
@@ -101,17 +118,68 @@ fn oscomp_prepare(root: &Path, args: &[String]) -> Result<()> {
 
     println!("prepared OSComp judge data at {}", data.display());
     println!("prepared OSComp kernel zip at {}", kernel_zip.display());
-    for (image, url) in [
-        ("sdcard-rv.img.gz", OSCOMP_SDCARD_RV_URL),
-        ("sdcard-la.img.gz", OSCOMP_SDCARD_LA_URL),
+
+    // Sdcard images. The qemu launch reads `.img` (uncompressed); the GitHub
+    // release ships `.xz`. We tolerate any of `.img`, `.img.xz`, `.img.gz`
+    // present locally and decompress to `.img` if needed so a downstream
+    // `cargo xtask oscomp qemu` run finds what it expects.
+    for (stem, url) in [
+        ("sdcard-rv.img", OSCOMP_SDCARD_RV_URL),
+        ("sdcard-la.img", OSCOMP_SDCARD_LA_URL),
     ] {
-        if !data.join(image).exists() {
-            println!(
-                "missing {image}; download and place it at {}",
-                data.join(image).display()
-            );
-            println!("  {url}");
+        let img = data.join(stem);
+        if img.exists() {
+            println!("ok: {}", img.display());
+            continue;
         }
+        match ensure_sdcard_image(&data, stem) {
+            Ok(()) => println!("ok: {}", img.display()),
+            Err(why) => {
+                println!(
+                    "missing {stem}; download {url} into {} (any of {stem}, {stem}.xz, {stem}.gz) \
+                     and re-run prepare ({why})",
+                    data.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Locate a compressed sdcard image next to `data` and decompress it
+/// in-place to `<stem>`.
+///
+/// Probes `<stem>.xz` then `<stem>.gz`. Returns `Err` when neither is
+/// present (signals "missing — user must download"). Decompression uses
+/// the host `xz` / `gunzip` binaries; both are common on the macOS dev
+/// machines we run from.
+fn ensure_sdcard_image(data: &Path, stem: &str) -> Result<()> {
+    let xz_path = data.join(format!("{stem}.xz"));
+    let gz_path = data.join(format!("{stem}.gz"));
+    let out_path = data.join(stem);
+    let (src, tool, args): (PathBuf, &str, Vec<String>) = if xz_path.exists() {
+        (
+            xz_path,
+            "xz",
+            vec!["--decompress".into(), "--keep".into(), "--force".into()],
+        )
+    } else if gz_path.exists() {
+        (gz_path, "gunzip", vec!["--keep".into(), "--force".into()])
+    } else {
+        return Err("no .xz or .gz archive present".into());
+    };
+    if !command_exists(tool) {
+        return Err(format!("{tool} not found; install via Homebrew or apt"));
+    }
+    println!("decompressing {} → {}", src.display(), out_path.display());
+    let mut full_args = args;
+    full_args.push(src.display().to_string());
+    run_cmd_owned_in(data, tool, &full_args)?;
+    if !out_path.exists() {
+        return Err(format!(
+            "{tool} ran but {} was not produced",
+            out_path.display()
+        ));
     }
     Ok(())
 }
@@ -530,6 +598,52 @@ fn oscomp_test(root: &Path, args: &[String]) -> Result<()> {
     oscomp_score(root, args)?;
 
     Ok(())
+}
+
+/// Build a trimmed SD card image with only specified test suites/cases.
+///
+/// Options:
+///   `--suite SUITE`               Include a test suite (repeatable).
+///   `--ltp-cases CASE1,CASE2`     LTP cases to include (comma-separated).
+///   `--source IMG`                Source sdcard image (default: testdata/sdcard-rv.img).
+///   `--output IMG`                Output image path.
+///   `--size-mb N`                 Target image size in MB (default: 256).
+///   `--config FILE`               TOML config file.
+///   `--list-suites`               List available suites and exit.
+///   `--list-cases SUITE`          List cases for a suite and exit.
+fn oscomp_slim_sdcard(root: &Path, args: &[String]) -> Result<()> {
+    let script = root.join("tools").join("build-slim-sdcard.py");
+    if !script.exists() {
+        return Err(format!(
+            "missing {}; this command requires the Python helper script",
+            script.display()
+        ));
+    }
+
+    // Forward all arguments to the Python script, with --source defaulting
+    // to the canonical testdata sdcard path.
+    let data = oscomp_data_dir(root, args);
+    let default_source = data.join("sdcard-rv.img");
+
+    let mut cmd = Command::new("python3");
+    cmd.arg(&script).current_dir(root);
+
+    // If --source is not provided and default exists, add it
+    let has_source = args.iter().any(|a| a == "--source" || a == "-s");
+    if !has_source && default_source.exists() {
+        cmd.arg("--source").arg(&default_source);
+    }
+
+    for arg in args {
+        cmd.arg(arg);
+    }
+
+    let status = cmd.status().map_err(|e| format!("failed to run build-slim-sdcard.py: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("build-slim-sdcard.py exited with {status}"))
+    }
 }
 
 fn oscomp_data_dir(root: &Path, args: &[String]) -> PathBuf {

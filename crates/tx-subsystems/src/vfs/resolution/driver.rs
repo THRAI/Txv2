@@ -16,7 +16,8 @@ use crate::vfs::FsOps;
 
 use super::error::classify;
 use super::state::{
-    FinalSymlinkPolicy, KernelStep, PathResolution, ResumeToken, WalkMode, WalkState, WalkingState,
+    FinalSymlinkPolicy, KernelStep, PathResolution, ResumeToken, WalkCause, WalkMode, WalkState,
+    WalkingState,
 };
 use super::step::kernel_step;
 
@@ -46,10 +47,29 @@ pub fn walk_to_completion(
 
     let _fs_ops: Arc<dyn FsOps> = walker::fs_ops_for(&current, guard)
         .or_else(|| walker::fs_ops_for(&mount_root, guard))
-        .ok_or(Errno::ENODEV)?;
+        .ok_or_else(|| {
+            use super::diagnostic;
+            let rn = current.rnode();
+            diagnostic::record_ctx(
+                8, // walk_to_completion: fs_ops_for None (pre-loop)
+                current.name().as_bytes(),
+                rn.fs_object_id(),
+                &remaining,
+                rn.containing_mount_weak().is_some(),
+            );
+            Errno::ENODEV
+        })?;
 
     let _mount_payload = walker::mount_payload_for(&current, guard)
         .or_else(|| walker::mount_payload_for(&mount_root, guard));
+    // record if mount_payload is None here (non-fatal, but diagnostic)
+    if walker::mount_payload_for(&current, guard).is_none()
+        && walker::mount_payload_for(&mount_root, guard).is_none()
+    {
+        use super::diagnostic;
+        diagnostic::record_diag(9); // walk_to_completion: mount_payload_for None
+        diagnostic::record_label(b"walk_to_completion: no mount_payload");
+    }
 
     let mut state = WalkState::Walking(WalkingState {
         current,
@@ -69,14 +89,50 @@ pub fn walk_to_completion(
 
         let fs_ops = walker::fs_ops_for(&walking.current, guard)
             .or_else(|| walker::fs_ops_for(&walking.mount_root, guard))
-            .ok_or(Errno::ENODEV)?;
+            .ok_or_else(|| {
+                use super::diagnostic;
+                let rn = walking.current.rnode();
+                diagnostic::record_ctx(
+                    8, // walk_to_completion loop: fs_ops_for None
+                    walking.current.name().as_bytes(),
+                    rn.fs_object_id(),
+                    &walking.remaining,
+                    rn.containing_mount_weak().is_some(),
+                );
+                Errno::ENODEV
+            })?;
 
         let mount_payload = walker::mount_payload_for(&walking.current, guard)
             .or_else(|| walker::mount_payload_for(&walking.mount_root, guard));
 
+        let walking_state = walking.clone();
         match kernel_step(walking, fs_ops, mount_payload, cred, mode, policy, guard) {
             KernelStep::Continue(next) => state = next,
-            KernelStep::Error(cause) => return Err(classify(&cause)),
+            KernelStep::Error(cause) => {
+                // Capture walker failure context before returning.
+                let rn = walking_state.current.rnode();
+                let errno = classify(&cause);
+                let stage = match &cause {
+                    WalkCause::TraverseDenied => 30,
+                    WalkCause::ComponentNotFound => 31,
+                    WalkCause::NotADirectory => 32,
+                    WalkCause::SymlinkLimit => 33,
+                    WalkCause::MountPointGap => 34,
+                    WalkCause::FsOpsRejected(_) => 35,
+                    WalkCause::Permission(_) => 36,
+                    WalkCause::TerminalOpenFailed(_) => 37,
+                };
+                super::diagnostic::record_ctx(
+                    stage,
+                    walking_state.current.name().as_bytes(),
+                    rn.fs_object_id(),
+                    &walking_state.remaining,
+                    rn.containing_mount_weak().is_some(),
+                );
+                // Also stamp the legacy diag for old sentinel compatibility.
+                super::diagnostic::record_diag(stage);
+                return Err(errno);
+            }
             KernelStep::NeedIO(_req, _token) => return Err(Errno::EAGAIN),
         }
     }

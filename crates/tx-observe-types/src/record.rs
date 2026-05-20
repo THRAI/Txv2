@@ -183,4 +183,10 @@ pub enum TxTraceLevel {
     Step = 4,
     Phase = 5,
     Mutation = 6,
+    /// Reactor scheduler track (OBS-9 in `08_OBSERVATION_v1.md` §15.6).
+    /// One span per task-on-hart interval: `SpanBegin(Sched)` when the
+    /// reactor picks a task to poll, `SpanEnd(Sched)` after the poll
+    /// returns. Renders as a sched_switch-equivalent Gantt timeline of
+    /// which reactor task held each hart over time.
+    Sched = 7,
 }

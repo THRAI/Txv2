@@ -146,12 +146,31 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
             &["xtask", "lint", "invariants", "all"],
             "txdoc:CI-GATE-INVARIANTS-LINT",
         ),
+        // The dispatch table at
+        // `crates/tx-shims/src/linux_syscall/{numbers,mod}.rs` is the
+        // single source of truth for syscall progress; this gate fails
+        // if the auto-maintained section in `SYSCALL_STATUS.md` drifts
+        // from the dispatch table. Fix with `cargo xtask syscall sync`.
+        ci_run(
+            root,
+            "syscall-status doc sync",
+            "cargo",
+            &["xtask", "lint", "syscall-status"],
+            "txdoc:CI-GATE-SYSCALL-STATUS",
+        ),
         ci_run(
             root,
             "progress json",
             "cargo",
             &["xtask", "progress", "validate"],
             "txdoc:CI-GATE-PROGRESS-JSON",
+        ),
+        ci_run(
+            root,
+            "syscall-status autogen",
+            "cargo",
+            &["xtask", "syscall-status", "--check"],
+            "txdoc:CI-GATE-SYSCALL-STATUS",
         ),
         // Quick observe smoke: demo writes a synthetic .txtrace, validate
         // parses the header and counts records. No daemon build required.

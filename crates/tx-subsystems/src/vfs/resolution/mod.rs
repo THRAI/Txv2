@@ -18,6 +18,7 @@
 //! When ext4 / disk-backed backends grow real IO yields, the component
 //! loop in `walker::walk_inner_v3` will be lifted into `kernel_step`.
 
+pub mod diagnostic;
 pub mod driver;
 pub mod error;
 pub mod state;
@@ -25,3 +26,6 @@ pub mod step;
 pub mod terminal;
 
 pub use state::PathResolution;
+
+/// Re-export the diagnostic probe for kernel-side consumption.
+pub use diagnostic::{last_ctx, last_diag, record_ctx, record_diag, render_ctx, DiagCtx};
