@@ -324,6 +324,87 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     SyscallResult::Return(ready)
 }
 
+/// PageBacked `write(2)` — direct user-buffer path.
+///
+/// Prefaults the user buffer through `reserve_user_range_for_access`,
+/// then drives `OpenFileWriteFromUserOp` which copies bytes directly
+/// from user pages to PC frames through the pmap, without kernel-buffer
+/// staging (PAGE_BACKED_v1 §5.1 / §3 prefault discipline).
+async fn sys_write_pagebacked<'a>(
+    file: &Cap<tx_subsystems::vfs::structure::OpenFile>,
+    buf_ptr: usize,
+    len: usize,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    if len == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    // Prefault: eagerly materialise every user page and publish to
+    // the pmap so the step loop below finds every page in the cache.
+    // If any page is unmapped or has a prot mismatch, fail before
+    // transferring any bytes.
+    if let Some(range) = super::user_copy::covering_user_range(buf_ptr as u64, len) {
+        use crate::adapter::step_engine::StepOutcome as V3;
+        use tx_subsystems::vm::UserAccessKind;
+        let _guard = crate::adapter::step_engine::guard();
+        match ctx.aspace.reserve_user_range_for_access(range, UserAccessKind::Read) {
+            V3::Done(()) => {}
+            V3::Err(e) => {
+                let errno: tx_subsystems::execution::Errno = e.into();
+                return SyscallResult::error_from(errno);
+            }
+            V3::Yield { .. } | V3::Continue { .. } => {
+                return SyscallResult::error_from(tx_subsystems::execution::Errno::EIO);
+            }
+        }
+    }
+
+    // Drive the write-from-user step loop.
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    use tx_subsystems::vfs::execution::OpenFileWriteFromUserOp;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mode = if file.flags().nonblocking {
+        DriveMode::Nonblocking
+    } else {
+        DriveMode::Waiting
+    };
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = OpenFileWriteFromUserOp {
+        file,
+        aspace: &ctx.aspace,
+        src: tx_hal::UserPtr::<u8>::new(buf_ptr),
+        len,
+        cursor: 0,
+    };
+    match drive(
+        op,
+        &mut script_ctx,
+        mode,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(total) => SyscallResult::Return(total as i64),
+        Err(v3errno) => {
+            let errno: tx_subsystems::execution::Errno = v3errno.into();
+            if errno == tx_subsystems::execution::Errno::EPIPE {
+                let _ = tx_subsystems::signal::step_kill_process(
+                    &ctx.process,
+                    tx_subsystems::signal::Signum::SIGPIPE,
+                    None,
+                );
+            }
+            SyscallResult::error_from(errno)
+        }
+    }
+}
+
 pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
     let buf_ptr = args[1] as usize;
@@ -349,6 +430,16 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // value to the counter. Dispatch before the generic VFS path.
     if file.eventfd().is_some() {
         return super::eventfd::sys_eventfd_write(&file, args[1], len, ctx).await;
+    }
+
+    // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).
+    // Prefault the user buffer in the observe phase, then drive the
+    // write through the pmap without kernel-buffer staging.
+    if matches!(
+        file.rnode().backing(),
+        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
+    ) {
+        return sys_write_pagebacked(&file, buf_ptr, len, ctx).await;
     }
 
     // Pull the user buffer into kernel memory through the canonical
@@ -422,21 +513,84 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     }
 }
 
+/// PageBacked `read(2)` — direct user-buffer path.
+///
+/// Prefaults the user buffer (Write access, since we're writing into
+/// it), then drives `OpenFileReadToUserOp` which copies bytes directly
+/// from PC frames to user pages through the pmap, without kernel-buffer
+/// staging (PAGE_BACKED_v1 §5.1 / §3 prefault discipline).
+async fn sys_read_pagebacked<'a, P: tx_hal::TimeIf>(
+    file: &Cap<tx_subsystems::vfs::structure::OpenFile>,
+    buf_ptr: usize,
+    len: usize,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    if len == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    // Prefault: eagerly materialise every user page and publish to
+    // the pmap so the step loop below finds every page in the cache.
+    // Access is Write — we're writing data *into* the user buffer.
+    if let Some(range) = super::user_copy::covering_user_range(buf_ptr as u64, len) {
+        use crate::adapter::step_engine::StepOutcome as V3;
+        use tx_subsystems::vm::UserAccessKind;
+        let _guard = crate::adapter::step_engine::guard();
+        match ctx.aspace.reserve_user_range_for_access(range, UserAccessKind::Write) {
+            V3::Done(()) => {}
+            V3::Err(e) => {
+                let errno: tx_subsystems::execution::Errno = e.into();
+                return SyscallResult::error_from(errno);
+            }
+            V3::Yield { .. } | V3::Continue { .. } => {
+                return SyscallResult::error_from(tx_subsystems::execution::Errno::EIO);
+            }
+        }
+    }
+
+    // Drive the read-to-user step loop.
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    use tx_subsystems::vfs::execution::OpenFileReadToUserOp;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mode = if file.flags().nonblocking {
+        DriveMode::Nonblocking
+    } else {
+        DriveMode::Waiting
+    };
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = OpenFileReadToUserOp {
+        file,
+        aspace: &ctx.aspace,
+        dst: tx_hal::UserPtr::<u8>::new(buf_ptr),
+        len,
+        cursor: 0,
+    };
+    match drive(
+        op,
+        &mut script_ctx,
+        mode,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(total) => SyscallResult::Return(total as i64),
+        Err(v3errno) => {
+            let errno: tx_subsystems::execution::Errno = v3errno.into();
+            SyscallResult::error_from(errno)
+        }
+    }
+}
+
 /// `read(fd, buf, count)`.
 ///
-/// Mirrors `sys_write`'s structure: resolve fd → `Cap<OpenFile>`,
-/// route the user buffer through `bootstrap_copy_to_user`, and loop
-/// on the wait-carrier discipline.
-///
-/// **Blocking semantic.** Pre-ELF Phase 5 (item 9) wires the UART RX
-/// path so a blocked `read(0, ...)` actually parks until bytes arrive:
-/// `tty::execution::step_read` returns `Blocked(token)` on an empty
-/// input queue, the dispatcher awaits `wait_source::wait_on_token`,
-/// and `tx_kernel::irq::uart_rx_irq_handler` drives
-/// `tty::execution::step_ingest` from the IRQ side, which fires the
-/// TTY's wait `Channel`. On any partial progress (`total > 0`)
-/// the dispatcher returns what it has rather than block again,
-/// matching `sys_write`'s partial-success policy.
+/// Mirrors `sys_write`'s structure. For PageBacked files, delegates to
+/// `sys_read_pagebacked` (direct user-buffer path, PAGE_BACKED_v1 §5.1);
+/// for struct-backed files, uses kernel-buffer staging + copy_to_user.
 pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
@@ -486,6 +640,16 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     // expiration count as an 8-byte u64.
     if file.timerfd().is_some() {
         return super::timerfd::sys_timerfd_read::<P>(&file, args[1], len, ctx).await;
+    }
+
+    // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).
+    // Prefault the user buffer in the observe phase, then drive the
+    // read through the pmap without kernel-buffer staging.
+    if matches!(
+        file.rnode().backing(),
+        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
+    ) {
+        return sys_read_pagebacked::<P>(&file, buf_ptr, len, ctx).await;
     }
 
     // Read into a kernel-side staging buffer, then copy out through

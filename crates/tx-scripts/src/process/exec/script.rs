@@ -813,11 +813,21 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             .vaddr
             .checked_add(segment.filesz)
             .ok_or(ExecError::NotExecutable)?;
-        let partial_in_page = file_end & (page_size - 1);
+        // Page-floor of `file_end` (start of the last page that
+        // contains file data).  `partial_start` is the vaddr of
+        // the first file-data byte in that page — clamped to
+        // `segment.vaddr` in case the segment starts mid-page.
+        let file_end_page_floor = file_end & !(page_size - 1);
+        let partial_start = file_end_page_floor.max(segment.vaddr);
+        // Number of file-content bytes in this partial page.
+        // This is the distance from `partial_start` to `file_end`,
+        // *not* the page-offset of `file_end` — the latter
+        // over-counts when the segment started mid-page and the
+        // page floor lies before `segment.vaddr`.
+        let partial_in_page = file_end - partial_start;
         if partial_in_page == 0 {
             continue;
         }
-        let partial_start = (file_end - partial_in_page).max(segment.vaddr);
         // File offset of `partial_start`. The segment's `file_offset`
         // corresponds to `vaddr`; offsetting by `partial_start - vaddr`
         // gives the file offset of the bytes we need to seed. If the

@@ -741,7 +741,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             // (the predecessor equality check, per POSIX).
             {
                 let guard = step_engine::guard();
-                let outcome = tx_subsystems::futex::step_futex_wait(uaddr, val, &guard);
+                let outcome = tx_subsystems::futex::step_futex_wait(&ctx.aspace, uaddr, val, &guard);
                 match outcome {
                     StepOutcome::Err(e) if e == V3Errno::EAGAIN => {
                         return SyscallResult::error_from(Errno::EAGAIN);
@@ -763,7 +763,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             // Op acquires its own epoch guard inside `step()`; no
             // guard crosses `drive(...).await` (REACTOR_v0,
             // STEP_MODEL_v2 §1, INVARIANTS_v5 EBR-7).
-            let op = FutexWaitOp { uaddr, val };
+            let op = FutexWaitOp { uaddr, val, aspace: &ctx.aspace };
             match drive(
                 op,
                 &mut script_ctx,

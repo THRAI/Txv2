@@ -593,6 +593,10 @@ impl Reactor {
         self.tasks.mailbox(task)
     }
 
+    pub fn queue_depths(&self, hart: HartId) -> crate::scheduler::Phase1QueueDepths {
+        self.scheduler.queue_depths(hart)
+    }
+
     pub fn next_scheduled_task(&mut self, hart: HartId) -> Option<(TaskHandle, SliceConfig)> {
         let mut signal = NoopRescheduleSignal::new();
         self.drain_wakes_for_hart(HartId(0), &mut signal);

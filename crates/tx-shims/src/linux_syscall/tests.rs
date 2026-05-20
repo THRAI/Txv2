@@ -58,7 +58,7 @@ use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use tx_hal::{
     Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
-    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, SmpIf, VirtAddr,
 };
 use tx_subsystems::vm::USER_PAGE_SIZE;
 
@@ -150,6 +150,8 @@ impl PmapIf for ShimsTestPmap {
 impl EntropyIf for ShimsTestPmap {}
 
 impl tx_hal::AuxvIf for ShimsTestPmap {}
+
+impl SmpIf for ShimsTestPmap {}
 
 // Slice 4 of the shell-prompt roadmap (2026-05-07) added a `TimeIf`
 // bound to `dispatch::<P>` so the time-syscall arms can read the

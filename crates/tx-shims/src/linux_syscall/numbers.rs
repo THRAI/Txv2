@@ -25,6 +25,12 @@ pub const NR_READV: u64 = 65;
 /// `__NR_sendfile64`. Copies data from `in_fd` to `out_fd` via
 /// page-level transfer without an intermediate userspace buffer.
 pub const NR_SENDFILE64: u64 = 71;
+/// `sched_setscheduler(pid, policy, param)`. Linux generic uapi
+/// `__NR_sched_setscheduler = 119`. musl calls this during
+/// pthread_create to set the new thread's scheduling policy.
+/// v1 stub: returns 0 (success, no-op) — real priority
+/// inheritance deferred to the scheduler slice.
+pub const NR_SCHED_SETSCHEDULER: u64 = 119;
 /// `ppoll(fds, nfds, tmo_p, sigmask)`. Linux generic ABI
 /// `__NR_ppoll`. busybox sh's interactive read loop polls stdin
 /// before reading. The v1 implementation is a minimal stub: walk
@@ -270,6 +276,13 @@ pub const CLONE_PARENT: u64 = 0x8000;
 pub const CLONE_THREAD: u64 = 0x10000;
 pub const CLONE_CHILD_CLEARTID: u64 = 0x200000;
 pub const CLONE_PARENT_SETTID: u64 = 0x100000;
+/// Ignored by Linux since 2.5.32; musl sets it unconditionally.
+pub const CLONE_DETACHED: u64 = 0x400000;
+/// System-V semaphore undo on exit; musl sets this in pthread_create.
+pub const CLONE_SYSVSEM: u64 = 0x40000;
+/// Namespace flags — silently accepted; txKernel does not namespace.
+pub const CLONE_NEWCGROUP: u64 = 0x2000000;
+pub const CLONE_NEWUTS: u64 = 0x4000000;
 
 /// `getppid()`. Linux generic ABI `__NR_getppid`. Wraps
 /// `ProcessIdentity::parent_pid()`. Returns `0` (`Pid::RESERVED`)
@@ -1620,3 +1633,50 @@ pub const TFD_TIMER_ABSTIME_FLAG: u32 = 1;
 /// `syslog(type, bufp, len)` — Linux kernel ring-buffer read / control.
 /// Linux generic uapi `__NR_syslog = 116`.  Called by `dmesg(1)`.
 pub const NR_SYSLOG: u64 = 116;
+
+// =====================================================================
+// membarrier syscall numbers and command flags
+//
+// `man 2 membarrier`. The Linux RV64 generic uapi does not assign
+// membarrier a dedicated slot — it was briefly `283` before
+// timerfd_create took that number. We use the x86_64 value 324,
+// which is unused in txKernel's RV64 table.
+// =====================================================================
+
+/// `membarrier(cmd, flags, cpu_id)`. x86_64 ABI `__NR_membarrier = 324`.
+/// RV64 generic uapi has no dedicated slot; 324 is unoccupied in the
+/// txKernel number space.
+pub const NR_MEMBARRIER: u64 = 324;
+
+/// Query supported commands. Always returns `MEMBARRIER_SUPPORTED_MASK`.
+pub const MEMBARRIER_CMD_QUERY: u64 = 0;
+
+/// Global barrier — broadcast to all online CPUs.
+pub const MEMBARRIER_CMD_GLOBAL: u64 = 1 << 0;
+/// Global expedited barrier.
+pub const MEMBARRIER_CMD_GLOBAL_EXPEDITED: u64 = 1 << 1;
+/// Register for global expedited barriers.
+pub const MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED: u64 = 1 << 2;
+
+/// Private expedited barrier (single-process).
+pub const MEMBARRIER_CMD_PRIVATE_EXPEDITED: u64 = 1 << 3;
+/// Register for private expedited barriers.
+pub const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: u64 = 1 << 4;
+/// Private expedited + sync_core (instruction-fetch barrier).
+pub const MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE: u64 = 1 << 5;
+/// Register for private expedited sync_core barriers.
+pub const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: u64 = 1 << 6;
+
+/// Bitmask of all commands this kernel supports — returned by
+/// `MEMBARRIER_CMD_QUERY`.
+///
+/// Includes `CMD_QUERY` plus every GLOBAL/PRIVATE barrier command.
+/// Registration cmds are accepted (no-op) but not advertised.
+pub const MEMBARRIER_SUPPORTED_MASK: u64 = MEMBARRIER_CMD_QUERY
+    | MEMBARRIER_CMD_GLOBAL
+    | MEMBARRIER_CMD_GLOBAL_EXPEDITED
+    | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+    | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+    | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+    | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
+    | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE;

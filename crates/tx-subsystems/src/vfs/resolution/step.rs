@@ -362,6 +362,8 @@ fn materialise_child(
                     mp,
                 )
             } else {
+                super::diagnostic::record_diag(6);
+                super::diagnostic::record_label(b"materialise:dir-no-mount");
                 RNode::new_cap(child_fs_object_id, *child_meta, RNodeBacking::Directory)
             };
             result.map_err(|_| {
@@ -369,14 +371,19 @@ fn materialise_child(
             })
         }
         InodeKind::Symlink => match fs_ops.read_link(child_fs_object_id, guard) {
-            StepOutcome::Done(b) => RNode::new_cap(
-                child_fs_object_id,
-                *child_meta,
-                RNodeBacking::Symlink { target: b },
-            )
-            .map_err(|_| {
-                KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM))
-            }),
+            StepOutcome::Done(b) => {
+                // NOTE: symlink RNode created without containing_mount.
+                super::diagnostic::record_diag(7);
+                super::diagnostic::record_label(b"materialise:symlink-no-mount");
+                RNode::new_cap(
+                    child_fs_object_id,
+                    *child_meta,
+                    RNodeBacking::Symlink { target: b },
+                )
+                .map_err(|_| {
+                    KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM))
+                })
+            }
             StepOutcome::Yield { .. } => Err(KernelStep::NeedIO(
                 IORequest::ReadLink {
                     fs_object_id: child_fs_object_id,

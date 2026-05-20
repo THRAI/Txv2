@@ -47,7 +47,7 @@
 use alloc::sync::Arc;
 
 use crate::adapter::step_engine::SpinMutex;
-use tx_substrate::SpinMutexGuard;
+// SpinMutexGuard used only through DerefMut — import omitted
 
 /// Per-resource sharing wrapper. Multiple `Shared<T>` handles can
 /// point to the same `T` via `Arc`; the `SpinMutex` provides

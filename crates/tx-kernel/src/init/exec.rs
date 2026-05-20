@@ -693,6 +693,20 @@ impl<P: TxPlatform> CoreInit<P> {
         // userspace trap (which is the only event that resolves the
         // thread future's pending wait).
         loop {
+            // Clear stale UART RX data before every iteration.
+            // Without this, drain_pending_uart_rx_into_tty calls
+            // step_ingest under an epoch guard; the TTY may fire
+            // channel/source notifications that trigger a reactor
+            // wake, and the resulting callback may acquire a second
+            // guard → epoch nesting panic.
+            crate::irq::clear_uart_rx_pending();
+            {
+                let es = crate::adapter::step_engine::epoch::summary();
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":diag:loop:A guards=");
+                Self::write_decimal_unsigned(es.active_guards);
+                tx_hal::console_write_str::<P>("\n");
+            }
             if init.is_zombie() {
                 break;
             }
@@ -705,8 +719,22 @@ impl<P: TxPlatform> CoreInit<P> {
             if Self::drain_pending_uart_rx_into_tty() != 0 {
                 continue;
             }
+            {
+                let es = crate::adapter::step_engine::epoch::summary();
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":diag:loop:B guards=");
+                Self::write_decimal_unsigned(es.active_guards);
+                tx_hal::console_write_str::<P>("\n");
+            }
             if Self::drain_sbi_console_into_tty() != 0 {
                 continue;
+            }
+            {
+                let es = crate::adapter::step_engine::epoch::summary();
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":diag:loop:C guards=");
+                Self::write_decimal_unsigned(es.active_guards);
+                tx_hal::console_write_str::<P>("\n");
             }
 
             // Drain any pending child-thread submits posted from
@@ -716,11 +744,44 @@ impl<P: TxPlatform> CoreInit<P> {
             // reactor here, outside the inner lock that sys_clone
             // ran under.
             Self::drain_pending_child_submits();
+            {
+                let es = crate::adapter::step_engine::epoch::summary();
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":diag:loop:D guards=");
+                Self::write_decimal_unsigned(es.active_guards);
+                tx_hal::console_write_str::<P>("\n");
+            }
+            // Diagnostic: queue depths after child-thread drain.
+            {
+                let depths = BOOT_REACTOR
+                    .with(|r| r.queue_depths(boot_runtime::HartId(current_cpu.0)));
+                if let Some(d) = depths {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":diag:loop:queue k=");
+                    Self::write_decimal_unsigned(d.kernel);
+                    tx_hal::console_write_str::<P>(" n=");
+                    Self::write_decimal_unsigned(d.new);
+                    tx_hal::console_write_str::<P>(" p=");
+                    Self::write_decimal_unsigned(d.preempted);
+                    tx_hal::console_write_str::<P>("\n");
+                }
+            }
 
             let step = match Self::step_boot_reactor_once(current_cpu) {
                 Some(step) => step,
                 None => break,
             };
+            // Diagnostic: step stats.
+            {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":diag:loop:step polled=");
+                Self::write_decimal_unsigned(step.stats.polled);
+                tx_hal::console_write_str::<P>(" completed=");
+                Self::write_decimal_unsigned(step.stats.completed);
+                tx_hal::console_write_str::<P>(" idle=");
+                tx_hal::console_write_str::<P>(if step.should_idle() { "y" } else { "n" });
+                tx_hal::console_write_str::<P>("\n");
+            }
 
             // EBR drain. Caps retired during the task polls above
             // (e.g. `Cap<OpenFile>` from `sys_close` / process exit fd
@@ -766,6 +827,10 @@ impl<P: TxPlatform> CoreInit<P> {
                     );
                 }
                 P::wait_for_interrupt_once();
+                if P::pending_ipi(IpiKind::Membarrier) {
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                    P::ack_ipi(IpiKind::Membarrier);
+                }
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);
                 }

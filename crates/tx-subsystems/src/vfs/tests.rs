@@ -292,7 +292,7 @@ fn open_file_step_ioctl_dispatches_basic_tty_requests() {
 fn open_file_step_ioctl_dispatches_process_aware_tty_session_ops() {
     let _g = setup_process_world();
     let init = fresh_init();
-    let peer = step_fork::<TestPmap>(&init, false).expect("fork");
+    let peer = step_fork::<TestPmap>(&init, false, false).expect("fork");
     let tty = alloc_tty(
         TtyKind::SerialHardware,
         3,

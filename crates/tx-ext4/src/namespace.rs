@@ -64,15 +64,26 @@ where
         name: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<FsObjectId, NoProgress> {
+        // Diagnostic: record that ext4 lookup was called (vs some other backend).
+        tx_subsystems::vfs::resolution::diagnostic::record_diag(20);
         let parent = match inode_no(parent) {
             Ok(parent) => parent,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => {
+                tx_subsystems::vfs::resolution::diagnostic::record_diag(21);
+                return StepOutcome::err(err.into());
+            }
         };
 
         match self.with_pager(|pager| pager.lookup(parent, name)) {
             Ok(Some(inode)) => StepOutcome::done(inode_fs_object_id(inode)),
-            Ok(None) => StepOutcome::err(Errno::ENOENT.into()),
-            Err(err) => StepOutcome::err(err.into()),
+            Ok(None) => {
+                tx_subsystems::vfs::resolution::diagnostic::record_diag(22); // ENOENT
+                StepOutcome::err(Errno::ENOENT.into())
+            }
+            Err(err) => {
+                tx_subsystems::vfs::resolution::diagnostic::record_diag(23); // format err
+                StepOutcome::err(err.into())
+            }
         }
     }
 
