@@ -622,6 +622,23 @@ fn exec_script_invalid_elf_falls_back_to_bin_sh() {
 }
 
 #[test]
+fn shebang_busybox_sh_normalization_consumes_applet_arg() {
+    let header = b"#!/bin/busybox sh\n./lua $1\n";
+    let (interp, opt_arg) = super::shebang_parse(header).expect("valid shebang");
+    let original_argv: [&[u8]; 2] = [b"./test.sh", b"date.lua"];
+
+    let (interp_path, argv) =
+        super::shebang_exec_argv(interp, opt_arg, b"./test.sh", &original_argv);
+
+    assert_eq!(interp_path, b"/bin/sh");
+    let argv_refs: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        argv_refs,
+        vec![b"/bin/sh".as_slice(), b"./test.sh", b"date.lua"]
+    );
+}
+
+#[test]
 fn exec_script_path_not_found_returns_path_not_found() {
     let _setup = setup();
     // Register a file but exec a different path so the walker

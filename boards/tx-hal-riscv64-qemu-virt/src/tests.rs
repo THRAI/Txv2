@@ -40,7 +40,7 @@ impl KernelTrapSink<Platform> for RecordingTrapSink {
         TrapAction::Resume
     }
 
-    fn on_timer_interrupt(_cpu: CpuId) -> TrapAction {
+    fn on_timer_interrupt(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         assert!(<Platform as IrqIf>::in_irq_context());
         TrapAction::Reschedule
     }

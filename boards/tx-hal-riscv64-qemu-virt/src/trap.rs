@@ -192,6 +192,16 @@ tx_rv64_qemu_minimal_trap_vector:
     sw   t0, TX_RV64_TF_FCSR(sp)
 1:
 
+    # From-user traps arrive with gp restored from the user frame.
+    # Reinstall the kernel global pointer before calling into Rust:
+    # compiler/linker relaxation may address kernel statics relative
+    # to gp, so running Rust trap code with a user gp corrupts global
+    # accesses in wonderfully cursed ways.
+    .option push
+    .option norelax
+    la gp, __global_pointer$
+    .option pop
+
     # From-user traps arrive with tp restored from the user frame.
     # Recover the kernel TLS pointer from the trap-stack top before
     # entering Rust; all per-CPU state (current_cpu_id, irq depth,
@@ -433,6 +443,10 @@ tx_rv64_enter_userspace_save_resume:
     .globl tx_rv64_resume_kernel_after_reschedule
     .type tx_rv64_resume_kernel_after_reschedule, @function
 tx_rv64_resume_kernel_after_reschedule:
+    .option push
+    .option norelax
+    la gp, __global_pointer$
+    .option pop
     ld sp,   TX_RV64_RCTX_SP(a0)
     ld ra,   TX_RV64_RCTX_RA(a0)
     ld s0,  (TX_RV64_RCTX_S0 +   0)(a0)
@@ -804,7 +818,10 @@ where
         TrapClass::Syscall => K::on_syscall(frame.view_mut()),
         TrapClass::TimerInterrupt => {
             let _irq_context = crate::enter_irq_context();
-            K::on_timer_interrupt(<Platform as tx_hal::SmpIf>::current_cpu_id())
+            K::on_timer_interrupt(
+                <Platform as tx_hal::SmpIf>::current_cpu_id(),
+                frame.view_mut(),
+            )
         }
         TrapClass::ExternalInterrupt => {
             let _irq_context = crate::enter_irq_context();

@@ -47,7 +47,9 @@ use crate::adapter::step_engine::PayloadCap;
 /// trio plan's "Phase 1 surface" reference for everyone above the
 /// reactor.
 pub use boot_runtime::userspace::SyscallRequest;
-use tx_subsystems::thread_runtime::{current_thread_payload, ThreadPayload};
+use tx_subsystems::thread_runtime::{
+    current_thread_payload, current_userspace_payload, ThreadPayload,
+};
 
 /// Re-export of the reactor's [`PageFaultAccess`] for the trap-shell
 /// surface. Phase 1 uses the reactor enum unchanged; the plan's
@@ -153,6 +155,18 @@ pub enum HandoffOutcome {
     SlotError(UserspaceRunError),
 }
 
+#[derive(Debug)]
+pub enum TimerPreemptOutcome {
+    /// The active userspace-run request was marked preempted.
+    Preempted,
+    /// No active payload existed for this hart.
+    NoActivePayload,
+    /// The active payload had no in-flight userspace-run request.
+    NoActiveRequest,
+    /// The userspace-run slot rejected the preemption update.
+    SlotError(UserspaceRunError),
+}
+
 /// Resolve the active per-hart [`PayloadCap<ThreadPayload>`].
 ///
 /// This indirects through the per-hart slot table maintained by the
@@ -162,7 +176,7 @@ pub enum HandoffOutcome {
 /// currently driving on this hart the slot is `None` and the trap
 /// shell falls back to the legacy `Terminate` policy.
 pub fn current_payload_for_hart(hart: usize) -> Option<PayloadCap<ThreadPayload>> {
-    current_thread_payload(hart)
+    current_thread_payload(hart).or_else(|| current_userspace_payload(hart))
 }
 
 /// Hand the syscall trap off to the active per-hart `ThreadPayload`.
@@ -255,6 +269,31 @@ pub fn hand_off_user_pf(
     }
 }
 
+/// Record a timer preemption of an active userspace-run request.
+///
+/// Timer preemption is intentionally not an "interesting trap": it must not
+/// resolve the userspace-run wait. The thread future observes the slot's
+/// `Preempted` phase after the platform userspace-entry shim returns, yields
+/// back to the reactor once, and then re-enters userspace from the saved
+/// context on a later poll.
+pub fn hand_off_timer_preempt(hart: usize, view: &TrapFrameMut<'_>) -> TimerPreemptOutcome {
+    let Some(payload) = current_payload_for_hart(hart) else {
+        return TimerPreemptOutcome::NoActivePayload;
+    };
+
+    let Some(active) = payload.active_userspace_request() else {
+        return TimerPreemptOutcome::NoActiveRequest;
+    };
+
+    payload.store_saved_user_context(Some(view.capture_user_context()));
+
+    let slot: UserspaceRunSlot = payload.userspace_slot().clone();
+    match slot.record_timer_preemption(active) {
+        Ok(_status) => TimerPreemptOutcome::Preempted,
+        Err(err) => TimerPreemptOutcome::SlotError(err),
+    }
+}
+
 /// Convert a [`HandoffOutcome`] into the `TrapAction` the
 /// `KernelTrapSink` should return. Phase 1 collapses every
 /// non-`Resolved` outcome to `Terminate`; later phases may want to
@@ -266,6 +305,15 @@ pub const fn outcome_to_trap_action(outcome: &HandoffOutcome) -> TrapAction {
         HandoffOutcome::NoActivePayload
         | HandoffOutcome::NoActiveRequest
         | HandoffOutcome::SlotError(_) => TrapAction::Terminate,
+    }
+}
+
+pub const fn timer_preempt_outcome_to_trap_action(outcome: &TimerPreemptOutcome) -> TrapAction {
+    match outcome {
+        TimerPreemptOutcome::Preempted => TrapAction::Reschedule,
+        TimerPreemptOutcome::NoActivePayload
+        | TimerPreemptOutcome::NoActiveRequest
+        | TimerPreemptOutcome::SlotError(_) => TrapAction::Resume,
     }
 }
 

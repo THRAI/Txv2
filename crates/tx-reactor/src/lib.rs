@@ -42,10 +42,13 @@ pub use dispatch::{
 pub use mailbox::{
     ActiveWait, MailboxEvent, SignalRouting, TaskMailbox, WaitGeneration, MAILBOX_QUEUE_BOUND,
 };
-pub use runtime::{Reactor, RunIdleReport, RunStats, SharedReactor};
+pub use runtime::{
+    HartRunStats, Reactor, ReactorObservability, RunIdleReport, RunStats, SharedReactor, SliceClock,
+};
 pub use scheduler::{
-    HartId, InitialSchedMeta, Phase1Scheduler, RunnablePlacement, SchedClass, SchedulerPolicy,
-    SliceConfig, StopReason, TaskHandle, WakeHint,
+    HartId, InitialSchedMeta, MigrationPolicy, Phase1QueueKind, Phase1Scheduler, RunnablePlacement,
+    SchedClass, SchedulerAffinityError, SchedulerPolicy, SchedulerStats, SliceConfig, StopReason,
+    TaskHandle, TaskRunOwner, WakeHint,
 };
 pub use task::{
     current_delegate_registry, current_task_mailbox, current_timer_wheel, TaskDrainRecord, TaskId,

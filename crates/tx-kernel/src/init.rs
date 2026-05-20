@@ -40,6 +40,10 @@ const BSP_REACTOR_TIMER_WAIT_SPINS: usize = 20_000;
 pub(crate) const IDLE_TIMER_PERIOD_NS: u64 = 5_000_000; // 5 ms
 
 static BOOT_REACTOR: boot_runtime::SharedReactor = boot_runtime::SharedReactor::empty();
+/// Switched to true when the userspace reactor phase begins, enabling
+/// the concurrent poll path on all harts.
+pub(super) static USE_CONCURRENT_POLL: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 
@@ -94,6 +98,12 @@ pub fn dev_mount() -> Option<Cap<MountIdentity>> {
 /// `register_console_hardware` has run.
 pub fn console_tty() -> Option<Cap<TtyIdentity>> {
     CONSOLE_TTY.lock().clone()
+}
+
+pub(crate) fn mark_boot_reactor_userspace_preempt(cpu_id: CpuId) {
+    let _ = BOOT_REACTOR.with(|reactor| {
+        reactor.mark_userspace_preempt(boot_runtime::HartId(cpu_id.0));
+    });
 }
 
 #[cfg(test)]
@@ -245,6 +255,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::run_zone_smoke();
             Self::run_bsp_reactor_runtime_smoke();
             Self::run_bsp_reactor_timer_idle_smoke();
+            Self::report_reactor_sched_observability();
             Self::init_process_subsystem();
 
             // ---- Phase 3b boot wiring ----
@@ -1195,6 +1206,28 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(s);
     }
 
+    fn write_usize(value: usize) {
+        Self::write_decimal_unsigned(value);
+    }
+
+    fn write_u64(value: u64) {
+        if value <= usize::MAX as u64 {
+            Self::write_decimal_unsigned(value as usize);
+            return;
+        }
+
+        let mut digits = [0u8; 20];
+        let mut n = value;
+        let mut idx = digits.len();
+        while n > 0 {
+            idx -= 1;
+            digits[idx] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+        let s = core::str::from_utf8(&digits[idx..]).unwrap_or("");
+        tx_hal::console_write_str::<P>(s);
+    }
+
     fn init_later(handoff: BootHandoff) {
         P::init_later(handoff);
     }
@@ -1377,7 +1410,12 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn run_secondary_reactor_once(cpu_id: CpuId) -> bool {
-        Self::step_boot_reactor_once(cpu_id).is_some_and(|step| !step.should_idle())
+        if USE_CONCURRENT_POLL.load(core::sync::atomic::Ordering::Relaxed) {
+            Self::step_boot_reactor_once_concurrent(cpu_id)
+        } else {
+            Self::step_boot_reactor_once(cpu_id)
+        }
+        .is_some_and(|step| !step.should_idle())
     }
 
     fn step_boot_reactor_once(cpu_id: CpuId) -> Option<boot_runtime::hart_loop::HartLoopStep> {
@@ -1387,6 +1425,41 @@ impl<P: TxPlatform> CoreInit<P> {
         let step = BOOT_REACTOR.with(|reactor| {
             boot_runtime::hart_loop::step_hart_loop_at(reactor, hart, now_ns, &mut signal)
         })?;
+        Self::program_hart_loop_deadline(step.deadline_action);
+        Some(step)
+    }
+
+    /// Concurrent variant: releases the reactor lock during each task's
+    /// `future.poll()`, allowing other harts to make progress in parallel
+    /// (Phase 1a poll lease).
+    fn step_boot_reactor_once_concurrent(
+        cpu_id: CpuId,
+    ) -> Option<boot_runtime::hart_loop::HartLoopStep> {
+        let hart = boot_runtime::HartId(cpu_id.0);
+        let now_ns = P::read_ns();
+        let mut signal = SmpRescheduleSignal::<P>::new();
+        struct KernelSliceClock<P>(core::marker::PhantomData<P>);
+        impl<P: TxPlatform> boot_runtime::SliceClock for KernelSliceClock<P> {
+            fn now_ns(&mut self) -> u64 {
+                P::read_ns()
+            }
+
+            fn set_deadline_ns(&mut self, deadline_ns: u64) {
+                P::set_deadline_ns(deadline_ns);
+            }
+
+            fn cancel_deadline(&mut self) {
+                P::cancel_deadline();
+            }
+        }
+
+        let mut slice_clock = KernelSliceClock::<P>(core::marker::PhantomData);
+        let step = BOOT_REACTOR.run_hart_loop_concurrent_with_slice_clock(
+            hart,
+            now_ns,
+            &mut signal,
+            &mut slice_clock,
+        )?;
         Self::program_hart_loop_deadline(step.deadline_action);
         Some(step)
     }
@@ -1429,6 +1502,20 @@ impl<P: TxPlatform> CoreInit<P> {
 
     fn cpu_bit(cpu_id: CpuId) -> u64 {
         CpuMask::single(cpu_id).bits()
+    }
+
+    fn userspace_thread_sched_meta() -> boot_runtime::InitialSchedMeta {
+        let affinity = P::online_cpus().bits();
+        let affinity = if affinity == 0 {
+            CpuMask::single(<P as tx_hal::SmpIf>::current_cpu_id()).bits()
+        } else {
+            affinity
+        };
+        boot_runtime::InitialSchedMeta::fair()
+            .with_affinity(affinity)
+            .movable()
+            .userspace_thread()
+            .spread_on_submit()
     }
 
     fn run_zone_smoke() {
@@ -1539,6 +1626,35 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":reactor:timer-idle:WARN-wake\n");
     }
 
+    fn report_reactor_sched_observability() {
+        let Some((observed, scheduler)) =
+            BOOT_REACTOR.with(|reactor| (reactor.observability(), reactor.scheduler_stats()))
+        else {
+            return;
+        };
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":reactor:sched:stats");
+        let mut hart = 0;
+        while hart < observed.per_hart().len() {
+            let stats = observed.hart(boot_runtime::HartId(hart));
+            if stats.polled > 0 || stats.completed > 0 {
+                tx_hal::console_write_str::<P>(":h");
+                Self::write_usize(hart);
+                tx_hal::console_write_str::<P>("=");
+                Self::write_u64(stats.polled);
+                tx_hal::console_write_str::<P>("/");
+                Self::write_u64(stats.completed);
+            }
+            hart += 1;
+        }
+        tx_hal::console_write_str::<P>(":steal=");
+        Self::write_u64(scheduler.work_steals);
+        tx_hal::console_write_str::<P>(":rebalance=");
+        Self::write_u64(scheduler.rebalance_moves);
+        tx_hal::console_write_str::<P>("\n");
+    }
+
     fn bsp_timer_smoke_done(cpu_bit: u64) -> bool {
         BSP_REACTOR_TIMER_DONE_CPUS.load(Ordering::Acquire) & cpu_bit != 0
     }
@@ -1601,14 +1717,17 @@ impl<P: TxPlatform> CoreInit<P> {
             };
             let task_payload = payload.clone();
             let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+            let current_hart = boot_runtime::HartId(current_cpu.0);
+            let mut signal = SmpRescheduleSignal::<P>::new();
             let _ = BOOT_REACTOR.with(|reactor| {
-                reactor.submit_task_with_meta(
+                reactor.submit_task_with_meta_from_hart(
                     crate::thread_future::PerHartSlotted::<P, _>::new(
                         task_payload.clone(),
                         crate::thread_future::run_thread::<P>(child_thread, task_payload),
                     ),
-                    boot_runtime::InitialSchedMeta::kernel()
-                        .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
+                    Self::userspace_thread_sched_meta(),
+                    current_hart,
+                    &mut signal,
                 );
             });
         }

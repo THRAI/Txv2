@@ -13,10 +13,12 @@ use tx_substrate::wake::mailbox::TaskMailbox;
 
 use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect},
-    dispatch::{DispatchState, NoopRescheduleSignal, RescheduleSignal, WakeDispatchReport},
+    dispatch::{NoopRescheduleSignal, RescheduleSignal, WakeDispatchAction, WakeDispatchReport},
+    hart_loop::HartLoopStep,
     preempt::PreemptMarkers,
     scheduler::{
-        HartId, InitialSchedMeta, Phase1Scheduler, SliceConfig, StopReason, TaskHandle, WakeHint,
+        HartId, InitialSchedMeta, Phase1Scheduler, RunnablePlacement, SchedulerAffinityError,
+        SchedulerStats, SliceConfig, StopReason, TaskHandle, TaskRunOwner, WakeHint,
     },
     spin_lock::SpinLock,
     task::{TaskDrainRecord, TaskId, TaskKey, TaskLifecycleError, TaskStatus, TaskTable},
@@ -100,14 +102,98 @@ where
     }
 }
 
+struct NoopSliceClock;
+
+impl SliceClock for NoopSliceClock {
+    fn now_ns(&mut self) -> u64 {
+        0
+    }
+
+    fn set_deadline_ns(&mut self, _deadline_ns: u64) {}
+
+    fn cancel_deadline(&mut self) {}
+}
+
+pub trait SliceClock {
+    fn now_ns(&mut self) -> u64;
+    fn set_deadline_ns(&mut self, deadline_ns: u64);
+    fn cancel_deadline(&mut self);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PollTiming {
+    slice: SliceConfig,
+    start_ns: u64,
+}
+
+impl PollTiming {
+    fn start<C: SliceClock>(slice: SliceConfig, clock: &mut C) -> Self {
+        let start_ns = clock.now_ns();
+        if let SliceConfig::Preemptive { slice_ns } = slice {
+            clock.set_deadline_ns(start_ns.saturating_add(slice_ns));
+        }
+        Self { slice, start_ns }
+    }
+
+    fn finish<C: SliceClock>(self, clock: &mut C) -> PollAccounting {
+        let end_ns = clock.now_ns();
+        clock.cancel_deadline();
+        let consumed_ns = end_ns.saturating_sub(self.start_ns);
+        let slice_expired = matches!(
+            self.slice,
+            SliceConfig::Preemptive { slice_ns } if consumed_ns >= slice_ns
+        );
+        PollAccounting {
+            consumed_ns,
+            slice_expired,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PollAccounting {
+    consumed_ns: u64,
+    slice_expired: bool,
+}
+
 pub struct Reactor {
     tasks: TaskTable,
     scheduler: Phase1Scheduler,
-    dispatch: DispatchState,
+    observability: ReactorObservability,
     timers: TimerQueue,
     timer_wheel: tx_substrate::wake::timer::TimerWheel,
     delegate_registry: Arc<tx_substrate::step::DelegateRegistry>,
     userspace: UserspaceRunSlot,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HartRunStats {
+    pub polled: u64,
+    pub completed: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReactorObservability {
+    per_hart: Vec<HartRunStats>,
+}
+
+impl ReactorObservability {
+    pub fn hart(&self, hart: HartId) -> HartRunStats {
+        self.per_hart.get(hart.0).copied().unwrap_or_default()
+    }
+
+    pub fn per_hart(&self) -> &[HartRunStats] {
+        &self.per_hart
+    }
+
+    fn record_run_stats(&mut self, hart: HartId, stats: RunStats) {
+        while self.per_hart.len() <= hart.0 {
+            self.per_hart.push(HartRunStats::default());
+        }
+        let slot = &mut self.per_hart[hart.0];
+        slot.polled = slot.polled.saturating_add(stats.polled as u64);
+        slot.completed = slot.completed.saturating_add(stats.completed as u64);
+    }
 }
 
 pub struct SharedReactor {
@@ -139,14 +225,206 @@ impl SharedReactor {
         let mut reactor = self.reactor.lock();
         reactor.as_mut().map(f)
     }
+
+    /// Phase 1a poll lease: lock → pick+take future → unlock → poll → lock → commit.
+    pub fn run_hart_loop_concurrent<S>(
+        &self,
+        hart: HartId,
+        now_ns: u64,
+        signal: &mut S,
+    ) -> Option<HartLoopStep>
+    where
+        S: RescheduleSignal,
+    {
+        self.run_hart_loop_concurrent_with_slice_clock(hart, now_ns, signal, &mut NoopSliceClock)
+    }
+
+    pub fn run_hart_loop_concurrent_with_slice_clock<S, C>(
+        &self,
+        hart: HartId,
+        now_ns: u64,
+        signal: &mut S,
+        slice_clock: &mut C,
+    ) -> Option<HartLoopStep>
+    where
+        S: RescheduleSignal,
+        C: SliceClock,
+    {
+        use crate::waker::task_waker;
+        use core::task::{Context, Poll};
+
+        let mut stats = RunStats::empty();
+        let timer_wakes: usize;
+        let wake_report: WakeDispatchReport;
+
+        // Phase 1: short lock — advance time & drain wakes
+        {
+            let mut guard = self.reactor.lock();
+            let reactor = guard.as_mut()?;
+            timer_wakes = reactor.advance_time_to(now_ns);
+            wake_report = reactor.drain_wakes_for_hart(hart, signal);
+            reactor.scheduler.rebalance_at(hart, now_ns);
+        }
+
+        // Phase 2: poll loop — lock/unlock per task
+        loop {
+            let poll_packet = {
+                let mut guard = self.reactor.lock();
+                let reactor = guard.as_mut()?;
+                reactor.drain_wakes_for_hart(hart, signal);
+                let Some((handle, slice)) = reactor.scheduler.pick_next_or_steal(hart) else {
+                    break;
+                };
+                let Some(key) = reactor.tasks.key_for_id(handle.id()) else {
+                    reactor.scheduler.task_dropped(handle.id());
+                    continue;
+                };
+                if reactor.tasks.status(key) != Some(TaskStatus::Runnable) {
+                    match reactor.tasks.status(key) {
+                        Some(TaskStatus::Completed | TaskStatus::Cancelled) => {
+                            reactor.scheduler.task_dropped(handle.id());
+                        }
+                        _ => {
+                            reactor.scheduler.task_stopped(
+                                handle.id(),
+                                StopReason::Blocked,
+                                0,
+                                hart,
+                            );
+                        }
+                    }
+                    continue;
+                }
+                match reactor.tasks.take_future(key) {
+                    Ok((future, wake_state, mailbox)) => {
+                        crate::task::set_current_mailbox(hart.0, Some(mailbox));
+                        crate::task::set_current_timer_wheel(
+                            hart.0,
+                            Some(reactor.timer_wheel.clone()),
+                        );
+                        crate::task::set_current_delegate_registry(
+                            hart.0,
+                            Some(Arc::clone(&reactor.delegate_registry)),
+                        );
+                        Some((key, future, wake_state, slice))
+                    }
+                    Err(_) => continue,
+                }
+            }; // LOCK RELEASED
+
+            let Some((key, mut future, wake_state, slice)) = poll_packet else {
+                continue;
+            };
+
+            let waker = task_waker(wake_state);
+            let mut cx = Context::from_waker(&waker);
+            stats.polled += 1;
+            let timing = PollTiming::start(slice, slice_clock);
+            let result = future.as_mut().poll(&mut cx);
+            let accounting = timing.finish(slice_clock);
+
+            crate::task::set_current_mailbox(hart.0, None);
+            crate::task::set_current_timer_wheel(hart.0, None);
+            crate::task::set_current_delegate_registry(hart.0, None);
+
+            // Phase 3: short lock — commit state
+            {
+                let mut guard = self.reactor.lock();
+                let reactor = guard.as_mut()?;
+                let _ = reactor.tasks.put_future(key, future);
+                match result {
+                    Poll::Ready(()) => {
+                        if reactor.tasks.complete_task(key).is_ok() {
+                            reactor.scheduler.task_stopped(
+                                key.id(),
+                                StopReason::Completed,
+                                accounting.consumed_ns,
+                                hart,
+                            );
+                            reactor.scheduler.task_dropped(key.id());
+                            stats.completed += 1;
+                        }
+                    }
+                    Poll::Pending => {
+                        let userspace_preempted = reactor.take_userspace_preempt_marker(hart);
+                        if userspace_preempted {
+                            if let Ok(task) = reactor.tasks.task_mut(key) {
+                                let _ = task.wake_state.take_wake();
+                                task.status = TaskStatus::Runnable;
+                                task.last_stop_reason = Some(StopReason::PreemptedExternal);
+                            }
+                            reactor.scheduler.task_stopped(
+                                key.id(),
+                                StopReason::PreemptedExternal,
+                                accounting.consumed_ns,
+                                hart,
+                            );
+                            let _ = reactor.dispatch_queued_task_from_hart(key.id(), hart, signal);
+                        } else if accounting.slice_expired {
+                            if let Ok(task) = reactor.tasks.task_mut(key) {
+                                let _ = task.wake_state.take_wake();
+                                task.status = TaskStatus::Runnable;
+                                task.last_stop_reason = Some(StopReason::SliceExpired);
+                            }
+                            reactor.scheduler.task_stopped(
+                                key.id(),
+                                StopReason::SliceExpired,
+                                accounting.consumed_ns,
+                                hart,
+                            );
+                            let _ = reactor.dispatch_queued_task_from_hart(key.id(), hart, signal);
+                        } else if reactor
+                            .tasks
+                            .task(key)
+                            .map(|t| t.wake_state.take_wake())
+                            .unwrap_or(false)
+                        {
+                            reactor.mark_runnable_from_hart(key, WakeHint::Normal, hart, signal);
+                        } else if let Ok(task) = reactor.tasks.task_mut(key) {
+                            task.status = TaskStatus::Parked;
+                            task.last_stop_reason = Some(StopReason::Blocked);
+                            reactor.scheduler.task_stopped(
+                                key.id(),
+                                StopReason::Blocked,
+                                accounting.consumed_ns,
+                                hart,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let (consumed_markers, next_deadline_ns) = {
+            let mut guard = self.reactor.lock();
+            let reactor = guard.as_mut()?;
+            reactor.record_run_stats(hart, stats);
+            (
+                reactor.consume_dispatch_markers(hart),
+                reactor.next_deadline_ns(),
+            )
+        };
+
+        Some(HartLoopStep::new(
+            hart,
+            now_ns,
+            stats,
+            wake_report,
+            consumed_markers,
+            timer_wakes,
+            next_deadline_ns,
+        ))
+    }
 }
 
 impl Reactor {
+    const WAKE_INBOX_DRAIN_LIMIT: usize = 64;
+
     pub fn new() -> Self {
         Self {
             tasks: TaskTable::new(),
             scheduler: Phase1Scheduler::new(),
-            dispatch: DispatchState::new(),
+            observability: ReactorObservability::default(),
             timers: TimerQueue::new(),
             timer_wheel: tx_substrate::wake::timer::TimerWheel::new(),
             delegate_registry: Arc::new(tx_substrate::step::DelegateRegistry::new()),
@@ -273,10 +551,61 @@ impl Reactor {
         key
     }
 
+    /// Submit a task from a running hart and dispatch a reschedule
+    /// marker/IPI if initial placement chooses another hart.
+    pub fn submit_task_with_meta_from_hart<F, S>(
+        &mut self,
+        future: F,
+        initial_meta: InitialSchedMeta,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> (TaskKey, WakeDispatchReport)
+    where
+        F: Future<Output = ()> + Send + 'static,
+        S: RescheduleSignal,
+    {
+        let key = self.submit_task_with_meta(future, initial_meta);
+        let mut report = WakeDispatchReport::empty();
+        if let Some(TaskRunOwner::Queued { hart, .. }) = self.scheduler.task_owner(key.id()) {
+            report.record(self.apply_runnable_placement(
+                RunnablePlacement {
+                    target_hart: hart,
+                    wake_remote: hart != current_hart,
+                },
+                signal,
+            ));
+        }
+        (key, report)
+    }
+
     pub fn cancel_task(&mut self, task: TaskKey) -> Result<(), TaskLifecycleError> {
         self.tasks.cancel_task(task)?;
         self.scheduler.task_dropped(task.id());
         Ok(())
+    }
+
+    pub fn set_task_affinity<S>(
+        &mut self,
+        task: TaskKey,
+        affinity: u64,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> Result<WakeDispatchReport, SchedulerAffinityError>
+    where
+        S: RescheduleSignal,
+    {
+        if self.tasks.status(task).is_none() {
+            return Err(SchedulerAffinityError::UnknownTask);
+        }
+
+        let mut report = WakeDispatchReport::empty();
+        if let Some(placement) = self
+            .scheduler
+            .set_affinity(task.id(), affinity, current_hart)?
+        {
+            report.record(self.apply_runnable_placement(placement, signal));
+        }
+        Ok(report)
     }
 
     pub fn queue_ast_marker(
@@ -369,6 +698,23 @@ impl Reactor {
     where
         S: RescheduleSignal,
     {
+        self.run_until_idle_on_hart_with_reschedule_and_slice_clock(
+            hart,
+            signal,
+            &mut NoopSliceClock,
+        )
+    }
+
+    pub fn run_until_idle_on_hart_with_reschedule_and_slice_clock<S, C>(
+        &mut self,
+        hart: HartId,
+        signal: &mut S,
+        slice_clock: &mut C,
+    ) -> RunStats
+    where
+        S: RescheduleSignal,
+        C: SliceClock,
+    {
         let mut stats = RunStats {
             polled: 0,
             completed: 0,
@@ -378,10 +724,11 @@ impl Reactor {
             // transition from Parked to Runnable and does it at poll-loop
             // boundaries, where duplicate wakes naturally coalesce.
             self.drain_wakes_for_hart(hart, signal);
-            let Some((handle, _slice)) = self.scheduler.pick_next(hart) else {
+            let Some((handle, slice)) = self.scheduler.pick_next_or_steal(hart) else {
                 break;
             };
             let Some(key) = self.tasks.key_for_id(handle.id()) else {
+                self.scheduler.task_dropped(handle.id());
                 continue;
             };
 
@@ -393,6 +740,15 @@ impl Reactor {
                     .and_then(|task| task.future.as_ref())
                     .is_none()
             {
+                match self.tasks.status(key) {
+                    Some(TaskStatus::Completed | TaskStatus::Cancelled) => {
+                        self.scheduler.task_dropped(handle.id());
+                    }
+                    _ => {
+                        self.scheduler
+                            .task_stopped(handle.id(), StopReason::Blocked, 0, hart);
+                    }
+                }
                 continue;
             }
 
@@ -415,60 +771,93 @@ impl Reactor {
                 // drive-taskmb: expose the task's mailbox so the trampoline
                 // can inject it into SyscallCtx (and from there into ScriptCtx
                 // for drive() yield resolution).
-                crate::task::set_current_mailbox(Some(Arc::clone(&task.mailbox)));
-
-                // drive-taskmb: expose the reactor's timer wheel for OnTimer
-                // yield resolution.
-                crate::task::set_current_timer_wheel(Some(self.timer_wheel.clone()));
-
-                // drive-taskmb: expose the reactor's delegate registry
-                // for OnAgent yield resolution.
-                crate::task::set_current_delegate_registry(Some(Arc::clone(
-                    &self.delegate_registry,
-                )));
+                crate::task::set_current_mailbox(hart.0, Some(Arc::clone(&task.mailbox)));
+                crate::task::set_current_timer_wheel(hart.0, Some(self.timer_wheel.clone()));
+                crate::task::set_current_delegate_registry(
+                    hart.0,
+                    Some(Arc::clone(&self.delegate_registry)),
+                );
 
                 let Some(future) = task.future.as_mut() else {
-                    crate::task::set_current_mailbox(None);
-                    crate::task::set_current_timer_wheel(None);
-                    crate::task::set_current_delegate_registry(None);
+                    crate::task::set_current_mailbox(hart.0, None);
+                    crate::task::set_current_timer_wheel(hart.0, None);
+                    crate::task::set_current_delegate_registry(hart.0, None);
                     continue;
                 };
 
                 stats.polled += 1;
+                let timing = PollTiming::start(slice, slice_clock);
                 let result = future.as_mut().poll(&mut cx);
-                crate::task::set_current_mailbox(None);
-                crate::task::set_current_timer_wheel(None);
-                crate::task::set_current_delegate_registry(None);
-                result
+                let accounting = timing.finish(slice_clock);
+                crate::task::set_current_mailbox(hart.0, None);
+                crate::task::set_current_timer_wheel(hart.0, None);
+                crate::task::set_current_delegate_registry(hart.0, None);
+                (result, accounting)
             };
 
             match poll {
-                Poll::Ready(()) => {
+                (Poll::Ready(()), accounting) => {
                     if self.tasks.complete_task(key).is_ok() {
-                        self.scheduler
-                            .task_stopped(key.id(), StopReason::Completed, 0, hart);
+                        self.scheduler.task_stopped(
+                            key.id(),
+                            StopReason::Completed,
+                            accounting.consumed_ns,
+                            hart,
+                        );
                         self.scheduler.task_dropped(key.id());
                         stats.completed += 1;
                     }
                 }
-                Poll::Pending => {
-                    let woke_during_poll = self
+                (Poll::Pending, accounting) => {
+                    let userspace_preempted = self.take_userspace_preempt_marker(hart);
+                    if userspace_preempted {
+                        if let Ok(task) = self.tasks.task_mut(key) {
+                            let _ = task.wake_state.take_wake();
+                            task.status = TaskStatus::Runnable;
+                            task.last_stop_reason = Some(StopReason::PreemptedExternal);
+                        }
+                        self.scheduler.task_stopped(
+                            key.id(),
+                            StopReason::PreemptedExternal,
+                            accounting.consumed_ns,
+                            hart,
+                        );
+                        let _ = self.dispatch_queued_task_from_hart(key.id(), hart, signal);
+                    } else if accounting.slice_expired {
+                        if let Ok(task) = self.tasks.task_mut(key) {
+                            let _ = task.wake_state.take_wake();
+                            task.status = TaskStatus::Runnable;
+                            task.last_stop_reason = Some(StopReason::SliceExpired);
+                        }
+                        self.scheduler.task_stopped(
+                            key.id(),
+                            StopReason::SliceExpired,
+                            accounting.consumed_ns,
+                            hart,
+                        );
+                        let _ = self.dispatch_queued_task_from_hart(key.id(), hart, signal);
+                    } else if self
                         .tasks
                         .task(key)
                         .map(|task| task.wake_state.take_wake())
-                        .unwrap_or(false);
-                    if woke_during_poll {
+                        .unwrap_or(false)
+                    {
                         self.mark_runnable_from_hart(key, WakeHint::Normal, hart, signal);
                     } else if let Ok(task) = self.tasks.task_mut(key) {
                         task.status = TaskStatus::Parked;
                         task.last_stop_reason = Some(StopReason::Blocked);
-                        self.scheduler
-                            .task_stopped(key.id(), StopReason::Blocked, 0, hart);
+                        self.scheduler.task_stopped(
+                            key.id(),
+                            StopReason::Blocked,
+                            accounting.consumed_ns,
+                            hart,
+                        );
                     }
                 }
             }
         }
 
+        self.record_run_stats(hart, stats);
         stats
     }
 
@@ -530,7 +919,7 @@ impl Reactor {
 
     pub fn next_scheduled_task(&mut self, hart: HartId) -> Option<(TaskHandle, SliceConfig)> {
         let mut signal = NoopRescheduleSignal::new();
-        self.drain_wakes_for_hart(HartId(0), &mut signal);
+        self.drain_wakes_for_hart(hart, &mut signal);
         self.scheduler.peek_next(hart)
     }
 
@@ -542,28 +931,80 @@ impl Reactor {
     where
         S: RescheduleSignal,
     {
-        let woken = self.tasks.drain_wakes();
         let mut report = WakeDispatchReport::empty();
-        for key in woken {
+        for id in self.tasks.drain_wake_ids() {
+            let Some(target_hart) = self.scheduler.target_hart_for_wake(id) else {
+                continue;
+            };
+            self.scheduler.push_wake_inbox(target_hart, id);
+            if target_hart != current_hart {
+                signal.send_reschedule_ipi(target_hart);
+                report.record(WakeDispatchAction {
+                    target_hart,
+                    wake_remote: true,
+                });
+            }
+        }
+
+        for id in self
+            .scheduler
+            .drain_wake_inbox(current_hart, Self::WAKE_INBOX_DRAIN_LIMIT)
+        {
+            let Some(key) = self.tasks.take_wake_if_parked_by_id(id) else {
+                continue;
+            };
             if let Some(placement) =
                 self.scheduler
                     .task_runnable_from(key.id(), WakeHint::Normal, current_hart)
             {
-                report.record(self.dispatch.apply_runnable_placement(placement, signal));
+                if placement.target_hart != current_hart {
+                    report.record(self.apply_runnable_placement(placement, signal));
+                } else {
+                    report.record(WakeDispatchAction {
+                        target_hart: placement.target_hart,
+                        wake_remote: false,
+                    });
+                }
             }
         }
         report
     }
 
     pub fn dispatch_markers(&self, hart: HartId) -> PreemptMarkers {
-        self.dispatch.snapshot_markers(hart)
+        self.scheduler.snapshot_markers(hart)
     }
 
     pub fn consume_dispatch_markers(&self, hart: HartId) -> PreemptMarkers {
-        self.dispatch.consume_markers(hart)
+        self.scheduler.consume_markers(hart)
     }
 
-    fn mark_runnable_from_hart<S>(
+    pub(crate) fn take_userspace_preempt_marker(&self, hart: HartId) -> bool {
+        self.scheduler.take_userspace_preempt(hart)
+    }
+
+    pub fn scheduler_stats(&self) -> SchedulerStats {
+        self.scheduler.stats()
+    }
+
+    pub fn observability(&self) -> ReactorObservability {
+        self.observability.clone()
+    }
+
+    fn record_run_stats(&mut self, hart: HartId, stats: RunStats) {
+        self.observability.record_run_stats(hart, stats);
+    }
+
+    /// Mark that userspace execution on `hart` should return to the reactor
+    /// before the next userspace entry.
+    ///
+    /// This is separate from normal reschedule markers, which are also used
+    /// as wake hints for idle harts. Trap/timer code should use this marker
+    /// for Phase 3 userspace preemption arbitration.
+    pub fn mark_userspace_preempt(&mut self, hart: HartId) {
+        self.scheduler.mark_userspace_preempt(hart);
+    }
+
+    pub(crate) fn mark_runnable_from_hart<S>(
         &mut self,
         key: TaskKey,
         hint: WakeHint,
@@ -579,10 +1020,51 @@ impl Reactor {
                 .scheduler
                 .task_runnable_from(key.id(), hint, current_hart)
             {
-                report.record(self.dispatch.apply_runnable_placement(placement, signal));
+                report.record(self.apply_runnable_placement(placement, signal));
             }
         }
         report
+    }
+
+    fn apply_runnable_placement<S>(
+        &mut self,
+        placement: RunnablePlacement,
+        signal: &mut S,
+    ) -> WakeDispatchAction
+    where
+        S: RescheduleSignal,
+    {
+        self.scheduler.mark_need_resched(placement.target_hart);
+        if placement.wake_remote {
+            signal.send_reschedule_ipi(placement.target_hart);
+        }
+
+        WakeDispatchAction {
+            target_hart: placement.target_hart,
+            wake_remote: placement.wake_remote,
+        }
+    }
+
+    fn dispatch_queued_task_from_hart<S>(
+        &mut self,
+        task: TaskId,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> Option<WakeDispatchAction>
+    where
+        S: RescheduleSignal,
+    {
+        let Some(TaskRunOwner::Queued { hart, .. }) = self.scheduler.task_owner(task) else {
+            return None;
+        };
+
+        Some(self.apply_runnable_placement(
+            RunnablePlacement {
+                target_hart: hart,
+                wake_remote: hart != current_hart,
+            },
+            signal,
+        ))
     }
 
     fn drain_terminal(&mut self, status: TaskStatus) -> Vec<TaskDrainRecord> {
