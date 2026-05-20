@@ -18,9 +18,6 @@ use tx_subsystems::vfs::structure::{DirCursor, FsObjectId, InodeMeta, Timespec};
 /// We use this cluster number for the FAT12/16 root dir in FsObjectId.
 pub(crate) const FAT_ROOT_CLUSTER_SENTINEL: u32 = 0xFFFF_FFFF;
 
-/// Read-ahead window for directory entries in `readdir`.
-pub(crate) const READDIR_WINDOW_ENTRIES: usize = 64;
-
 /// Capacity of the dirent cache.
 const CACHE_CAPACITY: usize = 64;
 
@@ -222,12 +219,6 @@ pub(crate) fn cluster_from_fs_id(fs_id: FsObjectId) -> u32 {
     (fs_id.as_u64() >> 32) as u32
 }
 
-/// Decode the entry offset from an FsObjectId.
-#[allow(dead_code)] // used in future operations
-pub(crate) fn entry_offset_from_fs_id(fs_id: FsObjectId) -> u32 {
-    fs_id.as_u64() as u32
-}
-
 /// Whether this FsObjectId represents the FAT12/16 root directory.
 pub(crate) fn is_fat_root(fs_id: FsObjectId) -> bool {
     cluster_from_fs_id(fs_id) == FAT_ROOT_CLUSTER_SENTINEL
@@ -242,7 +233,11 @@ pub(crate) fn map_cached_meta(dirent: &CachedDirent) -> InodeMeta {
     use tx_fat_format::ondisk::{decode_date, decode_time, ATTR_DIRECTORY};
 
     let is_dir = dirent.attr & ATTR_DIRECTORY != 0;
-    let mode = if is_dir { 0o555 | 0o040000 } else { 0o444 | 0o100000 };
+    let mode = if is_dir {
+        0o555 | 0o040000
+    } else {
+        0o444 | 0o100000
+    };
     let (year, month, day) = decode_date(dirent.write_date);
     let (hours, minutes, seconds) = decode_time(dirent.write_time);
     let mtime_sec = date_to_unix(year, month, day, hours, minutes, seconds);
@@ -253,33 +248,6 @@ pub(crate) fn map_cached_meta(dirent: &CachedDirent) -> InodeMeta {
         gid: 0,
         size: dirent.size as u64,
         atime: Timespec { sec: 0, nsec: 0 },
-        mtime: Timespec { sec: mtime_sec, nsec: 0 },
-        ctime: Timespec { sec: mtime_sec, nsec: 0 },
-        nlinks: 1,
-        blocks: (dirent.size as u64 + 511) / 512,
-        flags: 0,
-    }
-}
-
-/// Map a `DirEntryLite` into an `InodeMeta`.
-pub(crate) fn map_inode_meta(entry: &DirEntryLite) -> InodeMeta {
-    use tx_fat_format::ondisk::{decode_date, decode_time, ATTR_DIRECTORY};
-
-    let is_dir = entry.attr & ATTR_DIRECTORY != 0;
-    let mode = if is_dir { 0o555 | 0o040000 } else { 0o444 | 0o100000 }; // S_IFDIR | 0555 or S_IFREG | 0444
-
-    let (year, month, day) = decode_date(entry.write_date);
-    let (hours, minutes, seconds) = decode_time(entry.write_time);
-
-    // Compute Unix timestamp: days since 1970-01-01 for the given date.
-    let mtime_sec = date_to_unix(year, month, day, hours, minutes, seconds);
-
-    InodeMeta {
-        mode,
-        uid: 0,
-        gid: 0,
-        size: entry.size as u64,
-        atime: Timespec { sec: 0, nsec: 0 }, // FAT has no access time
         mtime: Timespec {
             sec: mtime_sec,
             nsec: 0,
@@ -287,9 +255,9 @@ pub(crate) fn map_inode_meta(entry: &DirEntryLite) -> InodeMeta {
         ctime: Timespec {
             sec: mtime_sec,
             nsec: 0,
-        }, // FAT has no ctime; reuse mtime
-        nlinks: 1, // FAT has no link count
-        blocks: (entry.size as u64 + 511) / 512,
+        },
+        nlinks: 1,
+        blocks: (dirent.size as u64).div_ceil(512),
         flags: 0,
     }
 }
@@ -337,16 +305,6 @@ pub(crate) fn cursor_from_cluster_index(cluster: u32, index: usize) -> DirCursor
     raw[0..4].copy_from_slice(&cluster.to_le_bytes());
     raw[4..12].copy_from_slice(&(index as u64).to_le_bytes());
     DirCursor(raw)
-}
-
-pub(crate) fn cluster_index_from_cursor(cursor: DirCursor) -> (u32, usize) {
-    let cluster = u32::from_le_bytes([cursor.0[0], cursor.0[1], cursor.0[2], cursor.0[3]]);
-    let index_bytes: [u8; 8] = [
-        cursor.0[4], cursor.0[5], cursor.0[6], cursor.0[7],
-        cursor.0[8], cursor.0[9], cursor.0[10], cursor.0[11],
-    ];
-    let index = u64::from_le_bytes(index_bytes) as usize;
-    (cluster, index)
 }
 
 // ====================================================================

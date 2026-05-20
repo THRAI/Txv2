@@ -41,7 +41,7 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<Frame, NoProgress> {
         const PAGE_SIZE: u64 = 4096;
-        if offset % PAGE_SIZE != 0 {
+        if !offset.is_multiple_of(PAGE_SIZE) {
             return StepOutcome::err(Errno::EINVAL.into());
         }
 
@@ -58,8 +58,8 @@ where
             // Compute the cluster range for this page.
             let page_start = offset;
             let page_end = offset + PAGE_SIZE;
-            let start_cluster_idx = (page_start / cluster_size) as usize;
-            let end_cluster_idx = ((page_end + cluster_size - 1) / cluster_size) as usize;
+            let _start_cluster_idx = (page_start / cluster_size) as usize;
+            let end_cluster_idx = page_end.div_ceil(cluster_size) as usize;
 
             // Allocate a page-sized buffer (zeroed for partial reads / holes).
             let mut page_buf = [0u8; PAGE_SIZE as usize];
@@ -126,11 +126,7 @@ where
                         Err(_) => return StepOutcome::err(Errno::EIO.into()),
                     };
                     unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            page_buf.as_ptr(),
-                            dst,
-                            PAGE_SIZE as usize,
-                        );
+                        core::ptr::copy_nonoverlapping(page_buf.as_ptr(), dst, PAGE_SIZE as usize);
                     }
                 }
 
@@ -149,7 +145,7 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         const PAGE_SIZE: u64 = 4096;
-        if offset % PAGE_SIZE != 0 {
+        if !offset.is_multiple_of(PAGE_SIZE) {
             return StepOutcome::err(Errno::EINVAL.into());
         }
 
@@ -180,8 +176,7 @@ where
 
             let page_start = offset;
             let page_end = offset + PAGE_SIZE;
-            let end_cluster_idx =
-                ((page_end + cluster_size - 1) / cluster_size) as usize;
+            let end_cluster_idx = page_end.div_ceil(cluster_size) as usize;
 
             let mut current_cluster = cluster;
             let mut idx: usize = 0;
@@ -198,8 +193,7 @@ where
                 // appropriate portion.
                 if cluster_start < page_end && cluster_end > page_start {
                     let src_start = cluster_start.saturating_sub(page_start) as usize;
-                    let src_end =
-                        (page_end.min(cluster_end)).saturating_sub(page_start) as usize;
+                    let src_end = (page_end.min(cluster_end)).saturating_sub(page_start) as usize;
                     let copy_len = src_end - src_start;
 
                     // Read the existing cluster, overlay our changes,
@@ -212,8 +206,7 @@ where
                     p.read_cluster(current_cluster, &mut cluster_buf)?;
 
                     // Dest offset within the cluster.
-                    let dest_start =
-                        page_start.saturating_sub(cluster_start) as usize;
+                    let dest_start = page_start.saturating_sub(cluster_start) as usize;
                     cluster_buf[dest_start..dest_start + copy_len]
                         .copy_from_slice(&page_data[src_start..src_start + copy_len]);
 
@@ -248,7 +241,7 @@ where
         new_size: u64,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        use crate::read_backend::{is_fat_root, unix_to_fat_date, unix_to_fat_time, FAT_ROOT_CLUSTER_SENTINEL};
+        use crate::read_backend::{is_fat_root, FAT_ROOT_CLUSTER_SENTINEL};
 
         // Root directory — nothing to truncate.
         if is_fat_root(fs_object_id) {

@@ -1744,7 +1744,6 @@ pub(crate) fn emit_process_group<P: tx_hal::TxPlatform>(pid_low: u32, pgid_low: 
 mod helpers;
 use helpers::{bootstrap_block_on, exec_error_tag, parse_init_from_cmdline};
 mod init_fixture;
-mod pthread_fixture;
 /// Shell-prompt roadmap Slice 10 (2026-05-08): when the build script
 /// at `crates/tx-kernel/build.rs` sees `TX_BUSYBOX` pointing at a
 /// real static-musl-built busybox binary, it copies the bytes to

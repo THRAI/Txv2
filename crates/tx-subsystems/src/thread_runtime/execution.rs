@@ -108,16 +108,16 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
 
     // Snapshot clear_child_tid and robust-list BEFORE
     // set_thread_zombie drops the thread payload.
-    let ctid = thread.payload.lock().as_ref().and_then(|p| *p.clear_child_tid.lock());
-    let robust = thread
+    let ctid = thread
         .payload
         .lock()
         .as_ref()
-        .and_then(|p| {
-            let head = *p.robust_list_head.lock();
-            let len = *p.robust_list_len.lock();
-            head.map(|h| (h, len))
-        });
+        .and_then(|p| *p.clear_child_tid.lock());
+    let robust = thread.payload.lock().as_ref().and_then(|p| {
+        let head = *p.robust_list_head.lock();
+        let len = *p.robust_list_len.lock();
+        head.map(|h| (h, len))
+    });
 
     // observe
     // upgrade
@@ -165,11 +165,8 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
         if let Some(proc) = thread.owner_proc.upgrade(&guard) {
             if let Some(payload) = proc.payload.lock().as_ref() {
                 let aspace = payload.aspace_cap();
-                let _ = aspace.copy_to_user(
-                    UserPtr::<u8>::new(ctid_ptr as usize),
-                    &[0u8; 4],
-                    &guard,
-                );
+                let _ =
+                    aspace.copy_to_user(UserPtr::<u8>::new(ctid_ptr as usize), &[0u8; 4], &guard);
             }
         }
         // Wake waiters on the clear_child_tid futex. Best-effort:

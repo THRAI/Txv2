@@ -40,6 +40,6 @@ pub use structure::{
     VmBacking, VmEntry, VmEntryError, VmEntryFlags, VmEntryRewrite, VmFault, VmFaultError,
     VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultOutcome, VmMapCommit, VmMapError,
     VmMapOutcome, VmMapRequest, VmMapTarget, VmPageOff, VmRemapOutcome, VmRemapRequest, WouldBlock,
-    RANGE_LOCK_RELEASE_MASK, USER_PAGE_SIZE,
+    FULL_USER_V1_TOP, RANGE_LOCK_RELEASE_MASK, USER_PAGE_SIZE,
 };
 pub use user_access::UserAccessKind;

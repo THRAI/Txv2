@@ -35,6 +35,22 @@ fn dispatch_futex_wait_with_mismatched_val_returns_neg_eagain() {
     let word: u32 = 0x1234;
     let uaddr = &word as *const u32 as u64;
 
+    use tx_subsystems::vm::{
+        MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmMapRequest,
+        USER_PAGE_SIZE,
+    };
+    let page_start = (uaddr as usize) & !(USER_PAGE_SIZE - 1);
+    let range =
+        UserRange::new_aligned(UserVirtAddr(page_start), USER_PAGE_SIZE).expect("aligned range");
+    let map_req = VmMapRequest::fixed(
+        range,
+        MapPlacement::FixedReplace,
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    ctx.aspace.try_mmap(map_req).expect("mmap anon for test");
+
     let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAIT as u64, 0x5678, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_AGAIN));
