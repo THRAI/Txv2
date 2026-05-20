@@ -14,7 +14,7 @@ use tx_subsystems::net::{
     step_accept, step_bind, step_connect, step_listen, step_poll_ready, step_poll_wait_token,
     step_recv_kernel_bytes, step_send_to_kernel_bytes, step_shutdown, step_socket_close,
     step_socket_open_file_in_namespace, step_tcp_loopback_transfer, IpEndpoint, Ipv4Address,
-    KernelSockAddr, LingerOption, PollMask, SendRecvFlags, SockAddrIn, SockShutdownCmd,
+    KernelSockAddr, LingerOption, PollMask, SendRecvFlags, SockAddrIn, SockAddrLl, SockShutdownCmd,
     SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol, TcpState, UdpInner,
 };
 use tx_subsystems::signal::step_kill_process;
@@ -22,6 +22,7 @@ use tx_subsystems::wait_source;
 
 const SOCKADDR_IN_BYTES: u32 = 16;
 const SOCKADDR_NL_BYTES: u32 = 12;
+const SOCKADDR_LL_BYTES: u32 = 20;
 const ACCEPT4_KNOWN_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
 const EPHEMERAL_PORT_START: u16 = 49_152;
 const EPHEMERAL_PORT_END: u16 = 49_216;
@@ -96,6 +97,19 @@ pub(super) fn sys_bind<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
         SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
     ) {
         return match read_sockaddr_nl(ctx, args[1], args[2]) {
+            Ok(()) => SyscallResult::Return(0),
+            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        };
+    }
+    if socket.kind == SocketKind::Packet {
+        let sockaddr = match read_sockaddr_ll(ctx, args[1], args[2]) {
+            Ok(sockaddr) => sockaddr,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        };
+        let Some(payload) = socket.acquire_operational() else {
+            return SyscallResult::Error(errno_to_i32(Errno::ENOTCONN));
+        };
+        return match payload.bind_packet_socket(sockaddr) {
             Ok(()) => SyscallResult::Return(0),
             Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
         };
@@ -342,6 +356,18 @@ pub(super) fn sys_getsockname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
     ) {
         return match write_sockaddr_nl(ctx, args[1], args[2]) {
+            Ok(()) => SyscallResult::Return(0),
+            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        };
+    }
+    if socket.kind == SocketKind::Packet {
+        let Some(payload) = socket.acquire_operational() else {
+            return SyscallResult::Error(errno_to_i32(Errno::ENOTCONN));
+        };
+        let Some(sockaddr) = payload.packet_sockaddr() else {
+            return SyscallResult::Error(EINVAL_VALUE);
+        };
+        return match write_sockaddr_ll(ctx, args[1], args[2], sockaddr) {
             Ok(()) => SyscallResult::Return(0),
             Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
         };
@@ -1270,6 +1296,29 @@ fn read_sockaddr_nl<'a>(
     Ok(())
 }
 
+fn read_sockaddr_ll<'a>(
+    ctx: &SyscallCtx<'a>,
+    sockaddr_ptr: u64,
+    sockaddr_len: u64,
+) -> Result<SockAddrLl, Errno> {
+    if sockaddr_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if sockaddr_len < SOCKADDR_LL_BYTES as u64 {
+        return Err(Errno::EINVAL);
+    }
+
+    let mut bytes = [0u8; SOCKADDR_LL_BYTES as usize];
+    bootstrap_copy_from_user(&ctx.aspace, &mut bytes, sockaddr_ptr)?;
+    let family = u16::from_le_bytes([bytes[0], bytes[1]]);
+    if family != AF_PACKET {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    let protocol = u16::from_be_bytes([bytes[2], bytes[3]]);
+    let ifindex = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    Ok(SockAddrLl::new(protocol, ifindex))
+}
+
 fn read_msghdr<'a>(ctx: &SyscallCtx<'a>, msghdr_ptr: u64) -> Result<UserMsghdr, Errno> {
     if msghdr_ptr == 0 {
         return Err(Errno::EFAULT);
@@ -1438,6 +1487,32 @@ fn write_sockaddr_nl<'a>(
     bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes)
 }
 
+fn write_sockaddr_ll<'a>(
+    ctx: &SyscallCtx<'a>,
+    sockaddr_ptr: u64,
+    sockaddr_len_ptr: u64,
+    sockaddr: SockAddrLl,
+) -> Result<(), Errno> {
+    if sockaddr_ptr == 0 && sockaddr_len_ptr == 0 {
+        return Ok(());
+    }
+    if sockaddr_ptr == 0 || sockaddr_len_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    let len: u32 = bootstrap_read_user(&ctx.aspace, sockaddr_len_ptr)?;
+    bootstrap_write_user(&ctx.aspace, sockaddr_len_ptr, SOCKADDR_LL_BYTES)?;
+    if len < SOCKADDR_LL_BYTES {
+        return Err(Errno::EINVAL);
+    }
+
+    let mut bytes = [0u8; SOCKADDR_LL_BYTES as usize];
+    bytes[0..2].copy_from_slice(&AF_PACKET.to_le_bytes());
+    bytes[2..4].copy_from_slice(&sockaddr.protocol.to_be_bytes());
+    bytes[4..8].copy_from_slice(&sockaddr.ifindex.to_le_bytes());
+    bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes)
+}
+
 fn write_sockaddr_endpoint<'a>(
     ctx: &SyscallCtx<'a>,
     sockaddr_ptr: u64,
@@ -1482,7 +1557,8 @@ fn socket_local_endpoint(socket: &Cap<SocketIdentity>) -> Result<IpEndpoint, Err
         }
         SocketProtocol::UnixDatagram
         | SocketProtocol::NetlinkRoute(_)
-        | SocketProtocol::NetlinkNetfilter(_) => Ok(IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0)),
+        | SocketProtocol::NetlinkNetfilter(_)
+        | SocketProtocol::Packet(_) => Ok(IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0)),
         SocketProtocol::Tcp(TcpState::Closed) | SocketProtocol::Udp(UdpInner::Closed) => {
             Err(Errno::ENOTCONN)
         }
@@ -1670,7 +1746,7 @@ fn socket_type_i32(socket: &Cap<SocketIdentity>) -> i32 {
         SocketKind::Tcp => 1,
         SocketKind::Udp => 2,
         SocketKind::RawIcmp => 3,
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter => 3,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter | SocketKind::Packet => 3,
     }
 }
 

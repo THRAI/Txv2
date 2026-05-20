@@ -330,6 +330,7 @@ pub const NR_ACCEPT4: u64 = 242;
 pub const AF_UNIX: u16 = 1;
 pub const AF_INET: u16 = 2;
 pub const AF_NETLINK: u16 = 16;
+pub const AF_PACKET: u16 = 17;
 pub const NETLINK_ROUTE: i32 = 0;
 pub const NETLINK_NETFILTER: i32 = 12;
 pub const SOL_NETLINK: i32 = 270;

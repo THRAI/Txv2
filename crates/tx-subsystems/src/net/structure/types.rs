@@ -8,6 +8,7 @@ pub enum AddressFamily {
     Unix,
     Inet,
     Netlink,
+    Packet,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +69,7 @@ impl ValidSocketType {
             1 => AddressFamily::Unix,
             2 => AddressFamily::Inet,
             16 => AddressFamily::Netlink,
+            17 => AddressFamily::Packet,
             _ => return Err(Errno::EAFNOSUPPORT),
         };
 
@@ -96,6 +98,7 @@ pub enum SocketKind {
     RawIcmp,
     NetlinkRoute,
     NetlinkNetfilter,
+    Packet,
 }
 
 impl SocketKind {
@@ -112,6 +115,7 @@ impl SocketKind {
             (AddressFamily::Netlink, SocketType::Raw | SocketType::Dgram, 12) => {
                 Ok(Self::NetlinkNetfilter)
             }
+            (AddressFamily::Packet, SocketType::Raw | SocketType::Dgram, _) => Ok(Self::Packet),
             _ => Err(Errno::EOPNOTSUPP),
         }
     }
@@ -160,12 +164,14 @@ impl IpEndpoint {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelSockAddr {
     V4(SockAddrIn),
+    Packet(SockAddrLl),
 }
 
 impl KernelSockAddr {
     pub const fn as_ip_endpoint(self) -> IpEndpoint {
         match self {
             Self::V4(sockaddr) => IpEndpoint::new(sockaddr.addr, sockaddr.port),
+            Self::Packet(_) => IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0),
         }
     }
 }
@@ -185,6 +191,25 @@ impl SockAddrIn {
             family: Self::AF_INET,
             port,
             addr,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SockAddrLl {
+    pub family: u16,
+    pub protocol: u16,
+    pub ifindex: i32,
+}
+
+impl SockAddrLl {
+    pub const AF_PACKET: u16 = 17;
+
+    pub const fn new(protocol: u16, ifindex: i32) -> Self {
+        Self {
+            family: Self::AF_PACKET,
+            protocol,
+            ifindex,
         }
     }
 }
@@ -403,7 +428,8 @@ impl SocketOptionSet {
             | SocketKind::Udp
             | SocketKind::RawIcmp
             | SocketKind::NetlinkRoute
-            | SocketKind::NetlinkNetfilter => Self::default_udp(),
+            | SocketKind::NetlinkNetfilter
+            | SocketKind::Packet => Self::default_udp(),
         }
     }
 }
@@ -504,5 +530,34 @@ impl RawIcmpState {
             bound_local: None,
             protocol,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PacketSocketState {
+    pub protocol: u16,
+    pub ifindex: Option<i32>,
+}
+
+impl PacketSocketState {
+    pub const fn new(protocol: u16) -> Self {
+        Self {
+            protocol,
+            ifindex: None,
+        }
+    }
+
+    pub const fn new_from_network_order(protocol: u16) -> Self {
+        Self::new(u16::from_be(protocol))
+    }
+
+    pub const fn sockaddr(self) -> SockAddrLl {
+        SockAddrLl::new(
+            self.protocol,
+            match self.ifindex {
+                Some(ifindex) => ifindex,
+                None => 0,
+            },
+        )
     }
 }

@@ -49,6 +49,14 @@ pub fn step_socket_create_in_namespace(
     {
         return StepOutcome::Err(Errno::ENOMEM);
     }
+    if kind == SocketKind::Packet {
+        let protocol =
+            crate::net::structure::PacketSocketState::new_from_network_order(valid.protocol)
+                .protocol;
+        if payload.set_packet_protocol(protocol).is_err() {
+            return StepOutcome::Err(Errno::EINVAL);
+        }
+    }
 
     StepOutcome::Done(identity)
 }

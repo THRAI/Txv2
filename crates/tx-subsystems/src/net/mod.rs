@@ -125,11 +125,12 @@ pub use rtnetlink::{
 pub use structure::{
     AcceptWireSet, AddressFamily, ConnectionKey, InitialSocketTableProxy, IpEndpoint,
     IpLevelOptions, Ipv4Address, KernelSockAddr, LingerOption, ListenerKey, LocalEndpointKey,
-    PollMask, ProtocolNumber, RawIcmpSocketKey, RawIcmpState, RecvWireSet, SendRecvFlags,
-    SendWireSet, SockAddrIn, SockFlags, SockShutdownCmd, SocketIdentity, SocketIoState, SocketKind,
-    SocketLevelOptions, SocketOperationalEvidence, SocketOptionSet, SocketPayload, SocketProtocol,
-    SocketReadiness, SocketRecvBytesOutcome, SocketTable, SocketType, SocketWaitCarriers, Takeable,
-    TcpLevelOptions, TcpState, UdpInner, UrgentEvent, ValidSocketType,
+    PacketSocketState, PollMask, ProtocolNumber, RawIcmpSocketKey, RawIcmpState, RecvWireSet,
+    SendRecvFlags, SendWireSet, SockAddrIn, SockAddrLl, SockFlags, SockShutdownCmd, SocketIdentity,
+    SocketIoState, SocketKind, SocketLevelOptions, SocketOperationalEvidence, SocketOptionSet,
+    SocketPayload, SocketProtocol, SocketReadiness, SocketRecvBytesOutcome, SocketTable,
+    SocketType, SocketWaitCarriers, Takeable, TcpLevelOptions, TcpState, UdpInner, UrgentEvent,
+    ValidSocketType,
 };
 
 pub(crate) fn register_zones() -> Result<(), tx_substrate::zone::ZoneError> {
