@@ -606,6 +606,9 @@ pub fn step_clone_thread(
 /// Open Q #3 DECIDED 2026-05-06.)
 pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     // observe
+    if let Some(payload) = process.payload.lock().as_ref() {
+        payload.notify_vfork_done();
+    }
     // upgrade
     // reserve
     // commit

@@ -1160,15 +1160,22 @@ pub(crate) fn la64_read_stable_counter() -> u64 {
 pub(crate) fn la64_current_cpu_id() -> CpuId {
     #[cfg(target_arch = "loongarch64")]
     {
-        let cpu: usize;
+        let kernel_tls = la64_read_kernel_tls();
+        let csr_cpu: usize;
         unsafe {
             core::arch::asm!(
                 "csrrd {cpu}, 0x20",
-                cpu = out(reg) cpu,
+                cpu = out(reg) csr_cpu,
                 options(nomem, nostack)
             );
         }
-        return CpuId(cpu.min(LA64_MAX_BOOT_CPUS - 1));
+        let csr_cpu = csr_cpu.min(LA64_MAX_BOOT_CPUS - 1);
+        if LA64_KERNEL_TLS_VALID[csr_cpu].load(Ordering::Acquire)
+            && kernel_tls < LA64_MAX_BOOT_CPUS
+        {
+            return CpuId(kernel_tls);
+        }
+        return CpuId(csr_cpu);
     }
 
     #[cfg(not(target_arch = "loongarch64"))]
@@ -1205,6 +1212,13 @@ pub(crate) fn la64_write_kernel_tls(value: usize) {
     #[cfg(target_arch = "loongarch64")]
     unsafe {
         core::arch::asm!("move $r21, {value}", value = in(reg) value, options(nomem, nostack));
+        let csr_cpu: usize;
+        core::arch::asm!(
+            "csrrd {cpu}, 0x20",
+            cpu = out(reg) csr_cpu,
+            options(nomem, nostack)
+        );
+        LA64_KERNEL_TLS_VALID[csr_cpu.min(LA64_MAX_BOOT_CPUS - 1)].store(true, Ordering::Release);
     }
 
     #[cfg(not(target_arch = "loongarch64"))]
