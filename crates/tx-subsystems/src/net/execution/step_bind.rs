@@ -5,7 +5,8 @@ use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_bind_target;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
-    KernelSockAddr, SocketIdentity, SocketKind, SocketProtocol, TcpState, UdpInner,
+    IpEndpoint, Ipv4Address, KernelSockAddr, SocketIdentity, SocketKind, SocketProtocol, TcpState,
+    UdpInner,
 };
 
 pub fn step_bind(
@@ -67,6 +68,15 @@ fn bind_udp_maybe_reuseaddr(
     local: crate::net::structure::IpEndpoint,
     guard: &Guard<'_>,
 ) -> Result<(), IndexError> {
+    if let Some(existing) = udp_bind_conflict(table, socket, local, guard) {
+        if !(socket_reuse_addr(socket) && socket_reuse_addr(&existing)) {
+            return Err(IndexError::Duplicate);
+        }
+        if udp_socket_local(&existing) != Some(local) {
+            return Err(IndexError::Duplicate);
+        }
+    }
+
     match table.bind_udp(local, socket.clone()) {
         Ok(()) => Ok(()),
         Err(IndexError::Duplicate) if socket_reuse_addr(socket) => {
@@ -83,6 +93,46 @@ fn bind_udp_maybe_reuseaddr(
         }
         Err(error) => Err(error),
     }
+}
+
+fn udp_bind_conflict(
+    table: &SocketTable,
+    socket: &Cap<SocketIdentity>,
+    local: IpEndpoint,
+    guard: &Guard<'_>,
+) -> Option<Cap<SocketIdentity>> {
+    if let Some(existing) = table.lookup_udp_bound_exact(local, guard) {
+        if existing.raw() != socket.raw() {
+            return Some(existing);
+        }
+    }
+
+    if local.addr == Ipv4Address::UNSPECIFIED {
+        for existing in table.snapshot_udp_bound(guard) {
+            if existing.raw() == socket.raw() {
+                continue;
+            }
+            if udp_socket_local(&existing).is_some_and(|endpoint| endpoint.port == local.port) {
+                return Some(existing);
+            }
+        }
+        return None;
+    }
+
+    let wildcard = IpEndpoint::new(Ipv4Address::UNSPECIFIED, local.port);
+    table
+        .lookup_udp_bound_exact(wildcard, guard)
+        .filter(|existing| existing.raw() != socket.raw())
+}
+
+fn udp_socket_local(socket: &Cap<SocketIdentity>) -> Option<IpEndpoint> {
+    socket
+        .acquire_operational()
+        .and_then(|payload| match payload.protocol_snapshot() {
+            SocketProtocol::Udp(UdpInner::Bound { local })
+            | SocketProtocol::Udp(UdpInner::Connected { local, .. }) => Some(local),
+            _ => None,
+        })
 }
 
 fn socket_reuse_addr(socket: &Cap<SocketIdentity>) -> bool {

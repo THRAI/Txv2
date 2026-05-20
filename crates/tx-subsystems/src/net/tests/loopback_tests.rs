@@ -159,6 +159,67 @@ fn udp_loopback_connected_send_reaches_bound_receiver() {
 }
 
 #[test]
+fn udp_loopback_sendto_reaches_wildcard_bound_receiver() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let iface = LoopbackIface::new(IfaceCommon::new(
+        Ipv4Address::LOOPBACK,
+        Ipv4Address::new([255, 0, 0, 0]),
+        1500,
+    ));
+    let server = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("server udp");
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("client udp");
+
+    assert_eq!(
+        step_bind(&server, any_inet(40_196), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_bind(&client, inet(50_196), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &client,
+            Some(endpoint(40_196)),
+            b"x",
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(1)
+    );
+
+    let transfer = match step_process_loopback_udp_on_iface(&client, 8, &iface, &guard) {
+        StepOutcome::Done(outcome) => outcome,
+        _ => panic!("unexpected udp loopback outcome"),
+    };
+
+    assert_eq!(transfer.tx_packets, 1);
+    assert_eq!(transfer.packets_seen, 1);
+    assert_eq!(transfer.bytes_moved, 1);
+    assert!(transfer.peer_wake_fired);
+    assert_eq!(
+        server
+            .acquire_operational()
+            .expect("server payload")
+            .io_snapshot()
+            .recv_len,
+        1
+    );
+}
+
+#[test]
 fn tcp_loopback_pollcontext_moves_data_through_packet_queue() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK

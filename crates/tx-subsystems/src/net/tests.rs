@@ -935,6 +935,35 @@ fn execution_bind_rejects_duplicate_local_endpoint() {
 }
 
 #[test]
+fn execution_udp_bind_rejects_wildcard_exact_port_overlap() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let wildcard = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("wildcard udp");
+    let exact = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("exact udp");
+    let port = 40_197;
+
+    assert_eq!(
+        step_bind(&wildcard, any_inet(port), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_bind(&exact, inet(port), &guard),
+        StepOutcome::Err(Errno::EADDRINUSE)
+    );
+}
+
+#[test]
 fn execution_listen_promotes_tcp_bound_socket() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK

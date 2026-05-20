@@ -38,7 +38,7 @@ pub use execution::{
     step_flush_pending_arp, step_listen, step_poll_ready, step_poll_wait_token,
     step_process_device_tx_pending, step_process_device_tx_pending_at,
     step_process_device_tx_pending_in_namespace_at, step_process_loopback_pending_in_namespace,
-    step_process_network_events, step_process_network_events_at,
+    step_process_loopback_udp, step_process_network_events, step_process_network_events_at,
     step_process_network_events_in_namespace_at, step_process_network_tick,
     step_process_network_tick_in_namespace, step_process_network_tick_loopback,
     step_process_network_tick_loopback_in_namespace, step_recv_kernel_bytes,
