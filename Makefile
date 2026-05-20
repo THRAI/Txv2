@@ -38,6 +38,9 @@ docker-help:
 	@echo "  make smp-smoke-la64"
 	@echo "  make oscomp-local-rv64-smp4"
 	@echo "  make oscomp-local-la64-smp4"
+	@echo "  make oscomp-local-rv64-libctest-musl-smp4"
+	@echo "  make oscomp-local-la64-libctest-musl-smp4"
+	@echo "  make oscomp-export-testcase"
 	@echo "  make docker-busybox-la64"
 	@echo "  make docker-oscomp-prepare docker-oscomp-submit docker-oscomp-run"
 
@@ -142,6 +145,9 @@ OSCOMP_OUT_RV ?= target/oscomp/os_serial_out_rv.txt
 OSCOMP_OUT_RV_SMP4 ?= target/oscomp/os_serial_out_rv_smp4.txt
 OSCOMP_OUT_LA ?= target/oscomp/os_serial_out_la.txt
 OSCOMP_OUT_LA_SMP4 ?= target/oscomp/os_serial_out_la_smp4.txt
+OSCOMP_GROUPS ?=
+OSCOMP_APPEND = $(if $(strip $(OSCOMP_GROUPS)),-append 'tx.oscomp.groups=$(OSCOMP_GROUPS)',)
+OSCOMP_TESTCASE_OUT ?= target/oscomp/testcase
 OSCOMP_SERIAL_NORMALIZE = stdbuf -o0 tr -d '\000\r'
 OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'
 
@@ -150,7 +156,10 @@ OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'
 	oscomp-judge-rv64 oscomp-judge-rv64-smp4 \
 	oscomp-judge-la64 oscomp-judge-la64-smp4 \
 	oscomp-local-rv64 oscomp-local-rv64-smp4 \
-	oscomp-local-la64 oscomp-local-la64-smp4
+	oscomp-local-la64 oscomp-local-la64-smp4 \
+	oscomp-local-rv64-libctest-musl oscomp-local-rv64-libctest-musl-smp4 \
+	oscomp-local-la64-libctest-musl oscomp-local-la64-libctest-musl-smp4 \
+	oscomp-export-testcase
 
 oscomp-submit:
 	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --submit $(OSCOMP_SUBMIT)
@@ -171,6 +180,7 @@ oscomp-qemu-rv64:
 		-no-reboot \
 		-device virtio-net-device,netdev=net -netdev user,id=net \
 		-rtc base=utc \
+		$(OSCOMP_APPEND) \
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_RV) | $(OSCOMP_CONSOLE_FILTER)
 
 oscomp-qemu-rv64-smp4:
@@ -184,6 +194,7 @@ oscomp-qemu-rv64-smp4:
 		-no-reboot \
 		-device virtio-net-device,netdev=net -netdev user,id=net \
 		-rtc base=utc \
+		$(OSCOMP_APPEND) \
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_RV_SMP4) | $(OSCOMP_CONSOLE_FILTER)
 
 oscomp-qemu-la64:
@@ -196,6 +207,7 @@ oscomp-qemu-la64:
 		-no-reboot \
 		-device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
 		-rtc base=utc \
+		$(OSCOMP_APPEND) \
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_LA) | $(OSCOMP_CONSOLE_FILTER)
 
 oscomp-qemu-la64-smp4:
@@ -209,6 +221,7 @@ oscomp-qemu-la64-smp4:
 		-no-reboot \
 		-device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
 		-rtc base=utc \
+		$(OSCOMP_APPEND) \
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_LA_SMP4) | $(OSCOMP_CONSOLE_FILTER)
 
 oscomp-judge-rv64:
@@ -240,3 +253,18 @@ oscomp-local-rv64-smp4: docker-build-rv64 docker-oscomp-prepare oscomp-submit-rv
 oscomp-local-la64: docker-build-la64 docker-oscomp-prepare oscomp-submit-la64 oscomp-qemu-la64 oscomp-judge-la64
 
 oscomp-local-la64-smp4: docker-build-la64 docker-oscomp-prepare oscomp-submit-la64 oscomp-qemu-la64-smp4 oscomp-judge-la64-smp4
+
+oscomp-local-rv64-libctest-musl:
+	$(MAKE) oscomp-local-rv64 OSCOMP_GROUPS=libctest-musl
+
+oscomp-local-rv64-libctest-musl-smp4:
+	$(MAKE) oscomp-local-rv64-smp4 OSCOMP_GROUPS=libctest-musl
+
+oscomp-local-la64-libctest-musl:
+	$(MAKE) oscomp-local-la64 OSCOMP_GROUPS=libctest-musl
+
+oscomp-local-la64-libctest-musl-smp4:
+	$(MAKE) oscomp-local-la64-smp4 OSCOMP_GROUPS=libctest-musl
+
+oscomp-export-testcase:
+	tools/oscomp-extract-testcase.sh $(OSCOMP_DATA) $(OSCOMP_TESTCASE_OUT)

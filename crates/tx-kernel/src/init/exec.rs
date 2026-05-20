@@ -364,8 +364,7 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>("\n");
         }
 
-        let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
-        let sdcard_boot = boot_info.initrd.is_none() && boot_info.cmdline.is_none();
+        let sdcard_boot = oscomp_sdcard_boot_enabled::<P>();
 
         if super::MUSL_MOUNT.lock().is_some() && sdcard_boot {
             // Per-arch busybox path and test-script chain.
@@ -376,43 +375,10 @@ impl<P: TxPlatform> CoreInit<P> {
             //
             // All testcode.sh scripts expect CWD = their own directory
             // and use `./busybox` for echo/cat etc., so we `cd` first.
-            let (sdcard_bin, sdcard_cmd): (&[u8], &[u8]) = match P::ARCH {
-                tx_hal::Arch::LoongArch64 => (
-                    // la64 sdcard has both glibc/ (dynamic) and musl/
-                    // (static). Use the musl static busybox; the kernel
-                    // does not yet support PT_INTERP (dynamic linker).
-                    b"/musl/musl/busybox",
-                    b"cd /musl/musl \
-                      && ./busybox sh basic_testcode.sh \
-                      && ./busybox sh busybox_testcode.sh \
-                      && ./busybox sh libctest_testcode.sh \
-                      && ./busybox sh libcbench_testcode.sh \
-                      && ./busybox sh lua_testcode.sh \
-                      && ./busybox sh lmbench_testcode.sh \
-                      && ./busybox sh iozone_testcode.sh \
-                      && ./busybox sh netperf_testcode.sh \
-                      && ./busybox sh iperf_testcode.sh \
-                      && ./busybox sh cyclictest_testcode.sh \
-                      && ./busybox sh ltp_testcode.sh",
-                ),
-                tx_hal::Arch::Riscv64 => (
-                    b"/musl/musl/busybox",
-                    b"cd /musl/musl \
-                      && ./busybox sh basic_testcode.sh \
-                      && ./busybox sh busybox_testcode.sh \
-                      && ./busybox sh libctest_testcode.sh \
-                      && ./busybox sh libcbench_testcode.sh \
-                      && ./busybox sh lua_testcode.sh \
-                      && ./busybox sh lmbench_testcode.sh \
-                      && ./busybox sh iozone_testcode.sh \
-                      && ./busybox sh netperf_testcode.sh \
-                      && ./busybox sh iperf_testcode.sh \
-                      && ./busybox sh cyclictest_testcode.sh \
-                      && ./busybox sh ltp_testcode.sh",
-                ),
-            };
+            let sdcard_bin = b"/musl/musl/busybox";
+            let sdcard_cmd = build_oscomp_sdcard_cmd::<P>();
             let sdcard_envp: &[&[u8]] = &[b"PATH=/musl/glibc:/musl/musl"];
-            let sdcard_argv: &[&[u8]] = &[b"sh", b"-c", sdcard_cmd];
+            let sdcard_argv: &[&[u8]] = &[b"sh", b"-c", sdcard_cmd.as_bytes()];
             let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
                 &init,
                 &thread,
@@ -835,5 +801,99 @@ impl<P: TxPlatform> CoreInit<P> {
     pub(super) fn write_board_sentinel_prefix() {
         tx_hal::console_write_str::<P>("txkernel:");
         tx_hal::console_write_str::<P>(P::BOARD);
+    }
+}
+
+fn oscomp_sdcard_boot_enabled<P: tx_hal::TxPlatform>() -> bool {
+    let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
+    if boot_info.initrd.is_some() {
+        return false;
+    }
+    let Some(cmdline) = boot_info.cmdline else {
+        return true;
+    };
+    !cmdline
+        .split_ascii_whitespace()
+        .any(|token| token.starts_with("init=") || token == "tx.profile=busybox")
+}
+
+fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
+    use alloc::string::String;
+    use core::fmt::Write as _;
+
+    let mut cmd = String::from("cd /musl/musl");
+    let mut selected = 0usize;
+    if let Some(groups) = oscomp_groups_from_cmdline::<P>() {
+        for group in groups.split(',') {
+            let group = group.trim();
+            if group.is_empty() {
+                continue;
+            }
+            if group == "all" {
+                append_default_oscomp_scripts(&mut cmd);
+                return cmd;
+            }
+            if let Some(script) = oscomp_musl_script_for_group(group) {
+                let _ = write!(cmd, " && ./busybox sh {script}");
+                selected += 1;
+            }
+        }
+    }
+    if selected == 0 {
+        append_default_oscomp_scripts(&mut cmd);
+    }
+    cmd
+}
+
+fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
+    let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline?;
+    for token in cmdline.split_ascii_whitespace() {
+        if let Some(groups) = token.strip_prefix("tx.oscomp.groups=") {
+            return Some(groups);
+        }
+    }
+    None
+}
+
+fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    for (_, script) in DEFAULT_OSCOMP_MUSL_SCRIPTS {
+        let _ = write!(cmd, " && ./busybox sh {script}");
+    }
+}
+
+const DEFAULT_OSCOMP_MUSL_SCRIPTS: &[(&str, &str)] = &[
+    ("basic-musl", "basic_testcode.sh"),
+    ("busybox-musl", "busybox_testcode.sh"),
+    ("libctest-musl", "libctest_testcode.sh"),
+    ("libcbench-musl", "libcbench_testcode.sh"),
+    ("lua-musl", "lua_testcode.sh"),
+    ("lmbench-musl", "lmbench_testcode.sh"),
+    ("iozone-musl", "iozone_testcode.sh"),
+    ("netperf-musl", "netperf_testcode.sh"),
+    ("iperf-musl", "iperf_testcode.sh"),
+    ("cyclictest-musl", "cyclictest_testcode.sh"),
+    ("ltp-musl", "ltp_testcode.sh"),
+];
+
+fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
+    let canonical = match group.strip_suffix("-musl") {
+        Some(prefix) => prefix,
+        None => group,
+    };
+    match canonical {
+        "basic" => Some("basic_testcode.sh"),
+        "busybox" => Some("busybox_testcode.sh"),
+        "libctest" => Some("libctest_testcode.sh"),
+        "libcbench" => Some("libcbench_testcode.sh"),
+        "lua" => Some("lua_testcode.sh"),
+        "lmbench" => Some("lmbench_testcode.sh"),
+        "iozone" => Some("iozone_testcode.sh"),
+        "netperf" => Some("netperf_testcode.sh"),
+        "iperf" => Some("iperf_testcode.sh"),
+        "cyclictest" => Some("cyclictest_testcode.sh"),
+        "ltp" => Some("ltp_testcode.sh"),
+        _ => None,
     }
 }

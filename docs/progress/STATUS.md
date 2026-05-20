@@ -1,3 +1,52 @@
+- 2026-05-20 **Added OSComp sdcard testcase export.**
+  Added `tools/oscomp-extract-testcase.sh` and the Makefile target
+  `make oscomp-export-testcase`. The target extracts Txv2's current official
+  OSComp images from `$(OSCOMP_DATA)/sdcard-rv.img` and `sdcard-la.img` into a
+  Chronix-like visible tree at `target/oscomp/testcase`, with
+  `riscv/{musl,glibc}` and `loongarch/{musl,glibc}` directories. The script
+  uses `7z` because `debugfs` rejects the official ext4 images with metadata
+  checksum errors; 7z reports those as header warnings but still extracts the
+  regular testcase tree. It excludes filesystem internals such as `[SYS]` and
+  `lost+found`, and marks shell scripts executable. The earlier mistaken
+  Chronix-to-image Makefile targets were removed.
+  **Verified:** `make oscomp-export-testcase`; checked
+  `target/oscomp/testcase/{riscv,loongarch}/{musl,glibc}`; checked
+  `libctest_testcode.sh`, `run-static.sh`, and `runtest.exe` for both RV64 and
+  LA64; listed all `*_testcode.sh` files under both architectures.
+  **Note:** the extracted tree is large, about 6.2G, because it includes the
+  full official musl/glibc payload including LTP.
+
+- 2026-05-20 **Added OSComp musl group-selection boot parameter.**
+  Added `OSCOMP_GROUPS` to the local OSComp Makefile QEMU paths. When set, the
+  RV64 and LA64 runners pass `-append 'tx.oscomp.groups=...'` into the kernel;
+  when unset, the command line remains effectively unchanged and the full musl
+  script chain still runs. The sdcard bootstrap path now treats cmdlines that do
+  not specify `init=` or `tx.profile=busybox` as OSComp sdcard boots, parses
+  `tx.oscomp.groups`, and maps musl group names such as `libctest-musl` (or the
+  short alias `libctest`) to the corresponding `*_testcode.sh`. `all` keeps the
+  full default chain. This allows targeted local runs such as
+  `make oscomp-local-rv64-smp4 OSCOMP_GROUPS=libctest-musl` and
+  `make oscomp-local-la64-smp4 OSCOMP_GROUPS=libctest-musl`.
+  **Verified:** `cargo fmt --check`; `cargo test -p tx-kernel --no-run`; `make
+  -n oscomp-qemu-rv64-smp4 OSCOMP_GROUPS=libctest-musl`; `make -n
+  oscomp-qemu-la64-smp4 OSCOMP_GROUPS=libctest-musl`; `make -n
+  oscomp-qemu-rv64-smp4`; `cargo xtask build --target rv64-qemu`; `cargo xtask
+  build --target la64-qemu`.
+  **Next step:** run the targeted RV64/LA64 commands and judge the resulting
+  `libctest-musl` group output.
+
+- 2026-05-20 **Added fixed libctest-musl OSComp Makefile aliases.**
+  Added shortcut targets for the common targeted libctest run so the full
+  command no longer has to be typed by hand:
+  `oscomp-local-rv64-libctest-musl`,
+  `oscomp-local-rv64-libctest-musl-smp4`,
+  `oscomp-local-la64-libctest-musl`, and
+  `oscomp-local-la64-libctest-musl-smp4`. Each alias delegates to the existing
+  full local OSComp pipeline with `OSCOMP_GROUPS=libctest-musl`, preserving the
+  build/prepare/submit/QEMU/judge sequence.
+  **Verified:** `make -n oscomp-local-la64-libctest-musl-smp4`; `make -n
+  oscomp-local-rv64-libctest-musl-smp4`; `git diff --check`.
+
 - 2026-05-20 **Fixed LA64 SMP IRQ-context false sharing.**
   Diagnosed the `make oscomp-local-la64-smp4` panic during basic-musl
   `test_yield` as LA64 HAL IRQ-depth state leaking across harts: CPU0 could be
