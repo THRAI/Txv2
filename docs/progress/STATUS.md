@@ -1,551 +1,342 @@
-<<<<<<< HEAD
-- 2026-05-20 **membarrier 后续 bug 修复。** 4 个在 membarrier 构建验证中
-  暴露的预存 bug 已修复：
+- 2026-05-20 **Fixed targeted LA64 OSComp group selection.**
+  `make oscomp-local-la64-libctest-musl-smp4` previously expanded to a QEMU
+  command with `-append 'tx.oscomp.groups=libctest-musl'`, but LA64 did not
+  reliably surface that QEMU append string through `BootInfo::cmdline`, so the
+  kernel fell back to the default full OSComp musl script chain and started at
+  `basic-musl`. Added a build-time fallback, `TX_OSCOMP_GROUPS`, wired through
+  the Docker build wrapper whenever `OSCOMP_GROUPS` is set. The runtime parser
+  still prefers the real boot cmdline when present, then falls back to the
+  build-time value. Added a boot log line `:oscomp:groups:<value>` so targeted
+  runs visibly show what the kernel selected.
+  **Verified:** `make -n oscomp-local-la64-libctest-musl-smp4`; `make -n
+  oscomp-local-rv64-libctest-musl-smp4`; `cargo fmt --check`; `git diff
+  --check`; `make docker-build-la64 OSCOMP_GROUPS=libctest-musl`; bounded
+  LA64 SMP4 QEMU run printed `txkernel:qemu-loongarch64-virt:oscomp:groups:libctest-musl`
+  and started with `#### OS COMP TEST GROUP START libctest-musl ####`.
+
+- 2026-05-20 **Added OSComp sdcard testcase export.**
+  Added `tools/oscomp-extract-testcase.sh` and the Makefile target
+  `make oscomp-export-testcase`. The target extracts Txv2's current official
+  OSComp images from `$(OSCOMP_DATA)/sdcard-rv.img` and `sdcard-la.img` into a
+  Chronix-like visible tree at `target/oscomp/testcase`, with
+  `riscv/{musl,glibc}` and `loongarch/{musl,glibc}` directories. The script
+  uses `7z` because `debugfs` rejects the official ext4 images with metadata
+  checksum errors; 7z reports those as header warnings but still extracts the
+  regular testcase tree. It excludes filesystem internals such as `[SYS]` and
+  `lost+found`, and marks shell scripts executable. The earlier mistaken
+  Chronix-to-image Makefile targets were removed.
+  **Verified:** `make oscomp-export-testcase`; checked
+  `target/oscomp/testcase/{riscv,loongarch}/{musl,glibc}`; checked
+  `libctest_testcode.sh`, `run-static.sh`, and `runtest.exe` for both RV64 and
+  LA64; listed all `*_testcode.sh` files under both architectures.
+  **Note:** the extracted tree is large, about 6.2G, because it includes the
+  full official musl/glibc payload including LTP.
+
+- 2026-05-20 **Added OSComp musl group-selection boot parameter.**
+  Added `OSCOMP_GROUPS` to the local OSComp Makefile QEMU paths. When set, the
+  RV64 and LA64 runners pass `-append 'tx.oscomp.groups=...'` into the kernel;
+  when unset, the command line remains effectively unchanged and the full musl
+  script chain still runs. The sdcard bootstrap path now treats cmdlines that do
+  not specify `init=` or `tx.profile=busybox` as OSComp sdcard boots, parses
+  `tx.oscomp.groups`, and maps musl group names such as `libctest-musl` (or the
+  short alias `libctest`) to the corresponding `*_testcode.sh`. `all` keeps the
+  full default chain. This allows targeted local runs such as
+  `make oscomp-local-rv64-smp4 OSCOMP_GROUPS=libctest-musl` and
+  `make oscomp-local-la64-smp4 OSCOMP_GROUPS=libctest-musl`.
+  **Verified:** `cargo fmt --check`; `cargo test -p tx-kernel --no-run`; `make
+  -n oscomp-qemu-rv64-smp4 OSCOMP_GROUPS=libctest-musl`; `make -n
+  oscomp-qemu-la64-smp4 OSCOMP_GROUPS=libctest-musl`; `make -n
+  oscomp-qemu-rv64-smp4`; `cargo xtask build --target rv64-qemu`; `cargo xtask
+  build --target la64-qemu`.
+  **Next step:** run the targeted RV64/LA64 commands and judge the resulting
+  `libctest-musl` group output.
+
+- 2026-05-20 **Added fixed libctest-musl OSComp Makefile aliases.**
+  Added shortcut targets for the common targeted libctest run so the full
+  command no longer has to be typed by hand:
+  `oscomp-local-rv64-libctest-musl`,
+  `oscomp-local-rv64-libctest-musl-smp4`,
+  `oscomp-local-la64-libctest-musl`, and
+  `oscomp-local-la64-libctest-musl-smp4`. Each alias delegates to the existing
+  full local OSComp pipeline with `OSCOMP_GROUPS=libctest-musl`, preserving the
+  build/prepare/submit/QEMU/judge sequence.
+  **Verified:** `make -n oscomp-local-la64-libctest-musl-smp4`; `make -n
+  oscomp-local-rv64-libctest-musl-smp4`; `git diff --check`.
+
+- 2026-05-20 **Fixed LA64 SMP IRQ-context false sharing.**
+  Diagnosed the `make oscomp-local-la64-smp4` panic during basic-musl
+  `test_yield` as LA64 HAL IRQ-depth state leaking across harts: CPU0 could be
+  in a timer interrupt while CPU1 entered a syscall, but
+  `IrqIf::in_irq_context()` read a single global `LA64_IRQ_CONTEXT_DEPTH` and
+  made CPU1 look like it was still inside IRQ context. That tripped the epoch
+  guard assertion in syscall script-context construction. Replaced the global
+  IRQ-depth counter with `LA64_IRQ_CONTEXT_DEPTHS[LA64_MAX_BOOT_CPUS]`, and made
+  the RAII guard store the exact per-CPU depth cell it incremented so drops are
+  correct even if host tests switch the simulated TLS CPU.
+  **Verified:** `cargo test -p tx-hal-loongarch64-qemu-virt
+  irq_context_depth_is_per_cpu`; `cargo test -p
+  tx-hal-loongarch64-qemu-virt dispatch_timer_trap_enters_irq_context_and_resumes`;
+  `cargo test -p tx-hal-loongarch64-qemu-virt`; `cargo fmt --check`; `cargo
+  xtask build --target la64-qemu`.
+  **Next step:** rerun `make oscomp-local-la64-smp4`; the previous epoch-guard
+  panic should be gone.
+
+- 2026-05-20 **Fixed SMP busybox pipeline pipe EOF accounting.**
+  Diagnosed the `make oscomp-local-rv64-smp4` busybox-musl stall at group
+  start as a pipe lifecycle bug: pipe reader/writer counts were tied to
+  `OpenFile::Drop`, so the last writer close could be delayed until EBR
+  reclaimed the shared open-file object. Busybox's
+  `cat ./busybox_cmd.txt | while read line` needs EOF as soon as the writer fd
+  closes or the writer process exits. Moved pipe endpoint accounting to the
+  process fd table: `close` / `exec` / process-exit drain decrement counts
+  immediately, while `dup` / `fcntl(F_DUPFD*)` / `fork` increment inherited pipe
+  fd refs. Removed the pipe-side `OpenFile` destructor hook and added process
+  tests covering immediate EOF on close, dup-held writers, fork-inherited
+  writers, and child-exit fd drain.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-subsystems pipe_`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-subsystems pipe_writer`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo
+  test -p tx-shims pipe2`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test
+  -p tx-shims fork_clone_wait4_wave3`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check
+  cargo test -p tx-kernel --no-run`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check
+  cargo xtask build --target rv64-qemu`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check
+  cargo xtask qemu --target rv64-qemu --profile smoke --expect-sentinel --smp
+  4`; `cargo fmt --check`; `git diff --check`.
+  **Next step:** rerun `make oscomp-local-rv64-smp4`; busybox should progress
+  past the `busybox-musl` group start instead of waiting forever for pipeline
+  EOF.
+
+- 2026-05-20 **Fixed SMP WaitSource lost-wake window hit by busybox pipelines.**
+  After the pipe fd-lifetime fix, `make oscomp-local-rv64-smp4` could still
+  stall immediately after `#### OS COMP TEST GROUP START busybox-musl ####`.
+  The stuck line is `./busybox cat ./busybox_cmd.txt | while read line`: the
+  reader can observe an empty pipe, return `Yield::OnWaitSource`, and only then
+  register its task mailbox. On SMP, the writer can publish `PIPE_READABLE` in
+  that gap, so the non-sticky `WaitSource` notification is lost and the reader
+  sleeps forever. Added a pending mask to `tx_substrate::wake::WaitSource`:
+  `notify` records fired bits, and a later `register` consumes matching pending
+  bits by posting a `SourceFired` event to the newly registered mailbox. This is
+  a conservative lost-wake bridge for current driver registrations; future
+  prepared-registration migration can tighten the predicate recheck path.
+  **Verified:** `CARGO_TARGET_DIR=target/codex-check cargo test -p
+  tx-substrate notify_before_register_is_delivered_as_pending_source_fire`;
+  `CARGO_TARGET_DIR=target/codex-check cargo test -p tx-scripts
+  wait_source_register_notify_delivers_to_mailbox`; `CARGO_TARGET_DIR=target/codex-check
+  cargo test -p tx-subsystems pipe`; `cargo test -p tx-kernel --no-run`;
+  `cargo xtask build --target rv64-qemu`; `cargo xtask qemu --target rv64-qemu
+  --profile smoke --expect-sentinel --smp 4`; `cargo fmt --check`; `git diff
+  --check`; a bounded `timeout 120s make oscomp-qemu-rv64-smp4` was manually
+  interrupted after reaching basic-musl.
+
+- 2026-05-20 **Fixed RV64 SMP OSComp brk-time pmap teardown trap.**
+  Diagnosed the `make oscomp-local-rv64-smp4` trap at
+  `sepc=0xffffffff8034cf82` as `VmPmap::teardown_range` stack/local
+  corruption while handling user pmap teardown during the basic-musl `brk`
+  test. The old path kept an `AddressSpaceShootdownBatch<64>` in the debug
+  kernel stack frame; RV64 disassembly showed the function reserving roughly
+  40 KiB of stack. Replaced the teardown batch path in
+  `crates/tx-subsystems/src/vm/pmap.rs` with immediate single-page
+  ASID-scoped shootdown followed by `MapPin` release, dropping the RV64 debug
+  stack frame to `0x230`. This is a conservative correctness fix; batching can
+  return later with a heap/per-CPU buffer instead of a large stack object.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-subsystems vm_pmap`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test
+  -p tx-subsystems
+  vm_aspace_reserve_user_range_for_access_publishes_private_anon_pages`;
+  `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p tx-kernel --no-run`;
+  `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo xtask build --target
+  rv64-qemu`; partial `make oscomp-local-rv64-smp4` run crossed
+  `Testing brk` and continued through clone/execve/fork before being manually
+  stopped for the user to rerun.
+
+- 2026-05-20 **Added 4-core RV64 OSComp local test target.**
+  Added `make oscomp-local-rv64-smp4` as the multi-core counterpart of the
+  existing primary `make oscomp-local-rv64` path. The new target keeps the same
+  build, data preparation, submit, and judge flow, but runs
+  `qemu-system-riscv64` with `-smp 4` and writes a separate serial log to
+  `target/oscomp/os_serial_out_rv_smp4.txt` so single-core logs remain
+  untouched. The SMP4 QEMU target creates the log directory before teeing
+  output, and the SMP4 judge target now reports a clear `make
+  oscomp-local-rv64-smp4` hint if the serial log has not been generated yet.
+  The original `oscomp-local-rv64` target remains `-smp 1`.
+  Added the matching `make oscomp-local-la64-smp4` path for LA64, with separate
+  `oscomp-qemu-la64-smp4` and `oscomp-judge-la64-smp4` targets and serial log
+  `target/oscomp/os_serial_out_la_smp4.txt`.
+  **Verified:** `make -n oscomp-local-rv64-smp4`; `make -n
+  oscomp-qemu-rv64-smp4`; `make -n oscomp-judge-rv64-smp4`; `make -n
+  oscomp-local-la64-smp4`; `make -n oscomp-qemu-la64-smp4`; `make -n
+  oscomp-judge-la64-smp4`.
+
+- 2026-05-20 **Added local SMP smoke Makefile targets.**
+  Added `make smp-smoke-rv64`, `make smp-smoke-la64`, and aggregate
+  `make smp-smoke` wrappers. They build the selected kernel in the repository
+  default `target/` directory, boot smoke under `--smp $(SMP_SMOKE_CPUS)`
+  (default `4`), and grep the serial log for SMP/IPI/reactor AP-runqueue
+  markers plus `boot:ok`. This gives the per-CPU reactor work a one-command
+  local validation path while keeping `oscomp-local-rv64` unchanged as the
+  single-core contest-style runner.
+  **Verified:** `make -n smp-smoke-rv64`; `make -n smp-smoke-la64`.
+
+- 2026-05-20 **RV64 SMP reactor dispatcher smoke made deterministic.**
+  Reworked the boot-time AP reactor dispatcher smoke in
+  `crates/tx-kernel/src/init.rs` so it validates remote submit +
+  reschedule IPI + AP runqueue execution directly instead of asserting an
+  instantaneous wait-channel waiter count. Under real `-smp 4`
+  multi-threaded TCG, the old `channel.fire(mask) == 1` assertion could race
+  the AP's first poll/subscription window and panic even though SMP, IPI, and
+  reactor scheduling were functioning. The smoke now submits a task pinned to
+  the first remote CPU via `submit_task_with_meta_from_hart`, checks the remote
+  IPI dispatch report, then waits for the AP to complete the task.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-kernel --no-run`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo xtask
+  build --target rv64-qemu`; manual QEMU using the fresh `/tmp` kernel with
+  `-smp 4` reached `txkernel:qemu-riscv64-virt:boot:ok` and printed
+  `reactor:dispatch:ipi:ok`, `reactor:ap-loop:ok`, `reactor:ap-runqueue:ok`,
+  and `reactor:sched:stats:h0=3/2:h1=1/1`.
+  **Note:** `cargo xtask qemu` currently resolves the kernel path under the
+  repository `target/` directory, not `CARGO_TARGET_DIR`; build the default
+  target dir or point QEMU at the `/tmp` kernel manually when using an
+  alternate target dir.
+
+- 2026-05-20 **Reactor per-CPU local refactor Phase 4 lock split completed.**
+  Completed the design-doc lock split for `tx-reactor`'s current reactor
+  surface. `SharedReactor` now stores a one-time initialized stable
+  `&'static Reactor`; its spinlock is only the initialization slot, and
+  `with(...)` / `with_hart_runtime(...)` no longer hold an outer reactor lock
+  while running the closure or hart loop. `ReactorShared` now protects
+  `TaskTable`, scheduler metadata/stats, timers, userspace slot, and
+  observability with narrow locks, while `TimerWheel` / delegate registry keep
+  their existing internally shared handles. `ReactorLocals` now records stable
+  per-hart local slots behind a small registry lock, and each
+  `HartSchedulerLocal` has separate locks for run queues and wake inbox plus
+  atomic markers / balance timestamp. Both concurrent and direct hart-loop
+  paths use `take_future -> poll outside reactor locks -> put/commit` so a
+  future is never polled under the task table lock. Scheduler runtime helpers
+  now operate through internally locked shared meta and no longer need
+  `&mut Phase1Scheduler`.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-reactor`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-kernel --no-run`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo xtask
+  build --target rv64-qemu`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check timeout
+  120s cargo xtask qemu --target rv64-qemu --profile smoke --expect-sentinel
+  --smp 4`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check timeout 120s cargo xtask
+  qemu --target la64-qemu --profile smoke --expect-sentinel --smp 4`.
+  **Next step:** stress/fix any AP userspace, timer, or steal edge cases that
+  appear under heavier workloads beyond the smoke sentinel path.
+
+- 2026-05-20 **Reactor per-CPU local refactor Phase 3 completed.**
+  Added `HartRuntimeView<'_>` in `crates/tx-reactor/src/runtime.rs` and
+  implemented `HartLoopRuntime` for it, so the platform-neutral hart loop can
+  run against `ReactorShared + ReactorLocals` rather than only a monolithic
+  `&mut Reactor`. `SharedReactor::with_hart_runtime()` is now the locked
+  transition entry for kernel-side stepping, and `tx-kernel`'s non-concurrent
+  `step_boot_reactor_once()` path uses it directly. The concurrent
+  `run_hart_loop_concurrent*` path now also creates a per-hart runtime view
+  inside each existing lock section, including wake draining, local stealing,
+  runnable placement, dispatch, slice/preempt handling, and stats/deadline
+  updates. `Reactor` keeps compatibility entry points, but its hart-loop
+  runtime methods delegate through `HartRuntimeView`, and the old private
+  monolithic helper copies were removed. Locking semantics remain unchanged;
+  this phase only changes the API shape needed for Phase 4 lock splitting.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-reactor`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-kernel --no-run`.
+  **Next step:** Phase 4, replace selected global reactor critical sections
+  with shared/local fine-grained locks while preserving the poll-lease
+  invariants.
+
+- 2026-05-20 **Reactor per-CPU local refactor Phase 2 compatibility checkpoint restored.**
+  Finished the scheduler compatibility bridge for the in-flight
+  `ReactorShared + ReactorLocals` split. `Phase1Scheduler` now keeps a small
+  temporary `compat_locals` set so legacy scheduler-only tests and old public
+  methods (`task_submitted`, `pick_next`, `task_stopped`, `task_runnable`,
+  `set_affinity`, `try_steal`, `rebalance_at`, `queue_depths`) continue to
+  exercise the same behavior while runtime paths use `HartReactorLocal`
+  through the new local-taking helpers. This closes the broken intermediate
+  state where `scheduler.rs` removed old methods before tests/callers were
+  migrated.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-reactor`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-kernel --no-run`.
+  **Next step:** begin Phase 3 by adding `HartRuntimeView<'_>` over
+  `&mut ReactorShared + &mut HartReactorLocal`, then move one hart-loop entry
+  at a time from `BOOT_REACTOR.with(...)` / `run_hart_loop_concurrent*` toward
+  `with_hart(...)` without changing lock semantics.
+
+- 2026-05-20 **Reactor per-CPU local refactor Phase 2 compatibility helpers started.**
+  Added local-taking scheduler bridge methods in `crates/tx-reactor/src/scheduler.rs`
+  for hart-local queue depth, wake inbox push/drain, preempt markers,
+  `peek_next`, enqueue/remove, and `pick_next`. The old `hart -> scheduler
+  internal local` methods still exist and continue to drive runtime behavior;
+  this cut is only preparing the API needed to wire `HartReactorLocal.scheduler`
+  in a later step. Temporary `dead_code` allowances mark the new bridge methods
+  that are intentionally unused until runtime is migrated.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-reactor --test scheduler`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo
+  test -p tx-reactor --test reactor_smoke`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check
+  cargo test -p tx-reactor --test hart_loop`.
+  **Next step:** continue Phase 2 by moving one runtime path at a time to call
+  the local-taking helpers through `SharedReactor::with_hart`, starting with
+  marker/wake-inbox paths before runqueue ownership is flipped.
+
+- 2026-05-20 **Reactor per-CPU local refactor Phase 1 landed.**
+  Added the first structural split in `crates/tx-reactor/src/runtime.rs`:
+  `Reactor` now contains `ReactorShared` plus `ReactorLocals`, and
+  `SharedReactor::with_hart()` can borrow shared state together with the
+  caller hart's `HartReactorLocal`. This is intentionally behavior-preserving:
+  the current global `SharedReactor` lock still protects the structure, and
+  scheduler hart queues remain inside `Phase1Scheduler` for this cut. The point
+  is to create a real code landing zone for the later shared-meta/local-queue
+  split without changing the poll/wake/steal interleavings yet.
+  **Verified:** `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo test -p
+  tx-reactor --test scheduler`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check cargo
+  test -p tx-reactor --test reactor_smoke`; `CARGO_TARGET_DIR=/tmp/txv2-percpu-check
+  cargo test -p tx-reactor --test hart_loop`.
+  **Next step:** Phase 2, move hart-local queues/inbox/markers out of
+  `Phase1Scheduler` into `HartReactorLocal` behind compatibility helpers before
+  attempting fine-grained lock removal.
+
+- 2026-05-19 **Reactor SMP design revised around poll-lease first split.**
+  Updated `docs/ljs/REACTOR_SMP_v1_CN.md` from draft v1.0 to v1.1 after
+  reviewing it against the current `tx-reactor` implementation. The design no
+  longer treats Phase 1 as “one independent `Phase1Scheduler` per hart”.
+  Instead it defines a safer path: shared task table / scheduler metadata as
+  the fact source, per-hart queues and runtime context as shards, and a Phase
+  1a poll-lease protocol that releases the global reactor/scheduler lock before
+  `future.poll()`. Added invariants for task ownership, per-hart current
+  mailbox/timer/delegate context, wake recheck, and a corrected Phase 2
+  stealing sketch based on queue locks plus task-state ownership transfer.
+  **Verified:** documentation-only change; grepped the design for old
+  independent-scheduler wording and reviewed the updated phase gates.
+  **Next step:** implement Phase 1a in `tx-reactor`: introduce task poll lease
+  / per-hart runtime context before attempting queue shard locks or stealing.
+
+- 2026-05-19 **TTY WaitSource registry gap fixed for interactive busybox.**
+  `docker-run-rv64-busybox` / `docker-run-la64-busybox` were not losing host
+  stdin at Docker or QEMU: input reached `step_ingest`, but the userspace
+  `ppoll`/`read` waiter never woke because TTY identities created a
+  `WaitSource` without registering it in the global wake registry used by
+  `drive()`'s mailbox path. Changed TTY `wait_routing::new_wait_source()` to
+  register/unregister sources, made `TtyIdentity::new()` use that helper, and
+  pinned the registry round-trip in `v3_tty_waitsource`. `sys_ppoll` now parks
+  on the TTY wait source instead of the backing `RNode` wait source, matching
+  `step_read`.
+  **Verified:** `cargo test -p tx-subsystems --test v3_tty_waitsource
+  tty_wait_source_invariants_round_trip`; `cargo test -p tx-scripts
+  drive_waiting_on_wait_source_unregistered_token_retries`; `cargo xtask build
+  --target rv64-qemu`; `timeout 90s cargo xtask shell-test --target rv64-qemu
+  --script tools/shell-tests/busybox-prompt.txt`; Docker LA64
+  `cargo xtask build --target la64-qemu` plus
+  `cargo xtask qemu --target la64-qemu --profile busybox --interactive --smp 1`
+  manually accepted empty Enter and `echo la64-clean`.
+  **Note:** `cargo fmt --check` for the whole tree still reports unrelated
+  pre-existing formatting diffs in other dirty files; a narrow `rustfmt
+  --edition 2021 --check` over the TTY/ppoll files touched here passed. The
+  LA64 `xtask shell-test` helper still lacks the `fw_cfg` wiring that
+  `xtask qemu` uses, so it boots `/init` instead of the busybox profile.
+  **Next step:** clean up the unrelated dirty formatting / LA64 shell-test
+  harness separately if we want a full-tree green formatting gate.
 
-  1. `step_fork` API 签名变更后 2 个调用点缺少第 3 参数 `clone_sighand`
-     （`tx-shims/tests/fcntl_misc.rs:168`、`tx-kernel/src/init/tests.rs:975`）
-  2. `sys_set_robust_list` 签名增加 `SyscallCtx` 后 2 个 dispatch arm 缺
-     参数（`mod.rs:423,471`）
-  3. `tx-scripts` exec-script 测试 CSPRNG 未初始化 → `setup()` 添加
-     `random::init(&random::platform_seed())`
-  4. `tx-kernel` boot-smoke 测试 CSPRNG 未初始化 → `setup()` 同上
-
-  验证：`cargo xtask unit` 构建通过。tx-scripts **42→50 全通过**；
-  tx-kernel **5→2 失败**（3 个 CSPRNG 修复，余 epoch-guard-nesting +
-  exit-group-NoReturn 预存）。
-  暴露的预存 bug 已修复：
-
-  1. `step_fork` API 签名变更后 2 个调用点缺少第 3 参数 `clone_sighand`
-     （`tx-shims/tests/fcntl_misc.rs:168`、`tx-kernel/src/init/tests.rs:975`）
-  2. `sys_set_robust_list` 签名增加 `SyscallCtx` 后 2 个 dispatch arm 缺
-     参数（`mod.rs:423,471`）
-  3. `tx-scripts` exec-script 测试 CSPRNG 未初始化 → `setup()` 添加
-     `random::init(&random::platform_seed())`
-  4. `tx-kernel` boot-smoke 测试 CSPRNG 未初始化 → `setup()` 同上
-
-  验证：`cargo xtask unit` 构建通过。tx-scripts **42→50 全通过**；
-  tx-kernel **5→2 失败**（3 个 CSPRNG 修复，余 epoch-guard-nesting +
-  exit-group-NoReturn 预存）。
-
-- 2026-05-19 **SysV/POSIX IPC subsystem implementation complete (6 phases).**
-  Plan: `docs/progress/plans/2026-05-19-sysv-ipc-implementation.json`.
-  Worktree: `.claude/worktrees/sysv-ipc-20260519` (branch `codex/sysv-ipc-implementation`).
-  - IPC-0: NsProxy + IpcNamespace + 8 namespace stubs on ProcessPayload.
-    `sign_init_nsproxy()` for bootstrap, `clone_nsproxy()` for fork.
-    MountNamespace deferred (MountIdentity not available at process-init time).
-  - IPC-1: SysV shm — ShmSegmentIdentity/Payload, IpcPerm, step_shmget/shmat/shmdt/shmctl.
-  - IPC-2: SysV msg — MsgQueueIdentity/Payload, Channel recv/send wake sources,
-    per-type-bucket message filtering, step_msgget/msgsnd/msgrcv/msgctl.
-  - IPC-3: SysV sem — SemArrayIdentity/Payload, SEM_UNDO (step_sem_undo on exit),
-    validate-all-then-apply atomic semop, step_semget/semop/semctl.
-  - IPC-4: POSIX mq — PosixMqInstance fd-shaped wrapper, mq_open/send/receive/notify/unlink.
-  - IPC-5: Syscall dispatch — 26 syscall numbers, 11 syscall arm functions.
-  - Errnos added: E2BIG, EFBIG, EIDRM (execution.rs + step/mod.rs + v3_algebra.rs + tx-shims).
-  - `cargo xtask check`: PASS (fmt + clippy + host + rv64 + rv64-m1dock + loongarch64).
-  - QEMU rv64-qemu smoke: 14/16 test cases pass (shmget/create/lookup/excl-fail/RMID,
-    msgget/create/lookup/RMID, semget/SETVAL/GETVAL/RMID). 2 pending: semop needs
-    copy_from_user for userspace sembuf array; shmat returns stub address until
-    VM PageContainer integration.
-
-- 2026-05-19 **membarrier(2) 初版实现完成。** Lane-1 (Immediate) 系统调用，
-  构建通过，零警告。系统性变更涉及 7 个文件：
-
-  HAL 层：
-  - `crates/tx-hal/src/lib.rs` — 新增 `IpiKind::Membarrier` 变体。
-
-  Syscall 层：
-  - `crates/tx-shims/src/linux_syscall/numbers.rs` — `NR_MEMBARRIER = 324`
-    （x86_64 编号，RV64 generic uapi 无固定槽位），以及全部 membarrier
-    命令常量和 `MEMBARRIER_SUPPORTED_MASK`。
-  - `crates/tx-shims/src/linux_syscall/mod.rs` — 新增 `SmpIf` + `IpiKind`
-    导入，`dispatch`/`dispatch_inner` 添加 `+ SmpIf` 约束，Lane-1
-    dispatch arm (`NR_MEMBARRIER → sys_membarrier::<P>(&req.args)`)，以及
-    `sys_membarrier` 函数实现（QUERY 返回位掩码，GLOBAL/PRIVATE_EXPEDITED
-    广播 Membarrier IPI 并自旋等待所有 hart ack，REGISTER_* 为 no-op）。
-  - `crates/tx-shims/src/linux_syscall/tests.rs` — `ShimsTestPmap` 实现
-    `SmpIf`（全默认方法，单 CPU 测试平台）。
-
-  Kernel IPI 处理（接收端 hart 执行 `fence(SeqCst)` + `ack_ipi`）：
-  - `crates/tx-kernel/src/trap.rs` — `on_ipi` 新增 Membarrier 和
-    TlbShootdown 分支。
-  - `crates/tx-kernel/src/init/exec.rs` — 主 idle 循环新增 Membarrier
-    处理。
-  - `crates/tx-kernel/src/init.rs` — 辅助 reactor 循环新增 Membarrier
-    处理。
-
-  验证：`cargo check -p tx-shims -p tx-kernel` 通过，零警告。
-  测试环境 CSPRNG 未初始化 + `step_fork` API 不匹配导致部分预存测试失败，
-  与本次修改无关。
-
-- 2026-05-19 **libctest-musl 0/220 → 14/220+ on rv64-qemu.** Two
-  cooperating fixes unblocked libctest's parent-side
-  `sys_rt_sigtimedwait` poll loop and identified the actual wedge
-  bug after the prior unit-test analysis proved the kernel-side
-  signal post→read path was correct:
-
-  1. **`sys_rt_sigtimedwait` mailbox + stale `SignalDelivered`
-     drain.** The poll loop was calling
-     `drive(NanosleepOp, …)` with `mailbox = None`, which made
-     `resolve_on_timer` short-circuit to `ResumeOutcome::Retry`
-     immediately (no actual park, no actual sleep) — the parent
-     spun fast and starved the reactor so child tasks never ran.
-     Fix: wire `tx_reactor::current_task_mailbox()` into the
-     drive call. Plus a drain of stale `MailboxEvent::SignalDelivered`
-     events between iterations (the inner `await_mailbox_event`
-     re-posts SignalDelivered for caller observation, but
-     sigtimedwait reads the canonical pending bitmap directly —
-     the re-post becomes a stale trap that returns `Ready(true)`
-     immediately on the next iteration).
-
-  2. **`TimerToken` / `TimerId` mismatch in
-     `tx_scripts::drive::resolve_on_timer`.** With (1) in place,
-     `argv` passed but `basename` hung. Trace investigation
-     showed `NanosleepOp::step` yields
-     `OnTimer { token: TimerId::new(1), … }` — a hard-coded
-     constant — while `TimerWheel::install_for_task` allocates a
-     fresh internal `TimerToken` from its monotonic
-     `next_token` counter. `resolve_on_timer` was comparing the
-     fired event against the caller-passed `TimerId(1)` instead
-     of the wheel-allocated guard token, so the predicate NEVER
-     matched a `TimerFired` event. The wait only ever unblocked
-     via the unrelated `SignalDelivered` wake path — which
-     happened fast enough for `argv` (child completes in ms) but
-     not for slower tests. Fix: use `_guard.token()` (the
-     wheel-allocated token) in the predicate.
-     ([`crates/tx-scripts/src/drive.rs`](../../crates/tx-scripts/src/drive.rs))
-
-  **Scoreboard after fix (this rv64-qemu run):**
-  - basic-musl: 102/102 (unchanged).
-  - busybox-musl: 52/55 (unchanged).
-  - libcbench-musl: ~14/27 (unchanged).
-  - **libctest-musl: 14/220+** — argv, basename,
-    clocale_mbfuncs, clock_gettime, dirname, env, fdopen,
-    fnmatch, fscanf, fwscanf, iconv_open, inet_pton, mbc,
-    memstream all pass. 15th test
-    (`pthread_cancel_points`) fails with `[signal
-    Segmentation fault]` because pthread support isn't wired
-    (`pthread_create` returns `EAGAIN`/`Resource temporarily
-    unavailable`). Then the kernel itself trapped on
-    `core::ptr::read_volatile::<u32>` of a user pointer
-    `0x40112da0` during `pthread_cancel` (separate
-    pre-existing bug: a syscall arm uses raw
-    `read_volatile` instead of the safe `aspace.read_user`
-    lane — needs follow-up). The trap aborts the suite
-    before the rest of libctest can score.
-  - lua-musl: 9/9 (unchanged).
-  - lmbench-musl: 0/36 (unchanged).
-
-  Doc updates:
-  - `SYSCALL_STATUS.md` scoreboard `libctest-musl` row
-    refreshed; auto-table re-synced.
-  - Next high-stakes row to swap in: identify and fix the
-    user-pointer `read_volatile` EFAULT crash so the kernel
-    survives pthread tests gracefully (returning -EFAULT
-    instead of trapping) — that should let libctest score
-    every non-pthread test (~150+ more) before any
-    real-pthread implementation work is needed.
-
-  Verification:
-  - `cargo -q xtask unit` — **339 host unit tests pass.**
-  - `cargo xtask ci` — **17/17 gates green.**
-  - `cargo xtask fault-decode --target rv64-qemu --serial …`
-    decoded the post-libctest trap to
-    `core::ptr::read_volatile::<u32>+0x1e` (kernel-internal
-    raw user-pointer read).
-
-  Files touched:
-  - `crates/tx-scripts/src/drive.rs` — `_guard.token()` fix.
-  - `crates/tx-shims/src/linux_syscall/signal.rs` — sys_rt_sigtimedwait
-    mailbox wiring + drain helper.
-  - `crates/tx-shims/src/adapter.rs` — re-export
-    `current_task_mailbox`, `TaskMailbox`, `MailboxEvent`.
-  - `crates/tx-kernel/src/lib.rs` — `OBSERVE_DUMP_THRESHOLD = 0`
-    (disabled at boot so long libctest runs aren't truncated;
-    investigation-only dump knobs flipped back).
-  - `crates/tx-shims/src/linux_syscall/proc.rs` — debug
-    execve-marker hook reverted.
-
-- 2026-05-18 **libctest wedge investigation: prove the
-  `sys_rt_sigtimedwait` wait-side is correct, isolate the gap
-  to the child-exit / SIGCHLD-post upstream.** Five new host
-  tests in
-  [`crates/tx-shims/src/linux_syscall/tests/sigtimedwait_dispatch.rs`](../../crates/tx-shims/src/linux_syscall/tests/sigtimedwait_dispatch.rs)
-  exercise the dispatch arm directly and prove the kernel-side
-  signal-wait path matches libctest's `runtest.c` shape exactly.
-
-  Tests added (all pass):
-  1. `sigtimedwait_returns_pending_signum_and_clears_bit` —
-     pre-loaded SIGCHLD observed; `Return(17)` + bit cleared.
-  2. `sigtimedwait_wrong_sigsetsize_returns_neg_einval` —
-     musl-style 8-byte enforcement (glibc-style 16 rejected).
-  3. `sigtimedwait_null_set_returns_neg_efault` — NULL set
-     returns -EFAULT.
-  4. `sigtimedwait_ignores_signals_outside_set_returns_neg_eagain` —
-     pending SIGTERM with `set = {SIGCHLD}` doesn't get confused;
-     -EAGAIN and SIGTERM stays pending.
-  5. `sigtimedwait_observes_sigchld_posted_by_child_exit` —
-     end-to-end fork → `step_exit_group(child)` → kernel's
-     `post_sigchld_to_parent` → `step_kill_process(parent,
-     SIGCHLD)` → `post_signal(thread, SIGCHLD)` →
-     `payload.pending().post(SIGCHLD)` → `sigtimedwait`
-     returns SIGCHLD with bit cleared. **Load-bearing test:**
-     this is the exact kernel-side post → read path libctest
-     uses.
-
-  All five pass on host. So the `[timed out]` from libctest
-  cannot come from the `sys_rt_sigtimedwait` body. The wedge is
-  **upstream** of the SIGCHLD post — most likely the child takes
-  >10s to reach `exit_group` (fork-without-execve COW path,
-  demand-paging, or a wedge on a syscall the kernel responds to
-  with the wrong value). The next investigation step is a
-  trap-trace of a single libctest test (`./run-static.sh argv`)
-  under QEMU, decoded with `cargo xtask fault-decode --target
-  rv64-qemu --serial <log> --user-elf .../entry-static.exe
-  --summary`, which will show whether the child is genuinely
-  slow or wedging on one specific syscall.
-
-  Doc updates:
-  - `SYSCALL_STATUS.md` top high-stakes row refined: the wait
-    side is "**proven correct**" with the test table as
-    evidence; the upstream-of-post hypothesis is now spelled
-    out with the three sub-cases.
-
-  `cargo -q xtask unit` — **334 → 339 tests pass** (5 new sigtimedwait tests).
-  `cargo xtask ci`      — 17/17 gates green.
-
-- 2026-05-18 **Boot-time `mkdir /tmp`, `/var`, `/var/tmp` in the
-  rootfs tmpfs — closes the first of the two lmbench blockers
-  (`/var/tmp` ENOENT).** Per the SYSCALL_STATUS.md "second move"
-  row, lmbench-musl 0/36 has two blockers: (1) `/var/tmp` doesn't
-  exist so the setup `open(O_CREAT, "/var/tmp/…")` returns
-  -ENOENT before the suite can run any benchmark; (2) a deeper
-  `Simple read: -1` runtime issue that needs `read(2)` triage.
-  This pass closes (1).
-
-  Change: new `populate_rootfs_tmp_dirs()` helper in
-  [`crates/tx-kernel/src/init/rootfs_shims.rs`](../../crates/tx-kernel/src/init/rootfs_shims.rs)
-  (sibling to the existing `populate_rootfs_shebang_shims`).
-  Uses the same `mkdir_or_find` + per-call epoch-guard scoping
-  pattern so a re-boot is idempotent and the helper never nests
-  guards (the same discipline that fixed the original shebang
-  shim panic). Creates `/tmp` and `/var/tmp` at mode 0o777
-  (sticky-style — the slice doesn't honour the sticky bit yet),
-  and `/var` at mode 0o755. Failures emit a board sentinel and
-  return non-fatally.
-
-  Invocation: added between `populate_rootfs_shebang_shims()`
-  and `bind_init_cwd_and_root()` in `init.rs`'s boot sequence.
-
-  Verification:
-  - `cargo -q xtask unit` — 334 tests pass
-  - `cargo xtask ci`      — 17/17 gates green
-  - `cargo xtask full-build --target rv64-qemu --no-image` — kernel ELF builds clean
-  - End-to-end OSComp QEMU run is **pending** in this worktree
-    (cpio image generation requires `TX_BUSYBOX` / vendored
-    busybox-riscv64-musl which isn't fetched in this worktree;
-    `tools/images/fetch-busybox.sh` is the standard way to
-    populate it).
-
-  Blocker (2) — `Simple read: -1` — remains. That's a runtime
-  `read(2)` edge case in the lmbench `lat_fs` / `bw_file_rd`
-  paths and needs trap-trace investigation; carving it into its
-  own commit so the kernel-side dir setup lands first.
-
-  Doc updates:
-  - `SYSCALL_STATUS.md` second-move section + Recently-landed.
-
-- 2026-05-18 **Wire 5 RT_SIG dispatch arms; `sys_rt_sigtimedwait`
-  becomes a real async poll loop.** Following the shebang/exec
-  unblock, the next-highest row in `SYSCALL_STATUS.md` was wiring
-  `sys_rt_sigtimedwait` (every libctest test was failing on
-  `sigtimedwait: ENOSYS` because `runtest.c` uses it to wait on
-  child exits). Done in this pass:
-
-  1. **`sys_rt_sigtimedwait` (137)** — new async body in
-     [`crates/tx-shims/src/linux_syscall/signal.rs`](../../crates/tx-shims/src/linux_syscall/signal.rs).
-     Reads the 8-byte sigset and (optional) `timespec`, then
-     poll-and-yield-loops on `payload.pending().snapshot() & set`.
-     On a hit, clears the bit and returns the signum (writing a
-     zeroed siginfo to `info_uaddr` if non-null). On timeout,
-     returns `-EAGAIN`. Between polls it `await`s a 5 ms
-     `NanosleepOp` via `tx_scripts::drive(.., DriveMode::Waiting, ..)`
-     so the reactor can run the sibling task that posts SIGCHLD.
-
-  2. **`sys_sigaltstack` returns 0** instead of `-ENOSYS`. The
-     slice doesn't honour an alternate signal stack yet (signal
-     frames always sit on the thread's current sp), but POSIX
-     permits a no-op and most callers just register the alt stack
-     during setup without actually relying on it during the test
-     body.
-
-  3. **4 cooperating dispatch arms wired** in `mod.rs` for
-     `sys_rt_sigpending`, `sys_rt_sigsuspend`, `sys_rt_sigqueueinfo`,
-     `sys_rt_sigtimedwait`, and `sys_sigaltstack` (the handlers
-     all existed; only the match arms were missing — they were
-     among the 13 `defined-but-no-arm` entries flagged by
-     `cargo xtask syscall list --filter defined`).
-
-  Headline counts after this pass (`cargo xtask syscall status`):
-  - NR_* defined: 120 (unchanged)
-  - Dispatched: 107 → **112**
-  - Defined-but-no-arm: 13 → **8**
-
-  Effect on OSComp:
-  - `libctest-musl`: every test now reaches the test body — no
-    more `sigtimedwait: ENOSYS`. Status moves from `[signal Killed]`
-    to `[timed out]`. Score still **0/220** because child
-    `entry-static.exe` processes don't appear to exit (and post
-    `SIGCHLD`) in time. The gap shifted from the wait-side (now
-    correct) to the child-exit / signal-post lane.
-  - `basic-musl`, `busybox-musl`, `libcbench-musl`, `lua-musl`,
-    `lmbench-musl`: unchanged.
-
-  Doc updates:
-  - `SYSCALL_STATUS.md`: headline counts refreshed; high-stakes
-    table top row swapped to "diagnose libctest child wedge"
-    (the `sigtimedwait` row is recorded under Recently landed);
-    auto-table re-synced via `cargo xtask syscall sync`;
-    Last refresh bumped to 6th pass.
-
-  Next step: diagnose why child `entry-static.exe` invocations
-  don't exit. Initial trap-trace showed lots of iPF/lPF/SY
-  syscalls in the child's sp=0x4037xxxx region but no obvious
-  wedge point — last visible was an iPF at `pc=0x11c1f8` before
-  the QEMU run timed out. Likely either a missing handler-return
-  path or a child-side syscall returning the wrong value and
-  spinning the test harness.
-
-  `cargo -q xtask unit` — **334 tests pass**.
-
-- 2026-05-18 **Shebang shims + ENOEXEC `/bin/sh` fallback land:
-  basic-musl 102/102, lua-musl 9/9, libctest now executes all 220
-  tests.** Two cooperating changes unblock the top-of-table fix in
-  SYSCALL_STATUS.md (the 229-OSComp-test shebang gap):
-
-  1. **`populate_rootfs_shebang_shims()`** — new init helper in
-     [`crates/tx-kernel/src/init/rootfs_shims.rs`](../../crates/tx-kernel/src/init/rootfs_shims.rs).
-     Auto-creates `/bin/`, `/usr/`, `/usr/bin/` in the tmpfs rootfs
-     and symlinks `/bin/sh`, `/bin/busybox`, `/usr/bin/env` →
-     `/musl/musl/busybox`. Carved into its own file so init.rs
-     stays under the 1800-line arch-lint cap.
-
-  2. **Kernel-side ENOEXEC fallback to `/bin/sh`** — when
-     `exec_script` sees a file that's neither ELF nor `#!`, it now
-     synthesizes `#!/bin/sh <path>` instead of returning
-     `ExecError::NotExecutable`. Matches every userspace shell's
-     standard ENOEXEC behaviour but is needed at the kernel layer
-     because busybox ash's fallback only fires for files whose first
-     character looks "script-like" — and the libctest wrappers
-     `run-static.sh` / `run-dynamic.sh` start with `./runtest.exe …`
-     (no shebang), which ash gives up on.
-
-  Two unit tests inverted to assert the new behaviour:
-  `exec_script_non_elf_non_shebang_falls_back_to_bin_sh` and
-  `dispatch_execve_non_elf_non_shebang_falls_back_to_bin_sh`.
-
-  Verified by `cargo xtask oscomp qemu --target rv64-qemu` +
-  per-suite `cargo xtask oscomp score`:
-  - `basic-musl`: 101/102 → **102/102** (full pass).
-  - `lua-musl`: 0/9 → **9/9** (full pass).
-  - `libctest-musl`: 0/220 (now executes; every test fails on
-    `sigtimedwait: Function not implemented` — the next move is
-    wiring `sys_rt_sigtimedwait` (handler exists in `signal.rs`,
-    just needs the dispatch arm; it's one of the 13
-    defined-no-arm entries flagged by `cargo xtask syscall list
-    --filter defined`)).
-  - `busybox-musl`, `libcbench-musl`, `lmbench-musl` unchanged.
-
-  Two side fixes to keep CI green:
-  - Carved the helper into a sibling file so `init.rs` stays under
-    the 1800-line arch-lint cap.
-  - SYSCALL_STATUS.md: scoreboard updated; high-stakes-table top
-    row swapped from "shebang shim" (landed) to "wire
-    `sys_rt_sigtimedwait`" (next +220 OSComp impact); **Last
-    refresh** bumped to 5th pass.
-
-  `cargo xtask ci` — 17/17 gates pass.
-  `cargo -q xtask unit` — 334 tests pass.
-
-- 2026-05-18 **Merged `origin/main` (post-PR #33) + recorded full
-  per-suite OSComp scoreboard in `SYSCALL_STATUS.md`.** PR #33 brings
-  `cargo xtask oscomp score`, `list-suites`, and `test` subcommands —
-  and lands busybox-musl 52/55 on `main`. With the new scoring tool
-  the per-suite picture is now:
-
-  | Suite | Score | Status |
-  |---|---:|---|
-  | basic-musl | 101/102 | mostly passing (1 partial mmap assertion) |
-  | busybox-musl | 52/55 | landed (PR #33) — 3 remaining are non-kernel |
-  | libcbench-musl | ~14/27 | malloc benches return 0; stdio fails |
-  | libctest-musl | 0/220 | `./run-static.sh: not found` — ENOENT blocker |
-  | lua-musl | 0/9 | `./test.sh: not found` — same pattern |
-  | lmbench-musl | 0/36 | missing `/var/tmp/` + `Simple read: -1` |
-
-  **Highest-leverage next move (now top of the high-stakes table):**
-  the `./run-static.sh` / `./test.sh` ENOENT in libctest + lua most
-  likely traces to `#!/usr/bin/env …` shebangs where `/usr/bin/env`
-  doesn't exist on the rootfs. Same fix pattern as
-  `mount_procfs_at_proc()` from PR #33 — create `/usr/bin/` and
-  symlink `env → /bin/busybox` (or the wherever the busybox image
-  lives) in the tmpfs rootfs at boot. ~1 day of work; unblocks
-  **229 OSComp tests** in one shot.
-
-  **Second move:** lmbench `mkdir /var/tmp` at boot is trivial; the
-  `Simple read: -1` failure needs runtime triage before the rest of
-  the 36 lmbench tests can be scored.
-
-  **Doc changes:**
-  - `SYSCALL_STATUS.md`: full per-suite scoreboard table; high-stakes
-    table re-sorted with the env-symlink fix at the top (LTP/OSComp
-    impact: +229); lmbench `/var/tmp` + libcbench triage rows added;
-    PR #33 entries appended to **Recently landed** (oscomp score
-    subcommands + busybox-musl 52/55 fixes); headline counts updated
-    (120 NR_*, 107 dispatched after `NR_SYSLOG` landed); **Last
-    refresh** bumped to 4th pass.
-  - `STATUS.md` (this entry): names the per-suite scoreboard and the
-    two next moves.
-
-  **Merge fixups:** resolved 3 conflicts (`SYSCALL_STATUS.md`,
-  `STATUS.md`, `skill_manifest.yaml`); combined `tx-ltp-syscall`
-  entries from both sides (kept main's richer cross-skill pointers,
-  added our `external/oscomp-autotest` + `xtask/src/syscall.rs`
-  sources). Two clippy / unused-import fixes in the LA64 board
-  (`platform_impls.rs`, `boot_smp.rs`) to bring fast CI back to 17/17.
-
-  **Verified:**
-  - `cargo -q xtask unit` — 334 tests pass.
-  - `cargo xtask ci` — 17/17 gates pass (incl. `syscall-status doc
-    sync`).
-  - `cargo xtask syscall status` — 120 NR_*, 107 dispatched, 13
-    defined-no-arm.
-
-- 2026-05-18 **busybox-musl 52/55 on `cc/great-ptolemy-982e05` `a2eff5f`
-  — recorded in SYSCALL_STATUS.md.** The commit lives on the
-  great-ptolemy branch (not yet merged to `main`), so this is a
-  forward-looking record: the 7 fixes that produced the score are
-  enumerated in `SYSCALL_STATUS.md` so the doc reflects where the
-  project actually stands across worktrees.
-  - ext4 `O_APPEND` (`pc.set_size_bytes(meta.size)` after
-    `PageContainer::new_cap()`) — 6 append tests.
-  - `utimensat` stub returns 0 — `touch(1)`.
-  - `NR_SYSLOG=116` dispatch returning 0 — `dmesg(1)`.
-  - ext4 `rename` / `rmdir` implementations — `mv(1)` / `rmdir(1)`.
-  - `/proc/meminfo` wired into procfs lookup/readdir/render — `free(1)`.
-  - Auto-mount `/proc` at kernel init (`mount_procfs_at_proc()`) —
-    `free(1)`, `ps(1)`, `df(1)`.
-
-  **Three remaining busybox-musl failures, all non-kernel:** `hwclock`
-  (no RTC), `kill 10` (judge script vs sdcard `busybox_cmd.txt`
-  mismatch), `which ls` (no `ls` symlink in
-  `PATH=/musl/glibc:/musl/musl`). Not blocking further work.
-
-  **Doc changes in this worktree (no code changes):** removed the
-  `utimensat`+`/proc` row from the high-stakes table (now landed);
-  added an `ext4 file-content writeback` row (next gap surfaced by
-  the 52/55 work — `flush_page`/`fsync_file` still return `-ENOSYS`);
-  bumped **Last refresh**.
-
-  **Verification:** `cargo xtask lint syscall-status` passes (no
-  auto-table drift); `cargo xtask progress validate` ok.
-
-- 2026-05-18 **`cargo xtask syscall` introduced; dispatch table is now
-  the SSoT for syscall progress.** New xtask module
-  ([`xtask/src/syscall.rs`](../../xtask/src/syscall.rs)) parses
-  `crates/tx-shims/src/linux_syscall/{numbers,mod}.rs` and exposes five
-  subcommands:
-  - `status` — counts (NR_* defined, dispatched, async, likely stubs,
-    defined-no-arm).
-  - `list [--filter wired|stub|defined|async|all] [--json]` — per-syscall
-    rows (NR, name, status, handler).
-  - `info <name>` — single-syscall details (e.g. `cargo xtask syscall
-    info openat`).
-  - `sync` — regenerates the `<!-- BEGIN syscall-auto-table -->` block
-    in [`SYSCALL_STATUS.md`](SYSCALL_STATUS.md), including a
-    machine-built counts summary, the likely-stub heuristic catalog,
-    the defined-but-no-arm list, and a per-syscall dispatched table.
-  - `pick` — prints the high-stakes table from `SYSCALL_STATUS.md` so a
-    new task can be scoped without re-reading the doc.
-
-  **CI gate added:** `cargo xtask lint syscall-status` (alias for
-  `syscall sync --check`) wired into `cargo xtask ci` as
-  `txdoc:CI-GATE-SYSCALL-STATUS`. Fails if the auto section drifts from
-  the dispatch table; fix with `cargo xtask syscall sync`.
-
-  **Pre-existing drift caught on first run:** 13 `NR_*` constants exist
-  in `numbers.rs` but have no dispatch arm in `mod.rs`:
-  - `NR_EPOLL_CREATE1` / `NR_EPOLL_CTL` / `NR_EPOLL_WAIT` /
-    `NR_EPOLL_PWAIT` (handler `sys_epoll_ctl` is even defined in
-    `epoll.rs` but never wired)
-  - `NR_IO_URING_ENTER`
-  - `NR_PIDFD_OPEN` / `NR_PIDFD_SEND_SIGNAL`
-  - `NR_RT_SIGPENDING` / `NR_RT_SIGQUEUEINFO` / `NR_RT_SIGSUSPEND` /
-    `NR_RT_SIGTIMEDWAIT` (all have handler functions defined in
-    `signal.rs` but no match arm)
-  - `NR_SIGALTSTACK` (`sys_sigaltstack` defined but not wired)
-  - `NR_SIGNALFD` (the older signum-no-flags variant; `NR_SIGNALFD4` is
-    wired)
-
-  These are now visible as a TODO list in the auto-table — they're
-  candidates for cleanup or wiring without any new subsystem work.
-
-  **Verified:** `cargo xtask ci` — 17/17 gates pass (added gate
-  recorded as `syscall-status doc sync`); `cargo xtask ci-slow` — 2/2
-  pass. Reference: [`docs/progress/SYSCALL_STATUS.md`](SYSCALL_STATUS.md).
-
-- 2026-05-18 **`SYSCALL_STATUS.md` + `tx-ltp-syscall` skill brought into
-  this worktree and refreshed.** Copied from `cc/brave-brown-d46827`
-  (where they were originally drafted), then updated to today's state:
-  - Headline counts recounted: NR_* still 119; dispatched arms 96 → 109
-    (grew through PRs #30 + #31 plus the merge train).
-  - `rt_sigreturn`, `sys_clone` `newsp` rejection, and the
-    pipe/eventfd/timerfd/process adapter `register_source` gaps moved
-    from **Already-partial** to a new "Recently closed" subsection.
-  - OSComp "Currently passing (basic-musl)" rewritten to enumerate the
-    full 32/32 set by name (was "brk, chdir, close, mkdir, unlink,
-    sleep" at seed).
-  - High-stakes table: `fork` + CLOEXEC row removed (audit found it was
-    already wired); added a `utimensat` + `/proc` row reflecting the
-    busybox-musl gap; reordered by current LTP-impact-per-effort.
-  - LTP section reframed: today's coverage is the *shape* implied by
-    syscall wiring, not a named-test list — recording a TODO to run an
-    actual LTP image inside QEMU and enumerate passing tests by name.
-
-  **Verification:** doc renders; `cargo xtask progress validate` —
-  records ok; no syscall code changed in this catch-up. Reference:
-  [`docs/progress/SYSCALL_STATUS.md`](SYSCALL_STATUS.md).
-
-  **Next:** capture an LTP-in-QEMU run and populate `Currently passing
-  (LTP)`. Then start work on the top high-stakes row
-  (`preadv`/`pwritev`/`fallocate`).
-=======
-- 2026-05-18 **`cargo xtask syscall-status` + lint-maintained autogen in `SYSCALL_STATUS.md`.**
-  New xtask command that reads `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}`
-  as the single source of truth for syscall implementation state. Replaces hand-edited
-  counts (which had drifted — the doc said "~96 dispatched" but the SSOT shows
-  **107 / 119 with 12 undispatched**).
-  Modes:
-  - `cargo xtask syscall-status` — brief: counts + detail-command menu.
-  - `cargo xtask syscall-status <NAME>` — info for one syscall: numbered? dispatched?
-    summary? what to load next.
-  - `cargo xtask syscall-status --list-missing` — defined but no dispatch arm.
-  - `cargo xtask syscall-status --regen` — refresh autogen section in `SYSCALL_STATUS.md`
-    (between `BEGIN/END AUTOGEN: syscall-table` markers).
-  - `cargo xtask syscall-status --check` — lint mode, exits non-zero on drift with a
-    one-line regen instruction.
-  New CI gate `txdoc:CI-GATE-SYSCALL-STATUS` added to `cargo xtask ci`; documented in
-  [CI_REPORTING_v1.md](../design/00_meta-framework/CI_REPORTING_v1.md). Surfaced in
-  [tx-ci-triage](../../.agents/skills/tx-ci-triage/SKILL.md) per-gate table and
-  rewritten into [tx-ltp-syscall](../../.agents/skills/tx-ltp-syscall/SKILL.md)
-  Identify-the-target and Update-on-completion steps. The autogen section is bounded —
-  human-curated content (high-stakes table, OSComp/LTP coverage, topic categorization,
-  Already-partial) stays untouched.
-  **Verified:** `cargo xtask syscall-status --check` → ok; drift smoke test (forced
-  119→999 mutation) → exit 1 with regen instruction → restored → ok. `cargo xtask lint docs`
-  → ok; `cargo xtask progress validate` → 24 records ok.
-  **Next step:** next syscall change exercises the full loop (edit dispatch → `--regen` →
-  commit both files).
-
->>>>>>> cc/brave-brown-d46827
 - 2026-05-17 **LA64 QEMU SMP shape made explicit.**
   Added a `--smp N` override to `cargo xtask qemu`, keeping the default LA64
   smoke lane at `-smp 4` while making `-smp 1` directly reproducible when
@@ -759,414 +550,6 @@
   (whether sdcard has ls symlinks or if PATH setup helps). libctest-musl
   and libcbench-musl show no output (0/N) — those test suites might be
   the next target.
-- 2026-05-18 **OBS: PGID swimlane grouping + fork/clone flow arrows.**
-  Two layout improvements to the Perfetto rendering, addressing the
-  "scattered views" feedback:
-  - **PGID grouping** (OBS-V1 §15.8). New
-    `PayloadProcessGroup { pid, pgid, sid }` wire payload + tag
-    `ProcessGroup = 55`, emitted as a Sched-level Instant alongside
-    `PayloadProcessLabel` at each submit / post-exec site.
-    `tx-kernel` reads `ProcessIdentity::pgrp_cap()` for the live
-    `Cap<ProcessGroup>` (pgid + session). Daemon caches `pid →
-    (pgid, sid)`; `TrackRegistry::ensure_pgrp_track` materialises a
-    top-level `pgroup-<pgid> (sid=<sid>)` swimlane keyed by
-    `0xE000_0000_0000_0000 | pgid`, and `ensure_process_track` now
-    accepts an optional `pgid` so per-process tracks set
-    `parent_uuid` to the pgrp swimlane. The basic-musl trace now
-    nests all 60 test processes under a single `pgroup-1` lane
-    instead of leaving them scattered top-level.
-  - **Fork/clone flow arrows** (OBS-V1 §15.9). New
-    `PayloadProcessFork { parent_pid, child_pid }` wire payload +
-    tag `ProcessFork = 56`, emitted from
-    `drain_pending_child_submits` after the child's PCB is queried.
-    Parent's PID resolved via `Cap<ProcessIdentity>::parent_pid()`.
-    Daemon decodes the edge and emits a pair of TrackEvents sharing
-    one `compute_flow_id(parent_pid, child_pid, FlowKind::Fork)` —
-    one anchored on the parent's process track named
-    `fork→<child>`, one on the child's track named
-    `forked←<parent>`. Perfetto draws an arrow between them. The
-    captured `oscomp.pftrace` carries 59 fork edges matching the
-    test driver's children. Materialises missing process tracks on
-    demand (uses cached `comm` + `pgid` to do it right) so the
-    flow's downstream anchor always has a track to land on.
-  - **Deadlock fix.** Moved the post-exec ProcessLabel +
-    ProcessGroup emit OUT of the `payload._comm.lock()` scope in
-    `exec_script` — keeping the emit (which itself locks `pgrp_cap`
-    and writes to the per-hart observation ring) inside the
-    payload-slot lock had hung busybox under the new code path.
-    Each lock acquisition is now flat and short.
-  - **Verification.** `cargo -q xtask unit` — 332 tests pass.
-    End-to-end `cargo xtask oscomp qemu --target rv64-qemu` → reach
-    20k threshold → `observe extract` + `observe pftrace`:
-    resulting pftrace shows `pgroup-1 (sid=1)` swimlane parenting
-    `busybox`/`sh`-named process tracks parenting `tid-N` thread
-    tracks; 59 fork edges connecting parent and child tracks.
-
-- 2026-05-18 **OBS: PCB program names + readable register values.**
-  Two visible follow-ups to the PID/TID plumbing:
-  - **Process names from PCB.** New `PayloadProcessLabel { pid: u32,
-    comm: [u8; 12] }` wire payload + `TxPayloadTag::ProcessLabel`
-    (=54). Emitted as a `Sched`-level Instant once per process at
-    submit time (kernel-side: `init/exec.rs` leader,
-    `init.rs::drain_pending_child_submits` for sys_clone children)
-    and re-emitted from `tx-scripts::process::exec::exec_script`
-    immediately after the PCB `_comm` is committed — so the daemon
-    picks up the post-execve binary name, not the parent's pre-fork
-    `comm`. Closes a latent gap: `step_store_exec_identity` existed
-    but had no callers, so `_comm` was `[0; 16]` forever. Now
-    `exec_script` writes basename(argv[0]) into `_comm` + `_cmdline`
-    at the PoNR commit; visibility of `_comm` widened from
-    `pub(crate)` to `pub` so the script crate can write it directly.
-    Daemon: extracts the printable ASCII prefix from the 12-byte
-    `comm`, caches `pid → name`, uses it as
-    `ProcessDescriptor.process_name` at first track materialisation;
-    when a fresh label arrives AFTER the track is already named,
-    `TrackRegistry::rename_process_track` re-emits a `TrackDescriptor`
-    keyed by the same UUID so Perfetto renames the swimlane
-    retroactively. Verified: `oscomp.pftrace` carries 28
-    `busybox`-named process tracks alongside the synthetic `pid-<N>`
-    fallback (processes that never reached the post-exec re-emit).
-  - **Readable register values.** Daemon's ArgValue Instant
-    rendering now formats the label as `a<i>=0x<hex>` (e.g.
-    `a0=0x163c14`) via `intern_str` instead of just `a<i>`. Perfetto
-    renders Instants as vertical markers labeled by event name, so
-    the register value now reads on the timeline directly below each
-    syscall slice — no click needed. The structured `DebugAnnotation
-    { name="value", uint_value=… }` is still emitted alongside for
-    tooling that prefers the raw number.
-
-- 2026-05-18 **OBS: real PID/TID in Perfetto slice details + per-syscall
-  arg annotations.** Slices in `oscomp.pftrace` no longer show the
-  synthetic `hart0[0] / txKernel[1]` placeholder pair — each reactor
-  task carries an owning `process_id_low` alongside `task_id_low`
-  end-to-end:
-  - `PayloadSchedSwitch` wire format extended (`offset 4: process_id_low
-    u32`, `_pad: [u8; 5]`); `encode_sched_switch` writes both fields.
-  - `TaskMailbox` gains a `process_id_low` field + `with_process_id`
-    builder + accessor, mirroring the `task_id_low` plumbing
-    (`crates/tx-substrate/src/wake/mailbox.rs`).
-  - `InitialSchedMeta::process_id_low` + `with_process_id` builder;
-    `TaskTable::submit_with_ids(future, tid, pid)` plumbs both into
-    `Task::new_for_handle`. Old `submit_with_task_id` kept as a thin
-    wrapper. `Reactor::submit_task_with_meta` threads
-    `initial_meta.process_id_low` through.
-  - `emit_sched_begin/end` read `mailbox.process_id_low()` next to
-    `task_id_low()` and stamp both into `PayloadSchedSwitch`.
-  - Kernel submit sites updated: leader thread in `init/exec.rs` reads
-    `init.pid.0`; `sys_clone` children in
-    `init.rs::drain_pending_child_submits` read
-    `child_thread.upgrade_owner_proc()?.pid.0`.
-  - Daemon `extract_sched_ids` returns `(tid, pid)`. Writer keeps
-    `current_pid_per_hart` in lockstep with `current_task_per_hart` via
-    SpanBegin/End(Sched). When both are known, non-Sched slices route to
-    `TrackRegistry::ensure_thread_track_under_process(pid, hart, tid)`:
-    a top-level `ProcessDescriptor (pid-<N>)` parents a
-    `ThreadDescriptor (tid-<M>, pid=<N> tid=<M>)`. Verified
-    `oscomp.pftrace` carries ~60 `pid-<N>` / `tid-<M>` track pairs
-    matching each basic-musl test process.
-  - **Syscall args (separate strand finished same day):** `tx-shims`
-    `emit_syscall_enter` now emits six `ArgValue` Instants (`a0..a5`)
-    as continuations of the L0 SpanBegin. Daemon renders them as
-    `DebugAnnotation { name="value", uint_value=… }`, surfacing
-    register state in the slice arg panel; `a0..a5` are pre-populated
-    in `observe names` so they read with friendly labels.
-  - **Verification.** `cargo -q xtask unit` — 332 tests pass.
-    `cargo test -p tx-trace-daemon` — 3 integration tests pass.
-    End-to-end `cargo xtask oscomp qemu --target rv64-qemu` ran to the
-    bounded-trace threshold; extracted via `cargo xtask observe extract`,
-    pftrace'd via `cargo xtask observe pftrace`; resulting
-    `target/oscomp/pftrace/oscomp.pftrace` has ~60 distinct `(pid, tid)`
-    pairs visible in the protobuf string table.
-  - **Next:** open the regenerated pftrace in Perfetto UI and confirm
-    slice details now read `pid=<real> tid=<real>`. Also: SpanEnd
-    records currently emit at `TxTraceLevel::Boundary` regardless of
-    SpanBegin's level — daemon could correlate SpanEnd level via
-    span_id for cleaner Sched-only filters (cosmetic, not blocking).
-
-- 2026-05-18 **OBS pipeline: full-stack debugger interface from real
-  oscomp run to Perfetto UI.** Build on top of the L0/L2/L3/L4 emits
-  that landed earlier in the day; this push closes every step between
-  "kernel emits records" and "Perfetto renders readable spans" for
-  oscomp basic-musl traces.
-
-  **rv64-qemu live transport.**
-  - Static 4 MiB `.bss` ring in `boards/tx-hal-riscv64-qemu-virt`, exposed
-    via `ObserverIf::observation_ring(hart)`; sized for ~52k records
-    (full basic-musl run + headroom).
-  - `tx_observe::dump_console_hex::<P>(hart)` emits a synthesised
-    `TxTraceHeader` + the ring as hex bytes framed by
-    `TXTRACE-BEGIN bytes=… hart=… clock_hz=…` / `TXTRACE-END` sentinels.
-    Header uses `clock_id = HostNanos` + `clock_freq_hz = 1_000_000_000`
-    to match the `TS_FN = P::read_ns` source (earlier
-    `frequency_hz()` value of 10 MHz caused a 100× Perfetto inflation;
-    fixed).
-  - Hook fires from `init/exec.rs` immediately before the
-    `:userspace:exited:` sentinel — the natural init-zombify exit path.
-
-  **Bounded-trace threshold.**
-  Oscomp init never exits naturally in any reasonable wall clock (runs
-  basic-musl → busybox-musl → libctest → cyclictest → LTP back-to-back).
-  Added `OBSERVE_DUMP_THRESHOLD = 20_000` and `tx_observe::should_dump_now()`
-  / `set_dump_threshold(n)` API. `tx_kernel::thread_future::run_thread`
-  polls the flag after every syscall and, on a threshold crossing, calls
-  `dump_console_hex` + emits a `:observe:dump:threshold` sentinel +
-  `PowerIf::system_off()`. Captures a finite trace covering the early
-  test groups before the producer wraps the ring.
-
-  **xtask observe pipeline.**
-  - `cargo xtask observe extract --serial <log> --output <txtrace>` —
-    grep `TXTRACE-BEGIN`/`END` framed hex out of the captured serial
-    log, hex-decode, write a standalone `.txtrace` file.
-  - `cargo xtask observe pftrace` auto-discovers a sibling
-    `<stem>.names.json`. When absent, **auto-runs `observe names`**
-    against `target/oscomp/submit/kernel-rv` (or the standard debug-build
-    path) to generate one. End-user pipeline:
-    ```
-    cargo xtask oscomp qemu --target rv64-qemu
-    cargo xtask observe extract --serial target/oscomp/os_serial_out_rv.txt \
-                                --output /tmp/oscomp.txtrace
-    cargo xtask observe pftrace --file /tmp/oscomp.txtrace \
-                                --output /tmp/oscomp.pftrace
-    ```
-    yields a Perfetto-renderable trace with readable syscall + drive +
-    yield names — no manual name-table maintenance.
-  - `cargo xtask observe demo` rewritten to emit a realistic spec §9
-    sys_read scenario with sibling `names.json`.
-  - `cargo xtask oscomp prepare` auto-decompresses
-    `sdcard-<arch>.img.xz`/`.gz` archives to `<stem>.img` via host
-    `xz`/`gunzip`. Earlier mismatch between the GitHub release filename
-    (`.xz`) and the prepare-step expected filename (`.gz`) is gone.
-
-  **`cargo xtask observe names` — spec OBS-V1-OPNAME-1.**
-  - Walks the kernel ELF's symbol table (`object` crate + `rustc-demangle`
-    with the alternate `{:#}` form to strip v0 crate-disambiguator
-    hashes). Filters for `tx_scripts::drive::op_name_id::<S>`
-    monomorphizations and extracts each generic type parameter `S`.
-  - Hashes both bare and `<'_>`-suffixed forms with the same
-    `tx_observe::fnv1a32` the kernel uses at the call site, so the
-    resulting `name_id` matches `type_name::<S>()` regardless of whether
-    `S` carries a lifetime (rustc strips lifetimes at codegen; `type_name`
-    keeps them as `<'_>`).
-  - Static prelude carries Linux RV64 syscall numbers, fixed
-    kernel-emitted names (`resume`, `step`, `yield.*`, `wake.notify`),
-    and the ASCII mutation-tag literals (`MZSG`, `MICX`).
-  - On the captured basic-musl trace: 16 `op_name_id::<S>` monomorphs
-    resolved, all 7 distinct drive `name_id`s in the trace rendered as
-    `drive.OpenOp` / `drive.OpenFileReadOp` / `drive.OpenFileWriteOp` /
-    `drive.VmBrkOp` / `drive.NanosleepOp` / `drive.VmMapOp` /
-    `drive.VmUnmapOp`.
-
-  **Stable instant names.**
-  - `tx_observe::fnv1a32(b"…")` is now `pub const`. Single hash space for
-    every `EventNameId` source.
-  - `tx_scripts::drive` switched its anonymous instants (Resume, Step,
-    Yield-by-shape) from `EventNameId::from_raw(0)` / per-iteration
-    hashes to compile-time stable hashes: `resume`, `step`,
-    `yield.OnWaitSource`, `yield.OnAgent`, `yield.OnTimer`. Eliminates
-    the "null-name anchor" rendering and the iteration-id name-interner
-    flooding.
-  - `tx_substrate::wake::wait_source::notify_emit` switched from
-    `EventNameId::of::<WaitSource>` (`TypeId`-derived) to
-    `fnv1a32(b"wake.notify")` — same readable hash space, no `TypeId`
-    lookup needed.
-
-  **WaitGeneration → PayloadResume.wait_generation.**
-  `resolve_yield` / `resolve_on_wait_source` return
-  `(ResumeOutcome, u64)` now; the `u64` is the `WaitGeneration::raw()`
-  minted on the task's mailbox during the park. Drive forwards it to
-  `emit_resume_end`, which writes it into the wire payload. Matches the
-  value emitted on the producer side via
-  `WaitSource::notify_emit` → `PayloadWaitSourceNotify.wait_generation_low`,
-  so the daemon's `(task_id, wait_gen, kind)` flow-hash converges and
-  Perfetto draws the wake.notify → Resume flow arrow the spec's §6
-  worked example describes.
-
-  **Per-thread TID.**
-  Added `InitialSchedMeta::with_task_id(tid)` + threaded into
-  `Task::new_for_handle` → `TaskMailbox::with_task_id(...)`. Kernel
-  thread-future submit sites (`init.rs::drain_pending_child_submits`
-  and `init/exec.rs` leader-thread submit) read `child_thread.tid.0` and
-  chain `.with_task_id(tid_low)`. `ScriptCtx::task_id_low()` prefers
-  the mailbox's installed TID over the subject's leader PID, so
-  per-thread observation identity flows end-to-end.
-
-  **OBS-A-1 + OBS-A-2 enforcement.**
-  `cargo xtask observe-discipline` now also flags `tx_observe::*` emit
-  patterns inside any `#[platform_adapter(...)]`-marked module, not just
-  inside `StepOp::step` bodies. Implements the spec-recommended
-  boundary-lint extension noted in `08_OBSERVATION_v1.md` §6
-  OBS-V1-HOOK-SCOPE. The scanner reuses the same brace-depth state
-  machine; 14 unit tests pass (9 OBS-A-1, 5 OBS-A-2). Current
-  pass: 471 files / 194 StepOp impls / 56 adapter blocks — zero
-  violations.
-
-  **Daemon bugs surfaced by real Perfetto run.**
-  - `ClockSnapshot`: ns-domain timestamps emit a single-clock snapshot at
-    `BUILTIN_CLOCK_BOOTTIME=6` instead of the sequence-scoped custom
-    clock 64 without a sync path (the latter caused
-    `CLOCK_SYNC_FAILURE_NO_PATH` and dropped every packet).
-  - `TrackEventType::Instant` fixed from `4` to `3`. Perfetto's actual
-    `TrackEvent.Type` enum is `TYPE_INSTANT = 3`, `TYPE_COUNTER = 4`;
-    the old `4` made every Instant surface as a TYPE_COUNTER without a
-    `counter_value` field — the "TrackEvent with TYPE_COUNTER received
-    without a counter value" import error.
-
-  **End-to-end verification on a real oscomp basic-musl run.**
-  - `cargo xtask oscomp qemu --target rv64-qemu` ran through 32/32
-    basic-musl tests + start of busybox-musl, hit the 20k threshold,
-    dumped the ring, and powered off cleanly.
-  - `cargo xtask observe extract` recovered **4 194 376 bytes**
-    (72-byte header + 4 MiB ring).
-  - `cargo xtask observe validate` — **0 framing errors, 20002 records**
-    (`1 hart, 32768 slots/hart`).
-  - Level breakdown: **10921 L0** (syscall boundaries) / **1925 L2**
-    (drive begin/end) / **1928 L4** (step) / **10 L3** (yield/resume) /
-    **5224 L6** (mutation) — every observation level firing in real
-    production.
-  - `cargo xtask observe pftrace` auto-generated names.json from the
-    kernel ELF, daemon emitted a valid Perfetto trace with span
-    nesting `sys_read → drive.OpenFileReadOp → step` and the
-    `wake.notify ↔ Resume` flow arrows where producer-side
-    `notify_emit` fires.
-  - `cargo -q xtask unit` clean: 332/332 tests pass.
-
-  **Files of interest:**
-  - `crates/tx-observe/src/lib.rs` — dump-hex helper, threshold
-    triggers, `fnv1a32` `pub const`, per-hart `PARENT_SPANS` slot,
-    `dump_console_hex::<P>`.
-  - `crates/tx-scripts/src/drive.rs` — L2/L3/L4 emit hooks, stable
-    `EventNameId` constants, `op_name_id::<S>` via
-    `tx_observe::fnv1a32(type_name::<S>())`, `wait_gen` plumbing.
-  - `crates/tx-shims/src/linux_syscall/mod.rs` — L0 `dispatch` wrapper,
-    syscall_enter / syscall_exit emit helpers.
-  - `crates/tx-kernel/src/{init.rs,init/exec.rs,thread_future.rs}` —
-    BSP/AP `tx_observe::init` wiring, threshold-trigger check, init-exit
-    dump hook.
-  - `boards/tx-hal-riscv64-qemu-virt/src/lib.rs` — 4 MiB ring backing.
-  - `xtask/src/observe.rs` — `extract` / `names` / `pftrace` auto-discovery.
-  - `xtask/src/observe_discipline.rs` — OBS-A-1 + OBS-A-2 lint.
-  - `xtask/src/oscomp.rs` — `prepare` auto-decompression.
-  - `tools/tx-trace-daemon/src/perfetto/{writer.rs,proto.rs}` — clock
-    snapshot fix + `TrackEventType::Instant` enum value fix.
-
-  **Next steps:** OBS-9 reactor-scheduler track (sched_switch-equivalent
-  Gantt view across harts); migrate the remaining wake callers
-  (SIGCHLD/process-exit path, signalfd) onto `WaitSource::notify_emit`
-  so every yield/resume pair has matching flow arrows.
-
-  **Blocker:** none.
-
-- 2026-05-18 **OBS-3a + L0 + L4 drive observation hooks LANDED.**
-  The central `drive<S, I>` loop in `crates/tx-scripts/src/drive.rs` and
-  the Linux syscall dispatch in
-  `crates/tx-shims/src/linux_syscall/mod.rs` now emit the convergence-
-  point records the v1 observation spec calls for. The previous state
-  was "L2/L3/L4 deliberately absent" (drive.rs preamble comment); after
-  this pass `drive` opens an `L2 SpanBegin(DriveBegin)`, wraps every
-  `op.step(ctx)` call in an `L4 SpanBegin/SpanEnd(StepOutcome)` pair,
-  opens an `L3 SpanBegin(YieldBegin)` on `AcceptOutcome::Resolve`,
-  emits an `L3 Instant(Resume)` + matching `L3 SpanEnd` after
-  `resolve_yield`, and closes the drive span with
-  `L2 SpanEnd(DriveEnd)` at every exit path. `dispatch()` now wraps
-  the body of every Linux syscall in `L0 SpanBegin(SyscallEnter)` +
-  `SpanEnd(SyscallExit)` with the kernel-side `Errno` mapped to its
-  Linux numeric value via the new `Errno::linux_i32()` method.
-
-  **What changed:**
-
-  - `crates/tx-substrate/src/step/mod.rs`: Added `Errno::linux_i32()`
-    (centralises the previously-only-in-tx-shims errno → i32 mapping
-    so trace records carry meaningful Linux error codes without a
-    cycle into tx-shims). Added `trace_kind()` and `trace_value()`
-    default methods to `StepProgress` so `PayloadStepOutcome` carries
-    the progress shape and count.
-  - `crates/tx-substrate/src/step/{page_progress,entry_progress,
-    iovec_progress}.rs`: Override `trace_kind` / `trace_value` for
-    PageProgress (kind=2, pages), EntryProgress (kind=3, count), and
-    IoVecProgress (kind=4, iovecs_complete). ByteProgress (kind=1)
-    overrides in mod.rs.
-  - `crates/tx-scripts/src/drive.rs`: Replaced the early-return
-    structure with a labeled `'drive:` loop so every exit path closes
-    the L2 drive span exactly once. New `emit_drive_begin`,
-    `emit_step_begin`, `emit_step_end`, `emit_yield_begin`,
-    `emit_resume_end`, `emit_drive_end` helpers (all `#[inline]` and
-    no-op when `tx_observe::current()` is None). Uses
-    `core::any::type_name::<S>()` FNV-1a-hashed to a u32 for the
-    op_name id — avoids the `'static` bound that would have broken
-    ~22 borrowed-StepOp impls in tx-shims.
-  - `crates/tx-shims/src/linux_syscall/mod.rs`: Renamed the existing
-    `dispatch` body to `dispatch_inner` and added a thin `dispatch`
-    wrapper that emits L0 boundary spans around the call. New
-    `emit_syscall_enter` / `emit_syscall_exit` helpers map
-    `SyscallResult` variants to the `PayloadSyscallExit` shape
-    (Return=Ok, Error=Err, NoReturn/ExecCommitted/SigreturnRestored
-    all classified as NoReturn=4 so the daemon's syscall slice
-    closes cleanly when no `a0` write occurs).
-  - `crates/tx-scripts/Cargo.toml`, `crates/tx-shims/Cargo.toml`:
-    Added explicit `tx-observe` + `tx-observe-types` dependencies
-    (previously only transitive through tx-substrate).
-  - `crates/tx-scripts/tests/drive_observe.rs`: New integration test
-    (4 cases) — Done-in-first-step (4 records), Continue→Done (6
-    records), Err with linux errno=38 propagating into both L4 step
-    end and L2 drive end, Nonblocking-yield → EAGAIN translation with
-    `shape_kind=OnWaitSource=1`.
-
-  **Verified:**
-  - `cargo -q xtask unit` clean: tx-shims 229/229, tx-kernel 44/44,
-    tx-ext4 8/8, tx-scripts 50/50.
-  - `cargo test -p tx-scripts --test drive_observe -- --test-threads=1`
-    4/4 pass.
-  - `cargo test -p tx-substrate --tests -- --test-threads=1` all OBS
-    integration tests still pass (obs4_cap_trace_id 1/1,
-    obs4_convergence_point_emit 1/1, obs4_wait_source_notify_emit 5/5,
-    obs8_index_commit_emit 2/2, obs8_zone_sign_emit 2/2).
-  - `cargo xtask observe-discipline` clean (471 files, 194 StepOp
-    impls).
-  - `cargo build --target riscv64gc-unknown-none-elf -p
-    tx-kernel-riscv64-qemu-virt` clean — confirms no_std compatible.
-
-  **Follow-on landings in the same pass:**
-
-  - L0 → L2 → L4 parent span linkage via a per-hart `PARENT_SPANS:
-    [AtomicU64; MAX_HARTS]` slot in `tx-observe::lib.rs`. The
-    dispatcher swaps its L0 span id in around `dispatch_inner()`;
-    `drive()` reads the slot into the parent argument of
-    `emit_drive_begin`, then swaps the L2 span in for its own body
-    so step span begins attach to the drive span. Reactor-task
-    migration across harts is handled by the daemon-side timestamp
-    fallback (OBS-V1 §13.1) — single-hart syscall arms get exact
-    parent linkage. New integration case
-    `drive_l2_links_to_l0_parent_via_per_hart_slot` pins the
-    behavior: synthetic L0 span → drive → 6 records with
-    `record.parent` forming the L0 → L2 → L4 chain.
-  - L6 mutation gates (`zone::MUTATION_EMIT_ENABLED`,
-    `index::INDEX_MUTATION_EMIT_ENABLED`) flipped to default-on at
-    `tx_substrate::init::<P>()` BSP entry. Existing `obs8_*` tests
-    that explicitly disable the gate still pass (they `store(false,
-    Release)` before the assertion); production builds now emit
-    `MutationZoneSign` / `MutationIndexCommit` instants scoped inside
-    the L4 step that triggered them.
-
-  **Final verification (post-follow-on):**
-  - `cargo -q xtask unit` clean: 331/331 tests.
-  - `cargo test -p tx-scripts --test drive_observe -- --test-threads=1`
-    5/5 pass (added parent-linkage case).
-  - `cargo test -p tx-substrate --test obs8_zone_sign_emit
-    --test obs8_index_commit_emit -- --test-threads=1` 4/4 pass.
-  - `cargo xtask observe-discipline` clean (471 files, 194 StepOp
-    impls).
-  - `cargo build --target riscv64gc-unknown-none-elf -p
-    tx-kernel-riscv64-qemu-virt` clean.
-
-  **Next step:** wire `with_task_id(tid.0)` at thread-future mailbox
-  construction so `PayloadResume.task_id_low` and
-  `PayloadDriveBegin.task_id_low` are non-zero in production traces
-  (today they pick up the subject's PID when a `SubjectContext` is
-  populated; kernel-internal actors still emit 0). After that, only
-  OBS-9 (reactor scheduler track) and dynamic string interning
-  remain on the v1 deferred list.
-
-  **Blocker:** none.
 
 - 2026-05-18 **All 32 basic-musl OSComp tests now pass on rv64-qemu.**
   Three sessions of work on `cc/great-ptolemy-982e05` brought the count
@@ -1250,446 +633,6 @@
   file-backed VMAs) and `test_munmap` EINVAL (path through
   `try_munmap` returning `Errno::EINVAL` for a range that mmap just
   produced — needs serial log).
-- 2026-05-18 **cred hygiene pass — three follow-ups complete: lint
-  alias support, per-FS rule consolidation, and VFS walker witness
-  adoption. The cred subsystem is now the single canonical
-  authorisation seam — every DAC check site in the kernel routes
-  through `cred::checks::*`.**
-
-  Three small commits, each independently verified by `xtask unit` +
-  `lint invariants cred-check` + (where relevant) `progress validate`:
-
-  **Pass 3 — `cred::checks` aliasing** (`6864ded`)
-  Adds `use tx_subsystems::cred::checks as cred_checks;` to
-  `linux_syscall/fs_mut.rs` and `fs_path.rs`; the 7 FS cred-check
-  sites collapse from 36-char path prefix to 12. The lint's
-  `CRED_CHECK_SIGNALS` list now matches `cred_checks::require_` /
-  `cred_checks::authorize_` in addition to the fully-qualified and
-  partially-qualified forms. The alias name `cred_checks` is
-  canonical — other aliases would silently bypass the gate, with a
-  rationale comment at each use site and in the lint source.
-
-  **Pass 1 — per-FS chmod/chown rule consolidation** (`f2b9dde`)
-  The DAC rule for chmod/chown previously lived in three places:
-  `cred::checks::require_chmod` / `require_chown`,
-  `vfs::predicates::check_chmod_perm` / `check_chown_perm`, and
-  inline duplicates in `tmpfs::step_chmod` / `step_chown`. (The
-  read-only backends — `devfs`, `bdevfs`, `procfs` — all return
-  EROFS unconditionally and have no rule to consolidate.) The tmpfs
-  inline rule now delegates to `vfs::predicates::check_chmod_perm` /
-  `check_chown_perm`; same behaviour, single source of truth.
-  Defense-in-depth role preserved: if a future caller bypasses the
-  `sys_fchmodat` / `sys_fchownat` arm and reaches
-  `tmpfs::step_chmod` / `step_chown` directly, the check still
-  fires.
-
-  **Pass 2 — VFS walker mints witnesses** (`2f12b06`)
-  Adds `require_path_search_with_walker_cred(&Credential, …, &Guard)`
-  and `require_open_with_walker_cred(&Credential, …, &Guard)`
-  variants to `cred::checks` so the walker's `&Credential` (walker
-  projection) flows into the witness surface without changing the
-  walker's signature. `vfs/walker.rs::step_open` and
-  `vfs/resolution/step.rs` (per-component descend) replace their
-  direct `predicates::check_*` calls with the new variants. The
-  witness is currently dropped — the publication sites
-  (`OpenFile::new_cap_with_dentry`, etc.) don't yet consume an
-  `OpenAuthorized<'g>` token at the type level; future work threads
-  it through. But after this commit, every DAC check in the kernel
-  flows through `cred::checks::*` — `vfs::predicates::check_*` have
-  no callers outside `cred::checks` itself and the defense-in-depth
-  tmpfs layer.
-
-  **Final state of the canonical authorisation seam:**
-
-  | Site | Route |
-  |---|---|
-  | `sys_kill` / `sys_tkill` family | `signal::script_*` → `cred::require_signal_send` |
-  | `sys_unlinkat` / `sys_linkat` / `sys_mkdirat` / `sys_symlinkat` / `sys_renameat2` | `cred_checks::authorize_*` |
-  | `sys_fchmodat` / `sys_fchownat` | `cred_checks::authorize_*` (+ tmpfs defense-in-depth via `vfs::predicates::*`) |
-  | VFS walker (search) | `cred::checks::require_path_search_with_walker_cred` |
-  | VFS walker (`step_open`) | `cred::checks::require_open_with_walker_cred` |
-
-  **Verification:** `cargo -q xtask unit` — tx-shims 233, tx-kernel
-  44, tx-ext4 8, tx-scripts 50 (335 total). `cargo test
-  -p tx-subsystems --lib` — **686** (+1 walker-variant agreement
-  test). `cargo xtask lint invariants cred-check` — 9 audited, 3
-  allow-listed, 0 violations.
-
-  Commits:
-  - `6864ded` cred: alias cred::checks → cred_checks at tx-shims call sites
-  - `f2b9dde` tmpfs: consolidate step_chmod / step_chown rule into vfs::predicates
-  - `2f12b06` cred: walker mints SearchAuthorized / OpenAuthorized via require_*_with_walker_cred
-
-  **Open follow-up:** `OpenFile::new_cap_with_dentry` (and similar
-  publication sites) could consume an `OpenAuthorized<'g>` token as
-  a type-level witness of "the cred check ran before publication".
-  Not a security gap; purely an architectural alignment item per
-  `cred_service_v_1` §"Minting rule" (cred authorises; subsystems
-  publish). Today the witness is minted at the walker and dropped;
-  threading it to the publication site adds a type-system anchor
-  but no behavioural change. Defer until the next cred-touched
-  feature has a natural reason to lift it.
-
-- 2026-05-18 **cred hygiene: extend `authorize_*` combinator family to
-  the FS surface. Seven syscall arms collapse from 5–7 line guard-
-  scope-and-match blocks to uniform 3-line `if let Err(e) =
-  authorize_X(...) { return error_from(e); }`. Saves ~37 lines of
-  boilerplate; eliminates one error-style divergence (`if let Err`
-  vs `let _auth = match`).**
-
-  Before: two of the seven cred-checked FS arms used
-  `if let Err(e) = require_chmod(...)` while the other five used
-  `let _auth = match require_X(...) { Ok(w) => w, Err(e) => return ...; }`.
-  Same intent, divergent style. The guard scope was open at every
-  call site, leaving the no-nested-guard discipline as a hidden
-  contract reviewers had to remember.
-
-  After: every `require_*` (FS family) gets a sibling `authorize_*`
-  combinator that takes its own guard, runs the predicate, drops the
-  witness, and returns `Result<(), Errno>`. Matches the established
-  shape of `authorize_signal_send`.
-
-  New in [cred/checks.rs](../../crates/tx-subsystems/src/cred/checks.rs):
-
-  ```rust
-  authorize_path_search(snapshot, meta)                                   -> Result<(), Errno>
-  authorize_open(snapshot, meta, flags)                                   -> Result<(), Errno>
-  authorize_unlink(snapshot, parent, child)                               -> Result<(), Errno>
-  authorize_link(snapshot, new_parent)                                    -> Result<(), Errno>
-  authorize_rename(snapshot, op, oc, np, displaced)                       -> Result<(), Errno>
-  authorize_chmod(snapshot, target, new_mode)                             -> Result<(), Errno>
-  authorize_chown(snapshot, target, new_uid, new_gid)                     -> Result<(), Errno>
-  ```
-
-  The 7 FS arms (`sys_unlinkat`, `sys_linkat`, `sys_mkdirat`,
-  `sys_symlinkat`, `sys_renameat2`, `sys_fchmodat`, `sys_fchownat`)
-  refactored to the uniform shape. `require_*` predicates stay
-  available unchanged for sites that genuinely want to hold the typed
-  `*Authorized<'g>` witness across a separate commit step.
-
-  6 new unit tests pin the `authorize_*` / `require_*` agreement
-  contract (each combinator agrees with its predicate on both
-  permit and deny). Lint unaffected — `cred::checks::authorize_`
-  was already a CRED_CHECK_SIGNAL prefix for the signal-side
-  combinator; FS sites now match the same prefix.
-
-  **Verification:** `cargo -q xtask unit` — tx-shims **233/233**,
-  tx-kernel 44, tx-ext4 8, tx-scripts 50. `cargo test
-  -p tx-subsystems --lib` — **685/685** (+6 new authorize_*
-  agreement tests). `cargo xtask lint invariants cred-check` —
-  9 audited, 3 allow-listed, 0 violations.
-
-  Commit: `02af0f3` cred: hygiene — extend authorize_* combinator family to the FS surface
-
-  **Next step:** Per-FS `step_chmod` / `step_chown` rule consolidation
-  (delete the redundant per-FS check, have the step body consume the
-  witness or trust the syscall-arm gate). Touches `tmpfs`, `devfs`,
-  `bdevfs`, `procfs`, possibly ext4.
-
-- 2026-05-18 **Cred migration complete: `require_rename` / `require_chmod` /
-  `require_chown` land, the new `xtask lint invariants cred-check`
-  CI gate enforces the floor, and two more bypasses
-  (`sys_mkdirat` / `sys_symlinkat`) it discovered are closed.**
-
-  This wraps the cred-snapshot wiring batch. Three new
-  `cred::checks::require_*` predicates land, three remaining VFS
-  mutator syscall arms (`sys_renameat2`, `sys_fchmodat`,
-  `sys_fchownat`) consume them; a static lint scans every
-  `pub(super) fn sys_*` in tx-shims and fails CI if a cred-relevant
-  mutator runs without an authorization gate.
-
-  **New `cred::checks::*` predicates**
-  ([cred/checks.rs](../../crates/tx-subsystems/src/cred/checks.rs)):
-  - `RenameAuthorized<'g>` + `require_rename(snapshot, old_parent_meta,
-    old_child_meta, new_parent_meta, displaced_child, &guard)` — composes
-    the unlink-side rule on (old_parent, old_child), the create rule on
-    new_parent, and (if displacing) the unlink-side rule on
-    (new_parent, displaced).
-  - `ChmodAuthorized<'g>` + `require_chmod(snapshot, target_meta,
-    new_mode, &guard)` — owner OR CAP_FOWNER OR euid 0 → EPERM otherwise.
-  - `ChownAuthorized<'g>` + `require_chown(snapshot, target_meta,
-    new_uid, new_gid, &guard)` — privileged callers (CAP_FOWNER) may
-    set arbitrary uid/gid; non-privileged callers may only set their
-    own. Matches the existing per-FS rule.
-
-  **New `vfs::predicates::*`**
-  ([vfs/predicates.rs](../../crates/tx-subsystems/src/vfs/predicates.rs)):
-  - `check_link_perm(new_parent, cred)` (W+X only, no sticky).
-  - `check_chmod_perm(meta, cred)`.
-  - `check_chown_perm(meta, new_uid, new_gid, cred)`.
-
-  **Five `sys_*` arms wired**
-  ([fs_mut.rs](../../crates/tx-shims/src/linux_syscall/fs_mut.rs),
-  [fs_path.rs](../../crates/tx-shims/src/linux_syscall/fs_path.rs)):
-  - `sys_renameat2` — pre-walks old child + both parents + (best-effort)
-    displaced new path, runs `require_rename` inside the commit guard
-    scope, then drives `RenameOp`. Closes a real bypass: previously
-    `RenameOp` did no cred check.
-  - `sys_fchmodat` / `sys_fchownat` — pre-walk target, run
-    `require_chmod` / `require_chown` at the syscall arm. The per-FS
-    `step_chmod` / `step_chown` rule remains as defense-in-depth; full
-    consolidation (deleting the per-FS rule and consuming the witness
-    inside the step body) is the next layering step.
-  - `sys_mkdirat` / `sys_symlinkat` — consume `require_link` (W+X on
-    parent; sticky-irrelevant for name creation). Discovered by the
-    new lint.
-
-  **`xtask lint invariants cred-check`**
-  ([xtask/src/lint_invariants_cred_check.rs](../../xtask/src/lint_invariants_cred_check.rs)):
-  - Walks every `pub(super) (async )? fn sys_*` in
-    `crates/tx-shims/src/linux_syscall/`, extracts the body via
-    brace-depth tracking.
-  - If body matches any [`MUTATOR_SIGNALS`] (signal-send primitives,
-    StepOp wraps for kill / rename / chmod / chown / mkdir / etc.,
-    `fs_ops.unlink` / `link` / `rename` / `mkdir` / `symlink` /
-    `create_inode` / `step_chmod` / `step_chown` / `step_truncate`)
-    AND matches *no* [`CRED_CHECK_SIGNALS`] (`cred::checks::require_*`,
-    `cred::checks::authorize_*`, the legacy `cred::require_*`
-    re-exports, `signal::script_kill_*` / `script_deliver_signal`):
-    flag.
-  - Allow-list with rationale: `sys_tgkill` (tgid==caller-pid),
-    `sys_write` (hot-path fd grant + kernel-synthesised SIGPIPE
-    self-send), `sys_ftruncate` (hot-path fd grant).
-  - No ratchet — fails on any violation. Current state: 9 audited
-    mutator arms, 3 allow-listed, 0 violations.
-
-  **Audit closure scorecard.** Seven real cred-bypass paths closed
-  across the cred-snapshot wiring batch + this completion:
-
-  | Syscall | Status | Closure |
-  |---|---|---|
-  | `sys_kill` (pid > 0) | ✅ | `script_kill_process` |
-  | `sys_kill` (pid == 0 pgrp) | ✅ | `script_kill_pgrp` |
-  | `sys_tkill` (thread) | ✅ | `script_deliver_signal` |
-  | `sys_unlinkat` | ✅ | `require_unlink` |
-  | `sys_linkat` | ✅ | `require_link` |
-  | `sys_renameat2` | ✅ | `require_rename` |
-  | `sys_mkdirat` | ✅ | `require_link` |
-  | `sys_symlinkat` | ✅ | `require_link` |
-  | `sys_fchmodat` | ✅ | `require_chmod` at arm + per-FS as defense |
-  | `sys_fchownat` | ✅ | `require_chown` at arm + per-FS as defense |
-  | `sys_tgkill` | ⚠️ allow-listed (tgid==caller-pid trivially permits) |
-
-  **Tests (16 new across this batch):** 13 in `cred/tests.rs`
-  (6 `require_rename` branches, 3 `require_chmod`, 4 `require_chown`)
-  + 1 `dispatch_renameat2_without_parent_write_returns_neg_eacces`
-  dispatch regression + 2 mkdir/symlink negative paths covered by
-  the lint enforcement.
-
-  **Verification:** `cargo -q xtask unit` — tx-shims **233/233**
-  (+1 EACCES dispatch test over the 232 baseline), tx-kernel 44/44,
-  tx-ext4 8/8, tx-scripts 50/50. `cargo test -p tx-subsystems --lib`
-  — **679/679** (+13 unit tests over 666 baseline).
-  `cargo xtask lint invariants cred-check` — 9 audited, 3 allow-listed,
-  0 violations.
-
-  Commits:
-  - `e2748b1` cred: complete migration — require_rename / require_chmod / require_chown
-  - `b675870` lint: cred-check — every cred-mutator syscall arm must be gated
-
-  **Open follow-ups (not security gaps, layering / hygiene):**
-  - Per-FS `step_chmod` / `step_chown` rule still exists alongside
-    `require_*` (defense-in-depth). Consolidation is a separate cleanup.
-  - VFS walker still consumes inline `vfs::predicates` directly rather
-    than minting `SearchAuthorized` / `OpenAuthorized` witnesses for the
-    cred chain. Behaviour identical; witness chain not yet intact at
-    walker mint sites.
-  - Cross-process `sys_tgkill` will need `script_deliver_signal` routing
-    when the tgid-must-match-caller-pid constraint is lifted.
-
-  **Next step:** Land the per-FS chmod/chown rule deletion (consume the
-  witness inside step body) once `FsOps::step_chmod` / `step_chown` take
-  `&CredSnapshot` or the equivalent.
-
-- 2026-05-18 **`require_unlink` + `require_link` close the two
-  remaining cred-bypass paths in the VFS mutator surface.**
-
-  Follow-up to the snapshot-wiring batch. The end-to-end witness
-  audit on `sys_unlinkat` and `sys_linkat` found that neither
-  enforced any POSIX permission rule beyond what the walker checked
-  (search-on-ancestors only). Anyone with X on a directory could
-  `rm` or hard-link files inside it regardless of the directory's W
-  bit or sticky-bit ownership rule.
-
-  **New cred::checks predicates** ([cred/checks.rs](../../crates/tx-subsystems/src/cred/checks.rs)):
-  - `UnlinkAuthorized<'g>` + `require_unlink(snapshot,
-    parent_meta, child_meta, &guard)` — POSIX rule: W+X on parent
-    (EACCES), plus S_ISVTX → owner-of-child / owner-of-parent /
-    CAP_FOWNER / euid 0 (EPERM). CAP_DAC_OVERRIDE bypasses the
-    W bit but NOT sticky (POSIX-correct).
-  - `LinkAuthorized<'g>` + `require_link(snapshot, new_parent_meta,
-    &guard)` — POSIX rule: W+X on new parent (EACCES). Sticky NOT
-    consulted (sticky governs *removal*, not name creation).
-
-  **New vfs::predicates** ([vfs/predicates.rs](../../crates/tx-subsystems/src/vfs/predicates.rs)):
-  - `check_unlink_perm(parent, child, cred)` — bit-level body
-    (W+X check + sticky-bit ownership rule).
-  - `check_link_perm(new_parent, cred)` — W+X only.
-
-  **Two `sys_*` arms rewired**
-  ([tx-shims/.../fs_mut.rs](../../crates/tx-shims/src/linux_syscall/fs_mut.rs)):
-  - `sys_unlinkat` consumes `UnlinkAuthorized<'g>` inside the commit
-    guard scope, before `FsOps::unlink` / `FsOps::rmdir`. Cred check
-    fires *before* any FS mutation.
-  - `sys_linkat` consumes `LinkAuthorized<'g>` similarly.
-
-  **Tests:** 11 new (7 + 4). `cred/tests.rs` covers all unlink
-  branches (owner-passes, no-W-EACCES, DAC_OVERRIDE bypass for W,
-  sticky-EPERM, sticky-permits-child-owner, sticky-not-bypassed-
-  by-DAC_OVERRIDE, sticky-CAP_FOWNER-bypass) and link branches
-  (owner-passes, no-W-EACCES, DAC_OVERRIDE bypass, sticky-irrelevant).
-  `file_mutation.rs` adds two dispatch regressions:
-  `dispatch_unlinkat_without_parent_write_returns_neg_eacces` and
-  `dispatch_linkat_without_new_parent_write_returns_neg_eacces` —
-  non-root caller in tmpfs-root (mode 0o755 owned by root) gets
-  -EACCES and the file/link is not minted.
-
-  **Verification:** `cargo -q xtask unit`: tx-shims **232/232**
-  (+2 EACCES dispatch tests over the snapshot-batch baseline of
-  230), tx-kernel 44/44, tx-ext4 8/8, tx-scripts 50/50.
-  `cargo test -p tx-subsystems --lib`: **666/666** (+11 unit tests
-  over the 655 baseline).
-
-  Commits:
-  - `a70a61f` cred: add require_unlink + close sys_unlinkat permission bypass
-  - `<this commit>` cred: add require_link + close sys_linkat permission bypass
-
-  **Audit summary across the cred-snapshot batch + these
-  follow-ups:** five real cred-bypass paths closed (`sys_kill`
-  pid > 0, `sys_kill` pgrp, `sys_tkill`, `sys_unlinkat`,
-  `sys_linkat`); `sys_tgkill` left intentionally
-  unmodified (tgid==caller-pid constraint trivially permits);
-  `sys_fchmodat` / `sys_fchownat` already cred-checked but the
-  rule lives in each FS impl rather than at the canonical
-  `cred::checks::*` seam (consolidation deferred —
-  `require_chmod` / `require_chown` would be the canonical site
-  and FS impls delegate); `sys_renameat2` is the remaining
-  open audit item (write-on-both-parents + sticky-on-old-parent
-  not enforced).
-
-  **Next step:** Either `require_rename` to close the last
-  identified bypass, or consolidate the per-FS chmod/chown
-  cred checks into `require_chmod` / `require_chown` at the
-  canonical seam.
-
-- 2026-05-18 **Cred snapshot lifted to first-class type; cred → signal
-  authorization fully rewired through it.**
-
-  Per `cred_service_v_1` §"In flight", the script-side credential
-  is supposed to be a by-value metadata copy captured *once* at
-  syscall entry, not a live re-read of `ProcessPayload.cred` on every
-  check. The slot for it on `SyscallCtx` had been reserved (the
-  `_lifetime` field's comment at
-  [ctx.rs:31](../../crates/tx-shims/src/linux_syscall/ctx.rs)
-  literally said "future cred snapshot field"); the actual type
-  + capture + threading didn't exist. This batch lands it and
-  rewires every cred-consuming subsystem boundary through it.
-
-  **New core types** ([cred/mod.rs](../../crates/tx-subsystems/src/cred/mod.rs)):
-  - `CredSnapshot` — `Copy` `must_use` wrapper around `Cred` with
-    `from_cred` / `root` / `cred` / `as_cred` / `is_privileged_for`.
-    `From<Cred>` + `AsRef<Cred>`. Future fields (generation tag for
-    racing-setuid, NOSUID hint, retained `Cap<Cred>`) land here
-    without touching call sites.
-  - `ProcessIdentity::cred_snapshot()` → `Option<CredSnapshot>`
-    (`None` for zombies). `ProcessPayload::cred_snapshot()` →
-    `CredSnapshot` (one `AtomicSlot` load + cap deref + value-copy).
-  - `SyscallCtx.cred_snapshot: CredSnapshot` field, captured once
-    in `SyscallCtx::new`. `ctx.cred()` reads from the cached
-    snapshot; `ctx.cred_snapshot()` borrows it; `ctx.walker_cred()`
-    projects directly via the new `From<&CredSnapshot> for
-    vfs::Credential` bridge — every VFS DAC entry traces back to the
-    single syscall-entry snapshot.
-
-  **`cred::checks::*` module** ([cred/checks.rs](../../crates/tx-subsystems/src/cred/checks.rs))
-  — the canonical authorization surface per `cred_service_v_1`
-  §"Checks surface" + §"Cred witnesses":
-  - Witness predicates (zero-sized, guard-bound, `must_use`):
-    `SearchAuthorized<'g>`, `OpenAuthorized<'g>`, plus re-export of
-    the existing `SignalAuthorized<'g>`.
-  - `require_path_search(&CredSnapshot, &InodeMeta, &Guard)` /
-    `require_open(.., OpenFileFlags, &Guard)` — delegate the bit-
-    level DAC math to `vfs::predicates` and wrap the result.
-  - `authorize_signal_send(source, target, sig) -> Result<AuthOutcome,
-    Errno>` + `_under_guard` fanout variant — combinators that
-    fold the repeating snapshot+facts+require sequence into one
-    call, take and drop the auth guard internally so the no-nested-
-    guard discipline is a property of the function (not a hidden
-    contract).
-
-  **`signal::script_*` reworks** ([signal/mod.rs](../../crates/tx-subsystems/src/signal/mod.rs)):
-  - `script_kill_process` / `script_kill_probe` /
-    `script_kill_pgrp_with_guard` rewired through the combinator;
-    `info: Option<SigInfo>` added to `script_kill_process` so the
-    SI_USER block sys_kill builds is preserved.
-  - New `script_deliver_signal(source, target, sig)` —
-    cred-checked counterpart to `deliver_posix_signal`. Resolves
-    Thread→Process before the auth guard scope (`upgrade_owner_proc`
-    takes its own guard).
-
-  **Closed three real cred-bypasses** in
-  [tx-shims/linux_syscall/signal.rs](../../crates/tx-shims/src/linux_syscall/signal.rs):
-  1. `sys_kill` (pid > 0) drove `KillProcessOp` →
-     `step_kill_process` directly, skipping `cred::require_signal_send`.
-     Now routes through `script_kill_process`.
-  2. `sys_kill` (pid == 0 pgrp fanout) called `step_kill_pgrp` —
-     no per-member cred check. Now `script_kill_pgrp`. POSIX-correct
-     behaviour change: returns `-EPERM` when no member was both live
-     AND permitted (was `-ESRCH`).
-  3. `sys_tkill` (thread tid resolved via PidName) drove
-     `DeliverSignalOp` without cred check. Now `script_deliver_signal`.
-  4. `sys_tgkill` left unchanged: tgid==caller-pid constraint means
-     check trivially permitted; comment notes the future migration
-     site for cross-process tgkill.
-
-  **`SyscallResult` / `Errno` bridge**
-  ([result.rs](../../crates/tx-shims/src/linux_syscall/result.rs)):
-  - `SyscallResult::error_from(errno)` + `impl From<Errno> for
-    SyscallResult` — collapses `errno_to_i32` translation at error paths.
-  - `dispatch_errno(Result<T, Errno>, FnOnce(T) -> SyscallResult)`
-    — folds the recurring `match script(...) { Ok(_) => map, Err(e)
-    => Error(errno_to_i32(e)) }` boilerplate.
-  - Mechanical sweep: 164 sites across 14 arm files collapsed from
-    `SyscallResult::Error(errno_to_i32(X))` to
-    `SyscallResult::error_from(X)`.
-
-  **Tests added (8 new):** `cred_snapshot_freezes_value_against_later_mutation`,
-  `cred_snapshot_root_constructor_matches_root_cred`,
-  `cred_snapshot_returns_none_for_zombie`,
-  `require_path_search_passes_for_dac_override`,
-  `require_path_search_denies_without_x_bit`,
-  `require_open_honors_read_and_write_bits`,
-  `script_deliver_signal_to_thread_{denied_for_mismatched_uid,
-  delivers_when_authorized}`, `authorize_signal_send_yields_three_state_outcome`,
-  `dispatch_kill_different_uid_returns_neg_eperm`.
-
-  **Verification:** `cargo -q xtask unit`: tx-shims **230/230** (+1
-  EPERM dispatch test), tx-kernel 44/44, tx-ext4 8/8,
-  tx-scripts 50/50. `cargo test -p tx-subsystems --lib` —
-  **655/655** (+6 cred/signal tests, 11 ignored).
-
-  Commits:
-  - `68c5499` cred: lift syscall-entry CredSnapshot to first-class type
-  - `0b45030` cred: thread CredSnapshot through signal authorization checks
-  - `446b553` cred: project CredSnapshot directly into VFS walker Credential
-  - `a2dbf80` cred: land cred::checks witness API per cred_service_v_1
-  - `32769d4` cred: enforce kill permission at sys_kill via script_kill_process
-  - `6d27c78` cred: close remaining kill-family permission bypasses
-  - `b737739` cred: extract authorize_signal_send combinator (snapshot + facts + check)
-  - `4ac80d8` tx-shims: land SyscallResult::error_from + dispatch_errno bridges
-
-  **Scope gaps (deferred, not regressed):** Supplementary group list,
-  `fsuid`/`fsgid`, capability bounding/inheritable/ambient sets, full
-  `capset` semantics — all still day-1 elisions per the original
-  `cred_service_v_1` deferred list. `RestrictionStackHandle` remains
-  a placeholder zone (PR-K territory). `cred::checks::*` covers
-  path_search / open / signal_send; `require_unlink` / `require_chmod`
-  / `require_setuid` land alongside the syscall arms that need them.
-
-  **Next step:** Either write the `docs/progress/decisions/` deep
-  dive (this STATUS entry is the summary), or pick up the next
-  cred-adjacent gap — `cred::checks::require_unlink` + migration of
-  one VFS execution call site to consume the witness end-to-end.
 
 - 2026-05-18 **ext4 mount-time RO/RW distinction + Linux `MS_RDONLY` honoured.**
   Previously `mount_ext4_read_only` was the only entry point and its

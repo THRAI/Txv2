@@ -91,7 +91,8 @@ use tx_subsystems::signal::Signum;
 use tx_subsystems::signal::{ast_dispatch, AstOutcome};
 use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload_into;
 use tx_subsystems::thread_runtime::{
-    clear_current_thread_payload, set_current_thread_payload, ThreadIdentity, ThreadPayload,
+    clear_current_thread_payload, clear_current_userspace_payload, set_current_thread_payload,
+    set_current_userspace_payload, ThreadIdentity, ThreadPayload,
 };
 use tx_subsystems::vm::{AccessMode, UserVirtAddr, VmFault};
 
@@ -404,6 +405,7 @@ pub async fn run_thread<P: TxPlatform>(
             "checkpoint_userspace_entry_batch must succeed with the freshly-started \
              entry-side request"
         );
+
         // ----------------------------------------------------------------
         // (2) BUILD MERGED CONTEXT AND DIVE INTO USERSPACE.
         //
@@ -443,6 +445,8 @@ pub async fn run_thread<P: TxPlatform>(
                 let mut ctx = tx_hal::UserTrapContext::empty();
                 prepare_userspace_entry_payload_into(&payload, &mut ctx);
                 payload.set_active_userspace_request(Some(entry_token));
+                let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
+                let _prev_userspace = set_current_userspace_payload(entry_hart, payload.clone());
                 <P as TrapIf>::enter_userspace_with_context(&ctx, root);
             } else {
                 return;
@@ -463,11 +467,19 @@ pub async fn run_thread<P: TxPlatform>(
         // the next poll.
         // ----------------------------------------------------------------
         let trap = entry_wait.await;
+        let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
+        if !matches!(trap, UserspaceTrapInfo::TimerPreempt) {
+            let _ = clear_current_userspace_payload(entry_hart);
+        }
+        payload.set_active_userspace_request(None);
 
         // ----------------------------------------------------------------
         // (4) DISPATCH THE RESOLVED TRAP.
         // ----------------------------------------------------------------
         match trap {
+            UserspaceTrapInfo::TimerPreempt => {
+                tx_reactor::yield_now().await;
+            }
             UserspaceTrapInfo::Syscall(req) => {
                 // Resolve the syscall context from the payload.
                 let Some(process) = thread.upgrade_owner_proc() else {
@@ -485,17 +497,18 @@ pub async fn run_thread<P: TxPlatform>(
                 );
                 // drive-taskmb: inject the current task's mailbox so
                 // drive() can park on it for yield resolution.
-                if let Some(mailbox) = tx_reactor::current_task_mailbox() {
+                let hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
+                if let Some(mailbox) = tx_reactor::current_task_mailbox(hart) {
                     ctx = ctx.with_mailbox(mailbox);
                 }
                 // drive-taskmb: inject the reactor's timer wheel for
                 // OnTimer yield resolution.
-                if let Some(tw) = tx_reactor::current_timer_wheel() {
+                if let Some(tw) = tx_reactor::current_timer_wheel(hart) {
                     ctx = ctx.with_timer_wheel(tw);
                 }
                 // drive-taskmb: inject the reactor's delegate registry
                 // for OnAgent yield resolution.
-                if let Some(dr) = tx_reactor::current_delegate_registry() {
+                if let Some(dr) = tx_reactor::current_delegate_registry(hart) {
                     ctx = ctx.with_delegate_registry(dr);
                 }
                 let result = tx_shims::linux_syscall::dispatch::<P>(req, &ctx).await;

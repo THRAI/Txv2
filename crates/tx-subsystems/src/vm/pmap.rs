@@ -1,7 +1,4 @@
-use crate::vm::adapter::step_engine::{
-    page_allocator::BitmapPageAllocator, AddressSpaceShootdownBatch, ShootdownError, SpinMutex,
-    ZoneError,
-};
+use crate::vm::adapter::step_engine::{SpinMutex, ZoneError};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 #[cfg(test)]
@@ -14,8 +11,6 @@ use tx_hal::{
 use crate::page_backed::MaterializedPagePin;
 
 use super::{Prot, UserPage, UserRange, USER_PAGE_SIZE};
-
-const TEARDOWN_BATCH_PAGES: usize = 64;
 
 type ReserveMappingFn = fn(
     &PmapRoot,
@@ -103,7 +98,6 @@ pub enum VmPmapError {
     MissingReservation,
     AlreadyMappedDrift,
     MappingMismatch,
-    ShootdownAccounting(ShootdownError),
 }
 
 impl From<PmapError> for VmPmapError {
@@ -239,21 +233,9 @@ impl VmPmap {
                     return Err(error);
                 }
             };
-            let mut batch = AddressSpaceShootdownBatch::<
-                BitmapPageAllocator<'static>,
-                TEARDOWN_BATCH_PAGES,
-            >::new(self.asid());
             match existing.into_pin() {
                 MaterializedPagePin::Allocated(map_pin) => {
-                    match batch.push_page_unmap_result(result, map_pin) {
-                        Ok(()) => {}
-                        Err(error) => {
-                            let reason = error.reason();
-                            core::mem::forget(error.into_map_pin());
-                            return Err(VmPmapError::ShootdownAccounting(reason));
-                        }
-                    }
-                    batch.issue_and_release_with(self.ops.shootdown_mappings);
+                    self.issue_single_unmap_result(result, MaterializedPagePin::Allocated(map_pin));
                 }
                 MaterializedPagePin::Device(_) => {
                     (self.ops.shootdown_mappings)(self.asid(), &[result.invalidation()]);
@@ -289,10 +271,6 @@ impl VmPmap {
     /// next access to the affected pages refaults, observes the new recipe
     /// protection, and republishes with the demoted permissions.
     pub fn teardown_range(&self, range: UserRange) -> Result<usize, VmPmapError> {
-        let mut batch = AddressSpaceShootdownBatch::<
-            BitmapPageAllocator<'static>,
-            TEARDOWN_BATCH_PAGES,
-        >::new(self.asid());
         let mut removed = 0;
 
         for page in range.iter_pages() {
@@ -304,45 +282,12 @@ impl VmPmap {
                 Ok(result) => result,
                 Err(error) => {
                     self.state.lock().mappings.insert(page, mapping);
-                    if !batch.is_empty() {
-                        self.issue_batch(batch);
-                    }
                     return Err(error);
                 }
             };
-            match mapping.into_pin() {
-                MaterializedPagePin::Allocated(map_pin) => {
-                    match batch.push_page_unmap_result(result, map_pin) {
-                        Ok(()) => {}
-                        Err(error) if error.reason() == ShootdownError::Full => {
-                            let map_pin = error.into_map_pin();
-                            batch = self.issue_batch(batch);
-                            if let Err(error) = batch.push_page_unmap_result(result, map_pin) {
-                                let reason = error.reason();
-                                core::mem::forget(error.into_map_pin());
-                                return Err(VmPmapError::ShootdownAccounting(reason));
-                            }
-                        }
-                        Err(error) => {
-                            let reason = error.reason();
-                            core::mem::forget(error.into_map_pin());
-                            return Err(VmPmapError::ShootdownAccounting(reason));
-                        }
-                    }
-                }
-                MaterializedPagePin::Device(_) => {
-                    if !batch.is_empty() {
-                        batch = self.issue_batch(batch);
-                    }
-                    (self.ops.shootdown_mappings)(self.asid(), &[result.invalidation()]);
-                    self.state.lock().shootdowns += 1;
-                }
-            }
+            self.issue_single_unmap_result(result, mapping.into_pin());
+            self.state.lock().shootdowns += 1;
             removed += 1;
-        }
-
-        if !batch.is_empty() {
-            self.issue_batch(batch);
         }
         Ok(removed)
     }
@@ -420,18 +365,11 @@ impl VmPmap {
         Ok(result)
     }
 
-    fn issue_batch(
-        &self,
-        batch: AddressSpaceShootdownBatch<
-            'static,
-            BitmapPageAllocator<'static>,
-            TEARDOWN_BATCH_PAGES,
-        >,
-    ) -> AddressSpaceShootdownBatch<'static, BitmapPageAllocator<'static>, TEARDOWN_BATCH_PAGES>
-    {
-        batch.issue_and_release_with(self.ops.shootdown_mappings);
-        self.state.lock().shootdowns += 1;
-        AddressSpaceShootdownBatch::new(self.asid())
+    fn issue_single_unmap_result(&self, result: tx_hal::PmapUnmapResult, pin: MaterializedPagePin) {
+        (self.ops.shootdown_mappings)(self.asid(), &[result.invalidation()]);
+        if let MaterializedPagePin::Allocated(map_pin) = pin {
+            drop(map_pin);
+        }
     }
 }
 

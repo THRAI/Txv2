@@ -62,7 +62,14 @@ pub mod wait_routing {
 
     /// Delegates to `tx_substrate::wake::new_source`.
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
-        tx_substrate::wake::new_source(source_id)
+        let source = tx_substrate::wake::new_source(source_id);
+        tx_substrate::wake::register_source(Arc::clone(&source));
+        source
+    }
+
+    /// Delegates to `tx_substrate::wake::unregister_source`.
+    pub fn unregister_source(source_id: u64) {
+        tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
     }
 
     /// Delegates to `tx_reactor::wait::fire_legacy`.

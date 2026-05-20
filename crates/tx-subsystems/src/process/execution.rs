@@ -361,7 +361,7 @@ pub fn step_fork<P: PmapIf>(
             payload.nsproxy_cap(),
             payload.cred(),
             payload.cwd(),
-            payload.snapshot_fds(),
+            payload.clone_fds_for_fork(),
             payload.fd_cloexec_snapshot(),
             payload.brk_base(),
             payload.current_brk(),
@@ -1532,6 +1532,7 @@ impl StepOp<crate::process::ProcessIdentity> for DupOp {
             Some(f) => f,
             None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
         };
+        super::structure::incr_pipe_fd_ref(&file);
         let newfd = self.process.allocate_fd();
         let _ = self.process.set_fd(newfd, Some(file));
         self.process.set_fd_cloexec(newfd, false);
@@ -1567,6 +1568,7 @@ impl StepOp<crate::process::ProcessIdentity> for Dup3Op {
             Some(f) => f,
             None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
         };
+        super::structure::incr_pipe_fd_ref(&file);
         let _prev = self.process.install_fd(self.newfd, file);
         let want_cloexec = self.flags & O_CLOEXEC != 0;
         self.process.set_fd_cloexec(self.newfd, want_cloexec);
@@ -1627,6 +1629,7 @@ impl StepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {
         }
         let new_fd = self.process.allocate_fd_at_least(self.min);
         let file = self.process.fd(self.fd).unwrap();
+        super::structure::incr_pipe_fd_ref(&file);
         let _prev = self.process.install_fd(new_fd, file);
         self.process.set_fd_cloexec(new_fd, self.cloexec);
         StepOutcome::Done(new_fd)
