@@ -40,6 +40,10 @@ const BSP_REACTOR_TIMER_WAIT_SPINS: usize = 20_000;
 pub(crate) const IDLE_TIMER_PERIOD_NS: u64 = 5_000_000; // 5 ms
 
 static BOOT_REACTOR: boot_runtime::SharedReactor = boot_runtime::SharedReactor::empty();
+/// Switched to true when the userspace reactor phase begins, enabling
+/// the concurrent poll path on all harts.
+pub(super) static USE_CONCURRENT_POLL: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 
@@ -74,6 +78,8 @@ static MUSL_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
 /// `register_console_hardware`; consulted by
 /// `register_devfs_console_alias` to publish `/dev/console`.
 static CONSOLE_TTY: SpinMutex<Option<Cap<TtyIdentity>>> = SpinMutex::new(None);
+static THREAD_REACTOR_TASKS: SpinMutex<alloc::vec::Vec<(u32, boot_runtime::TaskKey)>> =
+    SpinMutex::new(alloc::vec::Vec::new());
 
 /// Snapshot the boot-time root mount cap. Returns `None` until
 /// `mount_rootfs_tmpfs` has run (test pre-bootstrap or boot-time
@@ -94,6 +100,12 @@ pub fn dev_mount() -> Option<Cap<MountIdentity>> {
 /// `register_console_hardware` has run.
 pub fn console_tty() -> Option<Cap<TtyIdentity>> {
     CONSOLE_TTY.lock().clone()
+}
+
+pub(crate) fn mark_boot_reactor_userspace_preempt(cpu_id: CpuId) {
+    let _ = BOOT_REACTOR.with(|reactor| {
+        reactor.mark_userspace_preempt(boot_runtime::HartId(cpu_id.0));
+    });
 }
 
 #[cfg(test)]
@@ -176,8 +188,6 @@ pub struct CoreInit<P: TxPlatform> {
 }
 
 mod exec;
-mod procfs_mount;
-mod rootfs_shims;
 
 impl<P: TxPlatform> CoreInit<P> {
     pub fn boot(handoff: BootHandoff) -> ! {
@@ -236,21 +246,6 @@ impl<P: TxPlatform> CoreInit<P> {
     fn init_substrate_if_ready(handoff: BootHandoff) {
         if P::SUBSTRATE_BOOT_READY {
             init::<P>();
-            // Install the per-hart observation emitter on the BSP. Must run
-            // BEFORE the first `tx_observe::current()` caller so the
-            // CPU_ID_FN / TS_FN function pointers and the BSP's
-            // `HartEmitter` are in place. `Err(NoRing)` is benign — boards
-            // without an `observation_ring` impl get a runtime no-op.
-            let _ = tx_observe::init::<P>(<P as tx_hal::SmpIf>::current_cpu_id());
-            // Bounded-trace threshold: when set to N > 0, the kernel
-            // dumps the ring and powers off after N records have been
-            // emitted. Lets oscomp-style runs (where init runs many test
-            // groups back-to-back and never naturally exits in a useful
-            // wall clock) capture a finite trace covering the early
-            // stages. The value lives next to the board's other tuning
-            // constants in `tx-kernel/src/init.rs` so it can be flipped
-            // without redoing the observation contract.
-            tx_observe::set_dump_threshold(crate::OBSERVE_DUMP_THRESHOLD);
             crate::zones::register_all().expect("tx_kernel zone registration failed");
             Self::init_later(handoff);
             Self::install_kernel_trap_vector();
@@ -262,6 +257,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::run_zone_smoke();
             Self::run_bsp_reactor_runtime_smoke();
             Self::run_bsp_reactor_timer_idle_smoke();
+            Self::report_reactor_sched_observability();
             Self::init_process_subsystem();
 
             // ---- Phase 3b boot wiring ----
@@ -303,9 +299,6 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_procfs_at_proc();
             Self::mount_bdevfs_at_dev_block();
             Self::mount_sdcard_at_musl();
-            Self::populate_rootfs_shebang_shims();
-            Self::populate_rootfs_tmp_dirs();
-            Self::init_csprng();
             Self::bind_init_cwd_and_root();
 
             // Deferred H4 spine slots:
@@ -681,8 +674,97 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":mount:devfs:ok\n");
     }
 
-    // `mount_procfs_at_proc` moved to `init/procfs_mount.rs` to keep
-    // `init.rs` under the 1800-line arch-lint cap.
+    /// Mount procfs on `/proc`.
+    ///
+    /// Creates `/proc` on the rootfs (tmpfs) and mounts procfs there so
+    /// that userspace tools like `free`, `ps`, and `df` can read
+    /// `/proc/meminfo`, `/proc/<pid>/stat`, and `/proc/mounts`.
+    ///
+    /// **Order invariant:** runs after `mount_rootfs_from_boot_media`.
+    pub(crate) fn mount_procfs_at_proc() {
+        let root_mount = ROOT_MOUNT
+            .lock()
+            .clone()
+            .expect("mount_procfs_at_proc: ROOT_MOUNT must be populated");
+
+        let guard = step_engine::guard();
+        let cred = Credential::root();
+        use StepOutcome as V3;
+        let root_fs_object_id = root_mount.root().fs_object_id();
+        let (proc_object_id, proc_meta) = match root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .fs_ops
+            .mkdir(root_fs_object_id, b"proc", 0o555, &cred, &guard)
+        {
+            V3::Done(out) => out,
+            V3::Err(step_engine::Errno::ENOSYS) | V3::Err(step_engine::Errno::EROFS) => {
+                (root_fs_object_id, root_mount.root().meta())
+            }
+            other => panic!("mount_procfs_at_proc: mkdir(/proc) failed: {other:?}"),
+        };
+        drop(guard);
+
+        let proc_rnode_in_root = RNode::new_cap(proc_object_id, proc_meta, RNodeBacking::Directory)
+            .expect("mount_procfs_at_proc: /proc rnode-on-rootfs reservation");
+        let proc_dentry_on_root = DEntry::new_cap(
+            InlineName::new(b"proc").expect("mount_procfs_at_proc: /proc inline name"),
+            proc_rnode_in_root,
+        )
+        .expect("mount_procfs_at_proc: /proc dentry-on-rootfs reservation");
+
+        let procfs_fs_ops = tx_fs::procfs::Procfs::fs_ops_arc();
+        let procfs_fs_page_backing = alloc::sync::Arc::new(tx_fs::procfs::Procfs)
+            as alloc::sync::Arc<dyn tx_subsystems::page_backed::FsPageBacking>;
+
+        let procfs_payload = MountPayload::new_cap(
+            procfs_fs_ops,
+            procfs_fs_page_backing,
+            None,
+            mount::allocate_dev_id(),
+            MountOptions::default(),
+            "proc",
+            SourceLabel::Static("proc"),
+        )
+        .expect("mount_procfs_at_proc: payload reservation");
+
+        let procfs_root_rnode = {
+            let raw = RNode::new(
+                tx_fs::procfs::PROCFS_ROOT_ID,
+                InodeMeta::new(
+                    tx_subsystems::vfs::InodeKind::Directory,
+                    tx_fs::procfs::PROCFS_DIR_MODE,
+                ),
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&procfs_payload);
+            let res = step_engine::reserve_for::<RNode>()
+                .expect("mount_procfs_at_proc: procfs root rnode reservation");
+            step_engine::sign_for(res, raw)
+        };
+
+        let rootfs_payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .clone();
+
+        let proc_mount = MountIdentity::new_cap(
+            mount::allocate_mount_id(),
+            Some(proc_dentry_on_root),
+            procfs_root_rnode,
+            Some(root_mount),
+            procfs_payload,
+            MountFlags::empty(),
+        )
+        .expect("mount_procfs_at_proc: mount identity reservation");
+
+        mount::register_mount(&rootfs_payload, proc_object_id, proc_mount);
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:procfs:ok\n");
+    }
 
     /// Mount bdev-fs on `/dev/block`.
     ///
@@ -930,19 +1012,13 @@ impl<P: TxPlatform> CoreInit<P> {
 
         *MUSL_MOUNT.lock() = Some(musl_mount);
 
-        // TODO(phase-dynamic-link): bind-mount sdcard /lib → tmpfs
-        // /lib so ELF PT_INTERP and ld.so shared-library loads
-        // resolve.  Blocked on ext4 walk from root rnode not
-        // resolving child directories — step_walk returns
-        // non-Done.  See :sdcard:ext4:step_walk-lib:err in the
-        // boot log.
-        // Seed /bin/sh → the busybox binary in the rootfs tmpfs so
-        // that shebang scripts (e.g. run-all.sh #!/bin/sh) resolve
-        // correctly when no initramfs is loaded. RV64 OSComp images
-        // place busybox under /musl/musl; the LA64 busybox-root image
-        // built by xtask places it under /bin inside the mounted image.
-        // Both steps tolerate EEXIST so a baked initramfs or
-        // busybox_baked path that ran first wins.
+        // Seed /bin/sh and /bin/busybox → the busybox binary in the
+        // rootfs tmpfs so that shebang scripts (e.g. #!/bin/sh and
+        // #!/bin/busybox sh) resolve correctly when no initramfs is
+        // loaded.  RV64 OSComp images place busybox under /musl/musl;
+        // the LA64 busybox-root image built by xtask places it under
+        // /bin inside the mounted image.  Both steps tolerate EEXIST
+        // so a baked initramfs or busybox_baked path that ran first wins.
         {
             let guard = step_engine::guard();
             let bin_id = match rootfs_payload.fs_ops.mkdir(
@@ -1111,9 +1187,6 @@ impl<P: TxPlatform> CoreInit<P> {
         // wins. Entries unique to the cpio (e.g. `/bin/busybox`,
         // `/bin/sh` symlink) get added.
         Self::register_initramfs_if_present();
-        // pthread slice: inject the test binary into tmpfs so it can
-        // be exec'd by the init script or boot command line.
-
         Self::drive_bootstrap_exec();
     }
 
@@ -1123,6 +1196,28 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>("0");
             return;
         }
+        let mut digits = [0u8; 20];
+        let mut n = value;
+        let mut idx = digits.len();
+        while n > 0 {
+            idx -= 1;
+            digits[idx] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+        let s = core::str::from_utf8(&digits[idx..]).unwrap_or("");
+        tx_hal::console_write_str::<P>(s);
+    }
+
+    fn write_usize(value: usize) {
+        Self::write_decimal_unsigned(value);
+    }
+
+    fn write_u64(value: u64) {
+        if value <= usize::MAX as u64 {
+            Self::write_decimal_unsigned(value as usize);
+            return;
+        }
+
         let mut digits = [0u8; 20];
         let mut n = value;
         let mut idx = digits.len();
@@ -1188,62 +1283,36 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         };
 
-        let target_hart = boot_runtime::HartId(target_cpu.0);
         let current_hart = boot_runtime::HartId(<P as tx_hal::SmpIf>::current_cpu_id().0);
-        let mask = boot_runtime::wait::Mask::from_bits(0x1);
         let targets = CpuMask::single(target_cpu);
         Self::clear_ap_reactor_task_done(targets);
-
-        let channel = BOOT_REACTOR
-            .with(|reactor| {
-                let channel = reactor.channel();
-                reactor.submit_task_with_meta(
-                    {
-                        let channel = channel.clone();
-                        async move {
-                            let _ = channel.wait(mask).await;
-                            Self::mark_ap_reactor_task_done(target_cpu);
-                        }
-                    },
-                    boot_runtime::InitialSchedMeta::kernel()
-                        .with_affinity(CpuMask::single(target_cpu).bits()),
-                );
-                channel
-            })
-            .expect("boot reactor must be initialized before AP dispatcher smoke");
-
-        let parked = BOOT_REACTOR
-            .with(|reactor| reactor.run_until_idle_on_hart(target_hart))
-            .expect("boot reactor must be initialized before AP dispatcher smoke");
-        assert!(
-            parked.polled <= 1,
-            "reactor dispatcher smoke initial poll count"
-        );
-
         P::clear_ipi_ack_cpus(IpiKind::Reschedule, targets);
-        assert_eq!(
-            channel.fire(mask),
-            1,
-            "reactor dispatcher wake registration"
-        );
 
         let mut signal = SmpRescheduleSignal::<P>::new();
         let report = BOOT_REACTOR
-            .with(|reactor| reactor.drain_wakes_for_hart(current_hart, &mut signal))
+            .with(|reactor| {
+                let (_task, report) = reactor.submit_task_with_meta_from_hart(
+                    async move {
+                        Self::mark_ap_reactor_task_done(target_cpu);
+                    },
+                    boot_runtime::InitialSchedMeta::kernel()
+                        .with_affinity(CpuMask::single(target_cpu).bits()),
+                    current_hart,
+                    &mut signal,
+                );
+                report
+            })
             .expect("boot reactor must be initialized before AP dispatcher smoke");
-        // Under multi-threaded TCG (-accel tcg,thread=multi, see
-        // xtask/src/qemu.rs), the AP may poll its own runqueue and
-        // consume the wake before the BSP gets here to drain — in
-        // which case `remote_ipis` is 0, not 1. Both 0 (AP pre-empted)
-        // and 1 (BSP drained first) are valid; only >1 would indicate
-        // a bug in the wake-routing path. Same applies to the IPI ack
-        // count below: 0 acks if no IPI was sent, else `targets.count()`.
-        assert!(
-            report.remote_ipis <= 1,
-            "reactor dispatcher remote IPI count: got {} (expected 0 or 1)",
-            report.remote_ipis,
+        assert_eq!(
+            report.remote_ipis, 1,
+            "reactor dispatcher remote submit IPI count"
         );
 
+        // Under multi-threaded TCG (-accel tcg,thread=multi, see
+        // xtask/src/qemu.rs), the AP may poll its own runqueue and
+        // finish the task before the BSP checks the ack. 0 acks means the AP
+        // consumed the work without observing the explicit IPI in this small
+        // boot window; `targets.count()` means the IPI path was observed.
         let acked = P::wait_for_ipi_ack_cpus(targets, IpiKind::Reschedule);
         assert!(
             acked == 0 || acked == targets.count(),
@@ -1295,10 +1364,6 @@ impl<P: TxPlatform> CoreInit<P> {
         P::install_early_percpu(cpu_id);
         P::init_early_secondary(cpu_id);
         init_on_ap(cpu_id).expect("tx_kernel AP substrate initialization failed");
-        // Install this AP's observation emitter. Errors are benign —
-        // boards that allocate fewer rings than harts get a runtime
-        // no-op on the over-cap harts.
-        let _ = tx_observe::init::<P>(cpu_id);
         P::init_later_secondary(cpu_id);
         P::install_kernel_trap_vector();
         P::mark_cpu_online(cpu_id);
@@ -1314,10 +1379,6 @@ impl<P: TxPlatform> CoreInit<P> {
             }
             crate::zones::try_bounded_maintenance_tick();
             P::wait_for_interrupt_once();
-            if P::pending_ipi(IpiKind::Membarrier) {
-                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                P::ack_ipi(IpiKind::Membarrier);
-            }
             if P::pending_ipi(IpiKind::Reschedule) {
                 P::ack_ipi(IpiKind::Reschedule);
             }
@@ -1325,61 +1386,58 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn run_secondary_reactor_once(cpu_id: CpuId) -> bool {
-        Self::step_boot_reactor_once(cpu_id).is_some_and(|step| !step.should_idle())
+        if USE_CONCURRENT_POLL.load(core::sync::atomic::Ordering::Relaxed) {
+            Self::step_boot_reactor_once_concurrent(cpu_id)
+        } else {
+            Self::step_boot_reactor_once(cpu_id)
+        }
+        .is_some_and(|step| !step.should_idle())
     }
 
     fn step_boot_reactor_once(cpu_id: CpuId) -> Option<boot_runtime::hart_loop::HartLoopStep> {
         let hart = boot_runtime::HartId(cpu_id.0);
         let now_ns = P::read_ns();
         let mut signal = SmpRescheduleSignal::<P>::new();
-        // Force a guard acquire+drop to advance the epoch and clear
-        // any stale local_epoch state left by the prior reactor step.
+        // Force a guard acquire+drop to clear stale epoch state.
         drop(step_engine::guard());
-        #[cfg(feature = "diag-epoch-guards")]
-        let local_pre = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
-            .map(|c| c.local_epoch as usize)
-            .unwrap_or(999);
-        #[cfg(feature = "diag-epoch-guards")]
-        {
-            let epoch_pre_with = crate::adapter::step_engine::epoch::summary();
-            tx_hal::console_write_str::<P>(":diag:pre-boot-reactor-with:epoch=");
-            Self::write_decimal_unsigned(epoch_pre_with.global_epoch as usize);
-            tx_hal::console_write_str::<P>(":guards=");
-            Self::write_decimal_unsigned(epoch_pre_with.active_guards);
-            tx_hal::console_write_str::<P>("\n");
+        let step = BOOT_REACTOR.with_hart_runtime(hart, |runtime| {
+            boot_runtime::hart_loop::step_hart_loop_at(runtime, hart, now_ns, &mut signal)
+        })?;
+        Self::program_hart_loop_deadline(step.deadline_action);
+        Some(step)
+    }
+
+    /// Concurrent variant: releases the reactor lock during each task's
+    /// `future.poll()`, allowing other harts to make progress in parallel
+    /// (Phase 1a poll lease).
+    fn step_boot_reactor_once_concurrent(
+        cpu_id: CpuId,
+    ) -> Option<boot_runtime::hart_loop::HartLoopStep> {
+        let hart = boot_runtime::HartId(cpu_id.0);
+        let now_ns = P::read_ns();
+        let mut signal = SmpRescheduleSignal::<P>::new();
+        struct KernelSliceClock<P>(core::marker::PhantomData<P>);
+        impl<P: TxPlatform> boot_runtime::SliceClock for KernelSliceClock<P> {
+            fn now_ns(&mut self) -> u64 {
+                P::read_ns()
+            }
+
+            fn set_deadline_ns(&mut self, deadline_ns: u64) {
+                P::set_deadline_ns(deadline_ns);
+            }
+
+            fn cancel_deadline(&mut self) {
+                P::cancel_deadline();
+            }
         }
 
-        let step = BOOT_REACTOR.with(|reactor| {
-            let result =
-                boot_runtime::hart_loop::step_hart_loop_at(reactor, hart, now_ns, &mut signal);
-            #[cfg(feature = "diag-epoch-guards")]
-            {
-                let guard_epoch = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
-                    .map(|c| c.local_epoch as usize)
-                    .unwrap_or(999);
-                if guard_epoch != 0 {
-                    Self::write_board_sentinel_prefix();
-                    tx_hal::console_write_str::<P>(":diag:step-hart-loop-inside:epoch=");
-                    Self::write_decimal_unsigned(guard_epoch);
-                    tx_hal::console_write_str::<P>("\n");
-                }
-            }
-            result
-        })?;
-        #[cfg(feature = "diag-epoch-guards")]
-        {
-            let local_post = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
-                .map(|c| c.local_epoch as usize)
-                .unwrap_or(999);
-            if local_pre != 0 || local_post != 0 {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":diag:step-boot-reactor-once:guard-leak:pre=");
-                Self::write_decimal_unsigned(local_pre);
-                tx_hal::console_write_str::<P>(":post=");
-                Self::write_decimal_unsigned(local_post);
-                tx_hal::console_write_str::<P>("\n");
-            }
-        }
+        let mut slice_clock = KernelSliceClock::<P>(core::marker::PhantomData);
+        let step = BOOT_REACTOR.run_hart_loop_concurrent_with_slice_clock(
+            hart,
+            now_ns,
+            &mut signal,
+            &mut slice_clock,
+        )?;
         Self::program_hart_loop_deadline(step.deadline_action);
         Some(step)
     }
@@ -1422,6 +1480,20 @@ impl<P: TxPlatform> CoreInit<P> {
 
     fn cpu_bit(cpu_id: CpuId) -> u64 {
         CpuMask::single(cpu_id).bits()
+    }
+
+    fn userspace_thread_sched_meta() -> boot_runtime::InitialSchedMeta {
+        let affinity = P::online_cpus().bits();
+        let affinity = if affinity == 0 {
+            CpuMask::single(<P as tx_hal::SmpIf>::current_cpu_id()).bits()
+        } else {
+            affinity
+        };
+        boot_runtime::InitialSchedMeta::fair()
+            .with_affinity(affinity)
+            .movable()
+            .userspace_thread()
+            .spread_on_submit()
     }
 
     fn run_zone_smoke() {
@@ -1532,6 +1604,35 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":reactor:timer-idle:WARN-wake\n");
     }
 
+    fn report_reactor_sched_observability() {
+        let Some((observed, scheduler)) =
+            BOOT_REACTOR.with(|reactor| (reactor.observability(), reactor.scheduler_stats()))
+        else {
+            return;
+        };
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":reactor:sched:stats");
+        let mut hart = 0;
+        while hart < observed.per_hart().len() {
+            let stats = observed.hart(boot_runtime::HartId(hart));
+            if stats.polled > 0 || stats.completed > 0 {
+                tx_hal::console_write_str::<P>(":h");
+                Self::write_usize(hart);
+                tx_hal::console_write_str::<P>("=");
+                Self::write_u64(stats.polled);
+                tx_hal::console_write_str::<P>("/");
+                Self::write_u64(stats.completed);
+            }
+            hart += 1;
+        }
+        tx_hal::console_write_str::<P>(":steal=");
+        Self::write_u64(scheduler.work_steals);
+        tx_hal::console_write_str::<P>(":rebalance=");
+        Self::write_u64(scheduler.rebalance_moves);
+        tx_hal::console_write_str::<P>("\n");
+    }
+
     fn bsp_timer_smoke_done(cpu_bit: u64) -> bool {
         BSP_REACTOR_TIMER_DONE_CPUS.load(Ordering::Acquire) & cpu_bit != 0
     }
@@ -1568,6 +1669,56 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::queue_pending_child_submit(child_thread);
     }
 
+    fn register_thread_reactor_task(tid: u32, task: boot_runtime::TaskKey) {
+        let mut tasks = THREAD_REACTOR_TASKS.lock();
+        if let Some((_, existing)) = tasks
+            .iter_mut()
+            .find(|(existing_tid, _)| *existing_tid == tid)
+        {
+            *existing = task;
+        } else {
+            tasks.push((tid, task));
+        }
+    }
+
+    fn thread_reactor_task(tid: u32) -> Option<boot_runtime::TaskKey> {
+        THREAD_REACTOR_TASKS
+            .lock()
+            .iter()
+            .find(|(existing_tid, _)| *existing_tid == tid)
+            .map(|(_, task)| *task)
+    }
+
+    fn set_thread_reactor_affinity(
+        tid: u32,
+        affinity: u64,
+    ) -> Result<(), tx_subsystems::reactor_affinity::ReactorAffinityError> {
+        if affinity == 0 || (affinity & P::online_cpus().bits()) == 0 {
+            return Err(tx_subsystems::reactor_affinity::ReactorAffinityError::InvalidMask);
+        }
+        let task = Self::thread_reactor_task(tid)
+            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?;
+        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        let current_hart = boot_runtime::HartId(current_cpu.0);
+        let mut signal = SmpRescheduleSignal::<P>::new();
+        BOOT_REACTOR
+            .with(|reactor| reactor.set_task_affinity(task, affinity, current_hart, &mut signal))
+            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?
+            .map(|_| ())
+            .map_err(|_| tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)
+    }
+
+    fn get_thread_reactor_affinity(
+        tid: u32,
+    ) -> Result<u64, tx_subsystems::reactor_affinity::ReactorAffinityError> {
+        let task = Self::thread_reactor_task(tid)
+            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?;
+        BOOT_REACTOR
+            .with(|reactor| reactor.task_affinity(task))
+            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?
+            .map_err(|_| tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)
+    }
+
     /// Push a freshly-cloned child thread onto the deferred-submit
     /// queue. Called from sys_clone via the reactor-submission seam
     /// when the boot-reactor spin lock is already held by the
@@ -1594,70 +1745,23 @@ impl<P: TxPlatform> CoreInit<P> {
             };
             let task_payload = payload.clone();
             let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-            // OBS-V1 §13.2: thread the user-thread TID into the task's
-            // `TaskMailbox` so `WaitSource::notify_emit` and
-            // `PayloadDriveBegin` emit per-thread identity rather than
-            // 0. The TID is read from `child_thread` while we still have
-            // the cap; once the future moves it, the cap is consumed.
-            // OBS-V1 §15.6: also resolve the owning process PID so the
-            // daemon can build a ProcessDescriptor parent track for the
-            // per-thread tracks.
-            let tid_low = child_thread.tid.0;
-            let owner = child_thread.upgrade_owner_proc();
-            let pid_low = owner.as_ref().map(|p| p.pid.0).unwrap_or(0);
-            // Snapshot PCB `comm` before moving `child_thread` into the
-            // future. None for orphan threads with no owner_proc.
-            let comm = owner.as_ref().map(|p| p.comm());
-            // Snapshot pgid + sid for the OBS-V1 §15.8 group label.
-            // Read via `pgrp_cap` which clones the live `Cap<ProcessGroup>`
-            // under the per-process spin lock; the inner `session_cap`
-            // hop is a second clone — both are cheap (refcount bump).
-            let (pgid_low, sid_low) = owner
-                .as_ref()
-                .map(|p| {
-                    let pgrp = p.pgrp_cap();
-                    (pgrp.pgid.0, pgrp.session_cap().sid.0)
-                })
-                .unwrap_or((0, 0));
-            // Snapshot the parent's PID for the OBS-V1 §15.9 fork
-            // edge — `parent_pid()` returns `Pid::RESERVED` when the
-            // parent has been reaped, which the daemon treats the
-            // same as "no edge" (the fork emit dispatch elides any
-            // parent_pid == 0 record).
-            let parent_pid_low = owner.as_ref().map(|p| p.parent_pid().0).unwrap_or(0);
-            // OBS-V1 §15.7 + §15.8 + §15.9: emit ProcessLabel +
-            // ProcessGroup + ProcessFork BEFORE submitting the child
-            // task. Perfetto's TrackDescriptor compatibility rules
-            // reject any later descriptor that changes a track's
-            // `parent_uuid` — so the daemon MUST know the child's
-            // pgid by the time it materialises the per-process
-            // track, which happens on first slice. Emitting
-            // metadata first guarantees the daemon caches
-            // `(comm, pgid, sid)` before the next reactor poll
-            // dispatches the new task and fires its first Sched
-            // SpanBegin. Skipped if the parent process identity
-            // was already dropped (defensive — `comm` would be the
-            // `?` sentinel and pgid_low/sid_low both zero, adding
-            // no information).
-            if let Some(ref c) = comm {
-                emit_process_label(pid_low, c);
-                emit_process_group(pid_low, pgid_low, sid_low);
-                if parent_pid_low != 0 {
-                    emit_process_fork(parent_pid_low, pid_low);
-                }
-            }
-            let _ = BOOT_REACTOR.with(|reactor| {
-                reactor.submit_task_with_meta(
+            let current_hart = boot_runtime::HartId(current_cpu.0);
+            let child_tid = child_thread.tid.0;
+            let mut signal = SmpRescheduleSignal::<P>::new();
+            let submitted = BOOT_REACTOR.with(|reactor| {
+                reactor.submit_task_with_meta_from_hart(
                     crate::thread_future::PerHartSlotted::<P, _>::new(
                         task_payload.clone(),
                         crate::thread_future::run_thread::<P>(child_thread, task_payload),
                     ),
-                    boot_runtime::InitialSchedMeta::kernel()
-                        .with_affinity(tx_hal::CpuMask::single(current_cpu).bits())
-                        .with_task_id(tid_low)
-                        .with_process_id(pid_low),
-                );
+                    Self::userspace_thread_sched_meta(),
+                    current_hart,
+                    &mut signal,
+                )
             });
+            if let Some((task_key, _report)) = submitted {
+                Self::register_thread_reactor_task(child_tid, task_key);
+            }
         }
     }
 }
@@ -1675,125 +1779,141 @@ static PENDING_CHILD_SUBMITS: SpinMutex<
 /// Used by `CoreInit::drive_bootstrap_exec` to drive `exec_script`'s
 /// future without spinning up the reactor: the boot path runs before
 /// the BSP reactor loop is entered, and `exec_script` only awaits on
-/// Emit a one-shot `PayloadProcessLabel` Instant mapping `pid_low` to
-/// the PCB `comm` (Linux-style short program name). Surfaces the
-/// real program name on the per-process Perfetto track instead of
-/// the synthetic `pid-<N>` fallback (OBS-V1 §15.7).
+/// page-pull operations that resolve immediately under tmpfs.
 ///
-/// The Instant rides on the current parent span slot (the active
-/// Sched span when called from `submit_task_with_meta`'s caller) so
-/// the daemon can hang it off the right hart. Truncates `comm` to 12
-/// bytes to fit the inline payload buffer — the prefix is enough to
-/// disambiguate basic-musl test binaries and busybox.
-///
-/// No-op when no `HartEmitter` is installed (host tests, boards
-/// without an observation ring).
-pub(crate) fn emit_process_label(pid_low: u32, comm: &[u8; 16]) {
-    let _ = (pid_low, comm);
-    let Some(em) = tx_observe::current() else {
-        return;
-    };
-    let mut truncated = [0u8; 12];
-    let n = core::cmp::min(comm.len(), truncated.len());
-    truncated[..n].copy_from_slice(&comm[..n]);
-    // Force NUL termination of the truncated buffer if it lost one.
-    if !truncated.contains(&0) {
-        truncated[truncated.len() - 1] = 0;
+/// The bound `1024` polls is chosen to mirror the matching pattern in
+/// `tx-shims`'s and `tx-scripts`'s test suites; reaching the cap
+/// signals a logic bug (a never-resolving future inside the
+/// boot-time exec path) and triggers a panic.
+fn bootstrap_block_on<F: core::future::Future>(future: F) -> F::Output {
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    // Build a no-op waker without `alloc::sync::Arc`'s `Wake` trait,
+    // because tx-kernel's runtime allocator at boot does not have
+    // `Arc::new` plumbing wired by the time `bootstrap_block_on` is
+    // called. The raw-waker shape is a stable `core` API that
+    // sidesteps the `alloc` requirement entirely.
+    fn raw_waker() -> RawWaker {
+        fn no_op(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            raw_waker()
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+        RawWaker::new(core::ptr::null(), &VTABLE)
     }
-    let payload = tx_observe::PayloadProcessLabel {
-        process_id_low: pid_low,
-        comm: truncated,
-    };
-    let (enc, len) = tx_observe::encode::encode_process_label(&payload);
-    em.instant(
-        tx_observe::TxTraceLevel::Sched,
-        // Encode the PID into the EventNameId so the daemon can pair
-        // the label to a specific process even if it sees records
-        // out of order. The `0x9000_0000` prefix namespaces this away
-        // from both the kernel's FNV-1a-hashed op_name_id range and
-        // the `0x8000_0000` Sched-task range used by `emit_sched_*`.
-        tx_observe::EventNameId::from_raw(0x9000_0000 | pid_low),
-        tx_observe::current_parent_span(),
-        tx_observe::encode::process_label_tag(),
-        &enc[..len as usize],
-    );
-}
 
-/// Emit a one-shot `PayloadProcessFork` Instant carrying the
-/// parent → child PID edge. The daemon hashes
-/// `(parent_pid, child_pid)` into a Perfetto `flow_id` and draws an
-/// arrow from the parent's most recent `clone()` slice to the
-/// child's first `Sched` dispatch (OBS-V1 §15.9). Skipped when
-/// `parent_pid` is zero (kernel-internal or pre-init contexts).
-pub(crate) fn emit_process_fork(parent_pid: u32, child_pid: u32) {
-    if parent_pid == 0 || child_pid == 0 {
-        return;
+    // SAFETY: the raw waker's vtable functions are all no-op or
+    // re-construction; the data pointer is never dereferenced.
+    let waker = unsafe { Waker::from_raw(raw_waker()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut future = future;
+    // SAFETY: `future` lives on this stack frame for the duration of
+    // the loop and is never moved after pinning.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut future) };
+    for _ in 0..1024 {
+        match pinned.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => continue,
+        }
     }
-    let Some(em) = tx_observe::current() else {
-        return;
-    };
-    let payload = tx_observe::PayloadProcessFork {
-        parent_pid_low: parent_pid,
-        child_pid_low: child_pid,
-        _flags: 0,
-        _pad: 0,
-    };
-    let (enc, len) = tx_observe::encode::encode_process_fork(&payload);
-    em.instant(
-        tx_observe::TxTraceLevel::Sched,
-        // `0xB000_0000 | child_pid` namespace — disjoint from
-        // ProcessLabel (`0x9000_…`) and ProcessGroup (`0xA000_…`).
-        tx_observe::EventNameId::from_raw(0xB000_0000 | child_pid),
-        tx_observe::current_parent_span(),
-        tx_observe::encode::process_fork_tag(),
-        &enc[..len as usize],
-    );
+    panic!("bootstrap_block_on: future did not resolve in 1024 polls");
 }
 
-/// Emit a one-shot `PayloadProcessGroup` Instant mapping `pid_low`
-/// to its owning `pgid` + `sid`. Lets the daemon parent per-process
-/// Perfetto tracks under a per-pgrp swimlane (a test driver + its
-/// fork()ed children render together) and a per-session container
-/// above that (OBS-V1 §15.8).
+/// Render an `ExecError` as a short stable label for the boot sentinel
+/// stream (helps diagnose `bootstrap-exec:fail` post-mortem).
+fn exec_error_tag(error: &tx_scripts::process::exec::ExecError) -> &'static str {
+    use tx_scripts::process::exec::ExecError as E;
+    match error {
+        E::PathTooLong => "path-too-long",
+        E::PathNotFound => "path-not-found",
+        E::NotADirectory => "not-a-directory",
+        E::PermissionDenied => "permission-denied",
+        E::SymlinkLoop => "symlink-loop",
+        E::NotExecutable => "not-executable",
+        E::InvalidArgument => "invalid-argument",
+        E::OutOfMemory => "out-of-memory",
+        E::Busy => "busy",
+        E::IoError => "io-error",
+        // Forward-compat: ExecError may grow new variants. Avoid a
+        // build break if a future variant lands without a label here.
+        #[allow(unreachable_patterns)]
+        _ => "other",
+    }
+}
+
+/// Parse the firmware command line for an `init=` token and the
+/// `tx.profile=busybox` profile flag.
 ///
-/// Emitted alongside `emit_process_label` at the same kernel sites.
-/// No-op when no `HartEmitter` is installed.
-pub(crate) fn emit_process_group(pid_low: u32, pgid_low: u32, sid_low: u32) {
-    let Some(em) = tx_observe::current() else {
-        return;
+/// Resolution order (matches the Linux kernel's classic ordering):
+///   1. If the cmdline contains `init=PATH`, use `PATH` (argv0 set
+///      to `PATH`'s basename).
+///   2. Otherwise, if the cmdline contains the standalone token
+///      `tx.profile=busybox`, default to `/bin/sh` argv0=`sh`.
+///   3. Otherwise, fall back to the bake-in `/init` fixture.
+///
+/// The cmdline is borrowed from `<P as BootInfoIf>::boot_info()`,
+/// which the firmware (or QEMU `-append`) populates with a
+/// `&'static str`; the returned byte slices share that lifetime.
+fn parse_init_from_cmdline<P: tx_hal::TxPlatform>() -> (&'static [u8], &'static [u8]) {
+    let cmdline = match <P as tx_hal::BootInfoIf>::boot_info().cmdline {
+        Some(s) => s,
+        None => return (b"/init", b"init"),
     };
-    let payload = tx_observe::PayloadProcessGroup {
-        process_id_low: pid_low,
-        pgid_low,
-        sid_low,
-        _pad: 0,
-    };
-    let (enc, len) = tx_observe::encode::encode_process_group(&payload);
-    em.instant(
-        tx_observe::TxTraceLevel::Sched,
-        // Namespace `0xA000_0000 | pid` — disjoint from the
-        // ProcessLabel `0x9000_0000` range so the daemon can
-        // dispatch on EventNameId alone without consulting the
-        // payload tag.
-        tx_observe::EventNameId::from_raw(0xA000_0000 | pid_low),
-        tx_observe::current_parent_span(),
-        tx_observe::encode::process_group_tag(),
-        &enc[..len as usize],
-    );
+    for token in cmdline.split_ascii_whitespace() {
+        if let Some(path) = token.strip_prefix("init=") {
+            let argv0 = match path.rfind('/') {
+                Some(idx) => &path[idx + 1..],
+                None => path,
+            };
+            return (path.as_bytes(), argv0.as_bytes());
+        }
+    }
+    if cmdline
+        .split_ascii_whitespace()
+        .any(|t| t == "tx.profile=busybox")
+    {
+        // Direct path to the busybox binary. /bin/sh is a symlink
+        // pointing at "busybox" (relative); the walker follows
+        // symlinks but we keep the canonical path for clearer
+        // error reporting on bootstrap-exec failure.
+        return (b"/bin/busybox", b"sh");
+    }
+    (b"/init", b"init")
 }
 
-mod helpers;
-use helpers::{bootstrap_block_on, exec_error_tag, parse_init_from_cmdline};
 mod init_fixture;
 
+/// Shell-prompt roadmap Slice 10 (2026-05-08): when the build script
+/// at `crates/tx-kernel/build.rs` sees `TX_BUSYBOX` pointing at a
+/// real static-musl-built busybox binary, it copies the bytes to
+/// `$OUT_DIR/busybox.bin` and emits `cargo:rustc-cfg=busybox_baked`.
+/// This module is then compiled in and exposes
+/// `BUSYBOX_BYTES: &'static [u8]` for
+/// `register_busybox_into_tmpfs()` to consume.
+///
+/// Without `TX_BUSYBOX`, the module is not compiled in and the
+/// kernel boots through the existing `/init` fixture path
+/// exclusively (host tests + CI without a riscv64 cross-toolchain).
 #[cfg(busybox_baked)]
 mod busybox_fixture {
     pub static BUSYBOX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busybox.bin"));
 }
 
+/// DAC + setuid slice (Wave 5, Part 8): sibling fixture for the
+/// end-to-end setuid smoke. See `init_setuid_fixture.rs`'s module
+/// header for the deviation from Plan Q4 (extend-in-place was
+/// authored before the fork/clone/wait4 slice rewrote the existing
+/// fixture into a fork+wait+exit binary; sibling fixture keeps both
+/// smokes independently pinned).
 #[cfg(test)]
 mod init_setuid_fixture;
 
+/// fd-ops slice (Wave 4, Part 8): sibling fixture for the
+/// `openat → write → lseek → read → close → exit_group` byte-pin
+/// smoke. See `init_lseek_fixture.rs`'s module header for the
+/// sibling-vs-extend rationale (mirrors the setuid sibling
+/// decision so each fd-ops/DAC/fork test owns its own pinned ABI).
 #[cfg(test)]
 mod init_lseek_fixture;
 
