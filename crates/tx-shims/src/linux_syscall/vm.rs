@@ -715,6 +715,10 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             use tx_substrate::step::DriveMode;
             use tx_subsystems::futex::FutexWaitOp;
 
+            if uaddr == 0 {
+                return SyscallResult::error_from(Errno::EINVAL);
+            }
+
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mailbox_arc = script_ctx.mailbox().cloned();
             let timer_wheel_arc = script_ctx.timer_wheel().cloned();

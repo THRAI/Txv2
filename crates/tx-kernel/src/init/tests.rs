@@ -972,7 +972,7 @@ fn reactor_submission_seam_submits_child_thread_smoke() {
     // the call is a clean no-op (no panic, no submission).
     let init = tx_subsystems::process::execution::init_process()
         .expect("INIT_PROCESS populated by bootstrap_init");
-    let child = tx_subsystems::process::step_fork::<TestPlatform>(&init, false).expect("fork");
+    let child = tx_subsystems::process::step_fork::<TestPlatform>(&init, false, false).expect("fork");
     let leader = child
         .nth_thread(0)
         .expect("fresh child has a leader thread");

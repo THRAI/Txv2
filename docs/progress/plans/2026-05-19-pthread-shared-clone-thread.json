@@ -2,30 +2,30 @@
   "schema": "tx.progress.plan.v1",
   "id": "2026-05-19-pthread-shared-clone-thread",
   "title": "pthread Shared<T> + step_clone_thread implementation",
-  "status": "completed",
+  "status": "complete",
   "created": "2026-05-19",
   "updated": "2026-05-19",
   "owner": "agent",
   "summary": "Implement Shared<T> infrastructure and step_clone_thread to unblock pthread_create. Two phases: Phase A ships Shared<T> + Frame refactoring (~750 LOC); Phase B ships clone_thread + thread-exit futex protocol (~730 LOC). Total ~1,480 LOC, zero framework changes.",
   "scope": {
     "in": [
-      "crates/tx-subsystems/src/shared.rs (new — Shared<T> primitive)",
-      "crates/tx-subsystems/src/lib.rs (mod shared)",
-      "crates/tx-subsystems/src/process/structure.rs (Frame struct, ProcessPayload field migration)",
-      "crates/tx-subsystems/src/process/execution.rs (step_clone_thread, fork/clone Frame adaptation)",
-      "crates/tx-subsystems/src/thread_runtime/execution.rs (clear_child_tid futex wake on thread exit)",
-      "crates/tx-subsystems/src/thread_runtime/structure.rs (clear_child_tid slot, robust_list_head)",
-      "crates/tx-subsystems/src/futex/execution.rs (set_robust_list real impl)",
-      "crates/tx-shims/src/linux_syscall/numbers.rs (CLONE_* constant definitions verified)",
-      "crates/tx-shims/src/linux_syscall/proc.rs (clone flag dispatch, set_tid_address, set_robust_list)"
+      "crates/tx-subsystems/src/shared.rs",
+      "crates/tx-subsystems/src/lib.rs",
+      "crates/tx-subsystems/src/process/structure.rs",
+      "crates/tx-subsystems/src/process/execution.rs",
+      "crates/tx-subsystems/src/thread_runtime/execution.rs",
+      "crates/tx-subsystems/src/thread_runtime/structure.rs",
+      "crates/tx-subsystems/src/futex/execution.rs",
+      "crates/tx-shims/src/linux_syscall/numbers.rs",
+      "crates/tx-shims/src/linux_syscall/proc.rs"
     ],
     "out": [
-      "No new YieldShape, ExecutionScope, AbortReason, bus primitive, RestrictionKind",
-      "No new framework cells",
-      "vfork / posix_spawn — separate slice",
-      "SIGEV_THREAD — glibc domain",
-      "dup-shaped fd sharing within FdTable — existing BTreeMap stays",
-      "FsContext as separate struct — deferred; Frame.inline slots carry cwd/root/umask"
+      "no-new-yieldshape",
+      "no-new-framework-cells",
+      "vfork-posix-spawn-separate-slice",
+      "sigev-thread-glibc-domain",
+      "dup-shaped-fd-sharing",
+      "fscontext-as-separate-struct"
     ],
     "write_sets": [
       {
@@ -45,8 +45,8 @@
   },
   "context": {
     "design_docs": [
-      "docs/design/04_process-signals/PROCESS_v1.md §3 (Frame), §7.1.1 (clone flag table), §7.1.3 (step_clone_thread path)",
-      "docs/design/02_execution/THREAD_RUNTIME_v1.md §2.6 (clear_child_tid slot)",
+      "docs/design/04_process-signals/PROCESS_v1.md",
+      "docs/design/02_execution/THREAD_RUNTIME_v1.md",
       "docs/Txv3/01_CONCEPTS_v5.md",
       "docs/Txv3/02_INVARIANTS_v5.md",
       "docs/Txv3/03_STEP_MODEL_v2.md",
@@ -64,10 +64,10 @@
     {
       "id": "pth-a1-shared",
       "title": "A-1: Shared<T> infrastructure",
-      "status": "in_progress",
+      "status": "in-progress",
       "depends_on": [],
       "paths": [
-        "crates/tx-subsystems/src/shared.rs (new)",
+        "crates/tx-subsystems/src/shared.rs",
         "crates/tx-subsystems/src/lib.rs"
       ],
       "verification": [
