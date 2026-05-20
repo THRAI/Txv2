@@ -1163,6 +1163,27 @@ impl OpenFile {
         &self.backing
     }
 
+    /// Return the anonymous-pipe endpoint carried by this file, if any.
+    ///
+    /// Used by process fd-table accounting so `close` / `dup` / `fork`
+    /// update pipe reader/writer counts synchronously. That keeps pipe
+    /// EOF/EPIPE visible at fd-close time instead of waiting for EBR to
+    /// eventually retire the shared `OpenFile`.
+    pub(crate) fn pipe_endpoint(
+        &self,
+    ) -> Option<(Cap<crate::pipe::PipePayload>, crate::pipe::PipeSide)> {
+        let OpenFileBacking::Rnode { rnode } = &self.backing else {
+            return None;
+        };
+        let RNodeBacking::StructBacked {
+            payload: StructPayload::Pipe { payload, side },
+        } = rnode.backing()
+        else {
+            return None;
+        };
+        Some((payload.clone(), *side))
+    }
+
     /// VFS-shaped accessor — returns the inner `Cap<RNode>` for an
     /// `OpenFileBacking::Rnode` shape.
     ///
@@ -1429,50 +1450,6 @@ impl OpenFile {
     pub fn set_readdir_cursor(&self, cursor: DirCursor) {
         self.readdir_cursor
             .store(cursor.as_u64(), Ordering::Release);
-    }
-}
-
-/// Pipe-side lifecycle hook (shell-prompt roadmap Slice 1).
-///
-/// `Cap<OpenFile>` is refcounted via the zone-substrate machinery; the
-/// inner `OpenFile` value drops exactly once, when the last `Cap`
-/// referencing it is released and EBR fires the slot reclamation
-/// callback. That single-shot guarantee is what makes a per-side
-/// reader/writer count against `PipePayload` correct without an
-/// explicit hook on every `sys_close` / `sys_dup3`-replace / fork-CLOEXEC
-/// / exit-cleanup path: each fd-slot drop releases one `Cap`, and only
-/// the *last* such drop reaches this destructor.
-///
-/// The behaviour is keyed on `RNodeBacking::StructBacked { payload:
-/// StructPayload::Pipe { side, .. } }`; non-pipe backings have no
-/// per-OpenFile lifecycle (page-backed inodes own their own page
-/// containers; tty/chardev RNodes outlive any OpenFile referencing
-/// them).
-///
-/// On the *last-reader-close* transition `decr_reader` fires the
-/// writer-side wait channel so any blocked writer surfaces SIGPIPE/
-/// EPIPE. On the *last-writer-close* transition `decr_writer` fires
-/// the reader-side wait channel so any blocked reader surfaces EOF
-/// (`Done(0)`). Both transitions are owned by `pipe::PipePayload`'s
-/// `decr_*` helpers.
-impl Drop for OpenFile {
-    fn drop(&mut self) {
-        // PR-10 phase 0: only the RNode-backed shape carries the
-        // pipe lifecycle hook. Userfaultfd-backed OpenFiles have no
-        // per-side ref count to decrement — their inner
-        // `Cap<UserfaultFd>` drops via the normal `OpenFileBacking::Ufd`
-        // field drop and EBR reclamation of the ufd zone slot follows.
-        if let OpenFileBacking::Rnode { rnode } = &self.backing {
-            if let RNodeBacking::StructBacked {
-                payload: StructPayload::Pipe { payload, side },
-            } = rnode.backing()
-            {
-                match side {
-                    crate::pipe::PipeSide::Reader => payload.decr_reader(),
-                    crate::pipe::PipeSide::Writer => payload.decr_writer(),
-                }
-            }
-        }
     }
 }
 

@@ -430,6 +430,32 @@ fn dispatch_timer_trap_enters_irq_context_and_resumes() {
 }
 
 #[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn irq_context_depth_is_per_cpu() {
+    let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    assert!(!<Platform as IrqIf>::in_irq_context());
+    let cpu0_irq = enter_la64_irq_context();
+    assert!(<Platform as IrqIf>::in_irq_context());
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(1));
+    assert!(!<Platform as IrqIf>::in_irq_context());
+    {
+        let _cpu1_irq = enter_la64_irq_context();
+        assert!(<Platform as IrqIf>::in_irq_context());
+    }
+    assert!(!<Platform as IrqIf>::in_irq_context());
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    assert!(<Platform as IrqIf>::in_irq_context());
+    drop(cpu0_irq);
+    assert!(!<Platform as IrqIf>::in_irq_context());
+
+    <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+}
+
+#[test]
 fn dispatch_syscall_preserves_era_for_trap_handoff_and_uses_la64_abi() {
     TEST_SYSCALL_TRAPS.store(0, Ordering::Release);
     let mut frame = La64TrapFrame {

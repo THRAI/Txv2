@@ -210,7 +210,12 @@ static LA64_TIMEBASE_HZ: AtomicU64 = AtomicU64::new(0);
 static LA64_POSSIBLE_CPU_COUNT: AtomicUsize = AtomicUsize::new(LA64_DEFAULT_POSSIBLE_CPUS);
 static LA64_ONLINE_CPUS: AtomicU64 = AtomicU64::new(1);
 static LA64_IPI_ACKED_CPUS: AtomicU64 = AtomicU64::new(0);
-static LA64_IRQ_CONTEXT_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static LA64_IRQ_CONTEXT_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 static LA64_IRQ_DISPATCH_TABLE: AtomicUsize = AtomicUsize::new(0);
 static LA64_ALLOCATED_ASIDS: AtomicU64 = AtomicU64::new(1);
 static LA64_KERNEL_PGDH_PHYS: AtomicUsize = AtomicUsize::new(0);
