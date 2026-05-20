@@ -17,19 +17,23 @@ send "echo alpine-shell-ok\n"
 expect "alpine-shell-ok" within 10000
 expect "/ # " within 10000
 
+sleep 500
 send "ls /sbin/nft /usr/sbin/nft /sbin/iptables /usr/sbin/iptables\n"
 expect "nft" within 10000
 expect "iptables" within 10000
 expect "/ # " within 10000
 
+sleep 500
 send "/sbin/nft --version || /usr/sbin/nft --version\n"
 expect "nftables" within 10000
 expect "/ # " within 10000
 
+sleep 500
 send "/sbin/iptables --version || /usr/sbin/iptables --version\n"
 expect "iptables" within 10000
 expect "/ # " within 10000
 
+sleep 500
 send "/sbin/nft list ruleset || /usr/sbin/nft list ruleset\n"
 expect "/ # " within 15000
 

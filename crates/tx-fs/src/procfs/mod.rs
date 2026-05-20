@@ -49,6 +49,12 @@ pub const PROCFS_SYS_NET_IPV4_ID: FsObjectId = FsObjectId::new(0x7072_6F18);
 pub const PROCFS_SYS_NET_IPV4_IP_FORWARD_ID: FsObjectId = FsObjectId::new(0x7072_6F19);
 pub const PROCFS_NET_TX_NF_RULES_ID: FsObjectId = FsObjectId::new(0x7072_6F1a);
 pub const PROCFS_NET_NF_CONNTRACK_ID: FsObjectId = FsObjectId::new(0x7072_6F1b);
+pub const PROCFS_NET_TCP_ID: FsObjectId = FsObjectId::new(0x7072_6F1c);
+pub const PROCFS_NET_UDP_ID: FsObjectId = FsObjectId::new(0x7072_6F1d);
+pub const PROCFS_NET_RAW_ID: FsObjectId = FsObjectId::new(0x7072_6F1e);
+pub const PROCFS_NET_SNMP_ID: FsObjectId = FsObjectId::new(0x7072_6F1f);
+pub const PROCFS_NET_NETLINK_ID: FsObjectId = FsObjectId::new(0x7072_6F20);
+pub const PROCFS_NET_IF_INET6_ID: FsObjectId = FsObjectId::new(0x7072_6F21);
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 const PROCFS_PID_OBJECT_STRIDE: u64 = 0x100;
 const PROCFS_PID_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x10000;
@@ -396,6 +402,12 @@ impl FsOps for Procfs {
                 b"dev" => StepOutcome::done(PROCFS_NET_DEV_ID),
                 b"tx_nf_rules" => StepOutcome::done(PROCFS_NET_TX_NF_RULES_ID),
                 b"nf_conntrack" => StepOutcome::done(PROCFS_NET_NF_CONNTRACK_ID),
+                b"tcp" => StepOutcome::done(PROCFS_NET_TCP_ID),
+                b"udp" => StepOutcome::done(PROCFS_NET_UDP_ID),
+                b"raw" => StepOutcome::done(PROCFS_NET_RAW_ID),
+                b"snmp" => StepOutcome::done(PROCFS_NET_SNMP_ID),
+                b"netlink" => StepOutcome::done(PROCFS_NET_NETLINK_ID),
+                b"if_inet6" => StepOutcome::done(PROCFS_NET_IF_INET6_ID),
                 _ => StepOutcome::err(Errno::ENOENT.into()),
             };
         }
@@ -519,7 +531,13 @@ impl FsOps for Procfs {
             | PROCFS_NET_ROUTE_ID
             | PROCFS_NET_ARP_ID
             | PROCFS_NET_DEV_ID
-            | PROCFS_NET_NF_CONNTRACK_ID => {
+            | PROCFS_NET_NF_CONNTRACK_ID
+            | PROCFS_NET_TCP_ID
+            | PROCFS_NET_UDP_ID
+            | PROCFS_NET_RAW_ID
+            | PROCFS_NET_SNMP_ID
+            | PROCFS_NET_NETLINK_ID
+            | PROCFS_NET_IF_INET6_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             PROCFS_SYS_FS_PIPE_MAX_SIZE_ID
@@ -608,6 +626,12 @@ impl FsOps for Procfs {
                     PROCFS_NET_NF_CONNTRACK_ID,
                     InodeKind::Regular,
                 ),
+                (b"tcp", PROCFS_NET_TCP_ID, InodeKind::Regular),
+                (b"udp", PROCFS_NET_UDP_ID, InodeKind::Regular),
+                (b"raw", PROCFS_NET_RAW_ID, InodeKind::Regular),
+                (b"snmp", PROCFS_NET_SNMP_ID, InodeKind::Regular),
+                (b"netlink", PROCFS_NET_NETLINK_ID, InodeKind::Regular),
+                (b"if_inet6", PROCFS_NET_IF_INET6_ID, InodeKind::Regular),
             ];
             if idx < files.len() {
                 let (name, oid, kind) = files[idx];

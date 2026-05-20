@@ -978,6 +978,16 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
             ),
             "proc",
         ),
+        "sysfs" => (
+            tx_fs::sysfs::Sysfs::fs_ops_arc(),
+            tx_fs::sysfs::Sysfs::fs_page_backing_arc(),
+            tx_fs::sysfs::SYSFS_ROOT_ID,
+            tx_subsystems::vfs::InodeMeta::new(
+                tx_subsystems::vfs::InodeKind::Directory,
+                tx_fs::sysfs::SYSFS_DIR_MODE,
+            ),
+            "sysfs",
+        ),
         "ext4" => {
             // Resolve `source` (e.g. `/dev/block/vda`) into a bdev-fs
             // RNode, then ask bdev-fs which underlying block-device

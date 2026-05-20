@@ -81,6 +81,10 @@ static DEV_SHM_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(Non
 /// projections through their usual Linux paths.
 static PROC_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
 
+/// Global sysfs mount at `/sys`. Populated by `mount_sysfs_at_sys`
+/// so Alpine/OpenRC network probes can discover `/sys/class/net`.
+static SYS_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
+
 /// Global sdcard ext4 mount at `/musl`. Populated by
 /// `mount_sdcard_at_musl` when a `vda` block device is registered.
 /// Boards without a block device silently leave this `None`.
@@ -140,6 +144,7 @@ pub fn reset_boot_state_for_test() {
     *DEV_SHM_MOUNT.lock() = None;
     *MUSL_MOUNT.lock() = None;
     *PROC_MOUNT.lock() = None;
+    *SYS_MOUNT.lock() = None;
     *CONSOLE_TTY.lock() = None;
     *ROOT_DENTRY.lock() = None;
     *NULL_TTY.lock() = None;
@@ -330,6 +335,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::register_devfs_console_alias();
             Self::mount_tmpfs_at_dev_shm();
             Self::mount_procfs_at_proc();
+            Self::mount_sysfs_at_sys();
             Self::register_devfs_null_alias();
             Self::mount_bdevfs_at_dev_block();
             Self::mount_sdcard_at_musl();
@@ -964,6 +970,108 @@ impl<P: TxPlatform> CoreInit<P> {
         *DEV_SHM_MOUNT.lock() = Some(shm_mount);
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:devshm:tmpfs:ok\n");
+    }
+
+    /// Mount sysfs at `/sys`.
+    ///
+    /// This is a projection-only backend for `/sys/class/net/*`. The
+    /// network subsystem remains the authority for devices, addresses, and
+    /// statistics; sysfs only materialises read-only RNodes on demand.
+    pub(crate) fn mount_sysfs_at_sys() {
+        let root_mount = ROOT_MOUNT
+            .lock()
+            .clone()
+            .expect("mount_sysfs_at_sys: ROOT_MOUNT must be populated");
+
+        let rootfs_payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .clone();
+
+        let guard = step_engine::guard();
+        let cred = Credential::root();
+        use StepOutcome as V3;
+        let root_fs_object_id = root_mount.root().fs_object_id();
+        let (sys_object_id, sys_meta) =
+            match rootfs_payload
+                .fs_ops
+                .mkdir(root_fs_object_id, b"sys", 0o755, &cred, &guard)
+            {
+                V3::Done(out) => out,
+                V3::Err(step_engine::Errno::EEXIST) => {
+                    let id = match rootfs_payload
+                        .fs_ops
+                        .lookup(root_fs_object_id, b"sys", &guard)
+                    {
+                        V3::Done(id) => id,
+                        other => {
+                            panic!("mount_sysfs_at_sys: /sys lookup after EEXIST: {other:?}")
+                        }
+                    };
+                    let meta = match rootfs_payload.fs_ops.load_inode_meta(id, &guard) {
+                        V3::Done(meta) => meta,
+                        other => panic!("mount_sysfs_at_sys: /sys meta after EEXIST: {other:?}"),
+                    };
+                    (id, meta)
+                }
+                other => panic!("mount_sysfs_at_sys: mkdir(/sys) failed: {other:?}"),
+            };
+        drop(guard);
+
+        let sys_rnode_in_root = RNode::new_cap(sys_object_id, sys_meta, RNodeBacking::Directory)
+            .expect("mount_sysfs_at_sys: /sys rnode-on-rootfs reservation");
+        let sys_dentry_on_root = DEntry::new_cap(
+            InlineName::new(b"sys").expect("mount_sysfs_at_sys: /sys inline name"),
+            sys_rnode_in_root,
+        )
+        .expect("mount_sysfs_at_sys: /sys dentry-on-rootfs reservation");
+
+        let sysfs_payload = MountPayload::new_cap(
+            tx_fs::sysfs::Sysfs::fs_ops_arc(),
+            tx_fs::sysfs::Sysfs::fs_page_backing_arc(),
+            None,
+            mount::allocate_dev_id(),
+            MountOptions::default(),
+            "sysfs",
+            SourceLabel::Static("sysfs"),
+        )
+        .expect("mount_sysfs_at_sys: payload reservation");
+
+        let sysfs_root_rnode = {
+            let raw = RNode::new(
+                tx_fs::sysfs::SYSFS_ROOT_ID,
+                InodeMeta::new(
+                    tx_subsystems::vfs::InodeKind::Directory,
+                    tx_fs::sysfs::SYSFS_DIR_MODE,
+                ),
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&sysfs_payload);
+            let res = step_engine::reserve_for::<RNode>()
+                .expect("mount_sysfs_at_sys: sysfs root rnode reservation");
+            step_engine::sign_for(res, raw)
+        };
+
+        let sys_mount = MountIdentity::new_cap(
+            mount::allocate_mount_id(),
+            Some(sys_dentry_on_root),
+            sysfs_root_rnode,
+            Some(root_mount),
+            sysfs_payload,
+            MountFlags::empty(),
+        )
+        .expect("mount_sysfs_at_sys: mount identity reservation");
+
+        mount::register_mount(&rootfs_payload, sys_object_id, sys_mount.clone());
+        if let Some(mnt_ns) = init_mount_namespace() {
+            mnt_ns.register_mount(&rootfs_payload, sys_object_id, sys_mount.clone());
+        }
+
+        *SYS_MOUNT.lock() = Some(sys_mount);
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:sysfs:ok\n");
     }
 
     /// Mount bdev-fs on `/dev/block`.

@@ -44,6 +44,7 @@ pub const NLMSG_MIN_TYPE: u16 = 0x10;
 pub const NFNETLINK_V0: u8 = 0;
 pub const NFPROTO_IPV4: u8 = 2;
 pub const NFNL_SUBSYS_NFTABLES: u16 = 10;
+pub const NFNL_SUBSYS_NFT_COMPAT: u16 = 11;
 pub const NFNL_MSG_BATCH_BEGIN: u16 = NLMSG_MIN_TYPE;
 pub const NFNL_MSG_BATCH_END: u16 = NLMSG_MIN_TYPE + 1;
 
@@ -63,6 +64,7 @@ pub const NFT_MSG_GETGEN: u16 = 16;
 pub const NFT_MSG_GETOBJ: u16 = 19;
 pub const NFT_MSG_GETOBJ_RESET: u16 = 21;
 pub const NFT_MSG_GETFLOWTABLE: u16 = 23;
+pub const NFNL_MSG_COMPAT_GET: u16 = 0;
 
 const NLMSG_HDR_LEN: usize = 16;
 const NFGENMSG_LEN: usize = 4;
@@ -128,6 +130,10 @@ const NFTA_NAT_FAMILY: u16 = 2;
 const NFTA_NAT_REG_ADDR_MIN: u16 = 3;
 const NFTA_NAT_REG_PROTO_MIN: u16 = 5;
 
+const NFTA_TARGET_NAME: u16 = 1;
+const NFTA_TARGET_REV: u16 = 2;
+const NFTA_TARGET_INFO: u16 = 3;
+
 const NFT_REG_VERDICT: u32 = 0;
 const NFT_CMP_EQ: u32 = 0;
 const NFT_PAYLOAD_NETWORK_HEADER: u32 = 1;
@@ -141,6 +147,7 @@ const NFT_CHAIN_BASE: u32 = 1;
 const NFT_REG32_00: u32 = 8;
 const NF_DROP: u32 = 0;
 const NF_ACCEPT: u32 = 1;
+const IFNAMSIZ: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NetlinkNetfilterState;
@@ -240,10 +247,14 @@ pub fn netlink_netfilter_send(
         .raw_netlink_netfilter_socket()
         .ok_or(Errno::EOPNOTSUPP)?;
 
-    for response in
-        nfnetlink_handle_request_in_namespace_with_cred(&payload.net_namespace(), bytes, cred)
-    {
-        raw.queue_response(response);
+    let responses =
+        nfnetlink_handle_request_in_namespace_with_cred(&payload.net_namespace(), bytes, cred);
+    let mut packet = Vec::new();
+    for response in responses {
+        packet.extend_from_slice(&response);
+    }
+    if !packet.is_empty() {
+        raw.queue_response(packet);
     }
     payload.refresh_io_from_raw();
     if !raw.is_empty() {
@@ -331,6 +342,15 @@ fn handle_one_message(
         return;
     }
 
+    if nfnl_subsys(header.kind) == NFNL_SUBSYS_NFT_COMPAT {
+        if nfnl_msg_type(header.kind) == NFNL_MSG_COMPAT_GET {
+            responses.push(build_ack_response(header));
+        } else {
+            responses.push(build_error_response(Some(header), Errno::EOPNOTSUPP));
+        }
+        return;
+    }
+
     if nfnl_subsys(header.kind) != NFNL_SUBSYS_NFTABLES {
         responses.push(build_error_response(Some(header), Errno::EOPNOTSUPP));
         return;
@@ -343,17 +363,17 @@ fn handle_one_message(
         .unwrap_or(NFPROTO_IPV4);
     match nfnl_msg_type(header.kind) {
         NFT_MSG_GETTABLE => {
-            for msg in render_table_dump(netns, header, family) {
+            for msg in render_table_request(netns, header, family, payload) {
                 responses.push(msg);
             }
         }
         NFT_MSG_GETCHAIN => {
-            for msg in render_chain_dump(netns, header, family) {
+            for msg in render_chain_request(netns, header, family, payload) {
                 responses.push(msg);
             }
         }
         NFT_MSG_GETRULE => {
-            for msg in render_rule_dump(netns, header, family) {
+            for msg in render_rule_request(netns, header, family, payload) {
                 responses.push(msg);
             }
         }
@@ -392,16 +412,213 @@ fn handle_one_message(
     }
 }
 
+fn render_table_request(
+    netns: &NetNamespacePayload,
+    header: NlMsgHeader,
+    family: u8,
+    payload: &[u8],
+) -> Vec<Vec<u8>> {
+    if is_dump_request(header) {
+        return render_table_dump(netns, header, family);
+    }
+
+    let Ok(attrs) = parse_nfmsg_attrs(payload) else {
+        return alloc::vec![build_error_response(Some(header), Errno::EINVAL)];
+    };
+    let Some(name) = attr_string(&attrs, NFTA_TABLE_NAME) else {
+        return alloc::vec![build_error_response(Some(header), Errno::EINVAL)];
+    };
+    let Some(table) = table_summary_by_name(netns, family, name) else {
+        return alloc::vec![build_error_response(Some(header), Errno::ENOENT)];
+    };
+
+    alloc::vec![build_table_message(
+        header.seq, header.pid, 0, family, table,
+    )]
+}
+
 fn render_table_dump(netns: &NetNamespacePayload, header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
+    let tables = table_summaries(netns, family);
+    let mut out = Vec::new();
+    for table in tables {
+        out.push(build_table_message(
+            header.seq,
+            header.pid,
+            NLM_F_MULTI,
+            family,
+            table,
+        ));
+    }
+    out.push(build_done_message(header.seq, header.pid));
+    out
+}
+
+fn render_chain_request(
+    netns: &NetNamespacePayload,
+    header: NlMsgHeader,
+    family: u8,
+    payload: &[u8],
+) -> Vec<Vec<u8>> {
+    if is_dump_request(header) {
+        return render_chain_dump(netns, header, family);
+    }
+
+    let Ok(attrs) = parse_nfmsg_attrs(payload) else {
+        return alloc::vec![build_error_response(Some(header), Errno::EINVAL)];
+    };
+    let Some(table) = attr_string(&attrs, NFTA_CHAIN_TABLE) else {
+        return alloc::vec![build_error_response(Some(header), Errno::EINVAL)];
+    };
+    let Some(name) = attr_string(&attrs, NFTA_CHAIN_NAME) else {
+        return alloc::vec![build_error_response(Some(header), Errno::EINVAL)];
+    };
+    let Some((idx, chain)) = chain_summaries(netns, family)
+        .into_iter()
+        .enumerate()
+        .find(|(_, chain)| chain.table == table && chain.name == name)
+    else {
+        return alloc::vec![build_error_response(Some(header), Errno::ENOENT)];
+    };
+
+    alloc::vec![build_chain_message(
+        header.seq,
+        header.pid,
+        0,
+        family,
+        chain,
+        idx as u64 + 1,
+    )]
+}
+
+fn render_chain_dump(netns: &NetNamespacePayload, header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
+    let chains = chain_summaries(netns, family);
+    let mut out = Vec::new();
+    for (idx, chain) in chains.into_iter().enumerate() {
+        out.push(build_chain_message(
+            header.seq,
+            header.pid,
+            NLM_F_MULTI,
+            family,
+            chain,
+            idx as u64 + 1,
+        ));
+    }
+    out.push(build_done_message(header.seq, header.pid));
+    out
+}
+
+fn render_rule_request(
+    netns: &NetNamespacePayload,
+    header: NlMsgHeader,
+    family: u8,
+    payload: &[u8],
+) -> Vec<Vec<u8>> {
+    let Ok(attrs) = parse_nfmsg_attrs(payload) else {
+        return alloc::vec![build_error_response(Some(header), Errno::EINVAL)];
+    };
+    let table_filter = attr_string(&attrs, NFTA_RULE_TABLE);
+    let chain_filter = attr_string(&attrs, NFTA_RULE_CHAIN);
+    let handle = attr_u64(&attrs, NFTA_RULE_HANDLE);
+    if is_dump_request(header) {
+        return render_rule_dump(netns, header, family, table_filter, chain_filter, handle);
+    }
+
+    let Some((idx, rule)) = netfilter_rules_snapshot_for_namespace(netns)
+        .into_iter()
+        .enumerate()
+        .find(|(idx, rule)| {
+            rule_matches_filter(*rule, family, table_filter, chain_filter, handle, *idx)
+        })
+    else {
+        return alloc::vec![build_error_response(Some(header), Errno::ENOENT)];
+    };
+
+    alloc::vec![build_rule_message(
+        header.seq,
+        header.pid,
+        0,
+        family,
+        rule,
+        idx as u64 + 1,
+    )]
+}
+
+fn render_rule_dump(
+    netns: &NetNamespacePayload,
+    header: NlMsgHeader,
+    family: u8,
+    table_filter: Option<&str>,
+    chain_filter: Option<&str>,
+    handle: Option<u64>,
+) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for (idx, rule) in netfilter_rules_snapshot_for_namespace(netns)
+        .into_iter()
+        .enumerate()
+    {
+        if !rule_matches_filter(rule, family, table_filter, chain_filter, handle, idx) {
+            continue;
+        }
+        out.push(build_rule_message(
+            header.seq,
+            header.pid,
+            NLM_F_MULTI,
+            family,
+            rule,
+            idx as u64 + 1,
+        ));
+    }
+    out.push(build_done_message(header.seq, header.pid));
+    out
+}
+
+fn rule_matches_filter(
+    rule: NetfilterRule,
+    family: u8,
+    table_filter: Option<&str>,
+    chain_filter: Option<&str>,
+    handle: Option<u64>,
+    index: usize,
+) -> bool {
+    if let Some(handle) = handle {
+        if handle != index as u64 + 1 {
+            return false;
+        }
+    }
+    let chain = chain_for_rule(rule, family);
+    if let Some(table) = table_filter {
+        if table != chain.table {
+            return false;
+        }
+    }
+    if let Some(name) = chain_filter {
+        if name != chain.name {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_dump_request(header: NlMsgHeader) -> bool {
+    (header.flags & NLM_F_DUMP) != 0
+}
+
+fn table_summaries(netns: &NetNamespacePayload, family: u8) -> Vec<TableSummary> {
     let rules = netfilter_rules_snapshot_for_namespace(netns);
     let (nft_tables, _) = nft_state_snapshot(netns);
     let mut tables = Vec::<TableSummary>::new();
+    push_compat_table_summaries(&mut tables, family);
     for table in nft_tables.iter() {
-        if table.family == family {
+        if table.family == family
+            && tables
+                .iter()
+                .all(|summary| summary.name != table.name || summary.family != family)
+        {
+            let chains = compat_chain_count(&table.name);
             tables.push(TableSummary {
                 family,
                 name: table.name.clone(),
-                chains: 0,
+                chains,
             });
         }
     }
@@ -416,19 +633,55 @@ fn render_table_dump(netns: &NetNamespacePayload, header: NlMsgHeader, family: u
             tables.push(TableSummary { family, ..summary });
         }
     }
-    let mut out = Vec::new();
-    for table in tables {
-        out.push(build_table_message(header.seq, header.pid, family, table));
-    }
-    out.push(build_done_message(header.seq, header.pid));
-    out
+    tables
 }
 
-fn render_chain_dump(netns: &NetNamespacePayload, header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
+fn push_compat_table_summaries(tables: &mut Vec<TableSummary>, family: u8) {
+    if family != NFPROTO_IPV4 {
+        return;
+    }
+    tables.push(TableSummary {
+        family,
+        name: String::from("filter"),
+        chains: 3,
+    });
+    tables.push(TableSummary {
+        family,
+        name: String::from("nat"),
+        chains: 4,
+    });
+}
+
+fn compat_chain_count(table: &str) -> u32 {
+    match table {
+        "filter" | "FILTER" => 3,
+        "nat" | "NAT" => 4,
+        _ => 0,
+    }
+}
+
+fn table_summary_by_name(
+    netns: &NetNamespacePayload,
+    family: u8,
+    name: &str,
+) -> Option<TableSummary> {
+    table_summaries(netns, family)
+        .into_iter()
+        .find(|table| table.name == name)
+}
+
+fn chain_summaries(netns: &NetNamespacePayload, family: u8) -> Vec<ChainSummary> {
     let (_, nft_chains) = nft_state_snapshot(netns);
     let mut chains = Vec::<ChainSummary>::new();
+    push_compat_chain_summaries(&mut chains, family);
     for chain in nft_chains.iter() {
-        if chain.family == family {
+        if chain.family == family
+            && chains.iter().all(|summary| {
+                summary.table != chain.table
+                    || summary.name != chain.name
+                    || summary.family != family
+            })
+        {
             chains.push(ChainSummary {
                 family,
                 table: chain.table.clone(),
@@ -447,36 +700,31 @@ fn render_chain_dump(netns: &NetNamespacePayload, header: NlMsgHeader, family: u
             chains.push(chain);
         }
     }
-    let mut out = Vec::new();
-    for (idx, chain) in chains.into_iter().enumerate() {
-        out.push(build_chain_message(
-            header.seq,
-            header.pid,
-            family,
-            chain,
-            idx as u64 + 1,
-        ));
-    }
-    out.push(build_done_message(header.seq, header.pid));
-    out
+    chains
 }
 
-fn render_rule_dump(netns: &NetNamespacePayload, header: NlMsgHeader, family: u8) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    for (idx, rule) in netfilter_rules_snapshot_for_namespace(netns)
-        .into_iter()
-        .enumerate()
-    {
-        out.push(build_rule_message(
-            header.seq,
-            header.pid,
-            family,
-            rule,
-            idx as u64 + 1,
-        ));
+fn push_compat_chain_summaries(chains: &mut Vec<ChainSummary>, family: u8) {
+    if family != NFPROTO_IPV4 {
+        return;
     }
-    out.push(build_done_message(header.seq, header.pid));
-    out
+    for (table, name, hook, priority, chain_type) in [
+        ("filter", "INPUT", NetfilterHook::Input, 0, "filter"),
+        ("filter", "FORWARD", NetfilterHook::Forward, 0, "filter"),
+        ("filter", "OUTPUT", NetfilterHook::Output, 0, "filter"),
+        ("nat", "PREROUTING", NetfilterHook::Prerouting, -100, "nat"),
+        ("nat", "INPUT", NetfilterHook::Input, 100, "nat"),
+        ("nat", "OUTPUT", NetfilterHook::Output, -100, "nat"),
+        ("nat", "POSTROUTING", NetfilterHook::Postrouting, 100, "nat"),
+    ] {
+        chains.push(ChainSummary {
+            family,
+            table: String::from(table),
+            name: String::from(name),
+            hooknum: hooknum(hook),
+            priority,
+            chain_type: String::from(chain_type),
+        });
+    }
 }
 
 fn handle_newtable(
@@ -628,6 +876,7 @@ fn handle_newrule(
             in_iface: parsed.in_iface,
             out_iface: parsed.out_iface,
             target,
+            compat_target: parsed.compat_target,
             to_addr: parsed.to_addr,
             to_port: parsed.to_port,
         },
@@ -649,17 +898,18 @@ fn handle_delrule(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Re
     remove_netfilter_rule_in_namespace_for_test_or_bootstrap(netns, index)
 }
 
-fn build_table_message(seq: u32, pid: u32, family: u8, table: TableSummary) -> Vec<u8> {
+fn build_table_message(seq: u32, pid: u32, flags: u16, family: u8, table: TableSummary) -> Vec<u8> {
     let mut payload = nfgenmsg(family);
     push_attr_string(&mut payload, NFTA_TABLE_NAME, &table.name);
     push_attr_u32(&mut payload, NFTA_TABLE_FLAGS, 0);
     push_attr_u32(&mut payload, NFTA_TABLE_USE, table.chains);
-    build_nlmsg(nft_msg(NFT_MSG_NEWTABLE), NLM_F_MULTI, seq, pid, &payload)
+    build_nlmsg(nft_msg(NFT_MSG_NEWTABLE), flags, seq, pid, &payload)
 }
 
 fn build_chain_message(
     seq: u32,
     pid: u32,
+    flags: u16,
     family: u8,
     chain: ChainSummary,
     handle: u64,
@@ -675,10 +925,17 @@ fn build_chain_message(
     push_attr_u32(&mut payload, NFTA_CHAIN_POLICY, NF_ACCEPT);
     push_attr_string(&mut payload, NFTA_CHAIN_TYPE, &chain.chain_type);
     push_attr_u32(&mut payload, NFTA_CHAIN_FLAGS, NFT_CHAIN_BASE);
-    build_nlmsg(nft_msg(NFT_MSG_NEWCHAIN), NLM_F_MULTI, seq, pid, &payload)
+    build_nlmsg(nft_msg(NFT_MSG_NEWCHAIN), flags, seq, pid, &payload)
 }
 
-fn build_rule_message(seq: u32, pid: u32, family: u8, rule: NetfilterRule, handle: u64) -> Vec<u8> {
+fn build_rule_message(
+    seq: u32,
+    pid: u32,
+    flags: u16,
+    family: u8,
+    rule: NetfilterRule,
+    handle: u64,
+) -> Vec<u8> {
     let chain = chain_for_rule(rule, family);
     let mut payload = nfgenmsg(family);
     push_attr_string(&mut payload, NFTA_RULE_TABLE, &chain.table);
@@ -689,7 +946,7 @@ fn build_rule_message(seq: u32, pid: u32, family: u8, rule: NetfilterRule, handl
     });
     let summary = rule_summary(rule);
     push_attr(&mut payload, NFTA_RULE_USERDATA, summary.as_bytes());
-    build_nlmsg(nft_msg(NFT_MSG_NEWRULE), NLM_F_MULTI, seq, pid, &payload)
+    build_nlmsg(nft_msg(NFT_MSG_NEWRULE), flags, seq, pid, &payload)
 }
 
 fn build_generation_message(header: NlMsgHeader, family: u8) -> Vec<u8> {
@@ -723,7 +980,7 @@ fn chain_for_rule(rule: NetfilterRule, family: u8) -> ChainSummary {
     ChainSummary {
         family,
         table,
-        name: hook_name(rule.hook).to_string(),
+        name: hook_name_for_rule(rule).to_string(),
         hooknum: hooknum(rule.hook),
         priority: match rule.table {
             NetfilterTable::Filter => 0,
@@ -738,6 +995,13 @@ fn chain_for_rule(rule: NetfilterRule, family: u8) -> ChainSummary {
             NetfilterTable::Nat => String::from("nat"),
         },
     }
+}
+
+fn hook_name_for_rule(rule: NetfilterRule) -> &'static str {
+    if rule.compat_target.is_some() {
+        return hook_name_upper(rule.hook);
+    }
+    hook_name(rule.hook)
 }
 
 fn rule_summary(rule: NetfilterRule) -> String {
@@ -780,6 +1044,16 @@ fn hook_name(hook: NetfilterHook) -> &'static str {
         NetfilterHook::Forward => "forward",
         NetfilterHook::Output => "output",
         NetfilterHook::Postrouting => "postrouting",
+    }
+}
+
+fn hook_name_upper(hook: NetfilterHook) -> &'static str {
+    match hook {
+        NetfilterHook::Prerouting => "PREROUTING",
+        NetfilterHook::Input => "INPUT",
+        NetfilterHook::Forward => "FORWARD",
+        NetfilterHook::Output => "OUTPUT",
+        NetfilterHook::Postrouting => "POSTROUTING",
     }
 }
 
@@ -833,6 +1107,7 @@ fn parse_rule_expressions(bytes: &[u8]) -> Result<NftRuleParse, Errno> {
             "cmp" => parse_cmp_expr(data, &regs, &mut parsed)?,
             "immediate" => parse_immediate_expr(data, &mut regs, &mut parsed)?,
             "masq" => parsed.target = Some(NetfilterTarget::Masquerade),
+            "target" => parse_target_expr(data, &mut parsed)?,
             "nat" => parse_nat_expr(data, &regs, &mut parsed)?,
             "counter" => {}
             _ => return Err(Errno::EOPNOTSUPP),
@@ -843,6 +1118,12 @@ fn parse_rule_expressions(bytes: &[u8]) -> Result<NftRuleParse, Errno> {
 
 fn push_rule_expressions(out: &mut Vec<u8>, rule: NetfilterRule) {
     let mut next = 1u16;
+    if let Some(in_iface) = rule.in_iface {
+        push_ifname_match(out, &mut next, NFT_META_IIFNAME, in_iface);
+    }
+    if let Some(out_iface) = rule.out_iface {
+        push_ifname_match(out, &mut next, NFT_META_OIFNAME, out_iface);
+    }
     if let Some(src) = rule.src {
         push_ipv4_cidr_match(out, &mut next, NFT_PAYLOAD_NETWORK_HEADER, 12, src);
     }
@@ -850,11 +1131,34 @@ fn push_rule_expressions(out: &mut Vec<u8>, rule: NetfilterRule) {
         push_ipv4_cidr_match(out, &mut next, NFT_PAYLOAD_NETWORK_HEADER, 16, dst);
     }
     match rule.target {
-        NetfilterTarget::Masquerade => push_empty_expr(out, &mut next, "masq"),
+        NetfilterTarget::Masquerade => {
+            if let Some(name) = rule.compat_target {
+                push_compat_target_expr(out, &mut next, name);
+            } else {
+                push_empty_expr(out, &mut next, "masq");
+            }
+        }
         NetfilterTarget::Accept => push_immediate_verdict_expr(out, &mut next, NF_ACCEPT),
         NetfilterTarget::Drop => push_immediate_verdict_expr(out, &mut next, NF_DROP),
         NetfilterTarget::Dnat => push_summary_only_expr(out, &mut next),
     }
+}
+
+fn push_ifname_match(out: &mut Vec<u8>, next: &mut u16, key: u32, name: &str) {
+    let reg = NFT_REG32_00;
+    let mut value = [0u8; IFNAMSIZ];
+    let bytes = name.as_bytes();
+    let len = bytes.len().min(IFNAMSIZ.saturating_sub(1));
+    value[..len].copy_from_slice(&bytes[..len]);
+    push_meta_expr(out, next, reg, key);
+    push_cmp_expr(out, next, reg, &value);
+}
+
+fn push_meta_expr(out: &mut Vec<u8>, next: &mut u16, dreg: u32, key: u32) {
+    push_expr(out, next, "meta", |data| {
+        push_attr_u32(data, NFTA_META_DREG, dreg);
+        push_attr_u32(data, NFTA_META_KEY, key);
+    });
 }
 
 fn push_ipv4_cidr_match(
@@ -933,6 +1237,14 @@ fn push_immediate_verdict_expr(out: &mut Vec<u8>, next: &mut u16, verdict: u32) 
 
 fn push_empty_expr(out: &mut Vec<u8>, next: &mut u16, name: &str) {
     push_expr(out, next, name, |_| {});
+}
+
+fn push_compat_target_expr(out: &mut Vec<u8>, next: &mut u16, name: &str) {
+    push_expr(out, next, "target", |data| {
+        push_attr_string(data, NFTA_TARGET_NAME, name);
+        push_attr_u32(data, NFTA_TARGET_REV, 0);
+        push_attr(data, NFTA_TARGET_INFO, &[]);
+    });
 }
 
 fn push_summary_only_expr(out: &mut Vec<u8>, next: &mut u16) {
@@ -1118,6 +1430,19 @@ fn parse_nat_expr(
         )?);
     }
     Ok(())
+}
+
+fn parse_target_expr(data: &[u8], parsed: &mut NftRuleParse) -> Result<(), Errno> {
+    let attrs = parse_attrs(data)?;
+    let name = attr_string(&attrs, NFTA_TARGET_NAME).ok_or(Errno::EINVAL)?;
+    match name {
+        "MASQUERADE" => {
+            parsed.target = Some(NetfilterTarget::Masquerade);
+            parsed.compat_target = Some("MASQUERADE");
+            Ok(())
+        }
+        _ => Err(Errno::EOPNOTSUPP),
+    }
 }
 
 fn parse_rule_userdata(bytes: &[u8]) -> Result<NftRuleParse, Errno> {
@@ -1525,6 +1850,8 @@ fn hook_from_hooknum(value: u32) -> Result<NetfilterHook, Errno> {
 fn default_chain_priority(table: &str, chain: &str) -> i32 {
     match (table, chain) {
         ("nat", "PREROUTING") | ("nat", "prerouting") => -100,
+        ("nat", "INPUT") | ("nat", "input") => 100,
+        ("nat", "OUTPUT") | ("nat", "output") => -100,
         ("nat", "POSTROUTING") | ("nat", "postrouting") => 100,
         _ => 0,
     }
@@ -1688,6 +2015,7 @@ fn pad_to_align4(out: &mut Vec<u8>) {
 fn linux_errno_i32(errno: Errno) -> i32 {
     match errno {
         Errno::EINVAL => 22,
+        Errno::ENOENT => 2,
         Errno::ENOTCONN => 107,
         Errno::EOPNOTSUPP => 95,
         _ => 5,
@@ -1751,6 +2079,7 @@ struct NftRuleParse {
     in_iface: Option<&'static str>,
     out_iface: Option<&'static str>,
     target: Option<NetfilterTarget>,
+    compat_target: Option<&'static str>,
     to_addr: Option<Ipv4Address>,
     to_port: Option<u16>,
 }

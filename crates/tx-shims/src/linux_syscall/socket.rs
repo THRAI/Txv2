@@ -337,6 +337,15 @@ pub(super) fn sys_getsockname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         Ok((_, socket)) => socket,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
+    if matches!(
+        socket.kind,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
+    ) {
+        return match write_sockaddr_nl(ctx, args[1], args[2]) {
+            Ok(()) => SyscallResult::Return(0),
+            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        };
+    }
     let endpoint = match socket_local_endpoint(&socket) {
         Ok(endpoint) => endpoint,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
