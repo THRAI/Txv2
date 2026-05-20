@@ -61,6 +61,40 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     }
 
     const IOVEC_BYTES: u64 = 16;
+    if args[0] == 1 || args[0] == 2 {
+        let mut combined = alloc::vec::Vec::new();
+        for i in 0..iovcnt as u64 {
+            let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
+            let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
+                return SyscallResult::error_from(errno);
+            }
+            let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
+            let len = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap());
+            if len == 0 {
+                continue;
+            }
+
+            let old_len = combined.len();
+            combined.resize(old_len + len as usize, 0);
+            if let Err(errno) =
+                bootstrap_copy_from_user(&ctx.aspace, &mut combined[old_len..], base)
+            {
+                return SyscallResult::error_from(errno);
+            }
+        }
+
+        let write_args = [
+            args[0],
+            combined.as_ptr() as u64,
+            combined.len() as u64,
+            0,
+            0,
+            0,
+        ];
+        return sys_write(write_args, ctx).await;
+    }
+
     let mut total: i64 = 0;
     for i in 0..iovcnt as u64 {
         let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);

@@ -74,6 +74,15 @@ impl RunIdleReport {
     }
 }
 
+fn earliest_deadline(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 pub(crate) trait ClockSource {
     fn now_ns(&mut self) -> u64;
     fn set_deadline_ns(&mut self, deadline_ns: u64);
@@ -524,12 +533,16 @@ pub struct HartRuntimeView<'a> {
 
 impl HartRuntimeView<'_> {
     pub fn advance_time_to(&self, now_ns: u64) -> usize {
-        self.shared.timer_wheel.fire_due(now_ns);
-        self.shared.timers.lock().advance_time_to(now_ns)
+        let wheel_wakes = self.shared.timer_wheel.fire_due(now_ns);
+        let queue_wakes = self.shared.timers.lock().advance_time_to(now_ns);
+        wheel_wakes + queue_wakes
     }
 
     pub fn next_deadline_ns(&self) -> Option<u64> {
-        self.shared.timers.lock().next_deadline_ns()
+        earliest_deadline(
+            self.shared.timers.lock().next_deadline_ns(),
+            self.shared.timer_wheel.next_deadline_ns(),
+        )
     }
 
     pub fn drain_wakes_for_hart<S>(
@@ -1029,12 +1042,16 @@ impl Reactor {
 
     /// Advances the reactor-owned absolute nanosecond clock and wakes expired timers.
     pub fn advance_time_to(&self, now_ns: u64) -> usize {
-        self.shared.timer_wheel.fire_due(now_ns);
-        self.shared.timers.lock().advance_time_to(now_ns)
+        let wheel_wakes = self.shared.timer_wheel.fire_due(now_ns);
+        let queue_wakes = self.shared.timers.lock().advance_time_to(now_ns);
+        wheel_wakes + queue_wakes
     }
 
     pub fn next_deadline_ns(&self) -> Option<u64> {
-        self.shared.timers.lock().next_deadline_ns()
+        earliest_deadline(
+            self.shared.timers.lock().next_deadline_ns(),
+            self.shared.timer_wheel.next_deadline_ns(),
+        )
     }
 
     /// Create a future that resolves once the reactor's clock advances past `deadline_ns`.
@@ -1305,7 +1322,7 @@ impl Reactor {
     where
         C: ClockSource,
     {
-        let timer_wakes = self.shared.timers.lock().advance_time_to(clock.now_ns());
+        let timer_wakes = self.advance_time_to(clock.now_ns());
         let stats = self.run_until_idle();
         let next_deadline_ns = self.next_deadline_ns();
         match next_deadline_ns {
