@@ -165,7 +165,8 @@ fn dispatch_kill_different_uid_returns_neg_eperm() {
     // (`process_by_pid`) that `sys_kill` consults. The child
     // inherits the parent's root cred at fork time; we override
     // both creds below.
-    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false).expect("fork");
+    let child =
+        tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false).expect("fork");
     let child_pid = child.pid.0 as u64;
 
     // Drop the caller to (uid=1000, gid=1000) with empty caps so

@@ -151,9 +151,7 @@ impl BPB {
         // Determine FAT type
         if sectors_per_fat_16 != 0 {
             // FAT12 or FAT16
-            let root_dir_sectors =
-                ((root_entries as u32 * 32) + (bytes_per_sector as u32 - 1))
-                    / bytes_per_sector as u32;
+            let root_dir_sectors = (root_entries as u32 * 32).div_ceil(bytes_per_sector as u32);
             let fat_size = sectors_per_fat_16 as u32;
             let data_sectors = total_sectors
                 .saturating_sub(reserved_sectors as u32)
@@ -249,8 +247,7 @@ impl BPB {
         if self.fat_type == FatType::FAT32 {
             return 0;
         }
-        ((self.root_entries as u32 * 32) + (self.bytes_per_sector as u32 - 1))
-            / self.bytes_per_sector as u32
+        (self.root_entries as u32 * 32).div_ceil(self.bytes_per_sector as u32)
     }
 
     /// Sector index where data clusters start (cluster 2).
@@ -382,8 +379,10 @@ impl DirEntry {
     /// Render the 8.3 short name as a display-ready byte slice (space-trimmed).
     pub fn short_name_bytes(&self) -> &[u8] {
         // Name is 8 bytes, extension is 3 bytes
-        let name_part =
-            &self.name[..8].iter().rposition(|&b| b != b' ').map_or(&[] as &[u8], |pos| &self.name[..=pos]);
+        let name_part = &self.name[..8]
+            .iter()
+            .rposition(|&b| b != b' ')
+            .map_or(&[] as &[u8], |pos| &self.name[..=pos]);
         let ext_part = &self.name[8..11];
         // If extension is all spaces, no dot
         if ext_part.iter().all(|&b| b == b' ') {
@@ -420,6 +419,7 @@ pub struct LFNDirEntry {
 }
 
 impl LFNDirEntry {
+    #[allow(clippy::needless_range_loop)]
     pub fn parse(raw: &[u8]) -> Option<Self> {
         if raw.len() < DIR_ENTRY_SIZE {
             return None;
@@ -449,7 +449,11 @@ impl LFNDirEntry {
 
         let checksum = raw[13];
 
-        Some(LFNDirEntry { seq, chars, checksum })
+        Some(LFNDirEntry {
+            seq,
+            chars,
+            checksum,
+        })
     }
 
     /// Whether this is the last (first in sequence) LFN fragment.
@@ -551,7 +555,12 @@ fn read_u16_le(buf: &[u8], offset: usize) -> u16 {
 }
 
 fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
+    u32::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ])
 }
 
 // ====================================================================
@@ -624,7 +633,7 @@ mod tests {
         assert_eq!(bpb.fat_start_sector(), 32);
         // Root dir starts after reserved + 2 FATs × 256 sectors
         assert_eq!(bpb.root_dir_start_sector(), 32 + 2 * 256); // 544
-        // Data area = root dir start (FAT32 has no fixed root dir region)
+                                                               // Data area = root dir start (FAT32 has no fixed root dir region)
         assert_eq!(bpb.data_start_sector(), 544);
     }
 
@@ -696,7 +705,7 @@ mod tests {
         raw[2] = 0x00; // 'a'
         raw[3] = 0x62;
         raw[4] = 0x00; // 'b'
-        // checksum
+                       // checksum
         raw[13] = 0xAB;
 
         let lfn = LFNDirEntry::parse(&raw).expect("should parse");
@@ -772,7 +781,7 @@ mod tests {
     fn time_decode() {
         // 14:30:00: hours 14, minutes 30, seconds 0
         // time = (14 << 11) | (30 << 5) | 0 = 0x73C0
-        let time: u16 = (14 << 11) | (30 << 5) | 0;
+        let time: u16 = (14 << 11) | (30 << 5);
         let (hours, minutes, seconds) = decode_time(time);
         assert_eq!(hours, 14);
         assert_eq!(minutes, 30);

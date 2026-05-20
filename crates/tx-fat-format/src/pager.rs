@@ -7,7 +7,7 @@
 use alloc::vec::Vec;
 
 use crate::ondisk::{
-    self, BPB, BPBParseError, DirEntry, FatType, LFNDirEntry, ATTR_LFN, ATTR_LFN_MASK,
+    self, BPBParseError, DirEntry, FatType, LFNDirEntry, ATTR_LFN, ATTR_LFN_MASK, BPB,
     DIR_ENTRY_FREE, DIR_ENTRY_LAST, DIR_ENTRY_SIZE, LFN_LAST_MASK, LFN_MAX_ENTRIES,
 };
 
@@ -144,7 +144,9 @@ impl<I: BlockImage> FatPager<I> {
     /// very large FATs would require a paging strategy; see design doc §8.2).
     pub fn open(image: I) -> Result<Self> {
         let mut sector0 = [0u8; BLOCK_SIZE];
-        image.read_block(0, &mut sector0).map_err(|_| FatFormatError::IO)?;
+        image
+            .read_block(0, &mut sector0)
+            .map_err(|_| FatFormatError::IO)?;
         let bpb = BPB::parse(&sector0)?;
 
         // Read the active FAT into cache
@@ -163,11 +165,20 @@ impl<I: BlockImage> FatPager<I> {
             let sector = fat_start + i;
             let offset = (i as usize) * BLOCK_SIZE;
             image
-                .read_block(sector, (&mut fat_cache[offset..offset + BLOCK_SIZE]).try_into().unwrap())
+                .read_block(
+                    sector,
+                    (&mut fat_cache[offset..offset + BLOCK_SIZE])
+                        .try_into()
+                        .unwrap(),
+                )
                 .map_err(|_| FatFormatError::IO)?;
         }
 
-        Ok(Self { image, bpb, fat_cache })
+        Ok(Self {
+            image,
+            bpb,
+            fat_cache,
+        })
     }
 
     /// Read a raw FAT entry for a cluster.
@@ -243,8 +254,7 @@ impl<I: BlockImage> FatPager<I> {
                 self.fat_cache[offset..offset + 2].copy_from_slice(&new.to_le_bytes());
             }
             FatType::FAT16 => {
-                self.fat_cache[offset..offset + 2]
-                    .copy_from_slice(&(value as u16).to_le_bytes());
+                self.fat_cache[offset..offset + 2].copy_from_slice(&(value as u16).to_le_bytes());
             }
             FatType::FAT32 => {
                 // FAT32 uses 28-bit entries; preserve high 4 bits.
@@ -392,11 +402,7 @@ impl<I: BlockImage> FatPager<I> {
     /// Mark a directory entry as deleted by writing 0xE5 as its first
     /// byte.  Works for both subdirectory and root directory entries.
     /// `entry_index` is the 0-based index in the raw directory buffer.
-    pub fn delete_dirent_in_subdir(
-        &mut self,
-        parent_cluster: u32,
-        entry_index: u32,
-    ) -> Result<()> {
+    pub fn delete_dirent_in_subdir(&mut self, parent_cluster: u32, entry_index: u32) -> Result<()> {
         let chain = self.walk_fat_chain(parent_cluster)?;
         let cluster_size = self.bpb.bytes_per_cluster() as usize;
         let total_len = chain.len() * cluster_size;
@@ -558,12 +564,7 @@ impl<I: BlockImage> FatPager<I> {
     /// large enough to hold all cluster data. Returns the number of
     /// bytes valid in `buf` (the file size may be less than the
     /// allocated cluster chain).
-    pub fn read_cluster_chain(
-        &self,
-        chain: &[u32],
-        file_size: u32,
-        buf: &mut [u8],
-    ) -> Result<u32> {
+    pub fn read_cluster_chain(&self, chain: &[u32], file_size: u32, buf: &mut [u8]) -> Result<u32> {
         let cluster_size = self.bpb.bytes_per_cluster() as usize;
         let total_bytes = (chain.len() * cluster_size).min(buf.len());
         for (i, &cluster) in chain.iter().enumerate() {
@@ -600,6 +601,7 @@ impl<I: BlockImage> FatPager<I> {
 
     /// Append a new 8.3 directory entry to a subdirectory.  Returns
     /// the entry index (0-based) within the raw directory buffer.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_dirent_in_subdir(
         &mut self,
         parent_cluster: u32,
@@ -621,7 +623,13 @@ impl<I: BlockImage> FatPager<I> {
         }
 
         let (entry_index, wrote) = Self::write_dirent_into_buf(
-            &mut buf, short_name, attr, first_cluster, size, write_date, write_time,
+            &mut buf,
+            short_name,
+            attr,
+            first_cluster,
+            size,
+            write_date,
+            write_time,
         );
         if !wrote {
             return Err(FatFormatError::OutOfBounds); // directory full
@@ -637,6 +645,7 @@ impl<I: BlockImage> FatPager<I> {
     }
 
     /// Append a new 8.3 directory entry to the FAT12/16 root directory.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_dirent_in_root(
         &mut self,
         short_name: &[u8; 11],
@@ -653,7 +662,13 @@ impl<I: BlockImage> FatPager<I> {
         self.read_blocks(root_start, &mut buf)?;
 
         let (entry_index, wrote) = Self::write_dirent_into_buf(
-            &mut buf, short_name, attr, first_cluster, size, write_date, write_time,
+            &mut buf,
+            short_name,
+            attr,
+            first_cluster,
+            size,
+            write_date,
+            write_time,
         );
         if !wrote {
             return Err(FatFormatError::OutOfBounds);
@@ -1135,12 +1150,13 @@ mod tests {
         let entry = &mut root_dir[0..32];
         entry[0..5].copy_from_slice(b"HELLO");
         // pad name with spaces
+        #[allow(clippy::needless_range_loop)]
         for i in 5..8 {
             entry[i] = b' ';
         }
         entry[8..11].copy_from_slice(b"TXT");
         entry[11] = 0x20; // archive
-        // first cluster = 3
+                          // first cluster = 3
         entry[26] = 3;
         entry[27] = 0;
         entry[20] = 0;
@@ -1292,7 +1308,7 @@ mod tests {
         entry[7] = b' ';
         entry[8..11].copy_from_slice(b"TXT");
         entry[11] = 0x20; // archive
-        // first cluster = 3
+                          // first cluster = 3
         entry[26] = 3;
         entry[27] = 0;
         entry[20] = 0;

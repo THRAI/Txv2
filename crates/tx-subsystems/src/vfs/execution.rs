@@ -11,12 +11,12 @@ use alloc::vec::Vec;
 use crate::execution::Guard;
 use crate::page_backed::FsPageBacking;
 use crate::tty;
-use crate::vm::AddressSpace;
-use tx_hal::UserPtr;
 use crate::vfs::adapter::step_engine::{
     self, ByteProgress, Cap, Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome,
     SubjectIdentity,
 };
+use crate::vm::AddressSpace;
+use tx_hal::UserPtr;
 
 use super::structure::{
     Credential, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileBacking, OpenFileIoctl,

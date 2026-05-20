@@ -41,6 +41,11 @@ tx-observe = { path = "../tx-observe" }
 # already used by Phase 2a's syscall-dispatch tests in `tx-shims`.
 tx-subsystems = { path = "../tx-subsystems", features = ["test-support"] }
 
+[features]
+# Enable the per-reactor-step epoch/guard diagnostic console prints.
+# Off by default; noisy and not needed in normal test runs.
+diag-epoch-guards = []
+
 [lib]
 path = "src/lib.rs"
 test = true

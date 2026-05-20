@@ -270,13 +270,21 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         if flags & CLONE_SIGHAND == 0 {
             return SyscallResult::Error(EINVAL_VALUE);
         }
-        SIGCHLD | CLONE_THREAD | CLONE_VM | CLONE_SIGHAND
-            | CLONE_SETTLS | CLONE_CHILD_CLEARTID | CLONE_PARENT_SETTID
-            | CLONE_FILES | CLONE_FS | CLONE_DETACHED
-            | CLONE_SYSVSEM | CLONE_NEWCGROUP | CLONE_NEWUTS
+        SIGCHLD
+            | CLONE_THREAD
+            | CLONE_VM
+            | CLONE_SIGHAND
+            | CLONE_SETTLS
+            | CLONE_CHILD_CLEARTID
+            | CLONE_PARENT_SETTID
+            | CLONE_FILES
+            | CLONE_FS
+            | CLONE_DETACHED
+            | CLONE_SYSVSEM
+            | CLONE_NEWCGROUP
+            | CLONE_NEWUTS
     } else {
-        SIGCHLD | CLONE_SETTLS | CLONE_VM | CLONE_VFORK
-            | CLONE_SIGHAND | CLONE_FILES | CLONE_FS
+        SIGCHLD | CLONE_SETTLS | CLONE_VM | CLONE_VFORK | CLONE_SIGHAND | CLONE_FILES | CLONE_FS
     };
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
@@ -308,14 +316,13 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     // ProcessIdentity is created.
     if clone_thread {
         let ctid_ptr = if clone_child_cleartid { args[4] } else { 0 };
-        let child_thread =
-            tx_subsystems::process::execution::step_clone_thread(
-                &ctx.process,
-                &parent_user_ctx,
-                stack as usize,
-                tls as usize,
-                ctid_ptr,
-            );
+        let child_thread = tx_subsystems::process::execution::step_clone_thread(
+            &ctx.process,
+            &parent_user_ctx,
+            stack as usize,
+            tls as usize,
+            ctid_ptr,
+        );
         let child_thread = match child_thread {
             Ok(t) => t,
             Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
@@ -335,11 +342,16 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             }
         }
 
-        // Hand the child thread to the reactor.
-        reactor_submit::submit_child_thread(
-            ctx.process.clone(),
+        // Register the child thread's TID in the global PID
+        // namespace so resolve_pid_number(tid) can find it —
+        // pthread_cancel / tkill need this to route signals.
+        tx_subsystems::process::numbers::register_tid(
+            child_thread.tid,
             child_thread.clone(),
         );
+
+        // Hand the child thread to the reactor.
+        reactor_submit::submit_child_thread(ctx.process.clone(), child_thread.clone());
 
         return SyscallResult::Return(child_thread.tid.0 as i64);
     }

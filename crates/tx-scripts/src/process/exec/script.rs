@@ -96,7 +96,7 @@ fn emit_process_label_for(pid_low: u32, comm: &[u8; 16]) {
     let mut truncated = [0u8; 12];
     let n = core::cmp::min(comm.len(), truncated.len());
     truncated[..n].copy_from_slice(&comm[..n]);
-    if !truncated.iter().any(|&b| b == 0) {
+    if !truncated.contains(&0) {
         truncated[truncated.len() - 1] = 0;
     }
     let payload = tx_observe::PayloadProcessLabel {
@@ -603,10 +603,20 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 let mut musl_path = alloc::vec::Vec::with_capacity(5 + interp_path.len());
                 musl_path.extend_from_slice(b"/musl");
                 musl_path.extend_from_slice(interp_path);
-                outcome = step_open(rooted_at, &musl_path, OpenFileFlags {
-                    read: true, write: false, append: false,
-                    cloexec: false, nonblocking: false,
-                }, 0, cred, &guard);
+                outcome = step_open(
+                    rooted_at,
+                    &musl_path,
+                    OpenFileFlags {
+                        read: true,
+                        write: false,
+                        append: false,
+                        cloexec: false,
+                        nonblocking: false,
+                    },
+                    0,
+                    cred,
+                    &guard,
+                );
             }
             match outcome {
                 V3::Done(file) => file,

@@ -17,10 +17,7 @@ use super::*;
 /// (canonical `aspace.copy_to_user` lane with kernel-pointer fallback
 /// for test scaffolding). Null `buf` with non-zero `buflen` returns
 /// `-EFAULT`; `buflen == 0` is a successful no-op (`Return(0)`).
-pub(super) fn sys_getrandom<'a>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+pub(super) fn sys_getrandom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let buf_uaddr = args[0];
     let buf_len = args[1] as usize;
     let _flags = args[2] as u32; // GRND_* recognised but ignored.

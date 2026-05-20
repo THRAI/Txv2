@@ -18,7 +18,9 @@ use crate::adapter::step_engine::StepOutcome;
 use alloc::vec::Vec;
 use tx_hal::UserPtr;
 use tx_subsystems::execution::Errno;
-use tx_subsystems::vm::{AddressSpace, UserAccessKind, UserPage, UserRange, USER_PAGE_SIZE};
+use tx_subsystems::vm::{
+    AddressSpace, UserAccessKind, UserPage, UserRange, FULL_USER_V1_TOP, USER_PAGE_SIZE,
+};
 
 /// Outcome of `read_user_cstr` — distinguishes "no NUL within budget"
 /// from a successful copy. The successful arm yields the bytes up to
@@ -166,10 +168,17 @@ pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) ->
         V3::Done(v) => Ok(v),
         V3::Err(V3Errno::EFAULT) => {
             drop(guard);
-            // Fallback: kernel-pointer bootstrap exemption.
-            // SAFETY: existing dispatch tests pass kernel-side pointers
-            // directly. The fallback is a bridge until tests migrate.
-            Ok(unsafe { core::ptr::read_volatile(uaddr as *const T) })
+            #[cfg(target_os = "none")]
+            {
+                Err(Errno::EFAULT)
+            }
+            #[cfg(not(target_os = "none"))]
+            {
+                if uaddr < 0x1000 {
+                    return Err(Errno::EFAULT);
+                }
+                Ok(unsafe { core::ptr::read_volatile(uaddr as *const T) })
+            }
         }
         V3::Err(e) => Err(e.into()),
         V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
@@ -190,11 +199,20 @@ pub(super) fn bootstrap_write_user<T: Copy>(
         V3::Done(()) | V3::Continue { .. } => Ok(()),
         V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
             drop(guard);
-            // SAFETY: see `bootstrap_read_user`.
-            unsafe {
-                core::ptr::write_volatile(uaddr as *mut T, value);
+            #[cfg(target_os = "none")]
+            {
+                Err(Errno::EFAULT)
             }
-            Ok(())
+            #[cfg(not(target_os = "none"))]
+            {
+                if uaddr < 0x1000 {
+                    return Err(Errno::EFAULT);
+                }
+                unsafe {
+                    core::ptr::write_volatile(uaddr as *mut T, value);
+                }
+                Ok(())
+            }
         }
         V3::Err(e) => Err(Errno::from(e)),
         V3::Yield { .. } => Err(Errno::EIO),
@@ -233,32 +251,65 @@ pub(super) fn bootstrap_copy_from_user(
     if dst.is_empty() {
         return Ok(());
     }
-    let guard = step_engine::guard();
 
-    // Prefault: eagerly materialise every page in the user range so
-    // the copy below hits the pmap cache exclusively. If any page is
-    // unmapped or has a protection mismatch, fail before copying any
-    // bytes (PAGE_BACKED_v1 §3 prefault discipline).
-    if let Some(range) = covering_user_range(uaddr, dst.len()) {
-        match aspace.reserve_user_range_for_access(range, UserAccessKind::Read) {
-            V3::Done(()) => {}
-            V3::Err(e) => return Err(Errno::from(e)),
-            V3::Yield { .. } | V3::Continue { .. } => return Err(Errno::EIO),
+    #[cfg(target_os = "none")]
+    {
+        if let Some(range) = covering_user_range(uaddr, dst.len()) {
+            match aspace.reserve_user_range_for_access(range, UserAccessKind::Read) {
+                V3::Done(()) => {}
+                V3::Err(e) => return Err(Errno::from(e)),
+                V3::Yield { .. } | V3::Continue { .. } => return Err(Errno::EIO),
+            }
+        }
+
+        let guard = step_engine::guard();
+        match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
+            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Err(e) => Err(Errno::from(e)),
+            V3::Yield { .. } => Err(Errno::EIO),
         }
     }
 
-    match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
-        V3::Done(_) | V3::Continue { .. } => Ok(()),
-        V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
-            drop(guard);
-            // SAFETY: see `bootstrap_read_user`.
+    #[cfg(not(target_os = "none"))]
+    {
+        let mut prefault_failed_with_efault = false;
+        if let Some(range) = covering_user_range(uaddr, dst.len()) {
+            match aspace.reserve_user_range_for_access(range, UserAccessKind::Read) {
+                V3::Done(()) => {}
+                V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
+                    if uaddr < 0x1000 {
+                        return Err(Errno::EFAULT);
+                    }
+                    prefault_failed_with_efault = true;
+                }
+                V3::Err(e) => return Err(Errno::from(e)),
+                V3::Yield { .. } | V3::Continue { .. } => return Err(Errno::EIO),
+            }
+        }
+
+        if prefault_failed_with_efault {
             unsafe {
                 core::ptr::copy_nonoverlapping(uaddr as *const u8, dst.as_mut_ptr(), dst.len());
             }
-            Ok(())
+            return Ok(());
         }
-        V3::Err(e) => Err(Errno::from(e)),
-        V3::Yield { .. } => Err(Errno::EIO),
+
+        let guard = step_engine::guard();
+        match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
+            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
+                drop(guard);
+                if uaddr < 0x1000 {
+                    return Err(Errno::EFAULT);
+                }
+                unsafe {
+                    core::ptr::copy_nonoverlapping(uaddr as *const u8, dst.as_mut_ptr(), dst.len());
+                }
+                Ok(())
+            }
+            V3::Err(e) => Err(Errno::from(e)),
+            V3::Yield { .. } => Err(Errno::EIO),
+        }
     }
 }
 
@@ -274,31 +325,65 @@ pub(super) fn bootstrap_copy_to_user(
     if src.is_empty() {
         return Ok(());
     }
-    let guard = step_engine::guard();
 
-    // Prefault: eagerly materialise every page in the user range so
-    // the copy below hits the pmap cache exclusively (PAGE_BACKED_v1
-    // §3 prefault discipline).
-    if let Some(range) = covering_user_range(uaddr, src.len()) {
-        match aspace.reserve_user_range_for_access(range, UserAccessKind::Write) {
-            V3::Done(()) => {}
-            V3::Err(e) => return Err(Errno::from(e)),
-            V3::Yield { .. } | V3::Continue { .. } => return Err(Errno::EIO),
+    #[cfg(target_os = "none")]
+    {
+        if let Some(range) = covering_user_range(uaddr, src.len()) {
+            match aspace.reserve_user_range_for_access(range, UserAccessKind::Write) {
+                V3::Done(()) => {}
+                V3::Err(e) => return Err(Errno::from(e)),
+                V3::Yield { .. } | V3::Continue { .. } => return Err(Errno::EIO),
+            }
+        }
+
+        let guard = step_engine::guard();
+        match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
+            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Err(e) => Err(Errno::from(e)),
+            V3::Yield { .. } => Err(Errno::EIO),
         }
     }
 
-    match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
-        V3::Done(_) | V3::Continue { .. } => Ok(()),
-        V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
-            drop(guard);
-            // SAFETY: see `bootstrap_read_user`.
+    #[cfg(not(target_os = "none"))]
+    {
+        let mut prefault_failed_with_efault = false;
+        if let Some(range) = covering_user_range(uaddr, src.len()) {
+            match aspace.reserve_user_range_for_access(range, UserAccessKind::Write) {
+                V3::Done(()) => {}
+                V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
+                    if uaddr < 0x1000 {
+                        return Err(Errno::EFAULT);
+                    }
+                    prefault_failed_with_efault = true;
+                }
+                V3::Err(e) => return Err(Errno::from(e)),
+                V3::Yield { .. } | V3::Continue { .. } => return Err(Errno::EIO),
+            }
+        }
+
+        if prefault_failed_with_efault {
             unsafe {
                 core::ptr::copy_nonoverlapping(src.as_ptr(), uaddr as *mut u8, src.len());
             }
-            Ok(())
+            return Ok(());
         }
-        V3::Err(e) => Err(Errno::from(e)),
-        V3::Yield { .. } => Err(Errno::EIO),
+
+        let guard = step_engine::guard();
+        match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
+            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
+                drop(guard);
+                if uaddr < 0x1000 {
+                    return Err(Errno::EFAULT);
+                }
+                unsafe {
+                    core::ptr::copy_nonoverlapping(src.as_ptr(), uaddr as *mut u8, src.len());
+                }
+                Ok(())
+            }
+            V3::Err(e) => Err(Errno::from(e)),
+            V3::Yield { .. } => Err(Errno::EIO),
+        }
     }
 }
 
@@ -323,19 +408,29 @@ pub(super) fn bootstrap_read_user_cstr(
         V3::Done(v) => Ok(v),
         V3::Err(V3Errno::EFAULT) => {
             drop(guard);
-            // Fallback bootstrap scan — matches the previous inline
-            // helper.
-            let mut out: Vec<u8> = Vec::with_capacity(core::cmp::min(max_len, 256));
-            for offset in 0..max_len {
-                // SAFETY: see `bootstrap_read_user`.
-                let byte =
-                    unsafe { core::ptr::read_volatile((uaddr as usize + offset) as *const u8) };
-                if byte == 0 {
-                    return Ok(out);
-                }
-                out.push(byte);
+            #[cfg(target_os = "none")]
+            {
+                Err(Errno::EFAULT)
             }
-            Err(Errno::ENAMETOOLONG)
+            #[cfg(not(target_os = "none"))]
+            {
+                if uaddr < 0x1000 {
+                    return Err(Errno::EFAULT);
+                }
+                // Fallback bootstrap scan — matches the previous inline
+                // helper.
+                let mut out: Vec<u8> = Vec::with_capacity(core::cmp::min(max_len, 256));
+                for offset in 0..max_len {
+                    // SAFETY: see `bootstrap_read_user`.
+                    let byte =
+                        unsafe { core::ptr::read_volatile((uaddr as usize + offset) as *const u8) };
+                    if byte == 0 {
+                        return Ok(out);
+                    }
+                    out.push(byte);
+                }
+                Err(Errno::ENAMETOOLONG)
+            }
         }
         V3::Err(e) => Err(e.into()),
         V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),

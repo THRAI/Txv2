@@ -96,6 +96,11 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             }
             other => return other,
         }
+        // Yield the guard between iterations so the epoch can advance
+        // and retired zone nodes can be reclaimed.  Without this, a
+        // multi-element writev (common for musl's buffered stdio)
+        // can exhaust the retired-node pool.
+        drop(step_engine::guard());
     }
     SyscallResult::Return(total)
 }
@@ -348,7 +353,10 @@ async fn sys_write_pagebacked<'a>(
         use crate::adapter::step_engine::StepOutcome as V3;
         use tx_subsystems::vm::UserAccessKind;
         let _guard = crate::adapter::step_engine::guard();
-        match ctx.aspace.reserve_user_range_for_access(range, UserAccessKind::Read) {
+        match ctx
+            .aspace
+            .reserve_user_range_for_access(range, UserAccessKind::Read)
+        {
             V3::Done(()) => {}
             V3::Err(e) => {
                 let errno: tx_subsystems::execution::Errno = e.into();
@@ -413,9 +421,6 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     if fd < 0 {
         return SyscallResult::Error(EBADF_VALUE);
     }
-    if len > TTY_WRITE_MAX_INLINE {
-        return SyscallResult::Error(E2BIG_VALUE);
-    }
 
     // Resolve fd → Cap<OpenFile> against the process payload's stub
     // fd table. Holding the payload guard across the lookup is fine —
@@ -424,6 +429,15 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let file = match resolve_fd(&ctx.process, fd as u32) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
+    };
+
+    let len = if matches!(
+        file.rnode().backing(),
+        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
+    ) {
+        len
+    } else {
+        core::cmp::min(len, TTY_WRITE_MAX_INLINE)
     };
 
     // eventfd fds carry their own `write(2)` arm — add a 64-bit
@@ -536,7 +550,10 @@ async fn sys_read_pagebacked<'a, P: tx_hal::TimeIf>(
         use crate::adapter::step_engine::StepOutcome as V3;
         use tx_subsystems::vm::UserAccessKind;
         let _guard = crate::adapter::step_engine::guard();
-        match ctx.aspace.reserve_user_range_for_access(range, UserAccessKind::Write) {
+        match ctx
+            .aspace
+            .reserve_user_range_for_access(range, UserAccessKind::Write)
+        {
             V3::Done(()) => {}
             V3::Err(e) => {
                 let errno: tx_subsystems::execution::Errno = e.into();
@@ -602,13 +619,19 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     if fd < 0 {
         return SyscallResult::Error(EBADF_VALUE);
     }
-    if len > TTY_WRITE_MAX_INLINE {
-        return SyscallResult::Error(E2BIG_VALUE);
-    }
 
     let file = match resolve_fd(&ctx.process, fd as u32) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
+    };
+
+    let len = if matches!(
+        file.rnode().backing(),
+        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
+    ) {
+        len
+    } else {
+        core::cmp::min(len, TTY_WRITE_MAX_INLINE)
     };
 
     if len == 0 {
@@ -719,10 +742,7 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
 /// `*offset` and writes the updated position back; the input file's
 /// fd-level cursor is not touched in this case.  If `offset` is NULL,
 /// the input file's fd cursor is used and advanced.
-pub(super) async fn sys_sendfile64<'a>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+pub(super) async fn sys_sendfile64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     use tx_subsystems::page_backed::step_copy_file_range;
     use tx_subsystems::vfs::structure::RNodeBacking;
 
@@ -809,7 +829,7 @@ pub(super) async fn sys_sendfile64<'a>(
     if needs_offset_writeback {
         let new_off = in_offset + transferred as u64;
         let bytes = new_off.to_le_bytes();
-        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, offset_ptr, &bytes) {
+        if let Err(_errno) = bootstrap_copy_to_user(&ctx.aspace, offset_ptr, &bytes) {
             // On partial success, Linux prefers to return the byte
             // count rather than the fault error.
             return SyscallResult::Return(transferred as i64);
