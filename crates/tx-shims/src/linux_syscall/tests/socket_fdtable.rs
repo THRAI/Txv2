@@ -30,6 +30,8 @@ const SOCKADDR_NL_BYTES: u32 = 12;
 const TEST_POLLIN: i16 = 0x0001;
 const NLM_F_REQUEST: u16 = 0x0001;
 const NLM_F_DUMP: u16 = 0x0300;
+const MSG_PEEK: u64 = 0x02;
+const MSG_TRUNC: u64 = 0x20;
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const NFNL_SUBSYS_NFTABLES: u16 = 10;
@@ -826,6 +828,98 @@ fn dispatch_netlink_route_getlink_sendmsg_recvmsg_returns_dump() {
     assert_eq!(recv_hdr.namelen, SOCKADDR_NL_BYTES);
     assert_eq!(recv_hdr.flags, 0);
     assert_eq!(u16::from_le_bytes([source[0], source[1]]), AF_NETLINK);
+    assert_eq!(u16::from_le_bytes([response[4], response[5]]), RTM_NEWLINK);
+    assert!(response[..recv].windows(3).any(|window| window == b"lo\0"));
+}
+
+#[test]
+fn dispatch_netlink_route_recvmsg_peek_trunc_reports_datagram_len() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_netlink(&ctx);
+    let nladdr = sockaddr_nl();
+    let request = rtnl_getlink_request(0x45);
+
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                fd as u64,
+                request.as_ptr() as u64,
+                request.len() as u64,
+                0,
+                nladdr.as_ptr() as u64,
+                SOCKADDR_NL_BYTES as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(request.len() as i64)
+    );
+
+    let mut peek_hdr = TestMsghdr {
+        name: 0,
+        namelen: 0,
+        _pad0: 0,
+        iov: 0,
+        iovlen: 0,
+        control: 0,
+        controllen: 0,
+        flags: 0,
+        _pad1: 0,
+    };
+    let peek_len = match socket_req(
+        NR_RECVMSG,
+        [
+            fd as u64,
+            (&mut peek_hdr as *mut TestMsghdr) as u64,
+            MSG_PEEK | MSG_TRUNC,
+            0,
+            0,
+            0,
+        ],
+        &ctx,
+    ) {
+        SyscallResult::Return(recv) => recv as usize,
+        other => panic!("peek-trunc recvmsg netlink failed: {other:?}"),
+    };
+
+    assert!(peek_len >= 20);
+    assert_eq!(peek_hdr.flags, MSG_TRUNC as u32);
+
+    let mut response = [0u8; 8192];
+    let recv_iov = [TestIovec {
+        base: response.as_mut_ptr() as u64,
+        len: response.len() as u64,
+    }];
+    let mut recv_hdr = TestMsghdr {
+        name: 0,
+        namelen: 0,
+        _pad0: 0,
+        iov: recv_iov.as_ptr() as u64,
+        iovlen: recv_iov.len() as u64,
+        control: 0,
+        controllen: 0,
+        flags: 0xFFFF_FFFF,
+        _pad1: 0,
+    };
+    let recv = match socket_req(
+        NR_RECVMSG,
+        [
+            fd as u64,
+            (&mut recv_hdr as *mut TestMsghdr) as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
+        &ctx,
+    ) {
+        SyscallResult::Return(recv) => recv as usize,
+        other => panic!("post-peek recvmsg netlink failed: {other:?}"),
+    };
+
+    assert_eq!(recv, peek_len);
+    assert_eq!(recv_hdr.flags, 0);
     assert_eq!(u16::from_le_bytes([response[4], response[5]]), RTM_NEWLINK);
     assert!(response[..recv].windows(3).any(|window| window == b"lo\0"));
 }

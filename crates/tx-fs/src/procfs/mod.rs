@@ -1442,6 +1442,42 @@ mod tests {
     }
 
     #[test]
+    fn procfs_net_dev_renders_loopback_and_namespace_links() {
+        let _lock = PROCFS_TEST_LOCK.lock().expect("procfs test lock");
+        init_procfs_test();
+        let guard = tx_substrate::epoch::guard();
+        let procfs = Procfs::new();
+        let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+            left: VethEndpointConfig {
+                name: "procdev0",
+                devt: DevT::new(98, 11),
+                mac: EthernetAddress::new([0x02, 0, 0, 0x72, 1, 1]),
+            },
+            right: VethEndpointConfig {
+                name: "procpeer0",
+                devt: DevT::new(98, 12),
+                mac: EthernetAddress::new([0x02, 0, 0, 0x72, 1, 2]),
+            },
+            mtu: VETH_DEFAULT_MTU,
+        });
+        let netns = tx_subsystems::net::initial_net_namespace_payload();
+        netns
+            .attach_device_for_test_or_bootstrap(pair.left, None)
+            .expect("attach procdev0");
+
+        let mut out = [0u8; 512];
+        let read = match procfs.step_read_projected(PROCFS_NET_DEV_ID, 0, &mut out, &guard) {
+            StepOutcome::Done(read) => read as usize,
+            other => panic!("dev read failed: {other:?}"),
+        };
+        let text = core::str::from_utf8(&out[..read]).expect("dev text utf8");
+
+        assert!(text.contains("Inter-|"));
+        assert!(text.contains("lo"));
+        assert!(text.contains("procdev0"));
+    }
+
+    #[test]
     fn procfs_ip_forward_read_write_toggles_initial_namespace_forwarding() {
         let _setup = setup();
         let guard = adapter::step_engine::guard();

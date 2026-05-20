@@ -342,9 +342,10 @@ fn render_net_arp(caller_netns: Option<&NetNamespacePayload>) -> String {
 }
 
 fn render_net_dev(caller_netns: Option<&NetNamespacePayload>) -> String {
-    with_proc_netns(caller_netns, |netns| {
-        tx_subsystems::net::proc_net_dev_snapshot_text(&netns.ether_ifaces_snapshot())
-    })
+    with_proc_netns(
+        caller_netns,
+        tx_subsystems::net::proc_net_dev_snapshot_text_for_namespace,
+    )
 }
 
 fn render_netfilter_rules(caller_netns: Option<&NetNamespacePayload>) -> String {

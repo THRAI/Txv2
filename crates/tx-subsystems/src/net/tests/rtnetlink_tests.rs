@@ -55,6 +55,38 @@ fn rtnetlink_getlink_dump_reports_loopback_and_done() {
 }
 
 #[test]
+fn rtnetlink_getlink_single_by_name_reports_requested_link() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-getlink-one")
+        .expect("namespace")
+        .payload_cap()
+        .expect("namespace payload");
+    let root = crate::cred::Cred::root();
+
+    let bridge_req = nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        11,
+        &newlink_payload("docker0", bridge_linkinfo()),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &bridge_req)[0]);
+
+    let mut payload = ifinfomsg(0, 0, 0);
+    push_attr_string(&mut payload, IFLA_IFNAME, "docker0");
+    let request = nlmsg(RTM_GETLINK, NLM_F_REQUEST, 12, &payload);
+    let responses = rtnetlink_handle_request(&ns, root, &request);
+
+    assert_eq!(responses.len(), 1);
+    assert_eq!(nlmsg_type(&responses[0]), RTM_NEWLINK);
+    assert!(contains_bytes(&responses[0], b"docker0\0"));
+    assert!(!contains_bytes(&responses[0], b"lo\0"));
+}
+
+#[test]
 fn rtnetlink_newlink_setlink_and_newaddr_mutate_namespace_snapshot() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -146,6 +178,53 @@ fn rtnetlink_newlink_setlink_and_newaddr_mutate_namespace_snapshot() {
     assert!(getaddr
         .iter()
         .any(|msg| nlmsg_type(msg) == RTM_NEWADDR && contains_bytes(msg, &[172, 17, 0, 2])));
+}
+
+#[test]
+fn rtnetlink_newlink_without_create_updates_existing_link_flags() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-newlink-set")
+        .expect("namespace")
+        .payload_cap()
+        .expect("namespace payload");
+    let root = crate::cred::Cred::root();
+
+    let bridge_req = nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        27,
+        &newlink_payload("docker0", bridge_linkinfo()),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &bridge_req)[0]);
+    let bridge_ifindex = ifindex_for(&ns.link_snapshot(), "docker0");
+
+    let set_down_req = nlmsg(
+        RTM_SETLINK,
+        NLM_F_REQUEST | NLM_F_ACK,
+        28,
+        &ifinfomsg(bridge_ifindex, 0, IFF_UP),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &set_down_req)[0]);
+    assert!(ns
+        .link_snapshot()
+        .iter()
+        .any(|link| link.name == "docker0" && !link.is_up));
+
+    let set_up_req = nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK,
+        29,
+        &ifinfomsg(bridge_ifindex, IFF_UP, IFF_UP),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &set_up_req)[0]);
+    assert!(ns
+        .link_snapshot()
+        .iter()
+        .any(|link| link.name == "docker0" && link.is_up));
 }
 
 #[test]

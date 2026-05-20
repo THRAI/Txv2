@@ -1,0 +1,78 @@
+# alpine-openrc-networking-focused-probe.txt - classify OpenRC networking surface.
+#
+# This probe keeps the next Alpine/OpenRC step network-scoped. Missing OpenRC
+# service-manager pieces are recorded as non-network blockers, while iproute2,
+# procfs, and sysfs network visibility must still work.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "m=N72Y; IP=/sbin/ip; [ -x $IP ] || IP=/usr/sbin/ip; echo ${m}_TOOLS_${IP}\n"
+expect "N72Y_TOOLS_" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if ls /etc/init.d; then echo ${m}_INITD_PRESENT; else echo ${m}_NON_NETWORK_BLOCKER_NO_INITD; fi; echo ${m}_INITD_PROBE_DONE\n"
+expect "N72Y_INITD_PROBE_DONE" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if ls /etc/network; then echo ${m}_NETWORK_DIR_PRESENT; else echo ${m}_NON_NETWORK_BLOCKER_NO_NETWORK_DIR; fi; echo ${m}_NETWORK_DIR_PROBE_DONE\n"
+expect "N72Y_NETWORK_DIR_PROBE_DONE" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if command -v rc-service >/dev/null 2>&1; then rc-service --version; echo ${m}_RCSERVICE_PRESENT; else echo ${m}_NON_NETWORK_BLOCKER_NO_RCSERVICE; fi; echo ${m}_RCSERVICE_PROBE_DONE\n"
+expect "N72Y_RCSERVICE_PROBE_DONE" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if [ -x /etc/init.d/networking ]; then /etc/init.d/networking status; rc=$?; echo ${m}_NETWORKING_STATUS_RC_${rc}; else echo ${m}_NON_NETWORK_BLOCKER_NO_NETWORKING_INITD; fi; echo ${m}_NETWORKING_STATUS_PROBE_DONE\n"
+expect "N72Y_NETWORKING_STATUS_PROBE_DONE" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if [ -f /etc/network/interfaces ]; then cp /etc/network/interfaces /tmp/interfaces.n72y.bak 2>/dev/null || true; { echo 'auto lo'; echo 'iface lo inet loopback'; echo ''; echo 'auto docker0'; echo 'iface docker0 inet static'; echo '    address 172.17.0.1'; echo '    netmask 255.255.0.0'; echo '    bridge_ports none'; } > /etc/network/interfaces; echo ${m}_INTERFACES_NETWORK_CONFIG_WRITTEN; else echo ${m}_NON_NETWORK_BLOCKER_NO_INTERFACES; fi; echo ${m}_INTERFACES_PROBE_DONE\n"
+expect "N72Y_INTERFACES_PROBE_DONE" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if [ -x /etc/init.d/networking ] && [ -f /etc/network/interfaces ]; then /etc/init.d/networking start; rc=$?; if [ $rc -eq 0 ]; then echo ${m}_NETWORKING_START_OK; else echo ${m}_NETWORKING_START_FAILED_RC_${rc}; fi; else echo ${m}_NETWORKING_START_SKIPPED_NON_NETWORK_BLOCKER; fi; echo ${m}_NETWORKING_START_PROBE_DONE\n"
+expect "N72Y_NETWORKING_START_PROBE_DONE" within 20000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link; then echo ${m}_IP_LINK_OK; else echo ${m}_FAIL_IP_LINK; fi\n"
+expect "N72Y_IP_LINK_OK" within 15000
+expect "lo" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP addr; then echo ${m}_IP_ADDR_OK; else echo ${m}_FAIL_IP_ADDR; fi\n"
+expect "N72Y_IP_ADDR_OK" within 15000
+expect "127.0.0.1" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP route; then echo ${m}_IP_ROUTE_OK; else echo ${m}_FAIL_IP_ROUTE; fi\n"
+expect "N72Y_IP_ROUTE_OK" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/net/dev\n"
+expect "lo" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "ls /sys/class/net\n"
+expect "lo" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if [ -f /tmp/interfaces.n72y.bak ]; then cp /tmp/interfaces.n72y.bak /etc/network/interfaces; echo ${m}_INTERFACES_RESTORED; else echo ${m}_INTERFACES_RESTORE_SKIPPED; fi\n"
+expect "N72Y_INTERFACES_" within 10000
+expect "/ # " within 10000
+
+sleep 500
+quit

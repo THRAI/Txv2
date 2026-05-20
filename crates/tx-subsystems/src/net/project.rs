@@ -54,20 +54,12 @@ pub fn proc_net_arp_snapshot_zero_text(ifaces: &[&EtherIface]) -> String {
 
 pub fn proc_net_dev_snapshot_text(ifaces: &[&EtherIface]) -> String {
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "Inter-|   Receive                                                |  Transmit"
-    );
-    let _ = writeln!(
-        out,
-        " face |bytes    packets errs drop |bytes    packets errs"
-    );
+    push_proc_net_dev_header(&mut out);
 
     for iface in ifaces {
         let stats = iface.net_stats_snapshot();
-        let _ = writeln!(
-            out,
-            "{:>6}: {:<8} {:<7} {:<4} {:<4} |{:<8} {:<7} {:<4}",
+        push_proc_net_dev_line(
+            &mut out,
             stats.iface_name,
             stats.rx_bytes,
             stats.rx_packets,
@@ -77,6 +69,36 @@ pub fn proc_net_dev_snapshot_text(ifaces: &[&EtherIface]) -> String {
             stats.tx_packets,
             stats.tx_errors,
         );
+    }
+
+    out
+}
+
+pub fn proc_net_dev_snapshot_text_for_namespace(netns: &NetNamespacePayload) -> String {
+    let mut out = String::new();
+    push_proc_net_dev_header(&mut out);
+
+    let ifaces = netns.ether_ifaces_snapshot();
+    for link in netns.link_snapshot() {
+        if let Some(stats) = ifaces
+            .iter()
+            .find(|iface| iface.name == link.name)
+            .map(|iface| iface.net_stats_snapshot())
+        {
+            push_proc_net_dev_line(
+                &mut out,
+                stats.iface_name,
+                stats.rx_bytes,
+                stats.rx_packets,
+                stats.rx_errors,
+                stats.rx_dropped,
+                stats.tx_bytes,
+                stats.tx_packets,
+                stats.tx_errors,
+            );
+        } else {
+            push_proc_net_dev_line(&mut out, link.name, 0, 0, 0, 0, 0, 0, 0);
+        }
     }
 
     out
@@ -192,6 +214,34 @@ pub fn proc_net_nf_conntrack_text_for_namespace(netns: &NetNamespacePayload) -> 
     }
 
     out
+}
+
+fn push_proc_net_dev_header(out: &mut String) {
+    let _ = writeln!(
+        out,
+        "Inter-|   Receive                                                |  Transmit"
+    );
+    let _ = writeln!(
+        out,
+        " face |bytes    packets errs drop |bytes    packets errs"
+    );
+}
+
+fn push_proc_net_dev_line(
+    out: &mut String,
+    iface_name: &str,
+    rx_bytes: u64,
+    rx_packets: u64,
+    rx_errors: u64,
+    rx_dropped: u64,
+    tx_bytes: u64,
+    tx_packets: u64,
+    tx_errors: u64,
+) {
+    let _ = writeln!(
+        out,
+        "{iface_name:>6}: {rx_bytes:<8} {rx_packets:<7} {rx_errors:<4} {rx_dropped:<4} |{tx_bytes:<8} {tx_packets:<7} {tx_errors:<4}",
+    );
 }
 
 fn arp_state_name(state: ArpSnapshotState) -> &'static str {
