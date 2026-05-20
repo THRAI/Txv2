@@ -21,8 +21,8 @@ pub use table::{
     SocketTable,
 };
 pub use types::{
-    AddressFamily, IpEndpoint, IpLevelOptions, Ipv4Address, KernelSockAddr, LingerOption, PollMask,
-    ProtocolNumber, RawIcmpState, SendRecvFlags, SockAddrIn, SockFlags, SockShutdownCmd,
-    SocketKind, SocketLevelOptions, SocketOptionSet, SocketType, TcpLevelOptions, TcpState,
-    UdpInner, ValidSocketType,
+    AddressFamily, IpEndpoint, IpLevelOptions, Ipv4Address, KernelSockAddr, LingerOption,
+    PacketSocketState, PollMask, ProtocolNumber, RawIcmpState, SendRecvFlags, SockAddrIn,
+    SockAddrLl, SockFlags, SockShutdownCmd, SocketKind, SocketLevelOptions, SocketOptionSet,
+    SocketType, TcpLevelOptions, TcpState, UdpInner, ValidSocketType,
 };

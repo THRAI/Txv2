@@ -77,7 +77,9 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
                 mask |= PollMask::OUT;
             }
         }
-        SocketProtocol::NetlinkRoute(_) | SocketProtocol::NetlinkNetfilter(_) => {
+        SocketProtocol::NetlinkRoute(_)
+        | SocketProtocol::NetlinkNetfilter(_)
+        | SocketProtocol::Packet(_) => {
             let io = payload.io_snapshot();
             if io.recv_len > 0
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
@@ -118,6 +120,7 @@ pub fn step_poll_wait_token(
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)
         | SocketProtocol::NetlinkNetfilter(_)
+        | SocketProtocol::Packet(_)
             if interests.intersects(PollMask::IN) =>
         {
             Some(socket_recv_wait_token(&witness.identity))
@@ -127,6 +130,7 @@ pub fn step_poll_wait_token(
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)
         | SocketProtocol::NetlinkNetfilter(_)
+        | SocketProtocol::Packet(_)
             if interests.intersects(PollMask::OUT) =>
         {
             Some(socket_send_wait_token(&witness.identity))

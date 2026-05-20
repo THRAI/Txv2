@@ -28,7 +28,7 @@ pub fn step_bind(
         SocketKind::Tcp => table.bind_tcp(witness.local, socket.clone()),
         SocketKind::Udp => bind_udp_maybe_reuseaddr(table, socket, witness.local, guard),
         SocketKind::RawIcmp => Ok(()),
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter => Ok(()),
+        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter | SocketKind::Packet => Ok(()),
     };
     let _requested_addr = witness.addr;
     if let Err(error) = table_result {

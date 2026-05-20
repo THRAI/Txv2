@@ -347,6 +347,7 @@ fn socket_type_validation_maps_to_kind() {
     let dgram_icmp = ValidSocketType::validate(2, 2, 1).expect("ping socket");
     let raw_icmp = ValidSocketType::validate(2, 3, 1).expect("raw icmp socket");
     let nft = ValidSocketType::validate(16, 3, 12).expect("netlink netfilter socket");
+    let packet = ValidSocketType::validate(17, 3, 0x0300).expect("packet socket");
     let default_stream = ValidSocketType::validate(2, 1, 0).expect("default tcp socket");
 
     assert_eq!(unix_dgram.domain, AddressFamily::Unix);
@@ -376,6 +377,11 @@ fn socket_type_validation_maps_to_kind() {
     assert_eq!(
         SocketKind::from_valid_socket_type(nft),
         Ok(SocketKind::NetlinkNetfilter)
+    );
+    assert_eq!(packet.domain, AddressFamily::Packet);
+    assert_eq!(
+        SocketKind::from_valid_socket_type(packet),
+        Ok(SocketKind::Packet)
     );
     assert_eq!(
         SocketKind::from_valid_socket_type(default_stream),
@@ -530,7 +536,8 @@ fn socket_payload_initial_protocol_matches_kind() {
         | SocketProtocol::Udp(_)
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)
-        | SocketProtocol::NetlinkNetfilter(_) => panic!("tcp socket has wrong protocol"),
+        | SocketProtocol::NetlinkNetfilter(_)
+        | SocketProtocol::Packet(_) => panic!("tcp socket has wrong protocol"),
     }
     match udp_payload.protocol_snapshot() {
         SocketProtocol::Udp(inner) => assert_eq!(inner, UdpInner::Unbound),
@@ -538,7 +545,8 @@ fn socket_payload_initial_protocol_matches_kind() {
         | SocketProtocol::Tcp(_)
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)
-        | SocketProtocol::NetlinkNetfilter(_) => panic!("udp socket has wrong protocol"),
+        | SocketProtocol::NetlinkNetfilter(_)
+        | SocketProtocol::Packet(_) => panic!("udp socket has wrong protocol"),
     }
 }
 

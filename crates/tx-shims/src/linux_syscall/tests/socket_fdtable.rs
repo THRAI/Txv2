@@ -4,13 +4,13 @@
 use super::*;
 
 use crate::linux_syscall::{
-    AF_INET, AF_NETLINK, AF_UNIX, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_UDP,
-    IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO, IPT_SO_SET_REPLACE, IP_RECVERR, NETLINK_EXT_ACK,
-    NETLINK_NETFILTER, NETLINK_ROUTE, NR_BIND, NR_CLOSE, NR_CONNECT, NR_FCNTL, NR_GETSOCKNAME,
-    NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PPOLL, NR_PSELECT6, NR_RECVFROM, NR_RECVMSG, NR_SENDMSG,
-    NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET, O_CLOEXEC, O_NONBLOCK, O_RDWR, SIOCGIFFLAGS, SIOCGIFINDEX,
-    SIOCGIFTXQLEN, SIOCSIFFLAGS, SOL_NETLINK, SOL_SOCKET, SO_DONTROUTE, SO_ERROR, SO_RCVTIMEO,
-    SO_REUSEADDR, SO_TYPE, TTY_WRITE_MAX_INLINE,
+    AF_INET, AF_NETLINK, AF_PACKET, AF_UNIX, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_IP,
+    IPPROTO_UDP, IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO, IPT_SO_SET_REPLACE, IP_RECVERR,
+    NETLINK_EXT_ACK, NETLINK_NETFILTER, NETLINK_ROUTE, NR_BIND, NR_CLOSE, NR_CONNECT, NR_FCNTL,
+    NR_GETSOCKNAME, NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PPOLL, NR_PSELECT6, NR_RECVFROM,
+    NR_RECVMSG, NR_SENDMSG, NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET, O_CLOEXEC, O_NONBLOCK, O_RDWR,
+    SIOCGIFFLAGS, SIOCGIFINDEX, SIOCGIFTXQLEN, SIOCSIFFLAGS, SOL_NETLINK, SOL_SOCKET, SO_DONTROUTE,
+    SO_ERROR, SO_RCVTIMEO, SO_REUSEADDR, SO_TYPE, TTY_WRITE_MAX_INLINE,
 };
 use alloc::vec;
 use alloc::vec::Vec;
@@ -27,7 +27,11 @@ const SOCK_DGRAM: u64 = 2;
 const SOCK_RAW: u64 = 3;
 const SOCKADDR_IN_BYTES: u32 = 16;
 const SOCKADDR_NL_BYTES: u32 = 12;
+const SOCKADDR_LL_BYTES: u32 = 20;
 const TEST_POLLIN: i16 = 0x0001;
+const ETH_P_ALL: u16 = 0x0003;
+const ETH_P_ALL_NET: u16 = 0x0300;
+const MSG_DONTWAIT: u64 = 0x40;
 const NLM_F_REQUEST: u16 = 0x0001;
 const NLM_F_DUMP: u16 = 0x0300;
 const MSG_PEEK: u64 = 0x02;
@@ -96,6 +100,14 @@ fn sockaddr_in(addr: [u8; 4], port: u16) -> [u8; SOCKADDR_IN_BYTES as usize] {
 fn sockaddr_nl() -> [u8; SOCKADDR_NL_BYTES as usize] {
     let mut bytes = [0u8; SOCKADDR_NL_BYTES as usize];
     bytes[0..2].copy_from_slice(&AF_NETLINK.to_le_bytes());
+    bytes
+}
+
+fn sockaddr_ll(protocol: u16, ifindex: i32) -> [u8; SOCKADDR_LL_BYTES as usize] {
+    let mut bytes = [0u8; SOCKADDR_LL_BYTES as usize];
+    bytes[0..2].copy_from_slice(&AF_PACKET.to_le_bytes());
+    bytes[2..4].copy_from_slice(&protocol.to_be_bytes());
+    bytes[4..8].copy_from_slice(&ifindex.to_le_bytes());
     bytes
 }
 
@@ -262,6 +274,24 @@ fn socket_netfilter(ctx: &SyscallCtx<'static>) -> i64 {
     }
 }
 
+fn socket_packet(ctx: &SyscallCtx<'static>) -> i64 {
+    match socket_req(
+        NR_SOCKET,
+        [
+            AF_PACKET as u64,
+            SOCK_RAW | O_CLOEXEC as u64,
+            ETH_P_ALL_NET as u64,
+            0,
+            0,
+            0,
+        ],
+        ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_PACKET, RAW, ETH_P_ALL) failed: {other:?}"),
+    }
+}
+
 fn socket_unix_dgram(ctx: &SyscallCtx<'static>) -> i64 {
     match socket_req(
         NR_SOCKET,
@@ -359,6 +389,89 @@ fn dispatch_netlink_netfilter_getsockname_returns_sockaddr_nl() {
     );
     assert_eq!(out_len, SOCKADDR_NL_BYTES);
     assert_eq!(u16::from_le_bytes([out[0], out[1]]), AF_NETLINK);
+}
+
+#[test]
+fn dispatch_packet_bind_getsockname_and_ioctl_round_trip_sockaddr_ll() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_packet(&ctx);
+
+    let mut ifreq = [0u8; 40];
+    ifreq[0..2].copy_from_slice(b"lo");
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCGIFINDEX as u64,
+                ifreq.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    let ifindex = i32::from_le_bytes(ifreq[16..20].try_into().unwrap());
+    assert_eq!(ifindex, 1);
+
+    let addr = sockaddr_ll(ETH_P_ALL, ifindex);
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                fd as u64,
+                addr.as_ptr() as u64,
+                SOCKADDR_LL_BYTES as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out = [0u8; SOCKADDR_LL_BYTES as usize];
+    let mut out_len = SOCKADDR_LL_BYTES;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKNAME,
+            [
+                fd as u64,
+                out.as_mut_ptr() as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out_len, SOCKADDR_LL_BYTES);
+    assert_eq!(u16::from_le_bytes([out[0], out[1]]), AF_PACKET);
+    assert_eq!(u16::from_be_bytes([out[2], out[3]]), ETH_P_ALL);
+    assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), ifindex);
+
+    let mut buf = [0u8; 8];
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [
+                fd as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+                MSG_DONTWAIT,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(11)
+    );
 }
 
 #[test]

@@ -10,6 +10,7 @@ pub(crate) fn endpoint_from_sockaddr(addr: KernelSockAddr) -> Result<IpEndpoint,
             Ok(IpEndpoint::new(sockaddr.addr, sockaddr.port))
         }
         KernelSockAddr::V4(_) => Err(Errno::EAFNOSUPPORT),
+        KernelSockAddr::Packet(_) => Err(Errno::EAFNOSUPPORT),
     }
 }
 

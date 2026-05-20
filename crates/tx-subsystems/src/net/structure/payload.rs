@@ -18,8 +18,8 @@ use super::super::protocol::{
 };
 use super::identity::SocketIdentity;
 use super::types::{
-    IpEndpoint, Ipv4Address, ProtocolNumber, RawIcmpState, SockShutdownCmd, SocketKind,
-    SocketOptionSet, TcpState, UdpInner,
+    IpEndpoint, Ipv4Address, PacketSocketState, ProtocolNumber, RawIcmpState, SockAddrLl,
+    SockShutdownCmd, SocketKind, SocketOptionSet, TcpState, UdpInner,
 };
 
 pub type SocketOperationalEvidence = PayloadCap<SocketPayload>;
@@ -97,6 +97,14 @@ impl SocketPayload {
                     None,
                     Some(RawNetlinkNetfilterSocket::new()),
                 ),
+                SocketKind::Packet => (
+                    SocketProtocol::Packet(PacketSocketState::new(0)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
             };
         let payload = Self {
             net_namespace,
@@ -134,6 +142,53 @@ impl SocketPayload {
 
     pub fn protocol_snapshot(&self) -> SocketProtocol {
         self.protocol.lock().clone()
+    }
+
+    pub fn bind_packet_socket(&self, sockaddr: SockAddrLl) -> Result<(), crate::execution::Errno> {
+        if sockaddr.ifindex < 0 {
+            return Err(crate::execution::Errno::ENODEV);
+        }
+        if sockaddr.ifindex != 0 {
+            let ifindex = sockaddr.ifindex as u32;
+            if !self
+                .net_namespace
+                .link_snapshot()
+                .into_iter()
+                .any(|link| link.ifindex == ifindex)
+            {
+                return Err(crate::execution::Errno::ENODEV);
+            }
+        }
+
+        self.with_protocol_mut(|protocol| match protocol {
+            SocketProtocol::Packet(state) => {
+                state.protocol = sockaddr.protocol;
+                state.ifindex = Some(sockaddr.ifindex);
+                true
+            }
+            _ => false,
+        })
+        .then_some(())
+        .ok_or(crate::execution::Errno::EINVAL)
+    }
+
+    pub fn packet_sockaddr(&self) -> Option<SockAddrLl> {
+        match self.protocol_snapshot() {
+            SocketProtocol::Packet(state) => Some(state.sockaddr()),
+            _ => None,
+        }
+    }
+
+    pub fn set_packet_protocol(&self, protocol: u16) -> Result<(), crate::execution::Errno> {
+        self.with_protocol_mut(|socket_protocol| match socket_protocol {
+            SocketProtocol::Packet(state) => {
+                state.protocol = protocol;
+                true
+            }
+            _ => false,
+        })
+        .then_some(())
+        .ok_or(crate::execution::Errno::EINVAL)
     }
 
     pub(crate) fn with_protocol<R>(&self, f: impl FnOnce(&SocketProtocol) -> R) -> R {
@@ -896,6 +951,7 @@ pub enum SocketProtocol {
     RawIcmp(RawIcmpState),
     NetlinkRoute(NetlinkRouteState),
     NetlinkNetfilter(NetlinkNetfilterState),
+    Packet(PacketSocketState),
 }
 
 pub struct Takeable<T> {
