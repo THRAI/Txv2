@@ -205,7 +205,7 @@ fn exit_wait_source_invariants_round_trip() {
     let (_reg_guard, gen) = register(&parent_source, &mailbox, EXIT_SOURCE_CHILD_ZOMBIFIED);
     assert!(mailbox.is_empty(), "no events before any child zombifies");
 
-    let child = step_fork::<StubPmap>(&parent, false).expect("fork");
+    let child = step_fork::<StubPmap>(&parent, false, false).expect("fork");
 
     // Pin the child's own exit_wait_source (used in invariant 2 to
     // observe the post-zombify "unreachable through identity"

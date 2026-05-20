@@ -18,7 +18,7 @@ use crate::adapter::step_engine::StepOutcome;
 use alloc::vec::Vec;
 use tx_hal::UserPtr;
 use tx_subsystems::execution::Errno;
-use tx_subsystems::vm::AddressSpace;
+use tx_subsystems::vm::{AddressSpace, UserAccessKind, UserPage, UserRange, USER_PAGE_SIZE};
 
 /// Outcome of `read_user_cstr` — distinguishes "no NUL within budget"
 /// from a successful copy. The successful arm yields the bytes up to
@@ -201,9 +201,29 @@ pub(super) fn bootstrap_write_user<T: Copy>(
     }
 }
 
+/// Compute the page-aligned `UserRange` covering the byte range
+/// `[uaddr, uaddr + len)`. Returns `None` when `len == 0` or when
+/// `uaddr` addition overflows.
+pub(super) fn covering_user_range(uaddr: u64, len: usize) -> Option<UserRange> {
+    if len == 0 {
+        return None;
+    }
+    let uaddr = uaddr as usize;
+    let start_page_addr = uaddr & !(USER_PAGE_SIZE - 1);
+    let end = uaddr.checked_add(len)?;
+    let end_page_addr = (end + USER_PAGE_SIZE - 1) & !(USER_PAGE_SIZE - 1);
+    let page_count = (end_page_addr - start_page_addr) / USER_PAGE_SIZE;
+    UserRange::from_pages(UserPage(start_page_addr / USER_PAGE_SIZE), page_count).ok()
+}
+
 /// Copy `dst.len()` bytes from user-space `uaddr` into the kernel-side
 /// buffer `dst`. Bridges through `aspace.copy_from_user`, falling back
 /// to a kernel-pointer memcpy on `EFAULT`.
+///
+/// Before copying, eagerly prefaults the entire user range through
+/// `reserve_user_range_for_access` (per PAGE_BACKED_v1 §3 prefault
+/// discipline). If any page is unmapped or has a protection mismatch,
+/// EFAULT is surfaced before any bytes are transferred.
 pub(super) fn bootstrap_copy_from_user(
     aspace: &AddressSpace,
     dst: &mut [u8],
@@ -214,6 +234,19 @@ pub(super) fn bootstrap_copy_from_user(
         return Ok(());
     }
     let guard = step_engine::guard();
+
+    // Prefault: eagerly materialise every page in the user range so
+    // the copy below hits the pmap cache exclusively. If any page is
+    // unmapped or has a protection mismatch, fail before copying any
+    // bytes (PAGE_BACKED_v1 §3 prefault discipline).
+    if let Some(range) = covering_user_range(uaddr, dst.len()) {
+        match aspace.reserve_user_range_for_access(range, UserAccessKind::Read) {
+            V3::Done(()) => {}
+            V3::Err(e) => return Err(Errno::from(e)),
+            V3::Yield { .. } | V3::Continue { .. } => return Err(Errno::EIO),
+        }
+    }
+
     match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
         V3::Done(_) | V3::Continue { .. } => Ok(()),
         V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
@@ -242,6 +275,18 @@ pub(super) fn bootstrap_copy_to_user(
         return Ok(());
     }
     let guard = step_engine::guard();
+
+    // Prefault: eagerly materialise every page in the user range so
+    // the copy below hits the pmap cache exclusively (PAGE_BACKED_v1
+    // §3 prefault discipline).
+    if let Some(range) = covering_user_range(uaddr, src.len()) {
+        match aspace.reserve_user_range_for_access(range, UserAccessKind::Write) {
+            V3::Done(()) => {}
+            V3::Err(e) => return Err(Errno::from(e)),
+            V3::Yield { .. } | V3::Continue { .. } => return Err(Errno::EIO),
+        }
+    }
+
     match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
         V3::Done(_) | V3::Continue { .. } => Ok(()),
         V3::Err(e) if Errno::from(e) == Errno::EFAULT => {

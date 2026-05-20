@@ -239,9 +239,39 @@ pub fn step_open<'g>(
 /// `MountPayload::fs_ops` directly. The field is populated at
 /// mount-publication time.
 pub(crate) fn fs_ops_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<Arc<dyn FsOps>> {
-    let mount_payload_weak: Weak<MountPayload> = dentry.rnode().containing_mount_weak()?;
-    let payload = mount_payload_weak.upgrade(guard)?;
-    Some(payload.fs_ops().clone())
+    let rnode = dentry.rnode();
+    let mount_payload_weak: Weak<MountPayload> = match rnode.containing_mount_weak() {
+        Some(w) => w,
+        None => {
+            use crate::vfs::resolution::diagnostic;
+            diagnostic::record_ctx(
+                1, // fs_ops_for: no containing_mount_weak
+                dentry.name().as_bytes(),
+                rnode.fs_object_id(),
+                b"", // fs_ops_for doesn't have path context
+                false,
+            );
+            diagnostic::record_label(b"fs_ops_for: no containing_mount");
+            return None;
+        }
+    };
+    let payload = match mount_payload_weak.upgrade(guard) {
+        Some(p) => p,
+        None => {
+            use crate::vfs::resolution::diagnostic;
+            diagnostic::record_ctx(
+                10, // fs_ops_for: weak upgrade failed
+                dentry.name().as_bytes(),
+                rnode.fs_object_id(),
+                b"",
+                true, // had containing_mount, just dead
+            );
+            diagnostic::record_label(b"fs_ops_for: weak upgrade dead");
+            return None;
+        }
+    };
+    let ops = payload.fs_ops().clone();
+    Some(ops)
 }
 
 /// Like [`fs_ops_for`] but takes an `RNode` directly — used by

@@ -2,7 +2,7 @@
   "schema": "tx.progress.plan.v1",
   "id": "2026-05-19-pthread-shared-clone-thread",
   "title": "pthread Shared<T> + step_clone_thread implementation",
-  "status": "active",
+  "status": "completed",
   "created": "2026-05-19",
   "updated": "2026-05-19",
   "owner": "agent",

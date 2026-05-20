@@ -35,7 +35,7 @@ fn child_leader(child: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
 fn seed_child_leader_context_zeroes_a0() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
     let leader = child_leader(&child);
 
     let parent_ctx = synthetic_parent_ctx();
@@ -62,7 +62,7 @@ fn seed_child_leader_context_zeroes_a0() {
 fn seed_child_leader_context_inherits_pc() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
     let leader = child_leader(&child);
 
     let parent_ctx = synthetic_parent_ctx();
@@ -86,7 +86,7 @@ fn seed_child_leader_context_inherits_pc() {
 fn seed_child_leader_context_preserves_other_gprs_and_sp() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
     let leader = child_leader(&child);
 
     let parent_ctx = synthetic_parent_ctx();
@@ -129,7 +129,7 @@ fn seed_child_leader_context_preserves_other_gprs_and_sp() {
 fn seed_child_leader_context_overrides_sp_when_stack_nonzero() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
     let leader = child_leader(&child);
 
     let parent_ctx = synthetic_parent_ctx();

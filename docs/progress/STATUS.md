@@ -1,3 +1,81 @@
+- 2026-05-20 **membarrier 后续 bug 修复。** 4 个在 membarrier 构建验证中
+  暴露的预存 bug 已修复：
+
+  1. `step_fork` API 签名变更后 2 个调用点缺少第 3 参数 `clone_sighand`
+     （`tx-shims/tests/fcntl_misc.rs:168`、`tx-kernel/src/init/tests.rs:975`）
+  2. `sys_set_robust_list` 签名增加 `SyscallCtx` 后 2 个 dispatch arm 缺
+     参数（`mod.rs:423,471`）
+  3. `tx-scripts` exec-script 测试 CSPRNG 未初始化 → `setup()` 添加
+     `random::init(&random::platform_seed())`
+  4. `tx-kernel` boot-smoke 测试 CSPRNG 未初始化 → `setup()` 同上
+
+  验证：`cargo xtask unit` 构建通过。tx-scripts **42→50 全通过**；
+  tx-kernel **5→2 失败**（3 个 CSPRNG 修复，余 epoch-guard-nesting +
+  exit-group-NoReturn 预存）。
+  暴露的预存 bug 已修复：
+
+  1. `step_fork` API 签名变更后 2 个调用点缺少第 3 参数 `clone_sighand`
+     （`tx-shims/tests/fcntl_misc.rs:168`、`tx-kernel/src/init/tests.rs:975`）
+  2. `sys_set_robust_list` 签名增加 `SyscallCtx` 后 2 个 dispatch arm 缺
+     参数（`mod.rs:423,471`）
+  3. `tx-scripts` exec-script 测试 CSPRNG 未初始化 → `setup()` 添加
+     `random::init(&random::platform_seed())`
+  4. `tx-kernel` boot-smoke 测试 CSPRNG 未初始化 → `setup()` 同上
+
+  验证：`cargo xtask unit` 构建通过。tx-scripts **42→50 全通过**；
+  tx-kernel **5→2 失败**（3 个 CSPRNG 修复，余 epoch-guard-nesting +
+  exit-group-NoReturn 预存）。
+
+- 2026-05-19 **SysV/POSIX IPC subsystem implementation complete (6 phases).**
+  Plan: `docs/progress/plans/2026-05-19-sysv-ipc-implementation.json`.
+  Worktree: `.claude/worktrees/sysv-ipc-20260519` (branch `codex/sysv-ipc-implementation`).
+  - IPC-0: NsProxy + IpcNamespace + 8 namespace stubs on ProcessPayload.
+    `sign_init_nsproxy()` for bootstrap, `clone_nsproxy()` for fork.
+    MountNamespace deferred (MountIdentity not available at process-init time).
+  - IPC-1: SysV shm — ShmSegmentIdentity/Payload, IpcPerm, step_shmget/shmat/shmdt/shmctl.
+  - IPC-2: SysV msg — MsgQueueIdentity/Payload, Channel recv/send wake sources,
+    per-type-bucket message filtering, step_msgget/msgsnd/msgrcv/msgctl.
+  - IPC-3: SysV sem — SemArrayIdentity/Payload, SEM_UNDO (step_sem_undo on exit),
+    validate-all-then-apply atomic semop, step_semget/semop/semctl.
+  - IPC-4: POSIX mq — PosixMqInstance fd-shaped wrapper, mq_open/send/receive/notify/unlink.
+  - IPC-5: Syscall dispatch — 26 syscall numbers, 11 syscall arm functions.
+  - Errnos added: E2BIG, EFBIG, EIDRM (execution.rs + step/mod.rs + v3_algebra.rs + tx-shims).
+  - `cargo xtask check`: PASS (fmt + clippy + host + rv64 + rv64-m1dock + loongarch64).
+  - QEMU rv64-qemu smoke: 14/16 test cases pass (shmget/create/lookup/excl-fail/RMID,
+    msgget/create/lookup/RMID, semget/SETVAL/GETVAL/RMID). 2 pending: semop needs
+    copy_from_user for userspace sembuf array; shmat returns stub address until
+    VM PageContainer integration.
+
+- 2026-05-19 **membarrier(2) 初版实现完成。** Lane-1 (Immediate) 系统调用，
+  构建通过，零警告。系统性变更涉及 7 个文件：
+
+  HAL 层：
+  - `crates/tx-hal/src/lib.rs` — 新增 `IpiKind::Membarrier` 变体。
+
+  Syscall 层：
+  - `crates/tx-shims/src/linux_syscall/numbers.rs` — `NR_MEMBARRIER = 324`
+    （x86_64 编号，RV64 generic uapi 无固定槽位），以及全部 membarrier
+    命令常量和 `MEMBARRIER_SUPPORTED_MASK`。
+  - `crates/tx-shims/src/linux_syscall/mod.rs` — 新增 `SmpIf` + `IpiKind`
+    导入，`dispatch`/`dispatch_inner` 添加 `+ SmpIf` 约束，Lane-1
+    dispatch arm (`NR_MEMBARRIER → sys_membarrier::<P>(&req.args)`)，以及
+    `sys_membarrier` 函数实现（QUERY 返回位掩码，GLOBAL/PRIVATE_EXPEDITED
+    广播 Membarrier IPI 并自旋等待所有 hart ack，REGISTER_* 为 no-op）。
+  - `crates/tx-shims/src/linux_syscall/tests.rs` — `ShimsTestPmap` 实现
+    `SmpIf`（全默认方法，单 CPU 测试平台）。
+
+  Kernel IPI 处理（接收端 hart 执行 `fence(SeqCst)` + `ack_ipi`）：
+  - `crates/tx-kernel/src/trap.rs` — `on_ipi` 新增 Membarrier 和
+    TlbShootdown 分支。
+  - `crates/tx-kernel/src/init/exec.rs` — 主 idle 循环新增 Membarrier
+    处理。
+  - `crates/tx-kernel/src/init.rs` — 辅助 reactor 循环新增 Membarrier
+    处理。
+
+  验证：`cargo check -p tx-shims -p tx-kernel` 通过，零警告。
+  测试环境 CSPRNG 未初始化 + `step_fork` API 不匹配导致部分预存测试失败，
+  与本次修改无关。
+
 - 2026-05-19 **libctest-musl 0/220 → 14/220+ on rv64-qemu.** Two
   cooperating fixes unblocked libctest's parent-side
   `sys_rt_sigtimedwait` poll loop and identified the actual wedge

@@ -3,16 +3,18 @@
 
 use core::sync::atomic::Ordering;
 
-use tx_hal::UserTrapContext;
+use tx_hal::{UserPtr, UserTrapContext};
 
 use crate::thread_runtime::adapter::step_engine::{
     self, Cap, MailboxEvent, OneShotStepOp, OperationalCapExt, PayloadCap, SignalRouting,
 };
 
+use crate::futex::step_futex_wake;
 use crate::signal::{SignalMask, Signum};
 use crate::thread_runtime::structure::{
     drain_pending_syscall_return, ThreadIdentity, ThreadPayload,
 };
+// UserAccessIf trait not needed — copy_to_user is inherent on AddressSpace
 
 /// Best-effort `MailboxEvent::SignalDelivered` post to a thread
 /// payload's bound mailbox per D9-A.
@@ -104,6 +106,19 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     }
     drop(guard);
 
+    // Snapshot clear_child_tid and robust-list BEFORE
+    // set_thread_zombie drops the thread payload.
+    let ctid = thread.payload.lock().as_ref().and_then(|p| *p.clear_child_tid.lock());
+    let robust = thread
+        .payload
+        .lock()
+        .as_ref()
+        .and_then(|p| {
+            let head = *p.robust_list_head.lock();
+            let len = *p.robust_list_len.lock();
+            head.map(|h| (h, len))
+        });
+
     // observe
     // upgrade
     // reserve
@@ -138,6 +153,106 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
             crate::process::structure::ExitStatus::Exited(status),
         );
     }
+
+    // clear_child_tid futex protocol (CLONE_CHILD_CLEARTID).
+    // Linux semantics: atomically write 0 to *ctid, then
+    // FUTEX_WAKE on the same address. We do both best-effort —
+    // if the userspace page is unmapped, skip the write but
+    // still fire the wake (hash-bucket wake is unconditional).
+    if let Some(ctid_ptr) = ctid {
+        let guard = crate::thread_runtime::adapter::step_engine::guard();
+        // Zero the word at *ctid_ptr in userspace.
+        if let Some(proc) = thread.owner_proc.upgrade(&guard) {
+            if let Some(payload) = proc.payload.lock().as_ref() {
+                let aspace = payload.aspace_cap();
+                let _ = aspace.copy_to_user(
+                    UserPtr::<u8>::new(ctid_ptr as usize),
+                    &[0u8; 4],
+                    &guard,
+                );
+            }
+        }
+        // Wake waiters on the clear_child_tid futex. Best-effort:
+        // fires even if the zero-write above failed.
+        step_futex_wake(ctid_ptr, 1, &guard);
+        drop(guard);
+    }
+
+    // robust-list walk: mark each robust futex as FUTEX_OWNER_DIED
+    // and issue FUTEX_WAKE. Best-effort — if the userspace pages
+    // are unmapped or the list is malformed, skip the entry.
+    if let Some((head, _len)) = robust {
+        walk_robust_list(&thread, head, 16);
+    }
+}
+
+/// Best-effort robust-list walk on thread exit.
+///
+/// Linux's `robust_list_head` layout:
+///   head+0:  `list` (pointer to first robust_list entry)
+///   head+8:  `futex_offset` (long)
+///   head+16: `list_op_pending` (pointer to in-progress entry)
+///
+/// Each `robust_list` entry:
+///   entry+0:      `next` pointer
+///   entry+offset: futex word guarded by the mutex
+///
+/// v1 handles only `list_op_pending` (the entry being locked when
+/// the thread died). Full chain walk requires pointer-chasing in
+/// userspace and is deferred.
+fn walk_robust_list(thread: &Cap<ThreadIdentity>, head: u64, _offset: u64) {
+    let guard = step_engine::guard();
+    let Some(proc) = thread.owner_proc.upgrade(&guard) else {
+        return;
+    };
+    let proc_guard = proc.payload.lock();
+    let Some(payload) = proc_guard.as_ref() else {
+        return;
+    };
+    let aspace = payload.aspace_cap();
+
+    // Read futex_offset (i64 at head+8)
+    let mut futex_offset_buf = [0u8; 8];
+    let n = aspace.copy_from_user(
+        &mut futex_offset_buf,
+        UserPtr::<u8>::new((head + 8) as usize),
+        &guard,
+    );
+    let futex_offset: i64 = if matches!(n, step_engine::StepOutcome::Done(8)) {
+        i64::from_ne_bytes(futex_offset_buf)
+    } else {
+        return;
+    };
+
+    // Read list_op_pending (u64 at head+16)
+    let mut pending_buf = [0u8; 8];
+    let n = aspace.copy_from_user(
+        &mut pending_buf,
+        UserPtr::<u8>::new((head + 16) as usize),
+        &guard,
+    );
+    let pending: u64 = if matches!(n, step_engine::StepOutcome::Done(8)) {
+        u64::from_ne_bytes(pending_buf)
+    } else {
+        return;
+    };
+
+    // Process pending entry if non-NULL
+    if pending != 0 {
+        let futex_addr = (pending as i64 + futex_offset) as u64;
+        // Set FUTEX_OWNER_DIED bit (0x40000000) on the futex word.
+        // Best-effort: if the page is unmapped, skip.
+        let owner_died: u32 = 0x40000000;
+        let _ = aspace.copy_to_user(
+            UserPtr::<u8>::new(futex_addr as usize),
+            &owner_died.to_ne_bytes(),
+            &guard,
+        );
+        // Wake waiters on this futex.
+        step_futex_wake(futex_addr, 1, &guard);
+    }
+
+    drop(guard);
 }
 
 /// Outcome of `step_sigprocmask`. `Replaced` is the normal path;

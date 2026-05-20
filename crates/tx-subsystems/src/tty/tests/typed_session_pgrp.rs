@@ -296,7 +296,7 @@ fn process_aware_tiocnotty_clears_tty_and_session_links() {
 fn process_aware_tiocspgrp_rebinds_foreground_to_typed_target() {
     let _g = setup();
     let init = fresh_init();
-    let child = step_fork::<TestPmap>(&init, false).expect("fork");
+    let child = step_fork::<TestPmap>(&init, false, false).expect("fork");
     step_setpgid(&child, Pgid(child.pid.0)).expect("child pgrp");
     let child_pgrp = child.pgrp_cap();
 
@@ -325,7 +325,7 @@ fn process_aware_tiocspgrp_rebinds_foreground_to_typed_target() {
 fn step_read_for_process_posts_sigttin_to_background_caller_pgrp() {
     let _g = setup();
     let init = fresh_init();
-    let child = step_fork::<TestPmap>(&init, false).expect("fork");
+    let child = step_fork::<TestPmap>(&init, false, false).expect("fork");
     step_setpgid(&child, Pgid(child.pid.0)).expect("child pgrp");
 
     let tty = fresh_tty("ttyS-bg-read");
@@ -344,7 +344,7 @@ fn step_read_for_process_posts_sigttin_to_background_caller_pgrp() {
 fn step_write_for_process_posts_sigttou_to_background_caller_pgrp() {
     let _g = setup();
     let init = fresh_init();
-    let child = step_fork::<TestPmap>(&init, false).expect("fork");
+    let child = step_fork::<TestPmap>(&init, false, false).expect("fork");
     step_setpgid(&child, Pgid(child.pid.0)).expect("child pgrp");
 
     let tty = fresh_tty("ttyS-bg-write");
@@ -418,7 +418,7 @@ fn session_leader_exit_with_live_fg_pgrp_member_delivers_sighup_and_sigcont() {
     let init = fresh_init();
     // Fork a child to be the fg-pgrp member that will *survive* the
     // cascade and observe the SIGHUP/SIGCONT delivery.
-    let child = step_fork::<TestPmap>(&init, false).expect("fork");
+    let child = step_fork::<TestPmap>(&init, false, false).expect("fork");
 
     // Setup: init's session has a controlling tty whose fg pgrp is
     // init's pgrp — which contains both init and child.
@@ -455,9 +455,9 @@ fn non_session_leader_exit_does_not_fire_cascade() {
     // Fork a child and put it in its own session (now a session leader
     // of a new session). Then fork a grandchild from the new session
     // leader — grandchild is a member but NOT the session leader.
-    let session_leader = step_fork::<TestPmap>(&init, false).expect("fork");
+    let session_leader = step_fork::<TestPmap>(&init, false, false).expect("fork");
     let _new_sid = step_setsid(&session_leader).expect("setsid");
-    let grandchild = step_fork::<TestPmap>(&session_leader, false).expect("fork-of-leader");
+    let grandchild = step_fork::<TestPmap>(&session_leader, false, false).expect("fork-of-leader");
 
     // grandchild.pgrp.session.sid != grandchild.pid → grandchild is
     // not the session leader.
@@ -561,7 +561,7 @@ fn step_hangup_exposes_typed_session_leader_pgrp_dispatch() {
 fn typed_session_flips_dead_after_setsid_drops_old_session() {
     let _g = setup();
     let parent = fresh_init();
-    let child = crate::process::step_fork::<TestPmap>(&parent, false).expect("fork");
+    let child = crate::process::step_fork::<TestPmap>(&parent, false, false).expect("fork");
 
     let old_session = child.pgrp_cap().session_cap();
     let old_pgrp = child.pgrp_cap();

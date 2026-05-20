@@ -66,7 +66,9 @@ use adapter::step_engine::{
 use adapter::wait_routing::{self, Channel, WaitSource};
 
 use crate::execution::Guard;
+use crate::vm::AddressSpace;
 use crate::wait_source;
+use tx_hal::UserPtr;
 
 /// Number of futex hash buckets. Fixed; no dynamic allocation.
 /// Collisions are absorbed by the per-waiter re-check on wakeup.
@@ -166,7 +168,12 @@ pub fn bucket_index(uaddr: u64) -> usize {
 ///
 /// Wait never produces `Done`: completion arrives via the carrier
 /// resolution step driven by the script driver after the yield resolves.
-pub fn step_futex_wait(uaddr: u64, val: u32, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+pub fn step_futex_wait(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    val: u32,
+    guard: &Guard<'_>,
+) -> StepOutcome<(), NoProgress> {
     // observe
     // upgrade
     // reserve
@@ -178,9 +185,17 @@ pub fn step_futex_wait(uaddr: u64, val: u32, _guard: &Guard<'_>) -> StepOutcome<
     if uaddr == 0 || (uaddr & 0x3) != 0 {
         return StepOutcome::Err(Errno::EINVAL);
     }
-    // SAFETY: bootstrap kernel-buffer exemption — TODO(phase-userva).
-    // Mirrors `step_futex_wait`'s read; see that fn for migration plan.
-    let observed = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+    // Read the futex word through the safe user-access gate
+    // (`AddressSpace::read_user` → `copy_from_user`), replacing the
+    // retired `core::ptr::read_volatile` bootstrap exemption
+    // (TODO(phase-userva) resolved).
+    let observed: u32 = match aspace.read_user(UserPtr::<u32>::new(uaddr as usize), guard) {
+        StepOutcome::Done(v) => v,
+        StepOutcome::Err(e) => return StepOutcome::Err(e),
+        StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+            return StepOutcome::Err(Errno::EFAULT);
+        }
+    };
     if observed != val {
         return StepOutcome::Err(Errno::EAGAIN);
     }
@@ -304,17 +319,18 @@ pub fn bucket_wait_source_for_source_id(source_id: u64) -> Option<Arc<WaitSource
 /// epoch guard per STEP_MODEL_v2 §1, so the op stays `Send` and the
 /// driving future satisfies the reactor's `Send + 'static` contract
 /// (REACTOR_v0 §Submission, INVARIANTS_v5 EBR-7).
-pub struct FutexWaitOp {
+pub struct FutexWaitOp<'a> {
     pub uaddr: u64,
     pub val: u32,
+    pub aspace: &'a AddressSpace,
 }
 
-impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp {
+impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
     type Output = ();
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let guard = adapter::step_engine::guard();
-        step_futex_wait(self.uaddr, self.val, &guard)
+        step_futex_wait(self.aspace, self.uaddr, self.val, &guard)
     }
 }
 
@@ -353,6 +369,43 @@ mod tests {
         guard
     }
 
+    /// Create an `AddressSpace` with a single private-anon page at
+    /// `user_va` seeded with `word` at offset 0 of the page.
+    /// Returns the `AddressSpace` (which must live at least as long
+    /// as any guard used to access it) and the user VA of the word.
+    fn setup_aspace_with_word(
+        user_va: usize,
+        word: u32,
+    ) -> (AddressSpace, u64) {
+        use crate::vm::{
+            MapPlacement, MapReserveResult, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry,
+            VmEntryFlags, USER_PAGE_SIZE,
+        };
+        let aspace = AddressSpace::new();
+        let entry = VmEntry::new(
+            UserRange::new_aligned(UserVirtAddr(user_va), USER_PAGE_SIZE).unwrap(),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        );
+        match aspace.reserve_map(entry, MapPlacement::RequireFree) {
+            MapReserveResult::Reserved(reservation) => {
+                reservation.commit().expect("commit reservation");
+            }
+            other => panic!("reserve_map failed: {other:?}"),
+        }
+        // Materialise the page and write the word via write_user,
+        // which publishes the frame to the pmap so read_user hits.
+        let guard = guard();
+        let dst = tx_hal::UserPtr::<u32>::new(user_va);
+        match aspace.write_user(dst, word, &guard) {
+            StepOutcome::Done(()) => {}
+            other => panic!("write_user failed: {other:?}"),
+        }
+        drop(guard);
+        (aspace, user_va as u64)
+    }
+
     #[test]
     fn futex_step_wake_returns_n_for_valid_uaddr() {
         let _setup = setup();
@@ -386,12 +439,9 @@ mod tests {
     #[test]
     fn futex_step_wait_observes_mismatch_returns_eagain() {
         let _setup = setup();
-        // Word holds 0xdead_beef; FUTEX_WAIT with val=0 must
-        // observe the mismatch and short-circuit to EAGAIN.
-        let word: u32 = 0xdead_beef;
-        let uaddr = &word as *const u32 as u64;
+        let (aspace, uaddr) = setup_aspace_with_word(0x5000_0000, 0xdead_beef);
         let guard = guard();
-        let outcome = step_futex_wait(uaddr, 0, &guard);
+        let outcome = step_futex_wait(&aspace, uaddr, 0, &guard);
         drop(guard);
         assert_eq!(outcome, StepOutcome::Err(V3Errno::EAGAIN));
     }
@@ -399,10 +449,9 @@ mod tests {
     #[test]
     fn futex_step_wait_observes_match_returns_blocked_with_source_id() {
         let _setup = setup();
-        let word: u32 = 0xdead_beef;
-        let uaddr = &word as *const u32 as u64;
+        let (aspace, uaddr) = setup_aspace_with_word(0x6000_0000, 0xdead_beef);
         let guard = guard();
-        let outcome = step_futex_wait(uaddr, 0xdead_beef, &guard);
+        let outcome = step_futex_wait(&aspace, uaddr, 0xdead_beef, &guard);
         drop(guard);
         match outcome {
             StepOutcome::Yield {
@@ -426,8 +475,9 @@ mod tests {
     #[test]
     fn futex_step_wait_zero_uaddr_returns_einval() {
         let _setup = setup();
+        let aspace = AddressSpace::new();
         let guard = guard();
-        let outcome = step_futex_wait(0, 0, &guard);
+        let outcome = step_futex_wait(&aspace, 0, 0, &guard);
         drop(guard);
         assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
     }
@@ -435,8 +485,9 @@ mod tests {
     #[test]
     fn futex_step_wait_unaligned_uaddr_returns_einval() {
         let _setup = setup();
+        let aspace = AddressSpace::new();
         let guard = guard();
-        let outcome = step_futex_wait(0x2, 0, &guard);
+        let outcome = step_futex_wait(&aspace, 0x2, 0, &guard);
         drop(guard);
         assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
     }
@@ -477,9 +528,10 @@ mod tests {
         // commit
         // publish
         let _setup = setup();
+        let aspace = AddressSpace::new();
         let guard = guard();
         // 0x1 — non-zero, non-zero-mod-4 (misaligned for u32).
-        let outcome = step_futex_wait(0x1, 0, &guard);
+        let outcome = step_futex_wait(&aspace, 0x1, 0, &guard);
         drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::EINVAL) => {}
@@ -500,12 +552,9 @@ mod tests {
         // commit
         // publish
         let _setup = setup();
-        // Word holds 0xdead_beef; FUTEX_WAIT with val=0 must observe
-        // the mismatch and short-circuit to EAGAIN.
-        let word: u32 = 0xdead_beef;
-        let uaddr = &word as *const u32 as u64;
+        let (aspace, uaddr) = setup_aspace_with_word(0x7000_0000, 0xdead_beef);
         let guard = guard();
-        let outcome = step_futex_wait(uaddr, 0, &guard);
+        let outcome = step_futex_wait(&aspace, uaddr, 0, &guard);
         drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::EAGAIN) => {}
@@ -526,10 +575,9 @@ mod tests {
         // commit
         // publish
         let _setup = setup();
-        let word: u32 = 0xdead_beef;
-        let uaddr = &word as *const u32 as u64;
+        let (aspace, uaddr) = setup_aspace_with_word(0x8000_0000, 0xdead_beef);
         let guard = guard();
-        let outcome = step_futex_wait(uaddr, 0xdead_beef, &guard);
+        let outcome = step_futex_wait(&aspace, uaddr, 0xdead_beef, &guard);
         drop(guard);
         match outcome {
             StepOutcome::Yield {
@@ -613,11 +661,9 @@ mod tests {
         // bucket's carrier id matches across calls — the same
         // channel is fired on wake and parked on by wait.
         let _setup = setup();
-        let word: u32 = 42;
-        let uaddr = &word as *const u32 as u64;
+        let (aspace, uaddr) = setup_aspace_with_word(0x9000_0000, 42);
         let guard = guard();
-        // wait → Yield { OnWaitSource { … } }; pull the carrier id.
-        let wait_outcome = step_futex_wait(uaddr, 42, &guard);
+        let wait_outcome = step_futex_wait(&aspace, uaddr, 42, &guard);
         let waiter_carrier = match wait_outcome {
             StepOutcome::Yield {
                 shape:
@@ -653,18 +699,16 @@ mod tests {
             YieldShape,
         };
         use super::super::{step_futex_wake, FutexWaitOp, FutexWakeOp, FUTEX_WAKE_MASK};
-        use super::setup;
+        use super::{setup, setup_aspace_with_word};
 
         #[test]
         fn futex_wait_op_step_delegates_to_free_fn() {
             let _setup = setup();
             // Word holds 0xdead_beef; matching val parks → Yield::OnWaitSource.
-            let word: u32 = 0xdead_beef;
-            let uaddr = &word as *const u32 as u64;
-            // FutexWaitOp acquires its own guard inside step() per
-            // STEP_MODEL_v2 §1; outer guard would nest (EBR-7).
+            let (aspace, uaddr) = setup_aspace_with_word(0xa000_0000, 0xdead_beef);
             let mut op = FutexWaitOp {
                 uaddr,
+                aspace: &aspace,
                 val: 0xdead_beef,
             };
             let mut ctx = ScriptCtx::<ProcessIdentity>::new();

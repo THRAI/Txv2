@@ -1,5 +1,6 @@
 //! Process subsystem execution: fork, exit-group, setpgid, setsid, and
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -14,7 +15,7 @@ use crate::process::adapter::wait_routing::{self, Mask};
 
 use crate::cred::Cred;
 use crate::process::structure::{
-    ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session, Sid,
+    ExitStatus, Frame, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session, Sid,
 };
 use crate::process::topology::{
     ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers,
@@ -300,6 +301,7 @@ pub fn bootstrap_init_process(
         // mask defaults to `0o022` per Linux convention; children
         // inherit through `step_fork`'s umask thread-through.
         0o022,
+        Arc::new(SigActionTable::new()),
     )?;
     *proc_cap.payload.lock() = Some(payload);
 
@@ -324,6 +326,7 @@ pub fn bootstrap_init_process(
 pub fn step_fork<P: PmapIf>(
     parent: &Cap<ProcessIdentity>,
     clone_vm: bool,
+    clone_sighand: bool,
 ) -> Result<Cap<ProcessIdentity>, ForkError> {
     // observe
     // upgrade
@@ -367,6 +370,15 @@ pub fn step_fork<P: PmapIf>(
     };
     let parent_pgrp = parent.pgrp.lock().clone();
 
+    // Signal-action table: share via Arc (CLONE_SIGHAND) or fresh.
+    let child_sig_actions = if clone_sighand {
+        let payload_guard = parent.payload.lock();
+        let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
+        Arc::clone(&payload.frame.sig_actions)
+    } else {
+        Arc::new(SigActionTable::new())
+    };
+
     // Address space: fork (CoW clone) or share (CLONE_VM).
     let child_aspace_cap = if clone_vm {
         parent_aspace.clone()
@@ -408,6 +420,7 @@ pub fn step_fork<P: PmapIf>(
         parent_brk_base,
         parent_current_brk,
         parent_umask,
+        child_sig_actions,
     )
     .map_err(ForkError::Zone)?;
     *child_proc.payload.lock() = Some(payload);
@@ -517,8 +530,18 @@ pub fn seed_child_leader_context(
     //     (the libc clone wrapper has already pushed `fn`/`arg` to
     //     that stack); a zero `newsp` means "the child shares the
     //     parent's sp" (bare fork convention).
+    //
+    //     Also seed the frame pointer (s0/x8) to the same value.
+    //     zig cc's musl __clone wrapper uses s0-relative addressing
+    //     (sd a0, -64(s0); ld a0, -64(s0)) in the post-ecall path
+    //     shared by parent and child.  s0 inherits the parent's frame
+    //     pointer from the trap context; if the child stack is
+    //     smaller, the s0-relative store/load lands outside the
+    //     child's allocation → load page fault → SIGSEGV.
     if stack != 0 {
         child_ctx.regs[STACK_REG_INDEX] = stack;
+        // x8 = s0 = fp (frame pointer) on RV64
+        child_ctx.regs[8] = stack;
     }
     // (4) PC already points past `ecall`: the trap shell
     // (`tx-kernel::trap_handoff::hand_off_syscall`) added the 4-byte
@@ -1071,6 +1094,7 @@ fn sign_process_payload(
     brk_base: u64,
     current_brk: u64,
     umask: u16,
+    sig_actions: Arc<SigActionTable>,
 ) -> Result<PayloadCap<ProcessPayload>, ZoneError> {
     use crate::process::adapter::step_engine::AtomicSlot;
     use crate::process::adapter::step_engine::{RawPort, RawQueue};
@@ -1116,9 +1140,11 @@ fn sign_process_payload(
     let exit_wait_source = wait_routing::new_wait_source(exit_source_id);
 
     let cap = step_engine::sign(ProcessPayload {
-        aspace: aspace_slot,
+        frame: Frame {
+            vm: aspace_slot,
+            sig_actions,
+        },
         threads: ProcessThreads::from_vec(threads),
-        sig_actions: SigActionTable::new(),
         group_pending: PendingSignalQueue::new(),
         siginfo_slots: crate::signal::SigInfoSlots::new(),
         signal_port: RawPort::new(),
@@ -1237,6 +1263,7 @@ impl<T: 'static> WeakObserveExt<T> for Weak<T> {
 pub struct ForkOp<'a, P: PmapIf> {
     pub parent: &'a Cap<ProcessIdentity>,
     pub clone_vm: bool,
+    pub clone_sighand: bool,
     pub _pmap: core::marker::PhantomData<P>,
 }
 
@@ -1244,7 +1271,7 @@ impl<'a, P: PmapIf, I: SubjectIdentity> StepOp<I> for ForkOp<'a, P> {
     type Output = Result<Cap<ProcessIdentity>, ForkError>;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(step_fork::<P>(self.parent, self.clone_vm))
+        StepOutcome::Done(step_fork::<P>(self.parent, self.clone_vm, self.clone_sighand))
     }
 }
 
@@ -1642,6 +1669,7 @@ mod step_op_wraps {
         let mut op = ForkOp::<TestPmap> {
             parent: &parent,
             clone_vm: false,
+            clone_sighand: false,
             _pmap: core::marker::PhantomData,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
@@ -1659,7 +1687,7 @@ mod step_op_wraps {
     fn exit_group_op_delegates_to_step_exit_group() {
         let _g = setup();
         let parent = bootstrap();
-        let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+        let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
         let mut op = ExitGroupOp {
             process: &child,
             status: ExitStatus::Exited(0),
@@ -1675,7 +1703,7 @@ mod step_op_wraps {
     fn exit_group_with_signal_op_delegates_to_step_exit_group_with_signal() {
         let _g = setup();
         let parent = bootstrap();
-        let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+        let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
         let mut op = ExitGroupWithSignalOp {
             process: &child,
             sig: Signum::SIGKILL,
@@ -1743,7 +1771,7 @@ mod step_op_wraps {
     fn setsid_op_delegates_to_step_setsid() {
         let _g = setup();
         let parent = bootstrap();
-        let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+        let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
         let mut op = SetsidOp { target: &child };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);

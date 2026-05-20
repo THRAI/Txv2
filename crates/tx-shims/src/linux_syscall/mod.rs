@@ -46,7 +46,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use reactor_entry::userspace::SyscallRequest;
-use tx_hal::{AuxvIf, EntropyIf, PmapIf, TimeIf};
+use tx_hal::{AuxvIf, EntropyIf, IpiKind, PmapIf, SmpIf, TimeIf};
 use tx_observe::encode::{
     arg_value_tag, encode_arg_value, encode_syscall_enter, encode_syscall_exit, syscall_enter_tag,
     syscall_exit_tag,
@@ -160,7 +160,9 @@ pub use numbers::{
     CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW,
     CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID,
     CLONE_CHILD_CLEARTID, CLONE_FILES, CLONE_FS, CLONE_PARENT, CLONE_PARENT_SETTID, CLONE_SETTLS,
-    CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK,
+    CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM, CLONE_DETACHED,
+    CLONE_SYSVSEM, CLONE_NEWCGROUP, CLONE_NEWUTS,
+    DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK,
     DT_REG, DT_SOCK, DT_UNKNOWN, FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK,
     FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_TRYLOCK_PI,
     FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP,
@@ -182,6 +184,7 @@ pub use numbers::{
     NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT, NR_OPENAT, NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL,
     NR_PIPE2, NR_PPOLL, NR_PRLIMIT64, NR_READ, NR_READLINKAT, NR_READV, NR_RENAMEAT2,
     NR_RT_SIGACTION, NR_RT_SIGPENDING, NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN,
+    NR_SCHED_SETSCHEDULER,
     NR_RT_SIGSUSPEND, NR_RT_SIGTIMEDWAIT, NR_SEMCTL, NR_SEMGET, NR_SEMOP, NR_SEMTIMEDOP, NR_SETGID,
     NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID,
     NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET,
@@ -197,6 +200,14 @@ pub use numbers::{
     SEEK_END, SEEK_SET, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW, TIMER_ABSTIME,
     TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ,
     UTIME_NOW, UTIME_OMIT, WNOHANG, W_OK, X_OK,
+};
+
+pub use numbers::{
+    MEMBARRIER_CMD_GLOBAL, MEMBARRIER_CMD_GLOBAL_EXPEDITED, MEMBARRIER_CMD_PRIVATE_EXPEDITED,
+    MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, MEMBARRIER_CMD_QUERY,
+    MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED,
+    MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE, MEMBARRIER_SUPPORTED_MASK,
+    NR_MEMBARRIER, NR_SENDFILE64,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -356,7 +367,7 @@ pub(super) const SIGACTION_BYTES: usize = 32;
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
-pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
+pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -383,7 +394,7 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
     result
 }
 
-async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
+async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -411,8 +422,9 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         nr if nr == NR_GETRANDOM => return sys_getrandom(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
         nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
+        nr if nr == NR_SCHED_SETSCHEDULER => return sys_sched_setscheduler(),
         nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
-        nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args),
+        nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args, ctx),
         nr if nr == NR_MADVISE => return sys_madvise(req.args, ctx),
         nr if nr == NR_MLOCK => return sys_mlock(req.args, ctx).await,
         nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx).await,
@@ -423,28 +435,29 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         nr if nr == NR_MSGSND => return sys_msgsnd(req.args, ctx),
         nr if nr == NR_MSGRCV => return sys_msgrcv(req.args, ctx),
         nr if nr == NR_SEMGET => return sys_semget(req.args, ctx),
+        nr if nr == NR_MEMBARRIER => return sys_membarrier::<P>(&req.args),
         _ => {} // fall through to script lanes
     }
 
     // ── Lanes 2+3: Script-based (OneShotStepOp + Full async drive) ──
     match req.nr {
-        NR_WRITE => sys_write(req.args, ctx).await,
-        NR_WRITEV => sys_writev(req.args, ctx).await,
-        NR_READ => sys_read::<P>(req.args, ctx).await,
-        NR_READV => sys_readv::<P>(req.args, ctx).await,
-        NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
-        NR_PPOLL => sys_ppoll(req.args, ctx).await,
-        NR_EXIT => sys_exit(req.args, ctx),
-        NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
-        NR_BRK => sys_brk(req.args, ctx).await,
-        NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
-        NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx),
+        nr if nr == NR_WRITE => sys_write(req.args, ctx).await,
+        nr if nr == NR_WRITEV => sys_writev(req.args, ctx).await,
+        nr if nr == NR_READ => sys_read::<P>(req.args, ctx).await,
+        nr if nr == NR_READV => sys_readv::<P>(req.args, ctx).await,
+        nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
+        nr if nr == NR_PPOLL => sys_ppoll(req.args, ctx).await,
+        nr if nr == NR_EXIT => sys_exit(req.args, ctx),
+        nr if nr == NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
+        nr if nr == NR_BRK => sys_brk(req.args, ctx).await,
+        nr if nr == NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
+        nr if nr == NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx),
         nr if nr == NR_RT_SIGPENDING => sys_rt_sigpending(req.args, ctx),
         nr if nr == NR_RT_SIGSUSPEND => sys_rt_sigsuspend(req.args, ctx),
         nr if nr == NR_RT_SIGQUEUEINFO => sys_rt_sigqueueinfo(req.args, ctx),
         nr if nr == NR_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait::<P>(req.args, ctx).await,
         nr if nr == NR_SIGALTSTACK => sys_sigaltstack(req.args, ctx),
-        NR_FCNTL => sys_fcntl(req.args, ctx),
+        nr if nr == NR_FCNTL => sys_fcntl(req.args, ctx),
         nr if nr == NR_SHMCTL => sys_shmctl(req.args, ctx),
         nr if nr == NR_MSGCTL => sys_msgctl(req.args, ctx),
         nr if nr == NR_SEMOP => sys_semop(req.args, ctx),
@@ -459,7 +472,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
         nr if nr == NR_SETSID => sys_setsid(ctx),
         nr if nr == NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
-        nr if nr == NR_SET_ROBUST_LIST => sys_set_robust_list(req.args),
+        nr if nr == NR_SET_ROBUST_LIST => sys_set_robust_list(req.args, ctx),
         // Wave 2 of the DAC + setuid slice — Part 3 (cred-mutation /
         // cred-reading arms). Each wraps a Wave 1 `cred::step_*`
         // helper through the new `ctx.cred()` accessor.
@@ -706,6 +719,79 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         // timerfd_gettime(fd, curr_value).
         nr if nr == NR_TIMERFD_GETTIME => sys_timerfd_gettime(req.args[0] as u32, req.args[2], ctx),
         _ => SyscallResult::Error(ENOSYS_VALUE),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// membarrier(2)
+// ---------------------------------------------------------------------------
+
+/// `membarrier(cmd, flags, cpu_id)` — issue memory-ordering barriers
+/// across all online harts.
+///
+/// Lane 1 (Immediate): never yields, never enters StepOp.
+///
+/// Supported commands:
+/// - `MEMBARRIER_CMD_QUERY` (0) — returns a bitmask of supported commands.
+/// - `MEMBARRIER_CMD_GLOBAL` (1), `_EXPEDITED` (1<<1) — broadcast a
+///   [`IpiKind::Membarrier`] to every online hart and busy-wait for all
+///   acks. On the receiving hart the IPI handler executes a
+///   `core::sync::atomic::fence(SeqCst)` so that all prior stores are
+///   globally visible.
+/// - `MEMBARRIER_CMD_PRIVATE_EXPEDITED` (1<<3) — same as GLOBAL in a
+///   single-address-space kernel.
+/// - `MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE` (1<<5) — private
+///   expedited plus instruction-fetch barrier (`fence.i` on RV64).
+/// - `MEMBARRIER_CMD_REGISTER_*` — registration is a no-op; always
+///   returns 0.
+/// `sched_setscheduler(pid, policy, param)` — v1 stub.
+///
+/// musl calls this during `pthread_create` to set the new thread's
+/// scheduling policy. Returns 0 unconditionally (success, no-op);
+/// real priority inheritance is deferred to the scheduler slice.
+fn sys_sched_setscheduler() -> SyscallResult {
+    SyscallResult::Return(0)
+}
+
+///
+/// `flags` and `cpu_id` are currently ignored (must be 0).
+fn sys_membarrier<P: SmpIf>(args: &[u64; 6]) -> SyscallResult {
+    let cmd = args[0];
+    let flags = args[1] as u32;
+
+    if flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    match cmd {
+        MEMBARRIER_CMD_QUERY => SyscallResult::Return(MEMBARRIER_SUPPORTED_MASK as i64),
+
+        MEMBARRIER_CMD_GLOBAL
+        | MEMBARRIER_CMD_GLOBAL_EXPEDITED
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE => {
+            let targets = P::online_cpus();
+            if targets.is_empty() {
+                return SyscallResult::Return(0);
+            }
+            P::clear_ipi_ack_cpus(IpiKind::Membarrier, targets);
+            P::broadcast_ipi(targets, IpiKind::Membarrier);
+            // Synchronous wait: spin until every target hart has
+            // executed the barrier and acked. The IPI handler on the
+            // target hart runs `fence(SeqCst)` + ack before
+            // returning to its interrupt context.
+            P::wait_for_ipi_ack_cpus(targets, IpiKind::Membarrier);
+            SyscallResult::Return(0)
+        }
+
+        MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => {
+            // Registration is a no-op in this kernel.
+            SyscallResult::Return(0)
+        }
+
+        _ => SyscallResult::Error(EINVAL_VALUE),
     }
 }
 

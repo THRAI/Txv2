@@ -143,7 +143,7 @@ fn fork_assigns_distinct_tids_to_parent_and_child_leader_threads() {
     let parent = bootstrap();
     let parent_leader = first_thread(&parent);
 
-    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
     let child_leader = first_thread(&child);
 
     assert_ne!(parent_leader.tid, child_leader.tid);

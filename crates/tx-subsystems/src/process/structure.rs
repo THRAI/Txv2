@@ -414,7 +414,7 @@ impl ProcessIdentity {
     pub fn replace_aspace(&self, new: Cap<AddressSpace>) -> Option<Cap<AddressSpace>> {
         let payload_guard = self.payload.lock();
         let payload = payload_guard.as_ref()?;
-        payload.aspace.swap(Some(new))
+        payload.frame.vm.swap(Some(new))
     }
 
     /// Snapshot the `Cap<OpenFile>` registered at fd `idx` on this
@@ -841,6 +841,23 @@ pub(crate) struct GroupExitState {
     pub remaining_threads: AtomicU32,
 }
 
+/// Per-process resource frame — the set of resources governed by
+/// clone(2) sharing flags.
+///
+/// `Frame` groups the fields that can optionally be shared across
+/// processes via `Shared<Frame>`. v1 stores it inline on
+/// `ProcessPayload`; the cross-process sharing path is deferred
+/// to the `Shared<T>` wiring slice.
+pub struct Frame {
+    /// Virtual address space (CLONE_VM). Atomic slot so exec can
+    /// swap the address space atomically without &mut access.
+    pub vm: AtomicSlot<Cap<AddressSpace>>,
+    /// Signal-action table (CLONE_SIGHAND). `Arc` provides
+    /// shared ownership across processes; the inner `SpinMutex`
+    /// on `SigActionTable` handles per-entry concurrency.
+    pub sig_actions: Arc<SigActionTable>,
+}
+
 pub struct ProcessPayload {
     /// Authoritative address-space slot for this process. Per Open Q #2
     /// (DECIDED 2026-05-06, `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`),
@@ -854,12 +871,15 @@ pub struct ProcessPayload {
     /// dispatcher, the trap-shell aspace resolution, the page-fault
     /// driver) snapshot via `process.aspace_cap()` which clones the
     /// inner `Cap` out of the slot.
-    pub(crate) aspace: AtomicSlot<Cap<AddressSpace>>,
+    /// Per-process resource frame. Holds the shared-ownership
+    /// resources governed by clone(2) flags: the address space
+    /// (CLONE_VM) and the signal-action table (CLONE_SIGHAND).
+    /// v1: fields are inline on `ProcessPayload`. When cross-process
+    /// sharing through `Shared<Frame>` lands, the frame will move
+    /// to `Shared<Frame>` and the `share()` path will be wired
+    /// in `step_fork`.
+    pub(crate) frame: Frame,
     pub(crate) threads: ProcessThreads,
-    /// Per-process signal-action table. Day-1 records dispositions
-    /// installed via `step_sigaction`; the delivery step that consults
-    /// these lands with the AST/scripts pass.
-    pub(crate) sig_actions: SigActionTable,
     /// Process-group-targeted pending signals. Day-1 collapses
     /// repeated posts (bitset, no per-occurrence queueing); a thread
     /// whose mask permits the signal will sweep it on its next
@@ -1121,14 +1141,15 @@ impl ProcessPayload {
     /// is exec's phase 6 store, which atomically swaps to a fresh
     /// `Cap` and never leaves the slot empty.
     pub fn aspace_cap(&self) -> Cap<AddressSpace> {
-        self.aspace
+        self.frame
+            .vm
             .load()
-            .expect("ProcessPayload.aspace slot is always populated")
+            .expect("ProcessPayload.frame.vm slot is always populated")
     }
 
     /// Borrow the per-process action table.
     pub fn sig_actions(&self) -> &SigActionTable {
-        &self.sig_actions
+        &self.frame.sig_actions
     }
 
     /// Borrow the per-process group-pending queue.

@@ -1277,6 +1277,10 @@ pub type SecondaryEntry = unsafe extern "C" fn(cpu_id: usize) -> !;
 pub enum IpiKind {
     Reschedule,
     TlbShootdown,
+    /// Memory barrier IPI — used by `membarrier(2)` to force every
+    /// hart through a `fence` sequence so that all prior memory
+    /// operations are globally visible.
+    Membarrier,
     Stop,
 }
 

@@ -238,6 +238,9 @@ pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
 /// Wave 1's surface (`fork_aspace`'s `WouldBlock` cannot fire under
 /// v1's single-thread-per-process model). The function is non-`async`
 /// to keep the seam minimal.
+/// DIAGNOSTIC: track clone calls to debug pthread_create
+static CLONE_CALL_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 pub(super) async fn sys_clone<'a, P: PmapIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
@@ -245,13 +248,18 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     let flags = args[0];
     let stack = args[1];
 
-    // Validation: must include SIGCHLD. CLONE_THREAD creates a new
-    // thread within the calling process's thread group.
-    if flags & SIGCHLD == 0 {
+    // Validation: the lower byte specifies the exit signal.
+    // CLONE_THREAD threads don't generate an exit signal (the
+    // thread-group leader's exit signal governs process-wide
+    // SIGCHLD).  For fork-like clones we require SIGCHLD; for
+    // thread clones we accept any signal (including zero — musl
+    // sets the lower byte to zero when CLONE_THREAD is set).
+    let clone_thread = (flags & CLONE_THREAD) != 0;
+    if !clone_thread && flags & SIGCHLD == 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let clone_thread = (flags & CLONE_THREAD) != 0;
     let clone_vm = (flags & CLONE_VM) != 0;
+    let clone_sighand = (flags & CLONE_SIGHAND) != 0;
     let clone_vfork = (flags & CLONE_VFORK) != 0;
     let clone_settls = (flags & CLONE_SETTLS) != 0;
     let clone_child_cleartid = (flags & CLONE_CHILD_CLEARTID) != 0;
@@ -264,9 +272,11 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         }
         SIGCHLD | CLONE_THREAD | CLONE_VM | CLONE_SIGHAND
             | CLONE_SETTLS | CLONE_CHILD_CLEARTID | CLONE_PARENT_SETTID
-            | CLONE_FILES | CLONE_FS
+            | CLONE_FILES | CLONE_FS | CLONE_DETACHED
+            | CLONE_SYSVSEM | CLONE_NEWCGROUP | CLONE_NEWUTS
     } else {
         SIGCHLD | CLONE_SETTLS | CLONE_VM | CLONE_VFORK
+            | CLONE_SIGHAND | CLONE_FILES | CLONE_FS
     };
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
@@ -312,14 +322,17 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         };
 
         // CLONE_PARENT_SETTID: write child tid to *ptid in parent's
-        // userspace. Deferred — requires aspace.copy_to_user plumbing
-        // under the step_engine guard. For the initial pthread_create
-        // bring-up, the parent's clone(2) wrapper falls through to
-        // the CLONE_CHILD_CLEARTID futex protocol regardless of this
-        // write.
+        // userspace. Linux semantics: write `child_tid` (as i32)
+        // before the child is scheduled.
         if clone_parent_settid {
-            let _ptid_ptr = args[2]; // parent's tidptr
-            // TODO(phase-tls): aspace.copy_to_user(ptid_ptr, &child_thread.tid.0.to_ne_bytes(), &guard)
+            let ptid_ptr = args[2];
+            if ptid_ptr != 0 {
+                let _ = super::user_copy::bootstrap_write_user(
+                    &ctx.aspace,
+                    ptid_ptr,
+                    child_thread.tid.0 as i32,
+                );
+            }
         }
 
         // Hand the child thread to the reactor.
@@ -349,6 +362,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         let mut op = tx_subsystems::process::execution::ForkOp::<P> {
             parent: &ctx.process,
             clone_vm,
+            clone_sighand,
             _pmap: core::marker::PhantomData,
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
@@ -697,15 +711,11 @@ pub(super) fn sys_setsid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     }
 }
 
-/// `set_tid_address(tidptr)` — Wave 2 stub.
+/// `set_tid_address(tidptr)`.
 ///
-/// Returns the calling thread's tid (Linux's documented return for
-/// this syscall). Ignores `tidptr` — the real semantic
-/// (`clear_child_tid` slot + futex wakeup on thread exit) is deferred
-/// to the pthread/futex slice.
-///
-/// TODO(phase-tls): wire `tidptr` through to a per-thread
-/// `clear_child_tid` slot per `THREAD_RUNTIME_v1` §2.6.
+/// Stores the `clear_child_tid` pointer on the calling thread's
+/// payload. On thread exit, the kernel atomically writes 0 to *tidptr
+/// and issues `FUTEX_WAKE` so pthread_join can observe the transition.
 pub(super) fn sys_set_tid_address<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let tidptr = args[0];
     // Store the clear_child_tid pointer on the thread payload.
@@ -722,15 +732,23 @@ pub(super) fn sys_set_tid_address<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     SyscallResult::Return(ctx.thread.tid.0 as i64)
 }
 
-/// `set_robust_list(head, len)` — Wave 2 stub.
+/// `set_robust_list(head, len)`.
 ///
-/// Returns `0` unconditionally. Ignores `head`/`len` — the real
-/// semantic (futex robust-list registration + walk on thread exit)
-/// is deferred to the futex slice.
+/// Stores the robust-list head pointer and byte length on the
+/// calling thread's payload. The thread-exit path walks the list
+/// and marks each futex word as `FUTEX_OWNER_DIED` + wakes waiters.
 ///
-/// TODO(phase-futex): register the robust-list head per-thread once
-/// futex infrastructure lands.
-pub(super) fn sys_set_robust_list(_args: [u64; 6]) -> SyscallResult {
+/// Returns `0` unconditionally (Linux returns `0` on success; the
+/// only failure is `-EINVAL` for `len % size_of::<usize>() != 0`
+/// which we skip — txKernel ignores `len`).
+pub(super) fn sys_set_robust_list<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let head = args[0];
+    let len = args[1] as usize;
+    if let Some(payload) = ctx.thread.payload_cap() {
+        let mut slot = payload.robust_list_head.lock();
+        *slot = if head == 0 { None } else { Some(head) };
+        *payload.robust_list_len.lock() = len;
+    }
     SyscallResult::Return(0)
 }
 
