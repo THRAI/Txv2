@@ -13,6 +13,7 @@ OSCOMP_SUBMIT ?= target/oscomp/submit
 OSCOMP_DOCKER_IMAGE ?= zhouzhouyi/os-contest:20260104
 OSCOMP_TARGET ?= rv64-qemu
 OSCOMP_EXTRA ?=
+HOST_CARGO_TARGET_DIR ?= target/host-cargo
 
 .PHONY: docker-help docker-build docker-shell docker-ci docker-check docker-ci-slow \
 	docker-build-rv64 docker-build-la64 docker-image-cpio-rv64 docker-image-cpio-la64 \
@@ -122,13 +123,13 @@ OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'
 .PHONY: oscomp-submit oscomp-qemu-rv64 oscomp-qemu-la64 oscomp-judge-rv64 oscomp-judge-la64 oscomp-local-rv64 oscomp-local-la64
 
 oscomp-submit:
-	cargo xtask oscomp submit --submit $(OSCOMP_SUBMIT)
+	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --submit $(OSCOMP_SUBMIT)
 
 oscomp-submit-rv64:
-	cargo xtask oscomp submit --target rv64-qemu --submit $(OSCOMP_SUBMIT)
+	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --target rv64-qemu --submit $(OSCOMP_SUBMIT)
 
 oscomp-submit-la64:
-	cargo xtask oscomp submit --target la64-qemu --submit $(OSCOMP_SUBMIT)
+	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --target la64-qemu --submit $(OSCOMP_SUBMIT)
 
 oscomp-qemu-rv64:
 	set -o pipefail; \

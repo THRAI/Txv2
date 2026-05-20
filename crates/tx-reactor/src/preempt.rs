@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 const NEED_RESCHED: u8 = 0b0000_0001;
 const SLICE_EXPIRED: u8 = 0b0000_0010;
+const USERSPACE_PREEMPT: u8 = 0b0000_0100;
 
 /// One preemption marker kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -17,6 +18,14 @@ pub enum PreemptMarker {
     NeedResched,
     /// The currently dispatched slice expired.
     SliceExpired,
+    /// Userspace execution should return to the reactor before re-entering.
+    ///
+    /// This is intentionally distinct from [`PreemptMarker::NeedResched`].
+    /// A normal reschedule marker is also used to wake an idle hart to drain
+    /// its runqueue; consuming it at userspace-entry time can strand the task
+    /// that marker was meant to run. `UserspacePreempt` is the Phase 3 marker
+    /// for timer/trap-return arbitration.
+    UserspacePreempt,
 }
 
 impl PreemptMarker {
@@ -24,6 +33,7 @@ impl PreemptMarker {
         match self {
             Self::NeedResched => NEED_RESCHED,
             Self::SliceExpired => SLICE_EXPIRED,
+            Self::UserspacePreempt => USERSPACE_PREEMPT,
         }
     }
 }
@@ -50,6 +60,10 @@ impl PreemptMarkers {
         self.bits & SLICE_EXPIRED != 0
     }
 
+    pub const fn userspace_preempt(self) -> bool {
+        self.bits & USERSPACE_PREEMPT != 0
+    }
+
     pub const fn contains(self, marker: PreemptMarker) -> bool {
         self.bits & marker.bit() != 0
     }
@@ -64,7 +78,7 @@ impl PreemptMarkers {
 
     const fn from_bits(bits: u8) -> Self {
         Self {
-            bits: bits & (NEED_RESCHED | SLICE_EXPIRED),
+            bits: bits & (NEED_RESCHED | SLICE_EXPIRED | USERSPACE_PREEMPT),
         }
     }
 }
@@ -98,6 +112,10 @@ impl PreemptionPoint {
         self.mark(PreemptMarker::SliceExpired);
     }
 
+    pub fn mark_userspace_preempt(&self) {
+        self.mark(PreemptMarker::UserspacePreempt);
+    }
+
     pub fn is_marked(&self, marker: PreemptMarker) -> bool {
         self.snapshot().contains(marker)
     }
@@ -108,6 +126,16 @@ impl PreemptionPoint {
 
     pub fn consume(&self) -> PreemptMarkers {
         PreemptMarkers::from_bits(self.bits.swap(0, Ordering::AcqRel))
+    }
+
+    /// Atomically clear one marker bit and report whether it was set.
+    ///
+    /// This lets runtime code consume the Phase 3 userspace-preempt marker
+    /// without accidentally eating a normal `NeedResched` wake marker that may
+    /// have been set for unrelated runqueue work on the same hart.
+    pub fn take(&self, marker: PreemptMarker) -> bool {
+        let bit = marker.bit();
+        self.bits.fetch_and(!bit, Ordering::AcqRel) & bit != 0
     }
 
     pub fn clear(&self) {

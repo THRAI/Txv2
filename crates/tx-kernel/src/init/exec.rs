@@ -461,21 +461,21 @@ impl<P: TxPlatform> CoreInit<P> {
         // a guard at the call site (per
         // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`).
         let argv: &[&[u8]] = &[argv0];
-        let mut outcome =
-            bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
-                &init, &thread, init_path, argv, envp, &cred,
-            ));
+        let mut outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+            &init, &thread, init_path, argv, envp, &cred,
+        ));
         // If /bin/busybox failed, try /bin/sh (symlink → busybox).
         // Some initramfs layouts only resolve correctly through the
         // symlink path.
-        if outcome.is_err()
-            && init_path != b"/bin/sh"
-            && init_path != b"/init"
-        {
-            let sh_outcome =
-                bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
-                    &init, &thread, b"/bin/sh", &[b"sh"], envp, &cred,
-                ));
+        if outcome.is_err() && init_path != b"/bin/sh" && init_path != b"/init" {
+            let sh_outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                &init,
+                &thread,
+                b"/bin/sh",
+                &[b"sh"],
+                envp,
+                &cred,
+            ));
             if sh_outcome.is_ok() {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
@@ -650,14 +650,17 @@ impl<P: TxPlatform> CoreInit<P> {
         let wrapper_payload = payload.clone();
         let future_payload = payload.clone();
         let submit_thread = thread.clone();
+        let current_hart = boot_runtime::HartId(current_cpu.0);
+        let mut signal = super::SmpRescheduleSignal::<P>::new();
         let submitted = BOOT_REACTOR.with(|reactor| {
-            reactor.submit_task_with_meta(
+            reactor.submit_task_with_meta_from_hart(
                 crate::thread_future::PerHartSlotted::<P, _>::new(
                     wrapper_payload,
                     crate::thread_future::run_thread::<P>(submit_thread, future_payload),
                 ),
-                boot_runtime::InitialSchedMeta::kernel()
-                    .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
+                Self::userspace_thread_sched_meta(),
+                current_hart,
+                &mut signal,
             )
         });
         if submitted.is_none() {
@@ -668,6 +671,9 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":userspace:submitted\n");
 
         P::enable_timer_wakeups();
+
+        // Enable concurrent poll on all harts (Phase 1a poll lease).
+        super::USE_CONCURRENT_POLL.store(true, core::sync::atomic::Ordering::Release);
 
         // Drive the BSP reactor loop until init zombifies. Each
         // iteration is a `step_hart_loop_at` step: advance time, run
@@ -699,7 +705,7 @@ impl<P: TxPlatform> CoreInit<P> {
             // ran under.
             Self::drain_pending_child_submits();
 
-            let step = match Self::step_boot_reactor_once(current_cpu) {
+            let step = match Self::step_boot_reactor_once_concurrent(current_cpu) {
                 Some(step) => step,
                 None => break,
             };

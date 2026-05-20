@@ -83,7 +83,7 @@ fn ast_slots_are_task_local_and_independent() {
 }
 
 #[test]
-fn preemption_point_coalesces_need_resched_and_slice_expired_until_consumed() {
+fn preemption_point_coalesces_all_markers_until_consumed() {
     let point = PreemptionPoint::new();
 
     assert_eq!(point.snapshot(), PreemptMarkers::empty());
@@ -91,31 +91,52 @@ fn preemption_point_coalesces_need_resched_and_slice_expired_until_consumed() {
     point.mark(PreemptMarker::NeedResched);
     point.mark_slice_expired();
     point.mark(PreemptMarker::SliceExpired);
+    point.mark_userspace_preempt();
+    point.mark(PreemptMarker::UserspacePreempt);
 
     let snapshot = point.snapshot();
     assert!(snapshot.need_resched());
     assert!(snapshot.slice_expired());
+    assert!(snapshot.userspace_preempt());
     assert!(snapshot.contains(PreemptMarker::NeedResched));
     assert!(snapshot.contains(PreemptMarker::SliceExpired));
-    assert_eq!(snapshot.bits(), 0b0000_0011);
+    assert!(snapshot.contains(PreemptMarker::UserspacePreempt));
+    assert_eq!(snapshot.bits(), 0b0000_0111);
 
     assert_eq!(point.consume(), snapshot);
     assert!(point.consume().is_empty());
 }
 
 #[test]
-fn preemption_markers_are_consumed_independently_across_boundaries() {
+fn userspace_preempt_is_distinct_from_normal_reschedule() {
     let point = PreemptionPoint::new();
 
     point.mark_need_resched();
     let first = point.consume();
     assert!(first.need_resched());
     assert!(!first.slice_expired());
+    assert!(!first.userspace_preempt());
 
-    point.mark_slice_expired();
+    point.mark_userspace_preempt();
     let second = point.consume();
     assert!(!second.need_resched());
-    assert!(second.slice_expired());
+    assert!(!second.slice_expired());
+    assert!(second.userspace_preempt());
+}
+
+#[test]
+fn take_single_marker_preserves_other_pending_markers() {
+    let point = PreemptionPoint::new();
+
+    point.mark_need_resched();
+    point.mark_userspace_preempt();
+
+    assert!(point.take(PreemptMarker::UserspacePreempt));
+    assert!(!point.take(PreemptMarker::UserspacePreempt));
+
+    let remaining = point.consume();
+    assert!(remaining.need_resched());
+    assert!(!remaining.userspace_preempt());
 }
 
 #[test]
@@ -125,6 +146,9 @@ fn preemption_point_clear_drops_pending_markers_without_snapshot() {
     point.mark_need_resched();
     point.mark_slice_expired();
     assert!(point.is_marked(PreemptMarker::NeedResched));
+    assert!(!point.is_marked(PreemptMarker::UserspacePreempt));
+    point.mark_userspace_preempt();
+    assert!(point.is_marked(PreemptMarker::UserspacePreempt));
 
     point.clear();
 

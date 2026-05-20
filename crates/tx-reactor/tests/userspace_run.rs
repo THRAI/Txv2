@@ -9,9 +9,9 @@ use std::{sync::Arc, task::Wake};
 use tx_reactor::{
     ast::{AstMarker, AstQueueEffect, AstSlot},
     userspace::{
-        FatalTrapInfo, PageFaultAccess, PageFaultInfo, SyscallRequest, UserAddr,
-        UserspaceEntryAction, UserspaceEntryDecision, UserspaceEntryTaskError, UserspaceRunError,
-        UserspaceRunPhase, UserspaceRunSlot, UserspaceTrapInfo,
+        FatalTrapInfo, SyscallRequest, UserspaceEntryAction, UserspaceEntryDecision,
+        UserspaceEntryTaskError, UserspaceRunError, UserspaceRunPhase, UserspaceRunSlot,
+        UserspaceTrapInfo,
     },
     Reactor, TaskLifecycleError, TaskStatus,
 };
@@ -36,14 +36,6 @@ fn counting_waker(wakes: Arc<AtomicUsize>) -> Waker {
 
 fn syscall_trap(nr: u64) -> UserspaceTrapInfo {
     UserspaceTrapInfo::Syscall(SyscallRequest::new(nr, [1, 2, 3, 4, 5, 6]))
-}
-
-fn page_fault_trap(addr: u64) -> UserspaceTrapInfo {
-    UserspaceTrapInfo::PageFault(PageFaultInfo {
-        addr: UserAddr::new(addr),
-        access: PageFaultAccess::Write,
-        present: false,
-    })
 }
 
 fn fatal_trap(cause: u64) -> UserspaceTrapInfo {
@@ -83,7 +75,7 @@ fn userspace_run_wait_stays_pending_until_interesting_trap() {
 }
 
 #[test]
-fn timer_preemption_is_recorded_without_resolving_or_waking() {
+fn timer_preemption_resolves_and_wakes_waiter() {
     let slot = UserspaceRunSlot::new();
     let mut wait = slot.start_request().expect("start userspace wait");
     let request = wait.request();
@@ -100,27 +92,20 @@ fn timer_preemption_is_recorded_without_resolving_or_waking() {
     let preempted = slot
         .record_timer_preemption(request)
         .expect("record timer preemption");
-    assert_eq!(preempted.phase, UserspaceRunPhase::Preempted);
+    assert_eq!(preempted.phase, UserspaceRunPhase::Resolved);
     assert_eq!(preempted.dispatches, 1);
     assert_eq!(preempted.preemptions, 1);
-    assert_eq!(preempted.trap, None);
-    assert_eq!(wakes.load(Ordering::SeqCst), 0);
-    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending);
-
-    let dispatched_again = slot.dispatch(request).expect("redispatch userspace");
-    assert_eq!(dispatched_again.phase, UserspaceRunPhase::Running);
-    assert_eq!(dispatched_again.dispatches, 2);
-    assert_eq!(wakes.load(Ordering::SeqCst), 0);
-
-    let trap = page_fault_trap(0x4000);
-    slot.complete_interesting_trap(request, trap)
-        .expect("complete page fault");
+    assert_eq!(preempted.trap, Some(UserspaceTrapInfo::TimerPreempt));
     assert_eq!(wakes.load(Ordering::SeqCst), 1);
-    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(trap));
+    assert_eq!(
+        Pin::new(&mut wait).poll(&mut cx),
+        Poll::Ready(UserspaceTrapInfo::TimerPreempt)
+    );
+    assert_eq!(slot.status(), None);
 }
 
 #[test]
-fn interesting_trap_can_resolve_from_preempted_state() {
+fn late_interesting_trap_overrides_timer_preemption() {
     let slot = UserspaceRunSlot::new();
     let mut wait = slot.start_request().expect("start userspace wait");
     let request = wait.request();
@@ -136,10 +121,13 @@ fn interesting_trap_can_resolve_from_preempted_state() {
     let trap = fatal_trap(13);
     let resolved = slot
         .complete_interesting_trap(request, trap)
-        .expect("complete fatal trap");
+        .expect("interesting trap overrides soft timer preemption");
     assert_eq!(resolved.phase, UserspaceRunPhase::Resolved);
     assert_eq!(resolved.trap, Some(trap));
-    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(trap));
+    assert_eq!(
+        Pin::new(&mut wait).poll(&mut cx),
+        Poll::Ready(trap)
+    );
 }
 
 #[test]
@@ -296,19 +284,13 @@ fn timer_preemption_does_not_consume_pending_entry_ast() {
         .expect("record timer preemption");
 
     assert_eq!(ast.pending(), &[AstMarker::Drain]);
-    let outcome = slot
-        .checkpoint_userspace_entry(request, &mut ast, |_| {
-            UserspaceEntryDecision::EnterUserspace
-        })
-        .expect("checkpoint after preemption");
-
-    assert!(ast.is_empty());
-    let UserspaceEntryAction::Entered(status) = outcome.action else {
-        panic!("entry decision should redispatch userspace");
-    };
-    assert_eq!(status.phase, UserspaceRunPhase::Running);
-    assert_eq!(status.dispatches, 2);
-    assert_eq!(status.preemptions, 1);
+    assert_eq!(
+        slot.checkpoint_userspace_entry(request, &mut ast, |_| {
+            panic!("resolved timer preemption must not re-enter with the same request")
+        }),
+        Err(UserspaceRunError::AlreadyResolved(request))
+    );
+    assert_eq!(ast.pending(), &[AstMarker::Drain]);
 }
 
 #[test]
@@ -458,18 +440,13 @@ fn reactor_request_userspace_run_facade_preserves_preemption_transparency() {
             .record_userspace_timer_preemption(request)
             .expect("record timer preemption")
             .phase,
-        UserspaceRunPhase::Preempted
+        UserspaceRunPhase::Resolved
     );
-    assert_eq!(wakes.load(Ordering::SeqCst), 0);
-    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending);
-
-    let trap = syscall_trap(93);
-    let status = reactor
-        .complete_userspace_run(request, trap)
-        .expect("complete userspace run");
-    assert_eq!(status.phase, UserspaceRunPhase::Resolved);
     assert_eq!(wakes.load(Ordering::SeqCst), 1);
-    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(trap));
+    assert_eq!(
+        Pin::new(&mut wait).poll(&mut cx),
+        Poll::Ready(UserspaceTrapInfo::TimerPreempt)
+    );
     assert_eq!(reactor.userspace_run_status(), None);
 }
 
