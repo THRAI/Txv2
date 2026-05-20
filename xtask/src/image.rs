@@ -358,7 +358,8 @@ fn install_alpine_bootstrap_busybox(
     let busybox = resolve_busybox(root, target)?;
     let bin = layout.join("bin");
     fs::create_dir_all(&bin).map_err(|err| err.to_string())?;
-    fs::copy(&busybox, bin.join("busybox")).map_err(|err| err.to_string())?;
+    let bootstrap_name = "tx-bootstrap-busybox";
+    fs::copy(&busybox, bin.join(bootstrap_name)).map_err(|err| err.to_string())?;
 
     #[cfg(unix)]
     {
@@ -366,12 +367,13 @@ fn install_alpine_bootstrap_busybox(
         if sh.exists() {
             fs::remove_file(&sh).map_err(|err| err.to_string())?;
         }
-        unix_fs::symlink("busybox", sh).map_err(|err| err.to_string())?;
+        unix_fs::symlink(bootstrap_name, sh).map_err(|err| err.to_string())?;
     }
 
     println!(
-        "alpine: installed static bootstrap busybox from {}",
-        busybox.display()
+        "alpine: installed static bootstrap shell from {} as /bin/{}",
+        busybox.display(),
+        bootstrap_name
     );
     Ok(())
 }

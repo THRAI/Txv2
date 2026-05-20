@@ -34,12 +34,12 @@ confirmed the rootfs now contains:
 - `/etc/network/interfaces`
 
 Running the focused OpenRC probe against that image confirms the OpenRC package
-surface is now present. The next blocker is not a txKernel network ABI gap:
-there is no `timeout` applet in the image, and raw
-`/etc/init.d/networking status` was observed to hang when run directly under the
-shell-test. The probe therefore records `NO_TIMEOUT_FOR_NETWORKING_STATUS` and
-`NO_TIMEOUT_FOR_NETWORKING_START` as non-network shell/coreutils/OpenRC
-service-manager blockers.
+surface is now present. The next blocker is not a txKernel network ABI gap: the
+built image did not provide a usable safe timeout path for wrapping
+`/etc/init.d/networking status/start`, and raw `networking status` was observed
+to hang when run directly under the shell-test. The probe therefore records
+`NO_TIMEOUT_FOR_NETWORKING_STATUS` and `NO_TIMEOUT_FOR_NETWORKING_START` as
+non-network shell/coreutils/OpenRC service-manager blockers.
 
 The network visibility checks still pass:
 
