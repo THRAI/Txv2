@@ -44,7 +44,7 @@ impl KernelTrapSink<Platform> for RecordingTrapSink {
         panic!("unexpected syscall")
     }
 
-    fn on_timer_interrupt(cpu: CpuId) -> TrapAction {
+    fn on_timer_interrupt(cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         assert_eq!(cpu, CpuId(0));
         assert!(<Platform as IrqIf>::in_irq_context());
         TEST_TIMER_TRAPS.fetch_add(1, Ordering::AcqRel);
@@ -81,7 +81,7 @@ impl KernelTrapSink<Platform> for RecordingSyscallSink {
         TrapAction::Resume
     }
 
-    fn on_timer_interrupt(_cpu: CpuId) -> TrapAction {
+    fn on_timer_interrupt(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         panic!("unexpected timer")
     }
 
@@ -424,6 +424,32 @@ fn dispatch_timer_trap_enters_irq_context_and_resumes() {
         TrapAction::Resume
     );
     assert_eq!(TEST_TIMER_TRAPS.load(Ordering::Acquire), 1);
+    assert!(!<Platform as IrqIf>::in_irq_context());
+
+    <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn irq_context_depth_is_per_cpu() {
+    let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    assert!(!<Platform as IrqIf>::in_irq_context());
+    let cpu0_irq = enter_la64_irq_context();
+    assert!(<Platform as IrqIf>::in_irq_context());
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(1));
+    assert!(!<Platform as IrqIf>::in_irq_context());
+    {
+        let _cpu1_irq = enter_la64_irq_context();
+        assert!(<Platform as IrqIf>::in_irq_context());
+    }
+    assert!(!<Platform as IrqIf>::in_irq_context());
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    assert!(<Platform as IrqIf>::in_irq_context());
+    drop(cpu0_irq);
     assert!(!<Platform as IrqIf>::in_irq_context());
 
     <Platform as PercpuIf>::write_kernel_tls(saved_tls);

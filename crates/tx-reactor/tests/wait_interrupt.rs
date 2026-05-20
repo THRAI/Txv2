@@ -20,7 +20,7 @@ fn uninterruptible_ignores_deliverable_and_termination_interrupt_state() {
     let interrupts = Arc::new(AtomicInterruptSummary::new());
     let outcome = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = {
         let channel = channel.clone();
         let condition_ready = Arc::clone(&condition_ready);
@@ -64,7 +64,7 @@ fn interruptible_returns_interrupted_for_deliverable_signal() {
     let interrupts = Arc::new(AtomicInterruptSummary::new());
     let outcome = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = {
         let channel = channel.clone();
         let interrupts = Arc::clone(&interrupts);
@@ -98,7 +98,7 @@ fn interruptible_does_not_return_killed_for_termination_only() {
     let interrupts = Arc::new(AtomicInterruptSummary::new());
     let outcome = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = {
         let channel = channel.clone();
         let condition_ready = Arc::clone(&condition_ready);
@@ -140,7 +140,7 @@ fn killable_ignores_deliverable_signal_but_returns_killed_for_termination() {
     let interrupts = Arc::new(AtomicInterruptSummary::new());
     let outcome = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = {
         let channel = channel.clone();
         let interrupts = Arc::clone(&interrupts);
@@ -179,7 +179,7 @@ fn readiness_wins_when_condition_is_already_true() {
     interrupts.set_deliverable_signal(true);
     interrupts.set_termination(true);
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = {
         let channel = channel.clone();
         let interrupts = Arc::clone(&interrupts);
@@ -207,7 +207,7 @@ fn condition_recheck_wins_after_normal_wake_even_with_interrupt_pending() {
     let interrupts = Arc::new(AtomicInterruptSummary::new());
     let outcome = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = {
         let channel = channel.clone();
         let condition_ready = Arc::clone(&condition_ready);

@@ -756,6 +756,76 @@ pub(super) fn sys_set_robust_list<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     SyscallResult::Return(0)
 }
 
+fn affinity_tid_arg(pid_arg: u64, ctx: &SyscallCtx<'_>) -> Result<u32, SyscallResult> {
+    if pid_arg == 0 {
+        return Ok(ctx.thread.tid.0);
+    }
+    u32::try_from(pid_arg).map_err(|_| SyscallResult::Error(ESRCH_VALUE))
+}
+
+fn affinity_error_to_syscall(
+    err: tx_subsystems::reactor_affinity::ReactorAffinityError,
+) -> SyscallResult {
+    use tx_subsystems::reactor_affinity::ReactorAffinityError as E;
+    match err {
+        E::InvalidMask => SyscallResult::Error(EINVAL_VALUE),
+        E::NoSuchThread => SyscallResult::Error(ESRCH_VALUE),
+        E::NotInstalled => SyscallResult::Error(ENOSYS_VALUE),
+    }
+}
+
+/// `sched_setaffinity(pid, cpusetsize, mask)`.
+///
+/// v1 supports the single-`u64` CPU mask shape used by txKernel's HAL
+/// `CpuMask`. `pid == 0` targets the calling thread; otherwise the numeric
+/// pid is interpreted as a tid, matching Linux's per-thread affinity ABI.
+pub(super) fn sys_sched_setaffinity<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let tid = match affinity_tid_arg(args[0], ctx) {
+        Ok(tid) => tid,
+        Err(err) => return err,
+    };
+    let cpusetsize = args[1] as usize;
+    let mask_ptr = args[2];
+    if cpusetsize < core::mem::size_of::<u64>() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if mask_ptr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let mask = match bootstrap_read_user::<u64>(&ctx.aspace, mask_ptr) {
+        Ok(mask) => mask,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    match tx_subsystems::reactor_affinity::set_thread_affinity(tid, mask) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(err) => affinity_error_to_syscall(err),
+    }
+}
+
+/// `sched_getaffinity(pid, cpusetsize, mask)`.
+pub(super) fn sys_sched_getaffinity<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let tid = match affinity_tid_arg(args[0], ctx) {
+        Ok(tid) => tid,
+        Err(err) => return err,
+    };
+    let cpusetsize = args[1] as usize;
+    let mask_ptr = args[2];
+    if cpusetsize < core::mem::size_of::<u64>() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if mask_ptr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let mask = match tx_subsystems::reactor_affinity::get_thread_affinity(tid) {
+        Ok(mask) => mask,
+        Err(err) => return affinity_error_to_syscall(err),
+    };
+    match bootstrap_write_user::<u64>(&ctx.aspace, mask_ptr, mask) {
+        Ok(()) => SyscallResult::Return(core::mem::size_of::<u64>() as i64),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
 // =====================================================================
 // Slice 7 of the shell-prompt roadmap — fcntl extension + day-1 misc
 // syscalls (`getpgrp` / `kill` / `tkill` / `tgkill` / `getrandom` /

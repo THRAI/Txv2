@@ -1272,21 +1272,30 @@ impl ProcessPayload {
     /// same accessor to preopen fds 0/1/2.
     pub fn set_fd(&self, idx: u32, file: Option<Cap<OpenFile>>) -> Option<Cap<OpenFile>> {
         let mut slot = self.fds.lock();
-        match file {
+        let previous = match file {
             Some(f) => slot.insert(idx, f),
             None => slot.remove(&idx),
+        };
+        drop(slot);
+        if let Some(file) = &previous {
+            decr_pipe_fd_ref(file);
         }
+        previous
     }
 
     /// Remove every fd from this payload and return the detached table.
     ///
-    /// Process exit must close all open file descriptions before the
-    /// payload itself becomes unreachable. In particular, pipe EOF/EPIPE
-    /// publication is driven from `OpenFile` drop hooks, so exit paths
-    /// need a concrete fd-table drain rather than waiting for the whole
-    /// payload to disappear later through EBR.
+    /// Process exit must close all open fds before the payload itself
+    /// becomes unreachable. In particular, pipe EOF/EPIPE publication is
+    /// driven from fd-table accounting, so exit paths need a concrete
+    /// drain rather than waiting for the whole payload to disappear
+    /// later through EBR.
     pub(crate) fn drain_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
-        core::mem::take(&mut *self.fds.lock())
+        let drained = core::mem::take(&mut *self.fds.lock());
+        for file in drained.values() {
+            decr_pipe_fd_ref(file);
+        }
+        drained
     }
 
     /// Snapshot the entire fd table as a fresh `BTreeMap`. Each
@@ -1296,6 +1305,18 @@ impl ProcessPayload {
     /// `step_fork` to clone the parent's fd table into the child.
     pub(crate) fn snapshot_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
         self.fds.lock().clone()
+    }
+
+    /// Clone the fd table for `fork`, accounting each inherited pipe
+    /// endpoint as a new fd reference. Unlike [`Self::snapshot_fds`],
+    /// this result is intended to be installed into another live
+    /// `ProcessPayload`.
+    pub(crate) fn clone_fds_for_fork(&self) -> BTreeMap<u32, Cap<OpenFile>> {
+        let cloned = self.fds.lock().clone();
+        for file in cloned.values() {
+            incr_pipe_fd_ref(file);
+        }
+        cloned
     }
 
     /// Public fd-table snapshot (for procfs `/proc/<pid>/fd/`).
@@ -1586,6 +1607,26 @@ unsafe impl ZoneAllocated for ProcessPayload {
     type Policy = PayloadPolicy<Self>;
     fn zone() -> &'static Zone<Self> {
         &PROCESS_PAYLOAD_ZONE
+    }
+}
+
+pub(crate) fn incr_pipe_fd_ref(file: &Cap<OpenFile>) {
+    let Some((payload, side)) = file.pipe_endpoint() else {
+        return;
+    };
+    match side {
+        crate::pipe::PipeSide::Reader => payload.incr_reader(),
+        crate::pipe::PipeSide::Writer => payload.incr_writer(),
+    }
+}
+
+fn decr_pipe_fd_ref(file: &Cap<OpenFile>) {
+    let Some((payload, side)) = file.pipe_endpoint() else {
+        return;
+    };
+    match side {
+        crate::pipe::PipeSide::Reader => payload.decr_reader(),
+        crate::pipe::PipeSide::Writer => payload.decr_writer(),
     }
 }
 

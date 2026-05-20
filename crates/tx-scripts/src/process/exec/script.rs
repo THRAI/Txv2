@@ -492,17 +492,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     if is_shebang {
         if let Some((interp, opt_arg)) = shebang_parse(&header_bytes) {
             EXEC_SHEBANG_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            // Build new argv: [interp, opt_arg?, script_path, argv[1..]...]
-            let mut new_argv: Vec<Vec<u8>> = Vec::new();
-            new_argv.push(interp.to_vec());
-            if let Some(arg) = opt_arg {
-                new_argv.push(arg.to_vec());
-            }
-            new_argv.push(path.to_vec());
-            for &a in argv.iter().skip(1) {
-                new_argv.push(a.to_vec());
-            }
-            let interp_path: Vec<u8> = interp.to_vec();
+            let (interp_path, new_argv) = shebang_exec_argv(interp, opt_arg, path, argv);
             let new_argv_refs: Vec<&[u8]> = new_argv.iter().map(|v| v.as_slice()).collect();
             return alloc::boxed::Box::pin(exec_script_inner::<P>(
                 depth + 1,
@@ -545,10 +535,36 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // `txdoc:EXEC-8-3-PARSE-AND-VALIDATE`. Goblin-backed parser owns
     // every header and program-header check (class / data / version /
     // arch / type / no PT_INTERP / no PT_DYNAMIC / phdr-table fits /
-    // congruence / overlap / W^X). All failures collapse to
-    // `ExecError::NotExecutable` at the syscall boundary.
-    let mut parsed: ExecImagePlan =
-        parse_image_plan(&header_bytes).map_err(ExecError::from_parse_error)?;
+    // congruence / overlap / W^X).  If the file does not look like a
+    // valid ELF and has no shebang, fall back to `/bin/sh` so that
+    // scripts without a `#!` line (e.g. OSComp libctest's run-static.sh
+    // / run-dynamic.sh) still execute.
+    let mut parsed: ExecImagePlan = match parse_image_plan(&header_bytes) {
+        Ok(plan) => plan,
+        Err(_parse_err) => {
+            if depth < SHEBANG_MAX_DEPTH {
+                let interp_path: Vec<u8> = b"/bin/sh".to_vec();
+                let mut new_argv: Vec<Vec<u8>> = Vec::new();
+                new_argv.push(interp_path.clone());
+                new_argv.push(path.to_vec());
+                for &a in argv.iter().skip(1) {
+                    new_argv.push(a.to_vec());
+                }
+                let new_argv_refs: Vec<&[u8]> = new_argv.iter().map(|v| v.as_slice()).collect();
+                return alloc::boxed::Box::pin(exec_script_inner::<P>(
+                    depth + 1,
+                    process,
+                    thread,
+                    &interp_path,
+                    &new_argv_refs,
+                    envp,
+                    cred,
+                ))
+                .await;
+            }
+            return Err(ExecError::NotExecutable);
+        }
+    };
 
     // ASLR: for ET_DYN images, shift the fixed load_bias by a
     // random offset.  ET_EXEC binaries (load_bias == 0) are not
@@ -1292,6 +1308,44 @@ fn shebang_parse(header: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
         }
     };
     Some((interp, opt_arg))
+}
+
+/// Build argv for a shebang re-exec.
+///
+/// OSComp Lua uses helper scripts with `#!/bin/busybox sh`. Txv2
+/// publishes `/bin/sh` consistently across boot modes, while
+/// `/bin/busybox` is not guaranteed to exist. When normalising that
+/// exact shebang to `/bin/sh`, the original busybox applet selector
+/// (`sh`) must be consumed; otherwise busybox receives
+/// `/bin/sh sh script ...` and tries to open a script literally named
+/// `sh`.
+fn shebang_exec_argv(
+    interp: &[u8],
+    opt_arg: Option<&[u8]>,
+    script_path: &[u8],
+    original_argv: &[&[u8]],
+) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let mut interp_path = interp.to_vec();
+    let mut opt_arg = opt_arg;
+    if interp == b"/bin/busybox" {
+        interp_path = b"/bin/sh".to_vec();
+        if matches!(opt_arg, Some(b"sh" | b"ash")) {
+            opt_arg = None;
+        }
+    }
+
+    // Linux binfmt_script shape: [interp, opt_arg?, script_path,
+    // original argv[1..]...].
+    let mut new_argv: Vec<Vec<u8>> = Vec::new();
+    new_argv.push(interp_path.clone());
+    if let Some(arg) = opt_arg {
+        new_argv.push(arg.to_vec());
+    }
+    new_argv.push(script_path.to_vec());
+    for &a in original_argv.iter().skip(1) {
+        new_argv.push(a.to_vec());
+    }
+    (interp_path, new_argv)
 }
 
 fn shebang_trim_start(s: &[u8]) -> &[u8] {

@@ -5,7 +5,7 @@ use tx_reactor::{
 
 #[test]
 fn reactor_ast_api_preserves_task_local_coalesced_batches() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let first = reactor.submit_task(std::future::pending::<()>());
     let second = reactor.submit_task(std::future::pending::<()>());
 
@@ -38,7 +38,7 @@ fn reactor_ast_api_preserves_task_local_coalesced_batches() {
 
 #[test]
 fn poll_boundary_consumes_pending_ast_before_future_poll() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = reactor.submit_task(std::future::pending::<()>());
 
     assert_eq!(
@@ -67,7 +67,7 @@ fn poll_boundary_consumes_pending_ast_before_future_poll() {
 
 #[test]
 fn ast_apis_reject_terminal_and_stale_task_keys() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let completed = reactor.submit_task(async {});
 
     let stats = reactor.run_until_idle();

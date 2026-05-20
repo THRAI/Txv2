@@ -469,6 +469,11 @@ impl ThreadPayloadSlots {
 }
 
 static CURRENT_THREAD_PAYLOAD: ThreadPayloadSlots = ThreadPayloadSlots::new();
+static CURRENT_USERSPACE_PAYLOAD: ThreadPayloadSlots = ThreadPayloadSlots::new();
+static LAST_USERSPACE_SET_HART: AtomicU64 = AtomicU64::new(u64::MAX);
+static LAST_USERSPACE_CLEAR_HART: AtomicU64 = AtomicU64::new(u64::MAX);
+static USERSPACE_SET_COUNT: AtomicU64 = AtomicU64::new(0);
+static USERSPACE_CLEAR_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Return the `PayloadCap<ThreadPayload>` registered for `hart`, or
 /// `None` if no thread future is currently driving on that hart.
@@ -480,6 +485,28 @@ pub fn current_thread_payload(hart: usize) -> Option<PayloadCap<ThreadPayload>> 
         return None;
     }
     CURRENT_THREAD_PAYLOAD.slots[hart].lock().clone()
+}
+
+/// Return the payload that most recently entered userspace on `hart`.
+///
+/// Unlike [`current_thread_payload`], this slot spans the machine userspace
+/// round-trip rather than only the Rust `Future::poll` call. Timer preemption
+/// may unwind the poll boundary before a later user fault is delivered; the
+/// trap shell still needs a stable payload anchor to hand that fault back to
+/// the owning thread future.
+pub fn current_userspace_payload(hart: usize) -> Option<PayloadCap<ThreadPayload>> {
+    if hart >= MAX_THREAD_PAYLOAD_HARTS {
+        return None;
+    }
+    CURRENT_USERSPACE_PAYLOAD.slots[hart].lock().clone()
+}
+
+pub fn current_thread_payload_mask() -> u64 {
+    payload_slot_mask(&CURRENT_THREAD_PAYLOAD)
+}
+
+pub fn current_userspace_payload_mask() -> u64 {
+    payload_slot_mask(&CURRENT_USERSPACE_PAYLOAD)
 }
 
 /// Install `payload` as the current thread payload on `hart`. The
@@ -511,6 +538,55 @@ pub fn clear_current_thread_payload(hart: usize) -> Option<PayloadCap<ThreadPayl
         return None;
     }
     CURRENT_THREAD_PAYLOAD.slots[hart].lock().take()
+}
+
+/// Install `payload` as the userspace-running payload on `hart`.
+pub fn set_current_userspace_payload(
+    hart: usize,
+    payload: PayloadCap<ThreadPayload>,
+) -> Option<PayloadCap<ThreadPayload>> {
+    assert!(
+        hart < MAX_THREAD_PAYLOAD_HARTS,
+        "hart {hart} exceeds MAX_THREAD_PAYLOAD_HARTS",
+    );
+    let mut slot = CURRENT_USERSPACE_PAYLOAD.slots[hart].lock();
+    let prev = slot.clone();
+    *slot = Some(payload);
+    LAST_USERSPACE_SET_HART.store(hart as u64, Ordering::Relaxed);
+    USERSPACE_SET_COUNT.fetch_add(1, Ordering::Relaxed);
+    prev
+}
+
+/// Clear the userspace-running payload on `hart`.
+pub fn clear_current_userspace_payload(hart: usize) -> Option<PayloadCap<ThreadPayload>> {
+    if hart >= MAX_THREAD_PAYLOAD_HARTS {
+        return None;
+    }
+    let cleared = CURRENT_USERSPACE_PAYLOAD.slots[hart].lock().take();
+    LAST_USERSPACE_CLEAR_HART.store(hart as u64, Ordering::Relaxed);
+    USERSPACE_CLEAR_COUNT.fetch_add(1, Ordering::Relaxed);
+    cleared
+}
+
+pub fn userspace_payload_trace_counters() -> (u64, u64, u64, u64) {
+    (
+        LAST_USERSPACE_SET_HART.load(Ordering::Relaxed),
+        LAST_USERSPACE_CLEAR_HART.load(Ordering::Relaxed),
+        USERSPACE_SET_COUNT.load(Ordering::Relaxed),
+        USERSPACE_CLEAR_COUNT.load(Ordering::Relaxed),
+    )
+}
+
+fn payload_slot_mask(slots: &ThreadPayloadSlots) -> u64 {
+    let mut mask = 0u64;
+    let mut hart = 0;
+    while hart < MAX_THREAD_PAYLOAD_HARTS {
+        if slots.slots[hart].lock().is_some() {
+            mask |= 1u64 << hart;
+        }
+        hart += 1;
+    }
+    mask
 }
 
 static THREAD_IDENTITY_ZONE: Zone<ThreadIdentity> = Zone::const_new();
