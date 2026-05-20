@@ -1028,10 +1028,12 @@ impl HartRuntimeView<'_> {
     where
         S: crate::dispatch::RescheduleSignal,
     {
-        let mut reactor = self.reactor.lock();
-        let reactor = reactor.as_mut()?;
+        let mut view = HartRuntimeView {
+            shared: self.shared,
+            locals: self.locals,
+        };
         Some(crate::hart_loop::step_hart_loop_at(
-            reactor, hart, now_ns, signal,
+            &mut view, hart, now_ns, signal,
         ))
     }
 }

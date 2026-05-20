@@ -1691,8 +1691,7 @@ async fn sys_write_socket(
                         }
                     }
                     tx_substrate::step::YieldShape::OnAgent { .. }
-                    | tx_substrate::step::YieldShape::OnTimer { .. }
-                    | tx_substrate::step::YieldShape::OnEdge { .. } => {
+                    | tx_substrate::step::YieldShape::OnTimer { .. } => {
                         if total > 0 {
                             return SyscallResult::Return(total as i64);
                         }
@@ -2568,8 +2567,7 @@ async fn sys_read_socket<'a>(
                         }
                     }
                     tx_substrate::step::YieldShape::OnAgent { .. }
-                    | tx_substrate::step::YieldShape::OnTimer { .. }
-                    | tx_substrate::step::YieldShape::OnEdge { .. } => {
+                    | tx_substrate::step::YieldShape::OnTimer { .. } => {
                         return SyscallResult::Error(errno_to_i32(Errno::EIO));
                     }
                 }
