@@ -35,6 +35,44 @@ const OSCOMP_LIBCTEST_NETWORK_CMD: &str = "cd /musl/musl || exit 1; \
 	    ./runtest.exe -w entry-dynamic.exe inet_pton_empty_last_field; \
 	    ./busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\"";
 
+const OSCOMP_LMBENCH_NETWORK_CMD: &str = "cd /musl/musl || exit 1; \
+	    host=127.0.0.1; \
+	    export ENOUGH=1000000; \
+	    export TIMING_O=0; \
+	    export LOOP_O=0; \
+	    failed=0; \
+	    ./busybox mkdir -p /tmp; \
+	    check_contains() { label=$1; pat=$2; shift; shift; \
+	        ./busybox echo \"====== lmbench-network $label begin ======\"; \
+	        \"$@\" > /tmp/lmbench-network.out 2>&1; \
+	        ./busybox cat /tmp/lmbench-network.out; \
+	        if ./busybox grep -q \"$pat\" /tmp/lmbench-network.out; then ans=success; else ans=fail; failed=1; fi; \
+	        ./busybox echo \"====== lmbench-network $label end: $ans ======\"; \
+	    }; \
+	    ./busybox echo \"#### OS COMP TEST GROUP START lmbench-network ####\"; \
+	    ./lmbench_all lat_udp -s; \
+	    ./busybox sleep 1; \
+	    check_contains lat_udp \"UDP latency using\" ./lmbench_all lat_udp -W 0 -N 1 -P 1 $host; \
+	    ./lmbench_all lat_udp -S $host; \
+	    ./lmbench_all lat_tcp -s; \
+	    ./busybox sleep 1; \
+	    check_contains lat_tcp \"TCP latency using\" ./lmbench_all lat_tcp -W 0 -N 1 -P 1 $host; \
+	    ./lmbench_all lat_tcp -S $host; \
+	    ./lmbench_all lat_connect -s; \
+	    ./busybox sleep 1; \
+	    check_contains lat_connect \"TCP/IP connection cost\" ./lmbench_all lat_connect -N 1 $host; \
+	    ./lmbench_all lat_connect -S $host; \
+	    ./lmbench_all bw_tcp -s; \
+	    ./busybox sleep 1; \
+	    check_contains bw_tcp_1 \"MB/sec\" ./lmbench_all bw_tcp -P 1 -W 0 -N 1 -m 1 $host; \
+	    check_contains bw_tcp_64 \"MB/sec\" ./lmbench_all bw_tcp -P 1 -W 0 -N 1 -m 64 $host; \
+	    check_contains bw_tcp_1024 \"MB/sec\" ./lmbench_all bw_tcp -P 1 -W 0 -N 1 -m 1024 $host; \
+	    ./busybox echo \"====== lmbench-network bw_tcp_shutdown begin ======\"; \
+	    ./lmbench_all bw_tcp -S $host; \
+	    ./busybox echo \"====== lmbench-network bw_tcp_shutdown end ======\"; \
+	    ./busybox echo \"#### OS COMP TEST GROUP END lmbench-network ####\"; \
+	    exit $failed";
+
 fn oscomp_boot_suite(cmdline: Option<&str>) -> Option<&str> {
     let cmdline = cmdline?;
     for token in cmdline.split_ascii_whitespace() {
@@ -877,11 +915,10 @@ fn oscomp_sdcard_boot_enabled<P: tx_hal::TxPlatform>() -> bool {
 fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     use alloc::string::String;
 
-    if matches!(
-        oscomp_boot_suite(<P as tx_hal::BootInfoIf>::boot_info().cmdline),
-        Some("libctest-network")
-    ) {
-        return String::from(OSCOMP_LIBCTEST_NETWORK_CMD);
+    match oscomp_boot_suite(<P as tx_hal::BootInfoIf>::boot_info().cmdline) {
+        Some("libctest-network") => return String::from(OSCOMP_LIBCTEST_NETWORK_CMD),
+        Some("lmbench-network") => return String::from(OSCOMP_LMBENCH_NETWORK_CMD),
+        _ => {}
     }
 
     let mut cmd = String::from("cd /musl/musl");

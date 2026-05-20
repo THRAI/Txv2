@@ -174,6 +174,10 @@ impl RawTcpSocket {
             .saturating_sub(self.tx_buffer.lock().len())
     }
 
+    pub fn send_queued(&self) -> usize {
+        self.tx_buffer.lock().len()
+    }
+
     pub fn enqueue_tx_len(&self, len: usize) -> Option<(usize, bool)> {
         if len == 0 {
             return Some((0, false));
@@ -278,6 +282,10 @@ impl RawTcpSocket {
 
     pub fn abort(&self) {
         self.socket.lock().abort();
+    }
+
+    pub fn mark_recv_closed_by_peer(&self) {
+        self.protocol_state.lock().is_recv_shut = true;
     }
 
     pub fn listen_endpoint(&self, local: IpEndpoint) -> Result<(), RawTcpSocketError> {

@@ -726,10 +726,59 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
                                 false
                             }
                         }
+                        RNodeBacking::StructBacked {
+                            payload:
+                                StructPayload::Pipe {
+                                    payload,
+                                    side: tx_subsystems::pipe::PipeSide::Reader,
+                                },
+                        } => {
+                            if payload.readable_level() {
+                                true
+                            } else {
+                                if wait_token.is_none() {
+                                    wait_token = Some(tx_subsystems::execution::WaitToken::new(
+                                        payload.reader_source_id(),
+                                        tx_subsystems::pipe::PIPE_READABLE,
+                                    ));
+                                    wait_token_is_socket = false;
+                                }
+                                false
+                            }
+                        }
                         _ => false,
                     };
                     if readable {
                         fdset_set(&mut read_ready, fd);
+                        fd_ready = true;
+                    }
+                }
+                if want_write {
+                    let writable = match file.rnode().backing() {
+                        RNodeBacking::StructBacked {
+                            payload:
+                                StructPayload::Pipe {
+                                    payload,
+                                    side: tx_subsystems::pipe::PipeSide::Writer,
+                                },
+                        } => {
+                            if payload.writable_level() {
+                                true
+                            } else {
+                                if wait_token.is_none() {
+                                    wait_token = Some(tx_subsystems::execution::WaitToken::new(
+                                        payload.writer_source_id(),
+                                        tx_subsystems::pipe::PIPE_WRITABLE,
+                                    ));
+                                    wait_token_is_socket = false;
+                                }
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    if writable {
+                        fdset_set(&mut write_ready, fd);
                         fd_ready = true;
                     }
                 }
@@ -970,7 +1019,7 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
 ) -> SyscallResult {
     use tx_subsystems::{
         pipe::PipeSide,
-        vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload},
+        vfs::structure::{RNodeBacking, StructPayload},
     };
 
     let fds_ptr = args[0];
@@ -1012,13 +1061,28 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
     const POLLHUP: i16 = 0x0010;
     const POLLNVAL: i16 = 0x0020;
 
-    let wait_allowed = timeout_ns.is_none(); // NULL = infinite wait
-
-    // Track the first TTY fd's WaitSourceId for parking.
-    let mut park_source: Option<(u64, u64)> = None; // (source_id_raw, interests_raw)
+    let timeout = match pselect_timeout_policy(ctx, timeout_ptr) {
+        Ok(wait) => wait,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let timeout_deadline_ns = match timeout {
+        PselectTimeout::FiniteWait(duration_ns) => {
+            Some(<P as tx_hal::TimeIf>::read_ns().saturating_add(duration_ns))
+        }
+        PselectTimeout::Infinite | PselectTimeout::Poll => None,
+    };
 
     let ready = loop {
+        drive_loopback_pending();
+        if let Some(deadline_ns) = timeout_deadline_ns {
+            if <P as tx_hal::TimeIf>::read_ns() >= deadline_ns {
+                break 0;
+            }
+        }
+
         let mut ready: i64 = 0;
+        let mut wait_token = None;
+        let mut wait_token_is_socket = false;
         for i in 0..nfds {
             let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
             let mut ent_bytes = [0u8; POLLFD_BYTES as usize];
@@ -1040,6 +1104,13 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
                     if let Some(result) = socket_poll {
                         match result {
                             Ok(mask) => {
+                                let mut interests = tx_subsystems::net::PollMask::empty();
+                                if events & POLLIN != 0 {
+                                    interests |= tx_subsystems::net::PollMask::IN;
+                                }
+                                if events & POLLOUT != 0 {
+                                    interests |= tx_subsystems::net::PollMask::OUT;
+                                }
                                 if events & POLLIN != 0
                                     && mask.intersects(tx_subsystems::net::PollMask::IN)
                                 {
@@ -1056,6 +1127,21 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
                                 if mask.intersects(tx_subsystems::net::PollMask::HUP) {
                                     revents |= POLLHUP;
                                 }
+                                let should_wait_for_socket =
+                                    matches!(timeout, PselectTimeout::FiniteWait(_));
+                                if should_wait_for_socket && revents == 0 && interests.bits() != 0 {
+                                    match socket_poll_wait_token_from_file(&file, interests, &guard)
+                                    {
+                                        Some(Ok(Some(token))) => {
+                                            wait_token = Some(token);
+                                            wait_token_is_socket = true;
+                                        }
+                                        Some(Ok(None)) | None => {}
+                                        Some(Err(errno)) => {
+                                            return SyscallResult::Error(errno_to_i32(errno));
+                                        }
+                                    }
+                                }
                             }
                             Err(errno) => {
                                 return restore_ppoll_sigmask(
@@ -1068,63 +1154,69 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
                         }
                     } else {
                         let mut handled = false;
-                        if let OpenFileBacking::Rnode { rnode } = file.backing() {
-                            match rnode.backing() {
-                                RNodeBacking::StructBacked {
-                                    payload: StructPayload::Tty(tty),
-                                } => {
-                                    handled = true;
-                                    if events & POLLIN != 0 {
-                                        if tty_readable_level(tty) {
-                                            revents |= POLLIN;
-                                        } else if park_source.is_none() {
-                                            park_source =
-                                                Some((tty.wait_source_id(), POLLIN as u64));
-                                        }
-                                    }
-                                    if events & POLLOUT != 0 {
-                                        revents |= POLLOUT;
-                                    }
-                                }
-                                RNodeBacking::StructBacked {
-                                    payload: StructPayload::Pipe { payload, side },
-                                } => {
-                                    handled = true;
-                                    match side {
-                                        PipeSide::Reader => {
-                                            if events & POLLIN != 0 {
-                                                if payload.reader_readable_level() {
-                                                    revents |= POLLIN;
-                                                } else if park_source.is_none() {
-                                                    park_source = Some((
-                                                        payload.reader_source_id(),
-                                                        POLLIN as u64,
-                                                    ));
-                                                }
-                                            }
-                                            if payload.reader_hup_level() {
-                                                revents |= POLLHUP;
-                                            }
-                                        }
-                                        PipeSide::Writer => {
-                                            if events & POLLOUT != 0 {
-                                                if payload.writer_writable_level() {
-                                                    revents |= POLLOUT;
-                                                } else if park_source.is_none() {
-                                                    park_source = Some((
-                                                        payload.writer_source_id(),
-                                                        POLLOUT as u64,
-                                                    ));
-                                                }
-                                            }
-                                            if payload.writer_err_level() {
-                                                revents |= POLLERR;
-                                            }
-                                        }
+                        match file.rnode().backing() {
+                            RNodeBacking::StructBacked {
+                                payload: StructPayload::Tty(tty),
+                            } => {
+                                handled = true;
+                                if events & POLLIN != 0 {
+                                    if tty_readable_level(tty) {
+                                        revents |= POLLIN;
+                                    } else if wait_token.is_none() {
+                                        wait_token =
+                                            Some(tx_subsystems::execution::WaitToken::new(
+                                                tty.wait_source_id(),
+                                                POLLIN as u64,
+                                            ));
+                                        wait_token_is_socket = false;
                                     }
                                 }
-                                _ => {}
+                                if events & POLLOUT != 0 {
+                                    revents |= POLLOUT;
+                                }
                             }
+                            RNodeBacking::StructBacked {
+                                payload: StructPayload::Pipe { payload, side },
+                            } => {
+                                handled = true;
+                                match side {
+                                    PipeSide::Reader => {
+                                        if events & POLLIN != 0 {
+                                            if payload.reader_readable_level() {
+                                                revents |= POLLIN;
+                                            } else if wait_token.is_none() {
+                                                wait_token =
+                                                    Some(tx_subsystems::execution::WaitToken::new(
+                                                        payload.reader_source_id(),
+                                                        tx_subsystems::pipe::PIPE_READABLE,
+                                                    ));
+                                                wait_token_is_socket = false;
+                                            }
+                                        }
+                                        if payload.reader_hup_level() {
+                                            revents |= POLLHUP;
+                                        }
+                                    }
+                                    PipeSide::Writer => {
+                                        if events & POLLOUT != 0 {
+                                            if payload.writer_writable_level() {
+                                                revents |= POLLOUT;
+                                            } else if wait_token.is_none() {
+                                                wait_token =
+                                                    Some(tx_subsystems::execution::WaitToken::new(
+                                                        payload.writer_source_id(),
+                                                        tx_subsystems::pipe::PIPE_WRITABLE,
+                                                    ));
+                                                wait_token_is_socket = false;
+                                            }
+                                        }
+                                        if payload.writer_err_level() {
+                                            revents |= POLLERR;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                         if !handled {
                             if events & POLLIN != 0 {
@@ -1156,58 +1248,29 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
         if ready > 0 {
             break ready;
         }
-        if let Some(ns) = timeout_ns {
-            if ns != 0 {
-                match sleep_timeout_ns::<P>(ns, ctx).await {
-                    SyscallResult::Return(_) => {}
-                    other => {
-                        return restore_ppoll_sigmask(ctx, saved_mask, temporary_sigmask, other);
-                    }
+        if timeout == PselectTimeout::Poll {
+            break 0;
+        }
+
+        let Some(token) = wait_token else {
+            if let Some(deadline_ns) = timeout_deadline_ns {
+                wait_until_pselect_deadline::<P>(deadline_ns).await;
+            }
+            break 0;
+        };
+        if let Some(future) = wait_source::wait_on_token(token) {
+            if let Some(deadline_ns) = timeout_deadline_ns {
+                match wait_on_token_or_pselect_deadline::<P>(future, deadline_ns).await {
+                    PselectWaitWake::FdReady => {}
+                    PselectWaitWake::TimedOut => break 0,
                 }
+            } else {
+                let _ = future.await;
             }
+        } else if wait_token_is_socket {
+            tx_reactor::yield_now().await;
+        } else {
             break 0;
-        }
-        if !wait_allowed {
-            break 0;
-        }
-        let Some((source_id, interests)) = park_source.take() else {
-            break 0;
-        };
-
-        // drive-taskmb: park on the fd's WaitSource via drive() +
-        // PpollOp. The driver registers the task mailbox with the
-        // WaitSource, parks, and wakes when the fd fires.
-        use crate::adapter::step_engine;
-        use step_engine::{InterestMask, WaitSourceId};
-        use tx_scripts::drive;
-        use tx_substrate::step::DriveMode;
-
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mailbox_arc = script_ctx.mailbox().cloned();
-        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-        let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-        // PpollOp does not need an epoch guard (`yield → park` only).
-        let op = tx_subsystems::vfs::composite::PpollOp {
-            wait_source_id: WaitSourceId::new(source_id),
-            interests: InterestMask::new(interests),
-            timeout_ms: None,
-            started: false,
-        };
-        match drive(
-            op,
-            &mut script_ctx,
-            DriveMode::Waiting,
-            mailbox_arc.as_ref(),
-            delegate_registry_arc.as_deref(),
-            timer_wheel_arc.as_ref(),
-        )
-        .await
-        {
-            Ok(1) => {
-                // Fd is ready; re-scan to update revents.
-            }
-            Ok(_) => break 0,
-            Err(_e) => break 0,
         }
     };
 

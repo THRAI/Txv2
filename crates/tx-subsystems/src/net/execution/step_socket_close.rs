@@ -7,10 +7,15 @@ use crate::net::structure::{
     SocketProtocol, TcpState, UdpInner,
 };
 
+use super::step_tcp_loopback::step_tcp_loopback_transfer;
+
+const TCP_CLOSE_FLUSH_PASSES: usize = 8;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SocketCloseOutcome {
     pub payload_taken: bool,
     pub bindings_withdrawn: usize,
+    pub tcp_flushed_bytes: usize,
     pub recv_woken: usize,
     pub send_woken: usize,
     pub accept_woken: usize,
@@ -25,6 +30,7 @@ pub fn step_socket_close(
     };
 
     let mut bindings_withdrawn = 0;
+    let mut tcp_flushed_bytes = 0;
     let table = payload.socket_table();
     match payload.protocol_snapshot() {
         SocketProtocol::Tcp(TcpState::Bound { local }) => {
@@ -36,6 +42,7 @@ pub fn step_socket_close(
         }
         SocketProtocol::Tcp(TcpState::Connecting { local, remote })
         | SocketProtocol::Tcp(TcpState::Connected { local, remote }) => {
+            tcp_flushed_bytes += flush_tcp_tx_before_close(socket, guard);
             if let Some(peer) =
                 table.lookup_tcp_connection(ConnectionKey::new(remote, local), guard)
             {
@@ -80,10 +87,38 @@ pub fn step_socket_close(
     StepOutcome::Done(SocketCloseOutcome {
         payload_taken,
         bindings_withdrawn,
+        tcp_flushed_bytes,
         recv_woken,
         send_woken,
         accept_woken,
     })
+}
+
+fn flush_tcp_tx_before_close(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> usize {
+    let mut moved_total = 0;
+    for _ in 0..TCP_CLOSE_FLUSH_PASSES {
+        let queued = socket
+            .acquire_operational()
+            .and_then(|payload| {
+                payload
+                    .raw_tcp_socket()
+                    .map(|raw_tcp| raw_tcp.send_queued())
+            })
+            .unwrap_or(0);
+        if queued == 0 {
+            break;
+        }
+
+        let moved = match step_tcp_loopback_transfer(socket, queued, guard) {
+            StepOutcome::Done(outcome) => outcome.bytes_moved,
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } | StepOutcome::Err(_) => 0,
+        };
+        if moved == 0 {
+            break;
+        }
+        moved_total += moved;
+    }
+    moved_total
 }
 
 fn mark_tcp_peer_broken(peer: &Cap<SocketIdentity>) {
@@ -92,8 +127,9 @@ fn mark_tcp_peer_broken(peer: &Cap<SocketIdentity>) {
     };
     if let Some(raw_tcp) = payload.raw_tcp_socket() {
         raw_tcp.abort();
+        raw_tcp.mark_recv_closed_by_peer();
     }
-    payload.mark_shutdown(SockShutdownCmd::Both);
+    payload.mark_shutdown(SockShutdownCmd::Send);
     payload.refresh_io_from_raw();
     peer.readiness.fire_recv(RecvWireSet::BROKEN);
     peer.readiness.fire_send(SendWireSet::BROKEN);

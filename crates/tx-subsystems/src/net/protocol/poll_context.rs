@@ -104,6 +104,85 @@ impl PollContext {
         ))
     }
 
+    pub fn poll_udp_loopback_direct_one(
+        &mut self,
+        source: &Cap<SocketIdentity>,
+        iface: &LoopbackIface,
+        guard: &Guard<'_>,
+    ) -> Option<PollContextOutcome> {
+        let source_payload = source.acquire_operational()?;
+        let (local, connected_remote) = udp_endpoints(&source_payload.protocol_snapshot())?;
+        let mut drain = source_payload.take_udp_tx_datagram()?;
+        if drain.datagram.dst.port == 0 {
+            drain.datagram.dst = connected_remote?;
+        }
+        let src = select_udp_packet_source(local, drain.datagram.dst, iface);
+        if src.port == 0 || drain.datagram.dst.port == 0 || drain.datagram.payload.is_empty() {
+            return None;
+        }
+        if udp_ipv4_packet_len(drain.datagram.payload.len()) > usize::from(iface.mtu()) {
+            return None;
+        }
+
+        self.tx_packets += 1;
+        self.packets_seen += 1;
+        self.sockets_touched += 1;
+
+        let payload_len = drain.datagram.payload.len();
+        let mut publishes = Vec::new();
+        if drain.became_available {
+            publishes.push(NetworkPublishTarget::new(
+                source.clone(),
+                NetworkPublish {
+                    send_has_space: true,
+                    ..NetworkPublish::none()
+                },
+            ));
+        }
+
+        let Some(target) = self
+            .socket_table
+            .lookup_udp_ingress(src, drain.datagram.dst, guard)
+        else {
+            return Some(PollContextOutcome {
+                packets_seen: self.packets_seen,
+                tx_packets: self.tx_packets,
+                sockets_touched: self.sockets_touched,
+                bytes_moved: 0,
+                publishes,
+                created_children: Vec::new(),
+            });
+        };
+        let Some(target_payload) = target.acquire_operational() else {
+            return Some(PollContextOutcome {
+                packets_seen: self.packets_seen,
+                tx_packets: self.tx_packets,
+                sockets_touched: self.sockets_touched,
+                bytes_moved: 0,
+                publishes,
+                created_children: Vec::new(),
+            });
+        };
+
+        let mut peer_publish = NetworkPublish::none();
+        if target_payload.record_recv_payload(src, drain.datagram.dst, drain.datagram.payload) {
+            peer_publish.recv_has_data = true;
+        }
+        self.sockets_touched += 1;
+        if peer_publish.has_any() {
+            publishes.push(NetworkPublishTarget::new(target, peer_publish));
+        }
+
+        Some(PollContextOutcome {
+            packets_seen: self.packets_seen,
+            tx_packets: self.tx_packets,
+            sockets_touched: self.sockets_touched,
+            bytes_moved: payload_len,
+            publishes,
+            created_children: Vec::new(),
+        })
+    }
+
     pub fn poll_icmp_egress_one(
         &mut self,
         source: &Cap<SocketIdentity>,
@@ -493,6 +572,12 @@ fn select_udp_packet_source(
     } else {
         local
     }
+}
+
+fn udp_ipv4_packet_len(payload_len: usize) -> usize {
+    const IPV4_HEADER_LEN: usize = 20;
+    const UDP_HEADER_LEN: usize = 8;
+    IPV4_HEADER_LEN + UDP_HEADER_LEN + payload_len
 }
 
 fn accepts_loopback_icmp_destination(iface: &LoopbackIface, dst: Ipv4Address) -> bool {

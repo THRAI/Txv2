@@ -88,6 +88,17 @@ pub fn step_send_to_kernel_bytes(
     flags: SendRecvFlags,
     guard: &Guard<'_>,
 ) -> ByteStepOutcome<usize> {
+    step_send_to_kernel_bytes_with_poll_kick(socket, dst, bytes, flags, guard, true)
+}
+
+pub fn step_send_to_kernel_bytes_with_poll_kick(
+    socket: &Cap<SocketIdentity>,
+    dst: Option<IpEndpoint>,
+    bytes: &[u8],
+    flags: SendRecvFlags,
+    guard: &Guard<'_>,
+    kick_poll: bool,
+) -> ByteStepOutcome<usize> {
     let witness = match require_socket_write_target(socket, flags, guard) {
         Ok(witness) => witness,
         Err(errno) => return StepOutcome::Err(errno),
@@ -119,6 +130,8 @@ pub fn step_send_to_kernel_bytes(
         socket.readiness.clear_send(SendWireSet::SPACE);
     }
 
-    net_delegate_kick_poll();
+    if kick_poll {
+        net_delegate_kick_poll();
+    }
     StepOutcome::Done(reserve.bytes)
 }
