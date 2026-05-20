@@ -1332,45 +1332,9 @@ impl<P: TxPlatform> CoreInit<P> {
         let hart = boot_runtime::HartId(cpu_id.0);
         let now_ns = P::read_ns();
         let mut signal = SmpRescheduleSignal::<P>::new();
-        // Diagnostic: guard state at reactor entry point.
-        let local_pre = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
-            .map(|c| c.local_epoch as usize).unwrap_or(999);
-        // See if entering BOOT_REACTOR.with creates a guard.
-        let epoch_pre_with = crate::adapter::step_engine::epoch::summary();
-        tx_hal::console_write_str::<P>(":diag:pre-boot-reactor-with:epoch=");
-        Self::write_decimal_unsigned(epoch_pre_with.current_epoch as usize);
-        tx_hal::console_write_str::<P>(":guards=");
-        Self::write_decimal_unsigned(epoch_pre_with.active_guards);
-        tx_hal::console_write_str::<P>("\n");
-
         let step = BOOT_REACTOR.with(|reactor| {
-            // Diagnostic: guard state inside step_hart_loop_at
-            let pre = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
-                .map(|c| c.local_epoch as usize).unwrap_or(999);
-            let result = boot_runtime::hart_loop::step_hart_loop_at(reactor, hart, now_ns, &mut signal);
-            let post = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
-                .map(|c| c.local_epoch as usize).unwrap_or(999);
-            if pre != 0 || post != 0 {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":diag:step-hart-loop-inside:pre=");
-                Self::write_decimal_unsigned(pre);
-                tx_hal::console_write_str::<P>(":post=");
-                Self::write_decimal_unsigned(post);
-                tx_hal::console_write_str::<P>("\n");
-            }
-            result
+            boot_runtime::hart_loop::step_hart_loop_at(reactor, hart, now_ns, &mut signal)
         })?;
-        // Diagnostic: guard state after reactor step.
-        let local_post = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
-            .map(|c| c.local_epoch as usize).unwrap_or(999);
-        if local_pre != 0 || local_post != 0 {
-            Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":diag:step-boot-reactor-once:guard-leak:pre=");
-            Self::write_decimal_unsigned(local_pre);
-            tx_hal::console_write_str::<P>(":post=");
-            Self::write_decimal_unsigned(local_post);
-            tx_hal::console_write_str::<P>("\n");
-        }
         Self::program_hart_loop_deadline(step.deadline_action);
         Some(step)
     }
