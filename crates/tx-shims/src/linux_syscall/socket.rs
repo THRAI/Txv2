@@ -10,12 +10,14 @@ use super::*;
 use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
 use tx_subsystems::net::{
     net_namespace_payload_from_file, netlink_netfilter_recv, netlink_netfilter_send,
-    netlink_route_recv, netlink_route_send_with_netns_resolvers, socket_open_file_from_identity,
-    step_accept, step_bind, step_connect, step_listen, step_poll_ready, step_poll_wait_token,
-    step_recv_kernel_bytes, step_send_to_kernel_bytes, step_shutdown, step_socket_close,
-    step_socket_open_file_in_namespace, step_tcp_loopback_transfer, IpEndpoint, Ipv4Address,
-    KernelSockAddr, LingerOption, PollMask, SendRecvFlags, SockAddrIn, SockAddrLl, SockShutdownCmd,
-    SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol, TcpState, UdpInner,
+    netlink_route_recv, netlink_route_send_with_netns_resolvers, require_net_raw,
+    socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
+    step_poll_ready, step_poll_wait_token, step_recv_kernel_bytes, step_send_to_kernel_bytes,
+    step_shutdown, step_socket_close, step_socket_open_file_in_namespace,
+    step_tcp_loopback_transfer, AddressFamily, IpEndpoint, Ipv4Address, KernelSockAddr,
+    LingerOption, PollMask, SendRecvFlags, SockAddrIn, SockAddrLl, SockShutdownCmd,
+    SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol, SocketType, TcpState, UdpInner,
+    ValidSocketType,
 };
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::wait_source;
@@ -56,6 +58,19 @@ pub(super) fn sys_socket<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     let domain = args[0] as i32;
     let type_ = args[1] as i32;
     let protocol = args[2] as i32;
+    let valid = match ValidSocketType::validate(domain, type_, protocol) {
+        Ok(valid) => valid,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    let kind = match SocketKind::from_valid_socket_type(valid) {
+        Ok(kind) => kind,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    if socket_requires_net_raw(kind, valid) {
+        if let Err(errno) = require_net_raw(ctx.cred()) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+    }
 
     let outcome = {
         let guard = tx_substrate::epoch::guard();
@@ -77,6 +92,15 @@ pub(super) fn sys_socket<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     let _ = ctx.process.set_fd(fd, Some(opened.file));
     ctx.process.set_fd_cloexec(fd, opened.cloexec);
     SyscallResult::Return(fd as i64)
+}
+
+fn socket_requires_net_raw(kind: SocketKind, valid: ValidSocketType) -> bool {
+    kind == SocketKind::Packet
+        || (kind == SocketKind::RawIcmp
+            && matches!(
+                (valid.domain, valid.sock_type),
+                (AddressFamily::Inet, SocketType::Raw)
+            ))
 }
 
 pub(super) fn sys_socketpair<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {

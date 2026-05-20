@@ -14,6 +14,7 @@ use crate::linux_syscall::{
 };
 use alloc::vec;
 use alloc::vec::Vec;
+use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
 use tx_subsystems::net::execution::{step_process_loopback_pending, LoopbackPollBudget};
 use tx_subsystems::net::protocol::{
     build_icmpv4_echo_request_message, loopback_iface, parse_icmpv4_payload,
@@ -32,6 +33,7 @@ const TEST_POLLIN: i16 = 0x0001;
 const ETH_P_ALL: u16 = 0x0003;
 const ETH_P_ALL_NET: u16 = 0x0300;
 const MSG_DONTWAIT: u64 = 0x40;
+const E_PERM: i32 = 1;
 const NLM_F_REQUEST: u16 = 0x0001;
 const NLM_F_DUMP: u16 = 0x0300;
 const MSG_PEEK: u64 = 0x02;
@@ -472,6 +474,60 @@ fn dispatch_packet_bind_getsockname_and_ioctl_round_trip_sockaddr_ll() {
         ),
         SyscallResult::Error(11)
     );
+}
+
+#[test]
+fn dispatch_unprivileged_socket_denies_net_raw_families() {
+    let _setup = socket_setup();
+    let (process, ctx) = socket_ctx();
+    set_cred_ids_for_test(&process, 1000, 1000, 1000, 1000, 1000, 1000);
+    clear_caps_for_test(&process);
+
+    assert_eq!(
+        socket_req(
+            NR_SOCKET,
+            [
+                AF_PACKET as u64,
+                SOCK_RAW | O_CLOEXEC as u64,
+                ETH_P_ALL_NET as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(E_PERM)
+    );
+    assert_eq!(
+        socket_req(
+            NR_SOCKET,
+            [
+                AF_INET as u64,
+                SOCK_RAW | O_CLOEXEC as u64,
+                IPPROTO_ICMP as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(E_PERM)
+    );
+    assert!(matches!(
+        socket_req(
+            NR_SOCKET,
+            [
+                AF_INET as u64,
+                SOCK_DGRAM | O_CLOEXEC as u64,
+                IPPROTO_UDP as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(fd) if fd >= 0
+    ));
 }
 
 #[test]

@@ -20,7 +20,7 @@ pub mod protocol;
 pub mod rtnetlink;
 pub mod structure;
 
-pub use admin::{require_net_admin, NetAdminAuthority};
+pub use admin::{require_net_admin, require_net_raw, NetAdminAuthority, NetRawAuthority};
 pub use device::{
     create_bridge_for_test_or_bootstrap, create_veth_pair_for_test_or_bootstrap,
     net_device_by_devt, net_device_by_name, net_device_snapshot, register_net_devices,

@@ -487,6 +487,7 @@ fn install_optional_user_smokes(root: &Path, target: TxTarget, layout: &Path) ->
         "netns-helper",
         "nft-probe",
         "packet-probe",
+        "netcap-probe",
     ] {
         let source = root.join("tools").join("user").join(format!("{name}.c"));
         if !source.is_file() {
