@@ -31,6 +31,7 @@ mod qemu;
 mod shell_test;
 mod submit;
 mod syscall;
+mod syscall_status;
 mod target;
 mod test;
 mod trap_trace;
@@ -71,6 +72,7 @@ pub fn run() -> Result<()> {
         "unit" => unit::unit(&root),
         "observe" => observe::observe(&root, args.collect()),
         "observe-discipline" => observe_discipline::observe_discipline(&root),
+        "syscall-status" => syscall_status::syscall_status(&root, args.collect()),
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
@@ -110,6 +112,7 @@ fn print_usage() {
            cargo xtask progress close plan|handoff|worktree --id ID --status STATUS\n\
            cargo xtask lint arch|docs|unused|boundary|invariants [rule|all]|syscall-status\n\
            cargo xtask boundary-report [--top N] [--json]\n\
+           cargo xtask syscall-status [<NAME>...] [--regen|--check|--list-missing]\n\
            cargo xtask unit\n"
     );
 }

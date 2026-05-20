@@ -165,6 +165,13 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
             &["xtask", "progress", "validate"],
             "txdoc:CI-GATE-PROGRESS-JSON",
         ),
+        ci_run(
+            root,
+            "syscall-status autogen",
+            "cargo",
+            &["xtask", "syscall-status", "--check"],
+            "txdoc:CI-GATE-SYSCALL-STATUS",
+        ),
         // Quick observe smoke: demo writes a synthetic .txtrace, validate
         // parses the header and counts records. No daemon build required.
         ci_run(
