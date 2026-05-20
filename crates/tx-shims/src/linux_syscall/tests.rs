@@ -32,6 +32,7 @@ use tx_subsystems::cross_crate_test_support::{
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
 use tx_subsystems::process::{bootstrap_init_process, ExitStatus, Pid, ProcessIdentity};
+use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::vfs::OpenFile;
@@ -42,9 +43,9 @@ use super::{
     dispatch, SyscallCtx, SyscallResult, EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_SETFD,
     NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPGRP,
     NR_GETPID, NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_MEMBARRIER, NR_PIPE2, NR_PPOLL,
-    NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY,
-    NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_TIMERFD_CREATE, NR_WAIT4,
-    NR_WRITE, SIGCHLD, WNOHANG,
+    NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY,
+    NR_SCHED_SETAFFINITY, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
+    NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, SIGCHLD, WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
@@ -762,6 +763,76 @@ fn dispatch_rt_sigprocmask_rejects_wrong_sigsetsize() {
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Error(22));
+}
+
+/// `rt_sigtimedwait(set, info, {0,0}, 8)` is a true poll: if no
+/// matching pending signal exists, it returns `-EAGAIN`.
+#[test]
+fn dispatch_rt_sigtimedwait_zero_timeout_returns_neg_eagain() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let mut set = Signum::SIGCHLD.bit();
+    let mut timeout = [0i64, 0i64];
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_RT_SIGTIMEDWAIT,
+            [
+                &mut set as *mut u64 as u64,
+                0,
+                timeout.as_mut_ptr() as u64,
+                8,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(11));
+}
+
+/// `rt_sigtimedwait` consumes a matching pending signal and writes the
+/// leading `siginfo_t.si_signo` field. This pins the ABI shape used by
+/// the OSComp libctest runtest harness to wait for child `SIGCHLD`.
+#[test]
+fn dispatch_rt_sigtimedwait_consumes_pending_sigchld() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread.clone());
+
+    let payload = thread
+        .payload_cap()
+        .expect("bootstrap leader thread must be live");
+    payload.pending().post(Signum::SIGCHLD);
+
+    let mut set = Signum::SIGCHLD.bit();
+    let mut info = [0xa5u8; 128];
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_RT_SIGTIMEDWAIT,
+            [
+                &mut set as *mut u64 as u64,
+                info.as_mut_ptr() as u64,
+                0,
+                8,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(SIGCHLD as i64));
+    assert!(
+        !payload.pending().is_pending(Signum::SIGCHLD),
+        "sigtimedwait must dequeue the consumed signal"
+    );
+    assert_eq!(
+        u32::from_le_bytes(info[0..4].try_into().unwrap()),
+        SIGCHLD as u32
+    );
 }
 
 /// `rt_sigaction(SIGUSR1, act, oldact, 8)` round-trip: install a

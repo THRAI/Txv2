@@ -19,6 +19,35 @@ use super::helpers::{bootstrap_block_on, exec_error_tag, parse_init_from_cmdline
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
 
+const OSCOMP_LIBCTEST_NETWORK_CMD: &str = "cd /musl/musl || exit 1; \
+	    ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"; \
+	    ./runtest.exe -w entry-static.exe inet_pton; \
+	    ./runtest.exe -w entry-static.exe socket; \
+	    ./runtest.exe -w entry-static.exe dn_expand_empty; \
+	    ./runtest.exe -w entry-static.exe dn_expand_ptr_0; \
+	    ./runtest.exe -w entry-static.exe inet_ntop_v4mapped; \
+	    ./runtest.exe -w entry-static.exe inet_pton_empty_last_field; \
+	    ./runtest.exe -w entry-dynamic.exe inet_pton; \
+	    ./runtest.exe -w entry-dynamic.exe socket; \
+	    ./runtest.exe -w entry-dynamic.exe dn_expand_empty; \
+	    ./runtest.exe -w entry-dynamic.exe dn_expand_ptr_0; \
+	    ./runtest.exe -w entry-dynamic.exe inet_ntop_v4mapped; \
+	    ./runtest.exe -w entry-dynamic.exe inet_pton_empty_last_field; \
+	    ./busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\"";
+
+fn oscomp_boot_suite(cmdline: Option<&str>) -> Option<&str> {
+    let cmdline = cmdline?;
+    for token in cmdline.split_ascii_whitespace() {
+        if let Some(value) = token.strip_prefix("tx.oscomp=") {
+            return Some(value);
+        }
+        if let Some(value) = token.strip_prefix("tx.oscomp_suite=") {
+            return Some(value);
+        }
+    }
+    None
+}
+
 impl<P: TxPlatform> CoreInit<P> {
     /// Initramfs slice: walk `BootInfo::initrd` if present and
     /// reproduce its file tree inside the rootfs. Warn-and-skip on
@@ -848,9 +877,18 @@ fn oscomp_sdcard_boot_enabled<P: tx_hal::TxPlatform>() -> bool {
 fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     use alloc::string::String;
 
+    if matches!(
+        oscomp_boot_suite(<P as tx_hal::BootInfoIf>::boot_info().cmdline),
+        Some("libctest-network")
+    ) {
+        return String::from(OSCOMP_LIBCTEST_NETWORK_CMD);
+    }
+
     let mut cmd = String::from("cd /musl/musl");
     let mut selected = 0usize;
-    if let Some(groups) = oscomp_groups_from_cmdline::<P>() {
+    if let Some(groups) = oscomp_groups_from_cmdline::<P>()
+        .or_else(|| oscomp_boot_suite(<P as tx_hal::BootInfoIf>::boot_info().cmdline))
+    {
         for group in groups.split(',') {
             let group = group.trim();
             if group.is_empty() {

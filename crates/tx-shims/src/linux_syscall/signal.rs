@@ -268,74 +268,108 @@ pub(super) fn sys_rt_sigqueueinfo(_args: [u64; 6], _ctx: &SyscallCtx) -> Syscall
     SyscallResult::Error(ENOSYS_VALUE)
 }
 
-/// `rt_sigtimedwait(set, info, timeout, sigsetsize)` — Linux RV64
-/// ABI `__NR_rt_sigtimedwait = 137`.
+fn lowest_sigtimedwait_bit(bits: u64) -> Option<Signum> {
+    if bits == 0 {
+        return None;
+    }
+    let raw = bits.trailing_zeros() as u8 + 1;
+    Signum::new(raw)
+}
+
+fn take_matching_pending_signal(ctx: &SyscallCtx<'_>, wait_bits: u64) -> Option<Signum> {
+    let thread_payload = ctx.thread.payload_cap()?;
+    let thread_match = thread_payload.pending().snapshot() & wait_bits;
+    if let Some(sig) = lowest_sigtimedwait_bit(thread_match) {
+        thread_payload.pending().clear(sig);
+        return Some(sig);
+    }
+
+    let proc_payload = ctx.process.upgrade_operational().ok()?;
+    let group_match = proc_payload.group_pending().snapshot() & wait_bits;
+    let sig = lowest_sigtimedwait_bit(group_match)?;
+    proc_payload.group_pending().clear(sig);
+    Some(sig)
+}
+
+fn write_sigtimedwait_siginfo(ctx: &SyscallCtx<'_>, info_ptr: u64, sig: Signum) -> Result<(), i32> {
+    if info_ptr == 0 {
+        return Ok(());
+    }
+
+    let mut image = [0u8; 128];
+    image[0..4].copy_from_slice(&(sig.raw() as u32).to_le_bytes());
+    image[8..12].copy_from_slice(&0i32.to_le_bytes());
+    bootstrap_copy_to_user(&ctx.aspace, info_ptr, &image).map_err(errno_to_i32)
+}
+
+async fn park_sigtimedwait_tick<P: tx_hal::TimeIf>(
+    ctx: &SyscallCtx<'_>,
+    wait_bits: u64,
+    deadline_ns: Option<u64>,
+) {
+    const SIGTIMEDWAIT_POLL_NS: u64 = 1_000_000;
+
+    if wait_bits & Signum::SIGCHLD.bit() != 0 {
+        if let Some(token) = ctx.process.exit_source_wait_token() {
+            if let Some(future) = tx_subsystems::wait_source::wait_on_token(token) {
+                future.await;
+                return;
+            }
+        }
+    }
+
+    let now = <P as tx_hal::TimeIf>::read_ns();
+    let next = match deadline_ns {
+        Some(deadline) => core::cmp::min(deadline, now.saturating_add(SIGTIMEDWAIT_POLL_NS)),
+        None => now.saturating_add(SIGTIMEDWAIT_POLL_NS),
+    };
+    if let Some(future) = tx_subsystems::timer_sleep::sleep_until_ns(next) {
+        future.await;
+    } else {
+        tx_reactor::yield_now().await;
+    }
+}
+
+/// `rt_sigtimedwait(set, info, timeout, sigsetsize)`.
 ///
-/// Polls the calling thread's pending-signal bitset for any signal
-/// in `set`, with the given timeout (NULL = block forever).
-/// Returns the first matching signum on success, `-EAGAIN` on
-/// timeout. Does NOT invoke the signal handler — the signal is
-/// consumed from `payload.pending()` instead.
-///
-/// Implementation: synchronous poll loop. Each iteration reads
-/// `payload.pending()`, checks for any bit also set in `set`, and
-/// if found, clears that bit and returns its signum. Between
-/// polls the calling task awaits a short [`NanosleepOp`] so other
-/// reactor tasks (notably any sibling thread that will post the
-/// signal — usually `post_sigchld_to_parent` for a child exit)
-/// get a chance to run.
-///
-/// Carved out as the libctest unblock per `SYSCALL_STATUS.md`'s
-/// "wire `sys_rt_sigtimedwait`" high-stakes row (libctest's
-/// `runtest.c` uses `sigtimedwait(SIGCHLD, …)` to wait for child
-/// processes; without a real implementation it returns `-ENOSYS`
-/// and every test scores 0/220 with `[signal Killed]`).
+/// This is the small POSIX wait surface needed by the libctest
+/// harness: consume a pending signal named by `set`, optionally wait
+/// until `timeout` expires, and write the leading Linux `siginfo_t`
+/// fields. Signal-mask interaction is intentionally different from
+/// normal delivery: `sigtimedwait(2)` observes pending signals in
+/// `set` even when they are blocked, which is exactly how runtest waits
+/// for a child `SIGCHLD`.
 pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
-    let set_uaddr = args[0];
-    let info_uaddr = args[1];
-    let timeout_uaddr = args[2];
-    let sigsetsize = args[3] as usize;
+    let set_ptr = args[0];
+    let info_ptr = args[1];
+    let timeout_ptr = args[2];
+    let sigsetsize = args[3];
 
     // The slice only supports the canonical 8-byte sigset_t on RV64;
     // mirrors the `sys_rt_sigprocmask` precedent (`SIGSETSIZE_BYTES`).
-    if sigsetsize != SIGSETSIZE_BYTES as usize {
+    if sigsetsize != SIGSETSIZE_BYTES {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    if set_uaddr == 0 {
+    if set_ptr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
 
-    // Read the requested signal set (64-bit bitset).
-    let set_bits: u64 = match bootstrap_read_user::<u64>(&ctx.aspace, set_uaddr) {
-        Ok(v) => v,
-        Err(_) => return SyscallResult::Error(EFAULT_VALUE),
+    let wait_bits = match bootstrap_read_user::<u64>(&ctx.aspace, set_ptr) {
+        Ok(bits) => bits,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
-    if set_bits == 0 {
-        // Empty set — no signal can ever match. Block until timeout.
-    }
-
-    // Read the timeout. NULL means block forever (we cap at a
-    // generous u64::MAX/2 sentinel below since the reactor doesn't
-    // actually park us for years — each polling iteration sleeps
-    // ~5ms and re-checks).
-    let timeout_ns: u64 = if timeout_uaddr == 0 {
-        u64::MAX / 2
+    let timeout_ns = if timeout_ptr == 0 {
+        None
     } else {
-        match read_timespec_at(&ctx.aspace, timeout_uaddr) {
-            Some(ns) => ns,
+        match read_timespec_at(&ctx.aspace, timeout_ptr) {
+            Some(ns) => Some(ns),
             None => return SyscallResult::Error(EINVAL_VALUE),
         }
     };
-
-    let Some(payload) = ctx.thread.payload_cap() else {
-        return SyscallResult::Error(EFAULT_VALUE);
-    };
-
-    let start_ns = <P as tx_hal::TimeIf>::read_ns();
-    let deadline_ns = start_ns.saturating_add(timeout_ns);
+    let deadline_ns = timeout_ns.map(|ns| <P as tx_hal::TimeIf>::read_ns().saturating_add(ns));
 
     // `await_mailbox_event` (in `tx-scripts::drive::resolve_on_timer`)
     // RE-POSTS any `SignalDelivered` event it consumes back to the
@@ -352,75 +386,24 @@ pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
     if let Some(ref mbox) = mailbox_for_drain {
         drain_stale_signal_events(mbox);
     }
-
-    // Poll-and-yield loop. 5 ms chunks: long enough that we don't
-    // spin-burn the reactor, short enough that libctest tests with
-    // sub-second test bodies (most of them) react promptly to a
-    // child-exit-posted SIGCHLD.
-    const CHUNK_NS: u64 = 5_000_000;
     loop {
-        // Fast path: consume the first matching pending bit.
-        let pending = payload.pending().snapshot() & set_bits;
-        if pending != 0 {
-            let signum_raw = (pending.trailing_zeros() + 1) as u8;
-            if let Some(sig) = tx_subsystems::signal::Signum::new(signum_raw) {
-                payload.pending().clear(sig);
-                // Optionally write the siginfo struct. We don't
-                // synthesise full siginfo — kernel-posted SIGCHLD
-                // carries enough state via wait4 — but a non-zero
-                // `info_uaddr` deserves at least a zeroed-out buffer
-                // so the caller sees a valid struct shape rather
-                // than uninitialised stack memory.
-                if info_uaddr != 0 {
-                    let zeros = [0u8; 128];
-                    let _ = bootstrap_copy_to_user(&ctx.aspace, info_uaddr, &zeros);
-                }
-                return SyscallResult::Return(signum_raw as i64);
+        if let Some(sig) = take_matching_pending_signal(ctx, wait_bits) {
+            if let Err(errno) = write_sigtimedwait_siginfo(ctx, info_ptr, sig) {
+                return SyscallResult::Error(errno);
             }
+            return SyscallResult::Return(sig.raw() as i64);
         }
 
-        // Timeout check before the next yield.
-        let now_ns = <P as tx_hal::TimeIf>::read_ns();
-        if now_ns >= deadline_ns {
-            return SyscallResult::Error(EAGAIN_VALUE);
-        }
-
-        // Async-friendly chunk wait. Reuse the `NanosleepOp`
-        // machinery so we yield on the timer wheel; the next reactor
-        // poll re-enters this loop. **Critically**, pass the calling
-        // task's mailbox to `drive()` — without it,
-        // `resolve_on_timer` short-circuits to `Retry` immediately
-        // and the "5 ms sleep" becomes a no-op spin (parent then
-        // hogs the reactor so the child never runs).
-        let chunk = CHUNK_NS.min(deadline_ns.saturating_sub(now_ns));
-        use crate::adapter::step_engine::DriveMode;
-        use tx_scripts::drive;
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-        let mailbox = ctx.mailbox.clone();
-        let op = super::NanosleepOp {
-            nanos: chunk,
-            deadline_ns: now_ns.saturating_add(chunk),
-            started: false,
-        };
-        let _ = drive(
-            op,
-            &mut script_ctx,
-            DriveMode::Waiting,
-            mailbox.as_ref(),
-            None,
-            timer_wheel_arc.as_ref(),
-        )
-        .await;
-
-        // After drive returns, drain any `SignalDelivered` events
-        // the inner mailbox-await re-posted. See the matching
-        // comment at the top of this function — without this
-        // drain, a single stale SignalDelivered traps every
-        // subsequent drive iteration into a tight loop and the
-        // 5 ms sleep degenerates to a no-op spin.
-        if let Some(ref mbox) = mailbox {
-            drain_stale_signal_events(mbox);
+        match deadline_ns {
+            Some(deadline) if <P as tx_hal::TimeIf>::read_ns() >= deadline => {
+                return SyscallResult::Error(EAGAIN_VALUE);
+            }
+            Some(_) | None => {
+                park_sigtimedwait_tick::<P>(ctx, wait_bits, deadline_ns).await;
+                if let Some(ref mbox) = ctx.mailbox {
+                    drain_stale_signal_events(mbox);
+                }
+            }
         }
     }
 }

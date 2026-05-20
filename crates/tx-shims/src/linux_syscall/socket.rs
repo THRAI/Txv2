@@ -12,12 +12,12 @@ use tx_subsystems::net::{
     net_namespace_payload_from_file, netlink_netfilter_recv, netlink_netfilter_send,
     netlink_route_recv, netlink_route_send_with_netns_resolvers, require_net_raw,
     socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
-    step_poll_ready, step_poll_wait_token, step_recv_kernel_bytes, step_send_to_kernel_bytes,
-    step_shutdown, step_socket_close, step_socket_open_file_in_namespace,
-    step_tcp_loopback_transfer, AddressFamily, IpEndpoint, Ipv4Address, KernelSockAddr,
-    LingerOption, PollMask, SendRecvFlags, SockAddrIn, SockAddrLl, SockShutdownCmd,
-    SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol, SocketType, TcpState, UdpInner,
-    ValidSocketType,
+    step_poll_ready, step_poll_wait_token, step_process_loopback_udp, step_recv_kernel_bytes,
+    step_send_to_kernel_bytes, step_shutdown, step_socket_close,
+    step_socket_open_file_in_namespace, step_tcp_loopback_handshake, step_tcp_loopback_transfer,
+    AddressFamily, IpEndpoint, Ipv4Address, KernelSockAddr, LingerOption, PollMask, SendRecvFlags,
+    SockAddrIn, SockAddrLl, SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind,
+    SocketProtocol, SocketType, TcpState, UdpInner, ValidSocketType,
 };
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::wait_source;
@@ -266,6 +266,10 @@ pub(super) async fn sys_connect<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         match outcome {
             StepOutcome::Done(()) => return SyscallResult::Return(0),
             StepOutcome::Yield { shape, .. } => {
+                drive_tcp_loopback_after_connect(&socket);
+                if !socket_is_tcp_connecting(&socket) {
+                    return SyscallResult::Return(0);
+                }
                 if nonblocking {
                     let errno = if was_connecting {
                         Errno::EALREADY
@@ -322,6 +326,60 @@ fn maybe_autobind_connect_client(
     Err(Errno::EADDRINUSE)
 }
 
+fn maybe_autobind_udp_sendto(
+    socket: &Cap<SocketIdentity>,
+    dst: Option<IpEndpoint>,
+) -> Result<(), Errno> {
+    if socket.kind != SocketKind::Udp {
+        return Ok(());
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return Err(Errno::ENOTCONN);
+    };
+    if !matches!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Udp(UdpInner::Unbound)
+    ) {
+        return Ok(());
+    }
+
+    let local_addr = if dst.is_some_and(|endpoint| endpoint.addr == Ipv4Address::LOOPBACK) {
+        Ipv4Address::LOOPBACK
+    } else {
+        Ipv4Address::UNSPECIFIED
+    };
+
+    for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
+        let local = KernelSockAddr::V4(SockAddrIn::new(port, local_addr));
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            step_bind(socket, local, &guard)
+        };
+        match outcome {
+            StepOutcome::Done(()) => return Ok(()),
+            StepOutcome::Err(Errno::EADDRINUSE) => continue,
+            StepOutcome::Err(Errno::EINVAL) => return Ok(()),
+            StepOutcome::Err(errno) => return Err(errno),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => return Err(Errno::EIO),
+        }
+    }
+    Err(Errno::EADDRINUSE)
+}
+
+fn drive_tcp_loopback_after_connect(socket: &Cap<SocketIdentity>) {
+    let Some(payload) = socket.acquire_operational() else {
+        return;
+    };
+    if !matches!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connecting { .. })
+    ) {
+        return;
+    }
+    let guard = tx_substrate::epoch::guard();
+    let _ = step_tcp_loopback_handshake(socket, &guard);
+}
+
 fn bind_with_ephemeral_port(socket: &Cap<SocketIdentity>, addr: KernelSockAddr) -> SyscallResult {
     let requested = addr.as_ip_endpoint();
     if requested.port != 0 {
@@ -368,6 +426,28 @@ fn drive_tcp_loopback_after_sendto(socket: &Cap<SocketIdentity>, written: usize)
     socket
         .readiness
         .clear_send(tx_subsystems::net::structure::SendWireSet::SPACE);
+}
+
+fn drive_udp_loopback_after_sendto(socket: &Cap<SocketIdentity>, written: usize) {
+    if written == 0 {
+        return;
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return;
+    };
+    if !matches!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. })
+    ) {
+        return;
+    }
+    let guard = tx_substrate::epoch::guard();
+    let _ = step_process_loopback_udp(socket, 8, &guard);
+}
+
+fn drive_loopback_after_sendto(socket: &Cap<SocketIdentity>, written: usize) {
+    drive_tcp_loopback_after_sendto(socket, written);
+    drive_udp_loopback_after_sendto(socket, written);
 }
 
 pub(super) fn sys_getsockname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
@@ -485,6 +565,9 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     } else {
         None
     };
+    if let Err(errno) = maybe_autobind_udp_sendto(&socket, dst) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
 
     let mut bytes = alloc::vec![0; len];
     if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, args[1]) {
@@ -502,7 +585,7 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             StepOutcome::Done(sent) => {
                 total += sent;
                 if sent == 0 || sent >= remaining.len() {
-                    drive_tcp_loopback_after_sendto(&socket, sent);
+                    drive_loopback_after_sendto(&socket, sent);
                     tx_reactor::yield_now().await;
                     return SyscallResult::Return(total as i64);
                 }
@@ -512,7 +595,7 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
                 let sent = progress.bytes();
                 total += sent;
                 if sent == 0 || sent >= remaining.len() {
-                    drive_tcp_loopback_after_sendto(&socket, sent);
+                    drive_loopback_after_sendto(&socket, sent);
                     tx_reactor::yield_now().await;
                     return SyscallResult::Return(total as i64);
                 }
@@ -522,13 +605,13 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
                 let sent = progress.bytes();
                 total += sent;
                 if sent >= remaining.len() {
-                    drive_tcp_loopback_after_sendto(&socket, sent);
+                    drive_loopback_after_sendto(&socket, sent);
                     tx_reactor::yield_now().await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
                 if total > 0 {
-                    drive_tcp_loopback_after_sendto(&socket, total);
+                    drive_loopback_after_sendto(&socket, total);
                     tx_reactor::yield_now().await;
                     return SyscallResult::Return(total as i64);
                 }
@@ -543,7 +626,7 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             }
             StepOutcome::Err(errno) => {
                 if total > 0 {
-                    drive_tcp_loopback_after_sendto(&socket, total);
+                    drive_loopback_after_sendto(&socket, total);
                     tx_reactor::yield_now().await;
                     return SyscallResult::Return(total as i64);
                 }
