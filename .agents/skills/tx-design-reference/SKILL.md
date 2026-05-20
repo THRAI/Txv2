@@ -42,38 +42,32 @@ architecture, writing implementation code, or auditing readiness.
   `docs/design/06_devices/DEVICE.md`.
 - TTY and character-device work: `docs/design/06_devices/TTY.md`,
   `docs/design/06_devices/DEVICE.md`.
-- IPC (pipes, eventfd, signalfd, futex, sockets, SysV/POSIX IPC): **there is no
-  dedicated `IPC_*.md` design doc yet** — IPC discussion is scattered. Read, in
-  this order:
-  - `docs/Txv3/00_PREFACE.md` — establishes that txKernel is not a microkernel
-    and has no IPC boundary between subsystems (single address space; the
-    "audit story" replaces process isolation).
+- SysV/POSIX IPC (sem, shm, msg, mq): start with
+  `docs/Txv3/08_SYSV_IPC_v1.md` — the canonical v3 subsystem spec that covers
+  the full 30-syscall SysV+POSIX family as a composition of existing primitives
+  (zero closed-catalog growth). Companion reading:
+  - `docs/design/00_meta-framework/NAMESPACE_VIEW_v1.md` — `IpcNamespace` lens.
+  - `docs/design/03_memory-vm/PAGE_BACKED_v1.md` — shm segments route through
+    `RNodeBacking`.
+  - `docs/design/04_process-signals/SIGNAL_ATTACHMENTS_v1.md` — `mq_notify`
+    signal-attachment row.
+- Kernel-internal IPC primitives (pipe, eventfd, signalfd, futex, sockets,
+  io_uring): no single canonical spec yet — these are distinct from SysV/POSIX
+  IPC. Read, in this order:
+  - `docs/Txv3/00_PREFACE.md` — single address space, no IPC boundary between
+    subsystems; the "audit story" replaces process isolation.
   - `docs/design/06_devices/TTY.md` — the "IPC-producer-serialization pattern"
     section is the canonical write-up of how the ring/mutex/atomicity contract
-    works for any subsystem with a kernel-internal queue (pipe, socket
-    send/recv, POSIX message queue). Apply this pattern when designing or
-    auditing any new buffer-based IPC primitive.
-  - `docs/design/04_process-signals/SIGNAL_ATTACHMENTS_v1.md` — lists SysV IPC
-    (`msg`, `sem`, `shm`) and POSIX IPC (`mq_open`, `sem_open`, `shm_open`) as
-    **deferred** catalog entries pending dedicated subsystem specs. If you are
-    here because you are about to *write* the missing SysV/POSIX IPC spec, this
-    is your prior-art anchor and your obligation list (which signal carriers,
-    which attachment shapes, which deferral notes to retire).
+    works for any subsystem with a kernel-internal queue.
   - `docs/design/04_process-signals/SIGNAL_v1.md` and `PROCESS_v1.md` — signals
-    are the most fundamental IPC primitive and provide the shape every other
-    IPC primitive's wakeup/cancellation borrows from.
-  - `docs/design/03_memory-vm/PAGE_BACKED_v1.md` — the shared-memory backing
-    (shm/memfd/tmpfs) lives on `PageContainer`; any SysV `shm` or POSIX
-    `shm_open` work must route through `RNodeBacking` rather than invent local
-    page ownership.
-  - Code (no design doc, but the closest to a spec for these primitives):
-    `crates/tx-subsystems/src/{pipe,eventfd,signalfd,futex,signal,io_uring,userfaultfd,epoll}/`.
+    are the most fundamental IPC primitive; every other IPC primitive's
+    wakeup/cancellation borrows from this shape.
+  - Code: `crates/tx-subsystems/src/{pipe,eventfd,signalfd,futex,signal,io_uring,userfaultfd,epoll}/`.
   - Decision history: `docs/progress/decisions/2026-05-12-d17-pipe-pilot-adapter.md`
     and other dated `*pipe*` / `*signal*` decisions under `docs/progress/decisions/`.
 
-  When this changes — i.e. when a canonical `docs/design/04_process-signals/IPC_v1.md`
-  or similar lands — this bullet should be replaced with that file's path, and the
-  Manifest entry updated to match.
+  When a canonical pipe/socket/futex spec (e.g. `docs/design/04_process-signals/IPC_PRIMITIVES_v1.md`)
+  lands, replace the kernel-internal reading list with that file's path.
 
 ## Rules
 

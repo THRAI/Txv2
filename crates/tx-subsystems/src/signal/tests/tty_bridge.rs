@@ -109,7 +109,7 @@ fn deliver_tty_dispatch_with_no_typed_pgrp_returns_no_typed_pgrp() {
 fn typed_tty_vintr_routes_sigint_to_foreground_pgrp() {
     let _g = setup();
     let parent = fresh_init();
-    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
 
     // Bind the TTY's foreground pgrp typed-style to parent's pgrp
     // (which has both parent and child as members).
@@ -153,7 +153,7 @@ fn typed_tty_vintr_routes_sigint_to_foreground_pgrp() {
 fn deliver_tty_dispatch_skips_members_when_source_lacks_permission() {
     let _g = setup();
     let parent = fresh_init();
-    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
 
     // Make parent unprivileged and at uid=1000; child stays root.
     // parent attempts SIGINT to its own pgrp via the typed dispatch;

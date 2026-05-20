@@ -20,6 +20,14 @@ pub mod tx_ext4 {
 }
 mod tx_ext4_bridge;
 
+pub mod tx_fat {
+    pub use crate::fat_bridge::*;
+    pub use tx_fat::mount::{mount_fat_read_only, mount_fat_read_write, MountedFat};
+    pub use tx_fat_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
+    pub use tx_fat_format::{FatFormatError, Result as FatResult};
+}
+mod fat_bridge;
+
 #[cfg(test)]
 mod initramfs_tests;
 

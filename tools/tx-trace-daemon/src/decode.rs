@@ -201,6 +201,7 @@ fn level_name(level: u8) -> &'static str {
         l if l == TxTraceLevel::Step as u8 => "Step",
         l if l == TxTraceLevel::Phase as u8 => "Phase",
         l if l == TxTraceLevel::Mutation as u8 => "Mutation",
+        l if l == TxTraceLevel::Sched as u8 => "Sched",
         _ => "Unknown",
     }
 }
@@ -234,6 +235,10 @@ fn decode_payload(tag: u16, bytes: &[u8]) -> Result<Option<serde_json::Value>, (
         t if t == TxPayloadTag::MutationZoneSign as u16 => TxPayloadTag::MutationZoneSign,
         t if t == TxPayloadTag::MutationIndexCommit as u16 => TxPayloadTag::MutationIndexCommit,
         t if t == TxPayloadTag::PhaseTransition as u16 => TxPayloadTag::PhaseTransition,
+        t if t == TxPayloadTag::SchedSwitch as u16 => TxPayloadTag::SchedSwitch,
+        t if t == TxPayloadTag::ProcessLabel as u16 => TxPayloadTag::ProcessLabel,
+        t if t == TxPayloadTag::ProcessGroup as u16 => TxPayloadTag::ProcessGroup,
+        t if t == TxPayloadTag::ProcessFork as u16 => TxPayloadTag::ProcessFork,
         t if t == TxPayloadTag::Panic as u16 => TxPayloadTag::Panic,
         // Unknown tag with valid payload_len: skip payload bytes but keep record.
         _ => return Ok(None),
@@ -275,6 +280,14 @@ fn read_payload(tag: TxPayloadTag, bytes: &[u8]) -> Result<serde_json::Value, ()
         TxPayloadTag::MutationIndexCommit => read_as!(PayloadMutationIndexCommit),
         // OBS-8: L5 Phase transition payload.
         TxPayloadTag::PhaseTransition => read_as!(PayloadPhaseTransition),
+        // OBS-9: L7 Sched switch payload (reactor scheduler track).
+        TxPayloadTag::SchedSwitch => read_as!(PayloadSchedSwitch),
+        // OBS-9 §15.7: one-shot PCB `comm` mapping.
+        TxPayloadTag::ProcessLabel => read_as!(PayloadProcessLabel),
+        // OBS-9 §15.8: one-shot PCB pgrp/session mapping.
+        TxPayloadTag::ProcessGroup => read_as!(PayloadProcessGroup),
+        // OBS-9 §15.9: parent → child fork edge.
+        TxPayloadTag::ProcessFork => read_as!(PayloadProcessFork),
         TxPayloadTag::Panic => read_as!(PayloadPanic),
         TxPayloadTag::None => Ok(serde_json::Value::Null),
     }

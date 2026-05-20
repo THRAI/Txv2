@@ -69,7 +69,7 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             if total > 0 {
                 return SyscallResult::Return(total);
             }
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
         let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
         let len = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap());
@@ -96,6 +96,11 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             }
             other => return other,
         }
+        // Yield the guard between iterations so the epoch can advance
+        // and retired zone nodes can be reclaimed.  Without this, a
+        // multi-element writev (common for musl's buffered stdio)
+        // can exhaust the retired-node pool.
+        drop(step_engine::guard());
     }
     SyscallResult::Return(total)
 }
@@ -124,7 +129,7 @@ pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(
             if total > 0 {
                 return SyscallResult::Return(total);
             }
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
         let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
         let len = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap());
@@ -234,7 +239,7 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
             let mut ent_bytes = [0u8; POLLFD_BYTES as usize];
             if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
-                return SyscallResult::Error(errno_to_i32(errno));
+                return SyscallResult::error_from(errno);
             }
             let fd = i32::from_le_bytes(ent_bytes[0..4].try_into().unwrap());
             let events = i16::from_le_bytes(ent_bytes[4..6].try_into().unwrap());
@@ -269,7 +274,7 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             }
             ent_bytes[6..8].copy_from_slice(&revents.to_le_bytes());
             if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, ent_ptr, &ent_bytes) {
-                return SyscallResult::Error(errno_to_i32(errno));
+                return SyscallResult::error_from(errno);
             }
         }
 
@@ -323,6 +328,90 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     SyscallResult::Return(ready)
 }
 
+/// PageBacked `write(2)` — direct user-buffer path.
+///
+/// Prefaults the user buffer through `reserve_user_range_for_access`,
+/// then drives `OpenFileWriteFromUserOp` which copies bytes directly
+/// from user pages to PC frames through the pmap, without kernel-buffer
+/// staging (PAGE_BACKED_v1 §5.1 / §3 prefault discipline).
+async fn sys_write_pagebacked<'a>(
+    file: &Cap<tx_subsystems::vfs::structure::OpenFile>,
+    buf_ptr: usize,
+    len: usize,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    if len == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    // Prefault: eagerly materialise every user page and publish to
+    // the pmap so the step loop below finds every page in the cache.
+    // If any page is unmapped or has a prot mismatch, fail before
+    // transferring any bytes.
+    if let Some(range) = super::user_copy::covering_user_range(buf_ptr as u64, len) {
+        use crate::adapter::step_engine::StepOutcome as V3;
+        use tx_subsystems::vm::UserAccessKind;
+        let _guard = crate::adapter::step_engine::guard();
+        match ctx
+            .aspace
+            .reserve_user_range_for_access(range, UserAccessKind::Read)
+        {
+            V3::Done(()) => {}
+            V3::Err(e) => {
+                let errno: tx_subsystems::execution::Errno = e.into();
+                return SyscallResult::error_from(errno);
+            }
+            V3::Yield { .. } | V3::Continue { .. } => {
+                return SyscallResult::error_from(tx_subsystems::execution::Errno::EIO);
+            }
+        }
+    }
+
+    // Drive the write-from-user step loop.
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    use tx_subsystems::vfs::execution::OpenFileWriteFromUserOp;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mode = if file.flags().nonblocking {
+        DriveMode::Nonblocking
+    } else {
+        DriveMode::Waiting
+    };
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = OpenFileWriteFromUserOp {
+        file,
+        aspace: &ctx.aspace,
+        src: tx_hal::UserPtr::<u8>::new(buf_ptr),
+        len,
+        cursor: 0,
+    };
+    match drive(
+        op,
+        &mut script_ctx,
+        mode,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(total) => SyscallResult::Return(total as i64),
+        Err(v3errno) => {
+            let errno: tx_subsystems::execution::Errno = v3errno.into();
+            if errno == tx_subsystems::execution::Errno::EPIPE {
+                let _ = tx_subsystems::signal::step_kill_process(
+                    &ctx.process,
+                    tx_subsystems::signal::Signum::SIGPIPE,
+                    None,
+                );
+            }
+            SyscallResult::error_from(errno)
+        }
+    }
+}
+
 pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
     let buf_ptr = args[1] as usize;
@@ -330,9 +419,6 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 
     if fd < 0 {
         return SyscallResult::Error(EBADF_VALUE);
-    }
-    if len > TTY_WRITE_MAX_INLINE {
-        return SyscallResult::Error(E2BIG_VALUE);
     }
 
     // Resolve fd → Cap<OpenFile> against the process payload's stub
@@ -344,10 +430,29 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         None => return SyscallResult::Error(EBADF_VALUE),
     };
 
+    let len = if matches!(
+        file.rnode().backing(),
+        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
+    ) {
+        len
+    } else {
+        core::cmp::min(len, TTY_WRITE_MAX_INLINE)
+    };
+
     // eventfd fds carry their own `write(2)` arm — add a 64-bit
     // value to the counter. Dispatch before the generic VFS path.
     if file.eventfd().is_some() {
         return super::eventfd::sys_eventfd_write(&file, args[1], len, ctx).await;
+    }
+
+    // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).
+    // Prefault the user buffer in the observe phase, then drive the
+    // write through the pmap without kernel-buffer staging.
+    if matches!(
+        file.rnode().backing(),
+        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
+    ) {
+        return sys_write_pagebacked(&file, buf_ptr, len, ctx).await;
     }
 
     // Pull the user buffer into kernel memory through the canonical
@@ -360,7 +465,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
     if len > 0 {
         if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
 
@@ -416,26 +521,92 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     None,
                 );
             }
-            SyscallResult::Error(errno_to_i32(errno))
+            SyscallResult::error_from(errno)
+        }
+    }
+}
+
+/// PageBacked `read(2)` — direct user-buffer path.
+///
+/// Prefaults the user buffer (Write access, since we're writing into
+/// it), then drives `OpenFileReadToUserOp` which copies bytes directly
+/// from PC frames to user pages through the pmap, without kernel-buffer
+/// staging (PAGE_BACKED_v1 §5.1 / §3 prefault discipline).
+async fn sys_read_pagebacked<'a, P: tx_hal::TimeIf>(
+    file: &Cap<tx_subsystems::vfs::structure::OpenFile>,
+    buf_ptr: usize,
+    len: usize,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    if len == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    // Prefault: eagerly materialise every user page and publish to
+    // the pmap so the step loop below finds every page in the cache.
+    // Access is Write — we're writing data *into* the user buffer.
+    if let Some(range) = super::user_copy::covering_user_range(buf_ptr as u64, len) {
+        use crate::adapter::step_engine::StepOutcome as V3;
+        use tx_subsystems::vm::UserAccessKind;
+        let _guard = crate::adapter::step_engine::guard();
+        match ctx
+            .aspace
+            .reserve_user_range_for_access(range, UserAccessKind::Write)
+        {
+            V3::Done(()) => {}
+            V3::Err(e) => {
+                let errno: tx_subsystems::execution::Errno = e.into();
+                return SyscallResult::error_from(errno);
+            }
+            V3::Yield { .. } | V3::Continue { .. } => {
+                return SyscallResult::error_from(tx_subsystems::execution::Errno::EIO);
+            }
+        }
+    }
+
+    // Drive the read-to-user step loop.
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    use tx_subsystems::vfs::execution::OpenFileReadToUserOp;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mode = if file.flags().nonblocking {
+        DriveMode::Nonblocking
+    } else {
+        DriveMode::Waiting
+    };
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = OpenFileReadToUserOp {
+        file,
+        aspace: &ctx.aspace,
+        dst: tx_hal::UserPtr::<u8>::new(buf_ptr),
+        len,
+        cursor: 0,
+    };
+    match drive(
+        op,
+        &mut script_ctx,
+        mode,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(total) => SyscallResult::Return(total as i64),
+        Err(v3errno) => {
+            let errno: tx_subsystems::execution::Errno = v3errno.into();
+            SyscallResult::error_from(errno)
         }
     }
 }
 
 /// `read(fd, buf, count)`.
 ///
-/// Mirrors `sys_write`'s structure: resolve fd → `Cap<OpenFile>`,
-/// route the user buffer through `bootstrap_copy_to_user`, and loop
-/// on the wait-carrier discipline.
-///
-/// **Blocking semantic.** Pre-ELF Phase 5 (item 9) wires the UART RX
-/// path so a blocked `read(0, ...)` actually parks until bytes arrive:
-/// `tty::execution::step_read` returns `Blocked(token)` on an empty
-/// input queue, the dispatcher awaits `wait_source::wait_on_token`,
-/// and `tx_kernel::irq::uart_rx_irq_handler` drives
-/// `tty::execution::step_ingest` from the IRQ side, which fires the
-/// TTY's wait `Channel`. On any partial progress (`total > 0`)
-/// the dispatcher returns what it has rather than block again,
-/// matching `sys_write`'s partial-success policy.
+/// Mirrors `sys_write`'s structure. For PageBacked files, delegates to
+/// `sys_read_pagebacked` (direct user-buffer path, PAGE_BACKED_v1 §5.1);
+/// for struct-backed files, uses kernel-buffer staging + copy_to_user.
 pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
@@ -447,13 +618,19 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     if fd < 0 {
         return SyscallResult::Error(EBADF_VALUE);
     }
-    if len > TTY_WRITE_MAX_INLINE {
-        return SyscallResult::Error(E2BIG_VALUE);
-    }
 
     let file = match resolve_fd(&ctx.process, fd as u32) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
+    };
+
+    let len = if matches!(
+        file.rnode().backing(),
+        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
+    ) {
+        len
+    } else {
+        core::cmp::min(len, TTY_WRITE_MAX_INLINE)
     };
 
     if len == 0 {
@@ -485,6 +662,16 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     // expiration count as an 8-byte u64.
     if file.timerfd().is_some() {
         return super::timerfd::sys_timerfd_read::<P>(&file, args[1], len, ctx).await;
+    }
+
+    // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).
+    // Prefault the user buffer in the observe phase, then drive the
+    // read through the pmap without kernel-buffer staging.
+    if matches!(
+        file.rnode().backing(),
+        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
+    ) {
+        return sys_read_pagebacked::<P>(&file, buf_ptr, len, ctx).await;
     }
 
     // Read into a kernel-side staging buffer, then copy out through
@@ -533,14 +720,123 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
                 if let Err(errno) =
                     bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..total])
                 {
-                    return SyscallResult::Error(errno_to_i32(errno));
+                    return SyscallResult::error_from(errno);
                 }
             }
             SyscallResult::Return(total as i64)
         }
         Err(v3errno) => {
             let errno: tx_subsystems::execution::Errno = v3errno.into();
-            SyscallResult::Error(errno_to_i32(errno))
+            SyscallResult::error_from(errno)
         }
     }
+}
+
+/// `sendfile64(out_fd, in_fd, offset, count)` — page-level copy from
+/// one fd to another without an intermediate userspace buffer.
+///
+/// Linux generic ABI `__NR_sendfile64 = 71`.  Copies up to `count`
+/// bytes from `in_fd` (must be a page-backed regular file) to
+/// `out_fd`.  If `offset` is non-NULL, reads the input position from
+/// `*offset` and writes the updated position back; the input file's
+/// fd-level cursor is not touched in this case.  If `offset` is NULL,
+/// the input file's fd cursor is used and advanced.
+pub(super) async fn sys_sendfile64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    use tx_subsystems::page_backed::step_copy_file_range;
+    use tx_subsystems::vfs::structure::RNodeBacking;
+
+    let out_fd = args[0] as i32;
+    let in_fd = args[1] as i32;
+    let offset_ptr = args[2];
+    let count = args[3] as usize;
+
+    if out_fd < 0 || in_fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if count == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    let out_file = match resolve_fd(&ctx.process, out_fd as u32) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let in_file = match resolve_fd(&ctx.process, in_fd as u32) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+
+    // Input must be a regular file backed by PageContainer.
+    let in_rnode = in_file.rnode();
+    let in_pc = match in_rnode.backing() {
+        RNodeBacking::PageBacked { pc } => pc.clone(),
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+
+    // Output must be page-backed (regular file); pipes/sockets are
+    // deferred per PAGE_BACKED §9.1.
+    let out_rnode = out_file.rnode();
+    let out_pc = match out_rnode.backing() {
+        RNodeBacking::PageBacked { pc } => pc.clone(),
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+
+    // Determine input offset.
+    let in_offset: u64;
+    let needs_offset_writeback: bool;
+    if offset_ptr != 0 {
+        // Read the offset from userspace.
+        let mut off_bytes = [0u8; 8];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut off_bytes, offset_ptr) {
+            return SyscallResult::error_from(errno);
+        }
+        in_offset = u64::from_le_bytes(off_bytes);
+        needs_offset_writeback = true;
+    } else {
+        // Use the input file's current cursor.
+        in_offset = in_file.offset();
+        needs_offset_writeback = false;
+    }
+
+    // Output writes at the output file's current cursor.
+    let out_offset = out_file.offset();
+
+    // Single-shot page copy (non-blocking for v1).
+    let guard = tx_substrate::epoch::guard();
+    let outcome = step_copy_file_range(&in_pc, in_offset, &out_pc, out_offset, count, &guard);
+    drop(guard);
+
+    let transferred = match outcome {
+        tx_substrate::step::StepOutcome::Done(n) => n,
+        tx_substrate::step::StepOutcome::Err(e) => {
+            let errno: tx_subsystems::execution::Errno = e.into();
+            return SyscallResult::error_from(errno);
+        }
+        // If the operation would block, return EAGAIN (sendfile is
+        // non-blocking in this v1 implementation).
+        _ => return SyscallResult::Error(EAGAIN_VALUE),
+    };
+
+    if transferred == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    // Advance the output file's cursor.
+    out_file.advance_offset(transferred as u64);
+
+    // Update the input offset in userspace if a pointer was given.
+    if needs_offset_writeback {
+        let new_off = in_offset + transferred as u64;
+        let bytes = new_off.to_le_bytes();
+        if let Err(_errno) = bootstrap_copy_to_user(&ctx.aspace, offset_ptr, &bytes) {
+            // On partial success, Linux prefers to return the byte
+            // count rather than the fault error.
+            return SyscallResult::Return(transferred as i64);
+        }
+    } else {
+        // Advance the input file's cursor when offset was NULL.
+        in_file.advance_offset(transferred as u64);
+    }
+
+    SyscallResult::Return(transferred as i64)
 }

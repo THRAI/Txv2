@@ -99,7 +99,7 @@ pub(super) fn sys_clock_gettime<'a, P: TimeIf>(
     };
     let ts = ns_to_timespec(ns);
     if let Err(errno) = bootstrap_write_user::<TimespecLayout>(&ctx.aspace, ts_uaddr, ts) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
 }
@@ -120,7 +120,7 @@ pub(super) fn sys_gettimeofday<'a, P: TimeIf>(
     }
     let tv = ns_to_timeval(<P as TimeIf>::read_ns());
     if let Err(errno) = bootstrap_write_user::<TimevalLayout>(&ctx.aspace, tv_uaddr, tv) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
 }
@@ -143,7 +143,7 @@ pub(super) fn sys_times<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             tms_cstime: 0,
         };
         if let Err(errno) = bootstrap_write_user::<TmsLayout>(&ctx.aspace, buf_uaddr, tms) {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
     SyscallResult::Return(ticks)
@@ -178,7 +178,9 @@ pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
     let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = NanosleepOp {
         nanos: req_ns,
         deadline_ns,
@@ -188,14 +190,14 @@ pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
         op,
         &mut script_ctx,
         DriveMode::Waiting,
-        None,
-        None,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
         timer_wheel_arc.as_ref(),
     )
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -245,7 +247,9 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
     let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = NanosleepOp {
         nanos: req_ns,
         deadline_ns,
@@ -255,13 +259,13 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
         op,
         &mut script_ctx,
         DriveMode::Waiting,
-        None,
-        None,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
         timer_wheel_arc.as_ref(),
     )
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }

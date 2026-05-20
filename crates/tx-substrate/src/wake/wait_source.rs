@@ -258,7 +258,7 @@ impl WaitSource {
                         let (payload_bytes, _) = encode_wait_source_notify(&payload);
                         em.instant(
                             TxTraceLevel::Yield,
-                            EventNameId::of::<WaitSource>(),
+                            EventNameId::from_raw(tx_observe::fnv1a32(b"wake.notify")),
                             tx_observe::SpanId::NONE,
                             wait_source_notify_tag(),
                             &payload_bytes,

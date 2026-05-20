@@ -46,7 +46,15 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use reactor_entry::userspace::SyscallRequest;
-use tx_hal::{AuxvIf, EntropyIf, PmapIf, TimeIf};
+use tx_hal::{AuxvIf, EntropyIf, IpiKind, PmapIf, SmpIf, TimeIf};
+use tx_observe::encode::{
+    arg_value_tag, encode_arg_value, encode_syscall_enter, encode_syscall_exit, syscall_enter_tag,
+    syscall_exit_tag,
+};
+use tx_observe::{EventNameId, SpanId, TxTraceLevel};
+use tx_observe_types::{
+    PayloadArgValue, PayloadSyscallEnter, PayloadSyscallExit, TxPayloadTag, TxValueKind,
+};
 use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_subsystems::cred::{
     Capability, CredChange, Gid, SetgidOp, SetregidOp, SetresgidOp, SetresuidOp, SetreuidOp,
@@ -97,6 +105,8 @@ mod time;
 use time::*;
 mod signal;
 use signal::*;
+mod ipc;
+use ipc::*;
 mod vm;
 use vm::*;
 pub mod io;
@@ -149,30 +159,34 @@ pub use numbers::{
     AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW,
     CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW,
     CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID,
-    CLONE_CHILD_CLEARTID, CLONE_FILES, CLONE_FS, CLONE_PARENT, CLONE_PARENT_SETTID, CLONE_SETTLS,
-    CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK,
-    DT_REG, DT_SOCK, DT_UNKNOWN, FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK,
-    FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_TRYLOCK_PI,
-    FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP,
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_OK, F_SETFD, F_SETFL, GRND_INSECURE,
-    GRND_NONBLOCK, GRND_RANDOM, MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM,
-    MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED,
-    MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE,
-    MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_STACK, MAP_SYNC, NR_BRK, NR_CHDIR, NR_CLOCK_GETTIME,
-    NR_CLOCK_NANOSLEEP, NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EPOLL_CREATE1, NR_EPOLL_CTL,
-    NR_EPOLL_PWAIT, NR_EPOLL_WAIT, NR_EVENTFD2, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT,
-    NR_FACCESSAT2, NR_FCHDIR, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_FDATASYNC, NR_FLOCK, NR_FSTAT,
-    NR_FSTATFS, NR_FSYNC, NR_FTRUNCATE, NR_FUTEX, NR_GETCWD, NR_GETDENTS64, NR_GETEGID, NR_GETEUID,
-    NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID,
-    NR_GETRESUID, NR_GETSID, NR_GETTID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_IO_DESTROY,
-    NR_IO_GETEVENTS, NR_IO_SETUP, NR_IO_SUBMIT, NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_KILL,
-    NR_LINKAT, NR_LSEEK, NR_MADVISE, NR_MKDIRAT, NR_MKNODAT, NR_MLOCK, NR_MMAP, NR_MOUNT,
-    NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNLOCK, NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT,
-    NR_OPENAT, NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL, NR_PIPE2, NR_PPOLL, NR_PRLIMIT64, NR_READ,
-    NR_READLINKAT, NR_READV, NR_RENAMEAT2, NR_RT_SIGACTION, NR_RT_SIGPENDING, NR_RT_SIGPROCMASK,
-    NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN, NR_RT_SIGSUSPEND, NR_RT_SIGTIMEDWAIT,
-    NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SETGID, NR_SETPGID, NR_SETREGID, NR_SETRESGID,
-    NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
+    CLONE_CHILD_CLEARTID, CLONE_DETACHED, CLONE_FILES, CLONE_FS, CLONE_NEWCGROUP, CLONE_NEWUTS,
+    CLONE_PARENT, CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_SIGHAND, CLONE_SYSVSEM, CLONE_THREAD,
+    CLONE_VFORK, CLONE_VM, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, DT_UNKNOWN,
+    FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI,
+    FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT,
+    FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, F_DUPFD, F_DUPFD_CLOEXEC,
+    F_GETFD, F_GETFL, F_OK, F_SETFD, F_SETFL, GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM,
+    MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED,
+    MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN,
+    MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED,
+    MAP_STACK, MAP_SYNC, NR_BRK, NR_CHDIR, NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLONE,
+    NR_CLOSE, NR_DUP, NR_DUP3, NR_EPOLL_CREATE1, NR_EPOLL_CTL, NR_EPOLL_PWAIT, NR_EPOLL_WAIT,
+    NR_EVENTFD2, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHDIR,
+    NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_FDATASYNC, NR_FLOCK, NR_FSTAT, NR_FSTATFS, NR_FSYNC,
+    NR_FTRUNCATE, NR_FUTEX, NR_GETCWD, NR_GETDENTS64, NR_GETEGID, NR_GETEUID, NR_GETGID,
+    NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID, NR_GETRESUID,
+    NR_GETSID, NR_GETTID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_IO_DESTROY, NR_IO_GETEVENTS,
+    NR_IO_SETUP, NR_IO_SUBMIT, NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_KILL, NR_LINKAT, NR_LSEEK,
+    NR_MADVISE, NR_MKDIRAT, NR_MKNODAT, NR_MLOCK, NR_MMAP, NR_MOUNT, NR_MPROTECT, NR_MQ_GETSETATTR,
+    NR_MQ_NOTIFY, NR_MQ_OPEN, NR_MQ_TIMEDRECEIVE, NR_MQ_TIMEDSEND, NR_MQ_UNLINK, NR_MREMAP,
+    NR_MSGCTL, NR_MSGGET, NR_MSGRCV, NR_MSGSND, NR_MSYNC, NR_MUNLOCK, NR_MUNMAP, NR_NANOSLEEP,
+    NR_NEWFSTATAT, NR_OPENAT, NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL, NR_PIPE2, NR_PPOLL,
+    NR_PRLIMIT64, NR_READ, NR_READLINKAT, NR_READV, NR_RENAMEAT2, NR_RT_SIGACTION,
+    NR_RT_SIGPENDING, NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN, NR_RT_SIGSUSPEND,
+    NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SCHED_SETSCHEDULER,
+    NR_SEMCTL, NR_SEMGET, NR_SEMOP, NR_SEMTIMEDOP,
+    NR_SETGID, NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID,
+    NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET,
     NR_SIGALTSTACK, NR_SIGNALFD, NR_SIGNALFD4, NR_STATFS, NR_STATX, NR_SYMLINKAT, NR_SYNC,
     NR_SYNCFS, NR_SYSLOG, NR_TGKILL, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME,
     NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UMOUNT2, NR_UNAME, NR_UNLINKAT, NR_USERFAULTFD,
@@ -185,6 +199,14 @@ pub use numbers::{
     SEEK_END, SEEK_SET, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW, TIMER_ABSTIME,
     TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ,
     UTIME_NOW, UTIME_OMIT, WNOHANG, W_OK, X_OK,
+};
+
+pub use numbers::{
+    MEMBARRIER_CMD_GLOBAL, MEMBARRIER_CMD_GLOBAL_EXPEDITED, MEMBARRIER_CMD_PRIVATE_EXPEDITED,
+    MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, MEMBARRIER_CMD_QUERY,
+    MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED,
+    MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE, MEMBARRIER_SUPPORTED_MASK, NR_MEMBARRIER,
+    NR_SENDFILE64,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -344,7 +366,34 @@ pub(super) const SIGACTION_BYTES: usize = 32;
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
-pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
+pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
+    req: SyscallRequest,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    // L0 boundary span — `08_OBSERVATION_v1.md` §6 HOOKS-1.
+    // Always opened before the inner dispatch; closed after with the
+    // result-shaped `PayloadSyscallExit`. A `SpanId::NONE` short-circuit
+    // ensures we never emit a mismatched span-end when no emitter is
+    // installed (test contexts, boards with `ObserverIf` default).
+    //
+    // Parent-span linkage (L0 → L2 → L4) lives in a per-hart static
+    // installed via [`tx_observe::set_current_parent_span`] so the L2
+    // record in `tx_scripts::drive` picks it up implicitly without
+    // every syscall arm having to thread it through `ScriptCtx`.
+    //
+    // The threshold-based observation dump trigger is handled one level
+    // up in `tx_kernel::thread_future::run_thread` so the dispatch
+    // signature stays free of `ConsoleIf + PowerIf` bounds that would
+    // ripple into every test-stub platform.
+    let l0_span = emit_syscall_enter(&req);
+    let prev = tx_observe::set_current_parent_span(l0_span);
+    let result = dispatch_inner::<P>(req, ctx).await;
+    tx_observe::set_current_parent_span(prev);
+    emit_syscall_exit(l0_span, &result);
+    result
+}
+
+async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -369,42 +418,62 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         nr if nr == NR_GETTIMEOFDAY => return sys_gettimeofday::<P>(req.args, ctx),
         nr if nr == NR_UMASK => return sys_umask(req.args, ctx),
         nr if nr == NR_UNAME => return sys_uname(req.args, ctx),
-        nr if nr == NR_GETRANDOM => return sys_getrandom::<P>(req.args, ctx),
+        nr if nr == NR_GETRANDOM => return sys_getrandom(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
         nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
-        nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
-        nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args),
         nr if nr == NR_SCHED_GETAFFINITY => return sys_sched_getaffinity(req.args, ctx),
         nr if nr == NR_SCHED_SETAFFINITY => return sys_sched_setaffinity(req.args, ctx),
+        nr if nr == NR_SCHED_SETSCHEDULER => return sys_sched_setscheduler(),
+        nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
+        nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args, ctx),
         nr if nr == NR_MADVISE => return sys_madvise(req.args, ctx),
         nr if nr == NR_MLOCK => return sys_mlock(req.args, ctx).await,
         nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx).await,
         nr if nr == NR_UTIMENSAT => return sys_utimensat(req.args, ctx),
+        nr if nr == NR_SHMGET => return sys_shmget(req.args, ctx),
+        nr if nr == NR_SHMDT => return sys_shmdt(req.args, ctx),
+        nr if nr == NR_MSGGET => return sys_msgget(req.args, ctx),
+        nr if nr == NR_MSGSND => return sys_msgsnd(req.args, ctx),
+        nr if nr == NR_MSGRCV => return sys_msgrcv(req.args, ctx),
+        nr if nr == NR_SEMGET => return sys_semget(req.args, ctx),
+        nr if nr == NR_MEMBARRIER => return sys_membarrier::<P>(&req.args),
         _ => {} // fall through to script lanes
     }
 
     // ── Lanes 2+3: Script-based (OneShotStepOp + Full async drive) ──
     match req.nr {
-        NR_WRITE => sys_write(req.args, ctx).await,
-        NR_WRITEV => sys_writev(req.args, ctx).await,
-        NR_READ => sys_read::<P>(req.args, ctx).await,
-        NR_READV => sys_readv::<P>(req.args, ctx).await,
-        NR_PPOLL => sys_ppoll(req.args, ctx).await,
-        NR_EXIT => sys_exit(req.args, ctx),
-        NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
-        NR_BRK => sys_brk(req.args, ctx).await,
-        NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
-        NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx),
-        NR_FCNTL => sys_fcntl(req.args, ctx),
+        nr if nr == NR_WRITE => sys_write(req.args, ctx).await,
+        nr if nr == NR_WRITEV => sys_writev(req.args, ctx).await,
+        nr if nr == NR_READ => sys_read::<P>(req.args, ctx).await,
+        nr if nr == NR_READV => sys_readv::<P>(req.args, ctx).await,
+        nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
+        nr if nr == NR_PPOLL => sys_ppoll(req.args, ctx).await,
+        nr if nr == NR_EXIT => sys_exit(req.args, ctx),
+        nr if nr == NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
+        nr if nr == NR_BRK => sys_brk(req.args, ctx).await,
+        nr if nr == NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
+        nr if nr == NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx),
+        nr if nr == NR_RT_SIGPENDING => sys_rt_sigpending(req.args, ctx),
+        nr if nr == NR_RT_SIGSUSPEND => sys_rt_sigsuspend(req.args, ctx),
+        nr if nr == NR_RT_SIGQUEUEINFO => sys_rt_sigqueueinfo(req.args, ctx),
+        nr if nr == NR_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait::<P>(req.args, ctx).await,
+        nr if nr == NR_SIGALTSTACK => sys_sigaltstack(req.args, ctx),
+        nr if nr == NR_FCNTL => sys_fcntl(req.args, ctx),
+        nr if nr == NR_SHMCTL => sys_shmctl(req.args, ctx),
+        nr if nr == NR_MSGCTL => sys_msgctl(req.args, ctx),
+        nr if nr == NR_SEMOP => sys_semop(req.args, ctx),
+        nr if nr == NR_SEMCTL => sys_semctl(req.args, ctx),
+        nr if nr == NR_MSGCTL => sys_msgctl(req.args, ctx),
+        nr if nr == NR_SEMOP => sys_semop(req.args, ctx),
+        nr if nr == NR_SEMCTL => sys_semctl(req.args, ctx),
+        nr if nr == NR_SHMAT => sys_shmat(req.args, ctx),
         nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
         nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx).await,
         nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
         nr if nr == NR_SETSID => sys_setsid(ctx),
         nr if nr == NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
-        nr if nr == NR_SET_ROBUST_LIST => sys_set_robust_list(req.args),
-        nr if nr == NR_SCHED_GETAFFINITY => sys_sched_getaffinity(req.args, ctx),
-        nr if nr == NR_SCHED_SETAFFINITY => sys_sched_setaffinity(req.args, ctx),
+        nr if nr == NR_SET_ROBUST_LIST => sys_set_robust_list(req.args, ctx),
         // Wave 2 of the DAC + setuid slice — Part 3 (cred-mutation /
         // cred-reading arms). Each wraps a Wave 1 `cred::step_*`
         // helper through the new `ctx.cred()` accessor.
@@ -654,6 +723,79 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// membarrier(2)
+// ---------------------------------------------------------------------------
+
+/// `membarrier(cmd, flags, cpu_id)` — issue memory-ordering barriers
+/// across all online harts.
+///
+/// Lane 1 (Immediate): never yields, never enters StepOp.
+///
+/// Supported commands:
+/// - `MEMBARRIER_CMD_QUERY` (0) — returns a bitmask of supported commands.
+/// - `MEMBARRIER_CMD_GLOBAL` (1), `_EXPEDITED` (1<<1) — broadcast a
+///   [`IpiKind::Membarrier`] to every online hart and busy-wait for all
+///   acks. On the receiving hart the IPI handler executes a
+///   `core::sync::atomic::fence(SeqCst)` so that all prior stores are
+///   globally visible.
+/// - `MEMBARRIER_CMD_PRIVATE_EXPEDITED` (1<<3) — same as GLOBAL in a
+///   single-address-space kernel.
+/// - `MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE` (1<<5) — private
+///   expedited plus instruction-fetch barrier (`fence.i` on RV64).
+/// - `MEMBARRIER_CMD_REGISTER_*` — registration is a no-op; always
+///   returns 0.
+///   `sched_setscheduler(pid, policy, param)` — v1 stub.
+///
+/// musl calls this during `pthread_create` to set the new thread's
+/// scheduling policy. Returns 0 unconditionally (success, no-op);
+/// real priority inheritance is deferred to the scheduler slice.
+fn sys_sched_setscheduler() -> SyscallResult {
+    SyscallResult::Return(0)
+}
+
+///
+/// `flags` and `cpu_id` are currently ignored (must be 0).
+fn sys_membarrier<P: SmpIf>(args: &[u64; 6]) -> SyscallResult {
+    let cmd = args[0];
+    let flags = args[1] as u32;
+
+    if flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    match cmd {
+        MEMBARRIER_CMD_QUERY => SyscallResult::Return(MEMBARRIER_SUPPORTED_MASK as i64),
+
+        MEMBARRIER_CMD_GLOBAL
+        | MEMBARRIER_CMD_GLOBAL_EXPEDITED
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE => {
+            let targets = P::online_cpus();
+            if targets.is_empty() {
+                return SyscallResult::Return(0);
+            }
+            P::clear_ipi_ack_cpus(IpiKind::Membarrier, targets);
+            P::broadcast_ipi(targets, IpiKind::Membarrier);
+            // Synchronous wait: spin until every target hart has
+            // executed the barrier and acked. The IPI handler on the
+            // target hart runs `fence(SeqCst)` + ack before
+            // returning to its interrupt context.
+            P::wait_for_ipi_ack_cpus(targets, IpiKind::Membarrier);
+            SyscallResult::Return(0)
+        }
+
+        MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => {
+            // Registration is a no-op in this kernel.
+            SyscallResult::Return(0)
+        }
+
+        _ => SyscallResult::Error(EINVAL_VALUE),
+    }
+}
+
 /// Translate the subsystem-shared `Errno` enum into the Linux RV64
 /// generic ABI errno number used in `-errno` returns.
 ///
@@ -663,12 +805,15 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
 /// phases extend the table in lockstep with the syscall arms.
 pub(super) fn errno_to_i32(errno: Errno) -> i32 {
     match errno {
+        Errno::E2BIG => 7,
         Errno::EACCES => 13,
         Errno::EAGAIN => EAGAIN_VALUE,
         Errno::EBADF => EBADF_VALUE,
         Errno::EBUSY => 16,
         Errno::EDQUOT => 122,
         Errno::EEXIST => 17,
+        Errno::EFBIG => 27,
+        Errno::EIDRM => 43,
         Errno::EFAULT => 14,
         Errno::EINVAL => 22,
         Errno::EIO => 5,
@@ -692,6 +837,114 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
         Errno::ESTALE => 116,
         Errno::EINTR => 4,
     }
+}
+
+// ---------------------------------------------------------------------------
+// L0 observation hooks for the syscall U/K boundary.
+//
+// Per `docs/Txv3/08_OBSERVATION_v1.md` §6 OBS-V1-HOOKS-1: emit a
+// `SpanBegin(SyscallEnter)` at dispatch entry and a matching
+// `SpanEnd(SyscallExit)` at dispatch exit. The functions are no-ops
+// when no emitter is installed (test contexts, boards without an
+// `ObserverIf` impl).
+//
+// OBS-2 compliance: raw register-shaped args are emitted as opaque
+// `u64` (today: encoded only in the `argc` count; future `ArgValue`
+// continuations will carry the bits). No `UserPtr<T>` deref.
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn emit_syscall_enter(req: &SyscallRequest) -> SpanId {
+    let Some(em) = tx_observe::current() else {
+        return SpanId::NONE;
+    };
+    let payload = PayloadSyscallEnter {
+        sysno: req.nr as u32,
+        // Linux RV64 = 0 today; LoongArch64 will use 1 once its shim lands.
+        // Threading the per-board ABI through the call chain is OBS follow-up
+        // work; emitting 0 is correct for the only board currently emitting.
+        abi: 0,
+        // argc reflects the register-shaped arg slots — `req.args` is `[u64; 6]`
+        // for the Linux generic ABI. The daemon walks `argc` `ArgValue`
+        // continuation records after this `SpanBegin`.
+        argc: 6,
+    };
+    let (enc, len) = encode_syscall_enter(&payload);
+    let syscall_span = em.span_begin(
+        TxTraceLevel::Boundary,
+        EventNameId::from_raw(req.nr as u32),
+        SpanId::NONE,
+        syscall_enter_tag(),
+        &enc[..len as usize],
+    );
+
+    // Per OBS-V1 §6 / `08_OBSERVATION_SERIALIZATION_v0.md §8.6`: emit one
+    // `ArgValue` `Instant` per register-shaped syscall arg right after
+    // `SpanBegin(SyscallEnter)`. The daemon attaches them as debug
+    // annotations on the syscall slice so each `sys_*` chip in Perfetto
+    // shows `a0`/`a1`/…/`a5` with the raw u64 the userspace process
+    // passed in. OBS-2 compliance: the wire carries the raw register
+    // bits as `TxValueKind::U64`; no `UserPtr<T>` deref. The shim's
+    // arg-parsing code later decodes individual args as `Ptr` /
+    // `ObjectId` / etc. via separate `ArgValue` records once the
+    // higher-fidelity arg-classification pass lands.
+    if syscall_span != SpanId::NONE {
+        for (i, &raw) in req.args.iter().enumerate().take(6) {
+            let arg_payload = PayloadArgValue {
+                key: tx_observe::fnv1a32(SYSCALL_ARG_NAMES[i].as_bytes()),
+                value_kind: TxValueKind::U64 as u8,
+                _pad: [0; 3],
+                value0: raw,
+            };
+            let (enc, len) = encode_arg_value(&arg_payload);
+            em.instant(
+                TxTraceLevel::Boundary,
+                EventNameId::from_raw(tx_observe::fnv1a32(SYSCALL_ARG_NAMES[i].as_bytes())),
+                syscall_span,
+                arg_value_tag(),
+                &enc[..len as usize],
+            );
+        }
+    }
+
+    syscall_span
+}
+
+/// Stable register-position labels used as the `key` for syscall
+/// `ArgValue` continuations. Matches the Linux ABI's call-clobbered
+/// register names (a0..a5 on rv64, $a0..$a7 on la64, %rdi..%r9 on x86_64);
+/// using the position-agnostic `aN` form keeps the names ABI-portable.
+const SYSCALL_ARG_NAMES: [&str; 6] = ["a0", "a1", "a2", "a3", "a4", "a5"];
+
+#[inline]
+fn emit_syscall_exit(span: SpanId, result: &SyscallResult) {
+    if span == SpanId::NONE {
+        return;
+    }
+    let Some(em) = tx_observe::current() else {
+        return;
+    };
+    // result_kind: 0=Ok, 1=Err, 2=Restart, 3=Fatal, 4=NoReturn (per
+    // OBSERVATION_SERIALIZATION_v0 §8.1). `ExecCommitted` and
+    // `SigreturnRestored` are kernel-internal control-flow markers that
+    // never surface as a userspace return value; classify both as NoReturn
+    // for the trace so the daemon's syscall slice closes cleanly even
+    // though no `a0` write occurs.
+    let (ret, errno, result_kind) = match result {
+        SyscallResult::Return(v) => (*v, 0, 0u8),
+        SyscallResult::Error(e) => (0, *e, 1u8),
+        SyscallResult::NoReturn => (0, 0, 4u8),
+        SyscallResult::ExecCommitted => (0, 0, 4u8),
+        SyscallResult::SigreturnRestored => (0, 0, 4u8),
+    };
+    let payload = PayloadSyscallExit {
+        ret,
+        errno,
+        result_kind,
+        _pad: [0; 3],
+    };
+    let (enc, len) = encode_syscall_exit(&payload);
+    em.span_end(span, syscall_exit_tag(), &enc[..len as usize]);
 }
 
 /// Linux generic ABI errno value for "no such file or directory"

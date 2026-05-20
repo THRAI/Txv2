@@ -16,7 +16,6 @@ use alloc::vec::Vec;
 use crate::execution::Guard;
 use crate::mount::MountPayload;
 use crate::vfs::adapter::step_engine::{self, Cap, StepOutcome};
-use crate::vfs::predicates;
 use crate::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking,
 };
@@ -121,8 +120,14 @@ pub fn kernel_step(
     }
 
     // --- POSIX search permission ---
+    // Routes through cred::checks for a single source of truth at
+    // the cred seam; the witness is discarded because the per-
+    // component walk does not yet thread a SearchAuthorized<'g>
+    // token to a downstream publication site.
     let parent_meta = current.rnode().meta();
-    if let Err(_err) = predicates::check_descend_perm(&parent_meta, cred) {
+    if let Err(_err) =
+        crate::cred::checks::require_path_search_with_walker_cred(cred, &parent_meta, guard)
+    {
         return KernelStep::Error(WalkCause::Permission(
             super::state::NonTerminalDenial::SearchDenied,
         ));
@@ -357,6 +362,8 @@ fn materialise_child(
                     mp,
                 )
             } else {
+                super::diagnostic::record_diag(6);
+                super::diagnostic::record_label(b"materialise:dir-no-mount");
                 RNode::new_cap(child_fs_object_id, *child_meta, RNodeBacking::Directory)
             };
             result.map_err(|_| {
@@ -364,14 +371,19 @@ fn materialise_child(
             })
         }
         InodeKind::Symlink => match fs_ops.read_link(child_fs_object_id, guard) {
-            StepOutcome::Done(b) => RNode::new_cap(
-                child_fs_object_id,
-                *child_meta,
-                RNodeBacking::Symlink { target: b },
-            )
-            .map_err(|_| {
-                KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM))
-            }),
+            StepOutcome::Done(b) => {
+                // NOTE: symlink RNode created without containing_mount.
+                super::diagnostic::record_diag(7);
+                super::diagnostic::record_label(b"materialise:symlink-no-mount");
+                RNode::new_cap(
+                    child_fs_object_id,
+                    *child_meta,
+                    RNodeBacking::Symlink { target: b },
+                )
+                .map_err(|_| {
+                    KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM))
+                })
+            }
             StepOutcome::Yield { .. } => Err(KernelStep::NeedIO(
                 IORequest::ReadLink {
                     fs_object_id: child_fs_object_id,

@@ -1,0 +1,16 @@
+[package]
+name = "tx-fat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+std = []
+
+[dependencies]
+tx-fat-format = { path = "../tx-fat-format" }
+tx-platform-adapter = { path = "../tx-platform-adapter" }
+tx-substrate = { path = "../tx-substrate" }
+tx-subsystems = { path = "../tx-subsystems" }

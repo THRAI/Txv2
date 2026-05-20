@@ -21,6 +21,16 @@ pub const NR_READ: u64 = 63;
 pub const NR_WRITEV: u64 = 66;
 /// `readv(fd, iov, iovcnt)`. Linux generic ABI `__NR_readv`.
 pub const NR_READV: u64 = 65;
+/// `sendfile64(out_fd, in_fd, offset, count)`. Linux generic ABI
+/// `__NR_sendfile64`. Copies data from `in_fd` to `out_fd` via
+/// page-level transfer without an intermediate userspace buffer.
+pub const NR_SENDFILE64: u64 = 71;
+/// `sched_setscheduler(pid, policy, param)`. Linux generic uapi
+/// `__NR_sched_setscheduler = 119`. musl calls this during
+/// pthread_create to set the new thread's scheduling policy.
+/// v1 stub: returns 0 (success, no-op) — real priority
+/// inheritance deferred to the scheduler slice.
+pub const NR_SCHED_SETSCHEDULER: u64 = 119;
 /// `ppoll(fds, nfds, tmo_p, sigmask)`. Linux generic ABI
 /// `__NR_ppoll`. busybox sh's interactive read loop polls stdin
 /// before reading. The v1 implementation is a minimal stub: walk
@@ -266,6 +276,13 @@ pub const CLONE_PARENT: u64 = 0x8000;
 pub const CLONE_THREAD: u64 = 0x10000;
 pub const CLONE_CHILD_CLEARTID: u64 = 0x200000;
 pub const CLONE_PARENT_SETTID: u64 = 0x100000;
+/// Ignored by Linux since 2.5.32; musl sets it unconditionally.
+pub const CLONE_DETACHED: u64 = 0x400000;
+/// System-V semaphore undo on exit; musl sets this in pthread_create.
+pub const CLONE_SYSVSEM: u64 = 0x40000;
+/// Namespace flags — silently accepted; txKernel does not namespace.
+pub const CLONE_NEWCGROUP: u64 = 0x2000000;
+pub const CLONE_NEWUTS: u64 = 0x4000000;
 
 /// `getppid()`. Linux generic ABI `__NR_getppid`. Wraps
 /// `ProcessIdentity::parent_pid()`. Returns `0` (`Pid::RESERVED`)
@@ -1525,6 +1542,65 @@ pub const NR_EPOLL_PWAIT: u64 = 281;
 // `man 2 eventfd2`, `man 2 timerfd_create`.
 // =====================================================================
 
+// =====================================================================
+// SysV IPC syscall numbers
+//
+// `man 2 shmget`, `man 2 msgget`, `man 2 semget`.
+// =====================================================================
+
+/// `shmget(key, size, shmflg)`. Linux generic uapi `__NR_shmget = 194`.
+pub const NR_SHMGET: u64 = 194;
+/// `shmat(shmid, shmaddr, shmflg)`. Linux generic uapi `__NR_shmat = 196`.
+pub const NR_SHMAT: u64 = 196;
+/// `shmdt(shmaddr)`. Linux generic uapi `__NR_shmdt = 197`.
+pub const NR_SHMDT: u64 = 197;
+/// `shmctl(shmid, cmd, buf)`. Linux generic uapi `__NR_shmctl = 195`.
+pub const NR_SHMCTL: u64 = 195;
+
+/// `msgget(key, msgflg)`. Linux generic uapi `__NR_msgget = 186`.
+pub const NR_MSGGET: u64 = 186;
+/// `msgsnd(msqid, msgp, msgsz, msgflg)`. Linux generic uapi `__NR_msgsnd = 189`.
+pub const NR_MSGSND: u64 = 189;
+/// `msgrcv(msqid, msgp, msgsz, msgtyp, msgflg)`. Linux generic uapi `__NR_msgrcv = 188`.
+pub const NR_MSGRCV: u64 = 188;
+/// `msgctl(msqid, cmd, buf)`. Linux generic uapi `__NR_msgctl = 187`.
+pub const NR_MSGCTL: u64 = 187;
+
+/// `semget(key, nsems, semflg)`. Linux generic uapi `__NR_semget = 190`.
+pub const NR_SEMGET: u64 = 190;
+/// `semop(semid, sops, nsops)`. Linux generic uapi `__NR_semop = 193`.
+pub const NR_SEMOP: u64 = 193;
+/// `semtimedop(semid, sops, nsops, timeout)`. Linux generic uapi `__NR_semtimedop = 192`.
+pub const NR_SEMTIMEDOP: u64 = 192;
+/// `semctl(semid, semnum, cmd, arg)`. Linux generic uapi `__NR_semctl = 191`.
+pub const NR_SEMCTL: u64 = 191;
+
+// =====================================================================
+// POSIX message queue syscall numbers
+//
+// `man 7 mq_overview`.
+// =====================================================================
+
+/// `mq_open(name, oflag, mode, attr)`. Linux generic uapi `__NR_mq_open = 180`.
+pub const NR_MQ_OPEN: u64 = 180;
+/// `mq_unlink(name)`. Linux generic uapi `__NR_mq_unlink = 181`.
+pub const NR_MQ_UNLINK: u64 = 181;
+/// `mq_timedsend(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout)`.
+/// Linux generic uapi `__NR_mq_timedsend = 182`.
+pub const NR_MQ_TIMEDSEND: u64 = 182;
+/// `mq_timedreceive(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout)`.
+/// Linux generic uapi `__NR_mq_timedreceive = 183`.
+pub const NR_MQ_TIMEDRECEIVE: u64 = 183;
+/// `mq_notify(mqdes, sevp)`. Linux generic uapi `__NR_mq_notify = 184`.
+pub const NR_MQ_NOTIFY: u64 = 184;
+/// `mq_getsetattr(mqdes, newattr, oldattr)`. Linux generic uapi
+/// `__NR_mq_getsetattr = 185`.
+pub const NR_MQ_GETSETATTR: u64 = 185;
+
+// =====================================================================
+// eventfd / timerfd syscall numbers
+// =====================================================================
+
 /// `eventfd2(init_val, flags)`. Linux generic uapi `__NR_eventfd2 = 290`.
 /// Mints a fresh [`tx_subsystems::eventfd::EventFd`] cap, wraps it in
 /// an `OpenFile` with `OpenFileBacking::Eventfd`, and installs it at
@@ -1561,3 +1637,50 @@ pub const TFD_TIMER_ABSTIME_FLAG: u32 = 1;
 /// `syslog(type, bufp, len)` — Linux kernel ring-buffer read / control.
 /// Linux generic uapi `__NR_syslog = 116`.  Called by `dmesg(1)`.
 pub const NR_SYSLOG: u64 = 116;
+
+// =====================================================================
+// membarrier syscall numbers and command flags
+//
+// `man 2 membarrier`. The Linux RV64 generic uapi does not assign
+// membarrier a dedicated slot — it was briefly `283` before
+// timerfd_create took that number. We use the x86_64 value 324,
+// which is unused in txKernel's RV64 table.
+// =====================================================================
+
+/// `membarrier(cmd, flags, cpu_id)`. x86_64 ABI `__NR_membarrier = 324`.
+/// RV64 generic uapi has no dedicated slot; 324 is unoccupied in the
+/// txKernel number space.
+pub const NR_MEMBARRIER: u64 = 324;
+
+/// Query supported commands. Always returns `MEMBARRIER_SUPPORTED_MASK`.
+pub const MEMBARRIER_CMD_QUERY: u64 = 0;
+
+/// Global barrier — broadcast to all online CPUs.
+pub const MEMBARRIER_CMD_GLOBAL: u64 = 1 << 0;
+/// Global expedited barrier.
+pub const MEMBARRIER_CMD_GLOBAL_EXPEDITED: u64 = 1 << 1;
+/// Register for global expedited barriers.
+pub const MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED: u64 = 1 << 2;
+
+/// Private expedited barrier (single-process).
+pub const MEMBARRIER_CMD_PRIVATE_EXPEDITED: u64 = 1 << 3;
+/// Register for private expedited barriers.
+pub const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: u64 = 1 << 4;
+/// Private expedited + sync_core (instruction-fetch barrier).
+pub const MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE: u64 = 1 << 5;
+/// Register for private expedited sync_core barriers.
+pub const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: u64 = 1 << 6;
+
+/// Bitmask of all commands this kernel supports — returned by
+/// `MEMBARRIER_CMD_QUERY`.
+///
+/// Includes `CMD_QUERY` plus every GLOBAL/PRIVATE barrier command.
+/// Registration cmds are accepted (no-op) but not advertised.
+pub const MEMBARRIER_SUPPORTED_MASK: u64 = MEMBARRIER_CMD_QUERY
+    | MEMBARRIER_CMD_GLOBAL
+    | MEMBARRIER_CMD_GLOBAL_EXPEDITED
+    | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+    | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+    | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+    | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
+    | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE;

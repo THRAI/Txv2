@@ -193,16 +193,16 @@ pub(crate) fn pending_ipi() -> bool {
 }
 
 pub(crate) fn send_ipi(target: CpuId) {
-    if target == la64_current_cpu_id() {
-        return;
-    }
-
-    #[cfg(target_arch = "loongarch64")]
-    {
-        let value = LA64_IOCSR_IPI_SEND_BLOCKING
-            | ((target.0 as u32) << LA64_IOCSR_IPI_SEND_CPU_SHIFT)
-            | LA64_IOCSR_IPI_VEC_SCHED;
-        la64_iocsr_write_u32(LA64_IOCSR_IPI_SEND, value);
+    if target != la64_current_cpu_id() {
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let value = LA64_IOCSR_IPI_SEND_BLOCKING
+                | ((target.0 as u32) << LA64_IOCSR_IPI_SEND_CPU_SHIFT)
+                | LA64_IOCSR_IPI_VEC_SCHED;
+            la64_iocsr_write_u32(LA64_IOCSR_IPI_SEND, value);
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        let _ = target;
     }
 }
 

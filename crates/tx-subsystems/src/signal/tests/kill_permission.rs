@@ -1,7 +1,7 @@
 // Auto-extracted from `crates/tx-subsystems/src/signal/tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
-use crate::cred::{signal_permitted, Capability, CapabilitySet, Cred, Gid, Uid};
+use crate::cred::{signal_permitted, Capability, CapabilitySet, Cred, CredSnapshot, Gid, Uid};
 use crate::execution::Errno;
 use crate::process::structure::{ProcessIdentity, TargetProcCred};
 use crate::signal::adapter::step_engine::Cap;
@@ -61,14 +61,22 @@ fn cred_with(uid: u32, euid: u32) -> Cred {
 fn same_euid_passes() {
     let src = cred_with(1000, 1000);
     let tgt = target_with(1000, 1000, false);
-    assert!(signal_permitted(src, &tgt, Signum::SIGTERM));
+    assert!(signal_permitted(
+        &CredSnapshot::from_cred(src),
+        &tgt,
+        Signum::SIGTERM
+    ));
 }
 
 #[test]
 fn different_euid_fails_without_capability() {
     let src = cred_with(1000, 1000);
     let tgt = target_with(2000, 2000, false);
-    assert!(!signal_permitted(src, &tgt, Signum::SIGTERM));
+    assert!(!signal_permitted(
+        &CredSnapshot::from_cred(src),
+        &tgt,
+        Signum::SIGTERM
+    ));
 }
 
 #[test]
@@ -86,28 +94,44 @@ fn cap_kill_overrides_euid_mismatch() {
         permitted_caps: CapabilitySet::EMPTY,
     };
     let tgt = target_with(2000, 2000, false);
-    assert!(signal_permitted(src, &tgt, Signum::SIGTERM));
+    assert!(signal_permitted(
+        &CredSnapshot::from_cred(src),
+        &tgt,
+        Signum::SIGTERM
+    ));
 }
 
 #[test]
 fn root_overrides_euid_mismatch() {
     let src = Cred::root();
     let tgt = target_with(2000, 2000, false);
-    assert!(signal_permitted(src, &tgt, Signum::SIGTERM));
+    assert!(signal_permitted(
+        &CredSnapshot::from_cred(src),
+        &tgt,
+        Signum::SIGTERM
+    ));
 }
 
 #[test]
 fn sigcont_same_session_passes_regardless_of_uid() {
     let src = cred_with(1000, 1000);
     let tgt = target_with(2000, 2000, true);
-    assert!(signal_permitted(src, &tgt, Signum::SIGCONT));
+    assert!(signal_permitted(
+        &CredSnapshot::from_cred(src),
+        &tgt,
+        Signum::SIGCONT
+    ));
 }
 
 #[test]
 fn sigcont_different_session_still_requires_cred_match() {
     let src = cred_with(1000, 1000);
     let tgt = target_with(2000, 2000, false);
-    assert!(!signal_permitted(src, &tgt, Signum::SIGCONT));
+    assert!(!signal_permitted(
+        &CredSnapshot::from_cred(src),
+        &tgt,
+        Signum::SIGCONT
+    ));
 }
 
 // ----- integration tests against real Process / PGroup graph -----
@@ -135,10 +159,11 @@ fn fresh_init() -> Cap<crate::process::ProcessIdentity> {
 fn script_kill_process_same_uid_delivers() {
     let _g = setup();
     let parent = fresh_init();
-    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
+    let child =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
     // Both inherit root cred; same euid.
 
-    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM);
+    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM, None);
     assert_eq!(outcome, Ok(KillScriptOutcome::Delivered));
 }
 
@@ -146,7 +171,8 @@ fn script_kill_process_same_uid_delivers() {
 fn script_kill_process_different_uid_returns_eperm() {
     let _g = setup();
     let parent = fresh_init();
-    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
+    let child =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
 
     // Drop both to non-privileged uids that don't share. We set
     // creds directly because day-1 `step_setuid` retains caps
@@ -156,7 +182,7 @@ fn script_kill_process_different_uid_returns_eperm() {
     set_cred(&parent, limited_cred(1000));
     set_cred(&child, limited_cred(2000));
 
-    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM);
+    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM, None);
     assert_eq!(outcome, Err(Errno::EPERM));
 }
 
@@ -164,12 +190,13 @@ fn script_kill_process_different_uid_returns_eperm() {
 fn script_kill_process_zombie_target_returns_no_live_thread() {
     let _g = setup();
     let parent = fresh_init();
-    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
+    let child =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
     crate::process::step_exit_group(&child, ExitStatus::Exited(0));
 
     // Even without permission, target_proc_cred returns None for
     // a zombie, short-circuiting before the cred check.
-    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM);
+    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM, None);
     assert_eq!(outcome, Ok(KillScriptOutcome::NoLiveThread));
 }
 
@@ -177,10 +204,11 @@ fn script_kill_process_zombie_target_returns_no_live_thread() {
 fn script_kill_process_zombie_source_returns_esrch() {
     let _g = setup();
     let parent = fresh_init();
-    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
+    let child =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
     crate::process::step_exit_group(&parent, ExitStatus::Exited(0));
 
-    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM);
+    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM, None);
     assert_eq!(outcome, Err(Errno::ESRCH));
 }
 
@@ -188,8 +216,10 @@ fn script_kill_process_zombie_source_returns_esrch() {
 fn script_kill_pgrp_partial_permission_returns_count_of_permitted() {
     let _g = setup();
     let parent = fresh_init();
-    let child_a = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork a");
-    let child_b = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork b");
+    let child_a =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork a");
+    let child_b =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork b");
 
     // Set up a partial-permission scenario:
     //   parent (sender):    uid=1000, no caps
@@ -223,10 +253,114 @@ fn script_kill_pgrp_partial_permission_returns_count_of_permitted() {
 }
 
 #[test]
+fn authorize_signal_send_yields_three_state_outcome() {
+    // Pin the three-state contract of `cred::checks::authorize_signal_send`:
+    //   • same uid                  → Ok(Authorized)
+    //   • different uid, no caps    → Err(EPERM)
+    //   • target zombie             → Ok(NoLiveTarget)
+    //   • source zombie             → Err(ESRCH)
+    // The four outcomes drive the dispatch branches in every signal
+    // script that consumes the combinator.
+    use crate::cred::checks::{authorize_signal_send, AuthOutcome};
+
+    let _g = setup();
+    let parent = fresh_init();
+    let child =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
+
+    // Same uid (both root inherited from bootstrap).
+    assert_eq!(
+        authorize_signal_send(&parent, &child, Signum::SIGTERM),
+        Ok(AuthOutcome::Authorized),
+    );
+
+    // Mismatched non-privileged uids.
+    set_cred(&parent, limited_cred(1000));
+    set_cred(&child, limited_cred(2000));
+    assert_eq!(
+        authorize_signal_send(&parent, &child, Signum::SIGTERM),
+        Err(Errno::EPERM),
+    );
+
+    // Zombie target: re-bootstrap a fresh child, reap it, and check.
+    crate::process::step_exit_group(&child, crate::process::ExitStatus::Exited(0));
+    assert_eq!(
+        authorize_signal_send(&parent, &child, Signum::SIGTERM),
+        Ok(AuthOutcome::NoLiveTarget),
+    );
+
+    // Zombie source.
+    let live_target =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
+    crate::process::step_exit_group(&parent, crate::process::ExitStatus::Exited(0));
+    assert_eq!(
+        authorize_signal_send(&parent, &live_target, Signum::SIGTERM),
+        Err(Errno::ESRCH),
+    );
+}
+
+#[test]
+fn script_deliver_signal_to_thread_denied_for_mismatched_uid() {
+    use crate::signal::{script_deliver_signal, KillOutcome, SignalTarget};
+
+    let _g = setup();
+    let parent = fresh_init();
+    let child =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
+
+    set_cred(&parent, limited_cred(1000));
+    set_cred(&child, limited_cred(2000));
+
+    // Target the child's leader thread directly. The script must
+    // resolve the thread → owning process → cred check, and the
+    // mismatched uids without CAP_KILL must surface as EPERM.
+    let leader = {
+        let payload = child.payload.lock();
+        let payload = payload.as_ref().expect("alive");
+        payload.threads.nth(0).expect("leader")
+    };
+
+    let outcome = script_deliver_signal(&parent, SignalTarget::Thread(leader), Signum::SIGTERM);
+    assert_eq!(outcome, Err(Errno::EPERM));
+
+    // No post should have happened — verify the child's leader has
+    // no pending SIGTERM.
+    let pending = {
+        let payload = child.payload.lock();
+        let payload = payload.as_ref().unwrap();
+        let leader = payload.threads.nth(0).unwrap();
+        let lp = leader.payload.lock();
+        lp.as_ref().unwrap().pending().is_pending(Signum::SIGTERM)
+    };
+    assert!(!pending, "denied delivery must not post");
+}
+
+#[test]
+fn script_deliver_signal_to_thread_delivers_when_authorized() {
+    use crate::signal::{script_deliver_signal, KillOutcome, SignalTarget};
+
+    let _g = setup();
+    let parent = fresh_init();
+    let child =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
+
+    // Both inherit root cred → same euid → permitted.
+    let leader = {
+        let payload = child.payload.lock();
+        let payload = payload.as_ref().expect("alive");
+        payload.threads.nth(0).expect("leader")
+    };
+
+    let outcome = script_deliver_signal(&parent, SignalTarget::Thread(leader), Signum::SIGTERM);
+    assert_eq!(outcome, Ok(KillOutcome::Delivered));
+}
+
+#[test]
 fn signal_zero_is_permission_probe_no_delivery() {
     let _g = setup();
     let parent = fresh_init();
-    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
+    let child =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
 
     // Same uid — probe should succeed without delivery.
     let outcome = script_kill_probe(&parent, &child).expect("probe");

@@ -3,7 +3,7 @@ use super::la64_irq_trap::*;
 use super::la64_pmap::*;
 use super::*;
 
-#[cfg(not(target_arch = "loongarch64"))]
+#[cfg(all(not(target_arch = "loongarch64"), test))]
 use core::sync::atomic::AtomicU8;
 
 #[cfg(target_arch = "loongarch64")]

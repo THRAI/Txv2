@@ -28,7 +28,7 @@ pub(super) fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::NoReturn,
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -49,7 +49,7 @@ pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::NoReturn,
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -109,6 +109,11 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
         Ok(buf) => buf,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
+
+    // (Debug execve-marker observe-reset hook removed once
+    // `basename` was traced — the wedge was the TimerId/TimerToken
+    // mismatch in `tx_scripts::drive::resolve_on_timer`. See that
+    // function for the fix.)
 
     // ----- Step 2 + 3: bounded reads of argv and envp -----
     //
@@ -233,6 +238,9 @@ pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
 /// Wave 1's surface (`fork_aspace`'s `WouldBlock` cannot fire under
 /// v1's single-thread-per-process model). The function is non-`async`
 /// to keep the seam minimal.
+/// DIAGNOSTIC: track clone calls to debug pthread_create
+static CLONE_CALL_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 pub(super) async fn sys_clone<'a, P: PmapIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
@@ -240,15 +248,44 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     let flags = args[0];
     let stack = args[1];
 
-    // Validation: must include SIGCHLD. Only CLONE_SETTLS is
-    // accepted as an additional flag.
-    if flags & SIGCHLD == 0 {
+    // Validation: the lower byte specifies the exit signal.
+    // CLONE_THREAD threads don't generate an exit signal (the
+    // thread-group leader's exit signal governs process-wide
+    // SIGCHLD).  For fork-like clones we require SIGCHLD; for
+    // thread clones we accept any signal (including zero — musl
+    // sets the lower byte to zero when CLONE_THREAD is set).
+    let clone_thread = (flags & CLONE_THREAD) != 0;
+    if !clone_thread && flags & SIGCHLD == 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
     let clone_vm = (flags & CLONE_VM) != 0;
+    let clone_sighand = (flags & CLONE_SIGHAND) != 0;
     let clone_vfork = (flags & CLONE_VFORK) != 0;
     let clone_settls = (flags & CLONE_SETTLS) != 0;
-    let allowed_mask = SIGCHLD | CLONE_SETTLS | CLONE_VM | CLONE_VFORK;
+    let clone_child_cleartid = (flags & CLONE_CHILD_CLEARTID) != 0;
+    let clone_parent_settid = (flags & CLONE_PARENT_SETTID) != 0;
+
+    let allowed_mask = if clone_thread {
+        // CLONE_THREAD requires CLONE_SIGHAND per Linux semantics.
+        if flags & CLONE_SIGHAND == 0 {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        SIGCHLD
+            | CLONE_THREAD
+            | CLONE_VM
+            | CLONE_SIGHAND
+            | CLONE_SETTLS
+            | CLONE_CHILD_CLEARTID
+            | CLONE_PARENT_SETTID
+            | CLONE_FILES
+            | CLONE_FS
+            | CLONE_DETACHED
+            | CLONE_SYSVSEM
+            | CLONE_NEWCGROUP
+            | CLONE_NEWUTS
+    } else {
+        SIGCHLD | CLONE_SETTLS | CLONE_VM | CLONE_VFORK | CLONE_SIGHAND | CLONE_FILES | CLONE_FS
+    };
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
@@ -273,6 +310,45 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         .expect(":clone:no-context: kernel-invariant violation, parent thread had no saved_user_context");
 
     let tls = if clone_settls { args[3] } else { 0 };
+
+    // ── CLONE_THREAD fast path ─────────────────────────────────
+    // Create a new thread within the calling process — no new
+    // ProcessIdentity is created.
+    if clone_thread {
+        let ctid_ptr = if clone_child_cleartid { args[4] } else { 0 };
+        let child_thread = tx_subsystems::process::execution::step_clone_thread(
+            &ctx.process,
+            &parent_user_ctx,
+            stack as usize,
+            tls as usize,
+            ctid_ptr,
+        );
+        let child_thread = match child_thread {
+            Ok(t) => t,
+            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+        };
+
+        // CLONE_PARENT_SETTID: write child tid to *ptid in parent's
+        // userspace. Linux semantics: write `child_tid` (as i32)
+        // before the child is scheduled.
+        if clone_parent_settid {
+            let ptid_ptr = args[2];
+            if ptid_ptr != 0 {
+                let _ = super::user_copy::bootstrap_write_user(
+                    &ctx.aspace,
+                    ptid_ptr,
+                    child_thread.tid.0 as i32,
+                );
+            }
+        }
+
+        // Hand the child thread to the reactor.
+        reactor_submit::submit_child_thread(ctx.process.clone(), child_thread.clone());
+
+        return SyscallResult::Return(child_thread.tid.0 as i64);
+    }
+
+    // ── Non-CLONE_THREAD (fork) path ────────────────────────────
     // PR-9 phase 3b: drive `step_fork::<P>` via the `ForkOp::<P>`
     // StepOp wrap, threading a `&mut KernelScriptCtx`. The wrap lifts
     // the `Result<Cap<...>, ForkError>` into `StepOutcome::Done(inner_result)`
@@ -290,11 +366,12 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         let mut op = tx_subsystems::process::execution::ForkOp::<P> {
             parent: &ctx.process,
             clone_vm,
+            clone_sighand,
             _pmap: core::marker::PhantomData,
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(r) => r,
-            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
     // step_fork: mint a child ProcessIdentity + leader ThreadIdentity
@@ -478,7 +555,7 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     if let Err(errno) =
                         bootstrap_write_user::<i32>(&ctx.aspace, wstatus_uaddr, word)
                     {
-                        return SyscallResult::Error(errno_to_i32(errno));
+                        return SyscallResult::error_from(errno);
                     }
                 }
                 return SyscallResult::Return(child_pid.0 as i64);
@@ -507,7 +584,7 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     if let Err(errno) =
                         bootstrap_write_user::<i32>(&ctx.aspace, wstatus_uaddr, word)
                     {
-                        return SyscallResult::Error(errno_to_i32(errno));
+                        return SyscallResult::error_from(errno);
                     }
                 }
                 return SyscallResult::Return(child_pid.0 as i64);
@@ -528,7 +605,7 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     future.await;
                 }
             }
-            V3Out::Err(e) => return SyscallResult::Error(errno_to_i32(e.into())),
+            V3Out::Err(e) => return SyscallResult::error_from(e.into()),
             _ => {}
         }
     }
@@ -581,7 +658,7 @@ pub(super) fn sys_setpgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -634,19 +711,15 @@ pub(super) fn sys_setsid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(sid) => SyscallResult::Return(sid.0 as i64),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
-/// `set_tid_address(tidptr)` — Wave 2 stub.
+/// `set_tid_address(tidptr)`.
 ///
-/// Returns the calling thread's tid (Linux's documented return for
-/// this syscall). Ignores `tidptr` — the real semantic
-/// (`clear_child_tid` slot + futex wakeup on thread exit) is deferred
-/// to the pthread/futex slice.
-///
-/// TODO(phase-tls): wire `tidptr` through to a per-thread
-/// `clear_child_tid` slot per `THREAD_RUNTIME_v1` §2.6.
+/// Stores the `clear_child_tid` pointer on the calling thread's
+/// payload. On thread exit, the kernel atomically writes 0 to *tidptr
+/// and issues `FUTEX_WAKE` so pthread_join can observe the transition.
 pub(super) fn sys_set_tid_address<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let tidptr = args[0];
     // Store the clear_child_tid pointer on the thread payload.
@@ -663,15 +736,23 @@ pub(super) fn sys_set_tid_address<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     SyscallResult::Return(ctx.thread.tid.0 as i64)
 }
 
-/// `set_robust_list(head, len)` — Wave 2 stub.
+/// `set_robust_list(head, len)`.
 ///
-/// Returns `0` unconditionally. Ignores `head`/`len` — the real
-/// semantic (futex robust-list registration + walk on thread exit)
-/// is deferred to the futex slice.
+/// Stores the robust-list head pointer and byte length on the
+/// calling thread's payload. The thread-exit path walks the list
+/// and marks each futex word as `FUTEX_OWNER_DIED` + wakes waiters.
 ///
-/// TODO(phase-futex): register the robust-list head per-thread once
-/// futex infrastructure lands.
-pub(super) fn sys_set_robust_list(_args: [u64; 6]) -> SyscallResult {
+/// Returns `0` unconditionally (Linux returns `0` on success; the
+/// only failure is `-EINVAL` for `len % size_of::<usize>() != 0`
+/// which we skip — txKernel ignores `len`).
+pub(super) fn sys_set_robust_list<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let head = args[0];
+    let len = args[1] as usize;
+    if let Some(payload) = ctx.thread.payload_cap() {
+        let mut slot = payload.robust_list_head.lock();
+        *slot = if head == 0 { None } else { Some(head) };
+        *payload.robust_list_len.lock() = len;
+    }
     SyscallResult::Return(0)
 }
 

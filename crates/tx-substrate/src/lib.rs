@@ -470,6 +470,20 @@ pub fn init<P: TxPlatform>() {
     slab::init::<P>().expect("tx_substrate::init slab heap initialization failed");
     slab::allocation_smoke().expect("tx_substrate::init slab allocation smoke failed");
 
+    // L6 Mutation emit gates: turn on by default at BSP init so the
+    // observation pipeline carries `MutationZoneSign` and
+    // `MutationIndexCommit` instants once the L0/L2/L4 backbone is
+    // in place. Per OBS-V1 §3 / `08_OBSERVATION_v1.md` §6 HOOKS-1,
+    // these are the only L6 events emitted today; the daemon decodes
+    // them as `Instant` records scoped inside the surrounding L4/L2
+    // span hierarchy.
+    //
+    // Tests opt out by writing `false` to either gate before exercising
+    // a code path; see `tests/obs8_zone_sign_emit.rs`.
+    use core::sync::atomic::Ordering;
+    zone::MUTATION_EMIT_ENABLED.store(true, Ordering::Release);
+    index::INDEX_MUTATION_EMIT_ENABLED.store(true, Ordering::Release);
+
     // L5 Phase span end.
     emit_phase_span_end(phase_span);
 }

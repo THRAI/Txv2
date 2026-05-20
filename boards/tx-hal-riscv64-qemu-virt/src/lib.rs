@@ -759,7 +759,86 @@ impl EntropyIf for Platform {
     }
 }
 
-impl ObserverIf for Platform {}
+// ── Observation ring backing ──────────────────────────────────────────────────
+//
+// rv64-qemu reserves a static aligned buffer in .bss to back hart 0's
+// observation ring. The buffer's lifetime is the kernel's lifetime, so the
+// `'static` requirement in `RingDescriptor` is satisfied.
+//
+// Sizing: 4 MiB total → 208-byte ring header + 52428 × 80-byte slots ≈ 52k
+// records per hart. The ring is circular; once full, oldest slots are
+// overwritten. A full oscomp basic-musl run (~32 tests × ~30 syscalls ×
+// ~10 records each ≈ 10k records) fits with headroom, so the dump at
+// init-exit captures the full basic-era trace even when later test groups
+// (busybox-musl, libctest, cyclictest) continue and push more records.
+//
+// Sizing budget: rv64-qemu boots with 1 GiB of guest RAM (`-m 1G`); 4 MiB
+// in `.bss` is < 0.4 % of available memory and stays comfortably out of
+// the kernel direct-map / heap regions.
+//
+// One ring is allocated per supported hart; rv64-qemu boots with `-smp 1`
+// for oscomp/smoke runs so only hart 0's slot is populated, but the buffer
+// is sized for `MAX_OBS_HARTS = 1` here. Future SMP-aware impls can extend
+// the array.
+const OBS_RING_BYTES: usize = 4 * 1024 * 1024;
+const OBS_RING_HARTS: usize = 1;
+
+/// Aligned static backing for the observation ring. `#[repr(C, align(64))]`
+/// ensures cache-line alignment for the SPSC head/tail atomics that live in
+/// the `TxTraceHartRing` header.
+#[repr(C, align(64))]
+struct ObsRingBuf([u8; OBS_RING_BYTES]);
+
+static mut OBS_RINGS: [ObsRingBuf; OBS_RING_HARTS] =
+    [const { ObsRingBuf([0u8; OBS_RING_BYTES]) }; OBS_RING_HARTS];
+
+impl ObserverIf for Platform {
+    fn observation_ring(hart: CpuId) -> Option<tx_hal::RingDescriptor> {
+        let idx = hart.0;
+        if idx >= OBS_RING_HARTS {
+            return None;
+        }
+        // SAFETY: `OBS_RINGS[idx]` is a static buffer with the kernel's
+        // lifetime. The SPSC discipline in `tx-observe` guarantees that
+        // only the owning hart writes to its slot; readers (the daemon
+        // or the serial-dump path) read after the producer has stopped.
+        // `OBS_RING_BYTES` is a power of two (64 KiB = 2^16), satisfying
+        // the `size` invariant on `RingDescriptor`.
+        let ptr = unsafe { OBS_RINGS[idx].0.as_mut_ptr() };
+        Some(tx_hal::RingDescriptor {
+            base: core::ptr::NonNull::new(ptr).expect("OBS_RINGS slice has non-null base"),
+            size: OBS_RING_BYTES,
+            doorbell: None,
+        })
+    }
+
+    fn clock_shared() -> bool {
+        // QEMU virt `time` CSR is a single counter exposed identically
+        // across harts — cross-hart ordering is trustworthy without
+        // calibration.
+        true
+    }
+}
+
+/// Read the raw bytes of hart `hart`'s observation ring backing region.
+///
+/// Used by the serial-dump path (`tx_observe::dump_console_hex`) at
+/// shutdown to emit the full ring contents as a hex-framed blob over
+/// the console, where `cargo xtask observe extract` can recover it.
+///
+/// Returns `None` if the hart index is out of range.
+#[allow(static_mut_refs)]
+pub fn obs_ring_bytes(hart: CpuId) -> Option<&'static [u8]> {
+    let idx = hart.0;
+    if idx >= OBS_RING_HARTS {
+        return None;
+    }
+    // SAFETY: the kernel calls this only after the trace-producing
+    // workload has reached its observation-quiescence point (init
+    // zombified, no more emits in flight on this hart). The single-hart
+    // discipline (`-smp 1`) means no concurrent writer exists.
+    unsafe { Some(&OBS_RINGS[idx].0[..]) }
+}
 
 #[cfg(target_arch = "riscv64")]
 fn read_rdtime_ticks() -> u64 {
