@@ -315,6 +315,7 @@ fn prepare_alpine_rootfs(root: &Path, args: &[String], target: TxTarget) -> Resu
         fs::create_dir_all(layout.join(dir)).map_err(|err| err.to_string())?;
     }
     install_alpine_bootstrap_busybox(root, target, args, &layout)?;
+    install_optional_user_smokes(root, target, &layout)?;
     Ok(layout)
 }
 
