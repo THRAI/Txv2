@@ -342,14 +342,6 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             }
         }
 
-        // Register the child thread's TID in the global PID
-        // namespace so resolve_pid_number(tid) can find it —
-        // pthread_cancel / tkill need this to route signals.
-        tx_subsystems::process::numbers::register_tid(
-            child_thread.tid,
-            child_thread.clone(),
-        );
-
         // Hand the child thread to the reactor.
         reactor_submit::submit_child_thread(ctx.process.clone(), child_thread.clone());
 

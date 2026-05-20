@@ -174,7 +174,12 @@ pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) ->
             }
             #[cfg(not(target_os = "none"))]
             {
-                if uaddr < 0x1000 {
+                let limit = if cfg!(any(test, feature = "test-support")) {
+                    0x1000
+                } else {
+                    FULL_USER_V1_TOP as u64
+                };
+                if uaddr < limit {
                     return Err(Errno::EFAULT);
                 }
                 Ok(unsafe { core::ptr::read_volatile(uaddr as *const T) })
@@ -205,7 +210,12 @@ pub(super) fn bootstrap_write_user<T: Copy>(
             }
             #[cfg(not(target_os = "none"))]
             {
-                if uaddr < 0x1000 {
+                let limit = if cfg!(any(test, feature = "test-support")) {
+                    0x1000
+                } else {
+                    FULL_USER_V1_TOP as u64
+                };
+                if uaddr < limit {
                     return Err(Errno::EFAULT);
                 }
                 unsafe {
@@ -277,7 +287,12 @@ pub(super) fn bootstrap_copy_from_user(
             match aspace.reserve_user_range_for_access(range, UserAccessKind::Read) {
                 V3::Done(()) => {}
                 V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
-                    if uaddr < 0x1000 {
+                    let limit = if cfg!(any(test, feature = "test-support")) {
+                        0x1000
+                    } else {
+                        FULL_USER_V1_TOP as u64
+                    };
+                    if uaddr < limit {
                         return Err(Errno::EFAULT);
                     }
                     prefault_failed_with_efault = true;
@@ -299,7 +314,12 @@ pub(super) fn bootstrap_copy_from_user(
             V3::Done(_) | V3::Continue { .. } => Ok(()),
             V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
                 drop(guard);
-                if uaddr < 0x1000 {
+                let limit = if cfg!(any(test, feature = "test-support")) {
+                    0x1000
+                } else {
+                    FULL_USER_V1_TOP as u64
+                };
+                if uaddr < limit {
                     return Err(Errno::EFAULT);
                 }
                 unsafe {
@@ -351,7 +371,12 @@ pub(super) fn bootstrap_copy_to_user(
             match aspace.reserve_user_range_for_access(range, UserAccessKind::Write) {
                 V3::Done(()) => {}
                 V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
-                    if uaddr < 0x1000 {
+                    let limit = if cfg!(any(test, feature = "test-support")) {
+                        0x1000
+                    } else {
+                        FULL_USER_V1_TOP as u64
+                    };
+                    if uaddr < limit {
                         return Err(Errno::EFAULT);
                     }
                     prefault_failed_with_efault = true;
@@ -373,7 +398,12 @@ pub(super) fn bootstrap_copy_to_user(
             V3::Done(_) | V3::Continue { .. } => Ok(()),
             V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
                 drop(guard);
-                if uaddr < 0x1000 {
+                let limit = if cfg!(any(test, feature = "test-support")) {
+                    0x1000
+                } else {
+                    FULL_USER_V1_TOP as u64
+                };
+                if uaddr < limit {
                     return Err(Errno::EFAULT);
                 }
                 unsafe {
@@ -414,7 +444,12 @@ pub(super) fn bootstrap_read_user_cstr(
             }
             #[cfg(not(target_os = "none"))]
             {
-                if uaddr < 0x1000 {
+                let limit = if cfg!(any(test, feature = "test-support")) {
+                    0x1000
+                } else {
+                    FULL_USER_V1_TOP as u64
+                };
+                if uaddr < limit {
                     return Err(Errno::EFAULT);
                 }
                 // Fallback bootstrap scan — matches the previous inline

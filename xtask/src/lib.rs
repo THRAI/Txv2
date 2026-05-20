@@ -103,6 +103,7 @@ fn print_usage() {
            cargo xtask oscomp score [--target rv64-qemu|la64-qemu] [--input FILE] [--suite SUITE] [--data DIR] [--dry-run]\n\
            cargo xtask oscomp list-suites [--target rv64-qemu|la64-qemu] [--data DIR]\n\
            cargo xtask oscomp test --target rv64-qemu|la64-qemu [--suite SUITE] [--skip-build] [--data DIR] [--dry-run]\n\
+           cargo xtask oscomp slim-sdcard [--suite SUITE]... [--ltp-cases CASE1,CASE2] [--source IMG] [-o IMG] [--size-mb N]\n\
            cargo xtask submit k210 [--out target/submit/k210]\n\
            cargo xtask syscall status|list|info|sync|pick — query/maintain the syscall map (SSoT: numbers.rs + mod.rs)\n\
            cargo xtask progress validate\n\

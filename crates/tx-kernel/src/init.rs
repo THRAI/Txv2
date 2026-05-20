@@ -1333,13 +1333,53 @@ impl<P: TxPlatform> CoreInit<P> {
         let now_ns = P::read_ns();
         let mut signal = SmpRescheduleSignal::<P>::new();
         // Force a guard acquire+drop to advance the epoch and clear
-        // any stale local_epoch state that may have leaked from a
-        // prior reactor step or PreemptionPoint::consume epoch::try_advance.
+        // any stale local_epoch state left by the prior reactor step.
         drop(step_engine::guard());
+        #[cfg(feature = "diag-epoch-guards")]
+        let local_pre = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
+            .map(|c| c.local_epoch as usize)
+            .unwrap_or(999);
+        #[cfg(feature = "diag-epoch-guards")]
+        {
+            let epoch_pre_with = crate::adapter::step_engine::epoch::summary();
+            tx_hal::console_write_str::<P>(":diag:pre-boot-reactor-with:epoch=");
+            Self::write_decimal_unsigned(epoch_pre_with.global_epoch as usize);
+            tx_hal::console_write_str::<P>(":guards=");
+            Self::write_decimal_unsigned(epoch_pre_with.active_guards);
+            tx_hal::console_write_str::<P>("\n");
+        }
 
         let step = BOOT_REACTOR.with(|reactor| {
-            boot_runtime::hart_loop::step_hart_loop_at(reactor, hart, now_ns, &mut signal)
+            let result =
+                boot_runtime::hart_loop::step_hart_loop_at(reactor, hart, now_ns, &mut signal);
+            #[cfg(feature = "diag-epoch-guards")]
+            {
+                let guard_epoch = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
+                    .map(|c| c.local_epoch as usize)
+                    .unwrap_or(999);
+                if guard_epoch != 0 {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":diag:step-hart-loop-inside:epoch=");
+                    Self::write_decimal_unsigned(guard_epoch);
+                    tx_hal::console_write_str::<P>("\n");
+                }
+            }
+            result
         })?;
+        #[cfg(feature = "diag-epoch-guards")]
+        {
+            let local_post = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
+                .map(|c| c.local_epoch as usize)
+                .unwrap_or(999);
+            if local_pre != 0 || local_post != 0 {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":diag:step-boot-reactor-once:guard-leak:pre=");
+                Self::write_decimal_unsigned(local_pre);
+                tx_hal::console_write_str::<P>(":post=");
+                Self::write_decimal_unsigned(local_post);
+                tx_hal::console_write_str::<P>("\n");
+            }
+        }
         Self::program_hart_loop_deadline(step.deadline_action);
         Some(step)
     }
@@ -1600,10 +1640,11 @@ impl<P: TxPlatform> CoreInit<P> {
             // `?` sentinel and pgid_low/sid_low both zero, adding
             // no information).
             if let Some(ref c) = comm {
-                emit_process_label::<P>(pid_low, c);
-                emit_process_group::<P>(pid_low, pgid_low, sid_low);
-                // Fork edge: parent → child arrow on the timeline.
-                emit_process_fork::<P>(parent_pid_low, pid_low);
+                emit_process_label(pid_low, c);
+                emit_process_group(pid_low, pgid_low, sid_low);
+                if parent_pid_low != 0 {
+                    emit_process_fork(parent_pid_low, pid_low);
+                }
             }
             let _ = BOOT_REACTOR.with(|reactor| {
                 reactor.submit_task_with_meta(
@@ -1647,7 +1688,7 @@ static PENDING_CHILD_SUBMITS: SpinMutex<
 ///
 /// No-op when no `HartEmitter` is installed (host tests, boards
 /// without an observation ring).
-pub(crate) fn emit_process_label<P: tx_hal::TxPlatform>(pid_low: u32, comm: &[u8; 16]) {
+pub(crate) fn emit_process_label(pid_low: u32, comm: &[u8; 16]) {
     let _ = (pid_low, comm);
     let Some(em) = tx_observe::current() else {
         return;
@@ -1656,7 +1697,7 @@ pub(crate) fn emit_process_label<P: tx_hal::TxPlatform>(pid_low: u32, comm: &[u8
     let n = core::cmp::min(comm.len(), truncated.len());
     truncated[..n].copy_from_slice(&comm[..n]);
     // Force NUL termination of the truncated buffer if it lost one.
-    if !truncated.iter().any(|&b| b == 0) {
+    if !truncated.contains(&0) {
         truncated[truncated.len() - 1] = 0;
     }
     let payload = tx_observe::PayloadProcessLabel {
@@ -1684,7 +1725,7 @@ pub(crate) fn emit_process_label<P: tx_hal::TxPlatform>(pid_low: u32, comm: &[u8
 /// arrow from the parent's most recent `clone()` slice to the
 /// child's first `Sched` dispatch (OBS-V1 §15.9). Skipped when
 /// `parent_pid` is zero (kernel-internal or pre-init contexts).
-pub(crate) fn emit_process_fork<P: tx_hal::TxPlatform>(parent_pid: u32, child_pid: u32) {
+pub(crate) fn emit_process_fork(parent_pid: u32, child_pid: u32) {
     if parent_pid == 0 || child_pid == 0 {
         return;
     }
@@ -1717,7 +1758,7 @@ pub(crate) fn emit_process_fork<P: tx_hal::TxPlatform>(parent_pid: u32, child_pi
 ///
 /// Emitted alongside `emit_process_label` at the same kernel sites.
 /// No-op when no `HartEmitter` is installed.
-pub(crate) fn emit_process_group<P: tx_hal::TxPlatform>(pid_low: u32, pgid_low: u32, sid_low: u32) {
+pub(crate) fn emit_process_group(pid_low: u32, pgid_low: u32, sid_low: u32) {
     let Some(em) = tx_observe::current() else {
         return;
     };
@@ -1744,36 +1785,15 @@ pub(crate) fn emit_process_group<P: tx_hal::TxPlatform>(pid_low: u32, pgid_low: 
 mod helpers;
 use helpers::{bootstrap_block_on, exec_error_tag, parse_init_from_cmdline};
 mod init_fixture;
-/// Shell-prompt roadmap Slice 10 (2026-05-08): when the build script
-/// at `crates/tx-kernel/build.rs` sees `TX_BUSYBOX` pointing at a
-/// real static-musl-built busybox binary, it copies the bytes to
-/// `$OUT_DIR/busybox.bin` and emits `cargo:rustc-cfg=busybox_baked`.
-/// This module is then compiled in and exposes
-/// `BUSYBOX_BYTES: &'static [u8]` for
-/// `register_busybox_into_tmpfs()` to consume.
-///
-/// Without `TX_BUSYBOX`, the module is not compiled in and the
-/// kernel boots through the existing `/init` fixture path
-/// exclusively (host tests + CI without a riscv64 cross-toolchain).
+
 #[cfg(busybox_baked)]
 mod busybox_fixture {
     pub static BUSYBOX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busybox.bin"));
 }
 
-/// DAC + setuid slice (Wave 5, Part 8): sibling fixture for the
-/// end-to-end setuid smoke. See `init_setuid_fixture.rs`'s module
-/// header for the deviation from Plan Q4 (extend-in-place was
-/// authored before the fork/clone/wait4 slice rewrote the existing
-/// fixture into a fork+wait+exit binary; sibling fixture keeps both
-/// smokes independently pinned).
 #[cfg(test)]
 mod init_setuid_fixture;
 
-/// fd-ops slice (Wave 4, Part 8): sibling fixture for the
-/// `openat → write → lseek → read → close → exit_group` byte-pin
-/// smoke. See `init_lseek_fixture.rs`'s module header for the
-/// sibling-vs-extend rationale (mirrors the setuid sibling
-/// decision so each fd-ops/DAC/fork test owns its own pinned ABI).
 #[cfg(test)]
 mod init_lseek_fixture;
 

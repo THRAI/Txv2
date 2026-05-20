@@ -121,8 +121,6 @@ impl<P: TxPlatform> CoreInit<P> {
     pub(crate) fn init_csprng() {
         let seed = tx_services::random::platform_seed();
         tx_services::random::init(&seed);
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":csprng:ok\n");
     }
 
     pub(crate) fn populate_rootfs_tmp_dirs() {

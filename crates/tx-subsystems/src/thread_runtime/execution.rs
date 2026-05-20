@@ -181,6 +181,8 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     if let Some((head, _len)) = robust {
         walk_robust_list(&thread, head, 16);
     }
+
+    crate::process::numbers::unregister_pid_number(thread.tid.0 as u64);
 }
 
 /// Best-effort robust-list walk on thread exit.
@@ -325,6 +327,7 @@ pub fn step_sigprocmask(
 pub fn post_signal(
     thread: &Cap<ThreadIdentity>,
     sig: Signum,
+    routing: SignalRouting,
     info: Option<crate::signal::SigInfo>,
 ) {
     debug_assert!(
@@ -356,13 +359,8 @@ pub fn post_signal(
 
     // D9-A: post the wake-hint to the thread's mailbox *after* the
     // summary update so a parked future, on re-poll, observes the
-    // same summary bit the post advertises. Routing is
-    // `ProcessDirected` — `post_signal` is the back-end for
-    // `step_kill_process` / `step_kill_pgrp` (process-directed
-    // delivery). A future tgkill-shaped entry point that targets a
-    // specific thread will route through a sibling helper that
-    // passes `ThreadDirected { tid: thread.tid.0 as u64 }` instead.
-    post_signal_mailbox(&payload, sig, SignalRouting::ProcessDirected);
+    // same summary bit the post advertises.
+    post_signal_mailbox(&payload, sig, routing);
 }
 
 // ---------------------------------------------------------------------------
@@ -525,7 +523,10 @@ impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
         // reserve — N/A
         // commit — post_signal delivers to thread's pending queue
         // publish — post_signal sends MailboxEvent if mailbox bound
-        post_signal(&self.thread, self.sig, self.info);
+        let routing = SignalRouting::ThreadDirected {
+            tid: self.thread.tid.0 as u64,
+        };
+        post_signal(&self.thread, self.sig, routing, self.info);
         crate::thread_runtime::adapter::step_engine::StepOutcome::Done(())
     }
 }

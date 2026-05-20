@@ -20,7 +20,7 @@ const OSCOMP_SDCARD_LA_URL: &str =
 pub(crate) fn oscomp(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {
         return Err(
-            "oscomp command needs doctor, prepare, submit, run, qemu, score, list-suites, or test"
+            "oscomp command needs doctor, prepare, submit, run, qemu, score, list-suites, test, or slim-sdcard"
                 .into(),
         );
     };
@@ -33,8 +33,9 @@ pub(crate) fn oscomp(root: &Path, args: Vec<String>) -> Result<()> {
         "score" => oscomp_score(root, &args[1..]),
         "list-suites" => oscomp_list_suites(root, &args[1..]),
         "test" => oscomp_test(root, &args[1..]),
+        "slim-sdcard" => oscomp_slim_sdcard(root, &args[1..]),
         other => Err(format!(
-            "unknown oscomp command '{other}', expected doctor, prepare, submit, run, qemu, score, list-suites, or test"
+            "unknown oscomp command '{other}', expected doctor, prepare, submit, run, qemu, score, list-suites, test, or slim-sdcard"
         )),
     }
 }
@@ -597,6 +598,52 @@ fn oscomp_test(root: &Path, args: &[String]) -> Result<()> {
     oscomp_score(root, args)?;
 
     Ok(())
+}
+
+/// Build a trimmed SD card image with only specified test suites/cases.
+///
+/// Options:
+///   `--suite SUITE`               Include a test suite (repeatable).
+///   `--ltp-cases CASE1,CASE2`     LTP cases to include (comma-separated).
+///   `--source IMG`                Source sdcard image (default: testdata/sdcard-rv.img).
+///   `--output IMG`                Output image path.
+///   `--size-mb N`                 Target image size in MB (default: 256).
+///   `--config FILE`               TOML config file.
+///   `--list-suites`               List available suites and exit.
+///   `--list-cases SUITE`          List cases for a suite and exit.
+fn oscomp_slim_sdcard(root: &Path, args: &[String]) -> Result<()> {
+    let script = root.join("tools").join("build-slim-sdcard.py");
+    if !script.exists() {
+        return Err(format!(
+            "missing {}; this command requires the Python helper script",
+            script.display()
+        ));
+    }
+
+    // Forward all arguments to the Python script, with --source defaulting
+    // to the canonical testdata sdcard path.
+    let data = oscomp_data_dir(root, args);
+    let default_source = data.join("sdcard-rv.img");
+
+    let mut cmd = Command::new("python3");
+    cmd.arg(&script).current_dir(root);
+
+    // If --source is not provided and default exists, add it
+    let has_source = args.iter().any(|a| a == "--source" || a == "-s");
+    if !has_source && default_source.exists() {
+        cmd.arg("--source").arg(&default_source);
+    }
+
+    for arg in args {
+        cmd.arg(arg);
+    }
+
+    let status = cmd.status().map_err(|e| format!("failed to run build-slim-sdcard.py: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("build-slim-sdcard.py exited with {status}"))
+    }
 }
 
 fn oscomp_data_dir(root: &Path, args: &[String]) -> PathBuf {
