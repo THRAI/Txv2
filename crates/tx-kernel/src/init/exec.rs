@@ -551,6 +551,13 @@ impl<P: TxPlatform> CoreInit<P> {
         );
     }
 
+    pub(crate) fn install_reactor_affinity_seam() {
+        tx_subsystems::reactor_affinity::install_thread_affinity(
+            Self::set_thread_reactor_affinity,
+            Self::get_thread_reactor_affinity,
+        );
+    }
+
     /// Install the timer-sleep seam so `sys_nanosleep` / `sys_clock_nanosleep`
     /// in `tx-shims` can park the calling task until a real deadline fires
     /// in the BSP reactor's timer queue. Must be called before the reactor
@@ -633,6 +640,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // the platform parameter `P` is captured at install time
         // here so the seam stays parameter-free at the call site.
         Self::install_reactor_submit_seam();
+        Self::install_reactor_affinity_seam();
         Self::install_sleep_seam();
 
         let Some(init) = tx_subsystems::process::execution::init_process() else {
@@ -663,10 +671,11 @@ impl<P: TxPlatform> CoreInit<P> {
                 &mut signal,
             )
         });
-        if submitted.is_none() {
+        let Some((task_key, _report)) = submitted else {
             // Boot reactor not initialised; nothing to drive.
             return;
-        }
+        };
+        Self::register_thread_reactor_task(thread.tid.0, task_key);
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:submitted\n");
 

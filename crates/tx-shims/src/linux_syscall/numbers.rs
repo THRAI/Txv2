@@ -321,6 +321,10 @@ pub const NR_SET_TID_ADDRESS: u64 = 96;
 /// (futex robust-list registration) is deferred to the futex slice
 /// (`TODO(phase-futex)`).
 pub const NR_SET_ROBUST_LIST: u64 = 99;
+/// `sched_setaffinity(pid, cpusetsize, mask)`. Linux generic ABI.
+pub const NR_SCHED_SETAFFINITY: u64 = 122;
+/// `sched_getaffinity(pid, cpusetsize, mask)`. Linux generic ABI.
+pub const NR_SCHED_GETAFFINITY: u64 = 123;
 
 // ---------------------------------------------------------------------
 // Wave 3 of the fork/clone/wait4 slice — Part 3 (NR_WAIT4 syscall arm

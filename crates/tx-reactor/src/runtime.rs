@@ -608,6 +608,15 @@ impl Reactor {
         Ok(report)
     }
 
+    pub fn task_affinity(&self, task: TaskKey) -> Result<u64, SchedulerAffinityError> {
+        if self.tasks.status(task).is_none() {
+            return Err(SchedulerAffinityError::UnknownTask);
+        }
+        self.scheduler
+            .task_affinity(task.id())
+            .ok_or(SchedulerAffinityError::UnknownTask)
+    }
+
     pub fn queue_ast_marker(
         &mut self,
         task: TaskKey,

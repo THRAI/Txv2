@@ -650,6 +650,7 @@ fn runtime_affinity_update_moves_queued_task_and_dispatches_remote_marker() {
     let report = reactor
         .set_task_affinity(task, 0b0010, HartId(0), &mut signal)
         .expect("affinity update");
+    assert_eq!(reactor.task_affinity(task), Ok(0b0010));
 
     assert_eq!(
         report,

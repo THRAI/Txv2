@@ -78,6 +78,8 @@ static MUSL_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
 /// `register_console_hardware`; consulted by
 /// `register_devfs_console_alias` to publish `/dev/console`.
 static CONSOLE_TTY: SpinMutex<Option<Cap<TtyIdentity>>> = SpinMutex::new(None);
+static THREAD_REACTOR_TASKS: SpinMutex<alloc::vec::Vec<(u32, boot_runtime::TaskKey)>> =
+    SpinMutex::new(alloc::vec::Vec::new());
 
 /// Snapshot the boot-time root mount cap. Returns `None` until
 /// `mount_rootfs_tmpfs` has run (test pre-bootstrap or boot-time
@@ -1691,6 +1693,56 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::queue_pending_child_submit(child_thread);
     }
 
+    fn register_thread_reactor_task(tid: u32, task: boot_runtime::TaskKey) {
+        let mut tasks = THREAD_REACTOR_TASKS.lock();
+        if let Some((_, existing)) = tasks
+            .iter_mut()
+            .find(|(existing_tid, _)| *existing_tid == tid)
+        {
+            *existing = task;
+        } else {
+            tasks.push((tid, task));
+        }
+    }
+
+    fn thread_reactor_task(tid: u32) -> Option<boot_runtime::TaskKey> {
+        THREAD_REACTOR_TASKS
+            .lock()
+            .iter()
+            .find(|(existing_tid, _)| *existing_tid == tid)
+            .map(|(_, task)| *task)
+    }
+
+    fn set_thread_reactor_affinity(
+        tid: u32,
+        affinity: u64,
+    ) -> Result<(), tx_subsystems::reactor_affinity::ReactorAffinityError> {
+        if affinity == 0 || (affinity & P::online_cpus().bits()) == 0 {
+            return Err(tx_subsystems::reactor_affinity::ReactorAffinityError::InvalidMask);
+        }
+        let task = Self::thread_reactor_task(tid)
+            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?;
+        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        let current_hart = boot_runtime::HartId(current_cpu.0);
+        let mut signal = SmpRescheduleSignal::<P>::new();
+        BOOT_REACTOR
+            .with(|reactor| reactor.set_task_affinity(task, affinity, current_hart, &mut signal))
+            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?
+            .map(|_| ())
+            .map_err(|_| tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)
+    }
+
+    fn get_thread_reactor_affinity(
+        tid: u32,
+    ) -> Result<u64, tx_subsystems::reactor_affinity::ReactorAffinityError> {
+        let task = Self::thread_reactor_task(tid)
+            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?;
+        BOOT_REACTOR
+            .with(|reactor| reactor.task_affinity(task))
+            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?
+            .map_err(|_| tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)
+    }
+
     /// Push a freshly-cloned child thread onto the deferred-submit
     /// queue. Called from sys_clone via the reactor-submission seam
     /// when the boot-reactor spin lock is already held by the
@@ -1718,8 +1770,9 @@ impl<P: TxPlatform> CoreInit<P> {
             let task_payload = payload.clone();
             let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
             let current_hart = boot_runtime::HartId(current_cpu.0);
+            let child_tid = child_thread.tid.0;
             let mut signal = SmpRescheduleSignal::<P>::new();
-            let _ = BOOT_REACTOR.with(|reactor| {
+            let submitted = BOOT_REACTOR.with(|reactor| {
                 reactor.submit_task_with_meta_from_hart(
                     crate::thread_future::PerHartSlotted::<P, _>::new(
                         task_payload.clone(),
@@ -1728,8 +1781,11 @@ impl<P: TxPlatform> CoreInit<P> {
                     Self::userspace_thread_sched_meta(),
                     current_hart,
                     &mut signal,
-                );
+                )
             });
+            if let Some((task_key, _report)) = submitted {
+                Self::register_thread_reactor_task(child_tid, task_key);
+            }
         }
     }
 }

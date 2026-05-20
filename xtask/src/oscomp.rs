@@ -447,7 +447,11 @@ fn oscomp_list_suites(root: &Path, args: &[String]) -> Result<()> {
     suites.sort();
 
     if let Some(target) = &target_filter {
-        let hint = if target.starts_with("la") { "-glibc" } else { "-musl" };
+        let hint = if target.starts_with("la") {
+            "-glibc"
+        } else {
+            "-musl"
+        };
         println!(
             "Suites in {} (primary variant for {target}: {hint}*):",
             data.display()
@@ -498,13 +502,20 @@ fn oscomp_test(root: &Path, args: &[String]) -> Result<()> {
         if !dry_run {
             crate::full_build::full_build(
                 root,
-                vec!["--target".into(), target_str.clone(), "--skip-doctor".into()],
+                vec![
+                    "--target".into(),
+                    target_str.clone(),
+                    "--skip-doctor".into(),
+                ],
             )?;
         }
     }
 
     // Step 2: copy kernel to submit dir
-    println!("==> copy kernel → {}", submit.join(kernel_dest_name).display());
+    println!(
+        "==> copy kernel → {}",
+        submit.join(kernel_dest_name).display()
+    );
     if !dry_run {
         fs::create_dir_all(&submit).map_err(|e| e.to_string())?;
         copy_kernel_for_oscomp(root, target, &submit.join(kernel_dest_name))?;

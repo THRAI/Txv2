@@ -412,6 +412,10 @@ impl Phase1Scheduler {
         self.meta_for(task).map(|meta| meta.total_runtime_ns)
     }
 
+    pub fn task_affinity(&self, task: TaskId) -> Option<u64> {
+        self.meta_for(task).map(|meta| meta.affinity)
+    }
+
     pub fn is_queued(&self, task: TaskId) -> bool {
         self.meta_for(task)
             .map(TaskSchedMeta::is_queued)
