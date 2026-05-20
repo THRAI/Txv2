@@ -977,6 +977,169 @@ fn namespace_runtime_masquerades_icmp_and_conntrack_dnat_reply() {
 }
 
 #[test]
+fn namespace_runtime_retries_masqueraded_forward_after_uplink_arp_resolution() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    reset_netfilter_for_test();
+
+    let guard = tx_substrate::epoch::guard();
+    let now = smoltcp::time::Instant::ZERO;
+    let host = crate::net::create_isolated_net_namespace_for_test("runtime-nat-arp-host")
+        .expect("host namespace")
+        .payload_cap()
+        .expect("host payload");
+    let container = crate::net::create_isolated_net_namespace_for_test("runtime-nat-arp-container")
+        .expect("container namespace")
+        .payload_cap()
+        .expect("container payload");
+    let gateway = crate::net::create_isolated_net_namespace_for_test("runtime-nat-arp-gateway")
+        .expect("gateway namespace")
+        .payload_cap()
+        .expect("gateway payload");
+    let bridge = new_test_bridge("docker-nat-arp0", 105);
+    let container_pair = new_bridge_veth_pair("eth-nat-arp0", "veth-nat-arp0", 105);
+    let uplink_pair = new_bridge_veth_pair("uplink-nat-arp0", "gw-nat-arp0", 106);
+
+    bridge
+        .device
+        .add_port_for_test_or_bootstrap(container_pair.right)
+        .expect("bridge port");
+    host.attach_device_for_test_or_bootstrap(bridge.registration, None)
+        .expect("attach docker0");
+    host.attach_device_for_test_or_bootstrap(container_pair.right, None)
+        .expect("attach host veth");
+    host.attach_device_for_test_or_bootstrap(uplink_pair.left, None)
+        .expect("attach uplink");
+    container
+        .attach_device_for_test_or_bootstrap(container_pair.left, None)
+        .expect("attach container eth");
+    gateway
+        .attach_device_for_test_or_bootstrap(uplink_pair.right, None)
+        .expect("attach gateway");
+
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    let docker_ip = Ipv4Address::new([172, 17, 0, 1]);
+    let container_ip = Ipv4Address::new([172, 17, 0, 2]);
+    let uplink_ip = Ipv4Address::new([10, 0, 2, 15]);
+    let gateway_ip = Ipv4Address::new([10, 0, 2, 2]);
+
+    let docker_ifindex = bridge_ifindex_for(&host.link_snapshot(), "docker-nat-arp0");
+    host.set_device_ipv4_addr_by_ifindex(auth, docker_ifindex, Some(docker_ip), Some(16))
+        .expect("set docker0 addr");
+    let uplink_ifindex = bridge_ifindex_for(&host.link_snapshot(), "uplink-nat-arp0");
+    host.set_device_ipv4_addr_by_ifindex(auth, uplink_ifindex, Some(uplink_ip), Some(24))
+        .expect("set uplink addr");
+    host.add_ipv4_route(
+        auth,
+        crate::net::NetNamespaceRouteConfig {
+            dst: Ipv4Address::UNSPECIFIED,
+            prefix_len: 0,
+            gateway: Some(gateway_ip),
+            oif_name: Some("uplink-nat-arp0"),
+            preferred_src: Some(uplink_ip),
+            table: 254,
+            protocol: 4,
+            scope: 0,
+            route_type: 1,
+        },
+    )
+    .expect("host default route");
+    host.set_ipv4_forwarding_for_test_or_bootstrap(true);
+    crate::net::netfilter::add_masquerade_rule_in_namespace_for_test_or_bootstrap(
+        &host,
+        NetfilterIpv4Cidr {
+            addr: Ipv4Address::new([172, 17, 0, 0]),
+            prefix_len: 16,
+        },
+        "uplink-nat-arp0",
+    )
+    .expect("masquerade rule");
+
+    let eth_ifindex = bridge_ifindex_for(&container.link_snapshot(), "eth-nat-arp0");
+    container
+        .set_device_ipv4_addr_by_ifindex(auth, eth_ifindex, Some(container_ip), Some(16))
+        .expect("set container addr");
+    container
+        .add_ipv4_route(
+            auth,
+            crate::net::NetNamespaceRouteConfig {
+                dst: Ipv4Address::UNSPECIFIED,
+                prefix_len: 0,
+                gateway: Some(docker_ip),
+                oif_name: Some("eth-nat-arp0"),
+                preferred_src: Some(container_ip),
+                table: 254,
+                protocol: 4,
+                scope: 0,
+                route_type: 1,
+            },
+        )
+        .expect("container default route");
+
+    let gw_ifindex = bridge_ifindex_for(&gateway.link_snapshot(), "gw-nat-arp0");
+    gateway
+        .set_device_ipv4_addr_by_ifindex(auth, gw_ifindex, Some(gateway_ip), Some(24))
+        .expect("set gateway addr");
+
+    let raw = match crate::net::step_socket_create_in_namespace(
+        ValidSocketType::validate(2, 3, 1).expect("AF_INET SOCK_RAW ICMP"),
+        container.clone(),
+        &guard,
+    ) {
+        StepOutcome::Done(socket) => socket,
+        other => panic!("raw icmp socket create failed: {other:?}"),
+    };
+    let echo = Icmpv4EchoPacket {
+        src: Ipv4Address::UNSPECIFIED,
+        dst: gateway_ip,
+        ident: 0x73e0,
+        seq_no: 1,
+        payload: b"nat-arp-forward".to_vec(),
+    };
+    let message = crate::net::protocol::build_icmpv4_echo_request_message(&echo);
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &raw,
+            Some(IpEndpoint::new(gateway_ip, 0)),
+            &message,
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(message.len())
+    );
+
+    let mut total = crate::net::NetNamespaceRuntimeOutcome::default();
+    let mut reply_buf = [0u8; 96];
+    let mut received = None;
+    for _ in 0..32 {
+        let outcome = crate::net::drive_all_net_namespace_runtimes_at(now, &guard);
+        total.merge(outcome);
+        if let StepOutcome::Done(recv) =
+            step_recv_kernel_bytes(&raw, &mut reply_buf, SendRecvFlags::empty(), &guard)
+        {
+            received = Some(recv.bytes);
+            break;
+        }
+    }
+
+    assert_eq!(received, Some(message.len()), "runtime outcome: {total:?}");
+    assert!(
+        total.ipv4_forward_pending_resolution >= 1,
+        "test should exercise egress ARP pending: {total:?}"
+    );
+    assert!(total.ipv4_forwarded >= 2, "runtime outcome: {total:?}");
+
+    let conntrack = crate::net::netfilter_conntrack_snapshot_for_namespace(&host);
+    assert_eq!(conntrack.len(), 1);
+    assert_eq!(conntrack[0].original_src, container_ip);
+    assert_eq!(conntrack[0].masquerade_src, uplink_ip);
+    assert_eq!(conntrack[0].external_dst, gateway_ip);
+}
+
+#[test]
 fn namespace_runtime_masquerades_udp_and_conntrack_dnat_reply() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
