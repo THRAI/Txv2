@@ -233,7 +233,7 @@ pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
     // pre-existing `SignalDelivered` events left over from a previous
     // sigtimedwait call on this same thread before the poll loop
     // starts; the per-iteration drain below handles new arrivals.
-    let mailbox_for_drain = crate::adapter::reactor_entry::current_task_mailbox();
+    let mailbox_for_drain = crate::adapter::reactor_entry::current_task_mailbox(0);
     if let Some(ref mbox) = mailbox_for_drain {
         drain_stale_signal_events(mbox);
     }
@@ -283,7 +283,7 @@ pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
         use tx_scripts::drive;
         let mut script_ctx = build_subject_script_ctx(ctx);
         let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-        let mailbox = current_task_mailbox();
+        let mailbox = current_task_mailbox(0);
         let op = super::NanosleepOp {
             nanos: chunk,
             deadline_ns: now_ns.saturating_add(chunk),
