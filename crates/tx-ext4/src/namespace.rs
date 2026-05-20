@@ -180,7 +180,11 @@ where
         // EXT4_FT_REG_FILE=1, EXT4_FT_DIR=2.
         let file_type = match self.with_pager(|pager| pager.inode_meta(old_ino)) {
             Ok(meta) => {
-                if meta.mode & 0xF000 == 0x4000 { 2u8 } else { 1u8 }
+                if meta.mode & 0xF000 == 0x4000 {
+                    2u8
+                } else {
+                    1u8
+                }
             }
             Err(e) => return StepOutcome::err(e.into()),
         };
@@ -191,9 +195,9 @@ where
         let _ = self.with_pager(|pager| pager.remove_dir_entry(new_parent_ino, new_name));
 
         // Install the new directory entry.
-        if let Err(e) =
-            self.with_pager(|pager| pager.append_dir_entry(new_parent_ino, new_name, old_ino, file_type))
-        {
+        if let Err(e) = self.with_pager(|pager| {
+            pager.append_dir_entry(new_parent_ino, new_name, old_ino, file_type)
+        }) {
             return StepOutcome::err(e.into());
         }
 

@@ -124,10 +124,7 @@ fn late_interesting_trap_overrides_timer_preemption() {
         .expect("interesting trap overrides soft timer preemption");
     assert_eq!(resolved.phase, UserspaceRunPhase::Resolved);
     assert_eq!(resolved.trap, Some(trap));
-    assert_eq!(
-        Pin::new(&mut wait).poll(&mut cx),
-        Poll::Ready(trap)
-    );
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(trap));
 }
 
 #[test]
