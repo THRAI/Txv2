@@ -151,7 +151,7 @@ fn dispatch_openat_proc_pid_ns_net_walks_intermediate_ns_directory() {
             panic!("parent process zombified")
         }
     }
-    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false)
+    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false)
         .expect("fork child process");
     let child_netns = child.net_namespace().expect("child net namespace");
     let thread = first_thread(&parent);
@@ -236,7 +236,7 @@ fn procfs_pid_ns_net_materialises_namespace_fd_payload() {
 fn procfs_non_init_pid_ns_net_does_not_collide_with_next_pid_ns_dir() {
     let _setup = setup();
     let parent = bootstrap();
-    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false)
+    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false)
         .expect("fork child process");
     let netns = child.net_namespace().expect("child net namespace");
     let procfs = tx_fs::procfs::Procfs::new();

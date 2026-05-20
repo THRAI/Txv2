@@ -1802,7 +1802,3 @@ impl StepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {
 }
 
 impl OneShotStepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {}
-
-#[cfg(test)]
-#[path = "step_op_wraps.rs"]
-mod step_op_wraps;
