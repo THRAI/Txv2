@@ -47,6 +47,8 @@ static NET_NAMESPACE_RUNTIME_LIST: SpinMutex<Vec<PayloadCap<NetNamespacePayload>
     SpinMutex::new(Vec::new());
 const NETNS_FS_OBJECT_ID_BASE: u64 = 0xFFFD_0000_0000_0000;
 static NEXT_NETNS_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(NETNS_FS_OBJECT_ID_BASE);
+const PENDING_IPV4_FORWARD_LIMIT: usize = 32;
+const PENDING_IPV4_FORWARD_RETRY_LIMIT: u8 = 8;
 
 pub struct NetNamespaceIdentity {
     name: &'static str,
@@ -62,6 +64,7 @@ pub struct NetNamespacePayload {
     iface_runtime: SpinMutex<Vec<NetNamespaceIfaceRuntime>>,
     netfilter: SpinMutex<NetfilterState>,
     ipv4_forwarding: AtomicBool,
+    pending_ipv4_forwards: SpinMutex<Vec<PendingIpv4Forward>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,6 +175,12 @@ struct NetNamespaceRouteEntry {
     route_type: u8,
 }
 
+struct PendingIpv4Forward {
+    egress_name: &'static str,
+    packet: Vec<u8>,
+    attempts: u8,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NetNamespaceForwardOutcome {
     pub forwarded: usize,
@@ -268,6 +277,7 @@ impl NetNamespacePayload {
             iface_runtime: SpinMutex::new(Vec::new()),
             netfilter: SpinMutex::new(NetfilterState::new()),
             ipv4_forwarding: AtomicBool::new(false),
+            pending_ipv4_forwards: SpinMutex::new(Vec::new()),
         }
     }
 
@@ -973,6 +983,7 @@ pub fn drive_net_namespace_runtime_at(
         }
     }
 
+    outcome.merge_forwarding(net_namespace.retry_pending_ipv4_forwards(now, guard));
     outcome.merge_bridge(net_namespace.poll_bridges(guard));
     outcome
 }
@@ -1117,15 +1128,99 @@ impl NetNamespacePayload {
                 forwarded: 1,
                 ..NetNamespaceForwardOutcome::default()
             },
-            PacketTxResult::PendingResolution { .. } => NetNamespaceForwardOutcome {
-                pending_resolution: 1,
-                ..NetNamespaceForwardOutcome::default()
-            },
+            PacketTxResult::PendingResolution { .. } => {
+                let queued = self.enqueue_pending_ipv4_forward(egress.name, packet);
+                NetNamespaceForwardOutcome {
+                    pending_resolution: usize::from(queued),
+                    dropped: usize::from(!queued),
+                    ..NetNamespaceForwardOutcome::default()
+                }
+            }
             PacketTxResult::Busy | PacketTxResult::Failed { .. } => NetNamespaceForwardOutcome {
                 dropped: 1,
                 ..NetNamespaceForwardOutcome::default()
             },
         }
+    }
+
+    fn enqueue_pending_ipv4_forward(&self, egress_name: &'static str, packet: &[u8]) -> bool {
+        let mut pending = self.pending_ipv4_forwards.lock();
+        if pending.len() >= PENDING_IPV4_FORWARD_LIMIT {
+            return false;
+        }
+        pending.push(PendingIpv4Forward {
+            egress_name,
+            packet: packet.to_vec(),
+            attempts: 0,
+        });
+        true
+    }
+
+    fn retry_pending_ipv4_forwards(
+        &self,
+        now: Instant,
+        guard: &Guard<'_>,
+    ) -> NetNamespaceForwardOutcome {
+        let mut current = {
+            let mut pending = self.pending_ipv4_forwards.lock();
+            if pending.is_empty() {
+                return NetNamespaceForwardOutcome::default();
+            }
+            let mut current = Vec::new();
+            core::mem::swap(&mut *pending, &mut current);
+            current
+        };
+
+        let ifaces = self.configured_ether_ifaces();
+        let mut keep = Vec::new();
+        let mut outcome = NetNamespaceForwardOutcome::default();
+
+        for mut forward in current.drain(..) {
+            let Some(egress) = ifaces
+                .iter()
+                .copied()
+                .find(|iface| iface.name == forward.egress_name)
+            else {
+                outcome.dropped += 1;
+                continue;
+            };
+
+            match egress.dispatch_ip_at(&forward.packet, now, guard) {
+                PacketTxResult::Accepted { .. } => {
+                    outcome.forwarded += 1;
+                }
+                PacketTxResult::PendingResolution { .. } => {
+                    forward.attempts = forward.attempts.saturating_add(1);
+                    if forward.attempts >= PENDING_IPV4_FORWARD_RETRY_LIMIT {
+                        outcome.dropped += 1;
+                    } else {
+                        outcome.pending_resolution += 1;
+                        keep.push(forward);
+                    }
+                }
+                PacketTxResult::Busy => {
+                    forward.attempts = forward.attempts.saturating_add(1);
+                    if forward.attempts >= PENDING_IPV4_FORWARD_RETRY_LIMIT {
+                        outcome.dropped += 1;
+                    } else {
+                        keep.push(forward);
+                    }
+                }
+                PacketTxResult::Failed { .. } => {
+                    outcome.dropped += 1;
+                }
+            }
+        }
+
+        if !keep.is_empty() {
+            let mut pending = self.pending_ipv4_forwards.lock();
+            let available = PENDING_IPV4_FORWARD_LIMIT.saturating_sub(pending.len());
+            let overflow = keep.len().saturating_sub(available);
+            pending.extend(keep.into_iter().take(available));
+            outcome.dropped += overflow;
+        }
+
+        outcome
     }
 
     fn is_local_ipv4_destination(&self, dst: Ipv4Address) -> bool {
