@@ -1338,7 +1338,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // See if entering BOOT_REACTOR.with creates a guard.
         let epoch_pre_with = crate::adapter::step_engine::epoch::summary();
         tx_hal::console_write_str::<P>(":diag:pre-boot-reactor-with:epoch=");
-        Self::write_decimal_unsigned(epoch_pre_with.current_epoch as usize);
+        Self::write_decimal_unsigned(epoch_pre_with.global_epoch as usize);
         tx_hal::console_write_str::<P>(":guards=");
         Self::write_decimal_unsigned(epoch_pre_with.active_guards);
         tx_hal::console_write_str::<P>("\n");
