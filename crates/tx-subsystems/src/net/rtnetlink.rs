@@ -40,6 +40,7 @@ pub const NLM_F_ACK: u16 = 0x0004;
 pub const NLM_F_ROOT: u16 = 0x0100;
 pub const NLM_F_MATCH: u16 = 0x0200;
 pub const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
+const NLM_F_CREATE: u16 = 0x0400;
 
 pub const NLMSG_ERROR: u16 = 2;
 pub const NLMSG_DONE: u16 = 3;
@@ -242,11 +243,16 @@ pub fn netlink_route_recv(
     let response = raw.pop_response(peek).ok_or(Errno::EAGAIN)?;
     let copied = core::cmp::min(out.len(), response.len());
     out[..copied].copy_from_slice(&response[..copied]);
+    let reported = if flags.contains(SendRecvFlags::MSG_TRUNC) {
+        response.len()
+    } else {
+        copied
+    };
     payload.refresh_io_from_raw();
     if !peek && raw.is_empty() {
         socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
     }
-    Ok(copied)
+    Ok(reported)
 }
 
 pub fn rtnetlink_handle_request(
@@ -341,7 +347,7 @@ fn handle_one_message<F>(
 {
     match header.kind {
         RTM_GETLINK => {
-            for msg in render_getlink_dump(netns, header) {
+            for msg in render_getlink(netns, header, payload) {
                 responses.push(msg);
             }
         }
@@ -361,7 +367,14 @@ fn handle_one_message<F>(
             }
         }
         RTM_NEWLINK => {
-            let result = handle_newlink(netns, cred, payload);
+            let result = handle_newlink(
+                netns,
+                cred,
+                header,
+                payload,
+                resolve_netns_fd,
+                resolve_netns_pid,
+            );
             responses.push(ack_or_error(header, result));
         }
         RTM_DELLINK => {
@@ -386,6 +399,32 @@ fn handle_one_message<F>(
         }
         _ => responses.push(build_error_response(Some(header), Errno::EOPNOTSUPP)),
     }
+}
+
+fn render_getlink(
+    netns: &NetNamespacePayload,
+    header: NlMsgHeader,
+    payload: &[u8],
+) -> Vec<Vec<u8>> {
+    if header.flags & NLM_F_DUMP == NLM_F_DUMP {
+        return render_getlink_dump(netns, header);
+    }
+
+    let snapshot = netns.network_snapshot();
+    let target = match parse_ifinfomsg(payload)
+        .and_then(|info| link_target_from_info_or_attrs(netns, &info, &info.attrs))
+    {
+        Ok(target) => target,
+        Err(errno) => return alloc::vec![build_error_response(Some(header), errno)],
+    };
+    alloc::vec![build_link_message(
+        header.seq,
+        header.pid,
+        RTM_NEWLINK,
+        0,
+        &target,
+        &snapshot.links,
+    )]
 }
 
 fn render_getlink_dump(netns: &NetNamespacePayload, header: NlMsgHeader) -> Vec<Vec<u8>> {
@@ -461,12 +500,26 @@ fn render_getneigh_dump(netns: &NetNamespacePayload, header: NlMsgHeader) -> Vec
     out
 }
 
-fn handle_newlink(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Result<(), Errno> {
+fn handle_newlink<F>(
+    netns: &NetNamespacePayload,
+    cred: Cred,
+    header: NlMsgHeader,
+    payload: &[u8],
+    resolve_netns_fd: &mut F,
+    resolve_netns_pid: &mut impl FnMut(u32) -> Option<PayloadCap<NetNamespacePayload>>,
+) -> Result<(), Errno>
+where
+    F: FnMut(i32) -> Option<PayloadCap<NetNamespacePayload>>,
+{
+    let info = parse_ifinfomsg(payload)?;
+    let link_info = parse_linkinfo(&info.attrs)?;
+    if header.flags & NLM_F_CREATE == 0 && link_info.kind.is_none() {
+        return apply_setlink_info(netns, cred, info, resolve_netns_fd, resolve_netns_pid);
+    }
+
     let auth = require_net_admin(cred)?;
-    let attrs = parse_ifinfomsg(payload)?.attrs;
-    let name = attr_string(&attrs, IFLA_IFNAME).ok_or(Errno::EINVAL)?;
+    let name = attr_string(&info.attrs, IFLA_IFNAME).ok_or(Errno::EINVAL)?;
     validate_ifname(name)?;
-    let link_info = parse_linkinfo(&attrs)?;
 
     match link_info.kind {
         Some("bridge") => create_bridge_link(netns, auth, name),
@@ -499,8 +552,21 @@ fn handle_setlink<F>(
 where
     F: FnMut(i32) -> Option<PayloadCap<NetNamespacePayload>>,
 {
-    let auth = require_net_admin(cred)?;
     let info = parse_ifinfomsg(payload)?;
+    apply_setlink_info(netns, cred, info, resolve_netns_fd, resolve_netns_pid)
+}
+
+fn apply_setlink_info<F>(
+    netns: &NetNamespacePayload,
+    cred: Cred,
+    info: IfInfoMsg<'_>,
+    resolve_netns_fd: &mut F,
+    resolve_netns_pid: &mut impl FnMut(u32) -> Option<PayloadCap<NetNamespacePayload>>,
+) -> Result<(), Errno>
+where
+    F: FnMut(i32) -> Option<PayloadCap<NetNamespacePayload>>,
+{
+    let auth = require_net_admin(cred)?;
 
     let target = link_target_from_info_or_attrs(netns, &info, &info.attrs)?;
 

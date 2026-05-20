@@ -521,14 +521,15 @@ pub(super) async fn sys_recvfrom<'a, P: TimeIf>(
     if file.flags().nonblocking {
         flags |= SendRecvFlags::MSG_DONTWAIT;
     }
-    if len == 0 {
+    let is_netlink_socket = matches!(
+        socket.kind,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
+    );
+    if len == 0 && !(is_netlink_socket && flags.contains(SendRecvFlags::MSG_TRUNC)) {
         return SyscallResult::Return(0);
     }
 
-    if matches!(
-        socket.kind,
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
-    ) {
+    if is_netlink_socket {
         let mut staging = alloc::vec![0; len.min(NETLINK_RECVMSG_MAX)];
         let result = match socket.kind {
             SocketKind::NetlinkRoute => netlink_route_recv(&socket, &mut staging, flags),
@@ -539,8 +540,9 @@ pub(super) async fn sys_recvfrom<'a, P: TimeIf>(
             Ok(recv) => recv,
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         };
-        if recv > 0 {
-            if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, args[1], &staging[..recv]) {
+        let copied = core::cmp::min(recv, staging.len());
+        if copied > 0 {
+            if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, args[1], &staging[..copied]) {
                 return SyscallResult::Error(errno_to_i32(errno));
             }
         }
@@ -803,14 +805,15 @@ pub(super) async fn sys_recvmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     if let Err(errno) = write_msghdr_controllen(ctx, args[1], 0) {
         return SyscallResult::Error(errno_to_i32(errno));
     }
-    if total_len == 0 {
+    let is_netlink_socket = matches!(
+        socket.kind,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
+    );
+    if total_len == 0 && !(is_netlink_socket && flags.contains(SendRecvFlags::MSG_TRUNC)) {
         return SyscallResult::Return(0);
     }
 
-    if matches!(
-        socket.kind,
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
-    ) {
+    if is_netlink_socket {
         let mut staging = alloc::vec![0; total_len];
         let result = match socket.kind {
             SocketKind::NetlinkRoute => netlink_route_recv(&socket, &mut staging, flags),
@@ -821,8 +824,16 @@ pub(super) async fn sys_recvmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
             Ok(recv) => recv,
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         };
-        if recv > 0 {
-            if let Err(errno) = scatter_to_iovecs(ctx, &iovecs, &staging[..recv]) {
+        let copied = core::cmp::min(recv, staging.len());
+        if copied > 0 {
+            if let Err(errno) = scatter_to_iovecs(ctx, &iovecs, &staging[..copied]) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
+        if recv > copied {
+            if let Err(errno) =
+                write_msghdr_flags(ctx, args[1], SendRecvFlags::MSG_TRUNC.bits() as u32)
+            {
                 return SyscallResult::Error(errno_to_i32(errno));
             }
         }

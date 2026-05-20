@@ -279,11 +279,16 @@ pub fn netlink_netfilter_recv(
     let response = raw.pop_response(peek).ok_or(Errno::EAGAIN)?;
     let copied = core::cmp::min(out.len(), response.len());
     out[..copied].copy_from_slice(&response[..copied]);
+    let reported = if flags.contains(SendRecvFlags::MSG_TRUNC) {
+        response.len()
+    } else {
+        copied
+    };
     payload.refresh_io_from_raw();
     if !peek && raw.is_empty() {
         socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
     }
-    Ok(copied)
+    Ok(reported)
 }
 
 pub fn nfnetlink_handle_request(request: &[u8]) -> Vec<Vec<u8>> {
