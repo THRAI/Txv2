@@ -22,7 +22,7 @@ use crate::process::topology::{
 };
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::thread_runtime::execution::set_thread_zombie;
-use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload};
+use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload, Tid};
 use crate::vfs::OpenFile;
 use crate::vm::{AddressSpace, VmMapError};
 
@@ -32,8 +32,7 @@ use crate::vm::{AddressSpace, VmMapError};
 
 use crate::process::numbers::{
     allocate_pid, register_pid as ns_register_pid, register_tid, resolve_pid_number,
-    unregister_pid_number,
-    with_namespace, PidName, PidNameKind,
+    unregister_pid_number, with_namespace, PidName, PidNameKind,
 };
 
 /// Register a process pid → Cap binding. The Cap must be fully
@@ -263,7 +262,7 @@ pub fn bootstrap_init_process(
     pgrp.members.attach(proc_cap.downgrade());
     pgrp.session.members.attach(pgrp.downgrade());
 
-    let leader = sign_thread(proc_cap.downgrade())?;
+    let leader = sign_thread(proc_cap.downgrade(), Tid(pid.0))?;
     // Day-1: init has no cwd until a rootfs is mounted and an
     // initial chdir runs. Future EXEC_v1 / first-userspace lands
     // a synthesized "/" DEntry and threads it through here.
@@ -397,8 +396,7 @@ pub fn step_fork<P: PmapIf>(
     register_pid(child_pid, child_proc.clone());
 
     // Leader thread.
-    let leader = sign_thread(child_proc.downgrade()).map_err(ForkError::Zone)?;
-    register_tid(leader.tid, leader.clone());
+    let leader = sign_thread(child_proc.downgrade(), Tid(child_pid.0)).map_err(ForkError::Zone)?;
 
     // Wire up payload — child inherits parent credentials, cwd, and
     // a per-slot clone of the parent's fd table. POSIX: fork copies
@@ -579,7 +577,9 @@ pub fn step_clone_thread(
     tls: usize,
     ctid_ptr: u64,
 ) -> Result<Cap<ThreadIdentity>, ZoneError> {
-    let child = sign_thread(process.downgrade())?;
+    let tid = allocate_tid();
+    let child = sign_thread(process.downgrade(), tid)?;
+    register_tid(child.tid, child.clone());
     seed_child_leader_context(&child, parent_user_ctx, tls, stack);
     if ctid_ptr != 0 {
         let payload = child
@@ -620,6 +620,7 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
         let drained: Vec<Cap<ThreadIdentity>> = payload.threads.drain();
         for thread in &drained {
             set_thread_zombie(thread, status.wait_status_word());
+            unregister_pid_number(thread.tid.0 as u64);
         }
         // `_closed_fds` and `drained` drop here, releasing open-file and
         // thread refs before the payload is detached below.
@@ -1181,8 +1182,10 @@ fn sign_process_payload(
     Ok(PayloadCap::from_cap(cap))
 }
 
-fn sign_thread(owner_proc: Weak<ProcessIdentity>) -> Result<Cap<ThreadIdentity>, ZoneError> {
-    let tid = allocate_tid();
+fn sign_thread(
+    owner_proc: Weak<ProcessIdentity>,
+    tid: Tid,
+) -> Result<Cap<ThreadIdentity>, ZoneError> {
     let payload_cap = step_engine::sign(ThreadPayload::fresh())?;
     let payload = PayloadCap::from_cap(payload_cap);
     step_engine::sign(ThreadIdentity {
@@ -1208,7 +1211,9 @@ fn sign_thread(owner_proc: Weak<ProcessIdentity>) -> Result<Cap<ThreadIdentity>,
 pub fn spawn_sibling_thread_for_test(
     target: &Cap<ProcessIdentity>,
 ) -> Result<Cap<ThreadIdentity>, ZoneError> {
-    let sibling = sign_thread(target.downgrade())?;
+    let tid = allocate_tid();
+    let sibling = sign_thread(target.downgrade(), tid)?;
+    register_tid(sibling.tid, sibling.clone());
     if let Some(payload) = target.payload.lock().as_ref() {
         payload.threads.attach(sibling.clone());
     }

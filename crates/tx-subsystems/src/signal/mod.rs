@@ -836,7 +836,7 @@ pub fn step_kill_process(
         target.siginfo_store(sig, *sinfo);
     }
 
-    post_signal(&chosen, sig, info);
+    post_signal(&chosen, sig, SignalRouting::ProcessDirected, info);
 
     // D9-D: fan out to every per-process signalfd subscription whose
     // mask covers `sig`. Runs *after* the thread-eligibility post —

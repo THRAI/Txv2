@@ -351,6 +351,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // correctly — avoids any kernel-side VFS walk at this stage.
         // DIAGNOSTIC: emit epoch state right before the sdcard exec to
         // identify whether a guard leak pre-dates drive_bootstrap_exec.
+/*
         {
             let es = crate::adapter::step_engine::epoch::summary();
             let cpu0 = crate::adapter::step_engine::epoch::cpu_summary(tx_hal::CpuId(0));
@@ -363,6 +364,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::write_decimal_unsigned(cpu0.map(|c| c.local_epoch as usize).unwrap_or(999));
             tx_hal::console_write_str::<P>("\n");
         }
+*/
 
         let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
         let sdcard_boot = boot_info.initrd.is_none() && boot_info.cmdline.is_none();
@@ -653,8 +655,8 @@ impl<P: TxPlatform> CoreInit<P> {
         // Perfetto rejects later TrackDescriptors that change a
         // track's `parent_uuid`, so the metadata must arrive ahead
         // of the first dispatch.
-        emit_process_label::<P>(pid_low, &comm);
-        emit_process_group::<P>(pid_low, pgid_low, sid_low);
+        emit_process_label(pid_low, &comm);
+        emit_process_group(pid_low, pgid_low, sid_low);
         let submitted = BOOT_REACTOR.with(|reactor| {
             reactor.submit_task_with_meta(
                 crate::thread_future::PerHartSlotted::<P, _>::new(
@@ -671,6 +673,8 @@ impl<P: TxPlatform> CoreInit<P> {
             // Boot reactor not initialised; nothing to drive.
             return;
         }
+        /*
+/*
         {
             let es = crate::adapter::step_engine::epoch::summary();
             let cpu0 = crate::adapter::step_engine::epoch::cpu_summary(tx_hal::CpuId(0));
@@ -681,6 +685,8 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::write_decimal_unsigned(cpu0.map(|c| c.local_epoch as usize).unwrap_or(999));
             tx_hal::console_write_str::<P>("\n");
         }
+*/
+        */
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:submitted\n");
 
@@ -700,6 +706,8 @@ impl<P: TxPlatform> CoreInit<P> {
             // wake, and the resulting callback may acquire a second
             // guard → epoch nesting panic.
             crate::irq::clear_uart_rx_pending();
+            /*
+/*
             {
                 let es = crate::adapter::step_engine::epoch::summary();
                 Self::write_board_sentinel_prefix();
@@ -707,6 +715,8 @@ impl<P: TxPlatform> CoreInit<P> {
                 Self::write_decimal_unsigned(es.active_guards);
                 tx_hal::console_write_str::<P>("\n");
             }
+*/
+            */
             if init.is_zombie() {
                 break;
             }
@@ -719,6 +729,8 @@ impl<P: TxPlatform> CoreInit<P> {
             if Self::drain_pending_uart_rx_into_tty() != 0 {
                 continue;
             }
+            /*
+/*
             {
                 let es = crate::adapter::step_engine::epoch::summary();
                 Self::write_board_sentinel_prefix();
@@ -726,9 +738,13 @@ impl<P: TxPlatform> CoreInit<P> {
                 Self::write_decimal_unsigned(es.active_guards);
                 tx_hal::console_write_str::<P>("\n");
             }
+*/
+            */
             if Self::drain_sbi_console_into_tty() != 0 {
                 continue;
             }
+            /*
+/*
             {
                 let es = crate::adapter::step_engine::epoch::summary();
                 Self::write_board_sentinel_prefix();
@@ -736,6 +752,8 @@ impl<P: TxPlatform> CoreInit<P> {
                 Self::write_decimal_unsigned(es.active_guards);
                 tx_hal::console_write_str::<P>("\n");
             }
+*/
+            */
 
             // Drain any pending child-thread submits posted from
             // sys_clone *before* polling the reactor again. This is
@@ -744,6 +762,8 @@ impl<P: TxPlatform> CoreInit<P> {
             // reactor here, outside the inner lock that sys_clone
             // ran under.
             Self::drain_pending_child_submits();
+            /*
+/*
             {
                 let es = crate::adapter::step_engine::epoch::summary();
                 Self::write_board_sentinel_prefix();
@@ -751,10 +771,14 @@ impl<P: TxPlatform> CoreInit<P> {
                 Self::write_decimal_unsigned(es.active_guards);
                 tx_hal::console_write_str::<P>("\n");
             }
+*/
+            */
+            /*
             // Diagnostic: queue depths after child-thread drain.
             {
-                let depths = BOOT_REACTOR
-                    .with(|r| r.queue_depths(boot_runtime::HartId(current_cpu.0)));
+                let depths =
+                    BOOT_REACTOR.with(|r| r.queue_depths(boot_runtime::HartId(current_cpu.0)));
+/*
                 if let Some(d) = depths {
                     Self::write_board_sentinel_prefix();
                     tx_hal::console_write_str::<P>(":diag:loop:queue k=");
@@ -765,13 +789,17 @@ impl<P: TxPlatform> CoreInit<P> {
                     Self::write_decimal_unsigned(d.preempted);
                     tx_hal::console_write_str::<P>("\n");
                 }
+*/
             }
+            */
 
             let step = match Self::step_boot_reactor_once(current_cpu) {
                 Some(step) => step,
                 None => break,
             };
+            /*
             // Diagnostic: step stats.
+/*
             {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":diag:loop:step polled=");
@@ -782,6 +810,8 @@ impl<P: TxPlatform> CoreInit<P> {
                 tx_hal::console_write_str::<P>(if step.should_idle() { "y" } else { "n" });
                 tx_hal::console_write_str::<P>("\n");
             }
+*/
+            */
 
             // EBR drain. Caps retired during the task polls above
             // (e.g. `Cap<OpenFile>` from `sys_close` / process exit fd

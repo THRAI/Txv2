@@ -34,3 +34,7 @@ tx-services = { path = "../tx-services" }
 
 [dev-dependencies]
 tx-subsystems = { path = "../tx-subsystems", features = ["test-support"] }
+
+[features]
+test-support = []
+

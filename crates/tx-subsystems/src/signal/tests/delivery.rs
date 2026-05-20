@@ -2,7 +2,7 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use crate::process::{bootstrap_init_process, ExitStatus, ProcessIdentity};
-use crate::signal::adapter::step_engine::Cap;
+use crate::signal::adapter::step_engine::{Cap, SignalRouting};
 use crate::signal::{
     ast_check, default_action, select_next_signal, step_kill_process, step_sigaction, AstOutcome,
     DefaultAction, InterruptSummary, KillOutcome, PendingSource, SigDisposition, SignalTarget,
@@ -83,9 +83,24 @@ fn select_picks_lowest_signum_from_thread_pending() {
     let _g = setup();
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
-    post_signal(&leader, Signum::SIGTERM, None);
-    post_signal(&leader, Signum::SIGINT, None);
-    post_signal(&leader, Signum::SIGCHLD, None);
+    post_signal(
+        &leader,
+        Signum::SIGTERM,
+        SignalRouting::ProcessDirected,
+        None,
+    );
+    post_signal(
+        &leader,
+        Signum::SIGINT,
+        SignalRouting::ProcessDirected,
+        None,
+    );
+    post_signal(
+        &leader,
+        Signum::SIGCHLD,
+        SignalRouting::ProcessDirected,
+        None,
+    );
 
     // SIGINT (2) beats SIGTERM (15) and SIGCHLD (17).
     assert_eq!(
@@ -99,8 +114,18 @@ fn select_skips_masked_signals() {
     let _g = setup();
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
-    post_signal(&leader, Signum::SIGINT, None);
-    post_signal(&leader, Signum::SIGTERM, None);
+    post_signal(
+        &leader,
+        Signum::SIGINT,
+        SignalRouting::ProcessDirected,
+        None,
+    );
+    post_signal(
+        &leader,
+        Signum::SIGTERM,
+        SignalRouting::ProcessDirected,
+        None,
+    );
 
     let mut block = SignalMask::EMPTY;
     block.block(Signum::SIGINT);
@@ -121,7 +146,12 @@ fn select_prefers_thread_pending_over_group_pending() {
 
     // SIGTERM on thread queue, SIGINT on group queue. Thread
     // priority means SIGTERM wins despite higher signum.
-    post_signal(&leader, Signum::SIGTERM, None);
+    post_signal(
+        &leader,
+        Signum::SIGTERM,
+        SignalRouting::ProcessDirected,
+        None,
+    );
     proc_cap
         .payload
         .lock()
@@ -146,7 +176,12 @@ fn select_returns_none_when_all_masked_or_empty() {
     assert_eq!(select_next_signal(&leader), None);
 
     // All masked: None.
-    post_signal(&leader, Signum::SIGINT, None);
+    post_signal(
+        &leader,
+        Signum::SIGINT,
+        SignalRouting::ProcessDirected,
+        None,
+    );
     let mut block = SignalMask::EMPTY;
     block.block(Signum::SIGINT);
     let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
@@ -211,7 +246,12 @@ fn ast_check_default_terminate_for_sigterm() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    post_signal(&leader, Signum::SIGTERM, None);
+    post_signal(
+        &leader,
+        Signum::SIGTERM,
+        SignalRouting::ProcessDirected,
+        None,
+    );
     assert_eq!(
         ast_check(&leader),
         AstOutcome::DefaultTerminate {
@@ -226,7 +266,12 @@ fn ast_check_default_ignore_for_sigchld_drops_and_continues() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    post_signal(&leader, Signum::SIGCHLD, None);
+    post_signal(
+        &leader,
+        Signum::SIGCHLD,
+        SignalRouting::ProcessDirected,
+        None,
+    );
     assert_eq!(ast_check(&leader), AstOutcome::Continue);
     // SIGCHLD was dequeued during the loop, even though dropped.
     let pending = leader
@@ -245,7 +290,12 @@ fn ast_check_default_stop_for_sigtstp() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    post_signal(&leader, Signum::SIGTSTP, None);
+    post_signal(
+        &leader,
+        Signum::SIGTSTP,
+        SignalRouting::ProcessDirected,
+        None,
+    );
     assert_eq!(
         ast_check(&leader),
         AstOutcome::DefaultStop {
@@ -269,7 +319,12 @@ fn ast_check_deliver_handler_when_handler_installed() {
     let leader = leader(&proc_cap);
 
     let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Handler(0xCAFE));
-    post_signal(&leader, Signum::SIGTERM, None);
+    post_signal(
+        &leader,
+        Signum::SIGTERM,
+        SignalRouting::ProcessDirected,
+        None,
+    );
 
     assert_eq!(
         ast_check(&leader),
@@ -287,7 +342,12 @@ fn ast_check_silent_ignore_disposition_drops_and_continues() {
     let leader = leader(&proc_cap);
 
     let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Ignore);
-    post_signal(&leader, Signum::SIGTERM, None);
+    post_signal(
+        &leader,
+        Signum::SIGTERM,
+        SignalRouting::ProcessDirected,
+        None,
+    );
 
     // Ignore disposition: the loop dequeues + drops, then sees an
     // empty queue and returns Continue.
@@ -305,7 +365,12 @@ fn post_signal_marks_deliverable_when_unmasked() {
     let summary_before = leader.payload.lock().as_ref().unwrap().interrupt_summary();
     assert!(!summary_before.deliverable_signal);
 
-    post_signal(&leader, Signum::SIGINT, None);
+    post_signal(
+        &leader,
+        Signum::SIGINT,
+        SignalRouting::ProcessDirected,
+        None,
+    );
 
     let summary_after = leader.payload.lock().as_ref().unwrap().interrupt_summary();
     assert!(summary_after.deliverable_signal);
@@ -322,7 +387,12 @@ fn post_signal_skips_summary_deliverable_when_masked() {
     block.block(Signum::SIGINT);
     let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
 
-    post_signal(&leader, Signum::SIGINT, None);
+    post_signal(
+        &leader,
+        Signum::SIGINT,
+        SignalRouting::ProcessDirected,
+        None,
+    );
 
     let summary = leader.payload.lock().as_ref().unwrap().interrupt_summary();
     assert!(
@@ -342,7 +412,12 @@ fn sigprocmask_unblock_sets_deliverable_for_already_pending() {
     let mut block = SignalMask::EMPTY;
     block.block(Signum::SIGINT);
     let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
-    post_signal(&leader, Signum::SIGINT, None);
+    post_signal(
+        &leader,
+        Signum::SIGINT,
+        SignalRouting::ProcessDirected,
+        None,
+    );
     assert!(
         !leader
             .payload
@@ -516,7 +591,12 @@ fn ast_dispatch_default_terminate_zombifies_owner_with_signum() {
     // SIGTERM with default disposition → AstOutcome::DefaultTerminate.
     // ast_dispatch should invoke step_exit_group_with_signal so
     // the process zombifies with terminating_signal=Some(SIGTERM).
-    post_signal(&leader, Signum::SIGTERM, None);
+    post_signal(
+        &leader,
+        Signum::SIGTERM,
+        SignalRouting::ProcessDirected,
+        None,
+    );
     let outcome = crate::signal::ast_dispatch(&leader);
 
     assert_eq!(
@@ -559,7 +639,12 @@ fn ast_dispatch_default_stop_recognised_but_unrealised() {
     let leader = leader(&proc_cap);
 
     // SIGTSTP is catchable; default action is Stop.
-    post_signal(&leader, Signum::SIGTSTP, None);
+    post_signal(
+        &leader,
+        Signum::SIGTSTP,
+        SignalRouting::ProcessDirected,
+        None,
+    );
     let outcome = crate::signal::ast_dispatch(&leader);
 
     assert_eq!(
@@ -580,7 +665,12 @@ fn ast_dispatch_deliver_handler_recognised_but_unrealised() {
     let leader = leader(&proc_cap);
 
     let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Handler(0xFEED));
-    post_signal(&leader, Signum::SIGTERM, None);
+    post_signal(
+        &leader,
+        Signum::SIGTERM,
+        SignalRouting::ProcessDirected,
+        None,
+    );
 
     let outcome = crate::signal::ast_dispatch(&leader);
     assert_eq!(
