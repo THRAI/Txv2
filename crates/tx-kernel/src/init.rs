@@ -1332,6 +1332,11 @@ impl<P: TxPlatform> CoreInit<P> {
         let hart = boot_runtime::HartId(cpu_id.0);
         let now_ns = P::read_ns();
         let mut signal = SmpRescheduleSignal::<P>::new();
+        // Force a guard acquire+drop to advance the epoch and clear
+        // any stale local_epoch state that may have leaked from a
+        // prior reactor step or PreemptionPoint::consume epoch::try_advance.
+        drop(step_engine::guard());
+
         let step = BOOT_REACTOR.with(|reactor| {
             boot_runtime::hart_loop::step_hart_loop_at(reactor, hart, now_ns, &mut signal)
         })?;
