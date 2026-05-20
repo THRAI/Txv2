@@ -376,6 +376,13 @@ impl<P: TxPlatform> CoreInit<P> {
             // All testcode.sh scripts expect CWD = their own directory
             // and use `./busybox` for echo/cat etc., so we `cd` first.
             let sdcard_bin = b"/musl/musl/busybox";
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":oscomp:groups:");
+            match oscomp_groups_from_cmdline::<P>() {
+                Some(groups) => tx_hal::console_write_str::<P>(groups),
+                None => tx_hal::console_write_str::<P>("default"),
+            }
+            tx_hal::console_write_str::<P>("\n");
             let sdcard_cmd = build_oscomp_sdcard_cmd::<P>();
             let sdcard_envp: &[&[u8]] = &[b"PATH=/musl/glibc:/musl/musl"];
             let sdcard_argv: &[&[u8]] = &[b"sh", b"-c", sdcard_cmd.as_bytes()];
@@ -846,13 +853,20 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
 }
 
 fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
-    let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline?;
-    for token in cmdline.split_ascii_whitespace() {
-        if let Some(groups) = token.strip_prefix("tx.oscomp.groups=") {
-            return Some(groups);
+    if let Some(cmdline) = <P as tx_hal::BootInfoIf>::boot_info().cmdline {
+        for token in cmdline.split_ascii_whitespace() {
+            if let Some(groups) = token.strip_prefix("tx.oscomp.groups=") {
+                if !groups.trim().is_empty() {
+                    return Some(groups);
+                }
+            }
         }
     }
-    None
+
+    match option_env!("TX_OSCOMP_GROUPS") {
+        Some(groups) if !groups.trim().is_empty() => Some(groups),
+        _ => None,
+    }
 }
 
 fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {

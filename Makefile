@@ -7,6 +7,8 @@ DOCKER_COMPOSE ?= docker compose -f docker-compose.yml
 DOCKER_SERVICE ?= oscomp
 DOCKER_RUN = $(DOCKER_COMPOSE) run --rm $(DOCKER_SERVICE)
 DOCKER_RUN_IT = $(DOCKER_COMPOSE) run --rm -it $(DOCKER_SERVICE)
+DOCKER_BUILD_ENV = $(if $(strip $(OSCOMP_GROUPS)),-e TX_OSCOMP_GROUPS=$(OSCOMP_GROUPS),)
+DOCKER_RUN_BUILD = $(DOCKER_COMPOSE) run --rm $(DOCKER_BUILD_ENV) $(DOCKER_SERVICE)
 
 OSCOMP_DATA ?= target/oscomp/testdata
 OSCOMP_SUBMIT ?= target/oscomp/submit
@@ -60,10 +62,10 @@ docker-ci-slow:
 	$(DOCKER_RUN) cargo xtask ci-slow
 
 docker-build-rv64:
-	$(DOCKER_RUN) cargo xtask build --target rv64-qemu
+	$(DOCKER_RUN_BUILD) cargo xtask build --target rv64-qemu
 
 docker-build-la64:
-	$(DOCKER_RUN) cargo xtask build --target la64-qemu
+	$(DOCKER_RUN_BUILD) cargo xtask build --target la64-qemu
 
 docker-image-cpio-rv64:
 	$(DOCKER_RUN) cargo xtask image cpio --profile busybox --target rv64-qemu

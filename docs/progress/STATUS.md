@@ -1,3 +1,19 @@
+- 2026-05-20 **Fixed targeted LA64 OSComp group selection.**
+  `make oscomp-local-la64-libctest-musl-smp4` previously expanded to a QEMU
+  command with `-append 'tx.oscomp.groups=libctest-musl'`, but LA64 did not
+  reliably surface that QEMU append string through `BootInfo::cmdline`, so the
+  kernel fell back to the default full OSComp musl script chain and started at
+  `basic-musl`. Added a build-time fallback, `TX_OSCOMP_GROUPS`, wired through
+  the Docker build wrapper whenever `OSCOMP_GROUPS` is set. The runtime parser
+  still prefers the real boot cmdline when present, then falls back to the
+  build-time value. Added a boot log line `:oscomp:groups:<value>` so targeted
+  runs visibly show what the kernel selected.
+  **Verified:** `make -n oscomp-local-la64-libctest-musl-smp4`; `make -n
+  oscomp-local-rv64-libctest-musl-smp4`; `cargo fmt --check`; `git diff
+  --check`; `make docker-build-la64 OSCOMP_GROUPS=libctest-musl`; bounded
+  LA64 SMP4 QEMU run printed `txkernel:qemu-loongarch64-virt:oscomp:groups:libctest-musl`
+  and started with `#### OS COMP TEST GROUP START libctest-musl ####`.
+
 - 2026-05-20 **Added OSComp sdcard testcase export.**
   Added `tools/oscomp-extract-testcase.sh` and the Makefile target
   `make oscomp-export-testcase`. The target extracts Txv2's current official
