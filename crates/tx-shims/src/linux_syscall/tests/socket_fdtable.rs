@@ -316,6 +316,50 @@ fn dispatch_netlink_route_bind_accepts_sockaddr_nl() {
 }
 
 #[test]
+fn dispatch_netlink_netfilter_getsockname_returns_sockaddr_nl() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_netfilter(&ctx);
+    let nladdr = sockaddr_nl();
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                fd as u64,
+                nladdr.as_ptr() as u64,
+                SOCKADDR_NL_BYTES as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out = [0u8; SOCKADDR_NL_BYTES as usize];
+    let mut out_len = SOCKADDR_NL_BYTES;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKNAME,
+            [
+                fd as u64,
+                out.as_mut_ptr() as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out_len, SOCKADDR_NL_BYTES);
+    assert_eq!(u16::from_le_bytes([out[0], out[1]]), AF_NETLINK);
+}
+
+#[test]
 fn dispatch_netlink_route_sendto_recvfrom_returns_dump() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();
