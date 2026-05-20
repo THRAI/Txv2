@@ -32,6 +32,7 @@ fn main() {
     // trip `unexpected_cfgs`. Required by Rust 1.80+'s check-cfg lint.
     println!("cargo:rustc-check-cfg=cfg(busybox_baked)");
     println!("cargo:rerun-if-env-changed=TX_BUSYBOX");
+    println!("cargo:rerun-if-env-changed=TX_OSCOMP_GROUPS");
 
     let Ok(busybox_path) = env::var("TX_BUSYBOX") else {
         // Unset — the most common case for host tests + CI without
