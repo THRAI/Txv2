@@ -96,11 +96,6 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             }
             other => return other,
         }
-        // Yield the guard between iterations so the epoch can advance
-        // and retired zone nodes can be reclaimed.  Without this, a
-        // multi-element writev (common for musl's buffered stdio)
-        // can exhaust the retired-node pool.
-        drop(step_engine::guard());
     }
     SyscallResult::Return(total)
 }

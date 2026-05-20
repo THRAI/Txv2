@@ -94,12 +94,9 @@ fn store_key(k: &[u8; 32]) {
     KEY4.store(u64::from_le_bytes(k[24..32].try_into().unwrap()), Ordering::Release);
 }
 
-/// Fill `out` with random bytes.  Auto-initialises from
-/// `platform_seed()` on first call when `init` was not called.
+/// Fill `out` with random bytes.  Panics if `init` was not called.
 pub fn fill_bytes(out: &mut [u8]) {
-    if !READY.load(Ordering::Acquire) {
-        init(&platform_seed());
-    }
+    assert!(READY.load(Ordering::Acquire), "CSPRNG not initialised");
     let mut written = 0;
     while written < out.len() {
         let ctr = CTR.fetch_add(1, Ordering::AcqRel);
