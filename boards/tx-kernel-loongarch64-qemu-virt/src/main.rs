@@ -22,6 +22,7 @@ pub extern "C" fn rust_entry(
     system_table_phys: usize,
 ) -> ! {
     tx_hal_loongarch64_qemu_virt::capture_loongarch64_qemu_boot_args(
+        cpu_id,
         efi_boot,
         cmdline_phys,
         system_table_phys,

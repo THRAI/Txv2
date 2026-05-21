@@ -3,17 +3,15 @@
 //! Wires the [`crate::linux_syscall::mod`] dispatch table to the
 //! [`crate::epoll`] subsystem.
 
+use crate::adapter::step_engine::{guard, StepOutcome, WaitSourceId};
 use crate::linux_syscall::{
-    bootstrap_read_user, bootstrap_write_user, errno_to_i32, EBADF_VALUE, EFAULT_VALUE,
-    EINVAL_VALUE, ENOENT_VALUE, ENOMEM_VALUE, ENOSYS_VALUE, SyscallCtx, SyscallResult,
+    bootstrap_copy_from_user, bootstrap_copy_to_user, SyscallCtx, SyscallResult, EBADF_VALUE,
+    EFAULT_VALUE, EINVAL_VALUE, ENOMEM_VALUE, ENOSYS_VALUE,
 };
+use tx_hal::TimeIf;
 use tx_subsystems::{
     epoll,
-    execution::{self, Guard, StepOp},
-    vfs::{
-        self,
-        structure::{OpenFile, OpenFileBacking, OpenFileFlags},
-    },
+    vfs::structure::{OpenFile, OpenFileFlags},
 };
 
 // ---------------------------------------------------------------------------
@@ -27,11 +25,139 @@ const EPOLL_CTL_ADD: u32 = 1;
 const EPOLL_CTL_DEL: u32 = 2;
 const EPOLL_CTL_MOD: u32 = 3;
 
-/// Size of `struct epoll_event` — two u64s: events (u32) + data (u64).
-const EPOLL_EVENT_SIZE: usize = 12;
+/// Size of `struct epoll_event` on generic LP64 Linux targets.
+///
+/// musl only packs this struct on x86_64; RV64 and LoongArch64 use the
+/// natural layout: `events` at offset 0, four bytes of padding, then
+/// `epoll_data_t` at offset 8.
+const EPOLL_EVENT_SIZE: usize = 16;
 
 /// Max events returned in one `epoll_wait` call.
 const MAX_EVENTS: usize = 1024;
+
+const EPOLLIN: u32 = 0x001;
+const EPOLLOUT: u32 = 0x004;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UserEpollEvent {
+    events: u32,
+    data: u64,
+}
+
+impl UserEpollEvent {
+    fn to_bytes(self) -> [u8; EPOLL_EVENT_SIZE] {
+        let mut bytes = [0u8; EPOLL_EVENT_SIZE];
+        bytes[0..4].copy_from_slice(&self.events.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.data.to_le_bytes());
+        bytes
+    }
+}
+
+fn read_user_epoll_event(
+    ctx: &SyscallCtx<'_>,
+    event_ptr: u64,
+) -> Result<UserEpollEvent, SyscallResult> {
+    let mut bytes = [0u8; EPOLL_EVENT_SIZE];
+    bootstrap_copy_from_user(&ctx.aspace, &mut bytes, event_ptr)
+        .map_err(SyscallResult::error_from)?;
+    Ok(UserEpollEvent {
+        events: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+        data: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+    })
+}
+
+fn epoll_wait_source(file: &OpenFile, interests: u32) -> WaitSourceId {
+    if let Some(efd) = file.eventfd() {
+        let source = if (interests & EPOLLIN) != 0 {
+            efd.reader_source_id()
+        } else if (interests & EPOLLOUT) != 0 {
+            efd.writer_source_id()
+        } else {
+            0
+        };
+        return WaitSourceId::new(source);
+    }
+
+    if let Some(tfd) = file.timerfd() {
+        let source = if (interests & EPOLLIN) != 0 {
+            tfd.source_id()
+        } else {
+            0
+        };
+        return WaitSourceId::new(source);
+    }
+
+    if let Some(sfd) = file.signalfd() {
+        let source = if (interests & EPOLLIN) != 0 {
+            sfd.wait_source_id()
+        } else {
+            0
+        };
+        return WaitSourceId::new(source);
+    }
+
+    if let Some(ufd) = file.ufd() {
+        let source = if (interests & EPOLLIN) != 0 {
+            ufd.wait_source_id()
+        } else {
+            0
+        };
+        return WaitSourceId::new(source);
+    }
+
+    if let Some(mq) = file.posix_mq() {
+        let source = match tx_subsystems::ipc::posix_mq::execution::step_mq_poll_info(mq) {
+            Ok(info) if (interests & EPOLLIN) != 0 => info.read_source_id,
+            Ok(info) if (interests & EPOLLOUT) != 0 => info.write_source_id,
+            _ => 0,
+        };
+        return WaitSourceId::new(source);
+    }
+
+    WaitSourceId::new(0)
+}
+
+fn ready_events_for_entry<P: TimeIf>(
+    entry: &epoll::EpollEntry,
+    target: &OpenFile,
+) -> Option<UserEpollEvent> {
+    let mut ready = 0u32;
+
+    if let Some(efd) = target.eventfd() {
+        if (entry.interests & EPOLLIN) != 0 && efd.counter() > 0 {
+            ready |= EPOLLIN;
+        }
+        if (entry.interests & EPOLLOUT) != 0 && efd.counter() < tx_subsystems::eventfd::EVENTFD_MAX
+        {
+            ready |= EPOLLOUT;
+        }
+    } else if let Some(tfd) = target.timerfd() {
+        if (entry.interests & EPOLLIN) != 0 && tfd.deadline_ns() != 0 {
+            let now_ns = P::read_ns();
+            if tfd.expiration_count() > 0 || tfd.remaining_value_ns(now_ns) == 0 {
+                ready |= EPOLLIN;
+            }
+        }
+    } else if let Some(sfd) = target.signalfd() {
+        if (entry.interests & EPOLLIN) != 0 && sfd.pending_count() > 0 {
+            ready |= EPOLLIN;
+        }
+    } else if let Some(mq) = target.posix_mq() {
+        if let Ok(info) = tx_subsystems::ipc::posix_mq::execution::step_mq_poll_info(mq) {
+            if (entry.interests & EPOLLIN) != 0 && info.readable {
+                ready |= EPOLLIN;
+            }
+            if (entry.interests & EPOLLOUT) != 0 && info.writable {
+                ready |= EPOLLOUT;
+            }
+        }
+    }
+
+    (ready != 0).then_some(UserEpollEvent {
+        events: ready,
+        data: entry.data,
+    })
+}
 
 // ---------------------------------------------------------------------------
 // sys_epoll_create1
@@ -65,15 +191,11 @@ pub(super) fn sys_epoll_create1(flags: u32, ctx: &SyscallCtx<'_>) -> SyscallResu
     };
 
     // Install as an fd in the calling process.
-    let fd = match tx_subsystems::process::execution::install_fd_cap(
-        &ctx.process,
-        of,
-        cloexec,
-        None, // no specific target fd — kernel picks
-    ) {
-        Ok(fd) => fd,
-        Err(e) => return SyscallResult::Error(errno_to_i32(e)),
-    };
+    let fd = ctx.process.allocate_fd();
+    let _ = ctx.process.install_fd(fd, of);
+    if cloexec {
+        ctx.process.set_fd_cloexec(fd, true);
+    }
 
     SyscallResult::Return(fd as i64)
 }
@@ -95,21 +217,20 @@ pub(super) fn sys_epoll_ctl(
     }
 
     // Read epoll_event from userspace (ADD and MOD).
-    let interests: u32 = if op != EPOLL_CTL_DEL {
+    let event = if op != EPOLL_CTL_DEL {
         if event_ptr == 0 {
             return SyscallResult::Error(EFAULT_VALUE);
         }
-        // epoll_event.events is the first 4 bytes.
-        match bootstrap_read_user::<u32>(&ctx.aspace, event_ptr) {
-            Ok(v) => v,
-            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        match read_user_epoll_event(ctx, event_ptr) {
+            Ok(event) => event,
+            Err(result) => return result,
         }
     } else {
-        0
+        UserEpollEvent { events: 0, data: 0 }
     };
 
     // Resolve epfd → Cap<OpenFile> → Epoll.
-    let ep_of = match vfs::resolve_fd(&ctx.process, epfd) {
+    let ep_of = match super::resolve_fd(&ctx.process, epfd) {
         Some(of) => of,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -118,23 +239,29 @@ pub(super) fn sys_epoll_ctl(
         None => return SyscallResult::Error(EINVAL_VALUE), // not an epoll fd
     };
 
+    if epfd == fd {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let target_of = match super::resolve_fd(&ctx.process, fd) {
+        Some(of) => of,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+
     // Call the appropriate step function.
-    let _guard = execution::guard();
-    let ep_ref = ep_cap.as_ref();
-    // Phase B.2: resolve the monitored fd's WaitSourceId.
-    // Placeholder — Phase B.3 will look up the fd's bus wire.
-    let source = tx_subsystems::adapter::step_engine::WaitSourceId::new(0);
+    let _guard = guard();
+    let ep_ref = &*ep_cap;
+    let source = epoll_wait_source(&target_of, event.events);
     let outcome = match op {
-        EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
-            epoll::step_epoll_ctl_add(ep_ref, fd, interests, source)
-        }
+        EPOLL_CTL_ADD => epoll::step_epoll_ctl_add(ep_ref, fd, event.events, event.data, source),
+        EPOLL_CTL_MOD => epoll::step_epoll_ctl_mod(ep_ref, fd, event.events, event.data, source),
         EPOLL_CTL_DEL => epoll::step_epoll_ctl_del(ep_ref, fd),
         _ => unreachable!(),
     };
 
     match outcome {
-        execution::StepOutcome::Done(()) => SyscallResult::Return(0),
-        execution::StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(e.into())),
+        StepOutcome::Done(()) => SyscallResult::Return(0),
+        StepOutcome::Err(e) => SyscallResult::error_from(e.into()),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -143,19 +270,22 @@ pub(super) fn sys_epoll_ctl(
 // sys_epoll_wait
 // ---------------------------------------------------------------------------
 
-pub(super) fn sys_epoll_wait(
+pub(super) fn sys_epoll_wait<P: TimeIf>(
     epfd: u32,
     events_ptr: u64,
     maxevents: u32,
-    _timeout: u32, // ignored in PoC — always blocks indefinitely
+    timeout: i32,
     ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
-    if events_ptr == 0 || maxevents == 0 || maxevents as usize > MAX_EVENTS {
+    if maxevents == 0 || maxevents as usize > MAX_EVENTS {
         return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if events_ptr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
     }
 
     // Resolve epfd → Cap<OpenFile> → Epoll.
-    let ep_of = match vfs::resolve_fd(&ctx.process, epfd) {
+    let ep_of = match super::resolve_fd(&ctx.process, epfd) {
         Some(of) => of,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -164,31 +294,43 @@ pub(super) fn sys_epoll_wait(
         None => return SyscallResult::Error(EINVAL_VALUE),
     };
 
-    // PoC: call step_epoll_wait and convert to Linux format.
-    let _guard = execution::guard();
-    let ep_ref = ep_cap.as_ref();
+    let entries = ep_cap.entries_snapshot();
+    let mut ready = alloc::vec::Vec::new();
+    for entry in entries.iter() {
+        if ready.len() >= maxevents as usize {
+            break;
+        }
+        let Some(target) = super::resolve_fd(&ctx.process, entry.fd) else {
+            continue;
+        };
+        if let Some(event) = ready_events_for_entry::<P>(entry, &target) {
+            ready.push(event);
+        }
+    }
+
+    if !ready.is_empty() {
+        let mut bytes = alloc::vec![0u8; ready.len() * EPOLL_EVENT_SIZE];
+        for (index, event) in ready.iter().enumerate() {
+            let start = index * EPOLL_EVENT_SIZE;
+            bytes[start..start + EPOLL_EVENT_SIZE].copy_from_slice(&event.to_bytes());
+        }
+        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, events_ptr, &bytes) {
+            return SyscallResult::error_from(errno);
+        }
+        return SyscallResult::Return(ready.len() as i64);
+    }
+
+    if timeout == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    let _guard = guard();
+    let ep_ref = &*ep_cap;
     let outcome = epoll::step_epoll_wait(ep_ref, &_guard);
 
     match outcome {
-        execution::StepOutcome::Done(count) => {
-            // Write `count` epoll_event entries (events=0, data=0)
-            // back to userspace. Real implementation fills actual
-            // event data.
-            let nbytes = count * EPOLL_EVENT_SIZE;
-            if nbytes > 0 {
-                // Zero out the userspace buffer.
-                let zeros = alloc::vec![0u8; nbytes];
-                if let Err(errno) = bootstrap_write_user(
-                    &ctx.aspace,
-                    events_ptr,
-                    &zeros,
-                ) {
-                    return SyscallResult::Error(errno_to_i32(errno));
-                }
-            }
-            SyscallResult::Return(count as i64)
-        }
-        execution::StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(e.into())),
+        StepOutcome::Done(_) => SyscallResult::Error(ENOSYS_VALUE),
+        StepOutcome::Err(e) => SyscallResult::error_from(e.into()),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }

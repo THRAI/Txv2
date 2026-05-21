@@ -2,32 +2,34 @@ OUTPUT_ARCH(loongarch64)
 ENTRY(_start)
 
 KERNEL_LOAD_BASE = 0x00200000;
+KERNEL_LINK_BASE = 0x9000000000200000;
+KERNEL_LINK_OFFSET = KERNEL_LINK_BASE - KERNEL_LOAD_BASE;
 
 SECTIONS
 {
-    . = KERNEL_LOAD_BASE;
+    . = KERNEL_LINK_BASE;
     __kernel_start = .;
 
-    .text : ALIGN(4K) {
+    .text : AT(ADDR(.text) - KERNEL_LINK_OFFSET) ALIGN(4K) {
         KEEP(*(.text.boot))
         *(.text .text.*)
     }
     __text_end = .;
 
-    .rodata : ALIGN(4K) {
+    .rodata : AT(ADDR(.rodata) - KERNEL_LINK_OFFSET) ALIGN(4K) {
         *(.srodata .srodata.*)
         *(.rodata .rodata.*)
     }
     __rodata_end = .;
 
-    .data : ALIGN(4K) {
+    .data : AT(ADDR(.data) - KERNEL_LINK_OFFSET) ALIGN(4K) {
         PROVIDE(__global_pointer$ = . + 0x800);
         *(.sdata .sdata.*)
         *(.data .data.*)
     }
     __data_end = .;
 
-    .bss (NOLOAD) : ALIGN(4K) {
+    .bss (NOLOAD) : AT(ADDR(.bss) - KERNEL_LINK_OFFSET) ALIGN(4K) {
         _bss_start = .;
         __bss_start = .;
         *(.sbss .sbss.*)
@@ -38,7 +40,7 @@ SECTIONS
         __bss_end = .;
     }
 
-    .bss.stack (NOLOAD) : ALIGN(4K) {
+    .bss.stack (NOLOAD) : AT(ADDR(.bss.stack) - KERNEL_LINK_OFFSET) ALIGN(4K) {
         __tx_boot_stack_bottom = .;
         . += 512K;
         . = ALIGN(16);

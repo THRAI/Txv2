@@ -35,7 +35,7 @@ use crate::process::adapter::step_engine::{
 };
 use crate::process::adapter::wait_routing::{self, Channel, Mask, WaitSource};
 
-use crate::cred::{Cred, Gid, Uid};
+use crate::cred::{Cred, CredSnapshot, Gid, Uid};
 use crate::execution::WaitToken;
 use crate::process::topology::{
     ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers,
@@ -361,6 +361,27 @@ impl ProcessIdentity {
         self.payload.lock().as_ref().map(|p| p.cred_cap())
     }
 
+    /// Capture a syscall-entry credential snapshot for this process.
+    ///
+    /// Per `cred_service_v_1` §"In flight": the script holds a by-value
+    /// metadata copy of the credential, taken once at syscall entry and
+    /// threaded through prelude → checks → commit. This is the
+    /// `Cap<ProcessIdentity>`-side entry point producing that snapshot.
+    ///
+    /// Returns `None` for zombies (payload dropped — credential
+    /// unobservable). Live syscall arms never reach `None` by
+    /// construction; `SyscallCtx` falls back to `CredSnapshot::root()`
+    /// defensively at construction time.
+    pub fn cred_snapshot(&self) -> Option<CredSnapshot> {
+        self.payload.lock().as_ref().map(|p| p.cred_snapshot())
+    }
+
+    /// Snapshot the per-process namespace proxy bundle.
+    /// Returns `None` for zombies (no payload).
+    pub fn nsproxy_cap(&self) -> Option<Cap<crate::process::nsproxy::NsProxy>> {
+        self.payload.lock().as_ref().map(|p| p.nsproxy_cap())
+    }
+
     /// Process short name (for `/proc/<pid>/stat`). Returns `"?"` for
     /// zombies (no payload).
     pub fn comm(&self) -> [u8; 16] {
@@ -393,7 +414,7 @@ impl ProcessIdentity {
     pub fn replace_aspace(&self, new: Cap<AddressSpace>) -> Option<Cap<AddressSpace>> {
         let payload_guard = self.payload.lock();
         let payload = payload_guard.as_ref()?;
-        payload.aspace.swap(Some(new))
+        payload.frame.vm.swap(Some(new))
     }
 
     /// Snapshot the `Cap<OpenFile>` registered at fd `idx` on this
@@ -820,6 +841,23 @@ pub(crate) struct GroupExitState {
     pub remaining_threads: AtomicU32,
 }
 
+/// Per-process resource frame — the set of resources governed by
+/// clone(2) sharing flags.
+///
+/// `Frame` groups the fields that can optionally be shared across
+/// processes via `Shared<Frame>`. v1 stores it inline on
+/// `ProcessPayload`; the cross-process sharing path is deferred
+/// to the `Shared<T>` wiring slice.
+pub struct Frame {
+    /// Virtual address space (CLONE_VM). Atomic slot so exec can
+    /// swap the address space atomically without &mut access.
+    pub vm: AtomicSlot<Cap<AddressSpace>>,
+    /// Signal-action table (CLONE_SIGHAND). `Arc` provides
+    /// shared ownership across processes; the inner `SpinMutex`
+    /// on `SigActionTable` handles per-entry concurrency.
+    pub sig_actions: Arc<SigActionTable>,
+}
+
 pub struct ProcessPayload {
     /// Authoritative address-space slot for this process. Per Open Q #2
     /// (DECIDED 2026-05-06, `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`),
@@ -833,12 +871,15 @@ pub struct ProcessPayload {
     /// dispatcher, the trap-shell aspace resolution, the page-fault
     /// driver) snapshot via `process.aspace_cap()` which clones the
     /// inner `Cap` out of the slot.
-    pub(crate) aspace: AtomicSlot<Cap<AddressSpace>>,
+    /// Per-process resource frame. Holds the shared-ownership
+    /// resources governed by clone(2) flags: the address space
+    /// (CLONE_VM) and the signal-action table (CLONE_SIGHAND).
+    /// v1: fields are inline on `ProcessPayload`. When cross-process
+    /// sharing through `Shared<Frame>` lands, the frame will move
+    /// to `Shared<Frame>` and the `share()` path will be wired
+    /// in `step_fork`.
+    pub(crate) frame: Frame,
     pub(crate) threads: ProcessThreads,
-    /// Per-process signal-action table. Day-1 records dispositions
-    /// installed via `step_sigaction`; the delivery step that consults
-    /// these lands with the AST/scripts pass.
-    pub(crate) sig_actions: SigActionTable,
     /// Process-group-targeted pending signals. Day-1 collapses
     /// repeated posts (bitset, no per-occurrence queueing); a thread
     /// whose mask permits the signal will sweep it on its next
@@ -885,6 +926,14 @@ pub struct ProcessPayload {
     /// Field shape mirrors the existing
     /// `aspace: AtomicSlot<Cap<AddressSpace>>` precedent above.
     pub(crate) cred: AtomicSlot<Cap<Cred>>,
+    /// Per-process namespace proxy. Immutable-after-publication bundle
+    /// of namespace references per `NAMESPACE_VIEW_v1.md` §1.
+    /// `AtomicSlot` allows clone/unshare/setns to publish a replacement
+    /// bundle. Initial state is populated by `sign_process_payload`.
+    ///
+    /// Day-1: all namespace caps point at the init namespace.
+    /// `mnt_ns` is deferred (`MountNamespace` bootstrap not yet wired).
+    pub(crate) nsproxy: AtomicSlot<Cap<crate::process::nsproxy::NsProxy>>,
     /// Current working directory as a `DEntry` `Cap`.
     ///
     /// Spec note: `PROCESS_v1` §3 declares this as `Cap<RNode>` on a
@@ -1052,7 +1101,7 @@ pub struct ProcessPayload {
     /// Process short name (comm). Up to 15 bytes + NUL. Initialised
     /// from the executable basename at `execve`; can be changed via
     /// `prctl(PR_SET_NAME)`. Read by procfs `/proc/<pid>/stat`.
-    pub(crate) _comm: SpinMutex<[u8; 16]>,
+    pub _comm: SpinMutex<[u8; 16]>,
     pub(crate) thread_count: AtomicU32,
     pub(crate) group_exit: SpinMutex<Option<GroupExitState>>,
     pub vfork_done: AtomicBool,
@@ -1092,14 +1141,15 @@ impl ProcessPayload {
     /// is exec's phase 6 store, which atomically swaps to a fresh
     /// `Cap` and never leaves the slot empty.
     pub fn aspace_cap(&self) -> Cap<AddressSpace> {
-        self.aspace
+        self.frame
+            .vm
             .load()
-            .expect("ProcessPayload.aspace slot is always populated")
+            .expect("ProcessPayload.frame.vm slot is always populated")
     }
 
     /// Borrow the per-process action table.
     pub fn sig_actions(&self) -> &SigActionTable {
-        &self.sig_actions
+        &self.frame.sig_actions
     }
 
     /// Borrow the per-process group-pending queue.
@@ -1121,6 +1171,18 @@ impl ProcessPayload {
         *self.cred_cap()
     }
 
+    /// Capture a syscall-entry [`CredSnapshot`].
+    ///
+    /// Per `cred_service_v_1` §"In flight": scripts hold a by-value
+    /// metadata copy of the credential, captured once at syscall entry.
+    /// This is the `ProcessPayload`-side entry point producing that
+    /// snapshot — one `AtomicSlot` load + cap deref + value-copy +
+    /// drop, identical cost to [`Self::cred`] but typed as the
+    /// architectural snapshot rather than a raw `Cred`.
+    pub fn cred_snapshot(&self) -> CredSnapshot {
+        CredSnapshot::from_cred(self.cred())
+    }
+
     /// Snapshot the current `Cap<Cred>` out of the
     /// `AtomicSlot<Cap<Cred>>` slot. Panics if the slot is empty —
     /// by construction the initial state is always populated
@@ -1136,6 +1198,34 @@ impl ProcessPayload {
         self.cred
             .load()
             .expect("ProcessPayload.cred slot is always populated")
+    }
+
+    /// Snapshot the per-process namespace proxy. The returned `Cap`
+    /// shares the same `NsProxy` bundle; clone/unshare/setns publish
+    /// a replacement via `replace_nsproxy`.
+    ///
+    /// Day-1: all namespace caps point at init-namespace stubs.
+    /// `mnt_ns` is deferred (`MountNamespace` bootstrap not yet wired).
+    pub fn nsproxy_cap(&self) -> Cap<crate::process::nsproxy::NsProxy> {
+        self.nsproxy
+            .load()
+            .expect("ProcessPayload.nsproxy slot is always populated")
+    }
+
+    /// Atomically install `new` as the current nsproxy cap and return
+    /// the previously installed cap. Used by `step_clone_newipc` /
+    /// `step_setns` to publish a replacement bundle.
+    #[expect(
+        dead_code,
+        reason = "txdoc:NAMESPACE-VIEW-CORE-PLACEMENT-1 — called by clone_newipc/setns (future)"
+    )]
+    pub(crate) fn replace_nsproxy(
+        &self,
+        new: Cap<crate::process::nsproxy::NsProxy>,
+    ) -> Cap<crate::process::nsproxy::NsProxy> {
+        self.nsproxy
+            .swap(Some(new))
+            .expect("ProcessPayload.nsproxy slot is always populated")
     }
 
     /// Atomically install `new` as the current cred-cap and return
@@ -1182,10 +1272,30 @@ impl ProcessPayload {
     /// same accessor to preopen fds 0/1/2.
     pub fn set_fd(&self, idx: u32, file: Option<Cap<OpenFile>>) -> Option<Cap<OpenFile>> {
         let mut slot = self.fds.lock();
-        match file {
+        let previous = match file {
             Some(f) => slot.insert(idx, f),
             None => slot.remove(&idx),
+        };
+        drop(slot);
+        if let Some(file) = &previous {
+            decr_pipe_fd_ref(file);
         }
+        previous
+    }
+
+    /// Remove every fd from this payload and return the detached table.
+    ///
+    /// Process exit must close all open fds before the payload itself
+    /// becomes unreachable. In particular, pipe EOF/EPIPE publication is
+    /// driven from fd-table accounting, so exit paths need a concrete
+    /// drain rather than waiting for the whole payload to disappear
+    /// later through EBR.
+    pub(crate) fn drain_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
+        let drained = core::mem::take(&mut *self.fds.lock());
+        for file in drained.values() {
+            decr_pipe_fd_ref(file);
+        }
+        drained
     }
 
     /// Snapshot the entire fd table as a fresh `BTreeMap`. Each
@@ -1195,6 +1305,18 @@ impl ProcessPayload {
     /// `step_fork` to clone the parent's fd table into the child.
     pub(crate) fn snapshot_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
         self.fds.lock().clone()
+    }
+
+    /// Clone the fd table for `fork`, accounting each inherited pipe
+    /// endpoint as a new fd reference. Unlike [`Self::snapshot_fds`],
+    /// this result is intended to be installed into another live
+    /// `ProcessPayload`.
+    pub(crate) fn clone_fds_for_fork(&self) -> BTreeMap<u32, Cap<OpenFile>> {
+        let cloned = self.fds.lock().clone();
+        for file in cloned.values() {
+            incr_pipe_fd_ref(file);
+        }
+        cloned
     }
 
     /// Public fd-table snapshot (for procfs `/proc/<pid>/fd/`).
@@ -1485,6 +1607,26 @@ unsafe impl ZoneAllocated for ProcessPayload {
     type Policy = PayloadPolicy<Self>;
     fn zone() -> &'static Zone<Self> {
         &PROCESS_PAYLOAD_ZONE
+    }
+}
+
+pub(crate) fn incr_pipe_fd_ref(file: &Cap<OpenFile>) {
+    let Some((payload, side)) = file.pipe_endpoint() else {
+        return;
+    };
+    match side {
+        crate::pipe::PipeSide::Reader => payload.incr_reader(),
+        crate::pipe::PipeSide::Writer => payload.incr_writer(),
+    }
+}
+
+fn decr_pipe_fd_ref(file: &Cap<OpenFile>) {
+    let Some((payload, side)) = file.pipe_endpoint() else {
+        return;
+    };
+    match side {
+        crate::pipe::PipeSide::Reader => payload.decr_reader(),
+        crate::pipe::PipeSide::Writer => payload.decr_writer(),
     }
 }
 

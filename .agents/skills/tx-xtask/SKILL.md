@@ -56,8 +56,9 @@ edit.**
 
 ### `cargo xtask check`
 
-`cargo fmt --check` + `cargo clippy --workspace --all-targets`. Slower
-than `unit`; run before pushing.
+`cargo fmt --check` + `cargo clippy --workspace --all-targets` + host
+`cargo check --workspace` + architecture/docs/unused lints + the
+kernel-user musl layout redlight. Slower than `unit`; run before pushing.
 
 ### `cargo xtask ci` / `cargo xtask ci-slow`
 
@@ -73,6 +74,11 @@ Architecture/discipline linters. Kinds:
 - `unused` — unused-symbol detector.
 - `boundary` — substrate/reactor-call ratchet (post-adapter enforcement;
   fails if outside-adapter call count regresses).
+- `kernel-user-layouts` — extracts pinned musl RV64/LA64 C layouts for every
+  registered kernel/user candidate, requires registered Rust-backed
+  production `#[repr(C)]` kernel/user ABI structs to implement
+  `KernelToUserLayout`, and fails on size/align/offset drift or unaccounted
+  candidate status.
 - `invariants [rule|all]` — STEP-4 / WIT / SIG / SCRIPT / SUBJ / CHECKS
   discipline lints. Rule names: `step`, `step-discipline`,
   `step-v4-vocabulary`, `step-no-await`, `step-sync-signature`,

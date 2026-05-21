@@ -178,6 +178,12 @@ fn tty_wait_source_invariants_round_trip() {
         WaitSourceId::new(tty_source_id),
         "wait_source.id() must match wait_source_id (same u64 namespace)",
     );
+    let registered_source = tx_substrate::wake::lookup_source(WaitSourceId::new(tty_source_id))
+        .expect("TTY WaitSource must be globally registered for drive() wake resolution");
+    assert!(
+        Arc::ptr_eq(&registered_source, &tty_source),
+        "drive() registry must resolve the TTY identity's live WaitSource",
+    );
 
     // ---- (2) blocked-reader-woken-on-step_ingest ------------------
     let mailbox = Arc::new(TaskMailbox::new());

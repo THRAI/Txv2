@@ -5,6 +5,10 @@
 //! the encoded value into a fresh trap frame's `a0` slot just before
 //! `sret`.
 
+use tx_subsystems::execution::Errno;
+
+use super::errno_to_i32;
+
 /// Outcome of a syscall dispatch.
 ///
 /// Plan B (`txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`): the dispatcher
@@ -49,4 +53,49 @@ pub enum SyscallResult {
     /// (reading `SavedSignalFrame` from user stack) lands in
     /// Phase D with full handler delivery.
     SigreturnRestored,
+}
+
+impl SyscallResult {
+    /// Build an [`Error`](Self::Error) variant from a kernel [`Errno`].
+    ///
+    /// Folds the [`errno_to_i32`] translation so call sites don't
+    /// have to spell it out — every `-errno` return from a syscall
+    /// arm collapses from
+    /// `SyscallResult::error_from(errno)` to
+    /// `SyscallResult::error_from(errno)`.
+    pub fn error_from(errno: Errno) -> Self {
+        Self::Error(errno_to_i32(errno))
+    }
+}
+
+impl From<Errno> for SyscallResult {
+    fn from(errno: Errno) -> Self {
+        Self::error_from(errno)
+    }
+}
+
+/// Bridge a `Result<T, Errno>` returned by a subsystem-side script
+/// or check into a [`SyscallResult`].
+///
+/// `on_ok` maps the success value to its dispatch outcome (typically
+/// a `SyscallResult::Return(_)` or a sum-type match over an
+/// outcome enum like `KillScriptOutcome`). The `Err` arm goes
+/// through [`SyscallResult::error_from`] uniformly.
+///
+/// Folds the boilerplate
+/// ```ignore
+/// match script(...) {
+///     Ok(v) => /* per-call mapping */,
+///     Err(e) => SyscallResult::error_from(e),
+/// }
+/// ```
+/// into a single call.
+pub fn dispatch_errno<T, F>(result: Result<T, Errno>, on_ok: F) -> SyscallResult
+where
+    F: FnOnce(T) -> SyscallResult,
+{
+    match result {
+        Ok(value) => on_ok(value),
+        Err(errno) => SyscallResult::error_from(errno),
+    }
 }

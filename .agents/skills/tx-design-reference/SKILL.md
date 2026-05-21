@@ -10,9 +10,13 @@ architecture, writing implementation code, or auditing readiness.
 
 ## Read First
 
-- `docs/design/INDEX.md`
-- `docs/design/00_meta-framework/CONCEPTS_v4.md`
-- `docs/design/00_meta-framework/INVARIANTS_v4.md`
+- `docs/design/INDEX.md` — top-level read order across the v4 subsystem spine.
+- `docs/Txv3/INDEX.md` — the v3 refresh; tells you which v4 docs are superseded and which still apply.
+- `docs/Txv3/01_CONCEPTS_v5.md` — supersedes `CONCEPTS_v4.md`. Read this for new vocabulary (SubjectContext, YieldShape, ExecutionScope, primitive cells).
+- `docs/Txv3/02_INVARIANTS_v5.md` — canonical invariant catalog. Adds SUBJ-*, YIELD-*, DELEGATE-*, SCOPE-* families; updates STEP-*.
+- `docs/Txv3/03_STEP_MODEL_v2.md` — supersedes `STEP_MODEL_v1.md`. Four-variant `StepOutcome`, typed `StepOp`, anti-pattern catalog.
+- `docs/design/00_meta-framework/CONCEPTS_v4.md` — still useful for the v4 sections v5 carries forward.
+- `docs/design/00_meta-framework/INVARIANTS_v4.md` — section anchors that other v4 subsystem docs still cite.
 - `docs/design/00_meta-framework/MODULE_MAP_v1.md`
 - `docs/design/00_meta-framework/object_model_v2.md`
 - `docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md`
@@ -38,10 +42,41 @@ architecture, writing implementation code, or auditing readiness.
   `docs/design/06_devices/DEVICE.md`.
 - TTY and character-device work: `docs/design/06_devices/TTY.md`,
   `docs/design/06_devices/DEVICE.md`.
+- SysV/POSIX IPC (sem, shm, msg, mq): start with
+  `docs/Txv3/08_SYSV_IPC_v1.md` — the canonical v3 subsystem spec that covers
+  the full 30-syscall SysV+POSIX family as a composition of existing primitives
+  (zero closed-catalog growth). Companion reading:
+  - `docs/design/00_meta-framework/NAMESPACE_VIEW_v1.md` — `IpcNamespace` lens.
+  - `docs/design/03_memory-vm/PAGE_BACKED_v1.md` — shm segments route through
+    `RNodeBacking`.
+  - `docs/design/04_process-signals/SIGNAL_ATTACHMENTS_v1.md` — `mq_notify`
+    signal-attachment row.
+- Kernel-internal IPC primitives (pipe, eventfd, signalfd, futex, sockets,
+  io_uring): no single canonical spec yet — these are distinct from SysV/POSIX
+  IPC. Read, in this order:
+  - `docs/Txv3/00_PREFACE.md` — single address space, no IPC boundary between
+    subsystems; the "audit story" replaces process isolation.
+  - `docs/design/06_devices/TTY.md` — the "IPC-producer-serialization pattern"
+    section is the canonical write-up of how the ring/mutex/atomicity contract
+    works for any subsystem with a kernel-internal queue.
+  - `docs/design/04_process-signals/SIGNAL_v1.md` and `PROCESS_v1.md` — signals
+    are the most fundamental IPC primitive; every other IPC primitive's
+    wakeup/cancellation borrows from this shape.
+  - Code: `crates/tx-subsystems/src/{pipe,eventfd,signalfd,futex,signal,io_uring,userfaultfd,epoll}/`.
+  - Decision history: `docs/progress/decisions/2026-05-12-d17-pipe-pilot-adapter.md`
+    and other dated `*pipe*` / `*signal*` decisions under `docs/progress/decisions/`.
+
+  When a canonical pipe/socket/futex spec (e.g. `docs/design/04_process-signals/IPC_PRIMITIVES_v1.md`)
+  lands, replace the kernel-internal reading list with that file's path.
 
 ## Rules
 
-- Active docs in `docs/design/` override archived and source-trace docs.
+- For meta-framework reading: `Txv3/` is the new spine. v4 docs are still canonical
+  for everything the v3 docs don't touch (`docs/Txv3/INDEX.md` §3 spells out which is
+  which). For *new prose* about concepts, invariants, or the step model, cite v5.
+  For sections v5 carries forward unchanged, citing v4 is fine — and necessary,
+  because v4 anchors are what other subsystem docs still resolve against.
+- Active docs in `docs/design/` and `docs/Txv3/` override archived and source-trace docs.
 - Use `docs/ebr-zone/` as mechanics reference material; treat
   `EBR_ZONE_INTERFACE_v1.md` and the meta-framework docs as the current
   architecture contract.

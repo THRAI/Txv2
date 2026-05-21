@@ -12,9 +12,11 @@
 //! Spec ref: `08_OBSERVATION_SERIALIZATION_v0.md` §8.
 
 use tx_observe_types::{
-    PayloadDriveBegin, PayloadDriveEnd, PayloadMutationIndexCommit, PayloadMutationZoneSign,
-    PayloadPhaseTransition, PayloadResume, PayloadStepOutcome, PayloadSyscallEnter,
-    PayloadSyscallExit, PayloadWaitSourceNotify, PayloadYieldBegin, TxPayloadTag,
+    PayloadArgValue, PayloadDriveBegin, PayloadDriveEnd, PayloadMutationIndexCommit,
+    PayloadMutationZoneSign, PayloadPhaseTransition, PayloadProcessFork, PayloadProcessGroup,
+    PayloadProcessLabel, PayloadResume, PayloadSchedSwitch, PayloadStepOutcome,
+    PayloadSyscallEnter, PayloadSyscallExit, PayloadWaitSourceNotify, PayloadYieldBegin,
+    TxPayloadTag,
 };
 
 // ---------------------------------------------------------------------------
@@ -336,6 +338,157 @@ pub fn encode_phase_transition(p: &PayloadPhaseTransition) -> ([u8; 16], u16) {
 #[inline]
 pub const fn phase_transition_tag() -> TxPayloadTag {
     TxPayloadTag::PhaseTransition
+}
+
+// ---------------------------------------------------------------------------
+// L7 — SchedSwitch (OBS-9 reactor scheduler track)
+// ---------------------------------------------------------------------------
+
+/// Encode a [`PayloadSchedSwitch`] into a 16-byte buffer.
+///
+/// Wire layout (`08_OBSERVATION_v1.md` §15.6 OBS-9):
+/// ```text
+/// offset 0:  task_id_low     u32
+/// offset 4:  process_id_low  u32
+/// offset 8:  hart_id         u8
+/// offset 9:  kind            u8   (0 = Dispatch, 1 = Yield)
+/// offset 10: reason          u8   (0..3, see SchedReason)
+/// offset 11: _pad            [u8; 5]
+/// total = 16
+/// ```
+#[inline]
+pub fn encode_sched_switch(p: &PayloadSchedSwitch) -> ([u8; 16], u16) {
+    let mut buf = [0u8; 16];
+    write_u32_le(&mut buf, 0, p.task_id_low);
+    write_u32_le(&mut buf, 4, p.process_id_low);
+    write_u8(&mut buf, 8, p.hart_id);
+    write_u8(&mut buf, 9, p.kind);
+    write_u8(&mut buf, 10, p.reason);
+    // _pad bytes stay 0
+    let len = core::mem::size_of::<PayloadSchedSwitch>() as u16;
+    (buf, len)
+}
+
+/// Return the correct [`TxPayloadTag`] for a [`PayloadSchedSwitch`].
+#[inline]
+pub const fn sched_switch_tag() -> TxPayloadTag {
+    TxPayloadTag::SchedSwitch
+}
+
+// ---------------------------------------------------------------------------
+// L7 — ProcessLabel (OBS-9 §15.7 PCB-name mapping)
+// ---------------------------------------------------------------------------
+
+/// Encode a [`PayloadProcessLabel`] into a 16-byte buffer.
+///
+/// Wire layout (`08_OBSERVATION_v1.md` §15.7 OBS-9 process labels):
+/// ```text
+/// offset 0:  process_id_low  u32
+/// offset 4:  comm            [u8; 12]   PCB short name (NUL-padded ASCII)
+/// total = 16
+/// ```
+#[inline]
+pub fn encode_process_label(p: &PayloadProcessLabel) -> ([u8; 16], u16) {
+    let mut buf = [0u8; 16];
+    write_u32_le(&mut buf, 0, p.process_id_low);
+    let mut i = 0;
+    while i < 12 {
+        buf[4 + i] = p.comm[i];
+        i += 1;
+    }
+    let len = core::mem::size_of::<PayloadProcessLabel>() as u16;
+    (buf, len)
+}
+
+/// Return the correct [`TxPayloadTag`] for a [`PayloadProcessLabel`].
+#[inline]
+pub const fn process_label_tag() -> TxPayloadTag {
+    TxPayloadTag::ProcessLabel
+}
+
+/// Encode a [`PayloadProcessGroup`] into a 16-byte buffer.
+///
+/// Wire layout (`08_OBSERVATION_v1.md` §15.8 OBS-9 process groups):
+/// ```text
+/// offset 0:  process_id_low  u32
+/// offset 4:  pgid_low        u32
+/// offset 8:  sid_low         u32
+/// offset 12: _pad            u32
+/// total = 16
+/// ```
+#[inline]
+pub fn encode_process_group(p: &PayloadProcessGroup) -> ([u8; 16], u16) {
+    let mut buf = [0u8; 16];
+    write_u32_le(&mut buf, 0, p.process_id_low);
+    write_u32_le(&mut buf, 4, p.pgid_low);
+    write_u32_le(&mut buf, 8, p.sid_low);
+    // _pad bytes stay 0
+    let len = core::mem::size_of::<PayloadProcessGroup>() as u16;
+    (buf, len)
+}
+
+/// Return the correct [`TxPayloadTag`] for a [`PayloadProcessGroup`].
+#[inline]
+pub const fn process_group_tag() -> TxPayloadTag {
+    TxPayloadTag::ProcessGroup
+}
+
+/// Encode a [`PayloadProcessFork`] into a 16-byte buffer.
+///
+/// Wire layout (`08_OBSERVATION_v1.md` §15.9 OBS-9 fork edges):
+/// ```text
+/// offset 0:  parent_pid_low  u32
+/// offset 4:  child_pid_low   u32
+/// offset 8:  _flags          u32   (reserved for CLONE_*)
+/// offset 12: _pad            u32
+/// total = 16
+/// ```
+#[inline]
+pub fn encode_process_fork(p: &PayloadProcessFork) -> ([u8; 16], u16) {
+    let mut buf = [0u8; 16];
+    write_u32_le(&mut buf, 0, p.parent_pid_low);
+    write_u32_le(&mut buf, 4, p.child_pid_low);
+    write_u32_le(&mut buf, 8, p._flags);
+    // _pad stays 0
+    let len = core::mem::size_of::<PayloadProcessFork>() as u16;
+    (buf, len)
+}
+
+/// Return the correct [`TxPayloadTag`] for a [`PayloadProcessFork`].
+#[inline]
+pub const fn process_fork_tag() -> TxPayloadTag {
+    TxPayloadTag::ProcessFork
+}
+
+// ---------------------------------------------------------------------------
+// ArgValue (continuation records — `08_OBSERVATION_v1.md` §8.6)
+// ---------------------------------------------------------------------------
+
+/// Encode a [`PayloadArgValue`] into a 16-byte buffer.
+///
+/// Wire layout (§8.6):
+/// ```text
+/// offset 0:  key         u32   (DebugAnnotationNameId; daemon → "fd", "buf", …)
+/// offset 4:  value_kind  u8    (TxValueKind: 1=U64, 2=I64, 4=Ptr, 5=Errno, …)
+/// offset 5:  _pad        [u8; 3]
+/// offset 8:  value0      u64   (numeric value, low-64 of object id, etc.)
+/// total = 16
+/// ```
+#[inline]
+pub fn encode_arg_value(p: &PayloadArgValue) -> ([u8; 16], u16) {
+    let mut buf = [0u8; 16];
+    write_u32_le(&mut buf, 0, p.key);
+    write_u8(&mut buf, 4, p.value_kind);
+    // _pad bytes stay 0
+    write_u64_le(&mut buf, 8, p.value0);
+    let len = core::mem::size_of::<PayloadArgValue>() as u16;
+    (buf, len)
+}
+
+/// Return the correct [`TxPayloadTag`] for a [`PayloadArgValue`].
+#[inline]
+pub const fn arg_value_tag() -> TxPayloadTag {
+    TxPayloadTag::ArgValue
 }
 
 // ---------------------------------------------------------------------------

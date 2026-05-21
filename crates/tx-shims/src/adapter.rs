@@ -21,10 +21,10 @@ pub mod step_engine {
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
         drive_oneshot, AgentCancelPolicy, ByteProgress, CancelReason, DelegateReply,
-        DelegateRequest, DelegateState, DelegateTokenId, Errno, InterestMask, NoProgress,
-        OnBehalfOfAbort, OneShotStepOp, ScriptCtx, StepOp, StepOutcome, SubjectAuthority,
-        SubjectContext, SubjectIdentity, TokenDropPolicy, TransitionOutcome, UfdAccessKind,
-        UfdReply, UfdRequest, WaitSourceId, YieldShape,
+        DelegateRequest, DelegateState, DelegateTokenId, DriveMode, Errno, InterestMask,
+        NoProgress, OnBehalfOfAbort, OneShotStepOp, ScriptCtx, StepOp, StepOutcome,
+        SubjectAuthority, SubjectContext, SubjectIdentity, TokenDropPolicy, TransitionOutcome,
+        UfdAccessKind, UfdReply, UfdRequest, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
         register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
@@ -41,7 +41,9 @@ pub mod step_engine {
     reason = "wrap reactor userspace and wait re-exports used by tx-shims syscall and test scaffolding"
 )]
 pub mod reactor_entry {
+    pub use tx_reactor::current_task_mailbox;
     pub use tx_reactor::userspace;
     pub use tx_reactor::userspace::SyscallRequest;
     pub use tx_reactor::wait::{Mask, WaitProtocol};
+    pub use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 }

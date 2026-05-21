@@ -13,8 +13,14 @@
 //! | `OnAgent` | `DelegateRegistry::install_request` → `TaskMailbox` park → `AgentReplied`/`Abort` |
 //! | `OnTimer` | `TimerWheel::install` → `TaskMailbox` park → timer fire |
 //!
-//! Observation hooks are deliberately absent; they are added in a
-//! future PR as a single hook point inside `drive`.
+//! ## Observation
+//!
+//! `drive` is the convergence point for the observation subsystem per
+//! `docs/Txv3/08_OBSERVATION_v1.md` §2.3: it emits L2 (drive begin/end),
+//! L3 (yield begin/resume), and L4 (step begin/end with `PayloadStepOutcome`)
+//! records around every `op.step(ctx)` call site and yield resolution
+//! point. Span ids are `SpanId(u64)` only — no witnesses, guards, or
+//! borrows — so they are safe to hold across `.await` per OBS-12.
 //!
 //! txdoc anchor: `txdoc:STEP-V2-DRIVER-1`
 
@@ -26,12 +32,20 @@ use crate::adapter::step_engine::{
     DriveMode, Errno, ResumeOutcome, ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity,
     Translation, YieldShape,
 };
+use crate::adapter::wake::lookup_source;
 use crate::adapter::wake::{
-    agent_event_matches, ActiveWait, MailboxEvent, TaskMailbox, TimerGuardRole, TimerToken,
-    TimerWheel,
+    agent_event_matches, ActiveWait, MailboxEvent, TaskMailbox, TimerGuardRole, TimerWheel,
 };
 use alloc::sync::{Arc, Weak};
-use tx_substrate::wake::wait_source::lookup_source;
+use tx_observe::encode::{
+    drive_begin_tag, drive_end_tag, encode_drive_begin, encode_drive_end, encode_resume,
+    encode_step_outcome, encode_yield_begin, resume_tag, step_outcome_tag, yield_begin_tag,
+};
+use tx_observe::{EventNameId, HartEmitter, SpanId, TxTraceLevel};
+use tx_observe_types::{
+    PayloadDriveBegin, PayloadDriveEnd, PayloadResume, PayloadStepOutcome, PayloadYieldBegin,
+    TxPayloadTag,
+};
 
 use tx_subsystems::execution::WaitToken;
 use tx_subsystems::wait_source;
@@ -67,18 +81,42 @@ where
     S: StepOp<I>,
     I: SubjectIdentity,
 {
+    // L2: drive begin (returns `SpanId::NONE` if no emitter installed).
+    // `op_name_id::<S>()` uses `core::any::type_name::<S>()` (no `'static`
+    // bound) so StepOp impls that borrow from their caller (the dominant
+    // pattern in tx-shims syscall arms) still drive cleanly. Parent span
+    // is read from the per-hart slot — the syscall dispatcher installs
+    // the L0 `SyscallEnter` span there before invoking the arm so the L2
+    // record links back deterministically without every arm having to
+    // thread it through `ScriptCtx`.
+    let parent_span = tx_observe::current_parent_span();
+    let drive_span =
+        emit_drive_begin::<S, I>(mode, timer_wheel.is_some(), ctx.task_id_low(), parent_span);
+    // Install the L2 drive span as the new "current parent" so nested
+    // L3/L4 records attach to it; restored at the end of drive() below.
+    let prev_parent = tx_observe::set_current_parent_span(drive_span);
+
     let mut accumulated = S::Progress::EMPTY;
-    loop {
+    let mut iteration: u32 = 0;
+
+    let result: Result<S::Output, Errno> = 'drive: loop {
+        // L4: step begin — opens a step span attached to the drive span.
+        let step_span = emit_step_begin(iteration, drive_span);
+
         match op.step(ctx) {
             StepOutcome::Continue { progress } => {
+                emit_step_end(step_span, 0, &progress, 0, 0);
                 accumulated.extend(progress);
+                iteration = iteration.saturating_add(1);
             }
             StepOutcome::Yield { progress, shape } => {
+                let shape_kind = yield_shape_kind(&shape);
+                emit_step_end(step_span, 1, &progress, shape_kind, 0);
                 accumulated.extend(progress);
                 let progress_empty = accumulated.is_empty();
                 match mode.classify(&shape, progress_empty) {
                     AcceptOutcome::Translate(Translation::Eagain) => {
-                        return Err(Errno::EAGAIN);
+                        break 'drive Err(Errno::EAGAIN);
                     }
                     AcceptOutcome::Translate(Translation::PartialReturn) => {
                         // Surface accumulated progress as the output.
@@ -96,38 +134,321 @@ where
                             // guarantees it.
                             let output: S::Output = unsafe { core::mem::transmute_copy(&val) };
                             core::mem::forget(val);
-                            return Ok(output);
+                            break 'drive Ok(output);
                         }
-                        return Err(Errno::EAGAIN);
+                        break 'drive Err(Errno::EAGAIN);
                     }
                     AcceptOutcome::Translate(Translation::UnsupportedShape) => {
-                        return Err(Errno::ENOSYS);
+                        break 'drive Err(Errno::ENOSYS);
                     }
                     AcceptOutcome::Resolve => {
-                        let resume =
+                        // L3: yield begin — opens a yield span attached to the drive span.
+                        let yield_span =
+                            emit_yield_begin(drive_span, ctx.task_id_low(), shape_kind);
+
+                        let (resume, wait_gen) =
                             resolve_yield(&shape, mailbox, delegate_registry, timer_wheel).await;
+
+                        // L3: resume instant + yield span close. The
+                        // `wait_gen` returned by `resolve_yield` matches
+                        // the `WaitGeneration` minted on the mailbox; the
+                        // producer side's `notify_emit` carried the same
+                        // value in `PayloadWaitSourceNotify`, so the
+                        // daemon's flow-id hash converges and Perfetto
+                        // draws the wake.notify → Resume arrow.
+                        emit_resume_end(yield_span, &resume, wait_gen);
+
                         // D9-A: translate Aborted(Interrupted/Killed) to
                         // the appropriate errno without calling
                         // apply_resume (which defaults to rejecting
                         // non-Retry outcomes).
                         if matches!(resume, ResumeOutcome::Aborted(AbortReason::Interrupted)) {
-                            return Err(Errno::EINTR);
+                            break 'drive Err(Errno::EINTR);
                         }
                         if matches!(resume, ResumeOutcome::Aborted(AbortReason::Killed)) {
-                            return Err(Errno::EINTR);
+                            break 'drive Err(Errno::EINTR);
                         }
-                        op.apply_resume(resume).map_err(|_| Errno::EIO)?;
+                        match op.apply_resume(resume) {
+                            Ok(()) => {}
+                            Err(_) => break 'drive Err(Errno::EIO),
+                        }
+                        iteration = iteration.saturating_add(1);
                     }
                 }
             }
-            StepOutcome::Done(t) => return Ok(t),
-            StepOutcome::Err(e) => return Err(e),
+            StepOutcome::Done(t) => {
+                emit_step_end::<S::Progress>(step_span, 2, &S::Progress::EMPTY, 0, 0);
+                break 'drive Ok(t);
+            }
+            StepOutcome::Err(e) => {
+                emit_step_end::<S::Progress>(step_span, 3, &S::Progress::EMPTY, 0, e.linux_i32());
+                break 'drive Err(e);
+            }
+        }
+    };
+
+    // L2: drive end — closes the drive span with final outcome.
+    emit_drive_end(drive_span, &result);
+    // Restore the prior parent-span slot so an outer drive (or the
+    // syscall dispatcher) sees the same value it installed.
+    tx_observe::set_current_parent_span(prev_parent);
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Observation emit helpers
+//
+// Each helper is a no-op when `tx_observe::current()` returns `None` (no
+// emitter installed, no-board, or level gate off). All helpers are
+// `#[inline]` so the dead-code cost when observation is off is essentially
+// a single null-pointer compare per call site.
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn emit_drive_begin<S, I>(
+    mode: DriveMode,
+    has_deadline: bool,
+    task_id_low: u32,
+    parent: SpanId,
+) -> SpanId
+where
+    S: StepOp<I>,
+    I: SubjectIdentity,
+{
+    let Some(em) = tx_observe::current() else {
+        return SpanId::NONE;
+    };
+    let mode_wire = match mode {
+        DriveMode::Nonblocking => 0,
+        DriveMode::Waiting => 1,
+        DriveMode::Selecting => 2,
+    };
+    let name = op_name_id::<S>();
+    let payload = PayloadDriveBegin {
+        op_type: name.raw(),
+        mode: mode_wire,
+        // Interrupt policy is not yet plumbed through the drive signature;
+        // default to Interruptible (1) per the spec's MVP scope.
+        interrupt: 1,
+        has_deadline: has_deadline as u8,
+        _pad: 0,
+        task_id_low,
+    };
+    let (enc, len) = encode_drive_begin(&payload);
+    em.span_begin(
+        TxTraceLevel::Drive,
+        name,
+        parent,
+        drive_begin_tag(),
+        &enc[..len as usize],
+    )
+}
+
+/// Stable `EventNameId` for a [`StepOp`] type without requiring `'static`.
+///
+/// Uses `core::any::type_name::<S>()` (no lifetime bound) hashed to u32.
+/// This trades stability across-build (vs `TypeId`) for support of borrowed
+/// `StepOp` impls — the dominant pattern in tx-shims syscall arms where the
+/// op holds an `&'a PageCache` etc. The daemon resolves the u32 back to a
+/// human name from a build-emitted `names.json` per OBS-V1-OPNAME.
+#[inline]
+fn op_name_id<S: ?Sized>() -> EventNameId {
+    EventNameId::from_raw(tx_observe::fnv1a32(core::any::type_name::<S>().as_bytes()))
+}
+
+// Stable event names for the records that have no per-instance
+// discriminant. Computed at compile time via `tx_observe::fnv1a32` so the
+// trace carries the hash and the host-side `names.json` carries the
+// string. Reuses the same FNV-1a 32 hash that `op_name_id::<S>()` uses
+// for drive-level type-name hashes — single hash space for every
+// `EventNameId` source so any name collision is visible at the daemon.
+const RESUME_NAME: EventNameId = EventNameId::from_raw(tx_observe::fnv1a32(b"resume"));
+const STEP_NAME: EventNameId = EventNameId::from_raw(tx_observe::fnv1a32(b"step"));
+const YIELD_ON_WAIT_SOURCE_NAME: EventNameId =
+    EventNameId::from_raw(tx_observe::fnv1a32(b"yield.OnWaitSource"));
+const YIELD_ON_AGENT_NAME: EventNameId =
+    EventNameId::from_raw(tx_observe::fnv1a32(b"yield.OnAgent"));
+const YIELD_ON_TIMER_NAME: EventNameId =
+    EventNameId::from_raw(tx_observe::fnv1a32(b"yield.OnTimer"));
+
+#[inline]
+fn emit_step_begin(_iteration: u32, parent: SpanId) -> SpanId {
+    // Step spans share a single stable name (`step`); the per-iteration
+    // index is implicit in the begin-end timing relative to the parent
+    // drive span. Embedding iteration in the EventNameId was tried but
+    // produced 1k+ distinct hashes per drive (one per iteration), which
+    // both flooded the Perfetto name interner and rendered as
+    // `name_0xN` chips that were hard to read. The iteration count is
+    // still recoverable from the position of the step span within the
+    // drive span when needed.
+    let Some(em) = tx_observe::current() else {
+        return SpanId::NONE;
+    };
+    em.span_begin(
+        TxTraceLevel::Step,
+        STEP_NAME,
+        parent,
+        TxPayloadTag::None,
+        &[],
+    )
+}
+
+#[inline]
+fn emit_step_end<P: StepProgress>(
+    step_span: SpanId,
+    variant: u8,
+    progress: &P,
+    shape_kind: u8,
+    errno: i32,
+) {
+    let Some(em) = current_if_active(step_span) else {
+        return;
+    };
+    let payload = PayloadStepOutcome {
+        variant,
+        progress_empty: progress.is_empty() as u8,
+        progress_kind: progress.trace_kind(),
+        shape_kind,
+        errno,
+        progress_value: progress.trace_value(),
+        _pad: 0,
+    };
+    let (enc, len) = encode_step_outcome(&payload);
+    em.span_end(step_span, step_outcome_tag(), &enc[..len as usize]);
+}
+
+#[inline]
+fn emit_yield_begin(drive_span: SpanId, task_id_low: u32, shape_kind: u8) -> SpanId {
+    let Some(em) = tx_observe::current() else {
+        return SpanId::NONE;
+    };
+    let payload = PayloadYieldBegin {
+        shape_kind,
+        _pad: [0; 3],
+        task_id_low,
+        // `wait_generation` is populated once reactor parking writes it
+        // to the mailbox; OBS-3b-followup will replace 0 with the real
+        // generation pulled from the resume path.
+        wait_generation: 0,
+    };
+    let (enc, len) = encode_yield_begin(&payload);
+    let name = match shape_kind {
+        1 => YIELD_ON_WAIT_SOURCE_NAME,
+        2 => YIELD_ON_AGENT_NAME,
+        3 => YIELD_ON_TIMER_NAME,
+        _ => YIELD_ON_WAIT_SOURCE_NAME,
+    };
+    em.span_begin(
+        TxTraceLevel::Yield,
+        name,
+        drive_span,
+        yield_begin_tag(),
+        &enc[..len as usize],
+    )
+}
+
+#[inline]
+fn emit_resume_end(yield_span: SpanId, resume: &ResumeOutcome, wait_gen: u64) {
+    let Some(em) = current_if_active(yield_span) else {
+        return;
+    };
+    let (resume_kind, abort_reason) = resume_wire_fields(resume);
+    let payload = PayloadResume {
+        resume_kind,
+        abort_reason,
+        _pad: [0; 2],
+        object_id_low: 0,
+        // `wait_gen` is the `WaitGeneration::raw()` minted by
+        // `resolve_yield`; matches `PayloadWaitSourceNotify.wait_generation_low`
+        // on the producer side so the daemon's flow-id hash matches
+        // both ends.
+        wait_generation: wait_gen,
+    };
+    let (enc, len) = encode_resume(&payload);
+    em.instant(
+        TxTraceLevel::Yield,
+        RESUME_NAME,
+        yield_span,
+        resume_tag(),
+        &enc[..len as usize],
+    );
+    em.span_end(yield_span, TxPayloadTag::None, &[]);
+}
+
+#[inline]
+fn emit_drive_end<T>(drive_span: SpanId, result: &Result<T, Errno>) {
+    let Some(em) = current_if_active(drive_span) else {
+        return;
+    };
+    let (errno, result_kind) = match result {
+        Ok(_) => (0i32, 0u8),
+        Err(e) => (e.linux_i32(), 1u8),
+    };
+    let payload = PayloadDriveEnd {
+        ret: 0,
+        errno,
+        result_kind,
+        _pad: [0; 3],
+    };
+    let (enc, len) = encode_drive_end(&payload);
+    em.span_end(drive_span, drive_end_tag(), &enc[..len as usize]);
+}
+
+/// Returns `Some(emitter)` only when the span was successfully opened.
+///
+/// A `SpanId::NONE` indicates the span-begin emit was skipped (no emitter
+/// at the time, or filter rejected it); we must not emit a matching
+/// span-end against a missing span id.
+#[inline]
+fn current_if_active(span: SpanId) -> Option<&'static HartEmitter> {
+    if span == SpanId::NONE {
+        return None;
+    }
+    tx_observe::current()
+}
+
+#[inline]
+fn yield_shape_kind(shape: &YieldShape) -> u8 {
+    match shape {
+        YieldShape::OnWaitSource { .. } | YieldShape::OnEdge { .. } => 1,
+        YieldShape::OnAgent { .. } => 2,
+        YieldShape::OnTimer { .. } => 3,
+    }
+}
+
+#[inline]
+fn resume_wire_fields(resume: &ResumeOutcome) -> (u8, u8) {
+    match resume {
+        ResumeOutcome::Retry => (0, 0),
+        ResumeOutcome::WithReply(_) => (1, 0),
+        ResumeOutcome::TimerExpired(_) => (2, 0),
+        ResumeOutcome::Aborted(reason) => {
+            let abort = match reason {
+                // 0 = Signal (covers both Interruptible and Killed wake aborts).
+                AbortReason::Interrupted | AbortReason::Killed => 0,
+                AbortReason::Canceled => 1,
+                AbortReason::TimedOut => 2,
+                AbortReason::AgentDied => 3,
+                AbortReason::ScopeAbandoned => 4, // wire `BorrowerExited`
+            };
+            (3, abort)
         }
     }
 }
 
 /// Resolve a yield shape. Returns the [`ResumeOutcome`] to pass to
-/// [`StepOp::apply_resume`].
+/// [`StepOp::apply_resume`] paired with the `WaitGeneration::raw()` the
+/// resolver minted on this task's mailbox (`0` when no parking happened
+/// — e.g. fallback global-registry path on `OnWaitSource` without a
+/// mailbox, or `OnAgent`/`OnTimer` synchronous early returns).
+///
+/// The generation is threaded back so `drive` can populate
+/// `PayloadResume.wait_generation`, matching the value emitted on the
+/// producer side via `WaitSource::notify_emit` →
+/// `PayloadWaitSourceNotify.wait_generation_low`. Identical material on
+/// both sides lets the host daemon hash `(task_id, wait_gen, kind)` to
+/// the same Perfetto flow id, drawing the wake.notify ↔ Resume arrows
+/// the spec's §6 worked example describes.
 ///
 /// When the required runtime is not provided (`None`), falls back
 /// gracefully: `OnWaitSource` uses the global channel registry;
@@ -139,7 +460,7 @@ async fn resolve_yield(
     mailbox: Option<&Arc<TaskMailbox>>,
     delegate_registry: Option<&DelegateRegistry>,
     timer_wheel: Option<&TimerWheel>,
-) -> ResumeOutcome {
+) -> (ResumeOutcome, u64) {
     match shape {
         YieldShape::OnWaitSource { source, interests } => {
             resolve_on_wait_source(*source, *interests, mailbox).await
@@ -156,7 +477,10 @@ async fn resolve_yield(
             deadline,
             cancel,
         } => {
-            resolve_on_agent(
+            // `OnAgent` parks on the delegate registry; no `WaitGeneration`
+            // mints here (the delegate-token-id substitutes for it on the
+            // wire today). Reserved for OBS-9 follow-up.
+            let outcome = resolve_on_agent(
                 endpoint,
                 request,
                 token,
@@ -166,11 +490,15 @@ async fn resolve_yield(
                 delegate_registry,
                 timer_wheel,
             )
-            .await
+            .await;
+            (outcome, 0)
         }
 
         YieldShape::OnTimer { token, deadline } => {
-            resolve_on_timer(*token, *deadline, mailbox, timer_wheel).await
+            // `OnTimer` parks on the timer wheel via a `TimerToken`; the
+            // wheel's token-id is the matching discriminant on the wire.
+            let outcome = resolve_on_timer(*token, *deadline, mailbox, timer_wheel).await;
+            (outcome, 0)
         }
     }
 }
@@ -183,7 +511,7 @@ async fn resolve_on_wait_source(
     source: crate::adapter::step_engine::WaitSourceId,
     interests: crate::adapter::step_engine::InterestMask,
     mailbox: Option<&Arc<TaskMailbox>>,
-) -> ResumeOutcome {
+) -> (ResumeOutcome, u64) {
     if let Some(mbox) = mailbox {
         let gen = mbox.next_generation();
         let active = ActiveWait::new(gen, source, interests);
@@ -203,17 +531,25 @@ async fn resolve_on_wait_source(
             ws.unregister(id);
         }
 
-        // D9-A: signal interrupt during blocked wait.
+        // D9-A: signal interrupt during blocked wait. The generation we
+        // minted is still the right discriminant for the flow id — the
+        // wake came from the interruptible-signal path, which fires
+        // through the same mailbox with the same generation tag.
         if interrupted {
-            return ResumeOutcome::Aborted(AbortReason::Interrupted);
+            return (ResumeOutcome::Aborted(AbortReason::Interrupted), gen.raw());
         }
+        (ResumeOutcome::Retry, gen.raw())
     } else {
+        // Fallback path: no per-task mailbox, so no `WaitGeneration` is
+        // minted. The global registry path doesn't have flow-id material
+        // beyond the `WaitToken`; return 0 (the "no-gen" sentinel the
+        // daemon's flow-hash treats as a never-matches placeholder).
         let token = WaitToken::new(source.raw(), interests.raw());
         if let Some(future) = wait_source::wait_on_token(token) {
             future.await;
         }
+        (ResumeOutcome::Retry, 0)
     }
-    ResumeOutcome::Retry
 }
 
 // ---------------------------------------------------------------------------
@@ -302,12 +638,23 @@ async fn resolve_on_timer(
         return ResumeOutcome::Retry;
     };
 
-    // Convert TimerId → TimerToken (From impl added in PR-7).
-    let timer_token = TimerToken::from(token);
-
     // PR-8B: Install the timer with a weak mailbox reference so
     // the reactor's clock tick can post TimerFired on expiry.
+    // `install_for_task` allocates a fresh wheel-internal
+    // `TimerToken` (from the wheel's `next_token` counter) — that
+    // is the token the reactor's `fire_due` posts in
+    // `MailboxEvent::TimerFired`, so the predicate below must
+    // compare against the GUARD'S token, NOT the caller-passed
+    // `TimerId` (which is opaque-to-the-wheel and frequently a
+    // hard-coded constant like `TimerId::new(1)` from
+    // `NanosleepOp::step`). Using the constant token caused
+    // every `OnTimer` yield to wait forever for a token-1 event
+    // that never matched the wheel-allocated token; sigtimedwait
+    // bodies appeared to spin via the unrelated `SignalDelivered`
+    // wake path (which doesn't check the token) when the child
+    // exited fast, but hung outright when the child was slower.
     let _guard = tw.install_for_task(deadline, TimerGuardRole::PrimarySleep, Arc::downgrade(mbox));
+    let timer_token = _guard.token();
 
     // Park on mailbox until the reactor's timer-tick fires the
     // wheel and posts a TimerFired event for our token.

@@ -15,6 +15,14 @@ const E_FAULT: i32 = 14;
 const E_PERM: i32 = 1;
 const E_SRCH: i32 = 3;
 
+fn uts_field(buf: &[u8; 6 * 65], index: usize) -> &[u8] {
+    let start = index * 65;
+    let end = start + 65;
+    let field = &buf[start..end];
+    let n = field.iter().position(|b| *b == 0).unwrap_or(field.len());
+    &field[..n]
+}
+
 // -----------------------------------------------------------------
 // F_DUPFD / F_DUPFD_CLOEXEC / F_GETFL / F_SETFL.
 // -----------------------------------------------------------------
@@ -145,6 +153,53 @@ fn dispatch_kill_self_with_sigterm_succeeds() {
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Return(0));
+}
+
+/// `kill(target, sig)` from a non-privileged caller whose uid does
+/// not match the target's returns `-EPERM`. Locks in the
+/// cred-check wiring: `sys_kill` must route through
+/// `script_kill_process` (which runs `cred::require_signal_send`
+/// against the caller's syscall-entry `CredSnapshot`), **not** the
+/// primitive `step_kill_process` that bypasses authorization.
+#[test]
+fn dispatch_kill_different_uid_returns_neg_eperm() {
+    use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
+
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+
+    // Fork a child so its pid is registered in the global lookup
+    // (`process_by_pid`) that `sys_kill` consults. The child
+    // inherits the parent's root cred at fork time; we override
+    // both creds below.
+    let child =
+        tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false).expect("fork");
+    let child_pid = child.pid.0 as u64;
+
+    // Drop the caller to (uid=1000, gid=1000) with empty caps so
+    // CAP_KILL no longer bypasses the uid match.
+    clear_caps_for_test(&parent);
+    set_cred_ids_for_test(&parent, 1000, 1000, 1000, 1000, 1000, 1000);
+
+    // Drop the target to (uid=2000, gid=2000), non-overlapping
+    // with the caller's (uid, euid). signal_permitted's day-1 rule
+    // collapses to (source.uid|euid) × (target.uid|euid); no match.
+    clear_caps_for_test(&child);
+    set_cred_ids_for_test(&child, 2000, 2000, 2000, 2000, 2000, 2000);
+
+    // Construct ctx AFTER cred manipulation so the snapshot
+    // SyscallCtx::new captures reflects the deprivileged state.
+    let ctx = make_ctx(parent.clone(), parent_thread);
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [child_pid, 15, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(E_PERM));
+    // Target must remain live — the cred check blocked before any
+    // post happened.
+    assert!(!child.is_zombie());
 }
 
 /// `kill(unknown_pid, sig)` returns `-ESRCH`.
@@ -306,13 +361,60 @@ fn dispatch_uname_writes_utsname_to_user() {
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Return(0));
-    // sysname starts at offset 0; expect "Linux" then NUL pad.
-    assert_eq!(&buf[0..5], b"Linux");
+    assert_eq!(uts_field(&buf, 0), b"Linux");
     assert_eq!(buf[5], 0, "sysname must be NUL-terminated after \"Linux\"");
-    // release starts at offset 130 (2 × 65); expect "6.1.0" prefix.
-    assert_eq!(&buf[130..135], b"6.1.0");
-    // machine starts at offset 260 (4 × 65); expect "riscv64".
-    assert_eq!(&buf[260..267], b"riscv64");
+    assert!(uts_field(&buf, 2).starts_with(b"6.1.0"));
+    assert_eq!(uts_field(&buf, 4), b"riscv64");
+}
+
+struct LoongArchUnamePmap;
+
+impl PlatformConfig for LoongArchUnamePmap {
+    const ARCH: Arch = Arch::LoongArch64;
+    const BOARD: &'static str = "shims-test-la64";
+}
+
+impl PmapIf for LoongArchUnamePmap {
+    fn create_pmap_root() -> Result<PmapRoot, PmapError> {
+        ShimsTestPmap::create_pmap_root()
+    }
+}
+
+impl EntropyIf for LoongArchUnamePmap {}
+impl tx_hal::AuxvIf for LoongArchUnamePmap {}
+impl SmpIf for LoongArchUnamePmap {}
+impl tx_hal::TimeIf for LoongArchUnamePmap {
+    fn read_ns() -> u64 {
+        ShimsTestPmap::read_ns()
+    }
+
+    fn set_deadline_ns(deadline_ns: u64) {
+        ShimsTestPmap::set_deadline_ns(deadline_ns);
+    }
+
+    fn cancel_deadline() {
+        ShimsTestPmap::cancel_deadline();
+    }
+
+    fn frequency_hz() -> u64 {
+        ShimsTestPmap::frequency_hz()
+    }
+}
+
+#[test]
+fn dispatch_uname_uses_selected_platform_machine() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let mut buf = [0u8; 6 * 65];
+    let r = block_on(dispatch::<LoongArchUnamePmap>(
+        SyscallRequest::new(NR_UNAME, [buf.as_mut_ptr() as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(0));
+    assert_eq!(uts_field(&buf, 4), b"loongarch64");
 }
 
 /// `uname(NULL)` returns `-EFAULT`.
@@ -415,12 +517,12 @@ fn dispatch_prlimit64_cross_pid_returns_neg_eperm() {
 // -----------------------------------------------------------------
 
 /// `rt_sigreturn` returns `-ENOSYS` for now. The
-/// `SignalFrameIf::restore_signal_frame` surface needs a
-/// `TrapFrameMut` the dispatcher doesn't yet expose; carryover
-/// is documented at the syscall arm itself
-/// (`TODO(phase-signal-frame)`).
+/// `rt_sigreturn` with no parked signal frame returns `-EFAULT`.
+/// The kernel has no pre-handler context to restore — POSIX leaves
+/// this case undefined; we refuse rather than corrupt the live
+/// `saved_user_context`.
 #[test]
-fn dispatch_rt_sigreturn_returns_neg_enosys() {
+fn dispatch_rt_sigreturn_without_frame_returns_neg_efault() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
@@ -430,7 +532,41 @@ fn dispatch_rt_sigreturn_returns_neg_enosys() {
         SyscallRequest::new(NR_RT_SIGRETURN, [0; 6]),
         &ctx,
     ));
+    assert_eq!(r, SyscallResult::Error(14)); // EFAULT
+}
+
+/// `rt_sigreturn` with a parked signal frame restores it into
+/// `saved_user_context` and returns `SigreturnRestored` so the
+/// syscall-return path in `thread_future` skips the normal
+/// pending-return drain.
+#[test]
+fn dispatch_rt_sigreturn_restores_parked_signal_context() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    // Park a synthetic pre-signal context. In production this is
+    // stored at `thread_future.rs:285` by the AST checkpoint when
+    // it flips `saved_user_context` to the handler-entry context.
+    let payload = thread.payload_cap().expect("thread has payload");
+    let mut parked = tx_hal::UserTrapContext::empty();
+    parked.pc = 0x1234_5678;
+    parked.regs[10] = 0xdead_beef;
+    payload.store_saved_signal_context(Some(parked));
+
+    let ctx = make_ctx(proc_cap, thread.clone());
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_RT_SIGRETURN, [0; 6]),
+        &ctx,
+    ));
     assert_eq!(r, SyscallResult::SigreturnRestored);
+
+    let restored = thread
+        .payload_cap()
+        .expect("thread has payload")
+        .saved_user_context()
+        .expect("rt_sigreturn must have stored the parked context");
+    assert_eq!(restored.pc, 0x1234_5678);
+    assert_eq!(restored.regs[10], 0xdead_beef);
 }
 
 // E_BADF is reserved for the F_DUPFD-against-closed-fd shape;

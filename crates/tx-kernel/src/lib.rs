@@ -17,6 +17,25 @@ pub mod vdso;
 
 use tx_hal::{BootHandoff, TxPlatform};
 
+/// Bounded-trace dump threshold.
+///
+/// When set to `N > 0`, the kernel dumps the observation ring over the
+/// console and powers off after `N` records have been emitted. Set to
+/// `0` (disabled) for normal runs where init eventually exits and the
+/// existing `init/exec.rs` dump path captures the full trace.
+///
+/// Used by long-running workloads where init never naturally exits in
+/// a useful wall clock (e.g. oscomp's continuous basic-musl → busybox
+/// → libctest → cyclictest → LTP test-group sequence). A value of
+/// roughly 2–4× the basic-musl record budget (~10 000 records) keeps
+/// the dump fast while comfortably covering the early test groups
+/// before the producer starts wrapping the ring.
+///
+/// The threshold is installed once at BSP substrate-init time
+/// (`init.rs::init_substrate_if_ready`) via
+/// `tx_observe::set_dump_threshold`.
+pub const OBSERVE_DUMP_THRESHOLD: u64 = 0;
+
 #[cfg(all(not(target_os = "none"), not(test)))]
 mod host_check_allocator {
     use core::alloc::{GlobalAlloc, Layout};

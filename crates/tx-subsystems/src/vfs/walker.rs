@@ -87,8 +87,6 @@ use crate::mount::{MountIdentity, MountPayload};
 use crate::vfs::structure::{Credential, DEntry, InlineName, OpenFile, OpenFileFlags, RNode};
 use crate::vfs::FsOps;
 
-use super::predicates;
-
 /// POSIX symlink-loop budget. Matches Linux's `MAXSYMLINKS = 40`.
 /// The 41st observed symlink (after 40 hops have already been
 /// substituted into the path) returns `Errno::ELOOP`.
@@ -204,11 +202,22 @@ pub fn step_open<'g>(
     };
 
     // Validate the requested open mode against the terminal inode's
-    // R/W permission bits.
+    // R/W permission bits. Routes through the cred::checks witness
+    // surface rather than calling vfs::predicates directly — same
+    // bit math, intact witness chain. The _w witness is dropped
+    // because the publication site (OpenFile::new_cap_with_dentry
+    // below) does not yet consume an OpenAuthorized<'g> token; when
+    // it does, this is the mint point.
     let terminal_meta = dentry.rnode().meta();
-    if let Err(err) = predicates::check_open_perm(&terminal_meta, flags, cred) {
-        return V3::err(err.into());
-    }
+    let _w = match crate::cred::checks::require_open_with_walker_cred(
+        cred,
+        &terminal_meta,
+        flags,
+        guard,
+    ) {
+        Ok(w) => w,
+        Err(err) => return V3::err(err.into()),
+    };
 
     let rnode = dentry.rnode().clone();
     match OpenFile::new_cap_with_dentry(rnode, flags, dentry) {
@@ -230,9 +239,39 @@ pub fn step_open<'g>(
 /// `MountPayload::fs_ops` directly. The field is populated at
 /// mount-publication time.
 pub(crate) fn fs_ops_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<Arc<dyn FsOps>> {
-    let mount_payload_weak: Weak<MountPayload> = dentry.rnode().containing_mount_weak()?;
-    let payload = mount_payload_weak.upgrade(guard)?;
-    Some(payload.fs_ops().clone())
+    let rnode = dentry.rnode();
+    let mount_payload_weak: Weak<MountPayload> = match rnode.containing_mount_weak() {
+        Some(w) => w,
+        None => {
+            use crate::vfs::resolution::diagnostic;
+            diagnostic::record_ctx(
+                1, // fs_ops_for: no containing_mount_weak
+                dentry.name().as_bytes(),
+                rnode.fs_object_id(),
+                b"", // fs_ops_for doesn't have path context
+                false,
+            );
+            diagnostic::record_label(b"fs_ops_for: no containing_mount");
+            return None;
+        }
+    };
+    let payload = match mount_payload_weak.upgrade(guard) {
+        Some(p) => p,
+        None => {
+            use crate::vfs::resolution::diagnostic;
+            diagnostic::record_ctx(
+                10, // fs_ops_for: weak upgrade failed
+                dentry.name().as_bytes(),
+                rnode.fs_object_id(),
+                b"",
+                true, // had containing_mount, just dead
+            );
+            diagnostic::record_label(b"fs_ops_for: weak upgrade dead");
+            return None;
+        }
+    };
+    let ops = payload.fs_ops().clone();
+    Some(ops)
 }
 
 /// Like [`fs_ops_for`] but takes an `RNode` directly — used by

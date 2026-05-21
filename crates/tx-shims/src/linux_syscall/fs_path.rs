@@ -5,6 +5,10 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+// The alias-name `cred_checks` is required by
+// `xtask lint invariants cred-check` — see CRED_CHECK_SIGNALS in
+// xtask/src/lint_invariants_cred_check.rs.
+use tx_subsystems::cred::checks as cred_checks;
 use tx_subsystems::mount::MountPayload;
 
 // =====================================================================
@@ -70,12 +74,20 @@ use tx_subsystems::mount::MountPayload;
 #[cfg_attr(not(test), allow(clippy::extra_unused_type_parameters))]
 #[cfg_attr(test, allow(clippy::extra_unused_type_parameters))]
 /// Translate a dirfd into the root dentry for path resolution.
-/// Returns `EBADF` for non-`AT_FDCWD` dirfds (dirfd support TBD).
+/// `AT_FDCWD` resolves to the process's cwd; any other dirfd is
+/// looked up in the fd table and must reference a directory
+/// (`OpenFile::opendir_dentry()` carries the dentry for fds opened
+/// with `O_DIRECTORY`). Returns `EBADF` for closed/invalid fds and
+/// `ENOTDIR` for fds that aren't directories.
 fn resolve_cwd(dirfd: i32, ctx: &SyscallCtx) -> Result<Cap<DEntry>, i32> {
-    if dirfd != AT_FDCWD {
+    if dirfd == AT_FDCWD {
+        return ctx.process.cwd().ok_or(ENOENT_VALUE);
+    }
+    if dirfd < 0 {
         return Err(EBADF_VALUE);
     }
-    ctx.process.cwd().ok_or(ENOENT_VALUE)
+    let open_file = ctx.process.fd(dirfd as u32).ok_or(EBADF_VALUE)?;
+    open_file.opendir_dentry().ok_or(ENOTDIR_VALUE)
 }
 
 fn resolve_path_at<P: PmapIf>(
@@ -84,15 +96,7 @@ fn resolve_path_at<P: PmapIf>(
     cred: &Credential,
     ctx: &SyscallCtx<'_>,
 ) -> Result<Cap<DEntry>, i32> {
-    if dirfd != AT_FDCWD {
-        // TODO(phase-dirfd): real dirfd-relative paths once the fd
-        // table grows directory-fd semantics.
-        return Err(EBADF_VALUE);
-    }
-    let cwd: Cap<DEntry> = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return Err(EBADF_VALUE),
-    };
+    let cwd: Cap<DEntry> = resolve_cwd(dirfd, ctx)?;
     let guard = step_engine::guard();
     // Uses `step_walk` (consuming `FsOps` via the direct
     // `MountPayload::fs_ops` field) and matches the four-variant
@@ -213,6 +217,22 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
     };
     let walker_cred = ctx.walker_cred();
     let new_mode = (mode & 0o7777) as u16;
+
+    // Cred check at the syscall arm using ctx.cred_snapshot().
+    // Per-FS step_chmod impls (tmpfs / devfs / bdevfs / procfs)
+    // also enforce the rule internally; this is defense-in-depth at
+    // the canonical cred::checks::* seam per cred_service_v_1 §"Cred
+    // owns credential semantics". When the per-FS check is removed
+    // in a follow-up, this remains the single enforcement site.
+    let target_dentry = match walk_from(rooted_at.clone(), &path, &walker_cred) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
+    let target_meta = target_dentry.rnode().meta();
+    if let Err(e) = cred_checks::authorize_chmod(ctx.cred_snapshot(), &target_meta, new_mode) {
+        return SyscallResult::error_from(e);
+    }
+
     let result = {
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = ChmodOp {
@@ -220,7 +240,7 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
             path: &path,
             mode: new_mode,
             cred: &walker_cred,
-            target: None,
+            target: Some(target_dentry),
         };
         step_engine::drive_oneshot(&mut op, &mut script_ctx)
     };
@@ -257,6 +277,19 @@ pub(super) fn sys_fchownat<P: PmapIf>(
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
+
+    // Cred check at the syscall arm using ctx.cred_snapshot(). Same
+    // defense-in-depth role as sys_fchmodat — per-FS step_chown
+    // impls also enforce the rule.
+    let target_dentry = match walk_from(rooted_at.clone(), &path, &walker_cred) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
+    let target_meta = target_dentry.rnode().meta();
+    if let Err(e) = cred_checks::authorize_chown(ctx.cred_snapshot(), &target_meta, uid, gid) {
+        return SyscallResult::error_from(e);
+    }
+
     let result = {
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = ChownOp {
@@ -265,7 +298,7 @@ pub(super) fn sys_fchownat<P: PmapIf>(
             uid,
             gid,
             cred: &walker_cred,
-            target: None,
+            target: Some(target_dentry),
         };
         step_engine::drive_oneshot(&mut op, &mut script_ctx)
     };
@@ -360,7 +393,7 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(m) => m,
-            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
     let mode_bits = inode_meta.mode as u32;
@@ -467,7 +500,7 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
 
@@ -483,7 +516,7 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(ChdirOutcome::Replaced { .. }) => SyscallResult::Return(0),
         Ok(ChdirOutcome::ZombieIgnored) => SyscallResult::Error(ESRCH_VALUE),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -521,7 +554,7 @@ pub(super) fn sys_getcwd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     let path = match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(Some(p)) => p,
         Ok(None) => return SyscallResult::Error(ENOENT_VALUE),
-        Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
     };
     // `path` is the rendered absolute path bytes (no NUL terminator);
     // `size` must accommodate `path.len() + 1` to fit the terminator.
@@ -536,7 +569,7 @@ pub(super) fn sys_getcwd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     buf.extend_from_slice(&path);
     buf.push(0);
     if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &buf) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(needed as i64)
 }

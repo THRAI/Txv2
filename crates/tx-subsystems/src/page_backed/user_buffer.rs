@@ -115,6 +115,18 @@ impl UserBuffer {
     }
 }
 
+/// Outcome of a single chunk copy between a materialised PC frame and
+/// user-space memory via `AddressSpace::copy_*_user`.
+enum UserChunkOutcome {
+    /// Chunk copied in full.
+    Copied,
+    /// Fatal error (EFAULT, EIO, etc.).
+    Fault(Errno),
+    /// User-space page needs async materialisation; yield so the
+    /// reactor can re-poll after wake.
+    Blocked { source: u64, interests: u64 },
+}
+
 fn step_range_with_user_buffer(
     pc: &PageContainer,
     of: &OpenFile,
@@ -158,16 +170,31 @@ fn step_range_with_user_buffer(
                     aspace,
                     guard,
                 ) {
-                    Ok(()) => {
+                    UserChunkOutcome::Copied => {
                         advanced += chunk;
                         offset += chunk as u64;
                     }
-                    Err(errno) => {
+                    UserChunkOutcome::Fault(errno) => {
                         if advanced == 0 {
                             return V3::err(errno.into());
                         }
                         of.set_offset(offset);
                         return V3::done(advanced);
+                    }
+                    UserChunkOutcome::Blocked { source, interests } => {
+                        if advanced == 0 {
+                            return V3::yield_on_wait_source(
+                                ByteProgress::EMPTY,
+                                source,
+                                interests,
+                            );
+                        }
+                        of.set_offset(offset);
+                        return V3::yield_on_wait_source(
+                            ByteProgress::new(advanced),
+                            source,
+                            interests,
+                        );
                     }
                 }
             }
@@ -232,8 +259,11 @@ fn copy_chunk_user(
     already_advanced: usize,
     aspace: &AddressSpace,
     guard: &Guard<'_>,
-) -> Result<(), Errno> {
-    let frame_base = page_allocator::frame_kernel_addr(ppn).map_err(|_| Errno::EIO)?;
+) -> UserChunkOutcome {
+    let frame_base = match page_allocator::frame_kernel_addr(ppn) {
+        Ok(p) => p,
+        Err(_) => return UserChunkOutcome::Fault(Errno::EIO),
+    };
     // SAFETY: frame_base is the kernel direct-map view of the
     // materialised PC frame. We hold the materialisation pin via the
     // caller's `MaterializedPage`. `within_page + chunk <= USER_PAGE_SIZE`
@@ -250,16 +280,20 @@ fn copy_chunk_user(
             let user_dst = UserPtr::<u8>::new(dst.addr() + already_advanced);
             use crate::page_backed::adapter::step_engine::StepOutcome as V3;
             match aspace.copy_to_user(user_dst, kernel_slice, guard) {
-                V3::Done(n) if n == chunk => Ok(()),
-                V3::Continue { progress, .. } if progress.bytes() == chunk => Ok(()),
-                V3::Done(_) | V3::Continue { .. } => Err(Errno::EFAULT),
-                V3::Err(e) => Err(Errno::from(e)),
-                // For per-chunk copies we treat any block as EFAULT
-                // here — the outer step machinery already handles
-                // PC-side blocks; user-side blocks would only happen
-                // if a user-page backing itself blocks (not common
-                // for the fast paths PC ↔ user-buf serves today).
-                V3::Yield { .. } => Err(Errno::EFAULT),
+                V3::Done(n) if n == chunk => UserChunkOutcome::Copied,
+                V3::Done(_) | V3::Continue { .. } => UserChunkOutcome::Fault(Errno::EFAULT),
+                V3::Err(e) => UserChunkOutcome::Fault(Errno::from(e)),
+                V3::Yield {
+                    shape: step_engine::YieldShape::OnWaitSource { source, interests },
+                    ..
+                } => UserChunkOutcome::Blocked {
+                    source: source.raw(),
+                    interests: interests.raw(),
+                },
+                // OnAgent / OnTimer / other yield shapes: user-space
+                // page materialisation doesn't produce these; treat as
+                // fatal.
+                V3::Yield { .. } => UserChunkOutcome::Fault(Errno::EFAULT),
             }
         }
         UserBuffer::Write { src } => {
@@ -272,11 +306,17 @@ fn copy_chunk_user(
             let user_src = UserPtr::<u8>::new(src.addr() + already_advanced);
             use crate::page_backed::adapter::step_engine::StepOutcome as V3;
             match aspace.copy_from_user(kernel_slice, user_src, guard) {
-                V3::Done(n) if n == chunk => Ok(()),
-                V3::Continue { progress, .. } if progress.bytes() == chunk => Ok(()),
-                V3::Done(_) | V3::Continue { .. } => Err(Errno::EFAULT),
-                V3::Err(e) => Err(Errno::from(e)),
-                V3::Yield { .. } => Err(Errno::EFAULT),
+                V3::Done(n) if n == chunk => UserChunkOutcome::Copied,
+                V3::Done(_) | V3::Continue { .. } => UserChunkOutcome::Fault(Errno::EFAULT),
+                V3::Err(e) => UserChunkOutcome::Fault(Errno::from(e)),
+                V3::Yield {
+                    shape: step_engine::YieldShape::OnWaitSource { source, interests },
+                    ..
+                } => UserChunkOutcome::Blocked {
+                    source: source.raw(),
+                    interests: interests.raw(),
+                },
+                V3::Yield { .. } => UserChunkOutcome::Fault(Errno::EFAULT),
             }
         }
     }

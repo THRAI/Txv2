@@ -73,6 +73,13 @@ impl StepProgress for EntryProgress {
         None
     }
 
+    fn trace_kind(&self) -> u8 {
+        3
+    }
+    fn trace_value(&self) -> u32 {
+        self.count
+    }
+
     fn extend(&mut self, other: Self) {
         // Count: saturating add for parity with `ByteProgress`.
         self.count = self.count.saturating_add(other.count);

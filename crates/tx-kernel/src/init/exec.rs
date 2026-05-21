@@ -364,8 +364,7 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>("\n");
         }
 
-        let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
-        let sdcard_boot = boot_info.initrd.is_none() && boot_info.cmdline.is_none();
+        let sdcard_boot = oscomp_sdcard_boot_enabled::<P>();
 
         if super::MUSL_MOUNT.lock().is_some() && sdcard_boot {
             // Per-arch busybox path and test-script chain.
@@ -376,43 +375,17 @@ impl<P: TxPlatform> CoreInit<P> {
             //
             // All testcode.sh scripts expect CWD = their own directory
             // and use `./busybox` for echo/cat etc., so we `cd` first.
-            let (sdcard_bin, sdcard_cmd): (&[u8], &[u8]) = match P::ARCH {
-                tx_hal::Arch::LoongArch64 => (
-                    // la64 sdcard has both glibc/ (dynamic) and musl/
-                    // (static). Use the musl static busybox; the kernel
-                    // does not yet support PT_INTERP (dynamic linker).
-                    b"/musl/musl/busybox",
-                    b"cd /musl/musl \
-                      && ./busybox sh basic_testcode.sh \
-                      && ./busybox sh busybox_testcode.sh \
-                      && ./busybox sh libctest_testcode.sh \
-                      && ./busybox sh libcbench_testcode.sh \
-                      && ./busybox sh lua_testcode.sh \
-                      && ./busybox sh lmbench_testcode.sh \
-                      && ./busybox sh iozone_testcode.sh \
-                      && ./busybox sh netperf_testcode.sh \
-                      && ./busybox sh iperf_testcode.sh \
-                      && ./busybox sh cyclictest_testcode.sh \
-                      && ./busybox sh ltp_testcode.sh",
-                ),
-                tx_hal::Arch::Riscv64 => (
-                    b"/musl/musl/busybox",
-                    b"cd /musl/musl \
-                      && ./busybox sh basic_testcode.sh \
-                      && ./busybox sh busybox_testcode.sh \
-                      && ./busybox sh libctest_testcode.sh \
-                      && ./busybox sh libcbench_testcode.sh \
-                      && ./busybox sh lua_testcode.sh \
-                      && ./busybox sh lmbench_testcode.sh \
-                      && ./busybox sh iozone_testcode.sh \
-                      && ./busybox sh netperf_testcode.sh \
-                      && ./busybox sh iperf_testcode.sh \
-                      && ./busybox sh cyclictest_testcode.sh \
-                      && ./busybox sh ltp_testcode.sh",
-                ),
-            };
+            let sdcard_bin = b"/musl/musl/busybox";
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":oscomp:groups:");
+            match oscomp_groups_from_cmdline::<P>() {
+                Some(groups) => tx_hal::console_write_str::<P>(groups),
+                None => tx_hal::console_write_str::<P>("default"),
+            }
+            tx_hal::console_write_str::<P>("\n");
+            let sdcard_cmd = build_oscomp_sdcard_cmd::<P>();
             let sdcard_envp: &[&[u8]] = &[b"PATH=/musl/glibc:/musl/musl"];
-            let sdcard_argv: &[&[u8]] = &[b"sh", b"-c", sdcard_cmd];
+            let sdcard_argv: &[&[u8]] = &[b"sh", b"-c", sdcard_cmd.as_bytes()];
             let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
                 &init,
                 &thread,
@@ -447,7 +420,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // Cmdline-driven init path (initramfs slice):
         //   `init=/some/path` -> exec that path with argv=[basename]
-        //   `tx.profile=busybox` (no init=) -> /bin/sh argv=[sh]
+        //   `tx.profile=busybox` (no init=) -> /bin/busybox argv=[sh]
         //   default -> bake-in /init fixture, argv=[init]
         let (init_path, argv0) = parse_init_from_cmdline::<P>();
         Self::write_board_sentinel_prefix();
@@ -461,9 +434,28 @@ impl<P: TxPlatform> CoreInit<P> {
         // a guard at the call site (per
         // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`).
         let argv: &[&[u8]] = &[argv0];
-        let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+        let mut outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
             &init, &thread, init_path, argv, envp, &cred,
         ));
+        // If /bin/busybox failed, try /bin/sh (symlink → busybox).
+        // Some initramfs layouts only resolve correctly through the
+        // symlink path.
+        if outcome.is_err() && init_path != b"/bin/sh" && init_path != b"/init" {
+            let sh_outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                &init,
+                &thread,
+                b"/bin/sh",
+                &[b"sh"],
+                envp,
+                &cred,
+            ));
+            if sh_outcome.is_ok() {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
+                return;
+            }
+            outcome = sh_outcome;
+        }
         match outcome {
             Ok(()) => {
                 Self::write_board_sentinel_prefix();
@@ -529,6 +521,13 @@ impl<P: TxPlatform> CoreInit<P> {
     pub(crate) fn install_reactor_submit_seam() {
         tx_subsystems::reactor_submit::install_submit_child_thread(
             Self::submit_child_thread_into_boot_reactor,
+        );
+    }
+
+    pub(crate) fn install_reactor_affinity_seam() {
+        tx_subsystems::reactor_affinity::install_thread_affinity(
+            Self::set_thread_reactor_affinity,
+            Self::get_thread_reactor_affinity,
         );
     }
 
@@ -614,6 +613,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // the platform parameter `P` is captured at install time
         // here so the seam stays parameter-free at the call site.
         Self::install_reactor_submit_seam();
+        Self::install_reactor_affinity_seam();
         Self::install_sleep_seam();
 
         let Some(init) = tx_subsystems::process::execution::init_process() else {
@@ -631,24 +631,31 @@ impl<P: TxPlatform> CoreInit<P> {
         let wrapper_payload = payload.clone();
         let future_payload = payload.clone();
         let submit_thread = thread.clone();
+        let current_hart = boot_runtime::HartId(current_cpu.0);
+        let mut signal = super::SmpRescheduleSignal::<P>::new();
         let submitted = BOOT_REACTOR.with(|reactor| {
-            reactor.submit_task_with_meta(
+            reactor.submit_task_with_meta_from_hart(
                 crate::thread_future::PerHartSlotted::<P, _>::new(
                     wrapper_payload,
                     crate::thread_future::run_thread::<P>(submit_thread, future_payload),
                 ),
-                boot_runtime::InitialSchedMeta::kernel()
-                    .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
+                Self::userspace_thread_sched_meta(),
+                current_hart,
+                &mut signal,
             )
         });
-        if submitted.is_none() {
+        let Some((task_key, _report)) = submitted else {
             // Boot reactor not initialised; nothing to drive.
             return;
-        }
+        };
+        Self::register_thread_reactor_task(thread.tid.0, task_key);
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:submitted\n");
 
         P::enable_timer_wakeups();
+
+        // Enable concurrent poll on all harts (Phase 1a poll lease).
+        super::USE_CONCURRENT_POLL.store(true, core::sync::atomic::Ordering::Release);
 
         // Drive the BSP reactor loop until init zombifies. Each
         // iteration is a `step_hart_loop_at` step: advance time, run
@@ -666,10 +673,9 @@ impl<P: TxPlatform> CoreInit<P> {
             // They queue bytes in an IRQ-safe buffer and request a
             // reactor wake; consume that buffer here in normal
             // context before deciding whether there is runnable work.
-            if Self::drain_pending_uart_rx_into_tty() != 0 {
-                continue;
-            }
-            if Self::drain_sbi_console_into_tty() != 0 {
+            let had_uart = Self::drain_pending_uart_rx_into_tty() != 0;
+            let had_sbi = Self::drain_sbi_console_into_tty() != 0;
+            if had_uart || had_sbi {
                 continue;
             }
 
@@ -679,12 +685,13 @@ impl<P: TxPlatform> CoreInit<P> {
             // the previous poll iteration become visible to the
             // reactor here, outside the inner lock that sys_clone
             // ran under.
-            Self::drain_pending_child_submits();
+            let submitted_child_before_poll = Self::drain_pending_child_submits();
 
-            let step = match Self::step_boot_reactor_once(current_cpu) {
+            let step = match Self::step_boot_reactor_once_concurrent(current_cpu) {
                 Some(step) => step,
                 None => break,
             };
+            let submitted_child_after_poll = Self::drain_pending_child_submits();
 
             // EBR drain. Caps retired during the task polls above
             // (e.g. `Cap<OpenFile>` from `sys_close` / process exit fd
@@ -712,7 +719,12 @@ impl<P: TxPlatform> CoreInit<P> {
             // if there are items still pending reclamation (need more epoch
             // advances before they can be reclaimed).
             let ebr_active = drain_stats.reclaimed > 0 || drain_stats.remaining > 0;
-            if step.should_idle() && !ebr_active && !init.is_zombie() {
+            if step.should_idle()
+                && !submitted_child_before_poll
+                && !submitted_child_after_poll
+                && !ebr_active
+                && !init.is_zombie()
+            {
                 // When the reactor has no pending deadline, the platform
                 // timer was cancelled by `program_hart_loop_deadline`.
                 // Re-arm it here so WFI wakes periodically — the drain
@@ -802,5 +814,106 @@ impl<P: TxPlatform> CoreInit<P> {
     pub(super) fn write_board_sentinel_prefix() {
         tx_hal::console_write_str::<P>("txkernel:");
         tx_hal::console_write_str::<P>(P::BOARD);
+    }
+}
+
+fn oscomp_sdcard_boot_enabled<P: tx_hal::TxPlatform>() -> bool {
+    let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
+    if boot_info.initrd.is_some() {
+        return false;
+    }
+    let Some(cmdline) = boot_info.cmdline else {
+        return true;
+    };
+    !cmdline
+        .split_ascii_whitespace()
+        .any(|token| token.starts_with("init=") || token == "tx.profile=busybox")
+}
+
+fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
+    use alloc::string::String;
+    use core::fmt::Write as _;
+
+    let mut cmd = String::from("cd /musl/musl");
+    let mut selected = 0usize;
+    if let Some(groups) = oscomp_groups_from_cmdline::<P>() {
+        for group in groups.split(',') {
+            let group = group.trim();
+            if group.is_empty() {
+                continue;
+            }
+            if group == "all" {
+                append_default_oscomp_scripts(&mut cmd);
+                return cmd;
+            }
+            if let Some(script) = oscomp_musl_script_for_group(group) {
+                let _ = write!(cmd, " && ./busybox sh {script}");
+                selected += 1;
+            }
+        }
+    }
+    if selected == 0 {
+        append_default_oscomp_scripts(&mut cmd);
+    }
+    cmd
+}
+
+fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
+    if let Some(cmdline) = <P as tx_hal::BootInfoIf>::boot_info().cmdline {
+        for token in cmdline.split_ascii_whitespace() {
+            if let Some(groups) = token.strip_prefix("tx.oscomp.groups=") {
+                if !groups.trim().is_empty() {
+                    return Some(groups);
+                }
+            }
+        }
+    }
+
+    match option_env!("TX_OSCOMP_GROUPS") {
+        Some(groups) if !groups.trim().is_empty() => Some(groups),
+        _ => None,
+    }
+}
+
+fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    for (_, script) in DEFAULT_OSCOMP_MUSL_SCRIPTS {
+        let _ = write!(cmd, " && ./busybox sh {script}");
+    }
+}
+
+const DEFAULT_OSCOMP_MUSL_SCRIPTS: &[(&str, &str)] = &[
+    ("basic-musl", "basic_testcode.sh"),
+    ("busybox-musl", "busybox_testcode.sh"),
+    ("libctest-musl", "libctest_testcode.sh"),
+    ("libcbench-musl", "libcbench_testcode.sh"),
+    ("lua-musl", "lua_testcode.sh"),
+    ("lmbench-musl", "lmbench_testcode.sh"),
+    ("iozone-musl", "iozone_testcode.sh"),
+    ("netperf-musl", "netperf_testcode.sh"),
+    ("iperf-musl", "iperf_testcode.sh"),
+    ("cyclictest-musl", "cyclictest_testcode.sh"),
+    ("ltp-musl", "ltp_testcode.sh"),
+];
+
+fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
+    let canonical = match group.strip_suffix("-musl") {
+        Some(prefix) => prefix,
+        None => group,
+    };
+    match canonical {
+        "basic" => Some("basic_testcode.sh"),
+        "busybox" => Some("busybox_testcode.sh"),
+        "libctest" => Some("libctest_testcode.sh"),
+        "libcbench" => Some("libcbench_testcode.sh"),
+        "lua" => Some("lua_testcode.sh"),
+        "lmbench" => Some("lmbench_testcode.sh"),
+        "iozone" => Some("iozone_testcode.sh"),
+        "netperf" => Some("netperf_testcode.sh"),
+        "iperf" => Some("iperf_testcode.sh"),
+        "cyclictest" => Some("cyclictest_testcode.sh"),
+        "ltp" => Some("ltp_testcode.sh"),
+        _ => None,
     }
 }

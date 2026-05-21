@@ -21,7 +21,7 @@
 use crate::{
     dispatch::{RescheduleSignal, WakeDispatchReport},
     preempt::PreemptMarkers,
-    runtime::{Reactor, RunStats},
+    runtime::{HartRuntimeView, Reactor, RunStats},
     scheduler::HartId,
 };
 
@@ -209,6 +209,38 @@ where
 }
 
 impl HartLoopRuntime for Reactor {
+    fn advance_hart_loop_time(&mut self, now_ns: u64) -> usize {
+        self.advance_time_to(now_ns)
+    }
+
+    fn drain_hart_loop_wakes<S>(
+        &mut self,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> WakeDispatchReport
+    where
+        S: RescheduleSignal,
+    {
+        self.drain_wakes_for_hart(current_hart, signal)
+    }
+
+    fn consume_hart_loop_markers(&mut self, hart: HartId) -> PreemptMarkers {
+        self.consume_dispatch_markers(hart)
+    }
+
+    fn run_hart_loop_ready<S>(&mut self, hart: HartId, signal: &mut S) -> RunStats
+    where
+        S: RescheduleSignal,
+    {
+        self.run_until_idle_on_hart_with_reschedule(hart, signal)
+    }
+
+    fn hart_loop_next_deadline_ns(&self) -> Option<u64> {
+        self.next_deadline_ns()
+    }
+}
+
+impl HartLoopRuntime for HartRuntimeView<'_> {
     fn advance_hart_loop_time(&mut self, now_ns: u64) -> usize {
         self.advance_time_to(now_ns)
     }

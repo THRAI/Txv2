@@ -136,6 +136,8 @@ pub(crate) fn record_entry(ctx: &UserTrapContext) {
         crate::trap::console_write_hex(n);
         crate::trap::console_write_literal(b" pc=0x");
         crate::trap::console_write_hex(ctx.pc);
+        crate::trap::console_write_literal(b" ra=0x");
+        crate::trap::console_write_hex(ctx.regs[X_RA]);
         crate::trap::console_write_literal(b" a0=0x");
         crate::trap::console_write_hex(ctx.regs[X_A0]);
         crate::trap::console_write_literal(b" sp=0x");

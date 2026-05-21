@@ -180,6 +180,13 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
     }
     fs::copy(&busybox, layout.join("bin").join("busybox")).map_err(|err| err.to_string())?;
 
+    // IPC smoke test binary — copy if present
+    let ipc_test_src = root.join("tools/images/ipc_test");
+    if ipc_test_src.is_file() {
+        fs::copy(&ipc_test_src, layout.join("bin").join("ipc_test"))
+            .map_err(|err| err.to_string())?;
+    }
+
     if let Ok(musl) = env::var("TX_MUSL_LIBC") {
         let musl = PathBuf::from(musl);
         if !musl.is_file() {
