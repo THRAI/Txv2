@@ -5,12 +5,15 @@ use tx_substrate::mutation::{self, MutationError};
 use tx_substrate::zone::Cap;
 
 use super::identity::SocketIdentity;
-use super::types::{IpEndpoint, Ipv4Address};
+use super::types::{IpEndpoint, Ipv4Address, UnixSocketPath};
 
 const LOCAL_ENDPOINT_SLOTS: usize = 256;
 const LISTENER_SLOTS: usize = 128;
 const CONNECTION_SLOTS: usize = 256;
 const RAW_ICMP_SLOTS: usize = 128;
+const UNIX_PATH_NODE_SLOTS: usize = 256;
+const UNIX_BOUND_SLOTS: usize = 256;
+const UNIX_STREAM_PEER_SLOTS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LocalEndpointKey {
@@ -57,6 +60,11 @@ pub struct RawIcmpSocketKey {
     pub socket_raw: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnixStreamPeerKey {
+    pub socket_raw: u32,
+}
+
 impl ListenerKey {
     pub const fn exact(addr: Ipv4Address, port: u16) -> Self {
         Self {
@@ -84,6 +92,9 @@ pub struct SocketTable {
     udp_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
     udp_connections: Index<ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>,
     raw_icmp: Index<RawIcmpSocketKey, Cap<SocketIdentity>, RAW_ICMP_SLOTS>,
+    unix_path_nodes: Index<UnixSocketPath, (), UNIX_PATH_NODE_SLOTS>,
+    unix_bound: Index<UnixSocketPath, Cap<SocketIdentity>, UNIX_BOUND_SLOTS>,
+    unix_stream_peers: Index<UnixStreamPeerKey, Cap<SocketIdentity>, UNIX_STREAM_PEER_SLOTS>,
 }
 
 impl SocketTable {
@@ -95,6 +106,9 @@ impl SocketTable {
             udp_bound: Index::new(),
             udp_connections: Index::new(),
             raw_icmp: Index::new(),
+            unix_path_nodes: Index::new(),
+            unix_bound: Index::new(),
+            unix_stream_peers: Index::new(),
         }
     }
 
@@ -158,6 +172,29 @@ impl SocketTable {
         Ok(())
     }
 
+    pub fn bind_unix(
+        &self,
+        path: UnixSocketPath,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        let path_node = self.unix_path_nodes.reserve(path)?;
+        let bound = self.unix_bound.reserve(path)?;
+        path_node.commit(());
+        bound.commit(socket);
+        Ok(())
+    }
+
+    pub fn insert_unix_stream_peer(
+        &self,
+        socket_raw: u32,
+        peer: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.unix_stream_peers
+            .reserve(UnixStreamPeerKey { socket_raw })?
+            .commit(peer);
+        Ok(())
+    }
+
     pub fn insert_tcp_connection_pair(
         &self,
         first_key: ConnectionKey,
@@ -209,6 +246,26 @@ impl SocketTable {
 
     pub fn withdraw_raw_icmp(&self, socket_raw: u32) -> Result<Cap<SocketIdentity>, MutationError> {
         mutation::withdraw(&self.raw_icmp, &RawIcmpSocketKey { socket_raw })
+    }
+
+    pub fn withdraw_unix_bound(
+        &self,
+        path: UnixSocketPath,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        mutation::withdraw(&self.unix_bound, &path)
+    }
+
+    pub fn unlink_unix_path(&self, path: UnixSocketPath) -> Result<(), MutationError> {
+        mutation::withdraw(&self.unix_path_nodes, &path)?;
+        let _ = mutation::withdraw(&self.unix_bound, &path);
+        Ok(())
+    }
+
+    pub fn withdraw_unix_stream_peer(
+        &self,
+        socket_raw: u32,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        mutation::withdraw(&self.unix_stream_peers, &UnixStreamPeerKey { socket_raw })
     }
 
     pub fn lookup_tcp_bound(
@@ -287,6 +344,30 @@ impl SocketTable {
         self.lookup_udp_bound(dst, guard)
     }
 
+    pub fn lookup_unix_bound(
+        &self,
+        path: UnixSocketPath,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.unix_bound
+            .lookup(&path, guard)
+            .and_then(|entry| entry.value().try_clone_live())
+    }
+
+    pub fn lookup_unix_path_node(&self, path: UnixSocketPath, guard: &Guard<'_>) -> bool {
+        self.unix_path_nodes.lookup(&path, guard).is_some()
+    }
+
+    pub fn lookup_unix_stream_peer(
+        &self,
+        socket_raw: u32,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.unix_stream_peers
+            .lookup(&UnixStreamPeerKey { socket_raw }, guard)
+            .and_then(|entry| entry.value().try_clone_live())
+    }
+
     pub fn snapshot_tcp_listeners(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
         self.tcp_listeners
             .snapshot_values_filter_map(guard, Cap::try_clone_live)
@@ -353,6 +434,11 @@ impl SocketTable {
         self.raw_icmp
             .snapshot_values_filter_map(guard, Cap::try_clone_live)
     }
+
+    pub fn snapshot_unix_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.unix_bound
+            .snapshot_values_filter_map(guard, Cap::try_clone_live)
+    }
 }
 
 impl Default for SocketTable {
@@ -417,6 +503,22 @@ impl InitialSocketTableProxy {
         self.with_table(|table| table.register_raw_icmp(socket))
     }
 
+    pub fn bind_unix(
+        &self,
+        path: UnixSocketPath,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.with_table(|table| table.bind_unix(path, socket))
+    }
+
+    pub fn insert_unix_stream_peer(
+        &self,
+        socket_raw: u32,
+        peer: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.with_table(|table| table.insert_unix_stream_peer(socket_raw, peer))
+    }
+
     pub fn insert_tcp_connection_pair(
         &self,
         first_key: ConnectionKey,
@@ -466,6 +568,24 @@ impl InitialSocketTableProxy {
 
     pub fn withdraw_raw_icmp(&self, socket_raw: u32) -> Result<Cap<SocketIdentity>, MutationError> {
         self.with_table(|table| table.withdraw_raw_icmp(socket_raw))
+    }
+
+    pub fn withdraw_unix_bound(
+        &self,
+        path: UnixSocketPath,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        self.with_table(|table| table.withdraw_unix_bound(path))
+    }
+
+    pub fn unlink_unix_path(&self, path: UnixSocketPath) -> Result<(), MutationError> {
+        self.with_table(|table| table.unlink_unix_path(path))
+    }
+
+    pub fn withdraw_unix_stream_peer(
+        &self,
+        socket_raw: u32,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        self.with_table(|table| table.withdraw_unix_stream_peer(socket_raw))
     }
 
     pub fn lookup_tcp_bound(
@@ -518,6 +638,26 @@ impl InitialSocketTableProxy {
         self.with_table(|table| table.lookup_udp_ingress(src, dst, guard))
     }
 
+    pub fn lookup_unix_bound(
+        &self,
+        path: UnixSocketPath,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.with_table(|table| table.lookup_unix_bound(path, guard))
+    }
+
+    pub fn lookup_unix_path_node(&self, path: UnixSocketPath, guard: &Guard<'_>) -> bool {
+        self.with_table(|table| table.lookup_unix_path_node(path, guard))
+    }
+
+    pub fn lookup_unix_stream_peer(
+        &self,
+        socket_raw: u32,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.with_table(|table| table.lookup_unix_stream_peer(socket_raw, guard))
+    }
+
     pub fn snapshot_tcp_listeners(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
         self.with_table(|table| table.snapshot_tcp_listeners(guard))
     }
@@ -564,6 +704,10 @@ impl InitialSocketTableProxy {
 
     pub fn snapshot_raw_icmp(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
         self.with_table(|table| table.snapshot_raw_icmp(guard))
+    }
+
+    pub fn snapshot_unix_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.with_table(|table| table.snapshot_unix_bound(guard))
     }
 }
 

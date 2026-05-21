@@ -488,7 +488,12 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     let want_create = !want_path_only && flags & O_CREAT != 0;
     let want_excl = !want_path_only && flags & O_EXCL != 0;
     let want_trunc = !want_path_only && flags & O_TRUNC != 0;
+    let want_directory = flags & O_DIRECTORY != 0;
     // O_NONBLOCK and other unrecognised bits: silently dropped.
+
+    if want_create && want_directory {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
 
     let open_flags = OpenFileFlags {
         read: want_read && !want_path_only,
@@ -499,6 +504,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     };
 
     if path.as_slice() == b"/proc/self/ns/net" && !want_create && !want_trunc {
+        if want_directory {
+            return SyscallResult::Error(ENOTDIR_VALUE);
+        }
         if want_write {
             return SyscallResult::Error(EACCES_VALUE);
         }
@@ -553,6 +561,10 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // goes through `OpenOp + drive()` — no manual step loop.
     if !want_create && !want_trunc {
         use step_engine::DriveMode;
+        let fd = match allocate_fd_under_limit(ctx) {
+            Ok(fd) => fd,
+            Err(err) => return err,
+        };
         use tx_scripts::drive;
         let mut script_ctx = build_subject_script_ctx(ctx);
         let op = OpenOp {
@@ -580,10 +592,11 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
                 return SyscallResult::error_from(Errno::from(v3errno));
             }
         };
-        let fd = match allocate_fd_under_limit(ctx) {
-            Ok(fd) => fd,
-            Err(err) => return err,
-        };
+        if want_directory
+            && openfile.rnode().meta().kind() != tx_subsystems::vfs::structure::InodeKind::Directory
+        {
+            return SyscallResult::Error(ENOTDIR_VALUE);
+        }
         let _ = ctx.process.set_fd(fd, Some(openfile));
         if want_cloexec {
             ctx.process.set_fd_cloexec(fd, true);
@@ -639,17 +652,20 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         }
         V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
     };
+    let dentry_meta = dentry.rnode().meta();
+    if want_directory && dentry_meta.kind() != tx_subsystems::vfs::structure::InodeKind::Directory {
+        return SyscallResult::Error(ENOTDIR_VALUE);
+    }
 
     // Step 2: O_TRUNC. Apply *before* materialising the OpenFile so
     // any future `step_read` against the resulting fd observes the
     // truncated state. Directories → -EISDIR; backends without
     // truncate support → -ENOSYS.
     if want_trunc {
-        let meta = dentry.rnode().meta();
-        if meta.kind() == tx_subsystems::vfs::structure::InodeKind::Directory {
+        if dentry_meta.kind() == tx_subsystems::vfs::structure::InodeKind::Directory {
             return SyscallResult::Error(EISDIR_VALUE);
         }
-        if meta.size != 0 {
+        if dentry_meta.size != 0 {
             use StepOutcome as V3Trunc;
             let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
                 Some(b) => b,

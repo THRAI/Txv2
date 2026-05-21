@@ -21,13 +21,14 @@ use tx_subsystems::net::protocol::{
     build_icmpv4_echo_request_message, loopback_iface, parse_icmpv4_payload,
 };
 use tx_subsystems::net::PollMask;
-use tx_subsystems::net::{Icmpv4EchoPacket, Icmpv4Event, Ipv4Address};
+use tx_subsystems::net::{Icmpv4EchoPacket, Icmpv4Event, Ipv4Address, UnixSocketPath};
 use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
 
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
 const SOCK_RAW: u64 = 3;
 const SOCKADDR_IN_BYTES: u32 = 16;
+const SOCKADDR_UN_BYTES: u32 = 110;
 const SOCKADDR_NL_BYTES: u32 = 12;
 const SOCKADDR_LL_BYTES: u32 = 20;
 const TEST_POLLIN: i16 = 0x0001;
@@ -117,6 +118,13 @@ fn sockaddr_in(addr: [u8; 4], port: u16) -> [u8; SOCKADDR_IN_BYTES as usize] {
     bytes[0..2].copy_from_slice(&AF_INET.to_le_bytes());
     bytes[2..4].copy_from_slice(&port.to_be_bytes());
     bytes[4..8].copy_from_slice(&addr);
+    bytes
+}
+
+fn sockaddr_un(path: &[u8]) -> [u8; SOCKADDR_UN_BYTES as usize] {
+    let mut bytes = [0u8; SOCKADDR_UN_BYTES as usize];
+    bytes[0..2].copy_from_slice(&AF_UNIX.to_le_bytes());
+    bytes[2..2 + path.len()].copy_from_slice(path);
     bytes
 }
 
@@ -258,6 +266,13 @@ fn socket_icmp(ctx: &SyscallCtx<'static>, type_flags: u64) -> i64 {
     ) {
         SyscallResult::Return(fd) => fd,
         other => panic!("socket(AF_INET, ICMP) failed: {other:?}"),
+    }
+}
+
+fn socket_unix_stream(ctx: &SyscallCtx<'static>) -> i64 {
+    match socket_req(NR_SOCKET, [AF_UNIX as u64, SOCK_STREAM, 0, 0, 0, 0], ctx) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_UNIX, STREAM) failed: {other:?}"),
     }
 }
 
@@ -3324,6 +3339,322 @@ fn dispatch_ping_socket_sendto_recvfrom_loopback_echo_reply() {
         SyscallResult::Return(0)
     );
     assert_eq!(pollfd.revents, 0);
+}
+
+#[test]
+fn dispatch_unix_datagram_sendmsg_reaches_bound_peer() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let server_fd = socket_unix_dgram(&ctx);
+    let client_fd = socket_unix_dgram(&ctx);
+    let server_addr = sockaddr_un(b"ux_dgram_sendmsg");
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                server_fd as u64,
+                server_addr.as_ptr() as u64,
+                SOCKADDR_UN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let payload = *b"unix-dgram";
+    let send_iov = TestIovec {
+        base: payload.as_ptr() as u64,
+        len: payload.len() as u64,
+    };
+    let mut send_hdr = TestMsghdr {
+        name: server_addr.as_ptr() as u64,
+        namelen: SOCKADDR_UN_BYTES,
+        _pad0: 0,
+        iov: (&send_iov as *const TestIovec) as u64,
+        iovlen: 1,
+        control: 0,
+        controllen: 0,
+        flags: 0,
+        _pad1: 0,
+    };
+    assert_eq!(
+        socket_req(
+            NR_SENDMSG,
+            [
+                client_fd as u64,
+                (&mut send_hdr as *mut TestMsghdr) as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+
+    let mut out = [0u8; 32];
+    let recv_iov = TestIovec {
+        base: out.as_mut_ptr() as u64,
+        len: out.len() as u64,
+    };
+    let mut recv_hdr = TestMsghdr {
+        name: 0,
+        namelen: 0,
+        _pad0: 0,
+        iov: (&recv_iov as *const TestIovec) as u64,
+        iovlen: 1,
+        control: 0,
+        controllen: 0,
+        flags: 0,
+        _pad1: 0,
+    };
+    assert_eq!(
+        socket_req(
+            NR_RECVMSG,
+            [
+                server_fd as u64,
+                (&mut recv_hdr as *mut TestMsghdr) as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+    assert_eq!(&out[..payload.len()], &payload);
+}
+
+#[test]
+fn dispatch_unix_sendmsg_invalid_control_pointer_returns_efault() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let server_fd = socket_unix_dgram(&ctx);
+    let client_fd = socket_unix_dgram(&ctx);
+    let server_addr = sockaddr_un(b"ux_dgram_control");
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                server_fd as u64,
+                server_addr.as_ptr() as u64,
+                SOCKADDR_UN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let payload = *b"x";
+    let send_iov = TestIovec {
+        base: payload.as_ptr() as u64,
+        len: payload.len() as u64,
+    };
+    let mut send_hdr = TestMsghdr {
+        name: server_addr.as_ptr() as u64,
+        namelen: SOCKADDR_UN_BYTES,
+        _pad0: 0,
+        iov: (&send_iov as *const TestIovec) as u64,
+        iovlen: 1,
+        control: u64::MAX,
+        controllen: 16,
+        flags: 0,
+        _pad1: 0,
+    };
+    assert_eq!(
+        socket_req(
+            NR_SENDMSG,
+            [
+                client_fd as u64,
+                (&mut send_hdr as *mut TestMsghdr) as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(EFAULT_VALUE)
+    );
+}
+
+#[test]
+fn dispatch_unix_stream_connect_accept_and_sendmsg_round_trips() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let listener_fd = socket_unix_stream(&ctx);
+    let client_fd = socket_unix_stream(&ctx);
+    let listener_addr = sockaddr_un(b"ux_stream_sendmsg");
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                listener_fd as u64,
+                listener_addr.as_ptr() as u64,
+                SOCKADDR_UN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(NR_LISTEN, [listener_fd as u64, 10, 0, 0, 0, 0], &ctx),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                client_fd as u64,
+                listener_addr.as_ptr() as u64,
+                SOCKADDR_UN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut peer_addr = [0u8; SOCKADDR_UN_BYTES as usize];
+    let mut peer_len = SOCKADDR_UN_BYTES;
+    let accepted_fd = match socket_req(
+        NR_ACCEPT,
+        [
+            listener_fd as u64,
+            peer_addr.as_mut_ptr() as u64,
+            (&mut peer_len as *mut u32) as u64,
+            0,
+            0,
+            0,
+        ],
+        &ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("accept(AF_UNIX) failed: {other:?}"),
+    };
+    assert_eq!(peer_len, 2);
+    assert_eq!(u16::from_le_bytes([peer_addr[0], peer_addr[1]]), AF_UNIX);
+
+    let payload = *b"unix-stream";
+    let send_iov = TestIovec {
+        base: payload.as_ptr() as u64,
+        len: payload.len() as u64,
+    };
+    let mut send_hdr = TestMsghdr {
+        name: 0,
+        namelen: 0,
+        _pad0: 0,
+        iov: (&send_iov as *const TestIovec) as u64,
+        iovlen: 1,
+        control: 0,
+        controllen: 0,
+        flags: 0,
+        _pad1: 0,
+    };
+    assert_eq!(
+        socket_req(
+            NR_SENDMSG,
+            [
+                accepted_fd as u64,
+                (&mut send_hdr as *mut TestMsghdr) as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+
+    let mut out = [0u8; 32];
+    let recv_iov = TestIovec {
+        base: out.as_mut_ptr() as u64,
+        len: out.len() as u64,
+    };
+    let mut recv_hdr = TestMsghdr {
+        name: 0,
+        namelen: 0,
+        _pad0: 0,
+        iov: (&recv_iov as *const TestIovec) as u64,
+        iovlen: 1,
+        control: 0,
+        controllen: 0,
+        flags: 0,
+        _pad1: 0,
+    };
+    assert_eq!(
+        socket_req(
+            NR_RECVMSG,
+            [
+                client_fd as u64,
+                (&mut recv_hdr as *mut TestMsghdr) as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+    assert_eq!(&out[..payload.len()], &payload);
+}
+
+#[test]
+fn dispatch_unix_pathname_survives_close_until_unlink() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_unix_stream(&ctx);
+    let path = b"ux_path_lifecycle";
+    let unix_path = UnixSocketPath::new(path).expect("valid AF_UNIX path");
+    let addr = sockaddr_un(path);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                fd as u64,
+                addr.as_ptr() as u64,
+                SOCKADDR_UN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(NR_CLOSE, [fd as u64, 0, 0, 0, 0, 0], &ctx),
+        SyscallResult::Return(0)
+    );
+
+    let net_namespace = ctx.process.net_namespace().expect("test net namespace");
+    let table = net_namespace.socket_table();
+    let guard = step_engine::guard();
+    assert!(table.lookup_unix_path_node(unix_path, &guard));
+    assert!(table.lookup_unix_bound(unix_path, &guard).is_none());
+    drop(guard);
+
+    assert!(table.unlink_unix_path(unix_path).is_ok());
+    assert!(table.unlink_unix_path(unix_path).is_err());
 }
 
 #[test]

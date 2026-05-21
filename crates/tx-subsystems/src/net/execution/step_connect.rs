@@ -4,10 +4,12 @@ use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
 use crate::net::checks::require::require_socket_connect_target;
 use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::yield_on_token;
+use crate::net::structure::registry;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
-    ConnectionKey, IpEndpoint, Ipv4Address, KernelSockAddr, SendWireSet, SocketIdentity,
-    SocketProtocol, TcpState, UdpInner,
+    AcceptWireSet, ConnectionKey, IpEndpoint, Ipv4Address, KernelSockAddr, SendWireSet,
+    SocketAcceptEntry, SocketIdentity, SocketKind, SocketProtocol, TcpState, UdpInner,
+    UnixDatagramState, UnixSocketPath, UnixStreamState,
 };
 
 pub fn step_connect(
@@ -23,6 +25,10 @@ pub fn step_connect(
         return StepOutcome::Err(Errno::ENOTCONN);
     };
     debug_assert_eq!(witness.identity.raw(), socket.raw());
+
+    if matches!(remote, KernelSockAddr::Unix(_)) {
+        return step_unix_connect(socket, &payload, remote, guard);
+    }
 
     if let Err(errno) = update_udp_connection_index(
         payload.socket_table(),
@@ -91,6 +97,144 @@ pub fn step_connect(
     } else {
         net_delegate_kick_poll();
         StepOutcome::Done(())
+    }
+}
+
+fn step_unix_connect(
+    socket: &Cap<SocketIdentity>,
+    payload: &crate::net::structure::SocketOperationalEvidence,
+    remote: KernelSockAddr,
+    guard: &Guard<'_>,
+) -> StepOutcome<()> {
+    let KernelSockAddr::Unix(peer) = remote else {
+        return StepOutcome::Err(Errno::EAFNOSUPPORT);
+    };
+    match socket.kind {
+        SocketKind::UnixDatagram => connect_unix_datagram(payload, peer, guard),
+        SocketKind::UnixStream => connect_unix_stream(socket, payload, peer, guard),
+        _ => StepOutcome::Err(Errno::EAFNOSUPPORT),
+    }
+}
+
+fn connect_unix_datagram(
+    payload: &crate::net::structure::SocketOperationalEvidence,
+    peer: UnixSocketPath,
+    guard: &Guard<'_>,
+) -> StepOutcome<()> {
+    let table = payload.socket_table();
+    let Some(target) = table.lookup_unix_bound(peer, guard) else {
+        return StepOutcome::Err(Errno::ENOENT);
+    };
+    if target.kind != SocketKind::UnixDatagram {
+        return StepOutcome::Err(Errno::ECONNREFUSED);
+    }
+
+    let connected = payload.with_protocol_mut(|protocol| match protocol {
+        SocketProtocol::UnixDatagram(UnixDatagramState::Unbound) => {
+            *protocol =
+                SocketProtocol::UnixDatagram(UnixDatagramState::Connected { local: None, peer });
+            true
+        }
+        SocketProtocol::UnixDatagram(UnixDatagramState::Bound { local }) => {
+            *protocol = SocketProtocol::UnixDatagram(UnixDatagramState::Connected {
+                local: Some(*local),
+                peer,
+            });
+            true
+        }
+        SocketProtocol::UnixDatagram(UnixDatagramState::Connected { local, .. }) => {
+            *protocol = SocketProtocol::UnixDatagram(UnixDatagramState::Connected {
+                local: *local,
+                peer,
+            });
+            true
+        }
+        _ => false,
+    });
+    if connected {
+        StepOutcome::Done(())
+    } else {
+        StepOutcome::Err(Errno::EINVAL)
+    }
+}
+
+fn connect_unix_stream(
+    socket: &Cap<SocketIdentity>,
+    payload: &crate::net::structure::SocketOperationalEvidence,
+    peer: UnixSocketPath,
+    guard: &Guard<'_>,
+) -> StepOutcome<()> {
+    let table = payload.socket_table();
+    let Some(listener) = table.lookup_unix_bound(peer, guard) else {
+        return StepOutcome::Err(Errno::ENOENT);
+    };
+    let Some(listener_payload) = listener.acquire_operational() else {
+        return StepOutcome::Err(Errno::ECONNREFUSED);
+    };
+    let listener_local = match listener_payload.protocol_snapshot() {
+        SocketProtocol::UnixStream(UnixStreamState::Listening { local, .. }) => local,
+        _ => return StepOutcome::Err(Errno::ECONNREFUSED),
+    };
+
+    let options = listener_payload.with_options(Clone::clone);
+    let child = match registry::create_socket_in_namespace(
+        SocketKind::UnixStream,
+        options,
+        payload.net_namespace(),
+    ) {
+        Ok(child) => child,
+        Err(_) => return StepOutcome::Err(Errno::ENOMEM),
+    };
+
+    let local = match payload.protocol_snapshot() {
+        SocketProtocol::UnixStream(UnixStreamState::Init) => None,
+        SocketProtocol::UnixStream(UnixStreamState::Bound { local }) => Some(local),
+        _ => return StepOutcome::Err(Errno::EINVAL),
+    };
+
+    if table
+        .insert_unix_stream_peer(socket.raw(), child.clone())
+        .is_err()
+    {
+        return StepOutcome::Err(Errno::ENOMEM);
+    }
+    if table
+        .insert_unix_stream_peer(child.raw(), socket.clone())
+        .is_err()
+    {
+        let _ = table.withdraw_unix_stream_peer(socket.raw());
+        return StepOutcome::Err(Errno::ENOMEM);
+    }
+
+    payload.with_protocol_mut(|protocol| {
+        *protocol = SocketProtocol::UnixStream(UnixStreamState::Connected {
+            local,
+            peer_raw: child.raw(),
+        });
+    });
+    if let Some(child_payload) = child.acquire_operational() {
+        child_payload.with_protocol_mut(|protocol| {
+            *protocol = SocketProtocol::UnixStream(UnixStreamState::Connected {
+                local: Some(listener_local),
+                peer_raw: socket.raw(),
+            });
+        });
+    }
+
+    let child_raw = child.raw();
+    let entry = SocketAcceptEntry {
+        child,
+        local: unspecified_endpoint(),
+        peer: unspecified_endpoint(),
+        unix_peer: local,
+    };
+    if listener_payload.enqueue_accept_entry(entry).is_some() {
+        listener.readiness.fire_accept(AcceptWireSet::HAS_PENDING);
+        StepOutcome::Done(())
+    } else {
+        let _ = table.withdraw_unix_stream_peer(socket.raw());
+        let _ = table.withdraw_unix_stream_peer(child_raw);
+        StepOutcome::Err(Errno::ECONNREFUSED)
     }
 }
 

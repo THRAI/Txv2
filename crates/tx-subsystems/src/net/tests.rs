@@ -552,8 +552,8 @@ fn socket_payload_initial_protocol_matches_kind() {
 
     match tcp_payload.protocol_snapshot() {
         SocketProtocol::Tcp(state) => assert_eq!(state, TcpState::Init),
-        SocketProtocol::UnixDatagram
-        | SocketProtocol::UnixStream
+        SocketProtocol::UnixDatagram(_)
+        | SocketProtocol::UnixStream(_)
         | SocketProtocol::Udp(_)
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)
@@ -562,8 +562,8 @@ fn socket_payload_initial_protocol_matches_kind() {
     }
     match udp_payload.protocol_snapshot() {
         SocketProtocol::Udp(inner) => assert_eq!(inner, UdpInner::Unbound),
-        SocketProtocol::UnixDatagram
-        | SocketProtocol::UnixStream
+        SocketProtocol::UnixDatagram(_)
+        | SocketProtocol::UnixStream(_)
         | SocketProtocol::Tcp(_)
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)

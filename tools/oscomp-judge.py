@@ -430,9 +430,10 @@ def main():
     for group, group_lines in sorted(groups.items()):
         if group in judges:
             judge_path = judges[group]
+            judge_input = judge_compatible_input(group, group_lines)
             proc = subprocess.run(
                 [sys.executable, judge_path],
-                input="".join(group_lines).encode(),
+                input=judge_input.encode(),
                 capture_output=True,
             )
             try:
@@ -469,6 +470,34 @@ def base_group(group):
         if group.endswith(suffix):
             return group[: -len(suffix)]
     return group
+
+
+def judge_compatible_input(group, group_lines):
+    """Adapt local focused-suite output to the official judge input dialect."""
+    if base_group(group) != "ltp":
+        return "".join(group_lines)
+
+    rewritten = []
+    for idx, line in enumerate(group_lines):
+        rewritten.append(line)
+        if line.strip().startswith("PASS LTP CASE "):
+            # Official OSComp LTP judges use "FAIL LTP CASE ..." as an
+            # end-of-case marker and derive pass counts from preceding TPASS
+            # lines. Keep focused logs readable while feeding the legacy
+            # marker to the unmodified judge.
+            marker = line.replace("PASS LTP CASE", "FAIL LTP CASE", 1)
+            if not next_nonempty_line_is(group_lines, idx + 1, marker.strip()):
+                rewritten.append(marker)
+    return "".join(rewritten)
+
+
+def next_nonempty_line_is(lines, start_idx, expected):
+    for line in lines[start_idx:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        return stripped == expected
+    return False
 
 
 def fallback_results(group, group_lines):

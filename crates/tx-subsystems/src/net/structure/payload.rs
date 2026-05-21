@@ -19,7 +19,7 @@ use super::super::protocol::{
 use super::identity::SocketIdentity;
 use super::types::{
     IpEndpoint, Ipv4Address, PacketSocketState, ProtocolNumber, RawIcmpState, SockAddrLl,
-    SockShutdownCmd, SocketKind, SocketOptionSet, TcpState, UdpInner,
+    SockShutdownCmd, SocketKind, SocketOptionSet, TcpState, UdpInner, UnixSocketPath,
 };
 
 pub type SocketOperationalEvidence = PayloadCap<SocketPayload>;
@@ -34,6 +34,7 @@ pub struct SocketPayload {
     pub(crate) raw_tcp: Option<RawTcpSocket>,
     pub(crate) raw_udp: Option<RawUdpSocket>,
     pub(crate) raw_icmp: Option<RawIcmpSocket>,
+    pub(crate) raw_unix: Option<RawUnixSocket>,
     pub(crate) raw_netlink_route: Option<RawNetlinkRouteSocket>,
     pub(crate) raw_netlink_netfilter: Option<RawNetlinkNetfilterSocket>,
     pub(crate) io: SpinMutex<SocketIoState>,
@@ -52,63 +53,88 @@ impl SocketPayload {
         options: SocketOptionSet,
         net_namespace: PayloadCap<NetNamespacePayload>,
     ) -> Self {
-        let (protocol, raw_tcp, raw_udp, raw_icmp, raw_netlink_route, raw_netlink_netfilter) =
-            match kind {
-                SocketKind::UnixDatagram => {
-                    (SocketProtocol::UnixDatagram, None, None, None, None, None)
-                }
-                SocketKind::UnixStream => {
-                    (SocketProtocol::UnixStream, None, None, None, None, None)
-                }
-                SocketKind::Tcp => (
-                    SocketProtocol::Tcp(TcpState::Init),
-                    Some(RawTcpSocket::new(&options)),
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-                SocketKind::Udp => (
-                    SocketProtocol::Udp(UdpInner::Unbound),
-                    None,
-                    Some(RawUdpSocket::new(&options)),
-                    None,
-                    None,
-                    None,
-                ),
-                SocketKind::RawIcmp => (
-                    SocketProtocol::RawIcmp(RawIcmpState::new(ProtocolNumber(1))),
-                    None,
-                    None,
-                    Some(RawIcmpSocket::new(&options)),
-                    None,
-                    None,
-                ),
-                SocketKind::NetlinkRoute => (
-                    SocketProtocol::NetlinkRoute(NetlinkRouteState),
-                    None,
-                    None,
-                    None,
-                    Some(RawNetlinkRouteSocket::new()),
-                    None,
-                ),
-                SocketKind::NetlinkNetfilter => (
-                    SocketProtocol::NetlinkNetfilter(NetlinkNetfilterState),
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(RawNetlinkNetfilterSocket::new()),
-                ),
-                SocketKind::Packet => (
-                    SocketProtocol::Packet(PacketSocketState::new(0)),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-            };
+        let (
+            protocol,
+            raw_tcp,
+            raw_udp,
+            raw_icmp,
+            raw_unix,
+            raw_netlink_route,
+            raw_netlink_netfilter,
+        ) = match kind {
+            SocketKind::UnixDatagram => (
+                SocketProtocol::UnixDatagram(UnixDatagramState::Unbound),
+                None,
+                None,
+                None,
+                Some(RawUnixSocket::new(&options)),
+                None,
+                None,
+            ),
+            SocketKind::UnixStream => (
+                SocketProtocol::UnixStream(UnixStreamState::Init),
+                None,
+                None,
+                None,
+                Some(RawUnixSocket::new(&options)),
+                None,
+                None,
+            ),
+            SocketKind::Tcp => (
+                SocketProtocol::Tcp(TcpState::Init),
+                Some(RawTcpSocket::new(&options)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            SocketKind::Udp => (
+                SocketProtocol::Udp(UdpInner::Unbound),
+                None,
+                Some(RawUdpSocket::new(&options)),
+                None,
+                None,
+                None,
+                None,
+            ),
+            SocketKind::RawIcmp => (
+                SocketProtocol::RawIcmp(RawIcmpState::new(ProtocolNumber(1))),
+                None,
+                None,
+                Some(RawIcmpSocket::new(&options)),
+                None,
+                None,
+                None,
+            ),
+            SocketKind::NetlinkRoute => (
+                SocketProtocol::NetlinkRoute(NetlinkRouteState),
+                None,
+                None,
+                None,
+                None,
+                Some(RawNetlinkRouteSocket::new()),
+                None,
+            ),
+            SocketKind::NetlinkNetfilter => (
+                SocketProtocol::NetlinkNetfilter(NetlinkNetfilterState),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(RawNetlinkNetfilterSocket::new()),
+            ),
+            SocketKind::Packet => (
+                SocketProtocol::Packet(PacketSocketState::new(0)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        };
         let payload = Self {
             net_namespace,
             protocol: SpinMutex::new(protocol),
@@ -116,6 +142,7 @@ impl SocketPayload {
             raw_tcp,
             raw_udp,
             raw_icmp,
+            raw_unix,
             raw_netlink_route,
             raw_netlink_netfilter,
             io: SpinMutex::new(SocketIoState::new()),
@@ -257,6 +284,24 @@ impl SocketPayload {
         self.raw_netlink_netfilter.as_ref()
     }
 
+    pub(crate) fn record_unix_datagram(
+        &self,
+        source: Option<UnixSocketPath>,
+        payload: Vec<u8>,
+    ) -> Option<bool> {
+        let raw_unix = self.raw_unix.as_ref()?;
+        let became_readable = raw_unix.ingest_datagram(source, payload)?;
+        self.refresh_io_from_raw();
+        Some(became_readable)
+    }
+
+    pub(crate) fn record_unix_stream_bytes(&self, payload: Vec<u8>) -> Option<bool> {
+        let raw_unix = self.raw_unix.as_ref()?;
+        let became_readable = raw_unix.ingest_stream_bytes(payload)?;
+        self.refresh_io_from_raw();
+        Some(became_readable)
+    }
+
     pub fn accept_queue_len(&self) -> usize {
         self.tcp_backlog.lock().connected_len()
     }
@@ -308,11 +353,18 @@ impl SocketPayload {
         flags: super::types::SendRecvFlags,
     ) -> Option<SocketRecvBytesOutcome> {
         let peek = flags.contains(super::types::SendRecvFlags::MSG_PEEK);
-        let outcome = match (&self.raw_tcp, &self.raw_udp, &self.raw_icmp) {
-            (Some(raw_tcp), None, None) => match raw_tcp.recv_bytes(out, peek) {
+        let unix_stream = self.with_protocol(|protocol| {
+            matches!(
+                protocol,
+                SocketProtocol::UnixStream(UnixStreamState::Connected { .. })
+            )
+        });
+        let outcome = match (&self.raw_tcp, &self.raw_udp, &self.raw_icmp, &self.raw_unix) {
+            (Some(raw_tcp), None, None, None) => match raw_tcp.recv_bytes(out, peek) {
                 Some((bytes, became_empty)) => SocketRecvBytesOutcome {
                     bytes,
                     source: None,
+                    unix_source: None,
                     destination: None,
                     truncated: false,
                     became_empty,
@@ -320,28 +372,42 @@ impl SocketPayload {
                 None if raw_tcp.is_recv_closed() => SocketRecvBytesOutcome {
                     bytes: 0,
                     source: None,
+                    unix_source: None,
                     destination: None,
                     truncated: false,
                     became_empty: false,
                 },
                 None => return None,
             },
-            (None, Some(raw_udp), None) => {
+            (None, Some(raw_udp), None, None) => {
                 let drain = raw_udp.recv_datagram_bytes(out, peek)?;
                 SocketRecvBytesOutcome {
                     bytes: drain.bytes,
                     source: Some(drain.source),
+                    unix_source: None,
                     destination: Some(drain.destination),
                     truncated: drain.truncated,
                     became_empty: drain.became_empty,
                 }
             }
-            (None, None, Some(raw_icmp)) => {
+            (None, None, Some(raw_icmp), None) => {
                 let drain = raw_icmp.recv_echo_reply_bytes(out, peek)?;
                 SocketRecvBytesOutcome {
                     bytes: drain.bytes,
                     source: Some(IpEndpoint::new(drain.source, 0)),
+                    unix_source: None,
                     destination: Some(IpEndpoint::new(drain.destination, 0)),
+                    truncated: drain.truncated,
+                    became_empty: drain.became_empty,
+                }
+            }
+            (None, None, None, Some(raw_unix)) => {
+                let drain = raw_unix.recv_bytes(out, peek, unix_stream)?;
+                SocketRecvBytesOutcome {
+                    bytes: drain.bytes,
+                    source: None,
+                    unix_source: drain.source,
+                    destination: None,
                     truncated: drain.truncated,
                     became_empty: drain.became_empty,
                 }
@@ -553,37 +619,55 @@ impl SocketPayload {
     }
 
     fn raw_recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
+        let unix_stream = self.with_protocol(|protocol| {
+            matches!(
+                protocol,
+                SocketProtocol::UnixStream(UnixStreamState::Connected { .. })
+            )
+        });
         match (
             &self.raw_tcp,
             &self.raw_udp,
             &self.raw_icmp,
+            &self.raw_unix,
             &self.raw_netlink_route,
             &self.raw_netlink_netfilter,
         ) {
-            (Some(raw_tcp), None, None, None, None) => raw_tcp
+            (Some(raw_tcp), None, None, None, None, None) => raw_tcp
                 .recv_len(len, peek)
                 .or_else(|| raw_tcp.is_recv_closed().then_some((0, false))),
-            (None, Some(raw_udp), None, None, None) => raw_udp.recv_len(len, peek),
-            (None, None, Some(raw_icmp), None, None) => raw_icmp.recv_len(len, peek),
-            (None, None, None, Some(raw_netlink), None) => raw_netlink.recv_len(len),
-            (None, None, None, None, Some(raw_netlink)) => raw_netlink.recv_len(len),
+            (None, Some(raw_udp), None, None, None, None) => raw_udp.recv_len(len, peek),
+            (None, None, Some(raw_icmp), None, None, None) => raw_icmp.recv_len(len, peek),
+            (None, None, None, Some(raw_unix), None, None) => {
+                raw_unix.recv_len(len, peek, unix_stream)
+            }
+            (None, None, None, None, Some(raw_netlink), None) => raw_netlink.recv_len(len),
+            (None, None, None, None, None, Some(raw_netlink)) => raw_netlink.recv_len(len),
             _ => None,
         }
     }
 
     fn raw_recv_available(&self) -> usize {
+        let unix_stream = self.with_protocol(|protocol| {
+            matches!(
+                protocol,
+                SocketProtocol::UnixStream(UnixStreamState::Connected { .. })
+            )
+        });
         match (
             &self.raw_tcp,
             &self.raw_udp,
             &self.raw_icmp,
+            &self.raw_unix,
             &self.raw_netlink_route,
             &self.raw_netlink_netfilter,
         ) {
-            (Some(raw_tcp), None, None, None, None) => raw_tcp.recv_available(),
-            (None, Some(raw_udp), None, None, None) => raw_udp.recv_available(),
-            (None, None, Some(raw_icmp), None, None) => raw_icmp.recv_available(),
-            (None, None, None, Some(raw_netlink), None) => raw_netlink.recv_available(),
-            (None, None, None, None, Some(raw_netlink)) => raw_netlink.recv_available(),
+            (Some(raw_tcp), None, None, None, None, None) => raw_tcp.recv_available(),
+            (None, Some(raw_udp), None, None, None, None) => raw_udp.recv_available(),
+            (None, None, Some(raw_icmp), None, None, None) => raw_icmp.recv_available(),
+            (None, None, None, Some(raw_unix), None, None) => raw_unix.recv_available(unix_stream),
+            (None, None, None, None, Some(raw_netlink), None) => raw_netlink.recv_available(),
+            (None, None, None, None, None, Some(raw_netlink)) => raw_netlink.recv_available(),
             _ => 0,
         }
     }
@@ -593,14 +677,16 @@ impl SocketPayload {
             &self.raw_tcp,
             &self.raw_udp,
             &self.raw_icmp,
+            &self.raw_unix,
             &self.raw_netlink_route,
             &self.raw_netlink_netfilter,
         ) {
-            (Some(raw_tcp), None, None, None, None) => raw_tcp.send_available(),
-            (None, Some(raw_udp), None, None, None) => raw_udp.send_available(),
-            (None, None, Some(raw_icmp), None, None) => raw_icmp.send_available(),
-            (None, None, None, Some(raw_netlink), None) => raw_netlink.send_available(),
-            (None, None, None, None, Some(raw_netlink)) => raw_netlink.send_available(),
+            (Some(raw_tcp), None, None, None, None, None) => raw_tcp.send_available(),
+            (None, Some(raw_udp), None, None, None, None) => raw_udp.send_available(),
+            (None, None, Some(raw_icmp), None, None, None) => raw_icmp.send_available(),
+            (None, None, None, Some(raw_unix), None, None) => raw_unix.send_available(),
+            (None, None, None, None, Some(raw_netlink), None) => raw_netlink.send_available(),
+            (None, None, None, None, None, Some(raw_netlink)) => raw_netlink.send_available(),
             _ => 0,
         }
     }
@@ -656,6 +742,7 @@ pub struct SocketIoConsume {
 pub struct SocketRecvBytesOutcome {
     pub bytes: usize,
     pub source: Option<IpEndpoint>,
+    pub unix_source: Option<UnixSocketPath>,
     pub destination: Option<IpEndpoint>,
     pub truncated: bool,
     pub became_empty: bool,
@@ -685,11 +772,200 @@ pub(crate) struct SocketIcmpTxDrain {
     pub became_available: bool,
 }
 
+pub(crate) struct RawUnixSocket {
+    state: SpinMutex<RawUnixState>,
+    recv_limit: usize,
+    send_space: usize,
+}
+
+impl RawUnixSocket {
+    pub fn new(options: &SocketOptionSet) -> Self {
+        Self {
+            state: SpinMutex::new(RawUnixState::new()),
+            recv_limit: options.socket.recv_buf_size.max(1),
+            send_space: options.socket.send_buf_size.max(1),
+        }
+    }
+
+    pub fn ingest_datagram(&self, source: Option<UnixSocketPath>, bytes: Vec<u8>) -> Option<bool> {
+        self.state
+            .lock()
+            .push_frame(UnixFrame { source, bytes }, self.recv_limit)
+    }
+
+    pub fn ingest_stream_bytes(&self, bytes: Vec<u8>) -> Option<bool> {
+        self.state.lock().push_frame(
+            UnixFrame {
+                source: None,
+                bytes,
+            },
+            self.recv_limit,
+        )
+    }
+
+    pub fn recv_len(&self, len: usize, peek: bool, stream: bool) -> Option<(usize, bool)> {
+        self.state.lock().recv_len(len, peek, stream)
+    }
+
+    pub fn recv_bytes(&self, out: &mut [u8], peek: bool, stream: bool) -> Option<UnixRecvDrain> {
+        self.state.lock().recv_bytes(out, peek, stream)
+    }
+
+    pub fn recv_available(&self, stream: bool) -> usize {
+        self.state.lock().recv_available(stream)
+    }
+
+    pub const fn send_available(&self) -> usize {
+        self.send_space
+    }
+}
+
+struct RawUnixState {
+    frames: Vec<UnixFrame>,
+    queued_bytes: usize,
+}
+
+impl RawUnixState {
+    const fn new() -> Self {
+        Self {
+            frames: Vec::new(),
+            queued_bytes: 0,
+        }
+    }
+
+    fn push_frame(&mut self, frame: UnixFrame, recv_limit: usize) -> Option<bool> {
+        let was_empty = self.frames.is_empty();
+        let len = frame.bytes.len();
+        if self.queued_bytes.saturating_add(len) > recv_limit {
+            return None;
+        }
+        self.queued_bytes += len;
+        self.frames.push(frame);
+        Some(was_empty)
+    }
+
+    fn recv_len(&mut self, len: usize, peek: bool, stream: bool) -> Option<(usize, bool)> {
+        if stream {
+            return self.recv_stream_len(len, peek);
+        }
+        let frame_len = self.frames.first()?.bytes.len();
+        let bytes = core::cmp::min(len, frame_len);
+        if !peek {
+            let frame = self.frames.remove(0);
+            self.queued_bytes = self.queued_bytes.saturating_sub(frame.bytes.len());
+        }
+        Some((bytes, self.frames.is_empty()))
+    }
+
+    fn recv_bytes(&mut self, out: &mut [u8], peek: bool, stream: bool) -> Option<UnixRecvDrain> {
+        if stream {
+            return self.recv_stream_bytes(out, peek);
+        }
+        let frame = self.frames.first()?;
+        let bytes = core::cmp::min(out.len(), frame.bytes.len());
+        out[..bytes].copy_from_slice(&frame.bytes[..bytes]);
+        let source = frame.source;
+        let truncated = frame.bytes.len() > out.len();
+        if !peek {
+            let frame = self.frames.remove(0);
+            self.queued_bytes = self.queued_bytes.saturating_sub(frame.bytes.len());
+        }
+        Some(UnixRecvDrain {
+            bytes,
+            source,
+            truncated,
+            became_empty: self.frames.is_empty(),
+        })
+    }
+
+    fn recv_available(&self, stream: bool) -> usize {
+        if stream {
+            self.queued_bytes
+        } else {
+            self.frames.first().map_or(0, |frame| frame.bytes.len())
+        }
+    }
+
+    fn recv_stream_len(&mut self, len: usize, peek: bool) -> Option<(usize, bool)> {
+        if self.queued_bytes == 0 {
+            return None;
+        }
+        let mut remaining = core::cmp::min(len, self.queued_bytes);
+        let bytes = remaining;
+        if !peek {
+            while remaining > 0 {
+                let front_len = self.frames.first()?.bytes.len();
+                if front_len <= remaining {
+                    let frame = self.frames.remove(0);
+                    self.queued_bytes = self.queued_bytes.saturating_sub(frame.bytes.len());
+                    remaining -= frame.bytes.len();
+                } else {
+                    let front = self.frames.first_mut()?;
+                    front.bytes.drain(..remaining);
+                    self.queued_bytes = self.queued_bytes.saturating_sub(remaining);
+                    remaining = 0;
+                }
+            }
+        }
+        Some((bytes, self.queued_bytes == 0))
+    }
+
+    fn recv_stream_bytes(&mut self, out: &mut [u8], peek: bool) -> Option<UnixRecvDrain> {
+        if self.queued_bytes == 0 {
+            return None;
+        }
+        let mut copied = 0usize;
+        for frame in &self.frames {
+            if copied >= out.len() {
+                break;
+            }
+            let n = core::cmp::min(out.len() - copied, frame.bytes.len());
+            out[copied..copied + n].copy_from_slice(&frame.bytes[..n]);
+            copied += n;
+        }
+        if !peek {
+            let mut remaining = copied;
+            while remaining > 0 {
+                let front_len = self.frames.first()?.bytes.len();
+                if front_len <= remaining {
+                    let frame = self.frames.remove(0);
+                    self.queued_bytes = self.queued_bytes.saturating_sub(frame.bytes.len());
+                    remaining -= frame.bytes.len();
+                } else {
+                    let front = self.frames.first_mut()?;
+                    front.bytes.drain(..remaining);
+                    self.queued_bytes = self.queued_bytes.saturating_sub(remaining);
+                    remaining = 0;
+                }
+            }
+        }
+        Some(UnixRecvDrain {
+            bytes: copied,
+            source: None,
+            truncated: false,
+            became_empty: self.queued_bytes == 0,
+        })
+    }
+}
+
+struct UnixFrame {
+    source: Option<UnixSocketPath>,
+    bytes: Vec<u8>,
+}
+
+pub(crate) struct UnixRecvDrain {
+    pub bytes: usize,
+    pub source: Option<UnixSocketPath>,
+    pub truncated: bool,
+    pub became_empty: bool,
+}
+
 #[derive(Clone)]
 pub struct SocketAcceptEntry {
     pub child: Cap<SocketIdentity>,
     pub local: IpEndpoint,
     pub peer: IpEndpoint,
+    pub unix_peer: Option<UnixSocketPath>,
 }
 
 #[derive(Clone)]
@@ -840,6 +1116,7 @@ impl TcpBacklog {
             child: entry.child,
             local: entry.local,
             peer: entry.peer,
+            unix_peer: None,
         })?;
         Some(())
     }
@@ -943,14 +1220,43 @@ pub(crate) struct ShutdownMark {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SocketProtocol {
-    UnixDatagram,
-    UnixStream,
+    UnixDatagram(UnixDatagramState),
+    UnixStream(UnixStreamState),
     Tcp(TcpState),
     Udp(UdpInner),
     RawIcmp(RawIcmpState),
     NetlinkRoute(NetlinkRouteState),
     NetlinkNetfilter(NetlinkNetfilterState),
     Packet(PacketSocketState),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnixDatagramState {
+    Unbound,
+    Bound {
+        local: UnixSocketPath,
+    },
+    Connected {
+        local: Option<UnixSocketPath>,
+        peer: UnixSocketPath,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnixStreamState {
+    Init,
+    Bound {
+        local: UnixSocketPath,
+    },
+    Listening {
+        local: UnixSocketPath,
+        backlog_limit: usize,
+    },
+    Connected {
+        local: Option<UnixSocketPath>,
+        peer_raw: u32,
+    },
+    Closed,
 }
 
 pub struct Takeable<T> {

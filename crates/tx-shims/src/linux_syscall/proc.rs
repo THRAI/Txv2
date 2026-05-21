@@ -381,6 +381,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     let clone_vfork = (flags & CLONE_VFORK) != 0;
     let clone_settls = (flags & CLONE_SETTLS) != 0;
     let clone_child_cleartid = (flags & CLONE_CHILD_CLEARTID) != 0;
+    let clone_child_settid = (flags & CLONE_CHILD_SETTID) != 0;
     let clone_parent_settid = (flags & CLONE_PARENT_SETTID) != 0;
     let clone_newipc = (flags & CLONE_NEWIPC) != 0;
 
@@ -398,6 +399,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             | CLONE_SIGHAND
             | CLONE_SETTLS
             | CLONE_CHILD_CLEARTID
+            | CLONE_CHILD_SETTID
             | CLONE_PARENT_SETTID
             | CLONE_FILES
             | CLONE_FS
@@ -414,6 +416,9 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             | CLONE_FILES
             | CLONE_FS
             | CLONE_NEWIPC
+            | CLONE_CHILD_CLEARTID
+            | CLONE_CHILD_SETTID
+            | CLONE_PARENT_SETTID
     };
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
@@ -473,6 +478,16 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
                 let _ = super::user_copy::bootstrap_write_user(
                     &ctx.aspace,
                     ptid_ptr,
+                    child_thread.tid.0 as i32,
+                );
+            }
+        }
+        if clone_child_settid {
+            let ctid_ptr = args[4];
+            if ctid_ptr != 0 {
+                let _ = super::user_copy::bootstrap_write_user(
+                    &ctx.aspace,
+                    ctid_ptr,
                     child_thread.tid.0 as i32,
                 );
             }
@@ -553,6 +568,22 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         tls as usize,
         stack as usize,
     );
+
+    let child_tid = child_thread.tid.0 as i32;
+    if clone_parent_settid && args[2] != 0 {
+        let _ = super::user_copy::bootstrap_write_user(&ctx.aspace, args[2], child_tid);
+    }
+    if clone_child_cleartid && args[4] != 0 {
+        if let Some(payload) = child_thread.payload_cap() {
+            payload.clear_child_tid.lock().replace(args[4]);
+        }
+    }
+    if clone_child_settid && args[4] != 0 {
+        let child_aspace = child.aspace_cap().expect(
+            ":clone:no-child-aspace: kernel-invariant violation, fresh child has no aspace",
+        );
+        let _ = super::user_copy::bootstrap_write_user(&child_aspace, args[4], child_tid);
+    }
 
     // Hand the child's leader thread to the reactor. Panics with
     // `:clone:no-reactor-seam` if the boot path didn't install the

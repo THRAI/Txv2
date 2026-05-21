@@ -6,7 +6,7 @@ use crate::net::checks::require::require_socket_bind_target;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
     IpEndpoint, Ipv4Address, KernelSockAddr, SocketIdentity, SocketKind, SocketProtocol, TcpState,
-    UdpInner,
+    UdpInner, UnixDatagramState, UnixStreamState,
 };
 
 pub fn step_bind(
@@ -25,18 +25,36 @@ pub fn step_bind(
     let table = payload.socket_table();
 
     let table_result = match witness.identity.kind {
-        SocketKind::UnixDatagram | SocketKind::UnixStream => Ok(()),
+        SocketKind::UnixDatagram | SocketKind::UnixStream => match witness.addr {
+            KernelSockAddr::Unix(path) => table.bind_unix(path, socket.clone()),
+            _ => Err(IndexError::Missing),
+        },
         SocketKind::Tcp => bind_tcp_no_wildcard_overlap(table, socket, witness.local, guard),
         SocketKind::Udp => bind_udp_maybe_reuseaddr(table, socket, witness.local, guard),
         SocketKind::RawIcmp => Ok(()),
         SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter | SocketKind::Packet => Ok(()),
     };
-    let _requested_addr = witness.addr;
     if let Err(error) = table_result {
         return StepOutcome::Err(table_error_to_errno(error));
     }
 
     let bound = payload.with_protocol_mut(|protocol| match protocol {
+        SocketProtocol::UnixDatagram(UnixDatagramState::Unbound) => {
+            if let KernelSockAddr::Unix(local) = witness.addr {
+                *protocol = SocketProtocol::UnixDatagram(UnixDatagramState::Bound { local });
+                true
+            } else {
+                false
+            }
+        }
+        SocketProtocol::UnixStream(UnixStreamState::Init) => {
+            if let KernelSockAddr::Unix(local) = witness.addr {
+                *protocol = SocketProtocol::UnixStream(UnixStreamState::Bound { local });
+                true
+            } else {
+                false
+            }
+        }
         SocketProtocol::Tcp(TcpState::Init) => {
             *protocol = SocketProtocol::Tcp(TcpState::Bound {
                 local: witness.local,

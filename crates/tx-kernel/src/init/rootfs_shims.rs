@@ -28,6 +28,9 @@ impl<P: TxPlatform> CoreInit<P> {
     /// /bin/cat        → /musl/musl/busybox  (LTP opens it as a stable file)
     /// /bin/ls         → /musl/musl/busybox  (lets BusyBox `which ls` pass)
     /// /usr/bin/env    → /musl/musl/busybox  (handles `#!/usr/bin/env …`)
+    /// /lib/ld-linux-riscv64-lp64d.so.1 → /musl/glibc/lib/ld-linux-riscv64-lp64d.so.1
+    /// /lib/libc.so.6  → /musl/glibc/lib/libc.so.6
+    /// /lib/libm.so.6  → /musl/glibc/lib/libm.so.6
     /// ```
     ///
     /// The wrapper scripts (`scripts/lua/test.sh`, `run-static.sh`,
@@ -96,6 +99,40 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         };
         let _ = symlink_into(fs_ops, usr_bin_id, b"env", b"/musl/musl/busybox", &cred);
+
+        // glibc dynamic payloads in the OSComp sdcard request absolute loader
+        // paths such as /lib/ld-linux-riscv64-lp64d.so.1. Keep these as
+        // symlinks into the mounted sdcard so the same rootfs can boot either
+        // musl or glibc focused witnesses.
+        let lib_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"lib", 0o755, &cred) {
+            Some(id) => id,
+            None => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":shebang-shims:err:mkdir-lib\n");
+                return;
+            }
+        };
+        let _ = symlink_into(
+            fs_ops,
+            lib_id,
+            b"ld-linux-riscv64-lp64d.so.1",
+            b"/musl/glibc/lib/ld-linux-riscv64-lp64d.so.1",
+            &cred,
+        );
+        let _ = symlink_into(
+            fs_ops,
+            lib_id,
+            b"libc.so.6",
+            b"/musl/glibc/lib/libc.so.6",
+            &cred,
+        );
+        let _ = symlink_into(
+            fs_ops,
+            lib_id,
+            b"libm.so.6",
+            b"/musl/glibc/lib/libm.so.6",
+            &cred,
+        );
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":shebang-shims:ok\n");
