@@ -7,6 +7,8 @@
 //! identity/payload split is the primary subject under test: zombies
 //! retain identity but drop payload.
 
+use crate::cred::{sign_cred, Cred};
+use crate::ipc::sysv_shm;
 use crate::process::adapter::step_engine::{
     guard as ebr_guard, sign, Cap, ScriptCtx, StepOp, StepOutcome,
 };
@@ -27,6 +29,35 @@ use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentit
 use crate::vfs::{DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
+use core::future::Future;
+use core::pin::Pin;
+use core::ptr::null;
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    |_| RawWaker::new(null(), &NOOP_WAKER_VTABLE),
+    |_| {},
+    |_| {},
+    |_| {},
+);
+
+fn noop_waker() -> Waker {
+    unsafe { Waker::from_raw(RawWaker::new(null(), &NOOP_WAKER_VTABLE)) }
+}
+
+fn block_on<F: Future>(mut future: F) -> F::Output {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    // Safety: the future is stack-pinned for this helper call.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut future) };
+    for _ in 0..1024 {
+        match pinned.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => return out,
+            Poll::Pending => {}
+        }
+    }
+    panic!("process test block_on: future did not resolve in 1024 polls");
+}
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -139,6 +170,42 @@ fn last_thread_exit_zombifies_process_keeps_identity() {
 }
 
 #[test]
+fn last_thread_exit_detaches_live_sysv_shm_mappings() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let aspace = proc_cap.aspace_cap().expect("live aspace");
+    let ns = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+    let cred = sign_cred(Cred::root()).expect("root cred cap");
+    let shmid = sysv_shm::execution::step_shmget(
+        sysv_shm::execution::IPC_PRIVATE,
+        4096,
+        sysv_shm::execution::IPC_CREAT | 0o600,
+        &cred,
+        &ns,
+    )
+    .expect("shmget private");
+    let addr =
+        block_on(sysv_shm::execution::step_shmat(shmid, 0, 0, &cred, &aspace)).expect("shmat");
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(addr)).is_some());
+
+    let leader = first_thread(&proc_cap);
+    step_thread_exit(leader, 7);
+
+    assert!(proc_cap.is_zombie());
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(addr)).is_none());
+    let stat =
+        match sysv_shm::execution::step_shmctl(shmid, sysv_shm::execution::IPC_STAT, None, &cred)
+            .expect("stat after exit")
+        {
+            sysv_shm::execution::ShmCtlResult::Stat(info) => info,
+            other => panic!("expected Stat, got {other:?}"),
+        };
+    assert_eq!(stat.attach_count, 0);
+    sysv_shm::execution::step_shmctl(shmid, sysv_shm::execution::IPC_RMID, None, &cred)
+        .expect("rmid");
+}
+
+#[test]
 fn exit_group_zombifies_process_at_once_and_records_status() {
     let _g = setup();
     let proc_cap = bootstrap();
@@ -148,6 +215,41 @@ fn exit_group_zombifies_process_at_once_and_records_status() {
     assert!(proc_cap.is_zombie());
     assert_eq!(proc_cap.exit_status(), Some(ExitStatus::Exited(42)));
     assert_eq!(proc_cap.live_thread_count(), 0);
+}
+
+#[test]
+fn exit_group_detaches_live_sysv_shm_mappings() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let aspace = proc_cap.aspace_cap().expect("live aspace");
+    let ns = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+    let cred = sign_cred(Cred::root()).expect("root cred cap");
+    let shmid = sysv_shm::execution::step_shmget(
+        sysv_shm::execution::IPC_PRIVATE,
+        4096,
+        sysv_shm::execution::IPC_CREAT | 0o600,
+        &cred,
+        &ns,
+    )
+    .expect("shmget private");
+    let addr =
+        block_on(sysv_shm::execution::step_shmat(shmid, 0, 0, &cred, &aspace)).expect("shmat");
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(addr)).is_some());
+
+    step_exit_group(&proc_cap, ExitStatus::Exited(42));
+
+    assert!(proc_cap.is_zombie());
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(addr)).is_none());
+    let stat =
+        match sysv_shm::execution::step_shmctl(shmid, sysv_shm::execution::IPC_STAT, None, &cred)
+            .expect("stat after exit")
+        {
+            sysv_shm::execution::ShmCtlResult::Stat(info) => info,
+            other => panic!("expected Stat, got {other:?}"),
+        };
+    assert_eq!(stat.attach_count, 0);
+    sysv_shm::execution::step_shmctl(shmid, sysv_shm::execution::IPC_RMID, None, &cred)
+        .expect("rmid");
 }
 
 #[test]
@@ -1306,7 +1408,7 @@ fn step_fork_accounts_inherited_pipe_writer_fd() {
 
     parent.set_fd(3, Some(reader));
     parent.set_fd(4, Some(writer));
-    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
 
     parent.set_fd(4, None);
     assert_pipe_read_blocks(&payload);
@@ -1327,7 +1429,7 @@ fn child_exit_drains_inherited_pipe_writer_fd_and_publishes_eof() {
 
     parent.set_fd(3, Some(reader));
     parent.set_fd(4, Some(writer));
-    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
 
     parent.set_fd(4, None);
     assert_pipe_read_blocks(&payload);

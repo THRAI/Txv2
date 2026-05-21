@@ -21,8 +21,8 @@ use tx_subsystems::vfs::structure::{
 use tx_subsystems::vfs::{FsOps, OpenFile};
 
 use crate::linux_syscall::{
-    AT_EMPTY_PATH, AT_FDCWD, NR_CHDIR, NR_FCHDIR, NR_FSTAT, NR_GETCWD, NR_GETDENTS64,
-    NR_NEWFSTATAT, NR_STATX, NR_UMASK,
+    AT_EMPTY_PATH, AT_FDCWD, NR_CHDIR, NR_FCHDIR, NR_FSTAT, NR_FSTATFS, NR_GETCWD, NR_GETDENTS64,
+    NR_NEWFSTATAT, NR_STATFS, NR_STATX, NR_UMASK,
 };
 
 /// errno magnitudes the tests check against (positive Linux RV64
@@ -56,6 +56,11 @@ const STATX_MODE_OFF: usize = 28;
 const STATX_INO_OFF: usize = 32;
 const STATX_SIZE_OFF: usize = 40;
 const STATX_BYTES: usize = 256;
+const STATFS_BYTES: usize = 120;
+const STATFS_TYPE_OFF: usize = 0;
+const STATFS_BSIZE_OFF: usize = 8;
+const STATFS_NAMELEN_OFF: usize = 64;
+const STATFS_FRSIZE_OFF: usize = 72;
 
 /// `linux_dirent64` fixed header byte size (8 + 8 + 2 + 1 = 19).
 const DIRENT_HEADER_BYTES: usize = 19;
@@ -620,6 +625,53 @@ fn dispatch_chdir_to_regular_file_returns_neg_enotdir() {
 // now reports `-EBADF` for fd 0 (no open dir) rather than `-ENOSYS`.
 // The success path is exercised by integration tests once a directory
 // fd exists in the fd table.
+
+// -----------------------------------------------------------------
+// statfs / fstatfs
+// -----------------------------------------------------------------
+
+/// `statfs(path, buf)` writes the generic LP64 Linux `struct statfs`
+/// layout. The `f_namelen` and `f_frsize` offsets are especially
+/// important: musl's `struct statfs` places them at bytes 64 and 72,
+/// before `f_flags` and `f_spare`.
+#[test]
+fn dispatch_statfs_writes_musl_lp64_statfs_layout() {
+    let _setup = stat_setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/");
+    let mut statfs = vec![0u8; STATFS_BYTES];
+    let req = SyscallRequest::new(
+        NR_STATFS,
+        [path.as_ptr() as u64, statfs.as_mut_ptr() as u64, 0, 0, 0, 0],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(read_u64_at(&statfs, STATFS_TYPE_OFF), 0x0102_1994);
+    assert_eq!(read_u64_at(&statfs, STATFS_BSIZE_OFF), 4096);
+    assert_eq!(read_u64_at(&statfs, STATFS_NAMELEN_OFF), 255);
+    assert_eq!(read_u64_at(&statfs, STATFS_FRSIZE_OFF), 4096);
+}
+
+/// `fstatfs(fd, buf)` uses the same byte layout as `statfs`.
+#[test]
+fn dispatch_fstatfs_writes_musl_lp64_statfs_layout() {
+    let _setup = stat_setup();
+    let (_root_dentry, _tmpfs, root_rnode) = build_tmpfs_root();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    proc_cap.set_fd(8, Some(directory_open_file(root_rnode)));
+    let ctx = make_ctx(proc_cap, thread);
+
+    let mut statfs = vec![0u8; STATFS_BYTES];
+    let req = SyscallRequest::new(NR_FSTATFS, [8, statfs.as_mut_ptr() as u64, 0, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(read_u64_at(&statfs, STATFS_NAMELEN_OFF), 255);
+    assert_eq!(read_u64_at(&statfs, STATFS_FRSIZE_OFF), 4096);
+}
 
 // -----------------------------------------------------------------
 // getcwd

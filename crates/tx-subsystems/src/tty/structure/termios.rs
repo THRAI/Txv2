@@ -7,7 +7,13 @@
 // Sizing constants
 // ---------------------------------------------------------------------------
 
-/// Number of control-character slots.
+/// Number of kernel control-character slots.
+///
+/// Linux generic `TCGETS` / `TCSETS` copies the kernel `struct termios`
+/// shape, whose control-character array is 19 bytes. musl's public
+/// `struct termios` is larger (`NCCS = 32` plus speed fields), but its
+/// `tcgetattr` / `tcsetattr` wrappers pass that buffer directly to these
+/// ioctls; the kernel-populated prefix is the ABI contract.
 pub const NCCS: usize = 19;
 
 /// Value indicating a disabled control character (`_POSIX_VDISABLE`).
@@ -97,14 +103,18 @@ pub const TOSTOP: u32 = 0x0100;
 /// Layout matches `struct termios` from the Linux ABI. `c_cflag` (baud rate,
 /// character size, modem control) is carried for ABI compatibility but is not
 /// interpreted by the line discipline; hardware drivers consume it separately.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Termios {
     pub c_iflag: u32,
     pub c_oflag: u32,
     pub c_cflag: u32,
     pub c_lflag: u32,
+    pub c_line: u8,
     pub c_cc: [u8; NCCS],
 }
+
+const _: () = assert!(core::mem::size_of::<Termios>() == 36);
 
 impl Termios {
     /// All-zero termios (raw, no processing, no signals).
@@ -114,6 +124,7 @@ impl Termios {
             c_oflag: 0,
             c_cflag: 0,
             c_lflag: 0,
+            c_line: 0,
             c_cc: [0u8; NCCS],
         }
     }

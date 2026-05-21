@@ -464,6 +464,13 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         None => return SyscallResult::Error(EBADF_VALUE),
     };
 
+    // POSIX mq descriptors are not byte-stream fds. musl uses the
+    // mq_* syscalls directly, but raw read/write on an mqd_t should
+    // fail cleanly instead of falling into the VFS rnode path.
+    if file.posix_mq().is_some() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
     let len = if matches!(
         file.rnode().backing(),
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
@@ -657,6 +664,13 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
+
+    // POSIX mq descriptors are not byte-stream fds. musl uses the
+    // mq_* syscalls directly, but raw read/write on an mqd_t should
+    // fail cleanly instead of falling into the VFS rnode path.
+    if file.posix_mq().is_some() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
 
     let len = if matches!(
         file.rnode().backing(),

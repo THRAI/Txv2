@@ -28,6 +28,96 @@ struct TmsLayout {
     tms_cstime: i64,
 }
 
+pub(super) mod layout_descriptors {
+    use core::mem::{align_of, offset_of, size_of};
+
+    pub(super) use super::TmsLayout;
+    use super::{TimespecLayout, TimevalLayout};
+    use crate::linux_syscall::{KernelToUserLayout, KernelUserField, KernelUserLayout};
+
+    impl KernelToUserLayout for TimespecLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "TimespecLayout",
+            musl_header: "time.h",
+            musl_type: "struct timespec",
+            size: size_of::<TimespecLayout>(),
+            align: align_of::<TimespecLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "tv_sec",
+                    musl: "tv_sec",
+                    offset: offset_of!(TimespecLayout, tv_sec),
+                },
+                KernelUserField {
+                    rust: "tv_nsec",
+                    musl: "tv_nsec",
+                    offset: offset_of!(TimespecLayout, tv_nsec),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const TIMESPEC_LAYOUT: KernelUserLayout =
+        <TimespecLayout as KernelToUserLayout>::LAYOUT;
+
+    impl KernelToUserLayout for TimevalLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "TimevalLayout",
+            musl_header: "sys/time.h",
+            musl_type: "struct timeval",
+            size: size_of::<TimevalLayout>(),
+            align: align_of::<TimevalLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "tv_sec",
+                    musl: "tv_sec",
+                    offset: offset_of!(TimevalLayout, tv_sec),
+                },
+                KernelUserField {
+                    rust: "tv_usec",
+                    musl: "tv_usec",
+                    offset: offset_of!(TimevalLayout, tv_usec),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const TIMEVAL_LAYOUT: KernelUserLayout =
+        <TimevalLayout as KernelToUserLayout>::LAYOUT;
+
+    impl KernelToUserLayout for TmsLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "TmsLayout",
+            musl_header: "sys/times.h",
+            musl_type: "struct tms",
+            size: size_of::<TmsLayout>(),
+            align: align_of::<TmsLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "tms_utime",
+                    musl: "tms_utime",
+                    offset: offset_of!(TmsLayout, tms_utime),
+                },
+                KernelUserField {
+                    rust: "tms_stime",
+                    musl: "tms_stime",
+                    offset: offset_of!(TmsLayout, tms_stime),
+                },
+                KernelUserField {
+                    rust: "tms_cutime",
+                    musl: "tms_cutime",
+                    offset: offset_of!(TmsLayout, tms_cutime),
+                },
+                KernelUserField {
+                    rust: "tms_cstime",
+                    musl: "tms_cstime",
+                    offset: offset_of!(TmsLayout, tms_cstime),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const TMS_LAYOUT: KernelUserLayout =
+        <TmsLayout as KernelToUserLayout>::LAYOUT;
+}
+
 /// Convert a nanosecond count to a Linux-shaped `(tv_sec, tv_nsec)`
 /// pair. Both fields are signed 64-bit per the uapi.
 pub(super) fn ns_to_timespec(ns: u64) -> TimespecLayout {
