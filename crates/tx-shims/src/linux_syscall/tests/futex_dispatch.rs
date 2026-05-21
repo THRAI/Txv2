@@ -36,10 +36,12 @@ fn dispatch_futex_wait_with_mismatched_val_returns_neg_eagain() {
     let uaddr = &word as *const u32 as u64;
 
     use tx_subsystems::vm::{
-        UserVirtAddr, UserRange, VmMapRequest, MapPlacement, Prot, VmEntryFlags, VmBacking, USER_PAGE_SIZE,
+        MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmMapRequest,
+        USER_PAGE_SIZE,
     };
     let page_start = (uaddr as usize) & !(USER_PAGE_SIZE - 1);
-    let range = UserRange::new_aligned(UserVirtAddr(page_start), USER_PAGE_SIZE).expect("aligned range");
+    let range =
+        UserRange::new_aligned(UserVirtAddr(page_start), USER_PAGE_SIZE).expect("aligned range");
     let map_req = VmMapRequest::fixed(
         range,
         MapPlacement::FixedReplace,

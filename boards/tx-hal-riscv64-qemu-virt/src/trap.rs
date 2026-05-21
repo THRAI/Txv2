@@ -804,7 +804,10 @@ where
         TrapClass::Syscall => K::on_syscall(frame.view_mut()),
         TrapClass::TimerInterrupt => {
             let _irq_context = crate::enter_irq_context();
-            K::on_timer_interrupt(<Platform as tx_hal::SmpIf>::current_cpu_id())
+            K::on_timer_interrupt(
+                <Platform as tx_hal::SmpIf>::current_cpu_id(),
+                frame.view_mut(),
+            )
         }
         TrapClass::ExternalInterrupt => {
             let _irq_context = crate::enter_irq_context();

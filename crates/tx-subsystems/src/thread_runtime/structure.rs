@@ -7,7 +7,7 @@
 //! fast-check atomic land alongside the delivery pass.
 
 use alloc::sync::Weak as ArcWeak;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use tx_hal::UserTrapContext;
 
@@ -335,6 +335,11 @@ impl ThreadPayload {
         SignalMask::new(self.signal_mask.load(Ordering::Acquire))
     }
 
+    /// Write the current signal mask.
+    pub fn store_signal_mask(&self, mask: SignalMask) {
+        self.signal_mask.store(mask.raw_bits(), Ordering::Release);
+    }
+
     /// Whether this thread is stopped (SIGSTOP / default-Stop
     /// disposition). The AST checkpoint in thread_future uses this
     /// to decide whether to enter userspace.
@@ -529,15 +534,11 @@ unsafe impl ZoneAllocated for ThreadPayload {
     }
 }
 
-/// Simple atomic TID allocator. TID 1 reserved for the init leader by
-/// convention; allocator starts at 2.
-static NEXT_TID: AtomicU32 = AtomicU32::new(2);
-
 pub fn allocate_tid() -> Tid {
-    Tid(NEXT_TID.fetch_add(1, Ordering::Relaxed))
+    crate::process::numbers::allocate_tid()
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn reset_tid_counter_for_test() {
-    NEXT_TID.store(2, Ordering::Relaxed);
+    crate::process::numbers::reset_pid_counter_for_test();
 }

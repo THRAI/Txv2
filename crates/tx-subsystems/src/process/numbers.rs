@@ -89,6 +89,11 @@ pub fn allocate_pid() -> Pid {
     Pid(NEXT_PID.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Allocate a unique TID from the shared PID/TID space.
+pub fn allocate_tid() -> Tid {
+    Tid(NEXT_PID.fetch_add(1, Ordering::Relaxed))
+}
+
 pub fn reset_pid_counter_for_test() {
     NEXT_PID.store(2, Ordering::Relaxed);
     PID_NS.lock().clear();

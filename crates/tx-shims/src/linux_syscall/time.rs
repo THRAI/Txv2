@@ -178,7 +178,9 @@ pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
     let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = NanosleepOp {
         nanos: req_ns,
         deadline_ns,
@@ -188,8 +190,8 @@ pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
         op,
         &mut script_ctx,
         DriveMode::Waiting,
-        None,
-        None,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
         timer_wheel_arc.as_ref(),
     )
     .await
@@ -245,7 +247,9 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
     let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = NanosleepOp {
         nanos: req_ns,
         deadline_ns,
@@ -255,8 +259,8 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
         op,
         &mut script_ctx,
         DriveMode::Waiting,
-        None,
-        None,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
         timer_wheel_arc.as_ref(),
     )
     .await

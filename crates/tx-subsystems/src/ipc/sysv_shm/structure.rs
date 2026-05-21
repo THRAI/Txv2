@@ -9,7 +9,7 @@
 //! `IndexTable<SysvKey, Cap<ShmSegmentIdentity>>`.
 
 use alloc::collections::BTreeMap;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
 use crate::process::adapter::step_engine::{Cap, SpinMutex, Zone, ZoneAllocated, ZoneError};
 
@@ -70,7 +70,9 @@ pub struct ShmSegmentIdentity {
     pub shmid: u32,
     pub cred: Cap<Cred>,
     pub size: usize,
-    pub perm: IpcPerm,
+    pub mode: AtomicU16,
+    pub uid: AtomicU32,
+    pub gid: AtomicU32,
     /// Creator uid/gid — used by shmctl IPC_STAT.
     pub cuid: u32,
     pub cgid: u32,
@@ -83,6 +85,26 @@ pub struct ShmSegmentIdentity {
     /// shared access). Mutation goes through atomic stores so the
     /// flag can be set without `DerefMut`.
     pub destroyed: core::sync::atomic::AtomicBool,
+    /// Live segment payload.
+    pub payload: Cap<ShmSegmentPayload>,
+}
+
+impl ShmSegmentIdentity {
+    pub fn perm(&self) -> IpcPerm {
+        IpcPerm::new(self.mode.load(Ordering::Relaxed))
+    }
+
+    pub fn uid(&self) -> u32 {
+        self.uid.load(Ordering::Relaxed)
+    }
+
+    pub fn gid(&self) -> u32 {
+        self.gid.load(Ordering::Relaxed)
+    }
+
+    pub fn key_raw(&self) -> u32 {
+        self.key.map(|key| key.0).unwrap_or(0)
+    }
 }
 
 /// System V shared memory segment payload — the live backing.
@@ -169,24 +191,23 @@ pub(crate) fn register_shm(
 ) -> Result<u32, ZoneError> {
     use crate::process::adapter::step_engine::sign;
     let shmid = NEXT_SHMID.fetch_add(1, Ordering::Relaxed);
+    let payload = sign(ShmSegmentPayload {
+        attach_count: AtomicU32::new(0),
+        page_container: None,
+    })?;
     let identity = sign(ShmSegmentIdentity {
         key,
         shmid,
         cred,
         size,
-        perm,
+        mode: AtomicU16::new(perm.mode),
+        uid: AtomicU32::new(cuid),
+        gid: AtomicU32::new(cgid),
         cuid,
         cgid,
         destroyed: AtomicBool::new(false),
+        payload,
     })?;
-    let payload = sign(ShmSegmentPayload {
-        attach_count: AtomicU32::new(0),
-        page_container: None,
-    })?;
-    // The payload cap is held by the identity implicitly via the
-    // registration table. For now, the segment lives as long as
-    // the identity cap is in the table.
-    let _ = payload; // held alive by the table entry (identity route)
     SHM_TABLE.lock().insert(shmid, identity);
     Ok(shmid)
 }

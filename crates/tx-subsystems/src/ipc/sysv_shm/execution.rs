@@ -178,7 +178,12 @@ pub fn step_shmdt(_shmaddr: usize) -> Result<(), Errno> {
 /// `shmctl(shmid, cmd, buf)` — control a shared memory segment.
 ///
 /// Supported commands: IPC_RMID, IPC_SET, IPC_STAT, IPC_INFO.
-pub fn step_shmctl(shmid: u32, cmd: i32, cred: &Cap<Cred>) -> Result<ShmCtlResult, Errno> {
+pub fn step_shmctl(
+    shmid: u32,
+    cmd: i32,
+    set_fields: Option<(u16, u32, u32)>, // (mode, uid, gid)
+    cred: &Cap<Cred>,
+) -> Result<ShmCtlResult, Errno> {
     match cmd {
         IPC_RMID => {
             let segment = checks::require_shm_exists(shmid)?;
@@ -202,21 +207,28 @@ pub fn step_shmctl(shmid: u32, cmd: i32, cred: &Cap<Cred>) -> Result<ShmCtlResul
         IPC_SET => {
             let segment = checks::require_shm_exists(shmid)?;
             checks::require_owner_or_admin(&segment, cred)?;
-            // TODO(txdoc:IPC-V1-SHM-1): copy shmid_ds from userspace,
-            // update perm, uid, gid fields on the identity.
-            let _ = segment;
-            Err(Errno::ENOSYS)
+            if let Some((mode, uid, gid)) = set_fields {
+                segment.mode.store(mode & 0o777, Ordering::Release);
+                segment.uid.store(uid, Ordering::Release);
+                segment.gid.store(gid, Ordering::Release);
+                Ok(ShmCtlResult::Success)
+            } else {
+                Err(Errno::EINVAL)
+            }
         }
         IPC_STAT => {
             let segment = checks::require_shm_exists(shmid)?;
             checks::require_can_read_shm(&segment, cred)?;
             Ok(ShmCtlResult::Stat(ShmInfo {
+                key: segment.key_raw(),
                 shmid: segment.shmid,
                 size: segment.size,
-                perm: segment.perm,
+                perm: segment.perm(),
+                uid: segment.uid(),
+                gid: segment.gid(),
                 cuid: segment.cuid,
                 cgid: segment.cgid,
-                attach_count: 0, // TODO: read from payload
+                attach_count: segment.payload.attach_count.load(Ordering::Relaxed),
             }))
         }
         IPC_INFO => {
@@ -259,9 +271,12 @@ pub enum ShmCtlResult {
 /// IPC_STAT return data — maps to `struct shmid_ds`.
 #[derive(Clone, Debug)]
 pub struct ShmInfo {
+    pub key: u32,
     pub shmid: u32,
     pub size: usize,
     pub perm: IpcPerm,
+    pub uid: u32,
+    pub gid: u32,
     pub cuid: u32,
     pub cgid: u32,
     pub attach_count: u32,

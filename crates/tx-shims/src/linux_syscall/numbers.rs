@@ -1509,28 +1509,30 @@ pub const SFD_NONBLOCK: u32 = O_NONBLOCK;
 // Spec: `docs/Txv3/03_STEP_MODEL_v2.md` §5 `YieldShape::OnEdge`.
 // =====================================================================
 
-/// `epoll_create1(flags)`. Linux generic uapi `__NR_epoll_create1 = 291`.
+/// `epoll_create1(flags)`. Linux generic uapi `__NR_epoll_create1 = 20`
+/// on RV64 and LoongArch64. The historical x86_64 number is 291, but
+/// generic targets reserve 291 for `statx`.
 /// Allocates a fresh [`tx_subsystems::epoll::Epoll`] cap, wraps it in
 /// an `OpenFile` with `OpenFileBacking::Epoll`, and installs it at the
 /// lowest free fd.
-pub const NR_EPOLL_CREATE1: u64 = 291;
+pub const NR_EPOLL_CREATE1: u64 = 20;
 
 /// `epoll_ctl(epfd, op, fd, event_ptr)`. Linux generic uapi
-/// `__NR_epoll_ctl = 233`. ADD, MOD, or DEL a monitored fd.
-pub const NR_EPOLL_CTL: u64 = 233;
+/// `__NR_epoll_ctl = 21`. ADD, MOD, or DEL a monitored fd.
+pub const NR_EPOLL_CTL: u64 = 21;
 
-/// `epoll_wait(epfd, events, maxevents, timeout)`. Linux generic uapi
-/// `__NR_epoll_wait = 232`. Block until ready events arrive.
-/// (Note: the newer `epoll_pwait` = 281 is a superset with sigmask;
-/// not wired in Phase B.1.)
+/// `epoll_wait(epfd, events, maxevents, timeout)`. The RV64/LA64
+/// generic ABI does not expose a separate raw `epoll_wait` syscall;
+/// musl implements `epoll_wait(3)` through `epoll_pwait(2)`. Keep the
+/// x86_64 value here as an unwired cross-reference.
 pub const NR_EPOLL_WAIT: u64 = 232;
 
 /// `epoll_pwait(epfd, events, maxevents, timeout, sigmask)`.
-/// Linux generic uapi `__NR_epoll_pwait = 281`. Block until ready
+/// Linux generic uapi `__NR_epoll_pwait = 22`. Block until ready
 /// events arrive, atomically updating the signal mask. Phase B.1c
 /// stubs the sigmask; real signal-mask manipulation is deferred to
 /// a future signal-subsystem PR.
-pub const NR_EPOLL_PWAIT: u64 = 281;
+pub const NR_EPOLL_PWAIT: u64 = 22;
 
 // =====================================================================
 // eventfd / timerfd syscall numbers
@@ -1629,6 +1631,10 @@ pub const TFD_NONBLOCK_FLAG: u32 = O_NONBLOCK;
 
 /// `TFD_TIMER_ABSTIME` — interpret `it_value` as an absolute time.
 pub const TFD_TIMER_ABSTIME_FLAG: u32 = 1;
+/// `TFD_TIMER_CANCEL_ON_SET` — recognised for musl/Linux header
+/// compatibility. txKernel has no wall-clock discontinuity event yet,
+/// so the bit is accepted and otherwise ignored.
+pub const TFD_TIMER_CANCEL_ON_SET_FLAG: u32 = 1 << 1;
 
 /// `syslog(type, bufp, len)` — Linux kernel ring-buffer read / control.
 /// Linux generic uapi `__NR_syslog = 116`.  Called by `dmesg(1)`.

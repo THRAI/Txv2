@@ -965,15 +965,17 @@ pub struct SignalFramePlacement {
 /// catastrophically the on-stack `rt_sigreturn` trampoline at
 /// `offset_of!(SignalFrame, trampoline) = 712` — so the handler
 /// returned through `ra = frame_addr + 712` and the CPU fetched
-/// uninitialised stack bytes instead of the trampoline. Bump to
-/// 1024 to cover RV64 and LA64 layouts with comfortable headroom.
+/// uninitialised stack bytes instead of the trampoline. Musl-compatible
+/// RV64 `ucontext_t` now includes the full floating-point union, so
+/// keep the carrier above the board frame sizes rather than trimming
+/// the userspace ABI shape.
 pub struct SignalFrameBytes {
     pub data: [u8; Self::CAPACITY],
     pub len: usize,
 }
 
 impl SignalFrameBytes {
-    pub const CAPACITY: usize = 1024;
+    pub const CAPACITY: usize = 2048;
 
     pub fn from_slice(bytes: &[u8]) -> Self {
         let len = bytes.len();

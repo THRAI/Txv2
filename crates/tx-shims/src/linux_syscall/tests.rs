@@ -142,6 +142,10 @@ impl PmapIf for ShimsTestPmap {
     }
 }
 
+impl tx_hal::ConsoleIf for ShimsTestPmap {
+    fn write_bytes(_bytes: &[u8]) {}
+}
+
 // `dispatch::<P>` requires `P: PmapIf + EntropyIf` (added by the
 // CSPRNG chore so the execve path can pull AT_RANDOM bytes).
 // Trait default fills bytes from the deterministic boot-counter
@@ -152,6 +156,9 @@ impl EntropyIf for ShimsTestPmap {}
 impl tx_hal::AuxvIf for ShimsTestPmap {}
 
 impl SmpIf for ShimsTestPmap {}
+
+impl tx_hal::TrapIf for ShimsTestPmap {}
+impl tx_hal::SignalFrameIf for ShimsTestPmap {}
 
 // Slice 4 of the shell-prompt roadmap (2026-05-07) added a `TimeIf`
 // bound to `dispatch::<P>` so the time-syscall arms can read the
@@ -1091,6 +1098,20 @@ mod futex_dispatch;
 mod time_syscalls;
 
 // ===========================================================================
+// timerfd syscall ABI.
+//
+// Coverage:
+//   - `timerfd_settime` copies the caller's LP64 `struct itimerspec`
+//     into the kernel and reports the previous value in the same layout.
+//   - `timerfd_gettime(fd, curr_value)` uses the second syscall argument
+//     as the writeback pointer and returns remaining time, not the absolute
+//     internal deadline.
+//   - Unknown `timerfd_settime` flags and invalid `tv_nsec` fields return
+//     `-EINVAL`.
+// ===========================================================================
+mod timerfd_dispatch;
+
+// ===========================================================================
 // Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY routing.
 //
 // Coverage:
@@ -1159,3 +1180,20 @@ mod file_mutation;
 // =====================================================================
 
 mod sigtimedwait_dispatch;
+
+// ===========================================================================
+// `sigaltstack` — LP64 stack_t copy-in/copy-out contract used by musl.
+// ===========================================================================
+mod sigaltstack_dispatch;
+
+// ===========================================================================
+// SysV IPC dispatch copy paths and musl userspace layouts.
+// ===========================================================================
+
+mod ipc_dispatch;
+
+// ===========================================================================
+// `epoll_create1` / `epoll_ctl` / `epoll_pwait` generic musl syscall numbers
+// and LP64 `struct epoll_event` copy paths.
+// ===========================================================================
+mod epoll_dispatch;

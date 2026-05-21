@@ -12,14 +12,15 @@
 //!   txdoc:EXEC-8-6-AT-PHDR-COMPUTATION
 //!
 //! Supported ELF types:
-//!   - `ET_EXEC`: static executables (load_bias = 0, absolute VAs).
+//!   - `ET_EXEC`: static executables (load_bias = 0, absolute VAs), plus the
+//!     staged dynamic shape where `PT_INTERP` identifies an interpreter and
+//!     `PT_DYNAMIC` is left for that interpreter to consume.
 //!   - `ET_DYN`: static-PIE (position-independent, no `DT_NEEDED`, zero
-//!     relocations). The kernel chooses a fixed load bias
-//!     (`ET_DYN_LOAD_BIAS`) and shifts all virtual addresses. No dynamic
-//!     linker is loaded; `PT_INTERP` / `PT_DYNAMIC` are silently ignored.
+//!     relocations) and interpreter/shared-object images. The kernel chooses a
+//!     fixed load bias (`ET_DYN_LOAD_BIAS`) and shifts all virtual addresses.
 //!
 //! Out of scope for the slice:
-//!   - Full dynamic linking (PT_INTERP interpreter load + relocation).
+//!   - Kernel-side relocation processing and `DT_NEEDED` dependency loading.
 //!   - relocations and debug info.
 //!   - elf32 (RV64 only).
 //!
@@ -82,8 +83,9 @@ pub enum ParseError {
     Arch,
     /// `e_type` is neither `ET_EXEC` nor `ET_DYN`.
     Type,
-    /// `PT_INTERP` or `PT_DYNAMIC` was found in an `ET_EXEC` binary.
-    /// (`ET_DYN` static-PIE images silently ignore these segments.)
+    /// `PT_DYNAMIC` was found without a `PT_INTERP` owner in an
+    /// `ET_EXEC` binary. Dynamic executables must enter through their
+    /// interpreter.
     HasInterp,
     /// At least one `PT_LOAD` is required.
     NoLoad,
@@ -141,8 +143,7 @@ pub struct BssTail {
 /// (main + interpreter), this is just the interpreter's image.
 #[derive(Debug, Clone)]
 pub struct InterpreterPlan {
-    /// Load bias computed from the interpreter's first LOAD segment
-    /// (`INTERP_BASE - lowest_load_vaddr`).
+    /// Interpreter base reported through `AT_BASE`.
     pub load_bias: u64,
     /// Interpreter entry point, already bias-adjusted.
     pub entry: u64,
@@ -259,29 +260,25 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
     let mut exec_stack: bool = false;
     let mut interp_path: Option<Vec<u8>> = None;
 
+    let mut saw_dynamic = false;
+
     for phdr in &phdrs {
         match phdr.p_type {
-            PT_INTERP | PT_DYNAMIC if !is_dyn => {
-                if phdr.p_type == PT_INTERP {
-                    // Extract interpreter path from ELF bytes.
-                    let off = phdr.p_offset as usize;
-                    let len = (phdr.p_filesz as usize).min(4096);
-                    if off + len <= elf_bytes.len() {
-                        let path = elf_bytes[off..off + len]
-                            .split(|&b| b == 0)
-                            .next()
-                            .unwrap_or(&[])
-                            .to_vec();
-                        interp_path = Some(path);
-                    }
+            PT_INTERP if !is_dyn => {
+                // Extract interpreter path from ELF bytes.
+                let off = phdr.p_offset as usize;
+                let len = (phdr.p_filesz as usize).min(4096);
+                if off + len <= elf_bytes.len() {
+                    let path = elf_bytes[off..off + len]
+                        .split(|&b| b == 0)
+                        .next()
+                        .unwrap_or(&[])
+                        .to_vec();
+                    interp_path = Some(path);
                 }
-                // PT_DYNAMIC in ET_EXEC: reject (no dynamic linking in
-                // static executables; only PT_INTERP-interpreted
-                // binaries are accepted).
-                if phdr.p_type == PT_DYNAMIC {
-                    return Err(ParseError::HasInterp);
-                }
-                // PT_INTERP path was extracted above; fall through.
+            }
+            PT_DYNAMIC if !is_dyn => {
+                saw_dynamic = true;
             }
             PT_INTERP | PT_DYNAMIC => {
                 // ET_DYN static-PIE: PT_INTERP / PT_DYNAMIC present but
@@ -308,6 +305,9 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
 
     if load_segments.is_empty() {
         return Err(ParseError::NoLoad);
+    }
+    if saw_dynamic && interp_path.is_none() {
+        return Err(ParseError::HasInterp);
     }
 
     // Choose load bias: 0 for ET_EXEC (absolute VAs already in place),

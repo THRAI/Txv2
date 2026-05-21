@@ -14,6 +14,15 @@ const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
 const E_PERM: i32 = 1;
 const E_SRCH: i32 = 3;
+const E_MFILE: i32 = 24;
+
+fn uts_field(buf: &[u8; 6 * 65], index: usize) -> &[u8] {
+    let start = index * 65;
+    let end = start + 65;
+    let field = &buf[start..end];
+    let n = field.iter().position(|b| *b == 0).unwrap_or(field.len());
+    &field[..n]
+}
 
 // -----------------------------------------------------------------
 // F_DUPFD / F_DUPFD_CLOEXEC / F_GETFL / F_SETFL.
@@ -83,6 +92,46 @@ fn dispatch_fcntl_f_dupfd_cloexec_sets_cloexec_on_new_fd() {
         proc_cap.fd_cloexec(new_fd),
         "F_DUPFD_CLOEXEC must set the cloexec bit on the new fd"
     );
+}
+
+/// `F_DUPFD` with `min == RLIMIT_NOFILE` is invalid; Linux requires
+/// the requested minimum to be below the process fd limit.
+#[test]
+fn dispatch_fcntl_f_dupfd_min_at_rlimit_returns_neg_einval() {
+    let _setup = setup();
+    let _ops = install_capturing_console();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
+    let ctx = make_ctx(proc_cap, thread);
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_FCNTL, [3, F_DUPFD as u64, 1024, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(E_INVAL));
+}
+
+/// `F_DUPFD` reports `EMFILE` when no slot below `RLIMIT_NOFILE`
+/// remains at or above the requested minimum.
+#[test]
+fn dispatch_fcntl_f_dupfd_full_table_returns_neg_emfile() {
+    let _setup = setup();
+    let _ops = install_capturing_console();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let file = tx_fs::devfs::open_console_for_init();
+    proc_cap.set_fd(3, Some(file.clone()));
+    for fd in 4..1024 {
+        let _ = proc_cap.install_fd(fd, file.clone());
+    }
+    let ctx = make_ctx(proc_cap, thread);
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_FCNTL, [3, F_DUPFD as u64, 4, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(E_MFILE));
 }
 
 /// `fcntl(fd, F_GETFL, _)` composes the access-mode bits from
@@ -165,7 +214,8 @@ fn dispatch_kill_different_uid_returns_neg_eperm() {
     // (`process_by_pid`) that `sys_kill` consults. The child
     // inherits the parent's root cred at fork time; we override
     // both creds below.
-    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false).expect("fork");
+    let child =
+        tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false).expect("fork");
     let child_pid = child.pid.0 as u64;
 
     // Drop the caller to (uid=1000, gid=1000) with empty caps so
@@ -352,13 +402,65 @@ fn dispatch_uname_writes_utsname_to_user() {
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Return(0));
-    // sysname starts at offset 0; expect "Linux" then NUL pad.
-    assert_eq!(&buf[0..5], b"Linux");
+    assert_eq!(uts_field(&buf, 0), b"Linux");
     assert_eq!(buf[5], 0, "sysname must be NUL-terminated after \"Linux\"");
-    // release starts at offset 130 (2 × 65); expect "6.1.0" prefix.
-    assert_eq!(&buf[130..135], b"6.1.0");
-    // machine starts at offset 260 (4 × 65); expect "riscv64".
-    assert_eq!(&buf[260..267], b"riscv64");
+    assert!(uts_field(&buf, 2).starts_with(b"6.1.0"));
+    assert_eq!(uts_field(&buf, 4), b"riscv64");
+}
+
+struct LoongArchUnamePmap;
+
+impl PlatformConfig for LoongArchUnamePmap {
+    const ARCH: Arch = Arch::LoongArch64;
+    const BOARD: &'static str = "shims-test-la64";
+}
+
+impl PmapIf for LoongArchUnamePmap {
+    fn create_pmap_root() -> Result<PmapRoot, PmapError> {
+        ShimsTestPmap::create_pmap_root()
+    }
+}
+
+impl EntropyIf for LoongArchUnamePmap {}
+impl tx_hal::AuxvIf for LoongArchUnamePmap {}
+impl SmpIf for LoongArchUnamePmap {}
+impl tx_hal::TrapIf for LoongArchUnamePmap {}
+impl tx_hal::SignalFrameIf for LoongArchUnamePmap {}
+impl tx_hal::ConsoleIf for LoongArchUnamePmap {
+    fn write_bytes(_bytes: &[u8]) {}
+}
+impl tx_hal::TimeIf for LoongArchUnamePmap {
+    fn read_ns() -> u64 {
+        ShimsTestPmap::read_ns()
+    }
+
+    fn set_deadline_ns(deadline_ns: u64) {
+        ShimsTestPmap::set_deadline_ns(deadline_ns);
+    }
+
+    fn cancel_deadline() {
+        ShimsTestPmap::cancel_deadline();
+    }
+
+    fn frequency_hz() -> u64 {
+        ShimsTestPmap::frequency_hz()
+    }
+}
+
+#[test]
+fn dispatch_uname_uses_selected_platform_machine() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let mut buf = [0u8; 6 * 65];
+    let r = block_on(dispatch::<LoongArchUnamePmap>(
+        SyscallRequest::new(NR_UNAME, [buf.as_mut_ptr() as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(0));
+    assert_eq!(uts_field(&buf, 4), b"loongarch64");
 }
 
 /// `uname(NULL)` returns `-EFAULT`.

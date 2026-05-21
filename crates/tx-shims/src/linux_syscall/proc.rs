@@ -6,6 +6,12 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine};
 
+/// musl/Linux generic LP64 `struct rusage` byte size:
+/// two `timeval`s, fourteen `long` counters, and sixteen reserved
+/// `long`s. txKernel does not track usage counters yet, so wait4
+/// writes a zeroed image when callers request it.
+const RUSAGE_BYTES: usize = 256;
+
 /// `exit(status)` — per-thread exit per `PROCESS_v1` §7.3.1.
 ///
 /// The implementation of `step_thread_exit` (in
@@ -96,7 +102,7 @@ pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 // PR-9 phase 3b: StepOp-driven via ExecOp (10-phase state
 // machine).  Async operations yield; the drive loop parks on I/O.
 // Remaining synchronous phases return Continue.
-pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
+pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf + tx_hal::ConsoleIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -270,13 +276,21 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         if flags & CLONE_SIGHAND == 0 {
             return SyscallResult::Error(EINVAL_VALUE);
         }
-        SIGCHLD | CLONE_THREAD | CLONE_VM | CLONE_SIGHAND
-            | CLONE_SETTLS | CLONE_CHILD_CLEARTID | CLONE_PARENT_SETTID
-            | CLONE_FILES | CLONE_FS | CLONE_DETACHED
-            | CLONE_SYSVSEM | CLONE_NEWCGROUP | CLONE_NEWUTS
+        SIGCHLD
+            | CLONE_THREAD
+            | CLONE_VM
+            | CLONE_SIGHAND
+            | CLONE_SETTLS
+            | CLONE_CHILD_CLEARTID
+            | CLONE_PARENT_SETTID
+            | CLONE_FILES
+            | CLONE_FS
+            | CLONE_DETACHED
+            | CLONE_SYSVSEM
+            | CLONE_NEWCGROUP
+            | CLONE_NEWUTS
     } else {
-        SIGCHLD | CLONE_SETTLS | CLONE_VM | CLONE_VFORK
-            | CLONE_SIGHAND | CLONE_FILES | CLONE_FS
+        SIGCHLD | CLONE_SETTLS | CLONE_VM | CLONE_VFORK | CLONE_SIGHAND | CLONE_FILES | CLONE_FS
     };
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
@@ -308,14 +322,13 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     // ProcessIdentity is created.
     if clone_thread {
         let ctid_ptr = if clone_child_cleartid { args[4] } else { 0 };
-        let child_thread =
-            tx_subsystems::process::execution::step_clone_thread(
-                &ctx.process,
-                &parent_user_ctx,
-                stack as usize,
-                tls as usize,
-                ctid_ptr,
-            );
+        let child_thread = tx_subsystems::process::execution::step_clone_thread(
+            &ctx.process,
+            &parent_user_ctx,
+            stack as usize,
+            tls as usize,
+            ctid_ptr,
+        );
         let child_thread = match child_thread {
             Ok(t) => t,
             Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
@@ -336,10 +349,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         }
 
         // Hand the child thread to the reactor.
-        reactor_submit::submit_child_thread(
-            ctx.process.clone(),
-            child_thread.clone(),
-        );
+        reactor_submit::submit_child_thread(ctx.process.clone(), child_thread.clone());
 
         return SyscallResult::Return(child_thread.tid.0 as i64);
     }
@@ -489,10 +499,10 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
 ///
 /// ## rusage
 ///
-/// Wave 3 rejects non-NULL `rusage` with `-EINVAL` per the slice
-/// plan. txKernel doesn't track per-process resource usage today;
-/// zero-fill is busy-work that doesn't unblock anything LTP exercises.
-/// `TODO(phase-rusage)`: zero-fill or populate once rusage state lands.
+/// A non-NULL `rusage` pointer receives a zero-filled musl/Linux LP64
+/// `struct rusage`. txKernel doesn't track per-process resource usage
+/// today; `TODO(phase-rusage)` populates the counters once accounting
+/// state lands.
 ///
 /// ## wstatus write
 ///
@@ -521,12 +531,6 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let options = args[2] as i32;
     let rusage_uaddr = args[3];
 
-    // rusage: Wave 3 rejects non-NULL with -EINVAL. txKernel doesn't
-    // track rusage today.
-    if rusage_uaddr != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-
     // pid → WaitTarget. i32::MIN's negate overflows; reject upfront.
     let target = match pid {
         i32::MIN => return SyscallResult::Error(EINVAL_VALUE),
@@ -546,6 +550,9 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         // WNOHANG: one-shot poll, no waiting.
         match step_waitpid_nohang(&ctx.process, target) {
             Ok((child_pid, status)) => {
+                if let Err(result) = write_wait4_rusage_if_requested(ctx, rusage_uaddr) {
+                    return result;
+                }
                 if wstatus_uaddr != 0 {
                     let word = status.wait_status_word();
                     if let Err(errno) =
@@ -575,6 +582,9 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     loop {
         match op.step(&mut script_ctx) {
             V3Out::Done(Ok((child_pid, status))) => {
+                if let Err(result) = write_wait4_rusage_if_requested(ctx, rusage_uaddr) {
+                    return result;
+                }
                 if wstatus_uaddr != 0 {
                     let word = status.wait_status_word();
                     if let Err(errno) =
@@ -605,6 +615,17 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             _ => {}
         }
     }
+}
+
+fn write_wait4_rusage_if_requested(
+    ctx: &SyscallCtx<'_>,
+    rusage_uaddr: u64,
+) -> Result<(), SyscallResult> {
+    if rusage_uaddr == 0 {
+        return Ok(());
+    }
+    let zeros = [0u8; RUSAGE_BYTES];
+    bootstrap_copy_to_user(&ctx.aspace, rusage_uaddr, &zeros).map_err(SyscallResult::error_from)
 }
 
 /// `getppid()` — return the parent's pid, or `0` (`Pid::RESERVED`)

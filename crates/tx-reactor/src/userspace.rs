@@ -84,6 +84,7 @@ pub enum UserspaceTrapInfo {
     Syscall(SyscallRequest),
     PageFault(PageFaultInfo),
     Fatal(FatalTrapInfo),
+    Preempted,
 }
 
 /// Generation-checked identity for an in-flight userspace-run request.

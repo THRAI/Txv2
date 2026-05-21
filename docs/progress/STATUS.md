@@ -1,3 +1,398 @@
+- 2026-05-22 **Dynamic libctest TLS passes after removing the
+  post-`FUTEX_WAKE` self-park.** The remaining dynamic TLS failures were a
+  pthread-exit progress bug, not bad TLS register seeding: pthread children
+  had distinct `tp` values, but musl's thread-list lock path needs an exiting
+  thread to wake `self->detach_state` and then continue immediately to
+  `SYS_exit`, where `CLONE_CHILD_CLEARTID` clears/wakes
+  `__thread_list_lock`. The thread-future path no longer parks the issuing
+  thread after a successful `FUTEX_WAKE`, and a host regression now asserts
+  that a `FUTEX_WAKE | FUTEX_PRIVATE_FLAG` return is written back and the
+  thread immediately re-enters userspace. The dedicated full libctest run
+  advanced through `pthread_cancel_points` but then wedged in static
+  `pthread_cancel`; this is a separate pthread-cancel blocker before the
+  regular dynamic TLS cases. To isolate the TLS result, a disposable
+  TLS-only OSComp sdcard copy under `target/oscomp/libctest-tls-data` rewrote
+  `/musl/basic_testcode.sh` to run only `entry-dynamic.exe tls_init`,
+  `tls_local_exec`, and `tls_get_new_dtv`.
+  **Verification:** regression was red before the fix and green after it;
+  `cargo test -p tx-kernel thread_future::tests -- --nocapture` passed; `cargo
+  build -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`
+  passed. The full `cargo xtask oscomp test --target rv64-qemu --suite
+  libctest-musl --skip-build --data target/oscomp/libctest-data` run was
+  stopped after it stopped making serial progress in static `pthread_cancel`.
+  The targeted TLS run used `cargo xtask oscomp qemu --target rv64-qemu --data
+  target/oscomp/libctest-tls-data`; `target/oscomp/os_serial_out_rv.txt`
+  contains `END` markers for all three dynamic TLS cases, and `cargo xtask
+  oscomp score --target rv64-qemu --suite libctest-musl --data
+  target/oscomp/libctest-tls-data` reports those three cases as `3/3` within
+  the filtered libctest block. **Next:** resume pthread-cancel debugging from
+  static `pthread_cancel`; it now blocks full-suite progression before dynamic
+  TLS, but the isolated TLS cases are no longer blocked by TLS/runtime state.
+  **Blockers:** full `libctest-musl` remains blocked by pthread cancellation
+  and the broader non-TLS compatibility list, not by dynamic TLS.
+
+- 2026-05-22 **Libctest musl `utime` passes; open-unlinked fd lifetime fixed
+  for tmpfs and pinned at the VFS contract.** Continued the Gemini direct
+  `xtask oscomp` musl run after the musl header-aligned `stat`, `statfs`, and
+  `utimensat` work. The remaining `utime` failure was not an ABI/layout bug:
+  musl `tmpfile()` opens `/tmp/tmpfile_XXXXXX`, immediately unlinks it, then
+  `futimens(fd, NULL, times)` calls `utimensat(fd, NULL, times, 0)`. tmpfs
+  removed the inode record during `FsOps::unlink`, so fd-backed metadata loads
+  returned `ENOENT` for the still-open file. tmpfs now removes only the name
+  and decrements/publishes the inode link count; `destroy_inode` remains the
+  reclamation hook. `FsOps` docs now spell out the cross-backend contract:
+  `unlink`/`rmdir` unhook names and update links, while payload destruction
+  waits for VFS liveness. Added host regressions for tmpfs unlink-open lifetime
+  and syscall-level `futimens` on an unlinked open file.
+  **Verification:** `CARGO_TARGET_DIR=/private/tmp/tx-gemini-target cargo test
+  -p tx-fs tmpfs -- --test-threads=1`; `CARGO_TARGET_DIR=/private/tmp/tx-gemini-target
+  cargo test -p tx-shims dispatch_futimens -- --test-threads=1`;
+  `CARGO_TARGET_DIR=/private/tmp/tx-gemini-target cargo test -p tx-shims
+  file_mutation -- --test-threads=1`; `CARGO_TARGET_DIR=/private/tmp/tx-gemini-target
+  cargo test -p tx-shims stat_family -- --test-threads=1`;
+  `CARGO_TARGET_DIR=/private/tmp/tx-gemini-target cargo test -p tx-fs devfs --
+  --test-threads=1`; `cargo fmt --check`; `git diff --check`;
+  `CARGO_TARGET_DIR=/private/tmp/tx-gemini-target cargo build -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`; copied the
+  rebuilt temp-target kernel to the worktree target path; `./target/debug/xtask
+  oscomp test --target rv64-qemu --suite libctest-musl --skip-build --data
+  target/oscomp/libctest-data` completed at `185/220`. Static and dynamic
+  `utime`, `stat`, and `statvfs` are green.
+  **Next:** continue from the remaining libctest failures: `crypt`, pthread
+  cancellation/condition/robust/RW-lock cases, `socket`, `rlimit_open_files`,
+  `syscall_sign_extend`, dynamic TLS/daemon/sem tail cases. Audit writable FAT
+  unlink-open lifetime separately before using it for tmpfile-like workloads.
+  **Blockers:** full libctest remains blocked by those non-ABI compatibility
+  gaps, not by `stat`/`statfs` layout or open-unlinked `futimens`.
+
+- 2026-05-22 **Dynamic libctest `qsort` now reaches and passes the test body.**
+  Continued the Gemini print-debug run on the tailored qsort image and fixed
+  two dynamic-loader blockers. First, the interpreter's RW LOAD segment could
+  put initialized file bytes and BSS in the same final page, but the
+  interpreter path only registered VM recipes; musl `__copy_tls` then read
+  zeroed loader `.data` (`tls_align == 0`) and faulted through `s0 - 8`.
+  Shared the main-image partial-BSS eager population path and applied it to the
+  interpreter image plan too. Second, after TLS init advanced, musl `__dls3`
+  faulted in `strncmp(NULL, "/proc/", 6)` because the auxv builder emitted
+  absent optional pointer entries as present-with-zero (`AT_EXECFN = 0`).
+  The auxv builder now omits absent optional pointer entries
+  (`AT_PLATFORM`, `AT_SYSINFO_EHDR`, `AT_EXECFN`) and keeps reserved zeroed
+  slack after the first `AT_NULL`. Exec debug prints now include
+  `at_execfn`, `at_platform`, and `at_sysinfo_ehdr` as either a pointer or
+  `absent`; thread page-fault prints include saved PC/RA/SP/TP/A0/A1 so the
+  dynamic-user faults can be decoded directly from serial.
+  **Verification:** `cargo fmt`; `cargo test -p tx-scripts
+  build_initial_user_stack --lib`; `cargo build -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`; copied the
+  rebuilt kernel to `target/oscomp/submit/kernel-rv`; `cargo xtask oscomp qemu
+  --target rv64-qemu --data target/oscomp/libctest-qsort-data`. The serial log
+  for `entry-dynamic.exe qsort` now shows `at_execfn=absent`, reaches the main
+  entry `pc=0x2e2e8`, prints `Pass!`, and ends
+  `========== END entry-dynamic.exe qsort ==========` with no `FAIL qsort`
+  line. `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv.txt --all --brief` found no kernel
+  trap lines, consistent with the run being user-space/debug-trace only.
+  **Next:** continue from the remaining libctest/syscall compatibility
+  failures rather than qsort: the tailored image still exits the guest with
+  status 256 after the libctest group, and the serial log still shows later
+  `nr=260 errno=10` waits to classify. **Blockers:** dynamic qsort is no
+  longer blocked by interpreter TLS data, null auxv pointers, stack size, or
+  stack overlap; full libctest completion remains blocked by the broader
+  syscall/threading compatibility list.
+
+- 2026-05-22 **Diagnosed and fixed libctest `qsort` user SIGSEGV as a
+  too-small initial exec stack reservation.** The qsort child faults at
+  `pc=0x17a48` on a write to `0x40128d38`, immediately after subtracting
+  `0xa0` from `sp`; the initial stack image was around `0x4012ce10`, making
+  the fault just below the former 16-KiB stack recipe. `qsort.c` allocates
+  two `uint64_t[1026]` locals (16,416 bytes) before qsort/musl call frames,
+  so this was ordinary stack use, not a parent/child stack overlap and not the
+  nested epoch-guard panic. Bumped
+  `USER_STACK_INITIAL_RESERVATION` to an 8-MiB lazy recipe-only reservation and
+  added a VM regression assertion covering the libctest qsort frame shape.
+  **Verification:** `cargo fmt --check`; `cargo test -p tx-subsystems
+  build_aspace_from_image_stack_reservation_covers_libctest_qsort_frame --
+  --test-threads=1`; `cargo test -p tx-subsystems build_aspace_from_image --
+  --test-threads=1`; `cargo build -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`; bounded `cargo xtask oscomp test --target
+  rv64-qemu --suite libctest-musl --skip-build --data
+  target/oscomp/libctest-data` copied the rebuilt kernel and showed qsort
+  reach the former fault, materialise the deeper stack page, print `Pass!`,
+  and emit `========== END entry-static.exe qsort ==========` with no
+  `FAIL qsort [signal Segmentation fault]`. The same run later timed out
+  `entry-static.exe pthread_robust_detach` and continued into the dynamic
+  suite; `entry-dynamic.exe qsort` still fails because its child `execve`
+  returns `ENOEXEC` (`Exec format error`), not because of the stack SIGSEGV.
+  The run was stopped manually later in `entry-dynamic.exe string_memmem`, so
+  no final full-suite score was produced. **Next:** debug dynamic exec/loader
+  support and the pthread timeout separately. **Blockers:** static qsort is no
+  longer blocked by stack size or stack overlap; full libctest completion is
+  now blocked by dynamic exec/loader and later pthread/syscall compatibility
+  work.
+
+- 2026-05-22 **Libctest `ftello_unflushed_append` nested epoch-guard panic
+  fixed.** Root cause was the direct PageBacked `read(2)`/`write(2)` prefault
+  path in `crates/tx-shims/src/linux_syscall/io.rs`: it acquired a
+  `step_engine::guard()` immediately before calling
+  `AddressSpace::reserve_user_range_for_access`, whose VM implementation takes
+  epoch guards internally. Removed those outer guards so the prefault path
+  follows the same no-caller-held-guard discipline already used by
+  `bootstrap_copy_{from,to}_user`; the later StepOp drive still acquires its
+  own per-step guard. The tailored libctest run now passes
+  `ftello_unflushed_append` and finishes without a kernel panic.
+  **Verification:** `cargo fmt --check`; `cargo test -p tx-shims --
+  --test-threads=1`; `cargo test -p tx-subsystems page_backed --
+  --test-threads=1`; `cargo build -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`; `cargo xtask oscomp test --target rv64-qemu
+  --suite libctest-musl --skip-build --data target/oscomp/libctest-data`
+  completed with score `89/220`, no `epoch guards cannot be nested` panic, and
+  static `ftello_unflushed_append 1/1`.
+  **Next:** continue libctest compatibility from the remaining failures:
+  pthread timeout/cancellation cases, `qsort` user SIGSEGV, `socket`
+  returning ENOSYS, `stat`/`utime`/`statvfs`, `fflush_exit`, rlimit/syscall
+  sign-extension, and dynamic-suite startup. **Blockers:** full libctest is no
+  longer blocked by the nested epoch guard; it is now blocked by the remaining
+  libc syscall/threading compatibility failures listed above.
+
+- 2026-05-22 **AIO integration blocker fixed; full `tx-shims` package tests
+  pass.** The `io_submit` `EFAULT` blocker was the host bootstrap user-copy
+  gate: integration tests compile `tx-shims` as a normal dependency, so
+  `cfg(test)` was not active and the fallback rejected common macOS heap
+  pointers below `FULL_USER_V1_TOP`. Added a host-only
+  `host_bootstrap_kernel_pointer_allowed` helper that keeps the null-page
+  guard while preserving the kernel-pointer bridge for debug/test-support host
+  builds, with `target_os = "none"` still using strict user-VA copying. The
+  broader `tx-shims` run then exposed a second interface-order issue:
+  `read(2)` computed the PageBacked/VFS length cap via `OpenFile::rnode()`
+  before dispatching userfaultfd/signalfd/eventfd/timerfd read arms. Added an
+  `OpenFileBacking`-aware PageBacked probe and moved non-VFS read dispatch
+  before any `rnode()` access, so userfaultfd reads no longer panic.
+  **Verification:** `cargo test -p tx-shims --test v3_aio_io_submit
+  io_submit_admits_one_iocb_onto_the_queue -- --nocapture --test-threads=1`;
+  `cargo test -p tx-shims --test v3_aio_e2e
+  aio_pread_e2e_round_trip_against_tmpfs_file -- --nocapture --test-threads=1`;
+  `cargo test -p tx-shims --test v3_aio_e2e
+  aio_e2e_mid_flight_destroy_cancels_worker -- --nocapture --test-threads=1`;
+  `cargo test -p tx-shims --test v3_aio_io_submit -- --test-threads=1`;
+  `cargo test -p tx-shims --test v3_aio_e2e -- --test-threads=1`;
+  `cargo test -p tx-shims --test v3_userfaultfd_ioctl_reply --
+  --test-threads=1`; `cargo test -p tx-shims -- --test-threads=1`;
+  `cargo fmt --check`.
+  **Next:** resume the libctest/OSComp debug from the current Gemini stop
+  (`ftello_unflushed_append` nested epoch-guard panic) with the existing print
+  traces kept live. **Blockers:** none for `tx-shims` host package tests; the
+  remaining blocker is the OSComp/libctest runtime panic above.
+
+- 2026-05-22 **Merged 6a/6dea userspace interface fixes into the Gemini
+  worktree.** Hand-applied the interface slice from
+  `/Users/3y/.codex/worktrees/6dea/Tx` rather than doing a dirty-worktree merge,
+  preserving the existing Gemini debug/OSComp work and fd-limit fixes. The
+  merged surface fixes generic RV64/LoongArch epoll syscall numbers
+  (`20/21/22`) and LP64 `struct epoll_event` copy paths, registers the epoll
+  zone and `OpenFile::epoll()` accessor, tightens timerfd
+  `settime/gettime` copy/flag/remaining-time semantics, implements LP64
+  `sigaltstack` query/update over `ThreadPayload.alt_stack`, switches
+  `statfs/fstatfs` to the musl LP64 layout, pins `Termios`/`Winsize` with
+  `repr(C)` and size asserts, makes `uname.machine` follow the selected
+  platform, and zero-fills `wait4` rusage when requested. Added focused
+  regression coverage for timerfd, sigaltstack, epoll, termios, statfs, uname,
+  and wait4 rusage.
+  **Verification:** `cargo fmt`; `cargo test -p tx-shims timerfd_dispatch --
+  --test-threads=1`; `cargo test -p tx-shims sigaltstack_dispatch --
+  --test-threads=1`; `cargo test -p tx-shims epoll_dispatch --
+  --test-threads=1`; `cargo test -p tx-shims
+  dispatch_uname_uses_selected_platform_machine -- --test-threads=1`;
+  `cargo test -p tx-shims
+  dispatch_ioctl_tcgets_writes_linux_kernel_termios_layout -- --test-threads=1`;
+  `cargo test -p tx-shims dispatch_statfs_writes_musl_lp64_statfs_layout --
+  --test-threads=1`; `cargo test -p tx-shims
+  dispatch_fstatfs_writes_musl_lp64_statfs_layout -- --test-threads=1`;
+  `cargo test -p tx-shims
+  dispatch_wait4_rusage_nonzero_writes_zeroed_rusage -- --test-threads=1`;
+  `cargo test -p tx-subsystems timerfd -- --test-threads=1`;
+  `cargo test -p tx-subsystems epoll -- --test-threads=1`; `cargo test -p
+  tx-subsystems ioctl -- --test-threads=1`; `cargo test -p tx-shims --lib --
+  --test-threads=1` (269/269 pass).
+  **Next:** resume the libctest/OSComp debug from the current Gemini stop
+  (`ftello_unflushed_append` nested epoch-guard panic) or investigate the AIO
+  integration failures before using full `tx-shims` integration as a gate.
+  **Blockers:** full `cargo test -p tx-shims -- --test-threads=1` still fails
+  in unrelated-looking `tests/v3_aio_e2e.rs` cases:
+  `aio_pread_e2e_round_trip_against_tmpfs_file` and
+  `aio_e2e_mid_flight_destroy_cancels_worker` both see `io_submit` return
+  `Error(14)` (`EFAULT`) instead of `Return(1)`.
+
+- 2026-05-21 **Libctest fd-fill/daemon regression moved; current stop is
+  nested epoch guard in `ftello_unflushed_append`.** Continued the
+  print-debug libctest run in the Gemini worktree. The stale mailbox
+  `SignalDelivered` loop was already moved by consuming the wake hint in
+  `tx-scripts::drive`, and the next no-progress point was
+  `entry-static.exe daemon_failure`: `t_fdfill()` repeatedly called
+  `dup(1)` until the kernel handed out unbounded fd numbers. Added the
+  syscall-side `RLIMIT_NOFILE` ceiling (`1024`) and `EMFILE` handling for
+  fd-creating arms (`openat`, `dup`, `F_DUPFD`, `pipe2`, eventfd,
+  timerfd, signalfd, userfaultfd, AIO, io_uring), plus `dup3` target
+  range validation. `openat` now reserves/checks the fd slot before VFS
+  lookup so a full fd table returns `EMFILE` before `/dev/null` lookup can
+  return `ENOENT`, matching the musl regression's expected ordering.
+  **Verification:** `cargo fmt --check`; `cargo test -p tx-shims
+  dispatch_dup_at_rlimit_nofile_returns_neg_emfile`; `cargo test -p
+  tx-shims dispatch_fcntl_f_dupfd_min_at_rlimit_returns_neg_einval`;
+  `cargo test -p tx-shims dispatch_fcntl_f_dupfd_full_table_returns_neg_emfile`;
+  `cargo test -p tx-shims fd_ops_wave2::dispatch_dup -- --test-threads=1`;
+  `cargo test -p tx-shims fcntl_misc::dispatch_fcntl_f_dupfd --
+  --test-threads=1`; `cargo test -p tx-shims
+  dispatch_prlimit64_rlimit_nofile_returns_default`; `cargo test -p
+  tx-shims dispatch_openat_full_fd_table_returns_neg_emfile_before_enoent`;
+  `cargo test -p tx-shims fd_ops_wave2::dispatch_openat --
+  --test-threads=1`; `cargo build -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`; bounded `cargo xtask oscomp test --target
+  rv64-qemu --suite libctest-musl --skip-build --data
+  target/oscomp/libctest-data` rerun copied the rebuilt kernel, reached
+  `daemon_failure`, logged `nr=23 errno=24` and `nr=56 errno=24`, and
+  `daemon_failure` passed. **Next:** debug the new hard stop at
+  `entry-static.exe ftello_unflushed_append`: the serial log panics at
+  `crates/tx-substrate/src/epoch/local.rs:55` with `epoch guards cannot
+  be nested on the same CPU` immediately after syscall `nr=64` (`write`).
+  Earlier remaining libctest failures still include pthread cancellation
+  timeouts, `qsort` segfault, `socket`, `stat`, `utime`, and
+  `fflush_exit`. **Blockers:** full libctest completion is now blocked by
+  the nested epoch-guard panic, not by the previous daemon fd-fill loop;
+  the QEMU run was stopped/expired cleanly with no live QEMU process left.
+
+- 2026-05-21 **Docker-edited libctest-only OSComp sdcard copy.** With Docker
+  Desktop running, created `target/oscomp/libctest-data/` as a disposable
+  OSComp data directory. The existing uncompressed
+  `target/oscomp/testdata/sdcard-rv.img` had musl-subtree checksum trouble under
+  Linux `debugfs`/mount, so the working image was regenerated from the pristine
+  `target/oscomp/testdata/sdcard-rv.img.xz`. Inside an Ubuntu 22.04 container
+  with e2fsprogs, rewrote image path `/musl/basic_testcode.sh` to:
+  `./busybox sh libctest_testcode.sh; exit 1`. Because txKernel's default
+  sdcard command starts with `basic_testcode.sh` and chains later suites with
+  `&&`, this makes the existing boot path enter libctest first and then stop the
+  later suite chain. Judge scripts were copied from `target/oscomp/testdata/`,
+  and the original `target/oscomp/testdata/sdcard-rv.img` was left untouched.
+  **Verification:** `xz -dkc target/oscomp/testdata/sdcard-rv.img.xz >
+  target/oscomp/libctest-data/sdcard-rv.img`; Docker `e2fsck -fn
+  target/oscomp/libctest-data/sdcard-rv.img`; Docker `debugfs -w` remove/write
+  of `/musl/basic_testcode.sh`; Docker `e2fsck -fn` after the write; `cargo
+  xtask oscomp test --target rv64-qemu --suite libctest-musl --skip-build
+  --dry-run --data target/oscomp/libctest-data` confirmed QEMU will use the
+  edited copied image.
+  **Run result:** after rebuilding the RV64 kernel so the current print traces
+  were live, `cargo xtask oscomp test --target rv64-qemu --suite
+  libctest-musl --skip-build --data target/oscomp/libctest-data` booted the
+  copied image and entered `#### OS COMP TEST GROUP START libctest-musl ####`
+  directly. Static libctest advanced through `memstream` and then reproduced a
+  stall at `entry-static.exe pthread_cancel_points`. The live trace shows the
+  test thread repeatedly taking syscall `nr=98` (`futex`) and returning
+  `errno=4` (`EINTR`) while `:diag:mbox:thread-current tid=35 ... q=1 ov=n`
+  stays nonempty; no SysV IPC test was reached in this tailored run.
+  **Next:** inspect the futex wait/error path around `pthread_cancel_points`,
+  especially why `FUTEX_WAIT` is re-entered with `EINTR` instead of observing
+  the queued mailbox/signal state or completing cancellation progress.
+  **Blockers:** none for the copied-image route; it depends on Docker +
+  e2fsprogs and remains a generated `target/` artifact rather than tracked repo
+  source. The libctest run itself is blocked by the futex/EINTR loop, not by
+  image tailoring.
+
+- 2026-05-21 **Mailbox/reactor print trace added for libctest hang triage.**
+  Added console breadcrumbs across the user-thread wake path while keeping the
+  existing print-debug style active. The init and cloned-thread submit paths now
+  print reactor task key, TID/PID, mailbox TID/PID, queue length, and overflow
+  state after mailbox binding. The userspace reactor loop prints queue depth
+  before each step, and `step_boot_reactor_once` prints per-step poll,
+  completion, wake-placement, local/remote reschedule, timer-wake, reschedule,
+  idle, and queue-depth counters. The thread future now prints userspace entry
+  request ids, wake return, syscall number/result, current mailbox identity and
+  state, and page-fault details.
+  **Verification:** `cargo fmt --check`; `git diff --check -- crates/tx-kernel/src/thread_future.rs crates/tx-kernel/src/init.rs crates/tx-kernel/src/init/exec.rs docs/progress/STATUS.md docs/DEVELOPMENT.md`; `cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`.
+  **Trimmed/libctest check:** no `tools/build-slim-sdcard.py` or equivalent slim
+  sdcard helper exists in this Gemini worktree. `cargo xtask oscomp test
+  --target rv64-qemu --suite libctest-musl --skip-build --dry-run` shows the
+  current `--suite` path only filters scoring; QEMU still boots the full
+  `target/oscomp/testdata/sdcard-rv.img` ext4 image. That image is 4.0G logical
+  / 3.0G allocated, and this host lacks `mkfs.ext4`, `debugfs`, `e2fsck`, and
+  `resize2fs`, so making a true trimmed ext4 image needs e2fsprogs or a new
+  host-side extractor/builder. A faster near-term route is to add a
+  `tx.oscomp.suite=libctest-musl` cmdline hook so the full image can run only
+  `libctest_testcode.sh`.
+  **Next:** run OSComp with the new trace and compare `:diag:mbox:*` with
+  `:diag:reactor:*` around the pthread/libctest stall; decide whether to add the
+  suite cmdline hook or an ext4 trim builder.
+  **Blockers:** true trimmed sdcard creation is blocked on ext4 image tooling in
+  the current host environment.
+
+- 2026-05-21 **Musl libc reference submodule added for ABI checks.** Added
+  `external/musl` as a reference-only submodule pinned at
+  `5122f9f3c99fee366167c5de98b31546312921ab` (`v1.2.6-11-g5122f9f3`) and
+  documented it in `docs/DEVELOPMENT.md` for SysV IPC/userspace ABI layout
+  checks. `.gitmodules` marks the submodule `ignore = untracked` to keep
+  reference-tree scratch files from polluting parent status.
+  **Verification:** `git submodule status external/musl`; inspected
+  `external/musl/arch/generic/bits/{ipc,shm,msg,sem}.h`.
+  **Next:** compare `crates/tx-shims/src/linux_syscall/ipc.rs` layouts against
+  the musl headers before the next SysV IPC hang fix; keep mailbox print
+  diagnostics active while the lost-wakeup hypothesis is still open.
+  **Blockers:** none.
+
+- 2026-05-21 **Worktree cleanup after Gemini handoff.** Removed stale detached
+  Codex worktrees `/Users/3y/.codex/worktrees/a908/Tx` and
+  `/Users/3y/.codex/worktrees/eb44/Tx`; the remaining registered worktrees are
+  the main checkout and Gemini `check-oscomp-status`.
+  **Verification:** `git worktree list --porcelain`; `git status --short --branch --ignore-submodules=untracked` on main and Gemini.
+  **Next:** continue from Gemini `check-oscomp-status`.
+  **Blockers:** none.
+
+- 2026-05-21 **SysV SHM implementation cleanup and unit tests.** Cleaned up stubs in `sys_shmctl` and aligned `IpcPermLayout`, `ShmidDsLayout`, and `ShminfoLayout` with the RISC-V 64-bit Linux ABI. Added a comprehensive SysV shared memory unit test verifying segment creation, lookup, permission checks, `IPC_SET` atomic state updates, `IPC_STAT` queries, and `IPC_RMID` deletion.
+  **Verification:**
+  - Host unit tests: `cargo -q xtask unit` — **344/344 tests pass** (including the new `test_shm_lifecycle_and_ctl`).
+  - Crate-specific test: `cargo test -p tx-subsystems --lib ipc::sysv_shm` compiles cleanly and passes successfully.
+
+- 2026-05-21 **Musl IPC/pthread wake path now binds the task mailbox to the thread payload.** Fixed the likely `pthread_cancel` stall miswire by binding each production user-thread's `ThreadPayload` to its reactor `TaskMailbox` at submit time in both bootstrap-exec and cloned-thread creation paths. That makes signal wake hints land on the same mailbox the parked thread future is actually waiting on, instead of depending on the ambient reactor task slot. The earlier musl signal-frame ABI / SysV IPC layout work stays in place; this change closes the wake-routing gap that could leave `SIGCANCEL` updates invisible to the waiting thread.
+  **Changes:**
+  1. `crates/tx-kernel/src/init/exec.rs` now captures a third payload clone solely for mailbox binding, submits the init thread future, then looks up the task's `TaskMailbox` and stores a weak handle on the shared thread payload.
+  2. `crates/tx-kernel/src/init.rs` does the same for cloned child threads submitted from the deferred `sys_clone` queue.
+  3. No signal-frame ABI code changed in this step; the fix is purely wake routing.
+  **Verification:**
+  - `cargo check -p tx-kernel --target riscv64gc-unknown-none-elf -q`
+  - `cargo test -p tx-kernel init::tests::run_bsp_reactor_runtime_smoke -- --nocapture`
+  - `cargo test -p tx-subsystems v3_signal_mailbox -- --nocapture`
+  - `cargo -q xtask unit`
+  - `cargo xtask progress validate`
+  - Fresh `cargo xtask oscomp test --target rv64-qemu --suite libctest-musl` reaches the libctest-musl suite cleanly through `pthread_cancel_points` and into `pthread_cancel`; the run was still in progress at checkpoint, so full-suite completion remains the next proof point.
+  **Next:** finish the fresh OSComp libctest-musl run and confirm whether `pthread_cancel` now unwinds or still needs a second cancellation-path fix.
+
+- 2026-05-21 **`sys_rt_sigreturn` rewritten for cooperative pthread cancellation; PC rewind on EINTR.** Fixed the gap between the spec and the pthread cancellation implementation that caused musl's `pthread_cancel_points` test to fail at `shm_open` (line 144: `res != PTHREAD_CANCELED`). Two root causes:
+  1. The kernel eagerly advanced PC past `ecall` on syscall traps, so when interrupted by a signal the `ucontext_t` saved for the handler pointed to `__cp_end` (the instruction after `ecall`), failing musl's `[__cp_begin, __cp_end)` range check.
+  2. `sys_rt_sigreturn` restored registers from the parked `saved_signal_context` without reading the stack-based `ucontext_t`, ignoring user-space handler modifications (e.g. musl redirecting PC to `__cancel`).
+
+  **Changes:**
+  1. **PC rewind** (`crates/tx-kernel/src/thread_future.rs`): In the `AstOutcome::DeliverHandler` checkpoint, if the pending syscall return is `Err(4)` (EINTR), subtract 4 from `orig_ctx.pc` before saving it in `saved_signal_context`, so the stack `ucontext_t` correctly points to the `ecall` instruction.
+  2. **Stack-based sigreturn** (`crates/tx-shims/src/linux_syscall/signal.rs`): Rewrote `sys_rt_sigreturn<P: SignalFrameIf>` to read the signal frame from the user stack via `P::read_signal_frame`, compare the restored PC with the parked `saved_signal_context` PC, and conditionally advance PC for normal returns (where PC was not redirected by the handler). Falls back to restoring the parked context directly when the stack read fails (host tests, corrupted stack).
+  3. **`store_signal_mask`** (`crates/tx-subsystems/src/thread_runtime/structure.rs`): Exposed `store_signal_mask(&self, mask: SignalMask)` on `ThreadPayload` for cross-crate signal mask restoration.
+  4. **Dispatch bounds** (`crates/tx-shims/src/linux_syscall/mod.rs`): Added `tx_hal::SignalFrameIf` bound to `dispatch`/`dispatch_inner`.
+  5. **Test mock** (`crates/tx-shims/src/linux_syscall/tests.rs`): Implemented `TrapIf` + `SignalFrameIf` for `ShimsTestPmap`.
+
+  **Verification:**
+  - Host unit tests: `cargo -q xtask unit` — **343/343 tests pass** (241 tx-shims + 44 tx-kernel + 8 tx-ext4 + 50 tx-scripts).
+  - QEMU busybox-boot: sentinel observed, boot successful.
+  - Next: OSComp libctest-musl `pthread_cancel_points` verification pending.
+
+
+
+  **Changes:**
+  1. **`post_signal` signature** (`crates/tx-subsystems/src/thread_runtime/execution.rs`): added `routing: SignalRouting` as third parameter; `post_signal_mailbox` call now passes caller-supplied `routing` instead of hardcoded `ProcessDirected`.
+  2. **`ThreadKillOp::step`** (same file): constructs `SignalRouting::ThreadDirected { tid: self.thread.tid.0 as u64 }` and passes it to `post_signal`.
+  3. **`step_kill_process`** (`crates/tx-subsystems/src/signal/mod.rs`): updated to pass `SignalRouting::ProcessDirected` explicitly.
+  4. **Test callers** (`crates/tx-subsystems/src/signal/tests/delivery.rs`, `crates/tx-subsystems/tests/v3_signal_mailbox.rs`): all 21 `post_signal` call sites updated to pass `SignalRouting::ProcessDirected`.
+
+  **Verification:**
+  - Host unit tests: `cargo -q xtask unit` — **343/343 tests pass** (241 tx-shims + 44 tx-kernel + 8 tx-ext4 + 50 tx-scripts).
+  - `cargo xtask check` — all gates green (fmt, clippy, unused lint, all 3 board targets).
+  - `cargo xtask progress validate` — 27 records ok.
+  - QEMU OSComp: **168/377** — no regression. basic-musl 102/102, busybox-musl 52/55, libctest-musl 14/220 (14 static tests pass; `pthread_cancel` wedges on `pthread_create` EAGAIN — pre-existing, blocks remaining suites). `pthread_cancel_points` now fails gracefully (status 1) instead of crashing the kernel.
+
 - 2026-05-20 **OSComp / Unit Test Suite Stabilization.** Resolved all pre-existing panic / EFAULT issues on host and target, achieving 100% green test suites and successful QEMU boot:
 
   1. **Nested Epoch-Guard Panic Fix**: Reordered `bootstrap_copy_from_user` and `bootstrap_copy_to_user` in `crates/tx-shims/src/linux_syscall/user_copy.rs` to invoke eager user range prefaulting `reserve_user_range_for_access` *before* acquiring the outer `step_engine::guard()`, preventing epoch-guard nesting violations.
@@ -8793,6 +9188,16 @@
   `cargo xtask progress validate` on next JSON edit. Next step:
   implementation tracking via PR-3D successor task. No blocker. See
   `docs/progress/decisions/2026-05-11-d9-signal-wake-migration.md`.
+- 2026-05-21 Pthread cancellation and signal frame ABI fixes landed (worker W-X).
+  Restructured the RISC-V signal frame ABI to align with standard Linux
+  `ucontext_t` expectations, placing PC at `__gregs[0]` (offset 168) so musl's
+  `cancel_handler` can read and redirect the interrupted PC. Fixed PC-advancement
+  in `sys_rt_sigreturn` by tracking whether a syscall was actually rewound
+  using GPR `regs[0]` in the parked `saved_signal_context` as a private flag,
+  preventing PC skips on normal instruction/syscall signal returns.
+  Verification: built RV64 kernel cleanly, host unit tests (`cargo xtask unit`)
+  passed. Next step: integrate signal delivery further as other subsystems mature.
+  No blockers.
 
 ## Open Blockers
 

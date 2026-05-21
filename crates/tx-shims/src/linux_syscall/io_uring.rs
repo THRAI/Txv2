@@ -54,7 +54,7 @@ use tx_subsystems::io_uring::{spawn_sqpoll_worker, IoUring, SqpollWorkerFuture};
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
 
-use super::ENOMEM_VALUE;
+use super::{next_stdio_fd_below_nofile, ENOMEM_VALUE};
 use super::{SyscallCtx, SyscallResult};
 use crate::adapter::step_engine::SpinMutex;
 
@@ -130,7 +130,10 @@ pub(super) fn sys_io_uring_setup(
     };
 
     // Install at the lowest free fd.
-    let fd = ctx.process.allocate_fd();
+    let fd = match next_stdio_fd_below_nofile(&ctx.process) {
+        Ok(fd) => fd,
+        Err(result) => return result,
+    };
     let _ = ctx.process.install_fd(fd, open_cap);
 
     SyscallResult::Return(fd as i64)

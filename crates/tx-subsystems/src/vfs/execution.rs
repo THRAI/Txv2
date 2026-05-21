@@ -11,12 +11,12 @@ use alloc::vec::Vec;
 use crate::execution::Guard;
 use crate::page_backed::FsPageBacking;
 use crate::tty;
-use crate::vm::AddressSpace;
-use tx_hal::UserPtr;
 use crate::vfs::adapter::step_engine::{
     self, ByteProgress, Cap, Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome,
     SubjectIdentity,
 };
+use crate::vm::AddressSpace;
+use tx_hal::UserPtr;
 
 use super::structure::{
     Credential, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileBacking, OpenFileIoctl,
@@ -92,6 +92,12 @@ pub trait FsOps: Send + Sync + 'static {
         guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress>;
 
+    /// Remove one namespace entry and decrement the target's link
+    /// count. Implementations must not destroy the inode payload here:
+    /// open files, live RNodes, and page-cache state may still address
+    /// `target` after the last name disappears. Reclamation belongs to
+    /// [`FsOps::destroy_inode`] when the VFS lifetime predicate says
+    /// no live payload references remain.
     fn unlink(
         &self,
         parent: FsObjectId,
@@ -126,6 +132,10 @@ pub trait FsOps: Send + Sync + 'static {
         guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress>;
 
+    /// Remove an empty directory namespace entry. Like [`FsOps::unlink`],
+    /// this unhooks the name; backend storage reclamation is a
+    /// [`FsOps::destroy_inode`] responsibility once VFS proves no live
+    /// references remain.
     fn rmdir(
         &self,
         parent: FsObjectId,
@@ -156,6 +166,10 @@ pub trait FsOps: Send + Sync + 'static {
         guard: &Guard<'_>,
     ) -> StepOutcome<Option<(DirEntry, super::structure::DirCursor)>, NoProgress>;
 
+    /// Reclaim backend-owned inode storage after VFS payload liveness
+    /// falls false (for example, zero links and no open/RNode/page-cache
+    /// pins). Backends should tolerate a repeated call for an already
+    /// reclaimed object when practical.
     fn destroy_inode(
         &self,
         fs_object_id: FsObjectId,

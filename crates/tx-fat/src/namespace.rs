@@ -7,8 +7,8 @@
 
 use crate::adapter::step_engine::{Cap, Guard, NoProgress, StepOutcome};
 use crate::read_backend::{
-    cluster_from_fs_id, cursor_from_cluster_index, is_fat_root, map_cached_meta,
-    unix_to_fat_date, unix_to_fat_time, FatFsInstance, FAT_ROOT_CLUSTER_SENTINEL,
+    cluster_from_fs_id, cursor_from_cluster_index, is_fat_root, map_cached_meta, unix_to_fat_date,
+    unix_to_fat_time, FatFsInstance, FAT_ROOT_CLUSTER_SENTINEL,
 };
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -112,12 +112,9 @@ where
 
             // Cache the dirent metadata including parent info for
             // serialize_inode_meta / truncate.
-            self.dirent_cache.lock().insert(
-                fs_id,
-                entry,
-                parent_cluster,
-                entry_idx as u32,
-            );
+            self.dirent_cache
+                .lock()
+                .insert(fs_id, entry, parent_cluster, entry_idx as u32);
 
             return StepOutcome::done(fs_id);
         }
@@ -164,7 +161,11 @@ where
         };
 
         StepOutcome::done(InodeMeta {
-            mode: if is_dir { 0o555 | 0o040000 } else { 0o444 | 0o100000 },
+            mode: if is_dir {
+                0o555 | 0o040000
+            } else {
+                0o444 | 0o100000
+            },
             uid: 0,
             gid: 0,
             size: 0,
@@ -288,7 +289,11 @@ where
 
                 // ".." entry.
                 let dotdot_name = build_dotdot_name();
-                let parent_cluster_val = if is_fat_root(parent) { 0 } else { parent_cluster };
+                let parent_cluster_val = if is_fat_root(parent) {
+                    0
+                } else {
+                    parent_cluster
+                };
                 let parent_lo = (parent_cluster_val & 0xFFFF) as u16;
                 let parent_hi = ((parent_cluster_val >> 16) & 0xFFFF) as u16;
                 buf[32..43].copy_from_slice(&dotdot_name);
@@ -333,7 +338,11 @@ where
 
         let fs_id = crate::read_backend::fs_object_id(cluster, entry_index);
         let meta = InodeMeta {
-            mode: if is_dir { 0o555 | 0o040000 } else { mode & 0o777 | 0o100000 },
+            mode: if is_dir {
+                0o555 | 0o040000
+            } else {
+                mode & 0o777 | 0o100000
+            },
             uid: 0,
             gid: 0,
             size: 0,
@@ -355,12 +364,9 @@ where
             write_date: 0,
             write_time: 0,
         };
-        self.dirent_cache.lock().insert(
-            fs_id,
-            &dummy,
-            parent_cluster,
-            entry_index,
-        );
+        self.dirent_cache
+            .lock()
+            .insert(fs_id, &dummy, parent_cluster, entry_index);
 
         StepOutcome::done((fs_id, meta))
     }
@@ -644,9 +650,7 @@ where
         // Filter out volume labels and dot/dotdot entries
         let visible: Vec<&DirEntryLite> = entries
             .iter()
-            .filter(|e| {
-                e.attr & ATTR_VOLUME_ID == 0 && !is_dot_or_dotdot(e.display_name())
-            })
+            .filter(|e| e.attr & ATTR_VOLUME_ID == 0 && !is_dot_or_dotdot(e.display_name()))
             .collect();
 
         let index = {
@@ -677,12 +681,9 @@ where
         let fs_id = crate::read_backend::fs_object_id(child_cluster, index as u32);
 
         // Cache the dirent including parent info for serialize / truncate.
-        self.dirent_cache.lock().insert(
-            fs_id,
-            entry,
-            cluster,
-            index as u32,
-        );
+        self.dirent_cache
+            .lock()
+            .insert(fs_id, entry, cluster, index as u32);
 
         StepOutcome::done(Some((
             DirEntry {
@@ -755,7 +756,7 @@ fn name_eq(entry_name: &[u8], query: &[u8]) -> bool {
     entry_name
         .iter()
         .zip(query.iter())
-        .all(|(&a, &b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+        .all(|(&a, &b)| a.eq_ignore_ascii_case(&b))
 }
 
 fn is_dot_or_dotdot(name: &[u8]) -> bool {
@@ -825,8 +826,8 @@ fn to_valid_fat_char(b: u8) -> u8 {
         b'A'..=b'Z' => b,
         b'a'..=b'z' => b - 32, // uppercase
         b'0'..=b'9' => b,
-        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'(' | b')' | b'-' | b'@' | b'^'
-        | b'_' | b'`' | b'{' | b'}' | b'~' => b,
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'(' | b')' | b'-' | b'@' | b'^' | b'_'
+        | b'`' | b'{' | b'}' | b'~' => b,
         b' ' => 0, // skip spaces
         _ => 0,    // reject
     }

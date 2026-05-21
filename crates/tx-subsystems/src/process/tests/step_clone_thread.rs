@@ -40,8 +40,8 @@ fn clone_thread_creates_sibling_in_same_process() {
     let tls: usize = 0x6000_0000;
     let ctid: u64 = 0x8000_0000;
 
-    let child = step_clone_thread(&parent, &parent_ctx, stack, tls, ctid)
-        .expect("step_clone_thread");
+    let child =
+        step_clone_thread(&parent, &parent_ctx, stack, tls, ctid).expect("step_clone_thread");
 
     // After: two threads.
     assert_eq!(parent.live_thread_count(), 2);
@@ -91,8 +91,7 @@ fn clone_thread_zero_ctid_is_no_op() {
     let parent = bootstrap();
     let parent_ctx = synthetic_parent_ctx();
 
-    let child = step_clone_thread(&parent, &parent_ctx, 0, 0, 0)
-        .expect("step_clone_thread");
+    let child = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("step_clone_thread");
 
     let ctid_stored = *child
         .payload_cap()
@@ -142,8 +141,7 @@ fn clone_thread_preserves_parent_pc_and_status() {
     let parent = bootstrap();
     let parent_ctx = synthetic_parent_ctx();
 
-    let child = step_clone_thread(&parent, &parent_ctx, 0, 0, 0)
-        .expect("step_clone_thread");
+    let child = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("step_clone_thread");
 
     let saved = child
         .payload_cap()
@@ -161,8 +159,7 @@ fn clone_thread_zero_stack_inherits_parent_sp() {
     let parent = bootstrap();
     let parent_ctx = synthetic_parent_ctx();
 
-    let child = step_clone_thread(&parent, &parent_ctx, 0, 0, 0)
-        .expect("step_clone_thread");
+    let child = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("step_clone_thread");
 
     let saved = child
         .payload_cap()
@@ -171,7 +168,10 @@ fn clone_thread_zero_stack_inherits_parent_sp() {
         .expect("seed installs Some");
 
     #[cfg(not(target_arch = "loongarch64"))]
-    assert_eq!(saved.regs[2], parent_ctx.regs[2], "sp inherits parent when stack=0");
+    assert_eq!(
+        saved.regs[2], parent_ctx.regs[2],
+        "sp inherits parent when stack=0"
+    );
 }
 
 #[test]
@@ -180,8 +180,7 @@ fn clone_thread_zero_tls_inherits_parent_tp() {
     let parent = bootstrap();
     let parent_ctx = synthetic_parent_ctx();
 
-    let child = step_clone_thread(&parent, &parent_ctx, 0, 0, 0)
-        .expect("step_clone_thread");
+    let child = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("step_clone_thread");
 
     let saved = child
         .payload_cap()
@@ -190,5 +189,8 @@ fn clone_thread_zero_tls_inherits_parent_tp() {
         .expect("seed installs Some");
 
     #[cfg(not(target_arch = "loongarch64"))]
-    assert_eq!(saved.regs[4], parent_ctx.regs[4], "tp inherits parent when tls=0");
+    assert_eq!(
+        saved.regs[4], parent_ctx.regs[4],
+        "tp inherits parent when tls=0"
+    );
 }

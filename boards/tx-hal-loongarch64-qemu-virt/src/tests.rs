@@ -44,7 +44,7 @@ impl KernelTrapSink<Platform> for RecordingTrapSink {
         panic!("unexpected syscall")
     }
 
-    fn on_timer_interrupt(cpu: CpuId) -> TrapAction {
+    fn on_timer_interrupt(cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         assert_eq!(cpu, CpuId(0));
         assert!(<Platform as IrqIf>::in_irq_context());
         TEST_TIMER_TRAPS.fetch_add(1, Ordering::AcqRel);
@@ -81,7 +81,7 @@ impl KernelTrapSink<Platform> for RecordingSyscallSink {
         TrapAction::Resume
     }
 
-    fn on_timer_interrupt(_cpu: CpuId) -> TrapAction {
+    fn on_timer_interrupt(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         panic!("unexpected timer")
     }
 

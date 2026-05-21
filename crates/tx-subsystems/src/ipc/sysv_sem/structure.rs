@@ -7,7 +7,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::ipc::sysv_shm::structure::IpcPerm;
 use crate::process::adapter::step_engine::{
@@ -26,11 +26,31 @@ pub struct SemArrayIdentity {
     pub semid: u32,
     pub cred: Cap<crate::cred::Cred>,
     pub nsems: u16,
-    pub perm: IpcPerm,
+    pub mode: AtomicU16,
+    pub uid: AtomicU32,
+    pub gid: AtomicU32,
     pub cuid: u32,
     pub cgid: u32,
     pub destroyed: AtomicBool,
     pub payload: SpinMutex<Option<PayloadCap<SemArrayPayload>>>,
+}
+
+impl SemArrayIdentity {
+    pub fn perm(&self) -> IpcPerm {
+        IpcPerm::new(self.mode.load(Ordering::Relaxed))
+    }
+
+    pub fn uid(&self) -> u32 {
+        self.uid.load(Ordering::Relaxed)
+    }
+
+    pub fn gid(&self) -> u32 {
+        self.gid.load(Ordering::Relaxed)
+    }
+
+    pub fn key_raw(&self) -> u32 {
+        self.key.map(|key| key.0).unwrap_or(0)
+    }
 }
 
 /// A single semaphore value within an array.
@@ -134,7 +154,9 @@ pub(crate) fn register_sem(
         semid,
         cred,
         nsems,
-        perm,
+        mode: AtomicU16::new(perm.mode),
+        uid: AtomicU32::new(cuid),
+        gid: AtomicU32::new(cgid),
         cuid,
         cgid,
         destroyed: AtomicBool::new(false),

@@ -127,6 +127,81 @@ const fn pf_info_implies_from_user(_info: ReactorPageFaultInfo) -> bool {
     true
 }
 
+fn diag_write_decimal<P: TxPlatform>(value: usize) {
+    if value == 0 {
+        tx_hal::console_write_str::<P>("0");
+        return;
+    }
+    let mut digits = [0u8; 20];
+    let mut n = value;
+    let mut idx = digits.len();
+    while n > 0 {
+        idx -= 1;
+        digits[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    let s = core::str::from_utf8(&digits[idx..]).unwrap_or("");
+    tx_hal::console_write_str::<P>(s);
+}
+
+fn diag_write_signed<P: TxPlatform>(value: i64) {
+    if value < 0 {
+        tx_hal::console_write_str::<P>("-");
+        diag_write_decimal::<P>(value.unsigned_abs() as usize);
+    } else {
+        diag_write_decimal::<P>(value as usize);
+    }
+}
+
+fn diag_write_hex<P: TxPlatform>(value: u64) {
+    tx_hal::console_write_str::<P>("0x");
+    if value == 0 {
+        tx_hal::console_write_str::<P>("0");
+        return;
+    }
+    let mut digits = [0u8; 16];
+    let mut n = value;
+    let mut idx = digits.len();
+    while n > 0 {
+        idx -= 1;
+        let nibble = (n & 0xf) as u8;
+        digits[idx] = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + (nibble - 10)
+        };
+        n >>= 4;
+    }
+    let s = core::str::from_utf8(&digits[idx..]).unwrap_or("");
+    tx_hal::console_write_str::<P>(s);
+}
+
+fn diag_pf_access(access: PageFaultAccess) -> &'static str {
+    match access {
+        PageFaultAccess::Read => "read",
+        PageFaultAccess::Write => "write",
+        PageFaultAccess::Execute => "exec",
+        PageFaultAccess::Unknown => "unknown",
+    }
+}
+
+fn diag_write_user_context_regs<P: TxPlatform>(ctx: &tx_hal::UserTrapContext) {
+    tx_hal::console_write_str::<P>(" pc=");
+    diag_write_hex::<P>(ctx.pc as u64);
+    tx_hal::console_write_str::<P>(" ra=");
+    diag_write_hex::<P>(ctx.regs[1] as u64);
+    tx_hal::console_write_str::<P>(" sp=");
+    diag_write_hex::<P>(user_sp_from_context::<P>(ctx) as u64);
+    tx_hal::console_write_str::<P>(" tp=");
+    diag_write_hex::<P>(user_tp_from_context::<P>(ctx) as u64);
+    tx_hal::console_write_str::<P>(" a0=");
+    diag_write_hex::<P>(
+        ctx.regs[tx_subsystems::thread_runtime::execution::USER_CONTEXT_A0_INDEX] as u64,
+    );
+    tx_hal::console_write_str::<P>(" a1=");
+    diag_write_hex::<P>(user_a1_from_context::<P>(ctx) as u64);
+}
+
 /// Per-hart slot adapter for the production thread future.
 ///
 /// Wraps an inner future; on every poll, installs `payload` into the
@@ -236,6 +311,11 @@ pub async fn run_thread<P: TxPlatform>(
         };
         let entry_token = entry_wait.request();
         payload.set_active_userspace_request(Some(entry_token));
+        tx_hal::console_write_str::<P>(":diag:thread:entry tid=");
+        diag_write_decimal::<P>(thread.tid.0 as usize);
+        tx_hal::console_write_str::<P>(" req=");
+        diag_write_decimal::<P>(entry_token.raw() as usize);
+        tx_hal::console_write_str::<P>("\n");
 
         // Phase E (stop-state): before entering userspace, check
         // whether the thread is stopped (SIGSTOP / default-Stop
@@ -308,7 +388,14 @@ pub async fn run_thread<P: TxPlatform>(
                     {
                         let encoded = match result {
                             Ok(v) => v as u64,
-                            Err(errno) => (-i64::from(errno)) as u64,
+                            Err(errno) => {
+                                if errno == 4 {
+                                    // EINTR
+                                    orig_ctx.pc = orig_ctx.pc.wrapping_sub(4);
+                                    orig_ctx.regs[0] = 1;
+                                }
+                                (-i64::from(errno)) as u64
+                            }
                         };
                         orig_ctx.regs
                             [tx_subsystems::thread_runtime::execution::USER_CONTEXT_A0_INDEX] =
@@ -443,6 +530,22 @@ pub async fn run_thread<P: TxPlatform>(
                 let mut ctx = tx_hal::UserTrapContext::empty();
                 prepare_userspace_entry_payload_into(&payload, &mut ctx);
                 payload.set_active_userspace_request(Some(entry_token));
+                tx_hal::console_write_str::<P>(":diag:thread:enter tid=");
+                diag_write_decimal::<P>(thread.tid.0 as usize);
+                tx_hal::console_write_str::<P>(" req=");
+                diag_write_decimal::<P>(entry_token.raw() as usize);
+                tx_hal::console_write_str::<P>(" pc=");
+                diag_write_hex::<P>(ctx.pc as u64);
+                tx_hal::console_write_str::<P>(" a0=");
+                diag_write_hex::<P>(
+                    ctx.regs[tx_subsystems::thread_runtime::execution::USER_CONTEXT_A0_INDEX]
+                        as u64,
+                );
+                tx_hal::console_write_str::<P>(" sp=");
+                diag_write_hex::<P>(user_sp_from_context::<P>(&ctx) as u64);
+                tx_hal::console_write_str::<P>(" tp=");
+                diag_write_hex::<P>(user_tp_from_context::<P>(&ctx) as u64);
+                tx_hal::console_write_str::<P>("\n");
                 <P as TrapIf>::enter_userspace_with_context(&ctx, root);
             } else {
                 return;
@@ -463,6 +566,11 @@ pub async fn run_thread<P: TxPlatform>(
         // the next poll.
         // ----------------------------------------------------------------
         let trap = entry_wait.await;
+        tx_hal::console_write_str::<P>(":diag:thread:woke-userspace tid=");
+        diag_write_decimal::<P>(thread.tid.0 as usize);
+        tx_hal::console_write_str::<P>(" req=");
+        diag_write_decimal::<P>(entry_token.raw() as usize);
+        tx_hal::console_write_str::<P>("\n");
 
         // ----------------------------------------------------------------
         // (4) DISPATCH THE RESOLVED TRAP.
@@ -474,6 +582,21 @@ pub async fn run_thread<P: TxPlatform>(
                     // Owning process gone; thread is detached. Stop.
                     return;
                 };
+                tx_hal::console_write_str::<P>(":diag:thread:syscall:trap tid=");
+                diag_write_decimal::<P>(thread.tid.0 as usize);
+                tx_hal::console_write_str::<P>(" nr=");
+                diag_write_decimal::<P>(req.nr as usize);
+                if req.nr == 98 || req.nr == 139 {
+                    tx_hal::console_write_str::<P>(" a0=");
+                    diag_write_hex::<P>(req.args[0]);
+                    tx_hal::console_write_str::<P>(" a1=");
+                    diag_write_hex::<P>(req.args[1]);
+                    tx_hal::console_write_str::<P>(" a2=");
+                    diag_write_hex::<P>(req.args[2]);
+                    tx_hal::console_write_str::<P>(" a3=");
+                    diag_write_hex::<P>(req.args[3]);
+                }
+                tx_hal::console_write_str::<P>("\n");
                 let Some(aspace) = process.aspace_cap() else {
                     // Process zombified concurrently; stop.
                     return;
@@ -486,7 +609,22 @@ pub async fn run_thread<P: TxPlatform>(
                 // drive-taskmb: inject the current task's mailbox so
                 // drive() can park on it for yield resolution.
                 if let Some(mailbox) = tx_reactor::current_task_mailbox() {
+                    tx_hal::console_write_str::<P>(":diag:mbox:thread-current tid=");
+                    diag_write_decimal::<P>(thread.tid.0 as usize);
+                    tx_hal::console_write_str::<P>(" mb_tid=");
+                    diag_write_decimal::<P>(mailbox.task_id_low() as usize);
+                    tx_hal::console_write_str::<P>(" pid=");
+                    diag_write_decimal::<P>(mailbox.process_id_low() as usize);
+                    tx_hal::console_write_str::<P>(" q=");
+                    diag_write_decimal::<P>(mailbox.len());
+                    tx_hal::console_write_str::<P>(" ov=");
+                    tx_hal::console_write_str::<P>(if mailbox.overflow() { "y" } else { "n" });
+                    tx_hal::console_write_str::<P>("\n");
                     ctx = ctx.with_mailbox(mailbox);
+                } else {
+                    tx_hal::console_write_str::<P>(":diag:mbox:thread-current:none tid=");
+                    diag_write_decimal::<P>(thread.tid.0 as usize);
+                    tx_hal::console_write_str::<P>("\n");
                 }
                 // drive-taskmb: inject the reactor's timer wheel for
                 // OnTimer yield resolution.
@@ -516,17 +654,33 @@ pub async fn run_thread<P: TxPlatform>(
 
                 match result {
                     tx_shims::linux_syscall::SyscallResult::Return(v) => {
+                        tx_hal::console_write_str::<P>(":diag:thread:syscall:return nr=");
+                        diag_write_decimal::<P>(req.nr as usize);
+                        tx_hal::console_write_str::<P>(" value=");
+                        diag_write_signed::<P>(v);
+                        tx_hal::console_write_str::<P>("\n");
                         payload.store_pending_syscall_return(Some(Ok(v)));
                     }
                     tx_shims::linux_syscall::SyscallResult::Error(e) => {
+                        tx_hal::console_write_str::<P>(":diag:thread:syscall:error nr=");
+                        diag_write_decimal::<P>(req.nr as usize);
+                        tx_hal::console_write_str::<P>(" errno=");
+                        diag_write_decimal::<P>(e as usize);
+                        tx_hal::console_write_str::<P>("\n");
                         payload.store_pending_syscall_return(Some(Err(e)));
                     }
                     tx_shims::linux_syscall::SyscallResult::NoReturn => {
+                        tx_hal::console_write_str::<P>(":diag:thread:syscall:noreturn nr=");
+                        diag_write_decimal::<P>(req.nr as usize);
+                        tx_hal::console_write_str::<P>("\n");
                         // Thread/process exited inside dispatch; do not
                         // re-enter userspace.
                         return;
                     }
                     tx_shims::linux_syscall::SyscallResult::ExecCommitted => {
+                        tx_hal::console_write_str::<P>(":diag:thread:syscall:exec nr=");
+                        diag_write_decimal::<P>(req.nr as usize);
+                        tx_hal::console_write_str::<P>("\n");
                         // Wave 4 / Phase 6 of the ELF-loader plan:
                         // `execve` replaced the process's
                         // `AddressSpace` and seeded the thread's
@@ -554,6 +708,9 @@ pub async fn run_thread<P: TxPlatform>(
                         // `make_initial_user_trap_context`).
                     }
                     tx_shims::linux_syscall::SyscallResult::SigreturnRestored => {
+                        tx_hal::console_write_str::<P>(":diag:thread:syscall:sigreturn nr=");
+                        diag_write_decimal::<P>(req.nr as usize);
+                        tx_hal::console_write_str::<P>("\n");
                         // `sys_rt_sigreturn` already consumed the parked
                         // pre-handler context and restored it into
                         // `saved_user_context`.  Do not take it again here:
@@ -564,6 +721,18 @@ pub async fn run_thread<P: TxPlatform>(
                 }
             }
             UserspaceTrapInfo::PageFault(info) => {
+                tx_hal::console_write_str::<P>(":diag:thread:pf tid=");
+                diag_write_decimal::<P>(thread.tid.0 as usize);
+                tx_hal::console_write_str::<P>(" addr=");
+                diag_write_decimal::<P>(info.addr.raw() as usize);
+                tx_hal::console_write_str::<P>(" access=");
+                tx_hal::console_write_str::<P>(diag_pf_access(info.access));
+                tx_hal::console_write_str::<P>(" present=");
+                tx_hal::console_write_str::<P>(if info.present { "y" } else { "n" });
+                if let Some(ctx) = payload.saved_user_context() {
+                    diag_write_user_context_regs::<P>(&ctx);
+                }
+                tx_hal::console_write_str::<P>("\n");
                 // Per `txdoc:VM-5-1-FAULT-HANDLER` and
                 // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`: drive
                 // the canonical async fault script. On Ok the recipe
@@ -604,6 +773,9 @@ pub async fn run_thread<P: TxPlatform>(
                     }
                 }
             }
+            UserspaceTrapInfo::Preempted => {
+                tx_reactor::yield_now().await;
+            }
             UserspaceTrapInfo::Fatal(_info) => {
                 // Phase B: route fatal trap through canonical
                 // synchronous-fault entry per SIGNAL_v1 §20.
@@ -621,6 +793,20 @@ fn user_sp_from_context<P: TxPlatform>(ctx: &tx_hal::UserTrapContext) -> usize {
     match P::ARCH {
         tx_hal::Arch::Riscv64 => ctx.regs[2],
         tx_hal::Arch::LoongArch64 => ctx.regs[3],
+    }
+}
+
+fn user_tp_from_context<P: TxPlatform>(ctx: &tx_hal::UserTrapContext) -> usize {
+    match P::ARCH {
+        tx_hal::Arch::Riscv64 => ctx.regs[4],
+        tx_hal::Arch::LoongArch64 => ctx.regs[2],
+    }
+}
+
+fn user_a1_from_context<P: TxPlatform>(ctx: &tx_hal::UserTrapContext) -> usize {
+    match P::ARCH {
+        tx_hal::Arch::Riscv64 => ctx.regs[11],
+        tx_hal::Arch::LoongArch64 => ctx.regs[5],
     }
 }
 

@@ -16,4 +16,6 @@ pub mod pager;
 
 // Re-export the pager types consumers need.
 pub use ondisk::{BPBParseError, FatType};
-pub use pager::{BlockImage, DirEntryLite, FatFormatError, FatPager, Page4K, Result, BLOCK_SIZE, MAX_LFN_LENGTH};
+pub use pager::{
+    BlockImage, DirEntryLite, FatFormatError, FatPager, Page4K, Result, BLOCK_SIZE, MAX_LFN_LENGTH,
+};
