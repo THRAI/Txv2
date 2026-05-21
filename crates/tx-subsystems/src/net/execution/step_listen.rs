@@ -4,7 +4,7 @@ use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_listen_target;
 use crate::net::execution::step_bind::table_error_to_errno;
 use crate::net::execution::SOMAXCONN_STAGING;
-use crate::net::structure::{SocketIdentity, SocketProtocol, TcpState};
+use crate::net::structure::{SocketIdentity, SocketProtocol, TcpState, UnixStreamState};
 
 pub fn step_listen(
     socket: &Cap<SocketIdentity>,
@@ -21,11 +21,13 @@ pub fn step_listen(
     let Some(payload) = socket.acquire_operational() else {
         return StepOutcome::Err(Errno::ENOTCONN);
     };
-    if let Err(error) = payload
-        .socket_table()
-        .listen_tcp(witness.local, socket.clone())
-    {
-        return StepOutcome::Err(table_error_to_errno(error));
+    if socket.kind == crate::net::structure::SocketKind::Tcp {
+        if let Err(error) = payload
+            .socket_table()
+            .listen_tcp(witness.local, socket.clone())
+        {
+            return StepOutcome::Err(table_error_to_errno(error));
+        }
     }
 
     let listening = payload.with_protocol_mut(|protocol| match protocol {
@@ -36,11 +38,20 @@ pub fn step_listen(
             });
             true
         }
+        SocketProtocol::UnixStream(UnixStreamState::Bound { local }) => {
+            *protocol = SocketProtocol::UnixStream(UnixStreamState::Listening {
+                local: *local,
+                backlog_limit: witness.backlog_limit,
+            });
+            true
+        }
         _ => false,
     });
     if listening {
-        if let Some(raw_tcp) = payload.raw_tcp_socket() {
-            let _ = raw_tcp.listen_endpoint(witness.local);
+        if socket.kind == crate::net::structure::SocketKind::Tcp {
+            if let Some(raw_tcp) = payload.raw_tcp_socket() {
+                let _ = raw_tcp.listen_endpoint(witness.local);
+            }
         }
         payload.set_accept_limit(witness.backlog_limit);
         StepOutcome::Done(())

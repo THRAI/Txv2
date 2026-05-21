@@ -218,6 +218,10 @@ pub const O_TRUNC: u32 = 0o1000;
 /// is positioned at end-of-file regardless of the per-fd offset.
 /// Threads through to `OpenFileFlags::append`.
 pub const O_APPEND: u32 = 0o2000;
+/// `openat(2)` flag bit: require the resolved path to be a directory.
+/// Linux returns `ENOTDIR` when the terminal component exists but is not
+/// a directory; LTP cleanup depends on this to distinguish files from dirs.
+pub const O_DIRECTORY: u32 = 0o200000;
 /// `openat(2)` flag bit: non-blocking open + non-blocking I/O on the
 /// resulting fd. Wave 2 accepts but ignores this bit — there is no
 /// blocking-flag plumbing on `OpenFile` yet (`TODO(phase-nonblock)`).
@@ -415,6 +419,7 @@ pub const CLONE_PARENT: u64 = 0x8000;
 pub const CLONE_THREAD: u64 = 0x10000;
 pub const CLONE_CHILD_CLEARTID: u64 = 0x200000;
 pub const CLONE_PARENT_SETTID: u64 = 0x100000;
+pub const CLONE_CHILD_SETTID: u64 = 0x1000000;
 /// Ignored by Linux since 2.5.32; musl sets it unconditionally.
 pub const CLONE_DETACHED: u64 = 0x400000;
 /// System-V semaphore undo on exit; musl sets this in pthread_create.

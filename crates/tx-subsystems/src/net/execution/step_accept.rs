@@ -3,13 +3,16 @@ use tx_substrate::zone::Cap;
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_accept_target;
 use crate::net::execution::{socket_accept_wait_token, yield_on_token};
-use crate::net::structure::{AcceptWireSet, IpEndpoint, SocketIdentity, SocketProtocol, TcpState};
+use crate::net::structure::{
+    AcceptWireSet, IpEndpoint, SocketIdentity, SocketProtocol, TcpState, UnixSocketPath,
+};
 
 #[derive(Clone)]
 pub struct SocketAcceptOutcome {
     pub child: Cap<SocketIdentity>,
     pub local: IpEndpoint,
     pub peer: IpEndpoint,
+    pub unix_peer: Option<UnixSocketPath>,
 }
 
 pub fn step_accept(
@@ -48,5 +51,6 @@ pub fn step_accept(
         child: pop.entry.child,
         local: pop.entry.local,
         peer: pop.entry.peer,
+        unix_peer: pop.entry.unix_peer,
     })
 }

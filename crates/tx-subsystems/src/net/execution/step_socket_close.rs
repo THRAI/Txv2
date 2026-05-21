@@ -4,7 +4,7 @@ use crate::execution::{Guard, StepOutcome};
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
     AcceptWireSet, ConnectionKey, RecvWireSet, SendWireSet, SockShutdownCmd, SocketIdentity,
-    SocketProtocol, TcpState, UdpInner,
+    SocketProtocol, TcpState, UdpInner, UnixDatagramState, UnixStreamState,
 };
 
 use super::step_tcp_loopback::step_tcp_loopback_transfer;
@@ -65,7 +65,29 @@ pub fn step_socket_close(
         SocketProtocol::RawIcmp(_) => {
             bindings_withdrawn += withdraw_ok(table.withdraw_raw_icmp(socket.raw()));
         }
-        SocketProtocol::UnixDatagram | SocketProtocol::UnixStream => {}
+        SocketProtocol::UnixDatagram(UnixDatagramState::Bound { local }) => {
+            bindings_withdrawn += withdraw_ok(table.withdraw_unix_bound(local));
+        }
+        SocketProtocol::UnixDatagram(UnixDatagramState::Connected { local, .. }) => {
+            if let Some(local) = local {
+                bindings_withdrawn += withdraw_ok(table.withdraw_unix_bound(local));
+            }
+        }
+        SocketProtocol::UnixDatagram(UnixDatagramState::Unbound) => {}
+        SocketProtocol::UnixStream(UnixStreamState::Bound { local })
+        | SocketProtocol::UnixStream(UnixStreamState::Listening { local, .. }) => {
+            bindings_withdrawn += withdraw_ok(table.withdraw_unix_bound(local));
+        }
+        SocketProtocol::UnixStream(UnixStreamState::Connected { peer_raw, .. }) => {
+            if let Some(peer) = table.lookup_unix_stream_peer(socket.raw(), guard) {
+                mark_unix_peer_broken(&peer);
+                bindings_withdrawn += withdraw_ok(table.withdraw_unix_stream_peer(peer.raw()));
+            } else if peer_raw != 0 {
+                bindings_withdrawn += withdraw_ok(table.withdraw_unix_stream_peer(peer_raw));
+            }
+            bindings_withdrawn += withdraw_ok(table.withdraw_unix_stream_peer(socket.raw()));
+        }
+        SocketProtocol::UnixStream(UnixStreamState::Init | UnixStreamState::Closed) => {}
         SocketProtocol::NetlinkRoute(_)
         | SocketProtocol::NetlinkNetfilter(_)
         | SocketProtocol::Packet(_) => {}
@@ -150,4 +172,9 @@ fn withdraw_udp_bound_if_owner(
         return 0;
     }
     withdraw_ok(table.withdraw_udp_bound(local))
+}
+
+fn mark_unix_peer_broken(peer: &Cap<SocketIdentity>) {
+    peer.readiness.fire_recv(RecvWireSet::BROKEN);
+    peer.readiness.fire_send(SendWireSet::BROKEN);
 }

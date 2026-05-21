@@ -1496,6 +1496,7 @@ fn tcp_socket_close_flushes_queued_bytes_to_peer_before_eof() {
             bytes: 1,
             source: None,
             destination: None,
+            unix_source: None,
             truncated: false,
             became_empty: true,
         })
@@ -1984,6 +1985,7 @@ fn assert_tcp_payload_round_trip(
             bytes: bytes.len(),
             source: None,
             destination: None,
+            unix_source: None,
             truncated: false,
             became_empty: true,
         })

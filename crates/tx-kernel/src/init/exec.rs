@@ -452,7 +452,10 @@ impl<P: TxPlatform> CoreInit<P> {
             }
             tx_hal::console_write_str::<P>("\n");
             let sdcard_cmd = build_oscomp_sdcard_cmd::<P>();
-            let sdcard_envp: &[&[u8]] = &[b"PATH=/bin:/musl/glibc:/musl/musl"];
+            let sdcard_envp: &[&[u8]] = &[
+                b"PATH=/musl/musl:/sbin:/bin:/usr/sbin:/usr/bin:/musl/glibc",
+                b"LD_LIBRARY_PATH=/musl/glibc/lib:/lib",
+            ];
             let sdcard_argv: &[&[u8]] = &[b"sh", b"-c", sdcard_cmd.as_bytes()];
             let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
                 &init,
@@ -918,6 +921,9 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     match oscomp_boot_suite(<P as tx_hal::BootInfoIf>::boot_info().cmdline) {
         Some("libctest-network") => return String::from(OSCOMP_LIBCTEST_NETWORK_CMD),
         Some("lmbench-network") => return String::from(OSCOMP_LMBENCH_NETWORK_CMD),
+        Some("ltp-glibc") => {
+            return String::from("cd /musl/glibc && /musl/musl/busybox sh ltp_testcode.sh");
+        }
         _ => {}
     }
 
@@ -947,6 +953,14 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
             }
             if is_libctest_musl_group(group) {
                 append_full_libctest(&mut cmd);
+                selected += 1;
+                continue;
+            }
+            if group == "ltp-glibc" {
+                let _ = write!(
+                    cmd,
+                    " && cd /musl/glibc && /musl/musl/busybox sh ltp_testcode.sh && cd /musl/musl"
+                );
                 selected += 1;
                 continue;
             }

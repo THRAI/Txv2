@@ -12,6 +12,7 @@ use tx_fs;
 // silently bypass the gate.
 use tx_subsystems::cred::checks as cred_checks;
 use tx_subsystems::mount::{self};
+use tx_subsystems::net::UnixSocketPath;
 
 fn mount_is_read_only(dentry: &Cap<DEntry>) -> bool {
     if mount_payload_for_dentry(dentry)
@@ -308,6 +309,12 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         match fs_ops.lookup(parent_id, basename, &guard) {
             V3::Done(id) => id,
             V3::Continue { .. } | V3::Yield { .. } => return SyscallResult::Error(EIO_VALUE),
+            V3::Err(errno)
+                if Errno::from(errno) == Errno::ENOENT
+                    && try_unlink_unix_socket_path(ctx, &path) =>
+            {
+                return SyscallResult::Return(0);
+            }
             V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
@@ -351,6 +358,21 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
         V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
+}
+
+fn try_unlink_unix_socket_path(ctx: &SyscallCtx<'_>, path: &[u8]) -> bool {
+    let Ok(path) = UnixSocketPath::new(path) else {
+        return false;
+    };
+    let Some(net_namespace) = ctx.process.net_namespace() else {
+        return false;
+    };
+    let table = net_namespace.socket_table();
+    let guard = step_engine::guard();
+    if !table.lookup_unix_path_node(path, &guard) {
+        return false;
+    }
+    table.unlink_unix_path(path).is_ok()
 }
 
 /// `symlinkat(target, newdirfd, linkpath)`. Linux RV64 generic ABI

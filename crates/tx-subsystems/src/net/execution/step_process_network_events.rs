@@ -276,6 +276,7 @@ fn process_tcp_event(
             child,
             local: event.dst,
             peer: event.src,
+            unix_peer: None,
         };
         let mut publish = NetworkPublish::none();
         if payload.enqueue_accept_entry(entry)? {

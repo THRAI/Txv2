@@ -7,7 +7,7 @@ use crate::net::execution::{
 };
 use crate::net::structure::{
     AcceptWireSet, PollMask, RecvWireSet, SendWireSet, SocketIdentity, SocketProtocol, TcpState,
-    UdpInner,
+    UdpInner, UnixDatagramState, UnixStreamState,
 };
 
 pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepOutcome<PollMask> {
@@ -38,6 +38,15 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
                 mask |= PollMask::IN;
             }
         }
+        SocketProtocol::UnixStream(UnixStreamState::Listening { .. }) => {
+            let io = payload.io_snapshot();
+            if io.accept_pending > 0
+                || witness.identity.readiness.accept_wq.peek() & AcceptWireSet::HAS_PENDING.bits()
+                    != 0
+            {
+                mask |= PollMask::IN;
+            }
+        }
         SocketProtocol::Tcp(TcpState::Connected { .. }) => {
             let io = payload.io_snapshot();
             if io.recv_len > 0
@@ -56,7 +65,38 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
                 mask |= PollMask::OUT;
             }
         }
+        SocketProtocol::UnixStream(UnixStreamState::Connected { .. }) => {
+            let io = payload.io_snapshot();
+            if io.recv_len > 0
+                || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
+            {
+                mask |= PollMask::IN;
+            }
+            if witness.identity.readiness.recv_wq.peek() & RecvWireSet::BROKEN.bits() != 0 {
+                mask |= PollMask::IN | PollMask::RDHUP;
+            }
+            if io.send_space > 0
+                || witness.identity.readiness.send_wq.peek() & SendWireSet::SPACE.bits() != 0
+            {
+                mask |= PollMask::OUT;
+            }
+        }
         SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. }) => {
+            let io = payload.io_snapshot();
+            if io.recv_len > 0
+                || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
+            {
+                mask |= PollMask::IN;
+            }
+            if io.send_space > 0
+                || witness.identity.readiness.send_wq.peek() & SendWireSet::SPACE.bits() != 0
+            {
+                mask |= PollMask::OUT;
+            }
+        }
+        SocketProtocol::UnixDatagram(
+            UnixDatagramState::Bound { .. } | UnixDatagramState::Connected { .. },
+        ) => {
             let io = payload.io_snapshot();
             if io.recv_len > 0
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
@@ -116,10 +156,23 @@ pub fn step_poll_wait_token(
         SocketProtocol::Tcp(TcpState::Listening { .. }) if interests.intersects(PollMask::IN) => {
             Some(socket_accept_wait_token(&witness.identity))
         }
+        SocketProtocol::UnixStream(UnixStreamState::Listening { .. })
+            if interests.intersects(PollMask::IN) =>
+        {
+            Some(socket_accept_wait_token(&witness.identity))
+        }
         SocketProtocol::Tcp(TcpState::Connected { .. }) if interests.intersects(PollMask::IN) => {
             Some(socket_recv_wait_token(&witness.identity))
         }
+        SocketProtocol::UnixStream(UnixStreamState::Connected { .. })
+            if interests.intersects(PollMask::IN) =>
+        {
+            Some(socket_recv_wait_token(&witness.identity))
+        }
         SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. })
+        | SocketProtocol::UnixDatagram(
+            UnixDatagramState::Bound { .. } | UnixDatagramState::Connected { .. },
+        )
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)
         | SocketProtocol::NetlinkNetfilter(_)
@@ -129,7 +182,11 @@ pub fn step_poll_wait_token(
             Some(socket_recv_wait_token(&witness.identity))
         }
         SocketProtocol::Tcp(TcpState::Connected { .. })
+        | SocketProtocol::UnixStream(UnixStreamState::Connected { .. })
         | SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. })
+        | SocketProtocol::UnixDatagram(
+            UnixDatagramState::Bound { .. } | UnixDatagramState::Connected { .. },
+        )
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)
         | SocketProtocol::NetlinkNetfilter(_)

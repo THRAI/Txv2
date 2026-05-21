@@ -1,7 +1,8 @@
 use crate::execution::Errno;
 use crate::net::structure::{
     IpEndpoint, KernelSockAddr, SendRecvFlags, SockAddrIn, SockShutdownCmd, SocketIdentity,
-    SocketKind, SocketPayload, SocketProtocol, TcpState, UdpInner,
+    SocketKind, SocketPayload, SocketProtocol, TcpState, UdpInner, UnixDatagramState,
+    UnixStreamState,
 };
 
 pub(crate) fn endpoint_from_sockaddr(addr: KernelSockAddr) -> Result<IpEndpoint, Errno> {
@@ -10,6 +11,7 @@ pub(crate) fn endpoint_from_sockaddr(addr: KernelSockAddr) -> Result<IpEndpoint,
             Ok(IpEndpoint::new(sockaddr.addr, sockaddr.port))
         }
         KernelSockAddr::V4(_) => Err(Errno::EAFNOSUPPORT),
+        KernelSockAddr::Unix(_) => Err(Errno::EAFNOSUPPORT),
         KernelSockAddr::Packet(_) => Err(Errno::EAFNOSUPPORT),
     }
 }
@@ -72,6 +74,20 @@ pub(crate) fn socket_can_bind(
             return Err(Errno::ENOTCONN);
         };
         match (socket.kind, payload.protocol_snapshot()) {
+            (
+                SocketKind::UnixDatagram,
+                SocketProtocol::UnixDatagram(UnixDatagramState::Unbound),
+            )
+            | (SocketKind::UnixStream, SocketProtocol::UnixStream(UnixStreamState::Init)) => {
+                if matches!(addr, KernelSockAddr::Unix(_)) {
+                    Ok(IpEndpoint::new(
+                        crate::net::structure::Ipv4Address::UNSPECIFIED,
+                        0,
+                    ))
+                } else {
+                    Err(Errno::EAFNOSUPPORT)
+                }
+            }
             (SocketKind::Tcp, SocketProtocol::Tcp(TcpState::Init)) => {
                 let endpoint = require_bind_endpoint(addr)?;
                 require_local_bind_addr(payload, endpoint)
@@ -98,6 +114,18 @@ pub(crate) fn socket_can_listen(socket: &SocketIdentity) -> Result<IpEndpoint, E
         };
         match (socket.kind, payload.protocol_snapshot()) {
             (SocketKind::Tcp, SocketProtocol::Tcp(TcpState::Bound { local })) => Ok(local),
+            (SocketKind::UnixStream, SocketProtocol::UnixStream(UnixStreamState::Bound { .. })) => {
+                Ok(IpEndpoint::new(
+                    crate::net::structure::Ipv4Address::UNSPECIFIED,
+                    0,
+                ))
+            }
+            (
+                SocketKind::UnixDatagram,
+                SocketProtocol::UnixDatagram(UnixDatagramState::Unbound)
+                | SocketProtocol::UnixDatagram(UnixDatagramState::Bound { .. })
+                | SocketProtocol::UnixDatagram(UnixDatagramState::Connected { .. }),
+            ) => Err(Errno::EOPNOTSUPP),
             (SocketKind::Udp, SocketProtocol::Udp(_)) => Err(Errno::EOPNOTSUPP),
             (SocketKind::RawIcmp, SocketProtocol::RawIcmp(_)) => Err(Errno::EOPNOTSUPP),
             _ => Err(Errno::EINVAL),
@@ -109,18 +137,46 @@ pub(crate) fn socket_can_connect(
     socket: &SocketIdentity,
     addr: KernelSockAddr,
 ) -> Result<IpEndpoint, Errno> {
-    let remote = endpoint_from_sockaddr(addr)?;
     socket.with_payload_for_check(|payload| {
         let Some(payload) = payload else {
             return Err(Errno::ENOTCONN);
         };
         match (socket.kind, payload.protocol_snapshot()) {
             (
+                SocketKind::UnixDatagram,
+                SocketProtocol::UnixDatagram(
+                    UnixDatagramState::Unbound
+                    | UnixDatagramState::Bound { .. }
+                    | UnixDatagramState::Connected { .. },
+                ),
+            )
+            | (
+                SocketKind::UnixStream,
+                SocketProtocol::UnixStream(UnixStreamState::Init | UnixStreamState::Bound { .. }),
+            ) => {
+                if matches!(addr, KernelSockAddr::Unix(_)) {
+                    Ok(IpEndpoint::new(
+                        crate::net::structure::Ipv4Address::UNSPECIFIED,
+                        0,
+                    ))
+                } else {
+                    Err(Errno::EAFNOSUPPORT)
+                }
+            }
+            (
+                SocketKind::UnixStream,
+                SocketProtocol::UnixStream(UnixStreamState::Connected { .. }),
+            ) => Err(Errno::EISCONN),
+            (
+                SocketKind::UnixStream,
+                SocketProtocol::UnixStream(UnixStreamState::Listening { .. }),
+            ) => Err(Errno::EINVAL),
+            (
                 SocketKind::Tcp,
                 SocketProtocol::Tcp(
                     TcpState::Init | TcpState::Bound { .. } | TcpState::Connecting { .. },
                 ),
-            ) => Ok(remote),
+            ) => Ok(endpoint_from_sockaddr(addr)?),
             (SocketKind::Tcp, SocketProtocol::Tcp(TcpState::Connected { .. })) => {
                 Err(Errno::EISCONN)
             }
@@ -129,8 +185,8 @@ pub(crate) fn socket_can_connect(
                 SocketProtocol::Udp(
                     UdpInner::Unbound | UdpInner::Bound { .. } | UdpInner::Connected { .. },
                 ),
-            ) => Ok(remote),
-            (SocketKind::RawIcmp, SocketProtocol::RawIcmp(_)) => Ok(remote),
+            ) => Ok(endpoint_from_sockaddr(addr)?),
+            (SocketKind::RawIcmp, SocketProtocol::RawIcmp(_)) => Ok(endpoint_from_sockaddr(addr)?),
             _ => Err(Errno::EINVAL),
         }
     })
@@ -143,6 +199,16 @@ pub(crate) fn socket_can_accept(socket: &SocketIdentity) -> Result<(), Errno> {
         };
         match (socket.kind, payload.protocol_snapshot()) {
             (SocketKind::Tcp, SocketProtocol::Tcp(TcpState::Listening { .. })) => Ok(()),
+            (
+                SocketKind::UnixStream,
+                SocketProtocol::UnixStream(UnixStreamState::Listening { .. }),
+            ) => Ok(()),
+            (
+                SocketKind::UnixDatagram,
+                SocketProtocol::UnixDatagram(UnixDatagramState::Unbound)
+                | SocketProtocol::UnixDatagram(UnixDatagramState::Bound { .. })
+                | SocketProtocol::UnixDatagram(UnixDatagramState::Connected { .. }),
+            ) => Err(Errno::EOPNOTSUPP),
             (SocketKind::Udp, SocketProtocol::Udp(_)) => Err(Errno::EOPNOTSUPP),
             (SocketKind::RawIcmp, SocketProtocol::RawIcmp(_)) => Err(Errno::EOPNOTSUPP),
             _ => Err(Errno::EINVAL),

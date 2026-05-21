@@ -3,6 +3,8 @@ use core::time::Duration;
 
 use crate::execution::Errno;
 
+pub const UNIX_SOCKET_PATH_MAX: usize = 108;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddressFamily {
     Unix,
@@ -166,6 +168,7 @@ impl IpEndpoint {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelSockAddr {
+    Unix(UnixSocketPath),
     V4(SockAddrIn),
     Packet(SockAddrLl),
 }
@@ -173,9 +176,42 @@ pub enum KernelSockAddr {
 impl KernelSockAddr {
     pub const fn as_ip_endpoint(self) -> IpEndpoint {
         match self {
+            Self::Unix(_) => IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0),
             Self::V4(sockaddr) => IpEndpoint::new(sockaddr.addr, sockaddr.port),
             Self::Packet(_) => IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct UnixSocketPath {
+    len: u8,
+    bytes: [u8; UNIX_SOCKET_PATH_MAX],
+}
+
+impl UnixSocketPath {
+    pub fn new(path: &[u8]) -> Result<Self, Errno> {
+        if path.is_empty() || path.len() > UNIX_SOCKET_PATH_MAX {
+            return Err(Errno::EINVAL);
+        }
+        let mut bytes = [0u8; UNIX_SOCKET_PATH_MAX];
+        bytes[..path.len()].copy_from_slice(path);
+        Ok(Self {
+            len: path.len() as u8,
+            bytes,
+        })
+    }
+
+    pub const fn len(self) -> usize {
+        self.len as usize
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len()]
     }
 }
 
