@@ -15,6 +15,8 @@ use crate::vfs::adapter::step_engine::{
     self, ByteProgress, Cap, Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome,
     SubjectIdentity,
 };
+use crate::vm::AddressSpace;
+use tx_hal::UserPtr;
 
 use super::structure::{
     Credential, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileBacking, OpenFileIoctl,
@@ -739,6 +741,107 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteOp<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// User-buffer StepOps — spec model (PAGE_BACKED_v1 §5.1)
+// ---------------------------------------------------------------------------
+//
+// These ops drive `step_read_to_user` / `step_write_from_user` for
+// `RNodeBacking::PageBacked` files, copying bytes directly between
+// PC frames and user-space pages through the pmap (no kernel-buffer
+// staging). Non-PageBacked backings return `ENOSYS` — callers must
+// fall back to the kernel-buffer path (`OpenFileReadOp` /
+// `OpenFileWriteOp`).
+
+/// `StepOp` wrap of [`crate::page_backed::step_write_from_user`].
+///
+/// Each `step()` acquires its own epoch guard. The file offset
+/// (`OpenFile::offset()`) is advanced inside the page-backed helper;
+/// the `cursor` tracks the user-buffer position across retries.
+pub struct OpenFileWriteFromUserOp<'a> {
+    pub file: &'a Cap<super::structure::OpenFile>,
+    pub aspace: &'a AddressSpace,
+    pub src: UserPtr<u8>,
+    pub len: usize,
+    pub cursor: usize,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteFromUserOp<'a> {
+    type Output = usize;
+    type Progress = ByteProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let guard = step_engine::guard();
+        let remaining = self.len - self.cursor;
+        if remaining == 0 {
+            return StepOutcome::Done(self.cursor);
+        }
+        match self.file.rnode().backing() {
+            RNodeBacking::PageBacked { pc } => {
+                let result = crate::page_backed::step_write_from_user(
+                    pc,
+                    self.file,
+                    self.aspace,
+                    UserPtr::<u8>::new(self.src.addr() + self.cursor),
+                    remaining,
+                    &guard,
+                );
+                match &result {
+                    StepOutcome::Done(n) => self.cursor += *n,
+                    StepOutcome::Continue { progress } => self.cursor += progress.bytes(),
+                    StepOutcome::Yield { progress, .. } => self.cursor += progress.bytes(),
+                    StepOutcome::Err(_) => {}
+                }
+                result
+            }
+            _ => StepOutcome::Err(Errno::ENOSYS),
+        }
+    }
+}
+
+/// `StepOp` wrap of [`crate::page_backed::step_read_to_user`].
+///
+/// Mirrors `OpenFileWriteFromUserOp`: each `step()` acquires its own
+/// epoch guard; the file offset advances inside the page-backed
+/// helper; `cursor` tracks the user-buffer fill position.
+pub struct OpenFileReadToUserOp<'a> {
+    pub file: &'a Cap<super::structure::OpenFile>,
+    pub aspace: &'a AddressSpace,
+    pub dst: UserPtr<u8>,
+    pub len: usize,
+    pub cursor: usize,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileReadToUserOp<'a> {
+    type Output = usize;
+    type Progress = ByteProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let guard = step_engine::guard();
+        let remaining = self.len - self.cursor;
+        if remaining == 0 {
+            return StepOutcome::Done(self.cursor);
+        }
+        match self.file.rnode().backing() {
+            RNodeBacking::PageBacked { pc } => {
+                let result = crate::page_backed::step_read_to_user(
+                    pc,
+                    self.file,
+                    self.aspace,
+                    UserPtr::<u8>::new(self.dst.addr() + self.cursor),
+                    remaining,
+                    &guard,
+                );
+                match &result {
+                    StepOutcome::Done(n) => self.cursor += *n,
+                    StepOutcome::Continue { progress } => self.cursor += progress.bytes(),
+                    StepOutcome::Yield { progress, .. } => self.cursor += progress.bytes(),
+                    StepOutcome::Err(_) => {}
+                }
+                result
+            }
+            _ => StepOutcome::Err(Errno::ENOSYS),
+        }
+    }
+}
+
 /// `StepOp` wrap of [`OpenFile::step_ioctl`]. The caller / request enums
 /// borrow `'a`, so the wrap inherits the same lifetime.
 pub struct OpenFileIoctlOp<'a> {
@@ -1210,8 +1313,11 @@ mod step_op_wraps {
         };
 
         let iname = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
-        let dentry = DEntry::new(iname, rnode);
-        step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)
+        let mut dentry = DEntry::new(iname, rnode);
+        dentry.set_parent_hint(parent_dentry);
+        let dentry_cap = step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)?;
+        parent_dentry.cache_child(dentry_cap.clone());
+        Ok(dentry_cap)
     }
 
     /// Create a regular file under `parent_dentry` and open it.
@@ -1242,7 +1348,8 @@ mod step_op_wraps {
         };
 
         let iname = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
-        let dentry = DEntry::new(iname, rnode.clone());
+        let mut dentry = DEntry::new(iname, rnode.clone());
+        dentry.set_parent_hint(parent_dentry);
         let dentry_cap = step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)?;
 
         let open_file = OpenFile::new_cap(
@@ -1286,7 +1393,8 @@ mod step_op_wraps {
         };
 
         let iname = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
-        let dentry = DEntry::new(iname, rnode);
+        let mut dentry = DEntry::new(iname, rnode);
+        dentry.set_parent_hint(parent_dentry);
         step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)
     }
 

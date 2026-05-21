@@ -44,7 +44,7 @@ impl KernelTrapSink<Platform> for RecordingTrapSink {
         panic!("unexpected syscall")
     }
 
-    fn on_timer_interrupt(cpu: CpuId) -> TrapAction {
+    fn on_timer_interrupt(cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         assert_eq!(cpu, CpuId(0));
         assert!(<Platform as IrqIf>::in_irq_context());
         TEST_TIMER_TRAPS.fetch_add(1, Ordering::AcqRel);
@@ -81,7 +81,7 @@ impl KernelTrapSink<Platform> for RecordingSyscallSink {
         TrapAction::Resume
     }
 
-    fn on_timer_interrupt(_cpu: CpuId) -> TrapAction {
+    fn on_timer_interrupt(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         panic!("unexpected timer")
     }
 
@@ -127,7 +127,11 @@ fn boot_info_publishes_qemu_ram_and_kernel_image() {
 fn bootstrap_pmap_info_describes_dmw_direct_ram() {
     let info = Platform::boot_info();
     let pmap = Platform::bootstrap_pmap_info().expect("bootstrap pmap info");
+    let mapping = super::boot_facts::bootstrap_mapping_for_kernel_image(info.kernel_image);
 
+    assert!(mapping.dmw_backed);
+    assert_eq!(mapping.bootstrap_root(), PhysAddr(0));
+    assert_eq!(mapping.direct_map_phys(), la64_dmw_mapped_phys());
     assert_eq!(pmap.root, PhysAddr(0));
     assert_eq!(
         pmap.mapped,
@@ -152,6 +156,7 @@ fn bootstrap_pmap_info_describes_dmw_direct_ram() {
     assert_eq!(pmap.kernel_image.size, info.kernel_image.size);
     assert_eq!(pmap.pt_node_pool, PhysRange::empty());
     assert!(pmap.reserved_page_tables.is_empty());
+    assert_eq!(*pmap, mapping.to_bootstrap_pmap_info());
 }
 
 #[test]
@@ -230,7 +235,7 @@ fn console_read_bytes_is_nonblocking_when_host_has_no_uart_input() {
 }
 
 #[test]
-fn trap_vector_addresses_are_written_as_physical_addresses() {
+fn dmw_aliases_decode_back_to_physical_addresses() {
     assert_eq!(
         la64_kernel_addr_to_phys(la64_cached_virt(0x1234_5000)),
         0x1234_5000
@@ -425,6 +430,32 @@ fn dispatch_timer_trap_enters_irq_context_and_resumes() {
 }
 
 #[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn irq_context_depth_is_per_cpu() {
+    let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    assert!(!<Platform as IrqIf>::in_irq_context());
+    let cpu0_irq = enter_la64_irq_context();
+    assert!(<Platform as IrqIf>::in_irq_context());
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(1));
+    assert!(!<Platform as IrqIf>::in_irq_context());
+    {
+        let _cpu1_irq = enter_la64_irq_context();
+        assert!(<Platform as IrqIf>::in_irq_context());
+    }
+    assert!(!<Platform as IrqIf>::in_irq_context());
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    assert!(<Platform as IrqIf>::in_irq_context());
+    drop(cpu0_irq);
+    assert!(!<Platform as IrqIf>::in_irq_context());
+
+    <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+}
+
+#[test]
 fn dispatch_syscall_preserves_era_for_trap_handoff_and_uses_la64_abi() {
     TEST_SYSCALL_TRAPS.store(0, Ordering::Release);
     let mut frame = La64TrapFrame {
@@ -521,6 +552,37 @@ fn la64_signal_frame_layout_and_trampoline_are_stable() {
         0
     );
     assert_eq!(align_down(0x100f, LA64_SIGFRAME_ALIGN), 0x1000);
+}
+
+#[test]
+fn la64_prepare_signal_frame_keeps_complete_frame_bytes() {
+    let mut context = UserTrapContext::empty();
+    context.pc = 0x4000;
+    context.regs[LA64_R_SP] = 0x8000;
+
+    let setup = SignalFrameWrite {
+        stack_top: UserPtr::new(context.regs[LA64_R_SP]),
+        sig_no: 17,
+        siginfo: tx_hal::UserSigInfoAbi::ZERO,
+        old_mask: UserSignalMaskAbi::EMPTY,
+        flags: tx_hal::UserSaFlagsAbi::EMPTY,
+        handler_pc: UserPtr::new(0x5000),
+    };
+
+    let (handler_ctx, frame_bytes) =
+        <Platform as SignalFrameIf>::prepare_signal_frame(&context, &setup).expect("prepare");
+    let frame_size = core::mem::size_of::<La64SignalFrame>();
+    let trampoline_offset = core::mem::offset_of!(La64SignalFrame, trampoline);
+
+    assert_eq!(frame_bytes.as_slice().len(), frame_size);
+    assert!(frame_size <= tx_hal::SignalFrameBytes::CAPACITY);
+    assert!(trampoline_offset + core::mem::size_of_val(&LA64_SIGRETURN_TRAMPOLINE) <= frame_size);
+    assert_eq!(handler_ctx.pc, setup.handler_pc.addr());
+    assert_eq!(handler_ctx.regs[LA64_R_SP], 0x8000 - frame_size);
+    assert_eq!(
+        handler_ctx.regs[LA64_R_RA],
+        handler_ctx.regs[LA64_R_SP] + trampoline_offset
+    );
 }
 
 #[test]
@@ -855,11 +917,20 @@ fn activate_pmap_installs_pgdl_pgdh_and_asid() {
         first.asid().0 as usize
     );
     assert_eq!(LA64_KERNEL_PGDH_PHYS.load(Ordering::Acquire), pgdh);
-    // Activation allocates the shared kernel PGDH plus the low-kernel
-    // identity-map intermediates inside the user root.
+    // Activation allocates the shared kernel PGDH and its high bootstrap
+    // kernel image mapping. The per-process PGDL remains user-only.
     assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 6);
+    assert!(la64_page_table_mut_from_phys(first.phys())
+        .iter()
+        .all(|entry| *entry == 0));
+    assert!(la64_page_table_mut_from_phys(second.phys())
+        .iter()
+        .all(|entry| *entry == 0));
     let pgdh_page = la64_page_table_mut_from_phys(PhysAddr(pgdh));
-    assert!(pgdh_page.iter().all(|entry| *entry == 0));
+    assert!(pgdh_page.iter().any(|entry| *entry != 0));
+
+    Platform::activate_user_pmap(&first);
+    assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 6);
 
     Platform::activate_user_pmap(&second);
     assert_eq!(LA64_ACTIVE_PGDL.load(Ordering::Acquire), second.phys().0);
@@ -868,11 +939,11 @@ fn activate_pmap_installs_pgdl_pgdh_and_asid() {
         second.asid().0 as usize
     );
     assert_eq!(LA64_ACTIVE_PGDH.load(Ordering::Acquire), pgdh);
-    assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 9);
+    assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 6);
 
     Platform::destroy_pmap_root(first);
     Platform::destroy_pmap_root(second);
-    assert_eq!(TEST_PMAP_RELEASES.load(Ordering::Acquire), 8);
+    assert_eq!(TEST_PMAP_RELEASES.load(Ordering::Acquire), 2);
 
     reset_pmap_test_state();
 }
@@ -1263,6 +1334,7 @@ fn reset_pmap_test_state() {
     TEST_PMAP_ALLOCATIONS.store(0, Ordering::Release);
     TEST_PMAP_RELEASES.store(0, Ordering::Release);
     LA64_KERNEL_PGDH_PHYS.store(0, Ordering::Release);
+    LA64_KERNEL_PGDH_BOOTSTRAP_MAPPED.store(false, Ordering::Release);
     LA64_ACTIVE_PGDL.store(0, Ordering::Release);
     LA64_ACTIVE_PGDH.store(0, Ordering::Release);
     LA64_ACTIVE_ASID.store(0, Ordering::Release);

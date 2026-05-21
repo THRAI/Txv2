@@ -617,6 +617,17 @@ pub fn bind_mount(
 ///
 /// v1: synchronous detach only.  Returns `EINVAL` if the path is
 /// not a registered mountpoint.
+///
+/// `umount` accepts either of two dentry shapes for `target_dentry`:
+///
+/// 1. The mountpoint dentry on the parent filesystem — matches the
+///    registration key directly. Rare in practice since the walker
+///    crosses mount boundaries.
+/// 2. The mounted filesystem's root dentry — what the walker returns
+///    when the user resolves the mount path. We detect this by
+///    comparing every entry's `mount.root()` against
+///    `target_dentry.rnode()`; on a hit we remove the entry without
+///    requiring `parent_payload` to match.
 pub fn umount(
     target_dentry: &Cap<DEntry>,
     parent_payload: &Cap<MountPayload>,
@@ -625,11 +636,24 @@ pub fn umount(
 
     let parent_payload_ptr = cap_payload_ptr(parent_payload);
     let child_fs_object_id = target_dentry.rnode().fs_object_id();
+    let target_rnode_id = target_dentry.rnode().fs_object_id();
+    let target_rnode_cap_addr = cap_raw_addr(target_dentry.rnode());
 
     let mut table = MOUNT_TABLE.lock();
+    // First try the registration key. If the user passed the
+    // mountpoint dentry (matches the parent FS) the key is sound.
     let pos = table.iter().position(|entry| {
         entry.parent_payload_ptr == parent_payload_ptr
             && entry.child_fs_object_id == child_fs_object_id
+    });
+    // Fallback: the walker resolved the user path through the mount
+    // and handed us the mounted FS's root dentry. Scan for an entry
+    // whose registered mount has this rnode as its root.
+    let pos = pos.or_else(|| {
+        table.iter().position(|entry| {
+            let root = entry.mount.root();
+            cap_raw_addr(root) == target_rnode_cap_addr || root.fs_object_id() == target_rnode_id
+        })
     });
 
     match pos {

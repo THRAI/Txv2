@@ -112,6 +112,12 @@ pub fn reset_pending_uart_rx_for_test() {
     pending.len = 0;
 }
 
+/// Clear any stale UART RX data queued before the userspace reactor
+/// starts. See `run_userspace_reactor_loop` for rationale.
+pub(crate) fn clear_uart_rx_pending() {
+    UART_RX_PENDING.lock().len = 0;
+}
+
 /// Snapshot the handler currently registered for `irq`, if any.
 /// Test surface used to assert `install_irq_handlers` populated the
 /// expected slots.

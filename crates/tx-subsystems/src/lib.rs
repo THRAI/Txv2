@@ -14,11 +14,14 @@ pub mod execution;
 pub mod futex;
 pub mod initramfs;
 pub mod io_uring;
+pub mod ipc;
 pub mod mount;
 pub mod page_backed;
 pub mod pipe;
 pub mod process;
+pub mod reactor_affinity;
 pub mod reactor_submit;
+pub mod shared;
 pub mod signal;
 pub mod signalfd;
 mod sync;
@@ -101,6 +104,12 @@ pub mod cross_crate_test_support {
     /// to-end (Wave 1 of the fork/clone/wait4 slice).
     pub fn reset_reactor_submit_seam() {
         crate::reactor_submit::reset_for_test();
+    }
+
+    /// Clear the reactor affinity syscall seam. Used by syscall tests that
+    /// install a process-local fake hook.
+    pub fn reset_reactor_affinity_seam() {
+        crate::reactor_affinity::reset_for_test();
     }
 
     /// Clear `effective_caps` and `permitted_caps` to

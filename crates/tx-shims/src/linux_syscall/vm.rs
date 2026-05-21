@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+use tx_hal::UserPtr;
 use tx_scripts::drive;
 use tx_substrate::step::DriveMode;
 use tx_substrate::step::Errno as V3Errno;
@@ -193,7 +194,7 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
         };
         match extract_page_container(&file) {
             Some(pc) => VmBacking::Page { pc, offset },
-            None => return SyscallResult::Error(errno_to_i32(Errno::ENODEV)),
+            None => return SyscallResult::error_from(Errno::ENODEV),
         }
     };
 
@@ -215,7 +216,18 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
         };
         VmMapRequest::fixed(range, placement, prot, entry_flags, backing)
     } else {
-        let window = UserRange::full_user_v1();
+        // Linux mmap(addr=NULL, !MAP_FIXED) returns a chosen mapping
+        // address, and user programs commonly treat NULL as failure or
+        // a sentinel. Keep page 0 unmapped for syscall-allocated
+        // mappings while leaving the lower VM layer's full-user range
+        // semantics unchanged for fixed/exec paths.
+        let window = match UserRange::new_aligned(
+            UserVirtAddr(USER_PAGE_SIZE),
+            UserRange::full_user_v1().len() - USER_PAGE_SIZE,
+        ) {
+            Ok(range) => range,
+            Err(_) => return SyscallResult::Error(EINVAL_VALUE),
+        };
         let page_count = length / USER_PAGE_SIZE;
         VmMapRequest::anywhere(window, page_count, prot, entry_flags, backing)
     };
@@ -294,7 +306,7 @@ pub(super) async fn sys_munmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
     .await
     {
         Ok(_commit) => SyscallResult::Return(0),
-        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
+        Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
     }
 }
 
@@ -342,7 +354,7 @@ pub(super) async fn sys_mlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
     .await
     {
         Ok(_commit) => SyscallResult::Return(0),
-        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
+        Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
     }
 }
 
@@ -384,7 +396,7 @@ pub(super) async fn sys_munlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscall
     .await
     {
         Ok(_commit) => SyscallResult::Return(0),
-        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
+        Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
     }
 }
 
@@ -446,7 +458,7 @@ pub(super) async fn sys_mprotect(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscal
     .await
     {
         Ok(_commit) => SyscallResult::Return(0),
-        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
+        Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
     }
 }
 
@@ -510,7 +522,7 @@ pub(super) async fn sys_mremap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
     .await
     {
         Ok(outcome) => SyscallResult::Return(outcome.new_range.start().as_usize() as i64),
-        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
+        Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
     }
 }
 
@@ -604,7 +616,7 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -703,23 +715,41 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             use tx_substrate::step::DriveMode;
             use tx_subsystems::futex::FutexWaitOp;
 
+            if uaddr == 0 {
+                return SyscallResult::error_from(Errno::EINVAL);
+            }
+
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mailbox_arc = script_ctx.mailbox().cloned();
             let timer_wheel_arc = script_ctx.timer_wheel().cloned();
             let delegate_registry_arc = script_ctx.delegate_registry().cloned();
 
-            // First, probe the futex word without parking. EAGAIN
+            // Validate the user address before probing — the futex
+            // subsystem reads *uaddr via `read_volatile` (bootstrap
+            // exemption), which traps the kernel on an unmapped page.
+            // A pre-check with the safe `read_user` accessor converts
+            // the trap into a graceful -EFAULT.
+            {
+                let guard = step_engine::guard();
+                let user_ptr = UserPtr::<u32>::new(uaddr as usize);
+                if let StepOutcome::Err(_) = ctx.aspace.read_user(user_ptr, &guard) {
+                    return SyscallResult::error_from(Errno::EFAULT);
+                }
+            }
+
+            // Probe the futex word without parking. EAGAIN
             // here means "word != val" → return -EAGAIN immediately
             // (the predecessor equality check, per POSIX).
             {
                 let guard = step_engine::guard();
-                let outcome = tx_subsystems::futex::step_futex_wait(uaddr, val, &guard);
+                let outcome =
+                    tx_subsystems::futex::step_futex_wait(&ctx.aspace, uaddr, val, &guard);
                 match outcome {
                     StepOutcome::Err(e) if e == V3Errno::EAGAIN => {
-                        return SyscallResult::Error(errno_to_i32(Errno::EAGAIN));
+                        return SyscallResult::error_from(Errno::EAGAIN);
                     }
                     StepOutcome::Err(e) => {
-                        return SyscallResult::Error(errno_to_i32(Errno::from(e)));
+                        return SyscallResult::error_from(Errno::from(e));
                     }
                     // Yield / Continue / Done: fall through to drive().
                     _ => {}
@@ -735,7 +765,11 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             // Op acquires its own epoch guard inside `step()`; no
             // guard crosses `drive(...).await` (REACTOR_v0,
             // STEP_MODEL_v2 §1, INVARIANTS_v5 EBR-7).
-            let op = FutexWaitOp { uaddr, val };
+            let op = FutexWaitOp {
+                uaddr,
+                val,
+                aspace: &ctx.aspace,
+            };
             match drive(
                 op,
                 &mut script_ctx,
@@ -752,7 +786,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     if errno == Errno::EAGAIN {
                         SyscallResult::Return(0)
                     } else {
-                        SyscallResult::Error(errno_to_i32(errno))
+                        SyscallResult::error_from(errno)
                     }
                 }
             }
@@ -762,7 +796,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             let mut op = FutexWakeOp { uaddr, n: val };
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(woken) => SyscallResult::Return(woken as i64),
-                Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+                Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
             }
         }
         // FUTEX_REQUEUE / CMP_REQUEUE / WAKE_OP / LOCK_PI /

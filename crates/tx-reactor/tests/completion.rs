@@ -45,7 +45,7 @@ fn counted_wait_consumes_preexisting_credit() {
 
     completion.complete();
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = {
         let completion = Arc::clone(&completion);
         let outcome = Arc::clone(&outcome);
@@ -74,7 +74,7 @@ fn counted_completion_wake_is_rechecked_and_consumed_by_one_waiter() {
     let completion = Arc::new(Completion::new());
     let first_outcome = Arc::new(Mutex::new(None));
     let second_outcome = Arc::new(Mutex::new(None));
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
 
     let first = {
         let completion = Arc::clone(&completion);
@@ -136,7 +136,7 @@ fn counted_completion_wake_is_rechecked_and_consumed_by_one_waiter() {
 
 #[test]
 fn counted_completion_wait_propagates_timeout() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let completion = Arc::new(Completion::with_channel(reactor.channel()));
     let outcome = Arc::new(Mutex::new(None));
     let deadline_ns = 10;
@@ -181,7 +181,7 @@ fn counted_completion_wait_propagates_timeout() {
 fn countdown_completion_waits_until_final_arrival() {
     let countdown = Arc::new(CountdownCompletion::new(nz(2)));
     let outcome = Arc::new(Mutex::new(None));
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
 
     let task = {
         let countdown = Arc::clone(&countdown);

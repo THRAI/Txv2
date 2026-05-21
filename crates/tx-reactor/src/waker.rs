@@ -1,10 +1,12 @@
 //! Task-local waker state and raw-waker glue.
 
-use alloc::sync::Arc;
+use alloc::{collections::VecDeque, sync::Arc};
 use core::{
     sync::atomic::{AtomicBool, Ordering},
     task::{RawWaker, RawWakerVTable, Waker},
 };
+
+use crate::{spin_lock::SpinLock, task::TaskId};
 
 /// Shared state behind every waker cloned from a task poll.
 ///
@@ -12,18 +14,23 @@ use core::{
 /// before the next drain coalesce into one runnable transition, and the future
 /// decides on poll whether the underlying wait condition actually became true.
 pub(crate) struct TaskWakeState {
+    task: TaskId,
+    wake_queue: Arc<SpinLock<VecDeque<TaskId>>>,
     wake_requested: AtomicBool,
 }
 
 impl TaskWakeState {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(task: TaskId, wake_queue: Arc<SpinLock<VecDeque<TaskId>>>) -> Self {
         Self {
+            task,
+            wake_queue,
             wake_requested: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn wake(&self) {
         self.wake_requested.store(true, Ordering::Release);
+        self.wake_queue.lock().push_back(self.task);
     }
 
     pub(crate) fn take_wake(&self) -> bool {

@@ -13,8 +13,11 @@ ttys, hangup, devpts, or tty-facing VFS/process integration.
 - `docs/design/06_devices/TTY.md`
 - `docs/design/06_devices/DEVICE.md`
 - `docs/design/03_memory-vm/PAGE_BACKED_v1.md`
-- `docs/ljs/TTY_DESIGN_PLAN.md`
 - `docs/progress/research/2026-05-04-tty-implementation-status.md`
+- Newest TTY entries under `docs/progress/decisions/` (e.g. `2026-05-05-tty-process-aware-helpers.md`,
+  `2026-05-05-tty-signal-end-to-end-typed-dispatch.md`, `2026-05-05-tty-pgrp-typed-rebinding.md`,
+  `2026-05-05-foreground-pgrp-tty-owned.md`, `2026-05-06-tty-vmin-and-vfs-ioctl-status.md`,
+  `2026-05-12-d20-phase3-tty-adapter.md`)
 
 ## Current Code Map
 

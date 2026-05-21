@@ -28,6 +28,96 @@ struct TmsLayout {
     tms_cstime: i64,
 }
 
+pub(super) mod layout_descriptors {
+    use core::mem::{align_of, offset_of, size_of};
+
+    pub(super) use super::TmsLayout;
+    use super::{TimespecLayout, TimevalLayout};
+    use crate::linux_syscall::{KernelToUserLayout, KernelUserField, KernelUserLayout};
+
+    impl KernelToUserLayout for TimespecLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "TimespecLayout",
+            musl_header: "time.h",
+            musl_type: "struct timespec",
+            size: size_of::<TimespecLayout>(),
+            align: align_of::<TimespecLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "tv_sec",
+                    musl: "tv_sec",
+                    offset: offset_of!(TimespecLayout, tv_sec),
+                },
+                KernelUserField {
+                    rust: "tv_nsec",
+                    musl: "tv_nsec",
+                    offset: offset_of!(TimespecLayout, tv_nsec),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const TIMESPEC_LAYOUT: KernelUserLayout =
+        <TimespecLayout as KernelToUserLayout>::LAYOUT;
+
+    impl KernelToUserLayout for TimevalLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "TimevalLayout",
+            musl_header: "sys/time.h",
+            musl_type: "struct timeval",
+            size: size_of::<TimevalLayout>(),
+            align: align_of::<TimevalLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "tv_sec",
+                    musl: "tv_sec",
+                    offset: offset_of!(TimevalLayout, tv_sec),
+                },
+                KernelUserField {
+                    rust: "tv_usec",
+                    musl: "tv_usec",
+                    offset: offset_of!(TimevalLayout, tv_usec),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const TIMEVAL_LAYOUT: KernelUserLayout =
+        <TimevalLayout as KernelToUserLayout>::LAYOUT;
+
+    impl KernelToUserLayout for TmsLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "TmsLayout",
+            musl_header: "sys/times.h",
+            musl_type: "struct tms",
+            size: size_of::<TmsLayout>(),
+            align: align_of::<TmsLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "tms_utime",
+                    musl: "tms_utime",
+                    offset: offset_of!(TmsLayout, tms_utime),
+                },
+                KernelUserField {
+                    rust: "tms_stime",
+                    musl: "tms_stime",
+                    offset: offset_of!(TmsLayout, tms_stime),
+                },
+                KernelUserField {
+                    rust: "tms_cutime",
+                    musl: "tms_cutime",
+                    offset: offset_of!(TmsLayout, tms_cutime),
+                },
+                KernelUserField {
+                    rust: "tms_cstime",
+                    musl: "tms_cstime",
+                    offset: offset_of!(TmsLayout, tms_cstime),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const TMS_LAYOUT: KernelUserLayout =
+        <TmsLayout as KernelToUserLayout>::LAYOUT;
+}
+
 /// Convert a nanosecond count to a Linux-shaped `(tv_sec, tv_nsec)`
 /// pair. Both fields are signed 64-bit per the uapi.
 pub(super) fn ns_to_timespec(ns: u64) -> TimespecLayout {
@@ -99,7 +189,7 @@ pub(super) fn sys_clock_gettime<'a, P: TimeIf>(
     };
     let ts = ns_to_timespec(ns);
     if let Err(errno) = bootstrap_write_user::<TimespecLayout>(&ctx.aspace, ts_uaddr, ts) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
 }
@@ -120,7 +210,7 @@ pub(super) fn sys_gettimeofday<'a, P: TimeIf>(
     }
     let tv = ns_to_timeval(<P as TimeIf>::read_ns());
     if let Err(errno) = bootstrap_write_user::<TimevalLayout>(&ctx.aspace, tv_uaddr, tv) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
 }
@@ -143,7 +233,7 @@ pub(super) fn sys_times<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             tms_cstime: 0,
         };
         if let Err(errno) = bootstrap_write_user::<TmsLayout>(&ctx.aspace, buf_uaddr, tms) {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
     SyscallResult::Return(ticks)
@@ -178,7 +268,9 @@ pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
     let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = NanosleepOp {
         nanos: req_ns,
         deadline_ns,
@@ -188,14 +280,14 @@ pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
         op,
         &mut script_ctx,
         DriveMode::Waiting,
-        None,
-        None,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
         timer_wheel_arc.as_ref(),
     )
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -245,7 +337,9 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
     let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = NanosleepOp {
         nanos: req_ns,
         deadline_ns,
@@ -255,13 +349,13 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
         op,
         &mut script_ctx,
         DriveMode::Waiting,
-        None,
-        None,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
         timer_wheel_arc.as_ref(),
     )
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }

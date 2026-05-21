@@ -91,7 +91,8 @@ use tx_subsystems::signal::Signum;
 use tx_subsystems::signal::{ast_dispatch, AstOutcome};
 use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload_into;
 use tx_subsystems::thread_runtime::{
-    clear_current_thread_payload, set_current_thread_payload, ThreadIdentity, ThreadPayload,
+    clear_current_thread_payload, clear_current_userspace_payload, set_current_thread_payload,
+    set_current_userspace_payload, ThreadIdentity, ThreadPayload,
 };
 use tx_subsystems::vm::{AccessMode, UserVirtAddr, VmFault};
 
@@ -272,7 +273,7 @@ pub async fn run_thread<P: TxPlatform>(
                 // the modified context for the next userspace entry.
                 //
                 // See: `txdoc:SIGNAL-V1-S15-HANDLER-DELIVERY`.
-                if let Some(orig_ctx) = payload.saved_user_context() {
+                if let Some(mut orig_ctx) = payload.saved_user_context() {
                     // Resolve owning process for aspace + fallback exit.
                     let Some(process) = thread.upgrade_owner_proc() else {
                         return;
@@ -281,14 +282,50 @@ pub async fn run_thread<P: TxPlatform>(
                         return;
                     };
 
-                    // Save pre-handler context for sigreturn.
+                    // If a syscall return is pending (e.g. wait4 just
+                    // resolved, child exit raised SIGCHLD, and the AST
+                    // is now delivering the handler), apply that return
+                    // value to the parked pre-signal context's `a0` and
+                    // clear the pending slot.
+                    //
+                    // Without this, `prepare_userspace_entry_payload`
+                    // below would overlay `pending_syscall_return` onto
+                    // the freshly-built `handler_ctx.a0`, clobbering the
+                    // POSIX-required `sig_no` argument. Apply-and-clear
+                    // moves the syscall return into the place it should
+                    // surface — the post-`rt_sigreturn` userspace context
+                    // — while keeping the handler's `a0` equal to `sig_no`.
+                    //
+                    // The canonical `a0` register index lives in
+                    // `tx_subsystems::thread_runtime::execution::USER_CONTEXT_A0_INDEX`
+                    // and is the same index `prepare_userspace_entry_payload`
+                    // uses for the overlay we're pre-empting here. Source it
+                    // through that re-export so tx-kernel doesn't carry an
+                    // arch cfg (CI gate `CI-GATE-ARCH-LINT`).
+                    if let Some(result) =
+                        tx_subsystems::thread_runtime::structure::drain_pending_syscall_return(
+                            &payload,
+                        )
+                    {
+                        let encoded = match result {
+                            Ok(v) => v as u64,
+                            Err(errno) => (-i64::from(errno)) as u64,
+                        };
+                        orig_ctx.regs
+                            [tx_subsystems::thread_runtime::execution::USER_CONTEXT_A0_INDEX] =
+                            encoded as usize;
+                    }
+
+                    // Save pre-handler context for sigreturn (now
+                    // carrying the applied syscall return in a0).
                     payload.store_saved_signal_context(Some(orig_ctx));
 
                     // Read current mask to pass to the handler.
                     let old_mask = payload.signal_mask();
 
                     // Build the signal frame write descriptor.
-                    let stack_top = tx_hal::UserPtr::<u8>::new(orig_ctx.regs[2]); // sp
+                    let stack_top =
+                        tx_hal::UserPtr::<u8>::new(user_sp_from_context::<P>(&orig_ctx));
                     let setup = tx_hal::SignalFrameWrite {
                         stack_top,
                         sig_no: sig.raw() as u32,
@@ -307,14 +344,39 @@ pub async fn run_thread<P: TxPlatform>(
                         <P as tx_hal::SignalFrameIf>::prepare_signal_frame(&orig_ctx, &setup);
                     match prepared {
                         Ok((handler_ctx, frame_bytes)) => {
-                            let frame_addr = handler_ctx.regs[2];
-                            {
+                            let frame_addr = user_sp_from_context::<P>(&handler_ctx);
+                            // Check that the full frame (including the
+                            // sigreturn trampoline at its tail) actually
+                            // landed on the user stack. The previous
+                            // `let _ =` ignored every non-Done outcome —
+                            // including `Yield`/short copy — which left
+                            // the trampoline slot uninitialised, so the
+                            // handler returned to garbage / zeros and
+                            // the next instruction fetch faulted
+                            // (observed end-to-end as the basic-musl
+                            // crash with `lPF pc=trampoline_pc`). If the
+                            // copy doesn't complete fully, fall back to
+                            // the default action (terminate by sig) per
+                            // SIGNAL_v1 §15.1 — handler delivery cannot
+                            // proceed without a valid trampoline.
+                            use crate::adapter::step_engine::StepOutcome as V3;
+                            let copy_outcome = {
                                 let guard = crate::adapter::step_engine::guard();
-                                let _ = aspace.copy_to_user(
+                                aspace.copy_to_user(
                                     tx_hal::UserPtr::<u8>::new(frame_addr),
                                     frame_bytes.as_slice(),
                                     &guard,
+                                )
+                            };
+                            let fully_written = match copy_outcome {
+                                V3::Done(n) => n == frame_bytes.as_slice().len(),
+                                _ => false,
+                            };
+                            if !fully_written {
+                                tx_subsystems::process::execution::step_exit_group_with_signal(
+                                    &process, sig,
                                 );
+                                return;
                             }
                             payload.store_saved_user_context(Some(handler_ctx));
                         }
@@ -343,6 +405,7 @@ pub async fn run_thread<P: TxPlatform>(
             "checkpoint_userspace_entry_batch must succeed with the freshly-started \
              entry-side request"
         );
+
         // ----------------------------------------------------------------
         // (2) BUILD MERGED CONTEXT AND DIVE INTO USERSPACE.
         //
@@ -382,6 +445,8 @@ pub async fn run_thread<P: TxPlatform>(
                 let mut ctx = tx_hal::UserTrapContext::empty();
                 prepare_userspace_entry_payload_into(&payload, &mut ctx);
                 payload.set_active_userspace_request(Some(entry_token));
+                let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
+                let _prev_userspace = set_current_userspace_payload(entry_hart, payload.clone());
                 <P as TrapIf>::enter_userspace_with_context(&ctx, root);
             } else {
                 return;
@@ -402,11 +467,19 @@ pub async fn run_thread<P: TxPlatform>(
         // the next poll.
         // ----------------------------------------------------------------
         let trap = entry_wait.await;
+        let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
+        if !matches!(trap, UserspaceTrapInfo::TimerPreempt) {
+            let _ = clear_current_userspace_payload(entry_hart);
+        }
+        payload.set_active_userspace_request(None);
 
         // ----------------------------------------------------------------
         // (4) DISPATCH THE RESOLVED TRAP.
         // ----------------------------------------------------------------
         match trap {
+            UserspaceTrapInfo::TimerPreempt => {
+                tx_reactor::yield_now().await;
+            }
             UserspaceTrapInfo::Syscall(req) => {
                 // Resolve the syscall context from the payload.
                 let Some(process) = thread.upgrade_owner_proc() else {
@@ -424,20 +497,35 @@ pub async fn run_thread<P: TxPlatform>(
                 );
                 // drive-taskmb: inject the current task's mailbox so
                 // drive() can park on it for yield resolution.
-                if let Some(mailbox) = tx_reactor::current_task_mailbox() {
+                let hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
+                if let Some(mailbox) = tx_reactor::current_task_mailbox(hart) {
                     ctx = ctx.with_mailbox(mailbox);
                 }
                 // drive-taskmb: inject the reactor's timer wheel for
                 // OnTimer yield resolution.
-                if let Some(tw) = tx_reactor::current_timer_wheel() {
+                if let Some(tw) = tx_reactor::current_timer_wheel(hart) {
                     ctx = ctx.with_timer_wheel(tw);
                 }
                 // drive-taskmb: inject the reactor's delegate registry
                 // for OnAgent yield resolution.
-                if let Some(dr) = tx_reactor::current_delegate_registry() {
+                if let Some(dr) = tx_reactor::current_delegate_registry(hart) {
                     ctx = ctx.with_delegate_registry(dr);
                 }
                 let result = tx_shims::linux_syscall::dispatch::<P>(req, &ctx).await;
+
+                // Threshold-based observation dump. If the boot path
+                // installed a non-zero `OBSERVE_DUMP_THRESHOLD` (see
+                // `tx_observe::set_dump_threshold`), every emit ticks
+                // a global counter; once it crosses the threshold, this
+                // syscall return dumps the ring over the console and
+                // powers off the platform. Captures a bounded trace from
+                // workloads where init never naturally exits (e.g.
+                // oscomp's continuous test-group sequence).
+                if tx_observe::should_dump_now() {
+                    tx_observe::dump_console_hex::<P>(<P as tx_hal::SmpIf>::current_cpu_id());
+                    tx_hal::console_write_str::<P>(":observe:dump:threshold\n");
+                    <P as tx_hal::PowerIf>::system_off();
+                }
 
                 match result {
                     tx_shims::linux_syscall::SyscallResult::Return(v) => {
@@ -479,15 +567,12 @@ pub async fn run_thread<P: TxPlatform>(
                         // `make_initial_user_trap_context`).
                     }
                     tx_shims::linux_syscall::SyscallResult::SigreturnRestored => {
-                        // Phase B: rt_sigreturn restored the signal
-                        // frame into saved_user_context.  Same
-                        // fall-through semantics as ExecCommitted:
-                        // MUST NOT drain pending_syscall_return;
-                        // re-enters userspace with the restored
-                        // context.  The actual SignalFrameIf restore
-                        // (read_signal_frame + restore_signal_frame)
-                        // lands in Phase D.
-                        // Fall through to AST drain + re-entry.
+                        // `sys_rt_sigreturn` already consumed the parked
+                        // pre-handler context and restored it into
+                        // `saved_user_context`.  Do not take it again here:
+                        // this branch only preserves the ExecCommitted shape
+                        // of skipping normal pending-syscall-return writeback
+                        // and re-entering with the restored context.
                     }
                 }
             }
@@ -542,6 +627,13 @@ pub async fn run_thread<P: TxPlatform>(
         // Fall through to the top of the loop — next iteration
         // re-opens the entry-side wait, re-runs the AST checkpoint,
         // and re-dives into userspace with the merged context.
+    }
+}
+
+fn user_sp_from_context<P: TxPlatform>(ctx: &tx_hal::UserTrapContext) -> usize {
+    match P::ARCH {
+        tx_hal::Arch::Riscv64 => ctx.regs[2],
+        tx_hal::Arch::LoongArch64 => ctx.regs[3],
     }
 }
 

@@ -63,12 +63,23 @@ use tx_subsystems::futex::adapter::wait_routing::{
     MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
 };
 
+use tx_hal::UserPtr;
 use tx_subsystems::futex::{
     bucket_index, bucket_wait_source, bucket_wait_source_for_source_id, step_futex_wait,
     step_futex_wake, FUTEX_WAKE_MASK,
 };
+use tx_subsystems::vm::{
+    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
+    USER_PAGE_SIZE,
+};
 use tx_subsystems::wait_source as legacy_wait_source;
 use tx_subsystems::zones;
+
+/// Minimal `PmapIf` stub for integration tests — the futex wait-source
+/// test only needs an AddressSpace with a single PrivateAnon page; it
+/// never actually walks the pmap, so the stub is a no-op.
+struct FutexTestPmap;
+impl tx_hal::PmapIf for FutexTestPmap {}
 
 static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -355,14 +366,32 @@ fn waitsource_notify_stamps_caller_generation_on_event() {
 #[test]
 fn wait_source_id_round_trips_from_yield_shape_to_bucket_source() {
     let _setup = setup();
-    let word: u32 = 0xdead_beef;
-    let uaddr = &word as *const u32 as u64;
+    let user_va = 0xb000_0000usize;
+    let aspace = AddressSpace::new_for_platform::<FutexTestPmap>().expect("test pmap creates root");
+    let entry = VmEntry::new(
+        UserRange::new_aligned(UserVirtAddr(user_va), USER_PAGE_SIZE).unwrap(),
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    match aspace.reserve_map(entry, MapPlacement::RequireFree) {
+        tx_subsystems::vm::MapReserveResult::Reserved(reservation) => {
+            reservation.commit().expect("commit reservation");
+        }
+        other => panic!("reserve_map failed: {other:?}"),
+    }
+    // Seed the word through the pmap.
+    let guard = ebr_guard();
+    let _ = aspace.write_user(UserPtr::<u32>::new(user_va), 0xdead_beef_u32, &guard);
+    drop(guard);
+
+    let uaddr = user_va as u64;
 
     // `step_futex_wait` yields with the bucket's `source_id` stamped
     // into `OnWaitSource`. The same `u64` resolves to the bucket's
     // `Arc<WaitSource>` via `bucket_wait_source_for_source_id`.
     let guard = ebr_guard();
-    let outcome = step_futex_wait(uaddr, 0xdead_beef, &guard);
+    let outcome = step_futex_wait(&aspace, uaddr, 0xdead_beef, &guard);
     drop(guard);
 
     let stamped_id = match outcome {

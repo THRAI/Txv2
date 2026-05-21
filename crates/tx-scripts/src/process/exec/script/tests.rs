@@ -591,9 +591,12 @@ fn exec_script_resets_brk_base_from_image_plan() {
 }
 
 #[test]
-fn exec_script_invalid_elf_returns_not_executable() {
+fn exec_script_invalid_elf_falls_back_to_bin_sh() {
     let _setup = setup();
     // 4 KiB of zeroes — fails ELF magic check immediately.
+    // The kernel now falls back to /bin/sh for ENOEXEC; /bin/sh
+    // does not exist in this test fixture, so the result is
+    // PathNotFound.
     let bytes = vec![0u8; 4096];
     let (process, thread, _fs) = bootstrap_with_file(b"bad", &bytes);
 
@@ -607,7 +610,7 @@ fn exec_script_invalid_elf_returns_not_executable() {
         &[],
         &cred,
     ));
-    assert_eq!(result, Err(ExecError::NotExecutable));
+    assert_eq!(result, Err(ExecError::PathNotFound));
 
     // Pre-PoNR error path must leave the process aspace untouched.
     let aspace_after = process.aspace_cap().expect("alive aspace post-fail");
@@ -616,6 +619,23 @@ fn exec_script_invalid_elf_returns_not_executable() {
     // never seeds it).
     let payload = thread.payload_cap().expect("alive thread payload");
     assert!(payload.saved_user_context().is_none());
+}
+
+#[test]
+fn shebang_busybox_sh_normalization_consumes_applet_arg() {
+    let header = b"#!/bin/busybox sh\n./lua $1\n";
+    let (interp, opt_arg) = super::shebang_parse(header).expect("valid shebang");
+    let original_argv: [&[u8]; 2] = [b"./test.sh", b"date.lua"];
+
+    let (interp_path, argv) =
+        super::shebang_exec_argv(interp, opt_arg, b"./test.sh", &original_argv);
+
+    assert_eq!(interp_path, b"/bin/sh");
+    let argv_refs: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        argv_refs,
+        vec![b"/bin/sh".as_slice(), b"./test.sh", b"date.lua"]
+    );
 }
 
 #[test]

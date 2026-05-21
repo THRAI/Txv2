@@ -70,7 +70,7 @@ macro_rules! run_with_clock {
 }
 
 fn submit_timeout_waiter(
-    reactor: &mut Reactor,
+    reactor: &Reactor,
     deadline_ns: u64,
     outcome: Arc<Mutex<Option<WaitOutcome>>>,
 ) -> TaskId {
@@ -91,14 +91,14 @@ fn submit_timeout_waiter(
 #[test]
 fn clock_run_reports_earliest_deadline_and_arms_it() {
     let clock = ManualClock::new(0);
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let first_outcome = Arc::new(Mutex::new(None));
     let second_outcome = Arc::new(Mutex::new(None));
 
-    let _first = submit_timeout_waiter(&mut reactor, 50, Arc::clone(&first_outcome));
-    let _second = submit_timeout_waiter(&mut reactor, 20, Arc::clone(&second_outcome));
+    let _first = submit_timeout_waiter(&reactor, 50, Arc::clone(&first_outcome));
+    let _second = submit_timeout_waiter(&reactor, 20, Arc::clone(&second_outcome));
 
-    let report = run_with_clock!(&mut reactor, &clock);
+    let report = run_with_clock!(&reactor, &clock);
 
     assert_eq!(
         report.stats(),
@@ -124,12 +124,12 @@ fn clock_run_reports_earliest_deadline_and_arms_it() {
 #[test]
 fn clock_run_returns_idle_without_spinning_when_no_work_is_ready() {
     let clock = ManualClock::new(0);
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let outcome = Arc::new(Mutex::new(None));
 
-    let _task = submit_timeout_waiter(&mut reactor, 100, Arc::clone(&outcome));
-    let first = run_with_clock!(&mut reactor, &clock);
-    let second = run_with_clock!(&mut reactor, &clock);
+    let _task = submit_timeout_waiter(&reactor, 100, Arc::clone(&outcome));
+    let first = run_with_clock!(&reactor, &clock);
+    let second = run_with_clock!(&reactor, &clock);
 
     assert_eq!(
         first.stats(),
@@ -157,19 +157,19 @@ fn clock_run_returns_idle_without_spinning_when_no_work_is_ready() {
 #[test]
 fn clock_run_drives_expired_timer_wake_and_cancels_when_empty() {
     let clock = ManualClock::new(0);
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let outcome = Arc::new(Mutex::new(None));
 
-    let task = submit_timeout_waiter(&mut reactor, 10, Arc::clone(&outcome));
+    let task = submit_timeout_waiter(&reactor, 10, Arc::clone(&outcome));
 
     assert_eq!(
-        run_with_clock!(&mut reactor, &clock).next_deadline_ns(),
+        run_with_clock!(&reactor, &clock).next_deadline_ns(),
         Some(10)
     );
     assert_eq!(*outcome.lock().expect("outcome slot poisoned"), None);
 
     clock.set_now_ns(10);
-    let report = run_with_clock!(&mut reactor, &clock);
+    let report = run_with_clock!(&reactor, &clock);
 
     assert_eq!(report.timer_wakes(), 1);
     assert_eq!(
@@ -195,9 +195,9 @@ fn clock_run_drives_expired_timer_wake_and_cancels_when_empty() {
 
 #[test]
 fn host_driven_advance_time_to_behavior_is_preserved() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let outcome = Arc::new(Mutex::new(None));
-    let task = submit_timeout_waiter(&mut reactor, 5, Arc::clone(&outcome));
+    let task = submit_timeout_waiter(&reactor, 5, Arc::clone(&outcome));
 
     assert_eq!(
         reactor.run_until_idle(),

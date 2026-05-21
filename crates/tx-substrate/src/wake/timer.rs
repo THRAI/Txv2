@@ -249,12 +249,14 @@ impl TimerWheel {
     /// (if present). Retires expired entries from the wheel.
     ///
     /// Called by the reactor's clock tick.
-    pub fn fire_due(&self, now_ns: u64) {
+    pub fn fire_due(&self, now_ns: u64) -> usize {
         let mut state = self.state.lock();
         let mut i = 0;
+        let mut fired = 0;
         while i < state.entries.len() {
             if state.entries[i].deadline.raw() <= now_ns {
                 let entry = state.entries.remove(i);
+                fired += 1;
                 if let Some(ref mb_weak) = entry.mailbox {
                     if let Some(mb) = mb_weak.upgrade() {
                         let _ = mb.post(MailboxEvent::TimerFired { token: entry.token });
@@ -264,6 +266,17 @@ impl TimerWheel {
                 i += 1;
             }
         }
+        fired
+    }
+
+    /// Earliest deadline currently armed on the wheel.
+    pub fn next_deadline_ns(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .entries
+            .iter()
+            .map(|entry| entry.deadline.raw())
+            .min()
     }
 
     /// Install a `DelegateTimeout`-role timer tagged with the

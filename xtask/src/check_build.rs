@@ -29,6 +29,7 @@ pub(crate) fn check(root: &Path) -> Result<()> {
     lint_arch(root)?;
     lint_docs(root)?;
     lint_unused(root)?;
+    crate::kernel_user_layouts::kernel_user_layouts(root, Vec::new())?;
 
     let installed = installed_targets().unwrap_or_default();
     for target in [

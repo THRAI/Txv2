@@ -111,7 +111,7 @@ fn empty_target_set_is_immediately_complete() {
 fn waiter_wakes_on_final_ack() {
     let rendezvous = SyncRendezvous::new([target(1), target(2)]);
     let outcome = Arc::new(Mutex::new(None));
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
 
     let task = {
         let rendezvous = rendezvous.clone();

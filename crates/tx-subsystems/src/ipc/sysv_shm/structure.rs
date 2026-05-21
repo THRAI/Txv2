@@ -1,0 +1,268 @@
+//! SysV shared memory — identity and payload types.
+//!
+//! `ShmSegmentIdentity`: key, cred, size, shmid.
+//! `ShmSegmentPayload`: page-backed storage, attach count, shmctl state.
+//!
+//! Day-1 single-namespace: a global `SHM_TABLE` maps shmid → Cap.
+//! When `AllocIndex` lands (per `NAMESPACE_VIEW_v1.md` §3), the
+//! table moves into `IpcNamespace.sysv_shm` as an
+//! `IndexTable<SysvKey, Cap<ShmSegmentIdentity>>`.
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+
+use crate::process::adapter::step_engine::{Cap, SpinMutex, Zone, ZoneAllocated, ZoneError};
+
+use crate::cred::Cred;
+use crate::process::nsproxy::SysvKey;
+
+// ---------------------------------------------------------------------------
+// IpcPerm — shared across all IPC kinds
+// ---------------------------------------------------------------------------
+
+/// POSIX IPC permission flags — owner/group/other rw bits.
+///
+/// Shared across SysV shm, sem, and msg. The `IpcPerm` type lives here
+/// because `sysv_shm` is the first landing module; sem and msg import
+/// it via `crate::ipc::sysv_shm::structure::IpcPerm`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IpcPerm {
+    pub mode: u16,
+}
+
+impl IpcPerm {
+    pub const fn new(mode: u16) -> Self {
+        Self { mode: mode & 0o777 }
+    }
+
+    pub const fn owner_read(self) -> bool {
+        (self.mode & 0o400) != 0
+    }
+    pub const fn owner_write(self) -> bool {
+        (self.mode & 0o200) != 0
+    }
+    pub const fn group_read(self) -> bool {
+        (self.mode & 0o040) != 0
+    }
+    pub const fn group_write(self) -> bool {
+        (self.mode & 0o020) != 0
+    }
+    pub const fn other_read(self) -> bool {
+        (self.mode & 0o004) != 0
+    }
+    pub const fn other_write(self) -> bool {
+        (self.mode & 0o002) != 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ShmSegmentIdentity / ShmSegmentPayload
+// ---------------------------------------------------------------------------
+
+/// System V shared memory segment identity.
+///
+/// Key semantics: `Some(k)` for `shmget(key, ...)`; `None` for
+/// `shmget(IPC_PRIVATE, ...)`. The id (`shmid`) is assigned by
+/// the shm allocator on creation and is never reused (monotonic
+/// counter per the day-1 single-namespace design).
+pub struct ShmSegmentIdentity {
+    pub key: Option<SysvKey>,
+    pub shmid: u32,
+    pub cred: Cap<Cred>,
+    pub size: usize,
+    pub mode: AtomicU16,
+    pub uid: AtomicU32,
+    pub gid: AtomicU32,
+    /// Creator uid/gid — used by shmctl IPC_STAT.
+    pub cuid: u32,
+    pub cgid: u32,
+    /// Marked for deletion (IPC_RMID has been called). No new
+    /// attaches are allowed after this flag is set; existing
+    /// attaches continue to work. The segment is destroyed when
+    /// the last attach is removed.
+    ///
+    /// `AtomicBool` because `Cap<T>` only provides `Deref` (immutable
+    /// shared access). Mutation goes through atomic stores so the
+    /// flag can be set without `DerefMut`.
+    pub destroyed: core::sync::atomic::AtomicBool,
+    /// Live segment payload.
+    pub payload: Cap<ShmSegmentPayload>,
+}
+
+impl ShmSegmentIdentity {
+    pub fn perm(&self) -> IpcPerm {
+        IpcPerm::new(self.mode.load(Ordering::Relaxed))
+    }
+
+    pub fn uid(&self) -> u32 {
+        self.uid.load(Ordering::Relaxed)
+    }
+
+    pub fn gid(&self) -> u32 {
+        self.gid.load(Ordering::Relaxed)
+    }
+
+    pub fn key_raw(&self) -> i32 {
+        self.key.map(|key| key.0 as i32).unwrap_or(0)
+    }
+}
+
+/// System V shared memory segment payload — the live backing.
+///
+/// Phase IPC-1: the backing is an anonymous `PageContainer` allocated
+/// at `step_shmget` time. `step_shmat` maps it into the caller's
+/// address space via the existing VM fault path; `step_shmdt` unmaps.
+/// `attach_count` is bumped on shmat, decremented on shmdt.
+pub struct ShmSegmentPayload {
+    /// Number of active attaches. When zero and `destroyed` is true,
+    /// the segment is reclaimed.
+    ///
+    /// `AtomicU32` because `Cap<T>` only provides `Deref` — mutation
+    /// goes through atomic fetch_add / fetch_sub.
+    pub attach_count: AtomicU32,
+    /// Caller VMAs attached to this segment. Linux's `shmdt(2)` only
+    /// receives the start address returned by `shmat(2)`, so the
+    /// day-1 ownership key pairs that address with the caller's
+    /// retained `AddressSpace` slot identity.
+    pub attaches: SpinMutex<Vec<ShmAttach>>,
+    /// PageContainer holding the segment's pages.
+    pub page_container: Cap<crate::page_backed::PageContainer>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShmAttach {
+    pub aspace_key: u32,
+    pub addr: usize,
+    pub len: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Global shm registry — day-1 single-namespace
+// ---------------------------------------------------------------------------
+
+/// Global SysV shm segment table. Maps shmid → identity Cap.
+/// Replaced by `IpcNamespace.sysv_shm` when `AllocIndex` lands.
+static SHM_TABLE: SpinMutex<BTreeMap<u32, Cap<ShmSegmentIdentity>>> =
+    SpinMutex::new(BTreeMap::new());
+
+/// Monotonic shmid allocator. Starts at 0 and increments; shmids
+/// are never reused (matching Linux's `ipc_ids` allocator).
+static NEXT_SHMID: AtomicU32 = AtomicU32::new(1);
+
+// ---------------------------------------------------------------------------
+// Zone registration
+// ---------------------------------------------------------------------------
+
+static SHM_IDENTITY_ZONE: Zone<ShmSegmentIdentity> = Zone::const_new();
+static SHM_PAYLOAD_ZONE: Zone<ShmSegmentPayload> = Zone::const_new();
+
+unsafe impl ZoneAllocated for ShmSegmentIdentity {
+    fn zone() -> &'static Zone<Self> {
+        &SHM_IDENTITY_ZONE
+    }
+}
+
+unsafe impl ZoneAllocated for ShmSegmentPayload {
+    fn zone() -> &'static Zone<Self> {
+        &SHM_PAYLOAD_ZONE
+    }
+}
+
+pub(crate) fn register_zones() -> Result<(), ZoneError> {
+    use crate::process::adapter::step_engine::register_zone_for;
+    register_zone_for::<ShmSegmentIdentity>()?;
+    register_zone_for::<ShmSegmentPayload>()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Public registry accessors
+// ---------------------------------------------------------------------------
+
+/// Look up a shm segment by id. Returns `None` if the id is not
+/// registered or the segment has been destroyed and all attaches
+/// have been removed.
+pub(crate) fn lookup_shm(shmid: u32) -> Option<Cap<ShmSegmentIdentity>> {
+    SHM_TABLE.lock().get(&shmid).cloned()
+}
+
+/// Look up a live shm segment by Linux's dense IPC index used by
+/// `SHM_STAT`/`SHM_STAT_ANY`.
+pub(crate) fn lookup_shm_by_index(index: u32) -> Option<Cap<ShmSegmentIdentity>> {
+    SHM_TABLE.lock().values().nth(index as usize).cloned()
+}
+
+/// Register a newly created segment and return its shmid.
+pub(crate) fn register_shm(
+    key: Option<SysvKey>,
+    cred: Cap<Cred>,
+    size: usize,
+    perm: IpcPerm,
+    cuid: u32,
+    cgid: u32,
+) -> Result<u32, ZoneError> {
+    use crate::process::adapter::step_engine::sign;
+    let shmid = NEXT_SHMID.fetch_add(1, Ordering::Relaxed);
+    let payload = sign(ShmSegmentPayload {
+        attach_count: AtomicU32::new(0),
+        attaches: SpinMutex::new(Vec::new()),
+        page_container: crate::page_backed::PageContainer::new_cap(
+            crate::page_backed::PageContainerKind::Anon {
+                swap_policy: crate::page_backed::AnonSwapPolicy::Persistent,
+            },
+            size.div_ceil(crate::vm::USER_PAGE_SIZE) as u64,
+        )?,
+    })?;
+    let identity = sign(ShmSegmentIdentity {
+        key,
+        shmid,
+        cred,
+        size,
+        mode: AtomicU16::new(perm.mode),
+        uid: AtomicU32::new(cuid),
+        gid: AtomicU32::new(cgid),
+        cuid,
+        cgid,
+        destroyed: AtomicBool::new(false),
+        payload,
+    })?;
+    SHM_TABLE.lock().insert(shmid, identity);
+    Ok(shmid)
+}
+
+/// Mark a segment removed without dropping the global identity cap.
+///
+/// `IPC_RMID` makes the id/key unavailable for new lookups and new
+/// attaches, but already-attached address spaces must still be able to
+/// identify the segment when `shmdt(2)` arrives.
+pub(crate) fn mark_shm_removed(shmid: u32) -> Option<Cap<ShmSegmentIdentity>> {
+    let segment = SHM_TABLE.lock().get(&shmid).cloned()?;
+    segment.destroyed.store(true, Ordering::Release);
+    Some(segment)
+}
+
+/// Drop a removed segment once no attach records remain.
+pub(crate) fn reclaim_shm_if_unattached(segment: &Cap<ShmSegmentIdentity>) -> bool {
+    if !segment.destroyed.load(Ordering::Acquire) {
+        return false;
+    }
+    if segment.payload.attach_count.load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    SHM_TABLE.lock().remove(&segment.shmid).is_some()
+}
+
+/// Iterate all live segments (for /proc/sysvipc/shm projection).
+pub(crate) fn all_shm_segments() -> alloc::vec::Vec<Cap<ShmSegmentIdentity>> {
+    SHM_TABLE.lock().values().cloned().collect()
+}
+
+pub(crate) fn highest_shm_index() -> i64 {
+    let len = SHM_TABLE.lock().len();
+    if len == 0 {
+        -1
+    } else {
+        (len - 1).try_into().unwrap_or(i64::MAX)
+    }
+}

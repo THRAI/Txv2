@@ -1,5 +1,6 @@
 //! Process subsystem execution: fork, exit-group, setpgid, setsid, and
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -14,14 +15,14 @@ use crate::process::adapter::wait_routing::{self, Mask};
 
 use crate::cred::Cred;
 use crate::process::structure::{
-    ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session, Sid,
+    ExitStatus, Frame, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session, Sid,
 };
 use crate::process::topology::{
     ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers,
 };
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::thread_runtime::execution::set_thread_zombie;
-use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload};
+use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload, Tid};
 use crate::vfs::OpenFile;
 use crate::vm::{AddressSpace, VmMapError};
 
@@ -30,8 +31,8 @@ use crate::vm::{AddressSpace, VmMapError};
 // ---------------------------------------------------------------------------
 
 use crate::process::numbers::{
-    allocate_pid, register_pid as ns_register_pid, resolve_pid_number, unregister_pid_number,
-    with_namespace, PidName, PidNameKind,
+    allocate_pid, register_pid as ns_register_pid, register_tid, resolve_pid_number,
+    unregister_pid_number, with_namespace, PidName, PidNameKind,
 };
 
 /// Register a process pid → Cap binding. The Cap must be fully
@@ -261,7 +262,7 @@ pub fn bootstrap_init_process(
     pgrp.members.attach(proc_cap.downgrade());
     pgrp.session.members.attach(pgrp.downgrade());
 
-    let leader = sign_thread(proc_cap.downgrade())?;
+    let leader = sign_thread(proc_cap.downgrade(), Tid(pid.0))?;
     // Day-1: init has no cwd until a rootfs is mounted and an
     // initial chdir runs. Future EXEC_v1 / first-userspace lands
     // a synthesized "/" DEntry and threads it through here.
@@ -283,9 +284,13 @@ pub fn bootstrap_init_process(
     // NOT close-on-exec by Linux convention. Per the Wave 2 plan,
     // until `sys_open` exists in the trio's syscall surface, the
     // bitmap is mutated only by `fcntl(F_SETFD)`.
+    // Create the init namespace proxy. Day-1: all namespace caps
+    // point at init-namespace stubs; mnt_ns is deferred.
+    let nsproxy = crate::process::nsproxy::sign_init_nsproxy()?;
     let payload = sign_process_payload(
         aspace,
         vec![leader],
+        nsproxy,
         Cred::root(),
         None,
         BTreeMap::new(),
@@ -296,6 +301,7 @@ pub fn bootstrap_init_process(
         // mask defaults to `0o022` per Linux convention; children
         // inherit through `step_fork`'s umask thread-through.
         0o022,
+        Arc::new(SigActionTable::new()),
     )?;
     *proc_cap.payload.lock() = Some(payload);
 
@@ -314,47 +320,13 @@ pub fn bootstrap_init_process(
 }
 
 /// Clone a new thread into an existing process (CLONE_THREAD).
-///
-/// Five-phase protocol — PROCESS_v1 §7.1.3.
-pub fn step_clone_thread(
-    process: &Cap<ProcessIdentity>,
-    parent_ctx: &UserTrapContext,
-) -> Result<Cap<ThreadIdentity>, ForkError> {
-    use crate::process::numbers::register_tid;
-    use crate::thread_runtime::structure::allocate_tid;
-
-    // 1. Observe — check GroupExit not in progress
-    if let Some(payload) = process.payload.lock().as_ref() {
-        if payload.group_exit.lock().is_some() {
-            return Err(ForkError::ParentZombie);
-        }
-    }
-
-    // 3. Reserve — allocate new ThreadIdentity
-    let tid = allocate_tid();
-    let thread = sign_thread(process.downgrade()).map_err(|_| ForkError::PidNamespace)?;
-
-    // 4. Commit (infallible)
-    let payload_guard = process.payload.lock();
-    let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
-    payload.threads.attach(thread.clone());
-    payload.thread_count.fetch_add(1, Ordering::Relaxed);
-    register_tid(tid, thread.clone());
-
-    // Seed child's user context from parent
-    if let Some(payload_cap) = thread.payload_cap() {
-        payload_cap.store_saved_user_context(Some(*parent_ctx));
-    }
-
-    Ok(thread)
-}
-
 /// Fork a process: clones the parent's address space, allocates a new
 /// pid + leader tid, inherits the parent's pgrp/session, returns the
 /// child identity.
 pub fn step_fork<P: PmapIf>(
     parent: &Cap<ProcessIdentity>,
     clone_vm: bool,
+    clone_sighand: bool,
 ) -> Result<Cap<ProcessIdentity>, ForkError> {
     // observe
     // upgrade
@@ -373,6 +345,7 @@ pub fn step_fork<P: PmapIf>(
     // `AddressSpace::fork_aspace` below.
     let (
         parent_aspace,
+        parent_nsproxy,
         parent_cred,
         parent_cwd,
         parent_fds,
@@ -385,9 +358,10 @@ pub fn step_fork<P: PmapIf>(
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
         (
             payload.aspace_cap(),
+            payload.nsproxy_cap(),
             payload.cred(),
             payload.cwd(),
-            payload.snapshot_fds(),
+            payload.clone_fds_for_fork(),
             payload.fd_cloexec_snapshot(),
             payload.brk_base(),
             payload.current_brk(),
@@ -395,6 +369,15 @@ pub fn step_fork<P: PmapIf>(
         )
     };
     let parent_pgrp = parent.pgrp.lock().clone();
+
+    // Signal-action table: share via Arc (CLONE_SIGHAND) or fresh.
+    let child_sig_actions = if clone_sighand {
+        let payload_guard = parent.payload.lock();
+        let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
+        Arc::clone(&payload.frame.sig_actions)
+    } else {
+        Arc::new(SigActionTable::new())
+    };
 
     // Address space: fork (CoW clone) or share (CLONE_VM).
     let child_aspace_cap = if clone_vm {
@@ -413,7 +396,7 @@ pub fn step_fork<P: PmapIf>(
     register_pid(child_pid, child_proc.clone());
 
     // Leader thread.
-    let leader = sign_thread(child_proc.downgrade()).map_err(ForkError::Zone)?;
+    let leader = sign_thread(child_proc.downgrade(), Tid(child_pid.0)).map_err(ForkError::Zone)?;
 
     // Wire up payload — child inherits parent credentials, cwd, and
     // a per-slot clone of the parent's fd table. POSIX: fork copies
@@ -422,9 +405,14 @@ pub fn step_fork<P: PmapIf>(
     // copied across fork — the child sees the parent's snapshot at
     // fork time; subsequent `fcntl(F_SETFD)` calls in either parent
     // or child do not affect the other.
+    // Clone the parent's nsproxy. POSIX: fork inherits the parent's
+    // namespace bundle. CLONE_NEWIPC / CLONE_NEWPID / ... (future)
+    // will replace the nsproxy with a fresh bundle for unshared nss.
+    let child_nsproxy = crate::process::nsproxy::clone_nsproxy(&parent_nsproxy);
     let payload = sign_process_payload(
         child_aspace_cap,
         vec![leader],
+        child_nsproxy,
         parent_cred,
         parent_cwd,
         parent_fds,
@@ -432,6 +420,7 @@ pub fn step_fork<P: PmapIf>(
         parent_brk_base,
         parent_current_brk,
         parent_umask,
+        child_sig_actions,
     )
     .map_err(ForkError::Zone)?;
     *child_proc.payload.lock() = Some(payload);
@@ -471,7 +460,8 @@ pub fn step_fork<P: PmapIf>(
 ///
 /// 1. Clone `parent_user_ctx` into a fresh `UserTrapContext`.
 /// 2. Overwrite the child-return register (`a0`) with 0.
-/// 3. Overwrite `pc = parent_user_ctx.pc + 4` (skip past `ecall`).
+/// 3. If the clone syscall supplied a non-zero child stack, overwrite
+///    the architecture-specific stack-pointer register with it.
 /// 4. `store_saved_user_context(Some(child_ctx))` on the child
 ///    thread's payload.
 ///
@@ -508,10 +498,21 @@ const TLS_REG_INDEX: usize = 2;
 #[cfg(not(target_arch = "loongarch64"))]
 const TLS_REG_INDEX: usize = 4;
 
+/// Register index for the stack pointer (`sp` on RV64 = x2,
+/// r3 on LoongArch64). Used to seed the child's sp when the
+/// userspace `clone(2)` `newsp` argument is non-zero (libc-style
+/// `clone(fn, stack, flags, arg, ...)` wraps push the fn/arg pair
+/// on the new stack and pass it through).
+#[cfg(target_arch = "loongarch64")]
+const STACK_REG_INDEX: usize = 3;
+#[cfg(not(target_arch = "loongarch64"))]
+const STACK_REG_INDEX: usize = 2;
+
 pub fn seed_child_leader_context(
     child_thread: &Cap<ThreadIdentity>,
     parent_user_ctx: &UserTrapContext,
     tls: usize,
+    stack: usize,
 ) {
     // (1) Clone the parent context.
     let mut child_ctx = *parent_user_ctx;
@@ -522,6 +523,25 @@ pub fn seed_child_leader_context(
     //     inherits the parent's value (preserved from the clone).
     if tls != 0 {
         child_ctx.regs[TLS_REG_INDEX] = tls;
+    }
+    // (3b) sp = stack: seed the stack pointer when the syscall's
+    //     `newsp` argument is non-zero. Linux `clone(2)`: a non-zero
+    //     `newsp` means "the child enters userspace with sp = newsp"
+    //     (the libc clone wrapper has already pushed `fn`/`arg` to
+    //     that stack); a zero `newsp` means "the child shares the
+    //     parent's sp" (bare fork convention).
+    //
+    //     Also seed the frame pointer (s0/x8) to the same value.
+    //     zig cc's musl __clone wrapper uses s0-relative addressing
+    //     (sd a0, -64(s0); ld a0, -64(s0)) in the post-ecall path
+    //     shared by parent and child.  s0 inherits the parent's frame
+    //     pointer from the trap context; if the child stack is
+    //     smaller, the s0-relative store/load lands outside the
+    //     child's allocation → load page fault → SIGSEGV.
+    if stack != 0 {
+        child_ctx.regs[STACK_REG_INDEX] = stack;
+        // x8 = s0 = fp (frame pointer) on RV64
+        child_ctx.regs[8] = stack;
     }
     // (4) PC already points past `ecall`: the trap shell
     // (`tx-kernel::trap_handoff::hand_off_syscall`) added the 4-byte
@@ -538,7 +558,7 @@ pub fn seed_child_leader_context(
     // for an applet) place a `mv` or load between the ecall and the
     // branch, and the +4 turns into a wild PC.
 
-    // (5) Store on the leader thread's payload. payload_cap == None
+    // (6) Store on the leader thread's payload. payload_cap == None
     // here means a freshly forked thread already lost its payload,
     // which is a kernel-invariant violation: step_fork's post-condition
     // is exactly that the child leader is live-with-payload.
@@ -546,6 +566,32 @@ pub fn seed_child_leader_context(
         .payload_cap()
         .expect("seed_child_leader_context: fresh child thread missing payload");
     payload.store_saved_user_context(Some(child_ctx));
+}
+
+/// Create a new thread within an existing process (clone(2) with
+/// CLONE_THREAD).
+pub fn step_clone_thread(
+    process: &Cap<ProcessIdentity>,
+    parent_user_ctx: &UserTrapContext,
+    stack: usize,
+    tls: usize,
+    ctid_ptr: u64,
+) -> Result<Cap<ThreadIdentity>, ZoneError> {
+    let tid = allocate_tid();
+    let child = sign_thread(process.downgrade(), tid)?;
+    register_tid(child.tid, child.clone());
+    seed_child_leader_context(&child, parent_user_ctx, tls, stack);
+    if ctid_ptr != 0 {
+        let payload = child
+            .payload_cap()
+            .expect("step_clone_thread: fresh child missing payload");
+        *payload.clear_child_tid.lock() = Some(ctid_ptr);
+    }
+    if let Some(proc_payload) = process.payload.lock().as_ref() {
+        proc_payload.threads.attach(child.clone());
+        proc_payload.thread_count.fetch_add(1, Ordering::AcqRel);
+    }
+    Ok(child)
 }
 
 /// Exit the entire thread group: zombify every thread, drop the
@@ -560,6 +606,9 @@ pub fn seed_child_leader_context(
 /// Open Q #3 DECIDED 2026-05-06.)
 pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     // observe
+    if let Some(payload) = process.payload.lock().as_ref() {
+        payload.notify_vfork_done();
+    }
     // upgrade
     // reserve
     // commit
@@ -570,11 +619,16 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
 
     let mut payload_guard = process.payload.lock();
     if let Some(payload) = payload_guard.as_ref() {
+        let _shm_detach =
+            crate::ipc::sysv_shm::execution::detach_all_for_aspace(&payload.aspace_cap());
+        let _closed_fds = payload.drain_fds();
         let drained: Vec<Cap<ThreadIdentity>> = payload.threads.drain();
         for thread in &drained {
             set_thread_zombie(thread, status.wait_status_word());
+            unregister_pid_number(thread.tid.0 as u64);
         }
-        // `drained` drops here, releasing the strong refs on each thread.
+        // `_closed_fds` and `drained` drop here, releasing open-file and
+        // thread refs before the payload is detached below.
     }
     *payload_guard = None;
     drop(payload_guard);
@@ -610,7 +664,13 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
     session_leader_hangup_cascade(process);
     sever_children(process);
     *process.exit_status.lock() = Some(status);
-    *process.payload.lock() = None;
+    let mut payload_guard = process.payload.lock();
+    if let Some(payload) = payload_guard.as_ref() {
+        let _shm_detach =
+            crate::ipc::sysv_shm::execution::detach_all_for_aspace(&payload.aspace_cap());
+        let _closed_fds = payload.drain_fds();
+    }
+    *payload_guard = None;
     post_sigchld_to_parent(process);
 }
 
@@ -1037,6 +1097,7 @@ fn sign_process_identity(
 fn sign_process_payload(
     aspace: Cap<AddressSpace>,
     threads: Vec<Cap<ThreadIdentity>>,
+    nsproxy: Cap<crate::process::nsproxy::NsProxy>,
     cred: Cred,
     cwd: Option<Cap<crate::vfs::DEntry>>,
     fds: BTreeMap<u32, Cap<OpenFile>>,
@@ -1044,6 +1105,7 @@ fn sign_process_payload(
     brk_base: u64,
     current_brk: u64,
     umask: u16,
+    sig_actions: Arc<SigActionTable>,
 ) -> Result<PayloadCap<ProcessPayload>, ZoneError> {
     use crate::process::adapter::step_engine::AtomicSlot;
     use crate::process::adapter::step_engine::{RawPort, RawQueue};
@@ -1064,6 +1126,12 @@ fn sign_process_payload(
     let cred_slot: AtomicSlot<Cap<crate::cred::Cred>> = AtomicSlot::empty();
     cred_slot.store(Some(cred_cap));
 
+    // Namespace proxy slot — the caller provides the immutable
+    // namespace bundle (init nsproxy for bootstrap, parent clone for
+    // fork, or a new bundle for unshare).
+    let nsproxy_slot: AtomicSlot<Cap<crate::process::nsproxy::NsProxy>> = AtomicSlot::empty();
+    nsproxy_slot.store(Some(nsproxy));
+
     // Allocate a fresh `exit_source` Channel per `ProcessPayload` and
     // register it with the global wait-source resolver so async
     // awaiters can `wait_on_token` against the returned id without
@@ -1083,13 +1151,16 @@ fn sign_process_payload(
     let exit_wait_source = wait_routing::new_wait_source(exit_source_id);
 
     let cap = step_engine::sign(ProcessPayload {
-        aspace: aspace_slot,
+        frame: Frame {
+            vm: aspace_slot,
+            sig_actions,
+        },
         threads: ProcessThreads::from_vec(threads),
-        sig_actions: SigActionTable::new(),
         group_pending: PendingSignalQueue::new(),
         siginfo_slots: crate::signal::SigInfoSlots::new(),
         signal_port: RawPort::new(),
         cred: cred_slot,
+        nsproxy: nsproxy_slot,
         cwd: SpinMutex::new(cwd),
         fds: SpinMutex::new(fds),
         fd_cloexec: SpinMutex::new(fd_cloexec),
@@ -1118,8 +1189,10 @@ fn sign_process_payload(
     Ok(PayloadCap::from_cap(cap))
 }
 
-fn sign_thread(owner_proc: Weak<ProcessIdentity>) -> Result<Cap<ThreadIdentity>, ZoneError> {
-    let tid = allocate_tid();
+fn sign_thread(
+    owner_proc: Weak<ProcessIdentity>,
+    tid: Tid,
+) -> Result<Cap<ThreadIdentity>, ZoneError> {
     let payload_cap = step_engine::sign(ThreadPayload::fresh())?;
     let payload = PayloadCap::from_cap(payload_cap);
     step_engine::sign(ThreadIdentity {
@@ -1145,7 +1218,9 @@ fn sign_thread(owner_proc: Weak<ProcessIdentity>) -> Result<Cap<ThreadIdentity>,
 pub fn spawn_sibling_thread_for_test(
     target: &Cap<ProcessIdentity>,
 ) -> Result<Cap<ThreadIdentity>, ZoneError> {
-    let sibling = sign_thread(target.downgrade())?;
+    let tid = allocate_tid();
+    let sibling = sign_thread(target.downgrade(), tid)?;
+    register_tid(sibling.tid, sibling.clone());
     if let Some(payload) = target.payload.lock().as_ref() {
         payload.threads.attach(sibling.clone());
     }
@@ -1203,6 +1278,7 @@ impl<T: 'static> WeakObserveExt<T> for Weak<T> {
 pub struct ForkOp<'a, P: PmapIf> {
     pub parent: &'a Cap<ProcessIdentity>,
     pub clone_vm: bool,
+    pub clone_sighand: bool,
     pub _pmap: core::marker::PhantomData<P>,
 }
 
@@ -1210,7 +1286,11 @@ impl<'a, P: PmapIf, I: SubjectIdentity> StepOp<I> for ForkOp<'a, P> {
     type Output = Result<Cap<ProcessIdentity>, ForkError>;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(step_fork::<P>(self.parent, self.clone_vm))
+        StepOutcome::Done(step_fork::<P>(
+            self.parent,
+            self.clone_vm,
+            self.clone_sighand,
+        ))
     }
 }
 
@@ -1459,6 +1539,7 @@ impl StepOp<crate::process::ProcessIdentity> for DupOp {
             Some(f) => f,
             None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
         };
+        super::structure::incr_pipe_fd_ref(&file);
         let newfd = self.process.allocate_fd();
         let _ = self.process.set_fd(newfd, Some(file));
         self.process.set_fd_cloexec(newfd, false);
@@ -1494,6 +1575,7 @@ impl StepOp<crate::process::ProcessIdentity> for Dup3Op {
             Some(f) => f,
             None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
         };
+        super::structure::incr_pipe_fd_ref(&file);
         let _prev = self.process.install_fd(self.newfd, file);
         let want_cloexec = self.flags & O_CLOEXEC != 0;
         self.process.set_fd_cloexec(self.newfd, want_cloexec);
@@ -1554,6 +1636,7 @@ impl StepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {
         }
         let new_fd = self.process.allocate_fd_at_least(self.min);
         let file = self.process.fd(self.fd).unwrap();
+        super::structure::incr_pipe_fd_ref(&file);
         let _prev = self.process.install_fd(new_fd, file);
         self.process.set_fd_cloexec(new_fd, self.cloexec);
         StepOutcome::Done(new_fd)
@@ -1563,209 +1646,5 @@ impl StepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {
 impl OneShotStepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {}
 
 #[cfg(test)]
-mod step_op_wraps {
-    //! PR-2 StepOp wrap tests (process::execution scope).
-    //!
-    //! Each test exercises one `*Op` wrap end-to-end: build the op with
-    //! a fixture, drive `.step(&mut ScriptCtx)`, assert the outcome
-    //! variant shape. Coverage of the underlying step-fn semantics
-    //! lives in `process::tests`; the value here is the compile-check
-    //! plus a smoke that the wrap delegates with the expected arg
-    //! plumbing.
-    use super::*;
-    use crate::process::adapter::step_engine::{
-        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
-    };
-    use crate::process::structure::reset_pid_counter_for_test;
-    use crate::signal::Signum;
-    use crate::test_support::EPOCH_TEST_LOCK;
-    use crate::thread_runtime::structure::reset_tid_counter_for_test;
-    use crate::vm::{AddressSpace, TestPmap};
-    use crate::zones;
-    fn setup() -> std::sync::MutexGuard<'static, ()> {
-        let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        tx_test_support::init_host();
-        let _ = zones::register_all();
-        tx_test_support::drain_to_quiescence();
-        reset_pid_counter_for_test();
-        reset_tid_counter_for_test();
-        reset_init_process_for_test();
-        guard
-    }
-
-    fn fresh_aspace() -> Cap<AddressSpace> {
-        AddressSpace::new_cap_for_platform::<TestPmap>().expect("fresh aspace")
-    }
-
-    fn bootstrap() -> Cap<ProcessIdentity> {
-        bootstrap_init_process(fresh_aspace()).expect("bootstrap init")
-    }
-
-    #[test]
-    fn fork_op_delegates_to_step_fork() {
-        let _g = setup();
-        let parent = bootstrap();
-        let mut op = ForkOp::<TestPmap> {
-            parent: &parent,
-            clone_vm: false,
-            _pmap: core::marker::PhantomData,
-        };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        match outcome {
-            StepOutcome::Done(result) => {
-                let child = result.expect("step_fork should succeed");
-                assert_ne!(child.pid, parent.pid);
-            }
-            _ => panic!("expected Done(_), got non-Done outcome"),
-        }
-    }
-
-    #[test]
-    fn exit_group_op_delegates_to_step_exit_group() {
-        let _g = setup();
-        let parent = bootstrap();
-        let child = step_fork::<TestPmap>(&parent, false).expect("fork");
-        let mut op = ExitGroupOp {
-            process: &child,
-            status: ExitStatus::Exited(0),
-        };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        assert_eq!(outcome, StepOutcome::Done(()));
-        assert!(child.is_zombie());
-        assert_eq!(child.exit_status(), Some(ExitStatus::Exited(0)));
-    }
-
-    #[test]
-    fn exit_group_with_signal_op_delegates_to_step_exit_group_with_signal() {
-        let _g = setup();
-        let parent = bootstrap();
-        let child = step_fork::<TestPmap>(&parent, false).expect("fork");
-        let mut op = ExitGroupWithSignalOp {
-            process: &child,
-            sig: Signum::SIGKILL,
-        };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        assert_eq!(outcome, StepOutcome::Done(()));
-        assert!(child.is_zombie());
-        assert_eq!(
-            child.exit_status(),
-            Some(ExitStatus::Signaled(Signum::SIGKILL))
-        );
-    }
-
-    #[test]
-    fn waitpid_nohang_op_no_children_returns_echild() {
-        let _g = setup();
-        let parent = bootstrap();
-        let mut op = WaitpidNohangOp {
-            parent: &parent,
-            target: WaitTarget::Any,
-        };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        match outcome {
-            StepOutcome::Done(Err(WaitError::NoChildren)) => {}
-            other => panic!("expected Done(Err(NoChildren)), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn getcwd_op_returns_none_for_init_without_cwd() {
-        let _g = setup();
-        let parent = bootstrap();
-        let mut op = GetcwdOp { target: &parent };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        // init bootstrap leaves cwd unset, so step_getcwd returns None.
-        assert_eq!(outcome, StepOutcome::Done(None));
-    }
-
-    #[test]
-    fn setpgid_op_unimplemented_for_non_self_pgid() {
-        let _g = setup();
-        let parent = bootstrap();
-        // Day-1 only supports new_pgid == target.pid; anything else
-        // returns SetpgidError::Unimplemented. Use a value that is
-        // not the target's pid to exercise that arm deterministically.
-        let bogus = Pgid(parent.pid.0 + 999);
-        let mut op = SetpgidOp {
-            target: &parent,
-            new_pgid: bogus,
-        };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        match outcome {
-            StepOutcome::Err(v3_errno)
-                if Into::<crate::execution::Errno>::into(v3_errno)
-                    == crate::execution::Errno::ENOSYS => {}
-            other => panic!("expected Err(crate::execution::Errno::ENOSYS), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn setsid_op_delegates_to_step_setsid() {
-        let _g = setup();
-        let parent = bootstrap();
-        let child = step_fork::<TestPmap>(&parent, false).expect("fork");
-        let mut op = SetsidOp { target: &child };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        match outcome {
-            StepOutcome::Done(sid) => {
-                assert_eq!(sid.0, child.pid.0);
-            }
-            other => panic!("expected Done(Ok(sid)), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn close_cloexec_fds_op_is_noop_with_empty_set() {
-        let _g = setup();
-        let parent = bootstrap();
-        let mut op = CloseCloexecFdsOp { process: &parent };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        assert_eq!(outcome, StepOutcome::Done(()));
-        // Bootstrap leaves the CLOEXEC set empty; post-call it stays empty.
-        assert!(parent.fd_cloexec_snapshot().is_empty());
-    }
-
-    #[test]
-    fn reset_signal_dispositions_for_exec_op_runs_on_live_process() {
-        let _g = setup();
-        let parent = bootstrap();
-        let mut op = ResetSignalDispositionsForExecOp { process: &parent };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        assert_eq!(outcome, StepOutcome::Done(()));
-    }
-
-    #[test]
-    fn install_brk_for_exec_op_seeds_brk_base_and_current() {
-        let _g = setup();
-        let parent = bootstrap();
-        let new_base: u64 = 0x4000_0000;
-        let mut op = InstallBrkForExecOp {
-            process: &parent,
-            new_brk_base: new_base,
-        };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        assert_eq!(outcome, StepOutcome::Done(()));
-        let payload_guard = parent.payload.lock();
-        let payload = payload_guard.as_ref().expect("init payload live");
-        assert_eq!(
-            payload.brk_base.load(core::sync::atomic::Ordering::Acquire),
-            new_base
-        );
-        assert_eq!(
-            payload
-                .current_brk
-                .load(core::sync::atomic::Ordering::Acquire),
-            new_base
-        );
-    }
-}
+#[path = "step_op_wraps.rs"]
+mod step_op_wraps;

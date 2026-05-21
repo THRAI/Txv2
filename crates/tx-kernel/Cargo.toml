@@ -28,6 +28,11 @@ tx-shims = { path = "../tx-shims" }
 tx-substrate = { path = "../tx-substrate" }
 tx-test-support = { path = "../tx-test-support" }
 tx-subsystems = { path = "../tx-subsystems" }
+tx-services = { path = "../tx-services" }
+# Observation ring dump — `init/exec.rs` calls `tx_observe::dump_console_hex`
+# after the leader thread zombifies so a host-side `cargo xtask observe
+# extract` can recover the captured `.txtrace` blob from the serial log.
+tx-observe = { path = "../tx-observe" }
 
 [dev-dependencies]
 # `test-support` opens `tx_subsystems::cross_crate_test_support`, which
@@ -35,6 +40,13 @@ tx-subsystems = { path = "../tx-subsystems" }
 # slot (and pid/tid counters) between runs. The same mechanism is
 # already used by Phase 2a's syscall-dispatch tests in `tx-shims`.
 tx-subsystems = { path = "../tx-subsystems", features = ["test-support"] }
+tx-shims = { path = "../tx-shims", features = ["test-support"] }
+
+
+[features]
+# Enable the per-reactor-step epoch/guard diagnostic console prints.
+# Off by default; noisy and not needed in normal test runs.
+diag-epoch-guards = []
 
 [lib]
 path = "src/lib.rs"

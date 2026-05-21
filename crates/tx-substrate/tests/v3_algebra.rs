@@ -113,12 +113,15 @@ fn errno_mirrors_v4_catalog() {
     assert_eq!(cases.len(), 27);
     for errno in cases {
         match errno {
-            Errno::EACCES
+            Errno::E2BIG
+            | Errno::EACCES
             | Errno::EAGAIN
             | Errno::EBADF
             | Errno::EBUSY
             | Errno::EDQUOT
             | Errno::EEXIST
+            | Errno::EFBIG
+            | Errno::EIDRM
             | Errno::EFAULT
             | Errno::EINVAL
             | Errno::EIO

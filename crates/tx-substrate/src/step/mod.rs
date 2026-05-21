@@ -34,6 +34,7 @@ use crate::zone::Cap;
 /// similarly load-bearing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Errno {
+    E2BIG,
     EACCES,
     /// Resource temporarily unavailable. Surfaced by `O_NONBLOCK` I/O
     /// paths (e.g. fd-ops Wave 3 `pipe::step_read` / `step_write` with
@@ -50,6 +51,8 @@ pub enum Errno {
     EBUSY,
     EDQUOT,
     EEXIST,
+    EFBIG,
+    EIDRM,
     EFAULT,
     EINVAL,
     /// Interrupted system call (e.g. by signal delivery during a
@@ -88,6 +91,49 @@ pub enum Errno {
     ESPIPE,
     ESRCH,
     ESTALE,
+}
+
+impl Errno {
+    /// Linux ABI numeric value for this error code.
+    ///
+    /// Used by observation payloads (`PayloadStepOutcome::errno`,
+    /// `PayloadDriveEnd::errno`) so the trace daemon can decode the
+    /// kernel-internal `Errno` without importing tx-shims.
+    pub fn linux_i32(self) -> i32 {
+        match self {
+            Errno::E2BIG => 7,
+            Errno::EACCES => 13,
+            Errno::EAGAIN => 11,
+            Errno::EBADF => 9,
+            Errno::EBUSY => 16,
+            Errno::EDQUOT => 122,
+            Errno::EEXIST => 17,
+            Errno::EFAULT => 14,
+            Errno::EFBIG => 27,
+            Errno::EIDRM => 43,
+            Errno::EINVAL => 22,
+            Errno::EIO => 5,
+            Errno::EISDIR => 21,
+            Errno::ELOOP => 40,
+            Errno::ENAMETOOLONG => 36,
+            Errno::ENODEV => 19,
+            Errno::ENOEXEC => 8,
+            Errno::ENOMEM => 12,
+            Errno::ENOENT => 2,
+            Errno::ENOSYS => 38,
+            Errno::ENOTDIR => 20,
+            Errno::ENOTEMPTY => 39,
+            Errno::ENOTTY => 25,
+            Errno::EPERM => 1,
+            Errno::EPIPE => 32,
+            Errno::ERANGE => 34,
+            Errno::EROFS => 30,
+            Errno::ESPIPE => 29,
+            Errno::ESRCH => 3,
+            Errno::ESTALE => 116,
+            Errno::EINTR => 4,
+        }
+    }
 }
 
 /// Opaque wait-source handle. Replaces `tx_subsystems::execution::WaitToken`'s
@@ -249,6 +295,24 @@ pub trait StepProgress: Sized {
     /// progress across one or more `Continue` steps and surfaces
     /// that partial work instead of returning `EAGAIN`.
     fn into_output(self) -> Option<Self::Output>;
+
+    /// Observation wire tag for [`PayloadStepOutcome::progress_kind`].
+    ///
+    /// 0=NoProgress, 1=ByteProgress, 2=PageProgress, 3=EntryProgress,
+    /// 4=IoVecProgress. Default returns 0 (NoProgress).
+    #[inline]
+    fn trace_kind(&self) -> u8 {
+        0
+    }
+
+    /// Observation progress count for [`PayloadStepOutcome::progress_value`].
+    ///
+    /// Returns the accumulated count (bytes/pages/entries/iovecs) as a
+    /// saturating u32. Default returns 0.
+    #[inline]
+    fn trace_value(&self) -> u32 {
+        0
+    }
 }
 
 /// One-shot ops: open, mkdir, fork, dup, close, mmap-reservation, …
@@ -298,6 +362,12 @@ impl StepProgress for ByteProgress {
     }
     fn into_output(self) -> Option<usize> {
         Some(self.bytes)
+    }
+    fn trace_kind(&self) -> u8 {
+        1
+    }
+    fn trace_value(&self) -> u32 {
+        self.bytes.min(u32::MAX as usize) as u32
     }
 }
 
@@ -619,18 +689,36 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
         self.delegate_registry.as_ref()
     }
 
-    /// Low 32 bits of the subject's task trace identity.
+    /// Low 32 bits of the task's observation identity.
     ///
-    /// Delegates to `SubjectIdentity::task_id_low` on the subject's
-    /// process identity if a `SubjectContext` is populated; returns
-    /// `0` for empty (`None`) contexts (test / kernel-internal actors
-    /// with no subject wired in).
+    /// Resolution order:
+    /// 1. **Mailbox TID** — when a `TaskMailbox` is attached (production
+    ///    path: tx-kernel installs the thread's TID at
+    ///    `submit_task_with_meta` time via
+    ///    `InitialSchedMeta::with_task_id`). This is the per-thread
+    ///    identity; `PayloadDriveBegin` and `WaitSource::notify_emit`
+    ///    pick up the right TID rather than the thread-group PID.
+    /// 2. **Subject PID** — fallback for `ScriptCtx` instances built
+    ///    from a `SubjectContext` without a live mailbox (boot-time
+    ///    helpers, test scaffolding).
+    /// 3. **0** — empty `ScriptCtx` (kernel-internal actors without
+    ///    a subject or mailbox; documented "no identity" sentinel).
     ///
     /// Used by `drive` to populate `PayloadDriveBegin::task_id_low`
     /// (OBS-4 / γ-fix) so the daemon's `compute_flow_id` hashes the
     /// right identity.
     #[inline]
     pub fn task_id_low(&self) -> u32 {
+        // Mailbox TID wins when available — installed at task submit
+        // time (the only point at which per-thread identity is in
+        // scope). The subject context still carries the leader's PID,
+        // which is wrong for non-leader threads.
+        if let Some(mb) = self.mailbox.as_ref() {
+            let tid = mb.task_id_low();
+            if tid != 0 {
+                return tid;
+            }
+        }
         self.subject
             .as_ref()
             .map(|s| s.process().task_id_low())

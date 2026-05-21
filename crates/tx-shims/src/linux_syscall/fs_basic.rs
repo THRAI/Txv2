@@ -54,7 +54,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(Some(cloexec)) => SyscallResult::Return(if cloexec { FD_CLOEXEC as i64 } else { 0 }),
             Ok(None) => SyscallResult::Return(0),
-            Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
         };
     }
 
@@ -69,7 +69,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(new_fd) => SyscallResult::Return(new_fd as i64),
-                Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+                Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
             };
         }
         F_GETFL => {
@@ -78,7 +78,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             let f = match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(flags) => flags,
                 Err(v3errno) => {
-                    return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
+                    return SyscallResult::error_from(Errno::from(v3errno));
                 }
             };
             let mut bits: u64 = match (f.read, f.write) {
@@ -104,7 +104,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(()) => SyscallResult::Return(0),
-                Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+                Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
             }
         }
         _ => SyscallResult::Error(ENOSYS_VALUE),
@@ -160,14 +160,6 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     mode: u32,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
-    // Wave 2 slice: AT_FDCWD only. Real dirfd-relative resolution
-    // requires directory file descriptors — the slice's fd table
-    // doesn't carry them yet. (TODO(phase-dirfd): mirror Wave 4
-    // Part 4's `resolve_path_at` once dirfds land.)
-    if dirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
-
     // Bounded inline copy of the user path. Same `EXECVE_PATH_MAX = 4096`
     // budget as the existing `execve` / `fchmodat` arms (and matches
     // Linux's `PATH_MAX`). Empty paths surface as `-ENOENT` from the
@@ -196,14 +188,26 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         nonblocking: flags & O_NONBLOCK != 0,
     };
 
-    // Resolve the cwd anchor. Zombies + uninitialised init pre-rootfs
-    // both surface `cwd() == None`; the alive caller of `openat` always
-    // has a cwd installed by `step_chdir` / bootstrap. No-cwd is a
-    // defensive `-ENOENT` (matches Linux's "no such directory" shape
-    // for an unreachable cwd).
-    let cwd: Cap<DEntry> = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
+    // Resolve the dirfd anchor. AT_FDCWD → process cwd; a real dirfd
+    // → the `opendir_dentry` of its OpenFile (an O_DIRECTORY open of
+    // that directory). Invalid / non-directory fds surface as EBADF /
+    // ENOTDIR.
+    let cwd: Cap<DEntry> = if dirfd == AT_FDCWD {
+        match ctx.process.cwd() {
+            Some(d) => d,
+            None => return SyscallResult::Error(ENOENT_VALUE),
+        }
+    } else if dirfd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    } else {
+        let open_file = match ctx.process.fd(dirfd as u32) {
+            Some(f) => f,
+            None => return SyscallResult::Error(EBADF_VALUE),
+        };
+        match open_file.opendir_dentry() {
+            Some(d) => d,
+            None => return SyscallResult::Error(ENOTDIR_VALUE),
+        }
     };
 
     let walker_cred = ctx.walker_cred();
@@ -236,7 +240,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         {
             Ok(file) => file,
             Err(v3errno) => {
-                return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
+                return SyscallResult::error_from(Errno::from(v3errno));
             }
         };
         let fd = ctx.process.allocate_fd();
@@ -292,7 +296,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
                 Err(e) => return SyscallResult::Error(e),
             }
         }
-        V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
     };
 
     // Step 2: O_TRUNC. Apply *before* materialising the OpenFile so
@@ -318,7 +322,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
                     return SyscallResult::Error(EIO_VALUE);
                 }
                 V3Trunc::Err(errno) => {
-                    return SyscallResult::Error(errno_to_i32(Errno::from(errno)));
+                    return SyscallResult::error_from(Errno::from(errno));
                 }
             }
         }
@@ -343,7 +347,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
 
@@ -384,7 +388,7 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -404,7 +408,7 @@ pub(super) fn sys_dup<'a>(oldfd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(newfd) => SyscallResult::Return(newfd as i64),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -439,7 +443,7 @@ pub(super) fn sys_dup3<'a>(
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(fd) => SyscallResult::Return(fd as i64),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -492,7 +496,7 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(pair) => pair,
             Err(v3errno) => {
-                return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
+                return SyscallResult::error_from(Errno::from(v3errno));
             }
         }
     };
@@ -517,7 +521,7 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
     if let Err(errno) =
         bootstrap_write_user::<[u32; 2]>(&ctx.aspace, pipefd_uaddr, [reader_fd, writer_fd])
     {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
 
     SyscallResult::Return(0)
@@ -555,7 +559,7 @@ pub(super) fn sys_lseek<'a>(
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(new_offset) => SyscallResult::Return(new_offset as i64),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -656,7 +660,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             super::numbers::UFFDIO_CONTINUE => {
                 super::userfaultfd::step_uffdio_continue(&file, argp, ctx)
             }
-            _ => SyscallResult::Error(errno_to_i32(Errno::EINVAL)),
+            _ => SyscallResult::error_from(Errno::EINVAL),
         };
     }
 
@@ -667,7 +671,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         RNodeBacking::StructBacked {
             payload: StructPayload::Tty(tty),
         } => tty.clone(),
-        _ => return SyscallResult::Error(errno_to_i32(Errno::ENOTTY)),
+        _ => return SyscallResult::error_from(Errno::ENOTTY),
     };
 
     // v3 step_ioctl_* return Done/Err only in practice; helper to
@@ -694,11 +698,11 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                     }
                     if let Err(errno) = bootstrap_write_user::<Termios>(&ctx.aspace, argp, termios)
                     {
-                        return SyscallResult::Error(errno_to_i32(errno));
+                        return SyscallResult::error_from(errno);
                     }
                     SyscallResult::Return(0)
                 }
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         TCSETS | TCSETSW | TCSETSF => {
@@ -712,7 +716,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             // output queue.
             let new_termios: Termios = match bootstrap_read_user::<Termios>(&ctx.aspace, argp) {
                 Ok(v) => v,
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => return SyscallResult::error_from(errno),
             };
             let outcome = {
                 let guard = step_engine::guard();
@@ -720,7 +724,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             match unwrap_v3(outcome) {
                 Ok(_) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         TIOCGPGRP => {
@@ -734,11 +738,11 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
                     if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, argp, pgid) {
-                        return SyscallResult::Error(errno_to_i32(errno));
+                        return SyscallResult::error_from(errno);
                     }
                     SyscallResult::Return(0)
                 }
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         TIOCSPGRP => {
@@ -747,7 +751,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             }
             let new_pgrp: u32 = match bootstrap_read_user::<u32>(&ctx.aspace, argp) {
                 Ok(v) => v,
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => return SyscallResult::error_from(errno),
             };
             let caller = make_ioctl_caller(ctx);
             let outcome = {
@@ -756,7 +760,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             match unwrap_v3(outcome) {
                 Ok(_) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         TIOCGWINSZ => {
@@ -770,11 +774,11 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
                     if let Err(errno) = bootstrap_write_user::<Winsize>(&ctx.aspace, argp, ws) {
-                        return SyscallResult::Error(errno_to_i32(errno));
+                        return SyscallResult::error_from(errno);
                     }
                     SyscallResult::Return(0)
                 }
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         TIOCSWINSZ => {
@@ -783,7 +787,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             }
             let ws: Winsize = match bootstrap_read_user::<Winsize>(&ctx.aspace, argp) {
                 Ok(v) => v,
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => return SyscallResult::error_from(errno),
             };
             let outcome = {
                 let guard = step_engine::guard();
@@ -791,7 +795,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             match unwrap_v3(outcome) {
                 Ok(_) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         TIOCSCTTY => {
@@ -809,7 +813,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             match unwrap_v3(outcome) {
                 Ok(_) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         TIOCNOTTY => {
@@ -820,7 +824,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             match unwrap_v3(outcome) {
                 Ok(_) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         // Unknown ioctl request → -ENOTTY (the POSIX `man ioctl_tty`
@@ -828,7 +832,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         // hits this arm, but other libc paths (or buggy userspace)
         // observing -ENOTTY here is the canonical Linux signal that
         // the request is not a terminal ioctl on this fd.
-        _ => SyscallResult::Error(errno_to_i32(Errno::ENOTTY)),
+        _ => SyscallResult::error_from(Errno::ENOTTY),
     }
 }
 
@@ -898,11 +902,389 @@ const _: () = assert!(core::mem::size_of::<StatxLayout>() == 256);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct StatfsLayout {
+    f_type: u64,
+    f_bsize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_namelen: u64,
+    f_frsize: u64,
+    f_flags: u64,
+    f_spare: [u64; 4],
+}
+
+const _: () = assert!(core::mem::size_of::<StatfsLayout>() == 120);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct LinuxDirent64Header {
     d_ino: u64,
     d_off: i64,
     d_reclen: u16,
     d_type: u8,
+}
+
+pub(super) mod layout_descriptors {
+    use core::mem::{align_of, offset_of, size_of};
+
+    pub(super) use super::{
+        LinuxDirent64Header, StatLayout, StatfsLayout, StatxLayout, StatxTimestamp,
+    };
+    use crate::linux_syscall::{KernelToUserLayout, KernelUserField, KernelUserLayout};
+
+    impl KernelToUserLayout for StatLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "StatLayout",
+            musl_header: "sys/stat.h",
+            musl_type: "struct stat",
+            size: size_of::<StatLayout>(),
+            align: align_of::<StatLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "st_dev",
+                    musl: "st_dev",
+                    offset: offset_of!(StatLayout, st_dev),
+                },
+                KernelUserField {
+                    rust: "st_ino",
+                    musl: "st_ino",
+                    offset: offset_of!(StatLayout, st_ino),
+                },
+                KernelUserField {
+                    rust: "st_mode",
+                    musl: "st_mode",
+                    offset: offset_of!(StatLayout, st_mode),
+                },
+                KernelUserField {
+                    rust: "st_nlink",
+                    musl: "st_nlink",
+                    offset: offset_of!(StatLayout, st_nlink),
+                },
+                KernelUserField {
+                    rust: "st_uid",
+                    musl: "st_uid",
+                    offset: offset_of!(StatLayout, st_uid),
+                },
+                KernelUserField {
+                    rust: "st_gid",
+                    musl: "st_gid",
+                    offset: offset_of!(StatLayout, st_gid),
+                },
+                KernelUserField {
+                    rust: "st_rdev",
+                    musl: "st_rdev",
+                    offset: offset_of!(StatLayout, st_rdev),
+                },
+                KernelUserField {
+                    rust: "st_size",
+                    musl: "st_size",
+                    offset: offset_of!(StatLayout, st_size),
+                },
+                KernelUserField {
+                    rust: "st_blksize",
+                    musl: "st_blksize",
+                    offset: offset_of!(StatLayout, st_blksize),
+                },
+                KernelUserField {
+                    rust: "st_blocks",
+                    musl: "st_blocks",
+                    offset: offset_of!(StatLayout, st_blocks),
+                },
+                KernelUserField {
+                    rust: "st_atime_sec",
+                    musl: "st_atim.tv_sec",
+                    offset: offset_of!(StatLayout, st_atime_sec),
+                },
+                KernelUserField {
+                    rust: "st_atime_nsec",
+                    musl: "st_atim.tv_nsec",
+                    offset: offset_of!(StatLayout, st_atime_nsec),
+                },
+                KernelUserField {
+                    rust: "st_mtime_sec",
+                    musl: "st_mtim.tv_sec",
+                    offset: offset_of!(StatLayout, st_mtime_sec),
+                },
+                KernelUserField {
+                    rust: "st_mtime_nsec",
+                    musl: "st_mtim.tv_nsec",
+                    offset: offset_of!(StatLayout, st_mtime_nsec),
+                },
+                KernelUserField {
+                    rust: "st_ctime_sec",
+                    musl: "st_ctim.tv_sec",
+                    offset: offset_of!(StatLayout, st_ctime_sec),
+                },
+                KernelUserField {
+                    rust: "st_ctime_nsec",
+                    musl: "st_ctim.tv_nsec",
+                    offset: offset_of!(StatLayout, st_ctime_nsec),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const STAT_LAYOUT: KernelUserLayout =
+        <StatLayout as KernelToUserLayout>::LAYOUT;
+
+    impl KernelToUserLayout for StatxTimestamp {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "StatxTimestamp",
+            musl_header: "sys/stat.h",
+            musl_type: "struct statx_timestamp",
+            size: size_of::<StatxTimestamp>(),
+            align: align_of::<StatxTimestamp>(),
+            fields: &[
+                KernelUserField {
+                    rust: "tv_sec",
+                    musl: "tv_sec",
+                    offset: offset_of!(StatxTimestamp, tv_sec),
+                },
+                KernelUserField {
+                    rust: "tv_nsec",
+                    musl: "tv_nsec",
+                    offset: offset_of!(StatxTimestamp, tv_nsec),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const STATX_TIMESTAMP_LAYOUT: KernelUserLayout =
+        <StatxTimestamp as KernelToUserLayout>::LAYOUT;
+
+    impl KernelToUserLayout for StatxLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "StatxLayout",
+            musl_header: "sys/stat.h",
+            musl_type: "struct statx",
+            size: size_of::<StatxLayout>(),
+            align: align_of::<StatxLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "stx_mask",
+                    musl: "stx_mask",
+                    offset: offset_of!(StatxLayout, stx_mask),
+                },
+                KernelUserField {
+                    rust: "stx_blksize",
+                    musl: "stx_blksize",
+                    offset: offset_of!(StatxLayout, stx_blksize),
+                },
+                KernelUserField {
+                    rust: "stx_attributes",
+                    musl: "stx_attributes",
+                    offset: offset_of!(StatxLayout, stx_attributes),
+                },
+                KernelUserField {
+                    rust: "stx_nlink",
+                    musl: "stx_nlink",
+                    offset: offset_of!(StatxLayout, stx_nlink),
+                },
+                KernelUserField {
+                    rust: "stx_uid",
+                    musl: "stx_uid",
+                    offset: offset_of!(StatxLayout, stx_uid),
+                },
+                KernelUserField {
+                    rust: "stx_gid",
+                    musl: "stx_gid",
+                    offset: offset_of!(StatxLayout, stx_gid),
+                },
+                KernelUserField {
+                    rust: "stx_mode",
+                    musl: "stx_mode",
+                    offset: offset_of!(StatxLayout, stx_mode),
+                },
+                KernelUserField {
+                    rust: "stx_ino",
+                    musl: "stx_ino",
+                    offset: offset_of!(StatxLayout, stx_ino),
+                },
+                KernelUserField {
+                    rust: "stx_size",
+                    musl: "stx_size",
+                    offset: offset_of!(StatxLayout, stx_size),
+                },
+                KernelUserField {
+                    rust: "stx_blocks",
+                    musl: "stx_blocks",
+                    offset: offset_of!(StatxLayout, stx_blocks),
+                },
+                KernelUserField {
+                    rust: "stx_attributes_mask",
+                    musl: "stx_attributes_mask",
+                    offset: offset_of!(StatxLayout, stx_attributes_mask),
+                },
+                KernelUserField {
+                    rust: "stx_atime",
+                    musl: "stx_atime",
+                    offset: offset_of!(StatxLayout, stx_atime),
+                },
+                KernelUserField {
+                    rust: "stx_btime",
+                    musl: "stx_btime",
+                    offset: offset_of!(StatxLayout, stx_btime),
+                },
+                KernelUserField {
+                    rust: "stx_ctime",
+                    musl: "stx_ctime",
+                    offset: offset_of!(StatxLayout, stx_ctime),
+                },
+                KernelUserField {
+                    rust: "stx_mtime",
+                    musl: "stx_mtime",
+                    offset: offset_of!(StatxLayout, stx_mtime),
+                },
+                KernelUserField {
+                    rust: "stx_rdev_major",
+                    musl: "stx_rdev_major",
+                    offset: offset_of!(StatxLayout, stx_rdev_major),
+                },
+                KernelUserField {
+                    rust: "stx_rdev_minor",
+                    musl: "stx_rdev_minor",
+                    offset: offset_of!(StatxLayout, stx_rdev_minor),
+                },
+                KernelUserField {
+                    rust: "stx_dev_major",
+                    musl: "stx_dev_major",
+                    offset: offset_of!(StatxLayout, stx_dev_major),
+                },
+                KernelUserField {
+                    rust: "stx_dev_minor",
+                    musl: "stx_dev_minor",
+                    offset: offset_of!(StatxLayout, stx_dev_minor),
+                },
+                KernelUserField {
+                    rust: "stx_mnt_id",
+                    musl: "stx_mnt_id",
+                    offset: offset_of!(StatxLayout, stx_mnt_id),
+                },
+                KernelUserField {
+                    rust: "stx_dio_mem_align",
+                    musl: "stx_dio_mem_align",
+                    offset: offset_of!(StatxLayout, stx_dio_mem_align),
+                },
+                KernelUserField {
+                    rust: "stx_dio_offset_align",
+                    musl: "stx_dio_offset_align",
+                    offset: offset_of!(StatxLayout, stx_dio_offset_align),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const STATX_LAYOUT: KernelUserLayout =
+        <StatxLayout as KernelToUserLayout>::LAYOUT;
+
+    impl KernelToUserLayout for StatfsLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "StatfsLayout",
+            musl_header: "sys/statfs.h",
+            musl_type: "struct statfs",
+            size: size_of::<StatfsLayout>(),
+            align: align_of::<StatfsLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "f_type",
+                    musl: "f_type",
+                    offset: offset_of!(StatfsLayout, f_type),
+                },
+                KernelUserField {
+                    rust: "f_bsize",
+                    musl: "f_bsize",
+                    offset: offset_of!(StatfsLayout, f_bsize),
+                },
+                KernelUserField {
+                    rust: "f_blocks",
+                    musl: "f_blocks",
+                    offset: offset_of!(StatfsLayout, f_blocks),
+                },
+                KernelUserField {
+                    rust: "f_bfree",
+                    musl: "f_bfree",
+                    offset: offset_of!(StatfsLayout, f_bfree),
+                },
+                KernelUserField {
+                    rust: "f_bavail",
+                    musl: "f_bavail",
+                    offset: offset_of!(StatfsLayout, f_bavail),
+                },
+                KernelUserField {
+                    rust: "f_files",
+                    musl: "f_files",
+                    offset: offset_of!(StatfsLayout, f_files),
+                },
+                KernelUserField {
+                    rust: "f_ffree",
+                    musl: "f_ffree",
+                    offset: offset_of!(StatfsLayout, f_ffree),
+                },
+                KernelUserField {
+                    rust: "f_fsid",
+                    musl: "f_fsid",
+                    offset: offset_of!(StatfsLayout, f_fsid),
+                },
+                KernelUserField {
+                    rust: "f_namelen",
+                    musl: "f_namelen",
+                    offset: offset_of!(StatfsLayout, f_namelen),
+                },
+                KernelUserField {
+                    rust: "f_frsize",
+                    musl: "f_frsize",
+                    offset: offset_of!(StatfsLayout, f_frsize),
+                },
+                KernelUserField {
+                    rust: "f_flags",
+                    musl: "f_flags",
+                    offset: offset_of!(StatfsLayout, f_flags),
+                },
+                KernelUserField {
+                    rust: "f_spare",
+                    musl: "f_spare",
+                    offset: offset_of!(StatfsLayout, f_spare),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const STATFS_LAYOUT: KernelUserLayout =
+        <StatfsLayout as KernelToUserLayout>::LAYOUT;
+
+    impl KernelToUserLayout for LinuxDirent64Header {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "LinuxDirent64Header",
+            musl_header: "dirent.h",
+            musl_type: "struct dirent",
+            size: size_of::<LinuxDirent64Header>(),
+            align: align_of::<LinuxDirent64Header>(),
+            fields: &[
+                KernelUserField {
+                    rust: "d_ino",
+                    musl: "d_ino",
+                    offset: offset_of!(LinuxDirent64Header, d_ino),
+                },
+                KernelUserField {
+                    rust: "d_off",
+                    musl: "d_off",
+                    offset: offset_of!(LinuxDirent64Header, d_off),
+                },
+                KernelUserField {
+                    rust: "d_reclen",
+                    musl: "d_reclen",
+                    offset: offset_of!(LinuxDirent64Header, d_reclen),
+                },
+                KernelUserField {
+                    rust: "d_type",
+                    musl: "d_type",
+                    offset: offset_of!(LinuxDirent64Header, d_type),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const LINUX_DIRENT64_HEADER_LAYOUT: KernelUserLayout =
+        <LinuxDirent64Header as KernelToUserLayout>::LAYOUT;
 }
 
 /// Map an `InodeMeta` + (`fs_object_id`, `rdev`) pair onto the Linux
@@ -970,6 +1352,37 @@ fn inode_meta_to_statx(meta: &InodeMeta, ino: u64) -> StatxLayout {
     }
 }
 
+fn stat_meta_for_open_file(file: &Cap<OpenFile>) -> InodeMeta {
+    let rnode = file.rnode();
+    let fs_object_id = rnode.fs_object_id();
+    // Live size resolution: cached `rnode.meta()` is the snapshot at
+    // materialisation time and doesn't see in-place writes. For a
+    // page-backed regular file the in-memory `PageContainer.size_bytes`
+    // is the authoritative live size (`step_write_from_*` calls
+    // `pc.grow_size_to` on every write). Fall back to
+    // `fs_ops.load_inode_meta` for other rnode kinds, then to the
+    // cached meta. Without this, oscomp basic test_mmap/test_munmap
+    // print `file len: 0` and crash on the 0-length mmap because
+    // tmpfs/ext4's on-disk inode metadata is never refreshed after
+    // the page-cache write.
+    let mut meta = match fs_ops_for_rnode(rnode) {
+        Some(fs_ops) => {
+            let guard = step_engine::guard();
+            match fs_ops.load_inode_meta(fs_object_id, &guard) {
+                StepOutcome::Done(m) => m,
+                _ => rnode.meta(),
+            }
+        }
+        None => rnode.meta(),
+    };
+    if let Some(sz) =
+        crate::linux_syscall::vm::extract_page_container(file).map(|pc| pc.size_bytes())
+    {
+        meta.size = sz;
+    }
+    meta
+}
+
 /// `fstat(fd, statbuf)`. Linux RV64 generic ABI `__NR_fstat = 80`.
 ///
 /// Reads `OpenFile.rnode().meta()` for the fd and writes the Linux
@@ -996,12 +1409,13 @@ pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     };
 
     let rnode = file.rnode();
-    let meta = rnode.meta();
-    let ino = rnode.fs_object_id().as_u64();
+    let fs_object_id = rnode.fs_object_id();
+    let meta = stat_meta_for_open_file(&file);
+    let ino = fs_object_id.as_u64();
     let stat = inode_meta_to_stat(&meta, ino, 0);
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
 }
@@ -1028,10 +1442,11 @@ pub(super) async fn sys_fchdir<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
 /// `__NR_statx = 291`.
 ///
 /// This is the metadata probe LA64 musl/busybox uses before `ls`
-/// opens a directory. Txv2 reports the same inode metadata already
-/// used by `newfstatat`; unsupported sync policy bits are accepted
-/// because there is no cache coherency distinction in the current VFS
-/// layer.
+/// opens a directory and, on LA64 musl, for some `fstat(fd)` wrappers
+/// via `statx(fd, "", AT_EMPTY_PATH, ...)`. Txv2 reports the same
+/// inode metadata already used by `newfstatat`; unsupported sync
+/// policy bits are accepted because there is no cache coherency
+/// distinction in the current VFS layer.
 pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
@@ -1039,9 +1454,6 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let _mask = args[3] as u32;
     let statxbuf_uaddr = args[4];
 
-    if dirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
     if path_uaddr == 0 || statxbuf_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
@@ -1064,13 +1476,34 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         None => return SyscallResult::Error(ENOENT_VALUE),
     };
     let (statx_result, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
-        (
-            StatxResult {
-                meta: cwd.rnode().meta(),
-            },
-            cwd.rnode().fs_object_id(),
-        )
+        if dirfd == AT_FDCWD {
+            (
+                StatxResult {
+                    meta: cwd.rnode().meta(),
+                },
+                cwd.rnode().fs_object_id(),
+            )
+        } else {
+            let fd = dirfd;
+            if fd < 0 {
+                return SyscallResult::Error(EBADF_VALUE);
+            }
+            let file = match resolve_fd(&ctx.process, fd as u32) {
+                Some(f) => f,
+                None => return SyscallResult::Error(EBADF_VALUE),
+            };
+            let rnode = file.rnode();
+            (
+                StatxResult {
+                    meta: stat_meta_for_open_file(&file),
+                },
+                rnode.fs_object_id(),
+            )
+        }
     } else {
+        if dirfd != AT_FDCWD {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
         let walker_cred = ctx.walker_cred();
         let result = {
             let mut script_ctx = build_subject_script_ctx(ctx);
@@ -1084,13 +1517,13 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         };
         match result {
             Ok((sr, id)) => (sr, id),
-            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
 
     let statx = inode_meta_to_statx(&statx_result.meta, ino.as_u64());
     if let Err(errno) = bootstrap_write_user::<StatxLayout>(&ctx.aspace, statxbuf_uaddr, statx) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
 }
@@ -1099,9 +1532,10 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// `__NR_newfstatat = 79`.
 ///
 /// Slice 6 surface:
-/// - `dirfd == AT_FDCWD` only; non-cwd dirfds → `-EBADF`.
-/// - `flags & AT_EMPTY_PATH` paired with empty path stats the cwd
-///   directly (no walker invocation).
+/// - `dirfd == AT_FDCWD` for path walks; non-cwd dirfds → `-EBADF`.
+/// - `flags & AT_EMPTY_PATH` paired with empty path stats either the
+///   cwd (`AT_FDCWD`) or the supplied fd. LA64 musl uses this fd form
+///   to implement `fstat(fd)`.
 /// - `flags & AT_SYMLINK_NOFOLLOW` is accepted but ignored (the
 ///   walker always follows symlinks today; documented carryover).
 /// - `flags & AT_NO_AUTOMOUNT` is accepted but ignored (no
@@ -1116,9 +1550,6 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     let statbuf_uaddr = args[2];
     let flags = args[3] as u32;
 
-    if dirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
     if statbuf_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
@@ -1141,15 +1572,24 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 
     let walker_cred = ctx.walker_cred();
 
-    // AT_EMPTY_PATH + empty path: stat the cwd itself directly,
-    // bypassing the walker. Otherwise use StatOp + drive_oneshot.
+    // AT_EMPTY_PATH + empty path: stat the cwd itself for AT_FDCWD,
+    // or mirror fstat(fd) for a real fd. Otherwise use StatOp +
+    // drive_oneshot from cwd; directory-fd path walks remain out of
+    // scope for this slice.
     let cwd = match ctx.process.cwd() {
         Some(d) => d,
         None => return SyscallResult::Error(ENOENT_VALUE),
     };
     let (meta, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
-        (cwd.rnode().meta(), cwd.rnode().fs_object_id())
+        if dirfd == AT_FDCWD {
+            (cwd.rnode().meta(), cwd.rnode().fs_object_id())
+        } else {
+            return sys_fstat([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx);
+        }
     } else {
+        if dirfd != AT_FDCWD {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
         let result = {
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = StatOp {
@@ -1162,14 +1602,14 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         };
         match result {
             Ok((m, id)) => (m, id),
-            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
 
     let stat = inode_meta_to_stat(&meta, ino.as_u64(), 0);
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
 }
@@ -1299,7 +1739,7 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
                     if written > 0 {
                         return SyscallResult::Return(written as i64);
                     }
-                    return SyscallResult::Error(errno_to_i32(errno));
+                    return SyscallResult::error_from(errno);
                 }
                 written += total_len;
                 cursor = next_cursor;
@@ -1324,7 +1764,7 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
                 if written > 0 {
                     return SyscallResult::Return(written as i64);
                 }
-                return SyscallResult::Error(errno_to_i32(Errno::from(errno)));
+                return SyscallResult::error_from(Errno::from(errno));
             }
         }
     }
@@ -1359,13 +1799,22 @@ pub(super) fn fs_ops_for_rnode(
 pub(super) async fn sys_statfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let buf_uaddr = args[1];
-    let mut buf = [0u8; 120];
-    buf[0..8].copy_from_slice(&0x01021994u64.to_le_bytes());
-    buf[8..16].copy_from_slice(&4096u64.to_le_bytes());
-    buf[88..96].copy_from_slice(&255u64.to_le_bytes());
-    buf[96..104].copy_from_slice(&4096u64.to_le_bytes());
-    if let Err(e) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &buf) {
-        return SyscallResult::Error(errno_to_i32(e));
+    let statfs = StatfsLayout {
+        f_type: 0x0102_1994,
+        f_bsize: 4096,
+        f_blocks: 0,
+        f_bfree: 0,
+        f_bavail: 0,
+        f_files: 0,
+        f_ffree: 0,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: 4096,
+        f_flags: 0,
+        f_spare: [0; 4],
+    };
+    if let Err(e) = bootstrap_write_user::<StatfsLayout>(&ctx.aspace, buf_uaddr, statfs) {
+        return SyscallResult::error_from(e);
     }
     SyscallResult::Return(0)
 }
@@ -1408,7 +1857,7 @@ pub(super) async fn sys_syncfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
     // to `fsync_file(ROOT)`; journaling filesystems can override.
     match page_backing.sync_filesystem(&guard) {
         StepOutcome::Done(()) => SyscallResult::Return(0),
-        StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(Errno::from(e))),
+        StepOutcome::Err(e) => SyscallResult::error_from(Errno::from(e)),
         _ => SyscallResult::Error(EIO_VALUE),
     }
 }
@@ -1458,7 +1907,7 @@ pub(super) async fn sys_fsync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -1511,6 +1960,6 @@ pub(super) async fn sys_flock<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }

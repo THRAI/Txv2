@@ -72,7 +72,7 @@ fn wait_event_rechecks_after_register_before_parking() {
     let checks = Arc::new(AtomicUsize::new(0));
     let outcome = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = {
         let channel = channel.clone();
         let checks = Arc::clone(&checks);
@@ -111,7 +111,7 @@ fn wait_event_treats_wake_as_retry_signal_only() {
     let condition_checks = Arc::new(AtomicUsize::new(0));
     let outcome = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = {
         let channel = channel.clone();
         let condition_ready = Arc::clone(&condition_ready);
@@ -188,7 +188,7 @@ fn declared_channel_wait_event_uses_existing_typed_declared_port() {
     let ready = Arc::new(AtomicUsize::new(0));
     let outcome = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = {
         let channel = channel.clone();
         let ready = Arc::clone(&ready);
@@ -278,7 +278,7 @@ fn declared_channel_empty_interest_matches_raw_wait_behavior() {
 
 #[test]
 fn reactor_declared_channel_uses_timer_queue_for_timeouts() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let channel = reactor
         .declared_channel(WireDeclaration::<DeclaredWaitEvent>::port(
             "reactor.typed.timeout",
@@ -335,7 +335,7 @@ fn declared_readiness_channel_wait_event_uses_existing_typed_declared_queue() {
     let ready = Arc::new(AtomicUsize::new(0));
     let outcome = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let task = {
         let channel = channel.clone();
         let ready = Arc::clone(&ready);
@@ -431,7 +431,7 @@ fn declared_readiness_channel_empty_interest_matches_raw_wait_behavior() {
 
 #[test]
 fn reactor_declared_readiness_channel_uses_timer_queue_for_timeouts() {
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let channel = reactor
         .declared_readiness_channel(WireDeclaration::<DeclaredReadiness>::queue(
             "reactor.typed.readiness.timeout",

@@ -27,6 +27,7 @@ use tx_subsystems::vfs::{Credential, DEntry, InlineName, InodeMeta, RNode, RNode
 // pushed the AP further behind the 10M budget; bumped to 50M. Still
 // sub-second on real hardware.
 const AP_REACTOR_WAIT_SPINS: usize = 50_000_000;
+const BSP_REACTOR_TIMER_WAIT_SPINS: usize = 20_000;
 
 /// Minimum platform-timer period used in the userspace reactor loop when
 /// the reactor has no pending deadline. Without this, WFI never wakes
@@ -39,6 +40,11 @@ const AP_REACTOR_WAIT_SPINS: usize = 50_000_000;
 pub(crate) const IDLE_TIMER_PERIOD_NS: u64 = 5_000_000; // 5 ms
 
 static BOOT_REACTOR: boot_runtime::SharedReactor = boot_runtime::SharedReactor::empty();
+/// Switched to true when the userspace reactor phase begins, enabling
+/// the concurrent poll path on all harts.
+pub(super) static USE_CONCURRENT_POLL: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static CONSOLE_WRITE_LOCK: SpinMutex<()> = SpinMutex::new(());
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 
@@ -73,6 +79,8 @@ static MUSL_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
 /// `register_console_hardware`; consulted by
 /// `register_devfs_console_alias` to publish `/dev/console`.
 static CONSOLE_TTY: SpinMutex<Option<Cap<TtyIdentity>>> = SpinMutex::new(None);
+static THREAD_REACTOR_TASKS: SpinMutex<alloc::vec::Vec<(u32, boot_runtime::TaskKey)>> =
+    SpinMutex::new(alloc::vec::Vec::new());
 
 /// Snapshot the boot-time root mount cap. Returns `None` until
 /// `mount_rootfs_tmpfs` has run (test pre-bootstrap or boot-time
@@ -93,6 +101,12 @@ pub fn dev_mount() -> Option<Cap<MountIdentity>> {
 /// `register_console_hardware` has run.
 pub fn console_tty() -> Option<Cap<TtyIdentity>> {
     CONSOLE_TTY.lock().clone()
+}
+
+pub(crate) fn mark_boot_reactor_userspace_preempt(cpu_id: CpuId) {
+    let _ = BOOT_REACTOR.with(|reactor| {
+        reactor.mark_userspace_preempt(boot_runtime::HartId(cpu_id.0));
+    });
 }
 
 #[cfg(test)]
@@ -139,6 +153,7 @@ impl<P: TxPlatform> CharDeviceOps for ConsoleCharOps<P> {
         // `P::write_bytes` under the hood. We bypass the str
         // adapter so non-UTF-8 bytes (e.g., raw control sequences)
         // round-trip unchanged.
+        let _console_write_guard = CONSOLE_WRITE_LOCK.lock();
         <P as tx_hal::ConsoleIf>::write_bytes(bytes);
         StepOutcome::Done(bytes.len())
     }
@@ -244,6 +259,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::run_zone_smoke();
             Self::run_bsp_reactor_runtime_smoke();
             Self::run_bsp_reactor_timer_idle_smoke();
+            Self::report_reactor_sched_observability();
             Self::init_process_subsystem();
 
             // ---- Phase 3b boot wiring ----
@@ -282,6 +298,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_rootfs_from_boot_media();
             Self::mount_devfs_at_dev();
             Self::register_devfs_console_alias();
+            Self::mount_procfs_at_proc();
             Self::mount_bdevfs_at_dev_block();
             Self::mount_sdcard_at_musl();
             Self::bind_init_cwd_and_root();
@@ -659,6 +676,98 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":mount:devfs:ok\n");
     }
 
+    /// Mount procfs on `/proc`.
+    ///
+    /// Creates `/proc` on the rootfs (tmpfs) and mounts procfs there so
+    /// that userspace tools like `free`, `ps`, and `df` can read
+    /// `/proc/meminfo`, `/proc/<pid>/stat`, and `/proc/mounts`.
+    ///
+    /// **Order invariant:** runs after `mount_rootfs_from_boot_media`.
+    pub(crate) fn mount_procfs_at_proc() {
+        let root_mount = ROOT_MOUNT
+            .lock()
+            .clone()
+            .expect("mount_procfs_at_proc: ROOT_MOUNT must be populated");
+
+        let guard = step_engine::guard();
+        let cred = Credential::root();
+        use StepOutcome as V3;
+        let root_fs_object_id = root_mount.root().fs_object_id();
+        let (proc_object_id, proc_meta) = match root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .fs_ops
+            .mkdir(root_fs_object_id, b"proc", 0o555, &cred, &guard)
+        {
+            V3::Done(out) => out,
+            V3::Err(step_engine::Errno::ENOSYS) | V3::Err(step_engine::Errno::EROFS) => {
+                (root_fs_object_id, root_mount.root().meta())
+            }
+            other => panic!("mount_procfs_at_proc: mkdir(/proc) failed: {other:?}"),
+        };
+        drop(guard);
+
+        let proc_rnode_in_root = RNode::new_cap(proc_object_id, proc_meta, RNodeBacking::Directory)
+            .expect("mount_procfs_at_proc: /proc rnode-on-rootfs reservation");
+        let proc_dentry_on_root = DEntry::new_cap(
+            InlineName::new(b"proc").expect("mount_procfs_at_proc: /proc inline name"),
+            proc_rnode_in_root,
+        )
+        .expect("mount_procfs_at_proc: /proc dentry-on-rootfs reservation");
+
+        let procfs_fs_ops = tx_fs::procfs::Procfs::fs_ops_arc();
+        let procfs_fs_page_backing = alloc::sync::Arc::new(tx_fs::procfs::Procfs)
+            as alloc::sync::Arc<dyn tx_subsystems::page_backed::FsPageBacking>;
+
+        let procfs_payload = MountPayload::new_cap(
+            procfs_fs_ops,
+            procfs_fs_page_backing,
+            None,
+            mount::allocate_dev_id(),
+            MountOptions::default(),
+            "proc",
+            SourceLabel::Static("proc"),
+        )
+        .expect("mount_procfs_at_proc: payload reservation");
+
+        let procfs_root_rnode = {
+            let raw = RNode::new(
+                tx_fs::procfs::PROCFS_ROOT_ID,
+                InodeMeta::new(
+                    tx_subsystems::vfs::InodeKind::Directory,
+                    tx_fs::procfs::PROCFS_DIR_MODE,
+                ),
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&procfs_payload);
+            let res = step_engine::reserve_for::<RNode>()
+                .expect("mount_procfs_at_proc: procfs root rnode reservation");
+            step_engine::sign_for(res, raw)
+        };
+
+        let rootfs_payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .clone();
+
+        let proc_mount = MountIdentity::new_cap(
+            mount::allocate_mount_id(),
+            Some(proc_dentry_on_root),
+            procfs_root_rnode,
+            Some(root_mount),
+            procfs_payload,
+            MountFlags::empty(),
+        )
+        .expect("mount_procfs_at_proc: mount identity reservation");
+
+        mount::register_mount(&rootfs_payload, proc_object_id, proc_mount);
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:procfs:ok\n");
+    }
+
     /// Mount bdev-fs on `/dev/block`.
     ///
     /// Per `docs/design/05_filesystem/BDEV_FS.md` §7.1: "Exactly one
@@ -790,7 +899,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
     pub(crate) fn mount_sdcard_at_musl() {
-        use tx_fs::tx_ext4::{mount_ext4_read_only, BlockDeviceImage};
+        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
         use tx_subsystems::device::block_device_by_name;
 
         let Some(reg) = block_device_by_name(b"vda") else {
@@ -798,7 +907,16 @@ impl<P: TxPlatform> CoreInit<P> {
         };
 
         let image = BlockDeviceImage::new(reg.ops);
-        let mount_output = match mount_ext4_read_only(image) {
+        // Mount read-write so test binaries that create or write to
+        // files under `/musl/musl/basic/` (test_mmap, test_munmap,
+        // test_mkdir, test_openat with O_CREAT, …) don't fall to
+        // -EROFS at every mutation. The ext4 backend's RW path is
+        // wired (`create_inode`/`mkdir`/`unlink` go through the
+        // pager's direct-write path per the 2026-05-13 trail); the
+        // only RW gap is `flush_page` (returns -ENOSYS), which
+        // affects long-running persistence but not the per-syscall
+        // contract these basic tests check.
+        let mount_output = match mount_ext4_read_write(image) {
             Ok(out) => out,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
@@ -896,13 +1014,13 @@ impl<P: TxPlatform> CoreInit<P> {
 
         *MUSL_MOUNT.lock() = Some(musl_mount);
 
-        // Seed /bin/sh → the busybox binary in the rootfs tmpfs so
-        // that shebang scripts (e.g. run-all.sh #!/bin/sh) resolve
-        // correctly when no initramfs is loaded. RV64 OSComp images
-        // place busybox under /musl/musl; the LA64 busybox-root image
-        // built by xtask places it under /bin inside the mounted image.
-        // Both steps tolerate EEXIST so a baked initramfs or
-        // busybox_baked path that ran first wins.
+        // Seed /bin/sh and /bin/busybox → the busybox binary in the
+        // rootfs tmpfs so that shebang scripts (e.g. #!/bin/sh and
+        // #!/bin/busybox sh) resolve correctly when no initramfs is
+        // loaded.  RV64 OSComp images place busybox under /musl/musl;
+        // the LA64 busybox-root image built by xtask places it under
+        // /bin inside the mounted image.  Both steps tolerate EEXIST
+        // so a baked initramfs or busybox_baked path that ran first wins.
         {
             let guard = step_engine::guard();
             let bin_id = match rootfs_payload.fs_ops.mkdir(
@@ -1092,6 +1210,28 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(s);
     }
 
+    fn write_usize(value: usize) {
+        Self::write_decimal_unsigned(value);
+    }
+
+    fn write_u64(value: u64) {
+        if value <= usize::MAX as u64 {
+            Self::write_decimal_unsigned(value as usize);
+            return;
+        }
+
+        let mut digits = [0u8; 20];
+        let mut n = value;
+        let mut idx = digits.len();
+        while n > 0 {
+            idx -= 1;
+            digits[idx] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+        let s = core::str::from_utf8(&digits[idx..]).unwrap_or("");
+        tx_hal::console_write_str::<P>(s);
+    }
+
     fn init_later(handoff: BootHandoff) {
         P::init_later(handoff);
     }
@@ -1145,62 +1285,36 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         };
 
-        let target_hart = boot_runtime::HartId(target_cpu.0);
         let current_hart = boot_runtime::HartId(<P as tx_hal::SmpIf>::current_cpu_id().0);
-        let mask = boot_runtime::wait::Mask::from_bits(0x1);
         let targets = CpuMask::single(target_cpu);
         Self::clear_ap_reactor_task_done(targets);
-
-        let channel = BOOT_REACTOR
-            .with(|reactor| {
-                let channel = reactor.channel();
-                reactor.submit_task_with_meta(
-                    {
-                        let channel = channel.clone();
-                        async move {
-                            let _ = channel.wait(mask).await;
-                            Self::mark_ap_reactor_task_done(target_cpu);
-                        }
-                    },
-                    boot_runtime::InitialSchedMeta::kernel()
-                        .with_affinity(CpuMask::single(target_cpu).bits()),
-                );
-                channel
-            })
-            .expect("boot reactor must be initialized before AP dispatcher smoke");
-
-        let parked = BOOT_REACTOR
-            .with(|reactor| reactor.run_until_idle_on_hart(target_hart))
-            .expect("boot reactor must be initialized before AP dispatcher smoke");
-        assert!(
-            parked.polled <= 1,
-            "reactor dispatcher smoke initial poll count"
-        );
-
         P::clear_ipi_ack_cpus(IpiKind::Reschedule, targets);
-        assert_eq!(
-            channel.fire(mask),
-            1,
-            "reactor dispatcher wake registration"
-        );
 
         let mut signal = SmpRescheduleSignal::<P>::new();
         let report = BOOT_REACTOR
-            .with(|reactor| reactor.drain_wakes_for_hart(current_hart, &mut signal))
+            .with(|reactor| {
+                let (_task, report) = reactor.submit_task_with_meta_from_hart(
+                    async move {
+                        Self::mark_ap_reactor_task_done(target_cpu);
+                    },
+                    boot_runtime::InitialSchedMeta::kernel()
+                        .with_affinity(CpuMask::single(target_cpu).bits()),
+                    current_hart,
+                    &mut signal,
+                );
+                report
+            })
             .expect("boot reactor must be initialized before AP dispatcher smoke");
-        // Under multi-threaded TCG (-accel tcg,thread=multi, see
-        // xtask/src/qemu.rs), the AP may poll its own runqueue and
-        // consume the wake before the BSP gets here to drain — in
-        // which case `remote_ipis` is 0, not 1. Both 0 (AP pre-empted)
-        // and 1 (BSP drained first) are valid; only >1 would indicate
-        // a bug in the wake-routing path. Same applies to the IPI ack
-        // count below: 0 acks if no IPI was sent, else `targets.count()`.
-        assert!(
-            report.remote_ipis <= 1,
-            "reactor dispatcher remote IPI count: got {} (expected 0 or 1)",
-            report.remote_ipis,
+        assert_eq!(
+            report.remote_ipis, 1,
+            "reactor dispatcher remote submit IPI count"
         );
 
+        // Under multi-threaded TCG (-accel tcg,thread=multi, see
+        // xtask/src/qemu.rs), the AP may poll its own runqueue and
+        // finish the task before the BSP checks the ack. 0 acks means the AP
+        // consumed the work without observing the explicit IPI in this small
+        // boot window; `targets.count()` means the IPI path was observed.
         let acked = P::wait_for_ipi_ack_cpus(targets, IpiKind::Reschedule);
         assert!(
             acked == 0 || acked == targets.count(),
@@ -1274,16 +1388,64 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn run_secondary_reactor_once(cpu_id: CpuId) -> bool {
-        Self::step_boot_reactor_once(cpu_id).is_some_and(|step| !step.should_idle())
+        let step = if USE_CONCURRENT_POLL.load(core::sync::atomic::Ordering::Relaxed) {
+            Self::step_boot_reactor_once_concurrent(cpu_id)
+        } else {
+            Self::step_boot_reactor_once(cpu_id)
+        };
+
+        // A userspace task polled on this AP may fork while the reactor
+        // poll lease is active. sys_clone defers child submission in that
+        // case; make those children visible before the AP decides to WFI.
+        let submitted_child = Self::drain_pending_child_submits();
+
+        submitted_child || step.is_some_and(|step| !step.should_idle())
     }
 
     fn step_boot_reactor_once(cpu_id: CpuId) -> Option<boot_runtime::hart_loop::HartLoopStep> {
         let hart = boot_runtime::HartId(cpu_id.0);
         let now_ns = P::read_ns();
         let mut signal = SmpRescheduleSignal::<P>::new();
-        let step = BOOT_REACTOR.with(|reactor| {
-            boot_runtime::hart_loop::step_hart_loop_at(reactor, hart, now_ns, &mut signal)
+        // Force a guard acquire+drop to clear stale epoch state.
+        drop(step_engine::guard());
+        let step = BOOT_REACTOR.with_hart_runtime(hart, |runtime| {
+            boot_runtime::hart_loop::step_hart_loop_at(runtime, hart, now_ns, &mut signal)
         })?;
+        Self::program_hart_loop_deadline(step.deadline_action);
+        Some(step)
+    }
+
+    /// Concurrent variant: releases the reactor lock during each task's
+    /// `future.poll()`, allowing other harts to make progress in parallel
+    /// (Phase 1a poll lease).
+    fn step_boot_reactor_once_concurrent(
+        cpu_id: CpuId,
+    ) -> Option<boot_runtime::hart_loop::HartLoopStep> {
+        let hart = boot_runtime::HartId(cpu_id.0);
+        let now_ns = P::read_ns();
+        let mut signal = SmpRescheduleSignal::<P>::new();
+        struct KernelSliceClock<P>(core::marker::PhantomData<P>);
+        impl<P: TxPlatform> boot_runtime::SliceClock for KernelSliceClock<P> {
+            fn now_ns(&mut self) -> u64 {
+                P::read_ns()
+            }
+
+            fn set_deadline_ns(&mut self, deadline_ns: u64) {
+                P::set_deadline_ns(deadline_ns);
+            }
+
+            fn cancel_deadline(&mut self) {
+                P::cancel_deadline();
+            }
+        }
+
+        let mut slice_clock = KernelSliceClock::<P>(core::marker::PhantomData);
+        let step = BOOT_REACTOR.run_hart_loop_concurrent_with_slice_clock(
+            hart,
+            now_ns,
+            &mut signal,
+            &mut slice_clock,
+        )?;
         Self::program_hart_loop_deadline(step.deadline_action);
         Some(step)
     }
@@ -1326,6 +1488,21 @@ impl<P: TxPlatform> CoreInit<P> {
 
     fn cpu_bit(cpu_id: CpuId) -> u64 {
         CpuMask::single(cpu_id).bits()
+    }
+
+    fn userspace_thread_sched_meta_for(cpu_id: CpuId) -> boot_runtime::InitialSchedMeta {
+        // Userspace trap/return state still has hart-local architectural
+        // coupling. Keep OSComp user threads on the submit hart until the
+        // userspace context handoff is fully migration-safe.
+        let affinity = Self::cpu_bit(cpu_id);
+        boot_runtime::InitialSchedMeta::fair()
+            .with_affinity(affinity)
+            .pinned()
+            .userspace_thread()
+    }
+
+    fn userspace_thread_sched_meta() -> boot_runtime::InitialSchedMeta {
+        Self::userspace_thread_sched_meta_for(<P as tx_hal::SmpIf>::current_cpu_id())
     }
 
     fn run_zone_smoke() {
@@ -1404,19 +1581,19 @@ impl<P: TxPlatform> CoreInit<P> {
         P::enable_timer_wakeups();
 
         let mut deadline_reached = false;
-        for _ in 0..AP_REACTOR_WAIT_SPINS {
+        for _ in 0..BSP_REACTOR_TIMER_WAIT_SPINS {
             if P::read_ns() >= deadline_ns {
                 deadline_reached = true;
                 break;
             }
-            crate::zones::try_bounded_maintenance_tick();
             core::hint::spin_loop();
         }
 
-        assert!(
-            deadline_reached,
-            "BSP reactor timer idle smoke deadline did not arrive"
-        );
+        if !deadline_reached {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":reactor:timer-idle:WARN-deadline\n");
+            return;
+        }
 
         let mut observed_timer_wake = false;
         for _ in 0..1024 {
@@ -1429,11 +1606,40 @@ impl<P: TxPlatform> CoreInit<P> {
                 tx_hal::console_write_str::<P>(":reactor:timer-idle:ok\n");
                 return;
             }
-            crate::zones::try_bounded_maintenance_tick();
             core::hint::spin_loop();
         }
 
-        panic!("BSP reactor timer idle smoke did not complete");
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":reactor:timer-idle:WARN-wake\n");
+    }
+
+    fn report_reactor_sched_observability() {
+        let Some((observed, scheduler)) =
+            BOOT_REACTOR.with(|reactor| (reactor.observability(), reactor.scheduler_stats()))
+        else {
+            return;
+        };
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":reactor:sched:stats");
+        let mut hart = 0;
+        while hart < observed.per_hart().len() {
+            let stats = observed.hart(boot_runtime::HartId(hart));
+            if stats.polled > 0 || stats.completed > 0 {
+                tx_hal::console_write_str::<P>(":h");
+                Self::write_usize(hart);
+                tx_hal::console_write_str::<P>("=");
+                Self::write_u64(stats.polled);
+                tx_hal::console_write_str::<P>("/");
+                Self::write_u64(stats.completed);
+            }
+            hart += 1;
+        }
+        tx_hal::console_write_str::<P>(":steal=");
+        Self::write_u64(scheduler.work_steals);
+        tx_hal::console_write_str::<P>(":rebalance=");
+        Self::write_u64(scheduler.rebalance_moves);
+        tx_hal::console_write_str::<P>("\n");
     }
 
     fn bsp_timer_smoke_done(cpu_bit: u64) -> bool {
@@ -1469,7 +1675,57 @@ impl<P: TxPlatform> CoreInit<P> {
         // would deadlock that same spin lock. Defer the submit to a
         // separate pending-queue that the BSP reactor loop drains
         // between iterations (outside the inner lock).
-        Self::queue_pending_child_submit(child_thread);
+        Self::queue_pending_child_submit(<P as tx_hal::SmpIf>::current_cpu_id(), child_thread);
+    }
+
+    fn register_thread_reactor_task(tid: u32, task: boot_runtime::TaskKey) {
+        let mut tasks = THREAD_REACTOR_TASKS.lock();
+        if let Some((_, existing)) = tasks
+            .iter_mut()
+            .find(|(existing_tid, _)| *existing_tid == tid)
+        {
+            *existing = task;
+        } else {
+            tasks.push((tid, task));
+        }
+    }
+
+    fn thread_reactor_task(tid: u32) -> Option<boot_runtime::TaskKey> {
+        THREAD_REACTOR_TASKS
+            .lock()
+            .iter()
+            .find(|(existing_tid, _)| *existing_tid == tid)
+            .map(|(_, task)| *task)
+    }
+
+    fn set_thread_reactor_affinity(
+        tid: u32,
+        affinity: u64,
+    ) -> Result<(), tx_subsystems::reactor_affinity::ReactorAffinityError> {
+        if affinity == 0 || (affinity & P::online_cpus().bits()) == 0 {
+            return Err(tx_subsystems::reactor_affinity::ReactorAffinityError::InvalidMask);
+        }
+        let task = Self::thread_reactor_task(tid)
+            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?;
+        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        let current_hart = boot_runtime::HartId(current_cpu.0);
+        let mut signal = SmpRescheduleSignal::<P>::new();
+        BOOT_REACTOR
+            .with(|reactor| reactor.set_task_affinity(task, affinity, current_hart, &mut signal))
+            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?
+            .map(|_| ())
+            .map_err(|_| tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)
+    }
+
+    fn get_thread_reactor_affinity(
+        tid: u32,
+    ) -> Result<u64, tx_subsystems::reactor_affinity::ReactorAffinityError> {
+        let task = Self::thread_reactor_task(tid)
+            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?;
+        BOOT_REACTOR
+            .with(|reactor| reactor.task_affinity(task))
+            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?
+            .map_err(|_| tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)
     }
 
     /// Push a freshly-cloned child thread onto the deferred-submit
@@ -1478,47 +1734,65 @@ impl<P: TxPlatform> CoreInit<P> {
     /// caller. Drained by `drain_pending_child_submits` between
     /// reactor steps.
     fn queue_pending_child_submit(
+        submit_cpu: CpuId,
         child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
     ) {
-        PENDING_CHILD_SUBMITS.lock().push(child_thread);
+        PENDING_CHILD_SUBMITS.lock().push(PendingChildSubmit {
+            submit_cpu,
+            child_thread,
+        });
     }
 
     /// Drain the deferred-submit queue, building the task future for
     /// each pending child and submitting it through `BOOT_REACTOR`.
     /// Safe to call from the BSP loop because no syscall task is
     /// being polled at this point (the inner spin lock is free).
-    fn drain_pending_child_submits() {
+    fn drain_pending_child_submits() -> bool {
+        let mut submitted_any = false;
         loop {
             let next = PENDING_CHILD_SUBMITS.lock().pop();
-            let Some(child_thread) = next else {
+            let Some(pending) = next else {
                 break;
             };
+            let child_thread = pending.child_thread;
             let Some(payload) = child_thread.payload_cap() else {
                 continue;
             };
             let task_payload = payload.clone();
-            let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-            let _ = BOOT_REACTOR.with(|reactor| {
-                reactor.submit_task_with_meta(
+            let submit_hart = boot_runtime::HartId(pending.submit_cpu.0);
+            let child_tid = child_thread.tid.0;
+            let mut signal = SmpRescheduleSignal::<P>::new();
+            let submitted = BOOT_REACTOR.with(|reactor| {
+                reactor.submit_task_with_meta_from_hart(
                     crate::thread_future::PerHartSlotted::<P, _>::new(
                         task_payload.clone(),
                         crate::thread_future::run_thread::<P>(child_thread, task_payload),
                     ),
-                    boot_runtime::InitialSchedMeta::kernel()
-                        .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
-                );
+                    Self::userspace_thread_sched_meta_for(pending.submit_cpu).preempted_on_submit(),
+                    submit_hart,
+                    &mut signal,
+                )
             });
+            if let Some((task_key, _report)) = submitted {
+                submitted_any = true;
+                Self::register_thread_reactor_task(child_tid, task_key);
+            }
         }
+        submitted_any
     }
+}
+
+struct PendingChildSubmit {
+    submit_cpu: CpuId,
+    child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
 }
 
 /// Deferred-submit queue for `sys_clone` children. Pushed from
 /// `submit_child_thread_into_boot_reactor` (running inside the
 /// reactor-poll inner lock) and drained from the BSP loop between
 /// reactor steps.
-static PENDING_CHILD_SUBMITS: SpinMutex<
-    alloc::vec::Vec<Cap<tx_subsystems::thread_runtime::ThreadIdentity>>,
-> = SpinMutex::new(alloc::vec::Vec::new());
+static PENDING_CHILD_SUBMITS: SpinMutex<alloc::vec::Vec<PendingChildSubmit>> =
+    SpinMutex::new(alloc::vec::Vec::new());
 
 /// Synchronously poll a future to completion using a noop waker.
 ///

@@ -74,7 +74,7 @@ pub(super) fn sys_setuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -92,7 +92,7 @@ pub(super) fn sys_setgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -116,7 +116,7 @@ pub(super) fn sys_setreuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -133,7 +133,7 @@ pub(super) fn sys_setregid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -157,7 +157,7 @@ pub(super) fn sys_setresuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -176,7 +176,7 @@ pub(super) fn sys_setresgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -195,17 +195,17 @@ pub(super) fn sys_getresuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
 
     if ruid_uaddr != 0 {
         if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, ruid_uaddr, cred.uid.raw()) {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
     if euid_uaddr != 0 {
         if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, euid_uaddr, cred.euid.raw()) {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
     if suid_uaddr != 0 {
         if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, suid_uaddr, cred.suid.raw()) {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
 
@@ -222,17 +222,17 @@ pub(super) fn sys_getresgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
 
     if rgid_uaddr != 0 {
         if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, rgid_uaddr, cred.gid.raw()) {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
     if egid_uaddr != 0 {
         if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, egid_uaddr, cred.egid.raw()) {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
     if sgid_uaddr != 0 {
         if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, sgid_uaddr, cred.sgid.raw()) {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
 
