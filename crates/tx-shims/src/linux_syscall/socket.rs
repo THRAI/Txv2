@@ -16,10 +16,10 @@ use tx_subsystems::net::{
     step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
     step_send_udp_loopback_kernel_bytes, step_shutdown, step_socket_close,
     step_socket_open_file_in_namespace, step_tcp_loopback_handshake, step_tcp_loopback_transfer,
-    AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, KernelSockAddr, LingerOption, PollMask,
-    SendRecvFlags, SockAddrIn, SockAddrLl, SockShutdownCmd, SocketHandleFlags, SocketIdentity,
-    SocketKind, SocketProtocol, SocketType, TcpState, UdpInner, UnixDatagramState, UnixSocketPath,
-    UnixStreamState, ValidSocketType,
+    AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, Ipv4MulticastGroup, KernelSockAddr,
+    LingerOption, PollMask, SendRecvFlags, SockAddrIn, SockAddrLl, SockShutdownCmd,
+    SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol, SocketType, TcpState, UdpInner,
+    UnixDatagramState, UnixSocketPath, UnixStreamState, ValidSocketType,
 };
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::vfs::structure::OpenFileBacking;
@@ -49,6 +49,8 @@ const SOCKET_MSG_MAX_BYTES: usize = 1024 * 1024;
 const NETLINK_RECVMSG_MAX: usize = 1024 * 1024;
 const IPT_GETINFO_BYTES: usize = 84;
 const IPT_GET_ENTRIES_EMPTY_BYTES: usize = 36;
+const GROUP_REQ_BYTES: u32 = 136;
+const GROUP_REQ_GROUP_OFFSET: usize = 8;
 
 #[derive(Clone, Copy)]
 struct UserIovec {
@@ -1503,6 +1505,23 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.ip.recv_err = on);
             Ok(())
         }
+        (IPPROTO_IP, MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP) => {
+            if !matches!(
+                socket.kind,
+                SocketKind::Tcp | SocketKind::Udp | SocketKind::RawIcmp
+            ) {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            let group = match read_sockopt_ipv4_mcast_group_req(ctx, optval, optlen) {
+                Ok(group) => group,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            match optname {
+                MCAST_JOIN_GROUP => payload.join_ipv4_multicast_group(group),
+                MCAST_LEAVE_GROUP => payload.leave_ipv4_multicast_group(group),
+                _ => unreachable!(),
+            }
+        }
         (IPPROTO_TCP, TCP_NODELAY) => {
             let on = match read_sockopt_bool(ctx, optval, optlen) {
                 Ok(on) => on,
@@ -2381,6 +2400,32 @@ fn read_sockopt_i32<'a>(ctx: &SyscallCtx<'a>, optval: u64, optlen: u32) -> Resul
         return Err(Errno::EINVAL);
     }
     bootstrap_read_user(&ctx.aspace, optval)
+}
+
+fn read_sockopt_ipv4_mcast_group_req<'a>(
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<Ipv4MulticastGroup, Errno> {
+    if optval == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if optlen < GROUP_REQ_BYTES {
+        return Err(Errno::EINVAL);
+    }
+    let mut bytes = [0u8; GROUP_REQ_BYTES as usize];
+    bootstrap_copy_from_user(&ctx.aspace, &mut bytes, optval)?;
+    let interface = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let group = &bytes[GROUP_REQ_GROUP_OFFSET..];
+    let family = u16::from_le_bytes(group[0..2].try_into().unwrap());
+    if family != AF_INET {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    let group = Ipv4Address::new([group[4], group[5], group[6], group[7]]);
+    if !group.is_multicast() {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Ipv4MulticastGroup::new(interface, group))
 }
 
 fn read_sockopt_linger<'a>(

@@ -125,12 +125,12 @@ pub use rtnetlink::{
 };
 pub use structure::{
     AcceptWireSet, AddressFamily, ConnectionKey, InitialSocketTableProxy, IpEndpoint,
-    IpLevelOptions, Ipv4Address, KernelSockAddr, LingerOption, ListenerKey, LocalEndpointKey,
-    PacketSocketState, PollMask, ProtocolNumber, RawIcmpSocketKey, RawIcmpState, RecvWireSet,
-    SendRecvFlags, SendWireSet, SockAddrIn, SockAddrLl, SockFlags, SockShutdownCmd, SocketIdentity,
-    SocketIoState, SocketKind, SocketLevelOptions, SocketOperationalEvidence, SocketOptionSet,
-    SocketPayload, SocketProtocol, SocketReadiness, SocketRecvBytesOutcome, SocketTable,
-    SocketType, SocketWaitCarriers, Takeable, TcpLevelOptions, TcpState, UdpInner,
+    IpLevelOptions, Ipv4Address, Ipv4MulticastGroup, KernelSockAddr, LingerOption, ListenerKey,
+    LocalEndpointKey, PacketSocketState, PollMask, ProtocolNumber, RawIcmpSocketKey, RawIcmpState,
+    RecvWireSet, SendRecvFlags, SendWireSet, SockAddrIn, SockAddrLl, SockFlags, SockShutdownCmd,
+    SocketIdentity, SocketIoState, SocketKind, SocketLevelOptions, SocketOperationalEvidence,
+    SocketOptionSet, SocketPayload, SocketProtocol, SocketReadiness, SocketRecvBytesOutcome,
+    SocketTable, SocketType, SocketWaitCarriers, Takeable, TcpLevelOptions, TcpState, UdpInner,
     UnixDatagramState, UnixSocketPath, UnixStreamState, UrgentEvent, ValidSocketType,
     UNIX_SOCKET_PATH_MAX,
 };

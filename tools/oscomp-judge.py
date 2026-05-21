@@ -478,17 +478,95 @@ def judge_compatible_input(group, group_lines):
         return "".join(group_lines)
 
     rewritten = []
+    current_case = None
+    counts = None
+    saw_summary = False
     for idx, line in enumerate(group_lines):
+        line = normalize_ltp_result_token(line)
+        stripped = line.strip()
+
+        if stripped.startswith("RUN LTP CASE "):
+            current_case = stripped.split()[-1]
+            counts = new_ltp_counts()
+            saw_summary = False
+
+        kind = ltp_result_kind(line)
+        if counts is not None and kind is not None:
+            counts[kind] += 1
+
+        if stripped == "Summary:":
+            saw_summary = True
+
+        if stripped.startswith("FAIL LTP CASE "):
+            if current_case is not None and counts and not saw_summary and sum(counts.values()) > 0:
+                rewritten.extend(format_ltp_summary(counts))
+            current_case = None
+            counts = None
+            saw_summary = False
+
         rewritten.append(line)
-        if line.strip().startswith("PASS LTP CASE "):
+        if stripped.startswith("PASS LTP CASE "):
             # Official OSComp LTP judges use "FAIL LTP CASE ..." as an
             # end-of-case marker and derive pass counts from preceding TPASS
             # lines. Keep focused logs readable while feeding the legacy
             # marker to the unmodified judge.
             marker = line.replace("PASS LTP CASE", "FAIL LTP CASE", 1)
             if not next_nonempty_line_is(group_lines, idx + 1, marker.strip()):
+                if current_case is not None and counts and not saw_summary and sum(counts.values()) > 0:
+                    rewritten.extend(format_ltp_summary(counts))
                 rewritten.append(marker)
+                current_case = None
+                counts = None
+                saw_summary = False
     return "".join(rewritten)
+
+
+LTP_OLD_RESULT_TOKENS = [
+    ("\x1b[1;32mTPASS\x1b[0m", "\x1b[1;32mTPASS: \x1b[0m"),
+    ("\x1b[1;31mTFAIL\x1b[0m", "\x1b[1;31mTFAIL: \x1b[0m"),
+    ("\x1b[1;31mTBROK\x1b[0m", "\x1b[1;31mTBROK: \x1b[0m"),
+    ("\x1b[1;33mTCONF\x1b[0m", "\x1b[1;33mTCONF: \x1b[0m"),
+    ("\x1b[1;35mTWARN\x1b[0m", "\x1b[1;35mTWARN: \x1b[0m"),
+]
+
+
+def normalize_ltp_result_token(line):
+    """Normalize older LTP API result lines to the token shape parsed by OSComp."""
+    for old_token, new_token in LTP_OLD_RESULT_TOKENS:
+        marker = f"{old_token}  :"
+        if marker in line:
+            return line.replace(marker, new_token, 1)
+    return line
+
+
+def new_ltp_counts():
+    return {"passed": 0, "failed": 0, "broken": 0, "skipped": 0, "warnings": 0}
+
+
+def ltp_result_kind(line):
+    if "TPASS:" in line:
+        return "passed"
+    if "TFAIL:" in line:
+        return "failed"
+    if "TBROK:" in line:
+        return "broken"
+    if "TCONF:" in line:
+        return "skipped"
+    if "TWARN:" in line:
+        return "warnings"
+    return None
+
+
+def format_ltp_summary(counts):
+    return [
+        "\n",
+        "Summary:\n",
+        f"passed   {counts['passed']}\n",
+        f"failed   {counts['failed']}\n",
+        f"broken   {counts['broken']}\n",
+        f"skipped  {counts['skipped']}\n",
+        f"warnings {counts['warnings']}\n",
+    ]
 
 
 def next_nonempty_line_is(lines, start_idx, expected):

@@ -351,6 +351,8 @@ pub const IPPROTO_ICMP: i32 = 1;
 pub const IPPROTO_TCP: i32 = 6;
 pub const IPPROTO_UDP: i32 = 17;
 pub const IP_RECVERR: i32 = 11;
+pub const MCAST_JOIN_GROUP: i32 = 42;
+pub const MCAST_LEAVE_GROUP: i32 = 45;
 pub const SO_REUSEADDR: i32 = 2;
 pub const SO_TYPE: i32 = 3;
 pub const SO_ERROR: i32 = 4;
@@ -830,8 +832,9 @@ pub const MADV_FREE: u64 = 8;
 // musl's libc init issues `FUTEX_WAIT` / `FUTEX_WAKE` for its
 // `pthread_once`-style guards even in single-threaded programs, so
 // without this number wired the busybox shell can't get past
-// `__init_libc`. v1 supports `FUTEX_WAIT` / `FUTEX_WAKE` only; other
-// op selectors return `-ENOSYS`. The `FUTEX_PRIVATE_FLAG` and
+// `__init_libc`. v1 supports `FUTEX_WAIT` / `FUTEX_WAKE` plus the
+// bitset wait/wake variants glibc pthreads uses; other op selectors
+// return `-ENOSYS`. The `FUTEX_PRIVATE_FLAG` and
 // `FUTEX_CLOCK_REALTIME` flag bits are recognised but ignored
 // (per-process isolation is implicit from the per-aspace user word;
 // timeout support is deferred to Slice 4 with the timer-wait source).
@@ -847,7 +850,7 @@ pub const NR_FUTEX: u64 = 98;
 /// return `-EAGAIN` immediately.
 pub const FUTEX_WAIT: u32 = 0;
 /// `FUTEX_WAKE = 1` op selector. Wake up to `val` waiters parked on
-/// `uaddr`'s bucket. Returns the (best-effort) number woken.
+/// `uaddr`'s bucket. Returns the number of waiters notified on the bucket.
 pub const FUTEX_WAKE: u32 = 1;
 /// `FUTEX_REQUEUE = 3`. Out of scope for v1 — returns `-ENOSYS`.
 pub const FUTEX_REQUEUE: u32 = 3;
@@ -861,9 +864,11 @@ pub const FUTEX_LOCK_PI: u32 = 6;
 pub const FUTEX_UNLOCK_PI: u32 = 7;
 /// `FUTEX_TRYLOCK_PI = 8`. Out of scope for v1 — returns `-ENOSYS`.
 pub const FUTEX_TRYLOCK_PI: u32 = 8;
-/// `FUTEX_WAIT_BITSET = 9`. Out of scope for v1 — returns `-ENOSYS`.
+/// `FUTEX_WAIT_BITSET = 9`. Same wait path as `FUTEX_WAIT`; the bitset
+/// argument must be non-zero. Per-waiter bitset filtering is not modeled yet.
 pub const FUTEX_WAIT_BITSET: u32 = 9;
-/// `FUTEX_WAKE_BITSET = 10`. Out of scope for v1 — returns `-ENOSYS`.
+/// `FUTEX_WAKE_BITSET = 10`. Same wake path as `FUTEX_WAKE`; the bitset
+/// argument must be non-zero. Per-waiter bitset filtering is not modeled yet.
 pub const FUTEX_WAKE_BITSET: u32 = 10;
 
 /// `FUTEX_PRIVATE_FLAG = 0x80` flag bit OR'd into the op word.

@@ -1,6 +1,7 @@
 //! Socket structure types owned by the network subsystem.
 
 mod identity;
+mod multicast;
 mod payload;
 mod readiness;
 pub(crate) mod registry;
@@ -8,6 +9,7 @@ pub(crate) mod table;
 mod types;
 
 pub use identity::{SocketIdentity, SocketWaitCarriers};
+pub use multicast::Ipv4MulticastGroup;
 pub use payload::{
     SocketAcceptEntry, SocketAcceptQueue, SocketIoConsume, SocketIoState,
     SocketOperationalEvidence, SocketPayload, SocketProtocol, SocketRecvBytesOutcome,
