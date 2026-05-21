@@ -63,16 +63,16 @@ use tx_subsystems::futex::adapter::wait_routing::{
     MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
 };
 
+use tx_hal::UserPtr;
 use tx_subsystems::futex::{
     bucket_index, bucket_wait_source, bucket_wait_source_for_source_id, step_futex_wait,
     step_futex_wake, FUTEX_WAKE_MASK,
 };
 use tx_subsystems::vm::{
-    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr,
-    VmBacking, VmEntry, VmEntryFlags, USER_PAGE_SIZE,
+    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
+    USER_PAGE_SIZE,
 };
 use tx_subsystems::wait_source as legacy_wait_source;
-use tx_hal::UserPtr;
 use tx_subsystems::zones;
 
 /// Minimal `PmapIf` stub for integration tests — the futex wait-source
@@ -367,8 +367,7 @@ fn waitsource_notify_stamps_caller_generation_on_event() {
 fn wait_source_id_round_trips_from_yield_shape_to_bucket_source() {
     let _setup = setup();
     let user_va = 0xb000_0000usize;
-    let aspace = AddressSpace::new_for_platform::<FutexTestPmap>()
-        .expect("test pmap creates root");
+    let aspace = AddressSpace::new_for_platform::<FutexTestPmap>().expect("test pmap creates root");
     let entry = VmEntry::new(
         UserRange::new_aligned(UserVirtAddr(user_va), USER_PAGE_SIZE).unwrap(),
         Prot::READ_WRITE,

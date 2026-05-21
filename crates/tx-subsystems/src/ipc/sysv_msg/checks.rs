@@ -11,15 +11,15 @@ pub fn require_can_read_msg(queue: &MsgQueueIdentity, cred: &Cred) -> Result<(),
     if cred.euid.0 == 0 {
         return Ok(());
     }
-    if cred.euid.0 == queue.cuid {
-        if queue.perm.owner_read() {
+    if cred.euid.0 == queue.uid() {
+        if queue.perm().owner_read() {
             return Ok(());
         }
-    } else if cred.egid.0 == queue.cgid {
-        if queue.perm.group_read() {
+    } else if cred.egid.0 == queue.gid() {
+        if queue.perm().group_read() {
             return Ok(());
         }
-    } else if queue.perm.other_read() {
+    } else if queue.perm().other_read() {
         return Ok(());
     }
     Err(Errno::EACCES)
@@ -29,22 +29,22 @@ pub fn require_can_write_msg(queue: &MsgQueueIdentity, cred: &Cred) -> Result<()
     if cred.euid.0 == 0 {
         return Ok(());
     }
-    if cred.euid.0 == queue.cuid {
-        if queue.perm.owner_write() {
+    if cred.euid.0 == queue.uid() {
+        if queue.perm().owner_write() {
             return Ok(());
         }
-    } else if cred.egid.0 == queue.cgid {
-        if queue.perm.group_write() {
+    } else if cred.egid.0 == queue.gid() {
+        if queue.perm().group_write() {
             return Ok(());
         }
-    } else if queue.perm.other_write() {
+    } else if queue.perm().other_write() {
         return Ok(());
     }
     Err(Errno::EACCES)
 }
 
 pub fn require_owner_or_admin(queue: &MsgQueueIdentity, cred: &Cred) -> Result<(), Errno> {
-    if cred.euid.0 == 0 || cred.euid.0 == queue.cuid {
+    if cred.euid.0 == 0 || cred.euid.0 == queue.uid() || cred.euid.0 == queue.cuid {
         return Ok(());
     }
     Err(Errno::EPERM)

@@ -17,10 +17,7 @@ use super::*;
 /// (canonical `aspace.copy_to_user` lane with kernel-pointer fallback
 /// for test scaffolding). Null `buf` with non-zero `buflen` returns
 /// `-EFAULT`; `buflen == 0` is a successful no-op (`Return(0)`).
-pub(super) fn sys_getrandom<'a>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+pub(super) fn sys_getrandom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let buf_uaddr = args[0];
     let buf_len = args[1] as usize;
     let _flags = args[2] as u32; // GRND_* recognised but ignored.
@@ -53,15 +50,16 @@ pub(super) fn sys_getrandom<'a>(
 /// - `release = "6.1.0-txkernel"` so the version-triple parser at the
 ///   front of the string sees a Linux 2.6.16+ kernel (musl's
 ///   kernel-feature gating reads only the leading digits).
-/// - `machine = "riscv64"` matching the target ABI.
+/// - `machine` follows the selected platform ABI (`riscv64` or
+///   `loongarch64`) so musl's architecture probes see the right target.
 ///
 /// SAFETY: kernel-buffer exemption (mirrors `sys_getresuid`).
-pub(super) fn sys_uname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_uname<'a, P: AuxvIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let buf_uaddr = args[0];
     if buf_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
-    let utsname = build_utsname();
+    let utsname = build_utsname_for_machine(P::arch_auxv_facts().platform);
     if let Err(errno) = bootstrap_write_user::<UtsnameLayout>(&ctx.aspace, buf_uaddr, utsname) {
         return SyscallResult::error_from(errno);
     }
@@ -135,7 +133,7 @@ pub(super) struct UtsnameLayout {
     pub(super) domainname: [u8; UTSNAME_FIELD],
 }
 
-pub(super) fn build_utsname() -> UtsnameLayout {
+pub(super) fn build_utsname_for_machine(machine: &str) -> UtsnameLayout {
     fn pad(s: &str) -> [u8; UTSNAME_FIELD] {
         let mut out = [0u8; UTSNAME_FIELD];
         let bytes = s.as_bytes();
@@ -153,7 +151,7 @@ pub(super) fn build_utsname() -> UtsnameLayout {
         // as fully featured.
         release: pad("6.1.0-txkernel"),
         version: pad("#1 SMP txkernel"),
-        machine: pad("riscv64"),
+        machine: pad(machine),
         domainname: pad("(none)"),
     }
 }

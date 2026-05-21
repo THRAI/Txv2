@@ -295,10 +295,9 @@ fn parse_image_plan_et_dyn_accepts_wx_load() {
 }
 
 #[test]
-fn parse_image_plan_rejects_pt_interp() {
+fn parse_image_plan_accepts_pt_interp() {
     let mut cfg = FixtureCfg::minimal();
-    // Add a PT_INTERP segment (file_offset/filesz arbitrary; the
-    // parser rejects on type alone). Place it inside the file
+    // Add a PT_INTERP segment (file_offset/filesz arbitrary). Place it inside the file
     // (file is sized to fit phdrs+LOAD content, so an offset of 0
     // is fine).
     cfg.phdrs.push(PhdrSpec {
@@ -320,16 +319,54 @@ fn parse_image_plan_rejects_pt_interp() {
 }
 
 #[test]
-fn parse_image_plan_rejects_pt_dynamic() {
+fn parse_image_plan_accepts_pt_interp_with_pt_dynamic() {
+    let mut cfg = FixtureCfg::minimal();
+    let interp_offset = 0x200usize;
+    let interp = b"/lib/ld-musl-riscv64-sf.so.1\0";
+    cfg.phdrs.push(PhdrSpec {
+        p_type: PT_INTERP_U32,
+        p_flags: PF_R_BIT,
+        p_offset: interp_offset as u64,
+        p_vaddr: 0x10200,
+        p_paddr: 0x10200,
+        p_filesz: interp.len() as u64,
+        p_memsz: interp.len() as u64,
+        p_align: 1,
+    });
+    cfg.phdrs.push(PhdrSpec {
+        p_type: PT_DYNAMIC_U32,
+        p_flags: PF_R_BIT,
+        p_offset: 0x300,
+        p_vaddr: 0x10300,
+        p_paddr: 0x10300,
+        p_filesz: 16,
+        p_memsz: 16,
+        p_align: 8,
+    });
+    let mut bytes = cfg.build();
+    if bytes.len() < interp_offset + interp.len() {
+        bytes.resize(interp_offset + interp.len(), 0);
+    }
+    bytes[interp_offset..interp_offset + interp.len()].copy_from_slice(interp);
+    let plan =
+        parse_image_plan(&bytes).expect("PT_INTERP-owned PT_DYNAMIC should parse for interpreter");
+    assert_eq!(
+        plan.interpreter_path.as_deref(),
+        Some(&interp[..interp.len() - 1])
+    );
+}
+
+#[test]
+fn parse_image_plan_rejects_pt_dynamic_without_interp() {
     let mut cfg = FixtureCfg::minimal();
     cfg.phdrs.push(PhdrSpec {
         p_type: PT_DYNAMIC_U32,
         p_flags: PF_R_BIT,
-        p_offset: 0,
-        p_vaddr: 0,
-        p_paddr: 0,
-        p_filesz: 0,
-        p_memsz: 0,
+        p_offset: 0x200,
+        p_vaddr: 0x10200,
+        p_paddr: 0x10200,
+        p_filesz: 16,
+        p_memsz: 16,
         p_align: 8,
     });
     let bytes = cfg.build();

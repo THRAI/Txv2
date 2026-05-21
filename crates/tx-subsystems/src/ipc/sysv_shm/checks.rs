@@ -17,15 +17,21 @@ pub fn require_can_read_shm(segment: &ShmSegmentIdentity, cred: &Cred) -> Result
     if cred.euid.0 == 0 {
         return Ok(());
     }
-    if cred.euid.0 == segment.cuid {
-        if segment.perm.owner_read() {
+    let uid = segment.uid();
+    let cuid = segment.cuid;
+    let gid = segment.gid();
+    let cgid = segment.cgid;
+    let perm = segment.perm();
+
+    if cred.euid.0 == uid || cred.euid.0 == cuid {
+        if perm.owner_read() {
             return Ok(());
         }
-    } else if cred.egid.0 == segment.cgid {
-        if segment.perm.group_read() {
+    } else if cred.egid.0 == gid || cred.egid.0 == cgid {
+        if perm.group_read() {
             return Ok(());
         }
-    } else if segment.perm.other_read() {
+    } else if perm.other_read() {
         return Ok(());
     }
     Err(Errno::EACCES)
@@ -36,15 +42,21 @@ pub fn require_can_write_shm(segment: &ShmSegmentIdentity, cred: &Cred) -> Resul
     if cred.euid.0 == 0 {
         return Ok(());
     }
-    if cred.euid.0 == segment.cuid {
-        if segment.perm.owner_write() {
+    let uid = segment.uid();
+    let cuid = segment.cuid;
+    let gid = segment.gid();
+    let cgid = segment.cgid;
+    let perm = segment.perm();
+
+    if cred.euid.0 == uid || cred.euid.0 == cuid {
+        if perm.owner_write() {
             return Ok(());
         }
-    } else if cred.egid.0 == segment.cgid {
-        if segment.perm.group_write() {
+    } else if cred.egid.0 == gid || cred.egid.0 == cgid {
+        if perm.group_write() {
             return Ok(());
         }
-    } else if segment.perm.other_write() {
+    } else if perm.other_write() {
         return Ok(());
     }
     Err(Errno::EACCES)
@@ -53,7 +65,7 @@ pub fn require_can_write_shm(segment: &ShmSegmentIdentity, cred: &Cred) -> Resul
 /// Check that the caller is the owner (euid == cuid) or has
 /// `CAP_SYS_ADMIN` (root-euid day-1 approximation).
 pub fn require_owner_or_admin(segment: &ShmSegmentIdentity, cred: &Cred) -> Result<(), Errno> {
-    if cred.euid.0 == 0 || cred.euid.0 == segment.cuid {
+    if cred.euid.0 == 0 || cred.euid.0 == segment.uid() || cred.euid.0 == segment.cuid {
         return Ok(());
     }
     Err(Errno::EPERM)

@@ -115,7 +115,7 @@ pub fn render_ctx(ctx: &DiagCtx, buf: &mut [u8; 256]) -> usize {
         if b == 0 {
             break;
         }
-        let _ = w.write_byte(b);
+        w.write_byte(b);
     }
 
     // fsid=<hex>
@@ -127,7 +127,7 @@ pub fn render_ctx(ctx: &DiagCtx, buf: &mut [u8; 256]) -> usize {
         if b == 0 {
             break;
         }
-        let _ = w.write_byte(b);
+        w.write_byte(b);
     }
 
     // mount=<0|1>

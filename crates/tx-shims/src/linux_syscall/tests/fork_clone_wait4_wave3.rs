@@ -264,19 +264,38 @@ fn dispatch_wait4_blocking_resolves_when_child_zombifies() {
     panic!("dispatch_wait4 did not resolve after child zombified; last poll = {last:?}");
 }
 
-/// Non-NULL `rusage` argument is rejected with `-EINVAL`. Wave 3
-/// doesn't track rusage; future LTP tests that pass an rusage
-/// pointer will need zero-fill or real population (deferred).
+/// Non-NULL `rusage` receives a zero-filled musl/Linux LP64
+/// `struct rusage` image. Usage accounting is not wired yet, but
+/// libc callers that pass a buffer should not see `EINVAL`.
 #[test]
-fn dispatch_wait4_rusage_nonzero_returns_neg_einval() {
+fn dispatch_wait4_rusage_nonzero_writes_zeroed_rusage() {
     let _setup = setup();
+    install_noop_submit_seam();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap, thread);
+    seed_parent_trap_context(&thread);
+    let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let req = SyscallRequest::new(NR_WAIT4, [(-1i64) as u64, 0, 0, 0xDEAD, 0, 0]);
+    let clone_req = SyscallRequest::new(NR_CLONE, [SIGCHLD, 0, 0, 0, 0, 0]);
+    let _ = block_on(dispatch::<ShimsTestPmap>(clone_req, &ctx));
+    let child = proc_cap.children()[0].clone();
+    step_exit_group(&child, ExitStatus::Exited(0));
+
+    let mut rusage = [0xa5u8; 256];
+    let req = SyscallRequest::new(
+        NR_WAIT4,
+        [
+            (-1i64) as u64,
+            0,
+            WNOHANG as u64,
+            rusage.as_mut_ptr() as u64,
+            0,
+            0,
+        ],
+    );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(22), "expected -EINVAL");
+    assert_eq!(result, SyscallResult::Return(child.pid.0 as i64));
+    assert_eq!(rusage, [0u8; 256]);
 }
 
 /// `WUNTRACED` (0x2) and `WCONTINUED` (0x8) are accepted but

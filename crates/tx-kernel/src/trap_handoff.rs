@@ -255,6 +255,32 @@ pub fn hand_off_user_pf(
     }
 }
 
+/// Hand a user-mode timer preemption off to the active per-hart
+/// `ThreadPayload`.
+///
+/// Unlike syscall/page-fault traps, preemption is not semantically
+/// interesting to userspace. It snapshots the current context, resolves
+/// the userspace-run wait with a synthetic `Preempted` event, and lets
+/// the thread future yield at the reactor boundary before re-entering
+/// the same user PC.
+pub fn hand_off_user_preempt(hart: usize, view: &TrapFrameMut<'_>) -> HandoffOutcome {
+    let Some(payload) = current_payload_for_hart(hart) else {
+        return HandoffOutcome::NoActivePayload;
+    };
+
+    let Some(active) = payload.active_userspace_request() else {
+        return HandoffOutcome::NoActiveRequest;
+    };
+
+    payload.store_saved_user_context(Some(view.capture_user_context()));
+
+    let slot: UserspaceRunSlot = payload.userspace_slot().clone();
+    match slot.complete_interesting_trap(active, UserspaceTrapInfo::Preempted) {
+        Ok(_status) => HandoffOutcome::Resolved,
+        Err(err) => HandoffOutcome::SlotError(err),
+    }
+}
+
 /// Convert a [`HandoffOutcome`] into the `TrapAction` the
 /// `KernelTrapSink` should return. Phase 1 collapses every
 /// non-`Resolved` outcome to `Terminate`; later phases may want to

@@ -140,7 +140,7 @@ fn tmpfs_mkdir_then_readdir_yields_dir_entry() {
 }
 
 #[test]
-fn tmpfs_unlink_drops_inode() {
+fn tmpfs_unlink_unhooks_name_but_keeps_inode_until_destroy_inode() {
     let _serial = crate::test_support::FS_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -161,12 +161,19 @@ fn tmpfs_unlink_drops_inode() {
         StepOutcome::Done(())
     );
 
-    // After unlink: lookup misses and the inode is gone from the
-    // store (load_inode_meta returns ENOENT).
+    // After unlink: lookup misses, but an already-open RNode still
+    // addresses the inode by object id until VFS destroys it on the
+    // final live reference drop.
     assert_eq!(
         tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"victim", &guard),
         StepOutcome::Err(Errno::ENOENT)
     );
+    match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(meta) => assert_eq!(meta.kind(), InodeKind::Regular),
+        other => panic!("unlinked open inode must remain addressable: {other:?}"),
+    }
+
+    assert_eq!(tmpfs.destroy_inode(file_id, &guard), StepOutcome::Done(()));
     assert_eq!(
         tmpfs.load_inode_meta(file_id, &guard),
         StepOutcome::Err(Errno::ENOENT)

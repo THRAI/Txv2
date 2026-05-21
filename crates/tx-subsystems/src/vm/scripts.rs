@@ -51,11 +51,14 @@ use crate::vm::{
 /// VA layout is finalised.
 pub const USER_STACK_TOP_DEFAULT: u64 = 0x4000_0000;
 
-/// Default initial reservation for the userspace stack region. Sized
-/// at 16 KiB (4 pages) per `txdoc:EXEC-9-3-POPULATE-THE-INITIAL-USER-STACK`.
-/// Stack growth via a future `expand_stack` script is out of scope for
-/// the initial slice.
-pub const USER_STACK_INITIAL_RESERVATION: u64 = 16 * 1024;
+/// Default initial reservation for the userspace stack region.
+///
+/// The reservation is recipe-only: pages still materialise lazily on
+/// fault, so this costs virtual address space rather than physical
+/// memory. Keep it large enough for ordinary libc stack frames while a
+/// future `expand_stack` script remains out of scope for the initial
+/// slice.
+pub const USER_STACK_INITIAL_RESERVATION: u64 = 8 * 1024 * 1024;
 
 /// Loader's parsed view of the ELF image, in kernel-owned shape.
 ///
@@ -244,9 +247,7 @@ pub fn build_aspace_from_image<P: PmapIf>(
     // consumers (auxv, debug tooling) that care about the
     // byte-granularity range; only the redundant register-recipe pass
     // is removed.
-    for segment in &image_plan.load_segments {
-        register_load_segment(&aspace, segment)?;
-    }
+    register_image_load_segments(&aspace, image_plan)?;
 
     // Stack: anonymous private, page-aligned, anchored to `stack_top`.
     //
@@ -285,6 +286,20 @@ pub fn build_aspace_from_image<P: PmapIf>(
     register_recipe(&aspace, stack_entry)?;
 
     Ok(aspace)
+}
+
+/// Register every LOAD-segment recipe from an image plan into an existing
+/// detached address space. Used by dynamic exec after the main binary has
+/// created the aspace, so interpreter segments receive the same page-delta,
+/// file-offset, and BSS treatment as the main image.
+pub fn register_image_load_segments(
+    aspace: &Cap<AddressSpace>,
+    image_plan: &ImagePlan,
+) -> Result<(), ScriptError> {
+    for segment in &image_plan.load_segments {
+        register_load_segment(aspace, segment)?;
+    }
+    Ok(())
 }
 
 /// Populate a kernel-side `bytes` slice into the detached aspace at
@@ -646,6 +661,37 @@ mod tests {
             USER_STACK_TOP_DEFAULT - USER_STACK_INITIAL_RESERVATION
         );
         assert_eq!(stack.range.end().as_usize() as u64, USER_STACK_TOP_DEFAULT);
+    }
+
+    #[test]
+    fn build_aspace_from_image_stack_reservation_covers_libctest_qsort_frame() {
+        let _g = setup();
+        let plan = ImagePlan {
+            entry: 0x1_0000,
+            stack_top: USER_STACK_TOP_DEFAULT,
+            load_segments: Vec::new(),
+            bss_extension: None,
+            executable_stack: false,
+        };
+
+        let aspace =
+            build_aspace_from_image::<crate::vm::TestPmap>(&plan).expect("build empty aspace");
+        let stack = aspace
+            .recipes_snapshot()
+            .into_iter()
+            .find(|entry| entry.range.end().as_usize() as u64 == USER_STACK_TOP_DEFAULT)
+            .expect("stack recipe");
+
+        let qsort_local_arrays = 2 * 1026 * core::mem::size_of::<u64>() as u64;
+        let conservative_call_frames = 4 * USER_PAGE_SIZE as u64;
+        let lowest_expected_sp =
+            USER_STACK_TOP_DEFAULT - (qsort_local_arrays + conservative_call_frames);
+        assert!(
+            stack.range.start().as_usize() as u64 <= lowest_expected_sp,
+            "stack reservation starts at {:#x}, above qsort frame low water {:#x}",
+            stack.range.start().as_usize(),
+            lowest_expected_sp
+        );
     }
 
     #[test]

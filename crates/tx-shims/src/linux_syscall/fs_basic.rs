@@ -60,17 +60,17 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            let mut script_ctx = build_subject_script_ctx(ctx);
-            let mut op = FcntlDupFdOp {
-                process: ctx.process.clone(),
-                fd,
-                min: arg as u32,
-                cloexec: cmd == F_DUPFD_CLOEXEC,
+            let min = match u32::try_from(arg) {
+                Ok(min) => min,
+                Err(_) => return SyscallResult::Error(EINVAL_VALUE),
             };
-            return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-                Ok(new_fd) => SyscallResult::Return(new_fd as i64),
-                Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+            let new_fd = match next_fd_below_nofile(&ctx.process, min) {
+                Ok(fd) => fd,
+                Err(result) => return result,
             };
+            let _prev = ctx.process.install_fd(new_fd, file);
+            ctx.process.set_fd_cloexec(new_fd, cmd == F_DUPFD_CLOEXEC);
+            return SyscallResult::Return(new_fd as i64);
         }
         F_GETFL => {
             let mut script_ctx = build_subject_script_ctx(ctx);
@@ -211,6 +211,10 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     };
 
     let walker_cred = ctx.walker_cred();
+    let fd = match next_stdio_fd_below_nofile(&ctx.process) {
+        Ok(fd) => fd,
+        Err(result) => return result,
+    };
 
     // PR async migration: non-O_CREAT, non-O_TRUNC simple open
     // goes through `OpenOp + drive()` — no manual step loop.
@@ -243,7 +247,6 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
                 return SyscallResult::error_from(Errno::from(v3errno));
             }
         };
-        let fd = ctx.process.allocate_fd();
         let _ = ctx.process.set_fd(fd, Some(openfile));
         if want_cloexec {
             ctx.process.set_fd_cloexec(fd, true);
@@ -351,10 +354,8 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         }
     };
 
-    // Step 4: install at the lowest unused fd ≥ 0. Per fd-ops Wave 1
-    // the fd table is a sparse `BTreeMap<u32, Cap<OpenFile>>`;
-    // `allocate_fd()` scans for the lowest unused key.
-    let fd = ctx.process.allocate_fd();
+    // Step 4: install into the fd slot reserved before VFS work so a
+    // full fd table reports EMFILE before path lookup errors.
     let _ = ctx.process.set_fd(fd, Some(openfile));
     if want_cloexec {
         ctx.process.set_fd_cloexec(fd, true);
@@ -401,15 +402,17 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// (we clone the `Cap<OpenFile>`); both fds reference the same
 /// epoch-managed identity.
 pub(super) fn sys_dup<'a>(oldfd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let mut op = DupOp {
-        process: ctx.process.clone(),
-        oldfd,
+    let file = match ctx.process.fd(oldfd) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
     };
-    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-        Ok(newfd) => SyscallResult::Return(newfd as i64),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
-    }
+    let newfd = match next_stdio_fd_below_nofile(&ctx.process) {
+        Ok(fd) => fd,
+        Err(result) => return result,
+    };
+    let _ = ctx.process.set_fd(newfd, Some(file));
+    ctx.process.set_fd_cloexec(newfd, false);
+    SyscallResult::Return(newfd as i64)
 }
 
 /// `dup3(oldfd, newfd, flags)`. Linux RV64 generic ABI
@@ -434,6 +437,9 @@ pub(super) fn sys_dup3<'a>(
     flags: u32,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
+    if newfd >= RLIMIT_NOFILE_CUR {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = Dup3Op {
         process: ctx.process.clone(),
@@ -506,9 +512,19 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
     // reader first so on a fresh process it lands at 0 and the
     // writer at 1, matching Linux's user-visible (3, 4) pattern
     // post-stdin/out/err.
-    let reader_fd = ctx.process.allocate_fd();
+    let reader_fd = match next_stdio_fd_below_nofile(&ctx.process) {
+        Ok(fd) => fd,
+        Err(result) => return result,
+    };
     let _ = ctx.process.install_fd(reader_fd, reader_cap);
-    let writer_fd = ctx.process.allocate_fd();
+    let writer_fd = match next_stdio_fd_below_nofile(&ctx.process) {
+        Ok(fd) => fd,
+        Err(result) => {
+            let _ = ctx.process.set_fd(reader_fd, None);
+            ctx.process.set_fd_cloexec(reader_fd, false);
+            return result;
+        }
+    };
     let _ = ctx.process.install_fd(writer_fd, writer_cap);
 
     if pipe_flags.cloexec {
@@ -852,13 +868,15 @@ pub(super) struct StatLayout {
     __pad2: i32,
     pub(super) st_blocks: i64,
     pub(super) st_atime_sec: i64,
-    pub(super) st_atime_nsec: u64,
+    pub(super) st_atime_nsec: i64,
     pub(super) st_mtime_sec: i64,
-    pub(super) st_mtime_nsec: u64,
+    pub(super) st_mtime_nsec: i64,
     pub(super) st_ctime_sec: i64,
-    pub(super) st_ctime_nsec: u64,
+    pub(super) st_ctime_nsec: i64,
     __unused: [u32; 2],
 }
+
+const _: () = assert!(core::mem::size_of::<StatLayout>() == 128);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -902,6 +920,25 @@ const _: () = assert!(core::mem::size_of::<StatxLayout>() == 256);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct StatfsLayout {
+    f_type: u64,
+    f_bsize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_namelen: u64,
+    f_frsize: u64,
+    f_flags: u64,
+    f_spare: [u64; 4],
+}
+
+const _: () = assert!(core::mem::size_of::<StatfsLayout>() == 120);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct LinuxDirent64Header {
     d_ino: u64,
     d_off: i64,
@@ -930,13 +967,30 @@ pub(super) fn inode_meta_to_stat(meta: &InodeMeta, ino: u64, rdev: u64) -> StatL
         __pad2: 0,
         st_blocks: meta.blocks as i64,
         st_atime_sec: meta.atime.sec,
-        st_atime_nsec: meta.atime.nsec as u64,
+        st_atime_nsec: meta.atime.nsec as i64,
         st_mtime_sec: meta.mtime.sec,
-        st_mtime_nsec: meta.mtime.nsec as u64,
+        st_mtime_nsec: meta.mtime.nsec as i64,
         st_ctime_sec: meta.ctime.sec,
-        st_ctime_nsec: meta.ctime.nsec as u64,
+        st_ctime_nsec: meta.ctime.nsec as i64,
         __unused: [0, 0],
     }
+}
+
+fn clamp_meta_future_times<P: TimeIf>(mut meta: InodeMeta) -> InodeMeta {
+    if meta.kind() != InodeKind::Directory {
+        return meta;
+    }
+    let now = ns_to_timespec(<P as TimeIf>::read_ns());
+    let clamp_one = |ts: &mut tx_subsystems::vfs::Timespec| {
+        if ts.sec > now.tv_sec || (ts.sec == now.tv_sec && ts.nsec as i64 > now.tv_nsec) {
+            ts.sec = now.tv_sec;
+            ts.nsec = now.tv_nsec as i32;
+        }
+    };
+    clamp_one(&mut meta.atime);
+    clamp_one(&mut meta.mtime);
+    clamp_one(&mut meta.ctime);
+    meta
 }
 
 fn inode_meta_to_statx(meta: &InodeMeta, ino: u64) -> StatxLayout {
@@ -1015,7 +1069,7 @@ fn stat_meta_for_open_file(file: &Cap<OpenFile>) -> InodeMeta {
 /// - Unknown / closed fd → `-EBADF`.
 /// - `statbuf == 0` (NULL) → `-EFAULT`.
 /// - All other paths return `0` after writing the buffer.
-pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_fstat<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
     let statbuf_uaddr = args[1];
 
@@ -1032,7 +1086,7 @@ pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 
     let rnode = file.rnode();
     let fs_object_id = rnode.fs_object_id();
-    let meta = stat_meta_for_open_file(&file);
+    let meta = clamp_meta_future_times::<P>(stat_meta_for_open_file(&file));
     let ino = fs_object_id.as_u64();
     let stat = inode_meta_to_stat(&meta, ino, 0);
 
@@ -1166,7 +1220,10 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 ///
 /// Path resolution mirrors `resolve_path_at`'s shape (using
 /// `step_walk` from cwd with `walker_cred`).
-pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_newfstatat<'a, P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
     let statbuf_uaddr = args[2];
@@ -1206,7 +1263,7 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         if dirfd == AT_FDCWD {
             (cwd.rnode().meta(), cwd.rnode().fs_object_id())
         } else {
-            return sys_fstat([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx);
+            return sys_fstat::<P>([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx);
         }
     } else {
         if dirfd != AT_FDCWD {
@@ -1228,7 +1285,7 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         }
     };
 
-    let stat = inode_meta_to_stat(&meta, ino.as_u64(), 0);
+    let stat = inode_meta_to_stat(&clamp_meta_future_times::<P>(meta), ino.as_u64(), 0);
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
         return SyscallResult::error_from(errno);
@@ -1421,12 +1478,21 @@ pub(super) fn fs_ops_for_rnode(
 pub(super) async fn sys_statfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let buf_uaddr = args[1];
-    let mut buf = [0u8; 120];
-    buf[0..8].copy_from_slice(&0x01021994u64.to_le_bytes());
-    buf[8..16].copy_from_slice(&4096u64.to_le_bytes());
-    buf[88..96].copy_from_slice(&255u64.to_le_bytes());
-    buf[96..104].copy_from_slice(&4096u64.to_le_bytes());
-    if let Err(e) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &buf) {
+    let statfs = StatfsLayout {
+        f_type: 0x0102_1994,
+        f_bsize: 4096,
+        f_blocks: 1024,
+        f_bfree: 512,
+        f_bavail: 512,
+        f_files: 1024,
+        f_ffree: 512,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: 4096,
+        f_flags: 0,
+        f_spare: [0; 4],
+    };
+    if let Err(e) = bootstrap_write_user::<StatfsLayout>(&ctx.aspace, buf_uaddr, statfs) {
         return SyscallResult::error_from(e);
     }
     SyscallResult::Return(0)

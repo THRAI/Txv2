@@ -108,16 +108,16 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
 
     // Snapshot clear_child_tid and robust-list BEFORE
     // set_thread_zombie drops the thread payload.
-    let ctid = thread.payload.lock().as_ref().and_then(|p| *p.clear_child_tid.lock());
-    let robust = thread
+    let ctid = thread
         .payload
         .lock()
         .as_ref()
-        .and_then(|p| {
-            let head = *p.robust_list_head.lock();
-            let len = *p.robust_list_len.lock();
-            head.map(|h| (h, len))
-        });
+        .and_then(|p| *p.clear_child_tid.lock());
+    let robust = thread.payload.lock().as_ref().and_then(|p| {
+        let head = *p.robust_list_head.lock();
+        let len = *p.robust_list_len.lock();
+        head.map(|h| (h, len))
+    });
 
     // observe
     // upgrade
@@ -165,11 +165,8 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
         if let Some(proc) = thread.owner_proc.upgrade(&guard) {
             if let Some(payload) = proc.payload.lock().as_ref() {
                 let aspace = payload.aspace_cap();
-                let _ = aspace.copy_to_user(
-                    UserPtr::<u8>::new(ctid_ptr as usize),
-                    &[0u8; 4],
-                    &guard,
-                );
+                let _ =
+                    aspace.copy_to_user(UserPtr::<u8>::new(ctid_ptr as usize), &[0u8; 4], &guard);
             }
         }
         // Wake waiters on the clear_child_tid futex. Best-effort:
@@ -184,6 +181,8 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     if let Some((head, _len)) = robust {
         walk_robust_list(&thread, head, 16);
     }
+
+    crate::process::numbers::unregister_pid_number(thread.tid.0 as u64);
 }
 
 /// Best-effort robust-list walk on thread exit.
@@ -328,6 +327,7 @@ pub fn step_sigprocmask(
 pub fn post_signal(
     thread: &Cap<ThreadIdentity>,
     sig: Signum,
+    routing: SignalRouting,
     info: Option<crate::signal::SigInfo>,
 ) {
     debug_assert!(
@@ -359,13 +359,8 @@ pub fn post_signal(
 
     // D9-A: post the wake-hint to the thread's mailbox *after* the
     // summary update so a parked future, on re-poll, observes the
-    // same summary bit the post advertises. Routing is
-    // `ProcessDirected` — `post_signal` is the back-end for
-    // `step_kill_process` / `step_kill_pgrp` (process-directed
-    // delivery). A future tgkill-shaped entry point that targets a
-    // specific thread will route through a sibling helper that
-    // passes `ThreadDirected { tid: thread.tid.0 as u64 }` instead.
-    post_signal_mailbox(&payload, sig, SignalRouting::ProcessDirected);
+    // same summary bit the post advertises.
+    post_signal_mailbox(&payload, sig, routing);
 }
 
 // ---------------------------------------------------------------------------
@@ -528,7 +523,10 @@ impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
         // reserve — N/A
         // commit — post_signal delivers to thread's pending queue
         // publish — post_signal sends MailboxEvent if mailbox bound
-        post_signal(&self.thread, self.sig, self.info);
+        let routing = SignalRouting::ThreadDirected {
+            tid: self.thread.tid.0 as u64,
+        };
+        post_signal(&self.thread, self.sig, routing, self.info);
         crate::thread_runtime::adapter::step_engine::StepOutcome::Done(())
     }
 }

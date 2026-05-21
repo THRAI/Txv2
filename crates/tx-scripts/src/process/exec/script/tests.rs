@@ -140,6 +140,10 @@ impl PmapIf for ScriptsTestPmap {
     }
 }
 
+impl tx_hal::ConsoleIf for ScriptsTestPmap {
+    fn write_bytes(_bytes: &[u8]) {}
+}
+
 // `exec_script::<P>` requires `P: PmapIf + EntropyIf`. The trait
 // default fills bytes from the deterministic boot-counter
 // xorshift, which is exactly what test sites want — non-zero,

@@ -1380,6 +1380,21 @@ impl OpenFile {
         }
     }
 
+    /// `Some(&Cap<Epoll>)` iff this `OpenFile` is the epoll-backed
+    /// shape. Returns `None` for every non-epoll `OpenFile`.
+    pub fn epoll(&self) -> Option<&Cap<Epoll>> {
+        match &self.backing {
+            OpenFileBacking::Epoll { ep } => Some(ep),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::Ufd { .. }
+            | OpenFileBacking::AioContext { .. }
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. } => None,
+        }
+    }
+
     /// Load the current per-fd offset.
     ///
     /// `Acquire` paired with the `Release` store in `set_offset` /

@@ -65,8 +65,8 @@ use tx_subsystems::futex::FutexWakeOp;
 use tx_subsystems::page_backed::TruncateOp as FdTruncateOp;
 use tx_subsystems::process::{
     process_by_pid, seed_child_leader_context, step_waitpid_nohang, ChdirOp, ChdirOutcome, CloseOp,
-    Dup3Op, DupOp, ExitGroupOp, ExitStatus, FcntlDupFdOp, FcntlFdOp, GetcwdOp, Pgid, Pid,
-    ProcessIdentity, SetpgidOp, SetsidOp, WaitError, WaitTarget,
+    Dup3Op, ExitGroupOp, ExitStatus, FcntlFdOp, GetcwdOp, Pgid, Pid, ProcessIdentity, SetpgidOp,
+    SetsidOp, WaitError, WaitTarget,
 };
 use tx_subsystems::reactor_submit;
 use tx_subsystems::signal::{
@@ -142,6 +142,8 @@ mod eventfd;
 use eventfd::*;
 mod timerfd;
 use timerfd::*;
+mod epoll;
+use epoll::*;
 
 mod ctx;
 pub use ctx::*;
@@ -159,35 +161,33 @@ pub use numbers::{
     AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW,
     CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW,
     CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID,
-    CLONE_CHILD_CLEARTID, CLONE_FILES, CLONE_FS, CLONE_PARENT, CLONE_PARENT_SETTID, CLONE_SETTLS,
-    CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM, CLONE_DETACHED,
-    CLONE_SYSVSEM, CLONE_NEWCGROUP, CLONE_NEWUTS,
-    DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK,
-    DT_REG, DT_SOCK, DT_UNKNOWN, FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK,
-    FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_TRYLOCK_PI,
-    FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP,
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_OK, F_SETFD, F_SETFL, GRND_INSECURE,
-    GRND_NONBLOCK, GRND_RANDOM, MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM,
-    MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED,
-    MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE,
-    MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_STACK, MAP_SYNC, NR_BRK, NR_CHDIR, NR_CLOCK_GETTIME,
-    NR_CLOCK_NANOSLEEP, NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EPOLL_CREATE1, NR_EPOLL_CTL,
-    NR_EPOLL_PWAIT, NR_EPOLL_WAIT, NR_EVENTFD2, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT,
-    NR_FACCESSAT2, NR_FCHDIR, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_FDATASYNC, NR_FLOCK, NR_FSTAT,
-    NR_FSTATFS, NR_FSYNC, NR_FTRUNCATE, NR_FUTEX, NR_GETCWD, NR_GETDENTS64, NR_GETEGID, NR_GETEUID,
-    NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID,
-    NR_GETRESUID, NR_GETSID, NR_GETTID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_IO_DESTROY,
-    NR_IO_GETEVENTS, NR_IO_SETUP, NR_IO_SUBMIT, NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_KILL,
-    NR_LINKAT, NR_LSEEK, NR_MADVISE, NR_MKDIRAT, NR_MKNODAT, NR_MLOCK, NR_MMAP, NR_MOUNT,
-    NR_MPROTECT, NR_MQ_GETSETATTR, NR_MQ_NOTIFY, NR_MQ_OPEN, NR_MQ_TIMEDRECEIVE, NR_MQ_TIMEDSEND,
-    NR_MQ_UNLINK, NR_MREMAP, NR_MSGCTL, NR_MSGGET, NR_MSGRCV, NR_MSGSND, NR_MSYNC, NR_MUNLOCK,
-    NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT, NR_OPENAT, NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL,
-    NR_PIPE2, NR_PPOLL, NR_PRLIMIT64, NR_READ, NR_READLINKAT, NR_READV, NR_RENAMEAT2,
-    NR_RT_SIGACTION, NR_RT_SIGPENDING, NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN,
-    NR_SCHED_SETSCHEDULER,
-    NR_RT_SIGSUSPEND, NR_RT_SIGTIMEDWAIT, NR_SEMCTL, NR_SEMGET, NR_SEMOP, NR_SEMTIMEDOP, NR_SETGID,
-    NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID,
-    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET,
+    CLONE_CHILD_CLEARTID, CLONE_DETACHED, CLONE_FILES, CLONE_FS, CLONE_NEWCGROUP, CLONE_NEWUTS,
+    CLONE_PARENT, CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_SIGHAND, CLONE_SYSVSEM, CLONE_THREAD,
+    CLONE_VFORK, CLONE_VM, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, DT_UNKNOWN,
+    FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI,
+    FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT,
+    FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, F_DUPFD, F_DUPFD_CLOEXEC,
+    F_GETFD, F_GETFL, F_OK, F_SETFD, F_SETFL, GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM,
+    MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED,
+    MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN,
+    MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED,
+    MAP_STACK, MAP_SYNC, NR_BRK, NR_CHDIR, NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLONE,
+    NR_CLOSE, NR_DUP, NR_DUP3, NR_EPOLL_CREATE1, NR_EPOLL_CTL, NR_EPOLL_PWAIT, NR_EPOLL_WAIT,
+    NR_EVENTFD2, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHDIR,
+    NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_FDATASYNC, NR_FLOCK, NR_FSTAT, NR_FSTATFS, NR_FSYNC,
+    NR_FTRUNCATE, NR_FUTEX, NR_GETCWD, NR_GETDENTS64, NR_GETEGID, NR_GETEUID, NR_GETGID,
+    NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID, NR_GETRESUID,
+    NR_GETSID, NR_GETTID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_IO_DESTROY, NR_IO_GETEVENTS,
+    NR_IO_SETUP, NR_IO_SUBMIT, NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_KILL, NR_LINKAT, NR_LSEEK,
+    NR_MADVISE, NR_MKDIRAT, NR_MKNODAT, NR_MLOCK, NR_MMAP, NR_MOUNT, NR_MPROTECT, NR_MQ_GETSETATTR,
+    NR_MQ_NOTIFY, NR_MQ_OPEN, NR_MQ_TIMEDRECEIVE, NR_MQ_TIMEDSEND, NR_MQ_UNLINK, NR_MREMAP,
+    NR_MSGCTL, NR_MSGGET, NR_MSGRCV, NR_MSGSND, NR_MSYNC, NR_MUNLOCK, NR_MUNMAP, NR_NANOSLEEP,
+    NR_NEWFSTATAT, NR_OPENAT, NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL, NR_PIPE2, NR_PPOLL,
+    NR_PRLIMIT64, NR_READ, NR_READLINKAT, NR_READV, NR_RENAMEAT2, NR_RT_SIGACTION,
+    NR_RT_SIGPENDING, NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN, NR_RT_SIGSUSPEND,
+    NR_RT_SIGTIMEDWAIT, NR_SCHED_SETSCHEDULER, NR_SEMCTL, NR_SEMGET, NR_SEMOP, NR_SEMTIMEDOP,
+    NR_SETGID, NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID,
+    NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET,
     NR_SIGALTSTACK, NR_SIGNALFD, NR_SIGNALFD4, NR_STATFS, NR_STATX, NR_SYMLINKAT, NR_SYNC,
     NR_SYNCFS, NR_SYSLOG, NR_TGKILL, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME,
     NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UMOUNT2, NR_UNAME, NR_UNLINKAT, NR_USERFAULTFD,
@@ -206,8 +206,8 @@ pub use numbers::{
     MEMBARRIER_CMD_GLOBAL, MEMBARRIER_CMD_GLOBAL_EXPEDITED, MEMBARRIER_CMD_PRIVATE_EXPEDITED,
     MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, MEMBARRIER_CMD_QUERY,
     MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED,
-    MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE, MEMBARRIER_SUPPORTED_MASK,
-    NR_MEMBARRIER, NR_SENDFILE64,
+    MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE, MEMBARRIER_SUPPORTED_MASK, NR_MEMBARRIER,
+    NR_SENDFILE64,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -247,6 +247,8 @@ pub(super) const ENOSYS_VALUE: i32 = 38;
 pub(super) const ENODEV_VALUE: i32 = 19;
 /// Linux generic ABI errno value for "bad file descriptor" (`EBADF`).
 pub(super) const EBADF_VALUE: i32 = 9;
+/// Linux generic ABI errno value for "too many open files" (`EMFILE`).
+pub(super) const EMFILE_VALUE: i32 = 24;
 /// Linux generic ABI errno value for "bad address" (`EFAULT`).
 /// Used by Slice 4's time syscalls when a required user pointer is
 /// null, and by every `bootstrap_*` user-VA bridge for invalid user
@@ -280,6 +282,12 @@ pub(super) const EPERM_VALUE: i32 = 1;
 /// Used by `setpgid` / `setsid` when zone allocation fails minting a
 /// fresh `ProcessGroup` / `Session`.
 pub(super) const ENOMEM_VALUE: i32 = 12;
+/// Static `RLIMIT_NOFILE.rlim_cur` advertised by `prlimit64`.
+///
+/// fd-producing syscall arms must not hand userspace fd numbers
+/// greater than or equal to this value, or musl's `t_fdfill()` loops
+/// forever waiting for `EMFILE`.
+pub(super) const RLIMIT_NOFILE_CUR: u32 = 1024;
 /// Linux generic ABI errno value for "resource temporarily
 /// unavailable" (`EAGAIN`). Reserved for `sys_clone` to surface
 /// retriable allocator failures from `step_fork`'s VM-side clone path
@@ -307,6 +315,30 @@ pub(super) const EROFS_VALUE: i32 = 30;
 /// cannot produce today (chmod/chown/access never block in
 /// tmpfs/devfs); matches `errno_to_i32`'s `Errno::EIO` row.
 pub(super) const EIO_VALUE: i32 = 5;
+
+pub(super) fn next_fd_below_nofile(
+    process: &Cap<ProcessIdentity>,
+    min: u32,
+) -> Result<u32, SyscallResult> {
+    if min >= RLIMIT_NOFILE_CUR {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    let fd = process.allocate_fd_at_least(min);
+    if fd >= RLIMIT_NOFILE_CUR {
+        return Err(SyscallResult::Error(EMFILE_VALUE));
+    }
+    Ok(fd)
+}
+
+pub(super) fn next_stdio_fd_below_nofile(
+    process: &Cap<ProcessIdentity>,
+) -> Result<u32, SyscallResult> {
+    match next_fd_below_nofile(process, 0) {
+        Err(SyscallResult::Error(EINVAL_VALUE)) => Err(SyscallResult::Error(EMFILE_VALUE)),
+        other => other,
+    }
+}
+
 /// Required sigsetsize per Linux RV64 generic ABI: 8 bytes (a single
 /// `u64` bitset matching `tx_subsystems::signal::SignalMask`'s
 /// internal representation). `rt_sigprocmask` / `rt_sigaction`
@@ -367,7 +399,10 @@ pub(super) const SIGACTION_BYTES: usize = 32;
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
-pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
+pub async fn dispatch<
+    'a,
+    P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_hal::SignalFrameIf + tx_hal::ConsoleIf,
+>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -384,8 +419,8 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
     //
     // The threshold-based observation dump trigger is handled one level
     // up in `tx_kernel::thread_future::run_thread` so the dispatch
-    // signature stays free of `ConsoleIf + PowerIf` bounds that would
-    // ripple into every test-stub platform.
+    // signature stays free of the `PowerIf` bound that would ripple
+    // into every test-stub platform.
     let l0_span = emit_syscall_enter(&req);
     let prev = tx_observe::set_current_parent_span(l0_span);
     let result = dispatch_inner::<P>(req, ctx).await;
@@ -394,7 +429,10 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
     result
 }
 
-async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
+async fn dispatch_inner<
+    'a,
+    P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_hal::SignalFrameIf + tx_hal::ConsoleIf,
+>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -418,17 +456,17 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_TIMES => return sys_times::<P>(req.args, ctx),
         nr if nr == NR_GETTIMEOFDAY => return sys_gettimeofday::<P>(req.args, ctx),
         nr if nr == NR_UMASK => return sys_umask(req.args, ctx),
-        nr if nr == NR_UNAME => return sys_uname(req.args, ctx),
+        nr if nr == NR_UNAME => return sys_uname::<P>(req.args, ctx),
         nr if nr == NR_GETRANDOM => return sys_getrandom(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
-        nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
+        nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn::<P>(ctx),
         nr if nr == NR_SCHED_SETSCHEDULER => return sys_sched_setscheduler(),
         nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
         nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args, ctx),
         nr if nr == NR_MADVISE => return sys_madvise(req.args, ctx),
         nr if nr == NR_MLOCK => return sys_mlock(req.args, ctx).await,
         nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx).await,
-        nr if nr == NR_UTIMENSAT => return sys_utimensat(req.args, ctx),
+        nr if nr == NR_UTIMENSAT => return sys_utimensat::<P>(req.args, ctx),
         nr if nr == NR_SHMGET => return sys_shmget(req.args, ctx),
         nr if nr == NR_SHMDT => return sys_shmdt(req.args, ctx),
         nr if nr == NR_MSGGET => return sys_msgget(req.args, ctx),
@@ -584,8 +622,8 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         // (`fstat` / `newfstatat` / `getdents64` / `getcwd` / `chdir`
         // / `umask`). `fchdir` returns `-ENOSYS` (carryover; OpenFile
         // has no DEntry hint to install via step_chdir).
-        nr if nr == NR_FSTAT => sys_fstat(req.args, ctx),
-        nr if nr == NR_NEWFSTATAT => sys_newfstatat(req.args, ctx).await,
+        nr if nr == NR_FSTAT => sys_fstat::<P>(req.args, ctx),
+        nr if nr == NR_NEWFSTATAT => sys_newfstatat::<P>(req.args, ctx).await,
         nr if nr == NR_GETCWD => sys_getcwd(req.args, ctx),
         nr if nr == NR_CHDIR => sys_chdir(req.args, ctx).await,
         nr if nr == NR_FCHDIR => sys_fchdir::<P>(req.args, ctx).await,
@@ -717,7 +755,28 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
             ctx,
         ),
         // timerfd_gettime(fd, curr_value).
-        nr if nr == NR_TIMERFD_GETTIME => sys_timerfd_gettime(req.args[0] as u32, req.args[2], ctx),
+        nr if nr == NR_TIMERFD_GETTIME => {
+            sys_timerfd_gettime::<P>(req.args[0] as u32, req.args[1], ctx)
+        }
+        // epoll_create1 / epoll_ctl / epoll_pwait — generic Linux
+        // numbers used by musl on RV64 and LoongArch64. musl's
+        // epoll_wait wrapper calls epoll_pwait with a null mask on
+        // these targets.
+        nr if nr == NR_EPOLL_CREATE1 => sys_epoll_create1(req.args[0] as u32, ctx),
+        nr if nr == NR_EPOLL_CTL => sys_epoll_ctl(
+            req.args[0] as u32,
+            req.args[1] as u32,
+            req.args[2] as u32,
+            req.args[3],
+            ctx,
+        ),
+        nr if nr == NR_EPOLL_PWAIT => sys_epoll_wait::<P>(
+            req.args[0] as u32,
+            req.args[1],
+            req.args[2] as u32,
+            req.args[3] as i32,
+            ctx,
+        ),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -744,7 +803,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
 ///   expedited plus instruction-fetch barrier (`fence.i` on RV64).
 /// - `MEMBARRIER_CMD_REGISTER_*` — registration is a no-op; always
 ///   returns 0.
-/// `sched_setscheduler(pid, policy, param)` — v1 stub.
+///   `sched_setscheduler(pid, policy, param)` — v1 stub.
 ///
 /// musl calls this during `pthread_create` to set the new thread's
 /// scheduling policy. Returns 0 unconditionally (success, no-op);

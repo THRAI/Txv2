@@ -47,20 +47,33 @@ impl ItimerSpec {
     }
 
     pub fn from_bytes(bytes: &[u8; ITIMERSPEC_BYTES]) -> Self {
+        Self::try_from_bytes(bytes).unwrap_or_default()
+    }
+
+    pub fn try_from_bytes(bytes: &[u8; ITIMERSPEC_BYTES]) -> Option<Self> {
         let ival_sec = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
         let ival_nsec = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
         let val_sec = i64::from_le_bytes(bytes[16..24].try_into().unwrap());
         let val_nsec = i64::from_le_bytes(bytes[24..32].try_into().unwrap());
-        let it_interval_ns = (ival_sec.max(0) as u64)
+        if ival_sec < 0
+            || ival_nsec < 0
+            || ival_nsec >= 1_000_000_000
+            || val_sec < 0
+            || val_nsec < 0
+            || val_nsec >= 1_000_000_000
+        {
+            return None;
+        }
+        let it_interval_ns = (ival_sec as u64)
             .saturating_mul(1_000_000_000)
-            .saturating_add(ival_nsec.max(0) as u64);
-        let it_value_ns = (val_sec.max(0) as u64)
+            .saturating_add(ival_nsec as u64);
+        let it_value_ns = (val_sec as u64)
             .saturating_mul(1_000_000_000)
-            .saturating_add(val_nsec.max(0) as u64);
-        ItimerSpec {
+            .saturating_add(val_nsec as u64);
+        Some(ItimerSpec {
             it_interval_ns,
             it_value_ns,
-        }
+        })
     }
 }
 
@@ -120,6 +133,15 @@ impl TimerFd {
 
     pub fn expiration_count(&self) -> u64 {
         self.expiration_count.load(Ordering::Acquire)
+    }
+
+    pub fn remaining_value_ns(&self, now_ns: u64) -> u64 {
+        let deadline = self.deadline_ns();
+        if deadline == 0 {
+            0
+        } else {
+            deadline.saturating_sub(now_ns)
+        }
     }
 
     fn bump_expirations(&self, now_ns: u64) -> u64 {
@@ -186,7 +208,7 @@ pub fn timerfd_settime(
     if let Some(old) = old_value {
         *old = ItimerSpec {
             it_interval_ns: tfd.interval_ns(),
-            it_value_ns: tfd.deadline_ns(),
+            it_value_ns: tfd.remaining_value_ns(now_ns),
         };
     }
     let it_value = new_value.it_value_ns;

@@ -24,8 +24,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    ByteProgress, InterestMask, NoProgress, SpinMutex, StepOutcome, WaitSource, WaitSourceId,
-    YieldShape, Zone, ZoneAllocated, ZoneError,
+    ByteProgress, InterestMask, NoProgress, SpinMutex, StepOutcome, V3Errno, WaitSource,
+    WaitSourceId, YieldShape, Zone, ZoneAllocated, ZoneError,
 };
 
 // ---------------------------------------------------------------------------
@@ -33,18 +33,19 @@ use adapter::step_engine::{
 // ---------------------------------------------------------------------------
 
 /// Monitored fd entry.
-#[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
 #[derive(Clone, Debug)]
-struct EpollEntry {
+pub struct EpollEntry {
     /// Userspace fd number.
-    fd: u32,
+    pub fd: u32,
     /// `epoll_event.events` mask set by `EPOLL_CTL_ADD` / `EPOLL_CTL_MOD`.
-    interests: u32,
+    pub interests: u32,
+    /// Opaque `epoll_event.data` payload copied from userspace.
+    pub data: u64,
     /// The monitored fd's [`WaitSourceId`] (the bus wire that fires
     /// when the fd becomes readable/writable). `WaitSourceId::new(0)`
     /// is a sentinel meaning "source not yet known" — the entry is
     /// tracked but does not contribute to readiness.
-    source: WaitSourceId,
+    pub source: WaitSourceId,
 }
 
 /// Per-instance epoll state.
@@ -112,6 +113,10 @@ impl Epoll {
     pub fn wait_source_id(&self) -> WaitSourceId {
         self.wait_source.id()
     }
+
+    pub fn entries_snapshot(&self) -> alloc::vec::Vec<EpollEntry> {
+        self.fds.lock().values().cloned().collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +134,7 @@ pub fn step_epoll_ctl_add(
     ep: &Epoll,
     fd: u32,
     interests: u32,
+    data: u64,
     source: WaitSourceId,
 ) -> StepOutcome<(), NoProgress> {
     // observe — N/A: ep is &Epoll (always alive)
@@ -137,14 +143,39 @@ pub fn step_epoll_ctl_add(
     // commit — entry inserted atomically with respect to the lock
     // publish — N/A: no signal attachments
     let mut fds = ep.fds.lock();
+    if fds.contains_key(&fd) {
+        return StepOutcome::Err(V3Errno::EEXIST);
+    }
     fds.insert(
         fd,
         EpollEntry {
             fd,
             interests,
+            data,
             source,
         },
     );
+    StepOutcome::Done(())
+}
+
+/// `epoll_ctl(MOD)`: update an existing monitored fd.
+pub fn step_epoll_ctl_mod(
+    ep: &Epoll,
+    fd: u32,
+    interests: u32,
+    data: u64,
+    source: WaitSourceId,
+) -> StepOutcome<(), NoProgress> {
+    let mut fds = ep.fds.lock();
+    let Some(entry) = fds.get_mut(&fd) else {
+        return StepOutcome::Err(V3Errno::ENOENT);
+    };
+    *entry = EpollEntry {
+        fd,
+        interests,
+        data,
+        source,
+    };
     StepOutcome::Done(())
 }
 
@@ -156,8 +187,11 @@ pub fn step_epoll_ctl_del(ep: &Epoll, fd: u32) -> StepOutcome<(), NoProgress> {
     // commit — entry removed
     // publish — N/A
     let mut fds = ep.fds.lock();
-    fds.remove(&fd);
-    StepOutcome::Done(())
+    if fds.remove(&fd).is_some() {
+        StepOutcome::Done(())
+    } else {
+        StepOutcome::Err(V3Errno::ENOENT)
+    }
 }
 
 /// `epoll_wait`: block until ready events arrive, then return count.

@@ -32,6 +32,7 @@ const E_EXIST: i32 = 17;
 const E_INVAL: i32 = 22;
 const E_ACCES: i32 = 13;
 const E_NAMETOOLONG: i32 = 36;
+const E_MFILE: i32 = 24;
 
 fn ensure_zero_frame_claimed() {
     match page_allocator::claim_zero_frame() {
@@ -169,6 +170,68 @@ fn dispatch_openat_existing_file_o_rdonly_returns_fd() {
         other => panic!("openat existing file: {other:?}"),
     }
     drop(path);
+}
+
+/// `openat` reports `EMFILE` before path lookup once the visible fd
+/// table is full. Musl's `daemon_failure` relies on this ordering for
+/// `open("/dev/null")` after `t_fdfill()`.
+#[test]
+fn dispatch_openat_full_fd_table_returns_neg_emfile_before_enoent() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let path = nul_terminate(b"/f");
+    let oldfd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                O_RDONLY as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("openat /f: {other:?}"),
+    };
+    let file = proc_cap.fd(oldfd).expect("oldfd installed");
+    for fd in 1..1024 {
+        let _ = proc_cap.install_fd(fd, file.clone());
+    }
+
+    let missing = nul_terminate(b"/missing");
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                missing.as_ptr() as u64,
+                O_RDONLY as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_MFILE));
+    drop(path);
+    drop(missing);
 }
 
 /// `openat(AT_FDCWD, "/new", O_RDWR | O_CREAT, 0o644)` against a
@@ -633,6 +696,54 @@ fn dispatch_dup_closed_fd_returns_neg_ebadf() {
     assert_eq!(result, SyscallResult::Error(E_BADF));
 }
 
+/// `dup(oldfd)` must stop at the advertised `RLIMIT_NOFILE` ceiling.
+/// Musl's `t_fdfill()` depends on this returning `EMFILE`.
+#[test]
+fn dispatch_dup_at_rlimit_nofile_returns_neg_emfile() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let path = nul_terminate(b"/f");
+    let oldfd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                O_RDONLY as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("openat: {other:?}"),
+    };
+    let file = proc_cap.fd(oldfd).expect("oldfd installed");
+    for fd in 1..1024 {
+        let _ = proc_cap.install_fd(fd, file.clone());
+    }
+
+    let req = SyscallRequest::new(NR_DUP, [oldfd as u64, 0, 0, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_MFILE));
+    assert!(proc_cap.fd(1024).is_none(), "fd 1024 must stay uninstalled");
+    drop(path);
+}
+
 // ----------------------------------------------------------------
 // dup3
 // ----------------------------------------------------------------
@@ -833,5 +944,48 @@ fn dispatch_dup3_invalid_flags_returns_neg_einval() {
     let req = SyscallRequest::new(NR_DUP3, [fd as u64, 50u64, junk_flags, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_INVAL));
+    drop(path);
+}
+
+/// `dup3(oldfd, newfd, 0)` rejects target fds at or beyond the
+/// process-visible fd limit.
+#[test]
+fn dispatch_dup3_target_at_rlimit_nofile_returns_neg_ebadf() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/f");
+    let oldfd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                O_RDONLY as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("openat: {other:?}"),
+    };
+
+    let req = SyscallRequest::new(NR_DUP3, [oldfd as u64, 1024, 0, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_BADF));
     drop(path);
 }

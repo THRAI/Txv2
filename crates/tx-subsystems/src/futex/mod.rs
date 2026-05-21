@@ -373,10 +373,7 @@ mod tests {
     /// `user_va` seeded with `word` at offset 0 of the page.
     /// Returns the `AddressSpace` (which must live at least as long
     /// as any guard used to access it) and the user VA of the word.
-    fn setup_aspace_with_word(
-        user_va: usize,
-        word: u32,
-    ) -> (AddressSpace, u64) {
+    fn setup_aspace_with_word(user_va: usize, word: u32) -> (AddressSpace, u64) {
         use crate::vm::{
             MapPlacement, MapReserveResult, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry,
             VmEntryFlags, USER_PAGE_SIZE,

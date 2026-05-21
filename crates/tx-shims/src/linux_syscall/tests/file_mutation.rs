@@ -21,8 +21,9 @@ use tx_subsystems::vfs::structure::{
 use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
-    AT_FDCWD, AT_REMOVEDIR, NR_FTRUNCATE, NR_LINKAT, NR_MKDIRAT, NR_READLINKAT, NR_RENAMEAT2,
-    NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT, NR_UTIMENSAT, RENAME_EXCHANGE, RENAME_NOREPLACE,
+    AT_FDCWD, AT_REMOVEDIR, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_MKDIRAT, NR_OPENAT,
+    NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT, NR_UTIMENSAT, O_RDWR,
+    RENAME_EXCHANGE, RENAME_NOREPLACE, UTIME_NOW,
 };
 
 /// errno magnitudes (positive Linux RV64 generic ABI values).
@@ -35,6 +36,29 @@ const E_INVAL: i32 = 22;
 const E_PERM: i32 = 1;
 const E_ACCES: i32 = 13;
 const E_NOSYS: i32 = 38;
+const STAT_BYTES: usize = 128;
+const STAT_ATIME_SEC_OFF: usize = 72;
+const STAT_MTIME_SEC_OFF: usize = 88;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TestTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+fn read_i64_at(buf: &[u8], off: usize) -> i64 {
+    i64::from_le_bytes([
+        buf[off],
+        buf[off + 1],
+        buf[off + 2],
+        buf[off + 3],
+        buf[off + 4],
+        buf[off + 5],
+        buf[off + 6],
+        buf[off + 7],
+    ])
+}
 
 fn ensure_zero_frame_claimed() {
     match page_allocator::claim_zero_frame() {
@@ -847,18 +871,223 @@ fn dispatch_renameat2_exchange_returns_neg_enosys() {
 // utimensat
 // -----------------------------------------------------------------
 
-/// `utimensat` returns 0 (success-stub: timestamps are not mutated but
-/// the syscall succeeds so that `touch(1)` exits 0 in busybox-musl
-/// tests).  Real timestamp mutation is deferred under
-/// `TODO(phase-vfs-utimens)`.
 #[test]
-fn dispatch_utimensat_returns_success_stub() {
+fn dispatch_utimensat_updates_tmpfs_inode_timestamps() {
     let _setup = fm_setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    create_regular(&tmpfs, b"f");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
     let ctx = make_ctx(proc_cap, thread);
 
-    let req = SyscallRequest::new(NR_UTIMENSAT, [AT_FDCWD as i64 as u64, 0, 0, 0, 0, 0]);
+    let path = nul_terminate(b"/f");
+    let times = [
+        TestTimespec {
+            tv_sec: 123,
+            tv_nsec: 456,
+        },
+        TestTimespec {
+            tv_sec: 789,
+            tv_nsec: 987,
+        },
+    ];
+    let req = SyscallRequest::new(
+        NR_UTIMENSAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            times.as_ptr() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
+
+    let guard = guard();
+    let file_id = match tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"f", &guard) {
+        StepOutcome::Done(id) => id,
+        other => panic!("lookup f: {other:?}"),
+    };
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load meta f: {other:?}"),
+    };
+    assert_eq!(meta.atime.sec, 123);
+    assert_eq!(meta.atime.nsec, 456);
+    assert_eq!(meta.mtime.sec, 789);
+    assert_eq!(meta.mtime.nsec, 987);
+    drop(path);
+}
+
+#[test]
+fn dispatch_futimens_fd_path_honours_now_and_omit() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    create_regular(&tmpfs, b"f");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let path = nul_terminate(b"/f");
+    let open_req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDWR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(open_req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat /f: {other:?}"),
+    };
+
+    let times = [
+        TestTimespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_NOW,
+        },
+        TestTimespec {
+            tv_sec: 0,
+            tv_nsec: crate::linux_syscall::UTIME_OMIT,
+        },
+    ];
+    let req = SyscallRequest::new(NR_UTIMENSAT, [fd, 0, times.as_ptr() as u64, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let guard = guard();
+    let file_id = match tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"f", &guard) {
+        StepOutcome::Done(id) => id,
+        other => panic!("lookup f: {other:?}"),
+    };
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load meta f: {other:?}"),
+    };
+    assert!(meta.atime.sec >= 5);
+    assert_eq!(meta.mtime.sec, 0);
+    assert_eq!(meta.mtime.nsec, 0);
+    drop(path);
+}
+
+#[test]
+fn dispatch_futimens_updates_unlinked_open_file() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    create_regular(&tmpfs, b"tmpfile");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let path = nul_terminate(b"/tmpfile");
+    let open_req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDWR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(open_req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat /tmpfile: {other:?}"),
+    };
+
+    let unlink_req = SyscallRequest::new(
+        NR_UNLINKAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(unlink_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(
+        !lookup_exists(&tmpfs, b"tmpfile"),
+        "/tmpfile name must be unlinked"
+    );
+
+    let times = [
+        TestTimespec {
+            tv_sec: 321,
+            tv_nsec: 654,
+        },
+        TestTimespec {
+            tv_sec: 987,
+            tv_nsec: 123,
+        },
+    ];
+    let req = SyscallRequest::new(NR_UTIMENSAT, [fd, 0, times.as_ptr() as u64, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+
+    let mut statbuf = vec![0u8; STAT_BYTES];
+    let req = SyscallRequest::new(NR_FSTAT, [fd, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(read_i64_at(&statbuf, STAT_ATIME_SEC_OFF), 321);
+    assert_eq!(read_i64_at(&statbuf, STAT_MTIME_SEC_OFF), 987);
+    drop(path);
+}
+
+#[test]
+fn dispatch_futimens_preserves_large_explicit_time_in_fstat() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    create_regular(&tmpfs, b"f");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let path = nul_terminate(b"/f");
+    let open_req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDWR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(open_req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat /f: {other:?}"),
+    };
+
+    let large = 1_i64 << 32;
+    let times = [
+        TestTimespec {
+            tv_sec: large,
+            tv_nsec: 0,
+        },
+        TestTimespec {
+            tv_sec: large,
+            tv_nsec: 0,
+        },
+    ];
+    let req = SyscallRequest::new(NR_UTIMENSAT, [fd, 0, times.as_ptr() as u64, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+
+    let mut statbuf = vec![0u8; STAT_BYTES];
+    let req = SyscallRequest::new(NR_FSTAT, [fd, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(read_i64_at(&statbuf, STAT_ATIME_SEC_OFF), large);
+    assert_eq!(read_i64_at(&statbuf, STAT_MTIME_SEC_OFF), large);
+    drop(path);
 }

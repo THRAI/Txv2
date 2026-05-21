@@ -43,7 +43,7 @@
 
 use alloc::vec::Vec;
 
-use tx_hal::{EntropyIf, PmapIf, UserTrapContext};
+use tx_hal::{ConsoleIf, EntropyIf, PmapIf, UserTrapContext};
 use tx_subsystems::cred::{step_apply_suid_for_exec, Capability, Gid, Uid};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::MountFlags;
@@ -62,7 +62,6 @@ use tx_subsystems::vm::scripts::{
     self as vm_scripts, BssTail as VmBssTail, ImagePlan as VmImagePlan,
     LoadSegment as VmLoadSegment, SegmentFlags as VmSegmentFlags, USER_STACK_TOP_DEFAULT,
 };
-use tx_subsystems::vm::{MapPlacement, MapReserveResult, Prot, VmBacking, VmEntry, VmEntryFlags};
 
 use super::loader::{
     parse_image_plan, ExecImagePlan, InterpreterPlan, LoadSegment as ParsedLoadSegment, ParseError,
@@ -78,6 +77,107 @@ const USER_PAGE_SIZE: u64 = 4096;
 const INTERP_BASE: u64 = 0x3F_F000_0000;
 
 // ASLR functions moved inline to exec_script_inner
+
+fn diag_write_decimal<P: ConsoleIf>(value: usize) {
+    if value == 0 {
+        tx_hal::console_write_str::<P>("0");
+        return;
+    }
+    let mut digits = [0u8; 20];
+    let mut n = value;
+    let mut idx = digits.len();
+    while n > 0 {
+        idx -= 1;
+        digits[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    let s = core::str::from_utf8(&digits[idx..]).unwrap_or("");
+    tx_hal::console_write_str::<P>(s);
+}
+
+fn diag_write_hex<P: ConsoleIf>(value: u64) {
+    tx_hal::console_write_str::<P>("0x");
+    if value == 0 {
+        tx_hal::console_write_str::<P>("0");
+        return;
+    }
+    let mut digits = [0u8; 16];
+    let mut n = value;
+    let mut idx = digits.len();
+    while n > 0 {
+        idx -= 1;
+        let nibble = (n & 0xf) as u8;
+        digits[idx] = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + (nibble - 10)
+        };
+        n >>= 4;
+    }
+    let s = core::str::from_utf8(&digits[idx..]).unwrap_or("");
+    tx_hal::console_write_str::<P>(s);
+}
+
+fn diag_write_bytes_lossy<P: ConsoleIf>(bytes: &[u8], max: usize) {
+    let limit = core::cmp::min(bytes.len(), max);
+    for &byte in &bytes[..limit] {
+        if byte == 0 {
+            return;
+        }
+        let b = if byte.is_ascii_graphic() || byte == b'/' || byte == b'.' || byte == b'-' {
+            byte
+        } else {
+            b'?'
+        };
+        tx_hal::console_write_bytes::<P>(&[b]);
+    }
+    if bytes.len() > limit {
+        tx_hal::console_write_str::<P>("...");
+    }
+}
+
+fn diag_write_parse_error<P: ConsoleIf>(err: ParseError) {
+    let s = match err {
+        ParseError::Magic => "magic",
+        ParseError::Arch => "arch",
+        ParseError::Type => "type",
+        ParseError::HasInterp => "interp",
+        ParseError::NoLoad => "noload",
+        ParseError::Phdr => "phdr",
+        ParseError::LoadSegment => "loadseg",
+    };
+    tx_hal::console_write_str::<P>(s);
+}
+
+fn diag_write_exec_error<P: ConsoleIf>(err: ExecError) {
+    let s = match err {
+        ExecError::PathTooLong => "path-too-long",
+        ExecError::PathNotFound => "path-not-found",
+        ExecError::NotADirectory => "not-dir",
+        ExecError::PermissionDenied => "permission",
+        ExecError::SymlinkLoop => "eloop",
+        ExecError::NotExecutable => "not-exec",
+        ExecError::InvalidArgument => "invalid",
+        ExecError::OutOfMemory => "oom",
+        ExecError::Busy => "busy",
+        ExecError::IoError => "io",
+    };
+    tx_hal::console_write_str::<P>(s);
+}
+
+fn diag_write_vfs_ctx<P: ConsoleIf>() {
+    let ctx = tx_subsystems::vfs::resolution::last_ctx();
+    tx_hal::console_write_str::<P>(" vfs-stage=");
+    diag_write_decimal::<P>(ctx.stage as usize);
+    tx_hal::console_write_str::<P>(" name=");
+    diag_write_bytes_lossy::<P>(&ctx.dentry_name, 64);
+    tx_hal::console_write_str::<P>(" fsid=");
+    diag_write_hex::<P>(ctx.fs_object_id);
+    tx_hal::console_write_str::<P>(" rem=");
+    diag_write_bytes_lossy::<P>(&ctx.remaining_path, 128);
+    tx_hal::console_write_str::<P>(" mount=");
+    tx_hal::console_write_str::<P>(if ctx.had_containing_mount { "1" } else { "0" });
+}
 
 /// Emit a OBS-V1 §15.7 ProcessLabel Instant mapping `pid` to the PCB
 /// `comm` just committed by `step_store_exec_identity`-equivalent
@@ -96,7 +196,7 @@ fn emit_process_label_for(pid_low: u32, comm: &[u8; 16]) {
     let mut truncated = [0u8; 12];
     let n = core::cmp::min(comm.len(), truncated.len());
     truncated[..n].copy_from_slice(&comm[..n]);
-    if !truncated.iter().any(|&b| b == 0) {
+    if !truncated.contains(&0) {
         truncated[truncated.len() - 1] = 0;
     }
     let payload = tx_observe::PayloadProcessLabel {
@@ -310,7 +410,7 @@ impl ExecError {
 ///
 /// Cites: `txdoc:EXEC-7-EIGHT-PHASES`,
 /// `txdoc:EXEC-15-THE-EXEC-PONR-INVARIANT`.
-pub async fn exec_script<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
+pub async fn exec_script<P: PmapIf + EntropyIf + tx_hal::AuxvIf + ConsoleIf>(
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
     path: &[u8],
@@ -321,7 +421,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     exec_script_inner::<P>(0, process, thread, path, argv, envp, cred).await
 }
 
-async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
+async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf + ConsoleIf>(
     depth: usize,
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
@@ -330,6 +430,14 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     envp: &[&[u8]],
     cred: &Credential,
 ) -> Result<(), ExecError> {
+    tx_hal::console_write_str::<P>(":diag:exec:start depth=");
+    diag_write_decimal::<P>(depth);
+    tx_hal::console_write_str::<P>(" path=");
+    diag_write_bytes_lossy::<P>(path, 96);
+    tx_hal::console_write_str::<P>(" argc=");
+    diag_write_decimal::<P>(argv.len());
+    tx_hal::console_write_str::<P>("\n");
+
     // Shebang recursion guard (Linux limit: 4).
     if depth > SHEBANG_MAX_DEPTH {
         return Err(ExecError::IoError); // maps to ELOOP
@@ -403,7 +511,22 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             }
         };
         drop(guard);
-        result?
+        match result {
+            Ok(file) => {
+                tx_hal::console_write_str::<P>(":diag:exec:open-ok path=");
+                diag_write_bytes_lossy::<P>(path, 96);
+                tx_hal::console_write_str::<P>("\n");
+                file
+            }
+            Err(err) => {
+                tx_hal::console_write_str::<P>(":diag:exec:open-err path=");
+                diag_write_bytes_lossy::<P>(path, 96);
+                tx_hal::console_write_str::<P>(" err=");
+                diag_write_exec_error::<P>(err);
+                tx_hal::console_write_str::<P>("\n");
+                return Err(err);
+            }
+        }
     };
 
     // Snapshot the file's `Cap<PageContainer>` once. The exec image's
@@ -547,8 +670,34 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // arch / type / no PT_INTERP / no PT_DYNAMIC / phdr-table fits /
     // congruence / overlap / W^X). All failures collapse to
     // `ExecError::NotExecutable` at the syscall boundary.
-    let mut parsed: ExecImagePlan =
-        parse_image_plan(&header_bytes).map_err(ExecError::from_parse_error)?;
+    let mut parsed: ExecImagePlan = match parse_image_plan(&header_bytes) {
+        Ok(parsed) => {
+            tx_hal::console_write_str::<P>(":diag:exec:parse-ok path=");
+            diag_write_bytes_lossy::<P>(path, 96);
+            tx_hal::console_write_str::<P>(" entry=");
+            diag_write_hex::<P>(parsed.entry);
+            tx_hal::console_write_str::<P>(" bias=");
+            diag_write_hex::<P>(parsed.load_bias);
+            tx_hal::console_write_str::<P>(" phnum=");
+            diag_write_decimal::<P>(parsed.at_phnum as usize);
+            tx_hal::console_write_str::<P>(" interp=");
+            if let Some(ref interp) = parsed.interpreter_path {
+                diag_write_bytes_lossy::<P>(interp, 96);
+            } else {
+                tx_hal::console_write_str::<P>("-");
+            }
+            tx_hal::console_write_str::<P>("\n");
+            parsed
+        }
+        Err(err) => {
+            tx_hal::console_write_str::<P>(":diag:exec:parse-err path=");
+            diag_write_bytes_lossy::<P>(path, 96);
+            tx_hal::console_write_str::<P>(" err=");
+            diag_write_parse_error::<P>(err);
+            tx_hal::console_write_str::<P>("\n");
+            return Err(ExecError::from_parse_error(err));
+        }
+    };
 
     // ASLR: for ET_DYN images, shift the fixed load_bias by a
     // random offset.  ET_EXEC binaries (load_bias == 0) are not
@@ -572,11 +721,14 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     //
     // When the main binary carries PT_INTERP, open and parse the
     // interpreter ELF.  The interpreter is loaded above the main
-    // binary at a fixed high address (INTERP_LOAD_BIAS).
+    // binary at a randomized high address near `INTERP_BASE`.
     let interp_data: Option<(
         InterpreterPlan,
         Cap<tx_subsystems::page_backed::PageContainer>,
     )> = if let Some(ref interp_path) = parsed.interpreter_path {
+        tx_hal::console_write_str::<P>(":diag:exec:interp path=");
+        diag_write_bytes_lossy::<P>(interp_path, 96);
+        tx_hal::console_write_str::<P>("\n");
         let interp_file = {
             use StepOutcome as V3;
             let guard = step_engine::guard();
@@ -595,6 +747,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 cred,
                 &guard,
             );
+            let mut fallback_path: Option<alloc::vec::Vec<u8>> = None;
             // When the sdcard is mounted at /musl (OSComp layout),
             // PT_INTERP paths like /lib/ld-musl-riscv64.so.1 don't
             // resolve at the tmpfs root.  Retry with a /musl prefix
@@ -603,14 +756,111 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 let mut musl_path = alloc::vec::Vec::with_capacity(5 + interp_path.len());
                 musl_path.extend_from_slice(b"/musl");
                 musl_path.extend_from_slice(interp_path);
-                outcome = step_open(rooted_at, &musl_path, OpenFileFlags {
-                    read: true, write: false, append: false,
-                    cloexec: false, nonblocking: false,
-                }, 0, cred, &guard);
+                tx_hal::console_write_str::<P>(":diag:exec:interp-retry path=");
+                diag_write_bytes_lossy::<P>(&musl_path, 96);
+                tx_hal::console_write_str::<P>("\n");
+                outcome = step_open(
+                    rooted_at,
+                    &musl_path,
+                    OpenFileFlags {
+                        read: true,
+                        write: false,
+                        append: false,
+                        cloexec: false,
+                        nonblocking: false,
+                    },
+                    0,
+                    cred,
+                    &guard,
+                );
+                fallback_path = Some(musl_path);
+            }
+            if matches!(outcome, V3::Err(_)) && interp_path.starts_with(b"/") {
+                let mut musl_nested_path = alloc::vec::Vec::with_capacity(10 + interp_path.len());
+                musl_nested_path.extend_from_slice(b"/musl/musl");
+                musl_nested_path.extend_from_slice(interp_path);
+                tx_hal::console_write_str::<P>(":diag:exec:interp-retry path=");
+                diag_write_bytes_lossy::<P>(&musl_nested_path, 96);
+                tx_hal::console_write_str::<P>("\n");
+                let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
+                outcome = step_open(
+                    rooted_at,
+                    &musl_nested_path,
+                    OpenFileFlags {
+                        read: true,
+                        write: false,
+                        append: false,
+                        cloexec: false,
+                        nonblocking: false,
+                    },
+                    0,
+                    cred,
+                    &guard,
+                );
+                fallback_path = Some(musl_nested_path);
+            }
+            if matches!(outcome, V3::Err(_)) && interp_path == b"/lib/ld-musl-riscv64-sf.so.1" {
+                let libc_path: &[u8] = b"/musl/lib/libc.so";
+                tx_hal::console_write_str::<P>(":diag:exec:interp-retry path=");
+                diag_write_bytes_lossy::<P>(libc_path, 96);
+                tx_hal::console_write_str::<P>(" alias=sf\n");
+                let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
+                outcome = step_open(
+                    rooted_at,
+                    libc_path,
+                    OpenFileFlags {
+                        read: true,
+                        write: false,
+                        append: false,
+                        cloexec: false,
+                        nonblocking: false,
+                    },
+                    0,
+                    cred,
+                    &guard,
+                );
+                fallback_path = Some(libc_path.to_vec());
+            }
+            if matches!(outcome, V3::Err(_)) && interp_path == b"/lib/ld-musl-riscv64-sf.so.1" {
+                let libc_path: &[u8] = b"/musl/musl/lib/libc.so";
+                tx_hal::console_write_str::<P>(":diag:exec:interp-retry path=");
+                diag_write_bytes_lossy::<P>(libc_path, 96);
+                tx_hal::console_write_str::<P>(" alias=sf-nested\n");
+                let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
+                outcome = step_open(
+                    rooted_at,
+                    libc_path,
+                    OpenFileFlags {
+                        read: true,
+                        write: false,
+                        append: false,
+                        cloexec: false,
+                        nonblocking: false,
+                    },
+                    0,
+                    cred,
+                    &guard,
+                );
+                fallback_path = Some(libc_path.to_vec());
             }
             match outcome {
-                V3::Done(file) => file,
-                V3::Err(_) => return Err(ExecError::IoError),
+                V3::Done(file) => {
+                    tx_hal::console_write_str::<P>(":diag:exec:interp-open-ok path=");
+                    if let Some(ref path) = fallback_path {
+                        diag_write_bytes_lossy::<P>(path, 96);
+                    } else {
+                        diag_write_bytes_lossy::<P>(interp_path, 96);
+                    }
+                    tx_hal::console_write_str::<P>("\n");
+                    file
+                }
+                V3::Err(err) => {
+                    tx_hal::console_write_str::<P>(":diag:exec:interp-open-err errno=");
+                    diag_write_decimal::<P>(err as usize);
+                    diag_write_vfs_ctx::<P>();
+                    tx_hal::console_write_str::<P>("\n");
+                    return Err(ExecError::IoError);
+                }
                 _ => return Err(ExecError::Busy),
             }
         };
@@ -627,7 +877,24 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             StepOutcome::Done(()) => {}
             _ => return Err(ExecError::IoError),
         }
-        let interp_parsed = parse_image_plan(&interp_hdr).map_err(ExecError::from_parse_error)?;
+        let interp_parsed = match parse_image_plan(&interp_hdr) {
+            Ok(parsed) => {
+                tx_hal::console_write_str::<P>(":diag:exec:interp-parse-ok entry=");
+                diag_write_hex::<P>(parsed.entry);
+                tx_hal::console_write_str::<P>(" bias=");
+                diag_write_hex::<P>(parsed.load_bias);
+                tx_hal::console_write_str::<P>(" phnum=");
+                diag_write_decimal::<P>(parsed.at_phnum as usize);
+                tx_hal::console_write_str::<P>("\n");
+                parsed
+            }
+            Err(err) => {
+                tx_hal::console_write_str::<P>(":diag:exec:interp-parse-err err=");
+                diag_write_parse_error::<P>(err);
+                tx_hal::console_write_str::<P>("\n");
+                return Err(ExecError::from_parse_error(err));
+            }
+        };
         let mut interp_segs: Vec<ParsedLoadSegment> = Vec::new();
         let interp_lowest_vaddr = interp_parsed
             .load_segments
@@ -635,12 +902,11 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             .map(|s| s.vaddr)
             .min()
             .unwrap_or(0);
-        // Fixed high address for the interpreter.
-
-        let interp_load_bias = randomize_interp_base() - interp_lowest_vaddr;
+        let interp_reloc_delta = randomize_interp_base() - interp_lowest_vaddr;
+        let interp_base = interp_lowest_vaddr + interp_reloc_delta;
         for seg in &interp_parsed.load_segments {
             interp_segs.push(ParsedLoadSegment {
-                vaddr: seg.vaddr + interp_load_bias,
+                vaddr: seg.vaddr + interp_reloc_delta,
                 memsz: seg.memsz,
                 filesz: seg.filesz,
                 file_offset: seg.file_offset,
@@ -650,8 +916,8 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         }
         Some((
             InterpreterPlan {
-                load_bias: interp_load_bias,
-                entry: interp_parsed.entry + interp_load_bias,
+                load_bias: interp_base,
+                entry: interp_parsed.entry + interp_reloc_delta,
                 load_segments: interp_segs,
                 bss_extension: interp_parsed.bss_extension,
                 executable_stack: interp_parsed.executable_stack,
@@ -735,43 +1001,16 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // ===== Phase 4a.2 — register interpreter LOAD segments =========
     //
     // The interpreter's PageContainer-backed LOAD segments are
-    // registered as additional VmEntry recipes in the detached
-    // aspace, alongside the main binary's entries.  Overlap with the
-    // main binary's segments was validated in Phase 4a.1.
+    // registered as additional recipes in the detached aspace,
+    // alongside the main binary's entries. Route through the same
+    // VM image-plan builder as the main ELF so page-congruent but
+    // non-page-aligned LOADs get the same page-delta/file-offset
+    // treatment and BSS split.
     if let Some((ref interp, ref interp_pc)) = interp_data {
-        for seg in &interp.load_segments {
-            let seg_range = match vm_scripts::align_range(seg.vaddr, seg.memsz) {
-                Some(r) => r,
-                None => return Err(ExecError::NotExecutable),
-            };
-            let prot = if seg.flags.writable {
-                if seg.flags.executable {
-                    Prot::new(true, true, true)
-                } else {
-                    Prot::READ_WRITE
-                }
-            } else if seg.flags.executable {
-                Prot::READ_EXECUTE
-            } else {
-                Prot::READ
-            };
-            let entry = VmEntry::new(
-                seg_range,
-                prot,
-                VmEntryFlags::PRIVATE,
-                VmBacking::Page {
-                    pc: interp_pc.clone(),
-                    offset: seg.file_offset,
-                },
-            );
-            match new_aspace.reserve_map(entry, MapPlacement::RequireFree) {
-                MapReserveResult::Reserved(r) => {
-                    r.commit().map_err(|_| ExecError::OutOfMemory)?;
-                }
-                MapReserveResult::Blocked(_) => return Err(ExecError::Busy),
-                MapReserveResult::Err(_) => return Err(ExecError::OutOfMemory),
-            }
-        }
+        let interp_image_plan = build_interp_vm_image_plan(interp, stack_top, interp_pc);
+        vm_scripts::register_image_load_segments(&new_aspace, &interp_image_plan)
+            .map_err(ExecError::from_build_aspace_error)?;
+        populate_partial_bss_file_prefixes(&new_aspace, &interp_image_plan).await?;
     }
 
     // ===== Phase 5 — thread-group collapse (if multi-threaded) =======
@@ -795,66 +1034,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // case before the fix; busybox.musl crashed dereferencing
     // ".got\0ata" string fragments via gp-relative loads into its
     // BSS-extension area).
-    let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
-    for segment in &image_plan.load_segments {
-        if segment.filesz == 0 {
-            continue;
-        }
-        // Only segments with BSS extension (memsz > filesz) get the
-        // partial-last-page anon-with-eager-copy treatment per
-        // `register_load_segment`'s comment block. Segments without
-        // BSS keep the original Page-backed-up-to-`file_end_rounded`
-        // shape — there's no observable junk past filesz because
-        // userspace doesn't access bytes past `vaddr + memsz`.
-        if segment.memsz <= segment.filesz {
-            continue;
-        }
-        let file_end = segment
-            .vaddr
-            .checked_add(segment.filesz)
-            .ok_or(ExecError::NotExecutable)?;
-        // Page-floor of `file_end` (start of the last page that
-        // contains file data).  `partial_start` is the vaddr of
-        // the first file-data byte in that page — clamped to
-        // `segment.vaddr` in case the segment starts mid-page.
-        let file_end_page_floor = file_end & !(page_size - 1);
-        let partial_start = file_end_page_floor.max(segment.vaddr);
-        // Number of file-content bytes in this partial page.
-        // This is the distance from `partial_start` to `file_end`,
-        // *not* the page-offset of `file_end` — the latter
-        // over-counts when the segment started mid-page and the
-        // page floor lies before `segment.vaddr`.
-        let partial_in_page = file_end - partial_start;
-        if partial_in_page == 0 {
-            continue;
-        }
-        // File offset of `partial_start`. The segment's `file_offset`
-        // corresponds to `vaddr`; offsetting by `partial_start - vaddr`
-        // gives the file offset of the bytes we need to seed. If the
-        // segment starts mid-page, the page floor can precede `vaddr`,
-        // so `partial_start` is clamped to the segment start.
-        let file_off = segment
-            .file_offset
-            .checked_add(partial_start - segment.vaddr)
-            .ok_or(ExecError::NotExecutable)?;
-        let mut buf = alloc::vec![0u8; partial_in_page as usize];
-        {
-            use StepOutcome as V3;
-            let guard = step_engine::guard();
-            match read_exact_at(&segment.backing, file_off, &mut buf, &guard) {
-                V3::Done(()) => {}
-                V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
-                V3::Err(_) => return Err(ExecError::NotExecutable),
-            }
-        }
-        match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
-            StepOutcome::Done(()) => {}
-            StepOutcome::Err(err) => {
-                return Err(ExecError::from_populate_errno(err.into()));
-            }
-            _ => return Err(ExecError::Busy),
-        }
-    }
+    populate_partial_bss_file_prefixes(&new_aspace, &image_plan).await?;
 
     // ===== Phase 5 — compose + populate user stack ===================
     //
@@ -882,18 +1062,17 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     tx_services::random::fill_bytes(&mut at_random_bytes);
     let arch = <P as tx_hal::AuxvIf>::arch_auxv_facts();
 
+    let interp_load_bias = interp_data.as_ref().map_or(0, |(i, _)| i.load_bias);
     let auxv_facts = AuxvFacts {
         at_phdr: parsed.at_phdr,
         at_phent: ELF64_PHENT,
         at_phnum: parsed.at_phnum,
         at_pagesz: USER_PAGE_SIZE,
-        // Drift-cleanup chore (2026-05-07): `AT_BASE = 0` for the
-        // v1 static-`ET_EXEC` contract (no PT_INTERP per
-        // `EXEC_v1.md`'s static-only pin); a future dynamic-link
-        // slice flips this to the interpreter's load bias.
+        // `AT_BASE = 0` for static images; dynamically linked
+        // `ET_EXEC` images receive the interpreter's loaded base.
         // `AT_ENTRY` carries the parsed ELF entry through to musl's
         // `__libc_start_main`.
-        at_base: 0,
+        at_base: interp_load_bias,
         at_entry: parsed.entry,
         at_uid: cred.uid.raw() as u64,
         at_euid: cred.euid.raw() as u64,
@@ -977,9 +1156,43 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // so any concurrent reader on another hart can finish its
     // observation of the old aspace before its memory is reused.
 
-    let entry_pc = parsed.entry as usize;
+    let entry_pc = interp_data
+        .as_ref()
+        .map_or(parsed.entry, |(interp, _)| interp.entry) as usize;
     let initial_sp = stack_image.initial_sp as usize;
     let user_ctx = make_initial_user_trap_context(P::ARCH, entry_pc, initial_sp);
+    tx_hal::console_write_str::<P>(":diag:exec:commit path=");
+    diag_write_bytes_lossy::<P>(path, 96);
+    tx_hal::console_write_str::<P>(" entry=");
+    diag_write_hex::<P>(entry_pc as u64);
+    tx_hal::console_write_str::<P>(" main_entry=");
+    diag_write_hex::<P>(parsed.entry);
+    tx_hal::console_write_str::<P>(" at_base=");
+    diag_write_hex::<P>(interp_load_bias);
+    tx_hal::console_write_str::<P>(" at_phdr=");
+    diag_write_hex::<P>(parsed.at_phdr);
+    tx_hal::console_write_str::<P>(" at_phnum=");
+    diag_write_decimal::<P>(parsed.at_phnum as usize);
+    tx_hal::console_write_str::<P>(" at_entry=");
+    diag_write_hex::<P>(parsed.entry);
+    tx_hal::console_write_str::<P>(" at_execfn=");
+    match auxv_facts.at_execfn {
+        Some(value) => diag_write_hex::<P>(value),
+        None => tx_hal::console_write_str::<P>("absent"),
+    }
+    tx_hal::console_write_str::<P>(" at_platform=");
+    match auxv_facts.at_platform {
+        Some(value) => diag_write_hex::<P>(value),
+        None => tx_hal::console_write_str::<P>("absent"),
+    }
+    tx_hal::console_write_str::<P>(" at_sysinfo_ehdr=");
+    match auxv_facts.at_sysinfo_ehdr {
+        Some(value) => diag_write_hex::<P>(value),
+        None => tx_hal::console_write_str::<P>("absent"),
+    }
+    tx_hal::console_write_str::<P>(" sp=");
+    diag_write_hex::<P>(initial_sp as u64);
+    tx_hal::console_write_str::<P>("\n");
     if let Some(payload) = thread.payload_cap() {
         payload.store_saved_user_context(Some(user_ctx));
     }
@@ -1121,6 +1334,101 @@ fn build_vm_image_plan(
         bss_extension,
         executable_stack: parsed.executable_stack || interp_exec_stack,
     }
+}
+
+fn build_interp_vm_image_plan(
+    interp: &InterpreterPlan,
+    stack_top: u64,
+    interp_pc: &Cap<PageContainer>,
+) -> VmImagePlan {
+    let load_segments: alloc::vec::Vec<VmLoadSegment> = interp
+        .load_segments
+        .iter()
+        .map(|seg: &ParsedLoadSegment| VmLoadSegment {
+            vaddr: seg.vaddr,
+            memsz: seg.memsz,
+            filesz: seg.filesz,
+            file_offset: seg.file_offset,
+            flags: translate_flags(seg.flags),
+            backing: interp_pc.clone(),
+        })
+        .collect();
+
+    let bss_extension = interp.bss_extension.map(|tail| VmBssTail {
+        vaddr: tail.vaddr,
+        size: tail.size,
+    });
+
+    VmImagePlan {
+        entry: interp.entry,
+        stack_top,
+        load_segments,
+        bss_extension,
+        executable_stack: interp.executable_stack,
+    }
+}
+
+async fn populate_partial_bss_file_prefixes(
+    aspace: &Cap<tx_subsystems::vm::AddressSpace>,
+    image_plan: &VmImagePlan,
+) -> Result<(), ExecError> {
+    let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
+    for segment in &image_plan.load_segments {
+        if segment.filesz == 0 {
+            continue;
+        }
+        // Only segments with BSS extension (memsz > filesz) get the
+        // partial-last-page anon-with-eager-copy treatment per
+        // `register_load_segment`'s comment block. Segments without
+        // BSS keep the original Page-backed-up-to-`file_end_rounded`
+        // shape — there's no observable junk past filesz because
+        // userspace doesn't access bytes past `vaddr + memsz`.
+        if segment.memsz <= segment.filesz {
+            continue;
+        }
+        let file_end = segment
+            .vaddr
+            .checked_add(segment.filesz)
+            .ok_or(ExecError::NotExecutable)?;
+        // Page-floor of `file_end` (start of the last page that
+        // contains file data). `partial_start` is the vaddr of the
+        // first file-data byte in that page, clamped to `segment.vaddr`
+        // in case the segment starts mid-page.
+        let file_end_page_floor = file_end & !(page_size - 1);
+        let partial_start = file_end_page_floor.max(segment.vaddr);
+        // Number of file-content bytes in this partial page. This is
+        // the distance from `partial_start` to `file_end`, not the
+        // page-offset of `file_end`; the latter over-counts when the
+        // segment starts mid-page.
+        let partial_in_page = file_end - partial_start;
+        if partial_in_page == 0 {
+            continue;
+        }
+        // File offset of `partial_start`. The segment's `file_offset`
+        // corresponds to `vaddr`; offsetting by `partial_start - vaddr`
+        // gives the file offset of the bytes we need to seed.
+        let file_off = segment
+            .file_offset
+            .checked_add(partial_start - segment.vaddr)
+            .ok_or(ExecError::NotExecutable)?;
+        let mut buf = alloc::vec![0u8; partial_in_page as usize];
+        {
+            use StepOutcome as V3;
+            let guard = step_engine::guard();
+            match read_exact_at(&segment.backing, file_off, &mut buf, &guard) {
+                V3::Done(()) => {}
+                V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
+                V3::Err(_) => return Err(ExecError::NotExecutable),
+            }
+        }
+        match vm_scripts::populate_detached_user_range(aspace, partial_start, &buf).await {
+            StepOutcome::Done(()) => {}
+            StepOutcome::Err(err) => return Err(ExecError::from_populate_errno(err.into())),
+            _ => return Err(ExecError::Busy),
+        }
+    }
+
+    Ok(())
 }
 
 /// Compute the page-rounded brk base from the parsed LOAD segments.

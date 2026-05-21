@@ -302,6 +302,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::register_devfs_console_alias();
             Self::mount_procfs_at_proc();
             Self::mount_bdevfs_at_dev_block();
+            Self::mount_tmpfs_at_dev_shm();
             Self::mount_sdcard_at_musl();
             Self::populate_rootfs_shebang_shims();
             Self::populate_rootfs_tmp_dirs();
@@ -804,6 +805,94 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":mount:bdevfs:ok\n");
     }
 
+    /// Mount tmpfs at `/dev/shm` on top of devfs.
+    pub(crate) fn mount_tmpfs_at_dev_shm() {
+        let dev_mount = DEV_MOUNT
+            .lock()
+            .clone()
+            .expect("mount_tmpfs_at_dev_shm: DEV_MOUNT must be populated");
+
+        // The mountpoint dentry: synthetic `/dev/shm` directory
+        // owned by devfs (see `DEVFS_SHM_DIR_OBJECT_ID`).
+        let dev_shm_meta = InodeMeta::new(
+            tx_subsystems::vfs::InodeKind::Directory,
+            tx_fs::devfs::DEVFS_SHM_DIR_MODE,
+        );
+        let dev_shm_rnode_in_devfs = RNode::new_cap(
+            tx_fs::devfs::DEVFS_SHM_DIR_OBJECT_ID,
+            dev_shm_meta,
+            RNodeBacking::Directory,
+        )
+        .expect("mount_tmpfs_at_dev_shm: /dev/shm rnode-on-devfs reservation");
+        let dev_shm_dentry_on_devfs = DEntry::new_cap(
+            InlineName::new(b"shm").expect("mount_tmpfs_at_dev_shm: /shm inline name"),
+            dev_shm_rnode_in_devfs,
+        )
+        .expect("mount_tmpfs_at_dev_shm: /dev/shm dentry-on-devfs reservation");
+
+        // Build the tmpfs MountPayload for /dev/shm.
+        let cred = Credential::root();
+        let (_shm_tmpfs, shm_mount_output) = tx_fs::tmpfs::Tmpfs::new_root();
+        let shm_tmpfs_payload = MountPayload::new_cap(
+            shm_mount_output.fs_ops.clone(),
+            shm_mount_output.fs_page_backing,
+            None,
+            mount::allocate_dev_id(),
+            MountOptions::default(),
+            "tmpfs",
+            SourceLabel::Static("shmfs"),
+        )
+        .expect("mount_tmpfs_at_dev_shm: payload creation");
+
+        // Make the tmpfs root world-writable.
+        let guard = step_engine::guard();
+        let _ = shm_mount_output.fs_ops.step_chmod(
+            shm_mount_output.root_fs_object_id,
+            0o1777, // sticky + rwxrwxrwx
+            &cred,
+            &guard,
+        );
+
+        let shm_root_rnode = {
+            let raw = RNode::new(
+                shm_mount_output.root_fs_object_id,
+                InodeMeta::new(
+                    tx_subsystems::vfs::InodeKind::Directory,
+                    tx_fs::tmpfs::TMPFS_ROOT_MODE,
+                ),
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&shm_tmpfs_payload);
+            let res = step_engine::reserve_for::<RNode>()
+                .expect("mount_tmpfs_at_dev_shm: tmpfs root rnode reservation");
+            step_engine::sign_for(res, raw)
+        };
+
+        let devfs_payload = dev_mount
+            .payload_cap()
+            .expect("devfs payload alive during boot")
+            .into_cap();
+
+        let shm_mount = MountIdentity::new_cap(
+            mount::allocate_mount_id(),
+            Some(dev_shm_dentry_on_devfs),
+            shm_root_rnode,
+            Some(dev_mount),
+            shm_tmpfs_payload,
+            MountFlags::empty(),
+        )
+        .expect("mount_tmpfs_at_dev_shm: mount identity reservation");
+
+        mount::register_mount(
+            &devfs_payload,
+            tx_fs::devfs::DEVFS_SHM_DIR_OBJECT_ID,
+            shm_mount,
+        );
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:shmfs:ok\n");
+    }
+
     /// Mount the sdcard ext4 image at `/musl` on the rootfs tmpfs.
     ///
     /// If a `vda` block device is registered (RV64 QEMU virtio-blk
@@ -845,36 +934,45 @@ impl<P: TxPlatform> CoreInit<P> {
             .lock()
             .clone()
             .expect("mount_sdcard_at_musl: ROOT_MOUNT must be populated");
+        let rootfs_payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .clone();
+        let root_dentry_on_root = DEntry::new_cap(InlineName::ROOT, root_mount.root().clone())
+            .expect("mount_sdcard_at_musl: root dentry-on-rootfs reservation");
 
         // mkdir("/musl") in the rootfs tmpfs so we have a mountpoint.
         let guard = step_engine::guard();
         let cred = Credential::root();
         use step_engine::StepOutcome as V3;
-        let (musl_object_id, musl_meta) = match root_mount
-            .payload_cap()
-            .expect("rootfs payload alive during boot")
-            .into_cap()
-            .fs_ops
-            .mkdir(
-                tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
-                b"musl",
-                0o755,
-                &cred,
-                &guard,
-            ) {
+        let (musl_object_id, musl_meta) = match rootfs_payload.fs_ops.mkdir(
+            tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
+            b"musl",
+            0o755,
+            &cred,
+            &guard,
+        ) {
             V3::Done(out) => out,
             other => panic!("mount_sdcard_at_musl: tmpfs mkdir(/musl) failed: {other:?}"),
         };
         drop(guard);
 
         // Build the `/musl` mountpoint DEntry on the rootfs.
-        let musl_rnode_in_root = RNode::new_cap(musl_object_id, musl_meta, RNodeBacking::Directory)
-            .expect("mount_sdcard_at_musl: /musl rnode-on-rootfs reservation");
-        let musl_dentry_on_root = DEntry::new_cap(
+        let musl_rnode_in_root = RNode::new_cap_in_mount(
+            musl_object_id,
+            musl_meta,
+            RNodeBacking::Directory,
+            &rootfs_payload,
+        )
+        .expect("mount_sdcard_at_musl: /musl rnode-on-rootfs reservation");
+        let mut musl_dentry_raw = DEntry::new(
             InlineName::new(b"musl").expect("mount_sdcard_at_musl: /musl inline name"),
             musl_rnode_in_root,
-        )
-        .expect("mount_sdcard_at_musl: /musl dentry-on-rootfs reservation");
+        );
+        musl_dentry_raw.set_parent_hint(&root_dentry_on_root);
+        let musl_dentry_on_root = step_engine::sign(musl_dentry_raw)
+            .expect("mount_sdcard_at_musl: /musl dentry-on-rootfs reservation");
 
         // Build the ext4 mount payload.
         let ext4_payload = MountPayload::new_cap(
@@ -905,14 +1003,6 @@ impl<P: TxPlatform> CoreInit<P> {
                 .expect("mount_sdcard_at_musl: ext4 root rnode reservation");
             step_engine::sign_for(res, raw)
         };
-
-        // Snapshot rootfs payload before consuming root_mount into the
-        // new mount's parent slot.
-        let rootfs_payload = root_mount
-            .payload_cap()
-            .expect("rootfs payload alive during boot")
-            .into_cap()
-            .clone();
 
         let musl_mount = MountIdentity::new_cap(
             mount::allocate_mount_id(),
@@ -1332,44 +1422,81 @@ impl<P: TxPlatform> CoreInit<P> {
         let hart = boot_runtime::HartId(cpu_id.0);
         let now_ns = P::read_ns();
         let mut signal = SmpRescheduleSignal::<P>::new();
-        // Diagnostic: guard state at reactor entry point.
+        #[cfg(feature = "diag-epoch-guards")]
         let local_pre = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
-            .map(|c| c.local_epoch as usize).unwrap_or(999);
-        // See if entering BOOT_REACTOR.with creates a guard.
-        let epoch_pre_with = crate::adapter::step_engine::epoch::summary();
-        tx_hal::console_write_str::<P>(":diag:pre-boot-reactor-with:epoch=");
-        Self::write_decimal_unsigned(epoch_pre_with.global_epoch as usize);
-        tx_hal::console_write_str::<P>(":guards=");
-        Self::write_decimal_unsigned(epoch_pre_with.active_guards);
-        tx_hal::console_write_str::<P>("\n");
+            .map(|c| c.local_epoch as usize)
+            .unwrap_or(999);
+        #[cfg(feature = "diag-epoch-guards")]
+        {
+            let epoch_pre_with = crate::adapter::step_engine::epoch::summary();
+            tx_hal::console_write_str::<P>(":diag:pre-boot-reactor-with:epoch=");
+            Self::write_decimal_unsigned(epoch_pre_with.global_epoch as usize);
+            tx_hal::console_write_str::<P>(":guards=");
+            Self::write_decimal_unsigned(epoch_pre_with.active_guards);
+            tx_hal::console_write_str::<P>("\n");
+        }
 
         let step = BOOT_REACTOR.with(|reactor| {
-            // Diagnostic: guard state inside step_hart_loop_at
-            let pre = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
-                .map(|c| c.local_epoch as usize).unwrap_or(999);
-            let result = boot_runtime::hart_loop::step_hart_loop_at(reactor, hart, now_ns, &mut signal);
-            let post = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
-                .map(|c| c.local_epoch as usize).unwrap_or(999);
-            if pre != 0 || post != 0 {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":diag:step-hart-loop-inside:pre=");
-                Self::write_decimal_unsigned(pre);
-                tx_hal::console_write_str::<P>(":post=");
-                Self::write_decimal_unsigned(post);
-                tx_hal::console_write_str::<P>("\n");
+            let result =
+                boot_runtime::hart_loop::step_hart_loop_at(reactor, hart, now_ns, &mut signal);
+            #[cfg(feature = "diag-epoch-guards")]
+            {
+                let guard_epoch = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
+                    .map(|c| c.local_epoch as usize)
+                    .unwrap_or(999);
+                if guard_epoch != 0 {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":diag:step-hart-loop-inside:epoch=");
+                    Self::write_decimal_unsigned(guard_epoch);
+                    tx_hal::console_write_str::<P>("\n");
+                }
             }
             result
         })?;
-        // Diagnostic: guard state after reactor step.
-        let local_post = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
-            .map(|c| c.local_epoch as usize).unwrap_or(999);
-        if local_pre != 0 || local_post != 0 {
-            Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":diag:step-boot-reactor-once:guard-leak:pre=");
-            Self::write_decimal_unsigned(local_pre);
-            tx_hal::console_write_str::<P>(":post=");
-            Self::write_decimal_unsigned(local_post);
-            tx_hal::console_write_str::<P>("\n");
+        let depths = BOOT_REACTOR.with(|reactor| reactor.queue_depths(hart))?;
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":diag:reactor:step hart=");
+        Self::write_decimal_unsigned(cpu_id.0 as usize);
+        tx_hal::console_write_str::<P>(" polled=");
+        Self::write_decimal_unsigned(step.stats.polled);
+        tx_hal::console_write_str::<P>(" completed=");
+        Self::write_decimal_unsigned(step.stats.completed);
+        tx_hal::console_write_str::<P>(" wakes=");
+        Self::write_decimal_unsigned(step.wake_dispatch.placements);
+        tx_hal::console_write_str::<P>(" local=");
+        Self::write_decimal_unsigned(step.wake_dispatch.local_reschedules);
+        tx_hal::console_write_str::<P>(" remote=");
+        Self::write_decimal_unsigned(step.wake_dispatch.remote_ipis);
+        tx_hal::console_write_str::<P>(" timer=");
+        Self::write_decimal_unsigned(step.timer_wakes);
+        tx_hal::console_write_str::<P>(" resched=");
+        tx_hal::console_write_str::<P>(if step.consumed_reschedule_marker() {
+            "y"
+        } else {
+            "n"
+        });
+        tx_hal::console_write_str::<P>(" idle=");
+        tx_hal::console_write_str::<P>(if step.should_idle() { "y" } else { "n" });
+        tx_hal::console_write_str::<P>(" qk=");
+        Self::write_decimal_unsigned(depths.kernel);
+        tx_hal::console_write_str::<P>(" qn=");
+        Self::write_decimal_unsigned(depths.new);
+        tx_hal::console_write_str::<P>(" qp=");
+        Self::write_decimal_unsigned(depths.preempted);
+        tx_hal::console_write_str::<P>("\n");
+        #[cfg(feature = "diag-epoch-guards")]
+        {
+            let local_post = crate::adapter::step_engine::epoch::cpu_summary(cpu_id)
+                .map(|c| c.local_epoch as usize)
+                .unwrap_or(999);
+            if local_pre != 0 || local_post != 0 {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":diag:step-boot-reactor-once:guard-leak:pre=");
+                Self::write_decimal_unsigned(local_pre);
+                tx_hal::console_write_str::<P>(":post=");
+                Self::write_decimal_unsigned(local_post);
+                tx_hal::console_write_str::<P>("\n");
+            }
         }
         Self::program_hart_loop_deadline(step.deadline_action);
         Some(step)
@@ -1584,6 +1711,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 continue;
             };
             let task_payload = payload.clone();
+            let mailbox_payload = payload.clone();
             let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
             // OBS-V1 §13.2: thread the user-thread TID into the task's
             // `TaskMailbox` so `WaitSource::notify_emit` and
@@ -1631,13 +1759,15 @@ impl<P: TxPlatform> CoreInit<P> {
             // `?` sentinel and pgid_low/sid_low both zero, adding
             // no information).
             if let Some(ref c) = comm {
-                emit_process_label::<P>(pid_low, c);
-                emit_process_group::<P>(pid_low, pgid_low, sid_low);
-                // Fork edge: parent → child arrow on the timeline.
-                emit_process_fork::<P>(parent_pid_low, pid_low);
+                emit_process_label(pid_low, c);
+                emit_process_group(pid_low, pgid_low, sid_low);
+                if parent_pid_low != 0 {
+                    emit_process_fork(parent_pid_low, pid_low);
+                }
             }
-            let _ = BOOT_REACTOR.with(|reactor| {
-                reactor.submit_task_with_meta(
+            let mut mailbox_snapshot = None;
+            let submitted = BOOT_REACTOR.with(|reactor| {
+                let submitted = reactor.submit_task_with_meta(
                     crate::thread_future::PerHartSlotted::<P, _>::new(
                         task_payload.clone(),
                         crate::thread_future::run_thread::<P>(child_thread, task_payload),
@@ -1647,7 +1777,42 @@ impl<P: TxPlatform> CoreInit<P> {
                         .with_task_id(tid_low)
                         .with_process_id(pid_low),
                 );
+                if let Ok(mailbox) = reactor.task_mailbox(submitted) {
+                    mailbox_payload.bind_mailbox(alloc::sync::Arc::downgrade(&mailbox));
+                    mailbox_snapshot = Some((
+                        mailbox.task_id_low(),
+                        mailbox.process_id_low(),
+                        mailbox.len(),
+                        mailbox.overflow(),
+                    ));
+                }
+                submitted
             });
+            if let Some(submitted) = submitted {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":diag:mbox:child-submit tid=");
+                Self::write_decimal_unsigned(tid_low as usize);
+                tx_hal::console_write_str::<P>(" pid=");
+                Self::write_decimal_unsigned(pid_low as usize);
+                tx_hal::console_write_str::<P>(" task=");
+                Self::write_decimal_unsigned(submitted.id().index());
+                tx_hal::console_write_str::<P>(" gen=");
+                Self::write_decimal_unsigned(submitted.generation().value() as usize);
+                match mailbox_snapshot {
+                    Some((mb_tid, mb_pid, queued, overflow)) => {
+                        tx_hal::console_write_str::<P>(" mb_tid=");
+                        Self::write_decimal_unsigned(mb_tid as usize);
+                        tx_hal::console_write_str::<P>(" mb_pid=");
+                        Self::write_decimal_unsigned(mb_pid as usize);
+                        tx_hal::console_write_str::<P>(" q=");
+                        Self::write_decimal_unsigned(queued);
+                        tx_hal::console_write_str::<P>(" ov=");
+                        tx_hal::console_write_str::<P>(if overflow { "y" } else { "n" });
+                    }
+                    None => tx_hal::console_write_str::<P>(" mailbox=miss"),
+                }
+                tx_hal::console_write_str::<P>("\n");
+            }
         }
     }
 }
@@ -1678,7 +1843,7 @@ static PENDING_CHILD_SUBMITS: SpinMutex<
 ///
 /// No-op when no `HartEmitter` is installed (host tests, boards
 /// without an observation ring).
-pub(crate) fn emit_process_label<P: tx_hal::TxPlatform>(pid_low: u32, comm: &[u8; 16]) {
+pub(crate) fn emit_process_label(pid_low: u32, comm: &[u8; 16]) {
     let _ = (pid_low, comm);
     let Some(em) = tx_observe::current() else {
         return;
@@ -1687,7 +1852,7 @@ pub(crate) fn emit_process_label<P: tx_hal::TxPlatform>(pid_low: u32, comm: &[u8
     let n = core::cmp::min(comm.len(), truncated.len());
     truncated[..n].copy_from_slice(&comm[..n]);
     // Force NUL termination of the truncated buffer if it lost one.
-    if !truncated.iter().any(|&b| b == 0) {
+    if !truncated.contains(&0) {
         truncated[truncated.len() - 1] = 0;
     }
     let payload = tx_observe::PayloadProcessLabel {
@@ -1715,7 +1880,7 @@ pub(crate) fn emit_process_label<P: tx_hal::TxPlatform>(pid_low: u32, comm: &[u8
 /// arrow from the parent's most recent `clone()` slice to the
 /// child's first `Sched` dispatch (OBS-V1 §15.9). Skipped when
 /// `parent_pid` is zero (kernel-internal or pre-init contexts).
-pub(crate) fn emit_process_fork<P: tx_hal::TxPlatform>(parent_pid: u32, child_pid: u32) {
+pub(crate) fn emit_process_fork(parent_pid: u32, child_pid: u32) {
     if parent_pid == 0 || child_pid == 0 {
         return;
     }
@@ -1748,7 +1913,7 @@ pub(crate) fn emit_process_fork<P: tx_hal::TxPlatform>(parent_pid: u32, child_pi
 ///
 /// Emitted alongside `emit_process_label` at the same kernel sites.
 /// No-op when no `HartEmitter` is installed.
-pub(crate) fn emit_process_group<P: tx_hal::TxPlatform>(pid_low: u32, pgid_low: u32, sid_low: u32) {
+pub(crate) fn emit_process_group(pid_low: u32, pgid_low: u32, sid_low: u32) {
     let Some(em) = tx_observe::current() else {
         return;
     };
@@ -1775,37 +1940,15 @@ pub(crate) fn emit_process_group<P: tx_hal::TxPlatform>(pid_low: u32, pgid_low: 
 mod helpers;
 use helpers::{bootstrap_block_on, exec_error_tag, parse_init_from_cmdline};
 mod init_fixture;
-mod pthread_fixture;
-/// Shell-prompt roadmap Slice 10 (2026-05-08): when the build script
-/// at `crates/tx-kernel/build.rs` sees `TX_BUSYBOX` pointing at a
-/// real static-musl-built busybox binary, it copies the bytes to
-/// `$OUT_DIR/busybox.bin` and emits `cargo:rustc-cfg=busybox_baked`.
-/// This module is then compiled in and exposes
-/// `BUSYBOX_BYTES: &'static [u8]` for
-/// `register_busybox_into_tmpfs()` to consume.
-///
-/// Without `TX_BUSYBOX`, the module is not compiled in and the
-/// kernel boots through the existing `/init` fixture path
-/// exclusively (host tests + CI without a riscv64 cross-toolchain).
+
 #[cfg(busybox_baked)]
 mod busybox_fixture {
     pub static BUSYBOX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busybox.bin"));
 }
 
-/// DAC + setuid slice (Wave 5, Part 8): sibling fixture for the
-/// end-to-end setuid smoke. See `init_setuid_fixture.rs`'s module
-/// header for the deviation from Plan Q4 (extend-in-place was
-/// authored before the fork/clone/wait4 slice rewrote the existing
-/// fixture into a fork+wait+exit binary; sibling fixture keeps both
-/// smokes independently pinned).
 #[cfg(test)]
 mod init_setuid_fixture;
 
-/// fd-ops slice (Wave 4, Part 8): sibling fixture for the
-/// `openat → write → lseek → read → close → exit_group` byte-pin
-/// smoke. See `init_lseek_fixture.rs`'s module header for the
-/// sibling-vs-extend rationale (mirrors the setuid sibling
-/// decision so each fd-ops/DAC/fork test owns its own pinned ABI).
 #[cfg(test)]
 mod init_lseek_fixture;
 

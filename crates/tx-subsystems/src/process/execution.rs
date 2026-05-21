@@ -22,7 +22,7 @@ use crate::process::topology::{
 };
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::thread_runtime::execution::set_thread_zombie;
-use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload};
+use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload, Tid};
 use crate::vfs::OpenFile;
 use crate::vm::{AddressSpace, VmMapError};
 
@@ -31,8 +31,8 @@ use crate::vm::{AddressSpace, VmMapError};
 // ---------------------------------------------------------------------------
 
 use crate::process::numbers::{
-    allocate_pid, register_pid as ns_register_pid, resolve_pid_number, unregister_pid_number,
-    with_namespace, PidName, PidNameKind,
+    allocate_pid, register_pid as ns_register_pid, register_tid, resolve_pid_number,
+    unregister_pid_number, with_namespace, PidName, PidNameKind,
 };
 
 /// Register a process pid → Cap binding. The Cap must be fully
@@ -262,7 +262,7 @@ pub fn bootstrap_init_process(
     pgrp.members.attach(proc_cap.downgrade());
     pgrp.session.members.attach(pgrp.downgrade());
 
-    let leader = sign_thread(proc_cap.downgrade())?;
+    let leader = sign_thread(proc_cap.downgrade(), Tid(pid.0))?;
     // Day-1: init has no cwd until a rootfs is mounted and an
     // initial chdir runs. Future EXEC_v1 / first-userspace lands
     // a synthesized "/" DEntry and threads it through here.
@@ -396,7 +396,7 @@ pub fn step_fork<P: PmapIf>(
     register_pid(child_pid, child_proc.clone());
 
     // Leader thread.
-    let leader = sign_thread(child_proc.downgrade()).map_err(ForkError::Zone)?;
+    let leader = sign_thread(child_proc.downgrade(), Tid(child_pid.0)).map_err(ForkError::Zone)?;
 
     // Wire up payload — child inherits parent credentials, cwd, and
     // a per-slot clone of the parent's fd table. POSIX: fork copies
@@ -577,10 +577,13 @@ pub fn step_clone_thread(
     tls: usize,
     ctid_ptr: u64,
 ) -> Result<Cap<ThreadIdentity>, ZoneError> {
-    let child = sign_thread(process.downgrade())?;
+    let tid = allocate_tid();
+    let child = sign_thread(process.downgrade(), tid)?;
+    register_tid(child.tid, child.clone());
     seed_child_leader_context(&child, parent_user_ctx, tls, stack);
     if ctid_ptr != 0 {
-        let payload = child.payload_cap()
+        let payload = child
+            .payload_cap()
             .expect("step_clone_thread: fresh child missing payload");
         *payload.clear_child_tid.lock() = Some(ctid_ptr);
     }
@@ -617,6 +620,7 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
         let drained: Vec<Cap<ThreadIdentity>> = payload.threads.drain();
         for thread in &drained {
             set_thread_zombie(thread, status.wait_status_word());
+            unregister_pid_number(thread.tid.0 as u64);
         }
         // `_closed_fds` and `drained` drop here, releasing open-file and
         // thread refs before the payload is detached below.
@@ -1178,8 +1182,10 @@ fn sign_process_payload(
     Ok(PayloadCap::from_cap(cap))
 }
 
-fn sign_thread(owner_proc: Weak<ProcessIdentity>) -> Result<Cap<ThreadIdentity>, ZoneError> {
-    let tid = allocate_tid();
+fn sign_thread(
+    owner_proc: Weak<ProcessIdentity>,
+    tid: Tid,
+) -> Result<Cap<ThreadIdentity>, ZoneError> {
     let payload_cap = step_engine::sign(ThreadPayload::fresh())?;
     let payload = PayloadCap::from_cap(payload_cap);
     step_engine::sign(ThreadIdentity {
@@ -1205,7 +1211,9 @@ fn sign_thread(owner_proc: Weak<ProcessIdentity>) -> Result<Cap<ThreadIdentity>,
 pub fn spawn_sibling_thread_for_test(
     target: &Cap<ProcessIdentity>,
 ) -> Result<Cap<ThreadIdentity>, ZoneError> {
-    let sibling = sign_thread(target.downgrade())?;
+    let tid = allocate_tid();
+    let sibling = sign_thread(target.downgrade(), tid)?;
+    register_tid(sibling.tid, sibling.clone());
     if let Some(payload) = target.payload.lock().as_ref() {
         payload.threads.attach(sibling.clone());
     }
@@ -1271,7 +1279,11 @@ impl<'a, P: PmapIf, I: SubjectIdentity> StepOp<I> for ForkOp<'a, P> {
     type Output = Result<Cap<ProcessIdentity>, ForkError>;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(step_fork::<P>(self.parent, self.clone_vm, self.clone_sighand))
+        StepOutcome::Done(step_fork::<P>(
+            self.parent,
+            self.clone_vm,
+            self.clone_sighand,
+        ))
     }
 }
 
@@ -1624,210 +1636,5 @@ impl StepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {
 impl OneShotStepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {}
 
 #[cfg(test)]
-mod step_op_wraps {
-    //! PR-2 StepOp wrap tests (process::execution scope).
-    //!
-    //! Each test exercises one `*Op` wrap end-to-end: build the op with
-    //! a fixture, drive `.step(&mut ScriptCtx)`, assert the outcome
-    //! variant shape. Coverage of the underlying step-fn semantics
-    //! lives in `process::tests`; the value here is the compile-check
-    //! plus a smoke that the wrap delegates with the expected arg
-    //! plumbing.
-    use super::*;
-    use crate::process::adapter::step_engine::{
-        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
-    };
-    use crate::process::structure::reset_pid_counter_for_test;
-    use crate::signal::Signum;
-    use crate::test_support::EPOCH_TEST_LOCK;
-    use crate::thread_runtime::structure::reset_tid_counter_for_test;
-    use crate::vm::{AddressSpace, TestPmap};
-    use crate::zones;
-    fn setup() -> std::sync::MutexGuard<'static, ()> {
-        let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        tx_test_support::init_host();
-        let _ = zones::register_all();
-        tx_test_support::drain_to_quiescence();
-        reset_pid_counter_for_test();
-        reset_tid_counter_for_test();
-        reset_init_process_for_test();
-        guard
-    }
-
-    fn fresh_aspace() -> Cap<AddressSpace> {
-        AddressSpace::new_cap_for_platform::<TestPmap>().expect("fresh aspace")
-    }
-
-    fn bootstrap() -> Cap<ProcessIdentity> {
-        bootstrap_init_process(fresh_aspace()).expect("bootstrap init")
-    }
-
-    #[test]
-    fn fork_op_delegates_to_step_fork() {
-        let _g = setup();
-        let parent = bootstrap();
-        let mut op = ForkOp::<TestPmap> {
-            parent: &parent,
-            clone_vm: false,
-            clone_sighand: false,
-            _pmap: core::marker::PhantomData,
-        };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        match outcome {
-            StepOutcome::Done(result) => {
-                let child = result.expect("step_fork should succeed");
-                assert_ne!(child.pid, parent.pid);
-            }
-            _ => panic!("expected Done(_), got non-Done outcome"),
-        }
-    }
-
-    #[test]
-    fn exit_group_op_delegates_to_step_exit_group() {
-        let _g = setup();
-        let parent = bootstrap();
-        let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
-        let mut op = ExitGroupOp {
-            process: &child,
-            status: ExitStatus::Exited(0),
-        };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        assert_eq!(outcome, StepOutcome::Done(()));
-        assert!(child.is_zombie());
-        assert_eq!(child.exit_status(), Some(ExitStatus::Exited(0)));
-    }
-
-    #[test]
-    fn exit_group_with_signal_op_delegates_to_step_exit_group_with_signal() {
-        let _g = setup();
-        let parent = bootstrap();
-        let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
-        let mut op = ExitGroupWithSignalOp {
-            process: &child,
-            sig: Signum::SIGKILL,
-        };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        assert_eq!(outcome, StepOutcome::Done(()));
-        assert!(child.is_zombie());
-        assert_eq!(
-            child.exit_status(),
-            Some(ExitStatus::Signaled(Signum::SIGKILL))
-        );
-    }
-
-    #[test]
-    fn waitpid_nohang_op_no_children_returns_echild() {
-        let _g = setup();
-        let parent = bootstrap();
-        let mut op = WaitpidNohangOp {
-            parent: &parent,
-            target: WaitTarget::Any,
-        };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        match outcome {
-            StepOutcome::Done(Err(WaitError::NoChildren)) => {}
-            other => panic!("expected Done(Err(NoChildren)), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn getcwd_op_returns_none_for_init_without_cwd() {
-        let _g = setup();
-        let parent = bootstrap();
-        let mut op = GetcwdOp { target: &parent };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        // init bootstrap leaves cwd unset, so step_getcwd returns None.
-        assert_eq!(outcome, StepOutcome::Done(None));
-    }
-
-    #[test]
-    fn setpgid_op_unimplemented_for_non_self_pgid() {
-        let _g = setup();
-        let parent = bootstrap();
-        // Day-1 only supports new_pgid == target.pid; anything else
-        // returns SetpgidError::Unimplemented. Use a value that is
-        // not the target's pid to exercise that arm deterministically.
-        let bogus = Pgid(parent.pid.0 + 999);
-        let mut op = SetpgidOp {
-            target: &parent,
-            new_pgid: bogus,
-        };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        match outcome {
-            StepOutcome::Err(v3_errno)
-                if Into::<crate::execution::Errno>::into(v3_errno)
-                    == crate::execution::Errno::ENOSYS => {}
-            other => panic!("expected Err(crate::execution::Errno::ENOSYS), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn setsid_op_delegates_to_step_setsid() {
-        let _g = setup();
-        let parent = bootstrap();
-        let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
-        let mut op = SetsidOp { target: &child };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        match outcome {
-            StepOutcome::Done(sid) => {
-                assert_eq!(sid.0, child.pid.0);
-            }
-            other => panic!("expected Done(Ok(sid)), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn close_cloexec_fds_op_is_noop_with_empty_set() {
-        let _g = setup();
-        let parent = bootstrap();
-        let mut op = CloseCloexecFdsOp { process: &parent };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        assert_eq!(outcome, StepOutcome::Done(()));
-        // Bootstrap leaves the CLOEXEC set empty; post-call it stays empty.
-        assert!(parent.fd_cloexec_snapshot().is_empty());
-    }
-
-    #[test]
-    fn reset_signal_dispositions_for_exec_op_runs_on_live_process() {
-        let _g = setup();
-        let parent = bootstrap();
-        let mut op = ResetSignalDispositionsForExecOp { process: &parent };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        assert_eq!(outcome, StepOutcome::Done(()));
-    }
-
-    #[test]
-    fn install_brk_for_exec_op_seeds_brk_base_and_current() {
-        let _g = setup();
-        let parent = bootstrap();
-        let new_base: u64 = 0x4000_0000;
-        let mut op = InstallBrkForExecOp {
-            process: &parent,
-            new_brk_base: new_base,
-        };
-        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        let outcome = op.step(&mut ctx);
-        assert_eq!(outcome, StepOutcome::Done(()));
-        let payload_guard = parent.payload.lock();
-        let payload = payload_guard.as_ref().expect("init payload live");
-        assert_eq!(
-            payload.brk_base.load(core::sync::atomic::Ordering::Acquire),
-            new_base
-        );
-        assert_eq!(
-            payload
-                .current_brk
-                .load(core::sync::atomic::Ordering::Acquire),
-            new_base
-        );
-    }
-}
+#[path = "step_op_wraps.rs"]
+mod step_op_wraps;

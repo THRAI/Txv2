@@ -732,11 +732,8 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             {
                 let guard = step_engine::guard();
                 let user_ptr = UserPtr::<u32>::new(uaddr as usize);
-                match ctx.aspace.read_user(user_ptr, &guard) {
-                    StepOutcome::Err(_) => {
-                        return SyscallResult::error_from(Errno::EFAULT);
-                    }
-                    _ => {}
+                if let StepOutcome::Err(_) = ctx.aspace.read_user(user_ptr, &guard) {
+                    return SyscallResult::error_from(Errno::EFAULT);
                 }
             }
 
@@ -745,7 +742,8 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             // (the predecessor equality check, per POSIX).
             {
                 let guard = step_engine::guard();
-                let outcome = tx_subsystems::futex::step_futex_wait(&ctx.aspace, uaddr, val, &guard);
+                let outcome =
+                    tx_subsystems::futex::step_futex_wait(&ctx.aspace, uaddr, val, &guard);
                 match outcome {
                     StepOutcome::Err(e) if e == V3Errno::EAGAIN => {
                         return SyscallResult::error_from(Errno::EAGAIN);
@@ -767,7 +765,11 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             // Op acquires its own epoch guard inside `step()`; no
             // guard crosses `drive(...).await` (REACTOR_v0,
             // STEP_MODEL_v2 §1, INVARIANTS_v5 EBR-7).
-            let op = FutexWaitOp { uaddr, val, aspace: &ctx.aspace };
+            let op = FutexWaitOp {
+                uaddr,
+                val,
+                aspace: &ctx.aspace,
+            };
             match drive(
                 op,
                 &mut script_ctx,
