@@ -20,12 +20,14 @@ use tx_subsystems::net::device::{
     net_device_by_name, net_device_snapshot, VIRTIO_NET0_REGISTRATION,
 };
 use tx_subsystems::net::execution::{DeviceTxBudget, LoopbackPollBudget};
-use tx_subsystems::net::initial_loopback_iface;
 use tx_subsystems::net::packet::{
     PacketDispatch, PacketSource, PacketTxReadiness, PacketTxResult, PacketTxSink,
 };
 use tx_subsystems::net::protocol::{EtherIface, IfaceCommon, LoopbackIface};
 use tx_subsystems::net::structure::Ipv4Address;
+use tx_subsystems::net::{
+    initial_loopback_iface, initial_net_namespace_payload, NetAdminAuthority,
+};
 
 use super::{CoreInit, BOOT_REACTOR};
 
@@ -66,6 +68,7 @@ impl BootNetRuntime {
         reactor_base_ns: u64,
     ) -> Self {
         let netdev = boot_net_registration();
+        publish_boot_net_device_to_namespace(netdev);
         Self {
             ether_iface: EtherIface::new(
                 netdev,
@@ -133,6 +136,27 @@ fn boot_net_registration() -> &'static tx_subsystems::net::device::NetDeviceRegi
     net_device_by_name(b"eth0")
         .or_else(|| net_device_snapshot().into_iter().next())
         .unwrap_or(&VIRTIO_NET0_REGISTRATION)
+}
+
+fn publish_boot_net_device_to_namespace(
+    registration: &'static tx_subsystems::net::device::NetDeviceRegistration,
+) {
+    let namespace = initial_net_namespace_payload();
+    let authority = NetAdminAuthority::for_test_or_bootstrap();
+    if let Some(link) = namespace
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.name == registration.name)
+    {
+        let _ = namespace.set_device_ipv4_addr_by_ifindex(
+            authority,
+            link.ifindex,
+            Some(BOOT_ETH_IPV4),
+            Some(24),
+        );
+        return;
+    }
+    let _ = namespace.attach_device_for_test_or_bootstrap(registration, Some(BOOT_ETH_IPV4));
 }
 
 impl PacketSource for BootNetRuntime {
@@ -248,6 +272,11 @@ impl<P: TxPlatform> CoreInit<P> {
     ) -> Option<tx_reactor::TaskKey> {
         let runtime = Self::init_boot_net_runtime()?;
         Self::submit_net_delegate_task_with_config(runtime, config)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn init_boot_net_runtime_for_test() -> bool {
+        Self::init_boot_net_runtime().is_some()
     }
 
     #[cfg(test)]

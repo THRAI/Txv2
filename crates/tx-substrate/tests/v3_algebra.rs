@@ -105,6 +105,7 @@ fn errno_mirrors_v4_catalog() {
         Errno::EISCONN,
         Errno::EISDIR,
         Errno::ELOOP,
+        Errno::EMSGSIZE,
         Errno::ENAMETOOLONG,
         Errno::ENODEV,
         Errno::ENOEXEC,
@@ -154,6 +155,7 @@ fn errno_mirrors_v4_catalog() {
             | Errno::EISCONN
             | Errno::EISDIR
             | Errno::ELOOP
+            | Errno::EMSGSIZE
             | Errno::ENAMETOOLONG
             | Errno::ENODEV
             | Errno::ENOEXEC

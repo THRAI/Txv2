@@ -107,7 +107,7 @@ pub const DEVFS_RTC_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7805);
 /// `/dev/null` character device name as the lookup key.
 const DEVFS_NULL_NAME: &[u8] = b"null";
 
-/// `/dev/zero` directory name as the lookup key.
+/// `/dev/zero` character device name as the lookup key.
 const DEVFS_ZERO_NAME: &[u8] = b"zero";
 
 /// `/dev/misc` directory name as the lookup key.

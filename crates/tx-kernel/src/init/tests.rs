@@ -268,6 +268,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     tx_subsystems::cross_crate_test_support::reset_dev_id_counter();
     tx_subsystems::cross_crate_test_support::reset_reactor_submit_seam();
     crate::init::reset_boot_state_for_test();
+    tx_subsystems::net::initial_loopback_iface().clear_for_test_or_bootstrap();
     crate::irq::reset_dispatch_table_for_test();
     tx_subsystems::device::reset_block_registry_for_test();
     CONSOLE_CAPTURED_LEN.store(0, Ordering::Release);

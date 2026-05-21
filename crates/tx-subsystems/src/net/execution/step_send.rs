@@ -5,7 +5,11 @@ use crate::execution::{Errno, Guard};
 use crate::net::checks::require::require_socket_write_target;
 use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::{socket_send_wait_token, yield_bytes_on_token, ByteStepOutcome};
-use crate::net::structure::{IpEndpoint, SendRecvFlags, SendWireSet, SocketIdentity};
+use crate::net::protocol::UDP_IPV4_MAX_PAYLOAD_BYTES;
+use crate::net::structure::{
+    IpEndpoint, SendRecvFlags, SendWireSet, SocketIdentity, SocketKind, SocketPayload,
+    SocketProtocol, TcpState,
+};
 
 pub fn step_send(
     socket: &Cap<SocketIdentity>,
@@ -18,14 +22,19 @@ pub fn step_send(
         Err(errno) => return StepOutcome::Err(errno),
     };
     debug_assert_eq!(witness.identity.raw(), socket.raw());
-    let _flags = witness.flags;
 
     let Some(payload) = socket.acquire_operational() else {
         return StepOutcome::Err(Errno::ENOTCONN);
     };
 
+    if let Some(errno) = send_flags_error(witness.flags) {
+        return StepOutcome::Err(errno);
+    }
     if payload.shutdown_wr() {
         return StepOutcome::Err(Errno::EPIPE);
+    }
+    if let Some(errno) = udp_payload_len_error(socket.kind, len) {
+        return StepOutcome::Err(errno);
     }
     if len == 0 {
         return StepOutcome::Done(0);
@@ -55,14 +64,19 @@ pub fn step_send_kernel_bytes(
         Err(errno) => return StepOutcome::Err(errno),
     };
     debug_assert_eq!(witness.identity.raw(), socket.raw());
-    let _flags = witness.flags;
 
     let Some(payload) = socket.acquire_operational() else {
         return StepOutcome::Err(Errno::ENOTCONN);
     };
 
+    if let Some(errno) = send_flags_error(witness.flags) {
+        return StepOutcome::Err(errno);
+    }
     if payload.shutdown_wr() {
         return StepOutcome::Err(Errno::EPIPE);
+    }
+    if let Some(errno) = udp_payload_len_error(socket.kind, bytes.len()) {
+        return StepOutcome::Err(errno);
     }
     if bytes.is_empty() {
         return StepOutcome::Done(0);
@@ -104,14 +118,22 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
         Err(errno) => return StepOutcome::Err(errno),
     };
     debug_assert_eq!(witness.identity.raw(), socket.raw());
-    let _flags = witness.flags;
 
     let Some(payload) = socket.acquire_operational() else {
         return StepOutcome::Err(Errno::ENOTCONN);
     };
 
+    if let Some(errno) = send_flags_error(witness.flags) {
+        return StepOutcome::Err(errno);
+    }
     if payload.shutdown_wr() {
         return StepOutcome::Err(Errno::EPIPE);
+    }
+    if let Some(errno) = stream_send_state_error(socket, &payload) {
+        return StepOutcome::Err(errno);
+    }
+    if let Some(errno) = udp_payload_len_error(socket.kind, bytes.len()) {
+        return StepOutcome::Err(errno);
     }
     if bytes.is_empty() {
         return StepOutcome::Done(0);
@@ -134,4 +156,33 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
         net_delegate_kick_poll();
     }
     StepOutcome::Done(reserve.bytes)
+}
+
+pub(super) fn send_flags_error(flags: SendRecvFlags) -> Option<Errno> {
+    if flags.contains(SendRecvFlags::MSG_OOB) {
+        Some(Errno::EOPNOTSUPP)
+    } else if flags.contains(SendRecvFlags::MSG_ERRQUEUE) {
+        Some(Errno::EINVAL)
+    } else {
+        None
+    }
+}
+
+pub(super) fn udp_payload_len_error(kind: SocketKind, len: usize) -> Option<Errno> {
+    if kind == SocketKind::Udp && len > UDP_IPV4_MAX_PAYLOAD_BYTES {
+        Some(Errno::EMSGSIZE)
+    } else {
+        None
+    }
+}
+
+fn stream_send_state_error(socket: &Cap<SocketIdentity>, payload: &SocketPayload) -> Option<Errno> {
+    if socket.kind != SocketKind::Tcp {
+        return None;
+    }
+    match payload.protocol_snapshot() {
+        SocketProtocol::Tcp(TcpState::Connected { .. }) => None,
+        SocketProtocol::Tcp(TcpState::Closed) => Some(Errno::ENOTCONN),
+        _ => Some(Errno::EPIPE),
+    }
 }

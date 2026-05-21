@@ -233,6 +233,7 @@ mod exec;
 mod helpers;
 mod net;
 mod reactor_submit;
+mod rootfs_shims;
 
 impl<P: TxPlatform> CoreInit<P> {
     pub fn boot(handoff: BootHandoff) -> ! {
@@ -1388,6 +1389,13 @@ impl<P: TxPlatform> CoreInit<P> {
                 }
                 other => panic!("mount_sdcard_at_musl: mkdir /lib: {other:?}"),
             };
+            let _ = rootfs_payload.fs_ops.symlink(
+                lib_id,
+                b"ld-musl-riscv64.so.1",
+                b"/musl/musl/lib/libc.so",
+                &cred,
+                &guard,
+            );
             let _ = rootfs_payload.fs_ops.symlink(
                 lib_id,
                 b"ld-musl-riscv64-sf.so.1",

@@ -36,7 +36,7 @@ pub struct PollContextOutcome {
 }
 
 impl PollContext {
-    pub const fn new(timestamp: Instant) -> Self {
+    pub fn new(timestamp: Instant) -> Self {
         Self::new_with_table(timestamp, SOCKET_TABLE.as_table())
     }
 

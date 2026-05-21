@@ -77,7 +77,7 @@ impl ValidSocketType {
             1 => SocketType::Stream,
             2 => SocketType::Dgram,
             3 => SocketType::Raw,
-            _ => return Err(Errno::ESOCKTNOSUPPORT),
+            _ => return Err(Errno::EINVAL),
         };
 
         let protocol = u16::try_from(protocol).map_err(|_| Errno::EINVAL)?;
@@ -93,6 +93,7 @@ impl ValidSocketType {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketKind {
     UnixDatagram,
+    UnixStream,
     Tcp,
     Udp,
     RawIcmp,
@@ -105,10 +106,12 @@ impl SocketKind {
     pub fn from_valid_socket_type(valid: ValidSocketType) -> Result<Self, Errno> {
         match (valid.domain, valid.sock_type, valid.protocol) {
             (AddressFamily::Unix, SocketType::Dgram, 0) => Ok(Self::UnixDatagram),
+            (AddressFamily::Unix, SocketType::Stream, 0) => Ok(Self::UnixStream),
             (AddressFamily::Inet, SocketType::Stream, 0 | 6) => Ok(Self::Tcp),
             (AddressFamily::Inet, SocketType::Dgram, 0 | 17) => Ok(Self::Udp),
             (AddressFamily::Inet, SocketType::Dgram, 1)
             | (AddressFamily::Inet, SocketType::Raw, 1) => Ok(Self::RawIcmp),
+            (AddressFamily::Inet, _, _) => Err(Errno::EPROTONOSUPPORT),
             (AddressFamily::Netlink, SocketType::Raw | SocketType::Dgram, 0) => {
                 Ok(Self::NetlinkRoute)
             }
@@ -238,8 +241,10 @@ pub struct SendRecvFlags {
 }
 
 impl SendRecvFlags {
+    pub const MSG_OOB: Self = Self { bits: 0x01 };
     pub const MSG_DONTWAIT: Self = Self { bits: 0x40 };
     pub const MSG_PEEK: Self = Self { bits: 0x02 };
+    pub const MSG_ERRQUEUE: Self = Self { bits: 0x2000 };
     pub const MSG_WAITALL: Self = Self { bits: 0x100 };
     pub const MSG_NOSIGNAL: Self = Self { bits: 0x4000 };
     pub const MSG_TRUNC: Self = Self { bits: 0x20 };
@@ -251,8 +256,10 @@ impl SendRecvFlags {
 
     pub const fn all() -> Self {
         Self {
-            bits: Self::MSG_DONTWAIT.bits
+            bits: Self::MSG_OOB.bits
+                | Self::MSG_DONTWAIT.bits
                 | Self::MSG_PEEK.bits
+                | Self::MSG_ERRQUEUE.bits
                 | Self::MSG_WAITALL.bits
                 | Self::MSG_NOSIGNAL.bits
                 | Self::MSG_TRUNC.bits
@@ -425,6 +432,7 @@ impl SocketOptionSet {
         match kind {
             SocketKind::Tcp => Self::default_tcp(),
             SocketKind::UnixDatagram
+            | SocketKind::UnixStream
             | SocketKind::Udp
             | SocketKind::RawIcmp
             | SocketKind::NetlinkRoute

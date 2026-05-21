@@ -363,9 +363,6 @@ impl RawTcpSocket {
                 protocol_state.has_connected = true;
                 publish.connected = true;
             }
-            if !before.can_recv && after.can_recv {
-                publish.recv_readable = true;
-            }
             if before.can_send != after.can_send && after.can_send {
                 publish.send_writable = true;
             }
@@ -524,7 +521,6 @@ impl SmoltcpTcpRepr {
 #[derive(Clone, Copy)]
 struct SocketProtocolObservation {
     state: tcp::State,
-    can_recv: bool,
     can_send: bool,
     may_send: bool,
     is_active: bool,
@@ -533,7 +529,6 @@ struct SocketProtocolObservation {
 fn observe_socket(socket: &tcp::Socket<'_>) -> SocketProtocolObservation {
     SocketProtocolObservation {
         state: socket.state(),
-        can_recv: socket.can_recv(),
         can_send: socket.can_send(),
         may_send: socket.may_send(),
         is_active: matches!(

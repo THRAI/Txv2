@@ -1,7 +1,7 @@
 use crate::execution::Errno;
 use crate::net::structure::{
     IpEndpoint, KernelSockAddr, SendRecvFlags, SockAddrIn, SockShutdownCmd, SocketIdentity,
-    SocketKind, SocketProtocol, TcpState, UdpInner,
+    SocketKind, SocketPayload, SocketProtocol, TcpState, UdpInner,
 };
 
 pub(crate) fn endpoint_from_sockaddr(addr: KernelSockAddr) -> Result<IpEndpoint, Errno> {
@@ -25,6 +25,19 @@ pub(crate) fn require_bind_endpoint(addr: KernelSockAddr) -> Result<IpEndpoint, 
 pub(crate) fn raw_bind_endpoint(addr: KernelSockAddr) -> Result<IpEndpoint, Errno> {
     let endpoint = endpoint_from_sockaddr(addr)?;
     Ok(IpEndpoint::new(endpoint.addr, 0))
+}
+
+fn require_local_bind_addr(
+    payload: &SocketPayload,
+    endpoint: IpEndpoint,
+) -> Result<IpEndpoint, Errno> {
+    if endpoint.addr == crate::net::structure::Ipv4Address::UNSPECIFIED
+        || payload.net_namespace().owns_ipv4_addr(endpoint.addr)
+    {
+        Ok(endpoint)
+    } else {
+        Err(Errno::EADDRNOTAVAIL)
+    }
 }
 
 pub(crate) fn socket_payload_present(socket: &SocketIdentity) -> Result<(), Errno> {
@@ -59,14 +72,19 @@ pub(crate) fn socket_can_bind(
             return Err(Errno::ENOTCONN);
         };
         match (socket.kind, payload.protocol_snapshot()) {
-            (SocketKind::Tcp, SocketProtocol::Tcp(TcpState::Init)) => require_bind_endpoint(addr),
+            (SocketKind::Tcp, SocketProtocol::Tcp(TcpState::Init)) => {
+                let endpoint = require_bind_endpoint(addr)?;
+                require_local_bind_addr(payload, endpoint)
+            }
             (SocketKind::Udp, SocketProtocol::Udp(UdpInner::Unbound)) => {
-                require_bind_endpoint(addr)
+                let endpoint = require_bind_endpoint(addr)?;
+                require_local_bind_addr(payload, endpoint)
             }
             (SocketKind::RawIcmp, SocketProtocol::RawIcmp(state))
                 if state.bound_local.is_none() =>
             {
-                raw_bind_endpoint(addr)
+                let endpoint = raw_bind_endpoint(addr)?;
+                require_local_bind_addr(payload, endpoint)
             }
             _ => Err(Errno::EINVAL),
         }

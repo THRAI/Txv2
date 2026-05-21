@@ -364,8 +364,8 @@ impl Default for SocketTable {
 pub struct InitialSocketTableProxy;
 
 impl InitialSocketTableProxy {
-    pub const fn as_table(&self) -> &'static SocketTable {
-        crate::net::namespace::initial_socket_table()
+    pub fn as_table(&self) -> &'static SocketTable {
+        crate::net::namespace::initial_net_namespace_payload().socket_table()
     }
 
     fn with_table<R>(&self, f: impl FnOnce(&SocketTable) -> R) -> R {
