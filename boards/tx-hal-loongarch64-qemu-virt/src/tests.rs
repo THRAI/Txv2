@@ -920,12 +920,16 @@ fn activate_pmap_installs_pgdl_pgdh_and_asid() {
     // Activation allocates the shared kernel PGDH and its high bootstrap
     // kernel image mapping. The per-process PGDL remains user-only.
     assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 6);
-    assert!(la64_page_table_mut_from_phys(first.phys())
-        .iter()
-        .all(|entry| *entry == 0));
-    assert!(la64_page_table_mut_from_phys(second.phys())
-        .iter()
-        .all(|entry| *entry == 0));
+    assert!(
+        la64_page_table_mut_from_phys(first.phys())
+            .iter()
+            .all(|entry| *entry == 0)
+    );
+    assert!(
+        la64_page_table_mut_from_phys(second.phys())
+            .iter()
+            .all(|entry| *entry == 0)
+    );
     let pgdh_page = la64_page_table_mut_from_phys(PhysAddr(pgdh));
     assert!(pgdh_page.iter().any(|entry| *entry != 0));
 

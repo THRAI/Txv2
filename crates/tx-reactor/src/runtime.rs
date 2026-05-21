@@ -3,6 +3,8 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     future::Future,
+    ptr,
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 
@@ -22,7 +24,10 @@ use crate::{
         StopReason, TaskHandle, TaskRunOwner, WakeHint,
     },
     spin_lock::SpinLock,
-    task::{TaskDrainRecord, TaskId, TaskKey, TaskLifecycleError, TaskStatus, TaskTable},
+    task::{
+        PendingPollCommit, TakeRunnableError, TaskDrainRecord, TaskId, TaskKey, TaskLifecycleError,
+        TaskStatus, TaskTable,
+    },
     timer::{DeadlineFuture, TimerQueue},
     userspace::{
         UserspaceEntryCheckpoint, UserspaceEntryDecision, UserspaceEntryOutcome,
@@ -181,31 +186,60 @@ pub struct ReactorShared {
     userspace: SpinLock<UserspaceRunSlot>,
 }
 
+const MAX_REACTOR_HARTS: usize = 64;
+
 pub struct ReactorLocals {
-    harts: SpinLock<Vec<&'static HartReactorLocal>>,
+    harts: [AtomicPtr<HartReactorLocal>; MAX_REACTOR_HARTS],
+    len: AtomicUsize,
+    init_lock: SpinLock<()>,
 }
 
 impl ReactorLocals {
     fn new() -> Self {
         Self {
-            harts: SpinLock::new(Vec::new()),
+            harts: [const { AtomicPtr::new(ptr::null_mut()) }; MAX_REACTOR_HARTS],
+            len: AtomicUsize::new(0),
+            init_lock: SpinLock::new(()),
         }
     }
 
+    #[track_caller]
     fn ensure_hart(&self, hart: HartId) {
-        let mut harts = self.harts.lock();
-        while harts.len() <= hart.0 {
-            let local = Box::leak(Box::new(HartReactorLocal::new(HartId(harts.len()))));
-            harts.push(local);
+        if hart.0 >= MAX_REACTOR_HARTS {
+            let caller = core::panic::Location::caller();
+            panic!(
+                "hart {} exceeds MAX_REACTOR_HARTS at {}:{}",
+                hart.0,
+                caller.file(),
+                caller.line()
+            );
+        }
+        if !self.harts[hart.0].load(Ordering::Acquire).is_null() {
+            return;
+        }
+        let _guard = self.init_lock.lock();
+        while self.len.load(Ordering::Acquire) <= hart.0 {
+            let index = self.len.load(Ordering::Acquire);
+            let local = Box::leak(Box::new(HartReactorLocal::new(HartId(index))));
+            self.harts[index].store(local as *mut HartReactorLocal, Ordering::Release);
+            self.len.store(index + 1, Ordering::Release);
         }
     }
 
     fn get(&self, hart: HartId) -> Option<&HartReactorLocal> {
-        self.harts.lock().get(hart.0).copied()
+        if hart.0 >= MAX_REACTOR_HARTS {
+            return None;
+        }
+        let ptr = self.harts[hart.0].load(Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*ptr })
+        }
     }
 
     fn len(&self) -> usize {
-        self.harts.lock().len()
+        self.len.load(Ordering::Acquire)
     }
 
     fn total_queue_depth(&self, hart: HartId) -> usize {
@@ -383,24 +417,13 @@ impl SharedReactor {
                 let Some((handle, slice)) = view.pick_next_or_steal_local(hart) else {
                     break;
                 };
-                let Some(key) = view.shared.tasks.lock().key_for_id(handle.id()) else {
-                    view.shared.scheduler.task_dropped(handle.id());
-                    continue;
-                };
-                let status = view.shared.tasks.lock().status(key);
-                if status != Some(TaskStatus::Runnable) {
-                    match status {
-                        Some(TaskStatus::Completed | TaskStatus::Cancelled) => {
-                            view.shared.scheduler.task_dropped(handle.id());
-                        }
-                        _ => {
-                            view.task_stopped_local(handle.id(), StopReason::Blocked, 0, hart);
-                        }
-                    }
-                    continue;
-                }
-                let packet = match view.shared.tasks.lock().take_future(key) {
-                    Ok((future, wake_state, mailbox)) => {
+                let packet = match view
+                    .shared
+                    .tasks
+                    .lock()
+                    .take_runnable_future_by_id(handle.id())
+                {
+                    Ok((key, future, wake_state, mailbox)) => {
                         crate::task::set_current_mailbox(hart.0, Some(mailbox));
                         crate::task::set_current_timer_wheel(
                             hart.0,
@@ -412,7 +435,21 @@ impl SharedReactor {
                         );
                         Some((key, future, wake_state, slice))
                     }
-                    Err(_) => continue,
+                    Err(TakeRunnableError::Missing) => {
+                        view.shared.scheduler.task_dropped(handle.id());
+                        continue;
+                    }
+                    Err(TakeRunnableError::NotRunnable(status)) => {
+                        match status {
+                            TaskStatus::Completed | TaskStatus::Cancelled => {
+                                view.shared.scheduler.task_dropped(handle.id());
+                            }
+                            _ => {
+                                view.task_stopped_local(handle.id(), StopReason::Blocked, 0, hart);
+                            }
+                        }
+                        continue;
+                    }
                 };
                 packet
             };
@@ -435,10 +472,15 @@ impl SharedReactor {
             // Phase 3: commit state through task/scheduler/local locks.
             {
                 let mut view = reactor.hart_runtime_view(hart);
-                let _ = view.shared.tasks.lock().put_future(key, future);
                 match result {
                     Poll::Ready(()) => {
-                        if view.shared.tasks.lock().complete_task(key).is_ok() {
+                        if view
+                            .shared
+                            .tasks
+                            .lock()
+                            .finish_polled_complete(key, future)
+                            .is_ok()
+                        {
                             view.task_stopped_local(
                                 key.id(),
                                 StopReason::Completed,
@@ -452,55 +494,58 @@ impl SharedReactor {
                     Poll::Pending => {
                         let userspace_preempted = view.take_userspace_preempt_marker(hart);
                         if userspace_preempted {
-                            if let Ok(task) = view.shared.tasks.lock().task_mut(key) {
-                                let _ = task.wake_state.take_wake();
-                                task.status = TaskStatus::Runnable;
-                                task.last_stop_reason = Some(StopReason::PreemptedExternal);
-                            }
-                            view.task_stopped_local(
-                                key.id(),
-                                StopReason::PreemptedExternal,
-                                accounting.consumed_ns,
-                                hart,
-                            );
-                            let _ = view.dispatch_queued_task_from_hart(key.id(), hart, signal);
-                        } else if accounting.slice_expired {
-                            if let Ok(task) = view.shared.tasks.lock().task_mut(key) {
-                                let _ = task.wake_state.take_wake();
-                                task.status = TaskStatus::Runnable;
-                                task.last_stop_reason = Some(StopReason::SliceExpired);
-                            }
-                            view.task_stopped_local(
-                                key.id(),
-                                StopReason::SliceExpired,
-                                accounting.consumed_ns,
-                                hart,
-                            );
-                            let _ = view.dispatch_queued_task_from_hart(key.id(), hart, signal);
-                        } else if view
-                            .shared
-                            .tasks
-                            .lock()
-                            .task(key)
-                            .map(|t| t.wake_state.take_wake())
-                            .unwrap_or(false)
-                        {
-                            view.mark_runnable_from_hart(key, WakeHint::Normal, hart, signal);
-                        } else {
-                            let parked = if let Ok(task) = view.shared.tasks.lock().task_mut(key) {
-                                task.status = TaskStatus::Parked;
-                                task.last_stop_reason = Some(StopReason::Blocked);
-                                true
-                            } else {
-                                false
-                            };
-                            if parked {
+                            if view
+                                .shared
+                                .tasks
+                                .lock()
+                                .finish_polled_runnable(key, future, StopReason::PreemptedExternal)
+                                .is_ok()
+                            {
                                 view.task_stopped_local(
                                     key.id(),
-                                    StopReason::Blocked,
+                                    StopReason::PreemptedExternal,
                                     accounting.consumed_ns,
                                     hart,
                                 );
+                                let _ = view.dispatch_queued_task_from_hart(key.id(), hart, signal);
+                            }
+                        } else if accounting.slice_expired {
+                            if view
+                                .shared
+                                .tasks
+                                .lock()
+                                .finish_polled_runnable(key, future, StopReason::SliceExpired)
+                                .is_ok()
+                            {
+                                view.task_stopped_local(
+                                    key.id(),
+                                    StopReason::SliceExpired,
+                                    accounting.consumed_ns,
+                                    hart,
+                                );
+                                let _ = view.dispatch_queued_task_from_hart(key.id(), hart, signal);
+                            }
+                        } else {
+                            let pending_commit =
+                                { view.shared.tasks.lock().finish_polled_pending(key, future) };
+                            match pending_commit {
+                                Ok(PendingPollCommit::Woken) => {
+                                    view.mark_runnable_from_hart(
+                                        key,
+                                        WakeHint::Normal,
+                                        hart,
+                                        signal,
+                                    );
+                                }
+                                Ok(PendingPollCommit::Parked) => {
+                                    view.task_stopped_local(
+                                        key.id(),
+                                        StopReason::Blocked,
+                                        accounting.consumed_ns,
+                                        hart,
+                                    );
+                                }
+                                Err(_) => {}
                             }
                         }
                     }
@@ -648,24 +693,13 @@ impl HartRuntimeView<'_> {
                 let Some((handle, slice)) = self.pick_next_or_steal_local(hart) else {
                     break;
                 };
-                let Some(key) = self.shared.tasks.lock().key_for_id(handle.id()) else {
-                    self.shared.scheduler.task_dropped(handle.id());
-                    continue;
-                };
-                let status = self.shared.tasks.lock().status(key);
-                if status != Some(TaskStatus::Runnable) {
-                    match status {
-                        Some(TaskStatus::Completed | TaskStatus::Cancelled) => {
-                            self.shared.scheduler.task_dropped(handle.id());
-                        }
-                        _ => {
-                            self.task_stopped_local(handle.id(), StopReason::Blocked, 0, hart);
-                        }
-                    }
-                    continue;
-                }
-                match self.shared.tasks.lock().take_future(key) {
-                    Ok((future, wake_state, mailbox)) => {
+                match self
+                    .shared
+                    .tasks
+                    .lock()
+                    .take_runnable_future_by_id(handle.id())
+                {
+                    Ok((key, future, wake_state, mailbox)) => {
                         crate::task::set_current_mailbox(hart.0, Some(mailbox));
                         crate::task::set_current_timer_wheel(
                             hart.0,
@@ -677,7 +711,21 @@ impl HartRuntimeView<'_> {
                         );
                         Some((key, future, wake_state, slice))
                     }
-                    Err(_) => continue,
+                    Err(TakeRunnableError::Missing) => {
+                        self.shared.scheduler.task_dropped(handle.id());
+                        continue;
+                    }
+                    Err(TakeRunnableError::NotRunnable(status)) => {
+                        match status {
+                            TaskStatus::Completed | TaskStatus::Cancelled => {
+                                self.shared.scheduler.task_dropped(handle.id());
+                            }
+                            _ => {
+                                self.task_stopped_local(handle.id(), StopReason::Blocked, 0, hart);
+                            }
+                        }
+                        continue;
+                    }
                 }
             }) else {
                 continue;
@@ -693,11 +741,15 @@ impl HartRuntimeView<'_> {
             crate::task::set_current_timer_wheel(hart.0, None);
             crate::task::set_current_delegate_registry(hart.0, None);
 
-            let _ = self.shared.tasks.lock().put_future(key, future);
-
             match result {
                 Poll::Ready(()) => {
-                    if self.shared.tasks.lock().complete_task(key).is_ok() {
+                    if self
+                        .shared
+                        .tasks
+                        .lock()
+                        .finish_polled_complete(key, future)
+                        .is_ok()
+                    {
                         self.task_stopped_local(
                             key.id(),
                             StopReason::Completed,
@@ -711,55 +763,53 @@ impl HartRuntimeView<'_> {
                 Poll::Pending => {
                     let userspace_preempted = self.take_userspace_preempt_marker(hart);
                     if userspace_preempted {
-                        if let Ok(task) = self.shared.tasks.lock().task_mut(key) {
-                            let _ = task.wake_state.take_wake();
-                            task.status = TaskStatus::Runnable;
-                            task.last_stop_reason = Some(StopReason::PreemptedExternal);
-                        }
-                        self.task_stopped_local(
-                            key.id(),
-                            StopReason::PreemptedExternal,
-                            accounting.consumed_ns,
-                            hart,
-                        );
-                        let _ = self.dispatch_queued_task_from_hart(key.id(), hart, signal);
-                    } else if accounting.slice_expired {
-                        if let Ok(task) = self.shared.tasks.lock().task_mut(key) {
-                            let _ = task.wake_state.take_wake();
-                            task.status = TaskStatus::Runnable;
-                            task.last_stop_reason = Some(StopReason::SliceExpired);
-                        }
-                        self.task_stopped_local(
-                            key.id(),
-                            StopReason::SliceExpired,
-                            accounting.consumed_ns,
-                            hart,
-                        );
-                        let _ = self.dispatch_queued_task_from_hart(key.id(), hart, signal);
-                    } else if self
-                        .shared
-                        .tasks
-                        .lock()
-                        .task(key)
-                        .map(|task| task.wake_state.take_wake())
-                        .unwrap_or(false)
-                    {
-                        self.mark_runnable_from_hart(key, WakeHint::Normal, hart, signal);
-                    } else {
-                        let parked = if let Ok(task) = self.shared.tasks.lock().task_mut(key) {
-                            task.status = TaskStatus::Parked;
-                            task.last_stop_reason = Some(StopReason::Blocked);
-                            true
-                        } else {
-                            false
-                        };
-                        if parked {
+                        if self
+                            .shared
+                            .tasks
+                            .lock()
+                            .finish_polled_runnable(key, future, StopReason::PreemptedExternal)
+                            .is_ok()
+                        {
                             self.task_stopped_local(
                                 key.id(),
-                                StopReason::Blocked,
+                                StopReason::PreemptedExternal,
                                 accounting.consumed_ns,
                                 hart,
                             );
+                            let _ = self.dispatch_queued_task_from_hart(key.id(), hart, signal);
+                        }
+                    } else if accounting.slice_expired {
+                        if self
+                            .shared
+                            .tasks
+                            .lock()
+                            .finish_polled_runnable(key, future, StopReason::SliceExpired)
+                            .is_ok()
+                        {
+                            self.task_stopped_local(
+                                key.id(),
+                                StopReason::SliceExpired,
+                                accounting.consumed_ns,
+                                hart,
+                            );
+                            let _ = self.dispatch_queued_task_from_hart(key.id(), hart, signal);
+                        }
+                    } else {
+                        let pending_commit =
+                            { self.shared.tasks.lock().finish_polled_pending(key, future) };
+                        match pending_commit {
+                            Ok(PendingPollCommit::Woken) => {
+                                self.mark_runnable_from_hart(key, WakeHint::Normal, hart, signal);
+                            }
+                            Ok(PendingPollCommit::Parked) => {
+                                self.task_stopped_local(
+                                    key.id(),
+                                    StopReason::Blocked,
+                                    accounting.consumed_ns,
+                                    hart,
+                                );
+                            }
+                            Err(_) => {}
                         }
                     }
                 }
@@ -847,7 +897,10 @@ impl HartRuntimeView<'_> {
             let depth = self
                 .locals
                 .get(victim)
-                .map(|local| local.scheduler().queue_depths().preempted)
+                .map(|local| {
+                    let depths = local.scheduler().queue_depths();
+                    depths.new + depths.preempted
+                })
                 .unwrap_or(0);
             if depth > best_depth {
                 best = Some(victim);
@@ -876,7 +929,10 @@ impl HartRuntimeView<'_> {
             |victim| {
                 self.locals
                     .get(victim)
-                    .map(|local| local.scheduler().queue_depths().preempted)
+                    .map(|local| {
+                        let depths = local.scheduler().queue_depths();
+                        depths.new + depths.preempted
+                    })
                     .unwrap_or(0)
             },
         )?;

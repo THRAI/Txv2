@@ -1170,8 +1170,7 @@ pub(crate) fn la64_current_cpu_id() -> CpuId {
             );
         }
         let csr_cpu = csr_cpu.min(LA64_MAX_BOOT_CPUS - 1);
-        if LA64_KERNEL_TLS_VALID[csr_cpu].load(Ordering::Acquire)
-            && kernel_tls < LA64_MAX_BOOT_CPUS
+        if LA64_KERNEL_TLS_VALID[csr_cpu].load(Ordering::Acquire) && kernel_tls < LA64_MAX_BOOT_CPUS
         {
             return CpuId(kernel_tls);
         }

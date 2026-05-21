@@ -9,7 +9,7 @@ use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect, AstSlot},
     scheduler::StopReason,
     spin_lock::SpinLock,
-    waker::{task_waker, TaskWakeState},
+    waker::{TaskWakeState, task_waker},
 };
 
 // Per REACTOR_v0 §Submission: submitted futures must be `Send + 'static`.
@@ -93,6 +93,18 @@ pub enum TaskStatus {
     Parked,
     Completed,
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TakeRunnableError {
+    Missing,
+    NotRunnable(TaskStatus),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingPollCommit {
+    Woken,
+    Parked,
 }
 
 pub(crate) struct Task {
@@ -190,47 +202,29 @@ impl TaskTable {
         self.task_by_id(id).and_then(|task| task.last_stop_reason)
     }
 
-    pub(crate) fn key_for_id(&self, id: TaskId) -> Option<TaskKey> {
-        self.task_by_id(id).map(Task::handle)
-    }
-
-    pub(crate) fn task(&self, handle: TaskKey) -> Result<&Task, TaskLifecycleError> {
-        self.live_task(handle)
-    }
-
-    pub(crate) fn task_mut(&mut self, handle: TaskKey) -> Result<&mut Task, TaskLifecycleError> {
-        self.live_task_mut(handle)
-    }
-
-    /// Take the task future out of its slot for unlocked polling.
-    /// Transitions status to Polling, clears wake_state, consumes AST markers.
-    /// Returns (future, wake_state, mailbox) or Err if the slot is stale/terminal.
-    pub(crate) fn take_future(
+    /// Resolve a queued task id, verify it is runnable, and take its future
+    /// under one task-table lock acquisition.
+    pub(crate) fn take_runnable_future_by_id(
         &mut self,
-        handle: TaskKey,
-    ) -> Result<(TaskFuture, Arc<TaskWakeState>, Arc<TaskMailbox>), TaskLifecycleError> {
-        let task = self.live_task_mut(handle)?;
-        let future = task
-            .future
-            .take()
-            .ok_or(TaskLifecycleError::AlreadyTerminal(TaskStatus::Cancelled))?;
+        id: TaskId,
+    ) -> Result<(TaskKey, TaskFuture, Arc<TaskWakeState>, Arc<TaskMailbox>), TakeRunnableError>
+    {
+        let task = self
+            .slots
+            .get_mut(id.index())
+            .and_then(|slot| slot.task.as_mut())
+            .ok_or(TakeRunnableError::Missing)?;
+        let handle = task.handle();
+        if task.status != TaskStatus::Runnable {
+            return Err(TakeRunnableError::NotRunnable(task.status));
+        }
+        let future = task.future.take().ok_or(TakeRunnableError::Missing)?;
         task.status = TaskStatus::Polling;
         task.wake_state.clear();
         task.consume_ast_markers();
         let wake_state = Arc::clone(&task.wake_state);
         let mailbox = Arc::clone(&task.mailbox);
-        Ok((future, wake_state, mailbox))
-    }
-
-    /// Put a task future back into its slot after unlocked polling.
-    pub(crate) fn put_future(
-        &mut self,
-        handle: TaskKey,
-        future: TaskFuture,
-    ) -> Result<(), TaskLifecycleError> {
-        let task = self.live_task_mut(handle)?;
-        task.future = Some(future);
-        Ok(())
+        Ok((handle, future, wake_state, mailbox))
     }
 
     pub fn waker(&self, handle: TaskKey) -> Result<Waker, TaskLifecycleError> {
@@ -283,6 +277,44 @@ impl TaskTable {
         task.wake_state.clear();
         task.last_stop_reason = Some(StopReason::Completed);
         Ok(())
+    }
+
+    pub(crate) fn finish_polled_complete(
+        &mut self,
+        handle: TaskKey,
+        _future: TaskFuture,
+    ) -> Result<(), TaskLifecycleError> {
+        self.complete_task(handle)
+    }
+
+    pub(crate) fn finish_polled_runnable(
+        &mut self,
+        handle: TaskKey,
+        future: TaskFuture,
+        reason: StopReason,
+    ) -> Result<(), TaskLifecycleError> {
+        let task = self.live_nonterminal_task_mut(handle)?;
+        task.future = Some(future);
+        let _ = task.wake_state.take_wake();
+        task.status = TaskStatus::Runnable;
+        task.last_stop_reason = Some(reason);
+        Ok(())
+    }
+
+    pub(crate) fn finish_polled_pending(
+        &mut self,
+        handle: TaskKey,
+        future: TaskFuture,
+    ) -> Result<PendingPollCommit, TaskLifecycleError> {
+        let task = self.live_nonterminal_task_mut(handle)?;
+        task.future = Some(future);
+        if task.wake_state.take_wake() {
+            Ok(PendingPollCommit::Woken)
+        } else {
+            task.status = TaskStatus::Parked;
+            task.last_stop_reason = Some(StopReason::Blocked);
+            Ok(PendingPollCommit::Parked)
+        }
     }
 
     pub fn cancel_task(&mut self, handle: TaskKey) -> Result<(), TaskLifecycleError> {
