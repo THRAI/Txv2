@@ -15,6 +15,7 @@ use crate::process::adapter::step_engine::{
 use crate::process::execution::{
     init_process, reset_init_process_for_test, step_exit_group_with_signal, BootstrapError, DupOp,
 };
+use crate::process::numbers::{resolve_pid_number, PidName};
 use crate::process::structure::{
     reset_pid_counter_for_test, ExitStatus, Pgid, Pid, ProcessIdentity,
 };
@@ -300,6 +301,19 @@ fn setsid_creates_fresh_session_and_pgrp_at_target_pid() {
 }
 
 #[test]
+fn setsid_rejects_existing_process_group_leader() {
+    let _g = setup();
+    let parent = bootstrap();
+
+    let result = step_setsid(&parent);
+
+    assert!(
+        matches!(result, Err(crate::process::SetsidError::ProcessGroupLeader)),
+        "a process-group leader cannot create a new session"
+    );
+}
+
+#[test]
 fn pid_pgid_sid_share_value_space_but_are_distinct_types() {
     let _g = setup();
     let init = bootstrap();
@@ -529,6 +543,64 @@ fn waitpid_reap_withdraws_from_pgrp_members_list() {
 
     // Reap withdraws from pgrp.members.
     assert_eq!(pgrp.member_slot_count(), 1, "only parent remains in pgrp");
+}
+
+#[test]
+fn zombie_process_pid_remains_resolvable_until_reap() {
+    let _g = setup();
+    let parent = bootstrap();
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
+    let child_pid = child.pid;
+
+    step_exit_group(&child, ExitStatus::Exited(0));
+
+    assert!(
+        crate::process::process_by_pid(child_pid).is_some(),
+        "zombie child must remain pid-addressable before parent reap"
+    );
+
+    drop(child);
+    let _ = step_waitpid_nohang(&parent, WaitTarget::Pid(child_pid)).expect("reap");
+
+    assert!(
+        crate::process::process_by_pid(child_pid).is_none(),
+        "reap is the pid namespace withdrawal point"
+    );
+}
+
+#[test]
+fn bootstrap_and_topology_steps_register_role_capable_names() {
+    let _g = setup();
+    let parent = bootstrap();
+
+    match resolve_pid_number(parent.pid.0 as u64) {
+        Some(PidName::Process(cap)) => assert_eq!(cap.pid, parent.pid),
+        other => panic!("pid should resolve to process name, got {other:?}"),
+    }
+    match resolve_pid_number(parent.pgrp_cap().pgid.0 as u64) {
+        Some(PidName::ProcessGroup(pgrp)) => assert_eq!(pgrp.pgid, parent.pgrp_cap().pgid),
+        other => panic!("pgid should resolve to process-group name, got {other:?}"),
+    }
+    match resolve_pid_number(parent.pgrp_cap().session_cap().sid.0 as u64) {
+        Some(PidName::Session(session)) => {
+            assert_eq!(session.sid, parent.pgrp_cap().session_cap().sid)
+        }
+        other => panic!("sid should resolve to session name, got {other:?}"),
+    }
+
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
+    step_setpgid(&child, Pgid(child.pid.0)).expect("setpgid");
+    match resolve_pid_number(child.pgrp_cap().pgid.0 as u64) {
+        Some(PidName::ProcessGroup(pgrp)) => assert_eq!(pgrp.pgid, child.pgrp_cap().pgid),
+        other => panic!("new pgid should resolve to process-group name, got {other:?}"),
+    }
+
+    let session_child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
+    let sid = step_setsid(&session_child).expect("setsid");
+    match resolve_pid_number(sid.0 as u64) {
+        Some(PidName::Session(session)) => assert_eq!(session.sid, sid),
+        other => panic!("new sid should resolve to session name, got {other:?}"),
+    }
 }
 
 #[test]
