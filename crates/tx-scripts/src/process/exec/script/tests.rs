@@ -556,6 +556,48 @@ fn exec_script_loads_minimal_elf_seeds_saved_user_context() {
 }
 
 #[test]
+fn exec_script_collapses_sibling_threads_before_aspace_swap() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+
+    let sibling = tx_subsystems::process::execution::step_clone_thread(
+        &process,
+        &tx_hal::UserTrapContext {
+            regs: [0; 32],
+            pc: 0x4000_0000,
+            status: 0,
+            fp: tx_hal::UserFpContext::empty(),
+        },
+        0,
+        0,
+        0,
+    )
+    .expect("sibling thread");
+    assert_eq!(process.live_thread_count(), 2);
+
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+
+    assert_eq!(
+        process.live_thread_count(),
+        1,
+        "exec must leave only the initiating thread live"
+    );
+    assert!(process.thread_by_tid(thread.tid.0).is_some());
+    assert!(process.thread_by_tid(sibling.tid.0).is_none());
+    assert!(sibling.is_zombie());
+}
+
+#[test]
 fn initial_user_context_uses_arch_specific_stack_register() {
     assert_eq!(super::initial_user_sp_reg_for_arch(Arch::Riscv64), 2);
     assert_eq!(super::initial_user_sp_reg_for_arch(Arch::LoongArch64), 3);
