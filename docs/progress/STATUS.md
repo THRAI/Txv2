@@ -1,3 +1,31 @@
+- 2026-05-22 **Fixed first-pass process audit gaps and recorded status quo.**
+  Process pid identity now survives zombification until reap; fork delays pid
+  publication until later fallible allocations succeed; pid names cover
+  process/thread/pgrp/session roles; ordinary thread exit decrements live-thread
+  count; production `exec_script` collapses sibling threads after reversible
+  preparation and before address-space replacement; and `setsid` rejects zombies
+  plus process-group leaders.
+  **Verified:** `cargo fmt`; `cargo test -p tx-scripts
+  exec_script_collapses_sibling_threads_before_aspace_swap`; `cargo test -p
+  tx-subsystems --lib ordinary_thread_exit_decrements_live_thread_count`; `cargo
+  test -p tx-subsystems --lib
+  exec_group_collapse_keeps_initiator_and_clears_episode`; `cargo test -p
+  tx-subsystems --lib last_thread_exit_zombifies_process_keeps_identity`;
+  `cargo test -p tx-subsystems --lib
+  zombie_process_pid_remains_resolvable_until_reap`; `cargo test -p
+  tx-subsystems --lib setsid_rejects_existing_process_group_leader`; `cargo
+  check -p tx-subsystems`.
+  **Blocked:** package-level `cargo test -p tx-subsystems
+  ordinary_thread_exit_decrements_live_thread_count` currently fails before the
+  target test because `crates/tx-subsystems/tests/v3_signal_mailbox.rs` still
+  calls the old three-argument `post_signal` signature; `cargo xtask progress
+  validate` is still blocked by the pre-existing `completed` status in
+  `docs/progress/plans/2026-05-19-pthread-shared-clone-thread.json`.
+  **Next step:** finish `setpgid` cross-process/session rules, wait
+  stop/continue semantics, and full async GroupExit completion.
+  **Records:** `docs/progress/research/2026-05-22-process-implementation-audit.md`;
+  `docs/progress/research/2026-05-22-process-status-quo.md`.
+
 - 2026-05-22 **Fixed the musl kernel-user layout redlight positives.**
   The `kernel-user-layouts` gate now treats `KernelToUserLayout` as a marker
   for registered Rust-backed `#[repr(C)]` ABI structs instead of scanning every

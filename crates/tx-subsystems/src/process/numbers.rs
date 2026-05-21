@@ -15,7 +15,7 @@
 use alloc::collections::BTreeMap;
 
 use crate::adapter::step_engine::{Cap, SpinMutex};
-use crate::process::structure::{Pid, ProcessIdentity};
+use crate::process::structure::{Pgid, Pid, ProcessGroup, ProcessIdentity, Session, Sid};
 use crate::thread_runtime::structure::{ThreadIdentity, Tid};
 // allocate_tid re-exported via thread_runtime
 
@@ -23,11 +23,13 @@ use crate::thread_runtime::structure::{ThreadIdentity, Tid};
 // PidName
 // ---------------------------------------------------------------------------
 
-/// Authoritative pid/tid → identity binding.
-#[derive(Clone)]
+/// Authoritative pid/tid/pgid/sid → identity binding.
+#[derive(Clone, Debug)]
 pub enum PidName {
     Process(Cap<ProcessIdentity>),
     Thread(Cap<ThreadIdentity>),
+    ProcessGroup(Cap<ProcessGroup>),
+    Session(Cap<Session>),
 }
 
 /// Discriminant for `PidName`.
@@ -35,6 +37,8 @@ pub enum PidName {
 pub enum PidNameKind {
     Process,
     Thread,
+    ProcessGroup,
+    Session,
 }
 
 impl PidName {
@@ -42,6 +46,8 @@ impl PidName {
         match self {
             PidName::Process(_) => PidNameKind::Process,
             PidName::Thread(_) => PidNameKind::Thread,
+            PidName::ProcessGroup(_) => PidNameKind::ProcessGroup,
+            PidName::Session(_) => PidNameKind::Session,
         }
     }
 }
@@ -60,6 +66,18 @@ pub fn register_pid(pid: Pid, cap: Cap<ProcessIdentity>) {
 /// Register a thread-level tid.
 pub fn register_tid(tid: Tid, cap: Cap<ThreadIdentity>) {
     PID_NS.lock().insert(tid.0 as u64, PidName::Thread(cap));
+}
+
+/// Register a process-group-level pgid.
+pub fn register_pgrp(pgid: Pgid, cap: Cap<ProcessGroup>) {
+    PID_NS
+        .lock()
+        .insert(pgid.0 as u64, PidName::ProcessGroup(cap));
+}
+
+/// Register a session-level sid.
+pub fn register_session(sid: Sid, cap: Cap<Session>) {
+    PID_NS.lock().insert(sid.0 as u64, PidName::Session(cap));
 }
 
 /// Unregister a number.
