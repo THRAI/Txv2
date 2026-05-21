@@ -1,8 +1,8 @@
 use super::structure::{
-    registry, AcceptWireSet, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, KernelSockAddr,
-    PollMask, ProtocolNumber, RawIcmpState, RecvWireSet, SendRecvFlags, SendWireSet, SockAddrIn,
-    SockShutdownCmd, SocketIdentity, SocketKind, SocketOptionSet, SocketProtocol, SocketType,
-    TcpState, UdpInner, ValidSocketType,
+    registry, AcceptWireSet, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address,
+    Ipv4MulticastGroup, KernelSockAddr, PollMask, ProtocolNumber, RawIcmpState, RecvWireSet,
+    SendRecvFlags, SendWireSet, SockAddrIn, SockShutdownCmd, SocketIdentity, SocketKind,
+    SocketOptionSet, SocketProtocol, SocketType, TcpState, UdpInner, ValidSocketType,
 };
 use crate::execution::{Errno, WaitToken};
 use crate::net::checks::require::{
@@ -1898,6 +1898,64 @@ fn step_accept_returns_child_socket_and_clears_when_empty() {
         SocketProtocol::Tcp(TcpState::Connected { local: child_local, remote: child_remote })
             if child_local == local && child_remote == remote
     ));
+}
+
+#[test]
+fn step_accept_does_not_copy_ipv4_multicast_membership() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let listener = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("listener");
+    let local = endpoint(40_139);
+    let remote = endpoint(50_139);
+    let multicast = Ipv4MulticastGroup::new(0, Ipv4Address::new([224, 0, 0, 0]));
+
+    let listener_payload = listener.acquire_operational().expect("listener payload");
+    assert_eq!(
+        listener_payload.join_ipv4_multicast_group(multicast),
+        Ok(())
+    );
+    assert_eq!(
+        step_bind(&listener, inet(local.port), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(step_listen(&listener, 8, &guard), StepOutcome::Done(()));
+
+    let source = ScriptedPacketSource::new(std::vec![PacketDispatch::Tcp(TcpPacketEvent::new(
+        remote,
+        local,
+        TcpPacketFlags {
+            syn: true,
+            ack: false,
+            rst: false,
+        },
+        std::vec::Vec::new(),
+        false,
+    ),)]);
+    assert!(matches!(
+        step_process_network_events(&source, &guard),
+        StepOutcome::Done(_)
+    ));
+
+    let accepted = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("accept should return queued child"),
+    };
+    let accepted_payload = accepted.acquire_operational().expect("accepted payload");
+    assert_eq!(
+        accepted_payload.leave_ipv4_multicast_group(multicast),
+        Err(Errno::EADDRNOTAVAIL)
+    );
+    assert_eq!(
+        listener_payload.leave_ipv4_multicast_group(multicast),
+        Ok(())
+    );
 }
 
 #[test]

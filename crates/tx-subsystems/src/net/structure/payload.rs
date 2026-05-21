@@ -17,6 +17,7 @@ use super::super::protocol::{
     UdpTxDatagram,
 };
 use super::identity::SocketIdentity;
+use super::multicast::{Ipv4MulticastGroup, Ipv4MulticastMemberships};
 use super::types::{
     IpEndpoint, Ipv4Address, PacketSocketState, ProtocolNumber, RawIcmpState, SockAddrLl,
     SockShutdownCmd, SocketKind, SocketOptionSet, TcpState, UdpInner, UnixSocketPath,
@@ -31,6 +32,7 @@ pub struct SocketPayload {
     pub(crate) net_namespace: PayloadCap<NetNamespacePayload>,
     pub(crate) protocol: SpinMutex<SocketProtocol>,
     pub(crate) options: SpinMutex<SocketOptionSet>,
+    pub(crate) ip_multicast: SpinMutex<Ipv4MulticastMemberships>,
     pub(crate) raw_tcp: Option<RawTcpSocket>,
     pub(crate) raw_udp: Option<RawUdpSocket>,
     pub(crate) raw_icmp: Option<RawIcmpSocket>,
@@ -139,6 +141,7 @@ impl SocketPayload {
             net_namespace,
             protocol: SpinMutex::new(protocol),
             options: SpinMutex::new(options),
+            ip_multicast: SpinMutex::new(Ipv4MulticastMemberships::empty()),
             raw_tcp,
             raw_udp,
             raw_icmp,
@@ -252,6 +255,20 @@ impl SocketPayload {
 
     pub fn with_options_mut<R>(&self, f: impl FnOnce(&mut SocketOptionSet) -> R) -> R {
         f(&mut self.options.lock())
+    }
+
+    pub fn join_ipv4_multicast_group(
+        &self,
+        group: Ipv4MulticastGroup,
+    ) -> Result<(), crate::execution::Errno> {
+        self.ip_multicast.lock().join(group)
+    }
+
+    pub fn leave_ipv4_multicast_group(
+        &self,
+        group: Ipv4MulticastGroup,
+    ) -> Result<(), crate::execution::Errno> {
+        self.ip_multicast.lock().leave(group)
     }
 
     pub fn io_snapshot(&self) -> SocketIoState {

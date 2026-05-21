@@ -4,7 +4,6 @@ use core::time::Duration;
 use crate::execution::Errno;
 
 pub const UNIX_SOCKET_PATH_MAX: usize = 108;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddressFamily {
     Unix,
@@ -151,6 +150,10 @@ impl Ipv4Address {
 
     pub const fn octets(self) -> [u8; 4] {
         self.octets
+    }
+
+    pub const fn is_multicast(self) -> bool {
+        (self.octets[0] & 0xf0) == 0xe0
     }
 }
 
