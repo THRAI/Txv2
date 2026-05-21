@@ -4,11 +4,11 @@ use super::*;
 use crate::cred::Uid;
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::{Errno, Guard};
-use crate::process::{bootstrap_init_process, step_fork, ProcessIdentity};
+use crate::process::{ProcessIdentity, bootstrap_init_process, step_fork};
 use crate::signal::adapter::step_engine::{
-    reserve_for, sign_for, ByteProgress, PayloadCap, StepOutcome,
+    ByteProgress, PayloadCap, StepOutcome, reserve_for, sign_for,
 };
-use crate::signal::{deliver_tty_dispatch, signum_for_job_control, DispatchOutcome};
+use crate::signal::{DispatchOutcome, deliver_tty_dispatch, signum_for_job_control};
 use crate::tty::execution::{JobControlSignal, SignalDispatch, SignalTarget};
 use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
 use crate::vm::{AddressSpace, TestPmap};
@@ -141,11 +141,13 @@ fn typed_tty_vintr_routes_sigint_to_foreground_pgrp() {
         let payload = proc_cap.payload.lock();
         let leader = payload.as_ref().unwrap().threads.nth(0).unwrap();
         let leader_payload = leader.payload.lock();
-        assert!(leader_payload
-            .as_ref()
-            .unwrap()
-            .pending()
-            .is_pending(Signum::SIGINT));
+        assert!(
+            leader_payload
+                .as_ref()
+                .unwrap()
+                .pending()
+                .is_pending(Signum::SIGINT)
+        );
     }
 }
 

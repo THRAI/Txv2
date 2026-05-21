@@ -295,6 +295,7 @@ pub fn bootstrap_init_process(
         None,
         BTreeMap::new(),
         BTreeSet::new(),
+        (1024, 4096),
         BOOTSTRAP_BRK_BASE,
         BOOTSTRAP_BRK_BASE,
         // Slice 6 of the shell-prompt roadmap. init's file-creation
@@ -350,6 +351,7 @@ pub fn step_fork<P: PmapIf>(
         parent_cwd,
         parent_fds,
         parent_fd_cloexec,
+        parent_rlimit_nofile,
         parent_brk_base,
         parent_current_brk,
         parent_umask,
@@ -363,6 +365,7 @@ pub fn step_fork<P: PmapIf>(
             payload.cwd(),
             payload.clone_fds_for_fork(),
             payload.fd_cloexec_snapshot(),
+            payload.rlimit_nofile(),
             payload.brk_base(),
             payload.current_brk(),
             payload.umask(),
@@ -417,6 +420,7 @@ pub fn step_fork<P: PmapIf>(
         parent_cwd,
         parent_fds,
         parent_fd_cloexec,
+        parent_rlimit_nofile,
         parent_brk_base,
         parent_current_brk,
         parent_umask,
@@ -508,6 +512,14 @@ const STACK_REG_INDEX: usize = 3;
 #[cfg(not(target_arch = "loongarch64"))]
 const STACK_REG_INDEX: usize = 2;
 
+/// Register index for the frame pointer. The clone child starts on a
+/// freshly supplied stack; keeping the parent's frame pointer can make
+/// the post-syscall libc wrapper spill through the parent's stack.
+#[cfg(target_arch = "loongarch64")]
+const FRAME_REG_INDEX: usize = 22;
+#[cfg(not(target_arch = "loongarch64"))]
+const FRAME_REG_INDEX: usize = 8;
+
 pub fn seed_child_leader_context(
     child_thread: &Cap<ThreadIdentity>,
     parent_user_ctx: &UserTrapContext,
@@ -531,17 +543,15 @@ pub fn seed_child_leader_context(
     //     that stack); a zero `newsp` means "the child shares the
     //     parent's sp" (bare fork convention).
     //
-    //     Also seed the frame pointer (s0/x8) to the same value.
-    //     zig cc's musl __clone wrapper uses s0-relative addressing
-    //     (sd a0, -64(s0); ld a0, -64(s0)) in the post-ecall path
-    //     shared by parent and child.  s0 inherits the parent's frame
-    //     pointer from the trap context; if the child stack is
-    //     smaller, the s0-relative store/load lands outside the
-    //     child's allocation → load page fault → SIGSEGV.
+    //     Also seed the ABI frame pointer to the same value. Some libc
+    //     clone wrappers use fp-relative addressing in the post-syscall
+    //     path shared by parent and child. fp inherits the parent's
+    //     frame pointer from the trap context; if the child stack is
+    //     smaller, the fp-relative store/load can land outside the
+    //     child's allocation and turn into a userspace SIGSEGV.
     if stack != 0 {
         child_ctx.regs[STACK_REG_INDEX] = stack;
-        // x8 = s0 = fp (frame pointer) on RV64
-        child_ctx.regs[8] = stack;
+        child_ctx.regs[FRAME_REG_INDEX] = stack;
     }
     // (4) PC already points past `ecall`: the trap shell
     // (`tx-kernel::trap_handoff::hand_off_syscall`) added the 4-byte
@@ -1098,6 +1108,7 @@ fn sign_process_payload(
     cwd: Option<Cap<crate::vfs::DEntry>>,
     fds: BTreeMap<u32, Cap<OpenFile>>,
     fd_cloexec: BTreeSet<u32>,
+    rlimit_nofile: (u32, u32),
     brk_base: u64,
     current_brk: u64,
     umask: u16,
@@ -1160,6 +1171,8 @@ fn sign_process_payload(
         cwd: SpinMutex::new(cwd),
         fds: SpinMutex::new(fds),
         fd_cloexec: SpinMutex::new(fd_cloexec),
+        rlimit_nofile_cur: AtomicU32::new(rlimit_nofile.0),
+        rlimit_nofile_max: AtomicU32::new(rlimit_nofile.1),
         brk_base: core::sync::atomic::AtomicU64::new(brk_base),
         current_brk: core::sync::atomic::AtomicU64::new(current_brk),
         // Slice 6 of the shell-prompt roadmap. Per-process

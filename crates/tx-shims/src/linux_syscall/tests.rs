@@ -24,13 +24,13 @@ use core::task::{Context, Poll, Waker};
 use std::sync::Mutex;
 
 use crate::adapter::reactor_entry::userspace::SyscallRequest;
-use crate::adapter::step_engine::{self as step_engine, guard, Cap, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome, guard};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_reactor_affinity_seam, reset_tid_counter,
 };
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
-use tx_subsystems::process::{bootstrap_init_process, ExitStatus, Pid, ProcessIdentity};
+use tx_subsystems::process::{ExitStatus, Pid, ProcessIdentity, bootstrap_init_process};
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::vfs::OpenFile;
@@ -38,11 +38,11 @@ use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
 use super::{
-    dispatch, SyscallCtx, SyscallResult, EINVAL_VALUE, FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK,
-    NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPGRP, NR_GETPID,
-    NR_GETPPID, NR_GETSID, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SCHED_GETAFFINITY,
-    NR_SCHED_SETAFFINITY, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_WAIT4,
-    NR_WRITE, SIGCHLD, WNOHANG,
+    EINVAL_VALUE, F_GETFD, F_SETFD, FD_CLOEXEC, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT,
+    NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETSID, NR_READ,
+    NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY,
+    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SETPGID, NR_SETSID, NR_WAIT4, NR_WRITE, SIGCHLD,
+    SyscallCtx, SyscallResult, WNOHANG, dispatch,
 };
 
 // ---------------------------------------------------------------------------

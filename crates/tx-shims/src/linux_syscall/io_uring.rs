@@ -50,9 +50,9 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tx_subsystems::io_uring::{spawn_sqpoll_worker, IoUring, SqpollWorkerFuture};
-use tx_subsystems::vfs::structure::OpenFileFlags;
+use tx_subsystems::io_uring::{IoUring, SqpollWorkerFuture, spawn_sqpoll_worker};
 use tx_subsystems::vfs::OpenFile;
+use tx_subsystems::vfs::structure::OpenFileFlags;
 
 use super::ENOMEM_VALUE;
 use super::{SyscallCtx, SyscallResult};

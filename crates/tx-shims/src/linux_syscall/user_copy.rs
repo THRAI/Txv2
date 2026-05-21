@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use tx_hal::UserPtr;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::vm::{
-    AddressSpace, UserAccessKind, UserPage, UserRange, FULL_USER_V1_TOP, USER_PAGE_SIZE,
+    AddressSpace, FULL_USER_V1_TOP, USER_PAGE_SIZE, UserAccessKind, UserPage, UserRange,
 };
 
 /// Outcome of `read_user_cstr` — distinguishes "no NUL within budget"

@@ -9,7 +9,7 @@ use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect, AstSlot},
     scheduler::StopReason,
     spin_lock::SpinLock,
-    waker::{TaskWakeState, task_waker},
+    waker::{task_waker, TaskWakeState},
 };
 
 // Per REACTOR_v0 §Submission: submitted futures must be `Send + 'static`.

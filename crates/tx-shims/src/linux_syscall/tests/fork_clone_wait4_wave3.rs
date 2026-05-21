@@ -3,7 +3,7 @@
 use super::*;
 
 use tx_hal::UserTrapContext;
-use tx_subsystems::process::{step_exit_group, ExitStatus};
+use tx_subsystems::process::{ExitStatus, step_exit_group};
 use tx_subsystems::reactor_submit;
 
 /// No-op reactor-submit seam for tests that fork via `sys_clone`.

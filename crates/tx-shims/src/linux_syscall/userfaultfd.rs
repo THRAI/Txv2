@@ -36,17 +36,17 @@
 
 use tx_subsystems::execution::Errno;
 use tx_subsystems::userfaultfd::{UfdRange, UserfaultFd};
-use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
-use tx_subsystems::vm::{UfdRegistration, UserRange, UserVirtAddr, VmMapError, USER_PAGE_SIZE};
+use tx_subsystems::vfs::structure::OpenFileFlags;
+use tx_subsystems::vm::{USER_PAGE_SIZE, UfdRegistration, UserRange, UserVirtAddr, VmMapError};
 
 use super::numbers::{
-    O_CLOEXEC, O_NONBLOCK, UFFDIO_REGISTER_MODE_MINOR, UFFDIO_REGISTER_MODE_MISSING,
-    UFFDIO_REGISTER_MODE_WP, UFFDIO_REGISTER_REPLY_IOCTLS, UFFD_API,
+    O_CLOEXEC, O_NONBLOCK, UFFD_API, UFFDIO_REGISTER_MODE_MINOR, UFFDIO_REGISTER_MODE_MISSING,
+    UFFDIO_REGISTER_MODE_WP, UFFDIO_REGISTER_REPLY_IOCTLS,
 };
 use super::{
-    bootstrap_read_user, bootstrap_write_user, errno_to_i32, SyscallCtx, SyscallResult,
-    EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
+    EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE, SyscallCtx, SyscallResult,
+    bootstrap_read_user, bootstrap_write_user, errno_to_i32,
 };
 use crate::adapter::step_engine::{
     self as step_engine, DelegateReply, TransitionOutcome, UfdReply,

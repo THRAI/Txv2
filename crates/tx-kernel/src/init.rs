@@ -5,7 +5,7 @@ use core::{
 
 use crate::adapter::boot_runtime;
 use crate::adapter::step_engine::{
-    self as step_engine, ByteProgress, Cap, SpinMutex, StepOutcome, init, init_on_ap,
+    self as step_engine, init, init_on_ap, ByteProgress, Cap, SpinMutex, StepOutcome,
 };
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
@@ -301,6 +301,9 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_procfs_at_proc();
             Self::mount_bdevfs_at_dev_block();
             Self::mount_sdcard_at_musl();
+            Self::populate_rootfs_shebang_shims();
+            Self::populate_rootfs_tmp_dirs();
+            Self::init_csprng();
             Self::bind_init_cwd_and_root();
 
             // Deferred H4 spine slots:
@@ -434,7 +437,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// whether the bytes at offset 1024+56 spell the ext4 magic (`0x53 0xef`).
     /// Boards without a block device (e.g. m1dock-mock) silently no-op.
     fn probe_ext4_superblock_smoke() {
-        use tx_fs::tx_ext4::{BLOCK_SIZE, BlockDeviceImage, BlockImage};
+        use tx_fs::tx_ext4::{BlockDeviceImage, BlockImage, BLOCK_SIZE};
         use tx_subsystems::device::block_device_by_name;
 
         let Some(reg) = block_device_by_name(b"vda") else {
@@ -899,7 +902,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
     pub(crate) fn mount_sdcard_at_musl() {
-        use tx_fs::tx_ext4::{BlockDeviceImage, mount_ext4_read_write};
+        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
         use tx_subsystems::device::block_device_by_name;
 
         let Some(reg) = block_device_by_name(b"vda") else {
@@ -1936,6 +1939,7 @@ mod init_setuid_fixture;
 /// decision so each fd-ops/DAC/fork test owns its own pinned ABI).
 #[cfg(test)]
 mod init_lseek_fixture;
+mod rootfs_shims;
 
 #[cfg(test)]
 mod tests;

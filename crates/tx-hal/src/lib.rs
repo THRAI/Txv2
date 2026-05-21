@@ -945,6 +945,7 @@ pub struct SignalFrameWrite {
     pub old_mask: UserSignalMaskAbi,
     pub flags: UserSaFlagsAbi,
     pub handler_pc: UserPtr<()>,
+    pub restorer_pc: UserPtr<()>,
 }
 
 #[repr(C)]

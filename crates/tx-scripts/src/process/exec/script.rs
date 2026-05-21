@@ -75,7 +75,7 @@ use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 /// brk-base round-up doesn't require pulling in another import.
 const USER_PAGE_SIZE: u64 = 4096;
 
-const INTERP_BASE: u64 = 0x3F_F000_0000;
+const INTERP_BASE: u64 = 0x3E_0000_0000;
 
 // ASLR functions moved inline to exec_script_inner
 
@@ -542,7 +542,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     let mut parsed: ExecImagePlan = match parse_image_plan(&header_bytes) {
         Ok(plan) => plan,
         Err(_parse_err) => {
-            if depth < SHEBANG_MAX_DEPTH {
+            if !is_elf && depth < SHEBANG_MAX_DEPTH {
                 let interp_path: Vec<u8> = b"/bin/sh".to_vec();
                 let mut new_argv: Vec<Vec<u8>> = Vec::new();
                 new_argv.push(interp_path.clone());
@@ -620,8 +620,32 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 musl_path.extend_from_slice(b"/musl");
                 musl_path.extend_from_slice(interp_path);
                 outcome = step_open(
-                    rooted_at,
+                    rooted_at.clone(),
                     &musl_path,
+                    OpenFileFlags {
+                        read: true,
+                        write: false,
+                        append: false,
+                        cloexec: false,
+                        nonblocking: false,
+                    },
+                    0,
+                    cred,
+                    &guard,
+                );
+            }
+            // The musl OSComp images ship the dynamic linker as
+            // /musl/musl/lib/libc.so, while PT_INTERP names the Linux
+            // compatibility path (/lib*/ld-musl-*.so.1). Try the
+            // shipped location before giving up.
+            if matches!(outcome, V3::Err(_))
+                && interp_path
+                    .windows(b"ld-musl".len())
+                    .any(|window| window == b"ld-musl")
+            {
+                outcome = step_open(
+                    rooted_at,
+                    b"/musl/musl/lib/libc.so",
                     OpenFileFlags {
                         read: true,
                         write: false,
@@ -663,10 +687,14 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             .unwrap_or(0);
         // Fixed high address for the interpreter.
 
-        let interp_load_bias = randomize_interp_base() - interp_lowest_vaddr;
+        let interp_load_delta = randomize_interp_base() - interp_lowest_vaddr;
+        let interp_runtime_load_bias = interp_parsed
+            .load_bias
+            .checked_add(interp_load_delta)
+            .ok_or(ExecError::NotExecutable)?;
         for seg in &interp_parsed.load_segments {
             interp_segs.push(ParsedLoadSegment {
-                vaddr: seg.vaddr + interp_load_bias,
+                vaddr: seg.vaddr + interp_load_delta,
                 memsz: seg.memsz,
                 filesz: seg.filesz,
                 file_offset: seg.file_offset,
@@ -676,8 +704,8 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         }
         Some((
             InterpreterPlan {
-                load_bias: interp_load_bias,
-                entry: interp_parsed.entry + interp_load_bias,
+                load_bias: interp_runtime_load_bias,
+                entry: interp_parsed.entry + interp_load_delta,
                 load_segments: interp_segs,
                 bss_extension: interp_parsed.bss_extension,
                 executable_stack: interp_parsed.executable_stack,
@@ -766,10 +794,6 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // main binary's segments was validated in Phase 4a.1.
     if let Some((ref interp, ref interp_pc)) = interp_data {
         for seg in &interp.load_segments {
-            let seg_range = match vm_scripts::align_range(seg.vaddr, seg.memsz) {
-                Some(r) => r,
-                None => return Err(ExecError::NotExecutable),
-            };
             let prot = if seg.flags.writable {
                 if seg.flags.executable {
                     Prot::new(true, true, true)
@@ -781,21 +805,73 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             } else {
                 Prot::READ
             };
-            let entry = VmEntry::new(
-                seg_range,
-                prot,
-                VmEntryFlags::PRIVATE,
-                VmBacking::Page {
-                    pc: interp_pc.clone(),
-                    offset: seg.file_offset,
-                },
-            );
-            match new_aspace.reserve_map(entry, MapPlacement::RequireFree) {
-                MapReserveResult::Reserved(r) => {
-                    r.commit().map_err(|_| ExecError::OutOfMemory)?;
+
+            let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
+            let page_delta = seg.vaddr % page_size;
+            let map_start = seg.vaddr - page_delta;
+            let file_page_offset = seg
+                .file_offset
+                .checked_sub(page_delta)
+                .ok_or(ExecError::NotExecutable)?;
+            let file_end = seg
+                .vaddr
+                .checked_add(seg.filesz)
+                .ok_or(ExecError::NotExecutable)?;
+            let mem_end = seg
+                .vaddr
+                .checked_add(seg.memsz)
+                .ok_or(ExecError::NotExecutable)?;
+            let file_end_rounded = page_round_up(file_end).ok_or(ExecError::NotExecutable)?;
+            let mem_end_rounded = page_round_up(mem_end).ok_or(ExecError::NotExecutable)?;
+            let file_part_end = if mem_end > file_end {
+                (file_end & !(page_size - 1)).max(map_start)
+            } else {
+                file_end_rounded.min(mem_end_rounded)
+            };
+
+            if file_part_end > map_start {
+                let seg_range = match vm_scripts::align_range(map_start, file_part_end - map_start)
+                {
+                    Some(r) => r,
+                    None => return Err(ExecError::NotExecutable),
+                };
+                let entry = VmEntry::new(
+                    seg_range,
+                    prot,
+                    VmEntryFlags::PRIVATE,
+                    VmBacking::Page {
+                        pc: interp_pc.clone(),
+                        offset: file_page_offset,
+                    },
+                );
+                match new_aspace.reserve_map(entry, MapPlacement::RequireFree) {
+                    MapReserveResult::Reserved(r) => {
+                        r.commit().map_err(|_| ExecError::OutOfMemory)?;
+                    }
+                    MapReserveResult::Blocked(_) => return Err(ExecError::Busy),
+                    MapReserveResult::Err(_) => return Err(ExecError::OutOfMemory),
                 }
-                MapReserveResult::Blocked(_) => return Err(ExecError::Busy),
-                MapReserveResult::Err(_) => return Err(ExecError::OutOfMemory),
+            }
+
+            if mem_end_rounded > file_part_end {
+                let seg_range =
+                    match vm_scripts::align_range(file_part_end, mem_end_rounded - file_part_end) {
+                        Some(r) => r,
+                        None => return Err(ExecError::NotExecutable),
+                    };
+                let entry = VmEntry::new(
+                    seg_range,
+                    prot,
+                    VmEntryFlags::PRIVATE,
+                    VmBacking::PrivateAnon,
+                );
+                match new_aspace.reserve_map(entry, MapPlacement::RequireFree) {
+                    MapReserveResult::Reserved(r) => {
+                        r.commit().map_err(|_| ExecError::OutOfMemory)?;
+                    }
+                    MapReserveResult::Blocked(_) => return Err(ExecError::Busy),
+                    MapReserveResult::Err(_) => return Err(ExecError::OutOfMemory),
+                }
             }
         }
     }
@@ -881,6 +957,44 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             _ => return Err(ExecError::Busy),
         }
     }
+    if let Some((ref interp, ref interp_pc)) = interp_data {
+        for segment in &interp.load_segments {
+            if segment.filesz == 0 || segment.memsz <= segment.filesz {
+                continue;
+            }
+            let file_end = segment
+                .vaddr
+                .checked_add(segment.filesz)
+                .ok_or(ExecError::NotExecutable)?;
+            let file_end_page_floor = file_end & !(page_size - 1);
+            let partial_start = file_end_page_floor.max(segment.vaddr);
+            let partial_in_page = file_end - partial_start;
+            if partial_in_page == 0 {
+                continue;
+            }
+            let file_off = segment
+                .file_offset
+                .checked_add(partial_start - segment.vaddr)
+                .ok_or(ExecError::NotExecutable)?;
+            let mut buf = alloc::vec![0u8; partial_in_page as usize];
+            {
+                use StepOutcome as V3;
+                let guard = step_engine::guard();
+                match read_exact_at(interp_pc, file_off, &mut buf, &guard) {
+                    V3::Done(()) => {}
+                    V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
+                    V3::Err(_) => return Err(ExecError::NotExecutable),
+                }
+            }
+            match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
+                StepOutcome::Done(()) => {}
+                StepOutcome::Err(err) => {
+                    return Err(ExecError::from_populate_errno(err.into()));
+                }
+                _ => return Err(ExecError::Busy),
+            }
+        }
+    }
 
     // ===== Phase 5 — compose + populate user stack ===================
     //
@@ -908,18 +1022,19 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     tx_services::random::fill_bytes(&mut at_random_bytes);
     let arch = <P as tx_hal::AuxvIf>::arch_auxv_facts();
 
+    let interp_aux = interp_data
+        .as_ref()
+        .map(|(interp, _)| (interp.load_bias, interp.entry));
+
     let auxv_facts = AuxvFacts {
         at_phdr: parsed.at_phdr,
         at_phent: ELF64_PHENT,
         at_phnum: parsed.at_phnum,
         at_pagesz: USER_PAGE_SIZE,
-        // Drift-cleanup chore (2026-05-07): `AT_BASE = 0` for the
-        // v1 static-`ET_EXEC` contract (no PT_INTERP per
-        // `EXEC_v1.md`'s static-only pin); a future dynamic-link
-        // slice flips this to the interpreter's load bias.
-        // `AT_ENTRY` carries the parsed ELF entry through to musl's
-        // `__libc_start_main`.
-        at_base: 0,
+        // Dynamic ELF starts at the interpreter entry. The dynamic
+        // linker still needs the main program entry in AT_ENTRY and
+        // its own load bias in AT_BASE to relocate and hand off.
+        at_base: interp_aux.map(|(base, _)| base).unwrap_or(0),
         at_entry: parsed.entry,
         at_uid: cred.uid.raw() as u64,
         at_euid: cred.euid.raw() as u64,
@@ -1003,7 +1118,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // so any concurrent reader on another hart can finish its
     // observation of the old aspace before its memory is reused.
 
-    let entry_pc = parsed.entry as usize;
+    let entry_pc = interp_aux.map(|(_, entry)| entry).unwrap_or(parsed.entry) as usize;
     let initial_sp = stack_image.initial_sp as usize;
     let user_ctx = make_initial_user_trap_context(P::ARCH, entry_pc, initial_sp);
     if let Some(payload) = thread.payload_cap() {

@@ -157,6 +157,8 @@ pub struct SigInfo {
 
 /// SI_USER: signal sent by kill(2) / tkill(2) / tgkill(2).
 pub const SI_USER: i32 = 0;
+/// SI_TKILL: signal sent by tkill(2) / tgkill(2).
+pub const SI_TKILL: i32 = -6;
 
 /// Per-process siginfo slots — one optional [`SigInfo`] record
 /// per signum.  Lives on `ProcessPayload` alongside `group_pending`.
@@ -237,7 +239,29 @@ pub enum SigDisposition {
     /// Discard the signal without delivery.
     Ignore,
     /// User-defined handler at the recorded address.
-    Handler(usize),
+    Handler {
+        handler: usize,
+        flags: u64,
+        restorer: usize,
+    },
+}
+
+impl SigDisposition {
+    pub const fn handler(handler: usize) -> Self {
+        Self::Handler {
+            handler,
+            flags: 0,
+            restorer: 0,
+        }
+    }
+
+    pub const fn handler_with_restorer(handler: usize, flags: u64, restorer: usize) -> Self {
+        Self::Handler {
+            handler,
+            flags,
+            restorer,
+        }
+    }
 }
 
 /// Per-process signal-action table. One [`SigDisposition`] slot per
@@ -297,7 +321,7 @@ impl SigActionTable {
         // publish
         let mut entries = self.entries.lock();
         for slot in entries.iter_mut() {
-            if matches!(slot, SigDisposition::Handler(_)) {
+            if matches!(slot, SigDisposition::Handler { .. }) {
                 *slot = SigDisposition::Default;
             }
         }
@@ -479,7 +503,12 @@ pub enum AstOutcome {
     /// User-installed handler. Day-1 records the intent + handler
     /// address; signal-frame construction lands with the AST trap-
     /// return wiring.
-    DeliverHandler { sig: Signum, handler: usize },
+    DeliverHandler {
+        sig: Signum,
+        handler: usize,
+        flags: u64,
+        restorer: usize,
+    },
 }
 
 /// Site-B delivery decision per `SIGNAL_v1` §15.1.
@@ -549,7 +578,18 @@ pub fn ast_check(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstOutc
                 DefaultAction::Stop => return AstOutcome::DefaultStop { sig },
                 DefaultAction::Cont => return AstOutcome::DefaultContinue { sig },
             },
-            SigDisposition::Handler(handler) => return AstOutcome::DeliverHandler { sig, handler },
+            SigDisposition::Handler {
+                handler,
+                flags,
+                restorer,
+            } => {
+                return AstOutcome::DeliverHandler {
+                    sig,
+                    handler,
+                    flags,
+                    restorer,
+                };
+            }
         }
     }
 }
@@ -706,7 +746,7 @@ pub fn deliver_posix_signal(target: SignalTarget, sig: Signum) -> KillOutcome {
                 }
             }
         }
-        SigDisposition::Handler(_handler) => {
+        SigDisposition::Handler { .. } => {
             // Post to eligible thread's pending; AST delivers handler.
             step_kill_process(&cap, sig, None)
         }
@@ -1054,7 +1094,7 @@ pub fn script_kill_process(
     sig: Signum,
     info: Option<SigInfo>,
 ) -> Result<KillScriptOutcome, Errno> {
-    use crate::cred::checks::{authorize_signal_send, AuthOutcome};
+    use crate::cred::checks::{AuthOutcome, authorize_signal_send};
 
     match authorize_signal_send(source, target, sig)? {
         AuthOutcome::NoLiveTarget => return Ok(KillScriptOutcome::NoLiveThread),
@@ -1076,7 +1116,7 @@ pub fn script_kill_probe(
     source: &Cap<ProcessIdentity>,
     target: &Cap<ProcessIdentity>,
 ) -> Result<KillScriptOutcome, Errno> {
-    use crate::cred::checks::{authorize_signal_send, AuthOutcome};
+    use crate::cred::checks::{AuthOutcome, authorize_signal_send};
 
     // Use SIGTERM as the rule's signum input — the no-deliver probe
     // applies the same rule POSIX kill(pid, 0) does, which is
@@ -1115,7 +1155,7 @@ pub(crate) fn script_kill_pgrp_with_guard(
     sig: Signum,
     guard: &Guard<'_>,
 ) -> Result<u32, Errno> {
-    use crate::cred::checks::{authorize_signal_send_under_guard, AuthOutcome};
+    use crate::cred::checks::{AuthOutcome, authorize_signal_send_under_guard};
 
     let source_snapshot = source.cred_snapshot().ok_or(Errno::ESRCH)?;
 
@@ -1189,7 +1229,7 @@ pub fn script_deliver_signal(
     // Phase 1 — authorise. authorize_signal_send takes + drops its
     // own guard, so the commit phase can take its own guard for
     // SigInfo storage / weak upgrades without nesting.
-    use crate::cred::checks::{authorize_signal_send, AuthOutcome};
+    use crate::cred::checks::{AuthOutcome, authorize_signal_send};
     match authorize_signal_send(source, &target_proc, sig)? {
         AuthOutcome::NoLiveTarget => return Ok(KillOutcome::NoLiveThread),
         AuthOutcome::Authorized => {}

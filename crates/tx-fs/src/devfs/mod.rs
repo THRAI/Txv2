@@ -38,7 +38,8 @@ use alloc::sync::Arc;
 
 pub mod adapter;
 
-use adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOutcome};
+use adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, StepOutcome};
+use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
@@ -75,8 +76,20 @@ const DEVFS_ENTRY_OBJECT_BASE: u64 = 0x6465_7601;
 /// (`0x6465_7601..0x6465_77FF`) and the devfs root id.
 pub const DEVFS_BLOCK_DIR_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7800);
 
+/// Stable `FsObjectId` for the static `/dev/null` character device.
+pub const DEVFS_NULL_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7801);
+
+/// Stable `FsObjectId` for the static `/dev/zero` character device.
+pub const DEVFS_ZERO_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7802);
+
 /// `/dev/block` directory name as the lookup key.
 const DEVFS_BLOCK_DIR_NAME: &[u8] = b"block";
+
+/// `/dev/null` directory name as the lookup key.
+const DEVFS_NULL_NAME: &[u8] = b"null";
+
+/// `/dev/zero` directory name as the lookup key.
+const DEVFS_ZERO_NAME: &[u8] = b"zero";
 
 /// Mode for the synthetic `/dev/block` mountpoint directory.
 pub const DEVFS_BLOCK_DIR_MODE: u16 = S_IFDIR | 0o755;
@@ -84,6 +97,10 @@ pub const DEVFS_BLOCK_DIR_MODE: u16 = S_IFDIR | 0o755;
 /// Mode for any character-device alias resolved by devfs (per the
 /// Phase 3a plan §"devfs FsOps surface": `S_IFCHR | 0o620`).
 pub const DEVFS_CHAR_MODE: u16 = S_IFCHR | 0o620;
+
+/// Mode for `/dev/null`; libc tests expect the conventional world
+/// readable/writable null device.
+pub const DEVFS_NULL_MODE: u16 = S_IFCHR | 0o666;
 
 /// Mode for the devfs root directory (`S_IFDIR | 0o755`).
 pub const DEVFS_ROOT_MODE: u16 = S_IFDIR | 0o755;
@@ -97,6 +114,47 @@ pub const DEVFS_ROOT_MODE: u16 = S_IFDIR | 0o755;
 /// without needing a constructor.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Devfs;
+
+struct NullCharOps;
+
+impl CharDeviceOps for NullCharOps {
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        StepOutcome::done(0)
+    }
+
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        StepOutcome::done(bytes.len())
+    }
+}
+
+static NULL_CHAR_OPS: NullCharOps = NullCharOps;
+
+static NULL_CHAR_BINDING: CharDeviceBinding = CharDeviceBinding {
+    devt: DevT::new(1, 3),
+    name: "null",
+    ops: &NULL_CHAR_OPS,
+};
+
+struct ZeroCharOps;
+
+impl CharDeviceOps for ZeroCharOps {
+    fn read(&self, out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        out.fill(0);
+        StepOutcome::done(out.len())
+    }
+
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        StepOutcome::done(bytes.len())
+    }
+}
+
+static ZERO_CHAR_OPS: ZeroCharOps = ZeroCharOps;
+
+static ZERO_CHAR_BINDING: CharDeviceBinding = CharDeviceBinding {
+    devt: DevT::new(1, 5),
+    name: "zero",
+    ops: &ZERO_CHAR_OPS,
+};
 
 impl Devfs {
     pub const fn new() -> Self {
@@ -334,6 +392,12 @@ impl FsOps for Devfs {
         if name == DEVFS_BLOCK_DIR_NAME {
             return StepOutcome::done(DEVFS_BLOCK_DIR_OBJECT_ID);
         }
+        if name == DEVFS_NULL_NAME {
+            return StepOutcome::done(DEVFS_NULL_OBJECT_ID);
+        }
+        if name == DEVFS_ZERO_NAME {
+            return StepOutcome::done(DEVFS_ZERO_OBJECT_ID);
+        }
         if tty::project::resolve_devfs_alias(name).is_some() {
             // Identify the entry by its position in the live alias
             // snapshot. Stable for one snapshot, opaque to the caller —
@@ -360,6 +424,12 @@ impl FsOps for Devfs {
         }
         if fs_object_id == DEVFS_BLOCK_DIR_OBJECT_ID {
             return StepOutcome::done(InodeMeta::new(InodeKind::Directory, DEVFS_BLOCK_DIR_MODE));
+        }
+        if fs_object_id == DEVFS_NULL_OBJECT_ID {
+            return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, DEVFS_NULL_MODE));
+        }
+        if fs_object_id == DEVFS_ZERO_OBJECT_ID {
+            return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, DEVFS_NULL_MODE));
         }
         if entry_index_from_object_id(fs_object_id)
             .and_then(|idx| tty::project::devfs_alias_entries().into_iter().nth(idx))
@@ -472,7 +542,7 @@ impl FsOps for Devfs {
         let entries = tty::project::devfs_alias_entries();
         let index = cursor.as_u64() as usize;
         // Cursor 0..entries.len() emits the TTY aliases; the next
-        // cursor slot emits the synthetic `block` mountpoint stub.
+        // cursor slots emit static devfs nodes.
         if index < entries.len() {
             let entry = &entries[index];
             let dir_entry = match DirEntry::new(
@@ -486,6 +556,22 @@ impl FsOps for Devfs {
             return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
         }
         if index == entries.len() {
+            let dir_entry =
+                match DirEntry::new(DEVFS_NULL_OBJECT_ID, InodeKind::CharDevice, DEVFS_NULL_NAME) {
+                    Ok(de) => de,
+                    Err(err) => return StepOutcome::err(err.into()),
+                };
+            return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
+        }
+        if index == entries.len() + 1 {
+            let dir_entry =
+                match DirEntry::new(DEVFS_ZERO_OBJECT_ID, InodeKind::CharDevice, DEVFS_ZERO_NAME) {
+                    Ok(de) => de,
+                    Err(err) => return StepOutcome::err(err.into()),
+                };
+            return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
+        }
+        if index == entries.len() + 2 {
             let dir_entry = match DirEntry::new(
                 DEVFS_BLOCK_DIR_OBJECT_ID,
                 InodeKind::Directory,
@@ -539,6 +625,32 @@ impl FsOps for Devfs {
             // walker's inline `Directory` arm; anything else is a
             // backend bug.
             return StepOutcome::err(Errno::ENOSYS.into());
+        }
+        if fs_object_id == DEVFS_NULL_OBJECT_ID {
+            return match RNode::new_cap_in_mount(
+                fs_object_id,
+                meta,
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::CharDevice(&NULL_CHAR_BINDING),
+                },
+                mount,
+            ) {
+                Ok(rnode) => StepOutcome::done(rnode),
+                Err(_) => StepOutcome::err(Errno::EIO.into()),
+            };
+        }
+        if fs_object_id == DEVFS_ZERO_OBJECT_ID {
+            return match RNode::new_cap_in_mount(
+                fs_object_id,
+                meta,
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::CharDevice(&ZERO_CHAR_BINDING),
+                },
+                mount,
+            ) {
+                Ok(rnode) => StepOutcome::done(rnode),
+                Err(_) => StepOutcome::err(Errno::EIO.into()),
+            };
         }
         let Some(idx) = entry_index_from_object_id(fs_object_id) else {
             return StepOutcome::err(Errno::ENOENT.into());

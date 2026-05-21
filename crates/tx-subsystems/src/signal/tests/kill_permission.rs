@@ -1,11 +1,11 @@
 // Auto-extracted from `crates/tx-subsystems/src/signal/tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
-use crate::cred::{signal_permitted, Capability, CapabilitySet, Cred, CredSnapshot, Gid, Uid};
+use crate::cred::{Capability, CapabilitySet, Cred, CredSnapshot, Gid, Uid, signal_permitted};
 use crate::execution::Errno;
 use crate::process::structure::{ProcessIdentity, TargetProcCred};
 use crate::signal::adapter::step_engine::Cap;
-use crate::signal::{script_kill_pgrp, script_kill_probe, script_kill_process, KillScriptOutcome};
+use crate::signal::{KillScriptOutcome, script_kill_pgrp, script_kill_probe, script_kill_process};
 
 fn set_cred(proc_cap: &Cap<ProcessIdentity>, cred: Cred) {
     // PR-9 phase 5 (D5 Path A): `cred` lives in `AtomicSlot<Cap<Cred>>`.
@@ -261,7 +261,7 @@ fn authorize_signal_send_yields_three_state_outcome() {
     //   • source zombie             → Err(ESRCH)
     // The four outcomes drive the dispatch branches in every signal
     // script that consumes the combinator.
-    use crate::cred::checks::{authorize_signal_send, AuthOutcome};
+    use crate::cred::checks::{AuthOutcome, authorize_signal_send};
 
     let _g = setup();
     let parent = fresh_init();
@@ -301,7 +301,7 @@ fn authorize_signal_send_yields_three_state_outcome() {
 
 #[test]
 fn script_deliver_signal_to_thread_denied_for_mismatched_uid() {
-    use crate::signal::{script_deliver_signal, KillOutcome, SignalTarget};
+    use crate::signal::{KillOutcome, SignalTarget, script_deliver_signal};
 
     let _g = setup();
     let parent = fresh_init();
@@ -337,7 +337,7 @@ fn script_deliver_signal_to_thread_denied_for_mismatched_uid() {
 
 #[test]
 fn script_deliver_signal_to_thread_delivers_when_authorized() {
-    use crate::signal::{script_deliver_signal, KillOutcome, SignalTarget};
+    use crate::signal::{KillOutcome, SignalTarget, script_deliver_signal};
 
     let _g = setup();
     let parent = fresh_init();
