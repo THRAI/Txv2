@@ -547,6 +547,18 @@ async fn yield_after_sendto_if_needed(socket: &Cap<SocketIdentity>) {
     }
 }
 
+async fn finish_sendto_progress(
+    socket: &Cap<SocketIdentity>,
+    written: usize,
+    flags: SendRecvFlags,
+) {
+    if flags.contains(SendRecvFlags::MSG_MORE) {
+        return;
+    }
+    let _ = drive_loopback_after_sendto(socket, written);
+    yield_after_sendto_if_needed(socket).await;
+}
+
 fn recv_ready_mask(mask: PollMask) -> bool {
     mask.intersects(PollMask::IN | PollMask::ERR | PollMask::HUP | PollMask::RDHUP)
 }
@@ -724,19 +736,22 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             };
             match outcome {
                 StepOutcome::Done(sent) => {
-                    if sent > 0 {
+                    if sent > 0 && !flags.contains(SendRecvFlags::MSG_MORE) {
                         tx_reactor::yield_now().await;
                     }
                     return SyscallResult::Return(sent as i64);
                 }
                 StepOutcome::Continue { progress } => {
-                    if progress.bytes() > 0 {
+                    if progress.bytes() > 0 && !flags.contains(SendRecvFlags::MSG_MORE) {
                         tx_reactor::yield_now().await;
                     }
                     return SyscallResult::Return(progress.bytes() as i64);
                 }
                 StepOutcome::Yield { progress, shape } => {
                     if progress.bytes() > 0 {
+                        if flags.contains(SendRecvFlags::MSG_MORE) {
+                            return SyscallResult::Return(progress.bytes() as i64);
+                        }
                         tx_reactor::yield_now().await;
                         return SyscallResult::Return(progress.bytes() as i64);
                     }
@@ -767,8 +782,7 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             StepOutcome::Done(sent) => {
                 total += sent;
                 if sent == 0 || sent >= remaining.len() {
-                    let _ = drive_loopback_after_sendto(&socket, sent);
-                    yield_after_sendto_if_needed(&socket).await;
+                    finish_sendto_progress(&socket, sent, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
@@ -777,8 +791,7 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
                 let sent = progress.bytes();
                 total += sent;
                 if sent == 0 || sent >= remaining.len() {
-                    let _ = drive_loopback_after_sendto(&socket, sent);
-                    yield_after_sendto_if_needed(&socket).await;
+                    finish_sendto_progress(&socket, sent, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
@@ -787,14 +800,12 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
                 let sent = progress.bytes();
                 total += sent;
                 if sent >= remaining.len() {
-                    let _ = drive_loopback_after_sendto(&socket, sent);
-                    yield_after_sendto_if_needed(&socket).await;
+                    finish_sendto_progress(&socket, sent, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
                 if total > 0 {
-                    let _ = drive_loopback_after_sendto(&socket, total);
-                    yield_after_sendto_if_needed(&socket).await;
+                    finish_sendto_progress(&socket, total, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 if flags.is_nonblocking() {
@@ -808,8 +819,7 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             }
             StepOutcome::Err(errno) => {
                 if total > 0 {
-                    let _ = drive_loopback_after_sendto(&socket, total);
-                    yield_after_sendto_if_needed(&socket).await;
+                    finish_sendto_progress(&socket, total, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 maybe_raise_sigpipe(ctx, errno, flags);
@@ -1065,6 +1075,9 @@ pub(super) async fn sys_sendmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     } else {
         None
     };
+    if let Err(errno) = maybe_autobind_udp_sendto(&socket, dst) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
 
     let iovecs = match read_iovecs(ctx, header.iov, header.iovlen) {
         Ok(iovecs) => iovecs,
@@ -1112,8 +1125,7 @@ pub(super) async fn sys_sendmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
             StepOutcome::Done(sent) => {
                 total += sent;
                 if sent == 0 || sent >= remaining.len() {
-                    let _ = drive_loopback_after_sendto(&socket, sent);
-                    yield_after_sendto_if_needed(&socket).await;
+                    finish_sendto_progress(&socket, sent, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
@@ -1122,8 +1134,7 @@ pub(super) async fn sys_sendmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
                 let sent = progress.bytes();
                 total += sent;
                 if sent == 0 || sent >= remaining.len() {
-                    let _ = drive_loopback_after_sendto(&socket, sent);
-                    yield_after_sendto_if_needed(&socket).await;
+                    finish_sendto_progress(&socket, sent, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
@@ -1132,14 +1143,12 @@ pub(super) async fn sys_sendmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
                 let sent = progress.bytes();
                 total += sent;
                 if sent >= remaining.len() {
-                    let _ = drive_loopback_after_sendto(&socket, sent);
-                    yield_after_sendto_if_needed(&socket).await;
+                    finish_sendto_progress(&socket, sent, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
                 if total > 0 {
-                    let _ = drive_loopback_after_sendto(&socket, total);
-                    yield_after_sendto_if_needed(&socket).await;
+                    finish_sendto_progress(&socket, total, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 if flags.is_nonblocking() {
@@ -1153,8 +1162,7 @@ pub(super) async fn sys_sendmsg<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
             }
             StepOutcome::Err(errno) => {
                 if total > 0 {
-                    let _ = drive_loopback_after_sendto(&socket, total);
-                    yield_after_sendto_if_needed(&socket).await;
+                    finish_sendto_progress(&socket, total, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 maybe_raise_sigpipe(ctx, errno, flags);

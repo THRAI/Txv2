@@ -439,6 +439,13 @@ impl SocketPayload {
         self.raw_recv_len(len, true).map(|(bytes, _)| bytes)
     }
 
+    pub(crate) fn udp_corked_send_len(&self) -> usize {
+        self.raw_udp
+            .as_ref()
+            .map(RawUdpSocket::corked_tx_len)
+            .unwrap_or(0)
+    }
+
     pub(crate) fn reserve_send_space(&self, len: usize) -> Option<SocketSendReserve> {
         let (bytes, became_full) = match (&self.raw_tcp, &self.raw_udp, &self.raw_icmp) {
             (Some(raw_tcp), None, None) => raw_tcp.enqueue_tx_len(len)?,
@@ -452,12 +459,21 @@ impl SocketPayload {
         Some(SocketSendReserve { bytes, became_full })
     }
 
-    pub(crate) fn reserve_send_bytes(&self, bytes: &[u8]) -> Option<SocketSendReserve> {
+    pub(crate) fn reserve_send_bytes_with_flags(
+        &self,
+        bytes: &[u8],
+        flags: super::types::SendRecvFlags,
+    ) -> Option<SocketSendReserve> {
+        let more = flags.contains(super::types::SendRecvFlags::MSG_MORE);
         let (bytes, became_full) = match (&self.raw_tcp, &self.raw_udp, &self.raw_icmp) {
             (Some(raw_tcp), None, None) => raw_tcp.enqueue_tx_bytes(bytes)?,
             (None, Some(raw_udp), None) => match self.udp_connected_remote() {
-                Some(dst) => raw_udp.enqueue_tx_bytes_to(dst, bytes)?,
-                None => raw_udp.enqueue_tx_bytes(bytes)?,
+                Some(dst) => raw_udp.enqueue_tx_bytes_to_with_more(dst, bytes, more)?,
+                None => raw_udp.enqueue_tx_bytes_to_with_more(
+                    IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0),
+                    bytes,
+                    more,
+                )?,
             },
             _ => return None,
         };
@@ -465,11 +481,13 @@ impl SocketPayload {
         Some(SocketSendReserve { bytes, became_full })
     }
 
-    pub(crate) fn reserve_send_bytes_to(
+    pub(crate) fn reserve_send_bytes_to_with_flags(
         &self,
         dst: Option<IpEndpoint>,
         bytes: &[u8],
+        flags: super::types::SendRecvFlags,
     ) -> Result<Option<SocketSendReserve>, crate::execution::Errno> {
+        let more = flags.contains(super::types::SendRecvFlags::MSG_MORE);
         let (bytes, became_full) = match (&self.raw_tcp, &self.raw_udp, &self.raw_icmp) {
             (Some(raw_tcp), None, None) => match raw_tcp.enqueue_tx_bytes(bytes) {
                 Some(reserve) => reserve,
@@ -480,7 +498,7 @@ impl SocketPayload {
                     Some(dst) => dst,
                     None => return Err(crate::execution::Errno::EDESTADDRREQ),
                 };
-                match raw_udp.enqueue_tx_bytes_to(dst, bytes) {
+                match raw_udp.enqueue_tx_bytes_to_with_more(dst, bytes, more) {
                     Some(reserve) => reserve,
                     None => return Ok(None),
                 }

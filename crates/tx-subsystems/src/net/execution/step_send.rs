@@ -33,7 +33,7 @@ pub fn step_send(
     if payload.shutdown_wr() {
         return StepOutcome::Err(Errno::EPIPE);
     }
-    if let Some(errno) = udp_payload_len_error(socket.kind, len) {
+    if let Some(errno) = udp_payload_len_error(socket.kind, payload.udp_corked_send_len() + len) {
         return StepOutcome::Err(errno);
     }
     if len == 0 {
@@ -49,7 +49,9 @@ pub fn step_send(
         socket.readiness.clear_send(SendWireSet::SPACE);
     }
 
-    net_delegate_kick_poll();
+    if !flags.contains(SendRecvFlags::MSG_MORE) {
+        net_delegate_kick_poll();
+    }
     StepOutcome::Done(reserve.bytes)
 }
 
@@ -75,7 +77,9 @@ pub fn step_send_kernel_bytes(
     if payload.shutdown_wr() {
         return StepOutcome::Err(Errno::EPIPE);
     }
-    if let Some(errno) = udp_payload_len_error(socket.kind, bytes.len()) {
+    if let Some(errno) =
+        udp_payload_len_error(socket.kind, payload.udp_corked_send_len() + bytes.len())
+    {
         return StepOutcome::Err(errno);
     }
     if bytes.is_empty() {
@@ -88,7 +92,7 @@ pub fn step_send_kernel_bytes(
         return send_unix_datagram_connected(socket, &payload, bytes, guard);
     }
 
-    let Some(reserve) = payload.reserve_send_bytes(bytes) else {
+    let Some(reserve) = payload.reserve_send_bytes_with_flags(bytes, flags) else {
         socket.readiness.clear_send(SendWireSet::SPACE);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
@@ -97,7 +101,9 @@ pub fn step_send_kernel_bytes(
         socket.readiness.clear_send(SendWireSet::SPACE);
     }
 
-    net_delegate_kick_poll();
+    if !flags.contains(SendRecvFlags::MSG_MORE) {
+        net_delegate_kick_poll();
+    }
     StepOutcome::Done(reserve.bytes)
 }
 
@@ -169,7 +175,9 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
     if let Some(errno) = stream_send_state_error(socket, &payload) {
         return StepOutcome::Err(errno);
     }
-    if let Some(errno) = udp_payload_len_error(socket.kind, bytes.len()) {
+    if let Some(errno) =
+        udp_payload_len_error(socket.kind, payload.udp_corked_send_len() + bytes.len())
+    {
         return StepOutcome::Err(errno);
     }
     if bytes.is_empty() {
@@ -182,7 +190,7 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
         return send_unix_datagram_connected(socket, &payload, bytes, guard);
     }
 
-    let reserve = match payload.reserve_send_bytes_to(dst, bytes) {
+    let reserve = match payload.reserve_send_bytes_to_with_flags(dst, bytes, flags) {
         Ok(Some(reserve)) => reserve,
         Ok(None) => {
             socket.readiness.clear_send(SendWireSet::SPACE);
@@ -195,7 +203,7 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
         socket.readiness.clear_send(SendWireSet::SPACE);
     }
 
-    if kick_poll {
+    if kick_poll && !flags.contains(SendRecvFlags::MSG_MORE) {
         net_delegate_kick_poll();
     }
     StepOutcome::Done(reserve.bytes)

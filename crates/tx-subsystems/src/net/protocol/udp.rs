@@ -20,6 +20,7 @@ pub struct RawUdpSocket {
     socket: SpinMutex<Box<udp::Socket<'static>>>,
     rx_datagrams: SpinMutex<VecDeque<UdpRxDatagram>>,
     tx_datagrams: SpinMutex<VecDeque<UdpTxDatagram>>,
+    corked_tx: SpinMutex<Option<UdpTxDatagram>>,
     recv_capacity: usize,
     send_capacity: usize,
     recv_packet_capacity: usize,
@@ -78,6 +79,7 @@ impl RawUdpSocket {
             socket: SpinMutex::new(Box::new(socket)),
             rx_datagrams: SpinMutex::new(VecDeque::new()),
             tx_datagrams: SpinMutex::new(VecDeque::new()),
+            corked_tx: SpinMutex::new(None),
             recv_capacity,
             send_capacity,
             recv_packet_capacity,
@@ -158,8 +160,17 @@ impl RawUdpSocket {
     }
 
     pub fn send_available(&self) -> usize {
-        self.send_capacity
-            .saturating_sub(tx_payload_len(&self.tx_datagrams.lock()))
+        let queued = tx_payload_len(&self.tx_datagrams.lock());
+        let corked = self.corked_tx_len();
+        self.send_capacity.saturating_sub(queued + corked)
+    }
+
+    pub fn corked_tx_len(&self) -> usize {
+        self.corked_tx
+            .lock()
+            .as_ref()
+            .map(|datagram| datagram.payload.len())
+            .unwrap_or(0)
     }
 
     pub fn enqueue_tx_len(&self, len: usize) -> Option<(usize, bool)> {
@@ -172,19 +183,54 @@ impl RawUdpSocket {
     }
 
     pub fn enqueue_tx_datagram(&self, dst: IpEndpoint, payload: Vec<u8>) -> Option<(usize, bool)> {
+        self.enqueue_tx_datagram_with_more(dst, payload, false)
+    }
+
+    pub fn enqueue_tx_datagram_with_more(
+        &self,
+        dst: IpEndpoint,
+        payload: Vec<u8>,
+        more: bool,
+    ) -> Option<(usize, bool)> {
         if payload.is_empty() {
             return Some((0, false));
         }
 
         let mut tx = self.tx_datagrams.lock();
-        let available = self.send_capacity.saturating_sub(tx_payload_len(&tx));
+        let mut corked = self.corked_tx.lock();
+        let available = self
+            .send_capacity
+            .saturating_sub(tx_payload_len(&tx) + corked_payload_len(&corked));
         if payload.len() > available {
             return None;
         }
 
         let bytes = payload.len();
-        tx.push_back(UdpTxDatagram { dst, payload });
-        Some((bytes, tx_payload_len(&tx) == self.send_capacity))
+        if more {
+            match corked.as_mut() {
+                Some(datagram) => {
+                    datagram.payload.extend(payload);
+                    if datagram.dst.port == 0 {
+                        datagram.dst = dst;
+                    }
+                }
+                None => {
+                    *corked = Some(UdpTxDatagram { dst, payload });
+                }
+            }
+        } else if let Some(mut datagram) = corked.take() {
+            if datagram.dst.port == 0 {
+                datagram.dst = dst;
+            }
+            datagram.payload.extend(payload);
+            tx.push_back(datagram);
+        } else {
+            tx.push_back(UdpTxDatagram { dst, payload });
+        }
+        Some((
+            bytes,
+            tx_payload_len(&tx) + corked_payload_len(&corked) == self.send_capacity,
+        ))
     }
 
     pub fn enqueue_tx_bytes(&self, bytes: &[u8]) -> Option<(usize, bool)> {
@@ -193,6 +239,15 @@ impl RawUdpSocket {
 
     pub fn enqueue_tx_bytes_to(&self, dst: IpEndpoint, bytes: &[u8]) -> Option<(usize, bool)> {
         self.enqueue_tx_datagram(dst, bytes.to_vec())
+    }
+
+    pub fn enqueue_tx_bytes_to_with_more(
+        &self,
+        dst: IpEndpoint,
+        bytes: &[u8],
+        more: bool,
+    ) -> Option<(usize, bool)> {
+        self.enqueue_tx_datagram_with_more(dst, bytes.to_vec(), more)
     }
 
     pub fn pop_tx_datagram(&self) -> Option<UdpTxDatagramDrain> {
@@ -310,6 +365,13 @@ fn tx_payload_len(datagrams: &VecDeque<UdpTxDatagram>) -> usize {
         .iter()
         .map(|datagram| datagram.payload.len())
         .sum()
+}
+
+fn corked_payload_len(datagram: &Option<UdpTxDatagram>) -> usize {
+    datagram
+        .as_ref()
+        .map(|datagram| datagram.payload.len())
+        .unwrap_or(0)
 }
 
 fn unspecified_endpoint() -> IpEndpoint {
