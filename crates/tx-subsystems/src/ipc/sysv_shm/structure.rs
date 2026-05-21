@@ -9,7 +9,8 @@
 //! `IndexTable<SysvKey, Cap<ShmSegmentIdentity>>`.
 
 use alloc::collections::BTreeMap;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
 use crate::process::adapter::step_engine::{Cap, SpinMutex, Zone, ZoneAllocated, ZoneError};
 
@@ -70,7 +71,9 @@ pub struct ShmSegmentIdentity {
     pub shmid: u32,
     pub cred: Cap<Cred>,
     pub size: usize,
-    pub perm: IpcPerm,
+    pub mode: AtomicU16,
+    pub uid: AtomicU32,
+    pub gid: AtomicU32,
     /// Creator uid/gid — used by shmctl IPC_STAT.
     pub cuid: u32,
     pub cgid: u32,
@@ -83,6 +86,26 @@ pub struct ShmSegmentIdentity {
     /// shared access). Mutation goes through atomic stores so the
     /// flag can be set without `DerefMut`.
     pub destroyed: core::sync::atomic::AtomicBool,
+    /// Live segment payload.
+    pub payload: Cap<ShmSegmentPayload>,
+}
+
+impl ShmSegmentIdentity {
+    pub fn perm(&self) -> IpcPerm {
+        IpcPerm::new(self.mode.load(Ordering::Relaxed))
+    }
+
+    pub fn uid(&self) -> u32 {
+        self.uid.load(Ordering::Relaxed)
+    }
+
+    pub fn gid(&self) -> u32 {
+        self.gid.load(Ordering::Relaxed)
+    }
+
+    pub fn key_raw(&self) -> i32 {
+        self.key.map(|key| key.0 as i32).unwrap_or(0)
+    }
 }
 
 /// System V shared memory segment payload — the live backing.
@@ -98,14 +121,20 @@ pub struct ShmSegmentPayload {
     /// `AtomicU32` because `Cap<T>` only provides `Deref` — mutation
     /// goes through atomic fetch_add / fetch_sub.
     pub attach_count: AtomicU32,
+    /// Caller VMAs attached to this segment. Linux's `shmdt(2)` only
+    /// receives the start address returned by `shmat(2)`, so the
+    /// day-1 ownership key pairs that address with the caller's
+    /// retained `AddressSpace` slot identity.
+    pub attaches: SpinMutex<Vec<ShmAttach>>,
     /// PageContainer holding the segment's pages.
-    /// `None` until the page-backed storage is materialized.
-    ///
-    /// TODO(txdoc:IPC-V1-SHM-1): allocate pages on step_shmget and
-    /// integrate with PageBacked/RNodeBacking for demand-paged
-    /// materialization on shmat. For IPC-1 stub, the attacher is
-    /// responsible for faulting in pages.
-    pub page_container: Option<Cap<crate::page_backed::PageContainer>>,
+    pub page_container: Cap<crate::page_backed::PageContainer>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShmAttach {
+    pub aspace_key: u32,
+    pub addr: usize,
+    pub len: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +187,12 @@ pub(crate) fn lookup_shm(shmid: u32) -> Option<Cap<ShmSegmentIdentity>> {
     SHM_TABLE.lock().get(&shmid).cloned()
 }
 
+/// Look up a live shm segment by Linux's dense IPC index used by
+/// `SHM_STAT`/`SHM_STAT_ANY`.
+pub(crate) fn lookup_shm_by_index(index: u32) -> Option<Cap<ShmSegmentIdentity>> {
+    SHM_TABLE.lock().values().nth(index as usize).cloned()
+}
+
 /// Register a newly created segment and return its shmid.
 pub(crate) fn register_shm(
     key: Option<SysvKey>,
@@ -169,39 +204,65 @@ pub(crate) fn register_shm(
 ) -> Result<u32, ZoneError> {
     use crate::process::adapter::step_engine::sign;
     let shmid = NEXT_SHMID.fetch_add(1, Ordering::Relaxed);
+    let payload = sign(ShmSegmentPayload {
+        attach_count: AtomicU32::new(0),
+        attaches: SpinMutex::new(Vec::new()),
+        page_container: crate::page_backed::PageContainer::new_cap(
+            crate::page_backed::PageContainerKind::Anon {
+                swap_policy: crate::page_backed::AnonSwapPolicy::Persistent,
+            },
+            size.div_ceil(crate::vm::USER_PAGE_SIZE) as u64,
+        )?,
+    })?;
     let identity = sign(ShmSegmentIdentity {
         key,
         shmid,
         cred,
         size,
-        perm,
+        mode: AtomicU16::new(perm.mode),
+        uid: AtomicU32::new(cuid),
+        gid: AtomicU32::new(cgid),
         cuid,
         cgid,
         destroyed: AtomicBool::new(false),
+        payload,
     })?;
-    let payload = sign(ShmSegmentPayload {
-        attach_count: AtomicU32::new(0),
-        page_container: None,
-    })?;
-    // The payload cap is held by the identity implicitly via the
-    // registration table. For now, the segment lives as long as
-    // the identity cap is in the table.
-    let _ = payload; // held alive by the table entry (identity route)
     SHM_TABLE.lock().insert(shmid, identity);
     Ok(shmid)
 }
 
-/// Withdraw a segment from the global table (IPC_RMID).
-/// Returns the identity cap so the caller can mark it destroyed.
-pub(crate) fn withdraw_shm(shmid: u32) -> Option<Cap<ShmSegmentIdentity>> {
-    SHM_TABLE.lock().remove(&shmid)
+/// Mark a segment removed without dropping the global identity cap.
+///
+/// `IPC_RMID` makes the id/key unavailable for new lookups and new
+/// attaches, but already-attached address spaces must still be able to
+/// identify the segment when `shmdt(2)` arrives.
+pub(crate) fn mark_shm_removed(shmid: u32) -> Option<Cap<ShmSegmentIdentity>> {
+    let segment = SHM_TABLE.lock().get(&shmid).cloned()?;
+    segment.destroyed.store(true, Ordering::Release);
+    Some(segment)
+}
+
+/// Drop a removed segment once no attach records remain.
+pub(crate) fn reclaim_shm_if_unattached(segment: &Cap<ShmSegmentIdentity>) -> bool {
+    if !segment.destroyed.load(Ordering::Acquire) {
+        return false;
+    }
+    if segment.payload.attach_count.load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    SHM_TABLE.lock().remove(&segment.shmid).is_some()
 }
 
 /// Iterate all live segments (for /proc/sysvipc/shm projection).
-#[expect(
-    dead_code,
-    reason = "txdoc:IPC-V1-SHM-1 — consumed by procfs projection when wired"
-)]
 pub(crate) fn all_shm_segments() -> alloc::vec::Vec<Cap<ShmSegmentIdentity>> {
     SHM_TABLE.lock().values().cloned().collect()
+}
+
+pub(crate) fn highest_shm_index() -> i64 {
+    let len = SHM_TABLE.lock().len();
+    if len == 0 {
+        -1
+    } else {
+        (len - 1).try_into().unwrap_or(i64::MAX)
+    }
 }

@@ -1,3 +1,189 @@
+- 2026-05-22 **Fixed the musl kernel-user layout redlight positives.**
+  The `kernel-user-layouts` gate now treats `KernelToUserLayout` as a marker
+  for registered Rust-backed `#[repr(C)]` ABI structs instead of scanning every
+  production `repr(C)` in the syscall tree, which removes false positives from
+  unrelated Linux UAPI PODs while keeping the musl-backed registry enforced.
+  The candidate dump now carries `rust_type`, the source lint reads the
+  registered Rust-backed set from the dumped registry, and the docs/skill copy
+  now says exactly that. The redlight still covers the current musl-facing
+  kernel/user surface as `checked`, `prefix`, `manual`, `deferred`, or
+  `excluded` with a reason, with 21 full layouts and 49 total candidates.
+  **Verified:** `python3 -m unittest tools.tests.test_kernel_user_layouts`;
+  `python3 tools/check-kernel-user-layouts.py`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::kernel_user_layouts -- --nocapture`; `cargo check -p
+  tx-shims -p xtask`; `cargo fmt --check`; `git diff --check`.
+  **Next step:** keep feeding new musl-backed ABI structs through the candidate
+  registry so the redlight stays source-driven instead of path-driven.
+  **Blocker:** no blocker.
+
+- 2026-05-22 **Finished SysV shm RMID lifetime and namespace-key withdrawal.**
+  Picked up the IPC/musl shm implementation in
+  `/Users/3y/.codex/worktrees/6dea/Tx` and closed the remaining
+  `IPC_RMID` lifetime gap from the attach/detach pass. `shmctl(IPC_RMID)` now
+  marks a segment destroyed without dropping the identity while it still has
+  live attaches, so new `shmat` calls return `EIDRM` but the original returned
+  address remains valid for `shmdt`. Last detach, including process-exit
+  detach sweeps, reclaims the removed segment once `shm_nattch` reaches zero.
+  The syscall path now routes RMID through an nsproxy-aware helper that
+  withdraws keyed `IpcNamespace.sysv_shm` bindings, so a later `shmget` can
+  recreate the same key with a new shmid.
+  **Verified:** `cargo test -p tx-subsystems --lib
+  ipc::sysv_shm::tests -- --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::ipc_dispatch -- --nocapture`; `cargo check -p
+  tx-shims -p tx-subsystems`; `cargo fmt --check`.
+  **Next step:** run the guest IPC smoke with the current musl `ipc_test`
+  image, then decide whether SysV sem/msg RMID should get the same
+  namespace-key withdrawal wrapper in this branch.
+  **Blocker:** no focused shm blocker remains; QEMU guest coverage has not
+  been rerun after this RMID lifetime fix.
+
+- 2026-05-22 **Wired SysV shm attach/detach to PageBacked VM mappings.**
+  Continued the shm compliance pass by replacing the honest `shmat`/`shmdt`
+  unsupported stubs with a first real data-plane slice. `shmget` now creates a
+  persistent anonymous `PageContainer` for each segment, `shmat` installs a
+  shared `VmBacking::Page` VMA in the caller `AddressSpace` through the async
+  VM `mmap_script`, honors `SHM_RDONLY`, `SHM_EXEC`, `SHM_RND`, and
+  conservative `SHM_REMAP` placement, and increments `shm_nattch`. `shmdt` now
+  validates the returned attach address against the caller's current VMA,
+  checks that the VMA is shared and backed by the same segment `PageContainer`,
+  waits through `munmap_script`, rolls back its attach record if unmap fails,
+  and decrements the attach count. Attach records now include the caller
+  `AddressSpace` cap key, so two processes can attach the same segment at the
+  same virtual address without stealing each other's detach bookkeeping.
+  Process exit now sweeps all shm attaches for the dying `AddressSpace`, uses
+  synchronous `try_munmap` to drop the VM recipes/PTEs, and decrements
+  `shm_nattch` on both `exit_group` and last-thread process-exit teardown.
+  Tests pin subsystem bookkeeping, same-address/wrong-address-space rejection,
+  same-segment/same-address cross-address-space detach ownership, process-exit
+  cleanup, and the musl-visible syscall path.
+  **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::ipc_dispatch -- --nocapture`; `cargo test -p
+  tx-subsystems --lib ipc::sysv_shm::tests -- --nocapture`; `cargo test -p
+  tx-subsystems --lib process::tests -- --nocapture`; `cargo check -p
+  tx-shims -p tx-subsystems`; `cargo fmt --check`; `git diff --check`;
+  `cargo xtask progress validate`.
+  **Next step:** route `IPC_RMID` namespace-key withdrawal through the same
+  nsproxy-aware layer as `shmget`, then implement delayed segment reclamation
+  once `destroyed && shm_nattch == 0`.
+  **Blocker:** none for musl shm attach/detach or process-exit accounting;
+  final destruction timing still needs namespace-key withdrawal and delayed
+  reclaim wiring.
+
+- 2026-05-22 **Checked SysV shm musl compliance and removed fake attach success.**
+  Re-audited the shared-memory slice against `external/musl/include/sys/shm.h`,
+  `external/musl/arch/generic/bits/shm.h`, and Linux `shmctl(2)` return
+  semantics. Added the distinct musl LP64 `struct shm_info` layout for
+  `SHM_INFO`, made `IPC_INFO`/`SHM_INFO` return the highest live shm index,
+  made `SHM_STAT`/`SHM_STAT_ANY` use Linux's index input and return the real
+  `shmid`, and kept `SHM_STAT_ANY` from requiring the normal read-permission
+  check. The audit also found that `shmat` returned a fake address `0` and
+  `shmdt` always succeeded; those now surface `ENOSYS` and `EINVAL`
+  respectively until the VM-backed attach/detach path exists.
+  **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::ipc_dispatch -- --nocapture`; `cargo test -p
+  tx-subsystems --lib ipc::sysv_shm::tests -- --nocapture`; `cargo check -p
+  tx-shims -p tx-subsystems`; `cargo fmt --check`.
+  **Next step:** implement real `shmat`/`shmdt` as PageBacked VM mappings per
+  `txdoc:IPC-V1-SHM-1`. **Blocker:** full shm data-plane compliance still
+  depends on VM mapping integration and attach-count lifetime accounting.
+
+- 2026-05-22 **Tightened POSIX mq waits, readiness, and priority semantics.**
+  Continued the musl mq pass after the fd-shaped `mqd_t` work. POSIX mq
+  descriptors now fail raw `read(2)`/`write(2)` with `EINVAL` instead of
+  falling into the VFS-only `rnode()` path, `mq_timedsend` enforces
+  `mq_maxmsg` even for tiny messages and rejects priorities at/above musl's
+  `MQ_PRIO_MAX`, `mq_timedreceive` returns the oldest message at the highest
+  priority, `epoll_pwait(..., timeout=0)` reports mq `EPOLLIN`/`EPOLLOUT`
+  readiness from the SysV backing queue, and blocking null-timeout
+  `mq_timedsend`/`mq_timedreceive` now park on the existing queue wait sources
+  until a receiver/sender changes queue state. Queue-wide `mq_notify`
+  registrations for `SIGEV_SIGNAL`/`SIGEV_THREAD_ID` now deliver one-shot
+  signals on the empty-to-nonempty send edge, including when registration and
+  send use different descriptors for the same queue, and suppress delivery
+  when a blocked receiver was woken to consume the message. Unsupported
+  `SIGEV_THREAD` registration is rejected instead of silently succeeding.
+  **Verified:** `cargo test -p tx-shims
+  linux_syscall::tests::mq_dispatch -- --nocapture`; `cargo check -p
+  tx-shims -p tx-subsystems`; `cargo -q xtask unit`; `cargo xtask progress
+  validate`; `cargo xtask lint docs`; `git diff --check`.
+  **Next step:** implement absolute timeout expiry and full `SIGEV_THREAD`
+  callback delivery. **Blocker:** signal/socket-backed `SIGEV_THREAD`
+  notification delivery still depends on the broader signal/socket integration
+  surface.
+
+- 2026-05-22 **Moved POSIX mq out of ENOSYS for musl.**
+  `mq_open` now returns a real fd-backed `OpenFileBacking::PosixMq`, so musl's
+  `mqd_t=int` and `mq_close -> close` contract works. Wired generic Linux
+  `mq_*` dispatch, LP64 `mq_attr`, send/receive/getsetattr/notify/unlink
+  paths, `O_CLOEXEC`/`O_NONBLOCK`, priority round trip, and basic size/access
+  validation. Updated the musl ABI audit note and the SysV IPC plan record.
+  **Verified:** `cargo test -p tx-shims
+  linux_syscall::tests::mq_dispatch -- --nocapture`; `cargo check -p
+  tx-shims -p tx-subsystems`; `cargo -q xtask unit`; `cargo xtask progress
+  validate`; `cargo xtask lint docs`; `git diff --check`.
+  **Next step:** decide raw Linux AIO/io_uring compatibility policy and then
+  tackle remaining signal delivery/userfaultfd/timed-blocking gaps.
+  **Blocker:** no blocker for basic musl mq wrappers; full timed blocking and
+  notification delivery remain deferred.
+
+- 2026-05-21 **Audited non-SysV kernel-to-user ABI surfaces against musl.**
+  Used the pinned `external/musl` submodule to check termios/winsize,
+  statfs, timerfd, epoll, uname, wait4/rusage, sigaltstack, signal records,
+  eventfd/signalfd/userfaultfd, POSIX mq, raw AIO, io_uring, and exec auxv.
+  Fixed high-confidence musl-visible mismatches: Linux generic termios
+  `c_line` placement for `TCGETS`/`TCSETS`; musl LP64 `statfs` offsets;
+  timerfd set/get copy-in, flag validation, and remaining-time reporting;
+  generic RV64/LA64 epoll syscall numbers, `epoll_create1`/`epoll_ctl`/
+  `epoll_pwait` dispatch, LP64 `epoll_event` copyback with preserved
+  user `data`, and eventfd readiness polling; platform-specific
+  `uname.machine`; zero-filled `wait4` rusage; and LP64 `sigaltstack`
+  copy/query semantics. Added
+  `docs/progress/research/2026-05-21-musl-kernel-user-abi-audit.md` with the
+  remaining compliance gaps: epoll still lacks full blocking wait and broad
+  fd-readiness integration, raw AIO/io_uring ABI
+  divergence, incomplete signal-frame/siginfo semantics, partial userfaultfd,
+  skeletal accounting/timing, and LA64's looser kernel-side `MINSIGSTKSZ`
+  check.
+  **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::timerfd_dispatch -- --nocapture`; `cargo test -p
+  tx-shims --lib linux_syscall::tests::sigaltstack_dispatch -- --nocapture`;
+  `cargo test -p tx-shims --lib
+  linux_syscall::tests::fork_clone_wait4_wave3::dispatch_wait4_rusage_nonzero_writes_zeroed_rusage
+  -- --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::fcntl_misc::dispatch_uname -- --nocapture`; `cargo
+  test -p tx-shims --lib
+  linux_syscall::tests::ioctl_dispatch::dispatch_ioctl_tcgets_writes_linux_kernel_termios_layout
+  -- --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::stat_family::dispatch_statfs -- --nocapture`; `cargo
+  test -p tx-subsystems --lib timerfd::tests -- --nocapture`; `cargo test -p
+  tx-shims linux_syscall::tests::epoll_dispatch -- --nocapture`; `cargo check
+  -p tx-shims -p tx-subsystems`; `cargo -q xtask unit`; `cargo xtask progress
+  validate`; `cargo xtask lint docs`; `git diff --check`.
+  **Next step:** decide the raw Linux AIO / io_uring compatibility policy.
+  **Blocker:** raw Linux AIO and io_uring require an explicit compatibility
+  decision because the current fd-shaped scaffolds deliberately diverge from
+  Linux userspace ABI.
+
+- 2026-05-21 **Audited SysV IPC against musl headers.**
+  Added the `external/musl` submodule pinned at
+  `5122f9f3c99fee366167c5de98b31546312921ab` and used its generic LP64
+  `sys/{ipc,msg,sem,shm}.h` definitions as the ABI reference for Tx's SysV
+  IPC syscall layer. Ported the relevant Gemini SysV work with corrections:
+  musl-shaped `ipc_perm`, `msqid_ds`, `semid_ds`, `shmid_ds`, `shminfo`, and
+  `sembuf` layouts; real user-copy paths for `semop`, `msgsnd`, and `msgrcv`;
+  `IPC_SET`, `*_STAT`, `*_STAT_ANY`, and `*_INFO` writeback paths; mutable
+  owner/group/mode state; `MSG_NOERROR` truncation semantics; and corrected
+  musl constants including `SEM_UNDO` and `SHM_REMAP`.
+  **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::ipc_dispatch -- --nocapture`; `cargo test -p
+  tx-subsystems --lib ipc::sysv_shm::tests -- --nocapture`; `cargo check -p
+  tx-shims -p tx-subsystems`; `cargo -q xtask unit`; `git diff --check`;
+  `cargo xtask progress validate`.
+  **Next step:** integrate real `shmat` VM mappings, blocking queue/semaphore
+  waits, and the deferred POSIX mq surface. **Blocker cleared:** progress
+  validation was blocked by two stale `"completed"` status values in existing
+  progress JSON records; normalized them to the validator's enums.
+
 - 2026-05-20 **Fixed targeted LA64 OSComp group selection.**
   `make oscomp-local-la64-libctest-musl-smp4` previously expanded to a QEMU
   command with `-append 'tx.oscomp.groups=libctest-musl'`, but LA64 did not

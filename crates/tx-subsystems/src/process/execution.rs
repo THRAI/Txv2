@@ -619,6 +619,8 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
 
     let mut payload_guard = process.payload.lock();
     if let Some(payload) = payload_guard.as_ref() {
+        let _shm_detach =
+            crate::ipc::sysv_shm::execution::detach_all_for_aspace(&payload.aspace_cap());
         let _closed_fds = payload.drain_fds();
         let drained: Vec<Cap<ThreadIdentity>> = payload.threads.drain();
         for thread in &drained {
@@ -664,6 +666,8 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
     *process.exit_status.lock() = Some(status);
     let mut payload_guard = process.payload.lock();
     if let Some(payload) = payload_guard.as_ref() {
+        let _shm_detach =
+            crate::ipc::sysv_shm::execution::detach_all_for_aspace(&payload.aspace_cap());
         let _closed_fds = payload.drain_fds();
     }
     *payload_guard = None;

@@ -14,7 +14,7 @@ use tx_subsystems::wait_source;
 
 use super::numbers::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME,
-    TFD_CLOEXEC_FLAG, TFD_NONBLOCK_FLAG, TFD_TIMER_ABSTIME_FLAG,
+    TFD_CLOEXEC_FLAG, TFD_NONBLOCK_FLAG, TFD_TIMER_ABSTIME_FLAG, TFD_TIMER_CANCEL_ON_SET_FLAG,
 };
 use super::{
     bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user, errno_to_i32, SyscallCtx,
@@ -114,14 +114,21 @@ pub(super) fn sys_timerfd_settime<'a, P: super::TimeIf>(
         None => return SyscallResult::Error(EINVAL_VALUE),
     };
 
+    let recognised_flags = TFD_TIMER_ABSTIME_FLAG | TFD_TIMER_CANCEL_ON_SET_FLAG;
+    if flags & !recognised_flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
     let abstime = (flags & TFD_TIMER_ABSTIME_FLAG) != 0;
 
     // Read new_value from userspace.
-    let new_bytes = [0u8; ITIMERSPEC_BYTES];
-    if let Err(errno) = bootstrap_read_user::<[u8; ITIMERSPEC_BYTES]>(&ctx.aspace, new_value_ptr) {
-        return SyscallResult::error_from(errno);
-    }
-    let new_value = ItimerSpec::from_bytes(&new_bytes);
+    let new_bytes = match bootstrap_read_user::<[u8; ITIMERSPEC_BYTES]>(&ctx.aspace, new_value_ptr)
+    {
+        Ok(bytes) => bytes,
+        Err(errno) => return SyscallResult::error_from(errno),
+    };
+    let Some(new_value) = ItimerSpec::try_from_bytes(&new_bytes) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
 
     let now_ns = P::read_ns();
 
@@ -159,7 +166,7 @@ pub(super) fn sys_timerfd_settime<'a, P: super::TimeIf>(
 /// - `Return(0)` on success.
 /// - `Error(EBADF)` if `fd` doesn't name a timerfd.
 /// - `Error(EFAULT)` if `curr_value` pointer is bad.
-pub(super) fn sys_timerfd_gettime<'a>(
+pub(super) fn sys_timerfd_gettime<'a, P: super::TimeIf>(
     fd: u32,
     curr_value_ptr: u64,
     ctx: &SyscallCtx<'a>,
@@ -175,7 +182,7 @@ pub(super) fn sys_timerfd_gettime<'a>(
 
     let spec = ItimerSpec {
         it_interval_ns: tfd_cap.interval_ns(),
-        it_value_ns: tfd_cap.deadline_ns(),
+        it_value_ns: tfd_cap.remaining_value_ns(P::read_ns()),
     };
     let bytes = spec.to_bytes();
     if let Err(errno) =

@@ -8,6 +8,56 @@ use tx_subsystems::process::numbers::{resolve_pid_number, PidName};
 use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
 use tx_subsystems::signal::{KillOutcome, SignalTarget};
 
+#[repr(C)]
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct SigaltstackLayout {
+    ss_sp: u64,
+    ss_flags: i32,
+    _pad: u32,
+    ss_size: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<SigaltstackLayout>() == 24);
+const SS_ONSTACK: i32 = 1;
+const SS_DISABLE: i32 = 2;
+const SS_AUTODISARM: i32 = 1 << 31;
+
+pub(super) mod layout_descriptors {
+    use core::mem::{align_of, offset_of, size_of};
+
+    pub(super) use super::SigaltstackLayout;
+    use crate::linux_syscall::{KernelToUserLayout, KernelUserField, KernelUserLayout};
+
+    impl KernelToUserLayout for SigaltstackLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "SigaltstackLayout",
+            musl_header: "signal.h",
+            musl_type: "struct sigaltstack",
+            size: size_of::<SigaltstackLayout>(),
+            align: align_of::<SigaltstackLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "ss_sp",
+                    musl: "ss_sp",
+                    offset: offset_of!(SigaltstackLayout, ss_sp),
+                },
+                KernelUserField {
+                    rust: "ss_flags",
+                    musl: "ss_flags",
+                    offset: offset_of!(SigaltstackLayout, ss_flags),
+                },
+                KernelUserField {
+                    rust: "ss_size",
+                    musl: "ss_size",
+                    offset: offset_of!(SigaltstackLayout, ss_size),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const SIGALTSTACK_LAYOUT: KernelUserLayout =
+        <SigaltstackLayout as KernelToUserLayout>::LAYOUT;
+}
+
 /// Drain `SignalDelivered` events from a thread mailbox.
 ///
 /// The `tx-scripts::drive` inner mailbox-await re-posts any
@@ -137,15 +187,56 @@ pub(super) fn sys_rt_sigsuspend(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallRe
     SyscallResult::Error(ENOSYS_VALUE)
 }
 
-/// `sigaltstack(ss, old_ss)` — stub returning success. The slice
-/// doesn't honour an alternate signal stack yet (the signal-frame
-/// path always uses the thread's current sp); returning 0 lets
-/// libctest / lua / busybox proceed past their setup phase where
-/// they merely register an alt stack without actually relying on
-/// it during the test body. POSIX permits `sigaltstack` to be a
-/// no-op as long as both pointers are NULL or point to valid
-/// memory the kernel doesn't have to copy out.
-pub(super) fn sys_sigaltstack(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
+/// `sigaltstack(ss, old_ss)` — Linux LP64 `stack_t` query/update.
+///
+/// This records the registered alternate stack in
+/// `ThreadPayload.alt_stack` and reports it back through `old_ss`.
+/// Signal-frame delivery still uses the current user stack today, so
+/// `SA_ONSTACK` delivery semantics remain deferred; the syscall
+/// pointer contract itself is Linux/musl-shaped.
+pub(super) fn sys_sigaltstack(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
+    let ss_ptr = args[0];
+    let old_ss_ptr = args[1];
+    let Some(payload) = ctx.thread.payload_cap() else {
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+
+    if old_ss_ptr != 0 {
+        let (ss_sp, ss_flags, ss_size) = match payload.alt_stack() {
+            Some((base, size)) => (base as u64, 0, size as u64),
+            None => (0, SS_DISABLE, 0),
+        };
+        let old = SigaltstackLayout {
+            ss_sp,
+            ss_flags,
+            _pad: 0,
+            ss_size,
+        };
+        if let Err(errno) = bootstrap_write_user::<SigaltstackLayout>(&ctx.aspace, old_ss_ptr, old)
+        {
+            return SyscallResult::error_from(errno);
+        }
+    }
+
+    if ss_ptr != 0 {
+        let new = match bootstrap_read_user::<SigaltstackLayout>(&ctx.aspace, ss_ptr) {
+            Ok(value) => value,
+            Err(errno) => return SyscallResult::error_from(errno),
+        };
+        let allowed = SS_DISABLE | SS_AUTODISARM;
+        if new.ss_flags & !allowed != 0 {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        if new.ss_flags & SS_DISABLE != 0 {
+            payload.set_alt_stack(None);
+        } else {
+            if new.ss_size < MINSIGSTKSZ {
+                return SyscallResult::Error(ENOMEM_VALUE);
+            }
+            payload.set_alt_stack(Some((new.ss_sp as usize, new.ss_size as usize)));
+        }
+    }
+
     SyscallResult::Return(0)
 }
 

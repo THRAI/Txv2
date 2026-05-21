@@ -5,6 +5,7 @@
 /// Packed into a `u64` for atomic storage via `TtyPayload::window_size`
 /// (Phase B). Ordering: `ws_row` in the high 16 bits, `ws_ypixel` in the
 /// low 16 bits.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Winsize {
     pub ws_row: u16,
@@ -12,6 +13,8 @@ pub struct Winsize {
     pub ws_xpixel: u16,
     pub ws_ypixel: u16,
 }
+
+const _: () = assert!(core::mem::size_of::<Winsize>() == 8);
 
 impl Winsize {
     pub const fn new(rows: u16, cols: u16) -> Self {

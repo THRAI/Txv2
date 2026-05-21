@@ -142,6 +142,8 @@ mod eventfd;
 use eventfd::*;
 mod timerfd;
 use timerfd::*;
+mod epoll;
+use epoll::*;
 
 mod ctx;
 pub use ctx::*;
@@ -149,6 +151,11 @@ mod result;
 pub use result::*;
 mod user_copy;
 pub(super) use user_copy::*;
+mod user_layout;
+pub use user_layout::{
+    kernel_user_layout_candidates, kernel_user_layouts, KernelToUserLayout, KernelUserCandidate,
+    KernelUserField, KernelUserLayout,
+};
 mod helpers;
 pub(super) use helpers::*;
 
@@ -416,7 +423,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_TIMES => return sys_times::<P>(req.args, ctx),
         nr if nr == NR_GETTIMEOFDAY => return sys_gettimeofday::<P>(req.args, ctx),
         nr if nr == NR_UMASK => return sys_umask(req.args, ctx),
-        nr if nr == NR_UNAME => return sys_uname(req.args, ctx),
+        nr if nr == NR_UNAME => return sys_uname::<P>(req.args, ctx),
         nr if nr == NR_GETRANDOM => return sys_getrandom(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
         nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
@@ -430,11 +437,15 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx).await,
         nr if nr == NR_UTIMENSAT => return sys_utimensat(req.args, ctx),
         nr if nr == NR_SHMGET => return sys_shmget(req.args, ctx),
-        nr if nr == NR_SHMDT => return sys_shmdt(req.args, ctx),
+        nr if nr == NR_SHMDT => return sys_shmdt(req.args, ctx).await,
         nr if nr == NR_MSGGET => return sys_msgget(req.args, ctx),
         nr if nr == NR_MSGSND => return sys_msgsnd(req.args, ctx),
         nr if nr == NR_MSGRCV => return sys_msgrcv(req.args, ctx),
         nr if nr == NR_SEMGET => return sys_semget(req.args, ctx),
+        nr if nr == NR_MQ_OPEN => return sys_mq_open(req.args, ctx),
+        nr if nr == NR_MQ_UNLINK => return sys_mq_unlink(req.args, ctx),
+        nr if nr == NR_MQ_GETSETATTR => return sys_mq_getsetattr(req.args, ctx),
+        nr if nr == NR_MQ_NOTIFY => return sys_mq_notify(req.args, ctx),
         nr if nr == NR_MEMBARRIER => return sys_membarrier::<P>(&req.args),
         _ => {} // fall through to script lanes
     }
@@ -445,6 +456,8 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_WRITEV => sys_writev(req.args, ctx).await,
         nr if nr == NR_READ => sys_read::<P>(req.args, ctx).await,
         nr if nr == NR_READV => sys_readv::<P>(req.args, ctx).await,
+        nr if nr == NR_MQ_TIMEDSEND => sys_mq_timedsend(req.args, ctx).await,
+        nr if nr == NR_MQ_TIMEDRECEIVE => sys_mq_timedreceive(req.args, ctx).await,
         nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
         nr if nr == NR_PPOLL => sys_ppoll(req.args, ctx).await,
         nr if nr == NR_EXIT => sys_exit(req.args, ctx),
@@ -465,7 +478,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_MSGCTL => sys_msgctl(req.args, ctx),
         nr if nr == NR_SEMOP => sys_semop(req.args, ctx),
         nr if nr == NR_SEMCTL => sys_semctl(req.args, ctx),
-        nr if nr == NR_SHMAT => sys_shmat(req.args, ctx),
+        nr if nr == NR_SHMAT => sys_shmat(req.args, ctx).await,
         nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
         nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx).await,
         nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
@@ -717,7 +730,28 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
             ctx,
         ),
         // timerfd_gettime(fd, curr_value).
-        nr if nr == NR_TIMERFD_GETTIME => sys_timerfd_gettime(req.args[0] as u32, req.args[2], ctx),
+        nr if nr == NR_TIMERFD_GETTIME => {
+            sys_timerfd_gettime::<P>(req.args[0] as u32, req.args[1], ctx)
+        }
+        // epoll_create1 / epoll_ctl / epoll_pwait — generic Linux
+        // numbers used by musl on RV64 and LoongArch64. musl's
+        // epoll_wait wrapper calls epoll_pwait with a null mask on
+        // these targets.
+        nr if nr == NR_EPOLL_CREATE1 => sys_epoll_create1(req.args[0] as u32, ctx),
+        nr if nr == NR_EPOLL_CTL => sys_epoll_ctl(
+            req.args[0] as u32,
+            req.args[1] as u32,
+            req.args[2] as u32,
+            req.args[3],
+            ctx,
+        ),
+        nr if nr == NR_EPOLL_PWAIT => sys_epoll_wait::<P>(
+            req.args[0] as u32,
+            req.args[1],
+            req.args[2] as u32,
+            req.args[3] as i32,
+            ctx,
+        ),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }

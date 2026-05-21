@@ -10,3 +10,6 @@ pub mod checks;
 pub mod execution;
 mod projection;
 pub mod structure;
+
+#[cfg(test)]
+mod tests;

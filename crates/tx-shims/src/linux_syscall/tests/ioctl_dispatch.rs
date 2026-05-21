@@ -3,6 +3,7 @@
 use super::*;
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::bootstrap_init_process;
+use tx_subsystems::tty::structure::termios::{ICANON, VMIN};
 use tx_subsystems::tty::structure::{Termios, Winsize};
 
 use crate::linux_syscall::{
@@ -46,6 +47,39 @@ fn dispatch_ioctl_tcgets_on_tty_fd_writes_termios() {
     assert_ne!(
         out.c_lflag, 0,
         "TCGETS should write the cooked-mode termios; c_lflag has ICANON|ECHO|... set"
+    );
+}
+
+/// `TCGETS` copies Linux's kernel `struct termios` prefix, not musl's
+/// larger public buffer. musl passes its `struct termios *` directly
+/// to the ioctl and then reads these prefix fields.
+#[test]
+fn dispatch_ioctl_tcgets_writes_linux_kernel_termios_layout() {
+    let _setup = ioctl_setup();
+    let _ops = install_capturing_console();
+    let (proc_cap, thread) = fresh_proc_thread();
+    proc_cap.set_fd(0, Some(tx_fs::devfs::open_console_for_init()));
+    let ctx = make_ctx(proc_cap, thread);
+
+    let mut out = [0xa5u8; 64];
+    let req = SyscallRequest::new(
+        NR_IOCTL,
+        [0, TCGETS as u64, out.as_mut_ptr() as u64, 0, 0, 0],
+    );
+
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(out[16], 0, "c_line is the byte at offset 16");
+    assert_eq!(out[17 + VMIN], 1, "c_cc[VMIN] starts at offset 17");
+    assert_ne!(
+        u32::from_le_bytes(out[12..16].try_into().unwrap()) & ICANON,
+        0,
+        "c_lflag lives at offset 12 and carries ICANON in cooked mode",
+    );
+    assert_eq!(
+        &out[36..],
+        &[0xa5u8; 28],
+        "TCGETS must only copy the 36-byte kernel termios image",
     );
 }
 
