@@ -133,78 +133,136 @@ pub fn kernel_step(
         ));
     }
 
-    // --- lookup ---
-    let parent_fs_object_id = current.rnode().fs_object_id();
-    let child_fs_object_id = match fs_ops.lookup(parent_fs_object_id, &component, guard) {
-        StepOutcome::Done(id) => id,
-        StepOutcome::Yield { .. } => {
-            let token = ResumeToken {
-                walking: WalkingState {
-                    current,
-                    remaining,
-                    hop_count,
-                    mount_root,
-                    must_be_directory,
-                },
-                hop_count,
-            };
-            return KernelStep::NeedIO(
-                IORequest::DirLookup {
-                    fs_object_id: parent_fs_object_id,
-                    name: component.into_boxed_slice(),
-                },
-                token,
-            );
-        }
-        StepOutcome::Err(e) => {
-            return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(e)))
-        }
-        StepOutcome::Continue { .. } => {
-            // Re-enter lookup (v3 continue without yield).
-            return KernelStep::Continue(WalkState::Walking(WalkingState {
-                current,
-                remaining,
-                hop_count,
-                mount_root,
-                must_be_directory,
-            }));
-        }
+    let child_inline = match InlineName::new(&component) {
+        Ok(n) => n,
+        Err(_) => return KernelStep::Error(WalkCause::ComponentNotFound),
     };
 
-    // --- load inode meta ---
-    let child_meta = match fs_ops.load_inode_meta(child_fs_object_id, guard) {
-        StepOutcome::Done(m) => m,
-        StepOutcome::Yield { .. } => {
-            let token = ResumeToken {
-                walking: WalkingState {
-                    current,
-                    remaining,
+    // --- lookup / materialise, with parent-local dentry cache ---
+    let parent_fs_object_id = current.rnode().fs_object_id();
+    let (child_dentry, child_rnode_cap, child_fs_object_id, child_meta) =
+        if let Some(cached) = current
+            .cached_child(child_inline)
+            .filter(|dentry| dentry.rnode().meta().kind() == InodeKind::Directory)
+        {
+            let rnode = cached.rnode().clone();
+            let fs_object_id = rnode.fs_object_id();
+            let meta = rnode.meta();
+            (cached, rnode, fs_object_id, meta)
+        } else {
+            let child_fs_object_id = match fs_ops.lookup(parent_fs_object_id, &component, guard) {
+                StepOutcome::Done(id) => id,
+                StepOutcome::Yield { .. } => {
+                    let token = ResumeToken {
+                        walking: WalkingState {
+                            current,
+                            remaining,
+                            hop_count,
+                            mount_root,
+                            must_be_directory,
+                        },
+                        hop_count,
+                    };
+                    return KernelStep::NeedIO(
+                        IORequest::DirLookup {
+                            fs_object_id: parent_fs_object_id,
+                            name: component.into_boxed_slice(),
+                        },
+                        token,
+                    );
+                }
+                StepOutcome::Err(e) => {
+                    return KernelStep::Error(WalkCause::FsOpsRejected(
+                        crate::execution::Errno::from(e),
+                    ))
+                }
+                StepOutcome::Continue { .. } => {
+                    // Re-enter lookup (v3 continue without yield).
+                    return KernelStep::Continue(WalkState::Walking(WalkingState {
+                        current,
+                        remaining,
+                        hop_count,
+                        mount_root,
+                        must_be_directory,
+                    }));
+                }
+            };
+
+            let child_meta = match fs_ops.load_inode_meta(child_fs_object_id, guard) {
+                StepOutcome::Done(m) => m,
+                StepOutcome::Yield { .. } => {
+                    let token = ResumeToken {
+                        walking: WalkingState {
+                            current,
+                            remaining,
+                            hop_count,
+                            mount_root,
+                            must_be_directory,
+                        },
+                        hop_count,
+                    };
+                    return KernelStep::NeedIO(
+                        IORequest::LoadInodeMeta {
+                            fs_object_id: child_fs_object_id,
+                        },
+                        token,
+                    );
+                }
+                StepOutcome::Err(e) => {
+                    return KernelStep::Error(WalkCause::FsOpsRejected(
+                        crate::execution::Errno::from(e),
+                    ))
+                }
+                StepOutcome::Continue { .. } => {
+                    return KernelStep::Continue(WalkState::Walking(WalkingState {
+                        current,
+                        remaining,
+                        hop_count,
+                        mount_root,
+                        must_be_directory,
+                    }));
+                }
+            };
+
+            let child_rnode_cap = match materialise_child(
+                &fs_ops,
+                child_fs_object_id,
+                &child_meta,
+                mount_payload.as_ref(),
+                &WalkingState {
+                    current: current.clone(),
+                    remaining: remaining.clone(),
                     hop_count,
-                    mount_root,
+                    mount_root: mount_root.clone(),
                     must_be_directory,
                 },
-                hop_count,
+                guard,
+            ) {
+                Ok(rnode) => rnode,
+                Err(KernelStep::NeedIO(req, token)) => return KernelStep::NeedIO(req, token),
+                Err(KernelStep::Error(cause)) => return KernelStep::Error(cause),
+                Err(_) => {
+                    return KernelStep::Error(WalkCause::FsOpsRejected(
+                        crate::execution::Errno::EIO,
+                    ))
+                }
             };
-            return KernelStep::NeedIO(
-                IORequest::LoadInodeMeta {
-                    fs_object_id: child_fs_object_id,
-                },
-                token,
-            );
-        }
-        StepOutcome::Err(e) => {
-            return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(e)))
-        }
-        StepOutcome::Continue { .. } => {
-            return KernelStep::Continue(WalkState::Walking(WalkingState {
-                current,
-                remaining,
-                hop_count,
-                mount_root,
-                must_be_directory,
-            }));
-        }
-    };
+
+            let mut child_dentry_raw = DEntry::new(child_inline, child_rnode_cap.clone());
+            child_dentry_raw.set_parent_hint(&current);
+            let child_dentry = match step_engine::sign(child_dentry_raw) {
+                Ok(cap) => cap,
+                Err(_) => {
+                    return KernelStep::Error(WalkCause::FsOpsRejected(
+                        crate::execution::Errno::ENOMEM,
+                    ))
+                }
+            };
+            if child_meta.kind() == InodeKind::Directory {
+                current.cache_child(child_dentry.clone());
+            }
+            (child_dentry, child_rnode_cap, child_fs_object_id, child_meta)
+        };
 
     // --- mid-path non-directory check ---
     if child_meta.kind() != InodeKind::Directory
@@ -213,41 +271,6 @@ pub fn kernel_step(
     {
         return KernelStep::Error(WalkCause::NotADirectory);
     }
-
-    // --- materialise child RNode ---
-    let child_rnode_cap = match materialise_child(
-        &fs_ops,
-        child_fs_object_id,
-        &child_meta,
-        mount_payload.as_ref(),
-        &WalkingState {
-            current: current.clone(),
-            remaining: remaining.clone(),
-            hop_count,
-            mount_root: mount_root.clone(),
-            must_be_directory,
-        },
-        guard,
-    ) {
-        Ok(rnode) => rnode,
-        Err(KernelStep::NeedIO(req, token)) => return KernelStep::NeedIO(req, token),
-        Err(KernelStep::Error(cause)) => return KernelStep::Error(cause),
-        Err(_) => return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::EIO)),
-    };
-
-    // --- build child DEntry ---
-    let child_inline = match InlineName::new(&component) {
-        Ok(n) => n,
-        Err(_) => return KernelStep::Error(WalkCause::ComponentNotFound),
-    };
-    let mut child_dentry_raw = DEntry::new(child_inline, child_rnode_cap.clone());
-    child_dentry_raw.set_parent_hint(&current);
-    let child_dentry = match step_engine::sign(child_dentry_raw) {
-        Ok(cap) => cap,
-        Err(_) => {
-            return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM))
-        }
-    };
 
     // --- symlink chasing ---
     if let RNodeBacking::Symlink { target } = child_rnode_cap.backing() {

@@ -5,7 +5,7 @@ use core::{
 
 use crate::adapter::boot_runtime;
 use crate::adapter::step_engine::{
-    self as step_engine, init, init_on_ap, ByteProgress, Cap, SpinMutex, StepOutcome,
+    self as step_engine, ByteProgress, Cap, SpinMutex, StepOutcome, init, init_on_ap,
 };
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
@@ -434,7 +434,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// whether the bytes at offset 1024+56 spell the ext4 magic (`0x53 0xef`).
     /// Boards without a block device (e.g. m1dock-mock) silently no-op.
     fn probe_ext4_superblock_smoke() {
-        use tx_fs::tx_ext4::{BlockDeviceImage, BlockImage, BLOCK_SIZE};
+        use tx_fs::tx_ext4::{BLOCK_SIZE, BlockDeviceImage, BlockImage};
         use tx_subsystems::device::block_device_by_name;
 
         let Some(reg) = block_device_by_name(b"vda") else {
@@ -899,7 +899,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
     pub(crate) fn mount_sdcard_at_musl() {
-        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
+        use tx_fs::tx_ext4::{BlockDeviceImage, mount_ext4_read_write};
         use tx_subsystems::device::block_device_by_name;
 
         let Some(reg) = block_device_by_name(b"vda") else {
@@ -1491,10 +1491,9 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn userspace_thread_sched_meta_for(cpu_id: CpuId) -> boot_runtime::InitialSchedMeta {
-        // The current userspace trap/return slot is still global. Keep
-        // OSComp user threads on the hart that submits them until the
-        // userspace slot is per-hart; otherwise fork/exec/wait and timer
-        // preemption can bounce through different harts and lose ordering.
+        // Userspace trap/return state still has hart-local architectural
+        // coupling. Keep OSComp user threads on the submit hart until the
+        // userspace context handoff is fully migration-safe.
         let affinity = Self::cpu_bit(cpu_id);
         boot_runtime::InitialSchedMeta::fair()
             .with_affinity(affinity)
@@ -1769,7 +1768,7 @@ impl<P: TxPlatform> CoreInit<P> {
                         task_payload.clone(),
                         crate::thread_future::run_thread::<P>(child_thread, task_payload),
                     ),
-                    Self::userspace_thread_sched_meta_for(pending.submit_cpu),
+                    Self::userspace_thread_sched_meta_for(pending.submit_cpu).preempted_on_submit(),
                     submit_hart,
                     &mut signal,
                 )

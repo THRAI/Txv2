@@ -108,7 +108,9 @@ pub(crate) fn create_then_walk<P: PmapIf>(
         let guard = step_engine::guard();
         let outcome = fs_ops.create_inode(parent_fs_object_id, basename, new_mode, cred, &guard);
         match outcome {
-            V3::Done(_) => {}
+            V3::Done(_) => {
+                parent_dentry.remove_cached_child_by_name(basename);
+            }
             V3::Continue { .. } | V3::Yield { .. } => {
                 return Err(EIO_VALUE);
             }
@@ -216,7 +218,10 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         fs_ops.mkdir(parent_id, basename, effective_mode, &cred, &guard)
     };
     match outcome {
-        V3::Done(_) => SyscallResult::Return(0),
+        V3::Done(_) => {
+            parent_dentry.remove_cached_child_by_name(basename);
+            SyscallResult::Return(0)
+        }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
         V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
@@ -300,7 +305,10 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         }
     };
     match outcome {
-        V3::Done(()) => SyscallResult::Return(0),
+        V3::Done(()) => {
+            parent_dentry.remove_cached_child_by_name(basename);
+            SyscallResult::Return(0)
+        }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
         V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
@@ -369,7 +377,10 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         fs_ops.symlink(parent_id, basename, &target, &cred, &guard)
     };
     match outcome {
-        V3::Done(_) => SyscallResult::Return(0),
+        V3::Done(_) => {
+            parent_dentry.remove_cached_child_by_name(basename);
+            SyscallResult::Return(0)
+        }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
         V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
@@ -457,7 +468,10 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         fs_ops.link(new_parent_id, new_basename, source_id, &guard)
     };
     match outcome {
-        V3::Done(()) => SyscallResult::Return(0),
+        V3::Done(()) => {
+            new_parent_dentry.remove_cached_child_by_name(new_basename);
+            SyscallResult::Return(0)
+        }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
         V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }

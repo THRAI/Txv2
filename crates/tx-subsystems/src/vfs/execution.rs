@@ -1313,8 +1313,11 @@ mod step_op_wraps {
         };
 
         let iname = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
-        let dentry = DEntry::new(iname, rnode);
-        step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)
+        let mut dentry = DEntry::new(iname, rnode);
+        dentry.set_parent_hint(parent_dentry);
+        let dentry_cap = step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)?;
+        parent_dentry.cache_child(dentry_cap.clone());
+        Ok(dentry_cap)
     }
 
     /// Create a regular file under `parent_dentry` and open it.
@@ -1345,7 +1348,8 @@ mod step_op_wraps {
         };
 
         let iname = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
-        let dentry = DEntry::new(iname, rnode.clone());
+        let mut dentry = DEntry::new(iname, rnode.clone());
+        dentry.set_parent_hint(parent_dentry);
         let dentry_cap = step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)?;
 
         let open_file = OpenFile::new_cap(
@@ -1389,7 +1393,8 @@ mod step_op_wraps {
         };
 
         let iname = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
-        let dentry = DEntry::new(iname, rnode);
+        let mut dentry = DEntry::new(iname, rnode);
+        dentry.set_parent_hint(parent_dentry);
         step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)
     }
 

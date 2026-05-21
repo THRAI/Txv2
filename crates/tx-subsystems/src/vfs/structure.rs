@@ -8,10 +8,13 @@
 //! pure observation helpers belong here.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::vfs::adapter::step_engine::{self, Cap, Weak, Zone, ZoneAllocated, ZoneError};
+use crate::vfs::adapter::step_engine::{
+    self, Cap, SpinMutex, Weak, Zone, ZoneAllocated, ZoneError,
+};
 use crate::vfs::adapter::wait_routing::{self, Channel, WaitSource};
 
 use crate::aio::AioContext;
@@ -740,6 +743,7 @@ pub struct DEntry {
     parent: Option<Cap<DEntry>>,
     rnode: Cap<RNode>,
     mounted: Option<Weak<MountIdentity>>,
+    children: SpinMutex<BTreeMap<InlineName, Cap<DEntry>>>,
 }
 
 impl DEntry {
@@ -749,6 +753,7 @@ impl DEntry {
             parent: None,
             rnode,
             mounted: None,
+            children: SpinMutex::new(BTreeMap::new()),
         }
     }
 
@@ -786,6 +791,28 @@ impl DEntry {
     /// for dentries that have not been published as a mount point.
     pub fn mounted_hint(&self) -> Option<Weak<MountIdentity>> {
         self.mounted
+    }
+
+    pub fn cached_child(&self, name: InlineName) -> Option<Cap<DEntry>> {
+        self.children.lock().get(&name).cloned()
+    }
+
+    pub fn cache_child(&self, child: Cap<DEntry>) {
+        self.children.lock().insert(child.name(), child);
+    }
+
+    pub fn remove_cached_child(&self, name: InlineName) {
+        self.children.lock().remove(&name);
+    }
+
+    pub fn remove_cached_child_by_name(&self, name: &[u8]) {
+        if let Ok(name) = InlineName::new(name) {
+            self.remove_cached_child(name);
+        }
+    }
+
+    pub fn clear_cached_children(&self) {
+        self.children.lock().clear();
     }
 }
 

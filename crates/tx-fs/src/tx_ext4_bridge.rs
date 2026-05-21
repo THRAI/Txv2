@@ -6,9 +6,12 @@
 //! bridges the two by allocating a transient frame, issuing a DMA operation,
 //! and copying between the frame and the caller's `[u8; 4096]` buffer.
 
+use alloc::vec::Vec;
 use core::ptr::NonNull;
 
-use crate::devfs::adapter::step_engine::{epoch, page_allocator, StepOutcome, ZeroPolicy};
+use crate::devfs::adapter::step_engine::{
+    epoch, page_allocator, SpinMutex, StepOutcome, ZeroPolicy,
+};
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_ext4_format::{Ext4FormatError, Result};
 use tx_subsystems::device::{BlockDevice, PhysicalBlockNumber};
@@ -21,11 +24,15 @@ use tx_subsystems::page_backed::Frame;
 /// `Box::leak` at boot (see `crates/tx-kernel/src/devices.rs`).
 pub struct BlockDeviceImage {
     device: &'static dyn BlockDevice,
+    cache: SpinMutex<ReadBlockCache>,
 }
 
 impl BlockDeviceImage {
     pub fn new(device: &'static dyn BlockDevice) -> Self {
-        Self { device }
+        Self {
+            device,
+            cache: SpinMutex::new(ReadBlockCache::new()),
+        }
     }
 
     fn sectors_per_ext4_block(&self) -> Option<u64> {
@@ -35,17 +42,8 @@ impl BlockDeviceImage {
         }
         Some(BLOCK_SIZE as u64 / sector)
     }
-}
 
-impl BlockImage for BlockDeviceImage {
-    fn total_blocks(&self) -> u64 {
-        let Some(spb) = self.sectors_per_ext4_block() else {
-            return 0;
-        };
-        self.device.total_blocks() / spb
-    }
-
-    fn read_block(&self, block: u64, out: &mut Page4K) -> Result<()> {
+    fn read_block_uncached(&self, block: u64, out: &mut Page4K) -> Result<()> {
         let spb = self
             .sectors_per_ext4_block()
             .ok_or(Ext4FormatError::Unsupported)?;
@@ -86,6 +84,24 @@ impl BlockImage for BlockDeviceImage {
         drop(run);
         Ok(())
     }
+}
+
+impl BlockImage for BlockDeviceImage {
+    fn total_blocks(&self) -> u64 {
+        let Some(spb) = self.sectors_per_ext4_block() else {
+            return 0;
+        };
+        self.device.total_blocks() / spb
+    }
+
+    fn read_block(&self, block: u64, out: &mut Page4K) -> Result<()> {
+        if self.cache.lock().get(block, out) {
+            return Ok(());
+        }
+        self.read_block_uncached(block, out)?;
+        self.cache.lock().insert(block, out);
+        Ok(())
+    }
 
     fn write_block(&mut self, block: u64, data: &Page4K) -> Result<()> {
         let spb = self
@@ -117,8 +133,86 @@ impl BlockImage for BlockDeviceImage {
         drop(guard);
         drop(run);
         match outcome {
-            StepOutcome::Done(()) => Ok(()),
+            StepOutcome::Done(()) => {
+                self.cache.lock().insert(block, data);
+                Ok(())
+            }
             _ => Err(Ext4FormatError::Truncated),
+        }
+    }
+}
+
+const READ_BLOCK_CACHE_ENTRIES: usize = 128;
+
+struct ReadBlockCache {
+    clock: u64,
+    entries: Vec<ReadBlockCacheEntry>,
+}
+
+impl ReadBlockCache {
+    fn new() -> Self {
+        Self {
+            clock: 0,
+            entries: Vec::with_capacity(READ_BLOCK_CACHE_ENTRIES),
+        }
+    }
+
+    fn get(&mut self, block: u64, out: &mut Page4K) -> bool {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.valid && entry.block == block)
+        else {
+            return false;
+        };
+        self.clock = self.clock.wrapping_add(1);
+        let entry = &mut self.entries[index];
+        entry.last_used = self.clock;
+        out.copy_from_slice(&entry.data);
+        true
+    }
+
+    fn insert(&mut self, block: u64, data: &Page4K) {
+        self.clock = self.clock.wrapping_add(1);
+        let victim = self
+            .entries
+            .iter()
+            .position(|entry| !entry.valid || entry.block == block)
+            .unwrap_or_else(|| {
+                if self.entries.len() < READ_BLOCK_CACHE_ENTRIES {
+                    self.entries.push(ReadBlockCacheEntry::empty());
+                    self.entries.len() - 1
+                } else {
+                    self.entries
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, entry)| entry.last_used)
+                        .map(|(index, _)| index)
+                        .unwrap_or(0)
+                }
+            });
+        let entry = &mut self.entries[victim];
+        entry.valid = true;
+        entry.block = block;
+        entry.last_used = self.clock;
+        entry.data.copy_from_slice(data);
+    }
+}
+
+struct ReadBlockCacheEntry {
+    valid: bool,
+    block: u64,
+    last_used: u64,
+    data: Page4K,
+}
+
+impl ReadBlockCacheEntry {
+    fn empty() -> Self {
+        Self {
+            valid: false,
+            block: 0,
+            last_used: 0,
+            data: [0; BLOCK_SIZE],
         }
     }
 }
