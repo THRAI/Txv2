@@ -13,6 +13,7 @@ use crate::sync::SpinMutex;
 
 const MAX_UDP_PACKET_METADATA_CAPACITY: usize = 64;
 const UDP_PACKET_CAPACITY_DIVISOR: usize = 1500;
+pub const UDP_IPV4_MAX_PAYLOAD_BYTES: usize = u16::MAX as usize - 20 - 8;
 
 /// Doc-named owner for the smoltcp UDP socket and its packet buffers.
 pub struct RawUdpSocket {

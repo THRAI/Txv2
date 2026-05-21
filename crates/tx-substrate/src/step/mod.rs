@@ -74,6 +74,9 @@ pub enum Errno {
     EISDIR,
     ELOOP,
     EMLINK,
+    /// Message too long. Used by datagram sockets when a single packet
+    /// exceeds the protocol maximum. Linux value: 90.
+    EMSGSIZE,
     ENAMETOOLONG,
     ENODEV,
     ENOEXEC,
@@ -149,6 +152,7 @@ impl Errno {
             Errno::EISDIR => 21,
             Errno::ELOOP => 40,
             Errno::EMLINK => 31,
+            Errno::EMSGSIZE => 90,
             Errno::ENAMETOOLONG => 36,
             Errno::ENODEV => 19,
             Errno::ENOEXEC => 8,

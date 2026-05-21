@@ -477,13 +477,17 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // Decode the open flags. Access-mode picks the read/write pair;
     // O_APPEND / O_CLOEXEC thread through to OpenFileFlags. O_NONBLOCK
     // is accepted but ignored (no blocking state on OpenFile yet).
-    let (want_read, want_write) = decode_access_mode(flags);
-    let want_path_only = flags & 0o10000000 != 0;
+    let want_path_only = flags & O_PATH != 0;
+    let (want_read, want_write) = if want_path_only {
+        (false, false)
+    } else {
+        decode_access_mode(flags)
+    };
     let want_append = flags & O_APPEND != 0;
     let want_cloexec = flags & O_CLOEXEC != 0;
-    let want_create = flags & O_CREAT != 0;
-    let want_excl = flags & O_EXCL != 0;
-    let want_trunc = flags & O_TRUNC != 0;
+    let want_create = !want_path_only && flags & O_CREAT != 0;
+    let want_excl = !want_path_only && flags & O_EXCL != 0;
+    let want_trunc = !want_path_only && flags & O_TRUNC != 0;
     // O_NONBLOCK and other unrecognised bits: silently dropped.
 
     let open_flags = OpenFileFlags {

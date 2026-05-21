@@ -222,6 +222,10 @@ pub const O_APPEND: u32 = 0o2000;
 /// resulting fd. Wave 2 accepts but ignores this bit — there is no
 /// blocking-flag plumbing on `OpenFile` yet (`TODO(phase-nonblock)`).
 pub const O_NONBLOCK: u32 = 0o4000;
+/// `openat(2)` flag bit: path-only fd with no read/write capability.
+/// Linux ignores most other open flags when this is set; syscalls that
+/// require a real file operation generally fail with `EBADF`.
+pub const O_PATH: u32 = 0o10000000;
 
 // ---------------------------------------------------------------------
 // Wave 2 of the fd-ops slice — fd-management syscall numbers.
@@ -326,6 +330,8 @@ pub const NR_SHUTDOWN: u64 = 210;
 pub const NR_SENDMSG: u64 = 211;
 pub const NR_RECVMSG: u64 = 212;
 pub const NR_ACCEPT4: u64 = 242;
+pub const NR_RECVMMSG: u64 = 243;
+pub const NR_SENDMMSG: u64 = 269;
 
 pub const AF_UNIX: u16 = 1;
 pub const AF_INET: u16 = 2;
@@ -346,6 +352,7 @@ pub const SO_TYPE: i32 = 3;
 pub const SO_ERROR: i32 = 4;
 pub const SO_DONTROUTE: i32 = 5;
 pub const SO_KEEPALIVE: i32 = 9;
+pub const SO_OOBINLINE: i32 = 10;
 pub const SO_BROADCAST: i32 = 6;
 pub const SO_LINGER: i32 = 13;
 pub const SO_REUSEPORT: i32 = 15;

@@ -3,11 +3,12 @@ use tx_substrate::zone::Cap;
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_write_target;
 use crate::net::namespace::initial_loopback_iface;
-use crate::net::protocol::{LoopbackIface, PollContext};
+use crate::net::protocol::{LoopbackIface, PollContext, UDP_IPV4_MAX_PAYLOAD_BYTES};
 use crate::net::structure::{
     IpEndpoint, Ipv4Address, SendRecvFlags, SendWireSet, SocketIdentity, SocketProtocol, UdpInner,
 };
 
+use super::step_send::send_flags_error;
 use super::{socket_send_wait_token, yield_bytes_on_token, ByteStepOutcome};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -121,8 +122,14 @@ pub fn step_send_udp_loopback_kernel_bytes_on_iface(
     let Some(source_payload) = socket.acquire_operational() else {
         return tx_substrate::step::StepOutcome::Err(Errno::ENOTCONN);
     };
+    if let Some(errno) = send_flags_error(witness.flags) {
+        return tx_substrate::step::StepOutcome::Err(errno);
+    }
     if source_payload.shutdown_wr() {
         return tx_substrate::step::StepOutcome::Err(Errno::EPIPE);
+    }
+    if bytes.len() > UDP_IPV4_MAX_PAYLOAD_BYTES {
+        return tx_substrate::step::StepOutcome::Err(Errno::EMSGSIZE);
     }
     if bytes.is_empty() {
         return tx_substrate::step::StepOutcome::Done(0);
@@ -152,8 +159,11 @@ pub fn step_send_udp_loopback_kernel_bytes_on_iface(
     }
 
     let source = loopback_udp_source(local, destination, iface);
-    if source.port == 0 || destination.port == 0 || bytes.len() + 28 > usize::from(iface.mtu()) {
+    if source.port == 0 || destination.port == 0 {
         return tx_substrate::step::StepOutcome::Err(Errno::EINVAL);
+    }
+    if bytes.len() + 28 > usize::from(iface.mtu()) {
+        return tx_substrate::step::StepOutcome::Err(Errno::EMSGSIZE);
     }
 
     let Some(target) = source_payload

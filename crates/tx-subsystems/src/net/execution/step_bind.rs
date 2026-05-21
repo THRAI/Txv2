@@ -25,8 +25,8 @@ pub fn step_bind(
     let table = payload.socket_table();
 
     let table_result = match witness.identity.kind {
-        SocketKind::UnixDatagram => Ok(()),
-        SocketKind::Tcp => table.bind_tcp(witness.local, socket.clone()),
+        SocketKind::UnixDatagram | SocketKind::UnixStream => Ok(()),
+        SocketKind::Tcp => bind_tcp_no_wildcard_overlap(table, socket, witness.local, guard),
         SocketKind::Udp => bind_udp_maybe_reuseaddr(table, socket, witness.local, guard),
         SocketKind::RawIcmp => Ok(()),
         SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter | SocketKind::Packet => Ok(()),
@@ -60,6 +60,48 @@ pub fn step_bind(
     } else {
         StepOutcome::Err(Errno::EINVAL)
     }
+}
+
+fn bind_tcp_no_wildcard_overlap(
+    table: &SocketTable,
+    socket: &Cap<SocketIdentity>,
+    local: IpEndpoint,
+    guard: &Guard<'_>,
+) -> Result<(), IndexError> {
+    if tcp_bind_conflict(table, socket, local, guard).is_some() {
+        return Err(IndexError::Duplicate);
+    }
+    table.bind_tcp(local, socket.clone())
+}
+
+fn tcp_bind_conflict(
+    table: &SocketTable,
+    socket: &Cap<SocketIdentity>,
+    local: IpEndpoint,
+    guard: &Guard<'_>,
+) -> Option<Cap<SocketIdentity>> {
+    if let Some(existing) = table.lookup_tcp_bound(local, guard) {
+        if existing.raw() != socket.raw() {
+            return Some(existing);
+        }
+    }
+
+    if local.addr == Ipv4Address::UNSPECIFIED {
+        for existing in table.snapshot_tcp_bound(guard) {
+            if existing.raw() == socket.raw() {
+                continue;
+            }
+            if tcp_socket_local(&existing).is_some_and(|endpoint| endpoint.port == local.port) {
+                return Some(existing);
+            }
+        }
+        return None;
+    }
+
+    let wildcard = IpEndpoint::new(Ipv4Address::UNSPECIFIED, local.port);
+    table
+        .lookup_tcp_bound(wildcard, guard)
+        .filter(|existing| existing.raw() != socket.raw())
 }
 
 fn bind_udp_maybe_reuseaddr(
@@ -123,6 +165,18 @@ fn udp_bind_conflict(
     table
         .lookup_udp_bound_exact(wildcard, guard)
         .filter(|existing| existing.raw() != socket.raw())
+}
+
+fn tcp_socket_local(socket: &Cap<SocketIdentity>) -> Option<IpEndpoint> {
+    socket
+        .acquire_operational()
+        .and_then(|payload| match payload.protocol_snapshot() {
+            SocketProtocol::Tcp(TcpState::Bound { local })
+            | SocketProtocol::Tcp(TcpState::Listening { local, .. })
+            | SocketProtocol::Tcp(TcpState::Connecting { local, .. })
+            | SocketProtocol::Tcp(TcpState::Connected { local, .. }) => Some(local),
+            _ => None,
+        })
 }
 
 fn udp_socket_local(socket: &Cap<SocketIdentity>) -> Option<IpEndpoint> {

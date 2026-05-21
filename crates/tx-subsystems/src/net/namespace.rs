@@ -260,7 +260,7 @@ impl Entity for NetNamespaceIdentity {
 
 impl NetNamespacePayload {
     pub fn new_initial() -> Self {
-        Self::new(&INITIAL_SOCKET_TABLE, loopback_iface(), true)
+        Self::new(initial_socket_table_for_namespace(), loopback_iface(), true)
     }
 
     fn new(
@@ -467,6 +467,12 @@ impl NetNamespacePayload {
         }
 
         links
+    }
+
+    pub fn owns_ipv4_addr(&self, addr: Ipv4Address) -> bool {
+        self.link_snapshot()
+            .into_iter()
+            .any(|link| link.ipv4_addr == Some(addr))
     }
 
     pub fn device_snapshot(&self) -> Vec<&'static NetDeviceRegistration> {
@@ -1224,11 +1230,7 @@ impl NetNamespacePayload {
     }
 
     fn is_local_ipv4_destination(&self, dst: Ipv4Address) -> bool {
-        dst == Ipv4Address::BROADCAST
-            || self
-                .link_snapshot()
-                .into_iter()
-                .any(|link| link.ipv4_addr == Some(dst))
+        dst == Ipv4Address::BROADCAST || self.owns_ipv4_addr(dst)
     }
 
     fn poll_bridges(&self, guard: &Guard<'_>) -> BridgeForwardOutcome {
@@ -1502,6 +1504,17 @@ fn allocate_netns_fs_object_id() -> FsObjectId {
 
 fn create_initial_net_namespace() -> Result<Cap<NetNamespaceIdentity>, ZoneError> {
     create_net_namespace("init", NetNamespacePayload::new_initial())
+}
+
+fn initial_socket_table_for_namespace() -> &'static SocketTable {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        Box::leak(Box::new(SocketTable::new()))
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        &INITIAL_SOCKET_TABLE
+    }
 }
 
 fn create_net_namespace(

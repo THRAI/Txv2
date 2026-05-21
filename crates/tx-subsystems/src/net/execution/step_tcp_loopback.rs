@@ -360,6 +360,7 @@ fn connecting_endpoints(protocol: &SocketProtocol) -> Result<(IpEndpoint, IpEndp
         SocketProtocol::Tcp(TcpState::Connected { .. }) => Err(Errno::EISCONN),
         SocketProtocol::Tcp(_) => Err(Errno::EINVAL),
         SocketProtocol::UnixDatagram
+        | SocketProtocol::UnixStream
         | SocketProtocol::Udp(_)
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)
@@ -373,6 +374,7 @@ fn connected_endpoints(protocol: &SocketProtocol) -> Result<(IpEndpoint, IpEndpo
         SocketProtocol::Tcp(TcpState::Connected { local, remote }) => Ok((*local, *remote)),
         SocketProtocol::Tcp(_) => Err(Errno::ENOTCONN),
         SocketProtocol::UnixDatagram
+        | SocketProtocol::UnixStream
         | SocketProtocol::Udp(_)
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)

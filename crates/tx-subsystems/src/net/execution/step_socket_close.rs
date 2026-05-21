@@ -50,8 +50,6 @@ pub fn step_socket_close(
             }
             bindings_withdrawn +=
                 withdraw_ok(table.withdraw_tcp_connection(ConnectionKey::new(local, remote)));
-            bindings_withdrawn +=
-                withdraw_ok(table.withdraw_tcp_connection(ConnectionKey::new(remote, local)));
             bindings_withdrawn += withdraw_ok(table.withdraw_tcp_bound(local));
         }
         SocketProtocol::Tcp(TcpState::Init | TcpState::Closed) => {}
@@ -67,7 +65,7 @@ pub fn step_socket_close(
         SocketProtocol::RawIcmp(_) => {
             bindings_withdrawn += withdraw_ok(table.withdraw_raw_icmp(socket.raw()));
         }
-        SocketProtocol::UnixDatagram => {}
+        SocketProtocol::UnixDatagram | SocketProtocol::UnixStream => {}
         SocketProtocol::NetlinkRoute(_)
         | SocketProtocol::NetlinkNetfilter(_)
         | SocketProtocol::Packet(_) => {}

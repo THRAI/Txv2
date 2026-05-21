@@ -133,6 +133,10 @@ fn any_inet(port: u16) -> KernelSockAddr {
     KernelSockAddr::V4(SockAddrIn::new(port, Ipv4Address::UNSPECIFIED))
 }
 
+fn inet_addr(port: u16, addr: Ipv4Address) -> KernelSockAddr {
+    KernelSockAddr::V4(SockAddrIn::new(port, addr))
+}
+
 fn endpoint(port: u16) -> IpEndpoint {
     IpEndpoint::new(Ipv4Address::LOOPBACK, port)
 }
@@ -343,6 +347,7 @@ fn endpoint_orders_by_addr_and_port() {
 #[test]
 fn socket_type_validation_maps_to_kind() {
     let unix_dgram = ValidSocketType::validate(1, 2, 0).expect("unix dgram socket");
+    let unix_stream = ValidSocketType::validate(1, 1, 0).expect("unix stream socket");
     let stream = ValidSocketType::validate(2, 1, 6).expect("tcp socket");
     let dgram = ValidSocketType::validate(2, 2, 17).expect("udp socket");
     let dgram_icmp = ValidSocketType::validate(2, 2, 1).expect("ping socket");
@@ -355,6 +360,10 @@ fn socket_type_validation_maps_to_kind() {
     assert_eq!(
         SocketKind::from_valid_socket_type(unix_dgram),
         Ok(SocketKind::UnixDatagram)
+    );
+    assert_eq!(
+        SocketKind::from_valid_socket_type(unix_stream),
+        Ok(SocketKind::UnixStream)
     );
     assert_eq!(stream.sock_type, SocketType::Stream);
     assert_eq!(
@@ -392,9 +401,16 @@ fn socket_type_validation_maps_to_kind() {
         ValidSocketType::validate(99, 1, 0),
         Err(Errno::EAFNOSUPPORT)
     );
+    assert_eq!(ValidSocketType::validate(2, 999, 0), Err(Errno::EINVAL));
+    let udp_stream = ValidSocketType::validate(2, 1, 17).expect("valid raw socket tuple");
     assert_eq!(
-        ValidSocketType::validate(2, 999, 0),
-        Err(Errno::ESOCKTNOSUPPORT)
+        SocketKind::from_valid_socket_type(udp_stream),
+        Err(Errno::EPROTONOSUPPORT)
+    );
+    let raw_default = ValidSocketType::validate(2, 3, 0).expect("valid raw socket tuple");
+    assert_eq!(
+        SocketKind::from_valid_socket_type(raw_default),
+        Err(Errno::EPROTONOSUPPORT)
     );
 }
 
@@ -453,12 +469,15 @@ fn raw_icmp_bind_records_local_addr_without_port() {
 
 #[test]
 fn send_recv_flags_validate_mask() {
-    let flags =
-        SendRecvFlags::validate((SendRecvFlags::MSG_DONTWAIT | SendRecvFlags::MSG_PEEK).bits())
-            .expect("known flags");
+    let flags = SendRecvFlags::validate(
+        (SendRecvFlags::MSG_DONTWAIT | SendRecvFlags::MSG_PEEK | SendRecvFlags::MSG_ERRQUEUE)
+            .bits(),
+    )
+    .expect("known flags");
 
     assert!(flags.is_nonblocking());
     assert!(flags.contains(SendRecvFlags::MSG_PEEK));
+    assert!(flags.contains(SendRecvFlags::MSG_ERRQUEUE));
     assert!(SendRecvFlags::empty().is_empty());
     assert_eq!(SendRecvFlags::validate(0x4000_0000), Err(Errno::EINVAL));
 }
@@ -534,6 +553,7 @@ fn socket_payload_initial_protocol_matches_kind() {
     match tcp_payload.protocol_snapshot() {
         SocketProtocol::Tcp(state) => assert_eq!(state, TcpState::Init),
         SocketProtocol::UnixDatagram
+        | SocketProtocol::UnixStream
         | SocketProtocol::Udp(_)
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)
@@ -543,6 +563,7 @@ fn socket_payload_initial_protocol_matches_kind() {
     match udp_payload.protocol_snapshot() {
         SocketProtocol::Udp(inner) => assert_eq!(inner, UdpInner::Unbound),
         SocketProtocol::UnixDatagram
+        | SocketProtocol::UnixStream
         | SocketProtocol::Tcp(_)
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)
@@ -842,7 +863,7 @@ fn socket_create_facade_validates_raw_args_and_preserves_flags() {
     ));
     assert!(matches!(
         socket_create_facade(2, 999, 0, &guard),
-        StepOutcome::Err(Errno::ESOCKTNOSUPPORT)
+        StepOutcome::Err(Errno::EINVAL)
     ));
 }
 
@@ -931,6 +952,68 @@ fn execution_bind_rejects_duplicate_local_endpoint() {
     assert_eq!(step_bind(&first, local, &guard), StepOutcome::Done(()));
     assert_eq!(
         step_bind(&second, local, &guard),
+        StepOutcome::Err(Errno::EADDRINUSE)
+    );
+}
+
+#[test]
+fn execution_bind_rejects_nonlocal_ipv4_address() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let tcp = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("tcp socket");
+    let udp = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("udp socket");
+    let nonlocal = Ipv4Address::new([10, 255, 254, 253]);
+
+    assert_eq!(
+        step_bind(&tcp, inet_addr(40_198, nonlocal), &guard),
+        StepOutcome::Err(Errno::EADDRNOTAVAIL)
+    );
+    assert_eq!(
+        step_bind(&udp, inet_addr(40_199, nonlocal), &guard),
+        StepOutcome::Err(Errno::EADDRNOTAVAIL)
+    );
+    assert_eq!(
+        step_bind(&tcp, any_inet(40_198), &guard),
+        StepOutcome::Done(())
+    );
+}
+
+#[test]
+fn execution_tcp_bind_rejects_wildcard_exact_port_overlap() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let wildcard = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("wildcard tcp");
+    let exact = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("exact tcp");
+    let port = 40_196;
+
+    assert_eq!(
+        step_bind(&wildcard, any_inet(port), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_bind(&exact, inet(port), &guard),
         StepOutcome::Err(Errno::EADDRINUSE)
     );
 }
@@ -1037,13 +1120,15 @@ fn socket_table_listener_lookup_prefers_exact_over_wildcard() {
     .expect("exact listener");
     let port = 40_121;
 
-    assert_eq!(
-        step_bind(&wildcard, any_inet(port), &guard),
-        StepOutcome::Done(())
-    );
-    assert_eq!(step_listen(&wildcard, 8, &guard), StepOutcome::Done(()));
-    assert_eq!(step_bind(&exact, inet(port), &guard), StepOutcome::Done(()));
-    assert_eq!(step_listen(&exact, 8, &guard), StepOutcome::Done(()));
+    SOCKET_TABLE
+        .listen_tcp(
+            IpEndpoint::new(Ipv4Address::UNSPECIFIED, port),
+            wildcard.clone(),
+        )
+        .expect("wildcard listener insert");
+    SOCKET_TABLE
+        .listen_tcp(IpEndpoint::new(Ipv4Address::LOOPBACK, port), exact.clone())
+        .expect("exact listener insert");
 
     let found = SOCKET_TABLE
         .lookup_tcp_listener_addr(Ipv4Address::LOOPBACK, port, &guard)
@@ -1492,6 +1577,26 @@ fn step_recv_blocks_when_no_data() {
 }
 
 #[test]
+fn step_recv_broken_without_buffered_data_returns_eof() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let tcp = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("tcp socket");
+    tcp.readiness.fire_recv(RecvWireSet::BROKEN);
+
+    assert_eq!(
+        step_recv(&tcp, 32, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(0)
+    );
+}
+
+#[test]
 fn step_recv_peek_does_not_consume_or_clear() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -1513,6 +1618,29 @@ fn step_recv_peek_does_not_consume_or_clear() {
     );
     assert_eq!(payload.io_snapshot().recv_len, 16);
     assert!(tcp.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0);
+}
+
+#[test]
+fn step_recv_errqueue_without_error_returns_eagain() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let tcp = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("tcp socket");
+    let payload = tcp.acquire_operational().expect("payload");
+    assert!(payload.record_recv_payload(endpoint(50_137), endpoint(40_137), std::vec![0u8; 16]));
+    tcp.readiness.fire_recv(RecvWireSet::HAS_DATA);
+
+    assert_eq!(
+        step_recv(&tcp, 8, SendRecvFlags::MSG_ERRQUEUE, &guard),
+        StepOutcome::Err(Errno::EAGAIN)
+    );
+    assert_eq!(payload.io_snapshot().recv_len, 16);
 }
 
 #[test]
@@ -1568,6 +1696,104 @@ fn step_send_blocks_when_no_space() {
     assert_eq!(
         wait.interest(),
         SendWireSet::SPACE.bits() | SendWireSet::BROKEN.bits()
+    );
+}
+
+#[test]
+fn step_send_oob_is_not_supported() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let udp = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("udp socket");
+    assert_eq!(step_bind(&udp, inet(40_200), &guard), StepOutcome::Done(()));
+
+    assert_eq!(
+        step_send(&udp, 1, SendRecvFlags::MSG_OOB, &guard),
+        StepOutcome::Err(Errno::EOPNOTSUPP)
+    );
+}
+
+#[test]
+fn step_send_udp_datagram_too_large_returns_emsgsize() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let udp = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("udp socket");
+    assert_eq!(step_bind(&udp, inet(40_201), &guard), StepOutcome::Done(()));
+
+    assert_eq!(
+        step_send_kernel_bytes(&udp, &std::vec![0; 65_508], SendRecvFlags::empty(), &guard),
+        StepOutcome::Err(Errno::EMSGSIZE)
+    );
+}
+
+#[test]
+fn step_send_udp_loopback_oob_is_not_supported() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let udp = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("udp socket");
+    assert_eq!(step_bind(&udp, inet(40_206), &guard), StepOutcome::Done(()));
+
+    assert_eq!(
+        step_send_udp_loopback_kernel_bytes(
+            &udp,
+            Some(endpoint(50_206)),
+            b"x",
+            SendRecvFlags::MSG_OOB,
+            &guard
+        ),
+        StepOutcome::Err(Errno::EOPNOTSUPP)
+    );
+}
+
+#[test]
+fn step_sendto_connected_tcp_ignores_destination_argument() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let tcp = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("tcp socket");
+    let payload = tcp.acquire_operational().expect("payload");
+    payload.with_protocol_mut(|protocol| {
+        *protocol = SocketProtocol::Tcp(TcpState::Connected {
+            local: endpoint(40_202),
+            remote: endpoint(50_202),
+        });
+    });
+
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &tcp,
+            Some(IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0)),
+            b"x",
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(1)
     );
 }
 

@@ -57,6 +57,9 @@ impl SocketPayload {
                 SocketKind::UnixDatagram => {
                     (SocketProtocol::UnixDatagram, None, None, None, None, None)
                 }
+                SocketKind::UnixStream => {
+                    (SocketProtocol::UnixStream, None, None, None, None, None)
+                }
                 SocketKind::Tcp => (
                     SocketProtocol::Tcp(TcpState::Init),
                     Some(RawTcpSocket::new(&options)),
@@ -385,15 +388,10 @@ impl SocketPayload {
         bytes: &[u8],
     ) -> Result<Option<SocketSendReserve>, crate::execution::Errno> {
         let (bytes, became_full) = match (&self.raw_tcp, &self.raw_udp, &self.raw_icmp) {
-            (Some(raw_tcp), None, None) => {
-                if dst.is_some() {
-                    return Err(crate::execution::Errno::EISCONN);
-                }
-                match raw_tcp.enqueue_tx_bytes(bytes) {
-                    Some(reserve) => reserve,
-                    None => return Ok(None),
-                }
-            }
+            (Some(raw_tcp), None, None) => match raw_tcp.enqueue_tx_bytes(bytes) {
+                Some(reserve) => reserve,
+                None => return Ok(None),
+            },
             (None, Some(raw_udp), None) => {
                 let dst = match dst.or_else(|| self.udp_connected_remote()) {
                     Some(dst) => dst,
@@ -946,6 +944,7 @@ pub(crate) struct ShutdownMark {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SocketProtocol {
     UnixDatagram,
+    UnixStream,
     Tcp(TcpState),
     Udp(UdpInner),
     RawIcmp(RawIcmpState),

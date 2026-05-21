@@ -29,11 +29,14 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
     }
 
     payload.with_protocol(|protocol| match protocol {
-        SocketProtocol::Tcp(TcpState::Listening { .. })
-            if witness.identity.readiness.accept_wq.peek() & AcceptWireSet::HAS_PENDING.bits()
-                != 0 =>
-        {
-            mask |= PollMask::IN;
+        SocketProtocol::Tcp(TcpState::Listening { .. }) => {
+            let io = payload.io_snapshot();
+            if io.accept_pending > 0
+                || witness.identity.readiness.accept_wq.peek() & AcceptWireSet::HAS_PENDING.bits()
+                    != 0
+            {
+                mask |= PollMask::IN;
+            }
         }
         SocketProtocol::Tcp(TcpState::Connected { .. }) => {
             let io = payload.io_snapshot();

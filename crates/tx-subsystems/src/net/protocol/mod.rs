@@ -26,4 +26,4 @@ pub use smoltcp_adapter::{
     SmoltcpAdapter, SmoltcpAdapterConfig, SmoltcpPacketSource, SmoltcpPacketTxSink,
 };
 pub use tcp::{RawTcpSocket, SmoltcpTcpSegment};
-pub use udp::{RawUdpSocket, UdpRxDatagram, UdpTxDatagram};
+pub use udp::{RawUdpSocket, UdpRxDatagram, UdpTxDatagram, UDP_IPV4_MAX_PAYLOAD_BYTES};

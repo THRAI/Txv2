@@ -214,6 +214,10 @@ fn setup() -> TestSetup {
     reset_init_process();
     reset_reactor_affinity_seam();
     reset_uts_nodename_for_test();
+    tx_subsystems::net::reset_initial_net_namespace_for_test();
+    tx_subsystems::net::initial_loopback_iface().clear_for_test_or_bootstrap();
+    tx_subsystems::net::device::reset_net_registry_for_test();
+    tx_subsystems::net::reset_netfilter_for_test();
     super::reset_itimer_registry_for_test();
     super::reset_sigaction_restorers_for_test();
     TestSetup { _lock: lock }

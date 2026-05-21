@@ -1132,7 +1132,7 @@ fn net_delegate_reactor_timer_adapter_fires_tick_and_drives_retransmit() {
     crate::net::delegate::net_delegate_clear(
         crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
     );
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let timer_channel = reactor.channel();
     reactor.submit(async move {
         assert_eq!(
@@ -1509,6 +1509,129 @@ fn tcp_socket_close_flushes_queued_bytes_to_peer_before_eof() {
         step_send_kernel_bytes(&accepted, b"x", SendRecvFlags::empty(), &guard),
         StepOutcome::Err(Errno::EPIPE)
     );
+}
+
+#[test]
+fn tcp_loopback_listener_accepts_after_clients_close_without_draining() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let listener = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("listener");
+    assert_eq!(
+        step_bind(&listener, inet(40_203), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(step_listen(&listener, 8, &guard), StepOutcome::Done(()));
+
+    for client_port in [50_203, 50_204, 50_205] {
+        let client = registry::create_socket_for_test_or_bootstrap(
+            SocketKind::Tcp,
+            SocketOptionSet::default_tcp(),
+        )
+        .expect("client");
+        assert_eq!(
+            step_bind(&client, inet(client_port), &guard),
+            StepOutcome::Done(())
+        );
+        assert!(matches!(
+            step_connect(&client, inet(40_203), &guard),
+            StepOutcome::Yield {
+                shape: YieldShape::OnWaitSource { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            step_tcp_loopback_handshake(&client, &guard),
+            StepOutcome::Done(_)
+        ));
+
+        let accepted = match step_accept(&listener, &guard) {
+            StepOutcome::Done(accepted) => accepted.child,
+            _ => panic!("expected accepted child"),
+        };
+        assert_eq!(
+            step_send_kernel_bytes(&accepted, b"hoser\n", SendRecvFlags::empty(), &guard),
+            StepOutcome::Done(6)
+        );
+        let transfer = match step_tcp_loopback_transfer(&accepted, 6, &guard) {
+            StepOutcome::Done(transfer) => transfer,
+            _ => panic!("unexpected transfer outcome"),
+        };
+        assert_eq!(transfer.bytes_moved, 6);
+        assert!(matches!(
+            step_poll_ready(&accepted, &guard),
+            StepOutcome::Done(mask) if !mask.intersects(PollMask::IN | PollMask::RDHUP)
+        ));
+        assert!(matches!(
+            step_poll_ready(&client, &guard),
+            StepOutcome::Done(mask) if mask.intersects(PollMask::IN)
+        ));
+
+        assert!(matches!(
+            step_socket_close(&client, &guard),
+            StepOutcome::Done(_)
+        ));
+        assert!(matches!(
+            step_poll_ready(&accepted, &guard),
+            StepOutcome::Done(mask) if mask.intersects(PollMask::IN | PollMask::RDHUP)
+        ));
+        assert_eq!(
+            step_recv(&accepted, 1024, SendRecvFlags::empty(), &guard),
+            StepOutcome::Done(0)
+        );
+        assert!(matches!(
+            step_socket_close(&accepted, &guard),
+            StepOutcome::Done(_)
+        ));
+    }
+}
+
+#[test]
+fn tcp_listener_poll_ready_uses_accept_queue_level() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client, listener, _local, _remote) = prepare_loopback_connect(40_204, 50_206);
+    let guard = tx_substrate::epoch::guard();
+
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let payload = listener.acquire_operational().expect("listener payload");
+    assert_eq!(payload.io_snapshot().accept_pending, 1);
+    listener.readiness.clear_accept(AcceptWireSet::HAS_PENDING);
+
+    assert!(matches!(
+        step_poll_ready(&listener, &guard),
+        StepOutcome::Done(mask) if mask.intersects(PollMask::IN)
+    ));
+}
+
+#[test]
+fn tcp_loopback_handshake_does_not_mark_client_readable_without_data() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client, _listener, _local, _remote) = prepare_loopback_connect(40_205, 50_207);
+    let guard = tx_substrate::epoch::guard();
+
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    assert!(matches!(
+        step_poll_ready(&client, &guard),
+        StepOutcome::Done(mask) if !mask.intersects(PollMask::IN | PollMask::RDHUP)
+    ));
 }
 
 #[test]

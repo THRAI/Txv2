@@ -1391,6 +1391,16 @@ mod tests {
     }
 
     #[test]
+    fn procfs_meminfo_includes_ltp_required_fields() {
+        let meminfo = read::render_meminfo();
+        assert!(meminfo.contains("MemTotal:"));
+        assert!(meminfo.contains("MemFree:"));
+        assert!(meminfo.contains("MemAvailable:"));
+        assert!(meminfo.contains("Cached:"));
+        assert!(meminfo.contains("SwapFree:"));
+    }
+
+    #[test]
     fn procfs_net_route_renders_initial_namespace_routes() {
         let _setup = setup();
         let guard = adapter::step_engine::guard();

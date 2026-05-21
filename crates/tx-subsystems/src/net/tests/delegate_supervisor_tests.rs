@@ -42,7 +42,7 @@ fn net_delegate_supervisor_timer_wake_fires_tick_for_current_generation() {
     let arm = supervisor
         .refresh_deadline(Some(smoltcp::time::Instant::from_millis(3)))
         .expect("timer arm");
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
     let timer_channel = reactor.channel();
     reactor.submit(async move {
         let wake = net_delegate_wait_supervised_deadline(timer_channel, arm).await;

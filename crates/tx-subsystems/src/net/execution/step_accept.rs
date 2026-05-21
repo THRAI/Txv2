@@ -3,7 +3,7 @@ use tx_substrate::zone::Cap;
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_accept_target;
 use crate::net::execution::{socket_accept_wait_token, yield_on_token};
-use crate::net::structure::{AcceptWireSet, IpEndpoint, SocketIdentity};
+use crate::net::structure::{AcceptWireSet, IpEndpoint, SocketIdentity, SocketProtocol, TcpState};
 
 #[derive(Clone)]
 pub struct SocketAcceptOutcome {
@@ -32,6 +32,16 @@ pub fn step_accept(
 
     if pop.became_empty {
         socket.readiness.clear_accept(AcceptWireSet::HAS_PENDING);
+    }
+    if let Some(child_payload) = pop.entry.child.acquire_operational() {
+        child_payload.with_protocol_mut(|protocol| {
+            if matches!(protocol, SocketProtocol::Tcp(TcpState::Connecting { .. })) {
+                *protocol = SocketProtocol::Tcp(TcpState::Connected {
+                    local: pop.entry.local,
+                    remote: pop.entry.peer,
+                });
+            }
+        });
     }
 
     StepOutcome::Done(SocketAcceptOutcome {

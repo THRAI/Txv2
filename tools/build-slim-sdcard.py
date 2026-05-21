@@ -188,7 +188,8 @@ SUITE_DEFS = {
         "case_dir": "ltp/testcases/bin",
         # When cases specified: extract these infrastructure items instead of
         # the full ltp/ tree
-        "infra_dirs": ["ltp/bin", "ltp/libkirk", "ltp/metadata",
+        "infra_dirs": ["lib",
+                        "ltp/bin", "ltp/libkirk", "ltp/metadata",
                         "ltp/runtest", "ltp/scenario_groups",
                         "ltp/testscripts", "ltp/testcases/data"],
         "infra_files": ["ltp/kirk", "ltp/runltp-ng", "ltp/ltx",

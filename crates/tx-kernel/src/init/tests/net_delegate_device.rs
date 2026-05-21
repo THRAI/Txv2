@@ -25,6 +25,7 @@ const CLIENT_PORT: u16 = 55_143;
 fn boot_net_runtime_delivers_virtio_rx_udp_to_socket() {
     let _serial = setup();
     CoreInit::<TestPlatform>::init_boot_reactor_for_test();
+    assert!(CoreInit::<TestPlatform>::init_boot_net_runtime_for_test());
     net_delegate_clear(DelegateWireSet::POLL | DelegateWireSet::TICK);
 
     let server = {
@@ -101,6 +102,7 @@ fn boot_net_runtime_delivers_virtio_rx_udp_to_socket() {
 fn boot_net_runtime_transmits_udp_socket_tx_to_virtio_device() {
     let _serial = setup();
     CoreInit::<TestPlatform>::init_boot_reactor_for_test();
+    assert!(CoreInit::<TestPlatform>::init_boot_net_runtime_for_test());
     net_delegate_clear(DelegateWireSet::POLL | DelegateWireSet::TICK);
 
     let client = {

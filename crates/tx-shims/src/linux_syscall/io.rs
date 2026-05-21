@@ -603,6 +603,7 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
         PselectTimeout::Infinite | PselectTimeout::Poll => None,
     };
     let word_count = fdset_word_count(nfds);
+    let mut yielded_before_wait = false;
     let (read_ready, write_ready, except_ready, ready_count) = loop {
         drive_loopback_pending();
         if let Some(deadline_ns) = timeout_deadline_ns {
@@ -621,7 +622,6 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
         let mut ready_count: i64 = 0;
         let mut wait_token = None;
         let mut wait_token_is_socket = false;
-        let mut read_interest_count = 0usize;
 
         for fd in 0..nfds {
             let want_read = match fdset_contains(ctx, readfds, fd) {
@@ -638,9 +638,6 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
             };
             if !want_read && !want_write && !want_except {
                 continue;
-            }
-            if want_read {
-                read_interest_count += 1;
             }
             let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
                 return SyscallResult::Error(EBADF_VALUE);
@@ -792,7 +789,11 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
         if ready_count != 0 || timeout == PselectTimeout::Poll {
             break (read_ready, write_ready, except_ready, ready_count);
         }
-        if read_interest_count > 1 {
+        // Socket peers often make progress in another userspace task after this
+        // scan. Give that task one turn before parking on the selected token,
+        // then rescan so level-triggered readiness is observed directly.
+        if !yielded_before_wait && wait_token.is_some() {
+            yielded_before_wait = true;
             tx_reactor::yield_now().await;
             continue;
         }
@@ -1648,7 +1649,6 @@ async fn sys_write_socket(
             tx_substrate::step::StepOutcome::Done(written) => {
                 total += written;
                 drive_tcp_loopback_after_socket_write(&socket, written);
-                tx_reactor::yield_now().await;
                 return SyscallResult::Return(total as i64);
             }
             tx_substrate::step::StepOutcome::Continue { progress } => {
@@ -1657,7 +1657,6 @@ async fn sys_write_socket(
                 drive_tcp_loopback_after_socket_write(&socket, written);
                 let stop = written == 0 || written >= remaining.len();
                 if stop {
-                    tx_reactor::yield_now().await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[written..];
@@ -1668,7 +1667,6 @@ async fn sys_write_socket(
                     total += written;
                     drive_tcp_loopback_after_socket_write(&socket, written);
                     if written >= remaining.len() {
-                        tx_reactor::yield_now().await;
                         return SyscallResult::Return(total as i64);
                     }
                     remaining = &remaining[written..];
