@@ -1,6 +1,7 @@
 use super::*;
 use crate::net::step_socket_close;
 use crate::net::structure::SocketIdentity;
+use crate::net::SocketRecvBytesOutcome;
 use tx_substrate::zone::Cap;
 
 struct LoopbackDelegateDriver<'a> {
@@ -332,6 +333,85 @@ fn udp_loopback_direct_send_kernel_bytes_reaches_receiver() {
             .recv_len,
         1
     );
+}
+
+#[test]
+fn udp_loopback_msg_more_defers_until_uncork_send() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    let guard = tx_substrate::epoch::guard();
+    let server = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("server udp");
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("client udp");
+
+    assert_eq!(
+        step_bind(&server, any_inet(40_208), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_bind(&client, inet(50_208), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_udp_loopback_kernel_bytes(
+            &client,
+            Some(endpoint(40_208)),
+            b"hello",
+            SendRecvFlags::MSG_MORE,
+            &guard,
+        ),
+        StepOutcome::Done(5)
+    );
+    assert_eq!(
+        server
+            .acquire_operational()
+            .expect("server payload")
+            .io_snapshot()
+            .recv_len,
+        0
+    );
+
+    assert_eq!(
+        step_send_udp_loopback_kernel_bytes(
+            &client,
+            Some(endpoint(40_208)),
+            b"!",
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(1)
+    );
+    assert_eq!(
+        server
+            .acquire_operational()
+            .expect("server payload")
+            .io_snapshot()
+            .recv_len,
+        6
+    );
+    let mut out = [0u8; 8];
+    assert_eq!(
+        step_recv_kernel_bytes(&server, &mut out, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(SocketRecvBytesOutcome {
+            bytes: 6,
+            source: Some(endpoint(50_208)),
+            unix_source: None,
+            destination: Some(IpEndpoint::new(Ipv4Address::LOOPBACK, 40_208)),
+            truncated: false,
+            became_empty: true,
+        })
+    );
+    assert_eq!(&out[..6], b"hello!");
 }
 
 #[test]

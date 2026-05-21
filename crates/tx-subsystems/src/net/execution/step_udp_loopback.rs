@@ -128,7 +128,8 @@ pub fn step_send_udp_loopback_kernel_bytes_on_iface(
     if source_payload.shutdown_wr() {
         return tx_substrate::step::StepOutcome::Err(Errno::EPIPE);
     }
-    if bytes.len() > UDP_IPV4_MAX_PAYLOAD_BYTES {
+    let total_payload_len = source_payload.udp_corked_send_len() + bytes.len();
+    if total_payload_len > UDP_IPV4_MAX_PAYLOAD_BYTES {
         return tx_substrate::step::StepOutcome::Err(Errno::EMSGSIZE);
     }
     if bytes.is_empty() {
@@ -145,43 +146,56 @@ pub fn step_send_udp_loopback_kernel_bytes_on_iface(
     {
         return tx_substrate::step::StepOutcome::Err(Errno::EOPNOTSUPP);
     }
-    if bytes.len()
-        > source_payload
-            .raw_udp_socket()
-            .map(|raw_udp| raw_udp.send_available())
-            .unwrap_or(0)
-    {
+    if total_payload_len + 28 > usize::from(iface.mtu()) {
+        return tx_substrate::step::StepOutcome::Err(Errno::EMSGSIZE);
+    }
+    let reserve =
+        match source_payload.reserve_send_bytes_to_with_flags(Some(destination), bytes, flags) {
+            Ok(Some(reserve)) => reserve,
+            Ok(None) => {
+                socket.readiness.clear_send(SendWireSet::SPACE);
+                return yield_bytes_on_token(
+                    tx_substrate::step::ByteProgress::EMPTY,
+                    socket_send_wait_token(socket),
+                );
+            }
+            Err(errno) => return tx_substrate::step::StepOutcome::Err(errno),
+        };
+    if reserve.became_full {
         socket.readiness.clear_send(SendWireSet::SPACE);
-        return yield_bytes_on_token(
-            tx_substrate::step::ByteProgress::EMPTY,
-            socket_send_wait_token(socket),
-        );
+    }
+    if flags.contains(SendRecvFlags::MSG_MORE) {
+        return tx_substrate::step::StepOutcome::Done(reserve.bytes);
     }
 
     let source = loopback_udp_source(local, destination, iface);
     if source.port == 0 || destination.port == 0 {
         return tx_substrate::step::StepOutcome::Err(Errno::EINVAL);
     }
-    if bytes.len() + 28 > usize::from(iface.mtu()) {
-        return tx_substrate::step::StepOutcome::Err(Errno::EMSGSIZE);
-    }
 
-    let Some(target) = source_payload
-        .socket_table()
-        .lookup_udp_ingress(source, destination, guard)
+    let Some(drain) = source_payload.commit_udp_tx_datagram_sent() else {
+        return tx_substrate::step::StepOutcome::Done(reserve.bytes);
+    };
+    let Some(target) =
+        source_payload
+            .socket_table()
+            .lookup_udp_ingress(source, drain.datagram.dst, guard)
     else {
-        return tx_substrate::step::StepOutcome::Done(bytes.len());
+        return tx_substrate::step::StepOutcome::Done(reserve.bytes);
     };
     let Some(target_payload) = target.acquire_operational() else {
-        return tx_substrate::step::StepOutcome::Done(bytes.len());
+        return tx_substrate::step::StepOutcome::Done(reserve.bytes);
     };
 
-    if target_payload.record_recv_payload(source, destination, bytes.to_vec()) {
+    if target_payload.record_recv_payload(source, drain.datagram.dst, drain.datagram.payload) {
         target
             .readiness
             .fire_recv(crate::net::structure::RecvWireSet::HAS_DATA);
     }
-    tx_substrate::step::StepOutcome::Done(bytes.len())
+    if drain.became_available {
+        socket.readiness.fire_send(SendWireSet::SPACE);
+    }
+    tx_substrate::step::StepOutcome::Done(reserve.bytes)
 }
 
 fn udp_loopback_endpoints(

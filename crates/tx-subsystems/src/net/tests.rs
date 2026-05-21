@@ -1816,6 +1816,31 @@ fn raw_udp_send_queue_preserves_datagram_atomicity() {
 }
 
 #[test]
+fn raw_udp_msg_more_corks_until_uncork_send() {
+    let mut options = SocketOptionSet::default_udp();
+    options.socket.send_buf_size = 8;
+    let udp = RawUdpSocket::new(&options);
+    let dst = IpEndpoint::new(Ipv4Address::LOOPBACK, 40_139);
+
+    assert_eq!(
+        udp.enqueue_tx_bytes_to_with_more(dst, b"12345", true),
+        Some((5, false))
+    );
+    assert_eq!(udp.send_available(), 3);
+    assert!(udp.pop_tx_datagram().is_none());
+
+    assert_eq!(
+        udp.enqueue_tx_bytes_to_with_more(dst, b"67", false),
+        Some((2, false))
+    );
+    let drain = udp.pop_tx_datagram().expect("uncorked datagram");
+    assert_eq!(drain.datagram.dst, dst);
+    assert_eq!(drain.datagram.payload, b"1234567");
+    assert!(drain.became_available);
+    assert_eq!(udp.send_available(), 8);
+}
+
+#[test]
 fn raw_udp_recv_queue_drops_when_datagram_would_not_fit() {
     let mut options = SocketOptionSet::default_udp();
     options.socket.recv_buf_size = 8;
