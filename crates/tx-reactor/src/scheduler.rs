@@ -1355,7 +1355,11 @@ impl Phase1Scheduler {
 }
 
 fn normalize_affinity(affinity: u64) -> u64 {
-    if affinity == 0 { 1 } else { affinity }
+    if affinity == 0 {
+        1
+    } else {
+        affinity
+    }
 }
 
 fn first_hart_in_mask(mask: u64) -> HartId {

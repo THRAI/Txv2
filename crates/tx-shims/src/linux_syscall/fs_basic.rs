@@ -4,7 +4,51 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMutex, StepOutcome};
+use alloc::collections::BTreeMap;
+use tx_subsystems::vfs::FsObjectId;
+
+static STAT_META_OVERRIDES: SpinMutex<BTreeMap<FsObjectId, InodeMeta>> =
+    SpinMutex::new(BTreeMap::new());
+
+pub(super) fn record_stat_meta_override(fs_object_id: FsObjectId, meta: InodeMeta) {
+    STAT_META_OVERRIDES.lock().insert(fs_object_id, meta);
+}
+
+pub(super) fn stat_meta_override_or(fs_object_id: FsObjectId, fallback: InodeMeta) -> InodeMeta {
+    STAT_META_OVERRIDES
+        .lock()
+        .get(&fs_object_id)
+        .copied()
+        .unwrap_or(fallback)
+}
+
+fn apply_stat_meta_override(fs_object_id: FsObjectId, meta: &mut InodeMeta) {
+    *meta = stat_meta_override_or(fs_object_id, *meta);
+}
+
+fn allocate_fd_under_limit<'a>(ctx: &SyscallCtx<'a>) -> Result<u32, SyscallResult> {
+    let fd = ctx.process.allocate_fd();
+    let (soft_limit, _) = ctx.process.rlimit_nofile();
+    if fd >= soft_limit {
+        Err(SyscallResult::Error(EMFILE_VALUE))
+    } else {
+        Ok(fd)
+    }
+}
+
+fn allocate_fd_at_least_under_limit<'a>(
+    ctx: &SyscallCtx<'a>,
+    min: u32,
+) -> Result<u32, SyscallResult> {
+    let fd = ctx.process.allocate_fd_at_least(min);
+    let (soft_limit, _) = ctx.process.rlimit_nofile();
+    if fd >= soft_limit {
+        Err(SyscallResult::Error(EMFILE_VALUE))
+    } else {
+        Ok(fd)
+    }
+}
 
 /// `fcntl(fd, cmd, arg)` per the Wave 2 ELF-loader plan §"Part 2 —
 /// Per-fd CLOEXEC bitmap + fcntl(F_SETFD) + O_CLOEXEC" plus Slice 7 of
@@ -60,6 +104,13 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
+            let (soft_limit, _) = ctx.process.rlimit_nofile();
+            if arg > u32::MAX as u64 || arg as u32 >= soft_limit {
+                return SyscallResult::Error(EINVAL_VALUE);
+            }
+            if let Err(err) = allocate_fd_at_least_under_limit(ctx, arg as u32) {
+                return err;
+            }
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = FcntlDupFdOp {
                 process: ctx.process.clone(),
@@ -243,7 +294,10 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
                 return SyscallResult::error_from(Errno::from(v3errno));
             }
         };
-        let fd = ctx.process.allocate_fd();
+        let fd = match allocate_fd_under_limit(ctx) {
+            Ok(fd) => fd,
+            Err(err) => return err,
+        };
         let _ = ctx.process.set_fd(fd, Some(openfile));
         if want_cloexec {
             ctx.process.set_fd_cloexec(fd, true);
@@ -354,7 +408,10 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // Step 4: install at the lowest unused fd ≥ 0. Per fd-ops Wave 1
     // the fd table is a sparse `BTreeMap<u32, Cap<OpenFile>>`;
     // `allocate_fd()` scans for the lowest unused key.
-    let fd = ctx.process.allocate_fd();
+    let fd = match allocate_fd_under_limit(ctx) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
     let _ = ctx.process.set_fd(fd, Some(openfile));
     if want_cloexec {
         ctx.process.set_fd_cloexec(fd, true);
@@ -401,6 +458,12 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// (we clone the `Cap<OpenFile>`); both fds reference the same
 /// epoch-managed identity.
 pub(super) fn sys_dup<'a>(oldfd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if ctx.process.fd(oldfd).is_none() {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if let Err(err) = allocate_fd_under_limit(ctx) {
+        return err;
+    }
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = DupOp {
         process: ctx.process.clone(),
@@ -434,6 +497,10 @@ pub(super) fn sys_dup3<'a>(
     flags: u32,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
+    let (soft_limit, _) = ctx.process.rlimit_nofile();
+    if newfd >= soft_limit {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = Dup3Op {
         process: ctx.process.clone(),
@@ -506,9 +573,18 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
     // reader first so on a fresh process it lands at 0 and the
     // writer at 1, matching Linux's user-visible (3, 4) pattern
     // post-stdin/out/err.
-    let reader_fd = ctx.process.allocate_fd();
+    let reader_fd = match allocate_fd_under_limit(ctx) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
     let _ = ctx.process.install_fd(reader_fd, reader_cap);
-    let writer_fd = ctx.process.allocate_fd();
+    let writer_fd = match allocate_fd_under_limit(ctx) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let _ = ctx.process.set_fd(reader_fd, None);
+            return err;
+        }
+    };
     let _ = ctx.process.install_fd(writer_fd, writer_cap);
 
     if pipe_flags.cloexec {
@@ -1002,6 +1078,7 @@ fn stat_meta_for_open_file(file: &Cap<OpenFile>) -> InodeMeta {
     {
         meta.size = sz;
     }
+    apply_stat_meta_override(fs_object_id, &mut meta);
     meta
 }
 
@@ -1097,7 +1174,7 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         Some(d) => d,
         None => return SyscallResult::Error(ENOENT_VALUE),
     };
-    let (statx_result, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
+    let (mut statx_result, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
         if dirfd == AT_FDCWD {
             (
                 StatxResult {
@@ -1143,6 +1220,7 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         }
     };
 
+    apply_stat_meta_override(ino, &mut statx_result.meta);
     let statx = inode_meta_to_statx(&statx_result.meta, ino.as_u64());
     if let Err(errno) = bootstrap_write_user::<StatxLayout>(&ctx.aspace, statxbuf_uaddr, statx) {
         return SyscallResult::error_from(errno);
@@ -1202,7 +1280,7 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         Some(d) => d,
         None => return SyscallResult::Error(ENOENT_VALUE),
     };
-    let (meta, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
+    let (mut meta, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
         if dirfd == AT_FDCWD {
             (cwd.rnode().meta(), cwd.rnode().fs_object_id())
         } else {
@@ -1228,6 +1306,7 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         }
     };
 
+    apply_stat_meta_override(ino, &mut meta);
     let stat = inode_meta_to_stat(&meta, ino.as_u64(), 0);
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
@@ -1424,8 +1503,13 @@ pub(super) async fn sys_statfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
     let mut buf = [0u8; 120];
     buf[0..8].copy_from_slice(&0x01021994u64.to_le_bytes());
     buf[8..16].copy_from_slice(&4096u64.to_le_bytes());
-    buf[88..96].copy_from_slice(&255u64.to_le_bytes());
-    buf[96..104].copy_from_slice(&4096u64.to_le_bytes());
+    buf[16..24].copy_from_slice(&1024u64.to_le_bytes());
+    buf[24..32].copy_from_slice(&768u64.to_le_bytes());
+    buf[32..40].copy_from_slice(&768u64.to_le_bytes());
+    buf[40..48].copy_from_slice(&4096u64.to_le_bytes());
+    buf[48..56].copy_from_slice(&2048u64.to_le_bytes());
+    buf[64..72].copy_from_slice(&255u64.to_le_bytes());
+    buf[72..80].copy_from_slice(&4096u64.to_le_bytes());
     if let Err(e) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &buf) {
         return SyscallResult::error_from(e);
     }

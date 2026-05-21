@@ -2,10 +2,10 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use crate::adapter::step_engine::{
-    self as step_engine, guard, page_allocator, reserve_for, sign_for, StepOutcome,
+    self as step_engine, StepOutcome, guard, page_allocator, reserve_for, sign_for,
 };
-use tx_subsystems::page_backed::{step_truncate, AnonSwapPolicy, PageContainer, PageContainerKind};
-use tx_subsystems::pipe::{step_pipe2, PipeFlags};
+use tx_subsystems::page_backed::{AnonSwapPolicy, PageContainer, PageContainerKind, step_truncate};
+use tx_subsystems::pipe::{PipeFlags, step_pipe2};
 use tx_subsystems::process::bootstrap_init_process;
 use tx_subsystems::vfs::structure::{
     FsObjectId, InodeKind, InodeMeta, OpenFileFlags, RNode, RNodeBacking,

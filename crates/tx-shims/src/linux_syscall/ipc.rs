@@ -1,6 +1,6 @@
 //! SysV / POSIX IPC syscall arms — Phase IPC-5.
 
-use super::{errno_to_i32, SyscallCtx, SyscallResult, ENOSYS_VALUE};
+use super::{ENOSYS_VALUE, SyscallCtx, SyscallResult, errno_to_i32};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::ipc;
 

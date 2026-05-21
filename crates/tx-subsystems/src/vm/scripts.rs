@@ -51,11 +51,14 @@ use crate::vm::{
 /// VA layout is finalised.
 pub const USER_STACK_TOP_DEFAULT: u64 = 0x4000_0000;
 
-/// Default initial reservation for the userspace stack region. Sized
-/// at 16 KiB (4 pages) per `txdoc:EXEC-9-3-POPULATE-THE-INITIAL-USER-STACK`.
-/// Stack growth via a future `expand_stack` script is out of scope for
-/// the initial slice.
-pub const USER_STACK_INITIAL_RESERVATION: u64 = 16 * 1024;
+/// Default initial reservation for the userspace stack region.
+///
+/// Stack growth via a future `expand_stack` script is still out of
+/// scope for this slice, so reserve the Linux default soft limit up
+/// front. LA64 libc-test's `qsort` reaches well beyond the former
+/// 16 KiB bootstrap window before making another syscall, which means
+/// there is no kernel-side opportunity to grow the stack lazily.
+pub const USER_STACK_INITIAL_RESERVATION: u64 = 8 * 1024 * 1024;
 
 /// Loader's parsed view of the ELF image, in kernel-owned shape.
 ///

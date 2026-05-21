@@ -148,7 +148,13 @@ OSCOMP_OUT_RV_SMP4 ?= target/oscomp/os_serial_out_rv_smp4.txt
 OSCOMP_OUT_LA ?= target/oscomp/os_serial_out_la.txt
 OSCOMP_OUT_LA_SMP4 ?= target/oscomp/os_serial_out_la_smp4.txt
 OSCOMP_GROUPS ?=
-OSCOMP_APPEND = $(if $(strip $(OSCOMP_GROUPS)),-append 'tx.oscomp.groups=$(OSCOMP_GROUPS)',)
+OSCOMP_LIBCTEST ?=
+COMMA := ,
+OSCOMP_LIBCTEST_GROUP = libctest-musl:$(subst $(COMMA),+,$(OSCOMP_LIBCTEST))
+OSCOMP_EFFECTIVE_GROUPS = $(if $(strip $(OSCOMP_LIBCTEST)),$(OSCOMP_LIBCTEST_GROUP),$(OSCOMP_GROUPS))
+OSCOMP_CMDLINE = $(strip $(if $(strip $(OSCOMP_EFFECTIVE_GROUPS)),tx.oscomp.groups=$(OSCOMP_EFFECTIVE_GROUPS),))
+OSCOMP_APPEND_RV = $(if $(strip $(OSCOMP_CMDLINE)),-append '$(OSCOMP_CMDLINE)',)
+OSCOMP_APPEND_LA = $(if $(strip $(OSCOMP_CMDLINE)),-fw_cfg name=opt/cmdline$(COMMA)string='$(OSCOMP_CMDLINE)',)
 OSCOMP_TESTCASE_OUT ?= target/oscomp/testcase
 OSCOMP_SERIAL_NORMALIZE = stdbuf -o0 tr -d '\000\r'
 OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'
@@ -182,7 +188,7 @@ oscomp-qemu-rv64:
 		-no-reboot \
 		-device virtio-net-device,netdev=net -netdev user,id=net \
 		-rtc base=utc \
-		$(OSCOMP_APPEND) \
+		$(OSCOMP_APPEND_RV) \
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_RV) | $(OSCOMP_CONSOLE_FILTER)
 
 oscomp-qemu-rv64-smp4:
@@ -196,7 +202,7 @@ oscomp-qemu-rv64-smp4:
 		-no-reboot \
 		-device virtio-net-device,netdev=net -netdev user,id=net \
 		-rtc base=utc \
-		$(OSCOMP_APPEND) \
+		$(OSCOMP_APPEND_RV) \
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_RV_SMP4) | $(OSCOMP_CONSOLE_FILTER)
 
 oscomp-qemu-la64:
@@ -209,7 +215,7 @@ oscomp-qemu-la64:
 		-no-reboot \
 		-device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
 		-rtc base=utc \
-		$(OSCOMP_APPEND) \
+		$(OSCOMP_APPEND_LA) \
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_LA) | $(OSCOMP_CONSOLE_FILTER)
 
 oscomp-qemu-la64-smp4:
@@ -223,7 +229,7 @@ oscomp-qemu-la64-smp4:
 		-no-reboot \
 		-device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
 		-rtc base=utc \
-		$(OSCOMP_APPEND) \
+		$(OSCOMP_APPEND_LA) \
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_LA_SMP4) | $(OSCOMP_CONSOLE_FILTER)
 
 oscomp-judge-rv64:

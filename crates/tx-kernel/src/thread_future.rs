@@ -78,6 +78,8 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
+use alloc::sync::Arc;
+
 use crate::adapter::boot_runtime;
 use crate::adapter::step_engine::{Cap, PayloadCap};
 use boot_runtime::ast::AstBatch;
@@ -86,15 +88,18 @@ use boot_runtime::userspace::{
     UserspaceTrapInfo,
 };
 use tx_hal::{PercpuIf, TrapIf, TxPlatform};
-use tx_subsystems::signal::deliver_synchronous_fault;
 use tx_subsystems::signal::Signum;
-use tx_subsystems::signal::{ast_dispatch, AstOutcome};
+use tx_subsystems::signal::deliver_synchronous_fault;
+use tx_subsystems::signal::{AstOutcome, ast_dispatch};
 use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload_into;
 use tx_subsystems::thread_runtime::{
-    clear_current_thread_payload, clear_current_userspace_payload, set_current_thread_payload,
-    set_current_userspace_payload, ThreadIdentity, ThreadPayload,
+    ThreadIdentity, ThreadPayload, clear_current_thread_payload, clear_current_userspace_payload,
+    set_current_thread_payload, set_current_userspace_payload,
 };
-use tx_subsystems::vm::{AccessMode, UserVirtAddr, VmFault};
+use tx_subsystems::vm::{
+    AccessMode, AddressSpace, Prot, USER_PAGE_SIZE, UserAccessKind, UserRange, UserVirtAddr,
+    VmBacking, VmEntry, VmFault,
+};
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's
 /// `AccessMode`, which is what `VmFault` consumes. The two enums do
@@ -179,6 +184,9 @@ impl<P: TxPlatform, F: Future> Future for PerHartSlotted<P, F> {
         let hart = <P as PercpuIf>::current_cpu_id().0;
 
         let _prev = set_current_thread_payload(hart, this.payload.clone());
+        if let Some(mailbox) = tx_reactor::current_task_mailbox(hart) {
+            this.payload.bind_mailbox(Arc::downgrade(&mailbox));
+        }
 
         // SAFETY: `this.inner` is structurally pinned via the
         // `get_unchecked_mut` above; we never move out of it.
@@ -263,7 +271,12 @@ pub async fn run_thread<P: TxPlatform>(
         // handled inline.
         let ast_outcome = ast_dispatch(&thread);
         match ast_outcome {
-            AstOutcome::DeliverHandler { sig, handler } => {
+            AstOutcome::DeliverHandler {
+                sig,
+                handler,
+                flags,
+                restorer,
+            } => {
                 // Phase D: full signal-frame delivery via
                 // SignalFrameIf::prepare_signal_frame (added in the
                 // HAL for this purpose).  The HAL builds the
@@ -322,6 +335,10 @@ pub async fn run_thread<P: TxPlatform>(
 
                     // Read current mask to pass to the handler.
                     let old_mask = payload.signal_mask();
+                    let siginfo = process
+                        .siginfo_take(sig)
+                        .map(signal_siginfo_to_user_abi)
+                        .unwrap_or(tx_hal::UserSigInfoAbi::ZERO);
 
                     // Build the signal frame write descriptor.
                     let stack_top =
@@ -329,12 +346,13 @@ pub async fn run_thread<P: TxPlatform>(
                     let setup = tx_hal::SignalFrameWrite {
                         stack_top,
                         sig_no: sig.raw() as u32,
-                        siginfo: tx_hal::UserSigInfoAbi::ZERO,
+                        siginfo,
                         old_mask: tx_hal::UserSignalMaskAbi {
                             bits: old_mask.raw_bits(),
                         },
-                        flags: tx_hal::UserSaFlagsAbi { bits: 0 },
+                        flags: tx_hal::UserSaFlagsAbi { bits: flags },
                         handler_pc: tx_hal::UserPtr::<()>::new(handler),
+                        restorer_pc: tx_hal::UserPtr::<()>::new(restorer),
                     };
 
                     // Guard is scoped inside this block so it does not
@@ -345,6 +363,16 @@ pub async fn run_thread<P: TxPlatform>(
                     match prepared {
                         Ok((handler_ctx, frame_bytes)) => {
                             let frame_addr = user_sp_from_context::<P>(&handler_ctx);
+                            if !reserve_signal_frame_storage(
+                                &aspace,
+                                frame_addr,
+                                frame_bytes.as_slice().len(),
+                            ) {
+                                tx_subsystems::process::execution::step_exit_group_with_signal(
+                                    &process, sig,
+                                );
+                                return;
+                            }
                             // Check that the full frame (including the
                             // sigreturn trampoline at its tail) actually
                             // landed on the user stack. The previous
@@ -378,6 +406,15 @@ pub async fn run_thread<P: TxPlatform>(
                                 );
                                 return;
                             }
+                            make_signal_frame_executable(
+                                &aspace,
+                                frame_addr,
+                                frame_bytes.as_slice().len(),
+                            );
+                            <P as tx_hal::CacheIf>::flush_icache_range(
+                                tx_hal::VirtAddr(frame_addr),
+                                frame_bytes.as_slice().len(),
+                            );
                             payload.store_saved_user_context(Some(handler_ctx));
                         }
                         Err(_) => {
@@ -611,7 +648,9 @@ pub async fn run_thread<P: TxPlatform>(
                         // successful syscall, minus the
                         // `pending_syscall_return` write).
                     }
-                    Err(_e) => {
+                    Err(e) => {
+                        log_user_segv::<P>(&payload, info.addr.raw(), info.access, "pf", e);
+                        log_nearby_recipes::<P>(&aspace, info.addr.raw() as usize);
                         deliver_synchronous_fault(&thread, Signum::SIGSEGV);
                         return;
                     }
@@ -620,6 +659,13 @@ pub async fn run_thread<P: TxPlatform>(
             UserspaceTrapInfo::Fatal(_info) => {
                 // Phase B: route fatal trap through canonical
                 // synchronous-fault entry per SIGNAL_v1 §20.
+                log_user_segv::<P>(
+                    &payload,
+                    0,
+                    PageFaultAccess::Unknown,
+                    "fatal",
+                    tx_subsystems::vm::VmFaultError::NoRecipe,
+                );
                 deliver_synchronous_fault(&thread, Signum::SIGSEGV);
                 return;
             }
@@ -630,11 +676,218 @@ pub async fn run_thread<P: TxPlatform>(
     }
 }
 
+fn log_user_segv<P: TxPlatform>(
+    payload: &ThreadPayload,
+    fault_addr: u64,
+    access: PageFaultAccess,
+    kind: &str,
+    error: tx_subsystems::vm::VmFaultError,
+) {
+    let pc = payload
+        .saved_user_context()
+        .map(|ctx| ctx.pc as u64)
+        .unwrap_or(0);
+    tx_hal::console_write_str::<P>("txkernel:");
+    tx_hal::console_write_str::<P>(P::BOARD);
+    tx_hal::console_write_str::<P>(":user-segv:");
+    tx_hal::console_write_str::<P>(kind);
+    tx_hal::console_write_str::<P>(":access=");
+    tx_hal::console_write_str::<P>(match access {
+        PageFaultAccess::Read => "read",
+        PageFaultAccess::Write => "write",
+        PageFaultAccess::Execute => "exec",
+        PageFaultAccess::Unknown => "unknown",
+    });
+    tx_hal::console_write_str::<P>(":err=");
+    tx_hal::console_write_str::<P>(vm_fault_error_label(error));
+    tx_hal::console_write_str::<P>(":pc=0x");
+    write_hex_u64::<P>(pc);
+    tx_hal::console_write_str::<P>(":addr=0x");
+    write_hex_u64::<P>(fault_addr);
+    tx_hal::console_write_str::<P>("\n");
+}
+
+fn log_nearby_recipes<P: TxPlatform>(aspace: &AddressSpace, fault_addr: usize) {
+    let recipes = aspace.recipes_snapshot();
+    let mut containing: Option<VmEntry> = None;
+    let mut lower: Option<VmEntry> = None;
+    let mut upper: Option<VmEntry> = None;
+
+    for entry in recipes.iter().cloned() {
+        let start = entry.range.start().as_usize();
+        let end = entry.range.end().as_usize();
+        if start <= fault_addr && fault_addr < end {
+            containing = Some(entry);
+            break;
+        }
+        if end <= fault_addr
+            && lower
+                .as_ref()
+                .is_none_or(|old| old.range.end().as_usize() < end)
+        {
+            lower = Some(entry.clone());
+        }
+        if fault_addr < start
+            && upper
+                .as_ref()
+                .is_none_or(|old| start < old.range.start().as_usize())
+        {
+            upper = Some(entry);
+        }
+    }
+
+    tx_hal::console_write_str::<P>("txkernel:");
+    tx_hal::console_write_str::<P>(P::BOARD);
+    tx_hal::console_write_str::<P>(":user-segv:recipes:count=0x");
+    write_hex_u64::<P>(recipes.len() as u64);
+    tx_hal::console_write_str::<P>(":fault=0x");
+    write_hex_u64::<P>(fault_addr as u64);
+    tx_hal::console_write_str::<P>("\n");
+
+    if let Some(entry) = containing {
+        log_recipe::<P>("hit", &entry);
+    } else {
+        if let Some(entry) = lower {
+            log_recipe::<P>("lower", &entry);
+        }
+        if let Some(entry) = upper {
+            log_recipe::<P>("upper", &entry);
+        }
+    }
+}
+
+fn log_recipe<P: TxPlatform>(label: &str, entry: &VmEntry) {
+    tx_hal::console_write_str::<P>("txkernel:");
+    tx_hal::console_write_str::<P>(P::BOARD);
+    tx_hal::console_write_str::<P>(":user-segv:recipe:");
+    tx_hal::console_write_str::<P>(label);
+    tx_hal::console_write_str::<P>(":start=0x");
+    write_hex_u64::<P>(entry.range.start().as_usize() as u64);
+    tx_hal::console_write_str::<P>(":end=0x");
+    write_hex_u64::<P>(entry.range.end().as_usize() as u64);
+    tx_hal::console_write_str::<P>(":prot=");
+    tx_hal::console_write_str::<P>(if entry.prot.read { "r" } else { "-" });
+    tx_hal::console_write_str::<P>(if entry.prot.write { "w" } else { "-" });
+    tx_hal::console_write_str::<P>(if entry.prot.execute { "x" } else { "-" });
+    tx_hal::console_write_str::<P>(":backing=");
+    match &entry.backing {
+        VmBacking::None => tx_hal::console_write_str::<P>("none"),
+        VmBacking::PrivateAnon => tx_hal::console_write_str::<P>("anon"),
+        VmBacking::Page { offset, .. } => {
+            tx_hal::console_write_str::<P>("page@0x");
+            write_hex_u64::<P>(*offset);
+        }
+    }
+    tx_hal::console_write_str::<P>("\n");
+}
+
+fn vm_fault_error_label(error: tx_subsystems::vm::VmFaultError) -> &'static str {
+    match error {
+        tx_subsystems::vm::VmFaultError::Range(_) => "range",
+        tx_subsystems::vm::VmFaultError::NoRecipe => "no-recipe",
+        tx_subsystems::vm::VmFaultError::ProtectionViolation => "protection",
+        tx_subsystems::vm::VmFaultError::WouldBlock => "would-block",
+        tx_subsystems::vm::VmFaultError::BackingMismatch => "backing-mismatch",
+        tx_subsystems::vm::VmFaultError::BackingOffsetOverflow => "backing-offset-overflow",
+        tx_subsystems::vm::VmFaultError::PageBeyondSize => "page-beyond-size",
+        tx_subsystems::vm::VmFaultError::PageCache(_) => "page-cache",
+        tx_subsystems::vm::VmFaultError::StaleRecipe => "stale-recipe",
+        tx_subsystems::vm::VmFaultError::Pmap(error) => match error {
+            tx_subsystems::vm::VmPmapError::Pmap(tx_hal::PmapError::InvalidRequest) => {
+                "pmap-invalid"
+            }
+            tx_subsystems::vm::VmPmapError::Pmap(tx_hal::PmapError::Exhausted) => "pmap-exhausted",
+            tx_subsystems::vm::VmPmapError::Pmap(tx_hal::PmapError::AlreadyMapped) => {
+                "pmap-already-mapped"
+            }
+            tx_subsystems::vm::VmPmapError::Pmap(tx_hal::PmapError::Unsupported) => {
+                "pmap-unsupported"
+            }
+            tx_subsystems::vm::VmPmapError::Zone(_) => "pmap-zone",
+            tx_subsystems::vm::VmPmapError::MissingReservation => "pmap-missing-reservation",
+            tx_subsystems::vm::VmPmapError::AlreadyMappedDrift => "pmap-already-mapped-drift",
+            tx_subsystems::vm::VmPmapError::MappingMismatch => "pmap-mapping-mismatch",
+        },
+    }
+}
+
+fn write_hex_u64<P: TxPlatform>(value: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut digits = [0u8; 16];
+    let mut started = false;
+    let mut out = [0u8; 16];
+    let mut len = 0;
+    for idx in 0..16 {
+        let shift = (15 - idx) * 4;
+        let digit = ((value >> shift) & 0xf) as usize;
+        digits[idx] = HEX[digit];
+        if digit != 0 || started || idx == 15 {
+            started = true;
+            out[len] = digits[idx];
+            len += 1;
+        }
+    }
+    let s = core::str::from_utf8(&out[..len]).unwrap_or("0");
+    tx_hal::console_write_str::<P>(s);
+}
+
+fn signal_siginfo_to_user_abi(info: tx_subsystems::signal::SigInfo) -> tx_hal::UserSigInfoAbi {
+    let mut abi = tx_hal::UserSigInfoAbi::ZERO;
+    abi.bytes[0..4].copy_from_slice(&info.si_signo.to_ne_bytes());
+    abi.bytes[4..8].copy_from_slice(&0i32.to_ne_bytes());
+    abi.bytes[8..12].copy_from_slice(&info.si_code.to_ne_bytes());
+    abi.bytes[16..20].copy_from_slice(&info.si_pid.to_ne_bytes());
+    abi.bytes[20..24].copy_from_slice(&info.si_uid.to_ne_bytes());
+    abi
+}
+
 fn user_sp_from_context<P: TxPlatform>(ctx: &tx_hal::UserTrapContext) -> usize {
     match P::ARCH {
         tx_hal::Arch::Riscv64 => ctx.regs[2],
         tx_hal::Arch::LoongArch64 => ctx.regs[3],
     }
+}
+
+fn make_signal_frame_executable(aspace: &AddressSpace, frame_addr: usize, frame_len: usize) {
+    let start = frame_addr & !(USER_PAGE_SIZE - 1);
+    let Some(end_unaligned) = frame_addr.checked_add(frame_len) else {
+        return;
+    };
+    let Some(end) = end_unaligned.checked_next_multiple_of(USER_PAGE_SIZE) else {
+        return;
+    };
+    let Some(len) = end.checked_sub(start) else {
+        return;
+    };
+    let Ok(range) = UserRange::new_aligned(UserVirtAddr(start), len) else {
+        return;
+    };
+    let _ = aspace.try_mprotect(range, Prot::new(true, true, true));
+}
+
+fn reserve_signal_frame_storage(
+    aspace: &AddressSpace,
+    frame_addr: usize,
+    frame_len: usize,
+) -> bool {
+    let start = frame_addr & !(USER_PAGE_SIZE - 1);
+    let Some(end_unaligned) = frame_addr.checked_add(frame_len) else {
+        return false;
+    };
+    let Some(end) = end_unaligned.checked_next_multiple_of(USER_PAGE_SIZE) else {
+        return false;
+    };
+    let Some(len) = end.checked_sub(start) else {
+        return false;
+    };
+    let Ok(range) = UserRange::new_aligned(UserVirtAddr(start), len) else {
+        return false;
+    };
+    matches!(
+        aspace.reserve_user_range_for_access(range, UserAccessKind::Write),
+        crate::adapter::step_engine::StepOutcome::Done(())
+            | crate::adapter::step_engine::StepOutcome::Continue { .. }
+    )
 }
 
 #[cfg(test)]

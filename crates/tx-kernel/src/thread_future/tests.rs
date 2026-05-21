@@ -23,19 +23,19 @@ use tx_hal::{
     ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions,
     PmapReservation, PmapReserveKind, PmapRoot, PtNode,
 };
-use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult, NR_EXIT_GROUP, NR_WRITE};
+use tx_shims::linux_syscall::{NR_EXIT_GROUP, NR_WRITE, SyscallCtx, SyscallResult, dispatch};
 use tx_subsystems::process::ExitStatus;
 use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::{
-    clear_current_thread_payload, current_thread_payload, drain_pending_syscall_return,
-    ThreadPayload,
+    ThreadPayload, clear_current_thread_payload, current_thread_payload,
+    drain_pending_syscall_return,
 };
 use tx_subsystems::vm::{
     AccessMode, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmFault,
     VmFaultError, VmMapRequest,
 };
 
-use crate::thread_future::{pf_access_to_vm_access, PerHartSlotted};
+use crate::thread_future::{PerHartSlotted, pf_access_to_vm_access};
 
 const TEST_PAGE_SIZE: usize = 4096;
 

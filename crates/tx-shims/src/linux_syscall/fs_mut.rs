@@ -1010,14 +1010,130 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
 
 /// `utimensat(dirfd, pathname, times, flags)`. Linux RV64 generic ABI
 /// `__NR_utimensat = 88`.
-///
-/// Returns 0 (success) without actually mutating inode timestamps.
-/// The `FsOps` surface does not yet expose a `set_times` hook, so
-/// timestamps stay unchanged, but the syscall itself succeeds.
-/// This makes `touch(1)` exit 0, which the busybox-musl test suite
-/// requires (`touch test.txt` is scored as a test case).
-/// TODO(phase-vfs-utimens): wire to a real backend set_times method.
-pub(super) fn sys_utimensat<'a>(_args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_utimensat<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let dirfd = args[0] as i32;
+    let path_uaddr = args[1];
+    let times_uaddr = args[2];
+    let flags = args[3] as u32;
+
+    let known_flags = AT_EMPTY_PATH | (AT_SYMLINK_NOFOLLOW as u32);
+    if flags & !known_flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let now = time::ns_to_timespec(time::realtime_ns::<P>());
+    let mut new_times = [tx_subsystems::vfs::Timespec::new(now.tv_sec, now.tv_nsec as i32); 2];
+    let mut omit = [false; 2];
+
+    if times_uaddr != 0 {
+        let raw = match bootstrap_read_user::<[TimespecLayout; 2]>(&ctx.aspace, times_uaddr) {
+            Ok(raw) => raw,
+            Err(errno) => return SyscallResult::error_from(errno),
+        };
+        for i in 0..2 {
+            match raw[i].tv_nsec {
+                UTIME_OMIT => omit[i] = true,
+                UTIME_NOW => {
+                    new_times[i] = tx_subsystems::vfs::Timespec::new(now.tv_sec, now.tv_nsec as i32)
+                }
+                nsec if (0..1_000_000_000).contains(&nsec) => {
+                    if raw[i].tv_sec < 0 {
+                        return SyscallResult::Error(EINVAL_VALUE);
+                    }
+                    new_times[i] = tx_subsystems::vfs::Timespec::new(raw[i].tv_sec, nsec as i32);
+                }
+                _ => return SyscallResult::Error(EINVAL_VALUE),
+            }
+        }
+    }
+
+    if omit[0] && omit[1] {
+        return SyscallResult::Return(0);
+    }
+
+    let rnode = if path_uaddr == 0 {
+        if dirfd < 0 {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
+        match ctx.process.fd(dirfd as u32) {
+            Some(file) => file.rnode().clone(),
+            None => return SyscallResult::Error(EBADF_VALUE),
+        }
+    } else {
+        let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+            Ok(path) => path,
+            Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        };
+        if path.is_empty() && (dirfd != AT_FDCWD || flags & AT_EMPTY_PATH != 0) {
+            if dirfd == AT_FDCWD {
+                match ctx.process.cwd() {
+                    Some(cwd) => cwd.rnode().clone(),
+                    None => return SyscallResult::Error(ENOENT_VALUE),
+                }
+            } else {
+                if dirfd < 0 {
+                    return SyscallResult::Error(EBADF_VALUE);
+                }
+                match ctx.process.fd(dirfd as u32) {
+                    Some(file) => file.rnode().clone(),
+                    None => return SyscallResult::Error(EBADF_VALUE),
+                }
+            }
+        } else {
+            if dirfd != AT_FDCWD {
+                return SyscallResult::Error(EBADF_VALUE);
+            }
+            let cwd = match ctx.process.cwd() {
+                Some(cwd) => cwd,
+                None => return SyscallResult::Error(ENOENT_VALUE),
+            };
+            let dentry = match walk_from(cwd, &path, &ctx.walker_cred()) {
+                Ok(dentry) => dentry,
+                Err(errno) => return SyscallResult::Error(errno),
+            };
+            dentry.rnode().clone()
+        }
+    };
+
+    let fs_object_id = rnode.fs_object_id();
+    let fs_ops = fs_ops_for_rnode(&rnode);
+    let guard = step_engine::guard();
+    let mut meta = match fs_ops {
+        Some(ref fs_ops) => match fs_ops.load_inode_meta(fs_object_id, &guard) {
+            StepOutcome::Done(meta) => meta,
+            _ => rnode.meta(),
+        },
+        None => rnode.meta(),
+    };
+    if let Some(file) = if path_uaddr == 0 && dirfd >= 0 {
+        ctx.process.fd(dirfd as u32)
+    } else {
+        None
+    } {
+        if let Some(sz) =
+            crate::linux_syscall::vm::extract_page_container(&file).map(|pc| pc.size_bytes())
+        {
+            meta.size = sz;
+        }
+    }
+    meta = crate::linux_syscall::fs_basic::stat_meta_override_or(fs_object_id, meta);
+    if !omit[0] {
+        meta.atime = new_times[0];
+    }
+    if !omit[1] {
+        meta.mtime = new_times[1];
+    }
+    meta.ctime = tx_subsystems::vfs::Timespec::new(now.tv_sec, now.tv_nsec as i32);
+    crate::linux_syscall::fs_basic::record_stat_meta_override(fs_object_id, meta);
+    if let Some(fs_ops) = fs_ops {
+        match fs_ops.serialize_inode_meta(fs_object_id, &meta, &guard) {
+            StepOutcome::Done(()) | StepOutcome::Err(_) => {}
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {}
+        }
+    }
     SyscallResult::Return(0)
 }
 

@@ -2,7 +2,7 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
 
-use tx_subsystems::cred::{step_setresuid, Uid};
+use tx_subsystems::cred::{Uid, step_setresuid};
 use tx_subsystems::cross_crate_test_support::clear_caps_for_test;
 
 use crate::linux_syscall::{

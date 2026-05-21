@@ -1,13 +1,13 @@
 // Auto-extracted from `crates/tx-subsystems/src/signal/tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
-use crate::process::{bootstrap_init_process, ExitStatus, ProcessIdentity};
+use crate::process::{ExitStatus, ProcessIdentity, bootstrap_init_process};
 use crate::signal::adapter::step_engine::{Cap, SignalRouting};
 use crate::signal::{
-    ast_check, default_action, select_next_signal, step_kill_process, step_sigaction, AstOutcome,
-    DefaultAction, InterruptSummary, KillOutcome, PendingSource, SigDisposition, SignalTarget,
+    AstOutcome, DefaultAction, InterruptSummary, KillOutcome, PendingSource, SigDisposition,
+    SignalTarget, ast_check, default_action, select_next_signal, step_kill_process, step_sigaction,
 };
-use crate::thread_runtime::execution::{post_signal, step_sigprocmask, SigmaskHow};
+use crate::thread_runtime::execution::{SigmaskHow, post_signal, step_sigprocmask};
 use crate::thread_runtime::structure::ThreadIdentity;
 use crate::vm::{AddressSpace, TestPmap};
 
@@ -318,7 +318,7 @@ fn ast_check_deliver_handler_when_handler_installed() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Handler(0xCAFE));
+    let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::handler(0xCAFE));
     post_signal(
         &leader,
         Signum::SIGTERM,
@@ -331,6 +331,8 @@ fn ast_check_deliver_handler_when_handler_installed() {
         AstOutcome::DeliverHandler {
             sig: Signum::SIGTERM,
             handler: 0xCAFE,
+            flags: 0,
+            restorer: 0,
         }
     );
 }
@@ -529,13 +531,15 @@ fn sigstop_does_not_enter_thread_pending() {
 
     let _ = step_kill_process(&proc_cap, Signum::SIGSTOP, None);
 
-    assert!(!leader
-        .payload
-        .lock()
-        .as_ref()
-        .unwrap()
-        .pending()
-        .is_pending(Signum::SIGSTOP));
+    assert!(
+        !leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .pending()
+            .is_pending(Signum::SIGSTOP)
+    );
     assert!(
         leader
             .payload
@@ -555,13 +559,15 @@ fn sigcont_does_not_enter_thread_pending() {
 
     let _ = step_kill_process(&proc_cap, Signum::SIGCONT, None);
 
-    assert!(!leader
-        .payload
-        .lock()
-        .as_ref()
-        .unwrap()
-        .pending()
-        .is_pending(Signum::SIGCONT));
+    assert!(
+        !leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .pending()
+            .is_pending(Signum::SIGCONT)
+    );
 }
 
 #[test]
@@ -664,7 +670,7 @@ fn ast_dispatch_deliver_handler_recognised_but_unrealised() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Handler(0xFEED));
+    let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::handler(0xFEED));
     post_signal(
         &leader,
         Signum::SIGTERM,
@@ -677,7 +683,9 @@ fn ast_dispatch_deliver_handler_recognised_but_unrealised() {
         outcome,
         AstOutcome::DeliverHandler {
             sig: Signum::SIGTERM,
-            handler: 0xFEED
+            handler: 0xFEED,
+            flags: 0,
+            restorer: 0,
         }
     );
     // Handler installation overrides the default-Term path; the

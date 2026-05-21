@@ -1,9 +1,9 @@
 // Auto-extracted from `crates/tx-subsystems/src/signal/tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
-use crate::process::{bootstrap_init_process, ProcessIdentity};
+use crate::process::{ProcessIdentity, bootstrap_init_process};
 use crate::signal::adapter::step_engine::Cap;
-use crate::signal::{step_sigaction, SigDisposition};
+use crate::signal::{SigDisposition, step_sigaction};
 use crate::vm::{AddressSpace, TestPmap};
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
@@ -32,19 +32,19 @@ fn step_reset_for_exec_sets_all_dispositions_to_sig_dfl() {
     let _ = step_sigaction(
         &proc_cap,
         Signum::SIGINT,
-        SigDisposition::Handler(0xdead_beef),
+        SigDisposition::handler(0xdead_beef),
     );
     let _ = step_sigaction(
         &proc_cap,
         Signum::SIGTERM,
-        SigDisposition::Handler(0xcafe_d00d),
+        SigDisposition::handler(0xcafe_d00d),
     );
-    let _ = step_sigaction(&proc_cap, Signum::SIGHUP, SigDisposition::Handler(0xfeed));
+    let _ = step_sigaction(&proc_cap, Signum::SIGHUP, SigDisposition::handler(0xfeed));
 
     // Sanity: handlers are installed before reset.
     assert!(matches!(
         proc_cap.sig_disposition(Signum::SIGINT),
-        Some(SigDisposition::Handler(_))
+        Some(SigDisposition::Handler { .. })
     ));
 
     // Reset.
@@ -80,7 +80,7 @@ fn step_reset_for_exec_preserves_sig_ign() {
 
     // Also install a handler on SIGINT so we can confirm the
     // reset only touches handlers.
-    let _ = step_sigaction(&proc_cap, Signum::SIGINT, SigDisposition::Handler(0x1234));
+    let _ = step_sigaction(&proc_cap, Signum::SIGINT, SigDisposition::handler(0x1234));
 
     let payload_guard = proc_cap.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");
@@ -115,19 +115,21 @@ fn step_reset_for_exec_preserves_pending_signals() {
             .group_pending()
             .post(Signum::SIGTERM);
     }
-    assert!(proc_cap
-        .payload
-        .lock()
-        .as_ref()
-        .unwrap()
-        .group_pending()
-        .is_pending(Signum::SIGTERM));
+    assert!(
+        proc_cap
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .group_pending()
+            .is_pending(Signum::SIGTERM)
+    );
 
     // Install a handler on SIGTERM and reset.
     let _ = step_sigaction(
         &proc_cap,
         Signum::SIGTERM,
-        SigDisposition::Handler(0xdeadbeef),
+        SigDisposition::handler(0xdeadbeef),
     );
     let payload_guard = proc_cap.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");

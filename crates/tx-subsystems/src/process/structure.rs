@@ -287,11 +287,7 @@ impl ProcessIdentity {
 
     /// Process state char for /proc/<pid>/stat.
     pub fn state_char(&self) -> u8 {
-        if self.is_zombie() {
-            b'Z'
-        } else {
-            b'R'
-        }
+        if self.is_zombie() { b'Z' } else { b'R' }
     }
 
     /// Process command-line (delegates to payload).
@@ -309,6 +305,15 @@ impl ProcessIdentity {
         if let Some(payload) = self.payload.lock().as_ref() {
             payload.siginfo_slots.store(sig, info);
         }
+    }
+
+    /// Take siginfo for a signal being delivered to a userspace handler.
+    pub fn siginfo_take(&self, sig: crate::signal::Signum) -> Option<crate::signal::SigInfo> {
+        let payload_guard = self.payload.lock();
+        let payload = payload_guard.as_ref()?;
+        let info = payload.siginfo_slots.get(sig);
+        payload.siginfo_slots.clear(sig);
+        info
     }
 
     /// Find a thread by its tid within this process.
@@ -500,6 +505,20 @@ impl ProcessIdentity {
     /// use this; both methods share the same underlying scan.
     pub fn next_fd_above(&self, min: u32) -> u32 {
         self.allocate_fd_at_least(min)
+    }
+
+    pub fn rlimit_nofile(&self) -> (u32, u32) {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.rlimit_nofile())
+            .unwrap_or((1024, 4096))
+    }
+
+    pub fn set_rlimit_nofile(&self, cur: u32, max: u32) {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.set_rlimit_nofile(cur, max);
+        }
     }
 
     /// Install `file` at the specific fd `fd`, returning the
@@ -985,6 +1004,10 @@ pub struct ProcessPayload {
     /// clones the parent's set per Linux semantics (CLOEXEC is per-fd,
     /// copied across fork).
     pub(crate) fd_cloexec: SpinMutex<BTreeSet<u32>>,
+    /// Per-process open-fd resource limit. Linux exposes this as
+    /// `RLIMIT_NOFILE`; fork copies it and exec preserves it.
+    pub(crate) rlimit_nofile_cur: AtomicU32,
+    pub(crate) rlimit_nofile_max: AtomicU32,
     /// Base of the program-break (heap) region for this process.
     ///
     /// Set once at exec time (per `txdoc:VM-5-8-BRK`); never changes
@@ -1381,6 +1404,18 @@ impl ProcessPayload {
             }
         }
         next
+    }
+
+    pub fn rlimit_nofile(&self) -> (u32, u32) {
+        (
+            self.rlimit_nofile_cur.load(Ordering::Acquire),
+            self.rlimit_nofile_max.load(Ordering::Acquire),
+        )
+    }
+
+    pub fn set_rlimit_nofile(&self, cur: u32, max: u32) {
+        self.rlimit_nofile_cur.store(cur, Ordering::Release);
+        self.rlimit_nofile_max.store(max, Ordering::Release);
     }
 
     /// Read the close-on-exec bit for fd `idx`.

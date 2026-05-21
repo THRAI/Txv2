@@ -684,9 +684,9 @@ async fn resolve_on_timer(
 /// `false` if the predicate matched normally.
 ///
 /// When a `SignalDelivered` is encountered, the future returns
-/// immediately with `Ready(true)` **without consuming the event**
-/// — the event stays in the queue so the caller's re-poll path
-/// (AST drain / `InterruptSummary` check) can observe it.
+/// immediately with `Ready(true)`. The mailbox event itself is only a
+/// wake hint; the durable signal truth lives in the thread pending
+/// queue / interrupt summary, so the event must be consumed here.
 async fn await_mailbox_event<F>(mailbox: &TaskMailbox, predicate: F) -> bool
 where
     F: Fn(&MailboxEvent) -> bool,
@@ -705,15 +705,9 @@ where
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
             self.mailbox.register_waker(cx.waker().clone());
-            // Peek the queue without consuming (we re-post
-            // SignalDelivered after the check so the caller's
-            // AST/interrupt path sees it).
             while let Some(event) = self.mailbox.poll() {
                 // D9-A: SignalDelivered interrupts blocked waits.
-                // Re-post the event so the caller's re-poll /
-                // AST-drain path can observe it.
                 if matches!(event, MailboxEvent::SignalDelivered { .. }) {
-                    let _ = self.mailbox.post(event);
                     self.mailbox.clear_waker();
                     return Poll::Ready(true);
                 }

@@ -6,8 +6,8 @@ use alloc::vec;
 use std::collections::BTreeMap;
 
 use crate::adapter::step_engine::{
-    self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, Errno as V3Errno,
-    NoProgress, SpinMutex, StepOutcome,
+    self as step_engine, Cap, Errno as V3Errno, NoProgress, SpinMutex, StepOutcome, guard,
+    page_allocator, reserve_for, sign_for,
 };
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::{
@@ -714,8 +714,8 @@ fn execve_testfs_v3_lookup_round_trips_after_add_regular() {
 
 #[test]
 fn execve_testfs_v3_load_inode_meta_returns_directory_for_root() {
-    use tx_subsystems::vfs::FsOps;
     use StepOutcome as V3;
+    use tx_subsystems::vfs::FsOps;
 
     let _setup = execve_setup();
 
@@ -752,8 +752,8 @@ fn execve_testfs_v3_read_link_returns_einval_for_regular() {
 #[test]
 fn execve_testfs_v3_create_inode_returns_enosys() {
     use step_engine::{Errno as V3Errno, NoProgress, StepOutcome as V3};
-    use tx_subsystems::vfs::structure::InodeMeta;
     use tx_subsystems::vfs::FsOps;
+    use tx_subsystems::vfs::structure::InodeMeta;
 
     let _setup = execve_setup();
 

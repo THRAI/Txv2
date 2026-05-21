@@ -5,20 +5,20 @@ use alloc::sync::Arc;
 use alloc::vec;
 
 use crate::adapter::step_engine::{
-    self as step_engine, guard, page_allocator, reserve_for, sign_for, StepOutcome,
+    self as step_engine, StepOutcome, guard, page_allocator, reserve_for, sign_for,
 };
-use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
+use tx_fs::tmpfs::{TMPFS_ROOT_OBJECT_ID, Tmpfs};
 use tx_subsystems::cred::CapabilitySet;
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
 use tx_subsystems::page_backed::FsPageBacking;
-use tx_subsystems::pipe::{step_pipe2, PipeFlags};
+use tx_subsystems::pipe::{PipeFlags, step_pipe2};
 use tx_subsystems::process::step_chdir;
+use tx_subsystems::vfs::FsOps;
 use tx_subsystems::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
 };
-use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
     AT_FDCWD, AT_REMOVEDIR, NR_FTRUNCATE, NR_LINKAT, NR_MKDIRAT, NR_READLINKAT, NR_RENAMEAT2,

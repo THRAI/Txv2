@@ -1,7 +1,7 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
-use tx_subsystems::pipe::{step_pipe2, PipeFlags};
+use tx_subsystems::pipe::{PipeFlags, step_pipe2};
 use tx_subsystems::process::bootstrap_init_process;
 use tx_subsystems::tty::structure::{Termios, Winsize};
 

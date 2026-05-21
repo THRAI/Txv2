@@ -6,8 +6,8 @@
 use super::numbers::{DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK};
 use crate::adapter::step_engine::Cap;
 use tx_subsystems::process::ProcessIdentity;
-use tx_subsystems::vfs::structure::InodeKind;
 use tx_subsystems::vfs::OpenFile;
+use tx_subsystems::vfs::structure::InodeKind;
 
 /// Read 8 little-endian bytes from a slice as a `u64`. Used by
 /// `sys_rt_sigaction`'s `struct sigaction` decode.

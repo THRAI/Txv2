@@ -2,17 +2,17 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use crate::adapter::step_engine::{
-    self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, StepOutcome,
+    self as step_engine, Cap, StepOutcome, guard, page_allocator, reserve_for, sign_for,
 };
 use alloc::sync::Arc;
 use alloc::vec;
-use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
+use tx_fs::tmpfs::{TMPFS_ROOT_OBJECT_ID, Tmpfs};
 use tx_subsystems::cred::CapabilitySet;
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
 use tx_subsystems::page_backed::FsPageBacking;
-use tx_subsystems::pipe::{step_pipe2, PipeFlags};
+use tx_subsystems::pipe::{PipeFlags, step_pipe2};
 use tx_subsystems::process::step_chdir;
 use tx_subsystems::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode, RNodeBacking,

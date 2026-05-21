@@ -42,6 +42,7 @@ use alloc::vec::Vec;
 // ---------------------------------------------------------------------------
 
 const AT_NULL: u64 = 0;
+const AT_IGNORE: u64 = 1;
 const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
@@ -399,6 +400,18 @@ pub fn build_initial_user_stack(
     // for the slice's surface: AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ,
     // AT_BASE, AT_ENTRY, AT_UID, AT_EUID, AT_GID, AT_EGID, AT_SECURE,
     // AT_RANDOM, AT_NULL).
+    let at_platform_pair = auxv_facts
+        .at_platform
+        .map(|value| (AT_PLATFORM, value))
+        .unwrap_or((AT_IGNORE, 0));
+    let at_sysinfo_ehdr_pair = auxv_facts
+        .at_sysinfo_ehdr
+        .map(|value| (AT_SYSINFO_EHDR, value))
+        .unwrap_or((AT_IGNORE, 0));
+    let at_execfn_pair = auxv_facts
+        .at_execfn
+        .map(|value| (AT_EXECFN, value))
+        .unwrap_or((AT_IGNORE, 0));
     let auxv_entries: [(u64, u64); AUXV_PAIR_COUNT] = [
         (AT_PHDR, auxv_facts.at_phdr),
         (AT_PHENT, auxv_facts.at_phent),
@@ -414,10 +427,10 @@ pub fn build_initial_user_stack(
         (AT_RANDOM, at_random_base),
         (AT_HWCAP, auxv_facts.at_hwcap),
         (AT_HWCAP2, auxv_facts.at_hwcap2),
-        (AT_PLATFORM, auxv_facts.at_platform.unwrap_or(0)),
+        at_platform_pair,
         (AT_CLKTCK, auxv_facts.at_clktck),
-        (AT_SYSINFO_EHDR, auxv_facts.at_sysinfo_ehdr.unwrap_or(0)),
-        (AT_EXECFN, auxv_facts.at_execfn.unwrap_or(0)),
+        at_sysinfo_ehdr_pair,
+        at_execfn_pair,
         (AT_FLAGS, auxv_facts.at_flags),
         (AT_NULL, 0),
     ];
@@ -600,10 +613,10 @@ mod tests {
         assert_eq!(pair(11).0, AT_RANDOM);
         assert_eq!(pair(12).0, AT_HWCAP);
         assert_eq!(pair(13).0, AT_HWCAP2);
-        assert_eq!(pair(14).0, AT_PLATFORM);
+        assert_eq!(pair(14).0, AT_IGNORE);
         assert_eq!(pair(15).0, AT_CLKTCK);
-        assert_eq!(pair(16).0, AT_SYSINFO_EHDR);
-        assert_eq!(pair(17).0, AT_EXECFN);
+        assert_eq!(pair(16).0, AT_IGNORE);
+        assert_eq!(pair(17).0, AT_IGNORE);
         assert_eq!(pair(18).0, AT_FLAGS);
         assert_eq!(pair(19), (AT_NULL, 0));
 
@@ -765,10 +778,10 @@ mod tests {
         assert_eq!(pair(11).0, AT_RANDOM);
         assert_eq!(pair(12).0, AT_HWCAP);
         assert_eq!(pair(13).0, AT_HWCAP2);
-        assert_eq!(pair(14).0, AT_PLATFORM);
+        assert_eq!(pair(14).0, AT_IGNORE);
         assert_eq!(pair(15).0, AT_CLKTCK);
-        assert_eq!(pair(16).0, AT_SYSINFO_EHDR);
-        assert_eq!(pair(17).0, AT_EXECFN);
+        assert_eq!(pair(16).0, AT_IGNORE);
+        assert_eq!(pair(17).0, AT_IGNORE);
         assert_eq!(pair(18).0, AT_FLAGS);
         assert_eq!(pair(19), (AT_NULL, 0));
     }

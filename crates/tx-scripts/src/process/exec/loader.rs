@@ -258,6 +258,7 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
     let mut pt_phdr_vaddr: Option<u64> = None;
     let mut exec_stack: bool = false;
     let mut interp_path: Option<Vec<u8>> = None;
+    let mut has_dynamic = false;
 
     for phdr in &phdrs {
         match phdr.p_type {
@@ -275,13 +276,11 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
                         interp_path = Some(path);
                     }
                 }
-                // PT_DYNAMIC in ET_EXEC: reject (no dynamic linking in
-                // static executables; only PT_INTERP-interpreted
-                // binaries are accepted).
                 if phdr.p_type == PT_DYNAMIC {
-                    return Err(ParseError::HasInterp);
+                    has_dynamic = true;
                 }
-                // PT_INTERP path was extracted above; fall through.
+                // PT_INTERP-interpreted ET_EXEC binaries may also carry
+                // PT_DYNAMIC; the dynamic linker consumes that table.
             }
             PT_INTERP | PT_DYNAMIC => {
                 // ET_DYN static-PIE: PT_INTERP / PT_DYNAMIC present but
@@ -308,6 +307,9 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
 
     if load_segments.is_empty() {
         return Err(ParseError::NoLoad);
+    }
+    if !is_dyn && has_dynamic && interp_path.is_none() {
+        return Err(ParseError::HasInterp);
     }
 
     // Choose load bias: 0 for ET_EXEC (absolute VAs already in place),

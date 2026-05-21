@@ -71,11 +71,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         if let Some(inode) = self.lookup_cache.lock().get(parent, name) {
             return Ok(Some(inode));
         }
-        if let Some(cached) = self
-            .dir_cache
-            .lock()
-            .lookup(parent, name)
-        {
+        if let Some(cached) = self.dir_cache.lock().lookup(parent, name) {
             if let Some(inode) = cached {
                 self.lookup_cache.lock().insert(parent, name, inode);
             }
@@ -104,11 +100,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         inode: InodeNo,
         out: &mut [DirEntryLite; READDIR_WINDOW_ENTRIES],
     ) -> Result<usize, Errno> {
-        if let Some(count) = self
-            .dir_cache
-            .lock()
-            .get(inode, out)
-        {
+        if let Some(count) = self.dir_cache.lock().get(inode, out) {
             return Ok(count);
         }
 
@@ -217,9 +209,7 @@ impl DirCache {
         entry.count = count.min(READDIR_WINDOW_ENTRIES);
         entry.last_used = self.clock;
         entry.entries.clear();
-        entry
-            .entries
-            .extend_from_slice(&entries[..entry.count]);
+        entry.entries.extend_from_slice(&entries[..entry.count]);
     }
 
     fn invalidate(&mut self, inode: InodeNo) {

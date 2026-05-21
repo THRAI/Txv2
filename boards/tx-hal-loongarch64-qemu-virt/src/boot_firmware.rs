@@ -6,13 +6,13 @@
 
 use super::boot_args;
 use super::boot_facts::{
-    LA64_BOOT_CMDLINE_CAPACITY, LA64_BOOT_MEMORY_REGION_CAPACITY, boot_cmdline_ptr,
-    boot_memory_regions_ptr,
+    boot_cmdline_ptr, boot_memory_regions_ptr, LA64_BOOT_CMDLINE_CAPACITY,
+    LA64_BOOT_MEMORY_REGION_CAPACITY,
 };
 use super::la64_irq_trap::la64_detect_timebase_frequency_hz;
 use super::la64_pmap::{la64_cached_virt, la64_kernel_addr_to_phys, la64_uncached_virt};
 use super::*;
-use crate::dtb::{DtbBootInfo, parse_boot_info_from_fdt};
+use crate::dtb::{parse_boot_info_from_fdt, DtbBootInfo};
 
 pub(crate) fn parse_firmware_boot_info(
     reserved_end: usize,

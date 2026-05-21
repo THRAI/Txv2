@@ -47,6 +47,12 @@ pub(super) fn ns_to_timeval(ns: u64) -> TimevalLayout {
     }
 }
 
+const REALTIME_EPOCH_BASE_NS: u64 = 1_749_920_000_000_000_000;
+
+pub(super) fn realtime_ns<P: TimeIf>() -> u64 {
+    REALTIME_EPOCH_BASE_NS.saturating_add(<P as TimeIf>::read_ns())
+}
+
 /// Read a Linux-shaped `(tv_sec, tv_nsec)` pair from user memory and
 /// fold it back into a nanosecond count. Returns `None` if either
 /// field is negative or `tv_nsec` overflows the canonical
@@ -87,12 +93,11 @@ pub(super) fn sys_clock_gettime<'a, P: TimeIf>(
         return SyscallResult::Error(EFAULT_VALUE);
     }
     let ns = match clk_id {
-        CLOCK_REALTIME
-        | CLOCK_MONOTONIC
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE => realtime_ns::<P>(),
+        CLOCK_MONOTONIC
         | CLOCK_PROCESS_CPUTIME_ID
         | CLOCK_THREAD_CPUTIME_ID
         | CLOCK_MONOTONIC_RAW
-        | CLOCK_REALTIME_COARSE
         | CLOCK_MONOTONIC_COARSE
         | CLOCK_BOOTTIME => <P as TimeIf>::read_ns(),
         _ => return SyscallResult::Error(EINVAL_VALUE),
@@ -118,7 +123,7 @@ pub(super) fn sys_gettimeofday<'a, P: TimeIf>(
     if tv_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
-    let tv = ns_to_timeval(<P as TimeIf>::read_ns());
+    let tv = ns_to_timeval(realtime_ns::<P>());
     if let Err(errno) = bootstrap_write_user::<TimevalLayout>(&ctx.aspace, tv_uaddr, tv) {
         return SyscallResult::error_from(errno);
     }

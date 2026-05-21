@@ -4,16 +4,16 @@
 //! or written (adds to the counter).  Subsystem dispatch lives in
 //! `tx_subsystems::eventfd`.
 
-use tx_subsystems::eventfd::{step_eventfd_read, step_eventfd_write, EventFd, EFD_SEMAPHORE};
+use tx_subsystems::eventfd::{EFD_SEMAPHORE, EventFd, step_eventfd_read, step_eventfd_write};
 use tx_subsystems::execution::Errno;
-use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
+use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::wait_source;
 
 use super::numbers::{EFD_CLOEXEC_FLAG, EFD_NONBLOCK_FLAG, NR_EVENTFD2};
 use super::{
-    bootstrap_copy_to_user, bootstrap_read_user, errno_to_i32, SyscallCtx, SyscallResult,
-    EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
+    EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE, SyscallCtx, SyscallResult,
+    bootstrap_copy_to_user, bootstrap_read_user, errno_to_i32,
 };
 use crate::adapter::step_engine::{self as step_engine};
 

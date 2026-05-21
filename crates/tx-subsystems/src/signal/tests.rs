@@ -5,16 +5,16 @@
 //! and zombie-ignored cases.
 
 use crate::process::execution::reset_init_process_for_test;
-use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
-use crate::process::{bootstrap_init_process, step_exit_group, step_fork, ExitStatus};
+use crate::process::structure::{ProcessIdentity, reset_pid_counter_for_test};
+use crate::process::{ExitStatus, bootstrap_init_process, step_exit_group, step_fork};
 use crate::signal::adapter::step_engine::Cap;
 use crate::signal::{
-    step_kill_pgrp, step_kill_process, step_sigaction, KillOutcome, PendingSignalQueue,
-    SigDisposition, SigDispositionChange, SignalMask, Signum,
+    KillOutcome, PendingSignalQueue, SigDisposition, SigDispositionChange, SignalMask, Signum,
+    step_kill_pgrp, step_kill_process, step_sigaction,
 };
 use crate::test_support::EPOCH_TEST_LOCK;
-use crate::thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange};
-use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentity};
+use crate::thread_runtime::execution::{SigmaskHow, SigprocmaskChange, step_sigprocmask};
+use crate::thread_runtime::structure::{ThreadIdentity, reset_tid_counter_for_test};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
 
@@ -170,7 +170,7 @@ fn sigaction_installs_handler_and_returns_previous_disposition() {
     let second = step_sigaction(
         &proc_cap,
         Signum::SIGTERM,
-        SigDisposition::Handler(0xdead_beef),
+        SigDisposition::handler(0xdead_beef),
     );
     assert!(matches!(
         second,
@@ -238,22 +238,26 @@ fn sigprocmask_block_then_unblock_round_trips() {
     let mut to_block = SignalMask::EMPTY;
     to_block.block(Signum::SIGTERM);
     let _ = step_sigprocmask(&leader, SigmaskHow::Block, to_block);
-    assert!(leader
-        .payload
-        .lock()
-        .as_ref()
-        .unwrap()
-        .signal_mask()
-        .is_blocked(Signum::SIGTERM));
+    assert!(
+        leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .signal_mask()
+            .is_blocked(Signum::SIGTERM)
+    );
 
     let _ = step_sigprocmask(&leader, SigmaskHow::Unblock, to_block);
-    assert!(!leader
-        .payload
-        .lock()
-        .as_ref()
-        .unwrap()
-        .signal_mask()
-        .is_blocked(Signum::SIGTERM));
+    assert!(
+        !leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .signal_mask()
+            .is_blocked(Signum::SIGTERM)
+    );
 }
 
 #[test]

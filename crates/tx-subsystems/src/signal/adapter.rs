@@ -24,20 +24,20 @@ use tx_platform_adapter::platform_adapter;
     reason = "wrap substrate step engine (StepOp), EBR guard/guard(), and signal-routing primitives (SignalRouting, OperationalCapExt, SpinMutex) used by the signal mutators"
 )]
 pub mod step_engine {
-    pub use tx_substrate::epoch::{guard, Guard};
+    pub use tx_substrate::SpinMutex;
+    pub use tx_substrate::epoch::{Guard, guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
-        drive_oneshot, ByteProgress, Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp,
-        StepOutcome, SubjectIdentity,
+        ByteProgress, Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome,
+        SubjectIdentity, drive_oneshot,
     };
     pub use tx_substrate::wake::{MailboxEvent, SignalRouting, TaskMailbox};
     pub use tx_substrate::zone::{
-        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
-        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
-        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
-        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
+        Cap, CapProducingPolicy, CoLocatedEntity, Dead, Entity, IdentRef, IdentitySlot,
+        IsPayloadPolicy, ObserverNodePolicy, OperationalCapExt, OperationalRefExt, PayloadBinding,
+        PayloadCap, PayloadPolicy, RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError,
+        ZonePolicy, register_zone_for, reserve_for, sign, sign_for,
     };
-    pub use tx_substrate::SpinMutex;
 }
 
 #[platform_adapter(
@@ -46,7 +46,7 @@ pub mod step_engine {
     reason = "wrap reactor interrupt and wait primitives (InterruptSource, InterruptSummary, Channel, Mask, WaitOutcome, WaitProtocol, Reactor) used by the D9-C interrupt-wake integration test"
 )]
 pub mod wait_routing {
+    pub use tx_reactor::Reactor;
     pub use tx_reactor::interrupt::{InterruptSource, InterruptSummary};
     pub use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
-    pub use tx_reactor::Reactor;
 }

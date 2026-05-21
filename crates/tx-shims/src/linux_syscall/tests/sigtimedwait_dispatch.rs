@@ -177,7 +177,7 @@ fn sigtimedwait_ignores_signals_outside_set_returns_neg_eagain() {
 #[test]
 fn sigtimedwait_observes_sigchld_posted_by_child_exit() {
     use tx_hal::UserTrapContext;
-    use tx_subsystems::process::{step_exit_group, ExitStatus};
+    use tx_subsystems::process::{ExitStatus, step_exit_group};
     use tx_subsystems::reactor_submit;
 
     fn noop(_p: Cap<ProcessIdentity>, _t: Cap<ThreadIdentity>) {}
