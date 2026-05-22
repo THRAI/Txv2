@@ -1003,7 +1003,7 @@ fn boot_smoke_bootstrap_exec_seeds_init_user_context_from_fixture() {
     // hardening"): the effective stack top is
     // `USER_STACK_TOP_DEFAULT + r` where `r` is a page-aligned
     // random offset in `[0, 0x80_0000)`. Initial sp lands inside
-    // `[effective_top - 16 KiB, effective_top]`.
+    // `[effective_top - USER_STACK_INITIAL_RESERVATION, effective_top]`.
     use tx_subsystems::vm::scripts::{USER_STACK_INITIAL_RESERVATION, USER_STACK_TOP_DEFAULT};
     const MAX_STACK_TOP_ASLR_OFFSET: u64 = 0x80_0000;
     let sp = saved.regs[2] as u64;

@@ -73,6 +73,9 @@ The OSComp autotest suite is a submodule at `external/oscomp-autotest`.
 HumanLayer's agent workflow reference is a sparse submodule at
 `external/humanlayer-reference`; txKernel uses only its `.claude/` prompts as
 reference material.
+Musl libc is available as a reference-only submodule at `external/musl`; use
+`arch/riscv64/` plus `arch/generic/bits/` and `include/sys/` when checking
+userspace ABI layouts such as SysV IPC headers.
 
 Initialize submodules with:
 

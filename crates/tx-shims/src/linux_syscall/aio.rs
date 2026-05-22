@@ -82,7 +82,10 @@ use tx_subsystems::vfs::OpenFile;
 use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::wait_source;
 
-use super::{bootstrap_copy_from_user, bootstrap_copy_to_user, SyscallCtx, SyscallResult};
+use super::{
+    bootstrap_copy_from_user, bootstrap_copy_to_user, next_stdio_fd_below_nofile, SyscallCtx,
+    SyscallResult,
+};
 use super::{EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENOMEM_VALUE};
 use crate::adapter::step_engine::StepOutcome as V3Out;
 use crate::adapter::step_engine::{self as step_engine, Cap, SpinMutex, StepOp};
@@ -423,7 +426,10 @@ pub(super) fn sys_io_setup(nr_events: u32, _ctx_idp: u64, ctx: &SyscallCtx<'_>) 
     // Install at the lowest free fd. The fd-table machinery is
     // uniform across `OpenFileBacking` shapes; no AIO-specific
     // bookkeeping happens at install time in phase 1.
-    let fd = ctx.process.allocate_fd();
+    let fd = match next_stdio_fd_below_nofile(&ctx.process) {
+        Ok(fd) => fd,
+        Err(result) => return result,
+    };
     let _ = ctx.process.install_fd(fd, open_cap);
 
     SyscallResult::Return(fd as i64)

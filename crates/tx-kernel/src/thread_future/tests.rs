@@ -13,6 +13,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
+use std::sync::Mutex;
 
 use crate::adapter::boot_runtime::userspace::{
     PageFaultAccess, PageFaultInfo, SyscallRequest, UserAddr, UserspaceTrapInfo,
@@ -23,7 +24,10 @@ use tx_hal::{
     ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions,
     PmapReservation, PmapReserveKind, PmapRoot, PtNode,
 };
-use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult, NR_EXIT_GROUP, NR_WRITE};
+use tx_shims::linux_syscall::{
+    dispatch, SyscallCtx, SyscallResult, FUTEX_PRIVATE_FLAG, FUTEX_WAKE, NR_EXIT_GROUP, NR_FUTEX,
+    NR_WRITE,
+};
 use tx_subsystems::process::ExitStatus;
 use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::{
@@ -35,7 +39,7 @@ use tx_subsystems::vm::{
     VmFaultError, VmMapRequest,
 };
 
-use crate::thread_future::{pf_access_to_vm_access, PerHartSlotted};
+use crate::thread_future::{pf_access_to_vm_access, run_thread, PerHartSlotted};
 
 const TEST_PAGE_SIZE: usize = 4096;
 
@@ -87,7 +91,16 @@ impl ConsoleIf for TestPlatform {
     fn write_bytes(_bytes: &[u8]) {}
 }
 
-impl tx_hal::TrapIf for TestPlatform {}
+static USERSPACE_A0_LOG: Mutex<std::vec::Vec<usize>> = Mutex::new(std::vec::Vec::new());
+
+impl tx_hal::TrapIf for TestPlatform {
+    fn enter_userspace_with_context(ctx: &tx_hal::UserTrapContext, _root: &tx_hal::PmapRoot) {
+        USERSPACE_A0_LOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(ctx.regs[10]);
+    }
+}
 impl tx_hal::SignalFrameIf for TestPlatform {}
 impl tx_hal::IrqIf for TestPlatform {}
 
@@ -163,6 +176,10 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     tx_subsystems::cross_crate_test_support::reset_tid_counter();
     // Ensure the per-hart slot is empty across tests.
     let _ = clear_current_thread_payload(0);
+    USERSPACE_A0_LOG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     guard
 }
 
@@ -195,6 +212,61 @@ fn block_on<F: Future>(mut fut: F) -> F::Output {
         }
     }
     panic!("block_on: future did not resolve in 1024 polls");
+}
+
+/// A successful FUTEX_WAKE is just a syscall return. It must not park
+/// the issuing thread on its own mailbox; musl's pthread-exit path
+/// does `__wake(&self->detach_state)` and then immediately reaches
+/// `SYS_exit`, where `CLONE_CHILD_CLEARTID` clears
+/// `__thread_list_lock`. Parking between those two instructions
+/// leaves sibling threads blocked in `__tl_lock`.
+#[test]
+fn futex_wake_return_reenters_userspace_without_mailbox_event() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
+
+    payload.store_saved_user_context(Some(tx_hal::UserTrapContext {
+        regs: [0; 32],
+        pc: 0,
+        status: 0,
+        fp: tx_hal::UserFpContext::empty(),
+    }));
+
+    let future = run_thread::<TestPlatform>(leader, payload.clone());
+    let wrapped = PerHartSlotted::<TestPlatform, _>::new(payload.clone(), future);
+    let reactor = tx_reactor::Reactor::new();
+    let _task = reactor.submit_task(wrapped);
+
+    let first = reactor.run_until_idle();
+    assert_eq!(first.completed, 0);
+    assert_eq!(
+        *USERSPACE_A0_LOG.lock().unwrap_or_else(|e| e.into_inner()),
+        std::vec![0],
+        "first userspace dive uses the seeded baseline return register"
+    );
+
+    let active = payload
+        .active_userspace_request()
+        .expect("run_thread published a userspace wait");
+    let futex_wake = UserspaceTrapInfo::Syscall(SyscallRequest::new(
+        NR_FUTEX,
+        [0x1000, (FUTEX_WAKE | FUTEX_PRIVATE_FLAG) as u64, 1, 0, 0, 0],
+    ));
+    payload
+        .userspace_slot()
+        .complete_interesting_trap(active, futex_wake)
+        .expect("resolve wait with futex wake");
+
+    let second = reactor.run_until_idle();
+    assert_eq!(second.completed, 0);
+    assert_eq!(
+        *USERSPACE_A0_LOG.lock().unwrap_or_else(|e| e.into_inner()),
+        std::vec![0, 1],
+        "FUTEX_WAKE return must be written back and immediately re-enter userspace"
+    );
 }
 
 /// `PerHartSlotted` sets the per-hart slot before delegating to the

@@ -44,6 +44,10 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
+    fn recipe_guard() -> step_engine::Guard<'static> {
+        epoch::borrow_current_guard().unwrap_or_else(epoch::guard)
+    }
+
     pub fn new_for_platform<P: PmapIf>() -> Result<Self, VmPmapError> {
         Ok(Self {
             recipes: RecipeIndex::new(),
@@ -92,22 +96,22 @@ impl AddressSpace {
     }
 
     pub fn lookup(&self, addr: UserVirtAddr) -> Option<VmEntry> {
-        let guard = epoch::guard();
+        let guard = Self::recipe_guard();
         self.recipes.lookup(addr, &guard)
     }
 
     pub fn find_free_range(&self, window: UserRange, page_count: usize) -> Option<UserRange> {
-        let guard = epoch::guard();
+        let guard = Self::recipe_guard();
         self.recipes.find_free_range(window, page_count, &guard)
     }
 
     pub fn recipes_overlapping(&self, range: UserRange) -> Vec<VmEntry> {
-        let guard = epoch::guard();
+        let guard = Self::recipe_guard();
         self.recipes.overlapping(range, &guard)
     }
 
     pub fn recipes_snapshot(&self) -> Vec<VmEntry> {
-        let guard = epoch::guard();
+        let guard = Self::recipe_guard();
         self.recipes.snapshot(&guard)
     }
 

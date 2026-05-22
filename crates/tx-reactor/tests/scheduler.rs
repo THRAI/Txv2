@@ -85,6 +85,28 @@ fn submitted_task_uses_first_allowed_affinity_hart() {
 }
 
 #[test]
+fn submitted_task_can_start_in_preempted_queue() {
+    let mut scheduler = Phase1Scheduler::new();
+    let task = TaskId(72);
+    scheduler.task_submitted(
+        task,
+        TaskHandle::new(task),
+        InitialSchedMeta::fair().preempted_on_submit(),
+    );
+
+    let depths = scheduler.queue_depths(HartId(0));
+    assert_eq!(depths.new, 0);
+    assert_eq!(depths.preempted, 1);
+    assert_eq!(
+        scheduler.task_owner(task),
+        Some(TaskRunOwner::Queued {
+            hart: HartId(0),
+            queue: Phase1QueueKind::Preempted,
+        })
+    );
+}
+
+#[test]
 fn submitted_movable_fair_tasks_spread_across_allowed_harts() {
     let mut scheduler = Phase1Scheduler::new();
     let first = TaskId(23);
@@ -358,6 +380,38 @@ fn userspace_trap_without_remaining_budget_requeues_with_fresh_slice() {
                 slice_ns: Phase1Scheduler::PREEMPTED_QUEUE_SLICE_NS,
             },
         ))
+    );
+}
+
+#[test]
+fn userspace_thread_trap_requeues_at_front_even_after_budget_exhaustion() {
+    let mut scheduler = Phase1Scheduler::new();
+    let userspace = TaskId(70);
+    scheduler.task_submitted(
+        userspace,
+        TaskHandle::new(userspace),
+        InitialSchedMeta::fair().userspace_thread(),
+    );
+    let peer = submit_fair(&mut scheduler, 71);
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(userspace)
+    );
+    scheduler.task_stopped(
+        userspace,
+        StopReason::UserspaceTrap,
+        Phase1Scheduler::NEW_QUEUE_SLICE_NS,
+        HartId(0),
+    );
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(userspace)
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(peer)
     );
 }
 
@@ -678,41 +732,49 @@ fn idle_steal_prefers_busiest_preempted_victim() {
 }
 
 #[test]
-fn work_stealing_skips_new_queue_and_disallowed_affinity() {
+fn work_stealing_can_take_new_queue_but_respects_affinity() {
     let mut scheduler = Phase1Scheduler::new();
     let new_task = submit_fair_affinity(&mut scheduler, 41, 0b0011);
-    let pinned_task = submit_fair_affinity(&mut scheduler, 42, 0b0001);
-
-    assert_eq!(scheduler.try_steal(HartId(1), HartId(0)), None);
-    assert_eq!(scheduler.queue_depths(HartId(0)).new, 2);
+    let restricted_task = submit_fair_affinity(&mut scheduler, 42, 0b0001);
 
     assert_eq!(
-        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        scheduler.try_steal(HartId(1), HartId(0)).map(|h| h.id()),
+        Some(new_task)
+    );
+    assert_eq!(scheduler.queue_depths(HartId(0)).new, 1);
+    assert_eq!(scheduler.queue_depths(HartId(1)).new, 1);
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(1)).map(|x| x.0),
         Some(new_task)
     );
     scheduler.task_stopped(
         new_task,
         StopReason::SliceExpired,
         Phase1Scheduler::NEW_QUEUE_SLICE_NS,
-        HartId(0),
+        HartId(1),
     );
     assert_eq!(
         pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
-        Some(pinned_task)
+        Some(restricted_task)
     );
     scheduler.task_stopped(
-        pinned_task,
+        restricted_task,
         StopReason::SliceExpired,
         Phase1Scheduler::NEW_QUEUE_SLICE_NS,
         HartId(0),
     );
 
+    assert_eq!(scheduler.try_steal(HartId(1), HartId(0)), None);
     assert_eq!(
-        scheduler.try_steal(HartId(1), HartId(0)).map(|h| h.id()),
-        Some(new_task)
+        scheduler.task_owner(new_task),
+        Some(TaskRunOwner::Queued {
+            hart: HartId(1),
+            queue: Phase1QueueKind::Preempted,
+        })
     );
     assert_eq!(
-        scheduler.task_owner(pinned_task),
+        scheduler.task_owner(restricted_task),
         Some(TaskRunOwner::Queued {
             hart: HartId(0),
             queue: Phase1QueueKind::Preempted,

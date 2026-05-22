@@ -12,12 +12,15 @@ use alloc::vec::Vec;
 use std::sync::Mutex;
 
 use super::adapter::step_engine::{
-    self as step_engine, guard, ByteProgress, Errno as V3Errno, StepOutcome as V3Outcome,
+    self as step_engine, guard, ByteProgress, Cap, Errno as V3Errno, StepOutcome as V3Outcome,
 };
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
+use tx_subsystems::mount::{DevId, MountOptions, MountPayload, SourceLabel};
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
-use tx_subsystems::vfs::{Credential, DirCursor, FsObjectId, FsOps, RNodeBacking, StructPayload};
+use tx_subsystems::vfs::{
+    Credential, DirCursor, FsObjectId, FsOps, OpenFile, OpenFileFlags, RNodeBacking, StructPayload,
+};
 
 use super::{open_console_for_init, Devfs, DEVFS_ROOT_OBJECT_ID};
 
@@ -93,6 +96,19 @@ fn install_capturing_console() -> &'static CapturingOps {
     ops_static
 }
 
+fn devfs_mount_payload() -> Cap<MountPayload> {
+    MountPayload::new_cap(
+        Devfs::fs_ops_arc(),
+        Devfs::fs_page_backing_arc(),
+        None,
+        DevId::new(611),
+        MountOptions::default(),
+        "devfs-test",
+        SourceLabel::Static("devfs-test"),
+    )
+    .expect("devfs mount payload")
+}
+
 // --- tests ----------------------------------------------------------------
 
 #[test]
@@ -134,6 +150,57 @@ fn devfs_lookup_console_after_register_hardware_returns_tty_rnode() {
     // Lookup result is consistent with the entry's index in the alias
     // snapshot (sanity: the id is non-root, non-zero).
     assert_ne!(obj_id, DEVFS_ROOT_OBJECT_ID);
+}
+
+#[test]
+fn devfs_lookup_null_materialises_char_device() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+
+    let guard = guard();
+    let devfs = Devfs::new();
+
+    let obj_id = match <Devfs as FsOps>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"null", &guard) {
+        V3Outcome::Done(id) => id,
+        other => panic!("devfs.lookup(null) failed: {other:?}"),
+    };
+    assert_ne!(obj_id, DEVFS_ROOT_OBJECT_ID);
+
+    let meta = match <Devfs as FsOps>::load_inode_meta(&devfs, obj_id, &guard) {
+        V3Outcome::Done(meta) => meta,
+        other => panic!("devfs.load_inode_meta(null) failed: {other:?}"),
+    };
+    assert_eq!(meta.kind(), tx_subsystems::vfs::InodeKind::CharDevice);
+
+    let mount = devfs_mount_payload();
+    let rnode = match <Devfs as FsOps>::materialise_rnode(&devfs, obj_id, meta, &mount, &guard) {
+        V3Outcome::Done(rnode) => rnode,
+        other => panic!("devfs.materialise_rnode(null) failed: {other:?}"),
+    };
+    match rnode.backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::CharDevice(binding),
+        } => assert_eq!(binding.name, "null"),
+        other => panic!("expected StructBacked::CharDevice, got {other:?}"),
+    }
+
+    let file = OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+        },
+    )
+    .expect("null open file");
+    let mut out = [0xaa; 4];
+    assert_eq!(file.step_write(b"discarded", &guard), V3Outcome::Done(9));
+    assert_eq!(file.step_read(&mut out, &guard), V3Outcome::Done(0));
+    assert_eq!(out, [0xaa; 4]);
 }
 
 #[test]

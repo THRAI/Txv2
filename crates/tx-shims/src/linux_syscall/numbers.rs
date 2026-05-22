@@ -524,11 +524,17 @@ pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 /// addr+length)` window.
 pub const NR_MUNMAP: u64 = 215;
 /// `mremap(old_addr, old_size, new_size, flags, new_addr)`. Linux RV64
-/// generic ABI `__NR_mremap = 216`. Slice 2 only honours the
-/// `MREMAP_FIXED | MREMAP_MAYMOVE` shape musl emits — pure-grow without
-/// `MAYMOVE` returns `-ENOMEM` if the new size doesn't fit in place
-/// (which `try_mremap`'s disjoint-only contract always reports).
+/// generic ABI `__NR_mremap = 216`.
 pub const NR_MREMAP: u64 = 216;
+/// `MREMAP_MAYMOVE` — permit the kernel to move the mapping if in-place
+/// resize cannot be satisfied.
+pub const MREMAP_MAYMOVE: u64 = 0x1;
+/// `MREMAP_FIXED` — move to the supplied fifth argument. Linux requires
+/// this to be paired with `MREMAP_MAYMOVE`.
+pub const MREMAP_FIXED: u64 = 0x2;
+/// `MREMAP_DONTUNMAP` — accepted by newer Linux only for specialized
+/// userfaultfd-style moves; txKernel does not implement it yet.
+pub const MREMAP_DONTUNMAP: u64 = 0x4;
 /// `mmap(addr, length, prot, flags, fd, offset)`. Linux RV64 generic
 /// ABI `__NR_mmap = 222`.
 pub const NR_MMAP: u64 = 222;
@@ -596,9 +602,8 @@ pub const MAP_PRIVATE: u64 = 0x02;
 /// (`MapPlacement::FixedReplace`).
 pub const MAP_FIXED: u64 = 0x10;
 /// `MAP_ANONYMOUS` — mapping is not file-backed; `fd` and `offset` are
-/// ignored. Routes to `VmBacking::PrivateAnon` (or
-/// `VmBacking::None`-shaped Shared, which Slice 2 does not yet wire —
-/// shared anon is treated like private anon for now).
+/// ignored. Private anonymous mappings route to `VmBacking::PrivateAnon`;
+/// shared anonymous mappings allocate an anonymous `PageContainer`.
 pub const MAP_ANONYMOUS: u64 = 0x20;
 /// `MAP_GROWSDOWN` — stack-style mapping, threads through to
 /// `VmEntryFlags.grows_down`.
@@ -1513,28 +1518,30 @@ pub const SFD_NONBLOCK: u32 = O_NONBLOCK;
 // Spec: `docs/Txv3/03_STEP_MODEL_v2.md` §5 `YieldShape::OnEdge`.
 // =====================================================================
 
-/// `epoll_create1(flags)`. Linux generic uapi `__NR_epoll_create1 = 291`.
+/// `epoll_create1(flags)`. Linux generic uapi `__NR_epoll_create1 = 20`
+/// on RV64 and LoongArch64. The historical x86_64 number is 291, but
+/// generic targets reserve 291 for `statx`.
 /// Allocates a fresh [`tx_subsystems::epoll::Epoll`] cap, wraps it in
 /// an `OpenFile` with `OpenFileBacking::Epoll`, and installs it at the
 /// lowest free fd.
-pub const NR_EPOLL_CREATE1: u64 = 291;
+pub const NR_EPOLL_CREATE1: u64 = 20;
 
 /// `epoll_ctl(epfd, op, fd, event_ptr)`. Linux generic uapi
-/// `__NR_epoll_ctl = 233`. ADD, MOD, or DEL a monitored fd.
-pub const NR_EPOLL_CTL: u64 = 233;
+/// `__NR_epoll_ctl = 21`. ADD, MOD, or DEL a monitored fd.
+pub const NR_EPOLL_CTL: u64 = 21;
 
-/// `epoll_wait(epfd, events, maxevents, timeout)`. Linux generic uapi
-/// `__NR_epoll_wait = 232`. Block until ready events arrive.
-/// (Note: the newer `epoll_pwait` = 281 is a superset with sigmask;
-/// not wired in Phase B.1.)
+/// `epoll_wait(epfd, events, maxevents, timeout)`. The RV64/LA64
+/// generic ABI does not expose a separate raw `epoll_wait` syscall;
+/// musl implements `epoll_wait(3)` through `epoll_pwait(2)`. Keep the
+/// x86_64 value here as an unwired cross-reference.
 pub const NR_EPOLL_WAIT: u64 = 232;
 
 /// `epoll_pwait(epfd, events, maxevents, timeout, sigmask)`.
-/// Linux generic uapi `__NR_epoll_pwait = 281`. Block until ready
+/// Linux generic uapi `__NR_epoll_pwait = 22`. Block until ready
 /// events arrive, atomically updating the signal mask. Phase B.1c
 /// stubs the sigmask; real signal-mask manipulation is deferred to
 /// a future signal-subsystem PR.
-pub const NR_EPOLL_PWAIT: u64 = 281;
+pub const NR_EPOLL_PWAIT: u64 = 22;
 
 // =====================================================================
 // eventfd / timerfd syscall numbers
@@ -1633,6 +1640,10 @@ pub const TFD_NONBLOCK_FLAG: u32 = O_NONBLOCK;
 
 /// `TFD_TIMER_ABSTIME` — interpret `it_value` as an absolute time.
 pub const TFD_TIMER_ABSTIME_FLAG: u32 = 1;
+/// `TFD_TIMER_CANCEL_ON_SET` — recognised for musl/Linux header
+/// compatibility. txKernel has no wall-clock discontinuity event yet,
+/// so the bit is accepted and otherwise ignored.
+pub const TFD_TIMER_CANCEL_ON_SET_FLAG: u32 = 1 << 1;
 
 /// `syslog(type, bufp, len)` — Linux kernel ring-buffer read / control.
 /// Linux generic uapi `__NR_syslog = 116`.  Called by `dmesg(1)`.

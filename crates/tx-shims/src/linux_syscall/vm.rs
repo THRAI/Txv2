@@ -183,7 +183,21 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
 
     // Build the backing.
     let backing = if anonymous {
-        VmBacking::PrivateAnon
+        if shared {
+            let page_count = (length / USER_PAGE_SIZE) as u64;
+            let pc = match PageContainer::new_cap(
+                PageContainerKind::Anon {
+                    swap_policy: AnonSwapPolicy::Reclaimable,
+                },
+                page_count,
+            ) {
+                Ok(pc) => pc,
+                Err(_) => return SyscallResult::Error(errno_to_i32(Errno::ENOMEM)),
+            };
+            VmBacking::Page { pc, offset: 0 }
+        } else {
+            VmBacking::PrivateAnon
+        }
     } else {
         if fd < 0 {
             return SyscallResult::Error(EBADF_VALUE);
@@ -464,20 +478,23 @@ pub(super) async fn sys_mprotect(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscal
 
 /// `mremap(old_addr, old_size, new_size, flags, new_addr)` — Linux
 /// RV64 generic syscall #216.
-///
-/// Slice 2 wraps `AddressSpace::try_mremap`, which only supports the
-/// disjoint-range form (`old_range ∩ new_range == ∅`). The Linux
-/// `MREMAP_FIXED | MREMAP_MAYMOVE` shape musl emits maps cleanly to
-/// this contract; in-place grow without `MAYMOVE` would need
-/// `try_mremap`'s contract extended (deferred).
 pub(super) async fn sys_mremap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let old_addr = args[0];
     let old_size_in = args[1] as usize;
     let new_size_in = args[2] as usize;
-    let _flags = args[3];
+    let flags = args[3];
     let new_addr = args[4];
 
     if old_size_in == 0 || new_size_in == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let known_flags = MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP;
+    if flags & !known_flags != 0 || flags & MREMAP_DONTUNMAP != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let may_move = flags & MREMAP_MAYMOVE != 0;
+    let fixed = flags & MREMAP_FIXED != 0;
+    if fixed && !may_move {
         return SyscallResult::Error(EINVAL_VALUE);
     }
     let old_size = match old_size_in.checked_next_multiple_of(USER_PAGE_SIZE) {
@@ -488,21 +505,67 @@ pub(super) async fn sys_mremap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
         Some(r) => r,
         None => return SyscallResult::Error(EINVAL_VALUE),
     };
-    if !UserVirtAddr::new(old_addr as usize).is_page_aligned()
-        || !UserVirtAddr::new(new_addr as usize).is_page_aligned()
-    {
+    if !UserVirtAddr::new(old_addr as usize).is_page_aligned() {
         return SyscallResult::Error(EINVAL_VALUE);
     }
     let old_range = match UserRange::new_aligned(UserVirtAddr::new(old_addr as usize), old_size) {
         Ok(r) => r,
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
-    let new_range = match UserRange::new_aligned(UserVirtAddr::new(new_addr as usize), new_size) {
-        Ok(r) => r,
-        Err(_) => return SyscallResult::Error(EINVAL_VALUE),
+
+    let request = if fixed {
+        if !UserVirtAddr::new(new_addr as usize).is_page_aligned() {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        let new_range = match UserRange::new_aligned(UserVirtAddr::new(new_addr as usize), new_size)
+        {
+            Ok(r) => r,
+            Err(_) => return SyscallResult::Error(EINVAL_VALUE),
+        };
+        VmRemapRequest::fixed_replace(old_range, new_range)
+    } else {
+        let in_place_range =
+            match UserRange::new_aligned(UserVirtAddr::new(old_addr as usize), new_size) {
+                Ok(r) => r,
+                Err(_) => return SyscallResult::Error(EINVAL_VALUE),
+            };
+        VmRemapRequest::in_place(old_range, in_place_range)
     };
 
-    let request = VmRemapRequest::new(old_range, new_range);
+    let outcome = drive_vm_remap(ctx, request).await;
+    let result = match outcome {
+        Ok(outcome) => Ok(outcome),
+        Err(errno)
+            if !fixed && may_move && (errno == V3Errno::ENOMEM || errno == V3Errno::EEXIST) =>
+        {
+            let page_count = new_size / USER_PAGE_SIZE;
+            let window = match UserRange::new_aligned(
+                UserVirtAddr(USER_PAGE_SIZE),
+                FULL_USER_V1_TOP - USER_PAGE_SIZE,
+            ) {
+                Ok(range) => range,
+                Err(_) => return SyscallResult::Error(EINVAL_VALUE),
+            };
+            let Some(dst_range) = ctx.aspace.find_free_range(window, page_count) else {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOMEM));
+            };
+            let move_request = VmRemapRequest::new(old_range, dst_range);
+            drive_vm_remap(ctx, move_request).await
+        }
+        Err(errno) if !fixed && !may_move && errno == V3Errno::EEXIST => Err(V3Errno::ENOMEM),
+        Err(errno) => Err(errno),
+    };
+
+    match result {
+        Ok(outcome) => SyscallResult::Return(outcome.new_range.start().as_usize() as i64),
+        Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
+    }
+}
+
+async fn drive_vm_remap(
+    ctx: &SyscallCtx<'_>,
+    request: VmRemapRequest,
+) -> Result<tx_subsystems::vm::VmRemapOutcome, V3Errno> {
     let op = VmRemapOp {
         aspace: &ctx.aspace,
         request,
@@ -511,7 +574,7 @@ pub(super) async fn sys_mremap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
     let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    match drive(
+    drive(
         op,
         &mut script_ctx,
         DriveMode::Waiting,
@@ -520,10 +583,6 @@ pub(super) async fn sys_mremap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
         timer_wheel_arc.as_ref(),
     )
     .await
-    {
-        Ok(outcome) => SyscallResult::Return(outcome.new_range.start().as_usize() as i64),
-        Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
-    }
 }
 
 /// `madvise(addr, length, advice)` — Linux RV64 generic syscall #233.

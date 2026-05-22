@@ -685,12 +685,13 @@ impl<P: TxPlatform> CoreInit<P> {
             // the previous poll iteration become visible to the
             // reactor here, outside the inner lock that sys_clone
             // ran under.
-            Self::drain_pending_child_submits();
+            let submitted_child_before_poll = Self::drain_pending_child_submits();
 
             let step = match Self::step_boot_reactor_once_concurrent(current_cpu) {
                 Some(step) => step,
                 None => break,
             };
+            let submitted_child_after_poll = Self::drain_pending_child_submits();
 
             // EBR drain. Caps retired during the task polls above
             // (e.g. `Cap<OpenFile>` from `sys_close` / process exit fd
@@ -718,7 +719,12 @@ impl<P: TxPlatform> CoreInit<P> {
             // if there are items still pending reclamation (need more epoch
             // advances before they can be reclaimed).
             let ebr_active = drain_stats.reclaimed > 0 || drain_stats.remaining > 0;
-            if step.should_idle() && !ebr_active && !init.is_zombie() {
+            if step.should_idle()
+                && !submitted_child_before_poll
+                && !submitted_child_after_poll
+                && !ebr_active
+                && !init.is_zombie()
+            {
                 // When the reactor has no pending deadline, the platform
                 // timer was cancelled by `program_hart_loop_deadline`.
                 // Re-arm it here so WFI wakes periodically — the drain

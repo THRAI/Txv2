@@ -23,10 +23,11 @@
 //! the emitted auxv table from six entries to eleven so musl's
 //! `__init_security` runtime can read the cred + setuid-binary signal
 //! straight off the stack. The drift-cleanup chore added `AT_BASE` and
-//! `AT_ENTRY` to bring the table to thirteen entries: `AT_PHDR`,
+//! `AT_ENTRY` to bring the minimum table to thirteen entries: `AT_PHDR`,
 //! `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_BASE`, `AT_ENTRY`,
 //! `AT_UID`, `AT_EUID`, `AT_GID`, `AT_EGID`, `AT_SECURE`, `AT_RANDOM`,
-//! `AT_NULL`.
+//! `AT_NULL`. Later arch/runtime entries are emitted when present; absent
+//! optional pointer entries are omitted, not encoded with null values.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -76,7 +77,7 @@ const AT_RANDOM_REGION_SIZE: usize = 16;
 /// SysV RV64 psABI mandates 16-byte stack alignment at `_start`.
 const STACK_ALIGN: usize = 16;
 
-/// Number of auxv pairs we emit (12 facts + AT_NULL terminator).
+/// Maximum number of auxv pairs reserved in the initial stack image.
 ///
 /// Part 6 of the DAC + setuid slice grew this from 6 to 11 by adding
 /// `AT_UID`, `AT_EUID`, `AT_GID`, `AT_EGID`, and `AT_SECURE`. The
@@ -88,6 +89,11 @@ const STACK_ALIGN: usize = 16;
 /// 16 bytes, so the upper-table region grew by 7 × 16 = 112 bytes
 /// over the pre-Part-6 baseline; the existing alignment helper handles
 /// the size change automatically.
+///
+/// Optional pointer-valued entries (`AT_PLATFORM`, `AT_SYSINFO_EHDR`,
+/// `AT_EXECFN`) are omitted when absent, not emitted with a zero value:
+/// musl records presence in `aux[0]` while decoding auxv, and presence
+/// with a null pointer is observably different from absence.
 const AUXV_PAIR_COUNT: usize = 20;
 
 /// Composed stack image ready to write into a detached `AddressSpace`.
@@ -268,12 +274,10 @@ pub fn build_initial_user_stack(
 
     // ---- 3. Compute the upper-table size --------------------------------
     //
-    //   argc (8) + (argc+1) argv ptrs + (envc+1) envp ptrs + 13 auxv pairs
+    //   argc (8) + (argc+1) argv ptrs + (envc+1) envp ptrs + reserved auxv
     //
-    // The auxv pair count is fixed at `AUXV_PAIR_COUNT` (12 facts +
-    // AT_NULL). DAC + setuid slice Part 6 grew this from 6 to 11; the
-    // drift-cleanup chore (2026-05-07) grew it from 11 to 13 by adding
-    // `AT_BASE` and `AT_ENTRY`.
+    // The auxv reservation is fixed at `AUXV_PAIR_COUNT`; the actual
+    // emitted list can be shorter when optional pointer facts are absent.
     let upper_table_size = WORD_SIZE                   // argc
         + (argc + 1) * WORD_SIZE                       // argv ptrs + NULL
         + (envc + 1) * WORD_SIZE                       // envp ptrs + NULL
@@ -396,37 +400,50 @@ pub fn build_initial_user_stack(
     debug_assert!(envp_string_cursor == envp_pool_top);
 
     // auxv (fixed order matching Linux `fs/binfmt_elf.c::create_elf_tables`
-    // for the slice's surface: AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ,
-    // AT_BASE, AT_ENTRY, AT_UID, AT_EUID, AT_GID, AT_EGID, AT_SECURE,
-    // AT_RANDOM, AT_NULL).
-    let auxv_entries: [(u64, u64); AUXV_PAIR_COUNT] = [
-        (AT_PHDR, auxv_facts.at_phdr),
-        (AT_PHENT, auxv_facts.at_phent),
-        (AT_PHNUM, auxv_facts.at_phnum),
-        (AT_PAGESZ, auxv_facts.at_pagesz),
-        (AT_BASE, auxv_facts.at_base),
-        (AT_ENTRY, auxv_facts.at_entry),
-        (AT_UID, auxv_facts.at_uid),
-        (AT_EUID, auxv_facts.at_euid),
-        (AT_GID, auxv_facts.at_gid),
-        (AT_EGID, auxv_facts.at_egid),
-        (AT_SECURE, auxv_facts.at_secure),
-        (AT_RANDOM, at_random_base),
-        (AT_HWCAP, auxv_facts.at_hwcap),
-        (AT_HWCAP2, auxv_facts.at_hwcap2),
-        (AT_PLATFORM, auxv_facts.at_platform.unwrap_or(0)),
-        (AT_CLKTCK, auxv_facts.at_clktck),
-        (AT_SYSINFO_EHDR, auxv_facts.at_sysinfo_ehdr.unwrap_or(0)),
-        (AT_EXECFN, auxv_facts.at_execfn.unwrap_or(0)),
-        (AT_FLAGS, auxv_facts.at_flags),
-        (AT_NULL, 0),
-    ];
-    for (a_type, a_val) in auxv_entries {
+    // for the slice's surface). Optional pointer-valued entries are
+    // included only when they point at a real stack/user object.
+    let mut auxv_entries: [(u64, u64); AUXV_PAIR_COUNT] = [(AT_NULL, 0); AUXV_PAIR_COUNT];
+    let mut auxv_len = 0usize;
+    {
+        let mut push_auxv = |a_type: u64, a_val: u64| {
+            debug_assert!(auxv_len < AUXV_PAIR_COUNT);
+            auxv_entries[auxv_len] = (a_type, a_val);
+            auxv_len += 1;
+        };
+        push_auxv(AT_PHDR, auxv_facts.at_phdr);
+        push_auxv(AT_PHENT, auxv_facts.at_phent);
+        push_auxv(AT_PHNUM, auxv_facts.at_phnum);
+        push_auxv(AT_PAGESZ, auxv_facts.at_pagesz);
+        push_auxv(AT_BASE, auxv_facts.at_base);
+        push_auxv(AT_ENTRY, auxv_facts.at_entry);
+        push_auxv(AT_UID, auxv_facts.at_uid);
+        push_auxv(AT_EUID, auxv_facts.at_euid);
+        push_auxv(AT_GID, auxv_facts.at_gid);
+        push_auxv(AT_EGID, auxv_facts.at_egid);
+        push_auxv(AT_SECURE, auxv_facts.at_secure);
+        push_auxv(AT_RANDOM, at_random_base);
+        push_auxv(AT_HWCAP, auxv_facts.at_hwcap);
+        push_auxv(AT_HWCAP2, auxv_facts.at_hwcap2);
+        if let Some(at_platform) = auxv_facts.at_platform.filter(|v| *v != 0) {
+            push_auxv(AT_PLATFORM, at_platform);
+        }
+        push_auxv(AT_CLKTCK, auxv_facts.at_clktck);
+        if let Some(at_sysinfo_ehdr) = auxv_facts.at_sysinfo_ehdr.filter(|v| *v != 0) {
+            push_auxv(AT_SYSINFO_EHDR, at_sysinfo_ehdr);
+        }
+        if let Some(at_execfn) = auxv_facts.at_execfn.filter(|v| *v != 0) {
+            push_auxv(AT_EXECFN, at_execfn);
+        }
+        push_auxv(AT_FLAGS, auxv_facts.at_flags);
+        push_auxv(AT_NULL, 0);
+    }
+    for &(a_type, a_val) in auxv_entries[..auxv_len].iter() {
         write_u64(&mut bytes, off, a_type);
         write_u64(&mut bytes, off + WORD_SIZE, a_val);
         off += AUXV_PAIR_SIZE;
     }
-    debug_assert!(off == upper_table_size);
+    debug_assert!(off <= upper_table_size);
+    off = upper_table_size;
 
     // ---- 8. Padding region is already zeroed by `vec![0u8; total]` ------
     //
@@ -569,16 +586,15 @@ mod tests {
         // envp NULL terminator at offset 24 (argc + argv[0] + argv NULL).
         assert_eq!(read_u64(&image.bytes, 24), 0);
 
-        // auxv table starts at offset 32. Thirteen 16-byte pairs (12
-        // facts + AT_NULL terminator) per the drift-cleanup chore; the
-        // pre-chore baseline was eleven, and the pre-Part-6 baseline
-        // was six.
+        // auxv table starts at offset 32. Optional pointer-valued
+        // facts are omitted when absent, so this minimum image reaches
+        // AT_NULL earlier than the reserved table capacity.
         let auxv_off = WORD_SIZE                // argc
             + 2 * WORD_SIZE                     // argv[0] + NULL
             + WORD_SIZE; // envp NULL
                          // Pair order: PHDR, PHENT, PHNUM, PAGESZ,
                          // BASE, ENTRY, UID, EUID, GID, EGID, SECURE,
-                         // RANDOM, NULL.
+                         // RANDOM, HWCAP, HWCAP2, CLKTCK, FLAGS, NULL.
         let pair = |i: usize| {
             let base = auxv_off + i * AUXV_PAIR_SIZE;
             (
@@ -600,11 +616,11 @@ mod tests {
         assert_eq!(pair(11).0, AT_RANDOM);
         assert_eq!(pair(12).0, AT_HWCAP);
         assert_eq!(pair(13).0, AT_HWCAP2);
-        assert_eq!(pair(14).0, AT_PLATFORM);
-        assert_eq!(pair(15).0, AT_CLKTCK);
-        assert_eq!(pair(16).0, AT_SYSINFO_EHDR);
-        assert_eq!(pair(17).0, AT_EXECFN);
-        assert_eq!(pair(18).0, AT_FLAGS);
+        assert_eq!(pair(14).0, AT_CLKTCK);
+        assert_eq!(pair(15).0, AT_FLAGS);
+        assert_eq!(pair(16), (AT_NULL, 0));
+        assert_eq!(pair(17), (AT_NULL, 0));
+        assert_eq!(pair(18), (AT_NULL, 0));
         assert_eq!(pair(19), (AT_NULL, 0));
 
         // AT_RANDOM region is 16 bytes of zero in the image.
@@ -727,14 +743,16 @@ mod tests {
     }
 
     /// Walk a freshly built stack and round-trip-decode every auxv
-    /// entry, verifying the thirteen-pair shape introduced in the
+    /// entry, verifying the minimum auxv shape introduced in the
     /// drift-cleanup chore (2026-05-07). Pre-Part-6 the table was six
     /// pairs (PHDR, PHENT, PHNUM, PAGESZ, RANDOM, NULL); Part 6
     /// inserted UID, EUID, GID, EGID, SECURE between PAGESZ and
     /// RANDOM (eleven pairs); the drift-cleanup chore inserted BASE
-    /// and ENTRY between PAGESZ and UID (thirteen pairs).
+    /// and ENTRY between PAGESZ and UID. Optional pointer-valued
+    /// facts must be omitted when absent because musl tracks auxv
+    /// presence separately from auxv value.
     #[test]
-    fn build_initial_user_stack_emits_thirteen_auxv_entries() {
+    fn build_initial_user_stack_omits_absent_optional_auxv_entries() {
         let stack_top = 0x4000_0000u64;
         let image = build_initial_user_stack(stack_top, &[], &[], &facts());
 
@@ -749,7 +767,8 @@ mod tests {
             )
         };
 
-        // Thirteen entries (12 facts + AT_NULL terminator).
+        // Reserved capacity stays high enough for optional arch/runtime
+        // entries, but absent optional pointer facts do not occupy slots.
         assert_eq!(AUXV_PAIR_COUNT, 20);
         assert_eq!(pair(0).0, AT_PHDR);
         assert_eq!(pair(1).0, AT_PHENT);
@@ -765,11 +784,41 @@ mod tests {
         assert_eq!(pair(11).0, AT_RANDOM);
         assert_eq!(pair(12).0, AT_HWCAP);
         assert_eq!(pair(13).0, AT_HWCAP2);
-        assert_eq!(pair(14).0, AT_PLATFORM);
-        assert_eq!(pair(15).0, AT_CLKTCK);
-        assert_eq!(pair(16).0, AT_SYSINFO_EHDR);
-        assert_eq!(pair(17).0, AT_EXECFN);
-        assert_eq!(pair(18).0, AT_FLAGS);
+        assert_eq!(pair(14).0, AT_CLKTCK);
+        assert_eq!(pair(15).0, AT_FLAGS);
+        assert_eq!(pair(16), (AT_NULL, 0));
+        assert_eq!(pair(17), (AT_NULL, 0));
+        assert_eq!(pair(18), (AT_NULL, 0));
+        assert_eq!(pair(19), (AT_NULL, 0));
+    }
+
+    #[test]
+    fn build_initial_user_stack_emits_optional_auxv_entries_when_present() {
+        let stack_top = 0x4000_0000u64;
+        let auxv_facts = AuxvFacts {
+            at_platform: Some(0x4000_1000),
+            at_sysinfo_ehdr: Some(0x4000_2000),
+            at_execfn: Some(0x4000_3000),
+            ..facts()
+        };
+        let image = build_initial_user_stack(stack_top, &[], &[], &auxv_facts);
+
+        let auxv_off = WORD_SIZE                // argc
+            + 2 * WORD_SIZE                     // argv[0] + NULL
+            + WORD_SIZE; // envp NULL
+        let pair = |i: usize| {
+            let base = auxv_off + i * AUXV_PAIR_SIZE;
+            (
+                read_u64(&image.bytes, base),
+                read_u64(&image.bytes, base + 8),
+            )
+        };
+
+        assert_eq!(pair(14), (AT_PLATFORM, 0x4000_1000));
+        assert_eq!(pair(15), (AT_CLKTCK, CLKTCK_VALUE));
+        assert_eq!(pair(16), (AT_SYSINFO_EHDR, 0x4000_2000));
+        assert_eq!(pair(17), (AT_EXECFN, 0x4000_3000));
+        assert_eq!(pair(18), (AT_FLAGS, 0));
         assert_eq!(pair(19), (AT_NULL, 0));
     }
 

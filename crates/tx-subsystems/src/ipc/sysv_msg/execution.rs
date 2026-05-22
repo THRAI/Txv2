@@ -19,6 +19,11 @@ use crate::process::nsproxy::SysvKey;
 
 // msgctl commands (same numbering as shmctl)
 pub use crate::ipc::sysv_shm::execution::{IPC_INFO, IPC_RMID, IPC_SET, IPC_STAT};
+pub const MSG_NOERROR: i32 = 0o10000;
+pub const MSG_EXCEPT: i32 = 0o20000;
+pub const MSG_STAT: i32 = 11;
+pub const MSG_INFO: i32 = 12;
+pub const MSG_STAT_ANY: i32 = 13;
 
 // ---------------------------------------------------------------------------
 // Payload access helper
@@ -178,9 +183,16 @@ pub fn step_msgrcv(
         }
 
         let mut messages = payload.messages.lock();
-        let pos = find_msg(&messages, msgtyp, msgsz).ok_or(Errno::E2BIG)?;
+        let pos = find_msg(&messages, msgtyp).ok_or(Errno::EAGAIN)?;
+        if messages[pos].mtext.len() > msgsz && (msgflg & MSG_NOERROR) == 0 {
+            return Err(Errno::E2BIG);
+        }
         let msg = messages.remove(pos);
         let mlen = msg.mtext.len();
+        let mut mtext = msg.mtext;
+        if mtext.len() > msgsz {
+            mtext.truncate(msgsz);
+        }
         drop(messages);
         payload
             .current_bytes
@@ -188,23 +200,21 @@ pub fn step_msgrcv(
         payload.msg_count.fetch_sub(1, Ordering::Release);
         payload.send_channel.fire(Mask::from_bits(1));
 
-        Ok((msg.mtype, msg.mtext))
+        Ok((msg.mtype, mtext))
     })
 }
 
-fn find_msg(messages: &[Msg], msgtyp: i64, max_bytes: usize) -> Option<usize> {
+fn find_msg(messages: &[Msg], msgtyp: i64) -> Option<usize> {
     if msgtyp == 0 {
-        messages.iter().position(|m| m.mtext.len() <= max_bytes)
+        messages.iter().position(|_| true)
     } else if msgtyp > 0 {
-        messages
-            .iter()
-            .position(|m| m.mtype == msgtyp && m.mtext.len() <= max_bytes)
+        messages.iter().position(|m| m.mtype == msgtyp)
     } else {
         let threshold = -msgtyp;
         messages
             .iter()
             .enumerate()
-            .filter(|(_, m)| m.mtype <= threshold && m.mtext.len() <= max_bytes)
+            .filter(|(_, m)| m.mtype <= threshold)
             .min_by_key(|(_, m)| m.mtype)
             .map(|(i, _)| i)
     }
@@ -215,7 +225,12 @@ fn find_msg(messages: &[Msg], msgtyp: i64, max_bytes: usize) -> Option<usize> {
 // ---------------------------------------------------------------------------
 
 /// `msgctl(msqid, cmd, buf)` — control a message queue.
-pub fn step_msgctl(msqid: u32, cmd: i32, cred: &Cap<Cred>) -> Result<MsgCtlResult, Errno> {
+pub fn step_msgctl(
+    msqid: u32,
+    cmd: i32,
+    set_fields: Option<(u16, u32, u32)>,
+    cred: &Cap<Cred>,
+) -> Result<MsgCtlResult, Errno> {
     match cmd {
         IPC_RMID => {
             let queue = checks::require_msg_exists(msqid)?;
@@ -229,28 +244,38 @@ pub fn step_msgctl(msqid: u32, cmd: i32, cred: &Cap<Cred>) -> Result<MsgCtlResul
         IPC_SET => {
             let queue = checks::require_msg_exists(msqid)?;
             checks::require_owner_or_admin(&queue, cred)?;
-            let _ = queue;
+            let Some((mode, uid, gid)) = set_fields else {
+                return Err(Errno::EINVAL);
+            };
+            queue.mode.store(mode & 0o777, Ordering::Release);
+            queue.uid.store(uid, Ordering::Release);
+            queue.gid.store(gid, Ordering::Release);
             Ok(MsgCtlResult::Success)
         }
-        IPC_STAT => {
+        IPC_STAT | MSG_STAT | MSG_STAT_ANY => {
             let queue = checks::require_msg_exists(msqid)?;
             checks::require_can_read_msg(&queue, cred)?;
-            let (current_bytes, msg_count) = with_payload!(queue, payload, {
+            let (current_bytes, msg_count, qbytes) = with_payload!(queue, payload, {
                 (
                     payload.current_bytes.load(Ordering::Acquire) as usize,
                     payload.msg_count.load(Ordering::Acquire),
+                    payload.max_bytes,
                 )
             });
             Ok(MsgCtlResult::Stat(MsgInfo {
+                key: queue.key_raw(),
                 msqid: queue.msqid,
+                uid: queue.uid(),
+                gid: queue.gid(),
                 cuid: queue.cuid,
                 cgid: queue.cgid,
-                perm: queue.perm,
+                perm: queue.perm(),
                 current_bytes,
                 msg_count,
+                qbytes,
             }))
         }
-        IPC_INFO => Ok(MsgCtlResult::Info {
+        IPC_INFO | MSG_INFO => Ok(MsgCtlResult::Info {
             msgmni: 32000,
             msgmax: 8192,
             msgmnb: 16384,
@@ -276,10 +301,14 @@ pub enum MsgCtlResult {
 
 #[derive(Clone, Debug)]
 pub struct MsgInfo {
+    pub key: i32,
     pub msqid: u32,
+    pub uid: u32,
+    pub gid: u32,
     pub cuid: u32,
     pub cgid: u32,
     pub perm: IpcPerm,
     pub current_bytes: usize,
     pub msg_count: u32,
+    pub qbytes: usize,
 }

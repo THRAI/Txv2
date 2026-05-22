@@ -140,6 +140,10 @@ impl PmapIf for ScriptsTestPmap {
     }
 }
 
+impl tx_hal::ConsoleIf for ScriptsTestPmap {
+    fn write_bytes(_bytes: &[u8]) {}
+}
+
 // `exec_script::<P>` requires `P: PmapIf + EntropyIf`. The trait
 // default fills bytes from the deterministic boot-counter
 // xorshift, which is exactly what test sites want — non-zero,
@@ -553,6 +557,48 @@ fn exec_script_loads_minimal_elf_seeds_saved_user_context() {
     // Other GPRs (besides x2) are zero per System V `_start` contract.
     assert_eq!(ctx.regs[0], 0);
     assert_eq!(ctx.regs[1], 0);
+}
+
+#[test]
+fn exec_script_collapses_sibling_threads_before_aspace_swap() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+
+    let sibling = tx_subsystems::process::execution::step_clone_thread(
+        &process,
+        &tx_hal::UserTrapContext {
+            regs: [0; 32],
+            pc: 0x4000_0000,
+            status: 0,
+            fp: tx_hal::UserFpContext::empty(),
+        },
+        0,
+        0,
+        0,
+    )
+    .expect("sibling thread");
+    assert_eq!(process.live_thread_count(), 2);
+
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+
+    assert_eq!(
+        process.live_thread_count(),
+        1,
+        "exec must leave only the initiating thread live"
+    );
+    assert!(process.thread_by_tid(thread.tid.0).is_some());
+    assert!(process.thread_by_tid(sibling.tid.0).is_none());
+    assert!(sibling.is_zombie());
 }
 
 #[test]

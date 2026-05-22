@@ -741,6 +741,45 @@ fn vm_checks_require_fault_publication_rejects_stale_recipe_and_page() {
 }
 
 #[test]
+fn vm_checks_require_fault_publication_rejects_replaced_private_set_identity() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x4000, 1),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("map");
+
+    let outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x4000), AccessMode::Read))
+        .expect("fault resolves");
+    let materialized = outcome
+        .materialize_pagebacked()
+        .expect("private anon materialization");
+
+    aspace
+        .try_mmap(VmMapRequest::fixed(
+            range(0x4000, 1),
+            MapPlacement::FixedReplace,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ))
+        .expect("replace with semantically equivalent private mapping");
+
+    assert_eq!(
+        super::checks::require_fault_publication(&aspace, &outcome, &materialized),
+        Err(VmFaultError::StaleRecipe)
+    );
+}
+
+#[test]
 fn vm_checks_require_map_admission_preserves_placement_rules() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
@@ -772,14 +811,14 @@ fn vm_checks_require_map_admission_preserves_placement_rules() {
 }
 
 #[test]
-fn vm_checks_require_disjoint_remap_rejects_overlap_and_size_mismatch() {
+fn vm_checks_require_disjoint_remap_rejects_overlap_only() {
     assert_eq!(
         super::checks::require_disjoint_remap(range(0x1000, 2), range(0x2000, 2)),
         Err(VmMapError::InvalidRange)
     );
     assert_eq!(
         super::checks::require_disjoint_remap(range(0x1000, 2), range(0x8000, 1)),
-        Err(VmMapError::InvalidRange)
+        Ok(())
     );
     assert_eq!(
         super::checks::require_disjoint_remap(range(0x1000, 2), range(0x8000, 2)),

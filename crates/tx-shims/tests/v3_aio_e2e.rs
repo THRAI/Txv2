@@ -148,6 +148,7 @@ impl PmapIf for StubPmap {
 
 impl EntropyIf for StubPmap {}
 impl tx_hal::AuxvIf for StubPmap {}
+impl tx_hal::SmpIf for StubPmap {}
 
 impl TimeIf for StubPmap {
     fn read_ns() -> u64 {
