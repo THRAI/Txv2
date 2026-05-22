@@ -19,8 +19,27 @@ use super::helpers::{bootstrap_block_on, exec_error_tag, parse_init_from_cmdline
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
 
-const OSCOMP_LIBCTEST_NETWORK_CMD: &str = "cd /musl/musl || exit 1; \
-	    ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"; \
+fn oscomp_boot_suite(cmdline: Option<&str>) -> Option<&str> {
+    let cmdline = cmdline?;
+    for token in cmdline.split_ascii_whitespace() {
+        if let Some(value) = token.strip_prefix("tx.oscomp=") {
+            return Some(value);
+        }
+        if let Some(value) = token.strip_prefix("tx.oscomp_suite=") {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn oscomp_libctest_network_cmd(libc: &str) -> alloc::string::String {
+    use alloc::format;
+
+    let root = oscomp_libc_root(libc);
+    let group = oscomp_group_label("libctest", libc);
+    format!(
+        "cd {root} || exit 1; \
+	    ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\"; \
 	    ./runtest.exe -w entry-static.exe inet_pton; \
 	    ./runtest.exe -w entry-static.exe socket; \
 	    ./runtest.exe -w entry-static.exe dn_expand_empty; \
@@ -33,36 +52,44 @@ const OSCOMP_LIBCTEST_NETWORK_CMD: &str = "cd /musl/musl || exit 1; \
 	    ./runtest.exe -w entry-dynamic.exe dn_expand_ptr_0; \
 	    ./runtest.exe -w entry-dynamic.exe inet_ntop_v4mapped; \
 	    ./runtest.exe -w entry-dynamic.exe inet_pton_empty_last_field; \
-	    ./busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\"";
+	    ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\""
+    )
+}
 
-const OSCOMP_LMBENCH_NETWORK_CMD: &str = "cd /musl/musl || exit 1; \
+fn oscomp_lmbench_network_cmd(libc: &str) -> alloc::string::String {
+    use alloc::format;
+
+    let root = oscomp_libc_root(libc);
+    let group = oscomp_group_label("lmbench-network", libc);
+    format!(
+        "cd {root} || exit 1; \
 	    host=127.0.0.1; \
 	    export ENOUGH=1000000; \
 	    export TIMING_O=0; \
 	    export LOOP_O=0; \
 	    failed=0; \
 	    ./busybox mkdir -p /tmp; \
-	    check_contains() { label=$1; pat=$2; shift; shift; \
+	    check_contains() {{ label=$1; pat=$2; shift; shift; \
 	        ./busybox echo \"====== lmbench-network $label begin ======\"; \
 	        \"$@\" > /tmp/lmbench-network.out 2>&1; \
 	        ./busybox cat /tmp/lmbench-network.out; \
 	        if ./busybox grep -q \"$pat\" /tmp/lmbench-network.out; then ans=success; else ans=fail; failed=1; fi; \
 	        ./busybox echo \"====== lmbench-network $label end: $ans ======\"; \
-	    }; \
-	    ./busybox echo \"#### OS COMP TEST GROUP START lmbench-network ####\"; \
-	    ./lmbench_all lat_udp -s; \
+	    }}; \
+	    ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\"; \
+	    ./lmbench_all lat_udp -s & \
 	    ./busybox sleep 1; \
 	    check_contains lat_udp \"UDP latency using\" ./lmbench_all lat_udp -W 0 -N 1 -P 1 $host; \
 	    ./lmbench_all lat_udp -S $host; \
-	    ./lmbench_all lat_tcp -s; \
+	    ./lmbench_all lat_tcp -s & \
 	    ./busybox sleep 1; \
 	    check_contains lat_tcp \"TCP latency using\" ./lmbench_all lat_tcp -W 0 -N 1 -P 1 $host; \
 	    ./lmbench_all lat_tcp -S $host; \
-	    ./lmbench_all lat_connect -s; \
+	    ./lmbench_all lat_connect -s & \
 	    ./busybox sleep 1; \
 	    check_contains lat_connect \"TCP/IP connection cost\" ./lmbench_all lat_connect -N 1 $host; \
 	    ./lmbench_all lat_connect -S $host; \
-	    ./lmbench_all bw_tcp -s; \
+	    ./lmbench_all bw_tcp -s & \
 	    ./busybox sleep 1; \
 	    check_contains bw_tcp_1 \"MB/sec\" ./lmbench_all bw_tcp -P 1 -W 0 -N 1 -m 1 $host; \
 	    check_contains bw_tcp_64 \"MB/sec\" ./lmbench_all bw_tcp -P 1 -W 0 -N 1 -m 64 $host; \
@@ -70,20 +97,25 @@ const OSCOMP_LMBENCH_NETWORK_CMD: &str = "cd /musl/musl || exit 1; \
 	    ./busybox echo \"====== lmbench-network bw_tcp_shutdown begin ======\"; \
 	    ./lmbench_all bw_tcp -S $host; \
 	    ./busybox echo \"====== lmbench-network bw_tcp_shutdown end ======\"; \
-	    ./busybox echo \"#### OS COMP TEST GROUP END lmbench-network ####\"; \
-	    exit $failed";
+	    ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\"; \
+	    exit $failed"
+    )
+}
 
-fn oscomp_boot_suite(cmdline: Option<&str>) -> Option<&str> {
-    let cmdline = cmdline?;
-    for token in cmdline.split_ascii_whitespace() {
-        if let Some(value) = token.strip_prefix("tx.oscomp=") {
-            return Some(value);
-        }
-        if let Some(value) = token.strip_prefix("tx.oscomp_suite=") {
-            return Some(value);
-        }
+fn oscomp_libc_root(libc: &str) -> &'static str {
+    match libc {
+        "glibc" => "/musl/glibc",
+        _ => "/musl/musl",
     }
-    None
+}
+
+fn oscomp_group_label(base: &str, libc: &str) -> alloc::string::String {
+    use alloc::format;
+
+    match libc {
+        "glibc" => format!("{base}-glibc"),
+        _ => format!("{base}-musl"),
+    }
 }
 
 impl<P: TxPlatform> CoreInit<P> {
@@ -919,8 +951,14 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     use alloc::string::String;
 
     match oscomp_boot_suite(<P as tx_hal::BootInfoIf>::boot_info().cmdline) {
-        Some("libctest-network") => return String::from(OSCOMP_LIBCTEST_NETWORK_CMD),
-        Some("lmbench-network") => return String::from(OSCOMP_LMBENCH_NETWORK_CMD),
+        Some("libctest-network" | "libctest-network-musl") => {
+            return oscomp_libctest_network_cmd("musl");
+        }
+        Some("libctest-network-glibc") => return oscomp_libctest_network_cmd("glibc"),
+        Some("lmbench-network" | "lmbench-network-musl") => {
+            return oscomp_lmbench_network_cmd("musl");
+        }
+        Some("lmbench-network-glibc") => return oscomp_lmbench_network_cmd("glibc"),
         Some("ltp-glibc") => {
             return String::from("cd /musl/glibc && /musl/musl/busybox sh ltp_testcode.sh");
         }
@@ -960,6 +998,14 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 let _ = write!(
                     cmd,
                     " && cd /musl/glibc && /musl/musl/busybox sh ltp_testcode.sh && cd /musl/musl"
+                );
+                selected += 1;
+                continue;
+            }
+            if let Some(script) = oscomp_glibc_script_for_group(group) {
+                let _ = write!(
+                    cmd,
+                    " && cd /musl/glibc && /musl/musl/busybox sh {script} && cd /musl/musl"
                 );
                 selected += 1;
                 continue;
@@ -1189,6 +1235,24 @@ fn is_libctest_musl_group(group: &str) -> bool {
 
 fn libctest_case_needs_cwd_dso(case: &str) -> bool {
     matches!(case, "dlopen" | "tls_get_new_dtv")
+}
+
+fn oscomp_glibc_script_for_group(group: &str) -> Option<&'static str> {
+    let canonical = group.strip_suffix("-glibc")?;
+    match canonical {
+        "basic" => Some("basic_testcode.sh"),
+        "busybox" => Some("busybox_testcode.sh"),
+        "libctest" => Some("libctest_testcode.sh"),
+        "libcbench" => Some("libcbench_testcode.sh"),
+        "lua" => Some("lua_testcode.sh"),
+        "lmbench" => Some("lmbench_testcode.sh"),
+        "iozone" => Some("iozone_testcode.sh"),
+        "netperf" => Some("netperf_testcode.sh"),
+        "iperf" => Some("iperf_testcode.sh"),
+        "cyclictest" => Some("cyclictest_testcode.sh"),
+        "ltp" => Some("ltp_testcode.sh"),
+        _ => None,
+    }
 }
 
 const LIBCTEST_STATIC_SAFE_CASES: &str =
