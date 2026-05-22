@@ -312,6 +312,13 @@ impl ProcessIdentity {
         }
     }
 
+    /// Take siginfo for a signal being delivered to a userspace handler.
+    pub fn siginfo_take(&self, sig: crate::signal::Signum) -> Option<crate::signal::SigInfo> {
+        let payload_guard = self.payload.lock();
+        let payload = payload_guard.as_ref()?;
+        payload.siginfo_slots.take(sig)
+    }
+
     /// Find a thread by its tid within this process.
     pub fn thread_by_tid(&self, tid: u32) -> Option<Cap<ThreadIdentity>> {
         self.payload.lock().as_ref()?.threads.find_by_tid(tid)

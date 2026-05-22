@@ -10,7 +10,7 @@ use crate::process::{bootstrap_init_process, step_exit_group, step_fork, ExitSta
 use crate::signal::adapter::step_engine::Cap;
 use crate::signal::{
     step_kill_pgrp, step_kill_process, step_sigaction, KillOutcome, PendingSignalQueue,
-    SigDisposition, SigDispositionChange, SignalMask, Signum,
+    SigDisposition, SigDispositionChange, SigInfo, SigInfoSlots, SignalMask, Signum,
 };
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange};
@@ -91,6 +91,22 @@ fn pending_queue_post_clear_and_deliverable_with_mask() {
 
     q.clear(Signum::SIGTERM);
     assert!(!q.is_pending(Signum::SIGTERM));
+}
+
+#[test]
+fn siginfo_slots_take_is_one_shot() {
+    let slots = SigInfoSlots::new();
+    let sig = Signum::SIGTERM;
+    let info = SigInfo {
+        si_signo: sig.raw() as u32,
+        si_code: 1,
+        si_pid: 42,
+        si_uid: 24,
+    };
+    slots.store(sig, info);
+
+    assert_eq!(slots.take(sig), Some(info));
+    assert_eq!(slots.take(sig), None);
 }
 
 #[test]

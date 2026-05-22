@@ -185,6 +185,11 @@ impl SigInfoSlots {
         let idx = (signum.raw() - 1) as usize;
         self.slots.lock()[idx] = None;
     }
+
+    pub fn take(&self, signum: Signum) -> Option<SigInfo> {
+        let idx = (signum.raw() - 1) as usize;
+        self.slots.lock()[idx].take()
+    }
 }
 
 impl Default for SigInfoSlots {
