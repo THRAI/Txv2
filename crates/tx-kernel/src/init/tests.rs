@@ -304,7 +304,6 @@ fn bootstrap_init() {
 fn drive_boot_wiring() {
     bootstrap_init();
     CoreInit::<TestPlatform>::register_console_hardware();
-    CoreInit::<TestPlatform>::register_null_device();
     // Pre-ELF Phase 5 (item 9): mirrors the production boot order.
     // `TestPlatform`'s `IrqIf` impl uses the trait-default
     // `UART_IRQ = 0`, which `install_irq_handlers` accepts without
@@ -318,7 +317,6 @@ fn drive_boot_wiring() {
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
     CoreInit::<TestPlatform>::register_devfs_console_alias();
     CoreInit::<TestPlatform>::mount_tmpfs_at_dev_shm();
-    CoreInit::<TestPlatform>::register_devfs_null_alias();
     CoreInit::<TestPlatform>::mount_bdevfs_at_dev_block();
     CoreInit::<TestPlatform>::bind_init_cwd_and_root();
 }
@@ -435,6 +433,41 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
         }
         other => panic!("expected StructBacked Tty backing, got {other:?}"),
     }
+}
+
+#[test]
+fn boot_smoke_walker_resolves_dev_null_as_char_device() {
+    use tx_subsystems::vfs::{walker, Credential, InodeKind};
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let cwd = init.cwd().expect("init cwd must be bound");
+    let cred = Credential::root();
+    let guard = guard();
+    use step_engine::StepOutcome as V3;
+    let dentry = match walker::step_walk(cwd, b"/dev/null", &cred, &guard) {
+        V3::Done(dentry) => dentry,
+        other => panic!("step_walk(/dev/null) must succeed, got {other:?}"),
+    };
+    assert_eq!(dentry.name().as_bytes(), b"null");
+    assert_eq!(dentry.rnode().meta().kind(), InodeKind::CharDevice);
+
+    let payload = dentry
+        .rnode()
+        .containing_mount_weak()
+        .and_then(|weak| weak.upgrade(&guard))
+        .expect("/dev/null rnode must carry devfs mount payload");
+    let loaded = match payload
+        .fs_ops()
+        .load_inode_meta(dentry.rnode().fs_object_id(), &guard)
+    {
+        V3::Done(meta) => meta,
+        other => panic!("devfs load_inode_meta(/dev/null) failed: {other:?}"),
+    };
+    assert_eq!(loaded.kind(), InodeKind::CharDevice);
 }
 
 /// Post-`mount_bdevfs_at_dev_block`, the VFS walker must resolve

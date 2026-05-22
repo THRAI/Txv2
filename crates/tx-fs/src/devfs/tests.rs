@@ -296,6 +296,27 @@ fn devfs_lookup_zero_materialises_char_device() {
 }
 
 #[test]
+fn devfs_lookup_null_static_char_device_succeeds() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+
+    let guard = guard();
+    let devfs = Devfs::new();
+
+    let obj_id = match <Devfs as FsOps>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"null", &guard) {
+        V3Outcome::Done(id) => id,
+        other => panic!("devfs.lookup(null) failed: {other:?}"),
+    };
+    let meta = match <Devfs as FsOps>::load_inode_meta(&devfs, obj_id, &guard) {
+        V3Outcome::Done(meta) => meta,
+        other => panic!("devfs.load_inode_meta(null) failed: {other:?}"),
+    };
+    assert_eq!(meta.kind(), tx_subsystems::vfs::InodeKind::CharDevice);
+}
+
+#[test]
 fn open_console_for_init_now_routes_through_walker_with_legacy_fallback() {
     // Phase 4 retires the bootstrap exemption: when the walker can
     // resolve `/dev/console` (init_process bound, mount table

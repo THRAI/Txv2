@@ -149,26 +149,25 @@ fn dispatch_fcntl_f_setfl_updates_nonblocking_status_bit() {
 // kill / tkill / tgkill.
 // -----------------------------------------------------------------
 
-/// `kill(self_pid, SIGTERM)` returns 0 — the post is delivered to
-/// the calling process's leader thread. The process becomes a
-/// zombie via the (separately-tested) signal-driven exit path, but
-/// the test only asserts the return value (which is what userspace
-/// sees).
+/// `kill(self_pid, SIGTERM)` returns 0 and materialises the default
+/// terminate disposition immediately. This matches blocking-server
+/// shutdown paths that rely on SIGTERM killing a target even when it
+/// is asleep inside a syscall.
 #[test]
 fn dispatch_kill_self_with_sigterm_succeeds() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
     let pid = proc_cap.pid.0 as u64;
-    let ctx = make_ctx(proc_cap, thread);
+    let ctx = make_ctx(proc_cap.clone(), thread);
 
-    // SIGTERM = 15 (catchable; routes through post_signal, no
-    // zombification side-effect on the calling thread).
+    // SIGTERM = 15 (catchable; default disposition is terminate).
     let r = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(NR_KILL, [pid, 15, 0, 0, 0, 0]),
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Return(0));
+    assert!(proc_cap.is_zombie());
 }
 
 /// `kill(target, sig)` from a non-privileged caller whose uid does

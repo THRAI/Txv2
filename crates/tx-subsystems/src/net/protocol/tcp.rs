@@ -170,8 +170,18 @@ impl RawTcpSocket {
     }
 
     pub fn send_available(&self) -> usize {
-        self.send_capacity
-            .saturating_sub(self.tx_buffer.lock().len())
+        let staged_available = self
+            .send_capacity
+            .saturating_sub(self.tx_buffer.lock().len());
+        let protocol_available = {
+            let socket = self.socket.lock();
+            if socket.may_send() {
+                socket.send_capacity().saturating_sub(socket.send_queue())
+            } else {
+                0
+            }
+        };
+        core::cmp::min(staged_available, protocol_available)
     }
 
     pub fn send_queued(&self) -> usize {
@@ -183,18 +193,20 @@ impl RawTcpSocket {
             return Some((0, false));
         }
 
-        let mut tx = self.tx_buffer.lock();
-        let available = self.send_capacity.saturating_sub(tx.len());
+        let available = self.send_available();
         if available == 0 {
             return None;
         }
 
         let bytes = core::cmp::min(available, len);
-        tx.extend(core::iter::repeat_n(0, bytes));
-        drop(tx);
-        let _ = self.enqueue_protocol_tx_bytes(&vec![0; bytes]);
-        let tx = self.tx_buffer.lock();
-        Some((bytes, tx.len() == self.send_capacity))
+        let accepted = self.enqueue_protocol_tx_bytes(&vec![0; bytes]).ok()?;
+        if accepted == 0 {
+            return None;
+        }
+        self.tx_buffer
+            .lock()
+            .extend(core::iter::repeat_n(0, accepted));
+        Some((accepted, self.send_available() == 0))
     }
 
     pub fn enqueue_tx_bytes(&self, bytes: &[u8]) -> Option<(usize, bool)> {
@@ -202,18 +214,20 @@ impl RawTcpSocket {
             return Some((0, false));
         }
 
-        let mut tx = self.tx_buffer.lock();
-        let available = self.send_capacity.saturating_sub(tx.len());
+        let available = self.send_available();
         if available == 0 {
             return None;
         }
 
-        let accepted = core::cmp::min(available, bytes.len());
-        tx.extend(bytes.iter().copied().take(accepted));
-        drop(tx);
-        let _ = self.enqueue_protocol_tx_bytes(&bytes[..accepted]);
-        let tx = self.tx_buffer.lock();
-        Some((accepted, tx.len() == self.send_capacity))
+        let requested = core::cmp::min(available, bytes.len());
+        let accepted = self.enqueue_protocol_tx_bytes(&bytes[..requested]).ok()?;
+        if accepted == 0 {
+            return None;
+        }
+        self.tx_buffer
+            .lock()
+            .extend(bytes.iter().copied().take(accepted));
+        Some((accepted, self.send_available() == 0))
     }
 
     pub fn ack_tx_bytes(&self, bytes: usize) -> bool {
@@ -221,13 +235,14 @@ impl RawTcpSocket {
             return false;
         }
 
+        let had_no_space = self.send_available() == 0;
         let mut tx = self.tx_buffer.lock();
-        let had_no_space = tx.len() == self.send_capacity;
         let released = core::cmp::min(bytes, tx.len());
         for _ in 0..released {
             let _ = tx.pop_front();
         }
-        had_no_space && released > 0
+        drop(tx);
+        had_no_space && released > 0 && self.send_available() > 0
     }
 
     pub fn dequeue_tx_bytes(&self, max_len: usize) -> Option<(Vec<u8>, bool)> {
@@ -235,12 +250,12 @@ impl RawTcpSocket {
             return None;
         }
 
+        let had_no_space = self.send_available() == 0;
         let mut tx = self.tx_buffer.lock();
         if tx.is_empty() {
             return None;
         }
 
-        let had_no_space = tx.len() == self.send_capacity;
         let bytes = core::cmp::min(tx.len(), max_len);
         let mut drained = Vec::with_capacity(bytes);
         for _ in 0..bytes {

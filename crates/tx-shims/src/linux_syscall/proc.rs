@@ -628,6 +628,12 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             stored: false,
         }
         .await;
+    } else {
+        // A forked child is runnable before the parent observes the pid.
+        // Yield once so cooperative workloads that immediately wait or launch
+        // the next command still give daemon children a chance to reach their
+        // externally-visible setup points (for example listen sockets).
+        tx_reactor::yield_now().await;
     }
 
     // Parent observes the child's pid.
@@ -721,6 +727,7 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                         return SyscallResult::error_from(errno);
                     }
                 }
+                yield_after_reap().await;
                 return SyscallResult::Return(child_pid.0 as i64);
             }
             Err(WaitError::NoChildren) => return SyscallResult::Error(ECHILD_VALUE),
@@ -753,6 +760,14 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                         return SyscallResult::error_from(errno);
                     }
                 }
+                // A foreground child exit often unblocks shell scripts that
+                // immediately launch the next client while daemon peers are
+                // also ready to finish double-fork setup, observe EOF/close,
+                // or reset their listeners. Give the cooperative scheduler a
+                // short bounded fairness window so those peers can publish
+                // externally-visible socket state without scripts needing
+                // timing sleeps.
+                yield_after_reap().await;
                 return SyscallResult::Return(child_pid.0 as i64);
             }
             WaitOutcome::Done(Err(WaitError::NoChildren)) => {
@@ -786,6 +801,12 @@ fn write_wait4_rusage_if_requested(
     }
     let zeros = [0u8; RUSAGE_BYTES];
     bootstrap_copy_to_user(&ctx.aspace, rusage_uaddr, &zeros).map_err(SyscallResult::error_from)
+}
+
+async fn yield_after_reap() {
+    for _ in 0..4 {
+        tx_reactor::yield_now().await;
+    }
 }
 
 /// `getppid()` — return the parent's pid, or `0` (`Pid::RESERVED`)

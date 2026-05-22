@@ -425,7 +425,7 @@ impl SocketOptionSet {
             },
             tcp: TcpLevelOptions {
                 nodelay: false,
-                maxseg: 536,
+                maxseg: 0,
                 keepidle: 7200,
                 keepintvl: 75,
                 keepcnt: 9,
@@ -444,8 +444,8 @@ impl SocketOptionSet {
                 keep_alive: false,
                 broadcast: false,
                 linger: LingerOption::disabled(),
-                recv_buf_size: 87_380,
-                send_buf_size: 16_384,
+                recv_buf_size: 262_144,
+                send_buf_size: 262_144,
                 recv_timeout: None,
                 send_timeout: None,
             },
@@ -457,7 +457,7 @@ impl SocketOptionSet {
             },
             tcp: TcpLevelOptions {
                 nodelay: false,
-                maxseg: 536,
+                maxseg: 0,
                 keepidle: 7200,
                 keepintvl: 75,
                 keepcnt: 9,

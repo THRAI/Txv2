@@ -7,8 +7,8 @@ use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::{socket_send_wait_token, yield_bytes_on_token, ByteStepOutcome};
 use crate::net::protocol::UDP_IPV4_MAX_PAYLOAD_BYTES;
 use crate::net::structure::{
-    IpEndpoint, RecvWireSet, SendRecvFlags, SendWireSet, SocketIdentity, SocketKind, SocketPayload,
-    SocketProtocol, TcpState, UnixDatagramState, UnixSocketPath, UnixStreamState,
+    ConnectionKey, IpEndpoint, RecvWireSet, SendRecvFlags, SendWireSet, SocketIdentity, SocketKind,
+    SocketPayload, SocketProtocol, TcpState, UnixDatagramState, UnixSocketPath, UnixStreamState,
 };
 
 pub fn step_send(
@@ -34,6 +34,9 @@ pub fn step_send(
         return StepOutcome::Err(Errno::EPIPE);
     }
     if let Some(errno) = udp_payload_len_error(socket.kind, payload.udp_corked_send_len() + len) {
+        return StepOutcome::Err(errno);
+    }
+    if let Some(errno) = tcp_connected_peer_error(&payload, guard) {
         return StepOutcome::Err(errno);
     }
     if len == 0 {
@@ -80,6 +83,9 @@ pub fn step_send_kernel_bytes(
     if let Some(errno) =
         udp_payload_len_error(socket.kind, payload.udp_corked_send_len() + bytes.len())
     {
+        return StepOutcome::Err(errno);
+    }
+    if let Some(errno) = tcp_connected_peer_error(&payload, guard) {
         return StepOutcome::Err(errno);
     }
     if bytes.is_empty() {
@@ -175,6 +181,9 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
     if let Some(errno) = stream_send_state_error(socket, &payload) {
         return StepOutcome::Err(errno);
     }
+    if let Some(errno) = tcp_connected_peer_error(&payload, guard) {
+        return StepOutcome::Err(errno);
+    }
     if let Some(errno) =
         udp_payload_len_error(socket.kind, payload.udp_corked_send_len() + bytes.len())
     {
@@ -237,6 +246,29 @@ fn stream_send_state_error(socket: &Cap<SocketIdentity>, payload: &SocketPayload
             Some(Errno::EPIPE)
         }
         _ => None,
+    }
+}
+
+fn tcp_connected_peer_error(payload: &SocketPayload, guard: &Guard<'_>) -> Option<Errno> {
+    let SocketProtocol::Tcp(TcpState::Connected { local, remote }) = payload.protocol_snapshot()
+    else {
+        return None;
+    };
+    let Some(peer) = payload
+        .socket_table()
+        .lookup_tcp_connection(ConnectionKey::new(remote, local), guard)
+    else {
+        return Some(Errno::EPIPE);
+    };
+    let Some(peer_payload) = peer.acquire_operational() else {
+        return Some(Errno::EPIPE);
+    };
+    match peer_payload.protocol_snapshot() {
+        SocketProtocol::Tcp(TcpState::Connected {
+            local: peer_local,
+            remote: peer_remote,
+        }) if peer_local == remote && peer_remote == local => None,
+        _ => Some(Errno::EPIPE),
     }
 }
 

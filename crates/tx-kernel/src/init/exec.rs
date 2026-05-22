@@ -77,19 +77,19 @@ fn oscomp_lmbench_network_cmd(libc: &str) -> alloc::string::String {
 	        ./busybox echo \"====== lmbench-network $label end: $ans ======\"; \
 	    }}; \
 	    ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\"; \
-	    ./lmbench_all lat_udp -s & \
+	    ./lmbench_all lat_udp -s; \
 	    ./busybox sleep 1; \
 	    check_contains lat_udp \"UDP latency using\" ./lmbench_all lat_udp -W 0 -N 1 -P 1 $host; \
 	    ./lmbench_all lat_udp -S $host; \
-	    ./lmbench_all lat_tcp -s & \
+	    ./lmbench_all lat_tcp -s; \
 	    ./busybox sleep 1; \
 	    check_contains lat_tcp \"TCP latency using\" ./lmbench_all lat_tcp -W 0 -N 1 -P 1 $host; \
 	    ./lmbench_all lat_tcp -S $host; \
-	    ./lmbench_all lat_connect -s & \
+	    ./lmbench_all lat_connect -s; \
 	    ./busybox sleep 1; \
 	    check_contains lat_connect \"TCP/IP connection cost\" ./lmbench_all lat_connect -N 1 $host; \
 	    ./lmbench_all lat_connect -S $host; \
-	    ./lmbench_all bw_tcp -s & \
+	    ./lmbench_all bw_tcp -s; \
 	    ./busybox sleep 1; \
 	    check_contains bw_tcp_1 \"MB/sec\" ./lmbench_all bw_tcp -P 1 -W 0 -N 1 -m 1 $host; \
 	    check_contains bw_tcp_64 \"MB/sec\" ./lmbench_all bw_tcp -P 1 -W 0 -N 1 -m 64 $host; \

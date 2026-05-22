@@ -655,6 +655,48 @@ fn tcp_loopback_default_steps_use_persistent_loopback_iface() {
 }
 
 #[test]
+fn tcp_loopback_transfer_moves_large_write_within_one_budgeted_step() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (client, listener, _local, _remote) =
+        prepare_loopback_connect_with_client_send_buf(40_169, 50_169, 64 * 1024);
+    let guard = tx_substrate::epoch::guard();
+
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let accepted = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("unexpected accept outcome"),
+    };
+
+    let bytes = alloc::vec![0x5a; 32 * 1024];
+    assert_eq!(
+        step_send_kernel_bytes(&client, &bytes, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(bytes.len())
+    );
+
+    let transfer = match step_tcp_loopback_transfer(&client, bytes.len(), &guard) {
+        StepOutcome::Done(outcome) => outcome,
+        _ => panic!("unexpected transfer outcome"),
+    };
+
+    assert_eq!(transfer.bytes_moved, bytes.len());
+    assert_eq!(
+        accepted
+            .acquire_operational()
+            .expect("accepted child payload")
+            .io_snapshot()
+            .recv_len,
+        bytes.len()
+    );
+}
+
+#[test]
 fn tcp_loopback_accepted_recv_without_payload_waits() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -2129,6 +2171,53 @@ fn tcp_loopback_send_transfer_recv_moves_payload_bytes() {
     assert_eq!(
         accepted.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits(),
         0
+    );
+}
+
+#[test]
+fn tcp_close_preserves_peer_receive_bytes_until_eof() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client, listener, _local, _remote) =
+        prepare_loopback_connect_with_client_send_buf(40_166, 50_166, 64);
+    let guard = tx_substrate::epoch::guard();
+
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let accepted = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("unexpected accept outcome"),
+    };
+
+    assert_eq!(
+        step_send_kernel_bytes(&client, b"hello", SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(5)
+    );
+    assert!(matches!(
+        step_socket_close(&client, &guard),
+        StepOutcome::Done(close) if close.tcp_flushed_bytes == 5
+    ));
+
+    let mut out = [0u8; 5];
+    assert_eq!(
+        step_recv_kernel_bytes(&accepted, &mut out, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(SocketRecvBytesOutcome {
+            bytes: 5,
+            source: None,
+            unix_source: None,
+            destination: None,
+            truncated: false,
+            became_empty: true,
+        })
+    );
+    assert_eq!(&out, b"hello");
+    assert_eq!(
+        step_recv(&accepted, 1, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(0)
     );
 }
 

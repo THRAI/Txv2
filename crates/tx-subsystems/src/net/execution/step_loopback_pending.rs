@@ -18,7 +18,7 @@ pub const LOOPBACK_POLL_BUDGET_DEFAULT: LoopbackPollBudget = LoopbackPollBudget 
     udp_bound: 32,
     raw_icmp: 32,
     packet_budget: 32,
-    tcp_transfer_bytes: 4096,
+    tcp_transfer_bytes: 64 * 1024,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex};
 use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
 use tx_reactor::{
     HartId, InitialSchedMeta, Phase1Scheduler, Reactor, RescheduleSignal, RunStats, SharedReactor,
-    SliceClock, SliceConfig, StopReason, TaskHandle, TaskId, TaskStatus, WakeDispatchReport,
-    WakeHint,
+    SliceClock, SliceConfig, StopReason, TaskHandle, TaskId, TaskStatus, TimerGuard,
+    TimerGuardRole, WakeDispatchReport, WakeHint,
 };
-use tx_substrate::step::{InterestMask, WaitSourceId};
+use tx_substrate::step::{Deadline, InterestMask, WaitSourceId};
 use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox, WaitGeneration};
 
 static PENDING_POLLS: AtomicUsize = AtomicUsize::new(0);
@@ -122,6 +122,29 @@ impl Future for HartContextProbe {
         }
         self.seen.fetch_or(observed, Ordering::SeqCst);
         Poll::Ready(())
+    }
+}
+
+struct TimerWheelDeadlineProbe {
+    hart: usize,
+    deadline_ns: u64,
+    guard: Option<TimerGuard>,
+}
+
+impl Future for TimerWheelDeadlineProbe {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.guard.is_none() {
+            let wheel = tx_reactor::current_timer_wheel(this.hart)
+                .expect("reactor should expose timer wheel while polling");
+            this.guard = Some(wheel.install(
+                Deadline::from_raw(this.deadline_ns),
+                TimerGuardRole::PrimarySleep,
+            ));
+        }
+        Poll::Pending
     }
 }
 
@@ -1402,6 +1425,45 @@ fn next_deadline_ns_reports_earliest_and_clears_after_resolution() {
     assert_eq!(first.fire(mask), 1);
     assert_eq!(reactor.run_until_idle().completed, 1);
     assert_eq!(reactor.task_status(first_task), Some(TaskStatus::Completed));
+    assert_eq!(reactor.next_deadline_ns(), None);
+}
+
+#[test]
+fn next_deadline_ns_includes_timer_wheel_registrations() {
+    let reactor = Reactor::new();
+    let channel = reactor.channel();
+    let mask = Mask::from_bits(0x1);
+    let queue_outcome = Arc::new(Mutex::new(None));
+
+    {
+        let queue_outcome = Arc::clone(&queue_outcome);
+        reactor.submit(async move {
+            let outcome = channel
+                .wait_event(mask, WaitProtocol::InterruptibleTimeout(50), || false)
+                .await;
+            *queue_outcome.lock().expect("queue outcome poisoned") = Some(outcome);
+        });
+    }
+    reactor.submit_task_with_meta(
+        TimerWheelDeadlineProbe {
+            hart: 0,
+            deadline_ns: 20,
+            guard: None,
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(0)).polled, 2);
+    assert_eq!(reactor.next_deadline_ns(), Some(20));
+
+    assert_eq!(reactor.advance_time_to(19), 0);
+    assert_eq!(reactor.next_deadline_ns(), Some(20));
+
+    assert_eq!(reactor.advance_time_to(20), 1);
+    assert_eq!(reactor.next_deadline_ns(), Some(50));
+
+    assert_eq!(reactor.advance_time_to(50), 1);
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(0)).completed, 1);
     assert_eq!(reactor.next_deadline_ns(), None);
 }
 

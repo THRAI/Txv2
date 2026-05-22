@@ -3,18 +3,22 @@
 
 use super::*;
 
+use super::super::{errno_to_i32, Errno};
 use crate::linux_syscall::{
     AF_INET, AF_NETLINK, AF_PACKET, AF_UNIX, EAGAIN_VALUE, EBADF_VALUE, EFAULT_VALUE, F_GETFL,
-    F_SETFL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_UDP, IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO,
-    IPT_SO_SET_REPLACE, IP_RECVERR, NETLINK_EXT_ACK, NETLINK_NETFILTER, NETLINK_ROUTE, NR_ACCEPT,
-    NR_BIND, NR_CLOSE, NR_CONNECT, NR_FCNTL, NR_GETSOCKNAME, NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN,
-    NR_PIPE2, NR_PPOLL, NR_PSELECT6, NR_RECVFROM, NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG, NR_SENDMSG,
-    NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET, NR_WRITE, O_CLOEXEC, O_NONBLOCK, O_RDWR, SIOCGIFFLAGS,
-    SIOCGIFINDEX, SIOCGIFTXQLEN, SIOCSIFFLAGS, SOL_NETLINK, SOL_SOCKET, SO_DONTROUTE, SO_ERROR,
-    SO_RCVTIMEO, SO_REUSEADDR, SO_TYPE, TTY_WRITE_MAX_INLINE,
+    F_SETFL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP, IPT_SO_GET_ENTRIES,
+    IPT_SO_GET_INFO, IPT_SO_SET_REPLACE, IP_RECVERR, NETLINK_EXT_ACK, NETLINK_NETFILTER,
+    NETLINK_ROUTE, NR_ACCEPT, NR_BIND, NR_CLOSE, NR_CONNECT, NR_DUP, NR_FCNTL, NR_GETSOCKNAME,
+    NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PIPE2, NR_PPOLL, NR_PSELECT6, NR_READ, NR_RECVFROM,
+    NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG, NR_SENDMSG, NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET,
+    NR_WRITE, O_CLOEXEC, O_NONBLOCK, O_RDWR, SIOCGIFFLAGS, SIOCGIFINDEX, SIOCGIFTXQLEN,
+    SIOCSIFFLAGS, SOCKET_IO_MAX_INLINE, SOL_NETLINK, SOL_SOCKET, SO_DONTROUTE, SO_ERROR,
+    SO_RCVTIMEO, SO_REUSEADDR, SO_SNDBUF, SO_TYPE, TCP_MAXSEG, TTY_WRITE_MAX_INLINE,
 };
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::task::{Context, Poll, Waker};
 use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
 use tx_subsystems::net::execution::{step_process_loopback_pending, LoopbackPollBudget};
 use tx_subsystems::net::protocol::{
@@ -1633,6 +1637,96 @@ fn dispatch_tcp_accept_write_survives_client_close_without_drain() {
 }
 
 #[test]
+fn dispatch_tcp_read_write_allows_socket_sized_inline_batch() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let listener_fd = socket_stream(&ctx, SOCK_STREAM);
+    let client_fd = socket_stream(&ctx, SOCK_STREAM);
+    let listener_addr = sockaddr_in([0, 0, 0, 0], 49_154);
+    let connect_addr = sockaddr_in([127, 0, 0, 1], 49_154);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                listener_fd as u64,
+                listener_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(NR_LISTEN, [listener_fd as u64, 8, 0, 0, 0, 0], &ctx),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                client_fd as u64,
+                connect_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    let accepted_fd = match socket_req(NR_ACCEPT, [listener_fd as u64, 0, 0, 0, 0, 0], &ctx) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("accept failed: {other:?}"),
+    };
+
+    let payload_len = SOCKET_IO_MAX_INLINE.min(48 * 1024);
+    assert!(
+        payload_len > TTY_WRITE_MAX_INLINE,
+        "test must cover the socket cap rather than the tty cap"
+    );
+    let payload = vec![0x5au8; payload_len];
+    assert_eq!(
+        socket_req(
+            NR_WRITE,
+            [
+                client_fd as u64,
+                payload.as_ptr() as u64,
+                payload.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+
+    let mut read_back = vec![0u8; payload.len()];
+    assert_eq!(
+        socket_req(
+            NR_READ,
+            [
+                accepted_fd as u64,
+                read_back.as_mut_ptr() as u64,
+                read_back.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(read_back.len() as i64)
+    );
+    assert_eq!(read_back, payload);
+}
+
+#[test]
 fn dispatch_bind_zero_port_assigns_ephemeral_port() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();
@@ -1676,6 +1770,190 @@ fn dispatch_bind_zero_port_assigns_ephemeral_port() {
     let port = u16::from_be_bytes([out[2], out[3]]);
     assert!((49_152..49_216).contains(&port));
     assert_eq!(&out[4..8], &[0, 0, 0, 0]);
+}
+
+#[test]
+fn dispatch_udp_reuseaddr_bind_zero_skips_occupied_ephemeral_port() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let first_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let second_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let addr = sockaddr_in([0, 0, 0, 0], 0);
+    let one: i32 = 1;
+
+    for fd in [first_fd, second_fd] {
+        assert_eq!(
+            socket_req(
+                NR_SETSOCKOPT,
+                [
+                    fd as u64,
+                    SOL_SOCKET as u64,
+                    SO_REUSEADDR as u64,
+                    (&one as *const i32) as u64,
+                    core::mem::size_of::<i32>() as u64,
+                    0,
+                ],
+                &ctx,
+            ),
+            SyscallResult::Return(0)
+        );
+        assert_eq!(
+            socket_req(
+                NR_BIND,
+                [
+                    fd as u64,
+                    addr.as_ptr() as u64,
+                    SOCKADDR_IN_BYTES as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                &ctx,
+            ),
+            SyscallResult::Return(0)
+        );
+    }
+
+    let mut first_name = [0u8; SOCKADDR_IN_BYTES as usize];
+    let mut second_name = [0u8; SOCKADDR_IN_BYTES as usize];
+    let mut first_len = SOCKADDR_IN_BYTES;
+    let mut second_len = SOCKADDR_IN_BYTES;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKNAME,
+            [
+                first_fd as u64,
+                first_name.as_mut_ptr() as u64,
+                (&mut first_len as *mut u32) as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKNAME,
+            [
+                second_fd as u64,
+                second_name.as_mut_ptr() as u64,
+                (&mut second_len as *mut u32) as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let first_port = u16::from_be_bytes([first_name[2], first_name[3]]);
+    let second_port = u16::from_be_bytes([second_name[2], second_name[3]]);
+    assert_ne!(
+        first_port, second_port,
+        "bind(port=0) must allocate a fresh ephemeral port even when SO_REUSEADDR is set"
+    );
+}
+
+#[test]
+fn dispatch_tcp_maxseg_reports_loopback_route_mss() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let listener_fd = socket_stream(&ctx, SOCK_STREAM);
+    let client_fd = socket_stream(&ctx, SOCK_STREAM);
+    let listen_addr = sockaddr_in([0, 0, 0, 0], 49_123);
+    let connect_addr = sockaddr_in([127, 0, 0, 1], 49_123);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                listener_fd as u64,
+                listen_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(NR_LISTEN, [listener_fd as u64, 8, 0, 0, 0, 0], &ctx),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                client_fd as u64,
+                connect_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut maxseg: i32 = 0;
+    let mut maxseg_len = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                client_fd as u64,
+                IPPROTO_TCP as u64,
+                TCP_MAXSEG as u64,
+                (&mut maxseg as *mut i32) as u64,
+                (&mut maxseg_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert!(
+        maxseg >= 32_768,
+        "loopback TCP_MAXSEG should reflect the loopback MTU, got {maxseg}"
+    );
+    assert_eq!(maxseg_len, core::mem::size_of::<i32>() as u32);
+}
+
+#[test]
+fn dispatch_udp_default_send_buffer_can_hold_loopback_datagram() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_dgram(&ctx, SOCK_DGRAM);
+
+    let mut sndbuf: i32 = 0;
+    let mut sndbuf_len = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_SNDBUF as u64,
+                (&mut sndbuf as *mut i32) as u64,
+                (&mut sndbuf_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert!(
+        sndbuf >= 65_535,
+        "default UDP send buffer should allow a loopback-sized datagram, got {sndbuf}"
+    );
+    assert_eq!(sndbuf_len, core::mem::size_of::<i32>() as u32);
 }
 
 #[test]
@@ -2471,6 +2749,596 @@ fn dispatch_udp_connect_autobinds_and_reaches_wildcard_bound_peer() {
         SyscallResult::Return(pong.len() as i64)
     );
     assert_eq!(&reply[..pong.len()], &pong);
+}
+
+#[test]
+fn dispatch_udp_connected_write_reaches_bound_peer() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let server_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let client_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let server_bind_addr = sockaddr_in([0, 0, 0, 0], 49_109);
+    let server_connect_addr = sockaddr_in([127, 0, 0, 1], 49_109);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                server_fd as u64,
+                server_bind_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                client_fd as u64,
+                server_connect_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let payload = *b"iperf-udp";
+    assert_eq!(
+        socket_req(
+            NR_WRITE,
+            [
+                client_fd as u64,
+                payload.as_ptr() as u64,
+                payload.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+
+    let mut inbound = [0u8; 16];
+    let mut source_addr = [0u8; SOCKADDR_IN_BYTES as usize];
+    let mut source_len = SOCKADDR_IN_BYTES;
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [
+                server_fd as u64,
+                inbound.as_mut_ptr() as u64,
+                inbound.len() as u64,
+                0,
+                source_addr.as_mut_ptr() as u64,
+                (&mut source_len as *mut u32) as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+    assert_eq!(&inbound[..payload.len()], &payload);
+    assert_eq!(&source_addr[4..8], &[127, 0, 0, 1]);
+}
+
+#[test]
+fn dispatch_iperf_udp_connect_handshake_round_trips() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let server_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let client_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let server_bind_addr = sockaddr_in([0, 0, 0, 0], 49_110);
+    let server_connect_addr = sockaddr_in([127, 0, 0, 1], 49_110);
+    let one: i32 = 1;
+
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                server_fd as u64,
+                SOL_SOCKET as u64,
+                SO_REUSEADDR as u64,
+                (&one as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                server_fd as u64,
+                server_bind_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                client_fd as u64,
+                server_connect_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let connect_msg = 0x36373839u32.to_ne_bytes();
+    assert_eq!(
+        socket_req(
+            NR_WRITE,
+            [
+                client_fd as u64,
+                connect_msg.as_ptr() as u64,
+                connect_msg.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(connect_msg.len() as i64)
+    );
+
+    let mut accepted_msg = [0u8; 4];
+    let mut source_addr = [0u8; SOCKADDR_IN_BYTES as usize];
+    let mut source_len = SOCKADDR_IN_BYTES;
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [
+                server_fd as u64,
+                accepted_msg.as_mut_ptr() as u64,
+                accepted_msg.len() as u64,
+                0,
+                source_addr.as_mut_ptr() as u64,
+                (&mut source_len as *mut u32) as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(connect_msg.len() as i64)
+    );
+    assert_eq!(accepted_msg, connect_msg);
+
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                server_fd as u64,
+                source_addr.as_ptr() as u64,
+                source_len as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let new_listener_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                new_listener_fd as u64,
+                SOL_SOCKET as u64,
+                SO_REUSEADDR as u64,
+                (&one as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                new_listener_fd as u64,
+                server_bind_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let reply = 0x39383736u32.to_ne_bytes();
+    assert_eq!(
+        socket_req(
+            NR_WRITE,
+            [
+                server_fd as u64,
+                reply.as_ptr() as u64,
+                reply.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(reply.len() as i64)
+    );
+
+    let mut client_reply = [0u8; 4];
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [
+                client_fd as u64,
+                client_reply.as_mut_ptr() as u64,
+                client_reply.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(reply.len() as i64)
+    );
+    assert_eq!(client_reply, reply);
+}
+
+#[test]
+fn dispatch_netperf_udp_rr_unconnected_sendto_recvfrom_round_trips() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let server_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let client_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let server_bind_addr = sockaddr_in([0, 0, 0, 0], 49_120);
+    let server_addr = sockaddr_in([127, 0, 0, 1], 49_120);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                server_fd as u64,
+                server_bind_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let request = *b"netperf-rr-request";
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                client_fd as u64,
+                request.as_ptr() as u64,
+                request.len() as u64,
+                0,
+                server_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(request.len() as i64)
+    );
+
+    let mut inbound = [0u8; 64];
+    let mut client_addr = [0u8; 128];
+    let mut client_addr_len: u32 = client_addr.len() as u32;
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [
+                server_fd as u64,
+                inbound.as_mut_ptr() as u64,
+                inbound.len() as u64,
+                0,
+                client_addr.as_mut_ptr() as u64,
+                (&mut client_addr_len as *mut u32) as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(request.len() as i64)
+    );
+    assert_eq!(&inbound[..request.len()], &request);
+    assert_eq!(client_addr_len, SOCKADDR_IN_BYTES);
+    assert_eq!(&client_addr[4..8], &[127, 0, 0, 1]);
+    assert_ne!(u16::from_be_bytes([client_addr[2], client_addr[3]]), 0);
+
+    let reply = *b"netperf-rr-reply";
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                server_fd as u64,
+                reply.as_ptr() as u64,
+                reply.len() as u64,
+                0,
+                client_addr.as_ptr() as u64,
+                client_addr_len as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(reply.len() as i64)
+    );
+
+    let mut response = [0u8; 64];
+    let mut reply_source = [0u8; 128];
+    let mut reply_source_len: u32 = reply_source.len() as u32;
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [
+                client_fd as u64,
+                response.as_mut_ptr() as u64,
+                response.len() as u64,
+                0,
+                reply_source.as_mut_ptr() as u64,
+                (&mut reply_source_len as *mut u32) as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(reply.len() as i64)
+    );
+    assert_eq!(&response[..reply.len()], &reply);
+    assert_eq!(reply_source_len, SOCKADDR_IN_BYTES);
+    assert_eq!(
+        u16::from_be_bytes([reply_source[2], reply_source[3]]),
+        49_120
+    );
+    assert_eq!(&reply_source[4..8], &[127, 0, 0, 1]);
+}
+
+#[test]
+fn dispatch_netperf_udp_rr_two_process_contexts_round_trip() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (server_process, server_ctx) = socket_ctx();
+    let client_process =
+        tx_subsystems::process::step_fork::<ShimsTestPmap>(&server_process, false, false)
+            .expect("fork client");
+    let client_thread = first_thread(&client_process);
+    let client_ctx = make_ctx(client_process, client_thread);
+    let server_fd = socket_dgram(&server_ctx, SOCK_DGRAM);
+    let client_fd = socket_dgram(&client_ctx, SOCK_DGRAM);
+    let server_bind_addr = sockaddr_in([0, 0, 0, 0], 49_121);
+    let server_addr = sockaddr_in([127, 0, 0, 1], 49_121);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                server_fd as u64,
+                server_bind_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &server_ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let request = *b"netperf-rr-cross-process";
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                client_fd as u64,
+                request.as_ptr() as u64,
+                request.len() as u64,
+                0,
+                server_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+            ],
+            &client_ctx,
+        ),
+        SyscallResult::Return(request.len() as i64)
+    );
+
+    let mut inbound = [0u8; 64];
+    let mut client_addr = [0u8; 128];
+    let mut client_addr_len: u32 = client_addr.len() as u32;
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [
+                server_fd as u64,
+                inbound.as_mut_ptr() as u64,
+                inbound.len() as u64,
+                0,
+                client_addr.as_mut_ptr() as u64,
+                (&mut client_addr_len as *mut u32) as u64,
+            ],
+            &server_ctx,
+        ),
+        SyscallResult::Return(request.len() as i64)
+    );
+    assert_eq!(&inbound[..request.len()], &request);
+    assert_eq!(client_addr_len, SOCKADDR_IN_BYTES);
+    assert_eq!(&client_addr[4..8], &[127, 0, 0, 1]);
+
+    let reply = *b"netperf-rr-cross-reply";
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                server_fd as u64,
+                reply.as_ptr() as u64,
+                reply.len() as u64,
+                0,
+                client_addr.as_ptr() as u64,
+                client_addr_len as u64,
+            ],
+            &server_ctx,
+        ),
+        SyscallResult::Return(reply.len() as i64)
+    );
+
+    let mut response = [0u8; 64];
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [
+                client_fd as u64,
+                response.as_mut_ptr() as u64,
+                response.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &client_ctx,
+        ),
+        SyscallResult::Return(reply.len() as i64)
+    );
+    assert_eq!(&response[..reply.len()], &reply);
+}
+
+#[test]
+fn dispatch_blocked_udp_rr_client_recv_wakes_after_server_reply() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (server_process, server_ctx) = socket_ctx();
+    let client_process =
+        tx_subsystems::process::step_fork::<ShimsTestPmap>(&server_process, false, false)
+            .expect("fork client");
+    let client_thread = first_thread(&client_process);
+    let client_ctx = make_ctx(client_process, client_thread);
+    let server_fd = socket_dgram(&server_ctx, SOCK_DGRAM);
+    let client_fd = socket_dgram(&client_ctx, SOCK_DGRAM);
+    let server_bind_addr = sockaddr_in([0, 0, 0, 0], 49_122);
+    let server_addr = sockaddr_in([127, 0, 0, 1], 49_122);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                server_fd as u64,
+                server_bind_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &server_ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let request = *b"netperf-client-waits";
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                client_fd as u64,
+                request.as_ptr() as u64,
+                request.len() as u64,
+                0,
+                server_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+            ],
+            &client_ctx,
+        ),
+        SyscallResult::Return(request.len() as i64)
+    );
+
+    let mut response = [0u8; 64];
+    let client_recv_req = SyscallRequest::new(
+        NR_RECVFROM,
+        [
+            client_fd as u64,
+            response.as_mut_ptr() as u64,
+            response.len() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let mut client_recv = Box::pin(dispatch::<ShimsTestPmap>(client_recv_req, &client_ctx));
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        matches!(client_recv.as_mut().poll(&mut cx), Poll::Pending),
+        "client recvfrom should park before the server replies"
+    );
+
+    let mut inbound = [0u8; 64];
+    let mut client_addr = [0u8; 128];
+    let mut client_addr_len: u32 = client_addr.len() as u32;
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [
+                server_fd as u64,
+                inbound.as_mut_ptr() as u64,
+                inbound.len() as u64,
+                0,
+                client_addr.as_mut_ptr() as u64,
+                (&mut client_addr_len as *mut u32) as u64,
+            ],
+            &server_ctx,
+        ),
+        SyscallResult::Return(request.len() as i64)
+    );
+    assert_eq!(&inbound[..request.len()], &request);
+
+    let reply = *b"netperf-server-reply";
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                server_fd as u64,
+                reply.as_ptr() as u64,
+                reply.len() as u64,
+                0,
+                client_addr.as_ptr() as u64,
+                client_addr_len as u64,
+            ],
+            &server_ctx,
+        ),
+        SyscallResult::Return(reply.len() as i64)
+    );
+
+    for _ in 0..256 {
+        if let Poll::Ready(result) = client_recv.as_mut().poll(&mut cx) {
+            assert_eq!(result, SyscallResult::Return(reply.len() as i64));
+            drop(client_recv);
+            assert_eq!(&response[..reply.len()], &reply);
+            return;
+        }
+    }
+    panic!("client recvfrom did not wake after the server reply");
 }
 
 #[test]
@@ -3910,6 +4778,74 @@ fn dispatch_close_releases_bound_socket_port() {
             NR_BIND,
             [
                 second_fd as u64,
+                addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+}
+
+#[test]
+fn dispatch_close_keeps_duplicated_bound_socket_port_until_last_fd() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let addr = sockaddr_in([127, 0, 0, 1], 49_103);
+
+    let first_fd = socket_stream(&ctx, SOCK_STREAM);
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                first_fd as u64,
+                addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    let dup_fd = match socket_req(NR_DUP, [first_fd as u64, 0, 0, 0, 0, 0], &ctx) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("dup(socket) failed: {other:?}"),
+    };
+    assert_eq!(
+        socket_req(NR_CLOSE, [first_fd as u64, 0, 0, 0, 0, 0], &ctx),
+        SyscallResult::Return(0)
+    );
+
+    let competing_fd = socket_stream(&ctx, SOCK_STREAM);
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                competing_fd as u64,
+                addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EADDRINUSE))
+    );
+    assert_eq!(
+        socket_req(NR_CLOSE, [dup_fd as u64, 0, 0, 0, 0, 0], &ctx),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                competing_fd as u64,
                 addr.as_ptr() as u64,
                 SOCKADDR_IN_BYTES as u64,
                 0,

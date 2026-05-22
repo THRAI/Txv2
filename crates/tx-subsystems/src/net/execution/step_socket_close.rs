@@ -3,8 +3,8 @@ use tx_substrate::zone::Cap;
 use crate::execution::{Guard, StepOutcome};
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
-    AcceptWireSet, ConnectionKey, RecvWireSet, SendWireSet, SockShutdownCmd, SocketIdentity,
-    SocketProtocol, TcpState, UdpInner, UnixDatagramState, UnixStreamState,
+    AcceptWireSet, ConnectionKey, RecvWireSet, SendWireSet, SocketIdentity, SocketProtocol,
+    TcpState, UdpInner, UnixDatagramState, UnixStreamState,
 };
 
 use super::step_tcp_loopback::step_tcp_loopback_transfer;
@@ -31,6 +31,8 @@ pub fn step_socket_close(
 
     let mut bindings_withdrawn = 0;
     let mut tcp_flushed_bytes = 0;
+    let mut peer_recv_woken = 0;
+    let mut peer_send_woken = 0;
     let table = payload.socket_table();
     match payload.protocol_snapshot() {
         SocketProtocol::Tcp(TcpState::Bound { local }) => {
@@ -46,7 +48,9 @@ pub fn step_socket_close(
             if let Some(peer) =
                 table.lookup_tcp_connection(ConnectionKey::new(remote, local), guard)
             {
-                mark_tcp_peer_broken(&peer);
+                let peer_wakes = mark_tcp_peer_closed(&peer);
+                peer_recv_woken += peer_wakes.recv_woken;
+                peer_send_woken += peer_wakes.send_woken;
             }
             bindings_withdrawn +=
                 withdraw_ok(table.withdraw_tcp_connection(ConnectionKey::new(local, remote)));
@@ -100,8 +104,8 @@ pub fn step_socket_close(
         raw_udp.close();
     }
     let payload_taken = socket.take_payload().is_some();
-    let recv_woken = socket.readiness.fire_recv(RecvWireSet::BROKEN);
-    let send_woken = socket.readiness.fire_send(SendWireSet::BROKEN);
+    let recv_woken = peer_recv_woken + socket.readiness.fire_recv(RecvWireSet::BROKEN);
+    let send_woken = peer_send_woken + socket.readiness.fire_send(SendWireSet::BROKEN);
     let accept_woken = socket.readiness.fire_accept(AcceptWireSet::BROKEN);
 
     StepOutcome::Done(SocketCloseOutcome {
@@ -141,18 +145,26 @@ fn flush_tcp_tx_before_close(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) ->
     moved_total
 }
 
-fn mark_tcp_peer_broken(peer: &Cap<SocketIdentity>) {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PeerCloseWakes {
+    recv_woken: usize,
+    send_woken: usize,
+}
+
+fn mark_tcp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
     let Some(payload) = peer.acquire_operational() else {
-        return;
+        return PeerCloseWakes::default();
     };
     if let Some(raw_tcp) = payload.raw_tcp_socket() {
-        raw_tcp.abort();
         raw_tcp.mark_recv_closed_by_peer();
     }
-    payload.mark_shutdown(SockShutdownCmd::Send);
     payload.refresh_io_from_raw();
-    peer.readiness.fire_recv(RecvWireSet::BROKEN);
-    peer.readiness.fire_send(SendWireSet::BROKEN);
+    let recv_woken = peer.readiness.fire_recv(RecvWireSet::BROKEN);
+    let send_woken = peer.readiness.fire_send(SendWireSet::BROKEN);
+    PeerCloseWakes {
+        recv_woken,
+        send_woken,
+    }
 }
 
 fn withdraw_ok<T>(result: Result<T, tx_substrate::mutation::MutationError>) -> usize {

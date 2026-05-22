@@ -185,6 +185,17 @@ pub use numbers::*;
 /// across multiple write calls until the userspace-VA copy lane lands.
 pub const TTY_WRITE_MAX_INLINE: usize = 4096;
 
+/// Maximum socket payload bytes staged by a single `read(2)`/`write(2)`
+/// call.
+///
+/// TTY and pipe writes stay capped at one page because they fan into
+/// byte-oriented console/pipe paths. Socket payloads are already
+/// backed by bounded per-socket send/receive buffers, and network
+/// workloads such as iperf naturally issue 64 KiB-ish blocks. Keeping
+/// those blocks intact avoids turning one socket transfer into dozens
+/// of tiny syscalls while still bounding the temporary staging buffer.
+pub const SOCKET_IO_MAX_INLINE: usize = 64 * 1024;
+
 /// Maximum path-name length accepted by `execve(2)` (Linux's
 /// `PATH_MAX`). Mirrors the `TTY_WRITE_MAX_INLINE = 4096` discipline
 /// for inline buffer copies. A longer path returns `-ENAMETOOLONG`
@@ -593,7 +604,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_OPEN_BY_HANDLE_AT => {
             sys_open_by_handle_at(req.args[0] as i32, req.args[1], req.args[2] as u32, ctx)
         }
-        nr if nr == NR_CLOSE => sys_close(req.args[0] as u32, ctx),
+        nr if nr == NR_CLOSE => sys_close(req.args[0] as u32, ctx).await,
         nr if nr == NR_DUP => sys_dup(req.args[0] as u32, ctx),
         nr if nr == NR_DUP3 => sys_dup3(
             req.args[0] as u32,
