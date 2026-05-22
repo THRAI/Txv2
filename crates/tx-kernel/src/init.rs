@@ -2017,14 +2017,20 @@ impl<P: TxPlatform> CoreInit<P> {
         _child_process: Cap<tx_subsystems::process::ProcessIdentity>,
         child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
     ) {
-        // The reactor's `BOOT_REACTOR.with(...)` lock is held by
-        // `step_boot_reactor_once` *while* polling tasks. The
-        // currently-polled task is sys_clone — calling
-        // `BOOT_REACTOR.with(reactor.submit_task(...))` from here
-        // would deadlock that same spin lock. Defer the submit to a
-        // separate pending-queue that the BSP reactor loop drains
-        // between iterations (outside the inner lock).
-        Self::queue_pending_child_submit(<P as tx_hal::SmpIf>::current_cpu_id(), child_thread);
+        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        if USE_CONCURRENT_POLL.load(Ordering::Acquire) {
+            // The userspace loop polls tasks through the concurrent
+            // poll-lease path, so no `BOOT_REACTOR.with(...)` lock is
+            // held while sys_clone runs. Submit immediately: the
+            // clone arm's cooperative yield can then hand the next
+            // turn to the child before the parent resumes.
+            Self::submit_thread_to_boot_reactor_for(current_cpu, child_thread);
+        } else {
+            // The legacy single-lock hart loop holds the reactor lock
+            // while polling. Queue children there and drain the queue
+            // between reactor steps to avoid recursive lock entry.
+            Self::queue_pending_child_submit(current_cpu, child_thread);
+        }
     }
 
     fn register_thread_reactor_task(tid: u32, task: boot_runtime::TaskKey) {
@@ -2077,15 +2083,15 @@ impl<P: TxPlatform> CoreInit<P> {
             .map_err(|_| tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)
     }
 
-    fn submit_thread_to_boot_reactor(
+    fn submit_thread_to_boot_reactor_for(
+        submit_cpu: CpuId,
         child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
     ) {
         let Some(payload) = child_thread.payload_cap() else {
             return;
         };
         let task_payload = payload.clone();
-        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-        let current_hart = boot_runtime::HartId(current_cpu.0);
+        let submit_hart = boot_runtime::HartId(submit_cpu.0);
         let child_tid = child_thread.tid.0;
         let mut signal = SmpRescheduleSignal::<P>::new();
         let submitted = BOOT_REACTOR.with(|reactor| {
@@ -2094,8 +2100,8 @@ impl<P: TxPlatform> CoreInit<P> {
                     task_payload.clone(),
                     crate::thread_future::run_thread::<P>(child_thread, task_payload),
                 ),
-                Self::userspace_thread_sched_meta(),
-                current_hart,
+                Self::userspace_thread_sched_meta_for(submit_cpu),
+                submit_hart,
                 &mut signal,
             )
         });
@@ -2137,13 +2143,17 @@ impl<P: TxPlatform> CoreInit<P> {
             let submit_hart = boot_runtime::HartId(pending.submit_cpu.0);
             let child_tid = child_thread.tid.0;
             let mut signal = SmpRescheduleSignal::<P>::new();
+            // Fresh fork/clone children should get one normal "new task"
+            // turn before a parent that yielded inside clone resumes. This
+            // keeps daemon-style setup (listen/bind after background fork)
+            // visible to the next shell command without naming that workload.
             let submitted = BOOT_REACTOR.with(|reactor| {
                 reactor.submit_task_with_meta_from_hart(
                     crate::thread_future::PerHartSlotted::<P, _>::new(
                         task_payload.clone(),
                         crate::thread_future::run_thread::<P>(child_thread, task_payload),
                     ),
-                    Self::userspace_thread_sched_meta_for(pending.submit_cpu).preempted_on_submit(),
+                    Self::userspace_thread_sched_meta_for(pending.submit_cpu),
                     submit_hart,
                     &mut signal,
                 )
