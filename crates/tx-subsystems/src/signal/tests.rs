@@ -110,6 +110,44 @@ fn siginfo_slots_take_is_one_shot() {
 }
 
 #[test]
+fn siginfo_slots_take_returns_value_to_only_one_racer() {
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::vec::Vec;
+
+    let slots = Arc::new(SigInfoSlots::new());
+    let sig = Signum::SIGTERM;
+    let info = SigInfo {
+        si_signo: sig.raw() as u32,
+        si_code: 2,
+        si_pid: 7,
+        si_uid: 8,
+    };
+    slots.store(sig, info);
+
+    let barrier = Arc::new(Barrier::new(9));
+    let winners = Arc::new(Mutex::new(0usize));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let slots = Arc::clone(&slots);
+        let barrier = Arc::clone(&barrier);
+        let winners = Arc::clone(&winners);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            if slots.take(sig).is_some() {
+                let mut count = winners.lock().expect("winners lock");
+                *count += 1;
+            }
+        }));
+    }
+    barrier.wait();
+    for handle in handles {
+        handle.join().expect("thread join");
+    }
+    assert_eq!(*winners.lock().expect("winners lock"), 1);
+    assert_eq!(slots.take(sig), None);
+}
+
+#[test]
 fn kill_process_routes_signal_to_first_live_thread() {
     let _g = setup();
     let proc_cap = bootstrap();
