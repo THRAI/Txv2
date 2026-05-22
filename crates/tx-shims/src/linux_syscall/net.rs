@@ -21,6 +21,7 @@ const MAX_SOCKET_PAYLOAD: usize = 4096;
 struct FakeSocket {
     owner_pid: u32,
     kind: i32,
+    peer_fd: Option<u32>,
     bound_addr: Option<Vec<u8>>,
     inbox: Vec<u8>,
     listening: bool,
@@ -65,6 +66,93 @@ fn allocate_socket_fd() -> u32 {
     NEXT_SOCKET_FD.fetch_add(1, Ordering::Relaxed)
 }
 
+pub(super) fn is_socket_fd(fd: u32, ctx: &SyscallCtx<'_>) -> bool {
+    let owner_pid = ctx.process.pid.0;
+    SOCKETS
+        .lock()
+        .get(&fd)
+        .is_some_and(|sock| sock.owner_pid == owner_pid)
+}
+
+pub(super) fn socket_readable(fd: u32, ctx: &SyscallCtx<'_>) -> bool {
+    let owner_pid = ctx.process.pid.0;
+    SOCKETS
+        .lock()
+        .get(&fd)
+        .is_some_and(|sock| sock.owner_pid == owner_pid && !sock.inbox.is_empty())
+}
+
+pub(super) fn close_socket_fd(fd: u32, ctx: &SyscallCtx<'_>) -> bool {
+    let owner_pid = ctx.process.pid.0;
+    let mut sockets = SOCKETS.lock();
+    let Some(sock) = sockets.get(&fd) else {
+        return false;
+    };
+    if sock.owner_pid != owner_pid {
+        return false;
+    }
+    let peer_fd = sock.peer_fd;
+    sockets.remove(&fd);
+    if let Some(peer) = peer_fd.and_then(|peer| sockets.get_mut(&peer)) {
+        peer.peer_fd = None;
+        peer.connected = false;
+    }
+    true
+}
+
+pub(super) fn sys_socket_write(
+    fd: u32,
+    buf: u64,
+    len: usize,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    let owner_pid = ctx.process.pid.0;
+    let mut payload = alloc::vec![0u8; len];
+    if len > 0 {
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut payload, buf) {
+            return Some(SyscallResult::error_from(errno));
+        }
+    }
+
+    let mut sockets = SOCKETS.lock();
+    let peer_fd = match sockets.get(&fd) {
+        Some(sock) if sock.owner_pid == owner_pid => sock.peer_fd,
+        Some(_) => return Some(SyscallResult::Error(EBADF_VALUE)),
+        None => return None,
+    };
+    if let Some(peer) = peer_fd.and_then(|peer_fd| sockets.get_mut(&peer_fd)) {
+        if peer.owner_pid == owner_pid {
+            peer.inbox.extend_from_slice(&payload);
+        }
+    }
+    Some(SyscallResult::Return(len as i64))
+}
+
+pub(super) fn sys_socket_read(
+    fd: u32,
+    buf: u64,
+    len: usize,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    let owner_pid = ctx.process.pid.0;
+    let payload = {
+        let mut sockets = SOCKETS.lock();
+        let sock = match sockets.get_mut(&fd) {
+            Some(sock) if sock.owner_pid == owner_pid => sock,
+            Some(_) => return Some(SyscallResult::Error(EBADF_VALUE)),
+            None => return None,
+        };
+        let take_len = core::cmp::min(len, sock.inbox.len());
+        sock.inbox.drain(..take_len).collect::<Vec<u8>>()
+    };
+    if !payload.is_empty() {
+        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf, &payload) {
+            return Some(SyscallResult::error_from(errno));
+        }
+    }
+    Some(SyscallResult::Return(payload.len() as i64))
+}
+
 pub(super) fn sys_socket(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let kind = socket_kind(args[1] as i32);
     if kind != SOCK_DGRAM && kind != SOCK_STREAM {
@@ -77,6 +165,7 @@ pub(super) fn sys_socket(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
         FakeSocket {
             owner_pid,
             kind,
+            peer_fd: None,
             bound_addr: None,
             inbox: Vec::new(),
             listening: false,
@@ -123,6 +212,28 @@ pub(super) fn sys_getsockname(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
     }
 }
 
+pub(super) fn sys_getpeername(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let fd = args[0] as u32;
+    let owner_pid = ctx.process.pid.0;
+    let addr = {
+        let sockets = SOCKETS.lock();
+        let Some(sock) = sockets.get(&fd) else {
+            return SyscallResult::Error(EBADF_VALUE);
+        };
+        if sock.owner_pid != owner_pid {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
+        if sock.kind == SOCK_STREAM && !sock.connected {
+            return SyscallResult::Error(ENOTCONN_VALUE);
+        }
+        sock.bound_addr.clone().unwrap_or_else(default_sockaddr)
+    };
+    match write_sockaddr(ctx, args[1], args[2], &addr) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno),
+    }
+}
+
 pub(super) fn sys_setsockopt(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let owner_pid = ctx.process.pid.0;
     if SOCKETS
@@ -134,6 +245,94 @@ pub(super) fn sys_setsockopt(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
     } else {
         SyscallResult::Error(EBADF_VALUE)
     }
+}
+
+pub(super) fn sys_getsockopt(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let owner_pid = ctx.process.pid.0;
+    let valid_fd = SOCKETS
+        .lock()
+        .get(&(args[0] as u32))
+        .is_some_and(|sock| sock.owner_pid == owner_pid);
+    if !valid_fd {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if args[3] == 0 || args[4] == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let user_len = match bootstrap_read_user::<u32>(&ctx.aspace, args[4]) {
+        Ok(len) => len as usize,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    let value = 0i32.to_ne_bytes();
+    let copy_len = core::cmp::min(user_len, value.len());
+    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, args[3], &value[..copy_len]) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+    if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, args[4], value.len() as u32) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+    SyscallResult::Return(0)
+}
+
+pub(super) fn sys_shutdown(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let fd = args[0] as u32;
+    let owner_pid = ctx.process.pid.0;
+    let mut sockets = SOCKETS.lock();
+    let Some(sock) = sockets.get_mut(&fd) else {
+        return SyscallResult::Error(EBADF_VALUE);
+    };
+    if sock.owner_pid != owner_pid {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    sock.connected = false;
+    SyscallResult::Return(0)
+}
+
+pub(super) fn sys_socketpair(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let kind = socket_kind(args[1] as i32);
+    if kind != SOCK_DGRAM && kind != SOCK_STREAM {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if args[3] == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let owner_pid = ctx.process.pid.0;
+    let fd0 = allocate_socket_fd();
+    let fd1 = allocate_socket_fd();
+    {
+        let mut sockets = SOCKETS.lock();
+        sockets.insert(
+            fd0,
+            FakeSocket {
+                owner_pid,
+                kind,
+                peer_fd: Some(fd1),
+                bound_addr: Some(default_sockaddr()),
+                inbox: Vec::new(),
+                listening: false,
+                connected: true,
+            },
+        );
+        sockets.insert(
+            fd1,
+            FakeSocket {
+                owner_pid,
+                kind,
+                peer_fd: Some(fd0),
+                bound_addr: Some(default_sockaddr()),
+                inbox: Vec::new(),
+                listening: false,
+                connected: true,
+            },
+        );
+    }
+    let mut pair = [0u8; 8];
+    pair[..4].copy_from_slice(&fd0.to_ne_bytes());
+    pair[4..].copy_from_slice(&fd1.to_ne_bytes());
+    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, args[3], &pair) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+    SyscallResult::Return(0)
 }
 
 pub(super) fn sys_listen(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
@@ -210,6 +409,7 @@ pub(super) fn sys_accept4(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
         FakeSocket {
             owner_pid,
             kind: SOCK_STREAM,
+            peer_fd: None,
             bound_addr: Some(peer_addr),
             inbox: Vec::new(),
             listening: false,

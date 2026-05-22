@@ -16,6 +16,7 @@ use super::numbers::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME,
     TFD_CLOEXEC_FLAG, TFD_NONBLOCK_FLAG, TFD_TIMER_ABSTIME_FLAG, TFD_TIMER_CANCEL_ON_SET_FLAG,
 };
+use super::time::realtime_ns;
 use super::{
     bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user, errno_to_i32,
     next_stdio_fd_below_nofile, SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE,
@@ -57,6 +58,7 @@ pub(super) fn sys_timerfd_create<'a>(
         use tx_subsystems::timerfd::TimerfdCreateOp;
         let mut script_ctx = super::build_subject_script_ctx(ctx);
         let mut op = TimerfdCreateOp {
+            clockid,
             flags, // pass flags through; subsystem stores them
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
@@ -135,6 +137,16 @@ pub(super) fn sys_timerfd_settime<'a, P: super::TimeIf>(
     };
 
     let now_ns = P::read_ns();
+    let clock_now_ns = if tfd_cap.clockid() == CLOCK_REALTIME {
+        realtime_ns::<P>()
+    } else {
+        now_ns
+    };
+    let mut new_value = new_value;
+    if abstime && new_value.it_value_ns != 0 {
+        new_value.it_value_ns =
+            now_ns.saturating_add(new_value.it_value_ns.saturating_sub(clock_now_ns));
+    }
 
     // Read old_value if requested (before mutating).
     let old_spec = if old_value_ptr != 0 {

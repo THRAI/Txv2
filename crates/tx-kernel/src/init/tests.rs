@@ -309,6 +309,7 @@ fn drive_boot_wiring() {
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
     CoreInit::<TestPlatform>::register_devfs_console_alias();
     CoreInit::<TestPlatform>::mount_bdevfs_at_dev_block();
+    CoreInit::<TestPlatform>::mount_tmpfs_at_dev_shm();
     CoreInit::<TestPlatform>::bind_init_cwd_and_root();
 }
 
@@ -462,6 +463,41 @@ fn boot_smoke_walker_resolves_dev_block_after_bdevfs_mount() {
     assert!(
         matches!(dentry.rnode().backing(), RNodeBacking::Directory),
         "/dev/block is a Directory"
+    );
+}
+
+/// `/dev/shm` must resolve to a writable tmpfs mount root, not the
+/// read-only devfs stub. LTP creates temporary files here during its
+/// common setup; resolving to devfs would surface as `EROFS`.
+#[test]
+fn boot_smoke_walker_resolves_dev_shm_after_tmpfs_mount() {
+    use tx_subsystems::vfs::{walker, Credential, RNodeBacking};
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let cwd = init.cwd().expect("init cwd must be bound");
+    let cred = Credential::root();
+    let guard = guard();
+    use step_engine::StepOutcome as V3;
+    let outcome = walker::step_walk(cwd, b"/dev/shm", &cred, &guard);
+    drop(guard);
+
+    let dentry = match outcome {
+        V3::Done(d) => d,
+        other => panic!("step_walk(/dev/shm) must succeed after tmpfs mount, got {other:?}"),
+    };
+
+    assert_eq!(
+        dentry.rnode().fs_object_id(),
+        tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
+        "/dev/shm must resolve to the mounted tmpfs root, not devfs's synthetic stub"
+    );
+    assert!(
+        matches!(dentry.rnode().backing(), RNodeBacking::Directory),
+        "/dev/shm is a Directory"
     );
 }
 

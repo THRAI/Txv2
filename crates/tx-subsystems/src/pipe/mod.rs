@@ -175,6 +175,10 @@ impl RingBuffer {
         self.len == PIPE_BUF
     }
 
+    fn free_space(&self) -> usize {
+        PIPE_BUF - self.len
+    }
+
     /// Drain up to `out.len()` bytes. Returns the number of bytes
     /// copied (≤ `min(self.len, out.len())`).
     fn drain_to_slice(&mut self, out: &mut [u8]) -> usize {
@@ -282,6 +286,60 @@ impl PipePayload {
     /// `WaitSource::id()` matches [`Self::writer_source_id`].
     pub fn writer_wait_source(&self) -> &Arc<WaitSource> {
         &self.writer_wait_source
+    }
+
+    /// Level-triggered readable state for the pipe read end.
+    ///
+    /// A pipe reader is wake-relevant when buffered bytes are present
+    /// or when all writers have closed (EOF). This mirrors the
+    /// observation `step_read` makes before deciding whether to
+    /// complete, return EOF, or park.
+    pub fn reader_readable_level(&self) -> bool {
+        let ring = self.ring.lock();
+        let has_bytes = !ring.is_empty();
+        drop(ring);
+        has_bytes || self.writer_count.load(Ordering::Acquire) == 0
+    }
+
+    /// Level-triggered hangup state for the pipe read end.
+    pub fn reader_hup_level(&self) -> bool {
+        self.writer_count.load(Ordering::Acquire) == 0
+    }
+
+    /// Level-triggered writable state for the pipe write end.
+    ///
+    /// A pipe writer is writable while space remains and at least one
+    /// reader is alive. The no-reader case is handled by write(2) as
+    /// `EPIPE`; epoll's richer `EPOLLERR` surface can be layered on
+    /// top later without making ordinary writable checks hang.
+    pub fn writer_writable_level(&self) -> bool {
+        if self.reader_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let ring = self.ring.lock();
+        let writable = !ring.is_full();
+        drop(ring);
+        writable
+    }
+
+    /// Whether at least `PIPE_BUF` bytes can be written atomically.
+    /// EPOLLET tests use this stricter pipe-write readiness edge: a
+    /// full pipe that is only partially drained must not report a new
+    /// writable edge until enough space is available for an atomic
+    /// `PIPE_BUF` write.
+    pub fn writer_atomic_writable_level(&self) -> bool {
+        if self.reader_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let ring = self.ring.lock();
+        let writable = ring.free_space() >= PIPE_BUF;
+        drop(ring);
+        writable
+    }
+
+    /// Level-triggered error state for the pipe write end.
+    pub fn writer_err_level(&self) -> bool {
+        self.reader_count.load(Ordering::Acquire) == 0
     }
 
     /// A new fd now references this reader endpoint.

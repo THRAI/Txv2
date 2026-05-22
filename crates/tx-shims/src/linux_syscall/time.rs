@@ -4,6 +4,10 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use alloc::collections::BTreeMap;
+
+use crate::adapter::step_engine::{Cap, SpinMutex};
+use tx_subsystems::process::ProcessIdentity;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -17,6 +21,13 @@ pub(super) struct TimespecLayout {
 pub(super) struct TimevalLayout {
     pub(super) tv_sec: i64,
     pub(super) tv_usec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ItimervalLayout {
+    it_interval: TimevalLayout,
+    it_value: TimevalLayout,
 }
 
 #[repr(C)]
@@ -137,7 +148,18 @@ pub(super) fn ns_to_timeval(ns: u64) -> TimevalLayout {
     }
 }
 
+fn timeval_to_ns(tv: TimevalLayout) -> Option<u64> {
+    if tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1_000_000 {
+        return None;
+    }
+    (tv.tv_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|sec_ns| sec_ns.checked_add((tv.tv_usec as u64).saturating_mul(1_000)))
+}
+
 const REALTIME_EPOCH_BASE_NS: u64 = 1_749_920_000_000_000_000;
+const MAX_CLOCK_NANOSLEEP_NS: u64 = 30_000_000_000;
+const CLOCK_GETRES_NS: i64 = 2_000_000;
 
 pub(super) fn realtime_ns<P: TimeIf>() -> u64 {
     REALTIME_EPOCH_BASE_NS.saturating_add(<P as TimeIf>::read_ns())
@@ -166,6 +188,35 @@ pub(super) fn read_timespec_at(aspace: &AddressSpace, uaddr: u64) -> Option<u64>
     Some((ts.tv_sec as u64).saturating_mul(1_000_000_000) + (ts.tv_nsec as u64))
 }
 
+fn read_timespec_ns_checked(aspace: &AddressSpace, uaddr: u64) -> Result<u64, SyscallResult> {
+    if uaddr == 0 {
+        return Err(SyscallResult::Error(EFAULT_VALUE));
+    }
+    let ts: TimespecLayout = match bootstrap_read_user::<TimespecLayout>(aspace, uaddr) {
+        Ok(v) => v,
+        Err(errno) => return Err(SyscallResult::error_from(errno)),
+    };
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    Ok((ts.tv_sec as u64).saturating_mul(1_000_000_000) + (ts.tv_nsec as u64))
+}
+
+fn write_remaining_timespec(
+    aspace: &AddressSpace,
+    rem_uaddr: u64,
+    remaining_ns: u64,
+) -> SyscallResult {
+    if rem_uaddr == 0 {
+        return SyscallResult::Return(0);
+    }
+    let rem = ns_to_timespec(remaining_ns);
+    match bootstrap_write_user::<TimespecLayout>(aspace, rem_uaddr, rem) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::error_from(errno),
+    }
+}
+
 /// `clock_gettime(clk_id, tp)`. Linux RV64 generic ABI
 /// `__NR_clock_gettime = 113`.
 ///
@@ -183,18 +234,58 @@ pub(super) fn sys_clock_gettime<'a, P: TimeIf>(
         return SyscallResult::Error(EFAULT_VALUE);
     }
     let ns = match clk_id {
-        CLOCK_REALTIME | CLOCK_REALTIME_COARSE => realtime_ns::<P>(),
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_REALTIME_ALARM | CLOCK_TAI => {
+            realtime_ns::<P>()
+        }
         CLOCK_MONOTONIC
         | CLOCK_PROCESS_CPUTIME_ID
         | CLOCK_THREAD_CPUTIME_ID
         | CLOCK_MONOTONIC_RAW
         | CLOCK_MONOTONIC_COARSE
-        | CLOCK_BOOTTIME => <P as TimeIf>::read_ns(),
+        | CLOCK_BOOTTIME
+        | CLOCK_BOOTTIME_ALARM => <P as TimeIf>::read_ns(),
         _ => return SyscallResult::Error(EINVAL_VALUE),
     };
     let ts = ns_to_timespec(ns);
     if let Err(errno) = bootstrap_write_user::<TimespecLayout>(&ctx.aspace, ts_uaddr, ts) {
         return SyscallResult::error_from(errno);
+    }
+    SyscallResult::Return(0)
+}
+
+/// `clock_getres(clk_id, res)`. Linux RV64 generic ABI
+/// `__NR_clock_getres = 114`.
+///
+/// The hardware time source can be read at nanosecond scale, but the
+/// userspace-visible sleep wakeup path is scheduler/timer-wheel driven and is
+/// currently millisecond-ish under QEMU. Report that effective resolution so
+/// timer conformance tests do not assume a high-resolution wakeup guarantee we
+/// do not actually provide yet.
+pub(super) fn sys_clock_getres<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let clk_id = args[0] as u32;
+    let res_uaddr = args[1];
+    match clk_id {
+        CLOCK_REALTIME
+        | CLOCK_REALTIME_COARSE
+        | CLOCK_REALTIME_ALARM
+        | CLOCK_TAI
+        | CLOCK_MONOTONIC
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME
+        | CLOCK_BOOTTIME_ALARM => {}
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    }
+    if res_uaddr != 0 {
+        let ts = TimespecLayout {
+            tv_sec: 0,
+            tv_nsec: CLOCK_GETRES_NS,
+        };
+        if let Err(errno) = bootstrap_write_user::<TimespecLayout>(&ctx.aspace, res_uaddr, ts) {
+            return SyscallResult::error_from(errno);
+        }
     }
     SyscallResult::Return(0)
 }
@@ -218,6 +309,194 @@ pub(super) fn sys_gettimeofday<'a, P: TimeIf>(
         return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
+}
+
+const ITIMER_REAL: u32 = 0;
+const ITIMER_VIRTUAL: u32 = 1;
+const ITIMER_PROF: u32 = 2;
+const SIGALRM: u8 = 14;
+const SIGVTALRM: u8 = 26;
+const SIGPROF: u8 = 27;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct IntervalTimer {
+    deadline_ns: u64,
+    interval_ns: u64,
+}
+
+static INTERVAL_TIMERS: SpinMutex<Option<BTreeMap<(u32, u32), IntervalTimer>>> =
+    SpinMutex::new(None);
+
+fn with_interval_timers<R>(f: impl FnOnce(&mut BTreeMap<(u32, u32), IntervalTimer>) -> R) -> R {
+    let mut guard = INTERVAL_TIMERS.lock();
+    let timers = guard.get_or_insert_with(BTreeMap::new);
+    f(timers)
+}
+
+fn valid_itimer(which: u32) -> bool {
+    matches!(which, ITIMER_REAL | ITIMER_VIRTUAL | ITIMER_PROF)
+}
+
+fn signal_for_itimer(which: u32) -> Option<tx_subsystems::signal::Signum> {
+    let signo = match which {
+        ITIMER_REAL => SIGALRM,
+        ITIMER_VIRTUAL => SIGVTALRM,
+        ITIMER_PROF => SIGPROF,
+        _ => return None,
+    };
+    tx_subsystems::signal::Signum::new(signo)
+}
+
+fn itimer_to_layout(timer: Option<IntervalTimer>, now_ns: u64) -> ItimervalLayout {
+    let timer = timer.unwrap_or_default();
+    ItimervalLayout {
+        it_interval: ns_to_timeval(timer.interval_ns),
+        it_value: ns_to_timeval(if timer.deadline_ns == 0 {
+            0
+        } else {
+            timer.deadline_ns.saturating_sub(now_ns)
+        }),
+    }
+}
+
+fn parse_itimerval(value: ItimervalLayout) -> Option<(u64, u64)> {
+    let interval_ns = timeval_to_ns(value.it_interval)?;
+    let value_ns = timeval_to_ns(value.it_value)?;
+    Some((interval_ns, value_ns))
+}
+
+fn signal_unblocked_on_any_thread(
+    process: &Cap<ProcessIdentity>,
+    signal: tx_subsystems::signal::Signum,
+) -> bool {
+    let Some(threads) = process.threads_snapshot() else {
+        return false;
+    };
+    threads.iter().any(|thread| match thread.payload_cap() {
+        Some(payload) => !payload.signal_mask().is_blocked(signal),
+        None => false,
+    })
+}
+
+pub(super) fn sys_getitimer<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let which = args[0] as u32;
+    let curr_value_ptr = args[1];
+    if !valid_itimer(which) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if curr_value_ptr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    let now_ns = P::read_ns();
+    let timer = with_interval_timers(|timers| timers.get(&(ctx.process.pid.0, which)).copied());
+    let value = itimer_to_layout(timer, now_ns);
+    match bootstrap_write_user::<ItimervalLayout>(&ctx.aspace, curr_value_ptr, value) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::error_from(errno),
+    }
+}
+
+pub(super) fn sys_setitimer<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let which = args[0] as u32;
+    let new_value_ptr = args[1];
+    let old_value_ptr = args[2];
+    if !valid_itimer(which) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if new_value_ptr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    let new_value = match bootstrap_read_user::<ItimervalLayout>(&ctx.aspace, new_value_ptr) {
+        Ok(value) => value,
+        Err(errno) => return SyscallResult::error_from(errno),
+    };
+    let Some((interval_ns, value_ns)) = parse_itimerval(new_value) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+
+    let now_ns = P::read_ns();
+    let key = (ctx.process.pid.0, which);
+    let old_timer = with_interval_timers(|timers| timers.get(&key).copied());
+    if old_value_ptr != 0 {
+        let old_value = itimer_to_layout(old_timer, now_ns);
+        if let Err(errno) =
+            bootstrap_write_user::<ItimervalLayout>(&ctx.aspace, old_value_ptr, old_value)
+        {
+            return SyscallResult::error_from(errno);
+        }
+    }
+
+    let timer = IntervalTimer {
+        deadline_ns: if value_ns == 0 {
+            0
+        } else {
+            now_ns.saturating_add(value_ns)
+        },
+        interval_ns,
+    };
+    with_interval_timers(|timers| {
+        if timer.deadline_ns == 0 && timer.interval_ns == 0 {
+            timers.remove(&key);
+        } else {
+            timers.insert(key, timer);
+        }
+    });
+    if timer.deadline_ns != 0 {
+        P::set_deadline_ns(timer.deadline_ns);
+    }
+    SyscallResult::Return(0)
+}
+
+pub fn poll_due_itimers<P: TimeIf>(process: &Cap<ProcessIdentity>) -> Option<u64> {
+    let pid = process.pid.0;
+    let now_ns = P::read_ns();
+    let mut to_deliver = [None; 3];
+    let mut deliver_len = 0usize;
+
+    let next_deadline = with_interval_timers(|timers| {
+        let mut next_deadline: Option<u64> = None;
+        for ((timer_pid, which), timer) in timers.iter_mut() {
+            if *timer_pid != pid || timer.deadline_ns == 0 {
+                continue;
+            }
+
+            if timer.deadline_ns <= now_ns {
+                if let Some(signal) = signal_for_itimer(*which) {
+                    if signal_unblocked_on_any_thread(process, signal)
+                        && deliver_len < to_deliver.len()
+                    {
+                        to_deliver[deliver_len] = Some(signal);
+                        deliver_len += 1;
+                    }
+                }
+
+                if timer.interval_ns == 0 {
+                    timer.deadline_ns = 0;
+                } else {
+                    timer.deadline_ns = now_ns.saturating_add(timer.interval_ns);
+                }
+            }
+
+            if timer.deadline_ns != 0 {
+                next_deadline = Some(match next_deadline {
+                    Some(existing) => existing.min(timer.deadline_ns),
+                    None => timer.deadline_ns,
+                });
+            }
+        }
+        next_deadline
+    });
+
+    for signal in to_deliver.into_iter().flatten().take(deliver_len) {
+        let _ = tx_subsystems::signal::deliver_posix_signal(
+            tx_subsystems::signal::SignalTarget::Process(process.clone()),
+            signal,
+        );
+    }
+
+    next_deadline
 }
 
 /// `times(buf)`. Linux RV64 generic ABI `__NR_times = 153`.
@@ -244,6 +523,48 @@ pub(super) fn sys_times<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     SyscallResult::Return(ticks)
 }
 
+pub(super) async fn sleep_until_deadline<'a, P: TimeIf>(
+    deadline_ns: u64,
+    original_ns: u64,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+
+    while <P as TimeIf>::read_ns() < deadline_ns {
+        let remaining_ns = deadline_ns.saturating_sub(<P as TimeIf>::read_ns());
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mailbox_arc = script_ctx.mailbox().cloned();
+        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+        let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+        let op = NanosleepOp {
+            nanos: original_ns.min(remaining_ns),
+            deadline_ns,
+            started: false,
+        };
+        match drive(
+            op,
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox_arc.as_ref(),
+            delegate_registry_arc.as_deref(),
+            timer_wheel_arc.as_ref(),
+        )
+        .await
+        {
+            Ok(()) => return SyscallResult::Return(0),
+            Err(v3errno) => {
+                let errno = Errno::from(v3errno);
+                if errno == Errno::EINTR {
+                    return SyscallResult::Error(EINTR_VALUE);
+                }
+                return SyscallResult::error_from(errno);
+            }
+        }
+    }
+    SyscallResult::Return(0)
+}
+
 /// `nanosleep(req, rem)`. Linux RV64 generic ABI
 /// `__NR_nanosleep = 101`.
 ///
@@ -261,38 +582,24 @@ pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
     let req_uaddr = args[0];
-    let req_ns = match read_timespec_at(&ctx.aspace, req_uaddr) {
-        Some(ns) => ns,
-        None if req_uaddr == 0 => return SyscallResult::Error(EFAULT_VALUE),
-        None => return SyscallResult::Error(EINVAL_VALUE),
+    let rem_uaddr = args[1];
+    let req_ns = match read_timespec_ns_checked(&ctx.aspace, req_uaddr) {
+        Ok(ns) => ns,
+        Err(result) => return result,
     };
     if req_ns == 0 {
         return SyscallResult::Return(0);
     }
     let deadline_ns = <P as TimeIf>::read_ns().saturating_add(req_ns);
-    use tx_scripts::drive;
-    use tx_substrate::step::DriveMode;
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    let op = NanosleepOp {
-        nanos: req_ns,
-        deadline_ns,
-        started: false,
-    };
-    match drive(
-        op,
-        &mut script_ctx,
-        DriveMode::Waiting,
-        mailbox_arc.as_ref(),
-        delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
-    )
-    .await
-    {
-        Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+    match sleep_until_deadline::<P>(deadline_ns, req_ns, ctx).await {
+        SyscallResult::Error(errno) if errno == EINTR_VALUE => {
+            let remaining_ns = deadline_ns.saturating_sub(<P as TimeIf>::read_ns());
+            match write_remaining_timespec(&ctx.aspace, rem_uaddr, remaining_ns) {
+                SyscallResult::Return(_) => SyscallResult::Error(EINTR_VALUE),
+                other => other,
+            }
+        }
+        other => other,
     }
 }
 
@@ -310,57 +617,57 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
     let clk_id = args[0] as u32;
     let flags = args[1] as u32;
     let req_uaddr = args[2];
+    let rem_uaddr = args[3];
 
     match clk_id {
         CLOCK_REALTIME
         | CLOCK_MONOTONIC
-        | CLOCK_PROCESS_CPUTIME_ID
-        | CLOCK_THREAD_CPUTIME_ID
         | CLOCK_MONOTONIC_RAW
         | CLOCK_REALTIME_COARSE
+        | CLOCK_REALTIME_ALARM
+        | CLOCK_TAI
         | CLOCK_MONOTONIC_COARSE
-        | CLOCK_BOOTTIME => {}
+        | CLOCK_BOOTTIME
+        | CLOCK_BOOTTIME_ALARM => {}
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
+            return SyscallResult::Error(EOPNOTSUPP_VALUE);
+        }
         _ => return SyscallResult::Error(EINVAL_VALUE),
     }
     if (flags & !TIMER_ABSTIME) != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let req_ns = match read_timespec_at(&ctx.aspace, req_uaddr) {
-        Some(ns) => ns,
-        None if req_uaddr == 0 => return SyscallResult::Error(EFAULT_VALUE),
-        None => return SyscallResult::Error(EINVAL_VALUE),
+    let req_ns = match read_timespec_ns_checked(&ctx.aspace, req_uaddr) {
+        Ok(ns) => ns,
+        Err(result) => return result,
     };
-    let now = <P as TimeIf>::read_ns();
-    let deadline_ns = if (flags & TIMER_ABSTIME) != 0 {
-        req_ns
+    let platform_now = <P as TimeIf>::read_ns();
+    let clock_now = match clk_id {
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_REALTIME_ALARM | CLOCK_TAI => {
+            realtime_ns::<P>()
+        }
+        _ => platform_now,
+    };
+    let sleep_ns = if (flags & TIMER_ABSTIME) != 0 {
+        if clock_now >= req_ns {
+            return SyscallResult::Return(0);
+        }
+        req_ns.saturating_sub(clock_now)
     } else {
-        now.saturating_add(req_ns)
+        req_ns
     };
-    if now >= deadline_ns {
-        return SyscallResult::Return(0);
+    if sleep_ns > MAX_CLOCK_NANOSLEEP_NS {
+        return SyscallResult::Error(EOPNOTSUPP_VALUE);
     }
-    use tx_scripts::drive;
-    use tx_substrate::step::DriveMode;
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    let op = NanosleepOp {
-        nanos: req_ns,
-        deadline_ns,
-        started: false,
-    };
-    match drive(
-        op,
-        &mut script_ctx,
-        DriveMode::Waiting,
-        mailbox_arc.as_ref(),
-        delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
-    )
-    .await
-    {
-        Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+    let deadline_ns = platform_now.saturating_add(sleep_ns);
+    match sleep_until_deadline::<P>(deadline_ns, sleep_ns, ctx).await {
+        SyscallResult::Error(errno) if errno == EINTR_VALUE => {
+            let remaining_ns = deadline_ns.saturating_sub(<P as TimeIf>::read_ns());
+            match write_remaining_timespec(&ctx.aspace, rem_uaddr, remaining_ns) {
+                SyscallResult::Return(_) => SyscallResult::Error(EINTR_VALUE),
+                other => other,
+            }
+        }
+        other => other,
     }
 }

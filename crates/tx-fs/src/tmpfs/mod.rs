@@ -36,7 +36,8 @@ use tx_subsystems::page_backed::{
 };
 use tx_subsystems::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, MountOutput,
-    RNode, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_ISGID, S_ISUID, VFS_NAME_MAX,
+    RNode, RNodeBacking, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
+    VFS_NAME_MAX,
 };
 
 /// Mode for the tmpfs root directory.
@@ -70,8 +71,9 @@ const TMPFS_FILE_PAGE_CAP: u64 = 1024;
 pub const TMPFS_SYMLINK_MAX: usize = VFS_NAME_MAX;
 
 /// Per-inode payload. Variants line up with the inode kinds tmpfs
-/// supports today. Block-device, fifo, and socket variants are not
-/// yet in scope; `create_inode` rejects those modes with `EINVAL`.
+/// supports today. Block-device and socket variants are not yet in
+/// scope; named FIFOs are represented with an empty byte backing until
+/// full named-pipe endpoint semantics are needed.
 enum TmpfsPayload {
     /// Directory: child name → inode id.
     Directory(BTreeMap<InlineName, FsObjectId>),
@@ -307,14 +309,18 @@ impl FsOps for Tmpfs {
             Ok(n) => n,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        // Day-1 tmpfs only handles regular files via `create_inode`.
         // Directories arrive through `mkdir`, symlinks through
-        // `symlink`. Reject anything else with `EINVAL`.
+        // `symlink`. Regular files and named FIFOs both get a simple
+        // page-backed payload; FIFO endpoint semantics are handled by
+        // anonymous `pipe2` today and can grow here when a named-pipe
+        // test needs blocking open/read/write behavior.
         let kind_bits = mode & S_IFMT;
-        if kind_bits != 0 && kind_bits != S_IFREG {
-            return StepOutcome::err(step_engine::Errno::EINVAL);
-        }
-        let mode = (mode & !S_IFMT) | S_IFREG;
+        let (kind, type_bits) = match kind_bits {
+            0 | S_IFREG => (InodeKind::Regular, S_IFREG),
+            S_IFIFO => (InodeKind::Fifo, S_IFIFO),
+            _ => return StepOutcome::err(step_engine::Errno::EINVAL),
+        };
+        let mode = (mode & !S_IFMT) | type_bits;
 
         let container = match PageContainer::new_cap(
             PageContainerKind::Anon {
@@ -339,7 +345,7 @@ impl FsOps for Tmpfs {
         container.set_size_bytes(0);
 
         let new_id = self.alloc_object_id();
-        let mut meta = InodeMeta::new(InodeKind::Regular, mode);
+        let mut meta = InodeMeta::new(kind, mode);
         meta.uid = cred.uid;
         meta.gid = cred.gid;
         meta.size = 0;
@@ -749,9 +755,12 @@ impl FsOps for Tmpfs {
     ///   arm with one of those kinds is a backend bug. Return
     ///   `EISDIR` / `EINVAL` respectively to mirror the Linux
     ///   `inode_operations.lookup` shape.
-    /// - Block / FIFO / Socket: not supported by tmpfs today; return
-    ///   `ENOSYS` so callers fall through cleanly until those kinds
-    ///   acquire concrete materialisers.
+    /// - Block / Socket: not supported by tmpfs today; return `ENOSYS`
+    ///   so callers fall through cleanly until those kinds acquire
+    ///   concrete materialisers.
+    /// - Named FIFO currently uses the same page-backed payload as a
+    ///   regular file; anonymous pipe endpoints carry the true pipe
+    ///   wait/read/write semantics.
     fn materialise_rnode(
         &self,
         fs_object_id: FsObjectId,

@@ -301,7 +301,7 @@ pub fn bootstrap_init_process(
         None,
         BTreeMap::new(),
         BTreeSet::new(),
-        (1024, 4096),
+        (65536, 65536),
         BOOTSTRAP_BRK_BASE,
         BOOTSTRAP_BRK_BASE,
         // Slice 6 of the shell-prompt roadmap. init's file-creation
@@ -382,13 +382,16 @@ pub fn step_fork<P: PmapIf>(
     };
     let parent_pgrp = parent.pgrp.lock().clone();
 
-    // Signal-action table: share via Arc (CLONE_SIGHAND) or fresh.
-    let child_sig_actions = if clone_sighand {
+    // Signal-action table: share via Arc for CLONE_SIGHAND; otherwise
+    // fork takes a snapshot copy of the parent's dispositions.
+    let child_sig_actions = {
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
-        Arc::clone(&payload.frame.sig_actions)
-    } else {
-        Arc::new(SigActionTable::new())
+        if clone_sighand {
+            Arc::clone(&payload.frame.sig_actions)
+        } else {
+            Arc::new((*payload.frame.sig_actions).clone())
+        }
     };
 
     // Address space: fork (CoW clone) or share (CLONE_VM).

@@ -271,6 +271,14 @@ pub struct SigActionTable {
     entries: SpinMutex<[SigDisposition; Signum::MAX as usize]>,
 }
 
+impl Clone for SigActionTable {
+    fn clone(&self) -> Self {
+        Self {
+            entries: SpinMutex::new(*self.entries.lock()),
+        }
+    }
+}
+
 impl Default for SigActionTable {
     fn default() -> Self {
         Self::new()

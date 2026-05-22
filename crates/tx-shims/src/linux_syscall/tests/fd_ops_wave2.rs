@@ -143,6 +143,7 @@ fn dispatch_openat_existing_file_o_rdonly_returns_fd() {
     drop(guard);
 
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    proc_cap.set_rlimit_nofile(1024, 1024);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
     let path = nul_terminate(b"/f");
@@ -292,6 +293,7 @@ fn dispatch_openat_o_creat_o_excl_existing_returns_neg_eexist() {
     drop(guard);
 
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    proc_cap.set_rlimit_nofile(1024, 1024);
     let ctx = make_ctx(proc_cap, thread);
 
     let path = nul_terminate(b"/f");

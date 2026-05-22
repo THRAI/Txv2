@@ -1,3 +1,60 @@
+- 2026-05-22 **Mounted writable tmpfs on `/dev/shm` for LTP.**
+  LTP's common setup creates temporary files under `/dev/shm`; devfs already
+  exposed a synthetic `/dev/shm` directory, but devfs is read-only, so
+  `epoll_wait01` failed with `open(/dev/shm/ltp_epoll_wait01_*): EROFS`.
+  Boot now mounts an independent tmpfs over the devfs stub before userspace
+  starts, and the init smoke verifies that `/dev/shm` resolves across the
+  devfs->tmpfs mount boundary.
+  **Verified:** `cargo fmt --check`;
+  `CARGO_TARGET_DIR=/tmp/txv2-target cargo check -p tx-kernel -p tx-fs`;
+  `CARGO_TARGET_DIR=/tmp/txv2-target cargo test -p tx-kernel
+  init::tests::boot_smoke_walker_resolves_dev_shm_after_tmpfs_mount`.
+  **Next:** rerun `make oscomp-local-rv64-ltp-musl` to collect the first full
+  LTP baseline; expect remaining failures to be syscall/environment semantics
+  rather than loader startup or `/dev/shm` writability.
+
+- 2026-05-22 **Fixed dynamic-PIE interpreter discovery for LTP binaries.**
+  LTP musl test binaries are `ET_DYN` PIE executables with `PT_INTERP`; the
+  exec parser was only extracting `PT_INTERP` for `ET_EXEC`, so dynamic PIEs
+  were run as if they were static PIEs and jumped through unrelocated low
+  addresses such as `0x59xx`. The parser now records `PT_INTERP` for dynamic
+  PIE too, letting `exec_script` enter the musl dynamic linker before handing
+  off to the test.
+  **Verified:** `cargo fmt`; `cargo check`.
+  **Blocked check:** `cargo test -p tx-scripts process::exec::loader::tests`
+  currently fails before running loader tests on an unrelated stale
+  `SigDisposition::Handler(0xdead)` tuple-style test in
+  `crates/tx-scripts/src/process/exec/script/tests.rs`.
+  **Next:** rerun `make oscomp-local-rv64-ltp-musl
+  OSCOMP_LTP=signalfd01,epoll_wait01` and inspect the next real LTP failure.
+
+- 2026-05-22 **Added dedicated OSComp LTP Makefile targets.**
+  Added `oscomp-local-{rv64,la64}-ltp-musl` and SMP4 variants, plus
+  `OSCOMP_LTP=case1,case2` filtering that maps to
+  `tx.oscomp.groups=ltp-musl:case1+case2`. The init-side OSComp command
+  builder now emits judge-compatible single-case LTP wrappers, so LTP can be
+  run as a tight batch without editing or rebuilding a slim sdcard first.
+  **Verified:** `make -n oscomp-local-rv64-ltp-musl`;
+  `make -n oscomp-local-rv64-ltp-musl OSCOMP_LTP=signalfd01,epoll_wait01`;
+  `make -n oscomp-local-rv64-ltp-musl-smp4 OSCOMP_LTP=socketpair01,getsockopt01`;
+  `make -n oscomp-local-la64-ltp-musl OSCOMP_LTP=writev01,read01`;
+  `cargo check`.
+  **Next:** start with small syscall-family batches before attempting full
+  1411-case `ltp-musl`.
+
+- 2026-05-22 **Wired the first LTP-facing syscall entrypoint batch.**
+  Added dispatch for the already-scaffolded ABI surfaces that LTP probes early:
+  historical `signalfd`, `epoll_wait`, `semtimedop`, and local socket shim
+  coverage for `getpeername`, `getsockopt`, `shutdown`, and `socketpair`.
+  Refreshed `docs/progress/SYSCALL_STATUS.md`; mechanical coverage is now
+  159 `NR_*` definitions, 157 dispatched, and only `pidfd_open` /
+  `pidfd_send_signal` remain defined-but-undispatched.
+  **Verified:** `cargo fmt`; `cargo check`;
+  `cargo xtask syscall-status`; `cargo xtask syscall-status --list-missing`;
+  `cargo xtask syscall-status --regen`.
+  **Next:** run a slim `ltp-musl` sdcard with the touched cases before calling
+  any of these done against the LTP gold standard.
+
 - 2026-05-22 **Merged main into the Gemini OSComp/musl branch and captured the
   workflow.** Kept the in-progress merge state in
   `/Users/3y/.gemini/antigravity/worktrees/Tx/check-oscomp-status`, preserved

@@ -797,17 +797,43 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             // exemption), which traps the kernel on an unmapped page.
             // A pre-check with the safe `read_user` accessor converts
             // the trap into a graceful -EFAULT.
-            {
-                let guard = step_engine::guard();
+            let observed = {
+                let guard =
+                    tx_substrate::epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
                 let user_ptr = UserPtr::<u32>::new(uaddr as usize);
-                if let StepOutcome::Err(_) = ctx.aspace.read_user(user_ptr, &guard) {
-                    return SyscallResult::error_from(Errno::EFAULT);
+                match ctx.aspace.read_user(user_ptr, &guard) {
+                    StepOutcome::Done(value) => value,
+                    StepOutcome::Err(_) => return SyscallResult::error_from(Errno::EFAULT),
+                    StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+                        return SyscallResult::error_from(Errno::EFAULT);
+                    }
                 }
-            }
+            };
             if timeout_uaddr != 0 {
-                let Some(_timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
+                let Some(timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
                     return SyscallResult::Error(EINVAL_VALUE);
                 };
+                if observed != val {
+                    return SyscallResult::Error(EAGAIN_VALUE);
+                }
+                if timeout_ns > 0 {
+                    let deadline_ns = if op == FUTEX_WAIT_BITSET {
+                        if op_full & FUTEX_CLOCK_REALTIME != 0 {
+                            let now_realtime_ns = realtime_ns::<P>();
+                            let now_monotonic_ns = P::read_ns();
+                            now_monotonic_ns
+                                .saturating_add(timeout_ns.saturating_sub(now_realtime_ns))
+                        } else {
+                            timeout_ns
+                        }
+                    } else {
+                        P::read_ns().saturating_add(timeout_ns)
+                    };
+                    if let Some(future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) {
+                        future.await;
+                    }
+                }
+                return SyscallResult::Error(ETIMEDOUT_VALUE);
             }
 
             // Park and wait.  drive() parks on the futex bucket's
@@ -824,7 +850,9 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 uaddr,
                 val,
                 aspace: &ctx.aspace,
+                tid: Some(ctx.thread.tid.0),
                 woken: false,
+                registered_source_id: None,
             };
             match drive(
                 op,
@@ -854,7 +882,8 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 return SyscallResult::Error(EINVAL_VALUE);
             }
             if op == FUTEX_CMP_REQUEUE {
-                let guard = step_engine::guard();
+                let guard =
+                    tx_substrate::epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
                 let user_ptr = UserPtr::<u32>::new(uaddr as usize);
                 match ctx.aspace.read_user(user_ptr, &guard) {
                     StepOutcome::Done(observed) if observed == bitset => {}

@@ -339,7 +339,6 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             Ok(t) => t,
             Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
         };
-
         // CLONE_PARENT_SETTID: write child tid to *ptid in parent's
         // userspace. Linux semantics: write `child_tid` (as i32)
         // before the child is scheduled.

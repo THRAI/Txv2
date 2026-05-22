@@ -164,6 +164,8 @@ pub struct PerHartSlotted<P: TxPlatform, F: Future> {
 unsafe impl<P: TxPlatform, F: Future> Send for PerHartSlotted<P, F> where F: Send {}
 unsafe impl<P: TxPlatform, F: Future> Sync for PerHartSlotted<P, F> where F: Sync {}
 
+const SA_NODEFER: u64 = 0x4000_0000;
+
 impl<P: TxPlatform, F: Future> PerHartSlotted<P, F> {
     pub fn new(payload: PayloadCap<ThreadPayload>, inner: F) -> Self {
         Self {
@@ -269,6 +271,21 @@ pub async fn run_thread<P: TxPlatform>(
         // (lowest first), disposition is consulted, and outcomes that
         // need materialisation (DefaultTerminate, DeliverHandler) are
         // handled inline.
+        if let Some(process) = thread.upgrade_owner_proc() {
+            let posix_deadline = tx_shims::linux_syscall::poll_due_posix_timers::<P>(&process);
+            let itimer_deadline = tx_shims::linux_syscall::poll_due_itimers::<P>(&process);
+            match (posix_deadline, itimer_deadline) {
+                (Some(left), Some(right)) => P::set_deadline_ns(left.min(right)),
+                (Some(deadline_ns), None) | (None, Some(deadline_ns)) => {
+                    P::set_deadline_ns(deadline_ns);
+                }
+                (None, None) => {}
+            }
+            if thread.payload_cap().is_none() || process.aspace_cap().is_none() {
+                return;
+            }
+        }
+
         let ast_outcome = ast_dispatch(&thread);
         match ast_outcome {
             AstOutcome::DeliverHandler {
@@ -335,6 +352,12 @@ pub async fn run_thread<P: TxPlatform>(
 
                     // Read current mask to pass to the handler.
                     let old_mask = payload.signal_mask();
+                    payload.store_saved_signal_mask(Some(old_mask));
+                    if (flags & SA_NODEFER) == 0 {
+                        let mut handler_mask = old_mask;
+                        handler_mask.block(sig);
+                        payload.store_signal_mask(handler_mask);
+                    }
                     let siginfo = process
                         .siginfo_take(sig)
                         .map(signal_siginfo_to_user_abi)
@@ -428,6 +451,7 @@ pub async fn run_thread<P: TxPlatform>(
                     }
                 }
             }
+            AstOutcome::DefaultTerminate { .. } => return,
             AstOutcome::InitiateTermination => return,
             _ => {}
         }
@@ -515,7 +539,7 @@ pub async fn run_thread<P: TxPlatform>(
         // ----------------------------------------------------------------
         match trap {
             UserspaceTrapInfo::TimerPreempt => {
-                tx_reactor::yield_now().await;
+                continue;
             }
             UserspaceTrapInfo::Syscall(req) => {
                 // Resolve the syscall context from the payload.

@@ -776,6 +776,9 @@ pub(super) fn sys_rt_sigreturn(ctx: &SyscallCtx) -> SyscallResult {
     let Some(saved) = payload.take_saved_signal_context() else {
         return SyscallResult::Error(EFAULT_VALUE);
     };
+    if let Some(mask) = payload.take_saved_signal_mask() {
+        payload.store_signal_mask(mask);
+    }
     payload.store_saved_user_context(Some(saved));
     SyscallResult::SigreturnRestored
 }

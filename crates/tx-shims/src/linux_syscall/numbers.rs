@@ -70,6 +70,13 @@ pub const NR_SCHED_SETSCHEDULER: u64 = 119;
 /// empty — busybox observes the same external behaviour as on
 /// Linux (poll says ready, read either returns bytes or blocks).
 pub const NR_PPOLL: u64 = 73;
+/// `pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)`.
+/// Linux generic ABI `__NR_pselect6 = 72`.
+pub const NR_PSELECT6: u64 = 72;
+/// `pselect6_time64(...)`. Linux generic ABI `__NR_pselect6_time64 = 413`.
+/// On RV64 the userspace layout is already 64-bit; route it through the
+/// same implementation as `pselect6`.
+pub const NR_PSELECT6_TIME64: u64 = 413;
 /// `exit(status)`. Linux generic ABI `__NR_exit`. Per-thread exit per
 /// `PROCESS_v1` §7.3.1 — for a single-threaded process, the
 /// `step_thread_exit` chain triggers `step_process_exit` internally.
@@ -776,9 +783,16 @@ pub const FUTEX_CMD_MASK: u32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 /// uses `nanosleep` so the deferral does not block Slice 11's QEMU
 /// shell smoke.
 pub const NR_NANOSLEEP: u64 = 101;
+/// `getitimer(which, curr_value)`. Linux RV64 generic ABI `__NR_getitimer = 102`.
+pub const NR_GETITIMER: u64 = 102;
+/// `setitimer(which, new_value, old_value)`. Linux RV64 generic ABI `__NR_setitimer = 103`.
+pub const NR_SETITIMER: u64 = 103;
 /// `clock_gettime(clk_id, ts)`. Linux RV64 generic ABI
 /// `__NR_clock_gettime = 113`.
 pub const NR_CLOCK_GETTIME: u64 = 113;
+/// `clock_getres(clk_id, res)`. Linux RV64 generic ABI
+/// `__NR_clock_getres = 114`.
+pub const NR_CLOCK_GETRES: u64 = 114;
 /// `clock_nanosleep(clk_id, flags, req, rem)`. Linux RV64 generic ABI
 /// `__NR_clock_nanosleep = 115`. Same deferral as `nanosleep` — only
 /// the zero-duration / past-deadline short-circuit ships in Slice 4.
@@ -823,6 +837,15 @@ pub const CLOCK_MONOTONIC_COARSE: u32 = 6;
 /// `CLOCK_MONOTONIC` — txKernel's monotonic clock starts at boot, so
 /// "boot time" and "monotonic" are equivalent.
 pub const CLOCK_BOOTTIME: u32 = 7;
+/// `clock_gettime` clock id: `CLOCK_REALTIME_ALARM = 8`.
+/// Alarm wakeups are treated as `CLOCK_REALTIME` in the OSComp shim.
+pub const CLOCK_REALTIME_ALARM: u32 = 8;
+/// `clock_gettime` clock id: `CLOCK_BOOTTIME_ALARM = 9`.
+/// Alarm wakeups are treated as `CLOCK_BOOTTIME` in the OSComp shim.
+pub const CLOCK_BOOTTIME_ALARM: u32 = 9;
+/// `clock_gettime` clock id: `CLOCK_TAI = 11`.
+/// There is no separate TAI offset yet, so this aliases realtime.
+pub const CLOCK_TAI: u32 = 11;
 
 /// `clock_nanosleep` flag bit: `TIMER_ABSTIME = 0x1`. When set, the
 /// `req` value is interpreted as an absolute deadline (against the
@@ -1111,11 +1134,10 @@ pub const NR_UNAME: u64 = 160;
 /// Slice 7 v1 ships a read-only static rlimit table for the calling
 /// process only (`pid == 0` or `pid == self.pid`); cross-pid queries
 /// return `-EPERM`. `new_rlim` is silently ignored — limits are not
-/// actually enforced by any in-tree subsystem yet
-/// (`TODO(phase-rlimit-enforcement)`). The static table is generous
-/// (`RLIMIT_NOFILE = 1024 / 4096`, `RLIMIT_STACK = 8 MiB`, the rest
-/// `RLIM_INFINITY`) — matches the values musl probes and accepts as
-/// non-restrictive.
+/// actually enforced by most in-tree subsystems yet
+/// (`TODO(phase-rlimit-enforcement)`). The default table is generous
+/// (`RLIMIT_NOFILE = 65536 / 65536`, `RLIMIT_STACK = 8 MiB`, the rest
+/// `RLIM_INFINITY`) so LTP cases that reserve high-numbered fds can run.
 pub const NR_PRLIMIT64: u64 = 261;
 /// `getrandom(buf, buflen, flags)`. Linux RV64 generic ABI
 /// `__NR_getrandom = 278`. Fills `buf` with `buflen` bytes from the
@@ -1162,6 +1184,12 @@ pub const F_SETFL: i32 = 4;
 /// `F_DUPFD_CLOEXEC` cmd: like [`F_DUPFD`] but the new fd is marked
 /// close-on-exec (the per-fd CLOEXEC bit is set on the result).
 pub const F_DUPFD_CLOEXEC: i32 = 1030;
+/// `F_SETPIPE_SZ` cmd: request pipe capacity. txKernel pipes currently use a
+/// fixed 4096-byte ring, so the fcntl arm accepts the command on pipe fds and
+/// returns that capacity.
+pub const F_SETPIPE_SZ: i32 = 1031;
+/// `F_GETPIPE_SZ` cmd: return pipe capacity.
+pub const F_GETPIPE_SZ: i32 = 1032;
 
 // ---------------------------------------------------------------------
 // `RLIMIT_*` resource ids — Linux generic uapi `<sys/resource.h>`.
@@ -1185,7 +1213,7 @@ pub const RLIMIT_RSS: u32 = 5;
 /// `RLIMIT_NPROC = 6` — maximum number of processes per real uid.
 pub const RLIMIT_NPROC: u32 = 6;
 /// `RLIMIT_NOFILE = 7` — maximum open file descriptors. Slice 7
-/// reports `(1024, 4096)`.
+/// reports `(65536, 65536)`.
 pub const RLIMIT_NOFILE: u32 = 7;
 /// `RLIMIT_MEMLOCK = 8` — maximum locked-in-memory bytes.
 pub const RLIMIT_MEMLOCK: u32 = 8;
@@ -1641,11 +1669,11 @@ pub const NR_MQ_GETSETATTR: u64 = 185;
 // eventfd / timerfd syscall numbers
 // =====================================================================
 
-/// `eventfd2(init_val, flags)`. Linux generic uapi `__NR_eventfd2 = 290`.
+/// `eventfd2(init_val, flags)`. Linux generic uapi `__NR_eventfd2 = 19`.
 /// Mints a fresh [`tx_subsystems::eventfd::EventFd`] cap, wraps it in
 /// an `OpenFile` with `OpenFileBacking::Eventfd`, and installs it at
 /// the lowest free fd.
-pub const NR_EVENTFD2: u64 = 290;
+pub const NR_EVENTFD2: u64 = 19;
 
 /// Recognised `eventfd2` flags. EFD_SEMAPHORE is read by the eventfd
 /// subsystem; EFD_CLOEXEC / EFD_NONBLOCK are translated to OpenFileFlags.
@@ -1654,17 +1682,36 @@ pub const EFD_CLOEXEC_FLAG: u32 = O_CLOEXEC;
 pub const EFD_NONBLOCK_FLAG: u32 = O_NONBLOCK;
 
 /// `timerfd_create(clockid, flags)`. Linux generic uapi
-/// `__NR_timerfd_create = 283`. Mints a fresh
+/// `__NR_timerfd_create = 85`. Mints a fresh
 /// [`tx_subsystems::timerfd::TimerFd`] cap.
-pub const NR_TIMERFD_CREATE: u64 = 283;
+pub const NR_TIMERFD_CREATE: u64 = 85;
 
 /// `timerfd_settime(fd, flags, new_value, old_value)`. Linux generic
-/// uapi `__NR_timerfd_settime = 286`. Arms/disarms the timer.
-pub const NR_TIMERFD_SETTIME: u64 = 286;
+/// uapi `__NR_timerfd_settime = 86`. Arms/disarms the timer.
+pub const NR_TIMERFD_SETTIME: u64 = 86;
 
 /// `timerfd_gettime(fd, curr_value)`. Linux generic uapi
-/// `__NR_timerfd_gettime = 287`. Returns the current timer state.
-pub const NR_TIMERFD_GETTIME: u64 = 287;
+/// `__NR_timerfd_gettime = 87`. Returns the current timer state.
+pub const NR_TIMERFD_GETTIME: u64 = 87;
+
+/// `timer_create(clockid, sevp, timerid)`. Linux generic uapi
+/// `__NR_timer_create = 107`.
+pub const NR_TIMER_CREATE: u64 = 107;
+
+/// `timer_gettime(timerid, curr_value)`. Linux generic uapi
+/// `__NR_timer_gettime = 108`.
+pub const NR_TIMER_GETTIME: u64 = 108;
+
+/// `timer_getoverrun(timerid)`. Linux generic uapi
+/// `__NR_timer_getoverrun = 109`.
+pub const NR_TIMER_GETOVERRUN: u64 = 109;
+
+/// `timer_settime(timerid, flags, new_value, old_value)`. Linux generic
+/// uapi `__NR_timer_settime = 110`.
+pub const NR_TIMER_SETTIME: u64 = 110;
+
+/// `timer_delete(timerid)`. Linux generic uapi `__NR_timer_delete = 111`.
+pub const NR_TIMER_DELETE: u64 = 111;
 
 /// Recognised `timerfd_create` flags. TFD_CLOEXEC / TFD_NONBLOCK are
 /// translated to OpenFileFlags.

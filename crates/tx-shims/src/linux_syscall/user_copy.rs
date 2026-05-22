@@ -163,7 +163,7 @@ pub(super) fn read_user_cstr_vec(
 /// kernel-pointer dance on `EFAULT`.
 pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) -> Result<T, Errno> {
     use step_engine::{Errno as V3Errno, StepOutcome as V3};
-    let guard = step_engine::guard();
+    let guard = tx_substrate::epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
     match aspace.read_user(UserPtr::<T>::new(uaddr as usize), &guard) {
         V3::Done(v) => Ok(v),
         V3::Err(V3Errno::EFAULT) => {

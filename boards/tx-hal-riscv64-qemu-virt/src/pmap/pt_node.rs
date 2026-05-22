@@ -41,7 +41,12 @@ use crate::boot_static::{BootStaticBag, IdentityDropped};
 
 use super::{pool_index, pt_node_zero_ptr, zero_page, PT_NODE_POOL_ENTRIES};
 
-const COMMITTED_PT_NODE_REGISTRY_ENTRIES: usize = 256;
+// This registry tracks every committed intermediate page-table node in live
+// user roots. After boot, nodes come from the general typed-frame allocator,
+// so the registry must scale beyond the tiny boot PT-node pool. LTP futex wake
+// stress can keep many forked address spaces live at once; 256 slots is too
+// small for that steady-state load.
+const COMMITTED_PT_NODE_REGISTRY_ENTRIES: usize = 4096;
 
 static PT_NODE_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 static INSTALLED_PT_NODE_ALLOCATOR: AtomicUsize = AtomicUsize::new(0);

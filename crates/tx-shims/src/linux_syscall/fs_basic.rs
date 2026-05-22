@@ -6,6 +6,7 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMutex, StepOutcome};
 use alloc::collections::BTreeMap;
+use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload};
 use tx_subsystems::vfs::FsObjectId;
 
 static STAT_META_OVERRIDES: SpinMutex<BTreeMap<FsObjectId, InodeMeta>> =
@@ -162,8 +163,26 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
             }
         }
+        numbers::F_SETPIPE_SZ | numbers::F_GETPIPE_SZ => {
+            if !is_pipe_file(&file) {
+                return SyscallResult::Error(EINVAL_VALUE);
+            }
+            SyscallResult::Return(tx_subsystems::pipe::PIPE_BUF as i64)
+        }
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
+}
+
+fn is_pipe_file(file: &OpenFile) -> bool {
+    let OpenFileBacking::Rnode { rnode } = file.backing() else {
+        return false;
+    };
+    matches!(
+        rnode.backing(),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::Pipe { .. }
+        }
+    )
 }
 
 /// `openat(dirfd, path, flags, mode)`. Linux RV64 generic ABI
@@ -448,7 +467,13 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => {
+            if Errno::from(v3errno) == Errno::EBADF && super::net::close_socket_fd(fd, ctx) {
+                SyscallResult::Return(0)
+            } else {
+                SyscallResult::error_from(Errno::from(v3errno))
+            }
+        }
     }
 }
 

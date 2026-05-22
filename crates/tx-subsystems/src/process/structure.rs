@@ -289,7 +289,25 @@ impl ProcessIdentity {
     /// Process state char for /proc/<pid>/stat.
     pub fn state_char(&self) -> u8 {
         if self.is_zombie() {
-            b'Z'
+            return b'Z';
+        }
+        if let Some(leader) = self.thread_by_tid(self.pid.0) {
+            return leader.proc_state_char();
+        }
+        let Some(threads) = self.threads_snapshot() else {
+            return b'Z';
+        };
+        let mut saw_sleeping = false;
+        for thread in threads {
+            match thread.proc_state_char() {
+                b'R' => return b'R',
+                b'T' => return b'T',
+                b'S' => saw_sleeping = true,
+                _ => {}
+            }
+        }
+        if saw_sleeping {
+            b'S'
         } else {
             b'R'
         }
@@ -324,6 +342,11 @@ impl ProcessIdentity {
     /// Find a thread by its tid within this process.
     pub fn thread_by_tid(&self, tid: u32) -> Option<Cap<ThreadIdentity>> {
         self.payload.lock().as_ref()?.threads.find_by_tid(tid)
+    }
+
+    /// Snapshot live thread identities for `/proc/<pid>/task`.
+    pub fn threads_snapshot(&self) -> Option<alloc::vec::Vec<Cap<ThreadIdentity>>> {
+        Some(self.payload.lock().as_ref()?.threads.snapshot())
     }
 
     /// Collapse all sibling threads for exec, leaving `initiator`
@@ -528,7 +551,7 @@ impl ProcessIdentity {
             .lock()
             .as_ref()
             .map(|p| p.rlimit_nofile())
-            .unwrap_or((1024, 4096))
+            .unwrap_or((65536, 65536))
     }
 
     pub fn set_rlimit_nofile(&self, cur: u32, max: u32) {
