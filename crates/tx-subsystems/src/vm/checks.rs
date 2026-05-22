@@ -9,6 +9,7 @@ use crate::vm::adapter::step_engine::{self as step_engine};
 use crate::vm::{
     AccessMode, AddressSpace, MapPlacement, UserRange, VmEntry, VmFault, VmFaultError,
     VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultOutcome, VmMapError,
+    VmRemapPlacement,
 };
 
 pub fn require_fault_recipe(
@@ -23,6 +24,7 @@ pub fn require_fault_recipe(
 
     Ok(VmFaultOutcome {
         page_range,
+        private_identity: entry.private.as_ref().map(|set| set.raw()),
         entry,
         access: fault.access,
         pmap_materialization_deferred: aspace.pmap().materialization_deferred(),
@@ -38,6 +40,9 @@ pub fn require_fault_publication(
         .lookup(outcome.page_range.start())
         .ok_or(VmFaultError::StaleRecipe)?;
     if entry != outcome.entry || !permits_fault(&entry, outcome.access) {
+        return Err(VmFaultError::StaleRecipe);
+    }
+    if entry.private.as_ref().map(|set| set.raw()) != outcome.private_identity {
         return Err(VmFaultError::StaleRecipe);
     }
 
@@ -71,10 +76,26 @@ pub const fn require_disjoint_remap(
     old_range: UserRange,
     new_range: UserRange,
 ) -> Result<(), VmMapError> {
-    if old_range.overlaps(new_range) || old_range.len() != new_range.len() {
+    if old_range.overlaps(new_range) {
         return Err(VmMapError::InvalidRange);
     }
     Ok(())
+}
+
+pub const fn require_remap_shape(
+    old_range: UserRange,
+    new_range: UserRange,
+    placement: VmRemapPlacement,
+) -> Result<(), VmMapError> {
+    match placement {
+        VmRemapPlacement::Move => require_disjoint_remap(old_range, new_range),
+        VmRemapPlacement::InPlace => {
+            if old_range.start().0 != new_range.start().0 {
+                return Err(VmMapError::InvalidRange);
+            }
+            Ok(())
+        }
+    }
 }
 
 pub(in crate::vm) const fn permits_fault(entry: &VmEntry, access: AccessMode) -> bool {

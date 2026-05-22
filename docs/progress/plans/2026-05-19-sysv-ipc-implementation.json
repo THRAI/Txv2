@@ -5,35 +5,47 @@
   "status": "complete",
   "created": "2026-05-19",
   "updated": "2026-05-19",
-  "completed": "2026-05-19",
   "owner": "agent",
   "summary": "Implemented the full SysV + POSIX IPC subsystem family (sem, shm, msg, mq) per 08_SYSV_IPC_v1.md. Six phases: IPC-0 scaffold → IPC-1-4 implementations → IPC-5 syscall dispatch. Compilation verified with cargo xtask check; QEMU runtime smoke test passes 14/16 cases (semop needs copy_from_user, shmat stub).",
   "scope": {
     "in": [
-      "crates/tx-subsystems/src/ipc/ (new module: 5 sub-modules × 4 files each)",
-      "crates/tx-subsystems/src/process/nsproxy.rs (new: NsProxy + IpcNamespace + 8 namespace stubs)",
-      "crates/tx-subsystems/src/process/execution.rs (fork clone_nsproxy, bootstrap sign_init_nsproxy)",
-      "crates/tx-subsystems/src/process/structure.rs (nsproxy slot on ProcessPayload)",
-      "crates/tx-subsystems/src/process/mod.rs (mod nsproxy)",
-      "crates/tx-subsystems/src/lib.rs (pub mod ipc; ipc zone registration)",
-      "crates/tx-subsystems/src/zones.rs (9 zone entries for NsProxy + namespace stubs)",
-      "crates/tx-subsystems/src/execution.rs (E2BIG, EFBIG, EIDRM errno additions)",
-      "crates/tx-substrate/src/step/mod.rs (E2BIG, EFBIG, EIDRM V3Errno entries)",
-      "crates/tx-substrate/tests/v3_algebra.rs (E2BIG, EFBIG, EIDRM entries)",
-      "crates/tx-shims/src/linux_syscall/ipc.rs (11 syscall arm functions)",
-      "crates/tx-shims/src/linux_syscall/numbers.rs (26 new syscall number constants)",
-      "crates/tx-shims/src/linux_syscall/mod.rs (dispatch + pub use + errno_to_i32 entries)",
-      "crates/tx-shims/src/linux_syscall/ctx.rs (nsproxy_and_cred helper)",
-      "xtask/src/image.rs (ipc_test copy into cpio for QEMU testing)",
-      "tools/images/ipc_test.c (smoke test in C, musl-gcc compiled)"
+      "crates/tx-subsystems/src/ipc",
+      "crates/tx-subsystems/src/process/nsproxy.rs",
+      "crates/tx-subsystems/src/process/execution.rs",
+      "crates/tx-subsystems/src/process/structure.rs",
+      "crates/tx-subsystems/src/process/mod.rs",
+      "crates/tx-subsystems/src/lib.rs",
+      "crates/tx-subsystems/src/zones.rs",
+      "crates/tx-subsystems/src/execution.rs",
+      "crates/tx-substrate/src/step/mod.rs",
+      "crates/tx-substrate/tests/v3_algebra.rs",
+      "crates/tx-shims/src/linux_syscall/ipc.rs",
+      "crates/tx-shims/src/linux_syscall/numbers.rs",
+      "crates/tx-shims/src/linux_syscall/mod.rs",
+      "crates/tx-shims/src/linux_syscall/ctx.rs",
+      "xtask/src/image.rs",
+      "tools/images/ipc_test.c"
     ],
     "out": [
-      "No new YieldShape, ExecutionScope, AbortReason, bus primitive, RestrictionKind",
-      "No new framework cells",
-      "No SIGEV_THREAD (glibc concern)",
-      "No POSIX sem anonymous-in-shared-memory (futex territory)",
-      "No SysV sem deprecated obsolete-IPC-modes",
-      "No MountNamespace on NsProxy (deferred: MountIdentity not bootstrapped at process-init time)"
+      "non-goals/new-yieldshape-executionscope-abortreason-bus-restrictionkind",
+      "non-goals/new-framework-cells",
+      "non-goals/sigev-thread",
+      "non-goals/posix-sem-anonymous-shared-memory",
+      "non-goals/sysv-sem-obsolete-ipc-modes",
+      "non-goals/mountnamespace-on-nsproxy"
+    ],
+    "write_sets": [
+      {
+        "owner": "agent",
+        "paths": [
+          "crates/tx-subsystems/src/ipc",
+          "crates/tx-subsystems/src/process",
+          "crates/tx-shims/src/linux_syscall",
+          "xtask/src/image.rs",
+          "tools/images/ipc_test.c"
+        ],
+        "notes": "Historical completed plan normalized to the current progress schema."
+      }
     ]
   },
   "context": {
@@ -64,7 +76,8 @@
         "crates/tx-subsystems/src/lib.rs",
         "crates/tx-subsystems/src/zones.rs"
       ],
-      "verification": ["cargo xtask check: PASS"]
+      "verification": ["cargo xtask check: PASS"],
+      "notes": "Scaffolded NsProxy, IpcNamespace, and IPC module registration."
     },
     {
       "id": "ipc-1-shm",
@@ -72,7 +85,8 @@
       "status": "complete",
       "depends_on": ["ipc-0-setup"],
       "paths": ["crates/tx-subsystems/src/ipc/sysv_shm/"],
-      "verification": ["cargo xtask check: PASS", "QEMU smoke: shmget/create/lookup/excl-fail/RMID all PASS"]
+      "verification": ["cargo xtask check: PASS", "QEMU smoke: shmget/create/lookup/excl-fail/RMID all PASS"],
+      "notes": "Implemented SysV shared-memory structure and lifecycle surface."
     },
     {
       "id": "ipc-2-msg",
@@ -80,7 +94,8 @@
       "status": "complete",
       "depends_on": ["ipc-1-shm"],
       "paths": ["crates/tx-subsystems/src/ipc/sysv_msg/"],
-      "verification": ["cargo xtask check: PASS", "QEMU smoke: msgget/create/lookup/RMID all PASS"]
+      "verification": ["cargo xtask check: PASS", "QEMU smoke: msgget/create/lookup/RMID all PASS"],
+      "notes": "Implemented SysV message queue structure and lookup/removal surface."
     },
     {
       "id": "ipc-3-sem",
@@ -88,7 +103,8 @@
       "status": "complete",
       "depends_on": ["ipc-2-msg"],
       "paths": ["crates/tx-subsystems/src/ipc/sysv_sem/"],
-      "verification": ["cargo xtask check: PASS", "QEMU smoke: semget/SETVAL/GETVAL/RMID PASS; semop needs copy_from_user"]
+      "verification": ["cargo xtask check: PASS", "QEMU smoke: semget/SETVAL/GETVAL/RMID PASS; semop needs copy_from_user"],
+      "notes": "Implemented SysV semaphore structure, including staged SEM_UNDO integration."
     },
     {
       "id": "ipc-4-posix",
@@ -96,7 +112,8 @@
       "status": "complete",
       "depends_on": ["ipc-3-sem"],
       "paths": ["crates/tx-subsystems/src/ipc/posix_mq/"],
-      "verification": ["cargo xtask check: PASS; POSIX mq_open/mq_unlink stub returning ENOSYS"]
+      "verification": ["cargo xtask check: PASS; POSIX mq_open/mq_unlink stub returning ENOSYS"],
+      "notes": "Added POSIX message-queue wrappers with staged syscall behavior."
     },
     {
       "id": "ipc-5-syscall-dispatch",
@@ -104,7 +121,8 @@
       "status": "complete",
       "depends_on": ["ipc-4-posix"],
       "paths": ["crates/tx-shims/src/linux_syscall/"],
-      "verification": ["cargo xtask check: PASS", "QEMU smoke: 14/16 syscalls return correct values at runtime"]
+      "verification": ["cargo xtask check: PASS", "QEMU smoke: 14/16 syscalls return correct values at runtime"],
+      "notes": "Wired IPC syscall numbers and dispatch arms."
     }
   ],
   "verification": [

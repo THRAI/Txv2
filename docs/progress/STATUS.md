@@ -1,3 +1,19 @@
+- 2026-05-22 **Fixed VM musl-facing mmap/mremap and audit smells.**
+  Followed `docs/progress/research/2026-05-22-vm-musl-audit.md`: `mremap`
+  now decodes Linux flags, supports in-place resize, may-move relocation,
+  and fixed destination replacement; `MAP_SHARED | MAP_ANONYMOUS` now uses
+  an anonymous `PageContainer`; file-backed fault materialization preserves
+  wait-source yields; fork CoW pmap demotion errors propagate; user/brk
+  arithmetic uses checked addition/alignment; and fault publication now
+  revalidates the private-page-set identity. Also normalized stale progress
+  JSON records that were blocking `cargo xtask progress validate`.
+  **Verified:** `cargo test -p tx-subsystems --lib vm -- --test-threads=1`
+  (105 passed); `cargo test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls -- --test-threads=1` (20 passed);
+  `cargo xtask progress validate` (27 records ok).
+  **Next:** rerun full workspace format/check once the unrelated existing
+  dirty files are ready for a broader sweep.
+
 - 2026-05-20 **Fixed targeted LA64 OSComp group selection.**
   `make oscomp-local-la64-libctest-musl-smp4` previously expanded to a QEMU
   command with `-append 'tx.oscomp.groups=libctest-musl'`, but LA64 did not

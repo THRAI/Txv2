@@ -1,13 +1,13 @@
 //! AddressSpace identity and read accessors.
 
-use crate::vm::adapter::step_engine::{Cap, Zone, ZoneAllocated, epoch_mod as epoch};
+use crate::vm::adapter::step_engine::{epoch_mod as epoch, Cap, Zone, ZoneAllocated};
 use alloc::vec::Vec;
 use tx_hal::PmapIf;
 
-use crate::vm::VmPmapError;
 #[cfg(test)]
 use crate::vm::pmap::TestPmap;
 use crate::vm::pmap::VmPmap;
+use crate::vm::VmPmapError;
 
 use super::{
     AddressSpaceStats, AddressSpaceStatsCell, RangeLock, RecipeIndex, UfdRegistration, UserRange,

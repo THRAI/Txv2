@@ -3,7 +3,7 @@
   "id": "2026-05-19-sysv-ipc-worktree",
   "created": "2026-05-19",
   "updated": "2026-05-19",
-  "status": "completed",
+  "status": "closed",
   "branch": "codex/sysv-ipc-implementation",
   "path": "/Users/3y/Downloads/Tx/.claude/worktrees/sysv-ipc-20260519",
   "base": "main",
