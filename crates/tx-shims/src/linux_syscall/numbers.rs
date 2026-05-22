@@ -35,34 +35,6 @@ pub const NR_PREADV2: u64 = 286;
 /// `pwritev2(fd, iov, iovcnt, offset_lo, offset_hi, flags)`.
 /// Linux generic ABI `__NR_pwritev2`.
 pub const NR_PWRITEV2: u64 = 287;
-/// `socket(domain, type, protocol)`. Linux generic ABI `__NR_socket`.
-pub const NR_SOCKET: u64 = 198;
-/// `socketpair(domain, type, protocol, sv)`. Linux generic ABI `__NR_socketpair`.
-pub const NR_SOCKETPAIR: u64 = 199;
-/// `bind(sockfd, addr, addrlen)`. Linux generic ABI `__NR_bind`.
-pub const NR_BIND: u64 = 200;
-/// `listen(sockfd, backlog)`. Linux generic ABI `__NR_listen`.
-pub const NR_LISTEN: u64 = 201;
-/// `accept(sockfd, addr, addrlen)`. Linux generic ABI `__NR_accept`.
-pub const NR_ACCEPT: u64 = 202;
-/// `connect(sockfd, addr, addrlen)`. Linux generic ABI `__NR_connect`.
-pub const NR_CONNECT: u64 = 203;
-/// `getsockname(sockfd, addr, addrlen)`. Linux generic ABI `__NR_getsockname`.
-pub const NR_GETSOCKNAME: u64 = 204;
-/// `getpeername(sockfd, addr, addrlen)`. Linux generic ABI `__NR_getpeername`.
-pub const NR_GETPEERNAME: u64 = 205;
-/// `sendto(sockfd, buf, len, flags, dest_addr, addrlen)`. Linux generic ABI `__NR_sendto`.
-pub const NR_SENDTO: u64 = 206;
-/// `recvfrom(sockfd, buf, len, flags, src_addr, addrlen)`. Linux generic ABI `__NR_recvfrom`.
-pub const NR_RECVFROM: u64 = 207;
-/// `setsockopt(sockfd, level, optname, optval, optlen)`. Linux generic ABI `__NR_setsockopt`.
-pub const NR_SETSOCKOPT: u64 = 208;
-/// `getsockopt(sockfd, level, optname, optval, optlen)`. Linux generic ABI `__NR_getsockopt`.
-pub const NR_GETSOCKOPT: u64 = 209;
-/// `shutdown(sockfd, how)`. Linux generic ABI `__NR_shutdown`.
-pub const NR_SHUTDOWN: u64 = 210;
-/// `accept4(sockfd, addr, addrlen, flags)`. Linux generic ABI `__NR_accept4`.
-pub const NR_ACCEPT4: u64 = 242;
 /// `sendfile64(out_fd, in_fd, offset, count)`. Linux generic ABI
 /// `__NR_sendfile64`. Copies data from `in_fd` to `out_fd` via
 /// page-level transfer without an intermediate userspace buffer.
@@ -852,11 +824,11 @@ pub const FUTEX_WAIT: u32 = 0;
 /// `FUTEX_WAKE = 1` op selector. Wake up to `val` waiters parked on
 /// `uaddr`'s bucket. Returns the number of waiters notified on the bucket.
 pub const FUTEX_WAKE: u32 = 1;
-/// `FUTEX_REQUEUE = 3`. Out of scope for v1 — returns `-ENOSYS`.
+/// `FUTEX_REQUEUE = 3`. Approximate support wakes source waiters.
 pub const FUTEX_REQUEUE: u32 = 3;
-/// `FUTEX_CMP_REQUEUE = 4`. Out of scope for v1 — returns `-ENOSYS`.
+/// `FUTEX_CMP_REQUEUE = 4`. Approximate support checks then wakes source waiters.
 pub const FUTEX_CMP_REQUEUE: u32 = 4;
-/// `FUTEX_WAKE_OP = 5`. Out of scope for v1 — returns `-ENOSYS`.
+/// `FUTEX_WAKE_OP = 5`. Approximate support wakes both addresses.
 pub const FUTEX_WAKE_OP: u32 = 5;
 /// `FUTEX_LOCK_PI = 6`. Out of scope for v1 — returns `-ENOSYS`.
 pub const FUTEX_LOCK_PI: u32 = 6;

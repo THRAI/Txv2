@@ -79,9 +79,9 @@ impl RunIdleReport {
     }
 }
 
-fn earliest_deadline(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+const fn earliest_deadline(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
-        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), Some(b)) => Some(if a <= b { a } else { b }),
         (Some(a), None) => Some(a),
         (None, Some(b)) => Some(b),
         (None, None) => None,
@@ -1612,14 +1612,6 @@ impl Reactor {
             self.shared.scheduler.task_dropped(record.handle.id());
         }
         drained
-    }
-}
-
-const fn earliest_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(if left <= right { left } else { right }),
-        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-        (None, None) => None,
     }
 }
 

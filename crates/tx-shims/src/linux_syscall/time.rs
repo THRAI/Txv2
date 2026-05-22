@@ -664,7 +664,7 @@ pub fn maybe_deliver_itimer_signal<P: TimeIf>(
     let Some(sig) = Signum::new(SIGALRM_RAW) else {
         return ctx;
     };
-    let Some(SigDisposition::Handler(handler)) = process.sig_disposition(sig) else {
+    let Some(SigDisposition::Handler { handler, .. }) = process.sig_disposition(sig) else {
         let _ = step_kill_process(process, sig, None);
         return ctx;
     };
