@@ -524,11 +524,17 @@ pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 /// addr+length)` window.
 pub const NR_MUNMAP: u64 = 215;
 /// `mremap(old_addr, old_size, new_size, flags, new_addr)`. Linux RV64
-/// generic ABI `__NR_mremap = 216`. Slice 2 only honours the
-/// `MREMAP_FIXED | MREMAP_MAYMOVE` shape musl emits — pure-grow without
-/// `MAYMOVE` returns `-ENOMEM` if the new size doesn't fit in place
-/// (which `try_mremap`'s disjoint-only contract always reports).
+/// generic ABI `__NR_mremap = 216`.
 pub const NR_MREMAP: u64 = 216;
+/// `MREMAP_MAYMOVE` — permit the kernel to move the mapping if in-place
+/// resize cannot be satisfied.
+pub const MREMAP_MAYMOVE: u64 = 0x1;
+/// `MREMAP_FIXED` — move to the supplied fifth argument. Linux requires
+/// this to be paired with `MREMAP_MAYMOVE`.
+pub const MREMAP_FIXED: u64 = 0x2;
+/// `MREMAP_DONTUNMAP` — accepted by newer Linux only for specialized
+/// userfaultfd-style moves; txKernel does not implement it yet.
+pub const MREMAP_DONTUNMAP: u64 = 0x4;
 /// `mmap(addr, length, prot, flags, fd, offset)`. Linux RV64 generic
 /// ABI `__NR_mmap = 222`.
 pub const NR_MMAP: u64 = 222;
@@ -596,9 +602,8 @@ pub const MAP_PRIVATE: u64 = 0x02;
 /// (`MapPlacement::FixedReplace`).
 pub const MAP_FIXED: u64 = 0x10;
 /// `MAP_ANONYMOUS` — mapping is not file-backed; `fd` and `offset` are
-/// ignored. Routes to `VmBacking::PrivateAnon` (or
-/// `VmBacking::None`-shaped Shared, which Slice 2 does not yet wire —
-/// shared anon is treated like private anon for now).
+/// ignored. Private anonymous mappings route to `VmBacking::PrivateAnon`;
+/// shared anonymous mappings allocate an anonymous `PageContainer`.
 pub const MAP_ANONYMOUS: u64 = 0x20;
 /// `MAP_GROWSDOWN` — stack-style mapping, threads through to
 /// `VmEntryFlags.grows_down`.

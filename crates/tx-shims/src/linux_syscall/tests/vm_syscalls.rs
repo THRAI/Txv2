@@ -10,16 +10,18 @@ use tx_subsystems::process::bootstrap_init_process;
 use tx_subsystems::vfs::structure::{
     FsObjectId, InodeKind, InodeMeta, OpenFileFlags, RNode, RNodeBacking,
 };
-use tx_subsystems::vm::USER_PAGE_SIZE;
+use tx_subsystems::vm::{AccessMode, UserVirtAddr, VmFault, USER_PAGE_SIZE};
 
 use crate::linux_syscall::{
-    MADV_DONTNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, NR_MADVISE, NR_MMAP,
-    NR_MPROTECT, NR_MUNMAP, PROT_READ, PROT_WRITE,
+    MADV_DONTNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, MAP_SHARED,
+    MREMAP_FIXED, MREMAP_MAYMOVE, NR_MADVISE, NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MUNMAP,
+    PROT_READ, PROT_WRITE,
 };
 
 const E_BADF: i32 = 9;
 const E_EXIST: i32 = 17;
 const E_INVAL: i32 = 22;
+const E_NOMEM: i32 = 12;
 const E_NODEV: i32 = 19;
 const E_NOSYS: i32 = 38;
 
@@ -135,6 +137,41 @@ fn dispatch_mmap_anonymous_private_zero_length_returns_neg_einval() {
     assert_eq!(result, SyscallResult::Error(E_INVAL));
 }
 
+/// `MAP_SHARED | MAP_ANONYMOUS` should route to a real anonymous
+/// PageContainer, not `PrivateAnon`; the returned mapping must fault
+/// as shared page-backed memory instead of hitting BackingMismatch.
+#[test]
+fn dispatch_mmap_shared_anonymous_faults_through_page_container() {
+    let _setup = vm_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+
+    let req = SyscallRequest::new(
+        NR_MMAP,
+        [
+            0,
+            USER_PAGE_SIZE as u64,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_ANONYMOUS,
+            u64::MAX,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    let addr = match result {
+        SyscallResult::Return(addr) => addr as usize,
+        other => panic!("expected Return, got {other:?}"),
+    };
+
+    let published = block_on(
+        ctx.aspace
+            .fault_script(VmFault::new(UserVirtAddr(addr), AccessMode::Write)),
+    )
+    .expect("shared anonymous fault should materialize");
+
+    assert_eq!(published.page, UserVirtAddr(addr).containing_page());
+}
+
 /// `mmap(unaligned, PAGE, .., MAP_FIXED, ..)` rejects -EINVAL.
 #[test]
 fn dispatch_mmap_anonymous_private_unaligned_addr_with_fixed_returns_neg_einval() {
@@ -155,6 +192,177 @@ fn dispatch_mmap_anonymous_private_unaligned_addr_with_fixed_returns_neg_einval(
     );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_INVAL));
+}
+
+#[test]
+fn dispatch_mremap_maymove_without_fixed_ignores_new_addr_and_moves_when_needed() {
+    let _setup = vm_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+
+    let old_addr = 0x2000_0000u64;
+    let seed = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_MMAP,
+            [
+                old_addr,
+                USER_PAGE_SIZE as u64,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                u64::MAX,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(seed, SyscallResult::Return(old_addr as i64));
+    let blocker = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_MMAP,
+            [
+                old_addr + USER_PAGE_SIZE as u64,
+                USER_PAGE_SIZE as u64,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                u64::MAX,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(
+        blocker,
+        SyscallResult::Return((old_addr + USER_PAGE_SIZE as u64) as i64)
+    );
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_MREMAP,
+            [
+                old_addr,
+                USER_PAGE_SIZE as u64,
+                (USER_PAGE_SIZE * 2) as u64,
+                MREMAP_MAYMOVE,
+                0x1234, // ignored unless MREMAP_FIXED is present
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    let new_addr = match result {
+        SyscallResult::Return(addr) => addr as usize,
+        other => panic!("expected Return, got {other:?}"),
+    };
+
+    assert_eq!(new_addr % USER_PAGE_SIZE, 0);
+    assert_ne!(new_addr, 0x1234);
+    assert!(ctx.aspace.lookup(UserVirtAddr(old_addr as usize)).is_none());
+    assert!(ctx.aspace.lookup(UserVirtAddr(new_addr)).is_some());
+}
+
+#[test]
+fn dispatch_mremap_grow_without_maymove_returns_nomem_when_adjacent_range_occupied() {
+    let _setup = vm_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+
+    let old_addr = 0x3000_0000u64;
+    let seed = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_MMAP,
+            [
+                old_addr,
+                USER_PAGE_SIZE as u64,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                u64::MAX,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(seed, SyscallResult::Return(old_addr as i64));
+    let blocker = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_MMAP,
+            [
+                old_addr + USER_PAGE_SIZE as u64,
+                USER_PAGE_SIZE as u64,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                u64::MAX,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(
+        blocker,
+        SyscallResult::Return((old_addr + USER_PAGE_SIZE as u64) as i64)
+    );
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_MREMAP,
+            [
+                old_addr,
+                USER_PAGE_SIZE as u64,
+                (USER_PAGE_SIZE * 2) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_NOMEM));
+}
+
+#[test]
+fn dispatch_mremap_fixed_maymove_replaces_destination_mapping() {
+    let _setup = vm_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+
+    let old_addr = 0x3100_0000u64;
+    let new_addr = 0x3200_0000u64;
+    for addr in [old_addr, new_addr] {
+        let seed = block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_MMAP,
+                [
+                    addr,
+                    USER_PAGE_SIZE as u64,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                    u64::MAX,
+                    0,
+                ],
+            ),
+            &ctx,
+        ));
+        assert_eq!(seed, SyscallResult::Return(addr as i64));
+    }
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_MREMAP,
+            [
+                old_addr,
+                USER_PAGE_SIZE as u64,
+                USER_PAGE_SIZE as u64,
+                MREMAP_MAYMOVE | MREMAP_FIXED,
+                new_addr,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Return(new_addr as i64));
+    assert!(ctx.aspace.lookup(UserVirtAddr(old_addr as usize)).is_none());
+    assert!(ctx.aspace.lookup(UserVirtAddr(new_addr as usize)).is_some());
 }
 
 /// `mmap(0, PAGE, PROT_READ, MAP_PRIVATE, fd, 0)` against a fd

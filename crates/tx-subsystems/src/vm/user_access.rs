@@ -280,7 +280,9 @@ impl AddressSpace {
         let mut out: Vec<u8> = Vec::with_capacity(core::cmp::min(max_len, 256));
         let mut consumed = 0usize;
         while consumed < max_len {
-            let user_addr = src.addr().wrapping_add(consumed);
+            let Some(user_addr) = src.addr().checked_add(consumed) else {
+                return V3::Err(Errno::EFAULT.into());
+            };
             let page_addr = user_addr & !(USER_PAGE_SIZE - 1);
             let within = user_addr - page_addr;
             let chunk = core::cmp::min(max_len - consumed, USER_PAGE_SIZE - within);
@@ -336,7 +338,13 @@ fn copy_in(
     let mut copied = 0usize;
     let total = dst.len();
     while copied < total {
-        let user_addr = src.addr().wrapping_add(copied);
+        let Some(user_addr) = src.addr().checked_add(copied) else {
+            return if copied > 0 {
+                V3::Done(copied)
+            } else {
+                V3::Err(Errno::EFAULT.into())
+            };
+        };
         let page_addr = user_addr & !(USER_PAGE_SIZE - 1);
         let within = user_addr - page_addr;
         let chunk = core::cmp::min(total - copied, USER_PAGE_SIZE - within);
@@ -395,7 +403,13 @@ fn copy_out(
     let mut copied = 0usize;
     let total = src.len();
     while copied < total {
-        let user_addr = dst.addr().wrapping_add(copied);
+        let Some(user_addr) = dst.addr().checked_add(copied) else {
+            return if copied > 0 {
+                V3::Done(copied)
+            } else {
+                V3::Err(Errno::EFAULT.into())
+            };
+        };
         let page_addr = user_addr & !(USER_PAGE_SIZE - 1);
         let within = user_addr - page_addr;
         let chunk = core::cmp::min(total - copied, USER_PAGE_SIZE - within);
@@ -578,6 +592,7 @@ fn resolve_user_page(
             };
             let outcome = crate::vm::structure::VmFaultOutcome {
                 page_range,
+                private_identity: entry.private.as_ref().map(|set| set.raw()),
                 entry: entry.clone(),
                 access: kind.required_prot(),
                 pmap_materialization_deferred: true,

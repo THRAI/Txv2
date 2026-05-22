@@ -191,8 +191,16 @@ impl<'a, I: SubjectIdentity> StepOp<I> for VmBrkOp<'a> {
 
         if self.requested_brk.0 > self.current_brk.0 {
             // Grow: mmap the new pages.
-            let old_committed = crate::vm::execution::page_align_up(self.current_brk.0);
-            let new_committed = crate::vm::execution::page_align_up(self.requested_brk.0);
+            let Some(old_committed) =
+                crate::vm::execution::checked_page_align_up(self.current_brk.0)
+            else {
+                return StepOutcome::Err(Errno::EINVAL);
+            };
+            let Some(new_committed) =
+                crate::vm::execution::checked_page_align_up(self.requested_brk.0)
+            else {
+                return StepOutcome::Err(Errno::EINVAL);
+            };
             if new_committed <= old_committed {
                 return StepOutcome::Done(self.requested_brk);
             }
@@ -217,8 +225,16 @@ impl<'a, I: SubjectIdentity> StepOp<I> for VmBrkOp<'a> {
             }
         } else {
             // Shrink: munmap the excess pages.
-            let old_committed = crate::vm::execution::page_align_up(self.current_brk.0);
-            let new_committed = crate::vm::execution::page_align_up(self.requested_brk.0);
+            let Some(old_committed) =
+                crate::vm::execution::checked_page_align_up(self.current_brk.0)
+            else {
+                return StepOutcome::Err(Errno::EINVAL);
+            };
+            let Some(new_committed) =
+                crate::vm::execution::checked_page_align_up(self.requested_brk.0)
+            else {
+                return StepOutcome::Err(Errno::EINVAL);
+            };
             if new_committed >= old_committed {
                 return StepOutcome::Done(self.requested_brk);
             }

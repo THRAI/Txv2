@@ -19,19 +19,22 @@ use crate::vm::adapter::step_engine::{
     UfdAccessKind, UfdReply, UfdRequest, YieldShape,
 };
 use crate::vm::checks::{
-    require_disjoint_remap, require_fault_publication, require_fault_recipe, require_map_admission,
+    require_fault_publication, require_fault_recipe, require_map_admission, require_remap_shape,
 };
 use crate::vm::structure::{PrivatePageError, PrivatePageSet};
 use crate::vm::{
     AddressSpace, LockMode, MapPlacement, PmapPublishOutcome, Prot, RangeGuard, UserRange,
     UserVirtAddr, VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization,
-    VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget,
-    VmRemapOutcome, VmRemapRequest,
+    VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome,
+    VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapPlacement, VmRemapRequest, USER_PAGE_SIZE,
 };
 
 pub fn page_align_up(addr: usize) -> usize {
-    const PAGE_SIZE: usize = 4096;
-    (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+    checked_page_align_up(addr).expect("page_align_up overflow")
+}
+
+pub fn checked_page_align_up(addr: usize) -> Option<usize> {
+    addr.checked_next_multiple_of(USER_PAGE_SIZE)
 }
 
 impl AddressSpace {
@@ -127,7 +130,9 @@ impl AddressSpace {
                 .recipes
                 .commit_map(child_entry, MapPlacement::RequireFree)?;
             if private {
-                let _ = parent.pmap.protect_range(range, entry.prot.without_write());
+                parent
+                    .pmap
+                    .protect_range(range, entry.prot.without_write())?;
             }
         }
 
@@ -305,7 +310,16 @@ impl AddressSpace {
                     len,
                 })) => materialize_ufd_copy(&outcome, src_kernel_addr, len)?,
                 Some(DelegateReply::Ufd(UfdReply::ZeroPage { .. })) | None => {
-                    outcome.materialize_pagebacked()?
+                    let guard = step_engine::guard();
+                    match outcome.materialize_pagebacked_step(&guard) {
+                        VmFaultMaterializationStep::Done(materialization) => materialization,
+                        VmFaultMaterializationStep::Blocked(token) => {
+                            drop(guard);
+                            await_range_lock(token).await;
+                            continue;
+                        }
+                        VmFaultMaterializationStep::Err(error) => return Err(error),
+                    }
                 }
                 Some(DelegateReply::Ufd(UfdReply::Continue { .. })) => {
                     // `UFFDIO_CONTINUE` is the MINOR-mode path (ufd-shm
@@ -479,31 +493,66 @@ impl AddressSpace {
         &self,
         request: VmRemapRequest,
     ) -> Result<VmRemapOutcome, VmMapError> {
-        require_disjoint_remap(request.old_range, request.new_range)?;
+        require_remap_shape(request.old_range, request.new_range, request.placement)?;
         loop {
-            let _guard_pair = match self.range_lock.acquire_pair_step(
-                (request.old_range, LockMode::ExclusiveWriter),
-                (request.new_range, LockMode::ExclusiveWriter),
-            ) {
-                V3StepOutcome::Done(pair) => pair,
-                V3StepOutcome::Yield {
-                    shape:
-                        YieldShape::OnWaitSource {
-                            source: carrier,
-                            interests,
-                        },
-                    ..
-                } => {
-                    let token = WaitToken::new(carrier.raw(), interests.raw());
-                    await_range_lock(token).await;
-                    continue;
+            let _guard_pair;
+            let _guard_single;
+            match request.placement {
+                VmRemapPlacement::Move => {
+                    _guard_pair = match self.range_lock.acquire_pair_step(
+                        (request.old_range, LockMode::ExclusiveWriter),
+                        (request.new_range, LockMode::ExclusiveWriter),
+                    ) {
+                        V3StepOutcome::Done(pair) => pair,
+                        V3StepOutcome::Yield {
+                            shape:
+                                YieldShape::OnWaitSource {
+                                    source: carrier,
+                                    interests,
+                                },
+                            ..
+                        } => {
+                            let token = WaitToken::new(carrier.raw(), interests.raw());
+                            await_range_lock(token).await;
+                            continue;
+                        }
+                        _ => unreachable_acquire_step(),
+                    };
                 }
-                _ => unreachable_acquire_step(),
-            };
-            let commit = self
-                .recipes
-                .remap_disjoint(request.old_range, request.new_range)?;
-            self.pmap.teardown_range(request.old_range)?;
+                VmRemapPlacement::InPlace => {
+                    let lock_range = remap_union_range(request.old_range, request.new_range)?;
+                    _guard_single = match self
+                        .range_lock
+                        .acquire_step(lock_range, LockMode::ExclusiveWriter)
+                    {
+                        V3StepOutcome::Done(guard) => guard,
+                        V3StepOutcome::Yield {
+                            shape:
+                                YieldShape::OnWaitSource {
+                                    source: carrier,
+                                    interests,
+                                },
+                            ..
+                        } => {
+                            let token = WaitToken::new(carrier.raw(), interests.raw());
+                            await_range_lock(token).await;
+                            continue;
+                        }
+                        _ => unreachable_acquire_step(),
+                    };
+                }
+            }
+            let commit = self.recipes.remap(
+                request.old_range,
+                request.new_range,
+                request.placement,
+                request.destination,
+            )?;
+            for teardown_range in
+                remap_teardown_ranges(request.old_range, request.new_range, request.placement)?
+            {
+                self.pmap.teardown_range(teardown_range)?;
+            }
             let guard = step_engine::guard();
             self.stats.store(self.recipes.stats(&guard));
             return Ok(VmRemapOutcome {
@@ -544,8 +593,10 @@ impl AddressSpace {
             return Ok(current_brk);
         }
         if requested_brk.0 > current_brk.0 {
-            let old_committed = page_align_up(current_brk.0);
-            let new_committed = page_align_up(requested_brk.0);
+            let old_committed =
+                checked_page_align_up(current_brk.0).ok_or(VmMapError::InvalidRange)?;
+            let new_committed =
+                checked_page_align_up(requested_brk.0).ok_or(VmMapError::InvalidRange)?;
             if new_committed > old_committed {
                 let range = UserRange::new_aligned(
                     UserVirtAddr(old_committed),
@@ -562,8 +613,10 @@ impl AddressSpace {
                 self.mmap_script(request).await?;
             }
         } else {
-            let old_committed = page_align_up(current_brk.0);
-            let new_committed = page_align_up(requested_brk.0);
+            let old_committed =
+                checked_page_align_up(current_brk.0).ok_or(VmMapError::InvalidRange)?;
+            let new_committed =
+                checked_page_align_up(requested_brk.0).ok_or(VmMapError::InvalidRange)?;
             if new_committed < old_committed {
                 let range = UserRange::new_aligned(
                     UserVirtAddr(new_committed),
@@ -577,20 +630,44 @@ impl AddressSpace {
     }
 
     pub fn try_mremap(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
-        require_disjoint_remap(request.old_range, request.new_range)?;
+        require_remap_shape(request.old_range, request.new_range, request.placement)?;
 
-        let _guard_pair = match self.range_lock.acquire_pair_step(
-            (request.old_range, LockMode::ExclusiveWriter),
-            (request.new_range, LockMode::ExclusiveWriter),
-        ) {
-            V3StepOutcome::Done(pair) => pair,
-            V3StepOutcome::Yield { .. } => return Err(VmMapError::WouldBlock),
-            _ => unreachable_acquire_step(),
+        let _guard_pair;
+        let _guard_single;
+        match request.placement {
+            VmRemapPlacement::Move => {
+                _guard_pair = match self.range_lock.acquire_pair_step(
+                    (request.old_range, LockMode::ExclusiveWriter),
+                    (request.new_range, LockMode::ExclusiveWriter),
+                ) {
+                    V3StepOutcome::Done(pair) => pair,
+                    V3StepOutcome::Yield { .. } => return Err(VmMapError::WouldBlock),
+                    _ => unreachable_acquire_step(),
+                };
+            }
+            VmRemapPlacement::InPlace => {
+                let lock_range = remap_union_range(request.old_range, request.new_range)?;
+                _guard_single = match self
+                    .range_lock
+                    .acquire_step(lock_range, LockMode::ExclusiveWriter)
+                {
+                    V3StepOutcome::Done(guard) => guard,
+                    V3StepOutcome::Yield { .. } => return Err(VmMapError::WouldBlock),
+                    _ => unreachable_acquire_step(),
+                };
+            }
         };
-        let commit = self
-            .recipes
-            .remap_disjoint(request.old_range, request.new_range)?;
-        self.pmap.teardown_range(request.old_range)?;
+        let commit = self.recipes.remap(
+            request.old_range,
+            request.new_range,
+            request.placement,
+            request.destination,
+        )?;
+        for teardown_range in
+            remap_teardown_ranges(request.old_range, request.new_range, request.placement)?
+        {
+            self.pmap.teardown_range(teardown_range)?;
+        }
         let guard = step_engine::guard();
         self.stats.store(self.recipes.stats(&guard));
         Ok(VmRemapOutcome {
@@ -633,7 +710,7 @@ impl AddressSpace {
             match PrivatePageSet::new_cap() {
                 Ok(set) => entry.with_private(Some(set)),
                 Err(e) => {
-                    return MapReserveResult::Err(VmMapError::Private(PrivatePageError::Zone(e)))
+                    return MapReserveResult::Err(VmMapError::Private(PrivatePageError::Zone(e)));
                 }
             }
         } else {
@@ -701,6 +778,46 @@ impl AddressSpace {
         let guard = step_engine::guard();
         self.stats.store(self.recipes.stats(&guard));
         Ok(commit)
+    }
+}
+
+fn remap_union_range(old_range: UserRange, new_range: UserRange) -> Result<UserRange, VmMapError> {
+    let start = old_range
+        .start()
+        .as_usize()
+        .min(new_range.start().as_usize());
+    let end = old_range.end().as_usize().max(new_range.end().as_usize());
+    UserRange::new_aligned(UserVirtAddr(start), end - start).map_err(|_| VmMapError::InvalidRange)
+}
+
+fn remap_teardown_ranges(
+    old_range: UserRange,
+    new_range: UserRange,
+    placement: VmRemapPlacement,
+) -> Result<Vec<UserRange>, VmMapError> {
+    match placement {
+        VmRemapPlacement::Move => {
+            let mut ranges = Vec::with_capacity(2);
+            ranges.push(old_range);
+            ranges.push(new_range);
+            Ok(ranges)
+        }
+        VmRemapPlacement::InPlace if new_range.len() < old_range.len() => {
+            let start = old_range
+                .start()
+                .as_usize()
+                .checked_add(new_range.len())
+                .ok_or(VmMapError::InvalidRange)?;
+            let len = old_range.len() - new_range.len();
+            UserRange::new_aligned(UserVirtAddr(start), len)
+                .map(|range| {
+                    let mut ranges = Vec::with_capacity(1);
+                    ranges.push(range);
+                    ranges
+                })
+                .map_err(|_| VmMapError::InvalidRange)
+        }
+        VmRemapPlacement::InPlace => Ok(Vec::new()),
     }
 }
 

@@ -24,8 +24,9 @@ pub use types::{
     AccessMode, AddressSpaceStats, MapPlacement, Prot, UfdRegistration, UserPage, UserPageIter,
     UserRange, UserRangeError, UserVirtAddr, VmBacking, VmEntry, VmEntryError, VmEntryFlags,
     VmEntryRewrite, VmFault, VmFaultError, VmFaultMaterialization, VmFaultMaterializationBacking,
-    VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget,
-    VmRemapOutcome, VmRemapRequest, FULL_USER_V1_TOP, USER_PAGE_SIZE,
+    VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome,
+    VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapPlacement, VmRemapRequest, FULL_USER_V1_TOP,
+    USER_PAGE_SIZE,
 };
 
 pub(in crate::vm) use recipe::{AddressSpaceStatsCell, RecipeIndex};
