@@ -1,5 +1,6 @@
 use super::la64_pmap::{
-    dmw_covers_phys_range, la64_fixup_lookup, la64_kernel_addr_to_phys, la64_uncached_virt,
+    dmw_covers_phys_range, la64_current_cpu_id, la64_fixup_lookup, la64_kernel_addr_to_phys,
+    la64_uncached_virt,
 };
 use super::*;
 
@@ -540,11 +541,14 @@ pub(crate) const fn classify_la64_trap(estat: usize) -> TrapClass {
     }
 }
 
-pub(crate) struct La64IrqContextGuard;
+pub(crate) struct La64IrqContextGuard {
+    depth: &'static AtomicUsize,
+}
 
 impl Drop for La64IrqContextGuard {
     fn drop(&mut self) {
-        let previous = LA64_IRQ_CONTEXT_DEPTH
+        let previous = self
+            .depth
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
                 Some(depth.saturating_sub(1))
             })
@@ -554,12 +558,20 @@ impl Drop for La64IrqContextGuard {
 }
 
 pub(crate) fn enter_la64_irq_context() -> La64IrqContextGuard {
-    LA64_IRQ_CONTEXT_DEPTH.fetch_add(1, Ordering::AcqRel);
-    La64IrqContextGuard
+    let depth = current_la64_irq_depth_cell();
+    depth.fetch_add(1, Ordering::AcqRel);
+    La64IrqContextGuard { depth }
 }
 
 pub(crate) fn la64_irq_context_depth() -> usize {
-    LA64_IRQ_CONTEXT_DEPTH.load(Ordering::Acquire)
+    current_la64_irq_depth_cell().load(Ordering::Acquire)
+}
+
+fn current_la64_irq_depth_cell() -> &'static AtomicUsize {
+    let cpu = la64_current_cpu_id();
+    LA64_IRQ_CONTEXT_DEPTHS
+        .get(cpu.0)
+        .unwrap_or(&LA64_IRQ_CONTEXT_DEPTHS[0])
 }
 
 pub(crate) fn install_la64_trap_vectors() {

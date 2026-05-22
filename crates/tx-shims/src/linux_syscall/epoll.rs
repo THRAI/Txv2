@@ -105,6 +105,15 @@ fn epoll_wait_source(file: &OpenFile, interests: u32) -> WaitSourceId {
         return WaitSourceId::new(source);
     }
 
+    if let Some(mq) = file.posix_mq() {
+        let source = match tx_subsystems::ipc::posix_mq::execution::step_mq_poll_info(mq) {
+            Ok(info) if (interests & EPOLLIN) != 0 => info.read_source_id,
+            Ok(info) if (interests & EPOLLOUT) != 0 => info.write_source_id,
+            _ => 0,
+        };
+        return WaitSourceId::new(source);
+    }
+
     WaitSourceId::new(0)
 }
 
@@ -132,6 +141,15 @@ fn ready_events_for_entry<P: TimeIf>(
     } else if let Some(sfd) = target.signalfd() {
         if (entry.interests & EPOLLIN) != 0 && sfd.pending_count() > 0 {
             ready |= EPOLLIN;
+        }
+    } else if let Some(mq) = target.posix_mq() {
+        if let Ok(info) = tx_subsystems::ipc::posix_mq::execution::step_mq_poll_info(mq) {
+            if (entry.interests & EPOLLIN) != 0 && info.readable {
+                ready |= EPOLLIN;
+            }
+            if (entry.interests & EPOLLOUT) != 0 && info.writable {
+                ready |= EPOLLOUT;
+            }
         }
     }
 
@@ -173,10 +191,7 @@ pub(super) fn sys_epoll_create1(flags: u32, ctx: &SyscallCtx<'_>) -> SyscallResu
     };
 
     // Install as an fd in the calling process.
-    let fd = match super::next_stdio_fd_below_nofile(&ctx.process) {
-        Ok(fd) => fd,
-        Err(result) => return result,
-    };
+    let fd = ctx.process.allocate_fd();
     let _ = ctx.process.install_fd(fd, of);
     if cloexec {
         ctx.process.set_fd_cloexec(fd, true);

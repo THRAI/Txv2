@@ -27,6 +27,7 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::process::adapter::step_engine::{
@@ -314,6 +315,17 @@ impl ProcessIdentity {
     /// Find a thread by its tid within this process.
     pub fn thread_by_tid(&self, tid: u32) -> Option<Cap<ThreadIdentity>> {
         self.payload.lock().as_ref()?.threads.find_by_tid(tid)
+    }
+
+    /// Collapse all sibling threads for exec, leaving `initiator`
+    /// as the sole live thread. Returns the number of siblings
+    /// removed, or `None` for zombies.
+    pub fn collapse_threads_for_exec(&self, initiator: &Cap<ThreadIdentity>) -> Option<usize> {
+        let payload = {
+            let payload_guard = self.payload.lock();
+            payload_guard.as_ref().cloned()?
+        };
+        payload.collapse_threads_for_exec(initiator)
     }
 
     /// Snapshot the current address space `Cap`, if the process is
@@ -649,7 +661,7 @@ impl ProcessIdentity {
         self.payload
             .lock()
             .as_ref()
-            .map(|p| p.threads.count())
+            .map(|p| p.thread_count.load(Ordering::Acquire) as usize)
             .unwrap_or(0)
     }
 
@@ -1272,21 +1284,30 @@ impl ProcessPayload {
     /// same accessor to preopen fds 0/1/2.
     pub fn set_fd(&self, idx: u32, file: Option<Cap<OpenFile>>) -> Option<Cap<OpenFile>> {
         let mut slot = self.fds.lock();
-        match file {
+        let previous = match file {
             Some(f) => slot.insert(idx, f),
             None => slot.remove(&idx),
+        };
+        drop(slot);
+        if let Some(file) = &previous {
+            decr_pipe_fd_ref(file);
         }
+        previous
     }
 
     /// Remove every fd from this payload and return the detached table.
     ///
-    /// Process exit must close all open file descriptions before the
-    /// payload itself becomes unreachable. In particular, pipe EOF/EPIPE
-    /// publication is driven from `OpenFile` drop hooks, so exit paths
-    /// need a concrete fd-table drain rather than waiting for the whole
-    /// payload to disappear later through EBR.
+    /// Process exit must close all open fds before the payload itself
+    /// becomes unreachable. In particular, pipe EOF/EPIPE publication is
+    /// driven from fd-table accounting, so exit paths need a concrete
+    /// drain rather than waiting for the whole payload to disappear
+    /// later through EBR.
     pub(crate) fn drain_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
-        core::mem::take(&mut *self.fds.lock())
+        let drained = core::mem::take(&mut *self.fds.lock());
+        for file in drained.values() {
+            decr_pipe_fd_ref(file);
+        }
+        drained
     }
 
     /// Snapshot the entire fd table as a fresh `BTreeMap`. Each
@@ -1296,6 +1317,18 @@ impl ProcessPayload {
     /// `step_fork` to clone the parent's fd table into the child.
     pub(crate) fn snapshot_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
         self.fds.lock().clone()
+    }
+
+    /// Clone the fd table for `fork`, accounting each inherited pipe
+    /// endpoint as a new fd reference. Unlike [`Self::snapshot_fds`],
+    /// this result is intended to be installed into another live
+    /// `ProcessPayload`.
+    pub(crate) fn clone_fds_for_fork(&self) -> BTreeMap<u32, Cap<OpenFile>> {
+        let cloned = self.fds.lock().clone();
+        for file in cloned.values() {
+            incr_pipe_fd_ref(file);
+        }
+        cloned
     }
 
     /// Public fd-table snapshot (for procfs `/proc/<pid>/fd/`).
@@ -1332,6 +1365,42 @@ impl ProcessPayload {
         } else {
             false
         }
+    }
+
+    /// Collapse the thread group for exec. Marks all non-initiator
+    /// threads zombie, clears the roster down to the initiator, and
+    /// arms the exec GroupExit episode for the remaining exit path.
+    ///
+    /// Returns the number of threads removed from the live roster.
+    /// No-op for zombies; returns `0` if the process is already
+    /// single-threaded.
+    pub fn collapse_threads_for_exec(&self, initiator: &Cap<ThreadIdentity>) -> Option<usize> {
+        let siblings: Vec<Cap<ThreadIdentity>> = self
+            .threads
+            .snapshot()
+            .into_iter()
+            .filter(|thread| thread.key() != initiator.key())
+            .collect();
+
+        if siblings.is_empty() {
+            return Some(0);
+        }
+
+        {
+            let mut group_exit = self.group_exit.lock();
+            *group_exit = Some(GroupExitState {
+                status: ExitStatus::Exited(0),
+                is_exec: true,
+                remaining_threads: AtomicU32::new(siblings.len() as u32),
+            });
+        }
+
+        for sibling in siblings {
+            crate::thread_runtime::step_thread_exit(sibling, 0);
+        }
+
+        *self.group_exit.lock() = None;
+        Some(self.threads.count())
     }
 
     /// Process short name comm (for `/proc/<pid>/stat`).
@@ -1586,6 +1655,26 @@ unsafe impl ZoneAllocated for ProcessPayload {
     type Policy = PayloadPolicy<Self>;
     fn zone() -> &'static Zone<Self> {
         &PROCESS_PAYLOAD_ZONE
+    }
+}
+
+pub(crate) fn incr_pipe_fd_ref(file: &Cap<OpenFile>) {
+    let Some((payload, side)) = file.pipe_endpoint() else {
+        return;
+    };
+    match side {
+        crate::pipe::PipeSide::Reader => payload.incr_reader(),
+        crate::pipe::PipeSide::Writer => payload.incr_writer(),
+    }
+}
+
+fn decr_pipe_fd_ref(file: &Cap<OpenFile>) {
+    let Some((payload, side)) = file.pipe_endpoint() else {
+        return;
+    };
+    match side {
+        crate::pipe::PipeSide::Reader => payload.decr_reader(),
+        crate::pipe::PipeSide::Writer => payload.decr_writer(),
     }
 }
 

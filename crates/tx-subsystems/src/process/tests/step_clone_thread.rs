@@ -3,6 +3,7 @@
 use super::*;
 
 use crate::process::execution::step_clone_thread;
+use crate::thread_runtime::step_thread_exit;
 use crate::thread_runtime::structure::ThreadIdentity;
 use tx_hal::UserTrapContext;
 
@@ -192,5 +193,51 @@ fn clone_thread_zero_tls_inherits_parent_tp() {
     assert_eq!(
         saved.regs[4], parent_ctx.regs[4],
         "tp inherits parent when tls=0"
+    );
+}
+
+#[test]
+fn ordinary_thread_exit_decrements_live_thread_count() {
+    let _g = setup();
+    let parent = bootstrap();
+    let parent_ctx = synthetic_parent_ctx();
+    let child = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("step_clone_thread");
+
+    assert_eq!(parent.live_thread_count(), 2);
+
+    step_thread_exit(child, 0);
+
+    assert_eq!(
+        parent.live_thread_count(),
+        1,
+        "thread_count must track the roster after non-last thread exit"
+    );
+}
+
+#[test]
+fn exec_group_collapse_keeps_initiator_and_clears_episode() {
+    let _g = setup();
+    let parent = bootstrap();
+    let leader = first_thread(&parent);
+    let parent_ctx = synthetic_parent_ctx();
+    let sibling = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("step_clone_thread");
+
+    let collapsed = parent
+        .collapse_threads_for_exec(&leader)
+        .expect("live process");
+
+    assert_eq!(collapsed, 1);
+    assert_eq!(parent.live_thread_count(), 1);
+    assert!(
+        parent.thread_by_tid(leader.tid.0).is_some(),
+        "exec initiator remains the sole live thread"
+    );
+    assert!(
+        parent.thread_by_tid(sibling.tid.0).is_none(),
+        "exec collapse removes sibling thread from live roster"
+    );
+    assert!(
+        sibling.is_zombie(),
+        "exec collapse zombifies sibling identities before AS replacement"
     );
 }

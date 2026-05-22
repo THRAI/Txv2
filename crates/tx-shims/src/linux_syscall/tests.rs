@@ -26,7 +26,7 @@ use std::sync::Mutex;
 use crate::adapter::reactor_entry::userspace::SyscallRequest;
 use crate::adapter::step_engine::{self as step_engine, guard, Cap, StepOutcome};
 use tx_subsystems::cross_crate_test_support::{
-    reset_init_process, reset_pid_counter, reset_tid_counter,
+    reset_init_process, reset_pid_counter, reset_reactor_affinity_seam, reset_tid_counter,
 };
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
@@ -38,9 +38,10 @@ use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
 use super::{
-    dispatch, SyscallCtx, SyscallResult, FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK, NR_CLONE, NR_EXECVE,
-    NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETSID,
-    NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST,
+    dispatch, SyscallCtx, SyscallResult, EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_SETFD,
+    NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPGRP,
+    NR_GETPID, NR_GETPPID, NR_GETSID, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK,
+    NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST,
     NR_SET_TID_ADDRESS, NR_WAIT4, NR_WRITE, SIGCHLD, WNOHANG,
 };
 
@@ -142,10 +143,6 @@ impl PmapIf for ShimsTestPmap {
     }
 }
 
-impl tx_hal::ConsoleIf for ShimsTestPmap {
-    fn write_bytes(_bytes: &[u8]) {}
-}
-
 // `dispatch::<P>` requires `P: PmapIf + EntropyIf` (added by the
 // CSPRNG chore so the execve path can pull AT_RANDOM bytes).
 // Trait default fills bytes from the deterministic boot-counter
@@ -208,6 +205,7 @@ fn setup() -> TestSetup {
     reset_pid_counter();
     reset_tid_counter();
     reset_init_process();
+    reset_reactor_affinity_seam();
     TestSetup { _lock: lock }
 }
 
@@ -896,6 +894,108 @@ fn dispatch_fcntl_closed_fd_returns_neg_ebadf() {
     assert_eq!(r2, SyscallResult::Error(9));
 }
 
+fn fake_set_thread_affinity(
+    _tid: u32,
+    affinity: u64,
+) -> Result<(), tx_subsystems::reactor_affinity::ReactorAffinityError> {
+    if affinity == 0b101 {
+        Ok(())
+    } else if affinity == 0 {
+        Err(tx_subsystems::reactor_affinity::ReactorAffinityError::InvalidMask)
+    } else {
+        Err(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)
+    }
+}
+
+fn fake_get_thread_affinity(
+    tid: u32,
+) -> Result<u64, tx_subsystems::reactor_affinity::ReactorAffinityError> {
+    if tid != 0 {
+        Ok(0b101)
+    } else {
+        Err(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)
+    }
+}
+
+#[test]
+fn dispatch_sched_affinity_round_trips_through_reactor_seam() {
+    let _setup = setup();
+    tx_subsystems::reactor_affinity::install_thread_affinity(
+        fake_set_thread_affinity,
+        fake_get_thread_affinity,
+    );
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+    let in_mask = 0b101u64;
+    let mut out_mask = 0u64;
+
+    let set = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SCHED_SETAFFINITY,
+            [
+                0,
+                core::mem::size_of::<u64>() as u64,
+                &in_mask as *const u64 as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(set, SyscallResult::Return(0));
+
+    let get = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SCHED_GETAFFINITY,
+            [
+                0,
+                core::mem::size_of::<u64>() as u64,
+                &mut out_mask as *mut u64 as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(
+        get,
+        SyscallResult::Return(core::mem::size_of::<u64>() as i64)
+    );
+    assert_eq!(out_mask, 0b101);
+}
+
+#[test]
+fn dispatch_sched_setaffinity_rejects_empty_mask() {
+    let _setup = setup();
+    tx_subsystems::reactor_affinity::install_thread_affinity(
+        fake_set_thread_affinity,
+        fake_get_thread_affinity,
+    );
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+    let in_mask = 0u64;
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SCHED_SETAFFINITY,
+            [
+                0,
+                core::mem::size_of::<u64>() as u64,
+                &in_mask as *const u64 as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(EINVAL_VALUE));
+}
+
 // ===========================================================================
 // Wave 4 / Phase 6 — NR_EXECVE syscall arm.
 //
@@ -1197,3 +1297,14 @@ mod ipc_dispatch;
 // and LP64 `struct epoll_event` copy paths.
 // ===========================================================================
 mod epoll_dispatch;
+
+// ===========================================================================
+// POSIX message queues — musl treats `mqd_t` as an fd and uses the LP64
+// `struct mq_attr` layout from `<mqueue.h>`.
+// ===========================================================================
+mod mq_dispatch;
+
+// ===========================================================================
+// Kernel-to-user layout marker registry used by the musl ABI detector.
+// ===========================================================================
+mod kernel_user_layouts;

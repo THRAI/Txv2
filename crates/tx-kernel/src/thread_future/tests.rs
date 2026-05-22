@@ -237,7 +237,7 @@ fn futex_wake_return_reenters_userspace_without_mailbox_event() {
 
     let future = run_thread::<TestPlatform>(leader, payload.clone());
     let wrapped = PerHartSlotted::<TestPlatform, _>::new(payload.clone(), future);
-    let mut reactor = tx_reactor::Reactor::new();
+    let reactor = tx_reactor::Reactor::new();
     let _task = reactor.submit_task(wrapped);
 
     let first = reactor.run_until_idle();
@@ -253,14 +253,7 @@ fn futex_wake_return_reenters_userspace_without_mailbox_event() {
         .expect("run_thread published a userspace wait");
     let futex_wake = UserspaceTrapInfo::Syscall(SyscallRequest::new(
         NR_FUTEX,
-        [
-            0x1000,
-            (FUTEX_WAKE | FUTEX_PRIVATE_FLAG) as u64,
-            1,
-            0,
-            0,
-            0,
-        ],
+        [0x1000, (FUTEX_WAKE | FUTEX_PRIVATE_FLAG) as u64, 1, 0, 0, 0],
     ));
     payload
         .userspace_slot()

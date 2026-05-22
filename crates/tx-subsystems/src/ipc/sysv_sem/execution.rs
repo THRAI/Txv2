@@ -217,16 +217,15 @@ pub fn step_semctl(
         IPC_SET => {
             let array = checks::require_sem_exists(semid)?;
             checks::require_owner_or_admin(&array, cred)?;
-            if let SemCtlArg::IpcSet { mode, uid, gid } = arg {
-                array.mode.store(mode & 0o777, Ordering::Release);
-                array.uid.store(uid, Ordering::Release);
-                array.gid.store(gid, Ordering::Release);
-                Ok(SemCtlResult::Success)
-            } else {
-                Err(Errno::EINVAL)
-            }
+            let SemCtlArg::IpcSet { mode, uid, gid } = arg else {
+                return Err(Errno::EINVAL);
+            };
+            array.mode.store(mode & 0o777, Ordering::Release);
+            array.uid.store(uid, Ordering::Release);
+            array.gid.store(gid, Ordering::Release);
+            Ok(SemCtlResult::Success)
         }
-        IPC_STAT | SEM_STAT => {
+        IPC_STAT | SEM_STAT | SEM_STAT_ANY => {
             let array = checks::require_sem_exists(semid)?;
             checks::require_can_read_sem(&array, cred)?;
             Ok(SemCtlResult::Stat(SemInfo {
@@ -335,7 +334,7 @@ pub enum SemCtlResult {
 
 #[derive(Clone, Debug)]
 pub struct SemInfo {
-    pub key: u32,
+    pub key: i32,
     pub semid: u32,
     pub nsems: u16,
     pub uid: u32,

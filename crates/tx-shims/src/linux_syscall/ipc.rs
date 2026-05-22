@@ -2,17 +2,33 @@
 
 use super::{
     bootstrap_copy_from_user, bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user,
-    errno_to_i32, SyscallCtx, SyscallResult, EFAULT_VALUE, EINVAL_VALUE, ENOSYS_VALUE,
+    errno_to_i32, read_user_cstr, SyscallCtx, SyscallResult, EBADF_VALUE, EFAULT_VALUE,
+    EINVAL_VALUE, ENAMETOOLONG_VALUE, ENOENT_VALUE, ENOMEM_VALUE, O_ACCMODE, O_CLOEXEC, O_CREAT,
+    O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
 };
 use alloc::vec::Vec;
-use tx_subsystems::execution::Errno;
+use tx_subsystems::execution::{Errno, WaitToken};
 use tx_subsystems::ipc;
+use tx_subsystems::ipc::posix_mq::structure::MqNotification;
 use tx_subsystems::ipc::sysv_sem::structure::SemBuf;
+use tx_subsystems::signal::Signum;
+use tx_subsystems::vfs::structure::OpenFileFlags;
+use tx_subsystems::vfs::OpenFile;
+use tx_subsystems::wait_source;
+
+use super::time::TimespecLayout;
+
+const EMSGSIZE_VALUE: i32 = 90;
+const MQ_NAME_MAX: usize = 255;
+const SIGEV_SIGNAL: i32 = 0;
+const SIGEV_NONE: i32 = 1;
+const SIGEV_THREAD: i32 = 2;
+const SIGEV_THREAD_ID: i32 = 4;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct IpcPermLayout {
-    pub key: u32,
+    pub key: i32,
     pub uid: u32,
     pub gid: u32,
     pub cuid: u32,
@@ -24,7 +40,7 @@ pub struct IpcPermLayout {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ShmidDsLayout {
     pub shm_perm: IpcPermLayout,
     pub shm_segsz: u64,
@@ -34,12 +50,12 @@ pub struct ShmidDsLayout {
     pub shm_cpid: i32,
     pub shm_lpid: i32,
     pub shm_nattch: u64,
-    pub __unused4: u64,
-    pub __unused5: u64,
+    pub __pad1: u64,
+    pub __pad2: u64,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ShminfoLayout {
     pub shmmax: u64,
     pub shmmin: u64,
@@ -50,7 +66,19 @@ pub struct ShminfoLayout {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShmInfoLayout {
+    pub used_ids: i32,
+    pub __pad: i32,
+    pub shm_tot: u64,
+    pub shm_rss: u64,
+    pub shm_swp: u64,
+    pub swap_attempts: u64,
+    pub swap_successes: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct MsqidDsLayout {
     pub msg_perm: IpcPermLayout,
     pub msg_stime: i64,
@@ -65,7 +93,7 @@ pub struct MsqidDsLayout {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct MsginfoLayout {
     pub msgpool: i32,
     pub msgmap: i32,
@@ -75,11 +103,10 @@ pub struct MsginfoLayout {
     pub msgssz: i32,
     pub msgtql: i32,
     pub msgseg: u16,
-    pub __pad: u16,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SemidDsLayout {
     pub sem_perm: IpcPermLayout,
     pub sem_otime: i64,
@@ -91,7 +118,7 @@ pub struct SemidDsLayout {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SeminfoLayout {
     pub semmap: i32,
     pub semmni: i32,
@@ -106,17 +133,32 @@ pub struct SeminfoLayout {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SembufLayout {
     pub sem_num: u16,
     pub sem_op: i16,
     pub sem_flg: i16,
 }
 
-const MSG_NOERROR: i32 = 0o10000;
-const MAX_SYSV_MSG_TEXT: usize = 8192;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MqAttrLayout {
+    pub mq_flags: i64,
+    pub mq_maxmsg: i64,
+    pub mq_msgsize: i64,
+    pub mq_curmsgs: i64,
+    pub __unused: [i64; 4],
+}
 
-fn ipc_perm_layout(key: u32, uid: u32, gid: u32, cuid: u32, cgid: u32, mode: u16) -> IpcPermLayout {
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct SigeventPrefixLayout {
+    pub(super) sigval: u64,
+    pub(super) sigev_signo: i32,
+    pub(super) sigev_notify: i32,
+}
+
+fn ipc_perm_layout(key: i32, uid: u32, gid: u32, cuid: u32, cgid: u32, mode: u16) -> IpcPermLayout {
     IpcPermLayout {
         key,
         uid,
@@ -144,6 +186,86 @@ fn nsproxy_and_cred(
     Ok((nsproxy, cred))
 }
 
+fn read_mq_name(ctx: &SyscallCtx<'_>, name_ptr: u64) -> Result<Vec<u8>, SyscallResult> {
+    if name_ptr == 0 {
+        return Err(SyscallResult::Error(EFAULT_VALUE));
+    }
+    let name = match read_user_cstr(&ctx.aspace, name_ptr, MQ_NAME_MAX + 1) {
+        Ok(name) => name,
+        Err(_) => return Err(SyscallResult::Error(ENAMETOOLONG_VALUE)),
+    };
+    if name.is_empty() || name.iter().any(|&b| b == b'/') {
+        return Err(SyscallResult::Error(ENOENT_VALUE));
+    }
+    Ok(name)
+}
+
+fn mq_access_flags(oflag: i32) -> Option<(bool, bool)> {
+    match oflag & O_ACCMODE as i32 {
+        x if x == O_RDONLY as i32 => Some((true, false)),
+        x if x == O_WRONLY as i32 => Some((false, true)),
+        x if x == O_RDWR as i32 => Some((true, true)),
+        _ => None,
+    }
+}
+
+fn mq_open_file_flags(oflag: i32) -> Result<OpenFileFlags, SyscallResult> {
+    let (read, write) = mq_access_flags(oflag).ok_or(SyscallResult::Error(EINVAL_VALUE))?;
+    Ok(OpenFileFlags {
+        read,
+        write,
+        append: false,
+        cloexec: (oflag & O_CLOEXEC as i32) != 0,
+        nonblocking: (oflag & O_NONBLOCK as i32) != 0,
+    })
+}
+
+fn mq_attr_to_layout(attr: ipc::posix_mq::execution::MqAttr) -> MqAttrLayout {
+    MqAttrLayout {
+        mq_flags: attr.flags,
+        mq_maxmsg: attr.maxmsg,
+        mq_msgsize: attr.msgsize,
+        mq_curmsgs: attr.curmsgs,
+        __unused: [0; 4],
+    }
+}
+
+fn validate_abs_timeout(ctx: &SyscallCtx<'_>, timeout_ptr: u64) -> Result<(), SyscallResult> {
+    if timeout_ptr == 0 {
+        return Ok(());
+    }
+    let ts: TimespecLayout = match bootstrap_read_user(&ctx.aspace, timeout_ptr) {
+        Ok(v) => v,
+        Err(errno) => return Err(SyscallResult::Error(errno_to_i32(errno))),
+    };
+    if !(0..1_000_000_000).contains(&ts.tv_nsec) {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    Ok(())
+}
+
+async fn wait_for_mq_readiness(mq: &ipc::posix_mq::structure::PosixMqInstance, write: bool) {
+    let Ok(info) = ipc::posix_mq::execution::step_mq_poll_info(mq) else {
+        return;
+    };
+    let source_id = if write {
+        info.write_source_id
+    } else {
+        info.read_source_id
+    };
+    let token = WaitToken::new(source_id, 1);
+    if let Some(future) = wait_source::wait_on_token(token) {
+        let _ = future.await;
+    }
+}
+
+fn mq_file(
+    ctx: &SyscallCtx<'_>,
+    fd: u32,
+) -> Result<tx_subsystems::process::adapter::step_engine::Cap<OpenFile>, SyscallResult> {
+    ctx.process.fd(fd).ok_or(SyscallResult::Error(EBADF_VALUE))
+}
+
 pub(super) fn sys_shmget(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let (ns, cred) = match nsproxy_and_cred(ctx) {
         Ok(v) => v,
@@ -158,21 +280,24 @@ pub(super) fn sys_shmget(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
     }
 }
 
-pub(super) fn sys_shmat(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+pub(super) async fn sys_shmat(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let cred = ctx.cred_cap();
     match ipc::sysv_shm::execution::step_shmat(
         args[0] as u32,
         args[1] as usize,
         args[2] as i32,
         &cred,
-    ) {
+        &ctx.aspace,
+    )
+    .await
+    {
         Ok(addr) => SyscallResult::Return(addr as i64),
         Err(e) => SyscallResult::Error(errno_to_i32(e)),
     }
 }
 
-pub(super) fn sys_shmdt(args: [u64; 6], _ctx: &SyscallCtx<'_>) -> SyscallResult {
-    match ipc::sysv_shm::execution::step_shmdt(args[0] as usize) {
+pub(super) async fn sys_shmdt(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    match ipc::sysv_shm::execution::step_shmdt(args[0] as usize, &ctx.aspace).await {
         Ok(()) => SyscallResult::Return(0i64),
         Err(e) => SyscallResult::Error(errno_to_i32(e)),
     }
@@ -184,84 +309,100 @@ pub(super) fn sys_shmctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
     let buf_ptr = args[2];
     let cred = ctx.cred_cap();
 
-    match cmd {
-        ipc::sysv_shm::execution::IPC_INFO => {
-            match ipc::sysv_shm::execution::step_shmctl(shmid, cmd, None, &cred) {
-                Ok(ipc::sysv_shm::execution::ShmCtlResult::Info {
-                    shmmni,
-                    shmmax,
-                    shmmin,
-                    shmall,
-                    shmseg,
-                }) => {
-                    let info = ShminfoLayout {
-                        shmmax,
-                        shmmin,
-                        shmmni,
-                        shmseg,
-                        shmall,
-                        __unused: [0; 4],
-                    };
-                    if let Err(errno) = bootstrap_write_user(&ctx.aspace, buf_ptr, info) {
-                        return SyscallResult::Error(errno_to_i32(errno));
-                    }
-                    SyscallResult::Return(0)
-                }
-                Ok(_) => SyscallResult::Error(22), // EINVAL
-                Err(e) => SyscallResult::Error(errno_to_i32(e)),
-            }
-        }
-        ipc::sysv_shm::execution::IPC_STAT => {
-            match ipc::sysv_shm::execution::step_shmctl(shmid, cmd, None, &cred) {
-                Ok(ipc::sysv_shm::execution::ShmCtlResult::Stat(info)) => {
-                    let ds = ShmidDsLayout {
-                        shm_perm: IpcPermLayout {
-                            key: info.key,
-                            uid: info.uid,
-                            gid: info.gid,
-                            cuid: info.cuid,
-                            cgid: info.cgid,
-                            mode: info.perm.mode as u32,
-                            __seq: 0,
-                            __pad1: 0,
-                            __pad2: 0,
-                        },
-                        shm_segsz: info.size as u64,
-                        shm_atime: 0,
-                        shm_dtime: 0,
-                        shm_ctime: 0,
-                        shm_cpid: 0,
-                        shm_lpid: 0,
-                        shm_nattch: info.attach_count as u64,
-                        __unused4: 0,
-                        __unused5: 0,
-                    };
-                    if let Err(errno) = bootstrap_write_user(&ctx.aspace, buf_ptr, ds) {
-                        return SyscallResult::Error(errno_to_i32(errno));
-                    }
-                    SyscallResult::Return(0)
-                }
-                Ok(_) => SyscallResult::Error(22), // EINVAL
-                Err(e) => SyscallResult::Error(errno_to_i32(e)),
-            }
-        }
-        ipc::sysv_shm::execution::IPC_SET => {
-            let ds: ShmidDsLayout = match bootstrap_read_user(&ctx.aspace, buf_ptr) {
-                Ok(v) => v,
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
-            };
-            let set_fields = Some((ds.shm_perm.mode as u16, ds.shm_perm.uid, ds.shm_perm.gid));
-            match ipc::sysv_shm::execution::step_shmctl(shmid, cmd, set_fields, &cred) {
-                Ok(ipc::sysv_shm::execution::ShmCtlResult::Success) => SyscallResult::Return(0),
-                Ok(_) => SyscallResult::Error(22), // EINVAL
-                Err(e) => SyscallResult::Error(errno_to_i32(e)),
-            }
-        }
-        _ => match ipc::sysv_shm::execution::step_shmctl(shmid, cmd, None, &cred) {
-            Ok(ipc::sysv_shm::execution::ShmCtlResult::Success) => SyscallResult::Return(0),
-            Ok(_) => SyscallResult::Return(0),
-            Err(e) => SyscallResult::Error(errno_to_i32(e)),
+    let set_fields = if cmd == ipc::sysv_shm::execution::IPC_SET {
+        let ds: ShmidDsLayout = match bootstrap_read_user(&ctx.aspace, buf_ptr) {
+            Ok(v) => v,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        };
+        Some((ds.shm_perm.mode as u16, ds.shm_perm.uid, ds.shm_perm.gid))
+    } else {
+        None
+    };
+
+    let ns = match cmd == ipc::sysv_shm::execution::IPC_RMID {
+        true => match ctx.process.nsproxy_cap() {
+            Some(ns) => Some(ns),
+            None => return SyscallResult::Error(errno_to_i32(Errno::EINVAL)),
         },
+        false => None,
+    };
+    let result = match ns {
+        Some(ns) => ipc::sysv_shm::execution::step_shmctl_in_ns(shmid, cmd, set_fields, &cred, &ns),
+        None => ipc::sysv_shm::execution::step_shmctl(shmid, cmd, set_fields, &cred),
+    };
+
+    match result {
+        Ok(ipc::sysv_shm::execution::ShmCtlResult::Success) => SyscallResult::Return(0),
+        Ok(ipc::sysv_shm::execution::ShmCtlResult::Stat(info)) => {
+            let ds = ShmidDsLayout {
+                shm_perm: ipc_perm_layout(
+                    info.key,
+                    info.uid,
+                    info.gid,
+                    info.cuid,
+                    info.cgid,
+                    info.perm.mode,
+                ),
+                shm_segsz: info.size as u64,
+                shm_atime: 0,
+                shm_dtime: 0,
+                shm_ctime: 0,
+                shm_cpid: 0,
+                shm_lpid: 0,
+                shm_nattch: info.attach_count as u64,
+                __pad1: 0,
+                __pad2: 0,
+            };
+            if let Err(errno) = bootstrap_write_user(&ctx.aspace, buf_ptr, ds) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            SyscallResult::Return(info.return_value)
+        }
+        Ok(ipc::sysv_shm::execution::ShmCtlResult::Info {
+            return_value,
+            shmmni,
+            shmmax,
+            shmmin,
+            shmall,
+            shmseg,
+        }) => {
+            let info = ShminfoLayout {
+                shmmax,
+                shmmin,
+                shmmni,
+                shmseg,
+                shmall,
+                __unused: [0; 4],
+            };
+            if let Err(errno) = bootstrap_write_user(&ctx.aspace, buf_ptr, info) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            SyscallResult::Return(return_value)
+        }
+        Ok(ipc::sysv_shm::execution::ShmCtlResult::ShmInfo {
+            return_value,
+            used_ids,
+            shm_tot,
+            shm_rss,
+            shm_swp,
+            swap_attempts,
+            swap_successes,
+        }) => {
+            let info = ShmInfoLayout {
+                used_ids,
+                __pad: 0,
+                shm_tot,
+                shm_rss,
+                shm_swp,
+                swap_attempts,
+                swap_successes,
+            };
+            if let Err(errno) = bootstrap_write_user(&ctx.aspace, buf_ptr, info) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            SyscallResult::Return(return_value)
+        }
+        Err(e) => SyscallResult::Error(errno_to_i32(e)),
     }
 }
 
@@ -290,6 +431,7 @@ pub(super) fn sys_msgctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
     } else {
         None
     };
+
     match ipc::sysv_msg::execution::step_msgctl(msqid, cmd, set_fields, &cred) {
         Ok(result) => match result {
             ipc::sysv_msg::execution::MsgCtlResult::Success => SyscallResult::Return(0i64),
@@ -333,7 +475,6 @@ pub(super) fn sys_msgctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
                     msgssz: 0,
                     msgtql: msgmni_i32,
                     msgseg: 0,
-                    __pad: 0,
                 };
                 if let Err(errno) = bootstrap_write_user(&ctx.aspace, buf_ptr, info) {
                     return SyscallResult::Error(errno_to_i32(errno));
@@ -387,13 +528,10 @@ pub(super) fn sys_semop(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     }
     let mut sops = Vec::with_capacity(nsops);
     for chunk in bytes.chunks_exact(core::mem::size_of::<SembufLayout>()) {
-        let sem_num = u16::from_ne_bytes([chunk[0], chunk[1]]);
-        let sem_op = i16::from_ne_bytes([chunk[2], chunk[3]]);
-        let sem_flg = i16::from_ne_bytes([chunk[4], chunk[5]]);
         sops.push(SemBuf {
-            sem_num,
-            sem_op,
-            sem_flg,
+            sem_num: u16::from_ne_bytes([chunk[0], chunk[1]]),
+            sem_op: i16::from_ne_bytes([chunk[2], chunk[3]]),
+            sem_flg: i16::from_ne_bytes([chunk[4], chunk[5]]),
         });
     }
     match ipc::sysv_sem::execution::step_semop(semid, &sops, &cred, ctx.process.pid.0 as u64) {
@@ -428,6 +566,7 @@ pub(super) fn sys_semctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
         }
         _ => ipc::sysv_sem::execution::SemCtlArg::None,
     };
+
     match ipc::sysv_sem::execution::step_semctl(semid, semnum, cmd, sem_arg, &cred) {
         Ok(result) => match result {
             ipc::sysv_sem::execution::SemCtlResult::Success => SyscallResult::Return(0i64),
@@ -468,9 +607,9 @@ pub(super) fn sys_semctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
                     semmsl: semmsl.min(i32::MAX as u64) as i32,
                     semopm: semopm.min(i32::MAX as u64) as i32,
                     semume: 0,
-                    semusz: core::mem::size_of::<ipc::sysv_sem::structure::SemUndo>() as i32,
+                    semusz: 0,
                     semvmx: 32767,
-                    semaem: 32767,
+                    semaem: 0,
                 };
                 if let Err(errno) = bootstrap_write_user(&ctx.aspace, arg_raw, info) {
                     return SyscallResult::Error(errno_to_i32(errno));
@@ -483,7 +622,10 @@ pub(super) fn sys_semctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
 }
 
 pub(super) fn sys_msgsnd(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let cred = ctx.cred_cap();
+    let (_ns, cred) = match nsproxy_and_cred(ctx) {
+        Ok(v) => v,
+        Err(e) => return SyscallResult::Error(errno_to_i32(e)),
+    };
     let msqid = args[0] as u32;
     let msgp = args[1];
     let msgsz = args[2] as usize;
@@ -491,27 +633,32 @@ pub(super) fn sys_msgsnd(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
     if msgp == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
-    if msgsz > MAX_SYSV_MSG_TEXT {
-        return SyscallResult::Error(EINVAL_VALUE);
+    let mtype: i64 = match bootstrap_read_user(&ctx.aspace, msgp) {
+        Ok(v) => v,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    let mut mtext = Vec::new();
+    mtext.resize(msgsz, 0);
+    if msgsz > 0 {
+        let text_ptr = match msgp.checked_add(core::mem::size_of::<i64>() as u64) {
+            Some(ptr) => ptr,
+            None => return SyscallResult::Error(EFAULT_VALUE),
+        };
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut mtext, text_ptr) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
     }
-    let mut header = [0u8; 8];
-    if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut header, msgp) {
-        return SyscallResult::Error(errno_to_i32(errno));
-    }
-    let mtype = i64::from_ne_bytes(header);
-    let mut text = Vec::new();
-    text.resize(msgsz, 0);
-    if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut text, msgp.wrapping_add(8)) {
-        return SyscallResult::Error(errno_to_i32(errno));
-    }
-    match ipc::sysv_msg::execution::step_msgsnd(msqid, mtype, text, msgflg, &cred) {
+    match ipc::sysv_msg::execution::step_msgsnd(msqid, mtype, mtext, msgflg, &cred) {
         Ok(_) => SyscallResult::Return(0),
         Err(e) => SyscallResult::Error(errno_to_i32(e)),
     }
 }
 
 pub(super) fn sys_msgrcv(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let cred = ctx.cred_cap();
+    let (_ns, cred) = match nsproxy_and_cred(ctx) {
+        Ok(v) => v,
+        Err(e) => return SyscallResult::Error(errno_to_i32(e)),
+    };
     let msqid = args[0] as u32;
     let msgp = args[1];
     let msgsz = args[2] as usize;
@@ -522,111 +669,238 @@ pub(super) fn sys_msgrcv(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
     }
     match ipc::sysv_msg::execution::step_msgrcv(msqid, msgsz, msgtyp, msgflg, &cred) {
         Ok((mtype, mtext)) => {
-            if mtext.len() > msgsz && (msgflg & MSG_NOERROR) == 0 {
-                return SyscallResult::Error(errno_to_i32(Errno::E2BIG));
-            }
-            if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, msgp, &mtype.to_ne_bytes()) {
+            if let Err(errno) = bootstrap_write_user(&ctx.aspace, msgp, mtype) {
                 return SyscallResult::Error(errno_to_i32(errno));
             }
-            let copy_len = core::cmp::min(mtext.len(), msgsz);
-            if let Err(errno) =
-                bootstrap_copy_to_user(&ctx.aspace, msgp.wrapping_add(8), &mtext[..copy_len])
-            {
-                return SyscallResult::Error(errno_to_i32(errno));
+            if !mtext.is_empty() {
+                let text_ptr = match msgp.checked_add(core::mem::size_of::<i64>() as u64) {
+                    Some(ptr) => ptr,
+                    None => return SyscallResult::Error(EFAULT_VALUE),
+                };
+                if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, text_ptr, &mtext) {
+                    return SyscallResult::Error(errno_to_i32(errno));
+                }
             }
-            SyscallResult::Return(copy_len as i64)
+            SyscallResult::Return(mtext.len() as i64)
         }
         Err(e) => SyscallResult::Error(errno_to_i32(e)),
     }
 }
 
-pub(super) fn sys_mq_open(_args: [u64; 6], _ctx: &SyscallCtx<'_>) -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+pub(super) fn sys_mq_open(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let (ns, cred) = match nsproxy_and_cred(ctx) {
+        Ok(v) => v,
+        Err(e) => return SyscallResult::Error(errno_to_i32(e)),
+    };
+    let name = match read_mq_name(ctx, args[0]) {
+        Ok(v) => v,
+        Err(result) => return result,
+    };
+    let oflag = args[1] as i32;
+    let mode = args[2] as u16;
+    let open_flags = match mq_open_file_flags(oflag) {
+        Ok(flags) => flags,
+        Err(result) => return result,
+    };
+    let attr = if (oflag & O_CREAT as i32) != 0 && args[3] != 0 {
+        let layout: MqAttrLayout = match bootstrap_read_user(&ctx.aspace, args[3]) {
+            Ok(v) => v,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        };
+        Some(ipc::posix_mq::execution::MqCreateAttr {
+            maxmsg: layout.mq_maxmsg,
+            msgsize: layout.mq_msgsize,
+        })
+    } else {
+        None
+    };
+
+    let mq = match ipc::posix_mq::execution::step_mq_open(&name, oflag, mode, attr, &cred, &ns) {
+        Ok(mq) => mq,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    let open_cap = match OpenFile::new_posix_mq_cap(mq, open_flags) {
+        Ok(cap) => cap,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let fd = ctx.process.allocate_fd();
+    let _ = ctx.process.install_fd(fd, open_cap);
+    if open_flags.cloexec {
+        ctx.process.set_fd_cloexec(fd, true);
+    }
+    SyscallResult::Return(fd as i64)
 }
 
-pub(super) fn sys_mq_unlink(_args: [u64; 6], _ctx: &SyscallCtx<'_>) -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+pub(super) fn sys_mq_unlink(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let name = match read_mq_name(ctx, args[0]) {
+        Ok(v) => v,
+        Err(result) => return result,
+    };
+    match ipc::posix_mq::execution::step_mq_unlink(&name) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
 }
 
-#[cfg(test)]
-mod layout_tests {
-    use super::*;
-    use core::mem::{offset_of, size_of};
-
-    #[test]
-    fn ipc_perm_layout_matches_musl_generic() {
-        assert_eq!(offset_of!(IpcPermLayout, key), 0);
-        assert_eq!(offset_of!(IpcPermLayout, uid), 4);
-        assert_eq!(offset_of!(IpcPermLayout, gid), 8);
-        assert_eq!(offset_of!(IpcPermLayout, cuid), 12);
-        assert_eq!(offset_of!(IpcPermLayout, cgid), 16);
-        assert_eq!(offset_of!(IpcPermLayout, mode), 20);
-        assert_eq!(offset_of!(IpcPermLayout, __seq), 24);
-        assert_eq!(offset_of!(IpcPermLayout, __pad1), 32);
-        assert_eq!(offset_of!(IpcPermLayout, __pad2), 40);
-        assert_eq!(size_of::<IpcPermLayout>(), 48);
+pub(super) async fn sys_mq_timedsend(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    if let Err(result) = validate_abs_timeout(ctx, args[4]) {
+        return result;
     }
-
-    #[test]
-    fn shmid_ds_layout_matches_musl_generic() {
-        assert_eq!(offset_of!(ShmidDsLayout, shm_perm), 0);
-        assert_eq!(offset_of!(ShmidDsLayout, shm_segsz), 48);
-        assert_eq!(offset_of!(ShmidDsLayout, shm_atime), 56);
-        assert_eq!(offset_of!(ShmidDsLayout, shm_dtime), 64);
-        assert_eq!(offset_of!(ShmidDsLayout, shm_ctime), 72);
-        assert_eq!(offset_of!(ShmidDsLayout, shm_cpid), 80);
-        assert_eq!(offset_of!(ShmidDsLayout, shm_lpid), 84);
-        assert_eq!(offset_of!(ShmidDsLayout, shm_nattch), 88);
-        assert_eq!(offset_of!(ShmidDsLayout, __unused4), 96);
-        assert_eq!(offset_of!(ShmidDsLayout, __unused5), 104);
-        assert_eq!(size_of::<ShmidDsLayout>(), 112);
+    let fd = args[0] as u32;
+    let msg_ptr = args[1];
+    let msg_len = args[2] as usize;
+    if msg_ptr == 0 && msg_len != 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
     }
-
-    #[test]
-    fn shminfo_layout_matches_musl_generic() {
-        assert_eq!(offset_of!(ShminfoLayout, shmmax), 0);
-        assert_eq!(offset_of!(ShminfoLayout, shmmin), 8);
-        assert_eq!(offset_of!(ShminfoLayout, shmmni), 16);
-        assert_eq!(offset_of!(ShminfoLayout, shmseg), 24);
-        assert_eq!(offset_of!(ShminfoLayout, shmall), 32);
-        assert_eq!(offset_of!(ShminfoLayout, __unused), 40);
-        assert_eq!(size_of::<ShminfoLayout>(), 72);
+    let file = match mq_file(ctx, fd) {
+        Ok(file) => file,
+        Err(result) => return result,
+    };
+    if !file.flags().write {
+        return SyscallResult::Error(EBADF_VALUE);
     }
-
-    #[test]
-    fn msqid_ds_layout_matches_musl_generic() {
-        assert_eq!(offset_of!(MsqidDsLayout, msg_perm), 0);
-        assert_eq!(offset_of!(MsqidDsLayout, msg_stime), 48);
-        assert_eq!(offset_of!(MsqidDsLayout, msg_rtime), 56);
-        assert_eq!(offset_of!(MsqidDsLayout, msg_ctime), 64);
-        assert_eq!(offset_of!(MsqidDsLayout, msg_cbytes), 72);
-        assert_eq!(offset_of!(MsqidDsLayout, msg_qnum), 80);
-        assert_eq!(offset_of!(MsqidDsLayout, msg_qbytes), 88);
-        assert_eq!(offset_of!(MsqidDsLayout, msg_lspid), 96);
-        assert_eq!(offset_of!(MsqidDsLayout, msg_lrpid), 100);
-        assert_eq!(offset_of!(MsqidDsLayout, __unused), 104);
-        assert_eq!(size_of::<MsqidDsLayout>(), 120);
+    let mq = match file.posix_mq() {
+        Some(mq) => mq,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    if msg_len > mq.msgsize() as usize {
+        return SyscallResult::Error(EMSGSIZE_VALUE);
     }
-
-    #[test]
-    fn semid_ds_layout_matches_musl_generic() {
-        assert_eq!(offset_of!(SemidDsLayout, sem_perm), 0);
-        assert_eq!(offset_of!(SemidDsLayout, sem_otime), 48);
-        assert_eq!(offset_of!(SemidDsLayout, sem_ctime), 56);
-        assert_eq!(offset_of!(SemidDsLayout, sem_nsems), 64);
-        assert_eq!(offset_of!(SemidDsLayout, __sem_nsems_pad), 66);
-        assert_eq!(offset_of!(SemidDsLayout, __unused3), 72);
-        assert_eq!(offset_of!(SemidDsLayout, __unused4), 80);
-        assert_eq!(size_of::<SemidDsLayout>(), 88);
+    let mut msg = Vec::new();
+    msg.resize(msg_len, 0);
+    if msg_len > 0 {
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut msg, msg_ptr) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
     }
+    let cred = ctx.cred_cap();
+    loop {
+        match ipc::posix_mq::execution::step_mq_send(mq, &msg, args[3] as u32, &cred) {
+            Ok(()) => return SyscallResult::Return(0),
+            Err(Errno::EAGAIN) if args[4] == 0 && !file.flags().nonblocking => {
+                wait_for_mq_readiness(mq, true).await;
+            }
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        }
+    }
+}
 
-    #[test]
-    fn msginfo_and_seminfo_layouts_match_musl() {
-        assert_eq!(offset_of!(MsginfoLayout, msgpool), 0);
-        assert_eq!(offset_of!(MsginfoLayout, msgseg), 28);
-        assert_eq!(size_of::<MsginfoLayout>(), 32);
-        assert_eq!(offset_of!(SeminfoLayout, semmap), 0);
-        assert_eq!(offset_of!(SeminfoLayout, semaem), 36);
-        assert_eq!(size_of::<SeminfoLayout>(), 40);
+pub(super) async fn sys_mq_timedreceive(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    if let Err(result) = validate_abs_timeout(ctx, args[4]) {
+        return result;
+    }
+    let fd = args[0] as u32;
+    let msg_ptr = args[1];
+    let msg_len = args[2] as usize;
+    if msg_ptr == 0 && msg_len != 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let file = match mq_file(ctx, fd) {
+        Ok(file) => file,
+        Err(result) => return result,
+    };
+    if !file.flags().read {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    let mq = match file.posix_mq() {
+        Some(mq) => mq,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    if msg_len < mq.msgsize() as usize {
+        return SyscallResult::Error(EMSGSIZE_VALUE);
+    }
+    let cred = ctx.cred_cap();
+    loop {
+        match ipc::posix_mq::execution::step_mq_receive(mq, msg_len, &cred) {
+            Ok((msg, prio)) => {
+                if !msg.is_empty() {
+                    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, msg_ptr, &msg) {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                }
+                if args[3] != 0 {
+                    if let Err(errno) = bootstrap_write_user(&ctx.aspace, args[3], prio) {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                }
+                return SyscallResult::Return(msg.len() as i64);
+            }
+            Err(Errno::EAGAIN) if args[4] == 0 && !file.flags().nonblocking => {
+                wait_for_mq_readiness(mq, false).await;
+            }
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        }
+    }
+}
+
+pub(super) fn sys_mq_getsetattr(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let fd = args[0] as u32;
+    let newattr_ptr = args[1];
+    let oldattr_ptr = args[2];
+    let file = match mq_file(ctx, fd) {
+        Ok(file) => file,
+        Err(result) => return result,
+    };
+    let mq = match file.posix_mq() {
+        Some(mq) => mq,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let old = match ipc::posix_mq::execution::step_mq_getattr(mq) {
+        Ok(attr) => attr,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    if oldattr_ptr != 0 {
+        if let Err(errno) = bootstrap_write_user(&ctx.aspace, oldattr_ptr, mq_attr_to_layout(old)) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+    }
+    if newattr_ptr != 0 {
+        let new_layout: MqAttrLayout = match bootstrap_read_user(&ctx.aspace, newattr_ptr) {
+            Ok(v) => v,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        };
+        if let Err(errno) = ipc::posix_mq::execution::step_mq_setattr(mq, new_layout.mq_flags) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+        file.set_nonblocking((new_layout.mq_flags & O_NONBLOCK as i64) != 0);
+    }
+    SyscallResult::Return(0)
+}
+
+pub(super) fn sys_mq_notify(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let fd = args[0] as u32;
+    let file = match mq_file(ctx, fd) {
+        Ok(file) => file,
+        Err(result) => return result,
+    };
+    let mq = match file.posix_mq() {
+        Some(mq) => mq,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let notification = if args[1] == 0 {
+        None
+    } else {
+        let sev: SigeventPrefixLayout = match bootstrap_read_user(&ctx.aspace, args[1]) {
+            Ok(v) => v,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        };
+        match sev.sigev_notify {
+            SIGEV_SIGNAL | SIGEV_THREAD_ID => {
+                let Some(signum) = u8::try_from(sev.sigev_signo).ok().and_then(Signum::new) else {
+                    return SyscallResult::Error(EINVAL_VALUE);
+                };
+                Some(MqNotification::Signal {
+                    signum,
+                    owner: ctx.process.downgrade(),
+                })
+            }
+            SIGEV_NONE => Some(MqNotification::None),
+            SIGEV_THREAD => return SyscallResult::Error(EINVAL_VALUE),
+            _ => return SyscallResult::Error(EINVAL_VALUE),
+        }
+    };
+    match ipc::posix_mq::execution::step_mq_notify(mq, notification) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
 }

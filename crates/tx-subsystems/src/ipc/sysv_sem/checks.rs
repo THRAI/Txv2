@@ -9,15 +9,18 @@ pub fn require_can_read_sem(array: &SemArrayIdentity, cred: &Cred) -> Result<(),
     if cred.euid.0 == 0 {
         return Ok(());
     }
-    if cred.euid.0 == array.uid() {
-        if array.perm().owner_read() {
+    let uid = array.uid();
+    let gid = array.gid();
+    let perm = array.perm();
+    if cred.euid.0 == uid || cred.euid.0 == array.cuid {
+        if perm.owner_read() {
             return Ok(());
         }
-    } else if cred.egid.0 == array.gid() {
-        if array.perm().group_read() {
+    } else if cred.egid.0 == gid || cred.egid.0 == array.cgid {
+        if perm.group_read() {
             return Ok(());
         }
-    } else if array.perm().other_read() {
+    } else if perm.other_read() {
         return Ok(());
     }
     Err(Errno::EACCES)
@@ -27,15 +30,18 @@ pub fn require_can_write_sem(array: &SemArrayIdentity, cred: &Cred) -> Result<()
     if cred.euid.0 == 0 {
         return Ok(());
     }
-    if cred.euid.0 == array.uid() {
-        if array.perm().owner_write() {
+    let uid = array.uid();
+    let gid = array.gid();
+    let perm = array.perm();
+    if cred.euid.0 == uid || cred.euid.0 == array.cuid {
+        if perm.owner_write() {
             return Ok(());
         }
-    } else if cred.egid.0 == array.gid() {
-        if array.perm().group_write() {
+    } else if cred.egid.0 == gid || cred.egid.0 == array.cgid {
+        if perm.group_write() {
             return Ok(());
         }
-    } else if array.perm().other_write() {
+    } else if perm.other_write() {
         return Ok(());
     }
     Err(Errno::EACCES)

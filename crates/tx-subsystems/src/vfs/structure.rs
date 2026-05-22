@@ -8,10 +8,13 @@
 //! pure observation helpers belong here.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 
-use crate::vfs::adapter::step_engine::{self, Cap, Weak, Zone, ZoneAllocated, ZoneError};
+use crate::vfs::adapter::step_engine::{
+    self, Cap, SpinMutex, Weak, Zone, ZoneAllocated, ZoneError,
+};
 use crate::vfs::adapter::wait_routing::{self, Channel, WaitSource};
 
 use crate::aio::AioContext;
@@ -21,6 +24,7 @@ use crate::epoll::Epoll;
 use crate::eventfd::EventFd;
 use crate::execution::Errno;
 use crate::io_uring::IoUring;
+use crate::ipc::posix_mq::structure::PosixMqInstance;
 use crate::mount::{MountIdentity, MountPayload};
 use crate::page_backed::PageContainer;
 use crate::process::{ProcessGroup, ProcessIdentity};
@@ -740,6 +744,7 @@ pub struct DEntry {
     parent: Option<Cap<DEntry>>,
     rnode: Cap<RNode>,
     mounted: Option<Weak<MountIdentity>>,
+    children: SpinMutex<BTreeMap<InlineName, Cap<DEntry>>>,
 }
 
 impl DEntry {
@@ -749,6 +754,7 @@ impl DEntry {
             parent: None,
             rnode,
             mounted: None,
+            children: SpinMutex::new(BTreeMap::new()),
         }
     }
 
@@ -786,6 +792,28 @@ impl DEntry {
     /// for dentries that have not been published as a mount point.
     pub fn mounted_hint(&self) -> Option<Weak<MountIdentity>> {
         self.mounted
+    }
+
+    pub fn cached_child(&self, name: InlineName) -> Option<Cap<DEntry>> {
+        self.children.lock().get(&name).cloned()
+    }
+
+    pub fn cache_child(&self, child: Cap<DEntry>) {
+        self.children.lock().insert(child.name(), child);
+    }
+
+    pub fn remove_cached_child(&self, name: InlineName) {
+        self.children.lock().remove(&name);
+    }
+
+    pub fn remove_cached_child_by_name(&self, name: &[u8]) {
+        if let Ok(name) = InlineName::new(name) {
+            self.remove_cached_child(name);
+        }
+    }
+
+    pub fn clear_cached_children(&self) {
+        self.children.lock().clear();
     }
 }
 
@@ -918,6 +946,10 @@ pub enum OpenFileBacking {
     /// last read.  Drop semantics: same as eventfd — the inner
     /// `Cap<TimerFd>` drops via EBR with no external cleanup needed.
     Timerfd { tfd: Cap<TimerFd> },
+    /// `mq_open(2)` open file. musl defines `mqd_t` as `int`, so the
+    /// descriptor is a normal fd-table entry whose backing carries the
+    /// POSIX mq identity and per-open flags.
+    PosixMq { mq: Cap<PosixMqInstance> },
 }
 
 /// Per-fd file-position carrier.
@@ -954,7 +986,7 @@ pub struct OpenFile {
     readdir_cursor: AtomicU64,
     pub(crate) flags: OpenFileFlags,
     /// Runtime `O_NONBLOCK` override set via `fcntl(F_SETFL)`.
-    nonblocking_override: AtomicBool,
+    nonblocking_override: AtomicI8,
     /// Best-effort DEntry hint set by `step_open`. `None` for
     /// non-VFS shapes (ufd, aio, etc.). Used by `fchdir`.
     opendir_dentry: Option<Cap<DEntry>>,
@@ -970,7 +1002,7 @@ impl OpenFile {
             backing: OpenFileBacking::Rnode { rnode },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
-            nonblocking_override: AtomicBool::new(false),
+            nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1004,7 +1036,7 @@ impl OpenFile {
             backing: OpenFileBacking::Ufd { ufd },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
-            nonblocking_override: AtomicBool::new(false),
+            nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1034,7 +1066,7 @@ impl OpenFile {
             backing: OpenFileBacking::AioContext { ctx },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
-            nonblocking_override: AtomicBool::new(false),
+            nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1060,7 +1092,7 @@ impl OpenFile {
             backing: OpenFileBacking::SignalFd { sfd },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
-            nonblocking_override: AtomicBool::new(false),
+            nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1083,7 +1115,7 @@ impl OpenFile {
             backing: OpenFileBacking::Epoll { ep },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
-            nonblocking_override: AtomicBool::new(false),
+            nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1103,7 +1135,7 @@ impl OpenFile {
             backing: OpenFileBacking::Eventfd { efd },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
-            nonblocking_override: AtomicBool::new(false),
+            nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1126,7 +1158,7 @@ impl OpenFile {
             backing: OpenFileBacking::Timerfd { tfd },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
-            nonblocking_override: AtomicBool::new(false),
+            nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1141,6 +1173,27 @@ impl OpenFile {
         step_engine::sign(Self::new_timerfd(tfd, flags))
     }
 
+    /// Construct a POSIX message-queue-backed `OpenFile`.
+    pub fn new_posix_mq(mq: Cap<PosixMqInstance>, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::PosixMq { mq },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicI8::new(-1),
+            flags,
+            opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Zone-sign a fresh POSIX message-queue-backed `OpenFile`.
+    pub fn new_posix_mq_cap(
+        mq: Cap<PosixMqInstance>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_posix_mq(mq, flags))
+    }
+
     /// Construct an io_uring-backed `OpenFile` (future PR-12 phase 0 —
     /// second `OnBehalfOf<P>` canary). The resulting value carries
     /// `OpenFileBacking::IoUring { ring }` and no `Cap<RNode>` —
@@ -1152,7 +1205,7 @@ impl OpenFile {
             backing: OpenFileBacking::IoUring { ring },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
-            nonblocking_override: AtomicBool::new(false),
+            nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1173,6 +1226,27 @@ impl OpenFile {
     /// the dominant VFS path.
     pub fn backing(&self) -> &OpenFileBacking {
         &self.backing
+    }
+
+    /// Return the anonymous-pipe endpoint carried by this file, if any.
+    ///
+    /// Used by process fd-table accounting so `close` / `dup` / `fork`
+    /// update pipe reader/writer counts synchronously. That keeps pipe
+    /// EOF/EPIPE visible at fd-close time instead of waiting for EBR to
+    /// eventually retire the shared `OpenFile`.
+    pub(crate) fn pipe_endpoint(
+        &self,
+    ) -> Option<(Cap<crate::pipe::PipePayload>, crate::pipe::PipeSide)> {
+        let OpenFileBacking::Rnode { rnode } = &self.backing else {
+            return None;
+        };
+        let RNodeBacking::StructBacked {
+            payload: StructPayload::Pipe { payload, side },
+        } = rnode.backing()
+        else {
+            return None;
+        };
+        Some((payload.clone(), *side))
     }
 
     /// VFS-shaped accessor — returns the inner `Cap<RNode>` for an
@@ -1215,6 +1289,10 @@ impl OpenFile {
             OpenFileBacking::Timerfd { .. } => panic!(
                 "OpenFile::rnode() called on a timerfd-backed OpenFile; \
                  dispatch via OpenFile::backing() / OpenFile::timerfd() first",
+            ),
+            OpenFileBacking::PosixMq { .. } => panic!(
+                "OpenFile::rnode() called on a POSIX-mq-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::posix_mq() first",
             ),
         }
     }
@@ -1287,7 +1365,8 @@ impl OpenFile {
             | OpenFileBacking::IoUring { .. }
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
-            | OpenFileBacking::Timerfd { .. } => None,
+            | OpenFileBacking::Timerfd { .. }
+            | OpenFileBacking::PosixMq { .. } => None,
         }
     }
 
@@ -1307,7 +1386,8 @@ impl OpenFile {
             | OpenFileBacking::IoUring { .. }
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
-            | OpenFileBacking::Timerfd { .. } => None,
+            | OpenFileBacking::Timerfd { .. }
+            | OpenFileBacking::PosixMq { .. } => None,
         }
     }
 
@@ -1326,7 +1406,24 @@ impl OpenFile {
             | OpenFileBacking::IoUring { .. }
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
-            | OpenFileBacking::Timerfd { .. } => None,
+            | OpenFileBacking::Timerfd { .. }
+            | OpenFileBacking::PosixMq { .. } => None,
+        }
+    }
+
+    /// `Some(&Cap<Epoll>)` iff this `OpenFile` is the epoll-backed
+    /// shape. Returns `None` for every non-epoll `OpenFile`.
+    pub fn epoll(&self) -> Option<&Cap<Epoll>> {
+        match &self.backing {
+            OpenFileBacking::Epoll { ep } => Some(ep),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::Ufd { .. }
+            | OpenFileBacking::AioContext { .. }
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. }
+            | OpenFileBacking::PosixMq { .. } => None,
         }
     }
 
@@ -1341,7 +1438,8 @@ impl OpenFile {
             | OpenFileBacking::SignalFd { .. }
             | OpenFileBacking::IoUring { .. }
             | OpenFileBacking::Epoll { .. }
-            | OpenFileBacking::Timerfd { .. } => None,
+            | OpenFileBacking::Timerfd { .. }
+            | OpenFileBacking::PosixMq { .. } => None,
         }
     }
 
@@ -1356,7 +1454,8 @@ impl OpenFile {
             | OpenFileBacking::SignalFd { .. }
             | OpenFileBacking::IoUring { .. }
             | OpenFileBacking::Epoll { .. }
-            | OpenFileBacking::Eventfd { .. } => None,
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::PosixMq { .. } => None,
         }
     }
 
@@ -1376,22 +1475,24 @@ impl OpenFile {
             | OpenFileBacking::SignalFd { .. }
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
-            | OpenFileBacking::Timerfd { .. } => None,
+            | OpenFileBacking::Timerfd { .. }
+            | OpenFileBacking::PosixMq { .. } => None,
         }
     }
 
-    /// `Some(&Cap<Epoll>)` iff this `OpenFile` is the epoll-backed
-    /// shape. Returns `None` for every non-epoll `OpenFile`.
-    pub fn epoll(&self) -> Option<&Cap<Epoll>> {
+    /// `Some(&Cap<PosixMqInstance>)` iff this `OpenFile` is a POSIX
+    /// message-queue descriptor.
+    pub fn posix_mq(&self) -> Option<&Cap<PosixMqInstance>> {
         match &self.backing {
-            OpenFileBacking::Epoll { ep } => Some(ep),
+            OpenFileBacking::PosixMq { mq } => Some(mq),
             OpenFileBacking::Rnode { .. }
             | OpenFileBacking::Ufd { .. }
             | OpenFileBacking::AioContext { .. }
             | OpenFileBacking::SignalFd { .. }
-            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
-            | OpenFileBacking::Timerfd { .. } => None,
+            | OpenFileBacking::Timerfd { .. }
+            | OpenFileBacking::IoUring { .. } => None,
         }
     }
 
@@ -1425,14 +1526,17 @@ impl OpenFile {
 
     pub fn flags(&self) -> OpenFileFlags {
         let mut f = self.flags;
-        if self.nonblocking_override.load(Ordering::Acquire) {
-            f.nonblocking = true;
+        match self.nonblocking_override.load(Ordering::Acquire) {
+            0 => f.nonblocking = false,
+            1 => f.nonblocking = true,
+            _ => {}
         }
         f
     }
 
     pub fn set_nonblocking(&self, val: bool) {
-        self.nonblocking_override.store(val, Ordering::Release);
+        self.nonblocking_override
+            .store(if val { 1 } else { 0 }, Ordering::Release);
     }
 
     /// Snapshot the per-fd readdir cursor.
@@ -1456,50 +1560,6 @@ impl OpenFile {
     pub fn set_readdir_cursor(&self, cursor: DirCursor) {
         self.readdir_cursor
             .store(cursor.as_u64(), Ordering::Release);
-    }
-}
-
-/// Pipe-side lifecycle hook (shell-prompt roadmap Slice 1).
-///
-/// `Cap<OpenFile>` is refcounted via the zone-substrate machinery; the
-/// inner `OpenFile` value drops exactly once, when the last `Cap`
-/// referencing it is released and EBR fires the slot reclamation
-/// callback. That single-shot guarantee is what makes a per-side
-/// reader/writer count against `PipePayload` correct without an
-/// explicit hook on every `sys_close` / `sys_dup3`-replace / fork-CLOEXEC
-/// / exit-cleanup path: each fd-slot drop releases one `Cap`, and only
-/// the *last* such drop reaches this destructor.
-///
-/// The behaviour is keyed on `RNodeBacking::StructBacked { payload:
-/// StructPayload::Pipe { side, .. } }`; non-pipe backings have no
-/// per-OpenFile lifecycle (page-backed inodes own their own page
-/// containers; tty/chardev RNodes outlive any OpenFile referencing
-/// them).
-///
-/// On the *last-reader-close* transition `decr_reader` fires the
-/// writer-side wait channel so any blocked writer surfaces SIGPIPE/
-/// EPIPE. On the *last-writer-close* transition `decr_writer` fires
-/// the reader-side wait channel so any blocked reader surfaces EOF
-/// (`Done(0)`). Both transitions are owned by `pipe::PipePayload`'s
-/// `decr_*` helpers.
-impl Drop for OpenFile {
-    fn drop(&mut self) {
-        // PR-10 phase 0: only the RNode-backed shape carries the
-        // pipe lifecycle hook. Userfaultfd-backed OpenFiles have no
-        // per-side ref count to decrement — their inner
-        // `Cap<UserfaultFd>` drops via the normal `OpenFileBacking::Ufd`
-        // field drop and EBR reclamation of the ufd zone slot follows.
-        if let OpenFileBacking::Rnode { rnode } = &self.backing {
-            if let RNodeBacking::StructBacked {
-                payload: StructPayload::Pipe { payload, side },
-            } = rnode.backing()
-            {
-                match side {
-                    crate::pipe::PipeSide::Reader => payload.decr_reader(),
-                    crate::pipe::PipeSide::Writer => payload.decr_writer(),
-                }
-            }
-        }
     }
 }
 

@@ -2,7 +2,40 @@ use super::*;
 use crate::cred::{CapabilitySet, Cred, Gid, Uid};
 use crate::execution::Errno;
 use crate::test_support::EPOCH_TEST_LOCK;
+use crate::vm::{
+    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags,
+    VmMapRequest, USER_PAGE_SIZE,
+};
 use crate::zones;
+use core::future::Future;
+use core::pin::Pin;
+use core::ptr::null;
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    |_| RawWaker::new(null(), &NOOP_WAKER_VTABLE),
+    |_| {},
+    |_| {},
+    |_| {},
+);
+
+fn noop_waker() -> Waker {
+    unsafe { Waker::from_raw(RawWaker::new(null(), &NOOP_WAKER_VTABLE)) }
+}
+
+fn block_on<F: Future>(mut future: F) -> F::Output {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    // Safety: the future is stack-pinned for the duration of this helper.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut future) };
+    for _ in 0..1024 {
+        match pinned.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => return out,
+            Poll::Pending => {}
+        }
+    }
+    panic!("sysv_shm test block_on: future did not resolve in 1024 polls");
+}
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -12,101 +45,307 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     guard
 }
 
-#[test]
-fn test_shm_lifecycle_and_ctl() {
-    let _g = setup();
-
-    // 1. Create a credential for user 1000, group 1000
-    let cred_struct = Cred {
-        uid: Uid(1000),
-        euid: Uid(1000),
-        suid: Uid(1000),
-        gid: Gid(1000),
-        egid: Gid(1000),
-        sgid: Gid(1000),
+fn cred(uid: u32, gid: u32) -> crate::process::adapter::step_engine::Cap<Cred> {
+    crate::cred::sign_cred(Cred {
+        uid: Uid(uid),
+        euid: Uid(uid),
+        suid: Uid(uid),
+        gid: Gid(gid),
+        egid: Gid(gid),
+        sgid: Gid(gid),
         effective_caps: CapabilitySet::EMPTY,
         permitted_caps: CapabilitySet::EMPTY,
-    };
-    let cred_cap = crate::cred::sign_cred(cred_struct).expect("cred cap");
-    let ns_cap = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+    })
+    .expect("cred cap")
+}
 
-    // 2. Create a private segment (key = 0, size = 4096)
-    let shmid =
-        execution::step_shmget(0, 4096, 0o666 | 0x200, &cred_cap, &ns_cap).expect("shmget private");
-    assert!(shmid > 0);
+#[test]
+fn shmat_maps_pagebacked_segment_and_shmdt_tracks_attach_count() {
+    let _g = setup();
 
-    // 3. STAT the segment
-    let res =
-        execution::step_shmctl(shmid, execution::IPC_STAT, None, &cred_cap).expect("shmctl stat");
-    let info = match res {
+    let creator = cred(1000, 1000);
+    let ns = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+    let aspace = AddressSpace::new_cap().expect("aspace cap");
+    let shmid = execution::step_shmget(
+        execution::IPC_PRIVATE,
+        4096,
+        execution::IPC_CREAT | 0o600,
+        &creator,
+        &ns,
+    )
+    .expect("shmget private");
+
+    let addr = block_on(execution::step_shmat(shmid, 0, 0, &creator, &aspace)).expect("shmat");
+    assert_eq!(addr, USER_PAGE_SIZE);
+    let entry = aspace
+        .lookup(UserVirtAddr(addr))
+        .expect("shmat installs VMA");
+    assert_eq!(entry.prot, Prot::READ_WRITE);
+    assert!(entry.flags.shared);
+    assert!(matches!(entry.backing, VmBacking::Page { offset: 0, .. }));
+
+    let attached = match execution::step_shmctl(shmid, execution::IPC_STAT, None, &creator)
+        .expect("stat after attach")
+    {
         execution::ShmCtlResult::Stat(info) => info,
-        other => panic!("expected Stat, got {:?}", other),
+        other => panic!("expected Stat, got {other:?}"),
     };
-    assert_eq!(info.shmid, shmid);
-    assert_eq!(info.size, 4096);
-    assert_eq!(info.perm.mode, 0o666);
-    assert_eq!(info.cuid, 1000);
-    assert_eq!(info.cgid, 1000);
-    assert_eq!(info.attach_count, 0);
+    assert_eq!(attached.attach_count, 1);
 
-    // 4. Update owner/permissions via IPC_SET (change mode to 0o600, uid to 2000, gid to 2000)
+    block_on(execution::step_shmdt(addr, &aspace)).expect("shmdt");
+    assert!(aspace.lookup(UserVirtAddr(addr)).is_none());
+    let detached = match execution::step_shmctl(shmid, execution::IPC_STAT, None, &creator)
+        .expect("stat after detach")
+    {
+        execution::ShmCtlResult::Stat(info) => info,
+        other => panic!("expected Stat, got {other:?}"),
+    };
+    assert_eq!(detached.attach_count, 0);
+
+    execution::step_shmctl(shmid, execution::IPC_RMID, None, &creator).expect("rmid");
+}
+
+#[test]
+fn shmdt_rejects_same_address_mapping_from_other_address_space() {
+    let _g = setup();
+
+    let creator = cred(1000, 1000);
+    let ns = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+    let attached_aspace = AddressSpace::new_cap().expect("attached aspace cap");
+    let other_aspace = AddressSpace::new_cap().expect("other aspace cap");
+    let shmid = execution::step_shmget(
+        execution::IPC_PRIVATE,
+        4096,
+        execution::IPC_CREAT | 0o600,
+        &creator,
+        &ns,
+    )
+    .expect("shmget private");
+    let addr = block_on(execution::step_shmat(
+        shmid,
+        0,
+        0,
+        &creator,
+        &attached_aspace,
+    ))
+    .expect("shmat");
+
+    let same_range = UserRange::new_aligned(UserVirtAddr(addr), USER_PAGE_SIZE).expect("range");
+    other_aspace
+        .try_mmap(VmMapRequest::fixed(
+            same_range,
+            MapPlacement::RequireFree,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ))
+        .expect("unrelated mapping in other address space");
+
+    assert_eq!(
+        block_on(execution::step_shmdt(addr, &other_aspace))
+            .expect_err("wrong address space rejects"),
+        Errno::EINVAL
+    );
+    assert!(other_aspace.lookup(UserVirtAddr(addr)).is_some());
+    assert!(attached_aspace.lookup(UserVirtAddr(addr)).is_some());
+    let still_attached = match execution::step_shmctl(shmid, execution::IPC_STAT, None, &creator)
+        .expect("stat after rejected detach")
+    {
+        execution::ShmCtlResult::Stat(info) => info,
+        other => panic!("expected Stat, got {other:?}"),
+    };
+    assert_eq!(still_attached.attach_count, 1);
+
+    block_on(execution::step_shmdt(addr, &attached_aspace)).expect("real detach");
+    execution::step_shmctl(shmid, execution::IPC_RMID, None, &creator).expect("rmid");
+}
+
+#[test]
+fn shmdt_keeps_attach_records_keyed_by_address_space_identity() {
+    let _g = setup();
+
+    let creator = cred(1000, 1000);
+    let ns = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+    let first_aspace = AddressSpace::new_cap().expect("first aspace cap");
+    let second_aspace = AddressSpace::new_cap().expect("second aspace cap");
+    let shmid = execution::step_shmget(
+        execution::IPC_PRIVATE,
+        4096,
+        execution::IPC_CREAT | 0o600,
+        &creator,
+        &ns,
+    )
+    .expect("shmget private");
+
+    let fixed_addr = USER_PAGE_SIZE;
+    let first_addr = block_on(execution::step_shmat(
+        shmid,
+        fixed_addr,
+        0,
+        &creator,
+        &first_aspace,
+    ))
+    .expect("first shmat");
+    let second_addr = block_on(execution::step_shmat(
+        shmid,
+        fixed_addr,
+        0,
+        &creator,
+        &second_aspace,
+    ))
+    .expect("second shmat");
+    assert_eq!(first_addr, fixed_addr);
+    assert_eq!(second_addr, fixed_addr);
+
+    block_on(execution::step_shmdt(second_addr, &second_aspace)).expect("detach second");
+
+    let segment = checks::require_shm_exists(shmid).expect("segment exists");
+    let attaches = segment.payload.attaches.lock();
+    assert_eq!(attaches.len(), 1);
+    assert_eq!(attaches[0].aspace_key, first_aspace.key().raw());
+    assert_eq!(attaches[0].addr, fixed_addr);
+    drop(attaches);
+
+    assert!(first_aspace.lookup(UserVirtAddr(fixed_addr)).is_some());
+    assert!(second_aspace.lookup(UserVirtAddr(fixed_addr)).is_none());
+    let still_attached = match execution::step_shmctl(shmid, execution::IPC_STAT, None, &creator)
+        .expect("stat after one detach")
+    {
+        execution::ShmCtlResult::Stat(info) => info,
+        other => panic!("expected Stat, got {other:?}"),
+    };
+    assert_eq!(still_attached.attach_count, 1);
+
+    block_on(execution::step_shmdt(first_addr, &first_aspace)).expect("detach first");
+    execution::step_shmctl(shmid, execution::IPC_RMID, None, &creator).expect("rmid");
+}
+
+#[test]
+fn shmctl_ipc_set_updates_owner_group_and_mode_without_rewriting_creator() {
+    let _g = setup();
+
+    let creator = cred(1000, 1000);
+    let ns = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+    let shmid = execution::step_shmget(
+        execution::IPC_PRIVATE,
+        4096,
+        execution::IPC_CREAT | 0o666,
+        &creator,
+        &ns,
+    )
+    .expect("shmget private");
+
+    let before = match execution::step_shmctl(shmid, execution::IPC_STAT, None, &creator)
+        .expect("stat before")
+    {
+        execution::ShmCtlResult::Stat(info) => info,
+        other => panic!("expected Stat, got {other:?}"),
+    };
+    assert_eq!(before.perm.mode, 0o666);
+    assert_eq!(before.cuid, 1000);
+    assert_eq!(before.cgid, 1000);
+    assert_eq!(before.uid, 1000);
+    assert_eq!(before.gid, 1000);
+
     execution::step_shmctl(
         shmid,
         execution::IPC_SET,
         Some((0o600, 2000, 2000)),
-        &cred_cap,
+        &creator,
     )
-    .expect("shmctl set");
+    .expect("ipc set");
 
-    // 5. STAT again and verify modifications
-    let res2 =
-        execution::step_shmctl(shmid, execution::IPC_STAT, None, &cred_cap).expect("shmctl stat 2");
-    let info2 = match res2 {
+    let after = match execution::step_shmctl(shmid, execution::IPC_STAT, None, &creator)
+        .expect("stat after")
+    {
         execution::ShmCtlResult::Stat(info) => info,
-        other => panic!("expected Stat, got {:?}", other),
+        other => panic!("expected Stat, got {other:?}"),
     };
-    assert_eq!(info2.perm.mode, 0o600);
-    assert_eq!(info2.cuid, 1000); // creator remains 1000
-    assert_eq!(info2.cgid, 1000); // creator group remains 1000
+    assert_eq!(after.perm.mode, 0o600);
+    assert_eq!(after.cuid, 1000);
+    assert_eq!(after.cgid, 1000);
+    assert_eq!(after.uid, 2000);
+    assert_eq!(after.gid, 2000);
 
-    // 6. Test permissions checks with a different credential (user 3000, group 3000)
-    let cred3_struct = Cred {
-        uid: Uid(3000),
-        euid: Uid(3000),
-        suid: Uid(3000),
-        gid: Gid(3000),
-        egid: Gid(3000),
-        sgid: Gid(3000),
-        effective_caps: CapabilitySet::EMPTY,
-        permitted_caps: CapabilitySet::EMPTY,
-    };
-    let cred3_cap = crate::cred::sign_cred(cred3_struct).expect("cred3 cap");
-    let segment = checks::require_shm_exists(shmid).expect("shm exists");
+    let other = cred(3000, 3000);
+    let segment = checks::require_shm_exists(shmid).expect("segment exists");
+    assert_eq!(
+        checks::require_can_read_shm(&segment, &other).expect_err("other should not read"),
+        Errno::EACCES
+    );
 
-    // Mode is 0o600, and owner is now 2000. User 3000 is not owner/creator, so EACCES.
-    let err_read = checks::require_can_read_shm(&segment, &*cred3_cap).expect_err("should fail");
-    assert_eq!(err_read, Errno::EACCES);
+    let owner = cred(2000, 2000);
+    checks::require_can_read_shm(&segment, &owner).expect("new owner can read");
+    checks::require_can_write_shm(&segment, &owner).expect("new owner can write");
 
-    // If owner (user 2000) calls, it should succeed
-    let cred_owner_struct = Cred {
-        uid: Uid(2000),
-        euid: Uid(2000),
-        suid: Uid(2000),
-        gid: Gid(2000),
-        egid: Gid(2000),
-        sgid: Gid(2000),
-        effective_caps: CapabilitySet::EMPTY,
-        permitted_caps: CapabilitySet::EMPTY,
-    };
-    let cred_owner_cap = crate::cred::sign_cred(cred_owner_struct).expect("cred_owner cap");
-    checks::require_can_read_shm(&segment, &*cred_owner_cap).expect("owner should read");
-    checks::require_can_write_shm(&segment, &*cred_owner_cap).expect("owner should write");
+    execution::step_shmctl(shmid, execution::IPC_RMID, None, &creator).expect("rmid");
+    assert_eq!(
+        execution::step_shmctl(shmid, execution::IPC_STAT, None, &creator)
+            .expect_err("removed segment should not stat"),
+        Errno::EINVAL
+    );
+}
 
-    // 7. RMID the segment
-    execution::step_shmctl(shmid, execution::IPC_RMID, None, &cred_cap).expect("shmctl rmid");
+#[test]
+fn ipc_rmid_keeps_attached_segment_detachable_until_last_shmdt() {
+    let _g = setup();
 
-    // Verify it cannot be STATed anymore (lookup returns EINVAL)
-    let err_stat = execution::step_shmctl(shmid, execution::IPC_STAT, None, &cred_cap)
-        .expect_err("should fail");
-    assert_eq!(err_stat, Errno::EINVAL);
+    let creator = cred(1000, 1000);
+    let ns = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+    let aspace = AddressSpace::new_cap().expect("aspace cap");
+    let shmid = execution::step_shmget(
+        execution::IPC_PRIVATE,
+        4096,
+        execution::IPC_CREAT | 0o600,
+        &creator,
+        &ns,
+    )
+    .expect("shmget private");
+    let addr = block_on(execution::step_shmat(shmid, 0, 0, &creator, &aspace)).expect("shmat");
+
+    execution::step_shmctl(shmid, execution::IPC_RMID, None, &creator).expect("rmid");
+    assert_eq!(
+        block_on(execution::step_shmat(shmid, 0, 0, &creator, &aspace))
+            .expect_err("new attaches reject after rmid"),
+        Errno::EIDRM
+    );
+
+    block_on(execution::step_shmdt(addr, &aspace)).expect("attached mapping stays detachable");
+    assert!(aspace.lookup(UserVirtAddr(addr)).is_none());
+    assert_eq!(
+        execution::step_shmctl(shmid, execution::IPC_STAT, None, &creator)
+            .expect_err("last detach reclaims removed segment"),
+        Errno::EINVAL
+    );
+}
+
+#[test]
+fn ipc_rmid_withdraws_keyed_segment_from_namespace_for_recreate() {
+    let _g = setup();
+
+    let creator = cred(1000, 1000);
+    let ns = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+    let shmid = execution::step_shmget(
+        0x5348_4d31,
+        4096,
+        execution::IPC_CREAT | 0o600,
+        &creator,
+        &ns,
+    )
+    .expect("first keyed shmget");
+
+    execution::step_shmctl_in_ns(shmid, execution::IPC_RMID, None, &creator, &ns).expect("rmid");
+
+    let recreated = execution::step_shmget(
+        0x5348_4d31,
+        4096,
+        execution::IPC_CREAT | 0o600,
+        &creator,
+        &ns,
+    )
+    .expect("key should be reusable after rmid");
+    assert_ne!(recreated, shmid);
+
+    execution::step_shmctl_in_ns(recreated, execution::IPC_RMID, None, &creator, &ns)
+        .expect("cleanup recreated segment");
 }

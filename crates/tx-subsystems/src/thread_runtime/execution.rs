@@ -84,28 +84,7 @@ pub fn mark_thread_zombie_for_test(thread: &Cap<ThreadIdentity>, status: i32) {
 /// owning process's thread list, and zombifies the process if this was
 /// the last thread.
 pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
-    // GroupExit coordination (PROCESS_v1 §5): if the owning process
-    // has an active group-exit episode (exit_group or multi-threaded
-    // execve), decrement the remaining_threads counter.  The
-    // initiating thread (the one that set group_exit) is NOT counted
-    // — it continues through its own path after the collapse.
-    let guard = crate::thread_runtime::adapter::step_engine::guard();
-    if let Some(parent) = thread.owner_proc.upgrade(&guard) {
-        if let Some(payload) = parent.payload.lock().as_ref() {
-            if let Some(ref ge) = *payload.group_exit.lock() {
-                let prev = ge
-                    .remaining_threads
-                    .fetch_sub(1, core::sync::atomic::Ordering::Release);
-                // If this was the last non-initiator thread, the initiator
-                // (blocked on `remaining_threads == 0`) can proceed.
-                if prev == 1 {
-                    // Last thread — the initiator is now unblocked.
-                }
-            }
-        }
-    }
-    drop(guard);
-
+    let mut group_exit_completed = false;
     // Snapshot clear_child_tid and robust-list BEFORE
     // set_thread_zombie drops the thread payload.
     let ctid = thread
@@ -133,13 +112,30 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     drop(guard);
 
     let payload_guard = parent.payload.lock();
-    let was_last = match payload_guard.as_ref() {
-        Some(payload) => {
-            payload.threads.retain(|t| t.key() != thread.key());
-            payload.threads.count() == 0
-        }
-        None => return,
+    let Some(payload) = payload_guard.as_ref() else {
+        return;
     };
+
+    payload.threads.retain(|t| t.key() != thread.key());
+    let prev = payload
+        .thread_count
+        .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+    let new_count = prev.saturating_sub(1);
+
+    // GroupExit coordination (PROCESS_v1 §5): if the owning process
+    // has an active group-exit episode (exit_group or multi-threaded
+    // execve), decrement the remaining_threads counter. The
+    // initiating thread is not counted here.
+    if let Some(ref ge) = *payload.group_exit.lock() {
+        let prev_remaining = ge
+            .remaining_threads
+            .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+        if prev_remaining == 1 {
+            group_exit_completed = true;
+        }
+    }
+
+    let was_last = new_count == 0;
     drop(payload_guard);
 
     if was_last {
@@ -152,6 +148,12 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
             &parent,
             crate::process::structure::ExitStatus::Exited(status),
         );
+    }
+
+    if group_exit_completed {
+        if let Some(payload) = parent.payload.lock().as_ref() {
+            *payload.group_exit.lock() = None;
+        }
     }
 
     // clear_child_tid futex protocol (CLONE_CHILD_CLEARTID).
@@ -182,7 +184,14 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
         walk_robust_list(&thread, head, 16);
     }
 
-    crate::process::numbers::unregister_pid_number(thread.tid.0 as u64);
+    if thread
+        .owner_proc
+        .upgrade(&crate::thread_runtime::adapter::step_engine::guard())
+        .map(|proc| proc.pid.0 != thread.tid.0)
+        .unwrap_or(true)
+    {
+        crate::process::numbers::unregister_pid_number(thread.tid.0 as u64);
+    }
 }
 
 /// Best-effort robust-list walk on thread exit.

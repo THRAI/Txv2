@@ -83,8 +83,8 @@ impl FatalTrapInfo {
 pub enum UserspaceTrapInfo {
     Syscall(SyscallRequest),
     PageFault(PageFaultInfo),
+    TimerPreempt,
     Fatal(FatalTrapInfo),
-    Preempted,
 }
 
 /// Generation-checked identity for an in-flight userspace-run request.
@@ -217,7 +217,6 @@ struct ActiveRun {
 enum ActivePhase {
     Pending,
     Running,
-    Preempted,
     Resolved(UserspaceTrapInfo),
 }
 
@@ -296,12 +295,29 @@ impl UserspaceRunSlot {
         })
     }
 
-    /// Record a timer preemption without resolving the userspace-run wait.
+    /// Resolve the wait with a timer-preemption event and wake the task.
+    ///
+    /// Timer preemption participates in the same request-completion protocol as
+    /// syscall and page-fault traps. This keeps ownership of the active request
+    /// with the thread future: the trap shell only snapshots context and
+    /// publishes an event; the future consumes that event and decides whether to
+    /// yield, re-enter, or terminate.
     pub fn record_timer_preemption(
         &self,
         request: UserspaceRunRequest,
     ) -> Result<UserspaceRunStatus, UserspaceRunError> {
-        self.with_active(request, |active| {
+        let (status, waker) = {
+            let mut state = self.state.lock();
+            let active = state
+                .active
+                .as_mut()
+                .ok_or(UserspaceRunError::NoActiveRequest)?;
+            if active.request != request {
+                return Err(UserspaceRunError::StaleRequest {
+                    attempted: request,
+                    active: active.request,
+                });
+            }
             if let ActivePhase::Resolved(_) = active.phase {
                 return Err(UserspaceRunError::AlreadyResolved(request));
             }
@@ -309,10 +325,16 @@ impl UserspaceRunSlot {
                 return Err(UserspaceRunError::NotRunning(request));
             }
 
-            active.phase = ActivePhase::Preempted;
+            active.phase = ActivePhase::Resolved(UserspaceTrapInfo::TimerPreempt);
             active.preemptions += 1;
-            Ok(active.status())
-        })
+            (active.status(), active.waker.take())
+        };
+
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+
+        Ok(status)
     }
 
     /// Resolve the wait with an interesting trap and wake the registered task.
@@ -334,11 +356,14 @@ impl UserspaceRunSlot {
                 });
             }
             if let ActivePhase::Resolved(_) = active.phase {
-                return Err(UserspaceRunError::AlreadyResolved(request));
+                if !active.phase.replace_timer_preempt_with(trap) {
+                    return Err(UserspaceRunError::AlreadyResolved(request));
+                }
+                (active.status(), active.waker.take())
+            } else {
+                active.phase = ActivePhase::Resolved(trap);
+                (active.status(), active.waker.take())
             }
-
-            active.phase = ActivePhase::Resolved(trap);
-            (active.status(), active.waker.take())
         };
 
         if let Some(waker) = waker {
@@ -485,7 +510,7 @@ impl Future for UserspaceRunWait {
                 this.finished = true;
                 Poll::Ready(trap)
             }
-            ActivePhase::Pending | ActivePhase::Running | ActivePhase::Preempted => {
+            ActivePhase::Pending | ActivePhase::Running => {
                 if active
                     .waker
                     .as_ref()
@@ -529,11 +554,23 @@ impl ActiveRun {
 }
 
 impl ActivePhase {
+    fn replace_timer_preempt_with(&mut self, trap: UserspaceTrapInfo) -> bool {
+        match (*self, trap) {
+            (Self::Resolved(UserspaceTrapInfo::TimerPreempt), UserspaceTrapInfo::TimerPreempt) => {
+                false
+            }
+            (Self::Resolved(UserspaceTrapInfo::TimerPreempt), trap) => {
+                *self = Self::Resolved(trap);
+                true
+            }
+            _ => false,
+        }
+    }
+
     const fn public_phase(self) -> UserspaceRunPhase {
         match self {
             Self::Pending => UserspaceRunPhase::Pending,
             Self::Running => UserspaceRunPhase::Running,
-            Self::Preempted => UserspaceRunPhase::Preempted,
             Self::Resolved(_) => UserspaceRunPhase::Resolved,
         }
     }
@@ -541,7 +578,7 @@ impl ActivePhase {
     const fn trap(self) -> Option<UserspaceTrapInfo> {
         match self {
             Self::Resolved(trap) => Some(trap),
-            Self::Pending | Self::Running | Self::Preempted => None,
+            Self::Pending | Self::Running => None,
         }
     }
 }

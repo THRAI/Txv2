@@ -22,20 +22,6 @@ use tx_subsystems::vm::{
     AddressSpace, UserAccessKind, UserPage, UserRange, FULL_USER_V1_TOP, USER_PAGE_SIZE,
 };
 
-#[cfg(not(target_os = "none"))]
-fn host_bootstrap_kernel_pointer_allowed(uaddr: u64) -> bool {
-    // Integration tests compile `tx-shims` as a normal dependency, so
-    // `cfg(test)` is not set for this module. Keep the bootstrap
-    // kernel-pointer bridge available in debug/test-support host builds,
-    // but still reject NULL and the first unmapped page.
-    let floor = if cfg!(any(test, debug_assertions, feature = "test-support")) {
-        0x1000
-    } else {
-        FULL_USER_V1_TOP as u64
-    };
-    uaddr >= floor
-}
-
 /// Outcome of `read_user_cstr` — distinguishes "no NUL within budget"
 /// from a successful copy. The successful arm yields the bytes up to
 /// (not including) the NUL terminator, allocated as a kernel-owned
@@ -188,7 +174,12 @@ pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) ->
             }
             #[cfg(not(target_os = "none"))]
             {
-                if !host_bootstrap_kernel_pointer_allowed(uaddr) {
+                let limit = if cfg!(any(test, feature = "test-support")) {
+                    0x1000
+                } else {
+                    FULL_USER_V1_TOP as u64
+                };
+                if uaddr < limit {
                     return Err(Errno::EFAULT);
                 }
                 Ok(unsafe { core::ptr::read_volatile(uaddr as *const T) })
@@ -219,7 +210,12 @@ pub(super) fn bootstrap_write_user<T: Copy>(
             }
             #[cfg(not(target_os = "none"))]
             {
-                if !host_bootstrap_kernel_pointer_allowed(uaddr) {
+                let limit = if cfg!(any(test, feature = "test-support")) {
+                    0x1000
+                } else {
+                    FULL_USER_V1_TOP as u64
+                };
+                if uaddr < limit {
                     return Err(Errno::EFAULT);
                 }
                 unsafe {
@@ -291,7 +287,12 @@ pub(super) fn bootstrap_copy_from_user(
             match aspace.reserve_user_range_for_access(range, UserAccessKind::Read) {
                 V3::Done(()) => {}
                 V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
-                    if !host_bootstrap_kernel_pointer_allowed(uaddr) {
+                    let limit = if cfg!(any(test, feature = "test-support")) {
+                        0x1000
+                    } else {
+                        FULL_USER_V1_TOP as u64
+                    };
+                    if uaddr < limit {
                         return Err(Errno::EFAULT);
                     }
                     prefault_failed_with_efault = true;
@@ -313,7 +314,12 @@ pub(super) fn bootstrap_copy_from_user(
             V3::Done(_) | V3::Continue { .. } => Ok(()),
             V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
                 drop(guard);
-                if !host_bootstrap_kernel_pointer_allowed(uaddr) {
+                let limit = if cfg!(any(test, feature = "test-support")) {
+                    0x1000
+                } else {
+                    FULL_USER_V1_TOP as u64
+                };
+                if uaddr < limit {
                     return Err(Errno::EFAULT);
                 }
                 unsafe {
@@ -365,7 +371,12 @@ pub(super) fn bootstrap_copy_to_user(
             match aspace.reserve_user_range_for_access(range, UserAccessKind::Write) {
                 V3::Done(()) => {}
                 V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
-                    if !host_bootstrap_kernel_pointer_allowed(uaddr) {
+                    let limit = if cfg!(any(test, feature = "test-support")) {
+                        0x1000
+                    } else {
+                        FULL_USER_V1_TOP as u64
+                    };
+                    if uaddr < limit {
                         return Err(Errno::EFAULT);
                     }
                     prefault_failed_with_efault = true;
@@ -387,7 +398,12 @@ pub(super) fn bootstrap_copy_to_user(
             V3::Done(_) | V3::Continue { .. } => Ok(()),
             V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
                 drop(guard);
-                if !host_bootstrap_kernel_pointer_allowed(uaddr) {
+                let limit = if cfg!(any(test, feature = "test-support")) {
+                    0x1000
+                } else {
+                    FULL_USER_V1_TOP as u64
+                };
+                if uaddr < limit {
                     return Err(Errno::EFAULT);
                 }
                 unsafe {
@@ -428,7 +444,12 @@ pub(super) fn bootstrap_read_user_cstr(
             }
             #[cfg(not(target_os = "none"))]
             {
-                if !host_bootstrap_kernel_pointer_allowed(uaddr) {
+                let limit = if cfg!(any(test, feature = "test-support")) {
+                    0x1000
+                } else {
+                    FULL_USER_V1_TOP as u64
+                };
+                if uaddr < limit {
                     return Err(Errno::EFAULT);
                 }
                 // Fallback bootstrap scan — matches the previous inline

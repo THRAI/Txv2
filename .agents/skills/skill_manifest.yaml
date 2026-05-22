@@ -110,6 +110,26 @@ skills:
       - docs/design/01_substrate/HAL_v1.md
     purpose: Decide whether docs are precise enough to implement from.
 
+  tx-oscomp-musl-debug:
+    sources:
+      - AGENTS.md
+      - docs/progress/STATUS.md
+      - docs/progress/SYSCALL_STATUS.md
+      - .agents/skills/tx-xtask/SKILL.md
+      - .agents/skills/tx-ltp-syscall/SKILL.md
+      - .agents/skills/tx-shell-syscall-fixup/SKILL.md
+      - .agents/skills/tx-process-threadruntime/SKILL.md
+      - .agents/skills/tx-progress-memory/SKILL.md
+      - Makefile
+      - xtask/src/oscomp.rs
+      - tools/build-slim-sdcard.py
+      - tools/oscomp-extract-testcase.sh
+      - crates/tx-kernel/src/thread_future.rs
+      - crates/tx-subsystems/src/process/numbers.rs
+      - crates/tx-shims/src/linux_syscall/fs_basic.rs
+      - crates/tx-shims/src/linux_syscall/signal.rs
+    purpose: Debug named-worktree OSComp/LTP musl failures through tailored QEMU runs, serial diagnosis, focused host reductions, merge catch-up, and progress recording.
+
   tx-progress-memory:
     sources:
       - docs/progress/README.md

@@ -7,12 +7,15 @@ DOCKER_COMPOSE ?= docker compose -f docker-compose.yml
 DOCKER_SERVICE ?= oscomp
 DOCKER_RUN = $(DOCKER_COMPOSE) run --rm $(DOCKER_SERVICE)
 DOCKER_RUN_IT = $(DOCKER_COMPOSE) run --rm -it $(DOCKER_SERVICE)
+DOCKER_BUILD_ENV = $(if $(strip $(OSCOMP_GROUPS)),-e TX_OSCOMP_GROUPS=$(OSCOMP_GROUPS),)
+DOCKER_RUN_BUILD = $(DOCKER_COMPOSE) run --rm $(DOCKER_BUILD_ENV) $(DOCKER_SERVICE)
 
 OSCOMP_DATA ?= target/oscomp/testdata
 OSCOMP_SUBMIT ?= target/oscomp/submit
 OSCOMP_DOCKER_IMAGE ?= zhouzhouyi/os-contest:20260104
 OSCOMP_TARGET ?= rv64-qemu
 OSCOMP_EXTRA ?=
+HOST_CARGO_TARGET_DIR ?= target/host-cargo
 
 .PHONY: docker-help docker-build docker-shell docker-ci docker-check docker-ci-slow \
 	docker-build-rv64 docker-build-la64 docker-image-cpio-rv64 docker-image-cpio-la64 \
@@ -20,7 +23,8 @@ OSCOMP_EXTRA ?=
 	docker-qemu-rv64-smoke docker-qemu-rv64-busybox docker-qemu-la64-busybox \
 	docker-run-la64-busybox docker-run-la64-busybox-smp1 docker-run-rv64-busybox \
 	docker-busybox-la64 docker-oscomp-doctor docker-oscomp-prepare docker-oscomp-submit \
-	docker-oscomp-run docker-oscomp-qemu
+	docker-oscomp-run docker-oscomp-qemu \
+	smp-smoke-rv64 smp-smoke-la64 smp-smoke
 
 docker-help:
 	@echo "Txv2 Docker targets:"
@@ -32,6 +36,13 @@ docker-help:
 	@echo "  make docker-qemu-rv64-busybox"
 	@echo "  make docker-qemu-la64-busybox"
 	@echo "  make docker-run-la64-busybox-smp1"
+	@echo "  make smp-smoke-rv64"
+	@echo "  make smp-smoke-la64"
+	@echo "  make oscomp-local-rv64-smp4"
+	@echo "  make oscomp-local-la64-smp4"
+	@echo "  make oscomp-local-rv64-libctest-musl-smp4"
+	@echo "  make oscomp-local-la64-libctest-musl-smp4"
+	@echo "  make oscomp-export-testcase"
 	@echo "  make docker-busybox-la64"
 	@echo "  make docker-oscomp-prepare docker-oscomp-submit docker-oscomp-run"
 
@@ -51,10 +62,10 @@ docker-ci-slow:
 	$(DOCKER_RUN) cargo xtask ci-slow
 
 docker-build-rv64:
-	$(DOCKER_RUN) cargo xtask build --target rv64-qemu
+	$(DOCKER_RUN_BUILD) cargo xtask build --target rv64-qemu
 
 docker-build-la64:
-	$(DOCKER_RUN) cargo xtask build --target la64-qemu
+	$(DOCKER_RUN_BUILD) cargo xtask build --target la64-qemu
 
 docker-image-cpio-rv64:
 	$(DOCKER_RUN) cargo xtask image cpio --profile busybox --target rv64-qemu
@@ -113,22 +124,53 @@ docker-oscomp-run:
 docker-oscomp-qemu:
 	$(DOCKER_RUN) cargo xtask oscomp qemu --target $(OSCOMP_TARGET) --data $(OSCOMP_DATA) --submit $(OSCOMP_SUBMIT) $(OSCOMP_EXTRA)
 
+# 本地多核 reactor / AP runqueue smoke。
+# 注意：xtask qemu 当前从仓库默认 target/ 目录加载 kernel；这里故意不设置
+# CARGO_TARGET_DIR，避免构建到 /tmp 后 QEMU 仍运行旧内核。
+SMP_SMOKE_CPUS ?= 4
+SMP_SMOKE_MARKERS = smp:aps:online|smp:ipi:ok|reactor:dispatch:ipi:ok|reactor:ap-loop:ok|reactor:ap-runqueue:ok|reactor:sched:stats|boot:ok
+
+smp-smoke-rv64:
+	cargo xtask build --target rv64-qemu
+	cargo xtask qemu --target rv64-qemu --profile smoke --expect-sentinel --smp $(SMP_SMOKE_CPUS)
+	rg "$(SMP_SMOKE_MARKERS)" target/qemu-rv64-qemu-smoke.serial.log
+
+smp-smoke-la64:
+	cargo xtask build --target la64-qemu
+	cargo xtask qemu --target la64-qemu --profile smoke --expect-sentinel --smp $(SMP_SMOKE_CPUS)
+	rg "$(SMP_SMOKE_MARKERS)" target/qemu-la64-qemu-smoke.serial.log
+
+smp-smoke: smp-smoke-rv64 smp-smoke-la64
+
 # 本地评测（不需要 docker 评测镜像）
 OSCOMP_OUT_RV ?= target/oscomp/os_serial_out_rv.txt
+OSCOMP_OUT_RV_SMP4 ?= target/oscomp/os_serial_out_rv_smp4.txt
 OSCOMP_OUT_LA ?= target/oscomp/os_serial_out_la.txt
+OSCOMP_OUT_LA_SMP4 ?= target/oscomp/os_serial_out_la_smp4.txt
+OSCOMP_GROUPS ?=
+OSCOMP_APPEND = $(if $(strip $(OSCOMP_GROUPS)),-append 'tx.oscomp.groups=$(OSCOMP_GROUPS)',)
+OSCOMP_TESTCASE_OUT ?= target/oscomp/testcase
 OSCOMP_SERIAL_NORMALIZE = stdbuf -o0 tr -d '\000\r'
 OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'
 
-.PHONY: oscomp-submit oscomp-qemu-rv64 oscomp-qemu-la64 oscomp-judge-rv64 oscomp-judge-la64 oscomp-local-rv64 oscomp-local-la64
+.PHONY: oscomp-submit oscomp-qemu-rv64 oscomp-qemu-rv64-smp4 \
+	oscomp-qemu-la64 oscomp-qemu-la64-smp4 \
+	oscomp-judge-rv64 oscomp-judge-rv64-smp4 \
+	oscomp-judge-la64 oscomp-judge-la64-smp4 \
+	oscomp-local-rv64 oscomp-local-rv64-smp4 \
+	oscomp-local-la64 oscomp-local-la64-smp4 \
+	oscomp-local-rv64-libctest-musl oscomp-local-rv64-libctest-musl-smp4 \
+	oscomp-local-la64-libctest-musl oscomp-local-la64-libctest-musl-smp4 \
+	oscomp-export-testcase
 
 oscomp-submit:
-	cargo xtask oscomp submit --submit $(OSCOMP_SUBMIT)
+	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --submit $(OSCOMP_SUBMIT)
 
 oscomp-submit-rv64:
-	cargo xtask oscomp submit --target rv64-qemu --submit $(OSCOMP_SUBMIT)
+	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --target rv64-qemu --submit $(OSCOMP_SUBMIT)
 
 oscomp-submit-la64:
-	cargo xtask oscomp submit --target la64-qemu --submit $(OSCOMP_SUBMIT)
+	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --target la64-qemu --submit $(OSCOMP_SUBMIT)
 
 oscomp-qemu-rv64:
 	set -o pipefail; \
@@ -140,7 +182,22 @@ oscomp-qemu-rv64:
 		-no-reboot \
 		-device virtio-net-device,netdev=net -netdev user,id=net \
 		-rtc base=utc \
+		$(OSCOMP_APPEND) \
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_RV) | $(OSCOMP_CONSOLE_FILTER)
+
+oscomp-qemu-rv64-smp4:
+	mkdir -p $(dir $(OSCOMP_OUT_RV_SMP4))
+	set -o pipefail; \
+	qemu-system-riscv64 -machine virt \
+		-kernel $(OSCOMP_SUBMIT)/kernel-rv \
+		-m 1G -nographic -smp 4 -bios default \
+		-drive file=$(OSCOMP_DATA)/sdcard-rv.img,if=none,format=raw,id=x0,file.locking=off \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		-no-reboot \
+		-device virtio-net-device,netdev=net -netdev user,id=net \
+		-rtc base=utc \
+		$(OSCOMP_APPEND) \
+		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_RV_SMP4) | $(OSCOMP_CONSOLE_FILTER)
 
 oscomp-qemu-la64:
 	set -o pipefail; \
@@ -152,14 +209,64 @@ oscomp-qemu-la64:
 		-no-reboot \
 		-device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
 		-rtc base=utc \
+		$(OSCOMP_APPEND) \
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_LA) | $(OSCOMP_CONSOLE_FILTER)
+
+oscomp-qemu-la64-smp4:
+	mkdir -p $(dir $(OSCOMP_OUT_LA_SMP4))
+	set -o pipefail; \
+	qemu-system-loongarch64 \
+		-kernel $(OSCOMP_SUBMIT)/kernel-la \
+		-m 1G -nographic -smp 4 \
+		-drive file=$(OSCOMP_DATA)/sdcard-la.img,if=none,format=raw,id=x0,file.locking=off \
+		-device virtio-blk-pci,drive=x0 \
+		-no-reboot \
+		-device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
+		-rtc base=utc \
+		$(OSCOMP_APPEND) \
+		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_LA_SMP4) | $(OSCOMP_CONSOLE_FILTER)
 
 oscomp-judge-rv64:
 	python3 tools/oscomp-judge.py $(OSCOMP_OUT_RV) $(OSCOMP_DATA)
 
+oscomp-judge-rv64-smp4:
+	@test -f $(OSCOMP_OUT_RV_SMP4) || { \
+		echo "missing $(OSCOMP_OUT_RV_SMP4)"; \
+		echo "run: make oscomp-local-rv64-smp4"; \
+		exit 1; \
+	}
+	python3 tools/oscomp-judge.py $(OSCOMP_OUT_RV_SMP4) $(OSCOMP_DATA)
+
 oscomp-judge-la64:
 	python3 tools/oscomp-judge.py $(OSCOMP_OUT_LA) $(OSCOMP_DATA)
 
+oscomp-judge-la64-smp4:
+	@test -f $(OSCOMP_OUT_LA_SMP4) || { \
+		echo "missing $(OSCOMP_OUT_LA_SMP4)"; \
+		echo "run: make oscomp-local-la64-smp4"; \
+		exit 1; \
+	}
+	python3 tools/oscomp-judge.py $(OSCOMP_OUT_LA_SMP4) $(OSCOMP_DATA)
+
 oscomp-local-rv64: docker-build-rv64 docker-oscomp-prepare oscomp-submit-rv64 oscomp-qemu-rv64 oscomp-judge-rv64
 
+oscomp-local-rv64-smp4: docker-build-rv64 docker-oscomp-prepare oscomp-submit-rv64 oscomp-qemu-rv64-smp4 oscomp-judge-rv64-smp4
+
 oscomp-local-la64: docker-build-la64 docker-oscomp-prepare oscomp-submit-la64 oscomp-qemu-la64 oscomp-judge-la64
+
+oscomp-local-la64-smp4: docker-build-la64 docker-oscomp-prepare oscomp-submit-la64 oscomp-qemu-la64-smp4 oscomp-judge-la64-smp4
+
+oscomp-local-rv64-libctest-musl:
+	$(MAKE) oscomp-local-rv64 OSCOMP_GROUPS=libctest-musl
+
+oscomp-local-rv64-libctest-musl-smp4:
+	$(MAKE) oscomp-local-rv64-smp4 OSCOMP_GROUPS=libctest-musl
+
+oscomp-local-la64-libctest-musl:
+	$(MAKE) oscomp-local-la64 OSCOMP_GROUPS=libctest-musl
+
+oscomp-local-la64-libctest-musl-smp4:
+	$(MAKE) oscomp-local-la64-smp4 OSCOMP_GROUPS=libctest-musl
+
+oscomp-export-testcase:
+	tools/oscomp-extract-testcase.sh $(OSCOMP_DATA) $(OSCOMP_TESTCASE_OUT)

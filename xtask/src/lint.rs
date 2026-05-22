@@ -30,7 +30,7 @@ const AUTHORED_HOST_PACKAGES: &[&str] = &[
 
 pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {
-        return Err("lint command needs `arch`, `docs`, `unused`, `boundary`, `invariants`, or `syscall-status`".into());
+        return Err("lint command needs `arch`, `docs`, `unused`, `boundary`, `invariants`, `kernel-user-layouts`, or `syscall-status`".into());
     };
     match kind.as_str() {
         "arch" => lint_arch(root),
@@ -48,8 +48,12 @@ pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
             // is stale. Fix with `cargo xtask syscall sync`.
             crate::syscall::syscall(root, vec!["sync".into(), "--check".into()])
         }
+        "kernel-user-layouts" => crate::kernel_user_layouts::kernel_user_layouts(
+            root,
+            args.iter().skip(1).cloned().collect(),
+        ),
         other => Err(format!(
-            "unknown lint kind '{other}', expected arch, docs, unused, boundary, invariants, or syscall-status"
+            "unknown lint kind '{other}', expected arch, docs, unused, boundary, invariants, kernel-user-layouts, or syscall-status"
         )),
     }
 }

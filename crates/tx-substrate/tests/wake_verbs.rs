@@ -76,3 +76,42 @@ fn notify_zero_mask_posts_nothing() {
     wake::notify(&src, 0);
     assert!(mb.is_empty(), "zero-mask notify should post nothing");
 }
+
+/// A notify that races just before registration must not be lost.
+/// The next waiter consumes the pending mask and retries its step.
+#[test]
+fn notify_before_register_is_delivered_as_pending_source_fire() {
+    let src = wake::new_source(101);
+    let mb = Arc::new(TaskMailbox::new());
+    let gen = WaitGeneration::new(9);
+
+    wake::notify(&src, 0b0100);
+    assert!(mb.is_empty(), "no subscriber existed at notify time");
+
+    let _guard = src
+        .prepare(Arc::downgrade(&mb), gen, InterestMask::new(0b1100))
+        .install();
+
+    let evt = mb.poll().expect("pending source fire should be delivered");
+    match evt {
+        MailboxEvent::SourceFired {
+            generation,
+            interests,
+            ..
+        } => {
+            assert_eq!(generation, gen);
+            assert_eq!(interests, InterestMask::new(0b0100));
+        }
+        other => panic!("expected SourceFired, got {other:?}"),
+    }
+
+    let mb2 = Arc::new(TaskMailbox::new());
+    let _guard2 = src
+        .prepare(
+            Arc::downgrade(&mb2),
+            WaitGeneration::new(10),
+            InterestMask::new(0b1100),
+        )
+        .install();
+    assert!(mb2.is_empty(), "pending mask is consumed once");
+}

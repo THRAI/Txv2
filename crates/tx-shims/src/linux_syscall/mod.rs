@@ -65,8 +65,8 @@ use tx_subsystems::futex::FutexWakeOp;
 use tx_subsystems::page_backed::TruncateOp as FdTruncateOp;
 use tx_subsystems::process::{
     process_by_pid, seed_child_leader_context, step_waitpid_nohang, ChdirOp, ChdirOutcome, CloseOp,
-    Dup3Op, ExitGroupOp, ExitStatus, FcntlFdOp, GetcwdOp, Pgid, Pid, ProcessIdentity, SetpgidOp,
-    SetsidOp, WaitError, WaitTarget,
+    Dup3Op, DupOp, ExitGroupOp, ExitStatus, FcntlDupFdOp, FcntlFdOp, GetcwdOp, Pgid, Pid,
+    ProcessIdentity, SetpgidOp, SetsidOp, WaitError, WaitTarget,
 };
 use tx_subsystems::reactor_submit;
 use tx_subsystems::signal::{
@@ -151,6 +151,11 @@ mod result;
 pub use result::*;
 mod user_copy;
 pub(super) use user_copy::*;
+mod user_layout;
+pub use user_layout::{
+    kernel_user_layout_candidates, kernel_user_layouts, KernelToUserLayout, KernelUserCandidate,
+    KernelUserField, KernelUserLayout,
+};
 mod helpers;
 pub(super) use helpers::*;
 
@@ -185,21 +190,21 @@ pub use numbers::{
     NR_NEWFSTATAT, NR_OPENAT, NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL, NR_PIPE2, NR_PPOLL,
     NR_PRLIMIT64, NR_READ, NR_READLINKAT, NR_READV, NR_RENAMEAT2, NR_RT_SIGACTION,
     NR_RT_SIGPENDING, NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN, NR_RT_SIGSUSPEND,
-    NR_RT_SIGTIMEDWAIT, NR_SCHED_SETSCHEDULER, NR_SEMCTL, NR_SEMGET, NR_SEMOP, NR_SEMTIMEDOP,
-    NR_SETGID, NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID,
-    NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET,
-    NR_SIGALTSTACK, NR_SIGNALFD, NR_SIGNALFD4, NR_STATFS, NR_STATX, NR_SYMLINKAT, NR_SYNC,
-    NR_SYNCFS, NR_SYSLOG, NR_TGKILL, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME,
-    NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UMOUNT2, NR_UNAME, NR_UNLINKAT, NR_USERFAULTFD,
-    NR_UTIMENSAT, NR_WAIT4, NR_WRITE, NR_WRITEV, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT,
-    O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN,
-    PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, RENAME_EXCHANGE, RENAME_NOREPLACE,
-    RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS,
-    RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE, RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_RSS,
-    RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIMIT_SIGPENDING, RLIMIT_STACK, RLIM_INFINITY, R_OK, SEEK_CUR,
-    SEEK_END, SEEK_SET, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW, TIMER_ABSTIME,
-    TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ,
-    UTIME_NOW, UTIME_OMIT, WNOHANG, W_OK, X_OK,
+    NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SCHED_SETSCHEDULER,
+    NR_SEMCTL, NR_SEMGET, NR_SEMOP, NR_SEMTIMEDOP, NR_SETGID, NR_SETPGID, NR_SETREGID,
+    NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST,
+    NR_SET_TID_ADDRESS, NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET, NR_SIGALTSTACK, NR_SIGNALFD,
+    NR_SIGNALFD4, NR_STATFS, NR_STATX, NR_SYMLINKAT, NR_SYNC, NR_SYNCFS, NR_SYSLOG, NR_TGKILL,
+    NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME, NR_TIMES, NR_TKILL, NR_TRUNCATE,
+    NR_UMASK, NR_UMOUNT2, NR_UNAME, NR_UNLINKAT, NR_USERFAULTFD, NR_UTIMENSAT, NR_WAIT4, NR_WRITE,
+    NR_WRITEV, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY,
+    O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ,
+    PROT_WRITE, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE,
+    RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS, RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE,
+    RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_RSS, RLIMIT_RTPRIO, RLIMIT_RTTIME,
+    RLIMIT_SIGPENDING, RLIMIT_STACK, RLIM_INFINITY, R_OK, SEEK_CUR, SEEK_END, SEEK_SET, SIGCHLD,
+    TCGETS, TCSETS, TCSETSF, TCSETSW, TIMER_ABSTIME, TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ,
+    TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ, UTIME_NOW, UTIME_OMIT, WNOHANG, W_OK, X_OK,
 };
 
 pub use numbers::{
@@ -247,8 +252,6 @@ pub(super) const ENOSYS_VALUE: i32 = 38;
 pub(super) const ENODEV_VALUE: i32 = 19;
 /// Linux generic ABI errno value for "bad file descriptor" (`EBADF`).
 pub(super) const EBADF_VALUE: i32 = 9;
-/// Linux generic ABI errno value for "too many open files" (`EMFILE`).
-pub(super) const EMFILE_VALUE: i32 = 24;
 /// Linux generic ABI errno value for "bad address" (`EFAULT`).
 /// Used by Slice 4's time syscalls when a required user pointer is
 /// null, and by every `bootstrap_*` user-VA bridge for invalid user
@@ -282,12 +285,6 @@ pub(super) const EPERM_VALUE: i32 = 1;
 /// Used by `setpgid` / `setsid` when zone allocation fails minting a
 /// fresh `ProcessGroup` / `Session`.
 pub(super) const ENOMEM_VALUE: i32 = 12;
-/// Static `RLIMIT_NOFILE.rlim_cur` advertised by `prlimit64`.
-///
-/// fd-producing syscall arms must not hand userspace fd numbers
-/// greater than or equal to this value, or musl's `t_fdfill()` loops
-/// forever waiting for `EMFILE`.
-pub(super) const RLIMIT_NOFILE_CUR: u32 = 1024;
 /// Linux generic ABI errno value for "resource temporarily
 /// unavailable" (`EAGAIN`). Reserved for `sys_clone` to surface
 /// retriable allocator failures from `step_fork`'s VM-side clone path
@@ -315,6 +312,10 @@ pub(super) const EROFS_VALUE: i32 = 30;
 /// cannot produce today (chmod/chown/access never block in
 /// tmpfs/devfs); matches `errno_to_i32`'s `Errno::EIO` row.
 pub(super) const EIO_VALUE: i32 = 5;
+/// Linux generic ABI errno value for "too many open files" (`EMFILE`).
+pub(super) const EMFILE_VALUE: i32 = 24;
+/// Soft `RLIMIT_NOFILE` value exported by `prlimit64`.
+pub(super) const RLIMIT_NOFILE_CUR: u32 = 1024;
 
 pub(super) fn next_fd_below_nofile(
     process: &Cap<ProcessIdentity>,
@@ -323,7 +324,7 @@ pub(super) fn next_fd_below_nofile(
     if min >= RLIMIT_NOFILE_CUR {
         return Err(SyscallResult::Error(EINVAL_VALUE));
     }
-    let fd = process.allocate_fd_at_least(min);
+    let fd = process.next_fd_above(min);
     if fd >= RLIMIT_NOFILE_CUR {
         return Err(SyscallResult::Error(EMFILE_VALUE));
     }
@@ -399,10 +400,7 @@ pub(super) const SIGACTION_BYTES: usize = 32;
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
-pub async fn dispatch<
-    'a,
-    P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_hal::SignalFrameIf + tx_hal::ConsoleIf,
->(
+pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -419,8 +417,8 @@ pub async fn dispatch<
     //
     // The threshold-based observation dump trigger is handled one level
     // up in `tx_kernel::thread_future::run_thread` so the dispatch
-    // signature stays free of the `PowerIf` bound that would ripple
-    // into every test-stub platform.
+    // signature stays free of `ConsoleIf + PowerIf` bounds that would
+    // ripple into every test-stub platform.
     let l0_span = emit_syscall_enter(&req);
     let prev = tx_observe::set_current_parent_span(l0_span);
     let result = dispatch_inner::<P>(req, ctx).await;
@@ -429,10 +427,7 @@ pub async fn dispatch<
     result
 }
 
-async fn dispatch_inner<
-    'a,
-    P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_hal::SignalFrameIf + tx_hal::ConsoleIf,
->(
+async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -459,7 +454,9 @@ async fn dispatch_inner<
         nr if nr == NR_UNAME => return sys_uname::<P>(req.args, ctx),
         nr if nr == NR_GETRANDOM => return sys_getrandom(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
-        nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn::<P>(ctx),
+        nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
+        nr if nr == NR_SCHED_GETAFFINITY => return sys_sched_getaffinity(req.args, ctx),
+        nr if nr == NR_SCHED_SETAFFINITY => return sys_sched_setaffinity(req.args, ctx),
         nr if nr == NR_SCHED_SETSCHEDULER => return sys_sched_setscheduler(),
         nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
         nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args, ctx),
@@ -468,11 +465,15 @@ async fn dispatch_inner<
         nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx).await,
         nr if nr == NR_UTIMENSAT => return sys_utimensat::<P>(req.args, ctx),
         nr if nr == NR_SHMGET => return sys_shmget(req.args, ctx),
-        nr if nr == NR_SHMDT => return sys_shmdt(req.args, ctx),
+        nr if nr == NR_SHMDT => return sys_shmdt(req.args, ctx).await,
         nr if nr == NR_MSGGET => return sys_msgget(req.args, ctx),
         nr if nr == NR_MSGSND => return sys_msgsnd(req.args, ctx),
         nr if nr == NR_MSGRCV => return sys_msgrcv(req.args, ctx),
         nr if nr == NR_SEMGET => return sys_semget(req.args, ctx),
+        nr if nr == NR_MQ_OPEN => return sys_mq_open(req.args, ctx),
+        nr if nr == NR_MQ_UNLINK => return sys_mq_unlink(req.args, ctx),
+        nr if nr == NR_MQ_GETSETATTR => return sys_mq_getsetattr(req.args, ctx),
+        nr if nr == NR_MQ_NOTIFY => return sys_mq_notify(req.args, ctx),
         nr if nr == NR_MEMBARRIER => return sys_membarrier::<P>(&req.args),
         _ => {} // fall through to script lanes
     }
@@ -483,6 +484,8 @@ async fn dispatch_inner<
         nr if nr == NR_WRITEV => sys_writev(req.args, ctx).await,
         nr if nr == NR_READ => sys_read::<P>(req.args, ctx).await,
         nr if nr == NR_READV => sys_readv::<P>(req.args, ctx).await,
+        nr if nr == NR_MQ_TIMEDSEND => sys_mq_timedsend(req.args, ctx).await,
+        nr if nr == NR_MQ_TIMEDRECEIVE => sys_mq_timedreceive(req.args, ctx).await,
         nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
         nr if nr == NR_PPOLL => sys_ppoll(req.args, ctx).await,
         nr if nr == NR_EXIT => sys_exit(req.args, ctx),
@@ -503,7 +506,7 @@ async fn dispatch_inner<
         nr if nr == NR_MSGCTL => sys_msgctl(req.args, ctx),
         nr if nr == NR_SEMOP => sys_semop(req.args, ctx),
         nr if nr == NR_SEMCTL => sys_semctl(req.args, ctx),
-        nr if nr == NR_SHMAT => sys_shmat(req.args, ctx),
+        nr if nr == NR_SHMAT => sys_shmat(req.args, ctx).await,
         nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
         nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx).await,
         nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
@@ -622,8 +625,8 @@ async fn dispatch_inner<
         // (`fstat` / `newfstatat` / `getdents64` / `getcwd` / `chdir`
         // / `umask`). `fchdir` returns `-ENOSYS` (carryover; OpenFile
         // has no DEntry hint to install via step_chdir).
-        nr if nr == NR_FSTAT => sys_fstat::<P>(req.args, ctx),
-        nr if nr == NR_NEWFSTATAT => sys_newfstatat::<P>(req.args, ctx).await,
+        nr if nr == NR_FSTAT => sys_fstat(req.args, ctx),
+        nr if nr == NR_NEWFSTATAT => sys_newfstatat(req.args, ctx).await,
         nr if nr == NR_GETCWD => sys_getcwd(req.args, ctx),
         nr if nr == NR_CHDIR => sys_chdir(req.args, ctx).await,
         nr if nr == NR_FCHDIR => sys_fchdir::<P>(req.args, ctx).await,

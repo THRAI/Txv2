@@ -6,22 +6,10 @@
 use super::*;
 use crate::adapter::reactor_entry;
 use crate::adapter::step_engine::Cap;
-use tx_subsystems::vfs::structure::OpenFileBacking;
 
 fn tty_readable_level(tty: &Cap<tx_subsystems::tty::structure::TtyIdentity>) -> bool {
     use tx_subsystems::tty::execution::TTY_READABLE;
     tty.input_readable.peek() & TTY_READABLE != 0
-}
-
-fn is_pagebacked_file(file: &tx_subsystems::vfs::OpenFile) -> bool {
-    matches!(
-        file.backing(),
-        OpenFileBacking::Rnode { rnode }
-            if matches!(
-                rnode.backing(),
-                tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
-            )
-    )
 }
 
 async fn wait_for_tty_readable(tty: Cap<tx_subsystems::tty::structure::TtyIdentity>) {
@@ -73,6 +61,40 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     }
 
     const IOVEC_BYTES: u64 = 16;
+    if args[0] == 1 || args[0] == 2 {
+        let mut combined = alloc::vec::Vec::new();
+        for i in 0..iovcnt as u64 {
+            let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
+            let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
+                return SyscallResult::error_from(errno);
+            }
+            let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
+            let len = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap());
+            if len == 0 {
+                continue;
+            }
+
+            let old_len = combined.len();
+            combined.resize(old_len + len as usize, 0);
+            if let Err(errno) =
+                bootstrap_copy_from_user(&ctx.aspace, &mut combined[old_len..], base)
+            {
+                return SyscallResult::error_from(errno);
+            }
+        }
+
+        let write_args = [
+            args[0],
+            combined.as_ptr() as u64,
+            combined.len() as u64,
+            0,
+            0,
+            0,
+        ];
+        return sys_write(write_args, ctx).await;
+    }
+
     let mut total: i64 = 0;
     for i in 0..iovcnt as u64 {
         let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
@@ -266,8 +288,7 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                             if tty_readable_level(tty) {
                                 revents |= POLLIN;
                             } else if park_source.is_none() {
-                                park_source =
-                                    Some((file.rnode().read_wait_source_id(), POLLIN as u64));
+                                park_source = Some((tty.wait_source_id(), POLLIN as u64));
                             }
                         } else {
                             revents |= POLLIN;
@@ -364,6 +385,7 @@ async fn sys_write_pagebacked<'a>(
     if let Some(range) = super::user_copy::covering_user_range(buf_ptr as u64, len) {
         use crate::adapter::step_engine::StepOutcome as V3;
         use tx_subsystems::vm::UserAccessKind;
+        let _guard = crate::adapter::step_engine::guard();
         match ctx
             .aspace
             .reserve_user_range_for_access(range, UserAccessKind::Read)
@@ -442,7 +464,17 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         None => return SyscallResult::Error(EBADF_VALUE),
     };
 
-    let len = if is_pagebacked_file(&file) {
+    // POSIX mq descriptors are not byte-stream fds. musl uses the
+    // mq_* syscalls directly, but raw read/write on an mqd_t should
+    // fail cleanly instead of falling into the VFS rnode path.
+    if file.posix_mq().is_some() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let len = if matches!(
+        file.rnode().backing(),
+        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
+    ) {
         len
     } else {
         core::cmp::min(len, TTY_WRITE_MAX_INLINE)
@@ -457,7 +489,10 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).
     // Prefault the user buffer in the observe phase, then drive the
     // write through the pmap without kernel-buffer staging.
-    if is_pagebacked_file(&file) {
+    if matches!(
+        file.rnode().backing(),
+        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
+    ) {
         return sys_write_pagebacked(&file, buf_ptr, len, ctx).await;
     }
 
@@ -554,6 +589,7 @@ async fn sys_read_pagebacked<'a, P: tx_hal::TimeIf>(
     if let Some(range) = super::user_copy::covering_user_range(buf_ptr as u64, len) {
         use crate::adapter::step_engine::StepOutcome as V3;
         use tx_subsystems::vm::UserAccessKind;
+        let _guard = crate::adapter::step_engine::guard();
         match ctx
             .aspace
             .reserve_user_range_for_access(range, UserAccessKind::Write)
@@ -629,6 +665,26 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         None => return SyscallResult::Error(EBADF_VALUE),
     };
 
+    // POSIX mq descriptors are not byte-stream fds. musl uses the
+    // mq_* syscalls directly, but raw read/write on an mqd_t should
+    // fail cleanly instead of falling into the VFS rnode path.
+    if file.posix_mq().is_some() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let len = if matches!(
+        file.rnode().backing(),
+        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
+    ) {
+        len
+    } else {
+        core::cmp::min(len, TTY_WRITE_MAX_INLINE)
+    };
+
+    if len == 0 {
+        return SyscallResult::Return(0);
+    }
+
     // PR-10 phase 5: userfaultfd fds carry their own `read(2)` arm
     // (drain a fault message off the pending queue, serialize 32-byte
     // `struct uffd_msg`). The VFS-shaped `OpenFile::step_read` returns
@@ -656,20 +712,13 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         return super::timerfd::sys_timerfd_read::<P>(&file, args[1], len, ctx).await;
     }
 
-    let len = if is_pagebacked_file(&file) {
-        len
-    } else {
-        core::cmp::min(len, TTY_WRITE_MAX_INLINE)
-    };
-
-    if len == 0 {
-        return SyscallResult::Return(0);
-    }
-
     // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).
     // Prefault the user buffer in the observe phase, then drive the
     // read through the pmap without kernel-buffer staging.
-    if is_pagebacked_file(&file) {
+    if matches!(
+        file.rnode().backing(),
+        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
+    ) {
         return sys_read_pagebacked::<P>(&file, buf_ptr, len, ctx).await;
     }
 

@@ -2,21 +2,22 @@
 //!
 //! Each test exercises one `*Op` wrap end-to-end: build the op with
 //! a fixture, drive `.step(&mut ScriptCtx)`, assert the outcome
-//! variant shape. Coverage of the underlying step-fn semantics
-//! lives in `process::tests`; the value here is the compile-check
-//! plus a smoke that the wrap delegates with the expected arg
-//! plumbing.
+//! variant shape. Coverage of the underlying step-fn semantics lives
+//! in `process::tests`; the value here is the compile-check plus a
+//! smoke that the wrap delegates with the expected argument plumbing.
+
 use super::*;
+
 use crate::process::adapter::step_engine::{
     PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
 };
-
 use crate::process::structure::reset_pid_counter_for_test;
 use crate::signal::Signum;
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::structure::reset_tid_counter_for_test;
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
+
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tx_test_support::init_host();
@@ -115,7 +116,6 @@ fn getcwd_op_returns_none_for_init_without_cwd() {
     let mut op = GetcwdOp { target: &parent };
     let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
     let outcome = op.step(&mut ctx);
-    // init bootstrap leaves cwd unset, so step_getcwd returns None.
     assert_eq!(outcome, StepOutcome::Done(None));
 }
 
@@ -123,9 +123,6 @@ fn getcwd_op_returns_none_for_init_without_cwd() {
 fn setpgid_op_unimplemented_for_non_self_pgid() {
     let _g = setup();
     let parent = bootstrap();
-    // Day-1 only supports new_pgid == target.pid; anything else
-    // returns SetpgidError::Unimplemented. Use a value that is
-    // not the target's pid to exercise that arm deterministically.
     let bogus = Pgid(parent.pid.0 + 999);
     let mut op = SetpgidOp {
         target: &parent,
@@ -137,7 +134,7 @@ fn setpgid_op_unimplemented_for_non_self_pgid() {
         StepOutcome::Err(v3_errno)
             if Into::<crate::execution::Errno>::into(v3_errno)
                 == crate::execution::Errno::ENOSYS => {}
-        other => panic!("expected Err(crate::execution::Errno::ENOSYS), got {other:?}"),
+        other => panic!("expected Err(ENOSYS), got {other:?}"),
     }
 }
 
@@ -150,10 +147,8 @@ fn setsid_op_delegates_to_step_setsid() {
     let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
     let outcome = op.step(&mut ctx);
     match outcome {
-        StepOutcome::Done(sid) => {
-            assert_eq!(sid.0, child.pid.0);
-        }
-        other => panic!("expected Done(Ok(sid)), got {other:?}"),
+        StepOutcome::Done(sid) => assert_eq!(sid.0, child.pid.0),
+        other => panic!("expected Done(sid), got {other:?}"),
     }
 }
 
@@ -165,7 +160,6 @@ fn close_cloexec_fds_op_is_noop_with_empty_set() {
     let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
     let outcome = op.step(&mut ctx);
     assert_eq!(outcome, StepOutcome::Done(()));
-    // Bootstrap leaves the CLOEXEC set empty; post-call it stays empty.
     assert!(parent.fd_cloexec_snapshot().is_empty());
 }
 
@@ -191,16 +185,6 @@ fn install_brk_for_exec_op_seeds_brk_base_and_current() {
     let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
     let outcome = op.step(&mut ctx);
     assert_eq!(outcome, StepOutcome::Done(()));
-    let payload_guard = parent.payload.lock();
-    let payload = payload_guard.as_ref().expect("init payload live");
-    assert_eq!(
-        payload.brk_base.load(core::sync::atomic::Ordering::Acquire),
-        new_base
-    );
-    assert_eq!(
-        payload
-            .current_brk
-            .load(core::sync::atomic::Ordering::Acquire),
-        new_base
-    );
+    assert_eq!(parent.brk_base(), new_base);
+    assert_eq!(parent.current_brk(), new_base);
 }

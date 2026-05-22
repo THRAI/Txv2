@@ -6,11 +6,11 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine};
 
-/// musl/Linux generic LP64 `struct rusage` byte size:
-/// two `timeval`s, fourteen `long` counters, and sixteen reserved
-/// `long`s. txKernel does not track usage counters yet, so wait4
-/// writes a zeroed image when callers request it.
-const RUSAGE_BYTES: usize = 256;
+/// Linux raw `wait4`/`getrusage` rusage image for musl LP64:
+/// two `timeval`s plus fourteen `long` counters. musl passes the
+/// syscall a pointer adjusted to this 144-byte prefix and keeps the
+/// public `struct rusage` reserved tail in libc-owned memory.
+const RUSAGE_BYTES: usize = 144;
 
 /// `exit(status)` — per-thread exit per `PROCESS_v1` §7.3.1.
 ///
@@ -102,7 +102,7 @@ pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 // PR-9 phase 3b: StepOp-driven via ExecOp (10-phase state
 // machine).  Async operations yield; the drive loop parks on I/O.
 // Remaining synchronous phases return Continue.
-pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf + tx_hal::ConsoleIf>(
+pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -499,8 +499,10 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
 ///
 /// ## rusage
 ///
-/// A non-NULL `rusage` pointer receives a zero-filled musl/Linux LP64
-/// `struct rusage`. txKernel doesn't track per-process resource usage
+/// A non-NULL `rusage` pointer receives a zero-filled Linux raw LP64
+/// `rusage` prefix: two `timeval`s plus fourteen `long` counters
+/// (144 bytes). musl keeps the public `struct rusage` reserved tail in
+/// libc-owned memory. txKernel doesn't track per-process resource usage
 /// today; `TODO(phase-rusage)` populates the counters once accounting
 /// state lands.
 ///
@@ -513,15 +515,11 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
 ///
 /// ## Blocking shape
 ///
-/// The loop pattern matches `sys_read` / `vm::execution::fault_script`:
-/// each iteration calls the synchronous `step_waitpid_nohang` walker
-/// (no guard parameter — it takes its own snapshot internally). On
-/// `Err(WaitError::NoneReady)` without `WNOHANG`, build a `WaitToken`
-/// from `ctx.process.exit_source_wait_token()` and `wait_source::wait_on_token`
-/// it. Post-wake, loop and re-poll: a third party may have reaped the
-/// same zombie (e.g. another wait4 caller in the same process; or the
-/// shared `INIT_PROCESS` reaper if init wakes first), so the second
-/// poll may still return `NoneReady` — re-park.
+/// The blocking path drives `WaitpidNohangOp` through the v3 StepOp
+/// loop. On `Err(WaitError::NoneReady)` the op yields on the parent's
+/// exit source; child exit fires that source, and the loop re-runs the
+/// synchronous walker. Post-wake re-polling is still required because
+/// another waiter may have consumed the same zombie.
 ///
 /// Cites: `txdoc:PROCESS-WAIT-FAMILY-1`
 /// (`docs/design/04_process-signals/PROCESS_v1.md` §7.4).
@@ -569,9 +567,9 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     }
 
     // Blocking wait: drive WaitpidNohangOp through the v3 StepOp loop.
-    // The op yields on NoneReady via YieldShape::OnWaitSource;
-    // the drive loop parks the parent task, child exit fires the
-    // source, and step() is re-called on wake.
+    // The op yields on NoneReady via YieldShape::OnWaitSource; the
+    // drive loop parks the parent task, child exit fires the source,
+    // and step() is re-called on wake.
     use step_engine::{StepOp, StepOutcome as V3Out, YieldShape};
     use tx_subsystems::process::execution::WaitpidNohangOp;
     let mut op = WaitpidNohangOp {
@@ -771,6 +769,76 @@ pub(super) fn sys_set_robust_list<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         *payload.robust_list_len.lock() = len;
     }
     SyscallResult::Return(0)
+}
+
+fn affinity_tid_arg(pid_arg: u64, ctx: &SyscallCtx<'_>) -> Result<u32, SyscallResult> {
+    if pid_arg == 0 {
+        return Ok(ctx.thread.tid.0);
+    }
+    u32::try_from(pid_arg).map_err(|_| SyscallResult::Error(ESRCH_VALUE))
+}
+
+fn affinity_error_to_syscall(
+    err: tx_subsystems::reactor_affinity::ReactorAffinityError,
+) -> SyscallResult {
+    use tx_subsystems::reactor_affinity::ReactorAffinityError as E;
+    match err {
+        E::InvalidMask => SyscallResult::Error(EINVAL_VALUE),
+        E::NoSuchThread => SyscallResult::Error(ESRCH_VALUE),
+        E::NotInstalled => SyscallResult::Error(ENOSYS_VALUE),
+    }
+}
+
+/// `sched_setaffinity(pid, cpusetsize, mask)`.
+///
+/// v1 supports the single-`u64` CPU mask shape used by txKernel's HAL
+/// `CpuMask`. `pid == 0` targets the calling thread; otherwise the numeric
+/// pid is interpreted as a tid, matching Linux's per-thread affinity ABI.
+pub(super) fn sys_sched_setaffinity<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let tid = match affinity_tid_arg(args[0], ctx) {
+        Ok(tid) => tid,
+        Err(err) => return err,
+    };
+    let cpusetsize = args[1] as usize;
+    let mask_ptr = args[2];
+    if cpusetsize < core::mem::size_of::<u64>() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if mask_ptr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let mask = match bootstrap_read_user::<u64>(&ctx.aspace, mask_ptr) {
+        Ok(mask) => mask,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    match tx_subsystems::reactor_affinity::set_thread_affinity(tid, mask) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(err) => affinity_error_to_syscall(err),
+    }
+}
+
+/// `sched_getaffinity(pid, cpusetsize, mask)`.
+pub(super) fn sys_sched_getaffinity<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let tid = match affinity_tid_arg(args[0], ctx) {
+        Ok(tid) => tid,
+        Err(err) => return err,
+    };
+    let cpusetsize = args[1] as usize;
+    let mask_ptr = args[2];
+    if cpusetsize < core::mem::size_of::<u64>() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if mask_ptr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let mask = match tx_subsystems::reactor_affinity::get_thread_affinity(tid) {
+        Ok(mask) => mask,
+        Err(err) => return affinity_error_to_syscall(err),
+    };
+    match bootstrap_write_user::<u64>(&ctx.aspace, mask_ptr, mask) {
+        Ok(()) => SyscallResult::Return(core::mem::size_of::<u64>() as i64),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
 }
 
 // =====================================================================

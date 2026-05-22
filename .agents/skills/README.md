@@ -29,6 +29,9 @@ Current orientation skills:
 - `tx-implementation-readiness` audits whether a doc area is ready to implement
   from.
 - `tx-meta-alignment` covers edits under `docs/design/00_meta-framework/`.
+- `tx-oscomp-musl-debug` captures the named-worktree OSComp/LTP musl debugging
+  workflow, including tailored sdcard/QEMU runs, fault/trap tools, focused host
+  reductions, merge catch-up, and progress recording.
 - `tx-process-threadruntime` covers Process, ThreadRuntime, signal, syscall,
   exec, first-userspace, and runtime integration seams.
 - `tx-progress-memory` records or resumes durable decisions, plans, handoffs,

@@ -120,6 +120,10 @@ static LAST_USERSPACE_CTX: Mutex<Option<tx_hal::UserTrapContext>> = Mutex::new(N
 /// per-iteration `run_thread` invocations that the smoke chains.
 static USERSPACE_A0_LOG: Mutex<std::vec::Vec<usize>> = Mutex::new(std::vec::Vec::new());
 
+/// Test hook: when non-zero, the simulator marks the active userspace-run
+/// request as timer-preempted before returning from `enter_userspace_*`.
+static USERSPACE_PREEMPT_ON_ENTER: AtomicUsize = AtomicUsize::new(0);
+
 impl tx_hal::TrapIf for TestPlatform {
     /// Inverted-loop simulator: stand in for a real `sret` into
     /// userspace.
@@ -154,6 +158,23 @@ impl tx_hal::TrapIf for TestPlatform {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(ctx.regs[10]);
+        if USERSPACE_PREEMPT_ON_ENTER
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            let payload = tx_subsystems::thread_runtime::current_thread_payload(0)
+                .expect("userspace-entry test hook runs inside PerHartSlotted poll");
+            let active = payload
+                .active_userspace_request()
+                .expect("userspace-entry test hook sees the active request token");
+            payload.store_saved_user_context(Some(*ctx));
+            payload
+                .userspace_slot()
+                .record_timer_preemption(active)
+                .expect("active userspace request is running at entry hook");
+        }
     }
 }
 impl tx_hal::SignalFrameIf for TestPlatform {}
@@ -260,6 +281,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    USERSPACE_PREEMPT_ON_ENTER.store(0, Ordering::Release);
     guard
 }
 
@@ -783,6 +805,103 @@ fn boot_smoke_production_userspace_loop_writes_console_then_exits() {
          baseline (a0=0) and post-write merged (a0=3); exit_group's \
          NoReturn short-circuits before a third dive",
     );
+
+    drop(boxed);
+    let _ = tx_subsystems::thread_runtime::clear_current_thread_payload(0);
+}
+
+#[test]
+fn run_thread_timer_preempt_yields_and_reenters_without_resolving_wait() {
+    use crate::adapter::boot_runtime::userspace::{
+        SyscallRequest, UserspaceRunPhase, UserspaceTrapInfo,
+    };
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, Waker};
+    use tx_shims::linux_syscall::NR_EXIT_GROUP;
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let leader = init
+        .nth_thread(0)
+        .expect("init has a leader thread post-bootstrap");
+    let payload = leader
+        .payload_cap()
+        .expect("leader payload must be alive before exit");
+
+    payload.store_saved_user_context(Some(tx_hal::UserTrapContext {
+        regs: [0; 32],
+        pc: 0,
+        status: 0,
+        fp: tx_hal::UserFpContext::empty(),
+    }));
+
+    USERSPACE_PREEMPT_ON_ENTER.store(1, Ordering::Release);
+
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let future = crate::thread_future::run_thread::<TestPlatform>(leader.clone(), payload.clone());
+    let wrapped =
+        crate::thread_future::PerHartSlotted::<TestPlatform, _>::new(payload.clone(), future);
+    let mut boxed = std::boxed::Box::new(wrapped);
+    // SAFETY: `boxed` is owned for the duration of this test and is not moved
+    // after pinning.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut *boxed) };
+
+    match pinned.as_mut().poll(&mut cx) {
+        Poll::Pending => {}
+        Poll::Ready(()) => panic!("preempted first entry must yield, not complete"),
+    }
+    assert!(
+        payload.active_userspace_request().is_none(),
+        "timer preemption must cancel the entry-side wait instead of leaving it unresolved",
+    );
+    assert!(
+        payload.userspace_slot().is_idle(),
+        "timer-preempted userspace wait must be cleared before the yield boundary",
+    );
+
+    match pinned.as_mut().poll(&mut cx) {
+        Poll::Pending => {}
+        Poll::Ready(()) => panic!("second entry should park awaiting the next real trap"),
+    }
+    let active = payload
+        .active_userspace_request()
+        .expect("second entry publishes a fresh active userspace request");
+    let status = payload
+        .userspace_slot()
+        .status_for_request(active)
+        .expect("fresh request must still be active");
+    assert_eq!(
+        status.phase,
+        UserspaceRunPhase::Running,
+        "second entry re-dispatches userspace instead of awaiting the preempted wait",
+    );
+
+    let log = USERSPACE_A0_LOG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(
+        log,
+        std::vec![0usize, 0usize],
+        "preempted userspace entry should be retried from the saved context",
+    );
+
+    let exit_trap =
+        UserspaceTrapInfo::Syscall(SyscallRequest::new(NR_EXIT_GROUP, [0, 0, 0, 0, 0, 0]));
+    payload
+        .userspace_slot()
+        .complete_interesting_trap(active, exit_trap)
+        .expect("complete_interesting_trap on the retried request");
+
+    match pinned.as_mut().poll(&mut cx) {
+        Poll::Ready(()) => {}
+        Poll::Pending => panic!("exit_group after retry should complete the thread future"),
+    }
 
     drop(boxed);
     let _ = tx_subsystems::thread_runtime::clear_current_thread_payload(0);

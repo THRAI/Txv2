@@ -18,16 +18,13 @@ pub fn require_can_read_shm(segment: &ShmSegmentIdentity, cred: &Cred) -> Result
         return Ok(());
     }
     let uid = segment.uid();
-    let cuid = segment.cuid;
     let gid = segment.gid();
-    let cgid = segment.cgid;
     let perm = segment.perm();
-
-    if cred.euid.0 == uid || cred.euid.0 == cuid {
+    if cred.euid.0 == uid || cred.euid.0 == segment.cuid {
         if perm.owner_read() {
             return Ok(());
         }
-    } else if cred.egid.0 == gid || cred.egid.0 == cgid {
+    } else if cred.egid.0 == gid || cred.egid.0 == segment.cgid {
         if perm.group_read() {
             return Ok(());
         }
@@ -43,16 +40,13 @@ pub fn require_can_write_shm(segment: &ShmSegmentIdentity, cred: &Cred) -> Resul
         return Ok(());
     }
     let uid = segment.uid();
-    let cuid = segment.cuid;
     let gid = segment.gid();
-    let cgid = segment.cgid;
     let perm = segment.perm();
-
-    if cred.euid.0 == uid || cred.euid.0 == cuid {
+    if cred.euid.0 == uid || cred.euid.0 == segment.cuid {
         if perm.owner_write() {
             return Ok(());
         }
-    } else if cred.egid.0 == gid || cred.egid.0 == cgid {
+    } else if cred.egid.0 == gid || cred.egid.0 == segment.cgid {
         if perm.group_write() {
             return Ok(());
         }

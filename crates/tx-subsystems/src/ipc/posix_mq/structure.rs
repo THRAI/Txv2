@@ -6,11 +6,13 @@
 //! Day-1 single-namespace: a global `MQ_NAME_TABLE` maps name → msqid.
 
 use alloc::collections::BTreeMap;
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::ipc::sysv_shm::structure::IpcPerm;
-use crate::process::adapter::step_engine::{Cap, SpinMutex, Zone, ZoneAllocated, ZoneError};
+use crate::process::adapter::step_engine::{
+    sign, Cap, SpinMutex, Weak, Zone, ZoneAllocated, ZoneError,
+};
 use crate::process::nsproxy::PosixMqName;
+use crate::process::structure::ProcessIdentity;
 
 // ---------------------------------------------------------------------------
 // PosixMqIdentity / PosixMqInstance
@@ -22,13 +24,46 @@ pub struct PosixMqIdentity {
     pub cred: Cap<crate::cred::Cred>,
     pub perm: IpcPerm,
     pub msqid: u32,
+    pub maxmsg: i64,
+    pub msgsize: i64,
+    pub notify: SpinMutex<Option<MqNotification>>,
 }
 
 /// POSIX message queue open-instance — an fd-shaped wrapper.
 pub struct PosixMqInstance {
-    pub msqid: u32,
-    pub flags: i32,
-    pub notify_signal: SpinMutex<Option<crate::signal::Signum>>,
+    pub identity: Cap<PosixMqIdentity>,
+    pub flags: SpinMutex<i64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum MqNotification {
+    None,
+    Signal {
+        signum: crate::signal::Signum,
+        owner: Weak<ProcessIdentity>,
+    },
+}
+
+impl PosixMqInstance {
+    pub fn msqid(&self) -> u32 {
+        self.identity.msqid
+    }
+
+    pub fn maxmsg(&self) -> i64 {
+        self.identity.maxmsg
+    }
+
+    pub fn msgsize(&self) -> i64 {
+        self.identity.msgsize
+    }
+
+    pub fn flags(&self) -> i64 {
+        *self.flags.lock()
+    }
+
+    pub fn set_flags(&self, flags: i64) {
+        *self.flags.lock() = flags;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -37,11 +72,6 @@ pub struct PosixMqInstance {
 
 static MQ_NAME_TABLE: SpinMutex<BTreeMap<PosixMqName, Cap<PosixMqIdentity>>> =
     SpinMutex::new(BTreeMap::new());
-
-static MQ_INSTANCE_TABLE: SpinMutex<BTreeMap<u32, Cap<PosixMqInstance>>> =
-    SpinMutex::new(BTreeMap::new());
-
-static NEXT_MQFD: AtomicU32 = AtomicU32::new(1);
 
 // ---------------------------------------------------------------------------
 // Zone registration
@@ -82,38 +112,32 @@ pub(crate) fn register_mq(
     cred: Cap<crate::cred::Cred>,
     perm: IpcPerm,
     msqid: u32,
-) -> Result<(), ZoneError> {
-    use crate::process::adapter::step_engine::sign;
+    maxmsg: i64,
+    msgsize: i64,
+) -> Result<Cap<PosixMqIdentity>, ZoneError> {
     let identity = sign(PosixMqIdentity {
         name: name.clone(),
         cred,
         perm,
         msqid,
+        maxmsg,
+        msgsize,
+        notify: SpinMutex::new(None),
     })?;
-    MQ_NAME_TABLE.lock().insert(name, identity);
-    Ok(())
+    MQ_NAME_TABLE.lock().insert(name, identity.clone());
+    Ok(identity)
 }
 
 pub(crate) fn unlink_mq(name: &PosixMqName) -> bool {
     MQ_NAME_TABLE.lock().remove(name).is_some()
 }
 
-pub(crate) fn alloc_mqfd(msqid: u32, flags: i32) -> Result<u32, ZoneError> {
-    use crate::process::adapter::step_engine::sign;
-    let fd = NEXT_MQFD.fetch_add(1, Ordering::Relaxed);
-    let instance = sign(PosixMqInstance {
-        msqid,
-        flags,
-        notify_signal: SpinMutex::new(None),
-    })?;
-    MQ_INSTANCE_TABLE.lock().insert(fd, instance);
-    Ok(fd)
-}
-
-pub(crate) fn lookup_instance(mqfd: u32) -> Option<Cap<PosixMqInstance>> {
-    MQ_INSTANCE_TABLE.lock().get(&mqfd).cloned()
-}
-
-pub(crate) fn close_instance(mqfd: u32) {
-    MQ_INSTANCE_TABLE.lock().remove(&mqfd);
+pub(crate) fn open_instance(
+    identity: Cap<PosixMqIdentity>,
+    flags: i64,
+) -> Result<Cap<PosixMqInstance>, ZoneError> {
+    sign(PosixMqInstance {
+        identity,
+        flags: SpinMutex::new(flags),
+    })
 }

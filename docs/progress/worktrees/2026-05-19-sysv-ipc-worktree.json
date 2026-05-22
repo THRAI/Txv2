@@ -2,8 +2,8 @@
   "schema": "tx.progress.worktree.v1",
   "id": "2026-05-19-sysv-ipc-worktree",
   "created": "2026-05-19",
-  "updated": "2026-05-19",
-  "status": "merged",
+  "updated": "2026-05-22",
+  "status": "closed",
   "branch": "codex/sysv-ipc-implementation",
   "path": "/Users/3y/Downloads/Tx/.claude/worktrees/sysv-ipc-20260519",
   "base": "main",
@@ -26,7 +26,11 @@
   ],
   "verification": [
     "cargo xtask check: PASS",
-    "QEMU rv64-qemu smoke test: 14/16 passing"
+    "QEMU rv64-qemu smoke test: 14/16 passing (stale before later shm PageBacked/RMID fixes)",
+    "cargo test -p tx-subsystems --lib ipc::sysv_shm::tests -- --nocapture: PASS",
+    "cargo test -p tx-shims --lib linux_syscall::tests::ipc_dispatch -- --nocapture: PASS",
+    "cargo check -p tx-shims -p tx-subsystems: PASS",
+    "cargo fmt --check: PASS"
   ],
-  "notes": "SysV + POSIX IPC implementation per docs/Txv3/08_SYSV_IPC_v1.md. All 6 phases complete. Compilation verified across all targets. QEMU runtime verified with 14/16 test cases passing. Remaining: semop copy_from_user, shmat VM integration."
+  "notes": "SysV + POSIX IPC implementation per docs/Txv3/08_SYSV_IPC_v1.md. The current ipc/musl worktree has progressed beyond the original closed record: SysV shm now maps PageBacked segments through shmat/shmdt, sweeps attaches on process exit, keeps removed-but-attached segments detachable after IPC_RMID, reclaims on last detach, and withdraws keyed namespace bindings so shmget can recreate the key. Fresh focused host verification passes; rerun guest IPC smoke before claiming runtime-complete."
 }
