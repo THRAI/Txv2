@@ -74,6 +74,7 @@ pub struct InitialSchedMeta {
     pub userspace_thread: bool,
     pub migration: MigrationPolicy,
     pub spread_on_submit: bool,
+    pub preempted_on_submit: bool,
 }
 
 impl InitialSchedMeta {
@@ -87,6 +88,7 @@ impl InitialSchedMeta {
             userspace_thread: false,
             migration: MigrationPolicy::Movable,
             spread_on_submit: false,
+            preempted_on_submit: false,
         }
     }
 
@@ -100,6 +102,7 @@ impl InitialSchedMeta {
             userspace_thread: false,
             migration: MigrationPolicy::Pinned,
             spread_on_submit: false,
+            preempted_on_submit: false,
         }
     }
 
@@ -126,6 +129,11 @@ impl InitialSchedMeta {
 
     pub const fn spread_on_submit(mut self) -> Self {
         self.spread_on_submit = true;
+        self
+    }
+
+    pub const fn preempted_on_submit(mut self) -> Self {
+        self.preempted_on_submit = true;
         self
     }
 }
@@ -462,6 +470,8 @@ impl Phase1Scheduler {
             .unwrap_or_else(|| first_hart_in_mask(normalize_affinity(initial_meta.affinity)));
         let queue = if initial_meta.kernel_only {
             Phase1QueueKind::Kernel
+        } else if initial_meta.preempted_on_submit {
+            Phase1QueueKind::Preempted
         } else {
             Phase1QueueKind::New
         };
@@ -532,7 +542,10 @@ impl Phase1Scheduler {
         let local = self.compat_local(hart)? as *const HartSchedulerLocal;
         let local_count = self.compat_locals.len();
         let depths: Vec<usize> = (0..local_count)
-            .map(|victim| self.queue_depths(HartId(victim)).preempted)
+            .map(|victim| {
+                let depths = self.queue_depths(HartId(victim));
+                depths.new + depths.preempted
+            })
             .collect();
         let victim = self.rebalance_victim_from_locals(
             hart,
@@ -574,7 +587,8 @@ impl Phase1Scheduler {
             if victim == thief {
                 continue;
             }
-            let depth = self.queue_depths(victim).preempted;
+            let depths = self.queue_depths(victim);
+            let depth = depths.new + depths.preempted;
             if depth > best_depth {
                 best = Some(victim);
                 best_depth = depth;
@@ -597,7 +611,8 @@ impl Phase1Scheduler {
         }
         local.last_balance_ns.store(now_ns, Ordering::Release);
 
-        let local_depth = self.queue_depths_from_local(local).preempted;
+        let local_depths = self.queue_depths_from_local(local);
+        let local_depth = local_depths.new + local_depths.preempted;
         let mut best_victim = None;
         let mut best_depth = local_depth;
         for victim_index in 0..local_count {
@@ -726,6 +741,8 @@ impl Phase1Scheduler {
             .unwrap_or_else(|| first_hart_in_mask(normalize_affinity(initial_meta.affinity)));
         let queue = if initial_meta.kernel_only {
             Phase1QueueKind::Kernel
+        } else if initial_meta.preempted_on_submit {
+            Phase1QueueKind::Preempted
         } else {
             Phase1QueueKind::New
         };
@@ -861,56 +878,66 @@ impl Phase1Scheduler {
         let mut rejected = Vec::new();
         let mut stolen = None;
 
-        for _ in 0..Self::STEAL_SCAN_LIMIT {
-            let task = {
-                let mut queues = Self::lock_queues_from_local(victim_local);
-                queues.preempted_queue.pop_back()
-            };
-            let Some(task) = task else {
-                break;
-            };
-
-            let Some((reject_still_queued, stolen_handle)) =
-                self.shared.with_meta_mut(task, |meta| {
-                    let eligible = meta.can_migrate
-                        && !meta.kernel_only
-                        && !meta.recently_stolen
-                        && hart_allowed(meta.affinity, thief)
-                        && meta.is_queued_on(victim, Phase1QueueKind::Preempted);
-                    if !eligible {
-                        return (meta.is_queued_on(victim, Phase1QueueKind::Preempted), None);
+        for queue in [Phase1QueueKind::Preempted, Phase1QueueKind::New] {
+            for _ in 0..Self::STEAL_SCAN_LIMIT {
+                let task = {
+                    let mut queues = Self::lock_queues_from_local(victim_local);
+                    match queue {
+                        Phase1QueueKind::Kernel => None,
+                        Phase1QueueKind::New => queues.new_queue.pop_back(),
+                        Phase1QueueKind::Preempted => queues.preempted_queue.pop_back(),
                     }
+                };
+                let Some(task) = task else {
+                    break;
+                };
 
-                    meta.owner = TaskRunOwner::Queued {
-                        hart: thief,
-                        queue: Phase1QueueKind::Preempted,
-                    };
-                    meta.last_hart = Some(thief);
-                    meta.recently_stolen = true;
-                    (false, Some(meta.handle))
-                })
-            else {
-                continue;
-            };
-            if reject_still_queued {
-                rejected.push(task);
-                continue;
+                let Some((reject_still_queued, stolen_handle)) =
+                    self.shared.with_meta_mut(task, |meta| {
+                        let eligible = meta.can_migrate
+                            && !meta.kernel_only
+                            && !meta.recently_stolen
+                            && hart_allowed(meta.affinity, thief)
+                            && meta.is_queued_on(victim, queue);
+                        if !eligible {
+                            return (meta.is_queued_on(victim, queue), None);
+                        }
+
+                        meta.owner = TaskRunOwner::Queued { hart: thief, queue };
+                        meta.last_hart = Some(thief);
+                        meta.recently_stolen = true;
+                        (false, Some(meta.handle))
+                    })
+                else {
+                    continue;
+                };
+                if reject_still_queued {
+                    rejected.push((task, queue));
+                    continue;
+                }
+                if let Some(handle) = stolen_handle {
+                    stolen = Some((task, handle, queue));
+                    break;
+                }
             }
-            if let Some(handle) = stolen_handle {
-                stolen = Some((task, handle));
+            if stolen.is_some() {
                 break;
             }
         }
 
         if !rejected.is_empty() {
             let mut victim_local = Self::lock_queues_from_local(victim_local);
-            for task in rejected.into_iter().rev() {
-                victim_local.preempted_queue.push_back(task);
+            for (task, queue) in rejected.into_iter().rev() {
+                match queue {
+                    Phase1QueueKind::Kernel => {}
+                    Phase1QueueKind::New => victim_local.new_queue.push_back(task),
+                    Phase1QueueKind::Preempted => victim_local.preempted_queue.push_back(task),
+                }
             }
         }
 
-        let (task, handle) = stolen?;
-        Self::push_to_local_queue(thief_local, task, Phase1QueueKind::Preempted, true);
+        let (task, handle, queue) = stolen?;
+        Self::push_to_local_queue(thief_local, task, queue, true);
         Self::mark_need_resched_local(thief_local);
         self.shared.record_work_steal();
         Some(handle)
@@ -923,8 +950,9 @@ impl Phase1Scheduler {
         queue: &VecDeque<TaskId>,
         slice: SliceConfig,
     ) -> Option<(TaskHandle, SliceConfig)> {
+        let meta_table = self.shared.meta.lock();
         queue.iter().find_map(|task| {
-            let meta = self.shared.meta_for(*task)?;
+            let meta = meta_table.get(task.0)?.as_ref()?;
             meta.is_queued_on(hart, queue_kind)
                 .then_some((meta.handle, slice))
         })
@@ -935,8 +963,9 @@ impl Phase1Scheduler {
         hart: HartId,
         queue: &VecDeque<TaskId>,
     ) -> Option<(TaskHandle, SliceConfig)> {
+        let meta_table = self.shared.meta.lock();
         queue.iter().find_map(|task| {
-            let meta = self.shared.meta_for(*task)?;
+            let meta = meta_table.get(task.0)?.as_ref()?;
             if !meta.is_queued_on(hart, Phase1QueueKind::Preempted) {
                 return None;
             }
@@ -1292,7 +1321,11 @@ impl Phase1Scheduler {
                 }
                 StopReason::UserspaceTrap => {
                     meta.owner = TaskRunOwner::Parked;
-                    requeue = Some((Phase1QueueKind::Preempted, meta.remaining_budget_ns > 0));
+                    requeue = Some(if meta.userspace_thread {
+                        (Phase1QueueKind::New, true)
+                    } else {
+                        (Phase1QueueKind::Preempted, meta.remaining_budget_ns > 0)
+                    });
                 }
                 StopReason::PreemptedExternal => {
                     meta.owner = TaskRunOwner::Parked;

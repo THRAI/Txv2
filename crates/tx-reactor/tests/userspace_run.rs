@@ -42,6 +42,10 @@ fn fatal_trap(cause: u64) -> UserspaceTrapInfo {
     UserspaceTrapInfo::Fatal(FatalTrapInfo::new(cause, 0xfeed))
 }
 
+fn preempted_trap() -> UserspaceTrapInfo {
+    UserspaceTrapInfo::Preempted
+}
+
 #[test]
 fn userspace_run_wait_stays_pending_until_interesting_trap() {
     let slot = UserspaceRunSlot::new();
@@ -288,6 +292,32 @@ fn timer_preemption_does_not_consume_pending_entry_ast() {
         Err(UserspaceRunError::AlreadyResolved(request))
     );
     assert_eq!(ast.pending(), &[AstMarker::Drain]);
+}
+
+#[test]
+fn timer_preemption_can_resolve_for_cooperative_reactor_yield() {
+    let slot = UserspaceRunSlot::new();
+    let mut wait = slot.start_request().expect("start userspace wait");
+    let request = wait.request();
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let waker = counting_waker(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending);
+    assert_eq!(
+        slot.dispatch(request).expect("dispatch userspace").phase,
+        UserspaceRunPhase::Running
+    );
+
+    let trap = preempted_trap();
+    let resolved = slot
+        .complete_interesting_trap(request, trap)
+        .expect("timer preemption resolves userspace wait");
+    assert_eq!(resolved.phase, UserspaceRunPhase::Resolved);
+    assert_eq!(resolved.trap, Some(trap));
+    assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(trap));
+    assert_eq!(slot.status(), None);
 }
 
 #[test]

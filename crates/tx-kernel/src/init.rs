@@ -44,6 +44,7 @@ static BOOT_REACTOR: boot_runtime::SharedReactor = boot_runtime::SharedReactor::
 /// the concurrent poll path on all harts.
 pub(super) static USE_CONCURRENT_POLL: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+static CONSOLE_WRITE_LOCK: SpinMutex<()> = SpinMutex::new(());
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 
@@ -152,6 +153,7 @@ impl<P: TxPlatform> CharDeviceOps for ConsoleCharOps<P> {
         // `P::write_bytes` under the hood. We bypass the str
         // adapter so non-UTF-8 bytes (e.g., raw control sequences)
         // round-trip unchanged.
+        let _console_write_guard = CONSOLE_WRITE_LOCK.lock();
         <P as tx_hal::ConsoleIf>::write_bytes(bytes);
         StepOutcome::Done(bytes.len())
     }
@@ -1386,12 +1388,18 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn run_secondary_reactor_once(cpu_id: CpuId) -> bool {
-        if USE_CONCURRENT_POLL.load(core::sync::atomic::Ordering::Relaxed) {
+        let step = if USE_CONCURRENT_POLL.load(core::sync::atomic::Ordering::Relaxed) {
             Self::step_boot_reactor_once_concurrent(cpu_id)
         } else {
             Self::step_boot_reactor_once(cpu_id)
-        }
-        .is_some_and(|step| !step.should_idle())
+        };
+
+        // A userspace task polled on this AP may fork while the reactor
+        // poll lease is active. sys_clone defers child submission in that
+        // case; make those children visible before the AP decides to WFI.
+        let submitted_child = Self::drain_pending_child_submits();
+
+        submitted_child || step.is_some_and(|step| !step.should_idle())
     }
 
     fn step_boot_reactor_once(cpu_id: CpuId) -> Option<boot_runtime::hart_loop::HartLoopStep> {
@@ -1482,18 +1490,19 @@ impl<P: TxPlatform> CoreInit<P> {
         CpuMask::single(cpu_id).bits()
     }
 
-    fn userspace_thread_sched_meta() -> boot_runtime::InitialSchedMeta {
-        let affinity = P::online_cpus().bits();
-        let affinity = if affinity == 0 {
-            CpuMask::single(<P as tx_hal::SmpIf>::current_cpu_id()).bits()
-        } else {
-            affinity
-        };
+    fn userspace_thread_sched_meta_for(cpu_id: CpuId) -> boot_runtime::InitialSchedMeta {
+        // Userspace trap/return state still has hart-local architectural
+        // coupling. Keep OSComp user threads on the submit hart until the
+        // userspace context handoff is fully migration-safe.
+        let affinity = Self::cpu_bit(cpu_id);
         boot_runtime::InitialSchedMeta::fair()
             .with_affinity(affinity)
-            .movable()
+            .pinned()
             .userspace_thread()
-            .spread_on_submit()
+    }
+
+    fn userspace_thread_sched_meta() -> boot_runtime::InitialSchedMeta {
+        Self::userspace_thread_sched_meta_for(<P as tx_hal::SmpIf>::current_cpu_id())
     }
 
     fn run_zone_smoke() {
@@ -1666,7 +1675,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // would deadlock that same spin lock. Defer the submit to a
         // separate pending-queue that the BSP reactor loop drains
         // between iterations (outside the inner lock).
-        Self::queue_pending_child_submit(child_thread);
+        Self::queue_pending_child_submit(<P as tx_hal::SmpIf>::current_cpu_id(), child_thread);
     }
 
     fn register_thread_reactor_task(tid: u32, task: boot_runtime::TaskKey) {
@@ -1725,27 +1734,32 @@ impl<P: TxPlatform> CoreInit<P> {
     /// caller. Drained by `drain_pending_child_submits` between
     /// reactor steps.
     fn queue_pending_child_submit(
+        submit_cpu: CpuId,
         child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
     ) {
-        PENDING_CHILD_SUBMITS.lock().push(child_thread);
+        PENDING_CHILD_SUBMITS.lock().push(PendingChildSubmit {
+            submit_cpu,
+            child_thread,
+        });
     }
 
     /// Drain the deferred-submit queue, building the task future for
     /// each pending child and submitting it through `BOOT_REACTOR`.
     /// Safe to call from the BSP loop because no syscall task is
     /// being polled at this point (the inner spin lock is free).
-    fn drain_pending_child_submits() {
+    fn drain_pending_child_submits() -> bool {
+        let mut submitted_any = false;
         loop {
             let next = PENDING_CHILD_SUBMITS.lock().pop();
-            let Some(child_thread) = next else {
+            let Some(pending) = next else {
                 break;
             };
+            let child_thread = pending.child_thread;
             let Some(payload) = child_thread.payload_cap() else {
                 continue;
             };
             let task_payload = payload.clone();
-            let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-            let current_hart = boot_runtime::HartId(current_cpu.0);
+            let submit_hart = boot_runtime::HartId(pending.submit_cpu.0);
             let child_tid = child_thread.tid.0;
             let mut signal = SmpRescheduleSignal::<P>::new();
             let submitted = BOOT_REACTOR.with(|reactor| {
@@ -1754,25 +1768,31 @@ impl<P: TxPlatform> CoreInit<P> {
                         task_payload.clone(),
                         crate::thread_future::run_thread::<P>(child_thread, task_payload),
                     ),
-                    Self::userspace_thread_sched_meta(),
-                    current_hart,
+                    Self::userspace_thread_sched_meta_for(pending.submit_cpu).preempted_on_submit(),
+                    submit_hart,
                     &mut signal,
                 )
             });
             if let Some((task_key, _report)) = submitted {
+                submitted_any = true;
                 Self::register_thread_reactor_task(child_tid, task_key);
             }
         }
+        submitted_any
     }
+}
+
+struct PendingChildSubmit {
+    submit_cpu: CpuId,
+    child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
 }
 
 /// Deferred-submit queue for `sys_clone` children. Pushed from
 /// `submit_child_thread_into_boot_reactor` (running inside the
 /// reactor-poll inner lock) and drained from the BSP loop between
 /// reactor steps.
-static PENDING_CHILD_SUBMITS: SpinMutex<
-    alloc::vec::Vec<Cap<tx_subsystems::thread_runtime::ThreadIdentity>>,
-> = SpinMutex::new(alloc::vec::Vec::new());
+static PENDING_CHILD_SUBMITS: SpinMutex<alloc::vec::Vec<PendingChildSubmit>> =
+    SpinMutex::new(alloc::vec::Vec::new());
 
 /// Synchronously poll a future to completion using a noop waker.
 ///

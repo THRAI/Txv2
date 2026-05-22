@@ -638,7 +638,9 @@ fn oscomp_slim_sdcard(root: &Path, args: &[String]) -> Result<()> {
         cmd.arg(arg);
     }
 
-    let status = cmd.status().map_err(|e| format!("failed to run build-slim-sdcard.py: {e}"))?;
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to run build-slim-sdcard.py: {e}"))?;
     if status.success() {
         Ok(())
     } else {

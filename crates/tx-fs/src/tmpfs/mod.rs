@@ -247,7 +247,7 @@ impl FsOps for Tmpfs {
         match state.inodes.get(&fs_object_id) {
             Some(inode) => {
                 let mut meta = inode.meta;
-                // // meta.nlink = inode.nlink as u64; // TODO: nlink removed from InodeMeta // TODO: nlink field removed from InodeMeta
+                meta.nlinks = inode.nlink;
                 // For regular files the authoritative size lives in
                 // the PageContainer: writes via `step_write_from_*`
                 // call `pc.grow_size_to`, which the cached
@@ -284,6 +284,7 @@ impl FsOps for Tmpfs {
         let existing_kind_bits = inode.meta.mode & S_IFMT;
         let new_meta = InodeMeta {
             mode: (meta.mode & !S_IFMT) | existing_kind_bits,
+            nlinks: inode.nlink,
             ..*meta
         };
         inode.meta = new_meta;
@@ -409,16 +410,12 @@ impl FsOps for Tmpfs {
         if let TmpfsPayload::Directory(children) = &mut parent_inode.payload {
             children.remove(&inline);
         }
-        // Decrement link count; only free the inode when it reaches 0.
+        // Decrement the namespace link count but leave reclamation to
+        // `destroy_inode`. Open fds and live RNodes may still address
+        // this inode after the last name disappears.
         if let Some(target_inode) = state.inodes.get_mut(&found_id) {
-            // // target_inode.nlink = target_inode.nlink.saturating_sub(1); // TODO: nlink removed // TODO: nlink removed
-            if true
-            /* target_inode.nlink == 0 */
-            {
-                // TODO: nlink removed
-                let _ = target_inode;
-                state.inodes.remove(&found_id);
-            }
+            target_inode.nlink = target_inode.nlink.saturating_sub(1);
+            target_inode.meta.nlinks = target_inode.nlink;
         }
         StepOutcome::done(())
     }

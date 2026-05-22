@@ -335,6 +335,11 @@ impl ThreadPayload {
         SignalMask::new(self.signal_mask.load(Ordering::Acquire))
     }
 
+    /// Write the current signal mask.
+    pub fn store_signal_mask(&self, mask: SignalMask) {
+        self.signal_mask.store(mask.raw_bits(), Ordering::Release);
+    }
+
     /// Whether this thread is stopped (SIGSTOP / default-Stop
     /// disposition). The AST checkpoint in thread_future uses this
     /// to decide whether to enter userspace.

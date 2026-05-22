@@ -30,8 +30,8 @@ use tx_subsystems::wait_source;
 
 use super::numbers::{O_CLOEXEC, O_NONBLOCK, SFD_CLOEXEC, SFD_NONBLOCK};
 use super::{
-    bootstrap_read_user, errno_to_i32, SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE,
-    EINVAL_VALUE, ENOMEM_VALUE,
+    bootstrap_read_user, errno_to_i32, next_stdio_fd_below_nofile, SyscallCtx, SyscallResult,
+    EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
 };
 use crate::adapter::step_engine::{self as step_engine};
 
@@ -112,7 +112,10 @@ pub(super) fn sys_signalfd4<'a>(
             Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
         };
 
-        let new_fd = ctx.process.allocate_fd();
+        let new_fd = match next_stdio_fd_below_nofile(&ctx.process) {
+            Ok(fd) => fd,
+            Err(result) => return result,
+        };
         let _ = ctx.process.install_fd(new_fd, open_cap);
         if cloexec {
             ctx.process.set_fd_cloexec(new_fd, true);

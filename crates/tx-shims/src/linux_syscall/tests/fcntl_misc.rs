@@ -15,6 +15,14 @@ const E_FAULT: i32 = 14;
 const E_PERM: i32 = 1;
 const E_SRCH: i32 = 3;
 
+fn uts_field(buf: &[u8; 6 * 65], index: usize) -> &[u8] {
+    let start = index * 65;
+    let end = start + 65;
+    let field = &buf[start..end];
+    let n = field.iter().position(|b| *b == 0).unwrap_or(field.len());
+    &field[..n]
+}
+
 // -----------------------------------------------------------------
 // F_DUPFD / F_DUPFD_CLOEXEC / F_GETFL / F_SETFL.
 // -----------------------------------------------------------------
@@ -353,13 +361,60 @@ fn dispatch_uname_writes_utsname_to_user() {
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Return(0));
-    // sysname starts at offset 0; expect "Linux" then NUL pad.
-    assert_eq!(&buf[0..5], b"Linux");
+    assert_eq!(uts_field(&buf, 0), b"Linux");
     assert_eq!(buf[5], 0, "sysname must be NUL-terminated after \"Linux\"");
-    // release starts at offset 130 (2 × 65); expect "6.1.0" prefix.
-    assert_eq!(&buf[130..135], b"6.1.0");
-    // machine starts at offset 260 (4 × 65); expect "riscv64".
-    assert_eq!(&buf[260..267], b"riscv64");
+    assert!(uts_field(&buf, 2).starts_with(b"6.1.0"));
+    assert_eq!(uts_field(&buf, 4), b"riscv64");
+}
+
+struct LoongArchUnamePmap;
+
+impl PlatformConfig for LoongArchUnamePmap {
+    const ARCH: Arch = Arch::LoongArch64;
+    const BOARD: &'static str = "shims-test-la64";
+}
+
+impl PmapIf for LoongArchUnamePmap {
+    fn create_pmap_root() -> Result<PmapRoot, PmapError> {
+        ShimsTestPmap::create_pmap_root()
+    }
+}
+
+impl EntropyIf for LoongArchUnamePmap {}
+impl tx_hal::AuxvIf for LoongArchUnamePmap {}
+impl SmpIf for LoongArchUnamePmap {}
+impl tx_hal::TimeIf for LoongArchUnamePmap {
+    fn read_ns() -> u64 {
+        ShimsTestPmap::read_ns()
+    }
+
+    fn set_deadline_ns(deadline_ns: u64) {
+        ShimsTestPmap::set_deadline_ns(deadline_ns);
+    }
+
+    fn cancel_deadline() {
+        ShimsTestPmap::cancel_deadline();
+    }
+
+    fn frequency_hz() -> u64 {
+        ShimsTestPmap::frequency_hz()
+    }
+}
+
+#[test]
+fn dispatch_uname_uses_selected_platform_machine() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let mut buf = [0u8; 6 * 65];
+    let r = block_on(dispatch::<LoongArchUnamePmap>(
+        SyscallRequest::new(NR_UNAME, [buf.as_mut_ptr() as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(0));
+    assert_eq!(uts_field(&buf, 4), b"loongarch64");
 }
 
 /// `uname(NULL)` returns `-EFAULT`.

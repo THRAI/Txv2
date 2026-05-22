@@ -800,11 +800,6 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         }
     }
 
-    // ===== Phase 5 — thread-group collapse (if multi-threaded) =======
-    if let Some(payload) = process.payload_slot().lock().as_ref() {
-        payload.install_exec_group_exit();
-    }
-
     // ===== Phase 5a — eagerly populate partial-last-page bytes ========
     //
     // Per the ELF spec, bytes in the LAST file-backed page of a LOAD
@@ -963,12 +958,11 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
 
     // ----- Phase 5 (cont) — collapse old-AS work -------------------
     //
-    // `txdoc:EXEC-10-COLLAPSE-OLD-AS-WORK`. No-op for the v1 slice:
-    // no `CLONE_FILES` / `CLONE_SIGHAND` exists, the fd table and
-    // sig_actions are owned in-place by `process`, and there are no
-    // sibling threads to zombify. The Phase-7 commit list below
-    // mutates the in-place state directly. Spec anchor pinned for
-    // when CLONE_* support arrives.
+    // `txdoc:EXEC-10-COLLAPSE-OLD-AS-WORK`. CLONE_THREAD is live, so
+    // the old thread group must be reduced to the calling thread after
+    // all reversible preparation has succeeded and before the address
+    // space replacement becomes visible.
+    let _collapsed = process.collapse_threads_for_exec(thread);
 
     // ===== Phase 6 — address-space visibility boundary ===============
     //

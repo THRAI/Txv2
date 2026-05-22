@@ -6,6 +6,12 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine};
 
+/// Linux raw `wait4`/`getrusage` rusage image for musl LP64:
+/// two `timeval`s plus fourteen `long` counters. musl passes the
+/// syscall a pointer adjusted to this 144-byte prefix and keeps the
+/// public `struct rusage` reserved tail in libc-owned memory.
+const RUSAGE_BYTES: usize = 144;
+
 /// `exit(status)` — per-thread exit per `PROCESS_v1` §7.3.1.
 ///
 /// The implementation of `step_thread_exit` (in
@@ -493,10 +499,12 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
 ///
 /// ## rusage
 ///
-/// Wave 3 rejects non-NULL `rusage` with `-EINVAL` per the slice
-/// plan. txKernel doesn't track per-process resource usage today;
-/// zero-fill is busy-work that doesn't unblock anything LTP exercises.
-/// `TODO(phase-rusage)`: zero-fill or populate once rusage state lands.
+/// A non-NULL `rusage` pointer receives a zero-filled Linux raw LP64
+/// `rusage` prefix: two `timeval`s plus fourteen `long` counters
+/// (144 bytes). musl keeps the public `struct rusage` reserved tail in
+/// libc-owned memory. txKernel doesn't track per-process resource usage
+/// today; `TODO(phase-rusage)` populates the counters once accounting
+/// state lands.
 ///
 /// ## wstatus write
 ///
@@ -507,15 +515,11 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
 ///
 /// ## Blocking shape
 ///
-/// The loop pattern matches `sys_read` / `vm::execution::fault_script`:
-/// each iteration calls the synchronous `step_waitpid_nohang` walker
-/// (no guard parameter — it takes its own snapshot internally). On
-/// `Err(WaitError::NoneReady)` without `WNOHANG`, build a `WaitToken`
-/// from `ctx.process.exit_source_wait_token()` and `wait_source::wait_on_token`
-/// it. Post-wake, loop and re-poll: a third party may have reaped the
-/// same zombie (e.g. another wait4 caller in the same process; or the
-/// shared `INIT_PROCESS` reaper if init wakes first), so the second
-/// poll may still return `NoneReady` — re-park.
+/// The blocking path drives `WaitpidNohangOp` through the v3 StepOp
+/// loop. On `Err(WaitError::NoneReady)` the op yields on the parent's
+/// exit source; child exit fires that source, and the loop re-runs the
+/// synchronous walker. Post-wake re-polling is still required because
+/// another waiter may have consumed the same zombie.
 ///
 /// Cites: `txdoc:PROCESS-WAIT-FAMILY-1`
 /// (`docs/design/04_process-signals/PROCESS_v1.md` §7.4).
@@ -524,12 +528,6 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let wstatus_uaddr = args[1];
     let options = args[2] as i32;
     let rusage_uaddr = args[3];
-
-    // rusage: Wave 3 rejects non-NULL with -EINVAL. txKernel doesn't
-    // track rusage today.
-    if rusage_uaddr != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
 
     // pid → WaitTarget. i32::MIN's negate overflows; reject upfront.
     let target = match pid {
@@ -550,6 +548,9 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         // WNOHANG: one-shot poll, no waiting.
         match step_waitpid_nohang(&ctx.process, target) {
             Ok((child_pid, status)) => {
+                if let Err(result) = write_wait4_rusage_if_requested(ctx, rusage_uaddr) {
+                    return result;
+                }
                 if wstatus_uaddr != 0 {
                     let word = status.wait_status_word();
                     if let Err(errno) =
@@ -566,9 +567,9 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     }
 
     // Blocking wait: drive WaitpidNohangOp through the v3 StepOp loop.
-    // The op yields on NoneReady via YieldShape::OnWaitSource;
-    // the drive loop parks the parent task, child exit fires the
-    // source, and step() is re-called on wake.
+    // The op yields on NoneReady via YieldShape::OnWaitSource; the
+    // drive loop parks the parent task, child exit fires the source,
+    // and step() is re-called on wake.
     use step_engine::{StepOp, StepOutcome as V3Out, YieldShape};
     use tx_subsystems::process::execution::WaitpidNohangOp;
     let mut op = WaitpidNohangOp {
@@ -579,6 +580,9 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     loop {
         match op.step(&mut script_ctx) {
             V3Out::Done(Ok((child_pid, status))) => {
+                if let Err(result) = write_wait4_rusage_if_requested(ctx, rusage_uaddr) {
+                    return result;
+                }
                 if wstatus_uaddr != 0 {
                     let word = status.wait_status_word();
                     if let Err(errno) =
@@ -609,6 +613,17 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             _ => {}
         }
     }
+}
+
+fn write_wait4_rusage_if_requested(
+    ctx: &SyscallCtx<'_>,
+    rusage_uaddr: u64,
+) -> Result<(), SyscallResult> {
+    if rusage_uaddr == 0 {
+        return Ok(());
+    }
+    let zeros = [0u8; RUSAGE_BYTES];
+    bootstrap_copy_to_user(&ctx.aspace, rusage_uaddr, &zeros).map_err(SyscallResult::error_from)
 }
 
 /// `getppid()` — return the parent's pid, or `0` (`Pid::RESERVED`)

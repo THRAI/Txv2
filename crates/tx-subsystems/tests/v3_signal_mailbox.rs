@@ -170,7 +170,12 @@ fn signal_mailbox_phase_a_plumbing() {
     // ---- (4) mailbox-unbound-no-post-no-crash ----------------------
     // Before binding, post_signal must update the summary and not
     // crash on the missing mailbox.
-    post_signal(&leader, Signum::SIGTERM, None);
+    post_signal(
+        &leader,
+        Signum::SIGTERM,
+        SignalRouting::ProcessDirected,
+        None,
+    );
     let summary_before_bind = leader
         .payload_cap()
         .expect("live leader has payload")
@@ -187,7 +192,12 @@ fn signal_mailbox_phase_a_plumbing() {
 
     // SIGCHLD is catchable and not yet pending, so this is a fresh
     // post; the mailbox should receive one event.
-    post_signal(&leader, Signum::SIGCHLD, None);
+    post_signal(
+        &leader,
+        Signum::SIGCHLD,
+        SignalRouting::ProcessDirected,
+        None,
+    );
     assert_signal_delivered(
         &leader_mailbox,
         Signum::SIGCHLD.raw() as u32,
@@ -243,7 +253,12 @@ fn signal_mailbox_phase_a_plumbing() {
     // fail to upgrade on the next post. The summary side still
     // updates; no panic / UB.
     drop(leader_mailbox);
-    post_signal(&leader, Signum::SIGINT, None);
+    post_signal(
+        &leader,
+        Signum::SIGINT,
+        SignalRouting::ProcessDirected,
+        None,
+    );
     let summary_after_dangling = leader.payload_cap().expect("alive").interrupt_summary();
     assert!(
         summary_after_dangling.deliverable_signal,

@@ -77,6 +77,14 @@ The default CI gate is `cargo xtask ci`. It reports these checks individually:
 
 - `cargo xtask lint unused`
 
+<!-- txdoc:CI-GATE-KERNEL-USER-LAYOUTS -->
+
+- `cargo xtask lint kernel-user-layouts` — fails when a kernel/user ABI
+  candidate is unaccounted, missing a reason for deferral/exclusion, when a
+  registered Rust-backed production `#[repr(C)]` kernel/user ABI struct lacks
+  `KernelToUserLayout`, or when a probed checked/prefix/manual layout drifts
+  from pinned musl RV64/LA64 headers.
+
 <!-- txdoc:CI-GATE-PROGRESS-JSON -->
 
 - `cargo xtask progress validate`

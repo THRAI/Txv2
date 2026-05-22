@@ -24,7 +24,7 @@ use tx_scripts::adapter::step_engine::{
     Errno, InterestMask, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome, WaitSourceId,
     YieldShape,
 };
-use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox, WaitGeneration};
+use tx_substrate::wake::mailbox::{MailboxEvent, SignalRouting, TaskMailbox, WaitGeneration};
 use tx_substrate::wake::wait_source::{register_source, unregister_source, WaitSource};
 
 // ---------------------------------------------------------------------------
@@ -406,4 +406,42 @@ fn drive_yield_on_wait_source_with_mailbox_resolves_on_pre_posted_event() {
         None,
     ));
     assert_eq!(result, Ok(99u32));
+}
+
+#[test]
+fn drive_signal_delivered_interrupt_consumes_mailbox_hint() {
+    let mailbox = Arc::new(TaskMailbox::new());
+    let source_id = WaitSourceId::new(43);
+    let interests = InterestMask::new(0b1);
+
+    assert!(
+        mailbox.post(MailboxEvent::SignalDelivered {
+            signum: 32,
+            routing: SignalRouting::ThreadDirected { tid: 7 },
+        }),
+        "mailbox should accept signal wake hint"
+    );
+
+    let op = MockStepOp::new([StepOutcome::Yield {
+        progress: NoProgress,
+        shape: YieldShape::OnWaitSource {
+            source: source_id,
+            interests,
+        },
+    }]);
+
+    let mut ctx = ScriptCtx::new().with_mailbox(Arc::clone(&mailbox));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Waiting,
+        Some(&mailbox),
+        None,
+        None,
+    ));
+    assert_eq!(result, Err(Errno::EINTR));
+    assert!(
+        mailbox.is_empty(),
+        "SignalDelivered is a wake hint; drive must not re-post it into the next wait"
+    );
 }

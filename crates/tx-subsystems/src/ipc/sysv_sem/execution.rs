@@ -26,6 +26,8 @@ pub const GETVAL: i32 = 12;
 pub const GETZCNT: i32 = 15;
 pub const SETALL: i32 = 17;
 pub const SETVAL: i32 = 16;
+pub const SEM_INFO: i32 = 19;
+pub const SEM_STAT_ANY: i32 = 20;
 
 macro_rules! with_payload {
     ($array:expr, $guard:ident, $block:block) => {{
@@ -200,7 +202,7 @@ pub fn step_semctl(
     semid: u32,
     semnum: u16,
     cmd: i32,
-    arg: i32,
+    arg: SemCtlArg,
     cred: &Cap<Cred>,
 ) -> Result<SemCtlResult, Errno> {
     match cmd {
@@ -215,18 +217,26 @@ pub fn step_semctl(
         IPC_SET => {
             let array = checks::require_sem_exists(semid)?;
             checks::require_owner_or_admin(&array, cred)?;
-            let _ = array;
+            let SemCtlArg::IpcSet { mode, uid, gid } = arg else {
+                return Err(Errno::EINVAL);
+            };
+            array.mode.store(mode & 0o777, Ordering::Release);
+            array.uid.store(uid, Ordering::Release);
+            array.gid.store(gid, Ordering::Release);
             Ok(SemCtlResult::Success)
         }
-        IPC_STAT | SEM_STAT => {
+        IPC_STAT | SEM_STAT | SEM_STAT_ANY => {
             let array = checks::require_sem_exists(semid)?;
             checks::require_can_read_sem(&array, cred)?;
             Ok(SemCtlResult::Stat(SemInfo {
+                key: array.key_raw(),
                 semid: array.semid,
                 nsems: array.nsems,
+                uid: array.uid(),
+                gid: array.gid(),
                 cuid: array.cuid,
                 cgid: array.cgid,
-                perm: array.perm,
+                perm: array.perm(),
             }))
         }
         GETVAL => {
@@ -246,12 +256,15 @@ pub fn step_semctl(
             if semnum >= array.nsems {
                 return Err(Errno::EINVAL);
             }
-            if !(0..=32767).contains(&arg) {
+            let SemCtlArg::Val(setval) = arg else {
+                return Err(Errno::EINVAL);
+            };
+            if !(0..=32767).contains(&setval) {
                 return Err(Errno::ERANGE);
             }
             with_payload!(array, payload, {
                 let mut values = payload.values.lock();
-                values[semnum as usize].val = arg as i16;
+                values[semnum as usize].val = setval as i16;
                 payload.changed_seq.fetch_add(1, Ordering::Release);
                 payload.changed_channel.fire(Mask::from_bits(1));
             });
@@ -265,7 +278,7 @@ pub fn step_semctl(
             // Count queries — return 0 stubs.
             Ok(SemCtlResult::Val(0))
         }
-        IPC_INFO => Ok(SemCtlResult::Info {
+        IPC_INFO | SEM_INFO => Ok(SemCtlResult::Info {
             semmni: 32000,
             semmns: 1024000000,
             semmsl: 32000,
@@ -321,9 +334,19 @@ pub enum SemCtlResult {
 
 #[derive(Clone, Debug)]
 pub struct SemInfo {
+    pub key: i32,
     pub semid: u32,
     pub nsems: u16,
+    pub uid: u32,
+    pub gid: u32,
     pub cuid: u32,
     pub cgid: u32,
     pub perm: IpcPerm,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SemCtlArg {
+    None,
+    Val(i32),
+    IpcSet { mode: u16, uid: u32, gid: u32 },
 }

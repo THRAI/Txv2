@@ -320,8 +320,7 @@ mod epoll {
     use super::*;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
-        // TODO: epoll not yet landed
-        Ok(())
+        crate::epoll::register_zones()
     }
 }
 

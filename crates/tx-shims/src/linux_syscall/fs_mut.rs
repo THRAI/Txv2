@@ -108,7 +108,9 @@ pub(crate) fn create_then_walk<P: PmapIf>(
         let guard = step_engine::guard();
         let outcome = fs_ops.create_inode(parent_fs_object_id, basename, new_mode, cred, &guard);
         match outcome {
-            V3::Done(_) => {}
+            V3::Done(_) => {
+                parent_dentry.remove_cached_child_by_name(basename);
+            }
             V3::Continue { .. } | V3::Yield { .. } => {
                 return Err(EIO_VALUE);
             }
@@ -216,7 +218,10 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         fs_ops.mkdir(parent_id, basename, effective_mode, &cred, &guard)
     };
     match outcome {
-        V3::Done(_) => SyscallResult::Return(0),
+        V3::Done(_) => {
+            parent_dentry.remove_cached_child_by_name(basename);
+            SyscallResult::Return(0)
+        }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
         V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
@@ -300,7 +305,10 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         }
     };
     match outcome {
-        V3::Done(()) => SyscallResult::Return(0),
+        V3::Done(()) => {
+            parent_dentry.remove_cached_child_by_name(basename);
+            SyscallResult::Return(0)
+        }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
         V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
@@ -369,7 +377,10 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         fs_ops.symlink(parent_id, basename, &target, &cred, &guard)
     };
     match outcome {
-        V3::Done(_) => SyscallResult::Return(0),
+        V3::Done(_) => {
+            parent_dentry.remove_cached_child_by_name(basename);
+            SyscallResult::Return(0)
+        }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
         V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
@@ -457,7 +468,10 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         fs_ops.link(new_parent_id, new_basename, source_id, &guard)
     };
     match outcome {
-        V3::Done(()) => SyscallResult::Return(0),
+        V3::Done(()) => {
+            new_parent_dentry.remove_cached_child_by_name(new_basename);
+            SyscallResult::Return(0)
+        }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
         V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
@@ -994,17 +1008,149 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     }
 }
 
+fn current_vfs_timespec<P: TimeIf>() -> tx_subsystems::vfs::Timespec {
+    let now = ns_to_timespec(<P as TimeIf>::read_ns());
+    tx_subsystems::vfs::Timespec::new(now.tv_sec, now.tv_nsec as i32)
+}
+
+fn read_utimensat_times(
+    times_uaddr: u64,
+    ctx: &SyscallCtx<'_>,
+) -> Result<Option<[TimespecLayout; 2]>, SyscallResult> {
+    if times_uaddr == 0 {
+        return Ok(None);
+    }
+    let atime = match bootstrap_read_user::<TimespecLayout>(&ctx.aspace, times_uaddr) {
+        Ok(ts) => ts,
+        Err(errno) => return Err(SyscallResult::error_from(errno)),
+    };
+    let mtime_addr = times_uaddr.saturating_add(core::mem::size_of::<TimespecLayout>() as u64);
+    let mtime = match bootstrap_read_user::<TimespecLayout>(&ctx.aspace, mtime_addr) {
+        Ok(ts) => ts,
+        Err(errno) => return Err(SyscallResult::error_from(errno)),
+    };
+    Ok(Some([atime, mtime]))
+}
+
+fn apply_utimensat_times<P: TimeIf>(
+    meta: &mut InodeMeta,
+    times: Option<[TimespecLayout; 2]>,
+) -> Result<(), SyscallResult> {
+    let now = current_vfs_timespec::<P>();
+    let apply_one = |dst: &mut tx_subsystems::vfs::Timespec,
+                     src: Option<TimespecLayout>|
+     -> Result<(), SyscallResult> {
+        match src {
+            None => {
+                *dst = now;
+                Ok(())
+            }
+            Some(ts) if ts.tv_nsec == UTIME_OMIT => Ok(()),
+            Some(ts) if ts.tv_nsec == UTIME_NOW => {
+                *dst = now;
+                Ok(())
+            }
+            Some(ts) if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 => {
+                Err(SyscallResult::Error(EINVAL_VALUE))
+            }
+            Some(ts) => {
+                *dst = tx_subsystems::vfs::Timespec::new(ts.tv_sec, ts.tv_nsec as i32);
+                Ok(())
+            }
+        }
+    };
+    apply_one(&mut meta.atime, times.map(|pair| pair[0]))?;
+    apply_one(&mut meta.mtime, times.map(|pair| pair[1]))?;
+    meta.ctime = now;
+    Ok(())
+}
+
 /// `utimensat(dirfd, pathname, times, flags)`. Linux RV64 generic ABI
 /// `__NR_utimensat = 88`.
 ///
-/// Returns 0 (success) without actually mutating inode timestamps.
-/// The `FsOps` surface does not yet expose a `set_times` hook, so
-/// timestamps stay unchanged, but the syscall itself succeeds.
-/// This makes `touch(1)` exit 0, which the busybox-musl test suite
-/// requires (`touch test.txt` is scored as a test case).
-/// TODO(phase-vfs-utimens): wire to a real backend set_times method.
-pub(super) fn sys_utimensat<'a>(_args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
-    SyscallResult::Return(0)
+/// musl rv64 passes a `struct timespec[2]` whose fields are signed
+/// 64-bit `time_t`/`long` (`external/musl/include/alltypes.h.in`).
+/// This arm supports the libc paths used by `utimensat(3)` and
+/// `futimens(3)`: pathname relative to `AT_FDCWD`, and the musl
+/// `futimens(fd, times)` form with `pathname == NULL`.
+pub(super) fn sys_utimensat<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let dirfd = args[0] as i32;
+    let path_uaddr = args[1];
+    let times_uaddr = args[2];
+    let flags = args[3] as u32;
+    if flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let times = match read_utimensat_times(times_uaddr, ctx) {
+        Ok(times) => times,
+        Err(result) => return result,
+    };
+
+    let (fs_ops, target_id, mut meta) = if path_uaddr == 0 {
+        if dirfd < 0 {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
+        let file = match resolve_fd(&ctx.process, dirfd as u32) {
+            Some(file) => file,
+            None => return SyscallResult::Error(EBADF_VALUE),
+        };
+        let rnode = file.rnode();
+        let fs_ops = match fs_ops_for_rnode(rnode) {
+            Some(fs_ops) => fs_ops,
+            None => return SyscallResult::Error(ENOSYS_VALUE),
+        };
+        let target_id = rnode.fs_object_id();
+        let meta = {
+            let guard = step_engine::guard();
+            match fs_ops.load_inode_meta(target_id, &guard) {
+                StepOutcome::Done(meta) => meta,
+                StepOutcome::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+                StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                    return SyscallResult::Error(EIO_VALUE);
+                }
+            }
+        };
+        (fs_ops, target_id, meta)
+    } else {
+        let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+            Ok(path) => path,
+            Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        };
+        let cwd = match ctx.process.cwd() {
+            Some(dentry) => dentry,
+            None => return SyscallResult::Error(ENOENT_VALUE),
+        };
+        let target = match walk_from(cwd, &path, &ctx.walker_cred()) {
+            Ok(dentry) => dentry,
+            Err(errno) => return SyscallResult::Error(errno),
+        };
+        let fs_ops = match fs_ops_for_dentry(&target) {
+            Some(fs_ops) => fs_ops,
+            None => return SyscallResult::Error(ENOSYS_VALUE),
+        };
+        let target_id = target.rnode().fs_object_id();
+        let meta = {
+            let guard = step_engine::guard();
+            match fs_ops.load_inode_meta(target_id, &guard) {
+                StepOutcome::Done(meta) => meta,
+                StepOutcome::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+                StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                    return SyscallResult::Error(EIO_VALUE);
+                }
+            }
+        };
+        (fs_ops, target_id, meta)
+    };
+
+    if let Err(result) = apply_utimensat_times::<P>(&mut meta, times) {
+        return result;
+    }
+    let guard = step_engine::guard();
+    match fs_ops.serialize_inode_meta(target_id, &meta, &guard) {
+        StepOutcome::Done(()) => SyscallResult::Return(0),
+        StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+    }
 }
 
 /// `renameat2(olddirfd, oldpath, newdirfd, newpath, flags)`. Linux RV64
