@@ -437,6 +437,7 @@ impl SharedReactor {
                             hart.0,
                             Some(Arc::clone(&view.shared.delegate_registry)),
                         );
+                        crate::task::clear_current_task_yielded(hart.0);
                         Some((key, future, wake_state, slice))
                     }
                     Err(TakeRunnableError::Missing) => {
@@ -468,6 +469,7 @@ impl SharedReactor {
             let timing = PollTiming::start(slice, slice_clock);
             let result = future.as_mut().poll(&mut cx);
             let accounting = timing.finish(slice_clock);
+            let task_yielded = crate::task::take_current_task_yielded(hart.0);
 
             crate::task::set_current_mailbox(hart.0, None);
             crate::task::set_current_timer_wheel(hart.0, None);
@@ -524,6 +526,22 @@ impl SharedReactor {
                                 view.task_stopped_local(
                                     key.id(),
                                     StopReason::SliceExpired,
+                                    accounting.consumed_ns,
+                                    hart,
+                                );
+                                let _ = view.dispatch_queued_task_from_hart(key.id(), hart, signal);
+                            }
+                        } else if task_yielded {
+                            if view
+                                .shared
+                                .tasks
+                                .lock()
+                                .finish_polled_runnable(key, future, StopReason::Yielded)
+                                .is_ok()
+                            {
+                                view.task_stopped_local(
+                                    key.id(),
+                                    StopReason::Yielded,
                                     accounting.consumed_ns,
                                     hart,
                                 );
@@ -713,6 +731,7 @@ impl HartRuntimeView<'_> {
                             hart.0,
                             Some(Arc::clone(&self.shared.delegate_registry)),
                         );
+                        crate::task::clear_current_task_yielded(hart.0);
                         Some((key, future, wake_state, slice))
                     }
                     Err(TakeRunnableError::Missing) => {
@@ -741,6 +760,7 @@ impl HartRuntimeView<'_> {
             let timing = PollTiming::start(slice, slice_clock);
             let result = future.as_mut().poll(&mut cx);
             let accounting = timing.finish(slice_clock);
+            let task_yielded = crate::task::take_current_task_yielded(hart.0);
             crate::task::set_current_mailbox(hart.0, None);
             crate::task::set_current_timer_wheel(hart.0, None);
             crate::task::set_current_delegate_registry(hart.0, None);
@@ -793,6 +813,22 @@ impl HartRuntimeView<'_> {
                             self.task_stopped_local(
                                 key.id(),
                                 StopReason::SliceExpired,
+                                accounting.consumed_ns,
+                                hart,
+                            );
+                            let _ = self.dispatch_queued_task_from_hart(key.id(), hart, signal);
+                        }
+                    } else if task_yielded {
+                        if self
+                            .shared
+                            .tasks
+                            .lock()
+                            .finish_polled_runnable(key, future, StopReason::Yielded)
+                            .is_ok()
+                        {
+                            self.task_stopped_local(
+                                key.id(),
+                                StopReason::Yielded,
                                 accounting.consumed_ns,
                                 hart,
                             );
@@ -1576,6 +1612,14 @@ impl Reactor {
             self.shared.scheduler.task_dropped(record.handle.id());
         }
         drained
+    }
+}
+
+const fn earliest_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(if left <= right { left } else { right }),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
     }
 }
 

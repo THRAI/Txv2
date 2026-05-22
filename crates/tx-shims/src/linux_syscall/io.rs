@@ -7,6 +7,12 @@ use super::*;
 use crate::adapter::reactor_entry;
 use crate::adapter::step_engine::Cap;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+const PSELECT_READY_YIELD_INTERVAL: usize = 4;
+const PSELECT_EMPTY_POLL_YIELD_INTERVAL: usize = 4;
+static PSELECT_READY_RETURNS: AtomicUsize = AtomicUsize::new(0);
+static PSELECT_EMPTY_POLL_RETURNS: AtomicUsize = AtomicUsize::new(0);
 
 fn tty_readable_level(tty: &Cap<tx_subsystems::tty::structure::TtyIdentity>) -> bool {
     use tx_subsystems::tty::execution::TTY_READABLE;
@@ -620,8 +626,7 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
         let mut write_ready = alloc::vec![0u64; word_count as usize];
         let mut except_ready = alloc::vec![0u64; word_count as usize];
         let mut ready_count: i64 = 0;
-        let mut wait_token = None;
-        let mut wait_token_is_socket = false;
+        let mut wait_tokens = alloc::vec::Vec::new();
 
         for fd in 0..nfds {
             let want_read = match fdset_contains(ctx, readfds, fd) {
@@ -679,25 +684,23 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
                             | tx_subsystems::net::PollMask::HUP
                             | tx_subsystems::net::PollMask::RDHUP,
                     );
-                if read_blocked && (wait_token.is_none() || !wait_token_is_socket) {
+                if read_blocked {
                     match socket_poll_wait_token_from_file(
                         &file,
                         tx_subsystems::net::PollMask::IN,
                         &guard,
                     ) {
                         Some(Ok(Some(token))) => {
-                            wait_token = Some(token);
-                            wait_token_is_socket = true;
+                            push_unique_wait_token(&mut wait_tokens, token);
                         }
                         Some(Ok(None)) | None => {}
                         Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
                     }
                 }
-                if !fd_ready && (wait_token.is_none() || !wait_token_is_socket) {
+                if !fd_ready {
                     match socket_poll_wait_token_from_file(&file, interests, &guard) {
                         Some(Ok(Some(token))) => {
-                            wait_token = Some(token);
-                            wait_token_is_socket = true;
+                            push_unique_wait_token(&mut wait_tokens, token);
                         }
                         Some(Ok(None)) | None => {}
                         Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
@@ -713,13 +716,13 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
                             if tty.input_readable.peek() & TTY_READABLE != 0 {
                                 true
                             } else {
-                                if wait_token.is_none() {
-                                    wait_token = Some(tx_subsystems::execution::WaitToken::new(
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    tx_subsystems::execution::WaitToken::new(
                                         tty.wait_source_id(),
                                         TTY_READABLE,
-                                    ));
-                                    wait_token_is_socket = false;
-                                }
+                                    ),
+                                );
                                 false
                             }
                         }
@@ -733,13 +736,13 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
                             if payload.readable_level() {
                                 true
                             } else {
-                                if wait_token.is_none() {
-                                    wait_token = Some(tx_subsystems::execution::WaitToken::new(
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    tx_subsystems::execution::WaitToken::new(
                                         payload.reader_source_id(),
                                         tx_subsystems::pipe::PIPE_READABLE,
-                                    ));
-                                    wait_token_is_socket = false;
-                                }
+                                    ),
+                                );
                                 false
                             }
                         }
@@ -762,13 +765,13 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
                             if payload.writable_level() {
                                 true
                             } else {
-                                if wait_token.is_none() {
-                                    wait_token = Some(tx_subsystems::execution::WaitToken::new(
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    tx_subsystems::execution::WaitToken::new(
                                         payload.writer_source_id(),
                                         tx_subsystems::pipe::PIPE_WRITABLE,
-                                    ));
-                                    wait_token_is_socket = false;
-                                }
+                                    ),
+                                );
                                 false
                             }
                         }
@@ -792,12 +795,12 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
         // Socket peers often make progress in another userspace task after this
         // scan. Give that task one turn before parking on the selected token,
         // then rescan so level-triggered readiness is observed directly.
-        if !yielded_before_wait && wait_token.is_some() {
+        if !yielded_before_wait && !wait_tokens.is_empty() {
             yielded_before_wait = true;
             tx_reactor::yield_now().await;
             continue;
         }
-        let Some(token) = wait_token else {
+        if wait_tokens.is_empty() {
             if let Some(deadline_ns) = timeout_deadline_ns {
                 wait_until_pselect_deadline::<P>(deadline_ns).await;
             } else if timeout == PselectTimeout::Infinite {
@@ -806,16 +809,20 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
             }
             break (read_ready, write_ready, except_ready, ready_count);
         };
-        if let Some(future) = wait_source::wait_on_token(token) {
+        let futures = wait_tokens
+            .into_iter()
+            .filter_map(wait_source::wait_on_token)
+            .collect::<alloc::vec::Vec<_>>();
+        if !futures.is_empty() {
             if let Some(deadline_ns) = timeout_deadline_ns {
-                match wait_on_token_or_pselect_deadline::<P>(future, deadline_ns).await {
+                match wait_on_any_token_or_pselect_deadline::<P>(futures, deadline_ns).await {
                     PselectWaitWake::FdReady => {}
                     PselectWaitWake::TimedOut => {
                         break (read_ready, write_ready, except_ready, ready_count);
                     }
                 }
             } else {
-                let _ = future.await;
+                wait_on_any_token(futures).await;
             }
         } else {
             if let Some(deadline_ns) = timeout_deadline_ns {
@@ -825,7 +832,10 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
         }
     };
 
-    if ready_count != 0 || timeout != PselectTimeout::Infinite {
+    if ready_count != 0 && pselect_ready_return_should_yield() {
+        tx_reactor::yield_now().await;
+    }
+    if ready_count == 0 && timeout == PselectTimeout::Poll && pselect_empty_poll_should_yield() {
         tx_reactor::yield_now().await;
     }
 
@@ -840,6 +850,22 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
     }
 
     SyscallResult::Return(ready_count)
+}
+
+fn pselect_ready_return_should_yield() -> bool {
+    PSELECT_READY_RETURNS
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+        % PSELECT_READY_YIELD_INTERVAL
+        == 0
+}
+
+fn pselect_empty_poll_should_yield() -> bool {
+    PSELECT_EMPTY_POLL_RETURNS
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+        % PSELECT_EMPTY_POLL_YIELD_INTERVAL
+        == 0
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -878,6 +904,52 @@ fn pselect_timeout_policy<'a>(
 enum PselectWaitWake {
     FdReady,
     TimedOut,
+}
+
+fn push_unique_wait_token(
+    tokens: &mut alloc::vec::Vec<tx_subsystems::execution::WaitToken>,
+    token: tx_subsystems::execution::WaitToken,
+) {
+    if !tokens.contains(&token) {
+        tokens.push(token);
+    }
+}
+
+async fn wait_on_any_token(mut futures: alloc::vec::Vec<wait_source::RegisteredWaitFuture>) {
+    core::future::poll_fn(|cx| {
+        for future in futures.iter_mut() {
+            if core::future::Future::poll(core::pin::Pin::new(future), cx).is_ready() {
+                return core::task::Poll::Ready(());
+            }
+        }
+        core::task::Poll::Pending
+    })
+    .await
+}
+
+async fn wait_on_any_token_or_pselect_deadline<P: tx_hal::TimeIf>(
+    mut fd_futures: alloc::vec::Vec<wait_source::RegisteredWaitFuture>,
+    deadline_ns: u64,
+) -> PselectWaitWake {
+    if <P as tx_hal::TimeIf>::read_ns() >= deadline_ns {
+        return PselectWaitWake::TimedOut;
+    }
+    let Some(mut timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) else {
+        return PselectWaitWake::TimedOut;
+    };
+
+    core::future::poll_fn(|cx| {
+        for future in fd_futures.iter_mut() {
+            if core::future::Future::poll(core::pin::Pin::new(future), cx).is_ready() {
+                return core::task::Poll::Ready(PselectWaitWake::FdReady);
+            }
+        }
+        if core::future::Future::poll(core::pin::Pin::new(&mut timer_future), cx).is_ready() {
+            return core::task::Poll::Ready(PselectWaitWake::TimedOut);
+        }
+        core::task::Poll::Pending
+    })
+    .await
 }
 
 async fn wait_on_token_or_pselect_deadline<P: tx_hal::TimeIf>(
@@ -1278,6 +1350,10 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
         }
     };
 
+    if ready == 0 && timeout == PselectTimeout::Poll && pselect_empty_poll_should_yield() {
+        tx_reactor::yield_now().await;
+    }
+
     restore_ppoll_sigmask(
         ctx,
         saved_mask,
@@ -1415,14 +1491,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         return super::eventfd::sys_eventfd_write(&file, args[1], len, ctx).await;
     }
 
-    let len = if matches!(
-        file.rnode().backing(),
-        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
-    ) {
-        len
-    } else {
-        core::cmp::min(len, TTY_WRITE_MAX_INLINE)
-    };
+    let len = inline_io_len_for_file(&file, len);
 
     // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).
     // Prefault the user buffer in the observe phase, then drive the
@@ -1494,7 +1563,10 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     )
     .await
     {
-        Ok(total) => SyscallResult::Return(total as i64),
+        Ok(total) => {
+            yield_after_struct_write_if_needed(&file, total).await;
+            SyscallResult::Return(total as i64)
+        }
         Err(v3errno) => {
             let errno: tx_subsystems::execution::Errno = v3errno.into();
             // fd-ops Wave 3 — Q2 DECIDED 2026-05-07. SIGPIPE is
@@ -1509,6 +1581,21 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             }
             SyscallResult::error_from(errno)
         }
+    }
+}
+
+async fn yield_after_struct_write_if_needed(file: &Cap<OpenFile>, written: usize) {
+    if written == 0 {
+        return;
+    }
+    if matches!(
+        file.rnode().backing(),
+        tx_subsystems::vfs::structure::RNodeBacking::StructBacked {
+            payload: tx_subsystems::vfs::structure::StructPayload::Tty(_)
+                | tx_subsystems::vfs::structure::StructPayload::Pipe { .. },
+        }
+    ) {
+        tx_reactor::yield_now().await;
     }
 }
 
@@ -1603,6 +1690,10 @@ async fn sys_write_socket(
         flags |= tx_subsystems::net::SendRecvFlags::MSG_DONTWAIT;
     }
 
+    if udp_write_can_drive_loopback_inline(&socket) {
+        return sys_write_udp_loopback_socket(&socket, bytes, flags).await;
+    }
+
     if matches!(
         socket.kind,
         tx_subsystems::net::SocketKind::NetlinkRoute
@@ -1651,27 +1742,32 @@ async fn sys_write_socket(
         match outcome {
             tx_substrate::step::StepOutcome::Done(written) => {
                 total += written;
-                drive_tcp_loopback_after_socket_write(&socket, written);
+                drive_loopback_after_socket_write(&socket, written);
+                yield_after_socket_write_if_needed(&socket, written).await;
                 return SyscallResult::Return(total as i64);
             }
             tx_substrate::step::StepOutcome::Continue { progress } => {
                 let written = progress.bytes();
                 total += written;
-                drive_tcp_loopback_after_socket_write(&socket, written);
+                drive_loopback_after_socket_write(&socket, written);
                 let stop = written == 0 || written >= remaining.len();
                 if stop {
+                    yield_after_socket_write_if_needed(&socket, written).await;
                     return SyscallResult::Return(total as i64);
                 }
+                yield_after_socket_write_if_needed(&socket, written).await;
                 remaining = &remaining[written..];
             }
             tx_substrate::step::StepOutcome::Yield { progress, shape } => {
                 let written = progress.bytes();
                 if written > 0 {
                     total += written;
-                    drive_tcp_loopback_after_socket_write(&socket, written);
+                    drive_loopback_after_socket_write(&socket, written);
                     if written >= remaining.len() {
+                        yield_after_socket_write_if_needed(&socket, written).await;
                         return SyscallResult::Return(total as i64);
                     }
+                    yield_after_socket_write_if_needed(&socket, written).await;
                     remaining = &remaining[written..];
                 } else if flags.is_nonblocking() {
                     if total > 0 {
@@ -1710,6 +1806,95 @@ async fn sys_write_socket(
     }
 }
 
+async fn sys_write_udp_loopback_socket(
+    socket: &Cap<tx_subsystems::net::SocketIdentity>,
+    bytes: &[u8],
+    flags: tx_subsystems::net::SendRecvFlags,
+) -> SyscallResult {
+    loop {
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            tx_subsystems::net::execution::step_send_udp_loopback_kernel_bytes(
+                socket, None, bytes, flags, &guard,
+            )
+        };
+        match outcome {
+            tx_substrate::step::StepOutcome::Done(written) => {
+                return SyscallResult::Return(written as i64);
+            }
+            tx_substrate::step::StepOutcome::Continue { progress } => {
+                return SyscallResult::Return(progress.bytes() as i64);
+            }
+            tx_substrate::step::StepOutcome::Yield { progress, shape } => {
+                if progress.bytes() > 0 {
+                    return SyscallResult::Return(progress.bytes() as i64);
+                }
+                if flags.is_nonblocking() {
+                    return SyscallResult::Error(EAGAIN_VALUE);
+                }
+                match shape {
+                    tx_substrate::step::YieldShape::OnWaitSource { source, interests }
+                    | tx_substrate::step::YieldShape::OnEdge { source, interests } => {
+                        let token =
+                            tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
+                        if let Some(future) = wait_source::wait_on_token(token) {
+                            let _ = future.await;
+                        }
+                    }
+                    tx_substrate::step::YieldShape::OnAgent { .. }
+                    | tx_substrate::step::YieldShape::OnTimer { .. } => {
+                        return SyscallResult::Error(EIO_VALUE);
+                    }
+                }
+            }
+            tx_substrate::step::StepOutcome::Err(errno) => {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
+    }
+}
+
+fn udp_write_can_drive_loopback_inline(socket: &Cap<tx_subsystems::net::SocketIdentity>) -> bool {
+    if socket.kind != tx_subsystems::net::SocketKind::Udp {
+        return false;
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return false;
+    };
+    match payload.protocol_snapshot() {
+        tx_subsystems::net::SocketProtocol::Udp(tx_subsystems::net::UdpInner::Connected {
+            local,
+            remote,
+        }) => {
+            udp_local_allows_loopback_inline(local)
+                && remote.addr == tx_subsystems::net::Ipv4Address::LOOPBACK
+        }
+        _ => false,
+    }
+}
+
+fn udp_local_allows_loopback_inline(local: tx_subsystems::net::IpEndpoint) -> bool {
+    local.addr == tx_subsystems::net::Ipv4Address::UNSPECIFIED
+        || local.addr == tx_subsystems::net::Ipv4Address::LOOPBACK
+}
+
+async fn yield_after_socket_write_if_needed(
+    socket: &Cap<tx_subsystems::net::SocketIdentity>,
+    written: usize,
+) {
+    if written > 0 && matches!(socket.kind, tx_subsystems::net::SocketKind::Tcp) {
+        tx_reactor::yield_now().await;
+    }
+}
+
+fn drive_loopback_after_socket_write(
+    socket: &Cap<tx_subsystems::net::SocketIdentity>,
+    written: usize,
+) {
+    drive_tcp_loopback_after_socket_write(socket, written);
+    drive_udp_loopback_after_socket_write(socket, written);
+}
+
 fn drive_tcp_loopback_after_socket_write(
     socket: &Cap<tx_subsystems::net::SocketIdentity>,
     written: usize,
@@ -1722,6 +1907,29 @@ fn drive_tcp_loopback_after_socket_write(
     socket
         .readiness
         .clear_send(tx_subsystems::net::structure::SendWireSet::SPACE);
+}
+
+fn drive_udp_loopback_after_socket_write(
+    socket: &Cap<tx_subsystems::net::SocketIdentity>,
+    written: usize,
+) {
+    if written == 0 {
+        return;
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return;
+    };
+    if !matches!(
+        payload.protocol_snapshot(),
+        tx_subsystems::net::SocketProtocol::Udp(
+            tx_subsystems::net::UdpInner::Bound { .. }
+                | tx_subsystems::net::UdpInner::Connected { .. }
+        )
+    ) {
+        return;
+    }
+    let guard = tx_substrate::epoch::guard();
+    let _ = tx_subsystems::net::execution::step_process_loopback_udp(socket, 8, &guard);
 }
 
 fn drive_loopback_pending() {
@@ -1768,6 +1976,12 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
 
     if !file.flags().read {
         return SyscallResult::Error(EBADF_VALUE);
+    }
+
+    let len = inline_io_len_for_file(&file, len);
+
+    if len == 0 {
+        return SyscallResult::Return(0);
     }
 
     // PR-10 phase 5: userfaultfd fds carry their own `read(2)` arm
@@ -2479,7 +2693,7 @@ async fn sys_read_socket<'a>(
     if file.flags().nonblocking {
         flags |= tx_subsystems::net::SendRecvFlags::MSG_DONTWAIT;
     }
-    let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len.min(TTY_WRITE_MAX_INLINE)];
+    let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len.min(SOCKET_IO_MAX_INLINE)];
 
     if matches!(
         socket.kind,
@@ -2534,6 +2748,7 @@ async fn sys_read_socket<'a>(
     }
 
     loop {
+        drive_loopback_pending();
         let outcome = {
             let guard = tx_substrate::epoch::guard();
             tx_subsystems::net::execution::step_recv_kernel_bytes(
@@ -2552,6 +2767,7 @@ async fn sys_read_socket<'a>(
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
                 }
+                yield_after_socket_read_if_needed(&socket, recv.bytes).await;
                 return SyscallResult::Return(recv.bytes as i64);
             }
             tx_substrate::step::StepOutcome::Yield { shape, .. } => {
@@ -2578,5 +2794,24 @@ async fn sys_read_socket<'a>(
                 return SyscallResult::Error(errno_to_i32(errno));
             }
         }
+    }
+}
+
+fn inline_io_len_for_file(file: &Cap<OpenFile>, len: usize) -> usize {
+    match file.rnode().backing() {
+        tx_subsystems::vfs::RNodeBacking::PageBacked { .. } => len,
+        tx_subsystems::vfs::RNodeBacking::StructBacked {
+            payload: tx_subsystems::vfs::structure::StructPayload::Socket { .. },
+        } => len.min(SOCKET_IO_MAX_INLINE),
+        _ => len.min(TTY_WRITE_MAX_INLINE),
+    }
+}
+
+async fn yield_after_socket_read_if_needed(
+    socket: &Cap<tx_subsystems::net::SocketIdentity>,
+    bytes: usize,
+) {
+    if bytes > 0 && socket.kind == tx_subsystems::net::SocketKind::Tcp {
+        tx_reactor::yield_now().await;
     }
 }

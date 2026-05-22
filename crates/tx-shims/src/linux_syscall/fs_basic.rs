@@ -739,12 +739,11 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
 // (`fd`, `set_fd`, `set_fd_cloexec`). When fd-table mutation gains a
 // StepOp wrap, thread `&mut KernelScriptCtx` here.
 /// PR-3 migration: `CloseOp` is a `OneShotStepOp` — dispatched via
-/// `drive_oneshot` (no reactor, no yield).
-pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
-    let closing_file = ctx.process.fd(fd);
-    if let Some(file) = closing_file.as_deref() {
-        maybe_close_socket_file(file);
-    }
+/// `drive_oneshot`; socket-backed files are closed only after the fd-table
+/// slot is removed, so duplicated/fork-inherited open-file descriptions keep
+/// their underlying socket alive until the last reference closes.
+pub(super) async fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let file_to_close = ctx.process.fd(fd);
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = CloseOp {
         process: ctx.process.clone(),
@@ -752,19 +751,14 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => {
-            if let Some(file) = closing_file.as_deref() {
+            if let Some(file) = file_to_close {
                 file.flock_release();
-                fcntl_release_process_locks_for_file(ctx.process.pid.0, file);
+                fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
+                maybe_close_socket_file_after_fd_remove(&file);
             }
             SyscallResult::Return(0)
         }
-        Err(v3errno) => {
-            if Errno::from(v3errno) == Errno::EBADF && super::net::close_socket_fd(fd, ctx) {
-                SyscallResult::Return(0)
-            } else {
-                SyscallResult::error_from(Errno::from(v3errno))
-            }
-        }
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -1875,6 +1869,22 @@ pub(super) fn inode_meta_to_stat(meta: &InodeMeta, ino: u64, rdev: u64) -> StatL
     }
 }
 
+fn linux_encode_dev_t(major: u32, minor: u32) -> u64 {
+    ((minor & 0xff) as u64)
+        | (((major & 0xfff) as u64) << 8)
+        | (((minor & !0xff) as u64) << 12)
+        | (((major & !0xfff) as u64) << 32)
+}
+
+fn stat_rdev_for_open_file(file: &Cap<OpenFile>) -> u64 {
+    match file.rnode().backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::CharDevice(binding),
+        } => linux_encode_dev_t(binding.devt.major(), binding.devt.minor()),
+        _ => 0,
+    }
+}
+
 fn inode_meta_to_statx(meta: &InodeMeta, ino: u64) -> StatxLayout {
     let ts = |sec, nsec| StatxTimestamp {
         tv_sec: sec,
@@ -1971,7 +1981,7 @@ pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     let fs_object_id = rnode.fs_object_id();
     let meta = stat_meta_for_open_file(&file);
     let ino = fs_object_id.as_u64();
-    let stat = inode_meta_to_stat(&meta, ino, 0);
+    let stat = inode_meta_to_stat(&meta, ino, stat_rdev_for_open_file(&file));
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
         return SyscallResult::error_from(errno);

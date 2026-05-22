@@ -8,6 +8,7 @@
 use super::*;
 
 use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
+use tx_subsystems::net::protocol::loopback_iface;
 use tx_subsystems::net::{
     net_namespace_payload_from_file, netlink_netfilter_recv, netlink_netfilter_send,
     netlink_route_recv, netlink_route_send_with_netns_resolvers, require_net_raw,
@@ -19,7 +20,7 @@ use tx_subsystems::net::{
     AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, Ipv4MulticastGroup, KernelSockAddr,
     LingerOption, PollMask, SendRecvFlags, SockAddrIn, SockAddrLl, SockShutdownCmd,
     SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol, SocketType, TcpState, UdpInner,
-    UnixDatagramState, UnixSocketPath, UnixStreamState, ValidSocketType,
+    UnixDatagramState, UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
 };
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::vfs::structure::OpenFileBacking;
@@ -51,6 +52,7 @@ const IPT_GETINFO_BYTES: usize = 84;
 const IPT_GET_ENTRIES_EMPTY_BYTES: usize = 36;
 const GROUP_REQ_BYTES: u32 = 136;
 const GROUP_REQ_GROUP_OFFSET: usize = 8;
+const IPV4_TCP_HEADER_BYTES: u16 = 40;
 
 #[derive(Clone, Copy)]
 struct UserIovec {
@@ -479,6 +481,9 @@ fn bind_with_ephemeral_port(socket: &Cap<SocketIdentity>, addr: KernelSockAddr) 
     }
 
     for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
+        if ephemeral_port_in_use(socket, port) {
+            continue;
+        }
         let local = KernelSockAddr::V4(SockAddrIn::new(port, requested.addr));
         let outcome = {
             let guard = tx_substrate::epoch::guard();
@@ -494,6 +499,33 @@ fn bind_with_ephemeral_port(socket: &Cap<SocketIdentity>, addr: KernelSockAddr) 
         }
     }
     SyscallResult::Error(errno_to_i32(Errno::EADDRINUSE))
+}
+
+fn ephemeral_port_in_use(socket: &Cap<SocketIdentity>, port: u16) -> bool {
+    let Some(payload) = socket.acquire_operational() else {
+        return false;
+    };
+    let table = payload.socket_table();
+    let guard = tx_substrate::epoch::guard();
+
+    match socket.kind {
+        SocketKind::Tcp => table
+            .snapshot_tcp_bound(&guard)
+            .into_iter()
+            .chain(table.snapshot_tcp_listeners(&guard))
+            .any(|existing| {
+                existing.raw() != socket.raw()
+                    && socket_local_endpoint(&existing).is_ok_and(|local| local.port == port)
+            }),
+        SocketKind::Udp => table
+            .snapshot_udp_bound(&guard)
+            .into_iter()
+            .any(|existing| {
+                existing.raw() != socket.raw()
+                    && socket_local_endpoint(&existing).is_ok_and(|local| local.port == port)
+            }),
+        _ => false,
+    }
 }
 
 fn drive_tcp_loopback_after_sendto(socket: &Cap<SocketIdentity>, written: usize) {
@@ -559,6 +591,15 @@ async fn finish_sendto_progress(
     yield_after_sendto_if_needed(socket).await;
 }
 
+fn drive_loopback_pending() {
+    let guard = tx_substrate::epoch::guard();
+    let _ = tx_subsystems::net::execution::step_process_loopback_pending_zero(
+        tx_subsystems::net::protocol::loopback_iface(),
+        tx_subsystems::net::execution::LOOPBACK_POLL_BUDGET_DEFAULT,
+        &guard,
+    );
+}
+
 fn recv_ready_mask(mask: PollMask) -> bool {
     mask.intersects(PollMask::IN | PollMask::ERR | PollMask::HUP | PollMask::RDHUP)
 }
@@ -581,7 +622,7 @@ fn recv_queued_len(socket: &Cap<SocketIdentity>) -> usize {
 }
 
 fn socket_recv_should_yield_after_success(socket: &Cap<SocketIdentity>, bytes: usize) -> bool {
-    bytes > 0 && matches!(socket.kind, SocketKind::Tcp | SocketKind::Udp)
+    bytes > 0 && socket.kind == SocketKind::Tcp
 }
 
 fn sendto_can_drive_loopback_inline(socket: &Cap<SocketIdentity>, dst: Option<IpEndpoint>) -> bool {
@@ -604,6 +645,31 @@ fn sendto_can_drive_loopback_inline(socket: &Cap<SocketIdentity>, dst: Option<Ip
 
 fn local_allows_loopback_inline(local: IpEndpoint) -> bool {
     local.addr == Ipv4Address::UNSPECIFIED || local.addr == Ipv4Address::LOOPBACK
+}
+
+fn tcp_effective_maxseg(socket: &Cap<SocketIdentity>) -> i32 {
+    let route_mss = tcp_route_maxseg(socket);
+    let configured = socket
+        .acquire_operational()
+        .map(|payload| payload.with_options(|opts| opts.tcp.maxseg))
+        .unwrap_or(0);
+    let maxseg = if configured == 0 {
+        route_mss
+    } else {
+        configured.min(route_mss)
+    };
+    i32::from(maxseg)
+}
+
+fn tcp_route_maxseg(socket: &Cap<SocketIdentity>) -> u16 {
+    let mtu = match socket_peer_endpoint(socket) {
+        Ok(peer) if peer.addr == Ipv4Address::LOOPBACK => loopback_iface().mtu(),
+        _ => match socket_local_endpoint(socket) {
+            Ok(local) if local.addr == Ipv4Address::LOOPBACK => loopback_iface().mtu(),
+            _ => VIRTIO_NET_DEFAULT_MTU,
+        },
+    };
+    mtu.saturating_sub(IPV4_TCP_HEADER_BYTES).max(1)
 }
 
 pub(super) fn sys_getsockname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
@@ -891,6 +957,7 @@ pub(super) async fn sys_recvfrom<'a, P: TimeIf>(
 
     let mut yielded_before_wait = false;
     loop {
+        drive_loopback_pending();
         if recv_queued_len(&socket) == 0 {
             let ready = {
                 let guard = tx_substrate::epoch::guard();
@@ -1553,10 +1620,14 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             Ok(())
         }
         (IPPROTO_TCP, TCP_MAXSEG) => {
-            let _ = match read_sockopt_positive_usize(ctx, optval, optlen) {
+            let size = match read_sockopt_positive_usize(ctx, optval, optlen) {
                 Ok(size) => size,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
+            if size > u16::MAX as usize {
+                return SyscallResult::Error(EINVAL_VALUE);
+            }
+            payload.with_options_mut(|opts| opts.tcp.maxseg = size as u16);
             Ok(())
         }
         (SOL_NETLINK, NETLINK_EXT_ACK)
@@ -1678,7 +1749,9 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             optlen_ptr,
             payload.with_options(|o| o.tcp.nodelay as i32),
         ),
-        (IPPROTO_TCP, TCP_MAXSEG) => write_sockopt_i32(ctx, optval, optlen_ptr, 1460),
+        (IPPROTO_TCP, TCP_MAXSEG) => {
+            write_sockopt_i32(ctx, optval, optlen_ptr, tcp_effective_maxseg(&socket))
+        }
         (IPPROTO_TCP, TCP_INFO) => write_sockopt_bytes(ctx, optval, optlen_ptr, &[0u8; 104]),
         (IPPROTO_TCP, TCP_CONGESTION) => write_sockopt_bytes(ctx, optval, optlen_ptr, b"reno\0"),
         (SOL_NETLINK, NETLINK_EXT_ACK)
@@ -1727,8 +1800,12 @@ pub(super) fn sys_shutdown<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
     }
 }
 
-pub(super) fn maybe_close_socket_file(file: &Cap<OpenFile>) {
-    if file.retain_count() > 2 {
+pub(super) fn maybe_close_socket_file_after_fd_remove(file: &Cap<OpenFile>) {
+    // `CloseOp` has already removed the fd-table entry. The `Cap` passed here
+    // is the syscall's temporary reference; if anything else still retains the
+    // same open-file description (dup, fork, or another in-kernel owner), the
+    // underlying socket must stay alive.
+    if file.retain_count() > 1 {
         return;
     }
     let socket = match socket_identity_from_file(file) {

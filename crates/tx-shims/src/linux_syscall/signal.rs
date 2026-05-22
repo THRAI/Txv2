@@ -608,26 +608,20 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
         None => return SyscallResult::Error(EINVAL_VALUE),
     };
 
-    let siginfo = Some(SigInfo {
-        si_signo: signum.raw() as u32,
-        si_code: SI_USER,
-        si_pid: ctx.process.pid.0,
-        si_uid: 0, // TODO: populate from cred when available
-    });
-
-    // Route through the cred-checked script entry point. Drives
-    // `cred::require_signal_send` against the caller's syscall-entry
-    // snapshot (per cred_service_v_1 §"In flight" + §"Checks
-    // surface") and only then commits the post via `step_kill_process`.
-    // Going through `KillProcessOp::drive_oneshot` directly would
-    // bypass the cred check, since `KillProcessOp::step` calls the
-    // primitive `step_kill_process` without authorization.
-    use tx_subsystems::signal::KillScriptOutcome;
+    // Route through the cred-checked, disposition-aware script entry
+    // point. Default-terminate signals such as SIGTERM must take
+    // effect even if the target is blocked inside a syscall (for
+    // example a server waiting in accept(2)); merely posting the bit
+    // and waiting for a later AST checkpoint leaves such daemons alive.
     dispatch_errno(
-        tx_subsystems::signal::script_kill_process(&ctx.process, &target, signum, siginfo),
+        tx_subsystems::signal::script_deliver_signal(
+            &ctx.process,
+            SignalTarget::Process(target),
+            signum,
+        ),
         |outcome| match outcome {
-            KillScriptOutcome::Delivered | KillScriptOutcome::Probed => SyscallResult::Return(0),
-            KillScriptOutcome::NoLiveThread => SyscallResult::Error(ESRCH_VALUE),
+            KillOutcome::Delivered => SyscallResult::Return(0),
+            KillOutcome::NoLiveThread => SyscallResult::Error(ESRCH_VALUE),
         },
     )
 }

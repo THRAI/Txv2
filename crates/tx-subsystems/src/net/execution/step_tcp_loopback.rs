@@ -9,6 +9,8 @@ use crate::net::structure::{
     ConnectionKey, IpEndpoint, Ipv4Address, SocketIdentity, SocketProtocol, TcpState,
 };
 
+const TCP_LOOPBACK_TRANSFER_PACKET_PASSES: usize = 64;
+
 #[derive(Clone)]
 pub struct LoopbackTcpConnectOutcome {
     pub child: Cap<SocketIdentity>,
@@ -181,7 +183,7 @@ pub fn step_process_loopback_tcp(
     let mut bytes_moved = 0;
     let mut peer_wake_fired = false;
     let mut egress_packets = 0;
-    for _ in 0..4 {
+    for _ in 0..TCP_LOOPBACK_TRANSFER_PACKET_PASSES {
         let Some(source_publish) = ctx.poll_egress_one(source, iface, guard) else {
             break;
         };
