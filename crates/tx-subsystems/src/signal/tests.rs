@@ -170,7 +170,7 @@ fn sigaction_installs_handler_and_returns_previous_disposition() {
     let second = step_sigaction(
         &proc_cap,
         Signum::SIGTERM,
-        SigDisposition::Handler(0xdead_beef),
+        SigDisposition::handler(0xdead_beef),
     );
     assert!(matches!(
         second,

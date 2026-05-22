@@ -3,8 +3,8 @@
 use super::{
     bootstrap_copy_from_user, bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user,
     errno_to_i32, read_user_cstr, SyscallCtx, SyscallResult, EBADF_VALUE, EFAULT_VALUE,
-    EINVAL_VALUE, ENAMETOOLONG_VALUE, ENOENT_VALUE, ENOMEM_VALUE, O_ACCMODE, O_CLOEXEC, O_CREAT,
-    O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
+    EINVAL_VALUE, ENAMETOOLONG_VALUE, ENOENT_VALUE, ENOMEM_VALUE, ENOSYS_VALUE, O_ACCMODE,
+    O_CLOEXEC, O_CREAT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
 };
 use alloc::vec::Vec;
 use tx_subsystems::execution::{Errno, WaitToken};

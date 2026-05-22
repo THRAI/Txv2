@@ -567,6 +567,7 @@ fn la64_prepare_signal_frame_keeps_complete_frame_bytes() {
         old_mask: UserSignalMaskAbi::EMPTY,
         flags: tx_hal::UserSaFlagsAbi::EMPTY,
         handler_pc: UserPtr::new(0x5000),
+        restorer_pc: UserPtr::new(0),
     };
 
     let (handler_ctx, frame_bytes) =
