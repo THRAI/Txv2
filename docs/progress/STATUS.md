@@ -37,12 +37,13 @@
   zombie_process_pid_remains_resolvable_until_reap`; `cargo test -p
   tx-subsystems --lib setsid_rejects_existing_process_group_leader`; `cargo
   check -p tx-subsystems`.
-  **Blocked:** package-level `cargo test -p tx-subsystems
-  ordinary_thread_exit_decrements_live_thread_count` currently fails before the
-  target test because `crates/tx-subsystems/tests/v3_signal_mailbox.rs` still
-  calls the old three-argument `post_signal` signature; `cargo xtask progress
-  validate` is still blocked by the pre-existing `completed` status in
-  `docs/progress/plans/2026-05-19-pthread-shared-clone-thread.json`.
+  **Follow-up unblock:** local validation is clear again after the
+  `v3_signal_mailbox` integration test was aligned with the current
+  four-argument `post_signal(thread, sig, routing, info)` API and the
+  pthread shared-clone plan status was normalized to the validator's
+  `complete` enum.
+  **Verified:** `cargo check -p tx-subsystems`; `cargo xtask progress
+  validate`.
   **Next step:** finish `setpgid` cross-process/session rules, wait
   stop/continue semantics, and full async GroupExit completion.
   **Records:** `docs/progress/research/2026-05-22-process-implementation-audit.md`;
