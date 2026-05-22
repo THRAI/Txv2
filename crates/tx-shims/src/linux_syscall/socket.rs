@@ -580,6 +580,10 @@ fn recv_queued_len(socket: &Cap<SocketIdentity>) -> usize {
     payload.io_snapshot().recv_len
 }
 
+fn socket_recv_should_yield_after_success(socket: &Cap<SocketIdentity>, bytes: usize) -> bool {
+    bytes > 0 && matches!(socket.kind, SocketKind::Tcp | SocketKind::Udp)
+}
+
 fn sendto_can_drive_loopback_inline(socket: &Cap<SocketIdentity>, dst: Option<IpEndpoint>) -> bool {
     if socket.kind != SocketKind::Udp {
         return false;
@@ -951,6 +955,9 @@ pub(super) async fn sys_recvfrom<'a, P: TimeIf>(
                     if let Err(errno) = write_sockaddr_endpoint(ctx, args[4], args[5], source) {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
+                }
+                if socket_recv_should_yield_after_success(&socket, recv.bytes) {
+                    tx_reactor::yield_now().await;
                 }
                 return SyscallResult::Return(recv.bytes as i64);
             }
