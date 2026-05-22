@@ -800,6 +800,9 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
         let Some(token) = wait_token else {
             if let Some(deadline_ns) = timeout_deadline_ns {
                 wait_until_pselect_deadline::<P>(deadline_ns).await;
+            } else if timeout == PselectTimeout::Infinite {
+                tx_reactor::yield_now().await;
+                continue;
             }
             break (read_ready, write_ready, except_ready, ready_count);
         };

@@ -221,6 +221,98 @@ fn udp_loopback_sendto_reaches_wildcard_bound_receiver() {
 }
 
 #[test]
+fn udp_loopback_wildcard_server_reply_reaches_connected_client() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let iface = LoopbackIface::new(IfaceCommon::new(
+        Ipv4Address::LOOPBACK,
+        Ipv4Address::new([255, 0, 0, 0]),
+        1500,
+    ));
+    let server = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("server udp");
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("client udp");
+
+    assert_eq!(
+        step_bind(&server, any_inet(40_197), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_bind(&client, inet(50_197), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_connect(&client, inet(40_197), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_kernel_bytes(&client, b"ping", SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(4)
+    );
+
+    let client_to_server = match step_process_loopback_udp_on_iface(&client, 8, &iface, &guard) {
+        StepOutcome::Done(outcome) => outcome,
+        _ => panic!("unexpected client udp loopback outcome"),
+    };
+    assert_eq!(client_to_server.bytes_moved, 4);
+
+    let mut request = [0u8; 8];
+    let request_recv =
+        match step_recv_kernel_bytes(&server, &mut request, SendRecvFlags::empty(), &guard) {
+            StepOutcome::Done(outcome) => outcome,
+            _ => panic!("unexpected server recv outcome"),
+        };
+    assert_eq!(request_recv.bytes, 4);
+    assert_eq!(&request[..4], b"ping");
+    assert_eq!(request_recv.source, Some(endpoint(50_197)));
+    assert_eq!(
+        request_recv.destination,
+        Some(IpEndpoint::new(Ipv4Address::LOOPBACK, 40_197))
+    );
+
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &server,
+            request_recv.source,
+            b"pong",
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(4)
+    );
+
+    let server_to_client = match step_process_loopback_udp_on_iface(&server, 8, &iface, &guard) {
+        StepOutcome::Done(outcome) => outcome,
+        _ => panic!("unexpected server udp loopback outcome"),
+    };
+    assert_eq!(server_to_client.bytes_moved, 4);
+
+    let mut response = [0u8; 8];
+    assert_eq!(
+        step_recv_kernel_bytes(&client, &mut response, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(SocketRecvBytesOutcome {
+            bytes: 4,
+            source: Some(endpoint(40_197)),
+            unix_source: None,
+            destination: Some(endpoint(50_197)),
+            truncated: false,
+            became_empty: true,
+        })
+    );
+    assert_eq!(&response[..4], b"pong");
+}
+
+#[test]
 fn udp_loopback_inline_send_can_defer_delegate_poll_kick() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK

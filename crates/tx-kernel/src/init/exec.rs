@@ -102,6 +102,26 @@ fn oscomp_lmbench_network_cmd(libc: &str) -> alloc::string::String {
     )
 }
 
+fn oscomp_netperf_udp_rr_cmd(libc: &str) -> alloc::string::String {
+    use alloc::format;
+
+    let root = oscomp_libc_root(libc);
+    let group = oscomp_group_label("netperf-udp-rr", libc);
+    format!(
+        "cd {root} || exit 1; \
+	    ip=127.0.0.1; port=12865; \
+	    ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\"; \
+	    ./netserver -D -L $ip -p $port & server_pid=$!; \
+	    ./busybox sleep 1; \
+	    ./busybox echo \"====== netperf UDP_RR begin ======\"; \
+	    ./netperf -H $ip -p $port -t UDP_RR -l 1 -- -s 16k -S 16k -m 1k -M 1k -r 64,64 -R 1; \
+	    if [ $? = 0 ]; then ans=success; else ans=fail; fi; \
+	    ./busybox echo \"====== netperf UDP_RR end: $ans ======\"; \
+	    ./busybox kill -9 $server_pid; \
+	    ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\""
+    )
+}
+
 fn oscomp_libc_root(libc: &str) -> &'static str {
     match libc {
         "glibc" => "/musl/glibc",
@@ -959,6 +979,10 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
             return oscomp_lmbench_network_cmd("musl");
         }
         Some("lmbench-network-glibc") => return oscomp_lmbench_network_cmd("glibc"),
+        Some("netperf-udp-rr" | "netperf-udp-rr-musl") => {
+            return oscomp_netperf_udp_rr_cmd("musl");
+        }
+        Some("netperf-udp-rr-glibc") => return oscomp_netperf_udp_rr_cmd("glibc"),
         Some("ltp-glibc") => {
             return String::from("cd /musl/glibc && /musl/musl/busybox sh ltp_testcode.sh");
         }
