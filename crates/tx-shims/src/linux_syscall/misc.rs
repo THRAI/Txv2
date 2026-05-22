@@ -83,7 +83,7 @@ pub(super) fn sys_uname<'a, P: AuxvIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let pid = args[0] as u32;
     let resource = args[1] as u32;
-    let _new_uaddr = args[2]; // ignored — limits not enforced today.
+    let new_uaddr = args[2];
     let old_uaddr = args[3];
 
     if pid != 0 && pid != ctx.process.pid.0 {
@@ -92,11 +92,26 @@ pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
         return SyscallResult::Error(EPERM_VALUE);
     }
 
+    if resource == RLIMIT_NOFILE && new_uaddr != 0 {
+        let new_limit = match bootstrap_read_user::<RlimitLayout>(&ctx.aspace, new_uaddr) {
+            Ok(limit) => limit,
+            Err(errno) => return SyscallResult::error_from(errno),
+        };
+        if new_limit.rlim_cur > new_limit.rlim_max || new_limit.rlim_max > u32::MAX as u64 {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        ctx.process
+            .set_rlimit_nofile(new_limit.rlim_cur as u32, new_limit.rlim_max as u32);
+    }
+
     let limit = match resource {
-        RLIMIT_NOFILE => RlimitLayout {
-            rlim_cur: 1024,
-            rlim_max: 4096,
-        },
+        RLIMIT_NOFILE => {
+            let (cur, max) = ctx.process.rlimit_nofile();
+            RlimitLayout {
+                rlim_cur: cur as u64,
+                rlim_max: max as u64,
+            }
+        }
         RLIMIT_STACK => RlimitLayout {
             rlim_cur: 8 * 1024 * 1024,
             rlim_max: RLIM_INFINITY,

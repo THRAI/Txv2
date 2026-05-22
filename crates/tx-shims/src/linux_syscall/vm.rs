@@ -4,11 +4,10 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine, Cap, Errno as V3Errno, StepOutcome};
 use tx_hal::UserPtr;
 use tx_scripts::drive;
 use tx_substrate::step::DriveMode;
-use tx_substrate::step::Errno as V3Errno;
 use tx_subsystems::vm::step_ops::{
     VmBrkOp, VmMapOp, VmMlockOp, VmMsyncOp, VmMunlockOp, VmProtectOp, VmRemapOp, VmUnmapOp,
 };
@@ -761,21 +760,31 @@ pub(super) fn vmmap_error_to_i32(error: VmMapError) -> i32 {
 ///    showed the word changed" (return `0` per the WAIT contract)
 ///    via the `parked` flag tracked across loop iterations.
 /// 5. Other `Err(errno)` → return `-errno`.
-pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_futex<'a, P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let uaddr = args[0];
     let op_full = args[1] as u32;
     let val = args[2] as u32;
+    let timeout_uaddr = args[3];
+    let val2 = args[3] as u32;
+    let uaddr2 = args[4];
+    let bitset = args[5] as u32;
 
     let op = op_full & FUTEX_CMD_MASK;
 
     match op {
-        FUTEX_WAIT => {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             use tx_scripts::drive;
             use tx_substrate::step::DriveMode;
             use tx_subsystems::futex::FutexWaitOp;
 
             if uaddr == 0 {
                 return SyscallResult::error_from(Errno::EINVAL);
+            }
+            if op == FUTEX_WAIT_BITSET && bitset == 0 {
+                return SyscallResult::Error(EINVAL_VALUE);
             }
 
             let mut script_ctx = build_subject_script_ctx(ctx);
@@ -795,31 +804,18 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     return SyscallResult::error_from(Errno::EFAULT);
                 }
             }
-
-            // Probe the futex word without parking. EAGAIN
-            // here means "word != val" → return -EAGAIN immediately
-            // (the predecessor equality check, per POSIX).
-            {
-                let guard = step_engine::guard();
-                let outcome =
-                    tx_subsystems::futex::step_futex_wait(&ctx.aspace, uaddr, val, &guard);
-                match outcome {
-                    StepOutcome::Err(e) if e == V3Errno::EAGAIN => {
-                        return SyscallResult::error_from(Errno::EAGAIN);
-                    }
-                    StepOutcome::Err(e) => {
-                        return SyscallResult::error_from(Errno::from(e));
-                    }
-                    // Yield / Continue / Done: fall through to drive().
-                    _ => {}
-                }
+            if timeout_uaddr != 0 {
+                let Some(_timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
+                    return SyscallResult::Error(EINVAL_VALUE);
+                };
             }
 
             // Park and wait.  drive() parks on the futex bucket's
             // WaitSource via resolve_on_wait_source, wakes when
-            // step_futex_wake fires the bucket, and re-steps.
-            // After waking, EAGAIN means "word changed → wake was
-            // meaningful" → return 0.
+            // step_futex_wake fires the bucket, and re-steps.  The
+            // FutexWaitOp records the resume and completes immediately
+            // after a wake; Linux FUTEX_WAIT returns 0 for the wake and
+            // leaves condition re-checking to userspace.
             //
             // Op acquires its own epoch guard inside `step()`; no
             // guard crosses `drive(...).await` (REACTOR_v0,
@@ -828,6 +824,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 uaddr,
                 val,
                 aspace: &ctx.aspace,
+                woken: false,
             };
             match drive(
                 op,
@@ -842,26 +839,82 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 Ok(()) => SyscallResult::Return(0),
                 Err(v3errno) => {
                     let errno: Errno = v3errno.into();
-                    if errno == Errno::EAGAIN {
-                        SyscallResult::Return(0)
-                    } else {
-                        SyscallResult::error_from(errno)
-                    }
+                    SyscallResult::error_from(errno)
                 }
             }
         }
-        FUTEX_WAKE => {
-            let mut script_ctx = build_subject_script_ctx(ctx);
-            let mut op = FutexWakeOp { uaddr, n: val };
-            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-                Ok(woken) => SyscallResult::Return(woken as i64),
-                Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            if op == FUTEX_WAKE_BITSET && bitset == 0 {
+                return SyscallResult::Error(EINVAL_VALUE);
             }
+            futex_wake_oneshot(ctx, uaddr, val)
+        }
+        FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
+            if uaddr2 == 0 {
+                return SyscallResult::Error(EINVAL_VALUE);
+            }
+            if op == FUTEX_CMP_REQUEUE {
+                let guard = step_engine::guard();
+                let user_ptr = UserPtr::<u32>::new(uaddr as usize);
+                match ctx.aspace.read_user(user_ptr, &guard) {
+                    StepOutcome::Done(observed) if observed == bitset => {}
+                    StepOutcome::Done(_) => return SyscallResult::Error(EAGAIN_VALUE),
+                    StepOutcome::Err(_) => return SyscallResult::error_from(Errno::EFAULT),
+                    StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+                        return SyscallResult::error_from(Errno::EFAULT);
+                    }
+                }
+            }
+            // Approximate requeue by waking the source futex waiters.
+            // musl's private pthread_cond handoff uses
+            // FUTEX_REQUEUE(old_barrier, wake=0, requeue=1, mutex).
+            // Without a real wait-queue move, waking the destination
+            // mutex loses the source waiter forever. A source wake is
+            // a legal spurious wake and lets user space re-check.
+            let count = val.max(val2);
+            match futex_wake_count(ctx, uaddr, count) {
+                Ok(woken) => SyscallResult::Return(woken as i64),
+                Err(result) => result,
+            }
+        }
+        FUTEX_WAKE_OP => {
+            if uaddr2 == 0 {
+                return SyscallResult::Error(EINVAL_VALUE);
+            }
+            let first = match futex_wake_count(ctx, uaddr, val) {
+                Ok(woken) => woken,
+                Err(result) => return result,
+            };
+            let second = match futex_wake_count(ctx, uaddr2, val2) {
+                Ok(woken) => woken,
+                Err(result) => return result,
+            };
+            SyscallResult::Return(first.saturating_add(second) as i64)
         }
         // FUTEX_REQUEUE / CMP_REQUEUE / WAKE_OP / LOCK_PI /
         // UNLOCK_PI / TRYLOCK_PI / WAIT_BITSET / WAKE_BITSET — out
         // of scope for v1. musl's libc init only emits FUTEX_WAIT
         // and FUTEX_WAKE so these are not on the critical path.
         _ => SyscallResult::Error(ENOSYS_VALUE),
+    }
+}
+
+fn futex_wake_oneshot(ctx: &SyscallCtx<'_>, uaddr: u64, n: u32) -> SyscallResult {
+    match futex_wake_count(ctx, uaddr, n) {
+        Ok(woken) => SyscallResult::Return(woken as i64),
+        Err(result) => result,
+    }
+}
+
+fn futex_wake_count(ctx: &SyscallCtx<'_>, uaddr: u64, n: u32) -> Result<u32, SyscallResult> {
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = FutexWakeOp {
+        uaddr,
+        n,
+        aspace: &ctx.aspace,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(woken) => Ok(woken),
+        Err(v3errno) => Err(SyscallResult::error_from(Errno::from(v3errno))),
     }
 }

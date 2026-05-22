@@ -244,8 +244,6 @@ pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
 /// Wave 1's surface (`fork_aspace`'s `WouldBlock` cannot fire under
 /// v1's single-thread-per-process model). The function is non-`async`
 /// to keep the seam minimal.
-/// DIAGNOSTIC: track clone calls to debug pthread_create
-static CLONE_CALL_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 pub(super) async fn sys_clone<'a, P: PmapIf>(
     args: [u64; 6],
@@ -315,13 +313,21 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         .saved_user_context()
         .expect(":clone:no-context: kernel-invariant violation, parent thread had no saved_user_context");
 
-    let tls = if clone_settls { args[3] } else { 0 };
+    // Txv2's Linux syscall shim receives clone arguments in the
+    // asm-generic order used by the current userspace test images:
+    //   clone(flags, stack, ptid, tls, ctid)
+    // Treating LoongArch64 as ctid/tls here seeds the child thread
+    // pointer with the clear_child_tid address; pthread children then
+    // spin or fault after the first futex wake.
+    let (tls_arg, ctid_arg) = (args[3], args[4]);
+
+    let tls = if clone_settls { tls_arg } else { 0 };
 
     // ── CLONE_THREAD fast path ─────────────────────────────────
     // Create a new thread within the calling process — no new
     // ProcessIdentity is created.
     if clone_thread {
-        let ctid_ptr = if clone_child_cleartid { args[4] } else { 0 };
+        let ctid_ptr = if clone_child_cleartid { ctid_arg } else { 0 };
         let child_thread = tx_subsystems::process::execution::step_clone_thread(
             &ctx.process,
             &parent_user_ctx,
@@ -767,6 +773,41 @@ pub(super) fn sys_set_robust_list<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         let mut slot = payload.robust_list_head.lock();
         *slot = if head == 0 { None } else { Some(head) };
         *payload.robust_list_len.lock() = len;
+    }
+    SyscallResult::Return(0)
+}
+
+/// `get_robust_list(pid, head, len)`.
+///
+/// musl probes this before enabling robust mutexes. Returning the
+/// registered head/len for the current thread is enough for both
+/// private and process-shared robust mutex tests; non-current tids are
+/// resolved through the global pid/tid namespace when available.
+pub(super) fn sys_get_robust_list<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let pid = args[0];
+    let head_out = args[1];
+    let len_out = args[2];
+
+    let thread = if pid == 0 || pid == ctx.thread.tid.0 as u64 {
+        ctx.thread.clone()
+    } else {
+        match tx_subsystems::process::numbers::resolve_pid_number(pid) {
+            Some(tx_subsystems::process::numbers::PidName::Thread(thread)) => thread,
+            _ => return SyscallResult::Error(ESRCH_VALUE),
+        }
+    };
+
+    let Some(payload) = thread.payload_cap() else {
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+    let head = payload.robust_list_head.lock().unwrap_or(0);
+    let len = *payload.robust_list_len.lock() as u64;
+
+    if let Err(errno) = bootstrap_write_user::<u64>(&ctx.aspace, head_out, head) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+    if let Err(errno) = bootstrap_write_user::<u64>(&ctx.aspace, len_out, len) {
+        return SyscallResult::Error(errno_to_i32(errno));
     }
     SyscallResult::Return(0)
 }

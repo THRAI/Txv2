@@ -301,6 +301,9 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_procfs_at_proc();
             Self::mount_bdevfs_at_dev_block();
             Self::mount_sdcard_at_musl();
+            Self::populate_rootfs_shebang_shims();
+            Self::populate_rootfs_tmp_dirs();
+            Self::init_csprng();
             Self::bind_init_cwd_and_root();
 
             // Deferred H4 spine slots:
@@ -1936,6 +1939,7 @@ mod init_setuid_fixture;
 /// decision so each fd-ops/DAC/fork test owns its own pinned ABI).
 #[cfg(test)]
 mod init_lseek_fixture;
+mod rootfs_shims;
 
 #[cfg(test)]
 mod tests;

@@ -318,7 +318,7 @@ fn ast_check_deliver_handler_when_handler_installed() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Handler(0xCAFE));
+    let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::handler(0xCAFE));
     post_signal(
         &leader,
         Signum::SIGTERM,
@@ -331,6 +331,8 @@ fn ast_check_deliver_handler_when_handler_installed() {
         AstOutcome::DeliverHandler {
             sig: Signum::SIGTERM,
             handler: 0xCAFE,
+            flags: 0,
+            restorer: 0,
         }
     );
 }
@@ -664,7 +666,7 @@ fn ast_dispatch_deliver_handler_recognised_but_unrealised() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Handler(0xFEED));
+    let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::handler(0xFEED));
     post_signal(
         &leader,
         Signum::SIGTERM,
@@ -677,7 +679,9 @@ fn ast_dispatch_deliver_handler_recognised_but_unrealised() {
         outcome,
         AstOutcome::DeliverHandler {
             sig: Signum::SIGTERM,
-            handler: 0xFEED
+            handler: 0xFEED,
+            flags: 0,
+            restorer: 0,
         }
     );
     // Handler installation overrides the default-Term path; the

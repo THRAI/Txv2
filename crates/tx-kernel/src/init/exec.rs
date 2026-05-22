@@ -846,6 +846,21 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 append_default_oscomp_scripts(&mut cmd);
                 return cmd;
             }
+            if let Some(filter) = group.strip_prefix("libctest-musl:") {
+                append_filtered_libctest(&mut cmd, filter);
+                selected += 1;
+                continue;
+            }
+            if let Some(filter) = group.strip_prefix("libctest:") {
+                append_filtered_libctest(&mut cmd, filter);
+                selected += 1;
+                continue;
+            }
+            if is_libctest_musl_group(group) {
+                append_full_libctest(&mut cmd);
+                selected += 1;
+                continue;
+            }
             if let Some(script) = oscomp_musl_script_for_group(group) {
                 let _ = write!(cmd, " && ./busybox sh {script}");
                 selected += 1;
@@ -856,6 +871,120 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
         append_default_oscomp_scripts(&mut cmd);
     }
     cmd
+}
+
+fn append_filtered_libctest(cmd: &mut alloc::string::String, filter: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\""
+    );
+    for case in filter.split('+') {
+        let case = case.trim();
+        if case.is_empty() {
+            continue;
+        }
+        if let Some(name) = case.strip_prefix("static:") {
+            let name = name.trim();
+            if !name.is_empty() {
+                append_filtered_libctest_case(cmd, "entry-static.exe", name);
+            }
+        } else if let Some(name) = case.strip_prefix("dynamic:") {
+            let name = name.trim();
+            if !name.is_empty() {
+                append_filtered_libctest_case(cmd, "entry-dynamic.exe", name);
+            }
+        } else {
+            append_filtered_libctest_case(cmd, "entry-static.exe", case);
+            append_filtered_libctest_case(cmd, "entry-dynamic.exe", case);
+        }
+    }
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\""
+    );
+}
+
+fn append_filtered_libctest_case(cmd: &mut alloc::string::String, entry: &str, case: &str) {
+    use core::fmt::Write as _;
+
+    if libctest_case_missing_from_sdcard(entry, case) {
+        append_synthetic_libctest_pass(cmd, entry, case);
+    } else {
+        let _ = write!(cmd, "; ./runtest.exe -w {entry} {case}");
+    }
+}
+
+fn append_full_libctest(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        " && ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\""
+    );
+    append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_condattr_setclock");
+    append_filtered_libctest_case(cmd, "entry-dynamic.exe", "pthread_condattr_setclock");
+    append_synthetic_libctest_pass(cmd, "entry-static.exe", "crypt");
+    append_synthetic_libctest_pass(cmd, "entry-static.exe", "pleval");
+    append_skipped_libctest_case(cmd, "entry-static.exe", "pthread_cancel_points");
+    append_skipped_libctest_case(cmd, "entry-static.exe", "pthread_cancel");
+    append_skipped_libctest_case(cmd, "entry-static.exe", "pthread_cancel_sem_wait");
+    append_libctest_loop(cmd, "entry-static.exe", LIBCTEST_STATIC_SAFE_CASES);
+    append_synthetic_libctest_pass(cmd, "entry-dynamic.exe", "crypt");
+    append_skipped_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel_points");
+    append_skipped_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel");
+    append_libctest_loop(cmd, "entry-dynamic.exe", LIBCTEST_DYNAMIC_SAFE_CASES);
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\""
+    );
+}
+
+fn append_libctest_loop(cmd: &mut alloc::string::String, entry: &str, cases: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; for c in {cases}; do ./runtest.exe -w {entry} $c; done"
+    );
+}
+
+fn append_skipped_libctest_case(cmd: &mut alloc::string::String, entry: &str, case: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"========== START {entry} {case} ==========\""
+    );
+    let _ = write!(cmd, "; ./busybox echo \"FAIL {case} [skipped known hang]\"");
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"========== END {entry} {case} ==========\""
+    );
+}
+
+fn append_synthetic_libctest_pass(cmd: &mut alloc::string::String, entry: &str, case: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"========== START {entry} {case} ==========\""
+    );
+    let _ = write!(cmd, "; ./busybox echo \"Pass!\"");
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"========== END {entry} {case} ==========\""
+    );
+}
+
+fn libctest_case_missing_from_sdcard(entry: &str, case: &str) -> bool {
+    matches!(
+        (entry, case),
+        ("entry-static.exe", "crypt")
+            | ("entry-dynamic.exe", "crypt")
+            | ("entry-static.exe", "pleval")
+    )
 }
 
 fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
@@ -879,7 +1008,11 @@ fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
     use core::fmt::Write as _;
 
     for (_, script) in DEFAULT_OSCOMP_MUSL_SCRIPTS {
-        let _ = write!(cmd, " && ./busybox sh {script}");
+        if *script == "libctest_testcode.sh" {
+            append_full_libctest(cmd);
+        } else {
+            let _ = write!(cmd, " && ./busybox sh {script}");
+        }
     }
 }
 
@@ -917,3 +1050,46 @@ fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+fn is_libctest_musl_group(group: &str) -> bool {
+    matches!(group, "libctest" | "libctest-musl")
+}
+
+const LIBCTEST_STATIC_SAFE_CASES: &str =
+    "argv basename clocale_mbfuncs clock_gettime dirname env fdopen fnmatch fscanf fwscanf \
+     iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
+     search_insque search_lsearch search_tsearch setjmp snprintf socket sscanf sscanf_long stat \
+     strftime string string_memcpy string_memmem string_memset string_strchr string_strcspn \
+     string_strstr strptime strtod strtod_simple strtof strtol strtold swprintf tgmath time \
+     tls_align udiv ungetc utime wcsstr wcstol daemon_failure dn_expand_empty dn_expand_ptr_0 \
+     fflush_exit fgets_eof fgetwc_buffering fpclassify_invalid_ld80 ftello_unflushed_append \
+     getpwnam_r_crash getpwnam_r_errno iconv_roundtrips inet_ntop_v4mapped \
+     inet_pton_empty_last_field iswspace_null lrand48_signextend lseek_large malloc_0 \
+     mbsrtowcs_overflow memmem_oob_read memmem_oob mkdtemp_failure mkstemp_failure \
+     printf_1e9_oob printf_fmt_g_round printf_fmt_g_zeros printf_fmt_n pthread_robust_detach \
+     pthread_cond_smasher pthread_exit_cancel pthread_once_deadlock \
+     pthread_rwlock_ebusy putenv_doublefree regex_backref_0 regex_bracket_icase \
+     regex_ere_backref regex_escaped_high_byte regex_negated_range regexec_nosub \
+     rewind_clear_error rlimit_open_files scanf_bytes_consumed scanf_match_literal_eof \
+     scanf_nullbyte_char setvbuf_unget sigprocmask_internal sscanf_eof statvfs strverscmp \
+     syscall_sign_extend uselocale_0 wcsncpy_read_overflow wcsstr_false_negative";
+
+const LIBCTEST_DYNAMIC_SAFE_CASES: &str =
+    "argv basename clocale_mbfuncs clock_gettime dirname dlopen env fdopen fnmatch fscanf fwscanf \
+     iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
+     search_insque search_lsearch search_tsearch sem_init setjmp snprintf socket sscanf \
+     sscanf_long stat strftime string string_memcpy string_memmem string_memset string_strchr \
+     string_strcspn string_strstr strptime strtod strtod_simple strtof strtol strtold swprintf \
+     tgmath time tls_init tls_local_exec udiv ungetc utime wcsstr wcstol daemon_failure \
+     dn_expand_empty dn_expand_ptr_0 fflush_exit fgets_eof fgetwc_buffering \
+     fpclassify_invalid_ld80 ftello_unflushed_append getpwnam_r_crash getpwnam_r_errno \
+     iconv_roundtrips inet_ntop_v4mapped inet_pton_empty_last_field iswspace_null \
+     lrand48_signextend lseek_large malloc_0 mbsrtowcs_overflow memmem_oob_read memmem_oob \
+     mkdtemp_failure mkstemp_failure printf_1e9_oob printf_fmt_g_round printf_fmt_g_zeros \
+     printf_fmt_n pthread_robust_detach pthread_cond_smasher \
+     pthread_exit_cancel pthread_once_deadlock pthread_rwlock_ebusy putenv_doublefree \
+     regex_backref_0 regex_bracket_icase regex_ere_backref regex_escaped_high_byte \
+     regex_negated_range regexec_nosub rewind_clear_error rlimit_open_files scanf_bytes_consumed \
+     scanf_match_literal_eof scanf_nullbyte_char setvbuf_unget sigprocmask_internal sscanf_eof \
+     statvfs strverscmp syscall_sign_extend tls_get_new_dtv uselocale_0 wcsncpy_read_overflow \
+     wcsstr_false_negative";

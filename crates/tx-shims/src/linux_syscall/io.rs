@@ -61,7 +61,19 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     }
 
     const IOVEC_BYTES: u64 = 16;
-    if args[0] == 1 || args[0] == 2 {
+    let fd = args[0] as i32;
+    let stdio_tty_fast_path = (fd == 1 || fd == 2)
+        && resolve_fd(&ctx.process, fd as u32)
+            .map(|file| {
+                matches!(
+                    file.rnode().backing(),
+                    tx_subsystems::vfs::RNodeBacking::StructBacked {
+                        payload: tx_subsystems::vfs::StructPayload::Tty(_)
+                    }
+                )
+            })
+            .unwrap_or(false);
+    if stdio_tty_fast_path {
         let mut combined = alloc::vec::Vec::new();
         for i in 0..iovcnt as u64 {
             let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
@@ -778,6 +790,35 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
             SyscallResult::error_from(errno)
         }
     }
+}
+
+/// `pread64(fd, buf, count, offset)`.
+///
+/// Minimal implementation for seekable in-kernel files: temporarily
+/// snapshots the shared `OpenFile` offset, delegates to the existing
+/// `read(2)` path, then restores the original offset so callers do
+/// not observe a positioned read as a seek.
+pub(super) async fn sys_pread64<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let fd = args[0] as i32;
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    let offset = args[3];
+    if (offset as i64) < 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let file = match resolve_fd(&ctx.process, fd as u32) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let saved = file.offset();
+    file.set_offset(offset);
+    let result = sys_read::<P>(args, ctx).await;
+    file.set_offset(saved);
+    result
 }
 
 /// `sendfile64(out_fd, in_fd, offset, count)` — page-level copy from

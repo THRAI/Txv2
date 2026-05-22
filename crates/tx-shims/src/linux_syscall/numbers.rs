@@ -19,8 +19,38 @@ pub const NR_READ: u64 = 63;
 /// output goes through `writev` (not `write`), so this is on the
 /// busybox-startup hot path.
 pub const NR_WRITEV: u64 = 66;
+/// `pread64(fd, buf, count, offset)`. Linux generic ABI `__NR_pread64`.
+pub const NR_PREAD64: u64 = 67;
 /// `readv(fd, iov, iovcnt)`. Linux generic ABI `__NR_readv`.
 pub const NR_READV: u64 = 65;
+/// `socket(domain, type, protocol)`. Linux generic ABI `__NR_socket`.
+pub const NR_SOCKET: u64 = 198;
+/// `socketpair(domain, type, protocol, sv)`. Linux generic ABI `__NR_socketpair`.
+pub const NR_SOCKETPAIR: u64 = 199;
+/// `bind(sockfd, addr, addrlen)`. Linux generic ABI `__NR_bind`.
+pub const NR_BIND: u64 = 200;
+/// `listen(sockfd, backlog)`. Linux generic ABI `__NR_listen`.
+pub const NR_LISTEN: u64 = 201;
+/// `accept(sockfd, addr, addrlen)`. Linux generic ABI `__NR_accept`.
+pub const NR_ACCEPT: u64 = 202;
+/// `connect(sockfd, addr, addrlen)`. Linux generic ABI `__NR_connect`.
+pub const NR_CONNECT: u64 = 203;
+/// `getsockname(sockfd, addr, addrlen)`. Linux generic ABI `__NR_getsockname`.
+pub const NR_GETSOCKNAME: u64 = 204;
+/// `getpeername(sockfd, addr, addrlen)`. Linux generic ABI `__NR_getpeername`.
+pub const NR_GETPEERNAME: u64 = 205;
+/// `sendto(sockfd, buf, len, flags, dest_addr, addrlen)`. Linux generic ABI `__NR_sendto`.
+pub const NR_SENDTO: u64 = 206;
+/// `recvfrom(sockfd, buf, len, flags, src_addr, addrlen)`. Linux generic ABI `__NR_recvfrom`.
+pub const NR_RECVFROM: u64 = 207;
+/// `setsockopt(sockfd, level, optname, optval, optlen)`. Linux generic ABI `__NR_setsockopt`.
+pub const NR_SETSOCKOPT: u64 = 208;
+/// `getsockopt(sockfd, level, optname, optval, optlen)`. Linux generic ABI `__NR_getsockopt`.
+pub const NR_GETSOCKOPT: u64 = 209;
+/// `shutdown(sockfd, how)`. Linux generic ABI `__NR_shutdown`.
+pub const NR_SHUTDOWN: u64 = 210;
+/// `accept4(sockfd, addr, addrlen, flags)`. Linux generic ABI `__NR_accept4`.
+pub const NR_ACCEPT4: u64 = 242;
 /// `sendfile64(out_fd, in_fd, offset, count)`. Linux generic ABI
 /// `__NR_sendfile64`. Copies data from `in_fd` to `out_fd` via
 /// page-level transfer without an intermediate userspace buffer.
@@ -338,6 +368,9 @@ pub const NR_SET_TID_ADDRESS: u64 = 96;
 /// (futex robust-list registration) is deferred to the futex slice
 /// (`TODO(phase-futex)`).
 pub const NR_SET_ROBUST_LIST: u64 = 99;
+/// `get_robust_list(pid, head, len)`. Linux generic ABI
+/// `__NR_get_robust_list`.
+pub const NR_GET_ROBUST_LIST: u64 = 100;
 /// `sched_setaffinity(pid, cpusetsize, mask)`. Linux generic ABI.
 pub const NR_SCHED_SETAFFINITY: u64 = 122;
 /// `sched_getaffinity(pid, cpusetsize, mask)`. Linux generic ABI.

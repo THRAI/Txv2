@@ -54,6 +54,7 @@
 //! `WaitSourceId.raw()` round-trips cleanly to the right bucket's
 //! `WaitSource`.
 
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -113,6 +114,43 @@ static BUCKETS: SpinMutex<Option<[FutexBucket; FUTEX_BUCKET_COUNT]>> = SpinMutex
 /// fast path is the in-step `lock_buckets()` call which never
 /// re-initialises.
 static INITIALISED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FutexKey {
+    aspace: usize,
+    uaddr: u64,
+}
+
+struct FutexEntry {
+    channel: Channel,
+    source_id: u64,
+    wait_source: Arc<WaitSource>,
+}
+
+static EXACT_WAITERS: SpinMutex<Option<BTreeMap<FutexKey, FutexEntry>>> = SpinMutex::new(None);
+
+fn key_for(aspace: &AddressSpace, uaddr: u64) -> FutexKey {
+    let _ = aspace;
+    FutexKey {
+        // Cap deref addresses are not a stable cross-thread identity
+        // in all syscall paths. Use uaddr as the exact wake key for
+        // now; spurious cross-process wakes are permitted by futex
+        // semantics and user space re-checks its condition.
+        aspace: 0,
+        uaddr,
+    }
+}
+
+fn new_entry() -> FutexEntry {
+    let channel = Channel::new();
+    let source_id = wait_source::register_wait_channel(channel.clone());
+    let wait_source = wait_routing::new_wait_source(source_id);
+    FutexEntry {
+        channel,
+        source_id,
+        wait_source,
+    }
+}
 
 /// Initialise the bucket table. Idempotent: a second call is a
 /// no-op. Called once from [`crate::zones::register_all`].
@@ -200,18 +238,67 @@ pub fn step_futex_wait(
         return StepOutcome::Err(Errno::EAGAIN);
     }
     // upgrade — N/A (futex wait doesn't upgrade references)
-    // reserve — N/A (no zone allocation for futex wait)
-    // commit — register waiter under bucket lock via wait_routing
-    let idx = bucket_index(uaddr);
+    // reserve — lazy exact-key entry allocation if this futex word has
+    // never been waited on before.
+    // commit — while holding the futex table lock, re-read the word.
+    // This closes the common lost-wake window between the userspace
+    // value check and publishing the wait source.
+    let key = key_for(aspace, uaddr);
     let source_id = {
-        let guard = BUCKETS.lock();
-        let buckets = guard
-            .as_ref()
-            .expect("futex buckets uninitialised — register_zones not called");
-        buckets[idx].source_id
+        let mut table_guard = EXACT_WAITERS.lock();
+        let table = table_guard.get_or_insert_with(BTreeMap::new);
+        let observed_again: u32 = match aspace.read_user(UserPtr::<u32>::new(uaddr as usize), guard)
+        {
+            StepOutcome::Done(v) => v,
+            StepOutcome::Err(e) => return StepOutcome::Err(e),
+            StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+                return StepOutcome::Err(Errno::EFAULT);
+            }
+        };
+        if observed_again != val {
+            return StepOutcome::Err(Errno::EAGAIN);
+        }
+        table.entry(key).or_insert_with(new_entry).source_id
     };
-    // publish — yield OnWaitSource with carrier id and interest mask
+    // publish — yield on the exact `(AddressSpace, uaddr)` wait source.
+    // The old bucket source remains only as a compatibility wake path.
     step_engine::yield_until_wake(source_id, FUTEX_WAKE_MASK)
+}
+
+/// `futex(uaddr, FUTEX_WAKE, n, ...)` scoped to one address space.
+///
+/// This is the syscall/thread-exit path. It uses the exact
+/// `(AddressSpace, uaddr)` key that [`step_futex_wait`] published,
+/// avoiding the old bucket model's cross-address wakeups.
+pub fn step_futex_wake_in(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    n: u32,
+    _guard: &Guard<'_>,
+) -> StepOutcome<u32, NoProgress> {
+    if uaddr == 0 || (uaddr & 0x3) != 0 {
+        return StepOutcome::Err(Errno::EINVAL);
+    }
+    if n == 0 {
+        return StepOutcome::Done(0);
+    }
+
+    let key = key_for(aspace, uaddr);
+    let exact_wait_source = {
+        let table_guard = EXACT_WAITERS.lock();
+        table_guard
+            .as_ref()
+            .and_then(|table| table.get(&key))
+            .map(|entry| {
+                wait_routing::fire_legacy_channel(&entry.channel, FUTEX_WAKE_MASK);
+                entry.wait_source.clone()
+            })
+    };
+    if let Some(wait_source) = exact_wait_source {
+        wait_routing::notify_v3_source(&wait_source, FUTEX_WAKE_MASK);
+    }
+    let _ = step_futex_wake(uaddr, n, _guard);
+    StepOutcome::Done(n)
 }
 
 /// `futex(uaddr, FUTEX_WAKE, n, ...)`.
@@ -257,9 +344,8 @@ pub fn step_futex_wake(uaddr: u64, n: u32, _guard: &Guard<'_>) -> StepOutcome<u3
     };
     // PR-3D-2 new path: post `MailboxEvent::SourceFired` to any v3
     // caller that registered a `TaskMailbox` against this bucket's
-    // source. Per-waiter re-check on wakeup re-reads `*uaddr` and
-    // either returns success or re-parks.
-    // publish — notify v3 waiters via TaskMailbox, fire legacy channel
+    // source. Per the v1 bucket model this remains best-effort and
+    // reports the requested wake count.
     wait_routing::notify_v3_source(&wait_source, FUTEX_WAKE_MASK);
     StepOutcome::Done(n)
 }
@@ -323,35 +409,50 @@ pub struct FutexWaitOp<'a> {
     pub uaddr: u64,
     pub val: u32,
     pub aspace: &'a AddressSpace,
+    pub woken: bool,
 }
 
 impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
     type Output = ();
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        if self.woken {
+            return StepOutcome::Done(());
+        }
         let guard = adapter::step_engine::guard();
         step_futex_wait(self.aspace, self.uaddr, self.val, &guard)
+    }
+
+    fn apply_resume(&mut self, resume: adapter::step_engine::ResumeOutcome) -> Result<(), Errno> {
+        match resume {
+            adapter::step_engine::ResumeOutcome::Retry => {
+                self.woken = true;
+                Ok(())
+            }
+            _ => Err(Errno::EINVAL),
+        }
     }
 }
 
 /// StepOp wrap for [`step_futex_wake`]. PR-2 pilot. Note `Output = u32`,
 /// not `()` — wake returns the requested wake count.
-pub struct FutexWakeOp {
+pub struct FutexWakeOp<'a> {
     pub uaddr: u64,
     pub n: u32,
+    pub aspace: &'a AddressSpace,
 }
 
-impl<I: SubjectIdentity> StepOp<I> for FutexWakeOp {
+impl<I: SubjectIdentity> StepOp<I> for FutexWakeOp<'_> {
     type Output = u32;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let guard = adapter::step_engine::guard();
-        step_futex_wake(self.uaddr, self.n, &guard)
+        step_futex_wake_in(self.aspace, self.uaddr, self.n, &guard)
     }
 }
 
-impl OneShotStepOp for FutexWakeOp {}
-impl OneShotStepOp<crate::process::ProcessIdentity> for FutexWakeOp {}
+impl OneShotStepOp for FutexWakeOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for FutexWakeOp<'_> {}
 
 #[cfg(test)]
 mod tests {
@@ -707,6 +808,7 @@ mod tests {
                 uaddr,
                 aspace: &aspace,
                 val: 0xdead_beef,
+                woken: false,
             };
             let mut ctx = ScriptCtx::<ProcessIdentity>::new();
             let outcome = op.step(&mut ctx);

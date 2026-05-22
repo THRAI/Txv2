@@ -94,34 +94,25 @@ pub const DEVFS_SHM_DIR_MODE: u16 = S_IFDIR | 0o777;
 /// Stable `FsObjectId` for the synthetic `/dev/null` character device.
 pub const DEVFS_NULL_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7802);
 
+/// Stable `FsObjectId` for the static `/dev/zero` character device.
+pub const DEVFS_ZERO_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7803);
+
 /// `/dev/null` character device name as the lookup key.
 const DEVFS_NULL_NAME: &[u8] = b"null";
+
+/// `/dev/zero` directory name as the lookup key.
+const DEVFS_ZERO_NAME: &[u8] = b"zero";
 
 /// Mode for any character-device alias resolved by devfs (per the
 /// Phase 3a plan §"devfs FsOps surface": `S_IFCHR | 0o620`).
 pub const DEVFS_CHAR_MODE: u16 = S_IFCHR | 0o620;
 
+/// Mode for `/dev/null`; libc tests expect the conventional world
+/// readable/writable null device.
+pub const DEVFS_NULL_MODE: u16 = S_IFCHR | 0o666;
+
 /// Mode for the devfs root directory (`S_IFDIR | 0o755`).
 pub const DEVFS_ROOT_MODE: u16 = S_IFDIR | 0o755;
-
-struct NullOps;
-
-impl CharDeviceOps for NullOps {
-    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
-        StepOutcome::Done(0)
-    }
-
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
-        StepOutcome::Done(bytes.len())
-    }
-}
-
-static NULL_OPS: NullOps = NullOps;
-static NULL_BINDING: CharDeviceBinding = CharDeviceBinding {
-    devt: DevT::new(1, 3),
-    name: "null",
-    ops: &NULL_OPS,
-};
 
 /// Static read-only devfs backend.
 ///
@@ -132,6 +123,47 @@ static NULL_BINDING: CharDeviceBinding = CharDeviceBinding {
 /// without needing a constructor.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Devfs;
+
+struct NullCharOps;
+
+impl CharDeviceOps for NullCharOps {
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        StepOutcome::done(0)
+    }
+
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        StepOutcome::done(bytes.len())
+    }
+}
+
+static NULL_CHAR_OPS: NullCharOps = NullCharOps;
+
+static NULL_CHAR_BINDING: CharDeviceBinding = CharDeviceBinding {
+    devt: DevT::new(1, 3),
+    name: "null",
+    ops: &NULL_CHAR_OPS,
+};
+
+struct ZeroCharOps;
+
+impl CharDeviceOps for ZeroCharOps {
+    fn read(&self, out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        out.fill(0);
+        StepOutcome::done(out.len())
+    }
+
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        StepOutcome::done(bytes.len())
+    }
+}
+
+static ZERO_CHAR_OPS: ZeroCharOps = ZeroCharOps;
+
+static ZERO_CHAR_BINDING: CharDeviceBinding = CharDeviceBinding {
+    devt: DevT::new(1, 5),
+    name: "zero",
+    ops: &ZERO_CHAR_OPS,
+};
 
 impl Devfs {
     pub const fn new() -> Self {
@@ -375,6 +407,9 @@ impl FsOps for Devfs {
         if name == DEVFS_NULL_NAME {
             return StepOutcome::done(DEVFS_NULL_OBJECT_ID);
         }
+        if name == DEVFS_ZERO_NAME {
+            return StepOutcome::done(DEVFS_ZERO_OBJECT_ID);
+        }
         if tty::project::resolve_devfs_alias(name).is_some() {
             // Identify the entry by its position in the live alias
             // snapshot. Stable for one snapshot, opaque to the caller —
@@ -406,7 +441,10 @@ impl FsOps for Devfs {
             return StepOutcome::done(InodeMeta::new(InodeKind::Directory, DEVFS_SHM_DIR_MODE));
         }
         if fs_object_id == DEVFS_NULL_OBJECT_ID {
-            return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, S_IFCHR | 0o666));
+            return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, DEVFS_NULL_MODE));
+        }
+        if fs_object_id == DEVFS_ZERO_OBJECT_ID {
+            return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, DEVFS_NULL_MODE));
         }
         if entry_index_from_object_id(fs_object_id)
             .and_then(|idx| tty::project::devfs_alias_entries().into_iter().nth(idx))
@@ -524,7 +562,7 @@ impl FsOps for Devfs {
         let entries = tty::project::devfs_alias_entries();
         let index = cursor.as_u64() as usize;
         // Cursor 0..entries.len() emits the TTY aliases; the next
-        // cursor slot emits the synthetic `block` mountpoint stub.
+        // cursor slots emit static devfs nodes.
         if index < entries.len() {
             let entry = &entries[index];
             let dir_entry = match DirEntry::new(
@@ -538,6 +576,22 @@ impl FsOps for Devfs {
             return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
         }
         if index == entries.len() {
+            let dir_entry =
+                match DirEntry::new(DEVFS_NULL_OBJECT_ID, InodeKind::CharDevice, DEVFS_NULL_NAME) {
+                    Ok(de) => de,
+                    Err(err) => return StepOutcome::err(err.into()),
+                };
+            return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
+        }
+        if index == entries.len() + 1 {
+            let dir_entry =
+                match DirEntry::new(DEVFS_ZERO_OBJECT_ID, InodeKind::CharDevice, DEVFS_ZERO_NAME) {
+                    Ok(de) => de,
+                    Err(err) => return StepOutcome::err(err.into()),
+                };
+            return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
+        }
+        if index == entries.len() + 2 {
             let dir_entry = match DirEntry::new(
                 DEVFS_BLOCK_DIR_OBJECT_ID,
                 InodeKind::Directory,
@@ -548,15 +602,7 @@ impl FsOps for Devfs {
             };
             return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
         }
-        if index == entries.len() + 1 {
-            let dir_entry =
-                match DirEntry::new(DEVFS_NULL_OBJECT_ID, InodeKind::CharDevice, DEVFS_NULL_NAME) {
-                    Ok(de) => de,
-                    Err(err) => return StepOutcome::err(err.into()),
-                };
-            return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
-        }
-        if index == entries.len() + 2 {
+        if index == entries.len() + 3 {
             let dir_entry = match DirEntry::new(
                 DEVFS_SHM_DIR_OBJECT_ID,
                 InodeKind::Directory,
@@ -616,7 +662,20 @@ impl FsOps for Devfs {
                 fs_object_id,
                 meta,
                 RNodeBacking::StructBacked {
-                    payload: StructPayload::CharDevice(&NULL_BINDING),
+                    payload: StructPayload::CharDevice(&NULL_CHAR_BINDING),
+                },
+                mount,
+            ) {
+                Ok(rnode) => StepOutcome::done(rnode),
+                Err(_) => StepOutcome::err(Errno::EIO.into()),
+            };
+        }
+        if fs_object_id == DEVFS_ZERO_OBJECT_ID {
+            return match RNode::new_cap_in_mount(
+                fs_object_id,
+                meta,
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::CharDevice(&ZERO_CHAR_BINDING),
                 },
                 mount,
             ) {

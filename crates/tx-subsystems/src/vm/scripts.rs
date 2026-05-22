@@ -56,8 +56,10 @@ pub const USER_STACK_TOP_DEFAULT: u64 = 0x4000_0000;
 /// The reservation is recipe-only: pages still materialise lazily on
 /// fault, so this costs virtual address space rather than physical
 /// memory. Keep it large enough for ordinary libc stack frames while a
-/// future `expand_stack` script remains out of scope for the initial
-/// slice.
+/// future `expand_stack` script remains out of scope. LA64 libc-test's
+/// `qsort` reaches well beyond the former 16 KiB bootstrap window
+/// before making another syscall, so reserve the Linux default soft
+/// limit up front.
 pub const USER_STACK_INITIAL_RESERVATION: u64 = 8 * 1024 * 1024;
 
 /// Loader's parsed view of the ELF image, in kernel-owned shape.
