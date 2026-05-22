@@ -25,6 +25,7 @@ use std::sync::Mutex;
 
 use crate::adapter::reactor_entry::userspace::SyscallRequest;
 use crate::adapter::step_engine::{self as step_engine, guard, Cap, StepOutcome};
+use crate::linux_syscall::reset_uts_nodename_for_test;
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_reactor_affinity_seam, reset_tid_counter,
 };
@@ -210,6 +211,7 @@ fn setup() -> TestSetup {
     reset_tid_counter();
     reset_init_process();
     reset_reactor_affinity_seam();
+    reset_uts_nodename_for_test();
     TestSetup { _lock: lock }
 }
 

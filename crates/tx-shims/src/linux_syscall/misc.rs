@@ -4,14 +4,34 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use crate::adapter::step_engine::SpinMutex;
+
+static UTS_NODENAME: SpinMutex<[u8; UTSNAME_FIELD]> = SpinMutex::new(default_nodename());
+
+#[cfg(test)]
+pub(crate) fn reset_uts_nodename_for_test() {
+    *UTS_NODENAME.lock() = default_nodename();
+}
+
+const fn default_nodename() -> [u8; UTSNAME_FIELD] {
+    let mut out = [0u8; UTSNAME_FIELD];
+    out[0] = b't';
+    out[1] = b'x';
+    out[2] = b'k';
+    out[3] = b'e';
+    out[4] = b'r';
+    out[5] = b'n';
+    out[6] = b'e';
+    out[7] = b'l';
+    out
+}
 
 /// `getrandom(buf, buflen, flags)` — Linux RV64 generic ABI
 /// `__NR_getrandom = 278`.
 ///
-/// Slice 7 v1: fills `buflen` bytes at `buf` from
-/// `<P as EntropyIf>::fill_random`. The `flags` arg is recognised
-/// (`GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE`) but ignored — the
-/// in-tree default impl is deterministic + non-blocking.
+/// Slice 7 v1: fills `buflen` bytes at `buf` from the kernel CSPRNG.
+/// Supported `flags` (`GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE`)
+/// are accepted but ignored; unsupported bits return `-EINVAL`.
 ///
 /// User-VA writeback flows through `bootstrap_copy_to_user`
 /// (canonical `aspace.copy_to_user` lane with kernel-pointer fallback
@@ -20,7 +40,12 @@ use super::*;
 pub(super) fn sys_getrandom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let buf_uaddr = args[0];
     let buf_len = args[1] as usize;
-    let _flags = args[2] as u32; // GRND_* recognised but ignored.
+    let flags = args[2] as u32;
+    let supported_flags = GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE;
+
+    if flags & !supported_flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
 
     if buf_len == 0 {
         return SyscallResult::Return(0);
@@ -37,6 +62,32 @@ pub(super) fn sys_getrandom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
         return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(buf_len as i64)
+}
+
+/// `sethostname(name, len)` — Linux generic ABI `__NR_sethostname = 161`.
+///
+/// txKernel has a single global UTS nodename for now. This is enough for
+/// libc/LTP `gethostname()` probes, which update the hostname and then
+/// read it back through `uname().nodename`.
+pub(super) fn sys_sethostname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let name_uaddr = args[0];
+    let len = args[1] as usize;
+
+    if len > UTSNAME_FIELD - 1 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if len != 0 && name_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    let mut next = [0u8; UTSNAME_FIELD];
+    if len != 0 {
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut next[..len], name_uaddr) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    *UTS_NODENAME.lock() = next;
+    SyscallResult::Return(0)
 }
 
 /// `uname(buf)` — Linux generic ABI `__NR_uname = 160`.
@@ -159,9 +210,10 @@ pub(super) fn build_utsname_for_machine(machine: &str) -> UtsnameLayout {
         head.copy_from_slice(&bytes[..n]);
         out
     }
+    let nodename = *UTS_NODENAME.lock();
     UtsnameLayout {
         sysname: pad("Linux"),
-        nodename: pad("txkernel"),
+        nodename,
         // Linux 6.1.0 is the LTS line musl 1.2.x runtime probes treat
         // as fully featured.
         release: pad("6.1.0-txkernel"),
