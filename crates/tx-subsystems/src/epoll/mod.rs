@@ -24,7 +24,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    ByteProgress, InterestMask, NoProgress, SpinMutex, StepOutcome, V3Errno, WaitSource,
+    ByteProgress, Cap, InterestMask, NoProgress, SpinMutex, StepOutcome, V3Errno, WaitSource,
     WaitSourceId, YieldShape, Zone, ZoneAllocated, ZoneError,
 };
 
@@ -46,6 +46,15 @@ pub struct EpollEntry {
     /// is a sentinel meaning "source not yet known" — the entry is
     /// tracked but does not contribute to readiness.
     pub source: WaitSourceId,
+    /// Target epoll, when the monitored fd is itself an epoll fd.
+    pub target_epoll: Option<Cap<Epoll>>,
+    /// Last readiness mask observed by `epoll_wait`. Used by the
+    /// syscall shim to implement edge-triggered delivery without
+    /// re-reporting a level that has not transitioned.
+    pub last_ready: u32,
+    /// `EPOLLONESHOT` disables the entry after one delivered event
+    /// until userspace re-enables it with `EPOLL_CTL_MOD`.
+    pub disabled: bool,
 }
 
 /// Per-instance epoll state.
@@ -63,6 +72,7 @@ pub struct Epoll {
 // ---------------------------------------------------------------------------
 
 static NEXT_EPOLL_ID: AtomicU64 = AtomicU64::new(1);
+const EPOLL_MAX_NEST_DEPTH: usize = 5;
 
 fn allocate_epoll_id() -> u64 {
     NEXT_EPOLL_ID.fetch_add(1, Ordering::Relaxed)
@@ -117,6 +127,10 @@ impl Epoll {
     pub fn entries_snapshot(&self) -> alloc::vec::Vec<EpollEntry> {
         self.fds.lock().values().cloned().collect()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.fds.lock().is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -136,12 +150,24 @@ pub fn step_epoll_ctl_add(
     interests: u32,
     data: u64,
     source: WaitSourceId,
+    target_epoll: Option<Cap<Epoll>>,
 ) -> StepOutcome<(), NoProgress> {
     // observe — N/A: ep is &Epoll (always alive)
     // upgrade — N/A: fd is u32, not a Cap
     // reserve — BTreeMap insert under SpinMutex
     // commit — entry inserted atomically with respect to the lock
     // publish — N/A: no signal attachments
+    {
+        let fds = ep.fds.lock();
+        if fds.contains_key(&fd) {
+            return StepOutcome::Err(V3Errno::EEXIST);
+        }
+    }
+
+    if let Err(errno) = validate_epoll_target(ep, target_epoll.as_ref()) {
+        return StepOutcome::Err(errno);
+    }
+
     let mut fds = ep.fds.lock();
     if fds.contains_key(&fd) {
         return StepOutcome::Err(V3Errno::EEXIST);
@@ -153,6 +179,9 @@ pub fn step_epoll_ctl_add(
             interests,
             data,
             source,
+            target_epoll,
+            last_ready: 0,
+            disabled: false,
         },
     );
     StepOutcome::Done(())
@@ -165,7 +194,19 @@ pub fn step_epoll_ctl_mod(
     interests: u32,
     data: u64,
     source: WaitSourceId,
+    target_epoll: Option<Cap<Epoll>>,
 ) -> StepOutcome<(), NoProgress> {
+    {
+        let fds = ep.fds.lock();
+        if !fds.contains_key(&fd) {
+            return StepOutcome::Err(V3Errno::ENOENT);
+        }
+    }
+
+    if let Err(errno) = validate_epoll_target(ep, target_epoll.as_ref()) {
+        return StepOutcome::Err(errno);
+    }
+
     let mut fds = ep.fds.lock();
     let Some(entry) = fds.get_mut(&fd) else {
         return StepOutcome::Err(V3Errno::ENOENT);
@@ -175,8 +216,74 @@ pub fn step_epoll_ctl_mod(
         interests,
         data,
         source,
+        target_epoll,
+        last_ready: 0,
+        disabled: false,
     };
     StepOutcome::Done(())
+}
+
+pub fn step_epoll_note_ready(
+    ep: &Epoll,
+    fd: u32,
+    ready: u32,
+    disable_after_delivery: bool,
+) -> StepOutcome<(), NoProgress> {
+    let mut fds = ep.fds.lock();
+    let Some(entry) = fds.get_mut(&fd) else {
+        return StepOutcome::Err(V3Errno::ENOENT);
+    };
+    entry.last_ready = ready;
+    if disable_after_delivery {
+        entry.disabled = true;
+    }
+    StepOutcome::Done(())
+}
+
+fn validate_epoll_target(ep: &Epoll, target_epoll: Option<&Cap<Epoll>>) -> Result<(), V3Errno> {
+    let Some(target) = target_epoll else {
+        return Ok(());
+    };
+
+    if epoll_reaches(target, ep.epoll_id(), EPOLL_MAX_NEST_DEPTH) {
+        return Err(V3Errno::ELOOP);
+    }
+
+    let resulting_depth = 1 + epoll_max_depth(target, EPOLL_MAX_NEST_DEPTH);
+    if resulting_depth > EPOLL_MAX_NEST_DEPTH {
+        return Err(V3Errno::EINVAL);
+    }
+
+    Ok(())
+}
+
+fn epoll_reaches(ep: &Epoll, target_id: u64, budget: usize) -> bool {
+    if ep.epoll_id() == target_id {
+        return true;
+    }
+    if budget == 0 {
+        return false;
+    }
+
+    ep.entries_snapshot()
+        .iter()
+        .filter_map(|entry| entry.target_epoll.as_ref())
+        .any(|child| epoll_reaches(child, target_id, budget - 1))
+}
+
+fn epoll_max_depth(ep: &Epoll, budget: usize) -> usize {
+    if budget == 0 {
+        return 1;
+    }
+
+    let max_child_depth = ep
+        .entries_snapshot()
+        .iter()
+        .filter_map(|entry| entry.target_epoll.as_ref())
+        .map(|child| epoll_max_depth(child, budget - 1))
+        .max()
+        .unwrap_or(0);
+    1 + max_child_depth
 }
 
 /// `epoll_ctl(DEL)`: remove a monitored fd.

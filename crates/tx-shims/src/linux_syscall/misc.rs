@@ -74,7 +74,7 @@ pub(super) fn sys_uname<'a, P: AuxvIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 /// cross-pid queries return `-EPERM`. `new_rlim` is silently ignored
 /// — limits are not actually enforced by any in-tree subsystem yet
 /// (`TODO(phase-rlimit-enforcement)`). The static table is generous
-/// (`RLIMIT_NOFILE = (1024, 4096)`, `RLIMIT_STACK = 8 MiB`, the rest
+/// (`RLIMIT_NOFILE = (65536, 65536)`, `RLIMIT_STACK = 8 MiB`, the rest
 /// `RLIM_INFINITY`).
 ///
 /// Unknown resource ids return `-EINVAL`. Null `old_rlim` is OK (the

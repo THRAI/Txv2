@@ -40,9 +40,9 @@ use tx_subsystems::zones;
 use super::{
     dispatch, SyscallCtx, SyscallResult, EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_SETFD,
     NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPGRP,
-    NR_GETPID, NR_GETPPID, NR_GETSID, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK,
-    NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST,
-    NR_SET_TID_ADDRESS, NR_WAIT4, NR_WRITE, SIGCHLD, WNOHANG,
+    NR_GETPID, NR_GETPPID, NR_GETSID, NR_PIPE2, NR_PPOLL, NR_READ, NR_RT_SIGACTION,
+    NR_RT_SIGPROCMASK, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SETPGID, NR_SETSID,
+    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_WAIT4, NR_WRITE, SIGCHLD, WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
@@ -151,6 +151,10 @@ impl PmapIf for ShimsTestPmap {
 impl EntropyIf for ShimsTestPmap {}
 
 impl tx_hal::AuxvIf for ShimsTestPmap {}
+
+impl tx_hal::ConsoleIf for ShimsTestPmap {
+    fn write_bytes(_bytes: &[u8]) {}
+}
 
 impl SmpIf for ShimsTestPmap {}
 
@@ -521,6 +525,97 @@ fn dispatch_read_blocks_until_tty_input_then_returns_byte() {
         }
     }
     panic!("dispatch did not resolve after step_ingest woke the carrier; last poll = {result:?}");
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TestPollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+#[test]
+fn dispatch_ppoll_reports_pipe_polout_only_while_space_remains() {
+    const POLLOUT: i16 = 0x0004;
+
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let mut pipefd = [-1i32; 2];
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_PIPE2, [pipefd.as_mut_ptr() as u64, 0, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+
+    let timeout = [0u64; 2];
+    let mut pfd = TestPollFd {
+        fd: pipefd[1],
+        events: POLLOUT,
+        revents: 0,
+    };
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_PPOLL,
+                [
+                    &mut pfd as *mut TestPollFd as u64,
+                    1,
+                    timeout.as_ptr() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(1)
+    );
+    assert_eq!(pfd.revents, POLLOUT);
+
+    let buf = [0x41u8; tx_subsystems::pipe::PIPE_BUF];
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_WRITE,
+                [
+                    pipefd[1] as u64,
+                    buf.as_ptr() as u64,
+                    buf.len() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(buf.len() as i64)
+    );
+
+    pfd.revents = 0;
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_PPOLL,
+                [
+                    &mut pfd as *mut TestPollFd as u64,
+                    1,
+                    timeout.as_ptr() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(pfd.revents, 0);
 }
 
 /// `brk(0)` reports the current break, then `brk(>current)` grows,

@@ -6,6 +6,7 @@
 use super::*;
 use crate::adapter::reactor_entry;
 use crate::adapter::step_engine::Cap;
+use alloc::vec::Vec;
 
 fn tty_readable_level(tty: &Cap<tx_subsystems::tty::structure::TtyIdentity>) -> bool {
     use tx_subsystems::tty::execution::TTY_READABLE;
@@ -25,6 +26,301 @@ async fn wait_for_tty_readable(tty: Cap<tx_subsystems::tty::structure::TtyIdenti
             move || tty_readable_level(&condition_tty),
         )
         .await;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PselectTimespecLayout {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+const FD_SETSIZE_MAX: u64 = 1024;
+const FD_SET_WORD_BITS: u64 = 64;
+
+fn read_pselect_timeout_ns(
+    aspace: &Cap<AddressSpace>,
+    timeout_ptr: u64,
+) -> Result<Option<u64>, i32> {
+    if timeout_ptr == 0 {
+        return Ok(None);
+    }
+    let ts =
+        bootstrap_read_user::<PselectTimespecLayout>(aspace, timeout_ptr).map_err(errno_to_i32)?;
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Err(EINVAL_VALUE);
+    }
+    let ns = (ts.tv_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|sec_ns| sec_ns.checked_add(ts.tv_nsec as u64))
+        .ok_or(EINVAL_VALUE)?;
+    Ok(Some(ns))
+}
+
+fn fdset_words(nfds: u64) -> usize {
+    nfds.div_ceil(FD_SET_WORD_BITS) as usize
+}
+
+fn read_fdset(aspace: &Cap<AddressSpace>, ptr: u64, nfds: u64) -> Result<Option<Vec<u64>>, i32> {
+    if ptr == 0 {
+        return Ok(None);
+    }
+    let words = fdset_words(nfds);
+    let mut set = Vec::with_capacity(words);
+    for idx in 0..words {
+        let word_ptr = ptr.wrapping_add((idx * core::mem::size_of::<u64>()) as u64);
+        let word = bootstrap_read_user::<u64>(aspace, word_ptr).map_err(errno_to_i32)?;
+        set.push(word);
+    }
+    Ok(Some(set))
+}
+
+fn write_fdset(aspace: &Cap<AddressSpace>, ptr: u64, set: Option<&[u64]>) -> Result<(), i32> {
+    let Some(set) = set else {
+        return Ok(());
+    };
+    for (idx, word) in set.iter().copied().enumerate() {
+        let word_ptr = ptr.wrapping_add((idx * core::mem::size_of::<u64>()) as u64);
+        bootstrap_write_user::<u64>(aspace, word_ptr, word).map_err(errno_to_i32)?;
+    }
+    Ok(())
+}
+
+fn fdset_has(set: Option<&[u64]>, fd: u64) -> bool {
+    let Some(set) = set else {
+        return false;
+    };
+    let word = (fd / FD_SET_WORD_BITS) as usize;
+    let bit = fd % FD_SET_WORD_BITS;
+    set.get(word)
+        .map(|value| (value & (1u64 << bit)) != 0)
+        .unwrap_or(false)
+}
+
+fn fdset_clear(set: Option<&mut [u64]>, fd: u64) {
+    let Some(set) = set else {
+        return;
+    };
+    let word = (fd / FD_SET_WORD_BITS) as usize;
+    let bit = fd % FD_SET_WORD_BITS;
+    if let Some(value) = set.get_mut(word) {
+        *value &= !(1u64 << bit);
+    }
+}
+
+fn pselect_fd_ready(
+    file: &OpenFile,
+    want_read: bool,
+    want_write: bool,
+    want_except: bool,
+) -> (bool, bool, bool) {
+    use tx_subsystems::{
+        pipe::PipeSide,
+        vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload},
+    };
+
+    let mut read_ready = false;
+    let mut write_ready = false;
+    let except_ready = false;
+
+    if let Some(efd) = file.eventfd() {
+        return (
+            want_read && efd.counter() > 0,
+            want_write && efd.counter() < tx_subsystems::eventfd::EVENTFD_MAX,
+            false,
+        );
+    }
+
+    if let OpenFileBacking::Rnode { rnode } = file.backing() {
+        match rnode.backing() {
+            RNodeBacking::StructBacked {
+                payload: StructPayload::Tty(tty),
+            } => {
+                if want_read {
+                    read_ready = tty_readable_level(tty);
+                }
+                if want_write {
+                    write_ready = true;
+                }
+            }
+            RNodeBacking::StructBacked {
+                payload: StructPayload::Pipe { payload, side },
+            } => match side {
+                PipeSide::Reader => {
+                    if want_read {
+                        read_ready = payload.reader_readable_level() || payload.reader_hup_level();
+                    }
+                }
+                PipeSide::Writer => {
+                    if want_write {
+                        write_ready = payload.writer_writable_level();
+                    }
+                }
+            },
+            _ => {
+                read_ready = want_read;
+                write_ready = want_write;
+            }
+        }
+    }
+
+    (read_ready, write_ready, want_except && except_ready)
+}
+
+async fn sleep_timeout_ns<P: tx_hal::TimeIf>(ns: u64, ctx: &SyscallCtx<'_>) -> SyscallResult {
+    if ns == 0 {
+        return SyscallResult::Return(0);
+    }
+    let deadline_ns = P::read_ns().saturating_add(ns);
+    sleep_until_deadline::<P>(deadline_ns, ns, ctx).await
+}
+
+fn read_ppoll_sigmask(
+    ctx: &SyscallCtx<'_>,
+    mask_ptr: u64,
+    mask_size: u64,
+) -> Result<Option<u64>, SyscallResult> {
+    if mask_ptr == 0 {
+        return Ok(None);
+    }
+    if mask_size < SIGSETSIZE_BYTES {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    match bootstrap_read_user::<u64>(&ctx.aspace, mask_ptr) {
+        Ok(bits) => Ok(Some(bits)),
+        Err(errno) => Err(SyscallResult::error_from(errno)),
+    }
+}
+
+fn set_thread_signal_mask(ctx: &SyscallCtx<'_>, mask_bits: u64) -> Result<u64, SyscallResult> {
+    use tx_subsystems::{
+        signal::SignalMask,
+        thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange},
+    };
+
+    match step_sigprocmask(&ctx.thread, SigmaskHow::SetMask, SignalMask::new(mask_bits)) {
+        SigprocmaskChange::Replaced { prev, .. } => Ok(prev.raw_bits()),
+        SigprocmaskChange::ZombieIgnored => Err(SyscallResult::Error(ESRCH_VALUE)),
+    }
+}
+
+fn clear_thread_pending_signals(ctx: &SyscallCtx<'_>, mask_bits: u64) {
+    use tx_subsystems::signal::Signum;
+
+    let Some(payload) = ctx.thread.payload_cap() else {
+        return;
+    };
+    for raw in 1..=Signum::MAX {
+        let Some(sig) = Signum::new(raw) else {
+            continue;
+        };
+        if mask_bits & sig.bit() != 0 {
+            payload.pending().clear(sig);
+        }
+    }
+}
+
+fn restore_ppoll_sigmask(
+    ctx: &SyscallCtx<'_>,
+    saved_mask: Option<u64>,
+    temporary_sigmask: Option<u64>,
+    result: SyscallResult,
+) -> SyscallResult {
+    if let Some(bits) = saved_mask {
+        if matches!(result, SyscallResult::Return(_)) {
+            if let Some(temporary_bits) = temporary_sigmask {
+                clear_thread_pending_signals(ctx, temporary_bits & !bits);
+            }
+        }
+        let _ = set_thread_signal_mask(ctx, bits);
+    }
+    result
+}
+
+pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let nfds_signed = args[0] as i64;
+    if nfds_signed < 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let nfds = nfds_signed as u64;
+    if nfds > FD_SETSIZE_MAX {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let timeout_ns = match read_pselect_timeout_ns(&ctx.aspace, args[4]) {
+        Ok(value) => value,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+
+    let read_ptr = args[1];
+    let write_ptr = args[2];
+    let except_ptr = args[3];
+    let mut readfds = match read_fdset(&ctx.aspace, read_ptr, nfds) {
+        Ok(value) => value,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let mut writefds = match read_fdset(&ctx.aspace, write_ptr, nfds) {
+        Ok(value) => value,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let mut exceptfds = match read_fdset(&ctx.aspace, except_ptr, nfds) {
+        Ok(value) => value,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+
+    let mut ready = 0i64;
+    for fd in 0..nfds {
+        let want_read = fdset_has(readfds.as_deref(), fd);
+        let want_write = fdset_has(writefds.as_deref(), fd);
+        let want_except = fdset_has(exceptfds.as_deref(), fd);
+        if !want_read && !want_write && !want_except {
+            continue;
+        }
+        let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
+            return SyscallResult::Error(EBADF_VALUE);
+        };
+        let (read_ready, write_ready, except_ready) =
+            pselect_fd_ready(&file, want_read, want_write, want_except);
+        if !read_ready {
+            fdset_clear(readfds.as_deref_mut(), fd);
+        } else {
+            ready += 1;
+        }
+        if !write_ready {
+            fdset_clear(writefds.as_deref_mut(), fd);
+        } else {
+            ready += 1;
+        }
+        if !except_ready {
+            fdset_clear(exceptfds.as_deref_mut(), fd);
+        } else {
+            ready += 1;
+        }
+    }
+
+    if ready == 0 {
+        if let Some(ns) = timeout_ns {
+            match sleep_timeout_ns::<P>(ns, ctx).await {
+                SyscallResult::Return(_) => {}
+                other => return other,
+            }
+        }
+    }
+
+    if let Err(errno) = write_fdset(&ctx.aspace, read_ptr, readfds.as_deref()) {
+        return SyscallResult::Error(errno);
+    }
+    if let Err(errno) = write_fdset(&ctx.aspace, write_ptr, writefds.as_deref()) {
+        return SyscallResult::Error(errno);
+    }
+    if let Err(errno) = write_fdset(&ctx.aspace, except_ptr, exceptfds.as_deref()) {
+        return SyscallResult::Error(errno);
+    }
+
+    SyscallResult::Return(ready)
 }
 
 /// `write(fd, buf, count)`.
@@ -256,25 +552,55 @@ pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(
 ///   timeout-elapsed branch only as an upper bound; the actual
 ///   timer hookup ships with the OnTimer wave (deferred).
 /// - The signal mask is ignored.
-pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
+pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    use tx_subsystems::{
+        pipe::PipeSide,
+        vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload},
+    };
 
     let fds_ptr = args[0];
     let nfds = args[1];
     let timeout_ptr = args[2];
+    let sigmask_ptr = args[3];
+    let sigmask_size = args[4];
+    let timeout_ns = match read_pselect_timeout_ns(&ctx.aspace, timeout_ptr) {
+        Ok(value) => value,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let temporary_sigmask = match read_ppoll_sigmask(ctx, sigmask_ptr, sigmask_size) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
 
     if nfds > 1024 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
+    let saved_mask = match temporary_sigmask {
+        Some(bits) => match set_thread_signal_mask(ctx, bits) {
+            Ok(prev) => Some(prev),
+            Err(result) => return result,
+        },
+        None => None,
+    };
     if nfds == 0 {
-        return SyscallResult::Return(0);
+        let result = match timeout_ns {
+            Some(ns) => sleep_timeout_ns::<P>(ns, ctx).await,
+            None => SyscallResult::Return(0),
+        };
+        return restore_ppoll_sigmask(ctx, saved_mask, temporary_sigmask, result);
     }
 
     const POLLFD_BYTES: u64 = 8;
     const POLLIN: i16 = 0x0001;
+    const POLLOUT: i16 = 0x0004;
+    const POLLERR: i16 = 0x0008;
+    const POLLHUP: i16 = 0x0010;
+    const POLLNVAL: i16 = 0x0020;
 
-    let wait_allowed = timeout_ptr == 0; // NULL = infinite wait
-    let _ = timeout_ptr;
+    let wait_allowed = timeout_ns.is_none(); // NULL = infinite wait
 
     // Track the first TTY fd's WaitSourceId for parking.
     let mut park_source: Option<(u64, u64)> = None; // (source_id_raw, interests_raw)
@@ -285,34 +611,86 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
             let mut ent_bytes = [0u8; POLLFD_BYTES as usize];
             if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
-                return SyscallResult::error_from(errno);
+                return restore_ppoll_sigmask(
+                    ctx,
+                    saved_mask,
+                    temporary_sigmask,
+                    SyscallResult::error_from(errno),
+                );
             }
             let fd = i32::from_le_bytes(ent_bytes[0..4].try_into().unwrap());
             let events = i16::from_le_bytes(ent_bytes[4..6].try_into().unwrap());
             let mut revents: i16 = 0;
             if fd >= 0 {
                 if let Some(file) = resolve_fd(&ctx.process, fd as u32) {
-                    if events & POLLIN != 0 {
-                        if let RNodeBacking::StructBacked {
-                            payload: StructPayload::Tty(tty),
-                        } = file.rnode().backing()
-                        {
-                            if tty_readable_level(tty) {
-                                revents |= POLLIN;
-                            } else if park_source.is_none() {
-                                park_source = Some((tty.wait_source_id(), POLLIN as u64));
+                    let mut handled = false;
+                    if let OpenFileBacking::Rnode { rnode } = file.backing() {
+                        match rnode.backing() {
+                            RNodeBacking::StructBacked {
+                                payload: StructPayload::Tty(tty),
+                            } => {
+                                handled = true;
+                                if events & POLLIN != 0 {
+                                    if tty_readable_level(tty) {
+                                        revents |= POLLIN;
+                                    } else if park_source.is_none() {
+                                        park_source = Some((tty.wait_source_id(), POLLIN as u64));
+                                    }
+                                }
+                                if events & POLLOUT != 0 {
+                                    revents |= POLLOUT;
+                                }
                             }
-                        } else {
-                            revents |= POLLIN;
+                            RNodeBacking::StructBacked {
+                                payload: StructPayload::Pipe { payload, side },
+                            } => {
+                                handled = true;
+                                match side {
+                                    PipeSide::Reader => {
+                                        if events & POLLIN != 0 {
+                                            if payload.reader_readable_level() {
+                                                revents |= POLLIN;
+                                            } else if park_source.is_none() {
+                                                park_source = Some((
+                                                    payload.reader_source_id(),
+                                                    POLLIN as u64,
+                                                ));
+                                            }
+                                        }
+                                        if payload.reader_hup_level() {
+                                            revents |= POLLHUP;
+                                        }
+                                    }
+                                    PipeSide::Writer => {
+                                        if events & POLLOUT != 0 {
+                                            if payload.writer_writable_level() {
+                                                revents |= POLLOUT;
+                                            } else if park_source.is_none() {
+                                                park_source = Some((
+                                                    payload.writer_source_id(),
+                                                    POLLOUT as u64,
+                                                ));
+                                            }
+                                        }
+                                        if payload.writer_err_level() {
+                                            revents |= POLLERR;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    let pollout: i16 = 0x0004;
-                    if events & pollout != 0 {
-                        revents |= pollout;
+                    if !handled {
+                        if events & POLLIN != 0 {
+                            revents |= POLLIN;
+                        }
+                        if events & POLLOUT != 0 {
+                            revents |= POLLOUT;
+                        }
                     }
                 } else {
-                    let pollnval: i16 = 0x0020;
-                    revents = pollnval;
+                    revents = POLLNVAL;
                 }
             }
             if revents != 0 {
@@ -320,12 +698,28 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             }
             ent_bytes[6..8].copy_from_slice(&revents.to_le_bytes());
             if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, ent_ptr, &ent_bytes) {
-                return SyscallResult::error_from(errno);
+                return restore_ppoll_sigmask(
+                    ctx,
+                    saved_mask,
+                    temporary_sigmask,
+                    SyscallResult::error_from(errno),
+                );
             }
         }
 
         if ready > 0 {
             break ready;
+        }
+        if let Some(ns) = timeout_ns {
+            if ns != 0 {
+                match sleep_timeout_ns::<P>(ns, ctx).await {
+                    SyscallResult::Return(_) => {}
+                    other => {
+                        return restore_ppoll_sigmask(ctx, saved_mask, temporary_sigmask, other);
+                    }
+                }
+            }
+            break 0;
         }
         if !wait_allowed {
             break 0;
@@ -371,7 +765,12 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         }
     };
 
-    SyscallResult::Return(ready)
+    restore_ppoll_sigmask(
+        ctx,
+        saved_mask,
+        temporary_sigmask,
+        SyscallResult::Return(ready),
+    )
 }
 
 /// PageBacked `write(2)` — direct user-buffer path.
@@ -467,6 +866,10 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         return SyscallResult::Error(EBADF_VALUE);
     }
 
+    if let Some(result) = super::net::sys_socket_write(fd as u32, args[1], len, ctx) {
+        return result;
+    }
+
     // Resolve fd → Cap<OpenFile> against the process payload's stub
     // fd table. Holding the payload guard across the lookup is fine —
     // the resulting Cap is independent and the lock is released before
@@ -483,6 +886,12 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
+    // eventfd fds carry their own `write(2)` arm — add a 64-bit
+    // value to the counter. Dispatch before the generic VFS path.
+    if file.eventfd().is_some() {
+        return super::eventfd::sys_eventfd_write(&file, args[1], len, ctx).await;
+    }
+
     let len = if matches!(
         file.rnode().backing(),
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
@@ -491,12 +900,6 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     } else {
         core::cmp::min(len, TTY_WRITE_MAX_INLINE)
     };
-
-    // eventfd fds carry their own `write(2)` arm — add a 64-bit
-    // value to the counter. Dispatch before the generic VFS path.
-    if file.eventfd().is_some() {
-        return super::eventfd::sys_eventfd_write(&file, args[1], len, ctx).await;
-    }
 
     // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).
     // Prefault the user buffer in the observe phase, then drive the
@@ -672,6 +1075,10 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         return SyscallResult::Error(EBADF_VALUE);
     }
 
+    if let Some(result) = super::net::sys_socket_read(fd as u32, args[1], len, ctx) {
+        return result;
+    }
+
     let file = match resolve_fd(&ctx.process, fd as u32) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
@@ -683,15 +1090,6 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     if file.posix_mq().is_some() {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-
-    let len = if matches!(
-        file.rnode().backing(),
-        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
-    ) {
-        len
-    } else {
-        core::cmp::min(len, TTY_WRITE_MAX_INLINE)
-    };
 
     if len == 0 {
         return SyscallResult::Return(0);
@@ -723,6 +1121,15 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     if file.timerfd().is_some() {
         return super::timerfd::sys_timerfd_read::<P>(&file, args[1], len, ctx).await;
     }
+
+    let len = if matches!(
+        file.rnode().backing(),
+        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
+    ) {
+        len
+    } else {
+        core::cmp::min(len, TTY_WRITE_MAX_INLINE)
+    };
 
     // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).
     // Prefault the user buffer in the observe phase, then drive the

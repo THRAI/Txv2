@@ -54,7 +54,7 @@
 //! `WaitSourceId.raw()` round-trips cleanly to the right bucket's
 //! `WaitSource`.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -62,7 +62,7 @@ pub mod adapter;
 
 use adapter::step_engine::{
     self, Errno, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp, StepOutcome,
-    SubjectIdentity, ZoneError,
+    SubjectIdentity, YieldShape, ZoneError,
 };
 use adapter::wait_routing::{self, Channel, WaitSource};
 
@@ -122,9 +122,14 @@ struct FutexKey {
 }
 
 struct FutexEntry {
+    waiters: VecDeque<FutexWaiter>,
+}
+
+struct FutexWaiter {
     channel: Channel,
     source_id: u64,
     wait_source: Arc<WaitSource>,
+    tid: Option<u32>,
 }
 
 static EXACT_WAITERS: SpinMutex<Option<BTreeMap<FutexKey, FutexEntry>>> = SpinMutex::new(None);
@@ -142,14 +147,55 @@ fn key_for(aspace: &AddressSpace, uaddr: u64) -> FutexKey {
 }
 
 fn new_entry() -> FutexEntry {
+    FutexEntry {
+        waiters: VecDeque::new(),
+    }
+}
+
+fn new_waiter(tid: Option<u32>) -> FutexWaiter {
     let channel = Channel::new();
     let source_id = wait_source::register_wait_channel(channel.clone());
     let wait_source = wait_routing::new_wait_source(source_id);
-    FutexEntry {
+    FutexWaiter {
         channel,
         source_id,
         wait_source,
+        tid,
     }
+}
+
+fn unregister_exact_waiter(aspace: &AddressSpace, uaddr: u64, source_id: u64) {
+    let key = key_for(aspace, uaddr);
+    let mut table_guard = EXACT_WAITERS.lock();
+    let Some(table) = table_guard.as_mut() else {
+        return;
+    };
+    let Some(entry) = table.get_mut(&key) else {
+        return;
+    };
+    entry.waiters.retain(|waiter| waiter.source_id != source_id);
+}
+
+pub fn thread_has_waiter(tid: u32) -> bool {
+    let table_guard = EXACT_WAITERS.lock();
+    let Some(table) = table_guard.as_ref() else {
+        return false;
+    };
+    table
+        .values()
+        .any(|entry| entry.waiters.iter().any(|waiter| waiter.tid == Some(tid)))
+}
+
+pub fn debug_waiter_count(uaddr: u64) -> usize {
+    let table_guard = EXACT_WAITERS.lock();
+    let Some(table) = table_guard.as_ref() else {
+        return 0;
+    };
+    table
+        .iter()
+        .filter(|(key, _)| key.uaddr == uaddr)
+        .map(|(_, entry)| entry.waiters.len())
+        .sum()
 }
 
 /// Initialise the bucket table. Idempotent: a second call is a
@@ -212,6 +258,16 @@ pub fn step_futex_wait(
     val: u32,
     guard: &Guard<'_>,
 ) -> StepOutcome<(), NoProgress> {
+    step_futex_wait_with_tid(aspace, uaddr, val, guard, None)
+}
+
+fn step_futex_wait_with_tid(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    val: u32,
+    guard: &Guard<'_>,
+    tid: Option<u32>,
+) -> StepOutcome<(), NoProgress> {
     // observe
     // upgrade
     // reserve
@@ -258,7 +314,11 @@ pub fn step_futex_wait(
         if observed_again != val {
             return StepOutcome::Err(Errno::EAGAIN);
         }
-        table.entry(key).or_insert_with(new_entry).source_id
+        let entry = table.entry(key).or_insert_with(new_entry);
+        let waiter = new_waiter(tid);
+        let source_id = waiter.source_id;
+        entry.waiters.push_back(waiter);
+        source_id
     };
     // publish — yield on the exact `(AddressSpace, uaddr)` wait source.
     // The old bucket source remains only as a compatibility wake path.
@@ -284,21 +344,29 @@ pub fn step_futex_wake_in(
     }
 
     let key = key_for(aspace, uaddr);
-    let exact_wait_source = {
-        let table_guard = EXACT_WAITERS.lock();
-        table_guard
-            .as_ref()
-            .and_then(|table| table.get(&key))
-            .map(|entry| {
-                wait_routing::fire_legacy_channel(&entry.channel, FUTEX_WAKE_MASK);
-                entry.wait_source.clone()
-            })
+    let waiters = {
+        let mut table_guard = EXACT_WAITERS.lock();
+        let Some(entry) = table_guard.as_mut().and_then(|table| table.get_mut(&key)) else {
+            return StepOutcome::Done(0);
+        };
+        let mut waiters = alloc::vec::Vec::new();
+        for _ in 0..n {
+            let Some(waiter) = entry.waiters.pop_front() else {
+                break;
+            };
+            waiters.push(waiter);
+        }
+        waiters
     };
-    if let Some(wait_source) = exact_wait_source {
-        wait_routing::notify_v3_source(&wait_source, FUTEX_WAKE_MASK);
+    let woken = waiters.len() as u32;
+    for waiter in waiters {
+        wait_routing::fire_legacy_channel(&waiter.channel, FUTEX_WAKE_MASK);
+        wait_routing::notify_v3_source(&waiter.wait_source, FUTEX_WAKE_MASK);
     }
-    let _ = step_futex_wake(uaddr, n, _guard);
-    StepOutcome::Done(n)
+    if woken > 0 {
+        let _ = step_futex_wake(uaddr, woken, _guard);
+    }
+    StepOutcome::Done(woken)
 }
 
 /// `futex(uaddr, FUTEX_WAKE, n, ...)`.
@@ -409,7 +477,9 @@ pub struct FutexWaitOp<'a> {
     pub uaddr: u64,
     pub val: u32,
     pub aspace: &'a AddressSpace,
+    pub tid: Option<u32>,
     pub woken: bool,
+    pub registered_source_id: Option<u64>,
 }
 
 impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
@@ -419,18 +489,46 @@ impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
         if self.woken {
             return StepOutcome::Done(());
         }
-        let guard = adapter::step_engine::guard();
-        step_futex_wait(self.aspace, self.uaddr, self.val, &guard)
+        if let Some(source_id) = self.registered_source_id {
+            return step_engine::yield_until_wake(source_id, FUTEX_WAKE_MASK);
+        }
+        let guard =
+            tx_substrate::epoch::borrow_current_guard().unwrap_or_else(adapter::step_engine::guard);
+        let outcome = step_futex_wait_with_tid(self.aspace, self.uaddr, self.val, &guard, self.tid);
+        if let StepOutcome::Yield {
+            shape: YieldShape::OnWaitSource { source, .. },
+            ..
+        } = &outcome
+        {
+            self.registered_source_id = Some(source.raw());
+        }
+        outcome
     }
 
     fn apply_resume(&mut self, resume: adapter::step_engine::ResumeOutcome) -> Result<(), Errno> {
         match resume {
             adapter::step_engine::ResumeOutcome::Retry => {
+                self.unregister();
                 self.woken = true;
                 Ok(())
             }
             _ => Err(Errno::EINVAL),
         }
+    }
+}
+
+impl FutexWaitOp<'_> {
+    fn unregister(&mut self) {
+        if let Some(source_id) = self.registered_source_id.take() {
+            unregister_exact_waiter(self.aspace, self.uaddr, source_id);
+            wait_source::release_wait_channel(source_id);
+        }
+    }
+}
+
+impl Drop for FutexWaitOp<'_> {
+    fn drop(&mut self) {
+        self.unregister();
     }
 }
 
@@ -446,7 +544,8 @@ impl<I: SubjectIdentity> StepOp<I> for FutexWakeOp<'_> {
     type Output = u32;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        let guard = adapter::step_engine::guard();
+        let guard =
+            tx_substrate::epoch::borrow_current_guard().unwrap_or_else(adapter::step_engine::guard);
         step_futex_wake_in(self.aspace, self.uaddr, self.n, &guard)
     }
 }
@@ -808,7 +907,9 @@ mod tests {
                 uaddr,
                 aspace: &aspace,
                 val: 0xdead_beef,
+                tid: None,
                 woken: false,
+                registered_source_id: None,
             };
             let mut ctx = ScriptCtx::<ProcessIdentity>::new();
             let outcome = op.step(&mut ctx);
@@ -829,7 +930,12 @@ mod tests {
             // Zero uaddr → EINVAL. Output type is u32, not ().
             // FutexWakeOp acquires its own guard inside step() per
             // STEP_MODEL_v2 §1; outer guard would nest (EBR-7).
-            let mut op = FutexWakeOp { uaddr: 0, n: 1 };
+            let (aspace, _) = setup_aspace_with_word(0xa100_0000, 0);
+            let mut op = FutexWakeOp {
+                uaddr: 0,
+                n: 1,
+                aspace: &aspace,
+            };
             let mut ctx = ScriptCtx::<ProcessIdentity>::new();
             let outcome: StepOutcome<u32, NoProgress> = op.step(&mut ctx);
             assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));

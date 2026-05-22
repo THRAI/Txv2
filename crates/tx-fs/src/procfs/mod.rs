@@ -13,6 +13,7 @@ use adapter::step_engine::{Cap, NoProgress, StepOutcome};
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
+use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use tx_subsystems::process::{self, Pid};
 use tx_subsystems::vfs::{
     render_dentry_path, Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta,
@@ -25,110 +26,158 @@ pub const PROCFS_MOUNTS_ID: FsObjectId = FsObjectId::new(0x7072_6F02);
 pub const PROCFS_CPUINFO_ID: FsObjectId = FsObjectId::new(0x7072_6F03);
 pub const PROCFS_UPTIME_ID: FsObjectId = FsObjectId::new(0x7072_6F04);
 pub const PROCFS_MEMINFO_ID: FsObjectId = FsObjectId::new(0x7072_6F05);
+pub const PROCFS_SYS_ID: FsObjectId = FsObjectId::new(0x7072_6F06);
+pub const PROCFS_SYS_KERNEL_ID: FsObjectId = FsObjectId::new(0x7072_6F07);
+pub const PROCFS_SYS_KERNEL_TAINTED_ID: FsObjectId = FsObjectId::new(0x7072_6F08);
+pub const PROCFS_CONFIG_ID: FsObjectId = FsObjectId::new(0x7072_6F09);
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
-const PROCFS_STAT_OFFSET: u64 = 0x10000;
-const PROCFS_MEM_OFFSET: u64 = 0x10002;
-const PROCFS_MAPS_OFFSET: u64 = 0x10003;
-const PROCFS_EXE_OFFSET: u64 = 0x10004;
-const PROCFS_FD_OFFSET: u64 = 0x20000;
+const PROCFS_PID_OBJECT_STRIDE: u64 = 0x100;
+const PROCFS_PID_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x10000;
+const PROCFS_FD_OBJECT_STRIDE: u64 = 0x10000;
+const PROCFS_FD_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x0100_0000;
+const PROCFS_TASK_OBJECT_BASE: u64 = 0x7073_0000_0000;
+const PROCFS_TASK_OBJECT_TAG_MASK: u64 = 0xff;
+const PROCFS_TASK_TAG_TID_DIR: u64 = 0;
+const PROCFS_TASK_TAG_STAT: u64 = 1;
+const PROCFS_TAG_STAT: u64 = 0;
+const PROCFS_TAG_CMDLINE: u64 = 1;
+const PROCFS_TAG_MEM: u64 = 2;
+const PROCFS_TAG_MAPS: u64 = 3;
+const PROCFS_TAG_EXE: u64 = 4;
+const PROCFS_TAG_FD_DIR: u64 = 5;
+const PROCFS_TAG_TASK_DIR: u64 = 6;
+
 const fn pid_dir_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64)
 }
+const fn pid_object_id(pid: Pid, tag: u64) -> FsObjectId {
+    FsObjectId::new(PROCFS_PID_OBJECT_BASE + pid.0 as u64 * PROCFS_PID_OBJECT_STRIDE + tag)
+}
 const fn pid_stat_id(pid: Pid) -> FsObjectId {
-    FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_STAT_OFFSET)
+    pid_object_id(pid, PROCFS_TAG_STAT)
 }
 const fn pid_cmdline_id(pid: Pid) -> FsObjectId {
-    FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_STAT_OFFSET + 1)
+    pid_object_id(pid, PROCFS_TAG_CMDLINE)
 }
 const fn pid_mem_id(pid: Pid) -> FsObjectId {
-    FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_MEM_OFFSET)
+    pid_object_id(pid, PROCFS_TAG_MEM)
 }
 const fn pid_maps_id(pid: Pid) -> FsObjectId {
-    FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_MAPS_OFFSET)
+    pid_object_id(pid, PROCFS_TAG_MAPS)
 }
 const fn pid_exe_id(pid: Pid) -> FsObjectId {
-    FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_EXE_OFFSET)
+    pid_object_id(pid, PROCFS_TAG_EXE)
 }
 const fn pid_fd_dir_id(pid: Pid) -> FsObjectId {
-    FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_FD_OFFSET)
+    pid_object_id(pid, PROCFS_TAG_FD_DIR)
+}
+const fn pid_task_dir_id(pid: Pid) -> FsObjectId {
+    pid_object_id(pid, PROCFS_TAG_TASK_DIR)
+}
+const fn task_tid_dir_id(pid: Pid, tid: u32) -> FsObjectId {
+    FsObjectId::new(PROCFS_TASK_OBJECT_BASE + ((pid.0 as u64) << 32) + ((tid as u64) << 8))
+}
+const fn task_tid_stat_id(pid: Pid, tid: u32) -> FsObjectId {
+    FsObjectId::new(
+        PROCFS_TASK_OBJECT_BASE
+            + ((pid.0 as u64) << 32)
+            + ((tid as u64) << 8)
+            + PROCFS_TASK_TAG_STAT,
+    )
 }
 #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
 const fn pid_fd_id(pid: Pid, fd: u32) -> FsObjectId {
-    FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_FD_OFFSET + 1 + fd as u64)
+    FsObjectId::new(PROCFS_FD_OBJECT_BASE + pid.0 as u64 * PROCFS_FD_OBJECT_STRIDE + fd as u64)
+}
+fn pid_from_object_id(id: FsObjectId, tag: u64) -> Option<Pid> {
+    let r = id.as_u64();
+    if r < PROCFS_PID_OBJECT_BASE || r >= PROCFS_FD_OBJECT_BASE {
+        return None;
+    }
+    let offset = r - PROCFS_PID_OBJECT_BASE;
+    if offset % PROCFS_PID_OBJECT_STRIDE == tag {
+        Some(Pid((offset / PROCFS_PID_OBJECT_STRIDE) as u32))
+    } else {
+        None
+    }
 }
 pub fn pid_from_mem_id(id: FsObjectId) -> Option<Pid> {
-    let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_MEM_OFFSET;
-    if r >= base && r < base + 0x10000 {
-        Some(Pid((r - base) as u32))
-    } else {
-        None
-    }
+    pid_from_object_id(id, PROCFS_TAG_MEM)
 }
 pub fn pid_from_maps_id(id: FsObjectId) -> Option<Pid> {
-    let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_MAPS_OFFSET;
-    if r >= base && r < base + 0x10000 {
-        Some(Pid((r - base) as u32))
-    } else {
-        None
-    }
+    pid_from_object_id(id, PROCFS_TAG_MAPS)
 }
 pub fn pid_from_exe_id(id: FsObjectId) -> Option<Pid> {
-    let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_EXE_OFFSET;
-    if r >= base && r < base + 0x10000 {
-        Some(Pid((r - base) as u32))
-    } else {
-        None
-    }
+    pid_from_object_id(id, PROCFS_TAG_EXE)
 }
 fn pid_from_fd_dir(id: FsObjectId) -> Option<Pid> {
-    let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_FD_OFFSET;
-    if r >= base && r < base + 1 {
-        Some(Pid((r - base) as u32))
-    } else {
-        None
-    }
+    pid_from_object_id(id, PROCFS_TAG_FD_DIR)
 }
 fn pid_from_fd_id(id: FsObjectId) -> Option<(Pid, u32)> {
     let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_FD_OFFSET + 1;
-    if r >= base {
-        let offset = r - base;
-        let pid = Pid((offset / 0x10000) as u32);
-        let fd = (offset % 0x10000) as u32;
-        Some((pid, fd))
-    } else {
-        None
+    if !(PROCFS_FD_OBJECT_BASE..PROCFS_TASK_OBJECT_BASE).contains(&r) {
+        return None;
     }
+    let offset = r - PROCFS_FD_OBJECT_BASE;
+    let pid = Pid((offset / PROCFS_FD_OBJECT_STRIDE) as u32);
+    let fd = (offset % PROCFS_FD_OBJECT_STRIDE) as u32;
+    Some((pid, fd))
 }
 
 fn pid_from_dir(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    if r > PROCFS_PID_BASE && r < PROCFS_PID_BASE + PROCFS_STAT_OFFSET {
+    if r > PROCFS_PID_BASE && r < PROCFS_PID_OBJECT_BASE {
         Some(Pid((r - PROCFS_PID_BASE) as u32))
     } else {
         None
     }
 }
 pub fn pid_from_stat_id(id: FsObjectId) -> Option<Pid> {
-    let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_STAT_OFFSET;
-    if r >= base && r < base + 0x10000 {
-        Some(Pid((r - base) as u32))
-    } else {
-        None
-    }
+    pid_from_object_id(id, PROCFS_TAG_STAT)
 }
 pub fn pid_from_cmdline_id(id: FsObjectId) -> Option<Pid> {
+    pid_from_object_id(id, PROCFS_TAG_CMDLINE)
+}
+fn pid_from_task_dir(id: FsObjectId) -> Option<Pid> {
+    pid_from_object_id(id, PROCFS_TAG_TASK_DIR)
+}
+fn task_from_object_id(id: FsObjectId, tag: u64) -> Option<(Pid, u32)> {
     let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_STAT_OFFSET + 1;
-    if r >= base && r < base + 0x10000 {
-        Some(Pid((r - base) as u32))
-    } else {
-        None
+    if r < PROCFS_TASK_OBJECT_BASE {
+        return None;
+    }
+    let offset = r - PROCFS_TASK_OBJECT_BASE;
+    if offset & PROCFS_TASK_OBJECT_TAG_MASK != tag {
+        return None;
+    }
+    let pid = (offset >> 32) as u32;
+    let tid = ((offset >> 8) & 0x00ff_ffff) as u32;
+    Some((Pid(pid), tid))
+}
+fn task_from_tid_dir(id: FsObjectId) -> Option<(Pid, u32)> {
+    task_from_object_id(id, PROCFS_TASK_TAG_TID_DIR)
+}
+pub fn task_from_stat_id(id: FsObjectId) -> Option<(Pid, u32)> {
+    task_from_object_id(id, PROCFS_TASK_TAG_STAT)
+}
+
+fn procfs_number_exists(n: u32) -> bool {
+    if process::process_by_pid(Pid(n)).is_some() {
+        return true;
+    }
+    matches!(
+        resolve_pid_number_as(n as u64, PidNameKind::Thread),
+        Some(PidName::Thread(thread)) if thread.upgrade_owner_proc().is_some()
+    )
+}
+
+fn process_for_procfs_number(n: u32) -> Option<Cap<process::ProcessIdentity>> {
+    if let Some(proc) = process::process_by_pid(Pid(n)) {
+        return Some(proc);
+    }
+    match resolve_pid_number_as(n as u64, PidNameKind::Thread) {
+        Some(PidName::Thread(thread)) => thread.upgrade_owner_proc(),
+        _ => None,
     }
 }
 
@@ -175,31 +224,73 @@ impl FsOps for Procfs {
             if name == b"meminfo" {
                 return StepOutcome::done(PROCFS_MEMINFO_ID);
             }
+            if name == b"config" {
+                return StepOutcome::done(PROCFS_CONFIG_ID);
+            }
+            if name == b"sys" {
+                return StepOutcome::done(PROCFS_SYS_ID);
+            }
             if let Ok(n) = core::str::from_utf8(name).unwrap_or("").parse::<u32>() {
-                if n > 0 && process::process_by_pid(Pid(n)).is_some() {
+                if n > 0 && procfs_number_exists(n) {
                     return StepOutcome::done(pid_dir_id(Pid(n)));
                 }
             }
             return StepOutcome::err(Errno::ENOENT.into());
         }
+        if parent == PROCFS_SYS_ID {
+            if name == b"kernel" {
+                return StepOutcome::done(PROCFS_SYS_KERNEL_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if parent == PROCFS_SYS_KERNEL_ID {
+            if name == b"tainted" {
+                return StepOutcome::done(PROCFS_SYS_KERNEL_TAINTED_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
         if let Some(pid) = pid_from_dir(parent) {
-            if name == b"stat" && process::process_by_pid(pid).is_some() {
+            if name == b"stat" && process_for_procfs_number(pid.0).is_some() {
                 return StepOutcome::done(pid_stat_id(pid));
             }
-            if name == b"cmdline" && process::process_by_pid(pid).is_some() {
+            if name == b"cmdline" && process_for_procfs_number(pid.0).is_some() {
                 return StepOutcome::done(pid_cmdline_id(pid));
             }
-            if name == b"mem" && process::process_by_pid(pid).is_some() {
+            if name == b"mem" && process_for_procfs_number(pid.0).is_some() {
                 return StepOutcome::done(pid_mem_id(pid));
             }
-            if name == b"maps" && process::process_by_pid(pid).is_some() {
+            if name == b"maps" && process_for_procfs_number(pid.0).is_some() {
                 return StepOutcome::done(pid_maps_id(pid));
             }
-            if name == b"exe" && process::process_by_pid(pid).is_some() {
+            if name == b"exe" && process_for_procfs_number(pid.0).is_some() {
                 return StepOutcome::done(pid_exe_id(pid));
             }
-            if name == b"fd" && process::process_by_pid(pid).is_some() {
+            if name == b"fd" && process_for_procfs_number(pid.0).is_some() {
                 return StepOutcome::done(pid_fd_dir_id(pid));
+            }
+            if name == b"task" && process_for_procfs_number(pid.0).is_some() {
+                return StepOutcome::done(pid_task_dir_id(pid));
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if let Some(pid) = pid_from_task_dir(parent) {
+            if let Ok(n) = core::str::from_utf8(name).unwrap_or("").parse::<u32>() {
+                if process::process_by_pid(pid)
+                    .and_then(|proc| proc.thread_by_tid(n))
+                    .is_some()
+                {
+                    return StepOutcome::done(task_tid_dir_id(pid, n));
+                }
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if let Some((pid, tid)) = task_from_tid_dir(parent) {
+            if name == b"stat"
+                && process::process_by_pid(pid)
+                    .and_then(|proc| proc.thread_by_tid(tid))
+                    .is_some()
+            {
+                return StepOutcome::done(task_tid_stat_id(pid, tid));
             }
             return StepOutcome::err(Errno::ENOENT.into());
         }
@@ -215,10 +306,18 @@ impl FsOps for Procfs {
             PROCFS_ROOT_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
+            PROCFS_SYS_ID | PROCFS_SYS_KERNEL_ID => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
+            }
             PROCFS_SELF_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Symlink, PROCFS_SYMLINK_MODE))
             }
-            PROCFS_MOUNTS_ID | PROCFS_CPUINFO_ID | PROCFS_UPTIME_ID | PROCFS_MEMINFO_ID => {
+            PROCFS_MOUNTS_ID
+            | PROCFS_CPUINFO_ID
+            | PROCFS_UPTIME_ID
+            | PROCFS_MEMINFO_ID
+            | PROCFS_CONFIG_ID
+            | PROCFS_SYS_KERNEL_TAINTED_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             id if pid_from_dir(id).is_some() => {
@@ -244,6 +343,15 @@ impl FsOps for Procfs {
             }
             id if pid_from_fd_id(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Symlink, PROCFS_SYMLINK_MODE))
+            }
+            id if pid_from_task_dir(id).is_some() => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
+            }
+            id if task_from_tid_dir(id).is_some() => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
+            }
+            id if task_from_stat_id(id).is_some() => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             _ => StepOutcome::err(Errno::ENOENT.into()),
         }
@@ -271,6 +379,7 @@ impl FsOps for Procfs {
                 (b"maps", pid_maps_id(pid), InodeKind::Regular),
                 (b"exe", pid_exe_id(pid), InodeKind::Symlink),
                 (b"fd", pid_fd_dir_id(pid), InodeKind::Directory),
+                (b"task", pid_task_dir_id(pid), InodeKind::Directory),
             ];
             let fi = idx.saturating_sub(2);
             if fi < files.len() {
@@ -278,6 +387,73 @@ impl FsOps for Procfs {
                 return StepOutcome::done(Some((
                     dir_entry(oid, kind, name),
                     DirCursor([2, (fi + 1) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                )));
+            }
+            return StepOutcome::done(None);
+        }
+
+        if let Some(pid) = pid_from_task_dir(id) {
+            if state_byte < 2 {
+                return finish_dots(state_byte, idx, id);
+            }
+            if let Some(proc) = process::process_by_pid(pid) {
+                let mut threads = proc.threads_snapshot().unwrap_or_default();
+                threads.sort_by_key(|thread| thread.tid.0);
+                let ti = idx.saturating_sub(2);
+                if let Some(thread) = threads.get(ti) {
+                    let tid = thread.tid.0;
+                    let s = alloc::format!("{}", tid);
+                    return StepOutcome::done(Some((
+                        dir_entry(
+                            task_tid_dir_id(pid, tid),
+                            InodeKind::Directory,
+                            s.as_bytes(),
+                        ),
+                        DirCursor([2, (ti + 3) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    )));
+                }
+            }
+            return StepOutcome::done(None);
+        }
+
+        if let Some((pid, tid)) = task_from_tid_dir(id) {
+            if state_byte < 2 {
+                return finish_dots(state_byte, idx, id);
+            }
+            if idx == 2
+                && process::process_by_pid(pid)
+                    .and_then(|proc| proc.thread_by_tid(tid))
+                    .is_some()
+            {
+                return StepOutcome::done(Some((
+                    dir_entry(task_tid_stat_id(pid, tid), InodeKind::Regular, b"stat"),
+                    DirCursor([2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                )));
+            }
+            return StepOutcome::done(None);
+        }
+
+        if id == PROCFS_SYS_ID {
+            if state_byte < 2 {
+                return finish_dots(state_byte, idx, id);
+            }
+            if idx == 2 {
+                return StepOutcome::done(Some((
+                    dir_entry(PROCFS_SYS_KERNEL_ID, InodeKind::Directory, b"kernel"),
+                    DirCursor([2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                )));
+            }
+            return StepOutcome::done(None);
+        }
+
+        if id == PROCFS_SYS_KERNEL_ID {
+            if state_byte < 2 {
+                return finish_dots(state_byte, idx, id);
+            }
+            if idx == 2 {
+                return StepOutcome::done(Some((
+                    dir_entry(PROCFS_SYS_KERNEL_TAINTED_ID, InodeKind::Regular, b"tainted"),
+                    DirCursor([2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
                 )));
             }
             return StepOutcome::done(None);
@@ -297,6 +473,8 @@ impl FsOps for Procfs {
             (b"cpuinfo", PROCFS_CPUINFO_ID, InodeKind::Regular),
             (b"uptime", PROCFS_UPTIME_ID, InodeKind::Regular),
             (b"meminfo", PROCFS_MEMINFO_ID, InodeKind::Regular),
+            (b"config", PROCFS_CONFIG_ID, InodeKind::Regular),
+            (b"sys", PROCFS_SYS_ID, InodeKind::Directory),
         ];
         let si = idx.saturating_sub(2);
         if state_byte == 2 && si < statics.len() {
@@ -517,23 +695,10 @@ fn finish_dots(
     if (idx as u8) < 2 {
         let name: &[u8] = if idx == 0 { b"." } else { b".." };
         let entry = dir_entry(id, InodeKind::Directory, name);
+        let next_idx = if idx == 0 { 1 } else { 2 };
+        let next_state = if idx == 0 { state_byte } else { 2 };
         let next = DirCursor([
-            state_byte,
-            (idx + 1) as u8,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
+            next_state, next_idx, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ]);
         StepOutcome::done(Some((entry, next)))
     } else {

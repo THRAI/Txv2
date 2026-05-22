@@ -543,6 +543,9 @@ impl<P: TxPlatform> CoreInit<P> {
         if let Some(tq) = BOOT_REACTOR.with(|reactor| reactor.timer_queue()) {
             tx_subsystems::timer_sleep::install_timer_queue(tq);
         }
+        tx_subsystems::timer_sleep::install_posix_timer_signal_submit(
+            Self::submit_posix_timer_signal_into_boot_reactor,
+        );
     }
 
     /// Pre-ELF Phase 7: submit init's leader thread future as a
@@ -685,13 +688,15 @@ impl<P: TxPlatform> CoreInit<P> {
             // the previous poll iteration become visible to the
             // reactor here, outside the inner lock that sys_clone
             // ran under.
-            let submitted_child_before_poll = Self::drain_pending_child_submits();
+            let submitted_child_before_poll =
+                Self::drain_pending_child_submits() || Self::drain_pending_timer_signal_submits();
 
             let step = match Self::step_boot_reactor_once_concurrent(current_cpu) {
                 Some(step) => step,
                 None => break,
             };
-            let submitted_child_after_poll = Self::drain_pending_child_submits();
+            let submitted_child_after_poll =
+                Self::drain_pending_child_submits() || Self::drain_pending_timer_signal_submits();
 
             // EBR drain. Caps retired during the task polls above
             // (e.g. `Cap<OpenFile>` from `sys_close` / process exit fd
@@ -856,8 +861,28 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 selected += 1;
                 continue;
             }
+            if let Some(filter) = group.strip_prefix("ltp-musl:") {
+                append_filtered_ltp(&mut cmd, filter);
+                selected += 1;
+                continue;
+            }
+            if let Some(filter) = group.strip_prefix("ltp:") {
+                append_filtered_ltp(&mut cmd, filter);
+                selected += 1;
+                continue;
+            }
+            if let Some(batch) = group.strip_prefix("ltp-batch:") {
+                append_ltp_batch(&mut cmd, batch);
+                selected += 1;
+                continue;
+            }
             if is_libctest_musl_group(group) {
                 append_full_libctest(&mut cmd);
+                selected += 1;
+                continue;
+            }
+            if is_ltp_musl_group(group) {
+                append_full_ltp(&mut cmd);
                 selected += 1;
                 continue;
             }
@@ -872,6 +897,88 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     }
     cmd
 }
+
+fn append_full_ltp(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        " && ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+    );
+    let _ = write!(
+        cmd,
+        "; for file in ltp/testcases/bin/*; do if [ -f \"$file\" ]; then case=${{file##*/}}"
+    );
+    let _ = write!(cmd, "; ./busybox echo \"RUN LTP CASE $case\"");
+    let _ = write!(cmd, "; KCONFIG_PATH=/proc/config \"$file\"");
+    let _ = write!(cmd, "; ret=$?");
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"FAIL LTP CASE $case : $ret\"; fi; done"
+    );
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+    );
+}
+
+fn append_ltp_batch(cmd: &mut alloc::string::String, batch: &str) {
+    match batch.trim() {
+        "p0" => append_filtered_ltp(cmd, LTP_P0_CASES),
+        "smoke" => append_filtered_ltp(cmd, LTP_SMOKE_CASES),
+        _ => append_filtered_ltp(cmd, ""),
+    }
+}
+
+fn append_filtered_ltp(cmd: &mut alloc::string::String, filter: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+    );
+    for case in filter.split('+') {
+        let case = case.trim();
+        if case.is_empty() {
+            continue;
+        }
+        if case.ends_with('_') {
+            continue;
+        }
+        let _ = write!(cmd, "; ./busybox echo \"RUN LTP CASE {case} : {case}\"");
+        let _ = write!(
+            cmd,
+            "; PATH=/musl/musl/ltp/testcases/bin:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -c \"{case}\"; ret=$?"
+        );
+        let _ = write!(cmd, "; ./busybox echo \"FAIL LTP CASE {case} : $ret\"");
+    }
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+    );
+}
+
+const LTP_P0_CASES: &str = "\
+alarm02+alarm03+alarm05+alarm06+alarm07+\
+clock_nanosleep01+clock_nanosleep02+clock_nanosleep03+clock_nanosleep04+\
+epoll_ctl01+epoll_ctl02+epoll_ctl03+epoll_ctl04+epoll_ctl05+\
+epoll_wait01+epoll_wait02+epoll_wait03+epoll_wait04+epoll_wait06+epoll_wait07+\
+eventfd01+eventfd02+eventfd03+eventfd04+eventfd05+eventfd06+eventfd2_01+eventfd2_02+eventfd2_03+\
+futex_wait01+futex_wait02+futex_wait03+futex_wait04+futex_wait05+\
+futex_wake01+futex_wake02+futex_wake03+futex_wake04+\
+getitimer01+getitimer02+\
+nanosleep01+nanosleep02+nanosleep04+\
+poll01+poll02+ppoll01+\
+pselect01+pselect01_64+pselect02+pselect02_64+pselect03+pselect03_64+\
+select01+select02+select03+select04+\
+setitimer01+setitimer02+\
+timerfd01+timerfd02+timerfd04+timerfd_create01+timerfd_gettime01+timerfd_settime01";
+
+const LTP_SMOKE_CASES: &str = "\
+abort01+confstr01+fmtmsg01+fpathconf01+getcontext01+gethostbyname_r01+gethostid01+gethostname01+\
+gethostname02+getpagesize01+getrandom01+getrandom02+getrandom03+getrandom04+getrandom05+\
+mallinfo02+mallinfo2_01+mallopt01+memcmp01+memcpy01+memset01+nftw01+nftw6401+pathconf01+\
+pathconf02+profil01+qmm01+realpath01+string01+switch01+syscall01+sysconf01+ulimit01";
 
 fn append_filtered_libctest(cmd: &mut alloc::string::String, filter: &str) {
     use core::fmt::Write as _;
@@ -1010,6 +1117,8 @@ fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
     for (_, script) in DEFAULT_OSCOMP_MUSL_SCRIPTS {
         if *script == "libctest_testcode.sh" {
             append_full_libctest(cmd);
+        } else if *script == "ltp_testcode.sh" {
+            append_full_ltp(cmd);
         } else {
             let _ = write!(cmd, " && ./busybox sh {script}");
         }
@@ -1053,6 +1162,10 @@ fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
 
 fn is_libctest_musl_group(group: &str) -> bool {
     matches!(group, "libctest" | "libctest-musl")
+}
+
+fn is_ltp_musl_group(group: &str) -> bool {
+    matches!(group, "ltp" | "ltp-musl")
 }
 
 const LIBCTEST_STATIC_SAFE_CASES: &str =

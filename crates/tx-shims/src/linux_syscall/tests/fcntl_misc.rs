@@ -437,7 +437,7 @@ fn dispatch_uname_null_buffer_returns_neg_efault() {
 // -----------------------------------------------------------------
 
 /// `prlimit64(0, RLIMIT_NOFILE, NULL, &old)` returns 0 and writes
-/// the static `(1024, 4096)` pair to `old`.
+/// the default `(65536, 65536)` pair to `old`.
 #[test]
 fn dispatch_prlimit64_rlimit_nofile_returns_default() {
     let _setup = setup();
@@ -445,7 +445,7 @@ fn dispatch_prlimit64_rlimit_nofile_returns_default() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap, thread);
 
-    // Two consecutive u64s: rlim_cur (1024) then rlim_max (4096).
+    // Two consecutive u64s: rlim_cur then rlim_max.
     let mut buf = [0u64; 2];
     let buf_uaddr = buf.as_mut_ptr() as u64;
     let r = block_on(dispatch::<ShimsTestPmap>(
@@ -453,8 +453,14 @@ fn dispatch_prlimit64_rlimit_nofile_returns_default() {
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Return(0));
-    assert_eq!(buf[0], 1024, "RLIMIT_NOFILE rlim_cur must default to 1024");
-    assert_eq!(buf[1], 4096, "RLIMIT_NOFILE rlim_max must default to 4096");
+    assert_eq!(
+        buf[0], 65536,
+        "RLIMIT_NOFILE rlim_cur must default to 65536"
+    );
+    assert_eq!(
+        buf[1], 65536,
+        "RLIMIT_NOFILE rlim_max must default to 65536"
+    );
 }
 
 /// `prlimit64(0, RLIMIT_AS, NULL, &old)` returns the

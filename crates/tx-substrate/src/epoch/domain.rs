@@ -188,6 +188,11 @@ impl EpochDomain {
             "epoch::guard current CPU has not called epoch::init_on_ap/init_on_bsp"
         );
 
+        let local_epoch = local.current();
+        if local_epoch != 0 {
+            return Guard::new_borrowed(self, local, cpu_id, local_epoch, cpu_pin);
+        }
+
         let current_epoch = self.global_epoch.0.load(Ordering::Acquire);
         local.enter(current_epoch);
         self.active_guards.0.fetch_add(1, Ordering::AcqRel);

@@ -42,6 +42,12 @@ docker-help:
 	@echo "  make oscomp-local-la64-smp4"
 	@echo "  make oscomp-local-rv64-libctest-musl-smp4"
 	@echo "  make oscomp-local-la64-libctest-musl-smp4"
+	@echo "  make oscomp-local-rv64-ltp-musl"
+	@echo "  make oscomp-local-rv64-ltp-musl-smp4"
+	@echo "  make oscomp-local-la64-ltp-musl"
+	@echo "  make oscomp-local-la64-ltp-musl-smp4"
+	@echo "  make ltp-batches"
+	@echo "  make oscomp-local-rv64-ltp-batch LTP_BATCH=p0"
 	@echo "  make oscomp-export-testcase"
 	@echo "  make docker-busybox-la64"
 	@echo "  make docker-oscomp-prepare docker-oscomp-submit docker-oscomp-run"
@@ -149,9 +155,14 @@ OSCOMP_OUT_LA ?= target/oscomp/os_serial_out_la.txt
 OSCOMP_OUT_LA_SMP4 ?= target/oscomp/os_serial_out_la_smp4.txt
 OSCOMP_GROUPS ?=
 OSCOMP_LIBCTEST ?=
+OSCOMP_LTP ?=
+LTP_BATCH ?= p0
+LTP_BATCH_TOOL ?= python3 tools/ltp-batches.py
+LTP_BATCH_REFRESH ?= --refresh
 COMMA := ,
 OSCOMP_LIBCTEST_GROUP = libctest-musl:$(subst $(COMMA),+,$(OSCOMP_LIBCTEST))
-OSCOMP_EFFECTIVE_GROUPS = $(if $(strip $(OSCOMP_LIBCTEST)),$(OSCOMP_LIBCTEST_GROUP),$(OSCOMP_GROUPS))
+OSCOMP_LTP_GROUP = $(if $(strip $(OSCOMP_LTP)),ltp-musl:$(subst $(COMMA),+,$(OSCOMP_LTP)),ltp-musl)
+OSCOMP_EFFECTIVE_GROUPS = $(if $(strip $(OSCOMP_LIBCTEST)),$(OSCOMP_LIBCTEST_GROUP),$(if $(strip $(OSCOMP_LTP)),$(OSCOMP_LTP_GROUP),$(OSCOMP_GROUPS)))
 OSCOMP_CMDLINE = $(strip $(if $(strip $(OSCOMP_EFFECTIVE_GROUPS)),tx.oscomp.groups=$(OSCOMP_EFFECTIVE_GROUPS),))
 OSCOMP_APPEND_RV = $(if $(strip $(OSCOMP_CMDLINE)),-append '$(OSCOMP_CMDLINE)',)
 OSCOMP_APPEND_LA = $(if $(strip $(OSCOMP_CMDLINE)),-fw_cfg name=opt/cmdline$(COMMA)string='$(OSCOMP_CMDLINE)',)
@@ -167,6 +178,11 @@ OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'
 	oscomp-local-la64 oscomp-local-la64-smp4 \
 	oscomp-local-rv64-libctest-musl oscomp-local-rv64-libctest-musl-smp4 \
 	oscomp-local-la64-libctest-musl oscomp-local-la64-libctest-musl-smp4 \
+	oscomp-local-rv64-ltp-musl oscomp-local-rv64-ltp-musl-smp4 \
+	oscomp-local-la64-ltp-musl oscomp-local-la64-ltp-musl-smp4 \
+	ltp-batches ltp-batch-cases \
+	oscomp-local-rv64-ltp-batch oscomp-local-rv64-ltp-batch-smp4 \
+	oscomp-local-la64-ltp-batch oscomp-local-la64-ltp-batch-smp4 \
 	oscomp-export-testcase
 
 oscomp-submit:
@@ -273,6 +289,52 @@ oscomp-local-la64-libctest-musl:
 
 oscomp-local-la64-libctest-musl-smp4:
 	$(MAKE) oscomp-local-la64-smp4 OSCOMP_GROUPS=libctest-musl
+
+oscomp-local-rv64-ltp-musl:
+	$(MAKE) oscomp-local-rv64 OSCOMP_GROUPS=$(OSCOMP_LTP_GROUP)
+
+oscomp-local-rv64-ltp-musl-smp4:
+	$(MAKE) oscomp-local-rv64-smp4 OSCOMP_GROUPS=$(OSCOMP_LTP_GROUP)
+
+oscomp-local-la64-ltp-musl:
+	$(MAKE) oscomp-local-la64 OSCOMP_GROUPS=$(OSCOMP_LTP_GROUP)
+
+oscomp-local-la64-ltp-musl-smp4:
+	$(MAKE) oscomp-local-la64-smp4 OSCOMP_GROUPS=$(OSCOMP_LTP_GROUP)
+
+ltp-batches:
+	$(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --list
+
+ltp-batch-cases:
+	$(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --batch $(LTP_BATCH)
+
+oscomp-local-rv64-ltp-batch:
+	@cases="$$($(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --batch $(LTP_BATCH) --csv)"; \
+	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
+	echo "LTP batch $(LTP_BATCH): $$count cases"; \
+	test "$$count" != 0; \
+	$(MAKE) oscomp-local-rv64 OSCOMP_GROUPS=ltp-batch:$(LTP_BATCH)
+
+oscomp-local-rv64-ltp-batch-smp4:
+	@cases="$$($(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --batch $(LTP_BATCH) --csv)"; \
+	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
+	echo "LTP batch $(LTP_BATCH): $$count cases"; \
+	test "$$count" != 0; \
+	$(MAKE) oscomp-local-rv64-smp4 OSCOMP_GROUPS=ltp-batch:$(LTP_BATCH)
+
+oscomp-local-la64-ltp-batch:
+	@cases="$$($(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --batch $(LTP_BATCH) --csv)"; \
+	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
+	echo "LTP batch $(LTP_BATCH): $$count cases"; \
+	test "$$count" != 0; \
+	$(MAKE) oscomp-local-la64 OSCOMP_GROUPS=ltp-batch:$(LTP_BATCH)
+
+oscomp-local-la64-ltp-batch-smp4:
+	@cases="$$($(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --batch $(LTP_BATCH) --csv)"; \
+	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
+	echo "LTP batch $(LTP_BATCH): $$count cases"; \
+	test "$$count" != 0; \
+	$(MAKE) oscomp-local-la64-smp4 OSCOMP_GROUPS=ltp-batch:$(LTP_BATCH)
 
 oscomp-export-testcase:
 	tools/oscomp-extract-testcase.sh $(OSCOMP_DATA) $(OSCOMP_TESTCASE_OUT)

@@ -540,6 +540,10 @@ pub(super) fn sys_semop(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     }
 }
 
+pub(super) fn sys_semtimedop(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    sys_semop(args, ctx)
+}
+
 pub(super) fn sys_semctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let (_ns, cred) = match nsproxy_and_cred(ctx) {
         Ok(v) => v,

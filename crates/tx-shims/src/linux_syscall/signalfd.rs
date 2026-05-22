@@ -136,6 +136,13 @@ pub(super) fn sys_signalfd4<'a>(
     SyscallResult::Return(fd as i64)
 }
 
+/// Historical `signalfd(fd, mask, sizemask)` wrapper. Linux generic
+/// userspace normally reaches `signalfd4`, but some LTP binaries still
+/// probe the old three-argument shape.
+pub(super) fn sys_signalfd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    sys_signalfd4(args[0] as i32, args[1], args[2], 0, ctx)
+}
+
 /// signalfd-shaped `read(2)` arm. Drains one
 /// `struct signalfd_siginfo` (128 bytes) off the per-fd pending
 /// queue. Mirrors `step_ufd_read`'s shape.

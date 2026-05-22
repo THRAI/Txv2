@@ -300,6 +300,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::register_devfs_console_alias();
             Self::mount_procfs_at_proc();
             Self::mount_bdevfs_at_dev_block();
+            Self::mount_tmpfs_at_dev_shm();
             Self::mount_sdcard_at_musl();
             Self::populate_rootfs_shebang_shims();
             Self::populate_rootfs_tmp_dirs();
@@ -891,6 +892,94 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":mount:bdevfs:ok\n");
     }
 
+    /// Mount writable tmpfs on `/dev/shm`.
+    ///
+    /// devfs publishes `/dev/shm` as a synthetic directory so the VFS
+    /// walker has a stable mountpoint, but devfs itself is read-only.
+    /// LTP's harness creates temporary shared-memory files under this
+    /// path, so boot must cover the stub with a real tmpfs before
+    /// userspace starts.
+    ///
+    /// **Order invariant:** runs after `mount_devfs_at_dev` because
+    /// the mountpoint is devfs-owned. The tmpfs is independent from
+    /// rootfs; sharing object id 2 for its root is valid because mount
+    /// payload identity scopes object ids.
+    pub(crate) fn mount_tmpfs_at_dev_shm() {
+        use alloc::sync::Arc;
+
+        let dev_mount = DEV_MOUNT
+            .lock()
+            .clone()
+            .expect("mount_tmpfs_at_dev_shm: DEV_MOUNT must be populated");
+
+        let dev_shm_meta = InodeMeta::new(
+            tx_subsystems::vfs::InodeKind::Directory,
+            tx_fs::devfs::DEVFS_SHM_DIR_MODE,
+        );
+        let dev_shm_rnode_in_devfs = RNode::new_cap(
+            tx_fs::devfs::DEVFS_SHM_DIR_OBJECT_ID,
+            dev_shm_meta,
+            RNodeBacking::Directory,
+        )
+        .expect("mount_tmpfs_at_dev_shm: /dev/shm rnode-on-devfs reservation");
+        let dev_shm_dentry_on_devfs = DEntry::new_cap(
+            InlineName::new(b"shm").expect("mount_tmpfs_at_dev_shm: /shm inline name"),
+            dev_shm_rnode_in_devfs,
+        )
+        .expect("mount_tmpfs_at_dev_shm: /dev/shm dentry-on-devfs reservation");
+
+        let shm_tmpfs = Arc::new(tx_fs::tmpfs::Tmpfs::new());
+        let shm_payload = MountPayload::new_cap(
+            shm_tmpfs.clone().fs_ops_arc(),
+            shm_tmpfs.fs_page_backing_arc(),
+            None,
+            mount::allocate_dev_id(),
+            MountOptions::default(),
+            "tmpfs",
+            SourceLabel::Static("dev-shm-tmpfs"),
+        )
+        .expect("mount_tmpfs_at_dev_shm: payload reservation");
+
+        let shm_root_rnode = {
+            let raw = RNode::new(
+                tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
+                InodeMeta::new(
+                    tx_subsystems::vfs::InodeKind::Directory,
+                    tx_fs::tmpfs::TMPFS_ROOT_MODE,
+                ),
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&shm_payload);
+            let res = step_engine::reserve_for::<RNode>()
+                .expect("mount_tmpfs_at_dev_shm: tmpfs root rnode reservation");
+            step_engine::sign_for(res, raw)
+        };
+
+        let devfs_payload = dev_mount
+            .payload_cap()
+            .expect("devfs payload alive during boot")
+            .into_cap();
+
+        let shm_mount = MountIdentity::new_cap(
+            mount::allocate_mount_id(),
+            Some(dev_shm_dentry_on_devfs),
+            shm_root_rnode,
+            Some(dev_mount),
+            shm_payload,
+            MountFlags::empty(),
+        )
+        .expect("mount_tmpfs_at_dev_shm: mount identity reservation");
+
+        mount::register_mount(
+            &devfs_payload,
+            tx_fs::devfs::DEVFS_SHM_DIR_OBJECT_ID,
+            shm_mount,
+        );
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:dev-shm-tmpfs:ok\n");
+    }
+
     /// Mount the sdcard ext4 image at `/musl` on the rootfs tmpfs.
     ///
     /// If a `vda` block device is registered (RV64 QEMU virtio-blk
@@ -1400,7 +1489,8 @@ impl<P: TxPlatform> CoreInit<P> {
         // A userspace task polled on this AP may fork while the reactor
         // poll lease is active. sys_clone defers child submission in that
         // case; make those children visible before the AP decides to WFI.
-        let submitted_child = Self::drain_pending_child_submits();
+        let submitted_child =
+            Self::drain_pending_child_submits() || Self::drain_pending_timer_signal_submits();
 
         submitted_child || step.is_some_and(|step| !step.should_idle())
     }
@@ -1681,6 +1771,25 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::queue_pending_child_submit(<P as tx_hal::SmpIf>::current_cpu_id(), child_thread);
     }
 
+    fn submit_posix_timer_signal_into_boot_reactor(
+        deadline_ns: u64,
+        interval_ns: u64,
+        repeats: u32,
+        target: Cap<tx_subsystems::process::ProcessIdentity>,
+        sig: tx_subsystems::signal::Signum,
+    ) {
+        PENDING_TIMER_SIGNAL_SUBMITS
+            .lock()
+            .push(PendingTimerSignalSubmit {
+                submit_cpu: <P as tx_hal::SmpIf>::current_cpu_id(),
+                deadline_ns,
+                interval_ns,
+                repeats,
+                target,
+                sig,
+            });
+    }
+
     fn register_thread_reactor_task(tid: u32, task: boot_runtime::TaskKey) {
         let mut tasks = THREAD_REACTOR_TASKS.lock();
         if let Some((_, existing)) = tasks
@@ -1740,6 +1849,13 @@ impl<P: TxPlatform> CoreInit<P> {
         submit_cpu: CpuId,
         child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
     ) {
+        if CLONE_SUBMIT_TRACE {
+            tx_hal::console_write_str::<P>("txkernel:clone:queue:tid=");
+            Self::write_u64(child_thread.tid.0 as u64);
+            tx_hal::console_write_str::<P>(":cpu=");
+            Self::write_u64(submit_cpu.0 as u64);
+            tx_hal::console_write_str::<P>("\n");
+        }
         PENDING_CHILD_SUBMITS.lock().push(PendingChildSubmit {
             submit_cpu,
             child_thread,
@@ -1759,11 +1875,21 @@ impl<P: TxPlatform> CoreInit<P> {
             };
             let child_thread = pending.child_thread;
             let Some(payload) = child_thread.payload_cap() else {
+                if CLONE_SUBMIT_TRACE {
+                    tx_hal::console_write_str::<P>("txkernel:clone:drain:zombie\n");
+                }
                 continue;
             };
             let task_payload = payload.clone();
             let submit_hart = boot_runtime::HartId(pending.submit_cpu.0);
             let child_tid = child_thread.tid.0;
+            if CLONE_SUBMIT_TRACE {
+                tx_hal::console_write_str::<P>("txkernel:clone:drain:tid=");
+                Self::write_u64(child_tid as u64);
+                tx_hal::console_write_str::<P>(":hart=");
+                Self::write_u64(pending.submit_cpu.0 as u64);
+                tx_hal::console_write_str::<P>("\n");
+            }
             let mut signal = SmpRescheduleSignal::<P>::new();
             let submitted = BOOT_REACTOR.with(|reactor| {
                 reactor.submit_task_with_meta_from_hart(
@@ -1779,6 +1905,67 @@ impl<P: TxPlatform> CoreInit<P> {
             if let Some((task_key, _report)) = submitted {
                 submitted_any = true;
                 Self::register_thread_reactor_task(child_tid, task_key);
+                if CLONE_SUBMIT_TRACE {
+                    tx_hal::console_write_str::<P>("txkernel:clone:submitted:tid=");
+                    Self::write_u64(child_tid as u64);
+                    tx_hal::console_write_str::<P>("\n");
+                }
+            } else {
+                if CLONE_SUBMIT_TRACE {
+                    tx_hal::console_write_str::<P>("txkernel:clone:submit-failed:tid=");
+                    Self::write_u64(child_tid as u64);
+                    tx_hal::console_write_str::<P>("\n");
+                }
+            }
+        }
+        submitted_any
+    }
+
+    fn drain_pending_timer_signal_submits() -> bool {
+        let mut submitted_any = false;
+        loop {
+            let next = PENDING_TIMER_SIGNAL_SUBMITS.lock().pop();
+            let Some(pending) = next else {
+                break;
+            };
+            let submit_cpu = pending.submit_cpu;
+            let deadline_start_ns = pending.deadline_ns;
+            let interval_ns = pending.interval_ns;
+            let target = pending.target;
+            let sig = pending.sig;
+            let repeat_count = pending.repeats.max(1);
+            let submit_hart = boot_runtime::HartId(submit_cpu.0);
+            let mut signal = SmpRescheduleSignal::<P>::new();
+            let submitted = BOOT_REACTOR.with(|reactor| {
+                reactor.submit_task_with_meta_from_hart(
+                    async move {
+                        let mut deadline_ns = deadline_start_ns;
+                        let mut repeats = repeat_count;
+                        loop {
+                            if let Some(future) =
+                                tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns)
+                            {
+                                let _ = future.await;
+                            }
+                            let _ = tx_subsystems::signal::deliver_posix_signal(
+                                tx_subsystems::signal::SignalTarget::Process(target.clone()),
+                                sig,
+                            );
+                            repeats -= 1;
+                            if repeats == 0 || interval_ns == 0 {
+                                break;
+                            }
+                            deadline_ns = deadline_ns.saturating_add(interval_ns);
+                        }
+                    },
+                    boot_runtime::InitialSchedMeta::kernel()
+                        .with_affinity(CpuMask::single(submit_cpu).bits()),
+                    submit_hart,
+                    &mut signal,
+                )
+            });
+            if submitted.is_some() {
+                submitted_any = true;
             }
         }
         submitted_any
@@ -1790,11 +1977,25 @@ struct PendingChildSubmit {
     child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
 }
 
+struct PendingTimerSignalSubmit {
+    submit_cpu: CpuId,
+    deadline_ns: u64,
+    interval_ns: u64,
+    repeats: u32,
+    target: Cap<tx_subsystems::process::ProcessIdentity>,
+    sig: tx_subsystems::signal::Signum,
+}
+
+const CLONE_SUBMIT_TRACE: bool = false;
+
 /// Deferred-submit queue for `sys_clone` children. Pushed from
 /// `submit_child_thread_into_boot_reactor` (running inside the
 /// reactor-poll inner lock) and drained from the BSP loop between
 /// reactor steps.
 static PENDING_CHILD_SUBMITS: SpinMutex<alloc::vec::Vec<PendingChildSubmit>> =
+    SpinMutex::new(alloc::vec::Vec::new());
+
+static PENDING_TIMER_SIGNAL_SUBMITS: SpinMutex<alloc::vec::Vec<PendingTimerSignalSubmit>> =
     SpinMutex::new(alloc::vec::Vec::new());
 
 /// Synchronously poll a future to completion using a noop waker.

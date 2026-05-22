@@ -78,6 +78,7 @@ impl ItimerSpec {
 }
 
 pub struct TimerFd {
+    clockid: u32,
     deadline_ns: AtomicU64,
     interval_ns: AtomicU64,
     expiration_count: AtomicU64,
@@ -88,11 +89,12 @@ pub struct TimerFd {
 }
 
 impl TimerFd {
-    pub fn new(flags: u32) -> Self {
+    pub fn new(clockid: u32, flags: u32) -> Self {
         let channel = Channel::new();
         let source_id = wait_source::register_wait_channel(channel.clone());
         let source = Some(wait_routing::new_wait_source(source_id));
         TimerFd {
+            clockid,
             deadline_ns: AtomicU64::new(0),
             interval_ns: AtomicU64::new(0),
             expiration_count: AtomicU64::new(0),
@@ -103,6 +105,9 @@ impl TimerFd {
         }
     }
 
+    pub fn clockid(&self) -> u32 {
+        self.clockid
+    }
     pub fn deadline_ns(&self) -> u64 {
         self.deadline_ns.load(Ordering::Acquire)
     }
@@ -193,8 +198,8 @@ pub(crate) fn register_zones() -> Result<(), ZoneError> {
     Ok(())
 }
 
-pub fn timerfd_create(flags: u32) -> Result<Cap<TimerFd>, ZoneError> {
-    let tfd = TimerFd::new(flags);
+pub fn timerfd_create(clockid: u32, flags: u32) -> Result<Cap<TimerFd>, ZoneError> {
+    let tfd = TimerFd::new(clockid, flags);
     sign(tfd)
 }
 
@@ -250,13 +255,14 @@ pub fn step_timerfd_read(
 }
 
 pub struct TimerfdCreateOp {
+    pub clockid: u32,
     pub flags: u32,
 }
 impl<I: SubjectIdentity> StepOp<I> for TimerfdCreateOp {
     type Output = Result<Cap<TimerFd>, ZoneError>;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(timerfd_create(self.flags))
+        StepOutcome::Done(timerfd_create(self.clockid, self.flags))
     }
 }
 impl<I: SubjectIdentity> OneShotStepOp<I> for TimerfdCreateOp {}
@@ -278,7 +284,7 @@ mod tests {
     #[test]
     fn create_disarmed_read_returns_eagain() {
         let _g = setup();
-        let cap = timerfd_create(TFD_NONBLOCK).expect("create");
+        let cap = timerfd_create(1, TFD_NONBLOCK).expect("create");
         let mut buf = [0u8; 8];
         match step_timerfd_read(&cap, 0, &mut buf, true) {
             StepOutcome::Err(V3Errno::EAGAIN) => {}
@@ -289,7 +295,7 @@ mod tests {
     #[test]
     fn arm_and_past_deadline_reads_one() {
         let _g = setup();
-        let cap = timerfd_create(0).expect("create");
+        let cap = timerfd_create(1, 0).expect("create");
         let now = 1_000_000_000;
         timerfd_settime(
             &cap,
@@ -316,7 +322,7 @@ mod tests {
     #[test]
     fn disarm_zero_it_value() {
         let _g = setup();
-        let cap = timerfd_create(0).expect("create");
+        let cap = timerfd_create(1, 0).expect("create");
         let now = 1_000_000_000;
         timerfd_settime(
             &cap,

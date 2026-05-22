@@ -104,6 +104,7 @@ pub mod numbers;
 mod cred;
 use cred::*;
 mod time;
+pub use time::poll_due_itimers;
 use time::*;
 mod signal;
 use signal::*;
@@ -144,6 +145,9 @@ mod eventfd;
 use eventfd::*;
 mod timerfd;
 use timerfd::*;
+mod posix_timer;
+pub use posix_timer::poll_due_posix_timers;
+use posix_timer::*;
 mod epoll;
 use epoll::*;
 mod net;
@@ -168,50 +172,53 @@ mod tests;
 
 pub use numbers::{
     AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW,
-    CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW,
-    CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID,
-    CLONE_CHILD_CLEARTID, CLONE_DETACHED, CLONE_FILES, CLONE_FS, CLONE_NEWCGROUP, CLONE_NEWUTS,
-    CLONE_PARENT, CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_SIGHAND, CLONE_SYSVSEM, CLONE_THREAD,
-    CLONE_VFORK, CLONE_VM, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, DT_UNKNOWN,
-    FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI,
-    FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT,
-    FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, F_DUPFD, F_DUPFD_CLOEXEC,
-    F_GETFD, F_GETFL, F_OK, F_SETFD, F_SETFL, GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM,
-    MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED,
-    MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN,
-    MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED,
-    MAP_STACK, MAP_SYNC, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, NR_ACCEPT, NR_ACCEPT4,
-    NR_BIND, NR_BRK, NR_CHDIR, NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLONE, NR_CLOSE,
-    NR_CONNECT, NR_DUP, NR_DUP3, NR_EPOLL_CREATE1, NR_EPOLL_CTL, NR_EPOLL_PWAIT, NR_EPOLL_WAIT,
-    NR_EVENTFD2, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHDIR,
-    NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_FDATASYNC, NR_FLOCK, NR_FSTAT, NR_FSTATFS, NR_FSYNC,
-    NR_FTRUNCATE, NR_FUTEX, NR_GETCWD, NR_GETDENTS64, NR_GETEGID, NR_GETEUID, NR_GETGID,
-    NR_GETPEERNAME, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID,
-    NR_GETRESUID, NR_GETSID, NR_GETSOCKNAME, NR_GETSOCKOPT, NR_GETTID, NR_GETTIMEOFDAY, NR_GETUID,
+    CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE,
+    CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_ALARM,
+    CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, CLONE_CHILD_CLEARTID,
+    CLONE_DETACHED, CLONE_FILES, CLONE_FS, CLONE_NEWCGROUP, CLONE_NEWUTS, CLONE_PARENT,
+    CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_SIGHAND, CLONE_SYSVSEM, CLONE_THREAD, CLONE_VFORK,
+    CLONE_VM, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, DT_UNKNOWN, FD_CLOEXEC,
+    FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG,
+    FUTEX_REQUEUE, FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE,
+    FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_OK, F_SETFD,
+    F_SETFL, GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, MADV_DONTNEED, MADV_FREE, MADV_NORMAL,
+    MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE,
+    MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK,
+    MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_STACK, MAP_SYNC, MREMAP_DONTUNMAP,
+    MREMAP_FIXED, MREMAP_MAYMOVE, NR_ACCEPT, NR_ACCEPT4, NR_BIND, NR_BRK, NR_CHDIR,
+    NR_CLOCK_GETRES, NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLONE, NR_CLOSE, NR_CONNECT, NR_DUP,
+    NR_DUP3, NR_EPOLL_CREATE1, NR_EPOLL_CTL, NR_EPOLL_PWAIT, NR_EPOLL_WAIT, NR_EVENTFD2, NR_EXECVE,
+    NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHDIR, NR_FCHMODAT, NR_FCHOWNAT,
+    NR_FCNTL, NR_FDATASYNC, NR_FLOCK, NR_FSTAT, NR_FSTATFS, NR_FSYNC, NR_FTRUNCATE, NR_FUTEX,
+    NR_GETCWD, NR_GETDENTS64, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETITIMER, NR_GETPEERNAME,
+    NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID, NR_GETRESUID,
+    NR_GETSID, NR_GETSOCKNAME, NR_GETSOCKOPT, NR_GETTID, NR_GETTIMEOFDAY, NR_GETUID,
     NR_GET_ROBUST_LIST, NR_IOCTL, NR_IO_DESTROY, NR_IO_GETEVENTS, NR_IO_SETUP, NR_IO_SUBMIT,
     NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_KILL, NR_LINKAT, NR_LISTEN, NR_LSEEK, NR_MADVISE,
     NR_MKDIRAT, NR_MKNODAT, NR_MLOCK, NR_MMAP, NR_MOUNT, NR_MPROTECT, NR_MQ_GETSETATTR,
     NR_MQ_NOTIFY, NR_MQ_OPEN, NR_MQ_TIMEDRECEIVE, NR_MQ_TIMEDSEND, NR_MQ_UNLINK, NR_MREMAP,
     NR_MSGCTL, NR_MSGGET, NR_MSGRCV, NR_MSGSND, NR_MSYNC, NR_MUNLOCK, NR_MUNMAP, NR_NANOSLEEP,
     NR_NEWFSTATAT, NR_OPENAT, NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL, NR_PIPE2, NR_PPOLL, NR_PREAD64,
-    NR_PRLIMIT64, NR_READ, NR_READLINKAT, NR_READV, NR_RECVFROM, NR_RENAMEAT2, NR_RT_SIGACTION,
-    NR_RT_SIGPENDING, NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN, NR_RT_SIGSUSPEND,
-    NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SCHED_SETSCHEDULER,
-    NR_SEMCTL, NR_SEMGET, NR_SEMOP, NR_SEMTIMEDOP, NR_SENDTO, NR_SETGID, NR_SETPGID, NR_SETREGID,
-    NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETSOCKOPT, NR_SETUID,
-    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET, NR_SHUTDOWN,
-    NR_SIGALTSTACK, NR_SIGNALFD, NR_SIGNALFD4, NR_SOCKET, NR_SOCKETPAIR, NR_STATFS, NR_STATX,
-    NR_SYMLINKAT, NR_SYNC, NR_SYNCFS, NR_SYSLOG, NR_TGKILL, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME,
-    NR_TIMERFD_SETTIME, NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UMOUNT2, NR_UNAME,
-    NR_UNLINKAT, NR_USERFAULTFD, NR_UTIMENSAT, NR_WAIT4, NR_WRITE, NR_WRITEV, O_ACCMODE, O_APPEND,
-    O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
-    PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, RENAME_EXCHANGE,
-    RENAME_NOREPLACE, RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA,
-    RLIMIT_FSIZE, RLIMIT_LOCKS, RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE, RLIMIT_NICE, RLIMIT_NOFILE,
-    RLIMIT_NPROC, RLIMIT_RSS, RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIMIT_SIGPENDING, RLIMIT_STACK,
-    RLIM_INFINITY, R_OK, SEEK_CUR, SEEK_END, SEEK_SET, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW,
-    TIMER_ABSTIME, TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP,
-    TIOCSWINSZ, UTIME_NOW, UTIME_OMIT, WNOHANG, W_OK, X_OK,
+    NR_PRLIMIT64, NR_PSELECT6, NR_PSELECT6_TIME64, NR_READ, NR_READLINKAT, NR_READV, NR_RECVFROM,
+    NR_RENAMEAT2, NR_RT_SIGACTION, NR_RT_SIGPENDING, NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO,
+    NR_RT_SIGRETURN, NR_RT_SIGSUSPEND, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY,
+    NR_SCHED_SETAFFINITY, NR_SCHED_SETSCHEDULER, NR_SEMCTL, NR_SEMGET, NR_SEMOP, NR_SEMTIMEDOP,
+    NR_SENDTO, NR_SETGID, NR_SETITIMER, NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID,
+    NR_SETREUID, NR_SETSID, NR_SETSOCKOPT, NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
+    NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET, NR_SHUTDOWN, NR_SIGALTSTACK, NR_SIGNALFD,
+    NR_SIGNALFD4, NR_SOCKET, NR_SOCKETPAIR, NR_STATFS, NR_STATX, NR_SYMLINKAT, NR_SYNC, NR_SYNCFS,
+    NR_SYSLOG, NR_TGKILL, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME,
+    NR_TIMER_CREATE, NR_TIMER_DELETE, NR_TIMER_GETOVERRUN, NR_TIMER_GETTIME, NR_TIMER_SETTIME,
+    NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UMOUNT2, NR_UNAME, NR_UNLINKAT, NR_USERFAULTFD,
+    NR_UTIMENSAT, NR_WAIT4, NR_WRITE, NR_WRITEV, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT,
+    O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN,
+    PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, RENAME_EXCHANGE, RENAME_NOREPLACE,
+    RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS,
+    RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE, RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_RSS,
+    RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIMIT_SIGPENDING, RLIMIT_STACK, RLIM_INFINITY, R_OK, SEEK_CUR,
+    SEEK_END, SEEK_SET, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW, TIMER_ABSTIME,
+    TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ,
+    UTIME_NOW, UTIME_OMIT, WNOHANG, W_OK, X_OK,
 };
 
 pub use numbers::{
@@ -256,6 +263,10 @@ pub const EXECVE_VEC_MAX: usize = 256;
 /// Used as the `-ENOSYS` magnitude returned from `dispatch` for every
 /// syscall number not handled by Phase 2a / 2b.
 pub(super) const ENOSYS_VALUE: i32 = 38;
+/// Linux generic ABI errno value for "operation not supported" (`EOPNOTSUPP`).
+/// Used when a syscall surface exists but the requested object/clock flavor is
+/// outside txKernel's current emulation contract.
+pub(super) const EOPNOTSUPP_VALUE: i32 = 95;
 pub(super) const ENODEV_VALUE: i32 = 19;
 /// Linux generic ABI errno value for "bad file descriptor" (`EBADF`).
 pub(super) const EBADF_VALUE: i32 = 9;
@@ -305,6 +316,11 @@ pub(super) const ENOMEM_VALUE: i32 = 12;
 pub(super) const EAGAIN_VALUE: i32 = 11;
 /// Linux generic ABI errno value for "connection refused" (`ECONNREFUSED`).
 pub(super) const ECONNREFUSED_VALUE: i32 = 111;
+/// Linux generic ABI errno value for "connection timed out" / wait timeout
+/// (`ETIMEDOUT`). Used by futex wait timeout paths.
+pub(super) const ETIMEDOUT_VALUE: i32 = 110;
+/// Linux generic ABI errno value for "transport endpoint is not connected" (`ENOTCONN`).
+pub(super) const ENOTCONN_VALUE: i32 = 107;
 /// Linux generic ABI errno value for "no child processes" (`ECHILD`).
 /// Used by `sys_wait4` when the caller has no children matching the
 /// requested selector (Wave 3 of the fork/clone/wait4 slice).
@@ -325,8 +341,8 @@ pub(super) const EROFS_VALUE: i32 = 30;
 /// cannot produce today (chmod/chown/access never block in
 /// tmpfs/devfs); matches `errno_to_i32`'s `Errno::EIO` row.
 pub(super) const EIO_VALUE: i32 = 5;
-/// Soft `RLIMIT_NOFILE` value exported by `prlimit64`.
-pub(super) const RLIMIT_NOFILE_CUR: u32 = 1024;
+/// Fallback soft `RLIMIT_NOFILE` value used by legacy fd helpers.
+pub(super) const RLIMIT_NOFILE_CUR: u32 = 65536;
 
 pub(super) fn next_fd_below_nofile(
     process: &Cap<ProcessIdentity>,
@@ -461,6 +477,8 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_GETRESGID => return sys_getresgid(req.args, ctx),
         nr if nr == NR_TIMES => return sys_times::<P>(req.args, ctx),
         nr if nr == NR_GETTIMEOFDAY => return sys_gettimeofday::<P>(req.args, ctx),
+        nr if nr == NR_GETITIMER => return sys_getitimer::<P>(req.args, ctx),
+        nr if nr == NR_SETITIMER => return sys_setitimer::<P>(req.args, ctx),
         nr if nr == NR_UMASK => return sys_umask(req.args, ctx),
         nr if nr == NR_UNAME => return sys_uname::<P>(req.args, ctx),
         nr if nr == NR_GETRANDOM => return sys_getrandom(req.args, ctx),
@@ -502,7 +520,11 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_SOCKET => sys_socket(req.args, ctx),
         nr if nr == NR_BIND => sys_bind(req.args, ctx),
         nr if nr == NR_GETSOCKNAME => sys_getsockname(req.args, ctx),
+        nr if nr == NR_GETPEERNAME => sys_getpeername(req.args, ctx),
         nr if nr == NR_SETSOCKOPT => sys_setsockopt(req.args, ctx),
+        nr if nr == NR_GETSOCKOPT => sys_getsockopt(req.args, ctx),
+        nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx),
+        nr if nr == NR_SHUTDOWN => sys_shutdown(req.args, ctx),
         nr if nr == NR_SENDTO => sys_sendto(req.args, ctx),
         nr if nr == NR_RECVFROM => sys_recvfrom(req.args, ctx),
         nr if nr == NR_LISTEN => sys_listen(req.args, ctx),
@@ -510,7 +532,10 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_ACCEPT => sys_accept(req.args, ctx),
         nr if nr == NR_ACCEPT4 => sys_accept4(req.args, ctx),
         nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
-        nr if nr == NR_PPOLL => sys_ppoll(req.args, ctx).await,
+        nr if nr == NR_PPOLL => sys_ppoll::<P>(req.args, ctx).await,
+        nr if nr == NR_PSELECT6 || nr == NR_PSELECT6_TIME64 => {
+            sys_pselect6::<P>(req.args, ctx).await
+        }
         nr if nr == NR_EXIT => sys_exit(req.args, ctx),
         nr if nr == NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
         nr if nr == NR_BRK => sys_brk(req.args, ctx).await,
@@ -525,9 +550,11 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_SHMCTL => sys_shmctl(req.args, ctx),
         nr if nr == NR_MSGCTL => sys_msgctl(req.args, ctx),
         nr if nr == NR_SEMOP => sys_semop(req.args, ctx),
+        nr if nr == NR_SEMTIMEDOP => sys_semtimedop(req.args, ctx),
         nr if nr == NR_SEMCTL => sys_semctl(req.args, ctx),
         nr if nr == NR_MSGCTL => sys_msgctl(req.args, ctx),
         nr if nr == NR_SEMOP => sys_semop(req.args, ctx),
+        nr if nr == NR_SEMTIMEDOP => sys_semtimedop(req.args, ctx),
         nr if nr == NR_SEMCTL => sys_semctl(req.args, ctx),
         nr if nr == NR_SHMAT => sys_shmat(req.args, ctx).await,
         nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
@@ -635,6 +662,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         // timer queue for real-duration sleeps; zero-duration and
         // past-deadline cases short-circuit immediately.
         nr if nr == NR_CLOCK_GETTIME => sys_clock_gettime::<P>(req.args, ctx),
+        nr if nr == NR_CLOCK_GETRES => sys_clock_getres(req.args, ctx),
         nr if nr == NR_NANOSLEEP => sys_nanosleep::<P>(req.args, ctx).await,
         nr if nr == NR_CLOCK_NANOSLEEP => sys_clock_nanosleep::<P>(req.args, ctx).await,
         // Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY
@@ -760,6 +788,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         // existing signalfd. Returns the fd. The companion
         // signalfd-shaped read(2) arm lives in sys_read after the
         // ufd discriminator.
+        nr if nr == NR_SIGNALFD => sys_signalfd(req.args, ctx),
         nr if nr == NR_SIGNALFD4 => sys_signalfd4(
             req.args[0] as i32,
             req.args[1],
@@ -785,6 +814,22 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_TIMERFD_GETTIME => {
             sys_timerfd_gettime::<P>(req.args[0] as u32, req.args[1], ctx)
         }
+        // POSIX timer syscalls.
+        nr if nr == NR_TIMER_CREATE => {
+            sys_timer_create(req.args[0] as u32, req.args[1], req.args[2], ctx)
+        }
+        nr if nr == NR_TIMER_DELETE => sys_timer_delete(req.args[0] as u32, ctx),
+        nr if nr == NR_TIMER_GETOVERRUN => sys_timer_getoverrun(req.args[0] as u32, ctx),
+        nr if nr == NR_TIMER_GETTIME => {
+            sys_timer_gettime::<P>(req.args[0] as u32, req.args[1], ctx)
+        }
+        nr if nr == NR_TIMER_SETTIME => sys_timer_settime::<P>(
+            req.args[0] as u32,
+            req.args[1] as u32,
+            req.args[2],
+            req.args[3],
+            ctx,
+        ),
         // epoll_create1 / epoll_ctl / epoll_pwait — generic Linux
         // numbers used by musl on RV64 and LoongArch64. musl's
         // epoll_wait wrapper calls epoll_pwait with a null mask on
@@ -797,13 +842,26 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
             req.args[3],
             ctx,
         ),
-        nr if nr == NR_EPOLL_PWAIT => sys_epoll_wait::<P>(
-            req.args[0] as u32,
-            req.args[1],
-            req.args[2] as u32,
-            req.args[3] as i32,
-            ctx,
-        ),
+        nr if nr == NR_EPOLL_PWAIT => {
+            sys_epoll_wait::<P>(
+                req.args[0] as u32,
+                req.args[1],
+                req.args[2] as u32,
+                req.args[3] as i32,
+                ctx,
+            )
+            .await
+        }
+        nr if nr == NR_EPOLL_WAIT => {
+            sys_epoll_wait::<P>(
+                req.args[0] as u32,
+                req.args[1],
+                req.args[2] as u32,
+                req.args[3] as i32,
+                ctx,
+            )
+            .await
+        }
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
