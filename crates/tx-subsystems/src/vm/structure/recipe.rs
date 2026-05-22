@@ -11,7 +11,7 @@ use crate::execution::Guard;
 
 use super::{
     AddressSpaceStats, MapPlacement, Prot, UfdRegistration, UserRange, UserVirtAddr, VmBacking,
-    VmEntry, VmEntryError, VmEntryFlags, VmMapCommit, VmMapError, USER_PAGE_SIZE,
+    VmEntry, VmEntryError, VmEntryFlags, VmMapCommit, VmMapError, VmRemapPlacement, USER_PAGE_SIZE,
 };
 
 type RecipeTree = BTreeMap<UserVirtAddr, VmEntry>;
@@ -208,14 +208,21 @@ impl RecipeIndex {
         Ok(VmMapCommit { changed_pages })
     }
 
-    pub(in crate::vm) fn remap_disjoint(
+    pub(in crate::vm) fn remap(
         &self,
         old_range: UserRange,
         new_range: UserRange,
+        placement: VmRemapPlacement,
+        destination: MapPlacement,
     ) -> Result<VmMapCommit, VmMapError> {
         let _writer = self.mutation.lock();
         let current = unsafe { self.under_writer_lock() };
-        let (rewritten, changed_pages) = rewrite_remap_disjoint(current, old_range, new_range)?;
+        let (rewritten, changed_pages) = match placement {
+            VmRemapPlacement::Move => {
+                rewrite_remap_disjoint(current, old_range, new_range, destination)?
+            }
+            VmRemapPlacement::InPlace => rewrite_remap_in_place(current, old_range, new_range)?,
+        };
         self.publish(rewritten);
         Ok(VmMapCommit { changed_pages })
     }
@@ -408,17 +415,165 @@ fn rewrite_remap_disjoint(
     entries: &RecipeTree,
     old_range: UserRange,
     new_range: UserRange,
+    destination: MapPlacement,
 ) -> Result<(RecipeTree, usize), VmMapError> {
-    if old_range.overlaps(new_range) || old_range.len() != new_range.len() {
+    if old_range.overlaps(new_range) {
         return Err(VmMapError::InvalidRange);
     }
     if !range_is_fully_mapped(entries, old_range) {
         return Err(VmMapError::MissingMapping);
     }
+    if destination == MapPlacement::RequireFree {
+        validate_insert_free(
+            entries,
+            &VmEntry::new(
+                new_range,
+                Prot::NONE,
+                VmEntryFlags::PRIVATE,
+                VmBacking::None,
+            ),
+        )?;
+    }
+
+    let move_len = old_range.len().min(new_range.len());
+    let move_source = UserRange::new_aligned(old_range.start(), move_len)
+        .map_err(|_| VmMapError::InvalidRange)?;
+    let mut rewritten = RecipeTree::new();
+    let mut moved = Vec::new();
+
+    for existing in entries.values().cloned() {
+        let Some(moving_overlap) = range_intersection(existing.range, move_source) else {
+            continue;
+        };
+        moved.push(rebased_entry_for_move(
+            existing,
+            moving_overlap,
+            old_range,
+            new_range,
+        )?);
+    }
+
+    if new_range.len() > old_range.len() {
+        let Some(last) = moved.pop() else {
+            return Err(VmMapError::MissingMapping);
+        };
+        let tail_len = new_range.len() - old_range.len();
+        let expanded_range = UserRange::new_aligned(
+            last.range.start(),
+            last.range
+                .len()
+                .checked_add(tail_len)
+                .ok_or(VmMapError::InvalidRange)?,
+        )
+        .map_err(|_| VmMapError::InvalidRange)?;
+        moved.push(entry_with_range(&last, expanded_range)?);
+    }
+
+    for existing in entries.values().cloned() {
+        for entry in remove_remap_covered_ranges(&existing, old_range, new_range)? {
+            push_entry(&mut rewritten, entry);
+        }
+    }
+    for entry in moved {
+        push_entry(&mut rewritten, entry);
+    }
+
+    Ok((rewritten, old_range.page_count() + new_range.page_count()))
+}
+
+fn remove_remap_covered_ranges(
+    entry: &VmEntry,
+    old_range: UserRange,
+    new_range: UserRange,
+) -> Result<Vec<VmEntry>, VmMapError> {
+    let mut pieces = alloc::vec![entry.clone()];
+    for range in [old_range, new_range] {
+        let mut next = Vec::new();
+        for piece in pieces {
+            let Some(overlap) = range_intersection(piece.range, range) else {
+                next.push(piece);
+                continue;
+            };
+            let rewrite = piece.split_for_unmap(overlap).map_err(vm_entry_error)?;
+            if let Some(before) = rewrite.before {
+                next.push(before);
+            }
+            if let Some(after) = rewrite.after {
+                next.push(after);
+            }
+        }
+        pieces = next;
+    }
+    Ok(pieces)
+}
+
+fn rebased_entry_for_move(
+    existing: VmEntry,
+    moving_overlap: UserRange,
+    old_range: UserRange,
+    new_range: UserRange,
+) -> Result<VmEntry, VmMapError> {
+    let moving = existing
+        .split_for_protect(moving_overlap, existing.prot)
+        .map_err(vm_entry_error)?
+        .target
+        .ok_or(VmMapError::MissingMapping)?;
+    let delta = moving_overlap.start().as_usize() - old_range.start().as_usize();
+    let target_start = UserVirtAddr(
+        new_range
+            .start()
+            .as_usize()
+            .checked_add(delta)
+            .ok_or(VmMapError::InvalidRange)?,
+    );
+    let target_range = UserRange::new_aligned(target_start, moving_overlap.len())
+        .map_err(|_| VmMapError::InvalidRange)?;
+    // Preserve the moving VmEntry's private CoW set (mapping identity
+    // follows the VmEntry across mremap-move per the plan).
+    Ok(
+        VmEntry::new(target_range, moving.prot, moving.flags, moving.backing)
+            .with_ufd_registration(moving.ufd_registration)
+            .with_private(moving.private),
+    )
+}
+
+fn rewrite_remap_in_place(
+    entries: &RecipeTree,
+    old_range: UserRange,
+    new_range: UserRange,
+) -> Result<(RecipeTree, usize), VmMapError> {
+    if old_range.start() != new_range.start() {
+        return Err(VmMapError::InvalidRange);
+    }
+    if !range_is_fully_mapped(entries, old_range) {
+        return Err(VmMapError::MissingMapping);
+    }
+
+    if new_range.len() == old_range.len() {
+        return Ok((RecipeTree::clone(entries), 0));
+    }
+
+    if new_range.len() < old_range.len() {
+        let shrink_start = UserVirtAddr(
+            old_range
+                .start()
+                .as_usize()
+                .checked_add(new_range.len())
+                .ok_or(VmMapError::InvalidRange)?,
+        );
+        let shrink_range = UserRange::new_aligned(shrink_start, old_range.len() - new_range.len())
+            .map_err(|_| VmMapError::InvalidRange)?;
+        return rewrite_unmap(entries, shrink_range);
+    }
+
+    let grow_start = old_range.end();
+    let grow_len = new_range.len() - old_range.len();
+    let grow_range =
+        UserRange::new_aligned(grow_start, grow_len).map_err(|_| VmMapError::InvalidRange)?;
     validate_insert_free(
         entries,
         &VmEntry::new(
-            new_range,
+            grow_range,
             Prot::NONE,
             VmEntryFlags::PRIVATE,
             VmBacking::None,
@@ -426,53 +581,34 @@ fn rewrite_remap_disjoint(
     )?;
 
     let mut rewritten = RecipeTree::new();
-    let mut moved = Vec::new();
+    let mut expanded = false;
 
     for existing in entries.values().cloned() {
-        let Some(overlap) = range_intersection(existing.range, old_range) else {
+        if existing.range == old_range && !expanded {
+            push_entry(&mut rewritten, entry_with_range(&existing, new_range)?);
+            expanded = true;
+        } else {
             push_entry(&mut rewritten, existing);
-            continue;
-        };
-
-        let rewrite = existing.split_for_unmap(overlap).map_err(vm_entry_error)?;
-        if let Some(before) = rewrite.before {
-            push_entry(&mut rewritten, before);
         }
-        if let Some(after) = rewrite.after {
-            push_entry(&mut rewritten, after);
-        }
-
-        let moving = existing
-            .split_for_protect(overlap, existing.prot)
-            .map_err(vm_entry_error)?
-            .target
-            .ok_or(VmMapError::MissingMapping)?;
-        let delta = overlap.start().as_usize() - old_range.start().as_usize();
-        let target_start = UserVirtAddr(
-            new_range
-                .start()
-                .as_usize()
-                .checked_add(delta)
-                .ok_or(VmMapError::InvalidRange)?,
-        );
-        let target_range = UserRange::new_aligned(target_start, overlap.len())
-            .map_err(|_| VmMapError::InvalidRange)?;
-        // Preserve the moving VmEntry's private CoW set (mapping
-        // identity follows the VmEntry across mremap-move per the
-        // plan). `moving.private` is the Cap for the sub-range
-        // produced by `split_for_protect`; it already covers exactly
-        // the pages being relocated.
-        moved.push(
-            VmEntry::new(target_range, moving.prot, moving.flags, moving.backing)
-                .with_private(moving.private),
-        );
     }
 
-    for entry in moved {
-        push_entry(&mut rewritten, entry);
+    if !expanded {
+        return Err(VmMapError::InvalidRange);
     }
 
     Ok((rewritten, old_range.page_count() + new_range.page_count()))
+}
+
+fn entry_with_range(entry: &VmEntry, range: UserRange) -> Result<VmEntry, VmMapError> {
+    if entry.range.start() != range.start() || range.end().as_usize() < entry.range.end().as_usize()
+    {
+        return Err(VmMapError::InvalidRange);
+    }
+    Ok(
+        VmEntry::new(range, entry.prot, entry.flags, entry.backing.clone())
+            .with_ufd_registration(entry.ufd_registration)
+            .with_private(entry.private.clone()),
+    )
 }
 
 fn rewrite_tag_ufd_registration(
