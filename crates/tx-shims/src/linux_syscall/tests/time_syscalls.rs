@@ -380,7 +380,7 @@ fn itimer_real_sigalrm_handler_round_trip_restores_context() {
     let ctx = make_ctx(proc_cap.clone(), thread.clone());
     let sigalrm = Signum::new(14).expect("SIGALRM");
     let handler = 0xcafeusize;
-    let _ = step_sigaction(&proc_cap, sigalrm, SigDisposition::Handler(handler));
+    let _ = step_sigaction(&proc_cap, sigalrm, SigDisposition::handler(handler));
 
     let new_timer = TestItimerval {
         interval: TestTimeval {

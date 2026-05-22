@@ -2311,7 +2311,6 @@ mod init_setuid_fixture;
 /// decision so each fd-ops/DAC/fork test owns its own pinned ABI).
 #[cfg(test)]
 mod init_lseek_fixture;
-mod rootfs_shims;
 
 #[cfg(test)]
 mod tests;

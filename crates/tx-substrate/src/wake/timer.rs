@@ -175,16 +175,6 @@ impl TimerWheel {
         self.state.lock().entries.len()
     }
 
-    /// Earliest currently-armed deadline, if any.
-    pub fn next_deadline_ns(&self) -> Option<u64> {
-        self.state
-            .lock()
-            .entries
-            .iter()
-            .map(|entry| entry.deadline.raw())
-            .min()
-    }
-
     /// Install a timer firing at `deadline` with role `role`.
     /// Returns a [`TimerGuard`] whose drop cancels the
     /// registration; the guard carries the issued [`TimerToken`].

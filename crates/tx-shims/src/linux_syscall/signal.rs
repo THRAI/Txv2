@@ -7,6 +7,7 @@ use super::*;
 use alloc::collections::BTreeMap;
 
 use crate::adapter::step_engine::SpinMutex;
+use tx_substrate::verbs::OperationalCapExt;
 use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
 use tx_subsystems::signal::{KillOutcome, SignalTarget};
