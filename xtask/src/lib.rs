@@ -10,6 +10,7 @@ mod doctor;
 mod fault_decode;
 mod full_build;
 mod image;
+mod kernel_user_layouts;
 mod lint;
 mod lint_invariants_checks;
 mod lint_invariants_cred_check;
@@ -63,6 +64,7 @@ pub fn run() -> Result<()> {
         "trap-trace" => trap_trace::trap_trace(&root, args.collect()),
         "shell-test" => shell_test::shell_test(&root, args.collect()),
         "image" => image::image(&root, args.collect()),
+        "kernel-user-layouts" => kernel_user_layouts::kernel_user_layouts(&root, args.collect()),
         "oscomp" => oscomp::oscomp(&root, args.collect()),
         "submit" => submit::submit(&root, args.collect()),
         "syscall" => syscall::syscall(&root, args.collect()),
@@ -99,10 +101,12 @@ fn print_usage() {
            cargo xtask image cpio --profile busybox [--target rv64-qemu|la64-qemu]\n\
            cargo xtask image ext4 --profile busybox [--target rv64-qemu|la64-qemu] [--size 64M]\n\
            cargo xtask image m1dock-sd --profile busybox [--target rv64-m1dock-mock] [--size 64M]\n\
+           cargo xtask kernel-user-layouts [--arch riscv64|loongarch64] [--dump]\n\
            cargo xtask oscomp doctor|prepare|submit|run|qemu\n\
            cargo xtask oscomp score [--target rv64-qemu|la64-qemu] [--input FILE] [--suite SUITE] [--data DIR] [--dry-run]\n\
            cargo xtask oscomp list-suites [--target rv64-qemu|la64-qemu] [--data DIR]\n\
            cargo xtask oscomp test --target rv64-qemu|la64-qemu [--suite SUITE] [--skip-build] [--data DIR] [--dry-run]\n\
+           cargo xtask oscomp slim-sdcard [--suite SUITE]... [--ltp-cases CASE1,CASE2] [--source IMG] [-o IMG] [--size-mb N]\n\
            cargo xtask submit k210 [--out target/submit/k210]\n\
            cargo xtask syscall status|list|info|sync|pick — query/maintain the syscall map (SSoT: numbers.rs + mod.rs)\n\
            cargo xtask progress validate\n\
@@ -110,7 +114,7 @@ fn print_usage() {
            cargo xtask progress new plan|handoff|worktree --id ID --title TITLE [...]\n\
            cargo xtask progress claim plan|worktree --id ID --owner NAME --scope PATH [--scope PATH]\n\
            cargo xtask progress close plan|handoff|worktree --id ID --status STATUS\n\
-           cargo xtask lint arch|docs|unused|boundary|invariants [rule|all]|syscall-status\n\
+           cargo xtask lint arch|docs|unused|boundary|invariants [rule|all]|kernel-user-layouts|syscall-status\n\
            cargo xtask boundary-report [--top N] [--json]\n\
            cargo xtask syscall-status [<NAME>...] [--regen|--check|--list-missing]\n\
            cargo xtask unit\n"

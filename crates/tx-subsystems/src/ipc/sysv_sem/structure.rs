@@ -48,8 +48,8 @@ impl SemArrayIdentity {
         self.gid.load(Ordering::Relaxed)
     }
 
-    pub fn key_raw(&self) -> u32 {
-        self.key.map(|key| key.0).unwrap_or(0)
+    pub fn key_raw(&self) -> i32 {
+        self.key.map(|key| key.0 as i32).unwrap_or(0)
     }
 }
 
@@ -70,7 +70,7 @@ pub struct SemBuf {
 /// sem_flg bits from `struct sembuf`.
 pub mod sem_flg {
     pub const IPC_NOWAIT: i16 = 0o4000;
-    pub const SEM_UNDO: i16 = 0o2000;
+    pub const SEM_UNDO: i16 = 0x1000;
 }
 
 /// A SEM_UNDO entry — per-process adjustment to be reversed at exit.

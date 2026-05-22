@@ -83,6 +83,7 @@ pub struct WaitSource {
     id: WaitSourceId,
     subscribers: SpinMutex<Vec<Subscriber>>,
     next_subscriber_id: AtomicU64,
+    pending_mask: AtomicU64,
 }
 
 impl WaitSource {
@@ -92,6 +93,7 @@ impl WaitSource {
             subscribers: SpinMutex::new(Vec::new()),
             // 1-based; `SubscriberId(0)` is a never-issued sentinel.
             next_subscriber_id: AtomicU64::new(1),
+            pending_mask: AtomicU64::new(0),
         }
     }
 
@@ -119,12 +121,14 @@ impl WaitSource {
         interests: InterestMask,
     ) -> SubscriberId {
         let id = SubscriberId(self.next_subscriber_id.fetch_add(1, Ordering::AcqRel));
+        let mailbox_for_pending = mailbox.clone();
         self.subscribers.lock().push(Subscriber {
             mailbox,
             generation,
             interests,
             id,
         });
+        self.deliver_pending_to(mailbox_for_pending, generation, interests);
         id
     }
 
@@ -174,6 +178,7 @@ impl WaitSource {
     ///
     /// Returns the number of events successfully posted.
     pub fn notify(&self, mask: InterestMask) -> usize {
+        self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
         let mut subs = self.subscribers.lock();
         let mut posted = 0usize;
         // Walk forward and use `retain_mut` semantics: drop dead
@@ -225,6 +230,7 @@ impl WaitSource {
         use tx_observe::encode::{encode_wait_source_notify, wait_source_notify_tag};
         use tx_observe::EventNameId;
 
+        self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
         let mut subs = self.subscribers.lock();
         let mut posted = 0usize;
 
@@ -263,6 +269,41 @@ impl WaitSource {
             true
         });
         posted
+    }
+
+    fn deliver_pending_to(
+        &self,
+        mailbox: Weak<TaskMailbox>,
+        generation: WaitGeneration,
+        interests: InterestMask,
+    ) {
+        let Some(mailbox) = mailbox.upgrade() else {
+            return;
+        };
+        loop {
+            let current = self.pending_mask.load(Ordering::Acquire);
+            let overlap = current & interests.raw();
+            if overlap == 0 {
+                return;
+            }
+            let next = current & !overlap;
+            match self.pending_mask.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let _ = mailbox.post(MailboxEvent::SourceFired {
+                        generation,
+                        source: self.id,
+                        interests: InterestMask::new(overlap),
+                    });
+                    return;
+                }
+                Err(_) => continue,
+            }
+        }
     }
 }
 

@@ -210,7 +210,12 @@ static LA64_TIMEBASE_HZ: AtomicU64 = AtomicU64::new(0);
 static LA64_POSSIBLE_CPU_COUNT: AtomicUsize = AtomicUsize::new(LA64_DEFAULT_POSSIBLE_CPUS);
 static LA64_ONLINE_CPUS: AtomicU64 = AtomicU64::new(1);
 static LA64_IPI_ACKED_CPUS: AtomicU64 = AtomicU64::new(0);
-static LA64_IRQ_CONTEXT_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static LA64_IRQ_CONTEXT_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 static LA64_IRQ_DISPATCH_TABLE: AtomicUsize = AtomicUsize::new(0);
 static LA64_ALLOCATED_ASIDS: AtomicU64 = AtomicU64::new(1);
 static LA64_KERNEL_PGDH_PHYS: AtomicUsize = AtomicUsize::new(0);
@@ -221,6 +226,12 @@ static LA64_ACTIVE_ASID: AtomicUsize = AtomicUsize::new(0);
 static LA64_COMMITTED_PT_NODE_REGISTRY_LOCK: AtomicBool = AtomicBool::new(false);
 static LA64_COMMITTED_PT_NODES: La64CommittedPtNodeRegistry =
     La64CommittedPtNodeRegistry(UnsafeCell::new([None; 256]));
+static LA64_KERNEL_TLS_VALID: [AtomicBool; LA64_MAX_BOOT_CPUS] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
 #[cfg(not(target_arch = "loongarch64"))]
 static LA64_HOST_KERNEL_TLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(not(target_arch = "loongarch64"))]

@@ -134,6 +134,13 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
         ),
         ci_run(
             root,
+            "kernel-user musl layouts",
+            "cargo",
+            &["xtask", "lint", "kernel-user-layouts"],
+            "txdoc:CI-GATE-KERNEL-USER-LAYOUTS",
+        ),
+        ci_run(
+            root,
             "architecture boundary ratchet",
             "cargo",
             &["xtask", "lint", "boundary"],

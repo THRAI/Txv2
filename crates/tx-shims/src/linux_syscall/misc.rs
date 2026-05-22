@@ -39,7 +39,7 @@ pub(super) fn sys_getrandom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     SyscallResult::Return(buf_len as i64)
 }
 
-/// `uname(buf)` — Linux RV64 generic ABI `__NR_uname = 160`.
+/// `uname(buf)` — Linux generic ABI `__NR_uname = 160`.
 ///
 /// Writes a static utsname (`sysname` / `nodename` / `release` /
 /// `version` / `machine` / `domainname`) to `buf`. Each field is a
@@ -161,4 +161,79 @@ pub(super) fn build_utsname_for_machine(machine: &str) -> UtsnameLayout {
 struct RlimitLayout {
     rlim_cur: u64,
     rlim_max: u64,
+}
+
+pub(super) mod layout_descriptors {
+    use core::mem::{align_of, offset_of, size_of};
+
+    pub(super) use super::{RlimitLayout, UtsnameLayout};
+    use crate::linux_syscall::{KernelToUserLayout, KernelUserField, KernelUserLayout};
+
+    impl KernelToUserLayout for UtsnameLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "UtsnameLayout",
+            musl_header: "sys/utsname.h",
+            musl_type: "struct utsname",
+            size: size_of::<UtsnameLayout>(),
+            align: align_of::<UtsnameLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "sysname",
+                    musl: "sysname",
+                    offset: offset_of!(UtsnameLayout, sysname),
+                },
+                KernelUserField {
+                    rust: "nodename",
+                    musl: "nodename",
+                    offset: offset_of!(UtsnameLayout, nodename),
+                },
+                KernelUserField {
+                    rust: "release",
+                    musl: "release",
+                    offset: offset_of!(UtsnameLayout, release),
+                },
+                KernelUserField {
+                    rust: "version",
+                    musl: "version",
+                    offset: offset_of!(UtsnameLayout, version),
+                },
+                KernelUserField {
+                    rust: "machine",
+                    musl: "machine",
+                    offset: offset_of!(UtsnameLayout, machine),
+                },
+                KernelUserField {
+                    rust: "domainname",
+                    musl: "domainname",
+                    offset: offset_of!(UtsnameLayout, domainname),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const UTSNAME_LAYOUT: KernelUserLayout =
+        <UtsnameLayout as KernelToUserLayout>::LAYOUT;
+
+    impl KernelToUserLayout for RlimitLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "RlimitLayout",
+            musl_header: "sys/resource.h",
+            musl_type: "struct rlimit",
+            size: size_of::<RlimitLayout>(),
+            align: align_of::<RlimitLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "rlim_cur",
+                    musl: "rlim_cur",
+                    offset: offset_of!(RlimitLayout, rlim_cur),
+                },
+                KernelUserField {
+                    rust: "rlim_max",
+                    musl: "rlim_max",
+                    offset: offset_of!(RlimitLayout, rlim_max),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const RLIMIT_LAYOUT: KernelUserLayout =
+        <RlimitLayout as KernelToUserLayout>::LAYOUT;
 }

@@ -232,7 +232,7 @@ fn dispatch_epoll_ctl_del_allows_null_event_pointer() {
         block_on(dispatch::<ShimsTestPmap>(
             SyscallRequest::new(
                 NR_EPOLL_CTL,
-                [epfd as u64, EPOLL_CTL_DEL as u64, eventfd as u64, 0, 0, 0],
+                [epfd as u64, EPOLL_CTL_DEL as u64, eventfd as u64, 0, 0, 0,],
             ),
             &ctx,
         )),
@@ -310,7 +310,7 @@ fn dispatch_epoll_ctl_add_mod_del_enforce_registration_state() {
         block_on(dispatch::<ShimsTestPmap>(
             SyscallRequest::new(
                 NR_EPOLL_CTL,
-                [epfd as u64, EPOLL_CTL_DEL as u64, eventfd as u64, 0, 0, 0],
+                [epfd as u64, EPOLL_CTL_DEL as u64, eventfd as u64, 0, 0, 0,],
             ),
             &ctx,
         )),
@@ -321,7 +321,7 @@ fn dispatch_epoll_ctl_add_mod_del_enforce_registration_state() {
         block_on(dispatch::<ShimsTestPmap>(
             SyscallRequest::new(
                 NR_EPOLL_CTL,
-                [epfd as u64, EPOLL_CTL_DEL as u64, eventfd as u64, 0, 0, 0],
+                [epfd as u64, EPOLL_CTL_DEL as u64, eventfd as u64, 0, 0, 0,],
             ),
             &ctx,
         )),

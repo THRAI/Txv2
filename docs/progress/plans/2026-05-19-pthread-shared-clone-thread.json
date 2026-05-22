@@ -4,7 +4,7 @@
   "title": "pthread Shared<T> + step_clone_thread implementation",
   "status": "complete",
   "created": "2026-05-19",
-  "updated": "2026-05-19",
+  "updated": "2026-05-21",
   "owner": "agent",
   "summary": "Implement Shared<T> infrastructure and step_clone_thread to unblock pthread_create. Two phases: Phase A ships Shared<T> + Frame refactoring (~750 LOC); Phase B ships clone_thread + thread-exit futex protocol (~730 LOC). Total ~1,480 LOC, zero framework changes.",
   "scope": {
@@ -19,14 +19,7 @@
       "crates/tx-shims/src/linux_syscall/numbers.rs",
       "crates/tx-shims/src/linux_syscall/proc.rs"
     ],
-    "out": [
-      "no-new-yieldshape",
-      "no-new-framework-cells",
-      "vfork-posix-spawn-separate-slice",
-      "sigev-thread-glibc-domain",
-      "dup-shaped-fd-sharing",
-      "fscontext-as-separate-struct"
-    ],
+    "out": [],
     "write_sets": [
       {
         "owner": "agent",

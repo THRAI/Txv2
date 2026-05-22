@@ -264,9 +264,10 @@ fn dispatch_wait4_blocking_resolves_when_child_zombifies() {
     panic!("dispatch_wait4 did not resolve after child zombified; last poll = {last:?}");
 }
 
-/// Non-NULL `rusage` receives a zero-filled musl/Linux LP64
-/// `struct rusage` image. Usage accounting is not wired yet, but
-/// libc callers that pass a buffer should not see `EINVAL`.
+/// Non-NULL `rusage` receives a zero-filled raw Linux LP64
+/// `struct rusage` prefix. musl passes a pointer adjusted to the
+/// kernel's 18-long image and keeps the public `struct rusage`
+/// reserved tail in userspace, so the syscall must not overwrite it.
 #[test]
 fn dispatch_wait4_rusage_nonzero_writes_zeroed_rusage() {
     let _setup = setup();
@@ -295,7 +296,8 @@ fn dispatch_wait4_rusage_nonzero_writes_zeroed_rusage() {
     );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(child.pid.0 as i64));
-    assert_eq!(rusage, [0u8; 256]);
+    assert_eq!(rusage[..144], [0u8; 144]);
+    assert_eq!(rusage[144..], [0xa5u8; 112]);
 }
 
 /// `WUNTRACED` (0x2) and `WCONTINUED` (0x8) are accepted but

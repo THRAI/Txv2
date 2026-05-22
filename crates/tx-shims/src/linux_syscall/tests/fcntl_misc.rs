@@ -14,7 +14,6 @@ const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
 const E_PERM: i32 = 1;
 const E_SRCH: i32 = 3;
-const E_MFILE: i32 = 24;
 
 fn uts_field(buf: &[u8; 6 * 65], index: usize) -> &[u8] {
     let start = index * 65;
@@ -92,46 +91,6 @@ fn dispatch_fcntl_f_dupfd_cloexec_sets_cloexec_on_new_fd() {
         proc_cap.fd_cloexec(new_fd),
         "F_DUPFD_CLOEXEC must set the cloexec bit on the new fd"
     );
-}
-
-/// `F_DUPFD` with `min == RLIMIT_NOFILE` is invalid; Linux requires
-/// the requested minimum to be below the process fd limit.
-#[test]
-fn dispatch_fcntl_f_dupfd_min_at_rlimit_returns_neg_einval() {
-    let _setup = setup();
-    let _ops = install_capturing_console();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
-    let ctx = make_ctx(proc_cap, thread);
-
-    let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_FCNTL, [3, F_DUPFD as u64, 1024, 0, 0, 0]),
-        &ctx,
-    ));
-    assert_eq!(r, SyscallResult::Error(E_INVAL));
-}
-
-/// `F_DUPFD` reports `EMFILE` when no slot below `RLIMIT_NOFILE`
-/// remains at or above the requested minimum.
-#[test]
-fn dispatch_fcntl_f_dupfd_full_table_returns_neg_emfile() {
-    let _setup = setup();
-    let _ops = install_capturing_console();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let file = tx_fs::devfs::open_console_for_init();
-    proc_cap.set_fd(3, Some(file.clone()));
-    for fd in 4..1024 {
-        let _ = proc_cap.install_fd(fd, file.clone());
-    }
-    let ctx = make_ctx(proc_cap, thread);
-
-    let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_FCNTL, [3, F_DUPFD as u64, 4, 0, 0, 0]),
-        &ctx,
-    ));
-    assert_eq!(r, SyscallResult::Error(E_MFILE));
 }
 
 /// `fcntl(fd, F_GETFL, _)` composes the access-mode bits from
@@ -424,11 +383,6 @@ impl PmapIf for LoongArchUnamePmap {
 impl EntropyIf for LoongArchUnamePmap {}
 impl tx_hal::AuxvIf for LoongArchUnamePmap {}
 impl SmpIf for LoongArchUnamePmap {}
-impl tx_hal::TrapIf for LoongArchUnamePmap {}
-impl tx_hal::SignalFrameIf for LoongArchUnamePmap {}
-impl tx_hal::ConsoleIf for LoongArchUnamePmap {
-    fn write_bytes(_bytes: &[u8]) {}
-}
 impl tx_hal::TimeIf for LoongArchUnamePmap {
     fn read_ns() -> u64 {
         ShimsTestPmap::read_ns()

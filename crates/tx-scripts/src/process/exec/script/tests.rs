@@ -560,6 +560,48 @@ fn exec_script_loads_minimal_elf_seeds_saved_user_context() {
 }
 
 #[test]
+fn exec_script_collapses_sibling_threads_before_aspace_swap() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+
+    let sibling = tx_subsystems::process::execution::step_clone_thread(
+        &process,
+        &tx_hal::UserTrapContext {
+            regs: [0; 32],
+            pc: 0x4000_0000,
+            status: 0,
+            fp: tx_hal::UserFpContext::empty(),
+        },
+        0,
+        0,
+        0,
+    )
+    .expect("sibling thread");
+    assert_eq!(process.live_thread_count(), 2);
+
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+
+    assert_eq!(
+        process.live_thread_count(),
+        1,
+        "exec must leave only the initiating thread live"
+    );
+    assert!(process.thread_by_tid(thread.tid.0).is_some());
+    assert!(process.thread_by_tid(sibling.tid.0).is_none());
+    assert!(sibling.is_zombie());
+}
+
+#[test]
 fn initial_user_context_uses_arch_specific_stack_register() {
     assert_eq!(super::initial_user_sp_reg_for_arch(Arch::Riscv64), 2);
     assert_eq!(super::initial_user_sp_reg_for_arch(Arch::LoongArch64), 3);
@@ -595,16 +637,12 @@ fn exec_script_resets_brk_base_from_image_plan() {
 }
 
 #[test]
-fn exec_script_non_elf_non_shebang_falls_back_to_bin_sh() {
+fn exec_script_invalid_elf_falls_back_to_bin_sh() {
     let _setup = setup();
-    // 4 KiB of zeroes — fails ELF magic check immediately. Pre-2026-05-18
-    // this returned `ExecError::NotExecutable`; the new behaviour matches
-    // every userspace shell's ENOEXEC fallback — kernel-side treat the
-    // file as a `/bin/sh` script. The test fixture has no `/bin/sh`, so
-    // the second exec attempt fails the walker — but with `PathNotFound`,
-    // not `NotExecutable`. The shape of the failure proves the
-    // kernel-side fallback is firing (cf. STATUS.md 2026-05-18 — libctest
-    // unblock).
+    // 4 KiB of zeroes — fails ELF magic check immediately.
+    // The kernel now falls back to /bin/sh for ENOEXEC; /bin/sh
+    // does not exist in this test fixture, so the result is
+    // PathNotFound.
     let bytes = vec![0u8; 4096];
     let (process, thread, _fs) = bootstrap_with_file(b"bad", &bytes);
 
@@ -618,14 +656,7 @@ fn exec_script_non_elf_non_shebang_falls_back_to_bin_sh() {
         &[],
         &cred,
     ));
-    assert_eq!(
-        result,
-        Err(ExecError::PathNotFound),
-        "kernel-side ENOEXEC fallback should re-exec via /bin/sh; in the \
-         test fixture /bin/sh doesn't exist, so the second-level walker \
-         returns PathNotFound — but NOT NotExecutable, which would mean \
-         the fallback never fired."
-    );
+    assert_eq!(result, Err(ExecError::PathNotFound));
 
     // Pre-PoNR error path must leave the process aspace untouched.
     let aspace_after = process.aspace_cap().expect("alive aspace post-fail");
@@ -634,6 +665,23 @@ fn exec_script_non_elf_non_shebang_falls_back_to_bin_sh() {
     // never seeds it).
     let payload = thread.payload_cap().expect("alive thread payload");
     assert!(payload.saved_user_context().is_none());
+}
+
+#[test]
+fn shebang_busybox_sh_normalization_consumes_applet_arg() {
+    let header = b"#!/bin/busybox sh\n./lua $1\n";
+    let (interp, opt_arg) = super::shebang_parse(header).expect("valid shebang");
+    let original_argv: [&[u8]; 2] = [b"./test.sh", b"date.lua"];
+
+    let (interp_path, argv) =
+        super::shebang_exec_argv(interp, opt_arg, b"./test.sh", &original_argv);
+
+    assert_eq!(interp_path, b"/bin/sh");
+    let argv_refs: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        argv_refs,
+        vec![b"/bin/sh".as_slice(), b"./test.sh", b"date.lua"]
+    );
 }
 
 #[test]

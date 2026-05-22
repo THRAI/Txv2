@@ -4,12 +4,12 @@
   "title": "SysV / POSIX IPC subsystem implementation",
   "status": "complete",
   "created": "2026-05-19",
-  "updated": "2026-05-19",
+  "updated": "2026-05-22",
   "owner": "agent",
-  "summary": "Implemented the full SysV + POSIX IPC subsystem family (sem, shm, msg, mq) per 08_SYSV_IPC_v1.md. Six phases: IPC-0 scaffold → IPC-1-4 implementations → IPC-5 syscall dispatch. Compilation verified with cargo xtask check; QEMU runtime smoke test passes 14/16 cases (semop needs copy_from_user, shmat stub).",
+  "summary": "Implemented the SysV + POSIX IPC subsystem family (sem, shm, msg, mq) per 08_SYSV_IPC_v1.md. SysV shm now has PageBacked shmat/shmdt mappings, attach-count accounting, process-exit detach sweeps, and IPC_RMID marked-for-deletion lifetime with namespace-key withdrawal. Focused host verification passes; guest IPC smoke still needs a fresh rerun after the shm lifetime fix.",
   "scope": {
     "in": [
-      "crates/tx-subsystems/src/ipc",
+      "crates/tx-subsystems/src/ipc/",
       "crates/tx-subsystems/src/process/nsproxy.rs",
       "crates/tx-subsystems/src/process/execution.rs",
       "crates/tx-subsystems/src/process/structure.rs",
@@ -26,19 +26,12 @@
       "xtask/src/image.rs",
       "tools/images/ipc_test.c"
     ],
-    "out": [
-      "no-new-yieldshape",
-      "no-new-framework-cells",
-      "no-sigev-thread",
-      "no-posix-sem-anonymous-in-shared-memory",
-      "no-sysv-sem-deprecated-obsolete-ipc-modes",
-      "no-mountnamespace-on-nsproxy"
-    ],
+    "out": [],
     "write_sets": [
       {
         "owner": "agent",
         "paths": [
-          "crates/tx-subsystems/src/ipc",
+          "crates/tx-subsystems/src/ipc/",
           "crates/tx-subsystems/src/process/nsproxy.rs",
           "crates/tx-subsystems/src/process/execution.rs",
           "crates/tx-subsystems/src/process/structure.rs",
@@ -48,12 +41,11 @@
           "crates/tx-subsystems/src/execution.rs",
           "crates/tx-substrate/src/step/mod.rs",
           "crates/tx-substrate/tests/v3_algebra.rs",
-          "crates/tx-shims/src/linux_syscall/ipc.rs",
-          "crates/tx-shims/src/linux_syscall/numbers.rs",
-          "crates/tx-shims/src/linux_syscall/mod.rs",
-          "crates/tx-shims/src/linux_syscall/ctx.rs"
+          "crates/tx-shims/src/linux_syscall/",
+          "xtask/src/image.rs",
+          "tools/images/ipc_test.c"
         ],
-        "notes": "Implementation of SysV and POSIX IPC interfaces."
+        "notes": "Imported from the existing completed SysV IPC plan scope to satisfy the current progress schema."
       }
     ]
   },
@@ -85,53 +77,92 @@
         "crates/tx-subsystems/src/lib.rs",
         "crates/tx-subsystems/src/zones.rs"
       ],
-      "verification": ["cargo xtask check: PASS"],
-      "notes": ""
+      "verification": [
+        "cargo xtask check: PASS"
+      ],
+      "notes": "Schema-normalized from the existing completed SysV IPC plan."
     },
     {
       "id": "ipc-1-shm",
       "title": "IPC-1: SysV shared memory",
       "status": "complete",
-      "depends_on": ["ipc-0-setup"],
-      "paths": ["crates/tx-subsystems/src/ipc/sysv_shm/"],
-      "verification": ["cargo xtask check: PASS", "QEMU smoke: shmget/create/lookup/excl-fail/RMID all PASS"],
-      "notes": ""
+      "depends_on": [
+        "ipc-0-setup"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/ipc/sysv_shm/"
+      ],
+      "verification": [
+        "cargo xtask check: PASS",
+        "QEMU smoke: shmget/create/lookup/excl-fail/RMID all PASS",
+        "cargo test -p tx-subsystems --lib ipc::sysv_shm::tests -- --nocapture: PASS; PageBacked shmat/shmdt, same-address cross-aspace detach ownership, IPC_SET owner/mode updates, IPC_RMID detach-after-remove lifetime, and keyed namespace withdrawal/recreate pinned"
+      ],
+      "notes": "PageBacked attach/detach and IPC_RMID lifetime are now implemented for the focused host path. QEMU guest smoke still needs a fresh rerun after the 2026-05-22 RMID fix."
     },
     {
       "id": "ipc-2-msg",
       "title": "IPC-2: SysV message queues",
       "status": "complete",
-      "depends_on": ["ipc-1-shm"],
-      "paths": ["crates/tx-subsystems/src/ipc/sysv_msg/"],
-      "verification": ["cargo xtask check: PASS", "QEMU smoke: msgget/create/lookup/RMID all PASS"],
-      "notes": ""
+      "depends_on": [
+        "ipc-1-shm"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/ipc/sysv_msg/"
+      ],
+      "verification": [
+        "cargo xtask check: PASS",
+        "QEMU smoke: msgget/create/lookup/RMID all PASS"
+      ],
+      "notes": "Schema-normalized from the existing completed SysV IPC plan."
     },
     {
       "id": "ipc-3-sem",
       "title": "IPC-3: SysV semaphores + SEM_UNDO",
       "status": "complete",
-      "depends_on": ["ipc-2-msg"],
-      "paths": ["crates/tx-subsystems/src/ipc/sysv_sem/"],
-      "verification": ["cargo xtask check: PASS", "QEMU smoke: semget/SETVAL/GETVAL/RMID PASS; semop needs copy_from_user"],
-      "notes": ""
+      "depends_on": [
+        "ipc-2-msg"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/ipc/sysv_sem/"
+      ],
+      "verification": [
+        "cargo xtask check: PASS",
+        "QEMU smoke: semget/SETVAL/GETVAL/RMID PASS; semop needs copy_from_user"
+      ],
+      "notes": "Schema-normalized from the existing completed SysV IPC plan."
     },
     {
       "id": "ipc-4-posix",
       "title": "IPC-4: POSIX message queue wrappers",
       "status": "complete",
-      "depends_on": ["ipc-3-sem"],
-      "paths": ["crates/tx-subsystems/src/ipc/posix_mq/"],
-      "verification": ["cargo xtask check: PASS; POSIX mq_open/mq_unlink stub returning ENOSYS"],
-      "notes": ""
+      "depends_on": [
+        "ipc-3-sem"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/ipc/posix_mq/"
+      ],
+      "verification": [
+        "cargo xtask check: PASS",
+        "cargo test -p tx-shims linux_syscall::tests::mq_dispatch -- --nocapture: PASS; POSIX mq_open/mq_close fd shape, LP64 mq_attr dispatch, priority ordering, maxmsg enforcement, raw read/write rejection, epoll readiness, blocking null-timeout send/receive waits, queue-wide one-shot SIGEV_SIGNAL/SIGEV_THREAD_ID notification delivery, blocked-receiver notification suppression, and explicit SIGEV_THREAD rejection wired"
+      ],
+      "notes": "Schema-normalized from the existing completed SysV IPC plan."
     },
     {
       "id": "ipc-5-syscall-dispatch",
       "title": "IPC-5: Syscall dispatch + number tables",
       "status": "complete",
-      "depends_on": ["ipc-4-posix"],
-      "paths": ["crates/tx-shims/src/linux_syscall/"],
-      "verification": ["cargo xtask check: PASS", "QEMU smoke: 14/16 syscalls return correct values at runtime"],
-      "notes": ""
+      "depends_on": [
+        "ipc-4-posix"
+      ],
+      "paths": [
+        "crates/tx-shims/src/linux_syscall/"
+      ],
+      "verification": [
+        "cargo xtask check: PASS",
+        "QEMU smoke: 14/16 syscalls return correct values at runtime",
+        "cargo test -p tx-shims --lib linux_syscall::tests::ipc_dispatch -- --nocapture: PASS; musl LP64 IPC layouts and shm attach/detach syscall path covered"
+      ],
+      "notes": "Schema-normalized from the existing completed SysV IPC plan."
     }
   ],
   "verification": [
@@ -143,13 +174,29 @@
     {
       "command": "QEMU smoke test (tools/images/ipc_test.c + riscv64-linux-musl-gcc)",
       "status": "passed",
-      "notes": "14/16 test cases pass. Semop blocked on copy_from_user for sembuf array from userspace. Shmat returns stub address."
+      "notes": "Older run: 14/16 test cases passed before the later shm PageBacked/RMID lifetime fixes. Needs rerun for current branch state."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib ipc::sysv_shm::tests -- --nocapture",
+      "status": "passed",
+      "notes": "6/6 SysV shm focused tests pass, including RMID detach-after-remove and keyed recreate cases."
+    },
+    {
+      "command": "cargo test -p tx-shims --lib linux_syscall::tests::ipc_dispatch -- --nocapture",
+      "status": "passed",
+      "notes": "7/7 IPC syscall layout/dispatch tests pass, including musl-visible shm attach/detach."
+    },
+    {
+      "command": "cargo check -p tx-shims -p tx-subsystems",
+      "status": "passed",
+      "notes": "Focused compile check passes after the 2026-05-22 shm RMID lifetime update."
     }
   ],
   "risks": [
     "SEM_UNDO exit-step integration: resolved — added step_sem_undo() called from step_exit path",
     "MountNamespace on NsProxy: deferred — MountNamespace requires MountIdentity which is not bootstrapped at process-init time",
-    "ShmSegment PageBacked integration: stub only — shmat returns placeholder address until VM + PageContainer integration lands"
+    "Guest IPC smoke is stale after shm PageBacked/RMID lifetime fixes and should be rerun before treating the branch as runtime-complete",
+    "SysV sem/msg RMID still use non-ns-aware withdrawal helpers in this branch; decide whether to mirror shm's namespace-key withdrawal wrapper"
   ],
   "blockers": [],
   "handoff": {

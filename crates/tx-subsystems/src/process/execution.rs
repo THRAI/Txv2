@@ -31,8 +31,8 @@ use crate::vm::{AddressSpace, VmMapError};
 // ---------------------------------------------------------------------------
 
 use crate::process::numbers::{
-    allocate_pid, register_pid as ns_register_pid, register_tid, resolve_pid_number,
-    unregister_pid_number, with_namespace, PidName, PidNameKind,
+    allocate_pid, register_pgrp, register_pid as ns_register_pid, register_session, register_tid,
+    resolve_pid_number_as, unregister_pid_number, with_namespace, PidName, PidNameKind,
 };
 
 /// Register a process pid → Cap binding. The Cap must be fully
@@ -48,7 +48,7 @@ pub(crate) fn unregister_pid(pid: Pid) {
 
 /// Look up a process by PID.
 pub fn process_by_pid(pid: Pid) -> Option<Cap<ProcessIdentity>> {
-    match resolve_pid_number(pid.0 as u64) {
+    match resolve_pid_number_as(pid.0 as u64, PidNameKind::Process) {
         Some(PidName::Process(cap)) => Some(cap),
         _ => None,
     }
@@ -58,7 +58,7 @@ pub fn process_by_pid(pid: Pid) -> Option<Cap<ProcessIdentity>> {
 pub fn all_pids() -> alloc::vec::Vec<(Pid, bool)> {
     let mut out = alloc::vec::Vec::new();
     with_namespace(|ns| {
-        for (&num, name) in ns.iter() {
+        for (&(num, _), name) in ns.iter() {
             if matches!(name.kind(), PidNameKind::Process) {
                 out.push((Pid(num as u32), true));
             }
@@ -160,6 +160,8 @@ pub enum SetpgidError {
     /// Joining an existing group requires session-walk, which is a
     /// follow-up.
     Unimplemented,
+    /// Target is no longer operational.
+    Zombie,
     Zone(ZoneError),
 }
 
@@ -172,6 +174,10 @@ impl From<ZoneError> for SetpgidError {
 /// Errors from `step_setsid`.
 #[derive(Debug)]
 pub enum SetsidError {
+    /// POSIX: process-group leaders cannot create a new session.
+    ProcessGroupLeader,
+    /// Target is no longer operational.
+    Zombie,
     Zone(ZoneError),
 }
 
@@ -255,7 +261,7 @@ pub fn bootstrap_init_process(
 
     let pid = Pid::INIT;
     let session = sign_session(Sid(pid.0))?;
-    let pgrp = sign_process_group(Pgid(pid.0), session)?;
+    let pgrp = sign_process_group(Pgid(pid.0), session.clone())?;
 
     let proc_cap = sign_process_identity(pid, None, pgrp.clone())?;
 
@@ -289,7 +295,7 @@ pub fn bootstrap_init_process(
     let nsproxy = crate::process::nsproxy::sign_init_nsproxy()?;
     let payload = sign_process_payload(
         aspace,
-        vec![leader],
+        vec![leader.clone()],
         nsproxy,
         Cred::root(),
         None,
@@ -315,6 +321,9 @@ pub fn bootstrap_init_process(
     // registers child pids; init has no fork parent, so the bootstrap
     // path must register itself.
     register_pid(pid, proc_cap.clone());
+    register_tid(Tid(pid.0), leader);
+    register_pgrp(pgrp.pgid, pgrp.clone());
+    register_session(session.sid, session);
 
     Ok(proc_cap)
 }
@@ -361,7 +370,7 @@ pub fn step_fork<P: PmapIf>(
             payload.nsproxy_cap(),
             payload.cred(),
             payload.cwd(),
-            payload.snapshot_fds(),
+            payload.clone_fds_for_fork(),
             payload.fd_cloexec_snapshot(),
             payload.brk_base(),
             payload.current_brk(),
@@ -393,7 +402,6 @@ pub fn step_fork<P: PmapIf>(
     let child_proc =
         sign_process_identity(child_pid, Some(parent.downgrade()), parent_pgrp.clone())
             .map_err(ForkError::Zone)?;
-    register_pid(child_pid, child_proc.clone());
 
     // Leader thread.
     let leader = sign_thread(child_proc.downgrade(), Tid(child_pid.0)).map_err(ForkError::Zone)?;
@@ -424,6 +432,8 @@ pub fn step_fork<P: PmapIf>(
     )
     .map_err(ForkError::Zone)?;
     *child_proc.payload.lock() = Some(payload);
+
+    register_pid(child_pid, child_proc.clone());
 
     // Register child in parent's pgrp.
     parent_pgrp.members.attach(child_proc.downgrade());
@@ -606,21 +616,27 @@ pub fn step_clone_thread(
 /// Open Q #3 DECIDED 2026-05-06.)
 pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     // observe
+    if let Some(payload) = process.payload.lock().as_ref() {
+        payload.notify_vfork_done();
+    }
     // upgrade
     // reserve
     // commit
     // publish
-    unregister_pid(process.pid);
     session_leader_hangup_cascade(process);
     sever_children(process);
 
     let mut payload_guard = process.payload.lock();
     if let Some(payload) = payload_guard.as_ref() {
+        let _shm_detach =
+            crate::ipc::sysv_shm::execution::detach_all_for_aspace(&payload.aspace_cap());
         let _closed_fds = payload.drain_fds();
         let drained: Vec<Cap<ThreadIdentity>> = payload.threads.drain();
         for thread in &drained {
             set_thread_zombie(thread, status.wait_status_word());
-            unregister_pid_number(thread.tid.0 as u64);
+            if thread.tid.0 != process.pid.0 {
+                unregister_pid_number(thread.tid.0 as u64);
+            }
         }
         // `_closed_fds` and `drained` drop here, releasing open-file and
         // thread refs before the payload is detached below.
@@ -655,12 +671,13 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
     // reserve
     // commit
     // publish
-    unregister_pid(process.pid);
     session_leader_hangup_cascade(process);
     sever_children(process);
     *process.exit_status.lock() = Some(status);
     let mut payload_guard = process.payload.lock();
     if let Some(payload) = payload_guard.as_ref() {
+        let _shm_detach =
+            crate::ipc::sysv_shm::execution::detach_all_for_aspace(&payload.aspace_cap());
         let _closed_fds = payload.drain_fds();
     }
     *payload_guard = None;
@@ -916,6 +933,7 @@ pub fn step_waitpid_nohang(
             .unwrap_or(true)
     });
 
+    unregister_pid(pid);
     drop(child);
 
     Ok((pid, status))
@@ -975,16 +993,18 @@ pub fn step_getcwd(target: &Cap<ProcessIdentity>) -> Option<alloc::vec::Vec<u8>>
     crate::vfs::render_dentry_path(&cwd)
 }
 
-/// Day-1 setpgid: only supports `new_pgid == target.pid`, which
-/// creates a fresh process group inside the target's current session
-/// and rebinds the target into it. Joining an existing group requires
-/// walking the session for an existing pgid match — a follow-up.
+/// Day-1 setpgid: supports creating a fresh process group rooted at
+/// `target.pid` inside the target's current session. Joining an
+/// existing group requires session-walk, which is a follow-up.
 pub fn step_setpgid(target: &Cap<ProcessIdentity>, new_pgid: Pgid) -> Result<(), SetpgidError> {
     // observe
     // upgrade
     // reserve
     // commit
     // publish
+    if target.is_zombie() {
+        return Err(SetpgidError::Zombie);
+    }
     if new_pgid.0 != target.pid.0 {
         return Err(SetpgidError::Unimplemented);
     }
@@ -992,9 +1012,12 @@ pub fn step_setpgid(target: &Cap<ProcessIdentity>, new_pgid: Pgid) -> Result<(),
     // Clone session out of the current pgrp; we'll keep the same
     // session and create a new pgrp inside it.
     let old_pgrp = target.pgrp.lock().clone();
+    if old_pgrp.pgid == new_pgid {
+        return Ok(());
+    }
     let session = old_pgrp.session.clone();
 
-    let new_pgrp = sign_process_group(new_pgid, session)?;
+    let new_pgrp = sign_process_group(new_pgid, session.clone())?;
     new_pgrp.session.members.attach(new_pgrp.downgrade());
     new_pgrp.members.attach(target.downgrade());
 
@@ -1002,6 +1025,7 @@ pub fn step_setpgid(target: &Cap<ProcessIdentity>, new_pgid: Pgid) -> Result<(),
     drop_member(&old_pgrp, target);
 
     *target.pgrp.lock() = new_pgrp;
+    register_pgrp(new_pgid, target.pgrp_cap());
     Ok(())
 }
 
@@ -1017,6 +1041,12 @@ pub fn step_setsid(target: &Cap<ProcessIdentity>) -> Result<Sid, SetsidError> {
     // publish
     let new_sid = Sid(target.pid.0);
     let new_pgid = Pgid(target.pid.0);
+    if target.is_zombie() {
+        return Err(SetsidError::Zombie);
+    }
+    if target.pgrp_cap().pgid == new_pgid {
+        return Err(SetsidError::ProcessGroupLeader);
+    }
 
     let new_session = sign_session(new_sid)?;
     let new_pgrp = sign_process_group(new_pgid, new_session.clone())?;
@@ -1028,6 +1058,8 @@ pub fn step_setsid(target: &Cap<ProcessIdentity>) -> Result<Sid, SetsidError> {
     drop_member(&old_pgrp, target);
 
     *target.pgrp.lock() = new_pgrp;
+    register_session(new_sid, new_session);
+    register_pgrp(new_pgid, target.pgrp_cap());
     Ok(new_sid)
 }
 
@@ -1401,6 +1433,9 @@ impl<'a, I: SubjectIdentity> StepOp<I> for SetpgidOp<'a> {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         match step_setpgid(self.target, self.new_pgid) {
             Ok(()) => StepOutcome::Done(()),
+            Err(SetpgidError::Zombie) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::ESRCH)
+            }
             Err(SetpgidError::Unimplemented) => {
                 StepOutcome::Err(crate::process::adapter::step_engine::Errno::ENOSYS)
             }
@@ -1426,6 +1461,12 @@ impl<'a, I: SubjectIdentity> StepOp<I> for SetsidOp<'a> {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Sid, NoProgress> {
         match step_setsid(self.target) {
             Ok(sid) => StepOutcome::Done(sid),
+            Err(SetsidError::ProcessGroupLeader) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EPERM)
+            }
+            Err(SetsidError::Zombie) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::ESRCH)
+            }
             Err(SetsidError::Zone(_)) => {
                 StepOutcome::Err(crate::process::adapter::step_engine::Errno::ENOMEM)
             }
@@ -1532,6 +1573,7 @@ impl StepOp<crate::process::ProcessIdentity> for DupOp {
             Some(f) => f,
             None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
         };
+        super::structure::incr_pipe_fd_ref(&file);
         let newfd = self.process.allocate_fd();
         let _ = self.process.set_fd(newfd, Some(file));
         self.process.set_fd_cloexec(newfd, false);
@@ -1567,6 +1609,7 @@ impl StepOp<crate::process::ProcessIdentity> for Dup3Op {
             Some(f) => f,
             None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
         };
+        super::structure::incr_pipe_fd_ref(&file);
         let _prev = self.process.install_fd(self.newfd, file);
         let want_cloexec = self.flags & O_CLOEXEC != 0;
         self.process.set_fd_cloexec(self.newfd, want_cloexec);
@@ -1627,6 +1670,7 @@ impl StepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {
         }
         let new_fd = self.process.allocate_fd_at_least(self.min);
         let file = self.process.fd(self.fd).unwrap();
+        super::structure::incr_pipe_fd_ref(&file);
         let _prev = self.process.install_fd(new_fd, file);
         self.process.set_fd_cloexec(new_fd, self.cloexec);
         StepOutcome::Done(new_fd)

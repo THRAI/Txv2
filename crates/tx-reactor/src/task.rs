@@ -1,6 +1,6 @@
 //! Reactor task identity and task-table entries.
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 use core::{future::Future, pin::Pin, task::Waker};
 
 use tx_substrate::wake::mailbox::TaskMailbox;
@@ -8,6 +8,7 @@ use tx_substrate::wake::mailbox::TaskMailbox;
 use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect, AstSlot},
     scheduler::StopReason,
+    spin_lock::SpinLock,
     waker::{task_waker, TaskWakeState},
 };
 
@@ -94,6 +95,18 @@ pub enum TaskStatus {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TakeRunnableError {
+    Missing,
+    NotRunnable(TaskStatus),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingPollCommit {
+    Woken,
+    Parked,
+}
+
 pub(crate) struct Task {
     pub(crate) id: TaskId,
     pub(crate) generation: TaskGeneration,
@@ -109,7 +122,11 @@ pub(crate) struct Task {
 }
 
 impl Task {
-    fn new_for_handle<F>(handle: TaskKey, future: F, task_id_low: u32, process_id_low: u32) -> Self
+    fn new_for_handle<F>(
+        handle: TaskKey,
+        future: F,
+        wake_queue: Arc<SpinLock<VecDeque<TaskId>>>,
+    ) -> Self
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -118,21 +135,9 @@ impl Task {
             generation: handle.generation,
             future: Some(Box::pin(future)),
             status: TaskStatus::Runnable,
-            wake_state: Arc::new(TaskWakeState::new()),
+            wake_state: Arc::new(TaskWakeState::new(handle.id, wake_queue)),
             ast: AstSlot::new(),
-            // OBS-V1 §13.2 flow-id material: per-thread TID rides on
-            // the task's mailbox so `WaitSource::notify_emit` and
-            // `PayloadDriveBegin` carry the right identity. `0` is
-            // the documented sentinel for "no TID known" (kernel
-            // tasks, test contexts, pre-thread-runtime contexts).
-            // OBS-V1 §15.6 sched_switch view: `process_id_low` carries
-            // the owning process PID so the daemon can build per-PID
-            // ProcessDescriptor tracks parenting per-thread tracks.
-            mailbox: Arc::new(
-                TaskMailbox::new()
-                    .with_task_id(task_id_low)
-                    .with_process_id(process_id_low),
-            ),
+            mailbox: Arc::new(TaskMailbox::new()),
             last_ast_batch: AstBatch::default(),
             last_stop_reason: None,
         }
@@ -152,6 +157,7 @@ impl Task {
 pub struct TaskTable {
     slots: Vec<TaskSlot>,
     free: Vec<TaskId>,
+    wake_queue: Arc<SpinLock<VecDeque<TaskId>>>,
 }
 
 struct TaskSlot {
@@ -164,40 +170,11 @@ impl TaskTable {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
+            wake_queue: Arc::new(SpinLock::new(VecDeque::new())),
         }
     }
 
     pub fn submit<F>(&mut self, future: F) -> TaskKey
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        self.submit_with_ids(future, 0, 0)
-    }
-
-    /// Submit a task with an explicit observation TID.
-    ///
-    /// Backwards-compatible wrapper around [`Self::submit_with_ids`];
-    /// kept for callers that only know the TID (PID defaults to 0).
-    pub fn submit_with_task_id<F>(&mut self, future: F, task_id_low: u32) -> TaskKey
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        self.submit_with_ids(future, task_id_low, 0)
-    }
-
-    /// Submit a task with explicit observation TID and PID.
-    ///
-    /// Plumbed by [`Reactor::submit_task_with_meta`] so per-thread
-    /// (`task_id_low`) and per-process (`process_id_low`) trace
-    /// identities thread into the task's [`TaskMailbox`] at
-    /// construction time. Kernel-only tasks pass `0` for both (the
-    /// documented "no identity" sentinel).
-    pub fn submit_with_ids<F>(
-        &mut self,
-        future: F,
-        task_id_low: u32,
-        process_id_low: u32,
-    ) -> TaskKey
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -208,8 +185,7 @@ impl TaskTable {
         self.slots[id.index()].task = Some(Task::new_for_handle(
             handle,
             future,
-            task_id_low,
-            process_id_low,
+            Arc::clone(&self.wake_queue),
         ));
         handle
     }
@@ -226,16 +202,29 @@ impl TaskTable {
         self.task_by_id(id).and_then(|task| task.last_stop_reason)
     }
 
-    pub(crate) fn key_for_id(&self, id: TaskId) -> Option<TaskKey> {
-        self.task_by_id(id).map(Task::handle)
-    }
-
-    pub(crate) fn task(&self, handle: TaskKey) -> Result<&Task, TaskLifecycleError> {
-        self.live_task(handle)
-    }
-
-    pub(crate) fn task_mut(&mut self, handle: TaskKey) -> Result<&mut Task, TaskLifecycleError> {
-        self.live_task_mut(handle)
+    /// Resolve a queued task id, verify it is runnable, and take its future
+    /// under one task-table lock acquisition.
+    pub(crate) fn take_runnable_future_by_id(
+        &mut self,
+        id: TaskId,
+    ) -> Result<(TaskKey, TaskFuture, Arc<TaskWakeState>, Arc<TaskMailbox>), TakeRunnableError>
+    {
+        let task = self
+            .slots
+            .get_mut(id.index())
+            .and_then(|slot| slot.task.as_mut())
+            .ok_or(TakeRunnableError::Missing)?;
+        let handle = task.handle();
+        if task.status != TaskStatus::Runnable {
+            return Err(TakeRunnableError::NotRunnable(task.status));
+        }
+        let future = task.future.take().ok_or(TakeRunnableError::Missing)?;
+        task.status = TaskStatus::Polling;
+        task.wake_state.clear();
+        task.consume_ast_markers();
+        let wake_state = Arc::clone(&task.wake_state);
+        let mailbox = Arc::clone(&task.mailbox);
+        Ok((handle, future, wake_state, mailbox))
     }
 
     pub fn waker(&self, handle: TaskKey) -> Result<Waker, TaskLifecycleError> {
@@ -290,6 +279,44 @@ impl TaskTable {
         Ok(())
     }
 
+    pub(crate) fn finish_polled_complete(
+        &mut self,
+        handle: TaskKey,
+        _future: TaskFuture,
+    ) -> Result<(), TaskLifecycleError> {
+        self.complete_task(handle)
+    }
+
+    pub(crate) fn finish_polled_runnable(
+        &mut self,
+        handle: TaskKey,
+        future: TaskFuture,
+        reason: StopReason,
+    ) -> Result<(), TaskLifecycleError> {
+        let task = self.live_nonterminal_task_mut(handle)?;
+        task.future = Some(future);
+        let _ = task.wake_state.take_wake();
+        task.status = TaskStatus::Runnable;
+        task.last_stop_reason = Some(reason);
+        Ok(())
+    }
+
+    pub(crate) fn finish_polled_pending(
+        &mut self,
+        handle: TaskKey,
+        future: TaskFuture,
+    ) -> Result<PendingPollCommit, TaskLifecycleError> {
+        let task = self.live_nonterminal_task_mut(handle)?;
+        task.future = Some(future);
+        if task.wake_state.take_wake() {
+            Ok(PendingPollCommit::Woken)
+        } else {
+            task.status = TaskStatus::Parked;
+            task.last_stop_reason = Some(StopReason::Blocked);
+            Ok(PendingPollCommit::Parked)
+        }
+    }
+
     pub fn cancel_task(&mut self, handle: TaskKey) -> Result<(), TaskLifecycleError> {
         let task = self.live_nonterminal_task_mut(handle)?;
         task.future = None;
@@ -309,17 +336,42 @@ impl TaskTable {
     }
 
     pub fn drain_wakes(&mut self) -> Vec<TaskKey> {
+        let ids = self.drain_wake_ids();
         let mut woken = Vec::new();
-        for slot in &mut self.slots {
-            let Some(task) = slot.task.as_mut() else {
-                continue;
-            };
-            if task.wake_state.take_wake() && task.status == TaskStatus::Parked {
-                task.status = TaskStatus::Runnable;
-                woken.push(task.handle());
+        for id in ids {
+            if let Some(key) = self.take_wake_if_parked_by_id(id) {
+                woken.push(key);
             }
         }
         woken
+    }
+
+    pub(crate) fn drain_wake_ids(&mut self) -> Vec<TaskId> {
+        let mut woken = Vec::new();
+        loop {
+            let id = {
+                let mut queue = self.wake_queue.lock();
+                queue.pop_front()
+            };
+            let Some(id) = id else {
+                break;
+            };
+            woken.push(id);
+        }
+        woken
+    }
+
+    pub(crate) fn take_wake_if_parked_by_id(&mut self, id: TaskId) -> Option<TaskKey> {
+        let task = self.slots.get_mut(id.index())?.task.as_mut()?;
+        if !task.wake_state.take_wake() {
+            return None;
+        }
+        if task.status == TaskStatus::Parked {
+            task.status = TaskStatus::Runnable;
+            Some(task.handle())
+        } else {
+            None
+        }
     }
 
     pub(crate) fn is_idle(&self) -> bool {
@@ -442,21 +494,27 @@ const fn is_terminal(status: TaskStatus) -> bool {
 // Per-hart current-task mailbox slot (drive-taskmb trampoline injection)
 // ---------------------------------------------------------------------------
 
-use crate::spin_lock::SpinLock;
+/// Max harts for per-hart runtime context slots in the Phase 1 SMP shell.
+const MAX_HARTS: usize = 8;
 
-/// Global slot holding the currently-polling task's mailbox.
-/// Set by the reactor before each `future.poll()`, cleared after.
-/// Read by `run_thread` (or any trampoline) to inject into `SyscallCtx`.
-static CURRENT_MAILBOX: SpinLock<Option<Arc<TaskMailbox>>> = SpinLock::new(None);
+/// Per-hart slots for the currently-polling task's mailbox.
+/// Indexed by `HartId.0`.  Each hart writes only its own slot before
+/// `future.poll()` and clears it after — no cross‑hart contention.
+static CURRENT_MAILBOX: [SpinLock<Option<Arc<TaskMailbox>>>; MAX_HARTS] =
+    [const { SpinLock::new(None) }; MAX_HARTS];
 
-/// Set the current task's mailbox (called by reactor before poll).
-pub(crate) fn set_current_mailbox(mailbox: Option<Arc<TaskMailbox>>) {
-    *CURRENT_MAILBOX.lock() = mailbox;
+/// Set the current task's mailbox for `hart` (called by reactor before poll).
+pub(crate) fn set_current_mailbox(hart: usize, mailbox: Option<Arc<TaskMailbox>>) {
+    if let Some(slot) = CURRENT_MAILBOX.get(hart) {
+        *slot.lock() = mailbox;
+    }
 }
 
-/// Read the current task's mailbox (called by trampoline / `run_thread`).
-pub fn current_task_mailbox() -> Option<Arc<TaskMailbox>> {
-    CURRENT_MAILBOX.lock().clone()
+/// Read the current task's mailbox for `hart` (called by trampoline / `run_thread`).
+pub fn current_task_mailbox(hart: usize) -> Option<Arc<TaskMailbox>> {
+    CURRENT_MAILBOX
+        .get(hart)
+        .and_then(|slot| slot.lock().clone())
 }
 
 // -----------------------------------------------------------------------
@@ -465,19 +523,22 @@ pub fn current_task_mailbox() -> Option<Arc<TaskMailbox>> {
 
 use tx_substrate::wake::timer::TimerWheel;
 
-/// Set by the reactor before each `future.poll()`, cleared after.
-/// Read by `run_thread` to inject into `SyscallCtx` for `OnTimer` yield
-/// resolution via `resolve_on_timer`.
-static CURRENT_TIMER_WHEEL: SpinLock<Option<TimerWheel>> = SpinLock::new(None);
+/// Per-hart slots for the current reactor's timer wheel.
+static CURRENT_TIMER_WHEEL: [SpinLock<Option<TimerWheel>>; MAX_HARTS] =
+    [const { SpinLock::new(None) }; MAX_HARTS];
 
-/// Set the current reactor's timer wheel (called by reactor before poll).
-pub(crate) fn set_current_timer_wheel(wheel: Option<TimerWheel>) {
-    *CURRENT_TIMER_WHEEL.lock() = wheel;
+/// Set the current reactor's timer wheel for `hart` (called by reactor before poll).
+pub(crate) fn set_current_timer_wheel(hart: usize, wheel: Option<TimerWheel>) {
+    if let Some(slot) = CURRENT_TIMER_WHEEL.get(hart) {
+        *slot.lock() = wheel;
+    }
 }
 
-/// Read the current reactor's timer wheel (called by trampoline / `run_thread`).
-pub fn current_timer_wheel() -> Option<TimerWheel> {
-    CURRENT_TIMER_WHEEL.lock().clone()
+/// Read the current reactor's timer wheel for `hart` (called by trampoline / `run_thread`).
+pub fn current_timer_wheel(hart: usize) -> Option<TimerWheel> {
+    CURRENT_TIMER_WHEEL
+        .get(hart)
+        .and_then(|slot| slot.lock().clone())
 }
 
 // -----------------------------------------------------------------------
@@ -486,17 +547,20 @@ pub fn current_timer_wheel() -> Option<TimerWheel> {
 
 use tx_substrate::step::DelegateRegistry;
 
-/// Set by the reactor before each `future.poll()`, cleared after.
-/// Read by `run_thread` to inject into `SyscallCtx` for `OnAgent` yield
-/// resolution via `resolve_on_agent`.
-static CURRENT_DELEGATE_REGISTRY: SpinLock<Option<Arc<DelegateRegistry>>> = SpinLock::new(None);
+/// Per-hart slots for the current reactor's delegate registry.
+static CURRENT_DELEGATE_REGISTRY: [SpinLock<Option<Arc<DelegateRegistry>>>; MAX_HARTS] =
+    [const { SpinLock::new(None) }; MAX_HARTS];
 
-/// Set the current reactor's delegate registry (called by reactor before poll).
-pub(crate) fn set_current_delegate_registry(registry: Option<Arc<DelegateRegistry>>) {
-    *CURRENT_DELEGATE_REGISTRY.lock() = registry;
+/// Set the current reactor's delegate registry for `hart` (called by reactor before poll).
+pub(crate) fn set_current_delegate_registry(hart: usize, registry: Option<Arc<DelegateRegistry>>) {
+    if let Some(slot) = CURRENT_DELEGATE_REGISTRY.get(hart) {
+        *slot.lock() = registry;
+    }
 }
 
-/// Read the current reactor's delegate registry (called by trampoline / `run_thread`).
-pub fn current_delegate_registry() -> Option<Arc<DelegateRegistry>> {
-    CURRENT_DELEGATE_REGISTRY.lock().clone()
+/// Read the current reactor's delegate registry for `hart` (called by trampoline / `run_thread`).
+pub fn current_delegate_registry(hart: usize) -> Option<Arc<DelegateRegistry>> {
+    CURRENT_DELEGATE_REGISTRY
+        .get(hart)
+        .and_then(|slot| slot.lock().clone())
 }

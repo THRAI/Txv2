@@ -4,7 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
-use tx_subsystems::process::numbers::{resolve_pid_number, PidName};
+use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
 use tx_subsystems::signal::{KillOutcome, SignalTarget};
 
@@ -18,8 +18,45 @@ struct SigaltstackLayout {
 }
 
 const _: () = assert!(core::mem::size_of::<SigaltstackLayout>() == 24);
+const SS_ONSTACK: i32 = 1;
 const SS_DISABLE: i32 = 2;
 const SS_AUTODISARM: i32 = 1 << 31;
+
+pub(super) mod layout_descriptors {
+    use core::mem::{align_of, offset_of, size_of};
+
+    pub(super) use super::SigaltstackLayout;
+    use crate::linux_syscall::{KernelToUserLayout, KernelUserField, KernelUserLayout};
+
+    impl KernelToUserLayout for SigaltstackLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "SigaltstackLayout",
+            musl_header: "signal.h",
+            musl_type: "struct sigaltstack",
+            size: size_of::<SigaltstackLayout>(),
+            align: align_of::<SigaltstackLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "ss_sp",
+                    musl: "ss_sp",
+                    offset: offset_of!(SigaltstackLayout, ss_sp),
+                },
+                KernelUserField {
+                    rust: "ss_flags",
+                    musl: "ss_flags",
+                    offset: offset_of!(SigaltstackLayout, ss_flags),
+                },
+                KernelUserField {
+                    rust: "ss_size",
+                    musl: "ss_size",
+                    offset: offset_of!(SigaltstackLayout, ss_size),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const SIGALTSTACK_LAYOUT: KernelUserLayout =
+        <SigaltstackLayout as KernelToUserLayout>::LAYOUT;
+}
 
 /// Drain `SignalDelivered` events from a thread mailbox.
 ///
@@ -287,7 +324,7 @@ pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
     // pre-existing `SignalDelivered` events left over from a previous
     // sigtimedwait call on this same thread before the poll loop
     // starts; the per-iteration drain below handles new arrivals.
-    let mailbox_for_drain = crate::adapter::reactor_entry::current_task_mailbox();
+    let mailbox_for_drain = crate::adapter::reactor_entry::current_task_mailbox(0);
     if let Some(ref mbox) = mailbox_for_drain {
         drain_stale_signal_events(mbox);
     }
@@ -337,7 +374,7 @@ pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
         use tx_scripts::drive;
         let mut script_ctx = build_subject_script_ctx(ctx);
         let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-        let mailbox = current_task_mailbox();
+        let mailbox = current_task_mailbox(0);
         let op = super::NanosleepOp {
             nanos: chunk,
             deadline_ns: now_ns.saturating_add(chunk),
@@ -596,7 +633,7 @@ pub(super) fn sys_tkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
     }
 
     // Resolve tid → ThreadIdentity via PidName namespace
-    if let Some(PidName::Thread(thread_cap)) = resolve_pid_number(tid) {
+    if let Some(PidName::Thread(thread_cap)) = resolve_pid_number_as(tid, PidNameKind::Thread) {
         let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
             Some(s) => s,
             None => return SyscallResult::Error(EINVAL_VALUE),
@@ -694,64 +731,14 @@ pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
 /// If no signal frame is in flight, the kernel has no parked
 /// context to restore. POSIX leaves this case undefined; we return
 /// `-EFAULT` defensively rather than corrupt the current context.
-#[cfg(target_arch = "loongarch64")]
-pub const USER_CONTEXT_SP_INDEX: usize = 3;
-#[cfg(target_arch = "riscv64")]
-pub const USER_CONTEXT_SP_INDEX: usize = 2;
-#[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
-pub const USER_CONTEXT_SP_INDEX: usize = 2;
-
-pub(super) fn sys_rt_sigreturn<P: tx_hal::SignalFrameIf>(ctx: &SyscallCtx) -> SyscallResult {
+pub(super) fn sys_rt_sigreturn(ctx: &SyscallCtx) -> SyscallResult {
     let Some(payload) = ctx.thread.payload_cap() else {
         return SyscallResult::Error(EFAULT_VALUE);
     };
-
-    // Gate: a parked signal context must exist — it was stored by the
-    // AST checkpoint in `thread_future.rs` when delivering the handler.
-    // Without one, no signal frame is in flight and we refuse.
-    let Some(saved_signal) = payload.take_saved_signal_context() else {
+    let Some(saved) = payload.take_saved_signal_context() else {
         return SyscallResult::Error(EFAULT_VALUE);
     };
-
-    // Try the stack-based restore path.  In production the current
-    // `saved_user_context` holds the handler-entry register state
-    // whose SP points at the signal frame on the user stack.  The HAL
-    // `read_signal_frame` reads the `ucontext_t` from that frame,
-    // including any modifications the user-space signal handler made
-    // (e.g. musl's cancel handler redirecting PC to `__cancel`).
-    //
-    // In host tests (or if saved_user_context is absent / the stack is
-    // corrupted), we fall back to the parked `saved_signal` directly.
-    let stack_frame = payload.saved_user_context().and_then(|saved_user| {
-        let user_sp = saved_user.regs[USER_CONTEXT_SP_INDEX];
-        <P as tx_hal::SignalFrameIf>::read_signal_frame(tx_hal::UserPtr::new(user_sp)).ok()
-    });
-
-    match stack_frame {
-        Some(frame) => {
-            // Stack frame successfully read — use its (possibly
-            // handler-modified) register context.
-            let mut restored_ctx = frame.user_context;
-            // If the handler did NOT redirect PC (normal signal return),
-            // and the PC was rewound during signal delivery,
-            // advance past the ecall instruction that was rewound during
-            // delivery so the thread resumes at the instruction after
-            // the trapping syscall.
-            if restored_ctx.pc == saved_signal.pc && saved_signal.regs[0] == 1 {
-                restored_ctx.pc = restored_ctx.pc.wrapping_add(4);
-            }
-            payload.store_signal_mask(SignalMask::new(frame.saved_mask.bits));
-            payload.store_saved_user_context(Some(restored_ctx));
-        }
-        None => {
-            // Stack read unavailable or failed — restore the parked
-            // pre-signal context as-is.  Without a readable stack frame
-            // we cannot tell whether the handler redirected PC, so we
-            // restore the exact parked snapshot.
-            payload.store_saved_user_context(Some(saved_signal));
-        }
-    }
-
+    payload.store_saved_user_context(Some(saved));
     SyscallResult::SigreturnRestored
 }
 

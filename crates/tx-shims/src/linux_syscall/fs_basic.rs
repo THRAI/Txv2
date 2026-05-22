@@ -64,13 +64,20 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 Ok(min) => min,
                 Err(_) => return SyscallResult::Error(EINVAL_VALUE),
             };
-            let new_fd = match next_fd_below_nofile(&ctx.process, min) {
-                Ok(fd) => fd,
-                Err(result) => return result,
+            if let Err(result) = next_fd_below_nofile(&ctx.process, min) {
+                return result;
+            }
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = FcntlDupFdOp {
+                process: ctx.process.clone(),
+                fd,
+                min,
+                cloexec: cmd == F_DUPFD_CLOEXEC,
             };
-            let _prev = ctx.process.install_fd(new_fd, file);
-            ctx.process.set_fd_cloexec(new_fd, cmd == F_DUPFD_CLOEXEC);
-            return SyscallResult::Return(new_fd as i64);
+            return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(new_fd) => SyscallResult::Return(new_fd as i64),
+                Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+            };
         }
         F_GETFL => {
             let mut script_ctx = build_subject_script_ctx(ctx);
@@ -354,8 +361,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         }
     };
 
-    // Step 4: install into the fd slot reserved before VFS work so a
-    // full fd table reports EMFILE before path lookup errors.
+    // Step 4: install at the lowest unused fd ≥ 0. Per fd-ops Wave 1
+    // the fd table is a sparse `BTreeMap<u32, Cap<OpenFile>>`;
+    // `allocate_fd()` scans for the lowest unused key.
     let _ = ctx.process.set_fd(fd, Some(openfile));
     if want_cloexec {
         ctx.process.set_fd_cloexec(fd, true);
@@ -402,17 +410,21 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// (we clone the `Cap<OpenFile>`); both fds reference the same
 /// epoch-managed identity.
 pub(super) fn sys_dup<'a>(oldfd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
-    let file = match ctx.process.fd(oldfd) {
-        Some(file) => file,
-        None => return SyscallResult::Error(EBADF_VALUE),
+    if ctx.process.fd(oldfd).is_none() {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if let Err(result) = next_stdio_fd_below_nofile(&ctx.process) {
+        return result;
+    }
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = DupOp {
+        process: ctx.process.clone(),
+        oldfd,
     };
-    let newfd = match next_stdio_fd_below_nofile(&ctx.process) {
-        Ok(fd) => fd,
-        Err(result) => return result,
-    };
-    let _ = ctx.process.set_fd(newfd, Some(file));
-    ctx.process.set_fd_cloexec(newfd, false);
-    SyscallResult::Return(newfd as i64)
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(newfd) => SyscallResult::Return(newfd as i64),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+    }
 }
 
 /// `dup3(oldfd, newfd, flags)`. Linux RV64 generic ABI
@@ -512,19 +524,9 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
     // reader first so on a fresh process it lands at 0 and the
     // writer at 1, matching Linux's user-visible (3, 4) pattern
     // post-stdin/out/err.
-    let reader_fd = match next_stdio_fd_below_nofile(&ctx.process) {
-        Ok(fd) => fd,
-        Err(result) => return result,
-    };
+    let reader_fd = ctx.process.allocate_fd();
     let _ = ctx.process.install_fd(reader_fd, reader_cap);
-    let writer_fd = match next_stdio_fd_below_nofile(&ctx.process) {
-        Ok(fd) => fd,
-        Err(result) => {
-            let _ = ctx.process.set_fd(reader_fd, None);
-            ctx.process.set_fd_cloexec(reader_fd, false);
-            return result;
-        }
-    };
+    let writer_fd = ctx.process.allocate_fd();
     let _ = ctx.process.install_fd(writer_fd, writer_cap);
 
     if pipe_flags.cloexec {
@@ -868,15 +870,13 @@ pub(super) struct StatLayout {
     __pad2: i32,
     pub(super) st_blocks: i64,
     pub(super) st_atime_sec: i64,
-    pub(super) st_atime_nsec: i64,
+    pub(super) st_atime_nsec: u64,
     pub(super) st_mtime_sec: i64,
-    pub(super) st_mtime_nsec: i64,
+    pub(super) st_mtime_nsec: u64,
     pub(super) st_ctime_sec: i64,
-    pub(super) st_ctime_nsec: i64,
+    pub(super) st_ctime_nsec: u64,
     __unused: [u32; 2],
 }
-
-const _: () = assert!(core::mem::size_of::<StatLayout>() == 128);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -946,6 +946,365 @@ struct LinuxDirent64Header {
     d_type: u8,
 }
 
+pub(super) mod layout_descriptors {
+    use core::mem::{align_of, offset_of, size_of};
+
+    pub(super) use super::{
+        LinuxDirent64Header, StatLayout, StatfsLayout, StatxLayout, StatxTimestamp,
+    };
+    use crate::linux_syscall::{KernelToUserLayout, KernelUserField, KernelUserLayout};
+
+    impl KernelToUserLayout for StatLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "StatLayout",
+            musl_header: "sys/stat.h",
+            musl_type: "struct stat",
+            size: size_of::<StatLayout>(),
+            align: align_of::<StatLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "st_dev",
+                    musl: "st_dev",
+                    offset: offset_of!(StatLayout, st_dev),
+                },
+                KernelUserField {
+                    rust: "st_ino",
+                    musl: "st_ino",
+                    offset: offset_of!(StatLayout, st_ino),
+                },
+                KernelUserField {
+                    rust: "st_mode",
+                    musl: "st_mode",
+                    offset: offset_of!(StatLayout, st_mode),
+                },
+                KernelUserField {
+                    rust: "st_nlink",
+                    musl: "st_nlink",
+                    offset: offset_of!(StatLayout, st_nlink),
+                },
+                KernelUserField {
+                    rust: "st_uid",
+                    musl: "st_uid",
+                    offset: offset_of!(StatLayout, st_uid),
+                },
+                KernelUserField {
+                    rust: "st_gid",
+                    musl: "st_gid",
+                    offset: offset_of!(StatLayout, st_gid),
+                },
+                KernelUserField {
+                    rust: "st_rdev",
+                    musl: "st_rdev",
+                    offset: offset_of!(StatLayout, st_rdev),
+                },
+                KernelUserField {
+                    rust: "st_size",
+                    musl: "st_size",
+                    offset: offset_of!(StatLayout, st_size),
+                },
+                KernelUserField {
+                    rust: "st_blksize",
+                    musl: "st_blksize",
+                    offset: offset_of!(StatLayout, st_blksize),
+                },
+                KernelUserField {
+                    rust: "st_blocks",
+                    musl: "st_blocks",
+                    offset: offset_of!(StatLayout, st_blocks),
+                },
+                KernelUserField {
+                    rust: "st_atime_sec",
+                    musl: "st_atim.tv_sec",
+                    offset: offset_of!(StatLayout, st_atime_sec),
+                },
+                KernelUserField {
+                    rust: "st_atime_nsec",
+                    musl: "st_atim.tv_nsec",
+                    offset: offset_of!(StatLayout, st_atime_nsec),
+                },
+                KernelUserField {
+                    rust: "st_mtime_sec",
+                    musl: "st_mtim.tv_sec",
+                    offset: offset_of!(StatLayout, st_mtime_sec),
+                },
+                KernelUserField {
+                    rust: "st_mtime_nsec",
+                    musl: "st_mtim.tv_nsec",
+                    offset: offset_of!(StatLayout, st_mtime_nsec),
+                },
+                KernelUserField {
+                    rust: "st_ctime_sec",
+                    musl: "st_ctim.tv_sec",
+                    offset: offset_of!(StatLayout, st_ctime_sec),
+                },
+                KernelUserField {
+                    rust: "st_ctime_nsec",
+                    musl: "st_ctim.tv_nsec",
+                    offset: offset_of!(StatLayout, st_ctime_nsec),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const STAT_LAYOUT: KernelUserLayout =
+        <StatLayout as KernelToUserLayout>::LAYOUT;
+
+    impl KernelToUserLayout for StatxTimestamp {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "StatxTimestamp",
+            musl_header: "sys/stat.h",
+            musl_type: "struct statx_timestamp",
+            size: size_of::<StatxTimestamp>(),
+            align: align_of::<StatxTimestamp>(),
+            fields: &[
+                KernelUserField {
+                    rust: "tv_sec",
+                    musl: "tv_sec",
+                    offset: offset_of!(StatxTimestamp, tv_sec),
+                },
+                KernelUserField {
+                    rust: "tv_nsec",
+                    musl: "tv_nsec",
+                    offset: offset_of!(StatxTimestamp, tv_nsec),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const STATX_TIMESTAMP_LAYOUT: KernelUserLayout =
+        <StatxTimestamp as KernelToUserLayout>::LAYOUT;
+
+    impl KernelToUserLayout for StatxLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "StatxLayout",
+            musl_header: "sys/stat.h",
+            musl_type: "struct statx",
+            size: size_of::<StatxLayout>(),
+            align: align_of::<StatxLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "stx_mask",
+                    musl: "stx_mask",
+                    offset: offset_of!(StatxLayout, stx_mask),
+                },
+                KernelUserField {
+                    rust: "stx_blksize",
+                    musl: "stx_blksize",
+                    offset: offset_of!(StatxLayout, stx_blksize),
+                },
+                KernelUserField {
+                    rust: "stx_attributes",
+                    musl: "stx_attributes",
+                    offset: offset_of!(StatxLayout, stx_attributes),
+                },
+                KernelUserField {
+                    rust: "stx_nlink",
+                    musl: "stx_nlink",
+                    offset: offset_of!(StatxLayout, stx_nlink),
+                },
+                KernelUserField {
+                    rust: "stx_uid",
+                    musl: "stx_uid",
+                    offset: offset_of!(StatxLayout, stx_uid),
+                },
+                KernelUserField {
+                    rust: "stx_gid",
+                    musl: "stx_gid",
+                    offset: offset_of!(StatxLayout, stx_gid),
+                },
+                KernelUserField {
+                    rust: "stx_mode",
+                    musl: "stx_mode",
+                    offset: offset_of!(StatxLayout, stx_mode),
+                },
+                KernelUserField {
+                    rust: "stx_ino",
+                    musl: "stx_ino",
+                    offset: offset_of!(StatxLayout, stx_ino),
+                },
+                KernelUserField {
+                    rust: "stx_size",
+                    musl: "stx_size",
+                    offset: offset_of!(StatxLayout, stx_size),
+                },
+                KernelUserField {
+                    rust: "stx_blocks",
+                    musl: "stx_blocks",
+                    offset: offset_of!(StatxLayout, stx_blocks),
+                },
+                KernelUserField {
+                    rust: "stx_attributes_mask",
+                    musl: "stx_attributes_mask",
+                    offset: offset_of!(StatxLayout, stx_attributes_mask),
+                },
+                KernelUserField {
+                    rust: "stx_atime",
+                    musl: "stx_atime",
+                    offset: offset_of!(StatxLayout, stx_atime),
+                },
+                KernelUserField {
+                    rust: "stx_btime",
+                    musl: "stx_btime",
+                    offset: offset_of!(StatxLayout, stx_btime),
+                },
+                KernelUserField {
+                    rust: "stx_ctime",
+                    musl: "stx_ctime",
+                    offset: offset_of!(StatxLayout, stx_ctime),
+                },
+                KernelUserField {
+                    rust: "stx_mtime",
+                    musl: "stx_mtime",
+                    offset: offset_of!(StatxLayout, stx_mtime),
+                },
+                KernelUserField {
+                    rust: "stx_rdev_major",
+                    musl: "stx_rdev_major",
+                    offset: offset_of!(StatxLayout, stx_rdev_major),
+                },
+                KernelUserField {
+                    rust: "stx_rdev_minor",
+                    musl: "stx_rdev_minor",
+                    offset: offset_of!(StatxLayout, stx_rdev_minor),
+                },
+                KernelUserField {
+                    rust: "stx_dev_major",
+                    musl: "stx_dev_major",
+                    offset: offset_of!(StatxLayout, stx_dev_major),
+                },
+                KernelUserField {
+                    rust: "stx_dev_minor",
+                    musl: "stx_dev_minor",
+                    offset: offset_of!(StatxLayout, stx_dev_minor),
+                },
+                KernelUserField {
+                    rust: "stx_mnt_id",
+                    musl: "stx_mnt_id",
+                    offset: offset_of!(StatxLayout, stx_mnt_id),
+                },
+                KernelUserField {
+                    rust: "stx_dio_mem_align",
+                    musl: "stx_dio_mem_align",
+                    offset: offset_of!(StatxLayout, stx_dio_mem_align),
+                },
+                KernelUserField {
+                    rust: "stx_dio_offset_align",
+                    musl: "stx_dio_offset_align",
+                    offset: offset_of!(StatxLayout, stx_dio_offset_align),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const STATX_LAYOUT: KernelUserLayout =
+        <StatxLayout as KernelToUserLayout>::LAYOUT;
+
+    impl KernelToUserLayout for StatfsLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "StatfsLayout",
+            musl_header: "sys/statfs.h",
+            musl_type: "struct statfs",
+            size: size_of::<StatfsLayout>(),
+            align: align_of::<StatfsLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "f_type",
+                    musl: "f_type",
+                    offset: offset_of!(StatfsLayout, f_type),
+                },
+                KernelUserField {
+                    rust: "f_bsize",
+                    musl: "f_bsize",
+                    offset: offset_of!(StatfsLayout, f_bsize),
+                },
+                KernelUserField {
+                    rust: "f_blocks",
+                    musl: "f_blocks",
+                    offset: offset_of!(StatfsLayout, f_blocks),
+                },
+                KernelUserField {
+                    rust: "f_bfree",
+                    musl: "f_bfree",
+                    offset: offset_of!(StatfsLayout, f_bfree),
+                },
+                KernelUserField {
+                    rust: "f_bavail",
+                    musl: "f_bavail",
+                    offset: offset_of!(StatfsLayout, f_bavail),
+                },
+                KernelUserField {
+                    rust: "f_files",
+                    musl: "f_files",
+                    offset: offset_of!(StatfsLayout, f_files),
+                },
+                KernelUserField {
+                    rust: "f_ffree",
+                    musl: "f_ffree",
+                    offset: offset_of!(StatfsLayout, f_ffree),
+                },
+                KernelUserField {
+                    rust: "f_fsid",
+                    musl: "f_fsid",
+                    offset: offset_of!(StatfsLayout, f_fsid),
+                },
+                KernelUserField {
+                    rust: "f_namelen",
+                    musl: "f_namelen",
+                    offset: offset_of!(StatfsLayout, f_namelen),
+                },
+                KernelUserField {
+                    rust: "f_frsize",
+                    musl: "f_frsize",
+                    offset: offset_of!(StatfsLayout, f_frsize),
+                },
+                KernelUserField {
+                    rust: "f_flags",
+                    musl: "f_flags",
+                    offset: offset_of!(StatfsLayout, f_flags),
+                },
+                KernelUserField {
+                    rust: "f_spare",
+                    musl: "f_spare",
+                    offset: offset_of!(StatfsLayout, f_spare),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const STATFS_LAYOUT: KernelUserLayout =
+        <StatfsLayout as KernelToUserLayout>::LAYOUT;
+
+    impl KernelToUserLayout for LinuxDirent64Header {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "LinuxDirent64Header",
+            musl_header: "dirent.h",
+            musl_type: "struct dirent",
+            size: size_of::<LinuxDirent64Header>(),
+            align: align_of::<LinuxDirent64Header>(),
+            fields: &[
+                KernelUserField {
+                    rust: "d_ino",
+                    musl: "d_ino",
+                    offset: offset_of!(LinuxDirent64Header, d_ino),
+                },
+                KernelUserField {
+                    rust: "d_off",
+                    musl: "d_off",
+                    offset: offset_of!(LinuxDirent64Header, d_off),
+                },
+                KernelUserField {
+                    rust: "d_reclen",
+                    musl: "d_reclen",
+                    offset: offset_of!(LinuxDirent64Header, d_reclen),
+                },
+                KernelUserField {
+                    rust: "d_type",
+                    musl: "d_type",
+                    offset: offset_of!(LinuxDirent64Header, d_type),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const LINUX_DIRENT64_HEADER_LAYOUT: KernelUserLayout =
+        <LinuxDirent64Header as KernelToUserLayout>::LAYOUT;
+}
+
 /// Map an `InodeMeta` + (`fs_object_id`, `rdev`) pair onto the Linux
 /// `struct stat` byte image. Single-device kernel today
 /// (`st_dev = 0`); `st_blksize = 4096` is the universal page size on
@@ -967,30 +1326,13 @@ pub(super) fn inode_meta_to_stat(meta: &InodeMeta, ino: u64, rdev: u64) -> StatL
         __pad2: 0,
         st_blocks: meta.blocks as i64,
         st_atime_sec: meta.atime.sec,
-        st_atime_nsec: meta.atime.nsec as i64,
+        st_atime_nsec: meta.atime.nsec as u64,
         st_mtime_sec: meta.mtime.sec,
-        st_mtime_nsec: meta.mtime.nsec as i64,
+        st_mtime_nsec: meta.mtime.nsec as u64,
         st_ctime_sec: meta.ctime.sec,
-        st_ctime_nsec: meta.ctime.nsec as i64,
+        st_ctime_nsec: meta.ctime.nsec as u64,
         __unused: [0, 0],
     }
-}
-
-fn clamp_meta_future_times<P: TimeIf>(mut meta: InodeMeta) -> InodeMeta {
-    if meta.kind() != InodeKind::Directory {
-        return meta;
-    }
-    let now = ns_to_timespec(<P as TimeIf>::read_ns());
-    let clamp_one = |ts: &mut tx_subsystems::vfs::Timespec| {
-        if ts.sec > now.tv_sec || (ts.sec == now.tv_sec && ts.nsec as i64 > now.tv_nsec) {
-            ts.sec = now.tv_sec;
-            ts.nsec = now.tv_nsec as i32;
-        }
-    };
-    clamp_one(&mut meta.atime);
-    clamp_one(&mut meta.mtime);
-    clamp_one(&mut meta.ctime);
-    meta
 }
 
 fn inode_meta_to_statx(meta: &InodeMeta, ino: u64) -> StatxLayout {
@@ -1069,7 +1411,7 @@ fn stat_meta_for_open_file(file: &Cap<OpenFile>) -> InodeMeta {
 /// - Unknown / closed fd → `-EBADF`.
 /// - `statbuf == 0` (NULL) → `-EFAULT`.
 /// - All other paths return `0` after writing the buffer.
-pub(super) fn sys_fstat<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
     let statbuf_uaddr = args[1];
 
@@ -1086,7 +1428,7 @@ pub(super) fn sys_fstat<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 
     let rnode = file.rnode();
     let fs_object_id = rnode.fs_object_id();
-    let meta = clamp_meta_future_times::<P>(stat_meta_for_open_file(&file));
+    let meta = stat_meta_for_open_file(&file);
     let ino = fs_object_id.as_u64();
     let stat = inode_meta_to_stat(&meta, ino, 0);
 
@@ -1220,10 +1562,7 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 ///
 /// Path resolution mirrors `resolve_path_at`'s shape (using
 /// `step_walk` from cwd with `walker_cred`).
-pub(super) async fn sys_newfstatat<'a, P: TimeIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
     let statbuf_uaddr = args[2];
@@ -1263,7 +1602,7 @@ pub(super) async fn sys_newfstatat<'a, P: TimeIf>(
         if dirfd == AT_FDCWD {
             (cwd.rnode().meta(), cwd.rnode().fs_object_id())
         } else {
-            return sys_fstat::<P>([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx);
+            return sys_fstat([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx);
         }
     } else {
         if dirfd != AT_FDCWD {
@@ -1285,7 +1624,7 @@ pub(super) async fn sys_newfstatat<'a, P: TimeIf>(
         }
     };
 
-    let stat = inode_meta_to_stat(&clamp_meta_future_times::<P>(meta), ino.as_u64(), 0);
+    let stat = inode_meta_to_stat(&meta, ino.as_u64(), 0);
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
         return SyscallResult::error_from(errno);
@@ -1481,11 +1820,11 @@ pub(super) async fn sys_statfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
     let statfs = StatfsLayout {
         f_type: 0x0102_1994,
         f_bsize: 4096,
-        f_blocks: 1024,
-        f_bfree: 512,
-        f_bavail: 512,
-        f_files: 1024,
-        f_ffree: 512,
+        f_blocks: 0,
+        f_bfree: 0,
+        f_bavail: 0,
+        f_files: 0,
+        f_ffree: 0,
         f_fsid: [0, 0],
         f_namelen: 255,
         f_frsize: 4096,

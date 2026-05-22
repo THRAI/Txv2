@@ -524,13 +524,18 @@ impl<'a, I: SubjectIdentity> StepOp<I> for RenameOp<'a> {
             }
         };
         let fs_ops = walker::fs_ops_for(&old_parent, &__guard).expect("NoFsOps for RenameOp");
-        fs_ops.rename(
+        let outcome = fs_ops.rename(
             old_parent.rnode().fs_object_id(),
             old_name.as_bytes(),
             new_parent.rnode().fs_object_id(),
             new_name.as_bytes(),
             &__guard,
-        )
+        );
+        if matches!(outcome, StepOutcome::Done(())) {
+            old_parent.remove_cached_child(old_name);
+            new_parent.remove_cached_child(new_name);
+        }
+        outcome
     }
 }
 

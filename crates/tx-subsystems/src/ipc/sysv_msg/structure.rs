@@ -55,8 +55,8 @@ impl MsgQueueIdentity {
         self.gid.load(Ordering::Relaxed)
     }
 
-    pub fn key_raw(&self) -> u32 {
-        self.key.map(|key| key.0).unwrap_or(0)
+    pub fn key_raw(&self) -> i32 {
+        self.key.map(|key| key.0 as i32).unwrap_or(0)
     }
 }
 
