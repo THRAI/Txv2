@@ -11,6 +11,7 @@ use super::private::{
     PrivateFrame, PrivateFrameIdentity, PrivateFrameSnapshot, PrivateFrameState, PrivatePageError,
     PrivatePageSet, VmPageOff,
 };
+use crate::execution::WaitToken;
 use crate::vm::adapter::step_engine::{self as step_engine};
 use crate::vm::VmPmapError;
 
@@ -611,9 +612,17 @@ pub struct VmMapOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmRemapPlacement {
+    InPlace,
+    Move,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VmRemapRequest {
     pub old_range: UserRange,
     pub new_range: UserRange,
+    pub placement: VmRemapPlacement,
+    pub destination: MapPlacement,
 }
 
 impl VmRemapRequest {
@@ -621,6 +630,26 @@ impl VmRemapRequest {
         Self {
             old_range,
             new_range,
+            placement: VmRemapPlacement::Move,
+            destination: MapPlacement::RequireFree,
+        }
+    }
+
+    pub const fn fixed_replace(old_range: UserRange, new_range: UserRange) -> Self {
+        Self {
+            old_range,
+            new_range,
+            placement: VmRemapPlacement::Move,
+            destination: MapPlacement::FixedReplace,
+        }
+    }
+
+    pub const fn in_place(old_range: UserRange, new_range: UserRange) -> Self {
+        Self {
+            old_range,
+            new_range,
+            placement: VmRemapPlacement::InPlace,
+            destination: MapPlacement::RequireFree,
         }
     }
 }
@@ -648,6 +677,7 @@ impl VmFault {
 pub struct VmFaultOutcome {
     pub page_range: UserRange,
     pub entry: VmEntry,
+    pub private_identity: Option<u32>,
     pub access: AccessMode,
     pub pmap_materialization_deferred: bool,
 }
@@ -661,12 +691,27 @@ impl VmFaultOutcome {
     }
 
     pub fn materialize_pagebacked(&self) -> Result<VmFaultMaterialization, VmFaultError> {
+        let guard =
+            step_engine::epoch_mod::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        match self.materialize_pagebacked_step(&guard) {
+            VmFaultMaterializationStep::Done(materialization) => Ok(materialization),
+            VmFaultMaterializationStep::Blocked(_) => Err(VmFaultError::WouldBlock),
+            VmFaultMaterializationStep::Err(error) => Err(error),
+        }
+    }
+
+    pub fn materialize_pagebacked_step(
+        &self,
+        guard: &crate::execution::Guard<'_>,
+    ) -> VmFaultMaterializationStep {
         // SHARED mappings: passthrough materialize from backing — no
         // private-page consult.
         if self.entry.flags.shared {
             return match &self.entry.backing {
-                VmBacking::Page { pc, .. } => self.materialize_page_shared(pc),
-                VmBacking::PrivateAnon | VmBacking::None => Err(VmFaultError::BackingMismatch),
+                VmBacking::Page { pc, .. } => self.materialize_page_shared(pc, guard),
+                VmBacking::PrivateAnon | VmBacking::None => {
+                    VmFaultMaterializationStep::Err(VmFaultError::BackingMismatch)
+                }
             };
         }
         // PRIVATE mappings: consult `entry.private` first, then fall
@@ -675,49 +720,84 @@ impl VmFaultOutcome {
         // the per-VmEntry `PrivatePageSet`; read-fault on miss
         // installs an RO PTE pointing at the backing frame so concurrent
         // readers can share it.
-        self.materialize_private()
+        self.materialize_private(guard)
     }
 
     fn materialize_page_shared(
         &self,
         pc: &Cap<PageContainer>,
-    ) -> Result<VmFaultMaterialization, VmFaultError> {
-        let page_index = self.backing_page_index()?;
-        let access_byte = page_index
-            .as_u64()
-            .checked_mul(USER_PAGE_SIZE as u64)
-            .ok_or(VmFaultError::BackingOffsetOverflow)?;
+        guard: &crate::execution::Guard<'_>,
+    ) -> VmFaultMaterializationStep {
+        let page_index = match self.backing_page_index() {
+            Ok(page_index) => page_index,
+            Err(error) => return VmFaultMaterializationStep::Err(error),
+        };
+        let access_byte = page_index.as_u64().checked_mul(USER_PAGE_SIZE as u64);
+        let Some(access_byte) = access_byte else {
+            return VmFaultMaterializationStep::Err(VmFaultError::BackingOffsetOverflow);
+        };
         if access_byte >= pc.size_bytes() {
-            return Err(VmFaultError::PageBeyondSize);
+            return VmFaultMaterializationStep::Err(VmFaultError::PageBeyondSize);
         }
         let access = match self.access {
             AccessMode::Write => MaterializeAccess::Write,
             _ => MaterializeAccess::Read,
         };
-        let page = pc
-            .materialize_page_for_fault(page_index, access)
-            .map_err(VmFaultError::PageCache)?;
-        Ok(VmFaultMaterialization {
-            backing: VmFaultMaterializationBacking::PageBacked,
-            page_index,
-            page,
-            publish_prot: self.entry.prot,
-            replace_existing: false,
-            pmap_materialization_deferred: self.pmap_materialization_deferred,
-        })
+        match pc.materialize_page_for_fault_step(page_index, access, guard) {
+            step_engine::StepOutcome::Done(page) => {
+                VmFaultMaterializationStep::Done(VmFaultMaterialization {
+                    backing: VmFaultMaterializationBacking::PageBacked,
+                    page_index,
+                    page,
+                    publish_prot: self.entry.prot,
+                    replace_existing: false,
+                    pmap_materialization_deferred: self.pmap_materialization_deferred,
+                })
+            }
+            step_engine::StepOutcome::Yield {
+                shape:
+                    step_engine::YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
+                ..
+            } => {
+                VmFaultMaterializationStep::Blocked(WaitToken::new(carrier.raw(), interests.raw()))
+            }
+            step_engine::StepOutcome::Err(errno) => VmFaultMaterializationStep::Err(
+                VmFaultError::PageCache(PageCacheError::Backend(errno.into())),
+            ),
+            _ => VmFaultMaterializationStep::Err(VmFaultError::PageCache(PageCacheError::Backend(
+                crate::execution::Errno::EAGAIN,
+            ))),
+        }
     }
 
-    fn materialize_private(&self) -> Result<VmFaultMaterialization, VmFaultError> {
+    fn materialize_private(
+        &self,
+        guard: &crate::execution::Guard<'_>,
+    ) -> VmFaultMaterializationStep {
         let backing_kind = match &self.entry.backing {
             VmBacking::Page { .. } => VmFaultMaterializationBacking::PageBacked,
             VmBacking::PrivateAnon => VmFaultMaterializationBacking::PrivateAnon,
-            VmBacking::None => return Err(VmFaultError::BackingMismatch),
+            VmBacking::None => {
+                return VmFaultMaterializationStep::Err(VmFaultError::BackingMismatch);
+            }
         };
         let page_index = match backing_kind {
-            VmFaultMaterializationBacking::PageBacked => self.backing_page_index()?,
-            VmFaultMaterializationBacking::PrivateAnon => self.private_anon_page_index()?,
+            VmFaultMaterializationBacking::PageBacked => match self.backing_page_index() {
+                Ok(page_index) => page_index,
+                Err(error) => return VmFaultMaterializationStep::Err(error),
+            },
+            VmFaultMaterializationBacking::PrivateAnon => match self.private_anon_page_index() {
+                Ok(page_index) => page_index,
+                Err(error) => return VmFaultMaterializationStep::Err(error),
+            },
         };
-        let page_off = self.private_page_off()?;
+        let page_off = match self.private_page_off() {
+            Ok(page_off) => page_off,
+            Err(error) => return VmFaultMaterializationStep::Err(error),
+        };
         let write_fault = self.access == AccessMode::Write;
 
         // 1. Hit in `entry.private` → install PTE pointing at the
@@ -726,14 +806,17 @@ impl VmFaultOutcome {
         //    write+SharedCow).
         if let Some(set) = &self.entry.private {
             if let Some(snap) = set.lookup(page_off) {
-                return self.publish_existing_private(
+                return match self.publish_existing_private(
                     snap,
                     write_fault,
                     set,
                     page_off,
                     page_index,
                     backing_kind,
-                );
+                ) {
+                    Ok(materialization) => VmFaultMaterializationStep::Done(materialization),
+                    Err(error) => VmFaultMaterializationStep::Err(error),
+                };
             }
         }
 
@@ -744,9 +827,9 @@ impl VmFaultOutcome {
         //    allocate a fresh private frame, copy, and install into
         //    `entry.private` if present.
         if !write_fault {
-            return self.materialize_private_read_miss(backing_kind, page_index);
+            return self.materialize_private_read_miss(backing_kind, page_index, guard);
         }
-        self.materialize_private_write_miss(backing_kind, page_index, page_off)
+        self.materialize_private_write_miss(backing_kind, page_index, page_off, guard)
     }
 
     fn publish_existing_private(
@@ -839,25 +922,54 @@ impl VmFaultOutcome {
         &self,
         backing_kind: VmFaultMaterializationBacking,
         page_index: PageIndex,
-    ) -> Result<VmFaultMaterialization, VmFaultError> {
+        guard: &crate::execution::Guard<'_>,
+    ) -> VmFaultMaterializationStep {
         let page = match (&self.entry.backing, backing_kind) {
             (VmBacking::Page { pc, .. }, VmFaultMaterializationBacking::PageBacked) => {
-                let access_byte = page_index
-                    .as_u64()
-                    .checked_mul(USER_PAGE_SIZE as u64)
-                    .ok_or(VmFaultError::BackingOffsetOverflow)?;
+                let Some(access_byte) = page_index.as_u64().checked_mul(USER_PAGE_SIZE as u64)
+                else {
+                    return VmFaultMaterializationStep::Err(VmFaultError::BackingOffsetOverflow);
+                };
                 if access_byte >= pc.size_bytes() {
-                    return Err(VmFaultError::PageBeyondSize);
+                    return VmFaultMaterializationStep::Err(VmFaultError::PageBeyondSize);
                 }
-                pc.materialize_page_for_fault(page_index, MaterializeAccess::Read)
-                    .map_err(VmFaultError::PageCache)?
+                match pc.materialize_page_for_fault_step(page_index, MaterializeAccess::Read, guard)
+                {
+                    step_engine::StepOutcome::Done(page) => page,
+                    step_engine::StepOutcome::Yield {
+                        shape:
+                            step_engine::YieldShape::OnWaitSource {
+                                source: carrier,
+                                interests,
+                            },
+                        ..
+                    } => {
+                        return VmFaultMaterializationStep::Blocked(WaitToken::new(
+                            carrier.raw(),
+                            interests.raw(),
+                        ));
+                    }
+                    step_engine::StepOutcome::Err(errno) => {
+                        return VmFaultMaterializationStep::Err(VmFaultError::PageCache(
+                            PageCacheError::Backend(errno.into()),
+                        ));
+                    }
+                    _ => {
+                        return VmFaultMaterializationStep::Err(VmFaultError::PageCache(
+                            PageCacheError::Backend(crate::execution::Errno::EAGAIN),
+                        ));
+                    }
+                }
             }
             (VmBacking::PrivateAnon, VmFaultMaterializationBacking::PrivateAnon) => {
-                materialize_zero_frame()?
+                match materialize_zero_frame() {
+                    Ok(page) => page,
+                    Err(error) => return VmFaultMaterializationStep::Err(error),
+                }
             }
-            _ => return Err(VmFaultError::BackingMismatch),
+            _ => return VmFaultMaterializationStep::Err(VmFaultError::BackingMismatch),
         };
-        Ok(VmFaultMaterialization {
+        VmFaultMaterializationStep::Done(VmFaultMaterialization {
             backing: backing_kind,
             page_index,
             page,
@@ -872,46 +984,85 @@ impl VmFaultOutcome {
         backing_kind: VmFaultMaterializationBacking,
         page_index: PageIndex,
         page_off: VmPageOff,
-    ) -> Result<VmFaultMaterialization, VmFaultError> {
+        guard: &crate::execution::Guard<'_>,
+    ) -> VmFaultMaterializationStep {
         // Allocate a fresh private frame, copying from backing source
         // when the backing has authoritative content.
         let new_page = match (&self.entry.backing, backing_kind) {
             (VmBacking::Page { pc, .. }, VmFaultMaterializationBacking::PageBacked) => {
-                let access_byte = page_index
-                    .as_u64()
-                    .checked_mul(USER_PAGE_SIZE as u64)
-                    .ok_or(VmFaultError::BackingOffsetOverflow)?;
+                let Some(access_byte) = page_index.as_u64().checked_mul(USER_PAGE_SIZE as u64)
+                else {
+                    return VmFaultMaterializationStep::Err(VmFaultError::BackingOffsetOverflow);
+                };
                 if access_byte >= pc.size_bytes() {
-                    return Err(VmFaultError::PageBeyondSize);
+                    return VmFaultMaterializationStep::Err(VmFaultError::PageBeyondSize);
                 }
-                let source = pc
-                    .materialize_page_for_fault(page_index, MaterializeAccess::Read)
-                    .map_err(VmFaultError::PageCache)?;
-                let new = allocate_private_materialized_page_from_source(source.ppn, true)?;
+                let source = match pc.materialize_page_for_fault_step(
+                    page_index,
+                    MaterializeAccess::Read,
+                    guard,
+                ) {
+                    step_engine::StepOutcome::Done(source) => source,
+                    step_engine::StepOutcome::Yield {
+                        shape:
+                            step_engine::YieldShape::OnWaitSource {
+                                source: carrier,
+                                interests,
+                            },
+                        ..
+                    } => {
+                        return VmFaultMaterializationStep::Blocked(WaitToken::new(
+                            carrier.raw(),
+                            interests.raw(),
+                        ));
+                    }
+                    step_engine::StepOutcome::Err(errno) => {
+                        return VmFaultMaterializationStep::Err(VmFaultError::PageCache(
+                            PageCacheError::Backend(errno.into()),
+                        ));
+                    }
+                    _ => {
+                        return VmFaultMaterializationStep::Err(VmFaultError::PageCache(
+                            PageCacheError::Backend(crate::execution::Errno::EAGAIN),
+                        ));
+                    }
+                };
+                let new = match allocate_private_materialized_page_from_source(source.ppn, true) {
+                    Ok(new) => new,
+                    Err(error) => return VmFaultMaterializationStep::Err(error),
+                };
                 drop(source);
                 new
             }
             (VmBacking::PrivateAnon, VmFaultMaterializationBacking::PrivateAnon) => {
-                allocate_private_materialized_page(true)?
+                match allocate_private_materialized_page(true) {
+                    Ok(page) => page,
+                    Err(error) => return VmFaultMaterializationStep::Err(error),
+                }
             }
-            _ => return Err(VmFaultError::BackingMismatch),
+            _ => return VmFaultMaterializationStep::Err(VmFaultError::BackingMismatch),
         };
         // Install into `entry.private` if a set is attached. On CAS
         // failure (someone raced and published), drop our new page and
         // ask the script to retry.
         if let Some(set) = &self.entry.private {
-            let cache_pin =
-                page_allocator::acquire_cache_pin(new_page.ppn).map_err(page_alloc_error)?;
+            let cache_pin = match page_allocator::acquire_cache_pin(new_page.ppn) {
+                Ok(pin) => pin,
+                Err(error) => {
+                    drop(new_page);
+                    return VmFaultMaterializationStep::Err(page_alloc_error(error));
+                }
+            };
             let frame = PrivateFrame::new(new_page.ppn, PrivateFrameState::Exclusive, cache_pin);
             match set.install_if_absent(page_off, frame) {
                 Ok(_) => {}
                 Err(_) => {
                     drop(new_page);
-                    return Err(VmFaultError::WouldBlock);
+                    return VmFaultMaterializationStep::Err(VmFaultError::WouldBlock);
                 }
             }
         }
-        Ok(VmFaultMaterialization {
+        VmFaultMaterializationStep::Done(VmFaultMaterialization {
             backing: backing_kind,
             page_index,
             page: new_page,
@@ -1029,6 +1180,13 @@ pub struct VmFaultMaterialization {
     pub publish_prot: Prot,
     pub replace_existing: bool,
     pub pmap_materialization_deferred: bool,
+}
+
+#[derive(Debug)]
+pub enum VmFaultMaterializationStep {
+    Done(VmFaultMaterialization),
+    Blocked(WaitToken),
+    Err(VmFaultError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

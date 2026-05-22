@@ -398,46 +398,36 @@ impl PageContainer {
         })
     }
 
-    /// Materialize a page for VM fault resolution. Handles both
-    /// `Anon` and `File` PCs. `Anon` delegates to `materialize_anon`;
-    /// `File` borrows the current epoch guard (or acquires a fresh one
-    /// if none is held) and fetches via `FsPageBacking::fetch_page`.
-    /// `Device` is rejected — device mappings install through the pmap
-    /// directly and never fault.
     pub fn materialize_page_for_fault(
         &self,
         page: PageIndex,
         access: MaterializeAccess,
     ) -> Result<MaterializedPage, PageCacheError> {
+        let guard =
+            adapter::step_engine::epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        self.materialize_page_now(page, access, &guard)
+    }
+
+    /// Materialize a page for VM fault resolution while preserving
+    /// wait-source yields from file-backed fetches.
+    pub fn materialize_page_for_fault_step(
+        &self,
+        page: PageIndex,
+        access: MaterializeAccess,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<MaterializedPage, NoProgress> {
         match &self.kind {
-            PageContainerKind::Anon { .. } => self.materialize_anon(page, access),
+            PageContainerKind::Anon { .. } => match self.materialize_anon(page, access) {
+                Ok(page) => StepOutcome::Done(page),
+                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
+            },
             PageContainerKind::File {
                 mount,
                 fs_object_id,
-            } => {
-                use StepOutcome as V3;
-                let borrowed = adapter::step_engine::epoch::borrow_current_guard();
-                let fresh;
-                let guard: &Guard<'_> = match &borrowed {
-                    Some(g) => g,
-                    None => {
-                        fresh = step_engine::guard();
-                        &fresh
-                    }
-                };
-                match self.materialize_file_page(page, access, mount, *fs_object_id, guard) {
-                    V3::Done(materialized) => Ok(materialized),
-                    V3::Err(errno) => {
-                        if errno == step_engine::Errno::ENOMEM {
-                            Err(PageCacheError::Alloc(AllocError::Exhausted))
-                        } else {
-                            Err(PageCacheError::MissingPage)
-                        }
-                    }
-                    _ => Err(PageCacheError::MissingPage),
-                }
+            } => self.materialize_file_page(page, access, mount, *fs_object_id, guard),
+            PageContainerKind::Device { .. } => {
+                StepOutcome::Err(page_cache_error_to_errno(PageCacheError::UnsupportedKind).into())
             }
-            PageContainerKind::Device { .. } => Err(PageCacheError::UnsupportedKind),
         }
     }
 

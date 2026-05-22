@@ -223,10 +223,7 @@ fn mremap_script_yields_on_pair_conflict_and_completes_after_release() {
         _ => panic!("baseline acquire should succeed"),
     };
 
-    let request = VmRemapRequest {
-        old_range,
-        new_range,
-    };
+    let request = VmRemapRequest::new(old_range, new_range);
     let mut future = Box::pin(aspace.mremap_script(request));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);

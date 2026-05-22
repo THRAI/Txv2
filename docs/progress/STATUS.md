@@ -20,6 +20,21 @@
   **Blocker:** no host-test blocker; the guest OSComp run was not rerun after
   the main merge.
 
+- 2026-05-22 **Fixed VM musl-facing mmap/mremap and audit smells.**
+  Followed `docs/progress/research/2026-05-22-vm-musl-audit.md`: `mremap`
+  now decodes Linux flags, supports in-place resize, may-move relocation,
+  and fixed destination replacement; `MAP_SHARED | MAP_ANONYMOUS` now uses
+  an anonymous `PageContainer`; file-backed fault materialization preserves
+  wait-source yields; fork CoW pmap demotion errors propagate; user/brk
+  arithmetic uses checked addition/alignment; and fault publication now
+  revalidates the private-page-set identity.
+  **Verified:** `cargo test -p tx-subsystems --lib vm -- --test-threads=1`
+  (106 passed); `cargo test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls -- --test-threads=1` (20 passed);
+  `cargo xtask progress validate` (27 records ok).
+  **Next:** rerun full workspace format/check once the unrelated existing
+  dirty files are ready for a broader sweep.
+
 - 2026-05-22 **Fixed first-pass process audit gaps and recorded status quo.**
   Process pid identity now survives zombification until reap; fork delays pid
   publication until later fallible allocations succeed; pid names cover

@@ -38,8 +38,9 @@ pub use structure::{
     PrivateFrameState, PrivatePageError, PrivatePageSet, Prot, RangeGuard, RangeGuardPair,
     RangeLock, UfdRegistration, UserPage, UserPageIter, UserRange, UserRangeError, UserVirtAddr,
     VmBacking, VmEntry, VmEntryError, VmEntryFlags, VmEntryRewrite, VmFault, VmFaultError,
-    VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultOutcome, VmMapCommit, VmMapError,
-    VmMapOutcome, VmMapRequest, VmMapTarget, VmPageOff, VmRemapOutcome, VmRemapRequest, WouldBlock,
-    FULL_USER_V1_TOP, RANGE_LOCK_RELEASE_MASK, USER_PAGE_SIZE,
+    VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultMaterializationStep,
+    VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmPageOff,
+    VmRemapOutcome, VmRemapPlacement, VmRemapRequest, WouldBlock, FULL_USER_V1_TOP,
+    RANGE_LOCK_RELEASE_MASK, USER_PAGE_SIZE,
 };
 pub use user_access::UserAccessKind;
