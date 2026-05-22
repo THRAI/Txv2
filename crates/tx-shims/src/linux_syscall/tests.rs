@@ -46,7 +46,7 @@ use super::{
     NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_MEMBARRIER, NR_PIPE2, NR_PPOLL, NR_READ,
     NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY,
     NR_SCHED_SETAFFINITY, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
-    NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, O_DIRECTORY, SIGCHLD, WNOHANG,
+    NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, NR_WRITEV, O_DIRECTORY, SIGCHLD, WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
@@ -368,6 +368,36 @@ fn dispatch_write_one_to_console_returns_byte_count() {
         b"hello\r\n",
         "OPOST should expand LF to CRLF before reaching the device transport"
     );
+}
+
+/// `writev(1, iov, 2)` uses the stdout/stderr TTY fast path. The
+/// combined buffer is kernel-owned after iovec gather, so this verifies
+/// that the fast path writes those bytes directly instead of feeding a
+/// kernel pointer back through the user-buffer `write(2)` lane.
+#[test]
+fn dispatch_writev_stdout_tty_fast_path_writes_combined_buffer() {
+    let _setup = setup();
+    let ops = install_capturing_console();
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    proc_cap.set_fd(1, Some(tx_fs::devfs::open_console_for_init()));
+
+    let ctx = make_ctx(proc_cap, thread);
+    let part1: &[u8] = b"netperf ";
+    let part2: &[u8] = b"row\n";
+    let iov = [
+        part1.as_ptr() as u64,
+        part1.len() as u64,
+        part2.as_ptr() as u64,
+        part2.len() as u64,
+    ];
+    let req = SyscallRequest::new(NR_WRITEV, [1, iov.as_ptr() as u64, 2, 0, 0, 0]);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+
+    assert_eq!(result, SyscallResult::Return(12));
+    assert_eq!(ops.snapshot(), b"netperf row\r\n");
 }
 
 /// `exit_group(0)` zombifies the process at once and records

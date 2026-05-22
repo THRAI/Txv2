@@ -365,18 +365,19 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     const IOVEC_BYTES: u64 = 16;
     const MAX_RW_COUNT: u64 = 0x7fff_f000;
     let fd = args[0] as i32;
-    let stdio_tty_fast_path = (fd == 1 || fd == 2)
-        && resolve_fd(&ctx.process, fd as u32)
-            .map(|file| {
-                matches!(
-                    file.rnode().backing(),
-                    tx_subsystems::vfs::RNodeBacking::StructBacked {
-                        payload: tx_subsystems::vfs::StructPayload::Tty(_)
-                    }
-                )
-            })
-            .unwrap_or(false);
-    if stdio_tty_fast_path {
+    let stdio_tty_file = if fd == 1 || fd == 2 {
+        resolve_fd(&ctx.process, fd as u32).filter(|file| {
+            matches!(
+                file.rnode().backing(),
+                tx_subsystems::vfs::RNodeBacking::StructBacked {
+                    payload: tx_subsystems::vfs::StructPayload::Tty(_)
+                }
+            )
+        })
+    } else {
+        None
+    };
+    if let Some(file) = stdio_tty_file {
         let mut combined = alloc::vec::Vec::new();
         for i in 0..iovcnt as u64 {
             let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
@@ -409,9 +410,6 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             }
         }
 
-        let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
-            return SyscallResult::Error(EBADF_VALUE);
-        };
         if !file.flags().write {
             return SyscallResult::Error(EBADF_VALUE);
         }
@@ -473,6 +471,10 @@ async fn sys_write_kernel_bytes_to_file<'a>(
     bytes: &[u8],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
+    if bytes.is_empty() {
+        return SyscallResult::Return(0);
+    }
+
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
     use tx_subsystems::vfs::execution::OpenFileWriteOp;
@@ -489,8 +491,10 @@ async fn sys_write_kernel_bytes_to_file<'a>(
     let op = OpenFileWriteOp {
         file,
         bytes,
+        caller_netns: ctx.process.net_namespace(),
         cursor: 0,
     };
+
     match drive(
         op,
         &mut script_ctx,
@@ -501,7 +505,10 @@ async fn sys_write_kernel_bytes_to_file<'a>(
     )
     .await
     {
-        Ok(total) => SyscallResult::Return(total as i64),
+        Ok(total) => {
+            yield_after_struct_write_if_needed(file, total).await;
+            SyscallResult::Return(total as i64)
+        }
         Err(v3errno) => {
             let errno: tx_subsystems::execution::Errno = v3errno.into();
             if errno == tx_subsystems::execution::Errno::EPIPE {
