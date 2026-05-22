@@ -328,34 +328,31 @@ pub(super) const MINSIGSTKSZ: u64 = 2048;
 /// Size of the kernel `struct sigaction` exchanged via `rt_sigaction`
 /// on RV64 generic ABI.
 ///
-/// Layout decision: Linux's `arch/riscv/include/uapi/asm/signal.h`
-/// pulls in `asm-generic/signal.h`, which defines the kernel
-/// (uapi) `struct sigaction` as four 64-bit fields:
+/// Layout decision: Linux RV64 pulls in `asm-generic/signal.h` without
+/// defining `SA_RESTORER`, so the optional `sa_restorer` field is absent from
+/// the kernel-facing structure. The syscall therefore exchanges three 64-bit
+/// fields:
 ///
 /// ```text
 /// struct sigaction {
 ///     __sighandler_t  sa_handler;   // 8B
 ///     unsigned long   sa_flags;     // 8B
-///     __sigrestore_t  sa_restorer;  // 8B  (present under SA_RESTORER)
 ///     sigset_t        sa_mask;      // 8B  (single u64 bitset, sigsetsize=8)
 /// };
 /// ```
 ///
-/// So the rt_sigaction syscall takes a 32-byte buffer. The plan's
+/// So the rt_sigaction syscall takes a 24-byte buffer. The plan's
 /// "16 bytes" hint applied to the legacy `__OLD_SIGACTION` shape used
 /// by the (deprecated) `sigaction()` syscall — the modern
-/// `rt_sigaction` syscall uses the 32-byte form. We pin the modern
-/// shape because (a) Linux RV64 has no `sigaction()` syscall at all
-/// (it only ships `rt_sigaction`, NR_134) and (b) `__sa_restorer` is
-/// part of the ABI even when SA_RESTORER is unset (kernel reads all
-/// four words and ignores the restorer bits unless the flag is set).
+/// `rt_sigaction` syscall uses the 24-byte RV64 form. We pin the modern
+/// shape because Linux RV64 has no `sigaction()` syscall at all (it only ships
+/// `rt_sigaction`, NR_134), but unlike x86-64 the modern RV64 shape does not
+/// carry an in-struct restorer.
 ///
-/// Citation: linux/include/uapi/asm-generic/signal.h
-/// `struct sigaction { __sighandler_t sa_handler; unsigned long
-///  sa_flags; __ARCH_HAS_SA_RESTORER ? __sigrestore_t sa_restorer;
-///  sigset_t sa_mask; };` — RV64 enables `__ARCH_HAS_SA_RESTORER`
-/// transitively (the field is always emitted at the ABI level).
-pub(super) const SIGACTION_BYTES: usize = 32;
+/// Citation: linux/arch/riscv/include/uapi/asm/signal.h includes
+/// `asm-generic/signal.h`; there `sa_restorer` is guarded by
+/// `#ifdef SA_RESTORER`, and RV64 does not define that macro.
+pub(super) const SIGACTION_BYTES: usize = 24;
 
 /// Per-syscall context resolved by the trap-shell wrapper: the calling
 /// process / thread, the bound address space, and the bookkeeping the
