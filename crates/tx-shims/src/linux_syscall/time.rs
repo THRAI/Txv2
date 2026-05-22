@@ -4,7 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use core::mem::{offset_of, size_of};
 
 use crate::adapter::step_engine::{Cap, SpinMutex};
@@ -34,6 +34,11 @@ pub(super) struct ItimervalLayout {
     pub(super) it_interval: TimevalLayout,
     pub(super) it_value: TimevalLayout,
 }
+
+// Cooperative SIGALRM delivery can land at a syscall boundary instead of
+// inside the following blocking syscall. Keep one interrupt token so that wait
+// paths still observe the signal as `-EINTR`.
+static ITIMER_REAL_DELIVERED_INTERRUPTS: SpinMutex<BTreeSet<u32>> = SpinMutex::new(BTreeSet::new());
 
 const SIGALRM_RAW: u8 = 14;
 const RV64_SIGFRAME_ALIGN: usize = 16;
@@ -252,6 +257,18 @@ fn write_remaining_timespec(
     match bootstrap_write_user::<TimespecLayout>(aspace, rem_uaddr, rem) {
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::error_from(errno),
+    }
+}
+
+fn snapshot_itimer_real<P: TimeIf>(pid: u32) -> ItimervalLayout {
+    let now = P::read_ns();
+    let registry = ITIMER_REAL_REGISTRY.lock();
+    let Some(state) = registry.get(&pid) else {
+        return zero_itimerval();
+    };
+    ItimervalLayout {
+        interval: ns_to_timeval(state.interval_ns),
+        value: ns_to_timeval(state.deadline_ns.saturating_sub(now)),
     }
 }
 
@@ -610,6 +627,11 @@ pub(super) fn itimer_real_deadline_ns(pid: u32) -> Option<u64> {
             .and_then(|timer| (timer.deadline_ns != 0).then_some(timer.deadline_ns))
     })
 }
+
+pub(super) fn consume_itimer_real_delivered_interrupt(pid: u32) -> bool {
+    ITIMER_REAL_DELIVERED_INTERRUPTS.lock().remove(&pid)
+}
+
 pub fn maybe_deliver_itimer_signal<P: TimeIf>(
     mut ctx: UserTrapContext,
     process: &Cap<ProcessIdentity>,
@@ -635,6 +657,9 @@ pub fn maybe_deliver_itimer_signal<P: TimeIf>(
     if !delivered {
         return ctx;
     }
+    ITIMER_REAL_DELIVERED_INTERRUPTS
+        .lock()
+        .insert(process.pid.0);
 
     let Some(sig) = Signum::new(SIGALRM_RAW) else {
         return ctx;
@@ -676,6 +701,19 @@ pub fn maybe_deliver_itimer_signal<P: TimeIf>(
     if bootstrap_write_user::<CompatSignalFrame>(aspace, frame_addr as u64, frame).is_err() {
         return ctx;
     }
+    if return_pc == trampoline_pc {
+        let Ok(trampoline_range) = UserRange::containing_page(UserVirtAddr::new(trampoline_pc))
+        else {
+            return ctx;
+        };
+        if aspace
+            .pmap()
+            .protect_range(trampoline_range, Prot::new(true, true, true))
+            .is_err()
+        {
+            return ctx;
+        }
+    }
 
     ctx.pc = handler;
     ctx.regs[1] = return_pc;
@@ -710,6 +748,7 @@ const fn align_down(value: usize, align: usize) -> usize {
 #[cfg(test)]
 pub(super) fn reset_itimer_registry_for_test() {
     with_interval_timers(|timers| timers.clear());
+    ITIMER_REAL_DELIVERED_INTERRUPTS.lock().clear();
 }
 /// `nanosleep(req, rem)`. Linux RV64 generic ABI
 /// `__NR_nanosleep = 101`.

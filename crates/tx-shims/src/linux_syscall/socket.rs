@@ -929,6 +929,10 @@ pub(super) async fn sys_recvfrom<'a, P: TimeIf>(
                     wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0).await,
                     SocketWaitWake::ItimerExpired
                 ) {
+                    if recv_queued_len(&socket) > 0 {
+                        yielded_before_wait = false;
+                        continue;
+                    }
                     return SyscallResult::Error(EINTR_VALUE);
                 }
                 yielded_before_wait = false;
@@ -970,6 +974,9 @@ pub(super) async fn sys_recvfrom<'a, P: TimeIf>(
                         wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0).await,
                         SocketWaitWake::ItimerExpired
                     ) {
+                        if recv_queued_len(&socket) > 0 {
+                            continue;
+                        }
                         return SyscallResult::Error(EINTR_VALUE);
                     }
                 } else {
@@ -2647,6 +2654,9 @@ async fn wait_on_socket_or_itimer<P: TimeIf>(
     mut socket_future: wait_source::RegisteredWaitFuture,
     pid: u32,
 ) -> SocketWaitWake {
+    if super::time::consume_itimer_real_delivered_interrupt(pid) {
+        return SocketWaitWake::ItimerExpired;
+    }
     let Some(deadline_ns) = super::time::itimer_real_deadline_ns(pid) else {
         let _ = socket_future.await;
         return SocketWaitWake::SocketReady;

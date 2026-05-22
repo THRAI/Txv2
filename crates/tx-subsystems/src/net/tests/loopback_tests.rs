@@ -313,6 +313,66 @@ fn udp_loopback_wildcard_server_reply_reaches_connected_client() {
 }
 
 #[test]
+fn udp_loopback_netperf_rr_ephemeral_collision_shape() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let server = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("server udp");
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("client udp");
+
+    assert_eq!(
+        step_bind(&server, any_inet(49_152), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_bind(&client, inet(49_152), &guard),
+        StepOutcome::Err(Errno::EADDRINUSE)
+    );
+    assert_eq!(
+        step_bind(&client, inet(49_153), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_connect(&client, inet(49_152), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_udp_loopback_kernel_bytes(
+            &client,
+            None,
+            b"hello",
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(5)
+    );
+
+    let mut request = [0u8; 8];
+    let request_recv =
+        match step_recv_kernel_bytes(&server, &mut request, SendRecvFlags::empty(), &guard) {
+            StepOutcome::Done(outcome) => outcome,
+            _ => panic!("unexpected server recv outcome"),
+        };
+    assert_eq!(request_recv.bytes, 5);
+    assert_eq!(request_recv.source, Some(endpoint(49_153)));
+    assert_eq!(
+        request_recv.destination,
+        Some(IpEndpoint::new(Ipv4Address::LOOPBACK, 49_152))
+    );
+    assert_eq!(&request[..5], b"hello");
+}
+
+#[test]
 fn udp_loopback_inline_send_can_defer_delegate_poll_kick() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
