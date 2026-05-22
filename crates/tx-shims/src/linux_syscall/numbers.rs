@@ -1128,6 +1128,8 @@ pub const NR_PIDFD_SEND_SIGNAL: u64 = 424;
 /// pins `release = "6.1.0-txkernel"` so musl's runtime version probes
 /// see a Linux 2.6.16+ kernel.
 pub const NR_UNAME: u64 = 160;
+/// `sethostname(name, len)`. Linux generic ABI `__NR_sethostname = 161`.
+pub const NR_SETHOSTNAME: u64 = 161;
 /// `prlimit64(pid, resource, new_rlim, old_rlim)`. Linux RV64 generic
 /// ABI `__NR_prlimit64 = 261`.
 ///

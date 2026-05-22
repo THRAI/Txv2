@@ -4,8 +4,8 @@ use super::*;
 
 use crate::linux_syscall::{
     F_DUPFD, F_DUPFD_CLOEXEC, F_GETFL, F_SETFL, NR_FCNTL, NR_GETRANDOM, NR_KILL, NR_PRLIMIT64,
-    NR_RT_SIGRETURN, NR_TGKILL, NR_TKILL, NR_UNAME, O_RDWR, RLIMIT_AS, RLIMIT_NOFILE,
-    RLIM_INFINITY,
+    NR_RT_SIGRETURN, NR_SETHOSTNAME, NR_TGKILL, NR_TKILL, NR_UNAME, O_RDWR, RLIMIT_AS,
+    RLIMIT_NOFILE, RLIM_INFINITY,
 };
 
 const E_BADF: i32 = 9;
@@ -339,6 +339,25 @@ fn dispatch_getrandom_null_buffer_returns_neg_efault() {
     assert_eq!(r, SyscallResult::Error(E_FAULT));
 }
 
+/// Unsupported getrandom flag bits are rejected with `-EINVAL`.
+#[test]
+fn dispatch_getrandom_invalid_flags_returns_neg_einval() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let mut buf = [0u8; 8];
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_GETRANDOM,
+            [buf.as_mut_ptr() as u64, 8, 0x8000_0000, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(E_INVAL));
+}
+
 // -----------------------------------------------------------------
 // uname.
 // -----------------------------------------------------------------
@@ -430,6 +449,52 @@ fn dispatch_uname_null_buffer_returns_neg_efault() {
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Error(E_FAULT));
+}
+
+/// `sethostname(name, len)` updates the nodename observed through `uname`.
+#[test]
+fn dispatch_sethostname_updates_uname_nodename() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let name = b"ltp-smoke";
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETHOSTNAME,
+            [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(0));
+
+    let mut buf = [0u8; 6 * 65];
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_UNAME, [buf.as_mut_ptr() as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(0));
+    assert_eq!(uts_field(&buf, 1), name);
+}
+
+/// Linux rejects hostnames longer than `__NEW_UTS_LEN` (64 bytes).
+#[test]
+fn dispatch_sethostname_too_long_returns_neg_einval() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let name = [b'x'; 65];
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETHOSTNAME,
+            [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(E_INVAL));
 }
 
 // -----------------------------------------------------------------
