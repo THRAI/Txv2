@@ -118,6 +118,46 @@ fn dispatch_clone_with_clone_vm_flag_returns_child_pid() {
     }
 }
 
+/// flags = `SIGCHLD | CLONE_NEWIPC` creates a child process in a
+/// fresh IPC namespace while the rest of the namespace bundle remains
+/// shared.
+#[test]
+fn dispatch_clone_with_clone_newipc_publishes_fresh_ipc_namespace() {
+    let _setup = setup();
+    install_capturing_seam_and_reset();
+
+    let proc_cap = bootstrap();
+    let parent_nsproxy = proc_cap.nsproxy_cap().expect("parent nsproxy");
+    parent_nsproxy.ipc_ns.limits.lock().mq_maxmsg = 19;
+    let thread = first_thread(&proc_cap);
+    let _ = seed_parent_trap_context(&thread);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    const CLONE_NEWIPC: u64 = 0x08000000;
+    let req = SyscallRequest::new(NR_CLONE, [SIGCHLD | CLONE_NEWIPC, 0, 0, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    let child_pid = match result {
+        SyscallResult::Return(pid) => pid,
+        other => panic!("expected Return(pid), got {other:?}"),
+    };
+
+    let child = tx_subsystems::process::process_by_pid(tx_subsystems::process::structure::Pid(
+        child_pid as u32,
+    ))
+    .expect("child process is registered after clone");
+    let child_nsproxy = child.nsproxy_cap().expect("child nsproxy");
+    assert_ne!(parent_nsproxy.key().raw(), child_nsproxy.key().raw());
+    assert_ne!(
+        parent_nsproxy.ipc_ns.key().raw(),
+        child_nsproxy.ipc_ns.key().raw()
+    );
+    assert_eq!(
+        parent_nsproxy.pid_ns.key().raw(),
+        child_nsproxy.pid_ns.key().raw()
+    );
+    assert_eq!(child_nsproxy.ipc_ns.limits.lock().mq_maxmsg, 19);
+}
+
 /// flags = bare SIGCHLD, stack = `0x4000_0000` → success; the child's
 /// sp register is seeded with the supplied stack. Linux semantic:
 /// non-zero `newsp` means the libc `__clone` wrapper has staged the

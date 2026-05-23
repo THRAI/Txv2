@@ -103,7 +103,11 @@ fn resolve_path_at<P: PmapIf>(
     // outcome. Errno routes back through the reverse `From` bridge so
     // the existing `errno_to_i32` table stays the single source of truth.
     use StepOutcome as V3;
-    let outcome = tx_subsystems::vfs::step_walk(cwd, path, cred, &guard);
+    let outcome = if let Some(mnt_ns) = ctx.process.mount_namespace_cap() {
+        tx_subsystems::vfs::step_walk_in_mount_namespace(cwd, path, cred, &mnt_ns, &guard)
+    } else {
+        tx_subsystems::vfs::step_walk(cwd, path, cred, &guard)
+    };
     let dentry = match outcome {
         V3::Done(d) => d,
         V3::Continue { .. } | V3::Yield { .. } => {
@@ -656,6 +660,27 @@ pub(super) fn walk_from(
     let guard = step_engine::guard();
     use StepOutcome as V3;
     let outcome = step_walk(cwd, path, cred, &guard);
+    drop(guard);
+    match outcome {
+        V3::Done(d) => Ok(d),
+        V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
+        V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
+    }
+}
+
+pub(super) fn walk_from_process(
+    cwd: Cap<DEntry>,
+    path: &[u8],
+    cred: &Credential,
+    process: &Cap<ProcessIdentity>,
+) -> Result<Cap<DEntry>, i32> {
+    let guard = step_engine::guard();
+    use StepOutcome as V3;
+    let outcome = if let Some(mnt_ns) = process.mount_namespace_cap() {
+        tx_subsystems::vfs::step_walk_in_mount_namespace(cwd, path, cred, &mnt_ns, &guard)
+    } else {
+        step_walk(cwd, path, cred, &guard)
+    };
     drop(guard);
     match outcome {
         V3::Done(d) => Ok(d),

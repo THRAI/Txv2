@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine};
+use crate::linux_syscall::numbers::CLONE_NEWIPC;
 
 /// Linux raw `wait4`/`getrusage` rusage image for musl LP64:
 /// two `timeval`s plus fourteen `long` counters. musl passes the
@@ -268,10 +269,14 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     let clone_settls = (flags & CLONE_SETTLS) != 0;
     let clone_child_cleartid = (flags & CLONE_CHILD_CLEARTID) != 0;
     let clone_parent_settid = (flags & CLONE_PARENT_SETTID) != 0;
+    let clone_newipc = (flags & CLONE_NEWIPC) != 0;
 
     let allowed_mask = if clone_thread {
         // CLONE_THREAD requires CLONE_SIGHAND per Linux semantics.
         if flags & CLONE_SIGHAND == 0 {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        if clone_newipc {
             return SyscallResult::Error(EINVAL_VALUE);
         }
         SIGCHLD
@@ -288,7 +293,14 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             | CLONE_NEWCGROUP
             | CLONE_NEWUTS
     } else {
-        SIGCHLD | CLONE_SETTLS | CLONE_VM | CLONE_VFORK | CLONE_SIGHAND | CLONE_FILES | CLONE_FS
+        SIGCHLD
+            | CLONE_SETTLS
+            | CLONE_VM
+            | CLONE_VFORK
+            | CLONE_SIGHAND
+            | CLONE_FILES
+            | CLONE_FS
+            | CLONE_NEWIPC
     };
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
@@ -379,6 +391,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             parent: &ctx.process,
             clone_vm,
             clone_sighand,
+            clone_newipc,
             _pmap: core::marker::PhantomData,
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
