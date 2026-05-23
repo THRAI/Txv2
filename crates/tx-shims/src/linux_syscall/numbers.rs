@@ -21,8 +21,14 @@ pub const NR_READ: u64 = 63;
 pub const NR_WRITEV: u64 = 66;
 /// `pread64(fd, buf, count, offset)`. Linux generic ABI `__NR_pread64`.
 pub const NR_PREAD64: u64 = 67;
+/// `pwrite64(fd, buf, count, offset)`. Linux generic ABI `__NR_pwrite64`.
+pub const NR_PWRITE64: u64 = 68;
 /// `readv(fd, iov, iovcnt)`. Linux generic ABI `__NR_readv`.
 pub const NR_READV: u64 = 65;
+/// `preadv(fd, iov, iovcnt, offset)`. Linux generic ABI `__NR_preadv`.
+pub const NR_PREADV: u64 = 69;
+/// `pwritev(fd, iov, iovcnt, offset)`. Linux generic ABI `__NR_pwritev`.
+pub const NR_PWRITEV: u64 = 70;
 /// `socket(domain, type, protocol)`. Linux generic ABI `__NR_socket`.
 pub const NR_SOCKET: u64 = 198;
 /// `socketpair(domain, type, protocol, sv)`. Linux generic ABI `__NR_socketpair`.
@@ -55,6 +61,13 @@ pub const NR_ACCEPT4: u64 = 242;
 /// `__NR_sendfile64`. Copies data from `in_fd` to `out_fd` via
 /// page-level transfer without an intermediate userspace buffer.
 pub const NR_SENDFILE64: u64 = 71;
+/// `splice(fd_in, off_in, fd_out, off_out, len, flags)`. Linux generic ABI
+/// `__NR_splice`.
+pub const NR_SPLICE: u64 = 76;
+/// `fadvise64(fd, offset, len, advice)`. Linux generic ABI
+/// `__NR_fadvise64`. The current filesystem has no page-cache advice
+/// policy, so the syscall is validated and otherwise treated as a no-op.
+pub const NR_FADVISE64: u64 = 223;
 /// `sched_setscheduler(pid, policy, param)`. Linux generic uapi
 /// `__NR_sched_setscheduler = 119`. musl calls this during
 /// pthread_create to set the new thread's scheduling policy.

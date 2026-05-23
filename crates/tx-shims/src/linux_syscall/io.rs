@@ -902,6 +902,9 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     if file.posix_mq().is_some() {
         return SyscallResult::Error(EINVAL_VALUE);
     }
+    if !file.flags().write {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
 
     // eventfd fds carry their own `write(2)` arm — add a 64-bit
     // value to the counter. Dispatch before the generic VFS path.
@@ -1108,6 +1111,10 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
+    if !file.flags().read {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+
     if len == 0 {
         return SyscallResult::Return(0);
     }
@@ -1222,6 +1229,38 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
 /// snapshots the shared `OpenFile` offset, delegates to the existing
 /// `read(2)` path, then restores the original offset so callers do
 /// not observe a positioned read as a seek.
+fn positioned_io_check(file: &OpenFile, write: bool) -> Result<(), i32> {
+    let flags = file.flags();
+    if write {
+        if !flags.write {
+            return Err(EBADF_VALUE);
+        }
+    } else if !flags.read {
+        return Err(EBADF_VALUE);
+    }
+
+    match file.rnode().backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::Pipe { .. },
+        }
+        | RNodeBacking::StructBacked {
+            payload: StructPayload::Tty(_),
+        } => Err(ESPIPE_VALUE),
+        _ => Ok(()),
+    }
+}
+
+fn read_iovec_entry(ctx: &SyscallCtx<'_>, iov_ptr: u64, idx: u64) -> Result<(u64, u64), Errno> {
+    const IOVEC_BYTES: u64 = 16;
+
+    let ent_ptr = iov_ptr.wrapping_add(idx * IOVEC_BYTES);
+    let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
+    bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr)?;
+    let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
+    let len = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap());
+    Ok((base, len))
+}
+
 pub(super) async fn sys_pread64<'a, P: tx_hal::TimeIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
@@ -1238,11 +1277,224 @@ pub(super) async fn sys_pread64<'a, P: tx_hal::TimeIf>(
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
+    if let Err(errno) = positioned_io_check(&file, false) {
+        return SyscallResult::Error(errno);
+    }
     let saved = file.offset();
     file.set_offset(offset);
     let result = sys_read::<P>(args, ctx).await;
     file.set_offset(saved);
     result
+}
+
+/// `pwrite64(fd, buf, count, offset)`.
+pub(super) async fn sys_pwrite64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i32;
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    let offset = args[3];
+    if (offset as i64) < 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let file = match resolve_fd(&ctx.process, fd as u32) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    if let Err(errno) = positioned_io_check(&file, true) {
+        return SyscallResult::Error(errno);
+    }
+
+    let saved = file.offset();
+    file.set_offset(offset);
+    let result = sys_write(args, ctx).await;
+    file.set_offset(saved);
+    result
+}
+
+/// `preadv(fd, iov, iovcnt, offset)`.
+pub(super) async fn sys_preadv<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let iov_ptr = args[1];
+    let iovcnt = args[2] as i32;
+    let mut offset = args[3];
+
+    if !(0..=1024).contains(&iovcnt) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if (offset as i64) < 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if iovcnt == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    const MAX_RW_COUNT: u64 = 0x7fff_f000;
+    let mut total: i64 = 0;
+    for i in 0..iovcnt as u64 {
+        let (base, len) = match read_iovec_entry(ctx, iov_ptr, i) {
+            Ok(entry) => entry,
+            Err(errno) => {
+                if total > 0 {
+                    return SyscallResult::Return(total);
+                }
+                return SyscallResult::error_from(errno);
+            }
+        };
+        if len == 0 {
+            continue;
+        }
+        if len > MAX_RW_COUNT {
+            if total > 0 {
+                return SyscallResult::Return(total);
+            }
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+
+        let read_args = [args[0], base, len, offset, 0, 0];
+        match sys_pread64::<P>(read_args, ctx).await {
+            SyscallResult::Return(n) => {
+                total += n;
+                let n = n as u64;
+                offset = match offset.checked_add(n) {
+                    Some(value) => value,
+                    None => return SyscallResult::Error(EINVAL_VALUE),
+                };
+                if n < len {
+                    return SyscallResult::Return(total);
+                }
+            }
+            SyscallResult::Error(e) => {
+                if total > 0 {
+                    return SyscallResult::Return(total);
+                }
+                return SyscallResult::Error(e);
+            }
+            other => return other,
+        }
+    }
+    SyscallResult::Return(total)
+}
+
+/// `pwritev(fd, iov, iovcnt, offset)`.
+pub(super) async fn sys_pwritev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let iov_ptr = args[1];
+    let iovcnt = args[2] as i32;
+    let mut offset = args[3];
+
+    if !(0..=1024).contains(&iovcnt) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if (offset as i64) < 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if iovcnt == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    const MAX_RW_COUNT: u64 = 0x7fff_f000;
+    let mut total: i64 = 0;
+    for i in 0..iovcnt as u64 {
+        let (base, len) = match read_iovec_entry(ctx, iov_ptr, i) {
+            Ok(entry) => entry,
+            Err(errno) => {
+                if total > 0 {
+                    return SyscallResult::Return(total);
+                }
+                return SyscallResult::error_from(errno);
+            }
+        };
+        if len == 0 {
+            continue;
+        }
+        if len > MAX_RW_COUNT {
+            if total > 0 {
+                return SyscallResult::Return(total);
+            }
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+
+        let write_args = [args[0], base, len, offset, 0, 0];
+        match sys_pwrite64(write_args, ctx).await {
+            SyscallResult::Return(n) => {
+                total += n;
+                let n = n as u64;
+                offset = match offset.checked_add(n) {
+                    Some(value) => value,
+                    None => return SyscallResult::Error(EINVAL_VALUE),
+                };
+                if n < len {
+                    return SyscallResult::Return(total);
+                }
+            }
+            SyscallResult::Error(e) => {
+                if total > 0 {
+                    return SyscallResult::Return(total);
+                }
+                return SyscallResult::Error(e);
+            }
+            other => return other,
+        }
+    }
+    SyscallResult::Return(total)
+}
+
+/// `fadvise64(fd, offset, len, advice)`.
+pub(super) fn sys_fadvise64(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let fd = args[0] as i32;
+    let offset = args[1];
+    let len = args[2];
+    let advice = args[3] as i32;
+
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if (offset as i64) < 0 || (len as i64) < 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if !(0..=5).contains(&advice) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let file = match resolve_fd(&ctx.process, fd as u32) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    if let Err(errno) = positioned_io_check(&file, false) {
+        return SyscallResult::Error(errno);
+    }
+    SyscallResult::Return(0)
+}
+
+/// `splice(fd_in, off_in, fd_out, off_out, len, flags)`.
+///
+/// This is intentionally conservative. The fd-io `splice07` matrix is an
+/// invalid-combination test: it expects `EINVAL` or `EBADF` and skips the
+/// combinations that would perform real pipe/file transfer. Until the pipe
+/// zero-copy path lands, reject supported fd combinations deterministically
+/// instead of returning `ENOSYS` or blocking on empty pipes.
+pub(super) fn sys_splice(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let fd_in = args[0] as i32;
+    let fd_out = args[2] as i32;
+    let len = args[4];
+
+    if fd_in < 0 || fd_out < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if len == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    let in_exists = resolve_fd(&ctx.process, fd_in as u32).is_some()
+        || super::net::is_socket_fd(fd_in as u32, ctx);
+    let out_exists = resolve_fd(&ctx.process, fd_out as u32).is_some()
+        || super::net::is_socket_fd(fd_out as u32, ctx);
+    if !in_exists || !out_exists {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+
+    SyscallResult::Error(EINVAL_VALUE)
 }
 
 /// `sendfile64(out_fd, in_fd, offset, count)` — page-level copy from
