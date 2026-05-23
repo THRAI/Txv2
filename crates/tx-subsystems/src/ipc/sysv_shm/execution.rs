@@ -88,9 +88,8 @@ pub fn step_shmget(
     // Check if segment already exists for this key.
     if let Some(ref k) = ipc_key {
         let table = nsproxy.ipc_ns.sysv_shm.lock();
-        if let Some(&existing_shmid) = table.get(k) {
+        if let Some(seg) = table.get(k).cloned() {
             drop(table);
-            let seg = checks::require_shm_exists(existing_shmid)?;
             if exclusive {
                 return Err(Errno::EEXIST);
             }
@@ -100,7 +99,7 @@ pub fn step_shmget(
             }
             // Check permissions.
             checks::require_can_read_shm(&seg, cred)?;
-            return Ok(existing_shmid);
+            return Ok(seg.shmid);
         }
     }
 
@@ -110,16 +109,16 @@ pub fn step_shmget(
     }
 
     // Allocate the segment.
-    let shmid =
+    let segment =
         structure::register_shm(ipc_key, cred.clone(), size, perm, cred.euid.0, cred.egid.0)
             .map_err(|_| Errno::ENOMEM)?;
 
     // Register in the namespace's key→shmid table.
     if let Some(ref k) = ipc_key {
-        nsproxy.ipc_ns.sysv_shm.lock().insert(*k, shmid);
+        nsproxy.ipc_ns.sysv_shm.lock().insert(*k, segment.clone());
     }
 
-    Ok(shmid)
+    Ok(segment.shmid)
 }
 
 // ---------------------------------------------------------------------------
@@ -431,7 +430,7 @@ pub fn step_shmctl_in_ns(
     let result = step_shmctl(shmid, cmd, set_fields, cred)?;
     if let Some(Some(key)) = key {
         let mut table = nsproxy.ipc_ns.sysv_shm.lock();
-        if table.get(&key).copied() == Some(shmid) {
+        if table.get(&key).map(|segment| segment.shmid) == Some(shmid) {
             table.remove(&key);
         }
     }

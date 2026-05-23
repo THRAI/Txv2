@@ -9,6 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::execution::{Errno, Guard};
+use crate::mount::MountNamespace;
 use crate::vfs::adapter::step_engine::Cap;
 use crate::vfs::structure::{Credential, DEntry};
 use crate::vfs::walker;
@@ -33,6 +34,23 @@ pub fn walk_to_completion(
     mode: WalkMode,
     policy: FinalSymlinkPolicy,
     cred: &Credential,
+    guard: &Guard<'_>,
+) -> Result<PathResolution, Errno> {
+    walk_to_completion_with_mount_namespace(rooted_at, path, mode, policy, cred, None, guard)
+}
+
+/// Drive a walk from start to terminal using the supplied mount namespace.
+///
+/// When `mount_namespace` is present, mountpoint crossing consults that
+/// namespace's table only. A `None` namespace preserves the historical global
+/// mount-table fallback used by boot scaffolds and older tests.
+pub fn walk_to_completion_with_mount_namespace(
+    rooted_at: Cap<DEntry>,
+    path: &[u8],
+    mode: WalkMode,
+    policy: FinalSymlinkPolicy,
+    cred: &Credential,
+    mount_namespace: Option<&Cap<MountNamespace>>,
     guard: &Guard<'_>,
 ) -> Result<PathResolution, Errno> {
     let mount_root = walker::mount_root_dentry(&rooted_at);
@@ -106,7 +124,16 @@ pub fn walk_to_completion(
             .or_else(|| walker::mount_payload_for(&walking.mount_root, guard));
 
         let walking_state = walking.clone();
-        match kernel_step(walking, fs_ops, mount_payload, cred, mode, policy, guard) {
+        match kernel_step(
+            walking,
+            fs_ops,
+            mount_payload,
+            mount_namespace,
+            cred,
+            mode,
+            policy,
+            guard,
+        ) {
             KernelStep::Continue(next) => state = next,
             KernelStep::Error(cause) => {
                 // Capture walker failure context before returning.
@@ -200,7 +227,7 @@ pub fn resume_walker(
         let mp = walker::mount_payload_for(&w.current, guard)
             .or_else(|| walker::mount_payload_for(&w.mount_root, guard));
 
-        match kernel_step(w, fs_ops, mp, cred, mode, policy, guard) {
+        match kernel_step(w, fs_ops, mp, None, cred, mode, policy, guard) {
             KernelStep::Continue(next) => state = next,
             KernelStep::Error(cause) => return Err(classify(&cause)),
             KernelStep::NeedIO(_req, _token) => return Err(Errno::EAGAIN),

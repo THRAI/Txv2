@@ -38,6 +38,7 @@ use crate::process::adapter::wait_routing::{self, Channel, Mask, WaitSource};
 
 use crate::cred::{Cred, CredSnapshot, Gid, Uid};
 use crate::execution::WaitToken;
+use crate::ipc::sysv_sem::structure::SemUndo;
 use crate::process::topology::{
     ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers,
 };
@@ -422,6 +423,10 @@ impl ProcessIdentity {
     /// Returns `None` for zombies (no payload).
     pub fn nsproxy_cap(&self) -> Option<Cap<crate::process::nsproxy::NsProxy>> {
         self.payload.lock().as_ref().map(|p| p.nsproxy_cap())
+    }
+
+    pub fn mount_namespace_cap(&self) -> Option<Cap<crate::mount::MountNamespace>> {
+        self.nsproxy_cap()?.mnt_ns.clone()
     }
 
     /// Process short name (for `/proc/<pid>/stat`). Returns `"?"` for
@@ -1108,6 +1113,11 @@ pub struct ProcessPayload {
     /// `SpinMutex<u16>` would be heavier than necessary for a 16-bit
     /// scalar with swap semantics.
     pub(crate) umask: AtomicU16,
+    /// SysV semaphore undo records owned by this process.
+    ///
+    /// Per `docs/Txv3/08_SYSV_IPC_v1.md` §4.4 / IPC-3, `SEM_UNDO`
+    /// state is process-local and process exit drains only this list.
+    pub(crate) sem_undos: SpinMutex<BTreeMap<u32, SemUndo>>,
     /// Reactor wait source that fires when **any** child of this
     /// process zombifies (per `txdoc:PROCESS-WAIT-FAMILY-1`'s
     /// `children_state_channel` notion). Created at payload-sign time
@@ -1288,8 +1298,9 @@ impl ProcessPayload {
     /// shares the same `NsProxy` bundle; clone/unshare/setns publish
     /// a replacement via `replace_nsproxy`.
     ///
-    /// Day-1: all namespace caps point at init-namespace stubs.
-    /// `mnt_ns` is deferred (`MountNamespace` bootstrap not yet wired).
+    /// Day-1: most namespace caps point at init-namespace stubs. `mnt_ns`
+    /// is `None` until rootfs mount bootstrap publishes a concrete mount
+    /// namespace bundle.
     pub fn nsproxy_cap(&self) -> Cap<crate::process::nsproxy::NsProxy> {
         self.nsproxy
             .load()
@@ -1299,10 +1310,6 @@ impl ProcessPayload {
     /// Atomically install `new` as the current nsproxy cap and return
     /// the previously installed cap. Used by `step_clone_newipc` /
     /// `step_setns` to publish a replacement bundle.
-    #[expect(
-        dead_code,
-        reason = "txdoc:NAMESPACE-VIEW-CORE-PLACEMENT-1 — called by clone_newipc/setns (future)"
-    )]
     pub(crate) fn replace_nsproxy(
         &self,
         new: Cap<crate::process::nsproxy::NsProxy>,
@@ -1380,6 +1387,27 @@ impl ProcessPayload {
             decr_pipe_fd_ref(file);
         }
         drained
+    }
+
+    /// Merge one SysV `SEM_UNDO` adjustment vector into this process's
+    /// per-process undo list.
+    pub(crate) fn record_sem_undo(&self, semid: u32, adjustments: Vec<i16>) {
+        let mut undos = self.sem_undos.lock();
+        undos
+            .entry(semid)
+            .and_modify(|u| {
+                for (i, adj) in adjustments.iter().enumerate() {
+                    if *adj != 0 && i < u.adjustments.len() {
+                        u.adjustments[i] = u.adjustments[i].wrapping_add(*adj);
+                    }
+                }
+            })
+            .or_insert_with(|| SemUndo { semid, adjustments });
+    }
+
+    /// Drain this process's pending SysV `SEM_UNDO` records.
+    pub(crate) fn drain_sem_undos(&self) -> BTreeMap<u32, SemUndo> {
+        core::mem::take(&mut *self.sem_undos.lock())
     }
 
     /// Snapshot the entire fd table as a fresh `BTreeMap`. Each
