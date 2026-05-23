@@ -156,9 +156,38 @@ OSCOMP_OUT_LA_SMP4 ?= target/oscomp/os_serial_out_la_smp4.txt
 OSCOMP_GROUPS ?=
 OSCOMP_LIBCTEST ?=
 OSCOMP_LTP ?=
+
+# LTP local testing shortcuts:
+#
+# 1. Run the full ltp-musl image payload:
+#      make oscomp-local-rv64-ltp-musl
+#
+# 2. Run one or a few individual LTP cases:
+#      make oscomp-local-rv64 OSCOMP_LTP=umask01
+#      make oscomp-local-rv64 OSCOMP_LTP=open01,stat02
+#
+# 3. Run a Txv2 syscalls sub-batch. These batches split only
+#    /musl/ltp/runtest/syscalls by case prefix, and the guest expands the
+#    short "ltp-batch:<name>" selector from hard-coded lists in exec.rs.
+#      make ltp-batches
+#      make ltp-batch-cases LTP_BATCH=vfs
+#      make oscomp-local-rv64-ltp-batch LTP_BATCH=vfs
+#
+# 4. Run an LTP native runtest module outside syscalls. The guest receives
+#    "ltp-runtest:<module>", reads /musl/musl/ltp/runtest/<module>, and
+#    executes each original runtest command, preserving arguments.
+#      make ltp-runtests
+#      make ltp-runtest-cases LTP_RUNTEST=fs
+#      make oscomp-local-rv64-ltp-runtest LTP_RUNTEST=fs
+#
+# Add an outer timeout for exploratory runs, for example:
+#      timeout 1800s make oscomp-local-rv64-ltp-batch LTP_BATCH=vfs
+#      timeout 1800s make oscomp-local-rv64-ltp-runtest LTP_RUNTEST=fs
 LTP_BATCH ?= p0
 LTP_BATCH_TOOL ?= python3 tools/ltp-batches.py
 LTP_BATCH_REFRESH ?= --refresh
+LTP_RUNTEST ?= smoketest
+LTP_RUNTEST_TOOL ?= python3 tools/ltp-runtests.py
 COMMA := ,
 OSCOMP_LIBCTEST_GROUP = libctest-musl:$(subst $(COMMA),+,$(OSCOMP_LIBCTEST))
 OSCOMP_LTP_GROUP = $(if $(strip $(OSCOMP_LTP)),ltp-musl:$(subst $(COMMA),+,$(OSCOMP_LTP)),ltp-musl)
@@ -180,9 +209,11 @@ OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'
 	oscomp-local-la64-libctest-musl oscomp-local-la64-libctest-musl-smp4 \
 	oscomp-local-rv64-ltp-musl oscomp-local-rv64-ltp-musl-smp4 \
 	oscomp-local-la64-ltp-musl oscomp-local-la64-ltp-musl-smp4 \
-	ltp-batches ltp-batch-cases \
+	ltp-batches ltp-batch-cases ltp-runtests ltp-runtest-cases \
 	oscomp-local-rv64-ltp-batch oscomp-local-rv64-ltp-batch-smp4 \
 	oscomp-local-la64-ltp-batch oscomp-local-la64-ltp-batch-smp4 \
+	oscomp-local-rv64-ltp-runtest oscomp-local-rv64-ltp-runtest-smp4 \
+	oscomp-local-la64-ltp-runtest oscomp-local-la64-ltp-runtest-smp4 \
 	oscomp-export-testcase
 
 oscomp-submit:
@@ -302,11 +333,28 @@ oscomp-local-la64-ltp-musl:
 oscomp-local-la64-ltp-musl-smp4:
 	$(MAKE) oscomp-local-la64-smp4 OSCOMP_GROUPS=$(OSCOMP_LTP_GROUP)
 
+# LTP grouped runs:
+#
+# - ltp-batch / oscomp-local-*-ltp-batch:
+#   Txv2-maintained batches for the LTP syscalls runtest file, e.g.
+#   p0, smoke, fd-io, vfs, vm, process, cred, signal, time, ipc, event,
+#   sched, mount, heavy, aio.
+#
+# - ltp-runtest / oscomp-local-*-ltp-runtest:
+#   LTP native runtest files outside syscalls, e.g. fs, mm, smoketest,
+#   syscalls-ipc, pty, sched. This preserves each runtest line's original
+#   command and arguments.
 ltp-batches:
 	$(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --list
 
 ltp-batch-cases:
 	$(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --batch $(LTP_BATCH)
+
+ltp-runtests:
+	$(LTP_RUNTEST_TOOL) --list
+
+ltp-runtest-cases:
+	$(LTP_RUNTEST_TOOL) --module $(LTP_RUNTEST)
 
 oscomp-local-rv64-ltp-batch:
 	@cases="$$($(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --batch $(LTP_BATCH) --csv)"; \
@@ -314,6 +362,20 @@ oscomp-local-rv64-ltp-batch:
 	echo "LTP batch $(LTP_BATCH): $$count cases"; \
 	test "$$count" != 0; \
 	$(MAKE) oscomp-local-rv64 OSCOMP_GROUPS=ltp-batch:$(LTP_BATCH)
+
+oscomp-local-rv64-ltp-runtest:
+	@cases="$$($(LTP_RUNTEST_TOOL) --module $(LTP_RUNTEST) --csv)"; \
+	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
+	echo "LTP runtest $(LTP_RUNTEST): $$count entries"; \
+	test "$$count" != 0; \
+	$(MAKE) oscomp-local-rv64 OSCOMP_GROUPS=ltp-runtest:$(LTP_RUNTEST)
+
+oscomp-local-rv64-ltp-runtest-smp4:
+	@cases="$$($(LTP_RUNTEST_TOOL) --module $(LTP_RUNTEST) --csv)"; \
+	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
+	echo "LTP runtest $(LTP_RUNTEST): $$count entries"; \
+	test "$$count" != 0; \
+	$(MAKE) oscomp-local-rv64-smp4 OSCOMP_GROUPS=ltp-runtest:$(LTP_RUNTEST)
 
 oscomp-local-rv64-ltp-batch-smp4:
 	@cases="$$($(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --batch $(LTP_BATCH) --csv)"; \
@@ -328,6 +390,20 @@ oscomp-local-la64-ltp-batch:
 	echo "LTP batch $(LTP_BATCH): $$count cases"; \
 	test "$$count" != 0; \
 	$(MAKE) oscomp-local-la64 OSCOMP_GROUPS=ltp-batch:$(LTP_BATCH)
+
+oscomp-local-la64-ltp-runtest:
+	@cases="$$($(LTP_RUNTEST_TOOL) --module $(LTP_RUNTEST) --csv)"; \
+	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
+	echo "LTP runtest $(LTP_RUNTEST): $$count entries"; \
+	test "$$count" != 0; \
+	$(MAKE) oscomp-local-la64 OSCOMP_GROUPS=ltp-runtest:$(LTP_RUNTEST)
+
+oscomp-local-la64-ltp-runtest-smp4:
+	@cases="$$($(LTP_RUNTEST_TOOL) --module $(LTP_RUNTEST) --csv)"; \
+	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
+	echo "LTP runtest $(LTP_RUNTEST): $$count entries"; \
+	test "$$count" != 0; \
+	$(MAKE) oscomp-local-la64-smp4 OSCOMP_GROUPS=ltp-runtest:$(LTP_RUNTEST)
 
 oscomp-local-la64-ltp-batch-smp4:
 	@cases="$$($(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --batch $(LTP_BATCH) --csv)"; \
