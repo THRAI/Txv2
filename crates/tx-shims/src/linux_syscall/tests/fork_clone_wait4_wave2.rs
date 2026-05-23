@@ -473,3 +473,35 @@ fn dispatch_set_robust_list_returns_zero() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
 }
+
+/// `get_robust_list(0, headp, lenp)` round-trips the current thread's
+/// stored robust-list head and length.
+#[test]
+fn dispatch_get_robust_list_round_trips_current_thread_state() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread.clone());
+
+    let robust_head = [0x1111u64, 0x2222, 0x3333];
+    let robust_head_ptr = &robust_head as *const u64 as u64;
+    let req = SyscallRequest::new(NR_SET_ROBUST_LIST, [robust_head_ptr, 24, 0, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let mut out_head: u64 = 0;
+    let mut out_len: u64 = 0;
+    let out_head_ptr = &mut out_head as *mut u64 as u64;
+    let out_len_ptr = &mut out_len as *mut u64 as u64;
+    let req = SyscallRequest::new(NR_GET_ROBUST_LIST, [0, out_head_ptr, out_len_ptr, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(
+        out_head, robust_head_ptr,
+        "getter should return stored head pointer"
+    );
+    assert_eq!(
+        out_len, 24,
+        "getter should return stored robust-list length"
+    );
+}

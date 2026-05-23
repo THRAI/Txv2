@@ -263,7 +263,7 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
 
     for phdr in &phdrs {
         match phdr.p_type {
-            PT_INTERP if !is_dyn => {
+            PT_INTERP => {
                 // Extract interpreter path from ELF bytes.
                 let off = phdr.p_offset as usize;
                 let len = (phdr.p_filesz as usize).min(4096);
@@ -276,15 +276,10 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
                     interp_path = Some(path);
                 }
             }
-            PT_DYNAMIC if !is_dyn => {
+            PT_DYNAMIC => {
                 has_dynamic = true;
-                // PT_INTERP-interpreted ET_EXEC binaries may also carry
+                // PT_INTERP-interpreted binaries may also carry
                 // PT_DYNAMIC; the dynamic linker consumes that table.
-            }
-            PT_INTERP | PT_DYNAMIC => {
-                // ET_DYN static-PIE: PT_INTERP / PT_DYNAMIC present but
-                // the kernel runs the binary directly at entry + load_bias.
-                // No interpreter is loaded; the segments are silently skipped.
             }
             PT_PHDR => {
                 pt_phdr_vaddr = Some(phdr.p_vaddr);

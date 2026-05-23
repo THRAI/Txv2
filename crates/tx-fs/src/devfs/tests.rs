@@ -22,7 +22,10 @@ use tx_subsystems::vfs::{
     Credential, DirCursor, FsObjectId, FsOps, OpenFile, OpenFileFlags, RNodeBacking, StructPayload,
 };
 
-use super::{open_console_for_init, Devfs, DEVFS_ROOT_OBJECT_ID};
+use super::{
+    open_console_for_init, Devfs, DEVFS_MISC_DIR_OBJECT_ID, DEVFS_ROOT_OBJECT_ID,
+    DEVFS_RTC_OBJECT_ID,
+};
 
 fn init_tty_zones() {
     // Idempotent: `tx_subsystems::zones::register_all()` calls
@@ -201,6 +204,47 @@ fn devfs_lookup_null_materialises_char_device() {
     assert_eq!(file.step_write(b"discarded", &guard), V3Outcome::Done(9));
     assert_eq!(file.step_read(&mut out, &guard), V3Outcome::Done(0));
     assert_eq!(out, [0xaa; 4]);
+}
+
+#[test]
+fn devfs_lookup_misc_rtc_materialises_char_device() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+
+    let guard = guard();
+    let devfs = Devfs::new();
+
+    let misc_id = match <Devfs as FsOps>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"misc", &guard) {
+        V3Outcome::Done(id) => id,
+        other => panic!("devfs.lookup(misc) failed: {other:?}"),
+    };
+    assert_eq!(misc_id, DEVFS_MISC_DIR_OBJECT_ID);
+
+    let rtc_id = match <Devfs as FsOps>::lookup(&devfs, misc_id, b"rtc", &guard) {
+        V3Outcome::Done(id) => id,
+        other => panic!("devfs.lookup(misc/rtc) failed: {other:?}"),
+    };
+    assert_eq!(rtc_id, DEVFS_RTC_OBJECT_ID);
+
+    let meta = match <Devfs as FsOps>::load_inode_meta(&devfs, rtc_id, &guard) {
+        V3Outcome::Done(meta) => meta,
+        other => panic!("devfs.load_inode_meta(rtc) failed: {other:?}"),
+    };
+    assert_eq!(meta.kind(), tx_subsystems::vfs::InodeKind::CharDevice);
+
+    let mount = devfs_mount_payload();
+    let rnode = match <Devfs as FsOps>::materialise_rnode(&devfs, rtc_id, meta, &mount, &guard) {
+        V3Outcome::Done(rnode) => rnode,
+        other => panic!("devfs.materialise_rnode(rtc) failed: {other:?}"),
+    };
+    match rnode.backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::CharDevice(binding),
+        } => assert_eq!(binding.name, "rtc"),
+        other => panic!("expected StructBacked::CharDevice, got {other:?}"),
+    }
 }
 
 #[test]

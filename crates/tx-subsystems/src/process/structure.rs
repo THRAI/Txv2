@@ -217,6 +217,27 @@ impl step_engine::SubjectIdentity for ProcessIdentity {
     fn task_id_low(&self) -> u32 {
         self.pid.0
     }
+
+    fn thread_deliverable_signal_pending(thread: &Cap<Self::ThreadIdentity>) -> bool {
+        thread
+            .payload_cap()
+            .map(|payload| payload.interrupt_summary().deliverable_signal)
+            .unwrap_or(false)
+    }
+
+    fn thread_termination_in_force(thread: &Cap<Self::ThreadIdentity>) -> bool {
+        thread
+            .payload_cap()
+            .map(|payload| payload.interrupt_summary().termination)
+            .unwrap_or(true)
+    }
+
+    fn thread_stop_requested(thread: &Cap<Self::ThreadIdentity>) -> bool {
+        thread
+            .payload_cap()
+            .map(|payload| payload.interrupt_summary().stop_requested)
+            .unwrap_or(false)
+    }
 }
 
 impl ProcessIdentity {
@@ -612,19 +633,43 @@ impl ProcessIdentity {
         }
     }
 
-    /// Snapshot the current `SigDisposition` for `sig` from this
+    /// Snapshot the current `SigActionEntry` for `sig` from this
     /// process's per-process action table. Returns `None` for zombies
     /// (no payload). Used by the `rt_sigaction(2)` syscall dispatcher
-    /// to read the live disposition without going through
+    /// to read the live entry without going through
     /// `step_sigaction` (which would mutate). Per `SIGNAL_v1` §15.1.
+    pub fn sig_action_entry(
+        &self,
+        sig: crate::signal::Signum,
+    ) -> Option<crate::signal::SigActionEntry> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.sig_actions().get_entry(sig))
+    }
+
+    /// Compatibility snapshot for call sites that only care about
+    /// the disposition arm.
     pub fn sig_disposition(
         &self,
         sig: crate::signal::Signum,
     ) -> Option<crate::signal::SigDisposition> {
+        self.sig_action_entry(sig).map(|entry| entry.disposition)
+    }
+
+    /// Snapshot siginfo stored for a delivered signal.
+    pub fn siginfo_get(&self, sig: crate::signal::Signum) -> Option<crate::signal::SigInfo> {
         self.payload
             .lock()
             .as_ref()
-            .map(|p| p.sig_actions().get(sig))
+            .and_then(|p| p.siginfo_slots.get(sig))
+    }
+
+    /// Clear siginfo stored for a delivered signal.
+    pub fn siginfo_clear(&self, sig: crate::signal::Signum) {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.siginfo_slots.clear(sig);
+        }
     }
 
     /// Snapshot the program-break base for this process. Returns `0`

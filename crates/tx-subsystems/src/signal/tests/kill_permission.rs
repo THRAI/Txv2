@@ -5,7 +5,10 @@ use crate::cred::{signal_permitted, Capability, CapabilitySet, Cred, CredSnapsho
 use crate::execution::Errno;
 use crate::process::structure::{ProcessIdentity, TargetProcCred};
 use crate::signal::adapter::step_engine::Cap;
-use crate::signal::{script_kill_pgrp, script_kill_probe, script_kill_process, KillScriptOutcome};
+use crate::signal::{
+    script_kill_pgrp, script_kill_probe, script_kill_process, step_sigaction, KillScriptOutcome,
+    SigDisposition,
+};
 
 fn set_cred(proc_cap: &Cap<ProcessIdentity>, cred: Cred) {
     // PR-9 phase 5 (D5 Path A): `cred` lives in `AtomicSlot<Cap<Cred>>`.
@@ -320,7 +323,8 @@ fn script_deliver_signal_to_thread_denied_for_mismatched_uid() {
         payload.threads.nth(0).expect("leader")
     };
 
-    let outcome = script_deliver_signal(&parent, SignalTarget::Thread(leader), Signum::SIGTERM);
+    let outcome =
+        script_deliver_signal(&parent, SignalTarget::Thread(leader), Signum::SIGTERM, None);
     assert_eq!(outcome, Err(Errno::EPERM));
 
     // No post should have happened — verify the child's leader has
@@ -351,8 +355,50 @@ fn script_deliver_signal_to_thread_delivers_when_authorized() {
         payload.threads.nth(0).expect("leader")
     };
 
-    let outcome = script_deliver_signal(&parent, SignalTarget::Thread(leader), Signum::SIGTERM);
+    let outcome =
+        script_deliver_signal(&parent, SignalTarget::Thread(leader), Signum::SIGTERM, None);
     assert_eq!(outcome, Ok(KillOutcome::Delivered));
+}
+
+#[test]
+fn script_deliver_signal_to_thread_posts_to_requested_tid() {
+    use crate::process::execution::spawn_sibling_thread_for_test;
+    use crate::signal::{script_deliver_signal, KillOutcome, SignalTarget};
+
+    let _g = setup();
+    let proc = fresh_init();
+    let leader = {
+        let payload = proc.payload.lock();
+        let payload = payload.as_ref().expect("alive");
+        payload.threads.nth(0).expect("leader")
+    };
+    let sibling = spawn_sibling_thread_for_test(&proc).expect("sibling thread");
+    step_sigaction(&proc, Signum::SIGTERM, SigDisposition::Handler(0xCAFE_F00D));
+
+    let outcome = script_deliver_signal(
+        &proc,
+        SignalTarget::Thread(sibling.clone()),
+        Signum::SIGTERM,
+        None,
+    );
+    assert_eq!(outcome, Ok(KillOutcome::Delivered));
+
+    assert!(
+        !leader
+            .payload_cap()
+            .expect("leader live")
+            .pending()
+            .is_pending(Signum::SIGTERM),
+        "thread-directed delivery must not post to the leader"
+    );
+    assert!(
+        sibling
+            .payload_cap()
+            .expect("sibling live")
+            .pending()
+            .is_pending(Signum::SIGTERM),
+        "thread-directed delivery must post to the requested tid"
+    );
 }
 
 #[test]

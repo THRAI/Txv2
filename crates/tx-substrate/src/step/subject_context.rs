@@ -100,6 +100,28 @@ pub trait SubjectIdentity: 'static {
     fn task_id_low(&self) -> u32 {
         0
     }
+
+    /// Whether `thread` has a signal currently deliverable under its
+    /// active signal mask.
+    ///
+    /// This is the wait-adapt predicate from `THREAD_RUNTIME_v1` §5.3.
+    /// The substrate trait gives generic script drivers a narrow way
+    /// to ask the semantic owner for the truth-bearing interrupt
+    /// summary without depending on process/thread-runtime concrete
+    /// types. Placeholder identities report no pending interrupt.
+    fn thread_deliverable_signal_pending(_thread: &Cap<Self::ThreadIdentity>) -> bool {
+        false
+    }
+
+    /// Whether fatal termination is in force for `thread`.
+    fn thread_termination_in_force(_thread: &Cap<Self::ThreadIdentity>) -> bool {
+        false
+    }
+
+    /// Whether `thread` has a pending stop request.
+    fn thread_stop_requested(_thread: &Cap<Self::ThreadIdentity>) -> bool {
+        false
+    }
 }
 
 /// Narrow view of a credential. Exposes only what `step_v3` algebra

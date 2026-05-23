@@ -380,11 +380,34 @@ impl SignalFrameIf for Platform {
 
     fn read_signal_frame(user_sp: UserPtr<u8>) -> Result<SavedSignalFrame, FaultInfo> {
         let frame = unsafe { la64_read_user(UserPtr::<La64SignalFrame>::new(user_sp.addr()))? };
-        frame.validate(user_sp)?;
-        Ok(SavedSignalFrame {
-            saved_mask: frame.saved_mask,
-            user_context: frame.user_context,
-        })
+        decode_la64_signal_frame(user_sp, frame)
+    }
+
+    fn signal_frame_size() -> usize {
+        core::mem::size_of::<La64SignalFrame>()
+    }
+
+    fn decode_signal_frame_bytes(
+        user_sp: UserPtr<u8>,
+        bytes: &[u8],
+    ) -> Result<SavedSignalFrame, FaultInfo> {
+        if bytes.len() != core::mem::size_of::<La64SignalFrame>() {
+            return Err(FaultInfo {
+                address: VirtAddr(user_sp.addr()),
+                write: false,
+                instruction: false,
+                from_user: false,
+            });
+        }
+        let mut frame = core::mem::MaybeUninit::<La64SignalFrame>::uninit();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                frame.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of::<La64SignalFrame>(),
+            );
+            decode_la64_signal_frame(user_sp, frame.assume_init())
+        }
     }
 
     fn restore_signal_frame(mut tf: TrapFrameMut<'_>, frame: &SavedSignalFrame) {
@@ -432,6 +455,18 @@ impl SignalFrameIf for Platform {
         tf.rewind_pc(4);
     }
 }
+
+fn decode_la64_signal_frame(
+    user_sp: UserPtr<u8>,
+    frame: La64SignalFrame,
+) -> Result<SavedSignalFrame, FaultInfo> {
+    frame.validate(user_sp)?;
+    Ok(SavedSignalFrame {
+        saved_mask: frame.saved_mask,
+        user_context: frame.user_context,
+    })
+}
+
 impl FpSimdIf for Platform {
     const SUPPORTED: bool = true;
 

@@ -43,7 +43,7 @@ fn fatal_trap(cause: u64) -> UserspaceTrapInfo {
 }
 
 fn preempted_trap() -> UserspaceTrapInfo {
-    UserspaceTrapInfo::Preempted
+    UserspaceTrapInfo::TimerPreempt
 }
 
 #[test]
