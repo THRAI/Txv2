@@ -1,3 +1,162 @@
+- 2026-05-23 **Closed the five musl-facing futex gaps blocking pthread
+  condattr timeouts.** Futex wait now supports timer-backed nonzero timeouts
+  through the shared `drive()` wait-source deadline path and returns
+  `ETIMEDOUT`; timed-out waiters are removed from the exact waiter table before
+  later wakes count them. Exact futex waiters now carry bitset interest masks,
+  `FUTEX_WAKE(_BITSET)` reports actual registered waiters, `FUTEX_REQUEUE` /
+  `FUTEX_CMP_REQUEUE` move exact waiter state to the target key, and the PI
+  lock/trylock/unlock surface updates the owner word for musl probes. The
+  syscall errno catalog now includes `ETIMEDOUT = 110`, matching the Linux/musl
+  ABI.
+  **Verified:** `cargo fmt --check`; `cargo test -p tx-scripts --test drive
+  drive_yield_on_wait_source_with_deadline_returns_etimedout -- --nocapture`;
+  `cargo test -p tx-subsystems futex -- --nocapture`; `cargo test -p tx-shims
+  futex_dispatch -- --nocapture`; `cargo build -p tx-kernel-riscv64-qemu-virt
+  --target riscv64gc-unknown-none-elf`; copied the fresh kernel to
+  `target/oscomp/submit/kernel-rv`; `OSCOMP_LIBCTEST='pthread_condattr_setclock,pthread_cancel_sem_wait'
+  OSCOMP_DATA=target/oscomp/testdata OSCOMP_SUBMIT=target/oscomp/submit
+  OSCOMP_OUT_RV=target/oscomp/os_serial_out_rv_futex_five_fix_final_20260523.txt
+  make oscomp-submit-rv64 oscomp-qemu-rv64 oscomp-judge-rv64`; `cargo xtask
+  fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_futex_five_fix_final_20260523.txt --all
+  --brief` reported no scause/sepc/stval trap lines.
+  **Guest result:** static and dynamic `pthread_condattr_setclock` now print
+  `Pass!`; static `pthread_cancel_sem_wait` prints `Pass!`; dynamic
+  `pthread_cancel_sem_wait` still fails with status 255. **Next step:** debug
+  the remaining dynamic-only sem-wait cancellation failure as a loader/TLS or
+  dynamic runtime issue rather than a futex timeout gap. **Blocker:** focused
+  libctest slice is 3/4 for selected cases because dynamic
+  `pthread_cancel_sem_wait` still exits 255.
+
+- 2026-05-23 **Fixed the dynamic musl exec loader blocker for libctest
+  pthread slices.** The old pthread-slice serial showed every
+  `entry-dynamic.exe <case>` failing in `runtest.c` with `exec failed: I/O
+  error`. The exec parser now treats `ET_DYN` images with `PT_INTERP` as real
+  dynamically-linked executables instead of dropping the interpreter handoff,
+  and interpreter fallback opens resolve absolute `/lib/...` / `/musl/...`
+  paths from the namespace root rather than the caller cwd. Added parser
+  coverage for `ET_DYN + PT_INTERP + PT_DYNAMIC` and for static-PIE
+  `ET_DYN + PT_DYNAMIC` without an interpreter.
+  **Verified:** `cargo test -p tx-scripts process::exec::loader --lib`;
+  `cargo test -p tx-scripts build_initial_user_stack --lib`;
+  `cargo test -p tx-scripts exec_script_loads_minimal_elf_seeds_saved_user_context --lib`;
+  `cargo build -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`;
+  `OSCOMP_LIBCTEST='pthread_cancel,pthread_cancel_points,pthread_cond,pthread_tsd,pthread_robust_detach,pthread_cancel_sem_wait,pthread_cond_smasher,pthread_condattr_setclock' OSCOMP_DATA=target/oscomp/testdata OSCOMP_SUBMIT=target/oscomp/submit OSCOMP_OUT_RV=target/oscomp/os_serial_out_rv_dynamic_loader_verify_20260523.txt make oscomp-submit-rv64 oscomp-qemu-rv64 oscomp-judge-rv64`;
+  `cargo xtask fault-decode --target rv64-qemu --serial target/oscomp/os_serial_out_rv_dynamic_loader_verify_20260523.txt --all --brief` reported no trap lines.
+  **Next step:** continue pthread semantics from the remaining guest failures:
+  dynamic `pthread_cancel_sem_wait` exits 255, and static/dynamic
+  `pthread_condattr_setclock` time out. **Blocker:** `cargo fmt --check`
+  still reports unrelated dirty formatting drift outside the loader slice.
+
+- 2026-05-22 **Aligned the musl-facing futex contract with the current
+  dispatcher behavior and refreshed the host regression.** The old
+  `dispatch_futex_unsupported_op_returns_neg_enosys` /
+  `dispatch_futex_wake_op_returns_neg_enosys` expectations had drifted from
+  `sys_futex`: the current path already accepts `FUTEX_REQUEUE` /
+  `FUTEX_WAKE_OP` with valid user addresses and returns a best-effort wake
+  count. Updated the futex host tests to pin the current behavior, reused a
+  mapped user word helper so the tests exercise the real user-VA lane, and
+  kept the existing `FUTEX_WAIT` / `FUTEX_WAKE` checks intact.
+  **Verified:** `cargo test -p tx-kernel thread_future::tests -- --nocapture`;
+  `cargo test -p tx-shims futex_dispatch -- --nocapture`; `cargo xtask
+  progress validate`; `git diff --check`.
+  **Next step:** rerun the tailored OSComp `libctest-musl` pthread cases if we
+  want guest confirmation of the broader pthread suite, especially the
+  condition-variable and robust-list paths.
+  **Blocker:** none for the current host regression.
+
+- 2026-05-22 **Fixed the remaining static pthread_cancel_points blocker by
+  mounting tmpfs at `/dev/shm`.** The post-signal trace showed musl's
+  `shm_open("/testshm", O_RDWR|O_CREAT, 0666)` becoming
+  `openat("/dev/shm/testshm", ..., flags=0xa8842)` and failing with
+  `-EROFS` because devfs published `/dev/shm` only as a read-only synthetic
+  mountpoint. Boot now overlays that devfs node with writable tmpfs, retained in
+  `DEV_SHM_MOUNT`, matching `docs/Txv3/08_SYSV_IPC_v1.md` IPC-6 and
+  `external/musl/src/mman/shm_open.c`.
+  **Verified:** `cargo fmt --check`; `cargo test -p tx-kernel
+  init::tests::boot_wiring_mounts_writable_tmpfs_at_dev_shm_for_musl_shm_open
+  -- --nocapture`; `cargo test -p tx-kernel init::tests -- --nocapture`;
+  `cargo test -p tx-kernel thread_future::tests -- --nocapture`; `cargo test
+  -p tx-subsystems --lib signal::tests -- --nocapture`; `cargo test -p
+  tx-scripts --test drive -- --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::dispatch_rt_sigaction -- --nocapture`; `cargo test -p
+  tx-fs devfs -- --nocapture`; `cargo build -p tx-kernel-riscv64-qemu-virt
+  --target riscv64gc-unknown-none-elf`; copied the fresh non-trace kernel to
+  `target/oscomp/submit/kernel-rv`; bounded QEMU saved
+  `target/oscomp/os_serial_out_rv_pthread_cancel_devshm_20260522.txt`, selected
+  `oscomp:groups:libctest-musl`, printed `Pass!` for both
+  `entry-static.exe pthread_cancel` and `entry-static.exe
+  pthread_cancel_points`, and exited userspace with status 0. `cargo xtask
+  fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_pthread_cancel_devshm_20260522.txt --all
+  --brief` found no trap lines; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv_pthread_cancel_devshm_20260522.txt
+  target/oscomp/pthread-cancel-data` reported the two tailored pthread entries
+  passing (`2/220` overall because the image/log intentionally contains only
+  those two libctest cases).
+  **Next step:** continue the broader pthread suite at the next musl-visible
+  gaps: `get_robust_list` / full robust-list chain walking and compatible
+  `FUTEX_REQUEUE` for pthread condition-variable tests.
+  **Blocker:** none for the static `pthread_cancel` /
+  `pthread_cancel_points` blocker in this tailored OSComp run.
+  **Record:** `docs/progress/research/2026-05-22-pthread-musl-audit.md`.
+
+- 2026-05-22 **Fixed pthread signal-wake wait adaptation and mailbox binding.**
+  `drive()` now treats `MailboxEvent::SignalDelivered` as a wake hint and
+  re-reads the subject thread's `InterruptSummary`: deliverable signals still
+  abort with `EINTR`, terminal signals abort as killed, and masked signals only
+  force a retry instead of manufacturing `EINTR`. `PerHartSlotted` now binds
+  the current reactor task mailbox into the running `ThreadPayload`, so
+  `post_signal` can actually wake a syscall parked in a futex/wait-source path.
+  **Verified:** `cargo fmt --check`; `cargo test -p tx-scripts --test drive
+  -- --nocapture`; `cargo test -p tx-kernel thread_future::tests --
+  --nocapture`; `cargo test -p tx-subsystems --test v3_signal_mailbox --
+  --nocapture`; `cargo test -p tx-subsystems --test v3_signal_eligibility --
+  --nocapture`; `cargo check -p tx-scripts -p tx-kernel -p tx-substrate -p
+  tx-subsystems`; `cargo build -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`; bounded `cargo xtask oscomp qemu --target
+  rv64-qemu --data target/oscomp/pthread-cancel-data` attempt saved
+  `target/oscomp/os_serial_out_rv_pthread_cancel_waitadapt_20260522.txt`, but
+  it selected `oscomp:groups:default` and scored `0/0`; `cargo xtask
+  fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_pthread_cancel_waitadapt_20260522.txt --all
+  --brief` found no trap lines.
+  **Next step:** rebuild/rerun the dedicated OSComp `libctest-musl`
+  pthread cases, especially `pthread_cancel` and `pthread_cancel_points`, to
+  confirm the guest hang moves past signal cancellation with a correctly
+  selected libctest image.
+  **Blocker:** the guest rerun attempt did not select the tailored libctest
+  pthread group, so it is not pthread validation.
+  **Record:** `docs/progress/research/2026-05-22-pthread-musl-audit.md`.
+
+- 2026-05-22 **Fixed the audited pthread_cancel musl signal-action blockers.**
+  `rt_sigaction` now preserves the pinned RV64 musl `struct k_sigaction`
+  layout (`handler`, `flags`, `mask`, `unused`), `SigActionTable` stores full
+  `SigActionEntry` metadata, AST handler delivery carries flags/mask through
+  frame construction, handler entry updates the mask for `sa_mask`,
+  `SA_NODEFER`, `SA_ONSTACK`, and `SA_RESETHAND`, and `rt_sigreturn` restores
+  the user-edited signal frame so musl's cancellation handler can rewrite
+  `ucontext_t.uc_mcontext.MC_PC`. Thread-directed `tkill` delivery now posts to
+  the requested TID for handler-installed signals, matching musl
+  `pthread_kill`/`pthread_cancel`, and syscall numbers now match the pinned
+  RV64 header for `membarrier = 283` and `timerfd_create = 85`.
+  **Verified:** `cargo fmt --check`; `cargo test -p tx-subsystems --lib
+  signal::tests -- --nocapture`; `cargo test -p tx-kernel
+  thread_future::tests -- --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::dispatch_rt_sigaction -- --nocapture`; `cargo test -p
+  tx-shims --lib linux_syscall::tests::timerfd_dispatch -- --nocapture`;
+  `cargo check -p tx-shims -p tx-subsystems -p tx-kernel`; `cargo -q xtask
+  unit`; `cargo build -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`; `cargo xtask progress validate`; `git diff
+  --check`.
+  **Next step:** rerun the dedicated OSComp `libctest-musl` pthread cases,
+  especially `pthread_cancel` / `pthread_cancel_points`, against a rebuilt
+  guest image.
+  **Blocker:** guest OSComp was not rerun in this pass; remaining known pthread
+  gaps are `get_robust_list` / robust-list chain walking and compatible
+  `FUTEX_REQUEUE` for pthread cond tests.
+  **Record:** `docs/progress/research/2026-05-22-pthread-musl-audit.md`.
+
 - 2026-05-22 **Merged main into the Gemini OSComp/musl branch and captured the
   workflow.** Kept the in-progress merge state in
   `/Users/3y/.gemini/antigravity/worktrees/Tx/check-oscomp-status`, preserved
