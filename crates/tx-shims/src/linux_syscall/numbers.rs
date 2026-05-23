@@ -61,9 +61,14 @@ pub const NR_ACCEPT4: u64 = 242;
 /// `__NR_sendfile64`. Copies data from `in_fd` to `out_fd` via
 /// page-level transfer without an intermediate userspace buffer.
 pub const NR_SENDFILE64: u64 = 71;
+/// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)`.
+/// Linux generic ABI `__NR_copy_file_range`.
+pub const NR_COPY_FILE_RANGE: u64 = 285;
 /// `splice(fd_in, off_in, fd_out, off_out, len, flags)`. Linux generic ABI
 /// `__NR_splice`.
 pub const NR_SPLICE: u64 = 76;
+/// `readahead(fd, offset, count)`. Linux generic ABI `__NR_readahead`.
+pub const NR_READAHEAD: u64 = 213;
 /// `fadvise64(fd, offset, len, advice)`. Linux generic ABI
 /// `__NR_fadvise64`. The current filesystem has no page-cache advice
 /// policy, so the syscall is validated and otherwise treated as a no-op.
@@ -1316,11 +1321,16 @@ pub const NR_TRUNCATE: u64 = 45;
 /// Slice 8: PageBacked fds only; non-page-backed surfaces return
 /// `-EINVAL` per `step_truncate`.
 pub const NR_FTRUNCATE: u64 = 46;
+/// `NR_FALLOCATE = 47` — Linux RV64 generic ABI `__NR_fallocate`.
+pub const NR_FALLOCATE: u64 = 47;
 /// `NR_READLINKAT = 78` — Linux RV64 generic ABI `__NR_readlinkat`.
 /// Slice 8 walks the link's parent directory and calls
 /// `FsOps::lookup` + `read_link` directly so the symlink's target
 /// bytes are returned without the walker following the link.
 pub const NR_READLINKAT: u64 = 78;
+/// `NR_SYNC_FILE_RANGE = 84` — Linux RV64 generic ABI
+/// `__NR_sync_file_range`.
+pub const NR_SYNC_FILE_RANGE: u64 = 84;
 /// `NR_UTIMENSAT = 88` — Linux RV64 generic ABI `__NR_utimensat`.
 /// Slice 8 returns `-ENOSYS` (no `FsOps::set_times` hook yet); see
 /// the slice plan §"Out of scope".

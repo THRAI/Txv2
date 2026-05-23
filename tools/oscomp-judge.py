@@ -19,6 +19,62 @@ ltp_run_pat = re.compile(r"^RUN LTP CASE\s+(\S+)(?:\s+:.*)?\s*$")
 ansi_pat = re.compile(r"\x1b\[[0-9;]*m")
 ltp_status_pat = re.compile(r"\b(TPASS|TFAIL|TBROK|TCONF|TWARN):")
 
+# Older LTP tests in the 20240524 tree use the legacy `test.h` harness and
+# may print neither a Summary block nor TPASS/TFAIL detail lines.  The source
+# still declares `TST_TOTAL`, so use that as a local fallback when the runner
+# gives us only `FAIL LTP CASE <name> : <ret>`.
+legacy_ltp_points = {
+    "fallocate01": 2,
+    "fallocate02": 8,
+    "fcntl01": 1,
+    "fcntl01_64": 1,
+    "fcntl07": 4,
+    "fcntl07_64": 4,
+    "fcntl09": 2,
+    "fcntl09_64": 2,
+    "fcntl10": 2,
+    "fcntl10_64": 2,
+    "fcntl11": 1,
+    "fcntl11_64": 1,
+    "fcntl14": 1,
+    "fcntl14_64": 1,
+    "fcntl16": 1,
+    "fcntl16_64": 1,
+    "fcntl17": 1,
+    "fcntl17_64": 1,
+    "fcntl18": 1,
+    "fcntl18_64": 1,
+    "fcntl19": 1,
+    "fcntl19_64": 1,
+    "fcntl20": 1,
+    "fcntl20_64": 1,
+    "fcntl21": 1,
+    "fcntl21_64": 1,
+    "fcntl22": 1,
+    "fcntl22_64": 1,
+    "fcntl23": 1,
+    "fcntl23_64": 1,
+    "fcntl24": 1,
+    "fcntl24_64": 1,
+    "fcntl25": 1,
+    "fcntl25_64": 1,
+    "fcntl26": 1,
+    "fcntl26_64": 1,
+    "fcntl31": 5,
+    "fcntl31_64": 5,
+    "fcntl32": 9,
+    "fcntl32_64": 9,
+    "fdatasync01": 1,
+    "fdatasync02": 2,
+    "pipe04": 1,
+    "pipe05": 1,
+    "pipe09": 1,
+    "sockioctl01": 8,
+    "writev02": 1,
+    "writev05": 1,
+    "writev06": 1,
+}
+
 
 def parse_ltp_detail_counts(group_lines):
     """Parse per-assertion LTP results from serial output.
@@ -84,23 +140,31 @@ def adapt_ltp_detail_counts(group, group_lines, data):
     if not group.startswith("ltp-"):
         return data
 
-    detail_counts, _ = parse_ltp_detail_counts(group_lines)
+    detail_counts, ret_by_case = parse_ltp_detail_counts(group_lines)
 
     patched = []
     for item in data:
         name = item.get("name")
         counts = detail_counts.get(name)
-        if item.get("all", 0) == 0 and counts:
-            total = sum(counts.values())
-            if total > 0:
+        detail_total = sum(counts.values()) if counts else 0
+        if item.get("all", 0) == 0 and detail_total > 0:
+            item = dict(item)
+            item["pass"] = counts["passed"]
+            item["all"] = detail_total
+            item["score"] = counts["passed"]
+            item["failed"] = counts["failed"]
+            item["broken"] = counts["broken"]
+            item["skipped"] = counts["skipped"]
+            item["warnings"] = counts["warnings"]
+        elif item.get("all", 0) == 0 and name in legacy_ltp_points:
+            total = legacy_ltp_points[name]
+            ret = ret_by_case.get(name)
+            if ret is not None:
                 item = dict(item)
-                item["pass"] = counts["passed"]
+                item["pass"] = total if ret == 0 else 0
                 item["all"] = total
-                item["score"] = counts["passed"]
-                item["failed"] = counts["failed"]
-                item["broken"] = counts["broken"]
-                item["skipped"] = counts["skipped"]
-                item["warnings"] = counts["warnings"]
+                item["score"] = item["pass"]
+                item["legacy_ret"] = ret
         patched.append(item)
     return patched
 

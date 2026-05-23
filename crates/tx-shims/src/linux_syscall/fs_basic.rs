@@ -431,6 +431,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // O_APPEND / O_CLOEXEC thread through to OpenFileFlags. O_NONBLOCK
     // is accepted but ignored (no blocking state on OpenFile yet).
     let (want_read, want_write) = decode_access_mode(flags);
+    let want_path_only = flags & 0o10000000 != 0;
     let want_append = flags & O_APPEND != 0;
     let want_cloexec = flags & O_CLOEXEC != 0;
     let want_create = flags & O_CREAT != 0;
@@ -439,8 +440,8 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // O_NONBLOCK and other unrecognised bits: silently dropped.
 
     let open_flags = OpenFileFlags {
-        read: want_read,
-        write: want_write,
+        read: want_read && !want_path_only,
+        write: want_write && !want_path_only,
         append: want_append,
         cloexec: want_cloexec,
         nonblocking: flags & O_NONBLOCK != 0,
@@ -2130,6 +2131,73 @@ pub(super) async fn sys_fstatfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
 pub(super) async fn sys_sync<P: PmapIf>(_args: [u64; 6], _ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     SyscallResult::Return(0)
+}
+
+/// `readahead(fd, offset, count)`. Linux RV64 generic ABI
+/// `__NR_readahead = 213`.
+///
+/// The current page cache has no prefetch policy hook, so this syscall is a
+/// validation-only no-op for regular PageBacked files.
+pub(super) fn sys_readahead(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let fd = args[0] as i32;
+    let offset = args[1] as i64;
+
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if offset < 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let file = match resolve_fd(&ctx.process, fd as u32) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    if !file.flags().read {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    let OpenFileBacking::Rnode { rnode } = file.backing() else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    match rnode.backing() {
+        RNodeBacking::PageBacked { .. } => SyscallResult::Return(0),
+        _ => SyscallResult::Error(EINVAL_VALUE),
+    }
+}
+
+/// `sync_file_range(fd, offset, nbytes, flags)`. Linux RV64 generic ABI
+/// `__NR_sync_file_range = 84`.
+///
+/// Treats range sync as a no-op after Linux-compatible validation. This
+/// unblocks LTP error-path tests without claiming device writeback support.
+pub(super) fn sys_sync_file_range(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    const SYNC_FILE_RANGE_WAIT_BEFORE: u64 = 0x1;
+    const SYNC_FILE_RANGE_WRITE: u64 = 0x2;
+    const SYNC_FILE_RANGE_WAIT_AFTER: u64 = 0x4;
+    const SYNC_FILE_RANGE_VALID: u64 =
+        SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER;
+
+    let fd = args[0] as i32;
+    let offset = args[1] as i64;
+    let nbytes = args[2] as i64;
+    let flags = args[3];
+
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if offset < 0 || nbytes < 0 || (flags & !SYNC_FILE_RANGE_VALID) != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let file = match resolve_fd(&ctx.process, fd as u32) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let OpenFileBacking::Rnode { rnode } = file.backing() else {
+        return SyscallResult::Error(ESPIPE_VALUE);
+    };
+    match rnode.backing() {
+        RNodeBacking::PageBacked { .. } => SyscallResult::Return(0),
+        _ => SyscallResult::Error(ESPIPE_VALUE),
+    }
 }
 
 /// `syncfs(fd)`. Linux RV64 ABI `__NR_syncfs = 267`.
