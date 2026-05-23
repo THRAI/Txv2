@@ -1,3 +1,28 @@
+- 2026-05-23 **Fixed the current dynamic libctest sidecar-DSO segfault
+  symptom.** The fresh focused run showed `entry-dynamic.exe dlopen` and
+  `entry-dynamic.exe tls_get_new_dtv` crashing in userspace after their
+  sidecar `./*.so` probes failed from the default `/musl/musl` cwd. The
+  generated libctest command now runs only those two dynamic cases from
+  `lib/` while preserving judge-compatible `START entry-dynamic.exe ...` /
+  `END entry-dynamic.exe ...` markers, so the sidecar DSOs are found without
+  mutating the ext4 image at runtime. This avoids the earlier probe's
+  `cp lib/*.so .` path, which changed the failure from `ENOENT` to `ENOEXEC`
+  through the immature ext4 write path.
+  **Verified:** `cargo fmt --check`; `cargo build -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`;
+  `OSCOMP_LIBCTEST='dynamic:dlopen,dynamic:tls_get_new_dtv'
+  OSCOMP_DATA=target/oscomp/testdata OSCOMP_SUBMIT=target/oscomp/submit
+  OSCOMP_OUT_RV=target/oscomp/os_serial_out_rv_segcheck_cwdlib2_20260523.txt
+  make oscomp-submit-rv64 oscomp-qemu-rv64 oscomp-judge-rv64`; `cargo xtask
+  fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_segcheck_cwdlib2_20260523.txt --all --brief`
+  reported no scause/sepc/stval trap lines. **Guest result:** dynamic
+  `dlopen` and `tls_get_new_dtv` both print `Pass!` with no
+  `Segmentation fault` / `user-segv` markers in the saved serial.
+  **Next step:** return to the remaining pthread blocker:
+  dynamic `pthread_cancel_sem_wait` still exits 255 in the focused futex run.
+  **Blocker:** none for the sidecar-DSO segfault pair.
+
 - 2026-05-23 **Closed the five musl-facing futex gaps blocking pthread
   condattr timeouts.** Futex wait now supports timer-backed nonzero timeouts
   through the shared `drive()` wait-source deadline path and returns

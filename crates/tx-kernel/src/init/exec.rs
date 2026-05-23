@@ -911,6 +911,8 @@ fn append_filtered_libctest_case(cmd: &mut alloc::string::String, entry: &str, c
 
     if libctest_case_missing_from_sdcard(entry, case) {
         append_synthetic_libctest_pass(cmd, entry, case);
+    } else if entry == "entry-dynamic.exe" && libctest_case_needs_cwd_dso(case) {
+        append_dynamic_libctest_cwd_dso_case(cmd, case);
     } else {
         let _ = write!(cmd, "; ./runtest.exe -w {entry} {case}");
     }
@@ -938,6 +940,24 @@ fn append_full_libctest(cmd: &mut alloc::string::String) {
     let _ = write!(
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\""
+    );
+}
+
+fn append_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"========== START entry-dynamic.exe {case} ==========\""
+    );
+    let _ = write!(cmd, "; (cd lib && ../entry-dynamic.exe {case})");
+    let _ = write!(
+        cmd,
+        "; r=$?; if [ $r -eq 0 ]; then ./busybox echo \"Pass!\"; else ./busybox echo \"FAIL {case} [status $r]\"; fi"
+    );
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"========== END entry-dynamic.exe {case} ==========\""
     );
 }
 
@@ -1053,6 +1073,10 @@ fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
 
 fn is_libctest_musl_group(group: &str) -> bool {
     matches!(group, "libctest" | "libctest-musl")
+}
+
+fn libctest_case_needs_cwd_dso(case: &str) -> bool {
+    matches!(case, "dlopen" | "tls_get_new_dtv")
 }
 
 const LIBCTEST_STATIC_SAFE_CASES: &str =
