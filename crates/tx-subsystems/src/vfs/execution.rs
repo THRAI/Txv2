@@ -353,7 +353,7 @@ impl OpenFile {
                 crate::page_backed::step_read_to_kernel(pc, self, out, guard)
             }
             RNodeBacking::Symlink { .. } => StepOutcome::Err(Errno::ENOSYS),
-            RNodeBacking::Projected => {
+            RNodeBacking::Projected { .. } => {
                 let rnode = self.rnode();
                 let off = self.offset();
                 match rnode
@@ -442,7 +442,7 @@ impl OpenFile {
                 | StructPayload::Pipe { .. } => return StepOutcome::Err(Errno::ESPIPE),
             },
             RNodeBacking::Directory => return StepOutcome::Err(Errno::EISDIR),
-            RNodeBacking::Symlink { .. } | RNodeBacking::Projected => {
+            RNodeBacking::Symlink { .. } | RNodeBacking::Projected { .. } => {
                 return StepOutcome::Err(Errno::ENOSYS)
             }
             RNodeBacking::PageBacked { .. } => {}
@@ -539,7 +539,7 @@ impl OpenFile {
                 crate::page_backed::step_write_from_kernel(pc, self, bytes, guard)
             }
             RNodeBacking::Symlink { .. } => StepOutcome::Err(Errno::ENOSYS),
-            RNodeBacking::Projected => {
+            RNodeBacking::Projected { .. } => {
                 let rnode = self.rnode();
                 let off = self.offset();
                 match rnode
@@ -608,7 +608,7 @@ impl OpenFile {
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             RNodeBacking::PageBacked { .. }
             | RNodeBacking::Symlink { .. }
-            | RNodeBacking::Projected => StepOutcome::Err(Errno::ENOSYS),
+            | RNodeBacking::Projected { .. } => StepOutcome::Err(Errno::ENOSYS),
         }
     }
 }

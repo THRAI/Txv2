@@ -70,6 +70,8 @@ pub enum Errno {
     ESPIPE,
     ESRCH,
     ESTALE,
+    /// Wait deadline expired. Linux value: 110.
+    ETIMEDOUT,
 }
 
 /// Bridge `execution::Errno` into `step_v3::Errno`. The two enums
@@ -113,6 +115,7 @@ impl From<Errno> for crate::adapter::step_engine::V3Errno {
             Errno::ESPIPE => Self::ESPIPE,
             Errno::ESRCH => Self::ESRCH,
             Errno::ESTALE => Self::ESTALE,
+            Errno::ETIMEDOUT => Self::ETIMEDOUT,
         }
     }
 }
@@ -160,6 +163,7 @@ impl From<crate::adapter::step_engine::V3Errno> for Errno {
             V3::ESPIPE => Errno::ESPIPE,
             V3::ESRCH => Errno::ESRCH,
             V3::ESTALE => Errno::ESTALE,
+            V3::ETIMEDOUT => Errno::ETIMEDOUT,
         }
     }
 }
@@ -212,7 +216,8 @@ mod tests {
         // `step_v3::Errno` + the From impl) fails to compile or this
         // test fails immediately.
         use crate::adapter::step_engine::V3Errno as V3;
-        let table: [(Errno, V3); 28] = [
+        let table: [(Errno, V3); 30] = [
+            (Errno::E2BIG, V3::E2BIG),
             (Errno::EACCES, V3::EACCES),
             (Errno::EAGAIN, V3::EAGAIN),
             (Errno::EBADF, V3::EBADF),
@@ -242,8 +247,9 @@ mod tests {
             (Errno::ESPIPE, V3::ESPIPE),
             (Errno::ESRCH, V3::ESRCH),
             (Errno::ESTALE, V3::ESTALE),
+            (Errno::ETIMEDOUT, V3::ETIMEDOUT),
         ];
-        assert_eq!(table.len(), 28);
+        assert_eq!(table.len(), 30);
         for (v4, expected_v3) in table {
             let mapped: V3 = v4.into();
             assert_eq!(

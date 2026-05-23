@@ -72,8 +72,8 @@ use tx_subsystems::process::{
 };
 use tx_subsystems::reactor_submit;
 use tx_subsystems::signal::{
-    DeliverSignalOp, KillProcessOp, SigDisposition, SigDispositionChange, SigactionOp, SignalMask,
-    Signum,
+    DeliverSignalOp, KillProcessOp, SaFlags, SigActionEntry, SigDisposition, SigDispositionChange,
+    SigactionOp, SignalMask, Signum,
 };
 use tx_subsystems::thread_runtime::execution::{SigmaskHow, SigprocmaskChange};
 use tx_subsystems::thread_runtime::{SigprocmaskOp, ThreadExitOp, ThreadKillOp};
@@ -1014,6 +1014,7 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
         Errno::ESPIPE => 29,
         Errno::ESRCH => 3,
         Errno::ESTALE => 116,
+        Errno::ETIMEDOUT => 110,
         Errno::EINTR => 4,
     }
 }

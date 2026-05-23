@@ -37,6 +37,7 @@ use crate::adapter::wake::{
     agent_event_matches, ActiveWait, MailboxEvent, TaskMailbox, TimerGuardRole, TimerWheel,
 };
 use alloc::sync::{Arc, Weak};
+use core::sync::atomic::{AtomicBool, Ordering};
 use tx_observe::encode::{
     drive_begin_tag, drive_end_tag, encode_drive_begin, encode_drive_end, encode_resume,
     encode_step_outcome, encode_yield_begin, resume_tag, step_outcome_tag, yield_begin_tag,
@@ -146,8 +147,16 @@ where
                         let yield_span =
                             emit_yield_begin(drive_span, ctx.task_id_low(), shape_kind);
 
-                        let (resume, wait_gen) =
-                            resolve_yield(&shape, mailbox, delegate_registry, timer_wheel).await;
+                        let interrupt_state = InterruptView::<I>::from_ctx(ctx);
+                        let (resume, wait_gen) = resolve_yield(
+                            &shape,
+                            mailbox,
+                            delegate_registry,
+                            timer_wheel,
+                            ctx.deadline(),
+                            interrupt_state,
+                        )
+                        .await;
 
                         // L3: resume instant + yield span close. The
                         // `wait_gen` returned by `resolve_yield` matches
@@ -170,6 +179,19 @@ where
                         }
                         match op.apply_resume(resume) {
                             Ok(()) => {}
+                            Err(errno)
+                                if matches!(
+                                    resume,
+                                    ResumeOutcome::Aborted(AbortReason::TimedOut)
+                                ) =>
+                            {
+                                let errno = if errno == Errno::EINVAL {
+                                    Errno::ETIMEDOUT
+                                } else {
+                                    errno
+                                };
+                                break 'drive Err(errno);
+                            }
                             Err(_) => break 'drive Err(Errno::EIO),
                         }
                         iteration = iteration.saturating_add(1);
@@ -436,6 +458,39 @@ fn resume_wire_fields(resume: &ResumeOutcome) -> (u8, u8) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct InterruptView<'a, I: SubjectIdentity> {
+    thread: Option<&'a crate::adapter::step_engine::Cap<I::ThreadIdentity>>,
+}
+
+impl<'a, I: SubjectIdentity> InterruptView<'a, I> {
+    fn from_ctx(ctx: &'a ScriptCtx<I>) -> Self {
+        Self {
+            thread: ctx.subject().and_then(|subject| subject.thread()),
+        }
+    }
+
+    fn classify_signal_wake(&self) -> SignalWake {
+        let Some(thread) = self.thread else {
+            return SignalWake::Interrupt;
+        };
+        if I::thread_termination_in_force(thread) {
+            SignalWake::Kill
+        } else if I::thread_deliverable_signal_pending(thread) {
+            SignalWake::Interrupt
+        } else {
+            SignalWake::Retry
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SignalWake {
+    Retry,
+    Interrupt,
+    Kill,
+}
+
 /// Resolve a yield shape. Returns the [`ResumeOutcome`] to pass to
 /// [`StepOp::apply_resume`] paired with the `WaitGeneration::raw()` the
 /// resolver minted on this task's mailbox (`0` when no parking happened
@@ -455,19 +510,37 @@ fn resume_wire_fields(resume: &ResumeOutcome) -> (u8, u8) {
 /// `OnAgent`/`OnTimer` return `Retry` immediately (the step will
 /// re-poll and the caller's `DriveMode` will translate repeated
 /// yields appropriately).
-async fn resolve_yield(
+async fn resolve_yield<I: SubjectIdentity>(
     shape: &YieldShape,
     mailbox: Option<&Arc<TaskMailbox>>,
     delegate_registry: Option<&DelegateRegistry>,
     timer_wheel: Option<&TimerWheel>,
+    deadline: Option<Deadline>,
+    interrupt_state: InterruptView<'_, I>,
 ) -> (ResumeOutcome, u64) {
     match shape {
         YieldShape::OnWaitSource { source, interests } => {
-            resolve_on_wait_source(*source, *interests, mailbox).await
+            resolve_on_wait_source(
+                *source,
+                *interests,
+                mailbox,
+                timer_wheel,
+                deadline,
+                interrupt_state,
+            )
+            .await
         }
 
         YieldShape::OnEdge { source, interests } => {
-            resolve_on_wait_source(*source, *interests, mailbox).await
+            resolve_on_wait_source(
+                *source,
+                *interests,
+                mailbox,
+                timer_wheel,
+                deadline,
+                interrupt_state,
+            )
+            .await
         }
 
         YieldShape::OnAgent {
@@ -489,6 +562,7 @@ async fn resolve_yield(
                 mailbox,
                 delegate_registry,
                 timer_wheel,
+                interrupt_state,
             )
             .await;
             (outcome, 0)
@@ -497,7 +571,8 @@ async fn resolve_yield(
         YieldShape::OnTimer { token, deadline } => {
             // `OnTimer` parks on the timer wheel via a `TimerToken`; the
             // wheel's token-id is the matching discriminant on the wire.
-            let outcome = resolve_on_timer(*token, *deadline, mailbox, timer_wheel).await;
+            let outcome =
+                resolve_on_timer(*token, *deadline, mailbox, timer_wheel, interrupt_state).await;
             (outcome, 0)
         }
     }
@@ -507,10 +582,13 @@ async fn resolve_yield(
 // OnWaitSource resolution
 // ---------------------------------------------------------------------------
 
-async fn resolve_on_wait_source(
+async fn resolve_on_wait_source<I: SubjectIdentity>(
     source: crate::adapter::step_engine::WaitSourceId,
     interests: crate::adapter::step_engine::InterestMask,
     mailbox: Option<&Arc<TaskMailbox>>,
+    timer_wheel: Option<&TimerWheel>,
+    deadline: Option<Deadline>,
+    interrupt_state: InterruptView<'_, I>,
 ) -> (ResumeOutcome, u64) {
     if let Some(mbox) = mailbox {
         let gen = mbox.next_generation();
@@ -523,8 +601,36 @@ async fn resolve_on_wait_source(
         let sub_id = ws
             .as_ref()
             .map(|ws| ws.register(Arc::downgrade(mbox), gen, interests));
+        let timeout_guard = match (timer_wheel, deadline) {
+            (Some(tw), Some(deadline)) if deadline != Deadline::NEVER => Some(tw.install_for_task(
+                deadline,
+                TimerGuardRole::PrimarySleep,
+                Arc::downgrade(mbox),
+            )),
+            _ => None,
+        };
+        let timeout_token = timeout_guard.as_ref().map(|guard| guard.token());
+        let timed_out = AtomicBool::new(false);
 
-        let interrupted = await_mailbox_event(mbox, |event| active.matches(event)).await;
+        let wake = await_mailbox_event(
+            mbox,
+            |event| {
+                if active.matches(event) {
+                    return true;
+                }
+                if matches!(
+                    (event, timeout_token),
+                    (MailboxEvent::TimerFired { token: fired }, Some(expected))
+                        if *fired == expected
+                ) {
+                    timed_out.store(true, Ordering::Release);
+                    return true;
+                }
+                false
+            },
+            interrupt_state,
+        )
+        .await;
 
         // Clean up the WaitSource subscription now that we're awake.
         if let (Some(ws), Some(id)) = (&ws, sub_id) {
@@ -535,8 +641,17 @@ async fn resolve_on_wait_source(
         // minted is still the right discriminant for the flow id — the
         // wake came from the interruptible-signal path, which fires
         // through the same mailbox with the same generation tag.
-        if interrupted {
-            return (ResumeOutcome::Aborted(AbortReason::Interrupted), gen.raw());
+        match wake {
+            MailboxWake::Signal(SignalWake::Interrupt) => {
+                return (ResumeOutcome::Aborted(AbortReason::Interrupted), gen.raw());
+            }
+            MailboxWake::Signal(SignalWake::Kill) => {
+                return (ResumeOutcome::Aborted(AbortReason::Killed), gen.raw());
+            }
+            MailboxWake::Matched if timed_out.load(Ordering::Acquire) => {
+                return (ResumeOutcome::Aborted(AbortReason::TimedOut), gen.raw());
+            }
+            MailboxWake::Signal(SignalWake::Retry) | MailboxWake::Matched => {}
         }
         (ResumeOutcome::Retry, gen.raw())
     } else {
@@ -566,6 +681,7 @@ async fn resolve_on_agent(
     mailbox: Option<&Arc<TaskMailbox>>,
     delegate_registry: Option<&DelegateRegistry>,
     timer_wheel: Option<&TimerWheel>,
+    interrupt_state: InterruptView<'_, impl SubjectIdentity>,
 ) -> ResumeOutcome {
     let Some(registry) = delegate_registry else {
         return ResumeOutcome::Retry;
@@ -602,12 +718,22 @@ async fn resolve_on_agent(
 
     // Park on mailbox until the agent replies or the request is aborted.
     let token_id = _guard.id();
-    let interrupted =
-        await_mailbox_event(mbox, move |event| agent_event_matches(event, token_id)).await;
+    let wake = await_mailbox_event(
+        mbox,
+        move |event| agent_event_matches(event, token_id),
+        interrupt_state,
+    )
+    .await;
 
     // D9-A: signal interrupt during blocked wait.
-    if interrupted {
-        return ResumeOutcome::Aborted(AbortReason::Interrupted);
+    match wake {
+        MailboxWake::Signal(SignalWake::Interrupt) => {
+            return ResumeOutcome::Aborted(AbortReason::Interrupted);
+        }
+        MailboxWake::Signal(SignalWake::Kill) => {
+            return ResumeOutcome::Aborted(AbortReason::Killed);
+        }
+        MailboxWake::Signal(SignalWake::Retry) | MailboxWake::Matched => {}
     }
 
     // Extract the reply.
@@ -630,6 +756,7 @@ async fn resolve_on_timer(
     deadline: Deadline,
     mailbox: Option<&Arc<TaskMailbox>>,
     timer_wheel: Option<&TimerWheel>,
+    interrupt_state: InterruptView<'_, impl SubjectIdentity>,
 ) -> ResumeOutcome {
     let Some(tw) = timer_wheel else {
         return ResumeOutcome::Retry;
@@ -658,15 +785,25 @@ async fn resolve_on_timer(
 
     // Park on mailbox until the reactor's timer-tick fires the
     // wheel and posts a TimerFired event for our token.
-    let interrupted = await_mailbox_event(mbox, |event| match event {
-        MailboxEvent::TimerFired { token: fired } => *fired == timer_token,
-        _ => false,
-    })
+    let wake = await_mailbox_event(
+        mbox,
+        |event| match event {
+            MailboxEvent::TimerFired { token: fired } => *fired == timer_token,
+            _ => false,
+        },
+        interrupt_state,
+    )
     .await;
 
     // D9-A: signal interrupt during blocked wait.
-    if interrupted {
-        return ResumeOutcome::Aborted(AbortReason::Interrupted);
+    match wake {
+        MailboxWake::Signal(SignalWake::Interrupt) => {
+            return ResumeOutcome::Aborted(AbortReason::Interrupted);
+        }
+        MailboxWake::Signal(SignalWake::Kill) => {
+            return ResumeOutcome::Aborted(AbortReason::Killed);
+        }
+        MailboxWake::Signal(SignalWake::Retry) | MailboxWake::Matched => {}
     }
 
     ResumeOutcome::TimerExpired(token)
@@ -676,55 +813,74 @@ async fn resolve_on_timer(
 // Mailbox parking primitive
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MailboxWake {
+    Matched,
+    Signal(SignalWake),
+}
+
 /// Park the current task on `mailbox` until `predicate` matches an
-/// incoming event.  Spurious wakes are consumed and the task re-parks.
+/// incoming event. Spurious wakes are consumed and the task re-parks.
 ///
-/// Returns `true` if the wake was caused by a
-/// [`MailboxEvent::SignalDelivered`] (D9-A signal interrupt);
-/// `false` if the predicate matched normally.
-///
-/// When a `SignalDelivered` is encountered, the future returns
-/// immediately with `Ready(true)` after consuming the event. The
-/// event is only a wake hint; the truth-bearing state lives in the
-/// thread's pending-signal queue / `InterruptSummary`. Re-posting the
-/// hint makes the next `drive()` call consume the same event again and
-/// can turn one delivered signal into an endless `EINTR` loop.
-async fn await_mailbox_event<F>(mailbox: &TaskMailbox, predicate: F) -> bool
+/// A [`MailboxEvent::SignalDelivered`] is a wake hint, not truth. On
+/// signal hints this future consults the thread interrupt summary via
+/// `InterruptView`: deliverable signals interrupt, terminal signals
+/// kill the wait, and masked/non-deliverable hints only force a retry.
+async fn await_mailbox_event<F, I>(
+    mailbox: &TaskMailbox,
+    predicate: F,
+    interrupt_state: InterruptView<'_, I>,
+) -> MailboxWake
 where
     F: Fn(&MailboxEvent) -> bool,
+    I: SubjectIdentity,
 {
     use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll};
 
-    struct MailboxFuture<'a, F> {
+    struct MailboxFuture<'a, F, I: SubjectIdentity> {
         mailbox: &'a TaskMailbox,
         predicate: F,
+        interrupt_state: InterruptView<'a, I>,
     }
 
-    impl<'a, F: Fn(&MailboxEvent) -> bool> Future for MailboxFuture<'a, F> {
-        type Output = bool;
+    impl<'a, F, I> Future for MailboxFuture<'a, F, I>
+    where
+        F: Fn(&MailboxEvent) -> bool,
+        I: SubjectIdentity,
+    {
+        type Output = MailboxWake;
 
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<MailboxWake> {
             self.mailbox.register_waker(cx.waker().clone());
             while let Some(event) = self.mailbox.poll() {
-                // D9-A: SignalDelivered interrupts blocked waits.
                 if matches!(event, MailboxEvent::SignalDelivered { .. }) {
                     self.mailbox.clear_waker();
-                    return Poll::Ready(true);
+                    return Poll::Ready(MailboxWake::Signal(
+                        self.interrupt_state.classify_signal_wake(),
+                    ));
                 }
                 if (self.predicate)(&event) {
                     self.mailbox.clear_waker();
-                    return Poll::Ready(false);
+                    return Poll::Ready(MailboxWake::Matched);
                 }
             }
             Poll::Pending
         }
     }
 
-    impl<'a, F> Drop for MailboxFuture<'a, F> {
+    impl<'a, F, I> Drop for MailboxFuture<'a, F, I>
+    where
+        I: SubjectIdentity,
+    {
         fn drop(&mut self) {}
     }
 
-    MailboxFuture { mailbox, predicate }.await
+    MailboxFuture {
+        mailbox,
+        predicate,
+        interrupt_state,
+    }
+    .await
 }

@@ -41,9 +41,10 @@ use tx_subsystems::zones;
 use super::{
     dispatch, SyscallCtx, SyscallResult, EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_SETFD,
     NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPGRP,
-    NR_GETPID, NR_GETPPID, NR_GETSID, NR_PIPE2, NR_PPOLL, NR_READ, NR_RT_SIGACTION,
-    NR_RT_SIGPROCMASK, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SETPGID, NR_SETSID,
-    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_WAIT4, NR_WRITE, SIGCHLD, WNOHANG,
+    NR_GETPID, NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_MEMBARRIER, NR_PIPE2, NR_PPOLL,
+    NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY,
+    NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_TIMERFD_CREATE, NR_WAIT4,
+    NR_WRITE, SIGCHLD, WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
@@ -773,7 +774,7 @@ fn dispatch_rt_sigaction_install_then_query_round_trip() {
     let ctx = make_ctx(proc_cap.clone(), thread);
 
     const HANDLER_ADDR: u64 = 0xCAFE_F00D_DEAD_BEEFu64;
-    let act: [u64; 4] = [HANDLER_ADDR, 0, 0, 0]; // handler/flags/restorer/mask
+    let act: [u64; 4] = [HANDLER_ADDR, 0, 0, 0]; // handler/flags/mask/unused
     let mut oldact: [u64; 4] = [0xDEADu64; 4];
 
     // Install: oldact reports prev (Default == 0).
@@ -813,6 +814,77 @@ fn dispatch_rt_sigaction_install_then_query_round_trip() {
     );
 }
 
+/// musl's pthread cancellation handler is installed with
+/// `SA_SIGINFO | SA_RESTART | SA_ONSTACK` and a full mask. The kernel
+/// rt_sigaction ABI must preserve those words when queried back; losing
+/// them means AST delivery cannot distinguish the 3-argument handler
+/// shape or compute the handler-entry mask.
+#[test]
+fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    const HANDLER_ADDR: u64 = 0xCAFE_F00D_DEAD_BEEFu64;
+    const SA_SIGINFO: u64 = 4;
+    const SA_ONSTACK: u64 = 0x0800_0000;
+    const SA_RESTART: u64 = 0x1000_0000;
+    const FLAGS: u64 = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+    const MASK: u64 = u64::MAX;
+    const UNUSED: u64 = 0x4444_5555_6666_7777;
+
+    let act: [u64; 4] = [HANDLER_ADDR, FLAGS, MASK, UNUSED];
+    let mut oldact: [u64; 4] = [0xDEADu64; 4];
+
+    let r1 = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_RT_SIGACTION,
+            [
+                33, // musl-internal SIGCANCEL
+                act.as_ptr() as u64,
+                oldact.as_mut_ptr() as u64,
+                8,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r1, SyscallResult::Return(0));
+    assert_eq!(oldact, [0, 0, 0, 0]);
+
+    let mut observed: [u64; 4] = [0xDEADu64; 4];
+    let r2 = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_RT_SIGACTION,
+            [33, 0, observed.as_mut_ptr() as u64, 8, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r2, SyscallResult::Return(0));
+    assert_eq!(observed[0], HANDLER_ADDR);
+    assert_eq!(observed[1], FLAGS);
+    assert_eq!(
+        observed[2] & tx_subsystems::signal::Signum::SIGKILL.bit(),
+        0,
+        "kernel SignalMask must strip uncatchable bits"
+    );
+    assert_eq!(
+        observed[2] & tx_subsystems::signal::Signum::SIGSTOP.bit(),
+        0,
+        "kernel SignalMask must strip uncatchable bits"
+    );
+    assert_ne!(
+        observed[2] & tx_subsystems::signal::Signum::SIGTERM.bit(),
+        0
+    );
+    assert_eq!(
+        observed[3], UNUSED,
+        "RV64 musl has no SA_RESTORER, so the last word is ABI-unused"
+    );
+}
+
 /// `rt_sigaction` with `sigsetsize != 8` is rejected with `-EINVAL`
 /// per Linux generic ABI / `SIGNAL_v1` §15.1.
 #[test]
@@ -827,6 +899,23 @@ fn dispatch_rt_sigaction_rejects_wrong_sigsetsize() {
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Error(22));
+}
+
+/// The pinned musl riscv64 syscall header defines `__NR_membarrier`
+/// as 283. This is observed by pthread/TLS initialization, so the
+/// exported syscall number must match the submodule header.
+#[test]
+fn rv64_membarrier_number_matches_pinned_musl_header() {
+    assert_eq!(NR_MEMBARRIER, 283);
+}
+
+/// The pinned musl riscv64 syscall header defines
+/// `__NR_timerfd_create` as 85. This must not collide with
+/// `membarrier(283)`, or dispatch will route timerfd calls to the
+/// wrong syscall arm.
+#[test]
+fn rv64_timerfd_create_number_matches_pinned_musl_header() {
+    assert_eq!(NR_TIMERFD_CREATE, 85);
 }
 
 // ---------------------------------------------------------------------------

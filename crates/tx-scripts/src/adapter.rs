@@ -17,7 +17,8 @@ pub mod step_engine {
         AcceptOutcome, AgentCancelPolicy, ByteProgress, Deadline, DelegateEndpoint,
         DelegateRequest, DelegateToken, DriveMode, Errno, InterestMask, NoProgress,
         ProcessIdentity, ResumeOutcome, ScriptCtx, StepOp, StepOutcome, StepProgress,
-        SubjectIdentity, TimerId, Translation, WaitSourceId, YieldShape,
+        SubjectAuthority, SubjectContext, SubjectIdentity, TimerId, Translation, WaitSourceId,
+        YieldShape,
     };
     pub use tx_substrate::zone::{
         register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
@@ -36,9 +37,24 @@ pub mod step_engine {
 )]
 pub mod wake {
     pub use tx_substrate::wake::timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
-    pub use tx_substrate::wake::wait_source::lookup_source;
+    pub use tx_substrate::wake::wait_source::{
+        lookup_source, register_source, unregister_source, WaitSource,
+    };
     pub use tx_substrate::wake::{
-        agent_event_matches, ActiveWait, MailboxEvent, TaskMailbox, WaitGeneration,
+        agent_event_matches, ActiveWait, MailboxEvent, SignalRouting, TaskMailbox, WaitGeneration,
+    };
+}
+
+#[platform_adapter(
+    platform = "substrate",
+    domain = "vfs_exec",
+    apis = ["zone"],
+    reason = "expose VFS structure roles consumed by the tx-scripts exec script and its in-crate fixtures"
+)]
+pub mod vfs_exec {
+    pub use tx_subsystems::vfs::structure::{
+        Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta,
+        OpenFile, OpenFileFlags, RNode, RNodeBacking, S_IFDIR, S_IFREG,
     };
 }
 

@@ -76,6 +76,8 @@ impl MountFlags {
     pub const READ_ONLY: Self = Self(1 << 0);
     pub const NO_ATIME: Self = Self(1 << 1);
     pub const NOSUID: Self = Self(1 << 2);
+    pub const NODEV: Self = Self(1 << 3);
+    pub const NOEXEC: Self = Self(1 << 4);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -87,6 +89,10 @@ impl MountFlags {
 
     pub const fn contains(self, flag: Self) -> bool {
         (self.0 & flag.0) != 0
+    }
+
+    pub const fn union(self, flag: Self) -> Self {
+        Self(self.0 | flag.0)
     }
 }
 
@@ -385,11 +391,18 @@ impl MountNamespace {
     pub fn umount(&self, target: &Cap<DEntry>, pp: &Cap<MountPayload>) -> Result<(), Errno> {
         let ptr = cap_payload_ptr(pp);
         let id = target.rnode().fs_object_id();
+        let target_rnode_cap_addr = cap_raw_addr(target.rnode());
         let mut t = self.mounts.lock();
-        if let Some(i) = t
+        let pos = t
             .iter()
             .position(|e| e.parent_payload_ptr == ptr && e.child_fs_object_id == id)
-        {
+            .or_else(|| {
+                t.iter().position(|e| {
+                    let root = e.mount.root();
+                    cap_raw_addr(root) == target_rnode_cap_addr || root.fs_object_id() == id
+                })
+            });
+        if let Some(i) = pos {
             t.remove(i);
             Ok(())
         } else {

@@ -30,7 +30,7 @@ use tx_hal::{
 /// surface.
 const TEST_PAGE_SIZE: usize = 4096;
 
-use crate::init::{console_tty, dev_mount, root_mount, CoreInit};
+use crate::init::{console_tty, dev_mount, dev_shm_mount, root_mount, CoreInit};
 
 use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, StepOutcome};
 /// Serialise every test in this module against the rest of tx-kernel's
@@ -308,8 +308,8 @@ fn drive_boot_wiring() {
     CoreInit::<TestPlatform>::mount_rootfs_from_boot_media();
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
     CoreInit::<TestPlatform>::register_devfs_console_alias();
-    CoreInit::<TestPlatform>::mount_bdevfs_at_dev_block();
     CoreInit::<TestPlatform>::mount_tmpfs_at_dev_shm();
+    CoreInit::<TestPlatform>::mount_bdevfs_at_dev_block();
     CoreInit::<TestPlatform>::bind_init_cwd_and_root();
 }
 
@@ -466,11 +466,11 @@ fn boot_smoke_walker_resolves_dev_block_after_bdevfs_mount() {
     );
 }
 
-/// `/dev/shm` must resolve to a writable tmpfs mount root, not the
-/// read-only devfs stub. LTP creates temporary files here during its
-/// common setup; resolving to devfs would surface as `EROFS`.
+/// POSIX shm (`shm_open`) and named semaphores (`sem_open`) are libc
+/// path operations over `/dev/shm`; the kernel side must therefore
+/// publish a tmpfs mount over devfs's synthetic `/dev/shm` directory.
 #[test]
-fn boot_smoke_walker_resolves_dev_shm_after_tmpfs_mount() {
+fn boot_smoke_walker_resolves_dev_shm_to_tmpfs_mount() {
     use tx_subsystems::vfs::{walker, Credential, RNodeBacking};
 
     let _serial = setup();
@@ -480,25 +480,157 @@ fn boot_smoke_walker_resolves_dev_shm_after_tmpfs_mount() {
         .expect("INIT_PROCESS must be populated post-bootstrap");
     let cwd = init.cwd().expect("init cwd must be bound");
     let cred = Credential::root();
-    let guard = guard();
+    let walk_guard = guard();
     use step_engine::StepOutcome as V3;
-    let outcome = walker::step_walk(cwd, b"/dev/shm", &cred, &guard);
-    drop(guard);
+    let outcome = walker::step_walk(cwd, b"/dev/shm", &cred, &walk_guard);
+    drop(walk_guard);
 
     let dentry = match outcome {
         V3::Done(d) => d,
-        other => panic!("step_walk(/dev/shm) must succeed after tmpfs mount, got {other:?}"),
+        other => panic!("step_walk(/dev/shm) must succeed after shm tmpfs mount, got {other:?}"),
     };
 
     assert_eq!(
         dentry.rnode().fs_object_id(),
         tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
-        "/dev/shm must resolve to the mounted tmpfs root, not devfs's synthetic stub"
+        "/dev/shm must resolve to the tmpfs root, not devfs's mountpoint stub"
     );
     assert!(
         matches!(dentry.rnode().backing(), RNodeBacking::Directory),
         "/dev/shm is a Directory"
     );
+    let payload_guard = guard();
+    let payload = dentry
+        .rnode()
+        .containing_mount_weak()
+        .expect("/dev/shm tmpfs root has containing_mount")
+        .upgrade(&payload_guard)
+        .expect("/dev/shm tmpfs payload is retained");
+    assert_eq!(payload.fstype, "tmpfs");
+    drop(payload_guard);
+}
+
+#[test]
+fn boot_smoke_dev_shm_accepts_posix_shm_and_named_sem_files() {
+    use tx_subsystems::vfs::{walker, Credential, RNodeBacking};
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let cwd = init.cwd().expect("init cwd must be bound");
+    let cred = Credential::root();
+
+    let walk_guard = guard();
+    use step_engine::StepOutcome as V3;
+    let shm_dir = match walker::step_walk(cwd.clone(), b"/dev/shm", &cred, &walk_guard) {
+        V3::Done(d) => d,
+        other => panic!("step_walk(/dev/shm) must succeed after tmpfs mount, got {other:?}"),
+    };
+    drop(walk_guard);
+
+    let payload_guard = guard();
+    let payload = shm_dir
+        .rnode()
+        .containing_mount_weak()
+        .expect("/dev/shm has containing_mount")
+        .upgrade(&payload_guard)
+        .expect("/dev/shm tmpfs payload is retained");
+    let fs_ops = payload.fs_ops.clone();
+    drop(payload_guard);
+
+    for name in [b"tx-posix-shm".as_slice(), b"sem.tx-posix-sem".as_slice()] {
+        let create_guard = guard();
+        match fs_ops.create_inode(
+            shm_dir.rnode().fs_object_id(),
+            name,
+            0o600,
+            &cred,
+            &create_guard,
+        ) {
+            V3::Done(_) => {
+                shm_dir.remove_cached_child_by_name(name);
+            }
+            other => panic!("create_inode(/dev/shm/{:?}) failed: {other:?}", name),
+        }
+        drop(create_guard);
+
+        let path = match name {
+            b"tx-posix-shm" => b"/dev/shm/tx-posix-shm".as_slice(),
+            b"sem.tx-posix-sem" => b"/dev/shm/sem.tx-posix-sem".as_slice(),
+            _ => unreachable!(),
+        };
+        let verify_guard = guard();
+        let file = match walker::step_walk(cwd.clone(), path, &cred, &verify_guard) {
+            V3::Done(d) => d,
+            other => panic!(
+                "step_walk({:?}) must resolve tmpfs file, got {other:?}",
+                path
+            ),
+        };
+        drop(verify_guard);
+
+        assert!(
+            matches!(file.rnode().backing(), RNodeBacking::PageBacked { .. }),
+            "{:?} must resolve as a tmpfs page-backed regular file",
+            path
+        );
+    }
+}
+
+#[test]
+fn boot_wiring_mounts_writable_tmpfs_at_dev_shm_for_musl_shm_open() {
+    use tx_shims::linux_syscall::{
+        dispatch, SyscallCtx, SyscallResult, AT_FDCWD, NR_OPENAT, O_CLOEXEC, O_CREAT, O_NONBLOCK,
+        O_RDWR,
+    };
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    let dev_shm = dev_shm_mount().expect("DEV_SHM_MOUNT must be populated");
+    assert_eq!(
+        dev_shm
+            .payload_cap()
+            .expect("/dev/shm payload alive")
+            .into_cap()
+            .fstype,
+        "tmpfs"
+    );
+    assert_eq!(
+        dev_shm.root().fs_object_id(),
+        tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID
+    );
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let leader = init
+        .nth_thread(0)
+        .expect("init has a leader thread post-bootstrap");
+    let aspace = init.aspace_cap().expect("init aspace must be alive");
+    let ctx = SyscallCtx::new(init, leader, aspace);
+
+    let path = b"/dev/shm/testshm\0";
+    const O_LARGEFILE: u32 = 0o100000;
+    const O_NOFOLLOW: u32 = 0o400000;
+    let flags = O_RDWR | O_CREAT | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW | O_LARGEFILE;
+    let req = crate::adapter::boot_runtime::userspace::SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            flags as u64,
+            0o666,
+            0,
+            0,
+        ],
+    );
+
+    match block_on(dispatch::<TestPlatform>(req, &ctx)) {
+        SyscallResult::Return(fd) => assert!(fd >= 0, "openat returned a valid fd"),
+        other => panic!("musl shm_open path must create under /dev/shm, got {other:?}"),
+    }
 }
 
 #[test]

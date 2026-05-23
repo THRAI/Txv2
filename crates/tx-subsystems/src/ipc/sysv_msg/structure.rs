@@ -150,7 +150,7 @@ pub(crate) fn register_msg(
     cgid: u32,
     max_bytes: usize,
     max_msg_size: usize,
-) -> Result<u32, ZoneError> {
+) -> Result<Cap<MsgQueueIdentity>, ZoneError> {
     use crate::process::adapter::step_engine::sign;
     let msqid = NEXT_MSGID.fetch_add(1, Ordering::Relaxed);
 
@@ -184,18 +184,14 @@ pub(crate) fn register_msg(
         recv_source_id,
     })?;
     *identity.payload.lock() = Some(PayloadCap::from_cap(payload));
-    MSG_TABLE.lock().insert(msqid, identity);
-    Ok(msqid)
+    MSG_TABLE.lock().insert(msqid, identity.clone());
+    Ok(identity)
 }
 
 pub(crate) fn withdraw_msg(msqid: u32) -> Option<Cap<MsgQueueIdentity>> {
     MSG_TABLE.lock().remove(&msqid)
 }
 
-#[expect(
-    dead_code,
-    reason = "txdoc:IPC-V1-MSG-1 — consumed by procfs projection when wired"
-)]
 pub(crate) fn all_msg_queues() -> Vec<Cap<MsgQueueIdentity>> {
     MSG_TABLE.lock().values().cloned().collect()
 }

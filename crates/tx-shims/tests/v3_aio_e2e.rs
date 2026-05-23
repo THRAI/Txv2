@@ -68,7 +68,7 @@ use std::sync::{LazyLock, Mutex};
 
 use tx_hal::{
     Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
-    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, UserPtr, VirtAddr,
 };
 use tx_shims::adapter::reactor_entry::SyscallRequest;
 use tx_shims::adapter::step_engine::{
@@ -87,7 +87,10 @@ use tx_subsystems::vfs::structure::{
     FsObjectId, InodeKind, InodeMeta, OpenFileFlags, RNode, RNodeBacking,
 };
 use tx_subsystems::vfs::OpenFile;
-use tx_subsystems::vm::{AddressSpace, USER_PAGE_SIZE};
+use tx_subsystems::vm::{
+    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags,
+    VmMapRequest, USER_PAGE_SIZE,
+};
 use tx_subsystems::zones;
 
 use tx_shims::linux_syscall::aio::{reset_worker_registry_for_test, take_worker_future_for_test};
@@ -329,37 +332,71 @@ fn encode_iocb(
     buf
 }
 
-#[allow(clippy::vec_box)] // stable per-element heap addresses; Vec growth must not invalidate
-fn stage_iocb_array(iocbs: &[[u8; 64]]) -> (u64, alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>>) {
-    let mut heap_iocbs: alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>> =
-        iocbs.iter().map(|b| alloc::boxed::Box::new(*b)).collect();
-    let mut pointers: alloc::vec::Vec<u64> = heap_iocbs
-        .iter_mut()
-        .map(|b| b.as_mut_ptr() as u64)
-        .collect();
-    let iocbpp_ptr = pointers.as_mut_ptr() as u64;
-    let _leak = alloc::boxed::Box::leak(pointers.into_boxed_slice());
-    (iocbpp_ptr, heap_iocbs)
+const USER_AIO_IOCBPP: usize = 0x5200_0000;
+const USER_AIO_EVENTS: usize = 0x5200_2000;
+const USER_AIO_BUFFER: usize = 0x5200_3000;
+
+fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
+
+fn map_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, len: usize) {
+    let len = align_up(len.max(1), USER_PAGE_SIZE);
+    let range = UserRange::new_aligned(UserVirtAddr(uaddr), len).expect("aligned user range");
+    let request = VmMapRequest::fixed(
+        range,
+        MapPlacement::FixedReplace,
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    ctx.aspace.try_mmap(request).expect("mmap anon for aio e2e");
+}
+
+fn copy_to_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, bytes: &[u8]) {
+    let guard = zone::guard();
+    let copied = ctx
+        .aspace
+        .copy_to_user(UserPtr::<u8>::new(uaddr), bytes, &guard);
+    drop(guard);
+    assert_eq!(copied, zone::StepOutcome::Done(bytes.len()));
+}
+
+fn copy_from_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, out: &mut [u8]) {
+    let guard = zone::guard();
+    let copied = ctx
+        .aspace
+        .copy_from_user(out, UserPtr::<u8>::new(uaddr), &guard);
+    drop(guard);
+    assert_eq!(copied, zone::StepOutcome::Done(out.len()));
+}
+
+fn stage_iocb_array(ctx: &SyscallCtx<'_>, base: usize, iocbs: &[[u8; 64]]) -> u64 {
+    let pointer_bytes_len = iocbs.len() * core::mem::size_of::<u64>();
+    let iocb_base = base + USER_PAGE_SIZE;
+    map_user_bytes(ctx, base, pointer_bytes_len);
+    map_user_bytes(ctx, iocb_base, iocbs.len() * 64);
+
+    let mut pointer_bytes = alloc::vec![0u8; pointer_bytes_len];
+    for (i, iocb) in iocbs.iter().enumerate() {
+        let iocb_addr = iocb_base + i * 64;
+        pointer_bytes[i * 8..(i + 1) * 8].copy_from_slice(&(iocb_addr as u64).to_le_bytes());
+        copy_to_user_bytes(ctx, iocb_addr, iocb);
+    }
+    copy_to_user_bytes(ctx, base, &pointer_bytes);
+    base as u64
 }
 
 /// Heap-allocate a buffer large enough for `n` `struct io_event` records
-/// (32 bytes each) and return the raw pointer; leak it for the test's
-/// lifetime so the user-VA write stays valid across the syscall.
-fn stage_events_buffer(n: usize) -> u64 {
-    let buf: alloc::boxed::Box<[u8]> = alloc::vec![0u8; n * 32].into_boxed_slice();
-    let leak = alloc::boxed::Box::leak(buf);
-    leak.as_mut_ptr() as u64
+/// (32 bytes each) in the process address space.
+fn stage_events_buffer(ctx: &SyscallCtx<'_>, uaddr: usize, n: usize) -> u64 {
+    map_user_bytes(ctx, uaddr, n * 32);
+    uaddr as u64
 }
 
-/// Heap-allocate `len` zeroed bytes and return `(uaddr, slice_ref)` —
-/// the slice is leaked so the address stays valid for the test. We
-/// hold the leaked slice through `Box::leak` and access it post-syscall
-/// to verify byte-equality with the file's known content.
-fn stage_user_buffer(len: usize) -> (u64, &'static mut [u8]) {
-    let buf: alloc::boxed::Box<[u8]> = alloc::vec![0u8; len].into_boxed_slice();
-    let leak: &'static mut [u8] = alloc::boxed::Box::leak(buf);
-    let uaddr = leak.as_mut_ptr() as u64;
-    (uaddr, leak)
+fn stage_user_buffer(ctx: &SyscallCtx<'_>, uaddr: usize, len: usize) -> u64 {
+    map_user_bytes(ctx, uaddr, len);
+    uaddr as u64
 }
 
 fn pump_worker_until<F>(mut worker: AioWorkerFuture, mut done: F, budget: u32) -> AioWorkerFuture
@@ -430,12 +467,11 @@ fn aio_pread_e2e_round_trip_against_tmpfs_file() {
 
     let worker = take_worker_future_for_test(aio.context_id()).expect("worker stashed by io_setup");
 
-    // 3. Build and submit the PREAD iocb. The user buffer is a leaked
-    //    heap allocation; its raw pointer doubles as the user-VA the
-    //    dispatcher would `bootstrap_copy_to_user` into on a successful
-    //    read path.
+    // 3. Build and submit the PREAD iocb. The user buffer and iocb
+    //    array are mapped into the process address space so the
+    //    dispatcher exercises the canonical user-VA copy path.
     let user_len: usize = 32;
-    let (user_buf_addr, user_buf_view) = stage_user_buffer(user_len);
+    let user_buf_addr = stage_user_buffer(&ctx, USER_AIO_BUFFER, user_len);
     let cookie: u64 = 0xCAFE_FEED_DEAD_BEEF;
     let iocb = encode_iocb(
         cookie,
@@ -445,7 +481,7 @@ fn aio_pread_e2e_round_trip_against_tmpfs_file() {
         user_len as u64,
         0, /* offset */
     );
-    let (iocbpp, _ka) = stage_iocb_array(&[iocb]);
+    let iocbpp = stage_iocb_array(&ctx, USER_AIO_IOCBPP, &[iocb]);
 
     let submit_r = dispatch_call(
         &ctx,
@@ -464,7 +500,7 @@ fn aio_pread_e2e_round_trip_against_tmpfs_file() {
     assert_eq!(aio.completion_len(), 1, "exactly one completion landed");
 
     // 5. io_getevents → drain the completion.
-    let events_ptr = stage_events_buffer(2);
+    let events_ptr = stage_events_buffer(&ctx, USER_AIO_EVENTS, 2);
     // timeout = 1 (any non-zero) means "non-blocking" in this canary's
     // semantic; the completion has already landed so blocking-vs-not
     // does not matter functionally.
@@ -491,7 +527,8 @@ fn aio_pread_e2e_round_trip_against_tmpfs_file() {
     //        byte count from the seeded file content (W-KK closed the
     //        PageBacked seam 2026-05-12).
     //    (d) `res2 == 0` for non-vectored PREAD.
-    let event_bytes = unsafe { core::slice::from_raw_parts(events_ptr as *const u8, 32) };
+    let mut event_bytes = [0u8; 32];
+    copy_from_user_bytes(&ctx, events_ptr as usize, &mut event_bytes);
     let data = u64::from_le_bytes(event_bytes[0..8].try_into().unwrap());
     let obj = u64::from_le_bytes(event_bytes[8..16].try_into().unwrap());
     let res = i64::from_le_bytes(event_bytes[16..24].try_into().unwrap());
@@ -508,6 +545,8 @@ fn aio_pread_e2e_round_trip_against_tmpfs_file() {
     // dispatcher copied into P's address space via
     // `bootstrap_copy_to_user`. Compare against the seeded file
     // content to pin the full PREAD round-trip.
+    let mut user_buf_view = alloc::vec![0u8; user_len];
+    copy_from_user_bytes(&ctx, user_buf_addr as usize, &mut user_buf_view);
     assert_eq!(
         &user_buf_view[..],
         &file_content[..],
@@ -572,9 +611,9 @@ fn aio_e2e_mid_flight_destroy_cancels_worker() {
         .clone();
     let mut worker = take_worker_future_for_test(aio.context_id()).expect("worker stashed");
 
-    let (user_buf_addr, _user_buf_view) = stage_user_buffer(32);
+    let user_buf_addr = stage_user_buffer(&ctx, USER_AIO_BUFFER, 32);
     let iocb = encode_iocb(0xBEEF, IOCB_CMD_PREAD, file_fd, user_buf_addr, 32, 0);
-    let (iocbpp, _ka) = stage_iocb_array(&[iocb]);
+    let iocbpp = stage_iocb_array(&ctx, USER_AIO_IOCBPP, &[iocb]);
     let r = dispatch_call(
         &ctx,
         SyscallRequest::new(NR_IO_SUBMIT, [aio_fd as u64, 1, iocbpp, 0, 0, 0]),

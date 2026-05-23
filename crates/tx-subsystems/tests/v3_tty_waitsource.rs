@@ -254,6 +254,11 @@ fn tty_wait_source_invariants_round_trip() {
     // the hangup transition itself.
     let mailbox_hangup = Arc::new(TaskMailbox::new());
     let (_reg_guard_hangup, _gen_hangup) = register(&tty_source, &mailbox_hangup, TTY_READABLE);
+    // Because tty_source was previously notified, registering a new mailbox
+    // immediately receives the pending event due to the WaitSource pending mask.
+    // Drain it first so we can check for any new notifications from the hangup transition.
+    assert_eq!(mailbox_hangup.len(), 1);
+    let _ = mailbox_hangup.poll();
     assert!(mailbox_hangup.is_empty());
 
     let guard = ebr_guard();

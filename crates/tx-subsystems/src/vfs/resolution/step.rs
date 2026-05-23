@@ -14,7 +14,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::execution::Guard;
-use crate::mount::MountPayload;
+use crate::mount::{MountNamespace, MountPayload};
 use crate::vfs::adapter::step_engine::{self, Cap, StepOutcome};
 use crate::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_ISVTX,
@@ -28,6 +28,18 @@ use super::state::{
 };
 use super::terminal;
 
+#[derive(Clone, Copy)]
+pub struct TerminalRules {
+    mode: WalkMode,
+    policy: FinalSymlinkPolicy,
+}
+
+impl TerminalRules {
+    pub fn new(mode: WalkMode, policy: FinalSymlinkPolicy) -> Self {
+        Self { mode, policy }
+    }
+}
+
 /// Advance the walker one component.
 ///
 /// Reads the current `WalkingState`, the caller-supplied `mode` and
@@ -39,9 +51,9 @@ pub fn kernel_step(
     walking: WalkingState,
     fs_ops: Arc<dyn FsOps>,
     mount_payload: Option<Cap<MountPayload>>,
+    mount_namespace: Option<&Cap<MountNamespace>>,
     cred: &Credential,
-    mode: WalkMode,
-    policy: FinalSymlinkPolicy,
+    rules: TerminalRules,
     guard: &Guard<'_>,
 ) -> KernelStep {
     let WalkingState {
@@ -71,7 +83,7 @@ pub fn kernel_step(
             fs_object_id,
             meta,
         };
-        if terminal::accepts(&WalkState::Terminal(resolved.clone()), mode) {
+        if terminal::accepts(&WalkState::Terminal(resolved.clone()), rules.mode) {
             return KernelStep::Continue(WalkState::Terminal(resolved));
         }
         return KernelStep::Error(WalkCause::ComponentNotFound);
@@ -277,7 +289,7 @@ pub fn kernel_step(
     if let RNodeBacking::Symlink { target } = child_rnode_cap.backing() {
         // NoFollow: if this is the final component and the caller
         // asked us not to follow, return the symlink as terminal.
-        if policy == FinalSymlinkPolicy::NoFollow && remaining.is_empty() {
+        if rules.policy == FinalSymlinkPolicy::NoFollow && remaining.is_empty() {
             let rnode = child_rnode_cap.clone();
             let meta = child_meta;
             let fs_object_id = rnode.fs_object_id();
@@ -338,9 +350,17 @@ pub fn kernel_step(
     let crossing_mount = child_dentry.mounted_hint().and_then(|w| w.upgrade(guard));
     let crossing_mount = match crossing_mount {
         Some(m) => Some(m),
-        None => mount_payload
-            .as_ref()
-            .and_then(|payload| crate::mount::mount_for(payload, child_fs_object_id)),
+        None => mount_payload.as_ref().and_then(|payload| {
+            mount_namespace
+                .and_then(|ns| ns.mount_for(payload, child_fs_object_id))
+                .or_else(|| {
+                    if mount_namespace.is_some() {
+                        None
+                    } else {
+                        crate::mount::mount_for(payload, child_fs_object_id)
+                    }
+                })
+        }),
     };
     if let Some(mount_cap) = crossing_mount {
         let new_current = match walker::dentry_for_mount_root(&mount_cap, Some(&child_dentry)) {

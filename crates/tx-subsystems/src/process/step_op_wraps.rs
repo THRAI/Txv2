@@ -45,6 +45,7 @@ fn fork_op_delegates_to_step_fork() {
         parent: &parent,
         clone_vm: false,
         clone_sighand: false,
+        clone_newipc: false,
         _pmap: core::marker::PhantomData,
     };
     let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();

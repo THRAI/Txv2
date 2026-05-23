@@ -276,16 +276,10 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
                     interp_path = Some(path);
                 }
             }
-            PT_DYNAMIC if !is_dyn => {
-                has_dynamic = true;
-                // PT_INTERP-interpreted ET_EXEC binaries may also carry
-                // PT_DYNAMIC; the dynamic linker consumes that table.
-            }
             PT_DYNAMIC => {
-                // ET_DYN covers both static PIE and dynamic PIE. Static
-                // PIE/interpreter shared objects can carry PT_DYNAMIC
-                // without a PT_INTERP owner; dynamic PIE carries PT_INTERP
-                // and is handed to the interpreter by exec_script.
+                has_dynamic = true;
+                // PT_INTERP-interpreted binaries may also carry
+                // PT_DYNAMIC; the dynamic linker consumes that table.
             }
             PT_PHDR => {
                 pt_phdr_vaddr = Some(phdr.p_vaddr);

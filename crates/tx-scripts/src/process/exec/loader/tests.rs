@@ -357,7 +357,7 @@ fn parse_image_plan_accepts_pt_interp_with_pt_dynamic() {
 }
 
 #[test]
-fn parse_image_plan_et_dyn_extracts_pt_interp_for_dynamic_pie() {
+fn parse_image_plan_et_dyn_accepts_pt_interp_with_pt_dynamic() {
     let mut cfg = FixtureCfg::minimal();
     cfg.e_type = ET_DYN_U16;
     cfg.e_entry = 0x80;
@@ -390,13 +390,33 @@ fn parse_image_plan_et_dyn_extracts_pt_interp_for_dynamic_pie() {
         bytes.resize(interp_offset + interp.len(), 0);
     }
     bytes[interp_offset..interp_offset + interp.len()].copy_from_slice(interp);
-
-    let plan = parse_image_plan(&bytes).expect("dynamic PIE PT_INTERP should parse");
+    let plan = parse_image_plan(&bytes).expect("ET_DYN with PT_INTERP and PT_DYNAMIC should parse");
     assert_eq!(
         plan.interpreter_path.as_deref(),
         Some(&interp[..interp.len() - 1])
     );
     assert_eq!(plan.entry, 0x10080);
+    assert_eq!(plan.load_bias, 0x10000);
+}
+
+#[test]
+fn parse_image_plan_et_dyn_accepts_pt_dynamic_without_interp() {
+    let mut cfg = FixtureCfg::minimal();
+    cfg.e_type = ET_DYN_U16;
+    cfg.phdrs.push(PhdrSpec {
+        p_type: PT_DYNAMIC_U32,
+        p_flags: PF_R_BIT,
+        p_offset: 0x200,
+        p_vaddr: 0x200,
+        p_paddr: 0x200,
+        p_filesz: 16,
+        p_memsz: 16,
+        p_align: 8,
+    });
+    let bytes = cfg.build();
+    let plan = parse_image_plan(&bytes)
+        .expect("ET_DYN static-PIE with PT_DYNAMIC but no PT_INTERP should parse");
+    assert!(plan.interpreter_path.is_none());
 }
 
 #[test]

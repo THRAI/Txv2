@@ -28,6 +28,15 @@ pub(super) fn stat_meta_override_or(fs_object_id: FsObjectId, fallback: InodeMet
         .unwrap_or(fallback)
 }
 
+/// Drain all stale entries from the global `STAT_META_OVERRIDES` map.
+/// Called from test setup to prevent cross-test pollution (a
+/// `sys_utimensat` test writing an override for a `FsObjectId` that
+/// a later `newfstatat` test also uses).
+#[cfg(test)]
+pub(crate) fn clear_stat_meta_overrides() {
+    STAT_META_OVERRIDES.lock().clear();
+}
+
 fn apply_stat_meta_override(fs_object_id: FsObjectId, meta: &mut InodeMeta) {
     *meta = stat_meta_override_or(fs_object_id, *meta);
 }
@@ -428,6 +437,19 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     mode: u32,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
+    // Early FD-limit check: Linux returns EMFILE before doing any
+    // significant work (path resolution, inode lookup). The per-
+    // process soft limit is the gate — if the lowest free fd is ≥
+    // soft_limit, there is no room for a new descriptor. This avoids
+    // wasted I/O when the table is already full.
+    {
+        let next = ctx.process.allocate_fd();
+        let (soft_limit, _) = ctx.process.rlimit_nofile();
+        if next >= soft_limit {
+            return SyscallResult::Error(EMFILE_VALUE);
+        }
+    }
+
     // Bounded inline copy of the user path. Same `EXECVE_PATH_MAX = 4096`
     // budget as the existing `execve` / `fchmodat` arms (and matches
     // Linux's `PATH_MAX`). Empty paths surface as `-ENOENT` from the
@@ -492,8 +514,8 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // PR async migration: non-O_CREAT, non-O_TRUNC simple open
     // goes through `OpenOp + drive()` — no manual step loop.
     if !want_create && !want_trunc {
+        use step_engine::DriveMode;
         use tx_scripts::drive;
-        use tx_substrate::step::DriveMode;
         let mut script_ctx = build_subject_script_ctx(ctx);
         let op = OpenOp {
             rooted_at: cwd.clone(),
@@ -996,6 +1018,23 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         };
     }
 
+    if let RNodeBacking::StructBacked {
+        payload: StructPayload::CharDevice(binding),
+    } = file.rnode().backing()
+    {
+        if binding.name == "rtc" && request == RTC_RD_TIME {
+            if argp == 0 {
+                return SyscallResult::Error(EFAULT_VALUE);
+            }
+            let rtc_time = RtcTime::fixed_oscomp_time();
+            return match bootstrap_write_user::<RtcTime>(&ctx.aspace, argp, rtc_time) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::error_from(errno),
+            };
+        }
+        return SyscallResult::error_from(Errno::ENOTTY);
+    }
+
     // Resolve to a TTY. Non-TTY fds → -ENOTTY for terminal-shape ioctls
     // (Linux semantic — even pipes / regular files return ENOTTY for
     // these requests, per `man ioctl_tty`).
@@ -1165,6 +1204,38 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         // observing -ENOTTY here is the canonical Linux signal that
         // the request is not a terminal ioctl on this fd.
         _ => SyscallResult::error_from(Errno::ENOTTY),
+    }
+}
+
+const RTC_RD_TIME: u32 = 0x8024_7009;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RtcTime {
+    tm_sec: i32,
+    tm_min: i32,
+    tm_hour: i32,
+    tm_mday: i32,
+    tm_mon: i32,
+    tm_year: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
+}
+
+impl RtcTime {
+    const fn fixed_oscomp_time() -> Self {
+        Self {
+            tm_sec: 0,
+            tm_min: 0,
+            tm_hour: 0,
+            tm_mday: 23,
+            tm_mon: 4,
+            tm_year: 126,
+            tm_wday: 6,
+            tm_yday: 142,
+            tm_isdst: 0,
+        }
     }
 }
 
@@ -1960,7 +2031,6 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     }
     SyscallResult::Return(0)
 }
-
 /// `getdents64(fd, dirp, count)`. Linux RV64 generic ABI
 /// `__NR_getdents64 = 61`.
 ///
