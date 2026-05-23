@@ -18,6 +18,7 @@
 use super::helpers::{bootstrap_block_on, exec_error_tag, parse_init_from_cmdline};
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
+use core::fmt::Write;
 
 fn oscomp_boot_suite(cmdline: Option<&str>) -> Option<&str> {
     let cmdline = cmdline?;

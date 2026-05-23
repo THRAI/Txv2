@@ -91,6 +91,28 @@
   `make oscomp-local-rv64-smp4` / selected libctest lane. **Blocker:** none for
   the immediate `basic-musl` SMP panic.
 
+- 2026-05-24 **Rebased `feature-network` onto updated `main` and repaired the
+  post-rebase interface drift.** The branch now sits on the mainline that split
+  init reactor submission, refreshed procfs/sysfs/devfs, and expanded signal
+  delivery metadata. Rebase follow-up kept the network branch's `/proc/net`,
+  `/sys/class/net`, netlink/packet, loopback UDP/TCP, and socket fd-table work
+  while adapting sysfs regular files to the newer projected-rnode schema
+  (`ProjectionSchemaId::Sysfs`), updating `kill(2)` to pass `SI_USER`
+  `SigInfo` into the new `script_deliver_signal` API, and reading interval
+  timer handlers from the current tuple-style `SigDisposition::Handler(addr)`.
+  A duplicate `EINTR` errno mapping introduced by conflict resolution was also
+  removed. The RV64 kernel build also exposed an old in-file copy of reactor
+  submit helpers that conflicted with main's new `init/reactor_submit.rs`; the
+  stale copy was removed so the split mainline implementation owns that path.
+  **Verified:** `cargo fmt --check`; `cargo check -p tx-shims`; `cargo test -p
+  tx-shims socket_fdtable -- --test-threads=1` (`56 passed`); `cargo test -p
+  tx-subsystems net::tests::loopback_tests -- --test-threads=1` (`46 passed`);
+  `cargo build -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`; `cargo xtask progress validate`. **Next step:**
+  run the OSComp/network guest regressions after this rebase before pushing the
+  rebased branch. **Blocker:** none found so far; only pre-existing
+  non-network warnings remain in `tx-subsystems`, `tx-scripts`, and `tx-fs`.
+
 - 2026-05-23 **Brought the OSComp/musl/busybox fix branch through both CI
   gates.** This branch now includes the pthread/libctest, dynamic loader/DSO,
   file-time, futex, fd-table close, non-VFS fd routing, AIO syscall-number,
