@@ -909,7 +909,9 @@ fn append_filtered_libctest(cmd: &mut alloc::string::String, filter: &str) {
 fn append_filtered_libctest_case(cmd: &mut alloc::string::String, entry: &str, case: &str) {
     use core::fmt::Write as _;
 
-    if libctest_case_missing_from_sdcard(entry, case) {
+    if !libctest_case_present_in_entry(entry, case) {
+        append_unsupported_libctest_case(cmd, entry, case);
+    } else if libctest_case_missing_from_sdcard(entry, case) {
         append_synthetic_libctest_pass(cmd, entry, case);
     } else if entry == "entry-dynamic.exe" && libctest_case_needs_cwd_dso(case) {
         append_dynamic_libctest_cwd_dso_case(cmd, case);
@@ -996,6 +998,26 @@ fn append_synthetic_libctest_pass(cmd: &mut alloc::string::String, entry: &str, 
         cmd,
         "; ./busybox echo \"========== END {entry} {case} ==========\""
     );
+}
+
+fn append_unsupported_libctest_case(cmd: &mut alloc::string::String, entry: &str, case: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"SKIP {entry} {case} [not in libctest table]\""
+    );
+}
+
+fn libctest_case_present_in_entry(entry: &str, case: &str) -> bool {
+    match entry {
+        "entry-static.exe" => !matches!(
+            case,
+            "dlopen" | "sem_init" | "tls_get_new_dtv" | "tls_init" | "tls_local_exec"
+        ),
+        "entry-dynamic.exe" => !matches!(case, "pthread_cancel_sem_wait" | "tls_align"),
+        _ => true,
+    }
 }
 
 fn libctest_case_missing_from_sdcard(entry: &str, case: &str) -> bool {
@@ -1117,3 +1139,38 @@ const LIBCTEST_DYNAMIC_SAFE_CASES: &str =
      scanf_match_literal_eof scanf_nullbyte_char setvbuf_unget sigprocmask_internal sscanf_eof \
      statvfs strverscmp syscall_sign_extend tls_get_new_dtv uselocale_0 wcsncpy_read_overflow \
      wcsstr_false_negative";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::String;
+
+    #[test]
+    fn filtered_static_only_libctest_case_does_not_run_missing_dynamic_entry() {
+        let mut cmd = String::new();
+        append_filtered_libctest(&mut cmd, "pthread_cancel_sem_wait");
+
+        assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_sem_wait"));
+        assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_sem_wait"));
+        assert!(cmd.contains("SKIP entry-dynamic.exe pthread_cancel_sem_wait"));
+    }
+
+    #[test]
+    fn filtered_dynamic_only_libctest_case_does_not_run_missing_static_entry() {
+        let mut cmd = String::new();
+        append_filtered_libctest(&mut cmd, "dlopen");
+
+        assert!(!cmd.contains("./runtest.exe -w entry-static.exe dlopen"));
+        assert!(cmd.contains("SKIP entry-static.exe dlopen"));
+        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe dlopen)"));
+    }
+
+    #[test]
+    fn explicit_dynamic_missing_libctest_case_is_reported_without_start_marker() {
+        let mut cmd = String::new();
+        append_filtered_libctest(&mut cmd, "dynamic:pthread_cancel_sem_wait");
+
+        assert!(cmd.contains("SKIP entry-dynamic.exe pthread_cancel_sem_wait"));
+        assert!(!cmd.contains("START entry-dynamic.exe pthread_cancel_sem_wait"));
+    }
+}
