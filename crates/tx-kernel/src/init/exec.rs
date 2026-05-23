@@ -688,7 +688,10 @@ impl<P: TxPlatform> CoreInit<P> {
             // ran under.
             let submitted_child_before_poll = Self::drain_pending_child_submits();
 
-            let step = match Self::step_boot_reactor_once_concurrent(current_cpu) {
+            // The userspace trap shell returns through a longjmp-like path, so
+            // do not carry a pre-entry CpuId local across reactor iterations.
+            let loop_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+            let step = match Self::step_boot_reactor_once_concurrent(loop_cpu) {
                 Some(step) => step,
                 None => break,
             };
