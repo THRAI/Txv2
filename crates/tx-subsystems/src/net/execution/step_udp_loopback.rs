@@ -26,6 +26,11 @@ pub fn step_process_loopback_udp(
     budget: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackUdpTransferOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     step_process_loopback_udp_on_iface(source, budget, initial_loopback_iface(), guard)
 }
 
@@ -35,6 +40,11 @@ pub fn step_process_loopback_udp_on_iface(
     iface: &LoopbackIface,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackUdpTransferOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let Some(source_payload) = source.acquire_operational() else {
         return StepOutcome::Done(LoopbackUdpTransferOutcome::default());
     };
@@ -95,6 +105,11 @@ pub fn step_send_udp_loopback_kernel_bytes(
     flags: SendRecvFlags,
     guard: &Guard<'_>,
 ) -> ByteStepOutcome<usize> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     step_send_udp_loopback_kernel_bytes_on_iface(
         socket,
         dst,
@@ -113,6 +128,11 @@ pub fn step_send_udp_loopback_kernel_bytes_on_iface(
     iface: &LoopbackIface,
     guard: &Guard<'_>,
 ) -> ByteStepOutcome<usize> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let witness = match require_socket_write_target(socket, flags, guard) {
         Ok(witness) => witness,
         Err(errno) => return tx_substrate::step::StepOutcome::Err(errno),

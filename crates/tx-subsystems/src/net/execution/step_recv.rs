@@ -14,6 +14,11 @@ pub fn step_recv(
     flags: SendRecvFlags,
     guard: &Guard<'_>,
 ) -> ByteStepOutcome<usize> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let witness = match require_socket_read_target(socket, flags, guard) {
         Ok(witness) => witness,
         Err(errno) => return StepOutcome::Err(errno),
@@ -58,6 +63,11 @@ pub fn step_recv_kernel_bytes(
     flags: SendRecvFlags,
     guard: &Guard<'_>,
 ) -> ByteStepOutcome<SocketRecvBytesOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let witness = match require_socket_read_target(socket, flags, guard) {
         Ok(witness) => witness,
         Err(errno) => return StepOutcome::Err(errno),

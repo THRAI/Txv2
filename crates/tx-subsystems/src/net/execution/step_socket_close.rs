@@ -25,6 +25,11 @@ pub fn step_socket_close(
     socket: &Cap<SocketIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<SocketCloseOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let Some(payload) = socket.live_payload() else {
         return StepOutcome::Done(SocketCloseOutcome::default());
     };

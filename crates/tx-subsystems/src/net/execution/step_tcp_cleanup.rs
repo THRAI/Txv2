@@ -16,6 +16,11 @@ pub fn step_tcp_connection_cleanup(
     socket: &Cap<SocketIdentity>,
     _guard: &Guard<'_>,
 ) -> StepOutcome<TcpConnectionCleanupOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     match cleanup_tcp_connection(socket) {
         Ok(outcome) => StepOutcome::Done(outcome),
         Err(errno) => StepOutcome::Err(errno),

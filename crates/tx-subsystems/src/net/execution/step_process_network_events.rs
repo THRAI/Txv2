@@ -45,6 +45,11 @@ pub fn step_process_network_events(
     source: &dyn PacketSource,
     guard: &Guard<'_>,
 ) -> StepOutcome<NetworkStepOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     step_process_network_events_in_namespace_at(
         source,
         initial_net_namespace_payload(),
@@ -58,6 +63,11 @@ pub fn step_process_network_events_at(
     now: Instant,
     guard: &Guard<'_>,
 ) -> StepOutcome<NetworkStepOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     step_process_network_events_in_namespace_at(source, initial_net_namespace_payload(), now, guard)
 }
 
@@ -67,6 +77,11 @@ pub fn step_process_network_events_in_namespace_at(
     now: Instant,
     guard: &Guard<'_>,
 ) -> StepOutcome<NetworkStepOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let mut outcome = NetworkStepOutcome::default();
     let table = net_namespace.socket_table();
 
@@ -109,6 +124,11 @@ pub fn step_process_network_tick(
     now: Instant,
     guard: &Guard<'_>,
 ) -> StepOutcome<NetworkBacklogTickOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     StepOutcome::Done(process_tcp_backlog_tick_in_namespace(
         now,
         initial_net_namespace_payload().socket_table(),
@@ -121,6 +141,11 @@ pub fn step_process_network_tick_in_namespace(
     net_namespace: PayloadCap<NetNamespacePayload>,
     guard: &Guard<'_>,
 ) -> StepOutcome<NetworkBacklogTickOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     StepOutcome::Done(process_tcp_backlog_tick_in_namespace(
         now,
         net_namespace.socket_table(),
@@ -133,6 +158,11 @@ pub fn step_process_network_tick_loopback(
     iface: &LoopbackIface,
     guard: &Guard<'_>,
 ) -> StepOutcome<NetworkBacklogTickOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     StepOutcome::Done(process_tcp_backlog_tick_loopback_in_namespace(
         now,
         initial_net_namespace_payload().socket_table(),
@@ -147,6 +177,11 @@ pub fn step_process_network_tick_loopback_in_namespace(
     iface: &LoopbackIface,
     guard: &Guard<'_>,
 ) -> StepOutcome<NetworkBacklogTickOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     StepOutcome::Done(process_tcp_backlog_tick_loopback_in_namespace(
         now,
         net_namespace.socket_table(),

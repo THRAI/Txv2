@@ -19,6 +19,11 @@ pub fn step_tcp_backlog_cleanup(
     now: Instant,
     _guard: &Guard<'_>,
 ) -> StepOutcome<TcpBacklogCleanupOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     match cleanup_tcp_backlog_for_listener(listener, now) {
         Ok(outcome) => StepOutcome::Done(outcome),
         Err(errno) => StepOutcome::Err(errno),

@@ -11,6 +11,11 @@ use crate::net::structure::{
 };
 
 pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepOutcome<PollMask> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let witness = match require_socket_poll_target(socket, guard) {
         Ok(witness) => witness,
         Err(errno) => return StepOutcome::Err(errno),
@@ -144,6 +149,11 @@ pub fn step_poll_wait_token(
     interests: PollMask,
     guard: &Guard<'_>,
 ) -> StepOutcome<Option<WaitToken>> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let witness = match require_socket_poll_target(socket, guard) {
         Ok(witness) => witness,
         Err(errno) => return StepOutcome::Err(errno),

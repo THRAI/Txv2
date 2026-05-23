@@ -84,6 +84,11 @@ pub fn step_process_loopback_pending(
     budget: LoopbackPollBudget,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackPendingOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     step_process_loopback_pending_in_namespace(
         now,
         initial_net_namespace_payload(),
@@ -100,6 +105,11 @@ pub fn step_process_loopback_pending_in_namespace(
     budget: LoopbackPollBudget,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackPendingOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let mut outcome = LoopbackPendingOutcome::default();
     let table = net_namespace.socket_table();
 
@@ -228,6 +238,11 @@ pub fn step_process_loopback_pending_zero(
     budget: LoopbackPollBudget,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackPendingOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     step_process_loopback_pending(Instant::ZERO, iface, budget, guard)
 }
 
