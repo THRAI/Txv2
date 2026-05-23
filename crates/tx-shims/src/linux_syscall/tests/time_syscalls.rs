@@ -10,6 +10,7 @@ use crate::linux_syscall::{
 
 const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
+const OSCOMP_IMAGE_TIMESTAMP_FLOOR_SEC: i64 = 1_779_473_960;
 
 /// Mirror of `TimespecLayout` for test-side decoding. The
 /// production layout is private to `mod.rs`, so the tests
@@ -133,6 +134,25 @@ fn dispatch_gettimeofday_writes_timeval_to_user() {
         (0..1_000_000).contains(&tv.tv_usec),
         "tv_usec must be in [0, 1e6): got {}",
         tv.tv_usec,
+    );
+}
+
+#[test]
+fn dispatch_gettimeofday_realtime_is_not_before_oscomp_image_timestamps() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let mut tv = TestTimeval::default();
+    let tv_uaddr = &mut tv as *mut TestTimeval as u64;
+
+    let req = SyscallRequest::new(NR_GETTIMEOFDAY, [tv_uaddr, 0, 0, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(
+        tv.tv_sec >= OSCOMP_IMAGE_TIMESTAMP_FLOOR_SEC,
+        "CLOCK_REALTIME seconds {} must not predate OSComp image mtimes {}",
+        tv.tv_sec,
+        OSCOMP_IMAGE_TIMESTAMP_FLOOR_SEC,
     );
 }
 

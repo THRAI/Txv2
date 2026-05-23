@@ -130,7 +130,7 @@ SUITE_DEFS = {
         "case_dir": None,
     },
     "libctest-musl": {
-        "dirs": [],
+        "dirs": ["lib"],
         "scripts": ["libctest_testcode.sh", "run-static.sh", "run-dynamic.sh"],
         "extras": ["runtest.exe", "entry-static.exe", "entry-dynamic.exe"],
         "case_dir": None,
@@ -463,6 +463,7 @@ def build_slim_sdcard(config: SlimConfig):
         elif suite.cases and name in TESTCODE_GENS:
             custom_testcodes[sd["scripts"][0]] = TESTCODE_GENS[name](suite.cases)
             files.update(sd["extras"])
+            dirs.update(sd.get("dirs", []))
         else:
             dirs.update(sd.get("dirs", []))
             files.update(sd["scripts"])

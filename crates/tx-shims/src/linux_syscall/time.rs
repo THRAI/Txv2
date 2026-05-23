@@ -137,7 +137,10 @@ pub(super) fn ns_to_timeval(ns: u64) -> TimevalLayout {
     }
 }
 
-const REALTIME_EPOCH_BASE_NS: u64 = 1_749_920_000_000_000_000;
+// Keep CLOCK_REALTIME ahead of the OSComp ext4 image mtimes; libc
+// `stat.c` rejects file timestamps that appear to be in the future
+// relative to `time(0)`.
+const REALTIME_EPOCH_BASE_NS: u64 = 1_779_494_400_000_000_000;
 
 pub(super) fn realtime_ns<P: TimeIf>() -> u64 {
     REALTIME_EPOCH_BASE_NS.saturating_add(<P as TimeIf>::read_ns())

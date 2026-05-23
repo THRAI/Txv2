@@ -358,6 +358,9 @@ mod tests {
 
     #[test]
     fn static_block_registry_indexes_by_name_and_devt_once() {
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
         reset_block_registry_for_test();
         static REGS: &[&BlockDeviceRegistration] = &[&BLOCK_REG];
 
@@ -381,6 +384,9 @@ mod tests {
 
     #[test]
     fn static_block_registry_rejects_duplicate_names_or_devts() {
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
         reset_block_registry_for_test();
         static DUP_NAME: BlockDeviceRegistration = BlockDeviceRegistration {
             devt: DevT::new(8, 2),

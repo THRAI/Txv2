@@ -10,7 +10,7 @@ use crate::thread_runtime::adapter::step_engine::{
 };
 
 use crate::futex::step_futex_wake_in;
-use crate::signal::{SignalMask, Signum};
+use crate::signal::{refresh_deliverable_signal_summary, SignalMask, Signum};
 use crate::thread_runtime::structure::{
     drain_pending_syscall_return, ThreadIdentity, ThreadPayload,
 };
@@ -353,8 +353,7 @@ pub fn step_sigprocmask(
     let new = SignalMask::new(new_bits);
     payload.signal_mask.store(new.raw_bits(), Ordering::Release);
 
-    let any_deliverable = payload.pending().deliverable_bits(new) != 0;
-    payload.update_summary(|s| s.deliverable_signal = any_deliverable);
+    refresh_deliverable_signal_summary(thread);
 
     SigprocmaskChange::Replaced { prev, new }
 }

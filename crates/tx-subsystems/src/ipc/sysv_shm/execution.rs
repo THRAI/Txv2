@@ -63,6 +63,11 @@ pub fn step_shmget(
     cred: &Cap<Cred>,
     nsproxy: &Cap<crate::process::nsproxy::NsProxy>,
 ) -> Result<u32, Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let ipc_key = if key == IPC_PRIVATE {
         None
     } else {
@@ -88,9 +93,8 @@ pub fn step_shmget(
     // Check if segment already exists for this key.
     if let Some(ref k) = ipc_key {
         let table = nsproxy.ipc_ns.sysv_shm.lock();
-        if let Some(&existing_shmid) = table.get(k) {
+        if let Some(seg) = table.get(k).cloned() {
             drop(table);
-            let seg = checks::require_shm_exists(existing_shmid)?;
             if exclusive {
                 return Err(Errno::EEXIST);
             }
@@ -100,7 +104,7 @@ pub fn step_shmget(
             }
             // Check permissions.
             checks::require_can_read_shm(&seg, cred)?;
-            return Ok(existing_shmid);
+            return Ok(seg.shmid);
         }
     }
 
@@ -110,26 +114,26 @@ pub fn step_shmget(
     }
 
     // Allocate the segment.
-    let shmid =
+    let segment =
         structure::register_shm(ipc_key, cred.clone(), size, perm, cred.euid.0, cred.egid.0)
             .map_err(|_| Errno::ENOMEM)?;
 
     // Register in the namespace's key→shmid table.
     if let Some(ref k) = ipc_key {
-        nsproxy.ipc_ns.sysv_shm.lock().insert(*k, shmid);
+        nsproxy.ipc_ns.sysv_shm.lock().insert(*k, segment.clone());
     }
 
-    Ok(shmid)
+    Ok(segment.shmid)
 }
 
 // ---------------------------------------------------------------------------
-// step_shmat
+// script_shmat
 // ---------------------------------------------------------------------------
 
 /// `shmat(shmid, shmaddr, shmflg)` — attach a shared memory segment.
 ///
 /// Returns the virtual address where the segment was mapped.
-pub async fn step_shmat(
+pub async fn script_shmat(
     shmid: u32,
     shmaddr: usize,
     shmflg: i32,
@@ -212,13 +216,13 @@ pub async fn step_shmat(
 }
 
 // ---------------------------------------------------------------------------
-// step_shmdt
+// script_shmdt
 // ---------------------------------------------------------------------------
 
 /// `shmdt(shmaddr)` — detach a shared memory segment.
 ///
 /// Detach the mapping whose start address exactly matches `shmaddr`.
-pub async fn step_shmdt(shmaddr: usize, aspace: &Cap<AddressSpace>) -> Result<(), Errno> {
+pub async fn script_shmdt(shmaddr: usize, aspace: &Cap<AddressSpace>) -> Result<(), Errno> {
     if !shmaddr.is_multiple_of(USER_PAGE_SIZE) {
         return Err(Errno::EINVAL);
     }
@@ -344,6 +348,11 @@ pub fn step_shmctl(
     set_fields: Option<(u16, u32, u32)>,
     cred: &Cap<Cred>,
 ) -> Result<ShmCtlResult, Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     match cmd {
         IPC_RMID => {
             let segment = checks::require_shm_exists(shmid)?;
@@ -423,6 +432,11 @@ pub fn step_shmctl_in_ns(
     cred: &Cap<Cred>,
     nsproxy: &Cap<crate::process::nsproxy::NsProxy>,
 ) -> Result<ShmCtlResult, Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let key = if cmd == IPC_RMID {
         Some(checks::require_shm_exists(shmid)?.key)
     } else {
@@ -431,7 +445,7 @@ pub fn step_shmctl_in_ns(
     let result = step_shmctl(shmid, cmd, set_fields, cred)?;
     if let Some(Some(key)) = key {
         let mut table = nsproxy.ipc_ns.sysv_shm.lock();
-        if table.get(&key).copied() == Some(shmid) {
+        if table.get(&key).map(|segment| segment.shmid) == Some(shmid) {
             table.remove(&key);
         }
     }

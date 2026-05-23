@@ -338,6 +338,32 @@ pub fn step_fork<P: PmapIf>(
     clone_vm: bool,
     clone_sighand: bool,
 ) -> Result<Cap<ProcessIdentity>, ForkError> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
+    step_fork_with_options::<P>(
+        parent,
+        ForkOptions {
+            clone_vm,
+            clone_sighand,
+            clone_newipc: false,
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ForkOptions {
+    pub clone_vm: bool,
+    pub clone_sighand: bool,
+    pub clone_newipc: bool,
+}
+
+pub fn step_fork_with_options<P: PmapIf>(
+    parent: &Cap<ProcessIdentity>,
+    options: ForkOptions,
+) -> Result<Cap<ProcessIdentity>, ForkError> {
     // observe
     // upgrade
     // reserve
@@ -383,7 +409,7 @@ pub fn step_fork<P: PmapIf>(
     let parent_pgrp = parent.pgrp.lock().clone();
 
     // Signal-action table: share via Arc (CLONE_SIGHAND) or fresh.
-    let child_sig_actions = if clone_sighand {
+    let child_sig_actions = if options.clone_sighand {
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
         Arc::clone(&payload.frame.sig_actions)
@@ -392,7 +418,7 @@ pub fn step_fork<P: PmapIf>(
     };
 
     // Address space: fork (CoW clone) or share (CLONE_VM).
-    let child_aspace_cap = if clone_vm {
+    let child_aspace_cap = if options.clone_vm {
         parent_aspace.clone()
     } else {
         let child_aspace = AddressSpace::fork_aspace::<P>(&parent_aspace)?;
@@ -417,9 +443,11 @@ pub fn step_fork<P: PmapIf>(
     // fork time; subsequent `fcntl(F_SETFD)` calls in either parent
     // or child do not affect the other.
     // Clone the parent's nsproxy. POSIX: fork inherits the parent's
-    // namespace bundle. CLONE_NEWIPC / CLONE_NEWPID / ... (future)
-    // will replace the nsproxy with a fresh bundle for unshared nss.
-    let child_nsproxy = crate::process::nsproxy::clone_nsproxy(&parent_nsproxy);
+    // namespace bundle. CLONE_NEWIPC replaces only the IPC namespace
+    // in this slice; other namespace flags remain future work.
+    let child_nsproxy =
+        crate::process::nsproxy::clone_nsproxy_for_fork(&parent_nsproxy, options.clone_newipc)
+            .map_err(ForkError::Zone)?;
     let payload = sign_process_payload(
         child_aspace_cap,
         vec![leader],
@@ -449,6 +477,30 @@ pub fn step_fork<P: PmapIf>(
     parent.children.attach(child_proc.clone());
 
     Ok(child_proc)
+}
+
+/// Publish a concrete mount namespace into a process's namespace bundle.
+///
+/// Boot uses this after rootfs mount creation because the initial process is
+/// constructed before any `MountNamespace` exists in the current ordering.
+/// The operation follows the immutable-NsProxy rule: clone the existing bundle
+/// with the new mount namespace cap, then atomically replace the payload slot.
+pub fn step_set_mount_namespace(
+    process: &Cap<ProcessIdentity>,
+    mnt_ns: Cap<crate::mount::MountNamespace>,
+) -> Result<(), ForkError> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
+    let payload_guard = process.payload.lock();
+    let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
+    let current = payload.nsproxy_cap();
+    let replacement = crate::process::nsproxy::clone_nsproxy_with_mount_namespace(&current, mnt_ns)
+        .map_err(ForkError::Zone)?;
+    let _old = payload.replace_nsproxy(replacement);
+    Ok(())
 }
 
 /// Seed the child leader thread's `saved_user_context` from the
@@ -597,6 +649,11 @@ pub fn step_clone_thread(
     tls: usize,
     ctid_ptr: u64,
 ) -> Result<Cap<ThreadIdentity>, ZoneError> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let tid = allocate_tid();
     let child = sign_thread(process.downgrade(), tid)?;
     register_tid(child.tid, child.clone());
@@ -635,6 +692,7 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     // publish
     session_leader_hangup_cascade(process);
     sever_children(process);
+    crate::ipc::sysv_sem::execution::step_sem_undo(process);
 
     let mut payload_guard = process.payload.lock();
     if let Some(payload) = payload_guard.as_ref() {
@@ -684,6 +742,7 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
     session_leader_hangup_cascade(process);
     sever_children(process);
     *process.exit_status.lock() = Some(status);
+    crate::ipc::sysv_sem::execution::step_sem_undo(process);
     let mut payload_guard = process.payload.lock();
     if let Some(payload) = payload_guard.as_ref() {
         let _shm_detach =
@@ -1212,6 +1271,7 @@ fn sign_process_payload(
         // per-process, copied across fork). `step_exec` preserves
         // the umask (umask survives `exec` per POSIX).
         umask: core::sync::atomic::AtomicU16::new(umask & 0o777),
+        sem_undos: SpinMutex::new(BTreeMap::new()),
         exit_source,
         exit_source_id,
         exit_wait_source,
@@ -1317,6 +1377,7 @@ pub struct ForkOp<'a, P: PmapIf> {
     pub parent: &'a Cap<ProcessIdentity>,
     pub clone_vm: bool,
     pub clone_sighand: bool,
+    pub clone_newipc: bool,
     pub _pmap: core::marker::PhantomData<P>,
 }
 
@@ -1324,10 +1385,13 @@ impl<'a, P: PmapIf, I: SubjectIdentity> StepOp<I> for ForkOp<'a, P> {
     type Output = Result<Cap<ProcessIdentity>, ForkError>;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(step_fork::<P>(
+        StepOutcome::Done(step_fork_with_options::<P>(
             self.parent,
-            self.clone_vm,
-            self.clone_sighand,
+            ForkOptions {
+                clone_vm: self.clone_vm,
+                clone_sighand: self.clone_sighand,
+                clone_newipc: self.clone_newipc,
+            },
         ))
     }
 }

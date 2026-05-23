@@ -1,7 +1,7 @@
 //! SysV semaphore — identity, payload, and SEM_UNDO types.
 //!
 //! `SemArrayIdentity`: key, semid, cred, nsems, perm.
-//! `SemArrayPayload`: per-sem values, undo list, changed_seq, wake channel.
+//! `SemArrayPayload`: per-sem values, changed_seq, wake channel.
 //!
 //! Day-1 single-namespace: a global `SEM_TABLE` maps semid → Cap.
 
@@ -57,6 +57,7 @@ impl SemArrayIdentity {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SemValue {
     pub val: i16,
+    pub last_pid: u32,
 }
 
 /// A single operation in a semop array.
@@ -88,9 +89,6 @@ pub struct SemArrayPayload {
     /// Wake channel fired when any sem value changes.
     pub changed_channel: Channel,
     pub changed_source_id: u64,
-    /// Pending SEM_UNDO entries, keyed by process pid (day-1 proxy).
-    /// Walked at process exit by the exit-step undo walk.
-    pub undos: SpinMutex<BTreeMap<u64, SemUndo>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +140,7 @@ pub(crate) fn register_sem(
     perm: IpcPerm,
     cuid: u32,
     cgid: u32,
-) -> Result<u32, ZoneError> {
+) -> Result<Cap<SemArrayIdentity>, ZoneError> {
     use crate::process::adapter::step_engine::sign;
     let semid = NEXT_SEMID.fetch_add(1, Ordering::Relaxed);
 
@@ -167,17 +165,17 @@ pub(crate) fn register_sem(
         changed_seq: AtomicU64::new(0),
         changed_channel,
         changed_source_id,
-        undos: SpinMutex::new(BTreeMap::new()),
     })?;
     *identity.payload.lock() = Some(PayloadCap::from_cap(payload));
-    SEM_TABLE.lock().insert(semid, identity);
-    Ok(semid)
+    SEM_TABLE.lock().insert(semid, identity.clone());
+    Ok(identity)
 }
 
 pub(crate) fn withdraw_sem(semid: u32) -> Option<Cap<SemArrayIdentity>> {
     SEM_TABLE.lock().remove(&semid)
 }
 
+/// Iterate all live semaphore arrays (for /proc/sysvipc/sem projection).
 pub(crate) fn all_sem_arrays() -> Vec<Cap<SemArrayIdentity>> {
     SEM_TABLE.lock().values().cloned().collect()
 }

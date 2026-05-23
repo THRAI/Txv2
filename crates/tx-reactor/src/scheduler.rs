@@ -393,6 +393,12 @@ impl HartSchedulerLocal {
     }
 }
 
+impl Default for HartSchedulerLocal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Phase1Scheduler {
     pub const BASE_SLICE_NS: u64 = 10_000_000;
     pub const NEW_QUEUE_SLICE_NS: u64 = 1_000_000;
@@ -815,7 +821,6 @@ impl Phase1Scheduler {
         local.queue_depths()
     }
 
-    #[allow(dead_code)]
     pub fn total_queue_depth_from_local(&self, local: &HartSchedulerLocal) -> usize {
         let depths = self.queue_depths_from_local(local);
         depths.kernel + depths.new + depths.preempted
@@ -989,11 +994,6 @@ impl Phase1Scheduler {
         }
     }
 
-    #[allow(dead_code)]
-    fn initial_hart_for_meta(&self, meta: &TaskSchedMeta) -> HartId {
-        first_hart_in_mask(meta.affinity)
-    }
-
     fn initial_hart_for_meta_with_depths(
         &self,
         meta: &TaskSchedMeta,
@@ -1073,37 +1073,6 @@ impl Phase1Scheduler {
         target_hart
     }
 
-    #[allow(dead_code)]
-    pub fn enqueue_to_local(
-        &self,
-        task: TaskId,
-        hart: HartId,
-        local: &HartSchedulerLocal,
-        queue: Phase1QueueKind,
-        front: bool,
-    ) {
-        if self
-            .shared
-            .meta_for(task)
-            .map(|meta| meta.is_queued())
-            .unwrap_or(true)
-        {
-            return;
-        }
-        if self
-            .shared
-            .meta_for(task)
-            .is_some_and(|meta| meta.owner == TaskRunOwner::Terminal)
-        {
-            return;
-        }
-        self.shared.with_meta_mut(task, |meta| {
-            meta.queued = true;
-            meta.owner = TaskRunOwner::Queued { hart, queue };
-        });
-        Self::push_to_local_queue(local, task, queue, front);
-    }
-
     pub fn push_to_local_queue(
         local: &HartSchedulerLocal,
         task: TaskId,
@@ -1141,7 +1110,6 @@ impl Phase1Scheduler {
         true
     }
 
-    #[allow(dead_code)]
     pub fn pick_next_from_local(
         &self,
         hart: HartId,
@@ -1152,7 +1120,6 @@ impl Phase1Scheduler {
             .or_else(|| self.pop_from_local_queue(hart, local, Phase1QueueKind::Preempted))
     }
 
-    #[allow(dead_code)]
     fn pop_from_local_queue(
         &self,
         hart: HartId,

@@ -36,10 +36,10 @@ use std::sync::{LazyLock, Mutex};
 
 use tx_hal::{
     Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
-    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, UserPtr, VirtAddr,
 };
 use tx_shims::adapter::reactor_entry::SyscallRequest;
-use tx_shims::adapter::step_engine::Cap;
+use tx_shims::adapter::step_engine::{self as zone, Cap};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
@@ -237,6 +237,78 @@ fn dispatch_read(ctx: &SyscallCtx<'_>, fd: u32, buf: u64, len: usize) -> Syscall
     block_on(dispatch::<StubPmap>(req, ctx))
 }
 
+const USER_UFD_IOCTL_ARG: usize = 0x5300_0000;
+const USER_UFD_READ_BUF: usize = 0x5300_1000;
+
+fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
+
+fn map_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, len: usize) {
+    let len = align_up(len.max(1), USER_PAGE_SIZE);
+    let range = UserRange::new_aligned(UserVirtAddr(uaddr), len).expect("aligned user range");
+    let request = VmMapRequest::fixed(
+        range,
+        MapPlacement::FixedReplace,
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    ctx.aspace
+        .try_mmap(request)
+        .expect("mmap anon for ufd test");
+}
+
+fn copy_to_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, bytes: &[u8]) {
+    let guard = zone::guard();
+    let copied = ctx
+        .aspace
+        .copy_to_user(UserPtr::<u8>::new(uaddr), bytes, &guard);
+    drop(guard);
+    assert_eq!(copied, zone::StepOutcome::Done(bytes.len()));
+}
+
+fn copy_from_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, out: &mut [u8]) {
+    let guard = zone::guard();
+    let copied = ctx
+        .aspace
+        .copy_from_user(out, UserPtr::<u8>::new(uaddr), &guard);
+    drop(guard);
+    assert_eq!(copied, zone::StepOutcome::Done(out.len()));
+}
+
+fn stage_user_value<T: Copy>(ctx: &SyscallCtx<'_>, uaddr: usize, value: &T) -> u64 {
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(*value) as *const u8,
+            core::mem::size_of::<T>(),
+        )
+    };
+    if ctx
+        .aspace
+        .lookup(UserVirtAddr(uaddr))
+        .filter(|entry| {
+            entry
+                .range
+                .contains_addr(UserVirtAddr(uaddr + bytes.len() - 1))
+        })
+        .is_none()
+    {
+        map_user_bytes(ctx, uaddr, bytes.len());
+    }
+    copy_to_user_bytes(ctx, uaddr, bytes);
+    uaddr as u64
+}
+
+fn load_user_value<T: Copy>(ctx: &SyscallCtx<'_>, uaddr: usize) -> T {
+    let mut value = core::mem::MaybeUninit::<T>::uninit();
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, core::mem::size_of::<T>())
+    };
+    copy_from_user_bytes(ctx, uaddr, bytes);
+    unsafe { value.assume_init() }
+}
+
 /// Mint a ufd fd, perform the API handshake, and register a single
 /// private-anon page at `base`. Returns the fd.
 fn open_ufd_register_one_page(ctx: &SyscallCtx<'_>, base: usize) -> u32 {
@@ -245,12 +317,12 @@ fn open_ufd_register_one_page(ctx: &SyscallCtx<'_>, base: usize) -> u32 {
         other => panic!("expected Return, got {other:?}"),
     };
     // API handshake.
-    let mut api = UffdioApi {
+    let api = UffdioApi {
         api: UFFD_API,
         features: 0,
         ioctls: 0,
     };
-    let argp = (&mut api as *mut UffdioApi) as u64;
+    let argp = stage_user_value(ctx, USER_UFD_IOCTL_ARG, &api);
     assert_eq!(
         dispatch_ioctl(ctx, fd, UFFDIO_API, argp),
         SyscallResult::Return(0)
@@ -268,7 +340,7 @@ fn open_ufd_register_one_page(ctx: &SyscallCtx<'_>, base: usize) -> u32 {
     ctx.aspace.try_mmap(req).expect("mmap anon");
 
     // Register.
-    let mut reg = UffdioRegister {
+    let reg = UffdioRegister {
         range: UffdioRange {
             start: base as u64,
             len: USER_PAGE_SIZE as u64,
@@ -276,7 +348,7 @@ fn open_ufd_register_one_page(ctx: &SyscallCtx<'_>, base: usize) -> u32 {
         mode: UFFDIO_REGISTER_MODE_MISSING,
         ioctls: 0,
     };
-    let reg_argp = (&mut reg as *mut UffdioRegister) as u64;
+    let reg_argp = stage_user_value(ctx, USER_UFD_IOCTL_ARG, &reg);
     assert_eq!(
         dispatch_ioctl(ctx, fd, UFFDIO_REGISTER, reg_argp),
         SyscallResult::Return(0)
@@ -334,14 +406,14 @@ fn uffdio_copy_without_handshake_returns_einval() {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
-    let mut req = UffdioCopy {
+    let req = UffdioCopy {
         dst: 0x10_0000,
         src: 0,
         len: USER_PAGE_SIZE as u64,
         mode: 0,
         copy: 0,
     };
-    let argp = (&mut req as *mut UffdioCopy) as u64;
+    let argp = stage_user_value(&ctx, USER_UFD_IOCTL_ARG, &req);
     assert_eq!(
         dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp),
         SyscallResult::Error(22)
@@ -358,14 +430,14 @@ fn uffdio_copy_unaligned_dst_returns_einval() {
     let base = 0x10_0000usize;
     let fd = open_ufd_register_one_page(&ctx, base);
     push_fault(&ctx, fd, base as u64);
-    let mut req = UffdioCopy {
+    let req = UffdioCopy {
         dst: (base + 1) as u64,
         src: 0,
         len: USER_PAGE_SIZE as u64,
         mode: 0,
         copy: 0,
     };
-    let argp = (&mut req as *mut UffdioCopy) as u64;
+    let argp = stage_user_value(&ctx, USER_UFD_IOCTL_ARG, &req);
     assert_eq!(
         dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp),
         SyscallResult::Error(22)
@@ -382,14 +454,14 @@ fn uffdio_copy_zero_len_returns_einval() {
     let base = 0x10_0000usize;
     let fd = open_ufd_register_one_page(&ctx, base);
     push_fault(&ctx, fd, base as u64);
-    let mut req = UffdioCopy {
+    let req = UffdioCopy {
         dst: base as u64,
         src: 0,
         len: 0,
         mode: 0,
         copy: 0,
     };
-    let argp = (&mut req as *mut UffdioCopy) as u64;
+    let argp = stage_user_value(&ctx, USER_UFD_IOCTL_ARG, &req);
     assert_eq!(
         dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp),
         SyscallResult::Error(22)
@@ -405,14 +477,14 @@ fn uffdio_copy_no_pending_fault_returns_einval() {
     let ctx = make_ctx(proc_cap.clone(), thread);
     let base = 0x10_0000usize;
     let fd = open_ufd_register_one_page(&ctx, base);
-    let mut req = UffdioCopy {
+    let req = UffdioCopy {
         dst: base as u64,
         src: 0,
         len: USER_PAGE_SIZE as u64,
         mode: 0,
         copy: 0,
     };
-    let argp = (&mut req as *mut UffdioCopy) as u64;
+    let argp = stage_user_value(&ctx, USER_UFD_IOCTL_ARG, &req);
     assert_eq!(
         dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp),
         SyscallResult::Error(22)
@@ -436,14 +508,14 @@ fn uffdio_copy_with_pending_fault_succeeds_and_drains_queue() {
     let ufd = open.ufd().expect("ufd backing");
     assert_eq!(ufd.pending_fault_count(), 1);
 
-    let mut req = UffdioCopy {
+    let req = UffdioCopy {
         dst: base as u64,
         src: 0xDEAD_BEEF,
         len: USER_PAGE_SIZE as u64,
         mode: 0,
         copy: 0,
     };
-    let argp = (&mut req as *mut UffdioCopy) as u64;
+    let argp = stage_user_value(&ctx, USER_UFD_IOCTL_ARG, &req);
     assert_eq!(
         dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp),
         SyscallResult::Return(0)
@@ -451,7 +523,8 @@ fn uffdio_copy_with_pending_fault_succeeds_and_drains_queue() {
 
     // Post-state: queue drained, writeback set.
     assert_eq!(ufd.pending_fault_count(), 0);
-    assert_eq!(req.copy, USER_PAGE_SIZE as u64);
+    let req_after: UffdioCopy = load_user_value(&ctx, USER_UFD_IOCTL_ARG);
+    assert_eq!(req_after.copy, USER_PAGE_SIZE as u64);
 }
 
 /// `UFFDIO_ZEROPAGE` with a matching pending fault drives `mark_replied`,
@@ -466,7 +539,7 @@ fn uffdio_zeropage_with_pending_fault_succeeds_and_drains_queue() {
     let fd = open_ufd_register_one_page(&ctx, base);
     push_fault(&ctx, fd, base as u64);
 
-    let mut req = UffdioZeropage {
+    let req = UffdioZeropage {
         range: UffdioRange {
             start: base as u64,
             len: USER_PAGE_SIZE as u64,
@@ -474,7 +547,7 @@ fn uffdio_zeropage_with_pending_fault_succeeds_and_drains_queue() {
         mode: 0,
         zeropage: 0,
     };
-    let argp = (&mut req as *mut UffdioZeropage) as u64;
+    let argp = stage_user_value(&ctx, USER_UFD_IOCTL_ARG, &req);
     assert_eq!(
         dispatch_ioctl(&ctx, fd, UFFDIO_ZEROPAGE, argp),
         SyscallResult::Return(0)
@@ -483,7 +556,8 @@ fn uffdio_zeropage_with_pending_fault_succeeds_and_drains_queue() {
     let open = ctx.process.fd(fd).expect("fd installed");
     let ufd = open.ufd().expect("ufd backing");
     assert_eq!(ufd.pending_fault_count(), 0);
-    assert_eq!(req.zeropage, USER_PAGE_SIZE as u64);
+    let req_after: UffdioZeropage = load_user_value(&ctx, USER_UFD_IOCTL_ARG);
+    assert_eq!(req_after.zeropage, USER_PAGE_SIZE as u64);
 }
 
 /// `UFFDIO_CONTINUE` with a matching pending fault drives
@@ -498,7 +572,7 @@ fn uffdio_continue_with_pending_fault_succeeds_and_drains_queue() {
     let fd = open_ufd_register_one_page(&ctx, base);
     push_fault(&ctx, fd, base as u64);
 
-    let mut req = UffdioContinue {
+    let req = UffdioContinue {
         range: UffdioRange {
             start: base as u64,
             len: USER_PAGE_SIZE as u64,
@@ -506,7 +580,7 @@ fn uffdio_continue_with_pending_fault_succeeds_and_drains_queue() {
         mode: 0,
         mapped: 0,
     };
-    let argp = (&mut req as *mut UffdioContinue) as u64;
+    let argp = stage_user_value(&ctx, USER_UFD_IOCTL_ARG, &req);
     assert_eq!(
         dispatch_ioctl(&ctx, fd, UFFDIO_CONTINUE, argp),
         SyscallResult::Return(0)
@@ -515,7 +589,8 @@ fn uffdio_continue_with_pending_fault_succeeds_and_drains_queue() {
     let open = ctx.process.fd(fd).expect("fd installed");
     let ufd = open.ufd().expect("ufd backing");
     assert_eq!(ufd.pending_fault_count(), 0);
-    assert_eq!(req.mapped, USER_PAGE_SIZE as u64);
+    let req_after: UffdioContinue = load_user_value(&ctx, USER_UFD_IOCTL_ARG);
+    assert_eq!(req_after.mapped, USER_PAGE_SIZE as u64);
 }
 
 /// `UFFDIO_COPY` with `dst != fault_addr` returns `-EINVAL`. The agent
@@ -531,14 +606,14 @@ fn uffdio_copy_mismatched_dst_returns_einval() {
     push_fault(&ctx, fd, base as u64);
 
     let other = base + USER_PAGE_SIZE; // outside the registered range
-    let mut req = UffdioCopy {
+    let req = UffdioCopy {
         dst: other as u64,
         src: 0,
         len: USER_PAGE_SIZE as u64,
         mode: 0,
         copy: 0,
     };
-    let argp = (&mut req as *mut UffdioCopy) as u64;
+    let argp = stage_user_value(&ctx, USER_UFD_IOCTL_ARG, &req);
     assert_eq!(
         dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp),
         SyscallResult::Error(22)
@@ -567,8 +642,8 @@ fn ufd_read_empty_queue_nonblocking_returns_eagain() {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
-    let mut buf = [0u8; UFFD_MSG_WIRE_SIZE];
-    let buf_ptr = buf.as_mut_ptr() as u64;
+    let buf_ptr = USER_UFD_READ_BUF as u64;
+    map_user_bytes(&ctx, USER_UFD_READ_BUF, UFFD_MSG_WIRE_SIZE);
     assert_eq!(
         dispatch_read(&ctx, fd, buf_ptr, UFFD_MSG_WIRE_SIZE),
         SyscallResult::Error(11),
@@ -589,7 +664,9 @@ fn ufd_read_with_pending_returns_serialized_uffd_msg() {
     push_fault(&ctx, fd, base as u64);
 
     let mut buf = [0xAAu8; UFFD_MSG_WIRE_SIZE];
-    let buf_ptr = buf.as_mut_ptr() as u64;
+    let buf_ptr = USER_UFD_READ_BUF as u64;
+    map_user_bytes(&ctx, USER_UFD_READ_BUF, UFFD_MSG_WIRE_SIZE);
+    copy_to_user_bytes(&ctx, USER_UFD_READ_BUF, &buf);
     assert_eq!(
         dispatch_read(&ctx, fd, buf_ptr, UFFD_MSG_WIRE_SIZE),
         SyscallResult::Return(UFFD_MSG_WIRE_SIZE as i64),
@@ -603,6 +680,7 @@ fn ufd_read_with_pending_returns_serialized_uffd_msg() {
     //   bytes 16..24 = pagefault.address (le bytes of fault_addr)
     //   bytes 24..28 = pagefault.feat.ptid (zero in test push)
     //   bytes 28..32 = reserved (zero)
+    copy_from_user_bytes(&ctx, USER_UFD_READ_BUF, &mut buf);
     assert_eq!(buf[0], UFFD_EVENT_PAGEFAULT, "wire byte 0 is event");
     for b in &buf[1..16] {
         assert_eq!(*b, 0, "reserved + flags must be zero");
@@ -630,8 +708,8 @@ fn ufd_read_buf_too_small_returns_einval() {
     let fd = open_ufd_register_one_page(&ctx, base);
     push_fault(&ctx, fd, base as u64);
 
-    let mut buf = [0u8; UFFD_MSG_WIRE_SIZE - 1];
-    let buf_ptr = buf.as_mut_ptr() as u64;
+    let buf_ptr = USER_UFD_READ_BUF as u64;
+    map_user_bytes(&ctx, USER_UFD_READ_BUF, UFFD_MSG_WIRE_SIZE - 1);
     assert_eq!(
         dispatch_read(&ctx, fd, buf_ptr, UFFD_MSG_WIRE_SIZE - 1),
         SyscallResult::Error(22),

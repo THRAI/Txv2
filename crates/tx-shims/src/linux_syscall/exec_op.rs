@@ -271,6 +271,12 @@ impl<'a, P: PmapIf + EntropyIf + AuxvIf, I: step_engine::SubjectIdentity> StepOp
                 let mount_nosuid = file.rnode().containing_mount_weak()
                     .and_then(|w| { let g = step_engine::guard(); w.upgrade(&g) })
                     .is_some_and(|mp| mp.options.flags.contains(MountFlags::NOSUID));
+                let mount_noexec = file.rnode().containing_mount_weak()
+                    .and_then(|w| { let g = step_engine::guard(); w.upgrade(&g) })
+                    .is_some_and(|mp| mp.options.flags.contains(MountFlags::NOEXEC));
+                if mount_noexec {
+                    return StepOutcome::Err(step_engine::Errno::EACCES);
+                }
 
                 self.at_secure = if mount_nosuid { false } else {
                     step_apply_suid_for_exec(self.process, Uid(meta.uid), Gid(meta.gid), meta.mode)

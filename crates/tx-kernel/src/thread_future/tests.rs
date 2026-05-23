@@ -10,6 +10,7 @@
 //! the future relies on.
 
 use core::future::Future;
+use core::mem::size_of;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
@@ -29,7 +30,7 @@ use tx_shims::linux_syscall::{
     NR_WRITE,
 };
 use tx_subsystems::process::ExitStatus;
-use tx_subsystems::signal::Signum;
+use tx_subsystems::signal::{SigDisposition, Signum};
 use tx_subsystems::thread_runtime::{
     clear_current_thread_payload, current_thread_payload, drain_pending_syscall_return,
     ThreadPayload,
@@ -39,7 +40,10 @@ use tx_subsystems::vm::{
     VmFaultError, VmMapRequest,
 };
 
-use crate::thread_future::{pf_access_to_vm_access, run_thread, PerHartSlotted};
+use crate::thread_future::{
+    pf_access_to_vm_access, restore_sigreturn_frame, run_thread, siginfo_to_user_abi,
+    PerHartSlotted,
+};
 
 const TEST_PAGE_SIZE: usize = 4096;
 
@@ -101,7 +105,34 @@ impl tx_hal::TrapIf for TestPlatform {
             .push(ctx.regs[10]);
     }
 }
-impl tx_hal::SignalFrameIf for TestPlatform {}
+impl tx_hal::SignalFrameIf for TestPlatform {
+    fn signal_frame_size() -> usize {
+        size_of::<tx_hal::SavedSignalFrame>()
+    }
+
+    fn decode_signal_frame_bytes(
+        user_sp: tx_hal::UserPtr<u8>,
+        bytes: &[u8],
+    ) -> Result<tx_hal::SavedSignalFrame, tx_hal::FaultInfo> {
+        if bytes.len() != size_of::<tx_hal::SavedSignalFrame>() {
+            return Err(tx_hal::FaultInfo {
+                address: tx_hal::VirtAddr(user_sp.addr()),
+                write: false,
+                instruction: false,
+                from_user: true,
+            });
+        }
+        let mut frame = core::mem::MaybeUninit::<tx_hal::SavedSignalFrame>::uninit();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                frame.as_mut_ptr().cast::<u8>(),
+                size_of::<tx_hal::SavedSignalFrame>(),
+            );
+            Ok(frame.assume_init())
+        }
+    }
+}
 impl tx_hal::IrqIf for TestPlatform {}
 
 impl tx_hal::TimeIf for TestPlatform {
@@ -228,23 +259,25 @@ fn futex_wake_return_reenters_userspace_without_mailbox_event() {
         .expect("INIT_PROCESS populated post-bootstrap");
     let leader = init.nth_thread(0).expect("leader");
 
-    payload.store_saved_user_context(Some(tx_hal::UserTrapContext {
+    let mut initial_ctx = tx_hal::UserTrapContext {
         regs: [0; 32],
         pc: 0,
         status: 0,
         fp: tx_hal::UserFpContext::empty(),
-    }));
+    };
+    initial_ctx.regs[10] = 99;
+    payload.store_saved_user_context(Some(initial_ctx));
 
     let future = run_thread::<TestPlatform>(leader, payload.clone());
     let wrapped = PerHartSlotted::<TestPlatform, _>::new(payload.clone(), future);
-    let reactor = tx_reactor::Reactor::new();
+    let reactor = crate::adapter::boot_runtime::Reactor::new();
     let _task = reactor.submit_task(wrapped);
 
     let first = reactor.run_until_idle();
     assert_eq!(first.completed, 0);
     assert_eq!(
         *USERSPACE_A0_LOG.lock().unwrap_or_else(|e| e.into_inner()),
-        std::vec![0],
+        std::vec![99],
         "first userspace dive uses the seeded baseline return register"
     );
 
@@ -264,7 +297,7 @@ fn futex_wake_return_reenters_userspace_without_mailbox_event() {
     assert_eq!(second.completed, 0);
     assert_eq!(
         *USERSPACE_A0_LOG.lock().unwrap_or_else(|e| e.into_inner()),
-        std::vec![0, 1],
+        std::vec![99, 0],
         "FUTEX_WAKE return must be written back and immediately re-enter userspace"
     );
 }
@@ -358,6 +391,48 @@ fn per_hart_slotted_clears_slot_on_pending_exit() {
     assert!(
         current_thread_payload(0).is_none(),
         "slot cleared after Pending poll exit",
+    );
+}
+
+/// `PerHartSlotted` also binds the reactor task mailbox into the
+/// thread payload while the task is polled. Signal delivery posts its
+/// wake hint through this weak handle, so a syscall parked inside
+/// `drive()` must have the binding installed before it blocks.
+#[test]
+fn per_hart_slotted_binds_current_task_mailbox() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    assert!(
+        payload.mailbox_handle().is_none(),
+        "payload starts without a bound task mailbox",
+    );
+
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let observed_for_inner = std::sync::Arc::clone(&observed);
+    let payload_for_inner = payload.clone();
+    let inner = async move {
+        *observed_for_inner.lock().unwrap_or_else(|e| e.into_inner()) = payload_for_inner
+            .mailbox_handle()
+            .and_then(|mailbox| mailbox.upgrade())
+            .is_some();
+    };
+
+    let wrapped = PerHartSlotted::<TestPlatform, _>::new(payload.clone(), inner);
+    let reactor = crate::adapter::boot_runtime::Reactor::new();
+    let _task = reactor.submit_task(wrapped);
+    let result = reactor.run_until_idle();
+
+    assert_eq!(result.completed, 1);
+    assert!(
+        *observed.lock().unwrap_or_else(|e| e.into_inner()),
+        "inner future observes a live task mailbox binding",
+    );
+    assert!(
+        payload
+            .mailbox_handle()
+            .and_then(|mailbox| mailbox.upgrade())
+            .is_some(),
+        "payload retains a weak handle to the task mailbox after poll",
     );
 }
 
@@ -510,6 +585,20 @@ fn ensure_zero_frame_claimed() {
         Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for thread-future tests: {error:?}"),
     }
+}
+
+fn saved_signal_frame_bytes(
+    frame: &tx_hal::SavedSignalFrame,
+) -> [u8; size_of::<tx_hal::SavedSignalFrame>()] {
+    let mut bytes = [0u8; size_of::<tx_hal::SavedSignalFrame>()];
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            core::ptr::from_ref(frame).cast::<u8>(),
+            bytes.as_mut_ptr(),
+            bytes.len(),
+        );
+    }
+    bytes
 }
 
 /// `PageFault` Ok path: the fault script publishes a recipe and the
@@ -769,5 +858,223 @@ fn thread_future_execve_continues_loop_without_writing_pending_return() {
     assert!(
         !init.is_zombie(),
         "ExecCommitted is success — process must remain live"
+    );
+}
+
+/// `rt_sigreturn` must restore the user-edited signal frame. musl's
+/// pthread cancellation handler rewrites `ucontext_t.uc_mcontext.MC_PC`
+/// to `__cp_cancel`; resuming the parked pre-handler snapshot would
+/// lose that rewrite and keep returning to the interrupted syscall.
+#[test]
+fn thread_future_sigreturn_restores_user_edited_frame_context_and_mask() {
+    let _g = setup();
+    ensure_zero_frame_claimed();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader thread post-bootstrap");
+    let aspace = init.aspace_cap().expect("aspace alive");
+
+    let mut parked = tx_hal::UserTrapContext::empty();
+    parked.pc = 0x1234_5678;
+    parked.regs[10] = 0xdead_beef;
+    payload.store_saved_signal_context(Some(parked));
+
+    let mut handler_ctx = tx_hal::UserTrapContext::empty();
+    handler_ctx.regs[2] = 0x7000;
+    payload.store_saved_user_context(Some(handler_ctx));
+    payload.store_signal_mask(tx_subsystems::signal::SignalMask::new(
+        Signum::SIGTERM.bit(),
+    ));
+
+    let mut edited = tx_hal::UserTrapContext::empty();
+    edited.pc = 0x8765_4321;
+    edited.regs[2] = 0x8000;
+    edited.regs[10] = 0xfeed_face;
+    let frame = tx_hal::SavedSignalFrame {
+        saved_mask: tx_hal::UserSignalMaskAbi { bits: 0 },
+        user_context: edited,
+    };
+    let frame_bytes = saved_signal_frame_bytes(&frame);
+    aspace
+        .try_mmap(VmMapRequest::fixed(
+            UserRange::new_aligned(UserVirtAddr(0x7000), TEST_PAGE_SIZE).expect("frame range"),
+            MapPlacement::RequireFree,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ))
+        .expect("seed signal frame mapping");
+    let guard = crate::adapter::step_engine::guard();
+    let copied = aspace.copy_to_user(tx_hal::UserPtr::new(0x7000), &frame_bytes, &guard);
+    assert_eq!(
+        copied,
+        crate::adapter::step_engine::StepOutcome::Done(frame_bytes.len())
+    );
+    drop(guard);
+
+    restore_sigreturn_frame::<TestPlatform>(&leader, &aspace, &payload, &handler_ctx)
+        .expect("valid edited frame restores");
+
+    let restored = payload
+        .saved_user_context()
+        .expect("sigreturn arm must store restored context");
+    assert_eq!(restored.pc, 0x8765_4321);
+    assert_eq!(restored.regs[10], 0xfeed_face);
+    assert_eq!(payload.signal_mask().raw_bits(), 0);
+    assert!(
+        !init.is_zombie(),
+        "valid sigreturn frame keeps process live"
+    );
+}
+
+#[test]
+fn thread_future_sigreturn_preserves_user_blocked_sigcancel_mask() {
+    let _g = setup();
+    ensure_zero_frame_claimed();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader thread post-bootstrap");
+    let aspace = init.aspace_cap().expect("aspace alive");
+
+    let mut parked = tx_hal::UserTrapContext::empty();
+    parked.pc = 0x1234_5678;
+    parked.regs[10] = 0xdead_beef;
+    payload.store_saved_signal_context(Some(parked));
+
+    let mut handler_ctx = tx_hal::UserTrapContext::empty();
+    handler_ctx.regs[2] = 0x7000;
+    payload.store_saved_user_context(Some(handler_ctx));
+    payload.store_signal_mask(tx_subsystems::signal::SignalMask::EMPTY);
+
+    let mut edited = tx_hal::UserTrapContext::empty();
+    edited.pc = 0x8765_4321;
+    edited.regs[2] = 0x8000;
+    edited.regs[10] = 0xfeed_face;
+    let frame = tx_hal::SavedSignalFrame {
+        saved_mask: tx_hal::UserSignalMaskAbi {
+            bits: 1u64 << (33 - 1),
+        },
+        user_context: edited,
+    };
+    let frame_bytes = saved_signal_frame_bytes(&frame);
+    aspace
+        .try_mmap(VmMapRequest::fixed(
+            UserRange::new_aligned(UserVirtAddr(0x7000), TEST_PAGE_SIZE).expect("frame range"),
+            MapPlacement::RequireFree,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ))
+        .expect("seed signal frame mapping");
+    let guard = crate::adapter::step_engine::guard();
+    let copied = aspace.copy_to_user(tx_hal::UserPtr::new(0x7000), &frame_bytes, &guard);
+    assert_eq!(
+        copied,
+        crate::adapter::step_engine::StepOutcome::Done(frame_bytes.len())
+    );
+    drop(guard);
+
+    restore_sigreturn_frame::<TestPlatform>(&leader, &aspace, &payload, &handler_ctx)
+        .expect("valid edited frame restores");
+
+    assert!(
+        payload.signal_mask().raw_bits() & (1u64 << (33 - 1)) != 0,
+        "sigreturn must preserve a user-blocked SIGCANCEL mask"
+    );
+    let restored = payload
+        .saved_user_context()
+        .expect("sigreturn arm must store restored context");
+    assert_eq!(restored.pc, 0x8765_4321);
+    assert_eq!(restored.regs[10], 0xfeed_face);
+    assert!(
+        !init.is_zombie(),
+        "valid sigreturn frame keeps process live"
+    );
+}
+
+#[test]
+fn thread_future_sigreturn_recomputes_summary_for_restored_blocked_sigcancel() {
+    let _g = setup();
+    ensure_zero_frame_claimed();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader thread post-bootstrap");
+    let aspace = init.aspace_cap().expect("aspace alive");
+    let sigcancel = Signum::new(33).expect("musl SIGCANCEL");
+
+    tx_subsystems::signal::step_sigaction(&init, sigcancel, SigDisposition::Handler(0xCAFE));
+    tx_subsystems::thread_runtime::execution::post_signal(
+        &leader,
+        sigcancel,
+        tx_subsystems::signal::adapter::step_engine::SignalRouting::ThreadDirected {
+            tid: leader.tid.0 as u64,
+        },
+        None,
+    );
+    assert!(
+        payload.interrupt_summary().deliverable_signal,
+        "unmasked pending SIGCANCEL should start deliverable"
+    );
+
+    let mut handler_ctx = tx_hal::UserTrapContext::empty();
+    handler_ctx.regs[2] = 0x7000;
+    payload.store_saved_user_context(Some(handler_ctx));
+    payload.store_signal_mask(tx_subsystems::signal::SignalMask::EMPTY);
+
+    let frame = tx_hal::SavedSignalFrame {
+        saved_mask: tx_hal::UserSignalMaskAbi {
+            bits: sigcancel.bit(),
+        },
+        user_context: tx_hal::UserTrapContext::empty(),
+    };
+    let frame_bytes = saved_signal_frame_bytes(&frame);
+    aspace
+        .try_mmap(VmMapRequest::fixed(
+            UserRange::new_aligned(UserVirtAddr(0x7000), TEST_PAGE_SIZE).expect("frame range"),
+            MapPlacement::RequireFree,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ))
+        .expect("seed signal frame mapping");
+    let guard = crate::adapter::step_engine::guard();
+    let copied = aspace.copy_to_user(tx_hal::UserPtr::new(0x7000), &frame_bytes, &guard);
+    assert_eq!(
+        copied,
+        crate::adapter::step_engine::StepOutcome::Done(frame_bytes.len())
+    );
+    drop(guard);
+
+    restore_sigreturn_frame::<TestPlatform>(&leader, &aspace, &payload, &handler_ctx)
+        .expect("valid edited frame restores");
+
+    assert!(
+        !payload.interrupt_summary().deliverable_signal,
+        "restoring a mask that blocks pending SIGCANCEL must clear deliverability"
+    );
+}
+
+#[test]
+fn thread_future_siginfo_to_user_abi_matches_musl_siginfo_prefix() {
+    let info = tx_subsystems::signal::SigInfo {
+        si_signo: Signum::SIGTERM.raw() as u32,
+        si_code: tx_subsystems::signal::SI_USER,
+        si_pid: 123,
+        si_uid: 456,
+    };
+
+    let abi = siginfo_to_user_abi(info);
+    assert_eq!(u32::from_le_bytes(abi.bytes[0..4].try_into().unwrap()), 15);
+    assert_eq!(i32::from_le_bytes(abi.bytes[8..12].try_into().unwrap()), 0);
+    assert_eq!(
+        u32::from_le_bytes(abi.bytes[16..20].try_into().unwrap()),
+        123
+    );
+    assert_eq!(
+        u32::from_le_bytes(abi.bytes[20..24].try_into().unwrap()),
+        456
     );
 }

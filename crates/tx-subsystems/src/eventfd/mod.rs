@@ -113,6 +113,11 @@ pub fn eventfd_create(init_val: u64, flags: u32) -> Result<Cap<EventFd>, ZoneErr
 }
 
 pub fn step_eventfd_read(efd: &EventFd, out: &mut [u8; 8], nonblocking: bool) -> ByteOutcome {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     if efd.is_semaphore() {
         loop {
             let current = efd.counter.load(Ordering::Acquire);
@@ -152,6 +157,11 @@ pub fn step_eventfd_write(
     val: u64,
     nonblocking: bool,
 ) -> StepOutcome<(), NoProgress> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     if val == 0 || val == u64::MAX {
         return StepOutcome::Err(V3Errno::EINVAL);
     }

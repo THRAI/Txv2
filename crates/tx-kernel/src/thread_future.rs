@@ -90,7 +90,7 @@ use boot_runtime::userspace::{
 use tx_hal::{PercpuIf, TrapIf, TxPlatform};
 use tx_subsystems::signal::deliver_synchronous_fault;
 use tx_subsystems::signal::Signum;
-use tx_subsystems::signal::{ast_dispatch, AstOutcome};
+use tx_subsystems::signal::{ast_dispatch, refresh_deliverable_signal_summary, AstOutcome};
 use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload_into;
 use tx_subsystems::thread_runtime::{
     clear_current_thread_payload, clear_current_userspace_payload, set_current_thread_payload,
@@ -118,6 +118,37 @@ pub(crate) const fn pf_access_to_vm_access(access: PageFaultAccess) -> AccessMod
         PageFaultAccess::Write => AccessMode::Write,
         PageFaultAccess::Execute => AccessMode::Execute,
     }
+}
+
+fn restore_sigreturn_frame<P: TxPlatform>(
+    thread: &Cap<ThreadIdentity>,
+    aspace: &Cap<AddressSpace>,
+    payload: &PayloadCap<ThreadPayload>,
+    sigreturn_ctx: &tx_hal::UserTrapContext,
+) -> Result<(), ()> {
+    let frame_size = <P as tx_hal::SignalFrameIf>::signal_frame_size();
+    if frame_size == 0 || frame_size > tx_hal::SignalFrameBytes::CAPACITY {
+        return Err(());
+    }
+    let frame_sp = tx_hal::UserPtr::<u8>::new(user_sp_from_context::<P>(sigreturn_ctx));
+    let mut bytes = [0u8; tx_hal::SignalFrameBytes::CAPACITY];
+    let guard = crate::adapter::step_engine::guard();
+    let copied = aspace.copy_from_user(&mut bytes[..frame_size], frame_sp, &guard);
+    match copied {
+        crate::adapter::step_engine::StepOutcome::Done(n) if n == frame_size => {}
+        _ => return Err(()),
+    }
+    drop(guard);
+
+    let frame =
+        <P as tx_hal::SignalFrameIf>::decode_signal_frame_bytes(frame_sp, &bytes[..frame_size])
+            .map_err(|_| ())?;
+    payload.store_signal_mask(tx_subsystems::signal::SignalMask::new(
+        frame.saved_mask.bits,
+    ));
+    refresh_deliverable_signal_summary(thread);
+    payload.store_saved_user_context(Some(frame.user_context));
+    Ok(())
 }
 
 /// Sanity hook for the from-user invariant: the reactor's
@@ -184,7 +215,7 @@ impl<P: TxPlatform, F: Future> Future for PerHartSlotted<P, F> {
         let hart = <P as PercpuIf>::current_cpu_id().0;
 
         let _prev = set_current_thread_payload(hart, this.payload.clone());
-        if let Some(mailbox) = tx_reactor::current_task_mailbox(hart) {
+        if let Some(mailbox) = crate::adapter::boot_runtime::current_task_mailbox(hart) {
             this.payload.bind_mailbox(Arc::downgrade(&mailbox));
         }
 
@@ -271,12 +302,7 @@ pub async fn run_thread<P: TxPlatform>(
         // handled inline.
         let ast_outcome = ast_dispatch(&thread);
         match ast_outcome {
-            AstOutcome::DeliverHandler {
-                sig,
-                handler,
-                flags,
-                restorer,
-            } => {
+            AstOutcome::DeliverHandler { sig, action } => {
                 // Phase D: full signal-frame delivery via
                 // SignalFrameIf::prepare_signal_frame (added in the
                 // HAL for this purpose).  The HAL builds the
@@ -333,16 +359,40 @@ pub async fn run_thread<P: TxPlatform>(
                     // carrying the applied syscall return in a0).
                     payload.store_saved_signal_context(Some(orig_ctx));
 
-                    // Read current mask to pass to the handler.
+                    let handler = match action.disposition {
+                        tx_subsystems::signal::SigDisposition::Handler(addr) => addr,
+                        _ => continue,
+                    };
+
+                    // Read current mask to pass to the handler, and
+                    // compute the handler-entry mask per sigaction(2).
                     let old_mask = payload.signal_mask();
+                    let mut new_mask = old_mask.union(action.sa_mask);
+                    if !action
+                        .flags
+                        .contains(tx_subsystems::signal::SaFlags::NODEFER)
+                    {
+                        new_mask.block(sig);
+                    }
                     let siginfo = process
                         .siginfo_take(sig)
-                        .map(signal_siginfo_to_user_abi)
+                        .map(siginfo_to_user_abi)
                         .unwrap_or(tx_hal::UserSigInfoAbi::ZERO);
 
                     // Build the signal frame write descriptor.
-                    let stack_top =
-                        tx_hal::UserPtr::<u8>::new(user_sp_from_context::<P>(&orig_ctx));
+                    let stack_top = if action
+                        .flags
+                        .contains(tx_subsystems::signal::SaFlags::ONSTACK)
+                    {
+                        payload
+                            .alt_stack()
+                            .map(|(base, size)| tx_hal::UserPtr::<u8>::new(base + size))
+                            .unwrap_or_else(|| {
+                                tx_hal::UserPtr::<u8>::new(user_sp_from_context::<P>(&orig_ctx))
+                            })
+                    } else {
+                        tx_hal::UserPtr::<u8>::new(user_sp_from_context::<P>(&orig_ctx))
+                    };
                     let setup = tx_hal::SignalFrameWrite {
                         stack_top,
                         sig_no: sig.raw() as u32,
@@ -350,9 +400,11 @@ pub async fn run_thread<P: TxPlatform>(
                         old_mask: tx_hal::UserSignalMaskAbi {
                             bits: old_mask.raw_bits(),
                         },
-                        flags: tx_hal::UserSaFlagsAbi { bits: flags },
+                        flags: tx_hal::UserSaFlagsAbi {
+                            bits: action.flags.bits(),
+                        },
                         handler_pc: tx_hal::UserPtr::<()>::new(handler),
-                        restorer_pc: tx_hal::UserPtr::<()>::new(restorer),
+                        restorer_pc: tx_hal::UserPtr::<()>::new(action.restorer),
                     };
 
                     // Guard is scoped inside this block so it does not
@@ -415,6 +467,17 @@ pub async fn run_thread<P: TxPlatform>(
                                 tx_hal::VirtAddr(frame_addr),
                                 frame_bytes.as_slice().len(),
                             );
+                            payload.store_signal_mask(new_mask);
+                            if action
+                                .flags
+                                .contains(tx_subsystems::signal::SaFlags::RESETHAND)
+                            {
+                                let _ = tx_subsystems::signal::step_sigaction(
+                                    &process,
+                                    sig,
+                                    tx_subsystems::signal::SigDisposition::Default,
+                                );
+                            }
                             payload.store_saved_user_context(Some(handler_ctx));
                         }
                         Err(_) => {
@@ -515,7 +578,7 @@ pub async fn run_thread<P: TxPlatform>(
         // ----------------------------------------------------------------
         match trap {
             UserspaceTrapInfo::TimerPreempt => {
-                tx_reactor::yield_now().await;
+                crate::adapter::boot_runtime::yield_now().await;
             }
             UserspaceTrapInfo::Syscall(req) => {
                 // Resolve the syscall context from the payload.
@@ -530,24 +593,25 @@ pub async fn run_thread<P: TxPlatform>(
                 let mut ctx = tx_shims::linux_syscall::SyscallCtx::new(
                     process.clone(),
                     thread.clone(),
-                    aspace,
+                    aspace.clone(),
                 );
                 // drive-taskmb: inject the current task's mailbox so
                 // drive() can park on it for yield resolution.
                 let hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
-                if let Some(mailbox) = tx_reactor::current_task_mailbox(hart) {
+                if let Some(mailbox) = crate::adapter::boot_runtime::current_task_mailbox(hart) {
                     ctx = ctx.with_mailbox(mailbox);
                 }
                 // drive-taskmb: inject the reactor's timer wheel for
                 // OnTimer yield resolution.
-                if let Some(tw) = tx_reactor::current_timer_wheel(hart) {
+                if let Some(tw) = crate::adapter::boot_runtime::current_timer_wheel(hart) {
                     ctx = ctx.with_timer_wheel(tw);
                 }
                 // drive-taskmb: inject the reactor's delegate registry
                 // for OnAgent yield resolution.
-                if let Some(dr) = tx_reactor::current_delegate_registry(hart) {
+                if let Some(dr) = crate::adapter::boot_runtime::current_delegate_registry(hart) {
                     ctx = ctx.with_delegate_registry(dr);
                 }
+                let sigreturn_ctx = payload.saved_user_context();
                 let result = tx_shims::linux_syscall::dispatch::<P>(req, &ctx).await;
 
                 // Threshold-based observation dump. If the boot path
@@ -604,12 +668,28 @@ pub async fn run_thread<P: TxPlatform>(
                         // `make_initial_user_trap_context`).
                     }
                     tx_shims::linux_syscall::SyscallResult::SigreturnRestored => {
-                        // `sys_rt_sigreturn` already consumed the parked
-                        // pre-handler context and restored it into
-                        // `saved_user_context`.  Do not take it again here:
-                        // this branch only preserves the ExecCommitted shape
-                        // of skipping normal pending-syscall-return writeback
-                        // and re-entering with the restored context.
+                        // `rt_sigreturn` is special: musl cancellation
+                        // handlers may edit the on-stack ucontext (notably
+                        // MC_PC) before returning through the trampoline.
+                        // Read the user frame with the selected platform's
+                        // ABI decoder and replace the parked syscall-layer
+                        // fallback context with the user-edited one.
+                        let Some(sigreturn_ctx) = sigreturn_ctx else {
+                            tx_subsystems::process::execution::step_exit_group_with_signal(
+                                &process,
+                                Signum::SIGSEGV,
+                            );
+                            return;
+                        };
+                        if restore_sigreturn_frame::<P>(&thread, &aspace, &payload, &sigreturn_ctx)
+                            .is_err()
+                        {
+                            tx_subsystems::process::execution::step_exit_group_with_signal(
+                                &process,
+                                Signum::SIGSEGV,
+                            );
+                            return;
+                        }
                     }
                 }
             }
@@ -817,13 +897,13 @@ fn write_hex_u64<P: TxPlatform>(value: u64) {
     let mut started = false;
     let mut out = [0u8; 16];
     let mut len = 0;
-    for idx in 0..16 {
+    for (idx, slot) in digits.iter_mut().enumerate() {
         let shift = (15 - idx) * 4;
         let digit = ((value >> shift) & 0xf) as usize;
-        digits[idx] = HEX[digit];
+        *slot = HEX[digit];
         if digit != 0 || started || idx == 15 {
             started = true;
-            out[len] = digits[idx];
+            out[len] = *slot;
             len += 1;
         }
     }
@@ -831,7 +911,7 @@ fn write_hex_u64<P: TxPlatform>(value: u64) {
     tx_hal::console_write_str::<P>(s);
 }
 
-fn signal_siginfo_to_user_abi(info: tx_subsystems::signal::SigInfo) -> tx_hal::UserSigInfoAbi {
+fn siginfo_to_user_abi(info: tx_subsystems::signal::SigInfo) -> tx_hal::UserSigInfoAbi {
     let mut abi = tx_hal::UserSigInfoAbi::ZERO;
     abi.bytes[0..4].copy_from_slice(&info.si_signo.to_ne_bytes());
     abi.bytes[4..8].copy_from_slice(&0i32.to_ne_bytes());
@@ -883,10 +963,10 @@ fn reserve_signal_frame_storage(
     let Ok(range) = UserRange::new_aligned(UserVirtAddr(start), len) else {
         return false;
     };
-    matches!(
+    use crate::adapter::step_engine::StepOutcome as V3;
+    !matches!(
         aspace.reserve_user_range_for_access(range, UserAccessKind::Write),
-        crate::adapter::step_engine::StepOutcome::Done(())
-            | crate::adapter::step_engine::StepOutcome::Continue { .. }
+        V3::Err(_) | V3::Yield { .. }
     )
 }
 
