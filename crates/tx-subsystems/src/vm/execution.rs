@@ -260,26 +260,12 @@ impl AddressSpace {
     ) -> Result<PmapPublishOutcome, VmFaultError> {
         let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
         loop {
-            let outcome = {
-                let _guard = match self
-                    .range_lock
-                    .acquire_step(page_range, LockMode::Materializer)
-                {
-                    V3StepOutcome::Done(guard) => guard,
-                    V3StepOutcome::Yield {
-                        shape:
-                            YieldShape::OnWaitSource {
-                                source: carrier,
-                                interests,
-                            },
-                        ..
-                    } => {
-                        await_range_lock(WaitToken::new(carrier.raw(), interests.raw())).await;
-                        continue;
-                    }
-                    _ => unreachable_acquire_step(),
-                };
-                require_fault_recipe(self, fault)?
+            let outcome = match self.try_fault_script_resolve(page_range, fault)? {
+                FaultScriptResolve::Done(outcome) => outcome,
+                FaultScriptResolve::Wait(token) => {
+                    await_range_lock(token).await;
+                    continue;
+                }
             };
 
             // PR-10 phase 4 OnAgent branch. Read the per-VMA
@@ -303,68 +289,118 @@ impl AddressSpace {
                 None
             };
 
-            let materialization = match ufd_reply {
-                Some(DelegateReply::Ufd(UfdReply::Copy {
-                    src_kernel_addr,
-                    dst_uaddr: _,
-                    len,
-                })) => materialize_ufd_copy(&outcome, src_kernel_addr, len)?,
-                Some(DelegateReply::Ufd(UfdReply::ZeroPage { .. })) | None => {
-                    let guard = step_engine::guard();
-                    match outcome.materialize_pagebacked_step(&guard) {
-                        VmFaultMaterializationStep::Done(materialization) => materialization,
-                        VmFaultMaterializationStep::Blocked(token) => {
-                            drop(guard);
-                            await_range_lock(token).await;
-                            continue;
-                        }
-                        VmFaultMaterializationStep::Err(error) => return Err(error),
-                    }
-                }
-                Some(DelegateReply::Ufd(UfdReply::Continue { .. })) => {
-                    // `UFFDIO_CONTINUE` is the MINOR-mode path (ufd-shm
-                    // / page-cache shared mappings). Phase 3 only
-                    // admitted `UFFDIO_REGISTER_MODE_MISSING`, so this
-                    // variant should never appear in PR-10's wired
-                    // surface. Reject with `WouldBlock` rather than
-                    // pretending to install — the trap dispatcher will
-                    // surface SIGBUS per the
-                    // agent-dropped-reply mapping.
-                    return Err(VmFaultError::WouldBlock);
-                }
-            };
-
-            let _guard = match self
-                .range_lock
-                .acquire_step(outcome.page_range, LockMode::Materializer)
-            {
-                V3StepOutcome::Done(guard) => guard,
-                V3StepOutcome::Yield {
-                    shape:
-                        YieldShape::OnWaitSource {
-                            source: carrier,
-                            interests,
-                        },
-                    ..
-                } => {
-                    drop(materialization);
-                    await_range_lock(WaitToken::new(carrier.raw(), interests.raw())).await;
+            match self.try_fault_script_materialize_and_publish(&outcome, ufd_reply)? {
+                FaultScriptPublish::Done(outcome) => return Ok(outcome),
+                FaultScriptPublish::Wait(token) => {
+                    await_range_lock(token).await;
                     continue;
                 }
-                _ => unreachable_acquire_step(),
-            };
-            let _entry = require_fault_publication(self, &outcome, &materialization)?;
-            return self
-                .pmap
-                .publish_page_with_replacement(
-                    outcome.page_range.start().containing_page(),
-                    materialization.page.ppn,
-                    materialization.publish_prot,
-                    materialization.page.map_pin,
-                    materialization.replace_existing,
-                )
-                .map_err(VmFaultError::Pmap);
+            }
         }
+    }
+
+    fn try_fault_script_resolve(
+        &self,
+        page_range: UserRange,
+        fault: VmFault,
+    ) -> Result<FaultScriptResolve, VmFaultError> {
+        let _guard = match self
+            .range_lock
+            .acquire_step(page_range, LockMode::Materializer)
+        {
+            V3StepOutcome::Done(guard) => guard,
+            V3StepOutcome::Yield {
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
+                ..
+            } => {
+                return Ok(FaultScriptResolve::Wait(WaitToken::new(
+                    carrier.raw(),
+                    interests.raw(),
+                )));
+            }
+            _ => unreachable_acquire_step(),
+        };
+        Ok(FaultScriptResolve::Done(require_fault_recipe(self, fault)?))
+    }
+
+    fn try_fault_script_publish(
+        &self,
+        outcome: &VmFaultOutcome,
+        materialization: VmFaultMaterialization,
+    ) -> Result<FaultScriptPublish, VmFaultError> {
+        let _guard = match self
+            .range_lock
+            .acquire_step(outcome.page_range, LockMode::Materializer)
+        {
+            V3StepOutcome::Done(guard) => guard,
+            V3StepOutcome::Yield {
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
+                ..
+            } => {
+                drop(materialization);
+                return Ok(FaultScriptPublish::Wait(WaitToken::new(
+                    carrier.raw(),
+                    interests.raw(),
+                )));
+            }
+            _ => unreachable_acquire_step(),
+        };
+        let _entry = require_fault_publication(self, outcome, &materialization)?;
+        let published = self
+            .pmap
+            .publish_page_with_replacement(
+                outcome.page_range.start().containing_page(),
+                materialization.page.ppn,
+                materialization.publish_prot,
+                materialization.page.map_pin,
+                materialization.replace_existing,
+            )
+            .map_err(VmFaultError::Pmap)?;
+        Ok(FaultScriptPublish::Done(published))
+    }
+
+    fn try_fault_script_materialize_and_publish(
+        &self,
+        outcome: &VmFaultOutcome,
+        ufd_reply: Option<DelegateReply>,
+    ) -> Result<FaultScriptPublish, VmFaultError> {
+        let materialization = match ufd_reply {
+            Some(DelegateReply::Ufd(UfdReply::Copy {
+                src_kernel_addr,
+                dst_uaddr: _,
+                len,
+            })) => materialize_ufd_copy(outcome, src_kernel_addr, len)?,
+            Some(DelegateReply::Ufd(UfdReply::ZeroPage { .. })) | None => {
+                let guard = step_engine::guard();
+                match outcome.materialize_pagebacked_step(&guard) {
+                    VmFaultMaterializationStep::Done(materialization) => materialization,
+                    VmFaultMaterializationStep::Blocked(token) => {
+                        drop(guard);
+                        return Ok(FaultScriptPublish::Wait(token));
+                    }
+                    VmFaultMaterializationStep::Err(error) => return Err(error),
+                }
+            }
+            Some(DelegateReply::Ufd(UfdReply::Continue { .. })) => {
+                // `UFFDIO_CONTINUE` is the MINOR-mode path (ufd-shm
+                // / page-cache shared mappings). Phase 3 only
+                // admitted `UFFDIO_REGISTER_MODE_MISSING`, so this
+                // variant should never appear in PR-10's wired
+                // surface. Reject with `WouldBlock` rather than
+                // pretending to install; the trap dispatcher will
+                // surface SIGBUS per the agent-dropped-reply mapping.
+                return Err(VmFaultError::WouldBlock);
+            }
+        };
+        self.try_fault_script_publish(outcome, materialization)
     }
 
     pub fn try_mmap(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
@@ -825,6 +861,16 @@ pub enum MapReserveResult<'a> {
     Reserved(MapReservation<'a>),
     Blocked(WaitToken),
     Err(VmMapError),
+}
+
+enum FaultScriptResolve {
+    Done(VmFaultOutcome),
+    Wait(WaitToken),
+}
+
+enum FaultScriptPublish {
+    Done(PmapPublishOutcome),
+    Wait(WaitToken),
 }
 
 impl core::fmt::Debug for MapReserveResult<'_> {

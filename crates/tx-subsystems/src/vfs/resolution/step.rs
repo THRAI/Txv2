@@ -14,7 +14,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::execution::Guard;
-use crate::mount::MountPayload;
+use crate::mount::{MountNamespace, MountPayload};
 use crate::vfs::adapter::step_engine::{self, Cap, StepOutcome};
 use crate::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking,
@@ -39,6 +39,7 @@ pub fn kernel_step(
     walking: WalkingState,
     fs_ops: Arc<dyn FsOps>,
     mount_payload: Option<Cap<MountPayload>>,
+    mount_namespace: Option<&Cap<MountNamespace>>,
     cred: &Credential,
     mode: WalkMode,
     policy: FinalSymlinkPolicy,
@@ -331,9 +332,17 @@ pub fn kernel_step(
     let crossing_mount = child_dentry.mounted_hint().and_then(|w| w.upgrade(guard));
     let crossing_mount = match crossing_mount {
         Some(m) => Some(m),
-        None => mount_payload
-            .as_ref()
-            .and_then(|payload| crate::mount::mount_for(payload, child_fs_object_id)),
+        None => mount_payload.as_ref().and_then(|payload| {
+            mount_namespace
+                .and_then(|ns| ns.mount_for(payload, child_fs_object_id))
+                .or_else(|| {
+                    if mount_namespace.is_some() {
+                        None
+                    } else {
+                        crate::mount::mount_for(payload, child_fs_object_id)
+                    }
+                })
+        }),
     };
     if let Some(mount_cap) = crossing_mount {
         let new_current = match walker::dentry_for_mount_root(&mount_cap, Some(&child_dentry)) {

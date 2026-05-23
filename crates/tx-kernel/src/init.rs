@@ -11,7 +11,7 @@ use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
 use tx_subsystems::mount::{
-    self, MountFlags, MountIdentity, MountOptions, MountPayload, SourceLabel,
+    self, MountFlags, MountIdentity, MountNamespace, MountOptions, MountPayload, SourceLabel,
 };
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::tty::structure::TtyIdentity;
@@ -70,6 +70,11 @@ static ROOT_DENTRY: SpinMutex<Option<Cap<DEntry>>> = SpinMutex::new(None);
 /// after `init_substrate_if_ready` returns.
 static DEV_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
 
+/// Global tmpfs mount at `/dev/shm`. Populated by
+/// `mount_tmpfs_at_dev_shm` after devfs is mounted; retained so POSIX
+/// shm/named-sem paths have a live tmpfs payload for the kernel lifetime.
+static DEV_SHM_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
+
 /// Global sdcard ext4 mount at `/musl`. Populated by
 /// `mount_sdcard_at_musl` when a `vda` block device is registered.
 /// Boards without a block device silently leave this `None`.
@@ -91,10 +96,20 @@ pub fn root_mount() -> Option<Cap<MountIdentity>> {
     ROOT_MOUNT.lock().clone()
 }
 
+fn init_mount_namespace() -> Option<Cap<MountNamespace>> {
+    tx_subsystems::process::init_process()?.mount_namespace_cap()
+}
+
 /// Snapshot the boot-time devfs mount cap. Returns `None` until
 /// `mount_devfs_at_dev` has run.
 pub fn dev_mount() -> Option<Cap<MountIdentity>> {
     DEV_MOUNT.lock().clone()
+}
+
+/// Snapshot the boot-time `/dev/shm` tmpfs mount cap. Returns `None`
+/// until `mount_tmpfs_at_dev_shm` has run.
+pub fn dev_shm_mount() -> Option<Cap<MountIdentity>> {
+    DEV_SHM_MOUNT.lock().clone()
 }
 
 /// Snapshot the boot-time console TTY cap. Returns `None` until
@@ -113,6 +128,7 @@ pub(crate) fn mark_boot_reactor_userspace_preempt(cpu_id: CpuId) {
 pub fn reset_boot_state_for_test() {
     *ROOT_MOUNT.lock() = None;
     *DEV_MOUNT.lock() = None;
+    *DEV_SHM_MOUNT.lock() = None;
     *CONSOLE_TTY.lock() = None;
     *ROOT_DENTRY.lock() = None;
 }
@@ -298,6 +314,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_rootfs_from_boot_media();
             Self::mount_devfs_at_dev();
             Self::register_devfs_console_alias();
+            Self::mount_tmpfs_at_dev_shm();
             Self::mount_procfs_at_proc();
             Self::mount_bdevfs_at_dev_block();
             Self::mount_sdcard_at_musl();
@@ -549,6 +566,13 @@ impl<P: TxPlatform> CoreInit<P> {
         )
         .expect("mount_rootfs_tmpfs: mount identity reservation");
 
+        let mnt_ns = MountNamespace::new_cap(mount.clone())
+            .expect("mount_rootfs_tmpfs: mount namespace reservation");
+        if let Some(init) = tx_subsystems::process::init_process() {
+            tx_subsystems::process::step_set_mount_namespace(&init, mnt_ns)
+                .expect("mount_rootfs_tmpfs: publish init mount namespace");
+        }
+
         *ROOT_MOUNT.lock() = Some(mount);
 
         Self::write_board_sentinel_prefix();
@@ -669,6 +693,9 @@ impl<P: TxPlatform> CoreInit<P> {
         // sees the registered mount or no mount at all (never a
         // half-built one).
         mount::register_mount(&rootfs_payload, dev_object_id, dev_mount.clone());
+        if let Some(mnt_ns) = init_mount_namespace() {
+            mnt_ns.register_mount(&rootfs_payload, dev_object_id, dev_mount.clone());
+        }
 
         *DEV_MOUNT.lock() = Some(dev_mount);
 
@@ -762,10 +789,102 @@ impl<P: TxPlatform> CoreInit<P> {
         )
         .expect("mount_procfs_at_proc: mount identity reservation");
 
-        mount::register_mount(&rootfs_payload, proc_object_id, proc_mount);
+        mount::register_mount(&rootfs_payload, proc_object_id, proc_mount.clone());
+        if let Some(mnt_ns) = init_mount_namespace() {
+            mnt_ns.register_mount(&rootfs_payload, proc_object_id, proc_mount);
+        }
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:procfs:ok\n");
+    }
+
+    /// Mount tmpfs on `/dev/shm`.
+    ///
+    /// POSIX shm (`shm_open`) and named semaphores (`sem_open`) are
+    /// normal libc path operations under `/dev/shm`; the kernel side is
+    /// therefore just a tmpfs mount over devfs's synthetic `shm`
+    /// mountpoint. No separate POSIX-shm namespace is created.
+    ///
+    /// **Order invariant:** runs after `mount_devfs_at_dev` so the
+    /// devfs root payload and synthetic `/dev/shm` directory exist, and
+    /// before userspace starts.
+    pub(crate) fn mount_tmpfs_at_dev_shm() {
+        let dev_mount = DEV_MOUNT
+            .lock()
+            .clone()
+            .expect("mount_tmpfs_at_dev_shm: DEV_MOUNT must be populated");
+
+        let shm_meta = InodeMeta::new(
+            tx_subsystems::vfs::InodeKind::Directory,
+            tx_fs::devfs::DEVFS_SHM_DIR_MODE,
+        );
+        let shm_rnode_in_devfs = RNode::new_cap(
+            tx_fs::devfs::DEVFS_SHM_DIR_OBJECT_ID,
+            shm_meta,
+            RNodeBacking::Directory,
+        )
+        .expect("mount_tmpfs_at_dev_shm: /dev/shm rnode-on-devfs reservation");
+        let shm_dentry_on_devfs = DEntry::new_cap(
+            InlineName::new(b"shm").expect("mount_tmpfs_at_dev_shm: /shm inline name"),
+            shm_rnode_in_devfs,
+        )
+        .expect("mount_tmpfs_at_dev_shm: /dev/shm dentry-on-devfs reservation");
+
+        let (_tmpfs, mount_output) = tx_fs::tmpfs::Tmpfs::new_root();
+        let tmpfs_payload = MountPayload::new_cap(
+            mount_output.fs_ops.clone(),
+            mount_output.fs_page_backing.clone(),
+            None,
+            mount::allocate_dev_id(),
+            MountOptions::default(),
+            "tmpfs",
+            SourceLabel::Static("dev-shm"),
+        )
+        .expect("mount_tmpfs_at_dev_shm: payload reservation");
+
+        let tmpfs_root_rnode = {
+            let raw = RNode::new(
+                mount_output.root_fs_object_id,
+                mount_output.root_inode_meta,
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&tmpfs_payload);
+            let res = step_engine::reserve_for::<RNode>()
+                .expect("mount_tmpfs_at_dev_shm: tmpfs root rnode reservation");
+            step_engine::sign_for(res, raw)
+        };
+
+        let devfs_payload = dev_mount
+            .payload_cap()
+            .expect("devfs payload alive during boot")
+            .into_cap();
+
+        let shm_mount = MountIdentity::new_cap(
+            mount::allocate_mount_id(),
+            Some(shm_dentry_on_devfs),
+            tmpfs_root_rnode,
+            Some(dev_mount),
+            tmpfs_payload,
+            MountFlags::empty(),
+        )
+        .expect("mount_tmpfs_at_dev_shm: mount identity reservation");
+
+        mount::register_mount(
+            &devfs_payload,
+            tx_fs::devfs::DEVFS_SHM_DIR_OBJECT_ID,
+            shm_mount.clone(),
+        );
+        if let Some(mnt_ns) = init_mount_namespace() {
+            mnt_ns.register_mount(
+                &devfs_payload,
+                tx_fs::devfs::DEVFS_SHM_DIR_OBJECT_ID,
+                shm_mount.clone(),
+            );
+        }
+
+        *DEV_SHM_MOUNT.lock() = Some(shm_mount);
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:devshm:tmpfs:ok\n");
     }
 
     /// Mount bdev-fs on `/dev/block`.
@@ -877,8 +996,15 @@ impl<P: TxPlatform> CoreInit<P> {
         mount::register_mount(
             &devfs_payload,
             tx_fs::devfs::DEVFS_BLOCK_DIR_OBJECT_ID,
-            bdev_mount,
+            bdev_mount.clone(),
         );
+        if let Some(mnt_ns) = init_mount_namespace() {
+            mnt_ns.register_mount(
+                &devfs_payload,
+                tx_fs::devfs::DEVFS_BLOCK_DIR_OBJECT_ID,
+                bdev_mount,
+            );
+        }
 
         // rootfs ownership of the chain holds: devfs is mounted on
         // rootfs, bdev-fs is mounted on devfs.
@@ -1011,6 +1137,9 @@ impl<P: TxPlatform> CoreInit<P> {
         // Register in the VFS mount table so the walker crosses from
         // tmpfs into ext4 at `/musl`.
         mount::register_mount(&rootfs_payload, musl_object_id, musl_mount.clone());
+        if let Some(mnt_ns) = init_mount_namespace() {
+            mnt_ns.register_mount(&rootfs_payload, musl_object_id, musl_mount.clone());
+        }
 
         *MUSL_MOUNT.lock() = Some(musl_mount);
 

@@ -106,6 +106,43 @@ fn shmat_maps_pagebacked_segment_and_shmdt_tracks_attach_count() {
 }
 
 #[test]
+fn shm_namespace_entry_is_identity_cap_authority() {
+    let _g = setup();
+
+    let creator = cred(1000, 1000);
+    let ns = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+    let key = 0x5348_4d01;
+    let shmid = execution::step_shmget(
+        key,
+        4096,
+        execution::IPC_CREAT | execution::IPC_EXCL | 0o600,
+        &creator,
+        &ns,
+    )
+    .expect("shmget keyed");
+
+    let namespace_segment = ns
+        .ipc_ns
+        .sysv_shm
+        .lock()
+        .get(&crate::process::nsproxy::SysvKey::new(key as u32))
+        .expect("namespace entry")
+        .clone();
+
+    assert_eq!(namespace_segment.shmid, shmid);
+    assert_eq!(
+        namespace_segment.key().raw(),
+        crate::ipc::sysv_shm::structure::lookup_shm(shmid)
+            .expect("global compatibility registry")
+            .key()
+            .raw(),
+        "IpcNamespace.sysv_shm must be the authority for the shm identity cap"
+    );
+
+    execution::step_shmctl_in_ns(shmid, execution::IPC_RMID, None, &creator, &ns).expect("cleanup");
+}
+
+#[test]
 fn shmdt_rejects_same_address_mapping_from_other_address_space() {
     let _g = setup();
 

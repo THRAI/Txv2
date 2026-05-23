@@ -63,14 +63,12 @@ pub fn step_msgget(
 
     if let Some(ref k) = ipc_key {
         let table = nsproxy.ipc_ns.sysv_msg.lock();
-        if let Some(&existing_msqid) = table.get(k) {
-            drop(table);
-            let q = checks::require_msg_exists(existing_msqid)?;
+        if let Some(q) = table.get(k).cloned() {
             if exclusive {
                 return Err(Errno::EEXIST);
             }
             checks::require_can_read_msg(&q, cred)?;
-            return Ok(existing_msqid);
+            return Ok(q.msqid);
         }
     }
 
@@ -83,7 +81,7 @@ pub fn step_msgget(
     let max_msg_size = limits.msgmax as usize;
     drop(limits);
 
-    let msqid = crate::ipc::sysv_msg::structure::register_msg(
+    let queue = crate::ipc::sysv_msg::structure::register_msg(
         ipc_key,
         cred.clone(),
         perm,
@@ -95,10 +93,10 @@ pub fn step_msgget(
     .map_err(|_| Errno::ENOMEM)?;
 
     if let Some(ref k) = ipc_key {
-        nsproxy.ipc_ns.sysv_msg.lock().insert(*k, msqid);
+        nsproxy.ipc_ns.sysv_msg.lock().insert(*k, queue.clone());
     }
 
-    Ok(msqid)
+    Ok(queue.msqid)
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +280,30 @@ pub fn step_msgctl(
         }),
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// Namespace-aware `msgctl` wrapper for syscall paths that can withdraw
+/// keyed namespace bindings on `IPC_RMID`.
+pub fn step_msgctl_in_ns(
+    msqid: u32,
+    cmd: i32,
+    set_fields: Option<(u16, u32, u32)>,
+    cred: &Cap<Cred>,
+    nsproxy: &Cap<crate::process::nsproxy::NsProxy>,
+) -> Result<MsgCtlResult, Errno> {
+    let key = if cmd == IPC_RMID {
+        Some(checks::require_msg_exists(msqid)?.key)
+    } else {
+        None
+    };
+    let result = step_msgctl(msqid, cmd, set_fields, cred)?;
+    if let Some(Some(key)) = key {
+        let mut table = nsproxy.ipc_ns.sysv_msg.lock();
+        if table.get(&key).map(|queue| queue.msqid) == Some(msqid) {
+            table.remove(&key);
+        }
+    }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------

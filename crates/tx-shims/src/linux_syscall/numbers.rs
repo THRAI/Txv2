@@ -280,9 +280,12 @@ pub const CLONE_PARENT_SETTID: u64 = 0x100000;
 pub const CLONE_DETACHED: u64 = 0x400000;
 /// System-V semaphore undo on exit; musl sets this in pthread_create.
 pub const CLONE_SYSVSEM: u64 = 0x40000;
-/// Namespace flags — silently accepted; txKernel does not namespace.
+/// Namespace flags. `CLONE_NEWIPC` is wired to the process nsproxy
+/// clone path; the others are still silently accepted by pthread_create
+/// compatibility paths and remain namespace stubs.
 pub const CLONE_NEWCGROUP: u64 = 0x2000000;
 pub const CLONE_NEWUTS: u64 = 0x4000000;
+pub const CLONE_NEWIPC: u64 = 0x8000000;
 
 /// `getppid()`. Linux generic ABI `__NR_getppid`. Wraps
 /// `ProcessIdentity::parent_pid()`. Returns `0` (`Pid::RESERVED`)

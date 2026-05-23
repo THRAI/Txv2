@@ -308,6 +308,7 @@ fn drive_boot_wiring() {
     CoreInit::<TestPlatform>::mount_rootfs_from_boot_media();
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
     CoreInit::<TestPlatform>::register_devfs_console_alias();
+    CoreInit::<TestPlatform>::mount_tmpfs_at_dev_shm();
     CoreInit::<TestPlatform>::mount_bdevfs_at_dev_block();
     CoreInit::<TestPlatform>::bind_init_cwd_and_root();
 }
@@ -463,6 +464,119 @@ fn boot_smoke_walker_resolves_dev_block_after_bdevfs_mount() {
         matches!(dentry.rnode().backing(), RNodeBacking::Directory),
         "/dev/block is a Directory"
     );
+}
+
+/// POSIX shm (`shm_open`) and named semaphores (`sem_open`) are libc
+/// path operations over `/dev/shm`; the kernel side must therefore
+/// publish a tmpfs mount over devfs's synthetic `/dev/shm` directory.
+#[test]
+fn boot_smoke_walker_resolves_dev_shm_to_tmpfs_mount() {
+    use tx_subsystems::vfs::{walker, Credential, RNodeBacking};
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let cwd = init.cwd().expect("init cwd must be bound");
+    let cred = Credential::root();
+    let walk_guard = guard();
+    use step_engine::StepOutcome as V3;
+    let outcome = walker::step_walk(cwd, b"/dev/shm", &cred, &walk_guard);
+    drop(walk_guard);
+
+    let dentry = match outcome {
+        V3::Done(d) => d,
+        other => panic!("step_walk(/dev/shm) must succeed after shm tmpfs mount, got {other:?}"),
+    };
+
+    assert_eq!(
+        dentry.rnode().fs_object_id(),
+        tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
+        "/dev/shm must resolve to the tmpfs root, not devfs's mountpoint stub"
+    );
+    assert!(
+        matches!(dentry.rnode().backing(), RNodeBacking::Directory),
+        "/dev/shm is a Directory"
+    );
+    let payload_guard = guard();
+    let payload = dentry
+        .rnode()
+        .containing_mount_weak()
+        .expect("/dev/shm tmpfs root has containing_mount")
+        .upgrade(&payload_guard)
+        .expect("/dev/shm tmpfs payload is retained");
+    assert_eq!(payload.fstype, "tmpfs");
+    drop(payload_guard);
+}
+
+#[test]
+fn boot_smoke_dev_shm_accepts_posix_shm_and_named_sem_files() {
+    use tx_subsystems::vfs::{walker, Credential, RNodeBacking};
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let cwd = init.cwd().expect("init cwd must be bound");
+    let cred = Credential::root();
+
+    let walk_guard = guard();
+    use step_engine::StepOutcome as V3;
+    let shm_dir = match walker::step_walk(cwd.clone(), b"/dev/shm", &cred, &walk_guard) {
+        V3::Done(d) => d,
+        other => panic!("step_walk(/dev/shm) must succeed after tmpfs mount, got {other:?}"),
+    };
+    drop(walk_guard);
+
+    let payload_guard = guard();
+    let payload = shm_dir
+        .rnode()
+        .containing_mount_weak()
+        .expect("/dev/shm has containing_mount")
+        .upgrade(&payload_guard)
+        .expect("/dev/shm tmpfs payload is retained");
+    let fs_ops = payload.fs_ops.clone();
+    drop(payload_guard);
+
+    for name in [b"tx-posix-shm".as_slice(), b"sem.tx-posix-sem".as_slice()] {
+        let create_guard = guard();
+        match fs_ops.create_inode(
+            shm_dir.rnode().fs_object_id(),
+            name,
+            0o600,
+            &cred,
+            &create_guard,
+        ) {
+            V3::Done(_) => {
+                shm_dir.remove_cached_child_by_name(name);
+            }
+            other => panic!("create_inode(/dev/shm/{:?}) failed: {other:?}", name),
+        }
+        drop(create_guard);
+
+        let path = match name {
+            b"tx-posix-shm" => b"/dev/shm/tx-posix-shm".as_slice(),
+            b"sem.tx-posix-sem" => b"/dev/shm/sem.tx-posix-sem".as_slice(),
+            _ => unreachable!(),
+        };
+        let verify_guard = guard();
+        let file = match walker::step_walk(cwd.clone(), path, &cred, &verify_guard) {
+            V3::Done(d) => d,
+            other => panic!(
+                "step_walk({:?}) must resolve tmpfs file, got {other:?}",
+                path
+            ),
+        };
+        drop(verify_guard);
+
+        assert!(
+            matches!(file.rnode().backing(), RNodeBacking::PageBacked { .. }),
+            "{:?} must resolve as a tmpfs page-backed regular file",
+            path
+        );
+    }
 }
 
 #[test]
