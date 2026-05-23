@@ -29,6 +29,12 @@ pub const NR_READV: u64 = 65;
 pub const NR_PREADV: u64 = 69;
 /// `pwritev(fd, iov, iovcnt, offset)`. Linux generic ABI `__NR_pwritev`.
 pub const NR_PWRITEV: u64 = 70;
+/// `preadv2(fd, iov, iovcnt, offset_lo, offset_hi, flags)`.
+/// Linux generic ABI `__NR_preadv2`.
+pub const NR_PREADV2: u64 = 286;
+/// `pwritev2(fd, iov, iovcnt, offset_lo, offset_hi, flags)`.
+/// Linux generic ABI `__NR_pwritev2`.
+pub const NR_PWRITEV2: u64 = 287;
 /// `socket(domain, type, protocol)`. Linux generic ABI `__NR_socket`.
 pub const NR_SOCKET: u64 = 198;
 /// `socketpair(domain, type, protocol, sv)`. Linux generic ABI `__NR_socketpair`.
