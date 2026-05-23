@@ -226,6 +226,7 @@ static LA64_ACTIVE_ASID: AtomicUsize = AtomicUsize::new(0);
 static LA64_COMMITTED_PT_NODE_REGISTRY_LOCK: AtomicBool = AtomicBool::new(false);
 static LA64_COMMITTED_PT_NODES: La64CommittedPtNodeRegistry =
     La64CommittedPtNodeRegistry(UnsafeCell::new([None; 256]));
+#[cfg(target_arch = "loongarch64")]
 static LA64_KERNEL_TLS_VALID: [AtomicBool; LA64_MAX_BOOT_CPUS] = [
     AtomicBool::new(false),
     AtomicBool::new(false),

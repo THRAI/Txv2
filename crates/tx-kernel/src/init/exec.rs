@@ -15,6 +15,7 @@
 // enclosing module changed. The single `impl<P: TxPlatform>
 // CoreInit<P>` block in this file augments the one in `init.rs`.
 
+use super::helpers::{bootstrap_block_on, exec_error_tag, parse_init_from_cmdline};
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
 
@@ -384,7 +385,7 @@ impl<P: TxPlatform> CoreInit<P> {
             }
             tx_hal::console_write_str::<P>("\n");
             let sdcard_cmd = build_oscomp_sdcard_cmd::<P>();
-            let sdcard_envp: &[&[u8]] = &[b"PATH=/musl/glibc:/musl/musl"];
+            let sdcard_envp: &[&[u8]] = &[b"PATH=/bin:/musl/glibc:/musl/musl"];
             let sdcard_argv: &[&[u8]] = &[b"sh", b"-c", sdcard_cmd.as_bytes()];
             let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
                 &init,
@@ -832,7 +833,6 @@ fn oscomp_sdcard_boot_enabled<P: tx_hal::TxPlatform>() -> bool {
 
 fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     use alloc::string::String;
-    use core::fmt::Write as _;
 
     let mut cmd = String::from("cd /musl/musl");
     let mut selected = 0usize;
@@ -862,7 +862,7 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 continue;
             }
             if let Some(script) = oscomp_musl_script_for_group(group) {
-                let _ = write!(cmd, " && ./busybox sh {script}");
+                append_oscomp_musl_script(&mut cmd, script);
                 selected += 1;
             }
         }
@@ -909,8 +909,12 @@ fn append_filtered_libctest(cmd: &mut alloc::string::String, filter: &str) {
 fn append_filtered_libctest_case(cmd: &mut alloc::string::String, entry: &str, case: &str) {
     use core::fmt::Write as _;
 
-    if libctest_case_missing_from_sdcard(entry, case) {
+    if !libctest_case_present_in_entry(entry, case) {
+        append_unsupported_libctest_case(cmd, entry, case);
+    } else if libctest_case_missing_from_sdcard(entry, case) {
         append_synthetic_libctest_pass(cmd, entry, case);
+    } else if entry == "entry-dynamic.exe" && libctest_case_needs_cwd_dso(case) {
+        append_dynamic_libctest_cwd_dso_case(cmd, case);
     } else {
         let _ = write!(cmd, "; ./runtest.exe -w {entry} {case}");
     }
@@ -921,47 +925,48 @@ fn append_full_libctest(cmd: &mut alloc::string::String) {
 
     let _ = write!(
         cmd,
-        " && ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\""
+        "; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\""
     );
     append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_condattr_setclock");
     append_filtered_libctest_case(cmd, "entry-dynamic.exe", "pthread_condattr_setclock");
     append_synthetic_libctest_pass(cmd, "entry-static.exe", "crypt");
     append_synthetic_libctest_pass(cmd, "entry-static.exe", "pleval");
-    append_skipped_libctest_case(cmd, "entry-static.exe", "pthread_cancel_points");
-    append_skipped_libctest_case(cmd, "entry-static.exe", "pthread_cancel");
-    append_skipped_libctest_case(cmd, "entry-static.exe", "pthread_cancel_sem_wait");
-    append_libctest_loop(cmd, "entry-static.exe", LIBCTEST_STATIC_SAFE_CASES);
+    append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_cancel_points");
+    append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_cancel");
+    append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_cancel_sem_wait");
+    append_libctest_cases(cmd, "entry-static.exe", LIBCTEST_STATIC_SAFE_CASES);
     append_synthetic_libctest_pass(cmd, "entry-dynamic.exe", "crypt");
-    append_skipped_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel_points");
-    append_skipped_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel");
-    append_libctest_loop(cmd, "entry-dynamic.exe", LIBCTEST_DYNAMIC_SAFE_CASES);
+    append_filtered_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel_points");
+    append_filtered_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel");
+    append_libctest_cases(cmd, "entry-dynamic.exe", LIBCTEST_DYNAMIC_SAFE_CASES);
     let _ = write!(
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\""
     );
 }
 
-fn append_libctest_loop(cmd: &mut alloc::string::String, entry: &str, cases: &str) {
+fn append_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &str) {
     use core::fmt::Write as _;
 
     let _ = write!(
         cmd,
-        "; for c in {cases}; do ./runtest.exe -w {entry} $c; done"
+        "; ./busybox echo \"========== START entry-dynamic.exe {case} ==========\""
+    );
+    let _ = write!(cmd, "; (cd lib && ../entry-dynamic.exe {case})");
+    let _ = write!(
+        cmd,
+        "; r=$?; if [ $r -eq 0 ]; then ./busybox echo \"Pass!\"; else ./busybox echo \"FAIL {case} [status $r]\"; fi"
+    );
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"========== END entry-dynamic.exe {case} ==========\""
     );
 }
 
-fn append_skipped_libctest_case(cmd: &mut alloc::string::String, entry: &str, case: &str) {
-    use core::fmt::Write as _;
-
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"========== START {entry} {case} ==========\""
-    );
-    let _ = write!(cmd, "; ./busybox echo \"FAIL {case} [skipped known hang]\"");
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"========== END {entry} {case} ==========\""
-    );
+fn append_libctest_cases(cmd: &mut alloc::string::String, entry: &str, cases: &str) {
+    for case in cases.split_ascii_whitespace() {
+        append_filtered_libctest_case(cmd, entry, case);
+    }
 }
 
 fn append_synthetic_libctest_pass(cmd: &mut alloc::string::String, entry: &str, case: &str) {
@@ -976,6 +981,26 @@ fn append_synthetic_libctest_pass(cmd: &mut alloc::string::String, entry: &str, 
         cmd,
         "; ./busybox echo \"========== END {entry} {case} ==========\""
     );
+}
+
+fn append_unsupported_libctest_case(cmd: &mut alloc::string::String, entry: &str, case: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"SKIP {entry} {case} [not in libctest table]\""
+    );
+}
+
+fn libctest_case_present_in_entry(entry: &str, case: &str) -> bool {
+    match entry {
+        "entry-static.exe" => !matches!(
+            case,
+            "dlopen" | "sem_init" | "tls_get_new_dtv" | "tls_init" | "tls_local_exec"
+        ),
+        "entry-dynamic.exe" => !matches!(case, "pthread_cancel_sem_wait" | "tls_align"),
+        _ => true,
+    }
 }
 
 fn libctest_case_missing_from_sdcard(entry: &str, case: &str) -> bool {
@@ -1005,15 +1030,19 @@ fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
 }
 
 fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
-    use core::fmt::Write as _;
-
     for (_, script) in DEFAULT_OSCOMP_MUSL_SCRIPTS {
         if *script == "libctest_testcode.sh" {
             append_full_libctest(cmd);
         } else {
-            let _ = write!(cmd, " && ./busybox sh {script}");
+            append_oscomp_musl_script(cmd, script);
         }
     }
+}
+
+fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(cmd, "; ./busybox sh {script}");
 }
 
 const DEFAULT_OSCOMP_MUSL_SCRIPTS: &[(&str, &str)] = &[
@@ -1055,6 +1084,10 @@ fn is_libctest_musl_group(group: &str) -> bool {
     matches!(group, "libctest" | "libctest-musl")
 }
 
+fn libctest_case_needs_cwd_dso(case: &str) -> bool {
+    matches!(case, "dlopen" | "tls_get_new_dtv")
+}
+
 const LIBCTEST_STATIC_SAFE_CASES: &str =
     "argv basename clocale_mbfuncs clock_gettime dirname env fdopen fnmatch fscanf fwscanf \
      iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
@@ -1093,3 +1126,75 @@ const LIBCTEST_DYNAMIC_SAFE_CASES: &str =
      scanf_match_literal_eof scanf_nullbyte_char setvbuf_unget sigprocmask_internal sscanf_eof \
      statvfs strverscmp syscall_sign_extend tls_get_new_dtv uselocale_0 wcsncpy_read_overflow \
      wcsstr_false_negative";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::String;
+
+    #[test]
+    fn filtered_static_only_libctest_case_does_not_run_missing_dynamic_entry() {
+        let mut cmd = String::new();
+        append_filtered_libctest(&mut cmd, "pthread_cancel_sem_wait");
+
+        assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_sem_wait"));
+        assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_sem_wait"));
+        assert!(cmd.contains("SKIP entry-dynamic.exe pthread_cancel_sem_wait"));
+    }
+
+    #[test]
+    fn filtered_dynamic_only_libctest_case_does_not_run_missing_static_entry() {
+        let mut cmd = String::new();
+        append_filtered_libctest(&mut cmd, "dlopen");
+
+        assert!(!cmd.contains("./runtest.exe -w entry-static.exe dlopen"));
+        assert!(cmd.contains("SKIP entry-static.exe dlopen"));
+        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe dlopen)"));
+    }
+
+    #[test]
+    fn explicit_dynamic_missing_libctest_case_is_reported_without_start_marker() {
+        let mut cmd = String::new();
+        append_filtered_libctest(&mut cmd, "dynamic:pthread_cancel_sem_wait");
+
+        assert!(cmd.contains("SKIP entry-dynamic.exe pthread_cancel_sem_wait"));
+        assert!(!cmd.contains("START entry-dynamic.exe pthread_cancel_sem_wait"));
+    }
+
+    #[test]
+    fn full_libctest_routes_dynamic_sidecar_dso_cases_from_lib_cwd() {
+        let mut cmd = String::new();
+        append_full_libctest(&mut cmd);
+
+        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe dlopen)"));
+        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe tls_get_new_dtv)"));
+        assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe dlopen"));
+        assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe tls_get_new_dtv"));
+    }
+
+    #[test]
+    fn full_libctest_runs_current_pthread_cancel_cases() {
+        let mut cmd = String::new();
+        append_full_libctest(&mut cmd);
+
+        assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_points"));
+        assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel"));
+        assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_sem_wait"));
+        assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_points"));
+        assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel"));
+        assert!(!cmd.contains("skipped known hang"));
+    }
+
+    #[test]
+    fn oscomp_suite_chain_does_not_gate_later_group_markers_on_previous_scripts() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_oscomp_musl_script(&mut cmd, "basic_testcode.sh");
+        append_full_libctest(&mut cmd);
+
+        assert!(cmd.contains("; ./busybox sh basic_testcode.sh"));
+        assert!(
+            cmd.contains("; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"")
+        );
+        assert!(!cmd.contains("basic_testcode.sh && ./busybox echo"));
+    }
+}

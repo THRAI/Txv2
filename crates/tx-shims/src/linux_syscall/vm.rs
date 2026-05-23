@@ -777,8 +777,9 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
     match op {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             use tx_scripts::drive;
+            use tx_substrate::step::Deadline;
             use tx_substrate::step::DriveMode;
-            use tx_subsystems::futex::FutexWaitOp;
+            use tx_subsystems::futex::{FutexWaitOp, FUTEX_WAKE_MASK};
 
             if uaddr == 0 {
                 return SyscallResult::error_from(Errno::EINVAL);
@@ -787,10 +788,11 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 return SyscallResult::Error(EINVAL_VALUE);
             }
 
-            let mut script_ctx = build_subject_script_ctx(ctx);
-            let mailbox_arc = script_ctx.mailbox().cloned();
-            let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-            let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+            let wait_mask = if op == FUTEX_WAIT_BITSET {
+                bitset as u64
+            } else {
+                FUTEX_WAKE_MASK
+            };
 
             // Validate the user address before probing — the futex
             // subsystem reads *uaddr via `read_volatile` (bootstrap
@@ -804,11 +806,35 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                     return SyscallResult::error_from(Errno::EFAULT);
                 }
             }
+            let mut deadline_ns = None;
             if timeout_uaddr != 0 {
-                let Some(_timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
+                let Some(timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
                     return SyscallResult::Error(EINVAL_VALUE);
                 };
+                if timeout_ns == 0 {
+                    let guard = step_engine::guard();
+                    let user_ptr = UserPtr::<u32>::new(uaddr as usize);
+                    match ctx.aspace.read_user(user_ptr, &guard) {
+                        StepOutcome::Done(observed) if observed == val => {
+                            return SyscallResult::Error(110);
+                        }
+                        StepOutcome::Done(_) => return SyscallResult::Error(EAGAIN_VALUE),
+                        StepOutcome::Err(_) => return SyscallResult::error_from(Errno::EFAULT),
+                        StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+                            return SyscallResult::error_from(Errno::EFAULT);
+                        }
+                    }
+                }
+                deadline_ns = Some(<P as TimeIf>::read_ns().saturating_add(timeout_ns));
             }
+
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            if let Some(deadline_ns) = deadline_ns {
+                script_ctx = script_ctx.with_deadline(Deadline::from_raw(deadline_ns));
+            }
+            let mailbox_arc = script_ctx.mailbox().cloned();
+            let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+            let delegate_registry_arc = script_ctx.delegate_registry().cloned();
 
             // Park and wait.  drive() parks on the futex bucket's
             // WaitSource via resolve_on_wait_source, wakes when
@@ -824,7 +850,9 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 uaddr,
                 val,
                 aspace: &ctx.aspace,
+                interest_mask: wait_mask,
                 woken: false,
+                waiting: false,
             };
             match drive(
                 op,
@@ -847,7 +875,12 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             if op == FUTEX_WAKE_BITSET && bitset == 0 {
                 return SyscallResult::Error(EINVAL_VALUE);
             }
-            futex_wake_oneshot(ctx, uaddr, val)
+            let wake_mask = if op == FUTEX_WAKE_BITSET {
+                bitset as u64
+            } else {
+                tx_subsystems::futex::FUTEX_WAKE_MASK
+            };
+            futex_wake_oneshot(ctx, uaddr, val, wake_mask)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             if uaddr2 == 0 {
@@ -865,16 +898,24 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                     }
                 }
             }
-            // Approximate requeue by waking the source futex waiters.
-            // musl's private pthread_cond handoff uses
-            // FUTEX_REQUEUE(old_barrier, wake=0, requeue=1, mutex).
-            // Without a real wait-queue move, waking the destination
-            // mutex loses the source waiter forever. A source wake is
-            // a legal spurious wake and lets user space re-check.
-            let count = val.max(val2);
-            match futex_wake_count(ctx, uaddr, count) {
-                Ok(woken) => SyscallResult::Return(woken as i64),
-                Err(result) => result,
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let guard = step_engine::guard();
+            let outcome = tx_subsystems::futex::step_futex_requeue_in(
+                &ctx.aspace,
+                uaddr,
+                uaddr2,
+                val,
+                val2,
+                &guard,
+            );
+            drop(guard);
+            match outcome {
+                StepOutcome::Done(count) => SyscallResult::Return(count as i64),
+                StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+                StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+                    let _ = &mut script_ctx;
+                    SyscallResult::error_from(Errno::EIO)
+                }
             }
         }
         FUTEX_WAKE_OP => {
@@ -891,6 +932,9 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             };
             SyscallResult::Return(first.saturating_add(second) as i64)
         }
+        FUTEX_LOCK_PI => futex_pi_lock(ctx, uaddr, false),
+        FUTEX_TRYLOCK_PI => futex_pi_lock(ctx, uaddr, true),
+        FUTEX_UNLOCK_PI => futex_pi_unlock(ctx, uaddr),
         // FUTEX_REQUEUE / CMP_REQUEUE / WAKE_OP / LOCK_PI /
         // UNLOCK_PI / TRYLOCK_PI / WAIT_BITSET / WAKE_BITSET — out
         // of scope for v1. musl's libc init only emits FUTEX_WAIT
@@ -899,22 +943,86 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
     }
 }
 
-fn futex_wake_oneshot(ctx: &SyscallCtx<'_>, uaddr: u64, n: u32) -> SyscallResult {
-    match futex_wake_count(ctx, uaddr, n) {
+fn futex_wake_oneshot(ctx: &SyscallCtx<'_>, uaddr: u64, n: u32, wake_mask: u64) -> SyscallResult {
+    match futex_wake_count_masked(ctx, uaddr, n, wake_mask) {
         Ok(woken) => SyscallResult::Return(woken as i64),
         Err(result) => result,
     }
 }
 
 fn futex_wake_count(ctx: &SyscallCtx<'_>, uaddr: u64, n: u32) -> Result<u32, SyscallResult> {
+    futex_wake_count_masked(ctx, uaddr, n, tx_subsystems::futex::FUTEX_WAKE_MASK)
+}
+
+fn futex_wake_count_masked(
+    ctx: &SyscallCtx<'_>,
+    uaddr: u64,
+    n: u32,
+    wake_mask: u64,
+) -> Result<u32, SyscallResult> {
     let mut script_ctx = build_subject_script_ctx(ctx);
-    let mut op = FutexWakeOp {
-        uaddr,
-        n,
-        aspace: &ctx.aspace,
+    if wake_mask == tx_subsystems::futex::FUTEX_WAKE_MASK {
+        let mut op = FutexWakeOp {
+            uaddr,
+            n,
+            aspace: &ctx.aspace,
+        };
+        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(woken) => Ok(woken),
+            Err(v3errno) => Err(SyscallResult::error_from(Errno::from(v3errno))),
+        }
+    } else {
+        let guard = step_engine::guard();
+        let outcome = tx_subsystems::futex::step_futex_wake_masked_in(
+            &ctx.aspace,
+            uaddr,
+            n,
+            wake_mask,
+            &guard,
+        );
+        drop(guard);
+        match outcome {
+            StepOutcome::Done(woken) => Ok(woken),
+            StepOutcome::Err(errno) => Err(SyscallResult::error_from(Errno::from(errno))),
+            StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+                Err(SyscallResult::error_from(Errno::EIO))
+            }
+        }
+    }
+}
+
+fn futex_owner_tid(ctx: &SyscallCtx<'_>) -> u32 {
+    ctx.thread.tid.0
+}
+
+fn futex_pi_lock(ctx: &SyscallCtx<'_>, uaddr: u64, try_only: bool) -> SyscallResult {
+    let owner = futex_owner_tid(ctx);
+    let guard = step_engine::guard();
+    let outcome = if try_only {
+        tx_subsystems::futex::step_futex_trylock_pi_in(&ctx.aspace, uaddr, owner, &guard)
+    } else {
+        tx_subsystems::futex::step_futex_lock_pi_in(&ctx.aspace, uaddr, owner, false, &guard)
     };
-    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-        Ok(woken) => Ok(woken),
-        Err(v3errno) => Err(SyscallResult::error_from(Errno::from(v3errno))),
+    drop(guard);
+    match outcome {
+        StepOutcome::Done(()) => SyscallResult::Return(0),
+        StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+            SyscallResult::error_from(Errno::EIO)
+        }
+    }
+}
+
+fn futex_pi_unlock(ctx: &SyscallCtx<'_>, uaddr: u64) -> SyscallResult {
+    let owner = futex_owner_tid(ctx);
+    let guard = step_engine::guard();
+    let outcome = tx_subsystems::futex::step_futex_unlock_pi_in(&ctx.aspace, uaddr, owner, &guard);
+    drop(guard);
+    match outcome {
+        StepOutcome::Done(_) => SyscallResult::Return(0),
+        StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+            SyscallResult::error_from(Errno::EIO)
+        }
     }
 }

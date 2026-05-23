@@ -1,19 +1,35 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
+use crate::adapter::step_engine::page_allocator;
 use tx_subsystems::process::bootstrap_init_process;
 
 use crate::linux_syscall::{
-    FUTEX_CLOCK_REALTIME, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_WAIT, FUTEX_WAKE, FUTEX_WAKE_OP,
-    NR_FUTEX,
+    FUTEX_CLOCK_REALTIME, FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE,
+    FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE,
+    FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, NR_FUTEX,
 };
+use std::sync::Arc;
+use tx_substrate::wake::{TaskMailbox, TimerWheel};
 
 const E_INVAL: i32 = 22;
 const E_AGAIN: i32 = 11;
-const E_NOSYS: i32 = 38;
+const E_TIMEDOUT: i32 = 110;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TestTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
 
 fn futex_setup() -> TestSetup {
-    setup()
+    let setup = setup();
+    match page_allocator::claim_zero_frame() {
+        Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
+        Err(error) => panic!("claim zero frame for futex tests: {error:?}"),
+    }
+    setup
 }
 
 fn fresh_proc_thread() -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
@@ -22,24 +38,13 @@ fn fresh_proc_thread() -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
     (process, thread)
 }
 
-/// `futex(uaddr, FUTEX_WAIT, val, ...)` with `*uaddr != val`
-/// returns `-EAGAIN` immediately (first-call mismatch — the
-/// futex's "fast path" guard short-circuits before parking).
-#[test]
-fn dispatch_futex_wait_with_mismatched_val_returns_neg_eagain() {
-    let _setup = futex_setup();
-    let (proc_cap, thread) = fresh_proc_thread();
-    let ctx = make_ctx(proc_cap, thread);
-    // User word holds 0x1234; FUTEX_WAIT with val=0x5678 must
-    // observe the mismatch and short-circuit.
-    let word: u32 = 0x1234;
-    let uaddr = &word as *const u32 as u64;
-
+fn map_user_futex_word_at(ctx: &SyscallCtx<'_>, uaddr: usize, value: u32) -> u64 {
     use tx_subsystems::vm::{
         MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmMapRequest,
         USER_PAGE_SIZE,
     };
-    let page_start = (uaddr as usize) & !(USER_PAGE_SIZE - 1);
+
+    let page_start = uaddr;
     let range =
         UserRange::new_aligned(UserVirtAddr(page_start), USER_PAGE_SIZE).expect("aligned range");
     let map_req = VmMapRequest::fixed(
@@ -50,6 +55,76 @@ fn dispatch_futex_wait_with_mismatched_val_returns_neg_eagain() {
         VmBacking::PrivateAnon,
     );
     ctx.aspace.try_mmap(map_req).expect("mmap anon for test");
+
+    let guard = guard();
+    let copied = ctx.aspace.copy_to_user(
+        tx_hal::UserPtr::<u8>::new(uaddr),
+        &value.to_ne_bytes(),
+        &guard,
+    );
+    drop(guard);
+    assert_eq!(copied, StepOutcome::Done(core::mem::size_of::<u32>()));
+    uaddr as u64
+}
+
+fn map_user_futex_word(ctx: &SyscallCtx<'_>, value: u32) -> u64 {
+    map_user_futex_word_at(ctx, 0x5100_0000, value)
+}
+
+fn map_user_timespec(ctx: &SyscallCtx<'_>, ts: TestTimespec) -> u64 {
+    use tx_subsystems::vm::{
+        MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmMapRequest,
+        USER_PAGE_SIZE,
+    };
+
+    let uaddr = 0x5100_1000;
+    let page_start = uaddr;
+    let range =
+        UserRange::new_aligned(UserVirtAddr(page_start), USER_PAGE_SIZE).expect("aligned range");
+    let map_req = VmMapRequest::fixed(
+        range,
+        MapPlacement::FixedReplace,
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    ctx.aspace.try_mmap(map_req).expect("mmap anon for test");
+
+    let local = ts;
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(local) as *const u8,
+            core::mem::size_of::<TestTimespec>(),
+        )
+    };
+    let guard = guard();
+    let copied = ctx
+        .aspace
+        .copy_to_user(tx_hal::UserPtr::<u8>::new(uaddr), bytes, &guard);
+    drop(guard);
+    assert_eq!(
+        copied,
+        StepOutcome::Done(core::mem::size_of::<TestTimespec>())
+    );
+    uaddr as u64
+}
+
+fn ctx_with_mailbox_and_timer(ctx: SyscallCtx<'static>) -> (SyscallCtx<'static>, TimerWheel) {
+    let mailbox = Arc::new(TaskMailbox::new());
+    let wheel = TimerWheel::new();
+    let ctx = ctx.with_mailbox(mailbox).with_timer_wheel(wheel.clone());
+    (ctx, wheel)
+}
+
+/// `futex(uaddr, FUTEX_WAIT, val, ...)` with `*uaddr != val`
+/// returns `-EAGAIN` immediately (first-call mismatch — the
+/// futex's "fast path" guard short-circuits before parking).
+#[test]
+fn dispatch_futex_wait_with_mismatched_val_returns_neg_eagain() {
+    let _setup = futex_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+    let uaddr = map_user_futex_word(&ctx, 0x1234);
 
     let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAIT as u64, 0x5678, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
@@ -69,35 +144,71 @@ fn dispatch_futex_wait_zero_uaddr_returns_neg_einval() {
     assert_eq!(result, SyscallResult::Error(E_INVAL));
 }
 
-/// `futex(uaddr, FUTEX_WAKE, n, ...)` returns `n` (best-effort
-/// wake-N). v1 doesn't track per-bucket waiter counts so the
-/// return value is the requested maximum.
+#[test]
+fn dispatch_futex_wait_with_zero_timeout_returns_neg_etimedout() {
+    let _setup = futex_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+    let (ctx, _wheel) = ctx_with_mailbox_and_timer(ctx);
+    let uaddr = map_user_futex_word(&ctx, 0x1234);
+    let timeout = map_user_timespec(
+        &ctx,
+        TestTimespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+    );
+
+    let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAIT as u64, 0x1234, timeout, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_TIMEDOUT));
+}
+
+/// `futex(uaddr, FUTEX_WAKE, n, ...)` reports actual registered
+/// waiters. With no parked waiter, Linux returns 0.
 #[test]
 fn dispatch_futex_wake_returns_n() {
     let _setup = futex_setup();
     let (proc_cap, thread) = fresh_proc_thread();
     let ctx = make_ctx(proc_cap, thread);
-    let word: u32 = 0;
-    let uaddr = &word as *const u32 as u64;
+    let uaddr = map_user_futex_word(&ctx, 0);
 
     let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAKE as u64, 3, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Return(3));
+    assert_eq!(result, SyscallResult::Return(0));
 }
 
-/// `futex(uaddr, FUTEX_REQUEUE, ...)` returns `-ENOSYS` — only
-/// FUTEX_WAIT and FUTEX_WAKE are supported in v1.
+/// `futex(uaddr, FUTEX_REQUEUE, ...)` accepts a valid source and
+/// target futex word and returns a best-effort wake/requeue count.
 #[test]
-fn dispatch_futex_unsupported_op_returns_neg_enosys() {
+fn dispatch_futex_requeue_with_valid_uaddrs_returns_best_effort_count() {
     let _setup = futex_setup();
     let (proc_cap, thread) = fresh_proc_thread();
     let ctx = make_ctx(proc_cap, thread);
-    let word: u32 = 0;
-    let uaddr = &word as *const u32 as u64;
+    let source: u32 = 0;
+    let target: u32 = 0;
+    let uaddr = &source as *const u32 as u64;
+    let uaddr2 = &target as *const u32 as u64;
 
-    let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_REQUEUE as u64, 1, 0, 0, 0]);
+    let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_REQUEUE as u64, 1, 1, uaddr2, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(E_NOSYS));
+    assert!(matches!(result, SyscallResult::Return(_)));
+}
+
+#[test]
+fn dispatch_futex_cmp_requeue_mismatch_returns_neg_eagain() {
+    let _setup = futex_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+    let source = map_user_futex_word_at(&ctx, 0x5100_0000, 0x1234);
+    let target = map_user_futex_word_at(&ctx, 0x5100_2000, 0);
+
+    let req = SyscallRequest::new(
+        NR_FUTEX,
+        [source, FUTEX_CMP_REQUEUE as u64, 1, 1, target, 0x5678],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_AGAIN));
 }
 
 /// `futex(uaddr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, n, ...)`
@@ -109,13 +220,12 @@ fn dispatch_futex_with_private_flag_works() {
     let _setup = futex_setup();
     let (proc_cap, thread) = fresh_proc_thread();
     let ctx = make_ctx(proc_cap, thread);
-    let word: u32 = 0;
-    let uaddr = &word as *const u32 as u64;
+    let uaddr = map_user_futex_word(&ctx, 0);
 
     let op = FUTEX_WAKE | FUTEX_PRIVATE_FLAG;
     let req = SyscallRequest::new(NR_FUTEX, [uaddr, op as u64, 5, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Return(5));
+    assert_eq!(result, SyscallResult::Return(0));
 }
 
 /// `futex(uaddr, FUTEX_WAKE | FUTEX_CLOCK_REALTIME, n, ...)`
@@ -127,26 +237,88 @@ fn dispatch_futex_with_clock_realtime_flag_works() {
     let _setup = futex_setup();
     let (proc_cap, thread) = fresh_proc_thread();
     let ctx = make_ctx(proc_cap, thread);
-    let word: u32 = 0;
-    let uaddr = &word as *const u32 as u64;
+    let uaddr = map_user_futex_word(&ctx, 0);
 
     let op = FUTEX_WAKE | FUTEX_CLOCK_REALTIME;
     let req = SyscallRequest::new(NR_FUTEX, [uaddr, op as u64, 2, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Return(2));
+    assert_eq!(result, SyscallResult::Return(0));
 }
 
-/// `futex(uaddr, FUTEX_WAKE_OP, ...)` returns `-ENOSYS`. Pinned
-/// here as the canonical "complex op out of v1's surface" case.
 #[test]
-fn dispatch_futex_wake_op_returns_neg_enosys() {
+fn dispatch_futex_wake_bitset_zero_bitset_returns_neg_einval() {
     let _setup = futex_setup();
     let (proc_cap, thread) = fresh_proc_thread();
     let ctx = make_ctx(proc_cap, thread);
-    let word: u32 = 0;
-    let uaddr = &word as *const u32 as u64;
+    let uaddr = map_user_futex_word(&ctx, 0);
 
-    let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAKE_OP as u64, 1, 0, 0, 0]);
+    let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAKE_BITSET as u64, 1, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(E_NOSYS));
+    assert_eq!(result, SyscallResult::Error(E_INVAL));
+}
+
+#[test]
+fn dispatch_futex_wait_bitset_with_zero_timeout_returns_neg_etimedout() {
+    let _setup = futex_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+    let (ctx, _wheel) = ctx_with_mailbox_and_timer(ctx);
+    let uaddr = map_user_futex_word(&ctx, 0x1234);
+    let timeout = map_user_timespec(
+        &ctx,
+        TestTimespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+    );
+
+    let req = SyscallRequest::new(
+        NR_FUTEX,
+        [uaddr, FUTEX_WAIT_BITSET as u64, 0x1234, timeout, 0, 0x2],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_TIMEDOUT));
+}
+
+/// `futex(uaddr, FUTEX_WAKE_OP, ...)` accepts a valid source and
+/// target futex word and returns a best-effort wake count.
+#[test]
+fn dispatch_futex_wake_op_with_valid_uaddrs_returns_best_effort_count() {
+    let _setup = futex_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+    let source: u32 = 0;
+    let target: u32 = 0;
+    let uaddr = &source as *const u32 as u64;
+    let uaddr2 = &target as *const u32 as u64;
+
+    let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAKE_OP as u64, 1, 1, uaddr2, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert!(matches!(result, SyscallResult::Return(_)));
+}
+
+#[test]
+fn dispatch_futex_pi_lock_trylock_unlock_round_trip() {
+    let _setup = futex_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+    let uaddr = map_user_futex_word(&ctx, 0);
+
+    let lock_req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_LOCK_PI as u64, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(lock_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+
+    let try_req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_TRYLOCK_PI as u64, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(try_req, &ctx)),
+        SyscallResult::Error(E_AGAIN)
+    );
+
+    let unlock_req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_UNLOCK_PI as u64, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(unlock_req, &ctx)),
+        SyscallResult::Return(0)
+    );
 }

@@ -194,7 +194,7 @@ fn read_mq_name(ctx: &SyscallCtx<'_>, name_ptr: u64) -> Result<Vec<u8>, SyscallR
         Ok(name) => name,
         Err(_) => return Err(SyscallResult::Error(ENAMETOOLONG_VALUE)),
     };
-    if name.is_empty() || name.iter().any(|&b| b == b'/') {
+    if name.is_empty() || name.contains(&b'/') {
         return Err(SyscallResult::Error(ENOENT_VALUE));
     }
     Ok(name)
@@ -282,7 +282,7 @@ pub(super) fn sys_shmget(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
 
 pub(super) async fn sys_shmat(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let cred = ctx.cred_cap();
-    match ipc::sysv_shm::execution::step_shmat(
+    match ipc::sysv_shm::execution::script_shmat(
         args[0] as u32,
         args[1] as usize,
         args[2] as i32,
@@ -297,7 +297,7 @@ pub(super) async fn sys_shmat(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
 }
 
 pub(super) async fn sys_shmdt(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    match ipc::sysv_shm::execution::step_shmdt(args[0] as usize, &ctx.aspace).await {
+    match ipc::sysv_shm::execution::script_shmdt(args[0] as usize, &ctx.aspace).await {
         Ok(()) => SyscallResult::Return(0i64),
         Err(e) => SyscallResult::Error(errno_to_i32(e)),
     }
@@ -418,7 +418,10 @@ pub(super) fn sys_msgget(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
 }
 
 pub(super) fn sys_msgctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let cred = ctx.cred_cap();
+    let (ns, cred) = match nsproxy_and_cred(ctx) {
+        Ok(v) => v,
+        Err(e) => return SyscallResult::Error(errno_to_i32(e)),
+    };
     let msqid = args[0] as u32;
     let cmd = args[1] as i32;
     let buf_ptr = args[2];
@@ -432,7 +435,7 @@ pub(super) fn sys_msgctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
         None
     };
 
-    match ipc::sysv_msg::execution::step_msgctl(msqid, cmd, set_fields, &cred) {
+    match ipc::sysv_msg::execution::step_msgctl_in_ns(msqid, cmd, set_fields, &cred, &ns) {
         Ok(result) => match result {
             ipc::sysv_msg::execution::MsgCtlResult::Success => SyscallResult::Return(0i64),
             ipc::sysv_msg::execution::MsgCtlResult::Stat(info) => {
@@ -521,8 +524,7 @@ pub(super) fn sys_semop(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
         Some(len) => len,
         None => return SyscallResult::Error(EINVAL_VALUE),
     };
-    let mut bytes = Vec::new();
-    bytes.resize(byte_len, 0);
+    let mut bytes = alloc::vec![0; byte_len];
     if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, sops_ptr) {
         return SyscallResult::Error(errno_to_i32(errno));
     }
@@ -534,14 +536,14 @@ pub(super) fn sys_semop(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
             sem_flg: i16::from_ne_bytes([chunk[4], chunk[5]]),
         });
     }
-    match ipc::sysv_sem::execution::step_semop(semid, &sops, &cred, ctx.process.pid.0 as u64) {
+    match ipc::sysv_sem::execution::step_semop(semid, &sops, &cred, &ctx.process) {
         Ok(applied) => SyscallResult::Return(applied as i64),
         Err(e) => SyscallResult::Error(errno_to_i32(e)),
     }
 }
 
 pub(super) fn sys_semctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let (_ns, cred) = match nsproxy_and_cred(ctx) {
+    let (ns, cred) = match nsproxy_and_cred(ctx) {
         Ok(v) => v,
         Err(e) => return SyscallResult::Error(errno_to_i32(e)),
     };
@@ -564,13 +566,56 @@ pub(super) fn sys_semctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
         ipc::sysv_sem::execution::SETVAL => {
             ipc::sysv_sem::execution::SemCtlArg::Val(arg_raw as i32)
         }
+        ipc::sysv_sem::execution::SETALL => {
+            let nsems = match ipc::sysv_sem::execution::step_semctl_in_ns(
+                semid,
+                semnum,
+                ipc::sysv_sem::execution::IPC_STAT,
+                ipc::sysv_sem::execution::SemCtlArg::None,
+                &cred,
+                &ns,
+                Some(&ctx.process),
+            ) {
+                Ok(ipc::sysv_sem::execution::SemCtlResult::Stat(info)) => info.nsems,
+                Ok(_) => return SyscallResult::Error(EINVAL_VALUE),
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let byte_len = (nsems as usize) * core::mem::size_of::<u16>();
+            let mut bytes = alloc::vec![0u8; byte_len];
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, arg_raw) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            let values = bytes
+                .chunks_exact(core::mem::size_of::<u16>())
+                .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+                .collect();
+            ipc::sysv_sem::execution::SemCtlArg::All(values)
+        }
         _ => ipc::sysv_sem::execution::SemCtlArg::None,
     };
 
-    match ipc::sysv_sem::execution::step_semctl(semid, semnum, cmd, sem_arg, &cred) {
+    match ipc::sysv_sem::execution::step_semctl_in_ns(
+        semid,
+        semnum,
+        cmd,
+        sem_arg,
+        &cred,
+        &ns,
+        Some(&ctx.process),
+    ) {
         Ok(result) => match result {
             ipc::sysv_sem::execution::SemCtlResult::Success => SyscallResult::Return(0i64),
             ipc::sysv_sem::execution::SemCtlResult::Val(v) => SyscallResult::Return(v as i64),
+            ipc::sysv_sem::execution::SemCtlResult::All(values) => {
+                let mut bytes = Vec::with_capacity(values.len() * core::mem::size_of::<u16>());
+                for value in values {
+                    bytes.extend_from_slice(&value.to_ne_bytes());
+                }
+                if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, arg_raw, &bytes) {
+                    return SyscallResult::Error(errno_to_i32(errno));
+                }
+                SyscallResult::Return(0)
+            }
             ipc::sysv_sem::execution::SemCtlResult::Stat(info) => {
                 let ds = SemidDsLayout {
                     sem_perm: ipc_perm_layout(
@@ -637,8 +682,7 @@ pub(super) fn sys_msgsnd(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
         Ok(v) => v,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
-    let mut mtext = Vec::new();
-    mtext.resize(msgsz, 0);
+    let mut mtext = alloc::vec![0; msgsz];
     if msgsz > 0 {
         let text_ptr = match msgp.checked_add(core::mem::size_of::<i64>() as u64) {
             Some(ptr) => ptr,
@@ -732,11 +776,15 @@ pub(super) fn sys_mq_open(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
 }
 
 pub(super) fn sys_mq_unlink(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let (ns, _cred) = match nsproxy_and_cred(ctx) {
+        Ok(v) => v,
+        Err(e) => return SyscallResult::Error(errno_to_i32(e)),
+    };
     let name = match read_mq_name(ctx, args[0]) {
         Ok(v) => v,
         Err(result) => return result,
     };
-    match ipc::posix_mq::execution::step_mq_unlink(&name) {
+    match ipc::posix_mq::execution::step_mq_unlink(&name, &ns) {
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
@@ -766,8 +814,7 @@ pub(super) async fn sys_mq_timedsend(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Sy
     if msg_len > mq.msgsize() as usize {
         return SyscallResult::Error(EMSGSIZE_VALUE);
     }
-    let mut msg = Vec::new();
-    msg.resize(msg_len, 0);
+    let mut msg = alloc::vec![0; msg_len];
     if msg_len > 0 {
         if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut msg, msg_ptr) {
             return SyscallResult::Error(errno_to_i32(errno));

@@ -114,6 +114,51 @@ fn dispatch_sysv_msg_round_trip_and_ipc_stat_use_musl_layout() {
 }
 
 #[test]
+fn dispatch_sysv_msg_rmid_releases_namespace_key_for_recreate() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process, thread);
+
+    let key = 0x4d53524d;
+    let msgget_flags = (sysv_shm::execution::IPC_CREAT | 0o600) as u64;
+    let first_msqid = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_MSGGET, [key, msgget_flags, 0, 0, 0, 0]),
+        &ctx,
+    )) {
+        SyscallResult::Return(id) => id as u64,
+        other => panic!("first msgget failed: {other:?}"),
+    };
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_MSGCTL,
+                [
+                    first_msqid,
+                    sysv_msg::execution::IPC_RMID as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+
+    let second_msqid = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_MSGGET, [key, msgget_flags, 0, 0, 0, 0]),
+        &ctx,
+    )) {
+        SyscallResult::Return(id) => id as u64,
+        other => panic!("second msgget failed after IPC_RMID: {other:?}"),
+    };
+    assert_ne!(second_msqid, first_msqid);
+}
+
+#[test]
 fn dispatch_sysv_msg_noerror_truncates_oversized_receive() {
     let _setup = setup();
     let process = bootstrap();
@@ -275,6 +320,201 @@ fn dispatch_sysv_semop_and_semctl_stat_use_musl_layout() {
     assert_eq!(ds.sem_perm.key, 0x53454d31);
     assert_eq!(ds.sem_perm.mode, 0o660);
     assert_eq!(ds.sem_nsems, 1);
+}
+
+#[test]
+fn dispatch_sysv_semctl_setall_getall_round_trip() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process, thread);
+
+    let semid = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SEMGET,
+            [
+                0x5345414c,
+                3,
+                (sysv_shm::execution::IPC_CREAT | 0o660) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(id) => id as u64,
+        other => panic!("semget failed: {other:?}"),
+    };
+
+    let set_values = [3u16, 5, 8];
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMCTL,
+                [
+                    semid,
+                    0,
+                    sysv_sem::execution::SETALL as u64,
+                    set_values.as_ptr() as u64,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+
+    let mut got_values = [0u16; 3];
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMCTL,
+                [
+                    semid,
+                    0,
+                    sysv_sem::execution::GETALL as u64,
+                    got_values.as_mut_ptr() as u64,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(got_values, set_values);
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMCTL,
+                [semid, 1, sysv_sem::execution::GETVAL as u64, 0, 0, 0],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(5)
+    );
+}
+
+#[test]
+fn dispatch_sysv_semctl_getpid_tracks_last_modifier() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let expected_pid = process.pid.0 as i64;
+    let ctx = make_ctx(process, thread);
+
+    let semid = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SEMGET,
+            [
+                0x53455049,
+                1,
+                (sysv_shm::execution::IPC_CREAT | 0o660) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(id) => id as u64,
+        other => panic!("semget failed: {other:?}"),
+    };
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMCTL,
+                [semid, 0, sysv_sem::execution::SETVAL as u64, 2, 0, 0],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMCTL,
+                [semid, 0, sysv_sem::execution::GETPID as u64, 0, 0, 0],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(expected_pid)
+    );
+
+    let op = SembufLayout {
+        sem_num: 0,
+        sem_op: -1,
+        sem_flg: sysv_shm::execution::IPC_NOWAIT as i16,
+    };
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMOP,
+                [semid, (&op as *const SembufLayout) as u64, 1, 0, 0, 0]
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(1)
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMCTL,
+                [semid, 0, sysv_sem::execution::GETPID as u64, 0, 0, 0],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(expected_pid)
+    );
+}
+
+#[test]
+fn dispatch_sysv_sem_rmid_releases_namespace_key_for_recreate() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process, thread);
+
+    let key = 0x5345524d;
+    let semget_flags = (sysv_shm::execution::IPC_CREAT | 0o600) as u64;
+    let first_semid = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_SEMGET, [key, 1, semget_flags, 0, 0, 0]),
+        &ctx,
+    )) {
+        SyscallResult::Return(id) => id as u64,
+        other => panic!("first semget failed: {other:?}"),
+    };
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMCTL,
+                [
+                    first_semid,
+                    0,
+                    sysv_sem::execution::IPC_RMID as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+
+    let second_semid = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_SEMGET, [key, 1, semget_flags, 0, 0, 0]),
+        &ctx,
+    )) {
+        SyscallResult::Return(id) => id as u64,
+        other => panic!("second semget failed after IPC_RMID: {other:?}"),
+    };
+    assert_ne!(second_semid, first_semid);
 }
 
 #[test]

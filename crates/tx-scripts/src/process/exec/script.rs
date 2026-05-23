@@ -54,9 +54,6 @@ use tx_subsystems::process::{
     ProcessIdentity,
 };
 use tx_subsystems::thread_runtime::ThreadIdentity;
-use tx_subsystems::vfs::structure::{
-    Credential, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking,
-};
 use tx_subsystems::vfs::walker::step_open;
 use tx_subsystems::vm::scripts::{
     self as vm_scripts, BssTail as VmBssTail, ImagePlan as VmImagePlan,
@@ -70,6 +67,9 @@ use super::loader::{
 };
 use super::stack::{build_initial_user_stack, AuxvFacts};
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+use crate::adapter::vfs_exec::{
+    Credential, DEntry, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking,
+};
 
 /// User page size — RV64 today; mirrors `vm::USER_PAGE_SIZE` so the
 /// brk-base round-up doesn't require pulling in another import.
@@ -78,6 +78,21 @@ const USER_PAGE_SIZE: u64 = 4096;
 const INTERP_BASE: u64 = 0x3E_0000_0000;
 
 // ASLR functions moved inline to exec_script_inner
+
+fn namespace_root_for_dentry(mut cursor: Cap<DEntry>) -> Cap<DEntry> {
+    while let Some(parent) = cursor.parent_hint() {
+        cursor = parent;
+    }
+    cursor
+}
+
+fn exec_root_for_path(cwd: &Cap<DEntry>, path: &[u8]) -> Cap<DEntry> {
+    if path.starts_with(b"/") {
+        namespace_root_for_dentry(cwd.clone())
+    } else {
+        cwd.clone()
+    }
+}
 
 /// Emit a OBS-V1 §15.7 ProcessLabel Instant mapping `pid` to the PCB
 /// `comm` just committed by `step_store_exec_identity`-equivalent
@@ -597,8 +612,9 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             use StepOutcome as V3;
             let guard = step_engine::guard();
             let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
+            let interp_root = exec_root_for_path(&rooted_at, interp_path);
             let mut outcome = step_open(
-                rooted_at.clone(),
+                interp_root.clone(),
                 interp_path,
                 OpenFileFlags {
                     read: true,
@@ -619,8 +635,9 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 let mut musl_path = alloc::vec::Vec::with_capacity(5 + interp_path.len());
                 musl_path.extend_from_slice(b"/musl");
                 musl_path.extend_from_slice(interp_path);
+                let musl_root = exec_root_for_path(&rooted_at, &musl_path);
                 outcome = step_open(
-                    rooted_at.clone(),
+                    musl_root,
                     &musl_path,
                     OpenFileFlags {
                         read: true,
@@ -643,9 +660,11 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                     .windows(b"ld-musl".len())
                     .any(|window| window == b"ld-musl")
             {
+                let libc_path = b"/musl/musl/lib/libc.so";
+                let libc_root = exec_root_for_path(&rooted_at, libc_path);
                 outcome = step_open(
-                    rooted_at,
-                    b"/musl/musl/lib/libc.so",
+                    libc_root,
+                    libc_path,
                     OpenFileFlags {
                         read: true,
                         write: false,

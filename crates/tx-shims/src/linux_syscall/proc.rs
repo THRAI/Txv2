@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine};
+use crate::linux_syscall::numbers::CLONE_NEWIPC;
 
 /// Linux raw `wait4`/`getrusage` rusage image for musl LP64:
 /// two `timeval`s plus fourteen `long` counters. musl passes the
@@ -244,7 +245,6 @@ pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
 /// Wave 1's surface (`fork_aspace`'s `WouldBlock` cannot fire under
 /// v1's single-thread-per-process model). The function is non-`async`
 /// to keep the seam minimal.
-
 pub(super) async fn sys_clone<'a, P: PmapIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
@@ -268,10 +268,14 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     let clone_settls = (flags & CLONE_SETTLS) != 0;
     let clone_child_cleartid = (flags & CLONE_CHILD_CLEARTID) != 0;
     let clone_parent_settid = (flags & CLONE_PARENT_SETTID) != 0;
+    let clone_newipc = (flags & CLONE_NEWIPC) != 0;
 
     let allowed_mask = if clone_thread {
         // CLONE_THREAD requires CLONE_SIGHAND per Linux semantics.
         if flags & CLONE_SIGHAND == 0 {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        if clone_newipc {
             return SyscallResult::Error(EINVAL_VALUE);
         }
         SIGCHLD
@@ -288,7 +292,14 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             | CLONE_NEWCGROUP
             | CLONE_NEWUTS
     } else {
-        SIGCHLD | CLONE_SETTLS | CLONE_VM | CLONE_VFORK | CLONE_SIGHAND | CLONE_FILES | CLONE_FS
+        SIGCHLD
+            | CLONE_SETTLS
+            | CLONE_VM
+            | CLONE_VFORK
+            | CLONE_SIGHAND
+            | CLONE_FILES
+            | CLONE_FS
+            | CLONE_NEWIPC
     };
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
@@ -379,6 +390,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             parent: &ctx.process,
             clone_vm,
             clone_sighand,
+            clone_newipc,
             _pmap: core::marker::PhantomData,
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
@@ -576,7 +588,7 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // The op yields on NoneReady via YieldShape::OnWaitSource; the
     // drive loop parks the parent task, child exit fires the source,
     // and step() is re-called on wake.
-    use step_engine::{StepOp, StepOutcome as V3Out, YieldShape};
+    use step_engine::{StepOp, StepOutcome as WaitOutcome, YieldShape};
     use tx_subsystems::process::execution::WaitpidNohangOp;
     let mut op = WaitpidNohangOp {
         parent: &ctx.process,
@@ -585,7 +597,7 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let mut script_ctx = build_subject_script_ctx(ctx);
     loop {
         match op.step(&mut script_ctx) {
-            V3Out::Done(Ok((child_pid, status))) => {
+            WaitOutcome::Done(Ok((child_pid, status))) => {
                 if let Err(result) = write_wait4_rusage_if_requested(ctx, rusage_uaddr) {
                     return result;
                 }
@@ -599,14 +611,14 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 }
                 return SyscallResult::Return(child_pid.0 as i64);
             }
-            V3Out::Done(Err(WaitError::NoChildren)) => {
+            WaitOutcome::Done(Err(WaitError::NoChildren)) => {
                 return SyscallResult::Error(ECHILD_VALUE);
             }
-            V3Out::Done(Err(WaitError::NoneReady)) => {
+            WaitOutcome::Done(Err(WaitError::NoneReady)) => {
                 // Should not reach here — op yields on NoneReady.
                 // Fall through to the exit_source wait.
             }
-            V3Out::Yield {
+            WaitOutcome::Yield {
                 shape: YieldShape::OnWaitSource { source, .. },
                 ..
             } => {
@@ -615,7 +627,7 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     future.await;
                 }
             }
-            V3Out::Err(e) => return SyscallResult::error_from(e.into()),
+            WaitOutcome::Err(e) => return SyscallResult::error_from(e.into()),
             _ => {}
         }
     }
