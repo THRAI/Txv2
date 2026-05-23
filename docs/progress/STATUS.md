@@ -1,3 +1,25 @@
+- 2026-05-24 **Fixed the RV64 SMP OSComp userspace reactor hart-id panic.**
+  `oscomp-local-rv64-smp4` was entering userspace and then panicking in
+  `ReactorLocals::ensure_hart` with a `HartId` shaped like a kernel global
+  pointer (`0xffffffff805bf080`, near `tx_substrate::slab::GLOBAL_HEAP`).
+  The BSP userspace loop and AP reactor loop no longer carry pre-entry /
+  boot-time `CpuId` locals across trap-shell longjmp reactor iterations; both
+  re-read `<P as SmpIf>::current_cpu_id()` immediately before driving a reactor
+  step. **Verified:** `cargo fmt --check`; `cargo test -p tx-kernel
+  init::exec::tests -- --nocapture`; `cargo build -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`;
+  `/usr/bin/timeout 180s make oscomp-submit-rv64 oscomp-qemu-rv64-smp4
+  OSCOMP_GROUPS=basic-musl
+  OSCOMP_OUT_RV_SMP4=target/oscomp/os_serial_out_rv_smp4_codex_probe.txt`;
+  `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv_smp4_codex_probe.txt target/oscomp/testdata`
+  (`basic-musl 102/102`); serial grep found no panic/scause/FrozenForShutdown
+  markers, and `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_smp4_codex_probe.txt --all --brief` reported
+  no trap lines. **Next step:** rerun the broader default
+  `make oscomp-local-rv64-smp4` / selected libctest lane. **Blocker:** none for
+  the immediate `basic-musl` SMP panic.
+
 - 2026-05-23 **Brought the OSComp/musl/busybox fix branch through both CI
   gates.** This branch now includes the pthread/libctest, dynamic loader/DSO,
   file-time, futex, fd-table close, non-VFS fd routing, AIO syscall-number,

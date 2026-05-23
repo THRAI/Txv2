@@ -1475,13 +1475,16 @@ impl<P: TxPlatform> CoreInit<P> {
         P::init_later_secondary(cpu_id);
         P::install_kernel_trap_vector();
         P::mark_cpu_online(cpu_id);
-        Self::secondary_reactor_loop(cpu_id)
+        Self::secondary_reactor_loop()
     }
 
-    fn secondary_reactor_loop(cpu_id: CpuId) -> ! {
+    fn secondary_reactor_loop() -> ! {
         P::enable_ipi_wakeups();
         P::enable_timer_wakeups();
         loop {
+            // Re-read after every trap/longjmp round-trip; the boot argument is
+            // not the authoritative hart identity once the reactor is running.
+            let cpu_id = <P as tx_hal::SmpIf>::current_cpu_id();
             if Self::run_secondary_reactor_once(cpu_id) {
                 continue;
             }
