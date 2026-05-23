@@ -23,6 +23,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// ```text
     /// /bin/busybox    → /musl/musl/busybox  (handles `#!/bin/busybox sh …`)
     /// /bin/sh         → /musl/musl/busybox  (handles `#!/bin/sh`)
+    /// /bin/cat        → /musl/musl/busybox  (LTP opens it as a stable file)
     /// /usr/bin/env    → /musl/musl/busybox  (handles `#!/usr/bin/env …`)
     /// ```
     ///
@@ -70,6 +71,7 @@ impl<P: TxPlatform> CoreInit<P> {
         };
         let _ = symlink_into(fs_ops, bin_id, b"busybox", b"/musl/musl/busybox", &cred);
         let _ = symlink_into(fs_ops, bin_id, b"sh", b"/musl/musl/busybox", &cred);
+        let _ = symlink_into(fs_ops, bin_id, b"cat", b"/musl/musl/busybox", &cred);
 
         // /usr and /usr/bin
         let usr_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"usr", 0o755, &cred) {

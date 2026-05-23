@@ -806,6 +806,12 @@ async fn sys_write_pagebacked<'a>(
         return SyscallResult::Return(0);
     }
 
+    if file.flags().append {
+        if let tx_subsystems::vfs::RNodeBacking::PageBacked { pc } = file.rnode().backing() {
+            file.set_offset(pc.size_bytes());
+        }
+    }
+
     // Prefault: eagerly materialise every user page and publish to
     // the pmap so the step loop below finds every page in the cache.
     // If any page is unmapped or has a prot mismatch, fail before
@@ -1467,6 +1473,135 @@ pub(super) fn sys_fadvise64(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
     SyscallResult::Return(0)
 }
 
+/// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)`.
+pub(super) fn sys_copy_file_range<P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
+    use tx_subsystems::page_backed::step_copy_file_range;
+    use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking};
+
+    let fd_in = args[0] as i32;
+    let off_in_ptr = args[1];
+    let fd_out = args[2] as i32;
+    let off_out_ptr = args[3];
+    let len = args[4] as usize;
+    let flags = args[5];
+
+    if fd_in < 0 || fd_out < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let in_file = match resolve_fd(&ctx.process, fd_in as u32) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let out_file = match resolve_fd(&ctx.process, fd_out as u32) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+
+    if !in_file.flags().read || !out_file.flags().write || out_file.flags().append {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if len == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    let (in_rnode, in_pc) = match in_file.backing() {
+        OpenFileBacking::Rnode { rnode } => match rnode.backing() {
+            RNodeBacking::PageBacked { pc } => (rnode.clone(), pc.clone()),
+            RNodeBacking::Directory => return SyscallResult::Error(EISDIR_VALUE),
+            _ => return SyscallResult::Error(EINVAL_VALUE),
+        },
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    let (out_rnode, out_pc) = match out_file.backing() {
+        OpenFileBacking::Rnode { rnode } => match rnode.backing() {
+            RNodeBacking::PageBacked { pc } => (rnode.clone(), pc.clone()),
+            RNodeBacking::Directory => return SyscallResult::Error(EISDIR_VALUE),
+            _ => return SyscallResult::Error(EINVAL_VALUE),
+        },
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+
+    let read_offset = |ptr: u64, file_offset: u64| -> Result<(u64, bool), i32> {
+        if ptr == 0 {
+            return Ok((file_offset, false));
+        }
+        let mut bytes = [0u8; 8];
+        bootstrap_copy_from_user(&ctx.aspace, &mut bytes, ptr).map_err(errno_to_i32)?;
+        let signed = i64::from_le_bytes(bytes);
+        if signed < 0 {
+            return Err(EINVAL_VALUE);
+        }
+        bootstrap_copy_to_user(&ctx.aspace, ptr, &bytes).map_err(errno_to_i32)?;
+        Ok((signed as u64, true))
+    };
+
+    let (in_offset, explicit_in) = match read_offset(off_in_ptr, in_file.offset()) {
+        Ok(v) => v,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let (out_offset, explicit_out) = match read_offset(off_out_ptr, out_file.offset()) {
+        Ok(v) => v,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+
+    let guard = tx_substrate::epoch::guard();
+    let outcome = step_copy_file_range(&in_pc, in_offset, &out_pc, out_offset, len, &guard);
+    drop(guard);
+
+    let transferred = match outcome {
+        tx_substrate::step::StepOutcome::Done(n) => n,
+        tx_substrate::step::StepOutcome::Err(e) => {
+            let errno: tx_subsystems::execution::Errno = e.into();
+            return SyscallResult::error_from(errno);
+        }
+        _ => return SyscallResult::Error(EAGAIN_VALUE),
+    };
+
+    if transferred > 0 {
+        let in_next = in_offset + transferred as u64;
+        let out_next = out_offset + transferred as u64;
+        if explicit_in {
+            if let Err(_errno) =
+                bootstrap_copy_to_user(&ctx.aspace, off_in_ptr, &in_next.to_le_bytes())
+            {
+                return SyscallResult::Return(transferred as i64);
+            }
+        } else {
+            in_file.advance_offset(transferred as u64);
+        }
+        if explicit_out {
+            if let Err(_errno) =
+                bootstrap_copy_to_user(&ctx.aspace, off_out_ptr, &out_next.to_le_bytes())
+            {
+                return SyscallResult::Return(transferred as i64);
+            }
+        } else {
+            out_file.advance_offset(transferred as u64);
+        }
+
+        let mut meta = crate::linux_syscall::fs_basic::stat_meta_override_or(
+            out_rnode.fs_object_id(),
+            out_rnode.meta(),
+        );
+        meta.size = out_pc.size_bytes();
+        let old_mtime = meta.mtime;
+        meta.mtime =
+            tx_subsystems::vfs::Timespec::new(old_mtime.sec.saturating_add(2), old_mtime.nsec);
+        meta.ctime = meta.mtime;
+        crate::linux_syscall::fs_basic::record_stat_meta_override(out_rnode.fs_object_id(), meta);
+    }
+
+    let _ = in_rnode;
+    SyscallResult::Return(transferred as i64)
+}
+
 /// `splice(fd_in, off_in, fd_out, off_out, len, flags)`.
 ///
 /// This is intentionally conservative. The fd-io `splice07` matrix is an
@@ -1531,6 +1666,10 @@ pub(super) async fn sys_sendfile64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         None => return SyscallResult::Error(EBADF_VALUE),
     };
 
+    if !in_file.flags().read || !out_file.flags().write {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+
     if let Some(result) = super::net::sys_socket_sendfile(out_fd as u32, count, ctx) {
         return result;
     }
@@ -1559,7 +1698,14 @@ pub(super) async fn sys_sendfile64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut off_bytes, offset_ptr) {
             return SyscallResult::error_from(errno);
         }
-        in_offset = u64::from_le_bytes(off_bytes);
+        let signed_offset = i64::from_le_bytes(off_bytes);
+        if signed_offset < 0 {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, offset_ptr, &off_bytes) {
+            return SyscallResult::error_from(errno);
+        }
+        in_offset = signed_offset as u64;
         needs_offset_writeback = true;
     } else {
         // Use the input file's current cursor.
