@@ -16,7 +16,7 @@ use tx_hal::{CpuId, CpuPinGuard, IrqIf, PercpuIf, SmpIf};
 const INITIAL_EPOCH: u64 = 1;
 const RETIRE_THRESHOLD: usize = 64;
 const DEFAULT_DRAIN_BATCH: usize = 32;
-const MAX_EPOCH_CPUS: usize = 64;
+const MAX_EPOCH_CPUS: usize = 8;
 
 pub use super::retired::RETIRED_NODE_POOL_CAPACITY;
 

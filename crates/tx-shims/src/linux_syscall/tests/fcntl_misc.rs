@@ -502,7 +502,7 @@ fn dispatch_sethostname_too_long_returns_neg_einval() {
 // -----------------------------------------------------------------
 
 /// `prlimit64(0, RLIMIT_NOFILE, NULL, &old)` returns 0 and writes
-/// the default `(65536, 65536)` pair to `old`.
+/// the default `(1024, 1024)` pair to `old`.
 #[test]
 fn dispatch_prlimit64_rlimit_nofile_returns_default() {
     let _setup = setup();
@@ -518,14 +518,8 @@ fn dispatch_prlimit64_rlimit_nofile_returns_default() {
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Return(0));
-    assert_eq!(
-        buf[0], 65536,
-        "RLIMIT_NOFILE rlim_cur must default to 65536"
-    );
-    assert_eq!(
-        buf[1], 65536,
-        "RLIMIT_NOFILE rlim_max must default to 65536"
-    );
+    assert_eq!(buf[0], 1024, "RLIMIT_NOFILE rlim_cur must default to 1024");
+    assert_eq!(buf[1], 1024, "RLIMIT_NOFILE rlim_max must default to 1024");
 }
 
 /// `prlimit64(0, RLIMIT_AS, NULL, &old)` returns the

@@ -1183,6 +1183,22 @@ pub const F_GETFL: i32 = 3;
 /// the gating change; once it lands, this command moves to the
 /// mutator side. `TODO(phase-fcntl-setfl)`.
 pub const F_SETFL: i32 = 4;
+/// `F_GETLK` cmd: query POSIX advisory record locks.
+pub const F_GETLK: i32 = 5;
+/// `F_SETLK` cmd: set/clear POSIX advisory record locks without waiting.
+pub const F_SETLK: i32 = 6;
+/// `F_SETLKW` cmd: set/clear POSIX advisory record locks, waiting if needed.
+pub const F_SETLKW: i32 = 7;
+/// `F_OFD_GETLK` cmd: query open-file-description advisory locks.
+pub const F_OFD_GETLK: i32 = 36;
+/// `F_OFD_SETLK` cmd: set/clear open-file-description advisory locks.
+pub const F_OFD_SETLK: i32 = 37;
+/// `F_OFD_SETLKW` cmd: set/clear open-file-description locks, waiting if needed.
+pub const F_OFD_SETLKW: i32 = 38;
+/// `F_SETLEASE` cmd: request a file lease.
+pub const F_SETLEASE: i32 = 1024;
+/// `F_GETLEASE` cmd: query a file lease.
+pub const F_GETLEASE: i32 = 1025;
 /// `F_DUPFD_CLOEXEC` cmd: like [`F_DUPFD`] but the new fd is marked
 /// close-on-exec (the per-fd CLOEXEC bit is set on the result).
 pub const F_DUPFD_CLOEXEC: i32 = 1030;
@@ -1215,7 +1231,7 @@ pub const RLIMIT_RSS: u32 = 5;
 /// `RLIMIT_NPROC = 6` — maximum number of processes per real uid.
 pub const RLIMIT_NPROC: u32 = 6;
 /// `RLIMIT_NOFILE = 7` — maximum open file descriptors. Slice 7
-/// reports `(65536, 65536)`.
+/// reports `(1024, 1024)`.
 pub const RLIMIT_NOFILE: u32 = 7;
 /// `RLIMIT_MEMLOCK = 8` — maximum locked-in-memory bytes.
 pub const RLIMIT_MEMLOCK: u32 = 8;

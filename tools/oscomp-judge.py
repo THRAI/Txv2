@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """本地 OSComp 评分脚本，不依赖 pygrading。
-用法: python3 tools/oscomp-judge.py <serial_out.txt> <testdata_dir>
+
+默认使用 testdata 中的官方 judge，再对 LTP 的 0/0 老式输出补一层
+TPASS/TFAIL/TBROK/TCONF/TWARN 解析，输出字段仍保持官方的 pass/all/score
+结构。使用 --official-only 可查看未适配的官方原始结果。
+
+用法: python3 tools/oscomp-judge.py [--official-only] <serial_out.txt> <testdata_dir>
 """
 
 import json
@@ -68,25 +73,24 @@ def parse_ltp_detail_counts(group_lines):
     return counts, ret_by_case
 
 
-def patch_ltp_zero_denominator(group, group_lines, data):
-    """Local helper for OSComp LTP smoke runs.
+def adapt_ltp_detail_counts(group, group_lines, data):
+    """Adapt official LTP scores for logs without Summary blocks.
 
-    Some LTP binaries exit directly without printing the common "Summary:"
-    block. The bundled judge then reports the case as 0/0, which hides
-    crashes and makes return-code-only smoke tests look like passes. Keep the
-    official summary counts when present; otherwise score the case as a
-    one-point return-code test.
+    The official judge scores the LTP Summary block. Some older LTP cases in
+    this testdata print TPASS/TFAIL lines but no Summary, so official output is
+    0/0. In that case only, count detail lines and keep the same pass/all/score
+    shape. If a case has neither Summary nor detail lines, keep it as 0/0.
     """
     if not group.startswith("ltp-"):
         return data
 
-    detail_counts, ret_by_case = parse_ltp_detail_counts(group_lines)
+    detail_counts, _ = parse_ltp_detail_counts(group_lines)
 
     patched = []
     for item in data:
         name = item.get("name")
         counts = detail_counts.get(name)
-        if counts:
+        if item.get("all", 0) == 0 and counts:
             total = sum(counts.values())
             if total > 0:
                 item = dict(item)
@@ -97,24 +101,23 @@ def patch_ltp_zero_denominator(group, group_lines, data):
                 item["broken"] = counts["broken"]
                 item["skipped"] = counts["skipped"]
                 item["warnings"] = counts["warnings"]
-        if item.get("all", 0) == 0:
-            if name in ret_by_case:
-                ok = 1 if ret_by_case[name] == 0 else 0
-                item = dict(item)
-                item["pass"] = ok
-                item["all"] = 1
-                item["score"] = ok
         patched.append(item)
     return patched
 
 
 def main():
-    if len(sys.argv) < 3:
-        print(f"用法: {sys.argv[0]} <serial_out.txt> <testdata_dir>")
+    args = sys.argv[1:]
+    official_only = False
+    if "--official-only" in args:
+        args.remove("--official-only")
+        official_only = True
+
+    if len(args) < 2:
+        print(f"用法: {sys.argv[0]} [--official-only] <serial_out.txt> <testdata_dir>")
         sys.exit(1)
 
-    serial_file = sys.argv[1]
-    testdata_dir = sys.argv[2]
+    serial_file = args[0]
+    testdata_dir = args[1]
 
     with open(serial_file, "rb") as f:
         serial_text = f.read().decode("utf-8", errors="ignore")
@@ -177,7 +180,8 @@ def main():
             print(f"[{group}] judge 解析失败: {proc.stderr.decode()[:200]}")
             continue
 
-        data = patch_ltp_zero_denominator(group, group_lines, data)
+        if not official_only:
+            data = adapt_ltp_detail_counts(group, group_lines, data)
         results[group] = data
         g_pass = sum(item.get("pass", item.get("score", 0)) for item in data)
         g_all = sum(item.get("all", 1) for item in data)
@@ -187,7 +191,7 @@ def main():
         for item in data:
             p = item.get("pass", item.get("score", 0))
             a = item.get("all", 1)
-            mark = "✓" if p == a else ("~" if p > 0 else "✗")
+            mark = "?" if a == 0 else ("✓" if p == a else ("~" if p > 0 else "✗"))
             print(f"  {mark} {item['name']}  {p}/{a}")
 
     print()

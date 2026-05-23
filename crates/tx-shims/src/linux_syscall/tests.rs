@@ -933,16 +933,9 @@ fn dispatch_fcntl_setfd_clears_other_bits() {
 
 /// Unknown `cmd` values return `-ENOSYS`.
 ///
-/// Wave 2 originally treated F_DUPFD / F_GETFL / F_SETFL as unknown;
-/// Slice 7 of the shell-prompt roadmap (2026-05-07) adds real arms
-/// for F_DUPFD / F_DUPFD_CLOEXEC / F_GETFL (F_SETFL still returns
-/// ENOSYS as a documented carryover — see the dedicated
-/// `dispatch_fcntl_f_setfl_returns_neg_enosys` test in the
-/// `fcntl_misc` module). This test uses an arbitrary high `cmd` value
-/// (`F_GETLK = 5`, file locking — out of scope for v1) to exercise
-/// the catch-all unknown branch.
+/// Unknown fcntl commands return `-EINVAL` per Linux.
 #[test]
-fn dispatch_fcntl_unknown_cmd_returns_neg_enosys() {
+fn dispatch_fcntl_unknown_cmd_returns_neg_einval() {
     let _setup = setup();
     let _ops = install_capturing_console();
     let proc_cap = bootstrap();
@@ -952,12 +945,11 @@ fn dispatch_fcntl_unknown_cmd_returns_neg_enosys() {
     proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
     let ctx = make_ctx(proc_cap, thread);
 
-    // F_GETLK = 5 (file locking) is not in any in-tree fcntl surface.
     let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_FCNTL, [3, 5, 0, 0, 0, 0]),
+        SyscallRequest::new(NR_FCNTL, [3, 9999, 0, 0, 0, 0]),
         &ctx,
     ));
-    assert_eq!(r, SyscallResult::Error(38));
+    assert_eq!(r, SyscallResult::Error(22));
 }
 
 /// `fcntl` against a closed/never-installed fd returns `-EBADF`.
