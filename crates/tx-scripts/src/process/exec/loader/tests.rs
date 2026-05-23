@@ -357,6 +357,65 @@ fn parse_image_plan_accepts_pt_interp_with_pt_dynamic() {
 }
 
 #[test]
+fn parse_image_plan_et_dyn_accepts_pt_interp_with_pt_dynamic() {
+    let mut cfg = FixtureCfg::minimal();
+    cfg.e_type = ET_DYN_U16;
+    let interp_offset = 0x200usize;
+    let interp = b"/lib/ld-musl-riscv64-sf.so.1\0";
+    cfg.phdrs.push(PhdrSpec {
+        p_type: PT_INTERP_U32,
+        p_flags: PF_R_BIT,
+        p_offset: interp_offset as u64,
+        p_vaddr: 0x200,
+        p_paddr: 0x200,
+        p_filesz: interp.len() as u64,
+        p_memsz: interp.len() as u64,
+        p_align: 1,
+    });
+    cfg.phdrs.push(PhdrSpec {
+        p_type: PT_DYNAMIC_U32,
+        p_flags: PF_R_BIT,
+        p_offset: 0x300,
+        p_vaddr: 0x300,
+        p_paddr: 0x300,
+        p_filesz: 16,
+        p_memsz: 16,
+        p_align: 8,
+    });
+    let mut bytes = cfg.build();
+    if bytes.len() < interp_offset + interp.len() {
+        bytes.resize(interp_offset + interp.len(), 0);
+    }
+    bytes[interp_offset..interp_offset + interp.len()].copy_from_slice(interp);
+    let plan = parse_image_plan(&bytes).expect("ET_DYN with PT_INTERP and PT_DYNAMIC should parse");
+    assert_eq!(
+        plan.interpreter_path.as_deref(),
+        Some(&interp[..interp.len() - 1])
+    );
+    assert_eq!(plan.load_bias, 0x10000);
+}
+
+#[test]
+fn parse_image_plan_et_dyn_accepts_pt_dynamic_without_interp() {
+    let mut cfg = FixtureCfg::minimal();
+    cfg.e_type = ET_DYN_U16;
+    cfg.phdrs.push(PhdrSpec {
+        p_type: PT_DYNAMIC_U32,
+        p_flags: PF_R_BIT,
+        p_offset: 0x200,
+        p_vaddr: 0x200,
+        p_paddr: 0x200,
+        p_filesz: 16,
+        p_memsz: 16,
+        p_align: 8,
+    });
+    let bytes = cfg.build();
+    let plan = parse_image_plan(&bytes)
+        .expect("ET_DYN static-PIE with PT_DYNAMIC but no PT_INTERP should parse");
+    assert!(plan.interpreter_path.is_none());
+}
+
+#[test]
 fn parse_image_plan_rejects_pt_dynamic_without_interp() {
     let mut cfg = FixtureCfg::minimal();
     cfg.phdrs.push(PhdrSpec {

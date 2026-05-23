@@ -10,7 +10,7 @@ use crate::process::{bootstrap_init_process, step_exit_group, step_fork, ExitSta
 use crate::signal::adapter::step_engine::Cap;
 use crate::signal::{
     step_kill_pgrp, step_kill_process, step_sigaction, KillOutcome, PendingSignalQueue,
-    SigDisposition, SigDispositionChange, SignalMask, Signum,
+    SigActionEntry, SigDisposition, SigDispositionChange, SignalMask, Signum,
 };
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange};
@@ -163,7 +163,10 @@ fn sigaction_installs_handler_and_returns_previous_disposition() {
     assert!(matches!(
         first,
         SigDispositionChange::Replaced {
-            prev: SigDisposition::Default
+            prev: SigActionEntry {
+                disposition: SigDisposition::Default,
+                ..
+            }
         }
     ));
 
@@ -175,7 +178,10 @@ fn sigaction_installs_handler_and_returns_previous_disposition() {
     assert!(matches!(
         second,
         SigDispositionChange::Replaced {
-            prev: SigDisposition::Ignore
+            prev: SigActionEntry {
+                disposition: SigDisposition::Ignore,
+                ..
+            }
         }
     ));
 }
@@ -188,7 +194,10 @@ fn sigaction_refuses_to_change_uncatchable_disposition() {
     let outcome = step_sigaction(&proc_cap, Signum::SIGKILL, SigDisposition::Ignore);
     assert!(matches!(
         outcome,
-        SigDispositionChange::Uncatchable(SigDisposition::Default)
+        SigDispositionChange::Uncatchable(SigActionEntry {
+            disposition: SigDisposition::Default,
+            ..
+        })
     ));
 
     // Still Default afterwards.

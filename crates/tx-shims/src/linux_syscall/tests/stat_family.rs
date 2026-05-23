@@ -4,6 +4,7 @@ use super::*;
 use crate::adapter::step_engine::{
     self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, StepOutcome,
 };
+use crate::linux_syscall::clear_stat_meta_overrides;
 use alloc::sync::Arc;
 use alloc::vec;
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
@@ -73,6 +74,7 @@ fn ensure_zero_frame_claimed() {
 }
 
 fn stat_setup() -> TestSetup {
+    clear_stat_meta_overrides();
     let setup = setup();
     ensure_zero_frame_claimed();
     setup

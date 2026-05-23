@@ -1027,6 +1027,22 @@ pub trait SignalFrameIf: TrapIf {
         })
     }
 
+    fn signal_frame_size() -> usize {
+        0
+    }
+
+    fn decode_signal_frame_bytes(
+        user_sp: UserPtr<u8>,
+        _bytes: &[u8],
+    ) -> Result<SavedSignalFrame, FaultInfo> {
+        Err(FaultInfo {
+            address: VirtAddr(user_sp.addr()),
+            write: false,
+            instruction: false,
+            from_user: false,
+        })
+    }
+
     fn restore_signal_frame(_tf: TrapFrameMut<'_>, _frame: &SavedSignalFrame) {}
 
     fn rewind_syscall_pc(mut tf: TrapFrameMut<'_>) {

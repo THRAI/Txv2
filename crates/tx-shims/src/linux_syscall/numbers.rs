@@ -1654,17 +1654,17 @@ pub const EFD_CLOEXEC_FLAG: u32 = O_CLOEXEC;
 pub const EFD_NONBLOCK_FLAG: u32 = O_NONBLOCK;
 
 /// `timerfd_create(clockid, flags)`. Linux generic uapi
-/// `__NR_timerfd_create = 283`. Mints a fresh
+/// `__NR_timerfd_create = 85`. Mints a fresh
 /// [`tx_subsystems::timerfd::TimerFd`] cap.
-pub const NR_TIMERFD_CREATE: u64 = 283;
+pub const NR_TIMERFD_CREATE: u64 = 85;
 
 /// `timerfd_settime(fd, flags, new_value, old_value)`. Linux generic
-/// uapi `__NR_timerfd_settime = 286`. Arms/disarms the timer.
-pub const NR_TIMERFD_SETTIME: u64 = 286;
+/// uapi `__NR_timerfd_settime = 86`. Arms/disarms the timer.
+pub const NR_TIMERFD_SETTIME: u64 = 86;
 
 /// `timerfd_gettime(fd, curr_value)`. Linux generic uapi
-/// `__NR_timerfd_gettime = 287`. Returns the current timer state.
-pub const NR_TIMERFD_GETTIME: u64 = 287;
+/// `__NR_timerfd_gettime = 87`. Returns the current timer state.
+pub const NR_TIMERFD_GETTIME: u64 = 87;
 
 /// Recognised `timerfd_create` flags. TFD_CLOEXEC / TFD_NONBLOCK are
 /// translated to OpenFileFlags.
@@ -1685,16 +1685,12 @@ pub const NR_SYSLOG: u64 = 116;
 // =====================================================================
 // membarrier syscall numbers and command flags
 //
-// `man 2 membarrier`. The Linux RV64 generic uapi does not assign
-// membarrier a dedicated slot — it was briefly `283` before
-// timerfd_create took that number. We use the x86_64 value 324,
-// which is unused in txKernel's RV64 table.
+// `man 2 membarrier`. The Linux RV64 generic uapi assigns membarrier
+// dedicated slot 283.
 // =====================================================================
 
-/// `membarrier(cmd, flags, cpu_id)`. x86_64 ABI `__NR_membarrier = 324`.
-/// RV64 generic uapi has no dedicated slot; 324 is unoccupied in the
-/// txKernel number space.
-pub const NR_MEMBARRIER: u64 = 324;
+/// `membarrier(cmd, flags, cpu_id)`. RISC-V generic uapi `__NR_membarrier = 283`.
+pub const NR_MEMBARRIER: u64 = 283;
 
 /// Query supported commands. Always returns `MEMBARRIER_SUPPORTED_MASK`.
 pub const MEMBARRIER_CMD_QUERY: u64 = 0;

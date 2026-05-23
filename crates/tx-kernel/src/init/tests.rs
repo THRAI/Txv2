@@ -30,7 +30,7 @@ use tx_hal::{
 /// surface.
 const TEST_PAGE_SIZE: usize = 4096;
 
-use crate::init::{console_tty, dev_mount, root_mount, CoreInit};
+use crate::init::{console_tty, dev_mount, dev_shm_mount, root_mount, CoreInit};
 
 use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, StepOutcome};
 /// Serialise every test in this module against the rest of tx-kernel's
@@ -308,6 +308,7 @@ fn drive_boot_wiring() {
     CoreInit::<TestPlatform>::mount_rootfs_from_boot_media();
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
     CoreInit::<TestPlatform>::register_devfs_console_alias();
+    CoreInit::<TestPlatform>::mount_tmpfs_at_dev_shm();
     CoreInit::<TestPlatform>::mount_bdevfs_at_dev_block();
     CoreInit::<TestPlatform>::bind_init_cwd_and_root();
 }
@@ -463,6 +464,60 @@ fn boot_smoke_walker_resolves_dev_block_after_bdevfs_mount() {
         matches!(dentry.rnode().backing(), RNodeBacking::Directory),
         "/dev/block is a Directory"
     );
+}
+
+#[test]
+fn boot_wiring_mounts_writable_tmpfs_at_dev_shm_for_musl_shm_open() {
+    use tx_shims::linux_syscall::{
+        dispatch, SyscallCtx, SyscallResult, AT_FDCWD, NR_OPENAT, O_CLOEXEC, O_CREAT, O_NONBLOCK,
+        O_RDWR,
+    };
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    let dev_shm = dev_shm_mount().expect("DEV_SHM_MOUNT must be populated");
+    assert_eq!(
+        dev_shm
+            .payload_cap()
+            .expect("/dev/shm payload alive")
+            .into_cap()
+            .fstype,
+        "tmpfs"
+    );
+    assert_eq!(
+        dev_shm.root().fs_object_id(),
+        tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID
+    );
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let leader = init
+        .nth_thread(0)
+        .expect("init has a leader thread post-bootstrap");
+    let aspace = init.aspace_cap().expect("init aspace must be alive");
+    let ctx = SyscallCtx::new(init, leader, aspace);
+
+    let path = b"/dev/shm/testshm\0";
+    const O_LARGEFILE: u32 = 0o100000;
+    const O_NOFOLLOW: u32 = 0o400000;
+    let flags = O_RDWR | O_CREAT | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW | O_LARGEFILE;
+    let req = crate::adapter::boot_runtime::userspace::SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            flags as u64,
+            0o666,
+            0,
+            0,
+        ],
+    );
+
+    match block_on(dispatch::<TestPlatform>(req, &ctx)) {
+        SyscallResult::Return(fd) => assert!(fd >= 0, "openat returned a valid fd"),
+        other => panic!("musl shm_open path must create under /dev/shm, got {other:?}"),
+    }
 }
 
 #[test]

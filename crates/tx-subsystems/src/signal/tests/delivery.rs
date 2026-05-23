@@ -5,7 +5,8 @@ use crate::process::{bootstrap_init_process, ExitStatus, ProcessIdentity};
 use crate::signal::adapter::step_engine::{Cap, SignalRouting};
 use crate::signal::{
     ast_check, default_action, select_next_signal, step_kill_process, step_sigaction, AstOutcome,
-    DefaultAction, InterruptSummary, KillOutcome, PendingSource, SigDisposition, SignalTarget,
+    DefaultAction, InterruptSummary, KillOutcome, PendingSource, SaFlags, SigActionEntry,
+    SigDisposition, SignalTarget,
 };
 use crate::thread_runtime::execution::{post_signal, step_sigprocmask, SigmaskHow};
 use crate::thread_runtime::structure::ThreadIdentity;
@@ -318,7 +319,7 @@ fn ast_check_deliver_handler_when_handler_installed() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::handler(0xCAFE));
+    let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Handler(0xCAFE));
     post_signal(
         &leader,
         Signum::SIGTERM,
@@ -330,10 +331,78 @@ fn ast_check_deliver_handler_when_handler_installed() {
         ast_check(&leader),
         AstOutcome::DeliverHandler {
             sig: Signum::SIGTERM,
-            handler: 0xCAFE,
-            flags: 0,
-            restorer: 0,
+            action: SigActionEntry::handler(0xCAFE),
         }
+    );
+}
+
+#[test]
+fn ast_check_deliver_handler_carries_sigaction_entry() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+
+    let mut action = SigActionEntry::handler(0xCAFE);
+    action.flags = SaFlags::SIGINFO | SaFlags::RESTART | SaFlags::ONSTACK;
+    action.sa_mask = crate::signal::SignalMask::new(Signum::SIGINT.bit());
+    action.restorer = 0xFEED_FACE;
+
+    let _ = crate::signal::step_sigaction_entry(&proc_cap, Signum::SIGTERM, action);
+    post_signal(
+        &leader,
+        Signum::SIGTERM,
+        SignalRouting::ProcessDirected,
+        None,
+    );
+
+    assert_eq!(
+        ast_check(&leader),
+        AstOutcome::DeliverHandler {
+            sig: Signum::SIGTERM,
+            action,
+        }
+    );
+}
+
+#[test]
+fn ast_check_handler_delivery_clears_consumed_signal_summary() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+
+    let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Handler(0xCAFE));
+    post_signal(
+        &leader,
+        Signum::SIGTERM,
+        SignalRouting::ProcessDirected,
+        None,
+    );
+
+    assert!(
+        leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .interrupt_summary()
+            .deliverable_signal
+    );
+    assert_eq!(
+        ast_check(&leader),
+        AstOutcome::DeliverHandler {
+            sig: Signum::SIGTERM,
+            action: SigActionEntry::handler(0xCAFE),
+        }
+    );
+    assert!(
+        !leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .interrupt_summary()
+            .deliverable_signal,
+        "AST delivery must clear the summary bit after consuming the only pending signal"
     );
 }
 
@@ -440,6 +509,46 @@ fn sigprocmask_unblock_sets_deliverable_for_already_pending() {
             .unwrap()
             .interrupt_summary()
             .deliverable_signal
+    );
+}
+
+#[test]
+fn sigprocmask_unblock_sets_deliverable_for_group_pending() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+
+    let mut block = SignalMask::EMPTY;
+    block.block(Signum::SIGTERM);
+    let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
+    proc_cap
+        .payload
+        .lock()
+        .as_ref()
+        .unwrap()
+        .group_pending()
+        .post(Signum::SIGTERM);
+    assert!(
+        !leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .interrupt_summary()
+            .deliverable_signal
+    );
+
+    let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, SignalMask::EMPTY);
+
+    assert!(
+        leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .interrupt_summary()
+            .deliverable_signal,
+        "sigprocmask must recompute deliverability from process group-pending signals too"
     );
 }
 
@@ -661,12 +770,12 @@ fn ast_dispatch_default_stop_recognised_but_unrealised() {
 }
 
 #[test]
-fn ast_dispatch_deliver_handler_recognised_but_unrealised() {
+fn ast_dispatch_deliver_handler_returns_action_entry_for_frame_setup() {
     let _g = setup();
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::handler(0xFEED));
+    let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Handler(0xFEED));
     post_signal(
         &leader,
         Signum::SIGTERM,
@@ -679,9 +788,7 @@ fn ast_dispatch_deliver_handler_recognised_but_unrealised() {
         outcome,
         AstOutcome::DeliverHandler {
             sig: Signum::SIGTERM,
-            handler: 0xFEED,
-            flags: 0,
-            restorer: 0,
+            action: SigActionEntry::handler(0xFEED)
         }
     );
     // Handler installation overrides the default-Term path; the

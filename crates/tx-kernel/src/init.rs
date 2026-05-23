@@ -70,6 +70,10 @@ static ROOT_DENTRY: SpinMutex<Option<Cap<DEntry>>> = SpinMutex::new(None);
 /// after `init_substrate_if_ready` returns.
 static DEV_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
 
+/// Global tmpfs mount at `/dev/shm`. POSIX `shm_open` and named
+/// semaphore paths are plain VFS paths under this tmpfs.
+static DEV_SHM_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
+
 /// Global sdcard ext4 mount at `/musl`. Populated by
 /// `mount_sdcard_at_musl` when a `vda` block device is registered.
 /// Boards without a block device silently leave this `None`.
@@ -97,6 +101,12 @@ pub fn dev_mount() -> Option<Cap<MountIdentity>> {
     DEV_MOUNT.lock().clone()
 }
 
+/// Snapshot the boot-time `/dev/shm` tmpfs mount cap. Returns `None`
+/// until `mount_tmpfs_at_dev_shm` has run.
+pub fn dev_shm_mount() -> Option<Cap<MountIdentity>> {
+    DEV_SHM_MOUNT.lock().clone()
+}
+
 /// Snapshot the boot-time console TTY cap. Returns `None` until
 /// `register_console_hardware` has run.
 pub fn console_tty() -> Option<Cap<TtyIdentity>> {
@@ -113,6 +123,8 @@ pub(crate) fn mark_boot_reactor_userspace_preempt(cpu_id: CpuId) {
 pub fn reset_boot_state_for_test() {
     *ROOT_MOUNT.lock() = None;
     *DEV_MOUNT.lock() = None;
+    *DEV_SHM_MOUNT.lock() = None;
+    *MUSL_MOUNT.lock() = None;
     *CONSOLE_TTY.lock() = None;
     *ROOT_DENTRY.lock() = None;
 }
@@ -299,6 +311,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_devfs_at_dev();
             Self::register_devfs_console_alias();
             Self::mount_procfs_at_proc();
+            Self::mount_tmpfs_at_dev_shm();
             Self::mount_bdevfs_at_dev_block();
             Self::mount_sdcard_at_musl();
             Self::populate_rootfs_shebang_shims();
@@ -769,6 +782,91 @@ impl<P: TxPlatform> CoreInit<P> {
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:procfs:ok\n");
+    }
+
+    /// Mount writable tmpfs on `/dev/shm`.
+    ///
+    /// POSIX `shm_open` and named semaphore paths are specified as
+    /// ordinary VFS paths under `/dev/shm`; they are not SysV IPC
+    /// namespace objects. Devfs publishes a read-only synthetic
+    /// mountpoint directory and this boot step overlays it with a
+    /// mutable tmpfs so musl's `/dev/shm/<name>` open path can create
+    /// files.
+    ///
+    /// **Order invariant:** runs after `mount_devfs_at_dev` so the
+    /// devfs payload and `/dev/shm` mountpoint id are live, and before
+    /// userspace starts.
+    pub(crate) fn mount_tmpfs_at_dev_shm() {
+        let dev_mount = DEV_MOUNT
+            .lock()
+            .clone()
+            .expect("mount_tmpfs_at_dev_shm: DEV_MOUNT must be populated");
+
+        let dev_shm_meta = InodeMeta::new(
+            tx_subsystems::vfs::InodeKind::Directory,
+            tx_fs::devfs::DEVFS_SHM_DIR_MODE,
+        );
+        let dev_shm_rnode_in_devfs = RNode::new_cap(
+            tx_fs::devfs::DEVFS_SHM_DIR_OBJECT_ID,
+            dev_shm_meta,
+            RNodeBacking::Directory,
+        )
+        .expect("mount_tmpfs_at_dev_shm: /dev/shm rnode-on-devfs reservation");
+        let dev_shm_dentry_on_devfs = DEntry::new_cap(
+            InlineName::new(b"shm").expect("mount_tmpfs_at_dev_shm: /shm inline name"),
+            dev_shm_rnode_in_devfs,
+        )
+        .expect("mount_tmpfs_at_dev_shm: /dev/shm dentry-on-devfs reservation");
+
+        let (_tmpfs, mount_output) = tx_fs::tmpfs::Tmpfs::new_root();
+        let dev_shm_payload = MountPayload::new_cap(
+            mount_output.fs_ops.clone(),
+            mount_output.fs_page_backing.clone(),
+            None,
+            mount::allocate_dev_id(),
+            MountOptions::default(),
+            "tmpfs",
+            SourceLabel::Static("dev-shm"),
+        )
+        .expect("mount_tmpfs_at_dev_shm: payload reservation");
+
+        let dev_shm_root_rnode = {
+            let raw = RNode::new(
+                mount_output.root_fs_object_id,
+                mount_output.root_inode_meta,
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&dev_shm_payload);
+            let res = step_engine::reserve_for::<RNode>()
+                .expect("mount_tmpfs_at_dev_shm: tmpfs root rnode reservation");
+            step_engine::sign_for(res, raw)
+        };
+
+        let devfs_payload = dev_mount
+            .payload_cap()
+            .expect("devfs payload alive during boot")
+            .into_cap();
+
+        let dev_shm_mount = MountIdentity::new_cap(
+            mount::allocate_mount_id(),
+            Some(dev_shm_dentry_on_devfs),
+            dev_shm_root_rnode,
+            Some(dev_mount),
+            dev_shm_payload,
+            MountFlags::empty(),
+        )
+        .expect("mount_tmpfs_at_dev_shm: mount identity reservation");
+
+        mount::register_mount(
+            &devfs_payload,
+            tx_fs::devfs::DEVFS_SHM_DIR_OBJECT_ID,
+            dev_shm_mount.clone(),
+        );
+
+        *DEV_SHM_MOUNT.lock() = Some(dev_shm_mount);
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:dev-shm:tmpfs:ok\n");
     }
 
     /// Mount bdev-fs on `/dev/block`.

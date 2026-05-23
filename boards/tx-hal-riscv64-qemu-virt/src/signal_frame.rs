@@ -220,6 +220,16 @@ impl Rv64SignalFrame {
         ctx.status = self.saved_status as usize;
         ctx
     }
+
+    fn saved_frame(self, user_sp: UserPtr<u8>) -> Result<SavedSignalFrame, FaultInfo> {
+        self.validate(user_sp)?;
+        Ok(SavedSignalFrame {
+            saved_mask: UserSignalMaskAbi {
+                bits: self.ucontext.signal_mask_bits(),
+            },
+            user_context: self.to_full_user_context(),
+        })
+    }
 }
 
 impl SignalFrameIf for Platform {
@@ -283,13 +293,35 @@ impl SignalFrameIf for Platform {
             frame.assume_init()
         };
 
-        frame.validate(user_sp)?;
-        Ok(SavedSignalFrame {
-            saved_mask: UserSignalMaskAbi {
-                bits: frame.ucontext.signal_mask_bits(),
-            },
-            user_context: frame.to_full_user_context(),
-        })
+        frame.saved_frame(user_sp)
+    }
+
+    fn signal_frame_size() -> usize {
+        size_of::<Rv64SignalFrame>()
+    }
+
+    fn decode_signal_frame_bytes(
+        user_sp: UserPtr<u8>,
+        bytes: &[u8],
+    ) -> Result<SavedSignalFrame, FaultInfo> {
+        if bytes.len() != size_of::<Rv64SignalFrame>() {
+            return Err(FaultInfo {
+                address: VirtAddr(user_sp.addr()),
+                write: false,
+                instruction: false,
+                from_user: false,
+            });
+        }
+        let mut frame = core::mem::MaybeUninit::<Rv64SignalFrame>::uninit();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                frame.as_mut_ptr().cast::<u8>(),
+                size_of::<Rv64SignalFrame>(),
+            );
+            frame.assume_init()
+        }
+        .saved_frame(user_sp)
     }
 
     fn restore_signal_frame(mut tf: TrapFrameMut<'_>, frame: &SavedSignalFrame) {

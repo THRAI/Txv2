@@ -97,11 +97,23 @@ pub const DEVFS_NULL_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7802);
 /// Stable `FsObjectId` for the static `/dev/zero` character device.
 pub const DEVFS_ZERO_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7803);
 
+/// Stable `FsObjectId` for the synthetic `/dev/misc` directory.
+pub const DEVFS_MISC_DIR_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7804);
+
+/// Stable `FsObjectId` for the static `/dev/misc/rtc` character device.
+pub const DEVFS_RTC_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7805);
+
 /// `/dev/null` character device name as the lookup key.
 const DEVFS_NULL_NAME: &[u8] = b"null";
 
 /// `/dev/zero` directory name as the lookup key.
 const DEVFS_ZERO_NAME: &[u8] = b"zero";
+
+/// `/dev/misc` directory name as the lookup key.
+const DEVFS_MISC_DIR_NAME: &[u8] = b"misc";
+
+/// `/dev/misc/rtc` character device name as the lookup key.
+const DEVFS_RTC_NAME: &[u8] = b"rtc";
 
 /// Mode for any character-device alias resolved by devfs (per the
 /// Phase 3a plan §"devfs FsOps surface": `S_IFCHR | 0o620`).
@@ -110,6 +122,12 @@ pub const DEVFS_CHAR_MODE: u16 = S_IFCHR | 0o620;
 /// Mode for `/dev/null`; libc tests expect the conventional world
 /// readable/writable null device.
 pub const DEVFS_NULL_MODE: u16 = S_IFCHR | 0o666;
+
+/// Mode for the synthetic `/dev/misc` directory.
+pub const DEVFS_MISC_DIR_MODE: u16 = S_IFDIR | 0o755;
+
+/// Mode for `/dev/misc/rtc`; BusyBox `hwclock` opens this read-only.
+pub const DEVFS_RTC_MODE: u16 = S_IFCHR | 0o644;
 
 /// Mode for the devfs root directory (`S_IFDIR | 0o755`).
 pub const DEVFS_ROOT_MODE: u16 = S_IFDIR | 0o755;
@@ -163,6 +181,26 @@ static ZERO_CHAR_BINDING: CharDeviceBinding = CharDeviceBinding {
     devt: DevT::new(1, 5),
     name: "zero",
     ops: &ZERO_CHAR_OPS,
+};
+
+struct RtcCharOps;
+
+impl CharDeviceOps for RtcCharOps {
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        StepOutcome::done(0)
+    }
+
+    fn write(&self, _bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        StepOutcome::err(Errno::EINVAL.into())
+    }
+}
+
+static RTC_CHAR_OPS: RtcCharOps = RtcCharOps;
+
+pub static RTC_CHAR_BINDING: CharDeviceBinding = CharDeviceBinding {
+    devt: DevT::new(10, 135),
+    name: "rtc",
+    ops: &RTC_CHAR_OPS,
 };
 
 impl Devfs {
@@ -392,6 +430,12 @@ impl FsOps for Devfs {
         name: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<FsObjectId, NoProgress> {
+        if parent == DEVFS_MISC_DIR_OBJECT_ID {
+            if name == DEVFS_RTC_NAME {
+                return StepOutcome::done(DEVFS_RTC_OBJECT_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
         if parent != DEVFS_ROOT_OBJECT_ID {
             return StepOutcome::err(Errno::ENOENT.into());
         }
@@ -409,6 +453,9 @@ impl FsOps for Devfs {
         }
         if name == DEVFS_ZERO_NAME {
             return StepOutcome::done(DEVFS_ZERO_OBJECT_ID);
+        }
+        if name == DEVFS_MISC_DIR_NAME {
+            return StepOutcome::done(DEVFS_MISC_DIR_OBJECT_ID);
         }
         if tty::project::resolve_devfs_alias(name).is_some() {
             // Identify the entry by its position in the live alias
@@ -440,11 +487,17 @@ impl FsOps for Devfs {
         if fs_object_id == DEVFS_SHM_DIR_OBJECT_ID {
             return StepOutcome::done(InodeMeta::new(InodeKind::Directory, DEVFS_SHM_DIR_MODE));
         }
+        if fs_object_id == DEVFS_MISC_DIR_OBJECT_ID {
+            return StepOutcome::done(InodeMeta::new(InodeKind::Directory, DEVFS_MISC_DIR_MODE));
+        }
         if fs_object_id == DEVFS_NULL_OBJECT_ID {
             return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, DEVFS_NULL_MODE));
         }
         if fs_object_id == DEVFS_ZERO_OBJECT_ID {
             return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, DEVFS_NULL_MODE));
+        }
+        if fs_object_id == DEVFS_RTC_OBJECT_ID {
+            return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, DEVFS_RTC_MODE));
         }
         if entry_index_from_object_id(fs_object_id)
             .and_then(|idx| tty::project::devfs_alias_entries().into_iter().nth(idx))
@@ -556,6 +609,18 @@ impl FsOps for Devfs {
             // an empty directory.
             return StepOutcome::done(None);
         }
+        if fs_object_id == DEVFS_MISC_DIR_OBJECT_ID {
+            if cursor.as_u64() == 0 {
+                let dir_entry =
+                    match DirEntry::new(DEVFS_RTC_OBJECT_ID, InodeKind::CharDevice, DEVFS_RTC_NAME)
+                    {
+                        Ok(de) => de,
+                        Err(err) => return StepOutcome::err(err.into()),
+                    };
+                return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(1))));
+            }
+            return StepOutcome::done(None);
+        }
         if fs_object_id != DEVFS_ROOT_OBJECT_ID {
             return StepOutcome::err(Errno::ENOTDIR.into());
         }
@@ -607,6 +672,17 @@ impl FsOps for Devfs {
                 DEVFS_SHM_DIR_OBJECT_ID,
                 InodeKind::Directory,
                 DEVFS_SHM_DIR_NAME,
+            ) {
+                Ok(de) => de,
+                Err(err) => return StepOutcome::err(err.into()),
+            };
+            return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
+        }
+        if index == entries.len() + 4 {
+            let dir_entry = match DirEntry::new(
+                DEVFS_MISC_DIR_OBJECT_ID,
+                InodeKind::Directory,
+                DEVFS_MISC_DIR_NAME,
             ) {
                 Ok(de) => de,
                 Err(err) => return StepOutcome::err(err.into()),
@@ -676,6 +752,19 @@ impl FsOps for Devfs {
                 meta,
                 RNodeBacking::StructBacked {
                     payload: StructPayload::CharDevice(&ZERO_CHAR_BINDING),
+                },
+                mount,
+            ) {
+                Ok(rnode) => StepOutcome::done(rnode),
+                Err(_) => StepOutcome::err(Errno::EIO.into()),
+            };
+        }
+        if fs_object_id == DEVFS_RTC_OBJECT_ID {
+            return match RNode::new_cap_in_mount(
+                fs_object_id,
+                meta,
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::CharDevice(&RTC_CHAR_BINDING),
                 },
                 mount,
             ) {
