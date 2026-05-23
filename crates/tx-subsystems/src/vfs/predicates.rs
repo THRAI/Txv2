@@ -37,7 +37,7 @@ pub fn payload_live<'g>(r: &IdentRef<'g, RNode>) -> bool {
             | super::structure::RNodeBacking::StructBacked { .. }
             | super::structure::RNodeBacking::Symlink { .. }
             | super::structure::RNodeBacking::Directory
-            | super::structure::RNodeBacking::Projected
+            | super::structure::RNodeBacking::Projected { .. }
     )
 }
 

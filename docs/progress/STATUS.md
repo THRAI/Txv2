@@ -1,3 +1,290 @@
+- 2026-05-23 **Closed the eleventh IPC/VFS audit implementation slice:
+  compile blocker plus `/dev/shm` tmpfs-backed POSIX shm/named-sem path
+  setup.** VM fault handling no longer carries non-`Send` epoch guards or
+  `MaterializedPagePin` evidence across range-lock awaits; the fault loop now
+  uses synchronous resolve/materialize/publish helpers that return only
+  `WaitToken`s to the async state. Boot now mounts a retained tmpfs at
+  `/dev/shm`, publishes it to both the legacy mount table and init
+  `MountNamespace`, and keeps POSIX shm/named-sem creation on normal VFS/tmpfs
+  paths. Named sem files are path-resolvable under `/dev/shm/sem.*`; wiring
+  those files to `SemArrayPayload { nsems = 1 }` remains the deeper IPC payload
+  integration gap.
+  **Verified:** red `/dev/shm` walker test first resolved the devfs stub
+  (`DEVFS_SHM_DIR_OBJECT_ID`) instead of tmpfs root; then `cargo test -p
+  tx-kernel --lib init::tests::boot_smoke_walker_resolves_dev_shm_to_tmpfs_mount
+  -- --nocapture`, `cargo test -p tx-kernel --lib
+  init::tests::boot_smoke_dev_shm_accepts_posix_shm_and_named_sem_files --
+  --nocapture`, `cargo test -p tx-subsystems --lib fault_script --
+  --nocapture`, and `cargo check -p tx-subsystems -p tx-shims -p tx-kernel`
+  passed.
+  **Next step:** harden remaining namespace-aware syscall helpers that still
+  rely on global mount fallback, then wire named-sem tmpfs files to the
+  `SemArrayPayload` reuse model.
+  **Blocker:** full `cargo fmt --check` remains blocked by the unrelated
+  pre-existing formatting diff in `crates/tx-shims/src/linux_syscall/mod.rs`;
+  no QEMU guest IPC/VFS smoke was run in this slice.
+
+- 2026-05-23 **Closed the tenth IPC/VFS audit implementation slice:
+  mount namespace ownership and namespace-aware mount crossing.** `NsProxy`
+  now carries an optional `mnt_ns` cap, boot publishes the initial root
+  `MountNamespace` after rootfs mount creation, fork inherits the mount
+  namespace bundle, and boot/syscall mount publication registers entries in
+  the caller's mount namespace when present. The VFS walker has a
+  `step_walk_in_mount_namespace` path that consults the per-namespace mount
+  table instead of the legacy global fallback; `umount2` uses the namespace
+  table when available.
+  **Verified:** red tests first failed on the missing namespace-aware walker
+  entrypoint and missing `NsProxy.mnt_ns`; then `cargo test -p tx-subsystems
+  --lib vfs::walker::tests::step_walk_uses_mount_namespace_table_before_global_fallback
+  -- --nocapture`, `cargo test -p tx-subsystems --lib
+  process::tests::fork_inherits_mount_namespace_from_nsproxy_bundle -- --nocapture`,
+  `cargo test -p tx-subsystems --lib
+  process::tests::fork_with_clone_newipc_publishes_fresh_empty_ipc_namespace -- --nocapture`,
+  `cargo test -p tx-subsystems --lib
+  vfs::walker::tests::step_walk_crosses_mount_point_at_dev -- --nocapture`,
+  and `cargo check -p tx-subsystems -p tx-shims` passed.
+  `cargo test -p tx-subsystems --lib mount:: -- --nocapture` also passed
+  (7 tests) after the namespace-local `umount` fallback was aligned with the
+  legacy global-table behavior.
+  **Next step:** finish the remaining Mount/VFS ownership gaps:
+  open-file/FsContext mount caps and payload pins, lazy umount/detached-cwd
+  semantics, full walker witness/resume/`..` boundary handling, and
+  mount-namespace-aware procfs rendering.
+  **Blocker:** superseded by the eleventh slice, which fixed the
+  `cargo check -p tx-kernel` `run_thread` future `Send` failure. Full `cargo
+  fmt --check` is still blocked by the unrelated pre-existing formatting diff
+  in `crates/tx-shims/src/linux_syscall/mod.rs`.
+
+- 2026-05-23 **Closed the ninth IPC/VFS audit implementation slice:
+  `/proc/sysvipc/*`, POSIX mq fdinfo, `GETPID`, and mount-flag parsing /
+  exec `NOEXEC`.** Added live procfs renderers for `/proc/sysvipc/msg`,
+  `/proc/sysvipc/sem`, `/proc/sysvipc/shm`, plus `/proc/<pid>/fdinfo/<fd>`
+  with POSIX mq attribute reporting. SysV sem `GETPID` now tracks the last
+  modifier, and the syscall layer passes the process cap through semctl so
+  `SETVAL` / `SETALL` / `semop` update the stored pid. The VFS projected
+  backing now carries a schema/key pair, procfs stamps `ProjectionSchemaId::Procfs`,
+  mount parsing records `NOSUID` / `NODEV` / `NOEXEC` / `NOATIME`, and exec
+  rejects `NOEXEC` mounts with `EACCES`.
+  **Verified:** red tests first failed on missing `/proc/sysvipc` lookup and
+  zero `GETPID`; then `cargo test -p tx-shims --lib linux_syscall::tests::ipc_dispatch -- --nocapture`
+  passed (11 tests), `cargo test -p tx-subsystems --lib ipc::sysv_sem::tests -- --nocapture`
+  passed (2 tests), `cargo test -p tx-fs --lib procfs::tests -- --nocapture`
+  passed (2 tests), `cargo test -p tx-shims --lib linux_syscall::tests::mq_dispatch -- --nocapture`
+  passed (14 tests), and `cargo check -p tx-subsystems -p tx-fs -p tx-shims`
+  passed.
+  **Next step:** attack the remaining hard seams: blocking SysV msg/sem wait
+  semantics with RMID abort, `/dev/shm` tmpfs-backed POSIX shm/named sem,
+  MountNamespace/FsContext ownership, lazy umount, and the VFS witness/resume
+  model.
+  **Blocker:** full `cargo fmt --check` remains blocked by the unrelated
+  pre-existing formatting diff in `crates/tx-shims/src/linux_syscall/mod.rs`;
+  no QEMU guest IPC/VFS smoke was run in this slice.
+
+- 2026-05-23 **Closed the eighth IPC/VFS audit implementation slice: SysV
+  sem `GETALL`/`SETALL` now round-trip through the syscall layer.** Added a
+  musl-facing `NR_SEMCTL` dispatch regression that creates a three-semaphore
+  array, writes `[3, 5, 8]` with `SETALL`, reads it back with `GETALL`, and
+  confirms `GETVAL` sees the updated middle element. Implemented subsystem
+  `SemCtlArg::All` / `SemCtlResult::All`, all-value validation and wake
+  publication, plus shim copy-in/copy-out of the user `unsigned short[]`.
+  **Verified:** red test first failed with `ENOSYS` (`Error(38)`); then `cargo
+  test -p tx-shims --lib
+  linux_syscall::tests::ipc_dispatch::dispatch_sysv_semctl_setall_getall_round_trip -- --nocapture`
+  passed; `cargo test -p tx-shims --lib linux_syscall::tests::ipc_dispatch -- --nocapture`
+  passed (10 tests); `cargo test -p tx-subsystems --lib ipc::sysv_sem::tests -- --nocapture`
+  passed; `cargo test -p tx-subsystems --lib process::tests:: -- --nocapture`
+  passed (99 tests); `cargo check -p tx-shims -p tx-subsystems` passed.
+  **Next step:** move SysV msg/sem blocking paths from immediate `EAGAIN` to
+  sequenced `OnWaitSource` yields, including RMID waiter abort; separately,
+  fill the remaining sem count/query stubs (`GETNCNT`, `GETZCNT`, `GETPID`).
+  **Blocker:** full `cargo fmt --check` remains blocked by the unrelated
+  pre-existing formatting diff in `crates/tx-shims/src/linux_syscall/mod.rs`;
+  no QEMU guest IPC/VFS smoke was run in this slice.
+
+- 2026-05-23 **Closed the seventh IPC/VFS audit implementation slice: SysV
+  sem `SEM_UNDO` is now process-owned.** Added process regressions for
+  last-thread exit, `exit_group`, and fork isolation: a `SEM_UNDO` decrement
+  restores the semaphore value when the owning process exits, and a forked
+  child does not inherit the parent's pending undo records. Moved undo
+  ownership onto `ProcessPayload.sem_undos`, wired `step_semop` to record
+  through the owning process cap, and had process exit drain the exiting
+  process's own undo list before payload teardown.
+  **Verified:** red test first failed with `step_semop` still taking a raw pid
+  instead of a process cap; then `cargo test -p tx-subsystems --lib
+  process::tests::fork_child_exit_does_not_apply_parent_sysv_sem_undo_adjustments -- --nocapture`
+  passed; `cargo test -p tx-subsystems --lib
+  process::tests:: -- --nocapture` passed (99 tests); `cargo test -p
+  tx-subsystems --lib ipc::sysv_sem::tests -- --nocapture` passed; `cargo
+  test -p tx-shims --lib linux_syscall::tests::ipc_dispatch -- --nocapture`
+  passed (9 tests); `cargo check -p tx-shims -p tx-subsystems` passed.
+  **Next step:** move SysV msg/sem blocking paths from immediate `EAGAIN` to
+  sequenced `OnWaitSource` yields, including RMID waiter abort.
+  **Blocker:** full `cargo fmt --check` remains blocked by the unrelated
+  pre-existing formatting diff in `crates/tx-shims/src/linux_syscall/mod.rs`;
+  no QEMU guest IPC/VFS smoke was run in this slice.
+  **Blocker:** full `cargo fmt --check` remains blocked by the unrelated
+  pre-existing formatting diff in `crates/tx-shims/src/linux_syscall/mod.rs`;
+  no QEMU guest IPC/VFS smoke was run in this slice.
+
+- 2026-05-22 **Closed the sixth IPC/VFS audit implementation slice: SysV
+  msg/sem namespace entries are identity-cap authoritative.** Converted
+  `IpcNamespace.sysv_msg` and `IpcNamespace.sysv_sem` from key-to-id maps to
+  key-to-`Cap<MsgQueueIdentity>` / key-to-`Cap<SemArrayIdentity>`. `msgget`
+  and `semget` now reuse and return ids from namespace-held identity caps,
+  while the global msgid/semid tables remain compatibility registries for
+  id-based send/receive/control paths.
+  **Verified:** red tests first failed because the namespace entries were
+  `u32` values without `msqid`/`semid` or `Cap::key()`; then `cargo test -p
+  tx-subsystems --lib
+  ipc::sysv_msg::tests::msg_namespace_entry_is_identity_cap_authority -- --nocapture`
+  passed; `cargo test -p tx-subsystems --lib
+  ipc::sysv_sem::tests::sem_namespace_entry_is_identity_cap_authority -- --nocapture`
+  passed; `cargo test -p tx-subsystems --lib ipc::sysv_msg::tests -- --nocapture`
+  passed; `cargo test -p tx-subsystems --lib ipc::sysv_sem::tests -- --nocapture`
+  passed; `cargo test -p tx-subsystems --lib
+  process::tests::fork_with_clone_newipc_publishes_fresh_empty_ipc_namespace -- --nocapture`
+  passed; `cargo test -p tx-shims --lib linux_syscall::tests::ipc_dispatch -- --nocapture`
+  passed (9 tests); `cargo check -p tx-shims -p tx-subsystems` passed.
+  **Next step:** close SysV msg/sem blocking, waiter-abort, and `SEM_UNDO`
+  exit semantics, then continue to `/dev/shm` POSIX shm/named sem and
+  `/proc/sysvipc` projections.
+  **Blocker:** full `cargo fmt --check` remains blocked by the unrelated
+  pre-existing formatting diff in `crates/tx-shims/src/linux_syscall/mod.rs`;
+  no QEMU guest IPC/VFS smoke was run in this slice.
+
+- 2026-05-22 **Closed the fifth IPC/VFS audit implementation slice: SysV shm
+  namespace entries are identity-cap authoritative.** Converted
+  `IpcNamespace.sysv_shm` from key-to-shmid to
+  key-to-`Cap<ShmSegmentIdentity>`. `shmget` now reuses and returns ids from
+  the namespace-held segment cap, while the global shmid table remains as a
+  compatibility registry for id-based attach/stat paths and delayed
+  `IPC_RMID` detach cleanup.
+  **Verified:** red test first failed because the namespace entry was a `u32`
+  without `shmid`/`Cap::key()`; then `cargo test -p tx-subsystems --lib ipc::sysv_shm::tests -- --nocapture`
+  passed (7 tests); `cargo test -p tx-shims --lib linux_syscall::tests::ipc_dispatch -- --nocapture`
+  passed (9 tests); `cargo test -p tx-subsystems --lib
+  process::tests::fork_with_clone_newipc_publishes_fresh_empty_ipc_namespace -- --nocapture`
+  passed; `cargo test -p tx-shims --lib
+  linux_syscall::tests::fork_clone_wait4_wave2::dispatch_clone_with_clone_newipc_publishes_fresh_ipc_namespace -- --nocapture`
+  passed; `cargo test -p tx-subsystems --lib ipc::posix_mq::tests -- --nocapture`
+  passed (3 tests); `cargo test -p tx-shims --lib linux_syscall::tests::mq_dispatch -- --nocapture`
+  passed (14 tests); `cargo check -p tx-shims -p tx-subsystems` passed; `git
+  diff --check` passed.
+  **Next step:** convert the SysV msg/sem namespace maps from ids to identity
+  caps, then close SysV msg/sem blocking, waiter-abort, and `SEM_UNDO` exit
+  semantics.
+  **Blocker:** full `cargo fmt --check` remains blocked by the unrelated
+  pre-existing formatting diff in `crates/tx-shims/src/linux_syscall/mod.rs`;
+  no QEMU guest IPC/VFS smoke was run in this slice.
+
+- 2026-05-22 **Closed the fourth IPC/VFS audit implementation slice: POSIX mq
+  namespace entries are identity-cap authoritative.** Converted
+  `IpcNamespace.posix_mq` from name-to-mqid to name-to-`Cap<PosixMqIdentity>`.
+  `mq_open` now reopens directly from the namespace-held cap, while the global
+  mqid table remains only a compatibility registry for existing descriptor and
+  SysV-msg bridge paths.
+  **Verified:** red test first failed because the namespace entry was a `u32`
+  without `Cap::key()`; then `cargo test -p tx-subsystems --lib ipc::posix_mq::tests -- --nocapture`
+  passed (3 tests); `cargo test -p tx-shims --lib linux_syscall::tests::mq_dispatch -- --nocapture`
+  passed (14 tests); `cargo test -p tx-subsystems --lib
+  process::tests::fork_with_clone_newipc_publishes_fresh_empty_ipc_namespace -- --nocapture`
+  passed; `cargo test -p tx-shims --lib
+  linux_syscall::tests::fork_clone_wait4_wave2::dispatch_clone_with_clone_newipc_publishes_fresh_ipc_namespace -- --nocapture`
+  passed; `cargo test -p tx-shims --lib linux_syscall::tests::ipc_dispatch -- --nocapture`
+  passed (9 tests); `cargo check -p tx-shims -p tx-subsystems` passed; `cargo
+  xtask progress validate`, `cargo xtask lint docs`, and `git diff --check`
+  passed.
+  **Next step:** convert the SysV msg/sem namespace maps from ids to identity
+  caps, then close SysV msg/sem blocking, waiter-abort, and `SEM_UNDO` exit
+  semantics.
+  **Blocker:** full `cargo fmt --check` remains blocked by the unrelated
+  pre-existing formatting diff in `crates/tx-shims/src/linux_syscall/mod.rs`;
+  no QEMU guest IPC/VFS smoke was run in this slice.
+
+- 2026-05-22 **Closed the third IPC/VFS audit implementation slice:
+  `CLONE_NEWIPC` fork/clone namespace publication.** Added a process
+  `ForkOptions` path and nsproxy clone helper so default fork keeps sharing the
+  parent namespace bundle while `CLONE_NEWIPC` publishes a fresh `NsProxy` with
+  a fresh, empty `IpcNamespace` whose limits are copied from the parent.
+  `sys_clone(SIGCHLD | CLONE_NEWIPC, ...)` now reaches that path, while
+  `CLONE_THREAD | CLONE_NEWIPC` is rejected as an invalid process/thread
+  namespace mix.
+  **Verified:** red process test first failed on the missing fork-options API;
+  red syscall test first returned `Error(22)` for `SIGCHLD | CLONE_NEWIPC`;
+  then `cargo test -p tx-subsystems --lib process::tests -- --nocapture`
+  passed (96 tests); `cargo test -p tx-shims --lib
+  linux_syscall::tests::fork_clone_wait4_wave2 -- --nocapture` passed (17
+  tests); `cargo test -p tx-subsystems --lib ipc::posix_mq::tests -- --nocapture`
+  passed (2 tests); `cargo test -p tx-shims --lib linux_syscall::tests::ipc_dispatch -- --nocapture`
+  passed (9 tests); `cargo test -p tx-shims --lib linux_syscall::tests::mq_dispatch -- --nocapture`
+  passed (14 tests); `cargo check -p tx-shims -p tx-subsystems` passed; `git
+  diff --check` passed.
+  **Next step:** convert the SysV msg/sem namespace maps from ids to identity
+  caps, then close SysV msg/sem blocking, waiter-abort, and `SEM_UNDO` exit
+  semantics.
+  **Blocker:** full `cargo fmt --check` remains blocked by the unrelated
+  pre-existing formatting diff in `crates/tx-shims/src/linux_syscall/mod.rs`;
+  no QEMU guest IPC/VFS smoke was run in this slice.
+
+- 2026-05-22 **Closed the second IPC/VFS audit implementation slice: POSIX mq
+  namespace-scoped name resolution.** Moved POSIX mq name lookup/unlink to
+  `IpcNamespace.posix_mq`, kept the global mq registry as an id-to-identity
+  liveness table for fd holders, and added subsystem regressions proving two
+  IPC namespaces can create the same mq name independently and that
+  `mq_unlink` withdraws only the caller's namespace binding.
+  **Verified:** red tests first failed with `EEXIST` and cross-namespace
+  `ENOENT`; then `cargo test -p tx-subsystems --lib ipc::posix_mq::tests -- --nocapture`
+  passed (2 tests); `cargo test -p tx-shims --lib linux_syscall::tests::mq_dispatch -- --nocapture`
+  passed (14 tests); `cargo test -p tx-shims --lib linux_syscall::tests::ipc_dispatch -- --nocapture`
+  passed (9 tests); `cargo check -p tx-shims -p tx-subsystems` passed.
+  **Next step:** convert the SysV msg/sem namespace maps from ids to identity
+  caps, then close SysV msg/sem blocking, waiter-abort, and `SEM_UNDO` exit
+  semantics.
+  **Blocker:** full `cargo fmt --check` remains blocked by the unrelated
+  pre-existing formatting diff in `crates/tx-shims/src/linux_syscall/mod.rs`.
+
+- 2026-05-22 **Closed the first IPC/VFS audit implementation slice: SysV
+  msg/sem keyed `IPC_RMID` namespace withdrawal.** Added syscall-dispatch
+  regressions for `msgget`/`semget` key reuse after `IPC_RMID`, mirrored the
+  existing shm namespace-aware control wrapper for msg/sem, and routed
+  `msgctl`/`semctl` through the nsproxy-aware helpers so stale
+  `IpcNamespace.sysv_{msg,sem}` key entries are withdrawn after successful
+  removal.
+  **Verified:** red tests first failed with `Error(22)` on recreate; then
+  `cargo test -p tx-shims --lib linux_syscall::tests::ipc_dispatch -- --nocapture`
+  passed (9 tests); `cargo check -p tx-shims -p tx-subsystems` passed.
+  **Next step:** convert the SysV msg/sem namespace maps from ids to identity
+  caps, then close SysV msg/sem blocking, waiter-abort, and `SEM_UNDO` exit
+  semantics.
+  **Blocker:** `cargo fmt --check` still reports an unrelated pre-existing
+  formatting diff in `crates/tx-shims/src/linux_syscall/mod.rs`.
+
+- 2026-05-22 **Audited IPC/VFS integration against the active specs.**
+  Recorded the gap ledger in
+  `docs/progress/research/2026-05-22-ipc-vfs-integration-audit.md`.
+  Current verdict: SysV shm, POSIX mq dispatch, tmpfs/devfs/proc, ext4 mount,
+  and basic VFS/PageBacked host slices are integrated enough for the existing
+  tested paths, but the tree is not spec-complete for `08_SYSV_IPC_v1` or
+  `MOUNT_v1`. Blocking gaps are SysV msg/sem namespace-authoritative identity
+  tables, SysV msg/sem blocking and waiter-abort semantics, process-exit
+  `SEM_UNDO`, `/dev/shm` tmpfs-backed POSIX shm/named sem wiring,
+  `/proc/sysvipc` projections, process `MountNamespace`/mount-pin ownership,
+  lazy umount, and the code/spec drift around backend `materialise_rnode` plus
+  `RNode.containing_mount`.
+  **Verified:** `cargo test -p tx-subsystems --lib ipc::sysv_shm::tests -- --nocapture`;
+  `cargo test -p tx-shims --lib linux_syscall::tests::ipc_dispatch -- --nocapture`;
+  `cargo test -p tx-shims --lib linux_syscall::tests::mq_dispatch -- --nocapture`;
+  `cargo test -p tx-subsystems --lib vfs:: -- --test-threads=1` (40 passed,
+  11 ignored existing walker flakes); `cargo test -p tx-subsystems --lib
+  mount:: -- --nocapture`; `cargo test -p tx-fs --lib tmpfs -- --nocapture`;
+  `cargo test -p tx-ext4 --lib -- --nocapture`.
+  **Next step:** finish SysV msg/sem namespace-authoritative object ownership,
+  then SysV msg/sem wait semantics and `/dev/shm`; in parallel, decide whether
+  to bless or unwind the VFS `materialise_rnode`/`containing_mount` drift
+  before wiring full process `MountNamespace` and lazy umount.
+  **Blocker:** no host-test blocker; no QEMU guest IPC/VFS smoke was run in
+  this audit.
+
 - 2026-05-22 **Merged main into the Gemini OSComp/musl branch and captured the
   workflow.** Kept the in-progress merge state in
   `/Users/3y/.gemini/antigravity/worktrees/Tx/check-oscomp-status`, preserved

@@ -193,7 +193,7 @@ pub(crate) fn lookup_shm_by_index(index: u32) -> Option<Cap<ShmSegmentIdentity>>
     SHM_TABLE.lock().values().nth(index as usize).cloned()
 }
 
-/// Register a newly created segment and return its shmid.
+/// Register a newly created segment and return its identity cap.
 pub(crate) fn register_shm(
     key: Option<SysvKey>,
     cred: Cap<Cred>,
@@ -201,7 +201,7 @@ pub(crate) fn register_shm(
     perm: IpcPerm,
     cuid: u32,
     cgid: u32,
-) -> Result<u32, ZoneError> {
+) -> Result<Cap<ShmSegmentIdentity>, ZoneError> {
     use crate::process::adapter::step_engine::sign;
     let shmid = NEXT_SHMID.fetch_add(1, Ordering::Relaxed);
     let payload = sign(ShmSegmentPayload {
@@ -227,8 +227,8 @@ pub(crate) fn register_shm(
         destroyed: AtomicBool::new(false),
         payload,
     })?;
-    SHM_TABLE.lock().insert(shmid, identity);
-    Ok(shmid)
+    SHM_TABLE.lock().insert(shmid, identity.clone());
+    Ok(identity)
 }
 
 /// Mark a segment removed without dropping the global identity cap.

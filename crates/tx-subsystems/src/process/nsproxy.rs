@@ -15,6 +15,11 @@
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::ipc::posix_mq::structure::PosixMqIdentity;
+use crate::ipc::sysv_msg::structure::MsgQueueIdentity;
+use crate::ipc::sysv_sem::structure::SemArrayIdentity;
+use crate::ipc::sysv_shm::structure::ShmSegmentIdentity;
+use crate::mount::MountNamespace;
 use crate::process::adapter::step_engine::{sign, Cap, SpinMutex, Zone, ZoneAllocated, ZoneError};
 
 // ---------------------------------------------------------------------------
@@ -119,16 +124,13 @@ impl Default for IpcLimits {
 /// replaced with namespace-number `IndexTable<SysvKey, Cap<...>>`.
 pub struct IpcNamespace {
     /// SysV semaphore arrays, keyed by `key_t` (or IPC_PRIVATE id).
-    /// Day-1: stores semid values. The authoritative `Cap<SemArrayIdentity>`
-    /// registry lives in `crate::ipc::sysv_sem`. When `AllocIndex` lands,
-    /// this table becomes `IndexTable<SysvKey, Cap<SemArrayIdentity>>`.
-    pub sysv_sem: SpinMutex<BTreeMap<SysvKey, u32>>,
+    pub sysv_sem: SpinMutex<BTreeMap<SysvKey, Cap<SemArrayIdentity>>>,
     /// SysV shared memory segments, keyed by `key_t`.
-    pub sysv_shm: SpinMutex<BTreeMap<SysvKey, u32>>,
+    pub sysv_shm: SpinMutex<BTreeMap<SysvKey, Cap<ShmSegmentIdentity>>>,
     /// SysV message queues, keyed by `key_t`.
-    pub sysv_msg: SpinMutex<BTreeMap<SysvKey, u32>>,
+    pub sysv_msg: SpinMutex<BTreeMap<SysvKey, Cap<MsgQueueIdentity>>>,
     /// POSIX message queues, keyed by path name.
-    pub posix_mq: SpinMutex<BTreeMap<PosixMqName, u32>>,
+    pub posix_mq: SpinMutex<BTreeMap<PosixMqName, Cap<PosixMqIdentity>>>,
     /// Per-namespace tunable limits.
     pub limits: SpinMutex<IpcLimits>,
     /// Monotonic counter for `IPC_PRIVATE` id generation (shared across
@@ -138,6 +140,17 @@ pub struct IpcNamespace {
 }
 
 impl IpcNamespace {
+    pub fn with_limits(limits: IpcLimits) -> Self {
+        Self {
+            sysv_sem: SpinMutex::new(BTreeMap::new()),
+            sysv_shm: SpinMutex::new(BTreeMap::new()),
+            sysv_msg: SpinMutex::new(BTreeMap::new()),
+            posix_mq: SpinMutex::new(BTreeMap::new()),
+            limits: SpinMutex::new(limits),
+            next_private_id: AtomicU32::new(0),
+        }
+    }
+
     /// Allocate a fresh `IPC_PRIVATE` id. Returns a `SysvKey` with
     /// bit 31 set (negative `key_t` in Linux userspace), matching
     /// the convention that `IPC_PRIVATE`-allocated keys don't collide
@@ -150,14 +163,7 @@ impl IpcNamespace {
 
 impl Default for IpcNamespace {
     fn default() -> Self {
-        Self {
-            sysv_sem: SpinMutex::new(BTreeMap::new()),
-            sysv_shm: SpinMutex::new(BTreeMap::new()),
-            sysv_msg: SpinMutex::new(BTreeMap::new()),
-            posix_mq: SpinMutex::new(BTreeMap::new()),
-            limits: SpinMutex::new(IpcLimits::default()),
-            next_private_id: AtomicU32::new(0),
-        }
+        Self::with_limits(IpcLimits::default())
     }
 }
 
@@ -176,15 +182,6 @@ pub struct PidNamespaceStub;
 /// User namespace stub. Real impl arrives with the user-ns / capability
 /// lens per `NAMESPACE_VIEW_v1.md` §7.
 pub struct UserNamespaceStub;
-
-// Mount namespace (`mnt_ns`) is deferred. The `MountNamespace` type
-// already exists in `crate::mount`, but it is not yet wired into the
-// process model at bootstrap time (requires a root `MountIdentity` +
-// `MountPayload` + `FsOps`). When the mount namespace is bootstrapped
-// before `bootstrap_init_process`, add it to NsProxy and thread
-// through `sign_init_nsproxy`.
-//
-// pub use crate::mount::MountNamespace;
 
 /// Cgroup namespace stub. Real impl arrives with cgroup-v2 subsystem.
 pub struct CgroupNamespaceStub;
@@ -211,9 +208,10 @@ pub struct TimeNamespaceStub;
 pub struct NsProxy {
     pub pid_ns: Cap<PidNamespaceStub>,
     pub pid_for_children: Cap<PidNamespaceStub>,
-    // TODO(txdoc:NAMESPACE-VIEW-CORE-PLACEMENT-1): add mnt_ns when
-    // mount namespace bootstrap is wired to the process model.
-    // pub mnt_ns: Cap<MountNamespace>,
+    /// Mount namespace view. `None` only during early bootstrap before the
+    /// root mount exists; boot and tests publish a replacement NsProxy once
+    /// they have a concrete `MountNamespace` cap.
+    pub mnt_ns: Option<Cap<MountNamespace>>,
     pub user_ns: Cap<UserNamespaceStub>,
     pub cgroup_ns: Cap<CgroupNamespaceStub>,
     pub uts_ns: Cap<UtsNamespaceStub>,
@@ -285,10 +283,11 @@ pub(crate) fn register_zones() -> Result<(), ZoneError> {
 /// Create the root (init) `NsProxy` for `bootstrap_init_process`.
 /// All namespace caps point at freshly allocated stub singletons.
 ///
-/// `mnt_ns` is deferred — MountNamespace requires a root
+/// `mnt_ns` starts as `None` because MountNamespace requires a root
 /// `MountIdentity` + `MountPayload` + `FsOps` that aren't available
-/// at bootstrap time. When the mount namespace is bootstrapped before
-/// the init process, thread it through this function.
+/// at process-bootstrap time in the current boot order. Boot publishes
+/// a replacement bundle with a concrete mount namespace after rootfs
+/// mount creation.
 ///
 /// Panics on zone allocation failure — bootstrap is infallible in
 /// practice; if zone registration failed, the kernel cannot start.
@@ -305,7 +304,7 @@ pub fn sign_init_nsproxy() -> Result<Cap<NsProxy>, ZoneError> {
     sign(NsProxy {
         pid_ns,
         pid_for_children,
-        // mnt_ns: deferred — TODO(txdoc:NAMESPACE-VIEW-CORE-PLACEMENT-1)
+        mnt_ns: None,
         user_ns,
         cgroup_ns,
         uts_ns,
@@ -317,9 +316,56 @@ pub fn sign_init_nsproxy() -> Result<Cap<NsProxy>, ZoneError> {
 
 /// Clone the init `NsProxy` for `step_fork`. Since the bundle is
 /// immutable, cloning just clones the `Cap` (refcount bump).
-/// When `CLONE_NEWIPC` / `CLONE_NEWPID` / etc. land, the clone
-/// path will call `sign_init_nsproxy` for the subset of namespaces
-/// being unshared.
 pub fn clone_nsproxy(nsproxy: &Cap<NsProxy>) -> Cap<NsProxy> {
     nsproxy.clone()
+}
+
+/// Build the namespace bundle published by fork/clone.
+///
+/// Default fork inherits the parent's immutable bundle. `CLONE_NEWIPC`
+/// publishes a replacement bundle with all non-IPC namespace caps shared
+/// and a fresh IPC namespace whose limits are copied from the parent.
+pub fn clone_nsproxy_for_fork(
+    nsproxy: &Cap<NsProxy>,
+    clone_newipc: bool,
+) -> Result<Cap<NsProxy>, ZoneError> {
+    if !clone_newipc {
+        return Ok(clone_nsproxy(nsproxy));
+    }
+
+    let ipc_limits = *nsproxy.ipc_ns.limits.lock();
+    let ipc_ns = sign(IpcNamespace::with_limits(ipc_limits))?;
+    sign(NsProxy {
+        pid_ns: nsproxy.pid_ns.clone(),
+        pid_for_children: nsproxy.pid_for_children.clone(),
+        mnt_ns: nsproxy.mnt_ns.clone(),
+        user_ns: nsproxy.user_ns.clone(),
+        cgroup_ns: nsproxy.cgroup_ns.clone(),
+        uts_ns: nsproxy.uts_ns.clone(),
+        ipc_ns,
+        net_ns: nsproxy.net_ns.clone(),
+        time_ns: nsproxy.time_ns.clone(),
+    })
+}
+
+/// Return a replacement namespace bundle with `mnt_ns` installed.
+///
+/// NsProxy is immutable after publication, so mount namespace setup follows
+/// the same rule as unshare/setns: build a new bundle, then atomically publish
+/// it on the process payload.
+pub fn clone_nsproxy_with_mount_namespace(
+    nsproxy: &Cap<NsProxy>,
+    mnt_ns: Cap<MountNamespace>,
+) -> Result<Cap<NsProxy>, ZoneError> {
+    sign(NsProxy {
+        pid_ns: nsproxy.pid_ns.clone(),
+        pid_for_children: nsproxy.pid_for_children.clone(),
+        mnt_ns: Some(mnt_ns),
+        user_ns: nsproxy.user_ns.clone(),
+        cgroup_ns: nsproxy.cgroup_ns.clone(),
+        uts_ns: nsproxy.uts_ns.clone(),
+        ipc_ns: nsproxy.ipc_ns.clone(),
+        net_ns: nsproxy.net_ns.clone(),
+        time_ns: nsproxy.time_ns.clone(),
+    })
 }

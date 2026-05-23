@@ -9,12 +9,13 @@ use core::sync::atomic::Ordering;
 use crate::cred::Cred;
 use crate::execution::Errno;
 use crate::ipc::sysv_sem::checks;
-use crate::ipc::sysv_sem::structure::{self, sem_flg, SemBuf, SemUndo};
+use crate::ipc::sysv_sem::structure::{self, sem_flg, SemBuf};
 use crate::ipc::sysv_shm::execution::{IPC_CREAT, IPC_EXCL, IPC_PRIVATE};
 use crate::ipc::sysv_shm::structure::IpcPerm;
 use crate::process::adapter::step_engine::Cap;
 use crate::process::adapter::wait_routing::Mask;
 use crate::process::nsproxy::SysvKey;
+use crate::process::structure::ProcessIdentity;
 
 // semctl commands
 pub use crate::ipc::sysv_shm::execution::{IPC_INFO, IPC_RMID, IPC_SET, IPC_STAT};
@@ -64,9 +65,7 @@ pub fn step_semget(
 
     if let Some(ref k) = ipc_key {
         let table = nsproxy.ipc_ns.sysv_sem.lock();
-        if let Some(&existing_semid) = table.get(k) {
-            drop(table);
-            let a = checks::require_sem_exists(existing_semid)?;
+        if let Some(a) = table.get(k).cloned() {
             if exclusive {
                 return Err(Errno::EEXIST);
             }
@@ -74,7 +73,7 @@ pub fn step_semget(
                 return Err(Errno::EINVAL);
             }
             checks::require_can_read_sem(&a, cred)?;
-            return Ok(existing_semid);
+            return Ok(a.semid);
         }
     }
 
@@ -82,15 +81,15 @@ pub fn step_semget(
         return Err(Errno::ENOENT);
     }
 
-    let semid =
+    let array =
         structure::register_sem(ipc_key, cred.clone(), nsems, perm, cred.euid.0, cred.egid.0)
             .map_err(|_| Errno::ENOMEM)?;
 
     if let Some(ref k) = ipc_key {
-        nsproxy.ipc_ns.sysv_sem.lock().insert(*k, semid);
+        nsproxy.ipc_ns.sysv_sem.lock().insert(*k, array.clone());
     }
 
-    Ok(semid)
+    Ok(array.semid)
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +101,12 @@ pub fn step_semget(
 /// Returns the number of ops applied (always nsops on success).
 /// IPC_NOWAIT on any op makes the entire call non-blocking.
 /// SEM_UNDO on any op records the inverse adjustment.
-pub fn step_semop(semid: u32, sops: &[SemBuf], cred: &Cap<Cred>, pid: u64) -> Result<usize, Errno> {
+pub fn step_semop(
+    semid: u32,
+    sops: &[SemBuf],
+    cred: &Cap<Cred>,
+    process: &Cap<ProcessIdentity>,
+) -> Result<usize, Errno> {
     if sops.is_empty() {
         return Err(Errno::EINVAL);
     }
@@ -159,6 +163,7 @@ pub fn step_semop(semid: u32, sops: &[SemBuf], cred: &Cap<Cred>, pid: u64) -> Re
             } else if s.sem_op < 0 {
                 *v = v.saturating_sub(-s.sem_op);
             }
+            values[s.sem_num as usize].last_pid = process.pid.0;
             // sem_op == 0: already validated above, no change needed.
 
             if (s.sem_flg & sem_flg::SEM_UNDO) != 0 {
@@ -170,20 +175,13 @@ pub fn step_semop(semid: u32, sops: &[SemBuf], cred: &Cap<Cred>, pid: u64) -> Re
 
         // Record SEM_UNDO if any op had it.
         if has_undo {
-            let mut undos = payload.undos.lock();
-            undos
-                .entry(pid)
-                .and_modify(|u| {
-                    for (i, adj) in undo_adjustments.iter().enumerate() {
-                        if *adj != 0 && i < u.adjustments.len() {
-                            u.adjustments[i] = u.adjustments[i].wrapping_add(*adj);
-                        }
-                    }
-                })
-                .or_insert_with(|| SemUndo {
-                    semid,
-                    adjustments: undo_adjustments,
-                });
+            let proc_payload = process
+                .payload_slot()
+                .lock()
+                .as_ref()
+                .cloned()
+                .ok_or(Errno::ESRCH)?;
+            proc_payload.record_sem_undo(semid, undo_adjustments);
         }
 
         // Changed seq bump + wake.
@@ -204,6 +202,7 @@ pub fn step_semctl(
     cmd: i32,
     arg: SemCtlArg,
     cred: &Cap<Cred>,
+    process: Option<&Cap<ProcessIdentity>>,
 ) -> Result<SemCtlResult, Errno> {
     match cmd {
         IPC_RMID => {
@@ -265,16 +264,60 @@ pub fn step_semctl(
             with_payload!(array, payload, {
                 let mut values = payload.values.lock();
                 values[semnum as usize].val = setval as i16;
+                if let Some(process) = process {
+                    values[semnum as usize].last_pid = process.pid.0;
+                }
                 payload.changed_seq.fetch_add(1, Ordering::Release);
                 payload.changed_channel.fire(Mask::from_bits(1));
             });
             Ok(SemCtlResult::Success)
         }
-        GETALL | SETALL => {
-            // Multi-value get/set via userspace buffer — deferred.
-            Err(Errno::ENOSYS)
+        GETALL => {
+            let array = checks::require_sem_exists(semid)?;
+            checks::require_can_read_sem(&array, cred)?;
+            with_payload!(array, payload, {
+                let values = payload.values.lock();
+                Ok(SemCtlResult::All(
+                    values.iter().map(|value| value.val as u16).collect(),
+                ))
+            })
         }
-        GETNCNT | GETZCNT | GETPID => {
+        SETALL => {
+            let array = checks::require_sem_exists(semid)?;
+            checks::require_can_write_sem(&array, cred)?;
+            let SemCtlArg::All(set_values) = arg else {
+                return Err(Errno::EINVAL);
+            };
+            if set_values.len() != array.nsems as usize
+                || set_values.iter().any(|value| *value > 32767)
+            {
+                return Err(Errno::ERANGE);
+            }
+            with_payload!(array, payload, {
+                let mut values = payload.values.lock();
+                for (slot, set_value) in values.iter_mut().zip(set_values.iter()) {
+                    slot.val = *set_value as i16;
+                    if let Some(process) = process {
+                        slot.last_pid = process.pid.0;
+                    }
+                }
+                payload.changed_seq.fetch_add(1, Ordering::Release);
+                payload.changed_channel.fire(Mask::from_bits(1));
+            });
+            Ok(SemCtlResult::Success)
+        }
+        GETPID => {
+            let array = checks::require_sem_exists(semid)?;
+            checks::require_can_read_sem(&array, cred)?;
+            if semnum >= array.nsems {
+                return Err(Errno::EINVAL);
+            }
+            with_payload!(array, payload, {
+                let values = payload.values.lock();
+                Ok(SemCtlResult::Val(values[semnum as usize].last_pid as i32))
+            })
+        }
+        GETNCNT | GETZCNT => {
             // Count queries — return 0 stubs.
             Ok(SemCtlResult::Val(0))
         }
@@ -288,30 +331,57 @@ pub fn step_semctl(
     }
 }
 
+/// Namespace-aware `semctl` wrapper for syscall paths that can withdraw
+/// keyed namespace bindings on `IPC_RMID`.
+pub fn step_semctl_in_ns(
+    semid: u32,
+    semnum: u16,
+    cmd: i32,
+    arg: SemCtlArg,
+    cred: &Cap<Cred>,
+    nsproxy: &Cap<crate::process::nsproxy::NsProxy>,
+    process: Option<&Cap<ProcessIdentity>>,
+) -> Result<SemCtlResult, Errno> {
+    let key = if cmd == IPC_RMID {
+        Some(checks::require_sem_exists(semid)?.key)
+    } else {
+        None
+    };
+    let result = step_semctl(semid, semnum, cmd, arg, cred, process)?;
+    if let Some(Some(key)) = key {
+        let mut table = nsproxy.ipc_ns.sysv_sem.lock();
+        if table.get(&key).map(|array| array.semid) == Some(semid) {
+            table.remove(&key);
+        }
+    }
+    Ok(result)
+}
+
 // ---------------------------------------------------------------------------
 // step_sem_undo — called from process exit
 // ---------------------------------------------------------------------------
 
-/// Walk all SEM_UNDO entries for `pid` and reverse the adjustments.
+/// Walk all SEM_UNDO entries for `process` and reverse the adjustments.
 /// Called from `step_process_exit` before the process payload is torn down.
-pub fn step_sem_undo(pid: u64) {
-    // Iterate all live sem arrays and remove this pid's undo entries.
-    let arrays = structure::all_sem_arrays();
-    for array in arrays {
-        if let Some(payload_guard) = array.payload.lock().as_ref() {
-            let mut undos = payload_guard.undos.lock();
-            if let Some(undo) = undos.remove(&pid) {
-                let mut values = payload_guard.values.lock();
-                for (i, adj) in undo.adjustments.iter().enumerate() {
-                    if *adj != 0 && i < values.len() {
-                        // Reverse the adjustment.
-                        values[i].val = values[i].val.wrapping_sub(*adj);
-                    }
-                }
-                payload_guard.changed_seq.fetch_add(1, Ordering::Release);
-                payload_guard.changed_channel.fire(Mask::from_bits(1));
+pub fn step_sem_undo(process: &Cap<ProcessIdentity>) {
+    let Some(proc_payload) = process.payload_slot().lock().as_ref().cloned() else {
+        return;
+    };
+    for undo in proc_payload.drain_sem_undos().into_values() {
+        let Some(array) = structure::lookup_sem(undo.semid) else {
+            continue;
+        };
+        let Some(payload_guard) = array.payload.lock().as_ref().cloned() else {
+            continue;
+        };
+        let mut values = payload_guard.values.lock();
+        for (i, adj) in undo.adjustments.iter().enumerate() {
+            if *adj != 0 && i < values.len() {
+                values[i].val = values[i].val.wrapping_add(*adj);
             }
         }
+        payload_guard.changed_seq.fetch_add(1, Ordering::Release);
+        payload_guard.changed_channel.fire(Mask::from_bits(1));
     }
 }
 
@@ -323,6 +393,7 @@ pub fn step_sem_undo(pid: u64) {
 pub enum SemCtlResult {
     Success,
     Val(i32),
+    All(Vec<u16>),
     Stat(SemInfo),
     Info {
         semmni: u64,
@@ -344,9 +415,10 @@ pub struct SemInfo {
     pub perm: IpcPerm,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SemCtlArg {
     None,
     Val(i32),
+    All(Vec<u16>),
     IpcSet { mode: u16, uid: u32, gid: u32 },
 }

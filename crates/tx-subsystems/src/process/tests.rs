@@ -8,26 +8,38 @@
 //! retain identity but drop payload.
 
 use crate::cred::{sign_cred, Cred};
-use crate::ipc::sysv_shm;
+use crate::ipc::{posix_mq, sysv_msg, sysv_sem, sysv_shm};
+use crate::mount::{
+    DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
+    SourceLabel,
+};
+use alloc::sync::Arc;
+
+use crate::page_backed::{Frame as PageFrame, FsPageBacking};
 use crate::process::adapter::step_engine::{
     guard as ebr_guard, sign, Cap, ScriptCtx, StepOp, StepOutcome,
 };
 use crate::process::execution::{
     init_process, reset_init_process_for_test, step_exit_group_with_signal, BootstrapError, DupOp,
 };
+use crate::process::nsproxy::{PosixMqName, SysvKey};
 use crate::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use crate::process::structure::{
     reset_pid_counter_for_test, ExitStatus, Pgid, Pid, ProcessIdentity,
 };
 use crate::process::{
-    bootstrap_init_process, step_chdir, step_exit_group, step_fork, step_getcwd, step_setpgid,
-    step_setsid, step_waitpid_nohang, ChdirOutcome, ForkError, SetpgidError, WaitError, WaitTarget,
+    bootstrap_init_process, step_chdir, step_exit_group, step_fork, step_fork_with_options,
+    step_getcwd, step_setpgid, step_setsid, step_waitpid_nohang, ChdirOutcome, ForkError,
+    ForkOptions, SetpgidError, WaitError, WaitTarget,
 };
 use crate::signal::Signum;
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::step_thread_exit;
 use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentity};
-use crate::vfs::{DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking};
+use crate::vfs::{
+    Credential, DEntry, DirCursor, DirEntry, FsObjectId, FsOps, InlineName, InodeKind, InodeMeta,
+    RNode, RNodeBacking,
+};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
 use core::future::Future;
@@ -79,6 +91,200 @@ fn bootstrap() -> Cap<ProcessIdentity> {
     bootstrap_init_process(fresh_aspace()).expect("bootstrap init")
 }
 
+struct NullMountFs;
+
+impl FsOps for NullMountFs {
+    fn lookup(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<FsObjectId, crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn load_inode_meta(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<InodeMeta, crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn serialize_inode_meta(
+        &self,
+        _fs_object_id: FsObjectId,
+        _meta: &InodeMeta,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn create_inode(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), crate::process::adapter::step_engine::NoProgress>
+    {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn unlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn rename(
+        &self,
+        _old_parent: FsObjectId,
+        _old_name: &[u8],
+        _new_parent: FsObjectId,
+        _new_name: &[u8],
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn link(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn mkdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), crate::process::adapter::step_engine::NoProgress>
+    {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn rmdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn symlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _link_target: &[u8],
+        _cred: &Credential,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), crate::process::adapter::step_engine::NoProgress>
+    {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn readdir(
+        &self,
+        _fs_object_id: FsObjectId,
+        _cursor: DirCursor,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, crate::process::adapter::step_engine::NoProgress>
+    {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn destroy_inode(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+}
+
+impl FsPageBacking for NullMountFs {
+    fn fetch_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<PageFrame, crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never page the dummy mount")
+    }
+
+    fn flush_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _frame: &PageFrame,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never page the dummy mount")
+    }
+
+    fn truncate(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_size: u64,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never page the dummy mount")
+    }
+
+    fn fsync_file(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never page the dummy mount")
+    }
+}
+
+fn fresh_mount_namespace() -> Cap<MountNamespace> {
+    let fs = Arc::new(NullMountFs);
+    let payload = MountPayload::new_cap(
+        fs.clone(),
+        fs,
+        None,
+        DevId::new(100),
+        MountOptions::default(),
+        "nullfs",
+        SourceLabel::Static("nullfs"),
+    )
+    .expect("dummy mount payload");
+    let root = RNode::new_cap_in_mount(
+        FsObjectId::ROOT,
+        InodeMeta::new(InodeKind::Directory, 0o040755),
+        RNodeBacking::Directory,
+        &payload,
+    )
+    .expect("dummy root rnode");
+    let root_mount = MountIdentity::new_cap(
+        MountId::new(100),
+        None,
+        root,
+        None,
+        payload,
+        MountFlags::empty(),
+    )
+    .expect("dummy root mount");
+    MountNamespace::new_cap(root_mount).expect("dummy mount namespace")
+}
+
 fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
     let payload_guard = proc_cap.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");
@@ -119,6 +325,154 @@ fn fork_creates_child_with_leader_thread_and_inherits_pgrp() {
 
     // Child inherits parent's pgrp.
     assert_eq!(child.pgrp_cap().pgid, parent.pgrp_cap().pgid);
+}
+
+#[test]
+fn fork_with_clone_newipc_publishes_fresh_empty_ipc_namespace() {
+    let _g = setup();
+    let parent = bootstrap();
+    let parent_nsproxy = parent.nsproxy_cap().expect("parent nsproxy");
+
+    {
+        let mut limits = parent_nsproxy.ipc_ns.limits.lock();
+        limits.mq_maxmsg = 17;
+        limits.msgmni = 23;
+    }
+    let ipc_cred = sign_cred(Cred::root()).expect("ipc cred cap");
+    let sem_identity = sysv_sem::structure::register_sem(
+        Some(SysvKey::new(0x10)),
+        ipc_cred.clone(),
+        1,
+        sysv_shm::structure::IpcPerm::new(0o600),
+        0,
+        0,
+    )
+    .expect("sem identity");
+    parent_nsproxy
+        .ipc_ns
+        .sysv_sem
+        .lock()
+        .insert(SysvKey::new(0x10), sem_identity);
+    let shm_identity = sysv_shm::structure::register_shm(
+        Some(SysvKey::new(0x20)),
+        ipc_cred.clone(),
+        4096,
+        sysv_shm::structure::IpcPerm::new(0o600),
+        0,
+        0,
+    )
+    .expect("shm identity");
+    parent_nsproxy
+        .ipc_ns
+        .sysv_shm
+        .lock()
+        .insert(SysvKey::new(0x20), shm_identity);
+    let msg_identity = sysv_msg::structure::register_msg(
+        Some(SysvKey::new(0x30)),
+        ipc_cred.clone(),
+        sysv_shm::structure::IpcPerm::new(0o600),
+        0,
+        0,
+        16,
+        16,
+    )
+    .expect("msg identity");
+    parent_nsproxy
+        .ipc_ns
+        .sysv_msg
+        .lock()
+        .insert(SysvKey::new(0x30), msg_identity);
+    let mq_cred = sign_cred(Cred::root()).expect("mq cred cap");
+    let (_mqid, mq_identity) = posix_mq::structure::register_mq(
+        PosixMqName::new(b"/parent"),
+        mq_cred,
+        sysv_shm::structure::IpcPerm::new(0o600),
+        404,
+        2,
+        16,
+    )
+    .expect("mq identity");
+    parent_nsproxy
+        .ipc_ns
+        .posix_mq
+        .lock()
+        .insert(PosixMqName::new(b"/parent"), mq_identity);
+
+    let child = step_fork_with_options::<TestPmap>(
+        &parent,
+        ForkOptions {
+            clone_newipc: true,
+            ..ForkOptions::default()
+        },
+    )
+    .expect("fork with CLONE_NEWIPC");
+    let child_nsproxy = child.nsproxy_cap().expect("child nsproxy");
+
+    assert_ne!(
+        parent_nsproxy.key().raw(),
+        child_nsproxy.key().raw(),
+        "CLONE_NEWIPC must publish a replacement nsproxy bundle"
+    );
+    assert_ne!(
+        parent_nsproxy.ipc_ns.key().raw(),
+        child_nsproxy.ipc_ns.key().raw(),
+        "CLONE_NEWIPC must create a fresh IPC namespace"
+    );
+    assert_eq!(
+        parent_nsproxy.pid_ns.key().raw(),
+        child_nsproxy.pid_ns.key().raw(),
+        "non-IPC namespaces stay shared in this slice"
+    );
+
+    let child_limits = *child_nsproxy.ipc_ns.limits.lock();
+    assert_eq!(child_limits.mq_maxmsg, 17);
+    assert_eq!(child_limits.msgmni, 23);
+    assert!(child_nsproxy.ipc_ns.sysv_sem.lock().is_empty());
+    assert!(child_nsproxy.ipc_ns.sysv_shm.lock().is_empty());
+    assert!(child_nsproxy.ipc_ns.sysv_msg.lock().is_empty());
+    assert!(child_nsproxy.ipc_ns.posix_mq.lock().is_empty());
+
+    assert_eq!(parent_nsproxy.ipc_ns.sysv_sem.lock().len(), 1);
+    assert_eq!(parent_nsproxy.ipc_ns.sysv_shm.lock().len(), 1);
+    assert_eq!(parent_nsproxy.ipc_ns.sysv_msg.lock().len(), 1);
+    assert_eq!(parent_nsproxy.ipc_ns.posix_mq.lock().len(), 1);
+}
+
+#[test]
+fn fork_inherits_mount_namespace_from_nsproxy_bundle() {
+    let _g = setup();
+    let parent = bootstrap();
+    let parent_mnt_ns = fresh_mount_namespace();
+    let parent_nsproxy = parent.nsproxy_cap().expect("parent nsproxy");
+    let replacement =
+        crate::process::nsproxy::clone_nsproxy_with_mount_namespace(&parent_nsproxy, parent_mnt_ns)
+            .expect("replacement nsproxy");
+
+    {
+        let payload_guard = parent.payload.lock();
+        let payload = payload_guard.as_ref().expect("parent payload");
+        let _old = payload.replace_nsproxy(replacement);
+    }
+
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
+    let parent_nsproxy = parent.nsproxy_cap().expect("parent nsproxy");
+    let child_nsproxy = child.nsproxy_cap().expect("child nsproxy");
+
+    assert_eq!(
+        parent_nsproxy
+            .mnt_ns
+            .as_ref()
+            .expect("parent mnt ns")
+            .key()
+            .raw(),
+        child_nsproxy
+            .mnt_ns
+            .as_ref()
+            .expect("child mnt ns")
+            .key()
+            .raw(),
+        "plain fork must inherit the mount namespace cap"
+    );
 }
 
 #[test]
@@ -251,6 +605,181 @@ fn exit_group_detaches_live_sysv_shm_mappings() {
     assert_eq!(stat.attach_count, 0);
     sysv_shm::execution::step_shmctl(shmid, sysv_shm::execution::IPC_RMID, None, &cred)
         .expect("rmid");
+}
+
+#[test]
+fn last_thread_exit_applies_sysv_sem_undo_adjustments() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let ns = proc_cap.nsproxy_cap().expect("nsproxy cap");
+    let cred = sign_cred(Cred::root()).expect("root cred cap");
+    let semid = sysv_sem::execution::step_semget(
+        sysv_shm::execution::IPC_PRIVATE,
+        1,
+        sysv_shm::execution::IPC_CREAT | 0o600,
+        &cred,
+        &ns,
+    )
+    .expect("semget private");
+    sysv_sem::execution::step_semctl(
+        semid,
+        0,
+        sysv_sem::execution::SETVAL,
+        sysv_sem::execution::SemCtlArg::Val(2),
+        &cred,
+        None,
+    )
+    .expect("SETVAL");
+    sysv_sem::execution::step_semop(
+        semid,
+        &[sysv_sem::structure::SemBuf {
+            sem_num: 0,
+            sem_op: -2,
+            sem_flg: sysv_sem::structure::sem_flg::SEM_UNDO,
+        }],
+        &cred,
+        &proc_cap,
+    )
+    .expect("semop SEM_UNDO");
+
+    let leader = first_thread(&proc_cap);
+    step_thread_exit(leader, 7);
+
+    assert!(proc_cap.is_zombie());
+    match sysv_sem::execution::step_semctl(
+        semid,
+        0,
+        sysv_sem::execution::GETVAL,
+        sysv_sem::execution::SemCtlArg::None,
+        &cred,
+        None,
+    )
+    .expect("GETVAL after exit")
+    {
+        sysv_sem::execution::SemCtlResult::Val(value) => assert_eq!(value, 2),
+        other => panic!("expected Val, got {other:?}"),
+    }
+}
+
+#[test]
+fn exit_group_applies_sysv_sem_undo_adjustments() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let ns = proc_cap.nsproxy_cap().expect("nsproxy cap");
+    let cred = sign_cred(Cred::root()).expect("root cred cap");
+    let semid = sysv_sem::execution::step_semget(
+        sysv_shm::execution::IPC_PRIVATE,
+        1,
+        sysv_shm::execution::IPC_CREAT | 0o600,
+        &cred,
+        &ns,
+    )
+    .expect("semget private");
+    sysv_sem::execution::step_semctl(
+        semid,
+        0,
+        sysv_sem::execution::SETVAL,
+        sysv_sem::execution::SemCtlArg::Val(2),
+        &cred,
+        None,
+    )
+    .expect("SETVAL");
+    sysv_sem::execution::step_semop(
+        semid,
+        &[sysv_sem::structure::SemBuf {
+            sem_num: 0,
+            sem_op: -2,
+            sem_flg: sysv_sem::structure::sem_flg::SEM_UNDO,
+        }],
+        &cred,
+        &proc_cap,
+    )
+    .expect("semop SEM_UNDO");
+
+    step_exit_group(&proc_cap, ExitStatus::Exited(42));
+
+    assert!(proc_cap.is_zombie());
+    match sysv_sem::execution::step_semctl(
+        semid,
+        0,
+        sysv_sem::execution::GETVAL,
+        sysv_sem::execution::SemCtlArg::None,
+        &cred,
+        None,
+    )
+    .expect("GETVAL after exit_group")
+    {
+        sysv_sem::execution::SemCtlResult::Val(value) => assert_eq!(value, 2),
+        other => panic!("expected Val, got {other:?}"),
+    }
+}
+
+#[test]
+fn fork_child_exit_does_not_apply_parent_sysv_sem_undo_adjustments() {
+    let _g = setup();
+    let parent = bootstrap();
+    let ns = parent.nsproxy_cap().expect("nsproxy cap");
+    let cred = sign_cred(Cred::root()).expect("root cred cap");
+    let semid = sysv_sem::execution::step_semget(
+        sysv_shm::execution::IPC_PRIVATE,
+        1,
+        sysv_shm::execution::IPC_CREAT | 0o600,
+        &cred,
+        &ns,
+    )
+    .expect("semget private");
+    sysv_sem::execution::step_semctl(
+        semid,
+        0,
+        sysv_sem::execution::SETVAL,
+        sysv_sem::execution::SemCtlArg::Val(2),
+        &cred,
+        None,
+    )
+    .expect("SETVAL");
+    sysv_sem::execution::step_semop(
+        semid,
+        &[sysv_sem::structure::SemBuf {
+            sem_num: 0,
+            sem_op: -2,
+            sem_flg: sysv_sem::structure::sem_flg::SEM_UNDO,
+        }],
+        &cred,
+        &parent,
+    )
+    .expect("parent semop SEM_UNDO");
+
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
+    step_exit_group(&child, ExitStatus::Exited(0));
+
+    match sysv_sem::execution::step_semctl(
+        semid,
+        0,
+        sysv_sem::execution::GETVAL,
+        sysv_sem::execution::SemCtlArg::None,
+        &cred,
+        None,
+    )
+    .expect("GETVAL after child exit")
+    {
+        sysv_sem::execution::SemCtlResult::Val(value) => assert_eq!(value, 0),
+        other => panic!("expected Val, got {other:?}"),
+    }
+
+    step_exit_group(&parent, ExitStatus::Exited(0));
+    match sysv_sem::execution::step_semctl(
+        semid,
+        0,
+        sysv_sem::execution::GETVAL,
+        sysv_sem::execution::SemCtlArg::None,
+        &cred,
+        None,
+    )
+    .expect("GETVAL after parent exit")
+    {
+        sysv_sem::execution::SemCtlResult::Val(value) => assert_eq!(value, 2),
+        other => panic!("expected Val, got {other:?}"),
+    }
 }
 
 #[test]
