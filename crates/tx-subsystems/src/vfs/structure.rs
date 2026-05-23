@@ -480,7 +480,26 @@ pub enum RNodeBacking {
     StructBacked {
         payload: StructPayload,
     },
-    Projected,
+    Projected {
+        schema: ProjectionSchemaId,
+        key: ProjectionKey,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectionSchemaId {
+    Procfs,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectionKey {
+    pub object_id: FsObjectId,
+}
+
+impl ProjectionKey {
+    pub const fn from_fs_object_id(object_id: FsObjectId) -> Self {
+        Self { object_id }
+    }
 }
 
 #[derive(Clone, Debug)]
