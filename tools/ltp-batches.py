@@ -169,11 +169,41 @@ BATCH_PREFIXES: dict[str, list[str]] = {
     """.split(),
 }
 
+CUSTOM_BATCHES: dict[str, list[str]] = {
+    "vfs-tail": """
+        link01 link02 link04 link05 link08 linkat01 linkat02 listxattr01
+        listxattr02 listxattr03 llistxattr01 llistxattr02 llistxattr03
+        lremovexattr01 lstat01 lstat01A lstat01A_64 lstat01_64 lstat02
+        lstat02_64 mkdir02 mkdir03 mkdir04 mkdir05 mkdir09 mkdirat01
+        mkdirat02 mknod01 mknod02 mknod03 mknod04 mknod05 mknod06 mknod07
+        mknod08 mknod09 mknodat01 mknodat02 name_to_handle_at01
+        name_to_handle_at02 open01 open01A open02 open03 open04 open06
+        open07 open08 open09 open10 open11 open12 open13 open14
+        open_by_handle_at01 open_by_handle_at02 openat01 openat02 openat03
+        openat04 openat201 openat202 openat203 prot_hsymlinks readdir01
+        readdir21 readlink01 readlink01A readlink03 readlinkat01 readlinkat02
+        removexattr01 removexattr02 rename01 rename01A rename03 rename04
+        rename05 rename06 rename07 rename08 rename09 rename10 rename11
+        rename12 rename13 rename14 renameat01 renameat201 renameat202 rmdir01
+        rmdir02 rmdir03 rmdir03A setxattr01 setxattr02 setxattr03 stat01
+        stat01_64 stat02 stat02_64 stat03 stat03_64 stat04 stat04_64
+        statfs01 statfs01_64 statfs02 statfs02_64 statfs03 statfs03_64
+        statvfs01 statvfs02 statx01 statx02 statx03 statx04 statx05 statx06
+        statx07 statx08 statx09 statx10 statx11 statx12 symlink01 symlink02
+        symlink03 symlink04 symlinkat01 truncate02 truncate02_64 truncate03
+        truncate03_64 umask01 unlink01 unlink05 unlink07 unlink08 unlink09
+        unlinkat01 utime01 utime02 utime03 utime04 utime05 utime06 utime07
+        utimensat01 utimes01
+    """.split(),
+}
+CUSTOM_BATCHES["vfs-after-lgetxattr"] = CUSTOM_BATCHES["vfs-tail"]
+
 BATCH_ORDER = [
     "p0",
     "smoke",
     "fd-io",
     "vfs",
+    "vfs-tail",
     "vm",
     "process",
     "cred",
@@ -234,6 +264,16 @@ def parse_cases(lines: list[str]) -> list[str]:
 def cases_for_batch(cases: list[str], batch: str) -> list[str]:
     if batch == "all":
         return cases
+    if batch in CUSTOM_BATCHES:
+        available = set(cases)
+        return [
+            case
+            for case in CUSTOM_BATCHES[batch]
+            if case in available
+            and is_valid_case_name(case)
+            and case not in SKIP_CASES
+            and case_prefix(case) not in SKIP_PREFIXES
+        ]
     try:
         prefixes = set(BATCH_PREFIXES[batch])
     except KeyError:

@@ -552,7 +552,8 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             return SyscallResult::Error(EIO_VALUE);
         }
         V3::Err(V3Errno::ENOENT) if want_create => {
-            match create_then_walk::<P>(&cwd, &path, mode as u16, &walker_cred) {
+            let create_mode = (mode as u16) & !ctx.process.umask() & 0o7777;
+            match create_then_walk::<P>(&cwd, &path, create_mode, &walker_cred) {
                 Ok(d) => d,
                 Err(e) => return SyscallResult::Error(e),
             }
@@ -654,6 +655,7 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => {
             if let Some(file) = closing_file.as_deref() {
+                file.flock_release();
                 fcntl_release_process_locks_for_file(ctx.process.pid.0, file);
             }
             SyscallResult::Return(0)

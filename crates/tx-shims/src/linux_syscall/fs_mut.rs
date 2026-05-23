@@ -97,10 +97,9 @@ pub(crate) fn create_then_walk<P: PmapIf>(
         None => return Err(EROFS_VALUE),
     };
 
-    // Mint the new inode under the parent. The mode arrives from
-    // userspace as the bottom 12 bits (`rwxrwxrwx | S_ISUID/S_ISGID/
-    // S_ISVTX`); umask plumbing is deferred to a future slice
-    // (TODO(phase-umask)).
+    // Mint the new inode under the parent. The caller has already
+    // applied the process umask, leaving the bottom 12 mode bits
+    // (`rwxrwxrwx | S_ISUID/S_ISGID/S_ISVTX`) for the filesystem.
     let parent_fs_object_id = parent_dentry.rnode().fs_object_id();
     let new_mode = mode & 0o7777;
     {

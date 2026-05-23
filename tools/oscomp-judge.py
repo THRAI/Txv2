@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 ltp_ret_pat = re.compile(r"^FAIL LTP CASE\s+(\S+)\s+:\s+(-?\d+)\s*$")
 ltp_run_pat = re.compile(r"^RUN LTP CASE\s+(\S+)(?:\s+:.*)?\s*$")
@@ -74,6 +75,200 @@ legacy_ltp_points = {
     "writev05": 1,
     "writev06": 1,
 }
+
+symlink01_alias_points = {
+    "chdir01A": 3,
+    "chmod01A": 3,
+    "link01": 2,
+    "lstat01A": 3,
+    "lstat01A_64": 3,
+    "open01A": 5,
+    "readlink01A": 4,
+    "rename01A": 2,
+    "rmdir03A": 1,
+    "stat04": 3,
+    "stat04_64": 3,
+    "unlink01": 1,
+}
+
+ROOT = Path(__file__).resolve().parents[1]
+LTP_KERNEL_SRC = ROOT / "target/sources/ltp-20240524/testcases/kernel"
+_ltp_source_map = None
+_ltp_total_cache = {}
+
+
+def ltp_source_map():
+    global _ltp_source_map
+    if _ltp_source_map is not None:
+        return _ltp_source_map
+
+    sources = {}
+    if LTP_KERNEL_SRC.exists():
+        for path in LTP_KERNEL_SRC.rglob("*.c"):
+            sources.setdefault(path.stem, path)
+    _ltp_source_map = sources
+    return sources
+
+
+def ltp_source_names_for_case(name):
+    names = [name]
+    for suffix in ("_64", "_16"):
+        if name.endswith(suffix):
+            names.append(name[: -len(suffix)])
+    return names
+
+
+def parse_ltp_tst_total(path):
+    text = path.read_text(errors="ignore")
+    defines = {
+        m.group(1): int(m.group(2))
+        for m in re.finditer(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\s+(\d+)\b", text, re.M)
+    }
+    match = re.search(r"\bTST_TOTAL\s*=\s*([^;]+)\s*;", text)
+    if not match:
+        return None
+    expr = match.group(1).strip()
+    if expr.isdigit():
+        return int(expr)
+    size_match = re.fullmatch(
+        r"sizeof\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*/\s*sizeof\s*\(\s*\*\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+        expr,
+    )
+    if size_match and size_match.group(1) == size_match.group(2):
+        return count_c_array_items(text, size_match.group(1))
+    if expr.startswith("ARRAY_SIZE"):
+        array_match = re.fullmatch(
+            r"ARRAY_SIZE\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)", expr
+        )
+        if array_match:
+            return count_c_array_items(text, array_match.group(1))
+    return defines.get(expr)
+
+
+def count_c_array_items(text, array_name):
+    match = re.search(
+        r"^[^;\n]*\b" + re.escape(array_name) + r"\b[^;\n]*=\s*\{",
+        text,
+        re.M,
+    )
+    if not match:
+        return None
+
+    initializer = extract_c_initializer(text, match.end() - 1)
+    if initializer is None:
+        return None
+
+    depth = 0
+    count = 0
+    in_string = False
+    escaped = False
+    for ch in initializer:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                count += 1
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+
+    if count:
+        return count
+    return count_top_level_items(initializer)
+
+
+def extract_c_initializer(text, brace_pos):
+    depth = 0
+    in_string = False
+    escaped = False
+    start = brace_pos + 1
+    for idx, ch in enumerate(text[brace_pos:], brace_pos):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:idx]
+    return None
+
+
+def count_top_level_items(initializer):
+    initializer = re.sub(r"/\*.*?\*/", "", initializer, flags=re.S)
+    initializer = re.sub(r"//.*", "", initializer)
+    depth = 0
+    items = 0
+    token = []
+    in_string = False
+    escaped = False
+    for ch in initializer:
+        if in_string:
+            token.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            token.append(ch)
+            continue
+        if ch in "({[":
+            depth += 1
+            token.append(ch)
+            continue
+        if ch in ")}]":
+            depth -= 1
+            token.append(ch)
+            continue
+        if ch == "," and depth == 0:
+            if "".join(token).strip():
+                items += 1
+            token = []
+            continue
+        token.append(ch)
+    if "".join(token).strip():
+        items += 1
+    return items or None
+
+
+def legacy_total_for_case(name):
+    if name in _ltp_total_cache:
+        return _ltp_total_cache[name]
+
+    sources = ltp_source_map()
+    total = None
+    for source_name in ltp_source_names_for_case(name):
+        path = sources.get(source_name)
+        if path is None:
+            continue
+        total = parse_ltp_tst_total(path)
+        if total is not None:
+            break
+
+    _ltp_total_cache[name] = total
+    return total
 
 
 def parse_ltp_detail_counts(group_lines):
@@ -156,10 +351,14 @@ def adapt_ltp_detail_counts(group, group_lines, data):
             item["broken"] = counts["broken"]
             item["skipped"] = counts["skipped"]
             item["warnings"] = counts["warnings"]
-        elif item.get("all", 0) == 0 and name in legacy_ltp_points:
-            total = legacy_ltp_points[name]
+        elif item.get("all", 0) == 0:
+            total = (
+                legacy_ltp_points.get(name)
+                or symlink01_alias_points.get(name)
+                or legacy_total_for_case(name)
+            )
             ret = ret_by_case.get(name)
-            if ret is not None:
+            if ret is not None and total is not None:
                 item = dict(item)
                 item["pass"] = total if ret == 0 else 0
                 item["all"] = total
