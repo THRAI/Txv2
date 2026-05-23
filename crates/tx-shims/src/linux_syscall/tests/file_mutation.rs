@@ -221,7 +221,8 @@ fn dispatch_mkdirat_existing_returns_neg_eexist() {
     drop(path);
 }
 
-/// `mkdirat` with a non-cwd dirfd surfaces as `-EBADF`.
+/// `mkdirat` with a closed non-cwd dirfd surfaces as `-EBADF` for a
+/// relative path.
 #[test]
 fn dispatch_mkdirat_non_cwd_dirfd_returns_neg_ebadf() {
     let _setup = fm_setup();
@@ -229,11 +230,54 @@ fn dispatch_mkdirat_non_cwd_dirfd_returns_neg_ebadf() {
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
     let ctx = make_ctx(proc_cap, thread);
 
-    let path = nul_terminate(b"/d");
+    let path = nul_terminate(b"d");
     let req = SyscallRequest::new(NR_MKDIRAT, [3, path.as_ptr() as u64, 0o755, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_BADF));
     drop(path);
+}
+
+/// `mkdirat(dirfd, "child", mode)` resolves relative to an open
+/// directory fd.
+#[test]
+fn dispatch_mkdirat_directory_fd_creates_relative_child() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    make_dir(&tmpfs, b"base");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let base_path = nul_terminate(b"/base");
+    let open_req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            base_path.as_ptr() as u64,
+            O_RDWR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let dirfd = match block_on(dispatch::<ShimsTestPmap>(open_req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat /base: {other:?}"),
+    };
+
+    let child = nul_terminate(b"child");
+    let mkdir_req = SyscallRequest::new(NR_MKDIRAT, [dirfd, child.as_ptr() as u64, 0o755, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(mkdir_req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let guard = guard();
+    let base_id = match tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"base", &guard) {
+        StepOutcome::Done(id) => id,
+        other => panic!("lookup base: {other:?}"),
+    };
+    assert!(matches!(
+        tmpfs.lookup(base_id, b"child", &guard),
+        StepOutcome::Done(_)
+    ));
 }
 
 // -----------------------------------------------------------------

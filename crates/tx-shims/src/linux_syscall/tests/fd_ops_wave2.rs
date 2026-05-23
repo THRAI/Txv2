@@ -439,8 +439,8 @@ fn dispatch_openat_path_not_found_returns_neg_enoent() {
     drop(path);
 }
 
-/// Non-`AT_FDCWD` dirfd values return `-EBADF`. The slice's fd
-/// table doesn't carry directory-fd semantics yet.
+/// Non-`AT_FDCWD` dirfd values return `-EBADF` for relative paths
+/// when the fd is not open.
 #[test]
 fn dispatch_openat_dirfd_not_at_fdcwd_returns_neg_ebadf() {
     let _setup = fd_ops_setup();
@@ -448,7 +448,7 @@ fn dispatch_openat_dirfd_not_at_fdcwd_returns_neg_ebadf() {
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
     let ctx = make_ctx(proc_cap, thread);
 
-    let path = nul_terminate(b"/f");
+    let path = nul_terminate(b"f");
     // dirfd = 5 (a positive fd value); not AT_FDCWD = -100.
     let req = SyscallRequest::new(
         NR_OPENAT,

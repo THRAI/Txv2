@@ -17,7 +17,7 @@ use crate::execution::Guard;
 use crate::mount::MountPayload;
 use crate::vfs::adapter::step_engine::{self, Cap, StepOutcome};
 use crate::vfs::structure::{
-    Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking,
+    Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_ISVTX,
 };
 use crate::vfs::walker::{self, SYMLOOP_MAX};
 use crate::vfs::FsOps;
@@ -289,6 +289,13 @@ pub fn kernel_step(
             };
             return KernelStep::Continue(WalkState::Terminal(resolved));
         }
+        let protected_parent_meta = match fs_ops.load_inode_meta(parent_fs_object_id, guard) {
+            StepOutcome::Done(meta) => meta,
+            _ => parent_meta,
+        };
+        if protected_symlink_follow_denied(cred, &protected_parent_meta, &child_meta) {
+            return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::EACCES));
+        }
         hop_count += 1;
         if hop_count > SYMLOOP_MAX {
             return KernelStep::Error(WalkCause::SymlinkLimit);
@@ -357,6 +364,16 @@ pub fn kernel_step(
         mount_root,
         must_be_directory,
     }))
+}
+
+fn protected_symlink_follow_denied(
+    cred: &Credential,
+    parent_meta: &InodeMeta,
+    link_meta: &InodeMeta,
+) -> bool {
+    let sticky_world_writable =
+        (parent_meta.mode & S_ISVTX) != 0 && (parent_meta.mode & 0o002) != 0;
+    sticky_world_writable && cred.uid != link_meta.uid && parent_meta.uid != link_meta.uid
 }
 
 // ---------------------------------------------------------------------------

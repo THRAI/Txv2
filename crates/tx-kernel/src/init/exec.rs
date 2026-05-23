@@ -915,7 +915,10 @@ fn append_full_ltp(cmd: &mut alloc::string::String) {
         "; for file in ltp/testcases/bin/*; do if [ -f \"$file\" ]; then case=${{file##*/}}"
     );
     let _ = write!(cmd, "; ./busybox echo \"RUN LTP CASE $case\"");
-    let _ = write!(cmd, "; KCONFIG_PATH=/proc/config \"$file\"");
+    let _ = write!(
+        cmd,
+        "; LTP_DEV=/dev/block/ltpdev LTP_DEV_FS_TYPE=tmpfs KCONFIG_PATH=/proc/config \"$file\""
+    );
     let _ = write!(cmd, "; ret=$?");
     let _ = write!(
         cmd,
@@ -977,7 +980,7 @@ fn append_ltp_runtest(cmd: &mut alloc::string::String, module: &str) {
     );
     let _ = write!(
         cmd,
-        "; if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; cmdline=${{rest:-$tag}}; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -c \"$cmdline\"; ret=$?; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi"
+        "; if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; cmdline=${{rest:-$tag}}; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:/bin:/usr/bin:/sbin:/usr/sbin:$PATH LTPROOT=/musl/musl/ltp LTP_DEV=/dev/block/ltpdev LTP_DEV_FS_TYPE=tmpfs KCONFIG_PATH=/proc/config ./busybox sh -c \"$cmdline\"; ret=$?; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi"
     );
     let _ = write!(
         cmd,
@@ -1011,7 +1014,7 @@ fn append_filtered_ltp(cmd: &mut alloc::string::String, filter: &str) {
         let _ = write!(cmd, "; ./busybox echo \"RUN LTP CASE {case} : {case}\"");
         let _ = write!(
             cmd,
-            "; PATH=/musl/musl/ltp/testcases/bin:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -c \"{command}\"; ret=$?"
+            "; PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:/bin:/usr/bin:/sbin:/usr/sbin:$PATH LTPROOT=/musl/musl/ltp LTP_DEV=/dev/block/ltpdev LTP_DEV_FS_TYPE=tmpfs KCONFIG_PATH=/proc/config ./busybox sh -c \"{command}\"; ret=$?"
         );
         let _ = write!(cmd, "; ./busybox echo \"FAIL LTP CASE {case} : $ret\"");
     }
@@ -1035,6 +1038,7 @@ fn ltp_case_command(case: &str) -> &str {
         "stat04" => "symlink01 -T stat04",
         "stat04_64" => "symlink01 -T stat04_64",
         "unlink01" => "symlink01 -T unlink01",
+        "prot_hsymlinks" => "prot_hsymlinks -s",
         _ => case,
     }
 }

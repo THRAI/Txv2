@@ -42,6 +42,16 @@ fn allocate_fd_under_limit<'a>(ctx: &SyscallCtx<'a>) -> Result<u32, SyscallResul
     }
 }
 
+fn ensure_fd_room_under_limit<'a>(ctx: &SyscallCtx<'a>) -> Result<(), SyscallResult> {
+    let fd = ctx.process.next_fd_above(0);
+    let (soft_limit, _) = ctx.process.rlimit_nofile();
+    if fd >= soft_limit {
+        Err(SyscallResult::Error(EMFILE_VALUE))
+    } else {
+        Ok(())
+    }
+}
+
 fn allocate_fd_at_least_under_limit<'a>(
     ctx: &SyscallCtx<'a>,
     min: u32,
@@ -451,7 +461,12 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // → the `opendir_dentry` of its OpenFile (an O_DIRECTORY open of
     // that directory). Invalid / non-directory fds surface as EBADF /
     // ENOTDIR.
-    let cwd: Cap<DEntry> = if dirfd == AT_FDCWD {
+    let cwd: Cap<DEntry> = if path.starts_with(b"/") {
+        match ctx.process.cwd() {
+            Some(d) => d,
+            None => return SyscallResult::Error(ENOENT_VALUE),
+        }
+    } else if dirfd == AT_FDCWD {
         match ctx.process.cwd() {
             Some(d) => d,
             None => return SyscallResult::Error(ENOENT_VALUE),
@@ -468,6 +483,10 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             None => return SyscallResult::Error(ENOTDIR_VALUE),
         }
     };
+
+    if let Err(err) = ensure_fd_room_under_limit(ctx) {
+        return err;
+    }
 
     let walker_cred = ctx.walker_cred();
     // PR async migration: non-O_CREAT, non-O_TRUNC simple open
@@ -958,6 +977,22 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 super::userfaultfd::step_uffdio_continue(&file, argp, ctx)
             }
             _ => SyscallResult::error_from(Errno::EINVAL),
+        };
+    }
+
+    const BLKGETSIZE64: u32 = 0x8008_1272;
+    if request == BLKGETSIZE64 && file.rnode().meta().kind() == InodeKind::BlockDevice {
+        let Some(reg) = tx_fs::bdevfs::block_device_for_object_id(file.rnode().fs_object_id())
+        else {
+            return SyscallResult::error_from(Errno::ENOTTY);
+        };
+        let bytes = reg
+            .ops
+            .total_blocks()
+            .saturating_mul(reg.ops.block_size() as u64);
+        return match bootstrap_write_user::<u64>(&ctx.aspace, argp, bytes) {
+            Ok(()) => SyscallResult::Return(0),
+            Err(errno) => SyscallResult::error_from(errno),
         };
     }
 
@@ -1749,7 +1784,7 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
     let flags = args[2] as u32;
-    let _mask = args[3] as u32;
+    let mask = args[3] as u32;
     let statxbuf_uaddr = args[4];
 
     if path_uaddr == 0 || statxbuf_uaddr == 0 {
@@ -1763,18 +1798,22 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     if flags & !known_flags != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
+    let known_mask = numbers::STATX_BASIC_STATS | numbers::STATX_BTIME | numbers::STATX_MNT_ID;
+    if mask & !known_mask != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
 
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
 
-    let cwd = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
-    };
     let (mut statx_result, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
         if dirfd == AT_FDCWD {
+            let cwd = match ctx.process.cwd() {
+                Some(d) => d,
+                None => return SyscallResult::Error(ENOENT_VALUE),
+            };
             (
                 StatxResult {
                     meta: cwd.rnode().meta(),
@@ -1799,9 +1838,13 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             )
         }
     } else {
-        if dirfd != AT_FDCWD {
-            return SyscallResult::Error(EBADF_VALUE);
+        if path.is_empty() {
+            return SyscallResult::Error(ENOENT_VALUE);
         }
+        let cwd = match resolve_cwd_for_path(dirfd, &path, ctx) {
+            Ok(d) => d,
+            Err(e) => return SyscallResult::Error(e),
+        };
         let walker_cred = ctx.walker_cred();
         let result = {
             let mut script_ctx = build_subject_script_ctx(ctx);
@@ -1875,20 +1918,24 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     // or mirror fstat(fd) for a real fd. Otherwise use StatOp +
     // drive_oneshot from cwd; directory-fd path walks remain out of
     // scope for this slice.
-    let cwd = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
-    };
     let (mut meta, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
         if dirfd == AT_FDCWD {
+            let cwd = match ctx.process.cwd() {
+                Some(d) => d,
+                None => return SyscallResult::Error(ENOENT_VALUE),
+            };
             (cwd.rnode().meta(), cwd.rnode().fs_object_id())
         } else {
             return sys_fstat([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx);
         }
     } else {
-        if dirfd != AT_FDCWD {
-            return SyscallResult::Error(EBADF_VALUE);
+        if path.is_empty() {
+            return SyscallResult::Error(ENOENT_VALUE);
         }
+        let cwd = match resolve_cwd_for_path(dirfd, &path, ctx) {
+            Ok(d) => d,
+            Err(e) => return SyscallResult::Error(e),
+        };
         let result = {
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = StatOp {

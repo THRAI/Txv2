@@ -304,6 +304,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_sdcard_at_musl();
             Self::populate_rootfs_shebang_shims();
             Self::populate_rootfs_tmp_dirs();
+            Self::populate_rootfs_identity_files();
             Self::init_csprng();
             Self::bind_init_cwd_and_root();
 

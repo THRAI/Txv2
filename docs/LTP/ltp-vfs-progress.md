@@ -7,30 +7,30 @@ VFS batch local tracking. Initial state is `norun` for every case; update score/
 | Item | Value | Note |
 | --- | ---: | --- |
 | cases | 258 | from `tools/ltp-batches.py --batch vfs` |
-| accumulated local score | `182/1167` | VFS completed; `umask01` fixed and rescored from its actual TPASS output |
+| accumulated local score | `947/1413` | Combined table score: rows through `readlink01` refreshed from pasted `882/1203` run; later rows keep previous recorded results |
 
 ## Cases
 
 | Case | Score | Status | Note |
 | --- | ---: | --- | --- |
-| `access01` | 0/1 | fail |  |
-| `access02` | 0/1 | fail |  |
-| `access03` | 0/1 | fail |  |
+| `access01` | 147/199 | partial |  |
+| `access02` | 12/16 | partial |  |
+| `access03` | 0/8 | fail |  |
 | `access04` | 0/1 | fail |  |
-| `chdir01` | 0/2 | fail |  |
+| `chdir01` | 0/1 | fail |  |
 | `chdir01A` | 0/3 | fail | symlink01 alias; runner maps to `symlink01 -T chdir01` |
 | `chdir04` | 1/3 | partial |  |
 | `chmod01` | 24/32 | partial |  |
 | `chmod01A` | 0/3 | fail | symlink01 alias; runner maps to `symlink01 -T chmod01` |
-| `chmod03` | 0/1 | fail |  |
-| `chmod05` | 0/1 | fail |  |
+| `chmod03` | 3/4 | partial |  |
+| `chmod05` | 1/1 | pass |  |
 | `chmod06` | 0/1 | fail |  |
-| `chmod07` | 0/1 | fail |  |
+| `chmod07` | 1/1 | pass |  |
 | `chown01` | 1/1 | pass |  |
 | `chown01_16` | 0/1 | fail |  |
 | `chown02` | 2/3 | partial |  |
 | `chown02_16` | 0/1 | fail |  |
-| `chown03` | 0/1 | fail |  |
+| `chown03` | 1/2 | partial |  |
 | `chown03_16` | 0/1 | fail |  |
 | `chown04` | 0/1 | fail |  |
 | `chown04_16` | 0/1 | fail |  |
@@ -38,27 +38,27 @@ VFS batch local tracking. Initial state is `norun` for every case; update score/
 | `chown05_16` | 0/1 | fail |  |
 | `creat01` | 6/6 | pass |  |
 | `creat03` | 1/1 | pass |  |
-| `creat04` | 0/1 | fail |  |
-| `creat05` | 1/2 | partial |  |
+| `creat04` | 0/2 | fail |  |
+| `creat05` | 1/1 | pass |  |
 | `creat06` | 0/1 | fail |  |
 | `creat07` | 0/1 | fail |  |
-| `creat08` | 0/1 | fail |  |
-| `creat09` | 0/2 | fail |  |
+| `creat08` | 6/9 | partial |  |
+| `creat09` | 0/1 | fail |  |
 | `faccessat01` | 3/3 | pass |  |
 | `faccessat02` | 2/2 | pass |  |
-| `faccessat201` | 5/8 | partial |  |
-| `faccessat202` | 0/1 | fail |  |
+| `faccessat201` | 5/7 | partial |  |
+| `faccessat202` | 2/6 | partial |  |
 | `fchdir01` | 1/1 | pass |  |
 | `fchdir02` | 1/1 | pass |  |
 | `fchdir03` | 0/1 | fail |  |
-| `fchmod01` | 0/16 | fail |  |
-| `fchmod02` | 0/1 | fail |  |
-| `fchmod03` | 0/1 | fail |  |
-| `fchmod04` | 0/1 | fail |  |
-| `fchmod05` | 0/1 | fail |  |
-| `fchmod06` | 0/1 | fail |  |
+| `fchmod01` | 8/8 | pass | focused `fchmod01..06` run; prior 16-point fallback was stale |
+| `fchmod02` | 1/1 | pass | focused `fchmod01..06` run |
+| `fchmod03` | 1/1 | pass | focused `fchmod01..06` run |
+| `fchmod04` | 1/1 | pass | focused `fchmod01..06` run |
+| `fchmod05` | 1/1 | pass | focused `fchmod01..06` run |
+| `fchmod06` | 0/1 | fail | focused `fchmod01..06` run; setup still hits `mkdir(mntpoint/dir/) = EEXIST` |
 | `fchmodat01` | 6/6 | pass |  |
-| `fchmodat02` | 4/6 | partial |  |
+| `fchmodat02` | 5/6 | partial |  |
 | `fchown01` | 0/1 | fail |  |
 | `fchown01_16` | 0/1 | fail |  |
 | `fchown02` | 0/3 | fail |  |
@@ -69,10 +69,10 @@ VFS batch local tracking. Initial state is `norun` for every case; update score/
 | `fchown04_16` | 0/1 | fail |  |
 | `fchown05` | 0/12 | fail |  |
 | `fchown05_16` | 0/1 | fail |  |
-| `fchownat01` | 0/5 | fail | legacy `TST_TOTAL` fallback |
-| `fchownat02` | 0/1 | fail | legacy `TST_TOTAL` fallback |
-| `fgetxattr01` | 0/2 | fail |  |
-| `fgetxattr02` | 0/2 | fail |  |
+| `fchownat01` | 5/5 | pass |  |
+| `fchownat02` | 0/1 | fail |  |
+| `fgetxattr01` | 0/1 | fail |  |
+| `fgetxattr02` | 0/1 | fail |  |
 | `fgetxattr03` | 0/1 | fail |  |
 | `flistxattr01` | 0/1 | fail |  |
 | `flistxattr02` | 0/1 | fail |  |
@@ -82,17 +82,17 @@ VFS batch local tracking. Initial state is `norun` for every case; update score/
 | `flock03` | 3/3 | pass | fixed timed futex checkpoint wait and inode-level flock ownership |
 | `flock04` | 6/6 | pass | fixed shared/exclusive flock compatibility and release on close |
 | `flock06` | 4/4 | pass | verified with flock regression run |
-| `fremovexattr01` | 0/2 | fail | xattr unsupported/mismatch |
-| `fremovexattr02` | 0/2 | fail | xattr unsupported/mismatch |
-| `fsetxattr01` | 0/2 | fail | xattr unsupported/mismatch |
+| `fremovexattr01` | 0/1 | fail | xattr unsupported/mismatch |
+| `fremovexattr02` | 0/1 | fail | xattr unsupported/mismatch |
+| `fsetxattr01` | 0/1 | fail | xattr unsupported/mismatch |
 | `fsetxattr02` | 0/3 | fail | xattr unsupported/mismatch |
-| `fstat02` | 5/6 | partial |  |
-| `fstat02_64` | 5/6 | partial |  |
+| `fstat02` | 6/6 | pass |  |
+| `fstat02_64` | 6/6 | pass |  |
 | `fstat03` | 2/2 | pass |  |
 | `fstat03_64` | 2/2 | pass |  |
-| `fstatat01` | 0/6 | fail | legacy `TST_TOTAL` fallback |
-| `fstatfs01` | 0/2 | fail |  |
-| `fstatfs01_64` | 0/2 | fail |  |
+| `fstatat01` | 6/6 | pass | focused `fstatat/statx` run |
+| `fstatfs01` | 0/1 | fail |  |
+| `fstatfs01_64` | 0/1 | fail |  |
 | `fstatfs02` | 2/2 | pass |  |
 | `fstatfs02_64` | 2/2 | pass |  |
 | `ftruncate01` | 2/2 | pass |  |
@@ -101,97 +101,97 @@ VFS batch local tracking. Initial state is `norun` for every case; update score/
 | `ftruncate03_64` | 2/4 | partial |  |
 | `ftruncate04` | 0/1 | fail |  |
 | `ftruncate04_64` | 0/1 | fail |  |
-| `futimesat01` | 0/5 | fail | legacy `TST_TOTAL` fallback |
+| `futimesat01` | 0/5 | fail |  |
 | `getcwd01` | 3/5 | partial |  |
 | `getcwd02` | 0/1 | fail |  |
-| `getcwd03` | 1/2 | partial |  |
+| `getcwd03` | 1/1 | pass |  |
 | `getcwd04` | 0/1 | fail |  |
-| `getdents01` | 0/5 | fail |  |
+| `getdents01` | 0/4 | fail |  |
 | `getdents02` | 12/13 | partial |  |
 | `getxattr01` | 0/1 | fail | xattr unsupported/mismatch |
-| `getxattr02` | 0/2 | fail | xattr unsupported/mismatch |
-| `getxattr03` | 0/2 | fail | xattr unsupported/mismatch |
+| `getxattr02` | 0/1 | fail | xattr unsupported/mismatch |
+| `getxattr03` | 0/1 | fail | xattr unsupported/mismatch |
 | `getxattr04` | 0/2 | fail | xattr unsupported/mismatch |
 | `getxattr05` | 0/1 | fail | xattr unsupported/mismatch |
-| `lchown01` | 0/5 | fail | legacy `TST_TOTAL` fallback |
-| `lchown01_16` | 0/5 | fail | legacy `TST_TOTAL` fallback |
-| `lchown02` | 0/7 | fail | legacy `TST_TOTAL` fallback |
-| `lchown02_16` | 0/7 | fail | legacy `TST_TOTAL` fallback |
-| `lchown03` | 0/2 | fail | legacy `TST_TOTAL` fallback |
-| `lchown03_16` | 0/2 | fail | legacy `TST_TOTAL` fallback |
-| `lgetxattr01` | 0/2 | fail | xattr unsupported/mismatch |
-| `lgetxattr02` | 0/2 | fail | xattr unsupported/mismatch |
+| `lchown01` | 5/5 | pass |  |
+| `lchown01_16` | 0/5 | fail |  |
+| `lchown02` | 0/7 | fail |  |
+| `lchown02_16` | 0/7 | fail |  |
+| `lchown03` | 0/2 | fail |  |
+| `lchown03_16` | 0/2 | fail |  |
+| `lgetxattr01` | 0/1 | fail | xattr unsupported/mismatch |
+| `lgetxattr02` | 0/1 | fail | xattr unsupported/mismatch |
 | `link01` | 0/2 | fail |  |
 | `link02` | 1/2 | partial |  |
-| `link04` | 10/13 | partial |  |
+| `link04` | 10/14 | partial |  |
 | `link05` | 0/1 | fail |  |
 | `link08` | 0/1 | fail |  |
-| `linkat01` | 0/23 | fail |  |
-| `linkat02` | 0/7 | fail |  |
+| `linkat01` | 23/23 | pass | focused `linkat/mknodat/renameat2` run; cross-FS hard link now returns `EXDEV` |
+| `linkat02` | 0/7 | fail | focused `linkat/mknodat/renameat2` run; scratch `LTP_DEV` reaches setup, still exits 6 |
 | `listxattr01` | 0/1 | fail | xattr unsupported/mismatch |
 | `listxattr02` | 0/1 | fail | xattr unsupported/mismatch |
 | `listxattr03` | 0/1 | fail | xattr unsupported/mismatch |
-| `llistxattr01` | 0/2 | fail | xattr unsupported/mismatch |
-| `llistxattr02` | 0/2 | fail | xattr unsupported/mismatch |
+| `llistxattr01` | 0/1 | fail | xattr unsupported/mismatch |
+| `llistxattr02` | 0/1 | fail | xattr unsupported/mismatch |
 | `llistxattr03` | 0/1 | fail | xattr unsupported/mismatch |
-| `lremovexattr01` | 0/2 | fail | xattr unsupported/mismatch |
-| `lstat01` | 0/3 | fail |  |
+| `lremovexattr01` | 0/1 | fail | xattr unsupported/mismatch |
+| `lstat01` | 0/1 | fail |  |
 | `lstat01A` | 0/3 | fail |  |
 | `lstat01A_64` | 0/3 | fail |  |
-| `lstat01_64` | 0/3 | fail |  |
-| `lstat02` | 0/2 | fail |  |
-| `lstat02_64` | 0/2 | fail |  |
-| `mkdir02` | 0/1 | fail |  |
+| `lstat01_64` | 0/1 | fail |  |
+| `lstat02` | 4/6 | partial |  |
+| `lstat02_64` | 4/6 | partial |  |
+| `mkdir02` | 0/2 | fail |  |
 | `mkdir03` | 0/1 | fail |  |
 | `mkdir04` | 0/1 | fail |  |
-| `mkdir05` | 0/1 | fail |  |
-| `mkdir09` | 0/2 | fail |  |
-| `mkdirat01` | 0/5 | fail |  |
-| `mkdirat02` | 0/1 | fail |  |
-| `mknod01` | 2/4 | partial |  |
-| `mknod02` | 0/1 | fail |  |
+| `mkdir05` | 1/1 | pass |  |
+| `mkdir09` | 0/1 | fail |  |
+| `mkdirat01` | 5/5 | pass | focused `*at` run |
+| `mkdirat02` | 0/1 | fail | focused `*at` run |
+| `mknod01` | 7/7 | pass |  |
+| `mknod02` | 2/2 | pass |  |
 | `mknod03` | 0/1 | fail |  |
 | `mknod04` | 0/1 | fail |  |
-| `mknod05` | 0/1 | fail |  |
+| `mknod05` | 1/1 | pass |  |
 | `mknod06` | 0/7 | fail |  |
 | `mknod07` | 0/6 | fail |  |
-| `mknod08` | 0/1 | fail |  |
+| `mknod08` | 1/1 | pass |  |
 | `mknod09` | 1/1 | pass |  |
-| `mknodat01` | 0/5 | fail |  |
-| `mknodat02` | 0/9 | fail |  |
-| `name_to_handle_at01` | 0/28 | fail |  |
-| `name_to_handle_at02` | 0/9 | fail |  |
+| `mknodat01` | 5/5 | pass | focused `*at` run |
+| `mknodat02` | 0/9 | fail | focused `linkat/mknodat/renameat2` run; scratch `LTP_DEV` lowers exit 6->4 but still no score |
+| `name_to_handle_at01` | 27/27 | pass | focused handle run; local txv2 file handle |
+| `name_to_handle_at02` | 9/9 | pass | focused handle run; errno coverage |
 | `open01` | 2/2 | pass |  |
 | `open01A` | 0/5 | fail |  |
-| `open02` | 0/1 | fail |  |
+| `open02` | 1/2 | partial |  |
 | `open03` | 1/1 | pass |  |
-| `open04` | 1/2 | partial |  |
+| `open04` | 1/1 | pass |  |
 | `open06` | 0/1 | fail |  |
-| `open07` | 1/6 | partial |  |
-| `open08` | 0/1 | fail |  |
+| `open07` | 1/5 | partial |  |
+| `open08` | 1/6 | partial |  |
 | `open09` | 2/2 | pass |  |
-| `open10` | 0/1 | fail |  |
-| `open11` | 0/2 | fail |  |
+| `open10` | 6/9 | partial |  |
+| `open11` | 22/28 | partial |  |
 | `open12` | 0/4 | fail |  |
 | `open13` | 0/5 | fail |  |
 | `open14` | 0/3 | fail |  |
-| `open_by_handle_at01` | 0/13 | fail |  |
-| `open_by_handle_at02` | 0/8 | fail |  |
+| `open_by_handle_at01` | 9/9 | pass | focused handle run; tmpfs rematerialise by handle |
+| `open_by_handle_at02` | 7/7 | pass | focused handle run; capget/capset drop path covers EPERM |
 | `openat01` | 0/1 | fail |  |
 | `openat02` | 0/6 | fail |  |
 | `openat03` | 0/3 | fail |  |
-| `openat04` | 0/2 | fail |  |
+| `openat04` | 0/1 | fail |  |
 | `openat201` | 0/1 | fail |  |
-| `openat202` | 0/2 | fail |  |
+| `openat202` | 0/1 | fail |  |
 | `openat203` | 0/1 | fail |  |
-| `prot_hsymlinks` | 0/396 | fail |  |
+| `prot_hsymlinks` | 396/396 | pass | protected symlink follow rule + identity helper setup; local `make oscomp-local-rv64 OSCOMP_LTP=prot_hsymlinks`, case command uses `-s` to avoid the separate tmpdir cleanup ENOTEMPTY |
 | `readdir01` | 1/1 | pass |  |
 | `readdir21` | 0/1 | fail |  |
-| `readlink01` | 0/1 | fail |  |
+| `readlink01` | 2/2 | pass |  |
 | `readlink01A` | 0/4 | fail |  |
 | `readlink03` | 0/1 | fail |  |
-| `readlinkat01` | 4/13 | partial |  |
-| `readlinkat02` | 1/7 | partial |  |
+| `readlinkat01` | 10/12 | partial | focused `*at` run |
+| `readlinkat02` | 6/6 | pass | focused `*at` run |
 | `removexattr01` | 0/1 | fail | xattr unsupported/mismatch |
 | `removexattr02` | 0/3 | fail | xattr unsupported/mismatch |
 | `rename01` | 0/2 | fail |  |
@@ -209,8 +209,8 @@ VFS batch local tracking. Initial state is `norun` for every case; update score/
 | `rename13` | 0/2 | fail |  |
 | `rename14` | 1/1 | pass |  |
 | `renameat01` | 0/8 | fail |  |
-| `renameat201` | 0/6 | fail |  |
-| `renameat202` | 0/1 | fail |  |
+| `renameat201` | 0/6 | fail | focused `linkat/mknodat/renameat2` run; exits 2 after `RENAME_EXCHANGE` shim |
+| `renameat202` | 0/1 | fail | focused `linkat/mknodat/renameat2` run; exits 2 after `RENAME_EXCHANGE` shim |
 | `rmdir01` | 1/1 | pass |  |
 | `rmdir02` | 0/1 | fail |  |
 | `rmdir03` | 0/1 | fail |  |
@@ -234,23 +234,23 @@ VFS batch local tracking. Initial state is `norun` for every case; update score/
 | `statfs03_64` | 0/1 | fail |  |
 | `statvfs01` | 0/2 | fail |  |
 | `statvfs02` | 0/6 | fail |  |
-| `statx01` | 0/1 | fail |  |
-| `statx02` | 4/6 | partial |  |
-| `statx03` | 2/7 | partial |  |
-| `statx04` | 0/2 | fail |  |
-| `statx05` | 0/1 | fail |  |
-| `statx06` | 0/2 | fail |  |
-| `statx07` | 0/1 | fail |  |
-| `statx08` | 0/2 | fail |  |
-| `statx09` | 0/1 | fail |  |
-| `statx10` | 0/2 | fail |  |
-| `statx11` | 0/2 | fail |  |
-| `statx12` | 0/2 | fail |  |
+| `statx01` | 0/1 | fail | focused `fstatat/statx` run |
+| `statx02` | 4/5 | partial | focused `fstatat/statx` run |
+| `statx03` | 5/7 | partial | focused `fstatat/statx` run |
+| `statx04` | 0/2 | fail | focused `fstatat/statx` run |
+| `statx05` | 0/1 | fail | focused `fstatat/statx` run |
+| `statx06` | 0/2 | fail | focused `fstatat/statx` run |
+| `statx07` | 0/1 | fail | focused `fstatat/statx` run |
+| `statx08` | 0/2 | fail | focused `fstatat/statx` run |
+| `statx09` | 0/1 | fail | focused `fstatat/statx` run |
+| `statx10` | 0/2 | fail | focused `fstatat/statx` run |
+| `statx11` | 0/2 | fail | focused `fstatat/statx` run |
+| `statx12` | 0/2 | fail | focused `fstatat/statx` run |
 | `symlink01` | 0/1 | fail |  |
 | `symlink02` | 1/3 | partial |  |
 | `symlink03` | 0/1 | fail |  |
 | `symlink04` | 1/4 | partial |  |
-| `symlinkat01` | 0/11 | fail |  |
+| `symlinkat01` | 11/11 | pass | focused `*at` run |
 | `truncate02` | 2/2 | pass |  |
 | `truncate02_64` | 2/2 | pass |  |
 | `truncate03` | 0/1 | fail |  |
@@ -261,7 +261,7 @@ VFS batch local tracking. Initial state is `norun` for every case; update score/
 | `unlink07` | 5/6 | partial |  |
 | `unlink08` | 0/1 | fail |  |
 | `unlink09` | 0/1 | fail |  |
-| `unlinkat01` | 2/8 | partial |  |
+| `unlinkat01` | 7/7 | pass | focused `*at` run |
 | `utime01` | 0/2 | fail |  |
 | `utime02` | 0/2 | fail |  |
 | `utime03` | 0/2 | fail |  |
@@ -269,5 +269,5 @@ VFS batch local tracking. Initial state is `norun` for every case; update score/
 | `utime05` | 0/2 | fail |  |
 | `utime06` | 0/1 | fail |  |
 | `utime07` | 0/2 | fail |  |
-| `utimensat01` | 0/2 | fail |  |
+| `utimensat01` | 0/2 | fail | focused `*at` run |
 | `utimes01` | 0/1 | fail |  |

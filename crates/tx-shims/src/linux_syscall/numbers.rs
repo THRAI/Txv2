@@ -125,6 +125,10 @@ pub const NR_RT_SIGACTION: u64 = 134;
 /// `thread_runtime::execution::step_sigprocmask`. Rejects
 /// `sigsetsize != 8`.
 pub const NR_RT_SIGPROCMASK: u64 = 135;
+/// `capget(hdrp, datap)`. Linux generic ABI `__NR_capget = 90`.
+pub const NR_CAPGET: u64 = 90;
+/// `capset(hdrp, datap)`. Linux generic ABI `__NR_capset = 91`.
+pub const NR_CAPSET: u64 = 91;
 /// `fcntl(fd, cmd, arg)`. Linux generic ABI `__NR_fcntl` (= `__NR3264_fcntl`).
 ///
 /// Wave 2 of the ELF loader plan ships a minimal subset:
@@ -246,6 +250,12 @@ pub const NR_DUP3: u64 = 24;
 /// missing file, the syscall arm walks the parent dir and calls
 /// `FsOps::create_inode` before re-running `step_open`.
 pub const NR_OPENAT: u64 = 56;
+/// `name_to_handle_at(dirfd, pathname, handle, mount_id, flags)`.
+/// Linux RV64 generic ABI `__NR_name_to_handle_at = 264`.
+pub const NR_NAME_TO_HANDLE_AT: u64 = 264;
+/// `open_by_handle_at(mount_fd, handle, flags)`.
+/// Linux RV64 generic ABI `__NR_open_by_handle_at = 265`.
+pub const NR_OPEN_BY_HANDLE_AT: u64 = 265;
 /// `close(fd)`. Linux RV64 generic ABI `__NR_close = 57`. Removes
 /// the `OpenFile` cap from the fd table (EBR-deferred reclamation
 /// fires the OpenFile's `Drop`) and clears the cloexec bit. `-EBADF`
@@ -479,6 +489,11 @@ pub const NR_GETRESUID: u64 = 148;
 /// `(u32) -1` sentinel as for `setresuid`. LTP cluster:
 /// `setresgid01..04`.
 pub const NR_SETRESGID: u64 = 149;
+/// `setgroups(size, list)`. Linux RV64 generic ABI `__NR_setgroups = 159`.
+/// Txv2 currently does not model supplementary group membership; the
+/// syscall validates privilege/pointer shape and records success as a
+/// compatibility no-op.
+pub const NR_SETGROUPS: u64 = 159;
 /// `getresgid(rgid_uaddr, egid_uaddr, sgid_uaddr)`. Linux RV64
 /// generic ABI `__NR_getresgid = 150`. Companion of `getresuid`;
 /// writes the three gids to user pointers. Same Wave 2 bootstrap
@@ -523,6 +538,7 @@ pub const NR_FACCESSAT: u64 = 48;
 /// `flags` (`AT_SYMLINK_NOFOLLOW`) is accepted but ignored — the slice
 /// doesn't follow symlinks at chmod time anyway. LTP cluster:
 /// `fchmodat01..02`.
+pub const NR_FCHMOD: u64 = 52;
 pub const NR_FCHMODAT: u64 = 53;
 /// `fchownat(dirfd, path, uid, gid, flags)`. Linux RV64 generic ABI
 /// `__NR_fchownat = 54`. Wraps `FsOps::step_chown` (Wave 3 Part 2).

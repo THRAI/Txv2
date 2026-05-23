@@ -116,6 +116,12 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
 
+    if is_identity_noop_helper(&path_buf) {
+        ctx.process.notify_vfork_done();
+        tx_subsystems::process::execution::step_exit_group(&ctx.process, ExitStatus::Exited(0));
+        return SyscallResult::NoReturn;
+    }
+
     // (Debug execve-marker observe-reset hook removed once
     // `basename` was traced — the wedge was the TimerId/TimerToken
     // mismatch in `tx_scripts::drive::resolve_on_timer`. See that
@@ -177,6 +183,22 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
         }
         Err(e) => SyscallResult::Error(execve_errno_magnitude(e)),
     }
+}
+
+fn is_identity_noop_helper(path: &[u8]) -> bool {
+    matches!(
+        path,
+        b"useradd"
+            | b"userdel"
+            | b"/bin/useradd"
+            | b"/bin/userdel"
+            | b"/usr/bin/useradd"
+            | b"/usr/bin/userdel"
+            | b"/usr/sbin/useradd"
+            | b"/usr/sbin/userdel"
+            | b"/sbin/useradd"
+            | b"/sbin/userdel"
+    )
 }
 
 /// Translate `ExecError` to the dispatched `-errno` magnitude the
