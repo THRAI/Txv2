@@ -176,7 +176,6 @@ impl Errno {
             Errno::ESOCKTNOSUPPORT => 94,
             Errno::ESTALE => 116,
             Errno::ETIMEDOUT => 110,
-            Errno::EINTR => 4,
         }
     }
 }

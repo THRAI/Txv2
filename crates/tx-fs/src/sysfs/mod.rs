@@ -17,8 +17,8 @@ use tx_subsystems::mount::MountPayload;
 use tx_subsystems::net::{EthernetAddress, NetNamespaceLinkInfo, NetNamespacePayload};
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::vfs::{
-    Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, RNode, RNodeBacking,
-    S_IFDIR, S_IFREG,
+    Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, ProjectionKey,
+    ProjectionSchemaId, RNode, RNodeBacking, S_IFDIR, S_IFREG,
 };
 
 pub const SYSFS_ROOT_ID: FsObjectId = FsObjectId::new(0x7379_7300);
@@ -364,7 +364,10 @@ impl FsOps for Sysfs {
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
         let backing = match meta.kind() {
             InodeKind::Directory => RNodeBacking::Directory,
-            InodeKind::Regular => RNodeBacking::Projected,
+            InodeKind::Regular => RNodeBacking::Projected {
+                schema: ProjectionSchemaId::Sysfs,
+                key: ProjectionKey::from_fs_object_id(fs_object_id),
+            },
             _ => return StepOutcome::err(Errno::ENOSYS.into()),
         };
         match RNode::new_cap_in_mount(fs_object_id, meta, backing, mount) {

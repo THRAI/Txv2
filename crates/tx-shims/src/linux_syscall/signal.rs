@@ -614,11 +614,18 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
     // effect even if the target is blocked inside a syscall (for
     // example a server waiting in accept(2)); merely posting the bit
     // and waiting for a later AST checkpoint leaves such daemons alive.
+    let siginfo = Some(SigInfo {
+        si_signo: signum.raw() as u32,
+        si_code: SI_USER,
+        si_pid: ctx.process.pid.0,
+        si_uid: 0,
+    });
     dispatch_errno(
         tx_subsystems::signal::script_deliver_signal(
             &ctx.process,
             SignalTarget::Process(target),
             signum,
+            siginfo,
         ),
         |outcome| match outcome {
             KillOutcome::Delivered => SyscallResult::Return(0),

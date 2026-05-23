@@ -497,6 +497,7 @@ pub enum RNodeBacking {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectionSchemaId {
     Procfs,
+    Sysfs,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
