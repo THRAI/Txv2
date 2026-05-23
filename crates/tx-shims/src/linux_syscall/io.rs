@@ -403,15 +403,13 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             }
         }
 
-        let write_args = [
-            args[0],
-            combined.as_ptr() as u64,
-            combined.len() as u64,
-            0,
-            0,
-            0,
-        ];
-        return sys_write(write_args, ctx).await;
+        let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
+            return SyscallResult::Error(EBADF_VALUE);
+        };
+        if !file.flags().write {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
+        return sys_write_kernel_bytes_to_file(&file, &combined, ctx).await;
     }
 
     let mut total: i64 = 0;
@@ -462,6 +460,54 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         drop(step_engine::guard());
     }
     SyscallResult::Return(total)
+}
+
+async fn sys_write_kernel_bytes_to_file<'a>(
+    file: &Cap<tx_subsystems::vfs::structure::OpenFile>,
+    bytes: &[u8],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    use tx_subsystems::vfs::execution::OpenFileWriteOp;
+
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mode = if file.flags().nonblocking {
+        DriveMode::Nonblocking
+    } else {
+        DriveMode::Waiting
+    };
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = OpenFileWriteOp {
+        file,
+        bytes,
+        cursor: 0,
+    };
+    match drive(
+        op,
+        &mut script_ctx,
+        mode,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(total) => SyscallResult::Return(total as i64),
+        Err(v3errno) => {
+            let errno: tx_subsystems::execution::Errno = v3errno.into();
+            if errno == tx_subsystems::execution::Errno::EPIPE {
+                let _ = tx_subsystems::signal::step_kill_process(
+                    &ctx.process,
+                    tx_subsystems::signal::Signum::SIGPIPE,
+                    None,
+                );
+            }
+            SyscallResult::error_from(errno)
+        }
+    }
 }
 
 /// `readv(fd, iov, iovcnt)` — scatter-read counterpart of `sys_writev`.

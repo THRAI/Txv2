@@ -83,6 +83,8 @@ impl Capability {
     pub const CHOWN: Self = Self(0);
     /// `CAP_DAC_OVERRIDE` — bypass discretionary access control.
     pub const DAC_OVERRIDE: Self = Self(1);
+    /// `CAP_DAC_READ_SEARCH` — bypass read/search permission checks.
+    pub const DAC_READ_SEARCH: Self = Self(2);
     /// `CAP_FOWNER` — bypass file-owner-only checks (chmod, chown,
     /// utimes, etc.) for files the caller does not own. Per Linux's
     /// POSIX cap-FOWNER number (3).
@@ -212,6 +214,32 @@ unsafe impl ZoneAllocated for Cred {
 /// at `setup()`.
 pub fn sign_cred(cred: Cred) -> Result<Cap<Cred>, ZoneError> {
     step_engine::sign(cred)
+}
+
+/// Replace the current process capability masks. This is the syscall-facing
+/// primitive behind `capset(2)`; higher layers validate the Linux header,
+/// pid, and requested mask relationship before publishing.
+pub fn step_set_capability_sets(
+    target: &Cap<ProcessIdentity>,
+    effective_caps: CapabilitySet,
+    permitted_caps: CapabilitySet,
+) -> CredChange {
+    let payload_guard = target.payload.lock();
+    let Some(payload) = payload_guard.as_ref() else {
+        return CredChange::Zombie;
+    };
+    let prev_cap = payload.cred_cap();
+    let mut new = *prev_cap;
+    new.effective_caps = effective_caps;
+    new.permitted_caps = permitted_caps;
+    let Ok(new_cap) = sign_cred(new) else {
+        return CredChange::Zombie;
+    };
+    let _old_cap = payload.replace_cred(new_cap);
+    CredChange::Replaced {
+        prev: *prev_cap,
+        new,
+    }
 }
 
 /// PR-9 phase 5 — D5 §7. Mint a placeholder

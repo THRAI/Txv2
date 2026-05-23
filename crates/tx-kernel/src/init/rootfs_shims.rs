@@ -13,7 +13,9 @@
 // `populate_rootfs_shebang_shims` for the full design rationale.
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
+use tx_subsystems::page_backed::{FsPageBacking, MaterializeAccess, PageIndex};
+use tx_subsystems::vfs::{FsObjectId, FsOps};
 
 impl<P: TxPlatform> CoreInit<P> {
     /// Populate the rootfs tmpfs with the shebang shims the
@@ -72,6 +74,7 @@ impl<P: TxPlatform> CoreInit<P> {
         let _ = symlink_into(fs_ops, bin_id, b"busybox", b"/musl/musl/busybox", &cred);
         let _ = symlink_into(fs_ops, bin_id, b"sh", b"/musl/musl/busybox", &cred);
         let _ = symlink_into(fs_ops, bin_id, b"cat", b"/musl/musl/busybox", &cred);
+        let _ = symlink_into(fs_ops, bin_id, b"true", b"/musl/musl/busybox", &cred);
 
         // /usr and /usr/bin
         let usr_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"usr", 0o755, &cred) {
@@ -166,6 +169,128 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":tmp-dirs:ok\n");
     }
+
+    /// Seed the small identity database and helper commands expected by
+    /// older LTP tests that create a temporary non-root user.
+    pub(crate) fn populate_rootfs_identity_files() {
+        let root_mount = ROOT_MOUNT
+            .lock()
+            .clone()
+            .expect("populate_rootfs_identity_files: ROOT_MOUNT must be populated");
+        let rootfs_payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .clone();
+        let cred = Credential::root();
+        let root_fs_object_id = root_mount.root().fs_object_id();
+        let fs_ops = &rootfs_payload.fs_ops;
+        let fs_page_backing = &rootfs_payload.fs_page_backing;
+
+        let etc_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"etc", 0o755, &cred) {
+            Some(id) => id,
+            None => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":identity-files:err:mkdir-etc\n");
+                return;
+            }
+        };
+        let _ = mkdir_or_find(fs_ops, root_fs_object_id, b"home", 0o755, &cred);
+        let _ = mkdir_or_find(fs_ops, root_fs_object_id, b"root", 0o700, &cred);
+
+        let passwd = b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/bin/sh\nhsym:x:1000:1000:hsym:/home/hsym:/bin/sh\n";
+        let group =
+            b"root:x:0:\ndaemon:x:2:\nusers:x:100:\nnogroup:x:65534:\nnobody:x:65534:\nhsym:x:1000:\n";
+        if !create_file_with_data(
+            fs_ops,
+            fs_page_backing,
+            &rootfs_payload,
+            etc_id,
+            b"passwd",
+            0o666,
+            passwd,
+            &cred,
+        ) || !create_file_with_data(
+            fs_ops,
+            fs_page_backing,
+            &rootfs_payload,
+            etc_id,
+            b"group",
+            0o666,
+            group,
+            &cred,
+        ) {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":identity-files:err:create-etc-files\n");
+            return;
+        }
+        let _ = create_file_with_data(
+            fs_ops,
+            fs_page_backing,
+            &rootfs_payload,
+            etc_id,
+            b"shadow",
+            0o600,
+            b"root:*:0:0:99999:7:::\nnobody:*:0:0:99999:7:::\nhsym:*:0:0:99999:7:::\n",
+            &cred,
+        );
+        let _ = create_file_with_data(
+            fs_ops,
+            fs_page_backing,
+            &rootfs_payload,
+            etc_id,
+            b"gshadow",
+            0o600,
+            b"root:*::\ndaemon:*::\nusers:*::\nnogroup:*::\nnobody:*::\nhsym:*::\n",
+            &cred,
+        );
+
+        let bin_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"bin", 0o755, &cred) {
+            Some(id) => id,
+            None => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":identity-files:err:mkdir-bin\n");
+                return;
+            }
+        };
+        let useradd_script = b"#!/bin/sh\nexit 0\n";
+        let userdel_script = b"#!/bin/sh\nexit 0\n";
+        let _ = create_file_with_data(
+            fs_ops,
+            fs_page_backing,
+            &rootfs_payload,
+            bin_id,
+            b"useradd",
+            0o755,
+            useradd_script,
+            &cred,
+        );
+        let _ = create_file_with_data(
+            fs_ops,
+            fs_page_backing,
+            &rootfs_payload,
+            bin_id,
+            b"userdel",
+            0o755,
+            userdel_script,
+            &cred,
+        );
+        let usr_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"usr", 0o755, &cred) {
+            Some(id) => id,
+            None => root_fs_object_id,
+        };
+        let usr_bin_id = mkdir_or_find(fs_ops, usr_id, b"bin", 0o755, &cred).unwrap_or(usr_id);
+        let usr_sbin_id = mkdir_or_find(fs_ops, usr_id, b"sbin", 0o755, &cred).unwrap_or(usr_id);
+        let sbin_id = mkdir_or_find(fs_ops, root_fs_object_id, b"sbin", 0o755, &cred)
+            .unwrap_or(root_fs_object_id);
+        for parent in [usr_bin_id, usr_sbin_id, sbin_id] {
+            let _ = symlink_into(fs_ops, parent, b"useradd", b"/bin/useradd", &cred);
+            let _ = symlink_into(fs_ops, parent, b"userdel", b"/bin/userdel", &cred);
+        }
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":identity-files:ok\n");
+    }
 }
 
 /// Create-or-find a directory under `parent`. Treats EEXIST as
@@ -216,5 +341,58 @@ fn symlink_into(
     matches!(
         fs_ops.symlink(parent, name, target, cred, &guard),
         StepOutcome::Done(_)
+    )
+}
+
+fn create_file_with_data(
+    fs_ops: &alloc::sync::Arc<dyn FsOps>,
+    fs_page_backing: &alloc::sync::Arc<dyn FsPageBacking>,
+    mount: &Cap<MountPayload>,
+    parent: FsObjectId,
+    name: &[u8],
+    mode: u16,
+    data: &[u8],
+    cred: &Credential,
+) -> bool {
+    let (file_id, file_meta) = {
+        let guard = step_engine::guard();
+        match fs_ops.create_inode(parent, name, mode, cred, &guard) {
+            StepOutcome::Done(out) => out,
+            StepOutcome::Err(step_engine::Errno::EEXIST) => return true,
+            _ => return false,
+        }
+    };
+
+    let pc = {
+        let guard = step_engine::guard();
+        let rnode = match fs_ops.materialise_rnode(file_id, file_meta, mount, &guard) {
+            StepOutcome::Done(rnode) => rnode,
+            _ => return false,
+        };
+        match rnode.backing() {
+            RNodeBacking::PageBacked { pc } => pc.clone(),
+            _ => return false,
+        }
+    };
+
+    for (idx, chunk) in data.chunks(tx_subsystems::vm::USER_PAGE_SIZE).enumerate() {
+        let materialized =
+            match pc.materialize_anon(PageIndex::new(idx as u64), MaterializeAccess::Write) {
+                Ok(page) => page,
+                Err(_) => return false,
+            };
+        let frame_base = match page_allocator::frame_kernel_addr(materialized.ppn) {
+            Ok(addr) => addr,
+            Err(_) => return false,
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(chunk.as_ptr(), frame_base, chunk.len());
+        }
+    }
+
+    let guard = step_engine::guard();
+    matches!(
+        fs_page_backing.truncate(file_id, data.len() as u64, &guard),
+        StepOutcome::Done(())
     )
 }

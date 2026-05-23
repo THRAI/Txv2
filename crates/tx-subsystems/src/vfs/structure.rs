@@ -1096,7 +1096,9 @@ impl OpenFile {
         dentry: Cap<DEntry>,
     ) -> Result<Cap<Self>, ZoneError> {
         let mut file = Self::new(rnode, flags);
-        file.opendir_dentry = Some(dentry);
+        if matches!(file.rnode().backing(), RNodeBacking::Directory) {
+            file.opendir_dentry = Some(dentry);
+        }
         step_engine::sign(file)
     }
 

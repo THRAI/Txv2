@@ -36,8 +36,8 @@ use tx_subsystems::page_backed::{
 };
 use tx_subsystems::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, MountOutput,
-    RNode, RNodeBacking, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
-    VFS_NAME_MAX,
+    RNode, RNodeBacking, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
+    S_ISGID, S_ISUID, VFS_NAME_MAX,
 };
 
 /// Mode for the tmpfs root directory.
@@ -62,6 +62,7 @@ const TMPFS_FIRST_FREE_OBJECT_ID: u64 = 3;
 // on demand so tmpfs files are bounded only by global swap pressure
 // rather than by this static cap.
 const TMPFS_FILE_PAGE_CAP: u64 = 1024;
+const TMPFS_MAX_HARD_LINKS: u32 = 1024;
 
 /// Maximum length of an inline symlink target, in bytes.
 ///
@@ -310,14 +311,16 @@ impl FsOps for Tmpfs {
             Err(err) => return StepOutcome::err(err.into()),
         };
         // Directories arrive through `mkdir`, symlinks through
-        // `symlink`. Regular files and named FIFOs both get a simple
-        // page-backed payload; FIFO endpoint semantics are handled by
-        // anonymous `pipe2` today and can grow here when a named-pipe
-        // test needs blocking open/read/write behavior.
+        // `symlink`. Other mknod-created leaf nodes get a simple
+        // page-backed placeholder payload; their visible type is
+        // carried by `InodeMeta::mode`.
         let kind_bits = mode & S_IFMT;
         let (kind, type_bits) = match kind_bits {
             0 | S_IFREG => (InodeKind::Regular, S_IFREG),
             S_IFIFO => (InodeKind::Fifo, S_IFIFO),
+            S_IFCHR => (InodeKind::CharDevice, S_IFCHR),
+            S_IFBLK => (InodeKind::BlockDevice, S_IFBLK),
+            S_IFSOCK => (InodeKind::Socket, S_IFSOCK),
             _ => return StepOutcome::err(step_engine::Errno::EINVAL),
         };
         let mode = (mode & !S_IFMT) | type_bits;
@@ -434,12 +437,6 @@ impl FsOps for Tmpfs {
         new_name: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        // TODO(phase-vfs-rename-xdir): cross-directory rename. Day-1
-        // ships same-directory rename; cross-directory needs the
-        // walker + dentry rebinding seam to land first.
-        if old_parent != new_parent {
-            return StepOutcome::err(step_engine::Errno::ENOSYS);
-        }
         let old_key = match InlineName::new(old_name) {
             Ok(n) => n,
             Err(err) => return StepOutcome::err(err.into()),
@@ -453,19 +450,65 @@ impl FsOps for Tmpfs {
         }
 
         let mut state = self.state.lock();
-        let Some(parent_inode) = state.inodes.get_mut(&old_parent) else {
+        let target_id = {
+            let Some(parent_inode) = state.inodes.get(&old_parent) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let TmpfsPayload::Directory(children) = &parent_inode.payload else {
+                return StepOutcome::err(step_engine::Errno::ENOTDIR);
+            };
+            let Some(target_id) = children.get(&old_key).copied() else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            target_id
+        };
+        let Some(target_inode) = state.inodes.get(&target_id) else {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         };
-        let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
+        let target_is_dir = matches!(target_inode.payload, TmpfsPayload::Directory(_));
+        let displaced = {
+            let Some(new_parent_inode) = state.inodes.get(&new_parent) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let TmpfsPayload::Directory(children) = &new_parent_inode.payload else {
+                return StepOutcome::err(step_engine::Errno::ENOTDIR);
+            };
+            children.get(&new_key).copied()
+        };
+        if let Some(displaced_id) = displaced {
+            let Some(displaced_inode) = state.inodes.get(&displaced_id) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let displaced_is_dir = matches!(displaced_inode.payload, TmpfsPayload::Directory(_));
+            if target_is_dir != displaced_is_dir {
+                return StepOutcome::err(if target_is_dir {
+                    step_engine::Errno::ENOTDIR
+                } else {
+                    step_engine::Errno::EISDIR
+                });
+            }
+            if let TmpfsPayload::Directory(children) = &displaced_inode.payload {
+                if !children.is_empty() {
+                    return StepOutcome::err(step_engine::Errno::ENOTEMPTY);
+                }
+            }
+        }
+
+        let Some(old_parent_inode) = state.inodes.get_mut(&old_parent) else {
+            return StepOutcome::err(step_engine::Errno::ENOENT);
+        };
+        let TmpfsPayload::Directory(old_children) = &mut old_parent_inode.payload else {
             return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
-        let Some(target_id) = children.remove(&old_key) else {
+        old_children.remove(&old_key);
+
+        let Some(new_parent_inode) = state.inodes.get_mut(&new_parent) else {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         };
-        // If a file exists at the destination, replace it (POSIX
-        // rename semantics for same-type-collision; cross-type
-        // collision is left as a follow-up alongside cross-dir).
-        let displaced = children.insert(new_key, target_id);
+        let TmpfsPayload::Directory(new_children) = &mut new_parent_inode.payload else {
+            return StepOutcome::err(step_engine::Errno::ENOTDIR);
+        };
+        let displaced = new_children.insert(new_key, target_id);
         if let Some(displaced_id) = displaced {
             state.inodes.remove(&displaced_id);
         }
@@ -499,11 +542,16 @@ impl FsOps for Tmpfs {
             }
         }
         // Phase 2: mutable ops — validate target, insert link.
-        let _target_inode = match state.inodes.get_mut(&target) {
+        let target_inode = match state.inodes.get_mut(&target) {
             Some(i) if matches!(i.payload, TmpfsPayload::RegularFile { .. }) => i,
             Some(_) => return StepOutcome::err(step_engine::Errno::EPERM),
             None => return StepOutcome::err(step_engine::Errno::ENOENT),
         };
+        if target_inode.nlink >= TMPFS_MAX_HARD_LINKS {
+            return StepOutcome::err(step_engine::Errno::EMLINK);
+        }
+        target_inode.nlink = target_inode.nlink.saturating_add(1);
+        target_inode.meta.nlinks = target_inode.nlink;
         let parent_inode = match state.inodes.get_mut(&parent) {
             Some(i) => i,
             None => return StepOutcome::err(step_engine::Errno::ENOTDIR),

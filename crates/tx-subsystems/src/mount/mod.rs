@@ -541,6 +541,19 @@ pub fn mount_for(
     None
 }
 
+/// Look up a registered mount whose root RNode is represented by
+/// `root_dentry`. This covers syscall paths that have already walked
+/// across the mount point and therefore hold the mounted filesystem's
+/// root dentry rather than the parent-side mountpoint dentry.
+pub fn mount_for_root_dentry(root_dentry: &Cap<DEntry>) -> Option<Cap<MountIdentity>> {
+    let root_rnode_addr = cap_raw_addr(root_dentry.rnode());
+    let table = MOUNT_TABLE.lock();
+    table
+        .iter()
+        .find(|entry| cap_raw_addr(entry.mount.root()) == root_rnode_addr)
+        .map(|entry| entry.mount.clone_cap())
+}
+
 // ============================================================================
 // Mount table snapshot (for /proc/mounts)
 // ============================================================================

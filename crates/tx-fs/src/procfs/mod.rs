@@ -33,6 +33,8 @@ pub const PROCFS_CONFIG_ID: FsObjectId = FsObjectId::new(0x7072_6F09);
 pub const PROCFS_SYS_FS_ID: FsObjectId = FsObjectId::new(0x7072_6F0a);
 pub const PROCFS_SYS_FS_PIPE_MAX_SIZE_ID: FsObjectId = FsObjectId::new(0x7072_6F0b);
 pub const PROCFS_SYS_FS_LEASE_BREAK_TIME_ID: FsObjectId = FsObjectId::new(0x7072_6F0c);
+pub const PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F0d);
+pub const PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F0e);
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 const PROCFS_PID_OBJECT_STRIDE: u64 = 0x100;
 const PROCFS_PID_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x10000;
@@ -256,6 +258,12 @@ impl FsOps for Procfs {
             if name == b"lease-break-time" {
                 return StepOutcome::done(PROCFS_SYS_FS_LEASE_BREAK_TIME_ID);
             }
+            if name == b"protected_hardlinks" {
+                return StepOutcome::done(PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID);
+            }
+            if name == b"protected_symlinks" {
+                return StepOutcome::done(PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID);
+            }
             return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYS_KERNEL_ID {
@@ -335,7 +343,10 @@ impl FsOps for Procfs {
             | PROCFS_SYS_KERNEL_TAINTED_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
-            PROCFS_SYS_FS_PIPE_MAX_SIZE_ID | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID => {
+            PROCFS_SYS_FS_PIPE_MAX_SIZE_ID
+            | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID
+            | PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID
+            | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, S_IFREG | 0o644))
             }
             id if pid_from_dir(id).is_some() => {
@@ -483,6 +494,16 @@ impl FsOps for Procfs {
                 (
                     b"lease-break-time",
                     PROCFS_SYS_FS_LEASE_BREAK_TIME_ID,
+                    InodeKind::Regular,
+                ),
+                (
+                    b"protected_hardlinks",
+                    PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID,
+                    InodeKind::Regular,
+                ),
+                (
+                    b"protected_symlinks",
+                    PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID,
                     InodeKind::Regular,
                 ),
             ];
@@ -734,9 +755,10 @@ impl FsOps for Procfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
         match fs_object_id {
-            PROCFS_SYS_FS_PIPE_MAX_SIZE_ID | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID => {
-                StepOutcome::done(bytes.len() as u64)
-            }
+            PROCFS_SYS_FS_PIPE_MAX_SIZE_ID
+            | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID
+            | PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID
+            | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID => StepOutcome::done(bytes.len() as u64),
             _ => StepOutcome::err(Errno::EROFS.into()),
         }
     }
