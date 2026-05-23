@@ -1236,6 +1236,17 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
 /// `read(2)` path, then restores the original offset so callers do
 /// not observe a positioned read as a seek.
 fn positioned_io_check(file: &OpenFile, write: bool) -> Result<(), i32> {
+    if matches!(
+        file.rnode().backing(),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::Pipe { .. },
+        } | RNodeBacking::StructBacked {
+            payload: StructPayload::Tty(_),
+        }
+    ) {
+        return Err(ESPIPE_VALUE);
+    }
+
     let flags = file.flags();
     if write {
         if !flags.write {
@@ -1245,15 +1256,7 @@ fn positioned_io_check(file: &OpenFile, write: bool) -> Result<(), i32> {
         return Err(EBADF_VALUE);
     }
 
-    match file.rnode().backing() {
-        RNodeBacking::StructBacked {
-            payload: StructPayload::Pipe { .. },
-        }
-        | RNodeBacking::StructBacked {
-            payload: StructPayload::Tty(_),
-        } => Err(ESPIPE_VALUE),
-        _ => Ok(()),
-    }
+    Ok(())
 }
 
 fn read_iovec_entry(ctx: &SyscallCtx<'_>, iov_ptr: u64, idx: u64) -> Result<(u64, u64), Errno> {
@@ -1445,6 +1448,59 @@ pub(super) async fn sys_pwritev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         }
     }
     SyscallResult::Return(total)
+}
+
+fn preadv2_offset(args: [u64; 6]) -> Result<Option<u64>, i32> {
+    let lo = args[3] as i64;
+    let hi = args[4];
+    if lo == -1 {
+        return Ok(None);
+    }
+    if lo < 0 || hi != 0 {
+        return Err(EINVAL_VALUE);
+    }
+    Ok(Some(args[3]))
+}
+
+/// `preadv2(fd, iov, iovcnt, offset_lo, offset_hi, flags)`.
+pub(super) async fn sys_preadv2<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let flags = args[5] as i32;
+    if flags != 0 {
+        return SyscallResult::Error(EOPNOTSUPP_VALUE);
+    }
+    match preadv2_offset(args) {
+        Ok(Some(offset)) => {
+            let preadv_args = [args[0], args[1], args[2], offset, 0, 0];
+            sys_preadv::<P>(preadv_args, ctx).await
+        }
+        Ok(None) => {
+            let readv_args = [args[0], args[1], args[2], 0, 0, 0];
+            sys_readv::<P>(readv_args, ctx).await
+        }
+        Err(errno) => SyscallResult::Error(errno),
+    }
+}
+
+/// `pwritev2(fd, iov, iovcnt, offset_lo, offset_hi, flags)`.
+pub(super) async fn sys_pwritev2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let flags = args[5] as i32;
+    if flags != 0 {
+        return SyscallResult::Error(EOPNOTSUPP_VALUE);
+    }
+    match preadv2_offset(args) {
+        Ok(Some(offset)) => {
+            let pwritev_args = [args[0], args[1], args[2], offset, 0, 0];
+            sys_pwritev(pwritev_args, ctx).await
+        }
+        Ok(None) => {
+            let writev_args = [args[0], args[1], args[2], 0, 0, 0];
+            sys_writev(writev_args, ctx).await
+        }
+        Err(errno) => SyscallResult::Error(errno),
+    }
 }
 
 /// `fadvise64(fd, offset, len, advice)`.
