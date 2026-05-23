@@ -270,7 +270,7 @@ fn futex_wake_return_reenters_userspace_without_mailbox_event() {
 
     let future = run_thread::<TestPlatform>(leader, payload.clone());
     let wrapped = PerHartSlotted::<TestPlatform, _>::new(payload.clone(), future);
-    let reactor = tx_reactor::Reactor::new();
+    let reactor = crate::adapter::boot_runtime::Reactor::new();
     let _task = reactor.submit_task(wrapped);
 
     let first = reactor.run_until_idle();
@@ -418,7 +418,7 @@ fn per_hart_slotted_binds_current_task_mailbox() {
     };
 
     let wrapped = PerHartSlotted::<TestPlatform, _>::new(payload.clone(), inner);
-    let reactor = tx_reactor::Reactor::new();
+    let reactor = crate::adapter::boot_runtime::Reactor::new();
     let _task = reactor.submit_task(wrapped);
     let result = reactor.run_until_idle();
 

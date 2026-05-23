@@ -194,7 +194,7 @@ fn read_mq_name(ctx: &SyscallCtx<'_>, name_ptr: u64) -> Result<Vec<u8>, SyscallR
         Ok(name) => name,
         Err(_) => return Err(SyscallResult::Error(ENAMETOOLONG_VALUE)),
     };
-    if name.is_empty() || name.iter().any(|&b| b == b'/') {
+    if name.is_empty() || name.contains(&b'/') {
         return Err(SyscallResult::Error(ENOENT_VALUE));
     }
     Ok(name)
@@ -282,7 +282,7 @@ pub(super) fn sys_shmget(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
 
 pub(super) async fn sys_shmat(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let cred = ctx.cred_cap();
-    match ipc::sysv_shm::execution::step_shmat(
+    match ipc::sysv_shm::execution::script_shmat(
         args[0] as u32,
         args[1] as usize,
         args[2] as i32,
@@ -297,7 +297,7 @@ pub(super) async fn sys_shmat(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
 }
 
 pub(super) async fn sys_shmdt(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    match ipc::sysv_shm::execution::step_shmdt(args[0] as usize, &ctx.aspace).await {
+    match ipc::sysv_shm::execution::script_shmdt(args[0] as usize, &ctx.aspace).await {
         Ok(()) => SyscallResult::Return(0i64),
         Err(e) => SyscallResult::Error(errno_to_i32(e)),
     }
@@ -524,8 +524,7 @@ pub(super) fn sys_semop(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
         Some(len) => len,
         None => return SyscallResult::Error(EINVAL_VALUE),
     };
-    let mut bytes = Vec::new();
-    bytes.resize(byte_len, 0);
+    let mut bytes = alloc::vec![0; byte_len];
     if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, sops_ptr) {
         return SyscallResult::Error(errno_to_i32(errno));
     }
@@ -683,8 +682,7 @@ pub(super) fn sys_msgsnd(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
         Ok(v) => v,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
-    let mut mtext = Vec::new();
-    mtext.resize(msgsz, 0);
+    let mut mtext = alloc::vec![0; msgsz];
     if msgsz > 0 {
         let text_ptr = match msgp.checked_add(core::mem::size_of::<i64>() as u64) {
             Some(ptr) => ptr,
@@ -816,8 +814,7 @@ pub(super) async fn sys_mq_timedsend(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Sy
     if msg_len > mq.msgsize() as usize {
         return SyscallResult::Error(EMSGSIZE_VALUE);
     }
-    let mut msg = Vec::new();
-    msg.resize(msg_len, 0);
+    let mut msg = alloc::vec![0; msg_len];
     if msg_len > 0 {
         if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut msg, msg_ptr) {
             return SyscallResult::Error(errno_to_i32(errno));

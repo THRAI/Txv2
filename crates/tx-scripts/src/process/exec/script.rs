@@ -54,9 +54,6 @@ use tx_subsystems::process::{
     ProcessIdentity,
 };
 use tx_subsystems::thread_runtime::ThreadIdentity;
-use tx_subsystems::vfs::structure::{
-    Credential, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking,
-};
 use tx_subsystems::vfs::walker::step_open;
 use tx_subsystems::vm::scripts::{
     self as vm_scripts, BssTail as VmBssTail, ImagePlan as VmImagePlan,
@@ -70,6 +67,9 @@ use super::loader::{
 };
 use super::stack::{build_initial_user_stack, AuxvFacts};
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+use crate::adapter::vfs_exec::{
+    Credential, DEntry, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking,
+};
 
 /// User page size — RV64 today; mirrors `vm::USER_PAGE_SIZE` so the
 /// brk-base round-up doesn't require pulling in another import.
@@ -79,19 +79,14 @@ const INTERP_BASE: u64 = 0x3E_0000_0000;
 
 // ASLR functions moved inline to exec_script_inner
 
-fn namespace_root_for_dentry(
-    mut cursor: Cap<tx_subsystems::vfs::structure::DEntry>,
-) -> Cap<tx_subsystems::vfs::structure::DEntry> {
+fn namespace_root_for_dentry(mut cursor: Cap<DEntry>) -> Cap<DEntry> {
     while let Some(parent) = cursor.parent_hint() {
         cursor = parent;
     }
     cursor
 }
 
-fn exec_root_for_path(
-    cwd: &Cap<tx_subsystems::vfs::structure::DEntry>,
-    path: &[u8],
-) -> Cap<tx_subsystems::vfs::structure::DEntry> {
+fn exec_root_for_path(cwd: &Cap<DEntry>, path: &[u8]) -> Cap<DEntry> {
     if path.starts_with(b"/") {
         namespace_root_for_dentry(cwd.clone())
     } else {

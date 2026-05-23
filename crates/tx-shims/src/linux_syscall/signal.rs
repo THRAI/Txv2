@@ -662,15 +662,17 @@ pub(super) fn sys_tkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             si_pid: ctx.process.pid.0,
             si_uid: 0,
         });
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = ThreadKillOp {
-            thread: thread_cap,
-            sig: signum,
-            info: siginfo,
-        };
-        return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-            Ok(()) => SyscallResult::Return(0),
-            Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        return match tx_subsystems::signal::script_deliver_signal(
+            &ctx.process,
+            SignalTarget::Thread(thread_cap),
+            signum,
+            siginfo,
+        ) {
+            Ok(tx_subsystems::signal::KillOutcome::Delivered) => SyscallResult::Return(0),
+            Ok(tx_subsystems::signal::KillOutcome::NoLiveThread) => {
+                SyscallResult::Error(ESRCH_VALUE)
+            }
+            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
         };
     }
 

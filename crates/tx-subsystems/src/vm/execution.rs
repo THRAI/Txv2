@@ -832,12 +832,7 @@ fn remap_teardown_ranges(
     placement: VmRemapPlacement,
 ) -> Result<Vec<UserRange>, VmMapError> {
     match placement {
-        VmRemapPlacement::Move => {
-            let mut ranges = Vec::with_capacity(2);
-            ranges.push(old_range);
-            ranges.push(new_range);
-            Ok(ranges)
-        }
+        VmRemapPlacement::Move => Ok(alloc::vec![old_range, new_range]),
         VmRemapPlacement::InPlace if new_range.len() < old_range.len() => {
             let start = old_range
                 .start()
@@ -846,11 +841,7 @@ fn remap_teardown_ranges(
                 .ok_or(VmMapError::InvalidRange)?;
             let len = old_range.len() - new_range.len();
             UserRange::new_aligned(UserVirtAddr(start), len)
-                .map(|range| {
-                    let mut ranges = Vec::with_capacity(1);
-                    ranges.push(range);
-                    ranges
-                })
+                .map(|range| alloc::vec![range])
                 .map_err(|_| VmMapError::InvalidRange)
         }
         VmRemapPlacement::InPlace => Ok(Vec::new()),

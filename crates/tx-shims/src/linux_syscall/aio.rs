@@ -11,7 +11,7 @@
 //! # What lands here
 //!
 //! 1. [`sys_io_setup`] — the syscall dispatcher for `__NR_io_setup =
-//!    206`. Allocates a fresh [`AioContext`] cap (W-Z phase 1 zone),
+//!    0`. Allocates a fresh [`AioContext`] cap (W-Z phase 1 zone),
 //!    wraps it in an `OpenFile` whose backing is
 //!    `OpenFileBacking::AioContext`, installs at the lowest free fd
 //!    via [`tx_subsystems::process::ProcessIdentity::install_fd`], and

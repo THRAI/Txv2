@@ -483,6 +483,13 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
+    // eventfd fds carry their own `write(2)` arm — add a 64-bit
+    // value to the counter. Dispatch before any VFS-shaped rnode()
+    // access because eventfd is a non-VFS OpenFile backing.
+    if file.eventfd().is_some() {
+        return super::eventfd::sys_eventfd_write(&file, args[1], len, ctx).await;
+    }
+
     let len = if matches!(
         file.rnode().backing(),
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
@@ -491,12 +498,6 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     } else {
         core::cmp::min(len, TTY_WRITE_MAX_INLINE)
     };
-
-    // eventfd fds carry their own `write(2)` arm — add a 64-bit
-    // value to the counter. Dispatch before the generic VFS path.
-    if file.eventfd().is_some() {
-        return super::eventfd::sys_eventfd_write(&file, args[1], len, ctx).await;
-    }
 
     // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).
     // Prefault the user buffer in the observe phase, then drive the
@@ -684,24 +685,11 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
-    let len = if matches!(
-        file.rnode().backing(),
-        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
-    ) {
-        len
-    } else {
-        core::cmp::min(len, TTY_WRITE_MAX_INLINE)
-    };
-
-    if len == 0 {
-        return SyscallResult::Return(0);
-    }
-
     // PR-10 phase 5: userfaultfd fds carry their own `read(2)` arm
     // (drain a fault message off the pending queue, serialize 32-byte
     // `struct uffd_msg`). The VFS-shaped `OpenFile::step_read` returns
-    // EINVAL for ufd backings, so dispatch here before the generic
-    // path.
+    // EINVAL for ufd backings, so dispatch here before any VFS-shaped
+    // rnode() access.
     if file.ufd().is_some() {
         return super::userfaultfd::sys_ufd_read(&file, args[1], len, ctx).await;
     }
@@ -722,6 +710,19 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     // expiration count as an 8-byte u64.
     if file.timerfd().is_some() {
         return super::timerfd::sys_timerfd_read::<P>(&file, args[1], len, ctx).await;
+    }
+
+    let len = if matches!(
+        file.rnode().backing(),
+        tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
+    ) {
+        len
+    } else {
+        core::cmp::min(len, TTY_WRITE_MAX_INLINE)
+    };
+
+    if len == 0 {
+        return SyscallResult::Return(0);
     }
 
     // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).

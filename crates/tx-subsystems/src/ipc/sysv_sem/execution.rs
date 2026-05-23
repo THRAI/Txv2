@@ -49,6 +49,11 @@ pub fn step_semget(
     cred: &Cap<Cred>,
     nsproxy: &Cap<crate::process::nsproxy::NsProxy>,
 ) -> Result<u32, Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let ipc_key = if key == IPC_PRIVATE {
         None
     } else {
@@ -107,6 +112,11 @@ pub fn step_semop(
     cred: &Cap<Cred>,
     process: &Cap<ProcessIdentity>,
 ) -> Result<usize, Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     if sops.is_empty() {
         return Err(Errno::EINVAL);
     }
@@ -204,6 +214,11 @@ pub fn step_semctl(
     cred: &Cap<Cred>,
     process: Option<&Cap<ProcessIdentity>>,
 ) -> Result<SemCtlResult, Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     match cmd {
         IPC_RMID => {
             let array = checks::require_sem_exists(semid)?;
@@ -342,6 +357,11 @@ pub fn step_semctl_in_ns(
     nsproxy: &Cap<crate::process::nsproxy::NsProxy>,
     process: Option<&Cap<ProcessIdentity>>,
 ) -> Result<SemCtlResult, Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let key = if cmd == IPC_RMID {
         Some(checks::require_sem_exists(semid)?.key)
     } else {
@@ -364,6 +384,11 @@ pub fn step_semctl_in_ns(
 /// Walk all SEM_UNDO entries for `process` and reverse the adjustments.
 /// Called from `step_process_exit` before the process payload is torn down.
 pub fn step_sem_undo(process: &Cap<ProcessIdentity>) {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let Some(proc_payload) = process.payload_slot().lock().as_ref().cloned() else {
         return;
     };

@@ -1140,6 +1140,11 @@ pub fn step_sigaction(
     sig: Signum,
     disposition: SigDisposition,
 ) -> SigDispositionChange {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     step_sigaction_entry(process, sig, SigActionEntry::from(disposition))
 }
 

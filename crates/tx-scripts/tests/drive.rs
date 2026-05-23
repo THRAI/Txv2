@@ -27,12 +27,12 @@ use tx_hal::{
 use tx_scripts::adapter::step_engine::{
     AgentCancelPolicy, Cap, Deadline, DelegateEndpoint, DelegateRequest, DelegateToken, DriveMode,
     Errno, InterestMask, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
-    SubjectIdentity, WaitSourceId, YieldShape,
+    SubjectAuthority, SubjectContext, SubjectIdentity, WaitSourceId, YieldShape,
 };
-use tx_substrate::step::{SubjectAuthority, SubjectContext};
-use tx_substrate::wake::mailbox::{MailboxEvent, SignalRouting, TaskMailbox, WaitGeneration};
-use tx_substrate::wake::timer::TimerWheel;
-use tx_substrate::wake::wait_source::{register_source, unregister_source, WaitSource};
+use tx_scripts::adapter::wake::{
+    register_source, unregister_source, MailboxEvent, SignalRouting, TaskMailbox, TimerWheel,
+    WaitGeneration, WaitSource,
+};
 use tx_subsystems::cred::placeholder_restrictions_cap;
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
@@ -432,32 +432,47 @@ fn drive_selecting_on_agent_returns_enosys() {
 }
 
 // ---------------------------------------------------------------------------
-// Bonus: Waiting + OnWaitSource → Resolve → parks then retries
+// Bonus: Waiting + OnWaitSource → Resolve → parks, wakes, then retries
 // ---------------------------------------------------------------------------
 
 #[test]
-fn drive_waiting_on_wait_source_unregistered_token_retries() {
-    // When the wait source id is not registered (test placeholder),
-    // wait_on_token returns None and drive retries immediately.
-    // The op yields, drive skips the await, applies ResumeOutcome::Retry,
-    // loops, and step() returns Done.
+fn drive_waiting_on_wait_source_wake_retries() {
+    let mailbox = Arc::new(TaskMailbox::new());
+    let source_id = WaitSourceId::new(7);
+    let interests = InterestMask::new(0xff);
+    let ws = Arc::new(WaitSource::new(source_id));
+    register_source(Arc::clone(&ws));
+
     let op = MockStepOp::new([
         StepOutcome::Yield {
             progress: NoProgress,
-            shape: on_wait_source_shape(7, 0xff),
+            shape: YieldShape::OnWaitSource {
+                source: source_id,
+                interests,
+            },
         },
         StepOutcome::Done(42),
     ]);
-    let mut ctx = empty_ctx();
-    let result = block_on(tx_scripts::drive(
-        op,
-        &mut ctx,
-        DriveMode::Waiting,
-        None,
-        None,
-        None,
-    ));
-    assert_eq!(result, Ok(42));
+
+    let mut ctx = ScriptCtx::new().with_mailbox(Arc::clone(&mailbox));
+    let fut = tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, Some(&mailbox), None, None);
+    let waker = std::task::Waker::noop().clone();
+    let mut task_ctx = std::task::Context::from_waker(&waker);
+    let mut pinned = Box::pin(fut);
+    assert!(
+        matches!(
+            pinned.as_mut().poll(&mut task_ctx),
+            std::task::Poll::Pending
+        ),
+        "first poll should park on the registered wait source"
+    );
+
+    assert_eq!(ws.notify(interests), 1);
+    assert_eq!(
+        pinned.as_mut().poll(&mut task_ctx),
+        std::task::Poll::Ready(Ok(42))
+    );
+    unregister_source(source_id);
 }
 
 // ---------------------------------------------------------------------------

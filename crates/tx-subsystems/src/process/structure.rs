@@ -9,22 +9,6 @@
 //! absent here so day-1 code does not have to compile against placeholder
 //! types.
 //!
-//! Ownership graph:
-//!
-//! ```text
-//! ProcessIdentity ──Cap──▶ ProcessGroup ──Cap──▶ Session
-//!     │  ▲                       │ ▲                  │ ▲
-//!     │  └──Weak (members)───────┘ └──Weak (members)──┘ │
-//!     │                                                  │
-//!     └──PayloadCap──▶ ProcessPayload                    │
-//!                          │  ▲                          │
-//!                          │  └──Weak (owner_proc)───────┘  (from ThreadIdentity)
-//!                          │
-//!                          └──Cap──▶ ThreadIdentity ──PayloadCap──▶ ThreadPayload
-//!                                          │
-//!                                          └──Weak──▶ ProcessIdentity
-//! ```
-
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -1771,22 +1755,21 @@ unsafe impl ZoneAllocated for ProcessPayload {
 }
 
 pub(crate) fn incr_pipe_fd_ref(file: &Cap<OpenFile>) {
-    let Some((payload, side)) = file.pipe_endpoint() else {
-        return;
-    };
-    match side {
-        crate::pipe::PipeSide::Reader => payload.incr_reader(),
-        crate::pipe::PipeSide::Writer => payload.incr_writer(),
-    }
+    adjust_pipe_fd_ref(file, true);
 }
 
 fn decr_pipe_fd_ref(file: &Cap<OpenFile>) {
-    let Some((payload, side)) = file.pipe_endpoint() else {
-        return;
-    };
-    match side {
-        crate::pipe::PipeSide::Reader => payload.decr_reader(),
-        crate::pipe::PipeSide::Writer => payload.decr_writer(),
+    adjust_pipe_fd_ref(file, false);
+}
+
+fn adjust_pipe_fd_ref(file: &Cap<OpenFile>, increment: bool) {
+    if let Some((payload, side)) = file.pipe_endpoint() {
+        match (side, increment) {
+            (crate::pipe::PipeSide::Reader, true) => payload.incr_reader(),
+            (crate::pipe::PipeSide::Writer, true) => payload.incr_writer(),
+            (crate::pipe::PipeSide::Reader, false) => payload.decr_reader(),
+            (crate::pipe::PipeSide::Writer, false) => payload.decr_writer(),
+        }
     }
 }
 
@@ -1809,22 +1792,4 @@ unsafe impl ZoneAllocated for Session {
 pub use crate::process::numbers::reset_pid_counter_for_test;
 
 #[cfg(test)]
-mod subject_identity_tests {
-    use super::ProcessIdentity;
-    use crate::process::adapter::step_engine::{RestrictionStackHandle, SubjectIdentity};
-
-    /// Compile-only smoke: associated types must resolve so generic
-    /// bodies `fn step<I: SubjectIdentity>(...)` can name them.
-    #[test]
-    fn process_identity_implements_subject_identity_with_expected_associated_types() {
-        fn assert_credential<I: SubjectIdentity<Credential = crate::cred::Cred>>() {}
-        fn assert_restrictions<I: SubjectIdentity<Restrictions = RestrictionStackHandle>>() {}
-        fn assert_thread<
-            I: SubjectIdentity<ThreadIdentity = crate::thread_runtime::ThreadIdentity>,
-        >() {
-        }
-        assert_credential::<ProcessIdentity>();
-        assert_restrictions::<ProcessIdentity>();
-        assert_thread::<ProcessIdentity>();
-    }
-}
+mod subject_identity_tests;

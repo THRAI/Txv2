@@ -20,7 +20,7 @@ use super::state::{
     FinalSymlinkPolicy, KernelStep, PathResolution, ResumeToken, WalkCause, WalkMode, WalkState,
     WalkingState,
 };
-use super::step::kernel_step;
+use super::step::{kernel_step, TerminalRules};
 
 /// Drive a walk from start to terminal, synchronously.
 ///
@@ -124,14 +124,14 @@ pub fn walk_to_completion_with_mount_namespace(
             .or_else(|| walker::mount_payload_for(&walking.mount_root, guard));
 
         let walking_state = walking.clone();
+        let rules = TerminalRules::new(mode, policy);
         match kernel_step(
             walking,
             fs_ops,
             mount_payload,
             mount_namespace,
             cred,
-            mode,
-            policy,
+            rules,
             guard,
         ) {
             KernelStep::Continue(next) => state = next,
@@ -227,7 +227,8 @@ pub fn resume_walker(
         let mp = walker::mount_payload_for(&w.current, guard)
             .or_else(|| walker::mount_payload_for(&w.mount_root, guard));
 
-        match kernel_step(w, fs_ops, mp, None, cred, mode, policy, guard) {
+        let rules = TerminalRules::new(mode, policy);
+        match kernel_step(w, fs_ops, mp, None, cred, rules, guard) {
             KernelStep::Continue(next) => state = next,
             KernelStep::Error(cause) => return Err(classify(&cause)),
             KernelStep::NeedIO(_req, _token) => return Err(Errno::EAGAIN),

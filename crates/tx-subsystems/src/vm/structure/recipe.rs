@@ -469,8 +469,8 @@ fn rewrite_remap_disjoint(
         moved.push(entry_with_range(&last, expanded_range)?);
     }
 
-    for existing in entries.values().cloned() {
-        for entry in remove_remap_covered_ranges(&existing, old_range, new_range)? {
+    for existing in entries.values() {
+        for entry in remove_remap_covered_ranges(existing, old_range, new_range)? {
             push_entry(&mut rewritten, entry);
         }
     }

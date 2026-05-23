@@ -215,7 +215,7 @@ impl<P: TxPlatform, F: Future> Future for PerHartSlotted<P, F> {
         let hart = <P as PercpuIf>::current_cpu_id().0;
 
         let _prev = set_current_thread_payload(hart, this.payload.clone());
-        if let Some(mailbox) = tx_reactor::current_task_mailbox(hart) {
+        if let Some(mailbox) = crate::adapter::boot_runtime::current_task_mailbox(hart) {
             this.payload.bind_mailbox(Arc::downgrade(&mailbox));
         }
 
@@ -578,7 +578,7 @@ pub async fn run_thread<P: TxPlatform>(
         // ----------------------------------------------------------------
         match trap {
             UserspaceTrapInfo::TimerPreempt => {
-                tx_reactor::yield_now().await;
+                crate::adapter::boot_runtime::yield_now().await;
             }
             UserspaceTrapInfo::Syscall(req) => {
                 // Resolve the syscall context from the payload.
@@ -598,17 +598,17 @@ pub async fn run_thread<P: TxPlatform>(
                 // drive-taskmb: inject the current task's mailbox so
                 // drive() can park on it for yield resolution.
                 let hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
-                if let Some(mailbox) = tx_reactor::current_task_mailbox(hart) {
+                if let Some(mailbox) = crate::adapter::boot_runtime::current_task_mailbox(hart) {
                     ctx = ctx.with_mailbox(mailbox);
                 }
                 // drive-taskmb: inject the reactor's timer wheel for
                 // OnTimer yield resolution.
-                if let Some(tw) = tx_reactor::current_timer_wheel(hart) {
+                if let Some(tw) = crate::adapter::boot_runtime::current_timer_wheel(hart) {
                     ctx = ctx.with_timer_wheel(tw);
                 }
                 // drive-taskmb: inject the reactor's delegate registry
                 // for OnAgent yield resolution.
-                if let Some(dr) = tx_reactor::current_delegate_registry(hart) {
+                if let Some(dr) = crate::adapter::boot_runtime::current_delegate_registry(hart) {
                     ctx = ctx.with_delegate_registry(dr);
                 }
                 let sigreturn_ctx = payload.saved_user_context();
@@ -897,13 +897,13 @@ fn write_hex_u64<P: TxPlatform>(value: u64) {
     let mut started = false;
     let mut out = [0u8; 16];
     let mut len = 0;
-    for idx in 0..16 {
+    for (idx, slot) in digits.iter_mut().enumerate() {
         let shift = (15 - idx) * 4;
         let digit = ((value >> shift) & 0xf) as usize;
-        digits[idx] = HEX[digit];
+        *slot = HEX[digit];
         if digit != 0 || started || idx == 15 {
             started = true;
-            out[len] = digits[idx];
+            out[len] = *slot;
             len += 1;
         }
     }
@@ -963,10 +963,10 @@ fn reserve_signal_frame_storage(
     let Ok(range) = UserRange::new_aligned(UserVirtAddr(start), len) else {
         return false;
     };
-    matches!(
+    use crate::adapter::step_engine::StepOutcome as V3;
+    !matches!(
         aspace.reserve_user_range_for_access(range, UserAccessKind::Write),
-        crate::adapter::step_engine::StepOutcome::Done(())
-            | crate::adapter::step_engine::StepOutcome::Continue { .. }
+        V3::Err(_) | V3::Yield { .. }
     )
 }
 
