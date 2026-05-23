@@ -348,6 +348,35 @@ fn parse_image_plan_et_dyn_with_pt_interp_emits_ref() {
 }
 
 #[test]
+fn parse_image_plan_records_pt_interp_outside_initial_window() {
+    // The exec orchestrator may parse only the initial ELF window.
+    // Real OSComp basic PIE binaries place PT_INTERP after that
+    // window; the parser must still return the locator and leave the
+    // later file read to the PageContainer-backed phase.
+    let mut cfg = FixtureCfg::minimal();
+    cfg.e_type = ET_DYN_U16;
+    cfg.e_entry = 0x80;
+    cfg.phdrs[0].p_vaddr = 0x0;
+    cfg.phdrs[0].p_paddr = 0x0;
+    cfg.phdrs.push(PhdrSpec {
+        p_type: PT_INTERP_U32,
+        p_flags: PF_R_BIT,
+        p_offset: 0x1f57,
+        p_vaddr: 0x1f57,
+        p_paddr: 0x1f57,
+        p_filesz: 0x21,
+        p_memsz: 0x21,
+        p_align: 1,
+    });
+    let mut bytes = cfg.build();
+    bytes.truncate(4096);
+    let plan = parse_image_plan(&bytes).expect("out-of-window PT_INTERP locator is accepted");
+    let interp = plan.interp.expect("interp ref recorded");
+    assert_eq!(interp.file_offset, 0x1f57);
+    assert_eq!(interp.filesz, 0x21);
+}
+
+#[test]
 fn parse_image_plan_rejects_empty_pt_interp() {
     // Zero `p_filesz` is malformed — the toolchain never emits this
     // for a real interpreter path. Surface it loudly.
