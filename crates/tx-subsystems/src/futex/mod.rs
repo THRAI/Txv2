@@ -242,6 +242,11 @@ pub fn step_futex_wait(
     val: u32,
     guard: &Guard<'_>,
 ) -> StepOutcome<(), NoProgress> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     step_futex_wait_masked(aspace, uaddr, val, FUTEX_WAKE_MASK, guard)
 }
 
@@ -322,6 +327,11 @@ pub fn step_futex_wake_in(
     n: u32,
     _guard: &Guard<'_>,
 ) -> StepOutcome<u32, NoProgress> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     step_futex_wake_masked_in(aspace, uaddr, n, FUTEX_WAKE_MASK, _guard)
 }
 
@@ -332,6 +342,11 @@ pub fn step_futex_wake_masked_in(
     wake_mask: u64,
     _guard: &Guard<'_>,
 ) -> StepOutcome<u32, NoProgress> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     if uaddr == 0 || (uaddr & 0x3) != 0 {
         return StepOutcome::Err(Errno::EINVAL);
     }
@@ -388,6 +403,11 @@ pub fn step_futex_cancel_wait_in(
     interest_mask: u64,
     _guard: &Guard<'_>,
 ) -> StepOutcome<(), NoProgress> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     if uaddr == 0 || (uaddr & 0x3) != 0 || interest_mask == 0 {
         return StepOutcome::Err(Errno::EINVAL);
     }
@@ -417,6 +437,11 @@ pub fn step_futex_requeue_in(
     requeue_n: u32,
     guard: &Guard<'_>,
 ) -> StepOutcome<u32, NoProgress> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     if uaddr == 0 || uaddr2 == 0 || (uaddr & 0x3) != 0 || (uaddr2 & 0x3) != 0 {
         return StepOutcome::Err(Errno::EINVAL);
     }
@@ -526,6 +551,11 @@ pub fn step_futex_lock_pi_in(
     waiters: bool,
     guard: &Guard<'_>,
 ) -> StepOutcome<(), NoProgress> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     if uaddr == 0 || (uaddr & 0x3) != 0 || owner_tid == 0 || (owner_tid & !FUTEX_TID_MASK) != 0 {
         return StepOutcome::Err(Errno::EINVAL);
     }
@@ -557,6 +587,11 @@ pub fn step_futex_trylock_pi_in(
     owner_tid: u32,
     guard: &Guard<'_>,
 ) -> StepOutcome<(), NoProgress> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     step_futex_lock_pi_in(aspace, uaddr, owner_tid, false, guard)
 }
 
@@ -566,6 +601,11 @@ pub fn step_futex_unlock_pi_in(
     owner_tid: u32,
     guard: &Guard<'_>,
 ) -> StepOutcome<u32, NoProgress> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     if uaddr == 0 || (uaddr & 0x3) != 0 || owner_tid == 0 {
         return StepOutcome::Err(Errno::EINVAL);
     }
@@ -654,7 +694,8 @@ pub struct FutexWaitOp<'a> {
 impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
     type Output = ();
     type Progress = NoProgress;
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
         if self.woken {
             return StepOutcome::Done(());
         }
@@ -710,7 +751,8 @@ pub struct FutexWakeOp<'a> {
 impl<I: SubjectIdentity> StepOp<I> for FutexWakeOp<'_> {
     type Output = u32;
     type Progress = NoProgress;
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
         let guard = adapter::step_engine::guard();
         step_futex_wake_in(self.aspace, self.uaddr, self.n, &guard)
     }

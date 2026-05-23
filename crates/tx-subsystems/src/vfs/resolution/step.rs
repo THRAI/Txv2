@@ -28,6 +28,18 @@ use super::state::{
 };
 use super::terminal;
 
+#[derive(Clone, Copy)]
+pub struct TerminalRules {
+    mode: WalkMode,
+    policy: FinalSymlinkPolicy,
+}
+
+impl TerminalRules {
+    pub fn new(mode: WalkMode, policy: FinalSymlinkPolicy) -> Self {
+        Self { mode, policy }
+    }
+}
+
 /// Advance the walker one component.
 ///
 /// Reads the current `WalkingState`, the caller-supplied `mode` and
@@ -41,8 +53,7 @@ pub fn kernel_step(
     mount_payload: Option<Cap<MountPayload>>,
     mount_namespace: Option<&Cap<MountNamespace>>,
     cred: &Credential,
-    mode: WalkMode,
-    policy: FinalSymlinkPolicy,
+    rules: TerminalRules,
     guard: &Guard<'_>,
 ) -> KernelStep {
     let WalkingState {
@@ -72,7 +83,7 @@ pub fn kernel_step(
             fs_object_id,
             meta,
         };
-        if terminal::accepts(&WalkState::Terminal(resolved.clone()), mode) {
+        if terminal::accepts(&WalkState::Terminal(resolved.clone()), rules.mode) {
             return KernelStep::Continue(WalkState::Terminal(resolved));
         }
         return KernelStep::Error(WalkCause::ComponentNotFound);
@@ -278,7 +289,7 @@ pub fn kernel_step(
     if let RNodeBacking::Symlink { target } = child_rnode_cap.backing() {
         // NoFollow: if this is the final component and the caller
         // asked us not to follow, return the symlink as terminal.
-        if policy == FinalSymlinkPolicy::NoFollow && remaining.is_empty() {
+        if rules.policy == FinalSymlinkPolicy::NoFollow && remaining.is_empty() {
             let rnode = child_rnode_cap.clone();
             let meta = child_meta;
             let fs_object_id = rnode.fs_object_id();

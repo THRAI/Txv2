@@ -338,6 +338,11 @@ pub fn step_fork<P: PmapIf>(
     clone_vm: bool,
     clone_sighand: bool,
 ) -> Result<Cap<ProcessIdentity>, ForkError> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     step_fork_with_options::<P>(
         parent,
         ForkOptions {
@@ -484,6 +489,11 @@ pub fn step_set_mount_namespace(
     process: &Cap<ProcessIdentity>,
     mnt_ns: Cap<crate::mount::MountNamespace>,
 ) -> Result<(), ForkError> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let payload_guard = process.payload.lock();
     let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
     let current = payload.nsproxy_cap();
@@ -639,6 +649,11 @@ pub fn step_clone_thread(
     tls: usize,
     ctid_ptr: u64,
 ) -> Result<Cap<ThreadIdentity>, ZoneError> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let tid = allocate_tid();
     let child = sign_thread(process.downgrade(), tid)?;
     register_tid(child.tid, child.clone());

@@ -65,6 +65,11 @@ pub fn step_mq_open(
     cred: &Cap<Cred>,
     nsproxy: &Cap<crate::process::nsproxy::NsProxy>,
 ) -> Result<Cap<structure::PosixMqInstance>, Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let mq_name = PosixMqName::new(name);
     let create = (oflag & MQ_O_CREAT) != 0;
     let exclusive = (oflag & MQ_O_EXCL) != 0;
@@ -142,6 +147,11 @@ pub fn step_mq_send(
     prio: u32,
     cred: &Cap<Cred>,
 ) -> Result<(), Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     if prio >= MQ_PRIO_MAX {
         return Err(Errno::EINVAL);
     }
@@ -222,6 +232,11 @@ pub fn step_mq_receive(
     max_len: usize,
     cred: &Cap<Cred>,
 ) -> Result<(Vec<u8>, u32), Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let flags = if (instance.flags() & MQ_O_NONBLOCK as i64) != 0 {
         crate::ipc::sysv_shm::execution::IPC_NOWAIT
     } else {
@@ -262,6 +277,11 @@ pub fn step_mq_receive(
 }
 
 pub fn step_mq_getattr(instance: &structure::PosixMqInstance) -> Result<MqAttr, Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let queue =
         crate::ipc::sysv_msg::structure::lookup_msg(instance.msqid()).ok_or(Errno::EINVAL)?;
     let payload_guard = queue.payload.lock();
@@ -275,6 +295,11 @@ pub fn step_mq_getattr(instance: &structure::PosixMqInstance) -> Result<MqAttr, 
 }
 
 pub fn step_mq_poll_info(instance: &structure::PosixMqInstance) -> Result<MqPollInfo, Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let queue =
         crate::ipc::sysv_msg::structure::lookup_msg(instance.msqid()).ok_or(Errno::EINVAL)?;
     let payload_guard = queue.payload.lock();
@@ -295,6 +320,11 @@ pub fn step_mq_setattr(
     instance: &structure::PosixMqInstance,
     new_flags: i64,
 ) -> Result<MqAttr, Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     if new_flags & !(MQ_O_NONBLOCK as i64) != 0 {
         return Err(Errno::EINVAL);
     }
@@ -317,6 +347,11 @@ pub fn step_mq_notify(
     instance: &structure::PosixMqInstance,
     notification: Option<MqNotification>,
 ) -> Result<(), Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let mut slot = instance.identity.notify.lock();
     if notification.is_some() && slot.is_some() {
         return Err(Errno::EBUSY);
@@ -334,6 +369,11 @@ pub fn step_mq_unlink(
     name: &[u8],
     nsproxy: &Cap<crate::process::nsproxy::NsProxy>,
 ) -> Result<(), Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let mq_name = PosixMqName::new(name);
     if nsproxy.ipc_ns.posix_mq.lock().remove(&mq_name).is_some() {
         Ok(())

@@ -144,6 +144,11 @@ pub fn step_walk<'g>(
     cred: &Credential,
     guard: &Guard<'g>,
 ) -> StepOutcome<Cap<DEntry>, NoProgress> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     // Delegated to the resolution state-machine driver.
     // When the driver encounters a yield, it returns EAGAIN;
     // synchronous callers see the yield as an error.
@@ -172,6 +177,11 @@ pub fn step_walk_in_mount_namespace<'g>(
     mount_namespace: &Cap<MountNamespace>,
     guard: &Guard<'g>,
 ) -> StepOutcome<Cap<DEntry>, NoProgress> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     match crate::vfs::resolution::driver::walk_to_completion_with_mount_namespace(
         rooted_at,
         path,

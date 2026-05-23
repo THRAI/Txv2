@@ -202,7 +202,7 @@ fn pselect_style_wait_resolves_interrupted_via_signal_mailbox() {
     // Outcome slot the task fills in once the wait resolves.
     let outcome: Arc<Mutex<Option<WaitOutcome>>> = Arc::new(Mutex::new(None));
 
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
 
     {
         let channel = channel.clone();

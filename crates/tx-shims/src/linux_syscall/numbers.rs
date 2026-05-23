@@ -1439,39 +1439,38 @@ pub const UFFDIO_REGISTER_REPLY_IOCTLS: u64 = (1u64 << 0x03) | (1u64 << 0x04) | 
 // Userspace glibc shims bridge the fd back into the legacy
 // `aio_context_t *` out-parameter shape with a 5-line conversion.
 //
-// **Linux numbering reference (x86_64):** `io_setup = 206`,
-// `io_destroy = 207`, `io_getevents = 208`, `io_submit = 209`. These
-// numbers are stable across Linux's generic uapi for RV64 as well.
-// Phase 1 wires only `NR_IO_SETUP`; the other three are defined here
-// for forward-reference (phases 2–4 will populate the dispatch arms).
+// **Linux generic/RV64 numbering reference:** `io_setup = 0`,
+// `io_destroy = 1`, `io_submit = 2`, `io_cancel = 3`,
+// `io_getevents = 4`. Do not use x86_64's 206..209 range here; that
+// collides with generic socket syscalls such as `sendto`.
 // =====================================================================
 
 /// `io_setup(nr_events, ctx_idp)`. Linux RV64 generic ABI
-/// `__NR_io_setup = 206`. Mints a fresh [`AioContext`] cap (W-Z PR-11
+/// `__NR_io_setup = 0`. Mints a fresh [`AioContext`] cap (W-Z PR-11
 /// phase 1 zone), wraps it in an `OpenFile` with
 /// `OpenFileBacking::AioContext`, installs at the lowest free fd, and
 /// returns the fd (diverging from Linux which writes a pointer-shape
 /// into `*ctx_idp`; see module-doc note above).
 ///
 /// [`AioContext`]: tx_subsystems::aio::AioContext
-pub const NR_IO_SETUP: u64 = 206;
+pub const NR_IO_SETUP: u64 = 0;
 
-/// `io_destroy(ctx)`. Linux RV64 generic ABI `__NR_io_destroy = 207`.
+/// `io_destroy(ctx)`. Linux RV64 generic ABI `__NR_io_destroy = 1`.
 /// Phase 1 defines the constant for forward-reference; the dispatch
 /// arm lands in phase 4 (close + worker abandonment via the borrow's
 /// `exit_source`).
-pub const NR_IO_DESTROY: u64 = 207;
+pub const NR_IO_DESTROY: u64 = 1;
 
 /// `io_getevents(ctx, min, max, events, timeout)`. Linux RV64 generic
-/// ABI `__NR_io_getevents = 208`. Phase 1 defines the constant for
+/// ABI `__NR_io_getevents = 4`. Phase 1 defines the constant for
 /// forward-reference; the dispatch arm lands in phase 3.
-pub const NR_IO_GETEVENTS: u64 = 208;
+pub const NR_IO_GETEVENTS: u64 = 4;
 
 /// `io_submit(ctx, nr, iocbpp)`. Linux RV64 generic ABI
-/// `__NR_io_submit = 209`. Phase 1 defines the constant for
+/// `__NR_io_submit = 2`. Phase 1 defines the constant for
 /// forward-reference; the dispatch arm lands in phase 2 (alongside
 /// the worker task spawn + `with_on_behalf_of` integration).
-pub const NR_IO_SUBMIT: u64 = 209;
+pub const NR_IO_SUBMIT: u64 = 2;
 
 // =====================================================================
 // Future PR-12 phase 0 — io_uring SQPOLL syscall numbers (second

@@ -17,14 +17,14 @@
 //! 2. **blocked-writer-woken-on-read**. Symmetric: writer registers
 //!    against `writer_wait_source` on a full ring; a subsequent
 //!    `step_read` posts the event.
-//! 3. **terminal-fires-on-last-reader-close**. Dropping the last
-//!    reader `Cap<OpenFile>` (production close path) posts a
+//! 3. **terminal-fires-on-last-reader-close**. Closing the last
+//!    reader fd through the process fd table posts a
 //!    `MailboxEvent::SourceFired` on the writer-side `WaitSource`
 //!    with the `PIPE_WRITABLE` interest, so blocked writers
 //!    re-observe `reader_count == 0` and surface EPIPE.
 //! 4. **terminal-fires-on-last-writer-close**. Symmetric: last
-//!    writer close fires the reader-side `WaitSource` so blocked
-//!    readers re-observe EOF (`Done(0)`).
+//!    writer fd-table close fires the reader-side `WaitSource` so
+//!    blocked readers re-observe EOF (`Done(0)`).
 //! 5. **zero-byte-edge-cases**. A `step_read` with `out.len() == 0`
 //!    must not fire the writer source (no actual drain). A
 //!    `step_write` with `bytes.len() == 0` must not fire the
@@ -40,7 +40,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 use tx_subsystems::pipe::adapter::step_engine::{
-    guard as ebr_guard, Cap, InterestMask, StepOutcome, WaitSourceId,
+    guard as ebr_guard, Cap, InterestMask, StepOp, StepOutcome, WaitSourceId,
 };
 use tx_subsystems::pipe::adapter::wait_routing::{
     MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
@@ -49,8 +49,65 @@ use tx_subsystems::pipe::{
     step_pipe2, step_read, step_write, PipeFlags, PipePayload, PIPE_BUF, PIPE_READABLE,
     PIPE_WRITABLE,
 };
+use tx_subsystems::process::adapter::step_engine::ScriptCtx;
+use tx_subsystems::process::structure::ProcessIdentity;
+use tx_subsystems::process::{bootstrap_init_process, init_process, CloseOp};
 use tx_subsystems::vfs::structure::{OpenFile, RNodeBacking, StructPayload};
+use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
+
+use core::sync::atomic::{AtomicUsize, Ordering};
+use tx_hal::{
+    Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+    PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
+};
+
+struct StubPmap;
+
+static NEXT_ROOT_ID: AtomicUsize = AtomicUsize::new(1);
+
+impl PmapIf for StubPmap {
+    fn create_pmap_root() -> Result<PmapRoot, PmapError> {
+        let id = NEXT_ROOT_ID.fetch_add(1, Ordering::AcqRel);
+        Ok(PmapRoot::new(
+            PtNode::boot_pool(PhysAddr(id * 4096)),
+            Asid(id as u16),
+        ))
+    }
+    fn destroy_pmap_root(_root: PmapRoot) {}
+    fn reserve_mapping(
+        _root: &PmapRoot,
+        virt: VirtAddr,
+        phys: PhysAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapReservation>, PmapError> {
+        Ok(Some(PmapReservation::new(virt, phys, kind)))
+    }
+    fn rollback_mapping(_root: &PmapRoot, _reservation: PmapReservation) {}
+    fn commit_mapping(
+        _root: &PmapRoot,
+        _reservation: PmapReservation,
+        _permissions: PmapPermissions,
+    ) {
+    }
+    fn unmap_mapping(
+        _root: &PmapRoot,
+        virt: VirtAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapUnmapResult>, PmapError> {
+        Ok(Some(PmapUnmapResult::new(virt, PhysAddr(virt.0), kind)))
+    }
+    fn protect_mapping(
+        _root: &PmapRoot,
+        virt: VirtAddr,
+        kind: PmapReserveKind,
+        _permissions: PmapPermissions,
+    ) -> Result<Option<PmapInvalidation>, PmapError> {
+        Ok(Some(PmapInvalidation::new(virt, kind.size())))
+    }
+    fn shootdown_kernel_mapping(_invalidation: PmapInvalidation) {}
+    fn shootdown_mapping(_asid: Asid, _invalidation: PmapInvalidation) {}
+}
 
 static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -68,6 +125,26 @@ fn payload_of(openfile: &Cap<OpenFile>) -> Cap<PipePayload> {
             payload: StructPayload::Pipe { payload, .. },
         } => payload.clone(),
         other => panic!("expected StructPayload::Pipe, got {other:?}"),
+    }
+}
+
+fn bootstrap_process() -> Cap<ProcessIdentity> {
+    if let Some(process) = init_process() {
+        return process;
+    }
+    bootstrap_init_process(AddressSpace::new_cap_for_platform::<StubPmap>().expect("fresh aspace"))
+        .expect("bootstrap init")
+}
+
+fn close_fd(process: &Cap<ProcessIdentity>, fd: u32) {
+    let mut op = CloseOp {
+        process: process.clone(),
+        fd,
+    };
+    let mut ctx = ScriptCtx::<ProcessIdentity>::new();
+    match op.step(&mut ctx) {
+        StepOutcome::Done(()) => {}
+        other => panic!("close fd {fd} expected Done, got {other:?}"),
     }
 }
 
@@ -197,15 +274,18 @@ fn blocked_writer_on_full_ring_is_woken_when_reader_drains_bytes() {
 #[test]
 fn dropping_last_reader_cap_fires_writer_wait_source() {
     let _setup = setup();
+    let process = bootstrap_process();
     let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
     let payload = payload_of(&reader);
     let mailbox = Arc::new(TaskMailbox::new());
+    process.set_fd(10, Some(reader));
+    process.set_fd(11, Some(writer));
 
     // Writer registers on writer_wait_source (anticipating EPIPE).
     let (_guard_reg, gen) = register(payload.writer_wait_source(), &mailbox, PIPE_WRITABLE);
 
     // Production-path last-reader-close.
-    drop(reader);
+    close_fd(&process, 10);
     tx_test_support::drain_to_quiescence();
 
     // Sanity: the reader-source vs writer-source id namespaces are
@@ -224,7 +304,7 @@ fn dropping_last_reader_cap_fires_writer_wait_source() {
         PIPE_WRITABLE,
     );
 
-    drop(writer);
+    close_fd(&process, 11);
     tx_test_support::drain_to_quiescence();
 }
 
@@ -233,14 +313,17 @@ fn dropping_last_reader_cap_fires_writer_wait_source() {
 #[test]
 fn dropping_last_writer_cap_fires_reader_wait_source() {
     let _setup = setup();
+    let process = bootstrap_process();
     let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
     let payload = payload_of(&reader);
     let mailbox = Arc::new(TaskMailbox::new());
+    process.set_fd(10, Some(reader));
+    process.set_fd(11, Some(writer));
 
     // Reader registers on reader_wait_source (anticipating EOF).
     let (_guard_reg, gen) = register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
 
-    drop(writer);
+    close_fd(&process, 11);
     tx_test_support::drain_to_quiescence();
 
     assert_source_fired(
@@ -250,7 +333,7 @@ fn dropping_last_writer_cap_fires_reader_wait_source() {
         PIPE_READABLE,
     );
 
-    drop(reader);
+    close_fd(&process, 10);
     tx_test_support::drain_to_quiescence();
 }
 

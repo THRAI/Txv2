@@ -56,11 +56,9 @@ impl ItimerSpec {
         let val_sec = i64::from_le_bytes(bytes[16..24].try_into().unwrap());
         let val_nsec = i64::from_le_bytes(bytes[24..32].try_into().unwrap());
         if ival_sec < 0
-            || ival_nsec < 0
-            || ival_nsec >= 1_000_000_000
+            || !(0..1_000_000_000).contains(&ival_nsec)
             || val_sec < 0
-            || val_nsec < 0
-            || val_nsec >= 1_000_000_000
+            || !(0..1_000_000_000).contains(&val_nsec)
         {
             return None;
         }
@@ -234,6 +232,11 @@ pub fn step_timerfd_read(
     out: &mut [u8; 8],
     nonblocking: bool,
 ) -> ByteOutcome {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let count = tfd.bump_expirations(now_ns);
     if count > 0 {
         let drained = tfd.drain_count();
@@ -255,7 +258,8 @@ pub struct TimerfdCreateOp {
 impl<I: SubjectIdentity> StepOp<I> for TimerfdCreateOp {
     type Output = Result<Cap<TimerFd>, ZoneError>;
     type Progress = NoProgress;
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
         StepOutcome::Done(timerfd_create(self.flags))
     }
 }

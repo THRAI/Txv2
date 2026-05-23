@@ -1,7 +1,27 @@
 //! Bootstrap helpers extracted from `init.rs` to keep the file under
 //! the arch-lint line-count ceiling (1800 lines).
 
-use tx_hal::TxPlatform;
+use crate::adapter::boot_runtime;
+use core::marker::PhantomData;
+use tx_hal::{CpuId, IpiKind, TxPlatform};
+
+pub(super) struct SmpRescheduleSignal<P: TxPlatform> {
+    _platform: PhantomData<P>,
+}
+
+impl<P: TxPlatform> SmpRescheduleSignal<P> {
+    pub(super) const fn new() -> Self {
+        Self {
+            _platform: PhantomData,
+        }
+    }
+}
+
+impl<P: TxPlatform> boot_runtime::RescheduleSignal for SmpRescheduleSignal<P> {
+    fn send_reschedule_ipi(&mut self, target_hart: boot_runtime::HartId) {
+        <P as tx_hal::SmpIf>::send_ipi(CpuId(target_hart.0), IpiKind::Reschedule);
+    }
+}
 
 /// Synchronous poll loop for bootstrap futures. Mirrors
 /// `tx_scripts::drive::block_on` but does not depend on the reactor

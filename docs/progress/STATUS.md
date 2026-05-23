@@ -1,3 +1,29 @@
+- 2026-05-23 **Brought the OSComp/musl/busybox fix branch through both CI
+  gates.** This branch now includes the pthread/libctest, dynamic loader/DSO,
+  file-time, futex, fd-table close, non-VFS fd routing, AIO syscall-number,
+  mapped user-memory test-fixture, process/fd-table split, and full-run
+  BusyBox/OSComp harness fixes accumulated during the musl compatibility push.
+  The last CI blockers were host-side ratchets: Linux AIO syscall numbers were
+  aligned so `io_setup` no longer collided with `sendto`; AIO and
+  userfaultfd tests now stage ioctl/iocb/read buffers in mapped user memory;
+  userfaultfd/eventfd/timerfd/signalfd reads and eventfd writes dispatch before
+  VFS-backed file clamping; futex wait-source tests were realigned to exact
+  waiter keys, bitset/actual-wake semantics, and the current user-memory read
+  path; and pipe wait-source tests now close through the process fd table
+  `CloseOp` instead of treating raw cap drops as the production close path.
+  **Verified:** `cargo test -p tx-shims --test v3_aio_e2e --
+  --test-threads=1 --nocapture`; `cargo test -p tx-shims --test
+  v3_userfaultfd_ioctl_reply -- --test-threads=1 --nocapture`; `cargo test -p
+  tx-subsystems --test v3_futex_waitsource -- --test-threads=1 --nocapture`;
+  `cargo test -p tx-subsystems --test v3_pipe_waitsource --
+  --test-threads=1 --nocapture`; CI-style `cargo clippy --no-deps
+  --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude
+  tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D
+  warnings`; `cargo xtask ci` (`19 passed, 0 skipped, 0 failed`); and `cargo
+  xtask ci-slow` (`3 passed, 0 skipped, 0 failed`, including QEMU smoke and
+  busybox boot sentinels). **Next step:** publish this branch as a draft PR
+  against `main`. **Blocker:** none for CI.
+
 - 2026-05-23 **Debugged the last three full-run BusyBox reds: two kernel
   fixes landed, one harness/image skew remains.** BusyBox `which ls` now passes
   after the OSComp sdcard env prepends `/bin` and the rootfs shim publishes

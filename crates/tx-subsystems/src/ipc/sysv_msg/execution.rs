@@ -51,6 +51,11 @@ pub fn step_msgget(
     cred: &Cap<Cred>,
     nsproxy: &Cap<crate::process::nsproxy::NsProxy>,
 ) -> Result<u32, Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let ipc_key = if key == IPC_PRIVATE {
         None
     } else {
@@ -111,6 +116,11 @@ pub fn step_msgsnd(
     msgflg: i32,
     cred: &Cap<Cred>,
 ) -> Result<usize, Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     if mtype <= 0 {
         return Err(Errno::EINVAL);
     }
@@ -164,6 +174,11 @@ pub fn step_msgrcv(
     msgflg: i32,
     cred: &Cap<Cred>,
 ) -> Result<(i64, Vec<u8>), Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let queue = checks::require_msg_exists(msqid)?;
     checks::require_can_read_msg(&queue, cred)?;
 
@@ -229,6 +244,11 @@ pub fn step_msgctl(
     set_fields: Option<(u16, u32, u32)>,
     cred: &Cap<Cred>,
 ) -> Result<MsgCtlResult, Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     match cmd {
         IPC_RMID => {
             let queue = checks::require_msg_exists(msqid)?;
@@ -291,6 +311,11 @@ pub fn step_msgctl_in_ns(
     cred: &Cap<Cred>,
     nsproxy: &Cap<crate::process::nsproxy::NsProxy>,
 ) -> Result<MsgCtlResult, Errno> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let key = if cmd == IPC_RMID {
         Some(checks::require_msg_exists(msqid)?.key)
     } else {

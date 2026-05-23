@@ -7,6 +7,7 @@ use crate::adapter::boot_runtime;
 use crate::adapter::step_engine::{
     self as step_engine, init, init_on_ap, ByteProgress, Cap, SpinMutex, StepOutcome,
 };
+use crate::init::helpers::SmpRescheduleSignal;
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
@@ -84,8 +85,6 @@ static MUSL_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
 /// `register_console_hardware`; consulted by
 /// `register_devfs_console_alias` to publish `/dev/console`.
 static CONSOLE_TTY: SpinMutex<Option<Cap<TtyIdentity>>> = SpinMutex::new(None);
-static THREAD_REACTOR_TASKS: SpinMutex<alloc::vec::Vec<(u32, boot_runtime::TaskKey)>> =
-    SpinMutex::new(alloc::vec::Vec::new());
 
 /// Snapshot the boot-time root mount cap. Returns `None` until
 /// `mount_rootfs_tmpfs` has run (test pre-bootstrap or boot-time
@@ -176,24 +175,6 @@ impl<P: TxPlatform> CharDeviceOps for ConsoleCharOps<P> {
     }
 }
 
-struct SmpRescheduleSignal<P: TxPlatform> {
-    _platform: PhantomData<P>,
-}
-
-impl<P: TxPlatform> SmpRescheduleSignal<P> {
-    const fn new() -> Self {
-        Self {
-            _platform: PhantomData,
-        }
-    }
-}
-
-impl<P: TxPlatform> boot_runtime::RescheduleSignal for SmpRescheduleSignal<P> {
-    fn send_reschedule_ipi(&mut self, target_hart: boot_runtime::HartId) {
-        <P as tx_hal::SmpIf>::send_ipi(CpuId(target_hart.0), IpiKind::Reschedule);
-    }
-}
-
 /// Skeleton H3 boot spine for the generic kernel mainline.
 ///
 /// This type names the ordering that used to live inline in `kernel_main`:
@@ -207,6 +188,8 @@ pub struct CoreInit<P: TxPlatform> {
 }
 
 mod exec;
+mod helpers;
+mod reactor_submit;
 
 impl<P: TxPlatform> CoreInit<P> {
     pub fn boot(handoff: BootHandoff) -> ! {
@@ -219,16 +202,6 @@ impl<P: TxPlatform> CoreInit<P> {
         // BSP reactor loop below then picks up the seeded context
         // on its first poll and re-enters userspace through the
         // production trap return path.
-        //
-        // Open Q #3 (DECIDED 2026-05-06) — bootstrap exec failure
-        // is a boot-time invariant violation. The helper panics
-        // with the `:bootstrap-exec:fail` board sentinel on `Err`;
-        // CI catches the panic loudly and we never reach
-        // `boot_sentinel` (`:boot:ok`). No fallback to the trio's
-        // hand-built userspace path: that path is retired by the
-        // Phase 7 dual-codepath cleanup, and reintroducing it
-        // would re-create the dual code path the trio just
-        // collapsed.
         //
         // Order (per Phase 7 plan): runs after
         // `bind_init_cwd_and_root` (init has cwd + fds 0/1/2) and
@@ -1783,256 +1756,6 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":boot:ok\n");
     }
-
-    /// Reactor-submission hook body. Captured by
-    /// [`Self::install_reactor_submit_seam`] as a plain `fn` pointer
-    /// (the platform parameter `P` is monomorphised at install time
-    /// so the resulting fn pointer is parameter-free).
-    ///
-    /// Builds `PerHartSlotted::<P, _>::new(payload,
-    /// run_thread::<P>(child_thread, payload))` and submits via
-    /// `BOOT_REACTOR.submit_task`. `child_thread.payload_cap()`
-    /// returning `None` would indicate the child is already a
-    /// zombie, which violates `step_fork`'s post-condition and
-    /// `seed_child_leader_context`'s precondition; we treat it as a
-    /// silent no-op rather than panicking because the syscall arm
-    /// has its own error reporting path.
-    fn submit_child_thread_into_boot_reactor(
-        _child_process: Cap<tx_subsystems::process::ProcessIdentity>,
-        child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
-    ) {
-        // The reactor's `BOOT_REACTOR.with(...)` lock is held by
-        // `step_boot_reactor_once` *while* polling tasks. The
-        // currently-polled task is sys_clone — calling
-        // `BOOT_REACTOR.with(reactor.submit_task(...))` from here
-        // would deadlock that same spin lock. Defer the submit to a
-        // separate pending-queue that the BSP reactor loop drains
-        // between iterations (outside the inner lock).
-        Self::queue_pending_child_submit(<P as tx_hal::SmpIf>::current_cpu_id(), child_thread);
-    }
-
-    fn register_thread_reactor_task(tid: u32, task: boot_runtime::TaskKey) {
-        let mut tasks = THREAD_REACTOR_TASKS.lock();
-        if let Some((_, existing)) = tasks
-            .iter_mut()
-            .find(|(existing_tid, _)| *existing_tid == tid)
-        {
-            *existing = task;
-        } else {
-            tasks.push((tid, task));
-        }
-    }
-
-    fn thread_reactor_task(tid: u32) -> Option<boot_runtime::TaskKey> {
-        THREAD_REACTOR_TASKS
-            .lock()
-            .iter()
-            .find(|(existing_tid, _)| *existing_tid == tid)
-            .map(|(_, task)| *task)
-    }
-
-    fn set_thread_reactor_affinity(
-        tid: u32,
-        affinity: u64,
-    ) -> Result<(), tx_subsystems::reactor_affinity::ReactorAffinityError> {
-        if affinity == 0 || (affinity & P::online_cpus().bits()) == 0 {
-            return Err(tx_subsystems::reactor_affinity::ReactorAffinityError::InvalidMask);
-        }
-        let task = Self::thread_reactor_task(tid)
-            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?;
-        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-        let current_hart = boot_runtime::HartId(current_cpu.0);
-        let mut signal = SmpRescheduleSignal::<P>::new();
-        BOOT_REACTOR
-            .with(|reactor| reactor.set_task_affinity(task, affinity, current_hart, &mut signal))
-            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?
-            .map(|_| ())
-            .map_err(|_| tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)
-    }
-
-    fn get_thread_reactor_affinity(
-        tid: u32,
-    ) -> Result<u64, tx_subsystems::reactor_affinity::ReactorAffinityError> {
-        let task = Self::thread_reactor_task(tid)
-            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?;
-        BOOT_REACTOR
-            .with(|reactor| reactor.task_affinity(task))
-            .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?
-            .map_err(|_| tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)
-    }
-
-    /// Push a freshly-cloned child thread onto the deferred-submit
-    /// queue. Called from sys_clone via the reactor-submission seam
-    /// when the boot-reactor spin lock is already held by the
-    /// caller. Drained by `drain_pending_child_submits` between
-    /// reactor steps.
-    fn queue_pending_child_submit(
-        submit_cpu: CpuId,
-        child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
-    ) {
-        PENDING_CHILD_SUBMITS.lock().push(PendingChildSubmit {
-            submit_cpu,
-            child_thread,
-        });
-    }
-
-    /// Drain the deferred-submit queue, building the task future for
-    /// each pending child and submitting it through `BOOT_REACTOR`.
-    /// Safe to call from the BSP loop because no syscall task is
-    /// being polled at this point (the inner spin lock is free).
-    fn drain_pending_child_submits() -> bool {
-        let mut submitted_any = false;
-        loop {
-            let next = PENDING_CHILD_SUBMITS.lock().pop();
-            let Some(pending) = next else {
-                break;
-            };
-            let child_thread = pending.child_thread;
-            let Some(payload) = child_thread.payload_cap() else {
-                continue;
-            };
-            let task_payload = payload.clone();
-            let submit_hart = boot_runtime::HartId(pending.submit_cpu.0);
-            let child_tid = child_thread.tid.0;
-            let mut signal = SmpRescheduleSignal::<P>::new();
-            let submitted = BOOT_REACTOR.with(|reactor| {
-                reactor.submit_task_with_meta_from_hart(
-                    crate::thread_future::PerHartSlotted::<P, _>::new(
-                        task_payload.clone(),
-                        crate::thread_future::run_thread::<P>(child_thread, task_payload),
-                    ),
-                    Self::userspace_thread_sched_meta_for(pending.submit_cpu).preempted_on_submit(),
-                    submit_hart,
-                    &mut signal,
-                )
-            });
-            if let Some((task_key, _report)) = submitted {
-                submitted_any = true;
-                Self::register_thread_reactor_task(child_tid, task_key);
-            }
-        }
-        submitted_any
-    }
-}
-
-struct PendingChildSubmit {
-    submit_cpu: CpuId,
-    child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
-}
-
-/// Deferred-submit queue for `sys_clone` children. Pushed from
-/// `submit_child_thread_into_boot_reactor` (running inside the
-/// reactor-poll inner lock) and drained from the BSP loop between
-/// reactor steps.
-static PENDING_CHILD_SUBMITS: SpinMutex<alloc::vec::Vec<PendingChildSubmit>> =
-    SpinMutex::new(alloc::vec::Vec::new());
-
-/// Synchronously poll a future to completion using a noop waker.
-///
-/// Used by `CoreInit::drive_bootstrap_exec` to drive `exec_script`'s
-/// future without spinning up the reactor: the boot path runs before
-/// the BSP reactor loop is entered, and `exec_script` only awaits on
-/// page-pull operations that resolve immediately under tmpfs.
-///
-/// The bound `1024` polls is chosen to mirror the matching pattern in
-/// `tx-shims`'s and `tx-scripts`'s test suites; reaching the cap
-/// signals a logic bug (a never-resolving future inside the
-/// boot-time exec path) and triggers a panic.
-fn bootstrap_block_on<F: core::future::Future>(future: F) -> F::Output {
-    use core::pin::Pin;
-    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-    // Build a no-op waker without `alloc::sync::Arc`'s `Wake` trait,
-    // because tx-kernel's runtime allocator at boot does not have
-    // `Arc::new` plumbing wired by the time `bootstrap_block_on` is
-    // called. The raw-waker shape is a stable `core` API that
-    // sidesteps the `alloc` requirement entirely.
-    fn raw_waker() -> RawWaker {
-        fn no_op(_: *const ()) {}
-        fn clone(_: *const ()) -> RawWaker {
-            raw_waker()
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
-        RawWaker::new(core::ptr::null(), &VTABLE)
-    }
-
-    // SAFETY: the raw waker's vtable functions are all no-op or
-    // re-construction; the data pointer is never dereferenced.
-    let waker = unsafe { Waker::from_raw(raw_waker()) };
-    let mut cx = Context::from_waker(&waker);
-    let mut future = future;
-    // SAFETY: `future` lives on this stack frame for the duration of
-    // the loop and is never moved after pinning.
-    let mut pinned = unsafe { Pin::new_unchecked(&mut future) };
-    for _ in 0..1024 {
-        match pinned.as_mut().poll(&mut cx) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => continue,
-        }
-    }
-    panic!("bootstrap_block_on: future did not resolve in 1024 polls");
-}
-
-/// Render an `ExecError` as a short stable label for the boot sentinel
-/// stream (helps diagnose `bootstrap-exec:fail` post-mortem).
-fn exec_error_tag(error: &tx_scripts::process::exec::ExecError) -> &'static str {
-    use tx_scripts::process::exec::ExecError as E;
-    match error {
-        E::PathTooLong => "path-too-long",
-        E::PathNotFound => "path-not-found",
-        E::NotADirectory => "not-a-directory",
-        E::PermissionDenied => "permission-denied",
-        E::SymlinkLoop => "symlink-loop",
-        E::NotExecutable => "not-executable",
-        E::InvalidArgument => "invalid-argument",
-        E::OutOfMemory => "out-of-memory",
-        E::Busy => "busy",
-        E::IoError => "io-error",
-        // Forward-compat: ExecError may grow new variants. Avoid a
-        // build break if a future variant lands without a label here.
-        #[allow(unreachable_patterns)]
-        _ => "other",
-    }
-}
-
-/// Parse the firmware command line for an `init=` token and the
-/// `tx.profile=busybox` profile flag.
-///
-/// Resolution order (matches the Linux kernel's classic ordering):
-///   1. If the cmdline contains `init=PATH`, use `PATH` (argv0 set
-///      to `PATH`'s basename).
-///   2. Otherwise, if the cmdline contains the standalone token
-///      `tx.profile=busybox`, default to `/bin/sh` argv0=`sh`.
-///   3. Otherwise, fall back to the bake-in `/init` fixture.
-///
-/// The cmdline is borrowed from `<P as BootInfoIf>::boot_info()`,
-/// which the firmware (or QEMU `-append`) populates with a
-/// `&'static str`; the returned byte slices share that lifetime.
-fn parse_init_from_cmdline<P: tx_hal::TxPlatform>() -> (&'static [u8], &'static [u8]) {
-    let cmdline = match <P as tx_hal::BootInfoIf>::boot_info().cmdline {
-        Some(s) => s,
-        None => return (b"/init", b"init"),
-    };
-    for token in cmdline.split_ascii_whitespace() {
-        if let Some(path) = token.strip_prefix("init=") {
-            let argv0 = match path.rfind('/') {
-                Some(idx) => &path[idx + 1..],
-                None => path,
-            };
-            return (path.as_bytes(), argv0.as_bytes());
-        }
-    }
-    if cmdline
-        .split_ascii_whitespace()
-        .any(|t| t == "tx.profile=busybox")
-    {
-        // Direct path to the busybox binary. /bin/sh is a symlink
-        // pointing at "busybox" (relative); the walker follows
-        // symlinks but we keep the canonical path for clearer
-        // error reporting on bootstrap-exec failure.
-        return (b"/bin/busybox", b"sh");
-    }
-    (b"/init", b"init")
 }
 
 mod init_fixture;

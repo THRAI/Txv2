@@ -166,6 +166,11 @@ pub fn step_epoll_ctl_mod(
     data: u64,
     source: WaitSourceId,
 ) -> StepOutcome<(), NoProgress> {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
     let mut fds = ep.fds.lock();
     let Some(entry) = fds.get_mut(&fd) else {
         return StepOutcome::Err(V3Errno::ENOENT);

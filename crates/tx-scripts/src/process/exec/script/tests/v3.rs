@@ -12,13 +12,13 @@ use alloc::boxed::Box;
 use crate::adapter::step_engine::{
     self as step_engine, guard, Cap, Errno as V3Errno, NoProgress, StepOutcome as V3Outcome,
 };
-use tx_subsystems::execution::{Errno, Guard};
-use tx_subsystems::mount::MountPayload;
-use tx_subsystems::page_backed::{Frame, MaterializeAccess, PageIndex};
-use tx_subsystems::vfs::structure::{
+use crate::adapter::vfs_exec::{
     Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta, RNode, RNodeBacking,
     S_IFDIR, S_IFREG,
 };
+use tx_subsystems::execution::{Errno, Guard};
+use tx_subsystems::mount::MountPayload;
+use tx_subsystems::page_backed::{Frame, MaterializeAccess, PageIndex};
 use tx_subsystems::vm::USER_PAGE_SIZE;
 
 use super::{ExecTestFs, ExecTestInode};
@@ -287,8 +287,8 @@ fn exec_testfs_v3_lookup_round_trips_after_add_regular() {
 
 #[test]
 fn exec_testfs_v3_load_inode_meta_returns_regular() {
+    use crate::adapter::vfs_exec::InodeKind;
     use step_engine::StepOutcome as V3;
-    use tx_subsystems::vfs::structure::InodeKind;
     use tx_subsystems::vfs::FsOps;
 
     let _setup = super::setup();
