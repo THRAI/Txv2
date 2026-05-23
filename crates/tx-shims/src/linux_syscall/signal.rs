@@ -420,7 +420,7 @@ pub(super) fn sys_pidfd_send_signal(_args: [u64; 6], _ctx: &SyscallCtx) -> Sysca
 /// `rt_sigaction(signum, act, oldact, sigsetsize)` per `SIGNAL_v1`
 /// §15.1.
 ///
-/// Decodes a 32-byte kernel `struct sigaction` (see `SIGACTION_BYTES`
+/// Decodes the RV64 kernel `struct sigaction` (see `SIGACTION_BYTES`
 /// for the layout citation). `act_ptr == 0` queries the current
 /// disposition without changing it; `oldact_ptr == 0` discards the
 /// previous disposition.
@@ -454,10 +454,7 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         }
         let handler = read_u64_le(&bytes[0..8]);
         let flags = SaFlags::new(read_u64_le(&bytes[8..16]));
-        // Linux RV64 kernel sigaction layout is:
-        // handler, flags, restorer, mask.
-        let restorer = read_u64_le(&bytes[16..24]);
-        let mask = SignalMask::new(read_u64_le(&bytes[24..32]));
+        let mask = SignalMask::new(read_u64_le(&bytes[16..24]));
 
         // SIG_DFL == 0, SIG_IGN == 1 per Linux generic ABI; everything
         // else is a userspace function-pointer handler.
@@ -466,7 +463,7 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             1 => SigDisposition::Ignore,
             other => SigDisposition::Handler(other as usize),
         };
-        Some(SigActionEntry::new(disp, flags, mask, restorer as usize))
+        Some(SigActionEntry::new(disp, flags, mask, 0))
     };
 
     // If the caller wants the previous disposition, snapshot it
@@ -478,7 +475,6 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     let prev_entry: SigActionEntry = match new_entry {
         Some(entry) => {
             let mut script_ctx = build_subject_script_ctx(ctx);
-            let restorer = entry.restorer as u64;
             let mut op = SigactionOp {
                 process: ctx.process.clone(),
                 sig,
@@ -486,7 +482,7 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             };
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(SigDispositionChange::Replaced { prev }) => {
-                    remember_sigaction_restorer(ctx.process.pid.0, sig, restorer);
+                    remember_sigaction_restorer(ctx.process.pid.0, sig, entry.restorer as u64);
                     prev
                 }
                 Ok(SigDispositionChange::Uncatchable(prev)) => prev,
@@ -517,14 +513,14 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             SigDisposition::Ignore => 1,  // SIG_IGN
             SigDisposition::Handler(addr) => addr as u64,
         };
-        // Build a 32-byte image and copy out through the canonical
-        // user-VA lane. RV64 musl layout: 4×u64 little-endian
-        // (handler, flags, restorer, mask).
+        // Build an RV64 image and copy out through the canonical
+        // user-VA lane. RV64 layout: 3×u64 little-endian
+        // (handler, flags, mask); the architecture does not carry an
+        // in-struct userspace restorer.
         let mut image = [0u8; SIGACTION_BYTES];
         image[0..8].copy_from_slice(&handler_value.to_le_bytes());
         image[8..16].copy_from_slice(&prev_entry.flags.bits().to_le_bytes());
-        image[16..24].copy_from_slice(&(prev_entry.restorer as u64).to_le_bytes());
-        image[24..32].copy_from_slice(&prev_entry.sa_mask.raw_bits().to_le_bytes());
+        image[16..24].copy_from_slice(&prev_entry.sa_mask.raw_bits().to_le_bytes());
         if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, oldact_ptr as u64, &image) {
             return SyscallResult::error_from(errno);
         }

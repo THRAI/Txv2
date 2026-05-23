@@ -91,6 +91,30 @@
   `make oscomp-local-rv64-smp4` / selected libctest lane. **Blocker:** none for
   the immediate `basic-musl` SMP panic.
 
+- 2026-05-24 **Measured OSComp after the network rebase and fixed an RV64
+  `rt_sigaction` ABI regression exposed by the run.** The first full
+  `cargo xtask oscomp test --target rv64-qemu` boot reached userspace but
+  panicked immediately in `rt_sigaction`: the rebased branch was still decoding
+  a 32-byte handler/flags/restorer/mask layout while main pins RV64 to the
+  Linux 24-byte handler/flags/mask shape with no in-struct restorer. The shim
+  now reads and writes the 24-byte RV64 layout and records a zero restorer for
+  this ABI. **Verified:** `cargo fmt --check`; `cargo test -p tx-shims
+  itimer_real_sigalrm_ignores_rv64_sigaction_mask_as_restorer --
+  --test-threads=1`; `cargo check -p tx-shims`; `cargo build -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`. OSComp
+  observations after the fix: default local full run progressed through
+  `busybox-musl 54/55` and `libctest-musl 220/220`, then stopped making serial
+  progress in non-network `libcbench-musl b_malloc_sparse`; local partial score
+  was `274.0/404`. A focused completing run with
+  `TX_OSCOMP_GROUPS=basic-musl,busybox-musl,libctest-musl` scored `274/377`:
+  `libctest-musl 220/220`, `busybox-musl 54/55`, and `basic-musl 0/102`
+  because the basic ELF binaries were treated by the shell as scripts
+  (`execve` returned an exec-format failure path). **Next step:** investigate
+  the non-network basic ELF exec path separately if total OSComp score is the
+  priority; network/libctest coverage remained green. **Blocker:** default
+  local all-suite run still reaches a non-network libcbench hang before a
+  closed full score.
+
 - 2026-05-24 **Rebased `feature-network` onto updated `main` and repaired the
   post-rebase interface drift.** The branch now sits on the mainline that split
   init reactor submission, refreshed procfs/sysfs/devfs, and expanded signal
