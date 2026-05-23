@@ -91,6 +91,27 @@
   `make oscomp-local-rv64-smp4` / selected libctest lane. **Blocker:** none for
   the immediate `basic-musl` SMP panic.
 
+- 2026-05-24 **Compared OSComp against `main` and repaired the feature-branch
+  exec regression.** `main` scored `376/377` for
+  `TX_OSCOMP_GROUPS=basic-musl,busybox-musl,libctest-musl`, while the rebased
+  `feature-network` branch had dropped `basic-musl` to `0/102`. Root cause:
+  the feature branch's dynamic-ELF loader treated a `PT_INTERP` segment outside
+  the initial 4 KiB parse window as malformed, and the exec script also
+  recursively fell back to `/bin/sh` for ELF parse errors. OSComp basic PIE
+  binaries place `PT_INTERP` at offset `0x1f57`, so they were rejected with
+  `ENOEXEC` and BusyBox reported `Exec format error`. The loader now records
+  out-of-window `PT_INTERP` locators and lets the PageContainer-backed
+  interpreter-open phase read the path; the `/bin/sh` fallback is again limited
+  to non-ELF inputs. **Verified:** `cargo fmt --check`; `cargo test -p
+  tx-scripts parse_image_plan_records_pt_interp_outside_initial_window --
+  --test-threads=1`; `cargo check -p tx-scripts`; `TX_OSCOMP_GROUPS=basic-musl
+  cargo xtask oscomp test --target rv64-qemu` (`102/102`); and
+  `TX_OSCOMP_GROUPS=basic-musl,busybox-musl,libctest-musl cargo xtask oscomp
+  test --target rv64-qemu` (`376/377`: `basic-musl 102/102`,
+  `busybox-musl 54/55`, `libctest-musl 220/220`). **Next step:** keep this
+  regression pinned with the loader test before pushing the rebased network
+  branch. **Blocker:** none for the main-compared OSComp trio.
+
 - 2026-05-24 **Measured OSComp after the network rebase and fixed an RV64
   `rt_sigaction` ABI regression exposed by the run.** The first full
   `cargo xtask oscomp test --target rv64-qemu` boot reached userspace but

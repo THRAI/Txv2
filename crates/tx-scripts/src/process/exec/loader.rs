@@ -317,8 +317,6 @@ fn parse_with_mode(elf_bytes: &[u8], mode: ParseMode) -> Result<ExecImagePlan, P
     let mut pt_phdr_vaddr: Option<u64> = None;
     let mut exec_stack: bool = false;
     let mut interp: Option<InterpRef> = None;
-    let file_len = elf_bytes.len() as u64;
-
     for phdr in &phdrs {
         match phdr.p_type {
             PT_INTERP => match mode {
@@ -332,13 +330,10 @@ fn parse_with_mode(elf_bytes: &[u8], mode: ParseMode) -> Result<ExecImagePlan, P
                     if phdr.p_filesz == 0 {
                         return Err(ParseError::InterpMalformed);
                     }
-                    let end = phdr
+                    let _end = phdr
                         .p_offset
                         .checked_add(phdr.p_filesz)
                         .ok_or(ParseError::InterpMalformed)?;
-                    if end > file_len {
-                        return Err(ParseError::InterpMalformed);
-                    }
                     interp = Some(InterpRef {
                         file_offset: phdr.p_offset,
                         filesz: phdr.p_filesz,

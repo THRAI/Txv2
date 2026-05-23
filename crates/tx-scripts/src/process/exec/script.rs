@@ -550,7 +550,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     let mut parsed: ExecImagePlan = match parse_image_plan(&header_bytes) {
         Ok(plan) => plan,
         Err(parse_err) => {
-            if depth < SHEBANG_MAX_DEPTH {
+            if !is_elf && depth < SHEBANG_MAX_DEPTH {
                 let interp_path: Vec<u8> = b"/bin/sh".to_vec();
                 let mut new_argv: Vec<Vec<u8>> = Vec::new();
                 new_argv.push(interp_path.clone());
