@@ -303,6 +303,11 @@ fn exit_wait_source_invariants_round_trip() {
     // `post_sigchld_to_parent`.
     let mailbox2 = Arc::new(TaskMailbox::new());
     let (_reg_guard2, gen2) = register(&parent_source, &mailbox2, EXIT_SOURCE_CHILD_ZOMBIFIED);
+    // Because parent_source was previously notified, registering a new mailbox
+    // immediately receives the pending event due to the WaitSource pending mask.
+    // Drain it first so we can check for any new notifications from the double-call.
+    assert_eq!(mailbox2.len(), 1);
+    let _ = mailbox2.poll();
     assert!(mailbox2.is_empty());
 
     // Second zombify call on the same child — payload is already

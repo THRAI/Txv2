@@ -9,9 +9,9 @@ use core::{
 };
 
 use crate::adapter::bus_wire::{
-    DeclaredPort, DeclaredQueue, WireDeclaration, WireDeclarationError, WireEventSet,
+    DeclaredPort, DeclaredQueue, DelegateRegistry, TaskMailbox, TimerWheel, WireDeclaration,
+    WireDeclarationError, WireEventSet,
 };
-use tx_substrate::wake::mailbox::TaskMailbox;
 
 use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect},
@@ -181,8 +181,8 @@ pub struct ReactorShared {
     scheduler: Phase1Scheduler,
     observability: SpinLock<ReactorObservability>,
     timers: SpinLock<TimerQueue>,
-    timer_wheel: tx_substrate::wake::timer::TimerWheel,
-    delegate_registry: Arc<tx_substrate::step::DelegateRegistry>,
+    timer_wheel: TimerWheel,
+    delegate_registry: Arc<DelegateRegistry>,
     userspace: SpinLock<UserspaceRunSlot>,
 }
 
@@ -876,14 +876,12 @@ impl HartRuntimeView<'_> {
                     .scheduler
                     .pick_next_from_local(hart, local.scheduler())
             })
-            .or_else(|| {
-                Some((
-                    handle,
-                    SliceConfig::Preemptive {
-                        slice_ns: Phase1Scheduler::PREEMPTED_QUEUE_SLICE_NS,
-                    },
-                ))
-            })
+            .or(Some((
+                handle,
+                SliceConfig::Preemptive {
+                    slice_ns: Phase1Scheduler::PREEMPTED_QUEUE_SLICE_NS,
+                },
+            )))
     }
 
     fn busiest_local_steal_victim(&self, thief: HartId) -> Option<HartId> {
@@ -1028,8 +1026,8 @@ impl Reactor {
                 scheduler: Phase1Scheduler::new(),
                 observability: SpinLock::new(ReactorObservability::default()),
                 timers: SpinLock::new(TimerQueue::new()),
-                timer_wheel: tx_substrate::wake::timer::TimerWheel::new(),
-                delegate_registry: Arc::new(tx_substrate::step::DelegateRegistry::new()),
+                timer_wheel: TimerWheel::new(),
+                delegate_registry: Arc::new(DelegateRegistry::new()),
                 userspace: SpinLock::new(UserspaceRunSlot::new()),
             },
             locals: ReactorLocals::new(),

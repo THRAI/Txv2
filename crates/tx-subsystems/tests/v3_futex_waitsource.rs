@@ -21,12 +21,11 @@
 //!    user word matches `val`; a subsequent `step_futex_wake` on
 //!    the same `uaddr` posts a `MailboxEvent::SourceFired` with the
 //!    registration's generation and the `FUTEX_WAKE_MASK` interest.
-//! 2. **wake-count-n-still-fires-source-once-per-bucket**. v1
-//!    `step_futex_wake` is best-effort: returns the requested `n`
-//!    regardless of actually-woken count. The `WaitSource::notify`
-//!    side fires the bucket source exactly once per wake call,
-//!    independent of `n` — all registered subscribers receive the
-//!    event; the syscall arm's `n` semantic is layered above.
+//! 2. **wake-count-n-still-fires-source-once-per-bucket**.
+//!    `step_futex_wake` returns the number of bucket subscribers it
+//!    actually notified, capped by `n`. The compatibility bucket
+//!    `WaitSource::notify` side still fires at most once per wake call,
+//!    independent of `n`.
 //! 3. **wake-fires-all-bucket-subscribers**. Multiple `TaskMailbox`es
 //!    registered against the same bucket each receive a
 //!    `SourceFired` event on a single wake call (broadcast within
@@ -42,11 +41,10 @@
 //!    a regression in the futex-bucket lifetime model).
 //! 6. **generation-stamped**. The posted event carries the same
 //!    `WaitGeneration` the registration captured.
-//! 7. **bucket_wait_source_id-round-trip**. The `WaitSourceId`
-//!    stamped into `step_futex_wait`'s `OnWaitSource` yield matches
-//!    the `WaitSource::id()` returned by
-//!    `bucket_wait_source_for_source_id` — D2's "same id namespace"
-//!    pin.
+//! 7. **exact_wait_source_id**. The `WaitSourceId` stamped into
+//!    `step_futex_wait`'s `OnWaitSource` yield is the exact
+//!    `(aspace, uaddr)` wait source, not the legacy compatibility
+//!    bucket source.
 //! 8. **D2-coexistence**. A `step_futex_wake` call fires both the
 //!    legacy `Channel` AND the new `WaitSource` on the same step.
 //!    Mirrors the pipe-side `write_fires_both_legacy_channel_and_new_wait_source`
@@ -63,10 +61,15 @@ use tx_subsystems::futex::adapter::wait_routing::{
     MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
 };
 
-use tx_hal::UserPtr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use tx_hal::{
+    Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+    PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, UserPtr, VirtAddr,
+};
 use tx_subsystems::futex::{
     bucket_index, bucket_wait_source, bucket_wait_source_for_source_id, step_futex_wait,
-    step_futex_wake, FUTEX_WAKE_MASK,
+    step_futex_wake, step_futex_wake_in, FUTEX_WAKE_MASK,
 };
 use tx_subsystems::vm::{
     AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
@@ -75,11 +78,53 @@ use tx_subsystems::vm::{
 use tx_subsystems::wait_source as legacy_wait_source;
 use tx_subsystems::zones;
 
-/// Minimal `PmapIf` stub for integration tests — the futex wait-source
-/// test only needs an AddressSpace with a single PrivateAnon page; it
-/// never actually walks the pmap, so the stub is a no-op.
+/// Minimal `PmapIf` stub for integration tests.
 struct FutexTestPmap;
-impl tx_hal::PmapIf for FutexTestPmap {}
+
+static NEXT_ROOT_ID: AtomicUsize = AtomicUsize::new(1);
+
+impl PmapIf for FutexTestPmap {
+    fn create_pmap_root() -> Result<PmapRoot, PmapError> {
+        let id = NEXT_ROOT_ID.fetch_add(1, Ordering::AcqRel);
+        Ok(PmapRoot::new(
+            PtNode::boot_pool(PhysAddr(id * USER_PAGE_SIZE)),
+            Asid(id as u16),
+        ))
+    }
+    fn destroy_pmap_root(_root: PmapRoot) {}
+    fn reserve_mapping(
+        _root: &PmapRoot,
+        virt: VirtAddr,
+        phys: PhysAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapReservation>, PmapError> {
+        Ok(Some(PmapReservation::new(virt, phys, kind)))
+    }
+    fn rollback_mapping(_root: &PmapRoot, _reservation: PmapReservation) {}
+    fn commit_mapping(
+        _root: &PmapRoot,
+        _reservation: PmapReservation,
+        _permissions: PmapPermissions,
+    ) {
+    }
+    fn unmap_mapping(
+        _root: &PmapRoot,
+        virt: VirtAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapUnmapResult>, PmapError> {
+        Ok(Some(PmapUnmapResult::new(virt, PhysAddr(virt.0), kind)))
+    }
+    fn protect_mapping(
+        _root: &PmapRoot,
+        virt: VirtAddr,
+        kind: PmapReserveKind,
+        _permissions: PmapPermissions,
+    ) -> Result<Option<PmapInvalidation>, PmapError> {
+        Ok(Some(PmapInvalidation::new(virt, kind.size())))
+    }
+    fn shootdown_kernel_mapping(_invalidation: PmapInvalidation) {}
+    fn shootdown_mapping(_asid: Asid, _invalidation: PmapInvalidation) {}
+}
 
 static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -87,6 +132,13 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tx_test_support::init_host();
     let _ = zones::register_all();
+    let stale_uaddr = 0x4_u64;
+    let cleanup_guard = ebr_guard();
+    while matches!(
+        step_futex_wake(stale_uaddr, u32::MAX, &cleanup_guard),
+        StepOutcome::Done(n) if n > 0
+    ) {}
+    drop(cleanup_guard);
     guard
 }
 
@@ -164,11 +216,9 @@ fn blocked_waiter_on_matching_value_is_woken_on_futex_wake() {
 
 #[test]
 fn wake_count_n_fires_source_once_independent_of_n() {
-    // `step_futex_wake(uaddr, n, ..)` returns Done(n) (best-effort)
-    // but the `WaitSource::notify` is per-call (one notify per
-    // wake), independent of `n`. Pin that the wake-count semantic
-    // is layered above the mailbox event delivery: a single
-    // wake call delivers one event per subscriber, not n events.
+    // `step_futex_wake(uaddr, n, ..)` returns actual notified
+    // subscribers capped by n; the `WaitSource::notify` is still
+    // per-call, independent of `n`.
     let _setup = setup();
     let word: u32 = 0;
     let uaddr = &word as *const u32 as u64;
@@ -181,7 +231,7 @@ fn wake_count_n_fires_source_once_independent_of_n() {
     let guard = ebr_guard();
     let outcome = step_futex_wake(uaddr, 7, &guard);
     drop(guard);
-    assert_eq!(outcome, StepOutcome::Done(7));
+    assert_eq!(outcome, StepOutcome::Done(1));
     assert_eq!(
         mailbox.len(),
         1,
@@ -387,9 +437,10 @@ fn wait_source_id_round_trips_from_yield_shape_to_bucket_source() {
 
     let uaddr = user_va as u64;
 
-    // `step_futex_wait` yields with the bucket's `source_id` stamped
-    // into `OnWaitSource`. The same `u64` resolves to the bucket's
-    // `Arc<WaitSource>` via `bucket_wait_source_for_source_id`.
+    // `step_futex_wait` yields with an exact `(aspace, uaddr)` source
+    // id stamped into `OnWaitSource`. The old bucket source remains a
+    // compatibility wake path, but exact waiters no longer publish
+    // their source ids into the bucket namespace.
     let guard = ebr_guard();
     let outcome = step_futex_wait(&aspace, uaddr, 0xdead_beef, &guard);
     drop(guard);
@@ -402,16 +453,21 @@ fn wait_source_id_round_trips_from_yield_shape_to_bucket_source() {
         other => panic!("expected Yield::OnWaitSource, got {other:?}"),
     };
 
-    let direct = bucket_wait_source(uaddr).expect("bucket initialised");
-    let by_id = bucket_wait_source_for_source_id(stamped_id)
-        .expect("stamped source_id resolves via legacy id namespace");
-
-    // Same underlying Arc<WaitSource> identity (Arc::ptr_eq).
-    assert!(
-        Arc::ptr_eq(&direct, &by_id),
-        "bucket_wait_source(uaddr) and bucket_wait_source_for_source_id(stamped) must be the same Arc",
+    let bucket = bucket_wait_source(uaddr).expect("bucket initialised");
+    assert_ne!(
+        bucket.id().raw(),
+        stamped_id,
+        "futex wait should yield the exact wait source, not the bucket source",
     );
-    assert_eq!(direct.id().raw(), stamped_id);
+    assert!(
+        bucket_wait_source_for_source_id(stamped_id).is_none(),
+        "exact futex wait-source ids must not resolve through the legacy bucket namespace",
+    );
+
+    let guard = ebr_guard();
+    let wake = step_futex_wake_in(&aspace, uaddr, 1, &guard);
+    drop(guard);
+    assert_eq!(wake, StepOutcome::Done(1));
 }
 
 // === Invariant 8: D2 coexistence — both paths fire =====================
@@ -441,7 +497,10 @@ fn wake_fires_both_legacy_channel_and_new_wait_source() {
     let guard = ebr_guard();
     let outcome = step_futex_wake(uaddr, 1, &guard);
     drop(guard);
-    assert_eq!(outcome, StepOutcome::Done(1));
+    assert!(
+        matches!(outcome, StepOutcome::Done(_)),
+        "legacy bucket wake should complete synchronously, got {outcome:?}",
+    );
 
     assert_eq!(mailbox.len(), 1, "new path must have posted one event");
     assert_source_fired(&mailbox, source.id(), gen, FUTEX_WAKE_MASK);

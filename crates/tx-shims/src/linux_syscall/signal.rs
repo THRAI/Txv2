@@ -5,11 +5,12 @@
 
 use super::*;
 use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
-use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_TKILL, SI_USER};
+use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
 use tx_subsystems::signal::{KillOutcome, SignalTarget};
 
 #[cfg(target_arch = "loongarch64")]
 const MUSL_SIGCANCEL: u8 = 33;
+const SI_TKILL: i32 = -6;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
@@ -98,7 +99,7 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let oldset_ptr = args[2] as usize;
     let sigsetsize = args[3];
 
-    if sigsetsize < SIGSETSIZE_BYTES {
+    if sigsetsize != SIGSETSIZE_BYTES {
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
@@ -280,7 +281,7 @@ pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
 
     // The slice only supports the canonical 8-byte sigset_t on RV64;
     // mirrors the `sys_rt_sigprocmask` precedent (`SIGSETSIZE_BYTES`).
-    if sigsetsize < SIGSETSIZE_BYTES as usize {
+    if sigsetsize != SIGSETSIZE_BYTES as usize {
         return SyscallResult::Error(EINVAL_VALUE);
     }
     if set_uaddr == 0 {
@@ -425,7 +426,7 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     let oldact_ptr = args[2] as usize;
     let sigsetsize = args[3];
 
-    if sigsetsize < SIGSETSIZE_BYTES {
+    if sigsetsize != SIGSETSIZE_BYTES {
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
@@ -440,7 +441,7 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     // Decode the new action (if any) through the canonical user-VA
     // lane (`bootstrap_copy_from_user` bridges via
     // `aspace.copy_from_user`).
-    let new_disposition: Option<SigDisposition> = if act_ptr == 0 {
+    let new_entry: Option<SigActionEntry> = if act_ptr == 0 {
         None
     } else {
         let mut bytes = [0u8; SIGACTION_BYTES];
@@ -448,24 +449,18 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             return SyscallResult::error_from(errno);
         }
         let handler = read_u64_le(&bytes[0..8]);
-        // sa_flags / sa_restorer / sa_mask are decoded but unused at
-        // this layer — `SigDisposition` only stores the handler shape.
-        // Once SA_SIGINFO / SA_RESTORER / per-handler mask wiring
-        // lands these fields will materialise on `SigDisposition`.
-        let flags = read_u64_le(&bytes[8..16]);
-        let restorer = read_u64_le(&bytes[16..24]);
-        let _mask = read_u64_le(&bytes[24..32]);
+        let flags = SaFlags::new(read_u64_le(&bytes[8..16]));
+        let mask = SignalMask::new(read_u64_le(&bytes[16..24]));
+        let restorer = read_u64_le(&bytes[24..32]);
 
         // SIG_DFL == 0, SIG_IGN == 1 per Linux generic ABI; everything
         // else is a userspace function-pointer handler.
         let disp = match handler {
             0 => SigDisposition::Default,
             1 => SigDisposition::Ignore,
-            other => {
-                SigDisposition::handler_with_restorer(other as usize, flags, restorer as usize)
-            }
+            other => SigDisposition::Handler(other as usize),
         };
-        Some(disp)
+        Some(SigActionEntry::new(disp, flags, mask, restorer as usize))
     };
 
     // If the caller wants the previous disposition, snapshot it
@@ -474,13 +469,13 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     // for both install and query — but `act_ptr == 0` is "query only",
     // and we must not mutate. Read the live disposition through the
     // process's `sig_actions` table accessor in that case.
-    let prev_disposition: SigDisposition = match new_disposition {
-        Some(disp) => {
+    let prev_entry: SigActionEntry = match new_entry {
+        Some(entry) => {
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = SigactionOp {
                 process: ctx.process.clone(),
                 sig,
-                disposition: disp,
+                entry,
             };
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(SigDispositionChange::Replaced { prev }) => prev,
@@ -495,10 +490,10 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         }
         None => {
             // Query-only: read directly via the process's
-            // `sig_disposition` accessor. Returns `None` for zombies
+            // `sig_action_entry` accessor. Returns `None` for zombies
             // — surface as `-ESRCH`.
-            match ctx.process.sig_disposition(sig) {
-                Some(d) => d,
+            match ctx.process.sig_action_entry(sig) {
+                Some(entry) => entry,
                 None => {
                     return SyscallResult::Error(ESRCH_VALUE);
                 }
@@ -507,26 +502,19 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     };
 
     if oldact_ptr != 0 {
-        let handler_value: u64 = match prev_disposition {
+        let handler_value: u64 = match prev_entry.disposition {
             SigDisposition::Default => 0, // SIG_DFL
             SigDisposition::Ignore => 1,  // SIG_IGN
-            SigDisposition::Handler { handler, .. } => handler as u64,
+            SigDisposition::Handler(addr) => addr as u64,
         };
         // Build a 32-byte image and copy out through the canonical
-        // user-VA lane. Layout: 4×u64 little-endian (sa_handler,
-        // sa_flags, sa_restorer, sa_mask). All but sa_handler are 0
-        // until SA_SIGINFO / SA_RESTORER / per-handler mask wiring
-        // lands.
+        // user-VA lane. RV64 musl layout: 4×u64 little-endian
+        // (handler, flags, mask, unused/restorer).
         let mut image = [0u8; SIGACTION_BYTES];
         image[0..8].copy_from_slice(&handler_value.to_le_bytes());
-        if let SigDisposition::Handler {
-            flags, restorer, ..
-        } = prev_disposition
-        {
-            image[8..16].copy_from_slice(&flags.to_le_bytes());
-            image[16..24].copy_from_slice(&(restorer as u64).to_le_bytes());
-        }
-        // image[24..32] already zero.
+        image[8..16].copy_from_slice(&prev_entry.flags.bits().to_le_bytes());
+        image[16..24].copy_from_slice(&prev_entry.sa_mask.raw_bits().to_le_bytes());
+        image[24..32].copy_from_slice(&(prev_entry.restorer as u64).to_le_bytes());
         if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, oldact_ptr as u64, &image) {
             return SyscallResult::error_from(errno);
         }
@@ -674,15 +662,17 @@ pub(super) fn sys_tkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             si_pid: ctx.process.pid.0,
             si_uid: 0,
         });
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = ThreadKillOp {
-            thread: thread_cap,
-            sig: signum,
-            info: siginfo,
-        };
-        return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-            Ok(()) => SyscallResult::Return(0),
-            Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        return match tx_subsystems::signal::script_deliver_signal(
+            &ctx.process,
+            SignalTarget::Thread(thread_cap),
+            signum,
+            siginfo,
+        ) {
+            Ok(tx_subsystems::signal::KillOutcome::Delivered) => SyscallResult::Return(0),
+            Ok(tx_subsystems::signal::KillOutcome::NoLiveThread) => {
+                SyscallResult::Error(ESRCH_VALUE)
+            }
+            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
         };
     }
 
@@ -793,7 +783,7 @@ pub(super) fn sys_rt_sigpending(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResu
     let set_ptr = args[0] as usize;
     let sigsetsize = args[1];
 
-    if sigsetsize < SIGSETSIZE_BYTES {
+    if sigsetsize != SIGSETSIZE_BYTES {
         return SyscallResult::Error(EINVAL_VALUE);
     }
 

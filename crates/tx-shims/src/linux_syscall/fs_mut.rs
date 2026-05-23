@@ -853,7 +853,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     // No outer guard here: `walk_from` acquires its own internal
     // guard (fs_path.rs), and txKernel's epoch discipline panics
     // on nested guards (`tx-substrate::epoch::local:55`).
-    let target_dentry = match walk_from(cwd.clone(), &target, &cred) {
+    let target_dentry = match walk_from_process(cwd.clone(), &target, &cred, &ctx.process) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
@@ -865,10 +865,14 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     const MS_BIND: u64 = 4096;
     const MS_RDONLY: u64 = 1;
     const MS_REMOUNT: u64 = 32;
+    const MS_NOSUID: u64 = 2;
+    const MS_NODEV: u64 = 4;
+    const MS_NOEXEC: u64 = 8;
+    const MS_NOATIME: u64 = 1024;
     if (flags & MS_REMOUNT) != 0 {
         let mut mount_flags = mount::MountFlags::empty();
         if (flags & MS_RDONLY) != 0 {
-            mount_flags = mount::MountFlags::READ_ONLY;
+            mount_flags = mount_flags.union(mount::MountFlags::READ_ONLY);
         }
         let mount = match mount::mount_for_root_dentry(&target_dentry) {
             Some(mount) => mount,
@@ -884,7 +888,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         };
-        let source_dentry = match walk_from(cwd, &source, &cred) {
+        let source_dentry = match walk_from_process(cwd, &source, &cred, &ctx.process) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         };
@@ -983,7 +987,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
             let source = source_label_for_ext4
                 .as_ref()
                 .expect("ext4 fstype implies source was read");
-            let source_dentry = match walk_from(cwd.clone(), source, &cred) {
+            let source_dentry = match walk_from_process(cwd.clone(), source, &cred, &ctx.process) {
                 Ok(d) => d,
                 Err(e) => return SyscallResult::Error(e),
             };
@@ -1019,14 +1023,24 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         _ => return SyscallResult::Error(ENOSYS_VALUE),
     };
 
-    // Translate the Linux `flags` u64 into kernel `MountFlags`. Per
+    // Translate the Linux `flags` u64 into kernel `MountFlags`.
     // Linux's `mount(2)` manpage: `MS_RDONLY = 1`, `MS_NOSUID = 2`,
-    // `MS_NOATIME = 1024`. The kernel `MountFlags::READ_ONLY` bit
-    // mirrors `MS_RDONLY`. Other flags are accepted but not yet
-    // enforced.
+    // `MS_NODEV = 4`, `MS_NOEXEC = 8`, `MS_NOATIME = 1024`.
     let mut mount_flags = mount::MountFlags::empty();
     if (flags & MS_RDONLY) != 0 {
-        mount_flags = mount::MountFlags::READ_ONLY;
+        mount_flags = mount_flags.union(mount::MountFlags::READ_ONLY);
+    }
+    if (flags & MS_NOSUID) != 0 {
+        mount_flags = mount_flags.union(mount::MountFlags::NOSUID);
+    }
+    if (flags & MS_NODEV) != 0 {
+        mount_flags = mount_flags.union(mount::MountFlags::NODEV);
+    }
+    if (flags & MS_NOEXEC) != 0 {
+        mount_flags = mount_flags.union(mount::MountFlags::NOEXEC);
+    }
+    if (flags & MS_NOATIME) != 0 {
+        mount_flags = mount_flags.union(mount::MountFlags::NO_ATIME);
     }
     let mount_options = mount::MountOptions { flags: mount_flags };
 
@@ -1073,11 +1087,19 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         Err(_) => return SyscallResult::Error(Errno::ENOMEM as i32),
     };
 
-    mount::register_mount(
-        &parent_payload,
-        target_dentry.rnode().fs_object_id(),
-        mount_cap,
-    );
+    if let Some(mnt_ns) = ctx.process.mount_namespace_cap() {
+        mnt_ns.register_mount(
+            &parent_payload,
+            target_dentry.rnode().fs_object_id(),
+            mount_cap,
+        );
+    } else {
+        mount::register_mount(
+            &parent_payload,
+            target_dentry.rnode().fs_object_id(),
+            mount_cap,
+        );
+    }
 
     SyscallResult::Return(0)
 }
@@ -1106,7 +1128,7 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     // Use walk_from (which manages its own guard) instead of a
     // top-level guard + step_walk, because mount_payload_for_dentry
     // also acquires a guard — nesting panics at epoch::local:55.
-    let target_dentry = match walk_from(cwd.clone(), &target, &cred) {
+    let target_dentry = match walk_from_process(cwd.clone(), &target, &cred, &ctx.process) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
@@ -1115,7 +1137,13 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
         None => return SyscallResult::Error(ENODEV_VALUE),
     };
 
-    match mount::umount(&target_dentry, &parent_payload) {
+    let result = if let Some(mnt_ns) = ctx.process.mount_namespace_cap() {
+        mnt_ns.umount(&target_dentry, &parent_payload)
+    } else {
+        mount::umount(&target_dentry, &parent_payload)
+    };
+
+    match result {
         Ok(()) => SyscallResult::Return(0),
         Err(e) => SyscallResult::error_from(e),
     }

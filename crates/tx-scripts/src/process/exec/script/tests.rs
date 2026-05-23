@@ -26,6 +26,9 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 use crate::adapter::step_engine::{
     self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, SpinMutex, StepOutcome,
 };
+use crate::adapter::vfs_exec::{
+    Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
+};
 use tx_hal::{
     Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
     PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
@@ -42,9 +45,6 @@ use tx_subsystems::page_backed::{
 use tx_subsystems::process::{bootstrap_init_process, step_chdir, ChdirOutcome, ProcessIdentity};
 use tx_subsystems::signal::{SigDisposition, Signum};
 use tx_subsystems::thread_runtime::ThreadIdentity;
-use tx_subsystems::vfs::structure::{
-    Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
-};
 use tx_subsystems::vm::{AddressSpace, USER_PAGE_SIZE};
 use tx_subsystems::zones;
 
@@ -758,7 +758,7 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
     // the test only cares about presence/absence of the slot.
     let _ = fs.add_regular_with_bytes(FsObjectId::new(2), b"keep", b"hello-keep-me");
 
-    use tx_subsystems::vfs::structure::{OpenFile, OpenFileFlags};
+    use crate::adapter::vfs_exec::{OpenFile, OpenFileFlags};
     // Build OpenFiles directly over the test fs's PageContainers via
     // `materialise_rnode` — tx-subsystems::vfs::OpenFile::new_cap is
     // public.

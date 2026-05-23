@@ -8,26 +8,38 @@
 //! retain identity but drop payload.
 
 use crate::cred::{sign_cred, Cred};
-use crate::ipc::sysv_shm;
+use crate::ipc::{posix_mq, sysv_msg, sysv_sem, sysv_shm};
+use crate::mount::{
+    DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
+    SourceLabel,
+};
+use alloc::sync::Arc;
+
+use crate::page_backed::{Frame as PageFrame, FsPageBacking};
 use crate::process::adapter::step_engine::{
     guard as ebr_guard, sign, Cap, ScriptCtx, StepOp, StepOutcome,
 };
 use crate::process::execution::{
     init_process, reset_init_process_for_test, step_exit_group_with_signal, BootstrapError, DupOp,
 };
+use crate::process::nsproxy::{PosixMqName, SysvKey};
 use crate::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use crate::process::structure::{
     reset_pid_counter_for_test, ExitStatus, Pgid, Pid, ProcessIdentity,
 };
 use crate::process::{
-    bootstrap_init_process, step_chdir, step_exit_group, step_fork, step_getcwd, step_setpgid,
-    step_setsid, step_waitpid_nohang, ChdirOutcome, ForkError, SetpgidError, WaitError, WaitTarget,
+    bootstrap_init_process, step_chdir, step_exit_group, step_fork, step_fork_with_options,
+    step_getcwd, step_setpgid, step_setsid, step_waitpid_nohang, ChdirOutcome, ForkError,
+    ForkOptions, SetpgidError, WaitError, WaitTarget,
 };
 use crate::signal::Signum;
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::step_thread_exit;
 use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentity};
-use crate::vfs::{DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking};
+use crate::vfs::{
+    Credential, DEntry, DirCursor, DirEntry, FsObjectId, FsOps, InlineName, InodeKind, InodeMeta,
+    RNode, RNodeBacking,
+};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
 use core::future::Future;
@@ -79,6 +91,200 @@ fn bootstrap() -> Cap<ProcessIdentity> {
     bootstrap_init_process(fresh_aspace()).expect("bootstrap init")
 }
 
+struct NullMountFs;
+
+impl FsOps for NullMountFs {
+    fn lookup(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<FsObjectId, crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn load_inode_meta(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<InodeMeta, crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn serialize_inode_meta(
+        &self,
+        _fs_object_id: FsObjectId,
+        _meta: &InodeMeta,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn create_inode(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), crate::process::adapter::step_engine::NoProgress>
+    {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn unlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn rename(
+        &self,
+        _old_parent: FsObjectId,
+        _old_name: &[u8],
+        _new_parent: FsObjectId,
+        _new_name: &[u8],
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn link(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn mkdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), crate::process::adapter::step_engine::NoProgress>
+    {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn rmdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn symlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _link_target: &[u8],
+        _cred: &Credential,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), crate::process::adapter::step_engine::NoProgress>
+    {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn readdir(
+        &self,
+        _fs_object_id: FsObjectId,
+        _cursor: DirCursor,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, crate::process::adapter::step_engine::NoProgress>
+    {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+
+    fn destroy_inode(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never walk the dummy mount")
+    }
+}
+
+impl FsPageBacking for NullMountFs {
+    fn fetch_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<PageFrame, crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never page the dummy mount")
+    }
+
+    fn flush_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _frame: &PageFrame,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never page the dummy mount")
+    }
+
+    fn truncate(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_size: u64,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never page the dummy mount")
+    }
+
+    fn fsync_file(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("process namespace tests never page the dummy mount")
+    }
+}
+
+fn fresh_mount_namespace() -> Cap<MountNamespace> {
+    let fs = Arc::new(NullMountFs);
+    let payload = MountPayload::new_cap(
+        fs.clone(),
+        fs,
+        None,
+        DevId::new(100),
+        MountOptions::default(),
+        "nullfs",
+        SourceLabel::Static("nullfs"),
+    )
+    .expect("dummy mount payload");
+    let root = RNode::new_cap_in_mount(
+        FsObjectId::ROOT,
+        InodeMeta::new(InodeKind::Directory, 0o040755),
+        RNodeBacking::Directory,
+        &payload,
+    )
+    .expect("dummy root rnode");
+    let root_mount = MountIdentity::new_cap(
+        MountId::new(100),
+        None,
+        root,
+        None,
+        payload,
+        MountFlags::empty(),
+    )
+    .expect("dummy root mount");
+    MountNamespace::new_cap(root_mount).expect("dummy mount namespace")
+}
+
 fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
     let payload_guard = proc_cap.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");
@@ -119,6 +325,154 @@ fn fork_creates_child_with_leader_thread_and_inherits_pgrp() {
 
     // Child inherits parent's pgrp.
     assert_eq!(child.pgrp_cap().pgid, parent.pgrp_cap().pgid);
+}
+
+#[test]
+fn fork_with_clone_newipc_publishes_fresh_empty_ipc_namespace() {
+    let _g = setup();
+    let parent = bootstrap();
+    let parent_nsproxy = parent.nsproxy_cap().expect("parent nsproxy");
+
+    {
+        let mut limits = parent_nsproxy.ipc_ns.limits.lock();
+        limits.mq_maxmsg = 17;
+        limits.msgmni = 23;
+    }
+    let ipc_cred = sign_cred(Cred::root()).expect("ipc cred cap");
+    let sem_identity = sysv_sem::structure::register_sem(
+        Some(SysvKey::new(0x10)),
+        ipc_cred.clone(),
+        1,
+        sysv_shm::structure::IpcPerm::new(0o600),
+        0,
+        0,
+    )
+    .expect("sem identity");
+    parent_nsproxy
+        .ipc_ns
+        .sysv_sem
+        .lock()
+        .insert(SysvKey::new(0x10), sem_identity);
+    let shm_identity = sysv_shm::structure::register_shm(
+        Some(SysvKey::new(0x20)),
+        ipc_cred.clone(),
+        4096,
+        sysv_shm::structure::IpcPerm::new(0o600),
+        0,
+        0,
+    )
+    .expect("shm identity");
+    parent_nsproxy
+        .ipc_ns
+        .sysv_shm
+        .lock()
+        .insert(SysvKey::new(0x20), shm_identity);
+    let msg_identity = sysv_msg::structure::register_msg(
+        Some(SysvKey::new(0x30)),
+        ipc_cred.clone(),
+        sysv_shm::structure::IpcPerm::new(0o600),
+        0,
+        0,
+        16,
+        16,
+    )
+    .expect("msg identity");
+    parent_nsproxy
+        .ipc_ns
+        .sysv_msg
+        .lock()
+        .insert(SysvKey::new(0x30), msg_identity);
+    let mq_cred = sign_cred(Cred::root()).expect("mq cred cap");
+    let (_mqid, mq_identity) = posix_mq::structure::register_mq(
+        PosixMqName::new(b"/parent"),
+        mq_cred,
+        sysv_shm::structure::IpcPerm::new(0o600),
+        404,
+        2,
+        16,
+    )
+    .expect("mq identity");
+    parent_nsproxy
+        .ipc_ns
+        .posix_mq
+        .lock()
+        .insert(PosixMqName::new(b"/parent"), mq_identity);
+
+    let child = step_fork_with_options::<TestPmap>(
+        &parent,
+        ForkOptions {
+            clone_newipc: true,
+            ..ForkOptions::default()
+        },
+    )
+    .expect("fork with CLONE_NEWIPC");
+    let child_nsproxy = child.nsproxy_cap().expect("child nsproxy");
+
+    assert_ne!(
+        parent_nsproxy.key().raw(),
+        child_nsproxy.key().raw(),
+        "CLONE_NEWIPC must publish a replacement nsproxy bundle"
+    );
+    assert_ne!(
+        parent_nsproxy.ipc_ns.key().raw(),
+        child_nsproxy.ipc_ns.key().raw(),
+        "CLONE_NEWIPC must create a fresh IPC namespace"
+    );
+    assert_eq!(
+        parent_nsproxy.pid_ns.key().raw(),
+        child_nsproxy.pid_ns.key().raw(),
+        "non-IPC namespaces stay shared in this slice"
+    );
+
+    let child_limits = *child_nsproxy.ipc_ns.limits.lock();
+    assert_eq!(child_limits.mq_maxmsg, 17);
+    assert_eq!(child_limits.msgmni, 23);
+    assert!(child_nsproxy.ipc_ns.sysv_sem.lock().is_empty());
+    assert!(child_nsproxy.ipc_ns.sysv_shm.lock().is_empty());
+    assert!(child_nsproxy.ipc_ns.sysv_msg.lock().is_empty());
+    assert!(child_nsproxy.ipc_ns.posix_mq.lock().is_empty());
+
+    assert_eq!(parent_nsproxy.ipc_ns.sysv_sem.lock().len(), 1);
+    assert_eq!(parent_nsproxy.ipc_ns.sysv_shm.lock().len(), 1);
+    assert_eq!(parent_nsproxy.ipc_ns.sysv_msg.lock().len(), 1);
+    assert_eq!(parent_nsproxy.ipc_ns.posix_mq.lock().len(), 1);
+}
+
+#[test]
+fn fork_inherits_mount_namespace_from_nsproxy_bundle() {
+    let _g = setup();
+    let parent = bootstrap();
+    let parent_mnt_ns = fresh_mount_namespace();
+    let parent_nsproxy = parent.nsproxy_cap().expect("parent nsproxy");
+    let replacement =
+        crate::process::nsproxy::clone_nsproxy_with_mount_namespace(&parent_nsproxy, parent_mnt_ns)
+            .expect("replacement nsproxy");
+
+    {
+        let payload_guard = parent.payload.lock();
+        let payload = payload_guard.as_ref().expect("parent payload");
+        let _old = payload.replace_nsproxy(replacement);
+    }
+
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
+    let parent_nsproxy = parent.nsproxy_cap().expect("parent nsproxy");
+    let child_nsproxy = child.nsproxy_cap().expect("child nsproxy");
+
+    assert_eq!(
+        parent_nsproxy
+            .mnt_ns
+            .as_ref()
+            .expect("parent mnt ns")
+            .key()
+            .raw(),
+        child_nsproxy
+            .mnt_ns
+            .as_ref()
+            .expect("child mnt ns")
+            .key()
+            .raw(),
+        "plain fork must inherit the mount namespace cap"
+    );
 }
 
 #[test]
@@ -185,8 +539,10 @@ fn last_thread_exit_detaches_live_sysv_shm_mappings() {
         &ns,
     )
     .expect("shmget private");
-    let addr =
-        block_on(sysv_shm::execution::step_shmat(shmid, 0, 0, &cred, &aspace)).expect("shmat");
+    let addr = block_on(sysv_shm::execution::script_shmat(
+        shmid, 0, 0, &cred, &aspace,
+    ))
+    .expect("shmat");
     assert!(aspace.lookup(crate::vm::UserVirtAddr(addr)).is_some());
 
     let leader = first_thread(&proc_cap);
@@ -233,8 +589,10 @@ fn exit_group_detaches_live_sysv_shm_mappings() {
         &ns,
     )
     .expect("shmget private");
-    let addr =
-        block_on(sysv_shm::execution::step_shmat(shmid, 0, 0, &cred, &aspace)).expect("shmat");
+    let addr = block_on(sysv_shm::execution::script_shmat(
+        shmid, 0, 0, &cred, &aspace,
+    ))
+    .expect("shmat");
     assert!(aspace.lookup(crate::vm::UserVirtAddr(addr)).is_some());
 
     step_exit_group(&proc_cap, ExitStatus::Exited(42));
@@ -251,6 +609,181 @@ fn exit_group_detaches_live_sysv_shm_mappings() {
     assert_eq!(stat.attach_count, 0);
     sysv_shm::execution::step_shmctl(shmid, sysv_shm::execution::IPC_RMID, None, &cred)
         .expect("rmid");
+}
+
+#[test]
+fn last_thread_exit_applies_sysv_sem_undo_adjustments() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let ns = proc_cap.nsproxy_cap().expect("nsproxy cap");
+    let cred = sign_cred(Cred::root()).expect("root cred cap");
+    let semid = sysv_sem::execution::step_semget(
+        sysv_shm::execution::IPC_PRIVATE,
+        1,
+        sysv_shm::execution::IPC_CREAT | 0o600,
+        &cred,
+        &ns,
+    )
+    .expect("semget private");
+    sysv_sem::execution::step_semctl(
+        semid,
+        0,
+        sysv_sem::execution::SETVAL,
+        sysv_sem::execution::SemCtlArg::Val(2),
+        &cred,
+        None,
+    )
+    .expect("SETVAL");
+    sysv_sem::execution::step_semop(
+        semid,
+        &[sysv_sem::structure::SemBuf {
+            sem_num: 0,
+            sem_op: -2,
+            sem_flg: sysv_sem::structure::sem_flg::SEM_UNDO,
+        }],
+        &cred,
+        &proc_cap,
+    )
+    .expect("semop SEM_UNDO");
+
+    let leader = first_thread(&proc_cap);
+    step_thread_exit(leader, 7);
+
+    assert!(proc_cap.is_zombie());
+    match sysv_sem::execution::step_semctl(
+        semid,
+        0,
+        sysv_sem::execution::GETVAL,
+        sysv_sem::execution::SemCtlArg::None,
+        &cred,
+        None,
+    )
+    .expect("GETVAL after exit")
+    {
+        sysv_sem::execution::SemCtlResult::Val(value) => assert_eq!(value, 2),
+        other => panic!("expected Val, got {other:?}"),
+    }
+}
+
+#[test]
+fn exit_group_applies_sysv_sem_undo_adjustments() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let ns = proc_cap.nsproxy_cap().expect("nsproxy cap");
+    let cred = sign_cred(Cred::root()).expect("root cred cap");
+    let semid = sysv_sem::execution::step_semget(
+        sysv_shm::execution::IPC_PRIVATE,
+        1,
+        sysv_shm::execution::IPC_CREAT | 0o600,
+        &cred,
+        &ns,
+    )
+    .expect("semget private");
+    sysv_sem::execution::step_semctl(
+        semid,
+        0,
+        sysv_sem::execution::SETVAL,
+        sysv_sem::execution::SemCtlArg::Val(2),
+        &cred,
+        None,
+    )
+    .expect("SETVAL");
+    sysv_sem::execution::step_semop(
+        semid,
+        &[sysv_sem::structure::SemBuf {
+            sem_num: 0,
+            sem_op: -2,
+            sem_flg: sysv_sem::structure::sem_flg::SEM_UNDO,
+        }],
+        &cred,
+        &proc_cap,
+    )
+    .expect("semop SEM_UNDO");
+
+    step_exit_group(&proc_cap, ExitStatus::Exited(42));
+
+    assert!(proc_cap.is_zombie());
+    match sysv_sem::execution::step_semctl(
+        semid,
+        0,
+        sysv_sem::execution::GETVAL,
+        sysv_sem::execution::SemCtlArg::None,
+        &cred,
+        None,
+    )
+    .expect("GETVAL after exit_group")
+    {
+        sysv_sem::execution::SemCtlResult::Val(value) => assert_eq!(value, 2),
+        other => panic!("expected Val, got {other:?}"),
+    }
+}
+
+#[test]
+fn fork_child_exit_does_not_apply_parent_sysv_sem_undo_adjustments() {
+    let _g = setup();
+    let parent = bootstrap();
+    let ns = parent.nsproxy_cap().expect("nsproxy cap");
+    let cred = sign_cred(Cred::root()).expect("root cred cap");
+    let semid = sysv_sem::execution::step_semget(
+        sysv_shm::execution::IPC_PRIVATE,
+        1,
+        sysv_shm::execution::IPC_CREAT | 0o600,
+        &cred,
+        &ns,
+    )
+    .expect("semget private");
+    sysv_sem::execution::step_semctl(
+        semid,
+        0,
+        sysv_sem::execution::SETVAL,
+        sysv_sem::execution::SemCtlArg::Val(2),
+        &cred,
+        None,
+    )
+    .expect("SETVAL");
+    sysv_sem::execution::step_semop(
+        semid,
+        &[sysv_sem::structure::SemBuf {
+            sem_num: 0,
+            sem_op: -2,
+            sem_flg: sysv_sem::structure::sem_flg::SEM_UNDO,
+        }],
+        &cred,
+        &parent,
+    )
+    .expect("parent semop SEM_UNDO");
+
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
+    step_exit_group(&child, ExitStatus::Exited(0));
+
+    match sysv_sem::execution::step_semctl(
+        semid,
+        0,
+        sysv_sem::execution::GETVAL,
+        sysv_sem::execution::SemCtlArg::None,
+        &cred,
+        None,
+    )
+    .expect("GETVAL after child exit")
+    {
+        sysv_sem::execution::SemCtlResult::Val(value) => assert_eq!(value, 0),
+        other => panic!("expected Val, got {other:?}"),
+    }
+
+    step_exit_group(&parent, ExitStatus::Exited(0));
+    match sysv_sem::execution::step_semctl(
+        semid,
+        0,
+        sysv_sem::execution::GETVAL,
+        sysv_sem::execution::SemCtlArg::None,
+        &cred,
+        None,
+    )
+    .expect("GETVAL after parent exit")
+    {
+        sysv_sem::execution::SemCtlResult::Val(value) => assert_eq!(value, 2),
+        other => panic!("expected Val, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1208,455 +1741,7 @@ fn process_payload_aspace_atomic_replace_returns_previous_cap() {
     assert_ne!(post.key(), initial_key);
 }
 
-// ----- Wave 2 ELF loader plan: per-fd CLOEXEC bitmap + exec phase-7 -----
-//
-// Process-side tests for the Wave 2 deliverables:
-// - `ProcessPayload.fd_cloexec` storage (default 0; set/clear round trip).
-// - `step_fork` clones parent's CLOEXEC bits (Linux semantics).
-// - `step_close_cloexec_fds` (P1) closes only marked fds and clears the
-//   bitmap.
-// - `step_install_brk_for_exec` (P3) overwrites both `brk_base` and
-//   `current_brk`.
-
-/// Helper: synthesise an `OpenFile` `Cap` over a regular-file RNode so
-/// fd-table tests can install slots without standing up a TTY/devfs.
-fn fresh_open_file() -> Cap<crate::vfs::OpenFile> {
-    use crate::vfs::OpenFileFlags;
-    let rnode = fresh_rnode(7777);
-    crate::vfs::OpenFile::new_cap(
-        rnode,
-        OpenFileFlags {
-            read: true,
-            write: true,
-            append: false,
-            cloexec: false,
-            nonblocking: false,
-        },
-    )
-    .expect("open file cap")
-}
-
-fn pipe_payload_of(file: &Cap<crate::vfs::OpenFile>) -> Cap<crate::pipe::PipePayload> {
-    file.pipe_endpoint()
-        .expect("open file must be a pipe endpoint")
-        .0
-}
-
-fn assert_pipe_read_eof(payload: &Cap<crate::pipe::PipePayload>) {
-    let mut buf = [0u8; 4];
-    let guard = ebr_guard();
-    let outcome = crate::pipe::step_read(payload, &mut buf, &guard, false);
-    drop(guard);
-    assert_eq!(outcome, StepOutcome::Done(0));
-}
-
-fn assert_pipe_read_blocks(payload: &Cap<crate::pipe::PipePayload>) {
-    let mut buf = [0u8; 4];
-    let guard = ebr_guard();
-    let outcome = crate::pipe::step_read(payload, &mut buf, &guard, false);
-    drop(guard);
-    assert!(matches!(outcome, StepOutcome::Yield { .. }));
-}
-
-#[test]
-fn process_payload_fd_cloexec_default_zero() {
-    let _g = setup();
-    let proc_cap = bootstrap();
-    // Every fd defaults to "not CLOEXEC" — bootstrap_init_process
-    // initialises the CLOEXEC set empty per the Wave 2 plan (init's
-    // stdio is not close-on-exec by Linux convention).
-    //
-    // fd-ops Wave 1: assert via the snapshot accessor that the set
-    // really is empty; the previous AtomicU32 word check is gone.
-    assert!(
-        proc_cap.fd_cloexec_snapshot().is_empty(),
-        "bootstrap CLOEXEC set must start empty"
-    );
-    for fd in 0u32..16 {
-        assert!(!proc_cap.fd_cloexec(fd), "fd {fd} should default to false");
-    }
-    // fd-ops Wave 1: any `u32` is a valid fd key (the BTreeSet has no
-    // upper bound). Pre-Wave-1 the AtomicU32 capped at fd 31; the
-    // sparse set lifts that.
-    assert!(!proc_cap.fd_cloexec(31));
-    assert!(!proc_cap.fd_cloexec(32));
-    assert!(!proc_cap.fd_cloexec(64));
-}
-
-#[test]
-fn process_payload_set_fd_cloexec_round_trip() {
-    let _g = setup();
-    let proc_cap = bootstrap();
-
-    proc_cap.set_fd_cloexec(3, true);
-    assert!(proc_cap.fd_cloexec(3));
-    assert!(!proc_cap.fd_cloexec(2));
-    assert!(!proc_cap.fd_cloexec(4));
-
-    // Toggling another bit must not perturb the first.
-    proc_cap.set_fd_cloexec(5, true);
-    assert!(proc_cap.fd_cloexec(3));
-    assert!(proc_cap.fd_cloexec(5));
-
-    // Clearing fd 3 leaves fd 5 alone.
-    proc_cap.set_fd_cloexec(3, false);
-    assert!(!proc_cap.fd_cloexec(3));
-    assert!(proc_cap.fd_cloexec(5));
-
-    // fd-ops Wave 1: large fd values (> 31) are now legal — the
-    // sparse `BTreeSet<u32>` has no upper bound. Pre-Wave-1 the
-    // AtomicU32 silently dropped these.
-    proc_cap.set_fd_cloexec(100, true);
-    assert!(proc_cap.fd_cloexec(100));
-    assert!(proc_cap.fd_cloexec(5));
-    proc_cap.set_fd_cloexec(100, false);
-    assert!(!proc_cap.fd_cloexec(100));
-}
-
-// ---------------------------------------------------------------------------
-// fd-ops Wave 1 (2026-05-07): sparse `BTreeMap`/`BTreeSet` fd table.
-// ---------------------------------------------------------------------------
-
-/// fd-ops Wave 1: any `u32` fd is a valid key in the sparse
-/// `BTreeMap<u32, Cap<OpenFile>>` table. Pre-Wave-1 the table was a
-/// fixed `[Option<Cap<OpenFile>>; 8]` array and the install at fd 100
-/// would have been silently dropped.
-#[test]
-fn process_payload_fds_btreemap_supports_sparse_fd_above_31() {
-    let _g = setup();
-    let proc_cap = bootstrap();
-
-    let file = fresh_open_file();
-    let prev = proc_cap.set_fd(100, Some(file));
-    assert!(prev.is_none(), "fd 100 was not previously occupied");
-
-    assert!(proc_cap.fd(100).is_some(), "fd 100 must be observable");
-    // No other fds occupy.
-    for fd in [0u32, 1, 2, 3, 7, 31, 32, 99, 101, 200] {
-        assert!(
-            proc_cap.fd(fd).is_none(),
-            "fd {fd} must be empty (only fd 100 was set)"
-        );
-    }
-
-    let removed = proc_cap.set_fd(100, None);
-    assert!(removed.is_some(), "removing fd 100 returns the prior file");
-    assert!(
-        proc_cap.fd(100).is_none(),
-        "fd 100 must be empty post-remove"
-    );
-}
-
-/// fd-ops Wave 1: `allocate_fd` returns the lowest unused fd ≥ 0.
-/// Walks the BTreeMap's sorted keys looking for the first gap.
-#[test]
-fn process_payload_allocate_fd_returns_lowest_unused() {
-    let _g = setup();
-    let proc_cap = bootstrap();
-
-    // Empty table: lowest unused fd is 0.
-    assert_eq!(proc_cap.allocate_fd(), 0);
-
-    // Install fd 0 and fd 2 — leaving fd 1 as the gap.
-    proc_cap.set_fd(0, Some(fresh_open_file()));
-    proc_cap.set_fd(2, Some(fresh_open_file()));
-    assert_eq!(proc_cap.allocate_fd(), 1, "fd 1 is the lowest gap");
-
-    // Plug the gap; lowest unused fd shifts to 3.
-    proc_cap.set_fd(1, Some(fresh_open_file()));
-    assert_eq!(proc_cap.allocate_fd(), 3);
-
-    // `next_fd_above` is the same scan with a non-zero floor.
-    assert_eq!(proc_cap.next_fd_above(2), 3);
-    assert_eq!(proc_cap.next_fd_above(10), 10);
-}
-
-/// fd-ops Wave 1: `install_fd` returns the previous occupant so the
-/// caller can EBR-defer-drop the displaced `Cap<OpenFile>`. Matches
-/// the `dup2`/`dup3` shape (Wave 4).
-#[test]
-fn process_payload_install_fd_returns_previous_occupant() {
-    let _g = setup();
-    let proc_cap = bootstrap();
-
-    let first = fresh_open_file();
-    let second = fresh_open_file();
-
-    // First install: slot was empty.
-    let prev1 = proc_cap.install_fd(5, first);
-    assert!(
-        prev1.is_none(),
-        "first install at fd 5 has no prior occupant"
-    );
-
-    // Second install at the same fd: the first occupant returns.
-    let prev2 = proc_cap.install_fd(5, second);
-    assert!(
-        prev2.is_some(),
-        "second install at fd 5 must return the first occupant"
-    );
-
-    assert!(proc_cap.fd(5).is_some(), "fd 5 must remain installed");
-}
-
-/// fd-ops Wave 1: `step_fork`'s fd-table clone walks the parent's
-/// `BTreeMap` entries (sparse fds included), not a 0..8 array index
-/// loop. The child sees every parent fd, including fds > 31.
-#[test]
-fn process_payload_step_fork_clones_sparse_fd_table() {
-    let _g = setup();
-    let parent = bootstrap();
-
-    // Parent's fd table: fds 0, 1, 2 (the canonical stdio shape) plus
-    // fd 100 (the sparse case the BTreeMap migration unlocks).
-    parent.set_fd(0, Some(fresh_open_file()));
-    parent.set_fd(1, Some(fresh_open_file()));
-    parent.set_fd(2, Some(fresh_open_file()));
-    parent.set_fd(100, Some(fresh_open_file()));
-
-    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
-
-    // Child inherits the entire sparse map.
-    assert!(child.fd(0).is_some(), "child inherits fd 0");
-    assert!(child.fd(1).is_some(), "child inherits fd 1");
-    assert!(child.fd(2).is_some(), "child inherits fd 2");
-    assert!(child.fd(100).is_some(), "child inherits sparse fd 100");
-    assert!(child.fd(3).is_none(), "fd 3 was never set; child sees None");
-
-    // Mutating the child must not bleed back into the parent.
-    child.set_fd(100, None);
-    assert!(child.fd(100).is_none());
-    assert!(
-        parent.fd(100).is_some(),
-        "parent's fd 100 survives the child's close"
-    );
-}
-
-#[test]
-fn process_payload_close_pipe_writer_fd_publishes_eof_immediately() {
-    let _g = setup();
-    let proc_cap = bootstrap();
-    let (reader, writer) =
-        crate::pipe::step_pipe2(crate::pipe::PipeFlags::default()).expect("pipe2");
-    let payload = pipe_payload_of(&reader);
-
-    proc_cap.set_fd(3, Some(reader));
-    proc_cap.set_fd(4, Some(writer));
-
-    proc_cap.set_fd(4, None);
-
-    assert_pipe_read_eof(&payload);
-    proc_cap.set_fd(3, None);
-}
-
-#[test]
-fn process_payload_dup_pipe_writer_keeps_pipe_alive_until_all_writer_fds_close() {
-    let _g = setup();
-    let proc_cap = bootstrap();
-    let (reader, writer) =
-        crate::pipe::step_pipe2(crate::pipe::PipeFlags::default()).expect("pipe2");
-    let payload = pipe_payload_of(&reader);
-
-    proc_cap.set_fd(3, Some(reader));
-    proc_cap.set_fd(4, Some(writer));
-
-    let mut op = DupOp {
-        process: proc_cap.clone(),
-        oldfd: 4,
-    };
-    let mut ctx = ScriptCtx::<ProcessIdentity>::new();
-    let dupfd = match op.step(&mut ctx) {
-        StepOutcome::Done(fd) => fd,
-        other => panic!("expected dup Done(fd), got {other:?}"),
-    };
-
-    proc_cap.set_fd(4, None);
-    assert_pipe_read_blocks(&payload);
-
-    proc_cap.set_fd(dupfd, None);
-    assert_pipe_read_eof(&payload);
-    proc_cap.set_fd(3, None);
-}
-
-#[test]
-fn step_fork_accounts_inherited_pipe_writer_fd() {
-    let _g = setup();
-    let parent = bootstrap();
-    let (reader, writer) =
-        crate::pipe::step_pipe2(crate::pipe::PipeFlags::default()).expect("pipe2");
-    let payload = pipe_payload_of(&reader);
-
-    parent.set_fd(3, Some(reader));
-    parent.set_fd(4, Some(writer));
-    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
-
-    parent.set_fd(4, None);
-    assert_pipe_read_blocks(&payload);
-
-    child.set_fd(4, None);
-    assert_pipe_read_eof(&payload);
-    parent.set_fd(3, None);
-    child.set_fd(3, None);
-}
-
-#[test]
-fn child_exit_drains_inherited_pipe_writer_fd_and_publishes_eof() {
-    let _g = setup();
-    let parent = bootstrap();
-    let (reader, writer) =
-        crate::pipe::step_pipe2(crate::pipe::PipeFlags::default()).expect("pipe2");
-    let payload = pipe_payload_of(&reader);
-
-    parent.set_fd(3, Some(reader));
-    parent.set_fd(4, Some(writer));
-    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
-
-    parent.set_fd(4, None);
-    assert_pipe_read_blocks(&payload);
-
-    step_exit_group(&child, ExitStatus::Exited(0));
-    assert_pipe_read_eof(&payload);
-    parent.set_fd(3, None);
-}
-
-/// fd-ops Wave 1: the CLOEXEC `BTreeSet<u32>` accepts arbitrary `u32`
-/// keys — pre-Wave-1 the `AtomicU32` silently dropped fds ≥ 32.
-#[test]
-fn process_payload_fd_cloexec_btreeset_supports_sparse_fds_above_31() {
-    let _g = setup();
-    let proc_cap = bootstrap();
-
-    proc_cap.set_fd_cloexec(100, true);
-    assert!(proc_cap.fd_cloexec(100));
-    assert!(!proc_cap.fd_cloexec(99));
-    assert!(!proc_cap.fd_cloexec(101));
-
-    // Snapshot reflects only the high fd.
-    let snap = proc_cap.fd_cloexec_snapshot();
-    assert_eq!(snap.len(), 1);
-    assert!(snap.contains(&100));
-
-    proc_cap.set_fd_cloexec(100, false);
-    assert!(!proc_cap.fd_cloexec(100));
-    assert!(proc_cap.fd_cloexec_snapshot().is_empty());
-}
-
-#[test]
-fn step_fork_clones_fd_cloexec_bits() {
-    let _g = setup();
-    let parent = bootstrap();
-    parent.set_fd_cloexec(1, true);
-    parent.set_fd_cloexec(4, true);
-
-    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
-
-    // Child inherits parent's snapshot at fork time.
-    assert!(child.fd_cloexec(1));
-    assert!(child.fd_cloexec(4));
-    assert!(!child.fd_cloexec(0));
-    assert!(!child.fd_cloexec(2));
-
-    // Mutating the child must not bleed back into the parent.
-    child.set_fd_cloexec(2, true);
-    assert!(child.fd_cloexec(2));
-    assert!(!parent.fd_cloexec(2));
-
-    // Mutating the parent post-fork must not bleed into the child.
-    parent.set_fd_cloexec(0, true);
-    assert!(parent.fd_cloexec(0));
-    assert!(!child.fd_cloexec(0));
-}
-
-#[test]
-fn step_close_cloexec_fds_closes_marked_fds_clears_others() {
-    use crate::process::exec_prep::step_close_cloexec_fds;
-    let _g = setup();
-    let proc_cap = bootstrap();
-
-    // Install three open files at fds 0, 1, 2; mark only fd 1 as
-    // CLOEXEC.
-    proc_cap.set_fd(0, Some(fresh_open_file()));
-    proc_cap.set_fd(1, Some(fresh_open_file()));
-    proc_cap.set_fd(2, Some(fresh_open_file()));
-    proc_cap.set_fd_cloexec(1, true);
-
-    step_close_cloexec_fds(&proc_cap);
-
-    // Only fd 1 should be closed; the others remain.
-    assert!(proc_cap.fd(0).is_some(), "fd 0 was not marked; survives");
-    assert!(
-        proc_cap.fd(1).is_none(),
-        "fd 1 was marked CLOEXEC; should be closed"
-    );
-    assert!(proc_cap.fd(2).is_some(), "fd 2 was not marked; survives");
-}
-
-#[test]
-fn step_close_cloexec_fds_clears_bitmap_after() {
-    use crate::process::exec_prep::step_close_cloexec_fds;
-    let _g = setup();
-    let proc_cap = bootstrap();
-
-    proc_cap.set_fd(2, Some(fresh_open_file()));
-    proc_cap.set_fd_cloexec(2, true);
-    assert!(proc_cap.fd_cloexec(2));
-
-    step_close_cloexec_fds(&proc_cap);
-
-    // The sweep clears the set wholesale: future fcntl(F_SETFD) calls
-    // start from a clean state.
-    assert!(
-        !proc_cap.fd_cloexec(2),
-        "post-sweep, the CLOEXEC bit must be cleared"
-    );
-    assert!(
-        proc_cap.fd_cloexec_snapshot().is_empty(),
-        "post-sweep, the CLOEXEC set must be empty"
-    );
-}
-
-#[test]
-fn step_install_brk_for_exec_resets_both_brk_base_and_current() {
-    use crate::process::exec_prep::step_install_brk_for_exec;
-    use crate::process::execution::BOOTSTRAP_BRK_BASE;
-    let _g = setup();
-    let proc_cap = bootstrap();
-
-    // Bootstrap state: both brk_base and current_brk seeded to the
-    // same bootstrap value (per the existing
-    // `bootstrap_init_process` contract).
-    assert_eq!(proc_cap.brk_base(), BOOTSTRAP_BRK_BASE);
-    assert_eq!(proc_cap.current_brk(), BOOTSTRAP_BRK_BASE);
-
-    // Simulate a userspace brk(2) advance so current_brk diverges
-    // from brk_base — this is the "running process" state exec
-    // takes over.
-    proc_cap.set_current_brk(BOOTSTRAP_BRK_BASE + 0x1000);
-    assert_eq!(proc_cap.current_brk(), BOOTSTRAP_BRK_BASE + 0x1000);
-    assert_eq!(proc_cap.brk_base(), BOOTSTRAP_BRK_BASE);
-
-    // Install fresh exec-image brk: both fields rewritten to the
-    // same new value (per `txdoc:EXEC-12-4-INSTALL-BRK`).
-    let new_brk: u64 = 0xb000_0000;
-    step_install_brk_for_exec(&proc_cap, new_brk);
-
-    assert_eq!(proc_cap.brk_base(), new_brk);
-    assert_eq!(proc_cap.current_brk(), new_brk);
-}
-
-// ----- Wave 1 fork/clone/wait4 slice (2026-05-06) -----
-//
-// Tests for the kernel-side prerequisites Wave 2's `sys_clone` and
-// `sys_wait4` syscall arms will consume:
-//   - `seed_child_leader_context` (Part 1A): the syscall driver
-//     helper that stamps `regs[10] = 0` (RV64 a0) and `pc + 4`
-//     onto the child leader thread's saved trap context.
-//   - `ProcessPayload.exit_source` (Part 1B): the per-process wait
-//     channel that fires on child zombification, so a parent
-//     parked on `sys_wait4` wakes when any child exits.
-//   - POSIX `wait_status_word` migration (Open Q #3 DECIDED):
-//     `(code & 0xff) << 8` for explicit exits and `sig & 0x7f` for
-//     signal exits.
+mod fd_table;
 
 mod seed_child_leader_context;
 

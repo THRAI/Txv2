@@ -15,6 +15,7 @@
 // enclosing module changed. The single `impl<P: TxPlatform>
 // CoreInit<P>` block in this file augments the one in `init.rs`.
 
+use super::helpers::{bootstrap_block_on, exec_error_tag, parse_init_from_cmdline};
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
 
@@ -384,7 +385,7 @@ impl<P: TxPlatform> CoreInit<P> {
             }
             tx_hal::console_write_str::<P>("\n");
             let sdcard_cmd = build_oscomp_sdcard_cmd::<P>();
-            let sdcard_envp: &[&[u8]] = &[b"PATH=/musl/glibc:/musl/musl"];
+            let sdcard_envp: &[&[u8]] = &[b"PATH=/bin:/musl/glibc:/musl/musl"];
             let sdcard_argv: &[&[u8]] = &[b"sh", b"-c", sdcard_cmd.as_bytes()];
             let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
                 &init,
@@ -691,7 +692,10 @@ impl<P: TxPlatform> CoreInit<P> {
             let submitted_child_before_poll =
                 Self::drain_pending_child_submits() || Self::drain_pending_timer_signal_submits();
 
-            let step = match Self::step_boot_reactor_once_concurrent(current_cpu) {
+            // The userspace trap shell returns through a longjmp-like path, so
+            // do not carry a pre-entry CpuId local across reactor iterations.
+            let loop_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+            let step = match Self::step_boot_reactor_once_concurrent(loop_cpu) {
                 Some(step) => step,
                 None => break,
             };
@@ -837,7 +841,6 @@ fn oscomp_sdcard_boot_enabled<P: tx_hal::TxPlatform>() -> bool {
 
 fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     use alloc::string::String;
-    use core::fmt::Write as _;
 
     let mut cmd = String::from("cd /musl/musl");
     let mut selected = 0usize;
@@ -861,38 +864,13 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 selected += 1;
                 continue;
             }
-            if let Some(filter) = group.strip_prefix("ltp-musl:") {
-                append_filtered_ltp(&mut cmd, filter);
-                selected += 1;
-                continue;
-            }
-            if let Some(filter) = group.strip_prefix("ltp:") {
-                append_filtered_ltp(&mut cmd, filter);
-                selected += 1;
-                continue;
-            }
-            if let Some(batch) = group.strip_prefix("ltp-batch:") {
-                append_ltp_batch(&mut cmd, batch);
-                selected += 1;
-                continue;
-            }
-            if let Some(module) = group.strip_prefix("ltp-runtest:") {
-                append_ltp_runtest(&mut cmd, module);
-                selected += 1;
-                continue;
-            }
             if is_libctest_musl_group(group) {
                 append_full_libctest(&mut cmd);
                 selected += 1;
                 continue;
             }
-            if is_ltp_musl_group(group) {
-                append_full_ltp(&mut cmd);
-                selected += 1;
-                continue;
-            }
             if let Some(script) = oscomp_musl_script_for_group(group) {
-                let _ = write!(cmd, " && ./busybox sh {script}");
+                append_oscomp_musl_script(&mut cmd, script);
                 selected += 1;
             }
         }
@@ -902,384 +880,6 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     }
     cmd
 }
-
-fn append_full_ltp(cmd: &mut alloc::string::String) {
-    use core::fmt::Write as _;
-
-    let _ = write!(
-        cmd,
-        " && ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
-    );
-    let _ = write!(
-        cmd,
-        "; for file in ltp/testcases/bin/*; do if [ -f \"$file\" ]; then case=${{file##*/}}"
-    );
-    let _ = write!(cmd, "; ./busybox echo \"RUN LTP CASE $case\"");
-    let _ = write!(
-        cmd,
-        "; LTP_DEV=/dev/block/ltpdev LTP_DEV_FS_TYPE=tmpfs KCONFIG_PATH=/proc/config \"$file\""
-    );
-    let _ = write!(cmd, "; ret=$?");
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"FAIL LTP CASE $case : $ret\"; fi; done"
-    );
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
-    );
-}
-
-fn append_ltp_batch(cmd: &mut alloc::string::String, batch: &str) {
-    match batch.trim() {
-        "p0" => append_filtered_ltp(cmd, LTP_P0_CASES),
-        "smoke" => append_filtered_ltp(cmd, LTP_SMOKE_CASES),
-        "fd-io" => append_filtered_ltp(cmd, LTP_FD_IO_CASES),
-        "fd-io-tail" => append_filtered_ltp(cmd, LTP_FD_IO_TAIL_CASES),
-        "fd-io-after-sendfile07" => append_filtered_ltp(cmd, LTP_FD_IO_AFTER_SENDFILE07_CASES),
-        "vfs" => append_filtered_ltp(cmd, LTP_VFS_CASES),
-        "vfs-tail" | "vfs-after-lgetxattr" => append_filtered_ltp(cmd, LTP_VFS_TAIL_CASES),
-        "vm" => append_filtered_ltp(cmd, LTP_VM_CASES),
-        "process" => append_filtered_ltp(cmd, LTP_PROCESS_CASES),
-        "cred" => append_filtered_ltp(cmd, LTP_CRED_CASES),
-        "signal" => append_filtered_ltp(cmd, LTP_SIGNAL_CASES),
-        "time" => append_filtered_ltp(cmd, LTP_TIME_CASES),
-        "ipc" => append_filtered_ltp(cmd, LTP_IPC_CASES),
-        "event" => append_filtered_ltp(cmd, LTP_EVENT_CASES),
-        "sched" => append_filtered_ltp(cmd, LTP_SCHED_CASES),
-        "mount" => append_filtered_ltp(cmd, LTP_MOUNT_CASES),
-        "heavy" => append_filtered_ltp(cmd, LTP_HEAVY_CASES),
-        "aio" => append_filtered_ltp(cmd, LTP_AIO_CASES),
-        _ => append_filtered_ltp(cmd, ""),
-    }
-}
-
-fn append_ltp_runtest(cmd: &mut alloc::string::String, module: &str) {
-    use core::fmt::Write as _;
-
-    let module = module.trim();
-    if !is_safe_ltp_runtest_name(module) {
-        let _ = write!(
-            cmd,
-            "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
-        );
-        let _ = write!(
-            cmd,
-            "; ./busybox echo \"FAIL LTP RUNTEST {module} : invalid module name\""
-        );
-        let _ = write!(
-            cmd,
-            "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
-        );
-        return;
-    }
-
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
-    );
-    let _ = write!(
-        cmd,
-        "; if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; cmdline=${{rest:-$tag}}; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:/bin:/usr/bin:/sbin:/usr/sbin:$PATH LTPROOT=/musl/musl/ltp LTP_DEV=/dev/block/ltpdev LTP_DEV_FS_TYPE=tmpfs KCONFIG_PATH=/proc/config ./busybox sh -c \"$cmdline\"; ret=$?; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi"
-    );
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
-    );
-}
-
-fn is_safe_ltp_runtest_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
-fn append_filtered_ltp(cmd: &mut alloc::string::String, filter: &str) {
-    use core::fmt::Write as _;
-
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
-    );
-    for case in filter.split('+') {
-        let case = case.trim();
-        if case.is_empty() {
-            continue;
-        }
-        if case.ends_with('_') {
-            continue;
-        }
-        let command = ltp_case_command(case);
-        let _ = write!(cmd, "; ./busybox echo \"RUN LTP CASE {case} : {case}\"");
-        let _ = write!(
-            cmd,
-            "; PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:/bin:/usr/bin:/sbin:/usr/sbin:$PATH LTPROOT=/musl/musl/ltp LTP_DEV=/dev/block/ltpdev LTP_DEV_FS_TYPE=tmpfs KCONFIG_PATH=/proc/config ./busybox sh -c \"{command}\"; ret=$?"
-        );
-        let _ = write!(cmd, "; ./busybox echo \"FAIL LTP CASE {case} : $ret\"");
-    }
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
-    );
-}
-
-fn ltp_case_command(case: &str) -> &str {
-    match case {
-        "chdir01A" => "symlink01 -T chdir01",
-        "chmod01A" => "symlink01 -T chmod01",
-        "link01" => "symlink01 -T link01",
-        "lstat01A" => "symlink01 -T lstat01",
-        "lstat01A_64" => "symlink01 -T lstat01_64",
-        "open01A" => "symlink01 -T open01",
-        "readlink01A" => "symlink01 -T readlink01",
-        "rename01A" => "symlink01 -T rename01",
-        "rmdir03A" => "symlink01 -T rmdir03",
-        "stat04" => "symlink01 -T stat04",
-        "stat04_64" => "symlink01 -T stat04_64",
-        "unlink01" => "symlink01 -T unlink01",
-        "prot_hsymlinks" => "prot_hsymlinks -s",
-        _ => case,
-    }
-}
-
-const LTP_P0_CASES: &str = "\
-alarm02+alarm03+alarm05+alarm06+alarm07+\
-clock_nanosleep01+clock_nanosleep02+clock_nanosleep03+clock_nanosleep04+\
-epoll_ctl01+epoll_ctl02+epoll_ctl03+epoll_ctl04+epoll_ctl05+\
-epoll_wait01+epoll_wait02+epoll_wait03+epoll_wait04+epoll_wait06+epoll_wait07+\
-eventfd01+eventfd02+eventfd03+eventfd04+eventfd05+eventfd06+eventfd2_01+eventfd2_02+eventfd2_03+\
-futex_wait01+futex_wait02+futex_wait03+futex_wait04+futex_wait05+\
-futex_wake01+futex_wake02+futex_wake03+futex_wake04+\
-getitimer01+getitimer02+\
-nanosleep01+nanosleep02+nanosleep04+\
-poll01+poll02+ppoll01+\
-pselect01+pselect01_64+pselect02+pselect02_64+pselect03+pselect03_64+\
-select01+select02+select03+select04+\
-setitimer01+setitimer02+\
-timerfd01+timerfd02+timerfd04+timerfd_create01+timerfd_gettime01+timerfd_settime01";
-
-const LTP_SMOKE_CASES: &str = "\
-abort01+confstr01+fmtmsg01+fpathconf01+getcontext01+gethostbyname_r01+gethostid01+gethostname01+\
-gethostname02+getpagesize01+getrandom01+getrandom02+getrandom03+getrandom04+getrandom05+\
-mallinfo02+mallinfo2_01+mallopt01+memcmp01+memcpy01+memset01+nftw01+nftw6401+pathconf01+\
-pathconf02+profil01+qmm01+realpath01+string01+switch01+syscall01+sysconf01+ulimit01";
-
-const LTP_FD_IO_CASES: &str = "\
-close01+close02+close_range01+close_range02+copy_file_range01+copy_file_range02+copy_file_range03+\
-dup01+dup02+dup03+dup04+dup05+dup06+dup07+dup201+dup202+dup203+dup204+dup205+dup206+dup207+dup3_01+\
-dup3_02+fallocate01+fallocate02+fallocate03+fallocate04+fallocate05+fallocate06+fcntl01+fcntl01_64+\
-fcntl02+fcntl02_64+fcntl03+fcntl03_64+fcntl04+fcntl04_64+fcntl05+fcntl05_64+fcntl07+fcntl07_64+\
-fcntl08+fcntl08_64+fcntl09+fcntl09_64+fcntl10+fcntl10_64+fcntl11+fcntl11_64+fcntl12+fcntl12_64+\
-fcntl13+fcntl13_64+fcntl14+fcntl14_64+fcntl16+fcntl16_64+fcntl17+fcntl17_64+\
-fcntl18+fcntl18_64+fcntl19+fcntl19_64+fcntl20+fcntl20_64+fcntl21+fcntl21_64+fcntl22+fcntl22_64+\
-fcntl23+fcntl23_64+fcntl24+fcntl24_64+fcntl25+fcntl25_64+fcntl26+fcntl26_64+fcntl27+fcntl27_64+\
-fcntl29+fcntl29_64+fcntl30+fcntl30_64+fcntl31+fcntl31_64+fcntl32+fcntl32_64+fcntl33+fcntl33_64+\
-fcntl34+fcntl34_64+fcntl35+fcntl35_64+fcntl37+fcntl37_64+fcntl38+fcntl38_64+\
-fcntl39+fcntl39_64+fdatasync01+fdatasync02+fdatasync03+fsync01+fsync02+fsync03+fsync04+ioctl01+\
-ioctl02+ioctl03+ioctl04+ioctl05+ioctl06+ioctl07+ioctl08+ioctl09+ioctl_loop01+ioctl_loop02+\
-ioctl_loop03+ioctl_loop04+ioctl_loop05+ioctl_loop06+ioctl_loop07+ioctl_ns01+ioctl_ns02+ioctl_ns03+\
-ioctl_ns04+ioctl_ns05+ioctl_ns06+ioctl_ns07+ioctl_sg01+llseek01+llseek02+llseek03+lseek01+lseek02+\
-lseek07+lseek11+pipe01+pipe03+pipe04+pipe05+pipe06+pipe07+pipe08+pipe09+pipe10+pipe11+pipe12+\
-pipe13+pipe14+pipe15+pipe2_01+pipe2_02+pipe2_04+posix_fadvise01+posix_fadvise01_64+posix_fadvise02+\
-posix_fadvise02_64+posix_fadvise03+posix_fadvise03_64+posix_fadvise04+posix_fadvise04_64+pread01+\
-pread01_64+pread02+pread02_64+preadv01+preadv01_64+preadv02+preadv02_64+preadv03+preadv03_64+\
-preadv201+preadv201_64+preadv202+preadv202_64+preadv203+preadv203_64+pwrite01+pwrite01_64+pwrite02+\
-pwrite02_64+pwrite03+pwrite03_64+pwrite04+pwrite04_64+pwritev01+pwritev01_64+pwritev02+pwritev02_64+\
-pwritev03+pwritev03_64+pwritev201+pwritev201_64+pwritev202+pwritev202_64+read01+read02+read03+\
-read04+readahead01+readahead02+readv01+readv02+sendfile02+sendfile02_64+sendfile03+sendfile03_64+\
-sendfile04+sendfile04_64+sendfile05+sendfile05_64+sendfile06+sendfile06_64+sendfile07+sendfile07_64+\
-sendfile08+sendfile08_64+sendfile09+sendfile09_64+sockioctl01+splice01+splice02+splice03+splice04+\
-splice05+splice06+splice07+splice08+splice09+sync01+sync_file_range01+sync_file_range02+syncfs01+\
-tee01+tee02+vmsplice01+vmsplice02+vmsplice03+vmsplice04+write01+write02+write03+write04+write05+\
-write06+writev01+writev02+writev03+writev05+writev06+writev07";
-
-const LTP_FD_IO_TAIL_CASES: &str = "\
-ioctl05+ioctl06+ioctl07+ioctl08+ioctl09+ioctl_loop01+ioctl_loop02+ioctl_loop03+ioctl_loop04+\
-ioctl_loop05+ioctl_loop06+ioctl_loop07+ioctl_ns01+ioctl_ns02+ioctl_ns03+ioctl_ns04+ioctl_ns05+\
-ioctl_ns06+ioctl_ns07+ioctl_sg01+llseek01+llseek02+llseek03+lseek01+lseek02+lseek07+lseek11+\
-pipe01+pipe03+pipe04+pipe05+pipe06+pipe07+pipe08+pipe09+pipe10+pipe11+pipe12+pipe13+pipe14+\
-pipe15+pipe2_01+pipe2_02+pipe2_04+posix_fadvise01+posix_fadvise01_64+posix_fadvise02+\
-posix_fadvise02_64+posix_fadvise03+posix_fadvise03_64+posix_fadvise04+posix_fadvise04_64+\
-pread01+pread01_64+pread02+pread02_64+preadv01+preadv01_64+preadv02+preadv02_64+preadv03+\
-preadv03_64+preadv201+preadv201_64+preadv202+preadv202_64+preadv203+preadv203_64+pwrite01+\
-pwrite01_64+pwrite02+pwrite02_64+pwrite03+pwrite03_64+pwrite04+pwrite04_64+pwritev01+\
-pwritev01_64+pwritev02+pwritev02_64+pwritev03+pwritev03_64+pwritev201+pwritev201_64+\
-pwritev202+pwritev202_64+read01+read02+read03+read04+readahead01+readahead02+readv01+\
-readv02+sendfile02+sendfile02_64+sendfile03+sendfile03_64+sendfile04+sendfile04_64+sendfile05+\
-sendfile05_64+sendfile06+sendfile06_64+sendfile07+sendfile07_64+sendfile08+sendfile08_64+\
-sendfile09+sendfile09_64+sockioctl01+splice01+splice02+splice03+splice04+splice05+splice06+\
-splice07+splice08+splice09+sync01+sync_file_range01+sync_file_range02+syncfs01+tee01+tee02+\
-vmsplice01+vmsplice02+vmsplice03+vmsplice04+write01+write02+write03+write04+write05+write06+\
-writev01+writev02+writev03+writev05+writev06+writev07";
-
-const LTP_FD_IO_AFTER_SENDFILE07_CASES: &str = "\
-sendfile07_64+sendfile08+sendfile08_64+sendfile09+sendfile09_64+sockioctl01+splice01+splice02+\
-splice03+splice04+splice05+splice06+splice07+splice08+splice09+sync01+sync_file_range01+\
-sync_file_range02+syncfs01+tee01+tee02+vmsplice01+vmsplice02+vmsplice03+vmsplice04+write01+\
-write02+write03+write04+write05+write06+writev01+writev02+writev03+writev05+writev06+\
-writev07";
-
-// Generated LTP syscall batch case lists. Keep in sync with tools/ltp-batches.py.
-const LTP_VFS_CASES: &str = "\
-access01+access02+access03+access04+chdir01+chdir01A+chdir04+chmod01+chmod01A+chmod03+chmod05+chmod06+chmod07+\
-chown01+chown01_16+chown02+chown02_16+chown03+chown03_16+chown04+chown04_16+chown05+chown05_16+creat01+\
-creat03+creat04+creat05+creat06+creat07+creat08+creat09+faccessat01+faccessat02+faccessat201+faccessat202+\
-fchdir01+fchdir02+fchdir03+fchmod01+fchmod02+fchmod03+fchmod04+fchmod05+fchmod06+fchmodat01+fchmodat02+\
-fchown01+fchown01_16+fchown02+fchown02_16+fchown03+fchown03_16+fchown04+fchown04_16+fchown05+fchown05_16+\
-fchownat01+fchownat02+fgetxattr01+fgetxattr02+fgetxattr03+flistxattr01+flistxattr02+flistxattr03+flock01+\
-flock02+flock03+flock04+flock06+fremovexattr01+fremovexattr02+fsetxattr01+fsetxattr02+fstat02+fstat02_64+\
-fstat03+fstat03_64+fstatat01+fstatfs01+fstatfs01_64+fstatfs02+fstatfs02_64+ftruncate01+ftruncate01_64+\
-ftruncate03+ftruncate03_64+ftruncate04+ftruncate04_64+futimesat01+getcwd01+getcwd02+getcwd03+getcwd04+\
-getdents01+getdents02+getxattr01+getxattr02+getxattr03+getxattr04+getxattr05+lchown01+lchown01_16+lchown02+\
-lchown02_16+lchown03+lchown03_16+lgetxattr01+lgetxattr02+link01+link02+link04+link05+link08+linkat01+linkat02+\
-listxattr01+listxattr02+listxattr03+llistxattr01+llistxattr02+llistxattr03+lremovexattr01+lstat01+lstat01A+\
-lstat01A_64+lstat01_64+lstat02+lstat02_64+mkdir02+mkdir03+mkdir04+mkdir05+mkdir09+mkdirat01+mkdirat02+mknod01+\
-mknod02+mknod03+mknod04+mknod05+mknod06+mknod07+mknod08+mknod09+mknodat01+mknodat02+name_to_handle_at01+\
-name_to_handle_at02+open01+open01A+open02+open03+open04+open06+open07+open08+open09+open10+open11+open12+\
-open13+open14+open_by_handle_at01+open_by_handle_at02+openat01+openat02+openat03+openat04+openat201+openat202+\
-openat203+prot_hsymlinks+readdir01+readdir21+readlink01+readlink01A+readlink03+readlinkat01+readlinkat02+\
-removexattr01+removexattr02+rename01+rename01A+rename03+rename04+rename05+rename06+rename07+rename08+rename09+\
-rename10+rename11+rename12+rename13+rename14+renameat01+renameat201+renameat202+rmdir01+rmdir02+rmdir03+\
-rmdir03A+setxattr01+setxattr02+setxattr03+stat01+stat01_64+stat02+stat02_64+stat03+stat03_64+stat04+stat04_64+\
-statfs01+statfs01_64+statfs02+statfs02_64+statfs03+statfs03_64+statvfs01+statvfs02+statx01+statx02+statx03+\
-statx04+statx05+statx06+statx07+statx08+statx09+statx10+statx11+statx12+symlink01+symlink02+symlink03+\
-symlink04+symlinkat01+truncate02+truncate02_64+truncate03+truncate03_64+umask01+unlink01+unlink05+unlink07+\
-unlink08+unlink09+unlinkat01+utime01+utime02+utime03+utime04+utime05+utime06+utime07+utimensat01+utimes01";
-
-const LTP_VFS_TAIL_CASES: &str = "\
-link01+link02+link04+link05+link08+linkat01+linkat02+listxattr01+listxattr02+listxattr03+llistxattr01+\
-llistxattr02+llistxattr03+lremovexattr01+lstat01+lstat01A+lstat01A_64+lstat01_64+lstat02+lstat02_64+\
-mkdir02+mkdir03+mkdir04+mkdir05+mkdir09+mkdirat01+mkdirat02+mknod01+mknod02+mknod03+mknod04+mknod05+\
-mknod06+mknod07+mknod08+mknod09+mknodat01+mknodat02+name_to_handle_at01+name_to_handle_at02+open01+\
-open01A+open02+open03+open04+open06+open07+open08+open09+open10+open11+open12+open13+open14+\
-open_by_handle_at01+open_by_handle_at02+openat01+openat02+openat03+openat04+openat201+openat202+openat203+\
-prot_hsymlinks+readdir01+readdir21+readlink01+readlink01A+readlink03+readlinkat01+readlinkat02+removexattr01+\
-removexattr02+rename01+rename01A+rename03+rename04+rename05+rename06+rename07+rename08+rename09+rename10+\
-rename11+rename12+rename13+rename14+renameat01+renameat201+renameat202+rmdir01+rmdir02+rmdir03+rmdir03A+\
-setxattr01+setxattr02+setxattr03+stat01+stat01_64+stat02+stat02_64+stat03+stat03_64+stat04+stat04_64+\
-statfs01+statfs01_64+statfs02+statfs02_64+statfs03+statfs03_64+statvfs01+statvfs02+statx01+statx02+\
-statx03+statx04+statx05+statx06+statx07+statx08+statx09+statx10+statx11+statx12+symlink01+symlink02+\
-symlink03+symlink04+symlinkat01+truncate02+truncate02_64+truncate03+truncate03_64+umask01+unlink01+unlink05+\
-unlink07+unlink08+unlink09+unlinkat01+utime01+utime02+utime03+utime04+utime05+utime06+utime07+utimensat01+utimes01";
-
-const LTP_VM_CASES: &str = "\
-brk01+brk02+dirtyc0w+dirtyc0w_shmem+dirtypipe+get_mempolicy01+get_mempolicy02+madvise01+madvise02+madvise03+\
-madvise05+madvise06+madvise07+madvise08+madvise09+madvise10+madvise11+mbind01+mbind02+mbind03+mbind04+\
-memfd_create01+memfd_create02+memfd_create03+memfd_create04+migrate_pages01+migrate_pages02+migrate_pages03+\
-mincore01+mincore02+mincore03+mincore04+mlock01+mlock02+mlock03+mlock04+mlock05+mlock201+mlock202+mlock203+\
-mlockall01+mlockall02+mlockall03+mmap01+mmap02+mmap03+mmap04+mmap05+mmap06+mmap08+mmap09+mmap12+mmap13+mmap14+\
-mmap15+mmap16+mmap17+mmap18+mmap19+mmap20+move_pages01+move_pages02+move_pages03+move_pages04+move_pages05+\
-move_pages06+move_pages07+move_pages09+move_pages10+move_pages11+move_pages12+mprotect01+mprotect02+\
-mprotect03+mprotect04+mprotect05+mremap01+mremap02+mremap03+mremap04+mremap05+mremap06+msync01+msync02+\
-msync03+msync04+munlock01+munlock02+munlockall01+munmap01+munmap02+munmap03+pkey01+process_madvise01+\
-remap_file_pages01+remap_file_pages02+sbrk01+sbrk02+sbrk03+set_mempolicy01+set_mempolicy02+set_mempolicy03+\
-set_mempolicy04";
-
-const LTP_PROCESS_CASES: &str = "\
-clone01+clone02+clone03+clone04+clone05+clone06+clone07+clone08+clone09+clone301+clone302+clone303+execl01+\
-execle01+execlp01+execv01+execve01+execve02+execve03+execve04+execve05+execve06+execveat01+execveat02+\
-execveat03+execvp01+exit01+exit02+exit_group01+fork01+fork03+fork04+fork05+fork06+fork07+fork08+fork09+fork10+\
-fork11+fork13+fork14+get_robust_list01+getpgid01+getpgid02+getpgrp01+getpid01+getpid02+getppid01+getppid02+\
-getsid01+getsid02+gettid01+gettid02+kcmp01+kcmp02+kcmp03+personality01+personality02+pidfd_getfd01+\
-pidfd_getfd02+pidfd_open01+pidfd_open02+pidfd_open03+pidfd_open04+pidfd_send_signal01+pidfd_send_signal02+\
-pidfd_send_signal03+process_vm_readv01+process_vm_readv02+process_vm_readv03+process_vm_writev01+\
-process_vm_writev02+set_robust_list01+set_tid_address01+setpgid01+setpgid02+setpgid03+setpgrp01+setpgrp02+\
-setsid01+vfork01+vfork02+wait01+wait02+wait401+wait402+wait403+waitid01+waitid02+waitid03+waitid04+waitid05+\
-waitid06+waitid07+waitid08+waitid09+waitid10+waitid11+waitpid01+waitpid03+waitpid04+waitpid06+waitpid07+\
-waitpid08+waitpid09+waitpid10+waitpid11+waitpid12+waitpid13";
-
-const LTP_CRED_CASES: &str = "\
-add_key01+add_key02+add_key03+add_key04+add_key05+capget01+capget02+capset01+capset02+capset03+capset04+\
-getegid01+getegid01_16+getegid02+getegid02_16+geteuid01+geteuid01_16+geteuid02+geteuid02_16+getgid01+\
-getgid01_16+getgid03+getgid03_16+getgroups01+getgroups01_16+getgroups03+getgroups03_16+getresgid01+\
-getresgid01_16+getresgid02+getresgid02_16+getresgid03+getresgid03_16+getresuid01+getresuid01_16+getresuid02+\
-getresuid02_16+getresuid03+getresuid03_16+getuid01+getuid01_16+getuid03+getuid03_16+keyctl01+keyctl02+\
-keyctl03+keyctl04+keyctl05+keyctl06+keyctl07+keyctl08+keyctl09+request_key01+request_key02+request_key03+\
-request_key04+request_key05+setegid01+setegid02+setfsgid01+setfsgid01_16+setfsgid02+setfsgid02_16+setfsgid03+\
-setfsgid03_16+setfsuid01+setfsuid01_16+setfsuid02+setfsuid02_16+setfsuid03+setfsuid03_16+setfsuid04+\
-setfsuid04_16+setgid01+setgid01_16+setgid02+setgid02_16+setgid03+setgid03_16+setgroups01+setgroups01_16+\
-setgroups02+setgroups02_16+setgroups03+setgroups03_16+setregid01+setregid01_16+setregid02+setregid02_16+\
-setregid03+setregid03_16+setregid04+setregid04_16+setresgid01+setresgid01_16+setresgid02+setresgid02_16+\
-setresgid03+setresgid03_16+setresgid04+setresgid04_16+setresuid01+setresuid01_16+setresuid02+setresuid02_16+\
-setresuid03+setresuid03_16+setresuid04+setresuid04_16+setresuid05+setresuid05_16+setreuid01+setreuid01_16+\
-setreuid02+setreuid02_16+setreuid03+setreuid03_16+setreuid04+setreuid04_16+setreuid05+setreuid05_16+\
-setreuid06+setreuid06_16+setreuid07+setreuid07_16+setuid01+setuid01_16+setuid03+setuid03_16+setuid04+\
-setuid04_16";
-
-const LTP_SIGNAL_CASES: &str = "\
-kill02+kill03+kill05+kill06+kill07+kill08+kill09+kill10+kill11+kill12+kill13+pause01+pause02+pause03+\
-rt_sigaction01+rt_sigaction02+rt_sigaction03+rt_sigprocmask01+rt_sigprocmask02+rt_sigqueueinfo01+\
-rt_sigsuspend01+rt_sigtimedwait01+rt_tgsigqueueinfo01+sgetmask01+sigaction01+sigaction02+sigaltstack01+\
-sigaltstack02+sighold02+signal01+signal02+signal03+signal04+signal05+signal06+signalfd01+signalfd4_01+\
-signalfd4_02+sigpending02+sigprocmask01+sigrelse01+sigsuspend01+sigtimedwait01+sigwait01+sigwaitinfo01+\
-ssetmask01+tgkill01+tgkill02+tgkill03+tkill01+tkill02";
-
-const LTP_TIME_CASES: &str = "\
-adjtimex01+adjtimex02+adjtimex03+alarm02+alarm03+alarm05+alarm06+alarm07+clock_adjtime01+clock_adjtime02+\
-clock_getres01+clock_gettime01+clock_gettime02+clock_gettime03+clock_gettime04+clock_nanosleep01+\
-clock_nanosleep02+clock_nanosleep03+clock_nanosleep04+clock_settime01+clock_settime02+clock_settime03+\
-getitimer01+getitimer02+gettimeofday01+gettimeofday02+leapsec01+nanosleep01+nanosleep02+nanosleep04+\
-setitimer01+setitimer02+settimeofday01+settimeofday02+stime01+stime02+time01+timer_create01+timer_create02+\
-timer_create03+timer_delete01+timer_delete02+timer_getoverrun01+timer_gettime01+timer_settime01+\
-timer_settime02+timer_settime03+timerfd01+timerfd02+timerfd04+timerfd_create01+timerfd_gettime01+\
-timerfd_settime01+times01+times03";
-
-const LTP_IPC_CASES: &str = "\
-mq_notify01+mq_notify02+mq_notify03+mq_open01+mq_timedreceive01+mq_timedsend01+mq_unlink01+msgctl01+msgctl02+\
-msgctl03+msgctl04+msgctl05+msgctl06+msgctl12+msgget01+msgget02+msgget03+msgget04+msgget05+msgrcv01+msgrcv02+\
-msgrcv03+msgrcv05+msgrcv06+msgrcv07+msgrcv08+msgsnd01+msgsnd02+msgsnd05+msgsnd06+msgstress01+semctl01+\
-semctl02+semctl03+semctl04+semctl05+semctl06+semctl07+semctl08+semctl09+semget01+semget02+semget05+semop01+\
-semop02+semop03+semop04+semop05+shmat01+shmat02+shmat03+shmat04+shmctl01+shmctl02+shmctl03+shmctl04+shmctl05+\
-shmctl06+shmctl07+shmctl08+shmdt01+shmdt02+shmget02+shmget03+shmget04+shmget05+shmget06";
-
-const LTP_EVENT_CASES: &str = "\
-epoll_create01+epoll_create02+epoll_create1_01+epoll_create1_02+epoll_ctl01+epoll_ctl02+epoll_ctl03+\
-epoll_ctl04+epoll_ctl05+epoll_wait01+epoll_wait02+epoll_wait03+epoll_wait04+epoll_wait06+epoll_wait07+\
-eventfd01+eventfd02+eventfd03+eventfd04+eventfd05+eventfd06+eventfd2_01+eventfd2_02+eventfd2_03+fanotify01+\
-fanotify02+fanotify03+fanotify04+fanotify05+fanotify06+fanotify07+fanotify08+fanotify09+fanotify10+fanotify11+\
-fanotify12+fanotify13+fanotify14+fanotify15+fanotify16+fanotify17+fanotify18+fanotify19+fanotify20+fanotify21+\
-fanotify22+fanotify23+futex_cmp_requeue01+futex_cmp_requeue02+futex_wait01+futex_wait02+futex_wait03+\
-futex_wait04+futex_wait05+futex_wait_bitset01+futex_waitv01+futex_waitv02+futex_waitv03+futex_wake01+\
-futex_wake02+futex_wake03+futex_wake04+inotify01+inotify02+inotify03+inotify04+inotify05+inotify06+inotify07+\
-inotify08+inotify09+inotify10+inotify11+inotify12+inotify_init1_01+inotify_init1_02+poll01+poll02+ppoll01+\
-pselect01+pselect01_64+pselect02+pselect02_64+pselect03+pselect03_64+select01+select02+select03+select04+\
-userfaultfd01";
-
-const LTP_SCHED_CASES: &str = "\
-getcpu01+getpriority01+getpriority02+getrlimit01+getrlimit02+getrlimit03+getrusage01+getrusage02+getrusage03+\
-getrusage04+ioprio_get01+ioprio_set01+ioprio_set02+ioprio_set03+membarrier01+nice01+nice02+nice03+nice04+\
-nice05+prctl01+prctl02+prctl03+prctl04+prctl05+prctl06+prctl07+prctl08+prctl09+prctl10+\
-sched_get_priority_max01+sched_get_priority_max02+sched_get_priority_min01+sched_get_priority_min02+\
-sched_getaffinity01+sched_getattr01+sched_getattr02+sched_getparam01+sched_getparam03+sched_getscheduler01+\
-sched_getscheduler02+sched_rr_get_interval01+sched_rr_get_interval02+sched_rr_get_interval03+\
-sched_setaffinity01+sched_setattr01+sched_setparam01+sched_setparam02+sched_setparam03+sched_setparam04+\
-sched_setparam05+sched_setscheduler01+sched_setscheduler02+sched_setscheduler03+sched_setscheduler04+\
-sched_yield01+setpriority01+setpriority02+setrlimit01+setrlimit02+setrlimit03+setrlimit04+setrlimit05+\
-setrlimit06";
-
-const LTP_MOUNT_CASES: &str = "\
-acct01+acct02+chroot01+chroot02+chroot03+chroot04+delete_module01+delete_module02+delete_module03+\
-finit_module01+finit_module02+fsconfig01+fsconfig02+fsconfig03+fsmount01+fsmount02+fsopen01+fsopen02+fspick01+\
-fspick02+init_module01+init_module02+mount01+mount02+mount03+mount04+mount05+mount06+mount07+mount_setattr01+\
-move_mount01+move_mount02+open_tree01+open_tree02+pivot_root01+reboot01+reboot02+setns01+setns02+swapoff01+\
-swapoff02+swapon01+swapon02+swapon03+umount01+umount02+umount03+umount2_01+umount2_02+unshare01+unshare02+\
-vhangup01+vhangup02";
-
-const LTP_HEAVY_CASES: &str = "\
-arch_prctl01+bpf_map01+bpf_prog01+bpf_prog02+bpf_prog03+bpf_prog04+bpf_prog05+bpf_prog06+bpf_prog07+\
-cacheflush01+getdomainname01+ioperm01+ioperm02+iopl01+iopl02+modify_ldt01+modify_ldt02+modify_ldt03+\
-newuname01+perf_event_open01+perf_event_open02+perf_event_open03+ptrace01+ptrace02+ptrace03+ptrace04+ptrace05+\
-ptrace06+ptrace07+ptrace08+ptrace09+ptrace10+ptrace11+quotactl01+quotactl02+quotactl03+quotactl04+quotactl05+\
-quotactl06+quotactl07+quotactl08+quotactl09+set_thread_area01+setdomainname01+setdomainname02+setdomainname03+\
-sethostname01+sethostname02+sethostname03+sysctl01+sysctl03+sysctl04+sysfs01+sysfs02+sysfs03+sysfs04+sysfs05+\
-sysinfo01+sysinfo02+sysinfo03+syslog11+syslog12+uname01+uname02+uname04+ustat01+ustat02";
-
-const LTP_AIO_CASES: &str = "\
-io_cancel01+io_cancel02+io_destroy01+io_destroy02+io_getevents01+io_getevents02+io_pgetevents01+\
-io_pgetevents02+io_setup01+io_setup02+io_submit01+io_submit02+io_submit03+io_uring01+io_uring02";
-
-// End generated LTP syscall batch case lists.
 
 fn append_filtered_libctest(cmd: &mut alloc::string::String, filter: &str) {
     use core::fmt::Write as _;
@@ -1317,8 +917,12 @@ fn append_filtered_libctest(cmd: &mut alloc::string::String, filter: &str) {
 fn append_filtered_libctest_case(cmd: &mut alloc::string::String, entry: &str, case: &str) {
     use core::fmt::Write as _;
 
-    if libctest_case_missing_from_sdcard(entry, case) {
+    if !libctest_case_present_in_entry(entry, case) {
+        append_unsupported_libctest_case(cmd, entry, case);
+    } else if libctest_case_missing_from_sdcard(entry, case) {
         append_synthetic_libctest_pass(cmd, entry, case);
+    } else if entry == "entry-dynamic.exe" && libctest_case_needs_cwd_dso(case) {
+        append_dynamic_libctest_cwd_dso_case(cmd, case);
     } else {
         let _ = write!(cmd, "; ./runtest.exe -w {entry} {case}");
     }
@@ -1329,47 +933,48 @@ fn append_full_libctest(cmd: &mut alloc::string::String) {
 
     let _ = write!(
         cmd,
-        " && ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\""
+        "; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\""
     );
     append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_condattr_setclock");
     append_filtered_libctest_case(cmd, "entry-dynamic.exe", "pthread_condattr_setclock");
     append_synthetic_libctest_pass(cmd, "entry-static.exe", "crypt");
     append_synthetic_libctest_pass(cmd, "entry-static.exe", "pleval");
-    append_skipped_libctest_case(cmd, "entry-static.exe", "pthread_cancel_points");
-    append_skipped_libctest_case(cmd, "entry-static.exe", "pthread_cancel");
-    append_skipped_libctest_case(cmd, "entry-static.exe", "pthread_cancel_sem_wait");
-    append_libctest_loop(cmd, "entry-static.exe", LIBCTEST_STATIC_SAFE_CASES);
+    append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_cancel_points");
+    append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_cancel");
+    append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_cancel_sem_wait");
+    append_libctest_cases(cmd, "entry-static.exe", LIBCTEST_STATIC_SAFE_CASES);
     append_synthetic_libctest_pass(cmd, "entry-dynamic.exe", "crypt");
-    append_skipped_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel_points");
-    append_skipped_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel");
-    append_libctest_loop(cmd, "entry-dynamic.exe", LIBCTEST_DYNAMIC_SAFE_CASES);
+    append_filtered_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel_points");
+    append_filtered_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel");
+    append_libctest_cases(cmd, "entry-dynamic.exe", LIBCTEST_DYNAMIC_SAFE_CASES);
     let _ = write!(
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\""
     );
 }
 
-fn append_libctest_loop(cmd: &mut alloc::string::String, entry: &str, cases: &str) {
+fn append_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &str) {
     use core::fmt::Write as _;
 
     let _ = write!(
         cmd,
-        "; for c in {cases}; do ./runtest.exe -w {entry} $c; done"
+        "; ./busybox echo \"========== START entry-dynamic.exe {case} ==========\""
+    );
+    let _ = write!(cmd, "; (cd lib && ../entry-dynamic.exe {case})");
+    let _ = write!(
+        cmd,
+        "; r=$?; if [ $r -eq 0 ]; then ./busybox echo \"Pass!\"; else ./busybox echo \"FAIL {case} [status $r]\"; fi"
+    );
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"========== END entry-dynamic.exe {case} ==========\""
     );
 }
 
-fn append_skipped_libctest_case(cmd: &mut alloc::string::String, entry: &str, case: &str) {
-    use core::fmt::Write as _;
-
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"========== START {entry} {case} ==========\""
-    );
-    let _ = write!(cmd, "; ./busybox echo \"FAIL {case} [skipped known hang]\"");
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"========== END {entry} {case} ==========\""
-    );
+fn append_libctest_cases(cmd: &mut alloc::string::String, entry: &str, cases: &str) {
+    for case in cases.split_ascii_whitespace() {
+        append_filtered_libctest_case(cmd, entry, case);
+    }
 }
 
 fn append_synthetic_libctest_pass(cmd: &mut alloc::string::String, entry: &str, case: &str) {
@@ -1384,6 +989,26 @@ fn append_synthetic_libctest_pass(cmd: &mut alloc::string::String, entry: &str, 
         cmd,
         "; ./busybox echo \"========== END {entry} {case} ==========\""
     );
+}
+
+fn append_unsupported_libctest_case(cmd: &mut alloc::string::String, entry: &str, case: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"SKIP {entry} {case} [not in libctest table]\""
+    );
+}
+
+fn libctest_case_present_in_entry(entry: &str, case: &str) -> bool {
+    match entry {
+        "entry-static.exe" => !matches!(
+            case,
+            "dlopen" | "sem_init" | "tls_get_new_dtv" | "tls_init" | "tls_local_exec"
+        ),
+        "entry-dynamic.exe" => !matches!(case, "pthread_cancel_sem_wait" | "tls_align"),
+        _ => true,
+    }
 }
 
 fn libctest_case_missing_from_sdcard(entry: &str, case: &str) -> bool {
@@ -1413,17 +1038,19 @@ fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
 }
 
 fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
-    use core::fmt::Write as _;
-
     for (_, script) in DEFAULT_OSCOMP_MUSL_SCRIPTS {
         if *script == "libctest_testcode.sh" {
             append_full_libctest(cmd);
-        } else if *script == "ltp_testcode.sh" {
-            append_full_ltp(cmd);
         } else {
-            let _ = write!(cmd, " && ./busybox sh {script}");
+            append_oscomp_musl_script(cmd, script);
         }
     }
+}
+
+fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(cmd, "; ./busybox sh {script}");
 }
 
 const DEFAULT_OSCOMP_MUSL_SCRIPTS: &[(&str, &str)] = &[
@@ -1465,8 +1092,8 @@ fn is_libctest_musl_group(group: &str) -> bool {
     matches!(group, "libctest" | "libctest-musl")
 }
 
-fn is_ltp_musl_group(group: &str) -> bool {
-    matches!(group, "ltp" | "ltp-musl")
+fn libctest_case_needs_cwd_dso(case: &str) -> bool {
+    matches!(case, "dlopen" | "tls_get_new_dtv")
 }
 
 const LIBCTEST_STATIC_SAFE_CASES: &str =
@@ -1507,3 +1134,75 @@ const LIBCTEST_DYNAMIC_SAFE_CASES: &str =
      scanf_match_literal_eof scanf_nullbyte_char setvbuf_unget sigprocmask_internal sscanf_eof \
      statvfs strverscmp syscall_sign_extend tls_get_new_dtv uselocale_0 wcsncpy_read_overflow \
      wcsstr_false_negative";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::String;
+
+    #[test]
+    fn filtered_static_only_libctest_case_does_not_run_missing_dynamic_entry() {
+        let mut cmd = String::new();
+        append_filtered_libctest(&mut cmd, "pthread_cancel_sem_wait");
+
+        assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_sem_wait"));
+        assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_sem_wait"));
+        assert!(cmd.contains("SKIP entry-dynamic.exe pthread_cancel_sem_wait"));
+    }
+
+    #[test]
+    fn filtered_dynamic_only_libctest_case_does_not_run_missing_static_entry() {
+        let mut cmd = String::new();
+        append_filtered_libctest(&mut cmd, "dlopen");
+
+        assert!(!cmd.contains("./runtest.exe -w entry-static.exe dlopen"));
+        assert!(cmd.contains("SKIP entry-static.exe dlopen"));
+        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe dlopen)"));
+    }
+
+    #[test]
+    fn explicit_dynamic_missing_libctest_case_is_reported_without_start_marker() {
+        let mut cmd = String::new();
+        append_filtered_libctest(&mut cmd, "dynamic:pthread_cancel_sem_wait");
+
+        assert!(cmd.contains("SKIP entry-dynamic.exe pthread_cancel_sem_wait"));
+        assert!(!cmd.contains("START entry-dynamic.exe pthread_cancel_sem_wait"));
+    }
+
+    #[test]
+    fn full_libctest_routes_dynamic_sidecar_dso_cases_from_lib_cwd() {
+        let mut cmd = String::new();
+        append_full_libctest(&mut cmd);
+
+        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe dlopen)"));
+        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe tls_get_new_dtv)"));
+        assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe dlopen"));
+        assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe tls_get_new_dtv"));
+    }
+
+    #[test]
+    fn full_libctest_runs_current_pthread_cancel_cases() {
+        let mut cmd = String::new();
+        append_full_libctest(&mut cmd);
+
+        assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_points"));
+        assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel"));
+        assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_sem_wait"));
+        assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_points"));
+        assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel"));
+        assert!(!cmd.contains("skipped known hang"));
+    }
+
+    #[test]
+    fn oscomp_suite_chain_does_not_gate_later_group_markers_on_previous_scripts() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_oscomp_musl_script(&mut cmd, "basic_testcode.sh");
+        append_full_libctest(&mut cmd);
+
+        assert!(cmd.contains("; ./busybox sh basic_testcode.sh"));
+        assert!(
+            cmd.contains("; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"")
+        );
+        assert!(!cmd.contains("basic_testcode.sh && ./busybox echo"));
+    }
+}

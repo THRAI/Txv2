@@ -254,11 +254,10 @@ fn dispatch_kill_invalid_signum_returns_neg_einval() {
     assert_eq!(r, SyscallResult::Error(E_INVAL));
 }
 
-/// `tkill(tid, sig)` aliases to `kill(pid_as_tid, sig)` — the
-/// shape returns 0 for self-targeting + valid signum just like
-/// the kill arm.
+/// `tkill(tid, sig)` resolves the tid through the pid namespace.
+/// Self-targeting with a valid signal returns 0.
 #[test]
-fn dispatch_tkill_aliases_to_kill() {
+fn dispatch_tkill_self_returns_success() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
@@ -600,18 +599,15 @@ fn dispatch_rt_sigreturn_without_frame_returns_neg_efault() {
     assert_eq!(r, SyscallResult::Error(14)); // EFAULT
 }
 
-/// `rt_sigreturn` with a parked signal frame restores it into
-/// `saved_user_context` and returns `SigreturnRestored` so the
-/// syscall-return path in `thread_future` skips the normal
-/// pending-return drain.
+/// The syscall-layer fallback still restores the parked pre-handler
+/// snapshot when no platform frame reader has run. The full kernel
+/// thread future handles user-edited frames before this result is
+/// observed.
 #[test]
 fn dispatch_rt_sigreturn_restores_parked_signal_context() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
-    // Park a synthetic pre-signal context. In production this is
-    // stored at `thread_future.rs:285` by the AST checkpoint when
-    // it flips `saved_user_context` to the handler-entry context.
     let payload = thread.payload_cap().expect("thread has payload");
     let mut parked = tx_hal::UserTrapContext::empty();
     parked.pc = 0x1234_5678;

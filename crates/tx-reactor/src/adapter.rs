@@ -41,6 +41,7 @@ pub mod bus_wire {
         DeclaredWireError, RawPort, RawPortSubscription, RawQueue, WireDeclaration,
         WireDeclarationError, WireEventSet,
     };
+    pub use tx_substrate::step::DelegateRegistry;
     pub use tx_substrate::wake::mailbox;
     pub use tx_substrate::wake::timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
     pub use tx_substrate::wake::wait_source;

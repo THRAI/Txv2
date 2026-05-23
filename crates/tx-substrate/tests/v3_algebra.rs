@@ -77,11 +77,12 @@ fn step_outcome_continue_carries_progress() {
 #[test]
 fn errno_mirrors_v4_catalog() {
     // The `step::Errno` catalog mirrors `tx_subsystems::execution
-    // ::Errno` byte-for-byte (27 variants). Closed-catalog discipline:
+    // ::Errno` byte-for-byte. Closed-catalog discipline:
     // an exhaustive match with no wildcard arm so adding a variant
     // later requires mirroring it here.
     use tx_substrate::step::Errno;
     let cases = [
+        Errno::E2BIG,
         Errno::EACCES,
         Errno::EAGAIN,
         Errno::EBADF,
@@ -109,8 +110,9 @@ fn errno_mirrors_v4_catalog() {
         Errno::ESPIPE,
         Errno::ESRCH,
         Errno::ESTALE,
+        Errno::ETIMEDOUT,
     ];
-    assert_eq!(cases.len(), 27);
+    assert_eq!(cases.len(), 29);
     for errno in cases {
         match errno {
             Errno::E2BIG
@@ -143,6 +145,7 @@ fn errno_mirrors_v4_catalog() {
             | Errno::ESPIPE
             | Errno::ESRCH
             | Errno::ESTALE
+            | Errno::ETIMEDOUT
             | Errno::EINTR => {}
         }
     }

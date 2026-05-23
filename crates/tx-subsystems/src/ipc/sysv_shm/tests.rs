@@ -75,7 +75,7 @@ fn shmat_maps_pagebacked_segment_and_shmdt_tracks_attach_count() {
     )
     .expect("shmget private");
 
-    let addr = block_on(execution::step_shmat(shmid, 0, 0, &creator, &aspace)).expect("shmat");
+    let addr = block_on(execution::script_shmat(shmid, 0, 0, &creator, &aspace)).expect("shmat");
     assert_eq!(addr, USER_PAGE_SIZE);
     let entry = aspace
         .lookup(UserVirtAddr(addr))
@@ -92,7 +92,7 @@ fn shmat_maps_pagebacked_segment_and_shmdt_tracks_attach_count() {
     };
     assert_eq!(attached.attach_count, 1);
 
-    block_on(execution::step_shmdt(addr, &aspace)).expect("shmdt");
+    block_on(execution::script_shmdt(addr, &aspace)).expect("shmdt");
     assert!(aspace.lookup(UserVirtAddr(addr)).is_none());
     let detached = match execution::step_shmctl(shmid, execution::IPC_STAT, None, &creator)
         .expect("stat after detach")
@@ -103,6 +103,43 @@ fn shmat_maps_pagebacked_segment_and_shmdt_tracks_attach_count() {
     assert_eq!(detached.attach_count, 0);
 
     execution::step_shmctl(shmid, execution::IPC_RMID, None, &creator).expect("rmid");
+}
+
+#[test]
+fn shm_namespace_entry_is_identity_cap_authority() {
+    let _g = setup();
+
+    let creator = cred(1000, 1000);
+    let ns = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+    let key = 0x5348_4d01;
+    let shmid = execution::step_shmget(
+        key,
+        4096,
+        execution::IPC_CREAT | execution::IPC_EXCL | 0o600,
+        &creator,
+        &ns,
+    )
+    .expect("shmget keyed");
+
+    let namespace_segment = ns
+        .ipc_ns
+        .sysv_shm
+        .lock()
+        .get(&crate::process::nsproxy::SysvKey::new(key as u32))
+        .expect("namespace entry")
+        .clone();
+
+    assert_eq!(namespace_segment.shmid, shmid);
+    assert_eq!(
+        namespace_segment.key().raw(),
+        crate::ipc::sysv_shm::structure::lookup_shm(shmid)
+            .expect("global compatibility registry")
+            .key()
+            .raw(),
+        "IpcNamespace.sysv_shm must be the authority for the shm identity cap"
+    );
+
+    execution::step_shmctl_in_ns(shmid, execution::IPC_RMID, None, &creator, &ns).expect("cleanup");
 }
 
 #[test]
@@ -121,7 +158,7 @@ fn shmdt_rejects_same_address_mapping_from_other_address_space() {
         &ns,
     )
     .expect("shmget private");
-    let addr = block_on(execution::step_shmat(
+    let addr = block_on(execution::script_shmat(
         shmid,
         0,
         0,
@@ -142,7 +179,7 @@ fn shmdt_rejects_same_address_mapping_from_other_address_space() {
         .expect("unrelated mapping in other address space");
 
     assert_eq!(
-        block_on(execution::step_shmdt(addr, &other_aspace))
+        block_on(execution::script_shmdt(addr, &other_aspace))
             .expect_err("wrong address space rejects"),
         Errno::EINVAL
     );
@@ -156,7 +193,7 @@ fn shmdt_rejects_same_address_mapping_from_other_address_space() {
     };
     assert_eq!(still_attached.attach_count, 1);
 
-    block_on(execution::step_shmdt(addr, &attached_aspace)).expect("real detach");
+    block_on(execution::script_shmdt(addr, &attached_aspace)).expect("real detach");
     execution::step_shmctl(shmid, execution::IPC_RMID, None, &creator).expect("rmid");
 }
 
@@ -178,7 +215,7 @@ fn shmdt_keeps_attach_records_keyed_by_address_space_identity() {
     .expect("shmget private");
 
     let fixed_addr = USER_PAGE_SIZE;
-    let first_addr = block_on(execution::step_shmat(
+    let first_addr = block_on(execution::script_shmat(
         shmid,
         fixed_addr,
         0,
@@ -186,7 +223,7 @@ fn shmdt_keeps_attach_records_keyed_by_address_space_identity() {
         &first_aspace,
     ))
     .expect("first shmat");
-    let second_addr = block_on(execution::step_shmat(
+    let second_addr = block_on(execution::script_shmat(
         shmid,
         fixed_addr,
         0,
@@ -197,7 +234,7 @@ fn shmdt_keeps_attach_records_keyed_by_address_space_identity() {
     assert_eq!(first_addr, fixed_addr);
     assert_eq!(second_addr, fixed_addr);
 
-    block_on(execution::step_shmdt(second_addr, &second_aspace)).expect("detach second");
+    block_on(execution::script_shmdt(second_addr, &second_aspace)).expect("detach second");
 
     let segment = checks::require_shm_exists(shmid).expect("segment exists");
     let attaches = segment.payload.attaches.lock();
@@ -216,7 +253,7 @@ fn shmdt_keeps_attach_records_keyed_by_address_space_identity() {
     };
     assert_eq!(still_attached.attach_count, 1);
 
-    block_on(execution::step_shmdt(first_addr, &first_aspace)).expect("detach first");
+    block_on(execution::script_shmdt(first_addr, &first_aspace)).expect("detach first");
     execution::step_shmctl(shmid, execution::IPC_RMID, None, &creator).expect("rmid");
 }
 
@@ -301,16 +338,16 @@ fn ipc_rmid_keeps_attached_segment_detachable_until_last_shmdt() {
         &ns,
     )
     .expect("shmget private");
-    let addr = block_on(execution::step_shmat(shmid, 0, 0, &creator, &aspace)).expect("shmat");
+    let addr = block_on(execution::script_shmat(shmid, 0, 0, &creator, &aspace)).expect("shmat");
 
     execution::step_shmctl(shmid, execution::IPC_RMID, None, &creator).expect("rmid");
     assert_eq!(
-        block_on(execution::step_shmat(shmid, 0, 0, &creator, &aspace))
+        block_on(execution::script_shmat(shmid, 0, 0, &creator, &aspace))
             .expect_err("new attaches reject after rmid"),
         Errno::EIDRM
     );
 
-    block_on(execution::step_shmdt(addr, &aspace)).expect("attached mapping stays detachable");
+    block_on(execution::script_shmdt(addr, &aspace)).expect("attached mapping stays detachable");
     assert!(aspace.lookup(UserVirtAddr(addr)).is_none());
     assert_eq!(
         execution::step_shmctl(shmid, execution::IPC_STAT, None, &creator)

@@ -230,6 +230,14 @@ impl Prot {
             execute: self.execute,
         }
     }
+
+    pub const fn with_execute(self) -> Self {
+        Self {
+            read: self.read,
+            write: self.write,
+            execute: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

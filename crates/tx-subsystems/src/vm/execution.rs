@@ -29,16 +29,6 @@ use crate::vm::{
     VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapPlacement, VmRemapRequest, USER_PAGE_SIZE,
 };
 
-enum FaultRecipeStep {
-    Done(VmFaultOutcome),
-    Wait(WaitToken),
-}
-
-enum FaultPublishStep {
-    Done(PmapPublishOutcome),
-    Wait(WaitToken),
-}
-
 pub fn page_align_up(addr: usize) -> usize {
     checked_page_align_up(addr).expect("page_align_up overflow")
 }
@@ -48,108 +38,6 @@ pub fn checked_page_align_up(addr: usize) -> Option<usize> {
 }
 
 impl AddressSpace {
-    fn fault_recipe_step(
-        &self,
-        page_range: UserRange,
-        fault: VmFault,
-    ) -> Result<FaultRecipeStep, VmFaultError> {
-        let _guard = match self
-            .range_lock
-            .acquire_step(page_range, LockMode::Materializer)
-        {
-            V3StepOutcome::Done(guard) => guard,
-            V3StepOutcome::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                return Ok(FaultRecipeStep::Wait(WaitToken::new(
-                    carrier.raw(),
-                    interests.raw(),
-                )));
-            }
-            _ => unreachable_acquire_step(),
-        };
-        require_fault_recipe(self, fault).map(FaultRecipeStep::Done)
-    }
-
-    fn publish_fault_materialization_step(
-        &self,
-        outcome: &VmFaultOutcome,
-        materialization: VmFaultMaterialization,
-    ) -> Result<FaultPublishStep, VmFaultError> {
-        let _guard = match self
-            .range_lock
-            .acquire_step(outcome.page_range, LockMode::Materializer)
-        {
-            V3StepOutcome::Done(guard) => guard,
-            V3StepOutcome::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                drop(materialization);
-                return Ok(FaultPublishStep::Wait(WaitToken::new(
-                    carrier.raw(),
-                    interests.raw(),
-                )));
-            }
-            _ => unreachable_acquire_step(),
-        };
-        let _entry = require_fault_publication(self, outcome, &materialization)?;
-        self.pmap
-            .publish_page_with_replacement(
-                outcome.page_range.start().containing_page(),
-                materialization.page.ppn,
-                materialization.publish_prot,
-                materialization.page.map_pin,
-                materialization.replace_existing,
-            )
-            .map(FaultPublishStep::Done)
-            .map_err(VmFaultError::Pmap)
-    }
-
-    fn materialize_and_publish_fault_step(
-        &self,
-        outcome: &VmFaultOutcome,
-        ufd_reply: Option<DelegateReply>,
-    ) -> Result<FaultPublishStep, VmFaultError> {
-        let materialization = match ufd_reply {
-            Some(DelegateReply::Ufd(UfdReply::Copy {
-                src_kernel_addr,
-                dst_uaddr: _,
-                len,
-            })) => materialize_ufd_copy(outcome, src_kernel_addr, len)?,
-            Some(DelegateReply::Ufd(UfdReply::ZeroPage { .. })) | None => {
-                let guard = step_engine::guard();
-                match outcome.materialize_pagebacked_step(&guard) {
-                    VmFaultMaterializationStep::Done(materialization) => materialization,
-                    VmFaultMaterializationStep::Blocked(token) => {
-                        return Ok(FaultPublishStep::Wait(token));
-                    }
-                    VmFaultMaterializationStep::Err(error) => return Err(error),
-                }
-            }
-            Some(DelegateReply::Ufd(UfdReply::Continue { .. })) => {
-                // `UFFDIO_CONTINUE` is the MINOR-mode path (ufd-shm
-                // / page-cache shared mappings). Phase 3 only
-                // admitted `UFFDIO_REGISTER_MODE_MISSING`, so this
-                // variant should never appear in PR-10's wired
-                // surface. Reject with `WouldBlock` rather than
-                // pretending to install — the trap dispatcher will
-                // surface SIGBUS per the agent-dropped-reply mapping.
-                return Err(VmFaultError::WouldBlock);
-            }
-        };
-        self.publish_fault_materialization_step(outcome, materialization)
-    }
-
     pub fn resolve_fault(&self, fault: VmFault) -> Result<VmFaultOutcome, VmFaultError> {
         let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
         let V3StepOutcome::Done(_guard) = self
@@ -372,9 +260,9 @@ impl AddressSpace {
     ) -> Result<PmapPublishOutcome, VmFaultError> {
         let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
         loop {
-            let outcome = match self.fault_recipe_step(page_range, fault)? {
-                FaultRecipeStep::Done(outcome) => outcome,
-                FaultRecipeStep::Wait(token) => {
+            let outcome = match self.try_fault_script_resolve(page_range, fault)? {
+                FaultScriptResolve::Done(outcome) => outcome,
+                FaultScriptResolve::Wait(token) => {
                     await_range_lock(token).await;
                     continue;
                 }
@@ -401,14 +289,118 @@ impl AddressSpace {
                 None
             };
 
-            match self.materialize_and_publish_fault_step(&outcome, ufd_reply)? {
-                FaultPublishStep::Done(outcome) => return Ok(outcome),
-                FaultPublishStep::Wait(token) => {
+            match self.try_fault_script_materialize_and_publish(&outcome, ufd_reply)? {
+                FaultScriptPublish::Done(outcome) => return Ok(outcome),
+                FaultScriptPublish::Wait(token) => {
                     await_range_lock(token).await;
                     continue;
                 }
             }
         }
+    }
+
+    fn try_fault_script_resolve(
+        &self,
+        page_range: UserRange,
+        fault: VmFault,
+    ) -> Result<FaultScriptResolve, VmFaultError> {
+        let _guard = match self
+            .range_lock
+            .acquire_step(page_range, LockMode::Materializer)
+        {
+            V3StepOutcome::Done(guard) => guard,
+            V3StepOutcome::Yield {
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
+                ..
+            } => {
+                return Ok(FaultScriptResolve::Wait(WaitToken::new(
+                    carrier.raw(),
+                    interests.raw(),
+                )));
+            }
+            _ => unreachable_acquire_step(),
+        };
+        Ok(FaultScriptResolve::Done(require_fault_recipe(self, fault)?))
+    }
+
+    fn try_fault_script_publish(
+        &self,
+        outcome: &VmFaultOutcome,
+        materialization: VmFaultMaterialization,
+    ) -> Result<FaultScriptPublish, VmFaultError> {
+        let _guard = match self
+            .range_lock
+            .acquire_step(outcome.page_range, LockMode::Materializer)
+        {
+            V3StepOutcome::Done(guard) => guard,
+            V3StepOutcome::Yield {
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
+                ..
+            } => {
+                drop(materialization);
+                return Ok(FaultScriptPublish::Wait(WaitToken::new(
+                    carrier.raw(),
+                    interests.raw(),
+                )));
+            }
+            _ => unreachable_acquire_step(),
+        };
+        let _entry = require_fault_publication(self, outcome, &materialization)?;
+        let published = self
+            .pmap
+            .publish_page_with_replacement(
+                outcome.page_range.start().containing_page(),
+                materialization.page.ppn,
+                materialization.publish_prot,
+                materialization.page.map_pin,
+                materialization.replace_existing,
+            )
+            .map_err(VmFaultError::Pmap)?;
+        Ok(FaultScriptPublish::Done(published))
+    }
+
+    fn try_fault_script_materialize_and_publish(
+        &self,
+        outcome: &VmFaultOutcome,
+        ufd_reply: Option<DelegateReply>,
+    ) -> Result<FaultScriptPublish, VmFaultError> {
+        let materialization = match ufd_reply {
+            Some(DelegateReply::Ufd(UfdReply::Copy {
+                src_kernel_addr,
+                dst_uaddr: _,
+                len,
+            })) => materialize_ufd_copy(outcome, src_kernel_addr, len)?,
+            Some(DelegateReply::Ufd(UfdReply::ZeroPage { .. })) | None => {
+                let guard = step_engine::guard();
+                match outcome.materialize_pagebacked_step(&guard) {
+                    VmFaultMaterializationStep::Done(materialization) => materialization,
+                    VmFaultMaterializationStep::Blocked(token) => {
+                        drop(guard);
+                        return Ok(FaultScriptPublish::Wait(token));
+                    }
+                    VmFaultMaterializationStep::Err(error) => return Err(error),
+                }
+            }
+            Some(DelegateReply::Ufd(UfdReply::Continue { .. })) => {
+                // `UFFDIO_CONTINUE` is the MINOR-mode path (ufd-shm
+                // / page-cache shared mappings). Phase 3 only
+                // admitted `UFFDIO_REGISTER_MODE_MISSING`, so this
+                // variant should never appear in PR-10's wired
+                // surface. Reject with `WouldBlock` rather than
+                // pretending to install; the trap dispatcher will
+                // surface SIGBUS per the agent-dropped-reply mapping.
+                return Err(VmFaultError::WouldBlock);
+            }
+        };
+        self.try_fault_script_publish(outcome, materialization)
     }
 
     pub fn try_mmap(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
@@ -840,12 +832,7 @@ fn remap_teardown_ranges(
     placement: VmRemapPlacement,
 ) -> Result<Vec<UserRange>, VmMapError> {
     match placement {
-        VmRemapPlacement::Move => {
-            let mut ranges = Vec::with_capacity(2);
-            ranges.push(old_range);
-            ranges.push(new_range);
-            Ok(ranges)
-        }
+        VmRemapPlacement::Move => Ok(alloc::vec![old_range, new_range]),
         VmRemapPlacement::InPlace if new_range.len() < old_range.len() => {
             let start = old_range
                 .start()
@@ -854,11 +841,7 @@ fn remap_teardown_ranges(
                 .ok_or(VmMapError::InvalidRange)?;
             let len = old_range.len() - new_range.len();
             UserRange::new_aligned(UserVirtAddr(start), len)
-                .map(|range| {
-                    let mut ranges = Vec::with_capacity(1);
-                    ranges.push(range);
-                    ranges
-                })
+                .map(|range| alloc::vec![range])
                 .map_err(|_| VmMapError::InvalidRange)
         }
         VmRemapPlacement::InPlace => Ok(Vec::new()),
@@ -869,6 +852,16 @@ pub enum MapReserveResult<'a> {
     Reserved(MapReservation<'a>),
     Blocked(WaitToken),
     Err(VmMapError),
+}
+
+enum FaultScriptResolve {
+    Done(VmFaultOutcome),
+    Wait(WaitToken),
+}
+
+enum FaultScriptPublish {
+    Done(PmapPublishOutcome),
+    Wait(WaitToken),
 }
 
 impl core::fmt::Debug for MapReserveResult<'_> {

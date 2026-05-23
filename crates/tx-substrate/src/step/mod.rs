@@ -92,6 +92,8 @@ pub enum Errno {
     ESPIPE,
     ESRCH,
     ESTALE,
+    /// Wait deadline expired. Linux value: 110.
+    ETIMEDOUT,
 }
 
 impl Errno {
@@ -133,6 +135,7 @@ impl Errno {
             Errno::ESPIPE => 29,
             Errno::ESRCH => 3,
             Errno::ESTALE => 116,
+            Errno::ETIMEDOUT => 110,
             Errno::EINTR => 4,
         }
     }

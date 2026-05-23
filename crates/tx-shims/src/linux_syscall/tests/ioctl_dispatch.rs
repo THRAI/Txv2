@@ -5,6 +5,9 @@ use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::bootstrap_init_process;
 use tx_subsystems::tty::structure::termios::{ICANON, VMIN};
 use tx_subsystems::tty::structure::{Termios, Winsize};
+use tx_subsystems::vfs::{
+    FsObjectId, InodeKind, InodeMeta, OpenFileFlags, RNode, RNodeBacking, StructPayload,
+};
 
 use crate::linux_syscall::{
     NR_IOCTL, TCGETS, TCSETS, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ,
@@ -14,6 +17,7 @@ const E_BADF: i32 = 9;
 const E_FAULT: i32 = 14;
 const E_INVAL: i32 = 22;
 const E_NOTTY: i32 = 25;
+const RTC_RD_TIME: u32 = 0x8024_7009;
 
 fn ioctl_setup() -> TestSetup {
     setup()
@@ -193,6 +197,45 @@ fn dispatch_ioctl_tiocgwinsz_on_tty_writes_winsize() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
     assert_eq!(out, preset);
+}
+
+#[test]
+fn dispatch_ioctl_rtc_rd_time_on_rtc_char_device_writes_rtc_time() {
+    let _setup = ioctl_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let rnode = RNode::new_cap(
+        FsObjectId::new(0x6465_7805),
+        InodeMeta::new(InodeKind::CharDevice, 0o020644),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::CharDevice(&tx_fs::devfs::RTC_CHAR_BINDING),
+        },
+    )
+    .expect("rtc rnode");
+    let file = OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: false,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+        },
+    )
+    .expect("rtc open file");
+    proc_cap.set_fd(3, Some(file));
+    let ctx = make_ctx(proc_cap, thread);
+
+    let mut out = [0xa5u8; 36];
+    let req = SyscallRequest::new(
+        NR_IOCTL,
+        [3, RTC_RD_TIME as u64, out.as_mut_ptr() as u64, 0, 0, 0],
+    );
+
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(i32::from_le_bytes(out[12..16].try_into().unwrap()), 23);
+    assert_eq!(i32::from_le_bytes(out[16..20].try_into().unwrap()), 4);
+    assert_eq!(i32::from_le_bytes(out[20..24].try_into().unwrap()), 126);
 }
 
 /// `ioctl(tty_fd, TIOCSWINSZ, &new)` returns 0 and the next

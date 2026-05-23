@@ -17,7 +17,7 @@ use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKin
 use tx_subsystems::process::{self, Pid};
 use tx_subsystems::vfs::{
     render_dentry_path, Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta,
-    RNode, RNodeBacking, S_IFDIR, S_IFLNK, S_IFREG,
+    ProjectionKey, ProjectionSchemaId, RNode, RNodeBacking, S_IFDIR, S_IFLNK, S_IFREG,
 };
 
 pub const PROCFS_ROOT_ID: FsObjectId = FsObjectId::new(0x7072_6F00);
@@ -35,11 +35,16 @@ pub const PROCFS_SYS_FS_PIPE_MAX_SIZE_ID: FsObjectId = FsObjectId::new(0x7072_6F
 pub const PROCFS_SYS_FS_LEASE_BREAK_TIME_ID: FsObjectId = FsObjectId::new(0x7072_6F0c);
 pub const PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F0d);
 pub const PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F0e);
+pub const PROCFS_SYSVIPC_ID: FsObjectId = FsObjectId::new(0x7072_6F0f);
+pub const PROCFS_SYSVIPC_MSG_ID: FsObjectId = FsObjectId::new(0x7072_6F10);
+pub const PROCFS_SYSVIPC_SEM_ID: FsObjectId = FsObjectId::new(0x7072_6F11);
+pub const PROCFS_SYSVIPC_SHM_ID: FsObjectId = FsObjectId::new(0x7072_6F12);
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 const PROCFS_PID_OBJECT_STRIDE: u64 = 0x100;
 const PROCFS_PID_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x10000;
 const PROCFS_FD_OBJECT_STRIDE: u64 = 0x10000;
 const PROCFS_FD_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x0100_0000;
+const PROCFS_FDINFO_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x0200_0000;
 const PROCFS_TASK_OBJECT_BASE: u64 = 0x7073_0000_0000;
 const PROCFS_TASK_OBJECT_TAG_MASK: u64 = 0xff;
 const PROCFS_TASK_TAG_TID_DIR: u64 = 0;
@@ -51,6 +56,7 @@ const PROCFS_TAG_MAPS: u64 = 3;
 const PROCFS_TAG_EXE: u64 = 4;
 const PROCFS_TAG_FD_DIR: u64 = 5;
 const PROCFS_TAG_TASK_DIR: u64 = 6;
+const PROCFS_TAG_FDINFO_DIR: u64 = 7;
 
 const fn pid_dir_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64)
@@ -78,6 +84,12 @@ const fn pid_fd_dir_id(pid: Pid) -> FsObjectId {
 }
 const fn pid_task_dir_id(pid: Pid) -> FsObjectId {
     pid_object_id(pid, PROCFS_TAG_TASK_DIR)
+}
+const fn pid_fdinfo_dir_id(pid: Pid) -> FsObjectId {
+    pid_object_id(pid, PROCFS_TAG_FDINFO_DIR)
+}
+const fn pid_fdinfo_id(pid: Pid, fd: u32) -> FsObjectId {
+    FsObjectId::new(PROCFS_FDINFO_OBJECT_BASE + pid.0 as u64 * PROCFS_FD_OBJECT_STRIDE + fd as u64)
 }
 const fn task_tid_dir_id(pid: Pid, tid: u32) -> FsObjectId {
     FsObjectId::new(PROCFS_TASK_OBJECT_BASE + ((pid.0 as u64) << 32) + ((tid as u64) << 8))
@@ -120,7 +132,7 @@ fn pid_from_fd_dir(id: FsObjectId) -> Option<Pid> {
 }
 fn pid_from_fd_id(id: FsObjectId) -> Option<(Pid, u32)> {
     let r = id.as_u64();
-    if !(PROCFS_FD_OBJECT_BASE..PROCFS_TASK_OBJECT_BASE).contains(&r) {
+    if !(PROCFS_FD_OBJECT_BASE..PROCFS_FDINFO_OBJECT_BASE).contains(&r) {
         return None;
     }
     let offset = r - PROCFS_FD_OBJECT_BASE;
@@ -128,8 +140,43 @@ fn pid_from_fd_id(id: FsObjectId) -> Option<(Pid, u32)> {
     let fd = (offset % PROCFS_FD_OBJECT_STRIDE) as u32;
     Some((pid, fd))
 }
+fn pid_from_fdinfo_dir(id: FsObjectId) -> Option<Pid> {
+    pid_from_object_id(id, PROCFS_TAG_FDINFO_DIR)
+}
+pub fn pid_from_fdinfo_id(id: FsObjectId) -> Option<(Pid, u32)> {
+    let r = id.as_u64();
+    if !(PROCFS_FDINFO_OBJECT_BASE..PROCFS_TASK_OBJECT_BASE).contains(&r) {
+        return None;
+    }
+    let offset = r - PROCFS_FDINFO_OBJECT_BASE;
+    let pid = Pid((offset / PROCFS_FD_OBJECT_STRIDE) as u32);
+    let fd = (offset % PROCFS_FD_OBJECT_STRIDE) as u32;
+    Some((pid, fd))
+}
 
 fn pid_from_dir(id: FsObjectId) -> Option<Pid> {
+    match id {
+        PROCFS_ROOT_ID
+        | PROCFS_SELF_ID
+        | PROCFS_MOUNTS_ID
+        | PROCFS_CPUINFO_ID
+        | PROCFS_UPTIME_ID
+        | PROCFS_MEMINFO_ID
+        | PROCFS_SYS_ID
+        | PROCFS_SYS_KERNEL_ID
+        | PROCFS_SYS_KERNEL_TAINTED_ID
+        | PROCFS_CONFIG_ID
+        | PROCFS_SYS_FS_ID
+        | PROCFS_SYS_FS_PIPE_MAX_SIZE_ID
+        | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID
+        | PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID
+        | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID
+        | PROCFS_SYSVIPC_ID
+        | PROCFS_SYSVIPC_MSG_ID
+        | PROCFS_SYSVIPC_SEM_ID
+        | PROCFS_SYSVIPC_SHM_ID => return None,
+        _ => {}
+    }
     let r = id.as_u64();
     if r > PROCFS_PID_BASE && r < PROCFS_PID_OBJECT_BASE {
         Some(Pid((r - PROCFS_PID_BASE) as u32))
@@ -235,6 +282,9 @@ impl FsOps for Procfs {
             if name == b"sys" {
                 return StepOutcome::done(PROCFS_SYS_ID);
             }
+            if name == b"sysvipc" {
+                return StepOutcome::done(PROCFS_SYSVIPC_ID);
+            }
             if let Ok(n) = core::str::from_utf8(name).unwrap_or("").parse::<u32>() {
                 if n > 0 && procfs_number_exists(n) {
                     return StepOutcome::done(pid_dir_id(Pid(n)));
@@ -272,6 +322,18 @@ impl FsOps for Procfs {
             }
             return StepOutcome::err(Errno::ENOENT.into());
         }
+        if parent == PROCFS_SYSVIPC_ID {
+            if name == b"msg" {
+                return StepOutcome::done(PROCFS_SYSVIPC_MSG_ID);
+            }
+            if name == b"sem" {
+                return StepOutcome::done(PROCFS_SYSVIPC_SEM_ID);
+            }
+            if name == b"shm" {
+                return StepOutcome::done(PROCFS_SYSVIPC_SHM_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
         if let Some(pid) = pid_from_dir(parent) {
             if name == b"stat" && process_for_procfs_number(pid.0).is_some() {
                 return StepOutcome::done(pid_stat_id(pid));
@@ -293,6 +355,21 @@ impl FsOps for Procfs {
             }
             if name == b"task" && process_for_procfs_number(pid.0).is_some() {
                 return StepOutcome::done(pid_task_dir_id(pid));
+            }
+            if name == b"fdinfo" && process_for_procfs_number(pid.0).is_some() {
+                return StepOutcome::done(pid_fdinfo_dir_id(pid));
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if let Some(pid) = pid_from_fdinfo_dir(parent) {
+            let Ok(fd) = core::str::from_utf8(name).unwrap_or("").parse::<u32>() else {
+                return StepOutcome::err(Errno::ENOENT.into());
+            };
+            if process::process_by_pid(pid)
+                .and_then(|proc| proc.fd(fd))
+                .is_some()
+            {
+                return StepOutcome::done(pid_fdinfo_id(pid, fd));
             }
             return StepOutcome::err(Errno::ENOENT.into());
         }
@@ -329,7 +406,7 @@ impl FsOps for Procfs {
             PROCFS_ROOT_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
-            PROCFS_SYS_ID | PROCFS_SYS_KERNEL_ID | PROCFS_SYS_FS_ID => {
+            PROCFS_SYS_ID | PROCFS_SYS_KERNEL_ID | PROCFS_SYS_FS_ID | PROCFS_SYSVIPC_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
             PROCFS_SELF_ID => {
@@ -348,6 +425,9 @@ impl FsOps for Procfs {
             | PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID
             | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, S_IFREG | 0o644))
+            }
+            PROCFS_SYSVIPC_MSG_ID | PROCFS_SYSVIPC_SEM_ID | PROCFS_SYSVIPC_SHM_ID => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             id if pid_from_dir(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
@@ -372,6 +452,12 @@ impl FsOps for Procfs {
             }
             id if pid_from_fd_id(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Symlink, PROCFS_SYMLINK_MODE))
+            }
+            id if pid_from_fdinfo_dir(id).is_some() => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
+            }
+            id if pid_from_fdinfo_id(id).is_some() => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             id if pid_from_task_dir(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
@@ -409,13 +495,14 @@ impl FsOps for Procfs {
                 (b"exe", pid_exe_id(pid), InodeKind::Symlink),
                 (b"fd", pid_fd_dir_id(pid), InodeKind::Directory),
                 (b"task", pid_task_dir_id(pid), InodeKind::Directory),
+                (b"fdinfo", pid_fdinfo_dir_id(pid), InodeKind::Directory),
             ];
             let fi = idx.saturating_sub(2);
             if fi < files.len() {
                 let (name, oid, kind) = files[fi];
                 return StepOutcome::done(Some((
                     dir_entry(oid, kind, name),
-                    DirCursor([2, (fi + 1) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    DirCursor([2, (fi + 3) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
                 )));
             }
             return StepOutcome::done(None);
@@ -531,6 +618,51 @@ impl FsOps for Procfs {
             return StepOutcome::done(None);
         }
 
+        if let Some(pid) = pid_from_fdinfo_dir(id) {
+            if state_byte < 2 {
+                return finish_dots(state_byte, idx, id);
+            }
+            let Some(proc) = process::process_by_pid(pid) else {
+                return StepOutcome::done(None);
+            };
+            let fds: Vec<_> = proc
+                .payload_slot()
+                .lock()
+                .as_ref()
+                .map(|payload| payload.open_fds().into_keys().collect())
+                .unwrap_or_default();
+            let fi = idx.saturating_sub(2);
+            if fi < fds.len() {
+                let fd = fds[fi];
+                let name = alloc::format!("{}", fd);
+                return StepOutcome::done(Some((
+                    dir_entry(pid_fdinfo_id(pid, fd), InodeKind::Regular, name.as_bytes()),
+                    DirCursor([2, (fi + 3) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                )));
+            }
+            return StepOutcome::done(None);
+        }
+
+        if id == PROCFS_SYSVIPC_ID {
+            if state_byte < 2 {
+                return finish_dots(state_byte, idx, id);
+            }
+            let files: &[(&[u8], FsObjectId, InodeKind)] = &[
+                (b"msg", PROCFS_SYSVIPC_MSG_ID, InodeKind::Regular),
+                (b"sem", PROCFS_SYSVIPC_SEM_ID, InodeKind::Regular),
+                (b"shm", PROCFS_SYSVIPC_SHM_ID, InodeKind::Regular),
+            ];
+            let fi = idx.saturating_sub(2);
+            if fi < files.len() {
+                let (name, oid, kind) = files[fi];
+                return StepOutcome::done(Some((
+                    dir_entry(oid, kind, name),
+                    DirCursor([2, (fi + 3) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                )));
+            }
+            return StepOutcome::done(None);
+        }
+
         if id != PROCFS_ROOT_ID {
             return finish_dots(state_byte, idx, id);
         }
@@ -547,13 +679,14 @@ impl FsOps for Procfs {
             (b"meminfo", PROCFS_MEMINFO_ID, InodeKind::Regular),
             (b"config", PROCFS_CONFIG_ID, InodeKind::Regular),
             (b"sys", PROCFS_SYS_ID, InodeKind::Directory),
+            (b"sysvipc", PROCFS_SYSVIPC_ID, InodeKind::Directory),
         ];
         let si = idx.saturating_sub(2);
         if state_byte == 2 && si < statics.len() {
             let (name, oid, kind) = statics[si];
             return StepOutcome::done(Some((
                 dir_entry(oid, kind, name),
-                DirCursor([2, (si + 1) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                DirCursor([2, (si + 3) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
             )));
         }
 
@@ -694,7 +827,15 @@ impl FsOps for Procfs {
         mount: &Cap<MountPayload>,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
-        match RNode::new_cap_in_mount(id, meta, RNodeBacking::Projected, mount) {
+        match RNode::new_cap_in_mount(
+            id,
+            meta,
+            RNodeBacking::Projected {
+                schema: ProjectionSchemaId::Procfs,
+                key: ProjectionKey::from_fs_object_id(id),
+            },
+            mount,
+        ) {
             Ok(cap) => StepOutcome::done(cap),
             Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
         }
@@ -811,5 +952,34 @@ impl FsPageBacking for Procfs {
     }
     fn fsync_file(&self, _: FsObjectId, _: &Guard<'_>) -> StepOutcome<(), NoProgress> {
         StepOutcome::err(Errno::ENOSYS.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_one(fs: &Procfs, id: FsObjectId, cursor: DirCursor) -> (DirEntry, DirCursor) {
+        let guard = adapter::step_engine::guard();
+        match fs.readdir(id, cursor, &guard) {
+            StepOutcome::Done(Some(entry)) => entry,
+            other => panic!("procfs readdir returned {other:?}"),
+        }
+    }
+
+    #[test]
+    fn root_readdir_cursor_advances_through_static_entries() {
+        tx_test_support::init_host();
+        let fs = Procfs::new();
+        let (dot, cursor) = read_one(&fs, PROCFS_ROOT_ID, DirCursor::START);
+        assert_eq!(dot.name.as_bytes(), b".");
+        let (dotdot, cursor) = read_one(&fs, PROCFS_ROOT_ID, cursor);
+        assert_eq!(dotdot.name.as_bytes(), b"..");
+        let (self_entry, cursor) = read_one(&fs, PROCFS_ROOT_ID, cursor);
+        assert_eq!(self_entry.name.as_bytes(), b"self");
+        let (mounts_entry, cursor) = read_one(&fs, PROCFS_ROOT_ID, cursor);
+        assert_eq!(mounts_entry.name.as_bytes(), b"mounts");
+        let (cpuinfo_entry, _) = read_one(&fs, PROCFS_ROOT_ID, cursor);
+        assert_eq!(cpuinfo_entry.name.as_bytes(), b"cpuinfo");
     }
 }

@@ -129,6 +129,10 @@ impl SignalMask {
         (self.0 & sig.bit()) != 0
     }
 
+    pub const fn union(self, other: Self) -> Self {
+        Self::new(self.0 | other.0)
+    }
+
     const fn uncatchable_bits() -> u64 {
         Signum::SIGKILL.bit() | Signum::SIGSTOP.bit()
     }
@@ -157,8 +161,6 @@ pub struct SigInfo {
 
 /// SI_USER: signal sent by kill(2) / tkill(2) / tgkill(2).
 pub const SI_USER: i32 = 0;
-/// SI_TKILL: signal sent by tkill(2) / tgkill(2).
-pub const SI_TKILL: i32 = -6;
 
 /// Per-process siginfo slots — one optional [`SigInfo`] record
 /// per signum.  Lives on `ProcessPayload` alongside `group_pending`.
@@ -239,36 +241,115 @@ pub enum SigDisposition {
     /// Discard the signal without delivery.
     Ignore,
     /// User-defined handler at the recorded address.
-    Handler {
-        handler: usize,
-        flags: u64,
-        restorer: usize,
-    },
+    Handler(usize),
 }
 
 impl SigDisposition {
-    pub const fn handler(handler: usize) -> Self {
-        Self::Handler {
-            handler,
-            flags: 0,
-            restorer: 0,
-        }
-    }
-
-    pub const fn handler_with_restorer(handler: usize, flags: u64, restorer: usize) -> Self {
-        Self::Handler {
-            handler,
-            flags,
-            restorer,
-        }
+    pub const fn handler(addr: usize) -> Self {
+        Self::Handler(addr)
     }
 }
 
-/// Per-process signal-action table. One [`SigDisposition`] slot per
+/// POSIX sigaction flags stored alongside each disposition.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SaFlags {
+    bits: u64,
+}
+
+impl SaFlags {
+    pub const EMPTY: Self = Self { bits: 0 };
+    pub const NOCLDSTOP: Self = Self { bits: 1 };
+    pub const NOCLDWAIT: Self = Self { bits: 2 };
+    pub const SIGINFO: Self = Self { bits: 4 };
+    pub const ONSTACK: Self = Self { bits: 0x0800_0000 };
+    pub const RESTART: Self = Self { bits: 0x1000_0000 };
+    pub const NODEFER: Self = Self { bits: 0x4000_0000 };
+    pub const RESETHAND: Self = Self { bits: 0x8000_0000 };
+
+    pub const fn new(bits: u64) -> Self {
+        Self { bits }
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.bits
+    }
+
+    pub const fn contains(self, flag: Self) -> bool {
+        (self.bits & flag.bits) == flag.bits
+    }
+}
+
+impl core::ops::BitOr for SaFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self::new(self.bits | rhs.bits)
+    }
+}
+
+impl core::ops::BitOrAssign for SaFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.bits |= rhs.bits;
+    }
+}
+
+/// Full per-signal action entry required by POSIX `sigaction(2)`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SigActionEntry {
+    pub disposition: SigDisposition,
+    pub flags: SaFlags,
+    pub sa_mask: SignalMask,
+    /// ABI spare/restorer word. On RV64 musl this is the unused
+    /// fourth word of `struct k_sigaction` because the architecture
+    /// has no `SA_RESTORER`; other Linux ABIs may use the same storage
+    /// as a userspace restorer pointer. txKernel writes its own stack
+    /// trampoline during delivery either way.
+    pub restorer: usize,
+}
+
+impl SigActionEntry {
+    pub const DEFAULT: Self = Self {
+        disposition: SigDisposition::Default,
+        flags: SaFlags::EMPTY,
+        sa_mask: SignalMask::EMPTY,
+        restorer: 0,
+    };
+
+    pub const fn new(
+        disposition: SigDisposition,
+        flags: SaFlags,
+        sa_mask: SignalMask,
+        restorer: usize,
+    ) -> Self {
+        Self {
+            disposition,
+            flags,
+            sa_mask,
+            restorer,
+        }
+    }
+
+    pub const fn handler(addr: usize) -> Self {
+        Self::new(
+            SigDisposition::Handler(addr),
+            SaFlags::EMPTY,
+            SignalMask::EMPTY,
+            0,
+        )
+    }
+}
+
+impl From<SigDisposition> for SigActionEntry {
+    fn from(disposition: SigDisposition) -> Self {
+        Self::new(disposition, SaFlags::EMPTY, SignalMask::EMPTY, 0)
+    }
+}
+
+/// Per-process signal-action table. One [`SigActionEntry`] slot per
 /// signum. `SIGKILL` / `SIGSTOP` slots are ignored on writes to honor
 /// the uncatchable invariant.
 pub struct SigActionTable {
-    entries: SpinMutex<[SigDisposition; Signum::MAX as usize]>,
+    entries: SpinMutex<[SigActionEntry; Signum::MAX as usize]>,
 }
 
 impl Clone for SigActionTable {
@@ -288,19 +369,27 @@ impl Default for SigActionTable {
 impl SigActionTable {
     pub fn new() -> Self {
         Self {
-            entries: SpinMutex::new([SigDisposition::Default; Signum::MAX as usize]),
+            entries: SpinMutex::new([SigActionEntry::DEFAULT; Signum::MAX as usize]),
         }
     }
 
-    pub fn get(&self, sig: Signum) -> SigDisposition {
+    pub fn get_entry(&self, sig: Signum) -> SigActionEntry {
         self.entries.lock()[(sig.raw() - 1) as usize]
     }
 
-    pub fn set(&self, sig: Signum, disposition: SigDisposition) {
+    pub fn get(&self, sig: Signum) -> SigDisposition {
+        self.get_entry(sig).disposition
+    }
+
+    pub fn set_entry(&self, sig: Signum, entry: SigActionEntry) {
         if sig.is_uncatchable() {
             return;
         }
-        self.entries.lock()[(sig.raw() - 1) as usize] = disposition;
+        self.entries.lock()[(sig.raw() - 1) as usize] = entry;
+    }
+
+    pub fn set(&self, sig: Signum, disposition: SigDisposition) {
+        self.set_entry(sig, SigActionEntry::from(disposition));
     }
 
     /// Reset every user-installed handler to `SigDisposition::Default`,
@@ -313,12 +402,6 @@ impl SigActionTable {
     /// SIGTERM sent moments before exec is still delivered after the
     /// new image starts).
     ///
-    /// `SigDisposition` today carries only the handler shape
-    /// (`Default` / `Ignore` / `Handler(usize)`); when SA_FLAGS,
-    /// SA_RESTORER, and per-handler SA_MASK are added, those fields
-    /// will be zeroed in the same sweep (a `Default` slot has no
-    /// handler frame storage by definition).
-    ///
     /// Phase 7 — infallible. Called by the exec script after
     /// `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`.
     pub fn step_reset_for_exec(&self) {
@@ -329,8 +412,8 @@ impl SigActionTable {
         // publish
         let mut entries = self.entries.lock();
         for slot in entries.iter_mut() {
-            if matches!(slot, SigDisposition::Handler { .. }) {
-                *slot = SigDisposition::Default;
+            if matches!(slot.disposition, SigDisposition::Handler(_)) {
+                *slot = SigActionEntry::DEFAULT;
             }
         }
     }
@@ -477,6 +560,22 @@ pub fn select_next_signal(
     lowest_signum_bit(g_deliverable).map(|sig| (sig, PendingSource::Group))
 }
 
+/// Refresh the denormalised interrupt-summary deliverability bit from
+/// the authoritative pending queues and the thread's current mask.
+///
+/// Use this after consumers dequeue a signal or after a direct
+/// signal-mask restore outside [`thread_runtime::execution::step_sigprocmask`].
+/// Termination and stop bits are left untouched.
+pub fn refresh_deliverable_signal_summary(
+    thread: &Cap<crate::thread_runtime::ThreadIdentity>,
+) -> bool {
+    let deliverable = select_next_signal(thread).is_some();
+    if let Some(payload) = thread.payload_cap() {
+        payload.update_summary(|s| s.deliverable_signal = deliverable);
+    }
+    deliverable
+}
+
 fn lowest_signum_bit(bits: u64) -> Option<Signum> {
     if bits == 0 {
         return None;
@@ -508,15 +607,9 @@ pub enum AstOutcome {
     DefaultStop { sig: Signum },
     /// Default action is `Cont` (SIGCONT). Continue control op.
     DefaultContinue { sig: Signum },
-    /// User-installed handler. Day-1 records the intent + handler
-    /// address; signal-frame construction lands with the AST trap-
-    /// return wiring.
-    DeliverHandler {
-        sig: Signum,
-        handler: usize,
-        flags: u64,
-        restorer: usize,
-    },
+    /// User-installed handler and the sigaction metadata needed for
+    /// frame construction.
+    DeliverHandler { sig: Signum, action: SigActionEntry },
 }
 
 /// Site-B delivery decision per `SIGNAL_v1` §15.1.
@@ -570,13 +663,14 @@ pub fn ast_check(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstOutc
                 proc_payload.group_pending().clear(sig);
             }
         }
+        refresh_deliverable_signal_summary(thread);
 
-        let disposition = match proc.upgrade_operational() {
-            Ok(payload) => payload.sig_actions().get(sig),
+        let action = match proc.upgrade_operational() {
+            Ok(payload) => payload.sig_actions().get_entry(sig),
             Err(_) => return AstOutcome::Continue,
         };
 
-        match disposition {
+        match action.disposition {
             SigDisposition::Ignore => continue,
             SigDisposition::Default => match default_action(sig) {
                 DefaultAction::Ignore => continue,
@@ -586,18 +680,7 @@ pub fn ast_check(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstOutc
                 DefaultAction::Stop => return AstOutcome::DefaultStop { sig },
                 DefaultAction::Cont => return AstOutcome::DefaultContinue { sig },
             },
-            SigDisposition::Handler {
-                handler,
-                flags,
-                restorer,
-            } => {
-                return AstOutcome::DeliverHandler {
-                    sig,
-                    handler,
-                    flags,
-                    restorer,
-                };
-            }
+            SigDisposition::Handler(_) => return AstOutcome::DeliverHandler { sig, action },
         }
     }
 }
@@ -754,7 +837,7 @@ pub fn deliver_posix_signal(target: SignalTarget, sig: Signum) -> KillOutcome {
                 }
             }
         }
-        SigDisposition::Handler { .. } => {
+        SigDisposition::Handler(_handler) => {
             // Post to eligible thread's pending; AST delivers handler.
             step_kill_process(&cap, sig, None)
         }
@@ -1036,10 +1119,10 @@ pub fn step_kill_pgrp(pgrp: &Cap<ProcessGroup>, sig: Signum) -> usize {
 /// Install (or replace) the disposition of `sig` on `process`.
 /// `Default` for `SIGKILL`/`SIGSTOP` is rejected silently.
 /// Returns the previous disposition.
-pub fn step_sigaction(
+pub fn step_sigaction_entry(
     process: &Cap<ProcessIdentity>,
     sig: Signum,
-    disposition: SigDisposition,
+    entry: SigActionEntry,
 ) -> SigDispositionChange {
     // observe
     // upgrade
@@ -1049,12 +1132,28 @@ pub fn step_sigaction(
     let Ok(payload) = process.upgrade_operational() else {
         return SigDispositionChange::ZombieIgnored;
     };
-    let prev = payload.sig_actions().get(sig);
+    let prev = payload.sig_actions().get_entry(sig);
     if sig.is_uncatchable() {
         return SigDispositionChange::Uncatchable(prev);
     }
-    payload.sig_actions().set(sig, disposition);
+    payload.sig_actions().set_entry(sig, entry);
     SigDispositionChange::Replaced { prev }
+}
+
+/// Install (or replace) only the disposition of `sig` on `process`.
+/// Compatibility wrapper for older call sites that do not yet carry
+/// flags or a handler mask.
+pub fn step_sigaction(
+    process: &Cap<ProcessIdentity>,
+    sig: Signum,
+    disposition: SigDisposition,
+) -> SigDispositionChange {
+    // observe: inspect current subsystem state and validate inputs.
+    // upgrade: acquire capabilities/guards needed for mutation.
+    // reserve: reserve namespace, memory, or wait-source effects.
+    // commit: apply the state transition.
+    // publish: emit readiness, signal, or observable outcome.
+    step_sigaction_entry(process, sig, SigActionEntry::from(disposition))
 }
 
 /// Outcome of `step_sigaction`. `Replaced` is the normal path;
@@ -1062,8 +1161,8 @@ pub fn step_sigaction(
 /// means SIGKILL/SIGSTOP were silently kept at default.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SigDispositionChange {
-    Replaced { prev: SigDisposition },
-    Uncatchable(SigDisposition),
+    Replaced { prev: SigActionEntry },
+    Uncatchable(SigActionEntry),
     ZombieIgnored,
 }
 
@@ -1217,6 +1316,7 @@ pub fn script_deliver_signal(
     source: &Cap<ProcessIdentity>,
     target: SignalTarget,
     sig: Signum,
+    info: Option<SigInfo>,
 ) -> Result<KillOutcome, Errno> {
     // Resolve the target's owning process *before* taking the
     // auth-phase guard — `upgrade_owner_proc()` takes its own guard
@@ -1243,24 +1343,56 @@ pub fn script_deliver_signal(
         AuthOutcome::Authorized => {}
     }
 
-    // Phase 2 — commit. We pass `SignalTarget::Process(target_proc)`
-    // (the already-resolved owning process) rather than the original
-    // `target`, even for thread-targeted calls. Reasons:
-    //   • `deliver_posix_signal`'s `SignalTarget::Thread` branch
-    //     calls `upgrade_owner_proc` under a held guard, which would
-    //     nest a guard inside `Weak::upgrade`'s own guard and trip
-    //     the no-nested-guard invariant.
-    //   • txKernel currently delivers process-targeted even for
-    //     `tkill`/`tgkill` (thread-specific delivery is a later
-    //     phase); routing through Process matches that behaviour.
-    // `deliver_posix_signal` honours the target's `sig_actions` for
-    // catchable signals, default-action mapping for unhandled ones,
-    // and gewalt routing for SIGKILL/SIGSTOP/SIGCONT.
-    drop(target);
-    Ok(deliver_posix_signal(
-        SignalTarget::Process(target_proc),
-        sig,
-    ))
+    // Phase 2 — commit. Process-targeted sends keep the
+    // disposition-aware process selection path; thread-targeted
+    // sends post to the requested TID. musl's pthread_cancel uses
+    // pthread_kill -> SYS_tkill, so collapsing thread sends back to
+    // process-directed routing can strand SIGCANCEL on a different
+    // unblocked sibling.
+    Ok(match target {
+        SignalTarget::Process(_) => step_kill_process(&target_proc, sig, info),
+        SignalTarget::Thread(thread) => {
+            if is_gewalt(sig) {
+                return Ok(step_kill_process(&target_proc, sig, info));
+            }
+            let disposition = match target_proc.upgrade_operational() {
+                Ok(payload) => payload.sig_actions().get(sig),
+                Err(_) => return Ok(KillOutcome::NoLiveThread),
+            };
+            match disposition {
+                SigDisposition::Ignore => return Ok(KillOutcome::Delivered),
+                SigDisposition::Default => match default_action(sig) {
+                    DefaultAction::Ignore => return Ok(KillOutcome::Delivered),
+                    DefaultAction::Term | DefaultAction::Core => {
+                        crate::process::execution::step_exit_group_with_signal(&target_proc, sig);
+                        return Ok(KillOutcome::Delivered);
+                    }
+                    DefaultAction::Stop => {
+                        route_gewalt(&target_proc, Signum::SIGSTOP);
+                        return Ok(KillOutcome::Delivered);
+                    }
+                    DefaultAction::Cont => {
+                        route_gewalt(&target_proc, Signum::SIGCONT);
+                        return Ok(KillOutcome::Delivered);
+                    }
+                },
+                SigDisposition::Handler(_) => {}
+            }
+            if let Some(info) = info {
+                target_proc.siginfo_store(sig, info);
+            }
+            post_signal(
+                &thread,
+                sig,
+                SignalRouting::ThreadDirected {
+                    tid: thread.tid.0 as u64,
+                },
+                info,
+            );
+            KillOutcome::Delivered
+        }
+        SignalTarget::ProcessGroup(_) => KillOutcome::NoLiveThread,
+    })
 }
 
 // ----- TTY job-control bridge -----
@@ -1399,14 +1531,14 @@ impl<I: SubjectIdentity> OneShotStepOp<I> for DeliverSignalOp {}
 pub struct SigactionOp {
     pub process: Cap<ProcessIdentity>,
     pub sig: Signum,
-    pub disposition: SigDisposition,
+    pub entry: SigActionEntry,
 }
 
 impl<I: SubjectIdentity> StepOp<I> for SigactionOp {
     type Output = SigDispositionChange;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(step_sigaction(&self.process, self.sig, self.disposition))
+        StepOutcome::Done(step_sigaction_entry(&self.process, self.sig, self.entry))
     }
 }
 
@@ -1481,13 +1613,17 @@ mod step_op_wraps {
         let mut op = SigactionOp {
             process: proc_cap.clone(),
             sig: Signum::SIGTERM,
-            disposition: SigDisposition::Ignore,
+            entry: SigActionEntry::from(SigDisposition::Ignore),
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             StepOutcome::Done(SigDispositionChange::Replaced {
-                prev: SigDisposition::Default,
+                prev:
+                    SigActionEntry {
+                        disposition: SigDisposition::Default,
+                        ..
+                    },
             }) => {}
             other => panic!("expected Done(Replaced{{Default}}), got {other:?}"),
         }
@@ -1500,13 +1636,13 @@ mod step_op_wraps {
         let mut op = SigactionOp {
             process: proc_cap.clone(),
             sig: Signum::SIGKILL,
-            disposition: SigDisposition::Ignore,
+            entry: SigActionEntry::from(SigDisposition::Ignore),
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         assert_eq!(
             outcome,
-            StepOutcome::Done(SigDispositionChange::Uncatchable(SigDisposition::Default))
+            StepOutcome::Done(SigDispositionChange::Uncatchable(SigActionEntry::DEFAULT))
         );
     }
 }
