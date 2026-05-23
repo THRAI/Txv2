@@ -23,6 +23,11 @@ pub fn step_tcp_close_staging(
     socket: &Cap<SocketIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<TcpCloseStagingOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let witness = match require_socket_shutdown_target(socket, SockShutdownCmd::Both, guard) {
         Ok(witness) => witness,
         Err(errno) => return StepOutcome::Err(errno),

@@ -20,6 +20,11 @@ pub fn step_process_loopback_icmp(
     budget: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackIcmpTransferOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     step_process_loopback_icmp_on_iface(source, budget, initial_loopback_iface(), guard)
 }
 
@@ -29,6 +34,11 @@ pub fn step_process_loopback_icmp_on_iface(
     iface: &LoopbackIface,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackIcmpTransferOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let Some(source_payload) = source.acquire_operational() else {
         return StepOutcome::Done(LoopbackIcmpTransferOutcome::default());
     };

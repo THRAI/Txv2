@@ -10,6 +10,11 @@ pub fn step_socket_create(
     valid: ValidSocketType,
     guard: &Guard<'_>,
 ) -> StepOutcome<Cap<SocketIdentity>> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     step_socket_create_in_namespace(valid, initial_net_namespace_payload(), guard)
 }
 
@@ -18,6 +23,11 @@ pub fn step_socket_create_in_namespace(
     net_namespace: PayloadCap<NetNamespacePayload>,
     _guard: &Guard<'_>,
 ) -> StepOutcome<Cap<SocketIdentity>> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let kind = match SocketKind::from_valid_socket_type(valid) {
         Ok(kind) => kind,
         Err(errno) => return StepOutcome::Err(errno),

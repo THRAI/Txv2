@@ -31,6 +31,11 @@ pub fn step_socket_open_file(
     protocol: i32,
     guard: &Guard<'_>,
 ) -> StepOutcome<SocketOpenFileOutput> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     step_socket_open_file_in_namespace(
         domain,
         type_,
@@ -47,6 +52,11 @@ pub fn step_socket_open_file_in_namespace(
     net_namespace: PayloadCap<NetNamespacePayload>,
     guard: &Guard<'_>,
 ) -> StepOutcome<SocketOpenFileOutput> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let valid = match ValidSocketType::validate(domain, type_, protocol) {
         Ok(valid) => valid,
         Err(errno) => return StepOutcome::Err(errno),

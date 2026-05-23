@@ -43,6 +43,11 @@ pub fn step_tcp_loopback_handshake(
     client: &Cap<SocketIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackTcpConnectOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     step_tcp_loopback_handshake_on_iface(client, initial_loopback_iface(), guard)
 }
 
@@ -51,6 +56,11 @@ pub fn step_tcp_loopback_handshake_on_iface(
     iface: &LoopbackIface,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackTcpConnectOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let Some(client_payload) = client.acquire_operational() else {
         return StepOutcome::Err(Errno::ENOTCONN);
     };
@@ -125,6 +135,11 @@ pub fn step_tcp_loopback_transfer(
     max_bytes: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackTcpTransferOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     step_process_loopback_tcp(source, max_bytes, initial_loopback_iface(), guard)
 }
 
@@ -134,6 +149,11 @@ pub fn step_process_loopback_tcp(
     iface: &LoopbackIface,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackTcpTransferOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if max_bytes == 0 {
         return StepOutcome::Done(LoopbackTcpTransferOutcome::default());
     }

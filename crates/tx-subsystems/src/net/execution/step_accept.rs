@@ -19,6 +19,11 @@ pub fn step_accept(
     socket: &Cap<SocketIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<SocketAcceptOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let witness = match require_socket_accept_target(socket, guard) {
         Ok(witness) => witness,
         Err(errno) => return StepOutcome::Err(errno),

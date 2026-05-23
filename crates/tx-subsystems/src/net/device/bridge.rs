@@ -429,7 +429,8 @@ impl NetDeviceOps for BridgeDevice {
                 continue;
             }
 
-            match egress.ops.transmit(frame, guard) {
+            let outcome = egress.ops.transmit(frame, guard);
+            match outcome {
                 StepOutcome::Done(()) | StepOutcome::Continue { .. } => {
                     forwarded += 1;
                     self.forwarded_packets.fetch_add(1, Ordering::Relaxed);
@@ -437,13 +438,11 @@ impl NetDeviceOps for BridgeDevice {
                         self.flooded_packets.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                StepOutcome::Yield { progress, shape } => {
-                    return StepOutcome::Yield { progress, shape };
-                }
                 StepOutcome::Err(errno) => {
                     last_errno = Some(errno);
                     self.tx_errors.fetch_add(1, Ordering::Relaxed);
                 }
+                pending => return pending,
             }
         }
 

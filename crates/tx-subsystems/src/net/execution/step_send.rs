@@ -17,6 +17,11 @@ pub fn step_send(
     flags: SendRecvFlags,
     guard: &Guard<'_>,
 ) -> ByteStepOutcome<usize> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let witness = match require_socket_write_target(socket, flags, guard) {
         Ok(witness) => witness,
         Err(errno) => return StepOutcome::Err(errno),
@@ -64,6 +69,11 @@ pub fn step_send_kernel_bytes(
     flags: SendRecvFlags,
     guard: &Guard<'_>,
 ) -> ByteStepOutcome<usize> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let witness = match require_socket_write_target(socket, flags, guard) {
         Ok(witness) => witness,
         Err(errno) => return StepOutcome::Err(errno),
@@ -120,6 +130,11 @@ pub fn step_send_to_kernel_bytes(
     flags: SendRecvFlags,
     guard: &Guard<'_>,
 ) -> ByteStepOutcome<usize> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     step_send_to_kernel_bytes_with_poll_kick(socket, dst, bytes, flags, guard, true)
 }
 
@@ -130,6 +145,11 @@ pub fn step_send_to_unix_path_kernel_bytes(
     flags: SendRecvFlags,
     guard: &Guard<'_>,
 ) -> ByteStepOutcome<usize> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let witness = match require_socket_write_target(socket, flags, guard) {
         Ok(witness) => witness,
         Err(errno) => return StepOutcome::Err(errno),
@@ -162,6 +182,11 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
     guard: &Guard<'_>,
     kick_poll: bool,
 ) -> ByteStepOutcome<usize> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let witness = match require_socket_write_target(socket, flags, guard) {
         Ok(witness) => witness,
         Err(errno) => return StepOutcome::Err(errno),

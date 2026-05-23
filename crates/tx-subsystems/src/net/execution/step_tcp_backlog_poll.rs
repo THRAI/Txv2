@@ -17,6 +17,11 @@ pub fn step_tcp_backlog_poll_loopback(
     iface: &LoopbackIface,
     _guard: &Guard<'_>,
 ) -> StepOutcome<TcpBacklogRetransmitOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     match poll_tcp_backlog_for_listener_loopback(listener, now, iface) {
         Ok(outcome) => StepOutcome::Done(outcome),
         Err(errno) => StepOutcome::Err(errno),

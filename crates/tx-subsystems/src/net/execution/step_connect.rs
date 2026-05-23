@@ -17,6 +17,11 @@ pub fn step_connect(
     remote: KernelSockAddr,
     guard: &Guard<'_>,
 ) -> StepOutcome<()> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let witness = match require_socket_connect_target(socket, remote, guard) {
         Ok(witness) => witness,
         Err(errno) => return StepOutcome::Err(errno),

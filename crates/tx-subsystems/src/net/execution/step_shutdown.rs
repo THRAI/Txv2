@@ -21,6 +21,11 @@ pub fn step_shutdown(
     how: SockShutdownCmd,
     guard: &Guard<'_>,
 ) -> StepOutcome<ShutdownOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let witness = match require_socket_shutdown_target(socket, how, guard) {
         Ok(witness) => witness,
         Err(errno) => return StepOutcome::Err(errno),

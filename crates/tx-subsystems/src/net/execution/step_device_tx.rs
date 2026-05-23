@@ -81,6 +81,11 @@ pub fn step_process_device_tx_pending(
     budget: DeviceTxBudget,
     guard: &Guard<'_>,
 ) -> StepOutcome<DeviceTxOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     step_process_device_tx_pending_in_namespace_at(
         sink,
         initial_net_namespace_payload(),
@@ -96,6 +101,11 @@ pub fn step_process_device_tx_pending_at(
     budget: DeviceTxBudget,
     guard: &Guard<'_>,
 ) -> StepOutcome<DeviceTxOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     step_process_device_tx_pending_in_namespace_at(
         sink,
         initial_net_namespace_payload(),
@@ -112,6 +122,11 @@ pub fn step_process_device_tx_pending_in_namespace_at(
     budget: DeviceTxBudget,
     guard: &Guard<'_>,
 ) -> StepOutcome<DeviceTxOutcome> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let mut outcome = DeviceTxOutcome::default();
     let table = net_namespace.socket_table();
 

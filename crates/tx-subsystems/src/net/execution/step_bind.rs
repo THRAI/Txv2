@@ -14,6 +14,11 @@ pub fn step_bind(
     addr: KernelSockAddr,
     guard: &Guard<'_>,
 ) -> StepOutcome<()> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let witness = match require_socket_bind_target(socket, addr, guard) {
         Ok(witness) => witness,
         Err(errno) => return StepOutcome::Err(errno),

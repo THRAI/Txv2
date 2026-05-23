@@ -11,6 +11,11 @@ pub fn step_listen(
     backlog: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<()> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let backlog_limit = backlog.clamp(1, SOMAXCONN_STAGING);
     let witness = match require_socket_listen_target(socket, backlog_limit, guard) {
         Ok(witness) => witness,
