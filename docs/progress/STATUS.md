@@ -1,3 +1,34 @@
+- 2026-05-23 **Resolved the apparent dynamic `pthread_cancel_sem_wait`
+  failure as a libctest table-selection bug, not a pthread/futex bug.** Fresh
+  trap-trace reproduction of `dynamic:pthread_cancel_sem_wait` showed the child
+  exiting `-1` before any inner pthread clone/futex/cancel flow. Comparing the
+  libctest sources found `pthread_cancel_sem_wait` only in `static.txt`; it is
+  not in `dynamic.txt` or the dynamic judge baseline, so `entry-dynamic.exe`
+  returned `-1` because its dispatch table had no matching symbol. The
+  generated focused libctest command now honors static-only and dynamic-only
+  entry tables, skipping unsupported variants without emitting fake
+  START/FAIL markers, while still running sidecar-DSO dynamic cases from
+  `lib/`.
+  **Verified:** `cargo fmt --check`; `cargo test -p tx-kernel libctest_case
+  -- --nocapture`; `cargo build -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`; `OSCOMP_LIBCTEST='pthread_cancel_sem_wait'
+  OSCOMP_DATA=target/oscomp/testdata OSCOMP_SUBMIT=target/oscomp/submit
+  OSCOMP_OUT_RV=target/oscomp/os_serial_out_rv_pthread_cancel_sem_wait_tablefix_20260523.txt
+  make oscomp-submit-rv64 oscomp-qemu-rv64 oscomp-judge-rv64`;
+  `OSCOMP_LIBCTEST='dynamic:dlopen,dynamic:tls_get_new_dtv'
+  OSCOMP_DATA=target/oscomp/testdata OSCOMP_SUBMIT=target/oscomp/submit
+  OSCOMP_OUT_RV=target/oscomp/os_serial_out_rv_segcheck_tablefix_20260523.txt
+  make oscomp-submit-rv64 oscomp-qemu-rv64 oscomp-judge-rv64`; fault-decode on
+  both saved serials reported no scause/sepc/stval trap lines.
+  **Guest result:** static `pthread_cancel_sem_wait` prints `Pass!`; the
+  unsupported dynamic variant prints `SKIP entry-dynamic.exe
+  pthread_cancel_sem_wait [not in libctest table]` with no failing marker;
+  dynamic `dlopen` and `tls_get_new_dtv` still print `Pass!` with no
+  `Segmentation fault` / `user-segv` markers. **Next step:** continue from the
+  next real pthread/libctest failure in the judge baseline rather than chasing
+  the nonexistent dynamic sem-wait variant. **Blocker:** none for this focused
+  pthread/loader slice.
+
 - 2026-05-23 **Fixed the current dynamic libctest sidecar-DSO segfault
   symptom.** The fresh focused run showed `entry-dynamic.exe dlopen` and
   `entry-dynamic.exe tls_get_new_dtv` crashing in userspace after their
