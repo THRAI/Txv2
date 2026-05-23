@@ -70,7 +70,11 @@ pub fn step_mq_open(
     let exclusive = (oflag & MQ_O_EXCL) != 0;
     let instance_flags = (oflag & MQ_O_NONBLOCK) as i64;
 
-    if let Some(identity) = structure::lookup_mq_by_name(&mq_name) {
+    let existing_identity = {
+        let table = nsproxy.ipc_ns.posix_mq.lock();
+        table.get(&mq_name).cloned()
+    };
+    if let Some(identity) = existing_identity {
         if exclusive && create {
             return Err(Errno::EEXIST);
         }
@@ -97,7 +101,7 @@ pub fn step_mq_open(
             .checked_mul(attr.msgsize as usize)
             .ok_or(Errno::EINVAL)?;
 
-        let msqid = crate::ipc::sysv_msg::structure::register_msg(
+        let msg_queue = crate::ipc::sysv_msg::structure::register_msg(
             None,
             cred.clone(),
             IpcPerm::new(mode),
@@ -107,15 +111,20 @@ pub fn step_mq_open(
             attr.msgsize as usize,
         )
         .map_err(|_| Errno::ENOMEM)?;
-        let identity = structure::register_mq(
+        let (_mqid, identity) = structure::register_mq(
             mq_name,
             cred.clone(),
             IpcPerm::new(mode),
-            msqid,
+            msg_queue.msqid,
             attr.maxmsg,
             attr.msgsize,
         )
         .map_err(|_| Errno::ENOMEM)?;
+        nsproxy
+            .ipc_ns
+            .posix_mq
+            .lock()
+            .insert(identity.name.clone(), identity.clone());
         structure::open_instance(identity, instance_flags).map_err(|_| Errno::ENOMEM)
     } else {
         Err(Errno::ENOENT)
@@ -321,9 +330,12 @@ pub fn step_mq_notify(
 // ---------------------------------------------------------------------------
 
 /// `mq_unlink(name)` — remove a POSIX mq by name.
-pub fn step_mq_unlink(name: &[u8]) -> Result<(), Errno> {
+pub fn step_mq_unlink(
+    name: &[u8],
+    nsproxy: &Cap<crate::process::nsproxy::NsProxy>,
+) -> Result<(), Errno> {
     let mq_name = PosixMqName::new(name);
-    if structure::unlink_mq(&mq_name) {
+    if nsproxy.ipc_ns.posix_mq.lock().remove(&mq_name).is_some() {
         Ok(())
     } else {
         Err(Errno::ENOENT)

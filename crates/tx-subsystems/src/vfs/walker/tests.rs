@@ -23,7 +23,7 @@ use crate::vfs::structure::{
 };
 use crate::vfs::FsOps;
 
-use super::{step_open, step_walk, SYMLOOP_MAX};
+use super::{step_open, step_walk, step_walk_in_mount_namespace, SYMLOOP_MAX};
 
 // === capturing char-device binding for the console TTY ================
 
@@ -258,6 +258,7 @@ mod v3_walker;
 
 struct Topology {
     root_dentry: Cap<DEntry>,
+    root_mount: Cap<MountIdentity>,
     rootfs: Arc<TestFs>,
 }
 
@@ -290,7 +291,7 @@ fn build_rootfs() -> Topology {
         sign_for(res, raw)
     };
 
-    let _mount = MountIdentity::new_cap(
+    let root_mount = MountIdentity::new_cap(
         MountId::new(1),
         None,
         root_rnode.clone(),
@@ -304,6 +305,7 @@ fn build_rootfs() -> Topology {
 
     Topology {
         root_dentry,
+        root_mount,
         rootfs,
     }
 }
@@ -652,6 +654,62 @@ fn step_walk_crosses_mount_point_at_dev() {
             );
         }
         other => panic!("expected Done(consoledir), got {other:?}"),
+    }
+}
+
+#[test]
+fn step_walk_uses_mount_namespace_table_before_global_fallback() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    crate::mount::reset_mount_table_for_test();
+    let topo = build_rootfs();
+    let (dev_mount, _tty) = mount_devfs_at_dev(&topo);
+
+    let root_dev_id =
+        match <TestFs as FsOps>::lookup(&*topo.rootfs, FsObjectId::new(2), b"dev", &guard()) {
+            V3::Done(id) => id,
+            other => panic!("rootfs lookup(dev) failed: {other:?}"),
+        };
+    let rootfs_payload = topo
+        .root_dentry
+        .rnode()
+        .containing_mount_weak()
+        .expect("root rnode has containing_mount")
+        .upgrade(&guard())
+        .expect("rootfs payload upgrade");
+    let ns_with_mount =
+        crate::mount::MountNamespace::new_cap(topo.root_mount.clone()).expect("ns cap");
+    let ns_without_mount =
+        crate::mount::MountNamespace::new_cap(topo.root_mount.clone()).expect("ns cap");
+    ns_with_mount.register_mount(&rootfs_payload, root_dev_id, dev_mount);
+
+    let cred = Credential::root();
+    let guard = guard();
+    let visible = step_walk_in_mount_namespace(
+        topo.root_dentry.clone(),
+        b"/dev/consoledir",
+        &cred,
+        &ns_with_mount,
+        &guard,
+    );
+    let hidden = step_walk_in_mount_namespace(
+        topo.root_dentry.clone(),
+        b"/dev/consoledir",
+        &cred,
+        &ns_without_mount,
+        &guard,
+    );
+    drop(guard);
+
+    match visible {
+        V3::Done(d) => assert_eq!(d.name().as_bytes(), b"consoledir"),
+        other => panic!("expected namespace-local mount to resolve, got {other:?}"),
+    }
+    match hidden {
+        V3::Err(V3Errno::ENOENT) => {}
+        other => panic!("expected namespace without mount to hide /dev contents, got {other:?}"),
     }
 }
 

@@ -3,9 +3,12 @@
 //! `PosixMqIdentity`: name → SysV MsgQueue mapping.
 //! `PosixMqInstance`: fd-shaped open-instance with notify state.
 //!
-//! Day-1 single-namespace: a global `MQ_NAME_TABLE` maps name → msqid.
+//! Day-1 compatibility: namespaces store name → mqid, while a global
+//! `MQ_ID_TABLE` maps mqid → identity cap for fd holders and subsystem
+//! operations that already carry the queue id.
 
 use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::ipc::sysv_shm::structure::IpcPerm;
 use crate::process::adapter::step_engine::{
@@ -67,11 +70,13 @@ impl PosixMqInstance {
 }
 
 // ---------------------------------------------------------------------------
-// Global name registry
+// Global mqid registry
 // ---------------------------------------------------------------------------
 
-static MQ_NAME_TABLE: SpinMutex<BTreeMap<PosixMqName, Cap<PosixMqIdentity>>> =
+static MQ_ID_TABLE: SpinMutex<BTreeMap<u32, Cap<PosixMqIdentity>>> =
     SpinMutex::new(BTreeMap::new());
+
+static NEXT_MQID: AtomicU32 = AtomicU32::new(1);
 
 // ---------------------------------------------------------------------------
 // Zone registration
@@ -103,10 +108,6 @@ pub(crate) fn register_zones() -> Result<(), ZoneError> {
 // Public registry accessors
 // ---------------------------------------------------------------------------
 
-pub(crate) fn lookup_mq_by_name(name: &PosixMqName) -> Option<Cap<PosixMqIdentity>> {
-    MQ_NAME_TABLE.lock().get(name).cloned()
-}
-
 pub(crate) fn register_mq(
     name: PosixMqName,
     cred: Cap<crate::cred::Cred>,
@@ -114,9 +115,10 @@ pub(crate) fn register_mq(
     msqid: u32,
     maxmsg: i64,
     msgsize: i64,
-) -> Result<Cap<PosixMqIdentity>, ZoneError> {
+) -> Result<(u32, Cap<PosixMqIdentity>), ZoneError> {
+    let mqid = NEXT_MQID.fetch_add(1, Ordering::Relaxed);
     let identity = sign(PosixMqIdentity {
-        name: name.clone(),
+        name,
         cred,
         perm,
         msqid,
@@ -124,12 +126,8 @@ pub(crate) fn register_mq(
         msgsize,
         notify: SpinMutex::new(None),
     })?;
-    MQ_NAME_TABLE.lock().insert(name, identity.clone());
-    Ok(identity)
-}
-
-pub(crate) fn unlink_mq(name: &PosixMqName) -> bool {
-    MQ_NAME_TABLE.lock().remove(name).is_some()
+    MQ_ID_TABLE.lock().insert(mqid, identity.clone());
+    Ok((mqid, identity))
 }
 
 pub(crate) fn open_instance(

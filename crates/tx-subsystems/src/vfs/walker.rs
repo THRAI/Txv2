@@ -83,7 +83,7 @@ use alloc::sync::Arc;
 use crate::vfs::adapter::step_engine::{self, Cap, NoProgress, StepOutcome, Weak};
 
 use crate::execution::{Errno, Guard};
-use crate::mount::{MountIdentity, MountPayload};
+use crate::mount::{MountIdentity, MountNamespace, MountPayload};
 use crate::vfs::structure::{Credential, DEntry, InlineName, OpenFile, OpenFileFlags, RNode};
 use crate::vfs::FsOps;
 
@@ -153,6 +153,32 @@ pub fn step_walk<'g>(
         crate::vfs::resolution::state::WalkMode::Entity,
         crate::vfs::resolution::state::FinalSymlinkPolicy::Follow,
         cred,
+        guard,
+    ) {
+        Ok(resolved) => StepOutcome::done(resolved.dentry),
+        Err(e) => StepOutcome::err(e.into()),
+    }
+}
+
+/// Namespace-aware variant of [`step_walk`].
+///
+/// The supplied `MountNamespace` controls mountpoint crossing. The legacy
+/// [`step_walk`] entrypoint keeps the global mount-table fallback for boot
+/// scaffolds and older host tests that do not yet carry a process namespace.
+pub fn step_walk_in_mount_namespace<'g>(
+    rooted_at: Cap<DEntry>,
+    path: &[u8],
+    cred: &Credential,
+    mount_namespace: &Cap<MountNamespace>,
+    guard: &Guard<'g>,
+) -> StepOutcome<Cap<DEntry>, NoProgress> {
+    match crate::vfs::resolution::driver::walk_to_completion_with_mount_namespace(
+        rooted_at,
+        path,
+        crate::vfs::resolution::state::WalkMode::Entity,
+        crate::vfs::resolution::state::FinalSymlinkPolicy::Follow,
+        cred,
+        Some(mount_namespace),
         guard,
     ) {
         Ok(resolved) => StepOutcome::done(resolved.dentry),
