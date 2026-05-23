@@ -259,6 +259,19 @@ pub trait FsOps: Send + Sync + 'static {
         let _ = (fs_object_id, offset, buf, guard);
         StepOutcome::err(Errno::ENOSYS)
     }
+
+    /// Write content to a projected inode (procfs, sysfs, etc.).
+    /// Default: `ENOSYS`.
+    fn step_write_projected(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        bytes: &[u8],
+        guard: &Guard<'_>,
+    ) -> StepOutcome<u64, NoProgress> {
+        let _ = (fs_object_id, offset, bytes, guard);
+        StepOutcome::err(Errno::ENOSYS)
+    }
 }
 
 /// Filesystem driver output produced at mount time and consumed by Mount
@@ -525,8 +538,30 @@ impl OpenFile {
                 }
                 crate::page_backed::step_write_from_kernel(pc, self, bytes, guard)
             }
-            RNodeBacking::Symlink { .. } | RNodeBacking::Projected => {
-                StepOutcome::Err(Errno::ENOSYS)
+            RNodeBacking::Symlink { .. } => StepOutcome::Err(Errno::ENOSYS),
+            RNodeBacking::Projected => {
+                let rnode = self.rnode();
+                let off = self.offset();
+                match rnode
+                    .containing_mount_weak()
+                    .and_then(|mw| mw.upgrade(guard))
+                {
+                    Some(mp) => match mp.fs_ops().step_write_projected(
+                        rnode.fs_object_id(),
+                        off,
+                        bytes,
+                        guard,
+                    ) {
+                        StepOutcome::Done(n) => {
+                            self.set_offset(off + n);
+                            StepOutcome::Done(n as usize)
+                        }
+                        StepOutcome::Err(e) => StepOutcome::Err(e),
+                        StepOutcome::Continue { .. } => StepOutcome::Err(Errno::EAGAIN),
+                        StepOutcome::Yield { .. } => StepOutcome::Err(Errno::EIO),
+                    },
+                    None => StepOutcome::Err(Errno::ENOENT),
+                }
             }
         }
     }

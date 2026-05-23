@@ -357,6 +357,7 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     }
 
     const IOVEC_BYTES: u64 = 16;
+    const MAX_RW_COUNT: u64 = 0x7fff_f000;
     let fd = args[0] as i32;
     let stdio_tty_fast_path = (fd == 1 || fd == 2)
         && resolve_fd(&ctx.process, fd as u32)
@@ -382,9 +383,19 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             if len == 0 {
                 continue;
             }
+            if len > MAX_RW_COUNT {
+                return SyscallResult::Error(EINVAL_VALUE);
+            }
 
             let old_len = combined.len();
-            combined.resize(old_len + len as usize, 0);
+            let len = len as usize;
+            let Some(new_len) = old_len.checked_add(len) else {
+                return SyscallResult::Error(EINVAL_VALUE);
+            };
+            if new_len as u64 > MAX_RW_COUNT {
+                return SyscallResult::Error(EINVAL_VALUE);
+            }
+            combined.resize(new_len, 0);
             if let Err(errno) =
                 bootstrap_copy_from_user(&ctx.aspace, &mut combined[old_len..], base)
             {
@@ -417,6 +428,12 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         let len = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap());
         if len == 0 {
             continue;
+        }
+        if len > MAX_RW_COUNT {
+            if total > 0 {
+                return SyscallResult::Return(total);
+            }
+            return SyscallResult::Error(EINVAL_VALUE);
         }
 
         let write_args = [args[0], base, len, 0, 0, 0];
@@ -1261,6 +1278,10 @@ pub(super) async fn sys_sendfile64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
+
+    if let Some(result) = super::net::sys_socket_sendfile(out_fd as u32, count, ctx) {
+        return result;
+    }
 
     // Input must be a regular file backed by PageContainer.
     let in_rnode = in_file.rnode();

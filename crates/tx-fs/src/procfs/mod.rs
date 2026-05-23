@@ -30,6 +30,9 @@ pub const PROCFS_SYS_ID: FsObjectId = FsObjectId::new(0x7072_6F06);
 pub const PROCFS_SYS_KERNEL_ID: FsObjectId = FsObjectId::new(0x7072_6F07);
 pub const PROCFS_SYS_KERNEL_TAINTED_ID: FsObjectId = FsObjectId::new(0x7072_6F08);
 pub const PROCFS_CONFIG_ID: FsObjectId = FsObjectId::new(0x7072_6F09);
+pub const PROCFS_SYS_FS_ID: FsObjectId = FsObjectId::new(0x7072_6F0a);
+pub const PROCFS_SYS_FS_PIPE_MAX_SIZE_ID: FsObjectId = FsObjectId::new(0x7072_6F0b);
+pub const PROCFS_SYS_FS_LEASE_BREAK_TIME_ID: FsObjectId = FsObjectId::new(0x7072_6F0c);
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 const PROCFS_PID_OBJECT_STRIDE: u64 = 0x100;
 const PROCFS_PID_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x10000;
@@ -241,6 +244,18 @@ impl FsOps for Procfs {
             if name == b"kernel" {
                 return StepOutcome::done(PROCFS_SYS_KERNEL_ID);
             }
+            if name == b"fs" {
+                return StepOutcome::done(PROCFS_SYS_FS_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if parent == PROCFS_SYS_FS_ID {
+            if name == b"pipe-max-size" {
+                return StepOutcome::done(PROCFS_SYS_FS_PIPE_MAX_SIZE_ID);
+            }
+            if name == b"lease-break-time" {
+                return StepOutcome::done(PROCFS_SYS_FS_LEASE_BREAK_TIME_ID);
+            }
             return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYS_KERNEL_ID {
@@ -306,7 +321,7 @@ impl FsOps for Procfs {
             PROCFS_ROOT_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
-            PROCFS_SYS_ID | PROCFS_SYS_KERNEL_ID => {
+            PROCFS_SYS_ID | PROCFS_SYS_KERNEL_ID | PROCFS_SYS_FS_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
             PROCFS_SELF_ID => {
@@ -319,6 +334,9 @@ impl FsOps for Procfs {
             | PROCFS_CONFIG_ID
             | PROCFS_SYS_KERNEL_TAINTED_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            }
+            PROCFS_SYS_FS_PIPE_MAX_SIZE_ID | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, S_IFREG | 0o644))
             }
             id if pid_from_dir(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
@@ -437,10 +455,43 @@ impl FsOps for Procfs {
             if state_byte < 2 {
                 return finish_dots(state_byte, idx, id);
             }
-            if idx == 2 {
+            let files: &[(&[u8], FsObjectId, InodeKind)] = &[
+                (b"kernel", PROCFS_SYS_KERNEL_ID, InodeKind::Directory),
+                (b"fs", PROCFS_SYS_FS_ID, InodeKind::Directory),
+            ];
+            let fi = idx.saturating_sub(2);
+            if fi < files.len() {
+                let (name, oid, kind) = files[fi];
                 return StepOutcome::done(Some((
-                    dir_entry(PROCFS_SYS_KERNEL_ID, InodeKind::Directory, b"kernel"),
-                    DirCursor([2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    dir_entry(oid, kind, name),
+                    DirCursor([2, (fi + 3) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                )));
+            }
+            return StepOutcome::done(None);
+        }
+
+        if id == PROCFS_SYS_FS_ID {
+            if state_byte < 2 {
+                return finish_dots(state_byte, idx, id);
+            }
+            let files: &[(&[u8], FsObjectId, InodeKind)] = &[
+                (
+                    b"pipe-max-size",
+                    PROCFS_SYS_FS_PIPE_MAX_SIZE_ID,
+                    InodeKind::Regular,
+                ),
+                (
+                    b"lease-break-time",
+                    PROCFS_SYS_FS_LEASE_BREAK_TIME_ID,
+                    InodeKind::Regular,
+                ),
+            ];
+            let fi = idx.saturating_sub(2);
+            if fi < files.len() {
+                let (name, oid, kind) = files[fi];
+                return StepOutcome::done(Some((
+                    dir_entry(oid, kind, name),
+                    DirCursor([2, (fi + 3) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
                 )));
             }
             return StepOutcome::done(None);
@@ -674,6 +725,20 @@ impl FsOps for Procfs {
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         StepOutcome::err(Errno::EROFS.into())
+    }
+    fn step_write_projected(
+        &self,
+        fs_object_id: FsObjectId,
+        _offset: u64,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<u64, NoProgress> {
+        match fs_object_id {
+            PROCFS_SYS_FS_PIPE_MAX_SIZE_ID | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID => {
+                StepOutcome::done(bytes.len() as u64)
+            }
+            _ => StepOutcome::err(Errno::EROFS.into()),
+        }
     }
     fn step_chown(
         &self,

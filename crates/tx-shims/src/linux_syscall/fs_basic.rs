@@ -6,10 +6,14 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMutex, StepOutcome};
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload};
 use tx_subsystems::vfs::FsObjectId;
 
 static STAT_META_OVERRIDES: SpinMutex<BTreeMap<FsObjectId, InodeMeta>> =
+    SpinMutex::new(BTreeMap::new());
+
+static FCNTL_RECORD_LOCKS: SpinMutex<BTreeMap<FsObjectId, Vec<RecordLock>>> =
     SpinMutex::new(BTreeMap::new());
 
 pub(super) fn record_stat_meta_override(fs_object_id: FsObjectId, meta: InodeMeta) {
@@ -163,14 +167,194 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
             }
         }
-        numbers::F_SETPIPE_SZ | numbers::F_GETPIPE_SZ => {
+        numbers::F_GETLK | numbers::F_OFD_GETLK => fcntl_getlk(ctx, &file, arg),
+        numbers::F_SETLK | numbers::F_SETLKW | numbers::F_OFD_SETLK | numbers::F_OFD_SETLKW => {
+            fcntl_setlk(ctx, &file, arg)
+        }
+        numbers::F_SETLEASE => SyscallResult::Error(EAGAIN_VALUE),
+        numbers::F_GETLEASE => SyscallResult::Return(F_UNLCK as i64),
+        numbers::F_GETPIPE_SZ => {
             if !is_pipe_file(&file) {
                 return SyscallResult::Error(EINVAL_VALUE);
             }
             SyscallResult::Return(tx_subsystems::pipe::PIPE_BUF as i64)
         }
-        _ => SyscallResult::Error(ENOSYS_VALUE),
+        numbers::F_SETPIPE_SZ => {
+            if !is_pipe_file(&file) {
+                return SyscallResult::Error(EINVAL_VALUE);
+            }
+            if arg > (1u64 << 31) {
+                return SyscallResult::Error(EINVAL_VALUE);
+            }
+            let pipe_size = tx_subsystems::pipe::PIPE_BUF as u64;
+            if arg < pipe_size {
+                return SyscallResult::error_from(Errno::EBUSY);
+            }
+            if arg > pipe_size {
+                return SyscallResult::error_from(Errno::EPERM);
+            }
+            SyscallResult::Return(pipe_size as i64)
+        }
+        _ => SyscallResult::Error(EINVAL_VALUE),
     }
+}
+
+const F_RDLCK: i16 = 0;
+const F_WRLCK: i16 = 1;
+const F_UNLCK: i16 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlockLayout {
+    l_type: i16,
+    l_whence: i16,
+    _pad0: i32,
+    l_start: i64,
+    l_len: i64,
+    l_pid: i32,
+    _pad1: i32,
+}
+
+#[derive(Clone, Copy)]
+struct RecordLock {
+    owner: u32,
+    lock_type: i16,
+    start: i64,
+    len: i64,
+}
+
+impl RecordLock {
+    fn conflicts_with(&self, other: &RecordLock) -> bool {
+        self.owner != other.owner
+            && (self.lock_type == F_WRLCK || other.lock_type == F_WRLCK)
+            && lock_ranges_overlap(self.start, self.len, other.start, other.len)
+    }
+}
+
+fn lock_range_end(start: i64, len: i64) -> (i64, Option<i64>) {
+    if len == 0 {
+        (start, None)
+    } else if len > 0 {
+        (start, Some(start.saturating_add(len)))
+    } else {
+        (start.saturating_add(len), Some(start))
+    }
+}
+
+fn lock_ranges_overlap(a_start: i64, a_len: i64, b_start: i64, b_len: i64) -> bool {
+    let (a0, a1) = lock_range_end(a_start, a_len);
+    let (b0, b1) = lock_range_end(b_start, b_len);
+    let a_before_b = a1.is_some_and(|end| end <= b0);
+    let b_before_a = b1.is_some_and(|end| end <= a0);
+    !a_before_b && !b_before_a
+}
+
+fn fcntl_valid_whence(whence: i16) -> bool {
+    matches!(whence, 0..=2)
+}
+
+fn fcntl_valid_lock_type(lock_type: i16) -> bool {
+    matches!(lock_type, F_RDLCK | F_WRLCK | F_UNLCK)
+}
+
+fn fcntl_file_id(file: &OpenFile) -> Option<FsObjectId> {
+    match file.backing() {
+        OpenFileBacking::Rnode { rnode } => Some(rnode.fs_object_id()),
+        _ => None,
+    }
+}
+
+fn fcntl_release_process_locks_for_file(owner: u32, file: &OpenFile) {
+    let Some(file_id) = fcntl_file_id(file) else {
+        return;
+    };
+    let mut locks = FCNTL_RECORD_LOCKS.lock();
+    if let Some(list) = locks.get_mut(&file_id) {
+        list.retain(|lock| lock.owner != owner);
+        if list.is_empty() {
+            locks.remove(&file_id);
+        }
+    }
+}
+
+fn fcntl_getlk(ctx: &SyscallCtx<'_>, file: &OpenFile, flock_uaddr: u64) -> SyscallResult {
+    let mut flock = match bootstrap_read_user::<FlockLayout>(&ctx.aspace, flock_uaddr) {
+        Ok(flock) => flock,
+        Err(errno) => return SyscallResult::error_from(errno),
+    };
+    if !fcntl_valid_whence(flock.l_whence) || !fcntl_valid_lock_type(flock.l_type) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let query = RecordLock {
+        owner: ctx.process.pid.0,
+        lock_type: flock.l_type,
+        start: flock.l_start,
+        len: flock.l_len,
+    };
+    if let Some(file_id) = fcntl_file_id(file) {
+        if let Some(conflict) = FCNTL_RECORD_LOCKS.lock().get(&file_id).and_then(|locks| {
+            locks
+                .iter()
+                .copied()
+                .find(|lock| lock.conflicts_with(&query))
+        }) {
+            flock.l_type = conflict.lock_type;
+            flock.l_whence = 0;
+            flock.l_start = conflict.start;
+            flock.l_len = conflict.len;
+            flock.l_pid = conflict.owner as i32;
+            return match bootstrap_write_user::<FlockLayout>(&ctx.aspace, flock_uaddr, flock) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::error_from(errno),
+            };
+        }
+    }
+    flock.l_type = F_UNLCK;
+    match bootstrap_write_user::<FlockLayout>(&ctx.aspace, flock_uaddr, flock) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::error_from(errno),
+    }
+}
+
+fn fcntl_setlk(ctx: &SyscallCtx<'_>, file: &OpenFile, flock_uaddr: u64) -> SyscallResult {
+    let flock = match bootstrap_read_user::<FlockLayout>(&ctx.aspace, flock_uaddr) {
+        Ok(flock) => flock,
+        Err(errno) => return SyscallResult::error_from(errno),
+    };
+    if !fcntl_valid_whence(flock.l_whence) || !fcntl_valid_lock_type(flock.l_type) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let Some(file_id) = fcntl_file_id(file) else {
+        return SyscallResult::Return(0);
+    };
+    let owner = ctx.process.pid.0;
+    let request = RecordLock {
+        owner,
+        lock_type: flock.l_type,
+        start: flock.l_start,
+        len: flock.l_len,
+    };
+    let mut locks = FCNTL_RECORD_LOCKS.lock();
+    let list = locks.entry(file_id).or_default();
+    if flock.l_type == F_UNLCK {
+        list.retain(|lock| {
+            lock.owner != owner
+                || !lock_ranges_overlap(lock.start, lock.len, request.start, request.len)
+        });
+        if list.is_empty() {
+            locks.remove(&file_id);
+        }
+        return SyscallResult::Return(0);
+    }
+    if list.iter().any(|lock| lock.conflicts_with(&request)) {
+        return SyscallResult::Error(EAGAIN_VALUE);
+    }
+    list.retain(|lock| {
+        lock.owner != owner
+            || !lock_ranges_overlap(lock.start, lock.len, request.start, request.len)
+    });
+    list.push(request);
+    SyscallResult::Return(0)
 }
 
 fn is_pipe_file(file: &OpenFile) -> bool {
@@ -460,13 +644,19 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
 /// PR-3 migration: `CloseOp` is a `OneShotStepOp` — dispatched via
 /// `drive_oneshot` (no reactor, no yield).
 pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let closing_file = ctx.process.fd(fd);
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = CloseOp {
         process: ctx.process.clone(),
         fd,
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-        Ok(()) => SyscallResult::Return(0),
+        Ok(()) => {
+            if let Some(file) = closing_file.as_deref() {
+                fcntl_release_process_locks_for_file(ctx.process.pid.0, file);
+            }
+            SyscallResult::Return(0)
+        }
         Err(v3errno) => {
             if Errno::from(v3errno) == Errno::EBADF && super::net::close_socket_fd(fd, ctx) {
                 SyscallResult::Return(0)

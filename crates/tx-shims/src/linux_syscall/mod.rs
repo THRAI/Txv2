@@ -342,7 +342,7 @@ pub(super) const EROFS_VALUE: i32 = 30;
 /// tmpfs/devfs); matches `errno_to_i32`'s `Errno::EIO` row.
 pub(super) const EIO_VALUE: i32 = 5;
 /// Fallback soft `RLIMIT_NOFILE` value used by legacy fd helpers.
-pub(super) const RLIMIT_NOFILE_CUR: u32 = 65536;
+pub(super) const RLIMIT_NOFILE_CUR: u32 = 1024;
 
 pub(super) fn next_fd_below_nofile(
     process: &Cap<ProcessIdentity>,

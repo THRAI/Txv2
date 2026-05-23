@@ -2,8 +2,8 @@
 
 use crate::procfs::{
     pid_from_cmdline_id, pid_from_maps_id, pid_from_stat_id, task_from_stat_id, PROCFS_CONFIG_ID,
-    PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID, PROCFS_SYS_KERNEL_TAINTED_ID,
-    PROCFS_UPTIME_ID,
+    PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID, PROCFS_SYS_FS_LEASE_BREAK_TIME_ID,
+    PROCFS_SYS_FS_PIPE_MAX_SIZE_ID, PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_UPTIME_ID,
 };
 use alloc::string::String;
 use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
@@ -30,6 +30,8 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_MEMINFO_ID => render_meminfo(),
         PROCFS_CONFIG_ID => render_config(),
         PROCFS_SYS_KERNEL_TAINTED_ID => String::from("0\n"),
+        PROCFS_SYS_FS_PIPE_MAX_SIZE_ID => String::from("4096\n"),
+        PROCFS_SYS_FS_LEASE_BREAK_TIME_ID => String::from("45\n"),
         _ => String::new(),
     }
 }

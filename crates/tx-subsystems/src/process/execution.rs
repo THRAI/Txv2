@@ -301,7 +301,7 @@ pub fn bootstrap_init_process(
         None,
         BTreeMap::new(),
         BTreeSet::new(),
-        (65536, 65536),
+        (1024, 1024),
         BOOTSTRAP_BRK_BASE,
         BOOTSTRAP_BRK_BASE,
         // Slice 6 of the shell-prompt roadmap. init's file-creation

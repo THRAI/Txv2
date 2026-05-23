@@ -551,7 +551,7 @@ impl ProcessIdentity {
             .lock()
             .as_ref()
             .map(|p| p.rlimit_nofile())
-            .unwrap_or((65536, 65536))
+            .unwrap_or((1024, 1024))
     }
 
     pub fn set_rlimit_nofile(&self, cur: u32, max: u32) {

@@ -926,6 +926,9 @@ fn append_ltp_batch(cmd: &mut alloc::string::String, batch: &str) {
     match batch.trim() {
         "p0" => append_filtered_ltp(cmd, LTP_P0_CASES),
         "smoke" => append_filtered_ltp(cmd, LTP_SMOKE_CASES),
+        "fd-io" => append_filtered_ltp(cmd, LTP_FD_IO_CASES),
+        "fd-io-tail" => append_filtered_ltp(cmd, LTP_FD_IO_TAIL_CASES),
+        "fd-io-after-sendfile07" => append_filtered_ltp(cmd, LTP_FD_IO_AFTER_SENDFILE07_CASES),
         _ => append_filtered_ltp(cmd, ""),
     }
 }
@@ -979,6 +982,61 @@ abort01+confstr01+fmtmsg01+fpathconf01+getcontext01+gethostbyname_r01+gethostid0
 gethostname02+getpagesize01+getrandom01+getrandom02+getrandom03+getrandom04+getrandom05+\
 mallinfo02+mallinfo2_01+mallopt01+memcmp01+memcpy01+memset01+nftw01+nftw6401+pathconf01+\
 pathconf02+profil01+qmm01+realpath01+string01+switch01+syscall01+sysconf01+ulimit01";
+
+const LTP_FD_IO_CASES: &str = "\
+close01+close02+close_range01+close_range02+copy_file_range01+copy_file_range02+copy_file_range03+\
+dup01+dup02+dup03+dup04+dup05+dup06+dup07+dup201+dup202+dup203+dup204+dup205+dup206+dup207+dup3_01+\
+dup3_02+fallocate01+fallocate02+fallocate03+fallocate04+fallocate05+fallocate06+fcntl01+fcntl01_64+\
+fcntl02+fcntl02_64+fcntl03+fcntl03_64+fcntl04+fcntl04_64+fcntl05+fcntl05_64+fcntl07+fcntl07_64+\
+fcntl08+fcntl08_64+fcntl09+fcntl09_64+fcntl10+fcntl10_64+fcntl11+fcntl11_64+fcntl12+fcntl12_64+\
+fcntl13+fcntl13_64+fcntl14+fcntl14_64+fcntl16+fcntl16_64+fcntl17+fcntl17_64+\
+fcntl18+fcntl18_64+fcntl19+fcntl19_64+fcntl20+fcntl20_64+fcntl21+fcntl21_64+fcntl22+fcntl22_64+\
+fcntl23+fcntl23_64+fcntl24+fcntl24_64+fcntl25+fcntl25_64+fcntl26+fcntl26_64+fcntl27+fcntl27_64+\
+fcntl29+fcntl29_64+fcntl30+fcntl30_64+fcntl31+fcntl31_64+fcntl32+fcntl32_64+fcntl33+fcntl33_64+\
+fcntl34+fcntl34_64+fcntl35+fcntl35_64+fcntl37+fcntl37_64+fcntl38+fcntl38_64+\
+fcntl39+fcntl39_64+fdatasync01+fdatasync02+fdatasync03+fsync01+fsync02+fsync03+fsync04+ioctl01+\
+ioctl02+ioctl03+ioctl04+ioctl05+ioctl06+ioctl07+ioctl08+ioctl09+ioctl_loop01+ioctl_loop02+\
+ioctl_loop03+ioctl_loop04+ioctl_loop05+ioctl_loop06+ioctl_loop07+ioctl_ns01+ioctl_ns02+ioctl_ns03+\
+ioctl_ns04+ioctl_ns05+ioctl_ns06+ioctl_ns07+ioctl_sg01+llseek01+llseek02+llseek03+lseek01+lseek02+\
+lseek07+lseek11+pipe01+pipe03+pipe04+pipe05+pipe06+pipe07+pipe08+pipe09+pipe10+pipe11+pipe12+\
+pipe13+pipe14+pipe15+pipe2_01+pipe2_02+pipe2_04+posix_fadvise01+posix_fadvise01_64+posix_fadvise02+\
+posix_fadvise02_64+posix_fadvise03+posix_fadvise03_64+posix_fadvise04+posix_fadvise04_64+pread01+\
+pread01_64+pread02+pread02_64+preadv01+preadv01_64+preadv02+preadv02_64+preadv03+preadv03_64+\
+preadv201+preadv201_64+preadv202+preadv202_64+preadv203+preadv203_64+pwrite01+pwrite01_64+pwrite02+\
+pwrite02_64+pwrite03+pwrite03_64+pwrite04+pwrite04_64+pwritev01+pwritev01_64+pwritev02+pwritev02_64+\
+pwritev03+pwritev03_64+pwritev201+pwritev201_64+pwritev202+pwritev202_64+read01+read02+read03+\
+read04+readahead01+readahead02+readv01+readv02+sendfile02+sendfile02_64+sendfile03+sendfile03_64+\
+sendfile04+sendfile04_64+sendfile05+sendfile05_64+sendfile06+sendfile06_64+sendfile07+sendfile07_64+\
+sendfile08+sendfile08_64+sendfile09+sendfile09_64+sockioctl01+splice01+splice02+splice03+splice04+\
+splice05+splice06+splice07+splice08+splice09+sync01+sync_file_range01+sync_file_range02+syncfs01+\
+tee01+tee02+vmsplice01+vmsplice02+vmsplice03+vmsplice04+write01+write02+write03+write04+write05+\
+write06+writev01+writev02+writev03+writev05+writev06+writev07";
+
+const LTP_FD_IO_TAIL_CASES: &str = "\
+ioctl05+ioctl06+ioctl07+ioctl08+ioctl09+ioctl_loop01+ioctl_loop02+ioctl_loop03+ioctl_loop04+\
+ioctl_loop05+ioctl_loop06+ioctl_loop07+ioctl_ns01+ioctl_ns02+ioctl_ns03+ioctl_ns04+ioctl_ns05+\
+ioctl_ns06+ioctl_ns07+ioctl_sg01+llseek01+llseek02+llseek03+lseek01+lseek02+lseek07+lseek11+\
+pipe01+pipe03+pipe04+pipe05+pipe06+pipe07+pipe08+pipe09+pipe10+pipe11+pipe12+pipe13+pipe14+\
+pipe15+pipe2_01+pipe2_02+pipe2_04+posix_fadvise01+posix_fadvise01_64+posix_fadvise02+\
+posix_fadvise02_64+posix_fadvise03+posix_fadvise03_64+posix_fadvise04+posix_fadvise04_64+\
+pread01+pread01_64+pread02+pread02_64+preadv01+preadv01_64+preadv02+preadv02_64+preadv03+\
+preadv03_64+preadv201+preadv201_64+preadv202+preadv202_64+preadv203+preadv203_64+pwrite01+\
+pwrite01_64+pwrite02+pwrite02_64+pwrite03+pwrite03_64+pwrite04+pwrite04_64+pwritev01+\
+pwritev01_64+pwritev02+pwritev02_64+pwritev03+pwritev03_64+pwritev201+pwritev201_64+\
+pwritev202+pwritev202_64+read01+read02+read03+read04+readahead01+readahead02+readv01+\
+readv02+sendfile02+sendfile02_64+sendfile03+sendfile03_64+sendfile04+sendfile04_64+sendfile05+\
+sendfile05_64+sendfile06+sendfile06_64+sendfile07+sendfile07_64+sendfile08+sendfile08_64+\
+sendfile09+sendfile09_64+sockioctl01+splice01+splice02+splice03+splice04+splice05+splice06+\
+splice07+splice08+splice09+sync01+sync_file_range01+sync_file_range02+syncfs01+tee01+tee02+\
+vmsplice01+vmsplice02+vmsplice03+vmsplice04+write01+write02+write03+write04+write05+write06+\
+writev01+writev02+writev03+writev05+writev06+writev07";
+
+const LTP_FD_IO_AFTER_SENDFILE07_CASES: &str = "\
+sendfile07_64+sendfile08+sendfile08_64+sendfile09+sendfile09_64+sockioctl01+splice01+splice02+\
+splice03+splice04+splice05+splice06+splice07+splice08+splice09+sync01+sync_file_range01+\
+sync_file_range02+syncfs01+tee01+tee02+vmsplice01+vmsplice02+vmsplice03+vmsplice04+write01+\
+write02+write03+write04+write05+write06+writev01+writev02+writev03+writev05+writev06+\
+writev07";
 
 fn append_filtered_libctest(cmd: &mut alloc::string::String, filter: &str) {
     use core::fmt::Write as _;
