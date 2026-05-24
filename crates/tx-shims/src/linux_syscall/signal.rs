@@ -758,9 +758,10 @@ pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
 /// where the signal interrupted it.
 ///
 /// `SigreturnRestored` tells the syscall-return path in
-/// `thread_future` to skip its normal `pending_syscall_return` drain
-/// — the merged context's `a0` and `pc` come from the restored
-/// pre-signal snapshot, not the syscall's nominal return value.
+/// `thread_future` to decode the platform signal frame before
+/// re-entering userspace. `SigreturnContextRestored` is reserved for
+/// the small compatibility frame emitted by `maybe_deliver_itimer_signal`,
+/// where this syscall arm has already restored the context.
 ///
 /// Without this restore, the handler's "post-`ret`" path stays in
 /// the trampoline / signal-frame memory and the thread reads garbage
@@ -782,6 +783,23 @@ pub(super) fn sys_rt_sigreturn(ctx: &SyscallCtx) -> SyscallResult {
     let Some(payload) = ctx.thread.payload_cap() else {
         return SyscallResult::Error(EFAULT_VALUE);
     };
+
+    let Some(current) = payload.saved_user_context() else {
+        return SyscallResult::Error(EFAULT_VALUE);
+    };
+    if let Ok(frame) = read_compat_signal_frame(&ctx.aspace, current.regs[2] as u64) {
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = SigprocmaskOp {
+            thread: ctx.thread.clone(),
+            how: SigmaskHow::SetMask,
+            next: SignalMask::new(frame.saved_mask.bits),
+        };
+        let _ = step_engine::drive_oneshot(&mut op, &mut script_ctx);
+        let _ = payload.take_saved_signal_context();
+        payload.store_saved_user_context(Some(frame.user_context));
+        return SyscallResult::SigreturnContextRestored;
+    }
+
     if let Some(saved) = payload.take_saved_signal_context() {
         if let Some(mask) = payload.take_saved_signal_mask() {
             payload.store_signal_mask(mask);
@@ -790,9 +808,6 @@ pub(super) fn sys_rt_sigreturn(ctx: &SyscallCtx) -> SyscallResult {
         return SyscallResult::SigreturnRestored;
     }
 
-    let Some(current) = payload.saved_user_context() else {
-        return SyscallResult::Error(EFAULT_VALUE);
-    };
     let frame = match read_compat_signal_frame(&ctx.aspace, current.regs[2] as u64) {
         Ok(frame) => frame,
         Err(errno) => return SyscallResult::Error(errno),
@@ -805,7 +820,7 @@ pub(super) fn sys_rt_sigreturn(ctx: &SyscallCtx) -> SyscallResult {
     };
     let _ = step_engine::drive_oneshot(&mut op, &mut script_ctx);
     payload.store_saved_user_context(Some(frame.user_context));
-    SyscallResult::SigreturnRestored
+    SyscallResult::SigreturnContextRestored
 }
 
 /// `rt_sigpending(set, sigsetsize)` — Linux RV64 generic ABI
