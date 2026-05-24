@@ -80,15 +80,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
 pub mod adapter;
+pub mod notification;
 
 use adapter::step_engine::{
-    sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, InterestMask, OnBehalfOfAbort,
-    ScriptCtx, SpinMutex, SubjectContext, SubjectIdentity, WaitSource, WaitSourceId, Zone,
-    ZoneAllocated, ZoneError,
+    sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, OnBehalfOfAbort, ScriptCtx, SpinMutex,
+    SubjectContext, SubjectIdentity, WaitSource, Zone, ZoneAllocated, ZoneError,
 };
-use adapter::wait_routing::Channel;
-
-use crate::wait_source;
 
 // === SQE / CQE stubs =================================================
 //
@@ -166,19 +163,6 @@ static NEXT_RING_ID: AtomicU64 = AtomicU64::new(1);
 fn allocate_ring_id() -> u64 {
     NEXT_RING_ID.fetch_add(1, Ordering::AcqRel)
 }
-
-// === interest masks ==================================================
-
-/// Interest-mask bit the [`IoUring::sqe_arrived_source`] publishes on
-/// push. Single bit because the carrier has a single semantic event
-/// ("ring went from empty to non-empty"). Mirrors
-/// [`crate::aio::IOCB_ARRIVED_MASK`].
-pub const SQE_ARRIVED_MASK: u64 = 0x1;
-
-/// Interest-mask bit the [`IoUring::cqe_available_source`] publishes on
-/// completion-push. Single bit; pairs with [`SQE_ARRIVED_MASK`] on the
-/// opposite carrier. Mirrors [`crate::aio::EVENTS_AVAILABLE_MASK`].
-pub const CQE_AVAILABLE_MASK: u64 = 0x1;
 
 // === IoUring payload =================================================
 
@@ -259,22 +243,17 @@ impl IoUring {
     /// Construct a fresh io_uring payload with the given SQ / CQ ring
     /// depths. Mirrors `AioContext::with_nr_events`.
     pub fn with_entries(sq_entries: u32, cq_entries: u32) -> Self {
-        let sqe_arrived_channel = Channel::new();
-        let sqe_arrived_id = wait_source::register_wait_channel(sqe_arrived_channel);
-        let sqe_arrived = Arc::new(WaitSource::new(WaitSourceId::new(sqe_arrived_id)));
-        let cqe_available_channel = Channel::new();
-        let cqe_available_id = wait_source::register_wait_channel(cqe_available_channel);
-        let cqe_available = Arc::new(WaitSource::new(WaitSourceId::new(cqe_available_id)));
+        let wait_points = notification::new_wait_points();
         Self {
             ring_id: allocate_ring_id(),
             sq_entries,
             cq_entries,
             sq_ring: SpinMutex::new(VecDeque::new()),
             cq_ring: SpinMutex::new(VecDeque::new()),
-            sqe_arrived,
-            sqe_arrived_id,
-            cqe_available,
-            cqe_available_id,
+            sqe_arrived: wait_points.sqe_arrived,
+            sqe_arrived_id: wait_points.sqe_arrived_id,
+            cqe_available: wait_points.cqe_available,
+            cqe_available_id: wait_points.cqe_available_id,
             worker_abort: Arc::new(AbortSignal::new()),
             dispatched: AtomicU64::new(0),
         }
@@ -362,9 +341,7 @@ impl IoUring {
         }
         ring.push_back(sqe);
         drop(ring);
-        // Wake any parked SQPOLL kthread. Mirrors the AIO push path.
-        self.sqe_arrived
-            .notify_emit(InterestMask::new(SQE_ARRIVED_MASK));
+        notification::notify_sqe_arrived(&self.sqe_arrived);
         Ok(())
     }
 
@@ -379,8 +356,7 @@ impl IoUring {
     /// counter only).
     pub fn push_cqe(&self, cqe: CqeStub) {
         self.cq_ring.lock().push_back(cqe);
-        self.cqe_available
-            .notify_emit(InterestMask::new(CQE_AVAILABLE_MASK));
+        notification::notify_cqe_available(&self.cqe_available);
     }
 
     /// Pop one CQE off the ring, if any. Future `io_uring_enter(2)`
@@ -428,8 +404,7 @@ impl Drop for IoUring {
         self.worker_abort.trip(OnBehalfOfAbort::CooperativeCancel(
             CancelReason::OwnerRequested,
         ));
-        wait_source::release_wait_channel(self.sqe_arrived_id);
-        wait_source::release_wait_channel(self.cqe_available_id);
+        notification::release_wait_points(self.sqe_arrived_id, self.cqe_available_id);
     }
 }
 

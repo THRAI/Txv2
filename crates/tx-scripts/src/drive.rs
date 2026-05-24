@@ -48,9 +48,6 @@ use tx_observe_types::{
     TxPayloadTag,
 };
 
-use tx_subsystems::execution::WaitToken;
-use tx_subsystems::wait_source;
-
 /// Central `StepOp` driver.
 ///
 /// Per `docs/Txv3/03_STEP_MODEL_v2.md` §5: the subsystem-agnostic loop
@@ -655,14 +652,9 @@ async fn resolve_on_wait_source<I: SubjectIdentity>(
         }
         (ResumeOutcome::Retry, gen.raw())
     } else {
-        // Fallback path: no per-task mailbox, so no `WaitGeneration` is
-        // minted. The global registry path doesn't have flow-id material
-        // beyond the `WaitToken`; return 0 (the "no-gen" sentinel the
-        // daemon's flow-hash treats as a never-matches placeholder).
-        let token = WaitToken::new(source.raw(), interests.raw());
-        if let Some(future) = wait_source::wait_on_token(token) {
-            future.await;
-        }
+        // No per-task mailbox means there is nowhere to park or receive a
+        // generation-tagged wake. Retry lets the caller re-observe state
+        // without re-entering the retired WaitToken -> Channel bridge.
         (ResumeOutcome::Retry, 0)
     }
 }

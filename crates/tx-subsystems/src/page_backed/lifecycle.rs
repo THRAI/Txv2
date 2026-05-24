@@ -81,7 +81,7 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
     // reserve
     // commit
     // publish
-    use crate::page_backed::adapter::step_engine::{StepOutcome as V3, YieldShape};
+    use crate::page_backed::adapter::step_engine::StepOutcome as V3;
 
     let PageContainerKind::File {
         mount,
@@ -114,38 +114,20 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
                 };
                 return V3::continue_with(progress);
             }
-            V3::Yield {
-                progress: _,
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-            } => {
+            V3::Yield { progress: _, shape } => {
+                let Some((carrier, interests)) =
+                    crate::page_backed::notification::wait_source_parts(&shape)
+                else {
+                    return V3::err(step_engine::Errno::EIO);
+                };
                 let progress = if pages_so_far == 0 {
                     PageProgress::EMPTY
                 } else {
                     PageProgress::new(pages_so_far)
                 };
-                return V3::yield_on_wait_source(progress, carrier.raw(), interests.raw());
-            }
-            V3::Yield {
-                shape: YieldShape::OnAgent { .. },
-                ..
-            } => {
-                return V3::err(step_engine::Errno::EIO);
-            }
-            V3::Yield {
-                shape: YieldShape::OnEdge { .. },
-                ..
-            } => {
-                return V3::err(step_engine::Errno::EIO);
-            }
-            V3::Yield {
-                shape: YieldShape::OnTimer { .. },
-                ..
-            } => {
-                return V3::err(step_engine::Errno::EIO);
+                return crate::page_backed::notification::yield_on_wait_source(
+                    progress, carrier, interests,
+                );
             }
             V3::Err(v3_errno) => return V3::err(v3_errno),
         }
@@ -165,33 +147,19 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
             };
             V3::continue_with(progress)
         }
-        V3::Yield {
-            progress: _,
-            shape:
-                YieldShape::OnWaitSource {
-                    source: carrier,
-                    interests,
-                },
-        } => {
+        V3::Yield { progress: _, shape } => {
+            let Some((carrier, interests)) =
+                crate::page_backed::notification::wait_source_parts(&shape)
+            else {
+                return V3::err(step_engine::Errno::EIO);
+            };
             let progress = if pages_so_far == 0 {
                 PageProgress::EMPTY
             } else {
                 PageProgress::new(pages_so_far)
             };
-            V3::yield_on_wait_source(progress, carrier.raw(), interests.raw())
+            crate::page_backed::notification::yield_on_wait_source(progress, carrier, interests)
         }
-        V3::Yield {
-            shape: YieldShape::OnAgent { .. },
-            ..
-        } => V3::err(step_engine::Errno::EIO),
-        V3::Yield {
-            shape: YieldShape::OnEdge { .. },
-            ..
-        } => V3::err(step_engine::Errno::EIO),
-        V3::Yield {
-            shape: YieldShape::OnTimer { .. },
-            ..
-        } => V3::err(step_engine::Errno::EIO),
         V3::Err(v3_errno) => V3::err(v3_errno),
     }
 }
@@ -225,7 +193,7 @@ pub fn step_truncate(
     // reserve
     // commit
     // publish
-    use crate::page_backed::adapter::step_engine::{StepOutcome as V3, YieldShape};
+    use crate::page_backed::adapter::step_engine::StepOutcome as V3;
 
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
         return V3::err(Errno::EINVAL.into());
@@ -249,32 +217,18 @@ pub fn step_truncate(
         {
             V3::Done(()) => false,
             V3::Continue { progress: _ } => true,
-            V3::Yield {
-                progress: _,
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-            } => {
-                return V3::yield_on_wait_source(
+            V3::Yield { progress: _, shape } => {
+                let Some((carrier, interests)) =
+                    crate::page_backed::notification::wait_source_parts(&shape)
+                else {
+                    return V3::err(step_engine::Errno::EIO);
+                };
+                return crate::page_backed::notification::yield_on_wait_source(
                     PageProgress::EMPTY,
-                    carrier.raw(),
-                    interests.raw(),
+                    carrier,
+                    interests,
                 );
             }
-            V3::Yield {
-                shape: YieldShape::OnAgent { .. },
-                ..
-            } => return V3::err(step_engine::Errno::EIO),
-            V3::Yield {
-                shape: YieldShape::OnEdge { .. },
-                ..
-            } => return V3::err(step_engine::Errno::EIO),
-            V3::Yield {
-                shape: YieldShape::OnTimer { .. },
-                ..
-            } => return V3::err(step_engine::Errno::EIO),
             V3::Err(v3_errno) => return V3::err(v3_errno),
         },
         PageContainerKind::Anon { .. } => false,
@@ -310,7 +264,7 @@ pub fn step_fallocate(
     // reserve
     // commit
     // publish
-    use crate::page_backed::adapter::step_engine::{StepOutcome as V3, YieldShape};
+    use crate::page_backed::adapter::step_engine::StepOutcome as V3;
 
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
         return V3::err(Errno::EINVAL.into());
@@ -338,32 +292,18 @@ pub fn step_fallocate(
         {
             V3::Done(()) => false,
             V3::Continue { progress: _ } => true,
-            V3::Yield {
-                progress: _,
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-            } => {
-                return V3::yield_on_wait_source(
+            V3::Yield { progress: _, shape } => {
+                let Some((carrier, interests)) =
+                    crate::page_backed::notification::wait_source_parts(&shape)
+                else {
+                    return V3::err(step_engine::Errno::EIO);
+                };
+                return crate::page_backed::notification::yield_on_wait_source(
                     PageProgress::EMPTY,
-                    carrier.raw(),
-                    interests.raw(),
+                    carrier,
+                    interests,
                 );
             }
-            V3::Yield {
-                shape: YieldShape::OnAgent { .. },
-                ..
-            } => return V3::err(step_engine::Errno::EIO),
-            V3::Yield {
-                shape: YieldShape::OnEdge { .. },
-                ..
-            } => return V3::err(step_engine::Errno::EIO),
-            V3::Yield {
-                shape: YieldShape::OnTimer { .. },
-                ..
-            } => return V3::err(step_engine::Errno::EIO),
             V3::Err(v3_errno) => return V3::err(v3_errno),
         },
         PageContainerKind::Anon { .. } => false,

@@ -9,21 +9,19 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod adapter;
+pub mod notification;
 
 #[cfg(test)]
 use adapter::step_engine::V3Errno;
 use adapter::step_engine::{
-    eagain, sign, yield_until_readable, ByteOutcome, Cap, NoProgress, OneShotStepOp, ScriptCtx,
-    StepOp, StepOutcome, SubjectIdentity, WaitSource, Zone, ZoneAllocated, ZoneError,
+    eagain, sign, ByteOutcome, Cap, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome,
+    SubjectIdentity, WaitSource, Zone, ZoneAllocated, ZoneError,
 };
-use adapter::wait_routing::{self, Channel};
-
-use crate::wait_source;
+use adapter::wait_routing::Channel;
 
 pub const TFD_CLOEXEC: u32 = 0o2000000;
 pub const TFD_NONBLOCK: u32 = 0o4000;
 pub const TFD_TIMER_ABSTIME: u32 = 0x1;
-pub const TIMERFD_READABLE: u64 = 0x1;
 pub const ITIMERSPEC_BYTES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -87,16 +85,14 @@ pub struct TimerFd {
 
 impl TimerFd {
     pub fn new(flags: u32) -> Self {
-        let channel = Channel::new();
-        let source_id = wait_source::register_wait_channel(channel.clone());
-        let source = Some(wait_routing::new_wait_source(source_id));
+        let wait_point = notification::new_wait_point();
         TimerFd {
             deadline_ns: AtomicU64::new(0),
             interval_ns: AtomicU64::new(0),
             expiration_count: AtomicU64::new(0),
-            source_id,
-            channel: Some(channel),
-            source,
+            source_id: wait_point.source_id,
+            channel: Some(wait_point.channel),
+            source: Some(wait_point.source),
             flags: AtomicU64::new(flags as u64),
         }
     }
@@ -169,12 +165,7 @@ impl TimerFd {
     }
 
     fn fire_readable(&self) {
-        if let Some(ref ch) = self.channel {
-            wait_routing::fire_legacy_channel(ch, TIMERFD_READABLE);
-        }
-        if let Some(ref src) = self.source {
-            wait_routing::notify_v3_source(src, TIMERFD_READABLE);
-        }
+        notification::notify_readable(self.channel.as_ref(), self.source.as_ref());
     }
 }
 
@@ -249,7 +240,7 @@ pub fn step_timerfd_read(
     if nonblocking {
         return eagain();
     }
-    yield_until_readable(tfd.source_id, TIMERFD_READABLE)
+    notification::wait_until_readable(tfd.source_id)
 }
 
 pub struct TimerfdCreateOp {

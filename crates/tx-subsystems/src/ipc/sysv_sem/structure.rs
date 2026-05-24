@@ -89,6 +89,7 @@ pub struct SemArrayPayload {
     /// Wake channel fired when any sem value changes.
     pub changed_channel: Channel,
     pub changed_source_id: u64,
+    pub changed_source: alloc::sync::Arc<crate::process::adapter::wait_routing::WaitSource>,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +97,7 @@ pub struct SemArrayPayload {
 // ---------------------------------------------------------------------------
 
 static SEM_TABLE: SpinMutex<BTreeMap<u32, Cap<SemArrayIdentity>>> = SpinMutex::new(BTreeMap::new());
+static REMOVED_SEM_IDS: SpinMutex<Vec<u32>> = SpinMutex::new(Vec::new());
 static NEXT_SEMID: AtomicU32 = AtomicU32::new(1);
 
 // ---------------------------------------------------------------------------
@@ -133,6 +135,10 @@ pub(crate) fn lookup_sem(semid: u32) -> Option<Cap<SemArrayIdentity>> {
     SEM_TABLE.lock().get(&semid).cloned()
 }
 
+pub(crate) fn was_sem_removed(semid: u32) -> bool {
+    REMOVED_SEM_IDS.lock().contains(&semid)
+}
+
 pub(crate) fn register_sem(
     key: Option<SysvKey>,
     cred: Cap<crate::cred::Cred>,
@@ -144,8 +150,8 @@ pub(crate) fn register_sem(
     use crate::process::adapter::step_engine::sign;
     let semid = NEXT_SEMID.fetch_add(1, Ordering::Relaxed);
 
-    let changed_channel = Channel::new();
-    let changed_source_id = crate::wait_source::register_wait_channel(changed_channel.clone());
+    let (changed_channel, changed_source_id, changed_source) =
+        crate::ipc::sysv_sem::notification::new_changed_channel();
 
     let identity = sign(SemArrayIdentity {
         key,
@@ -165,6 +171,7 @@ pub(crate) fn register_sem(
         changed_seq: AtomicU64::new(0),
         changed_channel,
         changed_source_id,
+        changed_source,
     })?;
     *identity.payload.lock() = Some(PayloadCap::from_cap(payload));
     SEM_TABLE.lock().insert(semid, identity.clone());
@@ -172,7 +179,11 @@ pub(crate) fn register_sem(
 }
 
 pub(crate) fn withdraw_sem(semid: u32) -> Option<Cap<SemArrayIdentity>> {
-    SEM_TABLE.lock().remove(&semid)
+    let removed = SEM_TABLE.lock().remove(&semid);
+    if removed.is_some() {
+        REMOVED_SEM_IDS.lock().push(semid);
+    }
+    removed
 }
 
 /// Iterate all live semaphore arrays (for /proc/sysvipc/sem projection).

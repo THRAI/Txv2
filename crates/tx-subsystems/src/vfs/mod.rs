@@ -14,6 +14,7 @@ pub mod adapter;
 pub mod checks;
 pub mod composite;
 pub mod execution;
+pub mod notification;
 pub mod predicates;
 pub mod require;
 pub mod resolution;
@@ -29,11 +30,12 @@ pub use execution::{
     FileFsyncOp, FlockOp, FsOps, InodeStatOp, MountOutput, OpenFileGetFlOp, OpenFileIoctlOp,
     OpenFileLseekOp, OpenFileSetFlOp, OpenOp, PathWalkOp,
 };
+pub use notification::{VFS_READABLE, VFS_WRITABLE};
 pub use structure::{
     render_dentry_path, Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind,
     InodeMeta, OpenFile, OpenFileFlags, OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult,
     ProjectionKey, ProjectionSchemaId, RNode, RNodeBacking, StructPayload, Timespec, VfsName,
     S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_ISGID, S_ISUID,
-    S_ISVTX, VFS_NAME_MAX, VFS_READABLE, VFS_WRITABLE,
+    S_ISVTX, VFS_NAME_MAX,
 };
 pub use walker::{step_open, step_walk, step_walk_in_mount_namespace, SYMLOOP_MAX};

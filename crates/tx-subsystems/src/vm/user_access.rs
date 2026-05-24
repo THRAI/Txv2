@@ -273,7 +273,7 @@ impl AddressSpace {
         max_len: usize,
         guard: &Guard<'_>,
     ) -> StepOutcome<Vec<u8>, NoProgress> {
-        use step_engine::{InterestMask, NoProgress, StepOutcome as V3, WaitSourceId, YieldShape};
+        use step_engine::{NoProgress, StepOutcome as V3};
         if src.addr() == 0 || max_len == 0 {
             return V3::Done(Vec::new());
         }
@@ -291,13 +291,7 @@ impl AddressSpace {
                     ResolveOutcome::Done(addr) => addr,
                     ResolveOutcome::Err(e) => return V3::Err(e.into()),
                     ResolveOutcome::Blocked(t) => {
-                        return V3::Yield {
-                            progress: NoProgress,
-                            shape: YieldShape::OnWaitSource {
-                                source: WaitSourceId::new(t.source_id()),
-                                interests: InterestMask::new(t.interest()),
-                            },
-                        };
+                        return crate::vm::notification::yield_wait_token(NoProgress, t);
                     }
                 };
             // SAFETY: frame_base.add(within) is a valid kernel
@@ -328,7 +322,7 @@ fn copy_in(
     src: UserPtr<u8>,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-    use step_engine::{ByteProgress, InterestMask, StepOutcome as V3, WaitSourceId, YieldShape};
+    use step_engine::{ByteProgress, StepOutcome as V3};
     if dst.is_empty() {
         return V3::Done(0);
     }
@@ -374,13 +368,7 @@ fn copy_in(
                 return V3::Err(e.into());
             }
             ResolveOutcome::Blocked(t) => {
-                return V3::Yield {
-                    progress: ByteProgress::new(copied),
-                    shape: YieldShape::OnWaitSource {
-                        source: WaitSourceId::new(t.source_id()),
-                        interests: InterestMask::new(t.interest()),
-                    },
-                };
+                return crate::vm::notification::yield_wait_token(ByteProgress::new(copied), t);
             }
         }
     }
@@ -393,7 +381,7 @@ fn copy_out(
     src: &[u8],
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-    use step_engine::{ByteProgress, InterestMask, StepOutcome as V3, WaitSourceId, YieldShape};
+    use step_engine::{ByteProgress, StepOutcome as V3};
     if src.is_empty() {
         return V3::Done(0);
     }
@@ -435,13 +423,7 @@ fn copy_out(
                 return V3::Err(e.into());
             }
             ResolveOutcome::Blocked(t) => {
-                return V3::Yield {
-                    progress: ByteProgress::new(copied),
-                    shape: YieldShape::OnWaitSource {
-                        source: WaitSourceId::new(t.source_id()),
-                        interests: InterestMask::new(t.interest()),
-                    },
-                };
+                return crate::vm::notification::yield_wait_token(ByteProgress::new(copied), t);
             }
         }
     }
@@ -627,19 +609,17 @@ fn resolve_user_page(
             //   `ResolvePageOutcome::Blocked(WaitToken(c, i))`.
             // - v3 `Yield { OnAgent .. }` → `Err(EFAULT)`.
             // - v3 `Err(_)` → `Err(EFAULT)`.
-            use step_engine::{StepOutcome as V3, YieldShape};
+            use step_engine::StepOutcome as V3;
             match pc.materialize_page(page_index, kind.materialize_access(), guard) {
                 V3::Done(m) => ResolvePageOutcome::Done(m),
                 V3::Continue { .. } => ResolvePageOutcome::Err(Errno::EFAULT),
-                V3::Yield {
-                    shape:
-                        YieldShape::OnWaitSource {
-                            source: carrier,
-                            interests,
-                        },
-                    ..
-                } => ResolvePageOutcome::Blocked(WaitToken::new(carrier.raw(), interests.raw())),
-                V3::Yield { .. } => ResolvePageOutcome::Err(Errno::EFAULT),
+                V3::Yield { shape, .. } => {
+                    if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) {
+                        ResolvePageOutcome::Blocked(token)
+                    } else {
+                        ResolvePageOutcome::Err(Errno::EFAULT)
+                    }
+                }
                 V3::Err(_) => ResolvePageOutcome::Err(Errno::EFAULT),
             }
         }

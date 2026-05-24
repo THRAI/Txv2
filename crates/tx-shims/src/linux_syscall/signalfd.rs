@@ -26,7 +26,6 @@ use tx_subsystems::signalfd::ops::SignalfdCreateOp;
 use tx_subsystems::signalfd::{signalfd_read, SignalFd, SIGNALFD_SIGINFO_SIZE};
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
-use tx_subsystems::wait_source;
 
 use super::numbers::{O_CLOEXEC, O_NONBLOCK, SFD_CLOEXEC, SFD_NONBLOCK};
 use super::{
@@ -165,7 +164,6 @@ pub(super) async fn sys_signalfd_read(
     }
 
     let nonblocking = file.flags().nonblocking;
-    use tx_subsystems::execution::WaitToken;
     loop {
         let outcome = {
             let mut staging = [0u8; SIGNALFD_SIGINFO_SIZE];
@@ -200,10 +198,7 @@ pub(super) async fn sys_signalfd_read(
                     },
                 ..
             } => {
-                let token = WaitToken::new(carrier.raw(), interests.raw());
-                if let Some(future) = wait_source::wait_on_token(token) {
-                    let _ = future.await;
-                }
+                super::await_wait_source(ctx, carrier, interests).await;
                 // Re-poll on next loop iteration.
             }
             V3Out::Continue { .. } | V3Out::Yield { .. } => {

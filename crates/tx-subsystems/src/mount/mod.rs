@@ -762,6 +762,11 @@ pub fn bootstrap_mount(
     parent_mount: Option<Cap<MountIdentity>>,
     guard: &Guard<'_>,
 ) -> Result<Cap<MountIdentity>, Errno> {
+    let parent_payload = mountpoint
+        .rnode()
+        .containing_mount_weak()
+        .and_then(|weak| weak.upgrade(guard))
+        .ok_or(Errno::ENODEV)?;
     let fs_ops = source_payload.fs_ops().clone();
     let root_id = FsObjectId::ROOT;
 
@@ -788,7 +793,7 @@ pub fn bootstrap_mount(
 
     // Register in the global mount table.
     let mountpoint_fs_object_id = mountpoint.rnode().fs_object_id();
-    register_mount(&source_payload, mountpoint_fs_object_id, mount.clone());
+    register_mount(&parent_payload, mountpoint_fs_object_id, mount.clone());
 
     Ok(mount)
 }
@@ -1021,6 +1026,19 @@ mod tests {
         ) -> StepOutcome<(), NoProgress> {
             StepOutcome::done(())
         }
+
+        fn materialise_rnode(
+            &self,
+            fs_object_id: FsObjectId,
+            meta: InodeMeta,
+            mount: &Cap<MountPayload>,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<Cap<RNode>, NoProgress> {
+            match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::Directory, mount) {
+                Ok(rnode) => StepOutcome::done(rnode),
+                Err(_) => StepOutcome::err(V3Errno::ENOMEM),
+            }
+        }
     }
 
     impl FsPageBacking for MockFs {
@@ -1175,6 +1193,90 @@ mod tests {
         }
 
         assert_eq!(payload.payload_pin_count(), 0);
+    }
+
+    #[test]
+    fn bootstrap_mount_registers_with_parent_mount_payload_key() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        reset_mount_table_for_test();
+
+        let parent_fs = Arc::new(MockFs);
+        let parent_payload = MountPayload::new_cap(
+            parent_fs.clone() as Arc<dyn FsOps>,
+            parent_fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(11),
+            MountOptions::default(),
+            "parentfs",
+            SourceLabel::Static("parent"),
+        )
+        .expect("parent mount payload");
+        let parent_root = RNode::new_cap_in_mount(
+            FsObjectId::ROOT,
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &parent_payload,
+        )
+        .expect("parent root rnode");
+        let parent_mount = MountIdentity::new_cap(
+            MountId::new(11),
+            None,
+            parent_root,
+            None,
+            parent_payload.clone(),
+            MountFlags::empty(),
+        )
+        .expect("parent mount");
+
+        let mountpoint_id = FsObjectId::new(44);
+        let mountpoint_rnode = RNode::new_cap_in_mount(
+            mountpoint_id,
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &parent_payload,
+        )
+        .expect("mountpoint rnode");
+        let mountpoint = DEntry::new_cap(
+            crate::vfs::InlineName::new(b"mnt").expect("inline name"),
+            mountpoint_rnode,
+        )
+        .expect("mountpoint dentry");
+
+        let child_fs = Arc::new(MockFs);
+        let child_payload = MountPayload::new_cap(
+            child_fs.clone() as Arc<dyn FsOps>,
+            child_fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(12),
+            MountOptions::default(),
+            "childfs",
+            SourceLabel::Static("child"),
+        )
+        .expect("child mount payload");
+
+        let guard = crate::vfs::adapter::step_engine::guard();
+        let mounted = bootstrap_mount(
+            child_payload.clone(),
+            mountpoint,
+            Some(parent_mount),
+            &guard,
+        )
+        .expect("bootstrap mount");
+
+        assert_eq!(
+            mount_for(&parent_payload, mountpoint_id)
+                .expect("parent-keyed mount")
+                .id(),
+            mounted.id()
+        );
+        assert!(
+            mount_for(&child_payload, mountpoint_id).is_none(),
+            "child/source payload must not be used as the mountpoint lookup key"
+        );
     }
 
     // -- step_v3 free-fn probes -------------------------------------------

@@ -10,11 +10,12 @@ use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod adapter;
+pub mod notification;
 
 use adapter::step_engine::{
     self as step_engine, page_allocator, AllocError, BitmapPageAllocator, ByteProgress, CachePin,
     Cap, DeviceFrame, MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
-    YieldShape, ZeroPolicy, Zone, ZoneAllocated, ZoneError,
+    ZeroPolicy, Zone, ZoneAllocated, ZoneError,
 };
 
 use crate::execution::{Errno, Guard};
@@ -463,15 +464,14 @@ impl PageContainer {
         access: MaterializeAccess,
         guard: &Guard<'_>,
     ) -> Result<MaterializedPage, PageCacheError> {
-        use adapter::step_engine::{StepOutcome as V3, YieldShape};
+        use adapter::step_engine::StepOutcome as V3;
         match self.materialize_page(page, access, guard) {
             V3::Done(page) => Ok(page),
             V3::Err(errno) => Err(PageCacheError::Backend(errno.into())),
             V3::Continue { .. } => Err(PageCacheError::Backend(Errno::EAGAIN)),
-            V3::Yield {
-                shape: YieldShape::OnWaitSource { .. },
-                ..
-            } => Err(PageCacheError::Backend(Errno::EAGAIN)),
+            V3::Yield { shape, .. } if notification::is_wait_source(&shape) => {
+                Err(PageCacheError::Backend(Errno::EAGAIN))
+            }
             V3::Yield { .. } => Err(PageCacheError::Backend(Errno::EIO)),
         }
     }
@@ -512,26 +512,13 @@ impl PageContainer {
                 // a frame don't observe a stale value.
                 StepOutcome::Err(V3Errno::EAGAIN)
             }
-            StepOutcome::Yield {
-                progress: _,
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-            } => StepOutcome::yield_on_wait_source(NoProgress, carrier.raw(), interests.raw()),
-            StepOutcome::Yield {
-                shape: YieldShape::OnAgent { .. },
-                ..
-            } => StepOutcome::Err(V3Errno::EIO),
-            StepOutcome::Yield {
-                shape: YieldShape::OnEdge { .. },
-                ..
-            } => StepOutcome::Err(V3Errno::EIO),
-            StepOutcome::Yield {
-                shape: YieldShape::OnTimer { .. },
-                ..
-            } => StepOutcome::Err(V3Errno::EIO),
+            StepOutcome::Yield { progress: _, shape } => {
+                if let Some((carrier, interests)) = notification::wait_source_parts(&shape) {
+                    notification::yield_on_wait_source(NoProgress, carrier, interests)
+                } else {
+                    StepOutcome::Err(V3Errno::EIO)
+                }
+            }
             StepOutcome::Err(v3_errno) => StepOutcome::Err(v3_errno),
         }
     }
@@ -758,34 +745,27 @@ fn step_range(
                 advanced += chunk;
                 offset += chunk as u64;
             }
-            StepOutcome::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
+            StepOutcome::Yield { shape, .. } => {
+                let Some((carrier, interests)) = notification::wait_source_parts(&shape) else {
+                    if advanced == 0 {
+                        return StepOutcome::err(V3Errno::EIO);
+                    }
+                    of.set_offset(offset);
+                    return StepOutcome::done(advanced);
+                };
                 if advanced == 0 {
-                    return StepOutcome::yield_on_wait_source(
+                    return notification::yield_on_wait_source(
                         ByteProgress::EMPTY,
-                        carrier.raw(),
-                        interests.raw(),
+                        carrier,
+                        interests,
                     );
                 }
                 of.set_offset(offset);
-                return StepOutcome::yield_on_wait_source(
+                return notification::yield_on_wait_source(
                     ByteProgress::new(advanced),
-                    carrier.raw(),
-                    interests.raw(),
+                    carrier,
+                    interests,
                 );
-            }
-            StepOutcome::Yield { .. } => {
-                if advanced == 0 {
-                    return StepOutcome::err(V3Errno::EIO);
-                }
-                of.set_offset(offset);
-                return StepOutcome::done(advanced);
             }
             StepOutcome::Err(errno) => {
                 if advanced == 0 {

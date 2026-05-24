@@ -1,3 +1,156 @@
+- 2026-05-24 **Retired production legacy wait-channel path.**
+  Removed shim/script `wait_on_token` parking and moved blocking syscall waits
+  onto mailbox-backed `WaitSource` lookup. Notification wait points now mint
+  fresh subsystem notification ids instead of using the legacy channel registry,
+  and AIO, io_uring, signalfd, userfaultfd, VFS, SysV msg/sem, and VM RangeLock
+  sources register with the v3 wait-source registry so mailbox waiters resolve
+  directly. The `legacy-wait-channel` ratchet is now zero. **Verified:**
+  `cargo fmt --check`; `cargo check -p tx-subsystems`; `cargo check -p
+  tx-shims`; `cargo check -p tx-scripts`; `cargo test -p tx-subsystems
+  sysv_msg -- --nocapture`; `cargo test -p tx-subsystems sysv_sem --
+  --nocapture`; `cargo xtask lint invariants legacy-wait-channel`; `cargo
+  xtask lint invariants notification-boundary`; `cargo xtask lint invariants
+  all`; `cargo xtask lint docs`; `cargo xtask progress validate`. **Next step:** clean stale in-code comments that still
+  describe PR-3D coexistence/legacy resolver status and then remove the
+  compatibility module once no tests or docs reference it. **Blocker:** none
+  for production-path retirement; VM's older async helpers now retry rather
+  than park without a mailbox until their callers move fully through
+  `drive()`.
+
+- 2026-05-24 **Completed universal notification-wrapper convergence.**
+  Extended the `notification.rs` pattern across eventfd, signalfd,
+  userfaultfd, AIO, io_uring, VFS, POSIX mq, futex, TTY, process exit-source,
+  VM RangeLock, and PageBacked wait-yield relay paths. Raw wake/readiness
+  primitives now live behind `adapter.rs`, subsystem-local `notification.rs`,
+  or marked `#[notification_adapter]` scopes; the
+  `notification-boundary` ratchet is lowered to zero raw sites. The
+  `legacy-wait-channel` ratchet also dropped from 43 to 42, but the remaining
+  compatibility bridge uses are still intentional migration debt rather than a
+  coexistence target. **Verified:** `cargo fmt --check`; `cargo test -p
+  tx-subsystems tty -- --nocapture`; `cargo test -p tx-subsystems process --
+  --nocapture`; `cargo test -p tx-subsystems vm -- --nocapture`; `cargo test
+  -p tx-subsystems page_backed -- --nocapture`; `cargo check -p
+  tx-subsystems`; `cargo check -p tx-shims`; `cargo xtask lint invariants
+  notification-boundary`; `cargo xtask lint invariants legacy-wait-channel`;
+  `cargo xtask lint invariants all`; `cargo xtask lint docs`; `cargo xtask
+  progress validate`; `cargo -q xtask unit`; `git diff --check`. **Next step:** retire the
+  remaining shim/script wait drivers toward object-owned `WaitSource`
+  subscription/prepare paths, lowering `legacy-wait-channel` per slice.
+  **Blocker:** full legacy bridge retirement still needs syscall/script driver
+  migration; no blocker for the notification-boundary lint.
+
+- 2026-05-24 **Landed the first notification-boundary migration slice.**
+  Added `#[notification_adapter]` to `tx-platform-adapter`, wired
+  `cargo xtask lint invariants notification-boundary` into `invariants all`,
+  and piloted SysV msg/sem, pipe, and timerfd `notification.rs` wrappers for
+  send-space, message-available, semaphore-changed, readable, and writable wake
+  meanings. The new boundary ratchet started at 102 raw production
+  notification sites outside convergence homes, dropped to 86 after the SysV
+  pilot, to 82 after the pipe slice, and now sits at 81 after the timerfd
+  slice; `legacy-wait-channel`
+  remains at 43 because migrated users still register through the temporary
+  compatibility bridge from marked notification modules. The notification lint
+  now treats `#[notification_adapter]` as an inline-module grant instead of a
+  whole-file exemption, keeping `notification.rs` and `adapter.rs` as the broad
+  convergence homes during migration. **Verified:** `cargo test -p
+  tx-platform-adapter -- --nocapture`; `cargo test -p tx-subsystems sysv_msg
+  -- --nocapture`; `cargo test -p tx-subsystems sysv_sem -- --nocapture`;
+  `cargo test -p tx-subsystems pipe -- --nocapture`; `cargo test -p
+  tx-subsystems timerfd -- --nocapture`; `cargo test -p tx-shims
+  timerfd_dispatch -- --nocapture`; `cargo fmt --check`; `cargo check -p
+  xtask`; `cargo check -p tx-platform-adapter`; `cargo check
+  -p tx-subsystems`; `cargo xtask lint
+  invariants notification-boundary`; `cargo xtask lint invariants
+  legacy-wait-channel`; `cargo xtask lint invariants all`; `cargo xtask lint
+  docs`; `cargo -q xtask unit`; `cargo xtask progress validate`. **Next step:**
+  continue the same pattern with futex/eventfd/signalfd-style waitable
+  subsystems, lowering
+  `notification-boundary` per slice before any legacy wait-interface
+  retirement. **Blocker:** none for the marker/lint/current slices; full
+  retirement still waits on zero legacy bridge sites.
+
+- 2026-05-24 **Planned notification-boundary convergence before interface
+  retirement.** Added
+  `docs/superpowers/plans/2026-05-24-notification-convergence-migration.md`
+  as the migration plan for per-subsystem `notification.rs` wrappers, a
+  `#[notification_adapter]` marker modeled on `#[platform_adapter]`,
+  report-first `notification-boundary` linting, slice-by-slice subsystem
+  migration, and only then legacy wait-interface retirement. **Verified:**
+  placeholder scan and `git diff --check` on the plan. **Next step:** execute
+  Task 1/2 to add the marker macro and report-first lint baseline before
+  moving SysV msg/sem into semantic notification wrappers. **Blocker:** none
+  for planning; implementation must preserve the existing `wait_source` bridge
+  until migrated call sites are green.
+
+- 2026-05-24 **Added a stale wait-path ratchet lint.**
+  `cargo xtask lint invariants legacy-wait-channel` now scans production
+  kernel/shim/script/subsystem Rust for direct use of the legacy
+  `WaitToken`/reactor-channel bridge (`wait_on_token`,
+  `register_wait_channel`, `release_wait_channel`, `lookup_wait_channel`)
+  while excluding tests and the compatibility registry itself. The measured
+  live baseline is 43 production sites, so coexistence is recorded as current
+  compatibility debt rather than a desired steady state; any new stale path
+  use now fails `cargo xtask lint invariants all`. **Verified:** `cargo xtask
+  lint invariants legacy-wait-channel`; `cargo xtask lint invariants all`;
+  `cargo fmt --check`; `cargo check -p xtask`; `cargo xtask lint docs`;
+  `cargo xtask progress validate`; `git diff --check -- xtask/src/lint.rs
+  xtask/src/lib.rs xtask/src/lint_invariants_wait.rs
+  docs/progress/STATUS.md .agents/skills/tx-xtask/SKILL.md`.
+  **Next step:** migrate the listed subsystem payloads and syscall/script
+  drivers toward object-owned `Arc<WaitSource>` lists, lowering the ratchet as
+  each slice lands. **Blocker:** none for detection; eliminating the debt still
+  requires runtime wait-path migration.
+
+- 2026-05-24 **Closed the concrete dispatched drift fixes and deferred the
+  premature slices.** Parallel implementation workers fixed the musl-visible
+  SysV msg/sem blocking drift and one narrow Mount/VFS path-boundary bug.
+  SysV msg/sem now expose v3 wait-source outcomes for blocking calls when
+  `IPC_NOWAIT` is absent, preserve the old synchronous wrappers as
+  non-driving `EAGAIN` compatibility shims, wake send/recv/sem wait channels
+  on `IPC_RMID`, and tombstone removed ids so resumed callers see `EIDRM`.
+  `bootstrap_mount` now registers mounts with the parent mountpoint payload key
+  the walker uses, not the child/source payload. AIO yield preservation was
+  explicitly deferred because the native AIO dispatcher currently returns a
+  terminal `IoEvent` and cannot carry a lower `StepOutcome::Yield` without a
+  broader continuation/requeue contract; the closed-catalog scheduler/yield
+  findings remain architecture cleanup, not musl-priority fixes. **Verified:**
+  `cargo test -p tx-subsystems sysv_msg -- --nocapture`; `cargo test -p
+  tx-subsystems sysv_sem -- --nocapture`; `cargo test -p tx-subsystems
+  mount::tests::bootstrap_mount_registers_with_parent_mount_payload_key`;
+  `cargo check -p tx-subsystems`; `cargo fmt --check`. **Next step:** wire the
+  SysV syscall/script layer to drive the new v3 wait outcomes and map
+  cancellation to `EIDRM`, then handle broader mount evidence/topology as its
+  own slice. **Blocker:** full `AbortReason::Canceled` delivery still requires
+  SysV payloads to own `Arc<WaitSource>` subscriber lists rather than only
+  legacy channels/source ids.
+
+- 2026-05-24 **Completed the dispatch-aware per-module spec-drift/code-smell
+  audit.** Parallel read-only workers reviewed foundation/HAL/substrate/reactor,
+  core semantic subsystems, and IPC/fs/scripts/shims surfaces, then the main
+  thread verified the cited live code/spec anchors and recorded the durable
+  findings in
+  `docs/progress/research/2026-05-24-per-module-code-review.md`. The highest
+  priority live drifts are Mount/VFS evidence and topology (`EntityAtPath`,
+  `OpenFile`, process frame cwd/root mount state, namespace-less mount-table
+  fallback), SysV msg/sem blocking and `IPC_RMID` waiter abort semantics, v3
+  `YieldShape` closed-catalog drift (`OnAgent.deadline`, premature `OnEdge`),
+  and AIO borrowed-worker yield collapse. **Verified:** `cargo xtask
+  boundary-report`; `cargo xtask lint invariants all`; `cargo xtask lint docs`;
+  `cargo xtask lint boundary`; `cargo xtask progress validate`; `git diff
+  --check -- docs/progress/STATUS.md
+  docs/progress/research/2026-05-24-per-module-code-review.md`. `cargo xtask
+  lint arch` is blocked by the current `crates/tx-kernel/src/init.rs` file-size
+  ratchet (`1801` lines over the `1800` limit). **Next step:**
+  close the Mount/VFS evidence slice first, then add narrow lint ratchets only
+  after each concrete drift is fixed. **Blocker:** none for the audit; code
+  fixes and lint implementation remain follow-up work. The arch-lint size
+  ratchet is a separate cleanup blocker before full baseline green.
+  **Musl cross-check:** `external/musl` confirms SysV msg/sem blocking remains
+  the strongest musl-visible item; AIO yield collapse is direct Linux-AIO/Tx
+  canary drift rather than a musl POSIX-AIO blocker; `YieldShape`,
+  scheduler-class, BdevFs, and thread-stop findings are architecture/staging
+  priorities unless a guest test exercises them.
+
 - 2026-05-24 **Fixed the RV64 SMP OSComp userspace reactor hart-id panic.**
   `oscomp-local-rv64-smp4` was entering userspace and then panicking in
   `ReactorLocals::ensure_hart` with a `HartId` shaped like a kernel global

@@ -7,13 +7,11 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use tx_hal::{PmapIf, UserTrapContext};
 
+use crate::cred::Cred;
 use crate::process::adapter::step_engine::{
     self, Cap, IdentRef, NoProgress, OneShotStepOp, OperationalCapExt, PayloadCap, ScriptCtx,
     SpinMutex, StepOp, StepOutcome, SubjectIdentity, Weak, YieldShape, ZoneError,
 };
-use crate::process::adapter::wait_routing::{self, Mask};
-
-use crate::cred::Cred;
 use crate::process::structure::{
     ExitStatus, Frame, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session, Sid,
 };
@@ -899,9 +897,7 @@ fn post_sigchld_to_parent(process: &Cap<ProcessIdentity>) {
         let _ = crate::signal::step_kill_process(&parent, crate::signal::Signum::SIGCHLD, None);
         // Fire the parent's exit_source. A zombie parent has no payload
         // and `fire_exit_source` returns 0 — no panic, no double-fire.
-        let _ = parent.fire_exit_source(Mask::from_bits(
-            crate::process::structure::EXIT_SOURCE_CHILD_ZOMBIFIED,
-        ));
+        let _ = crate::process::notification::notify_child_zombified(&parent);
     }
 }
 
@@ -1204,7 +1200,6 @@ fn sign_process_payload(
 ) -> Result<PayloadCap<ProcessPayload>, ZoneError> {
     use crate::process::adapter::step_engine::AtomicSlot;
     use crate::process::adapter::step_engine::{RawPort, RawQueue};
-    use crate::process::adapter::wait_routing::Channel;
     let aspace_slot: AtomicSlot<Cap<AddressSpace>> = AtomicSlot::empty();
     aspace_slot.store(Some(aspace));
 
@@ -1237,13 +1232,11 @@ fn sign_process_payload(
     // Carrier-lifetime cleanup (release on payload drop) is tracked
     // as Cross-cutting Risk #1 in the slice plan and is deferred
     // beyond Wave 1.
-    let exit_source = Channel::new();
-    let exit_source_id = crate::wait_source::register_wait_channel(exit_source.clone());
+    let exit_wait_point = crate::process::notification::new_exit_wait_point();
     // PR-3D-3 (D2/D4 coexistence). Per-process `WaitSource` shares the
     // same `u64` namespace as the legacy `exit_source` channel so a
     // `WaitSourceId` stamped into `YieldShape::OnWaitSource` lands at
     // both ends (legacy resolver + new `Arc<WaitSource>` slot).
-    let exit_wait_source = wait_routing::new_wait_source(exit_source_id);
 
     let cap = step_engine::sign(ProcessPayload {
         frame: Frame {
@@ -1272,9 +1265,9 @@ fn sign_process_payload(
         // the umask (umask survives `exec` per POSIX).
         umask: core::sync::atomic::AtomicU16::new(umask & 0o777),
         sem_undos: SpinMutex::new(BTreeMap::new()),
-        exit_source,
-        exit_source_id,
-        exit_wait_source,
+        exit_source: exit_wait_point.channel,
+        exit_source_id: exit_wait_point.source_id,
+        exit_wait_source: exit_wait_point.source,
         exit_source_bus: RawQueue::new(),
         _cmdline: SpinMutex::new(None),
         _exe_file: SpinMutex::new(None),

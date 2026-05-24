@@ -33,5 +33,18 @@ pub mod step_engine {
     reason = "wrap reactor Channel/Mask as signalfd legacy wake verbs (D2/D4 coexistence)"
 )]
 pub mod wait_routing {
+    use alloc::sync::Arc;
+
     pub use tx_reactor::wait::{Channel, Mask};
+    pub use tx_substrate::wake::WaitSource;
+
+    pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
+        let source = tx_substrate::wake::new_source(source_id);
+        tx_substrate::wake::register_source(Arc::clone(&source));
+        source
+    }
+
+    pub fn unregister_source(source_id: u64) {
+        tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
+    }
 }

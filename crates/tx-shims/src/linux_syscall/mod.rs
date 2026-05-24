@@ -97,7 +97,6 @@ use tx_subsystems::vm::{
     AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking,
     VmEntryFlags, VmMapError, VmMapRequest, VmRemapRequest, FULL_USER_V1_TOP, USER_PAGE_SIZE,
 };
-use tx_subsystems::wait_source;
 
 pub mod numbers;
 
@@ -162,6 +161,8 @@ pub use user_layout::{
 };
 mod helpers;
 pub(super) use helpers::*;
+mod wait;
+pub(super) use wait::*;
 
 #[cfg(test)]
 mod tests;

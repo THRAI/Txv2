@@ -23,7 +23,7 @@ pub mod step_engine {
     };
     pub use tx_substrate::step::{
         ByteProgress, Errno, InterestMask, NoProgress, PageProgress,
-        ProcessIdentity as PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
+        ProcessIdentity as PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome, StepProgress,
         SubjectIdentity, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{

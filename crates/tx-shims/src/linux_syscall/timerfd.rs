@@ -10,7 +10,6 @@ use tx_subsystems::timerfd::{
 };
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
-use tx_subsystems::wait_source;
 
 use super::numbers::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME,
@@ -227,7 +226,6 @@ pub(super) async fn sys_timerfd_read<P: super::TimeIf>(
     }
 
     let nonblocking = file.flags().nonblocking;
-    use tx_subsystems::execution::WaitToken;
     loop {
         let now_ns = P::read_ns();
         let mut staging = [0u8; 8];
@@ -268,11 +266,7 @@ pub(super) async fn sys_timerfd_read<P: super::TimeIf>(
                         continue; // re-poll
                     }
                 }
-                // Fall back to the classic wait-source path.
-                let token = WaitToken::new(carrier.raw(), interests.raw());
-                if let Some(future) = wait_source::wait_on_token(token) {
-                    let _ = future.await;
-                }
+                super::await_wait_source(ctx, carrier, interests).await;
             }
             V3Out::Continue { .. } | V3Out::Yield { .. } => {
                 return SyscallResult::error_from(Errno::EIO);

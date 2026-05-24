@@ -56,7 +56,7 @@ pub fn step_write_for_process(
 }
 
 fn kick_transport(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
-    use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3Out, YieldShape};
+    use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3Out};
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
         Err(err) => return V3Out::Err(err.into()),
@@ -102,41 +102,37 @@ fn kick_transport(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<usiz
                     }
                     V3Out::Done(written.min(chunk.len()))
                 }
-                V3Out::Yield {
-                    progress,
-                    shape:
-                        YieldShape::OnWaitSource {
-                            source: carrier,
-                            interests,
-                        },
-                } => {
-                    let written = progress.bytes();
-                    if written < chunk.len() {
-                        restore_front(tty, &payload, &chunk[written..]);
+                V3Out::Yield { progress, shape } => {
+                    if let Some((carrier, interests)) =
+                        crate::tty::notification::wait_source_parts(&shape)
+                    {
+                        let written = progress.bytes();
+                        if written < chunk.len() {
+                            restore_front(tty, &payload, &chunk[written..]);
+                        } else {
+                            // Defensive: if the driver claimed it advanced
+                            // more than we passed, restore nothing.
+                        }
+                        if written == 0 {
+                            // Pure block: restore the chunk so a later kick
+                            // can try again.
+                            restore_front(tty, &payload, &chunk);
+                            crate::tty::notification::yield_on_wait_source(
+                                ByteProgress::EMPTY,
+                                carrier,
+                                interests,
+                            )
+                        } else {
+                            crate::tty::notification::yield_on_wait_source(
+                                ByteProgress::new(written.min(chunk.len())),
+                                carrier,
+                                interests,
+                            )
+                        }
                     } else {
-                        // Defensive: if the driver claimed it advanced
-                        // more than we passed, restore nothing.
-                    }
-                    if written == 0 {
-                        // Pure block: restore the chunk so a later kick
-                        // can try again.
                         restore_front(tty, &payload, &chunk);
-                        V3Out::yield_on_wait_source(
-                            ByteProgress::EMPTY,
-                            carrier.raw(),
-                            interests.raw(),
-                        )
-                    } else {
-                        V3Out::yield_on_wait_source(
-                            ByteProgress::new(written.min(chunk.len())),
-                            carrier.raw(),
-                            interests.raw(),
-                        )
+                        V3Out::Err(step_engine::Errno::EIO)
                     }
-                }
-                V3Out::Yield { .. } => {
-                    restore_front(tty, &payload, &chunk);
-                    V3Out::Err(step_engine::Errno::EIO)
                 }
                 V3Out::Err(err) => {
                     restore_front(tty, &payload, &chunk);
@@ -148,19 +144,19 @@ fn kick_transport(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<usiz
         Kick::Pty(peer) => match step_ingest(&peer, &chunk, guard) {
             V3Out::Done(_) | V3Out::Continue { .. } => V3Out::Done(chunk.len()),
             V3Out::Err(e) => V3Out::Err(e),
-            V3Out::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
+            V3Out::Yield { shape, .. } => {
+                if let Some((carrier, interests)) =
+                    crate::tty::notification::wait_source_parts(&shape)
+                {
+                    crate::tty::notification::yield_on_wait_source(
+                        ByteProgress::new(chunk.len()),
+                        carrier,
                         interests,
-                    },
-                ..
-            } => V3Out::yield_on_wait_source(
-                ByteProgress::new(chunk.len()),
-                carrier.raw(),
-                interests.raw(),
-            ),
-            V3Out::Yield { .. } => V3Out::Err(step_engine::Errno::EIO),
+                    )
+                } else {
+                    V3Out::Err(step_engine::Errno::EIO)
+                }
+            }
         },
     }
 }
@@ -262,27 +258,24 @@ pub fn step_write(
     });
 
     if consumed == 0 {
-        return StepOutcome::yield_on_wait_source(
-            ByteProgress::EMPTY,
-            tty.raw() as u64,
-            TTY_WRITABLE,
-        );
+        return crate::tty::notification::yield_writable_for_tty(tty.raw() as u64);
     }
 
-    use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3Out, YieldShape};
+    use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3Out};
     match kick_transport(tty, guard) {
         V3Out::Err(err) => V3Out::err(err),
-        V3Out::Yield {
-            shape:
-                YieldShape::OnWaitSource {
-                    source: carrier,
+        V3Out::Yield { shape, .. } => {
+            if let Some((carrier, interests)) = crate::tty::notification::wait_source_parts(&shape)
+            {
+                crate::tty::notification::yield_on_wait_source(
+                    ByteProgress::new(consumed),
+                    carrier,
                     interests,
-                },
-            ..
-        } => {
-            V3Out::yield_on_wait_source(ByteProgress::new(consumed), carrier.raw(), interests.raw())
+                )
+            } else {
+                V3Out::err(step_engine::Errno::EIO)
+            }
         }
-        V3Out::Yield { .. } => V3Out::err(step_engine::Errno::EIO),
         V3Out::Done(_) | V3Out::Continue { .. } => V3Out::done(consumed),
     }
 }

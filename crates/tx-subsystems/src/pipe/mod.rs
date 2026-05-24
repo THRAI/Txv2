@@ -46,29 +46,24 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub mod adapter;
+pub mod notification;
 
 use adapter::step_engine::{
     self, ByteProgress, Cap, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp, StepOutcome,
     SubjectIdentity, Zone, ZoneAllocated, ZoneError,
 };
-use adapter::wait_routing::{self, Channel, WaitSource};
+use adapter::wait_routing::{Channel, WaitSource};
+pub use notification::{PIPE_READABLE, PIPE_WRITABLE};
 
 use crate::execution::{Errno, Guard};
 use crate::vfs::structure::{
     FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking, StructPayload,
     S_IFIFO,
 };
-use crate::wait_source;
-
 /// Linux's `PIPE_BUF` per `man 7 pipe`. Atomic-write boundary; we
 /// reuse the same value as the ring capacity for simplicity (Linux
 /// uses 4096 bytes too on most architectures).
 pub const PIPE_BUF: usize = 4096;
-
-/// Carrier interest mask: bytes are available to read.
-pub const PIPE_READABLE: u64 = 0x1;
-/// Carrier interest mask: space is available to write.
-pub const PIPE_WRITABLE: u64 = 0x2;
 
 /// Reader vs writer end of a pipe. Threads through the synthetic
 /// `RNode` backing each `OpenFile` so `vfs::execution::step_read` /
@@ -226,28 +221,18 @@ impl PipePayload {
     /// `BTreeMap`-backed registry, but the Result surface keeps the
     /// signature aligned with future bounded carrier slabs).
     pub fn new() -> Result<Self, ZoneError> {
-        let reader_wait_channel = Channel::new();
-        let reader_wait_source_id = wait_source::register_wait_channel(reader_wait_channel.clone());
-        let writer_wait_channel = Channel::new();
-        let writer_wait_source_id = wait_source::register_wait_channel(writer_wait_channel.clone());
-
-        // PR-3D-1 (D2/D4 coexistence). Per-side `WaitSource`s share
-        // the legacy registry's id namespace so a v3 caller using the
-        // `WaitSourceId` stamped into `YieldShape::OnWaitSource` lands
-        // on the right side here.
-        let reader_wait_source = wait_routing::new_wait_source(reader_wait_source_id);
-        let writer_wait_source = wait_routing::new_wait_source(writer_wait_source_id);
+        let wait_points = notification::new_wait_points();
 
         Ok(Self {
             ring: SpinMutex::new(RingBuffer::new()),
             reader_count: AtomicU32::new(1),
             writer_count: AtomicU32::new(1),
-            reader_wait_channel,
-            reader_wait_source_id,
-            writer_wait_channel,
-            writer_wait_source_id,
-            reader_wait_source,
-            writer_wait_source,
+            reader_wait_channel: wait_points.reader_channel,
+            reader_wait_source_id: wait_points.reader_source_id,
+            writer_wait_channel: wait_points.writer_channel,
+            writer_wait_source_id: wait_points.writer_source_id,
+            reader_wait_source: wait_points.reader_source,
+            writer_wait_source: wait_points.writer_source,
         })
     }
 
@@ -305,13 +290,7 @@ impl PipePayload {
             return;
         };
         if prev == 1 {
-            // Legacy path (D2 coexistence): wake any `Waker`-based waiter.
-            wait_routing::fire_legacy_channel(&self.writer_wait_channel, PIPE_WRITABLE);
-            // PR-3D-1 new path: post `MailboxEvent::SourceFired` to
-            // any v3 caller that registered against the writer
-            // source. Blocked writers will re-observe and surface
-            // EPIPE on the next step (reader_count == 0).
-            wait_routing::notify_v3_source(&self.writer_wait_source, PIPE_WRITABLE);
+            notification::notify_writable(&self.writer_wait_channel, &self.writer_wait_source);
         }
     }
 
@@ -324,11 +303,7 @@ impl PipePayload {
             return;
         };
         if prev == 1 {
-            // Legacy path (D2 coexistence).
-            wait_routing::fire_legacy_channel(&self.reader_wait_channel, PIPE_READABLE);
-            // PR-3D-1 new path. Blocked readers will re-observe and
-            // surface EOF (Done(0)) on the next step.
-            wait_routing::notify_v3_source(&self.reader_wait_source, PIPE_READABLE);
+            notification::notify_readable(&self.reader_wait_channel, &self.reader_wait_source);
         }
     }
 
@@ -365,13 +340,7 @@ fn decrement_nonzero(counter: &AtomicU32) -> Option<u32> {
 
 impl Drop for PipePayload {
     fn drop(&mut self) {
-        wait_source::release_wait_channel(self.reader_wait_source_id);
-        wait_source::release_wait_channel(self.writer_wait_source_id);
-        // Deregister the v3 WaitSources so the global registry does not
-        // hold stale entries after the pipe is gone (mirrors the legacy
-        // channel cleanup above).
-        wait_routing::unregister_source(self.reader_wait_source_id);
-        wait_routing::unregister_source(self.writer_wait_source_id);
+        notification::release_wait_points(self.reader_wait_source_id, self.writer_wait_source_id);
     }
 }
 
@@ -508,11 +477,7 @@ pub fn step_read(
         drop(ring);
         // ④ commit — drain bytes into caller buffer, release lock
         // ⑤ publish — wake writers parked on space-available
-        // Wake any writer parked on space-available — both paths
-        // (D2 coexistence): legacy `Channel` waker AND the new
-        // `WaitSource` mailbox path.
-        wait_routing::fire_legacy_channel(&payload.writer_wait_channel, PIPE_WRITABLE);
-        wait_routing::notify_v3_source(&payload.writer_wait_source, PIPE_WRITABLE);
+        notification::notify_writable(&payload.writer_wait_channel, &payload.writer_wait_source);
         return step_engine::done_bytes(copied);
     }
     drop(ring);
@@ -524,7 +489,7 @@ pub fn step_read(
         return step_engine::eagain();
     }
     // Yield: wait for readable — publish (N/A) precedes yield, ok per A-14
-    step_engine::yield_until_readable(payload.reader_wait_source_id, PIPE_READABLE)
+    notification::wait_until_readable(payload.reader_wait_source_id)
 }
 
 /// `write(pipe_fd, buf, len)`.
@@ -562,10 +527,7 @@ pub fn step_write(
         drop(ring);
         // ④ commit — fill bytes into ring, release lock
         // ⑤ publish — wake readers parked on bytes-available
-        // Wake any reader parked on bytes-available — both paths
-        // (D2 coexistence).
-        wait_routing::fire_legacy_channel(&payload.reader_wait_channel, PIPE_READABLE);
-        wait_routing::notify_v3_source(&payload.reader_wait_source, PIPE_READABLE);
+        notification::notify_readable(&payload.reader_wait_channel, &payload.reader_wait_source);
         return step_engine::done_bytes(copied);
     }
     drop(ring);
@@ -573,7 +535,7 @@ pub fn step_write(
         return step_engine::eagain();
     }
     // Yield: wait for writable — publish (N/A) precedes yield
-    step_engine::yield_until_writable(payload.writer_wait_source_id, PIPE_WRITABLE)
+    notification::wait_until_writable(payload.writer_wait_source_id)
 }
 
 // ---------------------------------------------------------------------------

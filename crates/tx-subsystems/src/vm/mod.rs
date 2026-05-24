@@ -10,6 +10,7 @@
 pub mod adapter;
 pub mod checks;
 pub mod execution;
+pub mod notification;
 mod pmap;
 pub mod project;
 pub mod scripts;

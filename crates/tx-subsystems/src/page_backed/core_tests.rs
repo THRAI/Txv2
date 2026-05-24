@@ -584,16 +584,14 @@ fn page_container_materialize_page_propagates_file_block() {
     let pc = file_page_container(fs.clone(), fs, FsObjectId::new(77), 4);
 
     match pc.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
-        V3Out::Yield {
-            shape:
-                step_engine::YieldShape::OnWaitSource {
-                    source: carrier,
-                    interests,
-                },
-            ..
-        } => {
-            assert_eq!(carrier.raw(), 9);
-            assert_eq!(interests.raw(), 0x44);
+        V3Out::Yield { shape, .. } => {
+            let Some((carrier, interests)) =
+                crate::page_backed::notification::wait_source_parts(&shape)
+            else {
+                panic!("expected wait-source file fetch, got {shape:?}");
+            };
+            assert_eq!(carrier, 9);
+            assert_eq!(interests, 0x44);
         }
         other => panic!("expected blocked file fetch, got {other:?}"),
     }

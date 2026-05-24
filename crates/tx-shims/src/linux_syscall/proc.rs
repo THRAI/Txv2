@@ -619,13 +619,10 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 // Fall through to the exit_source wait.
             }
             WaitOutcome::Yield {
-                shape: YieldShape::OnWaitSource { source, .. },
+                shape: YieldShape::OnWaitSource { source, interests },
                 ..
             } => {
-                let token = tx_subsystems::execution::WaitToken::new(source.raw(), 1);
-                if let Some(future) = wait_source::wait_on_token(token) {
-                    future.await;
-                }
+                await_wait_source(ctx, source, interests).await;
             }
             WaitOutcome::Err(e) => return SyscallResult::error_from(e.into()),
             _ => {}

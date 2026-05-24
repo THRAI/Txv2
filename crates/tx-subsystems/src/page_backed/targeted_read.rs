@@ -38,7 +38,7 @@ pub fn read_exact_at(
     out: &mut [u8],
     guard: &Guard<'_>,
 ) -> StepOutcome<(), ByteProgress> {
-    use crate::page_backed::adapter::step_engine::{ByteProgress, StepOutcome as V3, YieldShape};
+    use crate::page_backed::adapter::step_engine::{ByteProgress, StepOutcome as V3};
     if out.is_empty() {
         return V3::done(());
     }
@@ -82,21 +82,18 @@ pub fn read_exact_at(
         let materialized = match pc.materialize_page(page_index, MaterializeAccess::Read, guard) {
             V3::Done(m) => m,
             V3::Continue { .. } => return V3::err(Errno::EAGAIN.into()),
-            V3::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
+            V3::Yield { shape, .. } => {
+                if let Some((carrier, interests)) =
+                    crate::page_backed::notification::wait_source_parts(&shape)
+                {
+                    return crate::page_backed::notification::yield_on_wait_source(
+                        ByteProgress::new(advanced),
+                        carrier,
                         interests,
-                    },
-                ..
-            } => {
-                return V3::yield_on_wait_source(
-                    ByteProgress::new(advanced),
-                    carrier.raw(),
-                    interests.raw(),
-                );
+                    );
+                }
+                return V3::err(Errno::EIO.into());
             }
-            V3::Yield { .. } => return V3::err(Errno::EIO.into()),
             V3::Err(errno) => return V3::err(errno),
         };
 

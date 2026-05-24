@@ -762,15 +762,14 @@ impl VmFaultOutcome {
                     pmap_materialization_deferred: self.pmap_materialization_deferred,
                 })
             }
-            step_engine::StepOutcome::Yield {
-                shape:
-                    step_engine::YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                VmFaultMaterializationStep::Blocked(WaitToken::new(carrier.raw(), interests.raw()))
+            step_engine::StepOutcome::Yield { shape, .. } => {
+                if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) {
+                    VmFaultMaterializationStep::Blocked(token)
+                } else {
+                    VmFaultMaterializationStep::Err(VmFaultError::PageCache(
+                        PageCacheError::Backend(crate::execution::Errno::EAGAIN),
+                    ))
+                }
             }
             step_engine::StepOutcome::Err(errno) => VmFaultMaterializationStep::Err(
                 VmFaultError::PageCache(PageCacheError::Backend(errno.into())),
@@ -944,17 +943,13 @@ impl VmFaultOutcome {
                 match pc.materialize_page_for_fault_step(page_index, MaterializeAccess::Read, guard)
                 {
                     step_engine::StepOutcome::Done(page) => page,
-                    step_engine::StepOutcome::Yield {
-                        shape:
-                            step_engine::YieldShape::OnWaitSource {
-                                source: carrier,
-                                interests,
-                            },
-                        ..
-                    } => {
-                        return VmFaultMaterializationStep::Blocked(WaitToken::new(
-                            carrier.raw(),
-                            interests.raw(),
+                    step_engine::StepOutcome::Yield { shape, .. } => {
+                        if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape)
+                        {
+                            return VmFaultMaterializationStep::Blocked(token);
+                        }
+                        return VmFaultMaterializationStep::Err(VmFaultError::PageCache(
+                            PageCacheError::Backend(crate::execution::Errno::EAGAIN),
                         ));
                     }
                     step_engine::StepOutcome::Err(errno) => {
@@ -1011,17 +1006,13 @@ impl VmFaultOutcome {
                     guard,
                 ) {
                     step_engine::StepOutcome::Done(source) => source,
-                    step_engine::StepOutcome::Yield {
-                        shape:
-                            step_engine::YieldShape::OnWaitSource {
-                                source: carrier,
-                                interests,
-                            },
-                        ..
-                    } => {
-                        return VmFaultMaterializationStep::Blocked(WaitToken::new(
-                            carrier.raw(),
-                            interests.raw(),
+                    step_engine::StepOutcome::Yield { shape, .. } => {
+                        if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape)
+                        {
+                            return VmFaultMaterializationStep::Blocked(token);
+                        }
+                        return VmFaultMaterializationStep::Err(VmFaultError::PageCache(
+                            PageCacheError::Backend(crate::execution::Errno::EAGAIN),
                         ));
                     }
                     step_engine::StepOutcome::Err(errno) => {

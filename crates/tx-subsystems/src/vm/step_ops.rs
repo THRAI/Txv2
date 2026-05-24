@@ -15,13 +15,11 @@
 //! reactors and shim layers that drive via `tx_scripts::drive`.
 
 use crate::vm::adapter::step_engine::{
-    self, Errno, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
-    WaitSourceId, YieldShape,
+    self, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
 use crate::vm::{
     AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags,
     VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmRemapOutcome, VmRemapRequest,
-    RANGE_LOCK_RELEASE_MASK,
 };
 
 /// Translate a [`VmMapError`] into a substrate [`Errno`] for
@@ -41,12 +39,7 @@ fn vmmap_error_to_errno(error: VmMapError) -> Errno {
 
 /// Build the canonical RangeLock wait-source Yield for WouldBlock.
 fn range_lock_blocked<O>(aspace: &AddressSpace) -> StepOutcome<O, NoProgress> {
-    let source = WaitSourceId::new(aspace.range_lock().wait_source_id());
-    let interests = InterestMask::new(RANGE_LOCK_RELEASE_MASK);
-    StepOutcome::Yield {
-        progress: NoProgress,
-        shape: YieldShape::OnWaitSource { source, interests },
-    }
+    crate::vm::notification::range_lock_blocked(aspace.range_lock().wait_source_id())
 }
 
 // ---------------------------------------------------------------------------
@@ -70,14 +63,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for VmMapOp<'a> {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         match self.aspace.try_mmap(self.request.clone()) {
             Ok(outcome) => StepOutcome::Done(outcome),
-            Err(VmMapError::WouldBlock) => {
-                let source = WaitSourceId::new(self.aspace.range_lock().wait_source_id());
-                let interests = InterestMask::new(RANGE_LOCK_RELEASE_MASK);
-                StepOutcome::Yield {
-                    progress: NoProgress,
-                    shape: YieldShape::OnWaitSource { source, interests },
-                }
-            }
+            Err(VmMapError::WouldBlock) => range_lock_blocked(self.aspace),
             Err(error) => StepOutcome::Err(vmmap_error_to_errno(error)),
         }
     }

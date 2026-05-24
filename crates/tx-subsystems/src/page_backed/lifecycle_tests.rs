@@ -815,6 +815,9 @@ fn fsopsv3_default_read_link_returns_enosys() {
     // Wave-8 design choice: defaults match `FsOps` exactly. `LifecycleFs`
     // does not override `read_link`, so the default `ENOSYS` answer
     // must round-trip through the v3 outcome shape.
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
     setup_host_substrate();
     let guard = step_engine::guard();
     let fs = LifecycleFs::new();

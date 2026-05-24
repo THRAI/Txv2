@@ -33,7 +33,7 @@ pub fn step_read(
     // reserve
     // commit
     // publish
-    use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3};
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     if out.is_empty() {
         return V3::Done(0);
@@ -91,12 +91,12 @@ pub fn step_read(
     // bytes arrive. Threshold / VMIN logic comes from main's
     // 2026-05-06 tty work.
     if threshold_unmet {
-        V3::yield_on_wait_source(ByteProgress::EMPTY, tty.wait_source_id(), TTY_READABLE)
+        crate::tty::notification::yield_readable_for_tty(tty.wait_source_id())
     } else if copied == 0 {
         if matches!(vmin_policy, Some(0)) {
             V3::Done(0)
         } else {
-            V3::yield_on_wait_source(ByteProgress::EMPTY, tty.wait_source_id(), TTY_READABLE)
+            crate::tty::notification::yield_readable_for_tty(tty.wait_source_id())
         }
     } else {
         V3::Done(copied)

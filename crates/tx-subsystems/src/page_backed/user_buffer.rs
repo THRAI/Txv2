@@ -158,7 +158,6 @@ fn step_range_with_user_buffer(
         //   if no progress yet, else partial `Done`.
         // - `Err(errno)` with `advanced == 0` → v3 `Err(errno)`.
         //   Otherwise return v3 `Done(advanced)` (partial-success).
-        use crate::page_backed::adapter::step_engine::YieldShape;
         match pc.materialize_page(page_index, access, guard) {
             StepOutcome::Done(materialized) => {
                 match copy_chunk_user(
@@ -183,14 +182,14 @@ fn step_range_with_user_buffer(
                     }
                     UserChunkOutcome::Blocked { source, interests } => {
                         if advanced == 0 {
-                            return V3::yield_on_wait_source(
+                            return crate::page_backed::notification::yield_on_wait_source(
                                 ByteProgress::EMPTY,
                                 source,
                                 interests,
                             );
                         }
                         of.set_offset(offset);
-                        return V3::yield_on_wait_source(
+                        return crate::page_backed::notification::yield_on_wait_source(
                             ByteProgress::new(advanced),
                             source,
                             interests,
@@ -208,34 +207,29 @@ fn step_range_with_user_buffer(
                 of.set_offset(offset);
                 return V3::done(advanced);
             }
-            StepOutcome::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
+            StepOutcome::Yield { shape, .. } => {
+                let Some((carrier, interests)) =
+                    crate::page_backed::notification::wait_source_parts(&shape)
+                else {
+                    if advanced == 0 {
+                        return V3::err(step_engine::Errno::EIO);
+                    }
+                    of.set_offset(offset);
+                    return V3::done(advanced);
+                };
                 if advanced == 0 {
-                    return V3::yield_on_wait_source(
+                    return crate::page_backed::notification::yield_on_wait_source(
                         ByteProgress::EMPTY,
-                        carrier.raw(),
-                        interests.raw(),
+                        carrier,
+                        interests,
                     );
                 }
                 of.set_offset(offset);
-                return V3::yield_on_wait_source(
+                return crate::page_backed::notification::yield_on_wait_source(
                     ByteProgress::new(advanced),
-                    carrier.raw(),
-                    interests.raw(),
+                    carrier,
+                    interests,
                 );
-            }
-            StepOutcome::Yield { .. } => {
-                if advanced == 0 {
-                    return V3::err(step_engine::Errno::EIO);
-                }
-                of.set_offset(offset);
-                return V3::done(advanced);
             }
             StepOutcome::Err(errno) => {
                 if advanced == 0 {
@@ -283,17 +277,15 @@ fn copy_chunk_user(
                 V3::Done(n) if n == chunk => UserChunkOutcome::Copied,
                 V3::Done(_) | V3::Continue { .. } => UserChunkOutcome::Fault(Errno::EFAULT),
                 V3::Err(e) => UserChunkOutcome::Fault(Errno::from(e)),
-                V3::Yield {
-                    shape: step_engine::YieldShape::OnWaitSource { source, interests },
-                    ..
-                } => UserChunkOutcome::Blocked {
-                    source: source.raw(),
-                    interests: interests.raw(),
-                },
-                // OnAgent / OnTimer / other yield shapes: user-space
-                // page materialisation doesn't produce these; treat as
-                // fatal.
-                V3::Yield { .. } => UserChunkOutcome::Fault(Errno::EFAULT),
+                V3::Yield { shape, .. } => {
+                    if let Some((source, interests)) =
+                        crate::page_backed::notification::wait_source_parts(&shape)
+                    {
+                        UserChunkOutcome::Blocked { source, interests }
+                    } else {
+                        UserChunkOutcome::Fault(Errno::EFAULT)
+                    }
+                }
             }
         }
         UserBuffer::Write { src } => {
@@ -309,14 +301,15 @@ fn copy_chunk_user(
                 V3::Done(n) if n == chunk => UserChunkOutcome::Copied,
                 V3::Done(_) | V3::Continue { .. } => UserChunkOutcome::Fault(Errno::EFAULT),
                 V3::Err(e) => UserChunkOutcome::Fault(Errno::from(e)),
-                V3::Yield {
-                    shape: step_engine::YieldShape::OnWaitSource { source, interests },
-                    ..
-                } => UserChunkOutcome::Blocked {
-                    source: source.raw(),
-                    interests: interests.raw(),
-                },
-                V3::Yield { .. } => UserChunkOutcome::Fault(Errno::EFAULT),
+                V3::Yield { shape, .. } => {
+                    if let Some((source, interests)) =
+                        crate::page_backed::notification::wait_source_parts(&shape)
+                    {
+                        UserChunkOutcome::Blocked { source, interests }
+                    } else {
+                        UserChunkOutcome::Fault(Errno::EFAULT)
+                    }
+                }
             }
         }
     }
@@ -444,7 +437,7 @@ fn step_range_with_kernel_buffer(
     mut buffer: KernelBuffer<'_>,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-    use crate::page_backed::adapter::step_engine::{ByteProgress, StepOutcome as V3, YieldShape};
+    use crate::page_backed::adapter::step_engine::{ByteProgress, StepOutcome as V3};
     let mut advanced = 0usize;
     let mut offset = of.offset();
     while advanced < len {
@@ -480,34 +473,29 @@ fn step_range_with_kernel_buffer(
                 of.set_offset(offset);
                 return V3::done(advanced);
             }
-            V3::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
+            V3::Yield { shape, .. } => {
+                let Some((carrier, interests)) =
+                    crate::page_backed::notification::wait_source_parts(&shape)
+                else {
+                    if advanced == 0 {
+                        return V3::err(step_engine::Errno::EIO);
+                    }
+                    of.set_offset(offset);
+                    return V3::done(advanced);
+                };
                 if advanced == 0 {
-                    return V3::yield_on_wait_source(
+                    return crate::page_backed::notification::yield_on_wait_source(
                         ByteProgress::EMPTY,
-                        carrier.raw(),
-                        interests.raw(),
+                        carrier,
+                        interests,
                     );
                 }
                 of.set_offset(offset);
-                return V3::yield_on_wait_source(
+                return crate::page_backed::notification::yield_on_wait_source(
                     ByteProgress::new(advanced),
-                    carrier.raw(),
-                    interests.raw(),
+                    carrier,
+                    interests,
                 );
-            }
-            V3::Yield { .. } => {
-                if advanced == 0 {
-                    return V3::err(step_engine::Errno::EIO);
-                }
-                of.set_offset(offset);
-                return V3::done(advanced);
             }
             V3::Err(errno) => {
                 if advanced == 0 {

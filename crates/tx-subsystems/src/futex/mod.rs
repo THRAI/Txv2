@@ -59,16 +59,16 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 pub mod adapter;
+pub mod notification;
 
 use adapter::step_engine::{
-    self, Errno, InterestMask, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp,
-    StepOutcome, SubjectIdentity, ZoneError,
+    self, Errno, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp, StepOutcome,
+    SubjectIdentity, ZoneError,
 };
-use adapter::wait_routing::{self, Channel, WaitSource};
+use adapter::wait_routing::{Channel, WaitSource};
 
 use crate::execution::Guard;
 use crate::vm::AddressSpace;
-use crate::wait_source;
 use tx_hal::UserPtr;
 
 /// Number of futex hash buckets. Fixed; no dynamic allocation.
@@ -146,13 +146,11 @@ fn key_for(aspace: &AddressSpace, uaddr: u64) -> FutexKey {
 }
 
 fn new_entry() -> FutexEntry {
-    let channel = Channel::new();
-    let source_id = wait_source::register_wait_channel(channel.clone());
-    let wait_source = wait_routing::new_wait_source(source_id);
+    let wait_point = notification::new_wait_point();
     FutexEntry {
-        channel,
-        source_id,
-        wait_source,
+        channel: wait_point.channel,
+        source_id: wait_point.source_id,
+        wait_source: wait_point.wait_source,
         waiters: 0,
         interest_mask: 0,
     }
@@ -194,17 +192,11 @@ pub(crate) fn register_zones() -> Result<(), ZoneError> {
         return Ok(());
     }
     let buckets: [FutexBucket; FUTEX_BUCKET_COUNT] = core::array::from_fn(|_| {
-        let channel = Channel::new();
-        let source_id = wait_source::register_wait_channel(channel.clone());
-        // PR-3D-2 (D2/D4 coexistence). Per-bucket `WaitSource` shares
-        // the legacy registry's id namespace so a v3 caller using the
-        // `WaitSourceId` stamped into `YieldShape::OnWaitSource` lands
-        // on the right bucket here.
-        let wait_source = wait_routing::new_wait_source(source_id);
+        let wait_point = notification::new_wait_point();
         FutexBucket {
-            channel,
-            source_id,
-            wait_source,
+            channel: wait_point.channel,
+            source_id: wait_point.source_id,
+            wait_source: wait_point.wait_source,
         }
     });
     *guard = Some(buckets);
@@ -378,8 +370,7 @@ pub fn step_futex_wake_masked_in(
             fired_mask,
         )
     };
-    wait_routing::fire_legacy_channel(&exact_channel, fired_mask);
-    wait_routing::notify_v3_source(&exact_wait_source, fired_mask);
+    notification::notify_exact(&exact_channel, &exact_wait_source, fired_mask);
     {
         let mut table_guard = EXACT_WAITERS.lock();
         if let Some(table) = table_guard.as_mut() {
@@ -527,20 +518,17 @@ pub fn step_futex_wake(uaddr: u64, n: u32, _guard: &Guard<'_>) -> StepOutcome<u3
     // source's subscriber-list lock) runs **outside** the BUCKETS
     // lock — keeps the lock-ordering simple if a future subscriber
     // callback ever needs to call back into futex.
-    let wait_source = {
+    let (channel, wait_source) = {
         let guard = BUCKETS.lock();
         let buckets = guard
             .as_ref()
             .expect("futex buckets uninitialised — register_zones not called");
-        // Legacy path (D2 coexistence): wake any `Waker`-based waiter.
-        wait_routing::fire_legacy_channel(&buckets[idx].channel, FUTEX_WAKE_MASK);
-        buckets[idx].wait_source.clone()
+        (
+            buckets[idx].channel.clone(),
+            buckets[idx].wait_source.clone(),
+        )
     };
-    // PR-3D-2 new path: post `MailboxEvent::SourceFired` to any v3
-    // caller that registered a `TaskMailbox` against this bucket's
-    // source. Per the v1 bucket model this remains best-effort and
-    // reports the requested wake count.
-    let posted = wait_source.notify(InterestMask::new(FUTEX_WAKE_MASK)) as u32;
+    let posted = notification::notify_bucket(&channel, &wait_source, FUTEX_WAKE_MASK);
     StepOutcome::Done(posted.min(n))
 }
 
@@ -768,6 +756,7 @@ mod tests {
     };
     use super::*;
     use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::wait_source;
     use crate::zones;
     use alloc::sync::Arc;
     use tx_substrate::wake::{TaskMailbox, WaitGeneration};

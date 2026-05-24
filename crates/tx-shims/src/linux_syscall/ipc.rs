@@ -6,15 +6,15 @@ use super::{
     EINVAL_VALUE, ENAMETOOLONG_VALUE, ENOENT_VALUE, ENOMEM_VALUE, ENOSYS_VALUE, O_ACCMODE,
     O_CLOEXEC, O_CREAT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
 };
+use crate::adapter::step_engine::{InterestMask, WaitSourceId};
 use alloc::vec::Vec;
-use tx_subsystems::execution::{Errno, WaitToken};
+use tx_subsystems::execution::Errno;
 use tx_subsystems::ipc;
 use tx_subsystems::ipc::posix_mq::structure::MqNotification;
 use tx_subsystems::ipc::sysv_sem::structure::SemBuf;
 use tx_subsystems::signal::Signum;
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
-use tx_subsystems::wait_source;
 
 use super::time::TimespecLayout;
 
@@ -244,7 +244,11 @@ fn validate_abs_timeout(ctx: &SyscallCtx<'_>, timeout_ptr: u64) -> Result<(), Sy
     Ok(())
 }
 
-async fn wait_for_mq_readiness(mq: &ipc::posix_mq::structure::PosixMqInstance, write: bool) {
+async fn wait_for_mq_readiness(
+    ctx: &SyscallCtx<'_>,
+    mq: &ipc::posix_mq::structure::PosixMqInstance,
+    write: bool,
+) {
     let Ok(info) = ipc::posix_mq::execution::step_mq_poll_info(mq) else {
         return;
     };
@@ -253,10 +257,7 @@ async fn wait_for_mq_readiness(mq: &ipc::posix_mq::structure::PosixMqInstance, w
     } else {
         info.read_source_id
     };
-    let token = WaitToken::new(source_id, 1);
-    if let Some(future) = wait_source::wait_on_token(token) {
-        let _ = future.await;
-    }
+    super::await_wait_source(ctx, WaitSourceId::new(source_id), InterestMask::new(1)).await;
 }
 
 fn mq_file(
@@ -825,7 +826,7 @@ pub(super) async fn sys_mq_timedsend(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Sy
         match ipc::posix_mq::execution::step_mq_send(mq, &msg, args[3] as u32, &cred) {
             Ok(()) => return SyscallResult::Return(0),
             Err(Errno::EAGAIN) if args[4] == 0 && !file.flags().nonblocking => {
-                wait_for_mq_readiness(mq, true).await;
+                wait_for_mq_readiness(ctx, mq, true).await;
             }
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         }
@@ -873,7 +874,7 @@ pub(super) async fn sys_mq_timedreceive(args: [u64; 6], ctx: &SyscallCtx<'_>) ->
                 return SyscallResult::Return(msg.len() as i64);
             }
             Err(Errno::EAGAIN) if args[4] == 0 && !file.flags().nonblocking => {
-                wait_for_mq_readiness(mq, false).await;
+                wait_for_mq_readiness(ctx, mq, false).await;
             }
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         }

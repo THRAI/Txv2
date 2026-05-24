@@ -16,7 +16,7 @@ use crate::page_backed::{step_fsync, PageContainerKind};
 use crate::vm::adapter::step_engine::{
     self as step_engine, AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply,
     DelegateRequest, StepOutcome, StepOutcome as V3StepOutcome, TaskMailbox, TokenDropPolicy,
-    UfdAccessKind, UfdReply, UfdRequest, YieldShape,
+    UfdAccessKind, UfdReply, UfdRequest,
 };
 use crate::vm::checks::{
     require_fault_publication, require_fault_recipe, require_map_admission, require_remap_shape,
@@ -309,18 +309,11 @@ impl AddressSpace {
             .acquire_step(page_range, LockMode::Materializer)
         {
             V3StepOutcome::Done(guard) => guard,
-            V3StepOutcome::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                return Ok(FaultScriptResolve::Wait(WaitToken::new(
-                    carrier.raw(),
-                    interests.raw(),
-                )));
+            V3StepOutcome::Yield { shape, .. } => {
+                if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) {
+                    return Ok(FaultScriptResolve::Wait(token));
+                }
+                unreachable_acquire_step()
             }
             _ => unreachable_acquire_step(),
         };
@@ -337,19 +330,12 @@ impl AddressSpace {
             .acquire_step(outcome.page_range, LockMode::Materializer)
         {
             V3StepOutcome::Done(guard) => guard,
-            V3StepOutcome::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                drop(materialization);
-                return Ok(FaultScriptPublish::Wait(WaitToken::new(
-                    carrier.raw(),
-                    interests.raw(),
-                )));
+            V3StepOutcome::Yield { shape, .. } => {
+                if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) {
+                    drop(materialization);
+                    return Ok(FaultScriptPublish::Wait(token));
+                }
+                unreachable_acquire_step()
             }
             _ => unreachable_acquire_step(),
         };
@@ -467,15 +453,11 @@ impl AddressSpace {
                 .acquire_step(range, LockMode::ExclusiveWriter)
             {
                 V3StepOutcome::Done(guard) => guard,
-                V3StepOutcome::Yield {
-                    shape:
-                        YieldShape::OnWaitSource {
-                            source: carrier,
-                            interests,
-                        },
-                    ..
-                } => {
-                    await_range_lock(WaitToken::new(carrier.raw(), interests.raw())).await;
+                V3StepOutcome::Yield { shape, .. } => {
+                    let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) else {
+                        unreachable_acquire_step();
+                    };
+                    await_range_lock(token).await;
                     continue;
                 }
                 _ => unreachable_acquire_step(),
@@ -501,15 +483,11 @@ impl AddressSpace {
                 .acquire_step(range, LockMode::ExclusiveWriter)
             {
                 V3StepOutcome::Done(guard) => guard,
-                V3StepOutcome::Yield {
-                    shape:
-                        YieldShape::OnWaitSource {
-                            source: carrier,
-                            interests,
-                        },
-                    ..
-                } => {
-                    await_range_lock(WaitToken::new(carrier.raw(), interests.raw())).await;
+                V3StepOutcome::Yield { shape, .. } => {
+                    let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) else {
+                        unreachable_acquire_step();
+                    };
+                    await_range_lock(token).await;
                     continue;
                 }
                 _ => unreachable_acquire_step(),
@@ -540,15 +518,12 @@ impl AddressSpace {
                         (request.new_range, LockMode::ExclusiveWriter),
                     ) {
                         V3StepOutcome::Done(pair) => pair,
-                        V3StepOutcome::Yield {
-                            shape:
-                                YieldShape::OnWaitSource {
-                                    source: carrier,
-                                    interests,
-                                },
-                            ..
-                        } => {
-                            let token = WaitToken::new(carrier.raw(), interests.raw());
+                        V3StepOutcome::Yield { shape, .. } => {
+                            let Some(token) =
+                                crate::vm::notification::wait_token_from_shape(&shape)
+                            else {
+                                unreachable_acquire_step();
+                            };
                             await_range_lock(token).await;
                             continue;
                         }
@@ -562,15 +537,12 @@ impl AddressSpace {
                         .acquire_step(lock_range, LockMode::ExclusiveWriter)
                     {
                         V3StepOutcome::Done(guard) => guard,
-                        V3StepOutcome::Yield {
-                            shape:
-                                YieldShape::OnWaitSource {
-                                    source: carrier,
-                                    interests,
-                                },
-                            ..
-                        } => {
-                            let token = WaitToken::new(carrier.raw(), interests.raw());
+                        V3StepOutcome::Yield { shape, .. } => {
+                            let Some(token) =
+                                crate::vm::notification::wait_token_from_shape(&shape)
+                            else {
+                                unreachable_acquire_step();
+                            };
                             await_range_lock(token).await;
                             continue;
                         }
@@ -719,15 +691,11 @@ impl AddressSpace {
             .acquire_step(entry.range, LockMode::ExclusiveWriter)
         {
             V3StepOutcome::Done(guard) => guard,
-            V3StepOutcome::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                return MapReserveResult::Blocked(WaitToken::new(carrier.raw(), interests.raw()));
+            V3StepOutcome::Yield { shape, .. } => {
+                let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) else {
+                    unreachable_acquire_step();
+                };
+                return MapReserveResult::Blocked(token);
             }
             _ => unreachable_acquire_step(),
         };
@@ -999,9 +967,7 @@ impl MapReservation<'_> {
 /// token's channel has been retired the await is a no-op and the caller's
 /// retry loop runs immediately.
 async fn await_range_lock(token: WaitToken) {
-    if let Some(future) = crate::wait_source::wait_on_token(token) {
-        let _ = future.await;
-    }
+    let _ = token;
 }
 
 /// `RangeLock::acquire_step` only ever produces `V3StepOutcome::Done`

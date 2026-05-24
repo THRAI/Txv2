@@ -23,6 +23,7 @@ pub mod adapter;
 pub mod checks;
 pub mod execution;
 pub mod ldisc;
+pub mod notification;
 pub mod project;
 pub mod structure;
 
