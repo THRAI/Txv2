@@ -1,3 +1,25 @@
+- 2026-05-24 **Rebased `feature-network` onto `main` `05028405` and cleaned
+  the post-rebase build fallout.** The rebase preserved the benchmark-daemon
+  fixes for immediate child reactor submission and compat-frame
+  `rt_sigreturn`, then removed three accidental conflict leftovers: duplicate
+  procfs `step_write_projected`, a stale simplified `pselect6`, and an old
+  `ITIMER_REAL_REGISTRY` snapshot helper. Procfs projected writes now keep both
+  network controls and main's `/proc/sys/fs/*` writable stubs. **Verified:**
+  `cargo fmt --check`; `cargo test -p tx-kernel
+  reactor_submission_seam_submits_child_thread_smoke -- --test-threads=1`;
+  `cargo test -p tx-kernel sigreturn -- --test-threads=1`; `cargo test -p
+  tx-shims itimer_real_sigalrm -- --test-threads=1`; `cargo test -p tx-shims
+  socket_fdtable -- --test-threads=1`; `cargo test -p tx-subsystems
+  net::tests::loopback_tests -- --test-threads=1`; `cargo build -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`; `cargo
+  xtask oscomp submit --target rv64-qemu`; focused OSComp `iperf-musl 6/6`,
+  `iperf-glibc 6/6`, `netperf-musl 5/5`, `netperf-glibc 5/5` using 30s then
+  60s bounded qemu windows as needed. **Next step:** run focused
+  lmbench/libctest suites on the rebased branch before pushing, or push now if
+  only netperf/iperf preservation is the gate. **Blocker:** none found in
+  host/kernel build validation or focused netperf/iperf; `msp/` remains
+  untracked and intentionally excluded.
+
 - 2026-05-24 **Fixed post-merge procfs readdir cursor regression that hung
   BusyBox `ps`.** After merging LTP procfs inode layout with main's
   `/proc/sysvipc`/fdinfo changes, `/proc` root readdir could be misclassified

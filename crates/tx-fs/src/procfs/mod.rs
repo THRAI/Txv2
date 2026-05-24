@@ -1163,6 +1163,16 @@ impl FsOps for Procfs {
             };
         }
 
+        if matches!(
+            fs_object_id,
+            PROCFS_SYS_FS_PIPE_MAX_SIZE_ID
+                | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID
+                | PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID
+                | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID
+        ) {
+            return StepOutcome::done(bytes.len() as u64);
+        }
+
         if fs_object_id != PROCFS_SYS_NET_IPV4_IP_FORWARD_ID {
             return StepOutcome::err(Errno::EROFS.into());
         }
@@ -1183,21 +1193,6 @@ impl FsOps for Procfs {
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         StepOutcome::err(Errno::EROFS.into())
-    }
-    fn step_write_projected(
-        &self,
-        fs_object_id: FsObjectId,
-        _offset: u64,
-        bytes: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<u64, NoProgress> {
-        match fs_object_id {
-            PROCFS_SYS_FS_PIPE_MAX_SIZE_ID
-            | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID
-            | PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID
-            | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID => StepOutcome::done(bytes.len() as u64),
-            _ => StepOutcome::err(Errno::EROFS.into()),
-        }
     }
     fn step_chown(
         &self,
