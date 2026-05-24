@@ -1296,7 +1296,7 @@ impl Phase1Scheduler {
                 }
                 StopReason::PreemptedExternal => {
                     meta.owner = TaskRunOwner::Parked;
-                    requeue = Some((Phase1QueueKind::Preempted, true));
+                    requeue = Some((Phase1QueueKind::Preempted, false));
                 }
                 StopReason::Blocked => {
                     meta.owner = TaskRunOwner::Parked;
