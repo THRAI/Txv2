@@ -1209,7 +1209,9 @@ impl Phase1Scheduler {
         } else {
             match meta.class {
                 SchedClass::Fair => {
-                    if meta.remaining_budget_ns > 0 {
+                    if meta.userspace_thread {
+                        (Phase1QueueKind::New, false)
+                    } else if meta.remaining_budget_ns > 0 {
                         (Phase1QueueKind::Preempted, true)
                     } else {
                         (Phase1QueueKind::New, false)

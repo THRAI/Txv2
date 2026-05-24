@@ -274,7 +274,9 @@ pub(super) fn bootstrap_copy_from_user(
 
         let guard = step_engine::guard();
         match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Done(n) if n == dst.len() => Ok(()),
+            V3::Done(_) => Err(Errno::EFAULT),
+            V3::Continue { .. } => Err(Errno::EIO),
             V3::Err(e) => Err(Errno::from(e)),
             V3::Yield { .. } => Err(Errno::EIO),
         }
@@ -311,7 +313,9 @@ pub(super) fn bootstrap_copy_from_user(
 
         let guard = step_engine::guard();
         match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Done(n) if n == dst.len() => Ok(()),
+            V3::Done(_) => Err(Errno::EFAULT),
+            V3::Continue { .. } => Err(Errno::EIO),
             V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
                 drop(guard);
                 let limit = if cfg!(any(test, feature = "test-support")) {
@@ -358,7 +362,9 @@ pub(super) fn bootstrap_copy_to_user(
 
         let guard = step_engine::guard();
         match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Done(n) if n == src.len() => Ok(()),
+            V3::Done(_) => Err(Errno::EFAULT),
+            V3::Continue { .. } => Err(Errno::EIO),
             V3::Err(e) => Err(Errno::from(e)),
             V3::Yield { .. } => Err(Errno::EIO),
         }
@@ -395,7 +401,9 @@ pub(super) fn bootstrap_copy_to_user(
 
         let guard = step_engine::guard();
         match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Done(n) if n == src.len() => Ok(()),
+            V3::Done(_) => Err(Errno::EFAULT),
+            V3::Continue { .. } => Err(Errno::EIO),
             V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
                 drop(guard);
                 let limit = if cfg!(any(test, feature = "test-support")) {

@@ -100,7 +100,9 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::UnixDatagram(
-            UnixDatagramState::Bound { .. } | UnixDatagramState::Connected { .. },
+            UnixDatagramState::Bound { .. }
+            | UnixDatagramState::Connected { .. }
+            | UnixDatagramState::ConnectedPair { .. },
         ) => {
             let io = payload.io_snapshot();
             if io.recv_len > 0
@@ -181,7 +183,9 @@ pub fn step_poll_wait_token(
         }
         SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. })
         | SocketProtocol::UnixDatagram(
-            UnixDatagramState::Bound { .. } | UnixDatagramState::Connected { .. },
+            UnixDatagramState::Bound { .. }
+            | UnixDatagramState::Connected { .. }
+            | UnixDatagramState::ConnectedPair { .. },
         )
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)
@@ -195,7 +199,9 @@ pub fn step_poll_wait_token(
         | SocketProtocol::UnixStream(UnixStreamState::Connected { .. })
         | SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. })
         | SocketProtocol::UnixDatagram(
-            UnixDatagramState::Bound { .. } | UnixDatagramState::Connected { .. },
+            UnixDatagramState::Bound { .. }
+            | UnixDatagramState::Connected { .. }
+            | UnixDatagramState::ConnectedPair { .. },
         )
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)

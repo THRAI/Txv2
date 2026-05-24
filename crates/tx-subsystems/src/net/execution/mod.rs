@@ -20,6 +20,7 @@ mod step_shutdown;
 mod step_socket_close;
 mod step_socket_create;
 mod step_socket_open_file;
+mod step_socketpair;
 mod step_tcp_backlog_cleanup;
 mod step_tcp_backlog_poll;
 mod step_tcp_cleanup;
@@ -67,6 +68,7 @@ pub use step_socket_open_file::{
     socket_open_file_from_identity, step_socket_open_file, step_socket_open_file_in_namespace,
     SocketOpenFileOutput,
 };
+pub use step_socketpair::step_unix_socketpair_connect;
 pub use step_tcp_backlog_cleanup::{
     step_tcp_backlog_cleanup, TcpBacklogCleanupOutcome, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
 };

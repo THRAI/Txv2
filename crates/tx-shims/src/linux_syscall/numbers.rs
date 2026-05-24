@@ -334,6 +334,7 @@ pub const SO_OOBINLINE: i32 = 10;
 pub const SO_BROADCAST: i32 = 6;
 pub const SO_LINGER: i32 = 13;
 pub const SO_REUSEPORT: i32 = 15;
+pub const SO_PEERCRED: i32 = 17;
 pub const SO_SNDBUF: i32 = 7;
 pub const SO_RCVBUF: i32 = 8;
 pub const SO_RCVTIMEO: i32 = 20;

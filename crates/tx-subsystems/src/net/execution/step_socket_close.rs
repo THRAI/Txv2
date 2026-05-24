@@ -82,6 +82,15 @@ pub fn step_socket_close(
                 bindings_withdrawn += withdraw_ok(table.withdraw_unix_bound(local));
             }
         }
+        SocketProtocol::UnixDatagram(UnixDatagramState::ConnectedPair { peer_raw }) => {
+            if let Some(peer) = table.lookup_unix_peer(socket.raw(), guard) {
+                mark_unix_peer_broken(&peer);
+                bindings_withdrawn += withdraw_ok(table.withdraw_unix_peer(peer.raw()));
+            } else if peer_raw != 0 {
+                bindings_withdrawn += withdraw_ok(table.withdraw_unix_peer(peer_raw));
+            }
+            bindings_withdrawn += withdraw_ok(table.withdraw_unix_peer(socket.raw()));
+        }
         SocketProtocol::UnixDatagram(UnixDatagramState::Unbound) => {}
         SocketProtocol::UnixStream(UnixStreamState::Bound { local })
         | SocketProtocol::UnixStream(UnixStreamState::Listening { local, .. }) => {

@@ -1,6 +1,34 @@
 use super::*;
 
 #[test]
+fn dispatch_bind_privileged_port_requires_root_euid() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let process = bootstrap();
+    set_cred_ids_for_test(&process, 65_534, 65_534, 65_534, 65_534, 65_534, 65_534);
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process, thread);
+    let fd = socket_stream(&ctx, SOCK_STREAM);
+    let low_port = sockaddr_in([0, 0, 0, 0], 463);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                fd as u64,
+                low_port.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(EACCES_VALUE)
+    );
+}
+
+#[test]
 fn dispatch_recvfrom_large_user_buffer_returns_short_read() {
     let _setup = socket_setup();
     loopback_iface().clear_for_test_or_bootstrap();

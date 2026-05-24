@@ -189,6 +189,14 @@ impl SocketTable {
         socket_raw: u32,
         peer: Cap<SocketIdentity>,
     ) -> Result<(), IndexError> {
+        self.insert_unix_peer(socket_raw, peer)
+    }
+
+    pub fn insert_unix_peer(
+        &self,
+        socket_raw: u32,
+        peer: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
         self.unix_stream_peers
             .reserve(UnixStreamPeerKey { socket_raw })?
             .commit(peer);
@@ -262,6 +270,13 @@ impl SocketTable {
     }
 
     pub fn withdraw_unix_stream_peer(
+        &self,
+        socket_raw: u32,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        self.withdraw_unix_peer(socket_raw)
+    }
+
+    pub fn withdraw_unix_peer(
         &self,
         socket_raw: u32,
     ) -> Result<Cap<SocketIdentity>, MutationError> {
@@ -359,6 +374,14 @@ impl SocketTable {
     }
 
     pub fn lookup_unix_stream_peer(
+        &self,
+        socket_raw: u32,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.lookup_unix_peer(socket_raw, guard)
+    }
+
+    pub fn lookup_unix_peer(
         &self,
         socket_raw: u32,
         guard: &Guard<'_>,

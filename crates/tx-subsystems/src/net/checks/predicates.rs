@@ -124,7 +124,8 @@ pub(crate) fn socket_can_listen(socket: &SocketIdentity) -> Result<IpEndpoint, E
                 SocketKind::UnixDatagram,
                 SocketProtocol::UnixDatagram(UnixDatagramState::Unbound)
                 | SocketProtocol::UnixDatagram(UnixDatagramState::Bound { .. })
-                | SocketProtocol::UnixDatagram(UnixDatagramState::Connected { .. }),
+                | SocketProtocol::UnixDatagram(UnixDatagramState::Connected { .. })
+                | SocketProtocol::UnixDatagram(UnixDatagramState::ConnectedPair { .. }),
             ) => Err(Errno::EOPNOTSUPP),
             (SocketKind::Udp, SocketProtocol::Udp(_)) => Err(Errno::EOPNOTSUPP),
             (SocketKind::RawIcmp, SocketProtocol::RawIcmp(_)) => Err(Errno::EOPNOTSUPP),
@@ -147,7 +148,8 @@ pub(crate) fn socket_can_connect(
                 SocketProtocol::UnixDatagram(
                     UnixDatagramState::Unbound
                     | UnixDatagramState::Bound { .. }
-                    | UnixDatagramState::Connected { .. },
+                    | UnixDatagramState::Connected { .. }
+                    | UnixDatagramState::ConnectedPair { .. },
                 ),
             )
             | (
@@ -207,7 +209,8 @@ pub(crate) fn socket_can_accept(socket: &SocketIdentity) -> Result<(), Errno> {
                 SocketKind::UnixDatagram,
                 SocketProtocol::UnixDatagram(UnixDatagramState::Unbound)
                 | SocketProtocol::UnixDatagram(UnixDatagramState::Bound { .. })
-                | SocketProtocol::UnixDatagram(UnixDatagramState::Connected { .. }),
+                | SocketProtocol::UnixDatagram(UnixDatagramState::Connected { .. })
+                | SocketProtocol::UnixDatagram(UnixDatagramState::ConnectedPair { .. }),
             ) => Err(Errno::EOPNOTSUPP),
             (SocketKind::Udp, SocketProtocol::Udp(_)) => Err(Errno::EOPNOTSUPP),
             (SocketKind::RawIcmp, SocketProtocol::RawIcmp(_)) => Err(Errno::EOPNOTSUPP),

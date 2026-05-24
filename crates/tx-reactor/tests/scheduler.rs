@@ -294,6 +294,49 @@ fn blocked_task_preserves_remaining_budget_until_wake() {
 }
 
 #[test]
+fn blocked_userspace_thread_wakes_through_new_queue_even_with_remaining_budget() {
+    let mut scheduler = Phase1Scheduler::new();
+    let task = TaskId(72);
+    scheduler.task_submitted(
+        task,
+        TaskHandle::new(task),
+        InitialSchedMeta::fair().userspace_thread(),
+    );
+    let preempted = TaskId(73);
+    scheduler.task_submitted(
+        preempted,
+        TaskHandle::new(preempted),
+        InitialSchedMeta::fair().preempted_on_submit(),
+    );
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(task)
+    );
+    scheduler.task_stopped(task, StopReason::Blocked, 100_000, HartId(0));
+    assert_eq!(
+        scheduler.remaining_budget_ns(task),
+        Some(Phase1Scheduler::NEW_QUEUE_SLICE_NS - 100_000)
+    );
+
+    scheduler.task_runnable(task, WakeHint::Normal);
+
+    assert_eq!(
+        scheduler.task_owner(task),
+        Some(TaskRunOwner::Queued {
+            hart: HartId(0),
+            queue: Phase1QueueKind::New,
+        })
+    );
+    assert_eq!(scheduler.queue_depths(HartId(0)).new, 1);
+    assert_eq!(scheduler.queue_depths(HartId(0)).preempted, 1);
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(task)
+    );
+}
+
+#[test]
 fn blocked_task_with_exhausted_budget_wakes_as_new() {
     let mut scheduler = Phase1Scheduler::new();
     let task = submit_fair(&mut scheduler, 4);
