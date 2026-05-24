@@ -923,8 +923,8 @@ fn dispatch_rt_sigaction_install_then_query_round_trip() {
 }
 
 /// musl's pthread cancellation handler is installed with
-/// `SA_SIGINFO | SA_RESTART | SA_ONSTACK` and a full mask. The kernel
-/// rt_sigaction ABI must preserve those words when queried back; losing
+/// `SA_SIGINFO | SA_RESTART | SA_ONSTACK` and a full mask. RV64's
+/// rt_sigaction ABI exchanges the kernel handler/flags/mask words; losing
 /// them means AST delivery cannot distinguish the 3-argument handler
 /// shape or compute the handler-entry mask.
 #[test]
@@ -940,10 +940,9 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
     const SA_RESTART: u64 = 0x1000_0000;
     const FLAGS: u64 = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
     const MASK: u64 = u64::MAX;
-    const UNUSED: u64 = 0x4444_5555_6666_7777;
 
-    let act: [u64; 4] = [HANDLER_ADDR, FLAGS, MASK, UNUSED];
-    let mut oldact: [u64; 4] = [0xDEADu64; 4];
+    let act: [u64; 3] = [HANDLER_ADDR, FLAGS, MASK];
+    let mut oldact: [u64; 3] = [0xDEADu64; 3];
 
     let r1 = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(
@@ -960,9 +959,9 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
         &ctx,
     ));
     assert_eq!(r1, SyscallResult::Return(0));
-    assert_eq!(oldact, [0, 0, 0, 0]);
+    assert_eq!(oldact, [0, 0, 0]);
 
-    let mut observed: [u64; 4] = [0xDEADu64; 4];
+    let mut observed: [u64; 3] = [0xDEADu64; 3];
     let r2 = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(
             NR_RT_SIGACTION,
@@ -986,10 +985,6 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
     assert_ne!(
         observed[2] & tx_subsystems::signal::Signum::SIGTERM.bit(),
         0
-    );
-    assert_eq!(
-        observed[3], UNUSED,
-        "RV64 musl has no SA_RESTORER, so the last word is ABI-unused"
     );
 }
 

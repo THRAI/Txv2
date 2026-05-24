@@ -120,10 +120,10 @@ static mut NET_REGISTRY: [Option<&'static NetDeviceRegistration>; MAX_STATIC_NET
 
 pub fn register_net_devices(regs: &'static [&'static NetDeviceRegistration]) -> StepOutcome<()> {
     if NET_REGISTRY_INITIALIZED.swap(true, Ordering::AcqRel) {
-        return StepOutcome::Err(Errno::EEXIST.into());
+        return StepOutcome::Err(Errno::EEXIST);
     }
     if regs.len() > MAX_STATIC_NET_DEVICES {
-        return StepOutcome::Err(Errno::ENOMEM.into());
+        return StepOutcome::Err(Errno::ENOMEM);
     }
 
     for (idx, reg) in regs.iter().copied().enumerate() {
@@ -132,7 +132,7 @@ pub fn register_net_devices(regs: &'static [&'static NetDeviceRegistration]) -> 
             .copied()
             .any(|seen| seen.devt == reg.devt || seen.name == reg.name)
         {
-            return StepOutcome::Err(Errno::EEXIST.into());
+            return StepOutcome::Err(Errno::EEXIST);
         }
         unsafe {
             NET_REGISTRY[idx] = Some(reg);
@@ -234,10 +234,7 @@ mod tests {
         let snapshot = net_device_snapshot();
         assert_eq!(snapshot.len(), 1);
         assert!(core::ptr::eq(snapshot[0], &ETH0));
-        assert_eq!(
-            register_net_devices(REGS),
-            StepOutcome::Err(Errno::EEXIST.into())
-        );
+        assert_eq!(register_net_devices(REGS), StepOutcome::Err(Errno::EEXIST));
         reset_net_registry_for_test();
     }
 
@@ -254,10 +251,7 @@ mod tests {
         };
         static REGS: &[&NetDeviceRegistration] = &[&ETH0, &DUP_NAME];
 
-        assert_eq!(
-            register_net_devices(REGS),
-            StepOutcome::Err(Errno::EEXIST.into())
-        );
+        assert_eq!(register_net_devices(REGS), StepOutcome::Err(Errno::EEXIST));
         assert!(net_device_snapshot().is_empty());
         reset_net_registry_for_test();
     }

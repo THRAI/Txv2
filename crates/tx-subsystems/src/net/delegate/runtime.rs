@@ -230,6 +230,9 @@ pub fn net_delegate_step_once(
             outcome.packets_seen += loopback.packets_seen;
             outcome.sockets_touched += loopback.sockets_touched;
             outcome.wakes_fired += loopback.wakes_fired;
+            if loopback.made_progress() {
+                outcome.wakes_fired += net_delegate_kick_poll();
+            }
         }
 
         if let Some(sink) = driver.packet_tx_sink() {

@@ -67,7 +67,7 @@ fn vm_copy_from_user_rejects_unmapped_pointer_before_kernel_copy() {
 
     let copied = aspace.copy_from_user(&mut observed, UserPtr::new(0x8000), &guard);
 
-    assert_eq!(copied, StepOutcome::Err(Errno::EFAULT.into()));
+    assert_eq!(copied, StepOutcome::Err(Errno::EFAULT));
     assert_eq!(observed, [0xAA; 8]);
 }
 
@@ -83,7 +83,7 @@ fn vm_copy_to_user_rejects_read_only_recipe() {
 
     let copied = aspace.copy_to_user(UserPtr::new(user_addr), &payload, &guard);
 
-    assert_eq!(copied, StepOutcome::Err(Errno::EFAULT.into()));
+    assert_eq!(copied, StepOutcome::Err(Errno::EFAULT));
 }
 
 #[test]
@@ -98,8 +98,8 @@ fn vm_read_write_user_reject_partial_guard_crossing_structs() {
     let guard = crate::vm::adapter::step_engine::guard();
 
     let read = aspace.read_user::<[u8; 32]>(UserPtr::new(crossing), &guard);
-    assert_eq!(read, StepOutcome::Err(Errno::EFAULT.into()));
+    assert_eq!(read, StepOutcome::Err(Errno::EFAULT));
 
     let write = aspace.write_user::<[u8; 32]>(UserPtr::new(crossing), [0x5A; 32], &guard);
-    assert_eq!(write, StepOutcome::Err(Errno::EFAULT.into()));
+    assert_eq!(write, StepOutcome::Err(Errno::EFAULT));
 }

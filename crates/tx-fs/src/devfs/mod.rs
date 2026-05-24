@@ -228,7 +228,7 @@ impl CharDeviceOps for RtcCharOps {
     }
 
     fn write(&self, _bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
-        StepOutcome::err(Errno::EINVAL.into())
+        StepOutcome::err(Errno::EINVAL)
     }
 }
 
@@ -290,7 +290,7 @@ fn static_char_entry_by_combined_index(idx: usize) -> Option<&'static CharDevice
 pub fn resolve_console_rnode(name: &[u8]) -> StepOutcome<Cap<RNode>, NoProgress> {
     use StepOutcome as V3;
     let Some(tty) = tty::project::resolve_devfs_alias(name) else {
-        return V3::err(Errno::ENOENT.into());
+        return V3::err(Errno::ENOENT);
     };
 
     let entries = tty::project::devfs_alias_entries();
@@ -308,7 +308,7 @@ pub fn resolve_console_rnode(name: &[u8]) -> StepOutcome<Cap<RNode>, NoProgress>
         },
     ) {
         Ok(rnode) => V3::done(rnode),
-        Err(_) => V3::err(Errno::EIO.into()),
+        Err(_) => V3::err(Errno::EIO),
     }
 }
 
@@ -483,10 +483,10 @@ impl FsOps for Devfs {
             if name == DEVFS_RTC_NAME {
                 return StepOutcome::done(DEVFS_RTC_OBJECT_ID);
             }
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
         if parent != DEVFS_ROOT_OBJECT_ID {
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
         // `/dev/block` is a synthetic mountpoint directory: bdev-fs
         // (`docs/design/05_filesystem/BDEV_FS.md` §7.1) attaches here
@@ -524,7 +524,7 @@ impl FsOps for Devfs {
                 DEVFS_ENTRY_OBJECT_BASE + entries.len() as u64 + idx as u64,
             ));
         }
-        StepOutcome::err(Errno::ENOENT.into())
+        StepOutcome::err(Errno::ENOENT)
     }
 
     fn load_inode_meta(
@@ -562,7 +562,7 @@ impl FsOps for Devfs {
         {
             return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, DEVFS_CHAR_MODE));
         }
-        StepOutcome::err(Errno::ENOENT.into())
+        StepOutcome::err(Errno::ENOENT)
     }
 
     fn serialize_inode_meta(
@@ -571,7 +571,7 @@ impl FsOps for Devfs {
         _meta: &InodeMeta,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn create_inode(
@@ -582,7 +582,7 @@ impl FsOps for Devfs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn unlink(
@@ -592,7 +592,7 @@ impl FsOps for Devfs {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn rename(
@@ -603,7 +603,7 @@ impl FsOps for Devfs {
         _new_name: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn link(
@@ -613,7 +613,7 @@ impl FsOps for Devfs {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn mkdir(
@@ -624,7 +624,7 @@ impl FsOps for Devfs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn rmdir(
@@ -634,7 +634,7 @@ impl FsOps for Devfs {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn symlink(
@@ -645,7 +645,7 @@ impl FsOps for Devfs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn readdir(
@@ -672,14 +672,14 @@ impl FsOps for Devfs {
                     match DirEntry::new(DEVFS_RTC_OBJECT_ID, InodeKind::CharDevice, DEVFS_RTC_NAME)
                     {
                         Ok(de) => de,
-                        Err(err) => return StepOutcome::err(err.into()),
+                        Err(err) => return StepOutcome::err(err),
                     };
                 return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(1))));
             }
             return StepOutcome::done(None);
         }
         if fs_object_id != DEVFS_ROOT_OBJECT_ID {
-            return StepOutcome::err(Errno::ENOTDIR.into());
+            return StepOutcome::err(Errno::ENOTDIR);
         }
         let entries = tty::project::devfs_alias_entries();
         let index = cursor.as_u64() as usize;
@@ -694,7 +694,7 @@ impl FsOps for Devfs {
                 &entry.name,
             ) {
                 Ok(de) => de,
-                Err(err) => return StepOutcome::err(err.into()),
+                Err(err) => return StepOutcome::err(err),
             };
             return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
         }
@@ -703,7 +703,7 @@ impl FsOps for Devfs {
             let dir_entry =
                 match DirEntry::new(DEVFS_NULL_OBJECT_ID, InodeKind::CharDevice, DEVFS_NULL_NAME) {
                     Ok(de) => de,
-                    Err(err) => return StepOutcome::err(err.into()),
+                    Err(err) => return StepOutcome::err(err),
                 };
             return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
         }
@@ -711,7 +711,7 @@ impl FsOps for Devfs {
             let dir_entry =
                 match DirEntry::new(DEVFS_ZERO_OBJECT_ID, InodeKind::CharDevice, DEVFS_ZERO_NAME) {
                     Ok(de) => de,
-                    Err(err) => return StepOutcome::err(err.into()),
+                    Err(err) => return StepOutcome::err(err),
                 };
             return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
         }
@@ -726,7 +726,7 @@ impl FsOps for Devfs {
                     entry.name.as_bytes(),
                 ) {
                     Ok(de) => de,
-                    Err(err) => return StepOutcome::err(err.into()),
+                    Err(err) => return StepOutcome::err(err),
                 };
                 return StepOutcome::done(Some((
                     dir_entry,
@@ -741,7 +741,7 @@ impl FsOps for Devfs {
                 DEVFS_BLOCK_DIR_NAME,
             ) {
                 Ok(de) => de,
-                Err(err) => return StepOutcome::err(err.into()),
+                Err(err) => return StepOutcome::err(err),
             };
             return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
         }
@@ -752,7 +752,7 @@ impl FsOps for Devfs {
                 DEVFS_SHM_DIR_NAME,
             ) {
                 Ok(de) => de,
-                Err(err) => return StepOutcome::err(err.into()),
+                Err(err) => return StepOutcome::err(err),
             };
             return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
         }
@@ -763,7 +763,7 @@ impl FsOps for Devfs {
                 DEVFS_MISC_DIR_NAME,
             ) {
                 Ok(de) => de,
-                Err(err) => return StepOutcome::err(err.into()),
+                Err(err) => return StepOutcome::err(err),
             };
             return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
         }
@@ -809,7 +809,7 @@ impl FsOps for Devfs {
             // char-device aliases. Directories are handled by the
             // walker's inline `Directory` arm; anything else is a
             // backend bug.
-            return StepOutcome::err(Errno::ENOSYS.into());
+            return StepOutcome::err(Errno::ENOSYS);
         }
         if fs_object_id == DEVFS_NULL_OBJECT_ID {
             return match RNode::new_cap_in_mount(
@@ -821,7 +821,7 @@ impl FsOps for Devfs {
                 mount,
             ) {
                 Ok(rnode) => StepOutcome::done(rnode),
-                Err(_) => StepOutcome::err(Errno::EIO.into()),
+                Err(_) => StepOutcome::err(Errno::EIO),
             };
         }
         if fs_object_id == DEVFS_ZERO_OBJECT_ID {
@@ -834,7 +834,7 @@ impl FsOps for Devfs {
                 mount,
             ) {
                 Ok(rnode) => StepOutcome::done(rnode),
-                Err(_) => StepOutcome::err(Errno::EIO.into()),
+                Err(_) => StepOutcome::err(Errno::EIO),
             };
         }
         if fs_object_id == DEVFS_RTC_OBJECT_ID {
@@ -847,11 +847,11 @@ impl FsOps for Devfs {
                 mount,
             ) {
                 Ok(rnode) => StepOutcome::done(rnode),
-                Err(_) => StepOutcome::err(Errno::EIO.into()),
+                Err(_) => StepOutcome::err(Errno::EIO),
             };
         }
         let Some(idx) = entry_index_from_object_id(fs_object_id) else {
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         };
         let entries = tty::project::devfs_alias_entries();
         let backing = if let Some(entry) = entries.into_iter().nth(idx) {
@@ -863,11 +863,11 @@ impl FsOps for Devfs {
                 payload: StructPayload::CharDevice(binding),
             }
         } else {
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         };
         match RNode::new_cap_in_mount(fs_object_id, meta, backing, mount) {
             Ok(rnode) => StepOutcome::done(rnode),
-            Err(_) => StepOutcome::err(Errno::EIO.into()),
+            Err(_) => StepOutcome::err(Errno::EIO),
         }
     }
 
@@ -880,7 +880,7 @@ impl FsOps for Devfs {
     ) -> StepOutcome<(), NoProgress> {
         // devfs is a read-only projection-shaped backend; mode-bit
         // mutation is not supported.
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn step_chown(
@@ -891,7 +891,7 @@ impl FsOps for Devfs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 }
 
@@ -905,7 +905,7 @@ impl FsPageBacking for Devfs {
         // Char-device I/O does not flow through the page cache; routing
         // happens via `OpenFile::step_read` / `step_write` against the
         // RNode's `StructBacked { Tty }` backing instead.
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
 
     fn flush_page(
@@ -915,7 +915,7 @@ impl FsPageBacking for Devfs {
         _frame: &Frame,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
 
     fn truncate(
@@ -924,7 +924,7 @@ impl FsPageBacking for Devfs {
         _new_size: u64,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
 
     fn fsync_file(
@@ -932,7 +932,7 @@ impl FsPageBacking for Devfs {
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
 
     // `fallocate` keeps the v3 trait default (`Done(())`) — devfs has

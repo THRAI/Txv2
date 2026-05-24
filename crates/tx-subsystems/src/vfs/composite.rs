@@ -672,7 +672,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for LstatOp<'a> {
                     &__guard,
                 ) {
                     Ok(resolved) => resolved.dentry,
-                    Err(e) => return StepOutcome::err(e.into()),
+                    Err(e) => return StepOutcome::err(e),
                 };
                 self.target = Some(d.clone());
                 d

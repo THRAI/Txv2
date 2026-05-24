@@ -150,41 +150,41 @@ impl FsOps for Sysfs {
         if parent == SYSFS_ROOT_ID {
             return match name {
                 b"class" => StepOutcome::done(SYSFS_CLASS_ID),
-                _ => StepOutcome::err(Errno::ENOENT.into()),
+                _ => StepOutcome::err(Errno::ENOENT),
             };
         }
         if parent == SYSFS_CLASS_ID {
             return match name {
                 b"net" => StepOutcome::done(SYSFS_CLASS_NET_ID),
-                _ => StepOutcome::err(Errno::ENOENT.into()),
+                _ => StepOutcome::err(Errno::ENOENT),
             };
         }
         if parent == SYSFS_CLASS_NET_ID {
             let netns = initial_netns();
             let Some(link) = link_by_name(&netns, name) else {
-                return StepOutcome::err(Errno::ENOENT.into());
+                return StepOutcome::err(Errno::ENOENT);
             };
             return StepOutcome::done(netdev_node_id(link.ifindex, NetdevNodeKind::DeviceDir));
         }
         if let Some((ifindex, NetdevNodeKind::DeviceDir)) = parse_netdev_node_id(parent) {
             if link_by_ifindex(&initial_netns(), ifindex).is_none() {
-                return StepOutcome::err(Errno::ENOENT.into());
+                return StepOutcome::err(Errno::ENOENT);
             }
             if let Some(entry) = NETDEV_FILES.iter().find(|entry| entry.name == name) {
                 return StepOutcome::done(netdev_node_id(ifindex, entry.node));
             }
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
         if let Some((ifindex, NetdevNodeKind::StatisticsDir)) = parse_netdev_node_id(parent) {
             if link_by_ifindex(&initial_netns(), ifindex).is_none() {
-                return StepOutcome::err(Errno::ENOENT.into());
+                return StepOutcome::err(Errno::ENOENT);
             }
             if let Some(entry) = NETDEV_STAT_FILES.iter().find(|entry| entry.name == name) {
                 return StepOutcome::done(netdev_node_id(ifindex, entry.node));
             }
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
-        StepOutcome::err(Errno::ENOENT.into())
+        StepOutcome::err(Errno::ENOENT)
     }
 
     fn load_inode_meta(
@@ -200,7 +200,7 @@ impl FsOps for Sysfs {
         }
         if let Some((ifindex, node)) = parse_netdev_node_id(fs_object_id) {
             if link_by_ifindex(&initial_netns(), ifindex).is_none() {
-                return StepOutcome::err(Errno::ENOENT.into());
+                return StepOutcome::err(Errno::ENOENT);
             }
             let kind = if matches!(
                 node,
@@ -217,7 +217,7 @@ impl FsOps for Sysfs {
             };
             return StepOutcome::done(InodeMeta::new(kind, mode));
         }
-        StepOutcome::err(Errno::ENOENT.into())
+        StepOutcome::err(Errno::ENOENT)
     }
 
     fn serialize_inode_meta(
@@ -226,7 +226,7 @@ impl FsOps for Sysfs {
         _meta: &InodeMeta,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn create_inode(
@@ -237,7 +237,7 @@ impl FsOps for Sysfs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn unlink(
@@ -247,7 +247,7 @@ impl FsOps for Sysfs {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn rename(
@@ -258,7 +258,7 @@ impl FsOps for Sysfs {
         _new_name: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn link(
@@ -268,7 +268,7 @@ impl FsOps for Sysfs {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn mkdir(
@@ -279,7 +279,7 @@ impl FsOps for Sysfs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn rmdir(
@@ -289,7 +289,7 @@ impl FsOps for Sysfs {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn symlink(
@@ -300,7 +300,7 @@ impl FsOps for Sysfs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn readdir(
@@ -329,22 +329,22 @@ impl FsOps for Sysfs {
                 Ok(entry) => {
                     StepOutcome::done(Some((entry, DirCursor::from_u64((idx + 1) as u64))))
                 }
-                Err(errno) => StepOutcome::err(errno.into()),
+                Err(errno) => StepOutcome::err(errno),
             };
         }
         if let Some((ifindex, NetdevNodeKind::DeviceDir)) = parse_netdev_node_id(fs_object_id) {
             if link_by_ifindex(&initial_netns(), ifindex).is_none() {
-                return StepOutcome::err(Errno::ENOENT.into());
+                return StepOutcome::err(Errno::ENOENT);
             }
             return emit_netdev_entry(idx, ifindex, NETDEV_FILES);
         }
         if let Some((ifindex, NetdevNodeKind::StatisticsDir)) = parse_netdev_node_id(fs_object_id) {
             if link_by_ifindex(&initial_netns(), ifindex).is_none() {
-                return StepOutcome::err(Errno::ENOENT.into());
+                return StepOutcome::err(Errno::ENOENT);
             }
             return emit_netdev_entry(idx, ifindex, NETDEV_STAT_FILES);
         }
-        StepOutcome::err(Errno::ENOTDIR.into())
+        StepOutcome::err(Errno::ENOTDIR)
     }
 
     fn destroy_inode(
@@ -368,11 +368,11 @@ impl FsOps for Sysfs {
                 schema: ProjectionSchemaId::Sysfs,
                 key: ProjectionKey::from_fs_object_id(fs_object_id),
             },
-            _ => return StepOutcome::err(Errno::ENOSYS.into()),
+            _ => return StepOutcome::err(Errno::ENOSYS),
         };
         match RNode::new_cap_in_mount(fs_object_id, meta, backing, mount) {
             Ok(rnode) => StepOutcome::done(rnode),
-            Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
+            Err(_) => StepOutcome::err(Errno::ENOMEM),
         }
     }
 
@@ -404,7 +404,7 @@ impl FsOps for Sysfs {
         };
         let content = match render_projected(fs_object_id, netns) {
             Ok(content) => content,
-            Err(errno) => return StepOutcome::err(errno.into()),
+            Err(errno) => return StepOutcome::err(errno),
         };
         let bytes = content.as_bytes();
         let off = offset as usize;
@@ -424,7 +424,7 @@ impl FsOps for Sysfs {
         _bytes: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn step_chmod(
@@ -434,7 +434,7 @@ impl FsOps for Sysfs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn step_chown(
@@ -445,7 +445,7 @@ impl FsOps for Sysfs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 }
 
@@ -456,7 +456,7 @@ impl FsPageBacking for Sysfs {
         _offset: u64,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Frame, NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
 
     fn flush_page(
@@ -466,7 +466,7 @@ impl FsPageBacking for Sysfs {
         _frame: &Frame,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
 
     fn truncate(
@@ -475,7 +475,7 @@ impl FsPageBacking for Sysfs {
         _new_size: u64,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
 
     fn fsync_file(
@@ -483,7 +483,7 @@ impl FsPageBacking for Sysfs {
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
 }
 
@@ -496,7 +496,7 @@ fn emit_static_entry(
     };
     match DirEntry::new(object_id, kind, name) {
         Ok(entry) => StepOutcome::done(Some((entry, DirCursor::from_u64((idx + 1) as u64)))),
-        Err(errno) => StepOutcome::err(errno.into()),
+        Err(errno) => StepOutcome::err(errno),
     }
 }
 
@@ -512,7 +512,7 @@ fn emit_netdev_entry(
         Ok(dir_entry) => {
             StepOutcome::done(Some((dir_entry, DirCursor::from_u64((idx + 1) as u64))))
         }
-        Err(errno) => StepOutcome::err(errno.into()),
+        Err(errno) => StepOutcome::err(errno),
     }
 }
 

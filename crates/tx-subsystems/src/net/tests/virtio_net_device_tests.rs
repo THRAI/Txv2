@@ -15,6 +15,16 @@ impl NetDelegateDriver for VirtioEtherDelegateDriver<'_> {
     }
 }
 
+fn setup() -> std::sync::MutexGuard<'static, ()> {
+    init_zones();
+    let lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    clear_delegate_queue();
+    lock
+}
+
 #[test]
 fn virtio_net_device_exposes_config_and_registration_shape() {
     let device = VirtioNetDevice::new(
@@ -59,10 +69,7 @@ fn virtio_net_device_rx_queue_feeds_receive() {
 
 #[test]
 fn virtio_net_device_tx_queue_accepts_frame_until_capacity() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
+    let _lock = setup();
 
     let device = VirtioNetDevice::new(
         VirtioNetConfig::new(
@@ -90,10 +97,7 @@ fn virtio_net_device_tx_queue_accepts_frame_until_capacity() {
 
 #[test]
 fn virtio_tx_completion_releases_capacity_for_retry() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
+    let _lock = setup();
 
     let device = VirtioNetDevice::new(
         VirtioNetConfig::new(
@@ -132,15 +136,14 @@ fn virtio_tx_completion_releases_capacity_for_retry() {
 
 #[test]
 fn virtio_rx_delegate_delivers_udp_payload_to_socket() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
-    clear_delegate_queue();
+    let _lock = setup();
 
     let device = leak_virtio_device(0x37, 4, 4);
     let registration = leak_virtio_registration(device, 37);
     let local_ip = Ipv4Address::new([192, 0, 2, 2]);
+    crate::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(registration, Some(local_ip))
+        .expect("attach virtio test device to initial net namespace");
     let iface = EtherIface::new(
         registration,
         IfaceCommon::new(local_ip, Ipv4Address::new([255, 255, 255, 0]), 1500),
@@ -194,11 +197,7 @@ fn virtio_rx_delegate_delivers_udp_payload_to_socket() {
 
 #[test]
 fn virtio_irq_rx_available_only_fires_delegate_poll() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
-    clear_delegate_queue();
+    let _lock = setup();
 
     let device = leak_virtio_device(0x47, 2, 2);
     let injected = device.inject_rx_for_test_or_irq(RxFrame::new(std::vec![1, 2, 3]));
@@ -216,11 +215,7 @@ fn virtio_irq_rx_available_only_fires_delegate_poll() {
 
 #[test]
 fn virtio_irq_tx_complete_releases_capacity_and_fires_delegate_poll() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
-    clear_delegate_queue();
+    let _lock = setup();
 
     let device = leak_virtio_device(0x48, 2, 1);
     let guard = tx_substrate::epoch::guard();

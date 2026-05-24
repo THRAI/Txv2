@@ -35,7 +35,7 @@ pub(super) fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::NoReturn,
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -51,7 +51,7 @@ pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::NoReturn,
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -523,7 +523,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(r) => r,
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+            Err(v3errno) => return SyscallResult::error_from(v3errno),
         }
     };
     // step_fork: mint a child ProcessIdentity + leader ThreadIdentity
@@ -786,7 +786,7 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     future.await;
                 }
             }
-            WaitOutcome::Err(e) => return SyscallResult::error_from(e.into()),
+            WaitOutcome::Err(e) => return SyscallResult::error_from(e),
             _ => {}
         }
     }
@@ -856,7 +856,7 @@ pub(super) fn sys_setpgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -909,7 +909,7 @@ pub(super) fn sys_setsid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(sid) => SyscallResult::Return(sid.0 as i64),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 

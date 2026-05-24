@@ -123,10 +123,15 @@ fn boot_smoke_userspace_tcp_loopback_uses_reactor_owned_delegate() {
                     UserspaceTrapInfo::Syscall(SyscallRequest::new($nr, $args)),
                 )
                 .expect(concat!($label, ": complete userspace trap"));
-            expect_pending(&mut pinned, &mut cx, $label);
-            LAST_USERSPACE_CTX
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            let mut returned = None;
+            for _ in 0..4 {
+                expect_pending(&mut pinned, &mut cx, $label);
+                returned = *LAST_USERSPACE_CTX.lock().unwrap_or_else(|e| e.into_inner());
+                if returned.is_some() {
+                    break;
+                }
+            }
+            returned
                 .expect(concat!($label, ": syscall returned to userspace"))
                 .regs[10]
         }};

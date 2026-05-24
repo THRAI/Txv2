@@ -674,7 +674,7 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -889,7 +889,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             {
                 Ok(()) => SyscallResult::Return(0),
                 Err(v3errno) => {
-                    let errno: Errno = v3errno.into();
+                    let errno: Errno = v3errno;
                     SyscallResult::error_from(errno)
                 }
             }
@@ -935,7 +935,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             drop(guard);
             match outcome {
                 StepOutcome::Done(count) => SyscallResult::Return(count as i64),
-                StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+                StepOutcome::Err(errno) => SyscallResult::error_from(errno),
                 StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
                     let _ = &mut script_ctx;
                     SyscallResult::error_from(Errno::EIO)
@@ -993,7 +993,7 @@ fn futex_wake_count_masked(
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(woken) => Ok(woken),
-            Err(v3errno) => Err(SyscallResult::error_from(Errno::from(v3errno))),
+            Err(v3errno) => Err(SyscallResult::error_from(v3errno)),
         }
     } else {
         let guard = step_engine::guard();
@@ -1007,7 +1007,7 @@ fn futex_wake_count_masked(
         drop(guard);
         match outcome {
             StepOutcome::Done(woken) => Ok(woken),
-            StepOutcome::Err(errno) => Err(SyscallResult::error_from(Errno::from(errno))),
+            StepOutcome::Err(errno) => Err(SyscallResult::error_from(errno)),
             StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
                 Err(SyscallResult::error_from(Errno::EIO))
             }
@@ -1030,7 +1030,7 @@ fn futex_pi_lock(ctx: &SyscallCtx<'_>, uaddr: u64, try_only: bool) -> SyscallRes
     drop(guard);
     match outcome {
         StepOutcome::Done(()) => SyscallResult::Return(0),
-        StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        StepOutcome::Err(errno) => SyscallResult::error_from(errno),
         StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
             SyscallResult::error_from(Errno::EIO)
         }
@@ -1044,7 +1044,7 @@ fn futex_pi_unlock(ctx: &SyscallCtx<'_>, uaddr: u64) -> SyscallResult {
     drop(guard);
     match outcome {
         StepOutcome::Done(_) => SyscallResult::Return(0),
-        StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        StepOutcome::Err(errno) => SyscallResult::error_from(errno),
         StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
             SyscallResult::error_from(Errno::EIO)
         }

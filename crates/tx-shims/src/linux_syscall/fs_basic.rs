@@ -121,7 +121,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(Some(cloexec)) => SyscallResult::Return(if cloexec { FD_CLOEXEC as i64 } else { 0 }),
             Ok(None) => SyscallResult::Return(0),
-            Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+            Err(v3errno) => SyscallResult::error_from(v3errno),
         };
     }
 
@@ -147,7 +147,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(new_fd) => SyscallResult::Return(new_fd as i64),
-                Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+                Err(v3errno) => SyscallResult::error_from(v3errno),
             };
         }
         F_GETFL => {
@@ -156,7 +156,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             let f = match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(flags) => flags,
                 Err(v3errno) => {
-                    return SyscallResult::error_from(Errno::from(v3errno));
+                    return SyscallResult::error_from(v3errno);
                 }
             };
             let mut bits: u64 = match (f.read, f.write) {
@@ -198,7 +198,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                     }
                     SyscallResult::Return(0)
                 }
-                Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+                Err(v3errno) => SyscallResult::error_from(v3errno),
             }
         }
         numbers::F_GETLK | numbers::F_OFD_GETLK => fcntl_getlk(ctx, &file, arg),
@@ -529,12 +529,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // → the `opendir_dentry` of its OpenFile (an O_DIRECTORY open of
     // that directory). Invalid / non-directory fds surface as EBADF /
     // ENOTDIR.
-    let cwd: Cap<DEntry> = if path.starts_with(b"/") {
-        match ctx.process.cwd() {
-            Some(d) => d,
-            None => return SyscallResult::Error(ENOENT_VALUE),
-        }
-    } else if dirfd == AT_FDCWD {
+    let cwd: Cap<DEntry> = if path.starts_with(b"/") || dirfd == AT_FDCWD {
         match ctx.process.cwd() {
             Some(d) => d,
             None => return SyscallResult::Error(ENOENT_VALUE),
@@ -589,7 +584,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         {
             Ok(file) => file,
             Err(v3errno) => {
-                return SyscallResult::error_from(Errno::from(v3errno));
+                return SyscallResult::error_from(v3errno);
             }
         };
         if want_directory
@@ -650,7 +645,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
                 Err(e) => return SyscallResult::Error(e),
             }
         }
-        V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        V3::Err(errno) => return SyscallResult::error_from(errno),
     };
     let dentry_meta = dentry.rnode().meta();
     if want_directory && dentry_meta.kind() != tx_subsystems::vfs::structure::InodeKind::Directory {
@@ -679,7 +674,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
                     return SyscallResult::Error(EIO_VALUE);
                 }
                 V3Trunc::Err(errno) => {
-                    return SyscallResult::error_from(Errno::from(errno));
+                    return SyscallResult::error_from(errno);
                 }
             }
         }
@@ -704,7 +699,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+            V3::Err(errno) => return SyscallResult::error_from(errno),
         }
     };
 
@@ -758,7 +753,7 @@ pub(super) async fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResul
             }
             SyscallResult::Return(0)
         }
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -784,7 +779,7 @@ pub(super) fn sys_dup<'a>(oldfd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(newfd) => SyscallResult::Return(newfd as i64),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -823,7 +818,7 @@ pub(super) fn sys_dup3<'a>(
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(fd) => SyscallResult::Return(fd as i64),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -876,7 +871,7 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(pair) => pair,
             Err(v3errno) => {
-                return SyscallResult::error_from(Errno::from(v3errno));
+                return SyscallResult::error_from(v3errno);
             }
         }
     };
@@ -948,7 +943,7 @@ pub(super) fn sys_lseek<'a>(
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(new_offset) => SyscallResult::Return(new_offset as i64),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -1107,7 +1102,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     fn unwrap_v3<T>(v: V3Out<T, NoProgress>) -> Result<T, Errno> {
         match v {
             V3Out::Done(t) => Ok(t),
-            V3Out::Err(e) => Err(e.into()),
+            V3Out::Err(e) => Err(e),
             V3Out::Continue { .. } | V3Out::Yield { .. } => Err(Errno::EIO),
         }
     }
@@ -2094,7 +2089,7 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         };
         match result {
             Ok((sr, id)) => (sr, id),
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+            Err(v3errno) => return SyscallResult::error_from(v3errno),
         }
     };
 
@@ -2184,7 +2179,7 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         };
         match result {
             Ok((m, id)) => (m, id),
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+            Err(v3errno) => return SyscallResult::error_from(v3errno),
         }
     };
 
@@ -2346,7 +2341,7 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
                 if written > 0 {
                     return SyscallResult::Return(written as i64);
                 }
-                return SyscallResult::error_from(Errno::from(errno));
+                return SyscallResult::error_from(errno);
             }
         }
     }
@@ -2506,7 +2501,7 @@ pub(super) async fn sys_syncfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
     // to `fsync_file(ROOT)`; journaling filesystems can override.
     match page_backing.sync_filesystem(&guard) {
         StepOutcome::Done(()) => SyscallResult::Return(0),
-        StepOutcome::Err(e) => SyscallResult::error_from(Errno::from(e)),
+        StepOutcome::Err(e) => SyscallResult::error_from(e),
         _ => SyscallResult::Error(EIO_VALUE),
     }
 }
@@ -2556,7 +2551,7 @@ pub(super) async fn sys_fsync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -2609,6 +2604,6 @@ pub(super) async fn sys_flock<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }

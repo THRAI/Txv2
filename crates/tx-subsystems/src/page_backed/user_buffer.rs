@@ -283,7 +283,7 @@ fn copy_chunk_user(
                 V3::Done(n) if n == chunk => UserChunkOutcome::Copied,
                 V3::Continue { progress } if progress.bytes() == chunk => UserChunkOutcome::Copied,
                 V3::Done(_) | V3::Continue { .. } => UserChunkOutcome::Fault(Errno::EFAULT),
-                V3::Err(e) => UserChunkOutcome::Fault(Errno::from(e)),
+                V3::Err(e) => UserChunkOutcome::Fault(e),
                 V3::Yield {
                     shape: step_engine::YieldShape::OnWaitSource { source, interests },
                     ..
@@ -310,7 +310,7 @@ fn copy_chunk_user(
                 V3::Done(n) if n == chunk => UserChunkOutcome::Copied,
                 V3::Continue { progress } if progress.bytes() == chunk => UserChunkOutcome::Copied,
                 V3::Done(_) | V3::Continue { .. } => UserChunkOutcome::Fault(Errno::EFAULT),
-                V3::Err(e) => UserChunkOutcome::Fault(Errno::from(e)),
+                V3::Err(e) => UserChunkOutcome::Fault(e),
                 V3::Yield {
                     shape: step_engine::YieldShape::OnWaitSource { source, interests },
                     ..
@@ -366,7 +366,7 @@ pub fn step_read_to_kernel(
         return V3::done(0);
     }
     let Some(capacity) = pc.byte_capacity() else {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     };
     let start = of.offset();
     let valid_end = core::cmp::min(pc.size_bytes(), capacity);
@@ -400,16 +400,16 @@ pub fn step_write_from_kernel(
         return V3::done(0);
     }
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     }
     let Some(capacity) = pc.byte_capacity() else {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     };
     let Some(end) = of.offset().checked_add(len as u64) else {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     };
     if end > capacity {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     }
     let start = of.offset();
     let outcome = step_range_with_kernel_buffer(pc, of, len, KernelBuffer::Write { src }, guard);
@@ -468,7 +468,7 @@ fn step_range_with_kernel_buffer(
                     }
                     Err(errno) => {
                         if advanced == 0 {
-                            return V3::err(errno.into());
+                            return V3::err(errno);
                         }
                         of.set_offset(offset);
                         return V3::done(advanced);

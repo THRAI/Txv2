@@ -25,5 +25,5 @@ pub use poll_context::{PollContext, PollContextOutcome};
 pub use smoltcp_adapter::{
     SmoltcpAdapter, SmoltcpAdapterConfig, SmoltcpPacketSource, SmoltcpPacketTxSink,
 };
-pub use tcp::{RawTcpSocket, SmoltcpTcpSegment};
+pub use tcp::{RawTcpSocket, SmoltcpTcpSegment, TCP_CORK_AUTO_FLUSH_BYTES};
 pub use udp::{RawUdpSocket, UdpRxDatagram, UdpTxDatagram, UDP_IPV4_MAX_PAYLOAD_BYTES};

@@ -120,7 +120,7 @@ fn load_meta_from_payload(
     let guard = step_engine::guard();
     match payload.fs_ops.load_inode_meta(fs_object_id, &guard) {
         StepOutcome::Done(meta) => Ok(meta),
-        StepOutcome::Err(errno) => Err(SyscallResult::error_from(Errno::from(errno))),
+        StepOutcome::Err(errno) => Err(SyscallResult::error_from(errno)),
         StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
             Err(SyscallResult::Error(EIO_VALUE))
         }
@@ -174,14 +174,14 @@ fn resolve_nofollow_target(
     let guard = step_engine::guard();
     let target_id = match fs_ops.lookup(parent_id, basename, &guard) {
         StepOutcome::Done(id) => id,
-        StepOutcome::Err(errno) => return Err(SyscallResult::error_from(Errno::from(errno))),
+        StepOutcome::Err(errno) => return Err(SyscallResult::error_from(errno)),
         StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
             return Err(SyscallResult::Error(EIO_VALUE));
         }
     };
     let meta = match fs_ops.load_inode_meta(target_id, &guard) {
         StepOutcome::Done(meta) => meta,
-        StepOutcome::Err(errno) => return Err(SyscallResult::error_from(Errno::from(errno))),
+        StepOutcome::Err(errno) => return Err(SyscallResult::error_from(errno)),
         StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
             return Err(SyscallResult::Error(EIO_VALUE));
         }
@@ -325,7 +325,7 @@ pub(super) fn sys_open_by_handle_at(
             .materialise_rnode(fs_object_id, meta, &mount_payload, &guard)
         {
             StepOutcome::Done(rnode) => rnode,
-            StepOutcome::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+            StepOutcome::Err(errno) => return SyscallResult::error_from(errno),
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }

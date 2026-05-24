@@ -195,6 +195,12 @@ pub struct RawNetlinkNetfilterSocket {
     rx: SpinMutex<VecDeque<Vec<u8>>>,
 }
 
+impl Default for RawNetlinkNetfilterSocket {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RawNetlinkNetfilterSocket {
     pub fn new() -> Self {
         Self {
@@ -1178,7 +1184,7 @@ fn push_ipv4_cidr_match(
     }
     let reg = NFT_REG32_00;
     let octets = cidr.addr.octets();
-    if cidr.prefix_len % 8 == 0 {
+    if cidr.prefix_len.is_multiple_of(8) {
         let len = (cidr.prefix_len / 8).clamp(1, 4);
         push_payload_expr(out, next, reg, base, offset, len as u32);
         push_cmp_expr(out, next, reg, &octets[..len as usize]);

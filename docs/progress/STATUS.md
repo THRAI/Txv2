@@ -1,3 +1,32 @@
+- 2026-05-24 **Restored focused OSComp iperf after the LTP network syscall
+  PR.** Compared the PR lineage against `133fa0c8` using a detached worktree
+  and the historical `cargo xtask oscomp qemu --boot-suite ...` path;
+  `133fa0c8` still scores `iperf-musl 6/6`, confirming the regression was in
+  the later network syscall work or follow-up fixes rather than the original
+  SMP stabilization commit. The remaining `PARALLEL_TCP` hang was a pselect
+  readiness bug: when one socket was watched for both read and write,
+  `pselect6` collapsed `IN|OUT` into one wait token and could park on the recv
+  source while only send-space was going to wake. `pselect6` now registers
+  blocked read and blocked write interests separately. The earlier semantic TCP
+  repairs remain in place: `MSG_MORE` corking auto-flushes once a segment is
+  large enough, zero-byte non-empty TCP write reservations yield instead of
+  succeeding, poll-out uses real send-space level, and TCP reads kick loopback
+  polling after freeing peer receive window. **Verified:** `cargo fmt --check`;
+  `cargo test -p tx-shims --lib pselect -- --test-threads=1`; `cargo test -p
+  tx-subsystems --lib tcp_msg_more_auto_flushes_full_segment_for_stream_progress
+  -- --test-threads=1`; `cargo test -p tx-subsystems --lib
+  tcp_loopback_pending_moves_multiple_msg_more_streams -- --test-threads=1`;
+  `cargo test -p tx-subsystems --lib
+  tcp_pollout_ignores_stale_send_space_wake_when_full -- --test-threads=1`;
+  `cargo test -p tx-subsystems --lib
+  tcp_recv_kicks_loopback_after_freeing_peer_window -- --test-threads=1`;
+  `cargo test -p tx-shims --lib
+  dispatch_tcp_msg_more_defers_until_uncork_send -- --test-threads=1`; `cargo
+  xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu`; focused `iperf-musl 6/6`; focused `netperf-musl 5/5`. **Next
+  step:** rerun the broader OSComp network set before pushing the PR update.
+  **Blocker:** none for the focused iperf/netperf regression.
+
 - 2026-05-24 **Advanced OSComp LTP syscall-network coverage on
   `feature-network`.** The focused LTP runner now honors filtered
   `ltp-musl:<case+case>` selections instead of falling back to the default

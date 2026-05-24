@@ -53,11 +53,19 @@ pub fn step_send(
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
 
+    if reserve.bytes == 0 {
+        if reserve.needs_poll_kick {
+            net_delegate_kick_poll();
+        }
+        socket.readiness.clear_send(SendWireSet::SPACE);
+        return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
+    }
+
     if reserve.became_full {
         socket.readiness.clear_send(SendWireSet::SPACE);
     }
 
-    if !flags.contains(SendRecvFlags::MSG_MORE) {
+    if !flags.contains(SendRecvFlags::MSG_MORE) || reserve.needs_poll_kick {
         net_delegate_kick_poll();
     }
     StepOutcome::Done(reserve.bytes)
@@ -113,11 +121,19 @@ pub fn step_send_kernel_bytes(
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
 
+    if reserve.bytes == 0 {
+        if reserve.needs_poll_kick {
+            net_delegate_kick_poll();
+        }
+        socket.readiness.clear_send(SendWireSet::SPACE);
+        return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
+    }
+
     if reserve.became_full {
         socket.readiness.clear_send(SendWireSet::SPACE);
     }
 
-    if !flags.contains(SendRecvFlags::MSG_MORE) {
+    if !flags.contains(SendRecvFlags::MSG_MORE) || reserve.needs_poll_kick {
         net_delegate_kick_poll();
     }
     StepOutcome::Done(reserve.bytes)
@@ -233,11 +249,19 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
         Err(errno) => return StepOutcome::Err(errno),
     };
 
+    if reserve.bytes == 0 {
+        if kick_poll && reserve.needs_poll_kick {
+            net_delegate_kick_poll();
+        }
+        socket.readiness.clear_send(SendWireSet::SPACE);
+        return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
+    }
+
     if reserve.became_full {
         socket.readiness.clear_send(SendWireSet::SPACE);
     }
 
-    if kick_poll && !flags.contains(SendRecvFlags::MSG_MORE) {
+    if kick_poll && (!flags.contains(SendRecvFlags::MSG_MORE) || reserve.needs_poll_kick) {
         net_delegate_kick_poll();
     }
     StepOutcome::Done(reserve.bytes)

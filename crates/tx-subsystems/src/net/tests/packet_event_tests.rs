@@ -1,11 +1,18 @@
 use super::*;
 
-#[test]
-fn udp_packet_event_sets_recv_readiness() {
+fn setup() -> std::sync::MutexGuard<'static, ()> {
     init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
+    let lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    loopback_iface().clear_for_test_or_bootstrap();
+    lock
+}
+
+#[test]
+fn udp_packet_event_sets_recv_readiness() {
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
     let udp = registry::create_socket_for_test_or_bootstrap(
         SocketKind::Udp,
@@ -137,11 +144,13 @@ fn smoltcp_packet_source_reads_device_frame_and_dispatches() {
 
 #[test]
 fn tcp_packet_event_sets_connection_readiness_and_urgent_port() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
+    let listener = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("listener");
     let tcp = registry::create_socket_for_test_or_bootstrap(
         SocketKind::Tcp,
         SocketOptionSet::default_tcp(),
@@ -149,10 +158,30 @@ fn tcp_packet_event_sets_connection_readiness_and_urgent_port() {
     .expect("tcp socket");
     let local = endpoint(40_143);
     let remote = endpoint(50_143);
-    let key = ConnectionKey::new(local, remote);
-    SOCKET_TABLE
-        .insert_tcp_connection(key, tcp.clone())
-        .expect("connection insert");
+    assert_eq!(
+        step_bind(&listener, inet(remote.port), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(step_listen(&listener, 8, &guard), StepOutcome::Done(()));
+    assert_eq!(
+        step_bind(&tcp, inet(local.port), &guard),
+        StepOutcome::Done(())
+    );
+    assert!(matches!(
+        step_connect(&tcp, inet(remote.port), &guard),
+        StepOutcome::Yield {
+            shape: YieldShape::OnWaitSource { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        step_tcp_loopback_handshake(&tcp, &guard),
+        StepOutcome::Done(_)
+    ));
+    assert!(matches!(
+        step_accept(&listener, &guard),
+        StepOutcome::Done(_)
+    ));
     let mut urgent_future =
         crate::wait_source::wait_on_token(socket_urgent_wait_token(&tcp)).expect("urgent future");
     let waker = noop_waker();
@@ -188,7 +217,7 @@ fn tcp_packet_event_sets_connection_readiness_and_urgent_port() {
         SocketOptionSet::default_tcp().socket.send_buf_size
     );
     assert!(tcp.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0);
-    assert_eq!(tcp.readiness.send_wq.peek() & SendWireSet::SPACE.bits(), 0);
+    assert!(tcp.readiness.send_wq.peek() & SendWireSet::SPACE.bits() != 0);
     assert!(matches!(
         Pin::new(&mut urgent_future).poll(&mut cx),
         Poll::Ready(WaitOutcome::Ready)
@@ -197,10 +226,7 @@ fn tcp_packet_event_sets_connection_readiness_and_urgent_port() {
 
 #[test]
 fn tcp_syn_to_listener_sets_accept_readiness() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
     let listener = registry::create_socket_for_test_or_bootstrap(
         SocketKind::Tcp,

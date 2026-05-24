@@ -88,6 +88,16 @@ impl NetDelegateDriver for EtherDelegateDriver<'_> {
     }
 }
 
+fn setup() -> std::sync::MutexGuard<'static, ()> {
+    init_zones();
+    let lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    clear_delegate_queue();
+    lock
+}
+
 #[test]
 fn ether_iface_route_decision_uses_direct_gateway_and_unreachable_paths() {
     let local = Ipv4Address::new([10, 0, 0, 1]);
@@ -124,11 +134,7 @@ fn ether_iface_route_decision_uses_direct_gateway_and_unreachable_paths() {
 
 #[test]
 fn ether_iface_arp_miss_sends_request_and_keeps_udp_datagram() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
-    clear_delegate_queue();
+    let _lock = setup();
 
     let local_ip = Ipv4Address::new([10, 0, 0, 1]);
     let remote_ip = Ipv4Address::new([10, 0, 0, 2]);
@@ -195,11 +201,7 @@ fn ether_iface_arp_miss_sends_request_and_keeps_udp_datagram() {
 
 #[test]
 fn ether_iface_arp_reply_learns_cache_and_udp_retry_uses_peer_mac() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
-    clear_delegate_queue();
+    let _lock = setup();
 
     let local_ip = Ipv4Address::new([10, 0, 0, 1]);
     let remote_ip = Ipv4Address::new([10, 0, 0, 2]);
@@ -263,10 +265,7 @@ fn ether_iface_arp_reply_learns_cache_and_udp_retry_uses_peer_mac() {
 
 #[test]
 fn ether_iface_replies_to_icmp_echo_request_for_local_ip() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
+    let _lock = setup();
 
     let local_ip = Ipv4Address::new([10, 0, 0, 1]);
     let remote_ip = Ipv4Address::new([10, 0, 0, 2]);
@@ -314,11 +313,7 @@ fn ether_iface_replies_to_icmp_echo_request_for_local_ip() {
 
 #[test]
 fn ether_iface_arp_request_is_rate_limited_by_pending_deadline() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
-    clear_delegate_queue();
+    let _lock = setup();
 
     let local_ip = Ipv4Address::new([10, 0, 0, 1]);
     let remote_ip = Ipv4Address::new([10, 0, 0, 2]);
@@ -385,11 +380,7 @@ fn ether_iface_arp_request_is_rate_limited_by_pending_deadline() {
 
 #[test]
 fn ether_iface_arp_retry_limit_marks_pending_entry_failed() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
-    clear_delegate_queue();
+    let _lock = setup();
 
     let local_ip = Ipv4Address::new([10, 0, 0, 1]);
     let remote_ip = Ipv4Address::new([10, 0, 0, 2]);
@@ -441,11 +432,7 @@ fn ether_iface_arp_retry_limit_marks_pending_entry_failed() {
 
 #[test]
 fn ether_iface_snapshots_project_arp_and_netdev_state() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
-    clear_delegate_queue();
+    let _lock = setup();
 
     let local_ip = Ipv4Address::new([10, 0, 0, 1]);
     let remote_ip = Ipv4Address::new([10, 0, 0, 2]);
@@ -525,6 +512,9 @@ fn leak_ether_iface(
     local_ip: Ipv4Address,
     local_mac: EthernetAddress,
 ) -> &'static EtherIface {
+    crate::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(registration, Some(local_ip))
+        .expect("attach ether iface to initial net namespace");
     Box::leak(Box::new(EtherIface::new(
         registration,
         IfaceCommon::new(local_ip, Ipv4Address::new([255, 255, 255, 0]), 1500),

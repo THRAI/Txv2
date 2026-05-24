@@ -12,6 +12,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +20,7 @@ use core::task::{Context, Poll};
 use tx_substrate::bus::{RawPort, RawPortSubscription, RawQueue, RawQueueSubscription};
 
 use crate::adapter::step_engine::SpinMutex;
+use crate::adapter::wait_mailbox::{ActiveWait, InterestMask, TaskMailbox};
 use crate::adapter::wait_routing::{Channel, Mask, WaitFuture, WaitOutcome};
 
 use crate::execution::WaitToken;
@@ -42,6 +44,8 @@ pub struct RawQueueWaitFuture {
     queue: RawQueue,
     mask: Mask,
     subscription: Option<RawQueueSubscription>,
+    mailbox: Arc<TaskMailbox>,
+    active_wait: Option<ActiveWait>,
 }
 
 /// Awaitable edge-event wait over a bus [`RawPort`].
@@ -49,6 +53,8 @@ pub struct RawPortWaitFuture {
     port: RawPort,
     mask: Mask,
     subscription: Option<RawPortSubscription>,
+    mailbox: Arc<TaskMailbox>,
+    active_wait: Option<ActiveWait>,
 }
 
 static REGISTRY: SpinMutex<BTreeMap<u64, RegisteredWaitSource>> = SpinMutex::new(BTreeMap::new());
@@ -130,6 +136,8 @@ pub fn wait_on_token(token: WaitToken) -> Option<RegisteredWaitFuture> {
                 queue,
                 mask,
                 subscription: None,
+                mailbox: Arc::new(TaskMailbox::new()),
+                active_wait: None,
             },
         ))),
         RegisteredWaitSource::RawPort(port) => {
@@ -137,6 +145,8 @@ pub fn wait_on_token(token: WaitToken) -> Option<RegisteredWaitFuture> {
                 port,
                 mask,
                 subscription: None,
+                mailbox: Arc::new(TaskMailbox::new()),
+                active_wait: None,
             })))
         }
     }
@@ -166,26 +176,25 @@ impl Future for RawQueueWaitFuture {
         if this.mask.is_empty() {
             return Poll::Ready(WaitOutcome::Ready);
         }
+        this.mailbox.register_waker(cx.waker().clone());
 
-        let ready = if let Some(subscription) = this.subscription.as_mut() {
-            if subscription.take_ready() {
-                true
-            } else {
-                subscription.update_with_waker(this.mask.bits(), cx.waker().clone());
-                false
-            }
+        let ready = if this.subscription.is_some() {
+            mailbox_ready(&this.mailbox, this.active_wait.as_ref())
         } else if this.queue.peek() & this.mask.bits() != 0 {
             true
         } else {
-            this.subscription = Some(
-                this.queue
-                    .subscribe_with_waker(this.mask.bits(), cx.waker().clone()),
-            );
+            ensure_queue_active_wait(this);
+            let generation = this.active_wait.as_ref().expect("active wait").generation;
+            this.subscription = Some(this.queue.subscribe(
+                this.mask.bits(),
+                Arc::downgrade(&this.mailbox),
+                generation,
+            ));
             if this.queue.peek() & this.mask.bits() != 0 {
                 this.subscription = None;
                 true
             } else {
-                false
+                mailbox_ready(&this.mailbox, this.active_wait.as_ref())
             }
         };
 
@@ -206,20 +215,19 @@ impl Future for RawPortWaitFuture {
         if this.mask.is_empty() {
             return Poll::Ready(WaitOutcome::Ready);
         }
+        this.mailbox.register_waker(cx.waker().clone());
 
-        let ready = if let Some(subscription) = this.subscription.as_mut() {
-            if subscription.take_ready() {
-                true
-            } else {
-                subscription.update_with_waker(this.mask.bits(), cx.waker().clone());
-                false
-            }
+        let ready = if this.subscription.is_some() {
+            mailbox_ready(&this.mailbox, this.active_wait.as_ref())
         } else {
-            this.subscription = Some(
-                this.port
-                    .subscribe_with_waker(this.mask.bits(), cx.waker().clone()),
-            );
-            false
+            ensure_port_active_wait(this);
+            let generation = this.active_wait.as_ref().expect("active wait").generation;
+            this.subscription = Some(this.port.subscribe(
+                this.mask.bits(),
+                Arc::downgrade(&this.mailbox),
+                generation,
+            ));
+            mailbox_ready(&this.mailbox, this.active_wait.as_ref())
         };
 
         if ready {
@@ -229,6 +237,37 @@ impl Future for RawPortWaitFuture {
             Poll::Pending
         }
     }
+}
+
+fn ensure_queue_active_wait(future: &mut RawQueueWaitFuture) {
+    if future.active_wait.is_none() {
+        let generation = future.mailbox.next_generation();
+        future.active_wait = Some(ActiveWait::new(
+            generation,
+            future.queue.source_id(),
+            InterestMask::new(future.mask.bits()),
+        ));
+    }
+}
+
+fn ensure_port_active_wait(future: &mut RawPortWaitFuture) {
+    if future.active_wait.is_none() {
+        let generation = future.mailbox.next_generation();
+        future.active_wait = Some(ActiveWait::new(
+            generation,
+            future.port.source_id(),
+            InterestMask::new(future.mask.bits()),
+        ));
+    }
+}
+
+fn mailbox_ready(mailbox: &TaskMailbox, active_wait: Option<&ActiveWait>) -> bool {
+    while let Some(event) = mailbox.poll() {
+        if active_wait.is_some_and(|wait| wait.matches(&event)) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use crate::net::netfilter::{
     NetfilterConntrackProtocol, NetfilterHook, NetfilterIpv4Cidr, NetfilterNatKind, NetfilterTable,
     NetfilterTarget,
 };
-use crate::net::protocol::{ArpSnapshotState, EtherIface};
+use crate::net::protocol::{ArpSnapshotState, EtherIface, NetStatsSnapshot};
 use crate::net::structure::Ipv4Address;
 use crate::net::{NetNamespacePayload, NetNamespaceRouteInfo};
 
@@ -58,17 +58,7 @@ pub fn proc_net_dev_snapshot_text(ifaces: &[&EtherIface]) -> String {
 
     for iface in ifaces {
         let stats = iface.net_stats_snapshot();
-        push_proc_net_dev_line(
-            &mut out,
-            stats.iface_name,
-            stats.rx_bytes,
-            stats.rx_packets,
-            stats.rx_errors,
-            stats.rx_dropped,
-            stats.tx_bytes,
-            stats.tx_packets,
-            stats.tx_errors,
-        );
+        push_proc_net_dev_line(&mut out, stats);
     }
 
     out
@@ -85,19 +75,21 @@ pub fn proc_net_dev_snapshot_text_for_namespace(netns: &NetNamespacePayload) -> 
             .find(|iface| iface.name == link.name)
             .map(|iface| iface.net_stats_snapshot())
         {
+            push_proc_net_dev_line(&mut out, stats);
+        } else {
             push_proc_net_dev_line(
                 &mut out,
-                stats.iface_name,
-                stats.rx_bytes,
-                stats.rx_packets,
-                stats.rx_errors,
-                stats.rx_dropped,
-                stats.tx_bytes,
-                stats.tx_packets,
-                stats.tx_errors,
+                NetStatsSnapshot {
+                    iface_name: link.name,
+                    rx_packets: 0,
+                    tx_packets: 0,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    rx_errors: 0,
+                    tx_errors: 0,
+                    rx_dropped: 0,
+                },
             );
-        } else {
-            push_proc_net_dev_line(&mut out, link.name, 0, 0, 0, 0, 0, 0, 0);
         }
     }
 
@@ -227,20 +219,18 @@ fn push_proc_net_dev_header(out: &mut String) {
     );
 }
 
-fn push_proc_net_dev_line(
-    out: &mut String,
-    iface_name: &str,
-    rx_bytes: u64,
-    rx_packets: u64,
-    rx_errors: u64,
-    rx_dropped: u64,
-    tx_bytes: u64,
-    tx_packets: u64,
-    tx_errors: u64,
-) {
+fn push_proc_net_dev_line(out: &mut String, stats: NetStatsSnapshot) {
     let _ = writeln!(
         out,
         "{iface_name:>6}: {rx_bytes:<8} {rx_packets:<7} {rx_errors:<4} {rx_dropped:<4} |{tx_bytes:<8} {tx_packets:<7} {tx_errors:<4}",
+        iface_name = stats.iface_name,
+        rx_bytes = stats.rx_bytes,
+        rx_packets = stats.rx_packets,
+        rx_errors = stats.rx_errors,
+        rx_dropped = stats.rx_dropped,
+        tx_bytes = stats.tx_bytes,
+        tx_packets = stats.tx_packets,
+        tx_errors = stats.tx_errors,
     );
 }
 

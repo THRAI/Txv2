@@ -1,11 +1,21 @@
 use super::*;
 
-#[test]
-fn smoltcp_tcp_segment_emits_and_parses_ipv4_packet() {
+fn setup() -> std::sync::MutexGuard<'static, ()> {
     init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
+    let lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    loopback_iface().clear_for_test_or_bootstrap();
+    crate::net::delegate::net_delegate_clear(
+        crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
+    );
+    lock
+}
+
+#[test]
+fn smoltcp_tcp_segment_emits_and_parses_ipv4_packet() {
+    let _lock = setup();
     let (client, listener, _local, _remote) = prepare_loopback_connect(40_165, 50_165);
     let guard = tx_substrate::epoch::guard();
 
@@ -68,10 +78,7 @@ fn loopback_iface_singleton_has_loopback_common_fields() {
 
 #[test]
 fn udp_loopback_connected_send_reaches_bound_receiver() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
     let iface = LoopbackIface::new(IfaceCommon::new(
         Ipv4Address::LOOPBACK,
@@ -137,10 +144,7 @@ fn udp_loopback_connected_send_reaches_bound_receiver() {
 
 #[test]
 fn udp_loopback_sendto_reaches_wildcard_bound_receiver() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
     let iface = LoopbackIface::new(IfaceCommon::new(
         Ipv4Address::LOOPBACK,
@@ -198,10 +202,7 @@ fn udp_loopback_sendto_reaches_wildcard_bound_receiver() {
 
 #[test]
 fn udp_loopback_wildcard_server_reply_reaches_connected_client() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
     let iface = LoopbackIface::new(IfaceCommon::new(
         Ipv4Address::LOOPBACK,
@@ -290,10 +291,7 @@ fn udp_loopback_wildcard_server_reply_reaches_connected_client() {
 
 #[test]
 fn udp_loopback_netperf_rr_ephemeral_collision_shape() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
     let server = registry::create_socket_for_test_or_bootstrap(
         SocketKind::Udp,
@@ -350,13 +348,7 @@ fn udp_loopback_netperf_rr_ephemeral_collision_shape() {
 
 #[test]
 fn udp_loopback_inline_send_can_defer_delegate_poll_kick() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
-    crate::net::delegate::net_delegate_clear(
-        crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
-    );
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
     let iface = LoopbackIface::new(IfaceCommon::new(
         Ipv4Address::LOOPBACK,
@@ -409,14 +401,7 @@ fn udp_loopback_inline_send_can_defer_delegate_poll_kick() {
 
 #[test]
 fn udp_loopback_direct_send_kernel_bytes_reaches_receiver() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
-    crate::net::delegate::net_delegate_clear(
-        crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
-    );
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
     let server = registry::create_socket_for_test_or_bootstrap(
         SocketKind::Udp,
@@ -465,11 +450,7 @@ fn udp_loopback_direct_send_kernel_bytes_reaches_receiver() {
 
 #[test]
 fn udp_loopback_msg_more_defers_until_uncork_send() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
     let server = registry::create_socket_for_test_or_bootstrap(
         SocketKind::Udp,

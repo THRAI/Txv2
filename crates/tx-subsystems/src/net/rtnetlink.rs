@@ -8,6 +8,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::str;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -116,6 +117,12 @@ pub struct NetlinkRouteState;
 
 pub struct RawNetlinkRouteSocket {
     rx: SpinMutex<VecDeque<Vec<u8>>>,
+}
+
+impl Default for RawNetlinkRouteSocket {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RawNetlinkRouteSocket {
@@ -772,11 +779,7 @@ fn build_addr_message(seq: u32, pid: u32, flags: u16, link: &NetNamespaceLinkInf
     let Some(addr) = link.ipv4_addr else {
         return build_done_message(seq, pid);
     };
-    let mut payload = Vec::new();
-    payload.push(AF_INET);
-    payload.push(link.ipv4_prefix_len.unwrap_or(32));
-    payload.push(0);
-    payload.push(0);
+    let mut payload = vec![AF_INET, link.ipv4_prefix_len.unwrap_or(32), 0, 0];
     payload.extend_from_slice(&link.ifindex.to_le_bytes());
     push_attr(&mut payload, IFA_ADDRESS, &addr.octets());
     push_attr(&mut payload, IFA_LOCAL, &addr.octets());

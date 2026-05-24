@@ -424,7 +424,7 @@ async fn sys_write_kernel_bytes_to_file<'a>(
             SyscallResult::Return(total as i64)
         }
         Err(v3errno) => {
-            let errno: tx_subsystems::execution::Errno = v3errno.into();
+            let errno: tx_subsystems::execution::Errno = v3errno;
             if errno == tx_subsystems::execution::Errno::EPIPE {
                 let _ = tx_subsystems::signal::step_kill_process(
                     &ctx.process,
@@ -576,16 +576,6 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
                     Ok(mask) => mask,
                     Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
                 };
-                let mut interests = tx_subsystems::net::PollMask::empty();
-                if want_read {
-                    interests |= tx_subsystems::net::PollMask::IN;
-                }
-                if want_write {
-                    interests |= tx_subsystems::net::PollMask::OUT;
-                }
-                if want_except {
-                    interests |= tx_subsystems::net::PollMask::ERR;
-                }
                 if pselect_socket_read_ready(want_read, mask) {
                     fdset_set(&mut read_ready, fd);
                     fd_ready = true;
@@ -598,13 +588,8 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
                     fdset_set(&mut except_ready, fd);
                     fd_ready = true;
                 }
-                let read_blocked = want_read
-                    && !mask.intersects(
-                        tx_subsystems::net::PollMask::IN
-                            | tx_subsystems::net::PollMask::ERR
-                            | tx_subsystems::net::PollMask::HUP
-                            | tx_subsystems::net::PollMask::RDHUP,
-                    );
+                let (read_blocked, write_blocked) =
+                    pselect_socket_blocked_interests(want_read, want_write, mask);
                 if read_blocked {
                     match socket_poll_wait_token_from_file(
                         &file,
@@ -618,8 +603,12 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
                         Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
                     }
                 }
-                if !fd_ready {
-                    match socket_poll_wait_token_from_file(&file, interests, &guard) {
+                if write_blocked {
+                    match socket_poll_wait_token_from_file(
+                        &file,
+                        tx_subsystems::net::PollMask::OUT,
+                        &guard,
+                    ) {
                         Some(Ok(Some(token))) => {
                             push_unique_wait_token(&mut wait_tokens, token);
                         }
@@ -777,16 +766,14 @@ fn pselect_ready_return_should_yield() -> bool {
     PSELECT_READY_RETURNS
         .fetch_add(1, Ordering::Relaxed)
         .wrapping_add(1)
-        % PSELECT_READY_YIELD_INTERVAL
-        == 0
+        .is_multiple_of(PSELECT_READY_YIELD_INTERVAL)
 }
 
 fn pselect_empty_poll_should_yield() -> bool {
     PSELECT_EMPTY_POLL_RETURNS
         .fetch_add(1, Ordering::Relaxed)
         .wrapping_add(1)
-        % PSELECT_EMPTY_POLL_YIELD_INTERVAL
-        == 0
+        .is_multiple_of(PSELECT_EMPTY_POLL_YIELD_INTERVAL)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -942,6 +929,17 @@ fn fdset_write<'a>(ctx: &SyscallCtx<'a>, set_ptr: u64, words: &[u64]) -> Result<
 
 fn pselect_socket_write_ready(want_write: bool, mask: tx_subsystems::net::PollMask) -> bool {
     want_write && mask.intersects(tx_subsystems::net::PollMask::OUT)
+}
+
+pub(super) fn pselect_socket_blocked_interests(
+    want_read: bool,
+    want_write: bool,
+    mask: tx_subsystems::net::PollMask,
+) -> (bool, bool) {
+    (
+        want_read && !pselect_socket_read_ready(true, mask),
+        want_write && !pselect_socket_write_ready(true, mask),
+    )
 }
 
 pub(super) fn pselect_socket_read_ready(
@@ -1319,7 +1317,7 @@ async fn sys_write_pagebacked<'a>(
         {
             V3::Done(()) => {}
             V3::Err(e) => {
-                let errno: tx_subsystems::execution::Errno = e.into();
+                let errno: tx_subsystems::execution::Errno = e;
                 return SyscallResult::error_from(errno);
             }
             V3::Yield { .. } | V3::Continue { .. } => {
@@ -1360,7 +1358,7 @@ async fn sys_write_pagebacked<'a>(
     {
         Ok(total) => SyscallResult::Return(total as i64),
         Err(v3errno) => {
-            let errno: tx_subsystems::execution::Errno = v3errno.into();
+            let errno: tx_subsystems::execution::Errno = v3errno;
             if errno == tx_subsystems::execution::Errno::EPIPE {
                 let _ = tx_subsystems::signal::step_kill_process(
                     &ctx.process,
@@ -1489,7 +1487,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             SyscallResult::Return(total as i64)
         }
         Err(v3errno) => {
-            let errno: tx_subsystems::execution::Errno = v3errno.into();
+            let errno: tx_subsystems::execution::Errno = v3errno;
             // fd-ops Wave 3 — Q2 DECIDED 2026-05-07. SIGPIPE is
             // delivered to the calling process before returning
             // `-EPIPE` to userspace.
@@ -1548,7 +1546,7 @@ async fn sys_read_pagebacked<'a, P: tx_hal::TimeIf>(
         {
             V3::Done(()) => {}
             V3::Err(e) => {
-                let errno: tx_subsystems::execution::Errno = e.into();
+                let errno: tx_subsystems::execution::Errno = e;
                 return SyscallResult::error_from(errno);
             }
             V3::Yield { .. } | V3::Continue { .. } => {
@@ -1589,7 +1587,7 @@ async fn sys_read_pagebacked<'a, P: tx_hal::TimeIf>(
     {
         Ok(total) => SyscallResult::Return(total as i64),
         Err(v3errno) => {
-            let errno: tx_subsystems::execution::Errno = v3errno.into();
+            let errno: tx_subsystems::execution::Errno = v3errno;
             SyscallResult::error_from(errno)
         }
     }
@@ -2013,7 +2011,7 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
             SyscallResult::Return(total as i64)
         }
         Err(v3errno) => {
-            let errno: tx_subsystems::execution::Errno = v3errno.into();
+            let errno: tx_subsystems::execution::Errno = v3errno;
             SyscallResult::error_from(errno)
         }
     }
@@ -2404,7 +2402,7 @@ pub(super) fn sys_copy_file_range<P: tx_hal::TimeIf>(
     let transferred = match outcome {
         tx_substrate::step::StepOutcome::Done(n) => n,
         tx_substrate::step::StepOutcome::Err(e) => {
-            let errno: tx_subsystems::execution::Errno = e.into();
+            let errno: tx_subsystems::execution::Errno = e;
             return SyscallResult::error_from(errno);
         }
         _ => return SyscallResult::Error(EAGAIN_VALUE),
@@ -2570,7 +2568,7 @@ pub(super) async fn sys_sendfile64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     let transferred = match outcome {
         tx_substrate::step::StepOutcome::Done(n) => n,
         tx_substrate::step::StepOutcome::Err(e) => {
-            let errno: tx_subsystems::execution::Errno = e.into();
+            let errno: tx_subsystems::execution::Errno = e;
             return SyscallResult::error_from(errno);
         }
         // If the operation would block, return EAGAIN (sendfile is
@@ -2718,12 +2716,22 @@ async fn sys_read_socket<'a>(
 }
 
 fn inline_io_len_for_file(file: &Cap<OpenFile>, len: usize) -> usize {
-    match file.rnode().backing() {
-        tx_subsystems::vfs::RNodeBacking::PageBacked { .. } => len,
-        tx_subsystems::vfs::RNodeBacking::StructBacked {
-            payload: tx_subsystems::vfs::structure::StructPayload::Socket { .. },
-        } => len.min(SOCKET_IO_MAX_INLINE),
-        _ => len.min(TTY_WRITE_MAX_INLINE),
+    match file.backing() {
+        tx_subsystems::vfs::structure::OpenFileBacking::Rnode { rnode } => match rnode.backing() {
+            tx_subsystems::vfs::RNodeBacking::PageBacked { .. } => len,
+            tx_subsystems::vfs::RNodeBacking::StructBacked {
+                payload: tx_subsystems::vfs::structure::StructPayload::Socket { .. },
+            } => len.min(SOCKET_IO_MAX_INLINE),
+            _ => len.min(TTY_WRITE_MAX_INLINE),
+        },
+        tx_subsystems::vfs::structure::OpenFileBacking::Ufd { .. }
+        | tx_subsystems::vfs::structure::OpenFileBacking::AioContext { .. }
+        | tx_subsystems::vfs::structure::OpenFileBacking::SignalFd { .. }
+        | tx_subsystems::vfs::structure::OpenFileBacking::Epoll { .. }
+        | tx_subsystems::vfs::structure::OpenFileBacking::IoUring { .. }
+        | tx_subsystems::vfs::structure::OpenFileBacking::Eventfd { .. }
+        | tx_subsystems::vfs::structure::OpenFileBacking::Timerfd { .. }
+        | tx_subsystems::vfs::structure::OpenFileBacking::PosixMq { .. } => len,
     }
 }
 

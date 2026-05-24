@@ -130,8 +130,8 @@ impl AddressSpace {
                 // before returning Done.
                 V3::Done(unsafe { value.assume_init() })
             }
-            V3::Done(_) => V3::Err(Errno::EFAULT.into()),
-            V3::Continue { .. } => V3::Err(Errno::EIO.into()),
+            V3::Done(_) => V3::Err(Errno::EFAULT),
+            V3::Continue { .. } => V3::Err(Errno::EIO),
             V3::Yield { shape, .. } => V3::Yield {
                 progress: NoProgress,
                 shape,
@@ -161,8 +161,8 @@ impl AddressSpace {
         let dst_bytes = UserPtr::<u8>::new(dst.addr());
         match self.copy_to_user(dst_bytes, src_bytes, guard) {
             V3::Done(n) if n == src_bytes.len() => V3::Done(()),
-            V3::Done(_) => V3::Err(Errno::EFAULT.into()),
-            V3::Continue { .. } => V3::Err(Errno::EIO.into()),
+            V3::Done(_) => V3::Err(Errno::EFAULT),
+            V3::Continue { .. } => V3::Err(Errno::EIO),
             V3::Yield { shape, .. } => V3::Yield {
                 progress: NoProgress,
                 shape,
@@ -214,7 +214,7 @@ impl AddressSpace {
         for page in range.iter_pages() {
             let page_addr = match page.checked_start_addr() {
                 Ok(a) => a,
-                Err(_) => return V3::err(Errno::EFAULT.into()),
+                Err(_) => return V3::err(Errno::EFAULT),
             };
 
             // Skip pages already published with sufficient protection
@@ -225,7 +225,7 @@ impl AddressSpace {
                     let guard = step_engine::guard();
                     match self.recipes.lookup(page_addr, &guard) {
                         Some(entry) if entry.prot.permits(kind.required_prot()) => continue,
-                        _ => return V3::err(Errno::EFAULT.into()),
+                        _ => return V3::err(Errno::EFAULT),
                     }
                 }
                 // Insufficient cached protection is not a hard fault:
@@ -239,11 +239,11 @@ impl AddressSpace {
             let fault = VmFault::new(page_addr, kind.required_prot());
             let outcome: VmFaultOutcome = match self.resolve_fault(fault) {
                 Ok(o) => o,
-                Err(_) => return V3::err(Errno::EFAULT.into()),
+                Err(_) => return V3::err(Errno::EFAULT),
             };
             let materialization = match outcome.materialize_pagebacked() {
                 Ok(m) => m,
-                Err(_) => return V3::err(Errno::EFAULT.into()),
+                Err(_) => return V3::err(Errno::EFAULT),
             };
             // Publish the materialisation. `replace_existing` honours
             // the materialisation's own intent (private CoW path sets
@@ -260,7 +260,7 @@ impl AddressSpace {
                 )
                 .is_err()
             {
-                return V3::err(Errno::EFAULT.into());
+                return V3::err(Errno::EFAULT);
             }
         }
         V3::done(())
@@ -291,7 +291,7 @@ impl AddressSpace {
         let mut consumed = 0usize;
         while consumed < max_len {
             let Some(user_addr) = src.addr().checked_add(consumed) else {
-                return V3::Err(Errno::EFAULT.into());
+                return V3::Err(Errno::EFAULT);
             };
             let page_addr = user_addr & !(USER_PAGE_SIZE - 1);
             let within = user_addr - page_addr;
@@ -299,7 +299,7 @@ impl AddressSpace {
             let frame_base =
                 match resolve_user_page_addr(self, page_addr, UserAccessKind::Read, guard) {
                     ResolveOutcome::Done(addr) => addr,
-                    ResolveOutcome::Err(e) => return V3::Err(e.into()),
+                    ResolveOutcome::Err(e) => return V3::Err(e),
                     ResolveOutcome::Blocked(t) => {
                         return V3::Yield {
                             progress: NoProgress,
@@ -328,7 +328,7 @@ impl AddressSpace {
             }
             consumed += chunk;
         }
-        V3::Err(Errno::ENAMETOOLONG.into())
+        V3::Err(Errno::ENAMETOOLONG)
     }
 }
 
@@ -343,7 +343,7 @@ fn copy_in(
         return V3::Done(0);
     }
     if src.addr() == 0 {
-        return V3::Err(Errno::EFAULT.into());
+        return V3::Err(Errno::EFAULT);
     }
     let mut copied = 0usize;
     let total = dst.len();
@@ -352,7 +352,7 @@ fn copy_in(
             return if copied > 0 {
                 V3::Done(copied)
             } else {
-                V3::Err(Errno::EFAULT.into())
+                V3::Err(Errno::EFAULT)
             };
         };
         let page_addr = user_addr & !(USER_PAGE_SIZE - 1);
@@ -381,7 +381,7 @@ fn copy_in(
                 if copied > 0 {
                     return V3::Done(copied);
                 }
-                return V3::Err(e.into());
+                return V3::Err(e);
             }
             ResolveOutcome::Blocked(t) => {
                 return V3::Yield {
@@ -408,7 +408,7 @@ fn copy_out(
         return V3::Done(0);
     }
     if dst.addr() == 0 {
-        return V3::Err(Errno::EFAULT.into());
+        return V3::Err(Errno::EFAULT);
     }
     let mut copied = 0usize;
     let total = src.len();
@@ -417,7 +417,7 @@ fn copy_out(
             return if copied > 0 {
                 V3::Done(copied)
             } else {
-                V3::Err(Errno::EFAULT.into())
+                V3::Err(Errno::EFAULT)
             };
         };
         let page_addr = user_addr & !(USER_PAGE_SIZE - 1);
@@ -442,7 +442,7 @@ fn copy_out(
                 if copied > 0 {
                     return V3::Done(copied);
                 }
-                return V3::Err(e.into());
+                return V3::Err(e);
             }
             ResolveOutcome::Blocked(t) => {
                 return V3::Yield {

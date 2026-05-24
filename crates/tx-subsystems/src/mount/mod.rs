@@ -815,7 +815,7 @@ fn drive_step_outcome_to_done<T>(
     loop {
         match step_fn() {
             StepOutcome::Done(value) => return Ok(value),
-            StepOutcome::Err(e) => return Err(e.into()),
+            StepOutcome::Err(e) => return Err(e),
             _ => {
                 // In bootstrap context, Continue/Yield are not expected;
                 // spin once and retry.
@@ -1250,7 +1250,7 @@ mod tests {
         _guard: &Guard<'_>,
     ) -> StepOutcome<Frame, NoProgress> {
         let exec_err = Errno::ENOSYS;
-        let v3_err: V3Errno = exec_err.into();
+        let v3_err: V3Errno = exec_err;
         StepOutcome::err(v3_err)
     }
 

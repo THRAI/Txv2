@@ -37,7 +37,7 @@ impl Ipv4MulticastMemberships {
         if !group.group.is_multicast() {
             return Err(Errno::EINVAL);
         }
-        if self.entries.iter().any(|entry| *entry == Some(group)) {
+        if self.entries.contains(&Some(group)) {
             return Ok(());
         }
         let Some(slot) = self.entries.iter_mut().find(|entry| entry.is_none()) else {

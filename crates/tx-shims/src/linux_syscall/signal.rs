@@ -172,7 +172,7 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                     return SyscallResult::Error(ESRCH_VALUE);
                 }
                 Err(v3errno) => {
-                    return SyscallResult::error_from(Errno::from(v3errno));
+                    return SyscallResult::error_from(v3errno);
                 }
             }
         }
@@ -189,7 +189,7 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                     return SyscallResult::Error(ESRCH_VALUE);
                 }
                 Err(v3errno) => {
-                    return SyscallResult::error_from(Errno::from(v3errno));
+                    return SyscallResult::error_from(v3errno);
                 }
             }
         }
@@ -490,7 +490,7 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
                     return SyscallResult::Error(ESRCH_VALUE);
                 }
                 Err(v3errno) => {
-                    return SyscallResult::error_from(Errno::from(v3errno));
+                    return SyscallResult::error_from(v3errno);
                 }
             }
         }
@@ -740,7 +740,7 @@ pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(()) => return SyscallResult::Return(0),
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+            Err(v3errno) => return SyscallResult::error_from(v3errno),
         }
     }
     SyscallResult::Error(ESRCH_VALUE)

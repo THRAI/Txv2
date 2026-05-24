@@ -674,7 +674,7 @@ pub(super) fn read_recvmmsg_timeout<'a>(
     bootstrap_copy_from_user(&ctx.aspace, &mut bytes, timeout_ptr)?;
     let tv_sec = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
     let tv_nsec = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
-    if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 {
+    if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
         return Err(Errno::EINVAL);
     }
 
