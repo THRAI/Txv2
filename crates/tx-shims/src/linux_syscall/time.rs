@@ -632,14 +632,9 @@ pub(super) fn consume_itimer_real_delivered_interrupt(pid: u32) -> bool {
     ITIMER_REAL_DELIVERED_INTERRUPTS.lock().remove(&pid)
 }
 
-pub fn maybe_deliver_itimer_signal<P: TimeIf>(
-    mut ctx: UserTrapContext,
-    process: &Cap<ProcessIdentity>,
-    thread: &Cap<ThreadIdentity>,
-    aspace: &AddressSpace,
-) -> UserTrapContext {
-    let delivered = with_interval_timers(|timers| {
-        let key = (process.pid.0, ITIMER_REAL);
+fn take_due_itimer_real<P: TimeIf>(pid: u32) -> bool {
+    with_interval_timers(|timers| {
+        let key = (pid, ITIMER_REAL);
         let Some(timer) = timers.get_mut(&key) else {
             return false;
         };
@@ -653,8 +648,22 @@ pub fn maybe_deliver_itimer_signal<P: TimeIf>(
             timer.deadline_ns = now_ns.saturating_add(timer.interval_ns);
         }
         true
-    });
-    if !delivered {
+    })
+}
+
+pub fn maybe_deliver_itimer_signal<P: TimeIf>(
+    mut ctx: UserTrapContext,
+    process: &Cap<ProcessIdentity>,
+    thread: &Cap<ThreadIdentity>,
+    aspace: &AddressSpace,
+) -> UserTrapContext {
+    let Some(thread_payload) = thread.payload_cap() else {
+        return ctx;
+    };
+    if thread_payload.has_saved_signal_context() {
+        return ctx;
+    }
+    if !take_due_itimer_real::<P>(process.pid.0) {
         return ctx;
     }
     ITIMER_REAL_DELIVERED_INTERRUPTS
@@ -666,9 +675,6 @@ pub fn maybe_deliver_itimer_signal<P: TimeIf>(
     };
     let Some(SigDisposition::Handler(handler)) = process.sig_disposition(sig) else {
         let _ = step_kill_process(process, sig, None);
-        return ctx;
-    };
-    let Some(thread_payload) = thread.payload_cap() else {
         return ctx;
     };
 
@@ -721,6 +727,7 @@ pub fn maybe_deliver_itimer_signal<P: TimeIf>(
     ctx.regs[10] = usize::from(SIGALRM_RAW);
     ctx.regs[11] = siginfo_addr;
     ctx.regs[12] = ucontext_addr;
+    thread_payload.store_saved_signal_context(Some(frame.user_context));
     ctx
 }
 

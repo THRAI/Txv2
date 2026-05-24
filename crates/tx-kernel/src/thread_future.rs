@@ -687,6 +687,13 @@ pub async fn run_thread<P: TxPlatform>(
                         // `UserTrapContext`, per
                         // `make_initial_user_trap_context`).
                     }
+                    tx_shims::linux_syscall::SyscallResult::SigreturnContextRestored => {
+                        // The syscall arm already restored a
+                        // syscall-layer compatibility frame (currently
+                        // the itimer/SIGALRM frame). Do not decode a
+                        // second platform frame from the same stack
+                        // pointer.
+                    }
                     tx_shims::linux_syscall::SyscallResult::SigreturnRestored => {
                         // `rt_sigreturn` is special: musl cancellation
                         // handlers may edit the on-stack ucontext (notably

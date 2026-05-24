@@ -1076,16 +1076,17 @@ fn emit_syscall_exit(span: SpanId, result: &SyscallResult) {
     };
     // result_kind: 0=Ok, 1=Err, 2=Restart, 3=Fatal, 4=NoReturn (per
     // OBSERVATION_SERIALIZATION_v0 §8.1). `ExecCommitted` and
-    // `SigreturnRestored` are kernel-internal control-flow markers that
-    // never surface as a userspace return value; classify both as NoReturn
-    // for the trace so the daemon's syscall slice closes cleanly even
-    // though no `a0` write occurs.
+    // `Sigreturn*` are kernel-internal control-flow markers that never
+    // surface as a userspace return value; classify them as NoReturn for
+    // the trace so the daemon's syscall slice closes cleanly even though
+    // no `a0` write occurs.
     let (ret, errno, result_kind) = match result {
         SyscallResult::Return(v) => (*v, 0, 0u8),
         SyscallResult::Error(e) => (0, *e, 1u8),
         SyscallResult::NoReturn => (0, 0, 4u8),
         SyscallResult::ExecCommitted => (0, 0, 4u8),
         SyscallResult::SigreturnRestored => (0, 0, 4u8),
+        SyscallResult::SigreturnContextRestored => (0, 0, 4u8),
     };
     let payload = PayloadSyscallExit {
         ret,

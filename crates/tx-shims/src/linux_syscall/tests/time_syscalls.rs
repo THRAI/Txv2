@@ -435,7 +435,7 @@ fn itimer_real_sigalrm_handler_round_trip_restores_context() {
         SyscallRequest::new(NR_RT_SIGRETURN, [0; 6]),
         &ctx,
     ));
-    assert_eq!(r, SyscallResult::SigreturnRestored);
+    assert_eq!(r, SyscallResult::SigreturnContextRestored);
     let restored = payload
         .saved_user_context()
         .expect("sigreturn restored context");

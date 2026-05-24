@@ -91,6 +91,99 @@
   `make oscomp-local-rv64-smp4` / selected libctest lane. **Blocker:** none for
   the immediate `basic-musl` SMP panic.
 
+- 2026-05-24 **Restored OSComp netperf/iperf after the network rebase.**
+  Root cause was twofold. First, the init split lost the earlier
+  concurrent-poll behavior where `sys_clone` can submit a child userspace
+  thread immediately; every child went through the deferred queue, so
+  daemon-style benchmark servers could return control to the shell before the
+  listening child had run. The split `init/reactor_submit.rs` now restores
+  immediate child submission when `USE_CONCURRENT_POLL` is active, while
+  keeping deferred submission for the legacy single-lock reactor path. Second,
+  netperf's `SIGALRM` completion path used the small itimer compatibility
+  signal frame; `rt_sigreturn` restored it in the syscall layer, then the
+  thread future tried to decode the same stack as a platform `SignalFrameIf`
+  frame and killed the process with `SIGSEGV`. `SyscallResult` now separates
+  platform-frame sigreturn from already-restored compatibility-frame
+  sigreturn. **Verified:** `cargo fmt --check`; `cargo test -p tx-kernel
+  reactor_submission_seam_submits_child_thread_smoke -- --test-threads=1`;
+  `cargo test -p tx-kernel sigreturn -- --test-threads=1`; `cargo test -p
+  tx-shims itimer_real_sigalrm -- --test-threads=1`; `cargo build -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`; `cargo
+  xtask oscomp submit --target rv64-qemu`; `iperf-musl 6/6`,
+  `iperf-glibc 6/6`, `netperf-musl 5/5`, and `netperf-glibc 5/5` via focused
+  `cargo xtask oscomp qemu --target rv64-qemu --boot-suite ...` plus matching
+  `cargo xtask oscomp score` runs. **Next step:** keep using focused
+  benchmark suites after future rebases before drawing conclusions from the
+  broad default OSComp chain. **Blocker:** none for netperf/iperf.
+
+- 2026-05-24 **Re-ran the default OSComp RV64 serial entry after the
+  `feature-network` rebase fixes.** Prepared a fresh RV64 build with
+  `cargo xtask full-build --target rv64-qemu --skip-doctor`, then ran
+  `cargo xtask oscomp test --target rv64-qemu --skip-build` in 30-second
+  observation windows. The run completed `basic-musl`, `busybox-musl`, and
+  `libctest-musl`, then stopped making progress in `libcbench-musl` after
+  printing `b_malloc_sparse (0)` and no `time:` line. The bounded serial score
+  was `376.0/404`: `basic-musl 102/102`, `busybox-musl 54/55` with only
+  `busybox kill 10` failing, `libctest-musl 220/220`, and `libcbench-musl
+  0/27`. Because the default script blocks in `libcbench-musl`, later default
+  suites (`lua`, `lmbench`, `iozone`, `netperf`, `iperf`, `cyclictest`, `ltp`)
+  were not reached in this all-entry run. **Next step:** diagnose the
+  non-network `libc-bench` first benchmark separately, or continue using
+  focused group runs for network suites until `libcbench-musl` is unstuck.
+  **Blocker:** `libcbench-musl` currently blocks the default serial chain.
+
+- 2026-05-24 **Swept OSComp non-LTP suites individually after `libcbench`
+  blocked the default chain.** Used focused `cargo xtask oscomp qemu --target
+  rv64-qemu --boot-suite <suite>` runs with short observation windows, then
+  scored each suite with `cargo xtask oscomp score --target rv64-qemu --suite
+  <suite>`. Musl bounded results: `basic-musl 102/102`, `busybox-musl 54/55`
+  (`busybox kill 10` only), `libctest-musl 220/220`, `libcbench-musl 0/27`
+  (stops after `b_malloc_sparse (0)`), `lua-musl 9/9`, `lmbench-musl 3/36`
+  after 120s (`Simple syscall/read/write` only), `iozone-musl 0/20` (sanity
+  check failed, then throughput stopped producing result rows), `netperf-musl
+  0/5`, `iperf-musl 4/6` (BASIC UDP/TCP fail, later parallel/reverse cases
+  pass), and `cyclictest-musl 0/4`. Glibc bounded results: `basic-glibc
+  102/102`, `busybox-glibc 54/55`, `libctest-glibc 63/220` before stopping in
+  the static pthread-condattr area, `libcbench-glibc 17/27` after 120s,
+  `lua-glibc 9/9`, `lmbench-glibc 1/36` after 60s, `iozone-glibc 0/20`,
+  `netperf-glibc 0/5`, `iperf-glibc 5/6`, and `cyclictest-glibc 0/4`. The
+  current netperf failures differ from the saved May 23 passing logs: netserver
+  is not ready when the first client attempts the control connection, and later
+  netperf subtests segfault. **Next step:** investigate the network regression
+  around child/server scheduling and readiness before returning to broad
+  non-network suites. **Blocker:** official netperf/iperf suites are no longer
+  fully green despite the older saved logs.
+
+- 2026-05-24 **Compared current `main` OSComp musl behavior against the
+  network branch after the non-LTP sweep.** Created a detached main worktree at
+  `/tmp/txv2-main-musl-check` on `52ce77c6` and used main's compile-time
+  `TX_OSCOMP_GROUPS` path because that mainline `xtask oscomp qemu` does not
+  yet translate `--boot-suite` into a QEMU cmdline append. Focused main
+  results against the same sdcard/testdata: `netperf-musl 0/5`,
+  `iperf-musl 0/6`, and `libcbench-musl 0/27` (90s, only group start printed).
+  This means the current mainline is not a fully passing musl baseline outside
+  netperf/iperf, and the current netperf failure is not unique to the rebased
+  `feature-network` branch. **Next step:** compare against the saved May 23
+  passing netperf/iperf logs or the earlier known-good network commit to find
+  the real regression point. **Blocker:** current main is not the passing
+  baseline implied by the remembered status.
+
+- 2026-05-24 **Completed the missing current-main musl suite spot-checks.**
+  Still using `/tmp/txv2-main-musl-check` at `52ce77c6`, rebuilt the RV64
+  kernel per suite with `TX_OSCOMP_GROUPS=<suite>`, submitted it, and ran
+  `cargo xtask oscomp qemu --target rv64-qemu --data
+  /home/msp/learning/Txv2/target/oscomp/testdata`. Additional main results:
+  `lua-musl 9/9`, `lmbench-musl 0/36` after 120s (only group header and
+  `latency measurements` printed), `iozone-musl 0/20` after 90s (stage headers
+  but no result rows), and `cyclictest-musl 0/4`. Combined with the prior main
+  checks, current main is demonstrably not a fully passing musl baseline outside
+  netperf/iperf: `libcbench-musl`, `lmbench-musl`, `iozone-musl`, and
+  `cyclictest-musl` also fail or fail to produce scoreable output within the
+  bounded windows. **Next step:** if a passing baseline exists, identify its
+  exact commit/image pair before comparing feature-network changes. **Blocker:**
+  remembered "all but netperf/iperf" status does not match current main
+  `52ce77c6` plus the local OSComp sdcard.
+
 - 2026-05-24 **Compared OSComp against `main` and repaired the feature-branch
   exec regression.** `main` scored `376/377` for
   `TX_OSCOMP_GROUPS=basic-musl,busybox-musl,libctest-musl`, while the rebased

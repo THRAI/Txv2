@@ -337,6 +337,13 @@ impl ThreadPayload {
         *self.saved_signal_context.lock() = ctx;
     }
 
+    /// Return whether a signal handler is currently using the saved
+    /// pre-handler context slot. Delivery code uses this to avoid
+    /// nesting another handler on top of the single parked context.
+    pub fn has_saved_signal_context(&self) -> bool {
+        self.saved_signal_context.lock().is_some()
+    }
+
     /// Take (consume) the saved signal context. Called by
     /// `rt_sigreturn` to retrieve the pre-handler context for
     /// restoration into `saved_user_context`. Returns `None` if no
