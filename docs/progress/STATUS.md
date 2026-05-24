@@ -1,3 +1,41 @@
+- 2026-05-24 **Advanced OSComp LTP syscall-network coverage on
+  `feature-network`.** The focused LTP runner now honors filtered
+  `ltp-musl:<case+case>` selections instead of falling back to the default
+  suite, and the rootfs now installs BusyBox `ip`/`ifconfig` plus identity
+  files so network LTP setup can resolve tooling and `nobody`. Socket work
+  added `SO_PEERCRED` for accepted AF_UNIX streams, TCP `MSG_MORE` corking,
+  non-root `EACCES` for privileged IPv4 binds, AF_UNIX abstract pathname
+  parsing, AF_UNIX `getsockname`/`getpeername`, AF_UNIX datagram `recvfrom`
+  source-address writeback, AF_UNIX `sendto` destination decoding, and real
+  anonymous AF_UNIX `socketpair` stream/datagram peer wiring with
+  `SOCK_CLOEXEC`/`SOCK_NONBLOCK` propagation. Reactor timer polling now
+  advances due timers during ready-poll loops, and user-copy helpers reject
+  partial guarded-struct copies. **Verified:** `cargo fmt --check`; `cargo
+  test -p tx-shims linux_syscall::tests::socket_fdtable --
+  --test-threads=1`; `cargo test -p tx-kernel filtered_ltp --
+  --test-threads=1`; `cargo test -p tx-subsystems
+  vm_read_write_user_reject_partial_guard_crossing_structs -- --test-threads=1`;
+  `cargo test -p tx-reactor
+  concurrent_hart_loop_advances_due_timers_between_ready_polls --
+  --test-threads=1`; `cargo test -p tx-reactor
+  blocked_userspace_thread_wakes_through_new_queue_even_with_remaining_budget
+  -- --test-threads=1`; `cargo test -p tx-reactor
+  userspace_thread_trap_requeues_at_front_even_after_budget_exhaustion --
+  --test-threads=1`; `cargo xtask build --target rv64-qemu`;
+  `CARGO_TARGET_DIR=target/host-cargo cargo xtask oscomp submit --target
+  rv64-qemu --submit target/oscomp/submit`; focused LTP/judge
+  `socketpair01,socketpair02,getpeername01 21/21`; focused LTP/judge
+  `bind02,bind04,bind05,getpeername01 13/15` with `bind02`, `bind05`, and
+  `getpeername01` passing. **Next step:** split the 50-case network list into
+  batches for aggregate scoring because one bootarg-length probe truncated the
+  full list around `send01+s`; then decide whether to implement real
+  AF_UNIX `SOCK_SEQPACKET`. **Blocker:** remaining focused gaps are semantic
+  or environment gates, not one-off errno fixes: `bind04` needs Unix
+  seqpacket, `bind06` needs kernel config visibility, IPv6/RDS cases remain
+  unsupported/TCONF, `recvmmsg01` still hits the known OSComp musl wrapper
+  guard-page SIGSEGV before the kernel sees the second bad-vector subcase,
+  and `socketcall*` is not present on RV64.
+
 - 2026-05-24 **Verified and fixed RV64 SMP4 netperf/iperf coverage on
   `feature-network`.** Focused `netperf-musl -smp4` passed immediately, but
   `netperf-glibc -smp4` exposed a boot-hart-3 stack underflow before the test

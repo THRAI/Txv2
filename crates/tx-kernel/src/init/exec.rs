@@ -1038,6 +1038,16 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 selected += 1;
                 continue;
             }
+            if let Some(filter) = group.strip_prefix("ltp-musl:") {
+                append_filtered_ltp(&mut cmd, "musl", filter);
+                selected += 1;
+                continue;
+            }
+            if let Some(filter) = group.strip_prefix("ltp:") {
+                append_filtered_ltp(&mut cmd, "musl", filter);
+                selected += 1;
+                continue;
+            }
             if let Some(script) = oscomp_glibc_script_for_group(group) {
                 let _ = write!(
                     cmd,
@@ -1056,6 +1066,55 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
         append_default_oscomp_scripts(&mut cmd);
     }
     cmd
+}
+
+fn append_filtered_ltp(cmd: &mut alloc::string::String, libc: &str, filter: &str) {
+    let group = oscomp_group_label("ltp", libc);
+    let echo = match libc {
+        "glibc" => "/musl/musl/busybox echo",
+        _ => "./busybox echo",
+    };
+
+    let _ = write!(
+        cmd,
+        "; {echo} \"#### OS COMP TEST GROUP START {group} ####\""
+    );
+    for case in filter.split('+') {
+        let case = case.trim();
+        if case.is_empty() {
+            continue;
+        }
+        if !is_ltp_case_token(case) {
+            let _ = write!(
+                cmd,
+                "; {echo} \"SKIP LTP CASE {case} : invalid case token\""
+            );
+            continue;
+        }
+
+        let _ = write!(
+            cmd,
+            "; {echo} \"RUN LTP CASE {case}\"; \
+             \"ltp/testcases/bin/{case}\"; \
+             ret=$?; \
+             if [ \"$ret\" -eq 0 ]; then \
+                 {echo} \"PASS LTP CASE {case} : $ret\"; \
+             else \
+                 {echo} \"FAIL LTP CASE {case} : $ret\"; \
+             fi; \
+             if [ \"$ret\" -eq 0 ]; then \
+                 {echo} \"FAIL LTP CASE {case} : $ret\"; \
+             fi"
+        );
+    }
+    let _ = write!(cmd, "; {echo} \"#### OS COMP TEST GROUP END {group} ####\"");
+}
+
+fn is_ltp_case_token(case: &str) -> bool {
+    !case.is_empty()
+        && case
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn append_filtered_libctest(cmd: &mut alloc::string::String, filter: &str) {
@@ -1386,6 +1445,31 @@ mod tests {
         assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_points"));
         assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel"));
         assert!(!cmd.contains("skipped known hang"));
+    }
+
+    #[test]
+    fn filtered_ltp_emits_case_markers_without_default_suite() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_filtered_ltp(&mut cmd, "musl", "socket01+getsockopt01");
+
+        assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-musl ####"));
+        assert!(cmd.contains("\"RUN LTP CASE socket01\""));
+        assert!(cmd.contains("\"ltp/testcases/bin/socket01\""));
+        assert!(cmd.contains("\"PASS LTP CASE socket01 : $ret\""));
+        assert!(cmd.contains("\"FAIL LTP CASE socket01 : $ret\""));
+        assert!(cmd.contains("\"RUN LTP CASE getsockopt01\""));
+        assert!(cmd.contains("#### OS COMP TEST GROUP END ltp-musl ####"));
+        assert!(!cmd.contains("basic_testcode.sh"));
+    }
+
+    #[test]
+    fn filtered_ltp_rejects_shell_metacharacters() {
+        let mut cmd = String::new();
+        append_filtered_ltp(&mut cmd, "musl", "socket01+bad;case");
+
+        assert!(cmd.contains("\"ltp/testcases/bin/socket01\""));
+        assert!(cmd.contains("SKIP LTP CASE bad;case : invalid case token"));
+        assert!(!cmd.contains("\"ltp/testcases/bin/bad;case\""));
     }
 
     #[test]

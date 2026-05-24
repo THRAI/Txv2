@@ -17,10 +17,11 @@ use tx_subsystems::net::{
     step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
     step_send_udp_loopback_kernel_bytes, step_shutdown, step_socket_close,
     step_socket_open_file_in_namespace, step_tcp_loopback_handshake, step_tcp_loopback_transfer,
-    AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, Ipv4MulticastGroup, KernelSockAddr,
-    LingerOption, PollMask, SendRecvFlags, SockAddrIn, SockAddrLl, SockShutdownCmd,
-    SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol, SocketType, TcpState, UdpInner,
-    UnixDatagramState, UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
+    step_unix_socketpair_connect, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address,
+    Ipv4MulticastGroup, KernelSockAddr, LingerOption, PollMask, SendRecvFlags, SockAddrIn,
+    SockAddrLl, SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol,
+    SocketType, TcpState, UdpInner, UnixDatagramState, UnixPeerCred, UnixSocketPath,
+    UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
 };
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::vfs::structure::OpenFileBacking;
@@ -119,12 +120,79 @@ fn socket_requires_net_raw(kind: SocketKind, valid: ValidSocketType) -> bool {
             ))
 }
 
-pub(super) fn sys_socketpair<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let domain = args[0] as i32;
-    if domain != AF_INET as i32 {
-        return SyscallResult::Error(errno_to_i32(Errno::EAFNOSUPPORT));
+    let type_ = args[1] as i32;
+    let protocol = args[2] as i32;
+    let sv = args[3];
+    let valid = match ValidSocketType::validate(domain, type_, protocol) {
+        Ok(valid) => valid,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    let kind = match SocketKind::from_valid_socket_type(valid) {
+        Ok(kind) => kind,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    if valid.domain != AddressFamily::Unix {
+        return SyscallResult::Error(errno_to_i32(Errno::EOPNOTSUPP));
     }
-    SyscallResult::Error(errno_to_i32(Errno::EOPNOTSUPP))
+    if !matches!(kind, SocketKind::UnixDatagram | SocketKind::UnixStream) {
+        return SyscallResult::Error(errno_to_i32(Errno::EOPNOTSUPP));
+    }
+    if let Err(errno) = validate_user_range(ctx, sv, 8, UserAccessKind::Write) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+
+    let Some(net_namespace) = ctx.process.net_namespace() else {
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+    let first = {
+        let guard = tx_substrate::epoch::guard();
+        match step_socket_open_file_in_namespace(
+            domain,
+            type_,
+            protocol,
+            net_namespace.clone(),
+            &guard,
+        ) {
+            StepOutcome::Done(opened) => opened,
+            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                return SyscallResult::Error(EIO_VALUE);
+            }
+        }
+    };
+    let second = {
+        let guard = tx_substrate::epoch::guard();
+        match step_socket_open_file_in_namespace(domain, type_, protocol, net_namespace, &guard) {
+            StepOutcome::Done(opened) => opened,
+            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                return SyscallResult::Error(EIO_VALUE);
+            }
+        }
+    };
+    {
+        let guard = tx_substrate::epoch::guard();
+        match step_unix_socketpair_connect(&first.identity, &second.identity, &guard) {
+            StepOutcome::Done(()) => {}
+            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                return SyscallResult::Error(EIO_VALUE);
+            }
+        }
+    }
+
+    let first_fd = ctx.process.allocate_fd();
+    let _ = ctx.process.set_fd(first_fd, Some(first.file));
+    ctx.process.set_fd_cloexec(first_fd, first.cloexec);
+    let second_fd = ctx.process.allocate_fd();
+    let _ = ctx.process.set_fd(second_fd, Some(second.file));
+    ctx.process.set_fd_cloexec(second_fd, second.cloexec);
+    match bootstrap_write_user::<[i32; 2]>(&ctx.aspace, sv, [first_fd as i32, second_fd as i32]) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
 }
 
 pub(super) fn sys_bind<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
@@ -159,8 +227,10 @@ pub(super) fn sys_bind<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
             Ok(path) => path,
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         };
-        if let Err(errno) = unix_pathname_bind_precheck(ctx, path.as_bytes()) {
-            return SyscallResult::Error(errno_to_i32(errno));
+        if !path.is_abstract() {
+            if let Err(errno) = unix_pathname_bind_precheck(ctx, path.as_bytes()) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
         }
         let outcome = {
             let guard = tx_substrate::epoch::guard();
@@ -172,6 +242,10 @@ pub(super) fn sys_bind<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
         Ok(addr) => addr,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
+    let requested = addr.as_ip_endpoint();
+    if requested.port != 0 && requested.port < 1024 && ctx.cred().euid.raw() != 0 {
+        return SyscallResult::Error(EACCES_VALUE);
+    }
 
     bind_with_ephemeral_port(&socket, addr)
 }
@@ -323,7 +397,10 @@ async fn connect_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
             step_connect(&socket, remote, &guard)
         };
         match outcome {
-            StepOutcome::Done(()) => return SyscallResult::Return(0),
+            StepOutcome::Done(()) => {
+                record_unix_stream_peer_cred(&socket, ctx);
+                return SyscallResult::Return(0);
+            }
             StepOutcome::Yield { shape, .. } => {
                 let connected = match drive_tcp_loopback_after_connect(&socket) {
                     Ok(connected) => connected || !socket_is_tcp_connecting(&socket),
@@ -356,6 +433,31 @@ async fn connect_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
     }
 }
 
+fn record_unix_stream_peer_cred(socket: &Cap<SocketIdentity>, ctx: &SyscallCtx<'_>) {
+    if socket.kind != SocketKind::UnixStream {
+        return;
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return;
+    };
+    let guard = tx_substrate::epoch::guard();
+    let Some(peer) = payload
+        .socket_table()
+        .lookup_unix_stream_peer(socket.raw(), &guard)
+    else {
+        return;
+    };
+    let Some(peer_payload) = peer.acquire_operational() else {
+        return;
+    };
+    let cred = ctx.cred();
+    peer_payload.set_unix_peer_cred(UnixPeerCred {
+        pid: ctx.process.pid.0,
+        uid: cred.uid.raw(),
+        gid: cred.gid.raw(),
+    });
+}
+
 mod helpers;
 use helpers::*;
 pub(super) use helpers::{socket_poll_mask_from_file, socket_poll_wait_token_from_file};
@@ -386,6 +488,19 @@ pub(super) fn sys_getsockname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
         };
     }
+    if matches!(
+        socket.kind,
+        SocketKind::UnixDatagram | SocketKind::UnixStream
+    ) {
+        let path = match socket_unix_local_path(&socket) {
+            Ok(path) => path,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        };
+        return match write_sockaddr_un(ctx, args[1], args[2], path) {
+            Ok(()) => SyscallResult::Return(0),
+            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        };
+    }
     let endpoint = match socket_local_endpoint(&socket) {
         Ok(endpoint) => endpoint,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
@@ -401,6 +516,19 @@ pub(super) fn sys_getpeername<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         Ok((_, socket)) => socket,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
+    if matches!(
+        socket.kind,
+        SocketKind::UnixDatagram | SocketKind::UnixStream
+    ) {
+        let path = match socket_unix_peer_path(&socket) {
+            Ok(path) => path,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        };
+        return match write_sockaddr_un(ctx, args[1], args[2], path) {
+            Ok(()) => SyscallResult::Return(0),
+            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        };
+    }
     let endpoint = match socket_peer_endpoint(&socket) {
         Ok(endpoint) => endpoint,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
@@ -475,7 +603,20 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
     }
 
     let ignore_dst = tcp_sendto_ignores_destination(&socket);
-    let dst = if args[4] != 0 && !ignore_dst {
+    let unix_dst = if matches!(
+        socket.kind,
+        SocketKind::UnixDatagram | SocketKind::UnixStream
+    ) && args[4] != 0
+        && !ignore_dst
+    {
+        match read_sockaddr_un_path(ctx, args[4], args[5]) {
+            Ok(path) => Some(path),
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        }
+    } else {
+        None
+    };
+    let dst = if args[4] != 0 && unix_dst.is_none() && !ignore_dst {
         match read_sockaddr_in(ctx, args[4], args[5]) {
             Ok(addr) => Some(addr.as_ip_endpoint()),
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
@@ -541,7 +682,11 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
     loop {
         let outcome = {
             let guard = tx_substrate::epoch::guard();
-            step_send_to_kernel_bytes(&socket, dst, remaining, flags, &guard)
+            if let Some(unix_dst) = unix_dst {
+                step_send_to_unix_path_kernel_bytes(&socket, unix_dst, remaining, flags, &guard)
+            } else {
+                step_send_to_kernel_bytes(&socket, dst, remaining, flags, &guard)
+            }
         };
         match outcome {
             StepOutcome::Done(sent) => {
@@ -723,6 +868,10 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                 }
                 if let Some(source) = recv.source {
                     if let Err(errno) = write_sockaddr_endpoint(ctx, args[4], args[5], source) {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                } else if let Some(source) = recv.unix_source {
+                    if let Err(errno) = write_sockaddr_un(ctx, args[4], args[5], Some(source)) {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
                 }
@@ -1446,6 +1595,12 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             write_sockopt_i32(ctx, optval, optlen_ptr, socket_type_i32(&socket))
         }
         (SOL_SOCKET, SO_ERROR) => write_sockopt_i32(ctx, optval, optlen_ptr, 0),
+        (SOL_SOCKET, SO_PEERCRED) if socket.kind == SocketKind::UnixStream => {
+            match payload.unix_peer_cred() {
+                Some(cred) => write_sockopt_unix_peer_cred(ctx, optval, optlen_ptr, cred),
+                None => Err(Errno::ENOTCONN),
+            }
+        }
         (SOL_SOCKET, SO_RCVTIMEO) => write_sockopt_timeval(
             ctx,
             optval,
@@ -1501,6 +1656,19 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
+}
+
+fn write_sockopt_unix_peer_cred<'a>(
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen_ptr: u64,
+    cred: UnixPeerCred,
+) -> Result<(), Errno> {
+    let mut bytes = [0u8; 12];
+    bytes[0..4].copy_from_slice(&(cred.pid as i32).to_le_bytes());
+    bytes[4..8].copy_from_slice(&cred.uid.to_le_bytes());
+    bytes[8..12].copy_from_slice(&cred.gid.to_le_bytes());
+    write_sockopt_bytes(ctx, optval, optlen_ptr, &bytes)
 }
 
 pub(super) fn sys_shutdown<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {

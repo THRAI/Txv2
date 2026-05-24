@@ -6,7 +6,7 @@
 // `impl<P: TxPlatform> CoreInit<P>` block in `init.rs` and
 // `init::exec`.
 //
-// The helper creates `/bin/{sh,busybox,ls}` and `/usr/bin/env` as
+// The helper creates `/bin/{sh,busybox,ls,ip,ifconfig}` and `/usr/bin/env` as
 // rootfs-tmpfs symlinks pointing at `/musl/musl/busybox` so the
 // OSComp `libctest`, `lua`, and `libcbench` wrapper scripts find
 // their shebang interpreters. See the doc-comment on
@@ -27,6 +27,8 @@ impl<P: TxPlatform> CoreInit<P> {
     /// /bin/sh         → /musl/musl/busybox  (handles `#!/bin/sh`)
     /// /bin/cat        → /musl/musl/busybox  (LTP opens it as a stable file)
     /// /bin/ls         → /musl/musl/busybox  (lets BusyBox `which ls` pass)
+    /// /bin/ip         → /musl/musl/busybox  (lets LTP setup scripts bring up lo)
+    /// /bin/ifconfig   → /musl/musl/busybox  (same, for older LTP helpers)
     /// /usr/bin/env    → /musl/musl/busybox  (handles `#!/usr/bin/env …`)
     /// /lib/ld-linux-riscv64-lp64d.so.1 → /musl/glibc/lib/ld-linux-riscv64-lp64d.so.1
     /// /lib/libc.so.6  → /musl/glibc/lib/libc.so.6
@@ -80,6 +82,8 @@ impl<P: TxPlatform> CoreInit<P> {
         let _ = symlink_into(fs_ops, bin_id, b"cat", b"/musl/musl/busybox", &cred);
         let _ = symlink_into(fs_ops, bin_id, b"true", b"/musl/musl/busybox", &cred);
         let _ = symlink_into(fs_ops, bin_id, b"ls", b"/musl/musl/busybox", &cred);
+        let _ = symlink_into(fs_ops, bin_id, b"ip", b"/musl/musl/busybox", &cred);
+        let _ = symlink_into(fs_ops, bin_id, b"ifconfig", b"/musl/musl/busybox", &cred);
 
         // /usr and /usr/bin
         let usr_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"usr", 0o755, &cred) {

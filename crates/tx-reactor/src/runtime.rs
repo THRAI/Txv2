@@ -402,7 +402,7 @@ impl SharedReactor {
 
         let reactor = self.initialized()?;
         let mut stats = RunStats::empty();
-        let timer_wakes: usize;
+        let mut timer_wakes: usize;
         let wake_report: WakeDispatchReport;
 
         // Phase 1: advance time & drain wakes through shared/local locks.
@@ -417,6 +417,8 @@ impl SharedReactor {
         loop {
             let poll_packet = {
                 let mut view = reactor.hart_runtime_view(hart);
+                timer_wakes =
+                    timer_wakes.saturating_add(view.advance_time_to(slice_clock.now_ns()));
                 view.drain_wakes_for_hart(hart, signal);
                 let Some((handle, slice)) = view.pick_next_or_steal_local(hart) else {
                     break;
@@ -711,6 +713,7 @@ impl HartRuntimeView<'_> {
         };
         loop {
             let Some((key, mut future, wake_state, slice)) = ({
+                self.advance_time_to(slice_clock.now_ns());
                 self.drain_wakes_for_hart(hart, signal);
                 let Some((handle, slice)) = self.pick_next_or_steal_local(hart) else {
                     break;

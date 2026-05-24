@@ -40,6 +40,7 @@ pub struct SocketPayload {
     pub(crate) raw_netlink_route: Option<RawNetlinkRouteSocket>,
     pub(crate) raw_netlink_netfilter: Option<RawNetlinkNetfilterSocket>,
     pub(crate) io: SpinMutex<SocketIoState>,
+    pub(crate) unix_peer_cred: SpinMutex<Option<UnixPeerCred>>,
     pub(crate) tcp_backlog: SpinMutex<TcpBacklog>,
     pub shutdown_rd: AtomicBool,
     pub shutdown_wr: AtomicBool,
@@ -149,6 +150,7 @@ impl SocketPayload {
             raw_netlink_route,
             raw_netlink_netfilter,
             io: SpinMutex::new(SocketIoState::new()),
+            unix_peer_cred: SpinMutex::new(None),
             tcp_backlog: SpinMutex::new(TcpBacklog::new()),
             shutdown_rd: AtomicBool::new(false),
             shutdown_wr: AtomicBool::new(false),
@@ -273,6 +275,14 @@ impl SocketPayload {
 
     pub fn io_snapshot(&self) -> SocketIoState {
         *self.io.lock()
+    }
+
+    pub fn unix_peer_cred(&self) -> Option<UnixPeerCred> {
+        *self.unix_peer_cred.lock()
+    }
+
+    pub fn set_unix_peer_cred(&self, cred: UnixPeerCred) {
+        *self.unix_peer_cred.lock() = Some(cred);
     }
 
     pub fn raw_tcp_socket(&self) -> Option<&RawTcpSocket> {
@@ -466,7 +476,7 @@ impl SocketPayload {
     ) -> Option<SocketSendReserve> {
         let more = flags.contains(super::types::SendRecvFlags::MSG_MORE);
         let (bytes, became_full) = match (&self.raw_tcp, &self.raw_udp, &self.raw_icmp) {
-            (Some(raw_tcp), None, None) => raw_tcp.enqueue_tx_bytes(bytes)?,
+            (Some(raw_tcp), None, None) => raw_tcp.enqueue_tx_bytes_with_more(bytes, more)?,
             (None, Some(raw_udp), None) => match self.udp_connected_remote() {
                 Some(dst) => raw_udp.enqueue_tx_bytes_to_with_more(dst, bytes, more)?,
                 None => raw_udp.enqueue_tx_bytes_to_with_more(
@@ -489,7 +499,7 @@ impl SocketPayload {
     ) -> Result<Option<SocketSendReserve>, crate::execution::Errno> {
         let more = flags.contains(super::types::SendRecvFlags::MSG_MORE);
         let (bytes, became_full) = match (&self.raw_tcp, &self.raw_udp, &self.raw_icmp) {
-            (Some(raw_tcp), None, None) => match raw_tcp.enqueue_tx_bytes(bytes) {
+            (Some(raw_tcp), None, None) => match raw_tcp.enqueue_tx_bytes_with_more(bytes, more) {
                 Some(reserve) => reserve,
                 None => return Ok(None),
             },
@@ -765,6 +775,13 @@ impl SocketIoState {
             accept_pending: 0,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnixPeerCred {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1274,6 +1291,9 @@ pub enum UnixDatagramState {
     Connected {
         local: Option<UnixSocketPath>,
         peer: UnixSocketPath,
+    },
+    ConnectedPair {
+        peer_raw: u32,
     },
 }
 

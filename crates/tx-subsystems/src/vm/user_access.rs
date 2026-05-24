@@ -103,7 +103,8 @@ impl AddressSpace {
     /// inner copy's byte-progress accumulator is summarised away here
     /// because a partial-`T` read is not a meaningful intermediate
     /// state for the caller). The inner v3 `copy_from_user` is bridged
-    /// per-variant: `Done`/`Continue` → `Done(value)`,
+    /// per-variant: full `Done(size_of::<T>())` → `Done(value)`,
+    /// partial `Done(_)` → `EFAULT`, `Continue` → `EIO`,
     /// `Yield { shape, .. }` → `Yield { progress: NoProgress, shape }`,
     /// `Err` → `Err(errno)` (errno already in `step::Errno`).
     pub fn read_user<T: Copy>(
@@ -124,11 +125,13 @@ impl AddressSpace {
         };
         let src_bytes = UserPtr::<u8>::new(src.addr());
         match self.copy_from_user(dst_bytes, src_bytes, guard) {
-            V3::Done(_) | V3::Continue { .. } => {
+            V3::Done(n) if n == dst_bytes.len() => {
                 // SAFETY: copy_from_user wrote `size_of::<T>()` bytes
                 // before returning Done.
                 V3::Done(unsafe { value.assume_init() })
             }
+            V3::Done(_) => V3::Err(Errno::EFAULT.into()),
+            V3::Continue { .. } => V3::Err(Errno::EIO.into()),
             V3::Yield { shape, .. } => V3::Yield {
                 progress: NoProgress,
                 shape,
@@ -157,7 +160,9 @@ impl AddressSpace {
         };
         let dst_bytes = UserPtr::<u8>::new(dst.addr());
         match self.copy_to_user(dst_bytes, src_bytes, guard) {
-            V3::Done(_) | V3::Continue { .. } => V3::Done(()),
+            V3::Done(n) if n == src_bytes.len() => V3::Done(()),
+            V3::Done(_) => V3::Err(Errno::EFAULT.into()),
+            V3::Continue { .. } => V3::Err(Errno::EIO.into()),
             V3::Yield { shape, .. } => V3::Yield {
                 progress: NoProgress,
                 shape,
@@ -207,12 +212,21 @@ impl AddressSpace {
     ) -> StepOutcome<(), NoProgress> {
         use crate::page_backed::adapter::step_engine::StepOutcome as V3;
         for page in range.iter_pages() {
-            // Skip pages already published with sufficient protection.
-            // We only avoid re-materialisation when the cached entry
-            // already permits the requested access.
+            let page_addr = match page.checked_start_addr() {
+                Ok(a) => a,
+                Err(_) => return V3::err(Errno::EFAULT.into()),
+            };
+
+            // Skip pages already published with sufficient protection
+            // only after rechecking the authoritative recipe. A stale
+            // pmap entry must not bypass a later mprotect/munmap shape.
             if let Some(snapshot) = self.pmap.lookup(page) {
                 if snapshot.prot.permits(kind.required_prot()) {
-                    continue;
+                    let guard = step_engine::guard();
+                    match self.recipes.lookup(page_addr, &guard) {
+                        Some(entry) if entry.prot.permits(kind.required_prot()) => continue,
+                        _ => return V3::err(Errno::EFAULT.into()),
+                    }
                 }
                 // Insufficient cached protection is not a hard fault:
                 // fork CoW deliberately leaves parent private pages
@@ -222,10 +236,6 @@ impl AddressSpace {
             }
             // Build a synthetic fault, observe the recipe, materialise,
             // and publish synchronously.
-            let page_addr = match page.checked_start_addr() {
-                Ok(a) => a,
-                Err(_) => return V3::err(Errno::EFAULT.into()),
-            };
             let fault = VmFault::new(page_addr, kind.required_prot());
             let outcome: VmFaultOutcome = match self.resolve_fault(fault) {
                 Ok(o) => o,

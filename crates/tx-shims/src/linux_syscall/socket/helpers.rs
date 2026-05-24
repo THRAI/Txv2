@@ -460,11 +460,18 @@ pub(super) fn read_sockaddr_un_path<'a>(
     }
 
     let raw_path = &bytes[SOCKADDR_UN_MIN_BYTES as usize..copy_len];
+    if raw_path.is_empty() || raw_path.len() > SOCKADDR_UN_PATH_BYTES {
+        return Err(Errno::EINVAL);
+    }
+    if raw_path[0] == 0 {
+        return UnixSocketPath::new(raw_path);
+    }
+
     let path_len = raw_path
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(raw_path.len());
-    if path_len == 0 || path_len > SOCKADDR_UN_PATH_BYTES {
+    if path_len == 0 {
         return Err(Errno::EINVAL);
     }
     UnixSocketPath::new(&raw_path[..path_len])
@@ -908,7 +915,14 @@ pub(super) fn write_sockaddr_un<'a>(
 }
 
 pub(super) fn sockaddr_un_len(path: Option<UnixSocketPath>) -> usize {
-    SOCKADDR_UN_MIN_BYTES as usize + path.map_or(0, |path| path.len().saturating_add(1))
+    SOCKADDR_UN_MIN_BYTES as usize
+        + path.map_or(0, |path| {
+            if path.is_abstract() {
+                path.len()
+            } else {
+                path.len().saturating_add(1)
+            }
+        })
 }
 
 pub(super) fn sockaddr_un_bytes(
@@ -980,6 +994,23 @@ pub(super) fn socket_local_endpoint(socket: &Cap<SocketIdentity>) -> Result<IpEn
     }
 }
 
+pub(super) fn socket_unix_local_path(
+    socket: &Cap<SocketIdentity>,
+) -> Result<Option<UnixSocketPath>, Errno> {
+    let payload = socket.acquire_operational().ok_or(Errno::ENOTCONN)?;
+    match payload.protocol_snapshot() {
+        SocketProtocol::UnixDatagram(UnixDatagramState::Bound { local }) => Ok(Some(local)),
+        SocketProtocol::UnixDatagram(UnixDatagramState::Connected { local, .. }) => Ok(local),
+        SocketProtocol::UnixDatagram(UnixDatagramState::ConnectedPair { .. }) => Ok(None),
+        SocketProtocol::UnixDatagram(UnixDatagramState::Unbound) => Ok(None),
+        SocketProtocol::UnixStream(UnixStreamState::Bound { local })
+        | SocketProtocol::UnixStream(UnixStreamState::Listening { local, .. }) => Ok(Some(local)),
+        SocketProtocol::UnixStream(UnixStreamState::Connected { local, .. }) => Ok(local),
+        SocketProtocol::UnixStream(UnixStreamState::Init) => Ok(None),
+        _ => Err(Errno::ENOTSOCK),
+    }
+}
+
 pub(super) fn socket_peer_endpoint(socket: &Cap<SocketIdentity>) -> Result<IpEndpoint, Errno> {
     let payload = socket.acquire_operational().ok_or(Errno::ENOTCONN)?;
     match payload.protocol_snapshot() {
@@ -987,6 +1018,21 @@ pub(super) fn socket_peer_endpoint(socket: &Cap<SocketIdentity>) -> Result<IpEnd
         | SocketProtocol::Tcp(TcpState::Connected { remote, .. })
         | SocketProtocol::Udp(UdpInner::Connected { remote, .. }) => Ok(remote),
         _ => Err(Errno::ENOTCONN),
+    }
+}
+
+pub(super) fn socket_unix_peer_path(
+    socket: &Cap<SocketIdentity>,
+) -> Result<Option<UnixSocketPath>, Errno> {
+    let payload = socket.acquire_operational().ok_or(Errno::ENOTCONN)?;
+    match payload.protocol_snapshot() {
+        SocketProtocol::UnixDatagram(UnixDatagramState::Connected { peer, .. }) => Ok(Some(peer)),
+        SocketProtocol::UnixDatagram(UnixDatagramState::ConnectedPair { .. }) => Ok(None),
+        SocketProtocol::UnixStream(UnixStreamState::Connected { .. }) => Ok(None),
+        SocketProtocol::UnixDatagram(_)
+        | SocketProtocol::UnixStream(UnixStreamState::Init | UnixStreamState::Bound { .. })
+        | SocketProtocol::UnixStream(UnixStreamState::Listening { .. }) => Err(Errno::ENOTCONN),
+        _ => Err(Errno::ENOTSOCK),
     }
 }
 

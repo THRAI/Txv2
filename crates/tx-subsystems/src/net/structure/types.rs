@@ -213,6 +213,10 @@ impl UnixSocketPath {
         self.len == 0
     }
 
+    pub fn is_abstract(&self) -> bool {
+        self.as_bytes().first().is_some_and(|byte| *byte == 0)
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len()]
     }

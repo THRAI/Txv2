@@ -691,6 +691,156 @@ fn dispatch_tcp_maxseg_reports_loopback_route_mss() {
 }
 
 #[test]
+fn dispatch_tcp_msg_more_defers_until_uncork_send() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let listener_fd = socket_stream(&ctx, SOCK_STREAM);
+    let client_fd = socket_stream(&ctx, SOCK_STREAM);
+    let listen_addr = sockaddr_in([0, 0, 0, 0], 49_124);
+    let connect_addr = sockaddr_in([127, 0, 0, 1], 49_124);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                listener_fd as u64,
+                listen_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(NR_LISTEN, [listener_fd as u64, 8, 0, 0, 0, 0], &ctx),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                client_fd as u64,
+                connect_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    let accepted_fd = match socket_req(NR_ACCEPT, [listener_fd as u64, 0, 0, 0, 0, 0], &ctx) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("accept(AF_INET) failed: {other:?}"),
+    };
+
+    let first = [0x42u8; 16];
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                client_fd as u64,
+                first.as_ptr() as u64,
+                first.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(first.len() as i64)
+    );
+    let mut out = [0u8; 32];
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [
+                accepted_fd as u64,
+                out.as_mut_ptr() as u64,
+                out.len() as u64,
+                MSG_DONTWAIT,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(first.len() as i64)
+    );
+    assert_eq!(&out[..first.len()], &first);
+
+    let corked = [0x43u8; 16];
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                client_fd as u64,
+                corked.as_ptr() as u64,
+                corked.len() as u64,
+                MSG_MORE,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(corked.len() as i64)
+    );
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [
+                accepted_fd as u64,
+                out.as_mut_ptr() as u64,
+                out.len() as u64,
+                MSG_DONTWAIT,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(EAGAIN_VALUE)
+    );
+
+    let uncork = [0x44u8; 1];
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                client_fd as u64,
+                uncork.as_ptr() as u64,
+                uncork.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(uncork.len() as i64)
+    );
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [
+                accepted_fd as u64,
+                out.as_mut_ptr() as u64,
+                out.len() as u64,
+                MSG_DONTWAIT,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return((corked.len() + uncork.len()) as i64)
+    );
+    assert_eq!(&out[..corked.len()], &corked);
+    assert_eq!(out[corked.len()], uncork[0]);
+}
+
+#[test]
 fn dispatch_udp_default_send_buffer_can_hold_loopback_datagram() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();

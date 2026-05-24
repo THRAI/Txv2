@@ -23,6 +23,7 @@ pub struct RawTcpSocket {
     last_syn_ack: SpinMutex<Option<SmoltcpTcpSegment>>,
     rx_buffer: SpinMutex<VecDeque<u8>>,
     tx_buffer: SpinMutex<VecDeque<u8>>,
+    corked_tx: SpinMutex<Vec<u8>>,
     recv_capacity: usize,
     send_capacity: usize,
 }
@@ -95,6 +96,7 @@ impl RawTcpSocket {
             last_syn_ack: SpinMutex::new(None),
             rx_buffer: SpinMutex::new(VecDeque::new()),
             tx_buffer: SpinMutex::new(VecDeque::new()),
+            corked_tx: SpinMutex::new(Vec::new()),
             recv_capacity,
             send_capacity,
         }
@@ -170,9 +172,11 @@ impl RawTcpSocket {
     }
 
     pub fn send_available(&self) -> usize {
+        let queued = self.tx_buffer.lock().len();
+        let corked = self.corked_tx.lock().len();
         let staged_available = self
             .send_capacity
-            .saturating_sub(self.tx_buffer.lock().len());
+            .saturating_sub(queued.saturating_add(corked));
         let protocol_available = {
             let socket = self.socket.lock();
             if socket.may_send() {
@@ -189,27 +193,14 @@ impl RawTcpSocket {
     }
 
     pub fn enqueue_tx_len(&self, len: usize) -> Option<(usize, bool)> {
-        if len == 0 {
-            return Some((0, false));
-        }
-
-        let available = self.send_available();
-        if available == 0 {
-            return None;
-        }
-
-        let bytes = core::cmp::min(available, len);
-        let accepted = self.enqueue_protocol_tx_bytes(&vec![0; bytes]).ok()?;
-        if accepted == 0 {
-            return None;
-        }
-        self.tx_buffer
-            .lock()
-            .extend(core::iter::repeat_n(0, accepted));
-        Some((accepted, self.send_available() == 0))
+        self.enqueue_tx_bytes(&vec![0; len])
     }
 
     pub fn enqueue_tx_bytes(&self, bytes: &[u8]) -> Option<(usize, bool)> {
+        self.enqueue_tx_bytes_with_more(bytes, false)
+    }
+
+    pub fn enqueue_tx_bytes_with_more(&self, bytes: &[u8], more: bool) -> Option<(usize, bool)> {
         if bytes.is_empty() {
             return Some((0, false));
         }
@@ -220,14 +211,32 @@ impl RawTcpSocket {
         }
 
         let requested = core::cmp::min(available, bytes.len());
-        let accepted = self.enqueue_protocol_tx_bytes(&bytes[..requested]).ok()?;
+        if more {
+            self.corked_tx
+                .lock()
+                .extend(bytes.iter().copied().take(requested));
+            return Some((requested, self.send_available() == 0));
+        }
+
+        let corked_len = self.corked_tx.lock().len();
+        let mut combined = Vec::with_capacity(corked_len + requested);
+        if corked_len != 0 {
+            combined.extend(self.corked_tx.lock().iter().copied());
+        }
+        combined.extend_from_slice(&bytes[..requested]);
+
+        let accepted = self.enqueue_protocol_tx_bytes(&combined).ok()?;
         if accepted == 0 {
             return None;
         }
+        if corked_len != 0 {
+            self.corked_tx.lock().clear();
+        }
         self.tx_buffer
             .lock()
-            .extend(bytes.iter().copied().take(accepted));
-        Some((accepted, self.send_available() == 0))
+            .extend(combined.iter().copied().take(accepted));
+        let accepted_new = accepted.saturating_sub(corked_len).min(requested);
+        Some((accepted_new, self.send_available() == 0))
     }
 
     pub fn ack_tx_bytes(&self, bytes: usize) -> bool {

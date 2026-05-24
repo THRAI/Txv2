@@ -85,3 +85,21 @@ fn vm_copy_to_user_rejects_read_only_recipe() {
 
     assert_eq!(copied, StepOutcome::Err(Errno::EFAULT.into()));
 }
+
+#[test]
+fn vm_read_write_user_reject_partial_guard_crossing_structs() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("vm user-access test lock");
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let base = 0x7000;
+    let crossing = base + USER_PAGE_SIZE - 16;
+    map_private(&aspace, base, USER_PAGE_SIZE, Prot::READ_WRITE);
+    map_private(&aspace, base + USER_PAGE_SIZE, USER_PAGE_SIZE, Prot::NONE);
+    let guard = crate::vm::adapter::step_engine::guard();
+
+    let read = aspace.read_user::<[u8; 32]>(UserPtr::new(crossing), &guard);
+    assert_eq!(read, StepOutcome::Err(Errno::EFAULT.into()));
+
+    let write = aspace.write_user::<[u8; 32]>(UserPtr::new(crossing), [0x5A; 32], &guard);
+    assert_eq!(write, StepOutcome::Err(Errno::EFAULT.into()));
+}

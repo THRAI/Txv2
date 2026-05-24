@@ -305,10 +305,39 @@ fn send_unix_datagram_connected(
 ) -> ByteStepOutcome<usize> {
     let peer = match payload.protocol_snapshot() {
         SocketProtocol::UnixDatagram(UnixDatagramState::Connected { peer, .. }) => peer,
+        SocketProtocol::UnixDatagram(UnixDatagramState::ConnectedPair { peer_raw }) => {
+            return send_unix_datagram_to_peer_raw(socket, payload, peer_raw, bytes, guard);
+        }
         SocketProtocol::UnixDatagram(_) => return StepOutcome::Err(Errno::EDESTADDRREQ),
         _ => return StepOutcome::Err(Errno::EINVAL),
     };
     send_unix_datagram_to_path(socket, payload, peer, bytes, guard)
+}
+
+fn send_unix_datagram_to_peer_raw(
+    socket: &Cap<SocketIdentity>,
+    payload: &SocketPayload,
+    peer_raw: u32,
+    bytes: &[u8],
+    guard: &Guard<'_>,
+) -> ByteStepOutcome<usize> {
+    let table = payload.socket_table();
+    let Some(target) = table.lookup_unix_peer(socket.raw(), guard) else {
+        return StepOutcome::Err(Errno::ECONNREFUSED);
+    };
+    if target.raw() != peer_raw || target.kind != SocketKind::UnixDatagram {
+        return StepOutcome::Err(Errno::ECONNREFUSED);
+    }
+    let Some(target_payload) = target.acquire_operational() else {
+        return StepOutcome::Err(Errno::ECONNREFUSED);
+    };
+    let Some(became_readable) = target_payload.record_unix_datagram(None, bytes.to_vec()) else {
+        return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
+    };
+    if became_readable {
+        target.readiness.fire_recv(RecvWireSet::HAS_DATA);
+    }
+    StepOutcome::Done(bytes.len())
 }
 
 fn send_unix_datagram_to_path(
@@ -328,6 +357,7 @@ fn send_unix_datagram_to_path(
     let source = match payload.protocol_snapshot() {
         SocketProtocol::UnixDatagram(UnixDatagramState::Bound { local }) => Some(local),
         SocketProtocol::UnixDatagram(UnixDatagramState::Connected { local, .. }) => local,
+        SocketProtocol::UnixDatagram(UnixDatagramState::ConnectedPair { .. }) => None,
         SocketProtocol::UnixDatagram(UnixDatagramState::Unbound) => None,
         _ => return StepOutcome::Err(Errno::EINVAL),
     };

@@ -46,10 +46,10 @@ pub use execution::{
     step_send_to_unix_path_kernel_bytes, step_send_udp_loopback_kernel_bytes, step_shutdown,
     step_socket_close, step_socket_create, step_socket_create_in_namespace, step_socket_open_file,
     step_socket_open_file_in_namespace, step_tcp_loopback_handshake, step_tcp_loopback_transfer,
-    ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome, LoopbackTcpConnectOutcome,
-    LoopbackTcpTransferOutcome, NetworkBacklogTickOutcome, NetworkStepOutcome, ShutdownOutcome,
-    SocketCloseOutcome, SocketOpenFileOutput, ARP_FLUSH_BUDGET_DEFAULT, DEVICE_TX_BUDGET_DEFAULT,
-    NET_BACKLOG_SCAN_BUDGET, NET_EVENT_BUDGET,
+    step_unix_socketpair_connect, ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome,
+    LoopbackTcpConnectOutcome, LoopbackTcpTransferOutcome, NetworkBacklogTickOutcome,
+    NetworkStepOutcome, ShutdownOutcome, SocketCloseOutcome, SocketOpenFileOutput,
+    ARP_FLUSH_BUDGET_DEFAULT, DEVICE_TX_BUDGET_DEFAULT, NET_BACKLOG_SCAN_BUDGET, NET_EVENT_BUDGET,
 };
 pub use facade::{
     drive_socket_connect_waiting, drive_socket_nonblocking, socket_bind_facade,
@@ -131,7 +131,7 @@ pub use structure::{
     SocketIdentity, SocketIoState, SocketKind, SocketLevelOptions, SocketOperationalEvidence,
     SocketOptionSet, SocketPayload, SocketProtocol, SocketReadiness, SocketRecvBytesOutcome,
     SocketTable, SocketType, SocketWaitCarriers, Takeable, TcpLevelOptions, TcpState, UdpInner,
-    UnixDatagramState, UnixSocketPath, UnixStreamState, UrgentEvent, ValidSocketType,
+    UnixDatagramState, UnixPeerCred, UnixSocketPath, UnixStreamState, UrgentEvent, ValidSocketType,
     UNIX_SOCKET_PATH_MAX,
 };
 
