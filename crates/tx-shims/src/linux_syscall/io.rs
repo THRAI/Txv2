@@ -1512,8 +1512,7 @@ async fn yield_after_struct_write_if_needed(file: &Cap<OpenFile>, written: usize
     if matches!(
         file.rnode().backing(),
         tx_subsystems::vfs::structure::RNodeBacking::StructBacked {
-            payload: tx_subsystems::vfs::structure::StructPayload::Tty(_)
-                | tx_subsystems::vfs::structure::StructPayload::Pipe { .. },
+            payload: tx_subsystems::vfs::structure::StructPayload::Pipe { .. },
         }
     ) {
         tx_reactor::yield_now().await;

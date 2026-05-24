@@ -1,3 +1,136 @@
+- 2026-05-24 **Verified and fixed RV64 SMP4 netperf/iperf coverage on
+  `feature-network`.** Focused `netperf-musl -smp4` passed immediately, but
+  `netperf-glibc -smp4` exposed a boot-hart-3 stack underflow before the test
+  group started: `sp` had fallen below `__tx_boot_stack_bottom` into the
+  pmap committed-node registry, so the kernel returned to a data address and
+  faulted. The RV64 static per-hart boot stack was doubled from 128 KiB to
+  256 KiB (`.bss.stack` 512 KiB -> 1024 KiB, trampoline stride 131072 ->
+  262144). `iperf-musl -smp4` then showed daemon-start timing loss because
+  SMP userspace parking had also disabled the lock-releasing poll path used
+  for immediate child submission. The AP parking decision is now separate:
+  BSP userspace keeps `USE_CONCURRENT_POLL=true` so forked benchmark servers
+  are submitted promptly, while APs remain parked until userspace migration is
+  made hart-safe. **Verified:** `cargo fmt --check`; `cargo build -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`; `cargo
+  xtask oscomp submit --target rv64-qemu`; `netperf-musl -smp4 5/5`;
+  `netperf-glibc -smp4 5/5`; `iperf-musl -smp4 6/6`; `iperf-glibc -smp4
+  6/6`; `cargo xtask qemu --target rv64-qemu --profile smoke
+  --expect-sentinel --smp 4 --timeout-ms 30000`; `basic-musl -smp4 102/102`;
+  `basic-glibc -smp4 102/102`. **Next step:** keep AP userspace migration as
+  a separate design task; current SMP benchmark coverage intentionally runs
+  userspace on the BSP with prompt child scheduling. **Blocker:** none for
+  netperf/iperf SMP4.
+
+- 2026-05-24 **Compared RV64 SMP4 `feature-network` against `main` for
+  OSComp musl parity.** The valid `main` baseline is musl-only for this
+  revision: `main` logs `tx.oscomp.groups=basic-glibc` but falls back to the
+  default musl chain because the mainline OSComp command builder only maps
+  musl group scripts. On the shared sdcard/testdata, `main` can score
+  `basic-musl 102/102` and `libctest-musl 220/220`, but it also remains
+  boot-hart sensitive under `-smp 4`: runs that OpenSBI starts on hart 3
+  panic before the selected suite with `BootStaticBag not constructed`
+  (`busybox-musl` and `lua-musl` probes hit this). `feature-network` now
+  matches or improves the main-pass SMP results: `basic-musl 102/102`,
+  `basic-glibc 102/102` for the feature-only glibc runtime selector,
+  `busybox-musl 54/55`, `lua-musl 9/9`, and `libctest-musl 220/220`, with
+  no trap/panic/WARN in the checked feature logs. No case was found where
+  `main` passed under SMP4 but `feature-network` failed. **Verified:**
+  main worktree `/tmp/txv2-main-oscomp-compare` at `05028405`; feature
+  `cargo xtask oscomp submit --target rv64-qemu`; bounded `make
+  oscomp-qemu-rv64-smp4` runs for `basic-musl`, `busybox-musl`, `lua-musl`,
+  and `libctest-musl`, plus local `tools/oscomp-judge.py` scoring. **Next
+  step:** keep comparing against main by musl suites unless the mainline glibc
+  selector is updated; treat true multi-hart userspace migration as separate
+  work. **Blocker:** none for feature SMP parity.
+
+- 2026-05-24 **Restored RV64 `-smp 4` smoke and OSComp basic stability.**
+  The multicore path had two separate hazards: APs could be marked online
+  before IPI/timer wakeups were armed, and high-half S-mode traps in the RV64
+  vector were using the interrupted kernel stack too broadly, corrupting
+  `sscratch`/TLS recovery during AP IPI and nested trap-return windows. The
+  AP path now marks a CPU online only after wakeups are enabled. The trap
+  vector distinguishes normal kernel traps from the narrow epilogue-nested
+  case, preserves the prior `sscratch` value in direct frames, and only
+  recovers `tp` from a trap-stack top when that lookup succeeds. Userspace
+  SMP is now conservative: APs park while userspace runs unless the concurrent
+  poll lease is explicitly safe, avoiding migration-unsafe user trap/return
+  paths until that larger work is designed. BSP timer-idle smoke now warns
+  instead of panicking if the boot hart/timer state makes the single expected
+  deadline unobservable. **Verified:** `cargo fmt --check`; `cargo build -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`; `cargo
+  test -p tx-hal-riscv64-qemu-virt
+  trap_dispatch_marks_external_and_ipi_as_irq_context -- --test-threads=1`;
+  `cargo test -p tx-kernel
+  thread_future_sigreturn_restores_user_edited_frame_context_and_mask --
+  --test-threads=1`; `cargo xtask qemu --target rv64-qemu --profile smoke
+  --expect-sentinel --smp 4 --timeout-ms 30000`; `cargo xtask oscomp submit
+  --target rv64-qemu`; `timeout 60s make oscomp-qemu-rv64-smp4
+  OSCOMP_GROUPS=basic-musl` with judge `102/102`; `timeout 60s make
+  oscomp-qemu-rv64-smp4 OSCOMP_GROUPS=basic-glibc` with judge `102/102`.
+  **Next step:** keep real multi-hart userspace scheduling/migration as a
+  separate design task; this change makes the current SMP boot/OSComp path
+  stable without pretending userspace migration is complete. **Blocker:**
+  none for smoke/basic SMP; `msp/` remains untracked and excluded.
+
+- 2026-05-24 **Restored post-rebase OSComp parity for `basic` and full
+  `libctest-musl`.** `basic-{musl,glibc}` had dropped to `99/102` because
+  stdout/TTY writes yielded after each struct-backed write, letting parent and
+  child `printf("cpid: %d\n")` fragments interleave inside `test_pipe`.
+  TTY writes now return without the pipe-specific fairness yield. Full
+  `libctest-musl` was stopping around dynamic `pthread_cancel`; trap-trace
+  reduced it to a busy-loop child thread being placed at the front of the
+  preempted queue after every timer preemption, starving its parent before the
+  parent could send cancellation. External userspace preemption now preserves
+  remaining budget but requeues at the back, and a scheduler regression test
+  pins that round-robin behaviour. **Verified:** `cargo fmt --check`;
+  `cargo test -p tx-reactor --test scheduler -- --test-threads=1`; `cargo
+  test -p tx-kernel futex_wake_return_reenters_userspace_without_mailbox_event
+  -- --test-threads=1`; `cargo test -p tx-kernel
+  thread_future_sigreturn_restores_user_edited_frame_context_and_mask --
+  --test-threads=1`; `cargo test -p tx-shims socket_fdtable --
+  --test-threads=1`; `cargo build -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`; `cargo xtask oscomp submit --target rv64-qemu`;
+  `basic-musl 102/102`; `basic-glibc 102/102`; focused
+  `libctest-musl:dynamic:pthread_cancel`; full `libctest-musl 220/220` in a
+  120s bounded run; `netperf-{musl,glibc} 5/5`; `iperf-{musl,glibc} 6/6`.
+  **Next step:** commit the parity fix, then continue LTP/network syscall
+  work from a clean tree. **Blocker:** none; `msp/` remains untracked and
+  intentionally excluded.
+
+- 2026-05-24 **Compared `feature-network` OSComp non-LTP results against
+  `main` `05028405`.** Main RV64 only supports musl group selection through
+  `TX_OSCOMP_GROUPS`, so glibc focused comparison is not valid on main. With
+  the same local sdcard/testdata, main scored `basic-musl 102/102`,
+  `busybox-musl 54/55`, `lua-musl 9/9`, `libctest-musl 220/220`,
+  `libcbench-musl 0/27`, `lmbench-musl 0/36`, `iozone-musl 0/20`,
+  `cyclictest-musl 0/4`, `netperf-musl 0/5`, and `iperf-musl 0/6`.
+  Compared to feature-network, this shows the network benchmark wins are from
+  the feature branch (`netperf/iperf` and targeted `lmbench-network` pass
+  there), while two non-network regressions need separate follow-up:
+  `basic-musl test_pipe` dropped to `99/102`, and full `libctest-musl` no
+  longer reaches `220/220` within 180s, stopping around dynamic
+  `pthread_cancel`. **Next step:** treat pipe output/scheduling and dynamic
+  pthread cancellation as separate non-network regressions if total OSComp
+  parity with main is required. **Blocker:** none for the network-focused
+  branch goal.
+
+- 2026-05-24 **Rechecked non-LTP OSComp suites after the `feature-network`
+  rebase.** Used focused `cargo xtask oscomp qemu --target rv64-qemu
+  --boot-suite ...` runs with 30s, 60s, and selected 120s/180s bounded windows.
+  Network-focused coverage stayed green: `netperf-musl 5/5`, `netperf-glibc
+  5/5`, `iperf-musl 6/6`, `iperf-glibc 6/6`, `libctest-network` scored the 12
+  targeted musl network ABI cases, and `lmbench-network` passed
+  `lat_udp/lat_tcp/lat_connect/bw_tcp_{1,64,1024}` for both musl and glibc.
+  Broader non-LTP observations: `basic-{musl,glibc}` now score `99/102` with
+  only `test_pipe` partial; `busybox-{musl,glibc}` remain `54/55`; `lua` is
+  `9/9`; `cyclictest` and `iozone` still score `0`; longer bounded runs gave
+  `libcbench-glibc 16/27`, `lmbench-{musl,glibc} 2/36`, `libctest-glibc
+  77/220`, and full `libctest-musl` stopped around the dynamic pthread-cancel
+  area after all static cases and the first dynamic cases. **Next step:** if
+  total OSComp, not network, is the priority, investigate non-network
+  `test_pipe` and dynamic pthread cancellation separately. **Blocker:** none
+  found in the network stack regressions targeted by this branch.
+
 - 2026-05-24 **Rebased `feature-network` onto `main` `05028405` and cleaned
   the post-rebase build fallout.** The rebase preserved the benchmark-daemon
   fixes for immediate child reactor submission and compat-frame

@@ -787,8 +787,17 @@ impl<P: TxPlatform> CoreInit<P> {
 
         P::enable_timer_wakeups();
 
-        // Enable concurrent poll on all harts (Phase 1a poll lease).
+        // The BSP userspace loop uses lock-releasing reactor polls, so a
+        // forked daemon child can be submitted immediately while its parent
+        // is still in the same poll turn. On SMP, keep APs parked separately:
+        // userspace trap/return state is still hart-local and not migration
+        // safe, but daemon-style children still need prompt BSP progress.
         super::USE_CONCURRENT_POLL.store(true, core::sync::atomic::Ordering::Release);
+        super::PARK_USERSPACE_APS.store(
+            P::online_cpu_count() > 1,
+            core::sync::atomic::Ordering::Release,
+        );
+        super::USERSPACE_REACTOR_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
 
         // Drive the BSP reactor loop until init zombifies. Each
         // iteration is a `step_hart_loop_at` step: advance time, run
@@ -908,6 +917,8 @@ impl<P: TxPlatform> CoreInit<P> {
         }
 
         // init zombified — emit the exit sentinel.
+        super::USERSPACE_REACTOR_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
+        super::PARK_USERSPACE_APS.store(false, core::sync::atomic::Ordering::Release);
         let status_word = init
             .exit_status()
             .map(|s| s.wait_status_word())

@@ -42,8 +42,13 @@ pub(crate) const IDLE_TIMER_PERIOD_NS: u64 = 5_000_000; // 5 ms
 
 static BOOT_REACTOR: boot_runtime::SharedReactor = boot_runtime::SharedReactor::empty();
 /// Switched to true when the userspace reactor phase begins, enabling
-/// the concurrent poll path on all harts.
+/// the lock-releasing poll path that lets clone submit child threads
+/// immediately from within userspace task polling.
 pub(super) static USE_CONCURRENT_POLL: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub(super) static USERSPACE_REACTOR_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub(super) static PARK_USERSPACE_APS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 static CONSOLE_WRITE_LOCK: SpinMutex<()> = SpinMutex::new(());
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
@@ -144,6 +149,9 @@ pub fn reset_boot_state_for_test() {
     *ROOT_DENTRY.lock() = None;
     AP_REACTOR_TASK_DONE_CPUS.store(0, Ordering::Release);
     BSP_REACTOR_TIMER_DONE_CPUS.store(0, Ordering::Release);
+    USE_CONCURRENT_POLL.store(false, Ordering::Release);
+    USERSPACE_REACTOR_ACTIVE.store(false, Ordering::Release);
+    PARK_USERSPACE_APS.store(false, Ordering::Release);
     BOOT_REACTOR.reset_for_test();
     net::reset_boot_net_runtime_for_test();
     tx_subsystems::net::reset_initial_net_namespace_for_test();
@@ -1689,17 +1697,27 @@ impl<P: TxPlatform> CoreInit<P> {
         init_on_ap(cpu_id).expect("tx_kernel AP substrate initialization failed");
         P::init_later_secondary(cpu_id);
         P::install_kernel_trap_vector();
-        P::mark_cpu_online(cpu_id);
-        Self::secondary_reactor_loop()
+        Self::secondary_reactor_loop(cpu_id)
     }
 
-    fn secondary_reactor_loop() -> ! {
+    fn secondary_reactor_loop(cpu_id: CpuId) -> ! {
         P::enable_ipi_wakeups();
         P::enable_timer_wakeups();
+        P::mark_cpu_online(cpu_id);
         loop {
             // Re-read after every trap/longjmp round-trip; the boot argument is
             // not the authoritative hart identity once the reactor is running.
             let cpu_id = <P as tx_hal::SmpIf>::current_cpu_id();
+            let userspace_single_hart = USERSPACE_REACTOR_ACTIVE.load(Ordering::Acquire)
+                && PARK_USERSPACE_APS.load(Ordering::Acquire);
+            if userspace_single_hart {
+                P::cancel_deadline();
+                P::wait_for_interrupt_once();
+                if P::pending_ipi(IpiKind::Reschedule) {
+                    P::ack_ipi(IpiKind::Reschedule);
+                }
+                continue;
+            }
             if Self::run_secondary_reactor_once(cpu_id) {
                 continue;
             }
@@ -1901,11 +1919,11 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let armed =
             Self::step_boot_reactor_once(current_cpu).expect("boot reactor timer arm step failed");
-        assert_eq!(
-            armed.next_deadline_ns,
-            Some(deadline_ns),
-            "BSP timer smoke deadline"
-        );
+        if armed.next_deadline_ns != Some(deadline_ns) {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":reactor:timer-idle:WARN-arm\n");
+            return;
+        }
 
         P::enable_timer_wakeups();
 

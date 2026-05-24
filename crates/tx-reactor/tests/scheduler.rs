@@ -449,7 +449,7 @@ fn slice_expired_resets_budget_and_moves_to_preempted_back() {
 }
 
 #[test]
-fn external_preemption_preserves_remaining_budget_at_front() {
+fn external_preemption_preserves_remaining_budget_at_back() {
     let mut scheduler = Phase1Scheduler::new();
     let first = submit_fair(&mut scheduler, 10);
     let second = submit_fair(&mut scheduler, 11);
@@ -472,6 +472,15 @@ fn external_preemption_preserves_remaining_budget_at_front() {
 
     let remaining = Phase1Scheduler::NEW_QUEUE_SLICE_NS - 100_000;
     assert_eq!(scheduler.remaining_budget_ns(second), Some(remaining));
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)),
+        Some((
+            first,
+            SliceConfig::Preemptive {
+                slice_ns: Phase1Scheduler::PREEMPTED_QUEUE_SLICE_NS,
+            }
+        ))
+    );
     assert_eq!(
         pick_id_and_slice(&mut scheduler, HartId(0)),
         Some((
