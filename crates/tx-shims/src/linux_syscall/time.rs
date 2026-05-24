@@ -260,18 +260,6 @@ fn write_remaining_timespec(
     }
 }
 
-fn snapshot_itimer_real<P: TimeIf>(pid: u32) -> ItimervalLayout {
-    let now = P::read_ns();
-    let registry = ITIMER_REAL_REGISTRY.lock();
-    let Some(state) = registry.get(&pid) else {
-        return zero_itimerval();
-    };
-    ItimervalLayout {
-        interval: ns_to_timeval(state.interval_ns),
-        value: ns_to_timeval(state.deadline_ns.saturating_sub(now)),
-    }
-}
-
 /// `clock_gettime(clk_id, tp)`. Linux RV64 generic ABI
 /// `__NR_clock_gettime = 113`.
 ///
