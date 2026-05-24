@@ -574,7 +574,7 @@ pub(super) async fn sleep_until_deadline<'a, P: TimeIf>(
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
 
-    while <P as TimeIf>::read_ns() < deadline_ns {
+    if <P as TimeIf>::read_ns() < deadline_ns {
         let remaining_ns = deadline_ns.saturating_sub(<P as TimeIf>::read_ns());
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mailbox_arc = script_ctx.mailbox().cloned();
@@ -597,7 +597,7 @@ pub(super) async fn sleep_until_deadline<'a, P: TimeIf>(
         {
             Ok(()) => return SyscallResult::Return(0),
             Err(v3errno) => {
-                let errno = Errno::from(v3errno);
+                let errno = v3errno;
                 if errno == Errno::EINTR {
                     return SyscallResult::Error(EINTR_VALUE);
                 }

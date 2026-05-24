@@ -3,9 +3,11 @@ use tx_substrate::zone::Cap;
 
 use crate::execution::{Errno, Guard};
 use crate::net::checks::require::require_socket_read_target;
+use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::{socket_recv_wait_token, yield_bytes_on_token, ByteStepOutcome};
 use crate::net::structure::{
-    RecvWireSet, SendRecvFlags, SocketIdentity, SocketPayload, SocketRecvBytesOutcome,
+    RecvWireSet, SendRecvFlags, SocketIdentity, SocketPayload, SocketProtocol,
+    SocketRecvBytesOutcome, TcpState,
 };
 
 pub fn step_recv(
@@ -53,6 +55,7 @@ pub fn step_recv(
     if consume.became_empty {
         socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
     }
+    kick_tcp_loopback_after_recv(&payload, consume.bytes);
 
     StepOutcome::Done(consume.bytes)
 }
@@ -95,8 +98,23 @@ pub fn step_recv_kernel_bytes(
     if outcome.became_empty && !witness.flags.contains(SendRecvFlags::MSG_PEEK) {
         socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
     }
+    if !witness.flags.contains(SendRecvFlags::MSG_PEEK) {
+        kick_tcp_loopback_after_recv(&payload, outcome.bytes);
+    }
 
     StepOutcome::Done(outcome)
+}
+
+fn kick_tcp_loopback_after_recv(payload: &SocketPayload, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    if matches!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connected { .. })
+    ) {
+        net_delegate_kick_poll();
+    }
 }
 
 fn recv_peer_closed(socket: &Cap<SocketIdentity>, payload: &SocketPayload) -> bool {

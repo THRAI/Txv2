@@ -410,9 +410,7 @@ fn minimal_elf_bytes() -> Vec<u8> {
 // a separately-built ET_DYN interpreter.
 // ---------------------------------------------------------------------------
 
-fn write_phdr_at(
-    b: &mut [u8],
-    at: usize,
+struct PhdrFields {
     p_type: u32,
     p_flags: u32,
     p_offset: u64,
@@ -420,15 +418,17 @@ fn write_phdr_at(
     p_filesz: u64,
     p_memsz: u64,
     p_align: u64,
-) {
-    b[at..at + 4].copy_from_slice(&p_type.to_le_bytes());
-    b[at + 4..at + 8].copy_from_slice(&p_flags.to_le_bytes());
-    b[at + 8..at + 16].copy_from_slice(&p_offset.to_le_bytes());
-    b[at + 16..at + 24].copy_from_slice(&p_vaddr.to_le_bytes());
-    b[at + 24..at + 32].copy_from_slice(&p_vaddr.to_le_bytes()); // paddr
-    b[at + 32..at + 40].copy_from_slice(&p_filesz.to_le_bytes());
-    b[at + 40..at + 48].copy_from_slice(&p_memsz.to_le_bytes());
-    b[at + 48..at + 56].copy_from_slice(&p_align.to_le_bytes());
+}
+
+fn write_phdr_at(b: &mut [u8], at: usize, phdr: PhdrFields) {
+    b[at..at + 4].copy_from_slice(&phdr.p_type.to_le_bytes());
+    b[at + 4..at + 8].copy_from_slice(&phdr.p_flags.to_le_bytes());
+    b[at + 8..at + 16].copy_from_slice(&phdr.p_offset.to_le_bytes());
+    b[at + 16..at + 24].copy_from_slice(&phdr.p_vaddr.to_le_bytes());
+    b[at + 24..at + 32].copy_from_slice(&phdr.p_vaddr.to_le_bytes()); // paddr
+    b[at + 32..at + 40].copy_from_slice(&phdr.p_filesz.to_le_bytes());
+    b[at + 40..at + 48].copy_from_slice(&phdr.p_memsz.to_le_bytes());
+    b[at + 48..at + 56].copy_from_slice(&phdr.p_align.to_le_bytes());
 }
 
 /// Emit a minimal ET_EXEC main image whose `PT_INTERP` segment points
@@ -468,39 +468,45 @@ fn minimal_elf_with_interp_bytes(interp_path: &[u8]) -> Vec<u8> {
     write_phdr_at(
         &mut bytes,
         phoff as usize,
-        PT_PHDR,
-        PF_R,
-        phoff,
-        pt_phdr_vaddr,
-        total_phdrs,
-        total_phdrs,
-        8,
+        PhdrFields {
+            p_type: PT_PHDR,
+            p_flags: PF_R,
+            p_offset: phoff,
+            p_vaddr: pt_phdr_vaddr,
+            p_filesz: total_phdrs,
+            p_memsz: total_phdrs,
+            p_align: 8,
+        },
     );
 
     // ----- PT_LOAD (R+X covers everything in the file) -----
     write_phdr_at(
         &mut bytes,
         (phoff + 56) as usize,
-        PT_LOAD,
-        PF_R | PF_X,
-        0,
-        BASE_LOAD_VADDR,
-        file_size as u64,
-        file_size as u64,
-        FIX_PAGE,
+        PhdrFields {
+            p_type: PT_LOAD,
+            p_flags: PF_R | PF_X,
+            p_offset: 0,
+            p_vaddr: BASE_LOAD_VADDR,
+            p_filesz: file_size as u64,
+            p_memsz: file_size as u64,
+            p_align: FIX_PAGE,
+        },
     );
 
     // ----- PT_INTERP -----
     write_phdr_at(
         &mut bytes,
         (phoff + 112) as usize,
-        PT_INTERP,
-        PF_R,
-        path_offset,
-        BASE_LOAD_VADDR + path_offset,
-        path_len,
-        path_len,
-        1,
+        PhdrFields {
+            p_type: PT_INTERP,
+            p_flags: PF_R,
+            p_offset: path_offset,
+            p_vaddr: BASE_LOAD_VADDR + path_offset,
+            p_filesz: path_len,
+            p_memsz: path_len,
+            p_align: 1,
+        },
     );
 
     // ----- inline NUL-terminated interpreter path -----
@@ -543,26 +549,30 @@ fn minimal_interp_elf_bytes() -> Vec<u8> {
     write_phdr_at(
         &mut bytes,
         phoff as usize,
-        PT_PHDR,
-        PF_R,
-        phoff,
-        phoff,
-        total_phdrs,
-        total_phdrs,
-        8,
+        PhdrFields {
+            p_type: PT_PHDR,
+            p_flags: PF_R,
+            p_offset: phoff,
+            p_vaddr: phoff,
+            p_filesz: total_phdrs,
+            p_memsz: total_phdrs,
+            p_align: 8,
+        },
     );
 
     // PT_LOAD covering everything; vaddr=0 (relative).
     write_phdr_at(
         &mut bytes,
         (phoff + 56) as usize,
-        PT_LOAD,
-        PF_R | PF_X,
-        0,
-        0,
-        file_size as u64,
-        file_size as u64,
-        FIX_PAGE,
+        PhdrFields {
+            p_type: PT_LOAD,
+            p_flags: PF_R | PF_X,
+            p_offset: 0,
+            p_vaddr: 0,
+            p_filesz: file_size as u64,
+            p_memsz: file_size as u64,
+            p_align: FIX_PAGE,
+        },
     );
 
     bytes

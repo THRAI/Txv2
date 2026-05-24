@@ -253,22 +253,45 @@ fn step_sendto_connected_tcp_ignores_destination_argument() {
         .lock()
         .expect("net epoch test lock");
     let guard = tx_substrate::epoch::guard();
-    let tcp = registry::create_socket_for_test_or_bootstrap(
+    let listener = registry::create_socket_for_test_or_bootstrap(
         SocketKind::Tcp,
         SocketOptionSet::default_tcp(),
     )
-    .expect("tcp socket");
-    let payload = tcp.acquire_operational().expect("payload");
-    payload.with_protocol_mut(|protocol| {
-        *protocol = SocketProtocol::Tcp(TcpState::Connected {
-            local: endpoint(40_202),
-            remote: endpoint(50_202),
-        });
-    });
+    .expect("listener");
+    assert_eq!(
+        step_bind(&listener, inet(40_202), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(step_listen(&listener, 8, &guard), StepOutcome::Done(()));
+
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("client");
+    assert_eq!(
+        step_bind(&client, inet(50_202), &guard),
+        StepOutcome::Done(())
+    );
+    assert!(matches!(
+        step_connect(&client, inet(40_202), &guard),
+        StepOutcome::Yield {
+            shape: YieldShape::OnWaitSource { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    assert!(matches!(
+        step_accept(&listener, &guard),
+        StepOutcome::Done(_)
+    ));
 
     assert_eq!(
         step_send_to_kernel_bytes(
-            &tcp,
+            &client,
             Some(IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0)),
             b"x",
             SendRecvFlags::empty(),

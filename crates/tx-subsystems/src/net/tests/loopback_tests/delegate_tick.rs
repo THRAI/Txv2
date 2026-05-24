@@ -99,6 +99,64 @@ fn net_delegate_step_once_processes_tick_backlog_retransmit() {
 }
 
 #[test]
+fn net_delegate_step_once_rekicks_after_loopback_progress() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (client, listener, _local, _remote) = prepare_loopback_connect_with_client_send_buf(
+        40_192,
+        50_192,
+        TCP_CORK_AUTO_FLUSH_BYTES * 2,
+    );
+    let guard = tx_substrate::epoch::guard();
+
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let accepted = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("unexpected accept outcome"),
+    };
+    let bytes = alloc::vec![0x44; TCP_CORK_AUTO_FLUSH_BYTES];
+    assert_eq!(
+        step_send_kernel_bytes(&client, &bytes, SendRecvFlags::MSG_MORE, &guard),
+        StepOutcome::Done(bytes.len())
+    );
+
+    let source = ScriptedPacketSource::new(std::vec::Vec::new());
+    let driver = LoopbackDelegateDriver {
+        now: smoltcp::time::Instant::ZERO,
+        source: &source,
+        iface: Some(loopback_iface()),
+    };
+    crate::net::delegate::net_delegate_clear(
+        crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
+    );
+    crate::net::delegate::net_delegate_kick_poll();
+
+    let outcome = net_delegate_step_once(&driver, &guard);
+
+    assert!(outcome.poll_seen);
+    assert_eq!(outcome.loopback.tcp_bytes_moved, TCP_CORK_AUTO_FLUSH_BYTES);
+    assert!(
+        crate::net::delegate::net_delegate_queue().peek()
+            & crate::net::delegate::DelegateWireSet::POLL.bits()
+            != 0
+    );
+    assert_eq!(
+        accepted
+            .acquire_operational()
+            .expect("accepted payload")
+            .io_snapshot()
+            .recv_len,
+        TCP_CORK_AUTO_FLUSH_BYTES
+    );
+}
+
+#[test]
 fn net_delegate_timer_adapter_converts_smoltcp_deadline_to_reactor_ns() {
     let base = smoltcp::time::Instant::from_millis(10);
     let deadline = smoltcp::time::Instant::from_millis(15);

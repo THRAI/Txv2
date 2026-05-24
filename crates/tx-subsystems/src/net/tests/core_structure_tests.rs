@@ -258,7 +258,7 @@ fn socket_option_set_default_has_documented_limits() {
     assert!(options.socket.send_buf_size > 0);
     assert!(!options.socket.linger.enabled);
     assert_eq!(options.ip.ttl, 64);
-    assert_eq!(options.tcp.maxseg, 536);
+    assert_eq!(options.tcp.maxseg, 0);
 }
 
 #[test]

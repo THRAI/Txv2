@@ -306,6 +306,6 @@ fn step_open_eacces_without_read_bit() {
 #[test]
 fn errno_v4_to_v3_is_consistent() {
     use crate::vfs::adapter::step_engine::Errno as V3Errno;
-    let v3: V3Errno = Errno::ENODEV.into();
+    let v3: V3Errno = Errno::ENODEV;
     assert_eq!(v3, V3Errno::ENODEV);
 }

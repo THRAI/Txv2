@@ -133,6 +133,12 @@ pub fn step_socket_close(
 }
 
 fn flush_tcp_tx_before_close(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> usize {
+    if let Some(payload) = socket.acquire_operational() {
+        if let Some(raw_tcp) = payload.raw_tcp_socket() {
+            let _ = raw_tcp.flush_corked_tx();
+        }
+    }
+
     let mut moved_total = 0;
     for _ in 0..TCP_CLOSE_FLUSH_PASSES {
         let queued = socket

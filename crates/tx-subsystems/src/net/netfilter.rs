@@ -708,9 +708,9 @@ pub fn apply_postrouting_nat_ipv4_in_namespace(
                 && rule.target == NetfilterTarget::Masquerade
                 && rule_matches_context(rule, ctx)
                 && rule_matches_l4(rule, tuple)
-                && rule.src.map_or(true, |cidr| ipv4_in_cidr(src, cidr))
-                && rule.dst.map_or(true, |cidr| ipv4_in_cidr(dst, cidr))
-                && rule.dst_port.map_or(true, |port| tuple.dst_port == port)
+                && rule.src.is_none_or(|cidr| ipv4_in_cidr(src, cidr))
+                && rule.dst.is_none_or(|cidr| ipv4_in_cidr(dst, cidr))
+                && rule.dst_port.is_none_or(|port| tuple.dst_port == port)
         }) {
             entry.counters.packets = entry.counters.packets.saturating_add(1);
             entry.counters.bytes = entry.counters.bytes.saturating_add(packet.len() as u64);
@@ -735,13 +735,7 @@ pub fn apply_postrouting_nat_ipv4_in_namespace(
             external_dst_port: tuple.dst_port,
         },
     );
-    Some(rewrite_ipv4_nat(
-        packet,
-        Some(masquerade_src),
-        None,
-        None,
-        None,
-    )?)
+    rewrite_ipv4_nat(packet, Some(masquerade_src), None, None, None)
 }
 
 pub fn apply_prerouting_nat_ipv4(ctx: NetfilterFrameContext, packet: &[u8]) -> Option<Vec<u8>> {
@@ -795,13 +789,7 @@ pub fn apply_prerouting_nat_ipv4_in_namespace(
             Some(entry.original_src_port)
         }
     };
-    Some(rewrite_ipv4_nat(
-        packet,
-        None,
-        Some(entry.original_src),
-        None,
-        dst_port,
-    )?)
+    rewrite_ipv4_nat(packet, None, Some(entry.original_src), None, dst_port)
 }
 
 pub fn netfilter_stats_snapshot() -> NetfilterStatsSnapshot {
@@ -853,9 +841,9 @@ fn find_dnat_rule_in_namespace(
             && rule.target == NetfilterTarget::Dnat
             && rule_matches_context(rule, ctx)
             && rule_matches_l4(rule, tuple)
-            && rule.src.map_or(true, |cidr| ipv4_in_cidr(src, cidr))
-            && rule.dst.map_or(true, |cidr| ipv4_in_cidr(dst, cidr))
-            && rule.dst_port.map_or(true, |port| tuple.dst_port == port)
+            && rule.src.is_none_or(|cidr| ipv4_in_cidr(src, cidr))
+            && rule.dst.is_none_or(|cidr| ipv4_in_cidr(dst, cidr))
+            && rule.dst_port.is_none_or(|port| tuple.dst_port == port)
         {
             entry.counters.packets = entry.counters.packets.saturating_add(1);
             entry.counters.bytes = entry.counters.bytes.saturating_add(packet_len as u64);

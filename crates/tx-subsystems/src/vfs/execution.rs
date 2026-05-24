@@ -1147,7 +1147,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FlockOp<'a> {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         match self.file.flock_acquire(self.lock_type, self.blocking) {
             Ok(()) => StepOutcome::Done(()),
-            Err(e) => StepOutcome::Err(e.into()),
+            Err(e) => StepOutcome::Err(e),
         }
     }
 }

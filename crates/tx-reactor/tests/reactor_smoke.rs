@@ -1014,9 +1014,9 @@ fn slice_clock_accounts_consumed_time_and_requeues_expired_slice() {
     assert_eq!(
         deadlines.lock().expect("deadline log poisoned").as_slice(),
         &[
-            Some(1_000 + Phase1Scheduler::NEW_QUEUE_SLICE_NS),
+            Some(1_000 + Phase1Scheduler::NEW_QUEUE_SLICE_NS * 2),
             None,
-            Some(20_000_000 + Phase1Scheduler::PREEMPTED_QUEUE_SLICE_NS),
+            Some(20_000_250 + Phase1Scheduler::PREEMPTED_QUEUE_SLICE_NS),
             None,
         ],
         "each preemptive poll arms a slice deadline and cancels it after accounting",

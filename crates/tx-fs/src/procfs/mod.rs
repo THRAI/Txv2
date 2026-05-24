@@ -31,12 +31,12 @@ pub const PROCFS_SYS_ID: FsObjectId = FsObjectId::new(0x7072_6F06);
 pub const PROCFS_SYS_KERNEL_ID: FsObjectId = FsObjectId::new(0x7072_6F07);
 pub const PROCFS_SYS_KERNEL_TAINTED_ID: FsObjectId = FsObjectId::new(0x7072_6F08);
 pub const PROCFS_CONFIG_ID: FsObjectId = FsObjectId::new(0x7072_6F09);
-pub const PROCFS_SYS_FS_ID: FsObjectId = FsObjectId::new(0x7072_6F0a);
-pub const PROCFS_SYS_FS_PIPE_MAX_SIZE_ID: FsObjectId = FsObjectId::new(0x7072_6F0b);
-pub const PROCFS_SYS_FS_LEASE_BREAK_TIME_ID: FsObjectId = FsObjectId::new(0x7072_6F0c);
-pub const PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F0d);
-pub const PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F0e);
-pub const PROCFS_SYSVIPC_ID: FsObjectId = FsObjectId::new(0x7072_6F0f);
+pub const PROCFS_SYS_FS_ID: FsObjectId = FsObjectId::new(0x7072_6F0A);
+pub const PROCFS_SYS_FS_PIPE_MAX_SIZE_ID: FsObjectId = FsObjectId::new(0x7072_6F0B);
+pub const PROCFS_SYS_FS_LEASE_BREAK_TIME_ID: FsObjectId = FsObjectId::new(0x7072_6F0C);
+pub const PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F0D);
+pub const PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F0E);
+pub const PROCFS_SYSVIPC_ID: FsObjectId = FsObjectId::new(0x7072_6F0F);
 pub const PROCFS_SYSVIPC_MSG_ID: FsObjectId = FsObjectId::new(0x7072_6F10);
 pub const PROCFS_SYSVIPC_SEM_ID: FsObjectId = FsObjectId::new(0x7072_6F11);
 pub const PROCFS_SYSVIPC_SHM_ID: FsObjectId = FsObjectId::new(0x7072_6F12);
@@ -47,12 +47,12 @@ pub const PROCFS_NET_DEV_ID: FsObjectId = FsObjectId::new(0x7072_6F16);
 pub const PROCFS_SYS_NET_ID: FsObjectId = FsObjectId::new(0x7072_6F17);
 pub const PROCFS_SYS_NET_IPV4_ID: FsObjectId = FsObjectId::new(0x7072_6F18);
 pub const PROCFS_SYS_NET_IPV4_IP_FORWARD_ID: FsObjectId = FsObjectId::new(0x7072_6F19);
-pub const PROCFS_NET_TX_NF_RULES_ID: FsObjectId = FsObjectId::new(0x7072_6F1a);
-pub const PROCFS_NET_NF_CONNTRACK_ID: FsObjectId = FsObjectId::new(0x7072_6F1b);
-pub const PROCFS_NET_TCP_ID: FsObjectId = FsObjectId::new(0x7072_6F1c);
-pub const PROCFS_NET_UDP_ID: FsObjectId = FsObjectId::new(0x7072_6F1d);
-pub const PROCFS_NET_RAW_ID: FsObjectId = FsObjectId::new(0x7072_6F1e);
-pub const PROCFS_NET_SNMP_ID: FsObjectId = FsObjectId::new(0x7072_6F1f);
+pub const PROCFS_NET_TX_NF_RULES_ID: FsObjectId = FsObjectId::new(0x7072_6F1A);
+pub const PROCFS_NET_NF_CONNTRACK_ID: FsObjectId = FsObjectId::new(0x7072_6F1B);
+pub const PROCFS_NET_TCP_ID: FsObjectId = FsObjectId::new(0x7072_6F1C);
+pub const PROCFS_NET_UDP_ID: FsObjectId = FsObjectId::new(0x7072_6F1D);
+pub const PROCFS_NET_RAW_ID: FsObjectId = FsObjectId::new(0x7072_6F1E);
+pub const PROCFS_NET_SNMP_ID: FsObjectId = FsObjectId::new(0x7072_6F1F);
 pub const PROCFS_NET_NETLINK_ID: FsObjectId = FsObjectId::new(0x7072_6F20);
 pub const PROCFS_NET_IF_INET6_ID: FsObjectId = FsObjectId::new(0x7072_6F21);
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
@@ -134,7 +134,7 @@ const fn pid_netns_id(pid: Pid) -> FsObjectId {
 }
 fn pid_from_object_id(id: FsObjectId, tag: u64) -> Option<Pid> {
     let r = id.as_u64();
-    if r < PROCFS_PID_OBJECT_BASE || r >= PROCFS_FD_OBJECT_BASE {
+    if !(PROCFS_PID_OBJECT_BASE..PROCFS_FD_OBJECT_BASE).contains(&r) {
         return None;
     }
     let offset = r - PROCFS_PID_OBJECT_BASE;
@@ -168,7 +168,7 @@ fn pid_from_fd_id(id: FsObjectId) -> Option<(Pid, u32)> {
 }
 fn pid_from_ns_object_id(id: FsObjectId, tag: u64) -> Option<Pid> {
     let r = id.as_u64();
-    if r < PROCFS_NS_OBJECT_BASE || r >= PROCFS_NS_OBJECT_BASE + 0x0100_0000 {
+    if !(PROCFS_NS_OBJECT_BASE..PROCFS_NS_OBJECT_BASE + 0x0100_0000).contains(&r) {
         return None;
     }
     let offset = r - PROCFS_NS_OBJECT_BASE;
@@ -239,7 +239,7 @@ fn pid_from_task_dir(id: FsObjectId) -> Option<Pid> {
 }
 fn task_from_object_id(id: FsObjectId, tag: u64) -> Option<(Pid, u32)> {
     let r = id.as_u64();
-    if r < PROCFS_TASK_OBJECT_BASE {
+    if !(PROCFS_TASK_OBJECT_BASE..PROCFS_NS_OBJECT_BASE).contains(&r) {
         return None;
     }
     let offset = r - PROCFS_TASK_OBJECT_BASE;
@@ -351,7 +351,7 @@ impl FsOps for Procfs {
                     return StepOutcome::done(pid_dir_id(Pid(n)));
                 }
             }
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
         if parent == PROCFS_SYS_ID {
             if name == b"kernel" {
@@ -360,7 +360,7 @@ impl FsOps for Procfs {
             if name == b"fs" {
                 return StepOutcome::done(PROCFS_SYS_FS_ID);
             }
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
         if parent == PROCFS_SYS_FS_ID {
             if name == b"pipe-max-size" {
@@ -375,13 +375,13 @@ impl FsOps for Procfs {
             if name == b"protected_symlinks" {
                 return StepOutcome::done(PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID);
             }
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
         if parent == PROCFS_SYS_KERNEL_ID {
             if name == b"tainted" {
                 return StepOutcome::done(PROCFS_SYS_KERNEL_TAINTED_ID);
             }
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
         if parent == PROCFS_SYSVIPC_ID {
             if name == b"msg" {
@@ -393,7 +393,7 @@ impl FsOps for Procfs {
             if name == b"shm" {
                 return StepOutcome::done(PROCFS_SYSVIPC_SHM_ID);
             }
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
         if parent == PROCFS_NET_ID {
             return match name {
@@ -408,25 +408,25 @@ impl FsOps for Procfs {
                 b"snmp" => StepOutcome::done(PROCFS_NET_SNMP_ID),
                 b"netlink" => StepOutcome::done(PROCFS_NET_NETLINK_ID),
                 b"if_inet6" => StepOutcome::done(PROCFS_NET_IF_INET6_ID),
-                _ => StepOutcome::err(Errno::ENOENT.into()),
+                _ => StepOutcome::err(Errno::ENOENT),
             };
         }
         if parent == PROCFS_SYS_ID {
             return match name {
                 b"net" => StepOutcome::done(PROCFS_SYS_NET_ID),
-                _ => StepOutcome::err(Errno::ENOENT.into()),
+                _ => StepOutcome::err(Errno::ENOENT),
             };
         }
         if parent == PROCFS_SYS_NET_ID {
             return match name {
                 b"ipv4" => StepOutcome::done(PROCFS_SYS_NET_IPV4_ID),
-                _ => StepOutcome::err(Errno::ENOENT.into()),
+                _ => StepOutcome::err(Errno::ENOENT),
             };
         }
         if parent == PROCFS_SYS_NET_IPV4_ID {
             return match name {
                 b"ip_forward" => StepOutcome::done(PROCFS_SYS_NET_IPV4_IP_FORWARD_ID),
-                _ => StepOutcome::err(Errno::ENOENT.into()),
+                _ => StepOutcome::err(Errno::ENOENT),
             };
         }
         if let Some(pid) = pid_from_dir(parent) {
@@ -457,11 +457,11 @@ impl FsOps for Procfs {
             if name == b"ns" && process::process_by_pid(pid).is_some() {
                 return StepOutcome::done(pid_ns_dir_id(pid));
             }
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
         if let Some(pid) = pid_from_fdinfo_dir(parent) {
             let Ok(fd) = core::str::from_utf8(name).unwrap_or("").parse::<u32>() else {
-                return StepOutcome::err(Errno::ENOENT.into());
+                return StepOutcome::err(Errno::ENOENT);
             };
             if process::process_by_pid(pid)
                 .and_then(|proc| proc.fd(fd))
@@ -469,7 +469,7 @@ impl FsOps for Procfs {
             {
                 return StepOutcome::done(pid_fdinfo_id(pid, fd));
             }
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
         if let Some(pid) = pid_from_task_dir(parent) {
             if let Ok(n) = core::str::from_utf8(name).unwrap_or("").parse::<u32>() {
@@ -480,7 +480,7 @@ impl FsOps for Procfs {
                     return StepOutcome::done(task_tid_dir_id(pid, n));
                 }
             }
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
         if let Some((pid, tid)) = task_from_tid_dir(parent) {
             if name == b"stat"
@@ -490,15 +490,15 @@ impl FsOps for Procfs {
             {
                 return StepOutcome::done(task_tid_stat_id(pid, tid));
             }
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
         if let Some(pid) = pid_from_ns_dir(parent) {
             if name == b"net" && process::process_by_pid(pid).is_some() {
                 return StepOutcome::done(pid_netns_id(pid));
             }
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
-        StepOutcome::err(Errno::ENOENT.into())
+        StepOutcome::err(Errno::ENOENT)
     }
 
     fn load_inode_meta(
@@ -597,7 +597,7 @@ impl FsOps for Procfs {
             id if pid_from_netns_id(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
-            _ => StepOutcome::err(Errno::ENOENT.into()),
+            _ => StepOutcome::err(Errno::ENOENT),
         }
     }
 
@@ -936,27 +936,27 @@ impl FsOps for Procfs {
         } else if let Some((pid, fd_num)) = pid_from_fd_id(id) {
             // /proc/<pid>/fd/N — symlink target is the path of the open file.
             let Some(proc) = process::process_by_pid(pid) else {
-                return StepOutcome::err(Errno::ENOENT.into());
+                return StepOutcome::err(Errno::ENOENT);
             };
             let Some(_open_file) = proc.fd(fd_num) else {
-                return StepOutcome::err(Errno::ENOENT.into());
+                return StepOutcome::err(Errno::ENOENT);
             };
             // v1: render as "fd:N" since we don't have reverse-path from OpenFile.
             let target = alloc::format!("anon_inode:[{}]", fd_num);
             StepOutcome::done(target.into_bytes().into_boxed_slice())
         } else if let Some(pid) = pid_from_exe_id(id) {
             let Some(proc) = process::process_by_pid(pid) else {
-                return StepOutcome::err(Errno::ENOENT.into());
+                return StepOutcome::err(Errno::ENOENT);
             };
             let Some(exe_dentry) = proc.exe_file() else {
-                return StepOutcome::err(Errno::ENOENT.into());
+                return StepOutcome::err(Errno::ENOENT);
             };
             match render_dentry_path(&exe_dentry) {
                 Some(path) => StepOutcome::done(path.into_boxed_slice()),
-                None => StepOutcome::err(Errno::ENOENT.into()),
+                None => StepOutcome::err(Errno::ENOENT),
             }
         } else {
-            StepOutcome::err(Errno::ENOENT.into())
+            StepOutcome::err(Errno::ENOENT)
         }
     }
 
@@ -968,7 +968,7 @@ impl FsOps for Procfs {
         _: &Credential,
         _: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
     fn mkdir(
         &self,
@@ -978,7 +978,7 @@ impl FsOps for Procfs {
         _: &Credential,
         _: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
     fn unlink(
         &self,
@@ -987,7 +987,7 @@ impl FsOps for Procfs {
         _: FsObjectId,
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
     fn rmdir(
         &self,
@@ -996,7 +996,7 @@ impl FsOps for Procfs {
         _: FsObjectId,
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
     fn symlink(
         &self,
@@ -1006,7 +1006,7 @@ impl FsOps for Procfs {
         _: &Credential,
         _: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
     fn rename(
         &self,
@@ -1016,7 +1016,7 @@ impl FsOps for Procfs {
         _: &[u8],
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
     fn link(
         &self,
@@ -1025,7 +1025,7 @@ impl FsOps for Procfs {
         _: FsObjectId,
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
     fn destroy_inode(&self, _: FsObjectId, _: &Guard<'_>) -> StepOutcome<(), NoProgress> {
         StepOutcome::done(())
@@ -1047,10 +1047,10 @@ impl FsOps for Procfs {
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
         if let Some(pid) = pid_from_netns_id(id) {
             let Some(proc) = process::process_by_pid(pid) else {
-                return StepOutcome::err(Errno::ENOENT.into());
+                return StepOutcome::err(Errno::ENOENT);
             };
             let Some(payload) = proc.net_namespace() else {
-                return StepOutcome::err(Errno::ESRCH.into());
+                return StepOutcome::err(Errno::ESRCH);
             };
             return match RNode::new_cap_in_mount(
                 id,
@@ -1061,7 +1061,7 @@ impl FsOps for Procfs {
                 mount,
             ) {
                 Ok(cap) => StepOutcome::done(cap),
-                Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
+                Err(_) => StepOutcome::err(Errno::ENOMEM),
             };
         }
 
@@ -1075,7 +1075,7 @@ impl FsOps for Procfs {
             mount,
         ) {
             Ok(cap) => StepOutcome::done(cap),
-            Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
+            Err(_) => StepOutcome::err(Errno::ENOMEM),
         }
     }
 
@@ -1101,17 +1101,17 @@ impl FsOps for Procfs {
         // `offset` is the virtual address to read from.
         if let Some(pid) = pid_from_mem_id(fs_object_id) {
             let Some(proc) = process::process_by_pid(pid) else {
-                return StepOutcome::err(Errno::ESRCH.into());
+                return StepOutcome::err(Errno::ESRCH);
             };
             let Some(aspace) = proc.aspace_cap() else {
-                return StepOutcome::err(Errno::ESRCH.into());
+                return StepOutcome::err(Errno::ESRCH);
             };
             let src = UserPtr::<u8>::new(offset as usize);
             match aspace.copy_from_user(buf, src, guard) {
                 StepOutcome::Done(n) => StepOutcome::done(n as u64),
                 StepOutcome::Err(e) => StepOutcome::err(e),
                 StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                    StepOutcome::err(Errno::EIO.into())
+                    StepOutcome::err(Errno::EIO)
                 }
             }
         } else {
@@ -1159,7 +1159,7 @@ impl FsOps for Procfs {
         if fs_object_id == PROCFS_NET_TX_NF_RULES_ID {
             return match tx_subsystems::net::apply_netfilter_control_command(netns, bytes) {
                 Ok(()) => StepOutcome::done(bytes.len() as u64),
-                Err(errno) => StepOutcome::err(errno.into()),
+                Err(errno) => StepOutcome::err(errno),
             };
         }
 
@@ -1174,13 +1174,13 @@ impl FsOps for Procfs {
         }
 
         if fs_object_id != PROCFS_SYS_NET_IPV4_IP_FORWARD_ID {
-            return StepOutcome::err(Errno::EROFS.into());
+            return StepOutcome::err(Errno::EROFS);
         }
         let trimmed = trim_ascii_space(bytes);
         let enabled = match trimmed {
             b"0" => false,
             b"1" => true,
-            _ => return StepOutcome::err(Errno::EINVAL.into()),
+            _ => return StepOutcome::err(Errno::EINVAL),
         };
         netns.set_ipv4_forwarding_for_test_or_bootstrap(enabled);
         StepOutcome::done(bytes.len() as u64)
@@ -1192,7 +1192,7 @@ impl FsOps for Procfs {
         _: &Credential,
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
     fn step_chown(
         &self,
@@ -1202,7 +1202,7 @@ impl FsOps for Procfs {
         _: &Credential,
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 }
 
@@ -1227,7 +1227,7 @@ fn finish_dots(
 
 impl FsPageBacking for Procfs {
     fn fetch_page(&self, _: FsObjectId, _: u64, _: &Guard<'_>) -> StepOutcome<Frame, NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
     fn flush_page(
         &self,
@@ -1236,111 +1236,25 @@ impl FsPageBacking for Procfs {
         _: &Frame,
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
     fn truncate(&self, _: FsObjectId, _: u64, _: &Guard<'_>) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
     fn fsync_file(&self, _: FsObjectId, _: &Guard<'_>) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-    use std::sync::{LazyLock, Mutex};
-    use tx_hal::{
-        Arch, Asid, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapReservation, PmapReserveKind,
-        PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
-    };
-    use tx_subsystems::cred::{sign_cred, Cred};
     use tx_subsystems::device::DevT;
-    use tx_subsystems::ipc::{sysv_msg, sysv_sem, sysv_shm};
     use tx_subsystems::net::{
         create_veth_pair_for_test_or_bootstrap, EthernetAddress, Ipv4Address, NetAdminAuthority,
         VethEndpointConfig, VethPairConfig, VETH_DEFAULT_MTU,
     };
-    use tx_subsystems::process::nsproxy::sign_init_nsproxy;
-    use tx_subsystems::vm::USER_PAGE_SIZE;
     use tx_subsystems::zones;
-
-    struct ProcfsTestPmap;
-
-    impl PlatformConfig for ProcfsTestPmap {
-        const ARCH: Arch = Arch::Riscv64;
-        const BOARD: &'static str = "procfs-test";
-    }
-
-    #[derive(Default)]
-    struct ProcfsTestPmapState {
-        next_root: usize,
-        mappings: BTreeMap<(usize, usize), PhysAddr>,
-    }
-
-    static PROCFS_TEST_PMAP_STATE: LazyLock<Mutex<ProcfsTestPmapState>> =
-        LazyLock::new(|| Mutex::new(ProcfsTestPmapState::default()));
-
-    fn root_key(root: &PmapRoot) -> usize {
-        root.phys().0
-    }
-
-    impl PmapIf for ProcfsTestPmap {
-        fn create_pmap_root() -> Result<PmapRoot, PmapError> {
-            let mut state = PROCFS_TEST_PMAP_STATE.lock().expect("procfs pmap lock");
-            let root_id = state.next_root.max(1);
-            state.next_root = root_id + 1;
-            Ok(PmapRoot::new(
-                PtNode::boot_pool(PhysAddr(root_id * USER_PAGE_SIZE)),
-                Asid(root_id as u16),
-            ))
-        }
-
-        fn destroy_pmap_root(root: PmapRoot) {
-            let mut state = PROCFS_TEST_PMAP_STATE.lock().expect("procfs pmap lock");
-            let key = root.phys().0;
-            state.mappings.retain(|(r, _), _| *r != key);
-        }
-
-        fn reserve_mapping(
-            root: &PmapRoot,
-            virt: VirtAddr,
-            phys: PhysAddr,
-            kind: PmapReserveKind,
-        ) -> Result<Option<PmapReservation>, PmapError> {
-            let state = PROCFS_TEST_PMAP_STATE.lock().expect("procfs pmap lock");
-            if state.mappings.contains_key(&(root_key(root), virt.0)) {
-                return Err(PmapError::AlreadyMapped);
-            }
-            Ok(Some(PmapReservation::new(virt, phys, kind)))
-        }
-
-        fn rollback_mapping(_root: &PmapRoot, _reservation: PmapReservation) {}
-
-        fn commit_mapping(
-            root: &PmapRoot,
-            reservation: PmapReservation,
-            _permissions: tx_hal::PmapPermissions,
-        ) {
-            let mut state = PROCFS_TEST_PMAP_STATE.lock().expect("procfs pmap lock");
-            state
-                .mappings
-                .insert((root_key(root), reservation.virt().0), reservation.phys());
-        }
-
-        fn unmap_mapping(
-            root: &PmapRoot,
-            virt: VirtAddr,
-            kind: PmapReserveKind,
-        ) -> Result<Option<PmapUnmapResult>, PmapError> {
-            let mut state = PROCFS_TEST_PMAP_STATE.lock().expect("procfs pmap lock");
-            let Some(phys) = state.mappings.remove(&(root_key(root), virt.0)) else {
-                return Ok(None);
-            };
-            Ok(Some(PmapUnmapResult::new(virt, phys, kind)))
-        }
-    }
 
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1355,10 +1269,6 @@ mod tests {
         tx_subsystems::net::reset_netfilter_for_test();
         tx_test_support::drain_to_quiescence();
         guard
-    }
-
-    fn root_cred() -> adapter::step_engine::Cap<Cred> {
-        sign_cred(Cred::root()).expect("root cred cap")
     }
 
     fn read_one(fs: &Procfs, id: FsObjectId, cursor: DirCursor) -> (DirEntry, DirCursor) {
@@ -1448,8 +1358,7 @@ mod tests {
 
     #[test]
     fn procfs_net_dev_renders_loopback_and_namespace_links() {
-        let _lock = PROCFS_TEST_LOCK.lock().expect("procfs test lock");
-        init_procfs_test();
+        let _lock = setup();
         let guard = tx_substrate::epoch::guard();
         let procfs = Procfs::new();
         let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
@@ -1587,8 +1496,7 @@ mod tests {
 
     #[test]
     fn procfs_net_files_use_supplied_caller_network_namespace() {
-        let _lock = PROCFS_TEST_LOCK.lock().expect("procfs test lock");
-        init_procfs_test();
+        let _lock = setup();
         let guard = tx_substrate::epoch::guard();
         let procfs = Procfs::new();
         let auth = NetAdminAuthority::for_test_or_bootstrap();

@@ -372,11 +372,10 @@ impl PollContext {
 
             match parse_icmpv4_loopback_packet(&packet) {
                 Icmpv4Event::EchoRequest(request)
-                    if accepts_loopback_icmp_destination(iface, request.dst) =>
+                    if accepts_loopback_icmp_destination(iface, request.dst)
+                        && iface.dispatch_ip(build_icmpv4_echo_reply(&request.reply_packet())) =>
                 {
-                    if iface.dispatch_ip(build_icmpv4_echo_reply(&request.reply_packet())) {
-                        self.tx_packets += 1;
-                    }
+                    self.tx_packets += 1;
                 }
                 Icmpv4Event::EchoReply(reply) => {
                     let moved = icmpv4_echo_message_len(&reply);

@@ -413,7 +413,7 @@ pub(super) fn sys_epoll_ctl(
 
     match outcome {
         StepOutcome::Done(()) => SyscallResult::Return(0),
-        StepOutcome::Err(e) => SyscallResult::error_from(e.into()),
+        StepOutcome::Err(e) => SyscallResult::error_from(e),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -498,7 +498,7 @@ pub(super) async fn sys_epoll_wait<P: TimeIf>(
 
     match outcome {
         StepOutcome::Done(_) => SyscallResult::Error(ENOSYS_VALUE),
-        StepOutcome::Err(e) => SyscallResult::error_from(e.into()),
+        StepOutcome::Err(e) => SyscallResult::error_from(e),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }

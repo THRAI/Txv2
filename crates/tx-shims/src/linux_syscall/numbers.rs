@@ -1258,8 +1258,8 @@ pub const NR_SETHOSTNAME: u64 = 161;
 /// return `-EPERM`. `new_rlim` is silently ignored — limits are not
 /// actually enforced by most in-tree subsystems yet
 /// (`TODO(phase-rlimit-enforcement)`). The default table is generous
-/// (`RLIMIT_NOFILE = 65536 / 65536`, `RLIMIT_STACK = 8 MiB`, the rest
-/// `RLIM_INFINITY`) so LTP cases that reserve high-numbered fds can run.
+/// (`RLIMIT_NOFILE = 1024 / 4096`, `RLIMIT_STACK = 8 MiB`, the rest
+/// `RLIM_INFINITY`) while fd helpers enforce the soft 1024 ceiling.
 pub const NR_PRLIMIT64: u64 = 261;
 /// `getrandom(buf, buflen, flags)`. Linux RV64 generic ABI
 /// `__NR_getrandom = 278`. Fills `buf` with `buflen` bytes from the
@@ -1350,8 +1350,8 @@ pub const RLIMIT_CORE: u32 = 4;
 pub const RLIMIT_RSS: u32 = 5;
 /// `RLIMIT_NPROC = 6` — maximum number of processes per real uid.
 pub const RLIMIT_NPROC: u32 = 6;
-/// `RLIMIT_NOFILE = 7` — maximum open file descriptors. Slice 7
-/// reports `(1024, 1024)`.
+/// `RLIMIT_NOFILE = 7` — maximum open file descriptors. The default
+/// process limit reports `(1024, 4096)`.
 pub const RLIMIT_NOFILE: u32 = 7;
 /// `RLIMIT_MEMLOCK = 8` — maximum locked-in-memory bytes.
 pub const RLIMIT_MEMLOCK: u32 = 8;
@@ -1438,9 +1438,8 @@ pub const NR_SYNC_FILE_RANGE: u64 = 84;
 /// for the bringup path used by busybox `touch`.
 pub const NR_UTIMENSAT: u64 = 88;
 /// `NR_RENAMEAT2 = 276` — Linux RV64 generic ABI `__NR_renameat2`.
-/// Slice 8: `RENAME_NOREPLACE` honoured via a pre-walk existence
-/// check; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` return `-ENOSYS`
-/// (no atomic-swap surface yet).
+/// `RENAME_NOREPLACE` honours the no-overwrite check; `RENAME_EXCHANGE`
+/// swaps two existing paths; `RENAME_WHITEOUT` is rejected.
 pub const NR_RENAMEAT2: u64 = 276;
 
 /// `AT_REMOVEDIR = 0x200` — `unlinkat(2)` flag bit. When set the arm
@@ -1455,7 +1454,6 @@ pub const AT_REMOVEDIR: u32 = 0x200;
 /// successfully, the arm short-circuits without touching `FsOps::rename`.
 pub const RENAME_NOREPLACE: u32 = 1;
 /// `RENAME_EXCHANGE = 2` — atomically swap two existing paths.
-/// Slice 8: returns `-ENOSYS` (no FsOps surface for atomic swap).
 pub const RENAME_EXCHANGE: u32 = 2;
 /// `RENAME_WHITEOUT = 4` — overlayfs whiteout-creating rename.
 /// Slice 8: returns `-EINVAL` (recognised but unsupported flag bit).

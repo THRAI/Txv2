@@ -67,11 +67,7 @@ impl ThreadIdentity {
         if crate::futex::thread_has_waiter(self.tid.0) {
             return b'S';
         }
-        if payload.active_userspace_request().is_some() {
-            b'R'
-        } else {
-            b'R'
-        }
+        b'R'
     }
 
     /// Snapshot the owning process via `Weak::upgrade` under a fresh

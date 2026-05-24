@@ -1246,6 +1246,22 @@ fn pselect_socket_read_ready_includes_hup_and_errors() {
 }
 
 #[test]
+fn pselect_socket_blocked_interests_keeps_read_and_write_distinct() {
+    assert_eq!(
+        crate::linux_syscall::io::pselect_socket_blocked_interests(true, true, PollMask::empty()),
+        (true, true)
+    );
+    assert_eq!(
+        crate::linux_syscall::io::pselect_socket_blocked_interests(true, true, PollMask::OUT),
+        (true, false)
+    );
+    assert_eq!(
+        crate::linux_syscall::io::pselect_socket_blocked_interests(true, true, PollMask::HUP),
+        (false, true)
+    );
+}
+
+#[test]
 fn dispatch_pselect_udp_write_ready_with_readfds_pointer() {
     let _setup = socket_setup();
     loopback_iface().clear_for_test_or_bootstrap();

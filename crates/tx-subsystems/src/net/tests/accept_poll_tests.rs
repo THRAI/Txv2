@@ -1,11 +1,17 @@
 use super::*;
 
-#[test]
-fn step_accept_returns_child_socket_and_clears_when_empty() {
+fn setup() -> std::sync::MutexGuard<'static, ()> {
     init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
+    let lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    lock
+}
+
+#[test]
+fn step_accept_returns_child_socket_and_clears_when_empty() {
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
     let listener = registry::create_socket_for_test_or_bootstrap(
         SocketKind::Tcp,
@@ -65,10 +71,7 @@ fn step_accept_returns_child_socket_and_clears_when_empty() {
 
 #[test]
 fn step_accept_does_not_copy_ipv4_multicast_membership() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
     let listener = registry::create_socket_for_test_or_bootstrap(
         SocketKind::Tcp,
@@ -123,10 +126,7 @@ fn step_accept_does_not_copy_ipv4_multicast_membership() {
 
 #[test]
 fn step_accept_blocks_when_queue_empty() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
     let listener = registry::create_socket_for_test_or_bootstrap(
         SocketKind::Tcp,
@@ -151,10 +151,7 @@ fn step_accept_blocks_when_queue_empty() {
 
 #[test]
 fn step_process_network_events_respects_budget() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
     let packets = (0..(NET_EVENT_BUDGET + 3))
         .map(|_| PacketDispatch::Unsupported)
@@ -172,10 +169,7 @@ fn step_process_network_events_respects_budget() {
 
 #[test]
 fn execution_poll_reports_socket_readiness() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
     let udp = registry::create_socket_for_test_or_bootstrap(
         SocketKind::Udp,
@@ -205,10 +199,7 @@ fn execution_poll_reports_socket_readiness() {
 
 #[test]
 fn execution_poll_udp_readiness_tracks_io_snapshot() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
+    let _lock = setup();
     let guard = tx_substrate::epoch::guard();
     let udp = registry::create_socket_for_test_or_bootstrap(
         SocketKind::Udp,

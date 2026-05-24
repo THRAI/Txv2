@@ -516,7 +516,7 @@ fn dispatch_sethostname_too_long_returns_neg_einval() {
 // -----------------------------------------------------------------
 
 /// `prlimit64(0, RLIMIT_NOFILE, NULL, &old)` returns 0 and writes
-/// the default `(1024, 1024)` pair to `old`.
+/// the process default `(1024, 4096)` pair to `old`.
 #[test]
 fn dispatch_prlimit64_rlimit_nofile_returns_default() {
     let _setup = setup();
@@ -533,7 +533,7 @@ fn dispatch_prlimit64_rlimit_nofile_returns_default() {
     ));
     assert_eq!(r, SyscallResult::Return(0));
     assert_eq!(buf[0], 1024, "RLIMIT_NOFILE rlim_cur must default to 1024");
-    assert_eq!(buf[1], 1024, "RLIMIT_NOFILE rlim_max must default to 1024");
+    assert_eq!(buf[1], 4096, "RLIMIT_NOFILE rlim_max must default to 4096");
 }
 
 /// `prlimit64(0, RLIMIT_AS, NULL, &old)` returns the
@@ -626,6 +626,7 @@ fn dispatch_rt_sigreturn_restores_parked_signal_context() {
     let mut parked = tx_hal::UserTrapContext::empty();
     parked.pc = 0x1234_5678;
     parked.regs[10] = 0xdead_beef;
+    payload.store_saved_user_context(Some(tx_hal::UserTrapContext::empty()));
     payload.store_saved_signal_context(Some(parked));
 
     let ctx = make_ctx(proc_cap, thread.clone());

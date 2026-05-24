@@ -27,7 +27,8 @@ use crate::net::execution::{
     socket_accept_wait_token, socket_recv_wait_token, socket_send_wait_token,
     socket_urgent_wait_token, step_accept, step_bind, step_connect, step_listen, step_poll_ready,
     step_process_device_tx_pending_in_namespace_at, step_process_loopback_pending,
-    step_process_loopback_tcp, step_process_loopback_udp_on_iface, step_process_network_events,
+    step_process_loopback_pending_zero, step_process_loopback_tcp,
+    step_process_loopback_udp_on_iface, step_process_network_events,
     step_process_network_events_at, step_process_network_events_in_namespace_at,
     step_process_network_tick, step_process_network_tick_loopback, step_recv,
     step_recv_kernel_bytes, step_send, step_send_kernel_bytes, step_send_to_kernel_bytes,
@@ -50,7 +51,7 @@ use crate::net::protocol::{
     ArpSnapshotState, EtherIface, EtherPacketSource, EtherPacketTxSink, Icmpv4EchoPacket,
     Icmpv4Event, IfaceCommon, Ipv4RouteDecision, LoopbackIface, PollContext, RawTcpSocket,
     RawUdpSocket, SmoltcpAdapter, SmoltcpAdapterConfig, SmoltcpPacketSource, SmoltcpPacketTxSink,
-    UdpTxDatagram, ARP_REQUEST_RETRY_LIMIT,
+    UdpTxDatagram, ARP_REQUEST_RETRY_LIMIT, TCP_CORK_AUTO_FLUSH_BYTES,
 };
 use crate::net::structure::table::SOCKET_TABLE;
 use crate::net::{

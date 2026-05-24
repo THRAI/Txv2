@@ -837,7 +837,7 @@ mod step_op_wraps {
             len: 8,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        assert_eq!(op.step(&mut ctx), V3Out::Err(Errno::EINVAL.into()));
+        assert_eq!(op.step(&mut ctx), V3Out::Err(Errno::EINVAL));
         assert_eq!(of.offset(), 0);
         assert_eq!(pc.resident_pages(), 0);
     }

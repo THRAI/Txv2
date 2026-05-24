@@ -229,6 +229,12 @@ impl<P: TxPlatform> CoreInit<P> {
         let root_fs_object_id = root_mount.root().fs_object_id();
         let fs_ops = &rootfs_payload.fs_ops;
         let fs_page_backing = &rootfs_payload.fs_page_backing;
+        let create_ctx = RootfsCreateContext {
+            fs_ops,
+            fs_page_backing,
+            mount: &rootfs_payload,
+            cred: &cred,
+        };
 
         let etc_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"etc", 0o755, &cred) {
             Some(id) => id,
@@ -244,48 +250,26 @@ impl<P: TxPlatform> CoreInit<P> {
         let passwd = b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/bin/sh\nhsym:x:1000:1000:hsym:/home/hsym:/bin/sh\n";
         let group =
             b"root:x:0:\ndaemon:x:2:\nusers:x:100:\nnogroup:x:65534:\nnobody:x:65534:\nhsym:x:1000:\n";
-        if !create_file_with_data(
-            fs_ops,
-            fs_page_backing,
-            &rootfs_payload,
-            etc_id,
-            b"passwd",
-            0o666,
-            passwd,
-            &cred,
-        ) || !create_file_with_data(
-            fs_ops,
-            fs_page_backing,
-            &rootfs_payload,
-            etc_id,
-            b"group",
-            0o666,
-            group,
-            &cred,
-        ) {
+        if !create_file_with_data(&create_ctx, etc_id, b"passwd", 0o666, passwd)
+            || !create_file_with_data(&create_ctx, etc_id, b"group", 0o666, group)
+        {
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":identity-files:err:create-etc-files\n");
             return;
         }
         let _ = create_file_with_data(
-            fs_ops,
-            fs_page_backing,
-            &rootfs_payload,
+            &create_ctx,
             etc_id,
             b"shadow",
             0o600,
             b"root:*:0:0:99999:7:::\nnobody:*:0:0:99999:7:::\nhsym:*:0:0:99999:7:::\n",
-            &cred,
         );
         let _ = create_file_with_data(
-            fs_ops,
-            fs_page_backing,
-            &rootfs_payload,
+            &create_ctx,
             etc_id,
             b"gshadow",
             0o600,
             b"root:*::\ndaemon:*::\nusers:*::\nnogroup:*::\nnobody:*::\nhsym:*::\n",
-            &cred,
         );
 
         let bin_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"bin", 0o755, &cred) {
@@ -298,26 +282,8 @@ impl<P: TxPlatform> CoreInit<P> {
         };
         let useradd_script = b"#!/bin/sh\nexit 0\n";
         let userdel_script = b"#!/bin/sh\nexit 0\n";
-        let _ = create_file_with_data(
-            fs_ops,
-            fs_page_backing,
-            &rootfs_payload,
-            bin_id,
-            b"useradd",
-            0o755,
-            useradd_script,
-            &cred,
-        );
-        let _ = create_file_with_data(
-            fs_ops,
-            fs_page_backing,
-            &rootfs_payload,
-            bin_id,
-            b"userdel",
-            0o755,
-            userdel_script,
-            &cred,
-        );
+        let _ = create_file_with_data(&create_ctx, bin_id, b"useradd", 0o755, useradd_script);
+        let _ = create_file_with_data(&create_ctx, bin_id, b"userdel", 0o755, userdel_script);
         let usr_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"usr", 0o755, &cred) {
             Some(id) => id,
             None => root_fs_object_id,
@@ -387,19 +353,26 @@ fn symlink_into(
     )
 }
 
+struct RootfsCreateContext<'a> {
+    fs_ops: &'a alloc::sync::Arc<dyn FsOps>,
+    fs_page_backing: &'a alloc::sync::Arc<dyn FsPageBacking>,
+    mount: &'a Cap<MountPayload>,
+    cred: &'a Credential,
+}
+
 fn create_file_with_data(
-    fs_ops: &alloc::sync::Arc<dyn FsOps>,
-    fs_page_backing: &alloc::sync::Arc<dyn FsPageBacking>,
-    mount: &Cap<MountPayload>,
+    ctx: &RootfsCreateContext<'_>,
     parent: FsObjectId,
     name: &[u8],
     mode: u16,
     data: &[u8],
-    cred: &Credential,
 ) -> bool {
     let (file_id, file_meta) = {
         let guard = step_engine::guard();
-        match fs_ops.create_inode(parent, name, mode, cred, &guard) {
+        match ctx
+            .fs_ops
+            .create_inode(parent, name, mode, ctx.cred, &guard)
+        {
             StepOutcome::Done(out) => out,
             StepOutcome::Err(step_engine::Errno::EEXIST) => return true,
             _ => return false,
@@ -408,7 +381,10 @@ fn create_file_with_data(
 
     let pc = {
         let guard = step_engine::guard();
-        let rnode = match fs_ops.materialise_rnode(file_id, file_meta, mount, &guard) {
+        let rnode = match ctx
+            .fs_ops
+            .materialise_rnode(file_id, file_meta, ctx.mount, &guard)
+        {
             StepOutcome::Done(rnode) => rnode,
             _ => return false,
         };
@@ -435,7 +411,8 @@ fn create_file_with_data(
 
     let guard = step_engine::guard();
     matches!(
-        fs_page_backing.truncate(file_id, data.len() as u64, &guard),
+        ctx.fs_page_backing
+            .truncate(file_id, data.len() as u64, &guard),
         StepOutcome::Done(())
     )
 }

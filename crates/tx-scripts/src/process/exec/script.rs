@@ -385,7 +385,8 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     let openfile = {
         use StepOutcome as V3;
         let guard = step_engine::guard();
-        let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
+        let cwd = process.cwd().ok_or(ExecError::PathNotFound)?;
+        let rooted_at = exec_root_for_path(&cwd, path);
         let outcome = step_open(
             rooted_at,
             path,
@@ -405,7 +406,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
             V3::Err(err) => {
                 EXEC_LAST_OPEN_ERRNO.store(err as i32, core::sync::atomic::Ordering::Relaxed);
-                Err(ExecError::from_walker_errno(Errno::from(err)))
+                Err(ExecError::from_walker_errno(err))
             }
         };
         drop(guard);
@@ -467,7 +468,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         let result = match outcome {
             V3::Done(()) => Ok(()),
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
-            V3::Err(err) => Err(ExecError::from_read_errno(err.into())),
+            V3::Err(err) => Err(ExecError::from_read_errno(err)),
         };
         drop(guard);
         result?;
@@ -691,9 +692,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     }
 
     // ===== Phase 5 — thread-group collapse (if multi-threaded) =======
-    if let Some(payload) = process.payload_slot().lock().as_ref() {
-        payload.install_exec_group_exit();
-    }
+    let _ = process.collapse_threads_for_exec(thread);
 
     // ===== Phase 5a — eagerly populate partial-last-page bytes ========
     //
@@ -803,7 +802,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     {
         StepOutcome::Done(()) => {}
         StepOutcome::Err(err) => {
-            return Err(ExecError::from_populate_errno(err.into()));
+            return Err(ExecError::from_populate_errno(err));
         }
         _ => return Err(ExecError::Busy),
     }
@@ -998,7 +997,7 @@ async fn populate_partial_last_pages(
                 return Err(ExecError::Busy);
             }
             StepOutcome::Err(err) => {
-                return Err(ExecError::from_populate_errno(err.into()));
+                return Err(ExecError::from_populate_errno(err));
             }
         }
     }
@@ -1128,7 +1127,8 @@ async fn load_interp_image(
     let interp_open = {
         use StepOutcome as V3;
         let guard = step_engine::guard();
-        let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
+        let cwd = process.cwd().ok_or(ExecError::PathNotFound)?;
+        let rooted_at = exec_root_for_path(&cwd, interp_path);
         let outcome = step_open(
             rooted_at,
             interp_path,
@@ -1146,7 +1146,7 @@ async fn load_interp_image(
         let result = match outcome {
             V3::Done(file) => Ok(file),
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
-            V3::Err(err) => Err(ExecError::from_walker_errno(Errno::from(err))),
+            V3::Err(err) => Err(ExecError::from_walker_errno(err)),
         };
         drop(guard);
         result?
@@ -1171,7 +1171,7 @@ async fn load_interp_image(
         let result = match outcome {
             V3::Done(()) => Ok(()),
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
-            V3::Err(err) => Err(ExecError::from_read_errno(err.into())),
+            V3::Err(err) => Err(ExecError::from_read_errno(err)),
         };
         drop(guard);
         result?;

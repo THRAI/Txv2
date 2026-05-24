@@ -447,8 +447,7 @@ impl NetNamespacePayload {
             is_up: true,
         });
 
-        let mut next_ifindex = 2;
-        for reg in devices {
+        for (next_ifindex, reg) in (2..).zip(devices) {
             let ipv4_addr = self.ipv4_for_device(reg);
             let ipv4_prefix_len = self.ipv4_prefix_len_for_device(reg);
             links.push(NetNamespaceLinkInfo {
@@ -463,7 +462,6 @@ impl NetNamespacePayload {
                 is_loopback: false,
                 is_up: self.is_device_up(reg),
             });
-            next_ifindex += 1;
         }
 
         links
@@ -662,11 +660,11 @@ impl NetNamespacePayload {
             let gateway = route.gateway?;
             if route.prefix_len == 0
                 && (route.oif_name == Some(name)
-                    || route
-                        .oif_name
-                        .is_none()
-                        .then(|| self.oif_for_gateway(gateway) == Some(name))
-                        .unwrap_or(false))
+                    || if route.oif_name.is_none() {
+                        self.oif_for_gateway(gateway) == Some(name)
+                    } else {
+                        false
+                    })
             {
                 Some(gateway)
             } else {
@@ -759,7 +757,7 @@ impl NetNamespacePayload {
             .lock()
             .iter()
             .find(|link| link.registration.devt == registration.devt)
-            .map_or(true, |link| link.is_up)
+            .is_none_or(|link| link.is_up)
     }
 
     fn remove_device_from_local_bridges(
@@ -1408,10 +1406,10 @@ impl NetNamespaceRouteEntry {
             && self.table == selector.table
             && selector
                 .gateway
-                .map_or(true, |gateway| self.gateway == Some(gateway))
+                .is_none_or(|gateway| self.gateway == Some(gateway))
             && selector
                 .oif_name
-                .map_or(true, |oif_name| self.oif_name == Some(oif_name))
+                .is_none_or(|oif_name| self.oif_name == Some(oif_name))
     }
 }
 

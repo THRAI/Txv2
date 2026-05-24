@@ -58,6 +58,15 @@ impl Default for LoopbackPollBudget {
 }
 
 impl LoopbackPendingOutcome {
+    pub fn made_progress(&self) -> bool {
+        self.tcp_connected != 0
+            || self.tcp_bytes_moved != 0
+            || self.udp_bytes_moved != 0
+            || self.icmp_bytes_moved != 0
+            || self.tx_packets != 0
+            || self.packets_seen != 0
+    }
+
     pub fn merge(&mut self, other: Self) {
         self.tcp_connect_attempted += other.tcp_connect_attempted;
         self.tcp_connected += other.tcp_connected;

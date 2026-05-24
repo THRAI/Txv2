@@ -1,5 +1,6 @@
 use super::*;
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::net::rtnetlink::{
@@ -782,11 +783,7 @@ fn veth_linkinfo_without_peer() -> Vec<u8> {
 }
 
 fn newaddr_payload(ifindex: u32, prefix_len: u8, addr: [u8; 4]) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.push(2);
-    payload.push(prefix_len);
-    payload.push(0);
-    payload.push(0);
+    let mut payload = vec![2, prefix_len, 0, 0];
     payload.extend_from_slice(&ifindex.to_le_bytes());
     push_attr(&mut payload, IFA_ADDRESS, &addr);
     push_attr(&mut payload, IFA_LOCAL, &addr);
@@ -811,25 +808,13 @@ fn ifinfomsg(index: u32, flags: u32, change: u32) -> Vec<u8> {
 }
 
 fn ifaddrmsg(index: u32, prefix_len: u8) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.push(2);
-    payload.push(prefix_len);
-    payload.push(0);
-    payload.push(0);
+    let mut payload = vec![2, prefix_len, 0, 0];
     payload.extend_from_slice(&index.to_le_bytes());
     payload
 }
 
 fn rtmsg() -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.push(2);
-    payload.push(0);
-    payload.push(0);
-    payload.push(0);
-    payload.push(0);
-    payload.push(0);
-    payload.push(0);
-    payload.push(0);
+    let mut payload = vec![2, 0, 0, 0, 0, 0, 0, 0];
     payload.extend_from_slice(&0u32.to_le_bytes());
     payload
 }
@@ -910,7 +895,7 @@ fn push_attr(out: &mut Vec<u8>, kind: u16, payload: &[u8]) {
 }
 
 fn pad_to_align4(out: &mut Vec<u8>) {
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
 }

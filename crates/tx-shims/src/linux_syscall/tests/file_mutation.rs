@@ -35,7 +35,6 @@ const E_ISDIR: i32 = 21;
 const E_INVAL: i32 = 22;
 const E_PERM: i32 = 1;
 const E_ACCES: i32 = 13;
-const E_NOSYS: i32 = 38;
 const STAT_BYTES: usize = 128;
 const STAT_ATIME_SEC_OFF: usize = 72;
 const STAT_MTIME_SEC_OFF: usize = 88;
@@ -881,10 +880,9 @@ fn dispatch_renameat2_same_directory_succeeds() {
 // `dispatch_renameat2_exchange_returns_neg_enosys` plus the
 // `step_rename` tests in `tx-subsystems`.
 
-/// `renameat2(.., RENAME_EXCHANGE)` returns `-ENOSYS` (atomic swap
-/// unsupported in Slice 8).
+/// `renameat2(.., RENAME_EXCHANGE)` atomically swaps two existing entries.
 #[test]
-fn dispatch_renameat2_exchange_returns_neg_enosys() {
+fn dispatch_renameat2_exchange_swaps_existing_entries() {
     let _setup = fm_setup();
     let (root_dentry, tmpfs) = build_tmpfs_root();
     create_regular(&tmpfs, b"a");
@@ -906,7 +904,15 @@ fn dispatch_renameat2_exchange_returns_neg_enosys() {
         ],
     );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(E_NOSYS));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(
+        lookup_exists(&tmpfs, b"a"),
+        "/a should still exist after exchange"
+    );
+    assert!(
+        lookup_exists(&tmpfs, b"b"),
+        "/b should still exist after exchange"
+    );
     drop(oldpath);
     drop(newpath);
 }

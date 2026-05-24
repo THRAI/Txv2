@@ -384,7 +384,7 @@ pub async fn populate_detached_user_range(
 
     // Bounds check.
     let Some(end) = (vaddr as usize).checked_add(bytes.len()) else {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     };
     let _ = end;
 
@@ -402,10 +402,10 @@ pub async fn populate_detached_user_range(
         // consumers that need a guard-scoped lookup later.
         let entry = match aspace.lookup(addr) {
             Some(entry) => entry,
-            None => return V3::err(Errno::EFAULT.into()),
+            None => return V3::err(Errno::EFAULT),
         };
         if !entry.prot.write {
-            return V3::err(Errno::EINVAL.into());
+            return V3::err(Errno::EINVAL);
         }
 
         // Materialise the page through the canonical fault-resolution
@@ -420,19 +420,19 @@ pub async fn populate_detached_user_range(
         // finds the mapping ready.
         let outcome = match aspace.resolve_fault(VmFault::new(addr, crate::vm::AccessMode::Write)) {
             Ok(outcome) => outcome,
-            Err(VmFaultError::WouldBlock) => return V3::err(Errno::EBUSY.into()),
-            Err(VmFaultError::ProtectionViolation) => return V3::err(Errno::EINVAL.into()),
-            Err(VmFaultError::NoRecipe) => return V3::err(Errno::EFAULT.into()),
-            Err(_) => return V3::err(Errno::EIO.into()),
+            Err(VmFaultError::WouldBlock) => return V3::err(Errno::EBUSY),
+            Err(VmFaultError::ProtectionViolation) => return V3::err(Errno::EINVAL),
+            Err(VmFaultError::NoRecipe) => return V3::err(Errno::EFAULT),
+            Err(_) => return V3::err(Errno::EIO),
         };
         let materialized = match outcome.materialize_pagebacked() {
             Ok(m) => m,
-            Err(_) => return V3::err(Errno::ENOMEM.into()),
+            Err(_) => return V3::err(Errno::ENOMEM),
         };
 
         let frame_base = match page_allocator::frame_kernel_addr(materialized.page.ppn) {
             Ok(ptr) => ptr,
-            Err(_) => return V3::err(Errno::EIO.into()),
+            Err(_) => return V3::err(Errno::EIO),
         };
         // SAFETY: `frame_base` is the kernel direct-map view of a
         // freshly materialised anonymous page; we hold the pin via
@@ -455,7 +455,7 @@ pub async fn populate_detached_user_range(
             // concurrent thread reservation contender); a `Pmap` /
             // `StaleRecipe` error here is a programmer error worth
             // surfacing.
-            return V3::err(map_publish_error(error).into());
+            return V3::err(map_publish_error(error));
         }
 
         written += chunk;
@@ -829,7 +829,7 @@ mod tests {
         // range near `USER_STACK_TOP_DEFAULT` is registered).
         let bytes = [0x55u8; 16];
         let outcome = run_async(populate_detached_user_range(&aspace, 0x100, &bytes));
-        assert_eq!(outcome, V3StepOutcome::Err(Errno::EFAULT.into()));
+        assert_eq!(outcome, V3StepOutcome::Err(Errno::EFAULT));
     }
 
     #[test]

@@ -235,7 +235,7 @@ fn push_nla(out: &mut Vec<u8>, kind: u16, payload: &[u8]) {
     out.extend_from_slice(&(len as u16).to_le_bytes());
     out.extend_from_slice(&kind.to_le_bytes());
     out.extend_from_slice(payload);
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
 }

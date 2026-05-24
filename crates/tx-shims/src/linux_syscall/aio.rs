@@ -277,7 +277,7 @@ fn run_read(file: &Cap<OpenFile>, out: &mut [u8]) -> Result<usize, i64> {
                 if total > 0 {
                     return Ok(total);
                 }
-                return Err(-(super::errno_to_i32(v3errno.into()) as i64));
+                return Err(-(super::errno_to_i32(v3errno) as i64));
             }
         }
     }
@@ -320,7 +320,7 @@ fn run_write(file: &Cap<OpenFile>, bytes: &[u8]) -> Result<usize, i64> {
                 if total > 0 {
                     return Ok(total);
                 }
-                return Err(-(super::errno_to_i32(v3errno.into()) as i64));
+                return Err(-(super::errno_to_i32(v3errno) as i64));
             }
         }
     }

@@ -16,6 +16,8 @@ use crate::net::packet::LoopbackIpPacket;
 use crate::net::structure::{IpEndpoint, Ipv4Address, SocketOptionSet};
 use crate::sync::SpinMutex;
 
+pub const TCP_CORK_AUTO_FLUSH_BYTES: usize = 1460;
+
 /// Doc-named owner for the smoltcp TCP socket and its backing buffers.
 pub struct RawTcpSocket {
     socket: SpinMutex<Box<tcp::Socket<'static>>>,
@@ -39,6 +41,13 @@ pub struct RawTcpProtocolState {
 pub enum RawTcpSocketError {
     InvalidEndpoint,
     InvalidState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawTcpSendReserve {
+    pub bytes: usize,
+    pub became_full: bool,
+    pub flushed_to_protocol: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,17 +201,25 @@ impl RawTcpSocket {
         self.tx_buffer.lock().len()
     }
 
-    pub fn enqueue_tx_len(&self, len: usize) -> Option<(usize, bool)> {
+    pub fn enqueue_tx_len(&self, len: usize) -> Option<RawTcpSendReserve> {
         self.enqueue_tx_bytes(&vec![0; len])
     }
 
-    pub fn enqueue_tx_bytes(&self, bytes: &[u8]) -> Option<(usize, bool)> {
+    pub fn enqueue_tx_bytes(&self, bytes: &[u8]) -> Option<RawTcpSendReserve> {
         self.enqueue_tx_bytes_with_more(bytes, false)
     }
 
-    pub fn enqueue_tx_bytes_with_more(&self, bytes: &[u8], more: bool) -> Option<(usize, bool)> {
+    pub fn enqueue_tx_bytes_with_more(
+        &self,
+        bytes: &[u8],
+        more: bool,
+    ) -> Option<RawTcpSendReserve> {
         if bytes.is_empty() {
-            return Some((0, false));
+            return Some(RawTcpSendReserve {
+                bytes: 0,
+                became_full: false,
+                flushed_to_protocol: false,
+            });
         }
 
         let available = self.send_available();
@@ -215,7 +232,16 @@ impl RawTcpSocket {
             self.corked_tx
                 .lock()
                 .extend(bytes.iter().copied().take(requested));
-            return Some((requested, self.send_available() == 0));
+            let flushed_to_protocol = if self.corked_tx.lock().len() >= TCP_CORK_AUTO_FLUSH_BYTES {
+                self.flush_corked_tx() > 0
+            } else {
+                false
+            };
+            return Some(RawTcpSendReserve {
+                bytes: requested,
+                became_full: self.send_available() == 0,
+                flushed_to_protocol,
+            });
         }
 
         let corked_len = self.corked_tx.lock().len();
@@ -236,7 +262,41 @@ impl RawTcpSocket {
             .lock()
             .extend(combined.iter().copied().take(accepted));
         let accepted_new = accepted.saturating_sub(corked_len).min(requested);
-        Some((accepted_new, self.send_available() == 0))
+        Some(RawTcpSendReserve {
+            bytes: accepted_new,
+            became_full: self.send_available() == 0,
+            flushed_to_protocol: accepted > 0,
+        })
+    }
+
+    pub fn flush_corked_tx(&self) -> usize {
+        let bytes = {
+            let mut corked = self.corked_tx.lock();
+            if corked.is_empty() {
+                return 0;
+            }
+            core::mem::take(&mut *corked)
+        };
+
+        let accepted = match self.enqueue_protocol_tx_bytes(&bytes) {
+            Ok(accepted) => accepted,
+            Err(_) => {
+                self.prepend_corked_tx(&bytes);
+                return 0;
+            }
+        };
+        if accepted == 0 {
+            self.prepend_corked_tx(&bytes);
+            return 0;
+        }
+
+        self.tx_buffer
+            .lock()
+            .extend(bytes.iter().copied().take(accepted));
+        if accepted < bytes.len() {
+            self.prepend_corked_tx(&bytes[accepted..]);
+        }
+        accepted
     }
 
     pub fn ack_tx_bytes(&self, bytes: usize) -> bool {
@@ -301,10 +361,12 @@ impl RawTcpSocket {
     }
 
     pub fn close(&self) {
+        let _ = self.flush_corked_tx();
         self.socket.lock().close();
     }
 
     pub fn abort(&self) {
+        self.corked_tx.lock().clear();
         self.socket.lock().abort();
     }
 
@@ -432,6 +494,22 @@ impl RawTcpSocket {
 
     fn enqueue_protocol_tx_bytes(&self, bytes: &[u8]) -> Result<usize, tcp::SendError> {
         self.socket.lock().send_slice(bytes)
+    }
+
+    fn prepend_corked_tx(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut corked = self.corked_tx.lock();
+        if corked.is_empty() {
+            corked.extend_from_slice(bytes);
+            return;
+        }
+
+        let mut combined = Vec::with_capacity(bytes.len() + corked.len());
+        combined.extend_from_slice(bytes);
+        combined.extend(corked.iter().copied());
+        *corked = combined;
     }
 
     fn remember_syn_ack(&self, segment: &SmoltcpTcpSegment) {
