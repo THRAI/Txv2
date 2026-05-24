@@ -19,6 +19,7 @@ pub fn init<P: TxPlatform>() -> Result<(), tx_subsystems::vdso::VdsoInitError> {
     // timebase frequency.
     let info = P::platform_info();
     tx_subsystems::vdso::vvar_page().init_clock_params(info.timebase_frequency_hz);
+    tx_subsystems::wall_clock::publish_vvar::<P>();
 
     Ok(())
 }

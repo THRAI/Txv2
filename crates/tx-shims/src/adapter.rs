@@ -45,6 +45,6 @@ pub mod reactor_entry {
     pub use tx_reactor::userspace;
     pub use tx_reactor::userspace::SyscallRequest;
     pub use tx_reactor::wait::{Mask, WaitProtocol};
-    pub use tx_substrate::wake::mailbox::{ActiveWait, MailboxEvent, TaskMailbox};
-    pub use tx_substrate::wake::wait_source::lookup_source;
+    pub use tx_substrate::wake::mailbox::{ActiveWait, MailboxEvent, TaskMailbox, WaitGeneration};
+    pub use tx_substrate::wake::wait_source::{lookup_source, SubscriberId, WaitSource};
 }

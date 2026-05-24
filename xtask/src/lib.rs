@@ -34,6 +34,7 @@ mod qemu;
 mod shell_test;
 mod submit;
 mod syscall;
+mod syscall_ref;
 mod syscall_status;
 mod target;
 mod test;

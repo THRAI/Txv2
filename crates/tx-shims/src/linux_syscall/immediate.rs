@@ -17,7 +17,6 @@
 //! | getpid             | proc.rs   | sys_getpid           |
 //! | getppid            | proc.rs   | sys_getppid          |
 //! | getpgid            | proc.rs   | sys_getpgid          |
-//! | getpgrp            | proc.rs   | sys_getpgrp          |
 //! | getsid             | proc.rs   | sys_getsid           |
 //! | getuid             | cred.rs   | sys_getuid           |
 //! | geteuid            | cred.rs   | sys_geteuid          |

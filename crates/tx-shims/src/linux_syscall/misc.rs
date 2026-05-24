@@ -137,6 +137,14 @@ pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     SyscallResult::Return(0)
 }
 
+pub(super) fn sys_getrlimit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    sys_prlimit64([0, args[0], 0, args[1], 0, 0], ctx)
+}
+
+pub(super) fn sys_setrlimit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    sys_prlimit64([0, args[0], args[1], 0, 0, 0], ctx)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct UtsnameLayout {

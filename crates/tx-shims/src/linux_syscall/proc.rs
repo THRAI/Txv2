@@ -12,6 +12,21 @@ use crate::linux_syscall::numbers::CLONE_NEWIPC;
 /// syscall a pointer adjusted to this 144-byte prefix and keeps the
 /// public `struct rusage` reserved tail in libc-owned memory.
 const RUSAGE_BYTES: usize = 144;
+const SCHED_OTHER: i32 = 0;
+const PRIO_PROCESS: i32 = 0;
+const NICE_MIN: i32 = -20;
+const NICE_MAX: i32 = 19;
+const NICE_ZERO_RAW: i64 = 20;
+const IOPRIO_WHO_PROCESS: i32 = 1;
+const IOPRIO_CLASS_NONE: i32 = 0;
+const IOPRIO_CLASS_BE: i32 = 2;
+const IOPRIO_CLASS_SHIFT: u32 = 13;
+const IOPRIO_DEFAULT_BE: i32 = IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT;
+const RUSAGE_CHILDREN: i32 = -1;
+const RUSAGE_SELF: i32 = 0;
+const RUSAGE_THREAD: i32 = 1;
+const LINUX_DEFAULT_PERSONALITY: u32 = 0;
+const PERSONALITY_QUERY: u32 = u32::MAX;
 
 /// `exit(status)` — per-thread exit per `PROCESS_v1` §7.3.1.
 ///
@@ -68,6 +83,43 @@ pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
 /// construction).
 pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.process.pid.0 as i64)
+}
+
+/// `getcpu(cpup, nodep, unused)`. Linux RV64 generic ABI `__NR_getcpu = 168`.
+///
+/// v1 has a fixed single-node test/kernel shape. Write CPU 0 and
+/// NUMA node 0 when requested; the cache pointer is obsolete on Linux
+/// and ignored.
+pub(super) fn sys_getcpu<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let cpu_uaddr = args[0];
+    let node_uaddr = args[1];
+    if cpu_uaddr != 0 {
+        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, cpu_uaddr, 0) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    if node_uaddr != 0 {
+        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, node_uaddr, 0) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    SyscallResult::Return(0)
+}
+
+/// `personality(persona)`. Linux RV64 generic ABI `__NR_personality = 92`.
+///
+/// txKernel has no personality-dependent execution policy. Support
+/// Linux's query sentinel and a no-op set of the default personality;
+/// reject all other changes so tests see the unsupported policy
+/// boundary explicitly.
+pub(super) fn sys_personality(args: [u64; 6]) -> SyscallResult {
+    let persona = args[0] as u32;
+    match persona {
+        PERSONALITY_QUERY | LINUX_DEFAULT_PERSONALITY => {
+            SyscallResult::Return(LINUX_DEFAULT_PERSONALITY as i64)
+        }
+        _ => SyscallResult::Error(EINVAL_VALUE),
+    }
 }
 
 /// `execve(path, argv, envp)` — Wave 4 / Phase 6 of the ELF-loader
@@ -891,22 +943,177 @@ pub(super) fn sys_sched_getaffinity<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) ->
     }
 }
 
+pub(super) fn sys_getrusage<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let who = args[0] as i32;
+    let usage = args[1];
+    if !matches!(who, RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if usage == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let raw = [0u8; RUSAGE_BYTES];
+    match bootstrap_copy_to_user(&ctx.aspace, usage, &raw) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
+fn validate_sched_pid(pid: u64, ctx: &SyscallCtx<'_>) -> Result<(), SyscallResult> {
+    if pid == 0 || pid == ctx.process.pid.0 as u64 || pid == ctx.thread.tid.0 as u64 {
+        Ok(())
+    } else {
+        Err(SyscallResult::Error(ESRCH_VALUE))
+    }
+}
+
+fn validate_sched_policy(policy: i32) -> bool {
+    policy == SCHED_OTHER
+}
+
+fn validate_self_process_target(
+    which: i32,
+    who: u64,
+    ctx: &SyscallCtx<'_>,
+) -> Result<(), SyscallResult> {
+    if which != PRIO_PROCESS {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    if who == 0 || who == ctx.process.pid.0 as u64 {
+        Ok(())
+    } else {
+        Err(SyscallResult::Error(ESRCH_VALUE))
+    }
+}
+
+pub(super) fn sys_sched_getscheduler<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_sched_pid(args[0], ctx) {
+        return err;
+    }
+    SyscallResult::Return(SCHED_OTHER as i64)
+}
+
+pub(super) fn sys_sched_setparam<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_sched_pid(args[0], ctx) {
+        return err;
+    }
+    let param = args[1];
+    if param == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let sched_priority = match bootstrap_read_user::<i32>(&ctx.aspace, param) {
+        Ok(priority) => priority,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    if sched_priority != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    SyscallResult::Return(0)
+}
+
+pub(super) fn sys_sched_getparam<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_sched_pid(args[0], ctx) {
+        return err;
+    }
+    let param = args[1];
+    if param == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    match bootstrap_copy_to_user(&ctx.aspace, param, &0i32.to_le_bytes()) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
+pub(super) fn sys_sched_yield() -> SyscallResult {
+    SyscallResult::Return(0)
+}
+
+pub(super) fn sys_sched_get_priority_max(args: [u64; 6]) -> SyscallResult {
+    if validate_sched_policy(args[0] as i32) {
+        SyscallResult::Return(0)
+    } else {
+        SyscallResult::Error(EINVAL_VALUE)
+    }
+}
+
+pub(super) fn sys_sched_get_priority_min(args: [u64; 6]) -> SyscallResult {
+    if validate_sched_policy(args[0] as i32) {
+        SyscallResult::Return(0)
+    } else {
+        SyscallResult::Error(EINVAL_VALUE)
+    }
+}
+
+pub(super) fn sys_sched_rr_get_interval<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_sched_pid(args[0], ctx) {
+        return err;
+    }
+    let interval = args[1];
+    if interval == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let raw = [0u8; 16];
+    match bootstrap_copy_to_user(&ctx.aspace, interval, &raw) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
+pub(super) fn sys_getpriority<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_self_process_target(args[0] as i32, args[1], ctx) {
+        return err;
+    }
+    SyscallResult::Return(NICE_ZERO_RAW)
+}
+
+pub(super) fn sys_setpriority<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_self_process_target(args[0] as i32, args[1], ctx) {
+        return err;
+    }
+    let nice = args[2] as i32;
+    if !(NICE_MIN..=NICE_MAX).contains(&nice) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    SyscallResult::Return(0)
+}
+
+pub(super) fn sys_ioprio_get<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_ioprio_target(args[0] as i32, args[1], ctx) {
+        return err;
+    }
+    SyscallResult::Return(IOPRIO_DEFAULT_BE as i64)
+}
+
+pub(super) fn sys_ioprio_set<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_ioprio_target(args[0] as i32, args[1], ctx) {
+        return err;
+    }
+    let ioprio = args[2] as i32;
+    if ioprio == IOPRIO_CLASS_NONE || ioprio == IOPRIO_DEFAULT_BE {
+        SyscallResult::Return(0)
+    } else {
+        SyscallResult::Error(EINVAL_VALUE)
+    }
+}
+
+fn validate_ioprio_target(which: i32, who: u64, ctx: &SyscallCtx<'_>) -> Result<(), SyscallResult> {
+    if which != IOPRIO_WHO_PROCESS {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    if who == 0 || who == ctx.process.pid.0 as u64 {
+        Ok(())
+    } else {
+        Err(SyscallResult::Error(ESRCH_VALUE))
+    }
+}
+
 // =====================================================================
 // Slice 7 of the shell-prompt roadmap — fcntl extension + day-1 misc
-// syscalls (`getpgrp` / `kill` / `tkill` / `tgkill` / `getrandom` /
-// `uname` / `prlimit64` / `rt_sigreturn`). Each is a small, isolated
+// syscalls (`kill` / `tkill` / `tgkill` / `getrandom` / `uname` /
+// `prlimit64` / `rt_sigreturn`). Each is a small, isolated
 // arm that unblocks a specific shell-startup path. F_DUPFD /
 // F_DUPFD_CLOEXEC / F_GETFL extensions to fcntl live inside `sys_fcntl`
 // itself (see above). See
 // `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 7.
 // =====================================================================
-
-/// `getpgrp()` — Linux RV64 generic ABI `__NR_getpgrp = 81`.
-///
-/// glibc-only legacy call: glibc emulates `getpgrp()` as `getpgid(0)`.
-/// musl uses `getpgid(0)` directly and never issues this number, but
-/// shipping a real implementation is cheap and removes a startup
-/// `-ENOSYS` from any glibc-built binary that lands later.
-pub(super) fn sys_getpgrp<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
-    SyscallResult::Return(ctx.process.pgrp_cap().pgid.0 as i64)
-}

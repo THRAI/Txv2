@@ -23,6 +23,10 @@ pub enum Errno {
     /// fd is `-EBADF`, not `-EPIPE`.
     EBADF,
     EBUSY,
+    /// Operation canceled. Used by Linux timerfd
+    /// `TFD_TIMER_CANCEL_ON_SET` after a realtime clock change.
+    /// Linux value: 125.
+    ECANCELED,
     EDQUOT,
     EEXIST,
     /// File too large — sem_num >= nsems in semop.
@@ -87,6 +91,7 @@ impl From<Errno> for crate::adapter::step_engine::V3Errno {
             Errno::EAGAIN => Self::EAGAIN,
             Errno::EBADF => Self::EBADF,
             Errno::EBUSY => Self::EBUSY,
+            Errno::ECANCELED => Self::ECANCELED,
             Errno::EDQUOT => Self::EDQUOT,
             Errno::EEXIST => Self::EEXIST,
             Errno::EFBIG => Self::EFBIG,
@@ -134,6 +139,7 @@ impl From<crate::adapter::step_engine::V3Errno> for Errno {
             V3::EAGAIN => Errno::EAGAIN,
             V3::EBADF => Errno::EBADF,
             V3::EBUSY => Errno::EBUSY,
+            V3::ECANCELED => Errno::ECANCELED,
             V3::EDQUOT => Errno::EDQUOT,
             V3::EEXIST => Errno::EEXIST,
             V3::EFBIG => Errno::EFBIG,

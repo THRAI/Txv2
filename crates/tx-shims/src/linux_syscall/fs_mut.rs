@@ -570,6 +570,53 @@ pub(super) async fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     }
 }
 
+pub(super) async fn sys_fallocate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i32;
+    let mode = args[1] as u32;
+    let offset = args[2] as i64;
+    let len = args[3] as i64;
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if mode != 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
+    if offset < 0 || len < 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let Some(new_size) = (offset as u64).checked_add(len as u64) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    let file = match resolve_fd(&ctx.process, fd as u32) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let pc = match file.rnode().backing() {
+        RNodeBacking::PageBacked { pc } => pc.clone(),
+        RNodeBacking::Directory => return SyscallResult::Error(EISDIR_VALUE),
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let op = tx_subsystems::page_backed::FallocateOp { pc: &pc, new_size };
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        None,
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+    }
+}
+
 /// `readlinkat(dirfd, pathname, buf, bufsiz)`. Linux RV64 generic ABI
 /// `__NR_readlinkat = 78`.
 ///

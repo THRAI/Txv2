@@ -604,11 +604,21 @@ impl ProcessIdentity {
     /// `BTreeSet<u32>`. Returns an empty set for zombies. Used by
     /// [`crate::process::execution::step_close_cloexec_fds`] during
     /// exec phase 7 to walk every marked fd.
-    pub(crate) fn fd_cloexec_snapshot(&self) -> BTreeSet<u32> {
+    pub fn fd_cloexec_snapshot(&self) -> BTreeSet<u32> {
         self.payload
             .lock()
             .as_ref()
             .map(|p| p.fd_cloexec_snapshot())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot the current open fd numbers. Used by range-based fd
+    /// syscalls to walk sparse keys without scanning to `u32::MAX`.
+    pub fn open_fd_numbers(&self) -> BTreeSet<u32> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.open_fd_numbers())
             .unwrap_or_default()
     }
 
@@ -1418,6 +1428,10 @@ impl ProcessPayload {
     /// Public fd-table snapshot (for procfs `/proc/<pid>/fd/`).
     pub fn open_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
         self.snapshot_fds()
+    }
+
+    pub fn open_fd_numbers(&self) -> BTreeSet<u32> {
+        self.fds.lock().keys().copied().collect()
     }
 
     /// Process command-line (for `/proc/<pid>/cmdline`).

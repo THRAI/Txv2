@@ -822,6 +822,137 @@ pub(super) async fn sys_pread64<'a, P: tx_hal::TimeIf>(
     result
 }
 
+pub(super) async fn sys_pwrite64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i32;
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    let offset = args[3];
+    if (offset as i64) < 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let file = match resolve_fd(&ctx.process, fd as u32) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let saved = file.offset();
+    file.set_offset(offset);
+    let result = sys_write(args, ctx).await;
+    file.set_offset(saved);
+    result
+}
+
+fn positioned_vector_offset(args: [u64; 6]) -> Result<u64, SyscallResult> {
+    let lo = args[3];
+    let hi = args[4];
+    let offset = lo | (hi << 32);
+    if (offset as i64) < 0 {
+        Err(SyscallResult::Error(EINVAL_VALUE))
+    } else {
+        Ok(offset)
+    }
+}
+
+pub(super) async fn sys_preadv<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let fd = args[0] as i32;
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    let offset = match positioned_vector_offset(args) {
+        Ok(offset) => offset,
+        Err(err) => return err,
+    };
+    let file = match resolve_fd(&ctx.process, fd as u32) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let saved = file.offset();
+    file.set_offset(offset);
+    let result = sys_readv::<P>(args, ctx).await;
+    file.set_offset(saved);
+    result
+}
+
+pub(super) async fn sys_pwritev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i32;
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    let offset = match positioned_vector_offset(args) {
+        Ok(offset) => offset,
+        Err(err) => return err,
+    };
+    let file = match resolve_fd(&ctx.process, fd as u32) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let saved = file.offset();
+    file.set_offset(offset);
+    let result = sys_writev(args, ctx).await;
+    file.set_offset(saved);
+    result
+}
+
+pub(super) async fn sys_preadv2<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    if args[5] != 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
+    sys_preadv::<P>(args, ctx).await
+}
+
+pub(super) async fn sys_pwritev2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if args[5] != 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
+    sys_pwritev(args, ctx).await
+}
+
+pub(super) fn sys_fadvise64_64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i32;
+    let offset = args[1] as i64;
+    let len = args[2] as i64;
+    let advice = args[3] as i32;
+    if fd < 0 || resolve_fd(&ctx.process, fd as u32).is_none() {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if offset < 0 || len < 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if !(0..=5).contains(&advice) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    SyscallResult::Return(0)
+}
+
+pub(super) fn sys_readahead<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i32;
+    if fd < 0 || resolve_fd(&ctx.process, fd as u32).is_none() {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    SyscallResult::Return(0)
+}
+
+pub(super) fn sys_sync_file_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i32;
+    let offset = args[1] as i64;
+    let nbytes = args[2] as i64;
+    let flags = args[3] as u32;
+    const SYNC_FILE_RANGE_KNOWN: u32 = 0x1 | 0x2 | 0x4;
+    if fd < 0 || resolve_fd(&ctx.process, fd as u32).is_none() {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if offset < 0 || nbytes < 0 || flags & !SYNC_FILE_RANGE_KNOWN != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    SyscallResult::Return(0)
+}
+
 /// `sendfile64(out_fd, in_fd, offset, count)` — page-level copy from
 /// one fd to another without an intermediate userspace buffer.
 ///
@@ -926,6 +1057,96 @@ pub(super) async fn sys_sendfile64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     } else {
         // Advance the input file's cursor when offset was NULL.
         in_file.advance_offset(transferred as u64);
+    }
+
+    SyscallResult::Return(transferred as i64)
+}
+
+pub(super) async fn sys_copy_file_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    use tx_subsystems::page_backed::step_copy_file_range;
+    use tx_subsystems::vfs::structure::RNodeBacking;
+
+    let in_fd = args[0] as i32;
+    let off_in_ptr = args[1];
+    let out_fd = args[2] as i32;
+    let off_out_ptr = args[3];
+    let len = args[4] as usize;
+    let flags = args[5] as u32;
+
+    if flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if in_fd < 0 || out_fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if len == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    let in_file = match resolve_fd(&ctx.process, in_fd as u32) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let out_file = match resolve_fd(&ctx.process, out_fd as u32) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let in_pc = match in_file.rnode().backing() {
+        RNodeBacking::PageBacked { pc } => pc.clone(),
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    let out_pc = match out_file.rnode().backing() {
+        RNodeBacking::PageBacked { pc } => pc.clone(),
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+
+    let in_offset = if off_in_ptr != 0 {
+        match bootstrap_read_user::<u64>(&ctx.aspace, off_in_ptr) {
+            Ok(offset) => offset,
+            Err(errno) => return SyscallResult::error_from(errno),
+        }
+    } else {
+        in_file.offset()
+    };
+    let out_offset = if off_out_ptr != 0 {
+        match bootstrap_read_user::<u64>(&ctx.aspace, off_out_ptr) {
+            Ok(offset) => offset,
+            Err(errno) => return SyscallResult::error_from(errno),
+        }
+    } else {
+        out_file.offset()
+    };
+
+    let guard = tx_substrate::epoch::guard();
+    let outcome = step_copy_file_range(&in_pc, in_offset, &out_pc, out_offset, len, &guard);
+    drop(guard);
+
+    let transferred = match outcome {
+        tx_substrate::step::StepOutcome::Done(n) => n,
+        tx_substrate::step::StepOutcome::Err(e) => {
+            let errno: tx_subsystems::execution::Errno = e.into();
+            return SyscallResult::error_from(errno);
+        }
+        _ => return SyscallResult::Error(EAGAIN_VALUE),
+    };
+
+    if transferred > 0 {
+        let new_in = in_offset + transferred as u64;
+        let new_out = out_offset + transferred as u64;
+        if off_in_ptr != 0 {
+            if let Err(_errno) = bootstrap_write_user::<u64>(&ctx.aspace, off_in_ptr, new_in) {
+                return SyscallResult::Return(transferred as i64);
+            }
+        } else {
+            in_file.advance_offset(transferred as u64);
+        }
+        if off_out_ptr != 0 {
+            if let Err(_errno) = bootstrap_write_user::<u64>(&ctx.aspace, off_out_ptr, new_out) {
+                return SyscallResult::Return(transferred as i64);
+            }
+        } else {
+            out_file.advance_offset(transferred as u64);
+        }
     }
 
     SyscallResult::Return(transferred as i64)

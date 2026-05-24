@@ -856,11 +856,19 @@ Some syscalls cross variant boundaries. Splice, sendfile, copy_file_range all ha
 ### 9.1 splice
 <!-- txdoc:PAGE-BACKED-9-1-SPLICE -->
 
-Between two fds; at least one must be a pipe. Common cases:
+Between two fds; at least one must be a pipe. Pipe owns ordered waitable
+transport; PageBacked owns page leases and install/copy policy. Common cases:
 
-- **Pipe → File (page-backed):** data flows from pipe ring buffer into file PC. For each chunk, read from pipe, write to PC at current offset, advance offset.
-- **File (page-backed) → Pipe:** reverse.
-- **Pipe → Pipe:** pure struct-backed; no PC involved.
+- **Pipe → File (page-backed):** if the front pipe descriptor carries a full
+  page-aligned `PageLease`, PageBacked installs it into the destination PC when
+  the target page is absent, or copies into the resident destination frame when
+  policy requires fallback. Ordinary anonymous pipe buffers and unaligned
+  ranges use the byte-copy path.
+- **File (page-backed) → Pipe:** full page-aligned file ranges export a
+  PageBacked-owned `PageLease` and enqueue it as a pipe descriptor. Partial,
+  unaligned, and unsupported ranges use the byte-copy path.
+- **Pipe → Pipe / tee:** moves or duplicates pipe descriptors while preserving
+  stream order and wait-source semantics.
 
 The script dispatches:
 
@@ -888,7 +896,17 @@ pub fn step_splice(ctx, in_fd, in_off, out_fd, out_off, len) -> StepOutcome<usiz
 }
 ```
 
-Splice uses simple copy in v1 (no zero-copy via frame handoff; that's a Phase 2 optimization per the pipe discussion earlier).
+Pipe capacity is a resizable descriptor ring (`F_GETPIPE_SZ` /
+`F_SETPIPE_SZ`), defaulting to 16 page slots. Ordinary `write(2)` uses
+anonymous pipe pages with tail-slot merge for small writes; `PIPE_BUF` writes
+reserve all required capacity before publishing bytes. Notification/watchqueue
+pipes are a separate future pipe mode and do not share the byte-stream storage
+variants.
+
+**Tech debt:** `vmsplice(SPLICE_F_GIFT)` remains non-stealing until VM exposes
+a real user-page pin/adoption primitive. Tx may copy user iov bytes into pipe
+buffers, but must not advertise gifted user pages as stealable until the VM can
+prove userspace no longer owns the page and PageBacked/pipe owns release.
 
 ### 9.2 sendfile
 <!-- txdoc:PAGE-BACKED-9-2-SENDFILE -->

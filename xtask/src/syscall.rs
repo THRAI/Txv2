@@ -20,6 +20,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::syscall_ref::{
+    extra_locals, load_reference, number_mismatches, reference_by_local_name, true_missing,
+    LocalNr, LINUX_REF_SUBMODULE, RV64_REFERENCE_JSON, RV64_REFERENCE_URL,
+};
 use crate::Result;
 
 const NUMBERS_REL: &str = "crates/tx-shims/src/linux_syscall/numbers.rs";
@@ -44,6 +48,15 @@ struct Entry {
     status: Status,
 }
 
+impl Entry {
+    fn local_nr(&self) -> LocalNr {
+        LocalNr {
+            name: self.name.clone(),
+            nr: self.nr,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Status {
     /// Dispatched in `mod.rs` with a handler function.
@@ -55,6 +68,8 @@ enum Status {
         /// `SYSCALL_STATUS.md` is the human-checked authority).
         likely_stub: bool,
     },
+    /// Dispatched directly in `mod.rs` without a named `sys_*` helper.
+    Inline { likely_stub: bool },
     /// `NR_` constant defined in `numbers.rs` but no dispatch arm.
     DefinedNotDispatched,
 }
@@ -65,6 +80,8 @@ impl Status {
             Status::Dispatched {
                 likely_stub: true, ..
             } => "stub",
+            Status::Inline { likely_stub: true } => "stub",
+            Status::Inline { .. } => "wired",
             Status::Dispatched { is_async: true, .. } => "async",
             Status::Dispatched { .. } => "wired",
             Status::DefinedNotDispatched => "defined",
@@ -115,8 +132,8 @@ fn parse_numbers(text: &str) -> BTreeMap<String, u64> {
 /// For the multi-line block form the handler may sit on a later line.
 /// The parser walks forward until it finds the first `sys_<…>` token
 /// inside the arm or hits the next arm's `NR_` reference.
-fn parse_dispatch(text: &str) -> BTreeMap<String, String> {
-    let mut out: BTreeMap<String, String> = BTreeMap::new();
+fn parse_dispatch(text: &str) -> BTreeMap<String, DispatchArm> {
+    let mut out: BTreeMap<String, DispatchArm> = BTreeMap::new();
     let lines: Vec<&str> = text.lines().collect();
     for (i, raw) in lines.iter().enumerate() {
         let line = raw.trim_start();
@@ -145,10 +162,13 @@ fn parse_dispatch(text: &str) -> BTreeMap<String, String> {
         // Scan forward starting at the same line's RHS for the first
         // `sys_<…>(` token. If we don't find one before reaching another
         // arm's `=>` or the end of the match, give up on this entry.
+        let mut arm_text = String::new();
         let mut scan = &line[arrow + 2..];
         let mut handler: Option<String> = None;
         let mut local_idx = i;
         loop {
+            arm_text.push_str(scan);
+            arm_text.push('\n');
             if let Some(sys_pos) = scan.find("sys_") {
                 let after_sys = &scan[sys_pos + 4..];
                 let h_end = after_sys
@@ -178,11 +198,21 @@ fn parse_dispatch(text: &str) -> BTreeMap<String, String> {
             }
             scan = next;
         }
-        if let Some(h) = handler {
-            out.entry(name.to_string()).or_insert(h);
-        }
+        let arm = match handler {
+            Some(h) => DispatchArm::Handler(h),
+            None => DispatchArm::Inline {
+                likely_stub: arm_text.contains("ENOSYS") || arm_text.contains("ENOSYS_VALUE"),
+            },
+        };
+        out.entry(name.to_string()).or_insert(arm);
     }
     out
+}
+
+#[derive(Clone, Debug)]
+enum DispatchArm {
+    Handler(String),
+    Inline { likely_stub: bool },
 }
 
 /// Walk every `.rs` in the handler directory looking for the named
@@ -272,7 +302,7 @@ fn collect_entries(root: &Path) -> Result<Vec<Entry>> {
     let mut out = Vec::with_capacity(numbers.len());
     for (name, nr) in numbers {
         let status = match dispatch.get(&name) {
-            Some(handler) => {
+            Some(DispatchArm::Handler(handler)) => {
                 let (is_async, likely_stub) = match locate_handler(&handler_dir, handler) {
                     Some((is_async, body)) => (is_async, is_likely_stub(&body)),
                     None => (false, false),
@@ -283,6 +313,9 @@ fn collect_entries(root: &Path) -> Result<Vec<Entry>> {
                     likely_stub,
                 }
             }
+            Some(DispatchArm::Inline { likely_stub }) => Status::Inline {
+                likely_stub: *likely_stub,
+            },
             None => Status::DefinedNotDispatched,
         };
         out.push(Entry { name, nr, status });
@@ -320,7 +353,7 @@ fn cmd_list(root: &Path, args: &[String]) -> Result<()> {
                 Status::Dispatched {
                     likely_stub: true,
                     ..
-                }
+                } | Status::Inline { likely_stub: true }
             ),
             "defined" => matches!(&e.status, Status::DefinedNotDispatched),
             "async" => matches!(&e.status, Status::Dispatched { is_async: true, .. }),
@@ -338,6 +371,7 @@ fn cmd_list(root: &Path, args: &[String]) -> Result<()> {
                     is_async,
                     likely_stub,
                 } => (handler.as_str(), *is_async, *likely_stub),
+                Status::Inline { likely_stub } => ("(inline)", false, *likely_stub),
                 Status::DefinedNotDispatched => ("", false, false),
             };
             print!(
@@ -371,6 +405,7 @@ fn cmd_list(root: &Path, args: &[String]) -> Result<()> {
                     is_async,
                     likely_stub,
                 } => (handler.as_str(), *is_async, *likely_stub),
+                Status::Inline { likely_stub } => ("(inline)", false, *likely_stub),
                 Status::DefinedNotDispatched => ("(no arm)", false, false),
             };
             println!(
@@ -402,8 +437,21 @@ fn cmd_info(root: &Path, args: &[String]) -> Result<()> {
         .trim_start_matches("nr_")
         .to_ascii_uppercase();
     let entries = collect_entries(root)?;
+    let reference = load_reference(root)?;
+    let reference_by_name = reference_by_local_name(&reference);
     let Some(e) = entries.iter().find(|e| e.name == key) else {
-        return Err(format!("no NR_{key} found in {NUMBERS_REL}"));
+        if let Some(sys) = reference_by_name.get(&key) {
+            println!("NR_{key}: not defined locally");
+            println!(
+                "  Linux RV64 {}: nr={} symbol={} source={}:{}",
+                reference.kernel.version, sys.number, sys.symbol, sys.file, sys.line
+            );
+            println!("  signature: {}", sys.signature.join(", "));
+            return Ok(());
+        }
+        return Err(format!(
+            "no NR_{key} found in {NUMBERS_REL} or Linux RV64 reference"
+        ));
     };
     println!("NR_{} = {}", e.name, e.nr);
     match &e.status {
@@ -420,10 +468,30 @@ fn cmd_info(root: &Path, args: &[String]) -> Result<()> {
             );
             println!("  stub:    {likely_stub}");
         }
+        Status::Inline { likely_stub } => {
+            println!("  status:  {}", e.status.label());
+            println!("  handler: (inline dispatch arm)");
+            println!("  stub:    {likely_stub}");
+        }
         Status::DefinedNotDispatched => {
             println!("  status:  defined (no dispatch arm)");
             println!("  TODO:    wire in {DISPATCH_REL}");
         }
+    }
+    if let Some(sys) = reference_by_name.get(&e.name) {
+        println!(
+            "  Linux:  nr={} symbol={} source={}:{}",
+            sys.number, sys.symbol, sys.file, sys.line
+        );
+        println!("  sig:    {}", sys.signature.join(", "));
+        if sys.number != e.nr {
+            println!("  WARN:   local number differs from Linux RV64 reference");
+        }
+    } else {
+        println!(
+            "  Linux:  no matching syscall name in RV64 {}",
+            reference.kernel.version
+        );
     }
     Ok(())
 }
@@ -459,6 +527,12 @@ fn count(entries: &[Entry]) -> Counts {
                     c.stubs += 1;
                 }
             }
+            Status::Inline { likely_stub } => {
+                c.dispatched += 1;
+                if *likely_stub {
+                    c.stubs += 1;
+                }
+            }
             Status::DefinedNotDispatched => {
                 c.defined_no_arm += 1;
             }
@@ -469,14 +543,33 @@ fn count(entries: &[Entry]) -> Counts {
 
 fn cmd_status(root: &Path, _args: &[String]) -> Result<()> {
     let entries = collect_entries(root)?;
+    let reference = load_reference(root)?;
     let c = count(&entries);
+    let locals: Vec<LocalNr> = entries.iter().map(Entry::local_nr).collect();
     println!("txKernel syscall progress");
     println!("=========================");
     println!("NR_* defined in numbers.rs : {}", c.total_nr);
+    println!(
+        "Linux RV64 reference       : {} ({})",
+        reference.syscalls.len(),
+        reference.kernel.version
+    );
     println!("dispatched in mod.rs       : {}", c.dispatched);
     println!("  …of which async          : {}", c.dispatched_async);
     println!("  …of which likely stubs   : {}", c.stubs);
     println!("defined but no dispatch arm: {}", c.defined_no_arm);
+    println!(
+        "true missing vs Linux      : {}",
+        true_missing(&locals, &reference).len()
+    );
+    println!(
+        "number mismatches          : {}",
+        number_mismatches(&locals, &reference).len()
+    );
+    println!(
+        "local extras               : {}",
+        extra_locals(&locals, &reference).len()
+    );
     println!();
     println!("Pick targets:  cargo xtask syscall pick");
     println!("List wired:    cargo xtask syscall list --filter wired");
@@ -489,23 +582,41 @@ fn cmd_status(root: &Path, _args: &[String]) -> Result<()> {
 // Subcommand: `syscall sync` / `sync --check`
 // ---------------------------------------------------------------------------
 
-fn render_auto_section(entries: &[Entry]) -> String {
+fn render_auto_section(
+    entries: &[Entry],
+    reference: &crate::syscall_ref::ReferenceTable,
+) -> String {
     let c = count(entries);
+    let locals: Vec<LocalNr> = entries.iter().map(Entry::local_nr).collect();
+    let true_missing = true_missing(&locals, reference);
+    let mismatches = number_mismatches(&locals, reference);
+    let extras = extra_locals(&locals, reference);
     let mut out = String::new();
     out.push_str(BEGIN_SENTINEL);
     out.push('\n');
     out.push_str(
-        "\n_This section is generated by `cargo xtask syscall sync` from\n\
-         `crates/tx-shims/src/linux_syscall/{numbers,mod}.rs`. Do not edit\n\
-         between the BEGIN/END sentinels by hand — your changes will be\n\
-         overwritten by the next `sync`. The lint variant\n\
-         `cargo xtask lint syscall-status` fails on drift._\n\n",
+        &format!(
+            "\n_This section is generated by `cargo xtask syscall sync` from\n\
+             `crates/tx-shims/src/linux_syscall/{{numbers,mod}}.rs` and the Linux RV64 {} reference\n\
+             at `{}` (source: {}). Linux file/line references point into `{}`. Do not edit\n\
+             between the BEGIN/END sentinels by hand — your changes will be\n\
+             overwritten by the next `sync`. The lint variant\n\
+             `cargo xtask lint syscall-status` fails on drift or number mismatch._\n\n",
+            reference.kernel.version,
+            RV64_REFERENCE_JSON,
+            RV64_REFERENCE_URL,
+            LINUX_REF_SUBMODULE
+        ),
     );
     // Counts summary.
     out.push_str("### Counts (from dispatch table)\n\n");
     out.push_str(&format!(
         "- `pub const NR_*` in numbers.rs: **{}**\n",
         c.total_nr
+    ));
+    out.push_str(&format!(
+        "- Linux RV64 reference syscalls: **{}**\n",
+        reference.syscalls.len()
     ));
     out.push_str(&format!(
         "- dispatched in mod.rs: **{}** (of which async: {}, likely-stub: {})\n",
@@ -515,6 +626,34 @@ fn render_auto_section(entries: &[Entry]) -> String {
         "- defined but not dispatched: **{}**\n\n",
         c.defined_no_arm
     ));
+    out.push_str(&format!(
+        "- true missing vs Linux RV64 reference: **{}**\n",
+        true_missing.len()
+    ));
+    out.push_str(&format!(
+        "- number mismatches vs Linux RV64 reference: **{}**\n",
+        mismatches.len()
+    ));
+    out.push_str(&format!(
+        "- local `NR_*` not in Linux RV64 reference: **{}**\n\n",
+        extras.len()
+    ));
+    if !mismatches.is_empty() {
+        out.push_str(&format!("### Number mismatches ({})\n\n", mismatches.len()));
+        out.push_str("| `NR_*` | Local # | Linux RV64 # | Linux source |\n");
+        out.push_str("|---|---:|---:|---|\n");
+        for mismatch in &mismatches {
+            out.push_str(&format!(
+                "| `NR_{}` | {} | {} | `{}`:{} |\n",
+                mismatch.name,
+                mismatch.local,
+                mismatch.reference,
+                mismatch.reference_file,
+                mismatch.reference_line
+            ));
+        }
+        out.push('\n');
+    }
     // Likely-stub list.
     let stubs: Vec<&Entry> = entries
         .iter()
@@ -524,7 +663,7 @@ fn render_auto_section(entries: &[Entry]) -> String {
                 Status::Dispatched {
                     likely_stub: true,
                     ..
-                }
+                } | Status::Inline { likely_stub: true }
             )
         })
         .collect();
@@ -534,6 +673,7 @@ fn render_auto_section(entries: &[Entry]) -> String {
         for e in stubs {
             let handler = match &e.status {
                 Status::Dispatched { handler, .. } => handler.as_str(),
+                Status::Inline { .. } => "(inline)",
                 _ => "",
             };
             out.push_str(&format!("- `NR_{}` ({}) → `{}`\n", e.name, e.nr, handler));
@@ -556,6 +696,43 @@ fn render_auto_section(entries: &[Entry]) -> String {
         }
         out.push('\n');
     }
+    if !true_missing.is_empty() {
+        out.push_str(&format!(
+            "### True missing from local `numbers.rs` ({})\n\n",
+            true_missing.len()
+        ));
+        out.push_str("These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the greenfield backlog; it is distinct from defined-but-not-dispatched.\n\n");
+        out.push_str("| Linux # | Name | Signature | Linux source |\n");
+        out.push_str("|---:|---|---|---|\n");
+        for sys in true_missing.iter().take(160) {
+            out.push_str(&format!(
+                "| {} | `{}` | `{}` | `{}`:{} |\n",
+                sys.number,
+                sys.name,
+                truncate_md(&sys.signature.join(", "), 90),
+                sys.file,
+                sys.line
+            ));
+        }
+        if true_missing.len() > 160 {
+            out.push_str(&format!(
+                "|  | ... | {} more omitted from doc output |  |\n",
+                true_missing.len() - 160
+            ));
+        }
+        out.push('\n');
+    }
+    if !extras.is_empty() {
+        out.push_str(&format!(
+            "### Local `NR_*` not in Linux RV64 reference ({})\n\n",
+            extras.len()
+        ));
+        out.push_str("These constants do not match a syscall name in the Linux RV64 v6.17 reference. They are usually compatibility aliases, stale cross-arch constants, or local scaffolding and should be justified or removed.\n\n");
+        for extra in extras {
+            out.push_str(&format!("- `NR_{}` (nr={})\n", extra.name, extra.nr));
+        }
+        out.push('\n');
+    }
     // Full dispatched list (compact).
     out.push_str(&format!(
         "### Dispatched syscalls ({}) — name → handler\n\n",
@@ -564,24 +741,33 @@ fn render_auto_section(entries: &[Entry]) -> String {
     out.push_str("Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.\n\n");
     let mut dispatched: Vec<&Entry> = entries
         .iter()
-        .filter(|e| matches!(&e.status, Status::Dispatched { .. }))
+        .filter(|e| matches!(&e.status, Status::Dispatched { .. } | Status::Inline { .. }))
         .collect();
     dispatched.sort_by_key(|e| e.nr);
     out.push_str("| NR | Name | Handler | Lane |\n");
     out.push_str("|---:|---|---|---|\n");
     for e in dispatched {
-        if let Status::Dispatched {
-            handler,
-            is_async,
-            likely_stub,
-        } = &e.status
-        {
-            let async_mark = if *is_async { "async" } else { "sync" };
-            let stub_mark = if *likely_stub { " [stub]" } else { "" };
-            out.push_str(&format!(
-                "| {} | `NR_{}` | `{}` | {}{} |\n",
-                e.nr, e.name, handler, async_mark, stub_mark
-            ));
+        match &e.status {
+            Status::Dispatched {
+                handler,
+                is_async,
+                likely_stub,
+            } => {
+                let async_mark = if *is_async { "async" } else { "sync" };
+                let stub_mark = if *likely_stub { " [stub]" } else { "" };
+                out.push_str(&format!(
+                    "| {} | `NR_{}` | `{}` | {}{} |\n",
+                    e.nr, e.name, handler, async_mark, stub_mark
+                ));
+            }
+            Status::Inline { likely_stub } => {
+                let stub_mark = if *likely_stub { " [stub]" } else { "" };
+                out.push_str(&format!(
+                    "| {} | `NR_{}` | `(inline)` | sync{} |\n",
+                    e.nr, e.name, stub_mark
+                ));
+            }
+            Status::DefinedNotDispatched => {}
         }
     }
     out.push('\n');
@@ -590,16 +776,37 @@ fn render_auto_section(entries: &[Entry]) -> String {
     out
 }
 
+fn truncate_md(s: &str, max: usize) -> String {
+    let s = s.replace('|', "\\|").replace('\n', " ");
+    if s.len() <= max {
+        s
+    } else {
+        let mut out: String = s.chars().take(max - 1).collect();
+        out.push('…');
+        out
+    }
+}
+
 fn write_section(root: &Path, args: &[String]) -> Result<()> {
     let check_only = args.iter().any(|a| a == "--check");
     let entries = collect_entries(root)?;
-    let new_section = render_auto_section(&entries);
+    let reference = load_reference(root)?;
+    let locals: Vec<LocalNr> = entries.iter().map(Entry::local_nr).collect();
+    let mismatches = number_mismatches(&locals, &reference);
+    let new_section = render_auto_section(&entries, &reference);
     let doc_path: PathBuf = root.join(STATUS_DOC_REL);
     let doc_text =
         fs::read_to_string(&doc_path).map_err(|e| format!("read {STATUS_DOC_REL}: {e}"))?;
 
     let updated = splice_section(&doc_text, &new_section)?;
     if updated == doc_text {
+        if check_only && !mismatches.is_empty() {
+            return Err(format!(
+                "syscall sync: {} number mismatch(es) against Linux RV64 {}; run `cargo xtask syscall sync` for details",
+                mismatches.len(),
+                reference.kernel.version
+            ));
+        }
         if !check_only {
             println!("syscall sync: {STATUS_DOC_REL} already up to date");
         }

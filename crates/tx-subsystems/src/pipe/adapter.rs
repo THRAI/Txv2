@@ -25,11 +25,12 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step", "zone"],
-    reason = "expose pipe step outcomes (done/eagain/epipe/yield) as named verbs; bundle zone allocation into pipe-domain helpers"
+    apis = ["step", "zone", "page_allocator"],
+    reason = "expose pipe step outcomes (done/eagain/epipe/yield) as named verbs; bundle zone allocation and page-backed lease frame reads into pipe-domain helpers"
 )]
 pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
+    pub use tx_substrate::page_allocator;
     pub use tx_substrate::step::{
         drive_oneshot, ByteProgress, Errno, InterestMask, NoProgress, OneShotStepOp,
         ProcessIdentity, ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity,

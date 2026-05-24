@@ -1,3 +1,85 @@
+- 2026-05-24 **Cleaned the pipe lease wait through notification wrappers before
+  merge-back.** The reactor boundary sweep found zero raw reactor references
+  outside adapters, but `notification-boundary` caught one stale raw
+  `YieldShape::OnWaitSource` in the new pipe page-lease pop path. Routed that
+  typed wait through `pipe/notification.rs` so all pipe readable/writable waits
+  stay behind the subsystem notification home. **Verified:** `cargo xtask lint
+  invariants notification-boundary`. **Next step:** merge the accumulated
+  syscall, wallclock, event notification, and pipe/splice worktree back into
+  local `main` and rerun merged-tree checks. **Blocker:** none for the stale
+  reactor/notification sweep; broader substrate boundary ratchet remains
+  pre-existing debt in this dirty lane and is reported separately by
+  `cargo xtask lint boundary`.
+
+- 2026-05-24 **Upgraded pipes to a lease-capable descriptor ring.** Replaced
+  the v1 byte-only pipe staging buffer with a Linux-shaped descriptor ring:
+  default 16 page slots, `PIPE_BUF` all-or-nothing reservation for small
+  writes, reusable anonymous pipe pages with tail merge, and
+  `fcntl(F_GETPIPE_SZ/F_SETPIPE_SZ)` sizing with a v1 1 MiB cap. Added
+  PageBacked-owned `PageLease` export/install semantics so full page-aligned
+  `splice(file -> pipe -> file)` can share a retained frame, while resident
+  destination pages copy fallback inside PageBacked. Recorded
+  `vmsplice(SPLICE_F_GIFT)` as tech debt until VM has user-page pin/adoption.
+  **Verified:** `cargo test -p tx-subsystems pipe_ -- --nocapture`; `cargo
+  test -p tx-subsystems page_backed -- --nocapture`; `cargo test -p tx-shims
+  --lib linux_syscall::tests::fd_ops_wave3 -- --nocapture`; `cargo test -p
+  tx-shims --lib linux_syscall::tests::splice_dispatch -- --nocapture`.
+  **Next step:** run the full pipe/splice validation set and decide whether to
+  extend leases to real user-page gifting or keep that deferred behind VM
+  design. **Blocker:** no VM user-page gift/adoption primitive exists yet.
+
+- 2026-05-24 **Wired the pipe/splice tail.** Added Linux RV64 v6.17
+  constants and dispatch arms for `vmsplice=75`, `splice=76`, and `tee=77`.
+  `vmsplice` writes userspace iovecs into pipe writer fds; pipe-to-pipe
+  `splice` moves bytes through a pipe-owned transfer helper; `tee` duplicates
+  bytes without consuming the input pipe; pipe/file directions use the existing
+  page-backed and byte-stream paths with Linux offset-pointer semantics. The
+  generated syscall status now reports `200` defined, `196` dispatched, `4`
+  defined-but-no-arm, `120` true missing, and zero number mismatches.
+  **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::splice_dispatch -- --nocapture`. **Next step:** run
+  the full syscall/progress validation set and then continue the next
+  high-impact lane, likely network completion or lightweight process/sysinfo.
+  **Blocker:** true Linux pipe-buffer page gifting/zero-copy ownership remains
+  beyond v1 and needs a separate page-grant policy.
+
+- 2026-05-24 **Added event-notification numbering and epoll_pwait2.**
+  Wired Linux RV64 v6.17 numbers and dispatch arms for `epoll_pwait2`,
+  `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`,
+  `fanotify_init`, and `fanotify_mark`. `epoll_pwait2` reuses the
+  mailbox-backed epoll wait path and parses nanosecond `timespec` timeouts;
+  inotify/fanotify are deliberate scaffolds that validate obvious init flag
+  errors and return `ENOSYS` until VFS fsnotify queues and fanotify permission
+  policy exist. The generated syscall status now reports `197` defined,
+  `193` dispatched, `4` defined-but-no-arm, `123` true missing, and zero
+  number mismatches. **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::event_notification_dispatch -- --nocapture`; `cargo
+  test -p tx-shims --lib linux_syscall::tests::epoll_dispatch --
+  --nocapture`; `cargo check -p tx-shims -p tx-subsystems`; `cargo xtask
+  syscall-status --check`; `cargo xtask syscall sync --check`; `cargo xtask
+  lint syscall-status`; `cargo fmt --check`. **Next step:** design the
+  inotify/fanotify backing subsystem around VFS fsnotify publication and
+  fanotify permission delegation before replacing the scaffold `ENOSYS` arms.
+  **Blocker:** no inotify/fanotify event source or queue policy exists yet.
+
+- 2026-05-24 **Continued epoll blocking wait onto mailbox sources.**
+  `epoll_pwait` now uses the syscall mailbox path when no monitored fd is
+  immediately ready: it registers the caller on the monitored fd wait sources,
+  parks, and rescans readiness after a wake while preserving the no-mailbox
+  host fallback and zero-timeout behavior. Added an eventfd-backed regression
+  test that proves an indefinite `epoll_pwait` future stays pending until an
+  eventfd write fires the reader source, then returns the registered
+  `epoll_event` data. **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::epoll_dispatch -- --nocapture`; `cargo test -p
+  tx-shims --lib linux_syscall::tests::timerfd_dispatch -- --nocapture`;
+  `cargo check -p tx-shims -p tx-subsystems`; `cargo fmt --check`; `git diff
+  --check`. **Next step:** extend the same blocking coverage to timerfd and
+  POSIX mq epoll waiters once their host mailbox tests are stable. **Blocker:**
+  the existing `linux_syscall::tests::mq_dispatch` blocking-receive test still
+  hung in the host harness and was killed during verification; this appears
+  independent of the epoll eventfd path but needs a separate mq wait-harness
+  pass before using the full mq group as a regression gate.
+
 - 2026-05-24 **Retired production legacy wait-channel path.**
   Removed shim/script `wait_on_token` parking and moved blocking syscall waits
   onto mailbox-backed `WaitSource` lookup. Notification wait points now mint
@@ -172,6 +254,193 @@
   no trap lines. **Next step:** rerun the broader default
   `make oscomp-local-rv64-smp4` / selected libctest lane. **Blocker:** none for
   the immediate `basic-musl` SMP panic.
+- 2026-05-24 **Closed stale already-partial syscall stubs.** Added a
+  nonblocking `io_uring_enter` scaffold over the existing in-kernel SQ/CQ
+  queues: it validates fd kind and enter flags, drains up to `to_submit` SQEs,
+  emits zero-result CQEs, and returns the submitted count. `epoll_pwait` now
+  reports pending userfaultfd faults as readable and no longer returns
+  `ENOSYS` for nonzero-timeout no-ready waits in the host syscall path. The
+  manual partial-stub list was cleared to match already-landed userfaultfd
+  phases 2-5, futex REQUEUE/PI, and `rt_sigreturn`; generated syscall-status
+  now reports one likely stub, the explicit `restart_syscall` policy stub.
+  **Verified:** red tests first observed the old `ENOSYS`/missing-readiness
+  failures; then `cargo test -p tx-shims --lib
+  linux_syscall::tests::epoll_dispatch -- --nocapture`; `cargo test -p
+  tx-shims --lib linux_syscall::tests::io_uring_dispatch -- --nocapture`;
+  `cargo test -p tx-shims --lib linux_syscall::tests::futex_dispatch --
+  --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::fcntl_misc::dispatch_rt_sigreturn -- --nocapture`;
+  `cargo test -p tx-subsystems --lib userfaultfd -- --nocapture`; `cargo test
+  -p tx-subsystems --lib io_uring -- --nocapture`; `cargo test -p tx-shims
+  --lib linux_syscall::tests`; `cargo check -p tx-shims -p tx-subsystems`;
+  `cargo xtask syscall-status --regen`; `cargo xtask syscall sync`; `cargo
+  xtask syscall-status --check`; `cargo xtask syscall sync --check`; `cargo
+  xtask lint syscall-status`; `cargo xtask progress validate`; `cargo fmt
+  --check`; and `git diff --check`. **Next step:** the remaining async-I/O
+  depth is real io_uring user-mmapped SQ/CQ parsing plus
+  `io_uring_register`; epoll still needs a reactor mailbox-backed blocking
+  wait rather than the host-path empty result.
+
+- 2026-05-24 **Implemented wallclock-backed realtime and vDSO timekeeping.**
+  Added a `tx_subsystems::wall_clock` layer above monotonic `TimeIf`,
+  wired `clock_gettime(CLOCK_REALTIME)`/`gettimeofday` through realtime offset
+  state, and added root-gated `clock_settime(CLOCK_REALTIME)` plus
+  `settimeofday`. The VVAR page now publishes Linux-shaped conversion state
+  (`cycle_last`, `mask`, `mult`, `shift`, shifted realtime/monotonic bases)
+  under a seqlock, and the RV64 vDSO computes time from `rdtime` instead of
+  per-tick exact writes. `timerfd` now tracks clock id, absolute realtime
+  target, cancel-on-set generation, and re-arms non-cancel realtime absolute
+  timers on wallclock changes; blocking reads race the timer deadline with the
+  timerfd wait source so cancel readiness is observable. `docs/progress/SYSCALL_STATUS.md`
+  now reflects `191` defined, `187` dispatched, `4` defined-but-no-arm, and
+  `129` true missing. **Verified so far:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::time_syscalls`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::timerfd_dispatch`; `cargo test -p tx-subsystems --lib
+  wall_clock`; `cargo test -p tx-subsystems --lib vdso`; `cargo test -p
+  tx-subsystems --lib timerfd`; `cargo test -p tx-shims --lib
+  linux_syscall::tests`; `cargo check -p tx-vdso -p tx-subsystems -p
+  tx-shims`; `cargo xtask syscall-status --regen`; and `cargo xtask syscall
+  sync`. **Next step:** run the final formatting/progress/syscall-status
+  validation bundle. **Blocker:** realtime `clock_nanosleep` revalidates after
+  timer resumes but still does not get an immediate wallclock-change wake; a
+  future wait-composition slice should combine its deadline wait with a shared
+  wallclock-change source.
+
+- 2026-05-24 **Swept the no-new-design easy ABI query/no-op syscall tail.**
+  Added Linux RV64 numbers and dispatch for `clock_getres`, `getcpu`,
+  `personality`, `getgroups`, `restart_syscall`, `sched_setparam`,
+  `getpriority`, `setpriority`, `ioprio_get`, and `ioprio_set`.
+  Implementations stay in existing v1 policy: fixed one-nanosecond
+  `clock_getres`, CPU/node `0`, default personality query/no-op only, zero
+  supplementary groups, explicit `restart_syscall` `ENOSYS`, fixed
+  `SCHED_OTHER` priority-zero `sched_setparam`, raw Linux nice-0 return value
+  (`20`) with no-op valid nice sets, and default best-effort ioprio for
+  self/current process only. `docs/progress/SYSCALL_STATUS.md` now reflects
+  the generated counts after the sweep (`189` defined, `185` dispatched, `4`
+  defined-but-no-arm, `131` true missing, `0` mismatches/extras) and moves the
+  next high-stakes focus to timer/time, lightweight process/sysinfo,
+  pipe/splice, and network completion. **TDD evidence:** worker slices first
+  observed `ENOSYS` for their new syscall tests before implementation.
+  **Verified so far:** `cargo test -p tx-shims --lib easy_syscalls --
+  --nocapture` (`6 passed`); `cargo test -p tx-shims --lib
+  time_personality_getcpu -- --nocapture` (`6 passed`); `cargo xtask
+  syscall-status` (`189/185/4/131` counts); `cargo xtask syscall-status
+  --regen`; and `cargo xtask syscall sync`. **Next step:** run the combined
+  full verification matrix for the shared syscall-status worktree. **Blocker:**
+  none for the easy sweep; xattrs, chroot/mount, splice, waitid,
+  credentials/security, sysinfo, and socket message APIs still need design or
+  broader subsystem policy.
+
+- 2026-05-24 **Refreshed syscall high-stakes priorities after the
+  no-new-design tranche.** `docs/progress/SYSCALL_STATUS.md` now carries the
+  current generated headline counts (`179` defined, `175` dispatched, `4`
+  defined-but-no-arm, `141` true missing, `0` mismatches/extras), removes the
+  stale manual unwired rows for already-landed file I/O, SysV IPC, POSIX mq,
+  and `close_range`, and adds an "Easy Remaining Syscalls" table for likely
+  no-new-design candidates: `clock_getres`, `sched_setparam`,
+  `getpriority`/`setpriority`, `getgroups`, `getcpu`, `personality`,
+  `ioprio_get`/`ioprio_set`, and an explicit `restart_syscall` stub arm. The
+  high-stakes table now starts with that ABI query/no-op tail, then timer/time
+  probes, lightweight process/sysinfo, pipe/splice, and network completion.
+  **Verified so far:** `cargo xtask syscall-status`; `cargo xtask
+  syscall-status --list-missing`; `cargo xtask progress validate`; and `git
+  diff --check -- docs/progress/SYSCALL_STATUS.md docs/progress/STATUS.md`.
+  **Next step:** implement the easy ABI query/no-op tail with focused
+  tx-shims tests, starting with `clock_getres` and scheduler/priority probes.
+  **Blocker:** none for the easy tail; xattrs, chroot/mount, splice, waitid,
+  credentials/security, sysinfo, and socket message APIs still need design or
+  broader subsystem policy.
+
+- 2026-05-24 **Implemented the no-new-design high-stakes syscall tranche.**
+  Added Linux RV64 numbers and dispatch for `close_range`, `getrlimit`,
+  `setrlimit`, `getrusage`, fixed `SCHED_OTHER` scheduler query arms,
+  `pwrite64`, `preadv`, `pwritev`, `preadv2(flags=0)`, `pwritev2(flags=0)`,
+  `fadvise64_64`, `fallocate(mode=0)`, `readahead`, `sync_file_range`,
+  `copy_file_range`, `fchmod`, `fchown`, and `fchmodat2`. The implementations
+  stay within existing semantics: sparse fd-table scans for `close_range`,
+  `prlimit64` aliases for legacy rlimit calls, zero-filled 144-byte raw rusage,
+  no-op advisory/cache hints, fixed scheduler query results, positioned I/O by
+  save/set/restore around existing read/write/vector paths, page-backed
+  fallocate/copy helpers, and existing chmod/chown authorization plus FsOps
+  mutation paths. `docs/progress/SYSCALL_STATUS.md` was regenerated and its
+  high-stakes table now reflects the landed tranche (`179` defined, `175`
+  dispatched, `4` defined-but-no-arm, `141` true missing, `0`
+  mismatches/extras). **Verified so far:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::high_stakes_syscalls -- --nocapture` (`10 passed`);
+  `cargo test -p tx-shims --lib linux_syscall::tests::dac_setuid_wave4 --
+  --nocapture` (`18 passed`); `cargo test -p tx-subsystems
+  pagebacked_step_fallocate -- --nocapture` (`5 passed` plus filtered
+  integration binaries); `cargo check -p tx-shims -p tx-subsystems`; `cargo
+  fmt`; `cargo xtask syscall-status --regen`; and `cargo xtask syscall sync`.
+  **Next step:** run the full requested verification matrix and address any
+  fallout. **Blocker:** none known.
+
+- 2026-05-24 **Realigned the syscall high-stakes direction table to the
+  Linux RV64 v6.17 missing list.** `docs/progress/SYSCALL_STATUS.md` now uses
+  the generated reference-backed counts (`156` defined, `152` dispatched, `4`
+  defined-but-no-arm, `164` true missing, `0` mismatches/extras) in the human
+  headline and reprioritizes the high-stakes rows around the actual missing
+  backlog: `close_range`/CLOEXEC hygiene, positional/vector file-I/O tails,
+  file allocation/copy/cache hints, limits/scheduler/resource queries,
+  timer/time tails, metadata/xattr work, socket completion, modern path/mount
+  APIs, event notification, process/sysinfo tails, io_uring/AIO tails, memory
+  policy/advice, and explicit v1 non-goals. The table no longer lists SysV IPC
+  or POSIX mq as greenfield missing rows because those syscall numbers are now
+  defined and dispatched; remaining work there is semantic depth. **Verified:**
+  `cargo xtask syscall-status --check`, `cargo xtask syscall sync --check`,
+  `cargo xtask lint syscall-status`, `cargo xtask progress validate`, and
+  `git diff --check`. **Next step:** use `cargo xtask syscall pick` for the
+  refreshed direction list before assigning the next syscall implementation
+  slice. **Blocker:** none.
+
+- 2026-05-24 **Added the SysV semaphore timed-op dispatch surface with the
+  current semop-compatible nonblocking subset.** `NR_SEMTIMEDOP` now routes to
+  `sys_semtimedop`, shares the existing `semop` user-array parser, validates a
+  nullable Linux `struct timespec` timeout pointer (`tv_sec >= 0` and
+  `0 <= tv_nsec < 1e9`), and then applies the same atomic SysV semaphore
+  transition as `semop`. Ready operations complete successfully and pending
+  operations currently return `EAGAIN`, matching the subsystem's existing
+  TODO-backed nonblocking behavior until real semaphore wait-source/deadline
+  blocking is implemented. The same non-network pass also routes
+  `NR_EPOLL_WAIT` through the existing epoll wait body, routes `pidfd_open` and
+  `pidfd_send_signal` to their explicit `ENOSYS` stubs, removes the stale
+  x86_64-shaped `NR_SIGNALFD = 282` constant because RV64 uses `signalfd4`
+  at 74 while 282 is `userfaultfd`, and refreshes `SYSCALL_STATUS.md`; only
+  the intentionally deferred network arms remain mechanically undispatched.
+  **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::ipc_dispatch -- --nocapture` passed (`14 passed`);
+  `cargo test -p tx-shims --lib
+  linux_syscall::tests::epoll_dispatch::dispatch_legacy_epoll_wait_routes_to_epoll_wait_shape
+  -- --nocapture` passed; `cargo test -p tx-shims --lib
+  linux_syscall::tests::fcntl_misc::dispatch_pidfd -- --nocapture` passed
+  (`2 passed`); and `cargo xtask syscall-status --list-missing` now reports
+  only `GETPEERNAME`, `GETSOCKOPT`, `SHUTDOWN`, and `SOCKETPAIR`. **Next
+  step:** implement real `semtimedop` sleep/deadline semantics when `sysv_sem`
+  grows wait-source registration, or resume the deferred network arms
+  separately. **Blocker:** none for dispatching the bounded non-network subset;
+  full semaphore timeout blocking and network syscall bodies remain deferred.
+
+- 2026-05-24 **Backed syscall status with the Linux RV64 v6.17 reference
+  table.** `cargo xtask syscall-status` and `cargo xtask syscall` now load
+  `xtask/data/syscalls/riscv/64/rv64/linux-6.17-table.json` (source:
+  `https://syscalls.mebeim.net/db/riscv/64/rv64/latest/table.json`) and split
+  the report into true missing Linux syscalls, defined-but-no-dispatch local
+  constants, number mismatches, and local extras. The checker treats
+  `newfstat`/`newuname`/`umount` as the Linux names for the local
+  `FSTAT`/`UNAME`/`UMOUNT2` aliases, fails on number mismatches, and prints
+  Linux file/line references against the `external/linux-rv-6.17` reference
+  submodule. Number cleanup from the same pass: `NR_EVENTFD2` is RV64 `19`;
+  `NR_SIGNALFD4` remains RV64 `74`; the stale non-RV64 `NR_EPOLL_WAIT=232`
+  and `NR_GETPGRP=81` constants/arms were removed because those RV64 numbers
+  are `mincore` and `sync`, respectively. **Verified so far:** `cargo check -p
+  xtask`; `cargo xtask syscall-status`; `cargo xtask syscall status`; `cargo
+  xtask syscall-status --list-missing` now reports `156` defined, `152`
+  dispatched, `4` defined-but-no-arm (`GETPEERNAME`, `GETSOCKOPT`, `SHUTDOWN`,
+  `SOCKETPAIR`), `164` true missing, `0` number mismatches, and `0` local
+  extras. **Next step:** regenerate `SYSCALL_STATUS.md`, run the syscall-status
+  lint/check commands, and rerun the affected tx-shims tests after the Linux
+  v6.17 submodule clone completes. **Blocker:** the shallow Linux tag clone is
+  still in progress in this worktree.
 
 - 2026-05-23 **Brought the OSComp/musl/busybox fix branch through both CI
   gates.** This branch now includes the pthread/libctest, dynamic loader/DSO,

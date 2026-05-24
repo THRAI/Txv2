@@ -3,10 +3,14 @@
 use super::*;
 use tx_subsystems::process::bootstrap_init_process;
 
-use crate::linux_syscall::{NR_PIPE2, O_CLOEXEC, O_DIRECT, O_NONBLOCK};
+use crate::linux_syscall::{
+    F_GETPIPE_SZ, F_SETPIPE_SZ, NR_FCNTL, NR_PIPE2, NR_WRITE, O_CLOEXEC, O_DIRECT, O_NONBLOCK,
+};
 
 const E_INVAL: i32 = 22;
 const E_NOSYS: i32 = 38;
+const E_BUSY: i32 = 16;
+const E_PERM: i32 = 1;
 
 fn pipe2_setup() -> TestSetup {
     setup()
@@ -113,4 +117,138 @@ fn dispatch_pipe2_with_junk_flags_returns_neg_einval() {
     let req = SyscallRequest::new(NR_PIPE2, [pipefd.as_mut_ptr() as u64, junk, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_INVAL));
+}
+
+#[test]
+fn dispatch_fcntl_getpipe_sz_returns_default_pipe_capacity() {
+    let _setup = pipe2_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let mut pipefd: [u32; 2] = [u32::MAX, u32::MAX];
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_PIPE2, [pipefd.as_mut_ptr() as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_FCNTL,
+            [pipefd[0] as u64, F_GETPIPE_SZ as u64, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(
+        result,
+        SyscallResult::Return((16 * tx_subsystems::vm::USER_PAGE_SIZE) as i64)
+    );
+}
+
+#[test]
+fn dispatch_fcntl_setpipe_sz_rounds_and_rejects_busy_shrink() {
+    let _setup = pipe2_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let mut pipefd: [u32; 2] = [u32::MAX, u32::MAX];
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_PIPE2, [pipefd.as_mut_ptr() as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_FCNTL,
+            [
+                pipefd[1] as u64,
+                F_SETPIPE_SZ as u64,
+                (tx_subsystems::vm::USER_PAGE_SIZE + 1) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(
+        result,
+        SyscallResult::Return((2 * tx_subsystems::vm::USER_PAGE_SIZE) as i64)
+    );
+
+    let fill = alloc::vec![b'x'; tx_subsystems::vm::USER_PAGE_SIZE];
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_WRITE,
+            [
+                pipefd[1] as u64,
+                fill.as_ptr() as u64,
+                fill.len() as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(fill.len() as i64));
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_WRITE,
+            [
+                pipefd[1] as u64,
+                fill.as_ptr() as u64,
+                fill.len() as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(fill.len() as i64));
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_FCNTL,
+            [
+                pipefd[1] as u64,
+                F_SETPIPE_SZ as u64,
+                tx_subsystems::vm::USER_PAGE_SIZE as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_BUSY));
+}
+
+#[test]
+fn dispatch_fcntl_setpipe_sz_rejects_v1_limit() {
+    let _setup = pipe2_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let mut pipefd: [u32; 2] = [u32::MAX, u32::MAX];
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_PIPE2, [pipefd.as_mut_ptr() as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_FCNTL,
+            [
+                pipefd[0] as u64,
+                F_SETPIPE_SZ as u64,
+                2 * 1024 * 1024,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_PERM));
 }

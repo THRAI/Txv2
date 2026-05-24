@@ -1,13 +1,13 @@
-//! Userfaultfd — fd-table scaffold (PR-10 phase 0).
+//! Userfaultfd — fd-table, registration, fault, and reply scaffold.
 //!
 //! Spec: `docs/Txv3/05_DELEGATE_v1.md` §8.1 (userfaultfd worked
 //! example), `docs/progress/decisions/2026-05-11-d7-pr-10-userfaultfd-plan.md`
 //! (phase plan).
 //!
-//! # Scope of this module (phase 0)
+//! # Scope of this module
 //!
-//! This module exists today **only to give a userfaultfd-kind fd a
-//! place to live in a process's fd table.** It establishes:
+//! This module gives a userfaultfd-kind fd a place to live in a
+//! process's fd table and carries the phase 2–5 machinery:
 //!
 //! 1. The zone-allocated `UserfaultFd` payload.
 //! 2. A stable `ufd_id` minted at construction — used in later phases
@@ -16,22 +16,16 @@
 //! 3. The `register_zones()` hook called from
 //!    [`crate::zones::register_all`].
 //!
-//! All real userfaultfd behaviour — `UFFDIO_API` handshake (P-10.2),
-//! `UFFDIO_REGISTER` per-VMA attachment (P-10.3), fault-path
-//! interception (P-10.4), `UFFDIO_COPY` / `UFFDIO_ZEROPAGE` /
-//! `UFFDIO_CONTINUE` reply ioctls (P-10.5), pending-fault queue
-//! (also P-10.5) — lands in later phases.
+//! `UFFDIO_API` handshake (P-10.2), `UFFDIO_REGISTER` per-VMA
+//! attachment (P-10.3), fault-path interception (P-10.4),
+//! `UFFDIO_COPY` / `UFFDIO_ZEROPAGE` / `UFFDIO_CONTINUE` reply ioctls
+//! (P-10.5), and the pending-fault read queue.
 //!
 //! # Drop semantics
 //!
-//! `UserfaultFd` carries no externally-registered state today, so
-//! the default drop is sufficient. When P-10.5 wires the pending-
-//! fault queue, the drop will also need to call
-//! `DelegateRegistry::mark_endpoint_died(self.ufd_id)` so any
-//! in-flight fault token transitions to `AgentDied` and parked
-//! faulting threads wake with the equivalent of SIGBUS (see D7 §3.3).
-//! That mark_endpoint_died call has no in-flight tokens to walk in
-//! phase 0 because nothing installs ufd-marked requests yet.
+//! Drop releases the ufd read wait-source registration. Endpoint-death
+//! fanout for parked faulting threads remains a follow-up for the
+//! production close-the-agent path.
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;

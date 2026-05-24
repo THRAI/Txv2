@@ -39,8 +39,8 @@ use tx_subsystems::zones;
 
 use super::{
     dispatch, SyscallCtx, SyscallResult, EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_SETFD,
-    NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPGRP,
-    NR_GETPID, NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_MEMBARRIER, NR_READ, NR_RT_SIGACTION,
+    NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPID,
+    NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_MEMBARRIER, NR_READ, NR_RT_SIGACTION,
     NR_RT_SIGPROCMASK, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SETPGID, NR_SETSID,
     NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, SIGCHLD,
     WNOHANG,
@@ -207,6 +207,7 @@ fn setup() -> TestSetup {
     reset_tid_counter();
     reset_init_process();
     reset_reactor_affinity_seam();
+    tx_subsystems::wall_clock::reset_for_test();
     TestSetup { _lock: lock }
 }
 
@@ -1207,6 +1208,18 @@ mod fd_ops_wave3;
 mod fd_ops_wave4;
 
 // ===========================================================================
+// Pipe/splice zero-copy tail (`splice` / `tee` / `vmsplice`).
+//
+// Coverage:
+//   - Linux RV64 numbers match v6.17 (`vmsplice=75`, `splice=76`, `tee=77`).
+//   - `vmsplice` writes userspace iovec bytes into a pipe writer fd.
+//   - `splice` moves bytes pipe -> pipe and validates pipe offset pointers.
+//   - `tee` duplicates bytes pipe -> pipe without consuming the input pipe.
+//   - Unknown splice flags return `-EINVAL`.
+// ===========================================================================
+mod splice_dispatch;
+
+// ===========================================================================
 // Slice 2 of the shell-prompt roadmap — VM syscall arms
 // (`mmap` / `munmap` / `mprotect` / `mremap` / `madvise` / `msync`).
 //
@@ -1343,13 +1356,32 @@ mod stat_family;
 // =====================================================================
 // Slice 7 of the shell-prompt roadmap — fcntl extension + day-1 misc
 // syscalls (`F_DUPFD` / `F_DUPFD_CLOEXEC` / `F_GETFL` / `F_SETFL` /
-// `getpgrp` / `kill` / `tkill` / `tgkill` / `getrandom` / `uname` /
-// `prlimit64` / `rt_sigreturn`).
+// `kill` / `tkill` / `tgkill` / `getrandom` / `uname` / `prlimit64` /
+// `rt_sigreturn`).
 //
 // See `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 7.
 // =====================================================================
 
 mod fcntl_misc;
+
+// ===========================================================================
+// No-new-design high-stakes syscall backlog entries that reuse existing
+// fd-table/resource/scheduler semantics.
+// ===========================================================================
+
+mod high_stakes_syscalls;
+
+// ===========================================================================
+// Easy time/personality/getcpu syscall slice.
+// ===========================================================================
+
+mod time_personality_getcpu;
+
+// ===========================================================================
+// Easy fixed-model scheduler/priority/ioprio syscall slice.
+// ===========================================================================
+
+mod easy_syscalls;
 
 // =====================================================================
 // Slice 8 of the shell-prompt roadmap — file-mutation syscalls.
@@ -1386,6 +1418,10 @@ mod ipc_dispatch;
 // and LP64 `struct epoll_event` copy paths.
 // ===========================================================================
 mod epoll_dispatch;
+#[path = "tests/event_notification_dispatch.rs"]
+mod event_notification_dispatch;
+#[path = "tests/io_uring_dispatch.rs"]
+mod io_uring_dispatch;
 
 // ===========================================================================
 // POSIX message queues — musl treats `mqd_t` as an fd and uses the LP64

@@ -260,6 +260,49 @@ async fn wait_for_mq_readiness(
     super::await_wait_source(ctx, WaitSourceId::new(source_id), InterestMask::new(1)).await;
 }
 
+fn validate_sem_timeout(ctx: &SyscallCtx<'_>, timeout_ptr: u64) -> Result<(), SyscallResult> {
+    if timeout_ptr == 0 {
+        return Ok(());
+    }
+    let ts: TimespecLayout = match bootstrap_read_user(&ctx.aspace, timeout_ptr) {
+        Ok(v) => v,
+        Err(errno) => return Err(SyscallResult::Error(errno_to_i32(errno))),
+    };
+    if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    Ok(())
+}
+
+fn read_semops(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Result<(u32, Vec<SemBuf>), SyscallResult> {
+    let semid = args[0] as u32;
+    let sops_ptr = args[1];
+    let nsops = args[2] as usize;
+    if nsops == 0 || nsops > 500 {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    if sops_ptr == 0 {
+        return Err(SyscallResult::Error(EFAULT_VALUE));
+    }
+    let byte_len = match nsops.checked_mul(core::mem::size_of::<SembufLayout>()) {
+        Some(len) => len,
+        None => return Err(SyscallResult::Error(EINVAL_VALUE)),
+    };
+    let mut bytes = alloc::vec![0; byte_len];
+    if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, sops_ptr) {
+        return Err(SyscallResult::Error(errno_to_i32(errno)));
+    }
+    let sops = bytes
+        .chunks_exact(core::mem::size_of::<SembufLayout>())
+        .map(|chunk| SemBuf {
+            sem_num: u16::from_ne_bytes([chunk[0], chunk[1]]),
+            sem_op: i16::from_ne_bytes([chunk[2], chunk[3]]),
+            sem_flg: i16::from_ne_bytes([chunk[4], chunk[5]]),
+        })
+        .collect();
+    Ok((semid, sops))
+}
+
 fn mq_file(
     ctx: &SyscallCtx<'_>,
     fd: u32,
@@ -512,31 +555,28 @@ pub(super) fn sys_semop(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
         Ok(v) => v,
         Err(e) => return SyscallResult::Error(errno_to_i32(e)),
     };
-    let semid = args[0] as u32;
-    let sops_ptr = args[1];
-    let nsops = args[2] as usize;
-    if nsops == 0 || nsops > 500 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    if sops_ptr == 0 {
-        return SyscallResult::Error(EFAULT_VALUE);
-    }
-    let byte_len = match nsops.checked_mul(core::mem::size_of::<SembufLayout>()) {
-        Some(len) => len,
-        None => return SyscallResult::Error(EINVAL_VALUE),
+    let (semid, sops) = match read_semops(args, ctx) {
+        Ok(v) => v,
+        Err(result) => return result,
     };
-    let mut bytes = alloc::vec![0; byte_len];
-    if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, sops_ptr) {
-        return SyscallResult::Error(errno_to_i32(errno));
+    match ipc::sysv_sem::execution::step_semop(semid, &sops, &cred, &ctx.process) {
+        Ok(applied) => SyscallResult::Return(applied as i64),
+        Err(e) => SyscallResult::Error(errno_to_i32(e)),
     }
-    let mut sops = Vec::with_capacity(nsops);
-    for chunk in bytes.chunks_exact(core::mem::size_of::<SembufLayout>()) {
-        sops.push(SemBuf {
-            sem_num: u16::from_ne_bytes([chunk[0], chunk[1]]),
-            sem_op: i16::from_ne_bytes([chunk[2], chunk[3]]),
-            sem_flg: i16::from_ne_bytes([chunk[4], chunk[5]]),
-        });
+}
+
+pub(super) fn sys_semtimedop(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let (_ns, cred) = match nsproxy_and_cred(ctx) {
+        Ok(v) => v,
+        Err(e) => return SyscallResult::Error(errno_to_i32(e)),
+    };
+    if let Err(result) = validate_sem_timeout(ctx, args[3]) {
+        return result;
     }
+    let (semid, sops) = match read_semops(args, ctx) {
+        Ok(v) => v,
+        Err(result) => return result,
+    };
     match ipc::sysv_sem::execution::step_semop(semid, &sops, &cred, &ctx.process) {
         Ok(applied) => SyscallResult::Return(applied as i64),
         Err(e) => SyscallResult::Error(errno_to_i32(e)),

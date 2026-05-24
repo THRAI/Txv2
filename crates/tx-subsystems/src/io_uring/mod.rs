@@ -56,10 +56,9 @@
 //! - **No `IORING_SETUP_*` flag handling.** Phase 0 accepts any
 //!   `flags` value verbatim; `IORING_SETUP_SQPOLL` is implicit. Future
 //!   phases gate the SQPOLL kthread spawn on the flag.
-//! - **No `io_uring_enter(2)`.** SQPOLL by definition does not need
-//!   `io_uring_enter` for SQE submission (the kthread polls); the
-//!   syscall is wired here only as a numeric constant for forward
-//!   reference.
+//! - **Minimal `io_uring_enter(2)`.** The syscall layer can drain this
+//!   in-kernel SQ scaffold into CQEs and return the submitted count.
+//!   User-mmapped SQ/CQ parsing remains deferred.
 //!
 //! # Framework reusability claim
 //!

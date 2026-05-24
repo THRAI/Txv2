@@ -4,12 +4,14 @@ use super::*;
 
 use crate::linux_syscall::{
     CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID,
-    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_GETTIMEOFDAY, NR_NANOSLEEP, NR_TIMES, TIMER_ABSTIME,
-    TIMES_NS_PER_TICK,
+    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLOCK_SETTIME, NR_GETTIMEOFDAY, NR_NANOSLEEP,
+    NR_SETTIMEOFDAY, NR_TIMES, TIMER_ABSTIME, TIMES_NS_PER_TICK,
 };
+use tx_subsystems::cred::{step_setresuid, Uid};
 
 const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
+const E_PERM: i32 = 1;
 const OSCOMP_IMAGE_TIMESTAMP_FLOOR_SEC: i64 = 1_779_473_960;
 
 /// Mirror of `TimespecLayout` for test-side decoding. The
@@ -165,6 +167,178 @@ fn dispatch_gettimeofday_null_buffer_returns_neg_efault() {
     let req = SyscallRequest::new(NR_GETTIMEOFDAY, [0, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_FAULT));
+}
+
+#[test]
+fn dispatch_clock_settime_updates_realtime_without_moving_monotonic() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let new_rt = TestTimespec {
+        tv_sec: 1_800_000_000,
+        tv_nsec: 123_456_789,
+    };
+
+    let before_mono = {
+        let mut ts = TestTimespec::default();
+        let result = block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_CLOCK_GETTIME,
+                [
+                    CLOCK_MONOTONIC as u64,
+                    &mut ts as *mut TestTimespec as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        ));
+        assert_eq!(result, SyscallResult::Return(0));
+        ts.tv_sec
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec)
+    };
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_CLOCK_SETTIME,
+            [
+                CLOCK_REALTIME as u64,
+                &new_rt as *const TestTimespec as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let mut rt = TestTimespec::default();
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_CLOCK_GETTIME,
+            [
+                CLOCK_REALTIME as u64,
+                &mut rt as *mut TestTimespec as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(rt.tv_sec, new_rt.tv_sec);
+    assert!(rt.tv_nsec >= new_rt.tv_nsec);
+
+    let mut after = TestTimespec::default();
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_CLOCK_GETTIME,
+            [
+                CLOCK_MONOTONIC as u64,
+                &mut after as *mut TestTimespec as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+    let after_mono = after
+        .tv_sec
+        .saturating_mul(1_000_000_000)
+        .saturating_add(after.tv_nsec);
+    assert!(after_mono >= before_mono);
+    assert!(
+        after_mono - before_mono < 1_000_000,
+        "clock_settime must not jump CLOCK_MONOTONIC: before={before_mono} after={after_mono}"
+    );
+}
+
+#[test]
+fn dispatch_settimeofday_updates_gettimeofday_realtime() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let tv = TestTimeval {
+        tv_sec: 1_800_000_010,
+        tv_usec: 654_321,
+    };
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETTIMEOFDAY,
+            [&tv as *const TestTimeval as u64, 0, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let mut out = TestTimeval::default();
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_GETTIMEOFDAY,
+            [&mut out as *mut TestTimeval as u64, 0, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(out.tv_sec, tv.tv_sec);
+    assert!(out.tv_usec >= tv.tv_usec);
+}
+
+#[test]
+fn dispatch_clock_settime_rejects_non_realtime_and_unprivileged_callers() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap.clone(), thread.clone());
+    let ts = TestTimespec {
+        tv_sec: 1_800_000_000,
+        tv_nsec: 0,
+    };
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_CLOCK_SETTIME,
+            [
+                CLOCK_MONOTONIC as u64,
+                &ts as *const TestTimespec as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_INVAL));
+
+    let target = Uid(1000);
+    assert!(matches!(
+        step_setresuid(&proc_cap, Some(target), Some(target), Some(target)),
+        tx_subsystems::cred::CredChange::Replaced { .. }
+    ));
+    let unpriv_ctx = make_ctx(proc_cap, thread);
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_CLOCK_SETTIME,
+            [
+                CLOCK_REALTIME as u64,
+                &ts as *const TestTimespec as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &unpriv_ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_PERM));
 }
 
 /// `times(buf)` returns the monotonic tick count and writes

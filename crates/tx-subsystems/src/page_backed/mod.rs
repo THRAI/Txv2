@@ -32,7 +32,7 @@ mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
 pub use fs_page_backing::FsPageBacking;
-pub use lifecycle::{step_fallocate, step_fsync, step_truncate, TruncateOp};
+pub use lifecycle::{step_fallocate, step_fsync, step_truncate, FallocateOp, TruncateOp};
 pub use reflink::{cow_replace_into_private, install_shared_page};
 pub use targeted_read::read_exact_at;
 pub use user_buffer::{
@@ -267,6 +267,44 @@ pub struct MaterializedPage {
 }
 
 #[derive(Debug)]
+pub struct PageLease {
+    ppn: Ppn,
+    cache_pin: PageCachePin,
+}
+
+// PageLease carries page-cache role evidence for an already-live frame.
+// Like PageContainer's internal PageCacheEntry pins, the token is an owned
+// liveness contribution; moving it between pipe descriptors across harts does
+// not create shared mutable access to the frame metadata.
+unsafe impl Send for PageLease {}
+unsafe impl Sync for PageLease {}
+
+impl PageLease {
+    pub const fn ppn(&self) -> Ppn {
+        self.ppn
+    }
+
+    pub fn retain(&self) -> Result<Self, PageCacheError> {
+        let cache_pin =
+            page_allocator::acquire_cache_pin(self.ppn).map_err(PageCacheError::Alloc)?;
+        Ok(Self {
+            ppn: self.ppn,
+            cache_pin: PageCachePin::Allocated(cache_pin),
+        })
+    }
+
+    pub fn confirm(&self) -> Result<(), PageCacheError> {
+        match &self.cache_pin {
+            PageCachePin::Allocated(pin) if pin.ppn() == self.ppn => Ok(()),
+            PageCachePin::Allocated(_) => {
+                Err(PageCacheError::MismatchedFrame { current: self.ppn })
+            }
+            PageCachePin::Device(_) => Err(PageCacheError::UnsupportedKind),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum MaterializedPagePin {
     Allocated(MapPin<'static, BitmapPageAllocator<'static>>),
     Device(DeviceFrame),
@@ -473,6 +511,56 @@ impl PageContainer {
                 Err(PageCacheError::Backend(Errno::EAGAIN))
             }
             V3::Yield { .. } => Err(PageCacheError::Backend(Errno::EIO)),
+        }
+    }
+
+    pub fn export_page_lease(
+        &self,
+        page: PageIndex,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<PageLease, NoProgress> {
+        if matches!(self.kind(), PageContainerKind::Device { .. }) {
+            return StepOutcome::Err(
+                page_cache_error_to_errno(PageCacheError::UnsupportedKind).into(),
+            );
+        }
+        match self.materialize_page(page, MaterializeAccess::Read, guard) {
+            StepOutcome::Done(materialized) => {
+                let cache_pin = match page_allocator::acquire_cache_pin(materialized.ppn) {
+                    Ok(pin) => pin,
+                    Err(error) => {
+                        return StepOutcome::Err(
+                            page_cache_error_to_errno(PageCacheError::Alloc(error)).into(),
+                        );
+                    }
+                };
+                StepOutcome::Done(PageLease {
+                    ppn: materialized.ppn,
+                    cache_pin: PageCachePin::Allocated(cache_pin),
+                })
+            }
+            StepOutcome::Continue { progress } => StepOutcome::Continue { progress },
+            StepOutcome::Yield { progress, shape } => StepOutcome::Yield { progress, shape },
+            StepOutcome::Err(errno) => StepOutcome::Err(errno),
+        }
+    }
+
+    pub fn install_page_lease_or_copy(
+        &self,
+        page: PageIndex,
+        lease: PageLease,
+    ) -> Result<bool, PageCacheError> {
+        lease.confirm()?;
+        match install_shared_page(self, page, lease.ppn) {
+            Ok(()) => Ok(true),
+            Err(PageCacheError::AlreadyPresent { current }) => {
+                page_allocator::copy_frame_contents(lease.ppn, current)
+                    .map_err(PageCacheError::Alloc)?;
+                let mut state = self.state.lock();
+                state.pages.mark_dirty(page)?;
+                Ok(false)
+            }
+            Err(error) => Err(error),
         }
     }
 

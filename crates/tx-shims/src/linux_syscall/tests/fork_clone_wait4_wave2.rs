@@ -414,27 +414,6 @@ fn dispatch_getpgid_self_returns_own_pgid() {
     assert_eq!(result, SyscallResult::Return(expected_pgid));
 }
 
-/// `getpgrp()` returns the caller's process-group id.
-///
-/// Slice 7 of the shell-prompt roadmap (2026-05-07) replaced the
-/// previous `-ENOSYS` stub with the real implementation
-/// (`process.pgrp_cap().pgid.0`). musl uses `getpgid(0)` directly
-/// and never issues this number, but glibc emulates `getpgrp()`
-/// as `getpgid(0)` and shipping the real arm removes a startup
-/// `-ENOSYS` from any glibc-built binary that lands later.
-#[test]
-fn dispatch_getpgrp_returns_caller_pgid() {
-    let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let expected_pgid = proc_cap.pgrp_cap().pgid.0 as i64;
-    let ctx = make_ctx(proc_cap, thread);
-
-    let req = SyscallRequest::new(NR_GETPGRP, [0; 6]);
-    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Return(expected_pgid));
-}
-
 /// `getsid(0)` returns the caller's session id.
 #[test]
 fn dispatch_getsid_self_returns_own_sid() {
