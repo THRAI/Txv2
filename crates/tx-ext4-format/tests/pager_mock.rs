@@ -9,7 +9,10 @@ use tx_ext4_format::pager::{
     BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, MetadataUpdate, PageRead,
     WritebackReceipt, BLOCK_SIZE,
 };
-use tx_ext4_format::xattr::{encode_external_xattr_block, encode_inline_xattrs, InlineXattr};
+use tx_ext4_format::xattr::{
+    encode_external_xattr_block, encode_inline_xattrs, xattr_entry_hash, xattr_inode_hash,
+    InlineXattr,
+};
 
 #[derive(Clone)]
 struct MemImage {
@@ -696,6 +699,89 @@ fn xattr_oversized_external_value_fails_without_accounting_drift() {
 }
 
 #[test]
+fn xattr_reads_ea_inode_value_spanning_multiple_blocks() {
+    let mut image = mock_image();
+    let value = ea_inode_value();
+    install_inode12_external_ea_inode_xattr(&mut image, 32, 14, b"large", &value);
+
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let attrs = pager.xattrs(InodeNo::new(12)).unwrap();
+    let large = attrs
+        .iter()
+        .find(|attr| attr.name == b"user.large")
+        .expect("ea-inode xattr");
+
+    assert_eq!(large.value, value);
+}
+
+#[test]
+fn xattr_rejects_ea_inode_hash_size_and_flag_mismatch() {
+    let value = ea_inode_value();
+    for corrupt in [
+        EaInodeCorruption::BadEntryHash,
+        EaInodeCorruption::BadInodeHash,
+        EaInodeCorruption::BadSize,
+        EaInodeCorruption::MissingFlag,
+    ] {
+        let mut image = mock_image();
+        install_inode12_external_ea_inode_xattr(&mut image, 32, 14, b"large", &value);
+        match corrupt {
+            EaInodeCorruption::BadEntryHash => {
+                image.block_mut(32)[44..48].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+            }
+            EaInodeCorruption::BadInodeHash => {
+                let mut inode = read_inode_from_image(&image, 14);
+                inode.atime ^= 1;
+                write_inode(&mut image, 14, &inode);
+            }
+            EaInodeCorruption::BadSize => {
+                let mut inode = read_inode_from_image(&image, 14);
+                inode.size -= 1;
+                write_inode(&mut image, 14, &inode);
+            }
+            EaInodeCorruption::MissingFlag => {
+                let mut inode = read_inode_from_image(&image, 14);
+                inode.flags &= !Inode::EA_INODE_FL;
+                write_inode(&mut image, 14, &inode);
+            }
+        }
+
+        let mut pager = Ext4Pager::open(image).unwrap();
+        assert_eq!(
+            pager.xattrs(InodeNo::new(12)),
+            Err(Ext4FormatError::Corrupt)
+        );
+    }
+}
+
+#[test]
+fn xattr_mutation_refuses_existing_ea_inode_values() {
+    let mut image = mock_image();
+    let value = ea_inode_value();
+    install_inode12_external_ea_inode_xattr(&mut image, 32, 14, b"large", &value);
+
+    let mut pager = Ext4Pager::open(image).unwrap();
+    assert_eq!(
+        pager.set_xattr(InodeNo::new(12), b"user.alpha", b"new", false, false),
+        Err(Ext4FormatError::Unsupported)
+    );
+    assert_eq!(
+        pager.remove_xattr(InodeNo::new(12), b"user.large"),
+        Err(Ext4FormatError::Unsupported)
+    );
+
+    let attrs = pager.xattrs(InodeNo::new(12)).unwrap();
+    assert_eq!(
+        attrs
+            .iter()
+            .find(|attr| attr.name == b"user.large")
+            .unwrap()
+            .value,
+        value
+    );
+}
+
+#[test]
 fn pager_resolves_indexed_extents_and_inodes_across_groups() {
     let mut image = mock_image();
     let mut sb = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
@@ -1044,6 +1130,84 @@ fn install_inode12_inline_and_external_xattrs(image: &mut MemImage, block: u64) 
         }],
     )
     .unwrap();
+}
+
+#[derive(Clone, Copy)]
+enum EaInodeCorruption {
+    BadEntryHash,
+    BadInodeHash,
+    BadSize,
+    MissingFlag,
+}
+
+fn ea_inode_value() -> Vec<u8> {
+    let mut value = vec![0xA5; BLOCK_SIZE + 17];
+    value[BLOCK_SIZE..].fill(0x5A);
+    value
+}
+
+fn install_inode12_external_ea_inode_xattr(
+    image: &mut MemImage,
+    xattr_block: u64,
+    ea_ino: u32,
+    suffix: &[u8],
+    value: &[u8],
+) {
+    let mut inode = read_inode_from_image(image, 12);
+    inode.extra_isize = 32;
+    inode.file_acl = xattr_block;
+    inode.blocks_512 = inode.blocks_512.saturating_add((BLOCK_SIZE / 512) as u64);
+    write_inode(image, 12, &inode);
+
+    BitmapMut::new(image.block_mut(2))
+        .set(xattr_block as usize)
+        .unwrap();
+
+    let value_hash = xattr_inode_hash(
+        &Superblock::parse(&image.block(0)[1024..2048]).unwrap(),
+        value,
+    );
+    let entry_hash = xattr_entry_hash(suffix, value_hash);
+    let block = image.block_mut(xattr_block);
+    block.fill(0);
+    write_u32_le(block, 0, tx_ext4_format::xattr::EXT4_XATTR_MAGIC);
+    write_u32_le(block, 4, 1);
+    write_u32_le(block, 8, 1);
+    block[32] = suffix.len() as u8;
+    block[33] = tx_ext4_format::xattr::EXT4_XATTR_INDEX_USER;
+    write_u16_le(block, 34, 0);
+    write_u32_le(block, 36, ea_ino);
+    write_u32_le(block, 40, value.len() as u32);
+    write_u32_le(block, 44, entry_hash);
+    block[48..48 + suffix.len()].copy_from_slice(suffix);
+    let last = (48 + suffix.len() + 3) & !3;
+    block[last..last + 4].fill(0);
+
+    let mut ea_inode = Inode::default();
+    ea_inode.mode = Inode::S_IFREG | 0o600;
+    ea_inode.size = value.len() as u64;
+    ea_inode.blocks_512 = (2 * BLOCK_SIZE / 512) as u64;
+    ea_inode.links_count = 1;
+    ea_inode.flags = Inode::EXTENTS_FL | Inode::EA_INODE_FL;
+    ea_inode.atime = value_hash;
+    ea_inode
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: 2,
+            physical_start: 60,
+        }])
+        .unwrap();
+    write_inode(image, ea_ino, &ea_inode);
+    image.block_mut(60).copy_from_slice(&value[..BLOCK_SIZE]);
+    image.block_mut(61)[..value.len() - BLOCK_SIZE].copy_from_slice(&value[BLOCK_SIZE..]);
+}
+
+fn write_u16_le(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32_le(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
 fn read_inode_from_image(image: &MemImage, ino: u32) -> Inode {

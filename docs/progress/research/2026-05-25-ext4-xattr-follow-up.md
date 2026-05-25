@@ -17,7 +17,9 @@ remaining work is deeper ext4 storage policy, not syscall/VFS plumbing.
   `FsOps::get_xattr` / `FsOps::list_xattr` / `set_xattr` / `remove_xattr`.
   External blocks validate the Linux header shape (`h_magic`, `h_blocks == 1`)
   and metadata checksum when the filesystem advertises `metadata_csum`; writes
-  refresh the same checksum. EA-inode values and non-`user.*` namespaces remain
+  refresh the same checksum. Read-only EA-inode values are resolved for
+  `user.*` entries after validating `EXT4_EA_INODE_FL`, value size, inode
+  hash, and entry hash; write-side EA-inode creation/refcount/free remains
   deliberately unsupported.
 - Tx ext4 now has a narrow metadata transaction path for supported xattr
   writes and chmod/chown. Descriptor/payload/commit records are barrier-ordered
@@ -50,16 +52,20 @@ remaining work is deeper ext4 storage policy, not syscall/VFS plumbing.
    free-on-last-removal for one-block `user.*` xattr storage.
 6. DONE 2026-05-25: Fence oversized/EA-inode-style xattr values with explicit
    unsupported errors and no accounting drift on failed allocation prep.
-7. Extend metadata transactions to truncate, page flush/fsync metadata,
+7. DONE 2026-05-25: Add read-only EA-inode-backed `user.*` values, including
+   multi-block extent reads and Linux-shaped hash/size/flag validation. Existing
+   EA-inode entries make set/remove return `ENOSYS` to avoid refcount leaks.
+8. Extend metadata transactions to truncate, page flush/fsync metadata,
    multi-block xattr growth, and EA-inode backed values once the EA-inode
    lifecycle policy exists.
-8. After that, revisit ACL, file-capability, and security namespaces; those
+9. After that, revisit ACL, file-capability, and security namespaces; those
    still require their owning policy subsystems.
 
 ## Next xattr followups
 
-- Multi-block and EA-inode values: keep returning `ENOSYS` until ext4 supports
-  EA-inode allocation, ownership, and lifecycle accounting.
+- EA-inode writes: keep returning `ENOSYS` until ext4 supports EA-inode
+  allocation, ownership, data-block writes, orphan/free, and lifecycle
+  accounting.
 - Namespace followups: `system.posix_acl_*`, `security.*`, `trusted.*`, and file
   capabilities stay blocked on ACL/security/exec policy owners.
 - Metadata transactions: reuse the new transaction primitive for truncate,
@@ -80,3 +86,4 @@ remaining work is deeper ext4 storage policy, not syscall/VFS plumbing.
 - `cargo xtask progress validate`
 - `cargo fmt --check`
 - `git diff --check`
+- `cargo test -p tx-ext4-format --test pager_mock xattr_ -- --nocapture`

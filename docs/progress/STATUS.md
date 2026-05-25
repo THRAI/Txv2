@@ -1,3 +1,19 @@
+- 2026-05-25 **Added read-only ext4 EA-inode xattr value support.** Ext4
+  `user.*` xattr reads now preserve `e_value_inum` entries through the parser,
+  resolve EA-inode-backed values from extent-mapped data blocks, and validate
+  the Linux-shaped EA inode flag, size, value crc32c hash, and entry hash.
+  Existing EA-inode xattrs make set/remove return `ENOSYS` so Tx does not
+  flatten large values or leak EA-inode refcounts before the write-side
+  lifecycle exists. **Verified:** `cargo test -p tx-ext4-format --test
+  pager_mock -- --nocapture`; `cargo test -p tx-ext4-format xattr --
+  --nocapture`; `cargo test -p tx-ext4 --lib xattr -- --nocapture`; `cargo
+  test -p tx-ext4 --lib tests_v3 -- --nocapture`; `cargo check -p tx-ext4 -p
+  tx-ext4-format -p tx-fs`; `cargo xtask progress validate`; `cargo fmt
+  --check`; `git diff --check`. **Next step:** add write-side EA-inode
+  allocation/refcount/orphan lifecycle only after journaled inode
+  allocation/free and EA data-block write policy are in place. **Blocker:**
+  write-side EA-inode lifecycle remains intentionally deferred.
+
 - 2026-05-25 **Continued ext4 xattr storage policy with shared-block COW and
   free-on-last-removal.** Ext4 `user.*` xattr writes now handle shared external
   blocks by journaling a private replacement block plus the old block refcount

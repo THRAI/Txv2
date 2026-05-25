@@ -18,6 +18,7 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::adapter::step_engine::{
@@ -25,6 +26,7 @@ use crate::adapter::step_engine::{
 };
 use tx_ext4_format::ondisk::{Extent, GroupDesc, Inode, Superblock};
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
+use tx_ext4_format::xattr::{xattr_entry_hash, xattr_inode_hash};
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::structure::{DirCursor, FsObjectId};
 use tx_subsystems::vfs::FsOps;
@@ -176,6 +178,47 @@ fn install_file_external_xattrs(image: &mut MemImage, block: u64) {
     write_u32_le(storage, 8, 1); // h_blocks
     let next = encode_external_xattr_entry(storage, 32, b"omega", 128, b"external");
     storage[next..next + 4].fill(0);
+}
+
+fn install_file_ea_inode_xattr(image: &mut MemImage, xattr_block: u64, ea_ino: u32) -> Vec<u8> {
+    let mut value = vec![0xA5; BLOCK_SIZE + 17];
+    value[BLOCK_SIZE..].fill(0x5A);
+    let sb = Superblock::parse(&image.block_mut(0)[1024..2048]).unwrap();
+    let value_hash = xattr_inode_hash(&sb, &value);
+    let entry_hash = xattr_entry_hash(b"large", value_hash);
+
+    let storage = image.block_mut(xattr_block);
+    storage.fill(0);
+    write_u32_le(storage, 0, tx_ext4_format::xattr::EXT4_XATTR_MAGIC);
+    write_u32_le(storage, 4, 1);
+    write_u32_le(storage, 8, 1);
+    storage[32] = b"large".len() as u8;
+    storage[33] = tx_ext4_format::xattr::EXT4_XATTR_INDEX_USER;
+    write_u16_le(storage, 34, 0);
+    write_u32_le(storage, 36, ea_ino);
+    write_u32_le(storage, 40, value.len() as u32);
+    write_u32_le(storage, 44, entry_hash);
+    storage[48..53].copy_from_slice(b"large");
+    storage[56..60].fill(0);
+
+    let mut ea_inode = Inode::default();
+    ea_inode.mode = Inode::S_IFREG | 0o600;
+    ea_inode.size = value.len() as u64;
+    ea_inode.blocks_512 = (2 * BLOCK_SIZE / 512) as u64;
+    ea_inode.links_count = 1;
+    ea_inode.flags = Inode::EXTENTS_FL | Inode::EA_INODE_FL;
+    ea_inode.atime = value_hash;
+    ea_inode
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: 2,
+            physical_start: 60,
+        }])
+        .unwrap();
+    write_inode_at(image, ea_ino, &ea_inode);
+    image.block_mut(60).copy_from_slice(&value[..BLOCK_SIZE]);
+    image.block_mut(61)[..value.len() - BLOCK_SIZE].copy_from_slice(&value[BLOCK_SIZE..]);
+    value
 }
 
 fn encode_dir(block: &mut Page4K, entries: &[(u32, u8, &[u8])]) {
@@ -395,6 +438,92 @@ fn ext4_v3_get_and_list_user_xattrs_from_inline_and_external_storage() {
         V3::<usize, NoProgress>::done(8)
     );
     assert_eq!(&external[..8], b"external");
+}
+
+#[test]
+fn ext4_v3_gets_ea_inode_backed_user_xattr_value() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let mut image = build_image();
+    let expected = install_file_ea_inode_xattr(&mut image, 21, 14);
+    let fs = Ext4FsInstance::open(image, true).expect("open ext4 mem image");
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+
+    let mut value = vec![0u8; expected.len()];
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::get_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.large",
+            &mut value,
+            &cred,
+            &guard,
+        ),
+        V3::<usize, NoProgress>::done(expected.len())
+    );
+    assert_eq!(value, expected);
+
+    let mut list = [0u8; 32];
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::list_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            &mut list,
+            &cred,
+            &guard,
+        ),
+        V3::<usize, NoProgress>::done(32)
+    );
+    assert_eq!(&list[..32], b"user.alpha\0user.large\0user.zeta\0");
+}
+
+#[test]
+fn ext4_v3_refuses_to_mutate_existing_ea_inode_xattrs() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let mut image = build_image();
+    let expected = install_file_ea_inode_xattr(&mut image, 21, 14);
+    let fs = Ext4FsInstance::open(image, false).expect("open ext4 mem image");
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::set_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.alpha",
+            b"new",
+            0,
+            &cred,
+            &guard,
+        ),
+        V3::<(), NoProgress>::err(V3Errno::ENOSYS)
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::remove_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.large",
+            &cred,
+            &guard,
+        ),
+        V3::<(), NoProgress>::err(V3Errno::ENOSYS)
+    );
+
+    let mut value = vec![0u8; expected.len()];
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::get_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.large",
+            &mut value,
+            &cred,
+            &guard,
+        ),
+        V3::<usize, NoProgress>::done(expected.len())
+    );
+    assert_eq!(value, expected);
 }
 
 #[test]

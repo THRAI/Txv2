@@ -346,6 +346,7 @@ pub struct Inode {
 
 impl Inode {
     pub const EXTENTS_FL: u32 = 0x0008_0000;
+    pub const EA_INODE_FL: u32 = 0x0020_0000;
     pub const S_IFMT: u16 = 0xF000;
     pub const S_IFLNK: u16 = 0xA000;
     pub const S_IFDIR: u16 = 0x4000;

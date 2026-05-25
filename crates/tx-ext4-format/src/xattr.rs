@@ -24,6 +24,18 @@ pub struct InlineXattr {
     pub value: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredXattr {
+    pub name: Vec<u8>,
+    pub value: StoredXattrValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoredXattrValue {
+    Inline(Vec<u8>),
+    EaInode { inode: u32, size: usize, hash: u32 },
+}
+
 #[derive(Clone, Debug)]
 struct RawEntry<'a> {
     name_index: u8,
@@ -31,9 +43,14 @@ struct RawEntry<'a> {
     value_offs: usize,
     value_inum: u32,
     value_size: usize,
+    hash: u32,
 }
 
 pub fn parse_inline_xattrs(inode: &Inode, inode_bytes: &[u8]) -> Result<Vec<InlineXattr>> {
+    parse_inline_stored_xattrs(inode, inode_bytes).and_then(resolve_inline_only)
+}
+
+pub fn parse_inline_stored_xattrs(inode: &Inode, inode_bytes: &[u8]) -> Result<Vec<StoredXattr>> {
     // Linux `IHDR/IFIRST`: inline values are addressed relative to
     // the first entry after the inode-body xattr header.
     let start = 128usize
@@ -88,6 +105,14 @@ pub fn parse_external_xattr_block(
     block_nr: u64,
     block: &[u8],
 ) -> Result<Vec<InlineXattr>> {
+    parse_external_stored_xattr_block(superblock, block_nr, block).and_then(resolve_inline_only)
+}
+
+pub fn parse_external_stored_xattr_block(
+    superblock: &Superblock,
+    block_nr: u64,
+    block: &[u8],
+) -> Result<Vec<StoredXattr>> {
     if block.len() < 32 {
         return Err(Ext4FormatError::Truncated);
     }
@@ -144,6 +169,21 @@ pub fn xattr_block_checksum(superblock: &Superblock, block_nr: u64, block: &[u8]
     ))
 }
 
+pub fn xattr_inode_hash(superblock: &Superblock, value: &[u8]) -> u32 {
+    // Linux reference: `fs/ext4/xattr.c::ext4_xattr_inode_hash`.
+    metadata_csum32(metadata_checksum_seed(superblock), &[value])
+}
+
+pub fn xattr_entry_hash(name: &[u8], value_hash: u32) -> u32 {
+    // Linux reference: `fs/ext4/xattr.c::ext4_xattr_hash_entry`
+    // with `VALUE_HASH_SHIFT` fed by the EA-inode value crc32c hash.
+    let mut hash = 0u32;
+    for byte in name {
+        hash = hash.rotate_left(5) ^ *byte as u32;
+    }
+    hash.rotate_left(16) ^ value_hash
+}
+
 fn metadata_checksum_seed(superblock: &Superblock) -> u32 {
     if superblock.checksum_seed != 0 {
         superblock.checksum_seed
@@ -156,7 +196,7 @@ fn parse_xattr_entries(
     storage: &[u8],
     entry_start: usize,
     value_base: usize,
-) -> Result<Vec<InlineXattr>> {
+) -> Result<Vec<StoredXattr>> {
     if entry_start > storage.len() || value_base > storage.len() {
         return Err(Ext4FormatError::Corrupt);
     }
@@ -179,13 +219,22 @@ fn parse_xattr_entries(
 
     let mut out = Vec::new();
     for entry in entries {
-        if entry.value_inum != 0 {
-            return Err(Ext4FormatError::Unsupported);
-        }
         if entry.name_index != EXT4_XATTR_INDEX_USER {
             continue;
         }
-        if entry.value_size > 0 {
+        if entry.value_inum != 0 {
+            if entry.value_size > (1 << 24) {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            out.push(StoredXattr {
+                name: user_xattr_name(entry.name),
+                value: StoredXattrValue::EaInode {
+                    inode: entry.value_inum,
+                    size: entry.value_size,
+                    hash: entry.hash,
+                },
+            });
+        } else if entry.value_size > 0 {
             if entry.value_offs % 4 != 0 {
                 return Err(Ext4FormatError::Corrupt);
             }
@@ -208,19 +257,32 @@ fn parse_xattr_entries(
             let Some(value) = storage.get(value_start..value_end) else {
                 return Err(Ext4FormatError::Truncated);
             };
-            out.push(InlineXattr {
+            out.push(StoredXattr {
                 name: user_xattr_name(entry.name),
-                value: value.to_vec(),
+                value: StoredXattrValue::Inline(value.to_vec()),
             });
         } else {
-            out.push(InlineXattr {
+            out.push(StoredXattr {
                 name: user_xattr_name(entry.name),
-                value: Vec::new(),
+                value: StoredXattrValue::Inline(Vec::new()),
             });
         }
     }
     out.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
+}
+
+fn resolve_inline_only(attrs: Vec<StoredXattr>) -> Result<Vec<InlineXattr>> {
+    attrs
+        .into_iter()
+        .map(|attr| match attr.value {
+            StoredXattrValue::Inline(value) => Ok(InlineXattr {
+                name: attr.name,
+                value,
+            }),
+            StoredXattrValue::EaInode { .. } => Err(Ext4FormatError::Unsupported),
+        })
+        .collect()
 }
 
 fn encode_xattr_entries(
@@ -315,6 +377,7 @@ fn parse_raw_entry<'a>(
     let value_offs = read_u16_le(storage, offset + 2)? as usize;
     let value_inum = read_u32_le(storage, offset + 4)?;
     let value_size = read_u32_le(storage, offset + 8)? as usize;
+    let hash = read_u32_le(storage, offset + 12)?;
     let name_start = offset + EXT4_XATTR_ENTRY_FIXED;
     let name_end = name_start
         .checked_add(name_len)
@@ -331,6 +394,7 @@ fn parse_raw_entry<'a>(
         value_offs,
         value_inum,
         value_size,
+        hash,
     });
     Ok(name_end)
 }

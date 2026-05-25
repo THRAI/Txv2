@@ -5,8 +5,9 @@ use crate::ondisk::{
 };
 use crate::ondisk::{read_u16_le, read_u32_le, write_u16_le, write_u32_le};
 use crate::xattr::{
-    encode_external_xattr_block, encode_inline_xattrs, parse_external_xattr_block,
-    parse_inline_xattrs, InlineXattr,
+    encode_external_xattr_block, encode_inline_xattrs, parse_external_stored_xattr_block,
+    parse_inline_stored_xattrs, xattr_entry_hash, xattr_inode_hash, InlineXattr, StoredXattr,
+    StoredXattrValue,
 };
 use crate::{Ext4FormatError, Result};
 use alloc::vec;
@@ -187,17 +188,36 @@ impl<I: BlockImage> Ext4Pager<I> {
     }
 
     pub fn xattrs(&mut self, inode: InodeNo) -> Result<Vec<InlineXattr>> {
+        let attrs = self.stored_xattrs(inode)?;
+        let mut resolved = Vec::with_capacity(attrs.len());
+        for attr in attrs {
+            let value = match attr.value {
+                StoredXattrValue::Inline(value) => value,
+                StoredXattrValue::EaInode { inode, size, hash } => {
+                    self.read_ea_inode_value(inode, size, hash, &attr.name)?
+                }
+            };
+            resolved.push(InlineXattr {
+                name: attr.name,
+                value,
+            });
+        }
+        resolved.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        Ok(resolved)
+    }
+
+    fn stored_xattrs(&mut self, inode: InodeNo) -> Result<Vec<StoredXattr>> {
         let location = self.inode_location(inode)?;
         let mut block = [0u8; BLOCK_SIZE];
         self.image.read_block(location.block, &mut block)?;
         let raw = &block[location.offset..location.offset + location.len];
         let disk_inode = Inode::parse(raw)?;
-        let mut attrs = parse_inline_xattrs(&disk_inode, raw)?;
+        let mut attrs = parse_inline_stored_xattrs(&disk_inode, raw)?;
         if disk_inode.file_acl != 0 {
             let mut xattr_block = [0u8; BLOCK_SIZE];
             self.image
                 .read_block(disk_inode.file_acl, &mut xattr_block)?;
-            attrs.extend(parse_external_xattr_block(
+            attrs.extend(parse_external_stored_xattr_block(
                 &self.superblock,
                 disk_inode.file_acl,
                 &xattr_block,
@@ -205,6 +225,47 @@ impl<I: BlockImage> Ext4Pager<I> {
             attrs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         }
         Ok(attrs)
+    }
+
+    fn read_ea_inode_value(
+        &mut self,
+        ea_inode_no: u32,
+        size: usize,
+        entry_hash: u32,
+        full_name: &[u8],
+    ) -> Result<Vec<u8>> {
+        let inode = self.read_inode(InodeNo::new(ea_inode_no))?;
+        if inode.flags & Inode::EA_INODE_FL == 0 || inode.file_acl != 0 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        if inode.size != size as u64 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let mut value = vec![0u8; size];
+        let blocks = size.div_ceil(BLOCK_SIZE);
+        for idx in 0..blocks {
+            let mut page = [0u8; BLOCK_SIZE];
+            match self.resolve_inode_block(&inode, idx as u32)? {
+                BlockMapping::Data(block) => self.image.read_block(block, &mut page)?,
+                BlockMapping::Hole | BlockMapping::NeedNode(_) => {
+                    return Err(Ext4FormatError::Unsupported)
+                }
+            }
+            let start = idx * BLOCK_SIZE;
+            let end = core::cmp::min(start + BLOCK_SIZE, size);
+            value[start..end].copy_from_slice(&page[..end - start]);
+        }
+        let value_hash = xattr_inode_hash(&self.superblock, &value);
+        if inode.atime != value_hash {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let suffix = full_name
+            .strip_prefix(b"user.")
+            .ok_or(Ext4FormatError::Corrupt)?;
+        if xattr_entry_hash(suffix, value_hash) != entry_hash {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        Ok(value)
     }
 
     pub fn set_xattr(
@@ -215,6 +276,9 @@ impl<I: BlockImage> Ext4Pager<I> {
         create: bool,
         replace: bool,
     ) -> Result<bool> {
+        if self.has_ea_inode_xattr(inode)? {
+            return Err(Ext4FormatError::Unsupported);
+        }
         let mut attrs = self.xattrs(inode)?;
         let found = attrs.iter().position(|attr| attr.name == name);
         match (found, create, replace) {
@@ -232,6 +296,9 @@ impl<I: BlockImage> Ext4Pager<I> {
     }
 
     pub fn remove_xattr(&mut self, inode: InodeNo, name: &[u8]) -> Result<bool> {
+        if self.has_ea_inode_xattr(inode)? {
+            return Err(Ext4FormatError::Unsupported);
+        }
         let mut attrs = self.xattrs(inode)?;
         let Some(index) = attrs.iter().position(|attr| attr.name == name) else {
             return Ok(false);
@@ -239,6 +306,13 @@ impl<I: BlockImage> Ext4Pager<I> {
         attrs.remove(index);
         self.write_xattrs(inode, &attrs)?;
         Ok(true)
+    }
+
+    fn has_ea_inode_xattr(&mut self, inode: InodeNo) -> Result<bool> {
+        Ok(self
+            .stored_xattrs(inode)?
+            .iter()
+            .any(|attr| matches!(attr.value, StoredXattrValue::EaInode { .. })))
     }
 
     fn write_xattrs(&mut self, inode: InodeNo, attrs: &[InlineXattr]) -> Result<()> {
