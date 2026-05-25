@@ -1,10 +1,30 @@
+- 2026-05-25 **Continued ext4 xattr storage policy with shared-block COW and
+  free-on-last-removal.** Ext4 `user.*` xattr writes now handle shared external
+  blocks by journaling a private replacement block plus the old block refcount
+  decrement, and removals that fit the remaining set inline now clear
+  `i_file_acl`, decrement `blocks_512`, free the old xattr block, and journal
+  bitmap/group-descriptor/superblock/inode updates together. Oversized xattr
+  values still return `ENOSYS`, but failed allocation preparation no longer
+  drifts in-memory free-block counters before a later successful transaction.
+  The ext4 test fixtures now mark metadata/journal blocks used so allocation
+  accounting does not collide with synthetic superblock or journal storage.
+  **Verified:**
+  `cargo test -p tx-ext4-format xattr -- --nocapture`;
+  `cargo test -p tx-ext4-format --test pager_mock -- --nocapture`; `cargo test
+  -p tx-ext4 --lib xattr -- --nocapture`; `cargo test -p tx-ext4 --lib
+  tests_v3 -- --nocapture`; `cargo check -p tx-ext4 -p tx-ext4-format
+  -p tx-fs`; `cargo xtask progress validate`; `cargo fmt --check`; `git diff
+  --check`. **Next step:** move to multi-block/EA-inode xattr values or
+  PageBacked metadata consumers (`truncate`, page flush, fsync/checkpoint).
+  **Blocker:** none for shared one-block external `user.*` COW/free semantics.
+
 - 2026-05-25 **Landed Tx-native ext4 metadata transactions for xattr and
   chmod/chown.** Replaced the one-block journal helper with a bounded
   multi-block metadata transaction path: descriptor tags cover all payload
   blocks, payloads and commit are barrier-ordered, home metadata blocks are
   synchronously checkpointed, and replay applies only committed records. Ext4
   xattr set/remove now commits inode, xattr block, and new-block bitmap updates
-  together; shared xattr blocks remain explicit `ENOSYS`. `step_chmod` and
+  together. `step_chmod` and
   `step_chown` now reuse the same journaled inode-table update path after the
   existing VFS/DAC checks. **Verified so far:** `cargo test -p tx-ext4-format
   journal -- --nocapture`; `cargo test -p tx-ext4-format --test pager_mock --
@@ -13,9 +33,9 @@
   tests_v3 -- --nocapture`; `cargo test -p tx-ext4 --features host-async
   --test async_adapter -- --nocapture`; `cargo check -p tx-ext4 -p
   tx-ext4-format -p tx-fs`. **Next step:** implement data/writeback consumers
-  (`flush_page`, `truncate`, fsync/checkpoint policy) and full ext4 xattr
-  shared-block COW/refcount/free handling. **Blocker:** none for supported
-  inline and single external-block `user.*` metadata updates.
+  (`flush_page`, `truncate`, fsync/checkpoint policy) and continue deeper ext4
+  xattr value/storage cases. **Blocker:** none for supported inline and single
+  external-block `user.*` metadata updates.
 
 - 2026-05-25 **Continued ext4 xattr follow-up with inline/external `user.*`
   read and write support.** Added `tx-ext4-format` parsing and encoding for

@@ -9,6 +9,7 @@ use tx_ext4_format::pager::{
     BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, MetadataUpdate, PageRead,
     WritebackReceipt, BLOCK_SIZE,
 };
+use tx_ext4_format::xattr::{encode_external_xattr_block, encode_inline_xattrs, InlineXattr};
 
 #[derive(Clone)]
 struct MemImage {
@@ -488,7 +489,7 @@ fn xattr_external_block_creation_journals_bitmap_xattr_and_inode_pointer() {
     let mut image = mock_image();
     {
         let mut bitmap = BitmapMut::new(image.block_mut(2));
-        for bit in 0..48 {
+        for bit in 0..56 {
             bitmap.set(bit).unwrap();
         }
     }
@@ -514,18 +515,184 @@ fn xattr_external_block_creation_journals_bitmap_xattr_and_inode_pointer() {
         .set_xattr(InodeNo::new(14), b"user.large", &value, true, false)
         .unwrap());
 
-    assert!(BitmapView::new(pager.image().block(2)).is_set(48));
+    assert!(BitmapView::new(pager.image().block(2)).is_set(56));
     assert_eq!(
-        u32::from_le_bytes(pager.image().block(48)[0..4].try_into().unwrap()),
+        u32::from_le_bytes(pager.image().block(56)[0..4].try_into().unwrap()),
         tx_ext4_format::xattr::EXT4_XATTR_MAGIC
     );
     let raw = &pager.image().block(4)[3328..3584];
-    assert_eq!(Inode::parse(raw).unwrap().file_acl, 48);
+    assert_eq!(Inode::parse(raw).unwrap().file_acl, 56);
 
     let attrs = pager.xattrs(InodeNo::new(14)).unwrap();
     assert_eq!(attrs.len(), 1);
     assert_eq!(attrs[0].name, b"user.large");
     assert_eq!(attrs[0].value, value);
+}
+
+#[test]
+fn xattr_shared_external_block_update_cows_and_decrements_old_refcount() {
+    let mut image = mock_image();
+    install_inode12_inline_and_external_xattrs(&mut image, 32);
+    {
+        let mut bitmap = BitmapMut::new(image.block_mut(2));
+        for bit in 0..56 {
+            bitmap.set(bit).unwrap();
+        }
+    }
+    let mut second = Inode::default();
+    second.mode = 0x8000 | 0o600;
+    second.size = BLOCK_SIZE as u64;
+    second.blocks_512 = 16;
+    second.links_count = 1;
+    second.flags = Inode::EXTENTS_FL;
+    second.extra_isize = 32;
+    second.file_acl = 32;
+    second
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: 1,
+            physical_start: 31,
+        }])
+        .unwrap();
+    write_inode(&mut image, 14, &second);
+    image.block_mut(32)[4..8].copy_from_slice(&2u32.to_le_bytes());
+
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let private = [0xCD; 200];
+    assert!(pager
+        .set_xattr(InodeNo::new(14), b"user.omega", &private, false, false)
+        .unwrap());
+
+    assert_eq!(
+        u32::from_le_bytes(pager.image().block(32)[4..8].try_into().unwrap()),
+        1
+    );
+    assert!(BitmapView::new(pager.image().block(2)).is_set(56));
+    assert_eq!(read_inode_from_image(pager.image(), 14).file_acl, 56);
+    assert_eq!(read_inode_from_image(pager.image(), 12).file_acl, 32);
+
+    let attrs_14 = pager.xattrs(InodeNo::new(14)).unwrap();
+    assert_eq!(
+        attrs_14
+            .iter()
+            .find(|attr| attr.name == b"user.omega")
+            .unwrap()
+            .value,
+        private
+    );
+    let attrs_12 = pager.xattrs(InodeNo::new(12)).unwrap();
+    assert_eq!(
+        attrs_12
+            .iter()
+            .find(|attr| attr.name == b"user.omega")
+            .unwrap()
+            .value,
+        b"external"
+    );
+}
+
+#[test]
+fn xattr_last_external_removal_frees_block_and_moves_remaining_attrs_inline() {
+    let mut image = mock_image();
+    install_inode12_inline_and_external_xattrs(&mut image, 32);
+    let before_group = GroupDesc::parse(&image.block(1)[..64]).unwrap();
+    let before_sb = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+
+    let mut pager = Ext4Pager::open(image).unwrap();
+    assert!(pager.remove_xattr(InodeNo::new(12), b"user.omega").unwrap());
+
+    assert!(!BitmapView::new(pager.image().block(2)).is_set(32));
+    let group = GroupDesc::parse(&pager.image().block(1)[..64]).unwrap();
+    assert_eq!(
+        group.free_blocks_count,
+        before_group.free_blocks_count.saturating_add(1)
+    );
+    let sb = Superblock::parse(&pager.image().block(0)[1024..2048]).unwrap();
+    assert_eq!(
+        sb.free_blocks_count,
+        before_sb.free_blocks_count.saturating_add(1)
+    );
+
+    let inode = read_inode_from_image(pager.image(), 12);
+    assert_eq!(inode.file_acl, 0);
+    assert_eq!(inode.blocks_512, 24);
+    let attrs = pager.xattrs(InodeNo::new(12)).unwrap();
+    assert_eq!(attrs.len(), 2);
+    assert!(attrs.iter().any(|attr| attr.name == b"user.alpha"));
+    assert!(attrs.iter().any(|attr| attr.name == b"user.zeta"));
+}
+
+#[test]
+fn xattr_external_create_is_visible_to_later_create_checks() {
+    let mut image = mock_image();
+    install_inode12_inline_and_external_xattrs(&mut image, 32);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    assert!(pager
+        .set_xattr(InodeNo::new(12), b"user.beta", b"created", true, false)
+        .unwrap());
+    assert!(!pager
+        .set_xattr(InodeNo::new(12), b"user.beta", b"again", true, false)
+        .unwrap());
+}
+
+#[test]
+fn xattr_oversized_external_value_fails_without_accounting_drift() {
+    let mut image = mock_image();
+    {
+        let mut bitmap = BitmapMut::new(image.block_mut(2));
+        for bit in 0..56 {
+            bitmap.set(bit).unwrap();
+        }
+    }
+    let mut inode = Inode::default();
+    inode.mode = 0x8000 | 0o600;
+    inode.size = BLOCK_SIZE as u64;
+    inode.blocks_512 = 8;
+    inode.links_count = 1;
+    inode.flags = Inode::EXTENTS_FL;
+    inode.extra_isize = 32;
+    inode
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: 1,
+            physical_start: 31,
+        }])
+        .unwrap();
+    write_inode(&mut image, 14, &inode);
+    let before_group = GroupDesc::parse(&image.block(1)[..64]).unwrap();
+    let before_sb = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let too_large = vec![0xFE; BLOCK_SIZE];
+    assert_eq!(
+        pager.set_xattr(InodeNo::new(14), b"user.huge", &too_large, false, false),
+        Err(Ext4FormatError::Unsupported)
+    );
+
+    let after_group = GroupDesc::parse(&pager.image().block(1)[..64]).unwrap();
+    let after_sb = Superblock::parse(&pager.image().block(0)[1024..2048]).unwrap();
+    assert_eq!(
+        after_group.free_blocks_count,
+        before_group.free_blocks_count
+    );
+    assert_eq!(after_sb.free_blocks_count, before_sb.free_blocks_count);
+
+    let private = [0xCD; 200];
+    assert!(pager
+        .set_xattr(InodeNo::new(14), b"user.omega", &private, false, false)
+        .unwrap());
+    assert_eq!(read_inode_from_image(pager.image(), 14).file_acl, 56);
+    let final_group = GroupDesc::parse(&pager.image().block(1)[..64]).unwrap();
+    let final_sb = Superblock::parse(&pager.image().block(0)[1024..2048]).unwrap();
+    assert_eq!(
+        final_group.free_blocks_count,
+        before_group.free_blocks_count.saturating_sub(1)
+    );
+    assert_eq!(
+        final_sb.free_blocks_count,
+        before_sb.free_blocks_count.saturating_sub(1)
+    );
 }
 
 #[test]
@@ -676,6 +843,7 @@ fn mock_image() -> MemImage {
     let sb = Superblock {
         inodes_count: 64,
         blocks_count: 64,
+        free_blocks_count: 32,
         log_block_size: 2,
         blocks_per_group: 64,
         inodes_per_group: 64,
@@ -701,14 +869,14 @@ fn mock_image() -> MemImage {
 
     let mut journal_inode = Inode::default();
     journal_inode.mode = 0x8000 | 0o600;
-    journal_inode.size = 8 * BLOCK_SIZE as u64;
-    journal_inode.blocks_512 = 64;
+    journal_inode.size = 16 * BLOCK_SIZE as u64;
+    journal_inode.blocks_512 = 128;
     journal_inode.links_count = 1;
     journal_inode.flags = Inode::EXTENTS_FL;
     journal_inode
         .set_extent_root(&[Extent {
             logical_block: 0,
-            len: 8,
+            len: 16,
             physical_start: 40,
         }])
         .unwrap();
@@ -835,6 +1003,55 @@ fn write_inode_at_table(image: &mut MemImage, inode_table_block: u64, ino: u32, 
     inode
         .encode(&mut image.block_mut(block as u64)[in_block..in_block + 256])
         .unwrap();
+}
+
+fn install_inode12_inline_and_external_xattrs(image: &mut MemImage, block: u64) {
+    let mut inode = read_inode_from_image(image, 12);
+    inode.extra_isize = 32;
+    inode.file_acl = block;
+    inode.blocks_512 = 32;
+    let index = 11usize;
+    let offset = index * 256;
+    let table_block = 4 + offset / BLOCK_SIZE;
+    let in_block = offset % BLOCK_SIZE;
+    let raw = &mut image.block_mut(table_block as u64)[in_block..in_block + 256];
+    inode.encode(raw).unwrap();
+    encode_inline_xattrs(
+        &inode,
+        raw,
+        &[
+            InlineXattr {
+                name: b"user.alpha".to_vec(),
+                value: b"bravo".to_vec(),
+            },
+            InlineXattr {
+                name: b"user.zeta".to_vec(),
+                value: b"last".to_vec(),
+            },
+        ],
+    )
+    .unwrap();
+    BitmapMut::new(image.block_mut(2))
+        .set(block as usize)
+        .unwrap();
+    encode_external_xattr_block(
+        &Superblock::parse(&image.block(0)[1024..2048]).unwrap(),
+        block,
+        image.block_mut(block),
+        &[InlineXattr {
+            name: b"user.omega".to_vec(),
+            value: b"external".to_vec(),
+        }],
+    )
+    .unwrap();
+}
+
+fn read_inode_from_image(image: &MemImage, ino: u32) -> Inode {
+    let index = (ino - 1) as usize;
+    let offset = index * 256;
+    let block = 4 + offset / BLOCK_SIZE;
+    let in_block = offset % BLOCK_SIZE;
+    Inode::parse(&image.block(block as u64)[in_block..in_block + 256]).unwrap()
 }
 
 fn filled_page(byte: u8) -> [u8; BLOCK_SIZE] {

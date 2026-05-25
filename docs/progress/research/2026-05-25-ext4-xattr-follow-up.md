@@ -21,9 +21,12 @@ remaining work is deeper ext4 storage policy, not syscall/VFS plumbing.
   deliberately unsupported.
 - Tx ext4 now has a narrow metadata transaction path for supported xattr
   writes and chmod/chown. Descriptor/payload/commit records are barrier-ordered
-  and synchronously checkpointed back to home metadata blocks. Xattr writes
-  remain deliberately scoped to whole-set rewrite of `user.*` entries, inline
-  when it fits and one external block otherwise.
+  and synchronously checkpointed back to home metadata blocks. Xattr writes now
+  cover whole-set rewrite of `user.*` entries, inline when it fits, one
+  external block otherwise, shared-block COW, and freeing a one-block external
+  xattr block when the remaining set moves inline. Oversized values remain
+  explicitly unsupported, with a regression test proving failed allocation
+  preparation does not dirty in-memory accounting before a later commit.
 - Linux ext4 xattrs span inline inode-body entries, external xattr blocks,
   checksums and hashes, shared-block refcounts, optional EA inode storage, and
   journal credit accounting.
@@ -43,20 +46,18 @@ remaining work is deeper ext4 storage policy, not syscall/VFS plumbing.
 4. DONE 2026-05-25: Land Tx-native metadata transactions for supported
    xattr set/remove and chmod/chown. The implementation is metadata-only,
    synchronous-checkpoint v1, not full Linux JBD2.
-5. Extend metadata transactions to truncate, page flush/fsync metadata,
-   multi-block xattr growth, shared-block COW/refcount mutation, and block
-   free on last xattr removal.
-6. After that, revisit ACL, file-capability, and security namespaces; those
+5. DONE 2026-05-25: Add shared external block COW/refcount decrement plus
+   free-on-last-removal for one-block `user.*` xattr storage.
+6. DONE 2026-05-25: Fence oversized/EA-inode-style xattr values with explicit
+   unsupported errors and no accounting drift on failed allocation prep.
+7. Extend metadata transactions to truncate, page flush/fsync metadata,
+   multi-block xattr growth, and EA-inode backed values once the EA-inode
+   lifecycle policy exists.
+8. After that, revisit ACL, file-capability, and security namespaces; those
    still require their owning policy subsystems.
 
 ## Next xattr followups
 
-- Shared external xattr block handling: detect `h_refcount > 1`, implement COW
-  to a new block, and journal old-block refcount decrement plus new block,
-  inode pointer, bitmap, and group descriptor updates together.
-- Removal/free path: when the last external `user.*` entry is removed, clear
-  `i_file_acl`, free the xattr block, decrement inode `blocks_512`, and journal
-  bitmap/group descriptor/inode updates atomically.
 - Multi-block and EA-inode values: keep returning `ENOSYS` until ext4 supports
   EA-inode allocation, ownership, and lifecycle accounting.
 - Namespace followups: `system.posix_acl_*`, `security.*`, `trusted.*`, and file
@@ -74,3 +75,8 @@ remaining work is deeper ext4 storage policy, not syscall/VFS plumbing.
 - `cargo test -p tx-ext4 --lib tests_v3 -- --nocapture`
 - `cargo test -p tx-ext4 --features host-async --test async_adapter -- --nocapture`
 - `cargo check -p tx-ext4 -p tx-ext4-format -p tx-fs`
+- `cargo test -p tx-ext4-format --test pager_mock xattr_ -- --nocapture`
+- `cargo test -p tx-ext4-format --test pager_mock -- --nocapture`
+- `cargo xtask progress validate`
+- `cargo fmt --check`
+- `git diff --check`

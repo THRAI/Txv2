@@ -3,7 +3,7 @@ use crate::ondisk::{
     BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry, DirEntryIter, Extent, ExtentNode,
     GroupDesc, Inode, InodeLocation, InodeTableLayout, Superblock,
 };
-use crate::ondisk::{read_u16_le, read_u32_le, write_u16_le};
+use crate::ondisk::{read_u16_le, read_u32_le, write_u16_le, write_u32_le};
 use crate::xattr::{
     encode_external_xattr_block, encode_inline_xattrs, parse_external_xattr_block,
     parse_inline_xattrs, InlineXattr,
@@ -245,42 +245,75 @@ impl<I: BlockImage> Ext4Pager<I> {
         let location = self.inode_location(inode)?;
         let mut inode_block = [0u8; BLOCK_SIZE];
         self.image.read_block(location.block, &mut inode_block)?;
-        let raw = &mut inode_block[location.offset..location.offset + location.len];
-        let mut disk_inode = Inode::parse(raw)?;
+        let mut disk_inode =
+            Inode::parse(&inode_block[location.offset..location.offset + location.len])?;
+        let old_xattr_block_nr = disk_inode.file_acl;
+        let old_refcount = if old_xattr_block_nr != 0 {
+            let mut current = [0u8; BLOCK_SIZE];
+            self.image.read_block(old_xattr_block_nr, &mut current)?;
+            let refcount = read_u32_le(&current, 4)?;
+            if refcount == 0 {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            Some((refcount, current))
+        } else {
+            None
+        };
 
-        if disk_inode.file_acl == 0 && encode_inline_xattrs(&disk_inode, raw, attrs)? {
-            self.commit_metadata_transaction(&[MetadataUpdate {
+        let mut inline_inode_block = inode_block;
+        let inline_raw = &mut inline_inode_block[location.offset..location.offset + location.len];
+        let mut inline_inode = disk_inode;
+        inline_inode.file_acl = 0;
+        if old_xattr_block_nr != 0 {
+            inline_inode.blocks_512 = inline_inode
+                .blocks_512
+                .saturating_sub((BLOCK_SIZE / 512) as u64);
+        }
+        inline_inode.encode(inline_raw)?;
+        if encode_inline_xattrs(&inline_inode, inline_raw, attrs)? {
+            let mut updates =
+                self.detach_old_xattr_block_updates(old_xattr_block_nr, old_refcount)?;
+            updates.push(MetadataUpdate {
                 target_block: location.block,
-                data: inode_block,
-            }])?;
+                data: inline_inode_block,
+            });
+            self.commit_metadata_transaction(&updates)?;
             return Ok(());
         }
 
         let mut updates = Vec::new();
-        let xattr_block_nr = if disk_inode.file_acl == 0 {
-            let (block, bitmap_block, bitmap) = self.allocate_block_update()?;
-            updates.push(MetadataUpdate {
-                target_block: bitmap_block,
-                data: bitmap,
-            });
+        let xattr_block_nr = if old_xattr_block_nr == 0 {
+            let (block, mut accounting) = self.allocate_block_updates()?;
+            updates.append(&mut accounting);
             disk_inode.file_acl = block;
             disk_inode.blocks_512 = disk_inode
                 .blocks_512
                 .saturating_add((BLOCK_SIZE / 512) as u64);
             block
-        } else {
-            let mut current = [0u8; BLOCK_SIZE];
-            self.image.read_block(disk_inode.file_acl, &mut current)?;
-            if read_u32_le(&current, 4)? != 1 {
-                return Err(Ext4FormatError::Unsupported);
+        } else if let Some((refcount, current)) = old_refcount {
+            if refcount == 1 {
+                old_xattr_block_nr
+            } else {
+                let (block, mut accounting) = self.allocate_block_updates()?;
+                updates.append(&mut accounting);
+                let mut decremented = current;
+                write_u32_le(&mut decremented, 4, refcount - 1)?;
+                updates.push(MetadataUpdate {
+                    target_block: old_xattr_block_nr,
+                    data: decremented,
+                });
+                disk_inode.file_acl = block;
+                block
             }
-            disk_inode.file_acl
+        } else {
+            return Err(Ext4FormatError::Corrupt);
         };
 
         let mut xattr_block = [0u8; BLOCK_SIZE];
         encode_external_xattr_block(&self.superblock, xattr_block_nr, &mut xattr_block, attrs)?;
-        let _ = encode_inline_xattrs(&disk_inode, raw, &[])?;
+        let raw = &mut inode_block[location.offset..location.offset + location.len];
         disk_inode.encode(raw)?;
+        let _ = encode_inline_xattrs(&disk_inode, raw, &[])?;
         updates.push(MetadataUpdate {
             target_block: xattr_block_nr,
             data: xattr_block,
@@ -473,6 +506,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         self.image.barrier()?;
         for update in &coalesced {
             self.image.write_block(update.target_block, &update.data)?;
+            self.refresh_cached_metadata_from_update(update)?;
         }
         let next_cursor = commit_block + 1;
         if next_cursor < journal_end {
@@ -601,12 +635,14 @@ impl<I: BlockImage> Ext4Pager<I> {
     /// Allocate a free data block in group 0, mark it used, and return its
     /// absolute block number.
     pub fn allocate_block(&mut self) -> Result<u64> {
-        let (block, bitmap_block, bitmap) = self.allocate_block_update()?;
-        self.image.write_block(bitmap_block, &bitmap)?;
+        let (block, updates) = self.allocate_block_updates()?;
+        for update in updates {
+            self.image.write_block(update.target_block, &update.data)?;
+        }
         Ok(block)
     }
 
-    fn allocate_block_update(&mut self) -> Result<(u64, u64, Page4K)> {
+    fn allocate_block_updates(&mut self) -> Result<(u64, Vec<MetadataUpdate>)> {
         let group = *self.groups.first().ok_or(Ext4FormatError::Corrupt)?;
         let bitmap_block = group.block_bitmap_block();
         let mut bitmap = [0u8; BLOCK_SIZE];
@@ -615,11 +651,103 @@ impl<I: BlockImage> Ext4Pager<I> {
             .first_zero()
             .ok_or(Ext4FormatError::OutOfBounds)?;
         BitmapMut::new(&mut bitmap).set(bit)?;
-        Ok((
-            self.superblock.first_data_block as u64 + bit as u64,
-            bitmap_block,
-            bitmap,
-        ))
+        let block = self.superblock.first_data_block as u64 + bit as u64;
+        let mut updates = vec![MetadataUpdate {
+            target_block: bitmap_block,
+            data: bitmap,
+        }];
+        updates.extend(self.account_free_block_delta(0, -1)?);
+        Ok((block, updates))
+    }
+
+    fn detach_old_xattr_block_updates(
+        &mut self,
+        block: u64,
+        old_refcount: Option<(u32, Page4K)>,
+    ) -> Result<Vec<MetadataUpdate>> {
+        if block == 0 {
+            return Ok(Vec::new());
+        }
+        let Some((refcount, mut current)) = old_refcount else {
+            return Err(Ext4FormatError::Corrupt);
+        };
+        if refcount > 1 {
+            write_u32_le(&mut current, 4, refcount - 1)?;
+            return Ok(vec![MetadataUpdate {
+                target_block: block,
+                data: current,
+            }]);
+        }
+        self.free_block_updates(block)
+    }
+
+    fn free_block_updates(&mut self, block: u64) -> Result<Vec<MetadataUpdate>> {
+        let group_index = block_group_index(&self.superblock, block)?;
+        let group = *self
+            .groups
+            .get(group_index as usize)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let bitmap_block = group.block_bitmap_block();
+        let bit = block_bit_in_group(&self.superblock, block)?;
+        let mut bitmap = [0u8; BLOCK_SIZE];
+        self.image.read_block(bitmap_block, &mut bitmap)?;
+        BitmapMut::new(&mut bitmap).clear(bit)?;
+        let mut updates = vec![MetadataUpdate {
+            target_block: bitmap_block,
+            data: bitmap,
+        }];
+        updates.extend(self.account_free_block_delta(group_index, 1)?);
+        Ok(updates)
+    }
+
+    fn account_free_block_delta(
+        &mut self,
+        group_index: u32,
+        delta: i64,
+    ) -> Result<Vec<MetadataUpdate>> {
+        let group_loc = group_desc_location(&self.superblock, group_index)?;
+        let mut group_block = [0u8; BLOCK_SIZE];
+        self.image.read_block(group_loc.block, &mut group_block)?;
+        let mut group = GroupDesc::parse_sized(
+            &group_block[group_loc.offset..group_loc.offset + group_loc.len],
+            group_loc.len,
+        )?;
+        let new_group_free = apply_signed_delta(group_free_blocks(&group), delta)?;
+        set_group_free_blocks(&mut group, new_group_free);
+        group.encode(&mut group_block[group_loc.offset..group_loc.offset + group_loc.len])?;
+
+        let mut super_block = [0u8; BLOCK_SIZE];
+        self.image.read_block(0, &mut super_block)?;
+        let mut superblock = Superblock::parse(&super_block[1024..2048])?;
+        superblock.free_blocks_count = apply_signed_delta(superblock.free_blocks_count, delta)?;
+        superblock.encode(&mut super_block[1024..2048])?;
+
+        Ok(vec![
+            MetadataUpdate {
+                target_block: group_loc.block,
+                data: group_block,
+            },
+            MetadataUpdate {
+                target_block: 0,
+                data: super_block,
+            },
+        ])
+    }
+
+    fn refresh_cached_metadata_from_update(&mut self, update: &MetadataUpdate) -> Result<()> {
+        if update.target_block == 0 {
+            self.superblock = Superblock::parse(&update.data[1024..2048])?;
+        }
+        for idx in 0..self.groups.len() {
+            let loc = group_desc_location(&self.superblock, idx as u32)?;
+            if loc.block == update.target_block {
+                self.groups[idx] = GroupDesc::parse_sized(
+                    &update.data[loc.offset..loc.offset + loc.len],
+                    loc.len,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Insert a new directory entry `(name → new_ino)` into an existing
@@ -941,6 +1069,73 @@ fn read_group_descs<I: BlockImage>(image: &I, superblock: &Superblock) -> Result
         )?);
     }
     Ok(groups)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GroupDescLocation {
+    block: u64,
+    offset: usize,
+    len: usize,
+}
+
+fn group_desc_location(superblock: &Superblock, group_index: u32) -> Result<GroupDescLocation> {
+    let desc_size = superblock.group_desc_size();
+    let gdt_start = if superblock.block_size() == 1024 {
+        2
+    } else {
+        1
+    };
+    let byte_offset = group_index as usize * desc_size;
+    let block = gdt_start + (byte_offset / BLOCK_SIZE) as u64;
+    let offset = byte_offset % BLOCK_SIZE;
+    if offset + desc_size > BLOCK_SIZE {
+        return Err(Ext4FormatError::Unsupported);
+    }
+    Ok(GroupDescLocation {
+        block,
+        offset,
+        len: desc_size,
+    })
+}
+
+fn block_group_index(superblock: &Superblock, block: u64) -> Result<u32> {
+    let first = superblock.first_data_block as u64;
+    if block < first || superblock.blocks_per_group == 0 {
+        return Err(Ext4FormatError::OutOfBounds);
+    }
+    ((block - first) / superblock.blocks_per_group as u64)
+        .try_into()
+        .map_err(|_| Ext4FormatError::OutOfBounds)
+}
+
+fn block_bit_in_group(superblock: &Superblock, block: u64) -> Result<usize> {
+    let first = superblock.first_data_block as u64;
+    if block < first || superblock.blocks_per_group == 0 {
+        return Err(Ext4FormatError::OutOfBounds);
+    }
+    let bit = (block - first) % superblock.blocks_per_group as u64;
+    bit.try_into().map_err(|_| Ext4FormatError::OutOfBounds)
+}
+
+fn group_free_blocks(group: &GroupDesc) -> u64 {
+    group.free_blocks_count as u64 | ((group.free_blocks_count_hi as u64) << 16)
+}
+
+fn set_group_free_blocks(group: &mut GroupDesc, value: u64) {
+    group.free_blocks_count = value as u16;
+    group.free_blocks_count_hi = (value >> 16) as u16;
+}
+
+fn apply_signed_delta(value: u64, delta: i64) -> Result<u64> {
+    if delta >= 0 {
+        value
+            .checked_add(delta as u64)
+            .ok_or(Ext4FormatError::OutOfBounds)
+    } else {
+        value
+            .checked_sub(delta.unsigned_abs())
+            .ok_or(Ext4FormatError::OutOfBounds)
+    }
 }
 
 fn inode_to_meta(inode: Inode) -> InodeMetaLite {

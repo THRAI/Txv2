@@ -205,6 +205,7 @@ fn build_image() -> MemImage {
     let sb = Superblock {
         inodes_count: 64,
         blocks_count: 64,
+        free_blocks_count: 16,
         log_block_size: 2,
         blocks_per_group: 64,
         inodes_per_group: 64,
@@ -220,13 +221,16 @@ fn build_image() -> MemImage {
         block_bitmap: 2,
         inode_bitmap: 3,
         inode_table: 4,
-        free_blocks_count: 32,
+        free_blocks_count: 16,
         free_inodes_count: 52,
         used_dirs_count: 1,
         ..GroupDesc::default()
     }
     .encode(&mut image.block_mut(1)[..64])
     .unwrap();
+    for bit in 0..48 {
+        image.block_mut(2)[bit / 8] |= 1u8 << (bit % 8);
+    }
 
     let mut journal_inode = Inode::default();
     journal_inode.mode = 0x8000 | 0o600;
@@ -608,7 +612,7 @@ fn ext4_v3_chmod_and_chown_mutate_inode_metadata_through_journal() {
 }
 
 #[test]
-fn ext4_v3_shared_xattr_blocks_remain_unsupported_for_writes() {
+fn ext4_v3_shared_xattr_block_update_cows_or_moves_inline() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let mut image = build_image();
@@ -627,8 +631,22 @@ fn ext4_v3_shared_xattr_blocks_remain_unsupported_for_writes() {
             &cred,
             &guard,
         ),
-        V3::<(), NoProgress>::err(V3Errno::ENOSYS)
+        V3::<(), NoProgress>::done(())
     );
+
+    let mut value = [0u8; 16];
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::get_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.omega",
+            &mut value,
+            &cred,
+            &guard,
+        ),
+        V3::<usize, NoProgress>::done(7)
+    );
+    assert_eq!(&value[..7], b"rewrite");
 }
 
 #[test]
