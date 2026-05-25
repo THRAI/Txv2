@@ -6,8 +6,8 @@ use crate::net::execution::{
     socket_accept_wait_token, socket_recv_wait_token, socket_send_wait_token,
 };
 use crate::net::structure::{
-    AcceptWireSet, PollMask, RecvWireSet, SocketIdentity, SocketProtocol, TcpState, UdpInner,
-    UnixDatagramState, UnixStreamState,
+    AcceptWireSet, PollMask, RecvWireSet, SendWireSet, SocketIdentity, SocketProtocol, TcpState,
+    UdpInner, UnixDatagramState, UnixStreamState,
 };
 
 pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepOutcome<PollMask> {
@@ -134,6 +134,10 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
         }
         _ => {}
     });
+
+    if witness.identity.readiness.send_wq.peek() & SendWireSet::BROKEN.bits() != 0 {
+        mask |= PollMask::OUT | PollMask::ERR;
+    }
 
     StepOutcome::Done(mask)
 }

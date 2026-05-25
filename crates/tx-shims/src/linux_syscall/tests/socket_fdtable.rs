@@ -37,6 +37,7 @@ const SOCKADDR_UN_BYTES: u32 = 110;
 const SOCKADDR_NL_BYTES: u32 = 12;
 const SOCKADDR_LL_BYTES: u32 = 20;
 const TEST_POLLIN: i16 = 0x0001;
+const TEST_POLLOUT: i16 = 0x0004;
 const ETH_P_ALL: u16 = 0x0003;
 const ETH_P_ALL_NET: u16 = 0x0300;
 const MSG_DONTWAIT: u64 = 0x40;
