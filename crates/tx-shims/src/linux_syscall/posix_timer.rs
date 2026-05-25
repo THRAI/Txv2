@@ -12,6 +12,7 @@ use tx_subsystems::timerfd::{ItimerSpec, ITIMERSPEC_BYTES};
 
 use tx_subsystems::process::ProcessIdentity;
 
+use super::ipc::SigeventPrefixLayout;
 use super::numbers::{
     CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID,
     CLOCK_REALTIME, CLOCK_REALTIME_ALARM, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, NR_TIMER_CREATE,
@@ -28,14 +29,6 @@ const SIGEV_SIGNAL: i32 = 0;
 const SIGEV_NONE: i32 = 1;
 const SIGEV_THREAD_ID: i32 = 4;
 const SIGALRM: u8 = 14;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct SigeventPrefixLayout {
-    sigval: u64,
-    sigev_signo: i32,
-    sigev_notify: i32,
-}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PosixTimer {

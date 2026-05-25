@@ -1,0 +1,164 @@
+# alpine-network-abi-focused-probe.txt - real Alpine network ABI probe.
+#
+# This keeps the next Alpine stage deliberately network-scoped: real iproute2,
+# nft, and iptables-nft must drive Docker-shaped bridge/veth/NAT control-plane
+# state through txKernel's existing net subsystem, while procfs/sysfs project
+# the resulting namespace state.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "m=N72X; IP=/sbin/ip; NFT=/sbin/nft; [ -x $NFT ] || NFT=/usr/sbin/nft; IPT=/sbin/iptables; [ -x $IPT ] || IPT=/usr/sbin/iptables; echo ${m}_TOOLS_${IP}_${NFT}_${IPT}\n"
+expect "N72X_TOOLS_" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "$IP -Version\n"
+expect "ip utility" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link; then echo ${m}_IP_LINK_OK; else echo ${m}_FAIL_IP_LINK; fi\n"
+expect "N72X_IP_LINK_OK" within 15000
+expect "lo" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP addr; then echo ${m}_IP_ADDR_OK; else echo ${m}_FAIL_IP_ADDR; fi\n"
+expect "N72X_IP_ADDR_OK" within 15000
+expect "127.0.0.1" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP route; then echo ${m}_IP_ROUTE_OK; else echo ${m}_FAIL_IP_ROUTE; fi\n"
+expect "N72X_IP_ROUTE_OK" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP neigh; then echo ${m}_IP_NEIGH_OK; else echo ${m}_FAIL_IP_NEIGH; fi\n"
+expect "N72X_IP_NEIGH_OK" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/net/dev\n"
+expect "lo" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/net/route\n"
+expect "Iface" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/net/snmp\n"
+expect "Ip:" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "ls /sys/class/net\n"
+expect "lo" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /sys/class/net/lo/ifindex\n"
+expect "1" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /sys/class/net/lo/mtu\n"
+expect "65535" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "$NFT list ruleset\n"
+expect "/ # " within 15000
+
+sleep 500
+send "$IPT -t nat -S\n"
+expect "POSTROUTING" within 15000
+expect "/ # " within 15000
+
+sleep 500
+send "if $IP link add name docker0 type bridge; then echo ${m}_BRIDGE_CREATED; else echo ${m}_FAIL_BRIDGE_CREATE; fi\n"
+expect "N72X_BRIDGE_CREATED" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link set docker0 up; then echo ${m}_BRIDGE_UP; else echo ${m}_FAIL_BRIDGE_UP; fi\n"
+expect "N72X_BRIDGE_UP" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP addr add 172.17.0.1/16 dev docker0; then echo ${m}_BRIDGE_ADDR; else echo ${m}_FAIL_BRIDGE_ADDR; fi\n"
+expect "N72X_BRIDGE_ADDR" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link add veth0 type veth peer name eth0; then echo ${m}_VETH_CREATED; else echo ${m}_FAIL_VETH_CREATE; fi\n"
+expect "N72X_VETH_CREATED" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link set veth0 master docker0; then echo ${m}_VETH_MASTER; else echo ${m}_FAIL_VETH_MASTER; fi\n"
+expect "N72X_VETH_MASTER" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link set veth0 up; then echo ${m}_VETH_UP; else echo ${m}_FAIL_VETH_UP; fi\n"
+expect "N72X_VETH_UP" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "$IP link\n"
+expect "docker0" within 15000
+expect "veth0" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "$IP addr\n"
+expect "172.17.0.1" within 15000
+expect "docker0" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "$IP route\n"
+expect "172.17.0.0" within 15000
+expect "docker0" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/net/dev\n"
+expect "docker0" within 10000
+expect "veth0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "ls /sys/class/net\n"
+expect "docker0" within 10000
+expect "veth0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /sys/class/net/docker0/mtu\n"
+expect "1500" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "$IPT -t nat -A POSTROUTING -s 172.17.0.0/16 -j MASQUERADE\n"
+expect "/ # " within 15000
+
+sleep 500
+send "$IPT -t nat -S\n"
+expect "172.17.0.0/16" within 15000
+expect "MASQUERADE" within 15000
+expect "/ # " within 15000
+
+sleep 500
+send "$NFT list ruleset\n"
+expect "172.17.0.0/16" within 15000
+expect "MASQUERADE" within 15000
+expect "/ # " within 15000
+
+sleep 500
+quit

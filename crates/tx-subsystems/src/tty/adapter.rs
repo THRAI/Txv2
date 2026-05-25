@@ -60,7 +60,9 @@ pub mod wait_routing {
         MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
     };
 
-    /// Delegates to `tx_substrate::wake::new_source`.
+    /// Delegates to `tx_substrate::wake::new_source`. Also registers
+    /// the source in the global registry so the driver can look it up
+    /// by [`WaitSourceId`] during yield resolution.
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
         let source = tx_substrate::wake::new_source(source_id);
         tx_substrate::wake::register_source(Arc::clone(&source));

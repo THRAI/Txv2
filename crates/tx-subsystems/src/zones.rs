@@ -28,6 +28,7 @@ pub fn register_all() -> Result<(), ZoneError> {
     vm::register_zones()?;
     page_backed::register_zones()?;
     mount::register_zones()?;
+    net::register_zones()?;
     vfs::register_zones()?;
     tty::register_zones()?;
     pipe::register_zones()?;
@@ -228,6 +229,14 @@ mod mount {
         zone::register_zone_for::<MountPayload>()?;
         zone::register_zone_for::<MountNamespace>()?;
         Ok(())
+    }
+}
+
+mod net {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        crate::net::register_zones()
     }
 }
 

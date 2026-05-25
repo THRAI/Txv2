@@ -187,6 +187,29 @@ skills:
       - docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md
     purpose: Guide Process, ThreadRuntime, signal, syscall, exec, and first-userspace implementation from canonical docs.
 
+  tx-network-test-fixup:
+    sources:
+      - docs/progress/research/2026-05-21-oscomp-network-suite-survey.md
+      - docs/progress/research/2026-05-21-ltp-network-prep.md
+      - docs/progress/STATUS.md
+      - crates/tx-shims/src/linux_syscall/socket.rs
+      - crates/tx-shims/src/linux_syscall/io.rs
+      - crates/tx-subsystems/src/net/
+      - crates/tx-subsystems/src/net/tests/loopback_tests.rs
+      - crates/tx-kernel/src/init/exec.rs
+      - xtask/src/oscomp.rs
+    purpose: Triage and fix OSComp/LTP network test failures with semantic socket/network fixes, targeted witnesses, and explicit refactor discussion boundaries.
+
+  tx-ltp-syscall:
+    sources:
+      - docs/progress/SYSCALL_STATUS.md
+      - docs/Txv3/04_SYSCALL_SHAPE_v1.md
+      - docs/Txv3/03_STEP_MODEL_v2.md
+      - docs/Txv3/02_INVARIANTS_v5.md
+      - docs/progress/research/2026-05-21-ltp-network-prep.md
+      - .agents/skills/tx-network-test-fixup/SKILL.md
+    purpose: Plan, prioritize, implement, and record Linux syscall work against OSComp/LTP coverage without test-specific hardcoding.
+
   tx-shell-syscall-fixup:
     sources:
       - docs/DEVELOPMENT.md

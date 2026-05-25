@@ -67,11 +67,7 @@ impl ThreadIdentity {
         if crate::futex::thread_has_waiter(self.tid.0) {
             return b'S';
         }
-        if payload.active_userspace_request().is_some() {
-            b'R'
-        } else {
-            b'R'
-        }
+        b'R'
     }
 
     /// Snapshot the owning process via `Weak::upgrade` under a fresh
@@ -335,6 +331,13 @@ impl ThreadPayload {
     /// to preserve the pre-handler context for `rt_sigreturn`.
     pub fn store_saved_signal_context(&self, ctx: Option<UserTrapContext>) {
         *self.saved_signal_context.lock() = ctx;
+    }
+
+    /// Return whether a signal handler is currently using the saved
+    /// pre-handler context slot. Delivery code uses this to avoid
+    /// nesting another handler on top of the single parked context.
+    pub fn has_saved_signal_context(&self) -> bool {
+        self.saved_signal_context.lock().is_some()
     }
 
     /// Take (consume) the saved signal context. Called by

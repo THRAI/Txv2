@@ -176,7 +176,7 @@ impl BlockDeviceHandle {
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         let Some(block_id) = self.block_id_for(lba_offset, target.len() as u64) else {
-            return StepOutcome::err(Errno::EINVAL.into());
+            return StepOutcome::err(Errno::EINVAL);
         };
         self.reg.ops.read_blocks(block_id, target, guard)
     }
@@ -188,7 +188,7 @@ impl BlockDeviceHandle {
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         let Some(block_id) = self.block_id_for(lba_offset, source.len() as u64) else {
-            return StepOutcome::err(Errno::EINVAL.into());
+            return StepOutcome::err(Errno::EINVAL);
         };
         self.reg.ops.write_blocks(block_id, source, guard)
     }
@@ -227,10 +227,10 @@ pub fn register_block_devices(
     regs: &'static [&'static BlockDeviceRegistration],
 ) -> StepOutcome<(), NoProgress> {
     if BLOCK_REGISTRY_INITIALIZED.swap(true, Ordering::AcqRel) {
-        return StepOutcome::Err(Errno::EEXIST.into());
+        return StepOutcome::Err(Errno::EEXIST);
     }
     if regs.len() > MAX_STATIC_BLOCK_DEVICES {
-        return StepOutcome::Err(Errno::ENOMEM.into());
+        return StepOutcome::Err(Errno::ENOMEM);
     }
 
     for (idx, reg) in regs.iter().copied().enumerate() {
@@ -239,7 +239,7 @@ pub fn register_block_devices(
             .copied()
             .any(|seen| seen.devt == reg.devt || seen.name == reg.name)
         {
-            return StepOutcome::Err(Errno::EEXIST.into());
+            return StepOutcome::Err(Errno::EEXIST);
         }
         unsafe {
             BLOCK_REGISTRY[idx] = Some(reg);
@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(frames[0].ppn(), Ppn(34));
         assert_eq!(
             handle.read_blocks(4, &mut frames, &guard),
-            V3::err(Errno::EINVAL.into())
+            V3::err(Errno::EINVAL)
         );
     }
 
@@ -378,7 +378,7 @@ mod tests {
         assert!(core::ptr::eq(snapshot[0], &BLOCK_REG));
         assert_eq!(
             register_block_devices(REGS),
-            StepOutcome::Err(Errno::EEXIST.into())
+            StepOutcome::Err(Errno::EEXIST)
         );
     }
 
@@ -397,7 +397,7 @@ mod tests {
 
         assert_eq!(
             register_block_devices(REGS),
-            StepOutcome::Err(Errno::EEXIST.into())
+            StepOutcome::Err(Errno::EEXIST)
         );
         assert!(block_device_snapshot().is_empty());
     }

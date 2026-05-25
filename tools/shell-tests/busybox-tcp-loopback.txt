@@ -1,0 +1,18 @@
+# busybox-tcp-loopback.txt — N68 BusyBox shell TCP loopback smoke.
+#
+# Run with:
+#   cargo xtask image cpio --profile busybox --target rv64-qemu
+#   cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/busybox-tcp-loopback.txt
+#
+# The shell launches a tiny freestanding static test binary that creates a TCP
+# listener and client on 127.0.0.1, completes connect/accept, writes one small
+# payload, reads it through the accepted socket, and returns to the prompt.
+
+wait "/ # " within 30000
+sleep 500
+
+send "/bin/tcp-loopback-smoke\n"
+expect "tx-n68-tcp-ok" within 10000
+expect "/ # " within 10000
+
+quit

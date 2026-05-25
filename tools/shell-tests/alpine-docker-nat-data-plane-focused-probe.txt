@@ -1,0 +1,214 @@
+# alpine-docker-nat-data-plane-focused-probe.txt - Alpine Docker NAT path.
+#
+# This keeps the Docker-default data-plane probe self-contained:
+# - container namespace eth0 sits behind host docker0 at 172.17.0.0/16.
+# - host uplink0 reaches a gateway namespace gw0 at 10.0.2.0/24.
+# - Alpine iptables-nft installs a MASQUERADE rule for 172.17.0.0/16.
+# - container ping to the gateway proves forwarding, NAT, conntrack reply DNAT,
+#   ARP/neigh, and bridge/veth delivery work together.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "m=N73E; IP=/sbin/ip; PING=/bin/ping; IPT=/sbin/iptables; [ -x $IPT ] || IPT=/usr/sbin/iptables; NFT=/sbin/nft; [ -x $NFT ] || NFT=/usr/sbin/nft; echo ${m}_TOOLS_${IP}_${PING}_${IPT}_${NFT}\n"
+expect "N73E_TOOLS_" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if [ -x /bin/netns-helper ]; then echo ${m}_NETNS_HELPER_PRESENT; else echo ${m}_FAIL_NO_NETNS_HELPER; fi\n"
+expect "N73E_NETNS_HELPER_PRESENT" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if [ -x $PING ]; then echo ${m}_PING_PRESENT; else echo ${m}_FAIL_NO_PING; fi\n"
+expect "N73E_PING_PRESENT" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if [ -x $IPT ]; then echo ${m}_IPTABLES_PRESENT; else echo ${m}_FAIL_NO_IPTABLES; fi\n"
+expect "N73E_IPTABLES_PRESENT" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "/bin/netns-helper hold &\n"
+expect "tx-netns-holder-ready" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "container=$!; echo ${m}_CONTAINER_${container}\n"
+expect "N73E_CONTAINER_" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "/bin/netns-helper hold &\n"
+expect "tx-netns-holder-ready" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "gateway=$!; echo ${m}_GATEWAY_${gateway}\n"
+expect "N73E_GATEWAY_" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link add name docker0 type bridge; then echo ${m}_BRIDGE_CREATED; else echo ${m}_FAIL_BRIDGE_CREATE; fi\n"
+expect "N73E_BRIDGE_CREATED" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP addr add 172.17.0.1/16 dev docker0; then echo ${m}_BRIDGE_ADDR; else echo ${m}_FAIL_BRIDGE_ADDR; fi\n"
+expect "N73E_BRIDGE_ADDR" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link set docker0 up; then echo ${m}_BRIDGE_UP; else echo ${m}_FAIL_BRIDGE_UP; fi\n"
+expect "N73E_BRIDGE_UP" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link add veth0 type veth peer name eth0; then echo ${m}_VETH_CREATED; else echo ${m}_FAIL_VETH_CREATE; fi\n"
+expect "N73E_VETH_CREATED" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link set veth0 master docker0 || /bin/netns-helper master veth0 docker0; then echo ${m}_VETH_MASTER; else echo ${m}_FAIL_VETH_MASTER; fi\n"
+expect "N73E_VETH_MASTER" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link set veth0 up; then echo ${m}_VETH_UP; else echo ${m}_FAIL_VETH_UP; fi\n"
+expect "N73E_VETH_UP" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link set eth0 netns $container || /bin/netns-helper netns eth0 $container; then echo ${m}_ETH_MOVED; else echo ${m}_FAIL_ETH_MOVE; fi\n"
+expect "N73E_ETH_MOVED" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if /bin/netns-helper exec $container $IP link set eth0 up; then echo ${m}_ETH_UP; else echo ${m}_FAIL_ETH_UP; fi\n"
+expect "N73E_ETH_UP" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if /bin/netns-helper exec $container $IP addr add 172.17.0.2/16 dev eth0; then echo ${m}_ETH_ADDR; else echo ${m}_FAIL_ETH_ADDR; fi\n"
+expect "N73E_ETH_ADDR" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if /bin/netns-helper exec $container $IP route add default via 172.17.0.1 dev eth0; then echo ${m}_ETH_DEFAULT_ROUTE; else echo ${m}_FAIL_ETH_DEFAULT_ROUTE; fi\n"
+expect "N73E_ETH_DEFAULT_ROUTE" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link add uplink0 type veth peer name gw0; then echo ${m}_UPLINK_CREATED; else echo ${m}_FAIL_UPLINK_CREATE; fi\n"
+expect "N73E_UPLINK_CREATED" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP addr add 10.0.2.15/24 dev uplink0; then echo ${m}_UPLINK_ADDR; else echo ${m}_FAIL_UPLINK_ADDR; fi\n"
+expect "N73E_UPLINK_ADDR" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link set uplink0 up; then echo ${m}_UPLINK_UP; else echo ${m}_FAIL_UPLINK_UP; fi\n"
+expect "N73E_UPLINK_UP" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link set gw0 netns $gateway || /bin/netns-helper netns gw0 $gateway; then echo ${m}_GW_MOVED; else echo ${m}_FAIL_GW_MOVE; fi\n"
+expect "N73E_GW_MOVED" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if /bin/netns-helper exec $gateway $IP link set gw0 up; then echo ${m}_GW_UP; else echo ${m}_FAIL_GW_UP; fi\n"
+expect "N73E_GW_UP" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if /bin/netns-helper exec $gateway $IP addr add 10.0.2.2/24 dev gw0; then echo ${m}_GW_ADDR; else echo ${m}_FAIL_GW_ADDR; fi\n"
+expect "N73E_GW_ADDR" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP route add default via 10.0.2.2 dev uplink0; then echo ${m}_HOST_DEFAULT_ROUTE; else echo ${m}_FAIL_HOST_DEFAULT_ROUTE; fi\n"
+expect "N73E_HOST_DEFAULT_ROUTE" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if echo 1 > /proc/sys/net/ipv4/ip_forward; then echo ${m}_IP_FORWARD_ON; else echo ${m}_FAIL_IP_FORWARD; fi\n"
+expect "N73E_IP_FORWARD_ON" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/sys/net/ipv4/ip_forward\n"
+expect "1" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IPT -t nat -A POSTROUTING -s 172.17.0.0/16 -j MASQUERADE; then echo ${m}_MASQ_RULE_ADDED; else echo ${m}_FAIL_MASQ_RULE; fi\n"
+expect "N73E_MASQ_RULE_ADDED" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "$IPT -t nat -S\n"
+expect "172.17.0.0/16" within 15000
+expect "MASQUERADE" within 15000
+expect "/ # " within 15000
+
+sleep 500
+send "$NFT list ruleset\n"
+expect "172.17.0.0/16" within 15000
+expect "MASQUERADE" within 15000
+expect "/ # " within 15000
+
+sleep 500
+send "$IP route\n"
+expect "default via 10.0.2.2" within 10000
+expect "uplink0" within 10000
+expect "docker0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "/bin/netns-helper exec $container $IP route\n"
+expect "default via 172.17.0.1" within 10000
+expect "eth0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "/bin/netns-helper exec $gateway $IP route\n"
+expect "10.0.2.0/24" within 10000
+expect "gw0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if /bin/netns-helper exec $container $PING -c 1 -W 5 10.0.2.2; then echo ${m}_PING_GATEWAY_OK; else echo ${m}_FAIL_PING_GATEWAY; fi\n"
+expect "N73E_PING_GATEWAY_OK" within 30000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/net/nf_conntrack\n"
+expect "icmp" within 10000
+expect "masquerade" within 10000
+expect "original=172.17.0.2" within 10000
+expect "dst=10.0.2.2" within 10000
+expect "translated=10.0.2.15" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "/bin/netns-helper exec $container $IP neigh\n"
+expect "172.17.0.1" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "/bin/netns-helper exec $gateway $IP neigh\n"
+expect "10.0.2.15" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "kill $container $gateway; echo ${m}_DOCKER_NAT_DATA_PLANE_SUCCESS\n"
+expect "N73E_DOCKER_NAT_DATA_PLANE_SUCCESS" within 10000
+expect "/ # " within 10000
+
+sleep 500
+quit

@@ -79,9 +79,9 @@ impl RunIdleReport {
     }
 }
 
-fn earliest_deadline(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+const fn earliest_deadline(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
-        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), Some(b)) => Some(if a <= b { a } else { b }),
         (Some(a), None) => Some(a),
         (None, Some(b)) => Some(b),
         (None, None) => None,
@@ -324,6 +324,10 @@ impl SharedReactor {
         true
     }
 
+    pub fn reset_for_test(&self) {
+        *self.reactor.lock() = None;
+    }
+
     pub fn is_initialized(&self) -> bool {
         self.reactor.lock().is_some()
     }
@@ -398,7 +402,7 @@ impl SharedReactor {
 
         let reactor = self.initialized()?;
         let mut stats = RunStats::empty();
-        let timer_wakes: usize;
+        let mut timer_wakes: usize;
         let wake_report: WakeDispatchReport;
 
         // Phase 1: advance time & drain wakes through shared/local locks.
@@ -413,6 +417,8 @@ impl SharedReactor {
         loop {
             let poll_packet = {
                 let mut view = reactor.hart_runtime_view(hart);
+                timer_wakes =
+                    timer_wakes.saturating_add(view.advance_time_to(slice_clock.now_ns()));
                 view.drain_wakes_for_hart(hart, signal);
                 let Some((handle, slice)) = view.pick_next_or_steal_local(hart) else {
                     break;
@@ -433,6 +439,7 @@ impl SharedReactor {
                             hart.0,
                             Some(Arc::clone(&view.shared.delegate_registry)),
                         );
+                        crate::task::clear_current_task_yielded(hart.0);
                         Some((key, future, wake_state, slice))
                     }
                     Err(TakeRunnableError::Missing) => {
@@ -464,6 +471,7 @@ impl SharedReactor {
             let timing = PollTiming::start(slice, slice_clock);
             let result = future.as_mut().poll(&mut cx);
             let accounting = timing.finish(slice_clock);
+            let task_yielded = crate::task::take_current_task_yielded(hart.0);
 
             crate::task::set_current_mailbox(hart.0, None);
             crate::task::set_current_timer_wheel(hart.0, None);
@@ -520,6 +528,22 @@ impl SharedReactor {
                                 view.task_stopped_local(
                                     key.id(),
                                     StopReason::SliceExpired,
+                                    accounting.consumed_ns,
+                                    hart,
+                                );
+                                let _ = view.dispatch_queued_task_from_hart(key.id(), hart, signal);
+                            }
+                        } else if task_yielded {
+                            if view
+                                .shared
+                                .tasks
+                                .lock()
+                                .finish_polled_runnable(key, future, StopReason::Yielded)
+                                .is_ok()
+                            {
+                                view.task_stopped_local(
+                                    key.id(),
+                                    StopReason::Yielded,
                                     accounting.consumed_ns,
                                     hart,
                                 );
@@ -689,6 +713,7 @@ impl HartRuntimeView<'_> {
         };
         loop {
             let Some((key, mut future, wake_state, slice)) = ({
+                self.advance_time_to(slice_clock.now_ns());
                 self.drain_wakes_for_hart(hart, signal);
                 let Some((handle, slice)) = self.pick_next_or_steal_local(hart) else {
                     break;
@@ -709,6 +734,7 @@ impl HartRuntimeView<'_> {
                             hart.0,
                             Some(Arc::clone(&self.shared.delegate_registry)),
                         );
+                        crate::task::clear_current_task_yielded(hart.0);
                         Some((key, future, wake_state, slice))
                     }
                     Err(TakeRunnableError::Missing) => {
@@ -737,6 +763,7 @@ impl HartRuntimeView<'_> {
             let timing = PollTiming::start(slice, slice_clock);
             let result = future.as_mut().poll(&mut cx);
             let accounting = timing.finish(slice_clock);
+            let task_yielded = crate::task::take_current_task_yielded(hart.0);
             crate::task::set_current_mailbox(hart.0, None);
             crate::task::set_current_timer_wheel(hart.0, None);
             crate::task::set_current_delegate_registry(hart.0, None);
@@ -789,6 +816,22 @@ impl HartRuntimeView<'_> {
                             self.task_stopped_local(
                                 key.id(),
                                 StopReason::SliceExpired,
+                                accounting.consumed_ns,
+                                hart,
+                            );
+                            let _ = self.dispatch_queued_task_from_hart(key.id(), hart, signal);
+                        }
+                    } else if task_yielded {
+                        if self
+                            .shared
+                            .tasks
+                            .lock()
+                            .finish_polled_runnable(key, future, StopReason::Yielded)
+                            .is_ok()
+                        {
+                            self.task_stopped_local(
+                                key.id(),
+                                StopReason::Yielded,
                                 accounting.consumed_ns,
                                 hart,
                             );
@@ -1012,6 +1055,24 @@ impl HartRuntimeView<'_> {
                 wake_remote: hart != current_hart,
             },
             signal,
+        ))
+    }
+
+    pub fn step_hart_loop_at<S>(
+        &self,
+        hart: crate::HartId,
+        now_ns: u64,
+        signal: &mut S,
+    ) -> Option<crate::hart_loop::HartLoopStep>
+    where
+        S: crate::dispatch::RescheduleSignal,
+    {
+        let mut view = HartRuntimeView {
+            shared: self.shared,
+            locals: self.locals,
+        };
+        Some(crate::hart_loop::step_hart_loop_at(
+            &mut view, hart, now_ns, signal,
         ))
     }
 }

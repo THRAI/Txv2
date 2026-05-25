@@ -246,6 +246,7 @@ fn run_read(file: &Cap<OpenFile>, out: &mut [u8]) -> Result<usize, i64> {
             let mut op = OpenFileReadOp {
                 file,
                 out: &mut out[total..],
+                caller_netns: None,
                 cursor: 0,
             };
             op.step(&mut script_ctx)
@@ -276,7 +277,7 @@ fn run_read(file: &Cap<OpenFile>, out: &mut [u8]) -> Result<usize, i64> {
                 if total > 0 {
                     return Ok(total);
                 }
-                return Err(-(super::errno_to_i32(v3errno.into()) as i64));
+                return Err(-(super::errno_to_i32(v3errno) as i64));
             }
         }
     }
@@ -292,6 +293,7 @@ fn run_write(file: &Cap<OpenFile>, bytes: &[u8]) -> Result<usize, i64> {
             let mut op = OpenFileWriteOp {
                 file,
                 bytes: remaining,
+                caller_netns: None,
                 cursor: 0,
             };
             op.step(&mut script_ctx)
@@ -318,7 +320,7 @@ fn run_write(file: &Cap<OpenFile>, bytes: &[u8]) -> Result<usize, i64> {
                 if total > 0 {
                     return Ok(total);
                 }
-                return Err(-(super::errno_to_i32(v3errno.into()) as i64));
+                return Err(-(super::errno_to_i32(v3errno) as i64));
             }
         }
     }

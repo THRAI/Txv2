@@ -33,6 +33,7 @@ tx-services = { path = "../tx-services" }
 # after the leader thread zombifies so a host-side `cargo xtask observe
 # extract` can recover the captured `.txtrace` blob from the serial log.
 tx-observe = { path = "../tx-observe" }
+smoltcp = { path = "../../external/smoltcp-asterinas", default-features = false, features = ["alloc", "medium-ip", "proto-ipv4"] }
 
 [dev-dependencies]
 # `test-support` opens `tx_subsystems::cross_crate_test_support`, which

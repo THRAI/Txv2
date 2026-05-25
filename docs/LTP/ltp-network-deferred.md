@@ -1,16 +1,45 @@
 # LTP network/socket deferred cases
 
-This file records LTP cases that are intentionally ignored during the current
-non-network bringup pass. They are not considered solved. Keep them out of fast
-debug batches, then revisit them when the socket/network module becomes a
-target.
+This file records LTP socket/network cases that are excluded from the normal
+non-network syscall batches. They are not considered solved. When the
+socket/network module is the current target, run them explicitly with
+`OSCOMP_LTP=...` instead of relying on `LTP_BATCH=net`.
 
 ## Policy
 
-- Do not spend current LTP iteration time on socket/network-dependent cases.
-- Keep them documented here instead of silently dropping them.
-- Manual `OSCOMP_LTP=...` can still run any case for investigation.
+- Keep socket/network cases out of the ordinary non-network batches so they do
+  not destabilize VFS/VM/process bring-up.
+- Do not interpret `make ltp-batches` showing `net 0` as "no network tests";
+  it means the 50 known network/socket syscall entries are filtered from the
+  active batch view.
+- Run focused network work with `OSCOMP_LTP=...`, for example
+  `OSCOMP_LTP=socket01,socket02,listen01`.
 - Batch filtering in `tools/ltp-batches.py` skips these during normal batch runs.
+
+## Syscalls Inventory
+
+The current OSComp LTP `runtest/syscalls` list contains 50 socket/network
+entries before filtering:
+
+- `accept`: `accept01`, `accept02`, `accept03`, `accept4_01`
+- `bind`: `bind01`, `bind02`, `bind03`, `bind04`, `bind05`, `bind06`
+- `connect`: `connect01`, `connect02`
+- `getpeername`: `getpeername01`
+- `getsockname`: `getsockname01`
+- `getsockopt`: `getsockopt01`, `getsockopt02`
+- `listen`: `listen01`
+- `recv`: `recv01`
+- `recvfrom`: `recvfrom01`
+- `recvmmsg`: `recvmmsg01`
+- `recvmsg`: `recvmsg01`, `recvmsg02`, `recvmsg03`
+- `send`: `send01`, `send02`
+- `sendmmsg`: `sendmmsg01`, `sendmmsg02`
+- `sendmsg`: `sendmsg01`, `sendmsg02`, `sendmsg03`
+- `sendto`: `sendto01`, `sendto02`, `sendto03`
+- `setsockopt`: `setsockopt01` through `setsockopt10`
+- `socket`: `socket01`, `socket02`
+- `socketcall`: `socketcall01`, `socketcall02`, `socketcall03`
+- `socketpair`: `socketpair01`, `socketpair02`
 
 ## Deferred socket/network prefixes
 

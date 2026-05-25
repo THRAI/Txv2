@@ -11,6 +11,7 @@
 //!   device.rs, execution.rs, and initramfs/mod.rs.
 //! * `wait_routing` — reactor: Channel, Mask, WaitFuture. Used by
 //!   wait_source.rs.
+//! * `wait_mailbox` — substrate wake mailbox types used by wait_source.rs.
 
 use tx_platform_adapter::platform_adapter;
 
@@ -41,5 +42,16 @@ pub mod step_engine {
     reason = "wrap reactor Channel/Mask/WaitFuture used by wait_source.rs registry"
 )]
 pub mod wait_routing {
-    pub use tx_reactor::wait::{Channel, Mask, WaitFuture};
+    pub use tx_reactor::wait::{Channel, Mask, WaitFuture, WaitOutcome};
+}
+
+#[platform_adapter(
+    platform = "substrate",
+    domain = "wait_routing",
+    apis = ["step", "wake"],
+    reason = "wrap substrate wake mailbox primitives and InterestMask used by wait_source.rs RawQueue/RawPort futures"
+)]
+pub mod wait_mailbox {
+    pub use tx_substrate::step::InterestMask;
+    pub use tx_substrate::wake::mailbox::{ActiveWait, TaskMailbox};
 }

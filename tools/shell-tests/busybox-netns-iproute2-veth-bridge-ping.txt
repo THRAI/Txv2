@@ -1,0 +1,132 @@
+# busybox-netns-iproute2-veth-bridge-ping.txt — N72C/D bridge data-plane smoke.
+#
+# This extends the N71M3 control-plane shape with packet-carrying checks:
+# - container A eth0 pings host docker0 at 172.17.0.1.
+# - container A eth0 pings container B eth0 through docker0.
+# - ip route and ip neigh can see the connected route and ARP neighbors.
+
+wait "/ # " within 30000
+sleep 500
+
+send "/bin/netns-helper hold &\n"
+expect "tx-netns-holder-ready" within 10000
+expect "/ # " within 10000
+
+send "target_a=$!; echo N72C_TARGET_A_$target_a\n"
+expect "N72C_TARGET_A_" within 5000
+expect "/ # " within 5000
+
+send "/bin/netns-helper hold &\n"
+expect "tx-netns-holder-ready" within 10000
+expect "/ # " within 10000
+
+send "target_b=$!; echo N72C_TARGET_B_$target_b\n"
+expect "N72C_TARGET_B_" within 5000
+expect "/ # " within 5000
+
+send "m=N72C; if /bin/busybox ip link add name docker0 type bridge; then echo ${m}_BRIDGE_CREATED; else echo ${m}_FAIL_BRIDGE_CREATE; fi\n"
+expect "N72C_BRIDGE_CREATED" within 15000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip addr add 172.17.0.1/16 dev docker0; then echo ${m}_BRIDGE_ADDR; else echo ${m}_FAIL_BRIDGE_ADDR; fi\n"
+expect "N72C_BRIDGE_ADDR" within 15000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip link set docker0 up; then echo ${m}_BRIDGE_UP; else echo ${m}_FAIL_BRIDGE_UP; fi\n"
+expect "N72C_BRIDGE_UP" within 15000
+expect "/ # " within 10000
+
+send "if echo 'masquerade 172.17.0.0/16 docker0' > /proc/net/tx_nf_rules; then echo ${m}_NF_MASQ_ADDED; else echo ${m}_FAIL_NF_MASQ_ADD; fi\n"
+expect "N72C_NF_MASQ_ADDED" within 10000
+expect "/ # " within 10000
+
+send "cat /proc/net/tx_nf_rules\n"
+expect "MASQUERADE" within 10000
+expect "docker0" within 10000
+expect "/ # " within 10000
+
+send "if echo 'delete 0' > /proc/net/tx_nf_rules; then echo ${m}_NF_MASQ_DELETED; else echo ${m}_FAIL_NF_MASQ_DELETE; fi\n"
+expect "N72C_NF_MASQ_DELETED" within 10000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip link add veth0 type veth peer name eth0; then echo ${m}_VETH_A_CREATED; else echo ${m}_FAIL_VETH_A_CREATE; fi\n"
+expect "N72C_VETH_A_CREATED" within 15000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip link set dev veth0 master docker0 || /bin/netns-helper master veth0 docker0; then echo ${m}_VETH_A_MASTER; else echo ${m}_FAIL_VETH_A_MASTER; fi\n"
+expect "N72C_VETH_A_MASTER" within 15000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip link set veth0 up; then echo ${m}_VETH_A_UP; else echo ${m}_FAIL_VETH_A_UP; fi\n"
+expect "N72C_VETH_A_UP" within 15000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip link set eth0 netns $target_a || /bin/netns-helper netns eth0 $target_a; then echo ${m}_ETH_A_MOVED; else echo ${m}_FAIL_ETH_A_MOVE; fi\n"
+expect "N72C_ETH_A_MOVED" within 15000
+expect "/ # " within 10000
+
+send "if /bin/netns-helper exec $target_a /bin/busybox ip link set eth0 up; then echo ${m}_ETH_A_UP; else echo ${m}_FAIL_ETH_A_UP; fi\n"
+expect "N72C_ETH_A_UP" within 15000
+expect "/ # " within 10000
+
+send "if /bin/netns-helper exec $target_a /bin/busybox ip addr add 172.17.0.2/16 dev eth0; then echo ${m}_ETH_A_ADDR; else echo ${m}_FAIL_ETH_A_ADDR; fi\n"
+expect "N72C_ETH_A_ADDR" within 15000
+expect "/ # " within 10000
+
+send "if /bin/netns-helper exec $target_a /bin/busybox ip route add default via 172.17.0.1 dev eth0; then echo ${m}_ETH_A_DEFAULT_ROUTE; else echo ${m}_FAIL_ETH_A_DEFAULT_ROUTE; fi\n"
+expect "N72C_ETH_A_DEFAULT_ROUTE" within 15000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip link add veth1 type veth peer name eth0; then echo ${m}_VETH_B_CREATED; else echo ${m}_FAIL_VETH_B_CREATE; fi\n"
+expect "N72C_VETH_B_CREATED" within 15000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip link set dev veth1 master docker0 || /bin/netns-helper master veth1 docker0; then echo ${m}_VETH_B_MASTER; else echo ${m}_FAIL_VETH_B_MASTER; fi\n"
+expect "N72C_VETH_B_MASTER" within 15000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip link set veth1 up; then echo ${m}_VETH_B_UP; else echo ${m}_FAIL_VETH_B_UP; fi\n"
+expect "N72C_VETH_B_UP" within 15000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip link set eth0 netns $target_b || /bin/netns-helper netns eth0 $target_b; then echo ${m}_ETH_B_MOVED; else echo ${m}_FAIL_ETH_B_MOVE; fi\n"
+expect "N72C_ETH_B_MOVED" within 15000
+expect "/ # " within 10000
+
+send "if /bin/netns-helper exec $target_b /bin/busybox ip link set eth0 up; then echo ${m}_ETH_B_UP; else echo ${m}_FAIL_ETH_B_UP; fi\n"
+expect "N72C_ETH_B_UP" within 15000
+expect "/ # " within 10000
+
+send "if /bin/netns-helper exec $target_b /bin/busybox ip addr add 172.17.0.3/16 dev eth0; then echo ${m}_ETH_B_ADDR; else echo ${m}_FAIL_ETH_B_ADDR; fi\n"
+expect "N72C_ETH_B_ADDR" within 15000
+expect "/ # " within 10000
+
+send "if /bin/netns-helper exec $target_b /bin/busybox ip route add default via 172.17.0.1 dev eth0; then echo ${m}_ETH_B_DEFAULT_ROUTE; else echo ${m}_FAIL_ETH_B_DEFAULT_ROUTE; fi\n"
+expect "N72C_ETH_B_DEFAULT_ROUTE" within 15000
+expect "/ # " within 10000
+
+send "/bin/netns-helper exec $target_a /bin/busybox ip route\n"
+expect "172.17.0.0" within 10000
+expect "default" within 10000
+expect "eth0" within 10000
+expect "/ # " within 10000
+
+send "if /bin/netns-helper exec $target_a /bin/busybox ping -c 1 -W 5 172.17.0.1; then echo ${m}_PING_HOST_OK; else echo ${m}_FAIL_PING_HOST; fi\n"
+expect "N72C_PING_HOST_OK" within 30000
+expect "/ # " within 10000
+
+send "if /bin/netns-helper exec $target_a /bin/busybox ping -c 1 -W 5 172.17.0.3; then echo ${m}_PING_PEER_OK; else echo ${m}_FAIL_PING_PEER; fi\n"
+expect "N72C_PING_PEER_OK" within 30000
+expect "/ # " within 10000
+
+send "/bin/netns-helper exec $target_a /bin/busybox ip neigh\n"
+expect "172.17.0.1" within 10000
+expect "172.17.0.3" within 10000
+expect "/ # " within 10000
+
+send "kill $target_a $target_b; echo ${m}_BRIDGE_PING_SUCCESS\n"
+expect "N72C_BRIDGE_PING_SUCCESS" within 5000
+expect "/ # " within 5000
+
+sleep 500
+quit
