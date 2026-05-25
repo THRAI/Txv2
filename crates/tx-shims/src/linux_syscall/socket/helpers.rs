@@ -1106,6 +1106,56 @@ pub(super) fn read_sockopt_i32<'a>(
     bootstrap_read_user(&ctx.aspace, optval)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PacketRxRingReq {
+    pub block_size: u32,
+    pub block_nr: u32,
+    pub frame_size: u32,
+    pub frame_nr: u32,
+    pub sizeof_priv: u32,
+}
+
+pub(super) fn read_packet_rx_ring_req<'a>(
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<PacketRxRingReq, Errno> {
+    if optval == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if optlen < 16 {
+        return Err(Errno::EINVAL);
+    }
+
+    let copy_len = core::cmp::min(optlen as usize, 28);
+    let mut bytes = [0u8; 28];
+    bootstrap_copy_from_user(&ctx.aspace, &mut bytes[..copy_len], optval)?;
+    Ok(PacketRxRingReq {
+        block_size: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+        block_nr: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        frame_size: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        frame_nr: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+        sizeof_priv: if optlen >= 24 {
+            u32::from_le_bytes(bytes[20..24].try_into().unwrap())
+        } else {
+            0
+        },
+    })
+}
+
+pub(super) fn validate_packet_rx_ring_req(req: PacketRxRingReq) -> Result<(), Errno> {
+    if req.block_nr == 0 && req.frame_nr == 0 {
+        return Ok(());
+    }
+    if req.block_size == 0 || req.block_nr == 0 || req.frame_size == 0 || req.frame_nr == 0 {
+        return Err(Errno::EINVAL);
+    }
+    if req.frame_size > req.block_size || req.sizeof_priv >= req.block_size {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
 pub(super) fn read_sockopt_ipv4_mcast_group_req<'a>(
     ctx: &SyscallCtx<'a>,
     optval: u64,
@@ -1297,6 +1347,15 @@ pub(super) fn invalid_socklen(len: u32) -> bool {
 }
 
 pub(super) fn socket_type_i32(socket: &Cap<SocketIdentity>) -> i32 {
+    if let Some(payload) = socket.acquire_operational() {
+        return match payload.with_options(|options| options.socket.sock_type) {
+            SocketType::Stream => 1,
+            SocketType::Dgram => 2,
+            SocketType::Raw => 3,
+            SocketType::SeqPacket => 5,
+        };
+    }
+
     match socket.kind {
         SocketKind::UnixStream => 1,
         SocketKind::UnixDatagram => 2,

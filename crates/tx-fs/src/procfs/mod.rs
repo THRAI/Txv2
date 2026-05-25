@@ -57,6 +57,14 @@ pub const PROCFS_NET_SNMP_ID: FsObjectId = FsObjectId::new(0x7072_6F1F);
 pub const PROCFS_NET_NETLINK_ID: FsObjectId = FsObjectId::new(0x7072_6F20);
 pub const PROCFS_NET_IF_INET6_ID: FsObjectId = FsObjectId::new(0x7072_6F21);
 pub const PROCFS_SYS_KERNEL_PID_MAX_ID: FsObjectId = FsObjectId::new(0x7072_6F22);
+pub const KERNEL_CONFIG_TEXT: &str = "CONFIG_EVENTFD=y\n\
+CONFIG_TIME_NS=y\n\
+CONFIG_HIGH_RES_TIMERS=y\n\
+CONFIG_NET_NS=y\n\
+# CONFIG_USER_NS is not set\n\
+# CONFIG_NETFILTER_XT_MATCH_STATE is not set\n\
+# CONFIG_IP_NF_TARGET_REJECT is not set\n\
+# CONFIG_TLS is not set\n";
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 const PROCFS_PID_OBJECT_STRIDE: u64 = 0x100;
 const PROCFS_PID_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x10000;
@@ -1352,6 +1360,25 @@ mod tests {
         assert!(meminfo.contains("MemAvailable:"));
         assert!(meminfo.contains("Cached:"));
         assert!(meminfo.contains("SwapFree:"));
+    }
+
+    #[test]
+    fn procfs_kernel_config_includes_ltp_required_surface() {
+        tx_test_support::init_host();
+        let procfs = Procfs::new();
+        let guard = adapter::step_engine::guard();
+        let mut out = [0u8; 512];
+        let read = match procfs.step_read_projected(PROCFS_CONFIG_ID, 0, &mut out, &guard) {
+            StepOutcome::Done(read) => read as usize,
+            other => panic!("procfs config read returned {other:?}"),
+        };
+        let config = core::str::from_utf8(&out[..read]).expect("config utf8");
+        assert_eq!(config, KERNEL_CONFIG_TEXT);
+        assert!(config.contains("CONFIG_NET_NS=y\n"));
+        assert!(config.contains("# CONFIG_USER_NS is not set\n"));
+        assert!(config.contains("# CONFIG_TLS is not set\n"));
+        assert!(config.contains("# CONFIG_NETFILTER_XT_MATCH_STATE is not set\n"));
+        assert!(config.contains("# CONFIG_IP_NF_TARGET_REJECT is not set\n"));
     }
 
     #[test]

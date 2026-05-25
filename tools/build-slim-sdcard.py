@@ -222,6 +222,17 @@ BUSYBOX_FILES = ["busybox"]
 BUSYBOX_APPLET_COPIES = ["ip", "ifconfig"]
 
 
+def unique_preserve_order(items):
+    seen = set()
+    ordered = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
 # ── case listing ──────────────────────────────────────────────────────────
 
 def list_basic_cases(debugfs, image):
@@ -491,20 +502,20 @@ def build_slim_sdcard(config: SlimConfig):
         if name == "ltp-musl":
             cases = suite.cases or config.ltp_cases
             if cases:
-                ltp_binaries = set(cases)
+                ltp_binaries = unique_preserve_order(cases)
                 dirs.update(sd.get("infra_dirs", []))
                 files.update(sd.get("infra_files", []))
-                custom_testcodes["ltp_testcode.sh"] = gen_ltp_testcode(list(ltp_binaries))
+                custom_testcodes["ltp_testcode.sh"] = gen_ltp_testcode(ltp_binaries)
             else:
                 dirs.update(sd["dirs"])
         elif name == "ltp-glibc":
             cases = suite.cases or config.ltp_cases
             if cases:
-                glibc_ltp_binaries = set(cases)
+                glibc_ltp_binaries = unique_preserve_order(cases)
                 glibc_dirs.update(sd.get("infra_dirs", []))
                 glibc_files.update(sd.get("infra_files", []))
                 glibc_custom_testcodes["ltp_testcode.sh"] = gen_ltp_glibc_testcode(
-                    list(glibc_ltp_binaries)
+                    glibc_ltp_binaries
                 )
             else:
                 glibc_dirs.update(sd["dirs"])
@@ -809,7 +820,11 @@ def main():
     if args.config:
         config = parse_config(args.config)
     elif args.suites:
-        ltp_cases = args.ltp_cases.split(",") if args.ltp_cases else []
+        ltp_cases = (
+            [case.strip() for case in args.ltp_cases.split(",") if case.strip()]
+            if args.ltp_cases
+            else []
+        )
         suites = [SuiteConfig(name=s) for s in args.suites]
         config = SlimConfig(
             source=src,

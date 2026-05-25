@@ -1420,12 +1420,28 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.socket.send_buf_size = size);
             Ok(())
         }
+        (SOL_SOCKET, SO_SNDBUFFORCE) => {
+            let raw_size = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(size) => size as u32,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let size = core::cmp::min(raw_size as usize, i32::MAX as usize);
+            payload.with_options_mut(|opts| opts.socket.send_buf_size = size);
+            Ok(())
+        }
         (SOL_SOCKET, SO_RCVBUF) => {
             let size = match read_sockopt_positive_usize(ctx, optval, optlen) {
                 Ok(size) => size,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
             payload.with_options_mut(|opts| opts.socket.recv_buf_size = size);
+            Ok(())
+        }
+        (SOL_SOCKET, SO_NO_CHECK) => {
+            let _ = match read_sockopt_bool(ctx, optval, optlen) {
+                Ok(on) => on,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
             Ok(())
         }
         (SOL_SOCKET, SO_LINGER) => {
@@ -1518,6 +1534,41 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         (IPPROTO_IP, IPT_SO_SET_REPLACE) | (IPPROTO_IP, IPT_SO_SET_ADD_COUNTERS) => {
             Err(Errno::EOPNOTSUPP)
         }
+        (SOL_PACKET, PACKET_VERSION) => {
+            if socket.kind != SocketKind::Packet {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            let version = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(version) => version,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            if !(TPACKET_V1..=TPACKET_V3).contains(&version) {
+                Err(Errno::EINVAL)
+            } else {
+                payload.set_packet_version(version)
+            }
+        }
+        (SOL_PACKET, PACKET_RESERVE) => {
+            if socket.kind != SocketKind::Packet {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            let reserve = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(reserve) if reserve >= 0 => reserve as u32,
+                Ok(_) => return SyscallResult::Error(errno_to_i32(Errno::EINVAL)),
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            payload.set_packet_reserve(reserve)
+        }
+        (SOL_PACKET, PACKET_RX_RING) => {
+            if socket.kind != SocketKind::Packet {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            let req = match read_packet_rx_ring_req(ctx, optval, optlen) {
+                Ok(req) => req,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            validate_packet_rx_ring_req(req)
+        }
         _ => Err(Errno::ENOPROTOOPT),
     };
 
@@ -1574,6 +1625,12 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options(|o| o.socket.broadcast as i32),
         ),
         (SOL_SOCKET, SO_SNDBUF) => write_sockopt_i32(
+            ctx,
+            optval,
+            optlen_ptr,
+            payload.with_options(|o| o.socket.send_buf_size as i32),
+        ),
+        (SOL_SOCKET, SO_SNDBUFFORCE) => write_sockopt_i32(
             ctx,
             optval,
             optlen_ptr,
@@ -1647,8 +1704,16 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         (IPPROTO_IP, IPT_SO_GET_ENTRIES) => {
             write_sockopt_bytes(ctx, optval, optlen_ptr, &[0u8; IPT_GET_ENTRIES_EMPTY_BYTES])
         }
+        (SOL_PACKET, PACKET_RESERVE) if socket.kind == SocketKind::Packet => {
+            match payload.packet_reserve() {
+                Ok(reserve) => write_sockopt_i32(ctx, optval, optlen_ptr, reserve as i32),
+                Err(errno) => Err(errno),
+            }
+        }
         (IPPROTO_UDP, _) => Err(Errno::EOPNOTSUPP),
-        (SOL_SOCKET | IPPROTO_IP | IPPROTO_TCP | SOL_NETLINK, _) => Err(Errno::ENOPROTOOPT),
+        (SOL_SOCKET | IPPROTO_IP | IPPROTO_TCP | SOL_NETLINK | SOL_PACKET, _) => {
+            Err(Errno::ENOPROTOOPT)
+        }
         _ => Err(Errno::EOPNOTSUPP),
     };
 

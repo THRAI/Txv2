@@ -871,6 +871,49 @@ fn dispatch_udp_default_send_buffer_can_hold_loopback_datagram() {
 }
 
 #[test]
+fn dispatch_so_sndbufforce_clamps_large_unsigned_value() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let sndbuf = 0xffffff00u32;
+
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_SNDBUFFORCE as u64,
+                (&sndbuf as *const u32) as u64,
+                core::mem::size_of::<u32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut rec_sndbuf: i32 = 0;
+    let mut optlen = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_SNDBUF as u64,
+                (&mut rec_sndbuf as *mut i32) as u64,
+                (&mut optlen as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert!(rec_sndbuf >= 0);
+}
+
+#[test]
 fn dispatch_setsockopt_getsockopt_round_trips_reuseaddr() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();

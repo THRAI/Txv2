@@ -1,3 +1,82 @@
+- 2026-05-25 **Added IPv4 UDP-Lite coverage for LTP `bind05`.** Mapped
+  `AF_INET/SOCK_DGRAM/IPPROTO_UDPLITE` to the existing UDP-like datagram path
+  and added host coverage for the socket type mapping. The focused `bind05`
+  witness now scores `8/9`: AF_UNIX, IPv4 UDP, and IPv4 UDP-Lite loopback /
+  wildcard datagram communication pass; the remaining subcase is the broader
+  IPv6 `EAFNOSUPPORT` gap. The bind/connect/accept split improves from
+  `62/77` to `66/81`, and the current 50-case split total is `190/221`.
+  **Verification:** `cargo test -p tx-subsystems
+  socket_type_validation_maps_to_kind -- --test-threads=1`; `cargo test -p
+  tx-shims dispatch_udplite_socket_reports_datagram_type -- --test-threads=1`;
+  `cargo xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu`; 30s LTP `bind05` log
+  `target/oscomp/ltp-net-bind05-after-udplite.txt`; 30s b4 log
+  `target/oscomp/ltp-net-b4-bind-connect-accept-after-udplite.txt`; local
+  judge. **Next step:** choose between broader user namespace setup and
+  remaining network protocol surfaces such as IPv6/SCTP/RDS/TLS/netfilter.
+  **Blocker:** IPv6 remains unsupported and is the only remaining `bind05`
+  subcase blocker.
+
+- 2026-05-25 **Resolved the LTP kernel-config visibility blocker for
+  syscall-network cases.** Boot now creates `/boot/config-6.1.0-txkernel`
+  from shared `tx_fs::procfs::KERNEL_CONFIG_TEXT`, while `/proc/config` renders
+  the same conservative config. LTP now parses that file instead of breaking
+  with `Cannot parse kernel .config`; the affected cases become honest
+  `TCONF` skips for unsupported `CONFIG_USER_NS`, TLS, or netfilter support.
+  The main split scores stay `186/217` because those surfaces remain out of
+  scope for a small network patch: b4 remains `62/77` and b6 remains `4/11`.
+  **Verification:** `cargo test -p tx-fs
+  procfs_kernel_config_includes_ltp_required_surface -- --test-threads=1`;
+  `cargo xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu`; 30s LTP kconfig probe
+  `target/oscomp/ltp-net-kconfig-after-config-file.txt`; b4 reconfirm
+  `target/oscomp/ltp-net-b4-bind-connect-accept-after-kconfig-file.txt`; b6
+  reconfirm `target/oscomp/ltp-net-b6-setsockopt-tail-after-kconfig-file.txt`;
+  local judge. **Next step:** decide whether to charter user namespace setup as
+  a broader process/procfs/credential change, or stay in narrower network
+  protocol gaps such as IPv6/SCTP/UDP-Lite/RDS/TLS/netfilter. **Blocker:**
+  user namespace is not a small socket fix and should not be faked by flipping
+  config bits.
+
+- 2026-05-25 **Advanced the LTP syscall-network split batches past the AF_UNIX
+  and packet-option blockers.** The six focused logs now cover all 50 manual
+  socket/network syscall cases with a local judge subcase total of `186/217`:
+  b1 basic `40/40`, b2 send/recv `32/34`, b3 msg/mmsg `34/38`, b4
+  bind/connect/accept `62/77`, b5 socketpair/socketcall `14/17`, and b6
+  setsockopt tail `4/11`. The runner now preserves explicit LTP case order in
+  `tools/build-slim-sdcard.py`, AF_UNIX `SOCK_SEQPACKET` reports `SO_TYPE=5`
+  and maps to the local stream path, abstract AF_UNIX names are removed on
+  close, and packet `PACKET_VERSION`/`PACKET_RX_RING`/`PACKET_RESERVE` plus
+  `SO_SNDBUFFORCE` now satisfy `setsockopt02` and `setsockopt04`. **Verification:**
+  focused host tests for seqpacket, abstract close/rebind, pathname close
+  retention, packet-ring option validation, and send-buffer force clamping;
+  `cargo xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu`; local judge on the b4/b5/b6 logs listed in
+  `docs/LTP/ltp-network-syscall-progress.md`. **Next step:** fix or classify
+  the shared kernel `.config` visibility blocker for `bind06`, `sendto03`,
+  `sendmsg03`, and `setsockopt05..10` before spending time on IPv6/SCTP/RDS
+  protocol gaps. **Blocker:** `.config` parsing currently fails before those
+  cases exercise their socket semantics.
+
+- 2026-05-25 **Recorded the current LTP syscall-network checkpoint and debug
+  discipline.** Added `docs/LTP/ltp-network-syscall-progress.md` as the
+  handoff ledger for the 50 manual OSComp LTP socket/network syscall cases:
+  current reliable focused scores are basic `40/40`, send/recv `32/34`,
+  msg/mmsg `34/38`, socketpair/getpeername `21/21`, and AF_UNIX bind follow-up
+  `13/15`; the older full-list probe is explicitly marked non-authoritative
+  because boot arguments truncated near `send01+s`. Added
+  `tx-ltp-timeout-ladder` to force focused 30s-first LTP/OSComp runs and
+  `tx-debug-logbook` to require detailed symptom/root-cause/fix/verification
+  logs under the untracked `msp/debug-logs/` area after debugging, with only
+  concise repo-tracked summaries in progress docs. **Verification:** re-scored the saved LTP network logs
+  with `tools/oscomp-judge.py`; `cargo xtask progress validate`; checked skill
+  metadata and markdown references by grep/readback. **Next step:** rerun the
+  bind/connect/accept split with `timeout 30s` and then fix the first semantic
+  failure, likely AF_UNIX `SOCK_SEQPACKET` for `bind04` if that remains the
+  top non-environment blocker. **Blocker:** `.agents/skills` is read-only in
+  the default sandbox, so creating the new skill directories required an
+  approved scoped `mkdir -p`; `msp/` remains untracked and must not be added.
+
 - 2026-05-25 **Stabilized focused OSComp iperf/netperf after the network PR
   update.** Reproduced the flaky `iperf-musl` behavior: runs could pass once
   and then hang at `BASIC_TCP` or `PARALLEL_TCP`, while `iperf-glibc` advanced

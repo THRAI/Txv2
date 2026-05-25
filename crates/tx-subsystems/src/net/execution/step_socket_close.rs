@@ -75,11 +75,11 @@ pub fn step_socket_close(
             bindings_withdrawn += withdraw_ok(table.withdraw_raw_icmp(socket.raw()));
         }
         SocketProtocol::UnixDatagram(UnixDatagramState::Bound { local }) => {
-            bindings_withdrawn += withdraw_ok(table.withdraw_unix_bound(local));
+            bindings_withdrawn += withdraw_unix_binding_on_close(table, local);
         }
         SocketProtocol::UnixDatagram(UnixDatagramState::Connected { local, .. }) => {
             if let Some(local) = local {
-                bindings_withdrawn += withdraw_ok(table.withdraw_unix_bound(local));
+                bindings_withdrawn += withdraw_unix_binding_on_close(table, local);
             }
         }
         SocketProtocol::UnixDatagram(UnixDatagramState::ConnectedPair { peer_raw }) => {
@@ -94,7 +94,7 @@ pub fn step_socket_close(
         SocketProtocol::UnixDatagram(UnixDatagramState::Unbound) => {}
         SocketProtocol::UnixStream(UnixStreamState::Bound { local })
         | SocketProtocol::UnixStream(UnixStreamState::Listening { local, .. }) => {
-            bindings_withdrawn += withdraw_ok(table.withdraw_unix_bound(local));
+            bindings_withdrawn += withdraw_unix_binding_on_close(table, local);
         }
         SocketProtocol::UnixStream(UnixStreamState::Connected { peer_raw, .. }) => {
             if let Some(peer) = table.lookup_unix_stream_peer(socket.raw(), guard) {
@@ -189,6 +189,17 @@ fn mark_tcp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
 
 fn withdraw_ok<T>(result: Result<T, tx_substrate::mutation::MutationError>) -> usize {
     usize::from(result.is_ok())
+}
+
+fn withdraw_unix_binding_on_close(
+    table: &SocketTable,
+    local: crate::net::structure::UnixSocketPath,
+) -> usize {
+    if local.is_abstract() {
+        withdraw_ok(table.unlink_unix_path(local))
+    } else {
+        withdraw_ok(table.withdraw_unix_bound(local))
+    }
 }
 
 fn withdraw_udp_bound_if_owner(

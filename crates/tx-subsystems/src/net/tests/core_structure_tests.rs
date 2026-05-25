@@ -116,8 +116,10 @@ fn endpoint_orders_by_addr_and_port() {
 fn socket_type_validation_maps_to_kind() {
     let unix_dgram = ValidSocketType::validate(1, 2, 0).expect("unix dgram socket");
     let unix_stream = ValidSocketType::validate(1, 1, 0).expect("unix stream socket");
+    let unix_seqpacket = ValidSocketType::validate(1, 5, 0).expect("unix seqpacket socket");
     let stream = ValidSocketType::validate(2, 1, 6).expect("tcp socket");
     let dgram = ValidSocketType::validate(2, 2, 17).expect("udp socket");
+    let dgram_udplite = ValidSocketType::validate(2, 2, 136).expect("udplite socket");
     let dgram_icmp = ValidSocketType::validate(2, 2, 1).expect("ping socket");
     let raw_icmp = ValidSocketType::validate(2, 3, 1).expect("raw icmp socket");
     let nft = ValidSocketType::validate(16, 3, 12).expect("netlink netfilter socket");
@@ -133,6 +135,11 @@ fn socket_type_validation_maps_to_kind() {
         SocketKind::from_valid_socket_type(unix_stream),
         Ok(SocketKind::UnixStream)
     );
+    assert_eq!(unix_seqpacket.sock_type, SocketType::SeqPacket);
+    assert_eq!(
+        SocketKind::from_valid_socket_type(unix_seqpacket),
+        Ok(SocketKind::UnixStream)
+    );
     assert_eq!(stream.sock_type, SocketType::Stream);
     assert_eq!(
         SocketKind::from_valid_socket_type(stream),
@@ -141,6 +148,10 @@ fn socket_type_validation_maps_to_kind() {
     assert_eq!(dgram.sock_type, SocketType::Dgram);
     assert_eq!(
         SocketKind::from_valid_socket_type(dgram),
+        Ok(SocketKind::Udp)
+    );
+    assert_eq!(
+        SocketKind::from_valid_socket_type(dgram_udplite),
         Ok(SocketKind::Udp)
     );
     assert_eq!(
@@ -180,6 +191,14 @@ fn socket_type_validation_maps_to_kind() {
         SocketKind::from_valid_socket_type(raw_default),
         Err(Errno::EPROTONOSUPPORT)
     );
+    let inet_seqpacket = ValidSocketType::validate(2, 5, 0).expect("inet seqpacket tuple");
+    assert_eq!(
+        SocketKind::from_valid_socket_type(inet_seqpacket),
+        Err(Errno::EPROTONOSUPPORT)
+    );
+    let unix_options =
+        SocketOptionSet::for_valid_socket_type(unix_seqpacket, SocketKind::UnixStream);
+    assert_eq!(unix_options.socket.sock_type, SocketType::SeqPacket);
 }
 
 #[test]

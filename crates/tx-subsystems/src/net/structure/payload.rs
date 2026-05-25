@@ -226,6 +226,37 @@ impl SocketPayload {
         .ok_or(crate::execution::Errno::EINVAL)
     }
 
+    pub fn set_packet_version(&self, version: i32) -> Result<(), crate::execution::Errno> {
+        self.with_protocol_mut(|socket_protocol| match socket_protocol {
+            SocketProtocol::Packet(state) => {
+                state.packet_version = version;
+                true
+            }
+            _ => false,
+        })
+        .then_some(())
+        .ok_or(crate::execution::Errno::EINVAL)
+    }
+
+    pub fn set_packet_reserve(&self, reserve: u32) -> Result<(), crate::execution::Errno> {
+        self.with_protocol_mut(|socket_protocol| match socket_protocol {
+            SocketProtocol::Packet(state) => {
+                state.packet_reserve = reserve;
+                true
+            }
+            _ => false,
+        })
+        .then_some(())
+        .ok_or(crate::execution::Errno::EINVAL)
+    }
+
+    pub fn packet_reserve(&self) -> Result<u32, crate::execution::Errno> {
+        match self.protocol_snapshot() {
+            SocketProtocol::Packet(state) => Ok(state.packet_reserve),
+            _ => Err(crate::execution::Errno::EINVAL),
+        }
+    }
+
     pub(crate) fn with_protocol<R>(&self, f: impl FnOnce(&SocketProtocol) -> R) -> R {
         f(&self.protocol.lock())
     }

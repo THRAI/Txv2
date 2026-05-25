@@ -17,6 +17,7 @@ pub enum SocketType {
     Stream,
     Dgram,
     Raw,
+    SeqPacket,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -78,6 +79,7 @@ impl ValidSocketType {
             1 => SocketType::Stream,
             2 => SocketType::Dgram,
             3 => SocketType::Raw,
+            5 => SocketType::SeqPacket,
             _ => return Err(Errno::EINVAL),
         };
 
@@ -107,9 +109,11 @@ impl SocketKind {
     pub fn from_valid_socket_type(valid: ValidSocketType) -> Result<Self, Errno> {
         match (valid.domain, valid.sock_type, valid.protocol) {
             (AddressFamily::Unix, SocketType::Dgram, 0) => Ok(Self::UnixDatagram),
-            (AddressFamily::Unix, SocketType::Stream, 0) => Ok(Self::UnixStream),
+            (AddressFamily::Unix, SocketType::Stream | SocketType::SeqPacket, 0) => {
+                Ok(Self::UnixStream)
+            }
             (AddressFamily::Inet, SocketType::Stream, 0 | 6) => Ok(Self::Tcp),
-            (AddressFamily::Inet, SocketType::Dgram, 0 | 17) => Ok(Self::Udp),
+            (AddressFamily::Inet, SocketType::Dgram, 0 | 17 | 136) => Ok(Self::Udp),
             (AddressFamily::Inet, SocketType::Dgram, 1)
             | (AddressFamily::Inet, SocketType::Raw, 1) => Ok(Self::RawIcmp),
             (AddressFamily::Inet, _, _) => Err(Errno::EPROTONOSUPPORT),
@@ -375,6 +379,7 @@ pub struct SocketOptionSet {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SocketLevelOptions {
+    pub sock_type: SocketType,
     pub reuse_addr: bool,
     pub reuse_port: bool,
     pub dont_route: bool,
@@ -410,6 +415,7 @@ impl SocketOptionSet {
     pub const fn default_tcp() -> Self {
         Self {
             socket: SocketLevelOptions {
+                sock_type: SocketType::Stream,
                 reuse_addr: false,
                 reuse_port: false,
                 dont_route: false,
@@ -442,6 +448,7 @@ impl SocketOptionSet {
     pub const fn default_udp() -> Self {
         Self {
             socket: SocketLevelOptions {
+                sock_type: SocketType::Dgram,
                 reuse_addr: false,
                 reuse_port: false,
                 dont_route: false,
@@ -472,16 +479,30 @@ impl SocketOptionSet {
     }
 
     pub const fn for_kind(kind: SocketKind) -> Self {
-        match kind {
-            SocketKind::Tcp => Self::default_tcp(),
+        let mut options = match kind {
+            SocketKind::Tcp | SocketKind::UnixStream => Self::default_tcp(),
             SocketKind::UnixDatagram
-            | SocketKind::UnixStream
             | SocketKind::Udp
             | SocketKind::RawIcmp
             | SocketKind::NetlinkRoute
             | SocketKind::NetlinkNetfilter
             | SocketKind::Packet => Self::default_udp(),
-        }
+        };
+        options.socket.sock_type = match kind {
+            SocketKind::Tcp | SocketKind::UnixStream => SocketType::Stream,
+            SocketKind::UnixDatagram | SocketKind::Udp => SocketType::Dgram,
+            SocketKind::RawIcmp
+            | SocketKind::NetlinkRoute
+            | SocketKind::NetlinkNetfilter
+            | SocketKind::Packet => SocketType::Raw,
+        };
+        options
+    }
+
+    pub const fn for_valid_socket_type(valid: ValidSocketType, kind: SocketKind) -> Self {
+        let mut options = Self::for_kind(kind);
+        options.socket.sock_type = valid.sock_type;
+        options
     }
 }
 
@@ -588,6 +609,8 @@ impl RawIcmpState {
 pub struct PacketSocketState {
     pub protocol: u16,
     pub ifindex: Option<i32>,
+    pub packet_version: i32,
+    pub packet_reserve: u32,
 }
 
 impl PacketSocketState {
@@ -595,6 +618,8 @@ impl PacketSocketState {
         Self {
             protocol,
             ifindex: None,
+            packet_version: 0,
+            packet_reserve: 0,
         }
     }
 

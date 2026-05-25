@@ -44,7 +44,11 @@ pub fn step_socket_create_in_namespace(
     let identity = zone::sign_for(identity_res, SocketIdentity::new(kind));
     let payload = PayloadCap::from_cap(zone::sign_for(
         payload_res,
-        SocketPayload::new_in_namespace(kind, SocketOptionSet::for_kind(kind), net_namespace),
+        SocketPayload::new_in_namespace(
+            kind,
+            SocketOptionSet::for_valid_socket_type(valid, kind),
+            net_namespace,
+        ),
     ));
     identity.install_payload(payload);
 
