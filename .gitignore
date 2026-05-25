@@ -15,3 +15,5 @@ __pycache__/
 .claude/worktrees/
 librust_out.rlib
 /target-codex-check
+/kernel-rv
+/kernel-la

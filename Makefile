@@ -18,6 +18,7 @@ OSCOMP_EXTRA ?=
 HOST_CARGO_TARGET_DIR ?= target/host-cargo
 
 .PHONY: docker-help docker-build docker-shell docker-ci docker-check docker-ci-slow \
+	all \
 	docker-build-rv64 docker-build-la64 docker-image-cpio-rv64 docker-image-cpio-la64 \
 	docker-image-ext4-rv64 docker-image-ext4-la64 \
 	docker-qemu-rv64-smoke docker-qemu-rv64-busybox docker-qemu-la64-busybox \
@@ -51,6 +52,14 @@ docker-help:
 	@echo "  make oscomp-export-testcase"
 	@echo "  make docker-busybox-la64"
 	@echo "  make docker-oscomp-prepare docker-oscomp-submit docker-oscomp-run"
+
+# Official OSComp entry point. The website's autotest runs `make all` in
+# /coursegrader/submit and then boots ./kernel-rv and ./kernel-la with the
+# official sdcard images.
+all:
+	cargo xtask build --target rv64-qemu
+	cargo xtask build --target la64-qemu
+	cargo xtask oscomp submit --submit .
 
 docker-build:
 	$(DOCKER_COMPOSE) build $(DOCKER_SERVICE)
@@ -166,16 +175,17 @@ OSCOMP_LTP ?=
 #      make oscomp-local-rv64 OSCOMP_LTP=umask01
 #      make oscomp-local-rv64 OSCOMP_LTP=open01,stat02
 #
-# 3. Run a Txv2 syscalls sub-batch. These batches split only
-#    /musl/ltp/runtest/syscalls by case prefix, and the guest expands the
-#    short "ltp-batch:<name>" selector from hard-coded lists in exec.rs.
+# 3. Run a Txv2 syscalls-oriented sub-batch. These batches split the
+#    extracted ltp-musl case list, which is mainly /musl/ltp/runtest/syscalls.
+#    LTP_BATCH=all is a syscalls sweep, not the official full OSComp run and
+#    not every upstream LTP runtest module.
 #      make ltp-batches
 #      make ltp-batch-cases LTP_BATCH=vfs
 #      make oscomp-local-rv64-ltp-batch LTP_BATCH=vfs
 #
-# 4. Run an LTP native runtest module outside syscalls. The guest receives
-#    "ltp-runtest:<module>", reads /musl/musl/ltp/runtest/<module>, and
-#    executes each original runtest command, preserving arguments.
+# 4. Inspect native LTP runtest modules outside syscalls. Guest-side
+#    ltp-runtest:<module> execution is not wired in exec.rs yet, so these
+#    targets are only useful after that selector is implemented.
 #      make ltp-runtests
 #      make ltp-runtest-cases LTP_RUNTEST=fs
 #      make oscomp-local-rv64-ltp-runtest LTP_RUNTEST=fs
@@ -336,14 +346,15 @@ oscomp-local-la64-ltp-musl-smp4:
 # LTP grouped runs:
 #
 # - ltp-batch / oscomp-local-*-ltp-batch:
-#   Txv2-maintained batches for the LTP syscalls runtest file, e.g.
+#   Txv2-maintained batches for the extracted/syscalls-oriented LTP case list,
+#   e.g.
 #   p0, smoke, fd-io, vfs, vm, process, cred, signal, time, ipc, event,
 #   sched, mount, heavy, aio.
 #
 # - ltp-runtest / oscomp-local-*-ltp-runtest:
 #   LTP native runtest files outside syscalls, e.g. fs, mm, smoketest,
-#   syscalls-ipc, pty, sched. This preserves each runtest line's original
-#   command and arguments.
+#   syscalls-ipc, pty, sched. The listing targets work; guest execution still
+#   needs exec.rs support before these run as real OSComp groups.
 ltp-batches:
 	$(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --list
 
@@ -361,7 +372,7 @@ oscomp-local-rv64-ltp-batch:
 	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
 	echo "LTP batch $(LTP_BATCH): $$count cases"; \
 	test "$$count" != 0; \
-	$(MAKE) oscomp-local-rv64 OSCOMP_GROUPS=ltp-batch:$(LTP_BATCH)
+	$(MAKE) oscomp-local-rv64 OSCOMP_LTP="$$cases"
 
 oscomp-local-rv64-ltp-runtest:
 	@cases="$$($(LTP_RUNTEST_TOOL) --module $(LTP_RUNTEST) --csv)"; \
@@ -382,14 +393,14 @@ oscomp-local-rv64-ltp-batch-smp4:
 	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
 	echo "LTP batch $(LTP_BATCH): $$count cases"; \
 	test "$$count" != 0; \
-	$(MAKE) oscomp-local-rv64-smp4 OSCOMP_GROUPS=ltp-batch:$(LTP_BATCH)
+	$(MAKE) oscomp-local-rv64-smp4 OSCOMP_LTP="$$cases"
 
 oscomp-local-la64-ltp-batch:
 	@cases="$$($(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --batch $(LTP_BATCH) --csv)"; \
 	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
 	echo "LTP batch $(LTP_BATCH): $$count cases"; \
 	test "$$count" != 0; \
-	$(MAKE) oscomp-local-la64 OSCOMP_GROUPS=ltp-batch:$(LTP_BATCH)
+	$(MAKE) oscomp-local-la64 OSCOMP_LTP="$$cases"
 
 oscomp-local-la64-ltp-runtest:
 	@cases="$$($(LTP_RUNTEST_TOOL) --module $(LTP_RUNTEST) --csv)"; \
@@ -410,7 +421,7 @@ oscomp-local-la64-ltp-batch-smp4:
 	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
 	echo "LTP batch $(LTP_BATCH): $$count cases"; \
 	test "$$count" != 0; \
-	$(MAKE) oscomp-local-la64-smp4 OSCOMP_GROUPS=ltp-batch:$(LTP_BATCH)
+	$(MAKE) oscomp-local-la64-smp4 OSCOMP_LTP="$$cases"
 
 oscomp-export-testcase:
 	tools/oscomp-extract-testcase.sh $(OSCOMP_DATA) $(OSCOMP_TESTCASE_OUT)

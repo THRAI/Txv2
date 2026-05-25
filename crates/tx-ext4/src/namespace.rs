@@ -319,20 +319,18 @@ where
             Ok(index) => index,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        if index >= READDIR_WINDOW_ENTRIES {
-            return StepOutcome::err(Errno::ENOSYS.into());
-        }
-
+        let window_start = index - (index % READDIR_WINDOW_ENTRIES);
+        let window_index = index - window_start;
         let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
-        let count = match self.read_dir_entries_cached(inode, &mut entries) {
+        let count = match self.read_dir_entries_cached(inode, window_start, &mut entries) {
             Ok(count) => count,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        if index >= count {
+        if window_index >= count {
             return StepOutcome::done(None);
         }
 
-        let entry = entries[index];
+        let entry = entries[window_index];
         let name = match InlineName::new(entry.name()) {
             Ok(name) => name,
             Err(err) => return StepOutcome::err(err.into()),

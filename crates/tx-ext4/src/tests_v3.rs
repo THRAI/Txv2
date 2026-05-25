@@ -17,6 +17,7 @@
 
 extern crate alloc;
 
+use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -211,6 +212,28 @@ fn open_fs_read_only() -> Arc<Ext4FsInstance<MemImage>> {
     Ext4FsInstance::open(build_image(), true).expect("open ext4 mem image (RO)")
 }
 
+fn open_wide_dir_fs(extra_entries: usize) -> Arc<Ext4FsInstance<MemImage>> {
+    let mut image = build_image();
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    names.push(b".".to_vec());
+    names.push(b"..".to_vec());
+    for index in 0..extra_entries {
+        names.push(format!("file{index:02}").into_bytes());
+    }
+
+    let entries: Vec<(u32, u8, &[u8])> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let inode = if index < 2 { 2 } else { 12 };
+            let file_type = if index < 2 { 2 } else { 1 };
+            (inode, file_type, name.as_slice())
+        })
+        .collect();
+    encode_dir(image.block_mut(16), &entries);
+    Ext4FsInstance::open(image, false).expect("open ext4 mem image with wide dir")
+}
+
 // === Tests =============================================================
 
 #[test]
@@ -375,6 +398,33 @@ fn ext4_v3_readdir_done_then_terminator() {
     };
     assert_eq!(entry.fs_object_id, FsObjectId::new(2)); // "."
     assert_ne!(next.0, [0u8; 16]);
+}
+
+#[test]
+fn ext4_v3_readdir_advances_past_first_window() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = open_wide_dir_fs(70);
+    let guard = epoch::guard();
+
+    let mut cursor = DirCursor([0u8; 16]);
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    loop {
+        match <Ext4FsInstance<MemImage> as FsOps>::readdir(&*fs, FsObjectId::new(2), cursor, &guard)
+        {
+            V3::Done(Some((entry, next))) => {
+                names.push(entry.name.as_bytes().to_vec());
+                cursor = next;
+                assert!(names.len() <= 80, "readdir did not terminate");
+            }
+            V3::Done(None) => break,
+            other => panic!("readdir wide dir v3: {other:?}"),
+        }
+    }
+
+    assert_eq!(names.len(), 72);
+    assert_eq!(names[64], b"file62");
+    assert_eq!(names.last().map(Vec::as_slice), Some(b"file69".as_slice()));
 }
 
 #[test]

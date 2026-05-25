@@ -894,6 +894,7 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
 fn append_filtered_ltp(cmd: &mut alloc::string::String, filter: &str) {
     use core::fmt::Write as _;
 
+    append_ltp_script_env(cmd);
     let _ = write!(
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
@@ -1083,7 +1084,19 @@ fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
 fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str) {
     use core::fmt::Write as _;
 
+    if script == "ltp_testcode.sh" {
+        append_ltp_script_env(cmd);
+    }
     let _ = write!(cmd, "; ./busybox sh {script}");
+}
+
+fn append_ltp_script_env(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; export LTPROOT=/musl/musl/ltp; export PATH=/bin:/musl/glibc:/musl/musl:/musl/musl/ltp/testcases/bin"
+    );
 }
 
 const DEFAULT_OSCOMP_MUSL_SCRIPTS: &[(&str, &str)] = &[
@@ -1237,5 +1250,26 @@ mod tests {
             cmd.contains("; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"")
         );
         assert!(!cmd.contains("basic_testcode.sh && ./busybox echo"));
+    }
+
+    #[test]
+    fn ltp_scripts_get_helper_path_without_busybox_applet_setup() {
+        let mut full_cmd = String::from("cd /musl/musl");
+        append_oscomp_musl_script(&mut full_cmd, "ltp_testcode.sh");
+
+        assert!(full_cmd.contains("export LTPROOT=/musl/musl/ltp"));
+        assert!(full_cmd.contains("/musl/musl/ltp/testcases/bin"));
+        assert!(full_cmd.contains("; ./busybox sh ltp_testcode.sh"));
+        assert!(!full_cmd.contains("/tmp/ltp-busybox"));
+        assert!(!full_cmd.contains("--install"));
+
+        let mut filtered_cmd = String::from("cd /musl/musl");
+        append_filtered_ltp(&mut filtered_cmd, "ar01.sh");
+
+        assert!(filtered_cmd.contains("export LTPROOT=/musl/musl/ltp"));
+        assert!(filtered_cmd.contains("/musl/musl/ltp/testcases/bin"));
+        assert!(filtered_cmd.contains("; ltp/testcases/bin/ar01.sh"));
+        assert!(!filtered_cmd.contains("/tmp/ltp-busybox"));
+        assert!(!filtered_cmd.contains("--install"));
     }
 }

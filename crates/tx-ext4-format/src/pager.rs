@@ -610,7 +610,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         Inode::parse(&block[location.offset..location.offset + location.len])
     }
 
-    fn read_dir_entries_from(
+    pub fn read_dir_entries_from(
         &mut self,
         directory: InodeNo,
         skip_entries: u64,
