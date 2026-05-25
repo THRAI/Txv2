@@ -25,6 +25,11 @@ fn tcp_socket_close_marks_connected_peer_broken() {
 
     assert!(client.readiness.recv_wq.peek() & RecvWireSet::BROKEN.bits() != 0);
     assert!(client.readiness.send_wq.peek() & SendWireSet::BROKEN.bits() != 0);
+    assert!(matches!(
+        step_poll_ready(&client, &guard),
+        StepOutcome::Done(mask)
+            if mask.contains(PollMask::ERR) && mask.contains(PollMask::OUT)
+    ));
     assert_eq!(
         step_send_kernel_bytes(&client, b"x", SendRecvFlags::empty(), &guard),
         StepOutcome::Err(Errno::EPIPE)

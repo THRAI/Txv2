@@ -1,3 +1,25 @@
+- 2026-05-25 **Stabilized focused OSComp iperf/netperf after the network PR
+  update.** Reproduced the flaky `iperf-musl` behavior: runs could pass once
+  and then hang at `BASIC_TCP` or `PARALLEL_TCP`, while `iperf-glibc` advanced
+  from `BASIC_TCP` to the same `PARALLEL_TCP` hang after the first ppoll fix.
+  Root cause was readiness semantics rather than an iperf-specific input:
+  `ppoll` still collapsed socket read/write wait interests into a single token
+  and did not wait on blocking socket polls, while TCP peer close fired
+  `send_wq BROKEN` without making poll/select report `ERR`/write-ready. `ppoll`
+  now tracks multiple wait tokens and splits socket `IN`/`OUT` waits like
+  `pselect6`; TCP send-side BROKEN now contributes `PollMask::ERR|OUT`, and
+  `pselect6` treats `ERR` as write-ready so close/error wakes do not strand
+  parallel TCP teardown. **Verification:** `cargo fmt --check`; `cargo test -p
+  tx-shims --lib ppoll -- --test-threads=1`; `cargo test -p tx-shims --lib
+  pselect_socket_blocked_interests_keeps_read_and_write_distinct --
+  --test-threads=1`; `cargo test -p tx-subsystems --lib
+  tcp_socket_close_marks_connected_peer_broken -- --test-threads=1`; `cargo
+  xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu --submit target/oscomp/submit`; focused OSComp `iperf-musl 6/6`
+  twice, `iperf-glibc 6/6`, `netperf-musl 5/5`, and `netperf-glibc 5/5` using
+  the local judge. **Next step:** optionally rerun the broader non-LTP OSComp
+  set before another PR push. **Blocker:** none found for focused iperf/netperf.
+
 - 2026-05-24 **Restored focused OSComp iperf after the LTP network syscall
   PR.** Compared the PR lineage against `133fa0c8` using a detached worktree
   and the historical `cargo xtask oscomp qemu --boot-suite ...` path;

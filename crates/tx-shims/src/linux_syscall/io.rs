@@ -860,29 +860,6 @@ async fn wait_on_any_token_or_pselect_deadline<P: tx_hal::TimeIf>(
     .await
 }
 
-async fn wait_on_token_or_pselect_deadline<P: tx_hal::TimeIf>(
-    mut fd_future: wait_source::RegisteredWaitFuture,
-    deadline_ns: u64,
-) -> PselectWaitWake {
-    if <P as tx_hal::TimeIf>::read_ns() >= deadline_ns {
-        return PselectWaitWake::TimedOut;
-    }
-    let Some(mut timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) else {
-        return PselectWaitWake::TimedOut;
-    };
-
-    core::future::poll_fn(|cx| {
-        if core::future::Future::poll(core::pin::Pin::new(&mut fd_future), cx).is_ready() {
-            return core::task::Poll::Ready(PselectWaitWake::FdReady);
-        }
-        if core::future::Future::poll(core::pin::Pin::new(&mut timer_future), cx).is_ready() {
-            return core::task::Poll::Ready(PselectWaitWake::TimedOut);
-        }
-        core::task::Poll::Pending
-    })
-    .await
-}
-
 async fn wait_until_pselect_deadline<P: tx_hal::TimeIf>(deadline_ns: u64) {
     if <P as tx_hal::TimeIf>::read_ns() >= deadline_ns {
         return;
@@ -928,7 +905,8 @@ fn fdset_write<'a>(ctx: &SyscallCtx<'a>, set_ptr: u64, words: &[u64]) -> Result<
 }
 
 fn pselect_socket_write_ready(want_write: bool, mask: tx_subsystems::net::PollMask) -> bool {
-    want_write && mask.intersects(tx_subsystems::net::PollMask::OUT)
+    want_write
+        && mask.intersects(tx_subsystems::net::PollMask::OUT | tx_subsystems::net::PollMask::ERR)
 }
 
 pub(super) fn pselect_socket_blocked_interests(
@@ -955,59 +933,11 @@ pub(super) fn pselect_socket_read_ready(
         )
 }
 
-/// `ppoll(fds, nfds, tmo_p, sigmask)` — minimal v1 stub for
-/// interactive `busybox sh` so its read loop doesn't trap with
-/// `-ENOSYS`.
-///
-/// `struct pollfd { int fd; short events; short revents; }`
-/// (8 bytes on RV64). For each entry with `fd >= 0`, set
-/// `revents = events` (i.e., mark every requested event "ready").
-/// Return `nfds`.
-///
-/// Why this is sufficient for busybox sh:
-///
-/// - Interactive `sh` calls `ppoll([{fd=0, events=POLLIN}], 1,
-///   NULL, NULL)` and then `read(0, ...)`. Our stub says
-///   "ready"; busybox calls `read`; our `sys_read` blocks on the
-///   TTY wait source until UART RX delivers bytes. End-to-end
-///   semantics match Linux.
-///
-/// - For polls with `nfds > 1`, every fd appears ready; busybox
-///   then individually reads each and observes which are actually
-///   ready (or blocks).
-///
-/// Limitations: timeout is currently ignored (we don't sleep to
-/// the deadline; we return "ready" immediately). For shell
-/// interactive use this is fine — the timeout is typically NULL
-/// (block indefinitely, which is what `read` does anyway in the
-/// follow-up). For non-blocking polls (timeout = 0) this would
-/// busy-loop in userspace; address it if/when a real workload hits
-/// it.
 /// `ppoll(fds, nfds, timeout_ptr, sigmask_ptr)`.
 ///
-/// Minimal implementation that supports the busybox interactive-shell
-/// pattern (single fd, POLLIN, blocking wait). For each pollfd we
-/// peek at the fd's TTY backing readability; if no fd is currently
-/// ready and the timeout is non-zero, we park on the first TTY fd's
-/// wait source and re-poll on wake. Returns the number of fds with
-/// non-zero `revents`.
-///
-/// Behaviour gaps (called out so a future caller doesn't trip on
-/// them):
-/// - Only POLLIN is honoured; POLLOUT / POLLERR / etc. are reported
-///   verbatim from `events` if any fd is found to be ready, otherwise
-///   suppressed. POLLOUT-only polls on TTY backings still return
-///   "ready" eagerly to match the legacy stub semantics.
-/// - Multi-fd waits park on the FIRST TTY POLLIN fd only. If a
-///   different fd becomes readable while we're parked on the first,
-///   we wake on the next ingest event regardless (the wait_source
-///   carrier fires from any TTY ingest path); the re-check loop then
-///   notices the other fd. Cross-fd starvation is theoretically
-///   possible but not observed in practice for the busybox flows.
-/// - The `timeout_ptr` is read but a non-NULL timeout uses the
-///   timeout-elapsed branch only as an upper bound; the actual
-///   timer hookup ships with the OnTimer wave (deferred).
-/// - The signal mask is ignored.
+/// Polls socket, TTY, and pipe readiness with level-triggered semantics.
+/// Socket wait interests stay split by direction so a caller that asks for
+/// both `POLLIN` and `POLLOUT` can wake on either side.
 pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
@@ -1067,6 +997,7 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
         PselectTimeout::Infinite | PselectTimeout::Poll => None,
     };
 
+    let mut yielded_before_wait = false;
     let ready = loop {
         drive_loopback_pending();
         if let Some(deadline_ns) = timeout_deadline_ns {
@@ -1076,8 +1007,7 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
         }
 
         let mut ready: i64 = 0;
-        let mut wait_token = None;
-        let mut wait_token_is_socket = false;
+        let mut wait_tokens = alloc::vec::Vec::new();
         for i in 0..nfds {
             let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
             let mut ent_bytes = [0u8; POLLFD_BYTES as usize];
@@ -1099,20 +1029,12 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
                     if let Some(result) = socket_poll {
                         match result {
                             Ok(mask) => {
-                                let mut interests = tx_subsystems::net::PollMask::empty();
-                                if events & POLLIN != 0 {
-                                    interests |= tx_subsystems::net::PollMask::IN;
-                                }
-                                if events & POLLOUT != 0 {
-                                    interests |= tx_subsystems::net::PollMask::OUT;
-                                }
-                                if events & POLLIN != 0
-                                    && mask.intersects(tx_subsystems::net::PollMask::IN)
-                                {
+                                let want_read = events & POLLIN != 0;
+                                let want_write = events & POLLOUT != 0;
+                                if want_read && mask.intersects(tx_subsystems::net::PollMask::IN) {
                                     revents |= POLLIN;
                                 }
-                                if events & POLLOUT != 0
-                                    && mask.intersects(tx_subsystems::net::PollMask::OUT)
+                                if want_write && mask.intersects(tx_subsystems::net::PollMask::OUT)
                                 {
                                     revents |= POLLOUT;
                                 }
@@ -1122,18 +1044,39 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
                                 if mask.intersects(tx_subsystems::net::PollMask::HUP) {
                                     revents |= POLLHUP;
                                 }
-                                let should_wait_for_socket =
-                                    matches!(timeout, PselectTimeout::FiniteWait(_));
-                                if should_wait_for_socket && revents == 0 && interests.bits() != 0 {
-                                    match socket_poll_wait_token_from_file(&file, interests, &guard)
-                                    {
-                                        Some(Ok(Some(token))) => {
-                                            wait_token = Some(token);
-                                            wait_token_is_socket = true;
+                                if timeout != PselectTimeout::Poll && revents == 0 {
+                                    let (read_blocked, write_blocked) =
+                                        pselect_socket_blocked_interests(
+                                            want_read, want_write, mask,
+                                        );
+                                    if read_blocked {
+                                        match socket_poll_wait_token_from_file(
+                                            &file,
+                                            tx_subsystems::net::PollMask::IN,
+                                            &guard,
+                                        ) {
+                                            Some(Ok(Some(token))) => {
+                                                push_unique_wait_token(&mut wait_tokens, token);
+                                            }
+                                            Some(Ok(None)) | None => {}
+                                            Some(Err(errno)) => {
+                                                return SyscallResult::Error(errno_to_i32(errno));
+                                            }
                                         }
-                                        Some(Ok(None)) | None => {}
-                                        Some(Err(errno)) => {
-                                            return SyscallResult::Error(errno_to_i32(errno));
+                                    }
+                                    if write_blocked {
+                                        match socket_poll_wait_token_from_file(
+                                            &file,
+                                            tx_subsystems::net::PollMask::OUT,
+                                            &guard,
+                                        ) {
+                                            Some(Ok(Some(token))) => {
+                                                push_unique_wait_token(&mut wait_tokens, token);
+                                            }
+                                            Some(Ok(None)) | None => {}
+                                            Some(Err(errno)) => {
+                                                return SyscallResult::Error(errno_to_i32(errno));
+                                            }
                                         }
                                     }
                                 }
@@ -1157,13 +1100,14 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
                                 if events & POLLIN != 0 {
                                     if tty_readable_level(tty) {
                                         revents |= POLLIN;
-                                    } else if wait_token.is_none() {
-                                        wait_token =
-                                            Some(tx_subsystems::execution::WaitToken::new(
+                                    } else {
+                                        push_unique_wait_token(
+                                            &mut wait_tokens,
+                                            tx_subsystems::execution::WaitToken::new(
                                                 tty.wait_source_id(),
                                                 POLLIN as u64,
-                                            ));
-                                        wait_token_is_socket = false;
+                                            ),
+                                        );
                                     }
                                 }
                                 if events & POLLOUT != 0 {
@@ -1179,13 +1123,14 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
                                         if events & POLLIN != 0 {
                                             if payload.reader_readable_level() {
                                                 revents |= POLLIN;
-                                            } else if wait_token.is_none() {
-                                                wait_token =
-                                                    Some(tx_subsystems::execution::WaitToken::new(
+                                            } else {
+                                                push_unique_wait_token(
+                                                    &mut wait_tokens,
+                                                    tx_subsystems::execution::WaitToken::new(
                                                         payload.reader_source_id(),
                                                         tx_subsystems::pipe::PIPE_READABLE,
-                                                    ));
-                                                wait_token_is_socket = false;
+                                                    ),
+                                                );
                                             }
                                         }
                                         if payload.reader_hup_level() {
@@ -1196,13 +1141,14 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
                                         if events & POLLOUT != 0 {
                                             if payload.writer_writable_level() {
                                                 revents |= POLLOUT;
-                                            } else if wait_token.is_none() {
-                                                wait_token =
-                                                    Some(tx_subsystems::execution::WaitToken::new(
+                                            } else {
+                                                push_unique_wait_token(
+                                                    &mut wait_tokens,
+                                                    tx_subsystems::execution::WaitToken::new(
                                                         payload.writer_source_id(),
                                                         tx_subsystems::pipe::PIPE_WRITABLE,
-                                                    ));
-                                                wait_token_is_socket = false;
+                                                    ),
+                                                );
                                             }
                                         }
                                         if payload.writer_err_level() {
@@ -1247,25 +1193,41 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
             break 0;
         }
 
-        let Some(token) = wait_token else {
+        if !yielded_before_wait && !wait_tokens.is_empty() {
+            yielded_before_wait = true;
+            tx_reactor::yield_now().await;
+            continue;
+        }
+        if wait_tokens.is_empty() {
             if let Some(deadline_ns) = timeout_deadline_ns {
                 wait_until_pselect_deadline::<P>(deadline_ns).await;
+            } else if timeout == PselectTimeout::Infinite {
+                tx_reactor::yield_now().await;
+                continue;
             }
             break 0;
-        };
-        if let Some(future) = wait_source::wait_on_token(token) {
+        }
+
+        let futures = wait_tokens
+            .into_iter()
+            .filter_map(wait_source::wait_on_token)
+            .collect::<alloc::vec::Vec<_>>();
+        if futures.is_empty() {
             if let Some(deadline_ns) = timeout_deadline_ns {
-                match wait_on_token_or_pselect_deadline::<P>(future, deadline_ns).await {
-                    PselectWaitWake::FdReady => {}
-                    PselectWaitWake::TimedOut => break 0,
-                }
-            } else {
-                let _ = future.await;
+                wait_until_pselect_deadline::<P>(deadline_ns).await;
+            } else if timeout == PselectTimeout::Infinite {
+                tx_reactor::yield_now().await;
+                continue;
             }
-        } else if wait_token_is_socket {
-            tx_reactor::yield_now().await;
-        } else {
             break 0;
+        }
+        if let Some(deadline_ns) = timeout_deadline_ns {
+            match wait_on_any_token_or_pselect_deadline::<P>(futures, deadline_ns).await {
+                PselectWaitWake::FdReady => {}
+                PselectWaitWake::TimedOut => break 0,
+            }
+        } else {
+            wait_on_any_token(futures).await;
         }
     };
 
