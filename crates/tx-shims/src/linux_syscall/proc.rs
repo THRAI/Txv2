@@ -232,6 +232,80 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
     }
 }
 
+/// `execveat(dirfd, pathname, argv, envp, flags)`. Linux RV64 generic ABI.
+///
+/// v1 supports normal pathname execution relative to `AT_FDCWD` or a real
+/// directory fd. `AT_EMPTY_PATH` fd-exec is deliberately deferred until exec
+/// can consume an already-open file.
+pub(super) async fn sys_execveat<'a, P: PmapIf + EntropyIf + AuxvIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let dirfd = args[0] as i32;
+    let path_uaddr = args[1];
+    let argv_uaddr = args[2];
+    let envp_uaddr = args[3];
+    let flags = args[4] as u32;
+
+    let known_flags = AT_EMPTY_PATH | (AT_SYMLINK_NOFOLLOW as u32);
+    if flags & !known_flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if flags & (AT_SYMLINK_NOFOLLOW as u32) != 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
+
+    let path_buf = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+        Ok(buf) => buf,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+    if path_buf.is_empty() {
+        if flags & AT_EMPTY_PATH != 0 {
+            return SyscallResult::Error(ENOSYS_VALUE);
+        }
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
+
+    let rooted_at = match resolve_root_for_path(dirfd, &path_buf, ctx) {
+        Ok(root) => root,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+
+    let mut remaining: usize = EXECVE_ARG_MAX_INLINE;
+    let argv_buf = match read_user_cstr_vec(&ctx.aspace, argv_uaddr, EXECVE_VEC_MAX, &mut remaining)
+    {
+        Ok(v) => v,
+        Err(ReadVecError::TooBig) => return SyscallResult::Error(E2BIG_VALUE),
+    };
+    let envp_buf = match read_user_cstr_vec(&ctx.aspace, envp_uaddr, EXECVE_VEC_MAX, &mut remaining)
+    {
+        Ok(v) => v,
+        Err(ReadVecError::TooBig) => return SyscallResult::Error(E2BIG_VALUE),
+    };
+    let argv_slices: Vec<&[u8]> = argv_buf.iter().map(|s| s.as_slice()).collect();
+    let envp_slices: Vec<&[u8]> = envp_buf.iter().map(|s| s.as_slice()).collect();
+    let cred = ctx.walker_cred();
+
+    let outcome = exec_script_at::<P>(
+        &ctx.process,
+        &ctx.thread,
+        rooted_at,
+        &path_buf,
+        &argv_slices,
+        &envp_slices,
+        &cred,
+    )
+    .await;
+
+    match outcome {
+        Ok(()) => {
+            ctx.process.notify_vfork_done();
+            SyscallResult::ExecCommitted
+        }
+        Err(e) => SyscallResult::Error(execve_errno_magnitude(e)),
+    }
+}
+
 /// Translate `ExecError` to the dispatched `-errno` magnitude the
 /// Phase 6 syscall arm hands back through `SyscallResult::Error`.
 ///

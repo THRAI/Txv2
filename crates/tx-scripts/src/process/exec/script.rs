@@ -333,13 +333,30 @@ pub async fn exec_script<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     envp: &[&[u8]],
     cred: &Credential,
 ) -> Result<(), ExecError> {
-    exec_script_inner::<P>(0, process, thread, path, argv, envp, cred).await
+    exec_script_inner::<P>(0, process, thread, None, path, argv, envp, cred).await
+}
+
+/// Variant of [`exec_script`] whose initial program path is resolved relative
+/// to a caller-supplied directory anchor. Recursive interpreter resolution
+/// intentionally falls back to process-root/cwd semantics, matching Linux's
+/// treatment of absolute `#!` and `PT_INTERP` paths.
+pub async fn exec_script_at<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
+    process: &Cap<ProcessIdentity>,
+    thread: &Cap<ThreadIdentity>,
+    rooted_at: Cap<DEntry>,
+    path: &[u8],
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+    cred: &Credential,
+) -> Result<(), ExecError> {
+    exec_script_inner::<P>(0, process, thread, Some(rooted_at), path, argv, envp, cred).await
 }
 
 async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     depth: usize,
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
+    rooted_at_override: Option<Cap<DEntry>>,
     path: &[u8],
     argv: &[&[u8]],
     envp: &[&[u8]],
@@ -394,7 +411,10 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     let openfile = {
         use StepOutcome as V3;
         let guard = step_engine::guard();
-        let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
+        let rooted_at = rooted_at_override
+            .clone()
+            .or_else(|| process.cwd())
+            .ok_or(ExecError::PathNotFound)?;
         let outcome = step_open(
             rooted_at,
             path,
@@ -513,6 +533,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 depth + 1,
                 process,
                 thread,
+                None,
                 &interp_path,
                 &new_argv_refs,
                 envp,
@@ -537,6 +558,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             depth + 1,
             process,
             thread,
+            None,
             DEFAULT_SHELL,
             &new_argv_refs,
             envp,
@@ -570,6 +592,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                     depth + 1,
                     process,
                     thread,
+                    None,
                     &interp_path,
                     &new_argv_refs,
                     envp,

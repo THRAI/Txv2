@@ -1394,6 +1394,7 @@ mod easy_syscalls;
 // =====================================================================
 
 mod file_mutation;
+mod xattr;
 
 // =====================================================================
 // `sys_rt_sigtimedwait` — verify the bit-encoding and post→read

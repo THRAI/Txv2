@@ -69,6 +69,30 @@ pub fn kernel_step(
         remaining.remove(0);
     }
 
+    if rules.mode == WalkMode::ParentAndName && is_single_remaining_component(&remaining) {
+        if current.rnode().meta().kind() != InodeKind::Directory {
+            return KernelStep::Error(WalkCause::NotADirectory);
+        }
+        let parent_meta = current.rnode().meta();
+        if let Err(_err) =
+            crate::cred::checks::require_path_search_with_walker_cred(cred, &parent_meta, guard)
+        {
+            return KernelStep::Error(WalkCause::Permission(
+                super::state::NonTerminalDenial::SearchDenied,
+            ));
+        }
+        let rnode = current.rnode().clone();
+        let meta = rnode.meta();
+        let fs_object_id = rnode.fs_object_id();
+        let resolved = PathResolution {
+            dentry: current,
+            rnode,
+            fs_object_id,
+            meta,
+        };
+        return KernelStep::Continue(WalkState::Terminal(resolved));
+    }
+
     // --- end of input ---
     if remaining.is_empty() {
         if must_be_directory && current.rnode().meta().kind() != InodeKind::Directory {
@@ -377,6 +401,10 @@ pub fn kernel_step(
         mount_root,
         must_be_directory,
     }))
+}
+
+fn is_single_remaining_component(remaining: &[u8]) -> bool {
+    !remaining.is_empty() && !remaining.contains(&b'/')
 }
 
 // ---------------------------------------------------------------------------

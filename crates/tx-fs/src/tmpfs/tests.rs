@@ -522,6 +522,143 @@ fn cred_with_caps(uid: u32, gid: u32, caps: CapabilitySet) -> Credential {
     }
 }
 
+// ---------------------------------------------------------------------------
+// xattr storage tests. tmpfs is the first backend with real VFS xattr storage;
+// other filesystems inherit the FsOps default unsupported answer.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tmpfs_xattr_set_get_list_remove_round_trip() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"xf", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode: {other:?}"),
+        };
+
+    assert_eq!(
+        <Tmpfs as FsOps>::set_xattr(&*tmpfs, file_id, b"user.alpha", b"bravo", 0, &cred, &guard),
+        StepOutcome::Done(())
+    );
+
+    let mut value = [0u8; 8];
+    assert_eq!(
+        <Tmpfs as FsOps>::get_xattr(&*tmpfs, file_id, b"user.alpha", &mut value, &cred, &guard),
+        StepOutcome::Done(5)
+    );
+    assert_eq!(&value[..5], b"bravo");
+
+    let mut list = [0u8; 32];
+    assert_eq!(
+        <Tmpfs as FsOps>::list_xattr(&*tmpfs, file_id, &mut list, &cred, &guard),
+        StepOutcome::Done(11)
+    );
+    assert_eq!(&list[..11], b"user.alpha\0");
+
+    assert_eq!(
+        <Tmpfs as FsOps>::remove_xattr(&*tmpfs, file_id, b"user.alpha", &cred, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        <Tmpfs as FsOps>::get_xattr(&*tmpfs, file_id, b"user.alpha", &mut value, &cred, &guard),
+        StepOutcome::Err(Errno::ENODATA)
+    );
+}
+
+#[test]
+fn tmpfs_xattr_flags_sizes_and_namespace_errors_match_linux_shape() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    const XATTR_CREATE: u32 = 0x1;
+    const XATTR_REPLACE: u32 = 0x2;
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"xf", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode: {other:?}"),
+        };
+
+    assert_eq!(
+        <Tmpfs as FsOps>::set_xattr(
+            &*tmpfs,
+            file_id,
+            b"user.alpha",
+            b"one",
+            XATTR_REPLACE,
+            &cred,
+            &guard
+        ),
+        StepOutcome::Err(Errno::ENODATA)
+    );
+    assert_eq!(
+        <Tmpfs as FsOps>::set_xattr(
+            &*tmpfs,
+            file_id,
+            b"user.alpha",
+            b"one",
+            XATTR_CREATE,
+            &cred,
+            &guard
+        ),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        <Tmpfs as FsOps>::set_xattr(
+            &*tmpfs,
+            file_id,
+            b"user.alpha",
+            b"two",
+            XATTR_CREATE,
+            &cred,
+            &guard
+        ),
+        StepOutcome::Err(Errno::EEXIST)
+    );
+    assert_eq!(
+        <Tmpfs as FsOps>::set_xattr(&*tmpfs, file_id, b"user.alpha", b"two", 0x4, &cred, &guard),
+        StepOutcome::Err(Errno::EINVAL)
+    );
+
+    let mut tiny = [0u8; 2];
+    assert_eq!(
+        <Tmpfs as FsOps>::get_xattr(&*tmpfs, file_id, b"user.alpha", &mut tiny, &cred, &guard),
+        StepOutcome::Err(Errno::ERANGE)
+    );
+    assert_eq!(
+        <Tmpfs as FsOps>::set_xattr(
+            &*tmpfs,
+            file_id,
+            b"system.posix_acl_access",
+            b"acl",
+            0,
+            &cred,
+            &guard
+        ),
+        StepOutcome::Err(Errno::EOPNOTSUPP)
+    );
+    assert_eq!(
+        <Tmpfs as FsOps>::set_xattr(&*tmpfs, file_id, b"", b"value", 0, &cred, &guard),
+        StepOutcome::Err(Errno::ERANGE)
+    );
+    assert_eq!(
+        <Tmpfs as FsOps>::remove_xattr(&*tmpfs, file_id, b"user.missing", &cred, &guard),
+        StepOutcome::Err(Errno::ENODATA)
+    );
+}
+
 #[test]
 fn tmpfs_chmod_owner_succeeds() {
     let _serial = crate::test_support::FS_TEST_LOCK

@@ -6,6 +6,8 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMutex, StepOutcome};
 use alloc::collections::BTreeMap;
+use tx_subsystems::cred::checks as cred_checks;
+use tx_subsystems::vfs::resolution::state::{FinalSymlinkPolicy, WalkMode};
 use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload};
 use tx_subsystems::vfs::FsObjectId;
 
@@ -17,6 +19,14 @@ pub(super) use dir_sync::{
 
 static STAT_META_OVERRIDES: SpinMutex<BTreeMap<FsObjectId, InodeMeta>> =
     SpinMutex::new(BTreeMap::new());
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OpenHowLayout {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
 
 pub(super) fn record_stat_meta_override(fs_object_id: FsObjectId, meta: InodeMeta) {
     STAT_META_OVERRIDES.lock().insert(fs_object_id, meta);
@@ -254,12 +264,8 @@ pub(super) fn sys_close_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// `openat(dirfd, path, flags, mode)`. Linux RV64 generic ABI
 /// `__NR_openat = 56`.
 ///
-/// Wave 2's surface: `dirfd == AT_FDCWD` only (non-cwd dirfds return
-/// `-EBADF` because the slice's fd table doesn't carry directory-fd
-/// semantics yet — `TODO(phase-dirfd)` matches Wave 4 Part 4's
-/// `resolve_path_at`). Path resolution goes through `vfs::step_open`
-/// using the caller's `walker_cred()` (effective ids per POSIX DAC
-/// rule).
+/// Path resolution goes through the syscall-facing dirfd resolver facade using
+/// the caller's `walker_cred()` (effective ids per POSIX DAC rule).
 ///
 /// Flag decoding mirrors Linux's `man 2 open` (`O_RDONLY`/`O_WRONLY`/
 /// `O_RDWR` access mode + `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_APPEND`/
@@ -341,26 +347,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         nonblocking: flags & O_NONBLOCK != 0,
     };
 
-    // Resolve the dirfd anchor. AT_FDCWD → process cwd; a real dirfd
-    // → the `opendir_dentry` of its OpenFile (an O_DIRECTORY open of
-    // that directory). Invalid / non-directory fds surface as EBADF /
-    // ENOTDIR.
-    let cwd: Cap<DEntry> = if dirfd == AT_FDCWD {
-        match ctx.process.cwd() {
-            Some(d) => d,
-            None => return SyscallResult::Error(ENOENT_VALUE),
-        }
-    } else if dirfd < 0 {
-        return SyscallResult::Error(EBADF_VALUE);
-    } else {
-        let open_file = match ctx.process.fd(dirfd as u32) {
-            Some(f) => f,
-            None => return SyscallResult::Error(EBADF_VALUE),
-        };
-        match open_file.opendir_dentry() {
-            Some(d) => d,
-            None => return SyscallResult::Error(ENOTDIR_VALUE),
-        }
+    let cwd: Cap<DEntry> = match resolve_cwd(dirfd, ctx) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
     };
 
     let walker_cred = ctx.walker_cred();
@@ -427,31 +416,27 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // `poll_walker_synchronously` helper that the file-mode arms also
     // use; every in-tree walker backend resolves immediately so the
     // noop-waker poll always returns `Ready`.
-    use step_engine::{Errno as V3Errno, StepOutcome as V3};
-    let walk_first = {
-        let guard = step_engine::guard();
-        let outcome = step_walk(cwd.clone(), &path, &walker_cred, &guard);
-        drop(guard);
-        outcome
-    };
-
-    let dentry: Cap<DEntry> = match walk_first {
-        V3::Done(d) => {
+    let dentry: Cap<DEntry> = match try_resolve_from_root_now(
+        ctx,
+        cwd.clone(),
+        &path,
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        &walker_cred,
+    ) {
+        Ok(resolved) => {
             if want_create && want_excl {
                 return SyscallResult::Error(EEXIST_VALUE);
             }
-            d
+            resolved.dentry
         }
-        V3::Continue { .. } | V3::Yield { .. } => {
-            return SyscallResult::Error(EIO_VALUE);
-        }
-        V3::Err(V3Errno::ENOENT) if want_create => {
-            match create_then_walk::<P>(&cwd, &path, mode as u16, &walker_cred) {
+        Err(errno) if errno == ENOENT_VALUE && want_create => {
+            match create_then_walk::<P>(ctx, &cwd, &path, mode as u16, &walker_cred) {
                 Ok(d) => d,
                 Err(e) => return SyscallResult::Error(e),
             }
         }
-        V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        Err(errno) => return SyscallResult::Error(errno),
     };
 
     // Step 2: O_TRUNC. Apply *before* materialising the OpenFile so
@@ -495,14 +480,18 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // Same Send-future discipline as Step 1: poll_walker_synchronously.
     let openfile: Cap<OpenFile> = {
         let guard = step_engine::guard();
-        let outcome = step_open(cwd, &path, open_flags, mode as u16, &walker_cred, &guard);
-        drop(guard);
-        match outcome {
-            V3::Done(file) => file,
-            V3::Continue { .. } | V3::Yield { .. } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        if let Err(errno) = cred_checks::require_open_with_walker_cred(
+            &walker_cred,
+            &dentry.rnode().meta(),
+            open_flags,
+            &guard,
+        ) {
+            return SyscallResult::error_from(errno);
+        }
+        let rnode = dentry.rnode().clone();
+        match OpenFile::new_cap_with_dentry(rnode, open_flags, dentry) {
+            Ok(file) => file,
+            Err(_) => return SyscallResult::Error(EIO_VALUE),
         }
     };
 
@@ -519,6 +508,74 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     }
 
     SyscallResult::Return(fd as i64)
+}
+
+/// `openat2(dirfd, path, how, size)`. Linux RV64 generic ABI
+/// `__NR_openat2 = 437`.
+///
+/// v1 accepts the `open_how` shape equivalent to current `openat` when
+/// `resolve == 0`; resolver policy bits remain deferred.
+pub(super) async fn sys_openat2<'a, P: PmapIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let dirfd = args[0] as i32;
+    let path_uaddr = args[1];
+    let how_uaddr = args[2];
+    let usize = args[3] as usize;
+
+    if how_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if usize < core::mem::size_of::<OpenHowLayout>() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let how = match bootstrap_read_user::<OpenHowLayout>(&ctx.aspace, how_uaddr) {
+        Ok(how) => how,
+        Err(errno) => return SyscallResult::error_from(errno),
+    };
+    if how.resolve != 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
+    if how.flags > u32::MAX as u64 || how.mode > u32::MAX as u64 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    sys_openat::<P>(dirfd, path_uaddr, how.flags as u32, how.mode as u32, ctx).await
+}
+
+pub(super) fn sys_name_to_handle_at(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let dirfd = args[0] as i32;
+    let name_uaddr = args[1];
+    let handle_uaddr = args[2];
+    let mount_id_uaddr = args[3];
+    if name_uaddr == 0 || handle_uaddr == 0 || mount_id_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let path = match read_user_cstr(&ctx.aspace, name_uaddr, EXECVE_PATH_MAX) {
+        Ok(path) => path,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+    if path.first() != Some(&b'/') {
+        if let Err(errno) = resolve_cwd(dirfd, ctx) {
+            return SyscallResult::Error(errno);
+        }
+    }
+    SyscallResult::Error(ENOSYS_VALUE)
+}
+
+pub(super) fn sys_open_by_handle_at(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let mountdirfd = args[0] as i32;
+    let handle_uaddr = args[1];
+    if handle_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if mountdirfd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if ctx.process.fd(mountdirfd as u32).is_none() {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    SyscallResult::Error(ENOSYS_VALUE)
 }
 
 /// `close(fd)`. Linux RV64 generic ABI `__NR_close = 57`.
@@ -1698,12 +1755,12 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
 
-    let cwd = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
-    };
     let (mut statx_result, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
         if dirfd == AT_FDCWD {
+            let cwd = match ctx.process.cwd() {
+                Some(d) => d,
+                None => return SyscallResult::Error(ENOENT_VALUE),
+            };
             (
                 StatxResult {
                     meta: cwd.rnode().meta(),
@@ -1728,23 +1785,20 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             )
         }
     } else {
-        if dirfd != AT_FDCWD {
-            return SyscallResult::Error(EBADF_VALUE);
-        }
         let walker_cred = ctx.walker_cred();
-        let result = {
-            let mut script_ctx = build_subject_script_ctx(ctx);
-            let mut op = StatxOp {
-                rooted_at: &cwd,
-                path: &path,
-                cred: &walker_cred,
-                target: None,
-            };
-            step_engine::drive_oneshot(&mut op, &mut script_ctx)
+        let request = if flags & (AT_SYMLINK_NOFOLLOW as u32) != 0 {
+            ResolveRequest::entity(dirfd, &path, &walker_cred).nofollow()
+        } else {
+            ResolveRequest::entity(dirfd, &path, &walker_cred)
         };
-        match result {
-            Ok((sr, id)) => (sr, id),
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+        match drive_resolve(ctx, request) {
+            Ok(resolved) => (
+                StatxResult {
+                    meta: resolved.meta,
+                },
+                resolved.fs_object_id,
+            ),
+            Err(errno) => return SyscallResult::Error(errno),
         }
     };
 
@@ -1759,8 +1813,7 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// `newfstatat(dirfd, path, statbuf, flags)`. Linux RV64 generic ABI
 /// `__NR_newfstatat = 79`.
 ///
-/// Slice 6 surface:
-/// - `dirfd == AT_FDCWD` for path walks; non-cwd dirfds → `-EBADF`.
+/// Slice surface:
 /// - `flags & AT_EMPTY_PATH` paired with empty path stats either the
 ///   cwd (`AT_FDCWD`) or the supplied fd. LA64 musl uses this fd form
 ///   to implement `fstat(fd)`.
@@ -1770,8 +1823,7 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 ///   automount machinery — matches Linux's lenience).
 /// - Other flag bits → `-EINVAL`.
 ///
-/// Path resolution mirrors `resolve_path_at`'s shape (using
-/// `step_walk` from cwd with `walker_cred`).
+/// Path resolution routes through the shared dirfd-aware facade.
 pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
@@ -1801,36 +1853,26 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     let walker_cred = ctx.walker_cred();
 
     // AT_EMPTY_PATH + empty path: stat the cwd itself for AT_FDCWD,
-    // or mirror fstat(fd) for a real fd. Otherwise use StatOp +
-    // drive_oneshot from cwd; directory-fd path walks remain out of
-    // scope for this slice.
-    let cwd = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
-    };
+    // or mirror fstat(fd) for a real fd.
     let (mut meta, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
         if dirfd == AT_FDCWD {
+            let cwd = match ctx.process.cwd() {
+                Some(d) => d,
+                None => return SyscallResult::Error(ENOENT_VALUE),
+            };
             (cwd.rnode().meta(), cwd.rnode().fs_object_id())
         } else {
             return sys_fstat([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx);
         }
     } else {
-        if dirfd != AT_FDCWD {
-            return SyscallResult::Error(EBADF_VALUE);
-        }
-        let result = {
-            let mut script_ctx = build_subject_script_ctx(ctx);
-            let mut op = StatOp {
-                rooted_at: &cwd,
-                path: &path,
-                cred: &walker_cred,
-                target: None,
-            };
-            step_engine::drive_oneshot(&mut op, &mut script_ctx)
+        let request = if flags & (AT_SYMLINK_NOFOLLOW as u32) != 0 {
+            ResolveRequest::entity(dirfd, &path, &walker_cred).nofollow()
+        } else {
+            ResolveRequest::entity(dirfd, &path, &walker_cred)
         };
-        match result {
-            Ok((m, id)) => (m, id),
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+        match drive_resolve(ctx, request) {
+            Ok(resolved) => (resolved.meta, resolved.fs_object_id),
+            Err(errno) => return SyscallResult::Error(errno),
         }
     };
 

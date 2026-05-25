@@ -1,9 +1,7 @@
-//! PR-3D-5 (D2/D4): per-RNode `read_wait_source` /
-//! `write_wait_source` integration tests — the **last** mechanical bus
-//! consumer landing.
+//! PR-3D-5: per-RNode `read_wait_source` / `write_wait_source`
+//! integration tests.
 //!
-//! Pin the new task-mailbox-based wake path that runs in parallel with
-//! the legacy `Channel`+`Waker` path on per-inode read/write
+//! Pin the task-mailbox-based wake path for per-inode read/write
 //! readiness. Unlike pipe (one payload — two sources) / futex (one
 //! registry — 256 buckets) / exit_source (one process — one source) /
 //! tty (one identity — one source), VFS is the **per-inode unbounded
@@ -29,11 +27,9 @@
 //! 1. **`WaitSourceId`-round-trip-both-directions**. The
 //!    `WaitSource::id()` of the RNode's `read_wait_source` /
 //!    `write_wait_source` each matches the `u64` returned by
-//!    `RNode::read_wait_source_id()` / `write_wait_source_id()` (the
-//!    `u64` the legacy `wait_source` resolver published). PR-3D-5's
-//!    "same id namespace" pin, applied per-direction. Read and write
-//!    ids are distinct so v3 callers can park on the right direction
-//!    without collision.
+//!    `RNode::read_wait_source_id()` / `write_wait_source_id()`.
+//!    Read and write ids are distinct so v3 callers can park on the
+//!    right direction without collision.
 //! 2. **blocked-reader-woken-on-fire_read_wait**. A subscriber
 //!    registers a `TaskMailbox` against the RNode's
 //!    `read_wait_source` while no fire has happened; a subsequent
@@ -42,42 +38,38 @@
 //!    and the `VFS_READABLE` interest.
 //! 3. **blocked-writer-woken-on-fire_write_wait**. Symmetric: writer
 //!    registers against `write_wait_source` and observes its post.
-//! 4. **D2-coexistence: legacy `Channel` fires alongside `WaitSource`**.
-//!    A `Channel.wait` future parked on the legacy `read_wait_channel`
-//!    keeps firing on `fire_read_wait` alongside the new path. If D2
-//!    coexistence regresses, one of the two consumers parks forever.
+//! 4. **drive-registry-resolves-live-sources**. The global v3 source
+//!    registry resolves each live source id to the same `Arc<WaitSource>`
+//!    that the RNode owns, so `drive()` can subscribe parked tasks by
+//!    `WaitSourceId`.
 //! 5. **direction-isolation**. `fire_read_wait` must NOT post to a
 //!    subscriber registered against the writer source, and vice versa.
 //!    This is the "two independent sources, one per direction" pin —
 //!    without it a poll/select on POLLOUT would spuriously fire on
 //!    every byte-arrival.
 //! 6. **drop-cleanup-retires-registry-slots**. When the last
-//!    `Cap<RNode>` drops and EBR retires the slot, the legacy
-//!    `wait_source` registry stops resolving the per-inode ids
-//!    (`lookup_wait_channel` returns `None`). Subscribers cloning the
-//!    `Arc<WaitSource>` before retirement still hold the strong ref
-//!    and observe no spurious posts, matching the exit_source /
+//!    `Cap<RNode>` drops and EBR retires the slot, the v3 source
+//!    registry stops resolving the per-inode ids. Subscribers cloning
+//!    the `Arc<WaitSource>` before retirement still hold the strong
+//!    ref and observe no spurious posts, matching the exit_source /
 //!    pipe / tty templates.
 //! 7. **large-N-inode-create-destroy-no-arc-leak**. The crux of the
 //!    per-inode unbounded-count flag: minting and immediately dropping
-//!    N inodes back-to-back must release N pairs of registry slots,
-//!    so a later `lookup_wait_channel` on any of those ids returns
-//!    `None`. Without `Drop for RNode` releasing the slots, the
-//!    `BTreeMap` would grow without bound.
+//!    N inodes back-to-back must release N pairs of registry slots.
 
 extern crate alloc;
 
+use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 
 use tx_subsystems::vfs::adapter::step_engine::{Cap, InterestMask, WaitSourceId};
 use tx_subsystems::vfs::adapter::wait_routing::{
-    MailboxEvent, Mask, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+    MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
 };
 
 use tx_subsystems::vfs::structure::{
     FsObjectId, InodeKind, InodeMeta, RNode, RNodeBacking, VFS_READABLE, VFS_WRITABLE,
 };
-use tx_subsystems::wait_source as legacy_wait_source;
 use tx_subsystems::zones;
 
 static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -170,45 +162,26 @@ fn vfs_wait_source_invariants_round_trip() {
         "write_wait_source.id() must match write_wait_source_id (same u64 namespace)",
     );
 
+    // ---- (4) drive-registry-resolves-live-sources -----------------
+    let registered_read = tx_substrate::wake::lookup_source(WaitSourceId::new(read_id))
+        .expect("live RNode read source must be registered for drive() wake resolution");
+    assert!(
+        Arc::ptr_eq(&registered_read, &read_source),
+        "drive() registry must resolve the RNode's live read WaitSource",
+    );
+    let registered_write = tx_substrate::wake::lookup_source(WaitSourceId::new(write_id))
+        .expect("live RNode write source must be registered for drive() wake resolution");
+    assert!(
+        Arc::ptr_eq(&registered_write, &write_source),
+        "drive() registry must resolve the RNode's live write WaitSource",
+    );
+
     // ---- (2) blocked-reader-woken-on-fire_read_wait ---------------
     let reader_mb = Arc::new(TaskMailbox::new());
     let (_reader_guard, reader_gen) = register(&read_source, &reader_mb, VFS_READABLE);
     assert!(reader_mb.is_empty(), "no events before any fire");
 
-    // ---- (4) D2-coexistence: drive a legacy `Channel.wait` future
-    // through Pending -> Ready across the same fire call.
-    use core::future::Future;
-    use core::pin::Pin;
-    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    fn no_op(_: *const ()) {}
-    fn waker_clone(_: *const ()) -> RawWaker {
-        const VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, no_op, no_op, no_op);
-        RawWaker::new(core::ptr::null(), &VTABLE)
-    }
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, no_op, no_op, no_op);
-    let raw = RawWaker::new(core::ptr::null(), &VTABLE);
-    // SAFETY: vtable functions are no-ops.
-    let waker = unsafe { Waker::from_raw(raw) };
-    let mut cx = Context::from_waker(&waker);
-
-    let legacy_read_channel = legacy_wait_source::lookup_wait_channel(read_id)
-        .expect("legacy resolver still has the read carrier");
-    let mut legacy_read_wait = legacy_read_channel.wait(Mask::from_bits(VFS_READABLE));
-    let pre_legacy_read = Pin::new(&mut legacy_read_wait).poll(&mut cx);
-    assert!(
-        matches!(pre_legacy_read, Poll::Pending),
-        "no fires yet -> legacy read Pending"
-    );
-
-    let released = rnode.fire_read_wait(VFS_READABLE);
-    // Legacy Channel side returned non-zero because the legacy wait
-    // future above was parked. Production callers don't branch on
-    // this, but the test pins that the dual-fire happens on the
-    // observable Channel side.
-    assert!(
-        released >= 1,
-        "fire_read_wait must release the parked legacy Channel awaiter; got {released}",
-    );
+    let _ = rnode.fire_read_wait(VFS_READABLE);
 
     // New path posted exactly one event with matching gen/source.
     assert_source_fired_for(
@@ -220,13 +193,6 @@ fn vfs_wait_source_invariants_round_trip() {
     assert!(
         reader_mb.is_empty(),
         "new path posts exactly one event per fire",
-    );
-
-    // D2 coexistence: legacy `Channel.wait` future also resolves.
-    let post_legacy_read = Pin::new(&mut legacy_read_wait).poll(&mut cx);
-    assert!(
-        matches!(post_legacy_read, Poll::Ready(_)),
-        "legacy Channel.fire on fire_read_wait must release the parked awaiter",
     );
 
     // ---- (3) blocked-writer-woken-on-fire_write_wait --------------
@@ -274,13 +240,13 @@ fn vfs_wait_source_invariants_round_trip() {
     );
 
     // ---- (6) drop-cleanup-retires-registry-slots ------------------
-    // Pre-drop: legacy resolver returns Some for both ids.
+    // Pre-drop: v3 registry resolves both ids.
     assert!(
-        legacy_wait_source::lookup_wait_channel(read_id).is_some(),
+        tx_substrate::wake::lookup_source(WaitSourceId::new(read_id)).is_some(),
         "live RNode keeps read slot registered"
     );
     assert!(
-        legacy_wait_source::lookup_wait_channel(write_id).is_some(),
+        tx_substrate::wake::lookup_source(WaitSourceId::new(write_id)).is_some(),
         "live RNode keeps write slot registered"
     );
 
@@ -292,12 +258,12 @@ fn vfs_wait_source_invariants_round_trip() {
     tx_test_support::drain_to_quiescence();
 
     assert!(
-        legacy_wait_source::lookup_wait_channel(read_id).is_none(),
-        "Drop for RNode must release the read carrier id",
+        tx_substrate::wake::lookup_source(WaitSourceId::new(read_id)).is_none(),
+        "Drop for RNode must unregister the read source id",
     );
     assert!(
-        legacy_wait_source::lookup_wait_channel(write_id).is_none(),
-        "Drop for RNode must release the write carrier id",
+        tx_substrate::wake::lookup_source(WaitSourceId::new(write_id)).is_none(),
+        "Drop for RNode must unregister the write source id",
     );
 
     // Strong-ref clones we held survive the drop: cloning an Arc
@@ -315,25 +281,30 @@ fn vfs_wait_source_invariants_round_trip() {
 
     // ---- (7) large-N-inode-create-destroy-no-arc-leak -------------
     // Mint N inodes back-to-back, snapshot the ids, drop the caps,
-    // and confirm every id is unresolvable. Without `Drop for RNode`
-    // releasing slots, the `BTreeMap` would retain `2 * N` rows.
+    // and confirm every id is unique, live while held, and unresolvable
+    // after teardown.
     const N: usize = 64;
     let mut minted_ids: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::with_capacity(N);
     {
         let mut caps: alloc::vec::Vec<Cap<RNode>> = alloc::vec::Vec::with_capacity(N);
+        let mut unique = BTreeSet::new();
         for i in 0..N {
             let inode = make_rnode(2000 + i as u64);
-            minted_ids.push((inode.read_wait_source_id(), inode.write_wait_source_id()));
+            let ids = (inode.read_wait_source_id(), inode.write_wait_source_id());
+            assert_ne!(ids.0, ids.1, "read/write ids must stay distinct");
+            assert!(unique.insert(ids.0), "duplicate read source id {}", ids.0);
+            assert!(unique.insert(ids.1), "duplicate write source id {}", ids.1);
+            minted_ids.push(ids);
             caps.push(inode);
         }
         // Every minted id is currently resolvable.
         for (r, w) in &minted_ids {
             assert!(
-                legacy_wait_source::lookup_wait_channel(*r).is_some(),
+                tx_substrate::wake::lookup_source(WaitSourceId::new(*r)).is_some(),
                 "live RNode read slot must resolve mid-stress"
             );
             assert!(
-                legacy_wait_source::lookup_wait_channel(*w).is_some(),
+                tx_substrate::wake::lookup_source(WaitSourceId::new(*w)).is_some(),
                 "live RNode write slot must resolve mid-stress"
             );
         }
@@ -343,15 +314,14 @@ fn vfs_wait_source_invariants_round_trip() {
     tx_test_support::drain_to_quiescence();
 
     // Post-drop: every minted id is unresolvable. This is the no-leak
-    // proof — without `Drop for RNode` releasing the slots, the legacy
-    // registry would still hold all 2*N Channel clones.
+    // proof for the drive-facing v3 source registry.
     for (r, w) in &minted_ids {
         assert!(
-            legacy_wait_source::lookup_wait_channel(*r).is_none(),
+            tx_substrate::wake::lookup_source(WaitSourceId::new(*r)).is_none(),
             "read slot {r} must be released after EBR retire",
         );
         assert!(
-            legacy_wait_source::lookup_wait_channel(*w).is_none(),
+            tx_substrate::wake::lookup_source(WaitSourceId::new(*w)).is_none(),
             "write slot {w} must be released after EBR retire",
         );
     }

@@ -20,6 +20,7 @@ pub mod require;
 pub mod resolution;
 pub mod structure;
 pub mod walker;
+pub mod xattr;
 
 #[cfg(test)]
 mod tests;
@@ -39,3 +40,4 @@ pub use structure::{
     S_ISVTX, VFS_NAME_MAX,
 };
 pub use walker::{step_open, step_walk, step_walk_in_mount_namespace, SYMLOOP_MAX};
+pub use xattr::{XATTR_CREATE, XATTR_LIST_MAX, XATTR_NAME_MAX, XATTR_REPLACE, XATTR_SIZE_MAX};

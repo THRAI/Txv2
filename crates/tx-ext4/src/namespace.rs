@@ -408,5 +408,245 @@ where
         }
     }
 
-    // `step_chmod`, `step_chown` inherit the trait-default `ENOSYS`.
+    fn get_xattr(
+        &self,
+        fs_object_id: FsObjectId,
+        name: &[u8],
+        value: &mut [u8],
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, NoProgress> {
+        if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_name(name) {
+            return StepOutcome::err(errno.into());
+        }
+        if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_value_len(value.len()) {
+            return StepOutcome::err(errno.into());
+        }
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match self.xattrs(inode) {
+            Ok(attrs) => {
+                let Some(attr) = attrs.iter().find(|attr| attr.name == name) else {
+                    return StepOutcome::err(Errno::ENODATA.into());
+                };
+                if value.is_empty() {
+                    return StepOutcome::done(attr.value.len());
+                }
+                if value.len() < attr.value.len() {
+                    return StepOutcome::err(Errno::ERANGE.into());
+                }
+                value[..attr.value.len()].copy_from_slice(&attr.value);
+                StepOutcome::done(attr.value.len())
+            }
+            Err(err) => StepOutcome::err(err.into()),
+        }
+    }
+
+    fn list_xattr(
+        &self,
+        fs_object_id: FsObjectId,
+        list: &mut [u8],
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, NoProgress> {
+        if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_list_len(list.len()) {
+            return StepOutcome::err(errno.into());
+        }
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match self.xattrs(inode) {
+            Ok(attrs) => {
+                let required = attrs
+                    .iter()
+                    .try_fold(0usize, |acc, attr| acc.checked_add(attr.name.len() + 1));
+                let Some(required) = required else {
+                    return StepOutcome::err(Errno::E2BIG.into());
+                };
+                if required > tx_subsystems::vfs::xattr::XATTR_LIST_MAX {
+                    return StepOutcome::err(Errno::E2BIG.into());
+                }
+                if list.is_empty() {
+                    return StepOutcome::done(required);
+                }
+                if list.len() < required {
+                    return StepOutcome::err(Errno::ERANGE.into());
+                }
+                let mut cursor = 0usize;
+                for attr in attrs {
+                    let end = cursor + attr.name.len();
+                    list[cursor..end].copy_from_slice(&attr.name);
+                    list[end] = 0;
+                    cursor = end + 1;
+                }
+                StepOutcome::done(required)
+            }
+            Err(err) => StepOutcome::err(err.into()),
+        }
+    }
+
+    fn set_xattr(
+        &self,
+        fs_object_id: FsObjectId,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+        cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_name(name) {
+            return StepOutcome::err(errno.into());
+        }
+        if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_value_len(value.len()) {
+            return StepOutcome::err(errno.into());
+        }
+        if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_set_flags(flags) {
+            return StepOutcome::err(errno.into());
+        }
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let meta = match self.inode_meta_cached(inode) {
+            Ok(meta) => map_inode_meta(meta),
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        if let Err(errno) = tx_subsystems::vfs::xattr::check_xattr_write_perm(&meta, cred) {
+            return StepOutcome::err(errno.into());
+        }
+
+        let create = flags & tx_subsystems::vfs::xattr::XATTR_CREATE != 0;
+        let replace = flags & tx_subsystems::vfs::xattr::XATTR_REPLACE != 0;
+        match self.set_xattr_on_disk(inode, name, value, create, replace) {
+            Ok(true) => {
+                self.invalidate_inode_meta(inode);
+                StepOutcome::done(())
+            }
+            Ok(false) if create => StepOutcome::err(Errno::EEXIST.into()),
+            Ok(false) => StepOutcome::err(Errno::ENODATA.into()),
+            Err(err) => StepOutcome::err(err.into()),
+        }
+    }
+
+    fn remove_xattr(
+        &self,
+        fs_object_id: FsObjectId,
+        name: &[u8],
+        cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_name(name) {
+            return StepOutcome::err(errno.into());
+        }
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let meta = match self.inode_meta_cached(inode) {
+            Ok(meta) => map_inode_meta(meta),
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        if let Err(errno) = tx_subsystems::vfs::xattr::check_xattr_write_perm(&meta, cred) {
+            return StepOutcome::err(errno.into());
+        }
+
+        match self.remove_xattr_on_disk(inode, name) {
+            Ok(true) => {
+                self.invalidate_inode_meta(inode);
+                StepOutcome::done(())
+            }
+            Ok(false) => StepOutcome::err(Errno::ENODATA.into()),
+            Err(err) => StepOutcome::err(err.into()),
+        }
+    }
+
+    fn step_chmod(
+        &self,
+        fs_object_id: FsObjectId,
+        new_mode: u16,
+        cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let meta = match self.inode_meta_cached(inode) {
+            Ok(meta) => meta,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let inode_meta = map_inode_meta(meta);
+        if let Err(errno) = tx_subsystems::vfs::predicates::check_chmod_perm(&inode_meta, cred) {
+            return StepOutcome::err(errno.into());
+        }
+        let mut updated = meta;
+        updated.mode = (meta.mode & 0xF000) | (new_mode & 0o7777);
+        match self.with_pager(|pager| pager.write_inode_meta_journaled(inode, updated)) {
+            Ok(_) => {
+                self.invalidate_inode_meta(inode);
+                StepOutcome::done(())
+            }
+            Err(err) => StepOutcome::err(err.into()),
+        }
+    }
+
+    fn step_chown(
+        &self,
+        fs_object_id: FsObjectId,
+        new_uid: Option<u32>,
+        new_gid: Option<u32>,
+        cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let meta = match self.inode_meta_cached(inode) {
+            Ok(meta) => meta,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let inode_meta = map_inode_meta(meta);
+        if let Err(errno) =
+            tx_subsystems::vfs::predicates::check_chown_perm(&inode_meta, new_uid, new_gid, cred)
+        {
+            return StepOutcome::err(errno.into());
+        }
+        let mut updated = meta;
+        if let Some(uid) = new_uid {
+            updated.uid = uid;
+        }
+        if let Some(gid) = new_gid {
+            updated.gid = gid;
+        }
+        let privileged = cred.uid == 0
+            || cred
+                .effective_caps
+                .contains(tx_subsystems::cred::Capability::FOWNER);
+        if !privileged {
+            updated.mode &= !(0o4000 | 0o2000);
+        }
+        match self.with_pager(|pager| pager.write_inode_meta_journaled(inode, updated)) {
+            Ok(_) => {
+                self.invalidate_inode_meta(inode);
+                StepOutcome::done(())
+            }
+            Err(err) => StepOutcome::err(err.into()),
+        }
+    }
 }

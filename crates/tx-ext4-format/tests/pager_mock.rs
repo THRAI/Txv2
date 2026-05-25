@@ -1,12 +1,13 @@
 use tx_ext4_format::ondisk::{
-    crc32c, crc32c_append, metadata_csum32, BitmapMut, BitmapView, CommitHeader, DirEntryIter,
-    DxCountLimit, DxEntry, DxEntryIter, DxRootInfo, Ext4FormatError, Extent, ExtentHeader,
-    ExtentIdx, ExtentNode, GroupDesc, Inode, JournalBlockTag, JournalHeader, Superblock,
-    JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR, JBD2_MAGIC,
+    crc32c, crc32c_append, encode_journal_commit, encode_journal_descriptor, metadata_csum32,
+    parse_journal_descriptor, BitmapMut, BitmapView, CommitHeader, DirEntryIter, DxCountLimit,
+    DxEntry, DxEntryIter, DxRootInfo, Ext4FormatError, Extent, ExtentHeader, ExtentIdx, ExtentNode,
+    GroupDesc, Inode, JournalBlockTag, JournalHeader, Superblock, JBD2_BLOCK_COMMIT,
+    JBD2_BLOCK_DESCRIPTOR, JBD2_MAGIC,
 };
 use tx_ext4_format::pager::{
-    BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, PageRead, WritebackReceipt,
-    BLOCK_SIZE,
+    BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, MetadataUpdate, PageRead,
+    WritebackReceipt, BLOCK_SIZE,
 };
 
 #[derive(Clone)]
@@ -347,11 +348,11 @@ fn pager_writeback_and_journal_replay_on_mock_image() {
         .write_inode_meta_journaled(InodeNo::new(12), updated)
         .unwrap();
     assert_eq!(receipt.sequence, 1);
-    assert_eq!(receipt.target_block, 4);
+    assert_eq!(receipt.target_blocks, vec![4]);
     assert_eq!(receipt.descriptor_block, 41);
-    assert_eq!(receipt.payload_block, 42);
+    assert_eq!(receipt.payload_blocks, vec![42]);
     assert_eq!(receipt.commit_block, 43);
-    assert_eq!(pager.image().barriers, 2);
+    assert_eq!(pager.image().barriers, 3);
 
     let descriptor = pager.image().block(receipt.descriptor_block);
     assert_eq!(
@@ -362,11 +363,12 @@ fn pager_writeback_and_journal_replay_on_mock_image() {
             sequence: 1,
         }
     );
-    let tag = JournalBlockTag::parse(&descriptor[12..20]).unwrap();
-    assert_eq!(tag.block, receipt.target_block as u32);
+    let tags = parse_journal_descriptor(descriptor).unwrap().1;
+    let tag = tags[0];
+    assert_eq!(tag.block, receipt.target_blocks[0] as u32);
     assert_eq!(tag.flags, JournalBlockTag::FLAG_LAST_TAG);
 
-    assert_ne!(
+    assert_eq!(
         pager.inode_meta(InodeNo::new(12)).unwrap().size,
         updated.size
     );
@@ -378,6 +380,152 @@ fn pager_writeback_and_journal_replay_on_mock_image() {
         updated.size
     );
     assert_eq!(pager.inode_meta(InodeNo::new(12)).unwrap().mtime, 99);
+}
+
+#[test]
+fn journal_descriptor_round_trips_multiple_target_tags() {
+    let mut block = [0u8; BLOCK_SIZE];
+    encode_journal_descriptor(7, &[4, 9, 12], &mut block).unwrap();
+    let (header, tags) = parse_journal_descriptor(&block).unwrap();
+    assert_eq!(
+        header,
+        JournalHeader {
+            magic: JBD2_MAGIC,
+            block_type: JBD2_BLOCK_DESCRIPTOR,
+            sequence: 7,
+        }
+    );
+    assert_eq!(tags.len(), 3);
+    assert_eq!(tags[0].block, 4);
+    assert_eq!(tags[0].flags, 0);
+    assert_eq!(tags[1].block, 9);
+    assert_eq!(tags[1].flags, 0);
+    assert_eq!(tags[2].block, 12);
+    assert_eq!(tags[2].flags, JournalBlockTag::FLAG_LAST_TAG);
+}
+
+#[test]
+fn metadata_transaction_coalesces_commits_and_checkpoints_home_blocks() {
+    let mut image = mock_image();
+    *image.block_mut(5) = filled_page(0x05);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let update_a = filled_page(0xA1);
+    let stale = filled_page(0x55);
+    let update_b = filled_page(0xB2);
+    let receipt = pager
+        .commit_metadata_transaction(&[
+            MetadataUpdate {
+                target_block: 4,
+                data: update_a,
+            },
+            MetadataUpdate {
+                target_block: 5,
+                data: stale,
+            },
+            MetadataUpdate {
+                target_block: 5,
+                data: update_b,
+            },
+        ])
+        .unwrap();
+
+    assert_eq!(receipt.sequence, 1);
+    assert_eq!(receipt.target_blocks, vec![4, 5]);
+    assert_eq!(receipt.descriptor_block, 41);
+    assert_eq!(receipt.payload_blocks, vec![42, 43]);
+    assert_eq!(receipt.commit_block, 44);
+    assert_eq!(pager.image().barriers, 3);
+    assert_eq!(pager.image().block(4), &update_a);
+    assert_eq!(pager.image().block(5), &update_b);
+
+    let (_, tags) = parse_journal_descriptor(pager.image().block(41)).unwrap();
+    assert_eq!(
+        tags.iter().map(|tag| tag.block).collect::<Vec<_>>(),
+        vec![4, 5]
+    );
+    assert_eq!(
+        CommitHeader::parse(pager.image().block(44))
+            .unwrap()
+            .sequence,
+        1
+    );
+}
+
+#[test]
+fn journal_replay_applies_committed_multi_block_records_only() {
+    let mut image = mock_image();
+    let before_a = *image.block(4);
+    let before_b = *image.block(5);
+
+    let update_a = filled_page(0xC1);
+    let update_b = filled_page(0xC2);
+    let mut descriptor = [0u8; BLOCK_SIZE];
+    encode_journal_descriptor(1, &[4, 5], &mut descriptor).unwrap();
+    *image.block_mut(41) = descriptor;
+    *image.block_mut(42) = update_a;
+    *image.block_mut(43) = update_b;
+
+    let mut pager = Ext4Pager::open(image.clone()).unwrap();
+    let replay = pager.replay_journal_for_test().unwrap();
+    assert_eq!(replay.transactions, 0);
+    assert_eq!(pager.image().block(4), &before_a);
+    assert_eq!(pager.image().block(5), &before_b);
+
+    let mut commit = [0u8; BLOCK_SIZE];
+    encode_journal_commit(1, &mut commit).unwrap();
+    *image.block_mut(44) = commit;
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let replay = pager.replay_journal_for_test().unwrap();
+    assert_eq!(replay.transactions, 1);
+    assert_eq!(replay.blocks_replayed, 2);
+    assert_eq!(pager.image().block(4), &update_a);
+    assert_eq!(pager.image().block(5), &update_b);
+}
+
+#[test]
+fn xattr_external_block_creation_journals_bitmap_xattr_and_inode_pointer() {
+    let mut image = mock_image();
+    {
+        let mut bitmap = BitmapMut::new(image.block_mut(2));
+        for bit in 0..48 {
+            bitmap.set(bit).unwrap();
+        }
+    }
+    let mut inode = Inode::default();
+    inode.mode = 0x8000 | 0o600;
+    inode.size = BLOCK_SIZE as u64;
+    inode.blocks_512 = 8;
+    inode.links_count = 1;
+    inode.flags = Inode::EXTENTS_FL;
+    inode.extra_isize = 32;
+    inode
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: 1,
+            physical_start: 31,
+        }])
+        .unwrap();
+    write_inode(&mut image, 14, &inode);
+
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let value = [0xAB; 200];
+    assert!(pager
+        .set_xattr(InodeNo::new(14), b"user.large", &value, true, false)
+        .unwrap());
+
+    assert!(BitmapView::new(pager.image().block(2)).is_set(48));
+    assert_eq!(
+        u32::from_le_bytes(pager.image().block(48)[0..4].try_into().unwrap()),
+        tx_ext4_format::xattr::EXT4_XATTR_MAGIC
+    );
+    let raw = &pager.image().block(4)[3328..3584];
+    assert_eq!(Inode::parse(raw).unwrap().file_acl, 48);
+
+    let attrs = pager.xattrs(InodeNo::new(14)).unwrap();
+    assert_eq!(attrs.len(), 1);
+    assert_eq!(attrs[0].name, b"user.large");
+    assert_eq!(attrs[0].value, value);
 }
 
 #[test]

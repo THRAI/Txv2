@@ -45,6 +45,9 @@ pub enum Errno {
     ELOOP,
     ENAMETOOLONG,
     ENODEV,
+    /// No data available. Used by xattr lookups/removes when the
+    /// named attribute is absent. Linux value: 61.
+    ENODATA,
     ENOEXEC,
     ENOMEM,
     ENOENT,
@@ -57,6 +60,9 @@ pub enum Errno {
     /// or the request code is not one of the eight TTY ioctls v1
     /// implements. Linux value: 25.
     ENOTTY,
+    /// Operation not supported on this object/filesystem. Used by
+    /// backend-default xattr methods. Linux value: 95.
+    EOPNOTSUPP,
     EPERM,
     /// Broken pipe: write to a pipe with all readers closed. The
     /// caller is responsible for delivering SIGPIPE before returning
@@ -104,6 +110,7 @@ impl From<Errno> for crate::adapter::step_engine::V3Errno {
             Errno::ELOOP => Self::ELOOP,
             Errno::ENAMETOOLONG => Self::ENAMETOOLONG,
             Errno::ENODEV => Self::ENODEV,
+            Errno::ENODATA => Self::ENODATA,
             Errno::ENOEXEC => Self::ENOEXEC,
             Errno::ENOMEM => Self::ENOMEM,
             Errno::ENOENT => Self::ENOENT,
@@ -111,6 +118,7 @@ impl From<Errno> for crate::adapter::step_engine::V3Errno {
             Errno::ENOTDIR => Self::ENOTDIR,
             Errno::ENOTEMPTY => Self::ENOTEMPTY,
             Errno::ENOTTY => Self::ENOTTY,
+            Errno::EOPNOTSUPP => Self::EOPNOTSUPP,
             Errno::EPERM => Self::EPERM,
             Errno::EPIPE => Self::EPIPE,
             Errno::ERANGE => Self::ERANGE,
@@ -152,6 +160,7 @@ impl From<crate::adapter::step_engine::V3Errno> for Errno {
             V3::ELOOP => Errno::ELOOP,
             V3::ENAMETOOLONG => Errno::ENAMETOOLONG,
             V3::ENODEV => Errno::ENODEV,
+            V3::ENODATA => Errno::ENODATA,
             V3::ENOEXEC => Errno::ENOEXEC,
             V3::ENOMEM => Errno::ENOMEM,
             V3::ENOENT => Errno::ENOENT,
@@ -159,6 +168,7 @@ impl From<crate::adapter::step_engine::V3Errno> for Errno {
             V3::ENOTDIR => Errno::ENOTDIR,
             V3::ENOTEMPTY => Errno::ENOTEMPTY,
             V3::ENOTTY => Errno::ENOTTY,
+            V3::EOPNOTSUPP => Errno::EOPNOTSUPP,
             V3::EPERM => Errno::EPERM,
             V3::EPIPE => Errno::EPIPE,
             V3::ERANGE => Errno::ERANGE,
@@ -235,6 +245,7 @@ mod tests {
             (Errno::ELOOP, V3::ELOOP),
             (Errno::ENAMETOOLONG, V3::ENAMETOOLONG),
             (Errno::ENODEV, V3::ENODEV),
+            (Errno::ENODATA, V3::ENODATA),
             (Errno::ENOEXEC, V3::ENOEXEC),
             (Errno::ENOMEM, V3::ENOMEM),
             (Errno::ENOENT, V3::ENOENT),
@@ -242,6 +253,7 @@ mod tests {
             (Errno::ENOTDIR, V3::ENOTDIR),
             (Errno::ENOTEMPTY, V3::ENOTEMPTY),
             (Errno::ENOTTY, V3::ENOTTY),
+            (Errno::EOPNOTSUPP, V3::EOPNOTSUPP),
             (Errno::EPERM, V3::EPERM),
             (Errno::EPIPE, V3::EPIPE),
             (Errno::ERANGE, V3::ERANGE),

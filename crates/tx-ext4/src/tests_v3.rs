@@ -106,6 +106,78 @@ fn write_inode_at(image: &mut MemImage, ino: u32, inode: &Inode) {
         .unwrap();
 }
 
+fn inode_raw_mut(image: &mut MemImage, ino: u32) -> &mut [u8] {
+    let index = (ino - 1) as usize;
+    let offset = index * 256;
+    let block = 4 + offset / BLOCK_SIZE;
+    let in_block = offset % BLOCK_SIZE;
+    &mut image.block_mut(block as u64)[in_block..in_block + 256]
+}
+
+fn write_u16_le(raw: &mut [u8], offset: usize, value: u16) {
+    raw[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32_le(raw: &mut [u8], offset: usize, value: u32) {
+    raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn encode_xattr_entry(
+    storage: &mut [u8],
+    offset: usize,
+    name: &[u8],
+    value_offs: u16,
+    value: &[u8],
+) -> usize {
+    storage[offset] = name.len() as u8;
+    storage[offset + 1] = 1; // EXT4_XATTR_INDEX_USER
+    write_u16_le(storage, offset + 2, value_offs);
+    write_u32_le(storage, offset + 4, 0);
+    write_u32_le(storage, offset + 8, value.len() as u32);
+    write_u32_le(storage, offset + 12, 0);
+    storage[offset + 16..offset + 16 + name.len()].copy_from_slice(name);
+    let value_start = 4 + value_offs as usize;
+    storage[value_start..value_start + value.len()].copy_from_slice(value);
+    (offset + 16 + name.len() + 3) & !3
+}
+
+fn encode_external_xattr_entry(
+    storage: &mut [u8],
+    offset: usize,
+    name: &[u8],
+    value_offs: u16,
+    value: &[u8],
+) -> usize {
+    storage[offset] = name.len() as u8;
+    storage[offset + 1] = 1; // EXT4_XATTR_INDEX_USER
+    write_u16_le(storage, offset + 2, value_offs);
+    write_u32_le(storage, offset + 4, 0);
+    write_u32_le(storage, offset + 8, value.len() as u32);
+    write_u32_le(storage, offset + 12, 0);
+    storage[offset + 16..offset + 16 + name.len()].copy_from_slice(name);
+    let value_start = value_offs as usize;
+    storage[value_start..value_start + value.len()].copy_from_slice(value);
+    (offset + 16 + name.len() + 3) & !3
+}
+
+fn install_file_inline_xattrs(image: &mut MemImage, ino: u32) {
+    let raw = inode_raw_mut(image, ino);
+    let storage = &mut raw[160..]; // 128-byte base inode + extra_isize 32.
+    write_u32_le(storage, 0, tx_ext4_format::xattr::EXT4_XATTR_MAGIC);
+    let next = encode_xattr_entry(storage, 4, b"zeta", 80, b"last");
+    let next = encode_xattr_entry(storage, next, b"alpha", 84, b"bravo");
+    storage[next..next + 4].fill(0);
+}
+
+fn install_file_external_xattrs(image: &mut MemImage, block: u64) {
+    let storage = image.block_mut(block);
+    write_u32_le(storage, 0, tx_ext4_format::xattr::EXT4_XATTR_MAGIC);
+    write_u32_le(storage, 4, 1); // h_refcount
+    write_u32_le(storage, 8, 1); // h_blocks
+    let next = encode_external_xattr_entry(storage, 32, b"omega", 128, b"external");
+    storage[next..next + 4].fill(0);
+}
+
 fn encode_dir(block: &mut Page4K, entries: &[(u32, u8, &[u8])]) {
     block.fill(0);
     let mut offset = 0usize;
@@ -156,6 +228,21 @@ fn build_image() -> MemImage {
     .encode(&mut image.block_mut(1)[..64])
     .unwrap();
 
+    let mut journal_inode = Inode::default();
+    journal_inode.mode = 0x8000 | 0o600;
+    journal_inode.size = 8 * BLOCK_SIZE as u64;
+    journal_inode.blocks_512 = 64;
+    journal_inode.links_count = 1;
+    journal_inode.flags = Inode::EXTENTS_FL;
+    journal_inode
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: 8,
+            physical_start: 40,
+        }])
+        .unwrap();
+    write_inode_at(&mut image, 8, &journal_inode);
+
     // root inode (ino 2): directory containing "hello" (ino 12).
     let mut root_inode = Inode::default();
     root_inode.mode = 0x4000 | 0o755;
@@ -181,6 +268,8 @@ fn build_image() -> MemImage {
     file_inode.links_count = 1;
     file_inode.blocks_512 = 8;
     file_inode.flags = Inode::EXTENTS_FL;
+    file_inode.extra_isize = 32;
+    file_inode.file_acl = 21;
     file_inode
         .set_extent_root(&[Extent {
             logical_block: 0,
@@ -189,6 +278,8 @@ fn build_image() -> MemImage {
         }])
         .unwrap();
     write_inode_at(&mut image, 12, &file_inode);
+    install_file_inline_xattrs(&mut image, 12);
+    install_file_external_xattrs(&mut image, 21);
 
     encode_dir(
         image.block_mut(16),
@@ -250,6 +341,294 @@ fn ext4_v3_load_inode_meta_returns_done_for_real_inode() {
     };
     assert_eq!(meta.size, BLOCK_SIZE as u64);
     assert_eq!(meta.uid, 1000);
+}
+
+#[test]
+fn ext4_v3_get_and_list_user_xattrs_from_inline_and_external_storage() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = open_fs_read_only();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+
+    let mut value = [0u8; 8];
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::get_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.alpha",
+            &mut value,
+            &cred,
+            &guard,
+        ),
+        V3::<usize, NoProgress>::done(5)
+    );
+    assert_eq!(&value[..5], b"bravo");
+
+    let mut list = [0u8; 32];
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::list_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            &mut list,
+            &cred,
+            &guard,
+        ),
+        V3::<usize, NoProgress>::done(32)
+    );
+    assert_eq!(&list[..32], b"user.alpha\0user.omega\0user.zeta\0");
+
+    let mut external = [0u8; 16];
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::get_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.omega",
+            &mut external,
+            &cred,
+            &guard,
+        ),
+        V3::<usize, NoProgress>::done(8)
+    );
+    assert_eq!(&external[..8], b"external");
+}
+
+#[test]
+fn ext4_v3_xattr_read_errors_and_write_deferral_are_explicit() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = open_fs_read_only();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+
+    let mut tiny = [0u8; 2];
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::get_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.alpha",
+            &mut tiny,
+            &cred,
+            &guard,
+        ),
+        V3::<usize, NoProgress>::err(V3Errno::ERANGE)
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::get_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.missing",
+            &mut tiny,
+            &cred,
+            &guard,
+        ),
+        V3::<usize, NoProgress>::err(V3Errno::ENODATA)
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::get_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"security.selinux",
+            &mut tiny,
+            &cred,
+            &guard,
+        ),
+        V3::<usize, NoProgress>::err(V3Errno::EOPNOTSUPP)
+    );
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::set_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.alpha",
+            b"new",
+            0,
+            &cred,
+            &guard,
+        ),
+        V3::<(), NoProgress>::err(V3Errno::EROFS)
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::remove_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.alpha",
+            &cred,
+            &guard,
+        ),
+        V3::<(), NoProgress>::err(V3Errno::EROFS)
+    );
+}
+
+#[test]
+fn ext4_v3_set_remove_user_xattrs_mutates_inline_and_external_storage() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = open_fs();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::set_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.alpha",
+            b"new",
+            0,
+            &cred,
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    let mut value = [0u8; 8];
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::get_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.alpha",
+            &mut value,
+            &cred,
+            &guard,
+        ),
+        V3::<usize, NoProgress>::done(3)
+    );
+    assert_eq!(&value[..3], b"new");
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::set_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.beta",
+            b"created",
+            tx_subsystems::vfs::xattr::XATTR_CREATE,
+            &cred,
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::set_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.beta",
+            b"again",
+            tx_subsystems::vfs::xattr::XATTR_CREATE,
+            &cred,
+            &guard,
+        ),
+        V3::<(), NoProgress>::err(V3Errno::EEXIST)
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::set_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.missing",
+            b"nope",
+            tx_subsystems::vfs::xattr::XATTR_REPLACE,
+            &cred,
+            &guard,
+        ),
+        V3::<(), NoProgress>::err(V3Errno::ENODATA)
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::remove_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.omega",
+            &cred,
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+
+    let mut list = [0u8; 64];
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::list_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            &mut list,
+            &cred,
+            &guard,
+        ),
+        V3::<usize, NoProgress>::done(31)
+    );
+    assert_eq!(&list[..31], b"user.alpha\0user.beta\0user.zeta\0");
+}
+
+#[test]
+fn ext4_v3_chmod_and_chown_mutate_inode_metadata_through_journal() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = open_fs();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::step_chmod(
+            &*fs,
+            FsObjectId::new(12),
+            0o4755,
+            &cred,
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    let meta = match <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(
+        &*fs,
+        FsObjectId::new(12),
+        &guard,
+    ) {
+        V3::Done(meta) => meta,
+        other => panic!("load after chmod: {other:?}"),
+    };
+    assert_eq!(meta.mode, 0x8000 | 0o4755);
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::step_chown(
+            &*fs,
+            FsObjectId::new(12),
+            Some(2000),
+            Some(3000),
+            &cred,
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    let meta = match <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(
+        &*fs,
+        FsObjectId::new(12),
+        &guard,
+    ) {
+        V3::Done(meta) => meta,
+        other => panic!("load after chown: {other:?}"),
+    };
+    assert_eq!(meta.uid, 2000);
+    assert_eq!(meta.gid, 3000);
+    assert_eq!(meta.mode, 0x8000 | 0o4755);
+}
+
+#[test]
+fn ext4_v3_shared_xattr_blocks_remain_unsupported_for_writes() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let mut image = build_image();
+    write_u32_le(image.block_mut(21), 4, 2);
+    let fs = Ext4FsInstance::open(image, false).expect("open ext4 mem image");
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::set_xattr(
+            &*fs,
+            FsObjectId::new(12),
+            b"user.omega",
+            b"rewrite",
+            0,
+            &cred,
+            &guard,
+        ),
+        V3::<(), NoProgress>::err(V3Errno::ENOSYS)
+    );
 }
 
 #[test]

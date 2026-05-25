@@ -93,6 +93,9 @@ enum TmpfsPayload {
 struct TmpfsInode {
     meta: InodeMeta,
     payload: TmpfsPayload,
+    /// Extended attributes owned by the filesystem backend. Keys are
+    /// full Linux xattr names (for example `user.comment`).
+    xattrs: BTreeMap<Vec<u8>, Vec<u8>>,
     /// Number of hard links. Directories start at 2 (`.` + `..`);
     /// regular files at 1.  Updated by `link`/`unlink`/`rmdir`.
     #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
@@ -111,6 +114,7 @@ impl TmpfsState {
             TmpfsInode {
                 meta: InodeMeta::new(InodeKind::Directory, TMPFS_ROOT_MODE),
                 payload: TmpfsPayload::Directory(BTreeMap::new()),
+                xattrs: BTreeMap::new(),
                 nlink: 2,
             },
         );
@@ -361,6 +365,7 @@ impl FsOps for Tmpfs {
             TmpfsInode {
                 meta,
                 payload: TmpfsPayload::RegularFile { container, size: 0 },
+                xattrs: BTreeMap::new(),
                 nlink: 1,
             },
         );
@@ -547,6 +552,7 @@ impl FsOps for Tmpfs {
             TmpfsInode {
                 meta,
                 payload: TmpfsPayload::Directory(BTreeMap::new()),
+                xattrs: BTreeMap::new(),
                 nlink: 2,
             },
         );
@@ -641,6 +647,7 @@ impl FsOps for Tmpfs {
             TmpfsInode {
                 meta,
                 payload: TmpfsPayload::Symlink(target),
+                xattrs: BTreeMap::new(),
                 nlink: 1,
             },
         );
@@ -859,6 +866,141 @@ impl FsOps for Tmpfs {
         // ownership shifts. Slice mirrors LTP `chown03`'s rule.
         if !privileged {
             inode.meta.mode &= !(S_ISUID | S_ISGID);
+        }
+        StepOutcome::done(())
+    }
+
+    fn get_xattr(
+        &self,
+        fs_object_id: FsObjectId,
+        name: &[u8],
+        value: &mut [u8],
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, NoProgress> {
+        if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_name(name) {
+            return StepOutcome::err(errno.into());
+        }
+        if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_value_len(value.len()) {
+            return StepOutcome::err(errno.into());
+        }
+
+        let state = self.state.lock();
+        let Some(inode) = state.inodes.get(&fs_object_id) else {
+            return StepOutcome::err(step_engine::Errno::ENOENT);
+        };
+        let Some(stored) = inode.xattrs.get(name) else {
+            return StepOutcome::err(step_engine::Errno::ENODATA);
+        };
+        if value.is_empty() {
+            return StepOutcome::done(stored.len());
+        }
+        if value.len() < stored.len() {
+            return StepOutcome::err(step_engine::Errno::ERANGE);
+        }
+        value[..stored.len()].copy_from_slice(stored);
+        StepOutcome::done(stored.len())
+    }
+
+    fn set_xattr(
+        &self,
+        fs_object_id: FsObjectId,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+        cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_name(name) {
+            return StepOutcome::err(errno.into());
+        }
+        if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_value_len(value.len()) {
+            return StepOutcome::err(errno.into());
+        }
+        if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_set_flags(flags) {
+            return StepOutcome::err(errno.into());
+        }
+
+        let mut state = self.state.lock();
+        let Some(inode) = state.inodes.get_mut(&fs_object_id) else {
+            return StepOutcome::err(step_engine::Errno::ENOENT);
+        };
+        if let Err(errno) = tx_subsystems::vfs::xattr::check_xattr_write_perm(&inode.meta, cred) {
+            return StepOutcome::err(errno.into());
+        }
+
+        let exists = inode.xattrs.contains_key(name);
+        if flags & tx_subsystems::vfs::xattr::XATTR_CREATE != 0 && exists {
+            return StepOutcome::err(step_engine::Errno::EEXIST);
+        }
+        if flags & tx_subsystems::vfs::xattr::XATTR_REPLACE != 0 && !exists {
+            return StepOutcome::err(step_engine::Errno::ENODATA);
+        }
+        inode.xattrs.insert(name.to_vec(), value.to_vec());
+        StepOutcome::done(())
+    }
+
+    fn list_xattr(
+        &self,
+        fs_object_id: FsObjectId,
+        list: &mut [u8],
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, NoProgress> {
+        if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_list_len(list.len()) {
+            return StepOutcome::err(errno.into());
+        }
+
+        let state = self.state.lock();
+        let Some(inode) = state.inodes.get(&fs_object_id) else {
+            return StepOutcome::err(step_engine::Errno::ENOENT);
+        };
+        let required = inode
+            .xattrs
+            .keys()
+            .try_fold(0usize, |acc, name| acc.checked_add(name.len() + 1));
+        let Some(required) = required else {
+            return StepOutcome::err(step_engine::Errno::E2BIG);
+        };
+        if required > tx_subsystems::vfs::xattr::XATTR_LIST_MAX {
+            return StepOutcome::err(step_engine::Errno::E2BIG);
+        }
+        if list.is_empty() {
+            return StepOutcome::done(required);
+        }
+        if list.len() < required {
+            return StepOutcome::err(step_engine::Errno::ERANGE);
+        }
+        let mut cursor = 0usize;
+        for name in inode.xattrs.keys() {
+            let end = cursor + name.len();
+            list[cursor..end].copy_from_slice(name);
+            list[end] = 0;
+            cursor = end + 1;
+        }
+        StepOutcome::done(required)
+    }
+
+    fn remove_xattr(
+        &self,
+        fs_object_id: FsObjectId,
+        name: &[u8],
+        cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_name(name) {
+            return StepOutcome::err(errno.into());
+        }
+
+        let mut state = self.state.lock();
+        let Some(inode) = state.inodes.get_mut(&fs_object_id) else {
+            return StepOutcome::err(step_engine::Errno::ENOENT);
+        };
+        if let Err(errno) = tx_subsystems::vfs::xattr::check_xattr_write_perm(&inode.meta, cred) {
+            return StepOutcome::err(errno.into());
+        }
+        if inode.xattrs.remove(name).is_none() {
+            return StepOutcome::err(step_engine::Errno::ENODATA);
         }
         StepOutcome::done(())
     }

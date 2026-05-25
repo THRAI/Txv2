@@ -10,6 +10,31 @@
 //! today. Phase 2b adds `read` (63), `brk` (214), `rt_sigprocmask`
 //! (135), and `rt_sigaction` (134).
 
+/// `setxattr(path, name, value, size, flags)`. Linux RV64 generic ABI.
+pub const NR_SETXATTR: u64 = 5;
+/// `lsetxattr(path, name, value, size, flags)`. Linux RV64 generic ABI.
+pub const NR_LSETXATTR: u64 = 6;
+/// `fsetxattr(fd, name, value, size, flags)`. Linux RV64 generic ABI.
+pub const NR_FSETXATTR: u64 = 7;
+/// `getxattr(path, name, value, size)`. Linux RV64 generic ABI.
+pub const NR_GETXATTR: u64 = 8;
+/// `lgetxattr(path, name, value, size)`. Linux RV64 generic ABI.
+pub const NR_LGETXATTR: u64 = 9;
+/// `fgetxattr(fd, name, value, size)`. Linux RV64 generic ABI.
+pub const NR_FGETXATTR: u64 = 10;
+/// `listxattr(path, list, size)`. Linux RV64 generic ABI.
+pub const NR_LISTXATTR: u64 = 11;
+/// `llistxattr(path, list, size)`. Linux RV64 generic ABI.
+pub const NR_LLISTXATTR: u64 = 12;
+/// `flistxattr(fd, list, size)`. Linux RV64 generic ABI.
+pub const NR_FLISTXATTR: u64 = 13;
+/// `removexattr(path, name)`. Linux RV64 generic ABI.
+pub const NR_REMOVEXATTR: u64 = 14;
+/// `lremovexattr(path, name)`. Linux RV64 generic ABI.
+pub const NR_LREMOVEXATTR: u64 = 15;
+/// `fremovexattr(fd, name)`. Linux RV64 generic ABI.
+pub const NR_FREMOVEXATTR: u64 = 16;
+
 /// `write(fd, buf, count)`. Linux generic ABI `__NR_write`.
 pub const NR_WRITE: u64 = 64;
 /// `read(fd, buf, count)`. Linux generic ABI `__NR_read`.
@@ -61,6 +86,10 @@ pub const NR_ACCEPT4: u64 = 242;
 pub const NR_FANOTIFY_INIT: u64 = 262;
 /// `fanotify_mark(fanotify_fd, flags, mask, dfd, pathname)`. Linux RV64 generic ABI.
 pub const NR_FANOTIFY_MARK: u64 = 263;
+/// `name_to_handle_at(dfd, name, handle, mnt_id, flags)`. Linux RV64 generic ABI.
+pub const NR_NAME_TO_HANDLE_AT: u64 = 264;
+/// `open_by_handle_at(mountdirfd, handle, flags)`. Linux RV64 generic ABI.
+pub const NR_OPEN_BY_HANDLE_AT: u64 = 265;
 /// `sendfile64(out_fd, in_fd, offset, count)`. Linux generic ABI
 /// `__NR_sendfile64`. Copies data from `in_fd` to `out_fd` via
 /// page-level transfer without an intermediate userspace buffer.
@@ -157,6 +186,8 @@ pub const NR_INOTIFY_RM_WATCH: u64 = 28;
 /// discarded). On `Err(_)` the standard `ExecError → -errno` mapping
 /// applies (cite: `txdoc:EXEC-12-1-INSTALL-USER-TRAP-CONTEXT`).
 pub const NR_EXECVE: u64 = 221;
+/// `execveat(fd, path, argv, envp, flags)`. Linux RV64 generic ABI.
+pub const NR_EXECVEAT: u64 = 281;
 /// `getgroups(gidsetsize, grouplist)`. Linux RV64 generic ABI
 /// `__NR_getgroups = 158`. txKernel v1 does not model supplementary
 /// groups, so this reports zero entries and performs no writes.
@@ -256,14 +287,20 @@ pub const NR_DUP: u64 = 23;
 /// `O_CLOEXEC`; other bits return `-EINVAL`.
 pub const NR_DUP3: u64 = 24;
 /// `openat(dirfd, path, flags, mode)`. Linux RV64 generic ABI
-/// `__NR_openat = 56`. Wave 2's slice surface only supports
-/// `dirfd == AT_FDCWD`; non-cwd dirfds return `-EBADF` (the slice's
-/// fd table doesn't carry directory-fd semantics yet). The walker
-/// resolves the path via `vfs::step_open` using the caller's
-/// `walker_cred()` (effective ids per POSIX). On `O_CREAT` against a
-/// missing file, the syscall arm walks the parent dir and calls
-/// `FsOps::create_inode` before re-running `step_open`.
+/// `__NR_openat = 56`. The syscall-facing resolver facade handles
+/// `AT_FDCWD`, real directory fds, absolute paths, and the caller's
+/// mount namespace before `openat` materialises the `OpenFile`.
 pub const NR_OPENAT: u64 = 56;
+/// `openat2(dirfd, path, struct open_how *, size)`. Linux RV64 generic ABI.
+pub const NR_OPENAT2: u64 = 437;
+/// `setxattrat(dirfd, path, at_flags, name, args, args_size)`. Linux RV64 ABI.
+pub const NR_SETXATTRAT: u64 = 463;
+/// `getxattrat(dirfd, path, at_flags, name, args, args_size)`. Linux RV64 ABI.
+pub const NR_GETXATTRAT: u64 = 464;
+/// `listxattrat(dirfd, path, at_flags, list, size)`. Linux RV64 ABI.
+pub const NR_LISTXATTRAT: u64 = 465;
+/// `removexattrat(dirfd, path, at_flags, name)`. Linux RV64 ABI.
+pub const NR_REMOVEXATTRAT: u64 = 466;
 /// `close(fd)`. Linux RV64 generic ABI `__NR_close = 57`. Removes
 /// the `OpenFile` cap from the fd table (EBR-deferred reclamation
 /// fires the OpenFile's `Drop`) and clears the cloexec bit. `-EBADF`
@@ -1031,9 +1068,9 @@ pub const NR_GETDENTS64: u64 = 61;
 /// `newfstatat(dirfd, path, statbuf, flags)`. Linux RV64 generic ABI
 /// `__NR_newfstatat = 79`.
 ///
-/// Slice 6's surface: `dirfd == AT_FDCWD` only (non-cwd dirfds return
-/// `-EBADF`). `AT_EMPTY_PATH` paired with an empty path stats the
-/// caller's cwd directly. `AT_SYMLINK_NOFOLLOW` is **deferred** —
+/// Directory-fd path walks route through the syscall-facing resolver facade.
+/// `AT_EMPTY_PATH` paired with an empty path stats the caller's cwd or the
+/// supplied fd. `AT_SYMLINK_NOFOLLOW` is **deferred** —
 /// the walker always follows symlinks at resolution time today
 /// (Wave 3's symlink budget guards cycles, but a "stop on terminal
 /// symlink" flag isn't plumbed yet). Documented carryover.
@@ -1065,10 +1102,13 @@ pub const NR_GETCPU: u64 = 168;
 
 /// `AT_EMPTY_PATH = 0x1000` flag bit (4th arg of `newfstatat`). When
 /// set with an empty path, the syscall operates on the dirfd itself
-/// (or, for `AT_FDCWD`, the caller's cwd). Slice 6 honours this only
-/// for `AT_FDCWD + ""`; non-cwd dirfds with `AT_EMPTY_PATH` return
-/// `-EBADF` (same as the dirfd-rejection path).
+/// (or, for `AT_FDCWD`, the caller's cwd).
 pub const AT_EMPTY_PATH: u32 = 0x1000;
+
+/// `setxattr` flag: fail if the named attribute already exists.
+pub const XATTR_CREATE: u32 = tx_subsystems::vfs::XATTR_CREATE;
+/// `setxattr` flag: fail if the named attribute does not exist.
+pub const XATTR_REPLACE: u32 = tx_subsystems::vfs::XATTR_REPLACE;
 /// `AT_NO_AUTOMOUNT = 0x800` flag bit (4th arg of `newfstatat`).
 /// Slice 6 has no automount machinery — the bit is recognised but
 /// ignored. Documented carryover; matches Linux's

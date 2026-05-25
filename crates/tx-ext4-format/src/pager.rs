@@ -3,7 +3,11 @@ use crate::ondisk::{
     BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry, DirEntryIter, Extent, ExtentNode,
     GroupDesc, Inode, InodeLocation, InodeTableLayout, Superblock,
 };
-use crate::ondisk::{read_u16_le, write_u16_le};
+use crate::ondisk::{read_u16_le, read_u32_le, write_u16_le};
+use crate::xattr::{
+    encode_external_xattr_block, encode_inline_xattrs, parse_external_xattr_block,
+    parse_inline_xattrs, InlineXattr,
+};
 use crate::{Ext4FormatError, Result};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -95,13 +99,19 @@ pub struct WritebackReceipt {
     pub physical_block: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalReceipt {
     pub sequence: u32,
-    pub target_block: u64,
+    pub target_blocks: Vec<u64>,
     pub descriptor_block: u64,
-    pub payload_block: u64,
+    pub payload_blocks: Vec<u64>,
     pub commit_block: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataUpdate {
+    pub target_block: u64,
+    pub data: Page4K,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +126,8 @@ pub struct Ext4Pager<I> {
     groups: Vec<GroupDesc>,
     inode_table: InodeTableLayout,
     journal_start: Option<u64>,
+    journal_blocks: Option<u64>,
+    journal_cursor: u64,
     next_sequence: u32,
 }
 
@@ -131,6 +143,8 @@ impl<I: BlockImage> Ext4Pager<I> {
                 first_inode_table_block: 0,
             },
             journal_start: None,
+            journal_blocks: None,
+            journal_cursor: 0,
             next_sequence: 1,
         };
         let mut block = [0u8; BLOCK_SIZE];
@@ -147,13 +161,16 @@ impl<I: BlockImage> Ext4Pager<I> {
         pager.superblock = superblock;
         pager.groups = groups;
         pager.inode_table = InodeTableLayout::from_superblock_group(&superblock, &group);
-        pager.journal_start = pager
-            .read_inode(InodeNo::new(superblock.journal_inode))
-            .ok()
-            .and_then(|inode| match pager.resolve_inode_block(&inode, 0).ok()? {
-                BlockMapping::Data(block) => Some(block),
-                _ => None,
-            });
+        if let Ok(inode) = pager.read_inode(InodeNo::new(superblock.journal_inode)) {
+            if let Ok(BlockMapping::Data(block)) = pager.resolve_inode_block(&inode, 0) {
+                let blocks = inode.size / BLOCK_SIZE as u64;
+                if blocks > 1 {
+                    pager.journal_start = Some(block);
+                    pager.journal_blocks = Some(blocks);
+                    pager.journal_cursor = block + 1;
+                }
+            }
+        }
         Ok(pager)
     }
 
@@ -167,6 +184,113 @@ impl<I: BlockImage> Ext4Pager<I> {
 
     pub fn inode_meta(&mut self, inode: InodeNo) -> Result<InodeMetaLite> {
         self.read_inode(inode).map(inode_to_meta)
+    }
+
+    pub fn xattrs(&mut self, inode: InodeNo) -> Result<Vec<InlineXattr>> {
+        let location = self.inode_location(inode)?;
+        let mut block = [0u8; BLOCK_SIZE];
+        self.image.read_block(location.block, &mut block)?;
+        let raw = &block[location.offset..location.offset + location.len];
+        let disk_inode = Inode::parse(raw)?;
+        let mut attrs = parse_inline_xattrs(&disk_inode, raw)?;
+        if disk_inode.file_acl != 0 {
+            let mut xattr_block = [0u8; BLOCK_SIZE];
+            self.image
+                .read_block(disk_inode.file_acl, &mut xattr_block)?;
+            attrs.extend(parse_external_xattr_block(
+                &self.superblock,
+                disk_inode.file_acl,
+                &xattr_block,
+            )?);
+            attrs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        }
+        Ok(attrs)
+    }
+
+    pub fn set_xattr(
+        &mut self,
+        inode: InodeNo,
+        name: &[u8],
+        value: &[u8],
+        create: bool,
+        replace: bool,
+    ) -> Result<bool> {
+        let mut attrs = self.xattrs(inode)?;
+        let found = attrs.iter().position(|attr| attr.name == name);
+        match (found, create, replace) {
+            (Some(_), true, _) => return Ok(false),
+            (None, _, true) => return Ok(false),
+            (Some(index), _, _) => attrs[index].value = value.to_vec(),
+            (None, _, _) => attrs.push(InlineXattr {
+                name: name.to_vec(),
+                value: value.to_vec(),
+            }),
+        }
+        attrs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        self.write_xattrs(inode, &attrs)?;
+        Ok(true)
+    }
+
+    pub fn remove_xattr(&mut self, inode: InodeNo, name: &[u8]) -> Result<bool> {
+        let mut attrs = self.xattrs(inode)?;
+        let Some(index) = attrs.iter().position(|attr| attr.name == name) else {
+            return Ok(false);
+        };
+        attrs.remove(index);
+        self.write_xattrs(inode, &attrs)?;
+        Ok(true)
+    }
+
+    fn write_xattrs(&mut self, inode: InodeNo, attrs: &[InlineXattr]) -> Result<()> {
+        let location = self.inode_location(inode)?;
+        let mut inode_block = [0u8; BLOCK_SIZE];
+        self.image.read_block(location.block, &mut inode_block)?;
+        let raw = &mut inode_block[location.offset..location.offset + location.len];
+        let mut disk_inode = Inode::parse(raw)?;
+
+        if disk_inode.file_acl == 0 && encode_inline_xattrs(&disk_inode, raw, attrs)? {
+            self.commit_metadata_transaction(&[MetadataUpdate {
+                target_block: location.block,
+                data: inode_block,
+            }])?;
+            return Ok(());
+        }
+
+        let mut updates = Vec::new();
+        let xattr_block_nr = if disk_inode.file_acl == 0 {
+            let (block, bitmap_block, bitmap) = self.allocate_block_update()?;
+            updates.push(MetadataUpdate {
+                target_block: bitmap_block,
+                data: bitmap,
+            });
+            disk_inode.file_acl = block;
+            disk_inode.blocks_512 = disk_inode
+                .blocks_512
+                .saturating_add((BLOCK_SIZE / 512) as u64);
+            block
+        } else {
+            let mut current = [0u8; BLOCK_SIZE];
+            self.image.read_block(disk_inode.file_acl, &mut current)?;
+            if read_u32_le(&current, 4)? != 1 {
+                return Err(Ext4FormatError::Unsupported);
+            }
+            disk_inode.file_acl
+        };
+
+        let mut xattr_block = [0u8; BLOCK_SIZE];
+        encode_external_xattr_block(&self.superblock, xattr_block_nr, &mut xattr_block, attrs)?;
+        let _ = encode_inline_xattrs(&disk_inode, raw, &[])?;
+        disk_inode.encode(raw)?;
+        updates.push(MetadataUpdate {
+            target_block: xattr_block_nr,
+            data: xattr_block,
+        });
+        updates.push(MetadataUpdate {
+            target_block: location.block,
+            data: inode_block,
+        });
+        self.commit_metadata_transaction(&updates)?;
+        Ok(())
     }
 
     pub fn read_page(
@@ -270,7 +394,6 @@ impl<I: BlockImage> Ext4Pager<I> {
         inode: InodeNo,
         meta: InodeMetaLite,
     ) -> Result<JournalReceipt> {
-        let journal_start = self.journal_start.ok_or(Ext4FormatError::Unsupported)?;
         let location = self.inode_location(inode)?;
         let mut home_block = [0u8; BLOCK_SIZE];
         self.image.read_block(location.block, &mut home_block)?;
@@ -278,29 +401,95 @@ impl<I: BlockImage> Ext4Pager<I> {
             Inode::parse(&home_block[location.offset..location.offset + location.len])?;
         apply_meta(&mut disk_inode, meta);
         disk_inode.encode(&mut home_block[location.offset..location.offset + location.len])?;
+        self.commit_metadata_transaction(&[MetadataUpdate {
+            target_block: location.block,
+            data: home_block,
+        }])
+    }
+
+    pub fn commit_metadata_transaction(
+        &mut self,
+        updates: &[MetadataUpdate],
+    ) -> Result<JournalReceipt> {
+        let journal_start = self.journal_start.ok_or(Ext4FormatError::Unsupported)?;
+        let journal_blocks = self.journal_blocks.ok_or(Ext4FormatError::Unsupported)?;
+        let mut coalesced: Vec<MetadataUpdate> = Vec::new();
+        for update in updates {
+            if update.target_block > u32::MAX as u64 {
+                return Err(Ext4FormatError::OutOfBounds);
+            }
+            if let Some(existing) = coalesced
+                .iter_mut()
+                .find(|existing| existing.target_block == update.target_block)
+            {
+                existing.data = update.data;
+            } else {
+                coalesced.push(update.clone());
+            }
+        }
+        if coalesced.is_empty() {
+            return Err(Ext4FormatError::OutOfBounds);
+        }
+        let log_blocks = coalesced
+            .len()
+            .checked_add(2)
+            .ok_or(Ext4FormatError::OutOfBounds)? as u64;
+        if journal_blocks <= 1 || log_blocks > journal_blocks - 1 {
+            return Err(Ext4FormatError::OutOfBounds);
+        }
+        let journal_end = journal_start
+            .checked_add(journal_blocks)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        if self.journal_cursor < journal_start + 1 || self.journal_cursor + log_blocks > journal_end
+        {
+            self.journal_cursor = journal_start + 1;
+        }
 
         let sequence = self.next_sequence;
-        let descriptor_block = journal_start + 1 + ((sequence - 1) as u64 * 3);
-        let payload_block = descriptor_block + 1;
-        let commit_block = descriptor_block + 2;
+        let descriptor_block = self.journal_cursor;
+        let payload_blocks: Vec<u64> = (0..coalesced.len())
+            .map(|idx| descriptor_block + 1 + idx as u64)
+            .collect();
+        let commit_block = descriptor_block + 1 + coalesced.len() as u64;
 
         let mut descriptor = [0u8; BLOCK_SIZE];
-        encode_journal_descriptor(sequence, location.block as u32, &mut descriptor)?;
+        let target32: Vec<u32> = coalesced
+            .iter()
+            .map(|update| update.target_block as u32)
+            .collect();
+        // Linux JBD2 and rsext4 both use descriptor/payload/commit ordering for
+        // metadata durability. Tx v1 checkpoints synchronously after commit,
+        // so the journal is a bounded recovery log rather than a batched tail.
+        encode_journal_descriptor(sequence, &target32, &mut descriptor)?;
         let mut commit = [0u8; BLOCK_SIZE];
         encode_journal_commit(sequence, &mut commit)?;
 
         self.image.write_block(descriptor_block, &descriptor)?;
-        self.image.write_block(payload_block, &home_block)?;
+        for (idx, update) in coalesced.iter().enumerate() {
+            self.image.write_block(payload_blocks[idx], &update.data)?;
+        }
         self.image.barrier()?;
         self.image.write_block(commit_block, &commit)?;
         self.image.barrier()?;
+        for update in &coalesced {
+            self.image.write_block(update.target_block, &update.data)?;
+        }
+        let next_cursor = commit_block + 1;
+        if next_cursor < journal_end {
+            self.image.write_block(next_cursor, &[0u8; BLOCK_SIZE])?;
+        }
+        self.image.barrier()?;
+        self.journal_cursor = next_cursor;
+        if self.journal_cursor >= journal_end {
+            self.journal_cursor = journal_start + 1;
+        }
         self.next_sequence = self.next_sequence.saturating_add(1);
 
         Ok(JournalReceipt {
             sequence,
-            target_block: location.block,
+            target_blocks: coalesced.iter().map(|update| update.target_block).collect(),
             descriptor_block,
-            payload_block,
+            payload_blocks,
             commit_block,
         })
     }
@@ -337,31 +526,45 @@ impl<I: BlockImage> Ext4Pager<I> {
 
     pub fn replay_journal_for_test(&mut self) -> Result<ReplayReport> {
         let journal_start = self.journal_start.ok_or(Ext4FormatError::Unsupported)?;
+        let journal_blocks = self.journal_blocks.ok_or(Ext4FormatError::Unsupported)?;
+        let journal_end = journal_start
+            .checked_add(journal_blocks)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
         let mut cursor = journal_start + 1;
         let mut transactions = 0u32;
         let mut blocks_replayed = 0u32;
         loop {
-            if cursor + 2 >= self.image.total_blocks() {
+            if cursor + 2 >= journal_end || cursor + 2 >= self.image.total_blocks() {
                 break;
             }
             let mut descriptor = [0u8; BLOCK_SIZE];
             self.image.read_block(cursor, &mut descriptor)?;
-            let (header, tag) = match parse_journal_descriptor(&descriptor) {
-                Ok((header, tag)) => (header, tag),
+            let (header, tags) = match parse_journal_descriptor(&descriptor) {
+                Ok((header, tags)) => (header, tags),
                 _ => break,
             };
+            let commit_block = cursor + 1 + tags.len() as u64;
+            if commit_block >= journal_end || commit_block >= self.image.total_blocks() {
+                break;
+            }
             let mut commit = [0u8; BLOCK_SIZE];
-            self.image.read_block(cursor + 2, &mut commit)?;
-            let commit = CommitHeader::parse(&commit)?;
+            self.image.read_block(commit_block, &mut commit)?;
+            let commit = match CommitHeader::parse(&commit) {
+                Ok(commit) => commit,
+                Err(_) => break,
+            };
             if commit.sequence != header.sequence {
                 break;
             }
-            let mut payload = [0u8; BLOCK_SIZE];
-            self.image.read_block(cursor + 1, &mut payload)?;
-            self.image.write_block(tag.block as u64, &payload)?;
-            blocks_replayed += 1;
+            for (idx, tag) in tags.iter().enumerate() {
+                let mut payload = [0u8; BLOCK_SIZE];
+                self.image
+                    .read_block(cursor + 1 + idx as u64, &mut payload)?;
+                self.image.write_block(tag.block as u64, &payload)?;
+                blocks_replayed += 1;
+            }
             transactions += 1;
-            cursor += 3;
+            cursor = commit_block + 1;
         }
         Ok(ReplayReport {
             transactions,
@@ -398,6 +601,12 @@ impl<I: BlockImage> Ext4Pager<I> {
     /// Allocate a free data block in group 0, mark it used, and return its
     /// absolute block number.
     pub fn allocate_block(&mut self) -> Result<u64> {
+        let (block, bitmap_block, bitmap) = self.allocate_block_update()?;
+        self.image.write_block(bitmap_block, &bitmap)?;
+        Ok(block)
+    }
+
+    fn allocate_block_update(&mut self) -> Result<(u64, u64, Page4K)> {
         let group = *self.groups.first().ok_or(Ext4FormatError::Corrupt)?;
         let bitmap_block = group.block_bitmap_block();
         let mut bitmap = [0u8; BLOCK_SIZE];
@@ -406,8 +615,11 @@ impl<I: BlockImage> Ext4Pager<I> {
             .first_zero()
             .ok_or(Ext4FormatError::OutOfBounds)?;
         BitmapMut::new(&mut bitmap).set(bit)?;
-        self.image.write_block(bitmap_block, &bitmap)?;
-        Ok(self.superblock.first_data_block as u64 + bit as u64)
+        Ok((
+            self.superblock.first_data_block as u64 + bit as u64,
+            bitmap_block,
+            bitmap,
+        ))
     }
 
     /// Insert a new directory entry `(name → new_ino)` into an existing

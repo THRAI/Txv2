@@ -67,6 +67,9 @@ pub enum Errno {
     ELOOP,
     ENAMETOOLONG,
     ENODEV,
+    /// No data available. Used by xattr lookups/removes when the
+    /// named attribute is absent. Linux value: 61.
+    ENODATA,
     ENOEXEC,
     ENOMEM,
     ENOENT,
@@ -79,6 +82,9 @@ pub enum Errno {
     /// or the request code is not one of the eight TTY ioctls v1
     /// implements. Linux value: 25.
     ENOTTY,
+    /// Operation not supported on this object/filesystem. Used by
+    /// backend-default xattr methods. Linux value: 95.
+    EOPNOTSUPP,
     EPERM,
     /// Broken pipe: write to a pipe with all readers closed. The
     /// caller is responsible for delivering SIGPIPE before returning
@@ -124,6 +130,7 @@ impl Errno {
             Errno::ELOOP => 40,
             Errno::ENAMETOOLONG => 36,
             Errno::ENODEV => 19,
+            Errno::ENODATA => 61,
             Errno::ENOEXEC => 8,
             Errno::ENOMEM => 12,
             Errno::ENOENT => 2,
@@ -131,6 +138,7 @@ impl Errno {
             Errno::ENOTDIR => 20,
             Errno::ENOTEMPTY => 39,
             Errno::ENOTTY => 25,
+            Errno::EOPNOTSUPP => 95,
             Errno::EPERM => 1,
             Errno::EPIPE => 32,
             Errno::ERANGE => 34,

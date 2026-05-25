@@ -24,6 +24,7 @@ use crate::vfs::structure::{
 use crate::vfs::FsOps;
 
 use super::{step_open, step_walk, step_walk_in_mount_namespace, SYMLOOP_MAX};
+use crate::vfs::require;
 
 // === capturing char-device binding for the console TTY ================
 
@@ -711,6 +712,49 @@ fn step_walk_uses_mount_namespace_table_before_global_fallback() {
         V3::Err(V3Errno::ENOENT) => {}
         other => panic!("expected namespace without mount to hide /dev contents, got {other:?}"),
     }
+}
+
+#[test]
+fn require_parent_and_name_resolves_absolute_parent_path() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs();
+    let dir = topo.rootfs.add_dir(FsObjectId::new(2), b"dir");
+    let guard = guard();
+    let cred = Credential::root();
+
+    let witness =
+        require::require_parent_and_name(topo.root_dentry.clone(), b"/dir/new", &cred, &guard)
+            .expect("parent witness");
+
+    assert_eq!(witness.name.as_bytes(), b"new");
+    assert_eq!(witness.parent.rnode().fs_object_id(), dir);
+}
+
+#[test]
+fn resolution_parent_and_name_mode_stops_at_penultimate_component() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs();
+    let dir = topo.rootfs.add_dir(FsObjectId::new(2), b"dir");
+    let guard = guard();
+    let cred = Credential::root();
+
+    let resolved = crate::vfs::resolution::driver::walk_to_completion(
+        topo.root_dentry.clone(),
+        b"/dir/new",
+        crate::vfs::resolution::state::WalkMode::ParentAndName,
+        crate::vfs::resolution::state::FinalSymlinkPolicy::Follow,
+        &cred,
+        &guard,
+    )
+    .expect("parent resolution");
+
+    assert_eq!(resolved.fs_object_id, dir);
 }
 
 // === DAC predicate tests (Wave 3 Part 2) ==============================

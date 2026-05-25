@@ -176,13 +176,13 @@ async fn journaled_inode_meta_write_awaits_ordered_descriptor_payload_commit() {
             .unwrap(),
         JournalReceipt {
             sequence: 1,
-            target_block: 4,
+            target_blocks: vec![4],
             descriptor_block: 41,
-            payload_block: 42,
+            payload_blocks: vec![42],
             commit_block: 43,
         }
     );
-    assert_eq!(image.counts().2, 2);
+    assert_eq!(image.counts().2, 3);
 
     let descriptor = image.block(41);
     assert_eq!(
@@ -197,7 +197,7 @@ async fn journaled_inode_meta_write_awaits_ordered_descriptor_payload_commit() {
         JournalBlockTag::parse(&descriptor[12..20]).unwrap().block,
         4
     );
-    assert_ne!(
+    assert_eq!(
         fs.inode_meta(FsObjectId::new(12)).await.unwrap().size,
         meta.size
     );

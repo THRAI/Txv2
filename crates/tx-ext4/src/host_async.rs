@@ -76,12 +76,12 @@ pub struct InodeMeta {
     pub mtime: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalReceipt {
     pub sequence: u32,
-    pub target_block: u64,
+    pub target_blocks: Vec<u64>,
     pub descriptor_block: u64,
-    pub payload_block: u64,
+    pub payload_blocks: Vec<u64>,
     pub commit_block: u64,
 }
 
@@ -96,6 +96,8 @@ pub struct Ext4Async<D> {
     superblock: Superblock,
     groups: Vec<GroupDesc>,
     journal_start: Option<u64>,
+    journal_blocks: Option<u64>,
+    journal_cursor: Mutex<u64>,
     next_sequence: Mutex<u32>,
     page_cache: Mutex<BTreeMap<(FsObjectId, u64), Page4K>>,
 }
@@ -117,6 +119,8 @@ impl<D: AsyncBlockDevice> Ext4Async<D> {
             superblock,
             groups,
             journal_start: None,
+            journal_blocks: None,
+            journal_cursor: Mutex::new(0),
             next_sequence: Mutex::new(1),
             page_cache: Mutex::new(BTreeMap::new()),
         };
@@ -125,7 +129,16 @@ impl<D: AsyncBlockDevice> Ext4Async<D> {
             .await
         {
             Ok(inode) => match fs.resolve_inode_block(&inode, 0).await? {
-                BlockMapping::Data(block) => Some(block),
+                BlockMapping::Data(block) => {
+                    let blocks = inode.size / BLOCK_SIZE as u64;
+                    if blocks > 1 {
+                        fs.journal_blocks = Some(blocks);
+                        *fs.journal_cursor.lock().unwrap() = block + 1;
+                        Some(block)
+                    } else {
+                        None
+                    }
+                }
                 BlockMapping::Hole | BlockMapping::NeedNode(_) => None,
             },
             Err(_) => None,
@@ -255,6 +268,7 @@ impl<D: AsyncBlockDevice> Ext4Async<D> {
         meta: InodeMeta,
     ) -> Result<JournalReceipt> {
         let journal_start = self.journal_start.ok_or(Ext4FormatError::Unsupported)?;
+        let journal_blocks = self.journal_blocks.ok_or(Ext4FormatError::Unsupported)?;
         let location = self.inode_location(fs_object_id)?;
         let mut home_block = [0u8; BLOCK_SIZE];
         self.device
@@ -270,12 +284,29 @@ impl<D: AsyncBlockDevice> Ext4Async<D> {
             *guard = sequence.saturating_add(1);
             sequence
         };
-        let descriptor_block = journal_start + 1 + ((sequence - 1) as u64 * 3);
+        let journal_end = journal_start
+            .checked_add(journal_blocks)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        if journal_blocks < 4 {
+            return Err(Ext4FormatError::OutOfBounds);
+        }
+        let descriptor_block = {
+            let mut cursor = self.journal_cursor.lock().unwrap();
+            if *cursor < journal_start + 1 || *cursor + 3 > journal_end {
+                *cursor = journal_start + 1;
+            }
+            let block = *cursor;
+            *cursor += 3;
+            if *cursor >= journal_end {
+                *cursor = journal_start + 1;
+            }
+            block
+        };
         let payload_block = descriptor_block + 1;
         let commit_block = descriptor_block + 2;
 
         let mut descriptor = [0u8; BLOCK_SIZE];
-        encode_journal_descriptor(sequence, location.block as u32, &mut descriptor)?;
+        encode_journal_descriptor(sequence, &[location.block as u32], &mut descriptor)?;
         let mut commit = [0u8; BLOCK_SIZE];
         encode_journal_commit(sequence, &mut commit)?;
 
@@ -286,43 +317,65 @@ impl<D: AsyncBlockDevice> Ext4Async<D> {
         self.device.barrier().await?;
         self.device.write_block(commit_block, &commit).await?;
         self.device.barrier().await?;
+        self.device.write_block(location.block, &home_block).await?;
+        if commit_block + 1 < journal_end {
+            self.device
+                .write_block(commit_block + 1, &[0u8; BLOCK_SIZE])
+                .await?;
+        }
+        self.device.barrier().await?;
 
         Ok(JournalReceipt {
             sequence,
-            target_block: location.block,
+            target_blocks: alloc::vec![location.block],
             descriptor_block,
-            payload_block,
+            payload_blocks: alloc::vec![payload_block],
             commit_block,
         })
     }
 
     pub async fn replay_journal_for_test(&self) -> Result<ReplayReport> {
         let journal_start = self.journal_start.ok_or(Ext4FormatError::Unsupported)?;
+        let journal_blocks = self.journal_blocks.ok_or(Ext4FormatError::Unsupported)?;
+        let journal_end = journal_start
+            .checked_add(journal_blocks)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
         let mut cursor = journal_start + 1;
         let mut transactions = 0u32;
         let mut blocks_replayed = 0u32;
         loop {
-            if cursor + 2 >= self.device.total_blocks() {
+            if cursor + 2 >= journal_end || cursor + 2 >= self.device.total_blocks() {
                 break;
             }
             let mut descriptor = [0u8; BLOCK_SIZE];
             self.device.read_block(cursor, &mut descriptor).await?;
-            let (header, tag) = match parse_journal_descriptor(&descriptor) {
+            let (header, tags) = match parse_journal_descriptor(&descriptor) {
                 Ok(parsed) => parsed,
                 Err(_) => break,
             };
+            let commit_block = cursor + 1 + tags.len() as u64;
+            if commit_block >= journal_end || commit_block >= self.device.total_blocks() {
+                break;
+            }
             let mut commit = [0u8; BLOCK_SIZE];
-            self.device.read_block(cursor + 2, &mut commit).await?;
-            let commit = CommitHeader::parse(&commit)?;
+            self.device.read_block(commit_block, &mut commit).await?;
+            let commit = match CommitHeader::parse(&commit) {
+                Ok(commit) => commit,
+                Err(_) => break,
+            };
             if commit.sequence != header.sequence {
                 break;
             }
-            let mut payload = [0u8; BLOCK_SIZE];
-            self.device.read_block(cursor + 1, &mut payload).await?;
-            self.device.write_block(tag.block as u64, &payload).await?;
+            for (idx, tag) in tags.iter().enumerate() {
+                let mut payload = [0u8; BLOCK_SIZE];
+                self.device
+                    .read_block(cursor + 1 + idx as u64, &mut payload)
+                    .await?;
+                self.device.write_block(tag.block as u64, &payload).await?;
+                blocks_replayed += 1;
+            }
             transactions += 1;
-            blocks_replayed += 1;
-            cursor += 3;
+            cursor = commit_block + 1;
         }
         Ok(ReplayReport {
             transactions,

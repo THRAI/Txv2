@@ -160,6 +160,7 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
         "syscall-adhoc-loop" => crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop(root),
         "syscall-no-await" => crate::lint_invariants_syscall::lint_invariants_syscall_no_await(root),
         "syscall-ctx-bridge" => crate::lint_invariants_syscall::lint_invariants_syscall_ctx_bridge(root),
+        "vfs-path-interface" => crate::lint_invariants_vfs_path::lint_invariants_vfs_path_interface(root),
         "all" => {
             type LintRule = fn(&Path) -> Result<()>;
             let rules: &[(&str, LintRule)] = &[
@@ -180,6 +181,7 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
                 ("syscall-adhoc-loop", crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop),
                 ("syscall-no-await", crate::lint_invariants_syscall::lint_invariants_syscall_no_await),
                 ("syscall-ctx-bridge", crate::lint_invariants_syscall::lint_invariants_syscall_ctx_bridge),
+                ("vfs-path-interface", crate::lint_invariants_vfs_path::lint_invariants_vfs_path_interface),
             ];
             let mut errors: Vec<String> = Vec::new();
             for (name, rule) in rules {
@@ -195,7 +197,7 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
             }
         }
         other => Err(format!(
-            "unknown invariants sub-rule '{other}'. Expected: step-discipline, step-v4-vocabulary, step-no-await, step-sync-signature, step, subject-context, witness-scope, signal-publish, script-boundary, checks-purity, cred-check, legacy-wait-channel, notification-boundary, no-adhoc-drive, syscall-adhoc-loop, syscall-no-await, syscall-ctx-bridge, all"
+            "unknown invariants sub-rule '{other}'. Expected: step-discipline, step-v4-vocabulary, step-no-await, step-sync-signature, step, subject-context, witness-scope, signal-publish, script-boundary, checks-purity, cred-check, legacy-wait-channel, notification-boundary, no-adhoc-drive, syscall-adhoc-loop, syscall-no-await, syscall-ctx-bridge, vfs-path-interface, all"
         )),
     }
 }

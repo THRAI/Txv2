@@ -13,6 +13,11 @@ pub const JBD2_BLOCK_COMMIT: u32 = 2;
 const EXTENT_MAGIC: u16 = 0xF30A;
 const EXTENT_ROOT_BYTES: usize = 60;
 
+// On-disk ext4/JBD2 field layouts here were cross-checked against
+// Linux v6.17 `fs/ext4/ext4.h`, `fs/jbd2/journal.c`, and the pinned
+// rsext4 reference (`external/rsext4` commit 984201f,
+// `src/ext4_backend/{superblock,disknode,jbd2}.rs`). Keep this crate
+// Tx-native/no_std; do not vendor rsext4's runtime cache model here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Superblock {
     pub inodes_count: u32,
@@ -1032,8 +1037,23 @@ impl<'a> BitmapMut<'a> {
     }
 }
 
-pub fn encode_journal_descriptor(sequence: u32, target_block: u32, out: &mut [u8]) -> Result<()> {
-    require_len(out, 20)?;
+pub fn encode_journal_descriptor(
+    sequence: u32,
+    target_blocks: &[u32],
+    out: &mut [u8],
+) -> Result<()> {
+    if target_blocks.is_empty() {
+        return Err(Ext4FormatError::OutOfBounds);
+    }
+    let required = 12usize
+        .checked_add(
+            target_blocks
+                .len()
+                .checked_mul(8)
+                .ok_or(Ext4FormatError::OutOfBounds)?,
+        )
+        .ok_or(Ext4FormatError::OutOfBounds)?;
+    require_len(out, required)?;
     out.fill(0);
     JournalHeader {
         magic: JBD2_MAGIC,
@@ -1041,21 +1061,46 @@ pub fn encode_journal_descriptor(sequence: u32, target_block: u32, out: &mut [u8
         sequence,
     }
     .encode(&mut out[..12])?;
-    JournalBlockTag {
-        block: target_block,
-        flags: JournalBlockTag::FLAG_LAST_TAG,
+    // Linux JBD2 descriptor blocks carry one tag per following payload block;
+    // Tx v1 keeps the compact 32-bit block tag form and omits checksums/revoke
+    // records until the journal grows beyond synchronous metadata checkpointing.
+    for (idx, block) in target_blocks.iter().enumerate() {
+        let start = 12 + idx * 8;
+        let flags = if idx + 1 == target_blocks.len() {
+            JournalBlockTag::FLAG_LAST_TAG
+        } else {
+            0
+        };
+        JournalBlockTag {
+            block: *block,
+            flags,
+        }
+        .encode(&mut out[start..start + 8])?;
     }
-    .encode(&mut out[12..20])?;
     Ok(())
 }
 
-pub fn parse_journal_descriptor(bytes: &[u8]) -> Result<(JournalHeader, JournalBlockTag)> {
+pub fn parse_journal_descriptor(bytes: &[u8]) -> Result<(JournalHeader, Vec<JournalBlockTag>)> {
     require_len(bytes, 20)?;
     let header = JournalHeader::parse(&bytes[..12])?;
     if header.block_type != JBD2_BLOCK_DESCRIPTOR {
         return Err(Ext4FormatError::Corrupt);
     }
-    Ok((header, JournalBlockTag::parse(&bytes[12..20])?))
+    let mut tags = Vec::new();
+    let mut offset = 12usize;
+    while offset + 8 <= bytes.len() {
+        let tag = JournalBlockTag::parse(&bytes[offset..offset + 8])?;
+        if tag.block == 0 && tag.flags == 0 {
+            break;
+        }
+        let last = tag.flags & JournalBlockTag::FLAG_LAST_TAG != 0;
+        tags.push(tag);
+        if last {
+            return Ok((header, tags));
+        }
+        offset += 8;
+    }
+    Err(Ext4FormatError::Corrupt)
 }
 
 pub fn encode_journal_commit(sequence: u32, out: &mut [u8]) -> Result<()> {

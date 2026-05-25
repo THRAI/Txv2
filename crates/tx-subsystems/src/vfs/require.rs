@@ -22,7 +22,6 @@ use super::checks::{DirectoryAtPath, EntityAtPath, ParentAndName};
 use super::resolution::driver;
 use super::resolution::state::{FinalSymlinkPolicy, WalkMode};
 use super::resolution::terminal;
-use super::resolution::PathResolution;
 use super::structure::{Credential, DEntry, InlineName};
 
 /// Resolve `path` relative to `rooted_at` and return a terminal
@@ -108,27 +107,15 @@ pub fn require_parent_and_name<'g>(
 
     let name = InlineName::new(name_bytes).map_err(|_| Errno::ENAMETOOLONG)?;
 
-    let resolved = if parent_path.is_empty() {
-        // path starts with "/" — parent is the namespace root.
-        let rnode = rooted_at.rnode().clone();
-        let meta = rnode.meta();
-        let fs_object_id = rnode.fs_object_id();
-        PathResolution {
-            dentry: rooted_at,
-            rnode,
-            fs_object_id,
-            meta,
-        }
-    } else {
-        driver::walk_to_completion(
-            rooted_at,
-            parent_path,
-            WalkMode::ParentAndName,
-            FinalSymlinkPolicy::Follow,
-            cred,
-            guard,
-        )?
-    };
+    let _ = parent_path;
+    let resolved = driver::walk_to_completion(
+        rooted_at,
+        path,
+        WalkMode::ParentAndName,
+        FinalSymlinkPolicy::Follow,
+        cred,
+        guard,
+    )?;
 
     terminal::build_parent_and_name_witness(&resolved, name, guard)
 }

@@ -7,6 +7,7 @@ use crate::adapter::step_engine::{Cap, PayloadCap, SpinMutex};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use tx_ext4_format::pager::{BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo};
+use tx_ext4_format::xattr::InlineXattr;
 use tx_ext4_format::Ext4FormatError;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
@@ -95,6 +96,25 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         Ok(meta)
     }
 
+    pub(crate) fn xattrs(&self, inode: InodeNo) -> Result<Vec<InlineXattr>, Errno> {
+        self.with_pager(|pager| pager.xattrs(inode))
+    }
+
+    pub(crate) fn set_xattr_on_disk(
+        &self,
+        inode: InodeNo,
+        name: &[u8],
+        value: &[u8],
+        create: bool,
+        replace: bool,
+    ) -> Result<bool, Errno> {
+        self.with_pager(|pager| pager.set_xattr(inode, name, value, create, replace))
+    }
+
+    pub(crate) fn remove_xattr_on_disk(&self, inode: InodeNo, name: &[u8]) -> Result<bool, Errno> {
+        self.with_pager(|pager| pager.remove_xattr(inode, name))
+    }
+
     pub(crate) fn read_dir_entries_cached(
         &self,
         inode: InodeNo,
@@ -121,6 +141,10 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         self.lookup_cache.lock().invalidate_parent(parent);
         self.dir_cache.lock().invalidate(parent);
         self.inode_meta_cache.lock().invalidate(parent);
+    }
+
+    pub(crate) fn invalidate_inode_meta(&self, inode: InodeNo) {
+        self.inode_meta_cache.lock().invalidate(inode);
     }
 }
 

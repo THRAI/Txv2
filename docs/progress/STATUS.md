@@ -1,3 +1,112 @@
+- 2026-05-25 **Landed Tx-native ext4 metadata transactions for xattr and
+  chmod/chown.** Replaced the one-block journal helper with a bounded
+  multi-block metadata transaction path: descriptor tags cover all payload
+  blocks, payloads and commit are barrier-ordered, home metadata blocks are
+  synchronously checkpointed, and replay applies only committed records. Ext4
+  xattr set/remove now commits inode, xattr block, and new-block bitmap updates
+  together; shared xattr blocks remain explicit `ENOSYS`. `step_chmod` and
+  `step_chown` now reuse the same journaled inode-table update path after the
+  existing VFS/DAC checks. **Verified so far:** `cargo test -p tx-ext4-format
+  journal -- --nocapture`; `cargo test -p tx-ext4-format --test pager_mock --
+  --nocapture`; `cargo test -p tx-ext4-format xattr -- --nocapture`; `cargo
+  test -p tx-ext4 xattr -- --nocapture`; `cargo test -p tx-ext4 --lib
+  tests_v3 -- --nocapture`; `cargo test -p tx-ext4 --features host-async
+  --test async_adapter -- --nocapture`; `cargo check -p tx-ext4 -p
+  tx-ext4-format -p tx-fs`. **Next step:** implement data/writeback consumers
+  (`flush_page`, `truncate`, fsync/checkpoint policy) and full ext4 xattr
+  shared-block COW/refcount/free handling. **Blocker:** none for supported
+  inline and single external-block `user.*` metadata updates.
+
+- 2026-05-25 **Continued ext4 xattr follow-up with inline/external `user.*`
+  read and write support.** Added `tx-ext4-format` parsing and encoding for
+  inline inode-body xattrs after `extra_isize` plus external `i_file_acl`
+  xattr blocks, corrected inline value-offset handling to Linux's
+  `IFIRST(header)` base, and wired combined read/list/set/remove through the
+  `tx-ext4` pager. External blocks now validate and refresh the Linux header
+  shape plus `metadata_csum` checksum when advertised. Writes are a narrow v1
+  complete user-xattr-set rewrite: inline when the set fits, otherwise one
+  external block. EA-inode values, non-`user.*` namespaces, shared-block COW,
+  and block free on last removal remain deferred. Updated
+  `docs/progress/research/2026-05-25-ext4-xattr-follow-up.md` to mark inline
+  and external-block read/list plus narrow set/remove done.
+  **Verified so far:** `cargo test -p tx-ext4-format xattr -- --nocapture`;
+  `cargo test -p tx-ext4 xattr -- --nocapture`; `cargo test -p tx-ext4 --lib
+  tests_v3 -- --nocapture`; `cargo check -p tx-ext4 -p tx-ext4-format -p
+  tx-fs`. **Next step:** land ext4 metadata transaction/journal policy for
+  chmod/chown, truncate, page flush, shared xattr-block COW/refcounts, and
+  block free on last xattr removal. **Blocker:** resolved for the supported
+  xattr/chmod/chown subset by the metadata transaction slice above.
+
+- 2026-05-25 **Landed VFS-owned xattr hooks and Linux `xattrat` dispatch.**
+  Added backend-owned `FsOps` xattr methods with default `EOPNOTSUPP`, tmpfs
+  in-memory `user.*` storage with create/replace/list/remove semantics, and
+  legacy plus Linux 6.17 `setxattrat`/`getxattrat`/`listxattrat`/
+  `removexattrat` syscall arms through the dirfd resolver facade. Ext4 stays
+  deliberately unsupported for xattr storage until metadata transaction/journal
+  readiness covers inode-body and external xattr blocks. Generated syscall
+  counts now report `220` defined, `216` dispatched, `4` defined-but-no-arm,
+  and `100` true missing. **Verified so far:** `cargo test -p tx-fs
+  tmpfs_xattr -- --nocapture`; `cargo test -p tx-shims --lib xattr --
+  --nocapture`; `cargo test -p tx-shims --lib file_mutation -- --nocapture`;
+  `cargo test -p tx-shims --lib fd_ops_wave2 -- --nocapture`; `cargo check
+  -p tx-shims -p tx-subsystems -p tx-fs -p tx-ext4 -p tx-ext4-format`;
+  `cargo xtask syscall-status --regen`; `cargo xtask syscall sync`. **Next
+  step:** finish the full syscall/progress/lint validation matrix and defer
+  ext4 xattr persistence to the recorded follow-up plan. **Blocker:** no ext4
+  metadata transaction/journal policy for safe xattr block mutation yet.
+
+- 2026-05-25 **Resolved the stale VFS waitsource caveat.** Updated
+  `v3_vfs_waitsource` to assert the current v3 `WaitSource` contract instead
+  of the retired legacy wait-channel resolver: live RNode read/write ids now
+  round-trip through the drive-facing source registry, mailbox subscribers
+  still observe direction-isolated read/write fires, and drop/large-N cleanup
+  proves source ids unregister after RNode teardown. **Verified:** `cargo test
+  -p tx-subsystems --test v3_vfs_waitsource -- --nocapture`; `cargo test -p
+  tx-subsystems vfs`; `cargo check -p tx-subsystems`; `cargo xtask lint
+  invariants legacy-wait-channel`. **Next step:** continue the planned stale
+  comment cleanup for older PR-3D coexistence wording outside the production
+  VFS path. **Blocker:** none for the VFS broad test caveat.
+
+- 2026-05-24 **Consolidated syscall `*at` path resolution behind the VFS
+  dirfd resolver facade.** Added `ResolveRequest`, `drive_resolve`, and
+  `try_resolve_now` for syscall-facing path walks, keeping the synchronous
+  walker as a VFS-internal fast path. Migrated open/stat/chmod/chown/access,
+  mutation, readlink, rename, and utimens-style syscall consumers off direct
+  walker helpers, added `cargo xtask lint invariants vfs-path-interface`, and
+  wired Linux RV64 `name_to_handle_at`, `open_by_handle_at`, `execveat`, and
+  `openat2` numbers/dispatch. `openat2(resolve=0)` routes through current
+  `openat`; normal-path `execveat` supports real dirfds; handle export/import
+  deliberately validate cheap bad inputs then return `ENOSYS`. Generated
+  syscall counts now report `204` defined, `200` dispatched, `4`
+  defined-but-no-arm, and `116` true missing. **Verified:** `cargo check -p
+  tx-shims -p tx-subsystems -p tx-scripts -p xtask`; `cargo xtask lint
+  invariants vfs-path-interface`; `cargo test -p tx-shims --lib fd_ops_wave2
+  -- --nocapture`; `cargo test -p tx-shims --lib stat_family -- --nocapture`;
+  `cargo test -p tx-shims --lib file_mutation -- --nocapture`; `cargo test -p
+  tx-shims --lib execve -- --nocapture`; `cargo test -p tx-shims --lib
+  dac_setuid_wave4 -- --nocapture`. **Next step:** implement xattr storage and
+  xattrat on top of the facade once the filesystem-facing xattr block policy is
+  decided. **Follow-up:** the broad `cargo test -p tx-subsystems vfs`
+  waitsource caveat was resolved on 2026-05-25.
+
+- 2026-05-24 **Started real dirfd-backed VFS at-walker integration.**
+  `WalkMode::ParentAndName` now stops at the penultimate component, so
+  `require_parent_and_name("/dir/new")` returns `/dir` plus `new` instead of
+  trying to resolve the not-yet-created child. The syscall dirfd helper is now
+  reusable across sibling syscall modules and validates real dirfds as
+  directory-backed fd anchors; `mkdirat(real_dirfd, "child")` now creates under
+  that directory while closed dirfds still return `EBADF`. Recorded the
+  migration policy in
+  `docs/progress/decisions/2026-05-24-vfs-at-walker-integration.md`.
+  **Verified:** `cargo test -p tx-shims --lib
+  dispatch_mkdirat_real_dirfd_creates_relative_child -- --nocapture`; `cargo
+  test -p tx-subsystems parent_and_name`; `cargo test -p tx-shims --lib mkdirat
+  -- --nocapture`; `cargo check -p tx-shims -p tx-subsystems`. **Next step:**
+  migrate the next easy `*at` consumers, especially xattr/chmod/chown/stat-style
+  helpers, onto the same anchor plus walker path. **Blocker:** absolute-path
+  root semantics and remaining `*at` arms still need a follow-up audit before
+  claiming full Linux/POSIX parity.
+
 - 2026-05-24 **Cleaned the pipe lease wait through notification wrappers before
   merge-back.** The reactor boundary sweep found zero raw reactor references
   outside adapters, but `notification-boundary` caught one stale raw

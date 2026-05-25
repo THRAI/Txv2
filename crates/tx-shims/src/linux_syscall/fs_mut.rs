@@ -12,6 +12,7 @@ use tx_fs;
 // silently bypass the gate.
 use tx_subsystems::cred::checks as cred_checks;
 use tx_subsystems::mount::{self};
+use tx_subsystems::vfs::resolution::state::{FinalSymlinkPolicy, WalkMode};
 
 /// Split a path into `(parent, basename)` for the `O_CREAT`-on-missing
 /// re-walk. `path` is a slash-separated sequence; trailing slashes
@@ -41,6 +42,32 @@ pub(super) fn split_path(path: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
+fn resolve_entity_from_anchor(
+    ctx: &SyscallCtx<'_>,
+    rooted_at: &Cap<DEntry>,
+    path: &[u8],
+    cred: &Credential,
+) -> Result<Cap<DEntry>, i32> {
+    try_resolve_from_root_now(
+        ctx,
+        rooted_at.clone(),
+        path,
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        cred,
+    )
+    .map(|resolved| resolved.dentry)
+}
+
+fn resolve_entity_at(
+    ctx: &SyscallCtx<'_>,
+    dirfd: i32,
+    path: &[u8],
+    cred: &Credential,
+) -> Result<Cap<DEntry>, i32> {
+    drive_resolve(ctx, ResolveRequest::entity(dirfd, path, cred)).map(|resolved| resolved.dentry)
+}
+
 /// Helper for the `O_CREAT`-on-missing path inside `sys_openat`.
 /// Walks to the parent of `path`, calls `FsOps::create_inode` for the
 /// basename, then re-walks the full path to return a dentry over the
@@ -56,6 +83,7 @@ pub(super) fn split_path(path: &[u8]) -> (&[u8], &[u8]) {
 /// future's `Send` bound). Returns the positive-magnitude `-errno`
 /// on failure.
 pub(crate) fn create_then_walk<P: PmapIf>(
+    ctx: &SyscallCtx<'_>,
     cwd: &Cap<DEntry>,
     path: &[u8],
     mode: u16,
@@ -77,16 +105,16 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     let parent_dentry: Cap<DEntry> = if parent_path.is_empty() {
         cwd.clone()
     } else {
-        let guard = step_engine::guard();
-        use StepOutcome as V3;
-        let outcome = step_walk(cwd.clone(), parent_path, cred, &guard);
-        drop(guard);
-        match outcome {
-            V3::Done(d) => d,
-            V3::Continue { .. } | V3::Yield { .. } => {
-                return Err(EIO_VALUE);
-            }
-            V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
+        match try_resolve_from_root_now(
+            ctx,
+            cwd.clone(),
+            parent_path,
+            WalkMode::Entity,
+            FinalSymlinkPolicy::Follow,
+            cred,
+        ) {
+            Ok(resolved) => resolved.dentry,
+            Err(errno) => return Err(errno),
         }
     };
 
@@ -121,15 +149,15 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     // Re-walk the full path. Lookup now resolves the freshly-created
     // inode; the resulting dentry carries the proper parent-hint
     // chain back to the mount root.
-    let guard = step_engine::guard();
-    use StepOutcome as V3;
-    let outcome = step_walk(cwd.clone(), path, cred, &guard);
-    drop(guard);
-    match outcome {
-        V3::Done(d) => Ok(d),
-        V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
-        V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
-    }
+    try_resolve_from_root_now(
+        ctx,
+        cwd.clone(),
+        path,
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        cred,
+    )
+    .map(|resolved| resolved.dentry)
 }
 
 /// Resolve the in-scope `Arc<dyn FsPageBacking>` for the given dentry.
@@ -154,8 +182,7 @@ pub(super) fn fs_page_backing_for_dentry(
 /// `mkdirat(dirfd, pathname, mode)`. Linux RV64 generic ABI
 /// `__NR_mkdirat = 34`.
 ///
-/// Slice 8: `dirfd == AT_FDCWD` only. Walks the parent directory of
-/// `pathname` (split via [`split_path`]), then calls
+/// Walks the parent directory of `pathname` relative to `dirfd`, then calls
 /// `FsOps::mkdir(parent, basename, mode & !umask, &cred, &guard)`.
 /// Empty paths and basenames surface as `-ENOENT` (let the FsOps
 /// surface canonicalise the error).
@@ -163,9 +190,6 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
     let mode = args[2] as u16;
-    if dirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
@@ -173,9 +197,9 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let cwd = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
+    let rooted_at = match resolve_cwd(dirfd, ctx) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
     };
     let cred = ctx.walker_cred();
     let (parent_path, basename) = split_path(&path);
@@ -187,9 +211,9 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         return SyscallResult::Error(EEXIST_VALUE);
     }
     let parent_dentry = if parent_path.is_empty() {
-        cwd
+        rooted_at
     } else {
-        match walk_from(cwd, parent_path, &cred) {
+        match resolve_entity_from_anchor(ctx, &rooted_at, parent_path, &cred) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
@@ -238,9 +262,6 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
     let flags = args[2] as u32;
-    if dirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
@@ -248,9 +269,9 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let cwd = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
+    let rooted_at = match resolve_cwd(dirfd, ctx) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
     };
     let cred = ctx.walker_cred();
     let (parent_path, basename) = split_path(&path);
@@ -261,14 +282,14 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     // walk gives us the target's `FsObjectId` and inode kind so the
     // arm can pick `unlink` vs `rmdir` correctly.
     let parent_dentry = if parent_path.is_empty() {
-        cwd.clone()
+        rooted_at.clone()
     } else {
-        match walk_from(cwd.clone(), parent_path, &cred) {
+        match resolve_entity_from_anchor(ctx, &rooted_at, parent_path, &cred) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
     };
-    let target_dentry = match walk_from(cwd, &path, &cred) {
+    let target_dentry = match resolve_entity_from_anchor(ctx, &rooted_at, &path, &cred) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
@@ -325,9 +346,6 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let target_uaddr = args[0];
     let newdirfd = args[1] as i32;
     let linkpath_uaddr = args[2];
-    if newdirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
     let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
@@ -342,9 +360,9 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     if linkpath.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let cwd = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
+    let rooted_at = match resolve_cwd(newdirfd, ctx) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
     };
     let cred = ctx.walker_cred();
     let (parent_path, basename) = split_path(&linkpath);
@@ -352,9 +370,9 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         return SyscallResult::Error(EEXIST_VALUE);
     }
     let parent_dentry = if parent_path.is_empty() {
-        cwd
+        rooted_at
     } else {
-        match walk_from(cwd, parent_path, &cred) {
+        match resolve_entity_from_anchor(ctx, &rooted_at, parent_path, &cred) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
@@ -402,9 +420,6 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     let newdirfd = args[2] as i32;
     let newpath_uaddr = args[3];
     let _flags = args[4] as u32;
-    if olddirfd != AT_FDCWD || newdirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
     let oldpath = match read_user_cstr(&ctx.aspace, oldpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
@@ -419,14 +434,18 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     if newpath.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let cwd = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
-    };
     let cred = ctx.walker_cred();
+    let old_rooted_at = match resolve_cwd(olddirfd, ctx) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
+    let new_rooted_at = match resolve_cwd(newdirfd, ctx) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
     // Walk source → target FsObjectId. Linux rejects directories
     // here as `-EPERM` (no hard-linking directories).
-    let source_dentry = match walk_from(cwd.clone(), &oldpath, &cred) {
+    let source_dentry = match resolve_entity_from_anchor(ctx, &old_rooted_at, &oldpath, &cred) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
@@ -440,9 +459,9 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         return SyscallResult::Error(EEXIST_VALUE);
     }
     let new_parent_dentry = if new_parent_path.is_empty() {
-        cwd
+        new_rooted_at
     } else {
-        match walk_from(cwd.clone(), new_parent_path, &cred) {
+        match resolve_entity_from_anchor(ctx, &new_rooted_at, new_parent_path, &cred) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
@@ -495,12 +514,8 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let cwd = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
-    };
     let cred = ctx.walker_cred();
-    let dentry = match walk_from(cwd, &path, &cred) {
+    let dentry = match resolve_entity_at(ctx, AT_FDCWD, &path, &cred) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
@@ -637,9 +652,6 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     let path_uaddr = args[1];
     let buf_uaddr = args[2];
     let buf_len = args[3] as usize;
-    if dirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
     if buf_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
@@ -653,9 +665,9 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let cwd = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
+    let rooted_at = match resolve_cwd(dirfd, ctx) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
     };
     let cred = ctx.walker_cred();
     let (parent_path, basename) = split_path(&path);
@@ -663,9 +675,9 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         return SyscallResult::Error(EINVAL_VALUE);
     }
     let parent_dentry = if parent_path.is_empty() {
-        cwd
+        rooted_at
     } else {
-        match walk_from(cwd, parent_path, &cred) {
+        match resolve_entity_from_anchor(ctx, &rooted_at, parent_path, &cred) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
@@ -742,10 +754,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     };
     let cred = ctx.walker_cred();
 
-    // No outer guard here: `walk_from` acquires its own internal
-    // guard (fs_path.rs), and txKernel's epoch discipline panics
-    // on nested guards (`tx-substrate::epoch::local:55`).
-    let target_dentry = match walk_from_process(cwd.clone(), &target, &cred, &ctx.process) {
+    let target_dentry = match resolve_entity_from_anchor(ctx, &cwd, &target, &cred) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
@@ -761,7 +770,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         };
-        let source_dentry = match walk_from_process(cwd, &source, &cred, &ctx.process) {
+        let source_dentry = match resolve_entity_from_anchor(ctx, &cwd, &source, &cred) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         };
@@ -860,7 +869,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
             let source = source_label_for_ext4
                 .as_ref()
                 .expect("ext4 fstype implies source was read");
-            let source_dentry = match walk_from_process(cwd.clone(), source, &cred, &ctx.process) {
+            let source_dentry = match resolve_entity_from_anchor(ctx, &cwd, source, &cred) {
                 Ok(d) => d,
                 Err(e) => return SyscallResult::Error(e),
             };
@@ -1003,10 +1012,7 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     };
     let cred = ctx.walker_cred();
 
-    // Use walk_from (which manages its own guard) instead of a
-    // top-level guard + step_walk, because mount_payload_for_dentry
-    // also acquires a guard — nesting panics at epoch::local:55.
-    let target_dentry = match walk_from_process(cwd.clone(), &target, &cred, &ctx.process) {
+    let target_dentry = match resolve_entity_from_anchor(ctx, &cwd, &target, &cred) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
@@ -1163,14 +1169,7 @@ pub(super) fn sys_utimensat<'a, P: tx_hal::TimeIf>(
                 }
             }
         } else {
-            if dirfd != AT_FDCWD {
-                return SyscallResult::Error(EBADF_VALUE);
-            }
-            let cwd = match ctx.process.cwd() {
-                Some(cwd) => cwd,
-                None => return SyscallResult::Error(ENOENT_VALUE),
-            };
-            let dentry = match walk_from(cwd, &path, &ctx.walker_cred()) {
+            let dentry = match resolve_entity_at(ctx, dirfd, &path, &ctx.walker_cred()) {
                 Ok(dentry) => dentry,
                 Err(errno) => return SyscallResult::Error(errno),
             };
@@ -1221,7 +1220,6 @@ pub(super) fn sys_utimensat<'a, P: tx_hal::TimeIf>(
 /// generic ABI `__NR_renameat2 = 276`.
 ///
 /// Slice 8 surface:
-/// - `dirfd != AT_FDCWD` → `-EBADF`.
 /// - `RENAME_EXCHANGE` → `-ENOSYS` (no atomic-swap surface yet).
 /// - `RENAME_WHITEOUT` → `-EINVAL` (recognised but unsupported).
 /// - Unknown flag bits → `-EINVAL`.
@@ -1238,9 +1236,6 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let newdirfd = args[2] as i32;
     let newpath_uaddr = args[3];
     let flags = args[4] as u32;
-    if olddirfd != AT_FDCWD || newdirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
     // Validate flags. RENAME_EXCHANGE → ENOSYS (atomic swap unsupported).
     // RENAME_WHITEOUT and any unrecognised bits → EINVAL.
     if (flags & RENAME_EXCHANGE) != 0 {
@@ -1267,14 +1262,15 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     if newpath.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let cwd = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
-    };
-    // RENAME_NOREPLACE: the composite RenameOp handles path resolution
-    // internally; the flag acts as a post-resolution collision check
-    // inside the op. RENAME_EXCHANGE was rejected above.
     let cred = ctx.walker_cred();
+    let old_rooted_at = match resolve_cwd(olddirfd, ctx) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
+    let new_rooted_at = match resolve_cwd(newdirfd, ctx) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
 
     // POSIX rename(2) permission check. Pre-walk old child, old
     // parent, new parent (and new child if it exists) so the cred
@@ -1293,21 +1289,21 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         return SyscallResult::Error(EISDIR_VALUE);
     }
     let old_parent_dentry = if old_parent_path.is_empty() {
-        cwd.clone()
+        old_rooted_at.clone()
     } else {
-        match walk_from(cwd.clone(), old_parent_path, &cred) {
+        match resolve_entity_from_anchor(ctx, &old_rooted_at, old_parent_path, &cred) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
     };
-    let old_child_dentry = match walk_from(cwd.clone(), &oldpath, &cred) {
+    let old_child_dentry = match resolve_entity_from_anchor(ctx, &old_rooted_at, &oldpath, &cred) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
     let new_parent_dentry = if new_parent_path.is_empty() {
-        cwd.clone()
+        new_rooted_at.clone()
     } else {
-        match walk_from(cwd.clone(), new_parent_path, &cred) {
+        match resolve_entity_from_anchor(ctx, &new_rooted_at, new_parent_path, &cred) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
@@ -1315,7 +1311,7 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     // Displaced inode is optional — walk_from returns Err(ENOENT)
     // when the new path doesn't exist, which is the normal case
     // for a rename that creates rather than overwrites.
-    let displaced_dentry = walk_from(cwd.clone(), &newpath, &cred).ok();
+    let displaced_dentry = resolve_entity_from_anchor(ctx, &new_rooted_at, &newpath, &cred).ok();
     let old_parent_meta = old_parent_dentry.rnode().meta();
     let old_child_meta = old_child_dentry.rnode().meta();
     let new_parent_meta = new_parent_dentry.rnode().meta();
@@ -1330,20 +1326,32 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     ) {
         return SyscallResult::error_from(e);
     }
-    let result = {
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = RenameOp {
-            rooted_at: &cwd,
-            oldpath: &oldpath,
-            newpath: &newpath,
-            cred: &cred,
-            state: None,
-        };
-        step_engine::drive_oneshot(&mut op, &mut script_ctx)
+    if displaced_dentry.is_some() && (flags & RENAME_NOREPLACE) != 0 {
+        return SyscallResult::Error(EEXIST_VALUE);
+    }
+
+    let fs_ops = match fs_ops_for_dentry(&old_parent_dentry) {
+        Some(ops) => ops,
+        None => return SyscallResult::Error(EROFS_VALUE),
     };
-    match result {
-        Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+    let outcome = {
+        let guard = step_engine::guard();
+        fs_ops.rename(
+            old_parent_dentry.rnode().fs_object_id(),
+            old_basename,
+            new_parent_dentry.rnode().fs_object_id(),
+            new_basename,
+            &guard,
+        )
+    };
+    match outcome {
+        StepOutcome::Done(()) => {
+            old_parent_dentry.remove_cached_child_by_name(old_basename);
+            new_parent_dentry.remove_cached_child_by_name(new_basename);
+            SyscallResult::Return(0)
+        }
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+        StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 

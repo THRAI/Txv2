@@ -22,6 +22,7 @@ mod lint_invariants_step;
 mod lint_invariants_step_v3;
 mod lint_invariants_subj;
 mod lint_invariants_syscall;
+mod lint_invariants_vfs_path;
 mod lint_invariants_wait;
 mod lint_invariants_witness;
 #[path = "lint_step_guard.rs"]

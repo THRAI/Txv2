@@ -10,18 +10,17 @@ use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 // xtask/src/lint_invariants_cred_check.rs.
 use tx_subsystems::cred::checks as cred_checks;
 use tx_subsystems::mount::MountPayload;
+use tx_subsystems::vfs::resolution::state::{FinalSymlinkPolicy, PathResolution, WalkMode};
 use tx_subsystems::vfs::structure::OpenFileBacking;
 
 // =====================================================================
 // Wave 4 Part 4 of the DAC + setuid slice — file-mode syscall arms.
 //
-// Each arm decodes a `dirfd` arg (only `AT_FDCWD` is supported in the
-// slice — non-CWD dirfds return `-EBADF` because the trio's day-1 fd
-// table doesn't carry directory-fd semantics yet) and a path string
-// from the user pointer (bounded inline at `EXECVE_PATH_MAX = 4096`,
-// mirroring the existing trio bootstrap exemption), resolves the path
-// through the walker, and dispatches to the FsOps method (Wave 3 Part
-// 2) or the inline `access(2)` predicate over the inode meta.
+// Each arm decodes a `dirfd` arg and a path string from the user pointer
+// (bounded inline at `EXECVE_PATH_MAX = 4096`, mirroring the existing
+// trio bootstrap exemption), resolves the path through the dirfd-aware
+// facade below, and dispatches to the FsOps method (Wave 3 Part 2) or
+// the inline `access(2)` predicate over the inode meta.
 //
 // `chmod` / `chown` use `walker_cred()` (POSIX path-resolution rule:
 // effective ids); `access(2)` defaults to **real** ids per POSIX
@@ -31,30 +30,76 @@ use tx_subsystems::vfs::structure::OpenFileBacking;
 // §"Part 4 — File-mode syscall arms".
 // =====================================================================
 
-/// Resolve `dirfd + path` to the final `Cap<DEntry>` via the walker.
+/// Empty-path policy for the syscall-facing resolver facade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EmptyPathPolicy {
+    Reject,
+    Allow,
+}
+
+/// Syscall-facing VFS resolution request.
 ///
-/// Slice surface: only `AT_FDCWD` is supported. Real dirfd-relative
-/// resolution requires directory file descriptors — the trio's
-/// fd-table doesn't carry them yet. Non-AT_FDCWD dirfds produce
-/// `-EBADF`. A missing cwd (init pre-rootfs / zombie) also returns
-/// `-EBADF` defensively (the alive caller of these arms has a cwd
-/// installed by `step_chdir`).
+/// The facade centralises Linux `dirfd` anchoring, mount-namespace selection,
+/// final symlink policy, and empty-path handling. Filesystem backends continue
+/// to receive component operations only; they never choose path-walk policy.
+#[derive(Clone, Copy)]
+pub(super) struct ResolveRequest<'a> {
+    pub dirfd: i32,
+    pub path: &'a [u8],
+    pub mode: WalkMode,
+    pub final_symlink_policy: FinalSymlinkPolicy,
+    pub empty_path_policy: EmptyPathPolicy,
+    pub cred: &'a Credential,
+}
+
+impl<'a> ResolveRequest<'a> {
+    pub fn entity(dirfd: i32, path: &'a [u8], cred: &'a Credential) -> Self {
+        Self {
+            dirfd,
+            path,
+            mode: WalkMode::Entity,
+            final_symlink_policy: FinalSymlinkPolicy::Follow,
+            empty_path_policy: EmptyPathPolicy::Reject,
+            cred,
+        }
+    }
+
+    pub fn parent(dirfd: i32, path: &'a [u8], cred: &'a Credential) -> Self {
+        Self {
+            dirfd,
+            path,
+            mode: WalkMode::ParentAndName,
+            final_symlink_policy: FinalSymlinkPolicy::Follow,
+            empty_path_policy: EmptyPathPolicy::Reject,
+            cred,
+        }
+    }
+
+    pub fn nofollow(mut self) -> Self {
+        self.final_symlink_policy = FinalSymlinkPolicy::NoFollow;
+        self.mode = WalkMode::EntityUnfollowed;
+        self
+    }
+
+    pub fn allow_empty(mut self) -> Self {
+        self.empty_path_policy = EmptyPathPolicy::Allow;
+        self
+    }
+}
+
+/// Resolve `dirfd + path` to a VFS `PathResolution` through the shared
+/// resolution driver.
+///
+/// `AT_FDCWD` resolves to the process cwd. A real dirfd must reference an
+/// open directory. Absolute paths intentionally ignore the supplied real dirfd
+/// after anchoring from cwd, matching Linux's "absolute path starts at root"
+/// behavior while still keeping the current mount namespace in scope.
 ///
 /// Walker errors are translated through `errno_to_i32`. Walker
 /// `Blocked` shapes don't fire under tmpfs/devfs (the FS surface is
 /// synchronous in this slice), so they're flattened to `-EIO`
 /// defensively rather than awaited — none of the file-mode arms park
 /// today.
-///
-/// We return the terminal `Cap<DEntry>` (not the bare `Cap<RNode>`)
-/// so callers can locate the in-scope `FsOps` via the
-/// parent-hint chain. Per the walker's `materialise_child_rnode`
-/// shape, freshly-resolved child rnodes do **not** carry a
-/// `with_containing_mount` weak — the walker tracks `current_fs_ops`
-/// internally via the parent dentry chain. Callers that need to
-/// dispatch through `FsOps::step_chmod` etc. must ascend the dentry
-/// chain to find an rnode with the mount weak set (the mount root
-/// rnode, which `MountIdentity::new_cap` wires up).
 ///
 /// ## Send-future discipline
 ///
@@ -64,23 +109,75 @@ use tx_subsystems::vfs::structure::OpenFileBacking;
 /// `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE` and
 /// `tx_scripts::process::exec::poll_walker_synchronously`). We poll
 /// the walker future once with a noop waker rather than awaiting it.
-/// Every in-tree walker backend resolves synchronously today; if a
-/// future async-aware backend lands, `poll_walker_synchronously`'s
-/// `panic!` arm fires and this site must shift to the canonical
-/// "fresh guard inside `await_*`" shape.
-// `P` is unused in the body but kept on the signature so the dispatch
-// arms keep their parameter passthrough shape; clippy's
-// extra-unused-type-parameters gate is silenced via cfg_attr so the
-// arch-lint substring check (`#[allow(`) does not also fire.
-#[cfg_attr(not(test), allow(clippy::extra_unused_type_parameters))]
-#[cfg_attr(test, allow(clippy::extra_unused_type_parameters))]
+/// Every in-tree walker backend resolves synchronously today. If a future
+/// async-aware backend returns an IO yield, this facade reports `EAGAIN` so the
+/// caller can move to the canonical drive/resume shape.
+pub(super) fn try_resolve_now(
+    ctx: &SyscallCtx<'_>,
+    request: ResolveRequest<'_>,
+) -> Result<PathResolution, i32> {
+    if request.path.is_empty() && request.empty_path_policy == EmptyPathPolicy::Reject {
+        return Err(ENOENT_VALUE);
+    }
+
+    let rooted_at = resolve_root_for_path(request.dirfd, request.path, ctx)?;
+    try_resolve_from_root_now(
+        ctx,
+        rooted_at,
+        request.path,
+        request.mode,
+        request.final_symlink_policy,
+        request.cred,
+    )
+}
+
+/// Drive a syscall resolution request. The v1 VFS backends complete
+/// synchronously, so this is currently the same implementation as
+/// `try_resolve_now`; the name marks the public syscall-facing seam for future
+/// waitable walkers.
+pub(super) fn drive_resolve(
+    ctx: &SyscallCtx<'_>,
+    request: ResolveRequest<'_>,
+) -> Result<PathResolution, i32> {
+    try_resolve_now(ctx, request)
+}
+
+/// Resolve from an already-vetted root dentry through the same VFS driver.
+pub(super) fn try_resolve_from_root_now(
+    ctx: &SyscallCtx<'_>,
+    rooted_at: Cap<DEntry>,
+    path: &[u8],
+    mode: WalkMode,
+    policy: FinalSymlinkPolicy,
+    cred: &Credential,
+) -> Result<PathResolution, i32> {
+    let guard = step_engine::guard();
+    let outcome = if let Some(mnt_ns) = ctx.process.mount_namespace_cap() {
+        tx_subsystems::vfs::resolution::driver::walk_to_completion_with_mount_namespace(
+            rooted_at,
+            path,
+            mode,
+            policy,
+            cred,
+            Some(&mnt_ns),
+            &guard,
+        )
+    } else {
+        tx_subsystems::vfs::resolution::driver::walk_to_completion(
+            rooted_at, path, mode, policy, cred, &guard,
+        )
+    };
+    drop(guard);
+    outcome.map_err(|errno| errno_to_i32(Errno::from(errno)))
+}
+
 /// Translate a dirfd into the root dentry for path resolution.
 /// `AT_FDCWD` resolves to the process's cwd; any other dirfd is
 /// looked up in the fd table and must reference a directory
 /// (`OpenFile::opendir_dentry()` carries the dentry for fds opened
 /// with `O_DIRECTORY`). Returns `EBADF` for closed/invalid fds and
 /// `ENOTDIR` for fds that aren't directories.
-fn resolve_cwd(dirfd: i32, ctx: &SyscallCtx) -> Result<Cap<DEntry>, i32> {
+pub(super) fn resolve_cwd(dirfd: i32, ctx: &SyscallCtx) -> Result<Cap<DEntry>, i32> {
     if dirfd == AT_FDCWD {
         return ctx.process.cwd().ok_or(ENOENT_VALUE);
     }
@@ -88,7 +185,22 @@ fn resolve_cwd(dirfd: i32, ctx: &SyscallCtx) -> Result<Cap<DEntry>, i32> {
         return Err(EBADF_VALUE);
     }
     let open_file = ctx.process.fd(dirfd as u32).ok_or(EBADF_VALUE)?;
-    open_file.opendir_dentry().ok_or(ENOTDIR_VALUE)
+    let dentry = open_file.opendir_dentry().ok_or(ENOTDIR_VALUE)?;
+    if dentry.rnode().meta().kind() != InodeKind::Directory {
+        return Err(ENOTDIR_VALUE);
+    }
+    Ok(dentry)
+}
+
+pub(super) fn resolve_root_for_path(
+    dirfd: i32,
+    path: &[u8],
+    ctx: &SyscallCtx<'_>,
+) -> Result<Cap<DEntry>, i32> {
+    if path.first() == Some(&b'/') {
+        return ctx.process.cwd().ok_or(ENOENT_VALUE);
+    }
+    resolve_cwd(dirfd, ctx)
 }
 
 fn resolve_path_at<P: PmapIf>(
@@ -97,27 +209,8 @@ fn resolve_path_at<P: PmapIf>(
     cred: &Credential,
     ctx: &SyscallCtx<'_>,
 ) -> Result<Cap<DEntry>, i32> {
-    let cwd: Cap<DEntry> = resolve_cwd(dirfd, ctx)?;
-    let guard = step_engine::guard();
-    // Uses `step_walk` (consuming `FsOps` via the direct
-    // `MountPayload::fs_ops` field) and matches the four-variant
-    // outcome. Errno routes back through the reverse `From` bridge so
-    // the existing `errno_to_i32` table stays the single source of truth.
-    use StepOutcome as V3;
-    let outcome = if let Some(mnt_ns) = ctx.process.mount_namespace_cap() {
-        tx_subsystems::vfs::step_walk_in_mount_namespace(cwd, path, cred, &mnt_ns, &guard)
-    } else {
-        tx_subsystems::vfs::step_walk(cwd, path, cred, &guard)
-    };
-    let dentry = match outcome {
-        V3::Done(d) => d,
-        V3::Continue { .. } | V3::Yield { .. } => {
-            return Err(EIO_VALUE);
-        }
-        V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
-    };
-    drop(guard);
-    Ok(dentry)
+    let _ = core::marker::PhantomData::<P>;
+    drive_resolve(ctx, ResolveRequest::entity(dirfd, path, cred)).map(|resolved| resolved.dentry)
 }
 
 /// Poll a walker future synchronously, panicking if it returns
@@ -229,8 +322,15 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
     // the canonical cred::checks::* seam per cred_service_v_1 §"Cred
     // owns credential semantics". When the per-FS check is removed
     // in a follow-up, this remains the single enforcement site.
-    let target_dentry = match walk_from(rooted_at.clone(), &path, &walker_cred) {
-        Ok(d) => d,
+    let target_dentry = match try_resolve_from_root_now(
+        ctx,
+        rooted_at.clone(),
+        &path,
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        &walker_cred,
+    ) {
+        Ok(resolved) => resolved.dentry,
         Err(e) => return SyscallResult::Error(e),
     };
     let target_meta = target_dentry.rnode().meta();
@@ -319,8 +419,15 @@ pub(super) fn sys_fchownat<P: PmapIf>(
     // Cred check at the syscall arm using ctx.cred_snapshot(). Same
     // defense-in-depth role as sys_fchmodat — per-FS step_chown
     // impls also enforce the rule.
-    let target_dentry = match walk_from(rooted_at.clone(), &path, &walker_cred) {
-        Ok(d) => d,
+    let target_dentry = match try_resolve_from_root_now(
+        ctx,
+        rooted_at.clone(),
+        &path,
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        &walker_cred,
+    ) {
+        Ok(resolved) => resolved.dentry,
         Err(e) => return SyscallResult::Error(e),
     };
     let target_meta = target_dentry.rnode().meta();
@@ -562,24 +669,12 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         return SyscallResult::Error(ENOENT_VALUE);
     }
 
-    let cwd = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
-    };
     let walker_cred = ctx.walker_cred();
-    let dentry: Cap<DEntry> = {
-        let guard = step_engine::guard();
-        use StepOutcome as V3;
-        let outcome = step_walk(cwd, &path, &walker_cred, &guard);
-        drop(guard);
-        match outcome {
-            V3::Done(d) => d,
-            V3::Continue { .. } | V3::Yield { .. } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
-        }
-    };
+    let dentry: Cap<DEntry> =
+        match drive_resolve(ctx, ResolveRequest::entity(AT_FDCWD, &path, &walker_cred)) {
+            Ok(resolved) => resolved.dentry,
+            Err(errno) => return SyscallResult::Error(errno),
+        };
 
     if dentry.rnode().meta().kind() != InodeKind::Directory {
         return SyscallResult::Error(ENOTDIR_VALUE);
@@ -716,48 +811,5 @@ pub(super) fn mount_payload_for_dentry(dentry: &Cap<DEntry>) -> Option<Cap<Mount
             return Some(payload);
         }
         cursor = cursor.parent_hint()?;
-    }
-}
-
-/// Walk `path` from `cwd` synchronously, returning the resolved
-/// dentry or a positive-magnitude `-errno`. Mirrors
-/// `resolve_path_at`'s shape but takes the cwd directly so callers
-/// that already hold it (every Slice 8 arm fetches it once for both
-/// the parent walk and the optional full walk) avoid the redundant
-/// `process.cwd()` lookup.
-pub(super) fn walk_from(
-    cwd: Cap<DEntry>,
-    path: &[u8],
-    cred: &Credential,
-) -> Result<Cap<DEntry>, i32> {
-    let guard = step_engine::guard();
-    use StepOutcome as V3;
-    let outcome = step_walk(cwd, path, cred, &guard);
-    drop(guard);
-    match outcome {
-        V3::Done(d) => Ok(d),
-        V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
-        V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
-    }
-}
-
-pub(super) fn walk_from_process(
-    cwd: Cap<DEntry>,
-    path: &[u8],
-    cred: &Credential,
-    process: &Cap<ProcessIdentity>,
-) -> Result<Cap<DEntry>, i32> {
-    let guard = step_engine::guard();
-    use StepOutcome as V3;
-    let outcome = if let Some(mnt_ns) = process.mount_namespace_cap() {
-        tx_subsystems::vfs::step_walk_in_mount_namespace(cwd, path, cred, &mnt_ns, &guard)
-    } else {
-        step_walk(cwd, path, cred, &guard)
-    };
-    drop(guard);
-    match outcome {
-        V3::Done(d) => Ok(d),
-        V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
-        V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
     }
 }

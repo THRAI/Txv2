@@ -4,6 +4,7 @@ extern crate alloc;
 
 pub mod ondisk;
 pub mod pager;
+pub mod xattr;
 
 pub type Result<T> = core::result::Result<T, Ext4FormatError>;
 

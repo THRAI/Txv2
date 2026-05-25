@@ -22,8 +22,8 @@ use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
     AT_FDCWD, AT_REMOVEDIR, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_MKDIRAT, NR_OPENAT,
-    NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT, NR_UTIMENSAT, O_RDWR,
-    RENAME_EXCHANGE, RENAME_NOREPLACE, UTIME_NOW,
+    NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT, NR_UTIMENSAT, O_RDONLY,
+    O_RDWR, RENAME_EXCHANGE, RENAME_NOREPLACE, UTIME_NOW,
 };
 
 /// errno magnitudes (positive Linux RV64 generic ABI values).
@@ -234,6 +234,49 @@ fn dispatch_mkdirat_non_cwd_dirfd_returns_neg_ebadf() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_BADF));
     drop(path);
+}
+
+#[test]
+fn dispatch_mkdirat_real_dirfd_creates_relative_child() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    make_dir(&tmpfs, b"base");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let base = nul_terminate(b"/base");
+    let open_req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            base.as_ptr() as u64,
+            O_RDONLY as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let dirfd = match block_on(dispatch::<ShimsTestPmap>(open_req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("open /base: {other:?}"),
+    };
+
+    let child = nul_terminate(b"child");
+    let mkdir_req = SyscallRequest::new(NR_MKDIRAT, [dirfd, child.as_ptr() as u64, 0o755, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(mkdir_req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let base_id = match tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"base", &guard()) {
+        StepOutcome::Done(id) => id,
+        other => panic!("lookup base: {other:?}"),
+    };
+    assert!(
+        matches!(
+            tmpfs.lookup(base_id, b"child", &guard()),
+            StepOutcome::Done(_)
+        ),
+        "base/child should exist after mkdirat(dirfd, child)"
+    );
 }
 
 // -----------------------------------------------------------------

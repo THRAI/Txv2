@@ -246,6 +246,61 @@ pub trait FsOps: Send + Sync + 'static {
         StepOutcome::err(Errno::ENOSYS)
     }
 
+    /// Read an extended attribute value. `value.len() == 0` is a size query:
+    /// backends return the required byte length without writing bytes.
+    /// Default returns `EOPNOTSUPP` for filesystems without xattr storage.
+    fn get_xattr(
+        &self,
+        fs_object_id: FsObjectId,
+        name: &[u8],
+        value: &mut [u8],
+        cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<usize, NoProgress> {
+        let _ = (fs_object_id, name, value, cred, guard);
+        StepOutcome::err(Errno::EOPNOTSUPP)
+    }
+
+    /// Set an extended attribute value. `flags` uses Linux
+    /// `XATTR_CREATE`/`XATTR_REPLACE` bits. Default returns `EOPNOTSUPP`.
+    fn set_xattr(
+        &self,
+        fs_object_id: FsObjectId,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+        cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        let _ = (fs_object_id, name, value, flags, cred, guard);
+        StepOutcome::err(Errno::EOPNOTSUPP)
+    }
+
+    /// Write the NUL-separated xattr name list. `list.len() == 0` is a size
+    /// query. Default returns `EOPNOTSUPP`.
+    fn list_xattr(
+        &self,
+        fs_object_id: FsObjectId,
+        list: &mut [u8],
+        cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<usize, NoProgress> {
+        let _ = (fs_object_id, list, cred, guard);
+        StepOutcome::err(Errno::EOPNOTSUPP)
+    }
+
+    /// Remove an extended attribute. Default returns `EOPNOTSUPP`.
+    fn remove_xattr(
+        &self,
+        fs_object_id: FsObjectId,
+        name: &[u8],
+        cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        let _ = (fs_object_id, name, cred, guard);
+        StepOutcome::err(Errno::EOPNOTSUPP)
+    }
+
     /// Read content from a projected inode (procfs, sysfs, etc.).
     /// Called by `OpenFile::step_read` when `RNodeBacking::Projected`.
     /// Default: `ENOSYS`.

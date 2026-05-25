@@ -21,8 +21,8 @@ use tx_subsystems::vfs::structure::{
 use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
-    AT_FDCWD, EXECVE_PATH_MAX, NR_CLOSE, NR_DUP, NR_DUP3, NR_OPENAT, O_CLOEXEC, O_CREAT, O_EXCL,
-    O_RDONLY, O_RDWR, O_TRUNC,
+    AT_FDCWD, EXECVE_PATH_MAX, NR_CLOSE, NR_DUP, NR_DUP3, NR_OPENAT, NR_OPENAT2, O_CLOEXEC,
+    O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC,
 };
 
 /// errno magnitudes: positive Linux RV64 generic ABI values.
@@ -33,6 +33,14 @@ const E_INVAL: i32 = 22;
 const E_ACCES: i32 = 13;
 const E_NAMETOOLONG: i32 = 36;
 const E_MFILE: i32 = 24;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TestOpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
 
 fn ensure_zero_frame_claimed() {
     match page_allocator::claim_zero_frame() {
@@ -170,6 +178,125 @@ fn dispatch_openat_existing_file_o_rdonly_returns_fd() {
         other => panic!("openat existing file: {other:?}"),
     }
     drop(path);
+}
+
+#[test]
+fn dispatch_openat_real_dirfd_opens_relative_child() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let _ = tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"dir", 0o755, &owner_cred, &guard);
+    let dir_id = match tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"dir", &guard) {
+        StepOutcome::Done(id) => id,
+        other => panic!("dir lookup: {other:?}"),
+    };
+    let _ = tmpfs.create_inode(dir_id, b"child", 0o100644, &owner_cred, &guard);
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let dir_path = nul_terminate(b"/dir");
+    let child_path = nul_terminate(b"child");
+
+    let dirfd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                dir_path.as_ptr() as u64,
+                O_RDONLY as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("open dir for dirfd: {other:?}"),
+    };
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                dirfd as u64,
+                child_path.as_ptr() as u64,
+                O_RDONLY as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    match result {
+        SyscallResult::Return(fd) => assert!(proc_cap.fd(fd as u32).is_some()),
+        other => panic!("openat real dirfd child: {other:?}"),
+    }
+}
+
+#[test]
+fn dispatch_openat2_basic_matches_openat_and_rejects_resolve() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let path = nul_terminate(b"/f");
+    let how = TestOpenHow {
+        flags: O_RDONLY as u64,
+        mode: 0,
+        resolve: 0,
+    };
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT2,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                (&how as *const TestOpenHow) as u64,
+                core::mem::size_of::<TestOpenHow>() as u64,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    match result {
+        SyscallResult::Return(fd) => assert!(proc_cap.fd(fd as u32).is_some()),
+        other => panic!("openat2 basic: {other:?}"),
+    }
+
+    let unsupported = TestOpenHow { resolve: 1, ..how };
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT2,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                (&unsupported as *const TestOpenHow) as u64,
+                core::mem::size_of::<TestOpenHow>() as u64,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(38));
 }
 
 /// `openat` reports `EMFILE` before path lookup once the visible fd
