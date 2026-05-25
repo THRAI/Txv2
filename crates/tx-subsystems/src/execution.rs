@@ -216,7 +216,7 @@ mod tests {
         // `step_v3::Errno` + the From impl) fails to compile or this
         // test fails immediately.
         use crate::adapter::step_engine::V3Errno as V3;
-        let table: [(Errno, V3); 30] = [
+        let table: [(Errno, V3); 31] = [
             (Errno::E2BIG, V3::E2BIG),
             (Errno::EACCES, V3::EACCES),
             (Errno::EAGAIN, V3::EAGAIN),

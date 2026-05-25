@@ -12,10 +12,24 @@ use crate::ipc::sysv_sem::checks;
 use crate::ipc::sysv_sem::structure::{self, sem_flg, SemBuf};
 use crate::ipc::sysv_shm::execution::{IPC_CREAT, IPC_EXCL, IPC_PRIVATE};
 use crate::ipc::sysv_shm::structure::IpcPerm;
-use crate::process::adapter::step_engine::Cap;
-use crate::process::adapter::wait_routing::Mask;
+use crate::process::adapter::step_engine::{
+    Cap, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, WaitSourceId,
+    YieldShape,
+};
+use crate::process::adapter::wait_routing::{self, Mask};
 use crate::process::nsproxy::SysvKey;
 use crate::process::structure::ProcessIdentity;
+use tx_substrate::step::{Errno as StepErrno, ResumeOutcome};
+
+const SEM_CHANGED_MASK: u64 = 1;
+
+fn fire_sem_changed(payload: &structure::SemArrayPayload) {
+    payload.changed_seq.fetch_add(1, Ordering::Release);
+    payload
+        .changed_channel
+        .fire(Mask::from_bits(SEM_CHANGED_MASK));
+    wait_routing::notify_v3_source(&payload.changed_wait_source, SEM_CHANGED_MASK);
+}
 
 // semctl commands
 pub use crate::ipc::sysv_shm::execution::{IPC_INFO, IPC_RMID, IPC_SET, IPC_STAT};
@@ -194,12 +208,112 @@ pub fn step_semop(
             proc_payload.record_sem_undo(semid, undo_adjustments);
         }
 
-        // Changed seq bump + wake.
-        payload.changed_seq.fetch_add(1, Ordering::Release);
-        payload.changed_channel.fire(Mask::from_bits(1));
+        fire_sem_changed(payload);
     });
 
     Ok(sops.len())
+}
+
+pub struct SemopWaitOp<'a> {
+    pub semid: u32,
+    pub sops: &'a [SemBuf],
+    pub cred: &'a Cap<Cred>,
+    pub process: &'a Cap<ProcessIdentity>,
+    pub tid: Option<u32>,
+    watched_array: Option<Cap<structure::SemArrayIdentity>>,
+    waiting: bool,
+}
+
+impl<'a> SemopWaitOp<'a> {
+    pub fn new(
+        semid: u32,
+        sops: &'a [SemBuf],
+        cred: &'a Cap<Cred>,
+        process: &'a Cap<ProcessIdentity>,
+        tid: Option<u32>,
+    ) -> Self {
+        Self {
+            semid,
+            sops,
+            cred,
+            process,
+            tid,
+            watched_array: None,
+            waiting: false,
+        }
+    }
+
+    fn changed_source(&mut self) -> Result<u64, Errno> {
+        let array = if let Some(array) = self.watched_array.as_ref() {
+            array.clone()
+        } else {
+            let array = checks::require_sem_exists(self.semid)?;
+            self.watched_array = Some(array.clone());
+            array
+        };
+        if array.destroyed.load(Ordering::Acquire) {
+            return Err(Errno::EIDRM);
+        }
+        let payload = array.payload.lock().as_ref().cloned().ok_or(Errno::EIDRM)?;
+        Ok(payload.changed_source_id)
+    }
+}
+
+impl<I: SubjectIdentity> StepOp<I> for SemopWaitOp<'_> {
+    type Output = usize;
+    type Progress = NoProgress;
+
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        match step_semop(self.semid, self.sops, self.cred, self.process) {
+            Ok(applied) => StepOutcome::Done(applied),
+            Err(Errno::EAGAIN) => match self.changed_source() {
+                Ok(source_id) => {
+                    if !self.waiting {
+                        crate::futex::register_waiting_tid(self.tid);
+                    }
+                    self.waiting = true;
+                    StepOutcome::Yield {
+                        progress: NoProgress,
+                        shape: YieldShape::OnWaitSource {
+                            source: WaitSourceId::new(source_id),
+                            interests: InterestMask::new(SEM_CHANGED_MASK),
+                        },
+                    }
+                }
+                Err(errno) => StepOutcome::Err(errno.into()),
+            },
+            Err(Errno::EINVAL)
+                if self
+                    .watched_array
+                    .as_ref()
+                    .is_some_and(|array| array.destroyed.load(Ordering::Acquire)) =>
+            {
+                StepOutcome::Err(Errno::EIDRM.into())
+            }
+            Err(errno) => StepOutcome::Err(errno.into()),
+        }
+    }
+
+    fn apply_resume(&mut self, resume: ResumeOutcome) -> Result<(), StepErrno> {
+        if matches!(resume, ResumeOutcome::Retry) {
+            if self.waiting {
+                crate::futex::unregister_waiting_tid(self.tid);
+            }
+            self.waiting = false;
+            Ok(())
+        } else {
+            Err(StepErrno::EINVAL)
+        }
+    }
+}
+
+impl Drop for SemopWaitOp<'_> {
+    fn drop(&mut self) {
+        if self.waiting {
+            crate::futex::unregister_waiting_tid(self.tid);
+            self.waiting = false;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +339,9 @@ pub fn step_semctl(
             checks::require_owner_or_admin(&array, cred)?;
             if let Some(a) = structure::withdraw_sem(semid) {
                 a.destroyed.store(true, Ordering::Release);
+                if let Some(payload) = a.payload.lock().as_ref().cloned() {
+                    fire_sem_changed(&payload);
+                }
             }
             Ok(SemCtlResult::Success)
         }
@@ -282,8 +399,7 @@ pub fn step_semctl(
                 if let Some(process) = process {
                     values[semnum as usize].last_pid = process.pid.0;
                 }
-                payload.changed_seq.fetch_add(1, Ordering::Release);
-                payload.changed_channel.fire(Mask::from_bits(1));
+                fire_sem_changed(payload);
             });
             Ok(SemCtlResult::Success)
         }
@@ -316,8 +432,7 @@ pub fn step_semctl(
                         slot.last_pid = process.pid.0;
                     }
                 }
-                payload.changed_seq.fetch_add(1, Ordering::Release);
-                payload.changed_channel.fire(Mask::from_bits(1));
+                fire_sem_changed(payload);
             });
             Ok(SemCtlResult::Success)
         }
@@ -405,8 +520,7 @@ pub fn step_sem_undo(process: &Cap<ProcessIdentity>) {
                 values[i].val = values[i].val.wrapping_add(*adj);
             }
         }
-        payload_guard.changed_seq.fetch_add(1, Ordering::Release);
-        payload_guard.changed_channel.fire(Mask::from_bits(1));
+        fire_sem_changed(&payload_guard);
     }
 }
 

@@ -651,7 +651,42 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
     if nfds == 0 {
         let result = match timeout_ns {
             Some(ns) => sleep_timeout_ns::<P>(ns, ctx).await,
-            None => SyscallResult::Return(0),
+            None => loop {
+                if tx_subsystems::signal::select_next_signal(&ctx.thread).is_some() {
+                    break SyscallResult::Error(EINTR_VALUE);
+                }
+
+                use tx_scripts::drive;
+                use tx_substrate::step::DriveMode;
+                let now_ns = P::read_ns();
+                let mut script_ctx = build_subject_script_ctx(ctx);
+                let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+                let mailbox = ctx.mailbox.clone();
+                let op = super::NanosleepOp {
+                    nanos: 5_000_000,
+                    deadline_ns: now_ns.saturating_add(5_000_000),
+                    started: false,
+                };
+                match drive(
+                    op,
+                    &mut script_ctx,
+                    DriveMode::Waiting,
+                    mailbox.as_ref(),
+                    None,
+                    timer_wheel_arc.as_ref(),
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(v3errno) => {
+                        let errno: tx_subsystems::execution::Errno = v3errno.into();
+                        if errno == tx_subsystems::execution::Errno::EINTR {
+                            break SyscallResult::Error(EINTR_VALUE);
+                        }
+                        break SyscallResult::error_from(errno);
+                    }
+                }
+            },
         };
         return restore_ppoll_sigmask(ctx, saved_mask, temporary_sigmask, result);
     }
@@ -1271,6 +1306,14 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         }
         Err(v3errno) => {
             let errno: tx_subsystems::execution::Errno = v3errno.into();
+            if file.flags().nonblocking && errno == tx_subsystems::execution::Errno::EAGAIN {
+                let deadline_ns = P::read_ns().saturating_add(1_000_000);
+                if let Some(future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) {
+                    future.await;
+                } else {
+                    tx_reactor::yield_now().await;
+                }
+            }
             SyscallResult::error_from(errno)
         }
     }

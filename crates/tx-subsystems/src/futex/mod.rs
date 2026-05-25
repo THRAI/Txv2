@@ -159,7 +159,7 @@ fn new_entry() -> FutexEntry {
     }
 }
 
-fn register_waiting_tid(tid: Option<u32>) {
+pub(crate) fn register_waiting_tid(tid: Option<u32>) {
     let Some(tid) = tid else {
         return;
     };
@@ -168,7 +168,7 @@ fn register_waiting_tid(tid: Option<u32>) {
     *count = count.saturating_add(1);
 }
 
-fn unregister_waiting_tid(tid: Option<u32>) {
+pub(crate) fn unregister_waiting_tid(tid: Option<u32>) {
     let Some(tid) = tid else {
         return;
     };

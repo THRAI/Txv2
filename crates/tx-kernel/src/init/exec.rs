@@ -864,6 +864,16 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 selected += 1;
                 continue;
             }
+            if let Some(filter) = group.strip_prefix("ltp-musl:") {
+                append_filtered_ltp(&mut cmd, filter);
+                selected += 1;
+                continue;
+            }
+            if let Some(filter) = group.strip_prefix("ltp:") {
+                append_filtered_ltp(&mut cmd, filter);
+                selected += 1;
+                continue;
+            }
             if is_libctest_musl_group(group) {
                 append_full_libctest(&mut cmd);
                 selected += 1;
@@ -879,6 +889,29 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
         append_default_oscomp_scripts(&mut cmd);
     }
     cmd
+}
+
+fn append_filtered_ltp(cmd: &mut alloc::string::String, filter: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+    );
+    for case in filter.split('+') {
+        let case = case.trim();
+        if case.is_empty() {
+            continue;
+        }
+        let _ = write!(cmd, "; ./busybox echo \"RUN LTP CASE {case}\"");
+        let _ = write!(cmd, "; ltp/testcases/bin/{case}");
+        let _ = write!(cmd, "; ret=$?");
+        let _ = write!(cmd, "; ./busybox echo \"FAIL LTP CASE {case} : $ret\"");
+    }
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+    );
 }
 
 fn append_filtered_libctest(cmd: &mut alloc::string::String, filter: &str) {

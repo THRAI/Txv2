@@ -297,6 +297,9 @@ impl ProcessIdentity {
         if self.is_zombie() {
             return b'Z';
         }
+        if crate::futex::thread_has_waiter(self.pid.0) {
+            return b'S';
+        }
         if let Some(leader) = self.thread_by_tid(self.pid.0) {
             return leader.proc_state_char();
         }

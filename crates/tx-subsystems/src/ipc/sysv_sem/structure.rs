@@ -6,6 +6,7 @@
 //! Day-1 single-namespace: a global `SEM_TABLE` maps semid → Cap.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
@@ -13,7 +14,7 @@ use crate::ipc::sysv_shm::structure::IpcPerm;
 use crate::process::adapter::step_engine::{
     Cap, PayloadCap, SpinMutex, Zone, ZoneAllocated, ZoneError,
 };
-use crate::process::adapter::wait_routing::Channel;
+use crate::process::adapter::wait_routing::{self, Channel, WaitSource};
 use crate::process::nsproxy::SysvKey;
 
 // ---------------------------------------------------------------------------
@@ -89,6 +90,7 @@ pub struct SemArrayPayload {
     /// Wake channel fired when any sem value changes.
     pub changed_channel: Channel,
     pub changed_source_id: u64,
+    pub changed_wait_source: Arc<WaitSource>,
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +148,7 @@ pub(crate) fn register_sem(
 
     let changed_channel = Channel::new();
     let changed_source_id = crate::wait_source::register_wait_channel(changed_channel.clone());
+    let changed_wait_source = wait_routing::new_wait_source(changed_source_id);
 
     let identity = sign(SemArrayIdentity {
         key,
@@ -165,6 +168,7 @@ pub(crate) fn register_sem(
         changed_seq: AtomicU64::new(0),
         changed_channel,
         changed_source_id,
+        changed_wait_source,
     })?;
     *identity.payload.lock() = Some(PayloadCap::from_cap(payload));
     SEM_TABLE.lock().insert(semid, identity.clone());

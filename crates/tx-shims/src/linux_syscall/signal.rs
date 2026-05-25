@@ -187,8 +187,85 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
 
 // --- Stub syscalls (deferred to post-bringup) -------------------------
 
-pub(super) fn sys_rt_sigsuspend(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+fn set_thread_signal_mask(ctx: &SyscallCtx, next: SignalMask) -> Result<SignalMask, SyscallResult> {
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = SigprocmaskOp {
+        thread: ctx.thread.clone(),
+        how: SigmaskHow::SetMask,
+        next,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(SigprocmaskChange::Replaced { prev, .. }) => Ok(prev),
+        Ok(SigprocmaskChange::ZombieIgnored) => Err(SyscallResult::Error(ESRCH_VALUE)),
+        Err(v3errno) => Err(SyscallResult::error_from(Errno::from(v3errno))),
+    }
+}
+
+pub(super) async fn sys_rt_sigsuspend<P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
+    let mask_ptr = args[0];
+    let sigset_size = args[1];
+    if mask_ptr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if sigset_size != core::mem::size_of::<u64>() as u64 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let mask_bits = match bootstrap_read_user::<u64>(&ctx.aspace, mask_ptr) {
+        Ok(bits) => bits,
+        Err(errno) => return SyscallResult::error_from(errno),
+    };
+    let old_mask = match set_thread_signal_mask(ctx, SignalMask::new(mask_bits)) {
+        Ok(mask) => mask,
+        Err(result) => return result,
+    };
+
+    let restore_and_eintr = |ctx: &SyscallCtx<'_>, old_mask: SignalMask| {
+        let _ = set_thread_signal_mask(ctx, old_mask);
+        SyscallResult::Error(EINTR_VALUE)
+    };
+
+    const CHUNK_NS: u64 = 5_000_000;
+    loop {
+        if tx_subsystems::signal::select_next_signal(&ctx.thread).is_some() {
+            return restore_and_eintr(ctx, old_mask);
+        }
+
+        use crate::adapter::step_engine::DriveMode;
+        use tx_scripts::drive;
+        let now_ns = <P as tx_hal::TimeIf>::read_ns();
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+        let mailbox = ctx.mailbox.clone();
+        let op = super::NanosleepOp {
+            nanos: CHUNK_NS,
+            deadline_ns: now_ns.saturating_add(CHUNK_NS),
+            started: false,
+        };
+        match drive(
+            op,
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox.as_ref(),
+            None,
+            timer_wheel_arc.as_ref(),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(v3errno) => {
+                let errno: Errno = v3errno.into();
+                if errno == Errno::EINTR {
+                    return restore_and_eintr(ctx, old_mask);
+                }
+                let _ = set_thread_signal_mask(ctx, old_mask);
+                return SyscallResult::error_from(errno);
+            }
+        }
+    }
 }
 
 /// `sigaltstack(ss, old_ss)` — Linux LP64 `stack_t` query/update.
