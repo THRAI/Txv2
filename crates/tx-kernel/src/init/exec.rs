@@ -905,7 +905,7 @@ fn append_filtered_ltp(cmd: &mut alloc::string::String, filter: &str) {
             continue;
         }
         let _ = write!(cmd, "; ./busybox echo \"RUN LTP CASE {case}\"");
-        let _ = write!(cmd, "; ltp/testcases/bin/{case}");
+        let _ = write!(cmd, "; /bin/setsid ltp/testcases/bin/{case}");
         let _ = write!(cmd, "; ret=$?");
         let _ = write!(cmd, "; ./busybox echo \"FAIL LTP CASE {case} : $ret\"");
     }
@@ -1085,9 +1085,18 @@ fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str) {
     use core::fmt::Write as _;
 
     if script == "ltp_testcode.sh" {
-        append_ltp_script_env(cmd);
+        append_full_ltp_runner(cmd);
+        return;
     }
     let _ = write!(cmd, "; ./busybox sh {script}");
+}
+
+fn append_full_ltp_runner(cmd: &mut alloc::string::String) {
+    append_ltp_script_env(cmd);
+    cmd.push_str("; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\"");
+    cmd.push_str("; target_dir=\"ltp/testcases/bin\"");
+    cmd.push_str("; for file in \"$target_dir\"/*; do if [ -f \"$file\" ]; then name=${file##*/}; ./busybox echo \"RUN LTP CASE $name\"; /bin/setsid \"$file\"; ret=$?; ./busybox echo \"FAIL LTP CASE $name : $ret\"; fi; done");
+    cmd.push_str("; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\"");
 }
 
 fn append_ltp_script_env(cmd: &mut alloc::string::String) {
@@ -1095,7 +1104,7 @@ fn append_ltp_script_env(cmd: &mut alloc::string::String) {
 
     let _ = write!(
         cmd,
-        "; export LTPROOT=/musl/musl/ltp; export PATH=/bin:/musl/glibc:/musl/musl:/musl/musl/ltp/testcases/bin"
+        "; ./busybox mkdir -p /bin; /musl/musl/busybox --install -s /bin; export LTPROOT=/musl/musl/ltp; export PATH=/bin:/musl/glibc:/musl/musl:/musl/musl/ltp/testcases/bin"
     );
 }
 
@@ -1253,23 +1262,31 @@ mod tests {
     }
 
     #[test]
-    fn ltp_scripts_get_helper_path_without_busybox_applet_setup() {
+    fn ltp_scripts_install_busybox_applets_and_get_helper_path() {
         let mut full_cmd = String::from("cd /musl/musl");
         append_oscomp_musl_script(&mut full_cmd, "ltp_testcode.sh");
 
+        assert!(full_cmd.contains("./busybox mkdir -p /bin"));
+        assert!(full_cmd.contains("/musl/musl/busybox --install -s /bin"));
         assert!(full_cmd.contains("export LTPROOT=/musl/musl/ltp"));
         assert!(full_cmd.contains("/musl/musl/ltp/testcases/bin"));
-        assert!(full_cmd.contains("; ./busybox sh ltp_testcode.sh"));
+        assert!(full_cmd.contains("; target_dir=\"ltp/testcases/bin\""));
+        assert!(full_cmd.contains("; /bin/setsid \"$file\""));
+        assert!(full_cmd.contains("RUN LTP CASE $name"));
+        assert!(full_cmd.contains("FAIL LTP CASE $name : $ret"));
+        assert!(!full_cmd.contains("; ./busybox sh ltp_testcode.sh"));
         assert!(!full_cmd.contains("/tmp/ltp-busybox"));
-        assert!(!full_cmd.contains("--install"));
+        assert!(!full_cmd.contains("/bin/timeout"));
 
         let mut filtered_cmd = String::from("cd /musl/musl");
         append_filtered_ltp(&mut filtered_cmd, "ar01.sh");
 
+        assert!(filtered_cmd.contains("./busybox mkdir -p /bin"));
+        assert!(filtered_cmd.contains("/musl/musl/busybox --install -s /bin"));
         assert!(filtered_cmd.contains("export LTPROOT=/musl/musl/ltp"));
         assert!(filtered_cmd.contains("/musl/musl/ltp/testcases/bin"));
-        assert!(filtered_cmd.contains("; ltp/testcases/bin/ar01.sh"));
+        assert!(filtered_cmd.contains("; /bin/setsid ltp/testcases/bin/ar01.sh"));
         assert!(!filtered_cmd.contains("/tmp/ltp-busybox"));
-        assert!(!filtered_cmd.contains("--install"));
+        assert!(!filtered_cmd.contains("/bin/timeout"));
     }
 }

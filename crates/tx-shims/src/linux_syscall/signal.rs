@@ -606,9 +606,10 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
 /// - `pid > 0`: deliver `sig` to the matching process via
 ///   `tx_subsystems::signal::step_kill_process`. Resolved through
 ///   `process_by_pid`'s init-rooted tree walk.
-/// - `pid <= 0`: pgrp / all-processes targets — out of scope for v1
-///   (`-ENOSYS`; needs a global pid-to-pgrp lookup the slice does
-///   not yet wire).
+/// - `pid == 0`: deliver to the caller's process group.
+/// - `pid < -1`: deliver to process group `-pid`.
+/// - `pid == -1`: all-processes target — out of scope for v1
+///   (`-ENOSYS`).
 /// - `sig == 0`: existence probe — return `0` if the target exists
 ///   (live or zombie), `-ESRCH` otherwise. Linux semantic.
 /// - Unknown signum (outside 1..=64): `-EINVAL`.
@@ -645,11 +646,39 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             },
         );
     }
-    if pid <= 0 {
-        // TODO(phase-pgrp-kill): pgrp-targeted (`pid < 0` /
-        // `pid == 0` / `pid == -1`) kills need a global pid-to-pgrp
-        // lookup the slice does not yet wire.
+    if pid == -1 {
+        // TODO(phase-all-processes-kill): Linux `kill(-1, sig)` sends
+        // to every permitted process except implementation-specific
+        // exclusions. Keep it explicit instead of confusing it with
+        // process-group dispatch.
         return SyscallResult::Error(ENOSYS_VALUE);
+    }
+    if pid < -1 {
+        let pgid = match pid.checked_neg() {
+            Some(pgid) => pgid as u64,
+            None => return SyscallResult::Error(ESRCH_VALUE),
+        };
+        let pgrp = match resolve_pid_number_as(pgid, PidNameKind::ProcessGroup) {
+            Some(PidName::ProcessGroup(pgrp)) => pgrp,
+            _ => return SyscallResult::Error(ESRCH_VALUE),
+        };
+        if sig == 0 {
+            return SyscallResult::Return(0);
+        }
+        let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
+            Some(s) => s,
+            None => return SyscallResult::Error(EINVAL_VALUE),
+        };
+        return dispatch_errno(
+            tx_subsystems::signal::script_kill_pgrp(&ctx.process, &pgrp, signum),
+            |n| {
+                if n > 0 {
+                    SyscallResult::Return(0)
+                } else {
+                    SyscallResult::Error(EPERM_VALUE)
+                }
+            },
+        );
     }
 
     let target = match process_by_pid(Pid(pid as u32)) {

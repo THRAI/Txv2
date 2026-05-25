@@ -7,6 +7,7 @@ use crate::linux_syscall::{
     NR_RT_SIGRETURN, NR_SETHOSTNAME, NR_TGKILL, NR_TKILL, NR_UNAME, O_RDWR, RLIMIT_AS,
     RLIMIT_NOFILE, RLIM_INFINITY,
 };
+use tx_subsystems::process::Pgid;
 
 const E_BADF: i32 = 9;
 const E_NOSYS: i32 = 38;
@@ -235,6 +236,67 @@ fn dispatch_kill_signal_zero_against_live_returns_zero() {
     assert_eq!(r, SyscallResult::Return(0));
     // The process must remain live — `sig == 0` is probe-only.
     assert!(!proc_cap.is_zombie());
+}
+
+/// `kill(-pgid, sig)` resolves a registered process group and fans
+/// the signal out through the same cred-checked path as `kill(0, sig)`.
+#[test]
+fn dispatch_kill_negative_pgid_succeeds() {
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+
+    let child =
+        tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false).expect("fork");
+    tx_subsystems::process::step_setpgid(&child, Pgid(child.pid.0)).expect("child setpgid");
+
+    let ctx = make_ctx(parent, parent_thread);
+    let neg_pgid = -(child.pgrp_cap().pgid.0 as i32);
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [neg_pgid as u64, 15, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(r, SyscallResult::Return(0));
+    assert!(!child.is_zombie());
+}
+
+/// `kill(-pgid, 0)` is an existence probe for the process group.
+#[test]
+fn dispatch_kill_negative_pgid_signal_zero_returns_zero() {
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+
+    let child =
+        tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false).expect("fork");
+    tx_subsystems::process::step_setpgid(&child, Pgid(child.pid.0)).expect("child setpgid");
+
+    let ctx = make_ctx(parent, parent_thread);
+    let neg_pgid = -(child.pgrp_cap().pgid.0 as i32);
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [neg_pgid as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(r, SyscallResult::Return(0));
+    assert!(!child.is_zombie());
+}
+
+/// `kill(-unknown_pgid, sig)` returns `-ESRCH`, not `-ENOSYS`.
+#[test]
+fn dispatch_kill_unknown_negative_pgid_returns_neg_esrch() {
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    let ctx = make_ctx(parent, parent_thread);
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [(-9999i32) as u64, 15, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(r, SyscallResult::Error(E_SRCH));
 }
 
 /// `kill(pid, sig)` with an out-of-range signum returns `-EINVAL`.
