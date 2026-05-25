@@ -476,6 +476,23 @@ fn fork_inherits_mount_namespace_from_nsproxy_bundle() {
 }
 
 #[test]
+fn fork_inherits_parent_network_namespace() {
+    let _g = setup();
+    let parent = bootstrap();
+
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
+    let parent_netns = parent.net_namespace().expect("parent netns");
+    let child_netns = child.net_namespace().expect("child netns");
+
+    assert!(core::ptr::eq(
+        parent_netns.socket_table(),
+        child_netns.socket_table()
+    ));
+    assert_eq!(parent_netns.link_snapshot()[0].name, "lo");
+    assert_eq!(child_netns.link_snapshot()[0].name, "lo");
+}
+
+#[test]
 fn fork_clones_address_space_into_distinct_cap() {
     let _g = setup();
     let parent = bootstrap();
@@ -783,6 +800,40 @@ fn fork_child_exit_does_not_apply_parent_sysv_sem_undo_adjustments() {
     {
         sysv_sem::execution::SemCtlResult::Val(value) => assert_eq!(value, 2),
         other => panic!("expected Val, got {other:?}"),
+    }
+}
+
+#[test]
+fn exit_group_closes_unshared_raw_icmp_socket_fd() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let netns = proc_cap.net_namespace().expect("process net namespace");
+    let opened = {
+        let guard = ebr_guard();
+        match crate::net::step_socket_open_file_in_namespace(2, 3, 1, netns.clone(), &guard) {
+            crate::execution::StepOutcome::Done(opened) => opened,
+            crate::execution::StepOutcome::Err(errno) => {
+                panic!("raw icmp socket open failed: {errno:?}")
+            }
+            crate::execution::StepOutcome::Continue { .. }
+            | crate::execution::StepOutcome::Yield { .. } => {
+                panic!("raw icmp socket open did not complete")
+            }
+        }
+    };
+
+    proc_cap.set_fd(7, Some(opened.file));
+    {
+        let guard = ebr_guard();
+        assert_eq!(netns.socket_table().snapshot_raw_icmp(&guard).len(), 1);
+    }
+
+    step_exit_group(&proc_cap, ExitStatus::Exited(0));
+
+    assert!(opened.identity.live_payload().is_none());
+    {
+        let guard = ebr_guard();
+        assert!(netns.socket_table().snapshot_raw_icmp(&guard).is_empty());
     }
 }
 

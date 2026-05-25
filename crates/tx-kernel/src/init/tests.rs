@@ -14,7 +14,7 @@
 //! mount slots populate, tmpfs's `/dev` mkdir succeeds, devfs's
 //! console alias resolves, and init's cwd + fds 0/1/2 are bound.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use std::sync::Mutex;
 
@@ -119,6 +119,7 @@ static LAST_USERSPACE_CTX: Mutex<Option<tx_hal::UserTrapContext>> = Mutex::new(N
 /// test. Reset only by the next `setup()` — persists across the
 /// per-iteration `run_thread` invocations that the smoke chains.
 static USERSPACE_A0_LOG: Mutex<std::vec::Vec<usize>> = Mutex::new(std::vec::Vec::new());
+static TEST_NOW_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Test hook: when non-zero, the simulator marks the active userspace-run
 /// request as timer-preempted before returning from `enter_userspace_*`.
@@ -182,7 +183,7 @@ impl tx_hal::IrqIf for TestPlatform {}
 
 impl tx_hal::TimeIf for TestPlatform {
     fn read_ns() -> u64 {
-        0
+        TEST_NOW_NS.load(Ordering::Acquire)
     }
     fn set_deadline_ns(_deadline: u64) {}
     fn cancel_deadline() {}
@@ -267,6 +268,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     tx_subsystems::cross_crate_test_support::reset_dev_id_counter();
     tx_subsystems::cross_crate_test_support::reset_reactor_submit_seam();
     crate::init::reset_boot_state_for_test();
+    tx_subsystems::net::initial_loopback_iface().clear_for_test_or_bootstrap();
     crate::irq::reset_dispatch_table_for_test();
     tx_subsystems::device::reset_block_registry_for_test();
     CONSOLE_CAPTURED_LEN.store(0, Ordering::Release);
@@ -282,7 +284,12 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
         .clear();
     USERSPACE_PREEMPT_ON_ENTER.store(0, Ordering::Release);
+    TEST_NOW_NS.store(0, Ordering::Release);
     guard
+}
+
+fn set_test_time_ns(now_ns: u64) {
+    TEST_NOW_NS.store(now_ns, Ordering::Release);
 }
 
 fn bootstrap_init() {
@@ -305,6 +312,7 @@ fn drive_boot_wiring() {
     // platform-publication path in the boot-wiring smoke.
     CoreInit::<TestPlatform>::install_irq_handlers();
     CoreInit::<TestPlatform>::init_block_devices();
+    CoreInit::<TestPlatform>::init_net_devices();
     CoreInit::<TestPlatform>::mount_rootfs_from_boot_media();
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
     CoreInit::<TestPlatform>::register_devfs_console_alias();
@@ -312,6 +320,10 @@ fn drive_boot_wiring() {
     CoreInit::<TestPlatform>::mount_bdevfs_at_dev_block();
     CoreInit::<TestPlatform>::bind_init_cwd_and_root();
 }
+
+mod net_delegate_deadline;
+mod net_delegate_device;
+mod userspace_net_smoke;
 
 // --- tests --------------------------------------------------------
 
@@ -421,6 +433,41 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
         }
         other => panic!("expected StructBacked Tty backing, got {other:?}"),
     }
+}
+
+#[test]
+fn boot_smoke_walker_resolves_dev_null_as_char_device() {
+    use tx_subsystems::vfs::{walker, Credential, InodeKind};
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let cwd = init.cwd().expect("init cwd must be bound");
+    let cred = Credential::root();
+    let guard = guard();
+    use step_engine::StepOutcome as V3;
+    let dentry = match walker::step_walk(cwd, b"/dev/null", &cred, &guard) {
+        V3::Done(dentry) => dentry,
+        other => panic!("step_walk(/dev/null) must succeed, got {other:?}"),
+    };
+    assert_eq!(dentry.name().as_bytes(), b"null");
+    assert_eq!(dentry.rnode().meta().kind(), InodeKind::CharDevice);
+
+    let payload = dentry
+        .rnode()
+        .containing_mount_weak()
+        .and_then(|weak| weak.upgrade(&guard))
+        .expect("/dev/null rnode must carry devfs mount payload");
+    let loaded = match payload
+        .fs_ops()
+        .load_inode_meta(dentry.rnode().fs_object_id(), &guard)
+    {
+        V3::Done(meta) => meta,
+        other => panic!("devfs load_inode_meta(/dev/null) failed: {other:?}"),
+    };
+    assert_eq!(loaded.kind(), InodeKind::CharDevice);
 }
 
 /// Post-`mount_bdevfs_at_dev_block`, the VFS walker must resolve

@@ -1,0 +1,60 @@
+# alpine-proc-net-sysfs-smoke.txt - Alpine procfs/sysfs network visibility.
+#
+# This probes the Linux-compatible read-only files that OpenRC and network
+# diagnostics commonly inspect before starting real services.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "ls /proc/net\n"
+expect "tcp" within 10000
+expect "udp" within 10000
+expect "snmp" within 10000
+expect "netlink" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/net/tcp\n"
+expect "local_address" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/net/snmp\n"
+expect "Ip:" within 10000
+expect "Tcp:" within 10000
+expect "Udp:" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "ls /sys/class/net\n"
+expect "lo" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /sys/class/net/lo/ifindex\n"
+expect "1" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /sys/class/net/lo/address\n"
+expect "00:00:00:00:00:00" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /sys/class/net/lo/mtu\n"
+expect "65535" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /sys/class/net/lo/operstate\n"
+expect "unknown" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /sys/class/net/lo/statistics/rx_packets\n"
+expect "0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+quit

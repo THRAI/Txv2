@@ -1353,7 +1353,7 @@ fn vm_aspace_reserve_user_range_for_access_returns_efault_for_unmapped() {
         aspace.reserve_user_range_for_access(range(0x30000, 1), crate::vm::UserAccessKind::Read);
     assert_eq!(
         outcome,
-        crate::vm::adapter::step_engine::StepOutcome::err(crate::execution::Errno::EFAULT.into())
+        crate::vm::adapter::step_engine::StepOutcome::err(crate::execution::Errno::EFAULT)
     );
     assert_eq!(aspace.pmap().stats().mapped_pages, 0);
 }
@@ -1378,7 +1378,7 @@ fn vm_aspace_reserve_user_range_for_access_propagates_prot_mismatch_efault() {
         aspace.reserve_user_range_for_access(range(0x40000, 1), crate::vm::UserAccessKind::Write);
     assert_eq!(
         outcome,
-        crate::vm::adapter::step_engine::StepOutcome::err(crate::execution::Errno::EFAULT.into())
+        crate::vm::adapter::step_engine::StepOutcome::err(crate::execution::Errno::EFAULT)
     );
 }
 

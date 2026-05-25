@@ -16,6 +16,7 @@ pub mod initramfs;
 pub mod io_uring;
 pub mod ipc;
 pub mod mount;
+pub mod net;
 pub mod page_backed;
 pub mod pipe;
 pub mod process;

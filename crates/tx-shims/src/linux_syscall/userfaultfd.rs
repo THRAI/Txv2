@@ -749,7 +749,7 @@ pub(super) async fn sys_ufd_read(
                 return SyscallResult::Return(read as i64);
             }
             V3Out::Err(v3errno) => {
-                let errno: Errno = v3errno.into();
+                let errno: Errno = v3errno;
                 if errno == Errno::EAGAIN {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }

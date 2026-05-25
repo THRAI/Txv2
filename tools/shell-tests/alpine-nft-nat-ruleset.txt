@@ -1,0 +1,47 @@
+# alpine-nft-nat-ruleset.txt - real Alpine nft NAT control-plane probe.
+#
+# This is the N72T stage-6 command shape. It intentionally uses real Alpine
+# nft rather than /bin/nft-probe so txKernel sees the frontend's real
+# NETLINK_NETFILTER batching, attributes, ACKs, and dump expectations.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "NFT=/sbin/nft; [ -x $NFT ] || NFT=/usr/sbin/nft; $NFT --version\n"
+expect "nftables" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "$NFT list ruleset\n"
+expect "/ # " within 15000
+
+sleep 500
+send "$NFT add table ip nat\n"
+expect "/ # " within 15000
+
+sleep 500
+send "$NFT add chain ip nat postrouting '{ type nat hook postrouting priority 100; }'\n"
+expect "/ # " within 15000
+
+sleep 500
+send "$NFT add rule ip nat postrouting ip saddr 172.17.0.0/16 masquerade\n"
+expect "/ # " within 15000
+
+sleep 500
+send "$NFT list ruleset\n"
+expect "table ip nat" within 15000
+expect "chain postrouting" within 15000
+expect "masquerade" within 15000
+expect "/ # " within 15000
+
+sleep 500
+send "$NFT delete table ip nat\n"
+expect "/ # " within 15000
+
+sleep 500
+send "$NFT list ruleset\n"
+expect "/ # " within 15000
+
+sleep 500
+quit

@@ -42,7 +42,7 @@ where
     ) -> StepOutcome<Frame, NoProgress> {
         const PAGE_SIZE: u64 = 4096;
         if !offset.is_multiple_of(PAGE_SIZE) {
-            return StepOutcome::err(Errno::EINVAL.into());
+            return StepOutcome::err(Errno::EINVAL);
         }
 
         let cluster = cluster_from_fs_id(fs_object_id);
@@ -111,7 +111,7 @@ where
             Ok(page_buf) => {
                 let owned = match page_allocator::reserve_frame(ZeroPolicy::Zeroed) {
                     Ok(reservation) => reservation.commit(),
-                    Err(_) => return StepOutcome::err(Errno::EBUSY.into()),
+                    Err(_) => return StepOutcome::err(Errno::EBUSY),
                 };
                 let ppn = owned.ppn();
 
@@ -123,7 +123,7 @@ where
                 {
                     let dst = match page_allocator::frame_kernel_addr(ppn) {
                         Ok(ptr) => ptr,
-                        Err(_) => return StepOutcome::err(Errno::EIO.into()),
+                        Err(_) => return StepOutcome::err(Errno::EIO),
                     };
                     unsafe {
                         core::ptr::copy_nonoverlapping(page_buf.as_ptr(), dst, PAGE_SIZE as usize);
@@ -133,7 +133,7 @@ where
                 let _permanent = owned.into_permanent_frame();
                 StepOutcome::done(Frame::new(ppn))
             }
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
@@ -146,7 +146,7 @@ where
     ) -> StepOutcome<(), NoProgress> {
         const PAGE_SIZE: u64 = 4096;
         if !offset.is_multiple_of(PAGE_SIZE) {
-            return StepOutcome::err(Errno::EINVAL.into());
+            return StepOutcome::err(Errno::EINVAL);
         }
 
         let cluster = cluster_from_fs_id(fs_object_id);
@@ -156,7 +156,7 @@ where
         let page_data = {
             let ptr = match page_allocator::frame_kernel_addr(ppn) {
                 Ok(p) => p,
-                Err(_) => return StepOutcome::err(Errno::EIO.into()),
+                Err(_) => return StepOutcome::err(Errno::EIO),
             };
             let mut buf = [0u8; PAGE_SIZE as usize];
             // SAFETY: `ptr` points to a valid kernel mapping of the frame.
@@ -231,7 +231,7 @@ where
 
         match result {
             Ok(()) => StepOutcome::done(()),
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
@@ -251,7 +251,7 @@ where
         // Look up cached dirent for parent info.
         let cached = match self.dirent_cache.lock().get(fs_object_id) {
             Some(c) => c,
-            None => return StepOutcome::err(Errno::ENOENT.into()),
+            None => return StepOutcome::err(Errno::ENOENT),
         };
 
         // Preserve existing timestamp.
@@ -278,7 +278,7 @@ where
 
         match result {
             Ok(()) => StepOutcome::done(()),
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
@@ -287,6 +287,6 @@ where
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 }

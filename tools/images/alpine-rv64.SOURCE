@@ -1,0 +1,16 @@
+Alpine RV64 rootfs helper
+=========================
+
+Default source:
+  https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/riscv64/latest-releases.yaml
+
+Default APK repositories:
+  https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/riscv64
+  https://dl-cdn.alpinelinux.org/alpine/latest-stable/community/riscv64
+
+Generated files stay under:
+  target/rootfs/alpine-rv64-qemu
+  target/images/alpine-cache
+
+Regenerate with:
+  tools/images/fetch-alpine-rv64.sh

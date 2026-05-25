@@ -183,11 +183,7 @@ pub fn kernel_step(
                     token,
                 );
             }
-            StepOutcome::Err(e) => {
-                return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(
-                    e,
-                )))
-            }
+            StepOutcome::Err(e) => return KernelStep::Error(WalkCause::FsOpsRejected(e)),
             StepOutcome::Continue { .. } => {
                 // Re-enter lookup (v3 continue without yield).
                 return KernelStep::Continue(WalkState::Walking(WalkingState {
@@ -220,11 +216,7 @@ pub fn kernel_step(
                     token,
                 );
             }
-            StepOutcome::Err(e) => {
-                return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(
-                    e,
-                )))
-            }
+            StepOutcome::Err(e) => return KernelStep::Error(WalkCause::FsOpsRejected(e)),
             StepOutcome::Continue { .. } => {
                 return KernelStep::Continue(WalkState::Walking(WalkingState {
                     current,
@@ -454,9 +446,7 @@ fn materialise_child(
                     hop_count: walking.hop_count,
                 },
             )),
-            StepOutcome::Err(e) => Err(KernelStep::Error(WalkCause::FsOpsRejected(
-                crate::execution::Errno::from(e),
-            ))),
+            StepOutcome::Err(e) => Err(KernelStep::Error(WalkCause::FsOpsRejected(e))),
             StepOutcome::Continue { .. } => Err(KernelStep::Error(WalkCause::FsOpsRejected(
                 crate::execution::Errno::ENOSYS,
             ))),
@@ -485,9 +475,7 @@ fn materialise_child(
                         hop_count: walking.hop_count,
                     },
                 )),
-                StepOutcome::Err(e) => Err(KernelStep::Error(WalkCause::FsOpsRejected(
-                    crate::execution::Errno::from(e),
-                ))),
+                StepOutcome::Err(e) => Err(KernelStep::Error(WalkCause::FsOpsRejected(e))),
                 StepOutcome::Continue { .. } => Err(KernelStep::Error(WalkCause::FsOpsRejected(
                     crate::execution::Errno::ENOSYS,
                 ))),

@@ -226,7 +226,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let state = self.state.lock();
         let Some(parent_inode) = state.inodes.get(&parent) else {
@@ -308,7 +308,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         // Directories arrive through `mkdir`, symlinks through
         // `symlink`. Other mknod-created leaf nodes get a simple
@@ -390,7 +390,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
@@ -439,11 +439,11 @@ impl FsOps for Tmpfs {
     ) -> StepOutcome<(), NoProgress> {
         let old_key = match InlineName::new(old_name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let new_key = match InlineName::new(new_name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         if old_key == new_key {
             return StepOutcome::done(());
@@ -576,7 +576,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let mode = (mode & !S_IFMT) | S_IFDIR;
         let new_id = self.alloc_object_id();
@@ -621,7 +621,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let mut state = self.state.lock();
         let Some(target_inode) = state.inodes.get(&target) else {
@@ -668,7 +668,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let new_id = self.alloc_object_id();
         let mut meta = InodeMeta::new(InodeKind::Symlink, S_IFLNK | 0o777);
@@ -729,7 +729,7 @@ impl FsOps for Tmpfs {
             .unwrap_or(InodeKind::Regular);
         let entry = match DirEntry::new(*child_id, kind, name.as_bytes()) {
             Ok(e) => e,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         StepOutcome::done(Some((entry, DirCursor::from_u64(cursor.as_u64() + 1))))
     }
@@ -867,7 +867,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         if let Err(e) = tx_subsystems::vfs::predicates::check_chmod_perm(&inode.meta, cred) {
-            return StepOutcome::err(e.into());
+            return StepOutcome::err(e);
         }
         // Preserve the IFMT bits from the existing meta — kind is
         // immutable through chmod (matches `serialize_inode_meta`).
@@ -902,7 +902,7 @@ impl FsOps for Tmpfs {
         if let Err(e) =
             tx_subsystems::vfs::predicates::check_chown_perm(&inode.meta, new_uid, new_gid, cred)
         {
-            return StepOutcome::err(e.into());
+            return StepOutcome::err(e);
         }
         let privileged = cred.effective_caps.contains(Capability::FOWNER) || cred.uid == 0;
         if let Some(u) = new_uid {

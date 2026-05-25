@@ -28,13 +28,13 @@ def is_valid_case_name(case: str) -> bool:
 
 SKIP_CASES: set[str] = {
     # Legacy epoll stress case. Slow on Txv2 and not useful while the
-    # socket/network surface is intentionally out of scope. Tracked in
-    # docs/ljs/ltp-network-deferred.md.
+    # socket/network surface is intentionally out of the ordinary batches.
+    # Tracked in docs/LTP/ltp-network-deferred.md.
     "epoll01",
     # Defensive guard for malformed prefix artifacts such as `epoll_`.
     "epoll_",
     # Uses socket/socketpair paths and checkpoint synchronization; defer until
-    # socket fd/readiness is implemented. Tracked in docs/ljs/ltp-network-deferred.md.
+    # socket fd/readiness is implemented. Tracked in docs/LTP/ltp-network-deferred.md.
     "epoll_wait05",
     # CVE stress test with .max_runtime = 150s and 1,000,000 timerfd_settime
     # races. Keep it out of fast p0; run explicitly when timerfd stress is the
@@ -46,7 +46,7 @@ SKIP_CASES: set[str] = {
 SKIP_PREFIXES: set[str] = {
     # These cases depend on socketpair()/socket readiness. Keep them out of
     # the fast LTP batches until the socket/network module is a real target.
-    # Tracked in docs/ljs/ltp-network-deferred.md.
+    # Tracked in docs/LTP/ltp-network-deferred.md.
     "epoll_pwait",
     # Network/socket groups are tracked separately and intentionally skipped
     # for the current LTP bringup pass.
