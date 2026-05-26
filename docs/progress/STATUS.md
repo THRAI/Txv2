@@ -1,3 +1,27 @@
+- 2026-05-27 **Closed the remaining non-kernel LTP network interpretations
+  with fresh witnesses.** Confirmed `socketcall01..03` and the
+  `accept4_01` socketcall variant are compiled as `syscall(-1)` on this RV64
+  LTP image because the legacy `socketcall` number exists only in non-RV64
+  LTP syscall tables. Re-ran the glibc `recvmmsg01` slim image and saved
+  `target/oscomp/ltp-glibc-recvmmsg-current.txt`: both libc and old-kernel
+  syscall variants pass all errno subcases (`10/10`), while the musl split
+  miss remains a userspace wrapper SIGSEGV before the bad-msgvec syscall
+  enters the kernel. Also re-read `setsockopt03.c`; its missing point is a
+  32-bit compat-only TCONF, while the native malformed `IPT_SO_SET_REPLACE`
+  crash-resistance subcase already passes. **Verification:** `rg` over LTP
+  syscall tables for `socketcall`; `cargo test -p tx-shims --lib
+  dispatch_sendmmsg_recvmmsg_error_order_matches_socket_abi --
+  --test-threads=1`; `cargo test -p tx-shims --lib
+  dispatch_sendmmsg_recvmmsg_udp_loopback_batch_round_trips --
+  --test-threads=1`; `timeout 180s cargo xtask oscomp qemu --target
+  rv64-qemu --data target/oscomp/ltp-glibc-recvmmsg --boot-suite
+  ltp-glibc`. **Next step:** do not add fake `syscall(-1)` handling or weaken
+  VM protections for musl; future score movement needs either a real 32-bit
+  compat ABI/userland charter, a rebuilt LTP image with current RV64
+  `memfd_secret(447)` headers, or a broader non-network syscall target.
+  **Blocker:** current split score remains `229/236` because these local
+  misses are arch/payload mismatches rather than missing socket semantics.
+
 - 2026-05-27 **Landed phase-0 kernel-object fd providers for the `accept03`
   tail.** Added typed `OpenFileBacking::KernelObject` metadata for
   `perf_event_open(241)` software CPU-clock events and

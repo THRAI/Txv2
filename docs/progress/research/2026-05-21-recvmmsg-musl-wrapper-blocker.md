@@ -45,6 +45,12 @@ change this path without incorrectly weakening VM protection.
   and glibc libraries. Disassembly of glibc `recvmmsg` shows a direct `ecall`
   without pre-writing `msgvec`, so the glibc variant should be a valid
   libc-level witness once txKernel's OSComp boot/rootfs path can run it.
+- Fresh glibc witness:
+  `target/oscomp/ltp-glibc-recvmmsg-current.txt` reports `recvmmsg01` passing
+  both the libc and old-kernel syscall variants, `10/10` total. The bad
+  message-vector address returns `EFAULT` in both variants, which confirms the
+  kernel path handles the LTP errno contract when userspace actually enters
+  the syscall.
 
 ## Current Policy
 
@@ -65,5 +71,6 @@ cargo build -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf
 cargo xtask oscomp submit --target rv64-qemu
 timeout 180s cargo xtask oscomp qemu --target rv64-qemu --data target/oscomp/ltp-net-layer4-mmsg --boot-suite ltp
 timeout 180s cargo xtask oscomp qemu --target rv64-qemu --data target/oscomp/ltp-recvmmsg-raw --boot-suite ltp
+timeout 180s cargo xtask oscomp qemu --target rv64-qemu --data target/oscomp/ltp-glibc-recvmmsg --boot-suite ltp-glibc
 cargo xtask progress validate
 ```

@@ -36,6 +36,7 @@ Reliable focused results already in `target/oscomp`:
 | TCP TLS ULP focused | `setsockopt10` | `1/1` | `target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt` |
 | RDS local seqpacket focused | `recvmsg03` | `1/1` | `target/oscomp/ltp-recvmsg03-rds-after-ipv6tcp.txt` |
 | SCTP local stream focused | `sendto02,bind04` | `17/17` | `target/oscomp/ltp-sctp-sendto02-bind04-after-ipv6tcp-submit.txt` |
+| glibc recvmmsg witness | `recvmmsg01` | `10/10` | `target/oscomp/ltp-glibc-recvmmsg-current.txt` |
 
 The first six result rows cover all 50 named syscall-network cases. The current
 local judge subcase total is now `229/236` after the b2/b3/b4/b6 refreshes.
@@ -174,8 +175,8 @@ surface. Use them as regression witnesses after related fixes.
 | `sendmsg03` | Refreshed b3 reports `1/1` in `target/oscomp/ltp-net-b3-after-rds-sctp.txt`; focused `LTP_MAX_RUNTIME=10` run also passes `1/1` in `target/oscomp/ltp-sendmsg03-after-yield-queue-maxruntime10.txt` | Not a network-table/linear-scan bottleneck. The raw `IP_HDRINCL` fast path validates four iovecs and returns `EOPNOTSUPP`; it does not enter packet routing or socket-table scans. The old timeout was LTP fzsync plus scheduler placement: userspace `sched_yield()` was requeued to `Preempted` behind hot userspace `New` work. Userspace yields now requeue to the `New` tail. |
 | `recvmsg02` | Focused log passes `1/1`: `recvmsg(..., MSG_PEEK)` receives the IPv6 UDP datagram and preserves the datagram | Use `target/oscomp/ltp-net-ipv6-udp.txt` and b3 `37/38` as regression witnesses. |
 | `recvmsg03` | Refreshed b3 and focused `recvmsg03` both report `1/1`: AF_RDS SOCK_SEQPACKET bind/sendmsg/recvmsg works locally and writes `msg_namelen = sizeof(sockaddr_in)` | Local-only RDS seqpacket queues are implemented for the LTP source-address/writeback surface. Full RDS wire or external-network behavior remains out of scope. |
-| `recvmmsg01` musl | First EBADF subcase passes, then userspace SIGSEGV before the bad-msgvec syscall | Known OSComp musl wrapper issue; kernel semantics have raw/glibc witnesses in `docs/progress/research/2026-05-21-recvmmsg-musl-wrapper-blocker.md` and `2026-05-21-ltp-glibc-sendmsg-witness.md`. |
-| `setsockopt03` | One 32-bit compat-only subcase is `TCONF`; supported subcase passes | Expected on RV64 unless compat mode is chartered. |
+| `recvmmsg01` musl | First EBADF subcase passes, then userspace SIGSEGV before the bad-msgvec syscall | Known OSComp musl wrapper issue, not a network-stack or `sys_recvmmsg` errno bug. Raw host tests pass, and the glibc LTP witness reports `10/10` in `target/oscomp/ltp-glibc-recvmmsg-current.txt`. |
+| `setsockopt03` | One 32-bit compat-only subcase is `TCONF`; supported malformed `IPT_SO_SET_REPLACE` subcase passes | Expected on RV64 unless a 32-bit compat-user ABI is chartered. The LTP source calls this out in `setup()` before running the crash-resistance check. |
 | `setsockopt05` | Focused log passes `1/1` after loopback MTU ioctl and namespace-relative `CAP_NET_ADMIN` checks | Use `target/oscomp/ltp-setsockopt05-userns-after-mtu.txt` as the focused regression witness. |
 | `setsockopt06` | Focused `LTP_MAX_RUNTIME=20` run passes `1/1` in `target/oscomp/ltp-setsockopt06-after-yield-queue-maxruntime20.txt`; refreshed b6 with `LTP_MAX_RUNTIME=30 LTP_MAX_RUNTIME_CASES=setsockopt06` reports `1/1` in `target/oscomp/ltp-net-b6-setsockopt-tail-maxruntime30.txt` | Not a packet-table scan. The hot socket paths are fixed-size sockopt reads/mutations plus per-loop AF_PACKET create/close. The old timeout was dominated by LTP fzsync delay bias and userspace yield placement, not by packet registry complexity. Use the clean focused log for direct regression and the b6 log for aggregate score. |
 | `setsockopt07` | Focused log passes `1/1` after `PACKET_RESERVE`/active `PACKET_RX_RING` validation was aligned | Use `target/oscomp/ltp-setsockopt07-userns-after-reserve2.txt` as the focused regression witness. |
@@ -203,6 +204,8 @@ surfaces:
 - `accept4_01`: legacy `socketcall` accept4 variant is not available on RV64.
 - `recvmmsg01` musl: known userspace wrapper SIGSEGV after the raw EBADF
   subcase passes.
+- `setsockopt03`: the missing subcase is explicitly 32-bit compat-only; the
+  native RV64 crash-resistance path passes.
 
 For regression refreshes, use:
 
