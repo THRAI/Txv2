@@ -16,8 +16,9 @@
 //!
 //! Deliberately deferred:
 //!
-//! - `SigInfo` payload (`si_code`, `si_value`, `si_pid`). Day-1 carries
-//!   only the signum bit.
+//! - Full realtime `SigInfo` queueing. The current slot carries the
+//!   Linux-visible prefix plus `si_value`, but repeated standard
+//!   signals still coalesce per signum.
 //! - Realtime queue (signums 32..=64). Day-1 is a 64-bit bitset; SIGRT*
 //!   bits coexist with standard but do not queue per-occurrence yet.
 //! - Default-disposition resolution (terminate / stop / continue /
@@ -149,15 +150,16 @@ pub struct PendingSignalQueue {
 }
 
 /// Minimal POSIX `siginfo_t` payload carried with each signal
-/// delivery.  Phase I carries `si_signo`, `si_code`, `si_pid`,
-/// and `si_uid`; `si_addr`, `si_value`, and the status union
-/// (`si_status`) are deferred.
+/// delivery.  Carries the common Linux-visible prefix plus
+/// `si_value` for POSIX timer/signalfd consumers; address, status,
+/// and full per-source union fidelity remain deferred.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SigInfo {
     pub si_signo: u32,
     pub si_code: i32,
     pub si_pid: u32,
     pub si_uid: u32,
+    pub si_value: u64,
 }
 
 /// SI_USER: signal sent by kill(2) / tkill(2) / tgkill(2).
@@ -916,7 +918,7 @@ pub fn step_kill_process(
             if let Some(payload) = target.payload.lock().as_ref() {
                 payload.signal_port.fire(SIGNAL_GENERATED);
             }
-            crate::signalfd::notify_process_signal(target.key().raw(), sig);
+            crate::signalfd::notify_process_signal_with_info(target.key().raw(), sig, info);
         }
         return outcome;
     }
@@ -984,7 +986,7 @@ pub fn step_kill_process(
     }
 
     // bus subscriber reaction: push siginfo to signalfd queues
-    crate::signalfd::notify_process_signal(target.key().raw(), sig);
+    crate::signalfd::notify_process_signal_with_info(target.key().raw(), sig, info);
 
     KillOutcome::Delivered
 }

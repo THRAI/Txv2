@@ -20,12 +20,11 @@
 //!    [`notify_process_signal`] is driven by
 //!    [`crate::signal::step_kill_process`] *after* the existing
 //!    thread-eligibility post completes.
-//! 4. A per-fd pending-signum queue with a paired
+//! 4. A per-fd pending-signal queue with a paired
 //!    [`Arc<WaitSource>`] for read-readiness. The queue is a
-//!    `VecDeque<u8>` (raw signum bytes) — phase D9-D treats signals
-//!    as the bitset their `Signum` shape allows; realtime
-//!    per-occurrence queuing is a follow-up. **Coalescence:** a
-//!    pending bit covers any number of matching deliveries.
+//!    `VecDeque<PendingSignal>` carrying the raw signum plus the
+//!    currently stored [`SigInfo`] prefix when available. Full
+//!    realtime per-occurrence queuing remains a follow-up.
 //! 5. The [`step_signalfd_read`] step body — mirrors the userfaultfd
 //!    `step_ufd_read` shape (one-siginfo-per-read, EAGAIN on
 //!    empty + nonblock, `Yield { OnWaitSource }` on empty + blocking).
@@ -33,9 +32,8 @@
 //! # signalfd_siginfo wire layout
 //!
 //! `struct signalfd_siginfo` is 128 bytes on Linux. Phase D9-D
-//! emits a minimal zero-filled record with the `ssi_signo` field
-//! populated; future passes extend with `ssi_pid` / `ssi_uid` /
-//! `ssi_code` once siginfo plumbing lands.
+//! emits a zero-filled record with the common prefix populated from
+//! [`SigInfo`] when the signal producer supplied one.
 //!
 //! ```text
 //!   off  size  field
@@ -44,7 +42,9 @@
 //!   8    4     ssi_code   (i32, zero)
 //!   12   4     ssi_pid    (u32, zero)
 //!   16   4     ssi_uid    (u32, zero)
-//!   ... 108 bytes reserved / zero
+//!   20   4     ssi_int    (low 32 bits of `si_value`)
+//!   48   8     ssi_ptr    (`si_value`)
+//!   ...        reserved / zero
 //! ```
 //!
 //! # Routing decision
@@ -75,11 +75,12 @@ use adapter::step_engine::{
 use adapter::wait_routing::Channel;
 
 use crate::process::structure::ProcessIdentity;
-use crate::signal::Signum;
+use crate::signal::{SigInfo, Signum};
 
 /// Wire size of one `struct signalfd_siginfo` record, per Linux's
-/// generic uapi (`<sys/signalfd.h>`). 128 bytes — phase D9-D emits a
-/// zero-filled record with only `ssi_signo` populated.
+/// generic uapi (`<sys/signalfd.h>`). 128 bytes — Tx populates the
+/// common prefix and POSIX timer value fields when `SigInfo` is
+/// available, leaving the rest zero-filled.
 pub const SIGNALFD_SIGINFO_SIZE: usize = 128;
 
 // === sfd_id minting ===================================================
@@ -131,16 +132,16 @@ pub struct SignalFd {
     /// The mask uses the same `Signum::bit` encoding as
     /// [`crate::signal::SignalMask`] — `1u64 << (signum - 1)`.
     mask: AtomicU64,
-    /// Per-fd pending-signum queue. `push_back(signum.raw())` on each
-    /// matching post; `pop_front()` on each `read(2)`. FIFO matches
-    /// Linux's signalfd queue ordering.
+    /// Per-fd pending-signal queue. `push_back(PendingSignal)` on
+    /// each matching post; `pop_front()` on each `read(2)`. FIFO
+    /// matches Linux's signalfd queue ordering.
     ///
     /// Coalescence: phase D9-D queues every matching post — multiple
     /// `kill(pid, SIGUSR1)` calls each push one entry. A future
     /// pass may collapse by signum if siginfo carries no
     /// per-occurrence payload; the current shape matches Linux's
     /// rt-signal queueing without needing extra state.
-    pending: SpinMutex<VecDeque<u8>>,
+    pending: SpinMutex<VecDeque<PendingSignal>>,
     /// Per-fd `WaitSource`. Fired whenever a matching signal is
     /// delivered to the owning process. Pattern mirrors pipe /
     /// userfaultfd: an `Arc<WaitSource>` whose id is paired with a
@@ -245,19 +246,42 @@ impl SignalFd {
     /// the current mask: posts only if `signum` is covered. Fires
     /// both wake paths (D2/D4 coexistence) on success.
     pub fn notify(&self, signum: Signum) -> bool {
+        self.notify_with_info(signum, None)
+    }
+
+    /// Notify this subscription with an optional siginfo snapshot.
+    pub fn notify_with_info(&self, signum: Signum, info: Option<SigInfo>) -> bool {
         if !self.covers(signum) {
             return false;
         }
-        self.pending.lock().push_back(signum.raw());
+        self.pending.lock().push_back(PendingSignal {
+            signum: signum.raw(),
+            info,
+        });
         notification::notify_readable(&self.wait_channel, &self.wait_source);
         true
     }
 
     /// Pop one signum off the pending queue. Returns `None` if empty.
     pub fn pop_pending(&self) -> Option<Signum> {
-        let raw = self.pending.lock().pop_front()?;
-        Signum::new(raw)
+        let pending = self.pop_pending_signal()?;
+        Signum::new(pending.signum)
     }
+
+    /// Pop one pending signal plus its optional siginfo snapshot.
+    fn pop_pending_signal(&self) -> Option<PendingSignal> {
+        self.pending.lock().pop_front()
+    }
+}
+
+/// One signalfd queue entry. The queue still coalesces at the
+/// producer's standard-signal pending-bit layer; this preserves the
+/// siginfo prefix for the currently visible delivery without adding a
+/// full realtime sigqueue in this slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingSignal {
+    signum: u8,
+    info: Option<SigInfo>,
 }
 
 impl Drop for SignalFd {
@@ -323,6 +347,16 @@ fn unregister_subscription(proc_key: u32, sfd_id: u64) {
 /// thread-eligibility post completes — the wake paths are additive
 /// (per D9 §6 / W-II prompt constraint 1).
 pub fn notify_process_signal(proc_key: u32, signum: Signum) -> usize {
+    notify_process_signal_with_info(proc_key, signum, None)
+}
+
+/// Notify subscriptions with a siginfo snapshot supplied by the
+/// signal producer.
+pub fn notify_process_signal_with_info(
+    proc_key: u32,
+    signum: Signum,
+    info: Option<SigInfo>,
+) -> usize {
     // Snapshot the subscription list under the lock so we don't hold
     // the registry spinlock across the per-subscription `notify`
     // calls (which take their own per-fd locks).
@@ -339,7 +373,7 @@ pub fn notify_process_signal(proc_key: u32, signum: Signum) -> usize {
         let Some(cap) = weak.upgrade(&guard) else {
             continue;
         };
-        if cap.notify(signum) {
+        if cap.notify_with_info(signum, info) {
             delivered += 1;
         }
     }
@@ -392,7 +426,7 @@ fn drain_pending_signals(sfd: &SignalFd) {
         }
         if let Some(signum) = Signum::new(signum_raw) {
             if (mask & signum.bit()) != 0 {
-                sfd.notify(signum);
+                sfd.notify_with_info(signum, proc.siginfo_get(signum));
             }
         }
     }
@@ -410,7 +444,7 @@ fn drain_pending_signals(sfd: &SignalFd) {
 ///
 /// - `out.len() < SIGNALFD_SIGINFO_SIZE` → `Err(EINVAL)`.
 /// - queue non-empty → `Done(SIGNALFD_SIGINFO_SIZE)` after
-///   serializing one zero-filled record with the popped `ssi_signo`.
+///   serializing one `struct signalfd_siginfo` record.
 /// - queue empty + `nonblocking` → `Err(EAGAIN)`.
 /// - queue empty + blocking → `Yield { OnWaitSource }` on the per-fd
 ///   wait source; the dispatcher parks on
@@ -432,8 +466,11 @@ pub fn signalfd_read(
     // checking the per-fd queue.
     drain_pending_signals(sfd);
 
-    if let Some(signum) = sfd.pop_pending() {
-        let bytes = serialize_signalfd_siginfo(signum);
+    if let Some(pending) = sfd.pop_pending_signal() {
+        let Some(signum) = Signum::new(pending.signum) else {
+            return StepOutcome::err(V3Errno::EINVAL);
+        };
+        let bytes = serialize_signalfd_siginfo(signum, pending.info);
         out[..SIGNALFD_SIGINFO_SIZE].copy_from_slice(&bytes);
         return StepOutcome::done(SIGNALFD_SIGINFO_SIZE);
     }
@@ -444,20 +481,22 @@ pub fn signalfd_read(
     notification::wait_until_readable(sfd.wait_source_id())
 }
 
-/// Serialize a single `Signum` into a 128-byte
-/// `struct signalfd_siginfo` record. Phase D9-D zero-fills every
-/// field except `ssi_signo` — siginfo plumbing (`ssi_pid`,
-/// `ssi_uid`, `ssi_code`) lands once the real siginfo payload exists
-/// (see D9 §11 follow-ups).
-fn serialize_signalfd_siginfo(signum: Signum) -> [u8; SIGNALFD_SIGINFO_SIZE] {
+/// Serialize a single signal into a 128-byte
+/// `struct signalfd_siginfo` record.
+fn serialize_signalfd_siginfo(
+    signum: Signum,
+    info: Option<SigInfo>,
+) -> [u8; SIGNALFD_SIGINFO_SIZE] {
     let mut out = [0u8; SIGNALFD_SIGINFO_SIZE];
-    let ssi_signo = signum.raw() as u32;
+    let ssi_signo = info.map_or(signum.raw() as u32, |info| info.si_signo);
     out[0..4].copy_from_slice(&ssi_signo.to_le_bytes());
-    // bytes [4..8] = ssi_errno (i32, zero — phase D9-D)
-    // bytes [8..12] = ssi_code (i32, zero — phase D9-D)
-    // bytes [12..16] = ssi_pid (u32, zero — phase D9-D)
-    // bytes [16..20] = ssi_uid (u32, zero — phase D9-D)
-    // bytes [20..128] reserved / zero
+    if let Some(info) = info {
+        out[8..12].copy_from_slice(&info.si_code.to_le_bytes());
+        out[12..16].copy_from_slice(&info.si_pid.to_le_bytes());
+        out[16..20].copy_from_slice(&info.si_uid.to_le_bytes());
+        out[20..24].copy_from_slice(&(info.si_value as u32).to_le_bytes());
+        out[48..56].copy_from_slice(&info.si_value.to_le_bytes());
+    }
     out
 }
 
@@ -563,6 +602,39 @@ mod tests {
         assert_eq!(signo, sigusr1.raw() as u32);
         // All other bytes are zero (phase D9-D zero-fills).
         assert!(buf[4..].iter().all(|&b| b == 0), "phase D9-D zero-fills");
+    }
+
+    #[test]
+    fn signalfd_read_serializes_siginfo_value_fields() {
+        let _g = setup();
+        let sigalrm = Signum::new(14).expect("SIGALRM");
+        let cap = { sign(SignalFd::new(0, None, sigalrm.bit())).expect("reserve") };
+        assert!(cap.notify_with_info(
+            sigalrm,
+            Some(crate::signal::SigInfo {
+                si_signo: sigalrm.raw() as u32,
+                si_code: -2,
+                si_pid: 0,
+                si_uid: 0,
+                si_value: 0x1122_3344_5566_7788,
+            }),
+        ));
+        let mut buf = [0u8; SIGNALFD_SIGINFO_SIZE];
+        let outcome = signalfd_read(&cap, &mut buf, false);
+        match outcome {
+            StepOutcome::Done(n) => assert_eq!(n, SIGNALFD_SIGINFO_SIZE),
+            other => panic!("expected Done(128), got {other:?}"),
+        }
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 14);
+        assert_eq!(i32::from_le_bytes(buf[8..12].try_into().unwrap()), -2);
+        assert_eq!(
+            u32::from_le_bytes(buf[20..24].try_into().unwrap()),
+            0x5566_7788,
+        );
+        assert_eq!(
+            u64::from_le_bytes(buf[48..56].try_into().unwrap()),
+            0x1122_3344_5566_7788,
+        );
     }
 
     #[test]

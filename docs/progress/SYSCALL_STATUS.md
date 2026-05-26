@@ -22,9 +22,9 @@ VM/mm worktree, and the timer wake follow-up: `mincore`, `mlock2`,
 `mlockall`, `munlockall`, `memfd_create`, single-node mempolicy/migration
 calls, self `process_vm_*`, shared-PageBacked `remap_file_pages`,
 pidfd-backed self `process_madvise`, `getitimer`/`setitimer`, POSIX timer id
-syscalls, `adjtimex`, and `clock_adjtime` are now wired; ext4 xattr
-persistence, true time discipline, CPU timers, and cross-process VM policy
-remain explicit follow-ups).
+syscalls, `adjtimex`, `clock_adjtime`, and POSIX timer `sigev_value` delivery
+through signalfd are now wired; ext4 xattr persistence, true time discipline,
+CPU timers, and cross-process VM policy remain explicit follow-ups).
 
 ## Headline counts
 
@@ -48,7 +48,7 @@ number of additional LTP tests that move from skipped/failed to runnable.
 
 | Gap | LTP impact | Effort | Substrate status |
 |---|---|---|---|
-| Timer/time tail (`timer_create` family, `clock_adjtime`, `adjtimex`) | +15 timer tests mostly landed; residual CPU-time/discipline cases remain | M (3–4w) mostly landed; residuals are new-policy work | wallclock set/get policy, vDSO conversion state, `timerfd`, `nanosleep`, `ITIMER_REAL` `getitimer`/`setitimer`, POSIX timer ids, `adjtimex`, and `clock_adjtime` are wired with v1 host coverage; `ADJ_TICK`/`ADJ_TIMECONST` now round-trip as bounded bookkeeping. Remaining gaps are CPU interval timers, true offset/frequency slew discipline, and full Linux blocking-syscall restart/remnant semantics |
+| Timer/time tail (`timer_create` family, `clock_adjtime`, `adjtimex`) | +15 timer tests mostly landed; residual CPU-time/discipline cases remain | M (3–4w) mostly landed; residuals are new-policy work | wallclock set/get policy, vDSO conversion state, `timerfd`, `nanosleep`, `ITIMER_REAL` `getitimer`/`setitimer`, POSIX timer ids, `adjtimex`, and `clock_adjtime` are wired with v1 host coverage; `ADJ_TICK`/`ADJ_TIMECONST` round-trip as bounded bookkeeping, and POSIX timer `sigev_value` now reaches signalfd `ssi_int`/`ssi_ptr`. Remaining gaps are CPU interval timers, true offset/frequency slew discipline, full realtime per-occurrence sigqueueing, and full Linux blocking-syscall restart/remnant semantics |
 | Lightweight process/sysinfo tail (`waitid`, `clone3`, `pidfd_getfd`, `setns`, `unshare`, `sysinfo`) | +20 process/namespace tests | M–L (4–8w) | wait/clone/pidfd scaffolding exists; namespace view and sysinfo accounting semantics need care |
 | Network completion slice (`socketpair`, `shutdown`, `getpeername`, `getsockopt`, `sendmsg`, `recvmsg`, `sendmmsg`, `recvmmsg`) | +25 socket tests | M–L (4–8w) | socket syscall skeleton exists; four constants are defined-but-no-arm, message-vector ABI still missing |
 | Filesystem metadata depth (ext4 xattr persistence, ACLs, file capabilities, quota) | +15 fs metadata tests | L (6–10w) | VFS xattr hooks and tmpfs `user.*` storage are wired; ext4 deliberately reports `EOPNOTSUPP` until metadata transactions/journal policy can cover inode-body and external xattr blocks |

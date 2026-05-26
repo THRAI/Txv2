@@ -1064,6 +1064,7 @@ fn thread_future_siginfo_to_user_abi_matches_musl_siginfo_prefix() {
         si_code: tx_subsystems::signal::SI_USER,
         si_pid: 123,
         si_uid: 456,
+        si_value: 0,
     };
 
     let abi = siginfo_to_user_abi(info);

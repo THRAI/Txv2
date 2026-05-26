@@ -623,6 +623,7 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
         si_code: SI_USER,
         si_pid: ctx.process.pid.0,
         si_uid: 0, // TODO: populate from cred when available
+        si_value: 0,
     });
 
     // Route through the cred-checked script entry point. Drives
@@ -685,6 +686,7 @@ pub(super) fn sys_tkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             si_code: SI_TKILL,
             si_pid: ctx.process.pid.0,
             si_uid: 0,
+            si_value: 0,
         });
         return match tx_subsystems::signal::script_deliver_signal(
             &ctx.process,
@@ -743,6 +745,7 @@ pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             si_code: SI_TKILL,
             si_pid: ctx.process.pid.0,
             si_uid: 0,
+            si_value: 0,
         });
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = ThreadKillOp {

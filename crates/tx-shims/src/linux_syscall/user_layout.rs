@@ -511,9 +511,19 @@ pub const KERNEL_USER_LAYOUT_CANDIDATES: &[KernelUserCandidate] = &[
                 offset: 0,
             },
             KernelUserField {
+                rust: "ssi_code",
+                musl: "ssi_code",
+                offset: 8,
+            },
+            KernelUserField {
                 rust: "ssi_pid",
                 musl: "ssi_pid",
                 offset: 12,
+            },
+            KernelUserField {
+                rust: "ssi_int",
+                musl: "ssi_int",
+                offset: 20,
             },
             KernelUserField {
                 rust: "ssi_ptr",
@@ -521,7 +531,7 @@ pub const KERNEL_USER_LAYOUT_CANDIDATES: &[KernelUserCandidate] = &[
                 offset: 48,
             },
         ],
-        reason: "signalfd read serializes a zero-filled 128-byte record with ssi_signo populated.",
+        reason: "signalfd read serializes the common prefix plus POSIX timer ssi_int/ssi_ptr when siginfo is available.",
     },
     KernelUserCandidate {
         name: "struct termios TCGETS prefix",

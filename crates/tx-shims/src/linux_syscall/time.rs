@@ -646,6 +646,7 @@ pub(super) fn poll_expired_process_timers_at(ctx: &SyscallCtx<'_>, now_mono_ns: 
             si_code: SI_TIMER_VALUE,
             si_pid: 0,
             si_uid: 0,
+            si_value: signal.sigval,
         };
         let _ = tx_subsystems::signal::step_kill_process(&ctx.process, signum, Some(info));
     }

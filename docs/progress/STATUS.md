@@ -1,3 +1,19 @@
+- 2026-05-26 **Preserved POSIX timer `sigev_value` through signalfd.**
+  Expired POSIX timers now copy their configured `sigval` into the stored
+  `SigInfo`, and signalfd queues carry the available siginfo prefix instead of
+  only the raw signum. `read(signalfd)` now serializes `ssi_code`, `ssi_pid`,
+  `ssi_uid`, `ssi_int`, and `ssi_ptr` when siginfo is available, so timer
+  events expose the Linux-visible `sigev_value` fields without adding full
+  realtime sigqueue semantics.
+  **Verified:** `cargo test -p tx-subsystems signalfd -- --nocapture`; `cargo
+  test -p tx-shims --lib linux_syscall::tests::signalfd_dispatch --
+  --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::time_syscalls -- --nocapture`; `cargo test -p
+  tx-shims --lib linux_syscall::tests::kernel_user_layouts -- --nocapture`;
+  `cargo check -p tx-shims -p tx-subsystems -p tx-kernel`.
+  **Next step:** keep full realtime per-occurrence signal queueing and
+  restart/remnant semantics as separate signal/time policy work.
+
 - 2026-05-26 **Finished the bounded `adjtimex` bookkeeping tail.**
   `ADJ_TICK` and `ADJ_TIMECONST` now round-trip through the timekeeping
   service as privileged, bounded bookkeeping fields: `ADJ_TICK` enforces
