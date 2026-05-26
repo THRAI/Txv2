@@ -12,7 +12,7 @@ use tx_subsystems::vfs::OpenFile;
 use super::numbers::{EFD_CLOEXEC_FLAG, EFD_NONBLOCK_FLAG, NR_EVENTFD2};
 use super::{
     bootstrap_copy_to_user, bootstrap_read_user, errno_to_i32, next_stdio_fd_below_nofile,
-    SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
+    SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINTR_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
 };
 use crate::adapter::step_engine::{self as step_engine};
 
@@ -81,6 +81,47 @@ pub(super) fn sys_eventfd2<'a>(init_val: u64, flags: u32, ctx: &SyscallCtx<'a>) 
     SyscallResult::Return(new_fd as i64)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventFdWakeReason {
+    WaitSource,
+    ProcessTimer,
+}
+
+async fn await_eventfd_source_or_process_timer(
+    ctx: &SyscallCtx<'_>,
+    source: step_engine::WaitSourceId,
+    interests: step_engine::InterestMask,
+) -> EventFdWakeReason {
+    let Some(process_timer_deadline) = ctx.process.next_process_timer_deadline_ns() else {
+        super::await_wait_source(ctx, source, interests).await;
+        return EventFdWakeReason::WaitSource;
+    };
+    let Some(timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(process_timer_deadline)
+    else {
+        super::await_wait_source(ctx, source, interests).await;
+        return EventFdWakeReason::WaitSource;
+    };
+
+    let source_future = super::await_wait_source(ctx, source, interests);
+    let mut source_future = core::pin::pin!(source_future);
+    let mut timer_future = core::pin::pin!(timer_future);
+
+    use core::future::{poll_fn, Future};
+    use core::task::Poll;
+
+    poll_fn(|cx| {
+        if source_future.as_mut().poll(cx).is_ready() {
+            Poll::Ready(EventFdWakeReason::WaitSource)
+        } else if timer_future.as_mut().poll(cx).is_ready() {
+            super::time::poll_expired_process_timers_at(ctx, process_timer_deadline);
+            Poll::Ready(EventFdWakeReason::ProcessTimer)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
 /// eventfd-shaped `read(2)` arm.  Drains the 64-bit counter and
 /// copies 8 bytes to userspace.
 ///
@@ -134,7 +175,11 @@ pub(super) async fn sys_eventfd_read(
                     },
                 ..
             } => {
-                super::await_wait_source(ctx, carrier, interests).await;
+                if await_eventfd_source_or_process_timer(ctx, carrier, interests).await
+                    == EventFdWakeReason::ProcessTimer
+                {
+                    return SyscallResult::Error(EINTR_VALUE);
+                }
             }
             V3Out::Continue { .. } | V3Out::Yield { .. } => {
                 return SyscallResult::error_from(Errno::EIO);
@@ -197,7 +242,11 @@ pub(super) async fn sys_eventfd_write(
                     },
                 ..
             } => {
-                super::await_wait_source(ctx, carrier, interests).await;
+                if await_eventfd_source_or_process_timer(ctx, carrier, interests).await
+                    == EventFdWakeReason::ProcessTimer
+                {
+                    return SyscallResult::Error(EINTR_VALUE);
+                }
             }
             V3Out::Continue { .. } | V3Out::Yield { .. } => {
                 return SyscallResult::error_from(Errno::EIO);

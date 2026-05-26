@@ -972,6 +972,21 @@ pub const NR_GETITIMER: u64 = 102;
 /// `setitimer(which, value, ovalue)`. Linux RV64 generic ABI
 /// `__NR_setitimer = 103`.
 pub const NR_SETITIMER: u64 = 103;
+/// `timer_create(clockid, sevp, timerid)`. Linux RV64 generic ABI
+/// `__NR_timer_create = 107`.
+pub const NR_TIMER_CREATE: u64 = 107;
+/// `timer_gettime(timerid, curr_value)`. Linux RV64 generic ABI
+/// `__NR_timer_gettime = 108`.
+pub const NR_TIMER_GETTIME: u64 = 108;
+/// `timer_getoverrun(timerid)`. Linux RV64 generic ABI
+/// `__NR_timer_getoverrun = 109`.
+pub const NR_TIMER_GETOVERRUN: u64 = 109;
+/// `timer_settime(timerid, flags, new_value, old_value)`. Linux RV64
+/// generic ABI `__NR_timer_settime = 110`.
+pub const NR_TIMER_SETTIME: u64 = 110;
+/// `timer_delete(timerid)`. Linux RV64 generic ABI
+/// `__NR_timer_delete = 111`.
+pub const NR_TIMER_DELETE: u64 = 111;
 /// `clock_settime(clk_id, ts)`. Linux RV64 generic ABI
 /// `__NR_clock_settime = 112`.
 pub const NR_CLOCK_SETTIME: u64 = 112;
@@ -999,6 +1014,11 @@ pub const NR_GETTIMEOFDAY: u64 = 169;
 /// `__NR_settimeofday = 170`. The `tz` argument is deprecated on Linux
 /// and the arm ignores it.
 pub const NR_SETTIMEOFDAY: u64 = 170;
+/// `adjtimex(timex)`. Linux RV64 generic ABI `__NR_adjtimex = 171`.
+pub const NR_ADJTIMEX: u64 = 171;
+/// `clock_adjtime(clockid, timex)`. Linux RV64 generic ABI
+/// `__NR_clock_adjtime = 266`.
+pub const NR_CLOCK_ADJTIME: u64 = 266;
 
 /// `ITIMER_REAL`: wall-clock interval timer that delivers `SIGALRM`.
 pub const ITIMER_REAL: u32 = 0;
@@ -1038,6 +1058,9 @@ pub const CLOCK_MONOTONIC_COARSE: u32 = 6;
 /// `CLOCK_MONOTONIC` — txKernel's monotonic clock starts at boot, so
 /// "boot time" and "monotonic" are equivalent.
 pub const CLOCK_BOOTTIME: u32 = 7;
+/// `clock_gettime` clock id: `CLOCK_TAI = 11`. v1 reports realtime
+/// plus the stored TAI offset from the timekeeping service.
+pub const CLOCK_TAI: u32 = 11;
 
 /// `clock_nanosleep` flag bit: `TIMER_ABSTIME = 0x1`. When set, the
 /// `req` value is interpreted as an absolute deadline (against the
@@ -1053,6 +1076,30 @@ pub const TIMER_ABSTIME: u32 = 0x1;
 pub const TIMES_TICK_HZ: u64 = 100;
 /// Number of nanoseconds per `times(2)` tick (10ms at 100Hz).
 pub const TIMES_NS_PER_TICK: u64 = 1_000_000_000 / TIMES_TICK_HZ;
+
+// ---------------------------------------------------------------------
+// `adjtimex(2)` / `clock_adjtime(2)` mode and status bits.
+//
+// Source: Linux `include/uapi/linux/timex.h`. v1 wires readback,
+// realtime stepping, and the bookkeeping modes documented in
+// `TIMEKEEPING_v1.md`; true slew/frequency modes return EOPNOTSUPP.
+// ---------------------------------------------------------------------
+
+pub const ADJ_OFFSET: u32 = tx_subsystems::timekeeping::ADJ_OFFSET;
+pub const ADJ_FREQUENCY: u32 = tx_subsystems::timekeeping::ADJ_FREQUENCY;
+pub const ADJ_MAXERROR: u32 = tx_subsystems::timekeeping::ADJ_MAXERROR;
+pub const ADJ_ESTERROR: u32 = tx_subsystems::timekeeping::ADJ_ESTERROR;
+pub const ADJ_STATUS: u32 = tx_subsystems::timekeeping::ADJ_STATUS;
+pub const ADJ_TIMECONST: u32 = tx_subsystems::timekeeping::ADJ_TIMECONST;
+pub const ADJ_TAI: u32 = tx_subsystems::timekeeping::ADJ_TAI;
+pub const ADJ_SETOFFSET: u32 = tx_subsystems::timekeeping::ADJ_SETOFFSET;
+pub const ADJ_MICRO: u32 = tx_subsystems::timekeeping::ADJ_MICRO;
+pub const ADJ_NANO: u32 = tx_subsystems::timekeeping::ADJ_NANO;
+pub const ADJ_TICK: u32 = tx_subsystems::timekeeping::ADJ_TICK;
+pub const ADJ_OFFSET_SINGLESHOT: u32 = tx_subsystems::timekeeping::ADJ_OFFSET_SINGLESHOT;
+pub const ADJ_OFFSET_SS_READ: u32 = tx_subsystems::timekeeping::ADJ_OFFSET_SS_READ;
+pub const STA_NANO: u32 = tx_subsystems::timekeeping::STA_NANO;
+pub const STA_RONLY: u32 = tx_subsystems::timekeeping::STA_RONLY;
 
 // ---------------------------------------------------------------------
 // Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY routing.

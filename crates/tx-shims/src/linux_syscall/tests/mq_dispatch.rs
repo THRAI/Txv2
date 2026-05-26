@@ -1,18 +1,19 @@
 use super::*;
 
 use crate::linux_syscall::{
-    MqAttrLayout, NR_CLOSE, NR_EPOLL_CREATE1, NR_EPOLL_CTL, NR_EPOLL_PWAIT, NR_FCNTL,
-    NR_MQ_GETSETATTR, NR_MQ_NOTIFY, NR_MQ_OPEN, NR_MQ_TIMEDRECEIVE, NR_MQ_TIMEDSEND, NR_MQ_UNLINK,
-    NR_READ, NR_RT_SIGACTION, NR_WRITE, O_CLOEXEC, O_CREAT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR,
-    O_WRONLY,
+    MqAttrLayout, CLOCK_MONOTONIC, NR_CLOSE, NR_EPOLL_CREATE1, NR_EPOLL_CTL, NR_EPOLL_PWAIT,
+    NR_FCNTL, NR_MQ_GETSETATTR, NR_MQ_NOTIFY, NR_MQ_OPEN, NR_MQ_TIMEDRECEIVE, NR_MQ_TIMEDSEND,
+    NR_MQ_UNLINK, NR_READ, NR_RT_SIGACTION, NR_TIMER_CREATE, NR_TIMER_SETTIME, NR_WRITE, O_CLOEXEC,
+    O_CREAT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
 };
 use tx_subsystems::signal::adapter::step_engine::{MailboxEvent, SignalRouting, TaskMailbox};
-use tx_subsystems::signal::Signum;
+use tx_subsystems::signal::{step_sigaction, SigDisposition, Signum};
 
 const E_AGAIN: i32 = 11;
 const E_BADF: i32 = 9;
 const E_EXIST: i32 = 17;
 const E_INVAL: i32 = 22;
+const E_INTR: i32 = 4;
 const E_MSGSIZE: i32 = 90;
 const E_NOENT: i32 = 2;
 const EPOLL_CTL_ADD: u32 = 1;
@@ -20,6 +21,7 @@ const EPOLLIN: u32 = 0x001;
 const EPOLLOUT: u32 = 0x004;
 const F_GETFL_CMD: i32 = 3;
 const MQ_PRIO_MAX: u64 = 32768;
+const SIGALRM_RAW: u8 = 14;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -37,6 +39,20 @@ struct TestEpollEvent {
     data: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TestTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TestItimerspec {
+    it_interval: TestTimespec,
+    it_value: TestTimespec,
+}
+
 fn mq_setup() -> (TestSetup, Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
     let setup = setup();
     let proc_cap = bootstrap();
@@ -51,6 +67,20 @@ fn create_epoll(ctx: &SyscallCtx<'_>) -> i64 {
     )) {
         SyscallResult::Return(fd) => fd,
         other => panic!("epoll_create1 failed: {other:?}"),
+    }
+}
+
+fn create_posix_timer(ctx: &SyscallCtx<'_>, clock: u32) -> i32 {
+    let mut timer_id = -1i32;
+    match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_TIMER_CREATE,
+            [clock as u64, 0, &mut timer_id as *mut i32 as u64, 0, 0, 0],
+        ),
+        ctx,
+    )) {
+        SyscallResult::Return(0) => timer_id,
+        other => panic!("timer_create failed: {other:?}"),
     }
 }
 
@@ -719,7 +749,8 @@ fn dispatch_mq_notify_registration_is_queue_wide_across_descriptors() {
 #[test]
 fn dispatch_mq_notify_does_not_fire_while_blocked_receiver_consumes_message() {
     let (_setup, proc_cap, thread) = mq_setup();
-    let ctx = make_ctx(proc_cap.clone(), thread.clone());
+    let mailbox = alloc::sync::Arc::new(TaskMailbox::new());
+    let ctx = make_ctx(proc_cap.clone(), thread.clone()).with_mailbox(mailbox.clone());
     let name = b"tx-mq-notify-blocked-recv\0";
     let attr = MqAttrLayout {
         mq_maxmsg: 4,
@@ -740,7 +771,6 @@ fn dispatch_mq_notify_does_not_fire_while_blocked_receiver_consumes_message() {
         )),
         SyscallResult::Return(0)
     );
-    let mailbox = alloc::sync::Arc::new(TaskMailbox::new());
     thread
         .payload_cap()
         .expect("leader has payload")
@@ -816,15 +846,21 @@ fn dispatch_mq_notify_does_not_fire_while_blocked_receiver_consumes_message() {
             .is_pending(sigusr1),
         "mq_notify must not fire when a blocked receiver consumes the message"
     );
-    assert!(mailbox.is_empty());
 
+    let mut received_first = false;
     for _ in 0..256 {
         if let Poll::Ready(result) = pinned_recv.as_mut().poll(&mut cx) {
             assert_eq!(result, SyscallResult::Return(first.len() as i64));
             assert_eq!(&out[..first.len()], &first);
+            received_first = true;
             break;
         }
     }
+    assert!(
+        received_first,
+        "blocked mq_receive should consume the first send"
+    );
+    assert!(mailbox.is_empty());
 
     let second = *b"two";
     assert_eq!(
@@ -917,7 +953,7 @@ fn dispatch_mq_raw_read_write_fail_cleanly_and_maxmsg_is_enforced() {
 #[test]
 fn dispatch_mq_blocking_receive_parks_until_send_wakes_queue() {
     let (_setup, proc_cap, thread) = mq_setup();
-    let ctx = make_ctx(proc_cap, thread);
+    let ctx = make_ctx(proc_cap, thread).with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()));
     let name = b"tx-mq-blocking-recv\0";
     let attr = MqAttrLayout {
         mq_maxmsg: 2,
@@ -977,9 +1013,92 @@ fn dispatch_mq_blocking_receive_parks_until_send_wakes_queue() {
 }
 
 #[test]
+fn dispatch_mq_timedreceive_wakes_for_process_timer_signal_deadline() {
+    let (_setup, proc_cap, thread) = mq_setup();
+    let timer_queue = tx_reactor::timer::TimerQueue::new();
+    tx_subsystems::timer_sleep::install_timer_queue(timer_queue.clone());
+    let ctx = make_ctx(proc_cap.clone(), thread.clone())
+        .with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()));
+    let sigalrm = Signum::new(SIGALRM_RAW).expect("SIGALRM signum");
+    let _ = step_sigaction(&proc_cap, sigalrm, SigDisposition::Handler(0xCAFE));
+
+    let timer_id = create_posix_timer(&ctx, CLOCK_MONOTONIC);
+    let timer = TestItimerspec {
+        it_interval: TestTimespec::default(),
+        it_value: TestTimespec {
+            tv_sec: 0,
+            tv_nsec: 1_000,
+        },
+    };
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_TIMER_SETTIME,
+                [
+                    timer_id as u64,
+                    0,
+                    &timer as *const TestItimerspec as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+
+    let name = b"tx-mq-process-timer-recv\0";
+    let attr = MqAttrLayout {
+        mq_maxmsg: 2,
+        mq_msgsize: 8,
+        ..MqAttrLayout::default()
+    };
+    let fd = match mq_open(&ctx, name, O_CREAT | O_RDWR, Some(&attr)) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("mq_open failed: {other:?}"),
+    };
+
+    let mut out = [0u8; 8];
+    let req = SyscallRequest::new(
+        NR_MQ_TIMEDRECEIVE,
+        [
+            fd as u64,
+            out.as_mut_ptr() as u64,
+            out.len() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let fut = dispatch::<ShimsTestPmap>(req, &ctx);
+    let mut pinned = Box::pin(fut);
+
+    assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Pending));
+
+    timer_queue.advance_time_to(u64::MAX);
+
+    let result = pinned.as_mut().poll(&mut cx).map(|result| {
+        assert_eq!(result, SyscallResult::Error(E_INTR));
+    });
+    assert!(
+        result.is_ready(),
+        "process timer deadline should wake blocked mq_timedreceive"
+    );
+
+    let payload = thread.payload_cap().expect("live thread");
+    assert!(
+        payload.pending().is_pending(sigalrm),
+        "mq process-timer wake should publish SIGALRM"
+    );
+}
+
+#[test]
 fn dispatch_mq_blocking_send_parks_until_receive_makes_space() {
     let (_setup, proc_cap, thread) = mq_setup();
-    let ctx = make_ctx(proc_cap, thread);
+    let ctx = make_ctx(proc_cap, thread).with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()));
     let name = b"tx-mq-blocking-send\0";
     let attr = MqAttrLayout {
         mq_maxmsg: 1,

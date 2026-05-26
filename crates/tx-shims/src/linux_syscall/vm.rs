@@ -1685,7 +1685,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                     return SyscallResult::error_from(Errno::EFAULT);
                 }
             }
-            let mut deadline_ns = None;
+            let mut timeout_deadline_ns = None;
             if timeout_uaddr != 0 {
                 let Some(timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
                     return SyscallResult::Error(EINVAL_VALUE);
@@ -1704,8 +1704,10 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                         }
                     }
                 }
-                deadline_ns = Some(<P as TimeIf>::read_ns().saturating_add(timeout_ns));
+                timeout_deadline_ns = Some(<P as TimeIf>::read_ns().saturating_add(timeout_ns));
             }
+            let (deadline_ns, interrupted_by_process_timer) =
+                futex_wait_deadline(ctx, timeout_deadline_ns);
 
             let mut script_ctx = build_subject_script_ctx(ctx);
             if let Some(deadline_ns) = deadline_ns {
@@ -1746,6 +1748,11 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 Ok(()) => SyscallResult::Return(0),
                 Err(v3errno) => {
                     let errno: Errno = v3errno.into();
+                    if interrupted_by_process_timer && errno == Errno::ETIMEDOUT {
+                        let now_ns = <P as TimeIf>::read_ns().max(deadline_ns.unwrap_or_default());
+                        super::time::poll_expired_process_timers_at(ctx, now_ns);
+                        return SyscallResult::Error(EINTR_VALUE);
+                    }
                     SyscallResult::error_from(errno)
                 }
             }
@@ -1819,6 +1826,23 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
         // of scope for v1. musl's libc init only emits FUTEX_WAIT
         // and FUTEX_WAKE so these are not on the critical path.
         _ => SyscallResult::Error(ENOSYS_VALUE),
+    }
+}
+
+fn futex_wait_deadline(
+    ctx: &SyscallCtx<'_>,
+    timeout_deadline_ns: Option<u64>,
+) -> (Option<u64>, bool) {
+    if ctx.mailbox.is_none() || ctx.timer_wheel.is_none() {
+        return (timeout_deadline_ns, false);
+    }
+    match (
+        timeout_deadline_ns,
+        ctx.process.next_process_timer_deadline_ns(),
+    ) {
+        (Some(timeout), Some(timer)) if timer <= timeout => (Some(timer), true),
+        (None, Some(timer)) => (Some(timer), true),
+        _ => (timeout_deadline_ns, false),
     }
 }
 

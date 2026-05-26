@@ -30,7 +30,7 @@ use tx_subsystems::vfs::OpenFile;
 use super::numbers::{O_CLOEXEC, O_NONBLOCK, SFD_CLOEXEC, SFD_NONBLOCK};
 use super::{
     bootstrap_read_user, errno_to_i32, next_stdio_fd_below_nofile, SyscallCtx, SyscallResult,
-    EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
+    EAGAIN_VALUE, EBADF_VALUE, EINTR_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
 };
 use crate::adapter::step_engine::{self as step_engine};
 
@@ -38,6 +38,54 @@ use crate::adapter::step_engine::{self as step_engine};
 /// The signalfd4 syscall takes `sizemask = sizeof(sigset_t) = 8` and
 /// rejects with `-EINVAL` for any other size.
 const SIGSET_SIZE: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SignalfdWakeReason {
+    WaitSource,
+    ProcessTimer,
+}
+
+async fn await_signalfd_source_or_process_timer(
+    ctx: &SyscallCtx<'_>,
+    source: step_engine::WaitSourceId,
+    interests: step_engine::InterestMask,
+) -> SignalfdWakeReason {
+    let Some(process_timer_deadline) = ctx.process.next_process_timer_deadline_ns() else {
+        super::await_wait_source(ctx, source, interests).await;
+        return SignalfdWakeReason::WaitSource;
+    };
+    let Some(timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(process_timer_deadline)
+    else {
+        super::await_wait_source(ctx, source, interests).await;
+        return SignalfdWakeReason::WaitSource;
+    };
+
+    let source_future = super::await_wait_source(ctx, source, interests);
+    let mut source_future = core::pin::pin!(source_future);
+    let mut timer_future = core::pin::pin!(timer_future);
+
+    use core::future::{poll_fn, Future};
+    use core::task::Poll;
+
+    poll_fn(|cx| {
+        if source_future.as_mut().poll(cx).is_ready() {
+            Poll::Ready(SignalfdWakeReason::WaitSource)
+        } else if timer_future.as_mut().poll(cx).is_ready() {
+            super::time::poll_expired_process_timers_at(ctx, process_timer_deadline);
+            Poll::Ready(SignalfdWakeReason::ProcessTimer)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+fn current_thread_has_deliverable_signal(ctx: &SyscallCtx<'_>) -> bool {
+    ctx.thread
+        .payload_cap()
+        .map(|payload| payload.interrupt_summary().deliverable_signal)
+        .unwrap_or(false)
+}
 
 /// `signalfd4(fd, &mask, sizemask, flags)` syscall arm.
 ///
@@ -164,6 +212,7 @@ pub(super) async fn sys_signalfd_read(
     }
 
     let nonblocking = file.flags().nonblocking;
+    let mut process_timer_recheck = false;
     loop {
         let outcome = {
             let mut staging = [0u8; SIGNALFD_SIGINFO_SIZE];
@@ -198,8 +247,18 @@ pub(super) async fn sys_signalfd_read(
                     },
                 ..
             } => {
-                super::await_wait_source(ctx, carrier, interests).await;
-                // Re-poll on next loop iteration.
+                if process_timer_recheck && current_thread_has_deliverable_signal(ctx) {
+                    return SyscallResult::Error(EINTR_VALUE);
+                }
+                process_timer_recheck = false;
+                if await_signalfd_source_or_process_timer(ctx, carrier, interests).await
+                    == SignalfdWakeReason::ProcessTimer
+                {
+                    process_timer_recheck = true;
+                }
+                // Re-poll on next loop iteration. A matching timer signal
+                // becomes a signalfd record; an unmatched deliverable one
+                // interrupts after that recheck observes no record.
             }
             V3Out::Continue { .. } | V3Out::Yield { .. } => {
                 return SyscallResult::error_from(Errno::EIO);

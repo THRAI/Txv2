@@ -253,10 +253,14 @@ pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(
 ///   notices the other fd. Cross-fd starvation is theoretically
 ///   possible but not observed in practice for the busybox flows.
 /// - The `timeout_ptr` is read but a non-NULL timeout uses the
-///   timeout-elapsed branch only as an upper bound; the actual
-///   timer hookup ships with the OnTimer wave (deferred).
+///   timeout-elapsed branch only as an upper bound. Process POSIX/interval
+///   timer deadlines are composed into the blocking wait so signal expiry can
+///   interrupt an otherwise indefinite poll.
 /// - The signal mask is ignored.
-pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_ppoll<'a, P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
 
     let fds_ptr = args[0];
@@ -340,9 +344,13 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         use crate::adapter::step_engine;
         use step_engine::{InterestMask, WaitSourceId};
         use tx_scripts::drive;
-        use tx_substrate::step::DriveMode;
+        use tx_substrate::step::{Deadline, DriveMode};
 
         let mut script_ctx = build_subject_script_ctx(ctx);
+        let process_timer_deadline = ctx.process.next_process_timer_deadline_ns();
+        if let Some(deadline_ns) = process_timer_deadline {
+            script_ctx = script_ctx.with_deadline(Deadline::from_raw(deadline_ns));
+        }
         let mailbox_arc = script_ctx.mailbox().cloned();
         let timer_wheel_arc = script_ctx.timer_wheel().cloned();
         let delegate_registry_arc = script_ctx.delegate_registry().cloned();
@@ -367,7 +375,17 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 // Fd is ready; re-scan to update revents.
             }
             Ok(_) => break 0,
-            Err(_e) => break 0,
+            Err(v3errno) => {
+                let errno: tx_subsystems::execution::Errno = v3errno.into();
+                if errno == tx_subsystems::execution::Errno::ETIMEDOUT {
+                    if let Some(deadline_ns) = process_timer_deadline {
+                        let now_ns = P::read_ns().max(deadline_ns);
+                        super::time::poll_expired_process_timers_at(ctx, now_ns);
+                        return SyscallResult::Error(EINTR_VALUE);
+                    }
+                }
+                break 0;
+            }
         }
     };
 

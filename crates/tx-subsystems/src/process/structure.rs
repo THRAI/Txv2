@@ -28,6 +28,9 @@ use crate::process::topology::{
 };
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::thread_runtime::ThreadIdentity;
+use crate::timekeeping::{
+    ExpiredTimerSignal, IntervalTimerSpec, PosixTimerSnapshot, ProcessIntervalTimer,
+};
 use crate::tty::structure::identity::TtyIdentity;
 use crate::vfs::{DEntry, OpenFile};
 use crate::vm::AddressSpace;
@@ -950,6 +953,107 @@ impl ProcessIdentity {
             same_session,
         })
     }
+
+    pub fn itimer_real(&self, now_ns: u64) -> Option<IntervalTimerSpec> {
+        self.payload.lock().as_ref().map(|p| p.itimer_real(now_ns))
+    }
+
+    pub fn set_itimer_real(
+        &self,
+        now_ns: u64,
+        new_value: IntervalTimerSpec,
+    ) -> Option<IntervalTimerSpec> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.set_itimer_real(now_ns, new_value))
+    }
+
+    pub fn create_posix_timer(
+        &self,
+        clock: crate::timekeeping::PosixTimerClock,
+        notify: crate::timekeeping::PosixTimerNotify,
+    ) -> Option<Result<u32, crate::timekeeping::TimekeepingError>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.create_posix_timer(clock, notify))
+    }
+
+    pub fn set_posix_timer(
+        &self,
+        timer_id: u32,
+        deadline_mono_ns: u64,
+        interval_ns: u64,
+        new_value_ns: u64,
+        now_mono_ns: u64,
+    ) -> Option<Result<PosixTimerSnapshot, crate::timekeeping::TimekeepingError>> {
+        self.payload.lock().as_ref().map(|p| {
+            p.set_posix_timer(
+                timer_id,
+                deadline_mono_ns,
+                interval_ns,
+                new_value_ns,
+                now_mono_ns,
+            )
+        })
+    }
+
+    pub fn get_posix_timer(
+        &self,
+        timer_id: u32,
+        now_mono_ns: u64,
+    ) -> Option<Result<PosixTimerSnapshot, crate::timekeeping::TimekeepingError>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.get_posix_timer(timer_id, now_mono_ns))
+    }
+
+    pub fn get_posix_timer_overrun(
+        &self,
+        timer_id: u32,
+    ) -> Option<Result<i32, crate::timekeeping::TimekeepingError>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.get_posix_timer_overrun(timer_id))
+    }
+
+    pub fn posix_timer_clock(
+        &self,
+        timer_id: u32,
+    ) -> Option<Result<crate::timekeeping::PosixTimerClock, crate::timekeeping::TimekeepingError>>
+    {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.posix_timer_clock(timer_id))
+    }
+
+    pub fn delete_posix_timer(
+        &self,
+        timer_id: u32,
+    ) -> Option<Result<(), crate::timekeeping::TimekeepingError>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.delete_posix_timer(timer_id))
+    }
+
+    pub fn consume_expired_timers(&self, now_mono_ns: u64) -> Option<Vec<ExpiredTimerSignal>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.consume_expired_timers(now_mono_ns))
+    }
+
+    pub fn next_process_timer_deadline_ns(&self) -> Option<u64> {
+        self.payload
+            .lock()
+            .as_ref()
+            .and_then(|p| p.next_process_timer_deadline_ns())
+    }
 }
 
 impl Entity for ProcessIdentity {
@@ -1197,6 +1301,14 @@ pub struct ProcessPayload {
     /// Per `docs/Txv3/08_SYSV_IPC_v1.md` §4.4 / IPC-3, `SEM_UNDO`
     /// state is process-local and process exit drains only this list.
     pub(crate) sem_undos: SpinMutex<BTreeMap<u32, SemUndo>>,
+    /// Per-process `ITIMER_REAL` state used by `getitimer(2)` /
+    /// `setitimer(2)`. CPU interval timers (`ITIMER_VIRTUAL` /
+    /// `ITIMER_PROF`) wait for scheduler CPU-time accounting.
+    pub(crate) itimer_real: SpinMutex<ProcessIntervalTimer>,
+    /// Per-process POSIX timer id table. Expiry-to-signal production
+    /// is a follow-up; v1 stores create/set/get/delete state here so
+    /// the syscall ABI does not invent a side table outside Process.
+    pub(crate) posix_timers: SpinMutex<crate::timekeeping::ProcessPosixTimers>,
     /// Reactor wait source that fires when **any** child of this
     /// process zombifies (per `txdoc:PROCESS-WAIT-FAMILY-1`'s
     /// `children_state_channel` notion). Created at payload-sign time
@@ -1487,6 +1599,91 @@ impl ProcessPayload {
     /// Drain this process's pending SysV `SEM_UNDO` records.
     pub(crate) fn drain_sem_undos(&self) -> BTreeMap<u32, SemUndo> {
         core::mem::take(&mut *self.sem_undos.lock())
+    }
+
+    pub fn itimer_real(&self, now_ns: u64) -> IntervalTimerSpec {
+        self.itimer_real.lock().snapshot(now_ns)
+    }
+
+    pub fn set_itimer_real(&self, now_ns: u64, new_value: IntervalTimerSpec) -> IntervalTimerSpec {
+        self.itimer_real.lock().replace(now_ns, new_value)
+    }
+
+    pub fn create_posix_timer(
+        &self,
+        clock: crate::timekeeping::PosixTimerClock,
+        notify: crate::timekeeping::PosixTimerNotify,
+    ) -> Result<u32, crate::timekeeping::TimekeepingError> {
+        self.posix_timers.lock().create(clock, notify)
+    }
+
+    pub fn set_posix_timer(
+        &self,
+        timer_id: u32,
+        deadline_mono_ns: u64,
+        interval_ns: u64,
+        new_value_ns: u64,
+        now_mono_ns: u64,
+    ) -> Result<PosixTimerSnapshot, crate::timekeeping::TimekeepingError> {
+        self.posix_timers.lock().settime(
+            timer_id,
+            deadline_mono_ns,
+            interval_ns,
+            new_value_ns,
+            now_mono_ns,
+        )
+    }
+
+    pub fn get_posix_timer(
+        &self,
+        timer_id: u32,
+        now_mono_ns: u64,
+    ) -> Result<PosixTimerSnapshot, crate::timekeeping::TimekeepingError> {
+        self.posix_timers.lock().gettime(timer_id, now_mono_ns)
+    }
+
+    pub fn get_posix_timer_overrun(
+        &self,
+        timer_id: u32,
+    ) -> Result<i32, crate::timekeeping::TimekeepingError> {
+        self.posix_timers.lock().getoverrun(timer_id)
+    }
+
+    pub fn posix_timer_clock(
+        &self,
+        timer_id: u32,
+    ) -> Result<crate::timekeeping::PosixTimerClock, crate::timekeeping::TimekeepingError> {
+        self.posix_timers.lock().clock(timer_id)
+    }
+
+    pub fn delete_posix_timer(
+        &self,
+        timer_id: u32,
+    ) -> Result<(), crate::timekeeping::TimekeepingError> {
+        self.posix_timers.lock().delete(timer_id)
+    }
+
+    pub fn consume_expired_timers(&self, now_mono_ns: u64) -> Vec<ExpiredTimerSignal> {
+        let mut expired = Vec::new();
+        if self.itimer_real.lock().consume_expired(now_mono_ns) {
+            expired.push(ExpiredTimerSignal {
+                signum: crate::signal::Signum::SIGALRM.raw() as u32,
+                sigval: 0,
+            });
+        }
+        expired.extend(self.posix_timers.lock().consume_expired(now_mono_ns));
+        expired
+    }
+
+    pub fn next_process_timer_deadline_ns(&self) -> Option<u64> {
+        let itimer = self.itimer_real.lock().next_deadline_ns();
+        let posix = self.posix_timers.lock().next_deadline_ns();
+        match (itimer, posix) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
     }
 
     /// Snapshot the entire fd table as a fresh `BTreeMap`. Each

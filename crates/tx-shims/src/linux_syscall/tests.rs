@@ -207,7 +207,7 @@ fn setup() -> TestSetup {
     reset_tid_counter();
     reset_init_process();
     reset_reactor_affinity_seam();
-    tx_subsystems::wall_clock::reset_for_test();
+    tx_subsystems::timekeeping::reset_for_test();
     TestSetup { _lock: lock }
 }
 
@@ -1418,11 +1418,21 @@ mod ipc_dispatch;
 // `epoll_create1` / `epoll_ctl` / `epoll_pwait` generic musl syscall numbers
 // and LP64 `struct epoll_event` copy paths.
 // ===========================================================================
+#[path = "tests/aio_dispatch.rs"]
+mod aio_dispatch;
 mod epoll_dispatch;
 #[path = "tests/event_notification_dispatch.rs"]
 mod event_notification_dispatch;
+#[path = "tests/eventfd_dispatch.rs"]
+mod eventfd_dispatch;
 #[path = "tests/io_uring_dispatch.rs"]
 mod io_uring_dispatch;
+#[path = "tests/ppoll_dispatch.rs"]
+mod ppoll_dispatch;
+#[path = "tests/signalfd_dispatch.rs"]
+mod signalfd_dispatch;
+#[path = "tests/userfaultfd_dispatch.rs"]
+mod userfaultfd_dispatch;
 
 // ===========================================================================
 // POSIX message queues — musl treats `mqd_t` as an fd and uses the LP64

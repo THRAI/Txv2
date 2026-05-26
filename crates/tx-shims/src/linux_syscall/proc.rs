@@ -28,6 +28,47 @@ const RUSAGE_THREAD: i32 = 1;
 const LINUX_DEFAULT_PERSONALITY: u32 = 0;
 const PERSONALITY_QUERY: u32 = u32::MAX;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Wait4WakeReason {
+    WaitSource,
+    ProcessTimer,
+}
+
+async fn await_wait4_source_or_process_timer(
+    ctx: &SyscallCtx<'_>,
+    source: step_engine::WaitSourceId,
+    interests: step_engine::InterestMask,
+) -> Wait4WakeReason {
+    let Some(process_timer_deadline) = ctx.process.next_process_timer_deadline_ns() else {
+        await_wait_source(ctx, source, interests).await;
+        return Wait4WakeReason::WaitSource;
+    };
+    let Some(timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(process_timer_deadline)
+    else {
+        await_wait_source(ctx, source, interests).await;
+        return Wait4WakeReason::WaitSource;
+    };
+
+    let source_future = await_wait_source(ctx, source, interests);
+    let mut source_future = core::pin::pin!(source_future);
+    let mut timer_future = core::pin::pin!(timer_future);
+
+    use core::future::{poll_fn, Future};
+    use core::task::Poll;
+
+    poll_fn(|cx| {
+        if source_future.as_mut().poll(cx).is_ready() {
+            Poll::Ready(Wait4WakeReason::WaitSource)
+        } else if timer_future.as_mut().poll(cx).is_ready() {
+            super::time::poll_expired_process_timers_at(ctx, process_timer_deadline);
+            Poll::Ready(Wait4WakeReason::ProcessTimer)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
 /// `exit(status)` — per-thread exit per `PROCESS_v1` §7.3.1.
 ///
 /// The implementation of `step_thread_exit` (in
@@ -748,7 +789,11 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 shape: YieldShape::OnWaitSource { source, interests },
                 ..
             } => {
-                await_wait_source(ctx, source, interests).await;
+                if await_wait4_source_or_process_timer(ctx, source, interests).await
+                    == Wait4WakeReason::ProcessTimer
+                {
+                    return SyscallResult::Error(EINTR_VALUE);
+                }
             }
             WaitOutcome::Err(e) => return SyscallResult::error_from(e.into()),
             _ => {}

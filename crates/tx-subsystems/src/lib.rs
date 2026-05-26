@@ -28,6 +28,7 @@ pub mod signal;
 pub mod signalfd;
 mod sync;
 pub mod thread_runtime;
+pub mod timekeeping;
 pub mod timer_sleep;
 pub mod timerfd;
 pub mod tty;

@@ -315,7 +315,9 @@ pub const KERNEL_USER_LAYOUTS: &[KernelUserLayout] = &[
     time::layout_descriptors::TIMESPEC_LAYOUT,
     time::layout_descriptors::TIMEVAL_LAYOUT,
     time::layout_descriptors::ITIMERVAL_LAYOUT,
+    time::layout_descriptors::ITIMERSPEC_LAYOUT,
     time::layout_descriptors::TMS_LAYOUT,
+    time::layout_descriptors::TIMEX_LAYOUT,
     fs_basic::layout_descriptors::STAT_LAYOUT,
     fs_basic::layout_descriptors::STATX_TIMESTAMP_LAYOUT,
     fs_basic::layout_descriptors::STATX_LAYOUT,
@@ -347,7 +349,12 @@ pub const KERNEL_USER_LAYOUT_CANDIDATES: &[KernelUserCandidate] = &[
         "struct itimerval",
         time::layout_descriptors::ITIMERVAL_LAYOUT
     ),
+    full_candidate!(
+        "struct itimerspec",
+        time::layout_descriptors::ITIMERSPEC_LAYOUT
+    ),
     full_candidate!("struct tms", time::layout_descriptors::TMS_LAYOUT),
+    full_candidate!("struct timex", time::layout_descriptors::TIMEX_LAYOUT),
     full_candidate!("struct stat", fs_basic::layout_descriptors::STAT_LAYOUT),
     full_candidate!(
         "struct statx_timestamp",
@@ -604,29 +611,6 @@ pub const KERNEL_USER_LAYOUT_CANDIDATES: &[KernelUserCandidate] = &[
         reason: "ppoll parses and writes pollfd entries from bytes.",
     },
     KernelUserCandidate {
-        name: "struct itimerspec",
-        rust_type: "",
-        kind: "manual",
-        status: "manual",
-        musl_header: "time.h",
-        musl_type: "struct itimerspec",
-        size: 32,
-        align: 8,
-        fields: &[
-            KernelUserField {
-                rust: "it_interval",
-                musl: "it_interval",
-                offset: 0,
-            },
-            KernelUserField {
-                rust: "it_value",
-                musl: "it_value",
-                offset: 16,
-            },
-        ],
-        reason: "timerfd set/get serializes itimerspec through ItimerSpec byte helpers.",
-    },
-    KernelUserCandidate {
         name: "cpu_set_t sched_affinity mask prefix",
         rust_type: "",
         kind: "prefix",
@@ -716,12 +700,6 @@ pub const KERNEL_USER_LAYOUT_CANDIDATES: &[KernelUserCandidate] = &[
         "sys/socket.h",
         "struct sockaddr",
         "socket address syscalls are not dispatched in this branch; enforce sockaddr-family records with the socket surface.",
-    ),
-    deferred_candidate!(
-        "struct timex",
-        "sys/timex.h",
-        "struct timex",
-        "adjtimex/clock_adjtime are not dispatched in this branch; musl has a translation path that needs a dedicated checker once time discipline lands.",
     ),
     deferred_candidate!(
         "struct sysinfo",

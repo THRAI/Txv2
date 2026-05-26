@@ -17,8 +17,8 @@ use super::numbers::{
 };
 use super::{
     bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user, errno_to_i32,
-    next_stdio_fd_below_nofile, SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE,
-    ENOMEM_VALUE,
+    next_stdio_fd_below_nofile, SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINTR_VALUE,
+    EINVAL_VALUE, ENOMEM_VALUE,
 };
 use crate::adapter::step_engine::{self as step_engine, InterestMask, WaitSourceId};
 
@@ -264,7 +264,11 @@ pub(super) async fn sys_timerfd_read<P: super::TimeIf>(
                 ..
             } => {
                 let deadline = tfd_cap.deadline_ns();
-                wait_for_timerfd_wake(ctx, deadline, now_ns, carrier, interests).await;
+                if wait_for_timerfd_wake::<P>(ctx, deadline, now_ns, carrier, interests).await
+                    == TimerFdWakeReason::ProcessTimer
+                {
+                    return SyscallResult::Error(EINTR_VALUE);
+                }
             }
             V3Out::Continue { .. } | V3Out::Yield { .. } => {
                 return SyscallResult::error_from(Errno::EIO);
@@ -273,19 +277,34 @@ pub(super) async fn sys_timerfd_read<P: super::TimeIf>(
     }
 }
 
-async fn wait_for_timerfd_wake(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimerFdWakeReason {
+    WaitSource,
+    TimerFdDeadline,
+    ProcessTimer,
+}
+
+async fn wait_for_timerfd_wake<P: super::TimeIf>(
     ctx: &SyscallCtx<'_>,
     deadline: u64,
     now_ns: u64,
     source: WaitSourceId,
     interests: InterestMask,
-) {
-    let Some(timer_future) = (deadline > now_ns)
-        .then(|| tx_subsystems::timer_sleep::sleep_until_ns(deadline))
-        .flatten()
+) -> TimerFdWakeReason {
+    let process_timer_deadline = ctx.process.next_process_timer_deadline_ns();
+    if matches!(process_timer_deadline, Some(process_deadline) if process_deadline <= now_ns) {
+        super::time::poll_expired_process_timers_at(ctx, now_ns);
+        return TimerFdWakeReason::ProcessTimer;
+    }
+    let Some((wake_deadline_ns, wake_reason)) =
+        earliest_timerfd_wake_deadline(deadline, now_ns, process_timer_deadline)
     else {
         super::await_wait_source(ctx, source, interests).await;
-        return;
+        return TimerFdWakeReason::WaitSource;
+    };
+    let Some(timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(wake_deadline_ns) else {
+        super::await_wait_source(ctx, source, interests).await;
+        return TimerFdWakeReason::WaitSource;
     };
 
     let source_future = super::await_wait_source(ctx, source, interests);
@@ -296,13 +315,38 @@ async fn wait_for_timerfd_wake(
     use core::task::Poll;
 
     poll_fn(|cx| {
-        if timer_future.as_mut().poll(cx).is_ready() || source_future.as_mut().poll(cx).is_ready() {
-            Poll::Ready(())
+        if source_future.as_mut().poll(cx).is_ready() {
+            Poll::Ready(TimerFdWakeReason::WaitSource)
+        } else if timer_future.as_mut().poll(cx).is_ready() {
+            if wake_reason == TimerFdWakeReason::ProcessTimer {
+                let now_ns = P::read_ns().max(wake_deadline_ns);
+                super::time::poll_expired_process_timers_at(ctx, now_ns);
+            }
+            Poll::Ready(wake_reason)
         } else {
             Poll::Pending
         }
     })
-    .await;
+    .await
+}
+
+fn earliest_timerfd_wake_deadline(
+    timerfd_deadline: u64,
+    now_ns: u64,
+    process_timer_deadline: Option<u64>,
+) -> Option<(u64, TimerFdWakeReason)> {
+    let timerfd = (timerfd_deadline > now_ns)
+        .then_some((timerfd_deadline, TimerFdWakeReason::TimerFdDeadline));
+    match (timerfd, process_timer_deadline) {
+        (Some((timerfd_deadline, _)), Some(process_deadline))
+            if process_deadline <= timerfd_deadline =>
+        {
+            Some((process_deadline, TimerFdWakeReason::ProcessTimer))
+        }
+        (Some(timerfd), _) => Some(timerfd),
+        (None, Some(process_deadline)) => Some((process_deadline, TimerFdWakeReason::ProcessTimer)),
+        (None, None) => None,
+    }
 }
 
 /// Silence unused-import warnings.

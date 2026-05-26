@@ -285,17 +285,20 @@ fn wait_sources_for_entries(
     sources
 }
 
-async fn wait_for_epoll_wake(
+async fn wait_for_epoll_wake<P: TimeIf>(
     ctx: &SyscallCtx<'_>,
     sources: &[(WaitSourceId, InterestMask)],
     deadline_ns: Option<u64>,
 ) -> bool {
     let source_future = super::await_any_wait_source(ctx, sources);
     let mut source_future = core::pin::pin!(source_future);
-    let Some(deadline_ns) = deadline_ns else {
+    let process_timer_deadline = ctx.process.next_process_timer_deadline_ns();
+    let Some((wake_deadline_ns, wake_reason)) =
+        earliest_epoll_wake_deadline(deadline_ns, process_timer_deadline)
+    else {
         return source_future.as_mut().await;
     };
-    let Some(timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) else {
+    let Some(timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(wake_deadline_ns) else {
         return false;
     };
     let mut timer_future = core::pin::pin!(timer_future);
@@ -307,12 +310,36 @@ async fn wait_for_epoll_wake(
         if source_future.as_mut().poll(cx).is_ready() {
             Poll::Ready(true)
         } else if timer_future.as_mut().poll(cx).is_ready() {
+            if wake_reason == EpollWakeDeadlineReason::ProcessTimer {
+                let now_ns = P::read_ns().max(wake_deadline_ns);
+                super::time::poll_expired_process_timers_at(ctx, now_ns);
+            }
             Poll::Ready(false)
         } else {
             Poll::Pending
         }
     })
     .await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EpollWakeDeadlineReason {
+    Timeout,
+    ProcessTimer,
+}
+
+fn earliest_epoll_wake_deadline(
+    timeout_deadline: Option<u64>,
+    process_timer_deadline: Option<u64>,
+) -> Option<(u64, EpollWakeDeadlineReason)> {
+    match (timeout_deadline, process_timer_deadline) {
+        (Some(timeout), Some(timer)) if timer <= timeout => {
+            Some((timer, EpollWakeDeadlineReason::ProcessTimer))
+        }
+        (Some(timeout), _) => Some((timeout, EpollWakeDeadlineReason::Timeout)),
+        (None, Some(timer)) => Some((timer, EpollWakeDeadlineReason::ProcessTimer)),
+        (None, None) => None,
+    }
 }
 
 fn epoll_timeout_ms_deadline<P: TimeIf>(timeout_ms: i32) -> Option<u64> {
@@ -528,7 +555,7 @@ async fn sys_epoll_wait_until<P: TimeIf>(
         if ctx.mailbox.is_none() || sources.is_empty() {
             return SyscallResult::Return(0);
         }
-        if !wait_for_epoll_wake(ctx, &sources, deadline_ns).await {
+        if !wait_for_epoll_wake::<P>(ctx, &sources, deadline_ns).await {
             return SyscallResult::Return(0);
         }
     }

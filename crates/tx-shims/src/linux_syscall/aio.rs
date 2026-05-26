@@ -84,7 +84,7 @@ use super::{
     bootstrap_copy_from_user, bootstrap_copy_to_user, next_stdio_fd_below_nofile, SyscallCtx,
     SyscallResult,
 };
-use super::{EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENOMEM_VALUE};
+use super::{EBADF_VALUE, EFAULT_VALUE, EINTR_VALUE, EINVAL_VALUE, ENOMEM_VALUE};
 use crate::adapter::step_engine::StepOutcome as V3Out;
 use crate::adapter::step_engine::{
     self as step_engine, Cap, InterestMask, SpinMutex, StepOp, WaitSourceId,
@@ -592,6 +592,47 @@ fn read_u64(bytes: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(buf)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AioWakeReason {
+    WaitSource,
+    ProcessTimer,
+}
+
+async fn await_aio_events_or_process_timer(
+    ctx: &SyscallCtx<'_>,
+    source: WaitSourceId,
+    interests: InterestMask,
+) -> AioWakeReason {
+    let Some(process_timer_deadline) = ctx.process.next_process_timer_deadline_ns() else {
+        super::await_wait_source(ctx, source, interests).await;
+        return AioWakeReason::WaitSource;
+    };
+    let Some(timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(process_timer_deadline)
+    else {
+        super::await_wait_source(ctx, source, interests).await;
+        return AioWakeReason::WaitSource;
+    };
+
+    let source_future = super::await_wait_source(ctx, source, interests);
+    let mut source_future = core::pin::pin!(source_future);
+    let mut timer_future = core::pin::pin!(timer_future);
+
+    use core::future::{poll_fn, Future};
+    use core::task::Poll;
+
+    poll_fn(|cx| {
+        if source_future.as_mut().poll(cx).is_ready() {
+            Poll::Ready(AioWakeReason::WaitSource)
+        } else if timer_future.as_mut().poll(cx).is_ready() {
+            super::time::poll_expired_process_timers_at(ctx, process_timer_deadline);
+            Poll::Ready(AioWakeReason::ProcessTimer)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
 /// `io_getevents(ctx_fd, min_nr, nr, events, timeout)` syscall arm.
 ///
 /// Per `man 2 io_getevents`:
@@ -668,13 +709,20 @@ pub(super) async fn sys_io_getevents<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -
         if !blocking {
             break;
         }
-        // Park on the events_available carrier and re-drain.
-        super::await_wait_source(
+        // Park on the events_available carrier and re-drain. Process
+        // timers are signal delivery deadlines; they interrupt the
+        // blocking wait through the same wake/recheck shape as the
+        // other wait-source syscalls.
+        if await_aio_events_or_process_timer(
             ctx,
             WaitSourceId::new(aio_cap.events_available_id()),
             InterestMask::new(EVENTS_AVAILABLE_MASK),
         )
-        .await;
+        .await
+            == AioWakeReason::ProcessTimer
+        {
+            return SyscallResult::Error(EINTR_VALUE);
+        }
         iter_budget = iter_budget.saturating_sub(1);
         if iter_budget == 0 {
             // Defensive break: never block forever in the canary even

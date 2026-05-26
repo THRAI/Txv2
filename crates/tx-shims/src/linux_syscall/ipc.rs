@@ -3,11 +3,12 @@
 use super::{
     bootstrap_copy_from_user, bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user,
     errno_to_i32, read_user_cstr, SyscallCtx, SyscallResult, EBADF_VALUE, EFAULT_VALUE,
-    EINVAL_VALUE, ENAMETOOLONG_VALUE, ENOENT_VALUE, ENOMEM_VALUE, ENOSYS_VALUE, O_ACCMODE,
-    O_CLOEXEC, O_CREAT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
+    EINTR_VALUE, EINVAL_VALUE, ENAMETOOLONG_VALUE, ENOENT_VALUE, ENOMEM_VALUE, ENOSYS_VALUE,
+    O_ACCMODE, O_CLOEXEC, O_CREAT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
 };
 use crate::adapter::step_engine::{InterestMask, WaitSourceId};
 use alloc::vec::Vec;
+use tx_hal::TimeIf;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::ipc;
 use tx_subsystems::ipc::posix_mq::structure::MqNotification;
@@ -244,20 +245,56 @@ fn validate_abs_timeout(ctx: &SyscallCtx<'_>, timeout_ptr: u64) -> Result<(), Sy
     Ok(())
 }
 
-async fn wait_for_mq_readiness(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MqWakeReason {
+    WaitSource,
+    ProcessTimer,
+}
+
+async fn wait_for_mq_readiness<P: TimeIf>(
     ctx: &SyscallCtx<'_>,
     mq: &ipc::posix_mq::structure::PosixMqInstance,
     write: bool,
-) {
+) -> MqWakeReason {
     let Ok(info) = ipc::posix_mq::execution::step_mq_poll_info(mq) else {
-        return;
+        return MqWakeReason::WaitSource;
     };
     let source_id = if write {
         info.write_source_id
     } else {
         info.read_source_id
     };
-    super::await_wait_source(ctx, WaitSourceId::new(source_id), InterestMask::new(1)).await;
+    let source = WaitSourceId::new(source_id);
+    let interests = InterestMask::new(1);
+    let Some(process_timer_deadline) = ctx.process.next_process_timer_deadline_ns() else {
+        super::await_wait_source(ctx, source, interests).await;
+        return MqWakeReason::WaitSource;
+    };
+    let Some(timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(process_timer_deadline)
+    else {
+        super::await_wait_source(ctx, source, interests).await;
+        return MqWakeReason::WaitSource;
+    };
+
+    let source_future = super::await_wait_source(ctx, source, interests);
+    let mut source_future = core::pin::pin!(source_future);
+    let mut timer_future = core::pin::pin!(timer_future);
+
+    use core::future::{poll_fn, Future};
+    use core::task::Poll;
+
+    poll_fn(|cx| {
+        if source_future.as_mut().poll(cx).is_ready() {
+            Poll::Ready(MqWakeReason::WaitSource)
+        } else if timer_future.as_mut().poll(cx).is_ready() {
+            let now_ns = P::read_ns().max(process_timer_deadline);
+            super::time::poll_expired_process_timers_at(ctx, now_ns);
+            Poll::Ready(MqWakeReason::ProcessTimer)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 fn validate_sem_timeout(ctx: &SyscallCtx<'_>, timeout_ptr: u64) -> Result<(), SyscallResult> {
@@ -831,7 +868,10 @@ pub(super) fn sys_mq_unlink(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
     }
 }
 
-pub(super) async fn sys_mq_timedsend(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+pub(super) async fn sys_mq_timedsend<P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
     if let Err(result) = validate_abs_timeout(ctx, args[4]) {
         return result;
     }
@@ -866,14 +906,19 @@ pub(super) async fn sys_mq_timedsend(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Sy
         match ipc::posix_mq::execution::step_mq_send(mq, &msg, args[3] as u32, &cred) {
             Ok(()) => return SyscallResult::Return(0),
             Err(Errno::EAGAIN) if args[4] == 0 && !file.flags().nonblocking => {
-                wait_for_mq_readiness(ctx, mq, true).await;
+                if wait_for_mq_readiness::<P>(ctx, mq, true).await == MqWakeReason::ProcessTimer {
+                    return SyscallResult::Error(EINTR_VALUE);
+                }
             }
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         }
     }
 }
 
-pub(super) async fn sys_mq_timedreceive(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+pub(super) async fn sys_mq_timedreceive<P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
     if let Err(result) = validate_abs_timeout(ctx, args[4]) {
         return result;
     }
@@ -914,7 +959,9 @@ pub(super) async fn sys_mq_timedreceive(args: [u64; 6], ctx: &SyscallCtx<'_>) ->
                 return SyscallResult::Return(msg.len() as i64);
             }
             Err(Errno::EAGAIN) if args[4] == 0 && !file.flags().nonblocking => {
-                wait_for_mq_readiness(ctx, mq, false).await;
+                if wait_for_mq_readiness::<P>(ctx, mq, false).await == MqWakeReason::ProcessTimer {
+                    return SyscallResult::Error(EINTR_VALUE);
+                }
             }
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         }

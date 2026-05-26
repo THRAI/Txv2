@@ -1267,6 +1267,8 @@ fn sign_process_payload(
         // the umask (umask survives `exec` per POSIX).
         umask: core::sync::atomic::AtomicU16::new(umask & 0o777),
         sem_undos: SpinMutex::new(BTreeMap::new()),
+        itimer_real: SpinMutex::new(crate::timekeeping::ProcessIntervalTimer::default()),
+        posix_timers: SpinMutex::new(crate::timekeeping::ProcessPosixTimers::default()),
         exit_source: exit_wait_point.channel,
         exit_source_id: exit_wait_point.source_id,
         exit_wait_source: exit_wait_point.source,

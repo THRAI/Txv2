@@ -33,6 +33,7 @@
 //! cap-typed). The shape stays — only the substrate primitive
 //! changes.
 
+use alloc::collections::BTreeMap;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -314,14 +315,13 @@ impl WaitSource {
 // task mailbox before parking.
 // ---------------------------------------------------------------------------
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
 /// Global registry mapping [`WaitSourceId`] → [`WaitSource`].
 ///
-/// Notification source IDs are intentionally sparse (subsystems allocate
-/// them from a high range so they never collide with legacy low IDs), so
-/// this must not be indexed by `WaitSourceId::raw()`.
+/// Notification source ids are intentionally sparse: subsystem-owned sources
+/// start above the legacy channel id range. Keep the registry sparse too so
+/// registering a high source id does not allocate empty slots up to that id.
 static REGISTRY: SpinMutex<BTreeMap<u64, Arc<WaitSource>>> = SpinMutex::new(BTreeMap::new());
 
 /// Register a source in the global registry so the driver can find it

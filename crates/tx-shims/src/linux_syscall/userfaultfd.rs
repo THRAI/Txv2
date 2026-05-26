@@ -46,7 +46,7 @@ use super::numbers::{
 };
 use super::{
     bootstrap_read_user, bootstrap_write_user, errno_to_i32, next_stdio_fd_below_nofile,
-    SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
+    SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINTR_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
 };
 use crate::adapter::step_engine::{
     self as step_engine, DelegateReply, TransitionOutcome, UfdReply,
@@ -111,6 +111,54 @@ pub struct UffdioApi {
     pub api: u64,
     pub features: u64,
     pub ioctls: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UfdReadWakeReason {
+    WaitSource,
+    ProcessTimer,
+}
+
+async fn await_ufd_source_or_process_timer(
+    ctx: &SyscallCtx<'_>,
+    source: step_engine::WaitSourceId,
+    interests: step_engine::InterestMask,
+) -> UfdReadWakeReason {
+    let Some(process_timer_deadline) = ctx.process.next_process_timer_deadline_ns() else {
+        super::await_wait_source(ctx, source, interests).await;
+        return UfdReadWakeReason::WaitSource;
+    };
+    let Some(timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(process_timer_deadline)
+    else {
+        super::await_wait_source(ctx, source, interests).await;
+        return UfdReadWakeReason::WaitSource;
+    };
+
+    let source_future = super::await_wait_source(ctx, source, interests);
+    let mut source_future = core::pin::pin!(source_future);
+    let mut timer_future = core::pin::pin!(timer_future);
+
+    use core::future::{poll_fn, Future};
+    use core::task::Poll;
+
+    poll_fn(|cx| {
+        if source_future.as_mut().poll(cx).is_ready() {
+            Poll::Ready(UfdReadWakeReason::WaitSource)
+        } else if timer_future.as_mut().poll(cx).is_ready() {
+            super::time::poll_expired_process_timers_at(ctx, process_timer_deadline);
+            Poll::Ready(UfdReadWakeReason::ProcessTimer)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+fn current_thread_has_deliverable_signal(ctx: &SyscallCtx<'_>) -> bool {
+    ctx.thread
+        .payload_cap()
+        .map(|payload| payload.interrupt_summary().deliverable_signal)
+        .unwrap_or(false)
 }
 
 /// `userfaultfd(flags)` syscall arm.
@@ -723,6 +771,7 @@ pub(super) async fn sys_ufd_read(
 
     let nonblocking = file.flags().nonblocking;
     let wire_size = tx_subsystems::userfaultfd::UFFD_MSG_WIRE_SIZE;
+    let mut process_timer_recheck = false;
     loop {
         let outcome = {
             let mut staging = [0u8; 32];
@@ -761,8 +810,18 @@ pub(super) async fn sys_ufd_read(
                     },
                 ..
             } => {
-                super::await_wait_source(ctx, carrier, interests).await;
-                // Re-poll on next loop iteration.
+                if process_timer_recheck && current_thread_has_deliverable_signal(ctx) {
+                    return SyscallResult::Error(EINTR_VALUE);
+                }
+                process_timer_recheck = false;
+                if await_ufd_source_or_process_timer(ctx, carrier, interests).await
+                    == UfdReadWakeReason::ProcessTimer
+                {
+                    process_timer_recheck = true;
+                }
+                // Re-poll on next loop iteration. A queued fault message wins
+                // via the normal Done path; an expired process timer with no
+                // message interrupts only if its signal is deliverable.
             }
             // Other shapes are unreachable for the ufd read path.
             V3Out::Continue { .. } | V3Out::Yield { .. } => {

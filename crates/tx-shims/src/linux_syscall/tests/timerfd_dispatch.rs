@@ -4,11 +4,17 @@ use super::*;
 
 use crate::linux_syscall::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, NR_READ, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME,
-    NR_TIMERFD_SETTIME, TFD_TIMER_ABSTIME_FLAG, TFD_TIMER_CANCEL_ON_SET_FLAG,
+    NR_TIMERFD_SETTIME, NR_TIMER_CREATE, NR_TIMER_SETTIME, TFD_TIMER_ABSTIME_FLAG,
+    TFD_TIMER_CANCEL_ON_SET_FLAG,
+};
+use tx_subsystems::signal::{
+    adapter::step_engine::TaskMailbox, step_sigaction, SigDisposition, Signum,
 };
 
 const E_INVAL: i32 = 22;
+const E_INTR: i32 = 4;
 const E_CANCELED: i32 = 125;
+const SIGALRM_RAW: u8 = 14;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -42,6 +48,20 @@ fn create_timerfd_with_clock(ctx: &SyscallCtx<'_>, clockid: u32) -> i64 {
     )) {
         SyscallResult::Return(fd) => fd,
         other => panic!("timerfd_create: {other:?}"),
+    }
+}
+
+fn create_posix_timer(ctx: &SyscallCtx<'_>, clock: u32) -> i32 {
+    let mut timer_id = -1i32;
+    match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_TIMER_CREATE,
+            [clock as u64, 0, &mut timer_id as *mut i32 as u64, 0, 0, 0],
+        ),
+        ctx,
+    )) {
+        SyscallResult::Return(0) => timer_id,
+        other => panic!("timer_create: {other:?}"),
     }
 }
 
@@ -257,4 +277,70 @@ fn dispatch_timerfd_cancel_on_set_realtime_abstime_read_returns_ecanceled() {
         &ctx,
     ));
     assert_eq!(result, SyscallResult::Error(E_CANCELED));
+}
+
+#[test]
+fn dispatch_timerfd_read_wakes_for_process_timer_signal_deadline() {
+    let (_setup, proc_cap, thread) = timerfd_setup();
+    let timer_queue = tx_reactor::timer::TimerQueue::new();
+    tx_subsystems::timer_sleep::install_timer_queue(timer_queue.clone());
+    let ctx = make_ctx(proc_cap.clone(), thread.clone())
+        .with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()));
+    let sigalrm = Signum::new(SIGALRM_RAW).expect("SIGALRM signum");
+    let _ = step_sigaction(&proc_cap, sigalrm, SigDisposition::Handler(0xCAFE));
+
+    let posix_timer_id = create_posix_timer(&ctx, CLOCK_MONOTONIC);
+    let posix_timer = TestItimerspec {
+        it_interval: TestTimespec::default(),
+        it_value: TestTimespec {
+            tv_sec: 0,
+            tv_nsec: 1_000,
+        },
+    };
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_TIMER_SETTIME,
+                [
+                    posix_timer_id as u64,
+                    0,
+                    &posix_timer as *const TestItimerspec as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+
+    let fd = create_timerfd(&ctx);
+    let mut buf = 0u64;
+    let req = SyscallRequest::new(
+        NR_READ,
+        [fd as u64, &mut buf as *mut u64 as u64, 8, 0, 0, 0],
+    );
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let fut = dispatch::<ShimsTestPmap>(req, &ctx);
+    let mut pinned = Box::pin(fut);
+
+    assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Pending));
+
+    timer_queue.advance_time_to(u64::MAX);
+
+    let result = pinned.as_mut().poll(&mut cx).map(|result| {
+        assert_eq!(result, SyscallResult::Error(E_INTR));
+    });
+    assert!(
+        result.is_ready(),
+        "process timer deadline should wake the blocked timerfd read"
+    );
+
+    let payload = thread.payload_cap().expect("live thread");
+    assert!(
+        payload.pending().is_pending(sigalrm),
+        "process timer wake should publish SIGALRM through the existing signal path"
+    );
 }

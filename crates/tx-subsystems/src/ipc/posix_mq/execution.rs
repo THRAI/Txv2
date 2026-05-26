@@ -200,8 +200,10 @@ pub fn step_mq_send(
             .fetch_add(msg.len() as u64, Ordering::Release);
         payload.msg_count.fetch_add(1, Ordering::Release);
         payload.queue_seq.fetch_add(1, Ordering::Release);
-        let woken_receivers =
-            crate::ipc::posix_mq::notification::notify_message_available(&payload.recv_channel);
+        let woken_receivers = crate::ipc::posix_mq::notification::notify_message_available(
+            &payload.recv_channel,
+            &payload.recv_source,
+        );
 
         if was_empty && woken_receivers == 0 {
             instance.identity.notify.lock().take()
@@ -272,7 +274,10 @@ pub fn step_mq_receive(
         .current_bytes
         .fetch_sub(msg_len as u64, Ordering::Release);
     payload.msg_count.fetch_sub(1, Ordering::Release);
-    crate::ipc::posix_mq::notification::notify_space_available(&payload.send_channel);
+    crate::ipc::posix_mq::notification::notify_space_available(
+        &payload.send_channel,
+        &payload.send_source,
+    );
     Ok((msg.mtext, msg.mtype.saturating_sub(1) as u32))
 }
 

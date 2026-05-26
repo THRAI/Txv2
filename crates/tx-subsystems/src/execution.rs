@@ -229,7 +229,7 @@ mod tests {
         // `step_v3::Errno` + the From impl) fails to compile or this
         // test fails immediately.
         use crate::adapter::step_engine::V3Errno as V3;
-        let table: [(Errno, V3); 30] = [
+        let table: [(Errno, V3); 32] = [
             (Errno::E2BIG, V3::E2BIG),
             (Errno::EACCES, V3::EACCES),
             (Errno::EAGAIN, V3::EAGAIN),
@@ -263,7 +263,7 @@ mod tests {
             (Errno::ESTALE, V3::ESTALE),
             (Errno::ETIMEDOUT, V3::ETIMEDOUT),
         ];
-        assert_eq!(table.len(), 30);
+        assert_eq!(table.len(), 32);
         for (v4, expected_v3) in table {
             let mapped: V3 = v4.into();
             assert_eq!(

@@ -14,16 +14,22 @@ pub(crate) use readiness::{notify_message_available, notify_space_available};
     reason = "posix mq notification.rs owns fd-shaped read/write wake meanings"
 )]
 mod readiness {
-    use crate::process::adapter::wait_routing::{Channel, Mask};
+    use alloc::sync::Arc;
+
+    use crate::process::adapter::wait_routing::{self, Channel, Mask, WaitSource};
 
     const MQ_CAN_RECV: u64 = 1;
     const MQ_CAN_SEND: u64 = 1;
 
-    pub(crate) fn notify_message_available(channel: &Channel) -> usize {
-        channel.fire(Mask::from_bits(MQ_CAN_RECV))
+    pub(crate) fn notify_message_available(channel: &Channel, source: &Arc<WaitSource>) -> usize {
+        let legacy = channel.fire(Mask::from_bits(MQ_CAN_RECV));
+        wait_routing::notify_v3_source(source, MQ_CAN_RECV);
+        legacy.saturating_add(source.subscriber_count())
     }
 
-    pub(crate) fn notify_space_available(channel: &Channel) -> usize {
-        channel.fire(Mask::from_bits(MQ_CAN_SEND))
+    pub(crate) fn notify_space_available(channel: &Channel, source: &Arc<WaitSource>) -> usize {
+        let legacy = channel.fire(Mask::from_bits(MQ_CAN_SEND));
+        wait_routing::notify_v3_source(source, MQ_CAN_SEND);
+        legacy.saturating_add(source.subscriber_count())
     }
 }
