@@ -69,6 +69,12 @@ pub struct ProcessPayload {
 `NsProxy` is immutable after publication. `clone`, `unshare`, and `setns`
 publish a new bundle or reuse an existing compatible one.
 
+The `user_ns` member is both a rendering lens for user/group IDs and the
+authority lens for Linux capability checks. A process does not become globally
+privileged by entering a child user namespace. It gains capabilities only in
+that user namespace, and operations on another namespace or object must check
+the user namespace that owns that operation's authority domain.
+
 ## 2. Process canonical topology
 
 <!-- txdoc:NAMESPACE-VIEW-PROCESS-CANONICAL-TOPOLOGY-1 -->
@@ -304,6 +310,63 @@ Path syscalls use `mnt_ns` for path resolution and then operate on canonical
 VFS/Mount/DEntry/RNode objects. `chroot` and `chdir` mutate the caller's
 filesystem context lens, not the canonical filesystem graph.
 
+### 6.1 User namespace authority and id maps
+
+<!-- txdoc:NAMESPACE-VIEW-USERNS-AUTHORITY-1 -->
+
+Linux user namespaces are the authority half of the namespace-view model:
+
+```rust
+pub struct UserNamespace {
+    pub parent: Option<Cap<UserNamespace>>,
+    pub owner_uid: KernelUid,
+    pub owner_gid: KernelGid,
+    pub uid_map: IdMap,
+    pub gid_map: IdMap,
+    pub uid_map_written: bool,
+    pub gid_map_written: bool,
+    pub setgroups: SetgroupsPolicy,
+}
+```
+
+The exact implementation may factor this through `Cred` / `SubjectAuthority`,
+but the semantics are:
+
+- every process is a member of exactly one user namespace via
+  `ProcessPayload.nsproxy.user_ns`;
+- `clone(CLONE_NEWUSER)` creates a child in a new user namespace;
+- `unshare(CLONE_NEWUSER)` moves the caller into a new user namespace;
+- the child/caller receives a full capability set in the new user namespace
+  only, not in the parent namespace;
+- a newly created user namespace starts with empty `uid_map` and `gid_map`;
+- the initial user namespace has the Linux dummy identity map
+  `0 0 4294967295`;
+- `/proc/<pid>/uid_map` and `/proc/<pid>/gid_map` are write-once projected
+  files that update user-namespace map state, not process credential objects;
+- `/proc/<pid>/setgroups` gates the unprivileged `gid_map` path and cannot be
+  changed after `gid_map` is written.
+
+All non-user namespaces carry the immutable user namespace that owned them at
+creation:
+
+```rust
+pub struct NetNamespace {
+    pub user_ns: Cap<UserNamespace>,
+    ...
+}
+```
+
+This applies equally to pid, mount, UTS, IPC, cgroup, network, and time
+namespaces. Privileged operations on resources governed by one of these
+namespaces check the caller's capability in that namespace's owning
+`UserNamespace`.
+
+If `CLONE_NEWUSER` is combined with other `CLONE_NEW*` flags, Linux creates the
+new user namespace first. The remaining namespaces are then created as owned by
+that new user namespace, which lets an unprivileged caller perform
+`unshare(CLONE_NEWUSER | CLONE_NEWNET)` without first holding `CAP_SYS_ADMIN`
+in the parent user namespace.
+
 ## 7. Namespace-changing syscalls
 
 <!-- txdoc:NAMESPACE-VIEW-CHANGING-SYSCALLS-1 -->
@@ -314,6 +377,21 @@ filesystem context lens, not the canonical filesystem graph.
 unshare(CLONE_NEWUTS):
   create/copy UtsNamespace
   create NsProxy with uts_ns swapped
+  commit ProcessPayload.nsproxy old -> new
+
+unshare(CLONE_NEWUSER):
+  require caller effective uid/gid mapped in current user_ns
+  require single-threaded process for Linux compatibility
+  create UserNamespace with empty uid/gid maps and inherited setgroups policy
+  grant full capabilities in the new user namespace only
+  create NsProxy with user_ns swapped
+  commit ProcessPayload.nsproxy old -> new
+
+unshare(CLONE_NEWUSER | CLONE_NEWNET):
+  create UserNamespace first
+  authorize CLONE_NEWNET against the new user namespace
+  create NetNamespace owned by the new user namespace
+  create NsProxy with user_ns and net_ns swapped
   commit ProcessPayload.nsproxy old -> new
 
 setns(net_fd):
@@ -478,24 +556,45 @@ kill(42):
 
 /proc/self/cgroup:
   Projected RNode over CgroupNamespace root lens
+
+/proc/self/uid_map, /proc/self/gid_map, /proc/self/setgroups:
+  Projected RNode -> ProcessIdentity -> ProcessPayload.nsproxy.user_ns
+  -> validate Linux map/setgroups write rules -> update UserNamespace state
 ```
 
 Projected RNodes may retain namespace objects or carry projection keys. They do
 not own the semantic object graph they render.
 
+For user namespace map files, Linux write rules are part of the projection
+contract:
+
+- writes occur at offset 0, contain at least one line, fit in one page, and use
+  valid numeric `inside outside length` fields with nonzero length;
+- ranges may not overlap;
+- malformed map shape fails with `EINVAL`;
+- repeated writes or permission failures fail with `EPERM`;
+- the unprivileged `gid_map` path requires `/proc/<pid>/setgroups` to be set to
+  `deny` first;
+- `setgroups` may be changed only before `gid_map` is written, and `deny`
+  cannot be reverted to `allow`.
+
 ## 10. Ownership by namespace kind
 
 <!-- txdoc:NAMESPACE-VIEW-OWNERSHIP-BY-KIND-1 -->
+
+Every non-user namespace also carries the immutable `UserNamespace` that owned
+it at creation; the table below names the domain-specific state in addition to
+that owner link.
 
 | Namespace kind | Owns | Does not own |
 |---|---|---|
 | `PidNamespace` | pid/tid/pgid/sid numeric bindings and visibility | process tree, pgrp/session membership, thread roster |
 | `MountNamespace` | visible mount topology/rooting and propagation state | file payloads, RNode semantics, filesystem driver state |
-| `UserNamespace` | uid/gid maps, capability interpretation | process ownership tree or credential object lifetime |
+| `UserNamespace` | uid/gid maps, setgroups policy, namespace-relative capability interpretation | process ownership tree or credential object lifetime |
 | `CgroupNamespace` | root-relative cgroup rendering lens | cgroup hierarchy or controller state |
 | `UtsNamespace` | hostname/domain values | process or network topology |
 | `IpcNamespace` | IPC registry domain | unrelated process topology |
-| `NetNamespace` | network registry/stack domain | process/session topology |
+| `NetNamespace` | network registry/stack domain and immutable owning `UserNamespace` link | process/session topology or user credential lifetime |
 | `TimeNamespace` | clock offsets/rendering | timer object graph unless timers are semantically allocated there |
 
 ## 11. Blast radius estimate
@@ -516,22 +615,25 @@ mostly mechanical once the data model is accepted.
 | VFS path resolution | Medium | Route path resolution through `ctx.nsproxy.mnt_ns`; keep canonical VFS operations unchanged after resolution. |
 | procfs/sysfs | High | Carry a projection view; enumerate `PidNamespace.numbers`; projected RNodes re-read canonical state and render through the view. |
 | TTY/job control | Medium | Resolve pgid/sid numbers through pid namespace; bind TTY to canonical `ProcessGroup`/`Session`, not leader-process caps or numbers. |
-| Cred/User namespace | Medium | Add user namespace lens to capability and uid/gid rendering checks. |
+| Cred/User namespace | High | Add user namespace lens to capability checks, uid/gid rendering, procfs map writes, setgroups gating, and non-user namespace ownership. |
 | Mount namespace | Medium | Clarify which mount topology is namespace-owned and which lower VFS objects remain shared. |
 | Cgroup/time namespaces | Low to Medium | Mostly projection/root/offset rendering unless deeper namespace-local allocation is added. |
 | Invariants/lints | Medium | Enforce no direct pid maps, no namespace-owned shadow process topology, no resolver helpers mutating canon, no target identities retaining `PidName`. |
-| Tests/model checks | High | Add resolve/render tests, zombie name lifetime tests, nested namespace allocation tests, setns/unshare tests, procfs visibility tests. |
+| Tests/model checks | High | Add resolve/render tests, zombie name lifetime tests, nested namespace allocation tests, setns/unshare tests, procfs visibility tests, userns map errno tests, and unprivileged `CLONE_NEWUSER | CLONE_NEWNET` authorization tests. |
 
 Recommended migration order:
 
 1. Introduce `NsProxy` and `SysCtx` while all fields point at init namespaces.
-2. Add `PidName` and `PidNamespace.numbers` behind compatibility wrappers.
-3. Convert syscall pid helpers to operation-specific resolve/render APIs.
-4. Convert fork/clone/exit/reap commits to publish/withdraw `PidName`.
-5. Convert procfs projections to use the pid namespace view.
-6. Remove direct `pid_map`, `tid_map`, `pgid_map`, and `sid_map`.
-7. Add nested pid namespace semantics and `pid_for_children`.
-8. Extend the same view discipline to mount, user, cgroup, time, ipc, net, and uts namespaces.
+2. Add `UserNamespace` identity/map state, namespace-local capability checks,
+   and owning-userns links on non-user namespaces.
+3. Add `PidName` and `PidNamespace.numbers` behind compatibility wrappers.
+4. Convert syscall pid helpers to operation-specific resolve/render APIs.
+5. Convert fork/clone/exit/reap commits to publish/withdraw `PidName`.
+6. Convert procfs projections to use the pid namespace view and userns map
+   projections.
+7. Remove direct `pid_map`, `tid_map`, `pgid_map`, and `sid_map`.
+8. Add nested pid namespace semantics and `pid_for_children`.
+9. Extend the same view discipline to mount, cgroup, time, ipc, net, and uts namespaces.
 
 ## 12. Review invariants
 
@@ -560,4 +662,15 @@ They must not be repaired by rewriting canonical parent, pgrp, or session edges.
 
 RNP-1. Projected RNodes expose namespace views through VFS.
 They do not own the canonical object graph being rendered.
+
+NSVIEW-4. Capability checks are namespace-relative.
+Entering a child UserNamespace grants authority only in that user namespace,
+never global authority in ancestors.
+
+NSVIEW-5. Every non-user namespace records its immutable owning UserNamespace.
+Privileged operations scoped by that namespace check capabilities in the owner.
+
+NSVIEW-6. UserNamespace uid/gid maps and setgroups policy are namespace state
+exposed through procfs projections. Map writes obey Linux write-once,
+offset-zero, non-overlap, and setgroups-gated gid_map rules.
 ```

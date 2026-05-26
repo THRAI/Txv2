@@ -1,8 +1,9 @@
 use super::structure::{
     registry, AcceptWireSet, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address,
-    Ipv4MulticastGroup, KernelSockAddr, PollMask, ProtocolNumber, RawIcmpState, RecvWireSet,
-    SendRecvFlags, SendWireSet, SockAddrIn, SockShutdownCmd, SocketIdentity, SocketKind,
-    SocketOptionSet, SocketProtocol, SocketType, TcpState, UdpInner, ValidSocketType,
+    Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, PollMask, ProtocolNumber, RawIcmpState,
+    RecvWireSet, SendRecvFlags, SendWireSet, SockAddrIn, SockAddrIn6, SockShutdownCmd,
+    SocketIdentity, SocketKind, SocketOptionSet, SocketProtocol, SocketType, TcpState, UdpInner,
+    ValidSocketType,
 };
 use crate::execution::{Errno, WaitToken};
 use crate::net::checks::require::{
@@ -132,6 +133,10 @@ fn inet(port: u16) -> KernelSockAddr {
 
 fn any_inet(port: u16) -> KernelSockAddr {
     KernelSockAddr::V4(SockAddrIn::new(port, Ipv4Address::UNSPECIFIED))
+}
+
+fn any_inet6(port: u16) -> KernelSockAddr {
+    KernelSockAddr::V6(SockAddrIn6::new(port, Ipv6Address::UNSPECIFIED))
 }
 
 fn inet_addr(port: u16, addr: Ipv4Address) -> KernelSockAddr {

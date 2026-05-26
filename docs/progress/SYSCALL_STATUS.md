@@ -243,8 +243,8 @@ overwritten by the next `sync`. The lint variant
 
 ### Counts (from dispatch table)
 
-- `pub const NR_*` in numbers.rs: **194**
-- dispatched in mod.rs: **190** (of which async: 58, likely-stub: 0)
+- `pub const NR_*` in numbers.rs: **195**
+- dispatched in mod.rs: **191** (of which async: 59, likely-stub: 0)
 - defined but not dispatched: **4**
 
 ### Defined in `numbers.rs` but no dispatch arm (4)
@@ -256,7 +256,7 @@ These have a syscall number constant but no match arm in `mod.rs`. Either wire t
 - `NR_PIDFD_SEND_SIGNAL` (nr=424)
 - `NR_PSELECT6` (nr=72)
 
-### Dispatched syscalls (190) — name → handler
+### Dispatched syscalls (191) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -347,6 +347,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 119 | `NR_SCHED_SETSCHEDULER` | `sys_sched_setscheduler` | sync |
 | 122 | `NR_SCHED_SETAFFINITY` | `sys_sched_setaffinity` | sync |
 | 123 | `NR_SCHED_GETAFFINITY` | `sys_sched_getaffinity` | sync |
+| 124 | `NR_SCHED_YIELD` | `sys_sched_yield` | async |
 | 129 | `NR_KILL` | `sys_kill` | sync |
 | 130 | `NR_TKILL` | `sys_tkill` | sync |
 | 131 | `NR_TGKILL` | `sys_tgkill` | sync |

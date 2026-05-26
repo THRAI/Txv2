@@ -5,7 +5,7 @@ use crate::net::checks::require::require_socket_write_target;
 use crate::net::namespace::initial_loopback_iface;
 use crate::net::protocol::{LoopbackIface, PollContext, UDP_IPV4_MAX_PAYLOAD_BYTES};
 use crate::net::structure::{
-    IpEndpoint, Ipv4Address, SendRecvFlags, SendWireSet, SocketIdentity, SocketProtocol, UdpInner,
+    IpEndpoint, SendRecvFlags, SendWireSet, SocketIdentity, SocketProtocol, UdpInner,
 };
 
 use super::step_send::send_flags_error;
@@ -161,12 +161,12 @@ pub fn step_send_udp_loopback_kernel_bytes_on_iface(
             Some(endpoints) => endpoints,
             None => return tx_substrate::step::StepOutcome::Err(Errno::EDESTADDRREQ),
         };
-    if destination.addr != iface.local_ipv4()
-        || !(local.addr == Ipv4Address::UNSPECIFIED || local.addr == iface.local_ipv4())
+    if !is_loopback_destination(destination)
+        || !(local.is_unspecified() || local.same_family(destination) && local.is_loopback())
     {
         return tx_substrate::step::StepOutcome::Err(Errno::EOPNOTSUPP);
     }
-    if total_payload_len + 28 > usize::from(iface.mtu()) {
+    if total_payload_len + udp_packet_overhead(destination) > usize::from(iface.mtu()) {
         return tx_substrate::step::StepOutcome::Err(Errno::EMSGSIZE);
     }
     let reserve =
@@ -236,10 +236,25 @@ fn loopback_udp_source(
     destination: IpEndpoint,
     iface: &LoopbackIface,
 ) -> IpEndpoint {
-    let addr = if local.addr == Ipv4Address::UNSPECIFIED && destination.addr == iface.local_ipv4() {
-        iface.local_ipv4()
+    let addr = if local.is_unspecified() && is_loopback_destination(destination) {
+        IpEndpoint::loopback_for_family(destination.family, local.port).ip_addr()
     } else {
-        local.addr
+        local.ip_addr()
     };
-    IpEndpoint::new(addr, local.port)
+    let _ = iface;
+    IpEndpoint::from_ip(addr, local.port)
+}
+
+fn is_loopback_destination(endpoint: IpEndpoint) -> bool {
+    endpoint.is_loopback()
+}
+
+fn udp_packet_overhead(endpoint: IpEndpoint) -> usize {
+    const IPV4_UDP_OVERHEAD: usize = 20 + 8;
+    const IPV6_UDP_OVERHEAD: usize = 40 + 8;
+    if endpoint.family == crate::net::structure::AddressFamily::Inet6 {
+        IPV6_UDP_OVERHEAD
+    } else {
+        IPV4_UDP_OVERHEAD
+    }
 }

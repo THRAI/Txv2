@@ -229,6 +229,42 @@ fn yielded_fair_task_resets_budget_and_requeues_with_fresh_preempted_slice() {
 }
 
 #[test]
+fn yielded_userspace_thread_requeues_at_new_tail_behind_peer() {
+    let mut scheduler = Phase1Scheduler::new();
+    let userspace = TaskId(31);
+    scheduler.task_submitted(
+        userspace,
+        TaskHandle::new(userspace),
+        InitialSchedMeta::fair().userspace_thread(),
+    );
+    let peer = submit_fair(&mut scheduler, 32);
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(userspace)
+    );
+    scheduler.task_stopped(userspace, StopReason::Yielded, 250_000, HartId(0));
+
+    assert_eq!(
+        scheduler.task_owner(userspace),
+        Some(TaskRunOwner::Queued {
+            hart: HartId(0),
+            queue: Phase1QueueKind::New,
+        })
+    );
+    assert_eq!(scheduler.queue_depths(HartId(0)).new, 2);
+    assert_eq!(scheduler.queue_depths(HartId(0)).preempted, 0);
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(peer)
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(userspace)
+    );
+}
+
+#[test]
 fn yielded_kernel_task_stays_cooperative() {
     let mut scheduler = Phase1Scheduler::new();
     let task = submit_kernel(&mut scheduler, 2);

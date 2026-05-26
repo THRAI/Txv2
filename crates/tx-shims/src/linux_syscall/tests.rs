@@ -45,8 +45,9 @@ use super::{
     NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPGRP, NR_GETPID,
     NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_MEMBARRIER, NR_PIPE2, NR_PPOLL, NR_READ,
     NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY,
-    NR_SCHED_SETAFFINITY, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
-    NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, NR_WRITEV, O_DIRECTORY, SIGCHLD, WNOHANG,
+    NR_SCHED_SETAFFINITY, NR_SCHED_YIELD, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST,
+    NR_SET_TID_ADDRESS, NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, NR_WRITEV, O_DIRECTORY, SIGCHLD,
+    WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
@@ -477,6 +478,26 @@ fn dispatch_unknown_nr_returns_neg_enosys() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
 
     assert_eq!(result, SyscallResult::Error(38));
+}
+
+#[test]
+fn dispatch_sched_yield_yields_before_returning_zero() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+    let req = SyscallRequest::new(NR_SCHED_YIELD, [0; 6]);
+    let mut fut = dispatch::<ShimsTestPmap>(req, &ctx);
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    // SAFETY: the future stays on the stack while pinned for these polls.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
+
+    assert_eq!(pinned.as_mut().poll(&mut cx), Poll::Pending);
+    assert_eq!(
+        pinned.as_mut().poll(&mut cx),
+        Poll::Ready(SyscallResult::Return(0))
+    );
 }
 
 // ---------------------------------------------------------------------------

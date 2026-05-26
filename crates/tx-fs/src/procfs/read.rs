@@ -1,20 +1,22 @@
 //! Content renderers for procfs pseudo-files.
 
 use crate::procfs::{
-    pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_smaps_id, pid_from_stat_id,
-    pid_from_status_id, task_from_stat_id,
-    KERNEL_CONFIG_TEXT, PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID,
-    PROCFS_NET_ARP_ID, PROCFS_NET_DEV_ID, PROCFS_NET_IF_INET6_ID, PROCFS_NET_NETLINK_ID,
-    PROCFS_NET_NF_CONNTRACK_ID, PROCFS_NET_RAW_ID, PROCFS_NET_ROUTE_ID, PROCFS_NET_SNMP_ID,
-    PROCFS_NET_TCP_ID, PROCFS_NET_TX_NF_RULES_ID, PROCFS_NET_UDP_ID, PROCFS_SYSVIPC_MSG_ID,
-    PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID, PROCFS_SYS_FS_LEASE_BREAK_TIME_ID,
-    PROCFS_SYS_FS_PIPE_MAX_SIZE_ID, PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID,
-    PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID, PROCFS_SYS_KERNEL_PID_MAX_ID,
-    PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYS_NET_IPV4_IP_FORWARD_ID, PROCFS_UPTIME_ID,
+    pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_gid_map_id, pid_from_maps_id,
+    pid_from_setgroups_id, pid_from_smaps_id, pid_from_stat_id, pid_from_status_id,
+    pid_from_uid_map_id, task_from_stat_id, KERNEL_CONFIG_TEXT, PROCFS_CONFIG_ID,
+    PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID, PROCFS_NET_ARP_ID, PROCFS_NET_DEV_ID,
+    PROCFS_NET_IF_INET6_ID, PROCFS_NET_NETLINK_ID, PROCFS_NET_NF_CONNTRACK_ID, PROCFS_NET_RAW_ID,
+    PROCFS_NET_ROUTE_ID, PROCFS_NET_SNMP_ID, PROCFS_NET_TCP_ID, PROCFS_NET_TX_NF_RULES_ID,
+    PROCFS_NET_UDP_ID, PROCFS_SYSVIPC_MSG_ID, PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID,
+    PROCFS_SYS_FS_LEASE_BREAK_TIME_ID, PROCFS_SYS_FS_PIPE_MAX_SIZE_ID,
+    PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID, PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID,
+    PROCFS_SYS_KERNEL_PID_MAX_ID, PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYS_NET_IPV4_IP_FORWARD_ID,
+    PROCFS_SYS_USER_MAX_USER_NAMESPACES_ID, PROCFS_UPTIME_ID,
 };
 use alloc::format;
 use alloc::string::String;
 use tx_subsystems::net::NetNamespacePayload;
+use tx_subsystems::process::nsproxy::{SetgroupsPolicy, UserIdMapEntry};
 use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use tx_subsystems::process::{self, Pid};
 use tx_subsystems::vfs::FsObjectId;
@@ -44,6 +46,15 @@ pub fn render_with_netns(
     if let Some((pid, fd)) = pid_from_fdinfo_id(fs_object_id) {
         return render_fdinfo(pid, fd);
     }
+    if let Some(pid) = pid_from_uid_map_id(fs_object_id) {
+        return render_userns_id_map(pid, UsernsProcFile::UidMap);
+    }
+    if let Some(pid) = pid_from_gid_map_id(fs_object_id) {
+        return render_userns_id_map(pid, UsernsProcFile::GidMap);
+    }
+    if let Some(pid) = pid_from_setgroups_id(fs_object_id) {
+        return render_userns_setgroups(pid);
+    }
     match fs_object_id {
         PROCFS_MOUNTS_ID => render_mounts(),
         PROCFS_CPUINFO_ID => render_cpuinfo(),
@@ -57,6 +68,7 @@ pub fn render_with_netns(
         PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID => {
             String::from("1\n")
         }
+        PROCFS_SYS_USER_MAX_USER_NAMESPACES_ID => String::from("1024\n"),
         PROCFS_SYSVIPC_MSG_ID => render_sysvipc_msg(),
         PROCFS_SYSVIPC_SEM_ID => render_sysvipc_sem(),
         PROCFS_SYSVIPC_SHM_ID => render_sysvipc_shm(),
@@ -73,6 +85,50 @@ pub fn render_with_netns(
         PROCFS_NET_IF_INET6_ID => String::new(),
         PROCFS_SYS_NET_IPV4_IP_FORWARD_ID => render_ip_forward(caller_netns),
         _ => String::new(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum UsernsProcFile {
+    UidMap,
+    GidMap,
+}
+
+fn render_userns_id_map(pid: Pid, file: UsernsProcFile) -> String {
+    let Some(proc) = process::process_by_pid(pid) else {
+        return String::new();
+    };
+    let Some(user_ns) = proc.user_namespace_cap() else {
+        return String::new();
+    };
+    let entries = match file {
+        UsernsProcFile::UidMap => user_ns.uid_map_snapshot(),
+        UsernsProcFile::GidMap => user_ns.gid_map_snapshot(),
+    };
+    render_id_map_entries(&entries)
+}
+
+fn render_id_map_entries(entries: &[UserIdMapEntry]) -> String {
+    let mut out = String::new();
+    for entry in entries {
+        out.push_str(&format!(
+            "{} {} {}\n",
+            entry.inside, entry.outside, entry.length
+        ));
+    }
+    out
+}
+
+fn render_userns_setgroups(pid: Pid) -> String {
+    let Some(proc) = process::process_by_pid(pid) else {
+        return String::new();
+    };
+    let Some(user_ns) = proc.user_namespace_cap() else {
+        return String::new();
+    };
+    match user_ns.setgroups_policy() {
+        SetgroupsPolicy::Allow => String::from("allow\n"),
+        SetgroupsPolicy::Deny => String::from("deny\n"),
     }
 }
 

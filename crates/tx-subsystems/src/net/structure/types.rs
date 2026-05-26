@@ -4,10 +4,11 @@ use core::time::Duration;
 use crate::execution::Errno;
 
 pub const UNIX_SOCKET_PATH_MAX: usize = 108;
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum AddressFamily {
     Unix,
     Inet,
+    Inet6,
     Netlink,
     Packet,
 }
@@ -70,6 +71,7 @@ impl ValidSocketType {
         let domain = match domain {
             1 => AddressFamily::Unix,
             2 => AddressFamily::Inet,
+            10 => AddressFamily::Inet6,
             16 => AddressFamily::Netlink,
             17 => AddressFamily::Packet,
             _ => return Err(Errno::EAFNOSUPPORT),
@@ -117,6 +119,9 @@ impl SocketKind {
             (AddressFamily::Inet, SocketType::Dgram, 1)
             | (AddressFamily::Inet, SocketType::Raw, 1) => Ok(Self::RawIcmp),
             (AddressFamily::Inet, _, _) => Err(Errno::EPROTONOSUPPORT),
+            (AddressFamily::Inet6, SocketType::Stream, 0 | 6) => Ok(Self::Tcp),
+            (AddressFamily::Inet6, SocketType::Dgram, 0 | 17 | 136) => Ok(Self::Udp),
+            (AddressFamily::Inet6, _, _) => Err(Errno::EPROTONOSUPPORT),
             (AddressFamily::Netlink, SocketType::Raw | SocketType::Dgram, 0) => {
                 Ok(Self::NetlinkRoute)
             }
@@ -161,15 +166,142 @@ impl Ipv4Address {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Ipv6Address {
+    octets: [u8; 16],
+}
+
+impl Ipv6Address {
+    pub const UNSPECIFIED: Self = Self { octets: [0; 16] };
+    pub const LOOPBACK: Self = Self {
+        octets: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    };
+
+    pub const fn new(octets: [u8; 16]) -> Self {
+        Self { octets }
+    }
+
+    pub const fn octets(self) -> [u8; 16] {
+        self.octets
+    }
+
+    pub fn is_unspecified(self) -> bool {
+        let mut idx = 0;
+        while idx < self.octets.len() {
+            if self.octets[idx] != 0 {
+                return false;
+            }
+            idx += 1;
+        }
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum IpAddress {
+    V4(Ipv4Address),
+    V6(Ipv6Address),
+}
+
+impl IpAddress {
+    pub const fn family(self) -> AddressFamily {
+        match self {
+            Self::V4(_) => AddressFamily::Inet,
+            Self::V6(_) => AddressFamily::Inet6,
+        }
+    }
+
+    pub fn is_unspecified(self) -> bool {
+        match self {
+            Self::V4(addr) => {
+                addr.octets()[0] == 0
+                    && addr.octets()[1] == 0
+                    && addr.octets()[2] == 0
+                    && addr.octets()[3] == 0
+            }
+            Self::V6(addr) => addr.is_unspecified(),
+        }
+    }
+
+    pub fn is_loopback(self) -> bool {
+        match self {
+            Self::V4(addr) => {
+                let octets = addr.octets();
+                octets[0] == 127 && octets[1] == 0 && octets[2] == 0 && octets[3] == 1
+            }
+            Self::V6(addr) => addr == Ipv6Address::LOOPBACK,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct IpEndpoint {
+    pub family: AddressFamily,
     pub addr: Ipv4Address,
+    pub addr6: Ipv6Address,
     pub port: u16,
 }
 
 impl IpEndpoint {
     pub const fn new(addr: Ipv4Address, port: u16) -> Self {
-        Self { addr, port }
+        Self {
+            family: AddressFamily::Inet,
+            addr,
+            addr6: Ipv6Address::UNSPECIFIED,
+            port,
+        }
+    }
+
+    pub const fn new_v6(addr: Ipv6Address, port: u16) -> Self {
+        Self {
+            family: AddressFamily::Inet6,
+            addr: Ipv4Address::UNSPECIFIED,
+            addr6: addr,
+            port,
+        }
+    }
+
+    pub const fn from_ip(addr: IpAddress, port: u16) -> Self {
+        match addr {
+            IpAddress::V4(addr) => Self::new(addr, port),
+            IpAddress::V6(addr) => Self::new_v6(addr, port),
+        }
+    }
+
+    pub const fn ip_addr(self) -> IpAddress {
+        match self.family {
+            AddressFamily::Inet => IpAddress::V4(self.addr),
+            AddressFamily::Inet6 => IpAddress::V6(self.addr6),
+            AddressFamily::Unix | AddressFamily::Netlink | AddressFamily::Packet => {
+                IpAddress::V4(self.addr)
+            }
+        }
+    }
+
+    pub const fn unspecified_for_family(family: AddressFamily, port: u16) -> Self {
+        match family {
+            AddressFamily::Inet6 => Self::new_v6(Ipv6Address::UNSPECIFIED, port),
+            _ => Self::new(Ipv4Address::UNSPECIFIED, port),
+        }
+    }
+
+    pub const fn loopback_for_family(family: AddressFamily, port: u16) -> Self {
+        match family {
+            AddressFamily::Inet6 => Self::new_v6(Ipv6Address::LOOPBACK, port),
+            _ => Self::new(Ipv4Address::LOOPBACK, port),
+        }
+    }
+
+    pub fn is_unspecified(self) -> bool {
+        self.ip_addr().is_unspecified()
+    }
+
+    pub fn is_loopback(self) -> bool {
+        self.ip_addr().is_loopback()
+    }
+
+    pub fn same_family(self, other: Self) -> bool {
+        self.family == other.family
     }
 }
 
@@ -177,7 +309,9 @@ impl IpEndpoint {
 pub enum KernelSockAddr {
     Unix(UnixSocketPath),
     V4(SockAddrIn),
+    V6(SockAddrIn6),
     Packet(SockAddrLl),
+    Unspec,
 }
 
 impl KernelSockAddr {
@@ -185,7 +319,9 @@ impl KernelSockAddr {
         match self {
             Self::Unix(_) => IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0),
             Self::V4(sockaddr) => IpEndpoint::new(sockaddr.addr, sockaddr.port),
+            Self::V6(sockaddr) => IpEndpoint::new_v6(sockaddr.addr, sockaddr.port),
             Self::Packet(_) => IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0),
+            Self::Unspec => IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0),
         }
     }
 }
@@ -241,6 +377,29 @@ impl SockAddrIn {
             family: Self::AF_INET,
             port,
             addr,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SockAddrIn6 {
+    pub family: u16,
+    pub port: u16,
+    pub flowinfo: u32,
+    pub addr: Ipv6Address,
+    pub scope_id: u32,
+}
+
+impl SockAddrIn6 {
+    pub const AF_INET6: u16 = 10;
+
+    pub const fn new(port: u16, addr: Ipv6Address) -> Self {
+        Self {
+            family: Self::AF_INET6,
+            port,
+            flowinfo: 0,
+            addr,
+            scope_id: 0,
         }
     }
 }
@@ -398,6 +557,8 @@ pub struct IpLevelOptions {
     pub ttl: u8,
     pub multicast_ttl: u8,
     pub recv_err: bool,
+    pub hdr_incl: bool,
+    pub ipv6_v6only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -432,6 +593,8 @@ impl SocketOptionSet {
                 ttl: 64,
                 multicast_ttl: 1,
                 recv_err: false,
+                hdr_incl: false,
+                ipv6_v6only: false,
             },
             tcp: TcpLevelOptions {
                 nodelay: false,
@@ -465,6 +628,8 @@ impl SocketOptionSet {
                 ttl: 64,
                 multicast_ttl: 1,
                 recv_err: false,
+                hdr_incl: false,
+                ipv6_v6only: false,
             },
             tcp: TcpLevelOptions {
                 nodelay: false,
@@ -611,6 +776,8 @@ pub struct PacketSocketState {
     pub ifindex: Option<i32>,
     pub packet_version: i32,
     pub packet_reserve: u32,
+    pub packet_vnet_hdr: bool,
+    pub packet_rx_ring_block_size: Option<u32>,
 }
 
 impl PacketSocketState {
@@ -620,6 +787,8 @@ impl PacketSocketState {
             ifindex: None,
             packet_version: 0,
             packet_reserve: 0,
+            packet_vnet_hdr: false,
+            packet_rx_ring_block_size: None,
         }
     }
 

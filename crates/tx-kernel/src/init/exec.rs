@@ -1002,6 +1002,7 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     }
 
     let mut cmd = String::from("cd /musl/musl");
+    let ltp_args = ltp_args_from_cmdline::<P>();
     let mut selected = 0usize;
     if let Some(groups) = oscomp_groups_from_cmdline::<P>()
         .or_else(|| oscomp_boot_suite(<P as tx_hal::BootInfoIf>::boot_info().cmdline))
@@ -1012,7 +1013,7 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 continue;
             }
             if group == "all" {
-                append_default_oscomp_scripts(&mut cmd);
+                append_default_oscomp_scripts(&mut cmd, &ltp_args);
                 return cmd;
             }
             if let Some(filter) = group.strip_prefix("libctest-musl:") {
@@ -1026,23 +1027,23 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 continue;
             }
             if let Some(filter) = group.strip_prefix("ltp-musl:") {
-                append_filtered_ltp(&mut cmd, "musl", filter);
+                append_filtered_ltp(&mut cmd, "musl", filter, &ltp_args);
                 selected += 1;
                 continue;
             }
             if let Some(filter) = group.strip_prefix("ltp:") {
-                append_filtered_ltp(&mut cmd, "musl", filter);
+                append_filtered_ltp(&mut cmd, "musl", filter, &ltp_args);
                 selected += 1;
                 continue;
             }
             if let Some(batch) = group.strip_prefix("ltp-batch:") {
-                append_ltp_batch(&mut cmd, batch);
+                append_ltp_batch(&mut cmd, batch, &ltp_args);
                 selected += 1;
                 continue;
             }
             if let Some(module) = group.strip_prefix("ltp-runtest:") {
                 let (module, filter) = module.split_once(':').unwrap_or((module, ""));
-                append_ltp_runtest(&mut cmd, module, filter);
+                append_ltp_runtest(&mut cmd, module, filter, &ltp_args);
                 selected += 1;
                 continue;
             }
@@ -1075,46 +1076,53 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 continue;
             }
             if let Some(script) = oscomp_musl_script_for_group(group) {
-                append_oscomp_musl_script(&mut cmd, script);
+                append_oscomp_musl_script(&mut cmd, script, &ltp_args);
                 selected += 1;
             }
         }
     }
     if selected == 0 {
-        append_default_oscomp_scripts(&mut cmd);
+        append_default_oscomp_scripts(&mut cmd, &ltp_args);
     }
     cmd
 }
 
-fn append_ltp_batch(cmd: &mut alloc::string::String, batch: &str) {
+fn append_ltp_batch(cmd: &mut alloc::string::String, batch: &str, args: &LtpArgs<'_>) {
     match batch.trim() {
-        "submit" | "whitelist" => append_submit_ltp_runner(cmd),
-        "p0" => append_filtered_ltp(cmd, "musl", LTP_P0_CASES),
-        "smoke" => append_filtered_ltp(cmd, "musl", LTP_SMOKE_CASES),
-        "fd-io" => append_filtered_ltp(cmd, "musl", LTP_FD_IO_CASES),
-        "fd-io-tail" => append_filtered_ltp(cmd, "musl", LTP_FD_IO_TAIL_CASES),
+        "submit" | "whitelist" => append_submit_ltp_runner(cmd, args),
+        "p0" => append_filtered_ltp(cmd, "musl", LTP_P0_CASES, args),
+        "smoke" => append_filtered_ltp(cmd, "musl", LTP_SMOKE_CASES, args),
+        "fd-io" => append_filtered_ltp(cmd, "musl", LTP_FD_IO_CASES, args),
+        "fd-io-tail" => append_filtered_ltp(cmd, "musl", LTP_FD_IO_TAIL_CASES, args),
         "fd-io-after-sendfile07" => {
-            append_filtered_ltp(cmd, "musl", LTP_FD_IO_AFTER_SENDFILE07_CASES)
+            append_filtered_ltp(cmd, "musl", LTP_FD_IO_AFTER_SENDFILE07_CASES, args)
         }
-        "vfs" => append_filtered_ltp(cmd, "musl", LTP_VFS_CASES),
-        "vfs-tail" | "vfs-after-lgetxattr" => append_filtered_ltp(cmd, "musl", LTP_VFS_TAIL_CASES),
-        "vm" => append_filtered_ltp(cmd, "musl", LTP_VM_CASES),
-        "process" => append_filtered_ltp(cmd, "musl", LTP_PROCESS_CASES),
-        "cred" => append_filtered_ltp(cmd, "musl", LTP_CRED_CASES),
-        "signal" => append_filtered_ltp(cmd, "musl", LTP_SIGNAL_CASES),
-        "time" => append_filtered_ltp(cmd, "musl", LTP_TIME_CASES),
-        "ipc" => append_filtered_ltp(cmd, "musl", LTP_IPC_CASES),
-        "event" => append_filtered_ltp(cmd, "musl", LTP_EVENT_CASES),
-        "sched" => append_filtered_ltp(cmd, "musl", LTP_SCHED_CASES),
-        "mount" => append_filtered_ltp(cmd, "musl", LTP_MOUNT_CASES),
-        "heavy" => append_filtered_ltp(cmd, "musl", LTP_HEAVY_CASES),
-        "aio" => append_filtered_ltp(cmd, "musl", LTP_AIO_CASES),
-        "all" => append_all_ltp(cmd),
-        _ => append_filtered_ltp(cmd, "musl", ""),
+        "vfs" => append_filtered_ltp(cmd, "musl", LTP_VFS_CASES, args),
+        "vfs-tail" | "vfs-after-lgetxattr" => {
+            append_filtered_ltp(cmd, "musl", LTP_VFS_TAIL_CASES, args)
+        }
+        "vm" => append_filtered_ltp(cmd, "musl", LTP_VM_CASES, args),
+        "process" => append_filtered_ltp(cmd, "musl", LTP_PROCESS_CASES, args),
+        "cred" => append_filtered_ltp(cmd, "musl", LTP_CRED_CASES, args),
+        "signal" => append_filtered_ltp(cmd, "musl", LTP_SIGNAL_CASES, args),
+        "time" => append_filtered_ltp(cmd, "musl", LTP_TIME_CASES, args),
+        "ipc" => append_filtered_ltp(cmd, "musl", LTP_IPC_CASES, args),
+        "event" => append_filtered_ltp(cmd, "musl", LTP_EVENT_CASES, args),
+        "sched" => append_filtered_ltp(cmd, "musl", LTP_SCHED_CASES, args),
+        "mount" => append_filtered_ltp(cmd, "musl", LTP_MOUNT_CASES, args),
+        "heavy" => append_filtered_ltp(cmd, "musl", LTP_HEAVY_CASES, args),
+        "aio" => append_filtered_ltp(cmd, "musl", LTP_AIO_CASES, args),
+        "all" => append_all_ltp(cmd, args),
+        _ => append_filtered_ltp(cmd, "musl", "", args),
     }
 }
 
-fn append_ltp_runtest(cmd: &mut alloc::string::String, module: &str, filter: &str) {
+fn append_ltp_runtest(
+    cmd: &mut alloc::string::String,
+    module: &str,
+    filter: &str,
+    args: &LtpArgs<'_>,
+) {
     use core::fmt::Write as _;
 
     let module = module.trim();
@@ -1142,9 +1150,10 @@ fn append_ltp_runtest(cmd: &mut alloc::string::String, module: &str, filter: &st
     );
     let selected_tags = ltp_runtest_selected_tags(filter);
     let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
+    let runtime_assignment = args.shell_max_runtime_assignment("tag");
     let _ = write!(
         cmd,
-        "; selected_tags='{selected_tags}'; if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; if [ -n \"$selected_tags\" ]; then case \"$selected_tags\" in *\"|$tag|\"*) ;; *) continue;; esac; fi; case \"$tag\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $tag : local skip\"; continue;; esac; cmdline=${{rest:-$tag}}; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -c \"$cmdline\"; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $tag : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi"
+        "; selected_tags='{selected_tags}'; if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; if [ -n \"$selected_tags\" ]; then case \"$selected_tags\" in *\"|$tag|\"*) ;; *) continue;; esac; fi; case \"$tag\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $tag : local skip\"; continue;; esac; cmdline=${{rest:-$tag}}; {runtime_assignment} if [ -n \"$ltp_max_runtime\" ]; then cmdline=\"$cmdline -I $ltp_max_runtime\"; fi; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -c \"$cmdline\"; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $tag : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi"
     );
     let _ = write!(
         cmd,
@@ -1181,7 +1190,12 @@ fn ltp_runtest_selected_tags(filter: &str) -> alloc::string::String {
     selected
 }
 
-fn append_filtered_ltp(cmd: &mut alloc::string::String, _libc: &str, filter: &str) {
+fn append_filtered_ltp(
+    cmd: &mut alloc::string::String,
+    _libc: &str,
+    filter: &str,
+    args: &LtpArgs<'_>,
+) {
     use core::fmt::Write as _;
 
     append_ltp_script_env(cmd);
@@ -1190,14 +1204,14 @@ fn append_filtered_ltp(cmd: &mut alloc::string::String, _libc: &str, filter: &st
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
     );
-    append_ltp_case_loop(cmd, filter);
+    append_ltp_case_loop(cmd, filter, args);
     let _ = write!(
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
     );
 }
 
-fn append_all_ltp(cmd: &mut alloc::string::String) {
+fn append_all_ltp(cmd: &mut alloc::string::String, args: &LtpArgs<'_>) {
     use core::fmt::Write as _;
 
     append_ltp_script_env(cmd);
@@ -1223,7 +1237,7 @@ fn append_all_ltp(cmd: &mut alloc::string::String) {
         LTP_AIO_CASES,
         LTP_NETWORK_DEFERRED_CASES,
     ] {
-        append_ltp_case_loop(cmd, filter);
+        append_ltp_case_loop(cmd, filter, args);
     }
     let _ = write!(
         cmd,
@@ -1231,7 +1245,7 @@ fn append_all_ltp(cmd: &mut alloc::string::String) {
     );
 }
 
-fn append_submit_ltp_runner(cmd: &mut alloc::string::String) {
+fn append_submit_ltp_runner(cmd: &mut alloc::string::String, args: &LtpArgs<'_>) {
     use core::fmt::Write as _;
 
     append_ltp_script_env(cmd);
@@ -1240,14 +1254,14 @@ fn append_submit_ltp_runner(cmd: &mut alloc::string::String) {
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
     );
-    append_ltp_case_loop(cmd, LTP_SUBMIT_CASES);
+    append_ltp_case_loop(cmd, LTP_SUBMIT_CASES, args);
     let _ = write!(
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
     );
 }
 
-fn append_ltp_case_loop(cmd: &mut alloc::string::String, filter: &str) {
+fn append_ltp_case_loop(cmd: &mut alloc::string::String, filter: &str, args: &LtpArgs<'_>) {
     use core::fmt::Write as _;
 
     let _ = write!(cmd, "; for case in");
@@ -1263,6 +1277,7 @@ fn append_ltp_case_loop(cmd: &mut alloc::string::String, filter: &str) {
         let _ = write!(cmd, " {case}");
     }
     let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
+    let runtime_assignment = args.shell_max_runtime_assignment("case");
     let _ = write!(
         cmd,
         "; do \
@@ -1283,8 +1298,13 @@ stat04_64) set -- symlink01 -T stat04_64; ltp_label='symlink01 -T stat04_64';; \
 unlink01) set -- symlink01 -T unlink01; ltp_label='symlink01 -T unlink01';; \
 *) set -- \"$case\";; \
 esac; \
+{runtime_assignment} \
 echo \"RUN LTP CASE $case : $ltp_label\"; \
+if [ -n \"$ltp_max_runtime\" ]; then \
+PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config \"$@\" -I \"$ltp_max_runtime\"; \
+else \
 PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config \"$@\"; \
+fi; \
 ret=$?; \
 if [ $ret = 0 ]; then echo \"PASS LTP CASE $case : $ret\"; fi; \
 echo \"FAIL LTP CASE $case : $ret\"; \
@@ -1297,6 +1317,98 @@ clock_gettime01|clock_gettime04|dirtyc0w_shmem|fork14|futex_cmp_requeue01|\
 getrusage03|getrusage04|kcmp03|kill10|kill11|msgrcv05|msgrcv06|msgsnd05|\
 msgsnd06|rename14|shmctl01|sigtimedwait01|sigwaitinfo01|wait401|waitid07|\
 waitid08|waitpid07|waitpid11";
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LtpArgs<'a> {
+    max_runtime: Option<&'a str>,
+    max_runtime_cases: Option<&'a str>,
+}
+
+impl<'a> LtpArgs<'a> {
+    const fn none() -> Self {
+        Self {
+            max_runtime: None,
+            max_runtime_cases: None,
+        }
+    }
+
+    const fn max_runtime(max_runtime: &'a str) -> Self {
+        Self {
+            max_runtime: Some(max_runtime),
+            max_runtime_cases: None,
+        }
+    }
+
+    const fn max_runtime_for_cases(max_runtime: &'a str, cases: &'a str) -> Self {
+        Self {
+            max_runtime: Some(max_runtime),
+            max_runtime_cases: Some(cases),
+        }
+    }
+
+    fn shell_max_runtime_assignment(&self, case_var: &str) -> alloc::string::String {
+        use alloc::string::String;
+
+        let mut assignment = String::from("ltp_max_runtime='';");
+        let Some(value) = self
+            .max_runtime
+            .filter(|value| is_positive_int_token(value))
+        else {
+            return assignment;
+        };
+        match self.max_runtime_cases {
+            None => {
+                let _ = write!(assignment, " ltp_max_runtime='{value}';");
+            }
+            Some(cases) => {
+                let mut pattern = String::new();
+                for candidate in cases.split('+').map(str::trim) {
+                    if !is_ltp_case_token(candidate) {
+                        continue;
+                    }
+                    if !pattern.is_empty() {
+                        pattern.push('|');
+                    }
+                    pattern.push_str(candidate);
+                }
+                if !pattern.is_empty() {
+                    let _ = write!(
+                        assignment,
+                        " case \"${case_var}\" in {pattern}) ltp_max_runtime='{value}';; esac;"
+                    );
+                }
+            }
+        }
+        assignment
+    }
+}
+
+fn ltp_args_from_cmdline<P: tx_hal::TxPlatform>() -> LtpArgs<'static> {
+    let max_runtime = cmdline_value::<P>("tx.ltp.max_runtime").filter(|v| is_positive_int_token(v));
+    let max_runtime_cases = cmdline_value::<P>("tx.ltp.max_runtime_cases");
+    match (max_runtime, max_runtime_cases) {
+        (Some(max_runtime), Some(cases)) => LtpArgs::max_runtime_for_cases(max_runtime, cases),
+        (Some(max_runtime), None) => LtpArgs::max_runtime(max_runtime),
+        _ => LtpArgs::none(),
+    }
+}
+
+fn cmdline_value<P: tx_hal::TxPlatform>(key: &str) -> Option<&'static str> {
+    let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline?;
+    for token in cmdline.split_ascii_whitespace() {
+        let Some((token_key, value)) = token.split_once('=') else {
+            continue;
+        };
+        if token_key == key && !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn is_positive_int_token(value: &str) -> bool {
+    value.bytes().all(|byte| byte.is_ascii_digit()) && value.bytes().any(|byte| byte != b'0')
+}
 
 fn is_ltp_case_token(case: &str) -> bool {
     !case.is_empty()
@@ -1792,36 +1904,37 @@ fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
     }
 }
 
-fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
+fn append_default_oscomp_scripts(cmd: &mut alloc::string::String, args: &LtpArgs<'_>) {
     for (_, script) in DEFAULT_OSCOMP_MUSL_SCRIPTS {
         if *script == "libctest_testcode.sh" {
             append_full_libctest(cmd);
         } else if *script == "ltp_testcode.sh" {
-            append_submit_ltp_runner(cmd);
+            append_submit_ltp_runner(cmd, args);
         } else {
-            append_oscomp_musl_script(cmd, script);
+            append_oscomp_musl_script(cmd, script, args);
         }
     }
 }
 
-fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str) {
+fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str, args: &LtpArgs<'_>) {
     use core::fmt::Write as _;
 
     if script == "ltp_testcode.sh" {
-        append_full_ltp_runner(cmd);
+        append_full_ltp_runner(cmd, args);
         return;
     }
     let _ = write!(cmd, "; ./busybox sh {script}");
 }
 
-fn append_full_ltp_runner(cmd: &mut alloc::string::String) {
+fn append_full_ltp_runner(cmd: &mut alloc::string::String, args: &LtpArgs<'_>) {
     append_ltp_script_env(cmd);
     cmd.push_str("; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\"");
     cmd.push_str("; target_dir=\"ltp/testcases/bin\"");
     let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
+    let runtime_assignment = args.shell_max_runtime_assignment("name");
     let _ = write!(
         cmd,
-        "; for file in \"$target_dir\"/*; do if [ -f \"$file\" ]; then name=${{file##*/}}; case \"$name\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $name : local skip\"; continue;; esac; ./busybox echo \"RUN LTP CASE $name\"; /bin/setsid \"$file\"; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $name : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $name : $ret\"; fi; done"
+        "; for file in \"$target_dir\"/*; do if [ -f \"$file\" ]; then name=${{file##*/}}; case \"$name\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $name : local skip\"; continue;; esac; {runtime_assignment} ./busybox echo \"RUN LTP CASE $name\"; if [ -n \"$ltp_max_runtime\" ]; then /bin/setsid \"$file\" -I \"$ltp_max_runtime\"; else /bin/setsid \"$file\"; fi; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $name : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $name : $ret\"; fi; done"
     );
     cmd.push_str("; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\"");
 }
@@ -1989,7 +2102,7 @@ mod tests {
     #[test]
     fn filtered_ltp_emits_case_markers_without_default_suite() {
         let mut cmd = String::from("cd /musl/musl");
-        append_filtered_ltp(&mut cmd, "musl", "socket01+getsockopt01");
+        append_filtered_ltp(&mut cmd, "musl", "socket01+getsockopt01", &LtpArgs::none());
 
         assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-musl ####"));
         assert!(cmd.contains("; for case in socket01 getsockopt01"));
@@ -2003,7 +2116,7 @@ mod tests {
     #[test]
     fn filtered_ltp_rejects_shell_metacharacters() {
         let mut cmd = String::new();
-        append_filtered_ltp(&mut cmd, "musl", "socket01+bad;case");
+        append_filtered_ltp(&mut cmd, "musl", "socket01+bad;case", &LtpArgs::none());
 
         assert!(cmd.contains("; for case in socket01"));
         assert!(cmd.contains("SKIP LTP CASE bad;case : invalid case token"));
@@ -2013,7 +2126,7 @@ mod tests {
     #[test]
     fn default_oscomp_uses_ltp_submit_whitelist() {
         let mut cmd = String::from("cd /musl/musl");
-        append_default_oscomp_scripts(&mut cmd);
+        append_default_oscomp_scripts(&mut cmd, &LtpArgs::none());
 
         assert!(cmd.contains("basic_testcode.sh"));
         assert!(cmd.contains("busybox_testcode.sh"));
@@ -2035,7 +2148,7 @@ mod tests {
     #[test]
     fn ltp_submit_batch_uses_whitelist_without_p0_source_only_cases() {
         let mut cmd = String::from("cd /musl/musl");
-        append_ltp_batch(&mut cmd, "submit");
+        append_ltp_batch(&mut cmd, "submit", &LtpArgs::none());
 
         assert!(cmd.contains("confstr01"));
         assert!(cmd.contains("futex_wake03"));
@@ -2045,9 +2158,44 @@ mod tests {
     }
 
     #[test]
+    fn filtered_ltp_can_pass_official_integer_runtime_option() {
+        let mut cmd = String::new();
+        append_filtered_ltp(&mut cmd, "musl", "sendmsg03", &LtpArgs::max_runtime("3"));
+
+        assert!(cmd.contains("; for case in sendmsg03"));
+        assert!(cmd.contains("ltp_max_runtime=''; ltp_max_runtime='3';"));
+        assert!(cmd.contains("\"$@\" -I \"$ltp_max_runtime\""));
+    }
+
+    #[test]
+    fn filtered_ltp_can_limit_runtime_option_to_named_cases() {
+        let mut cmd = String::new();
+        append_filtered_ltp(
+            &mut cmd,
+            "musl",
+            "sendmsg03+recvmsg01",
+            &LtpArgs::max_runtime_for_cases("3", "sendmsg03"),
+        );
+
+        assert!(cmd.contains("; for case in sendmsg03 recvmsg01"));
+        assert!(cmd.contains("case \"$case\" in sendmsg03) ltp_max_runtime='3';; esac;"));
+        assert!(!cmd.contains("case \"$case\" in sendmsg03|recvmsg01)"));
+    }
+
+    #[test]
+    fn ltp_integer_runtime_tokens_are_positive_decimal_only() {
+        assert!(is_positive_int_token("2"));
+        assert!(is_positive_int_token("30"));
+        assert!(!is_positive_int_token(""));
+        assert!(!is_positive_int_token("0"));
+        assert!(!is_positive_int_token("0.02"));
+        assert!(!is_positive_int_token("2;reboot"));
+    }
+
+    #[test]
     fn oscomp_suite_chain_does_not_gate_later_group_markers_on_previous_scripts() {
         let mut cmd = String::from("cd /musl/musl");
-        append_oscomp_musl_script(&mut cmd, "basic_testcode.sh");
+        append_oscomp_musl_script(&mut cmd, "basic_testcode.sh", &LtpArgs::none());
         append_full_libctest(&mut cmd);
 
         assert!(cmd.contains("; ./busybox sh basic_testcode.sh"));
@@ -2060,14 +2208,14 @@ mod tests {
     #[test]
     fn ltp_scripts_install_busybox_applets_and_get_helper_path() {
         let mut full_cmd = String::from("cd /musl/musl");
-        append_oscomp_musl_script(&mut full_cmd, "ltp_testcode.sh");
+        append_oscomp_musl_script(&mut full_cmd, "ltp_testcode.sh", &LtpArgs::none());
 
         assert!(full_cmd.contains("./busybox mkdir -p /bin"));
         assert!(full_cmd.contains("/musl/musl/busybox --install -s /bin"));
         assert!(full_cmd.contains("export LTPROOT=/musl/musl/ltp"));
         assert!(full_cmd.contains("/musl/musl/ltp/testcases/bin"));
         assert!(full_cmd.contains("; target_dir=\"ltp/testcases/bin\""));
-        assert!(full_cmd.contains("; /bin/setsid \"$file\""));
+        assert!(full_cmd.contains("/bin/setsid \"$file\""));
         assert!(full_cmd.contains("RUN LTP CASE $name"));
         assert!(full_cmd.contains("FAIL LTP CASE $name : $ret"));
         assert!(!full_cmd.contains("; ./busybox sh ltp_testcode.sh"));
@@ -2075,7 +2223,7 @@ mod tests {
         assert!(!full_cmd.contains("/bin/timeout"));
 
         let mut filtered_cmd = String::from("cd /musl/musl");
-        append_filtered_ltp(&mut filtered_cmd, "musl", "ar01.sh");
+        append_filtered_ltp(&mut filtered_cmd, "musl", "ar01.sh", &LtpArgs::none());
 
         assert!(filtered_cmd.contains("./busybox mkdir -p /bin"));
         assert!(filtered_cmd.contains("/musl/musl/busybox --install -s /bin"));

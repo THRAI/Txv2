@@ -11,6 +11,9 @@ pub(super) fn connect_sockaddr_for_local_stack(
         KernelSockAddr::V4(sockaddr) if sockaddr.addr == Ipv4Address::UNSPECIFIED => {
             KernelSockAddr::V4(SockAddrIn::new(sockaddr.port, Ipv4Address::LOOPBACK))
         }
+        KernelSockAddr::V6(sockaddr) if sockaddr.addr == Ipv6Address::UNSPECIFIED => {
+            KernelSockAddr::V6(SockAddrIn6::new(sockaddr.port, Ipv6Address::LOOPBACK))
+        }
         _ => remote,
     }
 }
@@ -22,24 +25,28 @@ pub(super) fn maybe_autobind_connect_client(
     if socket.kind != SocketKind::Tcp && socket.kind != SocketKind::Udp {
         return Ok(());
     }
+    if matches!(remote, KernelSockAddr::Unspec) {
+        return Ok(());
+    }
 
     let remote_endpoint = remote.as_ip_endpoint();
-    let local_addr = if remote_endpoint.addr == Ipv4Address::LOOPBACK
-        || remote_endpoint.addr == Ipv4Address::UNSPECIFIED
-    {
-        Ipv4Address::LOOPBACK
+    let local_endpoint_base = if remote_endpoint.is_loopback() || remote_endpoint.is_unspecified() {
+        IpEndpoint::loopback_for_family(remote_endpoint.family, 0)
     } else {
-        Ipv4Address::UNSPECIFIED
+        IpEndpoint::unspecified_for_family(remote_endpoint.family, 0)
     };
 
     for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
-        let local_endpoint = IpEndpoint::new(local_addr, port);
+        let local_endpoint = IpEndpoint::from_ip(local_endpoint_base.ip_addr(), port);
+        if ephemeral_port_in_use(socket, port) {
+            continue;
+        }
         if socket.kind == SocketKind::Tcp
             && tcp_connect_tuple_in_use(socket, local_endpoint, remote_endpoint)
         {
             continue;
         }
-        let local = KernelSockAddr::V4(SockAddrIn::new(port, local_addr));
+        let local = sockaddr_from_endpoint(local_endpoint);
         let outcome = {
             let guard = tx_substrate::epoch::guard();
             step_bind(socket, local, &guard)
@@ -90,14 +97,19 @@ pub(super) fn maybe_autobind_udp_sendto(
         return Ok(());
     }
 
-    let local_addr = if dst.is_some_and(|endpoint| endpoint.addr == Ipv4Address::LOOPBACK) {
-        Ipv4Address::LOOPBACK
+    let family = dst
+        .map(|endpoint| endpoint.family)
+        .or_else(|| socket.acquire_operational().map(|payload| payload.family()))
+        .unwrap_or(socket.family);
+    let local_endpoint_base = if dst.is_some_and(|endpoint| endpoint.is_loopback()) {
+        IpEndpoint::loopback_for_family(family, 0)
     } else {
-        Ipv4Address::UNSPECIFIED
+        IpEndpoint::unspecified_for_family(family, 0)
     };
 
     for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
-        let local = KernelSockAddr::V4(SockAddrIn::new(port, local_addr));
+        let local =
+            sockaddr_from_endpoint(IpEndpoint::from_ip(local_endpoint_base.ip_addr(), port));
         let outcome = {
             let guard = tx_substrate::epoch::guard();
             step_bind(socket, local, &guard)
@@ -151,7 +163,7 @@ pub(super) fn bind_with_ephemeral_port(
         if ephemeral_port_in_use(socket, port) {
             continue;
         }
-        let local = KernelSockAddr::V4(SockAddrIn::new(port, requested.addr));
+        let local = sockaddr_from_endpoint(IpEndpoint::from_ip(requested.ip_addr(), port));
         let outcome = {
             let guard = tx_substrate::epoch::guard();
             step_bind(socket, local, &guard)
@@ -174,6 +186,7 @@ pub(super) fn ephemeral_port_in_use(socket: &Cap<SocketIdentity>, port: u16) -> 
     };
     let table = payload.socket_table();
     let guard = tx_substrate::epoch::guard();
+    let family = payload.family();
 
     match socket.kind {
         SocketKind::Tcp => table
@@ -181,18 +194,39 @@ pub(super) fn ephemeral_port_in_use(socket: &Cap<SocketIdentity>, port: u16) -> 
             .into_iter()
             .chain(table.snapshot_tcp_listeners(&guard))
             .any(|existing| {
-                existing.raw() != socket.raw()
-                    && socket_local_endpoint(&existing).is_ok_and(|local| local.port == port)
+                existing.raw() != socket.raw() && occupies_tcp_port(&existing, family, port)
             }),
         SocketKind::Udp => table
             .snapshot_udp_bound(&guard)
             .into_iter()
             .any(|existing| {
                 existing.raw() != socket.raw()
-                    && socket_local_endpoint(&existing).is_ok_and(|local| local.port == port)
+                    && socket_local_endpoint(&existing)
+                        .is_ok_and(|local| local.family == family && local.port == port)
             }),
         _ => false,
     }
+}
+
+fn occupies_tcp_port(socket: &Cap<SocketIdentity>, family: AddressFamily, port: u16) -> bool {
+    let Ok(local) = socket_local_endpoint(socket) else {
+        return false;
+    };
+    if local.port != port {
+        return false;
+    }
+    if local.family == family {
+        return true;
+    }
+    if family != AddressFamily::Inet
+        || local.family != AddressFamily::Inet6
+        || !local.is_unspecified()
+    {
+        return false;
+    }
+    socket
+        .acquire_operational()
+        .is_some_and(|payload| !payload.with_options(|options| options.ip.ipv6_v6only))
 }
 
 pub(super) fn drive_tcp_loopback_after_sendto(socket: &Cap<SocketIdentity>, written: usize) {
@@ -309,18 +343,18 @@ pub(super) fn sendto_can_drive_loopback_inline(
         return false;
     };
     match payload.protocol_snapshot() {
-        SocketProtocol::Udp(UdpInner::Bound { local }) => dst.is_some_and(|dst| {
-            local_allows_loopback_inline(local) && dst.addr == Ipv4Address::LOOPBACK
-        }),
+        SocketProtocol::Udp(UdpInner::Bound { local }) => {
+            dst.is_some_and(|dst| local_allows_loopback_inline(local) && dst.is_loopback())
+        }
         SocketProtocol::Udp(UdpInner::Connected { local, remote }) => {
-            local_allows_loopback_inline(local) && remote.addr == Ipv4Address::LOOPBACK
+            local_allows_loopback_inline(local) && remote.is_loopback()
         }
         _ => false,
     }
 }
 
 pub(super) fn local_allows_loopback_inline(local: IpEndpoint) -> bool {
-    local.addr == Ipv4Address::UNSPECIFIED || local.addr == Ipv4Address::LOOPBACK
+    local.is_unspecified() || local.is_loopback()
 }
 
 pub(super) fn tcp_effective_maxseg(socket: &Cap<SocketIdentity>) -> i32 {
@@ -339,13 +373,20 @@ pub(super) fn tcp_effective_maxseg(socket: &Cap<SocketIdentity>) -> i32 {
 
 pub(super) fn tcp_route_maxseg(socket: &Cap<SocketIdentity>) -> u16 {
     let mtu = match socket_peer_endpoint(socket) {
-        Ok(peer) if peer.addr == Ipv4Address::LOOPBACK => loopback_iface().mtu(),
+        Ok(peer) if peer.is_loopback() => loopback_iface().mtu(),
         _ => match socket_local_endpoint(socket) {
-            Ok(local) if local.addr == Ipv4Address::LOOPBACK => loopback_iface().mtu(),
+            Ok(local) if local.is_loopback() => loopback_iface().mtu(),
             _ => VIRTIO_NET_DEFAULT_MTU,
         },
     };
     mtu.saturating_sub(IPV4_TCP_HEADER_BYTES).max(1)
+}
+
+fn sockaddr_from_endpoint(endpoint: IpEndpoint) -> KernelSockAddr {
+    match endpoint.family {
+        AddressFamily::Inet6 => KernelSockAddr::V6(SockAddrIn6::new(endpoint.port, endpoint.addr6)),
+        _ => KernelSockAddr::V4(SockAddrIn::new(endpoint.port, endpoint.addr)),
+    }
 }
 
 pub(super) fn resolve_socket_fd<'a>(
@@ -424,19 +465,42 @@ pub(super) fn read_sockaddr_in<'a>(
     if sockaddr_len > i32::MAX as u64 {
         return Err(Errno::EINVAL);
     }
-    if sockaddr_len < SOCKADDR_IN_BYTES as u64 {
+    if sockaddr_len < 2 {
         return Err(Errno::EINVAL);
     }
 
-    let mut bytes = [0u8; SOCKADDR_IN_BYTES as usize];
-    bootstrap_copy_from_user(&ctx.aspace, &mut bytes, sockaddr_ptr)?;
+    let copy_len = core::cmp::min(sockaddr_len, SOCKADDR_IN6_BYTES as u64) as usize;
+    let mut bytes = [0u8; SOCKADDR_IN6_BYTES as usize];
+    bootstrap_copy_from_user(&ctx.aspace, &mut bytes[..copy_len], sockaddr_ptr)?;
     let family = u16::from_le_bytes([bytes[0], bytes[1]]);
-    if family != AF_INET {
-        return Err(Errno::EAFNOSUPPORT);
+    match family {
+        AF_INET => {
+            if sockaddr_len < SOCKADDR_IN_BYTES as u64 {
+                return Err(Errno::EINVAL);
+            }
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let addr = Ipv4Address::new([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            Ok(KernelSockAddr::V4(SockAddrIn::new(port, addr)))
+        }
+        AF_INET6 => {
+            if sockaddr_len < SOCKADDR_IN6_BYTES as u64 {
+                return Err(Errno::EINVAL);
+            }
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let flowinfo = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+            let addr = Ipv6Address::new(bytes[8..24].try_into().unwrap());
+            let scope_id = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+            Ok(KernelSockAddr::V6(SockAddrIn6 {
+                family,
+                port,
+                flowinfo,
+                addr,
+                scope_id,
+            }))
+        }
+        0 => Ok(KernelSockAddr::Unspec),
+        _ => Err(Errno::EAFNOSUPPORT),
     }
-    let port = u16::from_be_bytes([bytes[2], bytes[3]]);
-    let addr = Ipv4Address::new([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    Ok(KernelSockAddr::V4(SockAddrIn::new(port, addr)))
 }
 
 pub(super) fn read_sockaddr_un_path<'a>(
@@ -784,16 +848,24 @@ pub(super) fn write_sockaddr_into_msghdr<'a>(
     if header.name == 0 {
         return Ok(());
     }
-    write_msghdr_namelen(ctx, msghdr_ptr, SOCKADDR_IN_BYTES)?;
-    if header.namelen < SOCKADDR_IN_BYTES {
-        return Err(Errno::EINVAL);
+    match endpoint.family {
+        AddressFamily::Inet6 => {
+            write_msghdr_namelen(ctx, msghdr_ptr, SOCKADDR_IN6_BYTES)?;
+            if header.namelen < SOCKADDR_IN6_BYTES {
+                return Err(Errno::EINVAL);
+            }
+            let bytes = sockaddr_in6_bytes(endpoint);
+            bootstrap_copy_to_user(&ctx.aspace, header.name, &bytes)
+        }
+        _ => {
+            write_msghdr_namelen(ctx, msghdr_ptr, SOCKADDR_IN_BYTES)?;
+            if header.namelen < SOCKADDR_IN_BYTES {
+                return Err(Errno::EINVAL);
+            }
+            let bytes = sockaddr_in_bytes(endpoint);
+            bootstrap_copy_to_user(&ctx.aspace, header.name, &bytes)
+        }
     }
-
-    let mut bytes = [0u8; SOCKADDR_IN_BYTES as usize];
-    bytes[0..2].copy_from_slice(&AF_INET.to_le_bytes());
-    bytes[2..4].copy_from_slice(&endpoint.port.to_be_bytes());
-    bytes[4..8].copy_from_slice(&endpoint.addr.octets());
-    bootstrap_copy_to_user(&ctx.aspace, header.name, &bytes)
 }
 
 pub(super) fn write_sockaddr_nl_into_msghdr<'a>(
@@ -951,20 +1023,43 @@ pub(super) fn write_sockaddr_endpoint<'a>(
         return Err(Errno::EFAULT);
     }
 
+    let out_len = if endpoint.family == AddressFamily::Inet6 {
+        SOCKADDR_IN6_BYTES
+    } else {
+        SOCKADDR_IN_BYTES
+    };
     let len: u32 = bootstrap_read_user(&ctx.aspace, sockaddr_len_ptr)?;
-    bootstrap_write_user(&ctx.aspace, sockaddr_len_ptr, SOCKADDR_IN_BYTES)?;
+    bootstrap_write_user(&ctx.aspace, sockaddr_len_ptr, out_len)?;
     if invalid_socklen(len) {
         return Err(Errno::EINVAL);
     }
-    if len < SOCKADDR_IN_BYTES {
+    if len < out_len {
         return Err(Errno::EINVAL);
     }
 
+    if endpoint.family == AddressFamily::Inet6 {
+        let bytes = sockaddr_in6_bytes(endpoint);
+        bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes)
+    } else {
+        let bytes = sockaddr_in_bytes(endpoint);
+        bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes)
+    }
+}
+
+fn sockaddr_in_bytes(endpoint: IpEndpoint) -> [u8; SOCKADDR_IN_BYTES as usize] {
     let mut bytes = [0u8; SOCKADDR_IN_BYTES as usize];
     bytes[0..2].copy_from_slice(&AF_INET.to_le_bytes());
     bytes[2..4].copy_from_slice(&endpoint.port.to_be_bytes());
     bytes[4..8].copy_from_slice(&endpoint.addr.octets());
-    bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes)
+    bytes
+}
+
+fn sockaddr_in6_bytes(endpoint: IpEndpoint) -> [u8; SOCKADDR_IN6_BYTES as usize] {
+    let mut bytes = [0u8; SOCKADDR_IN6_BYTES as usize];
+    bytes[0..2].copy_from_slice(&AF_INET6.to_le_bytes());
+    bytes[2..4].copy_from_slice(&endpoint.port.to_be_bytes());
+    bytes[8..24].copy_from_slice(&endpoint.addr6.octets());
+    bytes
 }
 
 pub(super) fn socket_local_endpoint(socket: &Cap<SocketIdentity>) -> Result<IpEndpoint, Errno> {
@@ -981,13 +1076,13 @@ pub(super) fn socket_local_endpoint(socket: &Cap<SocketIdentity>) -> Result<IpEn
             0,
         )),
         SocketProtocol::Tcp(TcpState::Init) | SocketProtocol::Udp(UdpInner::Unbound) => {
-            Ok(IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0))
+            Ok(IpEndpoint::unspecified_for_family(payload.family(), 0))
         }
         SocketProtocol::UnixDatagram(_)
         | SocketProtocol::UnixStream(_)
         | SocketProtocol::NetlinkRoute(_)
         | SocketProtocol::NetlinkNetfilter(_)
-        | SocketProtocol::Packet(_) => Ok(IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0)),
+        | SocketProtocol::Packet(_) => Ok(IpEndpoint::unspecified_for_family(payload.family(), 0)),
         SocketProtocol::Tcp(TcpState::Closed) | SocketProtocol::Udp(UdpInner::Closed) => {
             Err(Errno::ENOTCONN)
         }

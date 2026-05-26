@@ -57,6 +57,10 @@ pub const NR_FADVISE64: u64 = 223;
 /// v1 stub: returns 0 (success, no-op) — real priority
 /// inheritance deferred to the scheduler slice.
 pub const NR_SCHED_SETSCHEDULER: u64 = 119;
+/// `sched_yield()`. Linux generic ABI `__NR_sched_yield = 124`.
+/// LTP's fuzzy-sync helpers rely on this on single-CPU guests to hand
+/// execution to the peer racing thread.
+pub const NR_SCHED_YIELD: u64 = 124;
 /// `ppoll(fds, nfds, tmo_p, sigmask)`. Linux generic ABI
 /// `__NR_ppoll`. busybox sh's interactive read loop polls stdin
 /// before reading. The v1 implementation is a minimal stub: walk
@@ -313,6 +317,7 @@ pub const NR_SENDMMSG: u64 = 269;
 
 pub const AF_UNIX: u16 = 1;
 pub const AF_INET: u16 = 2;
+pub const AF_INET6: u16 = 10;
 pub const AF_NETLINK: u16 = 16;
 pub const AF_PACKET: u16 = 17;
 pub const NETLINK_ROUTE: i32 = 0;
@@ -326,8 +331,13 @@ pub const IPPROTO_IP: i32 = 0;
 pub const IPPROTO_ICMP: i32 = 1;
 pub const IPPROTO_TCP: i32 = 6;
 pub const IPPROTO_UDP: i32 = 17;
+pub const IPPROTO_IPV6: i32 = 41;
 pub const IPPROTO_UDPLITE: i32 = 136;
+pub const SOL_IPV6: i32 = 41;
+pub const IPV6_ADDRFORM: i32 = 1;
+pub const IPV6_V6ONLY: i32 = 26;
 pub const IP_RECVERR: i32 = 11;
+pub const IP_HDRINCL: i32 = 3;
 pub const MCAST_JOIN_GROUP: i32 = 42;
 pub const MCAST_LEAVE_GROUP: i32 = 45;
 pub const SO_REUSEADDR: i32 = 2;
@@ -349,6 +359,7 @@ pub const SO_SNDTIMEO: i32 = 21;
 pub const PACKET_RX_RING: i32 = 5;
 pub const PACKET_VERSION: i32 = 10;
 pub const PACKET_RESERVE: i32 = 12;
+pub const PACKET_VNET_HDR: i32 = 15;
 pub const TPACKET_V1: i32 = 0;
 pub const TPACKET_V2: i32 = 1;
 pub const TPACKET_V3: i32 = 2;
@@ -413,12 +424,14 @@ pub const CLONE_DETACHED: u64 = 0x400000;
 /// System-V semaphore undo on exit; musl sets this in pthread_create.
 pub const CLONE_SYSVSEM: u64 = 0x40000;
 /// Namespace flags. `CLONE_NEWIPC` is wired to the process nsproxy
-/// clone path; `CLONE_NEWNET` is wired to network namespace syscalls.
+/// clone path; `CLONE_NEWUSER` and `CLONE_NEWNET` are wired to
+/// namespace syscalls.
 /// The others are still silently accepted by pthread_create
 /// compatibility paths and remain namespace stubs.
 pub const CLONE_NEWCGROUP: u64 = 0x2000000;
 pub const CLONE_NEWUTS: u64 = 0x4000000;
 pub const CLONE_NEWIPC: u64 = 0x8000000;
+pub const CLONE_NEWUSER: u64 = 0x1000_0000;
 /// `CLONE_NEWNET` — create or join a network namespace via
 /// `unshare(2)` / `setns(2)`.
 pub const CLONE_NEWNET: u64 = 0x4000_0000;
@@ -1058,6 +1071,10 @@ pub const TIOCNOTTY: u32 = 0x5422;
 pub const SIOCGIFFLAGS: u32 = 0x8913;
 /// `SIOCSIFFLAGS = 0x8914` — write `struct ifreq.ifr_flags`.
 pub const SIOCSIFFLAGS: u32 = 0x8914;
+/// `SIOCGIFMTU = 0x8921` — read `struct ifreq.ifr_mtu`.
+pub const SIOCGIFMTU: u32 = 0x8921;
+/// `SIOCSIFMTU = 0x8922` — write `struct ifreq.ifr_mtu`.
+pub const SIOCSIFMTU: u32 = 0x8922;
 /// `SIOCGIFINDEX = 0x8933` — resolve `struct ifreq.ifr_name` to ifindex.
 pub const SIOCGIFINDEX: u32 = 0x8933;
 /// `SIOCGIFTXQLEN = 0x8942` — query `struct ifreq.ifr_qlen`.

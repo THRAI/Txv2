@@ -8,13 +8,16 @@ use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMute
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload};
-use tx_subsystems::vfs::FsObjectId;
+use tx_subsystems::vfs::{FsObjectId, FsOps};
 
 static STAT_META_OVERRIDES: SpinMutex<BTreeMap<FsObjectId, InodeMeta>> =
     SpinMutex::new(BTreeMap::new());
 
 static FCNTL_RECORD_LOCKS: SpinMutex<BTreeMap<FsObjectId, Vec<RecordLock>>> =
     SpinMutex::new(BTreeMap::new());
+
+static PROCFS_PROJECTED_MOUNT: SpinMutex<Option<Cap<tx_subsystems::mount::MountPayload>>> =
+    SpinMutex::new(None);
 
 pub(super) fn record_stat_meta_override(fs_object_id: FsObjectId, meta: InodeMeta) {
     STAT_META_OVERRIDES.lock().insert(fs_object_id, meta);
@@ -59,6 +62,61 @@ fn ensure_fd_room_under_limit<'a>(ctx: &SyscallCtx<'a>) -> Result<(), SyscallRes
     } else {
         Ok(())
     }
+}
+
+fn proc_self_userns_file_id(path: &[u8], pid: Pid) -> Option<FsObjectId> {
+    match path {
+        b"/proc/self/uid_map" => Some(tx_fs::procfs::pid_uid_map_id(pid)),
+        b"/proc/self/gid_map" => Some(tx_fs::procfs::pid_gid_map_id(pid)),
+        b"/proc/self/setgroups" => Some(tx_fs::procfs::pid_setgroups_id(pid)),
+        _ => None,
+    }
+}
+
+fn open_procfs_projected_file(
+    fs_object_id: FsObjectId,
+    flags: OpenFileFlags,
+) -> Result<Cap<OpenFile>, SyscallResult> {
+    let procfs = tx_fs::procfs::Procfs::new();
+    let mount = procfs_projected_mount()?;
+
+    let guard = step_engine::guard();
+    let meta = match procfs.load_inode_meta(fs_object_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        StepOutcome::Err(errno) => return Err(SyscallResult::error_from(errno)),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+            return Err(SyscallResult::Error(EIO_VALUE));
+        }
+    };
+    let rnode = match procfs.materialise_rnode(fs_object_id, meta, &mount, &guard) {
+        StepOutcome::Done(rnode) => rnode,
+        StepOutcome::Err(errno) => return Err(SyscallResult::error_from(errno)),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+            return Err(SyscallResult::Error(EIO_VALUE));
+        }
+    };
+    OpenFile::new_cap(rnode, flags).map_err(|_| SyscallResult::Error(ENOMEM_VALUE))
+}
+
+fn procfs_projected_mount() -> Result<Cap<tx_subsystems::mount::MountPayload>, SyscallResult> {
+    let mut cached = PROCFS_PROJECTED_MOUNT.lock();
+    if let Some(mount) = cached.as_ref() {
+        return Ok(mount.clone());
+    }
+
+    let mount = tx_subsystems::mount::MountPayload::new_cap(
+        tx_fs::procfs::Procfs::fs_ops_arc(),
+        alloc::sync::Arc::new(tx_fs::procfs::Procfs::new())
+            as alloc::sync::Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
+        None,
+        tx_subsystems::mount::allocate_dev_id(),
+        tx_subsystems::mount::MountOptions::default(),
+        "proc",
+        tx_subsystems::mount::SourceLabel::Static("proc"),
+    )
+    .map_err(|_| SyscallResult::Error(ENOMEM_VALUE))?;
+    *cached = Some(mount.clone());
+    Ok(mount)
 }
 
 fn allocate_fd_at_least_under_limit<'a>(
@@ -504,6 +562,28 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         cloexec: want_cloexec,
         nonblocking: flags & O_NONBLOCK != 0,
     };
+
+    if let Some(fs_object_id) = proc_self_userns_file_id(path.as_slice(), ctx.process.pid) {
+        if want_directory {
+            return SyscallResult::Error(ENOTDIR_VALUE);
+        }
+        if want_create && want_excl {
+            return SyscallResult::Error(EEXIST_VALUE);
+        }
+        let openfile = match open_procfs_projected_file(fs_object_id, open_flags) {
+            Ok(file) => file,
+            Err(result) => return result,
+        };
+        let fd = match allocate_fd_under_limit(ctx) {
+            Ok(fd) => fd,
+            Err(err) => return err,
+        };
+        let _ = ctx.process.set_fd(fd, Some(openfile));
+        if want_cloexec {
+            ctx.process.set_fd_cloexec(fd, true);
+        }
+        return SyscallResult::Return(fd as i64);
+    }
 
     if path.as_slice() == b"/proc/self/ns/net" && !want_create && !want_trunc {
         if want_directory {
@@ -1320,6 +1400,18 @@ fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>) -> Syscal
     let Some(netns) = ctx.process.net_namespace() else {
         return SyscallResult::Error(ESRCH_VALUE);
     };
+    let require_net_admin = || {
+        if let Some(owner) = netns.owner_user_namespace() {
+            let current = ctx.process.nsproxy_cap().ok_or(Errno::ESRCH)?;
+            tx_subsystems::net::require_net_admin_in_user_namespace(
+                ctx.cred(),
+                &current.user_ns,
+                &owner,
+            )
+        } else {
+            tx_subsystems::net::require_net_admin(ctx.cred())
+        }
+    };
     let link = netns
         .link_snapshot()
         .into_iter()
@@ -1348,7 +1440,7 @@ fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>) -> Syscal
             let Some(link) = link else {
                 return SyscallResult::Error(ENODEV_VALUE);
             };
-            let auth = match tx_subsystems::net::require_net_admin(ctx.cred()) {
+            let auth = match require_net_admin() {
                 Ok(auth) => auth,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
@@ -1357,6 +1449,36 @@ fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>) -> Syscal
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
             match netns.set_device_up_by_ifindex(auth, link.ifindex, requested & IFF_UP != 0) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        SIOCGIFMTU => {
+            let Some(link) = link else {
+                return SyscallResult::Error(ENODEV_VALUE);
+            };
+            let mtu = i32::from(link.mtu);
+            match bootstrap_write_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET, mtu) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        SIOCSIFMTU => {
+            let Some(link) = link else {
+                return SyscallResult::Error(ENODEV_VALUE);
+            };
+            let auth = match require_net_admin() {
+                Ok(auth) => auth,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let requested: i32 = match bootstrap_read_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET) {
+                Ok(mtu) => mtu,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let Ok(requested) = u16::try_from(requested) else {
+                return SyscallResult::Error(EINVAL_VALUE);
+            };
+            match netns.set_device_mtu_by_ifindex(auth, link.ifindex, requested) {
                 Ok(()) => SyscallResult::Return(0),
                 Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }

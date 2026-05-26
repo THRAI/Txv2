@@ -520,6 +520,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_PSELECT6 || nr == NR_PSELECT6_TIME64 => {
             sys_pselect6::<P>(req.args, ctx).await
         }
+        nr if nr == NR_SCHED_YIELD => sys_sched_yield().await,
         nr if nr == NR_EXIT => sys_exit(req.args, ctx),
         nr if nr == NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
         nr if nr == NR_BRK => sys_brk(req.args, ctx).await,
@@ -941,6 +942,15 @@ fn sys_sched_setscheduler<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
 ///   expedited plus instruction-fetch barrier (`fence.i` on RV64).
 /// - `MEMBARRIER_CMD_REGISTER_*` — registration is a no-op; always
 ///   returns 0.
+/// `sched_yield()` — cooperatively yield the current reactor task once.
+///
+/// This is not an immediate no-op: user-space race harnesses such as LTP
+/// fuzzy-sync use it to let the peer pthread run on single-CPU guests.
+async fn sys_sched_yield() -> SyscallResult {
+    tx_reactor::yield_now().await;
+    SyscallResult::Return(0)
+}
+
 ///
 /// `flags` and `cpu_id` are currently ignored (must be 0).
 fn sys_membarrier<P: SmpIf>(args: &[u64; 6]) -> SyscallResult {

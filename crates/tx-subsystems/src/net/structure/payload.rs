@@ -19,8 +19,8 @@ use super::super::protocol::{
 use super::identity::SocketIdentity;
 use super::multicast::{Ipv4MulticastGroup, Ipv4MulticastMemberships};
 use super::types::{
-    IpEndpoint, Ipv4Address, PacketSocketState, ProtocolNumber, RawIcmpState, SockAddrLl,
-    SockShutdownCmd, SocketKind, SocketOptionSet, TcpState, UdpInner, UnixSocketPath,
+    AddressFamily, IpEndpoint, Ipv4Address, PacketSocketState, ProtocolNumber, RawIcmpState,
+    SockAddrLl, SockShutdownCmd, SocketKind, SocketOptionSet, TcpState, UdpInner, UnixSocketPath,
 };
 
 pub type SocketOperationalEvidence = PayloadCap<SocketPayload>;
@@ -29,6 +29,7 @@ pub const TCP_BACKLOG_RETRANSMIT_LIMIT_STAGING: u8 = 3;
 pub const TCP_BACKLOG_RETRANSMIT_BACKOFF_MILLIS: i64 = 1_000;
 
 pub struct SocketPayload {
+    pub(crate) family: SpinMutex<AddressFamily>,
     pub(crate) net_namespace: PayloadCap<NetNamespacePayload>,
     pub(crate) protocol: SpinMutex<SocketProtocol>,
     pub(crate) options: SpinMutex<SocketOptionSet>,
@@ -53,6 +54,20 @@ impl SocketPayload {
 
     pub fn new_in_namespace(
         kind: SocketKind,
+        options: SocketOptionSet,
+        net_namespace: PayloadCap<NetNamespacePayload>,
+    ) -> Self {
+        Self::new_in_namespace_with_family(
+            kind,
+            default_family_for_kind(kind),
+            options,
+            net_namespace,
+        )
+    }
+
+    pub fn new_in_namespace_with_family(
+        kind: SocketKind,
+        family: AddressFamily,
         options: SocketOptionSet,
         net_namespace: PayloadCap<NetNamespacePayload>,
     ) -> Self {
@@ -139,6 +154,7 @@ impl SocketPayload {
             ),
         };
         let payload = Self {
+            family: SpinMutex::new(family),
             net_namespace,
             protocol: SpinMutex::new(protocol),
             options: SpinMutex::new(options),
@@ -157,6 +173,14 @@ impl SocketPayload {
         };
         payload.refresh_io_from_raw();
         payload
+    }
+
+    pub fn family(&self) -> AddressFamily {
+        *self.family.lock()
+    }
+
+    pub fn set_family(&self, family: AddressFamily) {
+        *self.family.lock() = family;
     }
 
     pub fn net_namespace(&self) -> PayloadCap<NetNamespacePayload> {
@@ -241,6 +265,12 @@ impl SocketPayload {
     pub fn set_packet_reserve(&self, reserve: u32) -> Result<(), crate::execution::Errno> {
         self.with_protocol_mut(|socket_protocol| match socket_protocol {
             SocketProtocol::Packet(state) => {
+                if state
+                    .packet_rx_ring_block_size
+                    .is_some_and(|block_size| reserve > block_size)
+                {
+                    return false;
+                }
                 state.packet_reserve = reserve;
                 true
             }
@@ -248,6 +278,40 @@ impl SocketPayload {
         })
         .then_some(())
         .ok_or(crate::execution::Errno::EINVAL)
+    }
+
+    pub fn set_packet_rx_ring_block_size(
+        &self,
+        block_size: Option<u32>,
+    ) -> Result<(), crate::execution::Errno> {
+        self.with_protocol_mut(|socket_protocol| match socket_protocol {
+            SocketProtocol::Packet(state) => {
+                state.packet_rx_ring_block_size = block_size;
+                true
+            }
+            _ => false,
+        })
+        .then_some(())
+        .ok_or(crate::execution::Errno::EINVAL)
+    }
+
+    pub fn set_packet_vnet_hdr(&self, enabled: bool) -> Result<(), crate::execution::Errno> {
+        self.with_protocol_mut(|socket_protocol| match socket_protocol {
+            SocketProtocol::Packet(state) => {
+                state.packet_vnet_hdr = enabled;
+                true
+            }
+            _ => false,
+        })
+        .then_some(())
+        .ok_or(crate::execution::Errno::EINVAL)
+    }
+
+    pub fn packet_vnet_hdr(&self) -> Result<bool, crate::execution::Errno> {
+        match self.protocol_snapshot() {
+            SocketProtocol::Packet(state) => Ok(state.packet_vnet_hdr),
+            _ => Err(crate::execution::Errno::EINVAL),
+        }
     }
 
     pub fn packet_reserve(&self) -> Result<u32, crate::execution::Errno> {
@@ -318,6 +382,15 @@ impl SocketPayload {
 
     pub fn raw_tcp_socket(&self) -> Option<&RawTcpSocket> {
         self.raw_tcp.as_ref()
+    }
+
+    pub fn reset_raw_tcp_socket(&self) -> Result<(), crate::execution::Errno> {
+        let Some(raw_tcp) = self.raw_tcp.as_ref() else {
+            return Err(crate::execution::Errno::EOPNOTSUPP);
+        };
+        self.with_options(|options| raw_tcp.reset(options));
+        self.refresh_io_from_raw();
+        Ok(())
     }
 
     pub fn tcp_recv_closed_by_peer(&self) -> bool {
@@ -838,6 +911,15 @@ impl SocketPayload {
         let mut io = self.io.lock();
         io.recv_len = recv_len;
         io.send_space = send_space;
+    }
+}
+
+const fn default_family_for_kind(kind: SocketKind) -> AddressFamily {
+    match kind {
+        SocketKind::UnixDatagram | SocketKind::UnixStream => AddressFamily::Unix,
+        SocketKind::Tcp | SocketKind::Udp | SocketKind::RawIcmp => AddressFamily::Inet,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter => AddressFamily::Netlink,
+        SocketKind::Packet => AddressFamily::Packet,
     }
 }
 

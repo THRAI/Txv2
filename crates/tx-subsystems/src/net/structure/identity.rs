@@ -6,7 +6,7 @@ use crate::wait_source;
 
 use super::payload::{SocketOperationalEvidence, SocketPayload};
 use super::readiness::{new_urgent_port, SocketReadiness};
-use super::types::SocketKind;
+use super::types::{AddressFamily, SocketKind};
 
 pub struct SocketWaitCarriers {
     pub recv: u64,
@@ -17,6 +17,7 @@ pub struct SocketWaitCarriers {
 
 pub struct SocketIdentity {
     pub kind: SocketKind,
+    pub family: AddressFamily,
     pub readiness: SocketReadiness,
     pub wait_carriers: SocketWaitCarriers,
     pub urgent_port: RawPort,
@@ -25,12 +26,17 @@ pub struct SocketIdentity {
 
 impl SocketIdentity {
     pub fn new(kind: SocketKind) -> Self {
+        Self::new_with_family(kind, default_family_for_kind(kind))
+    }
+
+    pub fn new_with_family(kind: SocketKind, family: AddressFamily) -> Self {
         let readiness = SocketReadiness::new();
         let urgent_port = new_urgent_port();
         let wait_carriers = SocketWaitCarriers::register(&readiness, &urgent_port);
 
         Self {
             kind,
+            family,
             readiness,
             wait_carriers,
             urgent_port,
@@ -64,6 +70,15 @@ impl SocketIdentity {
     ) -> R {
         let payload = self.payload.lock();
         f(payload.as_ref().map(|payload| &**payload))
+    }
+}
+
+const fn default_family_for_kind(kind: SocketKind) -> AddressFamily {
+    match kind {
+        SocketKind::UnixDatagram | SocketKind::UnixStream => AddressFamily::Unix,
+        SocketKind::Tcp | SocketKind::Udp | SocketKind::RawIcmp => AddressFamily::Inet,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter => AddressFamily::Netlink,
+        SocketKind::Packet => AddressFamily::Packet,
     }
 }
 

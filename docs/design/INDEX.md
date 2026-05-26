@@ -22,7 +22,7 @@ The architectural vocabulary every other doc references. Read these first.
 - [`CI_REPORTING_v1.md`](00_meta-framework/CI_REPORTING_v1.md) — CI output shape, design-reference tags, required gates, and future boot-sentinel reporting contract.
 - [`OBJECT_PATTERN_AUDIT_v1.md`](00_meta-framework/OBJECT_PATTERN_AUDIT_v1.md) — implementation cleanup audit of existing objects against the identity/payload, binding, filesystem-instance, service, and static carve-out patterns.
 - [`OBJECT_PATTERN_FIXES_v1.md`](00_meta-framework/OBJECT_PATTERN_FIXES_v1.md) — detailed `OPA-*` violation analysis, proposed fixes, TTY session/pgrp repair, and PidNamespace/PidStruct design recommendation.
-- [`NAMESPACE_VIEW_v1.md`](00_meta-framework/NAMESPACE_VIEW_v1.md) — nsproxy and namespace-view architecture: lens bundle, pid-name resolution, syscall commits, projected RNodes, and blast radius.
+- [`NAMESPACE_VIEW_v1.md`](00_meta-framework/NAMESPACE_VIEW_v1.md) — nsproxy and namespace-view architecture: lens bundle, user-namespace authority, pid-name resolution, syscall commits, projected RNodes, and blast radius.
 
 Noncanonical source-trace notes:
 

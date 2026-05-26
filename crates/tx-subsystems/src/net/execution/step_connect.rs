@@ -8,8 +8,8 @@ use crate::net::structure::registry;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
     AcceptWireSet, ConnectionKey, IpEndpoint, Ipv4Address, KernelSockAddr, SendWireSet,
-    SocketAcceptEntry, SocketIdentity, SocketKind, SocketProtocol, TcpState, UdpInner,
-    UnixDatagramState, UnixSocketPath, UnixStreamState,
+    SocketAcceptEntry, SocketIdentity, SocketKind, SocketOperationalEvidence, SocketProtocol,
+    TcpState, UdpInner, UnixDatagramState, UnixSocketPath, UnixStreamState,
 };
 
 pub fn step_connect(
@@ -22,12 +22,16 @@ pub fn step_connect(
     // reserve
     // commit
     // publish
+    let Some(payload) = socket.acquire_operational() else {
+        return StepOutcome::Err(Errno::ENOTCONN);
+    };
+    if matches!(remote, KernelSockAddr::Unspec) {
+        return step_connect_unspec(socket, &payload, guard);
+    }
+
     let witness = match require_socket_connect_target(socket, remote, guard) {
         Ok(witness) => witness,
         Err(errno) => return StepOutcome::Err(errno),
-    };
-    let Some(payload) = socket.acquire_operational() else {
-        return StepOutcome::Err(Errno::ENOTCONN);
     };
     debug_assert_eq!(witness.identity.raw(), socket.raw());
 
@@ -103,6 +107,40 @@ pub fn step_connect(
         net_delegate_kick_poll();
         StepOutcome::Done(())
     }
+}
+
+fn step_connect_unspec(
+    socket: &Cap<SocketIdentity>,
+    payload: &SocketOperationalEvidence,
+    _guard: &Guard<'_>,
+) -> StepOutcome<()> {
+    if socket.kind != SocketKind::Tcp {
+        return StepOutcome::Err(Errno::EAFNOSUPPORT);
+    }
+
+    let (local, remote) = match payload.protocol_snapshot() {
+        SocketProtocol::Tcp(TcpState::Connected { local, remote }) => (local, remote),
+        SocketProtocol::Tcp(TcpState::Connecting { local, remote }) => (local, remote),
+        SocketProtocol::Tcp(_) => return StepOutcome::Err(Errno::EINVAL),
+        _ => return StepOutcome::Err(Errno::EAFNOSUPPORT),
+    };
+
+    let table = payload.socket_table();
+    let _ = table.withdraw_tcp_connection(ConnectionKey::new(local, remote));
+    let _ = table.withdraw_tcp_connection(ConnectionKey::new(remote, local));
+    if let Err(errno) = payload.reset_raw_tcp_socket() {
+        return StepOutcome::Err(errno);
+    }
+    payload.with_protocol_mut(|protocol| {
+        *protocol = SocketProtocol::Tcp(TcpState::Init);
+    });
+    socket
+        .readiness
+        .clear_send(SendWireSet::SPACE | SendWireSet::BROKEN);
+    socket
+        .readiness
+        .clear_recv(crate::net::structure::RecvWireSet::HAS_DATA);
+    StepOutcome::Done(())
 }
 
 fn step_unix_connect(
@@ -311,8 +349,8 @@ fn udp_table_error_to_errno(error: tx_substrate::index::IndexError) -> Errno {
 }
 
 fn select_tcp_connect_local(local: IpEndpoint, remote: IpEndpoint) -> IpEndpoint {
-    if local.addr == Ipv4Address::UNSPECIFIED && remote.addr == Ipv4Address::LOOPBACK {
-        IpEndpoint::new(Ipv4Address::LOOPBACK, local.port)
+    if local.is_unspecified() && remote.is_loopback() {
+        IpEndpoint::loopback_for_family(remote.family, local.port)
     } else {
         local
     }

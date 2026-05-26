@@ -89,6 +89,68 @@ fn tcp_loopback_default_steps_use_persistent_loopback_iface() {
 }
 
 #[test]
+fn tcp_loopback_ipv4_client_reaches_inet6_wildcard_listener() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    let guard = tx_substrate::epoch::guard();
+    let server_port = 41_180;
+    let client_port = 51_180;
+
+    let listener = registry::create_socket_in_namespace_with_family(
+        SocketKind::Tcp,
+        AddressFamily::Inet6,
+        SocketOptionSet::default_tcp(),
+        crate::net::namespace::initial_net_namespace_payload(),
+    )
+    .expect("inet6 listener");
+    assert_eq!(
+        step_bind(&listener, any_inet6(server_port), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(step_listen(&listener, 8, &guard), StepOutcome::Done(()));
+
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("inet client");
+    assert_eq!(
+        step_bind(&client, inet(client_port), &guard),
+        StepOutcome::Done(())
+    );
+    assert!(matches!(
+        step_connect(&client, inet(server_port), &guard),
+        StepOutcome::Yield {
+            shape: YieldShape::OnWaitSource { .. },
+            ..
+        }
+    ));
+
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let accepted = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted,
+        _ => panic!("unexpected accept outcome"),
+    };
+
+    assert_eq!(accepted.local, endpoint(server_port));
+    assert_eq!(accepted.peer, endpoint(client_port));
+    assert_eq!(
+        accepted
+            .child
+            .acquire_operational()
+            .expect("accepted child payload")
+            .family(),
+        AddressFamily::Inet6
+    );
+}
+
+#[test]
 fn tcp_loopback_transfer_moves_large_write_within_one_budgeted_step() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK

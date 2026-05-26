@@ -86,18 +86,7 @@ impl RawTcpSocket {
     pub fn new(options: &SocketOptionSet) -> Self {
         let recv_capacity = options.socket.recv_buf_size;
         let send_capacity = options.socket.send_buf_size;
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; recv_capacity]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; send_capacity]);
-        let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-
-        socket.set_nagle_enabled(!options.tcp.nodelay);
-        socket.set_ack_delay(None);
-        if options.socket.keep_alive {
-            socket.set_keep_alive(Some(Duration::from_secs(options.tcp.keepidle as u64)));
-        }
-        if options.ip.ttl != 0 {
-            socket.set_hop_limit(Some(options.ip.ttl));
-        }
+        let socket = new_smoltcp_tcp_socket(recv_capacity, send_capacity, options);
 
         Self {
             socket: SpinMutex::new(Box::new(socket)),
@@ -370,6 +359,19 @@ impl RawTcpSocket {
         self.socket.lock().abort();
     }
 
+    pub fn reset(&self, options: &SocketOptionSet) {
+        *self.socket.lock() = Box::new(new_smoltcp_tcp_socket(
+            self.recv_capacity,
+            self.send_capacity,
+            options,
+        ));
+        *self.protocol_state.lock() = RawTcpProtocolState::default();
+        *self.last_syn_ack.lock() = None;
+        self.rx_buffer.lock().clear();
+        self.tx_buffer.lock().clear();
+        self.corked_tx.lock().clear();
+    }
+
     pub fn mark_recv_closed_by_peer(&self) {
         self.protocol_state.lock().is_recv_shut = true;
     }
@@ -517,6 +519,26 @@ impl RawTcpSocket {
             *self.last_syn_ack.lock() = Some(segment.clone());
         }
     }
+}
+
+fn new_smoltcp_tcp_socket(
+    recv_capacity: usize,
+    send_capacity: usize,
+    options: &SocketOptionSet,
+) -> tcp::Socket<'static> {
+    let rx_buf = tcp::SocketBuffer::new(vec![0u8; recv_capacity]);
+    let tx_buf = tcp::SocketBuffer::new(vec![0u8; send_capacity]);
+    let mut socket = tcp::Socket::new(rx_buf, tx_buf);
+
+    socket.set_nagle_enabled(!options.tcp.nodelay);
+    socket.set_ack_delay(None);
+    if options.socket.keep_alive {
+        socket.set_keep_alive(Some(Duration::from_secs(options.tcp.keepidle as u64)));
+    }
+    if options.ip.ttl != 0 {
+        socket.set_hop_limit(Some(options.ip.ttl));
+    }
+    socket
 }
 
 impl SmoltcpTcpSegment {

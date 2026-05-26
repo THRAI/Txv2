@@ -5,8 +5,8 @@ use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_bind_target;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
-    IpEndpoint, Ipv4Address, KernelSockAddr, SocketIdentity, SocketKind, SocketProtocol, TcpState,
-    UdpInner, UnixDatagramState, UnixStreamState,
+    IpEndpoint, KernelSockAddr, SocketIdentity, SocketKind, SocketProtocol, TcpState, UdpInner,
+    UnixDatagramState, UnixStreamState,
 };
 
 pub fn step_bind(
@@ -43,6 +43,7 @@ pub fn step_bind(
         return StepOutcome::Err(table_error_to_errno(error));
     }
 
+    let mut raw_icmp_wrong_family = false;
     let bound = payload.with_protocol_mut(|protocol| match protocol {
         SocketProtocol::UnixDatagram(UnixDatagramState::Unbound) => {
             if let KernelSockAddr::Unix(local) = witness.addr {
@@ -73,11 +74,18 @@ pub fn step_bind(
             true
         }
         SocketProtocol::RawIcmp(state) if state.bound_local.is_none() => {
+            if witness.local.family != crate::net::structure::AddressFamily::Inet {
+                raw_icmp_wrong_family = true;
+                return false;
+            }
             state.bound_local = Some(witness.local.addr);
             true
         }
         _ => false,
     });
+    if raw_icmp_wrong_family {
+        return StepOutcome::Err(Errno::EAFNOSUPPORT);
+    }
     if bound {
         StepOutcome::Done(())
     } else {
@@ -109,19 +117,21 @@ fn tcp_bind_conflict(
         }
     }
 
-    if local.addr == Ipv4Address::UNSPECIFIED {
+    if local.is_unspecified() {
         for existing in table.snapshot_tcp_bound(guard) {
             if existing.raw() == socket.raw() {
                 continue;
             }
-            if tcp_socket_local(&existing).is_some_and(|endpoint| endpoint.port == local.port) {
+            if tcp_socket_local(&existing)
+                .is_some_and(|endpoint| endpoint.same_family(local) && endpoint.port == local.port)
+            {
                 return Some(existing);
             }
         }
         return None;
     }
 
-    let wildcard = IpEndpoint::new(Ipv4Address::UNSPECIFIED, local.port);
+    let wildcard = IpEndpoint::unspecified_for_family(local.family, local.port);
     table
         .lookup_tcp_bound(wildcard, guard)
         .filter(|existing| existing.raw() != socket.raw())
@@ -172,19 +182,21 @@ fn udp_bind_conflict(
         }
     }
 
-    if local.addr == Ipv4Address::UNSPECIFIED {
+    if local.is_unspecified() {
         for existing in table.snapshot_udp_bound(guard) {
             if existing.raw() == socket.raw() {
                 continue;
             }
-            if udp_socket_local(&existing).is_some_and(|endpoint| endpoint.port == local.port) {
+            if udp_socket_local(&existing)
+                .is_some_and(|endpoint| endpoint.same_family(local) && endpoint.port == local.port)
+            {
                 return Some(existing);
             }
         }
         return None;
     }
 
-    let wildcard = IpEndpoint::new(Ipv4Address::UNSPECIFIED, local.port);
+    let wildcard = IpEndpoint::unspecified_for_family(local.family, local.port);
     table
         .lookup_udp_bound_exact(wildcard, guard)
         .filter(|existing| existing.raw() != socket.raw())

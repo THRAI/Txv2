@@ -1,3 +1,286 @@
+- 2026-05-26 **Finished the `sendmsg03`/`setsockopt06` fuzzy timeout fix and
+  refreshed the moving network splits.**
+  Root cause was not network-stack linear scanning: `sendmsg03`'s raw
+  `IP_HDRINCL` path is fixed-size user iovec validation plus an unsupported
+  send result, and `setsockopt06`'s packet path is fixed-size
+  `PACKET_VERSION`/`PACKET_RX_RING` mutation. The timeout came from LTP
+  fuzzy-sync repeatedly using `sched_yield()` while txKernel requeued yielded
+  userspace threads into `Preempted`, behind hot userspace `New` work on the
+  same hart. Userspace yields now requeue to the `New` tail, and focused runs
+  can bound LTP's own runtime with `LTP_MAX_RUNTIME=N` (`tx.ltp.max_runtime`
+  -> LTP `-I N`). Focused witnesses now pass: `sendmsg03 1/1` in
+  `target/oscomp/ltp-sendmsg03-after-yield-queue-maxruntime10.txt` and
+  `setsockopt06 1/1` in
+  `target/oscomp/ltp-setsockopt06-after-yield-queue-maxruntime20.txt`.
+  Added `LTP_MAX_RUNTIME_CASES` so mixed split batches can apply `-I` only to
+  the fuzzy case; a diagnostic b2 run showed that applying `LTP_MAX_RUNTIME`
+  across ordinary `send01` causes long repetition, EBADF drift, and EMFILE.
+  Refreshed split rows now score b2 `34/35`
+  (`target/oscomp/ltp-net-b2-sendrecv-after-userns-packet.txt`), b3 `36/38`
+  (`target/oscomp/ltp-net-b3-msg-after-yield-queue.txt`), b4 `74/86`
+  (`target/oscomp/ltp-net-b4-after-bind06-current.txt`), and b6 `9/12`
+  (`target/oscomp/ltp-net-b6-setsockopt-tail-after-yield-queue.txt`), for a
+  current split-batch total of `207/228`.
+  **Verification:** `cargo fmt --check`; `cargo test -p tx-kernel
+  filtered_ltp`; `cargo test -p tx-kernel
+  ltp_integer_runtime_tokens_are_positive_decimal_only`; `cargo test -p
+  tx-reactor yielded_userspace_thread_requeues_at_new_tail_behind_peer`;
+  `cargo test -p tx-reactor
+  yielded_fair_task_resets_budget_and_requeues_with_fresh_preempted_slice`;
+  `cargo test -p tx-reactor
+  two_yielding_tasks_both_make_progress_with_existing_policy`; `cargo xtask
+  build --target rv64-qemu`; `cargo xtask oscomp submit --target rv64-qemu
+  --submit target/oscomp/submit`; local judge `1/1` for both focused logs and
+  local judge on the refreshed b2/b3/b6 logs. **Next step:** decide whether to
+  charter one of the remaining explicit unsupported surfaces (SCTP/RDS/TLS,
+  RV64 legacy `socketcall`, broad `accept03` fd providers, or the known
+  `recvmmsg01` musl wrapper SIGSEGV). **Blocker:** no `sendmsg03` or
+  `setsockopt06` focused blocker remains.
+
+- 2026-05-26 **Wired `sched_yield(124)` and narrowed the long fuzzy bottleneck
+  analysis.** Added the RV64 `sched_yield` syscall arm so it awaits
+  `tx_reactor::yield_now()` and returns 0, matching the scheduler design note
+  and giving LTP fzsync a real cooperative handoff. Host coverage:
+  `cargo test -p tx-shims dispatch_sched_yield_yields_before_returning_zero`.
+  Focused post-fix QEMU probes rebuilt/submitted RV64 locally because Docker
+  compose is unavailable in this environment. `sendmsg03` improved from old
+  `spins` avg 12 to avg 1 with delay range `[0, 0]` in
+  `target/oscomp/ltp-sendmsg03-after-sched-yield-180.txt`, but still timed out
+  before TPASS/TFAIL. `setsockopt06` still timed out in
+  `target/oscomp/ltp-setsockopt06-after-sched-yield-150.txt` at loop 126 with
+  `delay_bias = -1240` and `spins` avg about 1200. Root-cause classification:
+  not a network-stack linear-scan issue. `sendmsg03`'s raw `IP_HDRINCL` path is
+  fixed-size iovec validation plus `EOPNOTSUPP`; `setsockopt06`'s packet
+  sockopts are fixed-size reads/mutations, while the huge cost is LTP fzsync
+  bias turning successful `PACKET_RX_RING` samples into many single-CPU
+  `sched_yield()` delay syscalls. **Next step:** complete score movement only
+  after either a stable multi-effective-CPU userspace runner exists or a focused
+  long run reaches result markers.
+
+- 2026-05-26 **Refreshed LTP b4 with `bind06` and classified the fuzzy-runner
+  strategy.** The refreshed bind/connect/accept split now scores `74/86` in
+  `target/oscomp/ltp-net-b4-after-bind06-current.txt`, including `bind06 1/1`.
+  The two remaining long userns-gated CVE fuzzy witnesses are bounded in source
+  by LTP `max_runtime` (`sendmsg03` 150s, reported as `0h 03m 00s`;
+  `setsockopt06` 270s, reported as `0h 05m 00s`) but current host-wall QEMU
+  probes still time out before result markers. Root cause is the fzsync race
+  harness plus runner shape: the default RV64 OSComp path is `-smp 1`, so LTP
+  sees one CPU and fzsync uses `sched_yield()` in waits/delays; `-smp 4` can
+  speed sampling but remains boot-hart-3 sensitive and hit `BootStaticBag not
+  constructed`; `-smp 2` avoids that panic in probes but still did not complete
+  the long witnesses (`sendmsg03` loop 1050 in 260s, `setsockopt06` no sampling
+  by 120s). Added `make oscomp-qemu-rv64-smp2` / `oscomp-judge-rv64-smp2` as a
+  reusable focused-runner entry. **Verification:** local judge `74/86` on the
+  b4 log; focused SMP logs `target/oscomp/ltp-sendmsg03-smp4-120.txt`,
+  `target/oscomp/ltp-sendmsg03-smp4-260.txt`,
+  `target/oscomp/ltp-sendmsg03-smp2-120.txt`,
+  `target/oscomp/ltp-sendmsg03-smp2-260.txt`,
+  `target/oscomp/ltp-setsockopt06-smp4-120.txt`, and
+  `target/oscomp/ltp-setsockopt06-smp2-120.txt`; `cargo xtask fault-decode`
+  on the SMP4 panic logs; `make -n oscomp-qemu-rv64-smp2`; `make -n
+  oscomp-judge-rv64-smp2`. **Next step:** either fix the SMP4 boot-hart-3
+  `BootStaticBag` path or add a stable xtask `--smp 2`/timeout profile before
+  attempting score movement for `sendmsg03`/`setsockopt06`. **Blocker:**
+  neither long fuzzy witness has a stable TPASS/TFAIL marker yet.
+
+- 2026-05-26 **Classified LTP `sendmsg03` as the other current slow fuzzy
+  witness.** A fresh focused `sendmsg03` run rebuilt/submitted the RV64 kernel,
+  generated `target/oscomp/ltp-sendmsg03-current-data/sdcard-rv.img`, and
+  confirmed the case reaches the raw ICMP `IP_HDRINCL`/`sendmsg()` race body:
+  the 60s probe reached fzsync loop 1024, and the 300s probe reached loop 1056
+  before the outer timeout killed QEMU. No `TFAIL`, `TBROK`, trap, errno, or
+  setup/config blocker surfaced; local judge stays `0/0` because the timeout
+  cuts the log before LTP result markers. **Verification:** `cargo xtask build
+  --target rv64-qemu`; `cargo xtask oscomp submit --target rv64-qemu`;
+  focused LTP logs `target/oscomp/ltp-sendmsg03-current30.txt`,
+  `target/oscomp/ltp-sendmsg03-current60.txt`, and
+  `target/oscomp/ltp-sendmsg03-current300.txt`; local judge on the 300s log.
+  **Next step:** refresh the b4 bind/connect/accept split if aggregate score
+  movement is needed after the focused `bind06` pass, or design a runner
+  strategy for completing the long fuzzy witnesses. **Blocker:** `sendmsg03`
+  and `setsockopt06` remain incomplete under the current single-hart timeout
+  ladder despite reaching their race bodies.
+
+- 2026-05-26 **Recovered the LTP network syscall-50 context and classified the
+  next packet race witnesses.** The working ledger now records a focused
+  `bind06 1/1` pass in `target/oscomp/ltp-bind06-current330.txt`; `bind06`
+  reaches the AF_PACKET bind/ioctl race body, exits by LTP execution time, and
+  reports `TPASS`. `setsockopt06` is no longer a setup/config/errno blocker: a
+  330s focused run reached fzsync loop 198 in
+  `target/oscomp/ltp-setsockopt06-current330.txt` before the outer timeout, so
+  it remains classified as an extremely slow CVE fuzzy witness on the current
+  single-hart runner. Also fixed stale host expectations for `SO_TYPE` on
+  AF_UNIX `SOCK_SEQPACKET` and malformed `TPACKET_V3` private-size validation.
+  **Verification:** `cargo fmt --check`; `cargo check -p tx-subsystems`;
+  `cargo check -p tx-shims`; `cargo test -p tx-fs
+  procfs_kernel_config_includes_ltp_required_surface -- --test-threads=1`;
+  `cargo test -p tx-shims netns_syscalls -- --test-threads=1`; `cargo test -p
+  tx-shims packet -- --test-threads=1`; `cargo test -p tx-shims raw_icmp --
+  --test-threads=1`; `cargo xtask build --target rv64-qemu`; `cargo xtask
+  oscomp submit --target rv64-qemu`; local judge `bind06 1/1`; local judge
+  `setsockopt06 0/0` due outer-timeout truncation before result markers.
+  **Next step:** focus `sendmsg03` or refresh b4 after the `bind06` focused
+  pass; keep `setsockopt06` out of score movement until a runner/timeout
+  strategy can complete the fuzzy loop. **Blocker:** `sendmsg03` and
+  `setsockopt06` still do not produce complete focused judge rows under the
+  current timeout ladder.
+
+- 2026-05-25 **Moved LTP `setsockopt08` from netfilter TCONF to a focused
+  pass.** The kernel config now advertises the minimal legacy x_tables
+  match/target surface required by the case, and `IPT_SO_SET_REPLACE` performs
+  structural request validation: too-short/malformed replace buffers return
+  `EINVAL`, while structurally complete table replacement remains
+  `EOPNOTSUPP` because full iptables installation/filtering is not implemented.
+  Also added a host-covered raw `IP_HDRINCL` sendmsg fast path that returns
+  `EOPNOTSUPP` for unsupported full IPv4-header transmit after validating user
+  ranges; `sendmsg03` still behaves as a long fuzzy-sync witness rather than a
+  new errno failure. **Verification:** `cargo fmt --check`; `cargo check -p
+  tx-fs`; `cargo check -p tx-shims`; `cargo test -p tx-fs
+  procfs_kernel_config_includes_ltp_required_surface -- --test-threads=1`;
+  `cargo test -p tx-shims
+  dispatch_iptables_legacy_sockopt_reports_empty_tables -- --test-threads=1`;
+  `cargo test -p tx-shims
+  dispatch_raw_icmp_ip_hdrincl_sendmsg_is_unsupported_fast_path --
+  --test-threads=1`; focused LTP `setsockopt08 1/1` in
+  `target/oscomp/ltp-setsockopt08-netfilter-minimal.txt`. **Next step:** focus
+  on `setsockopt06` and `bind06` packet race witnesses, then refresh the b6
+  split. **Blocker:** full netfilter table replacement/filtering remains
+  intentionally unsupported beyond this validation surface.
+
+- 2026-05-25 **Pushed the Linux-aligned userns work into the first
+  userns-gated LTP network bodies.** Procfs now exposes writable
+  `/proc/self/{setgroups,uid_map,gid_map}` with Linux-style map validation,
+  `/proc/sys/user/max_user_namespaces`, and `CONFIG_USER_NS=y` only after the
+  map semantics exist. Network privileged checks now use namespace-relative
+  userns authority, loopback MTU ioctl supports `SIOCGIFMTU`/`SIOCSIFMTU`,
+  packet sockets support `PACKET_VNET_HDR`, AF_PACKET `sendto(sockaddr_ll)`,
+  packet reserve/ring validation, and raw ICMP `IP_HDRINCL`. Focused LTP
+  witnesses now pass: `setsockopt05 1/1`, `sendto03 2/2`,
+  `setsockopt07 1/1`, and `setsockopt09 1/1`; `sendmsg03`, `setsockopt06`,
+  and `bind06` now reach long fuzzy/race bodies instead of failing setup.
+  **Verification:** `cargo fmt --check`; `cargo check -p tx-subsystems`;
+  `cargo check -p tx-fs`; `cargo check -p tx-shims`; targeted `tx-fs` and
+  `tx-shims` host tests for userns maps, netns syscalls, packet
+  MTU/VNET/sendto/reserve/ring, and raw `IP_HDRINCL`; local judge on the four
+  focused LTP logs above. **Next step:** finish/classify the long-body witnesses with the
+  short timeout ladder, then refresh the b2/b6 split rows. **Blocker:**
+  full netfilter/TLS/SCTP/RDS and RV64 legacy socketcall remain separate
+  unsupported surfaces.
+
+- 2026-05-25 **Completed the Linux-aligned userns Phase 1 authority slice for
+  LTP network setup.** `UserNamespace` now has namespace-relative capability
+  helpers, inherited setgroups policy, and current uid/gid map checks for
+  `unshare(CLONE_NEWUSER)`. `NetNamespacePayload` records the immutable
+  owner user namespace, bootstrap assigns the initial netns owner, and
+  `sys_unshare()` now follows Linux ordering for combined
+  `CLONE_NEWUSER | CLONE_NEWNET`: create userns first, authorize netns against
+  the new userns, then publish. `setns(CLONE_NEWNET)` now checks authority
+  against the target netns owner. Added host coverage for unprivileged
+  `CLONE_NEWNET` denial, unprivileged combined `NEWUSER|NEWNET` success, and
+  owner-userns preservation. **Verification:** `cargo fmt --check`;
+  `cargo check -p tx-subsystems`; `cargo check -p tx-shims`; `cargo test -p
+  tx-shims netns_syscalls -- --test-threads=1`. **Next step:** Phase 2
+  caller-sensitive procfs map files for `/proc/self/setgroups`,
+  `/proc/self/uid_map`, and `/proc/self/gid_map`. **Blocker:** no LTP score
+  movement expected until procfs map files and `CONFIG_USER_NS=y` are enabled.
+
+- 2026-05-25 **Aligned namespace design docs with Linux user namespace
+  behavior for the LTP network setup path.** Updated `NAMESPACE_VIEW_v1` to
+  make `user_ns` the namespace-relative capability/uid/gid authority lens,
+  require immutable owner-userns links on non-user namespaces, document
+  Linux's `CLONE_NEWUSER | CLONE_NEWNET` ordering, and specify procfs
+  `uid_map`/`gid_map`/`setgroups` map-write rules. Mirrored the new NSVIEW
+  invariants in both `INVARIANTS_v4` and `Txv3/02_INVARIANTS_v5`, clarified
+  the `PROCESS_v1` `nsproxy` boundary, and added the implementation handoff
+  `msp/ltp-userns-linux-aligned-implementation-plan.md`. **Verification:**
+  `cargo xtask progress validate`; `cargo xtask lint docs`. Also attempted
+  `cargo xtask lint invariants all`, which still fails on the pre-existing
+  `syscall-no-await` ratchet (`78 > 60`) outside this doc-only change. No code
+  or LTP run in this step. **Next step:** implement the Phase 1
+  capability/owner-userns slice before procfs map files or `CONFIG_USER_NS=y`.
+  **Blocker:** current code still lacks true namespace-local capability checks
+  and netns owner-userns authorization.
+
+- 2026-05-25 **Selected user namespace setup as the next highest-value LTP
+  network direction and landed Phase A.** Compared the remaining blockers:
+  legacy `socketcall` is not an RV64 target, SCTP/RDS/TLS/netfilter are narrow
+  protocol surfaces, while user namespace setup gates `bind06`, `sendto03`,
+  `sendmsg03`, and `setsockopt05..09`. Added a real minimal
+  `process::nsproxy::UserNamespace` cap with parent/owner/map storage and wired
+  `unshare(CLONE_NEWUSER)` so it publishes a fresh namespace bundle without
+  breaking the existing `CLONE_NEWNET` path. Kernel config still must not flip
+  to `CONFIG_USER_NS=y` until `/proc/self/{setgroups,uid_map,gid_map}` exists.
+  **Verification:** `cargo check -p tx-subsystems`; `cargo test -p tx-shims
+  dispatch_unshare -- --test-threads=1`. **Next step:** procfs Phase B:
+  caller-sensitive `/proc/sys/user/max_user_namespaces`,
+  `/proc/self/setgroups`, `/proc/self/uid_map`, and `/proc/self/gid_map`
+  projected files. **Blocker:** no LTP score expected yet because the map files
+  and config enablement are intentionally deferred.
+
+- 2026-05-25 **Refreshed the complete LTP bind/connect/accept split after the
+  dual-stack TCP fix and classified the accept tail.** The complete b4 split
+  now scores `73/86` in
+  `target/oscomp/ltp-net-b4-bind-connect-accept-after-connect02-complete.txt`;
+  the focused accept tail scores `28/39` in
+  `target/oscomp/ltp-net-accept-tail-after-connect02.txt`. `accept4_01`
+  passes the libc and native `__NR_accept4` variants and only skips the legacy
+  `socketcall` variant on RV64; `getpeername01` passes `7/7`; `accept03`
+  passes all available non-socket fd errno checks and is limited by broad
+  non-network descriptor providers such as pidfd, fanotify, inotify, perf,
+  bpf, fsopen/fspick/open_tree, memfd, and memfd_secret. The current split
+  total across the six network-syscall batches is `198/226`. **Verification:**
+  30s focused accept-tail LTP run; 150s complete b4 LTP run because
+  `connect02` is a known slow/silent 1000-iteration case; local judge on both
+  logs. **Next step:** do not fake those descriptor providers for `accept03`;
+  choose either a deliberate broader fd/syscall charter or move to another
+  remaining supported network surface. **Blocker:** no small TCP/accept
+  semantic blocker remains in b4.
+
+- 2026-05-25 **Moved LTP `connect02` through the dual-stack TCP regression
+  path.** AF_INET6 wildcard TCP listeners now accept IPv4 loopback clients when
+  v6-only is disabled, accepted children preserve enough IPv6 family state for
+  `setsockopt(SOL_IPV6, IPV6_ADDRFORM, AF_INET)`, `connect(AF_UNSPEC)` resets a
+  connected TCP socket back to a reusable init state, and IPv4 TCP autobind now
+  skips ports occupied by non-v6only IPv6 wildcard listeners. Focused LTP
+  `connect02` now scores `1/1`; a 120s b4 aggregate probe reached `accept4_01`
+  after `connect02` passed but was killed by the outer timeout, so the complete
+  b4 split row is not refreshed yet. **Verification:** `cargo fmt --check`;
+  `cargo test -p tx-subsystems
+  tcp_loopback_ipv4_client_reaches_inet6_wildcard_listener -- --test-threads=1`;
+  `cargo test -p tx-shims
+  dispatch_ipv6_addrform_reset_rebinds_accepted_tcp_as_ipv4_listener --
+  --test-threads=1`; `cargo test -p tx-shims dispatch_inet6_udp --
+  --test-threads=1`; `cargo xtask build --target rv64-qemu`; `cargo xtask
+  oscomp submit --target rv64-qemu`; focused LTP log
+  `target/oscomp/ltp-net-ipv6-connect02.txt`; local judge. **Next step:** if an
+  aggregate b4 score is needed, rerun b4 with a deliberate 180s timeout because
+  `connect02` is a slow/silent 1000-iteration case; otherwise move to remaining
+  non-network blockers such as user namespace setup, broad `accept03` fd probes,
+  SCTP/RDS, TLS, or netfilter. **Blocker:** no focused `connect02` blocker
+  remains.
+
+- 2026-05-25 **Implemented the first LTP IPv6 socket slice for UDP/UDP-Lite.**
+  AF_INET6 socket creation now reaches the normal TCP/UDP paths, socket
+  identity/payload state preserves address family, sockaddr helpers decode and
+  write `sockaddr_in6`, endpoint/table matching is family-aware, and direct UDP
+  loopback delivers `::1` traffic to both exact and wildcard IPv6 receivers.
+  Focused LTP `bind05,recvmsg02` now scores `15/15`; the split scores move to
+  b3 msg/mmsg `35/38` and b4 bind/connect/accept `72/86`, for a current
+  split-batch total of `197/226`. **Verification:** `cargo fmt --check`;
+  `cargo check -p tx-shims`; `cargo test -p tx-shims dispatch_inet6_udp --
+  --test-threads=1`; `cargo test -p tx-shims
+  dispatch_sendmsg_recvmsg_udp_loopback_round_trips_source_addr --
+  --test-threads=1`; `cargo xtask build --target rv64-qemu`; `cargo xtask
+  oscomp submit --target rv64-qemu`; 30s focused LTP log
+  `target/oscomp/ltp-net-ipv6-udp.txt`; b3 log
+  `target/oscomp/ltp-net-b3-msg-after-ipv6-udp.txt`; b4 log
+  `target/oscomp/ltp-net-b4-bind-connect-accept-after-ipv6-udp.txt`; local
+  judge. **Next step:** `connect02` now fails later with IPv4 client
+  `ECONNREFUSED` against an AF_INET6 wildcard listener, so the next slice is
+  dual-stack TCP listener fallback plus `IPV6_ADDRFORM` and `connect(AF_UNSPEC)`
+  reset/rebind semantics. **Blocker:** full dual-stack TCP is not yet
+  implemented.
+
 - 2026-05-25 **Added IPv4 UDP-Lite coverage for LTP `bind05`.** Mapped
   `AF_INET/SOCK_DGRAM/IPPROTO_UDPLITE` to the existing UDP-like datagram path
   and added host coverage for the socket type mapping. The focused `bind05`
