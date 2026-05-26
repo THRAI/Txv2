@@ -17,8 +17,9 @@ inner loop; OSComp + LTP are the correctness bar. When a syscall lands,
 record which specific OSComp/LTP test(s) closed it under "Currently
 passing" below.
 
-**Last refresh:** 2026-05-26 (mechanical syscall status refreshed after
-scoped `fsopen` / `fspick` / `open_tree` fd-provider dispatch).
+**Last refresh:** 2026-05-27 (mechanical syscall status refreshed after
+making the existing `pselect6_time64(413)` dispatch path visible to the
+status parser).
 
 ## Headline counts
 
@@ -30,8 +31,8 @@ _Counts read from `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}`._
 _Run `cargo xtask syscall-status --regen` to refresh; `--check` to lint in CI._
 
 - **`NR_*` defined:** 204
-- **Dispatched (has a match arm):** 202
-- **Defined but not dispatched:** 2 — see list below
+- **Dispatched (has a match arm):** 203
+- **Defined but not dispatched:** 1 — see list below
 
 #### Defined but not dispatched
 
@@ -40,7 +41,6 @@ These syscalls have a `pub const NR_*` in `numbers.rs` but no match arm in `disp
 | `NR_*` | # | Summary |
 |---|---:|---|
 | `NR_PIDFD_SEND_SIGNAL` | 424 | `pidfd_send_signal(pidfd, sig, info, flags)` — Linux RV64. |
-| `NR_PSELECT6_TIME64` | 413 | `pselect6_time64(...)`. Linux generic ABI `__NR_pselect6_time64 = 413`. |
 
 <!-- END AUTOGEN: syscall-table -->
 
@@ -263,18 +263,17 @@ overwritten by the next `sync`. The lint variant
 ### Counts (from dispatch table)
 
 - `pub const NR_*` in numbers.rs: **204**
-- dispatched in mod.rs: **201** (of which async: 62, likely-stub: 0)
-- defined but not dispatched: **3**
+- dispatched in mod.rs: **202** (of which async: 63, likely-stub: 0)
+- defined but not dispatched: **2**
 
-### Defined in `numbers.rs` but no dispatch arm (3)
+### Defined in `numbers.rs` but no dispatch arm (2)
 
 These have a syscall number constant but no match arm in `mod.rs`. Either wire them up or remove the constant.
 
 - `NR_IO_URING_ENTER` (nr=426)
 - `NR_PIDFD_SEND_SIGNAL` (nr=424)
-- `NR_PSELECT6` (nr=72)
 
-### Dispatched syscalls (201) — name → handler
+### Dispatched syscalls (202) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -327,6 +326,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 69 | `NR_PREADV` | `sys_preadv` | async |
 | 70 | `NR_PWRITEV` | `sys_pwritev` | async |
 | 71 | `NR_SENDFILE64` | `sys_sendfile64` | async |
+| 72 | `NR_PSELECT6` | `sys_pselect6` | async |
 | 73 | `NR_PPOLL` | `sys_ppoll` | async |
 | 74 | `NR_SIGNALFD4` | `sys_signalfd4` | sync |
 | 76 | `NR_SPLICE` | `sys_splice` | sync |

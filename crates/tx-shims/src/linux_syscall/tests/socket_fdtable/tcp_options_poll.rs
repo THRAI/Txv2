@@ -1677,6 +1677,50 @@ fn dispatch_pselect_udp_write_ready_with_readfds_pointer() {
 }
 
 #[test]
+fn dispatch_pselect_time64_udp_write_ready_uses_pselect6_path() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let remote = sockaddr_in([127, 0, 0, 1], 49_161);
+
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                fd as u64,
+                remote.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut writefds = 1u64 << fd;
+    let mut timeout = [0u64, 0u64];
+    assert_eq!(
+        socket_req(
+            NR_PSELECT6_TIME64,
+            [
+                fd as u64 + 1,
+                0,
+                &mut writefds as *mut u64 as u64,
+                0,
+                timeout.as_mut_ptr() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(1)
+    );
+    assert_eq!(writefds, 1u64 << fd);
+}
+
+#[test]
 fn dispatch_ppoll_udp_reports_write_ready_when_read_is_also_requested() {
     let _setup = socket_setup();
     loopback_iface().clear_for_test_or_bootstrap();

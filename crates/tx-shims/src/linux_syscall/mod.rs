@@ -519,9 +519,8 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
         nr if nr == NR_COPY_FILE_RANGE => sys_copy_file_range::<P>(req.args, ctx),
         nr if nr == NR_PPOLL => sys_ppoll::<P>(req.args, ctx).await,
-        nr if nr == NR_PSELECT6 || nr == NR_PSELECT6_TIME64 => {
-            sys_pselect6::<P>(req.args, ctx).await
-        }
+        nr if nr == NR_PSELECT6 => sys_pselect6::<P>(req.args, ctx).await,
+        nr if nr == NR_PSELECT6_TIME64 => sys_pselect6::<P>(req.args, ctx).await,
         nr if nr == NR_SCHED_YIELD => sys_sched_yield().await,
         nr if nr == NR_EXIT => sys_exit(req.args, ctx),
         nr if nr == NR_EXIT_GROUP => sys_exit_group(req.args, ctx),

@@ -1,3 +1,19 @@
+- 2026-05-27 **Made `pselect6_time64(413)` visible to syscall-status as a
+  dispatched syscall.** The RV64 implementation already routed
+  `NR_PSELECT6_TIME64` through the `sys_pselect6` path because the userspace
+  timespec layout is already 64-bit; the dispatch arm used a combined guard
+  that the mechanical status parser did not count. Split it into an explicit
+  arm and added a host dispatch regression. `cargo xtask syscall-status
+  pselect6_time64` now reports `dispatched`, and `--list-missing` is down to
+  `NR_PIDFD_SEND_SIGNAL` only. **Verification:** `cargo fmt --check`; `cargo
+  test -p tx-shims --lib
+  dispatch_pselect_time64_udp_write_ready_uses_pselect6_path --
+  --test-threads=1`; `cargo xtask syscall-status --regen`; `cargo xtask
+  syscall sync`; `cargo xtask lint syscall-status`. **Next step:** the last
+  defined-but-not-dispatched syscall is `pidfd_send_signal(424)`. **Blocker:**
+  no LTP score movement claimed here; this was a status/tooling visibility
+  fix over an already-shared pselect implementation path.
+
 - 2026-05-27 **Closed the remaining non-kernel LTP network interpretations
   with fresh witnesses.** Confirmed `socketcall01..03` and the
   `accept4_01` socketcall variant are compiled as `syscall(-1)` on this RV64
