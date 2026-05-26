@@ -20,6 +20,9 @@ const NSEC_PER_SEC: i64 = 1_000_000_000;
 const USEC_PER_SEC: i64 = 1_000_000;
 const USER_HZ: i64 = 100;
 const USER_TICK_USEC: i64 = USEC_PER_SEC / USER_HZ;
+const MIN_TICK_USEC: i64 = 900_000 / USER_HZ;
+const MAX_TICK_USEC: i64 = 1_100_000 / USER_HZ;
+const MAX_TIMECONST: i64 = 10;
 const MAX_TAI_OFFSET: i64 = 100_000;
 
 pub const ADJ_OFFSET: u32 = 0x0001;
@@ -39,15 +42,17 @@ pub const ADJ_OFFSET_SS_READ: u32 = 0xa001;
 pub const STA_NANO: u32 = 0x2000;
 pub const STA_RONLY: u32 = 0xff00;
 
-const BOOKKEEPING_MODES: u32 =
-    ADJ_MAXERROR | ADJ_ESTERROR | ADJ_STATUS | ADJ_TAI | ADJ_MICRO | ADJ_NANO;
-const STEP_MODES: u32 = ADJ_SETOFFSET;
-const UNSUPPORTED_DISCIPLINE_MODES: u32 = ADJ_OFFSET
-    | ADJ_FREQUENCY
-    | ADJ_TICK
+const BOOKKEEPING_MODES: u32 = ADJ_MAXERROR
+    | ADJ_ESTERROR
+    | ADJ_STATUS
     | ADJ_TIMECONST
-    | ADJ_OFFSET_SINGLESHOT
-    | ADJ_OFFSET_SS_READ;
+    | ADJ_TAI
+    | ADJ_MICRO
+    | ADJ_NANO
+    | ADJ_TICK;
+const STEP_MODES: u32 = ADJ_SETOFFSET;
+const UNSUPPORTED_DISCIPLINE_MODES: u32 =
+    ADJ_OFFSET | ADJ_FREQUENCY | ADJ_OFFSET_SINGLESHOT | ADJ_OFFSET_SS_READ;
 const KNOWN_MODES: u32 = BOOKKEEPING_MODES | STEP_MODES | UNSUPPORTED_DISCIPLINE_MODES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -325,6 +330,7 @@ pub struct Timekeeper {
     status: AtomicU32,
     maxerror_us: AtomicI64,
     esterror_us: AtomicI64,
+    time_constant: AtomicI64,
     tick_us: AtomicI64,
 }
 
@@ -335,6 +341,7 @@ impl Timekeeper {
             status: AtomicU32::new(STA_NANO),
             maxerror_us: AtomicI64::new(0),
             esterror_us: AtomicI64::new(0),
+            time_constant: AtomicI64::new(0),
             tick_us: AtomicI64::new(USER_TICK_USEC),
         }
     }
@@ -388,6 +395,9 @@ impl Timekeeper {
         if modes & ADJ_STATUS != 0 && (tx.status & STA_RONLY) != 0 {
             return Err(TimekeepingError::Invalid);
         }
+        if modes & ADJ_TICK != 0 && (tx.tick < MIN_TICK_USEC || tx.tick > MAX_TICK_USEC) {
+            return Err(TimekeepingError::Invalid);
+        }
 
         if modes & ADJ_SETOFFSET != 0 {
             let subsec_limit = if modes & ADJ_NANO != 0 {
@@ -422,6 +432,13 @@ impl Timekeeper {
             self.esterror_us
                 .store(tx.esterror.max(0), Ordering::Release);
         }
+        if modes & ADJ_TIMECONST != 0 {
+            self.time_constant
+                .store(tx.constant.clamp(0, MAX_TIMECONST), Ordering::Release);
+        }
+        if modes & ADJ_TICK != 0 {
+            self.tick_us.store(tx.tick, Ordering::Release);
+        }
         if modes & ADJ_STATUS != 0 {
             let readonly = self.status.load(Ordering::Acquire) & STA_RONLY;
             self.status
@@ -447,7 +464,7 @@ impl Timekeeper {
         tx.maxerror = self.maxerror_us.load(Ordering::Acquire);
         tx.esterror = self.esterror_us.load(Ordering::Acquire);
         tx.status = status;
-        tx.constant = 0;
+        tx.constant = self.time_constant.load(Ordering::Acquire);
         tx.precision = 1;
         tx.tolerance = 0;
         tx.time_sec = (realtime / NSEC_PER_SEC as u64) as i64;
@@ -475,6 +492,7 @@ impl Timekeeper {
         self.status.store(STA_NANO, Ordering::Release);
         self.maxerror_us.store(0, Ordering::Release);
         self.esterror_us.store(0, Ordering::Release);
+        self.time_constant.store(0, Ordering::Release);
         self.tick_us.store(USER_TICK_USEC, Ordering::Release);
     }
 }

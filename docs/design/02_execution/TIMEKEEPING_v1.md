@@ -417,7 +417,9 @@ v1 compatibility target:
 | `ADJ_MAXERROR` / `ADJ_ESTERROR` | privileged bookkeeping update; no realtime generation bump |
 | `ADJ_STATUS` | privileged update of writable status bits; rejects read-only `STA_RONLY` bits with `EINVAL` |
 | `ADJ_NANO` / `ADJ_MICRO` | privileged resolution-mode bookkeeping; affects `timex.status` / readback units only |
-| `ADJ_OFFSET`, `ADJ_FREQUENCY`, `ADJ_TICK`, `ADJ_TIMECONST`, `ADJ_OFFSET_SINGLESHOT`, `ADJ_OFFSET_SS_READ` | `EOPNOTSUPP` until true slew/frequency discipline lands |
+| `ADJ_TICK` | privileged bookkeeping update for `timex.tick`; validates the Linux 10 percent `USER_HZ` bound, but does not alter clock progression until true discipline lands |
+| `ADJ_TIMECONST` | privileged bookkeeping update for `timex.constant`; clamped to the Linux PLL max, but does not alter clock progression until true discipline lands |
+| `ADJ_OFFSET`, `ADJ_FREQUENCY`, `ADJ_OFFSET_SINGLESHOT`, `ADJ_OFFSET_SS_READ` | `EOPNOTSUPP` until true slew/frequency discipline lands |
 
 `clock_adjtime` uses the same matrix for `CLOCK_REALTIME`. Other clock ids
 return `EINVAL` when invalid and `EOPNOTSUPP` when valid but not adjustable.

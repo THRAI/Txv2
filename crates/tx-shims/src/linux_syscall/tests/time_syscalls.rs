@@ -3,12 +3,12 @@
 use super::*;
 
 use crate::linux_syscall::{
-    ADJ_OFFSET, ADJ_SETOFFSET, CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
-    CLOCK_THREAD_CPUTIME_ID, ITIMER_PROF, ITIMER_REAL, NR_ADJTIMEX, NR_CLOCK_ADJTIME,
-    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLOCK_SETTIME, NR_GETITIMER, NR_GETPID,
-    NR_GETTIMEOFDAY, NR_NANOSLEEP, NR_SETITIMER, NR_SETTIMEOFDAY, NR_TIMER_CREATE, NR_TIMER_DELETE,
-    NR_TIMER_GETOVERRUN, NR_TIMER_GETTIME, NR_TIMER_SETTIME, NR_TIMES, TIMER_ABSTIME,
-    TIMES_NS_PER_TICK,
+    ADJ_OFFSET, ADJ_SETOFFSET, ADJ_TICK, ADJ_TIMECONST, CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID,
+    CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID, ITIMER_PROF, ITIMER_REAL, NR_ADJTIMEX,
+    NR_CLOCK_ADJTIME, NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLOCK_SETTIME, NR_GETITIMER,
+    NR_GETPID, NR_GETTIMEOFDAY, NR_NANOSLEEP, NR_SETITIMER, NR_SETTIMEOFDAY, NR_TIMER_CREATE,
+    NR_TIMER_DELETE, NR_TIMER_GETOVERRUN, NR_TIMER_GETTIME, NR_TIMER_SETTIME, NR_TIMES,
+    TIMER_ABSTIME, TIMES_NS_PER_TICK,
 };
 use tx_subsystems::cred::{step_setresuid, Uid};
 use tx_subsystems::signal::{step_sigaction, SigDisposition, Signum};
@@ -676,6 +676,63 @@ fn dispatch_adjtimex_setoffset_steps_realtime() {
     let before_ns = before.tv_sec * 1_000_000_000 + before.tv_nsec;
     let after_ns = after.tv_sec * 1_000_000_000 + after.tv_nsec;
     assert!(after_ns >= before_ns + 2_250_000_000);
+}
+
+#[test]
+fn dispatch_adjtimex_tick_and_timeconst_bookkeeping_round_trip() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let mut tx = TestTimex {
+        modes: ADJ_TICK | ADJ_TIMECONST,
+        tick: 10_123,
+        constant: 17,
+        ..TestTimex::default()
+    };
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_ADJTIMEX,
+            [&mut tx as *mut TestTimex as u64, 0, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(tx.tick, 10_123);
+    assert_eq!(tx.constant, 10, "time constant is clamped to Linux MAXTC");
+
+    let mut readback = TestTimex::default();
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_ADJTIMEX,
+            [&mut readback as *mut TestTimex as u64, 0, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(readback.tick, 10_123);
+    assert_eq!(readback.constant, 10);
+}
+
+#[test]
+fn dispatch_adjtimex_rejects_out_of_range_tick() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let mut tx = TestTimex {
+        modes: ADJ_TICK,
+        tick: 11_001,
+        ..TestTimex::default()
+    };
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_ADJTIMEX,
+            [&mut tx as *mut TestTimex as u64, 0, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_INVAL));
 }
 
 #[test]

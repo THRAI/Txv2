@@ -35,26 +35,6 @@ use crate::tty::structure::identity::TtyIdentity;
 use crate::vfs::{DEntry, OpenFile};
 use crate::vm::AddressSpace;
 
-/// Process-owned state for Linux `ITIMER_REAL`.
-///
-/// Deadlines are stored in the monotonic clock domain used by the
-/// syscall layer's sleep/timer queue. `deadline_ns == 0` means disarmed.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RealTimerState {
-    pub deadline_ns: u64,
-    pub interval_ns: u64,
-}
-
-impl RealTimerState {
-    pub fn remaining_ns(self, now_ns: u64) -> u64 {
-        if self.deadline_ns == 0 {
-            0
-        } else {
-            self.deadline_ns.saturating_sub(now_ns)
-        }
-    }
-}
-
 /// Bit-mask for the "child has zombified" event on the per-process
 /// `exit_source`. Future events (stop, continue) get their own bits
 /// alongside their wakers; the slice carves out only this single bit.
@@ -741,41 +721,6 @@ impl ProcessIdentity {
         }
     }
 
-    /// Snapshot Linux `ITIMER_REAL` state for this process.
-    pub fn real_timer_snapshot(&self, now_ns: u64) -> RealTimerState {
-        self.payload
-            .lock()
-            .as_ref()
-            .map(|p| p.real_timer_snapshot(now_ns))
-            .unwrap_or_default()
-    }
-
-    /// Replace Linux `ITIMER_REAL`, returning the previous effective state.
-    pub fn set_real_timer(&self, now_ns: u64, value_ns: u64, interval_ns: u64) -> RealTimerState {
-        self.payload
-            .lock()
-            .as_ref()
-            .map(|p| p.set_real_timer(now_ns, value_ns, interval_ns))
-            .unwrap_or_default()
-    }
-
-    /// Return the armed `ITIMER_REAL` deadline, if any.
-    pub fn real_timer_deadline_ns(&self) -> Option<u64> {
-        self.payload
-            .lock()
-            .as_ref()
-            .and_then(|p| p.real_timer_deadline_ns())
-    }
-
-    /// Fire a due `ITIMER_REAL`, rearming interval timers and reporting
-    /// whether SIGALRM should be generated.
-    pub fn fire_real_timer_if_due(&self, now_ns: u64) -> bool {
-        self.payload
-            .lock()
-            .as_ref()
-            .is_some_and(|p| p.fire_real_timer_if_due(now_ns))
-    }
-
     /// Snapshot the per-process file-creation mask. Returns `0` for
     /// zombies (no payload — defensively, the alive caller of
     /// `umask(2)` always has a payload). Slice 6 of the shell-prompt
@@ -1276,12 +1221,6 @@ pub struct ProcessPayload {
     /// payloads start clear, `fork` does not inherit it, and exec
     /// clears it through [`ProcessIdentity::set_mlock_future`].
     pub(crate) mlock_future: AtomicBool,
-    /// Linux `ITIMER_REAL` state used by `alarm(2)`/`setitimer(2)`.
-    ///
-    /// Timers are process-local, start disarmed on freshly signed
-    /// payloads, and are deliberately not copied by `fork` in this
-    /// narrow LTP compatibility slice.
-    pub(crate) real_timer: SpinMutex<RealTimerState>,
     /// Per-process file-creation mask (`umask(2)`).
     ///
     /// Slice 6 of the shell-prompt roadmap. Bits set in `umask` are
@@ -1891,54 +1830,6 @@ impl ProcessPayload {
     /// Enable or clear Linux `mlockall(MCL_FUTURE)` policy.
     pub fn set_mlock_future(&self, value: bool) {
         self.mlock_future.store(value, Ordering::Release);
-    }
-
-    /// Snapshot `ITIMER_REAL`, folding expired one-shot timers to zero
-    /// without mutating state.
-    pub fn real_timer_snapshot(&self, now_ns: u64) -> RealTimerState {
-        let timer = *self.real_timer.lock();
-        RealTimerState {
-            deadline_ns: timer.remaining_ns(now_ns),
-            interval_ns: timer.interval_ns,
-        }
-    }
-
-    /// Replace `ITIMER_REAL`, returning the previous remaining interval.
-    pub fn set_real_timer(&self, now_ns: u64, value_ns: u64, interval_ns: u64) -> RealTimerState {
-        let mut timer = self.real_timer.lock();
-        let old = RealTimerState {
-            deadline_ns: timer.remaining_ns(now_ns),
-            interval_ns: timer.interval_ns,
-        };
-        *timer = RealTimerState {
-            deadline_ns: if value_ns == 0 {
-                0
-            } else {
-                now_ns.saturating_add(value_ns)
-            },
-            interval_ns,
-        };
-        old
-    }
-
-    pub fn real_timer_deadline_ns(&self) -> Option<u64> {
-        let timer = *self.real_timer.lock();
-        (timer.deadline_ns != 0).then_some(timer.deadline_ns)
-    }
-
-    pub fn fire_real_timer_if_due(&self, now_ns: u64) -> bool {
-        let mut timer = self.real_timer.lock();
-        if timer.deadline_ns == 0 || now_ns < timer.deadline_ns {
-            return false;
-        }
-        if timer.interval_ns == 0 {
-            timer.deadline_ns = 0;
-        } else {
-            while timer.deadline_ns <= now_ns {
-                timer.deadline_ns = timer.deadline_ns.saturating_add(timer.interval_ns);
-            }
-        }
-        true
     }
 
     /// Read the per-process file-creation mask. Slice 6 of the

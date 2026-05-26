@@ -1,3 +1,19 @@
+- 2026-05-26 **Finished the bounded `adjtimex` bookkeeping tail.**
+  `ADJ_TICK` and `ADJ_TIMECONST` now round-trip through the timekeeping
+  service as privileged, bounded bookkeeping fields: `ADJ_TICK` enforces
+  Linux's 10 percent `USER_HZ` tick range and `ADJ_TIMECONST` clamps to the
+  Linux PLL max. This does not claim true offset/frequency discipline; those
+  modes remain `EOPNOTSUPP`. Also removed the stale pre-timekeeping
+  `RealTimerState` process field/methods so `ITIMER_REAL` has a single home in
+  `ProcessIntervalTimer`.
+  **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::time_syscalls -- --nocapture`; `cargo test -p
+  tx-subsystems timekeeping -- --nocapture`; `cargo check -p tx-shims -p
+  tx-subsystems`.
+  **Next step:** CPU-time accounting remains the prerequisite for
+  `ITIMER_VIRTUAL`/`ITIMER_PROF`; true NTP-style offset/frequency slew remains
+  behind the time-discipline subsystem.
+
 - 2026-05-26 **Checked timer/time tail readiness and aligned the residual
   backlog.** The `timer_create` family, `getitimer`/`setitimer`,
   `adjtimex`, and `clock_adjtime` are wired in the v1 timekeeping model with

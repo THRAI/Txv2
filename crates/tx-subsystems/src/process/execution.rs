@@ -1257,7 +1257,6 @@ fn sign_process_payload(
         brk_base: core::sync::atomic::AtomicU64::new(brk_base),
         current_brk: core::sync::atomic::AtomicU64::new(current_brk),
         mlock_future: AtomicBool::new(false),
-        real_timer: SpinMutex::new(Default::default()),
         // Slice 6 of the shell-prompt roadmap. Per-process
         // file-creation mask. `bootstrap_init_process` seeds with
         // the Linux default `0o022` (owner keeps full perms,
