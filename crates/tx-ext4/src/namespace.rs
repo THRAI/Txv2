@@ -263,6 +263,11 @@ where
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e),
         };
+        match self.with_pager(|pager| pager.lookup(parent_ino, name)) {
+            Ok(Some(_)) => return StepOutcome::err(Errno::EEXIST),
+            Ok(None) => {}
+            Err(e) => return StepOutcome::err(e),
+        }
         match self.with_pager(|pager| {
             pager.create_directory(parent_ino, name, mode, cred.uid, cred.gid, 0)
         }) {

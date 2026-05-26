@@ -1060,10 +1060,17 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 continue;
             }
             if let Some(script) = oscomp_glibc_script_for_group(group) {
-                let _ = write!(
-                    cmd,
-                    " && cd /musl/glibc && /musl/musl/busybox sh {script} && cd /musl/musl"
-                );
+                if script == "basic_testcode.sh" {
+                    let _ = write!(
+                        cmd,
+                        " && cd /musl/glibc/basic && (/musl/musl/busybox mkdir test_chdir || :) && cd /musl/glibc && /musl/musl/busybox sh {script} && cd /musl/musl"
+                    );
+                } else {
+                    let _ = write!(
+                        cmd,
+                        " && cd /musl/glibc && /musl/musl/busybox sh {script} && cd /musl/musl"
+                    );
+                }
                 selected += 1;
                 continue;
             }
