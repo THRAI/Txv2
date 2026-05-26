@@ -17,20 +17,22 @@ inner loop; OSComp + LTP are the correctness bar. When a syscall lands,
 record which specific OSComp/LTP test(s) closed it under "Currently
 passing" below.
 
-**Last refresh:** 2026-05-26 (merged the VFS xattr/`*xattrat` table with
-the LTP VM/mm worktree: `mincore`, `mlock2`, `mlockall`, `munlockall`,
-`memfd_create`, single-node mempolicy/migration calls, self `process_vm_*`,
-shared-PageBacked `remap_file_pages`, pidfd-backed self `process_madvise`,
-and `getitimer`/`setitimer` are now wired; ext4 xattr persistence and
-cross-process VM policy remain explicit follow-ups).
+**Last refresh:** 2026-05-26 (merged the VFS xattr/`*xattrat` table, the LTP
+VM/mm worktree, and the timer wake follow-up: `mincore`, `mlock2`,
+`mlockall`, `munlockall`, `memfd_create`, single-node mempolicy/migration
+calls, self `process_vm_*`, shared-PageBacked `remap_file_pages`,
+pidfd-backed self `process_madvise`, `getitimer`/`setitimer`, POSIX timer id
+syscalls, `adjtimex`, and `clock_adjtime` are now wired; ext4 xattr
+persistence, true time discipline, CPU timers, and cross-process VM policy
+remain explicit follow-ups).
 
 ## Headline counts
 
-- `pub const NR_*` defined in `numbers.rs`: **236**
-- Dispatched in `mod.rs` (per match arms): **232**
+- `pub const NR_*` defined in `numbers.rs`: **243**
+- Dispatched in `mod.rs` (per match arms): **239**
 - Defined but not dispatched: **4** (`GETPEERNAME`, `GETSOCKOPT`,
   `SHUTDOWN`, `SOCKETPAIR`).
-- True missing from local `numbers.rs` vs Linux RV64 v6.17: **84**.
+- True missing from local `numbers.rs` vs Linux RV64 v6.17: **77**.
 - Number mismatches vs Linux RV64 v6.17: **0**.
 - Local `NR_*` extras not in the Linux RV64 v6.17 reference: **0**.
 
@@ -46,7 +48,7 @@ number of additional LTP tests that move from skipped/failed to runnable.
 
 | Gap | LTP impact | Effort | Substrate status |
 |---|---|---|---|
-| Timer/time tail (`timer_create` family, `clock_adjtime`, `adjtimex`) | +15 timer tests | M (3–4w) | wallclock set/get policy, vDSO conversion state, `timerfd`, `nanosleep`, and the LTP-observed `ITIMER_REAL` `getitimer`/`setitimer` alarm path exist; POSIX timer ids, CPU interval timers, and adjustment/slew policy still needed |
+| Timer/time tail (`timer_create` family, `clock_adjtime`, `adjtimex`) | +15 timer tests mostly landed; residual CPU-time/discipline cases remain | M (3–4w) mostly landed; residuals are new-policy work | wallclock set/get policy, vDSO conversion state, `timerfd`, `nanosleep`, `ITIMER_REAL` `getitimer`/`setitimer`, POSIX timer ids, `adjtimex`, and `clock_adjtime` are wired with v1 host coverage; remaining gaps are CPU interval timers, true slew/frequency discipline, and full Linux blocking-syscall restart/remnant semantics |
 | Lightweight process/sysinfo tail (`waitid`, `clone3`, `pidfd_getfd`, `setns`, `unshare`, `sysinfo`) | +20 process/namespace tests | M–L (4–8w) | wait/clone/pidfd scaffolding exists; namespace view and sysinfo accounting semantics need care |
 | Network completion slice (`socketpair`, `shutdown`, `getpeername`, `getsockopt`, `sendmsg`, `recvmsg`, `sendmmsg`, `recvmmsg`) | +25 socket tests | M–L (4–8w) | socket syscall skeleton exists; four constants are defined-but-no-arm, message-vector ABI still missing |
 | Filesystem metadata depth (ext4 xattr persistence, ACLs, file capabilities, quota) | +15 fs metadata tests | L (6–10w) | VFS xattr hooks and tmpfs `user.*` storage are wired; ext4 deliberately reports `EOPNOTSUPP` until metadata transactions/journal policy can cover inode-body and external xattr blocks |
@@ -64,7 +66,8 @@ are now defined and dispatched. The follow-up easy ABI query/no-op sweep also
 landed on 2026-05-24: `clock_getres`, `getcpu`, `personality`, `getgroups`,
 `restart_syscall`, `sched_setparam`, `getpriority`, `setpriority`,
 `ioprio_get`, and `ioprio_set`. Best remaining impact-per-effort is now
-timer/time probes, lightweight process/sysinfo calls, and network completion.
+lightweight process/sysinfo calls, network completion, and the residual
+timer/time policy work that needs CPU accounting or full time discipline.
 The pipe/splice tail also landed on 2026-05-24: `splice`, `tee`, and
 `vmsplice` now use Linux RV64 v6.17 numbers and dispatch through a
 lease-capable pipe/page-backed staging path, with pipe-to-pipe `splice`,
@@ -288,12 +291,12 @@ When you implement or change a syscall:
 _Counts read from `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}` and checked against Linux RV64 v6.17 from `xtask/data/syscalls/riscv/64/rv64/linux-6.17-table.json` (source: https://syscalls.mebeim.net/db/riscv/64/rv64/latest/table.json). Linux file/line references point into `external/linux-rv-6.17`._
 _Run `cargo xtask syscall-status --regen` to refresh; `--check` to lint in CI._
 
-- **`NR_*` defined:** 236
+- **`NR_*` defined:** 243
 - **Linux RV64 reference syscalls:** 320
-- **Dispatched (has a match arm):** 232
+- **Dispatched (has a match arm):** 239
 - **Defined but not dispatched:** 4 — see list below
 
-- **True missing vs Linux RV64 reference:** 84
+- **True missing vs Linux RV64 reference:** 77
 - **Number mismatches vs Linux RV64 reference:** 0
 - **Local `NR_*` not in Linux RV64 reference:** 0
 
@@ -328,11 +331,6 @@ Linux RV64 v6.17 syscalls that have no local `NR_*` constant. This is the greenf
 | 104 | `kexec_load` | `unsigned long entry, unsigned long nr_segments, struct kexec_segment *segments, unsigne…` | `kernel/kexec.c`:242 |
 | 105 | `init_module` | `void *umod, unsigned long len, const char *uargs` | `kernel/module/main.c`:3569 |
 | 106 | `delete_module` | `const char *name_user, unsigned int flags` | `kernel/module/main.c`:776 |
-| 107 | `timer_create` | `const clockid_t which_clock, struct sigevent *timer_event_spec, timer_t *created_timer_…` | `kernel/time/posix-timers.c`:574 |
-| 108 | `timer_gettime` | `timer_t timer_id, struct __kernel_itimerspec *setting` | `kernel/time/posix-timers.c`:752 |
-| 109 | `timer_getoverrun` | `timer_t timer_id` | `kernel/time/posix-timers.c`:800 |
-| 110 | `timer_settime` | `timer_t timer_id, int flags, const struct __kernel_itimerspec *new_setting, struct __ke…` | `kernel/time/posix-timers.c`:955 |
-| 111 | `timer_delete` | `timer_t timer_id` | `kernel/time/posix-timers.c`:1060 |
 | 117 | `ptrace` | `long request, long pid, unsigned long addr, unsigned long data` | `kernel/ptrace.c`:1387 |
 | 142 | `reboot` | `int magic1, int magic2, unsigned int cmd, void *arg` | `kernel/reboot.c`:728 |
 | 151 | `setfsuid` | `uid_t uid` | `kernel/sys.c`:940 |
@@ -341,7 +339,6 @@ Linux RV64 v6.17 syscalls that have no local `NR_*` constant. This is the greenf
 | 161 | `sethostname` | `char *name, int len` | `kernel/sys.c`:1419 |
 | 162 | `setdomainname` | `char *name, int len` | `kernel/sys.c`:1473 |
 | 167 | `prctl` | `int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long a…` | `kernel/sys.c`:2455 |
-| 171 | `adjtimex` | `struct __kernel_timex *txc_p` | `kernel/time/time.c`:269 |
 | 179 | `sysinfo` | `struct sysinfo *info` | `kernel/sys.c`:2896 |
 | 211 | `sendmsg` | `int fd, struct user_msghdr *msg, unsigned int flags` | `net/socket.c`:2703 |
 | 212 | `recvmsg` | `int fd, struct user_msghdr *msg, unsigned int flags` | `net/socket.c`:2912 |
@@ -355,7 +352,6 @@ Linux RV64 v6.17 syscalls that have no local `NR_*` constant. This is the greenf
 | 243 | `recvmmsg` | `int fd, struct mmsghdr *mmsg, unsigned int vlen, unsigned int flags, struct __kernel_ti…` | `net/socket.c`:3061 |
 | 258 | `riscv_hwprobe` | `struct riscv_hwprobe *pairs, size_t pair_count, size_t cpusetsize, unsigned long *cpus,…` | `arch/riscv/kernel/sys_hwprobe.c`:511 |
 | 259 | `riscv_flush_icache` | `uintptr_t start, uintptr_t end, uintptr_t flags` | `arch/riscv/kernel/sys_riscv.c`:59 |
-| 266 | `clock_adjtime` | `const clockid_t which_clock, struct __kernel_timex *utx` | `kernel/time/posix-timers.c`:1165 |
 | 268 | `setns` | `int fd, int flags` | `kernel/nsproxy.c`:536 |
 | 269 | `sendmmsg` | `int fd, struct mmsghdr *mmsg, unsigned int vlen, unsigned int flags` | `net/socket.c`:2781 |
 | 272 | `kcmp` | `pid_t pid1, pid_t pid2, int type, unsigned long idx1, unsigned long idx2` | `kernel/kcmp.c`:135 |
@@ -413,12 +409,12 @@ overwritten by the next `sync`. The lint variant
 
 ### Counts (from dispatch table)
 
-- `pub const NR_*` in numbers.rs: **236**
+- `pub const NR_*` in numbers.rs: **243**
 - Linux RV64 reference syscalls: **320**
-- dispatched in mod.rs: **232** (of which async: 58, likely-stub: 4)
+- dispatched in mod.rs: **239** (of which async: 58, likely-stub: 4)
 - defined but not dispatched: **4**
 
-- true missing vs Linux RV64 reference: **84**
+- true missing vs Linux RV64 reference: **77**
 - number mismatches vs Linux RV64 reference: **0**
 - local `NR_*` not in Linux RV64 reference: **0**
 
@@ -440,7 +436,7 @@ These have a syscall number constant but no match arm in `mod.rs`. Either wire t
 - `NR_SHUTDOWN` (nr=210)
 - `NR_SOCKETPAIR` (nr=199)
 
-### True missing from local `numbers.rs` (84)
+### True missing from local `numbers.rs` (77)
 
 These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the greenfield backlog; it is distinct from defined-but-not-dispatched.
 
@@ -460,11 +456,6 @@ These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the g
 | 104 | `kexec_load` | `unsigned long entry, unsigned long nr_segments, struct kexec_segment *segments, unsigned …` | `kernel/kexec.c`:242 |
 | 105 | `init_module` | `void *umod, unsigned long len, const char *uargs` | `kernel/module/main.c`:3569 |
 | 106 | `delete_module` | `const char *name_user, unsigned int flags` | `kernel/module/main.c`:776 |
-| 107 | `timer_create` | `const clockid_t which_clock, struct sigevent *timer_event_spec, timer_t *created_timer_id` | `kernel/time/posix-timers.c`:574 |
-| 108 | `timer_gettime` | `timer_t timer_id, struct __kernel_itimerspec *setting` | `kernel/time/posix-timers.c`:752 |
-| 109 | `timer_getoverrun` | `timer_t timer_id` | `kernel/time/posix-timers.c`:800 |
-| 110 | `timer_settime` | `timer_t timer_id, int flags, const struct __kernel_itimerspec *new_setting, struct __kern…` | `kernel/time/posix-timers.c`:955 |
-| 111 | `timer_delete` | `timer_t timer_id` | `kernel/time/posix-timers.c`:1060 |
 | 117 | `ptrace` | `long request, long pid, unsigned long addr, unsigned long data` | `kernel/ptrace.c`:1387 |
 | 142 | `reboot` | `int magic1, int magic2, unsigned int cmd, void *arg` | `kernel/reboot.c`:728 |
 | 151 | `setfsuid` | `uid_t uid` | `kernel/sys.c`:940 |
@@ -473,7 +464,6 @@ These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the g
 | 161 | `sethostname` | `char *name, int len` | `kernel/sys.c`:1419 |
 | 162 | `setdomainname` | `char *name, int len` | `kernel/sys.c`:1473 |
 | 167 | `prctl` | `int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5` | `kernel/sys.c`:2455 |
-| 171 | `adjtimex` | `struct __kernel_timex *txc_p` | `kernel/time/time.c`:269 |
 | 179 | `sysinfo` | `struct sysinfo *info` | `kernel/sys.c`:2896 |
 | 211 | `sendmsg` | `int fd, struct user_msghdr *msg, unsigned int flags` | `net/socket.c`:2703 |
 | 212 | `recvmsg` | `int fd, struct user_msghdr *msg, unsigned int flags` | `net/socket.c`:2912 |
@@ -487,7 +477,6 @@ These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the g
 | 243 | `recvmmsg` | `int fd, struct mmsghdr *mmsg, unsigned int vlen, unsigned int flags, struct __kernel_time…` | `net/socket.c`:3061 |
 | 258 | `riscv_hwprobe` | `struct riscv_hwprobe *pairs, size_t pair_count, size_t cpusetsize, unsigned long *cpus, u…` | `arch/riscv/kernel/sys_hwprobe.c`:511 |
 | 259 | `riscv_flush_icache` | `uintptr_t start, uintptr_t end, uintptr_t flags` | `arch/riscv/kernel/sys_riscv.c`:59 |
-| 266 | `clock_adjtime` | `const clockid_t which_clock, struct __kernel_timex *utx` | `kernel/time/posix-timers.c`:1165 |
 | 268 | `setns` | `int fd, int flags` | `kernel/nsproxy.c`:536 |
 | 269 | `sendmmsg` | `int fd, struct mmsghdr *mmsg, unsigned int vlen, unsigned int flags` | `net/socket.c`:2781 |
 | 272 | `kcmp` | `pid_t pid1, pid_t pid2, int type, unsigned long idx1, unsigned long idx2` | `kernel/kcmp.c`:135 |
@@ -531,7 +520,7 @@ These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the g
 | 468 | `file_getattr` | `int dfd, const char *filename, struct file_attr *ufattr, size_t usize, unsigned int at_fl…` | `fs/file_attr.c`:382 |
 | 469 | `file_setattr` | `int dfd, const char *filename, struct file_attr *ufattr, size_t usize, unsigned int at_fl…` | `fs/file_attr.c`:437 |
 
-### Dispatched syscalls (232) — name → handler
+### Dispatched syscalls (239) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -627,6 +616,11 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 101 | `NR_NANOSLEEP` | `sys_nanosleep` | async |
 | 102 | `NR_GETITIMER` | `sys_getitimer` | sync |
 | 103 | `NR_SETITIMER` | `sys_setitimer` | sync |
+| 107 | `NR_TIMER_CREATE` | `sys_timer_create` | sync |
+| 108 | `NR_TIMER_GETTIME` | `sys_timer_gettime` | sync |
+| 109 | `NR_TIMER_GETOVERRUN` | `sys_timer_getoverrun` | sync |
+| 110 | `NR_TIMER_SETTIME` | `sys_timer_settime` | sync |
+| 111 | `NR_TIMER_DELETE` | `sys_timer_delete` | sync |
 | 112 | `NR_CLOCK_SETTIME` | `sys_clock_settime` | sync |
 | 113 | `NR_CLOCK_GETTIME` | `sys_clock_gettime` | sync |
 | 114 | `NR_CLOCK_GETRES` | `sys_clock_getres` | sync |
@@ -678,6 +672,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 168 | `NR_GETCPU` | `sys_getcpu` | sync |
 | 169 | `NR_GETTIMEOFDAY` | `sys_gettimeofday` | sync |
 | 170 | `NR_SETTIMEOFDAY` | `sys_settimeofday` | sync |
+| 171 | `NR_ADJTIMEX` | `sys_adjtimex` | sync |
 | 172 | `NR_GETPID` | `sys_getpid` | sync |
 | 173 | `NR_GETPPID` | `sys_getppid` | sync |
 | 174 | `NR_GETUID` | `sys_getuid` | sync |
@@ -741,6 +736,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 263 | `NR_FANOTIFY_MARK` | `sys_fanotify_mark` | sync [stub] |
 | 264 | `NR_NAME_TO_HANDLE_AT` | `sys_name_to_handle_at` | sync |
 | 265 | `NR_OPEN_BY_HANDLE_AT` | `sys_open_by_handle_at` | sync |
+| 266 | `NR_CLOCK_ADJTIME` | `sys_clock_adjtime` | sync |
 | 267 | `NR_SYNCFS` | `sys_syncfs` | sync |
 | 270 | `NR_PROCESS_VM_READV` | `sys_process_vm_readv` | sync |
 | 271 | `NR_PROCESS_VM_WRITEV` | `sys_process_vm_writev` | sync |

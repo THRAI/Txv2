@@ -1,3 +1,208 @@
+- 2026-05-26 **Checked timer/time tail readiness and aligned the residual
+  backlog.** The `timer_create` family, `getitimer`/`setitimer`,
+  `adjtimex`, and `clock_adjtime` are wired in the v1 timekeeping model with
+  host coverage. The remaining timer/time work is no longer missing syscall
+  wiring: it is CPU-time accounting for `ITIMER_VIRTUAL`/`ITIMER_PROF`, true
+  slew/frequency time discipline, and full Linux blocking-syscall
+  restart/remnant semantics. Updated `SYSCALL_STATUS.md` so the high-stakes
+  row points at those residual blockers instead of stale POSIX timer-id gaps,
+  and fixed the older `setitimer` CPU-timer test expectation to match the
+  current `EOPNOTSUPP` v1 policy.
+  **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::time_syscalls -- --nocapture`; `cargo test -p
+  tx-subsystems timekeeping -- --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::kernel_user_layouts -- --nocapture`; `cargo check -p
+  tx-shims -p tx-subsystems`; `cargo xtask syscall-status --check`; `cargo
+  xtask syscall sync --check`; `cargo xtask lint syscall-status`; `cargo
+  xtask progress validate`; `cargo fmt --check`; `git diff --check`.
+  **Next step:** spec/implement scheduler CPU-time accounting before CPU
+  itimers, and keep true NTP-style discipline behind the time-discipline
+  subsystem plan.
+
+- 2026-05-26 **Aligned `SYSCALL_STATUS.md` prose with the generated syscall
+  tables.** Removed the stale historical count ladder from the manual
+  "Easy ABI query/no-op tail" section and updated the maintenance checklist to
+  regenerate/check the mechanical tables instead of hand-bumping counts. The
+  headline remains aligned with the current generated table: 229 constants,
+  225 dispatched arms, 4 defined-but-not-dispatched socket calls, 91 true
+  missing, and 0 number mismatches.
+  **Verified:** `cargo xtask syscall-status --check`; `cargo xtask syscall
+  sync --check`; `cargo xtask lint syscall-status`.
+  **Next step:** when the next syscall lands, regenerate/check first and only
+  copy generated count deltas into the headline.
+
+- 2026-05-26 **Cleared the `tx-substrate wait_source` verification caveat.**
+  The `v3_algebra` errno catalog canary now includes the newer
+  `ECANCELED`, `ENODATA`, and `EOPNOTSUPP` variants, so the broad filtered
+  `tx-substrate` wait-source test command no longer fails at compile time
+  before reaching the wait-source shard.
+  **Verified:** `cargo test -p tx-substrate wait_source -- --nocapture`;
+  `cargo check -p tx-substrate`; `cargo fmt --check`; `git diff --check`.
+  **Next step:** keep the full restart/remnant and CPU-time interval-timer
+  policy work separate from this catalog/test catch-up.
+
+- 2026-05-26 **Finished process-timer policy for `signalfd` and
+  `userfaultfd` reads.** Blocking `read(signalfd)` now races the fd wait source
+  against the next process timer deadline: timer signals covered by the
+  signalfd mask are returned as 128-byte `signalfd_siginfo` records, uncovered
+  deliverable timer signals return `EINTR`, and masked uncovered timer signals
+  leave the read parked. Blocking `read(userfaultfd)` now applies the
+  fault-queue-specific rule: a queued fault message wins over timer
+  interruption, an empty queue returns `EINTR` only for a deliverable timer
+  signal, and masked timer signals keep waiting. The pass also fixed the
+  wait-source registry to store sparse notification ids without allocating a
+  dense vector up to ids above `1 << 32`.
+  **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::signalfd_dispatch -- --nocapture`; `cargo test -p
+  tx-shims --lib linux_syscall::tests::userfaultfd_dispatch -- --nocapture`.
+  **Next step:** centralize full Linux restart/remnant semantics and keep
+  userfaultfd faulting-thread abort policy scoped to endpoint death/fatal
+  signal work.
+  **Blocker:** CPU-time interval timers still need scheduler CPU accounting.
+
+- 2026-05-26 **Extended process-timer expiry wakes to AIO and `wait4`.**
+  Blocking `io_getevents(min_nr > 0, timeout = NULL)` now races the AIO
+  completion wait source against the next process POSIX/interval timer
+  deadline and returns `EINTR` after publishing the configured timer signal
+  when that deadline wins. Blocking `wait4` now applies the same rule to the
+  parent exit-source wait without reaping the still-running child.
+  **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::aio_dispatch -- --nocapture`; `cargo test -p
+  tx-shims --lib
+  linux_syscall::tests::fork_clone_wait4_wave3::dispatch_wait4_blocking_wakes_for_process_timer_signal_deadline
+  -- --nocapture`.
+  **Next step:** design the remaining policy-sensitive waits: `signalfd` should
+  deliver readable timer signals rather than blindly returning `EINTR`, and
+  `userfaultfd` needs fault-agent wake semantics before adding interruption.
+  **Blocker:** full Linux restart/remnant semantics and CPU-time interval
+  timers remain separate follow-ups.
+
+- 2026-05-26 **Extended process-timer expiry wakes to eventfd reads.**
+  Empty blocking eventfd `read(2)` and write-overflow eventfd `write(2)` now
+  race the eventfd readiness source against the next process POSIX/interval
+  timer deadline. If the process timer wins, the shim consumes expired timers
+  at the wake deadline, publishes the configured signal through the existing
+  signal path, and returns `EINTR`.
+  **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::eventfd_dispatch::dispatch_eventfd_read_wakes_for_process_timer_signal_deadline
+  -- --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::eventfd_dispatch::dispatch_eventfd_write_wakes_for_process_timer_signal_deadline
+  -- --nocapture`.
+  **Next step:** handle the remaining fd wait-source families with per-syscall
+  Linux semantics, especially signalfd, userfaultfd, and AIO.
+  **Blocker:** full signal restart/remnant semantics still need the central
+  blocking-syscall interruption contract.
+
+- 2026-05-26 **Extended process-timer expiry wakes to `ppoll`.**
+  The blocking `ppoll` TTY/readiness path now composes the next process
+  POSIX/interval timer deadline into its existing `drive()` wait-source park.
+  When that deadline wins, the shim consumes expired timers, publishes the
+  configured signal through the existing signal path, and returns `EINTR`
+  without changing the existing v1 user-timeout approximation.
+  **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::ppoll_dispatch::dispatch_ppoll_wakes_for_process_timer_signal_deadline
+  -- --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::ppoll_dispatch -- --nocapture`.
+  **Next step:** centralize Linux restart/remnant semantics for blocking waits
+  instead of continuing one-off syscall return policy.
+  **Blocker:** CPU-time interval timers still need scheduler CPU accounting.
+
+- 2026-05-26 **Extended process-timer expiry wakes to POSIX mq blocking waits.**
+  `mq_timedsend`/`mq_timedreceive` now race their normal POSIX mq readiness
+  wait source against the next process POSIX/interval timer deadline; if the
+  process timer wins, the shim consumes expired timers at the wake deadline,
+  publishes the configured signal through the existing signal path, and returns
+  `EINTR`. POSIX mq readiness publication now emits the v3 `WaitSource` as
+  well as the legacy channel, so blocking mq receive/send tests park on the
+  same source that epoll observes, and mq notification suppression sees blocked
+  v3 receivers.
+  **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::mq_dispatch::dispatch_mq_timedreceive_wakes_for_process_timer_signal_deadline
+  -- --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::mq_dispatch -- --test-threads=1 --nocapture`.
+  **Next step:** decide whether `ppoll` should join this v1 interruption model
+  directly or wait for the central blocking-syscall signal/restart contract.
+  **Blocker:** full Linux `EINTR`/restart/remnant semantics and CPU-time
+  interval timers remain separate follow-ups.
+
+- 2026-05-25 **Added first reactor-backed process timer expiry wakes.**
+  Process interval/POSIX timer tables now expose their next monotonic deadline,
+  and the `epoll_pwait` blocking path races unreadable wait sources against
+  that process-timer deadline through the existing reactor `TimerQueue`. When
+  the timer deadline wins, the shim consumes expired `ITIMER_REAL`/POSIX timers
+  at the wake deadline and posts `SIGALRM`/timer signals through the existing
+  process-directed signal path; v1 returns from epoll with no ready events
+  rather than claiming full Linux `EINTR`/restart parity yet. Timerfd `read(2)`
+  now uses the same process-timer deadline race and returns `EINTR` after
+  publishing the timer signal when a separate process timer interrupts an
+  otherwise-blocked timerfd read. `nanosleep` and `clock_nanosleep` now route
+  through the same shortened process-timer deadline helper and return `EINTR`
+  after publishing the signal when the process timer wins. Futex waits now
+  compose the process-timer deadline with their existing `drive()` timeout path
+  and translate that process-timer abort into `EINTR` after publishing the
+  signal.
+  **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::timerfd_dispatch -- --nocapture`; `cargo test -p
+  tx-shims --lib linux_syscall::tests::epoll_dispatch -- --nocapture`; `cargo
+  test -p tx-shims --lib linux_syscall::tests::time_syscalls -- --nocapture`;
+  `cargo test -p tx-shims --lib linux_syscall::tests::futex_dispatch --
+  --nocapture`; `cargo test -p tx-subsystems timekeeping -- --nocapture`.
+  **Next step:** extend the same timer-deadline interruption model to the
+  remaining blocking waits (mq/select-style waits) and then wire full Linux
+  restart/remnant semantics.
+  **Blocker:** full POSIX conformance still needs a central signal-interruption
+  contract across blocking syscall drivers.
+
+- 2026-05-25 **Landed the v1 timekeeping service shell, `adjtimex`,
+  `ITIMER_REAL`, and POSIX timer-id state slices.** Added
+  `tx-subsystems::timekeeping` as the
+  syscall-facing service wrapper over the existing wall-clock/VVAR publisher,
+  with `CLOCK_REALTIME`, monotonic aliases, `CLOCK_TAI`, realtime generation,
+  and the v1 `adjtimex`/`clock_adjtime` mode matrix. `adjtimex` and
+  `clock_adjtime` now have RV64 constants and dispatch arms, a checked
+  `struct timex` kernel/user layout, read-only query, privileged
+  `ADJ_SETOFFSET`, `ADJ_TAI`/error/status/unit bookkeeping, and deliberate
+  `EOPNOTSUPP` for true slew/frequency modes. `getitimer` and `setitimer` now
+  store per-process `ITIMER_REAL` state and deliberately return `EOPNOTSUPP`
+  for CPU interval timers until scheduler CPU-time accounting exists. POSIX
+  `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/
+  `timer_delete` now have Linux RV64 numbers and dispatch arms backed by a
+  per-process timer id table for `CLOCK_REALTIME` and `CLOCK_MONOTONIC`;
+  syscall-boundary expiry polling now posts expired POSIX timers and
+  `ITIMER_REAL` through the existing process-directed signal path. Refreshed
+  syscall-status counts: 229 defined, 225 dispatched, 91 true-missing.
+  **Verified:** `cargo test -p
+  tx-shims --lib
+  linux_syscall::tests::time_syscalls -- --nocapture`; `cargo test -p
+  tx-subsystems timekeeping -- --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::kernel_user_layouts -- --nocapture`; `cargo check -p
+  tx-shims -p tx-subsystems`; `cargo xtask syscall-status --check`; `cargo
+  xtask syscall sync --check`; `cargo xtask lint syscall-status`; `cargo
+  xtask progress validate`; `cargo xtask lint docs`; `cargo fmt --check`;
+  `git diff --check`.
+  **Next step:** implement reactor/background deadline delivery for POSIX
+  timers so sleeping tasks can receive timer signals without a later syscall.
+  **Blocker:** full Linux time discipline still needs raw-cycle/frequency/slew
+  policy and CPU-time accounting follow-ups.
+
+- 2026-05-25 **Drafted and audited the timekeeping service architecture spec.**
+  Added `docs/design/02_execution/TIMEKEEPING_v1.md` and indexed it as the
+  service-subsystem home for Linux clock domains, wall-clock discipline,
+  VVAR/vDSO publication, realtime clock-change notifications, POSIX timer
+  consumers, and `adjtimex`/`clock_adjtime` policy. The draft keeps HAL
+  monotonic-only, treats reactor timers as wake machinery rather than time
+  truth, and explicitly defers raw-cycle HAL expansion, full NTP PLL/FLL
+  parity, CPU-time clocks, time namespaces, PPS, suspend/alarm clocks, and
+  leap-second behavior. Follow-up audit resolved the v1-blocking open
+  questions: no raw-cycle HAL change in v1, time namespaces stay deferred,
+  `CLOCK_BOOTTIME` aliases monotonic until suspend support, POSIX timer ids
+  live in a process-keyed timer table, and the v1 `adjtimex` mutation matrix is
+  explicit. **Verified:** `cargo xtask progress validate`; `cargo xtask lint
+  docs`; `git diff --check`.
+  **Next step:** turn the resolved v1 decisions into a scoped implementation
+  plan for the timekeeper service shell. **Blocker:** full Linux/POSIX conformance
+  still needs signal queueing and CPU accounting follow-ups.
+
 - 2026-05-26 **Advanced the full-image `ltp-musl` lane through
   `alarm05`, `epoll_ctl02`, and `epoll_ctl04`.** In
   `/Users/3y/.codex/worktrees/ltp-vm-mm/Tx` on `codex/ltp-vm-mm`, added
