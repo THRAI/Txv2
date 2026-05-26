@@ -23,7 +23,7 @@ Reliable focused results already in `target/oscomp`:
 | IPv6 UDP focused | `bind05,recvmsg02` | `15/15` | `target/oscomp/ltp-net-ipv6-udp.txt` |
 | IPv6 dual-stack TCP focused | `connect02` | `1/1` | `target/oscomp/ltp-net-ipv6-connect02.txt` |
 | accept tail focused | `accept03,accept4_01,getpeername01` | `28/39` | `target/oscomp/ltp-net-accept-tail-after-connect02.txt` |
-| accept03 fd-provider focused | `accept03` | `14/23` | `target/oscomp/ltp-accept03-after-pidfd-open-final.txt` |
+| accept03 fd-provider focused | `accept03` | `15/23` | `target/oscomp/ltp-accept03-after-memfd-create.txt` |
 | old kconfig blocker probe | `bind06,sendto03,sendmsg03,setsockopt05,setsockopt06,setsockopt07,setsockopt08,setsockopt09,setsockopt10` | `0/9` | `target/oscomp/ltp-net-kconfig-after-config-file.txt` |
 | userns packet send focused | `sendto03` | `2/2` | `target/oscomp/ltp-sendto03-userns-after-packet-send.txt` |
 | userns packet MTU focused | `setsockopt05` | `1/1` | `target/oscomp/ltp-setsockopt05-userns-after-mtu.txt` |
@@ -40,8 +40,11 @@ local judge subcase total is now `208/227` after the b2/b3/b4/b6 refreshes.
 Treat that as a split-batch progress score, not as "50/50 cases passed". The
 kconfig blocker probe and the focused IPv6/accept/userns rows overlap the split
 batches, so they are not added to that total.
-The focused `accept03` pidfd-provider run proves one additional b4 point, but
-the split total stays `208/227` until the full b4 row is refreshed.
+The focused `accept03` pidfd+memfd provider runs prove two additional b4
+points, but the split total stays `208/227` until the full b4 row is refreshed.
+Supporting ABI witness: `memfd_create02` reports `10/14` in
+`target/oscomp/ltp-memfd-create02-basic.txt`; the skipped subcases are the
+deliberately unsupported seal/hugetlb flag paths.
 
 Recent userns-gated probes changed the interpretation of the old kconfig row:
 `CONFIG_USER_NS=y`, procfs `uid_map`/`gid_map`/`setgroups`, loopback MTU ioctl,
@@ -142,7 +145,7 @@ surface. Use them as regression witnesses after related fixes.
 | `bind05` | AF_UNIX, IPv4 UDP, IPv4 UDP-Lite, IPv6 UDP, and IPv6 UDP-Lite datagram communication pass | Current focused and b4 logs show `14/14`; use this as the IPv6 UDP/UDP-Lite regression witness. |
 | `bind06` | Focused 330s run reaches the AF_PACKET bind/ioctl race body, exits by LTP execution time, and passes `1/1` in `target/oscomp/ltp-bind06-current330.txt`; refreshed b4 reports `bind06 1/1` and `74/86` in `target/oscomp/ltp-net-b4-after-bind06-current.txt` | Use the focused log for direct regression and the refreshed b4 log for aggregate score movement. |
 | `connect02` | Focused log passes `1/1`; the official case is slow and silent because it loops 1000 times | Use `target/oscomp/ltp-net-ipv6-connect02.txt` as the focused regression witness. A 30s outer timeout is too short for this case even though LTP's internal timeout is 30 guest seconds. |
-| `accept03` | Focused `accept03` reports `14/23` in `target/oscomp/ltp-accept03-after-pidfd-open-final.txt`: pidfd now passes `accept() on pidfd : ENOTSOCK`; fanotify/inotify/perf/bpf/new mount API/memfd/memfd_secret providers remain `TCONF` | Direct blocker is broader fd/syscall surface, not TCP accept dataplane. Keep adding principled fd providers; do not add fake descriptor-producing stubs just to satisfy this fd enumerator. |
+| `accept03` | Focused `accept03` reports `15/23` in `target/oscomp/ltp-accept03-after-memfd-create.txt`: pidfd and memfd now pass `accept() ... : ENOTSOCK`; fanotify/inotify/perf/bpf/new mount API/memfd_secret providers remain `TCONF` | Direct blocker is broader fd/syscall surface, not TCP accept dataplane. Keep adding principled fd providers; do not add fake descriptor-producing stubs just to satisfy this fd enumerator. |
 | `accept4_01` | Focused tail log reports `8/9`: libc and `__NR_accept4` variants pass all close-on-exec/nonblock subcases; legacy socketcall check is not available on RV64 | Architecture surface; do not fake legacy `socketcall` on RV64. |
 | `sendto02` | SCTP not supported, `TCONF` | Protocol family blocker; do not fake SCTP. |
 | `sendto03` | Refreshed b2 reports `2/2` in `target/oscomp/ltp-net-b2-sendrecv-after-userns-packet.txt` after AF_PACKET `sendto(sockaddr_ll)`, `PACKET_VNET_HDR`, and packet ring setup support | Use the refreshed b2 log for split movement and `target/oscomp/ltp-sendto03-userns-after-packet-send.txt` as the focused regression witness. |
@@ -172,8 +175,8 @@ now mostly explicit unsupported or broader non-network surfaces:
 - `sendto02`: SCTP unsupported.
 - `recvmsg03`: RDS unsupported.
 - `socketcall01..03`: legacy socketcall is not an RV64 syscall surface.
-- `accept03`: pidfd is now implemented; remaining broad descriptor providers
-  such as fanotify/inotify/perf, bpf, new mount API, memfd, and memfd_secret
+- `accept03`: pidfd and memfd are now implemented; remaining broad descriptor
+  providers such as fanotify/inotify/perf, bpf, new mount API, and memfd_secret
   are outside TCP accept dataplane.
 - `recvmmsg01` musl: known userspace wrapper SIGSEGV after the raw EBADF
   subcase passes.

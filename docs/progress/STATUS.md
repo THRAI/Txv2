@@ -1,3 +1,26 @@
+- 2026-05-26 **Landed basic `memfd_create` as the second `accept03`
+  fd-provider slice.** `memfd_create(279)` now dispatches on RV64, validates
+  the user name/flags, supports ordinary anonymous PageBacked memfds plus
+  `MFD_CLOEXEC`, installs a read/write regular-file fd backed by
+  `PageContainerKind::Anon`, and intentionally rejects `MFD_ALLOW_SEALING` and
+  `MFD_HUGETLB` with `EINVAL` until seal and huge-page semantics exist.
+  Focused LTP `accept03` now reports `15/23` in
+  `target/oscomp/ltp-accept03-after-memfd-create.txt`, with
+  `accept() on memfd : ENOTSOCK`; the focused `memfd_create02` ABI witness
+  reports `10/14` in `target/oscomp/ltp-memfd-create02-basic.txt`, with the
+  seal/hugetlb-only cases skipped as unsupported. **Verification:** `cargo
+  fmt --check`; `cargo check -p tx-subsystems -p tx-shims`; `cargo test -p
+  tx-shims memfd_create --lib`; `cargo xtask syscall-status memfd_create`;
+  `cargo xtask syscall-status --regen`; `cargo xtask syscall sync`; `cargo
+  xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu --submit target/oscomp/submit`; focused LTP `accept03 15/23`;
+  focused LTP `memfd_create02 10/14`; local judge on both logs. **Next step:**
+  continue `accept03` with basic inotify/fanotify instance fds, or switch to
+  the local-only RDS/SCTP protocol surfaces if the next goal is network-only.
+  **Blocker:** remaining `accept03` skips are fanotify, inotify, perf event,
+  bpf map, fsopen/fspick/open_tree, and memfd_secret; file seals and hugetlb
+  memfd remain deliberately unimplemented.
+
 - 2026-05-26 **Landed `pidfd_open` as the first `accept03` fd-provider
   slice.** VFS now has `OpenFileBacking::Pidfd { process }`, and
   `pidfd_open(434)` resolves the target process, installs a pidfd-backed

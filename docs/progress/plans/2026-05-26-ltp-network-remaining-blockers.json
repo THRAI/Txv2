@@ -6,7 +6,7 @@
   "created": "2026-05-26",
   "updated": "2026-05-26",
   "owner": "agent",
-  "summary": "Track the remaining explicit blockers after the LTP network syscall split: SCTP, RDS, TCP TLS ULP, RV64 socketcall interpretation, accept03 fd providers, and the recvmmsg01 musl wrapper SIGSEGV. The constrained TLS ULP setsockopt10 phase is complete and refreshed b6 to 10/11, moving the split total to 208/227. The first accept03 provider slice, pidfd_open, is complete and moves focused accept03 from 13/23 to 14/23; pidfd_send_signal remains pending.",
+  "summary": "Track the remaining explicit blockers after the LTP network syscall split: SCTP, RDS, TCP TLS ULP, RV64 socketcall interpretation, accept03 fd providers, and the recvmmsg01 musl wrapper SIGSEGV. The constrained TLS ULP setsockopt10 phase is complete and refreshed b6 to 10/11, moving the split total to 208/227. The pidfd_open and memfd_create accept03 provider slices are complete and move focused accept03 from 13/23 to 15/23; pidfd_send_signal remains pending.",
   "scope": {
     "in": [
       "crates/tx-shims/src/linux_syscall/socket.rs",
@@ -181,7 +181,7 @@
     {
       "id": "accept03-2-memfd",
       "title": "Implement memfd_create using PageBacked anonymous RNodes",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "accept03-0-inventory"
       ],
@@ -193,10 +193,14 @@
         "crates/tx-subsystems/src/page_backed/"
       ],
       "verification": [
-        "cargo test -p tx-shims --lib memfd",
-        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=accept03,memfd_create01 OSCOMP_OUT_RV=target/oscomp/ltp-memfd-accept03.txt"
+        "cargo test -p tx-shims memfd_create --lib",
+        "cargo xtask syscall-status memfd_create",
+        "timeout 240s make oscomp-qemu-rv64 OSCOMP_LTP=accept03 OSCOMP_OUT_RV=target/oscomp/ltp-accept03-after-memfd-create.txt",
+        "python3 tools/oscomp-judge.py target/oscomp/ltp-accept03-after-memfd-create.txt target/oscomp/testdata",
+        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=memfd_create02 OSCOMP_OUT_RV=target/oscomp/ltp-memfd-create02-basic.txt",
+        "python3 tools/oscomp-judge.py target/oscomp/ltp-memfd-create02-basic.txt target/oscomp/testdata"
       ],
-      "notes": "PAGE_BACKED_v1 explicitly models memfd as PageContainerKind::Anon with an RNode that has no path-namespace presence. Implement the fd as a normal page-backed file, not as an accept03-only descriptor. Seal/fcntl coverage can be staged after the basic fd/read/write/truncate/mmap shape lands."
+      "notes": "Complete as a basic ordinary memfd provider: NR_MEMFD_CREATE dispatches to an anonymous PageContainerKind::Anon wrapped in a synthetic regular-file RNode with no path-namespace presence, supports MFD_CLOEXEC, and rejects MFD_ALLOW_SEALING/MFD_HUGETLB until file seals and huge-page-backed memfds exist. Focused accept03 is 15/23 in target/oscomp/ltp-accept03-after-memfd-create.txt; memfd_create02 is 10/14 in target/oscomp/ltp-memfd-create02-basic.txt with seal/hugetlb subcases skipped as unsupported."
     },
     {
       "id": "accept03-3-notify-fds",
@@ -363,7 +367,7 @@
     {
       "command": "Implementation verification",
       "status": "passed",
-      "notes": "TLS ULP metadata phase passed host tests, focused LTP setsockopt10 1/1 in target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt, and refreshed b6 10/11 in target/oscomp/ltp-net-b6-after-tls-ulp.txt. pidfd_open passed host pidfd_open tests and focused LTP accept03 14/23 in target/oscomp/ltp-accept03-after-pidfd-open-final.txt. SCTP, RDS, pidfd_send_signal, and the remaining fd-provider phases remain pending."
+      "notes": "TLS ULP metadata phase passed host tests, focused LTP setsockopt10 1/1 in target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt, and refreshed b6 10/11 in target/oscomp/ltp-net-b6-after-tls-ulp.txt. pidfd_open passed host pidfd_open tests and focused LTP accept03 14/23 in target/oscomp/ltp-accept03-after-pidfd-open-final.txt. memfd_create passed host memfd_create tests, focused LTP accept03 15/23 in target/oscomp/ltp-accept03-after-memfd-create.txt, and memfd_create02 10/14 in target/oscomp/ltp-memfd-create02-basic.txt. SCTP, RDS, pidfd_send_signal, and the remaining notify/mount/heavy fd-provider phases remain pending."
     }
   ],
   "risks": [

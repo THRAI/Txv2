@@ -7,6 +7,7 @@ use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMutex, StepOutcome};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload};
 use tx_subsystems::vfs::{FsObjectId, FsOps};
 
@@ -18,6 +19,11 @@ static FCNTL_RECORD_LOCKS: SpinMutex<BTreeMap<FsObjectId, Vec<RecordLock>>> =
 
 static PROCFS_PROJECTED_MOUNT: SpinMutex<Option<Cap<tx_subsystems::mount::MountPayload>>> =
     SpinMutex::new(None);
+
+const MEMFD_NAME_MAX: usize = 249;
+const MEMFD_CAPACITY_BYTES: u64 = 16 * 1024 * 1024;
+const MEMFD_FS_OBJECT_ID_BASE: u64 = 0xFFFC_0000_0000_0000;
+static NEXT_MEMFD_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(MEMFD_FS_OBJECT_ID_BASE);
 
 pub(super) fn record_stat_meta_override(fs_object_id: FsObjectId, meta: InodeMeta) {
     STAT_META_OVERRIDES.lock().insert(fs_object_id, meta);
@@ -130,6 +136,81 @@ fn allocate_fd_at_least_under_limit<'a>(
     } else {
         Ok(fd)
     }
+}
+
+fn allocate_memfd_fs_object_id() -> FsObjectId {
+    FsObjectId::new(NEXT_MEMFD_FS_OBJECT_ID.fetch_add(1, Ordering::AcqRel))
+}
+
+/// `memfd_create(name, flags)`. Linux generic ABI `__NR_memfd_create = 279`.
+///
+/// `PAGE_BACKED_v1` models memfd as an anonymous `PageContainerKind::Anon`
+/// wrapped in a synthetic regular-file RNode with no path-namespace presence.
+/// This first slice supports ordinary memfds plus `MFD_CLOEXEC`; it rejects
+/// `MFD_ALLOW_SEALING` until `F_ADD_SEALS`/`F_GET_SEALS` exist, and rejects
+/// hugetlb memfds because there is no huge-page PageContainer variant.
+pub(super) fn sys_memfd_create<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let name_uaddr = args[0];
+    let flags = args[1] as u32;
+
+    if name_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    let recognised = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB;
+    if flags & !recognised != 0 || flags & (MFD_ALLOW_SEALING | MFD_HUGETLB) != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    match bootstrap_read_user_cstr(&ctx.aspace, name_uaddr, MEMFD_NAME_MAX + 1) {
+        Ok(name) if name.len() <= MEMFD_NAME_MAX => {}
+        Ok(_) | Err(Errno::ENAMETOOLONG) => return SyscallResult::Error(EINVAL_VALUE),
+        Err(errno) => return SyscallResult::error_from(errno),
+    }
+
+    let page_count = MEMFD_CAPACITY_BYTES / USER_PAGE_SIZE as u64;
+    let pc = match PageContainer::new_cap(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        page_count,
+    ) {
+        Ok(pc) => pc,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    pc.set_size_bytes(0);
+
+    let rnode = match tx_subsystems::vfs::RNode::new_cap(
+        allocate_memfd_fs_object_id(),
+        InodeMeta::new(InodeKind::Regular, 0o100666),
+        RNodeBacking::PageBacked { pc },
+    ) {
+        Ok(rnode) => rnode,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let open_file = match OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            cloexec: flags & MFD_CLOEXEC != 0,
+            ..OpenFileFlags::default()
+        },
+    ) {
+        Ok(file) => file,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+
+    let fd = match allocate_fd_under_limit(ctx) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let _ = ctx.process.install_fd(fd, open_file);
+    if flags & MFD_CLOEXEC != 0 {
+        ctx.process.set_fd_cloexec(fd, true);
+    }
+
+    SyscallResult::Return(fd as i64)
 }
 
 /// `fcntl(fd, cmd, arg)` per the Wave 2 ELF-loader plan §"Part 2 —

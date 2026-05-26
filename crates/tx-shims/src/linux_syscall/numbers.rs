@@ -1484,6 +1484,16 @@ pub const NR_TRUNCATE: u64 = 45;
 pub const NR_FTRUNCATE: u64 = 46;
 /// `NR_FALLOCATE = 47` — Linux RV64 generic ABI `__NR_fallocate`.
 pub const NR_FALLOCATE: u64 = 47;
+/// `NR_MEMFD_CREATE = 279` — Linux generic ABI `__NR_memfd_create`.
+/// Returns an anonymous PageBacked regular-file fd with no path presence.
+pub const NR_MEMFD_CREATE: u64 = 279;
+/// `memfd_create(2)` flag: mark the returned fd close-on-exec.
+pub const MFD_CLOEXEC: u32 = 0x0001;
+/// `memfd_create(2)` flag: allow file seals. Currently rejected until
+/// F_ADD_SEALS/F_GET_SEALS semantics exist.
+pub const MFD_ALLOW_SEALING: u32 = 0x0002;
+/// `memfd_create(2)` flag for hugetlb-backed memfds. Unsupported.
+pub const MFD_HUGETLB: u32 = 0x0004;
 /// `NR_READLINKAT = 78` — Linux RV64 generic ABI `__NR_readlinkat`.
 /// Slice 8 walks the link's parent directory and calls
 /// `FsOps::lookup` + `read_link` directly so the symlink's target

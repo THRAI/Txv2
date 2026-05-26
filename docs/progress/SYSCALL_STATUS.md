@@ -18,7 +18,7 @@ record which specific OSComp/LTP test(s) closed it under "Currently
 passing" below.
 
 **Last refresh:** 2026-05-26 (mechanical syscall status refreshed after
-`pidfd_open` dispatch).
+`memfd_create` dispatch).
 
 ## Headline counts
 
@@ -29,8 +29,8 @@ passing" below.
 _Counts read from `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}`._
 _Run `cargo xtask syscall-status --regen` to refresh; `--check` to lint in CI._
 
-- **`NR_*` defined:** 195
-- **Dispatched (has a match arm):** 193
+- **`NR_*` defined:** 196
+- **Dispatched (has a match arm):** 194
 - **Defined but not dispatched:** 2 — see list below
 
 #### Defined but not dispatched
@@ -107,6 +107,11 @@ core (PR-11).
 - 2026-05-26: `pidfd_open(434)` is dispatched and installs a pidfd-backed fd;
   focused LTP `accept03` moved from `13/23` to `14/23` in
   `target/oscomp/ltp-accept03-after-pidfd-open-final.txt`.
+- 2026-05-26: `memfd_create(279)` is dispatched and installs an anonymous
+  PageBacked regular-file fd; focused LTP `accept03` moved from `14/23` to
+  `15/23` in `target/oscomp/ltp-accept03-after-memfd-create.txt`, and
+  `memfd_create02` reports `10/14` in
+  `target/oscomp/ltp-memfd-create02-basic.txt`.
 
 ### When a syscall lands
 
@@ -115,7 +120,7 @@ test(s) that newly pass — e.g. *"2026-05-19: `getrlimit01`, `getrlimit02`
 pass after rlimit field landed (commit `<sha>`)"*. The skill's "Done Means"
 requires this entry before the work counts as complete.
 
-## Unwired by topic (~116 syscalls)
+## Unwired by topic (~115 syscalls)
 
 ### File I/O & VFS extras (18)
 
@@ -141,10 +146,10 @@ requires this entry before the work counts as complete.
 `mq_open` / `_close` / `_unlink` / `_getattr` / `_setattr` / `_send` /
 `_receive` / `_timedsend` / `_timedreceive` / `_notify`.
 
-### Memory extended (8)
+### Memory extended (7)
 
 `mlock2`, `mbind`, `migrate_pages`, `get_mempolicy`, `set_mempolicy`,
-`process_vm_readv` / `_writev`, `memfd_create`.
+`process_vm_readv` / `_writev`.
 
 ### Process / sched / limits (22)
 
@@ -246,8 +251,8 @@ overwritten by the next `sync`. The lint variant
 
 ### Counts (from dispatch table)
 
-- `pub const NR_*` in numbers.rs: **195**
-- dispatched in mod.rs: **192** (of which async: 59, likely-stub: 0)
+- `pub const NR_*` in numbers.rs: **196**
+- dispatched in mod.rs: **193** (of which async: 59, likely-stub: 0)
 - defined but not dispatched: **3**
 
 ### Defined in `numbers.rs` but no dispatch arm (3)
@@ -258,7 +263,7 @@ These have a syscall number constant but no match arm in `mod.rs`. Either wire t
 - `NR_PIDFD_SEND_SIGNAL` (nr=424)
 - `NR_PSELECT6` (nr=72)
 
-### Dispatched syscalls (192) — name → handler
+### Dispatched syscalls (193) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -445,6 +450,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 269 | `NR_SENDMMSG` | `sys_sendmmsg` | sync |
 | 276 | `NR_RENAMEAT2` | `sys_renameat2` | async |
 | 278 | `NR_GETRANDOM` | `sys_getrandom` | sync |
+| 279 | `NR_MEMFD_CREATE` | `sys_memfd_create` | sync |
 | 282 | `NR_SIGNALFD` | `sys_signalfd` | sync |
 | 282 | `NR_USERFAULTFD` | `sys_userfaultfd` | sync |
 | 283 | `NR_MEMBARRIER` | `sys_membarrier` | sync |

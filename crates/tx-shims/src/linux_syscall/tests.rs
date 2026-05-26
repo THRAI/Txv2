@@ -35,20 +35,21 @@ use tx_subsystems::process::{bootstrap_init_process, ExitStatus, Pid, ProcessIde
 use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
-use tx_subsystems::vfs::structure::OpenFileBacking;
+use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking};
 use tx_subsystems::vfs::OpenFile;
 use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
 use super::{
     dispatch, SyscallCtx, SyscallResult, CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID,
-    CLONE_PARENT_SETTID, EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, NR_BRK,
-    NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPGRP, NR_GETPID,
-    NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_MEMBARRIER, NR_PIDFD_OPEN, NR_PIPE2, NR_PPOLL,
-    NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY,
-    NR_SCHED_SETAFFINITY, NR_SCHED_YIELD, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST,
-    NR_SET_TID_ADDRESS, NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, NR_WRITEV, O_DIRECTORY, O_NONBLOCK,
-    PIDFD_NONBLOCK, SIGCHLD, WNOHANG,
+    CLONE_PARENT_SETTID, EFAULT_VALUE, EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_GETFL,
+    F_SETFD, MFD_ALLOW_SEALING, MFD_CLOEXEC, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP,
+    NR_FCNTL, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST,
+    NR_MEMBARRIER, NR_MEMFD_CREATE, NR_PIDFD_OPEN, NR_PIPE2, NR_PPOLL, NR_READ, NR_RT_SIGACTION,
+    NR_RT_SIGPROCMASK, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY,
+    NR_SCHED_YIELD, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
+    NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, NR_WRITEV, O_DIRECTORY, O_NONBLOCK, PIDFD_NONBLOCK,
+    SIGCHLD, WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
@@ -537,6 +538,78 @@ fn dispatch_pidfd_open_honours_nonblock_and_rejects_unknown_flags() {
         block_on(dispatch::<ShimsTestPmap>(getfl, &ctx)),
         SyscallResult::Return(O_NONBLOCK as i64)
     );
+}
+
+#[test]
+fn dispatch_memfd_create_installs_anon_pagebacked_file() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let name = b"ltp_memfd\0";
+
+    let req = SyscallRequest::new(NR_MEMFD_CREATE, [name.as_ptr() as u64, 0, 0, 0, 0, 0]);
+    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("memfd_create failed: {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("memfd installed");
+    assert!(!proc_cap.fd_cloexec(fd));
+    let flags = file.flags();
+    assert!(flags.read);
+    assert!(flags.write);
+    assert!(!flags.cloexec);
+    match file.rnode().backing() {
+        RNodeBacking::PageBacked { pc } => {
+            assert!(matches!(
+                pc.kind(),
+                tx_subsystems::page_backed::PageContainerKind::Anon { .. }
+            ));
+            assert_eq!(pc.size_bytes(), 0);
+        }
+        other => panic!("expected PageBacked memfd rnode, got {other:?}"),
+    }
+}
+
+#[test]
+fn dispatch_memfd_create_validates_name_flags_and_cloexec() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let name = b"test\0";
+
+    let null_name = SyscallRequest::new(NR_MEMFD_CREATE, [0, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(null_name, &ctx)),
+        SyscallResult::Error(EFAULT_VALUE)
+    );
+
+    let sealing = SyscallRequest::new(
+        NR_MEMFD_CREATE,
+        [name.as_ptr() as u64, MFD_ALLOW_SEALING as u64, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(sealing, &ctx)),
+        SyscallResult::Error(EINVAL_VALUE)
+    );
+
+    let unknown = SyscallRequest::new(NR_MEMFD_CREATE, [name.as_ptr() as u64, 0x100, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(unknown, &ctx)),
+        SyscallResult::Error(EINVAL_VALUE)
+    );
+
+    let cloexec = SyscallRequest::new(
+        NR_MEMFD_CREATE,
+        [name.as_ptr() as u64, MFD_CLOEXEC as u64, 0, 0, 0, 0],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(cloexec, &ctx)) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("memfd_create(MFD_CLOEXEC) failed: {other:?}"),
+    };
+    assert!(proc_cap.fd_cloexec(fd));
+    assert!(proc_cap.fd(fd).expect("memfd installed").flags().cloexec);
 }
 
 #[test]
