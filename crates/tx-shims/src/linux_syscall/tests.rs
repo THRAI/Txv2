@@ -35,19 +35,20 @@ use tx_subsystems::process::{bootstrap_init_process, ExitStatus, Pid, ProcessIde
 use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
+use tx_subsystems::vfs::structure::OpenFileBacking;
 use tx_subsystems::vfs::OpenFile;
 use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
 use super::{
     dispatch, SyscallCtx, SyscallResult, CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID,
-    CLONE_PARENT_SETTID, EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK,
+    CLONE_PARENT_SETTID, EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, NR_BRK,
     NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPGRP, NR_GETPID,
-    NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_MEMBARRIER, NR_PIPE2, NR_PPOLL, NR_READ,
-    NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY,
+    NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_MEMBARRIER, NR_PIDFD_OPEN, NR_PIPE2, NR_PPOLL,
+    NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY,
     NR_SCHED_SETAFFINITY, NR_SCHED_YIELD, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST,
-    NR_SET_TID_ADDRESS, NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, NR_WRITEV, O_DIRECTORY, SIGCHLD,
-    WNOHANG,
+    NR_SET_TID_ADDRESS, NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, NR_WRITEV, O_DIRECTORY, O_NONBLOCK,
+    PIDFD_NONBLOCK, SIGCHLD, WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
@@ -478,6 +479,64 @@ fn dispatch_unknown_nr_returns_neg_enosys() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
 
     assert_eq!(result, SyscallResult::Error(38));
+}
+
+#[test]
+fn dispatch_pidfd_open_installs_pidfd_backing_for_self() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let req = SyscallRequest::new(NR_PIDFD_OPEN, [proc_cap.pid.0 as u64, 0, 0, 0, 0, 0]);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    let fd = match result {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("pidfd_open failed: {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("pidfd installed");
+    match file.backing() {
+        OpenFileBacking::Pidfd { process } => assert_eq!(process.pid, proc_cap.pid),
+        other => panic!("expected pidfd backing, got {other:?}"),
+    }
+    assert!(proc_cap.fd_cloexec(fd));
+    let flags = file.flags();
+    assert!(flags.read);
+    assert!(!flags.write);
+    assert!(flags.cloexec);
+    assert!(!flags.nonblocking);
+}
+
+#[test]
+fn dispatch_pidfd_open_honours_nonblock_and_rejects_unknown_flags() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let invalid = SyscallRequest::new(NR_PIDFD_OPEN, [proc_cap.pid.0 as u64, 1, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(invalid, &ctx)),
+        SyscallResult::Error(EINVAL_VALUE)
+    );
+
+    let req = SyscallRequest::new(
+        NR_PIDFD_OPEN,
+        [proc_cap.pid.0 as u64, PIDFD_NONBLOCK as u64, 0, 0, 0, 0],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("pidfd_open(O_NONBLOCK) failed: {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("pidfd installed");
+    assert!(file.flags().nonblocking);
+    assert!(proc_cap.fd_cloexec(fd));
+
+    let getfl = SyscallRequest::new(NR_FCNTL, [fd as u64, F_GETFL as u64, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(getfl, &ctx)),
+        SyscallResult::Return(O_NONBLOCK as i64)
+    );
 }
 
 #[test]

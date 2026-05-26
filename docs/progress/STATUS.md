@@ -1,3 +1,22 @@
+- 2026-05-26 **Landed `pidfd_open` as the first `accept03` fd-provider
+  slice.** VFS now has `OpenFileBacking::Pidfd { process }`, and
+  `pidfd_open(434)` resolves the target process, installs a pidfd-backed
+  `OpenFile`, marks the fd close-on-exec, accepts `PIDFD_NONBLOCK`, and
+  rejects unknown flags with `EINVAL`. Focused LTP `accept03` now reports
+  `14/23` in `target/oscomp/ltp-accept03-after-pidfd-open-final.txt`, with
+  `accept() on pidfd : ENOTSOCK`; the previous focused baseline was `13/23`.
+  **Verification:** `cargo fmt --check`; `cargo check -p tx-subsystems -p
+  tx-shims`; `cargo test -p tx-shims pidfd_open --lib`; `cargo xtask
+  syscall-status --regen`; `cargo xtask syscall-status pidfd_open`; `cargo
+  xtask syscall-status --check`; `cargo xtask syscall sync`; `cargo xtask lint
+  syscall-status`; `cargo xtask build --target rv64-qemu`; `cargo xtask oscomp
+  submit --target rv64-qemu --submit target/oscomp/submit`; focused LTP
+  `accept03 14/23`. **Next step:** choose the next `accept03` provider, with
+  `memfd_create` or basic inotify instance fds looking lower-risk than
+  fanotify/perf/bpf/new-mount API. **Blocker:** remaining `accept03` skips are
+  fanotify, inotify, perf event, bpf map, fsopen/fspick/open_tree, memfd, and
+  memfd_secret; `pidfd_send_signal` remains separate signal semantics work.
+
 - 2026-05-26 **Landed the constrained TCP TLS ULP path for LTP
   `setsockopt10`.** TCP sockets now track a TLS ULP metadata state when
   `setsockopt(SOL_TCP/TCP_ULP, "tls")` is applied to a connected TCP socket,

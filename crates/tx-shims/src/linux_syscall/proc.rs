@@ -186,15 +186,11 @@ pub(super) fn sys_pidfd_getfd(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    let target_pid = match pidfd_file.pidfd_pid() {
-        Some(pid) => Pid(pid),
+    let target = match pidfd_file.pidfd_process() {
+        Some(target) => target,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    let target = match process_by_pid(target_pid) {
-        Some(target) => target,
-        None => return SyscallResult::Error(ESRCH_VALUE),
-    };
-    if !pidfd_getfd_permission_allows(ctx, &target) {
+    if !pidfd_getfd_permission_allows(ctx, target) {
         return SyscallResult::Error(EPERM_VALUE);
     }
 

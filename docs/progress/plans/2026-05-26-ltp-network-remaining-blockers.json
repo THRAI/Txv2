@@ -6,7 +6,7 @@
   "created": "2026-05-26",
   "updated": "2026-05-26",
   "owner": "agent",
-  "summary": "Track the remaining explicit blockers after the LTP network syscall split: SCTP, RDS, TCP TLS ULP, RV64 socketcall interpretation, accept03 fd providers, and the recvmmsg01 musl wrapper SIGSEGV. The constrained TLS ULP setsockopt10 phase is complete and refreshed b6 to 10/11, moving the split total to 208/227.",
+  "summary": "Track the remaining explicit blockers after the LTP network syscall split: SCTP, RDS, TCP TLS ULP, RV64 socketcall interpretation, accept03 fd providers, and the recvmmsg01 musl wrapper SIGSEGV. The constrained TLS ULP setsockopt10 phase is complete and refreshed b6 to 10/11, moving the split total to 208/227. The first accept03 provider slice, pidfd_open, is complete and moves focused accept03 from 13/23 to 14/23; pidfd_send_signal remains pending.",
   "scope": {
     "in": [
       "crates/tx-shims/src/linux_syscall/socket.rs",
@@ -141,7 +141,7 @@
     {
       "id": "accept03-0-inventory",
       "title": "Refresh accept03 provider inventory and fd error contract",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "audit-0"
       ],
@@ -151,10 +151,10 @@
         "docs/LTP/ltp-network-syscall-progress.md"
       ],
       "verification": [
-        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=accept03 OSCOMP_OUT_RV=target/oscomp/ltp-accept03-provider-inventory.txt",
-        "python3 tools/oscomp-judge.py target/oscomp/ltp-accept03-provider-inventory.txt target/oscomp/testdata"
+        "timeout 240s make oscomp-qemu-rv64 OSCOMP_LTP=accept03 OSCOMP_OUT_RV=target/oscomp/ltp-accept03-provider-inventory-current.txt",
+        "python3 tools/oscomp-judge.py target/oscomp/ltp-accept03-provider-inventory-current.txt target/oscomp/testdata"
       ],
-      "notes": "Read the exact TCONF list emitted by tst_fd.c before implementing providers. accept03 expects ENOTSOCK for real non-socket open files and EBADF for O_PATH/open_tree-style fds without a normal file object. First make sure accept(fd) classifies all existing OpenFileBacking values generically rather than by test name."
+      "notes": "Inventory refreshed before pidfd_open work: accept03 baseline was 13/23 and skipped pidfd_open, fanotify, inotify, perf event, bpf map, fsopen, fspick, open_tree, memfd, and memfd_secret. accept03 expects ENOTSOCK for real non-socket open files and EBADF for O_PATH/open_tree-style fds without a normal file object. Existing OpenFileBacking values are classified generically rather than by test name."
     },
     {
       "id": "accept03-1-pidfd",
@@ -166,15 +166,17 @@
       "paths": [
         "crates/tx-shims/src/linux_syscall/signal.rs",
         "crates/tx-shims/src/linux_syscall/mod.rs",
+        "crates/tx-subsystems/src/vfs/structure.rs",
         "crates/tx-subsystems/src/process/",
         "crates/tx-subsystems/src/signal/",
         "docs/progress/SYSCALL_STATUS.md"
       ],
       "verification": [
         "cargo test -p tx-shims --lib pidfd",
-        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=accept03,pidfd_open01,pidfd_send_signal01 OSCOMP_OUT_RV=target/oscomp/ltp-pidfd-accept03.txt"
+        "timeout 240s make oscomp-qemu-rv64 OSCOMP_LTP=accept03 OSCOMP_OUT_RV=target/oscomp/ltp-accept03-after-pidfd-open-final.txt",
+        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=pidfd_open01,pidfd_send_signal01 OSCOMP_OUT_RV=target/oscomp/ltp-pidfd-remaining.txt"
       ],
-      "notes": "SIGNAL_v1 commits pidfd Phase 1: pidfd_open and pidfd_send_signal, with pidfd readability driven by ProcessIdentity exit publication. This is a principled accept03 provider and also removes two defined-but-undispatched syscall rows."
+      "notes": "pidfd_open sub-slice complete: NR_PIDFD_OPEN now dispatches, resolves ProcessIdentity, installs OpenFileBacking::Pidfd, sets FD_CLOEXEC, accepts PIDFD_NONBLOCK, and makes accept03 pass pidfd as ENOTSOCK. Focused accept03 is 14/23 in target/oscomp/ltp-accept03-after-pidfd-open-final.txt. pidfd_send_signal and pidfd wait/readiness semantics remain pending; SIGNAL_v1 still points to ProcessIdentity exit publication for the later readiness path."
     },
     {
       "id": "accept03-2-memfd",
@@ -361,7 +363,7 @@
     {
       "command": "Implementation verification",
       "status": "passed",
-      "notes": "TLS ULP metadata phase passed host tests, focused LTP setsockopt10 1/1 in target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt, and refreshed b6 10/11 in target/oscomp/ltp-net-b6-after-tls-ulp.txt. SCTP, RDS, and fd-provider phases remain pending."
+      "notes": "TLS ULP metadata phase passed host tests, focused LTP setsockopt10 1/1 in target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt, and refreshed b6 10/11 in target/oscomp/ltp-net-b6-after-tls-ulp.txt. pidfd_open passed host pidfd_open tests and focused LTP accept03 14/23 in target/oscomp/ltp-accept03-after-pidfd-open-final.txt. SCTP, RDS, pidfd_send_signal, and the remaining fd-provider phases remain pending."
     }
   ],
   "risks": [

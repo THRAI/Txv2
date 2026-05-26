@@ -1288,8 +1288,10 @@ pub const NR_RT_SIGQUEUEINFO: u64 = 138;
 /// Phase J: returns `-ENOSYS`; TODO full implementation.
 pub const NR_RT_SIGTIMEDWAIT: u64 = 137;
 /// `pidfd_open(pid, flags)` — Linux RV64.
-/// Phase J: returns `-ENOSYS`; TODO full implementation.
+/// Returns a pidfd-backed `OpenFile` with close-on-exec set by default.
 pub const NR_PIDFD_OPEN: u64 = 434;
+/// `pidfd_open(2)` flag: open the resulting pidfd with `O_NONBLOCK`.
+pub const PIDFD_NONBLOCK: u32 = O_NONBLOCK;
 /// `pidfd_send_signal(pidfd, sig, info, flags)` — Linux RV64.
 /// Phase J: returns `-ENOSYS`; TODO full implementation.
 pub const NR_PIDFD_SEND_SIGNAL: u64 = 424;

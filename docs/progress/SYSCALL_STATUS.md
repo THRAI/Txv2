@@ -17,8 +17,8 @@ inner loop; OSComp + LTP are the correctness bar. When a syscall lands,
 record which specific OSComp/LTP test(s) closed it under "Currently
 passing" below.
 
-**Last refresh:** 2026-05-22 (mechanical syscall status refreshed after LTP
-entrypoint wiring).
+**Last refresh:** 2026-05-26 (mechanical syscall status refreshed after
+`pidfd_open` dispatch).
 
 ## Headline counts
 
@@ -29,9 +29,9 @@ entrypoint wiring).
 _Counts read from `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}`._
 _Run `cargo xtask syscall-status --regen` to refresh; `--check` to lint in CI._
 
-- **`NR_*` defined:** 194
-- **Dispatched (has a match arm):** 191
-- **Defined but not dispatched:** 3 — see list below
+- **`NR_*` defined:** 195
+- **Dispatched (has a match arm):** 193
+- **Defined but not dispatched:** 2 — see list below
 
 #### Defined but not dispatched
 
@@ -39,7 +39,6 @@ These syscalls have a `pub const NR_*` in `numbers.rs` but no match arm in `disp
 
 | `NR_*` | # | Summary |
 |---|---:|---|
-| `NR_PIDFD_OPEN` | 434 | `pidfd_open(pid, flags)` — Linux RV64. |
 | `NR_PIDFD_SEND_SIGNAL` | 424 | `pidfd_send_signal(pidfd, sig, info, flags)` — Linux RV64. |
 | `NR_PSELECT6_TIME64` | 413 | `pselect6_time64(...)`. Linux generic ABI `__NR_pselect6_time64 = 413`. |
 
@@ -104,6 +103,10 @@ current image ships).
 family, `mkdir`/`unlink`/`rename`/`symlink`, `getdents64`, `epoll`/`futex`/
 `timerfd`/`eventfd`/`signalfd` basics, `rt_sigaction`/`procmask` basics, AIO
 core (PR-11).
+
+- 2026-05-26: `pidfd_open(434)` is dispatched and installs a pidfd-backed fd;
+  focused LTP `accept03` moved from `13/23` to `14/23` in
+  `target/oscomp/ltp-accept03-after-pidfd-open-final.txt`.
 
 ### When a syscall lands
 
@@ -244,19 +247,18 @@ overwritten by the next `sync`. The lint variant
 ### Counts (from dispatch table)
 
 - `pub const NR_*` in numbers.rs: **195**
-- dispatched in mod.rs: **191** (of which async: 59, likely-stub: 0)
-- defined but not dispatched: **4**
+- dispatched in mod.rs: **192** (of which async: 59, likely-stub: 0)
+- defined but not dispatched: **3**
 
-### Defined in `numbers.rs` but no dispatch arm (4)
+### Defined in `numbers.rs` but no dispatch arm (3)
 
 These have a syscall number constant but no match arm in `mod.rs`. Either wire them up or remove the constant.
 
 - `NR_IO_URING_ENTER` (nr=426)
-- `NR_PIDFD_OPEN` (nr=434)
 - `NR_PIDFD_SEND_SIGNAL` (nr=424)
 - `NR_PSELECT6` (nr=72)
 
-### Dispatched syscalls (191) — name → handler
+### Dispatched syscalls (192) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -452,6 +454,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 291 | `NR_STATX` | `sys_statx` | async |
 | 413 | `NR_PSELECT6_TIME64` | `sys_pselect6` | async |
 | 425 | `NR_IO_URING_SETUP` | `sys_io_uring_setup` | sync |
+| 434 | `NR_PIDFD_OPEN` | `sys_pidfd_open` | sync |
 | 439 | `NR_FACCESSAT2` | `sys_faccessat2` | sync |
 
 <!-- END syscall-auto-table -->

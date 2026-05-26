@@ -704,6 +704,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_KILL => sys_kill(req.args, ctx),
         nr if nr == NR_TKILL => sys_tkill(req.args, ctx),
         nr if nr == NR_TGKILL => sys_tgkill(req.args, ctx),
+        nr if nr == NR_PIDFD_OPEN => sys_pidfd_open(req.args, ctx),
         // rt_sigreturn: deferred. Returns -ENOSYS — the
         // SignalFrameIf::restore_signal_frame surface needs the trap
         // frame which the dispatcher does not yet pass through. The

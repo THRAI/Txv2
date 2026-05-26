@@ -12,6 +12,7 @@ use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKin
 use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
 use tx_subsystems::signal::{KillOutcome, SignalTarget};
 use tx_subsystems::thread_runtime::execution::step_sigprocmask;
+use tx_subsystems::vfs::structure::{OpenFile, OpenFileFlags};
 
 #[cfg(target_arch = "loongarch64")]
 const MUSL_SIGCANCEL: u8 = 33;
@@ -484,8 +485,6 @@ pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
 }
 
 pub(super) fn sys_pidfd_open(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
-    const PIDFD_NONBLOCK: u32 = O_NONBLOCK;
-
     let pid_raw = args[0];
     let flags = args[1] as u32;
 
@@ -496,10 +495,10 @@ pub(super) fn sys_pidfd_open(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult 
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
-    let pid = Pid(pid_raw as u32);
-    if process_by_pid(pid).is_none() {
-        return SyscallResult::Error(ESRCH_VALUE);
-    }
+    let target = match resolve_pid_number_as(pid_raw, PidNameKind::Process) {
+        Some(PidName::Process(process)) => process,
+        _ => return SyscallResult::Error(ESRCH_VALUE),
+    };
 
     let fd = ctx.process.allocate_fd();
     let (soft_limit, _) = ctx.process.rlimit_nofile();
@@ -514,7 +513,7 @@ pub(super) fn sys_pidfd_open(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult 
         cloexec: true,
         nonblocking: (flags & PIDFD_NONBLOCK) != 0,
     };
-    let open_cap = match OpenFile::new_pidfd_cap(pid.0, open_flags) {
+    let open_cap = match OpenFile::new_pidfd_cap(target, open_flags) {
         Ok(cap) => cap,
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
@@ -523,12 +522,14 @@ pub(super) fn sys_pidfd_open(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult 
     SyscallResult::Return(fd as i64)
 }
 
-fn pid_from_pidfd_like_file(file: &OpenFile) -> Option<Pid> {
-    if let Some(pid) = file.pidfd_pid() {
-        return Some(Pid(pid));
+fn process_from_pidfd_like_file(file: &OpenFile) -> Option<Cap<ProcessIdentity>> {
+    if let Some(process) = file.pidfd_process() {
+        return Some(process.clone());
     }
     match file.backing() {
-        OpenFileBacking::Rnode { rnode } => tx_fs::procfs::pid_from_dir(rnode.fs_object_id()),
+        OpenFileBacking::Rnode { rnode } => {
+            tx_fs::procfs::pid_from_dir(rnode.fs_object_id()).and_then(process_by_pid)
+        }
         _ => None,
     }
 }
@@ -547,13 +548,9 @@ pub(super) fn sys_pidfd_send_signal(args: [u64; 6], ctx: &SyscallCtx) -> Syscall
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    let pid = match pid_from_pidfd_like_file(&file) {
-        Some(pid) => pid,
-        None => return SyscallResult::Error(EBADF_VALUE),
-    };
-    let target = match process_by_pid(pid) {
+    let target = match process_from_pidfd_like_file(&file) {
         Some(target) => target,
-        None => return SyscallResult::Error(ESRCH_VALUE),
+        None => return SyscallResult::Error(EBADF_VALUE),
     };
 
     if sig > 64 {

@@ -1059,10 +1059,10 @@ pub enum OpenFileBacking {
     /// descriptor is a normal fd-table entry whose backing carries the
     /// POSIX mq identity and per-open flags.
     PosixMq { mq: Cap<PosixMqInstance> },
-    /// `pidfd_open(2)` open file. The descriptor identifies a process by
-    /// pid for Linux compatibility; fuller pidfd wait/signal semantics
-    /// remain in the syscall layer.
-    Pidfd { pid: u32 },
+    /// `pidfd_open(2)` open file. The fd keeps a capability reference
+    /// to the target process identity; exit/readiness lives on the
+    /// process side, so this adapter does not duplicate signal truth.
+    Pidfd { process: Cap<ProcessIdentity> },
 }
 
 /// Per-fd file-position carrier.
@@ -1298,9 +1298,9 @@ impl OpenFile {
     }
 
     /// Construct a pidfd-backed `OpenFile`.
-    pub fn new_pidfd(pid: u32, flags: OpenFileFlags) -> Self {
+    pub fn new_pidfd(process: Cap<ProcessIdentity>, flags: OpenFileFlags) -> Self {
         Self {
-            backing: OpenFileBacking::Pidfd { pid },
+            backing: OpenFileBacking::Pidfd { process },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
@@ -1310,8 +1310,11 @@ impl OpenFile {
     }
 
     /// Zone-sign a fresh pidfd-backed `OpenFile`.
-    pub fn new_pidfd_cap(pid: u32, flags: OpenFileFlags) -> Result<Cap<Self>, ZoneError> {
-        step_engine::sign(Self::new_pidfd(pid, flags))
+    pub fn new_pidfd_cap(
+        process: Cap<ProcessIdentity>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_pidfd(process, flags))
     }
 
     /// Construct an io_uring-backed `OpenFile` (future PR-12 phase 0 —
@@ -1415,7 +1418,7 @@ impl OpenFile {
             ),
             OpenFileBacking::Pidfd { .. } => panic!(
                 "OpenFile::rnode() called on a pidfd-backed OpenFile; \
-                 dispatch via OpenFile::backing() / OpenFile::pidfd_pid() first",
+                 dispatch via OpenFile::backing() / OpenFile::pidfd_process() first",
             ),
         }
     }
@@ -1605,10 +1608,10 @@ impl OpenFile {
         }
     }
 
-    /// Return the target pid iff this `OpenFile` is pidfd-backed.
-    pub fn pidfd_pid(&self) -> Option<u32> {
+    /// `Some(&Cap<ProcessIdentity>)` iff this `OpenFile` is a pidfd.
+    pub fn pidfd_process(&self) -> Option<&Cap<ProcessIdentity>> {
         match &self.backing {
-            OpenFileBacking::Pidfd { pid } => Some(*pid),
+            OpenFileBacking::Pidfd { process } => Some(process),
             OpenFileBacking::Rnode { .. }
             | OpenFileBacking::Ufd { .. }
             | OpenFileBacking::AioContext { .. }
