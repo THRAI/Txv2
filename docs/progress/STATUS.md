@@ -1,3 +1,47 @@
+- 2026-05-27 **Refreshed b2/b3/b4 LTP network split rows after the local
+  RDS/SCTP slice.** Rebuilt/submitted the RV64 kernel and reran the affected
+  aggregate batches: b2 is now `35/35` in
+  `target/oscomp/ltp-net-b2-after-rds-sctp.txt`, b3 is `37/38` in
+  `target/oscomp/ltp-net-b3-after-rds-sctp.txt`, and b4 is `91/95` in
+  `target/oscomp/ltp-net-b4-after-rds-sctp.txt`. This moves the split-batch
+  total from `208/227` to `227/236`. The denominator increased because
+  previously skipped protocol/fd-provider subcases are now real scored
+  subcases. **Verification:** `cargo xtask build --target rv64-qemu`; `cargo
+  xtask oscomp submit --target rv64-qemu --submit target/oscomp/submit`;
+  focused split runs for b2/b3/b4; local judge on all three logs. **Next
+  step:** choose a remaining blocker: RV64 legacy `socketcall` interpretation,
+  `recvmmsg01` musl bad-msgvec SIGSEGV, `accept03` heavy providers
+  (`perf_event_open`, `bpf`, `memfd_secret`), or compat-only
+  `setsockopt03`. **Blocker:** remaining aggregate misses are not RDS/SCTP:
+  b3 has `recvmmsg01 1/2`, b4 has `accept03 20/23` plus `accept4_01 8/9`,
+  b5 remains the legacy `socketcall` row, and b6 keeps the 32-bit compat-only
+  `setsockopt03` gap.
+
+- 2026-05-26 **Landed local-only RDS/SCTP protocol surfaces for the remaining
+  LTP protocol-family blockers.** `AF_RDS SOCK_SEQPACKET` now has real local
+  bind/send/recv queue semantics with source-address writeback, moving
+  focused `recvmsg03` to `1/1`; `IPPROTO_SCTP` stream sockets now have
+  separate SCTP bind/listener/connection tables, local IPv4/IPv6
+  listen/connect/accept/read/write associations, and close/readiness cleanup,
+  moving focused `sendto02,bind04` to `17/17`. Enabling SCTP exposed that the
+  later `bind04` IPv6 TCP rows had not been exercised before; RawTcp loopback
+  now supports IPv6 smoltcp endpoints/segments, with a `[::1]` TCP host
+  regression test. This remains local syscall-surface coverage, not full RDS
+  or SCTP wire protocol work. **Verification:** `cargo fmt --check`; `cargo
+  check -p tx-subsystems -p tx-shims`; `cargo test -p tx-subsystems --lib
+  tcp_loopback_ipv6_client_reaches_inet6_loopback_listener -- --test-threads=1`;
+  `cargo test -p tx-subsystems --lib rds_sctp -- --test-threads=1`; `cargo
+  xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu --submit target/oscomp/submit`; focused LTP `recvmsg03 1/1` in
+  `target/oscomp/ltp-recvmsg03-rds-after-ipv6tcp.txt`; focused LTP
+  `sendto02,bind04 17/17` in
+  `target/oscomp/ltp-sctp-sendto02-bind04-after-ipv6tcp-submit.txt`; local
+  judge on both logs. **Next step:** refresh the affected b2/b3/b4 split rows
+  when aggregate score movement is needed, or choose the next remaining
+  blocker (`socketcall` ABI interpretation, `recvmmsg01` musl SIGSEGV, or the
+  heavy `accept03` providers). **Blocker:** full RDS/SCTP external protocol
+  stacks remain out of this slice.
+
 - 2026-05-26 **Landed scoped Linux new-mount-API fd providers for the
   `accept03` tail.** Added zone-managed `MountApiFile` descriptors and VFS
   `OpenFileBacking::MountApi`, wired `fsopen(430)`, `fspick(433)`, and

@@ -4,7 +4,7 @@ pub(super) fn connect_sockaddr_for_local_stack(
     kind: SocketKind,
     remote: KernelSockAddr,
 ) -> KernelSockAddr {
-    if kind != SocketKind::Tcp && kind != SocketKind::Udp {
+    if kind != SocketKind::Tcp && kind != SocketKind::Udp && kind != SocketKind::Sctp {
         return remote;
     }
     match remote {
@@ -22,7 +22,10 @@ pub(super) fn maybe_autobind_connect_client(
     socket: &Cap<SocketIdentity>,
     remote: KernelSockAddr,
 ) -> Result<(), Errno> {
-    if socket.kind != SocketKind::Tcp && socket.kind != SocketKind::Udp {
+    if socket.kind != SocketKind::Tcp
+        && socket.kind != SocketKind::Udp
+        && socket.kind != SocketKind::Sctp
+    {
         return Ok(());
     }
     if matches!(remote, KernelSockAddr::Unspec) {
@@ -41,7 +44,7 @@ pub(super) fn maybe_autobind_connect_client(
         if ephemeral_port_in_use(socket, port) {
             continue;
         }
-        if socket.kind == SocketKind::Tcp
+        if matches!(socket.kind, SocketKind::Tcp | SocketKind::Sctp)
             && tcp_connect_tuple_in_use(socket, local_endpoint, remote_endpoint)
         {
             continue;
@@ -72,12 +75,24 @@ pub(super) fn tcp_connect_tuple_in_use(
     };
     let table = payload.socket_table();
     let guard = tx_substrate::epoch::guard();
-    table
-        .lookup_tcp_connection(ConnectionKey::new(local, remote), &guard)
-        .is_some()
-        || table
-            .lookup_tcp_connection(ConnectionKey::new(remote, local), &guard)
-            .is_some()
+    match socket.kind {
+        SocketKind::Sctp => {
+            table
+                .lookup_sctp_connection(ConnectionKey::new(local, remote), &guard)
+                .is_some()
+                || table
+                    .lookup_sctp_connection(ConnectionKey::new(remote, local), &guard)
+                    .is_some()
+        }
+        _ => {
+            table
+                .lookup_tcp_connection(ConnectionKey::new(local, remote), &guard)
+                .is_some()
+                || table
+                    .lookup_tcp_connection(ConnectionKey::new(remote, local), &guard)
+                    .is_some()
+        }
+    }
 }
 
 pub(super) fn maybe_autobind_udp_sendto(
@@ -193,6 +208,13 @@ pub(super) fn ephemeral_port_in_use(socket: &Cap<SocketIdentity>, port: u16) -> 
             .snapshot_tcp_bound(&guard)
             .into_iter()
             .chain(table.snapshot_tcp_listeners(&guard))
+            .any(|existing| {
+                existing.raw() != socket.raw() && occupies_tcp_port(&existing, family, port)
+            }),
+        SocketKind::Sctp => table
+            .snapshot_sctp_bound(&guard)
+            .into_iter()
+            .chain(table.snapshot_sctp_listeners(&guard))
             .any(|existing| {
                 existing.raw() != socket.raw() && occupies_tcp_port(&existing, family, port)
             }),
@@ -329,7 +351,7 @@ pub(super) fn socket_recv_should_yield_after_success(
     socket: &Cap<SocketIdentity>,
     bytes: usize,
 ) -> bool {
-    bytes > 0 && socket.kind == SocketKind::Tcp
+    bytes > 0 && matches!(socket.kind, SocketKind::Tcp | SocketKind::Sctp)
 }
 
 pub(super) fn sendto_can_drive_loopback_inline(
@@ -1074,13 +1096,21 @@ pub(super) fn socket_local_endpoint(socket: &Cap<SocketIdentity>) -> Result<IpEn
         | SocketProtocol::Tcp(TcpState::Listening { local, .. })
         | SocketProtocol::Tcp(TcpState::Connecting { local, .. })
         | SocketProtocol::Tcp(TcpState::Connected { local, .. })
+        | SocketProtocol::Sctp(TcpState::Bound { local })
+        | SocketProtocol::Sctp(TcpState::Listening { local, .. })
+        | SocketProtocol::Sctp(TcpState::Connecting { local, .. })
+        | SocketProtocol::Sctp(TcpState::Connected { local, .. })
+        | SocketProtocol::Rds(tx_subsystems::net::RdsState::Bound { local })
         | SocketProtocol::Udp(UdpInner::Bound { local })
         | SocketProtocol::Udp(UdpInner::Connected { local, .. }) => Ok(local),
         SocketProtocol::RawIcmp(state) => Ok(IpEndpoint::new(
             state.bound_local.unwrap_or(Ipv4Address::UNSPECIFIED),
             0,
         )),
-        SocketProtocol::Tcp(TcpState::Init) | SocketProtocol::Udp(UdpInner::Unbound) => {
+        SocketProtocol::Tcp(TcpState::Init)
+        | SocketProtocol::Sctp(TcpState::Init)
+        | SocketProtocol::Udp(UdpInner::Unbound)
+        | SocketProtocol::Rds(tx_subsystems::net::RdsState::Unbound) => {
             Ok(IpEndpoint::unspecified_for_family(payload.family(), 0))
         }
         SocketProtocol::UnixDatagram(_)
@@ -1088,9 +1118,10 @@ pub(super) fn socket_local_endpoint(socket: &Cap<SocketIdentity>) -> Result<IpEn
         | SocketProtocol::NetlinkRoute(_)
         | SocketProtocol::NetlinkNetfilter(_)
         | SocketProtocol::Packet(_) => Ok(IpEndpoint::unspecified_for_family(payload.family(), 0)),
-        SocketProtocol::Tcp(TcpState::Closed) | SocketProtocol::Udp(UdpInner::Closed) => {
-            Err(Errno::ENOTCONN)
-        }
+        SocketProtocol::Tcp(TcpState::Closed)
+        | SocketProtocol::Sctp(TcpState::Closed)
+        | SocketProtocol::Udp(UdpInner::Closed)
+        | SocketProtocol::Rds(tx_subsystems::net::RdsState::Closed) => Err(Errno::ENOTCONN),
     }
 }
 
@@ -1116,6 +1147,8 @@ pub(super) fn socket_peer_endpoint(socket: &Cap<SocketIdentity>) -> Result<IpEnd
     match payload.protocol_snapshot() {
         SocketProtocol::Tcp(TcpState::Connecting { remote, .. })
         | SocketProtocol::Tcp(TcpState::Connected { remote, .. })
+        | SocketProtocol::Sctp(TcpState::Connecting { remote, .. })
+        | SocketProtocol::Sctp(TcpState::Connected { remote, .. })
         | SocketProtocol::Udp(UdpInner::Connected { remote, .. }) => Ok(remote),
         _ => Err(Errno::ENOTCONN),
     }
@@ -1137,13 +1170,14 @@ pub(super) fn socket_unix_peer_path(
 }
 
 pub(super) fn tcp_sendto_ignores_destination(socket: &Cap<SocketIdentity>) -> bool {
-    if socket.kind != SocketKind::Tcp {
+    if !matches!(socket.kind, SocketKind::Tcp | SocketKind::Sctp) {
         return false;
     }
     socket.acquire_operational().is_some_and(|payload| {
         matches!(
             payload.protocol_snapshot(),
             SocketProtocol::Tcp(TcpState::Connected { .. })
+                | SocketProtocol::Sctp(TcpState::Connected { .. })
         )
     })
 }
@@ -1460,7 +1494,9 @@ pub(super) fn socket_type_i32(socket: &Cap<SocketIdentity>) -> i32 {
         SocketKind::UnixStream => 1,
         SocketKind::UnixDatagram => 2,
         SocketKind::Tcp => 1,
+        SocketKind::Sctp => 1,
         SocketKind::Udp => 2,
+        SocketKind::RdsSeqPacket => 5,
         SocketKind::RawIcmp => 3,
         SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter | SocketKind::Packet => 3,
     }

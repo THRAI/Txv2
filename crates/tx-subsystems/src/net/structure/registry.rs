@@ -85,6 +85,22 @@ pub(crate) fn create_connected_stream_for_accept_in_namespace(
     Ok(child)
 }
 
+pub(crate) fn create_connected_sctp_for_accept_in_namespace(
+    local: IpEndpoint,
+    peer: IpEndpoint,
+    options: SocketOptionSet,
+    net_namespace: PayloadCap<NetNamespacePayload>,
+) -> Result<Cap<SocketIdentity>, ZoneError> {
+    let child = create_socket_in_namespace_with_family(
+        SocketKind::Sctp,
+        local.family,
+        options,
+        net_namespace,
+    )?;
+    set_connected_sctp_state(&child, local, peer);
+    Ok(child)
+}
+
 fn set_connected_stream_state(child: &Cap<SocketIdentity>, local: IpEndpoint, peer: IpEndpoint) {
     let payload = child.live_payload().expect("new socket payload");
     payload.with_protocol_mut(|protocol| {
@@ -95,11 +111,24 @@ fn set_connected_stream_state(child: &Cap<SocketIdentity>, local: IpEndpoint, pe
     });
 }
 
+fn set_connected_sctp_state(child: &Cap<SocketIdentity>, local: IpEndpoint, peer: IpEndpoint) {
+    let payload = child.live_payload().expect("new socket payload");
+    payload.with_protocol_mut(|protocol| {
+        *protocol = SocketProtocol::Sctp(TcpState::Connected {
+            local,
+            remote: peer,
+        });
+    });
+}
+
 const fn default_family_for_kind(kind: SocketKind) -> AddressFamily {
     match kind {
         SocketKind::UnixDatagram | SocketKind::UnixStream => AddressFamily::Unix,
-        SocketKind::Tcp | SocketKind::Udp | SocketKind::RawIcmp => AddressFamily::Inet,
+        SocketKind::Tcp | SocketKind::Udp | SocketKind::Sctp | SocketKind::RawIcmp => {
+            AddressFamily::Inet
+        }
         SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter => AddressFamily::Netlink,
         SocketKind::Packet => AddressFamily::Packet,
+        SocketKind::RdsSeqPacket => AddressFamily::Rds,
     }
 }

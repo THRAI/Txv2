@@ -6,7 +6,7 @@
   "created": "2026-05-26",
   "updated": "2026-05-26",
   "owner": "agent",
-  "summary": "Track the remaining explicit blockers after the LTP network syscall split: SCTP, RDS, TCP TLS ULP, RV64 socketcall interpretation, accept03 fd providers, and the recvmmsg01 musl wrapper SIGSEGV. The constrained TLS ULP setsockopt10 phase is complete and refreshed b6 to 10/11, moving the split total to 208/227. The pidfd_open, memfd_create, inotify_init1/fanotify_init, and scoped fsopen/fspick/open_tree accept03 provider slices are complete and move focused accept03 from 13/23 to 20/23; pidfd_send_signal, perf_event_open, bpf, and memfd_secret remain pending or explicitly heavy/out of scope.",
+  "summary": "Track the remaining explicit blockers after the LTP network syscall split: SCTP, RDS, TCP TLS ULP, RV64 socketcall interpretation, accept03 fd providers, and the recvmmsg01 musl wrapper SIGSEGV. The constrained TLS ULP setsockopt10 phase is complete and refreshed b6 to 10/11. Local-only RDS and SCTP protocol-surface phases are complete; refreshed b2/b3/b4 rows now report 35/35, 37/38, and 91/95, moving the split aggregate to 227/236. The pidfd_open, memfd_create, inotify_init1/fanotify_init, and scoped fsopen/fspick/open_tree accept03 provider slices are complete and move b4 accept03 to 20/23; pidfd_send_signal, perf_event_open, bpf, and memfd_secret remain pending or explicitly heavy/out of scope.",
   "scope": {
     "in": [
       "crates/tx-shims/src/linux_syscall/socket.rs",
@@ -302,7 +302,7 @@
     {
       "id": "rds-1-local-seqpacket",
       "title": "Implement local AF_RDS SOCK_SEQPACKET loopback sufficient for recvmsg03",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "audit-0"
       ],
@@ -315,16 +315,16 @@
         "crates/tx-shims/src/linux_syscall/socket.rs"
       ],
       "verification": [
-        "cargo test -p tx-subsystems --lib rds_loopback",
-        "cargo test -p tx-shims --lib recvmsg_rds_msg_namelen",
-        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=recvmsg03 OSCOMP_OUT_RV=target/oscomp/ltp-recvmsg03-rds.txt"
+        "cargo test -p tx-subsystems --lib rds_sctp -- --test-threads=1",
+        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=recvmsg03 OSCOMP_OUT_RV=target/oscomp/ltp-recvmsg03-rds-after-ipv6tcp.txt",
+        "python3 tools/oscomp-judge.py target/oscomp/ltp-recvmsg03-rds-after-ipv6tcp.txt target/oscomp/testdata"
       ],
-      "notes": "recvmsg03 needs AF_RDS creation, bind on 127.0.0.1:4000/4001, sendmsg to a bound peer, recvmsg delivery, and msg_namelen clamped back to sizeof(sockaddr_in). This can be a local-only RDS provider with explicit external-network non-goals, but it still needs real queues and readiness rather than a test-name shortcut."
+      "notes": "Complete as a local-only RDS provider: AF_RDS SOCK_SEQPACKET creates a real socket kind, bind owns an RDS endpoint, sendmsg/sendto to a bound local peer enqueues a packet with source metadata, recvmsg returns the source endpoint so the existing shim clamps msg_namelen to sizeof(sockaddr_in), and close withdraws the endpoint. Focused recvmsg03 is 1/1 in target/oscomp/ltp-recvmsg03-rds-after-ipv6tcp.txt. Full RDS wire/external-network behavior remains out of scope."
     },
     {
       "id": "sctp-1-local-stream",
       "title": "Implement local-only SCTP stream/seqpacket association semantics",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "audit-0"
       ],
@@ -340,11 +340,12 @@
         "crates/tx-shims/src/linux_syscall/socket.rs"
       ],
       "verification": [
-        "cargo test -p tx-subsystems --lib sctp_loopback",
-        "cargo test -p tx-shims --lib sendto_sctp_error_order",
-        "timeout 240s make oscomp-qemu-rv64 OSCOMP_LTP=sendto02,bind04 OSCOMP_OUT_RV=target/oscomp/ltp-sctp-sendto02-bind04.txt"
+        "cargo test -p tx-subsystems --lib rds_sctp -- --test-threads=1",
+        "cargo test -p tx-subsystems --lib tcp_loopback_ipv6_client_reaches_inet6_loopback_listener -- --test-threads=1",
+        "timeout 300s make oscomp-qemu-rv64 OSCOMP_LTP=sendto02,bind04 OSCOMP_OUT_RV=target/oscomp/ltp-sctp-sendto02-bind04-after-ipv6tcp-submit.txt",
+        "python3 tools/oscomp-judge.py target/oscomp/ltp-sctp-sendto02-bind04-after-ipv6tcp-submit.txt target/oscomp/testdata"
       ],
-      "notes": "bind04 exercises SCTP as an IPv4/IPv6 stream protocol with listen/connect/accept/read/write local communication; sendto02 only checks invalid user buffer error ordering. Full SCTP chunks, multihoming, wire format, and external NIC behavior are much larger. If this phase is approved, make the boundary explicit as local-only SCTP association semantics."
+      "notes": "Complete as local-only SCTP association semantics: IPPROTO_SCTP stream sockets create over IPv4/IPv6, bind/listen/connect/accept use separate SCTP endpoint tables, connected peers exchange bytes through local queues, readiness/close cleanup is wired, and SCTP endpoint/autobind helpers keep SCTP independent from TCP. Focused sendto02,bind04 is 17/17 in target/oscomp/ltp-sctp-sendto02-bind04-after-ipv6tcp-submit.txt. Enabling SCTP exposed later bind04 IPv6 TCP rows, so RawTcp loopback now supports IPv6 smoltcp endpoints/segments and has a [::1] TCP host regression test. Full SCTP chunks, multihoming, wire format, and external NIC behavior remain out of scope."
     },
     {
       "id": "score-1-refresh",
@@ -365,13 +366,13 @@
         "docs/progress/STATUS.md"
       ],
       "verification": [
-        "timeout 360s make oscomp-qemu-rv64 OSCOMP_LTP=send01,send02,sendto01,sendto02,sendto03,recv01,recvfrom01 OSCOMP_OUT_RV=target/oscomp/ltp-net-b2-after-remaining-blockers.txt",
-        "timeout 240s make oscomp-qemu-rv64 OSCOMP_LTP=sendmsg01,sendmsg02,sendmsg03,recvmsg01,recvmsg02,recvmsg03,sendmmsg01,sendmmsg02,recvmmsg01 LTP_MAX_RUNTIME=10 LTP_MAX_RUNTIME_CASES=sendmsg03 OSCOMP_OUT_RV=target/oscomp/ltp-net-b3-after-remaining-blockers.txt",
-        "timeout 360s make oscomp-qemu-rv64 OSCOMP_LTP=bind01,bind02,bind03,bind04,bind05,bind06,connect01,connect02,accept01,accept02,accept03,accept4_01,getpeername01 OSCOMP_OUT_RV=target/oscomp/ltp-net-b4-after-remaining-blockers.txt",
+        "timeout 360s make oscomp-qemu-rv64 OSCOMP_LTP=send01,send02,sendto01,sendto02,sendto03,recv01,recvfrom01 OSCOMP_OUT_RV=target/oscomp/ltp-net-b2-after-rds-sctp.txt",
+        "timeout 300s make oscomp-qemu-rv64 OSCOMP_LTP=sendmsg01,sendmsg02,sendmsg03,recvmsg01,recvmsg02,recvmsg03,sendmmsg01,sendmmsg02,recvmmsg01 LTP_MAX_RUNTIME=10 LTP_MAX_RUNTIME_CASES=sendmsg03 OSCOMP_OUT_RV=target/oscomp/ltp-net-b3-after-rds-sctp.txt",
+        "timeout 600s make oscomp-qemu-rv64 OSCOMP_LTP=bind01,bind02,bind03,bind04,bind05,bind06,connect01,connect02,accept01,accept02,accept03,accept4_01,getpeername01 OSCOMP_OUT_RV=target/oscomp/ltp-net-b4-after-rds-sctp.txt",
         "timeout 300s make oscomp-qemu-rv64 OSCOMP_LTP=setsockopt02,setsockopt03,setsockopt04,setsockopt05,setsockopt06,setsockopt07,setsockopt08,setsockopt09,setsockopt10 LTP_MAX_RUNTIME=30 LTP_MAX_RUNTIME_CASES=setsockopt06 OSCOMP_OUT_RV=target/oscomp/ltp-net-b6-after-remaining-blockers.txt",
         "cargo xtask progress validate"
       ],
-      "notes": "Do not wait for all phases to land before recording movement. Each phase should update the focused witness, the relevant split row, and the remaining blocker interpretation."
+      "notes": "RDS/SCTP refresh complete for the affected rows: b2 35/35 in target/oscomp/ltp-net-b2-after-rds-sctp.txt, b3 37/38 in target/oscomp/ltp-net-b3-after-rds-sctp.txt, and b4 91/95 in target/oscomp/ltp-net-b4-after-rds-sctp.txt. Together with unchanged b1 40/40, b5 14/17, and b6 10/11, the split aggregate is now 227/236. Remaining misses are recvmmsg01 musl SIGSEGV, RV64 legacy socketcall/accept4 socketcall interpretation, accept03 heavy providers, and setsockopt03 compat-only coverage."
     }
   ],
   "verification": [
@@ -388,7 +389,7 @@
     {
       "command": "Implementation verification",
       "status": "passed",
-      "notes": "TLS ULP metadata phase passed host tests, focused LTP setsockopt10 1/1 in target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt, and refreshed b6 10/11 in target/oscomp/ltp-net-b6-after-tls-ulp.txt. pidfd_open passed host pidfd_open tests and focused LTP accept03 14/23 in target/oscomp/ltp-accept03-after-pidfd-open-final.txt. memfd_create passed host memfd_create tests, focused LTP accept03 15/23 in target/oscomp/ltp-accept03-after-memfd-create.txt, and memfd_create02 10/14 in target/oscomp/ltp-memfd-create02-basic.txt. inotify_init1/fanotify_init passed host tests, focused LTP accept03 17/23 in target/oscomp/ltp-accept03-after-fsnotify-fds.txt, and inotify_init1_01/inotify_init1_02 8/8 in target/oscomp/ltp-inotify-init1-basic.txt. Scoped fsopen/fspick/open_tree fd providers passed host mount/fspick dispatch tests and focused LTP accept03 20/23 in target/oscomp/ltp-accept03-after-mount-api-fds.txt. SCTP, RDS, pidfd_send_signal, and the heavy perf/bpf/memfd_secret fd-provider phases remain pending."
+      "notes": "TLS ULP metadata phase passed host tests, focused LTP setsockopt10 1/1 in target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt, and refreshed b6 10/11 in target/oscomp/ltp-net-b6-after-tls-ulp.txt. pidfd_open passed host pidfd_open tests and focused LTP accept03 14/23 in target/oscomp/ltp-accept03-after-pidfd-open-final.txt. memfd_create passed host memfd_create tests, focused LTP accept03 15/23 in target/oscomp/ltp-accept03-after-memfd-create.txt, and memfd_create02 10/14 in target/oscomp/ltp-memfd-create02-basic.txt. inotify_init1/fanotify_init passed host tests, focused LTP accept03 17/23 in target/oscomp/ltp-accept03-after-fsnotify-fds.txt, and inotify_init1_01/inotify_init1_02 8/8 in target/oscomp/ltp-inotify-init1-basic.txt. Scoped fsopen/fspick/open_tree fd providers passed host mount/fspick dispatch tests, focused LTP accept03 20/23 in target/oscomp/ltp-accept03-after-mount-api-fds.txt, and refreshed b4 accept03 20/23 in target/oscomp/ltp-net-b4-after-rds-sctp.txt. RDS/SCTP local protocol phases passed host rds_sctp tests, the IPv6 TCP loopback regression, focused recvmsg03 1/1 in target/oscomp/ltp-recvmsg03-rds-after-ipv6tcp.txt, focused sendto02,bind04 17/17 in target/oscomp/ltp-sctp-sendto02-bind04-after-ipv6tcp-submit.txt, and refreshed b2/b3/b4 rows 35/35, 37/38, and 91/95. pidfd_send_signal and the heavy perf/bpf/memfd_secret fd-provider phases remain pending."
     }
   ],
   "risks": [
@@ -400,7 +401,7 @@
     "recvmmsg01 musl faults in userspace before syscall entry; kernel fixes would either be ineffective or would weaken VM protection."
   ],
   "blockers": [
-    "No active design document specifies full SCTP, full RDS, or TLS record encryption. The proposed phases are local syscall-surface witnesses, not full protocol stacks.",
+    "No active design document specifies full SCTP, full RDS, or TLS record encryption. The landed RDS/SCTP phases are local syscall-surface witnesses, not full protocol stacks.",
     "MOUNT_v1 now allows scoped fsopen/fspick/open_tree fd providers, but still defers full fsconfig/fsmount/move_mount/mount_setattr semantics.",
     "fanotify permission events require OnAgent/FanotifyPerm plumbing from TXV3-DELEGATE-V1 and should not be bundled with a basic notification fd."
   ],

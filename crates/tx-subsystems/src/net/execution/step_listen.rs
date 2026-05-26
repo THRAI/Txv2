@@ -38,11 +38,25 @@ pub fn step_listen(
         {
             return StepOutcome::Err(table_error_to_errno(error));
         }
+    } else if socket.kind == SocketKind::Sctp {
+        if let Err(error) = payload
+            .socket_table()
+            .listen_sctp(witness.local, socket.clone())
+        {
+            return StepOutcome::Err(table_error_to_errno(error));
+        }
     }
 
     let listening = payload.with_protocol_mut(|protocol| match protocol {
         SocketProtocol::Tcp(TcpState::Bound { local }) if *local == witness.local => {
             *protocol = SocketProtocol::Tcp(TcpState::Listening {
+                local: witness.local,
+                backlog_limit: witness.backlog_limit,
+            });
+            true
+        }
+        SocketProtocol::Sctp(TcpState::Bound { local }) if *local == witness.local => {
+            *protocol = SocketProtocol::Sctp(TcpState::Listening {
                 local: witness.local,
                 backlog_limit: witness.backlog_limit,
             });

@@ -1876,7 +1876,12 @@ async fn yield_after_socket_write_if_needed(
     socket: &Cap<tx_subsystems::net::SocketIdentity>,
     written: usize,
 ) {
-    if written > 0 && matches!(socket.kind, tx_subsystems::net::SocketKind::Tcp) {
+    if written > 0
+        && matches!(
+            socket.kind,
+            tx_subsystems::net::SocketKind::Tcp | tx_subsystems::net::SocketKind::Sctp
+        )
+    {
         tx_reactor::yield_now().await;
     }
 }
@@ -2825,7 +2830,12 @@ async fn yield_after_socket_read_if_needed(
     socket: &Cap<tx_subsystems::net::SocketIdentity>,
     bytes: usize,
 ) {
-    if bytes > 0 && socket.kind == tx_subsystems::net::SocketKind::Tcp {
+    if bytes > 0
+        && matches!(
+            socket.kind,
+            tx_subsystems::net::SocketKind::Tcp | tx_subsystems::net::SocketKind::Sctp
+        )
+    {
         tx_reactor::yield_now().await;
     }
 }

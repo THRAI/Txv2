@@ -11,6 +11,7 @@ pub enum AddressFamily {
     Inet6,
     Netlink,
     Packet,
+    Rds,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +75,7 @@ impl ValidSocketType {
             10 => AddressFamily::Inet6,
             16 => AddressFamily::Netlink,
             17 => AddressFamily::Packet,
+            21 => AddressFamily::Rds,
             _ => return Err(Errno::EAFNOSUPPORT),
         };
 
@@ -101,6 +103,8 @@ pub enum SocketKind {
     UnixStream,
     Tcp,
     Udp,
+    Sctp,
+    RdsSeqPacket,
     RawIcmp,
     NetlinkRoute,
     NetlinkNetfilter,
@@ -115,11 +119,13 @@ impl SocketKind {
                 Ok(Self::UnixStream)
             }
             (AddressFamily::Inet, SocketType::Stream, 0 | 6) => Ok(Self::Tcp),
+            (AddressFamily::Inet, SocketType::Stream, 132) => Ok(Self::Sctp),
             (AddressFamily::Inet, SocketType::Dgram, 0 | 17 | 136) => Ok(Self::Udp),
             (AddressFamily::Inet, SocketType::Dgram, 1)
             | (AddressFamily::Inet, SocketType::Raw, 1) => Ok(Self::RawIcmp),
             (AddressFamily::Inet, _, _) => Err(Errno::EPROTONOSUPPORT),
             (AddressFamily::Inet6, SocketType::Stream, 0 | 6) => Ok(Self::Tcp),
+            (AddressFamily::Inet6, SocketType::Stream, 132) => Ok(Self::Sctp),
             (AddressFamily::Inet6, SocketType::Dgram, 0 | 17 | 136) => Ok(Self::Udp),
             (AddressFamily::Inet6, _, _) => Err(Errno::EPROTONOSUPPORT),
             (AddressFamily::Netlink, SocketType::Raw | SocketType::Dgram, 0) => {
@@ -129,6 +135,8 @@ impl SocketKind {
                 Ok(Self::NetlinkNetfilter)
             }
             (AddressFamily::Packet, SocketType::Raw | SocketType::Dgram, _) => Ok(Self::Packet),
+            (AddressFamily::Rds, SocketType::SeqPacket, 0) => Ok(Self::RdsSeqPacket),
+            (AddressFamily::Rds, _, _) => Err(Errno::EPROTONOSUPPORT),
             _ => Err(Errno::EOPNOTSUPP),
         }
     }
@@ -272,9 +280,10 @@ impl IpEndpoint {
         match self.family {
             AddressFamily::Inet => IpAddress::V4(self.addr),
             AddressFamily::Inet6 => IpAddress::V6(self.addr6),
-            AddressFamily::Unix | AddressFamily::Netlink | AddressFamily::Packet => {
-                IpAddress::V4(self.addr)
-            }
+            AddressFamily::Unix
+            | AddressFamily::Netlink
+            | AddressFamily::Packet
+            | AddressFamily::Rds => IpAddress::V4(self.addr),
         }
     }
 
@@ -667,17 +676,19 @@ impl SocketOptionSet {
 
     pub const fn for_kind(kind: SocketKind) -> Self {
         let mut options = match kind {
-            SocketKind::Tcp | SocketKind::UnixStream => Self::default_tcp(),
+            SocketKind::Tcp | SocketKind::Sctp | SocketKind::UnixStream => Self::default_tcp(),
             SocketKind::UnixDatagram
             | SocketKind::Udp
+            | SocketKind::RdsSeqPacket
             | SocketKind::RawIcmp
             | SocketKind::NetlinkRoute
             | SocketKind::NetlinkNetfilter
             | SocketKind::Packet => Self::default_udp(),
         };
         options.socket.sock_type = match kind {
-            SocketKind::Tcp | SocketKind::UnixStream => SocketType::Stream,
+            SocketKind::Tcp | SocketKind::Sctp | SocketKind::UnixStream => SocketType::Stream,
             SocketKind::UnixDatagram | SocketKind::Udp => SocketType::Dgram,
+            SocketKind::RdsSeqPacket => SocketType::SeqPacket,
             SocketKind::RawIcmp
             | SocketKind::NetlinkRoute
             | SocketKind::NetlinkNetfilter
@@ -774,6 +785,13 @@ pub enum UdpInner {
         local: IpEndpoint,
         remote: IpEndpoint,
     },
+    Closed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RdsState {
+    Unbound,
+    Bound { local: IpEndpoint },
     Closed,
 }
 

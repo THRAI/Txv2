@@ -1,6 +1,6 @@
 # LTP syscall network progress
 
-Date: 2026-05-26
+Date: 2026-05-27
 Branch: `feature-network`
 
 This is the current working ledger for the 50 OSComp LTP socket/network syscall
@@ -15,9 +15,9 @@ Reliable focused results already in `target/oscomp`:
 | Scope | Cases | Judge | Log |
 | --- | --- | ---: | --- |
 | Basic socket/listen/options | `socket01,socket02,listen01,getsockname01,getsockopt01,getsockopt02,setsockopt01` | `40/40` | `target/oscomp/ltp-net-b1-basic.txt` |
-| Basic send/recv | `send01,send02,sendto01,sendto02,sendto03,recv01,recvfrom01` | `34/35` | `target/oscomp/ltp-net-b2-sendrecv-after-userns-packet.txt` |
-| msg/mmsg | `sendmsg01,sendmsg02,sendmsg03,recvmsg01,recvmsg02,recvmsg03,sendmmsg01,sendmmsg02,recvmmsg01` | `36/38` | `target/oscomp/ltp-net-b3-msg-after-yield-queue.txt` |
-| bind/connect/accept | `bind01,bind02,bind03,bind04,bind05,bind06,connect01,connect02,accept01,accept02,accept03,accept4_01,getpeername01` | `74/86` | `target/oscomp/ltp-net-b4-after-bind06-current.txt` |
+| Basic send/recv | `send01,send02,sendto01,sendto02,sendto03,recv01,recvfrom01` | `35/35` | `target/oscomp/ltp-net-b2-after-rds-sctp.txt` |
+| msg/mmsg | `sendmsg01,sendmsg02,sendmsg03,recvmsg01,recvmsg02,recvmsg03,sendmmsg01,sendmmsg02,recvmmsg01` | `37/38` | `target/oscomp/ltp-net-b3-after-rds-sctp.txt` |
+| bind/connect/accept | `bind01,bind02,bind03,bind04,bind05,bind06,connect01,connect02,accept01,accept02,accept03,accept4_01,getpeername01` | `91/95` | `target/oscomp/ltp-net-b4-after-rds-sctp.txt` |
 | socketpair/socketcall | `socketpair01,socketpair02,socketcall01,socketcall02,socketcall03` | `14/17` | `target/oscomp/ltp-net-b5-socketpair-socketcall.txt` |
 | setsockopt tail | `setsockopt02,setsockopt03,setsockopt04,setsockopt05,setsockopt06,setsockopt07,setsockopt08,setsockopt09,setsockopt10` | `10/11` | `target/oscomp/ltp-net-b6-after-tls-ulp.txt` |
 | IPv6 UDP focused | `bind05,recvmsg02` | `15/15` | `target/oscomp/ltp-net-ipv6-udp.txt` |
@@ -34,22 +34,29 @@ Reliable focused results already in `target/oscomp`:
 | fuzzy raw send focused | `sendmsg03` | `1/1` | `target/oscomp/ltp-sendmsg03-after-yield-queue-maxruntime10.txt` |
 | fuzzy packet ring focused | `setsockopt06` | `1/1` | `target/oscomp/ltp-setsockopt06-after-yield-queue-maxruntime20.txt` |
 | TCP TLS ULP focused | `setsockopt10` | `1/1` | `target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt` |
+| RDS local seqpacket focused | `recvmsg03` | `1/1` | `target/oscomp/ltp-recvmsg03-rds-after-ipv6tcp.txt` |
+| SCTP local stream focused | `sendto02,bind04` | `17/17` | `target/oscomp/ltp-sctp-sendto02-bind04-after-ipv6tcp-submit.txt` |
 
 The first six result rows cover all 50 named syscall-network cases. The current
-local judge subcase total is now `208/227` after the b2/b3/b4/b6 refreshes.
+local judge subcase total is now `227/236` after the b2/b3/b4/b6 refreshes.
 Treat that as a split-batch progress score, not as "50/50 cases passed". The
 kconfig blocker probe and the focused IPv6/accept/userns rows overlap the split
 batches, so they are not added to that total.
-The focused `accept03` pidfd+memfd+fsnotify+mount-api-provider runs prove
-seven additional b4 points, but the split total stays `208/227` until the full
-b4 row is refreshed. Supporting ABI witnesses: `memfd_create02` reports
-`10/14` in `target/oscomp/ltp-memfd-create02-basic.txt`, and
+The b4 row now reflects the focused `accept03`
+pidfd+memfd+fsnotify+mount-api-provider movement: `accept03` is `20/23`, with
+only perf event, bpf map, and memfd_secret skipped. Supporting ABI witnesses:
+`memfd_create02` reports `10/14` in
+`target/oscomp/ltp-memfd-create02-basic.txt`, and
 `inotify_init1_01,inotify_init1_02` report `8/8` in
 `target/oscomp/ltp-inotify-init1-basic.txt`. The memfd skipped subcases are
 the deliberately unsupported seal/hugetlb flag paths; fsnotify watch/mark
 event production remains future work. `fsopen`/`fspick`/`open_tree` are only
 scoped fd providers here; full `fsconfig`/`fsmount`/`move_mount` topology
 semantics remain deferred.
+The b2/b3/b4 rows now also reflect the local RDS/SCTP work: `sendto02`,
+`recvmsg03`, and `bind04` moved from focused-only proof into the split
+aggregate. The SCTP `bind04` refresh exercises the later IPv6 TCP rows, so
+RawTcp loopback has a `[::1]` TCP regression witness.
 
 Recent userns-gated probes changed the interpretation of the old kconfig row:
 `CONFIG_USER_NS=y`, procfs `uid_map`/`gid_map`/`setgroups`, loopback MTU ioctl,
@@ -59,8 +66,9 @@ packet `PACKET_VNET_HDR`, AF_PACKET `sendto(sockaddr_ll)`, raw IPv4
 `sendmsg03` and `setsockopt06` now have complete focused witnesses after the
 userspace `sched_yield()` scheduler placement fix and the focused
 `LTP_MAX_RUNTIME` runner knob. These passes prove the earlier timeouts were not
-network-stack table scans. `sendto03`, `sendmsg03`, `bind06`, and
-`setsockopt05..10` are now reflected in refreshed split rows. The b6
+network-stack table scans. `sendto02`, `sendto03`, `recvmsg03`, `bind04`,
+`bind06`, `sendmsg03`, and `setsockopt05..10` are now reflected in refreshed
+split rows. The b6
 `setsockopt06` row remains clean after using `LTP_MAX_RUNTIME=30` for that
 case only; the earlier `LTP_MAX_RUNTIME=20` b6 run produced a `TWARN` after
 TPASS.
@@ -93,13 +101,13 @@ above:
 
 - ABI/options: `socket01`, `socket02`, `listen01`, `getsockname01`,
   `getsockopt01`, `getsockopt02`, `setsockopt01`
-- send/recv basics: `send01`, `send02`, `sendto01`, `sendto03`, `recv01`,
-  `recvfrom01`
+- send/recv basics: `send01`, `send02`, `sendto01`, `sendto02`, `sendto03`,
+  `recv01`, `recvfrom01`
 - message vectors: `sendmsg01`, `sendmsg02`, `sendmsg03`, `recvmsg01`,
-  `sendmmsg01`, `sendmmsg02`
+  `recvmsg03`, `sendmmsg01`, `sendmmsg02`
 - AF_UNIX/socketpair: `socketpair01`, `socketpair02`, `getpeername01`
-- bind/connect/accept: `bind01`, `bind02`, `bind03`, `bind06`, `connect01`,
-  `accept01`, `accept02`
+- bind/connect/accept: `bind01`, `bind02`, `bind03`, `bind04`, `bind06`,
+  `connect01`, `accept01`, `accept02`
 - UDP-Lite: IPv4 `bind05` UDP-Lite loopback and wildcard datagram subcases
   pass through the UDP-like datagram path
 - IPv6 UDP/UDP-Lite: `bind05` IPv6 loopback and wildcard datagram subcases pass;
@@ -151,17 +159,17 @@ surface. Use them as regression witnesses after related fixes.
 
 | Case | Current observation | Interpretation |
 | --- | --- | --- |
-| `bind04` | AF_UNIX pathname, abstract stream, abstract seqpacket, and IPv4 TCP subcases pass; SCTP remains `TCONF` | AF_UNIX `SOCK_SEQPACKET` is implemented for LTP's local semantics. Remaining point is unsupported SCTP. |
+| `bind04` | Refreshed b4 reports `bind04 16/16`, and focused `sendto02,bind04` reports `17/17`: AF_UNIX pathname/abstract stream and seqpacket, IPv4/IPv6 TCP, and IPv4/IPv6 SCTP loopback/wildcard communication all pass | Local-only SCTP stream associations are implemented for LTP's bind/listen/connect/accept/read/write surface. Enabling SCTP exposed the later IPv6 TCP rows, so RawTcp loopback now parses/emits IPv6 smoltcp segments for `[::1]` connections. Full SCTP wire protocol remains out of scope. |
 | `bind05` | AF_UNIX, IPv4 UDP, IPv4 UDP-Lite, IPv6 UDP, and IPv6 UDP-Lite datagram communication pass | Current focused and b4 logs show `14/14`; use this as the IPv6 UDP/UDP-Lite regression witness. |
-| `bind06` | Focused 330s run reaches the AF_PACKET bind/ioctl race body, exits by LTP execution time, and passes `1/1` in `target/oscomp/ltp-bind06-current330.txt`; refreshed b4 reports `bind06 1/1` and `74/86` in `target/oscomp/ltp-net-b4-after-bind06-current.txt` | Use the focused log for direct regression and the refreshed b4 log for aggregate score movement. |
+| `bind06` | Focused 330s run reaches the AF_PACKET bind/ioctl race body, exits by LTP execution time, and passes `1/1` in `target/oscomp/ltp-bind06-current330.txt`; refreshed b4 reports `bind06 1/1` and `91/95` in `target/oscomp/ltp-net-b4-after-rds-sctp.txt` | Use the focused log for direct regression and the refreshed b4 log for aggregate score movement. |
 | `connect02` | Focused log passes `1/1`; the official case is slow and silent because it loops 1000 times | Use `target/oscomp/ltp-net-ipv6-connect02.txt` as the focused regression witness. A 30s outer timeout is too short for this case even though LTP's internal timeout is 30 guest seconds. |
-| `accept03` | Focused `accept03` reports `20/23` in `target/oscomp/ltp-accept03-after-mount-api-fds.txt`: pidfd, fanotify, inotify, memfd, fsopen, fspick, and open_tree now return the expected generic-fd errno (`ENOTSOCK`, except open_tree `EBADF`); perf/bpf/memfd_secret providers remain `TCONF` | Direct blocker is broader fd/syscall surface, not TCP accept dataplane. The new mount API work is intentionally fd-provider-only: full `fsconfig`/`fsmount`/`move_mount` semantics are still a mount-subsystem project. |
+| `accept03` | Refreshed b4 and focused `accept03` both report `20/23`: pidfd, fanotify, inotify, memfd, fsopen, fspick, and open_tree now return the expected generic-fd errno (`ENOTSOCK`, except open_tree `EBADF`); perf/bpf/memfd_secret providers remain `TCONF` | Direct blocker is broader fd/syscall surface, not TCP accept dataplane. The new mount API work is intentionally fd-provider-only: full `fsconfig`/`fsmount`/`move_mount` semantics are still a mount-subsystem project. |
 | `accept4_01` | Focused tail log reports `8/9`: libc and `__NR_accept4` variants pass all close-on-exec/nonblock subcases; legacy socketcall check is not available on RV64 | Architecture surface; do not fake legacy `socketcall` on RV64. |
-| `sendto02` | SCTP not supported, `TCONF` | Protocol family blocker; do not fake SCTP. |
-| `sendto03` | Refreshed b2 reports `2/2` in `target/oscomp/ltp-net-b2-sendrecv-after-userns-packet.txt` after AF_PACKET `sendto(sockaddr_ll)`, `PACKET_VNET_HDR`, and packet ring setup support | Use the refreshed b2 log for split movement and `target/oscomp/ltp-sendto03-userns-after-packet-send.txt` as the focused regression witness. |
-| `sendmsg03` | Refreshed b3 reports `1/1` in `target/oscomp/ltp-net-b3-msg-after-yield-queue.txt`; focused `LTP_MAX_RUNTIME=10` run also passes `1/1` in `target/oscomp/ltp-sendmsg03-after-yield-queue-maxruntime10.txt` | Not a network-table/linear-scan bottleneck. The raw `IP_HDRINCL` fast path validates four iovecs and returns `EOPNOTSUPP`; it does not enter packet routing or socket-table scans. The old timeout was LTP fzsync plus scheduler placement: userspace `sched_yield()` was requeued to `Preempted` behind hot userspace `New` work. Userspace yields now requeue to the `New` tail. |
-| `recvmsg02` | Focused log passes `1/1`: `recvmsg(..., MSG_PEEK)` receives the IPv6 UDP datagram and preserves the datagram | Use `target/oscomp/ltp-net-ipv6-udp.txt` and b3 `35/38` as regression witnesses. |
-| `recvmsg03` | RDS not supported, `TCONF` | Protocol family blocker; do not fake RDS. |
+| `sendto02` | Refreshed b2 and focused `sendto02,bind04` both report `sendto02 1/1`: SCTP socket creation succeeds and `sendto(NULL, ...)` returns `EFAULT` before protocol-state errors | This proves SCTP socket creation and user-buffer error order for the LTP witness; it is not full SCTP wire behavior. |
+| `sendto03` | Refreshed b2 reports `2/2` in `target/oscomp/ltp-net-b2-after-rds-sctp.txt` after AF_PACKET `sendto(sockaddr_ll)`, `PACKET_VNET_HDR`, and packet ring setup support | Use the refreshed b2 log for split movement and `target/oscomp/ltp-sendto03-userns-after-packet-send.txt` as the focused regression witness. |
+| `sendmsg03` | Refreshed b3 reports `1/1` in `target/oscomp/ltp-net-b3-after-rds-sctp.txt`; focused `LTP_MAX_RUNTIME=10` run also passes `1/1` in `target/oscomp/ltp-sendmsg03-after-yield-queue-maxruntime10.txt` | Not a network-table/linear-scan bottleneck. The raw `IP_HDRINCL` fast path validates four iovecs and returns `EOPNOTSUPP`; it does not enter packet routing or socket-table scans. The old timeout was LTP fzsync plus scheduler placement: userspace `sched_yield()` was requeued to `Preempted` behind hot userspace `New` work. Userspace yields now requeue to the `New` tail. |
+| `recvmsg02` | Focused log passes `1/1`: `recvmsg(..., MSG_PEEK)` receives the IPv6 UDP datagram and preserves the datagram | Use `target/oscomp/ltp-net-ipv6-udp.txt` and b3 `37/38` as regression witnesses. |
+| `recvmsg03` | Refreshed b3 and focused `recvmsg03` both report `1/1`: AF_RDS SOCK_SEQPACKET bind/sendmsg/recvmsg works locally and writes `msg_namelen = sizeof(sockaddr_in)` | Local-only RDS seqpacket queues are implemented for the LTP source-address/writeback surface. Full RDS wire or external-network behavior remains out of scope. |
 | `recvmmsg01` musl | First EBADF subcase passes, then userspace SIGSEGV before the bad-msgvec syscall | Known OSComp musl wrapper issue; kernel semantics have raw/glibc witnesses in `docs/progress/research/2026-05-21-recvmmsg-musl-wrapper-blocker.md` and `2026-05-21-ltp-glibc-sendmsg-witness.md`. |
 | `setsockopt03` | One 32-bit compat-only subcase is `TCONF`; supported subcase passes | Expected on RV64 unless compat mode is chartered. |
 | `setsockopt05` | Focused log passes `1/1` after loopback MTU ioctl and namespace-relative `CAP_NET_ADMIN` checks | Use `target/oscomp/ltp-setsockopt05-userns-after-mtu.txt` as the focused regression witness. |
@@ -180,15 +188,15 @@ Use short timeouts first. If a focused run gives no useful serial/LTP output by
 ### 1. Next score candidates
 
 The b2, b3, b4, and b6 split rows are fresh. The remaining score blockers are
-now mostly explicit unsupported or broader non-network surfaces:
+now mostly explicit unsupported, architecture-specific, or broader non-network
+surfaces:
 
-- `sendto02`: SCTP unsupported.
-- `recvmsg03`: RDS unsupported.
 - `socketcall01..03`: legacy socketcall is not an RV64 syscall surface.
 - `accept03`: pidfd, memfd, fanotify, inotify, fsopen, fspick, and open_tree
   fds are now implemented for generic fd classification; remaining broad
   descriptor providers are perf, bpf, and memfd_secret, all outside TCP accept
   dataplane.
+- `accept4_01`: legacy `socketcall` accept4 variant is not available on RV64.
 - `recvmmsg01` musl: known userspace wrapper SIGSEGV after the raw EBADF
   subcase passes.
 
@@ -197,12 +205,16 @@ For regression refreshes, use:
 ```sh
 timeout 360s make oscomp-qemu-rv64 \
   OSCOMP_LTP=send01,send02,sendto01,sendto02,sendto03,recv01,recvfrom01 \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-b2-sendrecv-after-userns-packet.txt
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-b2-after-rds-sctp.txt
 
-timeout 240s make oscomp-qemu-rv64 \
+timeout 300s make oscomp-qemu-rv64 \
   OSCOMP_LTP=sendmsg01,sendmsg02,sendmsg03,recvmsg01,recvmsg02,recvmsg03,sendmmsg01,sendmmsg02,recvmmsg01 \
   LTP_MAX_RUNTIME=10 LTP_MAX_RUNTIME_CASES=sendmsg03 \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-b3-msg-after-yield-queue.txt
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-b3-after-rds-sctp.txt
+
+timeout 600s make oscomp-qemu-rv64 \
+  OSCOMP_LTP=bind01,bind02,bind03,bind04,bind05,bind06,connect01,connect02,accept01,accept02,accept03,accept4_01,getpeername01 \
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-b4-after-rds-sctp.txt
 
 timeout 300s make oscomp-qemu-rv64 \
   OSCOMP_LTP=setsockopt02,setsockopt03,setsockopt04,setsockopt05,setsockopt06,setsockopt07,setsockopt08,setsockopt09,setsockopt10 \

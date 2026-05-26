@@ -81,6 +81,7 @@ mod loopback_tests;
 mod netdevice_staging_tests;
 mod nfnetlink_tests;
 mod projection_tests;
+mod rds_sctp_ltp_tests;
 mod rtnetlink_tests;
 mod smoltcp_fork_tests;
 mod table_snapshot_tests;

@@ -107,6 +107,10 @@ pub struct SocketTable {
     tcp_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
     tcp_listeners: Index<ListenerKey, Cap<SocketIdentity>, LISTENER_SLOTS>,
     tcp_connections: Index<ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>,
+    sctp_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
+    sctp_listeners: Index<ListenerKey, Cap<SocketIdentity>, LISTENER_SLOTS>,
+    sctp_connections: Index<ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>,
+    rds_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
     udp_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
     udp_connections: Index<ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>,
     raw_icmp: Index<RawIcmpSocketKey, Cap<SocketIdentity>, RAW_ICMP_SLOTS>,
@@ -121,6 +125,10 @@ impl SocketTable {
             tcp_bound: Index::new(),
             tcp_listeners: Index::new(),
             tcp_connections: Index::new(),
+            sctp_bound: Index::new(),
+            sctp_listeners: Index::new(),
+            sctp_connections: Index::new(),
+            rds_bound: Index::new(),
             udp_bound: Index::new(),
             udp_connections: Index::new(),
             raw_icmp: Index::new(),
@@ -152,6 +160,28 @@ impl SocketTable {
         Ok(())
     }
 
+    pub fn bind_sctp(
+        &self,
+        endpoint: IpEndpoint,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.sctp_bound
+            .reserve(LocalEndpointKey::new(endpoint))?
+            .commit(socket);
+        Ok(())
+    }
+
+    pub fn bind_rds(
+        &self,
+        endpoint: IpEndpoint,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.rds_bound
+            .reserve(LocalEndpointKey::new(endpoint))?
+            .commit(socket);
+        Ok(())
+    }
+
     pub fn listen_tcp(
         &self,
         endpoint: IpEndpoint,
@@ -163,12 +193,46 @@ impl SocketTable {
         Ok(())
     }
 
+    pub fn listen_sctp(
+        &self,
+        endpoint: IpEndpoint,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.sctp_listeners
+            .reserve(ListenerKey::from_endpoint(endpoint))?
+            .commit(socket);
+        Ok(())
+    }
+
     pub fn insert_tcp_connection(
         &self,
         key: ConnectionKey,
         socket: Cap<SocketIdentity>,
     ) -> Result<(), IndexError> {
         self.tcp_connections.reserve(key)?.commit(socket);
+        Ok(())
+    }
+
+    pub fn insert_sctp_connection(
+        &self,
+        key: ConnectionKey,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.sctp_connections.reserve(key)?.commit(socket);
+        Ok(())
+    }
+
+    pub fn insert_sctp_connection_pair(
+        &self,
+        first_key: ConnectionKey,
+        first_socket: Cap<SocketIdentity>,
+        second_key: ConnectionKey,
+        second_socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        let first = self.sctp_connections.reserve(first_key)?;
+        let second = self.sctp_connections.reserve(second_key)?;
+        first.commit(first_socket);
+        second.commit(second_socket);
         Ok(())
     }
 
@@ -242,6 +306,13 @@ impl SocketTable {
         mutation::withdraw(&self.tcp_connections, &key)
     }
 
+    pub fn withdraw_sctp_connection(
+        &self,
+        key: ConnectionKey,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        mutation::withdraw(&self.sctp_connections, &key)
+    }
+
     pub fn withdraw_tcp_bound(
         &self,
         endpoint: IpEndpoint,
@@ -249,11 +320,32 @@ impl SocketTable {
         mutation::withdraw(&self.tcp_bound, &LocalEndpointKey::new(endpoint))
     }
 
+    pub fn withdraw_sctp_bound(
+        &self,
+        endpoint: IpEndpoint,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        mutation::withdraw(&self.sctp_bound, &LocalEndpointKey::new(endpoint))
+    }
+
+    pub fn withdraw_rds_bound(
+        &self,
+        endpoint: IpEndpoint,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        mutation::withdraw(&self.rds_bound, &LocalEndpointKey::new(endpoint))
+    }
+
     pub fn withdraw_tcp_listener(
         &self,
         endpoint: IpEndpoint,
     ) -> Result<Cap<SocketIdentity>, MutationError> {
         mutation::withdraw(&self.tcp_listeners, &ListenerKey::from_endpoint(endpoint))
+    }
+
+    pub fn withdraw_sctp_listener(
+        &self,
+        endpoint: IpEndpoint,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        mutation::withdraw(&self.sctp_listeners, &ListenerKey::from_endpoint(endpoint))
     }
 
     pub fn withdraw_udp_bound(
@@ -311,12 +403,40 @@ impl SocketTable {
             .and_then(|entry| entry.value().try_clone_live())
     }
 
+    pub fn lookup_sctp_bound(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.sctp_bound
+            .lookup(&LocalEndpointKey::new(endpoint), guard)
+            .and_then(|entry| entry.value().try_clone_live())
+    }
+
+    pub fn lookup_rds_bound(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.rds_bound
+            .lookup(&LocalEndpointKey::new(endpoint), guard)
+            .and_then(|entry| entry.value().try_clone_live())
+    }
+
     pub fn lookup_tcp_listener(
         &self,
         endpoint: IpEndpoint,
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
         self.lookup_tcp_listener_endpoint(endpoint, guard)
+    }
+
+    pub fn lookup_sctp_listener(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.lookup_sctp_listener_endpoint(endpoint, guard)
     }
 
     pub fn lookup_tcp_listener_endpoint(
@@ -332,6 +452,23 @@ impl SocketTable {
         }
         let wildcard = ListenerKey::wildcard_for_family(endpoint.family, endpoint.port);
         self.tcp_listeners
+            .lookup(&wildcard, guard)
+            .and_then(|entry| entry.value().try_clone_live())
+    }
+
+    pub fn lookup_sctp_listener_endpoint(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        let exact = ListenerKey::from_endpoint(endpoint);
+        if let Some(entry) = self.sctp_listeners.lookup(&exact, guard) {
+            if let Some(socket) = entry.value().try_clone_live() {
+                return Some(socket);
+            }
+        }
+        let wildcard = ListenerKey::wildcard_for_family(endpoint.family, endpoint.port);
+        self.sctp_listeners
             .lookup(&wildcard, guard)
             .and_then(|entry| entry.value().try_clone_live())
     }
@@ -353,6 +490,23 @@ impl SocketTable {
             .and_then(|entry| entry.value().try_clone_live())
     }
 
+    pub fn lookup_sctp_listener_dual_stack_endpoint(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        if let Some(socket) = self.lookup_sctp_listener_endpoint(endpoint, guard) {
+            return Some(socket);
+        }
+        if endpoint.family != AddressFamily::Inet {
+            return None;
+        }
+        let wildcard6 = ListenerKey::wildcard_for_family(AddressFamily::Inet6, endpoint.port);
+        self.sctp_listeners
+            .lookup(&wildcard6, guard)
+            .and_then(|entry| entry.value().try_clone_live())
+    }
+
     pub fn lookup_tcp_listener_addr(
         &self,
         addr: Ipv4Address,
@@ -368,6 +522,16 @@ impl SocketTable {
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
         self.tcp_connections
+            .lookup(&key, guard)
+            .and_then(|entry| entry.value().try_clone_live())
+    }
+
+    pub fn lookup_sctp_connection(
+        &self,
+        key: ConnectionKey,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.sctp_connections
             .lookup(&key, guard)
             .and_then(|entry| entry.value().try_clone_live())
     }
@@ -441,13 +605,33 @@ impl SocketTable {
             .snapshot_values_filter_map(guard, Cap::try_clone_live)
     }
 
+    pub fn snapshot_sctp_listeners(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.sctp_listeners
+            .snapshot_values_filter_map(guard, Cap::try_clone_live)
+    }
+
     pub fn snapshot_tcp_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
         self.tcp_bound
             .snapshot_values_filter_map(guard, Cap::try_clone_live)
     }
 
+    pub fn snapshot_sctp_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.sctp_bound
+            .snapshot_values_filter_map(guard, Cap::try_clone_live)
+    }
+
+    pub fn snapshot_rds_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.rds_bound
+            .snapshot_values_filter_map(guard, Cap::try_clone_live)
+    }
+
     pub fn snapshot_tcp_connections(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
         self.tcp_connections
+            .snapshot_values_filter_map(guard, Cap::try_clone_live)
+    }
+
+    pub fn snapshot_sctp_connections(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.sctp_connections
             .snapshot_values_filter_map(guard, Cap::try_clone_live)
     }
 

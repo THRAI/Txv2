@@ -76,6 +76,7 @@ impl From<u8> for MulticastScope {
 
 pub use core::net::Ipv6Addr as Address;
 
+/// IPv6 address helpers used by the wire and interface layers.
 pub trait AddressExt {
     /// Construct an IPv6 address from a sequence of octets, in big-endian.
     ///

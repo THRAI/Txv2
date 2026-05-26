@@ -76,9 +76,12 @@ impl SocketIdentity {
 const fn default_family_for_kind(kind: SocketKind) -> AddressFamily {
     match kind {
         SocketKind::UnixDatagram | SocketKind::UnixStream => AddressFamily::Unix,
-        SocketKind::Tcp | SocketKind::Udp | SocketKind::RawIcmp => AddressFamily::Inet,
+        SocketKind::Tcp | SocketKind::Udp | SocketKind::Sctp | SocketKind::RawIcmp => {
+            AddressFamily::Inet
+        }
         SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter => AddressFamily::Netlink,
         SocketKind::Packet => AddressFamily::Packet,
+        SocketKind::RdsSeqPacket => AddressFamily::Rds,
     }
 }
 

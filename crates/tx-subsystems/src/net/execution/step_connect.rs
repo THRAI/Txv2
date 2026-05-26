@@ -3,6 +3,7 @@ use tx_substrate::zone::Cap;
 use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
 use crate::net::checks::require::require_socket_connect_target;
 use crate::net::delegate::net_delegate_kick_poll;
+use crate::net::execution::step_bind::table_error_to_errno;
 use crate::net::execution::yield_on_token;
 use crate::net::structure::registry;
 use crate::net::structure::table::SocketTable;
@@ -37,6 +38,9 @@ pub fn step_connect(
 
     if matches!(remote, KernelSockAddr::Unix(_)) {
         return step_unix_connect(socket, &payload, remote, guard);
+    }
+    if socket.kind == SocketKind::Sctp {
+        return step_sctp_connect(socket, &payload, witness.remote, guard);
     }
 
     if let Err(errno) = update_udp_connection_index(
@@ -279,6 +283,110 @@ fn connect_unix_stream(
         let _ = table.withdraw_unix_stream_peer(child_raw);
         StepOutcome::Err(Errno::ECONNREFUSED)
     }
+}
+
+fn step_sctp_connect(
+    socket: &Cap<SocketIdentity>,
+    payload: &SocketOperationalEvidence,
+    remote: IpEndpoint,
+    guard: &Guard<'_>,
+) -> StepOutcome<()> {
+    let local = match payload.protocol_snapshot() {
+        SocketProtocol::Sctp(TcpState::Init) => unspecified_endpoint(),
+        SocketProtocol::Sctp(TcpState::Bound { local }) => select_tcp_connect_local(local, remote),
+        SocketProtocol::Sctp(TcpState::Connecting { .. }) => {
+            return StepOutcome::Err(Errno::EALREADY)
+        }
+        SocketProtocol::Sctp(TcpState::Connected { .. }) => {
+            return StepOutcome::Err(Errno::EISCONN)
+        }
+        SocketProtocol::Sctp(TcpState::Listening { .. }) => return StepOutcome::Err(Errno::EINVAL),
+        SocketProtocol::Sctp(TcpState::Closed) => return StepOutcome::Err(Errno::ENOTCONN),
+        _ => return StepOutcome::Err(Errno::EINVAL),
+    };
+    if local.is_unspecified() || local.port == 0 {
+        return StepOutcome::Err(Errno::EADDRNOTAVAIL);
+    }
+    if !remote.is_loopback() {
+        return StepOutcome::Err(Errno::EOPNOTSUPP);
+    }
+
+    let table = payload.socket_table();
+    let Some(listener) = table.lookup_sctp_listener_dual_stack_endpoint(remote, guard) else {
+        return StepOutcome::Err(Errno::ECONNREFUSED);
+    };
+    let Some(listener_payload) = listener.acquire_operational() else {
+        return StepOutcome::Err(Errno::ECONNREFUSED);
+    };
+    let listener_local = match listener_payload.protocol_snapshot() {
+        SocketProtocol::Sctp(TcpState::Listening {
+            local: listener_local,
+            ..
+        }) if sctp_listener_accepts_incoming(&listener_payload, listener_local, remote) => {
+            listener_local
+        }
+        _ => return StepOutcome::Err(Errno::ECONNREFUSED),
+    };
+
+    let child_options = listener_payload.with_options(Clone::clone);
+    let child = match registry::create_connected_sctp_for_accept_in_namespace(
+        listener_local,
+        local,
+        child_options,
+        payload.net_namespace(),
+    ) {
+        Ok(child) => child,
+        Err(_) => return StepOutcome::Err(Errno::ENOMEM),
+    };
+
+    if let Err(error) = table.insert_sctp_connection_pair(
+        ConnectionKey::new(local, listener_local),
+        socket.clone(),
+        ConnectionKey::new(listener_local, local),
+        child.clone(),
+    ) {
+        return StepOutcome::Err(table_error_to_errno(error));
+    }
+
+    payload.with_protocol_mut(|protocol| {
+        *protocol = SocketProtocol::Sctp(TcpState::Connected {
+            local,
+            remote: listener_local,
+        });
+    });
+
+    let entry = SocketAcceptEntry {
+        child,
+        local: listener_local,
+        peer: local,
+        unix_peer: None,
+    };
+    if listener_payload.enqueue_accept_entry(entry).is_some() {
+        listener.readiness.fire_accept(AcceptWireSet::HAS_PENDING);
+        StepOutcome::Done(())
+    } else {
+        let _ = table.withdraw_sctp_connection(ConnectionKey::new(local, listener_local));
+        let _ = table.withdraw_sctp_connection(ConnectionKey::new(listener_local, local));
+        StepOutcome::Err(Errno::ECONNREFUSED)
+    }
+}
+
+fn sctp_listener_accepts_incoming(
+    listener_payload: &SocketOperationalEvidence,
+    listener_local: IpEndpoint,
+    dst: IpEndpoint,
+) -> bool {
+    let v6only = listener_payload.with_options(|options| options.ip.ipv6_v6only);
+    listener_local == dst
+        || (listener_local.same_family(dst)
+            && listener_local.is_unspecified()
+            && listener_local.port == dst.port)
+        || (!v6only
+            && listener_local.family == crate::net::structure::AddressFamily::Inet6
+            && listener_local.is_unspecified()
+            && dst.family == crate::net::structure::AddressFamily::Inet
+            && dst.is_loopback()
+            && listener_local.port == dst.port)
 }
 
 const fn unspecified_endpoint() -> IpEndpoint {

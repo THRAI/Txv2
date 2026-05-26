@@ -24,8 +24,8 @@ pub use table::{
 };
 pub use types::{
     AddressFamily, IpAddress, IpEndpoint, IpLevelOptions, Ipv4Address, Ipv6Address, KernelSockAddr,
-    LingerOption, PacketSocketState, PollMask, ProtocolNumber, RawIcmpState, SendRecvFlags,
-    SockAddrIn, SockAddrIn6, SockAddrLl, SockFlags, SockShutdownCmd, SocketKind,
+    LingerOption, PacketSocketState, PollMask, ProtocolNumber, RawIcmpState, RdsState,
+    SendRecvFlags, SockAddrIn, SockAddrIn6, SockAddrLl, SockFlags, SockShutdownCmd, SocketKind,
     SocketLevelOptions, SocketOptionSet, SocketType, TcpLevelOptions, TcpState, TcpTlsUlpState,
     UdpInner, UnixSocketPath, ValidSocketType, UNIX_SOCKET_PATH_MAX,
 };

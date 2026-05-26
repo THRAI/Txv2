@@ -131,12 +131,12 @@ pub use structure::{
     AcceptWireSet, AddressFamily, ConnectionKey, InitialSocketTableProxy, IpAddress, IpEndpoint,
     IpLevelOptions, Ipv4Address, Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, LingerOption,
     ListenerKey, LocalEndpointKey, PacketSocketState, PollMask, ProtocolNumber, RawIcmpSocketKey,
-    RawIcmpState, RecvWireSet, SendRecvFlags, SendWireSet, SockAddrIn, SockAddrIn6, SockAddrLl,
-    SockFlags, SockShutdownCmd, SocketIdentity, SocketIoState, SocketKind, SocketLevelOptions,
-    SocketOperationalEvidence, SocketOptionSet, SocketPayload, SocketProtocol, SocketReadiness,
-    SocketRecvBytesOutcome, SocketTable, SocketType, SocketWaitCarriers, Takeable, TcpLevelOptions,
-    TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState, UnixPeerCred, UnixSocketPath,
-    UnixStreamState, UrgentEvent, ValidSocketType, UNIX_SOCKET_PATH_MAX,
+    RawIcmpState, RdsState, RecvWireSet, SendRecvFlags, SendWireSet, SockAddrIn, SockAddrIn6,
+    SockAddrLl, SockFlags, SockShutdownCmd, SocketIdentity, SocketIoState, SocketKind,
+    SocketLevelOptions, SocketOperationalEvidence, SocketOptionSet, SocketPayload, SocketProtocol,
+    SocketReadiness, SocketRecvBytesOutcome, SocketTable, SocketType, SocketWaitCarriers, Takeable,
+    TcpLevelOptions, TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState, UnixPeerCred,
+    UnixSocketPath, UnixStreamState, UrgentEvent, ValidSocketType, UNIX_SOCKET_PATH_MAX,
 };
 
 pub(crate) fn register_zones() -> Result<(), tx_substrate::zone::ZoneError> {
