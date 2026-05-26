@@ -61,6 +61,7 @@ pub const VFS_WRITABLE: u64 = 0x2;
 static DENTRY_ZONE: Zone<DEntry> = Zone::const_new();
 static RNODE_ZONE: Zone<RNode> = Zone::const_new();
 static OPEN_FILE_ZONE: Zone<OpenFile> = Zone::const_new();
+static FSNOTIFY_INSTANCE_ZONE: Zone<FsNotifyInstance> = Zone::const_new();
 static FLOCK_TABLE: SpinMutex<BTreeMap<FsObjectId, FlockRecord>> = SpinMutex::new(BTreeMap::new());
 
 #[derive(Default)]
@@ -84,6 +85,12 @@ unsafe impl ZoneAllocated for RNode {
 unsafe impl ZoneAllocated for OpenFile {
     fn zone() -> &'static Zone<Self> {
         &OPEN_FILE_ZONE
+    }
+}
+
+unsafe impl ZoneAllocated for FsNotifyInstance {
+    fn zone() -> &'static Zone<Self> {
+        &FSNOTIFY_INSTANCE_ZONE
     }
 }
 
@@ -511,11 +518,43 @@ impl ProjectionKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FsNotifyKind {
+    Inotify,
+    Fanotify,
+}
+
+#[derive(Debug)]
+pub struct FsNotifyInstance {
+    kind: FsNotifyKind,
+}
+
+impl FsNotifyInstance {
+    pub const fn new(kind: FsNotifyKind) -> Self {
+        Self { kind }
+    }
+
+    pub fn new_cap(kind: FsNotifyKind) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new(kind))
+    }
+
+    pub const fn kind(&self) -> FsNotifyKind {
+        self.kind
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum StructPayload {
     Tty(Cap<TtyIdentity>),
     CharDevice(&'static CharDeviceBinding),
     BlockDevice(&'static BlockDeviceRegistration),
+    /// Linux fsnotify instance exposed as an fd (`inotify_init1`,
+    /// `fanotify_init`). This first shape provides a typed non-socket
+    /// descriptor and wait source; watch/mark event production lands in
+    /// the future fsnotify subsystem.
+    FsNotify {
+        instance: Cap<FsNotifyInstance>,
+    },
     /// Anonymous pipe — `pipe2(2)`. `side` distinguishes the
     /// reader-end RNode from the writer-end RNode; both share a
     /// single `Cap<PipePayload>`. fd-ops Wave 3.

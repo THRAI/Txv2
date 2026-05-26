@@ -87,8 +87,8 @@ use tx_subsystems::vfs::composite::{
     AccessOp, ChmodOp, ChownOp, MknodOp, NanosleepOp, StatOp, StatxOp, StatxResult,
 };
 use tx_subsystems::vfs::structure::{
-    Credential, InodeKind, InodeMeta, OpenFileBacking, OpenFileFlags, RNodeBacking, StructPayload,
-    S_ISGID,
+    Credential, FsNotifyInstance, FsNotifyKind, InodeKind, InodeMeta, OpenFileBacking,
+    OpenFileFlags, RNodeBacking, StructPayload, S_ISGID,
 };
 use tx_subsystems::vfs::{
     step_open, step_walk, DEntry, FileFsyncOp, FlockOp, OpenFile, OpenFileGetFlOp, OpenFileSetFlOp,
@@ -705,6 +705,8 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_TKILL => sys_tkill(req.args, ctx),
         nr if nr == NR_TGKILL => sys_tgkill(req.args, ctx),
         nr if nr == NR_PIDFD_OPEN => sys_pidfd_open(req.args, ctx),
+        nr if nr == NR_INOTIFY_INIT1 => sys_inotify_init1(req.args, ctx),
+        nr if nr == NR_FANOTIFY_INIT => sys_fanotify_init(req.args, ctx),
         nr if nr == NR_MEMFD_CREATE => sys_memfd_create(req.args, ctx),
         // rt_sigreturn: deferred. Returns -ENOSYS — the
         // SignalFrameIf::restore_signal_frame surface needs the trap

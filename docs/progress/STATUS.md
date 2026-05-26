@@ -1,3 +1,31 @@
+- 2026-05-26 **Landed typed `FsNotify` fds for the next `accept03`
+  provider slice.** Added `inotify_init1(26)` and `fanotify_init(262)` as
+  real VFS `StructPayload::FsNotify` descriptors with their own zone-managed
+  instance identity, read wait source, close-on-exec/nonblocking flag plumbing,
+  and generic non-socket `accept()` classification. This is intentionally the
+  notification-instance fd phase only: `inotify_add_watch`, `fanotify_mark`,
+  event queue production, and fanotify permission events remain future
+  fsnotify/OnAgent work. Focused LTP `accept03` now reports `17/23` in
+  `target/oscomp/ltp-accept03-after-fsnotify-fds.txt`, with both
+  `accept() on fanotify : ENOTSOCK` and `accept() on inotify : ENOTSOCK`.
+  The supporting LTP `inotify_init1_01,inotify_init1_02` witness reports
+  `8/8` in `target/oscomp/ltp-inotify-init1-basic.txt`. A 360s full b4
+  refresh attempt reached `bind06 1/1` and `connect01 7/7` but timed out after
+  entering the known slow `connect02`, so the split total is not updated from
+  that partial log. **Verification:**
+  `cargo fmt`; `cargo test -p tx-shims inotify_init1 --lib`; `cargo test -p
+  tx-shims fanotify_init --lib`; `cargo check -p tx-subsystems -p tx-shims`;
+  `cargo xtask syscall-status inotify_init1`; `cargo xtask syscall-status
+  fanotify_init`; `cargo xtask syscall-status --regen`; `cargo xtask syscall
+  sync`; `cargo xtask build --target rv64-qemu`; `cargo xtask oscomp submit
+  --target rv64-qemu --submit target/oscomp/submit`; focused LTP `accept03
+  17/23`; focused LTP `inotify_init1_01,inotify_init1_02 8/8`; local judge on
+  both logs. **Next step:** remaining accept03 score-effective fd providers
+  are now the heavy or design-deferred surfaces: perf event, bpf map,
+  fsopen/fspick/open_tree, and memfd_secret. **Blocker:** full inotify/fanotify
+  event semantics are not done; this slice only creates principled instance
+  fds.
+
 - 2026-05-26 **Landed basic `memfd_create` as the second `accept03`
   fd-provider slice.** `memfd_create(279)` now dispatches on RV64, validates
   the user name/flags, supports ordinary anonymous PageBacked memfds plus

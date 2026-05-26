@@ -18,7 +18,7 @@ record which specific OSComp/LTP test(s) closed it under "Currently
 passing" below.
 
 **Last refresh:** 2026-05-26 (mechanical syscall status refreshed after
-`memfd_create` dispatch).
+`inotify_init1` / `fanotify_init` dispatch).
 
 ## Headline counts
 
@@ -29,8 +29,8 @@ passing" below.
 _Counts read from `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}`._
 _Run `cargo xtask syscall-status --regen` to refresh; `--check` to lint in CI._
 
-- **`NR_*` defined:** 196
-- **Dispatched (has a match arm):** 194
+- **`NR_*` defined:** 198
+- **Dispatched (has a match arm):** 196
 - **Defined but not dispatched:** 2 — see list below
 
 #### Defined but not dispatched
@@ -60,7 +60,7 @@ number of additional LTP tests that move from skipped/failed to runnable.
 | `sendfile` / `splice` / `copy_file_range` | +15 | M (3–4w) | needs page-cache coherence path |
 | SysV IPC (`msg` / `sem` / `shm`) | +40 | L (6–10w) | new namespace-aware subsystem |
 | Network stack (full socket API) | +60 | XL (12–16w) | no subsystem exists — TCP/UDP state, sockaddr unions, sk_buff |
-| `inotify` / `fanotify` | +10 | M (~3w) | new event queue subsystem |
+| `inotify` / `fanotify` | +8 | M (~3w) | instance fds landed; watch/mark event queues pending |
 | `chroot` / `pivot_root` / `swap*` | +8 | S–M (1–2w) | `chroot` is one field; bdev-fs lands swap |
 | `seccomp` / capabilities / `keyctl` | +15 | L (6–8w) | filter bytecode + keyring |
 | `ptrace` | +20 | XL (12w+) | parallel exec context — out of scope v1 |
@@ -112,6 +112,11 @@ core (PR-11).
   `15/23` in `target/oscomp/ltp-accept03-after-memfd-create.txt`, and
   `memfd_create02` reports `10/14` in
   `target/oscomp/ltp-memfd-create02-basic.txt`.
+- 2026-05-26: `inotify_init1(26)` and `fanotify_init(262)` are dispatched and
+  install typed fsnotify instance fds; focused LTP `accept03` moved from
+  `15/23` to `17/23` in `target/oscomp/ltp-accept03-after-fsnotify-fds.txt`,
+  and `inotify_init1_01,inotify_init1_02` report `8/8` in
+  `target/oscomp/ltp-inotify-init1-basic.txt`.
 
 ### When a syscall lands
 
@@ -120,14 +125,14 @@ test(s) that newly pass — e.g. *"2026-05-19: `getrlimit01`, `getrlimit02`
 pass after rlimit field landed (commit `<sha>`)"*. The skill's "Done Means"
 requires this entry before the work counts as complete.
 
-## Unwired by topic (~115 syscalls)
+## Unwired by topic (~113 syscalls)
 
-### File I/O & VFS extras (18)
+### File I/O & VFS extras (16)
 
 `preadv`, `pwritev`, `preadv2`, `pwritev2`, `sendfile`, `copy_file_range`,
 `splice`, `tee`, `sync_file_range`, `readahead`, `fallocate`,
-`name_to_handle_at`, `open_by_handle_at`, `fanotify_init` / `_mark`,
-`inotify_init1` / `_add_watch` / `_rm_watch`.
+`name_to_handle_at`, `open_by_handle_at`, `fanotify_mark`,
+`inotify_add_watch` / `_rm_watch`.
 
 ### Network — entire socket API (20)
 
@@ -251,8 +256,8 @@ overwritten by the next `sync`. The lint variant
 
 ### Counts (from dispatch table)
 
-- `pub const NR_*` in numbers.rs: **196**
-- dispatched in mod.rs: **193** (of which async: 59, likely-stub: 0)
+- `pub const NR_*` in numbers.rs: **198**
+- dispatched in mod.rs: **195** (of which async: 59, likely-stub: 0)
 - defined but not dispatched: **3**
 
 ### Defined in `numbers.rs` but no dispatch arm (3)
@@ -263,7 +268,7 @@ These have a syscall number constant but no match arm in `mod.rs`. Either wire t
 - `NR_PIDFD_SEND_SIGNAL` (nr=424)
 - `NR_PSELECT6` (nr=72)
 
-### Dispatched syscalls (193) — name → handler
+### Dispatched syscalls (195) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -281,6 +286,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 23 | `NR_DUP` | `sys_dup` | sync |
 | 24 | `NR_DUP3` | `sys_dup3` | sync |
 | 25 | `NR_FCNTL` | `sys_fcntl` | sync |
+| 26 | `NR_INOTIFY_INIT1` | `sys_inotify_init1` | sync |
 | 29 | `NR_IOCTL` | `sys_ioctl` | sync |
 | 32 | `NR_FLOCK` | `sys_flock` | async |
 | 33 | `NR_MKNODAT` | `sys_mknodat` | async |
@@ -443,6 +449,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 243 | `NR_RECVMMSG` | `sys_recvmmsg` | sync |
 | 260 | `NR_WAIT4` | `sys_wait4` | async |
 | 261 | `NR_PRLIMIT64` | `sys_prlimit64` | sync |
+| 262 | `NR_FANOTIFY_INIT` | `sys_fanotify_init` | sync |
 | 264 | `NR_NAME_TO_HANDLE_AT` | `sys_name_to_handle_at` | sync |
 | 265 | `NR_OPEN_BY_HANDLE_AT` | `sys_open_by_handle_at` | sync |
 | 267 | `NR_SYNCFS` | `sys_syncfs` | async |

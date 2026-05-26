@@ -6,7 +6,7 @@
   "created": "2026-05-26",
   "updated": "2026-05-26",
   "owner": "agent",
-  "summary": "Track the remaining explicit blockers after the LTP network syscall split: SCTP, RDS, TCP TLS ULP, RV64 socketcall interpretation, accept03 fd providers, and the recvmmsg01 musl wrapper SIGSEGV. The constrained TLS ULP setsockopt10 phase is complete and refreshed b6 to 10/11, moving the split total to 208/227. The pidfd_open and memfd_create accept03 provider slices are complete and move focused accept03 from 13/23 to 15/23; pidfd_send_signal remains pending.",
+  "summary": "Track the remaining explicit blockers after the LTP network syscall split: SCTP, RDS, TCP TLS ULP, RV64 socketcall interpretation, accept03 fd providers, and the recvmmsg01 musl wrapper SIGSEGV. The constrained TLS ULP setsockopt10 phase is complete and refreshed b6 to 10/11, moving the split total to 208/227. The pidfd_open, memfd_create, inotify_init1, and fanotify_init accept03 provider slices are complete and move focused accept03 from 13/23 to 17/23; pidfd_send_signal remains pending.",
   "scope": {
     "in": [
       "crates/tx-shims/src/linux_syscall/socket.rs",
@@ -205,7 +205,7 @@
     {
       "id": "accept03-3-notify-fds",
       "title": "Implement basic inotify/fanotify notification fds without permission delegation",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "accept03-0-inventory"
       ],
@@ -217,10 +217,16 @@
         "docs/design/04_process-signals/SIGNAL_ATTACHMENTS_v1.md"
       ],
       "verification": [
-        "cargo test -p tx-shims --lib inotify",
-        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=accept03 OSCOMP_OUT_RV=target/oscomp/ltp-inotify-fanotify-accept03.txt"
+        "cargo test -p tx-shims inotify_init1 --lib",
+        "cargo test -p tx-shims fanotify_init --lib",
+        "cargo xtask syscall-status inotify_init1",
+        "cargo xtask syscall-status fanotify_init",
+        "timeout 240s make oscomp-qemu-rv64 OSCOMP_LTP=accept03 OSCOMP_OUT_RV=target/oscomp/ltp-accept03-after-fsnotify-fds.txt",
+        "python3 tools/oscomp-judge.py target/oscomp/ltp-accept03-after-fsnotify-fds.txt target/oscomp/testdata",
+        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=inotify_init1_01,inotify_init1_02 OSCOMP_OUT_RV=target/oscomp/ltp-inotify-init1-basic.txt",
+        "python3 tools/oscomp-judge.py target/oscomp/ltp-inotify-init1-basic.txt target/oscomp/testdata"
       ],
-      "notes": "SIGNAL_ATTACHMENTS_v1 already declares VFS fsnotify_port wires and SIGNAL_v1 says inotify/fanotify are future fd adapters. For accept03, first land real notification-instance fds whose read/poll/close semantics are coherent even with no marks. Full fanotify permission events must wait for the OnAgent/FanotifyPerm path in DELEGATE_v1 and should not be mixed into this small provider phase."
+      "notes": "Complete as typed instance-fd support: inotify_init1 and fanotify_init install VFS StructPayload::FsNotify descriptors with zone-managed instance identity, VFS read wait source, CLOEXEC/NONBLOCK flag plumbing, and generic non-socket accept() classification. Focused accept03 is 17/23 in target/oscomp/ltp-accept03-after-fsnotify-fds.txt; inotify_init1_01/inotify_init1_02 are 8/8 in target/oscomp/ltp-inotify-init1-basic.txt. Full watch/mark event queues and fanotify permission events remain future fsnotify/OnAgent work."
     },
     {
       "id": "accept03-4-mount-api-fds",
@@ -367,7 +373,7 @@
     {
       "command": "Implementation verification",
       "status": "passed",
-      "notes": "TLS ULP metadata phase passed host tests, focused LTP setsockopt10 1/1 in target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt, and refreshed b6 10/11 in target/oscomp/ltp-net-b6-after-tls-ulp.txt. pidfd_open passed host pidfd_open tests and focused LTP accept03 14/23 in target/oscomp/ltp-accept03-after-pidfd-open-final.txt. memfd_create passed host memfd_create tests, focused LTP accept03 15/23 in target/oscomp/ltp-accept03-after-memfd-create.txt, and memfd_create02 10/14 in target/oscomp/ltp-memfd-create02-basic.txt. SCTP, RDS, pidfd_send_signal, and the remaining notify/mount/heavy fd-provider phases remain pending."
+      "notes": "TLS ULP metadata phase passed host tests, focused LTP setsockopt10 1/1 in target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt, and refreshed b6 10/11 in target/oscomp/ltp-net-b6-after-tls-ulp.txt. pidfd_open passed host pidfd_open tests and focused LTP accept03 14/23 in target/oscomp/ltp-accept03-after-pidfd-open-final.txt. memfd_create passed host memfd_create tests, focused LTP accept03 15/23 in target/oscomp/ltp-accept03-after-memfd-create.txt, and memfd_create02 10/14 in target/oscomp/ltp-memfd-create02-basic.txt. inotify_init1/fanotify_init passed host tests, focused LTP accept03 17/23 in target/oscomp/ltp-accept03-after-fsnotify-fds.txt, and inotify_init1_01/inotify_init1_02 8/8 in target/oscomp/ltp-inotify-init1-basic.txt. SCTP, RDS, pidfd_send_signal, and the remaining mount/heavy fd-provider phases remain pending."
     }
   ],
   "risks": [

@@ -370,11 +370,23 @@ impl OpenFile {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
-        match self.rnode().backing() {
+        let rnode = self.rnode();
+        match rnode.backing() {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(tty) => tty::execution::step_read(tty, out, guard),
                 StructPayload::CharDevice(binding) => binding.ops.read(out, guard),
                 StructPayload::BlockDevice(_) => StepOutcome::Err(Errno::ENOSYS),
+                StructPayload::FsNotify { .. } => {
+                    if file_flags.nonblocking {
+                        StepOutcome::Err(Errno::EAGAIN)
+                    } else {
+                        StepOutcome::yield_on_wait_source(
+                            ByteProgress::EMPTY,
+                            rnode.read_wait_source_id(),
+                            super::structure::VFS_READABLE,
+                        )
+                    }
+                }
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Reader,
@@ -507,6 +519,7 @@ impl OpenFile {
                 StructPayload::Tty(_)
                 | StructPayload::CharDevice(_)
                 | StructPayload::BlockDevice(_)
+                | StructPayload::FsNotify { .. }
                 | StructPayload::Pipe { .. }
                 | StructPayload::Socket { .. }
                 | StructPayload::NetNamespace { .. } => return StepOutcome::Err(Errno::ESPIPE),
@@ -595,6 +608,7 @@ impl OpenFile {
                 StructPayload::Tty(tty) => tty::execution::step_write(tty, bytes, guard),
                 StructPayload::CharDevice(binding) => binding.ops.write(bytes, guard),
                 StructPayload::BlockDevice(_) => StepOutcome::Err(Errno::ENOSYS),
+                StructPayload::FsNotify { .. } => StepOutcome::Err(Errno::EINVAL),
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Writer,
@@ -708,7 +722,8 @@ impl OpenFile {
                 StructPayload::BlockDevice(_) => StepOutcome::Err(Errno::ENOSYS),
                 // Pipe was added on main; ioctl on a pipe returns
                 // ENOTTY (matches Linux behaviour).
-                StructPayload::Pipe { .. }
+                StructPayload::FsNotify { .. }
+                | StructPayload::Pipe { .. }
                 | StructPayload::Socket { .. }
                 | StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::ENOTTY),
             },

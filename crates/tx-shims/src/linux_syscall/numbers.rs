@@ -1162,6 +1162,12 @@ pub const NR_FSTAT: u64 = 80;
 /// `__NR_statx = 291`. LA64 musl/busybox prefers this over the older
 /// stat-family calls for directory listing metadata probes.
 pub const NR_STATX: u64 = 291;
+/// `inotify_init1(flags)`. Linux generic ABI `__NR_inotify_init1 = 26`.
+pub const NR_INOTIFY_INIT1: u64 = 26;
+/// `inotify_init1(2)` flag: close-on-exec, equal to `O_CLOEXEC`.
+pub const IN_CLOEXEC: u32 = O_CLOEXEC;
+/// `inotify_init1(2)` flag: nonblocking, equal to `O_NONBLOCK`.
+pub const IN_NONBLOCK: u32 = O_NONBLOCK;
 /// `umask(mask)`. Linux RV64 generic ABI `__NR_umask = 166`. Atomic
 /// swap of the per-process file-creation mask, returning the
 /// previous value. Mask is silently truncated to the bottom 9 bits
@@ -1940,6 +1946,20 @@ pub const NR_SYSLOG: u64 = 116;
 
 /// `membarrier(cmd, flags, cpu_id)`. RISC-V generic uapi `__NR_membarrier = 283`.
 pub const NR_MEMBARRIER: u64 = 283;
+/// `fanotify_init(flags, event_f_flags)`. Linux generic ABI
+/// `__NR_fanotify_init = 262`.
+pub const NR_FANOTIFY_INIT: u64 = 262;
+/// `fanotify_init(2)` flag: close-on-exec for the notification fd.
+pub const FAN_CLOEXEC: u32 = 0x0000_0001;
+/// `fanotify_init(2)` flag: nonblocking notification fd.
+pub const FAN_NONBLOCK: u32 = 0x0000_0002;
+/// `fanotify_init(2)` notification-only class. Other classes need
+/// content/permission-event semantics and are rejected for now.
+pub const FAN_CLASS_NOTIF: u32 = 0x0000_0000;
+/// `fanotify_init(2)` content class, unsupported in the basic fd slice.
+pub const FAN_CLASS_CONTENT: u32 = 0x0000_0004;
+/// `fanotify_init(2)` pre-content class, unsupported in the basic fd slice.
+pub const FAN_CLASS_PRE_CONTENT: u32 = 0x0000_0008;
 
 /// Query supported commands. Always returns `MEMBARRIER_SUPPORTED_MASK`.
 pub const MEMBARRIER_CMD_QUERY: u64 = 0;

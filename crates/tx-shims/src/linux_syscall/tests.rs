@@ -35,21 +35,22 @@ use tx_subsystems::process::{bootstrap_init_process, ExitStatus, Pid, ProcessIde
 use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
-use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking};
+use tx_subsystems::vfs::structure::{FsNotifyKind, OpenFileBacking, RNodeBacking, StructPayload};
 use tx_subsystems::vfs::OpenFile;
 use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
 use super::{
     dispatch, SyscallCtx, SyscallResult, CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID,
-    CLONE_PARENT_SETTID, EFAULT_VALUE, EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_GETFL,
-    F_SETFD, MFD_ALLOW_SEALING, MFD_CLOEXEC, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP,
-    NR_FCNTL, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST,
-    NR_MEMBARRIER, NR_MEMFD_CREATE, NR_PIDFD_OPEN, NR_PIPE2, NR_PPOLL, NR_READ, NR_RT_SIGACTION,
-    NR_RT_SIGPROCMASK, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY,
-    NR_SCHED_YIELD, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
-    NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, NR_WRITEV, O_DIRECTORY, O_NONBLOCK, PIDFD_NONBLOCK,
-    SIGCHLD, WNOHANG,
+    CLONE_PARENT_SETTID, EFAULT_VALUE, EINVAL_VALUE, ENOSYS_VALUE, FAN_CLASS_CONTENT,
+    FAN_CLASS_NOTIF, FAN_CLOEXEC, FAN_NONBLOCK, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, IN_CLOEXEC,
+    IN_NONBLOCK, MFD_ALLOW_SEALING, MFD_CLOEXEC, NR_ACCEPT, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT,
+    NR_EXIT_GROUP, NR_FANOTIFY_INIT, NR_FCNTL, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID,
+    NR_GETSID, NR_GET_ROBUST_LIST, NR_INOTIFY_INIT1, NR_MEMBARRIER, NR_MEMFD_CREATE, NR_PIDFD_OPEN,
+    NR_PIPE2, NR_PPOLL, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGTIMEDWAIT,
+    NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SCHED_YIELD, NR_SETPGID, NR_SETSID,
+    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, NR_WRITEV,
+    O_DIRECTORY, O_NONBLOCK, O_RDONLY, O_RDWR, PIDFD_NONBLOCK, SIGCHLD, WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
@@ -537,6 +538,117 @@ fn dispatch_pidfd_open_honours_nonblock_and_rejects_unknown_flags() {
     assert_eq!(
         block_on(dispatch::<ShimsTestPmap>(getfl, &ctx)),
         SyscallResult::Return(O_NONBLOCK as i64)
+    );
+}
+
+#[test]
+fn dispatch_inotify_init1_installs_typed_fsnotify_fd() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let invalid = SyscallRequest::new(NR_INOTIFY_INIT1, [0x100, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(invalid, &ctx)),
+        SyscallResult::Error(EINVAL_VALUE)
+    );
+
+    let req = SyscallRequest::new(
+        NR_INOTIFY_INIT1,
+        [(IN_CLOEXEC | IN_NONBLOCK) as u64, 0, 0, 0, 0, 0],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("inotify_init1 failed: {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("inotify fd installed");
+    match file.rnode().backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::FsNotify { instance },
+        } => assert_eq!(instance.kind(), FsNotifyKind::Inotify),
+        other => panic!("expected inotify fsnotify backing, got {other:?}"),
+    }
+    assert!(file.flags().read);
+    assert!(!file.flags().write);
+    assert!(file.flags().cloexec);
+    assert!(file.flags().nonblocking);
+    assert!(proc_cap.fd_cloexec(fd));
+
+    let getfd = SyscallRequest::new(NR_FCNTL, [fd as u64, F_GETFD as u64, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(getfd, &ctx)),
+        SyscallResult::Return(FD_CLOEXEC as i64)
+    );
+    let getfl = SyscallRequest::new(NR_FCNTL, [fd as u64, F_GETFL as u64, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(getfl, &ctx)),
+        SyscallResult::Return(O_NONBLOCK as i64)
+    );
+    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
+        SyscallResult::Error(88)
+    );
+}
+
+#[test]
+fn dispatch_fanotify_init_installs_notification_class_fd() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let unsupported_class = SyscallRequest::new(
+        NR_FANOTIFY_INIT,
+        [FAN_CLASS_CONTENT as u64, O_RDONLY as u64, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(unsupported_class, &ctx)),
+        SyscallResult::Error(EINVAL_VALUE)
+    );
+
+    let unsupported_event_flags = SyscallRequest::new(
+        NR_FANOTIFY_INIT,
+        [FAN_CLASS_NOTIF as u64, O_RDWR as u64, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(unsupported_event_flags, &ctx)),
+        SyscallResult::Error(EINVAL_VALUE)
+    );
+
+    let req = SyscallRequest::new(
+        NR_FANOTIFY_INIT,
+        [
+            (FAN_CLASS_NOTIF | FAN_CLOEXEC | FAN_NONBLOCK) as u64,
+            O_RDONLY as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("fanotify_init failed: {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("fanotify fd installed");
+    match file.rnode().backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::FsNotify { instance },
+        } => assert_eq!(instance.kind(), FsNotifyKind::Fanotify),
+        other => panic!("expected fanotify fsnotify backing, got {other:?}"),
+    }
+    assert!(file.flags().read);
+    assert!(!file.flags().write);
+    assert!(file.flags().cloexec);
+    assert!(file.flags().nonblocking);
+    assert!(proc_cap.fd_cloexec(fd));
+
+    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
+        SyscallResult::Error(88)
     );
 }
 

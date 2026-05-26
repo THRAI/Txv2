@@ -4,7 +4,7 @@ use tx_hal::{console_write_str, TxPlatform};
 use crate::{
     mount::{MountIdentity, MountNamespace, MountPayload},
     page_backed::PageContainer,
-    vfs::{DEntry, OpenFile, RNode},
+    vfs::{DEntry, FsNotifyInstance, OpenFile, RNode},
     vm::AddressSpace,
 };
 
@@ -247,6 +247,7 @@ mod vfs {
         zone::register_zone_for::<DEntry>()?;
         zone::register_zone_for::<RNode>()?;
         zone::register_zone_for::<OpenFile>()?;
+        zone::register_zone_for::<FsNotifyInstance>()?;
         Ok(())
     }
 }

@@ -23,7 +23,9 @@ static PROCFS_PROJECTED_MOUNT: SpinMutex<Option<Cap<tx_subsystems::mount::MountP
 const MEMFD_NAME_MAX: usize = 249;
 const MEMFD_CAPACITY_BYTES: u64 = 16 * 1024 * 1024;
 const MEMFD_FS_OBJECT_ID_BASE: u64 = 0xFFFC_0000_0000_0000;
+const FSNOTIFY_FS_OBJECT_ID_BASE: u64 = 0xFFFB_0000_0000_0000;
 static NEXT_MEMFD_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(MEMFD_FS_OBJECT_ID_BASE);
+static NEXT_FSNOTIFY_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(FSNOTIFY_FS_OBJECT_ID_BASE);
 
 pub(super) fn record_stat_meta_override(fs_object_id: FsObjectId, meta: InodeMeta) {
     STAT_META_OVERRIDES.lock().insert(fs_object_id, meta);
@@ -140,6 +142,100 @@ fn allocate_fd_at_least_under_limit<'a>(
 
 fn allocate_memfd_fs_object_id() -> FsObjectId {
     FsObjectId::new(NEXT_MEMFD_FS_OBJECT_ID.fetch_add(1, Ordering::AcqRel))
+}
+
+fn allocate_fsnotify_fs_object_id() -> FsObjectId {
+    FsObjectId::new(NEXT_FSNOTIFY_FS_OBJECT_ID.fetch_add(1, Ordering::AcqRel))
+}
+
+fn install_fsnotify_fd<'a>(
+    ctx: &SyscallCtx<'a>,
+    kind: FsNotifyKind,
+    cloexec: bool,
+    nonblocking: bool,
+) -> SyscallResult {
+    let instance = match FsNotifyInstance::new_cap(kind) {
+        Ok(instance) => instance,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let rnode = match tx_subsystems::vfs::RNode::new_cap(
+        allocate_fsnotify_fs_object_id(),
+        InodeMeta::new(InodeKind::Regular, 0o100600),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::FsNotify { instance },
+        },
+    ) {
+        Ok(rnode) => rnode,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let open_file = match OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: false,
+            cloexec,
+            nonblocking,
+            ..OpenFileFlags::default()
+        },
+    ) {
+        Ok(file) => file,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+
+    let fd = match allocate_fd_under_limit(ctx) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let _ = ctx.process.install_fd(fd, open_file);
+    if cloexec {
+        ctx.process.set_fd_cloexec(fd, true);
+    }
+
+    SyscallResult::Return(fd as i64)
+}
+
+/// `inotify_init1(flags)`. Linux generic ABI `__NR_inotify_init1 = 26`.
+///
+/// This is the fd-provider phase only: it creates a typed fsnotify instance
+/// fd with coherent CLOEXEC/NONBLOCK flags and a VFS wait source. Watch
+/// registration and event production remain future fsnotify work.
+pub(super) fn sys_inotify_init1<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let flags = args[0];
+    let recognised = (IN_CLOEXEC | IN_NONBLOCK) as u64;
+    if flags & !recognised != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    install_fsnotify_fd(
+        ctx,
+        FsNotifyKind::Inotify,
+        flags & IN_CLOEXEC as u64 != 0,
+        flags & IN_NONBLOCK as u64 != 0,
+    )
+}
+
+/// `fanotify_init(flags, event_f_flags)`. Linux generic ABI
+/// `__NR_fanotify_init = 262`.
+///
+/// Only the notification class is supported here. Content/pre-content and
+/// permission-event fanotify require the future `OnAgent`/fsnotify mark path.
+pub(super) fn sys_fanotify_init<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let flags = args[0];
+    let event_f_flags = args[1];
+    let recognised = (FAN_CLOEXEC | FAN_NONBLOCK | FAN_CLASS_NOTIF) as u64;
+    if flags & !recognised != 0
+        || flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT) as u64 != 0
+        || event_f_flags != O_RDONLY as u64
+    {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    install_fsnotify_fd(
+        ctx,
+        FsNotifyKind::Fanotify,
+        flags & FAN_CLOEXEC as u64 != 0,
+        flags & FAN_NONBLOCK as u64 != 0,
+    )
 }
 
 /// `memfd_create(name, flags)`. Linux generic ABI `__NR_memfd_create = 279`.
