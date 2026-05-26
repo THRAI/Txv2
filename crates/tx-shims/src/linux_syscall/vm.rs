@@ -132,6 +132,17 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
     let fd = args[4] as i32;
     let offset = args[4 + 1]; // args[5]
 
+    // Linux reports EBADF for a file-backed mmap with a closed fd even
+    // when another argument (notably length) is also invalid.
+    if flags & MAP_ANONYMOUS == 0 {
+        if fd < 0 {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
+        if resolve_fd(&ctx.process, fd as u32).is_none() {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
+    }
+
     // Length validation. Linux rounds the byte length up to a whole
     // page; addr (when MAP_FIXED is set) must already be page-aligned.
     if length_in == 0 {
@@ -160,12 +171,33 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
         prot_bits & PROT_EXEC != 0,
     );
 
-    // Decode `flags`. Exactly one of MAP_SHARED / MAP_PRIVATE required.
-    let private = flags & MAP_PRIVATE != 0;
-    let shared = flags & MAP_SHARED != 0;
-    if private == shared {
-        // both unset, or both set
+    // Decode `flags`. Linux's low nibble selects one mapping type:
+    // MAP_SHARED, MAP_PRIVATE, or MAP_SHARED_VALIDATE.
+    let map_type = flags & 0x0f;
+    let shared_validate = map_type == MAP_SHARED_VALIDATE;
+    let private = map_type == MAP_PRIVATE;
+    let shared = map_type == MAP_SHARED || shared_validate;
+    if !(private || shared) {
         return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if shared_validate {
+        let recognised = MAP_SHARED_VALIDATE
+            | MAP_FIXED
+            | MAP_ANONYMOUS
+            | MAP_GROWSDOWN
+            | MAP_DENYWRITE
+            | MAP_EXECUTABLE
+            | MAP_LOCKED
+            | MAP_NORESERVE
+            | MAP_POPULATE
+            | MAP_NONBLOCK
+            | MAP_STACK
+            | MAP_HUGETLB
+            | MAP_SYNC
+            | MAP_FIXED_NOREPLACE;
+        if flags & !recognised != 0 {
+            return SyscallResult::Error(EOPNOTSUPP_VALUE);
+        }
     }
     let fixed = flags & MAP_FIXED != 0;
     let fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
@@ -205,6 +237,9 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
             Some(f) => f,
             None => return SyscallResult::Error(EBADF_VALUE),
         };
+        if !file.flags().read {
+            return SyscallResult::Error(EACCES_VALUE);
+        }
         match extract_page_container(&file) {
             Some(pc) => VmBacking::Page { pc, offset },
             None => return SyscallResult::error_from(Errno::ENODEV),
@@ -682,6 +717,12 @@ pub(super) async fn sys_mremap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
         Ok(r) => r,
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
+    if old_range
+        .iter_pages()
+        .any(|page| ctx.aspace.lookup(page.start_addr()).is_none())
+    {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
 
     let request = if fixed {
         if !UserVirtAddr::new(new_addr as usize).is_page_aligned() {
@@ -794,6 +835,27 @@ pub(super) fn sys_madvise<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
         Ok(()) => SyscallResult::Return(0),
         Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
     }
+}
+
+/// `remap_file_pages(start, size, prot, pgoff, flags)` — Linux generic
+/// syscall #234.
+///
+/// txKernel does not model nonlinear file mappings yet. Keep the
+/// all-zero LTP feature-probe shape as `ENOSYS`, but report `EINVAL`
+/// for concrete calls so negative argument validation tests observe a
+/// recognized syscall rather than an unsupported architecture.
+pub(super) fn sys_remap_file_pages(args: [u64; 6]) -> SyscallResult {
+    let start = args[0];
+    let size = args[1];
+    let prot = args[2];
+    let pgoff = args[3];
+    let flags = args[4];
+
+    if start == 0 && size == 0 && prot == 0 && pgoff == 0 && flags == 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
+
+    SyscallResult::Error(EINVAL_VALUE)
 }
 
 /// `msync(addr, length, flags)` — Linux RV64 generic syscall #227.

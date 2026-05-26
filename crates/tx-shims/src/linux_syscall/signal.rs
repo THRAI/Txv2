@@ -483,12 +483,118 @@ pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
     }
 }
 
-pub(super) fn sys_pidfd_open(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+pub(super) fn sys_pidfd_open(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
+    const PIDFD_NONBLOCK: u32 = O_NONBLOCK;
+
+    let pid_raw = args[0];
+    let flags = args[1] as u32;
+
+    if pid_raw == 0 || pid_raw > i32::MAX as u64 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if flags & !PIDFD_NONBLOCK != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let pid = Pid(pid_raw as u32);
+    if process_by_pid(pid).is_none() {
+        return SyscallResult::Error(ESRCH_VALUE);
+    }
+
+    let fd = ctx.process.allocate_fd();
+    let (soft_limit, _) = ctx.process.rlimit_nofile();
+    if fd >= soft_limit {
+        return SyscallResult::Error(EMFILE_VALUE);
+    }
+
+    let open_flags = OpenFileFlags {
+        read: true,
+        write: false,
+        append: false,
+        cloexec: true,
+        nonblocking: (flags & PIDFD_NONBLOCK) != 0,
+    };
+    let open_cap = match OpenFile::new_pidfd_cap(pid.0, open_flags) {
+        Ok(cap) => cap,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let _ = ctx.process.install_fd(fd, open_cap);
+    ctx.process.set_fd_cloexec(fd, true);
+    SyscallResult::Return(fd as i64)
 }
 
-pub(super) fn sys_pidfd_send_signal(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+fn pid_from_pidfd_like_file(file: &OpenFile) -> Option<Pid> {
+    if let Some(pid) = file.pidfd_pid() {
+        return Some(Pid(pid));
+    }
+    match file.backing() {
+        OpenFileBacking::Rnode { rnode } => tx_fs::procfs::pid_from_dir(rnode.fs_object_id()),
+        _ => None,
+    }
+}
+
+pub(super) fn sys_pidfd_send_signal(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
+    let fd = args[0] as u32;
+    let sig = args[1] as u32;
+    let info_ptr = args[2];
+    let flags = args[3] as u32;
+
+    if flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let file = match ctx.process.fd(fd) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let pid = match pid_from_pidfd_like_file(&file) {
+        Some(pid) => pid,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let target = match process_by_pid(pid) {
+        Some(target) => target,
+        None => return SyscallResult::Error(ESRCH_VALUE),
+    };
+
+    if sig > 64 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if info_ptr != 0 {
+        let mut signo_bytes = [0u8; 4];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut signo_bytes, info_ptr) {
+            return SyscallResult::error_from(errno);
+        }
+        let info_signo = u32::from_le_bytes(signo_bytes);
+        if info_signo != sig {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+    }
+    if sig == 0 {
+        return SyscallResult::Return(0);
+    }
+    let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
+        Some(signum) => signum,
+        None => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    let siginfo = Some(SigInfo {
+        si_signo: signum.raw() as u32,
+        si_code: SI_USER,
+        si_pid: ctx.process.pid.0,
+        si_uid: 0,
+    });
+
+    dispatch_errno(
+        tx_subsystems::signal::script_deliver_signal(
+            &ctx.process,
+            SignalTarget::Process(target),
+            signum,
+            siginfo,
+        ),
+        |outcome| match outcome {
+            KillOutcome::Delivered => SyscallResult::Return(0),
+            KillOutcome::NoLiveThread => SyscallResult::Error(ESRCH_VALUE),
+        },
+    )
 }
 
 /// `rt_sigaction(signum, act, oldact, sigsetsize)` per `SIGNAL_v1`

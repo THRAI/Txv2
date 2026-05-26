@@ -47,6 +47,10 @@ docker-help:
 	@echo "  make oscomp-local-rv64-ltp-musl-smp4"
 	@echo "  make oscomp-local-la64-ltp-musl"
 	@echo "  make oscomp-local-la64-ltp-musl-smp4"
+	@echo "  make oscomp-local-rv64-ltp-glibc"
+	@echo "  make oscomp-local-la64-ltp-glibc"
+	@echo "  make oscomp-local-la64-ltp-glibc-cases OSCOMP_LTP=open01,stat02"
+	@echo "  make oscomp-local-la64-glibc OSCOMP_SUITE=basic"
 	@echo "  make ltp-batches"
 	@echo "  make oscomp-local-rv64-ltp-batch LTP_BATCH=p0"
 	@echo "  make oscomp-export-testcase"
@@ -165,6 +169,7 @@ OSCOMP_OUT_LA_SMP4 ?= target/oscomp/os_serial_out_la_smp4.txt
 OSCOMP_GROUPS ?=
 OSCOMP_LIBCTEST ?=
 OSCOMP_LTP ?=
+OSCOMP_SUITE ?= ltp
 
 # LTP local testing shortcuts:
 #
@@ -175,7 +180,13 @@ OSCOMP_LTP ?=
 #      make oscomp-local-rv64 OSCOMP_LTP=umask01
 #      make oscomp-local-rv64 OSCOMP_LTP=open01,stat02
 #
-# 3. Run a Txv2 syscalls-oriented sub-batch. These batches split the
+# 3. Run glibc LTP. Full-image glibc runs use the official group name;
+#    focused glibc case runs use a temporary slim sdcard because the guest
+#    command-line selector only supports per-case filtering for ltp-musl.
+#      make oscomp-local-la64-ltp-glibc
+#      make oscomp-local-la64-ltp-glibc-cases OSCOMP_LTP=open01,stat02
+#
+# 4. Run a Txv2 syscalls-oriented sub-batch. These batches split the
 #    extracted ltp-musl case list, which is mainly /musl/ltp/runtest/syscalls.
 #    LTP_BATCH=all is a syscalls sweep, not the official full OSComp run and
 #    not every upstream LTP runtest module.
@@ -183,7 +194,7 @@ OSCOMP_LTP ?=
 #      make ltp-batch-cases LTP_BATCH=vfs
 #      make oscomp-local-rv64-ltp-batch LTP_BATCH=vfs
 #
-# 4. Inspect native LTP runtest modules outside syscalls. Guest-side
+# 5. Inspect native LTP runtest modules outside syscalls. Guest-side
 #    ltp-runtest:<module> execution is not wired in exec.rs yet, so these
 #    targets are only useful after that selector is implemented.
 #      make ltp-runtests
@@ -199,6 +210,9 @@ LTP_BATCH_REFRESH ?= --refresh
 LTP_RUNTEST ?= smoketest
 LTP_RUNTEST_CASES ?=
 LTP_RUNTEST_TOOL ?= python3 tools/ltp-runtests.py
+OSCOMP_LTP_GLIBC_SIZE_MB ?= 512
+OSCOMP_LTP_GLIBC_RV_DATA ?= target/oscomp/ltp-glibc-rv-focus
+OSCOMP_LTP_GLIBC_LA_DATA ?= target/oscomp/ltp-glibc-la-focus
 COMMA := ,
 OSCOMP_LIBCTEST_GROUP = libctest-musl:$(subst $(COMMA),+,$(OSCOMP_LIBCTEST))
 OSCOMP_LTP_GROUP = $(if $(strip $(OSCOMP_LTP)),ltp-musl:$(subst $(COMMA),+,$(OSCOMP_LTP)),ltp-musl)
@@ -216,10 +230,15 @@ OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'
 	oscomp-judge-la64 oscomp-judge-la64-smp4 \
 	oscomp-local-rv64 oscomp-local-rv64-smp4 \
 	oscomp-local-la64 oscomp-local-la64-smp4 \
+	oscomp-local-rv64-glibc oscomp-local-rv64-glibc-smp4 \
+	oscomp-local-la64-glibc oscomp-local-la64-glibc-smp4 \
 	oscomp-local-rv64-libctest-musl oscomp-local-rv64-libctest-musl-smp4 \
 	oscomp-local-la64-libctest-musl oscomp-local-la64-libctest-musl-smp4 \
 	oscomp-local-rv64-ltp-musl oscomp-local-rv64-ltp-musl-smp4 \
 	oscomp-local-la64-ltp-musl oscomp-local-la64-ltp-musl-smp4 \
+	oscomp-local-rv64-ltp-glibc oscomp-local-rv64-ltp-glibc-smp4 \
+	oscomp-local-la64-ltp-glibc oscomp-local-la64-ltp-glibc-smp4 \
+	oscomp-local-rv64-ltp-glibc-cases oscomp-local-la64-ltp-glibc-cases \
 	ltp-batches ltp-batch-cases ltp-runtests ltp-runtest-cases \
 	oscomp-local-rv64-ltp-batch oscomp-local-rv64-ltp-batch-smp4 \
 	oscomp-local-la64-ltp-batch oscomp-local-la64-ltp-batch-smp4 \
@@ -320,6 +339,18 @@ oscomp-local-la64: docker-build-la64 docker-oscomp-prepare oscomp-submit-la64 os
 
 oscomp-local-la64-smp4: docker-build-la64 docker-oscomp-prepare oscomp-submit-la64 oscomp-qemu-la64-smp4 oscomp-judge-la64-smp4
 
+oscomp-local-rv64-glibc:
+	$(MAKE) oscomp-local-rv64 OSCOMP_GROUPS=$(OSCOMP_SUITE)-glibc
+
+oscomp-local-rv64-glibc-smp4:
+	$(MAKE) oscomp-local-rv64-smp4 OSCOMP_GROUPS=$(OSCOMP_SUITE)-glibc
+
+oscomp-local-la64-glibc:
+	$(MAKE) oscomp-local-la64 OSCOMP_GROUPS=$(OSCOMP_SUITE)-glibc
+
+oscomp-local-la64-glibc-smp4:
+	$(MAKE) oscomp-local-la64-smp4 OSCOMP_GROUPS=$(OSCOMP_SUITE)-glibc
+
 oscomp-local-rv64-libctest-musl:
 	$(MAKE) oscomp-local-rv64 OSCOMP_GROUPS=libctest-musl
 
@@ -343,6 +374,61 @@ oscomp-local-la64-ltp-musl:
 
 oscomp-local-la64-ltp-musl-smp4:
 	$(MAKE) oscomp-local-la64-smp4 OSCOMP_GROUPS=$(OSCOMP_LTP_GROUP)
+
+oscomp-local-rv64-ltp-glibc:
+	$(MAKE) oscomp-local-rv64 OSCOMP_GROUPS=ltp-glibc
+
+oscomp-local-rv64-ltp-glibc-smp4:
+	$(MAKE) oscomp-local-rv64-smp4 OSCOMP_GROUPS=ltp-glibc
+
+oscomp-local-la64-ltp-glibc:
+	$(MAKE) oscomp-local-la64 OSCOMP_GROUPS=ltp-glibc
+
+oscomp-local-la64-ltp-glibc-smp4:
+	$(MAKE) oscomp-local-la64-smp4 OSCOMP_GROUPS=ltp-glibc
+
+oscomp-local-rv64-ltp-glibc-cases: docker-build-rv64 docker-oscomp-prepare oscomp-submit-rv64
+	@test -n "$(strip $(OSCOMP_LTP))" || { \
+		echo "usage: make $@ OSCOMP_LTP=open01,stat02"; \
+		exit 1; \
+	}
+	mkdir -p $(OSCOMP_LTP_GLIBC_RV_DATA)
+	cargo xtask oscomp slim-sdcard \
+		--suite ltp-glibc \
+		--ltp-cases $(OSCOMP_LTP) \
+		--output $(OSCOMP_LTP_GLIBC_RV_DATA)/sdcard-rv.img \
+		--size-mb $(OSCOMP_LTP_GLIBC_SIZE_MB)
+	cargo xtask oscomp qemu \
+		--target rv64-qemu \
+		--data $(OSCOMP_LTP_GLIBC_RV_DATA) \
+		--submit $(OSCOMP_SUBMIT) \
+		--boot-suite ltp-glibc
+	cargo xtask oscomp score \
+		--target rv64-qemu \
+		--data $(OSCOMP_DATA) \
+		--suite ltp-glibc
+
+oscomp-local-la64-ltp-glibc-cases: docker-build-la64 docker-oscomp-prepare oscomp-submit-la64
+	@test -n "$(strip $(OSCOMP_LTP))" || { \
+		echo "usage: make $@ OSCOMP_LTP=open01,stat02"; \
+		exit 1; \
+	}
+	mkdir -p $(OSCOMP_LTP_GLIBC_LA_DATA)
+	cargo xtask oscomp slim-sdcard \
+		--source $(OSCOMP_DATA)/sdcard-la.img \
+		--suite ltp-glibc \
+		--ltp-cases $(OSCOMP_LTP) \
+		--output $(OSCOMP_LTP_GLIBC_LA_DATA)/sdcard-la.img \
+		--size-mb $(OSCOMP_LTP_GLIBC_SIZE_MB)
+	cargo xtask oscomp qemu \
+		--target la64-qemu \
+		--data $(OSCOMP_LTP_GLIBC_LA_DATA) \
+		--submit $(OSCOMP_SUBMIT) \
+		--boot-suite ltp-glibc
+	cargo xtask oscomp score \
+		--target la64-qemu \
+		--data $(OSCOMP_DATA) \
+		--suite ltp-glibc
 
 # LTP grouped runs:
 #

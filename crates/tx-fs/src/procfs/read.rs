@@ -1,7 +1,7 @@
 //! Content renderers for procfs pseudo-files.
 
 use crate::procfs::{
-    pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_stat_id,
+    pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_smaps_id, pid_from_stat_id,
     pid_from_status_id, task_from_stat_id, PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID,
     PROCFS_MOUNTS_ID, PROCFS_NET_ARP_ID, PROCFS_NET_DEV_ID, PROCFS_NET_IF_INET6_ID,
     PROCFS_NET_NETLINK_ID, PROCFS_NET_NF_CONNTRACK_ID, PROCFS_NET_RAW_ID, PROCFS_NET_ROUTE_ID,
@@ -34,6 +34,9 @@ pub fn render_with_netns(
     }
     if let Some(pid) = pid_from_maps_id(fs_object_id) {
         return render_maps(pid);
+    }
+    if let Some(pid) = pid_from_smaps_id(fs_object_id) {
+        return render_smaps(pid);
     }
     if let Some(pid) = pid_from_status_id(fs_object_id) {
         return render_status(pid);
@@ -204,6 +207,68 @@ fn render_maps(pid: Pid) -> String {
         out.push_str(&format!(
             "{:x}-{:x} {}{}{}{} {:08x} 00:00 0 {}{}\n",
             start, end, r, w, x, p, offset, backing_desc, locked,
+        ));
+    }
+
+    out
+}
+
+fn render_smaps(pid: Pid) -> String {
+    use tx_subsystems::vm::{VmBacking, USER_PAGE_SIZE};
+
+    let Some(proc) = process::process_by_pid(pid) else {
+        return String::new();
+    };
+    let Some(aspace) = proc.aspace_cap() else {
+        return String::new();
+    };
+
+    let mut entries = aspace.recipes_snapshot();
+    entries.sort_by_key(|e| e.range.start());
+
+    let mut out = String::new();
+    for entry in entries {
+        let start = entry.range.start().as_usize();
+        let end = entry.range.end().as_usize();
+
+        let r = if entry.prot.read { 'r' } else { '-' };
+        let w = if entry.prot.write { 'w' } else { '-' };
+        let x = if entry.prot.execute { 'x' } else { '-' };
+        let p = if entry.flags.shared { 's' } else { 'p' };
+
+        let (offset, backing_desc) = match &entry.backing {
+            VmBacking::None => (0u64, "[none]"),
+            VmBacking::PrivateAnon => (0u64, "[anon]"),
+            VmBacking::Page { pc, offset: off } => {
+                use tx_subsystems::page_backed::PageContainerKind;
+                let desc = match pc.kind() {
+                    PageContainerKind::Anon { .. } => "[anon]",
+                    PageContainerKind::File { .. } => "[file]",
+                    PageContainerKind::Device { .. } => "[device]",
+                };
+                (*off, desc)
+            }
+        };
+
+        let size_kb = entry.range.page_count() * (USER_PAGE_SIZE / 1024);
+        let locked_kb = if entry.flags.locked { size_kb } else { 0 };
+
+        out.push_str(&format!(
+            "{:x}-{:x} {}{}{}{} {:08x} 00:00 0 {}\n",
+            start, end, r, w, x, p, offset, backing_desc,
+        ));
+        out.push_str(&format!(
+            "Size:           {:8} kB\n\
+             Rss:            {:8} kB\n\
+             Pss:            {:8} kB\n\
+             Shared_Clean:   {:8} kB\n\
+             Shared_Dirty:   {:8} kB\n\
+             Private_Clean:  {:8} kB\n\
+             Private_Dirty:  {:8} kB\n\
+             Referenced:     {:8} kB\n\
+             Anonymous:      {:8} kB\n\
+             Locked:         {:8} kB\n",
+            size_kb, size_kb, size_kb, 0, 0, size_kb, 0, size_kb, size_kb, locked_kb,
         ));
     }
 

@@ -8,8 +8,8 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | Item | Value | Note |
 | --- | ---: | --- |
 | cases | 109 | from `make ltp-batch-cases LTP_BATCH=process` |
-| latest local run | timeout triage | 2026-05-26 single-case reruns for previously hung process cases |
-| cumulative scored | `163/355` | recorded rows in this document |
+| latest local run | pidfd_getfd01/02 | 2026-05-26 RV/LA reruns after pidfd_getfd support |
+| cumulative scored | `311/494` | recorded rows in this document |
 | reached case | `waitpid13` | batch completed |
 | logs | `target/oscomp/ltp-progress/process` | per-group stdout and serial snapshots |
 
@@ -18,7 +18,13 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 - TBROK: 25 recorded case(s); see per-case notes below.
 - host timeout before case completed: 4 recorded case(s); see per-case notes below.
 - TCONF: 15 recorded case(s); see per-case notes below.
-- TFAIL: 13 recorded case(s); see per-case notes below.
+- TFAIL: 11 recorded case(s); see per-case notes below.
+- Procfs refresh: `/proc/sys/kernel/pid_max` and `/proc/self/status` are now available; `getpid01`, `getppid01`, `getsid02`, `gettid01`, and `wait402` pass on RV/LA. `kcmp02` now reaches TCONF for missing `kcmp`; `setpgid02` reaches real setpgid errno checks.
+- `personality(2)` now records per-process personality state; `personality01` and `personality02` pass on RV/LA.
+- Minimal `pidfd_open(2)` fd support is available. `pidfd_open01` and `pidfd_open02` pass on RV/LA; `pidfd_open04` now reaches the `O_NONBLOCK` check but still fails `waitid(P_PIDFD)` with `ENOSYS` and times out in checkpoint cleanup. `pidfd_open03` still times out around checkpoint synchronization.
+- `pidfd_send_signal02` now passes on RV/LA. The pidfd path accepts `pidfd_open` fds and `/proc/<pid>` directory fds, validates flags/siginfo signum, and root `setuid(nonroot)` drops capabilities so the init-process permission case returns `EPERM`.
+- Minimal `kcmp(2)` support is available. `KCMP_FILE` compares open-file identity and the errno surface is wired; `kcmp01` and `kcmp02` pass on RV/LA. `kcmp03` is still locally skipped.
+- Minimal `pidfd_getfd(2)` support is available. It duplicates target-process fds with `FD_CLOEXEC`; `pidfd_getfd01` and `pidfd_getfd02` now score partial on RV/LA, with the remaining breakage in checkpoint cleanup.
 
 ## Cases
 
@@ -69,28 +75,28 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `getpgid01` | 4/8 | partial | single-case rerun exits cleanly; parent/init pgid lookups return `ESRCH` |
 | `getpgid02` | 2/2 | pass | single-case rerun passes |
 | `getpgrp01` | 2/2 | pass | single-case rerun passes |
-| `getpid01` | 0/1 | fail | TBROK: Failed to open FILE '/proc/sys/kernel/pid_max' for reading: ENOENT (2) |
+| `getpid01` | 100/100 | pass | `/proc/sys/kernel/pid_max` available; RV/LA pass |
 | `getpid02` | 2/2 | pass |  |
-| `getppid01` | 0/1 | fail | TBROK: Failed to open FILE '/proc/sys/kernel/pid_max' for reading: ENOENT (2) |
+| `getppid01` | 1/1 | pass | `/proc/sys/kernel/pid_max` available; RV/LA pass |
 | `getppid02` | 1/1 | pass |  |
 | `getsid01` | 1/1 | pass |  |
-| `getsid02` | 0/1 | fail | TBROK: Failed to open FILE '/proc/sys/kernel/pid_max' for reading: ENOENT (2) |
-| `gettid01` | 0/1 | fail | TBROK: Failed to open FILE '/proc/self/status' for reading: ENOENT (2) |
+| `getsid02` | 1/1 | pass | `/proc/sys/kernel/pid_max` available; unused pid returns ESRCH; RV/LA pass |
+| `gettid01` | 2/2 | pass | `/proc/self/status` available; tid matches pid; RV/LA pass |
 | `gettid02` | 11/11 | pass |  |
-| `kcmp01` | 0/5 | skip | TCONF: syscall(272) __NR_kcmp not supported on your arch |
-| `kcmp02` | 0/1 | fail | TBROK: Failed to open FILE '/proc/sys/kernel/pid_max' for reading: ENOENT (2) |
-| `kcmp03` | 0/0 | hang | TCONF: syscall(272) __NR_kcmp not supported on your arch |
-| `personality01` | 0/18 | fail | single-case rerun exits cleanly; all variants fail with `ENOSYS` |
-| `personality02` | 0/1 | fail | single-case rerun exits cleanly; `personality()` returns `ENOSYS` |
-| `pidfd_getfd01` | 0/1 | skip | single-case rerun exits cleanly; TCONF: `__NR_pidfd_open` not supported |
-| `pidfd_getfd02` | 0/1 | skip | single-case rerun exits cleanly; TCONF: `__NR_pidfd_open` not supported |
-| `pidfd_open01` | 0/1 | skip | TCONF: syscall(434) __NR_pidfd_open not supported on your arch |
-| `pidfd_open02` | 0/1 | skip | TCONF: syscall(434) __NR_pidfd_open not supported on your arch |
-| `pidfd_open03` | 0/1 | skip | TCONF: syscall(434) __NR_pidfd_open not supported on your arch |
-| `pidfd_open04` | 0/1 | skip | TCONF: syscall(434) __NR_pidfd_open not supported on your arch |
-| `pidfd_send_signal01` | 0/1 | skip | TCONF: syscall(424) __NR_pidfd_send_signal not supported on your arch |
-| `pidfd_send_signal02` | 0/1 | skip | TCONF: syscall(424) __NR_pidfd_send_signal not supported on your arch |
-| `pidfd_send_signal03` | 0/1 | skip | TCONF: syscall(424) __NR_pidfd_send_signal not supported on your arch |
+| `kcmp01` | 5/5 | pass | `KCMP_FILE` open-file identity comparisons pass on RV/LA |
+| `kcmp02` | 6/6 | pass | bad pid, invalid type, and bad fd errno cases pass on RV/LA |
+| `kcmp03` | 0/0 | skip | local skip after `kcmp` support; clone-sharing comparisons still deferred |
+| `personality01` | 18/18 | pass | per-process `personality(2)` read/write state; RV/LA pass |
+| `personality02` | 1/1 | pass | `STICKY_TIMEOUTS` personality read/write works; `select` keeps timeout unchanged; RV/LA pass |
+| `pidfd_getfd01` | 1/3 | partial | fd duplication and `kcmp` identity check pass; checkpoint wait/wake cleanup still times out; RV/LA 1/3 |
+| `pidfd_getfd02` | 3/5 | partial | invalid pidfd, invalid targetfd, and invalid flags pass; ESRCH/EPERM checkpoint paths still time out; RV/LA 3/5 |
+| `pidfd_open01` | 1/1 | pass | pidfd fd installs `FD_CLOEXEC`; RV/LA pass |
+| `pidfd_open02` | 3/3 | pass | expired pid, invalid pid, and invalid flags return expected errno; RV/LA pass |
+| `pidfd_open03` | 0/2 | fail | `pidfd_open` succeeds, but child checkpoint wait/wake still times out; RV 0/2 |
+| `pidfd_open04` | 1/4 | partial | `PIDFD_NONBLOCK` reflected by `F_GETFL`; `waitid(P_PIDFD)` still returns `ENOSYS` and checkpoint cleanup times out; RV/LA 1/4 |
+| `pidfd_send_signal01` | 0/1 | fail | syscall is available; remaining failure is checkpoint wait timeout after handler thread setup |
+| `pidfd_send_signal02` | 4/4 | pass | pidfd/proc-dir fd errno surface passes on RV/LA |
+| `pidfd_send_signal03` | 0/1 | skip | syscall is available; TCONF: `/proc/sys/kernel/ns_last_pid` does not exist |
 | `process_vm_readv01` | 0/0 | skip |  |
 | `process_vm_readv02` | 0/1 | skip | TCONF: syscall(270) __NR_process_vm_readv not supported on your arch |
 | `process_vm_readv03` | 0/1 | skip | TCONF: syscall(270) __NR_process_vm_readv not supported on your arch |
@@ -99,7 +105,7 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `set_robust_list01` | 1/2 | partial | TFAIL: set_robust_list01.c:117: set_robust_list: retval = 0 (expected -1), errno = 0 (expected 22) |
 | `set_tid_address01` | 1/1 | pass |  |
 | `setpgid01` | 1/2 | partial | TFAIL: setpgid01.c:87: test setpgid(19, 1) fail: TEST_ERRNO=ENOSYS(38): Function not implemented |
-| `setpgid02` | 0/1 | fail | TBROK: Failed to open FILE '/proc/sys/kernel/pid_max' for reading: ENOENT (2) |
+| `setpgid02` | 0/3 | fail | `/proc/sys/kernel/pid_max` available; remaining errno mismatches/ENOSYS in setpgid semantics |
 | `setpgid03` | 0/1 | fail | TBROK: tst_checkpoint_wait(0, 10000) failed: ETIMEDOUT (110) |
 | `setpgrp01` | 1/1 | pass |  |
 | `setpgrp02` | 2/2 | pass |  |
@@ -109,7 +115,7 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `wait01` | 1/1 | pass |  |
 | `wait02` | 1/1 | pass |  |
 | `wait401` | 0/0 | hang | single-case rerun still host-times out after LTP init output |
-| `wait402` | 0/1 | fail | TBROK: Failed to open FILE '/proc/sys/kernel/pid_max' for reading: ENOENT (2) |
+| `wait402` | 1/1 | pass | `/proc/sys/kernel/pid_max` available; wait4(pid_max + 1) returns ECHILD; RV/LA pass |
 | `wait403` | 0/1 | fail | TFAIL: wait4 fails with ESRCH expected ESRCH: EINVAL (22) |
 | `waitid01` | 0/6 | fail | TBROK: Invalid child (16) exit value 123 |
 | `waitid02` | 0/1 | fail | TFAIL: waitid(P_ALL, 0, infop, WNOHANG) expected EINVAL: ENOSYS (38) |

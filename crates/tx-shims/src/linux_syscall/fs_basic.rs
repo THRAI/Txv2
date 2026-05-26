@@ -1966,7 +1966,8 @@ fn stat_meta_for_non_vfs_open_file(file: &OpenFile) -> Option<InodeMeta> {
         | OpenFileBacking::Ufd { .. }
         | OpenFileBacking::AioContext { .. }
         | OpenFileBacking::IoUring { .. }
-        | OpenFileBacking::PosixMq { .. } => Some(InodeMeta {
+        | OpenFileBacking::PosixMq { .. }
+        | OpenFileBacking::Pidfd { .. } => Some(InodeMeta {
             mode: 0o600,
             uid: 0,
             gid: 0,

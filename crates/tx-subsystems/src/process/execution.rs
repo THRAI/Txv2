@@ -310,6 +310,7 @@ pub fn bootstrap_init_process(
         // mask defaults to `0o022` per Linux convention; children
         // inherit through `step_fork`'s umask thread-through.
         0o022,
+        0,
         Arc::new(SigActionTable::new()),
     )?;
     *proc_cap.payload.lock() = Some(payload);
@@ -394,6 +395,7 @@ pub fn step_fork_with_options<P: PmapIf>(
         parent_brk_base,
         parent_current_brk,
         parent_umask,
+        parent_personality,
     ) = {
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
@@ -410,6 +412,7 @@ pub fn step_fork_with_options<P: PmapIf>(
             payload.brk_base(),
             payload.current_brk(),
             payload.umask(),
+            payload.personality(),
         )
     };
     let parent_pgrp = parent.pgrp.lock().clone();
@@ -471,6 +474,7 @@ pub fn step_fork_with_options<P: PmapIf>(
         parent_brk_base,
         parent_current_brk,
         parent_umask,
+        parent_personality,
         child_sig_actions,
     )
     .map_err(ForkError::Zone)?;
@@ -1247,6 +1251,7 @@ fn sign_process_payload(
     brk_base: u64,
     current_brk: u64,
     umask: u16,
+    personality: u32,
     sig_actions: Arc<SigActionTable>,
 ) -> Result<PayloadCap<ProcessPayload>, ZoneError> {
     use crate::process::adapter::step_engine::AtomicSlot;
@@ -1325,6 +1330,7 @@ fn sign_process_payload(
         // per-process, copied across fork). `step_exec` preserves
         // the umask (umask survives `exec` per POSIX).
         umask: core::sync::atomic::AtomicU16::new(umask & 0o777),
+        personality: core::sync::atomic::AtomicU32::new(personality),
         sem_undos: SpinMutex::new(BTreeMap::new()),
         exit_source,
         exit_source_id,

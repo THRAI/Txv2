@@ -87,7 +87,8 @@ use tx_subsystems::vfs::composite::{
     AccessOp, ChmodOp, ChownOp, MknodOp, NanosleepOp, StatOp, StatxOp, StatxResult,
 };
 use tx_subsystems::vfs::structure::{
-    Credential, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking, StructPayload, S_ISGID,
+    Credential, InodeKind, InodeMeta, OpenFileBacking, OpenFileFlags, RNodeBacking, StructPayload,
+    S_ISGID,
 };
 use tx_subsystems::vfs::{
     step_open, step_walk, DEntry, FileFsyncOp, FlockOp, OpenFile, OpenFileGetFlOp, OpenFileSetFlOp,
@@ -428,6 +429,9 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_GETPGRP => return sys_getpgrp(ctx),
         nr if nr == NR_GETPGID => return sys_getpgid(req.args, ctx),
         nr if nr == NR_GETSID => return sys_getsid(req.args, ctx),
+        nr if nr == NR_KCMP => return sys_kcmp(req.args, ctx),
+        nr if nr == NR_PIDFD_GETFD => return sys_pidfd_getfd(req.args, ctx),
+        nr if nr == NR_GETRLIMIT => return sys_getrlimit(req.args, ctx),
         nr if nr == NR_GETUID => return sys_getuid(ctx),
         nr if nr == NR_GETEUID => return sys_geteuid(ctx),
         nr if nr == NR_GETGID => return sys_getgid(ctx),
@@ -443,6 +447,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_SETHOSTNAME => return sys_sethostname(req.args, ctx),
         nr if nr == NR_GETRANDOM => return sys_getrandom(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
+        nr if nr == NR_PERSONALITY => return sys_personality(req.args, ctx),
         nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
         nr if nr == NR_SCHED_GETATTR => return sys_sched_getattr(req.args, ctx),
         nr if nr == NR_SCHED_SETATTR => return sys_sched_setattr(req.args, ctx),
@@ -458,6 +463,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_MLOCKALL => return sys_mlockall(req.args, ctx).await,
         nr if nr == NR_MUNLOCKALL => return sys_munlockall(req.args, ctx).await,
         nr if nr == NR_MINCORE => return sys_mincore(req.args, ctx),
+        nr if nr == NR_REMAP_FILE_PAGES => return sys_remap_file_pages(req.args),
         nr if nr == NR_MLOCK2 => return sys_mlock2(req.args, ctx).await,
         nr if nr == NR_UTIMENSAT => return sys_utimensat::<P>(req.args, ctx),
         nr if nr == NR_SHMGET => return sys_shmget(req.args, ctx),
@@ -523,6 +529,8 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_RT_SIGSUSPEND => sys_rt_sigsuspend::<P>(req.args, ctx).await,
         nr if nr == NR_RT_SIGQUEUEINFO => sys_rt_sigqueueinfo(req.args, ctx),
         nr if nr == NR_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait::<P>(req.args, ctx).await,
+        nr if nr == NR_PIDFD_OPEN => sys_pidfd_open(req.args, ctx),
+        nr if nr == NR_PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(req.args, ctx),
         nr if nr == NR_SIGALTSTACK => sys_sigaltstack(req.args, ctx),
         nr if nr == NR_CAPGET => sys_capget(req.args, ctx),
         nr if nr == NR_CAPSET => sys_capset(req.args, ctx),

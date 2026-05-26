@@ -772,6 +772,26 @@ impl ProcessIdentity {
             .unwrap_or(0)
     }
 
+    /// Snapshot the Linux `personality(2)` value. Returns `0`
+    /// (`PER_LINUX`) for zombies.
+    pub fn personality(&self) -> u32 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.personality())
+            .unwrap_or(0)
+    }
+
+    /// Atomically replace the process personality, returning the
+    /// previous value. No-op (returns `0`) for zombies.
+    pub fn swap_personality(&self, new: u32) -> u32 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.swap_personality(new))
+            .unwrap_or(0)
+    }
+
     /// Number of currently-live threads owned by this process.
     /// Returns `0` for zombies.
     pub fn live_thread_count(&self) -> usize {
@@ -1170,6 +1190,15 @@ pub struct ProcessPayload {
     /// `SpinMutex<u16>` would be heavier than necessary for a 16-bit
     /// scalar with swap semantics.
     pub(crate) umask: AtomicU16,
+    /// Linux `personality(2)` value for this process.
+    ///
+    /// The low byte carries the execution domain (`PER_*`) and the
+    /// upper bytes carry bug-emulation flags such as `STICKY_TIMEOUTS`.
+    /// TxKernel records and reports the value so libc/LTP probes can
+    /// observe Linux-compatible set/readback semantics; individual
+    /// flag side effects are implemented by the affected syscall arms
+    /// as needed.
+    pub(crate) personality: AtomicU32,
     /// SysV semaphore undo records owned by this process.
     ///
     /// Per `docs/Txv3/08_SYSV_IPC_v1.md` §4.4 / IPC-3, `SEM_UNDO`
@@ -1699,6 +1728,17 @@ impl ProcessPayload {
     /// kind / setuid / setgid / sticky bits per Linux semantics.
     pub fn swap_umask(&self, new: u16) -> u16 {
         self.umask.swap(new & 0o777, Ordering::AcqRel)
+    }
+
+    /// Read the Linux `personality(2)` value.
+    pub fn personality(&self) -> u32 {
+        self.personality.load(Ordering::Acquire)
+    }
+
+    /// Replace the Linux `personality(2)` value, returning the old
+    /// value as Linux does.
+    pub fn swap_personality(&self, new: u32) -> u32 {
+        self.personality.swap(new, Ordering::AcqRel)
     }
 
     /// Borrow the per-process `exit_source` wait channel.

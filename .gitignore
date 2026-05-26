@@ -1,4 +1,5 @@
 /target/
+/target-codex/
 /tools/images/vendor/
 /.cache/
 **/.venv/

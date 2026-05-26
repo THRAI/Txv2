@@ -8,8 +8,8 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | Item | Value | Note |
 | --- | ---: | --- |
 | cases | 64 | from `make ltp-batch-cases LTP_BATCH=sched` |
-| latest local run | timeout triage | 2026-05-26 single-case reruns for previously hung sched cases |
-| cumulative scored | `57/187` | recorded rows in this document; previous `1878` maxima for `sched_getattr02`/`sched_setattr01` were stale batch-parser artifacts, single-case judge reports `4/4` each |
+| latest local run | getrlimit03 | 2026-05-26 RV/LA rerun passes 16/16 |
+| cumulative scored | `73/187` | recorded rows in this document; previous `1878` maxima for `sched_getattr02`/`sched_setattr01` were stale batch-parser artifacts, single-case judge reports `4/4` each |
 | reached case | `setrlimit06` | batch completed |
 | logs | `target/oscomp/ltp-progress/sched`, `target/oscomp/ltp-timeout-triage/sched` | per-group stdout, single-case timeout triage logs, and serial snapshots |
 
@@ -20,6 +20,7 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 - TCONF: 15 recorded case(s); see per-case notes below.
 - host timeout before case completed: 2 recorded case(s); see per-case notes below.
 - EINVAL observed: 1 recorded case(s); see per-case notes below.
+- `getrlimit(2)` old generic ABI now mirrors `prlimit64(pid=0, old_rlim)`; `getrlimit03` passes all 16 resource comparisons on RV/LA.
 
 ## Cases
 
@@ -30,7 +31,7 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `getpriority02` | 0/4 | fail | TFAIL: getpriority(-1, 0) should fail with EINVAL: ENOSYS (38) |
 | `getrlimit01` | 16/16 | pass |  |
 | `getrlimit02` | 2/2 | pass | EINVAL observed |
-| `getrlimit03` | 0/16 | fail | TFAIL: __NR_prlimit64(0) returned 0 (SUCCESS) but __NR_getrlimit(0) returned -1 (ENOSYS) |
+| `getrlimit03` | 16/16 | pass | old `getrlimit(2)` ABI returns the same rlimit table as `prlimit64`; RV/LA pass |
 | `getrusage01` | 2/2 | pass |  |
 | `getrusage02` | 3/4 | partial | TCONF: EFAULT is skipped for libc variant |
 | `getrusage03` | 0/0 | hang | single-case rerun still host-times out; before hang it reports missing `/proc/self/status` and one `TPASS` for child/self usage comparison |

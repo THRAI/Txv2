@@ -1590,9 +1590,10 @@ setns01+unshare02+clone01+clone02+clone03+clone05+clone06+clone07+\
 clone08+clone302+execl01+execle01+execlp01+execv01+execve01+execve03+\
 execve06+execvp01+exit01+exit02+exit_group01+fork01+fork03+fork04+\
 fork07+fork08+fork09+fork10+get_robust_list01+getpgid01+getpgid02+getpgrp01+\
-getpid02+getppid02+getsid01+gettid02+set_robust_list01+set_tid_address01+setpgid01+setpgrp01+\
-setpgrp02+setsid01+vfork01+wait01+wait02+waitid04+waitid05+waitid06+\
-waitpid01+waitpid03+waitpid04+getrlimit01+getrlimit02+getrusage01+getrusage02+membarrier01+\
+getpid01+getpid02+getppid01+getppid02+getsid01+getsid02+gettid01+gettid02+kcmp01+kcmp02+personality01+\
+personality02+pidfd_getfd01+pidfd_getfd02+pidfd_open01+pidfd_open02+pidfd_open04+pidfd_send_signal02+set_robust_list01+set_tid_address01+setpgid01+setpgrp01+setpgrp02+setsid01+vfork01+wait01+wait02+wait402+\
+waitid04+waitid05+waitid06+\
+waitpid01+waitpid03+waitpid04+getrlimit01+getrlimit02+getrlimit03+getrusage01+getrusage02+membarrier01+\
 sched_getaffinity01+sched_getattr01+sched_getattr02+sched_setaffinity01+sched_setattr01+sched_setscheduler01+setrlimit01+setrlimit02+\
 setrlimit03+setrlimit04+setrlimit05+kill02+kill06+kill07+kill08+kill09+\
 kill12+rt_sigaction01+rt_sigaction02+rt_sigaction03+rt_sigprocmask02+sigaction01+sigaction02+sigaltstack01+\
@@ -1619,11 +1620,11 @@ readlinkat02+rmdir01+stat01+stat01_64+stat02+stat02_64+stat03+stat03_64+\
 statfs02+statfs02_64+statx02+statx03+symlink01+symlink02+symlink03+symlink04+\
 symlinkat01+truncate02+truncate02_64+truncate03+truncate03_64+umask01+unlink05+unlink07+\
 unlink08+unlinkat01+brk01+brk02+madvise01+madvise02+madvise05+madvise10+\
-mincore01+mincore02+mincore03+mlock01+mlock02+mlock03+mlock04+mlock201+\
-mlock202+mlock203+mlockall01+mlockall02+mlockall03+mmap01+mmap02+mmap06+\
-mmap09+mmap15+mmap17+mmap19+mprotect01+mprotect03+mprotect05+mremap02+\
+mincore01+mincore02+mincore03+mlock01+mlock02+mlock03+mlock04+mlock05+mlock201+\
+mlock202+mlock203+mlockall01+mlockall02+mlockall03+mmap01+mmap02+mmap04+mmap06+\
+mmap08+mmap09+mmap15+mmap17+mmap19+mmap20+mprotect01+mprotect03+mprotect05+mremap02+mremap03+\
 mremap04+mremap05+mremap06+msync01+msync02+msync03+munlock01+munlock02+\
-munlockall01+munmap03+sbrk01+sbrk02";
+munlockall01+munmap03+remap_file_pages02+sbrk01+sbrk02";
 
 // End generated LTP syscall batch case lists.
 

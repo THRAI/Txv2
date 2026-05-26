@@ -78,6 +78,7 @@ const PROCFS_TAG_FD_DIR: u64 = 5;
 const PROCFS_TAG_TASK_DIR: u64 = 6;
 const PROCFS_TAG_FDINFO_DIR: u64 = 7;
 const PROCFS_TAG_STATUS: u64 = 8;
+const PROCFS_TAG_SMAPS: u64 = 9;
 const PROCFS_NS_TAG_NET: u64 = 1;
 const fn pid_dir_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64)
@@ -96,6 +97,9 @@ const fn pid_mem_id(pid: Pid) -> FsObjectId {
 }
 const fn pid_maps_id(pid: Pid) -> FsObjectId {
     pid_object_id(pid, PROCFS_TAG_MAPS)
+}
+const fn pid_smaps_id(pid: Pid) -> FsObjectId {
+    pid_object_id(pid, PROCFS_TAG_SMAPS)
 }
 const fn pid_status_id(pid: Pid) -> FsObjectId {
     pid_object_id(pid, PROCFS_TAG_STATUS)
@@ -156,6 +160,9 @@ pub fn pid_from_mem_id(id: FsObjectId) -> Option<Pid> {
 pub fn pid_from_maps_id(id: FsObjectId) -> Option<Pid> {
     pid_from_object_id(id, PROCFS_TAG_MAPS)
 }
+pub fn pid_from_smaps_id(id: FsObjectId) -> Option<Pid> {
+    pid_from_object_id(id, PROCFS_TAG_SMAPS)
+}
 pub fn pid_from_status_id(id: FsObjectId) -> Option<Pid> {
     pid_from_object_id(id, PROCFS_TAG_STATUS)
 }
@@ -207,7 +214,7 @@ pub fn pid_from_fdinfo_id(id: FsObjectId) -> Option<(Pid, u32)> {
     Some((pid, fd))
 }
 
-fn pid_from_dir(id: FsObjectId) -> Option<Pid> {
+pub fn pid_from_dir(id: FsObjectId) -> Option<Pid> {
     match id {
         PROCFS_ROOT_ID
         | PROCFS_SELF_ID
@@ -464,6 +471,9 @@ impl FsOps for Procfs {
             if name == b"maps" && process_for_procfs_number(pid.0).is_some() {
                 return StepOutcome::done(pid_maps_id(pid));
             }
+            if name == b"smaps" && process_for_procfs_number(pid.0).is_some() {
+                return StepOutcome::done(pid_smaps_id(pid));
+            }
             if name == b"status" && process_for_procfs_number(pid.0).is_some() {
                 return StepOutcome::done(pid_status_id(pid));
             }
@@ -591,6 +601,9 @@ impl FsOps for Procfs {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE | 0o600))
             }
             id if pid_from_maps_id(id).is_some() => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            }
+            id if pid_from_smaps_id(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             id if pid_from_status_id(id).is_some() => {
@@ -723,6 +736,7 @@ impl FsOps for Procfs {
                 (b"cmdline", pid_cmdline_id(pid), InodeKind::Regular),
                 (b"mem", pid_mem_id(pid), InodeKind::Regular),
                 (b"maps", pid_maps_id(pid), InodeKind::Regular),
+                (b"smaps", pid_smaps_id(pid), InodeKind::Regular),
                 (b"status", pid_status_id(pid), InodeKind::Regular),
                 (b"exe", pid_exe_id(pid), InodeKind::Symlink),
                 (b"fd", pid_fd_dir_id(pid), InodeKind::Directory),
