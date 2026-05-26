@@ -3,7 +3,8 @@
 use super::*;
 
 use crate::linux_syscall::{
-    NR_EPOLL_CREATE1, NR_EPOLL_CTL, NR_EPOLL_PWAIT, NR_EVENTFD2, NR_STATX, NR_USERFAULTFD, NR_WRITE,
+    NR_EPOLL_CREATE1, NR_EPOLL_CTL, NR_EPOLL_PWAIT, NR_EVENTFD2, NR_MEMFD_CREATE, NR_PIPE2,
+    NR_STATX, NR_USERFAULTFD, NR_WRITE,
 };
 use tx_substrate::step::DelegateTokenId;
 use tx_subsystems::signal::adapter::step_engine::TaskMailbox;
@@ -14,6 +15,7 @@ const E_FAULT: i32 = 14;
 const E_INVAL: i32 = 22;
 const E_EXIST: i32 = 17;
 const E_NOENT: i32 = 2;
+const E_PERM: i32 = 1;
 const EPOLL_CTL_ADD: u32 = 1;
 const EPOLL_CTL_DEL: u32 = 2;
 const EPOLL_CTL_MOD: u32 = 3;
@@ -53,6 +55,49 @@ fn create_eventfd(ctx: &SyscallCtx<'_>, init_val: u64) -> i64 {
         SyscallResult::Return(fd) => fd,
         other => panic!("eventfd2: {other:?}"),
     }
+}
+
+fn create_memfd(ctx: &SyscallCtx<'_>) -> i64 {
+    let name = b"epoll-regular\0";
+    match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_MEMFD_CREATE, [name.as_ptr() as u64, 0, 0, 0, 0, 0]),
+        ctx,
+    )) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("memfd_create: {other:?}"),
+    }
+}
+
+fn create_pipe(ctx: &SyscallCtx<'_>) -> [i32; 2] {
+    let mut fds = [-1i32; 2];
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_PIPE2, [fds.as_mut_ptr() as u64, 0, 0, 0, 0, 0]),
+        ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+    fds
+}
+
+fn epoll_add(ctx: &SyscallCtx<'_>, epfd: i64, fd: i64) -> SyscallResult {
+    let mut event = TestEpollEvent {
+        events: EPOLLIN,
+        _padding: 0,
+        data: fd as u64,
+    };
+    block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_EPOLL_CTL,
+            [
+                epfd as u64,
+                EPOLL_CTL_ADD as u64,
+                fd as u64,
+                &mut event as *mut TestEpollEvent as u64,
+                0,
+                0,
+            ],
+        ),
+        ctx,
+    ))
 }
 
 #[test]
@@ -376,6 +421,50 @@ fn dispatch_epoll_ctl_validates_fd_and_event_pointer() {
         &ctx,
     ));
     assert_eq!(result, SyscallResult::Error(E_INVAL));
+}
+
+#[test]
+fn dispatch_epoll_ctl_add_regular_file_returns_neg_eperm() {
+    let (_setup, proc_cap, thread) = epoll_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let epfd = create_epoll(&ctx);
+    let regular_fd = create_memfd(&ctx);
+
+    assert_eq!(
+        epoll_add(&ctx, epfd, regular_fd),
+        SyscallResult::Error(E_PERM)
+    );
+}
+
+#[test]
+fn dispatch_epoll_ctl_add_pipe_read_end_is_pollable() {
+    let (_setup, proc_cap, thread) = epoll_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let epfd = create_epoll(&ctx);
+    let pipe_fds = create_pipe(&ctx);
+
+    assert_eq!(
+        epoll_add(&ctx, epfd, pipe_fds[0] as i64),
+        SyscallResult::Return(0)
+    );
+}
+
+#[test]
+fn dispatch_epoll_ctl_add_rejects_too_deep_epoll_nesting() {
+    let (_setup, proc_cap, thread) = epoll_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let ep0 = create_epoll(&ctx);
+    let ep1 = create_epoll(&ctx);
+    let ep2 = create_epoll(&ctx);
+    let ep3 = create_epoll(&ctx);
+    let ep4 = create_epoll(&ctx);
+    let ep5 = create_epoll(&ctx);
+
+    assert_eq!(epoll_add(&ctx, ep4, ep5), SyscallResult::Return(0));
+    assert_eq!(epoll_add(&ctx, ep3, ep4), SyscallResult::Return(0));
+    assert_eq!(epoll_add(&ctx, ep2, ep3), SyscallResult::Return(0));
+    assert_eq!(epoll_add(&ctx, ep1, ep2), SyscallResult::Return(0));
+    assert_eq!(epoll_add(&ctx, ep0, ep1), SyscallResult::Error(E_INVAL));
 }
 
 #[test]

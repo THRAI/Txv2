@@ -58,6 +58,7 @@ impl Signum {
     pub const SIGKILL: Self = Self(9);
     pub const SIGSEGV: Self = Self(11);
     pub const SIGPIPE: Self = Self(13);
+    pub const SIGALRM: Self = Self(14);
     pub const SIGTERM: Self = Self(15);
     pub const SIGCHLD: Self = Self(17);
     pub const SIGCONT: Self = Self(18);
@@ -486,8 +487,8 @@ pub enum DefaultAction {
 /// signals).
 pub fn default_action(sig: Signum) -> DefaultAction {
     match sig.raw() {
-        // Term: SIGHUP, SIGINT, SIGKILL, SIGPIPE, SIGTERM
-        1 | 2 | 9 | 13 | 15 => DefaultAction::Term,
+        // Term: SIGHUP, SIGINT, SIGKILL, SIGPIPE, SIGALRM, SIGTERM
+        1 | 2 | 9 | 13 | 14 | 15 => DefaultAction::Term,
         // Core: SIGQUIT, SIGILL, SIGABRT, SIGSEGV
         3 | 4 | 6 | 11 => DefaultAction::Core,
         // Ignore: SIGCHLD, SIGWINCH (28), SIGURG (23, when wired)

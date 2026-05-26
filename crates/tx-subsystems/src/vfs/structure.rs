@@ -10,7 +10,7 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicI8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI8, AtomicU32, AtomicU64, Ordering};
 
 use crate::vfs::adapter::step_engine::{
     self, Cap, SpinMutex, Weak, Zone, ZoneAllocated, ZoneError,
@@ -957,6 +957,9 @@ pub enum OpenFileBacking {
     /// descriptor is a normal fd-table entry whose backing carries the
     /// POSIX mq identity and per-open flags.
     PosixMq { mq: Cap<PosixMqInstance> },
+    /// `pidfd_open(2)` open file. The descriptor carries the target
+    /// process identity for pidfd-consuming syscalls.
+    Pidfd { process: Cap<ProcessIdentity> },
 }
 
 /// Per-fd file-position carrier.
@@ -1001,6 +1004,12 @@ pub struct OpenFile {
     /// Advisory file lock state: 0 = unlocked, non-zero = exclusive-locked.
     /// Per open-file-description, not per-inode (POSIX flock semantics).
     flock_state: core::sync::atomic::AtomicU64,
+    /// Whether `fcntl(F_ADD_SEALS/F_GET_SEALS)` is meaningful for this
+    /// open file description. Today this is true only for memfd fds.
+    sealable: bool,
+    /// Memfd seal bitmask. Shared through `Cap<OpenFile>` clones, matching
+    /// Linux's file-description behavior for dup/fork of pathless memfds.
+    seal_state: AtomicU32,
 }
 
 impl OpenFile {
@@ -1013,11 +1022,45 @@ impl OpenFile {
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
+            sealable: false,
+            seal_state: AtomicU32::new(0),
         }
     }
 
     pub fn new_cap(rnode: Cap<RNode>, flags: OpenFileFlags) -> Result<Cap<Self>, ZoneError> {
         step_engine::sign(Self::new(rnode, flags))
+    }
+
+    pub fn new_memfd_cap(
+        rnode: Cap<RNode>,
+        flags: OpenFileFlags,
+        initial_seals: u32,
+    ) -> Result<Cap<Self>, ZoneError> {
+        let mut file = Self::new(rnode, flags);
+        file.sealable = true;
+        file.seal_state = AtomicU32::new(initial_seals);
+        step_engine::sign(file)
+    }
+
+    pub fn new_pidfd(process: Cap<ProcessIdentity>, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::Pidfd { process },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicI8::new(-1),
+            flags,
+            opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
+            sealable: false,
+            seal_state: AtomicU32::new(0),
+        }
+    }
+
+    pub fn new_pidfd_cap(
+        process: Cap<ProcessIdentity>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_pidfd(process, flags))
     }
 
     /// Like [`Self::new_cap`] but also records the DEntry that
@@ -1047,6 +1090,8 @@ impl OpenFile {
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
+            sealable: false,
+            seal_state: AtomicU32::new(0),
         }
     }
 
@@ -1077,6 +1122,8 @@ impl OpenFile {
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
+            sealable: false,
+            seal_state: AtomicU32::new(0),
         }
     }
 
@@ -1103,6 +1150,8 @@ impl OpenFile {
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
+            sealable: false,
+            seal_state: AtomicU32::new(0),
         }
     }
 
@@ -1126,6 +1175,8 @@ impl OpenFile {
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
+            sealable: false,
+            seal_state: AtomicU32::new(0),
         }
     }
 
@@ -1146,6 +1197,8 @@ impl OpenFile {
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
+            sealable: false,
+            seal_state: AtomicU32::new(0),
         }
     }
 
@@ -1169,6 +1222,8 @@ impl OpenFile {
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
+            sealable: false,
+            seal_state: AtomicU32::new(0),
         }
     }
 
@@ -1190,6 +1245,8 @@ impl OpenFile {
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
+            sealable: false,
+            seal_state: AtomicU32::new(0),
         }
     }
 
@@ -1216,6 +1273,8 @@ impl OpenFile {
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
+            sealable: false,
+            seal_state: AtomicU32::new(0),
         }
     }
 
@@ -1301,6 +1360,10 @@ impl OpenFile {
                 "OpenFile::rnode() called on a POSIX-mq-backed OpenFile; \
                  dispatch via OpenFile::backing() / OpenFile::posix_mq() first",
             ),
+            OpenFileBacking::Pidfd { .. } => panic!(
+                "OpenFile::rnode() called on a pidfd-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::pidfd_process() first",
+            ),
         }
     }
 
@@ -1373,7 +1436,8 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::PosixMq { .. } => None,
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. } => None,
         }
     }
 
@@ -1394,7 +1458,8 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::PosixMq { .. } => None,
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. } => None,
         }
     }
 
@@ -1414,7 +1479,8 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::PosixMq { .. } => None,
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. } => None,
         }
     }
 
@@ -1430,7 +1496,8 @@ impl OpenFile {
             | OpenFileBacking::IoUring { .. }
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::PosixMq { .. } => None,
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. } => None,
         }
     }
 
@@ -1446,7 +1513,8 @@ impl OpenFile {
             | OpenFileBacking::IoUring { .. }
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::PosixMq { .. } => None,
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. } => None,
         }
     }
 
@@ -1462,7 +1530,8 @@ impl OpenFile {
             | OpenFileBacking::IoUring { .. }
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
-            | OpenFileBacking::PosixMq { .. } => None,
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. } => None,
         }
     }
 
@@ -1483,7 +1552,8 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::PosixMq { .. } => None,
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. } => None,
         }
     }
 
@@ -1499,7 +1569,24 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::IoUring { .. } => None,
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::Pidfd { .. } => None,
+        }
+    }
+
+    /// `Some(&Cap<ProcessIdentity>)` iff this `OpenFile` is a pidfd.
+    pub fn pidfd_process(&self) -> Option<&Cap<ProcessIdentity>> {
+        match &self.backing {
+            OpenFileBacking::Pidfd { process } => Some(process),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::Ufd { .. }
+            | OpenFileBacking::AioContext { .. }
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. }
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::PosixMq { .. } => None,
         }
     }
 
@@ -1544,6 +1631,42 @@ impl OpenFile {
     pub fn set_nonblocking(&self, val: bool) {
         self.nonblocking_override
             .store(if val { 1 } else { 0 }, Ordering::Release);
+    }
+
+    pub fn memfd_seals(&self) -> Option<u32> {
+        self.sealable
+            .then(|| self.seal_state.load(Ordering::Acquire))
+    }
+
+    pub fn add_memfd_seals(
+        &self,
+        seals: u32,
+        allowed_mask: u32,
+        seal_seal_bit: u32,
+    ) -> Result<(), Errno> {
+        if !self.sealable || seals & !allowed_mask != 0 {
+            return Err(Errno::EINVAL);
+        }
+        loop {
+            let current = self.seal_state.load(Ordering::Acquire);
+            if current & seal_seal_bit != 0 {
+                return Err(Errno::EPERM);
+            }
+            let next = current | seals;
+            if self
+                .seal_state
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    pub fn has_memfd_seal(&self, seal: u32) -> bool {
+        self.memfd_seals()
+            .map(|seals| seals & seal != 0)
+            .unwrap_or(false)
     }
 
     /// Snapshot the per-fd readdir cursor.

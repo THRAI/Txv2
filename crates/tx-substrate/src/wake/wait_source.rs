@@ -314,39 +314,41 @@ impl WaitSource {
 // task mailbox before parking.
 // ---------------------------------------------------------------------------
 
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
 /// Global registry mapping [`WaitSourceId`] → [`WaitSource`].
 ///
-/// Indexed by `WaitSourceId::raw()` for O(1) lookup. Slot reuse is not
-/// needed — the id space is large enough for the system lifetime and
-/// sources are never destroyed in practice (they're embedded in
-/// long-lived semantic objects).
-static REGISTRY: SpinMutex<Vec<Option<Arc<WaitSource>>>> = SpinMutex::new(Vec::new());
+/// Notification source IDs are intentionally sparse (subsystems allocate
+/// them from a high range so they never collide with legacy low IDs), so
+/// this must not be indexed by `WaitSourceId::raw()`.
+static REGISTRY: SpinMutex<BTreeMap<u64, Arc<WaitSource>>> = SpinMutex::new(BTreeMap::new());
 
 /// Register a source in the global registry so the driver can find it
 /// by [`WaitSourceId`] during yield resolution.
 pub fn register_source(source: Arc<WaitSource>) {
-    let id = source.id().raw() as usize;
-    let mut reg = REGISTRY.lock();
-    while reg.len() <= id {
-        reg.push(None);
-    }
-    reg[id] = Some(source);
+    REGISTRY.lock().insert(source.id().raw(), source);
 }
 
 /// Remove a source from the global registry.
 pub fn unregister_source(id: WaitSourceId) {
-    let mut reg = REGISTRY.lock();
-    if let Some(slot) = reg.get_mut(id.raw() as usize) {
-        *slot = None;
-    }
+    REGISTRY.lock().remove(&id.raw());
 }
 
 /// Look up a source by id. Returns `None` if the id is unknown or
 /// the source was never registered.
 pub fn lookup_source(id: WaitSourceId) -> Option<Arc<WaitSource>> {
-    REGISTRY.lock().get(id.raw() as usize)?.clone()
+    REGISTRY.lock().get(&id.raw()).cloned()
+}
+
+#[cfg(test)]
+fn registry_len_for_test() -> usize {
+    REGISTRY.lock().len()
+}
+
+#[cfg(test)]
+fn clear_registry_for_test() {
+    REGISTRY.lock().clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -693,5 +695,25 @@ mod tests {
             }
             other => panic!("expected SourceFired, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn global_registry_stores_sparse_source_ids_without_dense_growth() {
+        clear_registry_for_test();
+
+        let source = Arc::new(WaitSource::new(WaitSourceId::new(4096)));
+        register_source(source.clone());
+
+        assert_eq!(registry_len_for_test(), 1);
+        assert!(
+            Arc::ptr_eq(
+                &lookup_source(WaitSourceId::new(4096)).expect("source registered"),
+                &source
+            ),
+            "lookup must return the exact registered source"
+        );
+
+        unregister_source(WaitSourceId::new(4096));
+        assert_eq!(registry_len_for_test(), 0);
     }
 }

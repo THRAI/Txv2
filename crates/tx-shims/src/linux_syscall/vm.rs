@@ -5,12 +5,19 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, Errno as V3Errno, StepOutcome};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use tx_hal::UserPtr;
 use tx_scripts::drive;
 use tx_substrate::step::DriveMode;
 use tx_subsystems::vm::step_ops::{
     VmBrkOp, VmMapOp, VmMlockOp, VmMsyncOp, VmMunlockOp, VmProtectOp, VmRemapOp, VmUnmapOp,
 };
+
+const MEMFD_NAME_MAX: usize = 249;
+const MFD_HUGE_MASK: u64 = 0x3f << 26;
+
+static NEXT_MEMFD_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(0x6d66_6400);
 
 /// `brk(requested)` per `txdoc:VM-5-8-BRK`.
 ///
@@ -119,8 +126,9 @@ pub(super) async fn sys_brk(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
 ///   (`-EINVAL`). With either, the backing is `VmBacking::PrivateAnon`
 ///   regardless of shared/private (Slice 2 does not yet model shared
 ///   anon as distinct).
-/// - `MAP_HUGETLB` / `MAP_LOCKED` / `MAP_POPULATE` / `MAP_STACK` etc.
-///   are recognised but ignored (best-effort hints).
+/// - `MAP_HUGETLB` / `MAP_POPULATE` / `MAP_STACK` etc. are recognised
+///   but ignored (best-effort hints). `MAP_LOCKED` and process-local
+///   `mlockall(MCL_FUTURE)` are represented by `VmEntryFlags.locked`.
 /// - File-backed mmap requires `fd` to resolve to an `OpenFile` whose
 ///   rnode is `RNodeBacking::PageBacked` — TTY / pipe / chardev /
 ///   directory / symlink → `-ENODEV`.
@@ -177,8 +185,11 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
     if flags & MAP_GROWSDOWN != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let entry_flags =
-        VmEntryFlags::new(shared, flags & MAP_GROWSDOWN != 0, flags & MAP_LOCKED != 0);
+    let entry_flags = VmEntryFlags::new(
+        shared,
+        flags & MAP_GROWSDOWN != 0,
+        flags & MAP_LOCKED != 0 || ctx.process.mlock_future(),
+    );
 
     // Build the backing.
     let backing = if anonymous {
@@ -205,6 +216,12 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
             Some(f) => f,
             None => return SyscallResult::Error(EBADF_VALUE),
         };
+        if shared
+            && prot.write
+            && (file.has_memfd_seal(F_SEAL_WRITE) || file.has_memfd_seal(F_SEAL_FUTURE_WRITE))
+        {
+            return SyscallResult::Error(EPERM_VALUE);
+        }
         match extract_page_container(&file) {
             Some(pc) => VmBacking::Page { pc, offset },
             None => return SyscallResult::error_from(Errno::ENODEV),
@@ -371,6 +388,43 @@ pub(super) async fn sys_mlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
     }
 }
 
+/// `mlock2(addr, len, flags)` — Linux RV64 generic syscall #284.
+///
+/// Tx has no swap, so `MLOCK_ONFAULT` and eager locking collapse to the
+/// same observational VMA flag. Unknown flags are rejected per Linux.
+pub(super) async fn sys_mlock2(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let flags = args[2];
+    if flags & !MLOCK_ONFAULT != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    sys_mlock(args, ctx).await
+}
+
+/// `mlockall(flags)` — Linux RV64 generic syscall #230.
+///
+/// Under Tx's no-swap policy this is an observational VMA-flag update:
+/// `MCL_CURRENT` marks every current recipe locked. `MCL_FUTURE` sets a
+/// process-local policy so later mappings are born locked.
+pub(super) async fn sys_mlockall(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let flags = args[0];
+    let known = MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT;
+    if flags & !known != 0 || flags & (MCL_CURRENT | MCL_FUTURE) == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    if flags & MCL_CURRENT != 0 {
+        match set_all_current_mlock(ctx, true).await {
+            Ok(()) => {}
+            Err(errno) => return SyscallResult::error_from(Into::<Errno>::into(errno)),
+        }
+    }
+    if flags & MCL_FUTURE != 0 {
+        ctx.process.set_mlock_future(true);
+    }
+
+    SyscallResult::Return(0)
+}
+
 /// `munlock(addr, len)` — Linux RV64 generic syscall #229.
 ///
 /// Clears `VmEntryFlags.locked` on every VMA overlapping the range.
@@ -411,6 +465,656 @@ pub(super) async fn sys_munlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscall
         Ok(_commit) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
     }
+}
+
+/// `memfd_create(name, flags)` — Linux RV64 generic syscall #279.
+///
+/// Implements the PageBacked v1 contract: a memfd is an anonymous
+/// `PageContainer` wrapped by a synthetic pathless regular-file RNode
+/// and installed as a read/write fd. `MFD_ALLOW_SEALING` controls the
+/// initial seal set: without it, Linux starts the file with
+/// `F_SEAL_SEAL`; with it, callers can add seals via fcntl.
+pub(super) fn sys_memfd_create(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let name_uaddr = args[0];
+    let flags = args[1];
+    let known_flags =
+        MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_NOEXEC_SEAL | MFD_EXEC | MFD_HUGE_MASK;
+    if flags & !known_flags != 0
+        || flags & (MFD_NOEXEC_SEAL | MFD_EXEC) == (MFD_NOEXEC_SEAL | MFD_EXEC)
+    {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if flags & (MFD_HUGETLB | MFD_HUGE_MASK) != 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
+    if name_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let name = match bootstrap_read_user_cstr(&ctx.aspace, name_uaddr, MEMFD_NAME_MAX + 1) {
+        Ok(name) => name,
+        Err(Errno::ENAMETOOLONG) => return SyscallResult::Error(EINVAL_VALUE),
+        Err(_) => return SyscallResult::Error(EFAULT_VALUE),
+    };
+    if name.len() > MEMFD_NAME_MAX {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let memfd_capacity_pages = (FULL_USER_V1_TOP as u64) / (USER_PAGE_SIZE as u64);
+    let pc = match PageContainer::new_cap(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        memfd_capacity_pages,
+    ) {
+        Ok(pc) => pc,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    pc.set_size_bytes(0);
+    let rnode = match tx_subsystems::vfs::RNode::new_cap(
+        tx_subsystems::vfs::FsObjectId::new(
+            NEXT_MEMFD_FS_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+        ),
+        InodeMeta::new(InodeKind::Regular, 0o100600),
+        RNodeBacking::PageBacked { pc },
+    ) {
+        Ok(rnode) => rnode,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let initial_seals = if flags & MFD_ALLOW_SEALING != 0 {
+        0
+    } else {
+        F_SEAL_SEAL
+    };
+    let file = match OpenFile::new_memfd_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+            cloexec: flags & MFD_CLOEXEC != 0,
+            nonblocking: false,
+        },
+        initial_seals,
+    ) {
+        Ok(file) => file,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let fd = ctx.process.allocate_fd();
+    let (soft_limit, _) = ctx.process.rlimit_nofile();
+    if fd >= soft_limit {
+        return SyscallResult::Error(EMFILE_VALUE);
+    }
+    let _ = ctx.process.install_fd(fd, file);
+    if flags & MFD_CLOEXEC != 0 {
+        ctx.process.set_fd_cloexec(fd, true);
+    }
+
+    SyscallResult::Return(fd as i64)
+}
+
+/// `get_mempolicy(policy, nodemask, maxnode, addr, flags)` — Linux
+/// RV64 generic syscall #236.
+///
+/// Tx phase 1 has one memory node and no persistent NUMA policy. This
+/// reports `MPOL_DEFAULT` for policy queries and node mask `{0}` for
+/// `MPOL_F_MEMS_ALLOWED`.
+pub(super) fn sys_get_mempolicy(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let policy_uaddr = args[0];
+    let nodemask_uaddr = args[1];
+    let maxnode = args[2];
+    let addr = args[3];
+    let flags = args[4];
+
+    let known_flags = MPOL_F_ADDR | MPOL_F_NODE | MPOL_F_MEMS_ALLOWED;
+    if flags & !known_flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if flags & MPOL_F_MEMS_ALLOWED != 0 && flags != MPOL_F_MEMS_ALLOWED {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if flags & MPOL_F_NODE != 0 && flags & MPOL_F_ADDR == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if flags & MPOL_F_ADDR != 0 && ctx.aspace.lookup(UserVirtAddr(addr as usize)).is_none() {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    if policy_uaddr != 0 {
+        let value = if flags & MPOL_F_NODE != 0 {
+            0
+        } else {
+            MPOL_DEFAULT as i32
+        };
+        if let Err(errno) = bootstrap_write_user::<i32>(&ctx.aspace, policy_uaddr, value) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    if nodemask_uaddr != 0 && maxnode > 0 {
+        let mask = if flags & MPOL_F_MEMS_ALLOWED != 0 {
+            1u64
+        } else {
+            0u64
+        };
+        if let Err(errno) = bootstrap_write_user::<u64>(&ctx.aspace, nodemask_uaddr, mask) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+
+    SyscallResult::Return(0)
+}
+
+/// `set_mempolicy(mode, nodemask, maxnode)` — Linux RV64 generic
+/// syscall #237.
+///
+/// Accepts Linux policy modes that can collapse onto Tx's single node.
+/// The policy is not persisted because phase 1 has no NUMA allocator.
+pub(super) fn sys_set_mempolicy(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    match validate_single_node_policy(args[0], args[1], args[2], ctx) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno),
+    }
+}
+
+/// `mbind(start, len, mode, nodemask, maxnode, flags)` — Linux RV64
+/// generic syscall #235.
+///
+/// Validates the target range and single-node policy, then records no
+/// persistent binding because Tx phase 1 has no NUMA placement state.
+pub(super) fn sys_mbind(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let addr = args[0];
+    let len_in = args[1] as usize;
+    let mode = args[2];
+    let nodemask_uaddr = args[3];
+    let maxnode = args[4];
+    let flags = args[5];
+
+    let known_flags = MPOL_MF_STRICT | MPOL_MF_MOVE | MPOL_MF_MOVE_ALL;
+    if flags & !known_flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if len_in == 0 {
+        return SyscallResult::Return(0);
+    }
+    if !UserVirtAddr::new(addr as usize).is_page_aligned() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let Some(len) = len_in.checked_next_multiple_of(USER_PAGE_SIZE) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    let Ok(range) = UserRange::new_aligned(UserVirtAddr(addr as usize), len) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    if !range_fully_mapped(ctx, range) {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    match validate_single_node_policy(mode, nodemask_uaddr, maxnode, ctx) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno),
+    }
+}
+
+/// `migrate_pages(pid, maxnode, old_nodes, new_nodes)` — Linux RV64
+/// generic syscall #238.
+///
+/// Tx phase 1 has one memory node, so node-0 to node-0 migration is a
+/// no-op and returns zero pages migrated.
+pub(super) fn sys_migrate_pages(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let pid = args[0] as i64;
+    let maxnode = args[1];
+    let old_nodes_uaddr = args[2];
+    let new_nodes_uaddr = args[3];
+
+    if let Err(errno) = validate_process_target(pid, ctx) {
+        return SyscallResult::Error(errno);
+    }
+    let old_nodes = match read_single_node_mask(old_nodes_uaddr, maxnode, ctx) {
+        Ok(mask) => mask,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let new_nodes = match read_single_node_mask(new_nodes_uaddr, maxnode, ctx) {
+        Ok(mask) => mask,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    if old_nodes & !1 != 0 || new_nodes & !1 != 0 || new_nodes == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    SyscallResult::Return(0)
+}
+
+/// `move_pages(pid, nr_pages, pages, nodes, status, flags)` — Linux
+/// RV64 generic syscall #239.
+///
+/// Supports Tx's single-node query path and node-0 no-op moves for the
+/// current process. Each mapped page reports status node `0`.
+pub(super) fn sys_move_pages(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let pid = args[0] as i64;
+    let nr_pages = args[1] as usize;
+    let pages_uaddr = args[2];
+    let nodes_uaddr = args[3];
+    let status_uaddr = args[4];
+    let flags = args[5];
+
+    if flags & !(MPOL_MF_MOVE | MPOL_MF_MOVE_ALL) != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if let Err(errno) = validate_process_target(pid, ctx) {
+        return SyscallResult::Error(errno);
+    }
+    if nr_pages == 0 {
+        return SyscallResult::Return(0);
+    }
+    if pages_uaddr == 0 || status_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if nr_pages > 4096 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    for index in 0..nr_pages {
+        let page_ptr_uaddr = pages_uaddr + (index * core::mem::size_of::<u64>()) as u64;
+        let page = match bootstrap_read_user::<u64>(&ctx.aspace, page_ptr_uaddr) {
+            Ok(page) => page,
+            Err(errno) => return SyscallResult::error_from(errno),
+        };
+        if nodes_uaddr != 0 {
+            let node_uaddr = nodes_uaddr + (index * core::mem::size_of::<i32>()) as u64;
+            let node = match bootstrap_read_user::<i32>(&ctx.aspace, node_uaddr) {
+                Ok(node) => node,
+                Err(errno) => return SyscallResult::error_from(errno),
+            };
+            if node != 0 {
+                return SyscallResult::Error(EINVAL_VALUE);
+            }
+        }
+        let status = if ctx.aspace.lookup(UserVirtAddr(page as usize)).is_some() {
+            0
+        } else {
+            -EFAULT_VALUE
+        };
+        let status_slot = status_uaddr + (index * core::mem::size_of::<i32>()) as u64;
+        if let Err(errno) = bootstrap_write_user::<i32>(&ctx.aspace, status_slot, status) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+
+    SyscallResult::Return(0)
+}
+
+/// `process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt,
+/// flags)` — Linux RV64 generic syscall #270.
+///
+/// Phase 1 supports only the current process (`pid == 0` or the
+/// caller pid), which collapses both iovec arrays onto `ctx.aspace`.
+/// Cross-process address-space lookup and ptrace/credential permission
+/// checks are deferred to the process/cred integration slice.
+pub(super) fn sys_process_vm_readv(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    sys_process_vm_transfer(args, ctx, ProcessVmDirection::Read)
+}
+
+/// `process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt,
+/// flags)` — Linux RV64 generic syscall #271. See
+/// `sys_process_vm_readv` for the phase-1 self-process scope.
+pub(super) fn sys_process_vm_writev(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    sys_process_vm_transfer(args, ctx, ProcessVmDirection::Write)
+}
+
+/// `process_madvise(pidfd, vec, vlen, behavior, flags)` — Linux RV64
+/// generic syscall #440.
+///
+/// The first supported slice resolves real pidfd-backed `OpenFile`s and
+/// applies the existing VM advice operation to the target process's
+/// current address space. Permission policy is intentionally narrow:
+/// only the caller's own process is accepted until ptrace/cred checks
+/// are modeled.
+pub(super) fn sys_process_madvise(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let pidfd = args[0] as u32;
+    let iov_uaddr = args[1];
+    let iovcnt = args[2];
+    let advice_raw = args[3];
+    let flags = args[4];
+
+    if flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let Some(target_process) = resolve_pidfd_process(ctx, pidfd) else {
+        return SyscallResult::Error(EBADF_VALUE);
+    };
+    if target_process.pid.0 != ctx.process.pid.0 {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+    let Some(target_aspace) = target_process.aspace_cap() else {
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+    let advice = match decode_madvise_advice(advice_raw) {
+        Ok(advice) => advice,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let iovs = match read_process_vm_iovs(iov_uaddr, iovcnt, ctx) {
+        Ok(iovs) => iovs,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+
+    let mut total = 0i64;
+    for iov in iovs {
+        if iov.len == 0 {
+            continue;
+        }
+        if !UserVirtAddr::new(iov.base as usize).is_page_aligned() {
+            if total > 0 {
+                return SyscallResult::Return(total);
+            }
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        let len = match iov.len.checked_next_multiple_of(USER_PAGE_SIZE) {
+            Some(len) => len,
+            None => return SyscallResult::Error(EINVAL_VALUE),
+        };
+        let range = match UserRange::new_aligned(UserVirtAddr::new(iov.base as usize), len) {
+            Ok(range) => range,
+            Err(_) => {
+                if total > 0 {
+                    return SyscallResult::Return(total);
+                }
+                return SyscallResult::Error(EINVAL_VALUE);
+            }
+        };
+        if let Err(error) = target_aspace.madvise(range, advice) {
+            if total > 0 {
+                return SyscallResult::Return(total);
+            }
+            return SyscallResult::Error(vmmap_error_to_i32(error));
+        }
+        total += iov.len as i64;
+    }
+
+    SyscallResult::Return(total)
+}
+
+/// `munlockall()` — Linux RV64 generic syscall #231.
+///
+/// Clears the observational lock flag from every current VMA and clears
+/// the process-local future-lock policy.
+pub(super) async fn sys_munlockall(ctx: &SyscallCtx<'_>) -> SyscallResult {
+    ctx.process.set_mlock_future(false);
+    match set_all_current_mlock(ctx, false).await {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
+    }
+}
+
+async fn set_all_current_mlock(ctx: &SyscallCtx<'_>, locked: bool) -> Result<(), V3Errno> {
+    let entries = ctx.aspace.recipes_snapshot();
+    for entry in entries {
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mailbox_arc = script_ctx.mailbox().cloned();
+        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+        let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+
+        if locked {
+            let op = VmMlockOp {
+                aspace: &ctx.aspace,
+                range: entry.range,
+            };
+            drive(
+                op,
+                &mut script_ctx,
+                DriveMode::Waiting,
+                mailbox_arc.as_ref(),
+                delegate_registry_arc.as_deref(),
+                timer_wheel_arc.as_ref(),
+            )
+            .await?;
+        } else {
+            let op = VmMunlockOp {
+                aspace: &ctx.aspace,
+                range: entry.range,
+            };
+            drive(
+                op,
+                &mut script_ctx,
+                DriveMode::Waiting,
+                mailbox_arc.as_ref(),
+                delegate_registry_arc.as_deref(),
+                timer_wheel_arc.as_ref(),
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ProcessVmIov {
+    base: u64,
+    len: usize,
+}
+
+#[derive(Clone, Copy)]
+enum ProcessVmDirection {
+    Read,
+    Write,
+}
+
+fn sys_process_vm_transfer(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+    direction: ProcessVmDirection,
+) -> SyscallResult {
+    let pid = args[0] as i64;
+    let local_iov_uaddr = args[1];
+    let local_iovcnt = args[2];
+    let remote_iov_uaddr = args[3];
+    let remote_iovcnt = args[4];
+    let flags = args[5];
+
+    if flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if let Err(errno) = validate_process_target(pid, ctx) {
+        return SyscallResult::Error(errno);
+    }
+
+    let local_iovs = match read_process_vm_iovs(local_iov_uaddr, local_iovcnt, ctx) {
+        Ok(iovs) => iovs,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let remote_iovs = match read_process_vm_iovs(remote_iov_uaddr, remote_iovcnt, ctx) {
+        Ok(iovs) => iovs,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+
+    copy_process_vm_iovs(ctx, &local_iovs, &remote_iovs, direction)
+}
+
+fn read_process_vm_iovs(
+    iov_uaddr: u64,
+    iovcnt: u64,
+    ctx: &SyscallCtx<'_>,
+) -> Result<Vec<ProcessVmIov>, i32> {
+    if iovcnt > 1024 {
+        return Err(EINVAL_VALUE);
+    }
+    if iovcnt == 0 {
+        return Ok(Vec::new());
+    }
+
+    const IOVEC_BYTES: u64 = 16;
+    let mut iovs = Vec::with_capacity(iovcnt as usize);
+    let mut total: i64 = 0;
+    for index in 0..iovcnt {
+        let Some(ent_ptr) = iov_uaddr.checked_add(index.saturating_mul(IOVEC_BYTES)) else {
+            return Err(EINVAL_VALUE);
+        };
+        let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
+        bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr).map_err(errno_to_i32)?;
+        let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
+        let len_raw = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap());
+        let len = usize::try_from(len_raw).map_err(|_| EINVAL_VALUE)?;
+        let len_i64 = i64::try_from(len).map_err(|_| EINVAL_VALUE)?;
+        total = total.checked_add(len_i64).ok_or(EINVAL_VALUE)?;
+        iovs.push(ProcessVmIov { base, len });
+    }
+    Ok(iovs)
+}
+
+fn copy_process_vm_iovs(
+    ctx: &SyscallCtx<'_>,
+    local_iovs: &[ProcessVmIov],
+    remote_iovs: &[ProcessVmIov],
+    direction: ProcessVmDirection,
+) -> SyscallResult {
+    const CHUNK_MAX: usize = USER_PAGE_SIZE;
+
+    let mut local_index = 0usize;
+    let mut remote_index = 0usize;
+    let mut local_offset = 0usize;
+    let mut remote_offset = 0usize;
+    let mut total = 0i64;
+    let mut chunk = Vec::new();
+
+    while local_index < local_iovs.len() && remote_index < remote_iovs.len() {
+        if local_offset == local_iovs[local_index].len {
+            local_index += 1;
+            local_offset = 0;
+            continue;
+        }
+        if remote_offset == remote_iovs[remote_index].len {
+            remote_index += 1;
+            remote_offset = 0;
+            continue;
+        }
+
+        let local = local_iovs[local_index];
+        let remote = remote_iovs[remote_index];
+        let chunk_len = (local.len - local_offset)
+            .min(remote.len - remote_offset)
+            .min(CHUNK_MAX);
+        if chunk_len == 0 {
+            continue;
+        }
+
+        chunk.resize(chunk_len, 0);
+        let Some(local_addr) = local.base.checked_add(local_offset as u64) else {
+            if total > 0 {
+                return SyscallResult::Return(total);
+            }
+            return SyscallResult::Error(EFAULT_VALUE);
+        };
+        let Some(remote_addr) = remote.base.checked_add(remote_offset as u64) else {
+            if total > 0 {
+                return SyscallResult::Return(total);
+            }
+            return SyscallResult::Error(EFAULT_VALUE);
+        };
+        let result = match direction {
+            ProcessVmDirection::Read => {
+                bootstrap_copy_from_user(&ctx.aspace, &mut chunk, remote_addr)
+                    .and_then(|()| bootstrap_copy_to_user(&ctx.aspace, local_addr, &chunk))
+            }
+            ProcessVmDirection::Write => {
+                bootstrap_copy_from_user(&ctx.aspace, &mut chunk, local_addr)
+                    .and_then(|()| bootstrap_copy_to_user(&ctx.aspace, remote_addr, &chunk))
+            }
+        };
+        if let Err(errno) = result {
+            if total > 0 {
+                return SyscallResult::Return(total);
+            }
+            return SyscallResult::error_from(errno);
+        }
+
+        total += chunk_len as i64;
+        local_offset += chunk_len;
+        remote_offset += chunk_len;
+    }
+
+    SyscallResult::Return(total)
+}
+
+fn resolve_pidfd_process(ctx: &SyscallCtx<'_>, pidfd: u32) -> Option<Cap<ProcessIdentity>> {
+    resolve_fd(&ctx.process, pidfd).and_then(|file| file.pidfd_process().cloned())
+}
+
+fn validate_single_node_policy(
+    raw_mode: u64,
+    nodemask_uaddr: u64,
+    maxnode: u64,
+    ctx: &SyscallCtx<'_>,
+) -> Result<(), i32> {
+    let mode_flags = raw_mode & (MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES);
+    if mode_flags == (MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES) {
+        return Err(EINVAL_VALUE);
+    }
+    let mode = raw_mode & !(MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES);
+    if !matches!(
+        mode,
+        MPOL_DEFAULT
+            | MPOL_PREFERRED
+            | MPOL_BIND
+            | MPOL_INTERLEAVE
+            | MPOL_LOCAL
+            | MPOL_PREFERRED_MANY
+    ) {
+        return Err(EINVAL_VALUE);
+    }
+
+    let mask = read_single_node_mask(nodemask_uaddr, maxnode, ctx)?;
+    if mask & !1 != 0 {
+        return Err(EINVAL_VALUE);
+    }
+    if mode == MPOL_DEFAULT && mask != 0 {
+        return Err(EINVAL_VALUE);
+    }
+    if matches!(mode, MPOL_BIND | MPOL_INTERLEAVE | MPOL_PREFERRED_MANY) && mask == 0 {
+        return Err(EINVAL_VALUE);
+    }
+    Ok(())
+}
+
+fn read_single_node_mask(
+    nodemask_uaddr: u64,
+    maxnode: u64,
+    ctx: &SyscallCtx<'_>,
+) -> Result<u64, i32> {
+    if nodemask_uaddr == 0 || maxnode == 0 {
+        return Ok(0);
+    }
+    bootstrap_read_user::<u64>(&ctx.aspace, nodemask_uaddr).map_err(errno_to_i32)
+}
+
+fn validate_process_target(pid: i64, ctx: &SyscallCtx<'_>) -> Result<(), i32> {
+    if pid < 0 {
+        return Err(EINVAL_VALUE);
+    }
+    if pid == 0 || pid as u32 == ctx.process.pid.0 {
+        return Ok(());
+    }
+    match process_by_pid(Pid(pid as u32)) {
+        Some(_) => Err(EPERM_VALUE),
+        None => Err(ESRCH_VALUE),
+    }
+}
+
+fn range_fully_mapped(ctx: &SyscallCtx<'_>, range: UserRange) -> bool {
+    let entries = ctx.aspace.recipes_overlapping(range);
+    let mut cursor = range.start().as_usize();
+    let end = range.end().as_usize();
+    for entry in entries {
+        let start = entry.range.start().as_usize();
+        let entry_end = entry.range.end().as_usize();
+        if start > cursor {
+            return false;
+        }
+        if entry_end > cursor {
+            cursor = entry_end;
+            if cursor >= end {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// `mprotect(addr, length, prot)` — Linux RV64 generic syscall #226.
@@ -584,6 +1288,174 @@ async fn drive_vm_remap(
     .await
 }
 
+/// `remap_file_pages(start, size, prot, pgoff, flags)` — Linux RV64
+/// generic syscall #234.
+///
+/// Linux keeps this obsolete syscall as a compatibility wrapper for
+/// nonlinear file mappings. Tx's v1 slice accepts the common LTP shape:
+/// an existing shared PageBacked VMA range is replaced in place with the
+/// same protection/flags and the same PageContainer at `pgoff` pages.
+pub(super) async fn sys_remap_file_pages(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let addr = args[0];
+    let size_in = args[1] as usize;
+    let prot = args[2];
+    let pgoff = args[3];
+    let flags = args[4];
+
+    if size_in == 0 || prot != 0 || flags & !MAP_NONBLOCK != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if !UserVirtAddr::new(addr as usize).is_page_aligned() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let size = match size_in.checked_next_multiple_of(USER_PAGE_SIZE) {
+        Some(size) => size,
+        None => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    let range = match UserRange::new_aligned(UserVirtAddr::new(addr as usize), size) {
+        Ok(range) => range,
+        Err(_) => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    let offset = match pgoff.checked_mul(USER_PAGE_SIZE as u64) {
+        Some(offset) => offset,
+        None => return SyscallResult::Error(EINVAL_VALUE),
+    };
+
+    let Some((pc, prot, entry_flags)) = remap_file_pages_target(ctx, range) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    let request = VmMapRequest::fixed(
+        range,
+        MapPlacement::FixedReplace,
+        prot,
+        entry_flags,
+        VmBacking::Page { pc, offset },
+    );
+    let op = VmMapOp {
+        aspace: &ctx.aspace,
+        request,
+    };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(_) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
+    }
+}
+
+fn remap_file_pages_target(
+    ctx: &SyscallCtx<'_>,
+    range: UserRange,
+) -> Option<(Cap<PageContainer>, Prot, VmEntryFlags)> {
+    let entries = ctx.aspace.recipes_overlapping(range);
+    let mut cursor = range.start().as_usize();
+    let end = range.end().as_usize();
+    let mut target_pc: Option<Cap<PageContainer>> = None;
+    let mut target_prot: Option<Prot> = None;
+    let mut target_flags: Option<VmEntryFlags> = None;
+
+    for entry in entries {
+        if entry.range.start().as_usize() > cursor {
+            return None;
+        }
+        if !entry.flags.shared {
+            return None;
+        }
+        let VmBacking::Page { pc, .. } = entry.backing else {
+            return None;
+        };
+        match &target_pc {
+            Some(existing) if existing.raw() != pc.raw() => return None,
+            None => target_pc = Some(pc.clone()),
+            _ => {}
+        }
+        match target_prot {
+            Some(prot) if prot != entry.prot => return None,
+            None => target_prot = Some(entry.prot),
+            _ => {}
+        }
+        match target_flags {
+            Some(flags) if flags != entry.flags => return None,
+            None => target_flags = Some(entry.flags),
+            _ => {}
+        }
+
+        cursor = cursor.max(entry.range.end().as_usize());
+        if cursor >= end {
+            return Some((
+                target_pc.expect("page-backed target recorded"),
+                target_prot.expect("prot recorded"),
+                target_flags.expect("flags recorded"),
+            ));
+        }
+    }
+
+    None
+}
+
+/// `mincore(addr, length, vec)` — Linux RV64 generic syscall #232.
+///
+/// Copies one byte per covered page to `vec`; bit 0 is set when the page
+/// has a resident pmap entry at the moment of observation.
+pub(super) fn sys_mincore<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let addr = args[0];
+    let length_in = args[1] as usize;
+    let vec_uaddr = args[2];
+
+    if length_in == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let length = match length_in.checked_next_multiple_of(USER_PAGE_SIZE) {
+        Some(r) => r,
+        None => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    if !UserVirtAddr::new(addr as usize).is_page_aligned() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let range = match UserRange::new_aligned(UserVirtAddr::new(addr as usize), length) {
+        Ok(r) => r,
+        Err(_) => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    if !range_is_fully_mapped_for_mincore(&ctx.aspace, range) {
+        return SyscallResult::error_from(Errno::ENOMEM);
+    }
+
+    let residency = ctx.aspace.mincore(range);
+    let mut vec = Vec::with_capacity(residency.len());
+    vec.extend(residency.into_iter().map(|resident| u8::from(resident)));
+    match bootstrap_copy_to_user(&ctx.aspace, vec_uaddr, &vec) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::error_from(errno),
+    }
+}
+
+fn range_is_fully_mapped_for_mincore(aspace: &AddressSpace, range: UserRange) -> bool {
+    let mut cursor = range.start().as_usize();
+    for entry in aspace.recipes_overlapping(range) {
+        let entry_start = entry.range.start().as_usize();
+        let entry_end = entry.range.end().as_usize();
+        if entry_start > cursor {
+            return false;
+        }
+        cursor = cursor.max(entry_end);
+        if cursor >= range.end().as_usize() {
+            return true;
+        }
+    }
+    false
+}
+
 /// `madvise(addr, length, advice)` — Linux RV64 generic syscall #233.
 ///
 /// Slice 2 honours `MADV_NORMAL` / `RANDOM` / `SEQUENTIAL` / `WILLNEED`
@@ -606,14 +1478,9 @@ pub(super) fn sys_madvise<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
     if !UserVirtAddr::new(addr as usize).is_page_aligned() {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let advice = match advice_raw {
-        MADV_NORMAL => MadviseAdvice::Normal,
-        MADV_RANDOM => MadviseAdvice::Random,
-        MADV_SEQUENTIAL => MadviseAdvice::Sequential,
-        MADV_WILLNEED => MadviseAdvice::WillNeed,
-        MADV_DONTNEED => MadviseAdvice::DontNeed,
-        MADV_FREE => MadviseAdvice::Free,
-        _ => return SyscallResult::Error(ENOSYS_VALUE),
+    let advice = match decode_madvise_advice(advice_raw) {
+        Ok(advice) => advice,
+        Err(errno) => return SyscallResult::Error(errno),
     };
     let range = match UserRange::new_aligned(UserVirtAddr::new(addr as usize), length) {
         Ok(r) => r,
@@ -622,6 +1489,18 @@ pub(super) fn sys_madvise<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
     match ctx.aspace.madvise(range, advice) {
         Ok(()) => SyscallResult::Return(0),
         Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
+    }
+}
+
+fn decode_madvise_advice(advice_raw: u64) -> Result<MadviseAdvice, i32> {
+    match advice_raw {
+        MADV_NORMAL => Ok(MadviseAdvice::Normal),
+        MADV_RANDOM => Ok(MadviseAdvice::Random),
+        MADV_SEQUENTIAL => Ok(MadviseAdvice::Sequential),
+        MADV_WILLNEED => Ok(MadviseAdvice::WillNeed),
+        MADV_DONTNEED => Ok(MadviseAdvice::DontNeed),
+        MADV_FREE => Ok(MadviseAdvice::Free),
+        _ => Err(ENOSYS_VALUE),
     }
 }
 

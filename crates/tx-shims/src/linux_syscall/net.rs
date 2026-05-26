@@ -10,6 +10,7 @@ use crate::adapter::step_engine::SpinMutex;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
+use tx_subsystems::vfs::structure::OpenFileBacking;
 
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
@@ -29,6 +30,20 @@ struct FakeSocket {
 
 static NEXT_SOCKET_FD: AtomicU32 = AtomicU32::new(10_000);
 static SOCKETS: SpinMutex<BTreeMap<u32, FakeSocket>> = SpinMutex::new(BTreeMap::new());
+
+fn non_socket_accept_errno(ctx: &SyscallCtx<'_>, fd: u32) -> i32 {
+    let Some(file) = ctx.process.fd(fd) else {
+        return EBADF_VALUE;
+    };
+    if matches!(file.backing(), OpenFileBacking::Rnode { .. })
+        && !file.flags().read
+        && !file.flags().write
+    {
+        EBADF_VALUE
+    } else {
+        ENOTSOCK_VALUE
+    }
+}
 
 fn socket_kind(raw_type: i32) -> i32 {
     raw_type & SOCK_TYPE_MASK
@@ -63,6 +78,20 @@ fn default_sockaddr() -> Vec<u8> {
 
 fn allocate_socket_fd() -> u32 {
     NEXT_SOCKET_FD.fetch_add(1, Ordering::Relaxed)
+}
+
+pub(super) fn close_socket_fd(fd: u32, ctx: &SyscallCtx<'_>) -> bool {
+    let owner_pid = ctx.process.pid.0;
+    let mut sockets = SOCKETS.lock();
+    if sockets
+        .get(&fd)
+        .is_some_and(|sock| sock.owner_pid == owner_pid)
+    {
+        sockets.remove(&fd);
+        true
+    } else {
+        false
+    }
 }
 
 pub(super) fn sys_socket(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
@@ -189,12 +218,15 @@ pub(super) fn sys_accept4(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
     let peer_addr = {
         let sockets = SOCKETS.lock();
         let Some(listener) = sockets.get(&fd) else {
-            return SyscallResult::Error(EBADF_VALUE);
+            return SyscallResult::Error(non_socket_accept_errno(ctx, fd));
         };
         if listener.owner_pid != owner_pid {
             return SyscallResult::Error(EBADF_VALUE);
         }
-        if listener.kind != SOCK_STREAM || !listener.listening {
+        if listener.kind != SOCK_STREAM {
+            return SyscallResult::Error(EOPNOTSUPP_VALUE);
+        }
+        if !listener.listening {
             return SyscallResult::Error(EINVAL_VALUE);
         }
         listener.bound_addr.clone().unwrap_or_else(default_sockaddr)

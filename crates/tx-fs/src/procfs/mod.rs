@@ -29,6 +29,9 @@ pub const PROCFS_SYSVIPC_ID: FsObjectId = FsObjectId::new(0x7072_6F06);
 pub const PROCFS_SYSVIPC_MSG_ID: FsObjectId = FsObjectId::new(0x7072_6F07);
 pub const PROCFS_SYSVIPC_SEM_ID: FsObjectId = FsObjectId::new(0x7072_6F08);
 pub const PROCFS_SYSVIPC_SHM_ID: FsObjectId = FsObjectId::new(0x7072_6F09);
+pub const PROCFS_SYS_ID: FsObjectId = FsObjectId::new(0x7072_6F0A);
+pub const PROCFS_SYS_KERNEL_ID: FsObjectId = FsObjectId::new(0x7072_6F0B);
+pub const PROCFS_SYS_KERNEL_TAINTED_ID: FsObjectId = FsObjectId::new(0x7072_6F0C);
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 const PROCFS_STAT_OFFSET: u64 = 0x10000;
 const PROCFS_MEM_OFFSET: u64 = 0x10002;
@@ -212,6 +215,9 @@ impl FsOps for Procfs {
             if name == b"sysvipc" {
                 return StepOutcome::done(PROCFS_SYSVIPC_ID);
             }
+            if name == b"sys" {
+                return StepOutcome::done(PROCFS_SYS_ID);
+            }
             if let Ok(n) = core::str::from_utf8(name).unwrap_or("").parse::<u32>() {
                 if n > 0 && process::process_by_pid(Pid(n)).is_some() {
                     return StepOutcome::done(pid_dir_id(Pid(n)));
@@ -228,6 +234,18 @@ impl FsOps for Procfs {
             }
             if name == b"shm" {
                 return StepOutcome::done(PROCFS_SYSVIPC_SHM_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if parent == PROCFS_SYS_ID {
+            if name == b"kernel" {
+                return StepOutcome::done(PROCFS_SYS_KERNEL_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if parent == PROCFS_SYS_KERNEL_ID {
+            if name == b"tainted" {
+                return StepOutcome::done(PROCFS_SYS_KERNEL_TAINTED_ID);
             }
             return StepOutcome::err(Errno::ENOENT.into());
         }
@@ -285,10 +303,13 @@ impl FsOps for Procfs {
             PROCFS_MOUNTS_ID | PROCFS_CPUINFO_ID | PROCFS_UPTIME_ID | PROCFS_MEMINFO_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
-            PROCFS_SYSVIPC_ID => {
+            PROCFS_SYSVIPC_ID | PROCFS_SYS_ID | PROCFS_SYS_KERNEL_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
-            PROCFS_SYSVIPC_MSG_ID | PROCFS_SYSVIPC_SEM_ID | PROCFS_SYSVIPC_SHM_ID => {
+            PROCFS_SYSVIPC_MSG_ID
+            | PROCFS_SYSVIPC_SEM_ID
+            | PROCFS_SYSVIPC_SHM_ID
+            | PROCFS_SYS_KERNEL_TAINTED_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             id if pid_from_dir(id).is_some() => {
@@ -404,6 +425,30 @@ impl FsOps for Procfs {
                 }
                 return StepOutcome::done(None);
             }
+            if id == PROCFS_SYS_ID {
+                if state_byte < 2 {
+                    return finish_dots(state_byte, idx, id);
+                }
+                if idx.saturating_sub(2) == 0 {
+                    return StepOutcome::done(Some((
+                        dir_entry(PROCFS_SYS_KERNEL_ID, InodeKind::Directory, b"kernel"),
+                        DirCursor([2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    )));
+                }
+                return StepOutcome::done(None);
+            }
+            if id == PROCFS_SYS_KERNEL_ID {
+                if state_byte < 2 {
+                    return finish_dots(state_byte, idx, id);
+                }
+                if idx.saturating_sub(2) == 0 {
+                    return StepOutcome::done(Some((
+                        dir_entry(PROCFS_SYS_KERNEL_TAINTED_ID, InodeKind::Regular, b"tainted"),
+                        DirCursor([2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    )));
+                }
+                return StepOutcome::done(None);
+            }
             return finish_dots(state_byte, idx, id);
         }
 
@@ -418,6 +463,7 @@ impl FsOps for Procfs {
             (b"uptime", PROCFS_UPTIME_ID, InodeKind::Regular),
             (b"meminfo", PROCFS_MEMINFO_ID, InodeKind::Regular),
             (b"sysvipc", PROCFS_SYSVIPC_ID, InodeKind::Directory),
+            (b"sys", PROCFS_SYS_ID, InodeKind::Directory),
         ];
         let si = idx.saturating_sub(2);
         if state_byte == 2 && si < statics.len() {
@@ -867,6 +913,44 @@ mod tests {
         assert!(shm.contains("bytes"));
         assert!(shm.contains(&alloc::format!("{} {}", 0x53484d50, shmid)));
         assert!(shm.contains("4096"), "{shm}");
+    }
+
+    #[test]
+    fn procfs_meminfo_renders_ltp_parseable_linux_fields() {
+        let meminfo = read::render(PROCFS_MEMINFO_ID);
+
+        assert!(meminfo.contains("MemTotal:"), "{meminfo}");
+        assert!(meminfo.contains("MemFree:"), "{meminfo}");
+        assert!(meminfo.contains("MemAvailable:"), "{meminfo}");
+        assert!(meminfo.contains("Cached:"), "{meminfo}");
+        assert!(meminfo.contains("SwapTotal:"), "{meminfo}");
+        for key in ["MemTotal:", "MemFree:", "MemAvailable:"] {
+            let line = meminfo
+                .lines()
+                .find(|line| line.starts_with(key))
+                .expect("field present");
+            let value = line[key.len()..]
+                .split_ascii_whitespace()
+                .next()
+                .expect("numeric value");
+            assert!(value.parse::<u64>().expect("numeric kB value") > 0);
+        }
+    }
+
+    #[test]
+    fn procfs_sys_kernel_tainted_exists_and_renders_zero() {
+        let _setup = setup();
+        let fs = Procfs::new();
+        let sys_id = lookup(&fs, PROCFS_ROOT_ID, b"sys");
+        let kernel_id = lookup(&fs, sys_id, b"kernel");
+        let tainted_id = lookup(&fs, kernel_id, b"tainted");
+        let guard = adapter::step_engine::guard();
+
+        assert!(matches!(
+            fs.load_inode_meta(tainted_id, &guard),
+            StepOutcome::Done(meta) if meta.kind() == InodeKind::Regular
+        ));
+        assert_eq!(read::render(tainted_id), "0\n");
     }
 
     #[test]

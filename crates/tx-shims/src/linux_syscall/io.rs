@@ -489,6 +489,9 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     if file.eventfd().is_some() {
         return super::eventfd::sys_eventfd_write(&file, args[1], len, ctx).await;
     }
+    if file.has_memfd_seal(F_SEAL_WRITE) || file.has_memfd_seal(F_SEAL_FUTURE_WRITE) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
 
     let len = if matches!(
         file.rnode().backing(),

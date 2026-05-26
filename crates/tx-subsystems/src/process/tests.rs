@@ -328,6 +328,22 @@ fn fork_creates_child_with_leader_thread_and_inherits_pgrp() {
 }
 
 #[test]
+fn fork_does_not_inherit_mlock_future_policy() {
+    let _g = setup();
+    let parent = bootstrap();
+    parent.set_mlock_future(true);
+    assert!(parent.mlock_future());
+
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
+
+    assert!(
+        !child.mlock_future(),
+        "Linux clears mlockall(MCL_FUTURE) policy across fork"
+    );
+    assert!(parent.mlock_future(), "parent policy remains armed");
+}
+
+#[test]
 fn fork_with_clone_newipc_publishes_fresh_empty_ipc_namespace() {
     let _g = setup();
     let parent = bootstrap();

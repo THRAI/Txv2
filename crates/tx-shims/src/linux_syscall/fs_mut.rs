@@ -544,6 +544,13 @@ pub(super) async fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         RNodeBacking::Directory => return SyscallResult::Error(EISDIR_VALUE),
         _ => return SyscallResult::Error(EINVAL_VALUE),
     };
+    let current_size = pc.size_bytes();
+    if new_size < current_size && file.has_memfd_seal(F_SEAL_SHRINK) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+    if new_size > current_size && file.has_memfd_seal(F_SEAL_GROW) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
     let mut script_ctx = build_subject_script_ctx(ctx);

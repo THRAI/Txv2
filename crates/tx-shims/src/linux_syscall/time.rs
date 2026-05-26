@@ -21,6 +21,13 @@ pub(super) struct TimevalLayout {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub(super) struct ItimervalLayout {
+    pub(super) it_interval: TimevalLayout,
+    pub(super) it_value: TimevalLayout,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct TmsLayout {
     tms_utime: i64,
     tms_stime: i64,
@@ -32,7 +39,7 @@ pub(super) mod layout_descriptors {
     use core::mem::{align_of, offset_of, size_of};
 
     pub(super) use super::TmsLayout;
-    use super::{TimespecLayout, TimevalLayout};
+    use super::{ItimervalLayout, TimespecLayout, TimevalLayout};
     use crate::linux_syscall::{KernelToUserLayout, KernelUserField, KernelUserLayout};
 
     impl KernelToUserLayout for TimespecLayout {
@@ -82,6 +89,44 @@ pub(super) mod layout_descriptors {
     }
     pub(in crate::linux_syscall) const TIMEVAL_LAYOUT: KernelUserLayout =
         <TimevalLayout as KernelToUserLayout>::LAYOUT;
+
+    impl KernelToUserLayout for ItimervalLayout {
+        const LAYOUT: KernelUserLayout = KernelUserLayout {
+            rust_type: "ItimervalLayout",
+            musl_header: "sys/time.h",
+            musl_type: "struct itimerval",
+            size: size_of::<ItimervalLayout>(),
+            align: align_of::<ItimervalLayout>(),
+            fields: &[
+                KernelUserField {
+                    rust: "it_interval.tv_sec",
+                    musl: "it_interval.tv_sec",
+                    offset: offset_of!(ItimervalLayout, it_interval)
+                        + offset_of!(TimevalLayout, tv_sec),
+                },
+                KernelUserField {
+                    rust: "it_interval.tv_usec",
+                    musl: "it_interval.tv_usec",
+                    offset: offset_of!(ItimervalLayout, it_interval)
+                        + offset_of!(TimevalLayout, tv_usec),
+                },
+                KernelUserField {
+                    rust: "it_value.tv_sec",
+                    musl: "it_value.tv_sec",
+                    offset: offset_of!(ItimervalLayout, it_value)
+                        + offset_of!(TimevalLayout, tv_sec),
+                },
+                KernelUserField {
+                    rust: "it_value.tv_usec",
+                    musl: "it_value.tv_usec",
+                    offset: offset_of!(ItimervalLayout, it_value)
+                        + offset_of!(TimevalLayout, tv_usec),
+                },
+            ],
+        };
+    }
+    pub(in crate::linux_syscall) const ITIMERVAL_LAYOUT: KernelUserLayout =
+        <ItimervalLayout as KernelToUserLayout>::LAYOUT;
 
     impl KernelToUserLayout for TmsLayout {
         const LAYOUT: KernelUserLayout = KernelUserLayout {
@@ -176,6 +221,30 @@ fn read_timeval_at(aspace: &AddressSpace, uaddr: u64) -> Option<u64> {
         return None;
     }
     Some((tv.tv_sec as u64).saturating_mul(1_000_000_000) + (tv.tv_usec as u64) * 1_000)
+}
+
+fn timeval_to_ns(tv: TimevalLayout) -> Option<u64> {
+    if tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1_000_000 {
+        return None;
+    }
+    Some((tv.tv_sec as u64).saturating_mul(1_000_000_000) + (tv.tv_usec as u64) * 1_000)
+}
+
+fn read_itimerval_at(aspace: &AddressSpace, uaddr: u64) -> Result<(u64, u64), Errno> {
+    if uaddr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let it: ItimervalLayout = bootstrap_read_user::<ItimervalLayout>(aspace, uaddr)?;
+    let interval_ns = timeval_to_ns(it.it_interval).ok_or(Errno::EINVAL)?;
+    let value_ns = timeval_to_ns(it.it_value).ok_or(Errno::EINVAL)?;
+    Ok((value_ns, interval_ns))
+}
+
+fn itimerval_from_ns(value_ns: u64, interval_ns: u64) -> ItimervalLayout {
+    ItimervalLayout {
+        it_interval: ns_to_timeval(interval_ns),
+        it_value: ns_to_timeval(value_ns),
+    }
 }
 
 fn can_set_realtime(ctx: &SyscallCtx<'_>) -> bool {
@@ -349,6 +418,61 @@ pub(super) fn sys_times<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     SyscallResult::Return(ticks)
 }
 
+/// `getitimer(which, value)`. Linux RV64 generic ABI
+/// `__NR_getitimer = 102`.
+///
+/// v1 implements the `ITIMER_REAL` shape used by musl's `alarm(2)`
+/// wrapper. CPU-time timers (`ITIMER_VIRTUAL` / `ITIMER_PROF`) remain
+/// deferred until process CPU accounting exists.
+pub(super) fn sys_getitimer<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let which = args[0] as u32;
+    let value_uaddr = args[1];
+    if value_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if which != ITIMER_REAL {
+        return match which {
+            ITIMER_VIRTUAL | ITIMER_PROF => SyscallResult::Error(EINVAL_VALUE),
+            _ => SyscallResult::Error(EINVAL_VALUE),
+        };
+    }
+    let now_ns = <P as TimeIf>::read_ns();
+    let timer = ctx.process.real_timer_snapshot(now_ns);
+    let it = itimerval_from_ns(timer.deadline_ns, timer.interval_ns);
+    if let Err(errno) = bootstrap_write_user::<ItimervalLayout>(&ctx.aspace, value_uaddr, it) {
+        return SyscallResult::error_from(errno);
+    }
+    SyscallResult::Return(0)
+}
+
+/// `setitimer(which, value, ovalue)`. Linux RV64 generic ABI
+/// `__NR_setitimer = 103`.
+pub(super) fn sys_setitimer<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let which = args[0] as u32;
+    let value_uaddr = args[1];
+    let old_uaddr = args[2];
+    if which != ITIMER_REAL {
+        return match which {
+            ITIMER_VIRTUAL | ITIMER_PROF => SyscallResult::Error(EINVAL_VALUE),
+            _ => SyscallResult::Error(EINVAL_VALUE),
+        };
+    }
+    let (value_ns, interval_ns) = match read_itimerval_at(&ctx.aspace, value_uaddr) {
+        Ok(v) => v,
+        Err(errno) => return SyscallResult::error_from(errno),
+    };
+    let now_ns = <P as TimeIf>::read_ns();
+    let old = ctx.process.set_real_timer(now_ns, value_ns, interval_ns);
+    if old_uaddr != 0 {
+        let old_it = itimerval_from_ns(old.deadline_ns, old.interval_ns);
+        if let Err(errno) = bootstrap_write_user::<ItimervalLayout>(&ctx.aspace, old_uaddr, old_it)
+        {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    SyscallResult::Return(0)
+}
+
 /// `nanosleep(req, rem)`. Linux RV64 generic ABI
 /// `__NR_nanosleep = 101`.
 ///
@@ -375,30 +499,7 @@ pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
         return SyscallResult::Return(0);
     }
     let deadline_ns = <P as TimeIf>::read_ns().saturating_add(req_ns);
-    use tx_scripts::drive;
-    use tx_substrate::step::DriveMode;
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    let op = NanosleepOp {
-        nanos: req_ns,
-        deadline_ns,
-        started: false,
-    };
-    match drive(
-        op,
-        &mut script_ctx,
-        DriveMode::Waiting,
-        mailbox_arc.as_ref(),
-        delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
-    )
-    .await
-    {
-        Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
-    }
+    drive_nanosleep_until::<P>(ctx, req_ns, deadline_ns, args[1]).await
 }
 
 /// `clock_nanosleep(clk_id, flags, req, rem)`. Linux RV64 generic ABI
@@ -449,7 +550,7 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
             if <P as TimeIf>::read_ns() >= deadline_ns {
                 continue;
             }
-            match drive_nanosleep_until(ctx, req_ns, deadline_ns).await {
+            match drive_nanosleep_until::<P>(ctx, req_ns, deadline_ns, 0).await {
                 SyscallResult::Return(0) => continue,
                 other => return other,
             }
@@ -464,23 +565,34 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
     if <P as TimeIf>::read_ns() >= deadline_ns {
         return SyscallResult::Return(0);
     }
-    drive_nanosleep_until(ctx, req_ns, deadline_ns).await
+    let rem_uaddr = if (flags & TIMER_ABSTIME) == 0 {
+        args[3]
+    } else {
+        0
+    };
+    drive_nanosleep_until::<P>(ctx, req_ns, deadline_ns, rem_uaddr).await
 }
 
-async fn drive_nanosleep_until<'a>(
+async fn drive_nanosleep_until<'a, P: TimeIf>(
     ctx: &SyscallCtx<'a>,
     req_ns: u64,
     deadline_ns: u64,
+    rem_uaddr: u64,
 ) -> SyscallResult {
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
+    let wait_deadline_ns = ctx
+        .process
+        .real_timer_deadline_ns()
+        .map(|alarm_deadline| alarm_deadline.min(deadline_ns))
+        .unwrap_or(deadline_ns);
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = NanosleepOp {
         nanos: req_ns,
-        deadline_ns,
+        deadline_ns: wait_deadline_ns,
         started: false,
     };
     match drive(
@@ -493,7 +605,25 @@ async fn drive_nanosleep_until<'a>(
     )
     .await
     {
-        Ok(()) => SyscallResult::Return(0),
+        Ok(()) => {
+            let now_ns = <P as TimeIf>::read_ns();
+            if ctx.process.fire_real_timer_if_due(now_ns) {
+                let _ =
+                    tx_subsystems::signal::step_kill_process(&ctx.process, Signum::SIGALRM, None);
+                if rem_uaddr != 0 {
+                    let remaining = deadline_ns.saturating_sub(now_ns);
+                    let rem = ns_to_timespec(remaining);
+                    if let Err(errno) =
+                        bootstrap_write_user::<TimespecLayout>(&ctx.aspace, rem_uaddr, rem)
+                    {
+                        return SyscallResult::error_from(errno);
+                    }
+                }
+                SyscallResult::Error(EINTR_VALUE)
+            } else {
+                SyscallResult::Return(0)
+            }
+        }
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }

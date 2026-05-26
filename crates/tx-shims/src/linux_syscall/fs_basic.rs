@@ -8,6 +8,7 @@ use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMute
 use alloc::collections::BTreeMap;
 use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload};
 use tx_subsystems::vfs::FsObjectId;
+use tx_subsystems::vm::VmBacking;
 
 mod dir_sync;
 pub(super) use dir_sync::{
@@ -178,6 +179,28 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
             }
         }
+        F_GET_SEALS => match file.memfd_seals() {
+            Some(seals) => SyscallResult::Return(seals as i64),
+            None => SyscallResult::Error(EINVAL_VALUE),
+        },
+        F_ADD_SEALS => {
+            if !file.flags().write {
+                return SyscallResult::Error(EPERM_VALUE);
+            }
+            let seals = match u32::try_from(arg) {
+                Ok(seals) => seals,
+                Err(_) => return SyscallResult::Error(EINVAL_VALUE),
+            };
+            const MEMFD_SEAL_MASK: u32 =
+                F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
+            if seals & F_SEAL_WRITE != 0 && has_current_writable_shared_mapping(ctx, &file) {
+                return SyscallResult::error_from(Errno::EBUSY);
+            }
+            match file.add_memfd_seals(seals, MEMFD_SEAL_MASK, F_SEAL_SEAL) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::error_from(errno),
+            }
+        }
         F_GETPIPE_SZ | F_SETPIPE_SZ => {
             let Some(payload) = pipe_payload_for_fcntl(&file) else {
                 return SyscallResult::Error(EINVAL_VALUE);
@@ -196,6 +219,17 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         }
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
+}
+
+fn has_current_writable_shared_mapping(ctx: &SyscallCtx<'_>, file: &Cap<OpenFile>) -> bool {
+    let Some(target_pc) = crate::linux_syscall::vm::extract_page_container(file) else {
+        return false;
+    };
+    ctx.aspace.recipes_snapshot().into_iter().any(|entry| {
+        entry.flags.shared
+            && entry.prot.write
+            && matches!(entry.backing, VmBacking::Page { pc, .. } if pc.raw() == target_pc.raw())
+    })
 }
 
 fn pipe_payload_for_fcntl(file: &Cap<OpenFile>) -> Option<Cap<tx_subsystems::pipe::PipePayload>> {
@@ -325,7 +359,11 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // Decode the open flags. Access-mode picks the read/write pair;
     // O_APPEND / O_CLOEXEC thread through to OpenFileFlags. O_NONBLOCK
     // is accepted but ignored (no blocking state on OpenFile yet).
-    let (want_read, want_write) = decode_access_mode(flags);
+    let (want_read, want_write) = if flags & O_PATH != 0 {
+        (false, false)
+    } else {
+        decode_access_mode(flags)
+    };
     let want_append = flags & O_APPEND != 0;
     let want_cloexec = flags & O_CLOEXEC != 0;
     let want_create = flags & O_CREAT != 0;
@@ -539,6 +577,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
 /// PR-3 migration: `CloseOp` is a `OneShotStepOp` — dispatched via
 /// `drive_oneshot` (no reactor, no yield).
 pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if close_socket_fd(fd, ctx) {
+        return SyscallResult::Return(0);
+    }
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = CloseOp {
         process: ctx.process.clone(),

@@ -1,3 +1,269 @@
+- 2026-05-26 **Advanced the full-image `ltp-musl` lane through
+  `alarm05`, `epoll_ctl02`, and `epoll_ctl04`.** In
+  `/Users/3y/.codex/worktrees/ltp-vm-mm/Tx` on `codex/ltp-vm-mm`, added
+  Linux RV64 `getitimer(102)` / `setitimer(103)` dispatch with a
+  process-owned `ITIMER_REAL` state slot, `SIGALRM` default-Term metadata,
+  Linux `struct itimerval` layout coverage, and nanosleep/clock_nanosleep
+  early wake on a due real timer. This closes the musl `alarm(2)` path LTP
+  uses: the full-image serial now shows `alarm05` `alarm(10)`,
+  `alarm(1)`, and `alarms_fired == 1` all `TPASS`. Added a minimal
+  `/proc/sys/kernel/tainted` procfs path that renders `0\n`, replacing the
+  earlier named `tst_taint` ENOENT TBROK, though a nearby unnamed
+  `FAIL LTP CASE  : 2` still needs case-name capture from the harness.
+  Tightened `epoll_ctl` Linux errno behavior: regular/page-backed files now
+  reject `EPOLL_CTL_ADD` with `EPERM`, pipes and tty-backed fds are accepted
+  as pollable wait-source producers, and excessive epoll nesting returns the
+  LTP-observed `EINVAL`. **Guest evidence:** after
+  `cargo xtask full-build --target rv64-qemu --skip-doctor --no-image` and a
+  fresh CoW clone of `sdcard-rv-full.img`, `/opt/homebrew/bin/timeout 120s
+  cargo xtask oscomp test --target rv64-qemu --skip-build --data
+  target/oscomp/ltp-full-run --suite ltp-musl` timed out as expected for the
+  bounded probe, but `target/oscomp/os_serial_out_rv.txt` shows `accept03`,
+  `alarm05`, `brk01`, `brk02`, `connect02`, `dup201`, `epoll_ctl02`, and
+  `epoll_ctl04` with `FAIL LTP CASE  : 0`; `cargo xtask fault-decode
+  --target rv64-qemu --serial target/oscomp/os_serial_out_rv.txt --all
+  --brief` found no trap lines. **Host verification:** `cargo test -p
+  tx-shims --lib linux_syscall::tests::time_syscalls -- --test-threads=1
+  --nocapture` (22 passed); `cargo test -p tx-shims --lib
+  linux_syscall::tests::kernel_user_layouts -- --test-threads=1 --nocapture`
+  (3 passed); `cargo test -p tx-subsystems
+  signal::tests::delivery::default_action_table_matches_spec -- --exact
+  --nocapture`; `cargo test -p tx-fs procfs -- --test-threads=1 --nocapture`
+  (4 passed); `cargo test -p tx-shims --lib
+  linux_syscall::tests::epoll_dispatch -- --test-threads=1 --nocapture`
+  (12 passed); `cargo test -p tx-subsystems
+  process::tests::fork_does_not_inherit_mlock_future_policy -- --exact
+  --nocapture`; `cargo xtask syscall-status --regen`; `cargo xtask syscall
+  sync`; `cargo fmt --check`; `git diff --check`. **Next step:** capture case
+  names for the remaining unnamed `FAIL LTP CASE  : 2` and continue from the
+  next named semantic blocker after `epoll_ctl04`; `chroot01` still blocks on
+  userspace image identity data (`getpwnam(nobody)` ENOENT), not the kernel
+  `chroot(2)` syscall yet. **Blocker/gap:** CPU-time interval timers
+  (`ITIMER_VIRTUAL`/`ITIMER_PROF`) and POSIX timer ids remain deferred; the
+  implemented timer slice is the LTP-observed `ITIMER_REAL`/alarm path.
+
+- 2026-05-26 **Advanced the full-image `ltp-musl` probe through
+  `accept03`.** In `/Users/3y/.codex/worktrees/ltp-vm-mm/Tx` on
+  `codex/ltp-vm-mm`, created a private full-image OSComp data dir under
+  `target/oscomp/ltp-full-run` with a CoW copy of
+  `/Users/3y/Downloads/Tx/target/oscomp/testdata/sdcard-rv-full.img` as
+  `sdcard-rv.img`, avoiding the shared `sdcard-rv.img -> /tmp/sdcard-debug.img`
+  symlink. A bounded full-image run reached live LTP cases and exposed
+  `accept03`: valid non-socket fds returned `EBADF` where Linux expects
+  `ENOTSOCK`, while O_PATH fds must still return `EBADF`. Added
+  `ENOTSOCK_VALUE`, made `accept4` distinguish missing fds, path-only VFS fds,
+  UDP sockets, non-listening streams, and ordinary non-socket fds, and added
+  Linux generic `O_PATH` flag decoding so `openat(..., O_PATH)` installs an
+  fd with no read/write access. **Guest evidence:** after rebuild and a fresh
+  private full-image clone, `/opt/homebrew/bin/timeout 90s cargo xtask oscomp
+  test --target rv64-qemu --skip-build --data target/oscomp/ltp-full-run
+  --suite ltp-musl` showed every `accept03` subcase as `TPASS` and
+  `FAIL LTP CASE  : 0`; `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv.txt --all --brief` found no trap lines. The
+  next live red case is `alarm05`: `alarm(1)` should return the remaining 9s
+  from `alarm(10)` and fire SIGALRM, but the current setitimer/alarm path still
+  reports `ENOSYS`/no signal firing. **Host verification:** `cargo test -p
+  tx-shims --lib linux_syscall::tests::net_dispatch -- --test-threads=1
+  --nocapture` (4 passed); `cargo test -p tx-shims --lib
+  linux_syscall::tests::fd_ops_wave2::dispatch_openat_o_path_installs_path_only_fd
+  -- --exact --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::fd_ops_wave2 -- --test-threads=1` (22 passed); `cargo
+  xtask full-build --target rv64-qemu --skip-doctor --no-image`; `cargo fmt
+  --check`; `cargo xtask syscall-status --check`; `cargo xtask syscall sync
+  --check`; `git diff --check`. **Next step:** implement the narrow
+  `getitimer`/`setitimer`/SIGALRM compatibility slice for `alarm05`, or defer
+  it behind the broader timer/time tail if the next pass prioritizes VM/mm-only
+  cases. **Blocker/gap:** full LTP is now running far enough to expose real
+  ABI depth; score remains `0/0` for these local probes because the judge data
+  does not assign weights to the partial serial, so serial case lines remain
+  the authoritative evidence.
+
+- 2026-05-26 **Proved the LTP slim guest lane for the VM/mm worktree and
+  closed the first OSComp bootstrap blockers.** In
+  `/Users/3y/.codex/worktrees/ltp-vm-mm/Tx` on `codex/ltp-vm-mm`, fixed a
+  sparse wait-source registry boot panic by replacing the dense global
+  `WaitSourceId` vector with a `BTreeMap` keyed by raw source id; the first
+  process notification source starts at `1 << 32`, so the dense vector could
+  try to allocate a huge index range before userspace. Updated the OSComp RV64
+  QEMU launcher to prefer `external/opensbi-silent/fw_dynamic.bin` and pass a
+  kernel cmdline (`tx.oscomp.groups=ltp-musl console=ttyS0`) for suite
+  selection. Fixed `/proc/meminfo` to render Linux-shaped, nonzero fields that
+  LTP's bootstrap parser accepts. Fixed `accept4` on UDP sockets to return
+  Linux's `EOPNOTSUPP(95)` while preserving `EINVAL` for non-listening stream
+  sockets, and taught `close()` to release fake socket fds so LTP cleanup does
+  not report `EBADF` warnings. **Guest evidence:** `cargo xtask full-build
+  --target rv64-qemu --skip-doctor --no-image`; `/opt/homebrew/bin/timeout
+  180s cargo xtask oscomp test --target rv64-qemu --skip-build --data
+  /Users/3y/Downloads/Tx/target/oscomp/ltp-slim-run --suite ltp-musl` booted
+  the slim LTP image, ran `writev01` and `accept01`, and the serial log at
+  `target/oscomp/os_serial_out_rv.txt` shows only `TPASS` lines for both cases
+  followed by `FAIL LTP CASE writev01 : 0`, `FAIL LTP CASE accept01 : 0`, and
+  `txkernel:qemu-riscv64-virt:userspace:exited:0`. The judge reports `0/0`
+  because this two-case slim image is zero-weight, so the serial is the
+  authoritative signal. `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv.txt --all --brief` found no trap lines.
+  **Host verification:** `cargo fmt --check`; `cargo test -p tx-substrate
+  --lib wake::wait_source::tests -- --test-threads=1`; `cargo test -p xtask
+  oscomp_kernel_cmdline -- --nocapture`; `cargo test -p xtask rv64_oscomp --
+  --nocapture`; `cargo test -p tx-fs meminfo -- --nocapture`; `cargo test -p
+  tx-shims --lib linux_syscall::tests::net_dispatch -- --test-threads=1
+  --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls -- --test-threads=1` (45 passed); `cargo
+  test -p tx-shims --lib linux_syscall::tests::fcntl_misc -- --test-threads=1`
+  (23 passed); `cargo test -p tx-subsystems --test
+  v3_userfaultfd_fd_scaffold -- --test-threads=1`; `cargo test -p
+  tx-subsystems process::tests::fork_does_not_inherit_mlock_future_policy --
+  --exact --nocapture`; `cargo xtask syscall-status --check`; `cargo xtask
+  syscall sync --check`; `cargo xtask lint docs` (ok with the existing two
+  stale-vocabulary warnings); `cargo xtask progress validate`; `git diff
+  --check`. **Next step:** expand beyond the two-case zero-weight slim image
+  into a richer LTP/mm run or verified full image and triage the next semantic
+  failure from fresh serial output. **Blocker/gap:** the branch is no longer
+  blocked before LTP starts, but full LTP-grade behavior still needs broader
+  procfs/devfs/sysfs, networking, process, filesystem, and cross-process VM
+  semantics; VM-specific residuals include global memfd writable-mapping
+  accounting and ptrace/cred target-address-space policy for cross-process
+  `process_vm_*` and `process_madvise`.
+
+- 2026-05-26 **Closed the `mlockall(MCL_FUTURE)` host-semantics gap in the
+  LTP-grade VM/mm worktree.** In
+  `/Users/3y/.codex/worktrees/ltp-vm-mm/Tx` on `codex/ltp-vm-mm`, added a
+  process-local `mlockall(MCL_FUTURE)` policy bit on `ProcessPayload`, exposed
+  `ProcessIdentity` accessors, and threaded it into `sys_mmap` so later
+  mappings are born with `VmEntryFlags.locked` under Tx's no-swap
+  observational-lock model. `munlockall()` now clears both current VMA lock
+  flags and the future policy; new fork payloads start clear, matching Linux's
+  "not inherited across fork" rule; the exec post-commit path clears the policy
+  as well. **Verified:** red
+  `dispatch_mlockall_future_locks_later_mappings_until_munlockall`; `cargo
+  test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls::dispatch_mlockall_future_locks_later_mappings_until_munlockall
+  -- --exact --nocapture`; `cargo test -p tx-subsystems
+  process::tests::fork_does_not_inherit_mlock_future_policy -- --exact
+  --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls -- --test-threads=1` (45 passed); `cargo
+  test -p tx-shims --lib linux_syscall::tests::fcntl_misc -- --test-threads=1`
+  (23 passed); `cargo test -p tx-subsystems --test
+  v3_userfaultfd_fd_scaffold -- --test-threads=1`; `cargo fmt --check`; `git
+  diff --check`; `cargo xtask progress validate`; `cargo xtask syscall-status
+  --check`; `cargo xtask syscall sync --check`; `cargo xtask lint docs` (ok
+  with the existing two stale-vocabulary warnings). **Next step:** run guest
+  LTP mm coverage against this worktree. **Blocker:** still no guest LTP run;
+  `cargo test -p tx-subsystems process::tests -- --test-threads=1` remains red
+  in the pre-existing legacy wait-source/resolver lane
+  (`process::tests::exit_source::*` lookup assertions), while the new
+  `fork_does_not_inherit_mlock_future_policy` regression passes. Cross-process
+  / global mapping accounting for memfd `F_SEAL_WRITE` and ptrace/cred
+  target-address-space policy for `process_vm_*`/`process_madvise` remain
+  semantic depth.
+
+- 2026-05-26 **Extended the LTP-grade VM/mm worktree with single-node
+  memory-policy compatibility.** In
+  `/Users/3y/.codex/worktrees/ltp-vm-mm/Tx` on `codex/ltp-vm-mm`, wired Linux
+  RV64 `mbind(235)`, `get_mempolicy(236)`, and `set_mempolicy(237)`.
+  `get_mempolicy` now reports `MPOL_DEFAULT` for default policy queries and
+  node mask `{0}` for `MPOL_F_MEMS_ALLOWED`; `set_mempolicy` accepts policy
+  shapes that collapse onto Tx's single memory node; `mbind` validates mapped
+  page ranges and accepts single-node/default bindings without recording NUMA
+  placement state. `migrate_pages` treats node-0 to node-0 migration as a no-op
+  and returns zero migrated pages; query-only `move_pages` reports mapped pages
+  on node 0. Added self/current-process `process_vm_readv(270)` and
+  `process_vm_writev(271)`: both validate zero flags and process target,
+  parse Linux RV64 `struct iovec` arrays, and copy through the existing
+  user-copy path without claiming cross-process permission/address-space
+  support. Added `remap_file_pages(234)` for the LTP-compatible shared
+  PageBacked shape: it validates an existing shared PageBacked VMA range and
+  rewrites the mapping to the same PageContainer at the requested `pgoff`. Added
+  memfd seal metadata and fcntl support: `F_GET_SEALS` reports the current seal
+  mask, `F_ADD_SEALS` accumulates valid seals until `F_SEAL_SEAL`, memfds
+  created without `MFD_ALLOW_SEALING` start sealed, `F_SEAL_WRITE` blocks
+  write-family syscalls, `F_SEAL_GROW`/`F_SEAL_SHRINK` block `ftruncate`
+  resizing, `F_SEAL_FUTURE_WRITE` blocks new shared writable mappings, and
+  adding `F_SEAL_WRITE` returns `EBUSY` while the caller address space still has
+  a writable shared mapping of the memfd. Added
+  a real non-VFS pidfd backing for `pidfd_open(434)` and wired
+  `process_madvise(440)` for self-pidfds through the existing VM advice path;
+  cross-process advice still returns `EPERM` until ptrace/cred policy lands.
+  Refreshed the generated syscall-status table: local `NR_*` count is now 214,
+  dispatched arms 210, true missing 106. **Verified:** red
+  tests for missing `NR_GET_MEMPOLICY`/`NR_SET_MEMPOLICY`/`NR_MBIND`; `cargo
+  test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls::dispatch_get_mempolicy --
+  --test-threads=1`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls::dispatch_set_mempolicy --
+  --test-threads=1`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls::dispatch_mbind -- --test-threads=1`;
+  red tests for missing `NR_MIGRATE_PAGES`/`NR_MOVE_PAGES`; `cargo test -p
+  tx-shims --lib linux_syscall::tests::vm_syscalls::dispatch_migrate_pages --
+  --test-threads=1`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls::dispatch_move_pages -- --test-threads=1`;
+  red tests for missing `NR_PROCESS_VM_READV`/`NR_PROCESS_VM_WRITEV`; `cargo
+  test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls::dispatch_process_vm -- --test-threads=1`;
+  red test for missing `NR_REMAP_FILE_PAGES`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls::dispatch_remap_file_pages --
+  --test-threads=1`;
+  red tests for missing `NR_PROCESS_MADVISE` and pidfd backing;
+  `cargo test -p tx-shims --lib dispatch_pidfd_open_returns_process_backed_fd
+  -- --test-threads=1`; `cargo test -p tx-shims --lib
+  dispatch_process_madvise_self_pidfd_returns_advised_bytes -- --test-threads=1`;
+  `cargo test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls::dispatch_memfd -- --test-threads=1` (6
+  passed); `cargo test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls::dispatch_memfd_write_seal_rejects_existing_writable_shared_mmap
+  -- --test-threads=1`; `cargo test -p tx-shims --lib linux_syscall::tests::fcntl_misc --
+  --test-threads=1` (23 passed); `cargo test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls -- --test-threads=1` (43 passed); `cargo
+  test -p tx-subsystems --test v3_userfaultfd_fd_scaffold -- --test-threads=1`;
+  `cargo fmt --check`; `cargo xtask syscall-status --regen`; `cargo xtask
+  syscall sync`; `cargo xtask progress validate`; `cargo xtask syscall-status
+  --check`; `cargo xtask syscall sync --check`; `cargo xtask lint docs` (ok
+  with existing two stale-vocabulary warnings); `git diff --check`. A VFS broad-filter check
+  is still blocked by the pre-existing/stale `v3_vfs_waitsource` legacy
+  resolver assertion (`cargo test -p tx-subsystems --test v3_vfs_waitsource --
+  --test-threads=1` fails at `legacy resolver still has the read carrier`;
+  matching TTY wait-source legacy assertion fails the same way after the
+  retired wait-channel path). **Next step:** run guest LTP mm cases against
+  this surface and then deepen failures by semantic class. **Blocker:** no guest
+  LTP run yet, so these are host-covered compatibility closures; cross-process
+  cross-process/global-mapping `F_SEAL_WRITE` busy checks plus cross-process
+  `process_vm_*` and `process_madvise` still need ptrace/cred permission and
+  target-address-space policy.
+
+- 2026-05-25 **Started the LTP-grade VM/mm worktree with mincore and
+  memory-lock coverage.** In `/Users/3y/.codex/worktrees/ltp-vm-mm/Tx` on
+  `codex/ltp-vm-mm`, wired Linux RV64 `mincore(232)`, `mlock2(284)`,
+  `mlockall(230)`, `munlockall(231)`, and `memfd_create(279)`.
+  `mincore` now validates page alignment/coverage, returns Linux-shaped
+  `ENOMEM` for unmapped target ranges, and copies one residency byte per page
+  to the user vector through the existing user-copy gate. `mlock2` accepts
+  `MLOCK_ONFAULT` under Tx's no-swap observational-lock policy, rejects
+  unknown flag bits, and reuses the existing `mlock` path. `mlockall` now
+  applies `MCL_CURRENT` to every current VMA, accepts `MCL_FUTURE` as a
+  documented v1 no-op until future-lock process policy exists, and rejects
+  invalid flag shapes; `munlockall` clears the current VMA lock flags.
+  `memfd_create` now returns a pathless synthetic regular-file fd backed by an
+  anonymous PageContainer, honors `MFD_CLOEXEC`, rejects unknown/hugetlb flags,
+  and maps through the existing PageBacked `ftruncate`/`mmap` path; seals remain
+  metadata-only intent until the fcntl seal slice lands. Refreshed the
+  generated syscall-status table: local `NR_*` count is now 205, dispatched
+  arms 201, true missing 115. **Verified:** red tests for missing
+  `NR_MINCORE`/`NR_MLOCK2`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls::dispatch_mincore -- --test-threads=1`;
+  `cargo test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls::dispatch_mlock2 -- --test-threads=1`;
+  red tests for missing `NR_MLOCKALL`/`NR_MUNLOCKALL`; `cargo test -p
+  tx-shims --lib linux_syscall::tests::vm_syscalls::dispatch_m --
+  --test-threads=1` (27 passed); `cargo test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls -- --test-threads=1`; red tests for missing
+  `NR_MEMFD_CREATE`/`MFD_CLOEXEC`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::vm_syscalls::dispatch_memfd -- --test-threads=1`;
+  `cargo xtask syscall-status --regen`; `cargo xtask syscall sync`. **Next
+  step:** continue the VM/mm LTP slice with `remap_file_pages` or memory-policy
+  stubs, then run guest LTP mm cases once enough syscall surface is wired.
+  **Blocker:** no guest LTP run yet, so these are host-covered syscall closures,
+  not gold-standard LTP closures.
+
 - 2026-05-24 **Cleaned the pipe lease wait through notification wrappers before
   merge-back.** The reactor boundary sweep found zero raw reactor references
   outside adapters, but `notification-boundary` caught one stale raw

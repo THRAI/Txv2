@@ -314,6 +314,7 @@ marked_kernel_user_layout!(
 pub const KERNEL_USER_LAYOUTS: &[KernelUserLayout] = &[
     time::layout_descriptors::TIMESPEC_LAYOUT,
     time::layout_descriptors::TIMEVAL_LAYOUT,
+    time::layout_descriptors::ITIMERVAL_LAYOUT,
     time::layout_descriptors::TMS_LAYOUT,
     fs_basic::layout_descriptors::STAT_LAYOUT,
     fs_basic::layout_descriptors::STATX_TIMESTAMP_LAYOUT,
@@ -342,6 +343,10 @@ pub fn kernel_user_layouts() -> &'static [KernelUserLayout] {
 pub const KERNEL_USER_LAYOUT_CANDIDATES: &[KernelUserCandidate] = &[
     full_candidate!("struct timespec", time::layout_descriptors::TIMESPEC_LAYOUT),
     full_candidate!("struct timeval", time::layout_descriptors::TIMEVAL_LAYOUT),
+    full_candidate!(
+        "struct itimerval",
+        time::layout_descriptors::ITIMERVAL_LAYOUT
+    ),
     full_candidate!("struct tms", time::layout_descriptors::TMS_LAYOUT),
     full_candidate!("struct stat", fs_basic::layout_descriptors::STAT_LAYOUT),
     full_candidate!(
@@ -648,12 +653,6 @@ pub const KERNEL_USER_LAYOUT_CANDIDATES: &[KernelUserCandidate] = &[
         "",
         "",
         "musl registers an internal three-word robust-list head; txKernel stores the pointer/length and best-effort reads fields on thread exit, but the checker needs internal-header extraction before enforcing it.",
-    ),
-    deferred_candidate!(
-        "struct itimerval",
-        "sys/time.h",
-        "struct itimerval",
-        "getitimer/setitimer are not dispatched yet; add checked/manual coverage when interval timers land.",
     ),
     KernelUserCandidate {
         name: "struct sigevent timer_create prefix",

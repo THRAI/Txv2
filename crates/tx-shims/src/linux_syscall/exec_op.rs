@@ -386,6 +386,7 @@ impl<'a, P: PmapIf + EntropyIf + AuxvIf, I: step_engine::SubjectIdentity> StepOp
                 step_close_cloexec_fds(self.process);
                 step_reset_signal_dispositions_for_exec(self.process);
                 step_install_brk_for_exec(self.process, 0);
+                self.process.set_mlock_future(false);
                 // Store exe_file and cmdline for procfs.
                 if let Some(payload) = self.process.payload_slot().lock().as_ref() {
                     if let Some(file) = &self.openfile {
