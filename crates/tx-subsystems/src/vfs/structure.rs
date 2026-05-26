@@ -25,7 +25,7 @@ use crate::eventfd::EventFd;
 use crate::execution::Errno;
 use crate::io_uring::IoUring;
 use crate::ipc::posix_mq::structure::PosixMqInstance;
-use crate::mount::{MountIdentity, MountPayload};
+use crate::mount::{MountApiFile, MountIdentity, MountPayload};
 use crate::net::{NetNamespacePayload, SocketIdentity};
 use crate::page_backed::PageContainer;
 use crate::process::{ProcessGroup, ProcessIdentity};
@@ -1102,6 +1102,10 @@ pub enum OpenFileBacking {
     /// to the target process identity; exit/readiness lives on the
     /// process side, so this adapter does not duplicate signal truth.
     Pidfd { process: Cap<ProcessIdentity> },
+    /// Linux 5.2 new mount API fd (`fsopen`, `fspick`, `fsmount`,
+    /// `open_tree`). The cap carries the mount-context or detached
+    /// mount identity; full topology mutation remains in mount syscalls.
+    MountApi { file: Cap<MountApiFile> },
 }
 
 /// Per-fd file-position carrier.
@@ -1356,6 +1360,26 @@ impl OpenFile {
         step_engine::sign(Self::new_pidfd(process, flags))
     }
 
+    /// Construct a new-mount-API-backed `OpenFile`.
+    pub fn new_mount_api(file: Cap<MountApiFile>, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::MountApi { file },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicI8::new(-1),
+            flags,
+            opendir_dentry: None,
+        }
+    }
+
+    /// Zone-sign a fresh new-mount-API-backed `OpenFile`.
+    pub fn new_mount_api_cap(
+        file: Cap<MountApiFile>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_mount_api(file, flags))
+    }
+
     /// Construct an io_uring-backed `OpenFile` (future PR-12 phase 0 —
     /// second `OnBehalfOf<P>` canary). The resulting value carries
     /// `OpenFileBacking::IoUring { ring }` and no `Cap<RNode>` —
@@ -1459,6 +1483,10 @@ impl OpenFile {
                 "OpenFile::rnode() called on a pidfd-backed OpenFile; \
                  dispatch via OpenFile::backing() / OpenFile::pidfd_process() first",
             ),
+            OpenFileBacking::MountApi { .. } => panic!(
+                "OpenFile::rnode() called on a mount-api-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::mount_api_file() first",
+            ),
         }
     }
 
@@ -1510,7 +1538,8 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. } => None,
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::MountApi { .. } => None,
         }
     }
 
@@ -1532,7 +1561,8 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. } => None,
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::MountApi { .. } => None,
         }
     }
 
@@ -1553,7 +1583,8 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. } => None,
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::MountApi { .. } => None,
         }
     }
 
@@ -1570,7 +1601,8 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. } => None,
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::MountApi { .. } => None,
         }
     }
 
@@ -1587,7 +1619,8 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. } => None,
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::MountApi { .. } => None,
         }
     }
 
@@ -1604,7 +1637,8 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. } => None,
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::MountApi { .. } => None,
         }
     }
 
@@ -1626,7 +1660,8 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. } => None,
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::MountApi { .. } => None,
         }
     }
 
@@ -1643,7 +1678,8 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::IoUring { .. }
-            | OpenFileBacking::Pidfd { .. } => None,
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::MountApi { .. } => None,
         }
     }
 
@@ -1659,7 +1695,26 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::IoUring { .. }
-            | OpenFileBacking::PosixMq { .. } => None,
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::MountApi { .. } => None,
+        }
+    }
+
+    /// `Some(&Cap<MountApiFile>)` iff this `OpenFile` is a Linux new
+    /// mount API fd (`fsopen`, `fspick`, `fsmount`, or `open_tree`).
+    pub fn mount_api_file(&self) -> Option<&Cap<MountApiFile>> {
+        match &self.backing {
+            OpenFileBacking::MountApi { file } => Some(file),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::Ufd { .. }
+            | OpenFileBacking::AioContext { .. }
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. }
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. } => None,
         }
     }
 

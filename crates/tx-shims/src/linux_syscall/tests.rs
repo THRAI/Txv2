@@ -17,6 +17,7 @@
 //! - `txdoc:PROCESS-STEP-EXIT-GROUP-1` (PROCESS_v1 §7.3.2).
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
@@ -26,30 +27,42 @@ use std::sync::Mutex;
 use crate::adapter::reactor_entry::userspace::SyscallRequest;
 use crate::adapter::step_engine::{self as step_engine, guard, Cap, StepOutcome};
 use crate::linux_syscall::reset_uts_nodename_for_test;
+use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_reactor_affinity_seam, reset_tid_counter,
 };
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
-use tx_subsystems::process::{bootstrap_init_process, ExitStatus, Pid, ProcessIdentity};
+use tx_subsystems::mount::{
+    self, FsContextMode, MountApiFileKind, MountFlags, MountIdentity, MountOptions, MountPayload,
+    SourceLabel,
+};
+use tx_subsystems::process::{
+    bootstrap_init_process, step_chdir, ChdirOutcome, ExitStatus, Pid, ProcessIdentity,
+};
 use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
-use tx_subsystems::vfs::structure::{FsNotifyKind, OpenFileBacking, RNodeBacking, StructPayload};
-use tx_subsystems::vfs::OpenFile;
+use tx_subsystems::vfs::structure::{
+    DEntry, FsNotifyKind, InlineName, InodeKind, InodeMeta, OpenFileBacking, RNode, RNodeBacking,
+    StructPayload,
+};
+use tx_subsystems::vfs::{FsOps, OpenFile};
 use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
 use super::{
-    dispatch, SyscallCtx, SyscallResult, CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID,
-    CLONE_PARENT_SETTID, EFAULT_VALUE, EINVAL_VALUE, ENOSYS_VALUE, FAN_CLASS_CONTENT,
-    FAN_CLASS_NOTIF, FAN_CLOEXEC, FAN_NONBLOCK, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, IN_CLOEXEC,
+    dispatch, SyscallCtx, SyscallResult, AT_FDCWD, CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID,
+    CLONE_PARENT_SETTID, EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENODEV_VALUE, ENOENT_VALUE,
+    ENOSYS_VALUE, FAN_CLASS_CONTENT, FAN_CLASS_NOTIF, FAN_CLOEXEC, FAN_NONBLOCK, FD_CLOEXEC,
+    FSOPEN_CLOEXEC, FSPICK_CLOEXEC, FSPICK_NO_AUTOMOUNT, F_GETFD, F_GETFL, F_SETFD, IN_CLOEXEC,
     IN_NONBLOCK, MFD_ALLOW_SEALING, MFD_CLOEXEC, NR_ACCEPT, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT,
-    NR_EXIT_GROUP, NR_FANOTIFY_INIT, NR_FCNTL, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID,
-    NR_GETSID, NR_GET_ROBUST_LIST, NR_INOTIFY_INIT1, NR_MEMBARRIER, NR_MEMFD_CREATE, NR_PIDFD_OPEN,
-    NR_PIPE2, NR_PPOLL, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGTIMEDWAIT,
-    NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SCHED_YIELD, NR_SETPGID, NR_SETSID,
-    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, NR_WRITEV,
+    NR_EXIT_GROUP, NR_FANOTIFY_INIT, NR_FCNTL, NR_FSOPEN, NR_FSPICK, NR_GETPGID, NR_GETPGRP,
+    NR_GETPID, NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_INOTIFY_INIT1, NR_MEMBARRIER,
+    NR_MEMFD_CREATE, NR_OPEN_TREE, NR_PIDFD_OPEN, NR_PIPE2, NR_PPOLL, NR_READ, NR_RT_SIGACTION,
+    NR_RT_SIGPROCMASK, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY,
+    NR_SCHED_YIELD, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
+    NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, NR_WRITEV, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE,
     O_DIRECTORY, O_NONBLOCK, O_RDONLY, O_RDWR, PIDFD_NONBLOCK, SIGCHLD, WNOHANG,
 };
 
@@ -234,6 +247,52 @@ fn fresh_aspace() -> Cap<AddressSpace> {
 
 fn bootstrap() -> Cap<ProcessIdentity> {
     bootstrap_init_process(fresh_aspace()).expect("bootstrap init")
+}
+
+fn build_mount_api_test_root() -> (Cap<DEntry>, Cap<MountIdentity>) {
+    let tmpfs = Arc::new(Tmpfs::new());
+    let payload = MountPayload::new_cap(
+        tmpfs.clone() as Arc<dyn FsOps>,
+        tmpfs as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
+        None,
+        mount::allocate_dev_id(),
+        MountOptions::default(),
+        "tmpfs",
+        SourceLabel::Static("tmpfs"),
+    )
+    .expect("mount payload");
+
+    let root_rnode = {
+        let raw = RNode::new(
+            TMPFS_ROOT_OBJECT_ID,
+            InodeMeta::new(InodeKind::Directory, 0o755),
+            RNodeBacking::Directory,
+        )
+        .with_containing_mount(&payload);
+        let res = step_engine::reserve_for::<RNode>().expect("rnode reservation");
+        step_engine::sign_for(res, raw)
+    };
+    let root_mount = MountIdentity::new_cap(
+        mount::allocate_mount_id(),
+        None,
+        root_rnode.clone(),
+        None,
+        payload,
+        MountFlags::empty(),
+    )
+    .expect("root mount identity");
+    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
+    (root_dentry, root_mount)
+}
+
+fn bootstrap_with_cwd(root_dentry: Cap<DEntry>) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    match step_chdir(&process, root_dentry) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("init bootstrap zombified"),
+    }
+    (process, thread)
 }
 
 fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
@@ -649,6 +708,230 @@ fn dispatch_fanotify_init_installs_notification_class_fd() {
     assert_eq!(
         block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
         SyscallResult::Error(88)
+    );
+}
+
+#[test]
+fn dispatch_fsopen_installs_mount_context_fd() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let ext2 = b"ext2\0";
+    let invalid_fs = b"invalid\0";
+
+    let invalid_flags = SyscallRequest::new(NR_FSOPEN, [ext2.as_ptr() as u64, 0x10, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(invalid_flags, &ctx)),
+        SyscallResult::Error(EINVAL_VALUE)
+    );
+
+    let invalid_fs_req =
+        SyscallRequest::new(NR_FSOPEN, [invalid_fs.as_ptr() as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(invalid_fs_req, &ctx)),
+        SyscallResult::Error(ENODEV_VALUE)
+    );
+
+    let req = SyscallRequest::new(
+        NR_FSOPEN,
+        [ext2.as_ptr() as u64, FSOPEN_CLOEXEC as u64, 0, 0, 0, 0],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("fsopen(ext2) failed: {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("fsopen fd installed");
+    match file.backing() {
+        OpenFileBacking::MountApi { file } => {
+            assert_eq!(file.kind(), MountApiFileKind::FsContext);
+            assert_eq!(file.mode(), Some(FsContextMode::New));
+            assert_eq!(file.fstype(), "ext2");
+        }
+        other => panic!("expected mount-api fs-context backing, got {other:?}"),
+    }
+    assert!(file.flags().read);
+    assert!(file.flags().write);
+    assert!(file.flags().cloexec);
+    assert!(proc_cap.fd_cloexec(fd));
+
+    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
+        SyscallResult::Error(88)
+    );
+}
+
+#[test]
+fn dispatch_fspick_installs_reconfigure_context_fd() {
+    let _setup = setup();
+    let (root_dentry, _root_mount) = build_mount_api_test_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let root = b"/\0";
+    let relative = b"mntpoint\0";
+    let missing = b"/definitely-not-present\0";
+
+    let invalid_flags = SyscallRequest::new(
+        NR_FSPICK,
+        [AT_FDCWD as u64, root.as_ptr() as u64, 0x10, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(invalid_flags, &ctx)),
+        SyscallResult::Error(EINVAL_VALUE)
+    );
+
+    let invalid_fd = SyscallRequest::new(
+        NR_FSPICK,
+        [
+            (-1_i64) as u64,
+            relative.as_ptr() as u64,
+            (FSPICK_CLOEXEC | FSPICK_NO_AUTOMOUNT) as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(invalid_fd, &ctx)),
+        SyscallResult::Error(EBADF_VALUE)
+    );
+
+    let invalid_path = SyscallRequest::new(
+        NR_FSPICK,
+        [
+            AT_FDCWD as u64,
+            missing.as_ptr() as u64,
+            FSPICK_NO_AUTOMOUNT as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(invalid_path, &ctx)),
+        SyscallResult::Error(ENOENT_VALUE)
+    );
+
+    let req = SyscallRequest::new(
+        NR_FSPICK,
+        [
+            AT_FDCWD as u64,
+            root.as_ptr() as u64,
+            (FSPICK_CLOEXEC | FSPICK_NO_AUTOMOUNT) as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("fspick(/) failed: {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("fspick fd installed");
+    match file.backing() {
+        OpenFileBacking::MountApi { file } => {
+            assert_eq!(file.kind(), MountApiFileKind::FsContext);
+            assert_eq!(file.mode(), Some(FsContextMode::Reconfigure));
+            assert!(!file.fstype().is_empty());
+        }
+        other => panic!("expected mount-api reconfigure backing, got {other:?}"),
+    }
+    assert!(file.flags().read);
+    assert!(file.flags().write);
+    assert!(file.flags().cloexec);
+    assert!(proc_cap.fd_cloexec(fd));
+
+    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
+        SyscallResult::Error(88)
+    );
+}
+
+#[test]
+fn dispatch_open_tree_installs_path_only_mount_fd() {
+    let _setup = setup();
+    let (root_dentry, _root_mount) = build_mount_api_test_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let root = b"/\0";
+    let relative = b"mntpoint\0";
+    let missing = b"/definitely-not-present\0";
+
+    let invalid_flags = SyscallRequest::new(
+        NR_OPEN_TREE,
+        [AT_FDCWD as u64, root.as_ptr() as u64, 0xffff_ffff, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(invalid_flags, &ctx)),
+        SyscallResult::Error(EINVAL_VALUE)
+    );
+
+    let invalid_fd = SyscallRequest::new(
+        NR_OPEN_TREE,
+        [
+            (-1_i64) as u64,
+            relative.as_ptr() as u64,
+            OPEN_TREE_CLONE as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(invalid_fd, &ctx)),
+        SyscallResult::Error(EBADF_VALUE)
+    );
+
+    let invalid_path = SyscallRequest::new(
+        NR_OPEN_TREE,
+        [
+            AT_FDCWD as u64,
+            missing.as_ptr() as u64,
+            OPEN_TREE_CLONE as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(invalid_path, &ctx)),
+        SyscallResult::Error(ENOENT_VALUE)
+    );
+
+    let req = SyscallRequest::new(
+        NR_OPEN_TREE,
+        [
+            AT_FDCWD as u64,
+            root.as_ptr() as u64,
+            OPEN_TREE_CLOEXEC as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("open_tree(/) failed: {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("open_tree fd installed");
+    match file.backing() {
+        OpenFileBacking::MountApi { file } => {
+            assert_eq!(file.kind(), MountApiFileKind::OpenTree);
+            assert!(!file.fstype().is_empty());
+        }
+        other => panic!("expected mount-api open_tree backing, got {other:?}"),
+    }
+    assert!(!file.flags().read);
+    assert!(!file.flags().write);
+    assert!(file.flags().cloexec);
+    assert!(proc_cap.fd_cloexec(fd));
+
+    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
+        SyscallResult::Error(EBADF_VALUE)
     );
 }
 

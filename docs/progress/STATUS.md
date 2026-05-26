@@ -1,3 +1,26 @@
+- 2026-05-26 **Landed scoped Linux new-mount-API fd providers for the
+  `accept03` tail.** Added zone-managed `MountApiFile` descriptors and VFS
+  `OpenFileBacking::MountApi`, wired `fsopen(430)`, `fspick(433)`, and
+  `open_tree(428)` as fd providers with Linux-like flag/path validation,
+  close-on-exec plumbing, and generic socket rejection: `fsopen`/`fspick`
+  report `ENOTSOCK` through `accept()`, while O_PATH-like `open_tree` reports
+  `EBADF`. This is intentionally not full Linux 5.2 mount API support:
+  `fsconfig`, `fsmount`, `move_mount`, and `mount_setattr` topology/superblock
+  semantics remain deferred by `MOUNT_v1`. Focused LTP `accept03` now reports
+  `20/23` in `target/oscomp/ltp-accept03-after-mount-api-fds.txt`, with the
+  remaining skips limited to perf event, bpf map, and memfd_secret. **Verification:**
+  `cargo fmt`; `cargo check -p tx-subsystems -p tx-shims`; `cargo test -p
+  tx-shims --lib mount -- --test-threads=1`; `cargo test -p tx-shims --lib
+  fspick -- --test-threads=1`; `cargo xtask syscall-status fsopen`; `cargo
+  xtask syscall-status fspick`; `cargo xtask syscall-status open_tree`; `cargo
+  xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu --submit target/oscomp/submit`; focused LTP `accept03 20/23`.
+  **Next step:** choose between the remaining heavy accept03 providers
+  (`perf_event_open`, `bpf`, `memfd_secret`) or return to protocol blockers
+  (`RDS`, `SCTP`). **Blocker:** full new mount API semantics need a separate
+  mount-subsystem implementation and should not be inferred from this fd
+  provider slice.
+
 - 2026-05-26 **Landed typed `FsNotify` fds for the next `accept03`
   provider slice.** Added `inotify_init1(26)` and `fanotify_init(262)` as
   real VFS `StructPayload::FsNotify` descriptors with their own zone-managed

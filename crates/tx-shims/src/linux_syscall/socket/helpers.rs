@@ -412,6 +412,11 @@ pub(super) fn socket_identity_from_file(
             _ if open_file_is_path_only(file) => Err(Errno::EBADF),
             _ => Err(Errno::ENOTSOCK),
         },
+        OpenFileBacking::MountApi { file }
+            if file.kind() == tx_subsystems::mount::MountApiFileKind::OpenTree =>
+        {
+            Err(Errno::EBADF)
+        }
         _ => Err(Errno::ENOTSOCK),
     }
 }

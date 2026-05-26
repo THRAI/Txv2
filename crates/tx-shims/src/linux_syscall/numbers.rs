@@ -1132,6 +1132,39 @@ pub const NR_FLOCK: u64 = 32;
 pub const NR_MOUNT: u64 = 40;
 /// `umount2(target, flags)`. Linux RV64 ABI `__NR_umount2 = 39`.
 pub const NR_UMOUNT2: u64 = 39;
+/// `open_tree(dirfd, path, flags)`. Linux generic ABI `__NR_open_tree = 428`.
+///
+/// Current txKernel scope: fd-provider semantics for LTP's generic fd
+/// consumers (`accept03`) plus argument/error validation. Full detached
+/// mount topology transfer via `move_mount(2)` remains in the mount-API
+/// follow-up.
+pub const NR_OPEN_TREE: u64 = 428;
+/// `fsopen(fsname, flags)`. Linux generic ABI `__NR_fsopen = 430`.
+///
+/// Current txKernel scope: mint a mount-context fd for supported in-tree
+/// filesystem labels. `fsconfig(2)` / `fsmount(2)` superblock creation is
+/// intentionally not claimed by this constant.
+pub const NR_FSOPEN: u64 = 430;
+/// `fspick(dirfd, path, flags)`. Linux generic ABI `__NR_fspick = 433`.
+///
+/// Current txKernel scope: mint a reconfiguration-context fd for an existing
+/// resolved mount path. Full reconfiguration via `fsconfig(2)` is deferred.
+pub const NR_FSPICK: u64 = 433;
+
+/// `open_tree(2)` flag: clone the selected mount subtree.
+pub const OPEN_TREE_CLONE: u32 = 0x0000_0001;
+/// `open_tree(2)` flag: mark the returned fd close-on-exec.
+pub const OPEN_TREE_CLOEXEC: u32 = O_CLOEXEC;
+/// `fsopen(2)` flag: mark the returned fd close-on-exec.
+pub const FSOPEN_CLOEXEC: u32 = 0x0000_0001;
+/// `fspick(2)` flag: mark the returned fd close-on-exec.
+pub const FSPICK_CLOEXEC: u32 = 0x0000_0001;
+/// `fspick(2)` flag: do not follow the final symlink component.
+pub const FSPICK_SYMLINK_NOFOLLOW: u32 = 0x0000_0002;
+/// `fspick(2)` flag: do not trigger automounts.
+pub const FSPICK_NO_AUTOMOUNT: u32 = 0x0000_0004;
+/// `fspick(2)` flag: allow an empty pathname with a path-bearing fd.
+pub const FSPICK_EMPTY_PATH: u32 = 0x0000_0008;
 /// `mknodat(dirfd, path, mode, dev)`. Linux RV64 ABI `__NR_mknodat = 33`.
 pub const NR_MKNODAT: u64 = 33;
 /// `getdents64(fd, dirp, count)`. Linux RV64 generic ABI

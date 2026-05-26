@@ -2266,7 +2266,9 @@ fn stat_meta_for_non_vfs_open_file(file: &OpenFile) -> Option<InodeMeta> {
         | OpenFileBacking::AioContext { .. }
         | OpenFileBacking::IoUring { .. }
         | OpenFileBacking::PosixMq { .. }
-        | OpenFileBacking::Pidfd { .. } => Some(InodeMeta {
+        | OpenFileBacking::Pidfd { .. }
+        | OpenFileBacking::KernelObject { .. }
+        | OpenFileBacking::MountApi { .. } => Some(InodeMeta {
             mode: 0o600,
             uid: 0,
             gid: 0,

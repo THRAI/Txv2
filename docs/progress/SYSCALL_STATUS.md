@@ -18,7 +18,7 @@ record which specific OSComp/LTP test(s) closed it under "Currently
 passing" below.
 
 **Last refresh:** 2026-05-26 (mechanical syscall status refreshed after
-`inotify_init1` / `fanotify_init` dispatch).
+scoped `fsopen` / `fspick` / `open_tree` fd-provider dispatch).
 
 ## Headline counts
 
@@ -29,8 +29,8 @@ passing" below.
 _Counts read from `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}`._
 _Run `cargo xtask syscall-status --regen` to refresh; `--check` to lint in CI._
 
-- **`NR_*` defined:** 198
-- **Dispatched (has a match arm):** 196
+- **`NR_*` defined:** 201
+- **Dispatched (has a match arm):** 199
 - **Defined but not dispatched:** 2 — see list below
 
 #### Defined but not dispatched
@@ -117,6 +117,11 @@ core (PR-11).
   `15/23` to `17/23` in `target/oscomp/ltp-accept03-after-fsnotify-fds.txt`,
   and `inotify_init1_01,inotify_init1_02` report `8/8` in
   `target/oscomp/ltp-inotify-init1-basic.txt`.
+- 2026-05-26: `fsopen(430)`, `fspick(433)`, and `open_tree(428)` are
+  dispatched as scoped new-mount-API fd providers; focused LTP `accept03`
+  moved from `17/23` to `20/23` in
+  `target/oscomp/ltp-accept03-after-mount-api-fds.txt`. Full
+  `fsconfig`/`fsmount`/`move_mount` semantics remain deferred.
 
 ### When a syscall lands
 
@@ -256,8 +261,8 @@ overwritten by the next `sync`. The lint variant
 
 ### Counts (from dispatch table)
 
-- `pub const NR_*` in numbers.rs: **198**
-- dispatched in mod.rs: **195** (of which async: 59, likely-stub: 0)
+- `pub const NR_*` in numbers.rs: **201**
+- dispatched in mod.rs: **198** (of which async: 62, likely-stub: 0)
 - defined but not dispatched: **3**
 
 ### Defined in `numbers.rs` but no dispatch arm (3)
@@ -268,7 +273,7 @@ These have a syscall number constant but no match arm in `mod.rs`. Either wire t
 - `NR_PIDFD_SEND_SIGNAL` (nr=424)
 - `NR_PSELECT6` (nr=72)
 
-### Dispatched syscalls (195) — name → handler
+### Dispatched syscalls (198) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -467,6 +472,9 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 291 | `NR_STATX` | `sys_statx` | async |
 | 413 | `NR_PSELECT6_TIME64` | `sys_pselect6` | async |
 | 425 | `NR_IO_URING_SETUP` | `sys_io_uring_setup` | sync |
+| 428 | `NR_OPEN_TREE` | `sys_open_tree` | async |
+| 430 | `NR_FSOPEN` | `sys_fsopen` | async |
+| 433 | `NR_FSPICK` | `sys_fspick` | async |
 | 434 | `NR_PIDFD_OPEN` | `sys_pidfd_open` | sync |
 | 439 | `NR_FACCESSAT2` | `sys_faccessat2` | sync |
 

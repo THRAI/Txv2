@@ -2816,7 +2816,8 @@ fn inline_io_len_for_file(file: &Cap<OpenFile>, len: usize) -> usize {
         | tx_subsystems::vfs::structure::OpenFileBacking::Eventfd { .. }
         | tx_subsystems::vfs::structure::OpenFileBacking::Timerfd { .. }
         | tx_subsystems::vfs::structure::OpenFileBacking::PosixMq { .. }
-        | tx_subsystems::vfs::structure::OpenFileBacking::Pidfd { .. } => len,
+        | tx_subsystems::vfs::structure::OpenFileBacking::Pidfd { .. }
+        | tx_subsystems::vfs::structure::OpenFileBacking::MountApi { .. } => len,
     }
 }
 

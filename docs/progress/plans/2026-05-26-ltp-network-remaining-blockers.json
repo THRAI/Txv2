@@ -6,7 +6,7 @@
   "created": "2026-05-26",
   "updated": "2026-05-26",
   "owner": "agent",
-  "summary": "Track the remaining explicit blockers after the LTP network syscall split: SCTP, RDS, TCP TLS ULP, RV64 socketcall interpretation, accept03 fd providers, and the recvmmsg01 musl wrapper SIGSEGV. The constrained TLS ULP setsockopt10 phase is complete and refreshed b6 to 10/11, moving the split total to 208/227. The pidfd_open, memfd_create, inotify_init1, and fanotify_init accept03 provider slices are complete and move focused accept03 from 13/23 to 17/23; pidfd_send_signal remains pending.",
+  "summary": "Track the remaining explicit blockers after the LTP network syscall split: SCTP, RDS, TCP TLS ULP, RV64 socketcall interpretation, accept03 fd providers, and the recvmmsg01 musl wrapper SIGSEGV. The constrained TLS ULP setsockopt10 phase is complete and refreshed b6 to 10/11, moving the split total to 208/227. The pidfd_open, memfd_create, inotify_init1/fanotify_init, and scoped fsopen/fspick/open_tree accept03 provider slices are complete and move focused accept03 from 13/23 to 20/23; pidfd_send_signal, perf_event_open, bpf, and memfd_secret remain pending or explicitly heavy/out of scope.",
   "scope": {
     "in": [
       "crates/tx-shims/src/linux_syscall/socket.rs",
@@ -15,9 +15,11 @@
       "crates/tx-shims/src/linux_syscall/numbers.rs",
       "crates/tx-subsystems/src/net/",
       "crates/tx-subsystems/src/vfs/",
+      "crates/tx-subsystems/src/mount/",
       "crates/tx-subsystems/src/process/",
       "crates/tx-subsystems/src/vm/",
       "crates/tx-fs/src/procfs/mod.rs",
+      "docs/design/05_filesystem/MOUNT_v1.md",
       "docs/LTP/ltp-network-syscall-progress.md",
       "docs/progress/STATUS.md"
     ],
@@ -43,8 +45,11 @@
         "paths": [
           "crates/tx-shims/src/linux_syscall/signal.rs",
           "crates/tx-shims/src/linux_syscall/fs_basic.rs",
+          "crates/tx-shims/src/linux_syscall/fs_mut.rs",
           "crates/tx-shims/src/linux_syscall/mod.rs",
+          "crates/tx-shims/src/linux_syscall/numbers.rs",
           "crates/tx-subsystems/src/process/",
+          "crates/tx-subsystems/src/mount/",
           "crates/tx-subsystems/src/vfs/",
           "crates/tx-subsystems/src/vm/",
           "crates/tx-fs/src/"
@@ -230,21 +235,30 @@
     },
     {
       "id": "accept03-4-mount-api-fds",
-      "title": "Decide and stage fsopen/fspick/open_tree providers",
-      "status": "pending",
+      "title": "Stage scoped fsopen/fspick/open_tree fd providers",
+      "status": "complete",
       "depends_on": [
         "accept03-0-inventory"
       ],
       "paths": [
-        "crates/tx-shims/src/linux_syscall/fs_basic.rs",
+        "crates/tx-shims/src/linux_syscall/fs_mut.rs",
+        "crates/tx-shims/src/linux_syscall/socket/helpers.rs",
+        "crates/tx-shims/src/linux_syscall/mod.rs",
+        "crates/tx-shims/src/linux_syscall/numbers.rs",
         "crates/tx-subsystems/src/vfs/",
-        "crates/tx-subsystems/src/mount.rs",
+        "crates/tx-subsystems/src/mount/",
         "docs/design/05_filesystem/MOUNT_v1.md"
       ],
       "verification": [
-        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=accept03,fsopen01,fspick01,open_tree01 OSCOMP_OUT_RV=target/oscomp/ltp-new-mount-fds-accept03.txt"
+        "cargo test -p tx-shims --lib mount -- --test-threads=1",
+        "cargo test -p tx-shims --lib fspick -- --test-threads=1",
+        "cargo xtask syscall-status fsopen",
+        "cargo xtask syscall-status fspick",
+        "cargo xtask syscall-status open_tree",
+        "timeout 240s make oscomp-qemu-rv64 OSCOMP_LTP=accept03 OSCOMP_OUT_RV=target/oscomp/ltp-accept03-after-mount-api-fds.txt",
+        "python3 tools/oscomp-judge.py target/oscomp/ltp-accept03-after-mount-api-fds.txt target/oscomp/testdata"
       ],
-      "notes": "MOUNT_v1 currently defers Linux 5.2 new mount API. If this is chartered for accept03, add a design update first, then implement fs_context and detached-mount fds with Linux-like lifecycle. open_tree may intentionally return EBADF in accept03 because LTP treats it like an fd without a regular struct file."
+      "notes": "Complete as a scoped fd-provider phase: NR_FSOPEN, NR_FSPICK, and NR_OPEN_TREE dispatch, validate flags/paths, install OpenFileBacking::MountApi descriptors, and classify accept03 errno generically (fsopen/fspick ENOTSOCK, open_tree EBADF). MOUNT_v1 now records that full fsconfig/fsmount/move_mount/mount_setattr topology and superblock semantics remain deferred. Focused accept03 is 20/23 in target/oscomp/ltp-accept03-after-mount-api-fds.txt; remaining skips are perf event, bpf map, and memfd_secret."
     },
     {
       "id": "accept03-5-heavy-fds",
@@ -341,6 +355,7 @@
         "accept03-1-pidfd",
         "accept03-2-memfd",
         "accept03-3-notify-fds",
+        "accept03-4-mount-api-fds",
         "tls-1-ulp-metadata",
         "rds-1-local-seqpacket",
         "sctp-1-local-stream"
@@ -373,7 +388,7 @@
     {
       "command": "Implementation verification",
       "status": "passed",
-      "notes": "TLS ULP metadata phase passed host tests, focused LTP setsockopt10 1/1 in target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt, and refreshed b6 10/11 in target/oscomp/ltp-net-b6-after-tls-ulp.txt. pidfd_open passed host pidfd_open tests and focused LTP accept03 14/23 in target/oscomp/ltp-accept03-after-pidfd-open-final.txt. memfd_create passed host memfd_create tests, focused LTP accept03 15/23 in target/oscomp/ltp-accept03-after-memfd-create.txt, and memfd_create02 10/14 in target/oscomp/ltp-memfd-create02-basic.txt. inotify_init1/fanotify_init passed host tests, focused LTP accept03 17/23 in target/oscomp/ltp-accept03-after-fsnotify-fds.txt, and inotify_init1_01/inotify_init1_02 8/8 in target/oscomp/ltp-inotify-init1-basic.txt. SCTP, RDS, pidfd_send_signal, and the remaining mount/heavy fd-provider phases remain pending."
+      "notes": "TLS ULP metadata phase passed host tests, focused LTP setsockopt10 1/1 in target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt, and refreshed b6 10/11 in target/oscomp/ltp-net-b6-after-tls-ulp.txt. pidfd_open passed host pidfd_open tests and focused LTP accept03 14/23 in target/oscomp/ltp-accept03-after-pidfd-open-final.txt. memfd_create passed host memfd_create tests, focused LTP accept03 15/23 in target/oscomp/ltp-accept03-after-memfd-create.txt, and memfd_create02 10/14 in target/oscomp/ltp-memfd-create02-basic.txt. inotify_init1/fanotify_init passed host tests, focused LTP accept03 17/23 in target/oscomp/ltp-accept03-after-fsnotify-fds.txt, and inotify_init1_01/inotify_init1_02 8/8 in target/oscomp/ltp-inotify-init1-basic.txt. Scoped fsopen/fspick/open_tree fd providers passed host mount/fspick dispatch tests and focused LTP accept03 20/23 in target/oscomp/ltp-accept03-after-mount-api-fds.txt. SCTP, RDS, pidfd_send_signal, and the heavy perf/bpf/memfd_secret fd-provider phases remain pending."
     }
   ],
   "risks": [
@@ -386,7 +401,7 @@
   ],
   "blockers": [
     "No active design document specifies full SCTP, full RDS, or TLS record encryption. The proposed phases are local syscall-surface witnesses, not full protocol stacks.",
-    "MOUNT_v1 explicitly defers fsopen/fspick/open_tree; implementing those fd providers needs a design update or a scoped exception.",
+    "MOUNT_v1 now allows scoped fsopen/fspick/open_tree fd providers, but still defers full fsconfig/fsmount/move_mount/mount_setattr semantics.",
     "fanotify permission events require OnAgent/FanotifyPerm plumbing from TXV3-DELEGATE-V1 and should not be bundled with a basic notification fd."
   ],
   "handoff": {
