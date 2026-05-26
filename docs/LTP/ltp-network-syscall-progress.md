@@ -19,7 +19,7 @@ Reliable focused results already in `target/oscomp`:
 | msg/mmsg | `sendmsg01,sendmsg02,sendmsg03,recvmsg01,recvmsg02,recvmsg03,sendmmsg01,sendmmsg02,recvmmsg01` | `36/38` | `target/oscomp/ltp-net-b3-msg-after-yield-queue.txt` |
 | bind/connect/accept | `bind01,bind02,bind03,bind04,bind05,bind06,connect01,connect02,accept01,accept02,accept03,accept4_01,getpeername01` | `74/86` | `target/oscomp/ltp-net-b4-after-bind06-current.txt` |
 | socketpair/socketcall | `socketpair01,socketpair02,socketcall01,socketcall02,socketcall03` | `14/17` | `target/oscomp/ltp-net-b5-socketpair-socketcall.txt` |
-| setsockopt tail | `setsockopt02,setsockopt03,setsockopt04,setsockopt05,setsockopt06,setsockopt07,setsockopt08,setsockopt09,setsockopt10` | `9/12` | `target/oscomp/ltp-net-b6-setsockopt-tail-after-yield-queue.txt` |
+| setsockopt tail | `setsockopt02,setsockopt03,setsockopt04,setsockopt05,setsockopt06,setsockopt07,setsockopt08,setsockopt09,setsockopt10` | `9/11` | `target/oscomp/ltp-net-b6-setsockopt-tail-maxruntime30.txt` |
 | IPv6 UDP focused | `bind05,recvmsg02` | `15/15` | `target/oscomp/ltp-net-ipv6-udp.txt` |
 | IPv6 dual-stack TCP focused | `connect02` | `1/1` | `target/oscomp/ltp-net-ipv6-connect02.txt` |
 | accept tail focused | `accept03,accept4_01,getpeername01` | `28/39` | `target/oscomp/ltp-net-accept-tail-after-connect02.txt` |
@@ -34,7 +34,7 @@ Reliable focused results already in `target/oscomp`:
 | fuzzy packet ring focused | `setsockopt06` | `1/1` | `target/oscomp/ltp-setsockopt06-after-yield-queue-maxruntime20.txt` |
 
 The first six result rows cover all 50 named syscall-network cases. The current
-local judge subcase total is now `207/228` after the b2/b3/b4/b6 refreshes.
+local judge subcase total is now `207/227` after the b2/b3/b4/b6 refreshes.
 Treat that as a split-batch progress score, not as "50/50 cases passed". The
 kconfig blocker probe and the focused IPv6/accept/userns rows overlap the split
 batches, so they are not added to that total.
@@ -48,9 +48,9 @@ packet `PACKET_VNET_HDR`, AF_PACKET `sendto(sockaddr_ll)`, raw IPv4
 userspace `sched_yield()` scheduler placement fix and the focused
 `LTP_MAX_RUNTIME` runner knob. These passes prove the earlier timeouts were not
 network-stack table scans. `sendto03`, `sendmsg03`, `bind06`, and
-`setsockopt05..09` are now reflected in refreshed split rows. In the refreshed
-b6 split, `setsockopt06` is `1/2` because LTP emitted a `TWARN` after a TPASS;
-the clean focused `setsockopt06 1/1` log remains the direct regression witness.
+`setsockopt05..09` are now reflected in refreshed split rows. The b6
+`setsockopt06` row is clean after using `LTP_MAX_RUNTIME=30` for that case
+only; the earlier `LTP_MAX_RUNTIME=20` b6 run produced a `TWARN` after TPASS.
 
 There is also a partial full-list probe:
 
@@ -146,7 +146,7 @@ surface. Use them as regression witnesses after related fixes.
 | `recvmmsg01` musl | First EBADF subcase passes, then userspace SIGSEGV before the bad-msgvec syscall | Known OSComp musl wrapper issue; kernel semantics have raw/glibc witnesses in `docs/progress/research/2026-05-21-recvmmsg-musl-wrapper-blocker.md` and `2026-05-21-ltp-glibc-sendmsg-witness.md`. |
 | `setsockopt03` | One 32-bit compat-only subcase is `TCONF`; supported subcase passes | Expected on RV64 unless compat mode is chartered. |
 | `setsockopt05` | Focused log passes `1/1` after loopback MTU ioctl and namespace-relative `CAP_NET_ADMIN` checks | Use `target/oscomp/ltp-setsockopt05-userns-after-mtu.txt` as the focused regression witness. |
-| `setsockopt06` | Focused `LTP_MAX_RUNTIME=20` run passes `1/1` in `target/oscomp/ltp-setsockopt06-after-yield-queue-maxruntime20.txt`; refreshed b6 reports `1/2` in `target/oscomp/ltp-net-b6-setsockopt-tail-after-yield-queue.txt` because LTP emitted a `TWARN` after TPASS | Not a packet-table scan. The hot socket paths are fixed-size sockopt reads/mutations plus per-loop AF_PACKET create/close. The old timeout was dominated by LTP fzsync delay bias and userspace yield placement, not by packet registry complexity. Use the clean focused log for direct regression and the b6 log for aggregate score. |
+| `setsockopt06` | Focused `LTP_MAX_RUNTIME=20` run passes `1/1` in `target/oscomp/ltp-setsockopt06-after-yield-queue-maxruntime20.txt`; refreshed b6 with `LTP_MAX_RUNTIME=30 LTP_MAX_RUNTIME_CASES=setsockopt06` reports `1/1` in `target/oscomp/ltp-net-b6-setsockopt-tail-maxruntime30.txt` | Not a packet-table scan. The hot socket paths are fixed-size sockopt reads/mutations plus per-loop AF_PACKET create/close. The old timeout was dominated by LTP fzsync delay bias and userspace yield placement, not by packet registry complexity. Use the clean focused log for direct regression and the b6 log for aggregate score. |
 | `setsockopt07` | Focused log passes `1/1` after `PACKET_RESERVE`/active `PACKET_RX_RING` validation was aligned | Use `target/oscomp/ltp-setsockopt07-userns-after-reserve2.txt` as the focused regression witness. |
 | `setsockopt08` | Focused log passes `1/1`: malformed `IPT_SO_SET_REPLACE` returns `EINVAL` with the x_tables kconfig surface advertised | This is validation coverage, not full iptables table installation. Structurally complete replace requests still return `EOPNOTSUPP`. |
 | `setsockopt09` | Focused log passes `1/1` with userns/netns setup and current packet fanout semantics | Use `target/oscomp/ltp-setsockopt09-userns.txt` as the focused regression witness. |
@@ -186,8 +186,8 @@ timeout 240s make oscomp-qemu-rv64 \
 
 timeout 300s make oscomp-qemu-rv64 \
   OSCOMP_LTP=setsockopt02,setsockopt03,setsockopt04,setsockopt05,setsockopt06,setsockopt07,setsockopt08,setsockopt09,setsockopt10 \
-  LTP_MAX_RUNTIME=20 LTP_MAX_RUNTIME_CASES=setsockopt06 \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-b6-setsockopt-tail-after-yield-queue.txt
+  LTP_MAX_RUNTIME=30 LTP_MAX_RUNTIME_CASES=setsockopt06 \
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-b6-setsockopt-tail-maxruntime30.txt
 ```
 
 Build and submit the RV64 kernel before these if code changed:

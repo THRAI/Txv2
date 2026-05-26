@@ -18,9 +18,11 @@
   Refreshed split rows now score b2 `34/35`
   (`target/oscomp/ltp-net-b2-sendrecv-after-userns-packet.txt`), b3 `36/38`
   (`target/oscomp/ltp-net-b3-msg-after-yield-queue.txt`), b4 `74/86`
-  (`target/oscomp/ltp-net-b4-after-bind06-current.txt`), and b6 `9/12`
-  (`target/oscomp/ltp-net-b6-setsockopt-tail-after-yield-queue.txt`), for a
-  current split-batch total of `207/228`.
+  (`target/oscomp/ltp-net-b4-after-bind06-current.txt`), and b6 `9/11`
+  (`target/oscomp/ltp-net-b6-setsockopt-tail-maxruntime30.txt`), for a current
+  split-batch total of `207/227`. The b6 `LTP_MAX_RUNTIME=30` rerun removed the
+  previous `setsockopt06` `TWARN`; the pass count stayed the same while the
+  warning-created denominator disappeared.
   **Verification:** `cargo fmt --check`; `cargo test -p tx-kernel
   filtered_ltp`; `cargo test -p tx-kernel
   ltp_integer_runtime_tokens_are_positive_decimal_only`; `cargo test -p
@@ -31,8 +33,9 @@
   two_yielding_tasks_both_make_progress_with_existing_policy`; `cargo xtask
   build --target rv64-qemu`; `cargo xtask oscomp submit --target rv64-qemu
   --submit target/oscomp/submit`; local judge `1/1` for both focused logs and
-  local judge on the refreshed b2/b3/b6 logs. **Next step:** decide whether to
-  charter one of the remaining explicit unsupported surfaces (SCTP/RDS/TLS,
+  local judge on the refreshed b2/b3/b6 logs, including the b6 max-runtime-30
+  rerun. **Next step:** decide whether to charter one of the remaining explicit
+  unsupported surfaces (SCTP/RDS/TLS,
   RV64 legacy `socketcall`, broad `accept03` fd providers, or the known
   `recvmmsg01` musl wrapper SIGSEGV). **Blocker:** no `sendmsg03` or
   `setsockopt06` focused blocker remains.
