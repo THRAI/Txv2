@@ -135,8 +135,8 @@ pub use structure::{
     SockFlags, SockShutdownCmd, SocketIdentity, SocketIoState, SocketKind, SocketLevelOptions,
     SocketOperationalEvidence, SocketOptionSet, SocketPayload, SocketProtocol, SocketReadiness,
     SocketRecvBytesOutcome, SocketTable, SocketType, SocketWaitCarriers, Takeable, TcpLevelOptions,
-    TcpState, UdpInner, UnixDatagramState, UnixPeerCred, UnixSocketPath, UnixStreamState,
-    UrgentEvent, ValidSocketType, UNIX_SOCKET_PATH_MAX,
+    TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState, UnixPeerCred, UnixSocketPath,
+    UnixStreamState, UrgentEvent, ValidSocketType, UNIX_SOCKET_PATH_MAX,
 };
 
 pub(crate) fn register_zones() -> Result<(), tx_substrate::zone::ZoneError> {

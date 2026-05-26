@@ -570,6 +570,26 @@ pub struct TcpLevelOptions {
     pub keepcnt: u32,
     pub cork: bool,
     pub window_clamp: u32,
+    pub tls_ulp: Option<TcpTlsUlpState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TcpTlsUlpState {
+    pub tx_configured: bool,
+}
+
+impl TcpTlsUlpState {
+    pub const fn attached() -> Self {
+        Self {
+            tx_configured: false,
+        }
+    }
+
+    pub const fn with_tx_config() -> Self {
+        Self {
+            tx_configured: true,
+        }
+    }
 }
 
 impl SocketOptionSet {
@@ -604,6 +624,7 @@ impl SocketOptionSet {
                 keepcnt: 9,
                 cork: false,
                 window_clamp: 0,
+                tls_ulp: None,
             },
         }
     }
@@ -639,6 +660,7 @@ impl SocketOptionSet {
                 keepcnt: 9,
                 cork: false,
                 window_clamp: 0,
+                tls_ulp: None,
             },
         }
     }

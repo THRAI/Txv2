@@ -66,7 +66,7 @@ CONFIG_NET_NS=y\n\
 CONFIG_USER_NS=y\n\
 CONFIG_NETFILTER_XT_MATCH_STATE=y\n\
 CONFIG_IP_NF_TARGET_REJECT=y\n\
-# CONFIG_TLS is not set\n";
+CONFIG_TLS=y\n";
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 const PROCFS_PID_OBJECT_STRIDE: u64 = 0x100;
 const PROCFS_PID_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x10000;
@@ -1513,7 +1513,7 @@ mod tests {
         assert_eq!(config, KERNEL_CONFIG_TEXT);
         assert!(config.contains("CONFIG_NET_NS=y\n"));
         assert!(config.contains("CONFIG_USER_NS=y\n"));
-        assert!(config.contains("# CONFIG_TLS is not set\n"));
+        assert!(config.contains("CONFIG_TLS=y\n"));
         assert!(config.contains("CONFIG_NETFILTER_XT_MATCH_STATE=y\n"));
         assert!(config.contains("CONFIG_IP_NF_TARGET_REJECT=y\n"));
     }

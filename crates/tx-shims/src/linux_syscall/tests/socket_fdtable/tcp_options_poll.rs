@@ -1,5 +1,11 @@
 use super::*;
 
+#[repr(C)]
+struct TestTlsCryptoInfo {
+    version: u16,
+    cipher_type: u16,
+}
+
 fn dispatch_bind_listen_getsockname_round_trips_inet_addr() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();
@@ -47,6 +53,136 @@ fn dispatch_bind_listen_getsockname_round_trips_inet_addr() {
     assert_eq!(u16::from_le_bytes([out[0], out[1]]), AF_INET);
     assert_eq!(u16::from_be_bytes([out[2], out[3]]), 49_101);
     assert_eq!(&out[4..8], &[127, 0, 0, 1]);
+}
+
+#[test]
+fn dispatch_tls_ulp_disconnect_rebind_listen_returns_einval() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let listener_fd = socket_stream(&ctx, SOCK_STREAM);
+    let listener_addr = sockaddr_in([127, 0, 0, 1], 49_118);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                listener_fd as u64,
+                listener_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(NR_LISTEN, [listener_fd as u64, 1, 0, 0, 0, 0], &ctx),
+        SyscallResult::Return(0)
+    );
+
+    let client_fd = socket_stream(&ctx, SOCK_STREAM);
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                client_fd as u64,
+                listener_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    let accepted_fd = match socket_req(NR_ACCEPT, [listener_fd as u64, 0, 0, 0, 0, 0], &ctx) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("accept failed: {other:?}"),
+    };
+
+    let ulp_name = *b"tls";
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                client_fd as u64,
+                IPPROTO_TCP as u64,
+                TCP_ULP as u64,
+                ulp_name.as_ptr() as u64,
+                ulp_name.len() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    let tls = TestTlsCryptoInfo {
+        version: 0x0303,
+        cipher_type: 51,
+    };
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                client_fd as u64,
+                SOL_TLS as u64,
+                TLS_TX as u64,
+                (&tls as *const TestTlsCryptoInfo) as u64,
+                core::mem::size_of::<TestTlsCryptoInfo>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let unspec_addr = [0u8; SOCKADDR_IN_BYTES as usize];
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                client_fd as u64,
+                unspec_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    let rebind_addr = sockaddr_in([127, 0, 0, 1], 49_119);
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                client_fd as u64,
+                rebind_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(NR_LISTEN, [client_fd as u64, 1, 0, 0, 0, 0], &ctx),
+        SyscallResult::Error(errno_to_i32(Errno::EINVAL))
+    );
+
+    for fd in [accepted_fd, client_fd, listener_fd] {
+        assert_eq!(
+            socket_req(NR_CLOSE, [fd as u64, 0, 0, 0, 0, 0], &ctx),
+            SyscallResult::Return(0)
+        );
+    }
 }
 
 #[test]

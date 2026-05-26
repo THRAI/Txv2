@@ -20,8 +20,8 @@ use tx_subsystems::net::{
     step_unix_socketpair_connect, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address,
     Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, LingerOption, PollMask, SendRecvFlags,
     SockAddrIn, SockAddrIn6, SockAddrLl, SockShutdownCmd, SocketHandleFlags, SocketIdentity,
-    SocketKind, SocketProtocol, SocketType, TcpState, UdpInner, UnixDatagramState, UnixPeerCred,
-    UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
+    SocketKind, SocketProtocol, SocketType, TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState,
+    UnixPeerCred, UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
 };
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::vfs::structure::OpenFileBacking;
@@ -1611,6 +1611,8 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.tcp.maxseg = size as u16);
             Ok(())
         }
+        (IPPROTO_TCP, TCP_ULP) => set_tcp_ulp(&socket, &payload, ctx, optval, optlen),
+        (SOL_TLS, TLS_TX) => set_tls_tx(&socket, &payload, ctx, optval, optlen),
         (SOL_NETLINK, NETLINK_EXT_ACK)
             if matches!(
                 socket.kind,
@@ -1695,6 +1697,70 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
+}
+
+fn set_tcp_ulp<'a>(
+    socket: &Cap<SocketIdentity>,
+    payload: &tx_subsystems::net::SocketOperationalEvidence,
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<(), Errno> {
+    if socket.kind != SocketKind::Tcp {
+        return Err(Errno::ENOPROTOOPT);
+    }
+    if !matches!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connected { .. })
+    ) {
+        return Err(Errno::ENOTCONN);
+    }
+    if optval == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if !(3..=16).contains(&optlen) {
+        return Err(Errno::EINVAL);
+    }
+
+    let len = optlen as usize;
+    let mut name = [0u8; 16];
+    bootstrap_copy_from_user(&ctx.aspace, &mut name[..len], optval)?;
+    let end = name[..len]
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(len);
+    if &name[..end] != b"tls" {
+        return Err(Errno::ENOENT);
+    }
+
+    payload.with_options_mut(|opts| opts.tcp.tls_ulp = Some(TcpTlsUlpState::attached()));
+    Ok(())
+}
+
+fn set_tls_tx<'a>(
+    socket: &Cap<SocketIdentity>,
+    payload: &tx_subsystems::net::SocketOperationalEvidence,
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<(), Errno> {
+    if socket.kind != SocketKind::Tcp {
+        return Err(Errno::ENOPROTOOPT);
+    }
+    if !payload.with_options(|opts| opts.tcp.tls_ulp.is_some()) {
+        return Err(Errno::ENOPROTOOPT);
+    }
+    if optval == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if optlen < 4 {
+        return Err(Errno::EINVAL);
+    }
+
+    let mut info = [0u8; 4];
+    bootstrap_copy_from_user(&ctx.aspace, &mut info, optval)?;
+    payload.with_options_mut(|opts| opts.tcp.tls_ulp = Some(TcpTlsUlpState::with_tx_config()));
+    Ok(())
 }
 
 fn set_ipv6_addrform<'a>(

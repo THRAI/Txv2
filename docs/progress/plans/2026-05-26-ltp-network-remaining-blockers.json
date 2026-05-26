@@ -1,0 +1,384 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-05-26-ltp-network-remaining-blockers",
+  "title": "Remaining LTP network syscall blockers",
+  "status": "active",
+  "created": "2026-05-26",
+  "updated": "2026-05-26",
+  "owner": "agent",
+  "summary": "Track the remaining explicit blockers after the LTP network syscall split: SCTP, RDS, TCP TLS ULP, RV64 socketcall interpretation, accept03 fd providers, and the recvmmsg01 musl wrapper SIGSEGV. The constrained TLS ULP setsockopt10 phase is complete and refreshed b6 to 10/11, moving the split total to 208/227.",
+  "scope": {
+    "in": [
+      "crates/tx-shims/src/linux_syscall/socket.rs",
+      "crates/tx-shims/src/linux_syscall/socket/",
+      "crates/tx-shims/src/linux_syscall/signal.rs",
+      "crates/tx-shims/src/linux_syscall/numbers.rs",
+      "crates/tx-subsystems/src/net/",
+      "crates/tx-subsystems/src/vfs/",
+      "crates/tx-subsystems/src/process/",
+      "crates/tx-subsystems/src/vm/",
+      "crates/tx-fs/src/procfs/mod.rs",
+      "docs/LTP/ltp-network-syscall-progress.md",
+      "docs/progress/STATUS.md"
+    ],
+    "out": [
+      "full-wire-sctp",
+      "full-external-rds",
+      "rv64-compat-socketcall",
+      "musl-prot-none-workaround",
+      "accept03-fake-fd-stubs"
+    ],
+    "write_sets": [
+      {
+        "owner": "network-worker",
+        "paths": [
+          "crates/tx-subsystems/src/net/",
+          "crates/tx-shims/src/linux_syscall/socket.rs",
+          "crates/tx-shims/src/linux_syscall/socket/"
+        ],
+        "notes": "Owns TLS ULP metadata, local-only SCTP/RDS protocol state, socket errno/order rules, and focused socket host tests."
+      },
+      {
+        "owner": "fd-provider-worker",
+        "paths": [
+          "crates/tx-shims/src/linux_syscall/signal.rs",
+          "crates/tx-shims/src/linux_syscall/fs_basic.rs",
+          "crates/tx-shims/src/linux_syscall/mod.rs",
+          "crates/tx-subsystems/src/process/",
+          "crates/tx-subsystems/src/vfs/",
+          "crates/tx-subsystems/src/vm/",
+          "crates/tx-fs/src/"
+        ],
+        "notes": "Owns principled fd providers for accept03, especially pidfd, memfd, inotify/fanotify notification fds, and new mount API fds."
+      },
+      {
+        "owner": "coordinator",
+        "paths": [
+          "docs/LTP/ltp-network-syscall-progress.md",
+          "docs/LTP/ltp-network-deferred.md",
+          "docs/progress/STATUS.md",
+          "docs/progress/plans/2026-05-26-ltp-network-remaining-blockers.json"
+        ],
+        "notes": "Owns progress docs, score interpretation, witness paths, and split-batch refreshes."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/INDEX.md",
+      "docs/Txv3/INDEX.md",
+      "docs/Txv3/04_SYSCALL_SHAPE_v1.md",
+      "docs/Txv3/05_DELEGATE_v1.md",
+      "docs/Txv3/06_EXECUTION_SCOPE_v1.md",
+      "docs/design/04_process-signals/PROCESS_v1.md",
+      "docs/design/04_process-signals/SIGNAL_v1.md",
+      "docs/design/04_process-signals/SIGNAL_ATTACHMENTS_v1.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/design/05_filesystem/VFS_CHECKS_V2.1.md",
+      "docs/design/05_filesystem/MOUNT_v1.md",
+      "docs/design/06_devices/DEVICE.md"
+    ],
+    "progress_refs": [
+      "docs/progress/research/2026-05-21-ltp-network-prep.md",
+      "docs/progress/research/2026-05-21-ltp-network-layered-plan.md",
+      "docs/progress/research/2026-05-21-recvmmsg-musl-wrapper-blocker.md",
+      "docs/progress/research/2026-05-21-ltp-glibc-sendmsg-witness.md",
+      "docs/progress/SYSCALL_STATUS.md"
+    ],
+    "external_refs": [
+      "docs/LTP/ltp-network-syscall-progress.md",
+      "docs/LTP/ltp-network-deferred.md",
+      "/home/msp/learning/rustOS/testsuits-for-oskernel/ltp-full-20240524/testcases/kernel/syscalls/accept/accept03.c",
+      "/home/msp/learning/rustOS/testsuits-for-oskernel/ltp-full-20240524/lib/tst_fd.c",
+      "/home/msp/learning/rustOS/testsuits-for-oskernel/ltp-full-20240524/testcases/kernel/syscalls/bind/bind04.c",
+      "/home/msp/learning/rustOS/testsuits-for-oskernel/ltp-full-20240524/testcases/kernel/syscalls/sendto/sendto02.c",
+      "/home/msp/learning/rustOS/testsuits-for-oskernel/ltp-full-20240524/testcases/kernel/syscalls/recvmsg/recvmsg03.c",
+      "/home/msp/learning/rustOS/testsuits-for-oskernel/ltp-full-20240524/testcases/kernel/syscalls/setsockopt/setsockopt10.c",
+      "/home/msp/learning/rustOS/testsuits-for-oskernel/ltp-full-20240524/testcases/kernel/syscalls/socketcall/socketcall01.c",
+      "/home/msp/learning/rustOS/testsuits-for-oskernel/ltp-full-20240524/testcases/kernel/syscalls/socketcall/socketcall02.c",
+      "/home/msp/learning/rustOS/testsuits-for-oskernel/ltp-full-20240524/testcases/kernel/syscalls/socketcall/socketcall03.c",
+      "/home/msp/learning/rustOS/testsuits-for-oskernel/ltp-full-20240524/testcases/kernel/syscalls/recvmmsg/recvmmsg01.c"
+    ]
+  },
+  "steps": [
+    {
+      "id": "audit-0",
+      "title": "Audit docs and LTP source for each remaining blocker",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "docs/Txv3/",
+        "docs/design/",
+        "docs/LTP/ltp-network-syscall-progress.md",
+        "docs/progress/research/"
+      ],
+      "verification": [
+        "Read the design/progress docs listed under context.design_docs and context.progress_refs.",
+        "Read LTP accept03/tst_fd, bind04, sendto02, recvmsg03, setsockopt10, socketcall01..03, and recvmmsg01 sources."
+      ],
+      "notes": "The audit classifies the blockers as: unsupported protocol surfaces (SCTP/RDS/TLS ULP), broader fd-provider work (accept03), non-RV64 ABI surface (socketcall), and non-kernel musl wrapper SIGSEGV (recvmmsg01 musl)."
+    },
+    {
+      "id": "policy-1-socketcall-recvmmsg",
+      "title": "Close the non-kernel or non-RV64 interpretation items",
+      "status": "pending",
+      "depends_on": [
+        "audit-0"
+      ],
+      "paths": [
+        "docs/LTP/ltp-network-syscall-progress.md",
+        "docs/progress/STATUS.md",
+        "crates/tx-shims/src/linux_syscall/numbers.rs",
+        "crates/tx-shims/src/linux_syscall/socket.rs"
+      ],
+      "verification": [
+        "Confirm no NR_socketcall exists for the RV64 generic syscall table.",
+        "Rerun or cite the glibc recvmmsg01 witness: timeout 180s cargo xtask oscomp qemu --target rv64-qemu --data target/oscomp/ltp-glibc-recvmmsg --boot-suite ltp-glibc.",
+        "Keep raw recvmmsg host tests passing: cargo test -p tx-shims --lib dispatch_sendmmsg_recvmmsg_error_order_matches_socket_abi -- --test-threads=1."
+      ],
+      "notes": "socketcall01..03 should remain architecture-surface blockers on RV64 unless a 32-bit compat ABI is chartered. recvmmsg01 musl should not be fixed in the kernel because the musl wrapper writes to LTP's PROT_NONE bad address before issuing the second syscall; use raw and glibc witnesses for kernel semantics."
+    },
+    {
+      "id": "accept03-0-inventory",
+      "title": "Refresh accept03 provider inventory and fd error contract",
+      "status": "pending",
+      "depends_on": [
+        "audit-0"
+      ],
+      "paths": [
+        "crates/tx-shims/src/linux_syscall/socket.rs",
+        "crates/tx-subsystems/src/vfs/",
+        "docs/LTP/ltp-network-syscall-progress.md"
+      ],
+      "verification": [
+        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=accept03 OSCOMP_OUT_RV=target/oscomp/ltp-accept03-provider-inventory.txt",
+        "python3 tools/oscomp-judge.py target/oscomp/ltp-accept03-provider-inventory.txt target/oscomp/testdata"
+      ],
+      "notes": "Read the exact TCONF list emitted by tst_fd.c before implementing providers. accept03 expects ENOTSOCK for real non-socket open files and EBADF for O_PATH/open_tree-style fds without a normal file object. First make sure accept(fd) classifies all existing OpenFileBacking values generically rather than by test name."
+    },
+    {
+      "id": "accept03-1-pidfd",
+      "title": "Implement pidfd_open and pidfd_send_signal as signal bus adapter fds",
+      "status": "pending",
+      "depends_on": [
+        "accept03-0-inventory"
+      ],
+      "paths": [
+        "crates/tx-shims/src/linux_syscall/signal.rs",
+        "crates/tx-shims/src/linux_syscall/mod.rs",
+        "crates/tx-subsystems/src/process/",
+        "crates/tx-subsystems/src/signal/",
+        "docs/progress/SYSCALL_STATUS.md"
+      ],
+      "verification": [
+        "cargo test -p tx-shims --lib pidfd",
+        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=accept03,pidfd_open01,pidfd_send_signal01 OSCOMP_OUT_RV=target/oscomp/ltp-pidfd-accept03.txt"
+      ],
+      "notes": "SIGNAL_v1 commits pidfd Phase 1: pidfd_open and pidfd_send_signal, with pidfd readability driven by ProcessIdentity exit publication. This is a principled accept03 provider and also removes two defined-but-undispatched syscall rows."
+    },
+    {
+      "id": "accept03-2-memfd",
+      "title": "Implement memfd_create using PageBacked anonymous RNodes",
+      "status": "pending",
+      "depends_on": [
+        "accept03-0-inventory"
+      ],
+      "paths": [
+        "crates/tx-shims/src/linux_syscall/fs_basic.rs",
+        "crates/tx-shims/src/linux_syscall/mod.rs",
+        "crates/tx-subsystems/src/vfs/",
+        "crates/tx-subsystems/src/vm/",
+        "crates/tx-subsystems/src/page_backed/"
+      ],
+      "verification": [
+        "cargo test -p tx-shims --lib memfd",
+        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=accept03,memfd_create01 OSCOMP_OUT_RV=target/oscomp/ltp-memfd-accept03.txt"
+      ],
+      "notes": "PAGE_BACKED_v1 explicitly models memfd as PageContainerKind::Anon with an RNode that has no path-namespace presence. Implement the fd as a normal page-backed file, not as an accept03-only descriptor. Seal/fcntl coverage can be staged after the basic fd/read/write/truncate/mmap shape lands."
+    },
+    {
+      "id": "accept03-3-notify-fds",
+      "title": "Implement basic inotify/fanotify notification fds without permission delegation",
+      "status": "pending",
+      "depends_on": [
+        "accept03-0-inventory"
+      ],
+      "paths": [
+        "crates/tx-shims/src/linux_syscall/fs_basic.rs",
+        "crates/tx-subsystems/src/vfs/",
+        "crates/tx-substrate/src/step/endpoint_kind.rs",
+        "docs/Txv3/05_DELEGATE_v1.md",
+        "docs/design/04_process-signals/SIGNAL_ATTACHMENTS_v1.md"
+      ],
+      "verification": [
+        "cargo test -p tx-shims --lib inotify",
+        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=accept03 OSCOMP_OUT_RV=target/oscomp/ltp-inotify-fanotify-accept03.txt"
+      ],
+      "notes": "SIGNAL_ATTACHMENTS_v1 already declares VFS fsnotify_port wires and SIGNAL_v1 says inotify/fanotify are future fd adapters. For accept03, first land real notification-instance fds whose read/poll/close semantics are coherent even with no marks. Full fanotify permission events must wait for the OnAgent/FanotifyPerm path in DELEGATE_v1 and should not be mixed into this small provider phase."
+    },
+    {
+      "id": "accept03-4-mount-api-fds",
+      "title": "Decide and stage fsopen/fspick/open_tree providers",
+      "status": "pending",
+      "depends_on": [
+        "accept03-0-inventory"
+      ],
+      "paths": [
+        "crates/tx-shims/src/linux_syscall/fs_basic.rs",
+        "crates/tx-subsystems/src/vfs/",
+        "crates/tx-subsystems/src/mount.rs",
+        "docs/design/05_filesystem/MOUNT_v1.md"
+      ],
+      "verification": [
+        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=accept03,fsopen01,fspick01,open_tree01 OSCOMP_OUT_RV=target/oscomp/ltp-new-mount-fds-accept03.txt"
+      ],
+      "notes": "MOUNT_v1 currently defers Linux 5.2 new mount API. If this is chartered for accept03, add a design update first, then implement fs_context and detached-mount fds with Linux-like lifecycle. open_tree may intentionally return EBADF in accept03 because LTP treats it like an fd without a regular struct file."
+    },
+    {
+      "id": "accept03-5-heavy-fds",
+      "title": "Keep perf_event_open, bpf, and memfd_secret behind explicit charters",
+      "status": "pending",
+      "depends_on": [
+        "accept03-0-inventory"
+      ],
+      "paths": [
+        "docs/LTP/ltp-network-syscall-progress.md",
+        "docs/progress/SYSCALL_STATUS.md"
+      ],
+      "verification": [
+        "Document the remaining TCONF lines after pidfd, memfd, and notify-fd phases."
+      ],
+      "notes": "SYSCALL_STATUS marks bpf/perf_event_open as out of scope v1, and memfd_secret is a VM/secret-memory feature rather than ordinary memfd. Do not add descriptor shells for these just to gain accept03 points."
+    },
+    {
+      "id": "tls-1-ulp-metadata",
+      "title": "Implement constrained TCP TLS ULP metadata for setsockopt10",
+      "status": "complete",
+      "depends_on": [
+        "audit-0"
+      ],
+      "paths": [
+        "crates/tx-shims/src/linux_syscall/socket.rs",
+        "crates/tx-subsystems/src/net/structure/types.rs",
+        "crates/tx-subsystems/src/net/execution/step_listen.rs",
+        "crates/tx-subsystems/src/net/execution/step_connect.rs",
+        "crates/tx-fs/src/procfs/mod.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems execution_listen_rejects_tcp_tls_ulp_without_clone --lib",
+        "cargo test -p tx-shims dispatch_tls_ulp_disconnect_rebind_listen_returns_einval --lib",
+        "cargo test -p tx-fs procfs_kernel_config_includes_ltp_required_surface --lib",
+        "timeout 240s make oscomp-qemu-rv64 OSCOMP_LTP=setsockopt10 OSCOMP_OUT_RV=target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt",
+        "python3 tools/oscomp-judge.py target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt target/oscomp/testdata"
+      ],
+      "notes": "Completed as constrained metadata support: setsockopt10 checks CONFIG_TLS, sets TCP_ULP to \"tls\", applies SOL_TLS/TLS_TX crypto info, disconnects with AF_UNSPEC, then expects listen() on a disconnected TLS socket to fail EINVAL. The kernel now advertises CONFIG_TLS=y after socket state tracks a TLS ULP context and step_listen rejects ULP-without-clone. This phase does not implement encrypted data records."
+    },
+    {
+      "id": "rds-1-local-seqpacket",
+      "title": "Implement local AF_RDS SOCK_SEQPACKET loopback sufficient for recvmsg03",
+      "status": "pending",
+      "depends_on": [
+        "audit-0"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/net/structure/types.rs",
+        "crates/tx-subsystems/src/net/structure/payload.rs",
+        "crates/tx-subsystems/src/net/execution/step_bind.rs",
+        "crates/tx-subsystems/src/net/execution/step_send.rs",
+        "crates/tx-subsystems/src/net/execution/step_recv.rs",
+        "crates/tx-shims/src/linux_syscall/socket.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib rds_loopback",
+        "cargo test -p tx-shims --lib recvmsg_rds_msg_namelen",
+        "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=recvmsg03 OSCOMP_OUT_RV=target/oscomp/ltp-recvmsg03-rds.txt"
+      ],
+      "notes": "recvmsg03 needs AF_RDS creation, bind on 127.0.0.1:4000/4001, sendmsg to a bound peer, recvmsg delivery, and msg_namelen clamped back to sizeof(sockaddr_in). This can be a local-only RDS provider with explicit external-network non-goals, but it still needs real queues and readiness rather than a test-name shortcut."
+    },
+    {
+      "id": "sctp-1-local-stream",
+      "title": "Implement local-only SCTP stream/seqpacket association semantics",
+      "status": "pending",
+      "depends_on": [
+        "audit-0"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/net/structure/types.rs",
+        "crates/tx-subsystems/src/net/structure/payload.rs",
+        "crates/tx-subsystems/src/net/execution/step_bind.rs",
+        "crates/tx-subsystems/src/net/execution/step_connect.rs",
+        "crates/tx-subsystems/src/net/execution/step_listen.rs",
+        "crates/tx-subsystems/src/net/execution/step_accept.rs",
+        "crates/tx-subsystems/src/net/execution/step_send.rs",
+        "crates/tx-subsystems/src/net/execution/step_recv.rs",
+        "crates/tx-shims/src/linux_syscall/socket.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib sctp_loopback",
+        "cargo test -p tx-shims --lib sendto_sctp_error_order",
+        "timeout 240s make oscomp-qemu-rv64 OSCOMP_LTP=sendto02,bind04 OSCOMP_OUT_RV=target/oscomp/ltp-sctp-sendto02-bind04.txt"
+      ],
+      "notes": "bind04 exercises SCTP as an IPv4/IPv6 stream protocol with listen/connect/accept/read/write local communication; sendto02 only checks invalid user buffer error ordering. Full SCTP chunks, multihoming, wire format, and external NIC behavior are much larger. If this phase is approved, make the boundary explicit as local-only SCTP association semantics."
+    },
+    {
+      "id": "score-1-refresh",
+      "title": "Refresh focused and split-batch witnesses after each landed phase",
+      "status": "pending",
+      "depends_on": [
+        "policy-1-socketcall-recvmmsg",
+        "accept03-1-pidfd",
+        "accept03-2-memfd",
+        "accept03-3-notify-fds",
+        "tls-1-ulp-metadata",
+        "rds-1-local-seqpacket",
+        "sctp-1-local-stream"
+      ],
+      "paths": [
+        "docs/LTP/ltp-network-syscall-progress.md",
+        "docs/progress/STATUS.md"
+      ],
+      "verification": [
+        "timeout 360s make oscomp-qemu-rv64 OSCOMP_LTP=send01,send02,sendto01,sendto02,sendto03,recv01,recvfrom01 OSCOMP_OUT_RV=target/oscomp/ltp-net-b2-after-remaining-blockers.txt",
+        "timeout 240s make oscomp-qemu-rv64 OSCOMP_LTP=sendmsg01,sendmsg02,sendmsg03,recvmsg01,recvmsg02,recvmsg03,sendmmsg01,sendmmsg02,recvmmsg01 LTP_MAX_RUNTIME=10 LTP_MAX_RUNTIME_CASES=sendmsg03 OSCOMP_OUT_RV=target/oscomp/ltp-net-b3-after-remaining-blockers.txt",
+        "timeout 360s make oscomp-qemu-rv64 OSCOMP_LTP=bind01,bind02,bind03,bind04,bind05,bind06,connect01,connect02,accept01,accept02,accept03,accept4_01,getpeername01 OSCOMP_OUT_RV=target/oscomp/ltp-net-b4-after-remaining-blockers.txt",
+        "timeout 300s make oscomp-qemu-rv64 OSCOMP_LTP=setsockopt02,setsockopt03,setsockopt04,setsockopt05,setsockopt06,setsockopt07,setsockopt08,setsockopt09,setsockopt10 LTP_MAX_RUNTIME=30 LTP_MAX_RUNTIME_CASES=setsockopt06 OSCOMP_OUT_RV=target/oscomp/ltp-net-b6-after-remaining-blockers.txt",
+        "cargo xtask progress validate"
+      ],
+      "notes": "Do not wait for all phases to land before recording movement. Each phase should update the focused witness, the relevant split row, and the remaining blocker interpretation."
+    }
+  ],
+  "verification": [
+    {
+      "command": "docs/LTP and docs/progress audit",
+      "status": "passed",
+      "notes": "Read current network progress, recvmmsg musl/glibc research, syscall status, and related Txv3/VFS/Process/PageBacked/Mount/Device design docs."
+    },
+    {
+      "command": "LTP source audit",
+      "status": "passed",
+      "notes": "Read accept03/tst_fd, bind04, sendto02, recvmsg03, setsockopt10, socketcall01..03, and recvmmsg01 sources from the local LTP tree."
+    },
+    {
+      "command": "Implementation verification",
+      "status": "passed",
+      "notes": "TLS ULP metadata phase passed host tests, focused LTP setsockopt10 1/1 in target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt, and refreshed b6 10/11 in target/oscomp/ltp-net-b6-after-tls-ulp.txt. SCTP, RDS, and fd-provider phases remain pending."
+    }
+  ],
+  "risks": [
+    "SCTP and RDS can become misleading if implemented as descriptor shells. Any local-only provider must have explicit protocol-state, queue, readiness, and errno behavior, plus documented external-network non-goals.",
+    "TLS ULP must not flip /proc/config.gz to CONFIG_TLS=y until TCP_ULP and SOL_TLS/TLS_TX state exists; otherwise setsockopt10 would pass the kconfig gate and fail as TBROK.",
+    "accept03 has high score value but pulls in non-network subsystems. Keep provider phases independent and do not let them change socket accept behavior beyond generic non-socket fd classification.",
+    "perf_event_open and bpf are marked out of scope v1 in SYSCALL_STATUS; implementing fake fds would distort later heavy-batch work.",
+    "socketcall is absent from the Linux RV64 generic ABI. Adding it would be a compatibility-ABI project, not a network stack fix.",
+    "recvmmsg01 musl faults in userspace before syscall entry; kernel fixes would either be ineffective or would weaken VM protection."
+  ],
+  "blockers": [
+    "No active design document specifies full SCTP, full RDS, or TLS record encryption. The proposed phases are local syscall-surface witnesses, not full protocol stacks.",
+    "MOUNT_v1 explicitly defers fsopen/fspick/open_tree; implementing those fd providers needs a design update or a scoped exception.",
+    "fanotify permission events require OnAgent/FanotifyPerm plumbing from TXV3-DELEGATE-V1 and should not be bundled with a basic notification fd."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

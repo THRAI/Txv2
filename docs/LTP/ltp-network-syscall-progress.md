@@ -19,7 +19,7 @@ Reliable focused results already in `target/oscomp`:
 | msg/mmsg | `sendmsg01,sendmsg02,sendmsg03,recvmsg01,recvmsg02,recvmsg03,sendmmsg01,sendmmsg02,recvmmsg01` | `36/38` | `target/oscomp/ltp-net-b3-msg-after-yield-queue.txt` |
 | bind/connect/accept | `bind01,bind02,bind03,bind04,bind05,bind06,connect01,connect02,accept01,accept02,accept03,accept4_01,getpeername01` | `74/86` | `target/oscomp/ltp-net-b4-after-bind06-current.txt` |
 | socketpair/socketcall | `socketpair01,socketpair02,socketcall01,socketcall02,socketcall03` | `14/17` | `target/oscomp/ltp-net-b5-socketpair-socketcall.txt` |
-| setsockopt tail | `setsockopt02,setsockopt03,setsockopt04,setsockopt05,setsockopt06,setsockopt07,setsockopt08,setsockopt09,setsockopt10` | `9/11` | `target/oscomp/ltp-net-b6-setsockopt-tail-maxruntime30.txt` |
+| setsockopt tail | `setsockopt02,setsockopt03,setsockopt04,setsockopt05,setsockopt06,setsockopt07,setsockopt08,setsockopt09,setsockopt10` | `10/11` | `target/oscomp/ltp-net-b6-after-tls-ulp.txt` |
 | IPv6 UDP focused | `bind05,recvmsg02` | `15/15` | `target/oscomp/ltp-net-ipv6-udp.txt` |
 | IPv6 dual-stack TCP focused | `connect02` | `1/1` | `target/oscomp/ltp-net-ipv6-connect02.txt` |
 | accept tail focused | `accept03,accept4_01,getpeername01` | `28/39` | `target/oscomp/ltp-net-accept-tail-after-connect02.txt` |
@@ -32,9 +32,10 @@ Reliable focused results already in `target/oscomp`:
 | userns packet bind race focused | `bind06` | `1/1` | `target/oscomp/ltp-bind06-current330.txt` |
 | fuzzy raw send focused | `sendmsg03` | `1/1` | `target/oscomp/ltp-sendmsg03-after-yield-queue-maxruntime10.txt` |
 | fuzzy packet ring focused | `setsockopt06` | `1/1` | `target/oscomp/ltp-setsockopt06-after-yield-queue-maxruntime20.txt` |
+| TCP TLS ULP focused | `setsockopt10` | `1/1` | `target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt` |
 
 The first six result rows cover all 50 named syscall-network cases. The current
-local judge subcase total is now `207/227` after the b2/b3/b4/b6 refreshes.
+local judge subcase total is now `208/227` after the b2/b3/b4/b6 refreshes.
 Treat that as a split-batch progress score, not as "50/50 cases passed". The
 kconfig blocker probe and the focused IPv6/accept/userns rows overlap the split
 batches, so they are not added to that total.
@@ -48,9 +49,10 @@ packet `PACKET_VNET_HDR`, AF_PACKET `sendto(sockaddr_ll)`, raw IPv4
 userspace `sched_yield()` scheduler placement fix and the focused
 `LTP_MAX_RUNTIME` runner knob. These passes prove the earlier timeouts were not
 network-stack table scans. `sendto03`, `sendmsg03`, `bind06`, and
-`setsockopt05..09` are now reflected in refreshed split rows. The b6
-`setsockopt06` row is clean after using `LTP_MAX_RUNTIME=30` for that case
-only; the earlier `LTP_MAX_RUNTIME=20` b6 run produced a `TWARN` after TPASS.
+`setsockopt05..10` are now reflected in refreshed split rows. The b6
+`setsockopt06` row remains clean after using `LTP_MAX_RUNTIME=30` for that
+case only; the earlier `LTP_MAX_RUNTIME=20` b6 run produced a `TWARN` after
+TPASS.
 
 There is also a partial full-list probe:
 
@@ -90,7 +92,7 @@ above:
 - IPv6 dual-stack TCP: focused `connect02` passes through IPv4 client to IPv6
   wildcard listener, `IPV6_ADDRFORM`, and `connect(AF_UNSPEC)` reset/rebind
 - packet/socket options: `setsockopt02`, `setsockopt04`, `setsockopt05`,
-  `setsockopt06`, `setsockopt07`, `setsockopt09`
+  `setsockopt06`, `setsockopt07`, `setsockopt09`, `setsockopt10`
 - legacy netfilter validation: `setsockopt08` malformed
   `IPT_SO_SET_REPLACE` returns `EINVAL`
 
@@ -126,7 +128,8 @@ surface. Use them as regression witnesses after related fixes.
 - LTP can now parse `/boot/config-6.1.0-txkernel`. The config exposes
   `CONFIG_NET_NS=y`, `CONFIG_USER_NS=y`, and the minimal legacy x_tables
   match/target surface needed to validate malformed `IPT_SO_SET_REPLACE`.
-  Unsupported TLS remains not set.
+  It also exposes `CONFIG_TLS=y` after the constrained TCP TLS ULP metadata
+  path landed for `setsockopt10`.
 
 ## Known Gaps And Interpretation
 
@@ -150,7 +153,7 @@ surface. Use them as regression witnesses after related fixes.
 | `setsockopt07` | Focused log passes `1/1` after `PACKET_RESERVE`/active `PACKET_RX_RING` validation was aligned | Use `target/oscomp/ltp-setsockopt07-userns-after-reserve2.txt` as the focused regression witness. |
 | `setsockopt08` | Focused log passes `1/1`: malformed `IPT_SO_SET_REPLACE` returns `EINVAL` with the x_tables kconfig surface advertised | This is validation coverage, not full iptables table installation. Structurally complete replace requests still return `EOPNOTSUPP`. |
 | `setsockopt09` | Focused log passes `1/1` with userns/netns setup and current packet fanout semantics | Use `target/oscomp/ltp-setsockopt09-userns.txt` as the focused regression witness. |
-| `setsockopt10` | Parse kernel config, then `TCONF` because `CONFIG_TLS` is not satisfied | TLS ULP is not implemented; do not fake it. |
+| `setsockopt10` | Focused log passes `1/1`, and refreshed b6 reports `setsockopt10 1/1`: `TCP_ULP` accepts `"tls"` on connected TCP, `SOL_TLS/TLS_TX` records TX setup metadata, `connect(AF_UNSPEC)` preserves the ULP state, and `listen()` returns `EINVAL` after rebind | This is the Linux CVE-2023-0461 guard needed by LTP, not TLS record encryption. Use `target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt` as the focused regression witness and `target/oscomp/ltp-net-b6-after-tls-ulp.txt` for aggregate score. |
 | `socketcall01..03` | RV64 has no legacy `socketcall` syscall | Architecture surface; expect unsupported/TCONF-style behavior, not an RV64 kernel bug. |
 
 ## Recommended Next Runs
@@ -165,7 +168,6 @@ now mostly explicit unsupported or broader non-network surfaces:
 
 - `sendto02`: SCTP unsupported.
 - `recvmsg03`: RDS unsupported.
-- `setsockopt10`: TLS ULP unsupported by config and implementation.
 - `socketcall01..03`: legacy socketcall is not an RV64 syscall surface.
 - `accept03`: broad descriptor providers such as pidfd/fanotify/inotify/perf,
   bpf, new mount API, and memfd are outside TCP accept dataplane.
@@ -187,7 +189,7 @@ timeout 240s make oscomp-qemu-rv64 \
 timeout 300s make oscomp-qemu-rv64 \
   OSCOMP_LTP=setsockopt02,setsockopt03,setsockopt04,setsockopt05,setsockopt06,setsockopt07,setsockopt08,setsockopt09,setsockopt10 \
   LTP_MAX_RUNTIME=30 LTP_MAX_RUNTIME_CASES=setsockopt06 \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-b6-setsockopt-tail-maxruntime30.txt
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-b6-after-tls-ulp.txt
 ```
 
 Build and submit the RV64 kernel before these if code changed:

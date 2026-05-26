@@ -1,3 +1,48 @@
+- 2026-05-26 **Landed the constrained TCP TLS ULP path for LTP
+  `setsockopt10`.** TCP sockets now track a TLS ULP metadata state when
+  `setsockopt(SOL_TCP/TCP_ULP, "tls")` is applied to a connected TCP socket,
+  accept `SOL_TLS/TLS_TX` crypto-info setup as metadata, preserve the ULP state
+  across `connect(AF_UNSPEC)`, and reject `listen()` with `EINVAL` when a
+  disconnected TCP socket still carries a TLS ULP without clone support.
+  `/boot/config-6.1.0-txkernel` now advertises `CONFIG_TLS=y` only after that
+  state and `listen()` rejection exist. This is intentionally not TLS record
+  encryption or a full kTLS data path. **Verification:** `cargo fmt --check`;
+  `cargo test -p tx-subsystems
+  execution_listen_rejects_tcp_tls_ulp_without_clone --lib`; `cargo test -p
+  tx-shims dispatch_tls_ulp_disconnect_rebind_listen_returns_einval --lib`;
+  `cargo test -p tx-fs
+  procfs_kernel_config_includes_ltp_required_surface --lib`; `cargo xtask
+  build --target rv64-qemu`; `cargo xtask oscomp submit --target rv64-qemu
+  --submit target/oscomp/submit`; focused LTP `setsockopt10 1/1` in
+  `target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt`; refreshed b6
+  setsockopt split `10/11` in `target/oscomp/ltp-net-b6-after-tls-ulp.txt`,
+  moving the split-batch total to `208/227`. **Next step:** choose between
+  `accept03` fd providers, local-only RDS, or local-only SCTP for the next
+  official-score-effective blocker.
+  **Blocker:** full TLS record encryption, SCTP, RDS, broad fd providers, RV64
+  `socketcall`, and the `recvmmsg01` musl wrapper fault remain separate
+  surfaces.
+
+- 2026-05-26 **Planned the remaining explicit LTP network blockers after the
+  clean `setsockopt06` witness.** Committed the small witness-doc update as
+  `6c2dc69c` (`docs: record clean setsockopt06 b6 witness`) and added the
+  proposed plan at
+  `docs/progress/plans/2026-05-26-ltp-network-remaining-blockers.json`.
+  The docs/LTP/source audit classifies the remaining items as distinct
+  surfaces: SCTP/RDS/TLS ULP need explicit network protocol-state work,
+  `accept03` needs principled non-socket fd providers rather than accept-path
+  changes, `socketcall01..03` are not RV64 generic ABI syscalls, and
+  `recvmmsg01` musl still faults in userspace before the bad-msgvec syscall
+  while raw/glibc witnesses validate kernel semantics. **Verification:** plan
+  file written from active Txv3/VFS/Process/PageBacked/Mount/Device docs and
+  local LTP source audit; implementation commands not run because this is a
+  planning step. **Next step:** choose the first implementation lane; the
+  recommended honest score path is pidfd/memfd/inotify-style `accept03`
+  providers or the constrained TCP TLS ULP `setsockopt10` lane before
+  chartering local-only SCTP/RDS. **Blocker:** full SCTP, full RDS, TLS record
+  encryption, BPF/perf fds, and RV64 compat `socketcall` remain outside the
+  current narrow network-syscall surface.
+
 - 2026-05-26 **Finished the `sendmsg03`/`setsockopt06` fuzzy timeout fix and
   refreshed the moving network splits.**
   Root cause was not network-stack linear scanning: `sendmsg03`'s raw

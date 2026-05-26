@@ -4,7 +4,9 @@ use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_listen_target;
 use crate::net::execution::step_bind::table_error_to_errno;
 use crate::net::execution::SOMAXCONN_STAGING;
-use crate::net::structure::{SocketIdentity, SocketProtocol, TcpState, UnixStreamState};
+use crate::net::structure::{
+    SocketIdentity, SocketKind, SocketProtocol, TcpState, UnixStreamState,
+};
 
 pub fn step_listen(
     socket: &Cap<SocketIdentity>,
@@ -26,7 +28,10 @@ pub fn step_listen(
     let Some(payload) = socket.acquire_operational() else {
         return StepOutcome::Err(Errno::ENOTCONN);
     };
-    if socket.kind == crate::net::structure::SocketKind::Tcp {
+    if socket.kind == SocketKind::Tcp && payload.with_options(|opts| opts.tcp.tls_ulp.is_some()) {
+        return StepOutcome::Err(Errno::EINVAL);
+    }
+    if socket.kind == SocketKind::Tcp {
         if let Err(error) = payload
             .socket_table()
             .listen_tcp(witness.local, socket.clone())
@@ -53,7 +58,7 @@ pub fn step_listen(
         _ => false,
     });
     if listening {
-        if socket.kind == crate::net::structure::SocketKind::Tcp {
+        if socket.kind == SocketKind::Tcp {
             if let Some(raw_tcp) = payload.raw_tcp_socket() {
                 let _ = raw_tcp.listen_endpoint(witness.local);
             }

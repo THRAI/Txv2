@@ -2,8 +2,8 @@ use super::structure::{
     registry, AcceptWireSet, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address,
     Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, PollMask, ProtocolNumber, RawIcmpState,
     RecvWireSet, SendRecvFlags, SendWireSet, SockAddrIn, SockAddrIn6, SockShutdownCmd,
-    SocketIdentity, SocketKind, SocketOptionSet, SocketProtocol, SocketType, TcpState, UdpInner,
-    ValidSocketType,
+    SocketIdentity, SocketKind, SocketOptionSet, SocketProtocol, SocketType, TcpState,
+    TcpTlsUlpState, UdpInner, ValidSocketType,
 };
 use crate::execution::{Errno, WaitToken};
 use crate::net::checks::require::{
