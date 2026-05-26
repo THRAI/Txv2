@@ -212,9 +212,9 @@ struct BlockingFs;
 
 // Trait impls so `BlockingFs` satisfies the `FsOps` /
 // `FsPageBacking` fields on `MountPayload`. The interesting case
-// is `fetch_page`: a `Blocked(token)` shape has no equivalent in
-// `NoProgress` outcomes, so the closest analog `Err(EAGAIN)` is
-// surfaced here — that gives walker-driven tests a non-Done
+// is `fetch_page`: a carrier wait has no equivalent in this
+// one-shot `NoProgress` stub, so the closest analog `Err(EAGAIN)`
+// is surfaced here — that gives walker-driven tests a non-Done
 // deterministic result. The page-backed unit tests below all
 // drive `BlockingFs` through `materialize_page` (which reads its
 // own `fs_page_backing` route), so this trait body is
@@ -733,10 +733,7 @@ fn pagebacked_step_write_rejects_device_backing() {
     );
     let of = open_file_for_pc(&pc);
 
-    assert_eq!(
-        step_write(&pc, &of, 8, &guard),
-        V3Out::Err(Errno::EINVAL.into())
-    );
+    assert_eq!(step_write(&pc, &of, 8, &guard), V3Out::Err(Errno::EINVAL));
     assert_eq!(of.offset(), 0);
     assert_eq!(pc.resident_pages(), 0);
 }
@@ -840,7 +837,7 @@ mod step_op_wraps {
             len: 8,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        assert_eq!(op.step(&mut ctx), V3Out::Err(Errno::EINVAL.into()));
+        assert_eq!(op.step(&mut ctx), V3Out::Err(Errno::EINVAL));
         assert_eq!(of.offset(), 0);
         assert_eq!(pc.resident_pages(), 0);
     }

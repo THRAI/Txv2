@@ -29,9 +29,9 @@ entrypoint wiring).
 _Counts read from `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}`._
 _Run `cargo xtask syscall-status --regen` to refresh; `--check` to lint in CI._
 
-- **`NR_*` defined:** 159
-- **Dispatched (has a match arm):** 157
-- **Defined but not dispatched:** 2 — see list below
+- **`NR_*` defined:** 194
+- **Dispatched (has a match arm):** 191
+- **Defined but not dispatched:** 3 — see list below
 
 #### Defined but not dispatched
 
@@ -41,6 +41,7 @@ These syscalls have a `pub const NR_*` in `numbers.rs` but no match arm in `disp
 |---|---:|---|
 | `NR_PIDFD_OPEN` | 434 | `pidfd_open(pid, flags)` — Linux RV64. |
 | `NR_PIDFD_SEND_SIGNAL` | 424 | `pidfd_send_signal(pidfd, sig, info, flags)` — Linux RV64. |
+| `NR_PSELECT6_TIME64` | 413 | `pselect6_time64(...)`. Linux generic ABI `__NR_pselect6_time64 = 413`. |
 
 <!-- END AUTOGEN: syscall-table -->
 
@@ -242,26 +243,20 @@ overwritten by the next `sync`. The lint variant
 
 ### Counts (from dispatch table)
 
-- `pub const NR_*` in numbers.rs: **159**
-- dispatched in mod.rs: **149** (of which async: 41, likely-stub: 0)
-- defined but not dispatched: **10**
+- `pub const NR_*` in numbers.rs: **194**
+- dispatched in mod.rs: **190** (of which async: 58, likely-stub: 0)
+- defined but not dispatched: **4**
 
-### Defined in `numbers.rs` but no dispatch arm (10)
+### Defined in `numbers.rs` but no dispatch arm (4)
 
 These have a syscall number constant but no match arm in `mod.rs`. Either wire them up or remove the constant.
 
-- `NR_EPOLL_WAIT` (nr=232)
-- `NR_GETPEERNAME` (nr=205)
-- `NR_GETSOCKOPT` (nr=209)
 - `NR_IO_URING_ENTER` (nr=426)
 - `NR_PIDFD_OPEN` (nr=434)
 - `NR_PIDFD_SEND_SIGNAL` (nr=424)
-- `NR_SEMTIMEDOP` (nr=192)
-- `NR_SHUTDOWN` (nr=210)
-- `NR_SIGNALFD` (nr=282)
-- `NR_SOCKETPAIR` (nr=199)
+- `NR_PSELECT6` (nr=72)
 
-### Dispatched syscalls (149) — name → handler
+### Dispatched syscalls (190) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -272,14 +267,15 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 2 | `NR_IO_SUBMIT` | `sys_io_submit` | sync |
 | 4 | `NR_IO_GETEVENTS` | `sys_io_getevents` | async |
 | 17 | `NR_GETCWD` | `sys_getcwd` | sync |
+| 19 | `NR_EVENTFD2` | `sys_eventfd2` | sync |
 | 20 | `NR_EPOLL_CREATE1` | `sys_epoll_create1` | sync |
 | 21 | `NR_EPOLL_CTL` | `sys_epoll_ctl` | sync |
-| 22 | `NR_EPOLL_PWAIT` | `sys_epoll_wait` | sync |
+| 22 | `NR_EPOLL_PWAIT` | `sys_epoll_wait` | async |
 | 23 | `NR_DUP` | `sys_dup` | sync |
 | 24 | `NR_DUP3` | `sys_dup3` | sync |
 | 25 | `NR_FCNTL` | `sys_fcntl` | sync |
 | 29 | `NR_IOCTL` | `sys_ioctl` | sync |
-| 32 | `NR_FLOCK` | `sys_flock` | sync |
+| 32 | `NR_FLOCK` | `sys_flock` | async |
 | 33 | `NR_MKNODAT` | `sys_mknodat` | async |
 | 34 | `NR_MKDIRAT` | `sys_mkdirat` | async |
 | 35 | `NR_UNLINKAT` | `sys_unlinkat` | async |
@@ -287,47 +283,65 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 37 | `NR_LINKAT` | `sys_linkat` | async |
 | 39 | `NR_UMOUNT2` | `sys_umount2` | async |
 | 40 | `NR_MOUNT` | `sys_mount` | async |
-| 43 | `NR_STATFS` | `sys_statfs` | sync |
-| 44 | `NR_FSTATFS` | `sys_fstatfs` | sync |
+| 43 | `NR_STATFS` | `sys_statfs` | async |
+| 44 | `NR_FSTATFS` | `sys_fstatfs` | async |
 | 45 | `NR_TRUNCATE` | `sys_truncate` | async |
 | 46 | `NR_FTRUNCATE` | `sys_ftruncate` | async |
+| 47 | `NR_FALLOCATE` | `sys_fallocate` | sync |
 | 48 | `NR_FACCESSAT` | `sys_faccessat` | sync |
 | 49 | `NR_CHDIR` | `sys_chdir` | async |
 | 50 | `NR_FCHDIR` | `sys_fchdir` | async |
+| 52 | `NR_FCHMOD` | `sys_fchmod` | sync |
 | 53 | `NR_FCHMODAT` | `sys_fchmodat` | sync |
 | 54 | `NR_FCHOWNAT` | `sys_fchownat` | sync |
 | 56 | `NR_OPENAT` | `sys_openat` | async |
-| 57 | `NR_CLOSE` | `sys_close` | sync |
+| 57 | `NR_CLOSE` | `sys_close` | async |
 | 59 | `NR_PIPE2` | `sys_pipe2` | sync |
-| 61 | `NR_GETDENTS64` | `sys_getdents64` | sync |
+| 61 | `NR_GETDENTS64` | `sys_getdents64` | async |
 | 62 | `NR_LSEEK` | `sys_lseek` | sync |
 | 63 | `NR_READ` | `sys_read` | sync |
 | 64 | `NR_WRITE` | `sys_write` | sync |
 | 65 | `NR_READV` | `sys_readv` | async |
 | 66 | `NR_WRITEV` | `sys_writev` | async |
 | 67 | `NR_PREAD64` | `sys_pread64` | async |
+| 68 | `NR_PWRITE64` | `sys_pwrite64` | async |
+| 69 | `NR_PREADV` | `sys_preadv` | async |
+| 70 | `NR_PWRITEV` | `sys_pwritev` | async |
 | 71 | `NR_SENDFILE64` | `sys_sendfile64` | async |
 | 73 | `NR_PPOLL` | `sys_ppoll` | async |
 | 74 | `NR_SIGNALFD4` | `sys_signalfd4` | sync |
+| 76 | `NR_SPLICE` | `sys_splice` | sync |
 | 78 | `NR_READLINKAT` | `sys_readlinkat` | async |
 | 79 | `NR_NEWFSTATAT` | `sys_newfstatat` | async |
 | 80 | `NR_FSTAT` | `sys_fstat` | sync |
 | 81 | `NR_GETPGRP` | `sys_getpgrp` | sync |
-| 81 | `NR_SYNC` | `sys_sync` | sync |
-| 82 | `NR_FSYNC` | `sys_fsync` | sync |
-| 83 | `NR_FDATASYNC` | `sys_fdatasync` | sync |
+| 81 | `NR_SYNC` | `sys_sync` | async |
+| 82 | `NR_FSYNC` | `sys_fsync` | async |
+| 83 | `NR_FDATASYNC` | `sys_fdatasync` | async |
+| 84 | `NR_SYNC_FILE_RANGE` | `sys_sync_file_range` | sync |
 | 85 | `NR_TIMERFD_CREATE` | `sys_timerfd_create` | sync |
 | 86 | `NR_TIMERFD_SETTIME` | `sys_timerfd_settime` | sync |
 | 87 | `NR_TIMERFD_GETTIME` | `sys_timerfd_gettime` | sync |
 | 88 | `NR_UTIMENSAT` | `sys_utimensat` | sync |
+| 90 | `NR_CAPGET` | `sys_capget` | sync |
+| 91 | `NR_CAPSET` | `sys_capset` | sync |
 | 93 | `NR_EXIT` | `sys_exit` | sync |
 | 94 | `NR_EXIT_GROUP` | `sys_exit_group` | sync |
 | 96 | `NR_SET_TID_ADDRESS` | `sys_set_tid_address` | sync |
+| 97 | `NR_UNSHARE` | `sys_unshare` | sync |
 | 98 | `NR_FUTEX` | `sys_futex` | async |
 | 99 | `NR_SET_ROBUST_LIST` | `sys_set_robust_list` | sync |
 | 100 | `NR_GET_ROBUST_LIST` | `sys_get_robust_list` | sync |
 | 101 | `NR_NANOSLEEP` | `sys_nanosleep` | async |
+| 102 | `NR_GETITIMER` | `sys_getitimer` | sync |
+| 103 | `NR_SETITIMER` | `sys_setitimer` | sync |
+| 107 | `NR_TIMER_CREATE` | `sys_timer_create` | sync |
+| 108 | `NR_TIMER_GETTIME` | `sys_timer_gettime` | sync |
+| 109 | `NR_TIMER_GETOVERRUN` | `sys_timer_getoverrun` | sync |
+| 110 | `NR_TIMER_SETTIME` | `sys_timer_settime` | sync |
+| 111 | `NR_TIMER_DELETE` | `sys_timer_delete` | sync |
 | 113 | `NR_CLOCK_GETTIME` | `sys_clock_gettime` | sync |
+| 114 | `NR_CLOCK_GETRES` | `sys_clock_getres` | sync |
 | 115 | `NR_CLOCK_NANOSLEEP` | `sys_clock_nanosleep` | async |
 | 116 | `NR_SYSLOG` | `sys_syslog` | sync |
 | 119 | `NR_SCHED_SETSCHEDULER` | `sys_sched_setscheduler` | sync |
@@ -357,7 +371,10 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 155 | `NR_GETPGID` | `sys_getpgid` | sync |
 | 156 | `NR_GETSID` | `sys_getsid` | sync |
 | 157 | `NR_SETSID` | `sys_setsid` | sync |
+| 159 | `NR_SETGROUPS` | `sys_setgroups` | sync |
 | 160 | `NR_UNAME` | `sys_uname` | sync |
+| 161 | `NR_SETHOSTNAME` | `sys_sethostname` | sync |
+| 165 | `NR_GETRUSAGE` | `sys_getrusage` | sync |
 | 166 | `NR_UMASK` | `sys_umask` | sync |
 | 169 | `NR_GETTIMEOFDAY` | `sys_gettimeofday` | sync |
 | 172 | `NR_GETPID` | `sys_getpid` | sync |
@@ -379,41 +396,60 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 189 | `NR_MSGSND` | `sys_msgsnd` | sync |
 | 190 | `NR_SEMGET` | `sys_semget` | sync |
 | 191 | `NR_SEMCTL` | `sys_semctl` | sync |
+| 192 | `NR_SEMTIMEDOP` | `sys_semtimedop` | sync |
 | 193 | `NR_SEMOP` | `sys_semop` | sync |
 | 194 | `NR_SHMGET` | `sys_shmget` | sync |
 | 195 | `NR_SHMCTL` | `sys_shmctl` | sync |
 | 196 | `NR_SHMAT` | `sys_shmat` | async |
 | 197 | `NR_SHMDT` | `sys_shmdt` | async |
 | 198 | `NR_SOCKET` | `sys_socket` | sync |
+| 199 | `NR_SOCKETPAIR` | `sys_socketpair` | sync |
 | 200 | `NR_BIND` | `sys_bind` | sync |
 | 201 | `NR_LISTEN` | `sys_listen` | sync |
 | 202 | `NR_ACCEPT` | `sys_accept` | sync |
 | 203 | `NR_CONNECT` | `sys_connect` | sync |
 | 204 | `NR_GETSOCKNAME` | `sys_getsockname` | sync |
+| 205 | `NR_GETPEERNAME` | `sys_getpeername` | sync |
 | 206 | `NR_SENDTO` | `sys_sendto` | sync |
 | 207 | `NR_RECVFROM` | `sys_recvfrom` | sync |
 | 208 | `NR_SETSOCKOPT` | `sys_setsockopt` | sync |
+| 209 | `NR_GETSOCKOPT` | `sys_getsockopt` | sync |
+| 210 | `NR_SHUTDOWN` | `sys_shutdown` | sync |
+| 211 | `NR_SENDMSG` | `sys_sendmsg` | sync |
+| 212 | `NR_RECVMSG` | `sys_recvmsg` | sync |
+| 213 | `NR_READAHEAD` | `sys_readahead` | sync |
 | 214 | `NR_BRK` | `sys_brk` | async |
 | 215 | `NR_MUNMAP` | `sys_munmap` | async |
 | 216 | `NR_MREMAP` | `sys_mremap` | async |
 | 220 | `NR_CLONE` | `sys_clone` | async |
 | 221 | `NR_EXECVE` | `sys_execve` | async |
 | 222 | `NR_MMAP` | `sys_mmap` | async |
+| 223 | `NR_FADVISE64` | `sys_fadvise64` | sync |
 | 226 | `NR_MPROTECT` | `sys_mprotect` | async |
 | 227 | `NR_MSYNC` | `sys_msync` | async |
 | 228 | `NR_MLOCK` | `sys_mlock` | async |
 | 229 | `NR_MUNLOCK` | `sys_munlock` | async |
+| 232 | `NR_EPOLL_WAIT` | `sys_epoll_wait` | async |
 | 233 | `NR_MADVISE` | `sys_madvise` | sync |
 | 242 | `NR_ACCEPT4` | `sys_accept4` | sync |
+| 243 | `NR_RECVMMSG` | `sys_recvmmsg` | sync |
 | 260 | `NR_WAIT4` | `sys_wait4` | async |
 | 261 | `NR_PRLIMIT64` | `sys_prlimit64` | sync |
-| 267 | `NR_SYNCFS` | `sys_syncfs` | sync |
+| 264 | `NR_NAME_TO_HANDLE_AT` | `sys_name_to_handle_at` | sync |
+| 265 | `NR_OPEN_BY_HANDLE_AT` | `sys_open_by_handle_at` | sync |
+| 267 | `NR_SYNCFS` | `sys_syncfs` | async |
+| 268 | `NR_SETNS` | `sys_setns` | sync |
+| 269 | `NR_SENDMMSG` | `sys_sendmmsg` | sync |
 | 276 | `NR_RENAMEAT2` | `sys_renameat2` | async |
 | 278 | `NR_GETRANDOM` | `sys_getrandom` | sync |
+| 282 | `NR_SIGNALFD` | `sys_signalfd` | sync |
 | 282 | `NR_USERFAULTFD` | `sys_userfaultfd` | sync |
 | 283 | `NR_MEMBARRIER` | `sys_membarrier` | sync |
-| 290 | `NR_EVENTFD2` | `sys_eventfd2` | sync |
+| 285 | `NR_COPY_FILE_RANGE` | `sys_copy_file_range` | sync |
+| 286 | `NR_PREADV2` | `sys_preadv2` | async |
+| 287 | `NR_PWRITEV2` | `sys_pwritev2` | async |
 | 291 | `NR_STATX` | `sys_statx` | async |
+| 413 | `NR_PSELECT6_TIME64` | `sys_pselect6` | async |
 | 425 | `NR_IO_URING_SETUP` | `sys_io_uring_setup` | sync |
 | 439 | `NR_FACCESSAT2` | `sys_faccessat2` | sync |
 

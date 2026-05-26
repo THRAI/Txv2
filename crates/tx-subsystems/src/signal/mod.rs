@@ -1277,15 +1277,38 @@ pub(crate) fn script_kill_pgrp_with_guard(
             Ok(AuthOutcome::Authorized) => {}
             Ok(AuthOutcome::NoLiveTarget) | Err(_) => continue,
         }
-        if step_kill_process(member, sig, None) == KillOutcome::Delivered {
-            // Catchable only: mirror onto group_pending. Gewalt
-            // signals (SIGKILL/SIGSTOP/SIGCONT) bypass pending
-            // queues entirely per SIGNAL_v1 §2 Consequence 2.
-            if !is_gewalt(sig) {
-                if let Ok(payload) = member.upgrade_operational() {
-                    payload.group_pending().post(sig);
+        let disposition = match member.upgrade_operational() {
+            Ok(payload) => payload.sig_actions().get(sig),
+            Err(_) => continue,
+        };
+
+        let outcome = match disposition {
+            SigDisposition::Ignore => KillOutcome::Delivered,
+            SigDisposition::Default => match default_action(sig) {
+                DefaultAction::Ignore => KillOutcome::Delivered,
+                DefaultAction::Term | DefaultAction::Core => {
+                    crate::process::execution::step_exit_group_with_signal(member, sig);
+                    KillOutcome::Delivered
                 }
+                DefaultAction::Stop => route_gewalt(member, Signum::SIGSTOP),
+                DefaultAction::Cont => route_gewalt(member, Signum::SIGCONT),
+            },
+            SigDisposition::Handler(_) => {
+                let outcome = step_kill_process(member, sig, None);
+                // Catchable handled signals are visible through the
+                // process-group pending queue as well as the chosen
+                // thread's pending queue. Default terminate/ignore/stop
+                // materialise above and do not leave a pending bit.
+                if outcome == KillOutcome::Delivered && !is_gewalt(sig) {
+                    if let Ok(payload) = member.upgrade_operational() {
+                        payload.group_pending().post(sig);
+                    }
+                }
+                outcome
             }
+        };
+
+        if outcome == KillOutcome::Delivered {
             delivered += 1;
         }
     }
@@ -1350,7 +1373,31 @@ pub fn script_deliver_signal(
     // process-directed routing can strand SIGCANCEL on a different
     // unblocked sibling.
     Ok(match target {
-        SignalTarget::Process(_) => step_kill_process(&target_proc, sig, info),
+        SignalTarget::Process(_) => {
+            let disposition = match target_proc.upgrade_operational() {
+                Ok(payload) => payload.sig_actions().get(sig),
+                Err(_) => return Ok(KillOutcome::NoLiveThread),
+            };
+            match disposition {
+                SigDisposition::Ignore => return Ok(KillOutcome::Delivered),
+                SigDisposition::Default => match default_action(sig) {
+                    DefaultAction::Ignore => return Ok(KillOutcome::Delivered),
+                    DefaultAction::Term | DefaultAction::Core => {
+                        crate::process::execution::step_exit_group_with_signal(&target_proc, sig);
+                        return Ok(KillOutcome::Delivered);
+                    }
+                    DefaultAction::Stop => {
+                        route_gewalt(&target_proc, Signum::SIGSTOP);
+                        return Ok(KillOutcome::Delivered);
+                    }
+                    DefaultAction::Cont => {
+                        route_gewalt(&target_proc, Signum::SIGCONT);
+                        return Ok(KillOutcome::Delivered);
+                    }
+                },
+                SigDisposition::Handler(_) => step_kill_process(&target_proc, sig, info),
+            }
+        }
         SignalTarget::Thread(thread) => {
             if is_gewalt(sig) {
                 return Ok(step_kill_process(&target_proc, sig, info));

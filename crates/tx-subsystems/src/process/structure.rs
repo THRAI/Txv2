@@ -175,7 +175,7 @@ pub struct ProcessIdentity {
 /// thread-identity view, and exit-source id). Concrete types stay
 /// here in the subsystem layer.
 ///
-/// `Restrictions` currently uses the `step_v3::RestrictionStackHandle`
+/// `Restrictions` currently uses the `step::RestrictionStackHandle`
 /// placeholder because the real append-only stack lives in
 /// `tx-policy`, which is still skeleton. PR-K wires the real type
 /// alongside the seccomp/landlock landing. The trait's
@@ -474,6 +474,26 @@ impl ProcessIdentity {
         payload.frame.vm.swap(Some(new))
     }
 
+    /// Snapshot the process's current network namespace. Day-1 all
+    /// processes are seeded with the initial namespace; fork inherits
+    /// the parent's namespace cap. Future `clone/unshare/setns` work
+    /// mutates this slot under the namespace/capability syscalls.
+    pub fn net_namespace(&self) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
+        self.payload.lock().as_ref().map(|p| p.net_namespace())
+    }
+
+    /// Replace the process's current network namespace, returning the
+    /// previous namespace cap. Returns `None` for zombies.
+    pub fn replace_net_namespace(
+        &self,
+        new: PayloadCap<crate::net::NetNamespacePayload>,
+    ) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.replace_net_namespace(new))
+    }
+
     /// Snapshot the `Cap<OpenFile>` registered at fd `idx` on this
     /// process's payload. Returns `None` if the process is a zombie
     /// (no payload) or the slot is empty.
@@ -570,6 +590,20 @@ impl ProcessIdentity {
     pub fn set_rlimit_nofile(&self, cur: u32, max: u32) {
         if let Some(payload) = self.payload.lock().as_ref() {
             payload.set_rlimit_nofile(cur, max);
+        }
+    }
+
+    pub fn rlimit_memlock(&self) -> (u64, u64) {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.rlimit_memlock())
+            .unwrap_or((u64::MAX, u64::MAX))
+    }
+
+    pub fn set_rlimit_memlock(&self, cur: u64, max: u64) {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.set_rlimit_memlock(cur, max);
         }
     }
 
@@ -1029,6 +1063,15 @@ pub struct ProcessPayload {
     /// Day-1: all namespace caps point at the init namespace.
     /// `mnt_ns` is deferred (`MountNamespace` bootstrap not yet wired).
     pub(crate) nsproxy: AtomicSlot<Cap<crate::process::nsproxy::NsProxy>>,
+
+    /// Current network namespace for socket/device lookup.
+    ///
+    /// N71M3 staging: `bootstrap_init_process` seeds this with
+    /// `initial_net_namespace_payload()`, `step_fork` clones the
+    /// parent's cap, and `unshare(CLONE_NEWNET)` / `setns(...,
+    /// CLONE_NEWNET)` publish a replacement cap through this slot.
+    /// Socket creation in `tx-shims` resolves through this field.
+    pub(crate) net_namespace: AtomicSlot<PayloadCap<crate::net::NetNamespacePayload>>,
     /// Current working directory as a `DEntry` `Cap`.
     ///
     /// Spec note: `PROCESS_v1` §3 declares this as `Cap<RNode>` on a
@@ -1084,6 +1127,10 @@ pub struct ProcessPayload {
     /// `RLIMIT_NOFILE`; fork copies it and exec preserves it.
     pub(crate) rlimit_nofile_cur: AtomicU32,
     pub(crate) rlimit_nofile_max: AtomicU32,
+    /// Per-process locked-memory resource limit. Linux exposes this as
+    /// `RLIMIT_MEMLOCK`; fork copies it and exec preserves it.
+    pub(crate) rlimit_memlock_cur: AtomicU64,
+    pub(crate) rlimit_memlock_max: AtomicU64,
     /// Base of the program-break (heap) region for this process.
     ///
     /// Set once at exec time (per `txdoc:VM-5-8-BRK`); never changes
@@ -1329,6 +1376,21 @@ impl ProcessPayload {
             .expect("ProcessPayload.nsproxy slot is always populated")
     }
 
+    pub fn net_namespace(&self) -> PayloadCap<crate::net::NetNamespacePayload> {
+        self.net_namespace
+            .load()
+            .expect("ProcessPayload.net_namespace slot is always populated")
+    }
+
+    pub fn replace_net_namespace(
+        &self,
+        new: PayloadCap<crate::net::NetNamespacePayload>,
+    ) -> PayloadCap<crate::net::NetNamespacePayload> {
+        self.net_namespace
+            .swap(Some(new))
+            .expect("ProcessPayload.net_namespace slot is always populated")
+    }
+
     /// Atomically install `new` as the current cred-cap and return
     /// the previously installed cap. Used by the 7 cred-mutator
     /// `step_*` functions and their test-only siblings.
@@ -1551,6 +1613,18 @@ impl ProcessPayload {
     pub fn set_rlimit_nofile(&self, cur: u32, max: u32) {
         self.rlimit_nofile_cur.store(cur, Ordering::Release);
         self.rlimit_nofile_max.store(max, Ordering::Release);
+    }
+
+    pub fn rlimit_memlock(&self) -> (u64, u64) {
+        (
+            self.rlimit_memlock_cur.load(Ordering::Acquire),
+            self.rlimit_memlock_max.load(Ordering::Acquire),
+        )
+    }
+
+    pub fn set_rlimit_memlock(&self, cur: u64, max: u64) {
+        self.rlimit_memlock_cur.store(cur, Ordering::Release);
+        self.rlimit_memlock_max.store(max, Ordering::Release);
     }
 
     /// Read the close-on-exec bit for fd `idx`.

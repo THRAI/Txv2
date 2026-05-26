@@ -295,86 +295,202 @@ fn parse_image_plan_et_dyn_accepts_wx_load() {
 }
 
 #[test]
-fn parse_image_plan_accepts_pt_interp() {
+fn parse_image_plan_accepts_pt_interp_segment_and_emits_ref() {
+    // N69a: PT_INTERP is now accepted; the parser records the segment
+    // locator so the orchestrator can read the interpreter path.
     let mut cfg = FixtureCfg::minimal();
-    // Add a PT_INTERP segment (file_offset/filesz arbitrary). Place it inside the file
-    // (file is sized to fit phdrs+LOAD content, so an offset of 0
-    // is fine).
+    // Place a 32-byte interp path inside the LOAD's file range
+    // (filesz=176 covers offset 96..128).
+    cfg.phdrs.push(PhdrSpec {
+        p_type: PT_INTERP_U32,
+        p_flags: PF_R_BIT,
+        p_offset: 96,
+        p_vaddr: 0x10000 + 96,
+        p_paddr: 0x10000 + 96,
+        p_filesz: 32,
+        p_memsz: 32,
+        p_align: 1,
+    });
+    let bytes = cfg.build();
+    let plan = parse_image_plan(&bytes).expect("PT_INTERP is accepted");
+    let interp = plan.interp.expect("interp ref recorded");
+    assert_eq!(interp.file_offset, 96);
+    assert_eq!(interp.filesz, 32);
+}
+
+#[test]
+fn parse_image_plan_et_dyn_with_pt_interp_emits_ref() {
+    // Real Alpine userland tools are PIE ET_DYN binaries with PT_INTERP.
+    // They must go through the dynamic interpreter; treating them as
+    // static PIE jumps into unrelocated code.
+    let mut cfg = FixtureCfg::minimal();
+    cfg.e_type = ET_DYN_U16;
+    cfg.e_entry = 0x80;
+    cfg.phdrs[0].p_vaddr = 0x0;
+    cfg.phdrs[0].p_paddr = 0x0;
+    cfg.phdrs.push(PhdrSpec {
+        p_type: PT_INTERP_U32,
+        p_flags: PF_R_BIT,
+        p_offset: 96,
+        p_vaddr: 96,
+        p_paddr: 96,
+        p_filesz: 32,
+        p_memsz: 32,
+        p_align: 1,
+    });
+    let bytes = cfg.build();
+    let plan = parse_image_plan(&bytes).expect("ET_DYN PT_INTERP is accepted");
+    assert_eq!(plan.load_bias, 0x10000);
+    assert_eq!(plan.entry, 0x10080);
+    let interp = plan.interp.expect("interp ref recorded for PIE");
+    assert_eq!(interp.file_offset, 96);
+    assert_eq!(interp.filesz, 32);
+}
+
+#[test]
+fn parse_image_plan_records_pt_interp_outside_initial_window() {
+    // The exec orchestrator may parse only the initial ELF window.
+    // Real OSComp basic PIE binaries place PT_INTERP after that
+    // window; the parser must still return the locator and leave the
+    // later file read to the PageContainer-backed phase.
+    let mut cfg = FixtureCfg::minimal();
+    cfg.e_type = ET_DYN_U16;
+    cfg.e_entry = 0x80;
+    cfg.phdrs[0].p_vaddr = 0x0;
+    cfg.phdrs[0].p_paddr = 0x0;
+    cfg.phdrs.push(PhdrSpec {
+        p_type: PT_INTERP_U32,
+        p_flags: PF_R_BIT,
+        p_offset: 0x1f57,
+        p_vaddr: 0x1f57,
+        p_paddr: 0x1f57,
+        p_filesz: 0x21,
+        p_memsz: 0x21,
+        p_align: 1,
+    });
+    let mut bytes = cfg.build();
+    bytes.truncate(4096);
+    let plan = parse_image_plan(&bytes).expect("out-of-window PT_INTERP locator is accepted");
+    let interp = plan.interp.expect("interp ref recorded");
+    assert_eq!(interp.file_offset, 0x1f57);
+    assert_eq!(interp.filesz, 0x21);
+}
+
+#[test]
+fn parse_image_plan_rejects_empty_pt_interp() {
+    // Zero `p_filesz` is malformed — the toolchain never emits this
+    // for a real interpreter path. Surface it loudly.
+    let mut cfg = FixtureCfg::minimal();
     cfg.phdrs.push(PhdrSpec {
         p_type: PT_INTERP_U32,
         p_flags: PF_R_BIT,
         p_offset: 0,
         p_vaddr: 0,
         p_paddr: 0,
-        p_filesz: 1,
-        p_memsz: 1,
+        p_filesz: 0,
+        p_memsz: 0,
         p_align: 1,
     });
     let bytes = cfg.build();
-    let plan = parse_image_plan(&bytes).expect("PT_INTERP should be accepted");
-    assert!(
-        plan.interpreter_path.is_some(),
-        "interpreter path should be extracted"
+    assert_eq!(
+        parse_image_plan(&bytes).unwrap_err(),
+        ParseError::InterpMalformed
     );
 }
 
 #[test]
-fn parse_image_plan_accepts_pt_interp_with_pt_dynamic() {
+fn parse_image_plan_rejects_duplicate_pt_interp() {
+    // More than one PT_INTERP is malformed: real images have exactly
+    // one, and supporting multiple would force the orchestrator to
+    // pick a winner.
     let mut cfg = FixtureCfg::minimal();
-    let interp_offset = 0x200usize;
-    let interp = b"/lib/ld-musl-riscv64-sf.so.1\0";
     cfg.phdrs.push(PhdrSpec {
         p_type: PT_INTERP_U32,
         p_flags: PF_R_BIT,
-        p_offset: interp_offset as u64,
-        p_vaddr: 0x10200,
-        p_paddr: 0x10200,
-        p_filesz: interp.len() as u64,
-        p_memsz: interp.len() as u64,
+        p_offset: 96,
+        p_vaddr: 0x10000 + 96,
+        p_paddr: 0x10000 + 96,
+        p_filesz: 16,
+        p_memsz: 16,
         p_align: 1,
     });
     cfg.phdrs.push(PhdrSpec {
-        p_type: PT_DYNAMIC_U32,
+        p_type: PT_INTERP_U32,
         p_flags: PF_R_BIT,
-        p_offset: 0x300,
-        p_vaddr: 0x10300,
-        p_paddr: 0x10300,
+        p_offset: 112,
+        p_vaddr: 0x10000 + 112,
+        p_paddr: 0x10000 + 112,
         p_filesz: 16,
         p_memsz: 16,
-        p_align: 8,
+        p_align: 1,
     });
-    let mut bytes = cfg.build();
-    if bytes.len() < interp_offset + interp.len() {
-        bytes.resize(interp_offset + interp.len(), 0);
-    }
-    bytes[interp_offset..interp_offset + interp.len()].copy_from_slice(interp);
-    let plan =
-        parse_image_plan(&bytes).expect("PT_INTERP-owned PT_DYNAMIC should parse for interpreter");
+    let bytes = cfg.build();
     assert_eq!(
-        plan.interpreter_path.as_deref(),
-        Some(&interp[..interp.len() - 1])
+        parse_image_plan(&bytes).unwrap_err(),
+        ParseError::InterpMalformed
     );
 }
 
 #[test]
-fn parse_image_plan_et_dyn_accepts_pt_interp_with_pt_dynamic() {
+fn parse_image_plan_ignores_pt_dynamic() {
+    // The main program's PT_DYNAMIC is consumed by `ld`, not the
+    // kernel. The parser must accept it without recording anything.
+    let mut cfg = FixtureCfg::minimal();
+    cfg.phdrs.push(PhdrSpec {
+        p_type: PT_DYNAMIC_U32,
+        p_flags: PF_R_BIT,
+        p_offset: 0,
+        p_vaddr: 0,
+        p_paddr: 0,
+        p_filesz: 0,
+        p_memsz: 0,
+        p_align: 8,
+    });
+    let bytes = cfg.build();
+    let plan = parse_image_plan(&bytes).expect("PT_DYNAMIC is ignored");
+    assert!(plan.interp.is_none(), "no PT_INTERP → interp stays None");
+}
+
+#[test]
+fn parse_image_plan_static_keeps_interp_none() {
+    // Pin the default: a static ET_EXEC with no PT_INTERP still parses
+    // and surfaces `interp = None`. Defends the iperf3 / busybox path.
+    let cfg = FixtureCfg::minimal();
+    let bytes = cfg.build();
+    let plan = parse_image_plan(&bytes).expect("static fixture parses");
+    assert!(plan.interp.is_none());
+}
+
+#[test]
+fn parse_interp_plan_accepts_et_dyn() {
+    // N69a: musl `libc.so` is ET_DYN. The interp parser accepts it.
+    let mut cfg = FixtureCfg::minimal();
+    cfg.e_type = ET_DYN_U16;
+    let bytes = cfg.build();
+    let plan = parse_interp_plan(&bytes).expect("ET_DYN interp parses");
+    assert!(
+        plan.interp.is_none(),
+        "interp parse never records nested interp"
+    );
+}
+
+#[test]
+fn parse_interp_plan_rejects_et_exec() {
+    // A regular ET_EXEC passed to the interp parser is a caller bug;
+    // surface it loudly so a future orchestrator typo can't silently
+    // load the main program as its own interpreter.
+    let cfg = FixtureCfg::minimal();
+    let bytes = cfg.build();
+    assert_eq!(parse_interp_plan(&bytes).unwrap_err(), ParseError::Type);
+}
+
+#[test]
+fn parse_image_plan_et_dyn_accepts_pt_dynamic_without_interp() {
     let mut cfg = FixtureCfg::minimal();
     cfg.e_type = ET_DYN_U16;
     cfg.e_entry = 0x80;
     cfg.phdrs[0].p_vaddr = 0x0;
     cfg.phdrs[0].p_paddr = 0x0;
-    let interp_offset = 0x200usize;
-    let interp = b"/lib/ld-musl-riscv64.so.1\0";
-    cfg.phdrs.push(PhdrSpec {
-        p_type: PT_INTERP_U32,
-        p_flags: PF_R_BIT,
-        p_offset: interp_offset as u64,
-        p_vaddr: 0x200,
-        p_paddr: 0x200,
-        p_filesz: interp.len() as u64,
-        p_memsz: interp.len() as u64,
-        p_align: 1,
-    });
     cfg.phdrs.push(PhdrSpec {
         p_type: PT_DYNAMIC_U32,
         p_flags: PF_R_BIT,
@@ -385,55 +501,34 @@ fn parse_image_plan_et_dyn_accepts_pt_interp_with_pt_dynamic() {
         p_memsz: 16,
         p_align: 8,
     });
-    let mut bytes = cfg.build();
-    if bytes.len() < interp_offset + interp.len() {
-        bytes.resize(interp_offset + interp.len(), 0);
-    }
-    bytes[interp_offset..interp_offset + interp.len()].copy_from_slice(interp);
-    let plan = parse_image_plan(&bytes).expect("ET_DYN with PT_INTERP and PT_DYNAMIC should parse");
-    assert_eq!(
-        plan.interpreter_path.as_deref(),
-        Some(&interp[..interp.len() - 1])
-    );
+    let bytes = cfg.build();
+    let plan = parse_image_plan(&bytes).expect("ET_DYN with PT_DYNAMIC should parse");
+    assert!(plan.interp.is_none());
     assert_eq!(plan.entry, 0x10080);
     assert_eq!(plan.load_bias, 0x10000);
 }
 
 #[test]
-fn parse_image_plan_et_dyn_accepts_pt_dynamic_without_interp() {
+fn parse_interp_plan_rejects_nested_pt_interp() {
+    // Defensive: an interpreter image with its own PT_INTERP is
+    // pathological. Reject with `HasInterp`.
     let mut cfg = FixtureCfg::minimal();
     cfg.e_type = ET_DYN_U16;
     cfg.phdrs.push(PhdrSpec {
-        p_type: PT_DYNAMIC_U32,
+        p_type: PT_INTERP_U32,
         p_flags: PF_R_BIT,
-        p_offset: 0x200,
-        p_vaddr: 0x200,
-        p_paddr: 0x200,
+        p_offset: 96,
+        p_vaddr: 0x10000 + 96,
+        p_paddr: 0x10000 + 96,
         p_filesz: 16,
         p_memsz: 16,
-        p_align: 8,
+        p_align: 1,
     });
     let bytes = cfg.build();
-    let plan = parse_image_plan(&bytes)
-        .expect("ET_DYN static-PIE with PT_DYNAMIC but no PT_INTERP should parse");
-    assert!(plan.interpreter_path.is_none());
-}
-
-#[test]
-fn parse_image_plan_rejects_pt_dynamic_without_interp() {
-    let mut cfg = FixtureCfg::minimal();
-    cfg.phdrs.push(PhdrSpec {
-        p_type: PT_DYNAMIC_U32,
-        p_flags: PF_R_BIT,
-        p_offset: 0x200,
-        p_vaddr: 0x10200,
-        p_paddr: 0x10200,
-        p_filesz: 16,
-        p_memsz: 16,
-        p_align: 8,
-    });
-    let bytes = cfg.build();
-    assert_eq!(parse_image_plan(&bytes).unwrap_err(), ParseError::HasInterp);
+    assert_eq!(
+        parse_interp_plan(&bytes).unwrap_err(),
+        ParseError::HasInterp
+    );
 }
 
 #[test]

@@ -32,6 +32,7 @@ use tx_subsystems::cross_crate_test_support::{
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
 use tx_subsystems::process::{bootstrap_init_process, ExitStatus, Pid, ProcessIdentity};
+use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::vfs::OpenFile;
@@ -39,12 +40,13 @@ use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
 use super::{
-    dispatch, SyscallCtx, SyscallResult, EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_SETFD,
-    NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPGRP,
-    NR_GETPID, NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_MEMBARRIER, NR_PIPE2, NR_PPOLL,
-    NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY,
-    NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_TIMERFD_CREATE, NR_WAIT4,
-    NR_WRITE, SIGCHLD, WNOHANG,
+    dispatch, SyscallCtx, SyscallResult, CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID,
+    CLONE_PARENT_SETTID, EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK,
+    NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPGRP, NR_GETPID,
+    NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_MEMBARRIER, NR_PIPE2, NR_PPOLL, NR_READ,
+    NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY,
+    NR_SCHED_SETAFFINITY, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
+    NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, NR_WRITEV, O_DIRECTORY, SIGCHLD, WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
@@ -213,6 +215,12 @@ fn setup() -> TestSetup {
     reset_init_process();
     reset_reactor_affinity_seam();
     reset_uts_nodename_for_test();
+    tx_subsystems::net::reset_initial_net_namespace_for_test();
+    tx_subsystems::net::initial_loopback_iface().clear_for_test_or_bootstrap();
+    tx_subsystems::net::device::reset_net_registry_for_test();
+    tx_subsystems::net::reset_netfilter_for_test();
+    super::reset_itimer_registry_for_test();
+    super::reset_sigaction_restorers_for_test();
     TestSetup { _lock: lock }
 }
 
@@ -360,6 +368,36 @@ fn dispatch_write_one_to_console_returns_byte_count() {
         b"hello\r\n",
         "OPOST should expand LF to CRLF before reaching the device transport"
     );
+}
+
+/// `writev(1, iov, 2)` uses the stdout/stderr TTY fast path. The
+/// combined buffer is kernel-owned after iovec gather, so this verifies
+/// that the fast path writes those bytes directly instead of feeding a
+/// kernel pointer back through the user-buffer `write(2)` lane.
+#[test]
+fn dispatch_writev_stdout_tty_fast_path_writes_combined_buffer() {
+    let _setup = setup();
+    let ops = install_capturing_console();
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    proc_cap.set_fd(1, Some(tx_fs::devfs::open_console_for_init()));
+
+    let ctx = make_ctx(proc_cap, thread);
+    let part1: &[u8] = b"netperf ";
+    let part2: &[u8] = b"row\n";
+    let iov = [
+        part1.as_ptr() as u64,
+        part1.len() as u64,
+        part2.as_ptr() as u64,
+        part2.len() as u64,
+    ];
+    let req = SyscallRequest::new(NR_WRITEV, [1, iov.as_ptr() as u64, 2, 0, 0, 0]);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+
+    assert_eq!(result, SyscallResult::Return(12));
+    assert_eq!(ops.snapshot(), b"netperf row\r\n");
 }
 
 /// `exit_group(0)` zombifies the process at once and records
@@ -762,6 +800,76 @@ fn dispatch_rt_sigprocmask_rejects_wrong_sigsetsize() {
     assert_eq!(r, SyscallResult::Error(22));
 }
 
+/// `rt_sigtimedwait(set, info, {0,0}, 8)` is a true poll: if no
+/// matching pending signal exists, it returns `-EAGAIN`.
+#[test]
+fn dispatch_rt_sigtimedwait_zero_timeout_returns_neg_eagain() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let mut set = Signum::SIGCHLD.bit();
+    let mut timeout = [0i64, 0i64];
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_RT_SIGTIMEDWAIT,
+            [
+                &mut set as *mut u64 as u64,
+                0,
+                timeout.as_mut_ptr() as u64,
+                8,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(11));
+}
+
+/// `rt_sigtimedwait` consumes a matching pending signal and writes the
+/// leading `siginfo_t.si_signo` field. This pins the ABI shape used by
+/// the OSComp libctest runtest harness to wait for child `SIGCHLD`.
+#[test]
+fn dispatch_rt_sigtimedwait_consumes_pending_sigchld() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread.clone());
+
+    let payload = thread
+        .payload_cap()
+        .expect("bootstrap leader thread must be live");
+    payload.pending().post(Signum::SIGCHLD);
+
+    let mut set = Signum::SIGCHLD.bit();
+    let mut info = [0xa5u8; 128];
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_RT_SIGTIMEDWAIT,
+            [
+                &mut set as *mut u64 as u64,
+                info.as_mut_ptr() as u64,
+                0,
+                8,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(SIGCHLD as i64));
+    assert!(
+        !payload.pending().is_pending(Signum::SIGCHLD),
+        "sigtimedwait must dequeue the consumed signal"
+    );
+    assert_eq!(
+        u32::from_le_bytes(info[0..4].try_into().unwrap()),
+        SIGCHLD as u32
+    );
+}
+
 /// `rt_sigaction(SIGUSR1, act, oldact, 8)` round-trip: install a
 /// custom handler for SIGUSR1 (signum 10), then query it back via
 /// oldact in a follow-up call. The handler value is preserved
@@ -815,8 +923,8 @@ fn dispatch_rt_sigaction_install_then_query_round_trip() {
 }
 
 /// musl's pthread cancellation handler is installed with
-/// `SA_SIGINFO | SA_RESTART | SA_ONSTACK` and a full mask. The kernel
-/// rt_sigaction ABI must preserve those words when queried back; losing
+/// `SA_SIGINFO | SA_RESTART | SA_ONSTACK` and a full mask. RV64's
+/// rt_sigaction ABI exchanges the kernel handler/flags/mask words; losing
 /// them means AST delivery cannot distinguish the 3-argument handler
 /// shape or compute the handler-entry mask.
 #[test]
@@ -832,10 +940,9 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
     const SA_RESTART: u64 = 0x1000_0000;
     const FLAGS: u64 = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
     const MASK: u64 = u64::MAX;
-    const UNUSED: u64 = 0x4444_5555_6666_7777;
 
-    let act: [u64; 4] = [HANDLER_ADDR, FLAGS, MASK, UNUSED];
-    let mut oldact: [u64; 4] = [0xDEADu64; 4];
+    let act: [u64; 3] = [HANDLER_ADDR, FLAGS, MASK];
+    let mut oldact: [u64; 3] = [0xDEADu64; 3];
 
     let r1 = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(
@@ -852,9 +959,9 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
         &ctx,
     ));
     assert_eq!(r1, SyscallResult::Return(0));
-    assert_eq!(oldact, [0, 0, 0, 0]);
+    assert_eq!(oldact, [0, 0, 0]);
 
-    let mut observed: [u64; 4] = [0xDEADu64; 4];
+    let mut observed: [u64; 3] = [0xDEADu64; 3];
     let r2 = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(
             NR_RT_SIGACTION,
@@ -878,10 +985,6 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
     assert_ne!(
         observed[2] & tx_subsystems::signal::Signum::SIGTERM.bit(),
         0
-    );
-    assert_eq!(
-        observed[3], UNUSED,
-        "RV64 musl has no SA_RESTORER, so the last word is ABI-unused"
     );
 }
 
@@ -1486,3 +1589,27 @@ mod mq_dispatch;
 // Kernel-to-user layout marker registry used by the musl ABI detector.
 // ===========================================================================
 mod kernel_user_layouts;
+
+// =====================================================================
+// Network N39 — socket fdtable/syscall bridge.
+//
+// Coverage:
+// - `socket(2)` installs a struct-backed socket `OpenFile`.
+// - `bind(2)` / `listen(2)` update the socket state and
+//   `getsockname(2)` reports the bound endpoint.
+// - `setsockopt(2)` / `getsockopt(2)` round-trip day-1 socket options.
+// - `close(2)` tears down the socket binding when the final fd closes.
+// =====================================================================
+
+mod socket_fdtable;
+
+// =====================================================================
+// Network N71M3 — namespace user ABI.
+//
+// Coverage:
+// - `unshare(CLONE_NEWNET)` publishes a fresh process net namespace.
+// - `setns(fd, CLONE_NEWNET)` joins a namespace fd payload.
+// - `/proc/<pid>/ns/net` materialises as a struct-backed namespace fd.
+// =====================================================================
+
+mod netns_syscalls;

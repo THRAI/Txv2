@@ -87,6 +87,8 @@ core::arch::global_asm!(
     .equ TX_RV64_TF_F31, TX_RV64_TF_F_BASE + 31*8
     .equ TX_RV64_TF_FCSR, TX_RV64_TF_F_BASE + 256
     .equ TX_RV64_TF_SIZE, 552
+    .equ TX_RV64_TF_TMP_T0, TX_RV64_TF_SIZE - 16
+    .equ TX_RV64_TF_TMP_SSCRATCH, TX_RV64_TF_SIZE - 8
 
     # Per-hart KernelResumeCtx field offsets — must match
     # `boards::tx_hal_riscv64_qemu_virt::KernelResumeCtx` in lib.rs.
@@ -101,21 +103,53 @@ tx_rv64_qemu_minimal_trap_vector:
     # trap-handler stack. sscratch is boot-primed (and re-primed on
     # every clean exit) to point at trap_stack_top for this hart.
     #
-    # On entry: sp = trap-time sp (user sp for from-user, kernel sp
-    # for from-kernel); sscratch = trap_stack_top.
-    # After swap: sp = trap_stack_top; sscratch = trap-time sp.
-    csrrw sp, sscratch, sp
+	    # On entry: sp = trap-time sp (user sp for from-user, kernel sp
+	    # for from-kernel); sscratch = trap_stack_top.
+	    # After swap: sp = trap_stack_top; sscratch = trap-time sp.
+	    #
+	    # If the trap arrives while S-mode is already running in the
+	    # trap epilogue, sscratch may still contain the interrupted user
+	    # sp. Only use the current high-half stack directly in that
+	    # narrow case. Normal kernel traps keep sscratch primed with the
+	    # per-hart trap-stack top and should still swap onto that stack;
+	    # otherwise an interrupt in a large kernel frame can trample the
+	    # interrupted function's locals.
+	    bgez sp, 7f
+	    addi sp, sp, -16
+	    sd t0, 0(sp)
+	    csrr t0, sscratch
+	    sd t0, 8(sp)
+	    bgez t0, 6f
+	    ld t0, 0(sp)
+	    addi sp, sp, 16
+	    j 7f
 
-    # Allocate the trap frame on the trap stack.
-    addi sp, sp, -TX_RV64_TF_SIZE
-    sd t0, TX_RV64_TF_X5(sp)
-    sd zero, TX_RV64_TF_X0(sp)
-    sd ra, TX_RV64_TF_X1(sp)
-    # The trap-time sp is currently in sscratch; save it to the
-    # frame's X_SP slot. Subsystems read it via TrapFrameView.
-    csrr t0, sscratch
-    sd t0, TX_RV64_TF_X2(sp)
-    sd gp, TX_RV64_TF_X3(sp)
+6:
+	    # Trap-time sp is already a trap stack pointer.
+	    addi sp, sp, -(TX_RV64_TF_SIZE - 16)
+	    ld t0, TX_RV64_TF_TMP_T0(sp)
+	    sd t0, TX_RV64_TF_X5(sp)
+	    ld t0, TX_RV64_TF_TMP_SSCRATCH(sp)
+	    sd t0, TX_RV64_TF_X0(sp)
+	    sd ra, TX_RV64_TF_X1(sp)
+	    addi t0, sp, TX_RV64_TF_SIZE
+	    sd t0, TX_RV64_TF_X2(sp)
+	    j 8f
+
+7:
+	    csrrw sp, sscratch, sp
+
+	    # Allocate the trap frame on the trap stack.
+	    addi sp, sp, -TX_RV64_TF_SIZE
+	    sd t0, TX_RV64_TF_X5(sp)
+	    sd zero, TX_RV64_TF_X0(sp)
+	    sd ra, TX_RV64_TF_X1(sp)
+	    # The trap-time sp is currently in sscratch; save it to the
+	    # frame's X_SP slot. Subsystems read it via TrapFrameView.
+	    csrr t0, sscratch
+	    sd t0, TX_RV64_TF_X2(sp)
+8:
+	    sd gp, TX_RV64_TF_X3(sp)
     sd tp, TX_RV64_TF_X4(sp)
     sd t1, TX_RV64_TF_X6(sp)
     sd t2, TX_RV64_TF_X7(sp)
@@ -206,9 +240,19 @@ tx_rv64_qemu_minimal_trap_vector:
     # Recover the kernel TLS pointer from the trap-stack top before
     # entering Rust; all per-CPU state (current_cpu_id, irq depth,
     # active userspace payload) depends on tp being the kernel value.
+    #
+    # The high-half S-mode prologue path may keep the frame on the
+    # interrupted kernel stack instead of the per-hart trap stack, so
+    # `sp + TX_RV64_TF_SIZE` is not always a trap-stack top. In that
+    # case the helper returns 0 and tp is already the kernel TLS. If
+    # the frame is on a trap stack, recover tp even when SPP=1: a trap
+    # can land in the userspace-entry epilogue after user tp has been
+    # restored but before sret.
     addi a0, sp, TX_RV64_TF_SIZE
     call tx_rv64_kernel_tls_from_trap_stack_top
+    beqz a0, .Ltx_rv64_skip_tls_recover
     mv tp, a0
+.Ltx_rv64_skip_tls_recover:
 
     mv a0, sp
     call tx_rv64_qemu_kernel_trap_entry
@@ -229,11 +273,15 @@ tx_rv64_qemu_minimal_trap_vector:
     # (re-primed for the next trap).
     ld t0, TX_RV64_TF_SEPC(sp)
     csrw sepc, t0
-    ld t0, TX_RV64_TF_SSTATUS(sp)
-    csrw sstatus, t0
-    # t0 = outgoing sstatus; restore FP regs if FS != Off.
-    # prepare_user_return always sets FS=Initial, so this block
-    # executes on every return to userspace that had FP active.
+	    ld t0, TX_RV64_TF_SSTATUS(sp)
+	    csrw sstatus, t0
+	    # Keep S-mode interrupts masked while the trap shell restores
+	    # user registers. sret restores the user-visible interrupt state
+	    # from SPIE.
+	    csrci sstatus, 0x2
+	    # t0 = outgoing sstatus; restore FP regs if FS != Off.
+	    # prepare_user_return always sets FS=Initial, so this block
+	    # executes on every return to userspace that had FP active.
     srli t0, t0, 13
     andi t0, t0, 3
     beqz t0, 2f
@@ -273,19 +321,12 @@ tx_rv64_qemu_minimal_trap_vector:
     fld f31, TX_RV64_TF_F31(sp)
 2:
 
-    # Move trap-time sp into sscratch via t0. Safe to clobber t0
-    # because we'll restore the user's t0 from the frame below
-    # before we sret.
-    ld t0, TX_RV64_TF_X2(sp)
-    csrw sscratch, t0
-
-    ld ra, TX_RV64_TF_X1(sp)
-    ld gp, TX_RV64_TF_X3(sp)
-    ld tp, TX_RV64_TF_X4(sp)
-    ld t0, TX_RV64_TF_X5(sp)
-    ld t1, TX_RV64_TF_X6(sp)
-    ld t2, TX_RV64_TF_X7(sp)
-    ld s0, TX_RV64_TF_X8(sp)
+	    ld ra, TX_RV64_TF_X1(sp)
+	    ld gp, TX_RV64_TF_X3(sp)
+	    ld tp, TX_RV64_TF_X4(sp)
+	    ld t1, TX_RV64_TF_X6(sp)
+	    ld t2, TX_RV64_TF_X7(sp)
+	    ld s0, TX_RV64_TF_X8(sp)
     ld s1, TX_RV64_TF_X9(sp)
     ld a0, TX_RV64_TF_X10(sp)
     ld a1, TX_RV64_TF_X11(sp)
@@ -305,16 +346,26 @@ tx_rv64_qemu_minimal_trap_vector:
     ld s9, TX_RV64_TF_X25(sp)
     ld s10, TX_RV64_TF_X26(sp)
     ld s11, TX_RV64_TF_X27(sp)
-    ld t3, TX_RV64_TF_X28(sp)
-    ld t4, TX_RV64_TF_X29(sp)
-    ld t5, TX_RV64_TF_X30(sp)
-    ld t6, TX_RV64_TF_X31(sp)
+	    ld t3, TX_RV64_TF_X28(sp)
+	    ld t4, TX_RV64_TF_X29(sp)
 
-    # Deallocate the frame and atomically swap sp ↔ sscratch:
-    # sp = trap-time sp, sscratch = trap_stack_top.
-    addi sp, sp, TX_RV64_TF_SIZE
-    csrrw sp, sscratch, sp
-    sret
+	    # Keep sscratch as the trap-stack top across the final return.
+	    # Earlier versions used sscratch to hold trap-time sp for a final
+	    # csrrw, which made S-mode exceptions in the epilogue re-enter the
+	    # trap vector with a user stack pointer in sscratch. Use t6 as a
+	    # temporary frame base instead; then restore the few remaining
+	    # registers and sret directly with sp set to the trap-time value.
+	    mv t6, sp
+	    ld t5, TX_RV64_TF_X0(t6)
+	    bnez t5, .Ltx_rv64_restore_sscratch
+	    addi t5, t6, TX_RV64_TF_SIZE
+.Ltx_rv64_restore_sscratch:
+	    csrw sscratch, t5
+	    ld t0, TX_RV64_TF_X5(t6)
+	    ld t5, TX_RV64_TF_X30(t6)
+	    ld sp, TX_RV64_TF_X2(t6)
+	    ld t6, TX_RV64_TF_X31(t6)
+	    sret
 
     # ------------------------------------------------------------------
     # tx_rv64_enter_userspace_save_resume:
@@ -357,9 +408,12 @@ tx_rv64_enter_userspace_save_resume:
     mv t6, a1
     ld t0, TX_RV64_TF_SEPC(t6)
     csrw sepc, t0
-    ld t0, TX_RV64_TF_SSTATUS(t6)
-    csrw sstatus, t0
-    # t0 = outgoing sstatus; restore FP regs if FS != Off.
+	    ld t0, TX_RV64_TF_SSTATUS(t6)
+	    csrw sstatus, t0
+	    # The frame's SPIE bit controls user interrupt state after sret.
+	    # Keep S-mode interrupts disabled throughout the restore itself.
+	    csrci sstatus, 0x2
+	    # t0 = outgoing sstatus; restore FP regs if FS != Off.
     srli t0, t0, 13
     andi t0, t0, 3
     beqz t0, 3f

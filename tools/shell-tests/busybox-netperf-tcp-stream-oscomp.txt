@@ -1,0 +1,22 @@
+# busybox-netperf-tcp-stream-oscomp.txt — N69c exact OSComp TCP_STREAM probe.
+#
+# Build image with:
+#   TX_OSCOMP_RISCV_MUSL_DIR=/home/msp/learning/rustOS/testcase/riscv/musl \
+#     cargo xtask image cpio --profile busybox --target rv64-qemu
+#
+# This keeps the N69b TCP_STREAM path but uses the exact OSComp netperf
+# arguments from riscv/musl/netperf_testcode.sh.
+
+wait "/ # " within 30000
+sleep 500
+
+send "/bin/netserver -D -L 127.0.0.1 -p 12865 & server_pid=$!\n"
+expect "/ # " within 10000
+sleep 1500
+
+send "echo \"====== netperf TCP_STREAM begin ======\"; if /bin/netperf -H 127.0.0.1 -p 12865 -t TCP_STREAM -l 1 -- -s 16k -S 16k -m 1k -M 1k; then echo \"N69C_TCP_STREAM_OSCOMP_OK\"; else echo \"N69C_TCP_STREAM_OSCOMP_FAIL\"; fi; kill -9 $server_pid\n"
+expect "N69C_TCP_STREAM_OSCOMP_OK" within 60000
+expect "/ # " within 10000
+
+sleep 500
+quit

@@ -1,20 +1,28 @@
 //! Content renderers for procfs pseudo-files.
 
 use crate::procfs::{
-    pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_stat_id, task_from_stat_id,
-    PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID,
+    pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_stat_id,
+    pid_from_status_id, task_from_stat_id, PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID,
+    PROCFS_MOUNTS_ID, PROCFS_NET_ARP_ID, PROCFS_NET_DEV_ID, PROCFS_NET_IF_INET6_ID,
+    PROCFS_NET_NETLINK_ID, PROCFS_NET_NF_CONNTRACK_ID, PROCFS_NET_RAW_ID, PROCFS_NET_ROUTE_ID,
+    PROCFS_NET_SNMP_ID, PROCFS_NET_TCP_ID, PROCFS_NET_TX_NF_RULES_ID, PROCFS_NET_UDP_ID,
     PROCFS_SYSVIPC_MSG_ID, PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID,
     PROCFS_SYS_FS_LEASE_BREAK_TIME_ID, PROCFS_SYS_FS_PIPE_MAX_SIZE_ID,
     PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID, PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID,
-    PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_UPTIME_ID,
+    PROCFS_SYS_KERNEL_PID_MAX_ID, PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYS_NET_IPV4_IP_FORWARD_ID,
+    PROCFS_UPTIME_ID,
 };
 use alloc::format;
 use alloc::string::String;
+use tx_subsystems::net::NetNamespacePayload;
 use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use tx_subsystems::process::{self, Pid};
 use tx_subsystems::vfs::FsObjectId;
 
-pub fn render(fs_object_id: FsObjectId) -> String {
+pub fn render_with_netns(
+    fs_object_id: FsObjectId,
+    caller_netns: Option<&NetNamespacePayload>,
+) -> String {
     if let Some(pid) = pid_from_stat_id(fs_object_id) {
         return render_stat(pid);
     }
@@ -27,6 +35,9 @@ pub fn render(fs_object_id: FsObjectId) -> String {
     if let Some(pid) = pid_from_maps_id(fs_object_id) {
         return render_maps(pid);
     }
+    if let Some(pid) = pid_from_status_id(fs_object_id) {
+        return render_status(pid);
+    }
     if let Some((pid, fd)) = pid_from_fdinfo_id(fs_object_id) {
         return render_fdinfo(pid, fd);
     }
@@ -37,6 +48,7 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_MEMINFO_ID => render_meminfo(),
         PROCFS_CONFIG_ID => render_config(),
         PROCFS_SYS_KERNEL_TAINTED_ID => String::from("0\n"),
+        PROCFS_SYS_KERNEL_PID_MAX_ID => String::from("4194304\n"),
         PROCFS_SYS_FS_PIPE_MAX_SIZE_ID => String::from("4096\n"),
         PROCFS_SYS_FS_LEASE_BREAK_TIME_ID => String::from("45\n"),
         PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID => {
@@ -45,6 +57,18 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_SYSVIPC_MSG_ID => render_sysvipc_msg(),
         PROCFS_SYSVIPC_SEM_ID => render_sysvipc_sem(),
         PROCFS_SYSVIPC_SHM_ID => render_sysvipc_shm(),
+        PROCFS_NET_ROUTE_ID => render_net_route(caller_netns),
+        PROCFS_NET_ARP_ID => render_net_arp(caller_netns),
+        PROCFS_NET_DEV_ID => render_net_dev(caller_netns),
+        PROCFS_NET_TX_NF_RULES_ID => render_netfilter_rules(caller_netns),
+        PROCFS_NET_NF_CONNTRACK_ID => render_nf_conntrack(caller_netns),
+        PROCFS_NET_TCP_ID => render_net_socket_table("tcp"),
+        PROCFS_NET_UDP_ID => render_net_socket_table("udp"),
+        PROCFS_NET_RAW_ID => render_net_socket_table("raw"),
+        PROCFS_NET_SNMP_ID => render_net_snmp(),
+        PROCFS_NET_NETLINK_ID => render_net_netlink(),
+        PROCFS_NET_IF_INET6_ID => String::new(),
+        PROCFS_SYS_NET_IPV4_IP_FORWARD_ID => render_ip_forward(caller_netns),
         _ => String::new(),
     }
 }
@@ -186,6 +210,47 @@ fn render_maps(pid: Pid) -> String {
     out
 }
 
+fn render_status(pid: Pid) -> String {
+    let Some(proc) = process::process_by_pid(pid) else {
+        return String::new();
+    };
+    let state = proc.state_char() as char;
+    let name_buf = proc.comm();
+    let name =
+        core::str::from_utf8(&name_buf[..name_buf.iter().position(|&b| b == 0).unwrap_or(16)])
+            .unwrap_or("?");
+
+    let mut vm_lck_kb = 0usize;
+    if let Some(aspace) = proc.aspace_cap() {
+        for entry in aspace.recipes_snapshot() {
+            if entry.flags.locked {
+                vm_lck_kb += entry.range.page_count() * (tx_subsystems::vm::USER_PAGE_SIZE / 1024);
+            }
+        }
+    }
+
+    format!(
+        "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nThreads:\t{}\nVmLck:\t{:8} kB\n",
+        name,
+        state,
+        state_name(state),
+        pid.0,
+        pid.0,
+        proc.parent_pid().0,
+        proc.live_thread_count(),
+        vm_lck_kb,
+    )
+}
+
+const fn state_name(state: char) -> &'static str {
+    match state {
+        'R' => "running",
+        'S' => "sleeping",
+        'Z' => "zombie",
+        _ => "unknown",
+    }
+}
+
 fn render_fdinfo(pid: Pid, fd: u32) -> String {
     let Some(proc) = process::process_by_pid(pid) else {
         return String::new();
@@ -304,4 +369,81 @@ fn render_sysvipc_shm() -> String {
         ));
     }
     out
+}
+
+fn render_net_route(caller_netns: Option<&NetNamespacePayload>) -> String {
+    with_proc_netns(
+        caller_netns,
+        tx_subsystems::net::proc_net_route_snapshot_text,
+    )
+}
+
+fn render_net_arp(caller_netns: Option<&NetNamespacePayload>) -> String {
+    with_proc_netns(caller_netns, |netns| {
+        tx_subsystems::net::proc_net_arp_snapshot_zero_text(&netns.ether_ifaces_snapshot())
+    })
+}
+
+fn render_net_dev(caller_netns: Option<&NetNamespacePayload>) -> String {
+    with_proc_netns(
+        caller_netns,
+        tx_subsystems::net::proc_net_dev_snapshot_text_for_namespace,
+    )
+}
+
+fn render_netfilter_rules(caller_netns: Option<&NetNamespacePayload>) -> String {
+    with_proc_netns(
+        caller_netns,
+        tx_subsystems::net::proc_net_netfilter_rules_text_for_namespace,
+    )
+}
+
+fn render_nf_conntrack(caller_netns: Option<&NetNamespacePayload>) -> String {
+    with_proc_netns(
+        caller_netns,
+        tx_subsystems::net::proc_net_nf_conntrack_text_for_namespace,
+    )
+}
+
+fn render_net_socket_table(_kind: &'static str) -> String {
+    String::from("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
+}
+
+fn render_net_snmp() -> String {
+    String::from(
+        "Ip: Forwarding DefaultTTL InReceives InHdrErrors InAddrErrors ForwDatagrams InUnknownProtos InDiscards InDelivers OutRequests OutDiscards OutNoRoutes ReasmTimeout ReasmReqds ReasmOKs ReasmFails FragOKs FragFails FragCreates\n\
+Ip: 0 64 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+Icmp: InMsgs InErrors InCsumErrors InDestUnreachs InTimeExcds InParmProbs InSrcQuenchs InRedirects InEchos InEchoReps InTimestamps InTimestampReps InAddrMasks InAddrMaskReps OutMsgs OutErrors OutDestUnreachs OutTimeExcds OutParmProbs OutSrcQuenchs OutRedirects OutEchos OutEchoReps OutTimestamps OutTimestampReps OutAddrMasks OutAddrMaskReps\n\
+Icmp: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails EstabResets CurrEstab InSegs OutSegs RetransSegs InErrs OutRsts InCsumErrors\n\
+Tcp: 1 200 120000 -1 0 0 0 0 0 0 0 0 0 0 0\n\
+Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors\n\
+Udp: 0 0 0 0 0 0 0 0 0\n",
+    )
+}
+
+fn render_net_netlink() -> String {
+    String::from("sk       Eth Pid    Groups   Rmem     Wmem     Dump  Locks    Drops    Inode\n")
+}
+
+fn render_ip_forward(caller_netns: Option<&NetNamespacePayload>) -> String {
+    let enabled = with_proc_netns(caller_netns, |netns| netns.ipv4_forwarding_enabled());
+    if enabled {
+        String::from("1\n")
+    } else {
+        String::from("0\n")
+    }
+}
+
+fn with_proc_netns<T>(
+    caller_netns: Option<&NetNamespacePayload>,
+    render: impl FnOnce(&NetNamespacePayload) -> T,
+) -> T {
+    match caller_netns {
+        Some(netns) => render(netns),
+        None => {
+            let netns = tx_subsystems::net::initial_net_namespace_payload();
+            render(&netns)
+        }
+    }
 }

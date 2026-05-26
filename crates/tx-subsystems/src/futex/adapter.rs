@@ -86,15 +86,17 @@ pub mod wait_routing {
     /// coexistence wake path.
     ///
     /// Delegates to `tx_reactor::wait::fire_legacy`.
-    pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) {
-        tx_reactor::wait::fire_legacy(channel, mask_bits);
+    pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) -> usize {
+        tx_reactor::wait::fire_legacy(channel, mask_bits)
     }
 
     /// Notify the v3 `WaitSource` for one futex bucket — D2
     /// coexistence wake path (mailbox).
     ///
     /// Delegates to `tx_substrate::wake::notify`.
-    pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) {
-        tx_substrate::wake::notify(source, mask_bits)
+    pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) -> usize {
+        use tx_substrate::step::InterestMask;
+
+        source.notify(InterestMask::new(mask_bits))
     }
 }

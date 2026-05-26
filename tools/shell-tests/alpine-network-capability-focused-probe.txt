@@ -1,0 +1,50 @@
+# alpine-network-capability-focused-probe.txt - network capability surface.
+#
+# This probe keeps capability work network-scoped. It verifies root can perform
+# CAP_NET_RAW and CAP_NET_ADMIN-shaped network operations, and records the
+# current non-network capability-lifecycle blocker around setuid preserving caps.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "m=N73H; IP=/sbin/ip; [ -x $IP ] || IP=/usr/sbin/ip; echo ${m}_TOOLS_${IP}\n"
+expect "N73H_TOOLS_" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if [ -x /bin/netcap-probe ]; then echo ${m}_NETCAP_PROBE_PRESENT; else echo ${m}_FAIL_NO_NETCAP_PROBE; fi\n"
+expect "N73H_NETCAP_PROBE_PRESENT" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if [ -x /bin/packet-probe ]; then echo ${m}_PACKET_PROBE_PRESENT; else echo ${m}_FAIL_NO_PACKET_PROBE; fi\n"
+expect "N73H_PACKET_PROBE_PRESENT" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if /bin/packet-probe lo; then echo ${m}_ROOT_PACKET_PROBE_OK; else echo ${m}_FAIL_ROOT_PACKET_PROBE; fi\n"
+expect "tx-packet-probe-ok" within 10000
+expect "N73H_ROOT_PACKET_PROBE_OK" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link add name capadmin0 type bridge; then echo ${m}_ROOT_NET_ADMIN_OK; else echo ${m}_FAIL_ROOT_NET_ADMIN; fi\n"
+expect "N73H_ROOT_NET_ADMIN_OK" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if /bin/netcap-probe; then echo ${m}_NETCAP_PROBE_OK; else echo ${m}_FAIL_NETCAP_PROBE; fi\n"
+expect "tx-netcap-probe-root-raw-ok" within 10000
+expect "tx-netcap-probe-setuid-" within 10000
+expect "tx-netcap-probe-success" within 10000
+expect "N73H_NETCAP_PROBE_OK" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "echo ${m}_CAPABILITY_PROBE_SUCCESS\n"
+expect "N73H_CAPABILITY_PROBE_SUCCESS" within 10000
+expect "/ # " within 10000
+
+sleep 500
+quit

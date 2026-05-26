@@ -64,7 +64,7 @@ pub(super) fn sys_timerfd_create<'a>(
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(Ok(cap)) => cap,
             Ok(Err(_)) => return SyscallResult::Error(ENOMEM_VALUE),
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+            Err(v3errno) => return SyscallResult::error_from(v3errno),
         }
     };
 
@@ -253,7 +253,7 @@ pub(super) async fn sys_timerfd_read<P: super::TimeIf>(
                 return SyscallResult::Return(n as i64);
             }
             V3Out::Err(v3errno) => {
-                let errno: Errno = v3errno.into();
+                let errno: Errno = v3errno;
                 if errno == Errno::EAGAIN {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }

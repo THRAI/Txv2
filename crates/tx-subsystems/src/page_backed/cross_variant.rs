@@ -41,21 +41,21 @@ pub fn step_copy_file_range(
         return V3::done(0);
     }
     if matches!(out_pc.kind(), PageContainerKind::Device { .. }) {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     }
 
     let Some(in_capacity) = in_pc.byte_capacity() else {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     };
     let Some(out_capacity) = out_pc.byte_capacity() else {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     };
 
     let Some(out_end) = out_offset.checked_add(len as u64) else {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     };
     if out_end > out_capacity {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     }
 
     let in_valid_end = core::cmp::min(in_pc.size_bytes(), in_capacity);
@@ -190,7 +190,7 @@ pub fn step_copy_file_range(
             Ok(ptr) => ptr,
             Err(_) => {
                 if advanced == 0 {
-                    return V3::err(Errno::EIO.into());
+                    return V3::err(Errno::EIO);
                 }
                 publish_progress(out_pc, out_offset, advanced);
                 return V3::done(advanced);
@@ -200,7 +200,7 @@ pub fn step_copy_file_range(
             Ok(ptr) => ptr,
             Err(_) => {
                 if advanced == 0 {
-                    return V3::err(Errno::EIO.into());
+                    return V3::err(Errno::EIO);
                 }
                 publish_progress(out_pc, out_offset, advanced);
                 return V3::done(advanced);

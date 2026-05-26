@@ -428,20 +428,24 @@ def main():
     results = {}
 
     for group, group_lines in sorted(groups.items()):
-        if group not in judges:
-            print(f"[{group}] 无对应 judge 脚本，跳过")
-            continue
-        judge_path = judges[group]
-        proc = subprocess.run(
-            [sys.executable, judge_path],
-            input="".join(group_lines).encode(),
-            capture_output=True,
-        )
-        try:
-            data = json.loads(proc.stdout.decode())
-        except Exception:
-            print(f"[{group}] judge 解析失败: {proc.stderr.decode()[:200]}")
-            continue
+        if group in judges:
+            judge_path = judges[group]
+            judge_input = judge_compatible_input(group, group_lines)
+            proc = subprocess.run(
+                [sys.executable, judge_path],
+                input=judge_input.encode(),
+                capture_output=True,
+            )
+            try:
+                data = json.loads(proc.stdout.decode())
+            except Exception:
+                print(f"[{group}] judge 解析失败: {proc.stderr.decode()[:200]}")
+                continue
+        else:
+            data = fallback_results(group, group_lines)
+            if data is None:
+                print(f"[{group}] 无对应 judge 脚本，跳过")
+                continue
 
         if not official_only:
             data = adapt_ltp_detail_counts(group, group_lines, data)
@@ -459,6 +463,146 @@ def main():
 
     print()
     print(f"总分: {total_pass}/{total_all}")
+
+
+def base_group(group):
+    for suffix in ("-musl", "-glibc"):
+        if group.endswith(suffix):
+            return group[: -len(suffix)]
+    return group
+
+
+def judge_compatible_input(group, group_lines):
+    """Adapt local focused-suite output to the official judge input dialect."""
+    if base_group(group) != "ltp":
+        return "".join(group_lines)
+
+    rewritten = []
+    current_case = None
+    counts = None
+    saw_summary = False
+    for idx, line in enumerate(group_lines):
+        line = normalize_ltp_result_token(line)
+        stripped = line.strip()
+
+        if stripped.startswith("RUN LTP CASE "):
+            current_case = stripped.split()[-1]
+            counts = new_ltp_counts()
+            saw_summary = False
+
+        kind = ltp_result_kind(line)
+        if counts is not None and kind is not None:
+            counts[kind] += 1
+
+        if stripped == "Summary:":
+            saw_summary = True
+
+        if stripped.startswith("FAIL LTP CASE "):
+            if current_case is not None and counts and not saw_summary and sum(counts.values()) > 0:
+                rewritten.extend(format_ltp_summary(counts))
+            current_case = None
+            counts = None
+            saw_summary = False
+
+        rewritten.append(line)
+        if stripped.startswith("PASS LTP CASE "):
+            # Official OSComp LTP judges use "FAIL LTP CASE ..." as an
+            # end-of-case marker and derive pass counts from preceding TPASS
+            # lines. Keep focused logs readable while feeding the legacy
+            # marker to the unmodified judge.
+            marker = line.replace("PASS LTP CASE", "FAIL LTP CASE", 1)
+            if not next_nonempty_line_is(group_lines, idx + 1, marker.strip()):
+                if current_case is not None and counts and not saw_summary and sum(counts.values()) > 0:
+                    rewritten.extend(format_ltp_summary(counts))
+                rewritten.append(marker)
+                current_case = None
+                counts = None
+                saw_summary = False
+    return "".join(rewritten)
+
+
+LTP_OLD_RESULT_TOKENS = [
+    ("\x1b[1;32mTPASS\x1b[0m", "\x1b[1;32mTPASS: \x1b[0m"),
+    ("\x1b[1;31mTFAIL\x1b[0m", "\x1b[1;31mTFAIL: \x1b[0m"),
+    ("\x1b[1;31mTBROK\x1b[0m", "\x1b[1;31mTBROK: \x1b[0m"),
+    ("\x1b[1;33mTCONF\x1b[0m", "\x1b[1;33mTCONF: \x1b[0m"),
+    ("\x1b[1;35mTWARN\x1b[0m", "\x1b[1;35mTWARN: \x1b[0m"),
+]
+
+
+def normalize_ltp_result_token(line):
+    """Normalize older LTP API result lines to the token shape parsed by OSComp."""
+    for old_token, new_token in LTP_OLD_RESULT_TOKENS:
+        marker = f"{old_token}  :"
+        if marker in line:
+            return line.replace(marker, new_token, 1)
+    return line
+
+
+def new_ltp_counts():
+    return {"passed": 0, "failed": 0, "broken": 0, "skipped": 0, "warnings": 0}
+
+
+def ltp_result_kind(line):
+    if "TPASS:" in line:
+        return "passed"
+    if "TFAIL:" in line:
+        return "failed"
+    if "TBROK:" in line:
+        return "broken"
+    if "TCONF:" in line:
+        return "skipped"
+    if "TWARN:" in line:
+        return "warnings"
+    return None
+
+
+def format_ltp_summary(counts):
+    return [
+        "\n",
+        "Summary:\n",
+        f"passed   {counts['passed']}\n",
+        f"failed   {counts['failed']}\n",
+        f"broken   {counts['broken']}\n",
+        f"skipped  {counts['skipped']}\n",
+        f"warnings {counts['warnings']}\n",
+    ]
+
+
+def next_nonempty_line_is(lines, start_idx, expected):
+    for line in lines[start_idx:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        return stripped == expected
+    return False
+
+
+def fallback_results(group, group_lines):
+    """Parse stable output emitted by official testsuits shell scripts."""
+    group = base_group(group)
+    text = "".join(group_lines)
+    if group == "busybox":
+        return command_results(text, r"testcase busybox (.*?) (success|fail)\s*$")
+    if group in ("iperf", "netperf"):
+        return command_results(
+            text, rf"====== {re.escape(group)} (.*?) end: (success|fail) ======"
+        )
+    return None
+
+
+def command_results(text, pattern):
+    items = []
+    for match in re.finditer(pattern, text, flags=re.MULTILINE):
+        name, status = match.groups()
+        items.append(
+            {
+                "name": name.strip(),
+                "pass": 1 if status == "success" else 0,
+                "all": 1,
+            }
+        )
+    return items or None
 
 
 if __name__ == "__main__":

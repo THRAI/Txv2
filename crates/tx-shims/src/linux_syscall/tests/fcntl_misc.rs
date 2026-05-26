@@ -4,13 +4,12 @@ use super::*;
 
 use crate::linux_syscall::{
     F_DUPFD, F_DUPFD_CLOEXEC, F_GETFL, F_SETFL, NR_FCNTL, NR_GETRANDOM, NR_KILL, NR_PRLIMIT64,
-    NR_RT_SIGRETURN, NR_SETHOSTNAME, NR_TGKILL, NR_TKILL, NR_UNAME, O_RDWR, RLIMIT_AS,
+    NR_RT_SIGRETURN, NR_SETHOSTNAME, NR_TGKILL, NR_TKILL, NR_UNAME, O_NONBLOCK, O_RDWR, RLIMIT_AS,
     RLIMIT_NOFILE, RLIM_INFINITY,
 };
 use tx_subsystems::process::Pgid;
 
 const E_BADF: i32 = 9;
-const E_NOSYS: i32 = 38;
 const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
 const E_PERM: i32 = 1;
@@ -115,12 +114,29 @@ fn dispatch_fcntl_f_getfl_returns_open_flag_bits() {
     assert_eq!(r, SyscallResult::Return(O_RDWR as i64));
 }
 
-// Removed: `dispatch_fcntl_f_setfl_returns_neg_enosys`.
-// `F_SETFL` is now wired (the OpenFile-flags interior-mutability hook
-// landed in a later slice); the `-ENOSYS` expectation is stale. The
-// success path is exercised by `dispatch_fcntl_f_setfl_*` tests
-// elsewhere in this file when present, and at the
-// `OpenFile::set_runtime_nonblocking` unit-test level.
+/// `fcntl(fd, F_SETFL, O_NONBLOCK)` updates the shared OpenFile status
+/// bits that `F_GETFL` reports.
+#[test]
+fn dispatch_fcntl_f_setfl_updates_nonblocking_status_bit() {
+    let _setup = setup();
+    let _ops = install_capturing_console();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
+    let ctx = make_ctx(proc_cap, thread);
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_FCNTL, [3, F_SETFL as u64, O_NONBLOCK as u64, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(0));
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_FCNTL, [3, F_GETFL as u64, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return((O_RDWR | O_NONBLOCK) as i64));
+}
 
 // -----------------------------------------------------------------
 // getpgrp.
@@ -134,26 +150,25 @@ fn dispatch_fcntl_f_getfl_returns_open_flag_bits() {
 // kill / tkill / tgkill.
 // -----------------------------------------------------------------
 
-/// `kill(self_pid, SIGTERM)` returns 0 — the post is delivered to
-/// the calling process's leader thread. The process becomes a
-/// zombie via the (separately-tested) signal-driven exit path, but
-/// the test only asserts the return value (which is what userspace
-/// sees).
+/// `kill(self_pid, SIGTERM)` returns 0 and materialises the default
+/// terminate disposition immediately. This matches blocking-server
+/// shutdown paths that rely on SIGTERM killing a target even when it
+/// is asleep inside a syscall.
 #[test]
 fn dispatch_kill_self_with_sigterm_succeeds() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
     let pid = proc_cap.pid.0 as u64;
-    let ctx = make_ctx(proc_cap, thread);
+    let ctx = make_ctx(proc_cap.clone(), thread);
 
-    // SIGTERM = 15 (catchable; routes through post_signal, no
-    // zombification side-effect on the calling thread).
+    // SIGTERM = 15 (catchable; default disposition is terminate).
     let r = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(NR_KILL, [pid, 15, 0, 0, 0, 0]),
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Return(0));
+    assert!(proc_cap.is_zombie());
 }
 
 /// `kill(target, sig)` from a non-privileged caller whose uid does
@@ -563,7 +578,7 @@ fn dispatch_sethostname_too_long_returns_neg_einval() {
 // -----------------------------------------------------------------
 
 /// `prlimit64(0, RLIMIT_NOFILE, NULL, &old)` returns 0 and writes
-/// the default `(1024, 1024)` pair to `old`.
+/// the process default `(1024, 4096)` pair to `old`.
 #[test]
 fn dispatch_prlimit64_rlimit_nofile_returns_default() {
     let _setup = setup();
@@ -580,7 +595,7 @@ fn dispatch_prlimit64_rlimit_nofile_returns_default() {
     ));
     assert_eq!(r, SyscallResult::Return(0));
     assert_eq!(buf[0], 1024, "RLIMIT_NOFILE rlim_cur must default to 1024");
-    assert_eq!(buf[1], 1024, "RLIMIT_NOFILE rlim_max must default to 1024");
+    assert_eq!(buf[1], 4096, "RLIMIT_NOFILE rlim_max must default to 4096");
 }
 
 /// `prlimit64(0, RLIMIT_AS, NULL, &old)` returns the
@@ -642,7 +657,6 @@ fn dispatch_prlimit64_cross_pid_returns_neg_eperm() {
 // rt_sigreturn (carryover marker).
 // -----------------------------------------------------------------
 
-/// `rt_sigreturn` returns `-ENOSYS` for now. The
 /// `rt_sigreturn` with no parked signal frame returns `-EFAULT`.
 /// The kernel has no pre-handler context to restore — POSIX leaves
 /// this case undefined; we refuse rather than corrupt the live
@@ -658,7 +672,7 @@ fn dispatch_rt_sigreturn_without_frame_returns_neg_efault() {
         SyscallRequest::new(NR_RT_SIGRETURN, [0; 6]),
         &ctx,
     ));
-    assert_eq!(r, SyscallResult::Error(14)); // EFAULT
+    assert_eq!(r, SyscallResult::Error(E_FAULT));
 }
 
 /// The syscall-layer fallback still restores the parked pre-handler
@@ -674,6 +688,7 @@ fn dispatch_rt_sigreturn_restores_parked_signal_context() {
     let mut parked = tx_hal::UserTrapContext::empty();
     parked.pc = 0x1234_5678;
     parked.regs[10] = 0xdead_beef;
+    payload.store_saved_user_context(Some(tx_hal::UserTrapContext::empty()));
     payload.store_saved_signal_context(Some(parked));
 
     let ctx = make_ctx(proc_cap, thread.clone());

@@ -220,7 +220,7 @@ pub(super) fn sys_setuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -238,7 +238,7 @@ pub(super) fn sys_setgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -288,7 +288,7 @@ pub(super) fn sys_setreuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -305,7 +305,7 @@ pub(super) fn sys_setregid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -329,7 +329,7 @@ pub(super) fn sys_setresuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -348,7 +348,7 @@ pub(super) fn sys_setresgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 

@@ -3,7 +3,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tx_hal::{PmapIf, UserTrapContext};
 
@@ -301,7 +301,9 @@ pub fn bootstrap_init_process(
         None,
         BTreeMap::new(),
         BTreeSet::new(),
-        (1024, 1024),
+        (1024, 4096),
+        (u64::MAX, u64::MAX),
+        crate::net::initial_net_namespace_payload(),
         BOOTSTRAP_BRK_BASE,
         BOOTSTRAP_BRK_BASE,
         // Slice 6 of the shell-prompt roadmap. init's file-creation
@@ -387,6 +389,8 @@ pub fn step_fork_with_options<P: PmapIf>(
         parent_fds,
         parent_fd_cloexec,
         parent_rlimit_nofile,
+        parent_rlimit_memlock,
+        parent_net_namespace,
         parent_brk_base,
         parent_current_brk,
         parent_umask,
@@ -401,6 +405,8 @@ pub fn step_fork_with_options<P: PmapIf>(
             payload.clone_fds_for_fork(),
             payload.fd_cloexec_snapshot(),
             payload.rlimit_nofile(),
+            payload.rlimit_memlock(),
+            payload.net_namespace(),
             payload.brk_base(),
             payload.current_brk(),
             payload.umask(),
@@ -460,6 +466,8 @@ pub fn step_fork_with_options<P: PmapIf>(
         parent_fds,
         parent_fd_cloexec,
         parent_rlimit_nofile,
+        parent_rlimit_memlock,
+        parent_net_namespace,
         parent_brk_base,
         parent_current_brk,
         parent_umask,
@@ -701,7 +709,8 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     if let Some(payload) = payload_guard.as_ref() {
         let _shm_detach =
             crate::ipc::sysv_shm::execution::detach_all_for_aspace(&payload.aspace_cap());
-        let _closed_fds = payload.drain_fds();
+        let closed_fds = payload.drain_fds();
+        close_socket_files_for_process_exit(&closed_fds);
         let drained: Vec<Cap<ThreadIdentity>> = payload.threads.drain();
         for thread in &drained {
             set_thread_zombie(thread, status.wait_status_word());
@@ -709,7 +718,7 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
                 unregister_pid_number(thread.tid.0 as u64);
             }
         }
-        // `_closed_fds` and `drained` drop here, releasing open-file and
+        // `closed_fds` and `drained` drop here, releasing open-file and
         // thread refs before the payload is detached below.
     }
     *payload_guard = None;
@@ -750,10 +759,43 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
     if let Some(payload) = payload_guard.as_ref() {
         let _shm_detach =
             crate::ipc::sysv_shm::execution::detach_all_for_aspace(&payload.aspace_cap());
-        let _closed_fds = payload.drain_fds();
+        let closed_fds = payload.drain_fds();
+        close_socket_files_for_process_exit(&closed_fds);
     }
     *payload_guard = None;
     post_sigchld_to_parent(process);
+}
+
+fn close_socket_files_for_process_exit(fds: &BTreeMap<u32, Cap<OpenFile>>) {
+    let mut seen_files = Vec::new();
+    for file in fds.values() {
+        let raw_file = file.raw();
+        if seen_files.contains(&raw_file) {
+            continue;
+        }
+        seen_files.push(raw_file);
+
+        let drained_refs = fds
+            .values()
+            .filter(|candidate| candidate.raw() == raw_file)
+            .count() as u32;
+        if file.retain_count() > drained_refs {
+            continue;
+        }
+
+        let crate::vfs::structure::OpenFileBacking::Rnode { rnode } = file.backing() else {
+            continue;
+        };
+        let crate::vfs::structure::RNodeBacking::StructBacked {
+            payload: crate::vfs::structure::StructPayload::Socket { identity },
+        } = rnode.backing()
+        else {
+            continue;
+        };
+
+        let guard = step_engine::guard();
+        let _ = crate::net::execution::step_socket_close(identity, &guard);
+    }
 }
 
 /// Children reparenting per `PROCESS_v1` §8.1. Three cases:
@@ -1200,6 +1242,8 @@ fn sign_process_payload(
     fds: BTreeMap<u32, Cap<OpenFile>>,
     fd_cloexec: BTreeSet<u32>,
     rlimit_nofile: (u32, u32),
+    rlimit_memlock: (u64, u64),
+    net_namespace: PayloadCap<crate::net::NetNamespacePayload>,
     brk_base: u64,
     current_brk: u64,
     umask: u16,
@@ -1230,6 +1274,10 @@ fn sign_process_payload(
     let nsproxy_slot: AtomicSlot<Cap<crate::process::nsproxy::NsProxy>> = AtomicSlot::empty();
     nsproxy_slot.store(Some(nsproxy));
 
+    let net_namespace_slot: AtomicSlot<PayloadCap<crate::net::NetNamespacePayload>> =
+        AtomicSlot::empty();
+    net_namespace_slot.store(Some(net_namespace));
+
     // Allocate a fresh `exit_source` Channel per `ProcessPayload` and
     // register it with the global wait-source resolver so async
     // awaiters can `wait_on_token` against the returned id without
@@ -1259,11 +1307,14 @@ fn sign_process_payload(
         signal_port: RawPort::new(),
         cred: cred_slot,
         nsproxy: nsproxy_slot,
+        net_namespace: net_namespace_slot,
         cwd: SpinMutex::new(cwd),
         fds: SpinMutex::new(fds),
         fd_cloexec: SpinMutex::new(fd_cloexec),
         rlimit_nofile_cur: AtomicU32::new(rlimit_nofile.0),
         rlimit_nofile_max: AtomicU32::new(rlimit_nofile.1),
+        rlimit_memlock_cur: AtomicU64::new(rlimit_memlock.0),
+        rlimit_memlock_max: AtomicU64::new(rlimit_memlock.1),
         brk_base: core::sync::atomic::AtomicU64::new(brk_base),
         current_brk: core::sync::atomic::AtomicU64::new(current_brk),
         // Slice 6 of the shell-prompt roadmap. Per-process
@@ -1758,7 +1809,3 @@ impl StepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {
 }
 
 impl OneShotStepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {}
-
-#[cfg(test)]
-#[path = "step_op_wraps.rs"]
-mod step_op_wraps;

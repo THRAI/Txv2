@@ -125,7 +125,7 @@ pub(super) fn sys_uname<'a, P: AuxvIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 /// cross-pid queries return `-EPERM`. `new_rlim` is silently ignored
 /// — limits are not actually enforced by any in-tree subsystem yet
 /// (`TODO(phase-rlimit-enforcement)`). The static table is generous
-/// (`RLIMIT_NOFILE = (1024, 1024)`, `RLIMIT_STACK = 8 MiB`, the rest
+/// (`RLIMIT_NOFILE = (1024, 4096)`, `RLIMIT_STACK = 8 MiB`, the rest
 /// `RLIM_INFINITY`).
 ///
 /// Unknown resource ids return `-EINVAL`. Null `old_rlim` is OK (the
@@ -143,16 +143,23 @@ pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
         return SyscallResult::Error(EPERM_VALUE);
     }
 
-    if resource == RLIMIT_NOFILE && new_uaddr != 0 {
+    if (resource == RLIMIT_NOFILE || resource == RLIMIT_MEMLOCK) && new_uaddr != 0 {
         let new_limit = match bootstrap_read_user::<RlimitLayout>(&ctx.aspace, new_uaddr) {
             Ok(limit) => limit,
             Err(errno) => return SyscallResult::error_from(errno),
         };
-        if new_limit.rlim_cur > new_limit.rlim_max || new_limit.rlim_max > u32::MAX as u64 {
+        if new_limit.rlim_cur > new_limit.rlim_max
+            || (resource == RLIMIT_NOFILE && new_limit.rlim_max > u32::MAX as u64)
+        {
             return SyscallResult::Error(EINVAL_VALUE);
         }
-        ctx.process
-            .set_rlimit_nofile(new_limit.rlim_cur as u32, new_limit.rlim_max as u32);
+        if resource == RLIMIT_NOFILE {
+            ctx.process
+                .set_rlimit_nofile(new_limit.rlim_cur as u32, new_limit.rlim_max as u32);
+        } else {
+            ctx.process
+                .set_rlimit_memlock(new_limit.rlim_cur, new_limit.rlim_max);
+        }
     }
 
     let limit = match resource {
@@ -171,9 +178,16 @@ pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
             rlim_cur: 0,
             rlim_max: RLIM_INFINITY,
         },
-        RLIMIT_CPU | RLIMIT_FSIZE | RLIMIT_DATA | RLIMIT_RSS | RLIMIT_NPROC | RLIMIT_MEMLOCK
-        | RLIMIT_AS | RLIMIT_LOCKS | RLIMIT_SIGPENDING | RLIMIT_MSGQUEUE | RLIMIT_NICE
-        | RLIMIT_RTPRIO | RLIMIT_RTTIME => RlimitLayout {
+        RLIMIT_MEMLOCK => {
+            let (cur, max) = ctx.process.rlimit_memlock();
+            RlimitLayout {
+                rlim_cur: cur,
+                rlim_max: max,
+            }
+        }
+        RLIMIT_CPU | RLIMIT_FSIZE | RLIMIT_DATA | RLIMIT_RSS | RLIMIT_NPROC | RLIMIT_AS
+        | RLIMIT_LOCKS | RLIMIT_SIGPENDING | RLIMIT_MSGQUEUE | RLIMIT_NICE | RLIMIT_RTPRIO
+        | RLIMIT_RTTIME => RlimitLayout {
             rlim_cur: RLIM_INFINITY,
             rlim_max: RLIM_INFINITY,
         },

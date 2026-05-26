@@ -32,11 +32,11 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
     ) -> V3Outcome<FsObjectId, NoProgress> {
         let inner = self.inner.lock();
         let Some(map) = inner.children.get(&parent) else {
-            return V3Outcome::err(Errno::ENOTDIR.into());
+            return V3Outcome::err(Errno::ENOTDIR);
         };
         match map.get(name) {
             Some(id) => V3Outcome::done(*id),
-            None => V3Outcome::err(Errno::ENOENT.into()),
+            None => V3Outcome::err(Errno::ENOENT),
         }
     }
 
@@ -47,7 +47,7 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
     ) -> V3Outcome<InodeMeta, NoProgress> {
         let inner = self.inner.lock();
         let Some(inode) = inner.inodes.get(&fs_object_id) else {
-            return V3Outcome::err(Errno::ENOENT.into());
+            return V3Outcome::err(Errno::ENOENT);
         };
         let meta = match inode {
             ExecTestInode::Directory => InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
@@ -85,7 +85,7 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> V3Outcome<(FsObjectId, InodeMeta), NoProgress> {
-        V3Outcome::err(Errno::ENOSYS.into())
+        V3Outcome::err(Errno::ENOSYS)
     }
 
     fn unlink(
@@ -95,7 +95,7 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> V3Outcome<(), NoProgress> {
-        V3Outcome::err(Errno::ENOSYS.into())
+        V3Outcome::err(Errno::ENOSYS)
     }
 
     fn rename(
@@ -106,7 +106,7 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
         _new_name: &[u8],
         _guard: &Guard<'_>,
     ) -> V3Outcome<(), NoProgress> {
-        V3Outcome::err(Errno::ENOSYS.into())
+        V3Outcome::err(Errno::ENOSYS)
     }
 
     fn link(
@@ -116,7 +116,7 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> V3Outcome<(), NoProgress> {
-        V3Outcome::err(Errno::ENOSYS.into())
+        V3Outcome::err(Errno::ENOSYS)
     }
 
     fn mkdir(
@@ -127,7 +127,7 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> V3Outcome<(FsObjectId, InodeMeta), NoProgress> {
-        V3Outcome::err(Errno::ENOSYS.into())
+        V3Outcome::err(Errno::ENOSYS)
     }
 
     fn rmdir(
@@ -137,7 +137,7 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> V3Outcome<(), NoProgress> {
-        V3Outcome::err(Errno::ENOSYS.into())
+        V3Outcome::err(Errno::ENOSYS)
     }
 
     fn symlink(
@@ -148,7 +148,7 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> V3Outcome<(FsObjectId, InodeMeta), NoProgress> {
-        V3Outcome::err(Errno::ENOSYS.into())
+        V3Outcome::err(Errno::ENOSYS)
     }
 
     fn readdir(
@@ -173,7 +173,7 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> V3Outcome<Box<[u8]>, NoProgress> {
-        V3Outcome::err(Errno::EINVAL.into())
+        V3Outcome::err(Errno::EINVAL)
     }
 
     fn materialise_rnode(
@@ -185,7 +185,7 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
     ) -> V3Outcome<Cap<RNode>, NoProgress> {
         let inner = self.inner.lock();
         let Some(inode) = inner.inodes.get(&fs_object_id) else {
-            return V3Outcome::err(Errno::ENOENT.into());
+            return V3Outcome::err(Errno::ENOENT);
         };
         match inode {
             ExecTestInode::Regular { container, .. } => {
@@ -198,10 +198,10 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
                     mount,
                 ) {
                     Ok(rnode) => V3Outcome::done(rnode),
-                    Err(_) => V3Outcome::err(Errno::ENOMEM.into()),
+                    Err(_) => V3Outcome::err(Errno::ENOMEM),
                 }
             }
-            ExecTestInode::Directory => V3Outcome::err(Errno::EISDIR.into()),
+            ExecTestInode::Directory => V3Outcome::err(Errno::EISDIR),
         }
     }
 }
@@ -216,14 +216,14 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecTestFs {
         let inner = self.inner.lock();
         let container = match inner.inodes.get(&fs_object_id) {
             Some(ExecTestInode::Regular { container, .. }) => container.clone(),
-            Some(ExecTestInode::Directory) => return V3Outcome::err(Errno::EISDIR.into()),
-            None => return V3Outcome::err(Errno::ENOENT.into()),
+            Some(ExecTestInode::Directory) => return V3Outcome::err(Errno::EISDIR),
+            None => return V3Outcome::err(Errno::ENOENT),
         };
         drop(inner);
 
         let page_size = USER_PAGE_SIZE as u64;
         if !offset.is_multiple_of(page_size) {
-            return V3Outcome::err(Errno::EINVAL.into());
+            return V3Outcome::err(Errno::EINVAL);
         }
         let page_index = PageIndex::new(offset / page_size);
         match container.materialize_page(page_index, MaterializeAccess::Read, guard) {

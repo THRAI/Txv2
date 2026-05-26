@@ -4,14 +4,38 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine};
+use crate::adapter::step_engine::{self as step_engine, SpinMutex};
 use crate::linux_syscall::numbers::CLONE_NEWIPC;
+use alloc::collections::BTreeMap;
 
 /// Linux raw `wait4`/`getrusage` rusage image for musl LP64:
 /// two `timeval`s plus fourteen `long` counters. musl passes the
 /// syscall a pointer adjusted to this 144-byte prefix and keeps the
 /// public `struct rusage` reserved tail in libc-owned memory.
 const RUSAGE_BYTES: usize = 144;
+
+const SCHED_ATTR_SIZE: u32 = core::mem::size_of::<SchedAttrLayout>() as u32;
+const SCHED_NORMAL: u32 = 0;
+const SCHED_FIFO: u32 = 1;
+const SCHED_RR: u32 = 2;
+const SCHED_BATCH: u32 = 3;
+const SCHED_IDLE: u32 = 5;
+const SCHED_DEADLINE: u32 = 6;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct SchedAttrLayout {
+    size: u32,
+    sched_policy: u32,
+    sched_flags: u64,
+    sched_nice: i32,
+    sched_priority: u32,
+    sched_runtime: u64,
+    sched_deadline: u64,
+    sched_period: u64,
+}
+
+static SCHED_ATTRS: SpinMutex<BTreeMap<u32, SchedAttrLayout>> = SpinMutex::new(BTreeMap::new());
 
 /// `exit(status)` — per-thread exit per `PROCESS_v1` §7.3.1.
 ///
@@ -35,18 +59,13 @@ pub(super) fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::NoReturn,
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
 /// `exit_group(status)` — per `PROCESS_v1` §7.3.2.
 /// PR-3 migration: `ExitGroupOp` is a `OneShotStepOp` — dispatched
 /// via `drive_oneshot` (no reactor, no yield).
-/// `gettid()` — return the callers thread id.
-pub(super) fn sys_gettid(ctx: &SyscallCtx) -> SyscallResult {
-    SyscallResult::Return(ctx.thread.tid.0 as i64)
-}
-
 pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let status = args[0] as i32;
     let mut script_ctx = build_subject_script_ctx(ctx);
@@ -56,7 +75,7 @@ pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::NoReturn,
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -68,6 +87,103 @@ pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
 /// construction).
 pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.process.pid.0 as i64)
+}
+
+/// `gettid()` — direct read of the calling thread identity.
+///
+/// musl-linked network tools use this as part of their fork/thread
+/// bookkeeping. txKernel's current thread model already assigns a
+/// stable tid when the `ThreadIdentity` is signed, so the syscall can
+/// expose that id without touching process state.
+pub(super) fn sys_gettid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SyscallResult::Return(ctx.thread.tid.0 as i64)
+}
+
+/// `getrusage(who, usage)` — minimal zeroed resource accounting.
+///
+/// iperf3 probes this for CPU-utilisation reporting after the TCP
+/// control channel is established. txKernel does not yet maintain
+/// per-process CPU/io accounting, so this accepts the Linux `who`
+/// values that userland commonly passes and writes a zeroed
+/// `struct rusage`. That is preferable to `-ENOSYS`: callers can
+/// continue with valid "unknown/zero" counters instead of taking an
+/// error path unrelated to the network data plane.
+pub(super) fn sys_getrusage<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    const RUSAGE_SELF: i32 = 0;
+    const RUSAGE_CHILDREN: i32 = -1;
+    const RUSAGE_THREAD: i32 = 1;
+    const RUSAGE_BYTES_RV64: usize = 18 * 8;
+
+    let who = args[0] as i32;
+    match who {
+        RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD => {}
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    }
+    if args[1] == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    let usage = [0u8; RUSAGE_BYTES_RV64];
+    match bootstrap_copy_to_user(&ctx.aspace, args[1], &usage) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
+/// `unshare(CLONE_NEWNET)` — move the calling process into a fresh
+/// network namespace.
+///
+/// This is intentionally the minimal Docker-control-plane ABI: only
+/// `CLONE_NEWNET` is accepted, and the operation is gated by
+/// `CAP_SYS_ADMIN` like Linux. The namespace object itself still
+/// belongs to the network subsystem; the process only swaps the
+/// payload cap it uses for socket/netlink operations.
+pub(super) fn sys_unshare<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let flags = args[0];
+    if flags == 0 {
+        return SyscallResult::Return(0);
+    }
+    if flags & !CLONE_NEWNET != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if !ctx.cred().is_privileged_for(Capability::SYS_ADMIN) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+
+    let namespace = match tx_subsystems::net::create_isolated_net_namespace("unshare") {
+        Ok(namespace) => namespace,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let Some(payload) = namespace.payload_cap() else {
+        return SyscallResult::Error(EIO_VALUE);
+    };
+    let _old = ctx.process.replace_net_namespace(payload);
+    SyscallResult::Return(0)
+}
+
+/// `setns(fd, CLONE_NEWNET)` — join a network namespace referenced by
+/// a namespace fd such as `/proc/<pid>/ns/net`.
+pub(super) fn sys_setns<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i64;
+    let nstype = args[1];
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if nstype != 0 && nstype != CLONE_NEWNET {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if !ctx.cred().is_privileged_for(Capability::SYS_ADMIN) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+
+    let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
+        return SyscallResult::Error(EBADF_VALUE);
+    };
+    let Some(payload) = tx_subsystems::net::net_namespace_payload_from_file(&file) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    let _old = ctx.process.replace_net_namespace(payload);
+    SyscallResult::Return(0)
 }
 
 /// `execve(path, argv, envp)` — Wave 4 / Phase 6 of the ELF-loader
@@ -289,6 +405,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     let clone_vfork = (flags & CLONE_VFORK) != 0;
     let clone_settls = (flags & CLONE_SETTLS) != 0;
     let clone_child_cleartid = (flags & CLONE_CHILD_CLEARTID) != 0;
+    let clone_child_settid = (flags & CLONE_CHILD_SETTID) != 0;
     let clone_parent_settid = (flags & CLONE_PARENT_SETTID) != 0;
     let clone_newipc = (flags & CLONE_NEWIPC) != 0;
 
@@ -306,6 +423,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             | CLONE_SIGHAND
             | CLONE_SETTLS
             | CLONE_CHILD_CLEARTID
+            | CLONE_CHILD_SETTID
             | CLONE_PARENT_SETTID
             | CLONE_FILES
             | CLONE_FS
@@ -322,6 +440,9 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             | CLONE_FILES
             | CLONE_FS
             | CLONE_NEWIPC
+            | CLONE_CHILD_CLEARTID
+            | CLONE_CHILD_SETTID
+            | CLONE_PARENT_SETTID
     };
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
@@ -385,6 +506,16 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
                 );
             }
         }
+        if clone_child_settid {
+            let ctid_ptr = args[4];
+            if ctid_ptr != 0 {
+                let _ = super::user_copy::bootstrap_write_user(
+                    &ctx.aspace,
+                    ctid_ptr,
+                    child_thread.tid.0 as i32,
+                );
+            }
+        }
 
         // Hand the child thread to the reactor.
         reactor_submit::submit_child_thread(ctx.process.clone(), child_thread.clone());
@@ -416,7 +547,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(r) => r,
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+            Err(v3errno) => return SyscallResult::error_from(v3errno),
         }
     };
     // step_fork: mint a child ProcessIdentity + leader ThreadIdentity
@@ -462,6 +593,22 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         stack as usize,
     );
 
+    let child_tid = child_thread.tid.0 as i32;
+    if clone_parent_settid && args[2] != 0 {
+        let _ = super::user_copy::bootstrap_write_user(&ctx.aspace, args[2], child_tid);
+    }
+    if clone_child_cleartid && args[4] != 0 {
+        if let Some(payload) = child_thread.payload_cap() {
+            payload.clear_child_tid.lock().replace(args[4]);
+        }
+    }
+    if clone_child_settid && args[4] != 0 {
+        let child_aspace = child.aspace_cap().expect(
+            ":clone:no-child-aspace: kernel-invariant violation, fresh child has no aspace",
+        );
+        let _ = super::user_copy::bootstrap_write_user(&child_aspace, args[4], child_tid);
+    }
+
     // Hand the child's leader thread to the reactor. Panics with
     // `:clone:no-reactor-seam` if the boot path didn't install the
     // seam — that's a boot-time invariant violation.
@@ -505,6 +652,12 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             stored: false,
         }
         .await;
+    } else {
+        // A forked child is runnable before the parent observes the pid.
+        // Yield once so cooperative workloads that immediately wait or launch
+        // the next command still give daemon children a chance to reach their
+        // externally-visible setup points (for example listen sockets).
+        tx_reactor::yield_now().await;
     }
 
     // Parent observes the child's pid.
@@ -598,6 +751,7 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                         return SyscallResult::error_from(errno);
                     }
                 }
+                yield_after_reap().await;
                 return SyscallResult::Return(child_pid.0 as i64);
             }
             Err(WaitError::NoChildren) => return SyscallResult::Error(ECHILD_VALUE),
@@ -630,6 +784,14 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                         return SyscallResult::error_from(errno);
                     }
                 }
+                // A foreground child exit often unblocks shell scripts that
+                // immediately launch the next client while daemon peers are
+                // also ready to finish double-fork setup, observe EOF/close,
+                // or reset their listeners. Give the cooperative scheduler a
+                // short bounded fairness window so those peers can publish
+                // externally-visible socket state without scripts needing
+                // timing sleeps.
+                yield_after_reap().await;
                 return SyscallResult::Return(child_pid.0 as i64);
             }
             WaitOutcome::Done(Err(WaitError::NoChildren)) => {
@@ -648,7 +810,7 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     future.await;
                 }
             }
-            WaitOutcome::Err(e) => return SyscallResult::error_from(e.into()),
+            WaitOutcome::Err(e) => return SyscallResult::error_from(e),
             _ => {}
         }
     }
@@ -663,6 +825,12 @@ fn write_wait4_rusage_if_requested(
     }
     let zeros = [0u8; RUSAGE_BYTES];
     bootstrap_copy_to_user(&ctx.aspace, rusage_uaddr, &zeros).map_err(SyscallResult::error_from)
+}
+
+async fn yield_after_reap() {
+    for _ in 0..4 {
+        tx_reactor::yield_now().await;
+    }
 }
 
 /// `getppid()` — return the parent's pid, or `0` (`Pid::RESERVED`)
@@ -712,7 +880,7 @@ pub(super) fn sys_setpgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -765,7 +933,7 @@ pub(super) fn sys_setsid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(sid) => SyscallResult::Return(sid.0 as i64),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -852,6 +1020,110 @@ fn affinity_tid_arg(pid_arg: u64, ctx: &SyscallCtx<'_>) -> Result<u32, SyscallRe
     u32::try_from(pid_arg).map_err(|_| SyscallResult::Error(ESRCH_VALUE))
 }
 
+fn sched_attr_tid_arg(pid_arg: u64, ctx: &SyscallCtx<'_>) -> Result<u32, SyscallResult> {
+    if pid_arg == 0 {
+        return Ok(ctx.thread.tid.0);
+    }
+    let tid = u32::try_from(pid_arg).map_err(|_| SyscallResult::Error(ESRCH_VALUE))?;
+    if process_by_pid(Pid(tid)).is_some()
+        || matches!(
+            tx_subsystems::process::numbers::resolve_pid_number(tid as u64),
+            Some(tx_subsystems::process::numbers::PidName::Thread(_))
+        )
+    {
+        Ok(tid)
+    } else {
+        Err(SyscallResult::Error(ESRCH_VALUE))
+    }
+}
+
+fn sched_attr_default() -> SchedAttrLayout {
+    SchedAttrLayout {
+        size: SCHED_ATTR_SIZE,
+        sched_policy: SCHED_NORMAL,
+        sched_flags: 0,
+        sched_nice: 0,
+        sched_priority: 0,
+        sched_runtime: 0,
+        sched_deadline: 0,
+        sched_period: 0,
+    }
+}
+
+fn sched_attr_policy_supported(policy: u32) -> bool {
+    matches!(
+        policy,
+        SCHED_NORMAL | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE
+    )
+}
+
+/// `sched_setattr(pid, attr, flags)`.
+///
+/// This is an ABI compatibility layer for LTP and libc probes. It validates
+/// the Linux error cases and records the requested attributes per tid so a
+/// follow-up `sched_getattr` can observe them; it does not change txKernel's
+/// actual run-queue policy.
+pub(super) fn sys_sched_setattr<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let pid = args[0];
+    let attr_ptr = args[1];
+    let flags = args[2];
+
+    if flags != 0 || attr_ptr == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let tid = match sched_attr_tid_arg(pid, ctx) {
+        Ok(tid) => tid,
+        Err(err) => return err,
+    };
+
+    let mut attr = match bootstrap_read_user::<SchedAttrLayout>(&ctx.aspace, attr_ptr) {
+        Ok(attr) => attr,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    if attr.size < SCHED_ATTR_SIZE || !sched_attr_policy_supported(attr.sched_policy) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if attr.sched_policy == SCHED_DEADLINE
+        && (attr.sched_runtime == 0
+            || attr.sched_deadline == 0
+            || attr.sched_period == 0
+            || attr.sched_runtime > attr.sched_deadline
+            || attr.sched_deadline > attr.sched_period)
+    {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    attr.size = SCHED_ATTR_SIZE;
+    SCHED_ATTRS.lock().insert(tid, attr);
+    SyscallResult::Return(0)
+}
+
+/// `sched_getattr(pid, attr, size, flags)`.
+pub(super) fn sys_sched_getattr<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let pid = args[0];
+    let attr_ptr = args[1];
+    let size = args[2] as u32;
+    let flags = args[3];
+
+    if flags != 0 || attr_ptr == 0 || size < SCHED_ATTR_SIZE {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let tid = match sched_attr_tid_arg(pid, ctx) {
+        Ok(tid) => tid,
+        Err(err) => return err,
+    };
+
+    let attr = SCHED_ATTRS
+        .lock()
+        .get(&tid)
+        .copied()
+        .unwrap_or_else(sched_attr_default);
+    match bootstrap_write_user::<SchedAttrLayout>(&ctx.aspace, attr_ptr, attr) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
 fn affinity_error_to_syscall(
     err: tx_subsystems::reactor_affinity::ReactorAffinityError,
 ) -> SyscallResult {
@@ -861,6 +1133,17 @@ fn affinity_error_to_syscall(
         E::NoSuchThread => SyscallResult::Error(ESRCH_VALUE),
         E::NotInstalled => SyscallResult::Error(ENOSYS_VALUE),
     }
+}
+
+fn affinity_set_crosses_process<'a>(pid_arg: u64, tid: u32, ctx: &SyscallCtx<'a>) -> bool {
+    if pid_arg == 0 || tid == ctx.thread.tid.0 || ctx.process.thread_by_tid(tid).is_some() {
+        return false;
+    }
+    process_by_pid(Pid(tid)).is_some()
+        || matches!(
+            tx_subsystems::process::numbers::resolve_pid_number(tid as u64),
+            Some(tx_subsystems::process::numbers::PidName::Thread(_))
+        )
 }
 
 /// `sched_setaffinity(pid, cpusetsize, mask)`.
@@ -873,6 +1156,9 @@ pub(super) fn sys_sched_setaffinity<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) ->
         Ok(tid) => tid,
         Err(err) => return err,
     };
+    if affinity_set_crosses_process(args[0], tid, ctx) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
     let cpusetsize = args[1] as usize;
     let mask_ptr = args[2];
     if cpusetsize < core::mem::size_of::<u64>() {

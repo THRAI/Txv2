@@ -114,6 +114,8 @@ mod vm;
 use vm::*;
 pub mod io;
 use io::*;
+mod socket;
+use socket::*;
 pub mod fs_basic;
 use fs_basic::*;
 mod fs_path;
@@ -153,7 +155,6 @@ use posix_timer::*;
 mod epoll;
 use epoll::*;
 mod net;
-use net::*;
 
 mod ctx;
 pub use ctx::*;
@@ -169,70 +170,12 @@ pub use user_layout::{
 mod helpers;
 pub(super) use helpers::*;
 
+pub use time::maybe_deliver_itimer_signal;
+
 #[cfg(test)]
 mod tests;
 
-pub use numbers::{
-    AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW,
-    CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE,
-    CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_ALARM,
-    CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, CLONE_CHILD_CLEARTID,
-    CLONE_DETACHED, CLONE_FILES, CLONE_FS, CLONE_NEWCGROUP, CLONE_NEWUTS, CLONE_PARENT,
-    CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_SIGHAND, CLONE_SYSVSEM, CLONE_THREAD, CLONE_VFORK,
-    CLONE_VM, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, DT_UNKNOWN, FD_CLOEXEC,
-    FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG,
-    FUTEX_REQUEUE, FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE,
-    FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_OK, F_SETFD,
-    F_SETFL, GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, MADV_DONTNEED, MADV_FREE, MADV_NORMAL,
-    MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE,
-    MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK,
-    MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_STACK, MAP_SYNC, MREMAP_DONTUNMAP,
-    MREMAP_FIXED, MREMAP_MAYMOVE, NR_ACCEPT, NR_ACCEPT4, NR_BIND, NR_BRK, NR_CAPGET, NR_CAPSET,
-    NR_CHDIR, NR_CLOCK_GETRES, NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLONE, NR_CLOSE,
-    NR_CONNECT, NR_COPY_FILE_RANGE, NR_DUP, NR_DUP3, NR_EPOLL_CREATE1, NR_EPOLL_CTL,
-    NR_EPOLL_PWAIT, NR_EPOLL_WAIT, NR_EVENTFD2, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT,
-    NR_FACCESSAT2, NR_FADVISE64, NR_FALLOCATE, NR_FCHDIR, NR_FCHMOD, NR_FCHMODAT, NR_FCHOWNAT,
-    NR_FCNTL, NR_FDATASYNC, NR_FLOCK, NR_FSTAT, NR_FSTATFS, NR_FSYNC, NR_FTRUNCATE, NR_FUTEX,
-    NR_GETCWD, NR_GETDENTS64, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETITIMER, NR_GETPEERNAME,
-    NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID, NR_GETRESUID,
-    NR_GETSID, NR_GETSOCKNAME, NR_GETSOCKOPT, NR_GETTID, NR_GETTIMEOFDAY, NR_GETUID,
-    NR_GET_ROBUST_LIST, NR_IOCTL, NR_IO_DESTROY, NR_IO_GETEVENTS, NR_IO_SETUP, NR_IO_SUBMIT,
-    NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_KILL, NR_LINKAT, NR_LISTEN, NR_LSEEK, NR_MADVISE,
-    NR_MKDIRAT, NR_MKNODAT, NR_MLOCK, NR_MMAP, NR_MOUNT, NR_MPROTECT, NR_MQ_GETSETATTR,
-    NR_MQ_NOTIFY, NR_MQ_OPEN, NR_MQ_TIMEDRECEIVE, NR_MQ_TIMEDSEND, NR_MQ_UNLINK, NR_MREMAP,
-    NR_MSGCTL, NR_MSGGET, NR_MSGRCV, NR_MSGSND, NR_MSYNC, NR_MUNLOCK, NR_MUNMAP,
-    NR_NAME_TO_HANDLE_AT, NR_NANOSLEEP, NR_NEWFSTATAT, NR_OPENAT, NR_OPEN_BY_HANDLE_AT,
-    NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL, NR_PIPE2, NR_PPOLL, NR_PREAD64, NR_PREADV, NR_PREADV2,
-    NR_PRLIMIT64, NR_PSELECT6, NR_PSELECT6_TIME64, NR_PWRITE64, NR_PWRITEV, NR_PWRITEV2, NR_READ,
-    NR_READAHEAD, NR_READLINKAT, NR_READV, NR_RECVFROM, NR_RENAMEAT2, NR_RT_SIGACTION,
-    NR_RT_SIGPENDING, NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN, NR_RT_SIGSUSPEND,
-    NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SCHED_SETSCHEDULER,
-    NR_SEMCTL, NR_SEMGET, NR_SEMOP, NR_SEMTIMEDOP, NR_SENDTO, NR_SETGID, NR_SETGROUPS,
-    NR_SETHOSTNAME, NR_SETITIMER, NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID,
-    NR_SETSID, NR_SETSOCKOPT, NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SHMAT,
-    NR_SHMCTL, NR_SHMDT, NR_SHMGET, NR_SHUTDOWN, NR_SIGALTSTACK, NR_SIGNALFD, NR_SIGNALFD4,
-    NR_SOCKET, NR_SOCKETPAIR, NR_SPLICE, NR_STATFS, NR_STATX, NR_SYMLINKAT, NR_SYNC, NR_SYNCFS,
-    NR_SYNC_FILE_RANGE, NR_SYSLOG, NR_TGKILL, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME,
-    NR_TIMERFD_SETTIME, NR_TIMER_CREATE, NR_TIMER_DELETE, NR_TIMER_GETOVERRUN, NR_TIMER_GETTIME,
-    NR_TIMER_SETTIME, NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UMOUNT2, NR_UNAME, NR_UNLINKAT,
-    NR_USERFAULTFD, NR_UTIMENSAT, NR_WAIT4, NR_WRITE, NR_WRITEV, O_ACCMODE, O_APPEND, O_CLOEXEC,
-    O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC,
-    PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, RENAME_EXCHANGE,
-    RENAME_NOREPLACE, RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA,
-    RLIMIT_FSIZE, RLIMIT_LOCKS, RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE, RLIMIT_NICE, RLIMIT_NOFILE,
-    RLIMIT_NPROC, RLIMIT_RSS, RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIMIT_SIGPENDING, RLIMIT_STACK,
-    RLIM_INFINITY, R_OK, SEEK_CUR, SEEK_END, SEEK_SET, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW,
-    TIMER_ABSTIME, TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP,
-    TIOCSWINSZ, UTIME_NOW, UTIME_OMIT, WNOHANG, W_OK, X_OK,
-};
-
-pub use numbers::{
-    MEMBARRIER_CMD_GLOBAL, MEMBARRIER_CMD_GLOBAL_EXPEDITED, MEMBARRIER_CMD_PRIVATE_EXPEDITED,
-    MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, MEMBARRIER_CMD_QUERY,
-    MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED,
-    MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE, MEMBARRIER_SUPPORTED_MASK, NR_MEMBARRIER,
-    NR_SENDFILE64,
-};
+pub use numbers::*;
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
 /// in a single call. The dispatcher copies `[buf_ptr, buf_ptr+len)` into
@@ -241,6 +184,17 @@ pub use numbers::{
 /// scope". 4 KiB matches a single page; values above that should batch
 /// across multiple write calls until the userspace-VA copy lane lands.
 pub const TTY_WRITE_MAX_INLINE: usize = 4096;
+
+/// Maximum socket payload bytes staged by a single `read(2)`/`write(2)`
+/// call.
+///
+/// TTY and pipe writes stay capped at one page because they fan into
+/// byte-oriented console/pipe paths. Socket payloads are already
+/// backed by bounded per-socket send/receive buffers, and network
+/// workloads such as iperf naturally issue 64 KiB-ish blocks. Keeping
+/// those blocks intact avoids turning one socket transfer into dozens
+/// of tiny syscalls while still bounding the temporary staging buffer.
+pub const SOCKET_IO_MAX_INLINE: usize = 64 * 1024;
 
 /// Maximum path-name length accepted by `execve(2)` (Linux's
 /// `PATH_MAX`). Mirrors the `TTY_WRITE_MAX_INLINE = 4096` discipline
@@ -385,34 +339,31 @@ pub(super) const MINSIGSTKSZ: u64 = 2048;
 /// Size of the kernel `struct sigaction` exchanged via `rt_sigaction`
 /// on RV64 generic ABI.
 ///
-/// Layout decision: Linux's `arch/riscv/include/uapi/asm/signal.h`
-/// pulls in `asm-generic/signal.h`, which defines the kernel
-/// (uapi) `struct sigaction` as four 64-bit fields:
+/// Layout decision: Linux RV64 pulls in `asm-generic/signal.h` without
+/// defining `SA_RESTORER`, so the optional `sa_restorer` field is absent from
+/// the kernel-facing structure. The syscall therefore exchanges three 64-bit
+/// fields:
 ///
 /// ```text
 /// struct sigaction {
 ///     __sighandler_t  sa_handler;   // 8B
 ///     unsigned long   sa_flags;     // 8B
-///     __sigrestore_t  sa_restorer;  // 8B  (present under SA_RESTORER)
 ///     sigset_t        sa_mask;      // 8B  (single u64 bitset, sigsetsize=8)
 /// };
 /// ```
 ///
-/// So the rt_sigaction syscall takes a 32-byte buffer. The plan's
+/// So the rt_sigaction syscall takes a 24-byte buffer. The plan's
 /// "16 bytes" hint applied to the legacy `__OLD_SIGACTION` shape used
 /// by the (deprecated) `sigaction()` syscall — the modern
-/// `rt_sigaction` syscall uses the 32-byte form. We pin the modern
-/// shape because (a) Linux RV64 has no `sigaction()` syscall at all
-/// (it only ships `rt_sigaction`, NR_134) and (b) `__sa_restorer` is
-/// part of the ABI even when SA_RESTORER is unset (kernel reads all
-/// four words and ignores the restorer bits unless the flag is set).
+/// `rt_sigaction` syscall uses the 24-byte RV64 form. We pin the modern
+/// shape because Linux RV64 has no `sigaction()` syscall at all (it only ships
+/// `rt_sigaction`, NR_134), but unlike x86-64 the modern RV64 shape does not
+/// carry an in-struct restorer.
 ///
-/// Citation: linux/include/uapi/asm-generic/signal.h
-/// `struct sigaction { __sighandler_t sa_handler; unsigned long
-///  sa_flags; __ARCH_HAS_SA_RESTORER ? __sigrestore_t sa_restorer;
-///  sigset_t sa_mask; };` — RV64 enables `__ARCH_HAS_SA_RESTORER`
-/// transitively (the field is always emitted at the ABI level).
-pub(super) const SIGACTION_BYTES: usize = 32;
+/// Citation: linux/arch/riscv/include/uapi/asm/signal.h includes
+/// `asm-generic/signal.h`; there `sa_restorer` is guarded by
+/// `#ifdef SA_RESTORER`, and RV64 does not define that macro.
+pub(super) const SIGACTION_BYTES: usize = 24;
 
 /// Per-syscall context resolved by the trap-shell wrapper: the calling
 /// process / thread, the bound address space, and the bookkeeping the
@@ -493,15 +444,21 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_GETRANDOM => return sys_getrandom(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
         nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
+        nr if nr == NR_SCHED_GETATTR => return sys_sched_getattr(req.args, ctx),
+        nr if nr == NR_SCHED_SETATTR => return sys_sched_setattr(req.args, ctx),
         nr if nr == NR_SCHED_GETAFFINITY => return sys_sched_getaffinity(req.args, ctx),
         nr if nr == NR_SCHED_SETAFFINITY => return sys_sched_setaffinity(req.args, ctx),
-        nr if nr == NR_SCHED_SETSCHEDULER => return sys_sched_setscheduler(),
+        nr if nr == NR_SCHED_SETSCHEDULER => return sys_sched_setscheduler(req.args, ctx),
         nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
         nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args, ctx),
         nr if nr == NR_GET_ROBUST_LIST => return sys_get_robust_list(req.args, ctx),
         nr if nr == NR_MADVISE => return sys_madvise(req.args, ctx),
         nr if nr == NR_MLOCK => return sys_mlock(req.args, ctx).await,
         nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx).await,
+        nr if nr == NR_MLOCKALL => return sys_mlockall(req.args, ctx).await,
+        nr if nr == NR_MUNLOCKALL => return sys_munlockall(req.args, ctx).await,
+        nr if nr == NR_MINCORE => return sys_mincore(req.args, ctx),
+        nr if nr == NR_MLOCK2 => return sys_mlock2(req.args, ctx).await,
         nr if nr == NR_UTIMENSAT => return sys_utimensat::<P>(req.args, ctx),
         nr if nr == NR_SHMGET => return sys_shmget(req.args, ctx),
         nr if nr == NR_SHMDT => return sys_shmdt(req.args, ctx).await,
@@ -534,19 +491,23 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_FADVISE64 => sys_fadvise64(req.args, ctx),
         nr if nr == NR_SPLICE => sys_splice(req.args, ctx),
         nr if nr == NR_SOCKET => sys_socket(req.args, ctx),
+        nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx),
         nr if nr == NR_BIND => sys_bind(req.args, ctx),
+        nr if nr == NR_LISTEN => sys_listen(req.args, ctx),
+        nr if nr == NR_ACCEPT => sys_accept::<P>(req.args, ctx).await,
+        nr if nr == NR_ACCEPT4 => sys_accept4::<P>(req.args, ctx).await,
+        nr if nr == NR_CONNECT => sys_connect(req.args, ctx).await,
         nr if nr == NR_GETSOCKNAME => sys_getsockname(req.args, ctx),
         nr if nr == NR_GETPEERNAME => sys_getpeername(req.args, ctx),
+        nr if nr == NR_SENDTO => sys_sendto(req.args, ctx).await,
+        nr if nr == NR_RECVFROM => sys_recvfrom::<P>(req.args, ctx).await,
+        nr if nr == NR_SENDMSG => sys_sendmsg(req.args, ctx).await,
+        nr if nr == NR_RECVMSG => sys_recvmsg(req.args, ctx).await,
+        nr if nr == NR_RECVMMSG => sys_recvmmsg::<P>(req.args, ctx).await,
+        nr if nr == NR_SENDMMSG => sys_sendmmsg(req.args, ctx).await,
         nr if nr == NR_SETSOCKOPT => sys_setsockopt(req.args, ctx),
         nr if nr == NR_GETSOCKOPT => sys_getsockopt(req.args, ctx),
-        nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx),
         nr if nr == NR_SHUTDOWN => sys_shutdown(req.args, ctx),
-        nr if nr == NR_SENDTO => sys_sendto(req.args, ctx),
-        nr if nr == NR_RECVFROM => sys_recvfrom(req.args, ctx),
-        nr if nr == NR_LISTEN => sys_listen(req.args, ctx),
-        nr if nr == NR_CONNECT => sys_connect(req.args, ctx),
-        nr if nr == NR_ACCEPT => sys_accept(req.args, ctx),
-        nr if nr == NR_ACCEPT4 => sys_accept4(req.args, ctx),
         nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
         nr if nr == NR_COPY_FILE_RANGE => sys_copy_file_range::<P>(req.args, ctx),
         nr if nr == NR_PPOLL => sys_ppoll::<P>(req.args, ctx).await,
@@ -571,14 +532,13 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_SEMOP => sys_semop(req.args, ctx).await,
         nr if nr == NR_SEMTIMEDOP => sys_semtimedop::<P>(req.args, ctx).await,
         nr if nr == NR_SEMCTL => sys_semctl(req.args, ctx),
-        nr if nr == NR_MSGCTL => sys_msgctl(req.args, ctx),
-        nr if nr == NR_SEMOP => sys_semop(req.args, ctx).await,
-        nr if nr == NR_SEMTIMEDOP => sys_semtimedop::<P>(req.args, ctx).await,
-        nr if nr == NR_SEMCTL => sys_semctl(req.args, ctx),
         nr if nr == NR_SHMAT => sys_shmat(req.args, ctx).await,
         nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
         nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx).await,
+        nr if nr == NR_UNSHARE => sys_unshare(req.args, ctx),
+        nr if nr == NR_SETNS => sys_setns(req.args, ctx),
         nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
+        nr if nr == NR_GETRUSAGE => sys_getrusage(req.args, ctx),
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
         nr if nr == NR_SETSID => sys_setsid(ctx),
         nr if nr == NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
@@ -650,7 +610,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_OPEN_BY_HANDLE_AT => {
             sys_open_by_handle_at(req.args[0] as i32, req.args[1], req.args[2] as u32, ctx)
         }
-        nr if nr == NR_CLOSE => sys_close(req.args[0] as u32, ctx),
+        nr if nr == NR_CLOSE => sys_close(req.args[0] as u32, ctx).await,
         nr if nr == NR_DUP => sys_dup(req.args[0] as u32, ctx),
         nr if nr == NR_DUP3 => sys_dup3(
             req.args[0] as u32,
@@ -697,6 +657,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_CLOCK_GETRES => sys_clock_getres(req.args, ctx),
         nr if nr == NR_NANOSLEEP => sys_nanosleep::<P>(req.args, ctx).await,
         nr if nr == NR_CLOCK_NANOSLEEP => sys_clock_nanosleep::<P>(req.args, ctx).await,
+        nr if nr == NR_SETITIMER => sys_setitimer::<P>(req.args, ctx),
         // Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY
         // routing. Without this, musl's `isatty(STDIN_FILENO)` check
         // returns false, the shell starts in non-interactive mode, no
@@ -887,16 +848,6 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
             )
             .await
         }
-        nr if nr == NR_EPOLL_WAIT => {
-            sys_epoll_wait::<P>(
-                req.args[0] as u32,
-                req.args[1],
-                req.args[2] as u32,
-                req.args[3] as i32,
-                ctx,
-            )
-            .await
-        }
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -904,6 +855,65 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
 // ---------------------------------------------------------------------------
 // membarrier(2)
 // ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SchedParamLayout {
+    sched_priority: i32,
+}
+
+/// `sched_setscheduler(pid, policy, param)` — validation-only shim.
+///
+/// The actual scheduler policy remains txKernel's native policy, but Linux
+/// callers expect the basic errno surface for bad pid/policy/param/priority.
+fn sys_sched_setscheduler<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    const SCHED_OTHER: u32 = 0;
+    const SCHED_FIFO: u32 = 1;
+    const SCHED_RR: u32 = 2;
+    const SCHED_BATCH: u32 = 3;
+    const SCHED_IDLE: u32 = 5;
+
+    let pid = args[0];
+    let policy = args[1] as u32;
+    let param_ptr = args[2];
+
+    if pid != 0 {
+        let Ok(pid32) = u32::try_from(pid) else {
+            return SyscallResult::Error(ESRCH_VALUE);
+        };
+        if process_by_pid(Pid(pid32)).is_none()
+            && !matches!(
+                tx_subsystems::process::numbers::resolve_pid_number(pid),
+                Some(tx_subsystems::process::numbers::PidName::Thread(_))
+            )
+        {
+            return SyscallResult::Error(ESRCH_VALUE);
+        }
+    }
+    if !matches!(
+        policy,
+        SCHED_OTHER | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE
+    ) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if param_ptr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let param = match bootstrap_read_user::<SchedParamLayout>(&ctx.aspace, param_ptr) {
+        Ok(param) => param,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    let priority = param.sched_priority;
+    let valid_priority = match policy {
+        SCHED_FIFO | SCHED_RR => (1..=99).contains(&priority),
+        _ => priority == 0,
+    };
+    if !valid_priority {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    SyscallResult::Return(0)
+}
 
 /// `membarrier(cmd, flags, cpu_id)` — issue memory-ordering barriers
 /// across all online harts.
@@ -923,15 +933,6 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
 ///   expedited plus instruction-fetch barrier (`fence.i` on RV64).
 /// - `MEMBARRIER_CMD_REGISTER_*` — registration is a no-op; always
 ///   returns 0.
-///   `sched_setscheduler(pid, policy, param)` — v1 stub.
-///
-/// musl calls this during `pthread_create` to set the new thread's
-/// scheduling policy. Returns 0 unconditionally (success, no-op);
-/// real priority inheritance is deferred to the scheduler slice.
-fn sys_sched_setscheduler() -> SyscallResult {
-    SyscallResult::Return(0)
-}
-
 ///
 /// `flags` and `cpu_id` are currently ignored (must be 0).
 fn sys_membarrier<P: SmpIf>(args: &[u64; 6]) -> SyscallResult {
@@ -985,34 +986,49 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
     match errno {
         Errno::E2BIG => 7,
         Errno::EACCES => 13,
+        Errno::EALREADY => 114,
+        Errno::EADDRINUSE => 98,
+        Errno::EADDRNOTAVAIL => 99,
+        Errno::EAFNOSUPPORT => 97,
         Errno::EAGAIN => EAGAIN_VALUE,
         Errno::EBADF => EBADF_VALUE,
         Errno::EBUSY => 16,
+        Errno::ECONNREFUSED => 111,
+        Errno::EDESTADDRREQ => 89,
         Errno::EDQUOT => 122,
         Errno::EEXIST => 17,
         Errno::EFBIG => 27,
         Errno::EIDRM => 43,
         Errno::EFAULT => 14,
         Errno::EINVAL => 22,
+        Errno::EINPROGRESS => 115,
         Errno::EIO => 5,
+        Errno::EISCONN => 106,
         Errno::EISDIR => 21,
         Errno::ELOOP => 40,
         Errno::EMLINK => 31,
+        Errno::EMSGSIZE => 90,
         Errno::ENAMETOOLONG => 36,
         Errno::ENODEV => 19,
         Errno::ENOEXEC => 8,
         Errno::ENOMEM => 12,
         Errno::ENOENT => 2,
         Errno::ENOSYS => ENOSYS_VALUE,
+        Errno::ENOPROTOOPT => 92,
+        Errno::ENOTCONN => 107,
         Errno::ENOTDIR => 20,
         Errno::ENOTEMPTY => 39,
         Errno::ENOTTY => 25,
         Errno::EPERM => 1,
         Errno::EPIPE => 32,
         Errno::ERANGE => 34,
+        Errno::EOPNOTSUPP => 95,
         Errno::EROFS => 30,
+        Errno::ENOTSOCK => 88,
+        Errno::EPROTONOSUPPORT => 93,
         Errno::ESPIPE => 29,
         Errno::ESRCH => 3,
+        Errno::ESOCKTNOSUPPORT => 94,
         Errno::ESTALE => 116,
         Errno::ETIMEDOUT => 110,
         Errno::EINTR => 4,
@@ -1106,16 +1122,17 @@ fn emit_syscall_exit(span: SpanId, result: &SyscallResult) {
     };
     // result_kind: 0=Ok, 1=Err, 2=Restart, 3=Fatal, 4=NoReturn (per
     // OBSERVATION_SERIALIZATION_v0 §8.1). `ExecCommitted` and
-    // `SigreturnRestored` are kernel-internal control-flow markers that
-    // never surface as a userspace return value; classify both as NoReturn
-    // for the trace so the daemon's syscall slice closes cleanly even
-    // though no `a0` write occurs.
+    // `Sigreturn*` are kernel-internal control-flow markers that never
+    // surface as a userspace return value; classify them as NoReturn for
+    // the trace so the daemon's syscall slice closes cleanly even though
+    // no `a0` write occurs.
     let (ret, errno, result_kind) = match result {
         SyscallResult::Return(v) => (*v, 0, 0u8),
         SyscallResult::Error(e) => (0, *e, 1u8),
         SyscallResult::NoReturn => (0, 0, 4u8),
         SyscallResult::ExecCommitted => (0, 0, 4u8),
         SyscallResult::SigreturnRestored => (0, 0, 4u8),
+        SyscallResult::SigreturnContextRestored => (0, 0, 4u8),
     };
     let payload = PayloadSyscallExit {
         ret,

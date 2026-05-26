@@ -110,9 +110,9 @@ pub(super) fn sys_socket_write(
     }
 
     let mut sockets = SOCKETS.lock();
-    let (peer_fd, nonblocking) = match sockets.get(&fd) {
-        Some(sock) => (sock.peer_fd, sock.nonblocking),
-        None => return None,
+    let (peer_fd, nonblocking) = {
+        let sock = sockets.get(&fd)?;
+        (sock.peer_fd, sock.nonblocking)
     };
     if let Some(peer) = peer_fd.and_then(|peer_fd| sockets.get_mut(&peer_fd)) {
         if peer.inbox.len().saturating_add(payload.len()) > MAX_SOCKET_PAYLOAD {
@@ -131,10 +131,7 @@ pub(super) fn sys_socket_sendfile(
 ) -> Option<SyscallResult> {
     let _ = ctx;
     let sockets = SOCKETS.lock();
-    let sock = match sockets.get(&fd) {
-        Some(sock) => sock,
-        None => return None,
-    };
+    let sock = sockets.get(&fd)?;
     let Some(peer_fd) = sock.peer_fd else {
         return Some(SyscallResult::Error(ENOTCONN_VALUE));
     };
@@ -155,10 +152,7 @@ pub(super) fn sys_socket_read(
 ) -> Option<SyscallResult> {
     let payload = {
         let mut sockets = SOCKETS.lock();
-        let sock = match sockets.get_mut(&fd) {
-            Some(sock) => sock,
-            None => return None,
-        };
+        let sock = sockets.get_mut(&fd)?;
         let take_len = core::cmp::min(len, sock.inbox.len());
         sock.inbox.drain(..take_len).collect::<Vec<u8>>()
     };

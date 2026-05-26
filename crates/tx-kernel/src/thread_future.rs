@@ -558,12 +558,15 @@ pub async fn run_thread<P: TxPlatform>(
         // stale Cap.
         if let Some(process) = thread.upgrade_owner_proc() {
             if let Some(aspace) = process.aspace_cap() {
-                let root = aspace.pmap().root_handle();
                 let mut ctx = tx_hal::UserTrapContext::empty();
                 prepare_userspace_entry_payload_into(&payload, &mut ctx);
                 payload.set_active_userspace_request(Some(entry_token));
                 let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
                 let _prev_userspace = set_current_userspace_payload(entry_hart, payload.clone());
+                ctx = tx_shims::linux_syscall::maybe_deliver_itimer_signal::<P>(
+                    ctx, &process, &thread, &aspace,
+                );
+                let root = aspace.pmap().root_handle();
                 <P as TrapIf>::enter_userspace_with_context(&ctx, root);
             } else {
                 return;
@@ -629,7 +632,9 @@ pub async fn run_thread<P: TxPlatform>(
                     ctx = ctx.with_delegate_registry(dr);
                 }
                 let sigreturn_ctx = payload.saved_user_context();
+                payload.set_proc_sleeping(true);
                 let result = tx_shims::linux_syscall::dispatch::<P>(req, &ctx).await;
+                payload.set_proc_sleeping(false);
 
                 // Threshold-based observation dump. If the boot path
                 // installed a non-zero `OBSERVE_DUMP_THRESHOLD` (see
@@ -683,6 +688,13 @@ pub async fn run_thread<P: TxPlatform>(
                         // carries (zero from the script's fresh
                         // `UserTrapContext`, per
                         // `make_initial_user_trap_context`).
+                    }
+                    tx_shims::linux_syscall::SyscallResult::SigreturnContextRestored => {
+                        // The syscall arm already restored a
+                        // syscall-layer compatibility frame (currently
+                        // the itimer/SIGALRM frame). Do not decode a
+                        // second platform frame from the same stack
+                        // pointer.
                     }
                     tx_shims::linux_syscall::SyscallResult::SigreturnRestored => {
                         // `rt_sigreturn` is special: musl cancellation

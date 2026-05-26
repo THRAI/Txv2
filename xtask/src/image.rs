@@ -3,6 +3,7 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::target::{Profile, TxTarget};
 use crate::util::{
@@ -18,12 +19,16 @@ pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
     let target = image_target(&args[1..])?;
     match (kind.as_str(), profile) {
         ("cpio" | "initramfs", Profile::Busybox) => image_cpio_busybox(root, target),
+        ("cpio" | "initramfs", Profile::Alpine) => image_cpio_alpine(root, &args[1..], target),
         ("ext4", Profile::Busybox) => {
             let name = busybox_root_ext4_name(target);
             image_ext4_busybox(root, &args[1..], target, &name)
         }
         ("m1dock-sd", Profile::Busybox) => {
             image_ext4_busybox(root, &args[1..], target, "m1dock-sd.img")
+        }
+        ("ext4" | "m1dock-sd", Profile::Alpine) => {
+            Err("image alpine profile currently supports cpio/initramfs only".into())
         }
         ("cpio" | "initramfs" | "ext4" | "m1dock-sd", Profile::Smoke) => {
             Err("image smoke profile is not defined; use --profile busybox".into())
@@ -36,6 +41,10 @@ pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
 
 pub(crate) fn busybox_initramfs_name(target: TxTarget) -> String {
     format!("busybox-initramfs-{}.cpio", target.name())
+}
+
+pub(crate) fn alpine_initramfs_name(target: TxTarget) -> String {
+    format!("alpine-initramfs-{}.cpio", target.name())
 }
 
 pub(crate) fn busybox_root_ext4_name(target: TxTarget) -> String {
@@ -58,6 +67,32 @@ fn image_cpio_busybox(root: &Path, target: TxTarget) -> Result<()> {
         .join("target")
         .join("images")
         .join(busybox_initramfs_name(target));
+    fs::create_dir_all(out.parent().expect("image path has parent"))
+        .map_err(|err| err.to_string())?;
+    remove_existing_image(&out)?;
+
+    let script = format!(
+        "cd '{}' && find . -print | cpio -o -H newc > '{}'",
+        shell_escape(&layout.display().to_string()),
+        shell_escape(&out.display().to_string())
+    );
+    run_shell(root, &script)?;
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
+fn image_cpio_alpine(root: &Path, args: &[String], target: TxTarget) -> Result<()> {
+    if target != TxTarget::Rv64Qemu {
+        return Err("alpine image profile is currently supported only for rv64-qemu".into());
+    }
+    if !command_exists("cpio") {
+        return Err("cpio is required to create the alpine initramfs".into());
+    }
+    let layout = prepare_alpine_rootfs(root, args, target)?;
+    let out = root
+        .join("target")
+        .join("images")
+        .join(alpine_initramfs_name(target));
     fs::create_dir_all(out.parent().expect("image path has parent"))
         .map_err(|err| err.to_string())?;
     remove_existing_image(&out)?;
@@ -179,6 +214,8 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
         fs::create_dir_all(layout.join(dir)).map_err(|err| err.to_string())?;
     }
     fs::copy(&busybox, layout.join("bin").join("busybox")).map_err(|err| err.to_string())?;
+    install_optional_user_smokes(root, target, &layout)?;
+    install_optional_oscomp_net_tools(target, &layout)?;
 
     // IPC smoke test binary — copy if present
     let ipc_test_src = root.join("tools/images/ipc_test");
@@ -195,18 +232,7 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
                 musl.display()
             ));
         }
-        let libc = layout.join("lib").join("libc.so");
-        fs::copy(&musl, &libc).map_err(|err| err.to_string())?;
-        #[cfg(unix)]
-        {
-            for loader in ["ld-musl-riscv64.so.1", "ld-musl-loongarch64.so.1"] {
-                let loader_path = layout.join("lib").join(loader);
-                if loader_path.exists() {
-                    fs::remove_file(&loader_path).map_err(|err| err.to_string())?;
-                }
-                unix_fs::symlink("libc.so", loader_path).map_err(|err| err.to_string())?;
-            }
-        }
+        install_musl_libc(&layout, &musl)?;
     }
 
     fs::write(
@@ -235,7 +261,7 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
         for name in [
             "sh", "ls", "cat", "mkdir", "rm", "rmdir", "mv", "cp", "touch", "pwd", "echo", "ln",
             "chmod", "chown", "uname", "ps", "kill", "grep", "find", "head", "tail", "wc", "sort",
-            "sed", "awk", "mount",
+            "sed", "awk", "mount", "ping", "telnet", "telnetd",
         ] {
             let path = layout.join("bin").join(name);
             if path.exists() {
@@ -258,4 +284,242 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
     }
 
     Ok(layout)
+}
+
+fn prepare_alpine_rootfs(root: &Path, args: &[String], target: TxTarget) -> Result<PathBuf> {
+    let source = resolve_alpine_rootfs(root, args, target)?;
+    if !source.is_dir() {
+        return Err(format!(
+            "alpine rootfs source must be a directory, got {}",
+            source.display()
+        ));
+    }
+
+    let layout = root
+        .join("target")
+        .join("rootfs")
+        .join(format!("alpine-stage-{}", target.name()));
+    if layout.exists() {
+        fs::remove_dir_all(&layout).map_err(|err| err.to_string())?;
+    }
+    fs::create_dir_all(&layout).map_err(|err| err.to_string())?;
+
+    let script = format!(
+        "cp -a '{}'/'.' '{}'",
+        shell_escape(&source.display().to_string()),
+        shell_escape(&layout.display().to_string())
+    );
+    run_shell(root, &script)?;
+
+    for dir in ["dev", "proc", "sys", "tmp", "run", "var/run"] {
+        fs::create_dir_all(layout.join(dir)).map_err(|err| err.to_string())?;
+    }
+    install_alpine_bootstrap_busybox(root, target, args, &layout)?;
+    install_optional_user_smokes(root, target, &layout)?;
+    Ok(layout)
+}
+
+fn resolve_alpine_rootfs(root: &Path, args: &[String], target: TxTarget) -> Result<PathBuf> {
+    if let Some(value) = optional_option_value(args, "--rootfs") {
+        return Ok(resolve_root_path(root, &value));
+    }
+    if let Ok(value) = env::var("TX_ALPINE_ROOTFS") {
+        return Ok(resolve_root_path(root, &value));
+    }
+    Ok(root
+        .join("target")
+        .join("rootfs")
+        .join(format!("alpine-{}", target.name())))
+}
+
+fn resolve_root_path(root: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+fn install_alpine_bootstrap_busybox(
+    root: &Path,
+    target: TxTarget,
+    args: &[String],
+    layout: &Path,
+) -> Result<()> {
+    if target != TxTarget::Rv64Qemu {
+        return Ok(());
+    }
+    if args.iter().any(|arg| arg == "--no-bootstrap-busybox")
+        || env::var("TX_ALPINE_BOOTSTRAP_BUSYBOX").as_deref() == Ok("0")
+    {
+        return Ok(());
+    }
+
+    let busybox = resolve_busybox(root, target)?;
+    let bin = layout.join("bin");
+    fs::create_dir_all(&bin).map_err(|err| err.to_string())?;
+    let bootstrap_name = "tx-bootstrap-busybox";
+    fs::copy(&busybox, bin.join(bootstrap_name)).map_err(|err| err.to_string())?;
+
+    #[cfg(unix)]
+    {
+        let sh = bin.join("sh");
+        if sh.exists() {
+            fs::remove_file(&sh).map_err(|err| err.to_string())?;
+        }
+        unix_fs::symlink(bootstrap_name, sh).map_err(|err| err.to_string())?;
+    }
+
+    println!(
+        "alpine: installed static bootstrap shell from {} as /bin/{}",
+        busybox.display(),
+        bootstrap_name
+    );
+    Ok(())
+}
+
+/// Optionally install OSComp/RustOS network benchmark binaries into
+/// the BusyBox rootfs.
+///
+/// This is deliberately opt-in: the benchmark binaries are large,
+/// live outside this repository, and mix static (`iperf3`) with
+/// dynamic (`netperf`/`netserver`) musl layouts depending on the
+/// source tree.
+///
+/// Supported knobs:
+///
+/// - `TX_OSCOMP_RISCV_MUSL_DIR=/path/to/testcase/riscv/musl` copies
+///   `iperf3`, `netperf`, `netserver` when present and installs
+///   `lib/libc.so` as the musl loader payload.
+/// - `TX_IPERF3`, `TX_NETPERF`, `TX_NETSERVER` copy individual
+///   binaries and override files from the directory knob.
+fn install_optional_oscomp_net_tools(target: TxTarget, layout: &Path) -> Result<()> {
+    if target != TxTarget::Rv64Qemu {
+        return Ok(());
+    }
+
+    if let Ok(dir) = env::var("TX_OSCOMP_RISCV_MUSL_DIR") {
+        let dir = PathBuf::from(dir);
+        if !dir.is_dir() {
+            return Err(format!(
+                "TX_OSCOMP_RISCV_MUSL_DIR must point at a directory, got {}",
+                dir.display()
+            ));
+        }
+        for name in ["iperf3", "netperf", "netserver"] {
+            copy_optional_binary(&dir.join(name), &layout.join("bin").join(name))?;
+        }
+        let libc = dir.join("lib").join("libc.so");
+        if libc.is_file() {
+            install_musl_libc(layout, &libc)?;
+        }
+    }
+
+    copy_env_binary("TX_IPERF3", &layout.join("bin").join("iperf3"))?;
+    copy_env_binary("TX_NETPERF", &layout.join("bin").join("netperf"))?;
+    copy_env_binary("TX_NETSERVER", &layout.join("bin").join("netserver"))?;
+
+    Ok(())
+}
+
+fn copy_env_binary(var: &str, dest: &Path) -> Result<()> {
+    let Ok(value) = env::var(var) else {
+        return Ok(());
+    };
+    let source = PathBuf::from(value);
+    if !source.is_file() {
+        return Err(format!(
+            "{var} must point at a file, got {}",
+            source.display()
+        ));
+    }
+    fs::copy(&source, dest).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn copy_optional_binary(source: &Path, dest: &Path) -> Result<()> {
+    if source.is_file() {
+        fs::copy(source, dest).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn install_musl_libc(layout: &Path, musl: &Path) -> Result<()> {
+    let libc = layout.join("lib").join("libc.so");
+    fs::copy(musl, &libc).map_err(|err| err.to_string())?;
+    install_musl_loader_links(layout)
+}
+
+#[cfg(unix)]
+fn install_musl_loader_links(layout: &Path) -> Result<()> {
+    for loader in [
+        "ld-musl-riscv64.so.1",
+        "ld-musl-riscv64-sf.so.1",
+        "ld-musl-loongarch64.so.1",
+    ] {
+        let loader_path = layout.join("lib").join(loader);
+        if loader_path.exists() {
+            fs::remove_file(&loader_path).map_err(|err| err.to_string())?;
+        }
+        unix_fs::symlink("libc.so", loader_path).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_musl_loader_links(_layout: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn install_optional_user_smokes(root: &Path, target: TxTarget, layout: &Path) -> Result<()> {
+    if target != TxTarget::Rv64Qemu {
+        return Ok(());
+    }
+    if !command_exists("riscv64-linux-gnu-gcc") {
+        println!("warn: riscv64-linux-gnu-gcc not found; skipping optional user smokes");
+        return Ok(());
+    }
+
+    for name in [
+        "udp-loopback-smoke",
+        "tcp-loopback-smoke",
+        "netns-helper",
+        "nft-probe",
+        "packet-probe",
+        "netcap-probe",
+    ] {
+        let source = root.join("tools").join("user").join(format!("{name}.c"));
+        if !source.is_file() {
+            continue;
+        }
+        let out = root
+            .join("target")
+            .join("images")
+            .join(format!("{name}-riscv64"));
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        let status = Command::new("riscv64-linux-gnu-gcc")
+            .args([
+                "-nostdlib",
+                "-static",
+                "-ffreestanding",
+                "-fno-builtin",
+                "-fno-stack-protector",
+                "-O2",
+                "-Wall",
+                "-Wextra",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&out)
+            .status()
+            .map_err(|err| format!("failed to run riscv64-linux-gnu-gcc: {err}"))?;
+        if !status.success() {
+            return Err(format!("riscv64-linux-gnu-gcc exited with {status}"));
+        }
+        fs::copy(&out, layout.join("bin").join(name)).map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }

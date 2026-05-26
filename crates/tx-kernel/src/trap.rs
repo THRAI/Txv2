@@ -1,6 +1,6 @@
 use tx_hal::{
-    CpuId, FaultInfo, IpiKind, IrqHandled, KernelTrapSink, PercpuIf, TrapAction, TrapFrameMut,
-    TxPlatform,
+    CpuId, FaultInfo, IpiKind, IrqHandled, KernelTrapSink, PercpuIf, SmpIf, TrapAction,
+    TrapFrameMut, TxPlatform,
 };
 
 use crate::{adapter::boot_runtime, trap_handoff};
@@ -13,6 +13,9 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         // policy; only user-mode faults can be handed off to a
         // userspace-run wait.
         if !fault.from_user {
+            if fault.instruction && fault.address.0 == 0 && <P as SmpIf>::online_cpu_count() > 1 {
+                <P as SmpIf>::park_this_cpu();
+            }
             return TrapAction::Terminate;
         }
 

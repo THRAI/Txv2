@@ -395,6 +395,18 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok(())
     }
 
+    /// Update the inode table metadata fields directly (no journal).
+    pub fn write_inode_meta(&mut self, inode_no: InodeNo, meta: InodeMetaLite) -> Result<()> {
+        let loc = self.inode_location(inode_no)?;
+        let mut block = [0u8; BLOCK_SIZE];
+        self.image.read_block(loc.block, &mut block)?;
+        let mut inode = Inode::parse(&block[loc.offset..loc.offset + loc.len])?;
+        apply_meta(&mut inode, meta);
+        inode.encode(&mut block[loc.offset..loc.offset + loc.len])?;
+        self.image.write_block(loc.block, &block)?;
+        Ok(())
+    }
+
     /// Allocate a free data block in group 0, mark it used, and return its
     /// absolute block number.
     pub fn allocate_block(&mut self) -> Result<u64> {
