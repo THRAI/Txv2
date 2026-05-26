@@ -1,3 +1,27 @@
+- 2026-05-27 **Landed phase-0 kernel-object fd providers for the `accept03`
+  tail.** Added typed `OpenFileBacking::KernelObject` metadata for
+  `perf_event_open(241)` software CPU-clock events and
+  `bpf(280, BPF_MAP_CREATE)` array maps, so they install real non-socket fds
+  instead of returning `ENOSYS`. This is fd-provider scope only: perf counter
+  reads/ioctl/poll and BPF map update/lookup/program semantics remain separate
+  subsystem work. Also wired `memfd_secret(447)` as an anonymous PageBacked
+  fd provider, but the current prebuilt LTP image still calls an invalid
+  syscall number for memfd_secret, so it remains a local TCONF and is not
+  counted. Focused `accept03` is now `22/23` in
+  `target/oscomp/ltp-accept03-after-kernel-object-fds.txt`; refreshed b4 is
+  `93/95` in `target/oscomp/ltp-net-b4-after-kernel-object-fds.txt`, moving
+  the split aggregate to `229/236`. **Verification:** `cargo fmt --check`;
+  `cargo check -p tx-subsystems -p tx-shims`; `cargo test -p tx-shims
+  non_socket_kernel_object --lib`; `cargo test -p tx-shims memfd_secret
+  --lib`; `cargo xtask syscall-status perf_event_open`; `cargo xtask
+  syscall-status bpf`; `cargo xtask syscall-status memfd_secret`; `cargo
+  xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu --submit target/oscomp/submit`; focused `accept03 22/23`;
+  refreshed b4 `93/95`; local judge on both logs. **Next step:** remaining
+  score blockers are `recvmmsg01` musl SIGSEGV, RV64 legacy `socketcall`
+  / `accept4_01` socketcall interpretation, compat-only `setsockopt03`, and
+  the local-image memfd_secret syscall-number gap.
+
 - 2026-05-27 **Refreshed b2/b3/b4 LTP network split rows after the local
   RDS/SCTP slice.** Rebuilt/submitted the RV64 kernel and reran the affected
   aggregate batches: b2 is now `35/35` in

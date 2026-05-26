@@ -23,8 +23,10 @@ static PROCFS_PROJECTED_MOUNT: SpinMutex<Option<Cap<tx_subsystems::mount::MountP
 const MEMFD_NAME_MAX: usize = 249;
 const MEMFD_CAPACITY_BYTES: u64 = 16 * 1024 * 1024;
 const MEMFD_FS_OBJECT_ID_BASE: u64 = 0xFFFC_0000_0000_0000;
+const MEMFD_SECRET_FS_OBJECT_ID_BASE: u64 = 0xFFFA_0000_0000_0000;
 const FSNOTIFY_FS_OBJECT_ID_BASE: u64 = 0xFFFB_0000_0000_0000;
 static NEXT_MEMFD_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(MEMFD_FS_OBJECT_ID_BASE);
+static NEXT_MEMFD_SECRET_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(MEMFD_SECRET_FS_OBJECT_ID_BASE);
 static NEXT_FSNOTIFY_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(FSNOTIFY_FS_OBJECT_ID_BASE);
 
 pub(super) fn record_stat_meta_override(fs_object_id: FsObjectId, meta: InodeMeta) {
@@ -142,6 +144,10 @@ fn allocate_fd_at_least_under_limit<'a>(
 
 fn allocate_memfd_fs_object_id() -> FsObjectId {
     FsObjectId::new(NEXT_MEMFD_FS_OBJECT_ID.fetch_add(1, Ordering::AcqRel))
+}
+
+fn allocate_memfd_secret_fs_object_id() -> FsObjectId {
+    FsObjectId::new(NEXT_MEMFD_SECRET_FS_OBJECT_ID.fetch_add(1, Ordering::AcqRel))
 }
 
 fn allocate_fsnotify_fs_object_id() -> FsObjectId {
@@ -305,6 +311,60 @@ pub(super) fn sys_memfd_create<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     if flags & MFD_CLOEXEC != 0 {
         ctx.process.set_fd_cloexec(fd, true);
     }
+
+    SyscallResult::Return(fd as i64)
+}
+
+/// `memfd_secret(flags)`. Linux generic ABI `__NR_memfd_secret = 447`.
+///
+/// This is a scoped fd-provider phase: the returned descriptor is a real
+/// anonymous PageBacked regular file, so generic fd users such as `accept(2)`
+/// see a non-socket file and return `ENOTSOCK`. Secret-memory isolation
+/// (direct-map exclusion, mlock/accounting policy, and special mmap rules)
+/// remains a VM charter; unknown flags are rejected until that charter lands.
+pub(super) fn sys_memfd_secret<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let flags = args[0];
+    if flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let page_count = MEMFD_CAPACITY_BYTES / USER_PAGE_SIZE as u64;
+    let pc = match PageContainer::new_cap(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        page_count,
+    ) {
+        Ok(pc) => pc,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    pc.set_size_bytes(0);
+
+    let rnode = match tx_subsystems::vfs::RNode::new_cap(
+        allocate_memfd_secret_fs_object_id(),
+        InodeMeta::new(InodeKind::Regular, 0o100600),
+        RNodeBacking::PageBacked { pc },
+    ) {
+        Ok(rnode) => rnode,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let open_file = match OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            ..OpenFileFlags::default()
+        },
+    ) {
+        Ok(file) => file,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+
+    let fd = match allocate_fd_under_limit(ctx) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let _ = ctx.process.install_fd(fd, open_file);
 
     SyscallResult::Return(fd as i64)
 }

@@ -29,8 +29,8 @@ scoped `fsopen` / `fspick` / `open_tree` fd-provider dispatch).
 _Counts read from `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}`._
 _Run `cargo xtask syscall-status --regen` to refresh; `--check` to lint in CI._
 
-- **`NR_*` defined:** 201
-- **Dispatched (has a match arm):** 199
+- **`NR_*` defined:** 204
+- **Dispatched (has a match arm):** 202
 - **Defined but not dispatched:** 2 — see list below
 
 #### Defined but not dispatched
@@ -64,13 +64,14 @@ number of additional LTP tests that move from skipped/failed to runnable.
 | `chroot` / `pivot_root` / `swap*` | +8 | S–M (1–2w) | `chroot` is one field; bdev-fs lands swap |
 | `seccomp` / capabilities / `keyctl` | +15 | L (6–8w) | filter bytecode + keyring |
 | `ptrace` | +20 | XL (12w+) | parallel exec context — out of scope v1 |
-| `bpf` / `perf_event_open` | +10 | XL (12w+) | out of scope v1 |
+| full `bpf` / `perf_event_open` semantics | +10 | XL (12w+) | phase-0 fd providers landed for `accept03`; full maps/programs/perf sampling out of scope v1 |
 
 **Reading the table.** Best LTP-impact-per-effort: `fork` + CLOEXEC,
 `getrlimit`/`setrlimit`, then `preadv`/`pwritev`/`fallocate`. SysV IPC and the
 network stack are larger but unlock the biggest LTP coverage jumps. `ptrace`
-and `bpf` are explicitly **out of scope for v1** — flag them and move on
-unless the user specifically chartered them.
+full `bpf`/`perf_event_open` semantics are explicitly **out of scope for v1**;
+the `accept03` fd-provider probe has a narrower phase-0 implementation that
+installs typed non-socket fds without claiming map/program or counter support.
 
 ## OSComp + LTP coverage (the gold standard)
 
@@ -184,7 +185,7 @@ requires this entry before the work counts as complete.
 
 ### Misc / debug (8)
 
-`reboot`, `kexec_load`, `syslog`, `perf_event_open`, `bpf`, `ptrace`,
+`reboot`, `kexec_load`, `syslog`, full `perf_event_open`, full `bpf`, `ptrace`,
 `process_madvise`, `close_range`.
 
 ## Already-partial (existing arms returning `-ENOSYS`)
@@ -261,8 +262,8 @@ overwritten by the next `sync`. The lint variant
 
 ### Counts (from dispatch table)
 
-- `pub const NR_*` in numbers.rs: **201**
-- dispatched in mod.rs: **198** (of which async: 62, likely-stub: 0)
+- `pub const NR_*` in numbers.rs: **204**
+- dispatched in mod.rs: **201** (of which async: 62, likely-stub: 0)
 - defined but not dispatched: **3**
 
 ### Defined in `numbers.rs` but no dispatch arm (3)
@@ -273,7 +274,7 @@ These have a syscall number constant but no match arm in `mod.rs`. Either wire t
 - `NR_PIDFD_SEND_SIGNAL` (nr=424)
 - `NR_PSELECT6` (nr=72)
 
-### Dispatched syscalls (198) — name → handler
+### Dispatched syscalls (201) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -450,6 +451,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 229 | `NR_MUNLOCK` | `sys_munlock` | async |
 | 232 | `NR_EPOLL_WAIT` | `sys_epoll_wait` | async |
 | 233 | `NR_MADVISE` | `sys_madvise` | sync |
+| 241 | `NR_PERF_EVENT_OPEN` | `sys_perf_event_open` | sync |
 | 242 | `NR_ACCEPT4` | `sys_accept4` | sync |
 | 243 | `NR_RECVMMSG` | `sys_recvmmsg` | sync |
 | 260 | `NR_WAIT4` | `sys_wait4` | async |
@@ -463,6 +465,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 276 | `NR_RENAMEAT2` | `sys_renameat2` | async |
 | 278 | `NR_GETRANDOM` | `sys_getrandom` | sync |
 | 279 | `NR_MEMFD_CREATE` | `sys_memfd_create` | sync |
+| 280 | `NR_BPF` | `sys_bpf` | sync |
 | 282 | `NR_SIGNALFD` | `sys_signalfd` | sync |
 | 282 | `NR_USERFAULTFD` | `sys_userfaultfd` | sync |
 | 283 | `NR_MEMBARRIER` | `sys_membarrier` | sync |
@@ -477,6 +480,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 433 | `NR_FSPICK` | `sys_fspick` | async |
 | 434 | `NR_PIDFD_OPEN` | `sys_pidfd_open` | sync |
 | 439 | `NR_FACCESSAT2` | `sys_faccessat2` | sync |
+| 447 | `NR_MEMFD_SECRET` | `sys_memfd_secret` | sync |
 
 <!-- END syscall-auto-table -->
 

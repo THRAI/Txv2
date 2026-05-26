@@ -17,13 +17,13 @@ Reliable focused results already in `target/oscomp`:
 | Basic socket/listen/options | `socket01,socket02,listen01,getsockname01,getsockopt01,getsockopt02,setsockopt01` | `40/40` | `target/oscomp/ltp-net-b1-basic.txt` |
 | Basic send/recv | `send01,send02,sendto01,sendto02,sendto03,recv01,recvfrom01` | `35/35` | `target/oscomp/ltp-net-b2-after-rds-sctp.txt` |
 | msg/mmsg | `sendmsg01,sendmsg02,sendmsg03,recvmsg01,recvmsg02,recvmsg03,sendmmsg01,sendmmsg02,recvmmsg01` | `37/38` | `target/oscomp/ltp-net-b3-after-rds-sctp.txt` |
-| bind/connect/accept | `bind01,bind02,bind03,bind04,bind05,bind06,connect01,connect02,accept01,accept02,accept03,accept4_01,getpeername01` | `91/95` | `target/oscomp/ltp-net-b4-after-rds-sctp.txt` |
+| bind/connect/accept | `bind01,bind02,bind03,bind04,bind05,bind06,connect01,connect02,accept01,accept02,accept03,accept4_01,getpeername01` | `93/95` | `target/oscomp/ltp-net-b4-after-kernel-object-fds.txt` |
 | socketpair/socketcall | `socketpair01,socketpair02,socketcall01,socketcall02,socketcall03` | `14/17` | `target/oscomp/ltp-net-b5-socketpair-socketcall.txt` |
 | setsockopt tail | `setsockopt02,setsockopt03,setsockopt04,setsockopt05,setsockopt06,setsockopt07,setsockopt08,setsockopt09,setsockopt10` | `10/11` | `target/oscomp/ltp-net-b6-after-tls-ulp.txt` |
 | IPv6 UDP focused | `bind05,recvmsg02` | `15/15` | `target/oscomp/ltp-net-ipv6-udp.txt` |
 | IPv6 dual-stack TCP focused | `connect02` | `1/1` | `target/oscomp/ltp-net-ipv6-connect02.txt` |
 | accept tail focused | `accept03,accept4_01,getpeername01` | `28/39` | `target/oscomp/ltp-net-accept-tail-after-connect02.txt` |
-| accept03 fd-provider focused | `accept03` | `20/23` | `target/oscomp/ltp-accept03-after-mount-api-fds.txt` |
+| accept03 fd-provider focused | `accept03` | `22/23` | `target/oscomp/ltp-accept03-after-kernel-object-fds.txt` |
 | old kconfig blocker probe | `bind06,sendto03,sendmsg03,setsockopt05,setsockopt06,setsockopt07,setsockopt08,setsockopt09,setsockopt10` | `0/9` | `target/oscomp/ltp-net-kconfig-after-config-file.txt` |
 | userns packet send focused | `sendto03` | `2/2` | `target/oscomp/ltp-sendto03-userns-after-packet-send.txt` |
 | userns packet MTU focused | `setsockopt05` | `1/1` | `target/oscomp/ltp-setsockopt05-userns-after-mtu.txt` |
@@ -38,13 +38,17 @@ Reliable focused results already in `target/oscomp`:
 | SCTP local stream focused | `sendto02,bind04` | `17/17` | `target/oscomp/ltp-sctp-sendto02-bind04-after-ipv6tcp-submit.txt` |
 
 The first six result rows cover all 50 named syscall-network cases. The current
-local judge subcase total is now `227/236` after the b2/b3/b4/b6 refreshes.
+local judge subcase total is now `229/236` after the b2/b3/b4/b6 refreshes.
 Treat that as a split-batch progress score, not as "50/50 cases passed". The
 kconfig blocker probe and the focused IPv6/accept/userns rows overlap the split
 batches, so they are not added to that total.
 The b4 row now reflects the focused `accept03`
-pidfd+memfd+fsnotify+mount-api-provider movement: `accept03` is `20/23`, with
-only perf event, bpf map, and memfd_secret skipped. Supporting ABI witnesses:
+pidfd+memfd+fsnotify+mount-api+kernel-object-provider movement: `accept03` is
+`22/23`, with perf event and bpf map now returning the expected generic
+non-socket fd errno. The only remaining local skip is memfd_secret: the kernel
+has `memfd_secret(447)` wired, but the current LTP image calls an invalid
+syscall number for that provider and therefore cannot reach the kernel arm.
+Supporting ABI witnesses:
 `memfd_create02` reports `10/14` in
 `target/oscomp/ltp-memfd-create02-basic.txt`, and
 `inotify_init1_01,inotify_init1_02` report `8/8` in
@@ -161,9 +165,9 @@ surface. Use them as regression witnesses after related fixes.
 | --- | --- | --- |
 | `bind04` | Refreshed b4 reports `bind04 16/16`, and focused `sendto02,bind04` reports `17/17`: AF_UNIX pathname/abstract stream and seqpacket, IPv4/IPv6 TCP, and IPv4/IPv6 SCTP loopback/wildcard communication all pass | Local-only SCTP stream associations are implemented for LTP's bind/listen/connect/accept/read/write surface. Enabling SCTP exposed the later IPv6 TCP rows, so RawTcp loopback now parses/emits IPv6 smoltcp segments for `[::1]` connections. Full SCTP wire protocol remains out of scope. |
 | `bind05` | AF_UNIX, IPv4 UDP, IPv4 UDP-Lite, IPv6 UDP, and IPv6 UDP-Lite datagram communication pass | Current focused and b4 logs show `14/14`; use this as the IPv6 UDP/UDP-Lite regression witness. |
-| `bind06` | Focused 330s run reaches the AF_PACKET bind/ioctl race body, exits by LTP execution time, and passes `1/1` in `target/oscomp/ltp-bind06-current330.txt`; refreshed b4 reports `bind06 1/1` and `91/95` in `target/oscomp/ltp-net-b4-after-rds-sctp.txt` | Use the focused log for direct regression and the refreshed b4 log for aggregate score movement. |
+| `bind06` | Focused 330s run reaches the AF_PACKET bind/ioctl race body, exits by LTP execution time, and passes `1/1` in `target/oscomp/ltp-bind06-current330.txt`; refreshed b4 reports `bind06 1/1` and `93/95` in `target/oscomp/ltp-net-b4-after-kernel-object-fds.txt` | Use the focused log for direct regression and the refreshed b4 log for aggregate score movement. |
 | `connect02` | Focused log passes `1/1`; the official case is slow and silent because it loops 1000 times | Use `target/oscomp/ltp-net-ipv6-connect02.txt` as the focused regression witness. A 30s outer timeout is too short for this case even though LTP's internal timeout is 30 guest seconds. |
-| `accept03` | Refreshed b4 and focused `accept03` both report `20/23`: pidfd, fanotify, inotify, memfd, fsopen, fspick, and open_tree now return the expected generic-fd errno (`ENOTSOCK`, except open_tree `EBADF`); perf/bpf/memfd_secret providers remain `TCONF` | Direct blocker is broader fd/syscall surface, not TCP accept dataplane. The new mount API work is intentionally fd-provider-only: full `fsconfig`/`fsmount`/`move_mount` semantics are still a mount-subsystem project. |
+| `accept03` | Refreshed b4 and focused `accept03` both report `22/23`: pidfd, fanotify, inotify, userfaultfd, io_uring, memfd, fsopen, fspick, perf event, bpf map, and open_tree now return the expected generic-fd errno (`ENOTSOCK`, except open_tree `EBADF`); only memfd_secret remains `TCONF` in the current local image | Direct blocker is broader fd/syscall surface, not TCP accept dataplane. Perf event and bpf map are phase-0 typed kernel-object fds; full perf sampling and BPF map operations remain future subsystem work. `memfd_secret(447)` is wired in the kernel, but this local LTP image appears compiled without the syscall number, so it calls an invalid syscall and still reports `ENOSYS`. |
 | `accept4_01` | Focused tail log reports `8/9`: libc and `__NR_accept4` variants pass all close-on-exec/nonblock subcases; legacy socketcall check is not available on RV64 | Architecture surface; do not fake legacy `socketcall` on RV64. |
 | `sendto02` | Refreshed b2 and focused `sendto02,bind04` both report `sendto02 1/1`: SCTP socket creation succeeds and `sendto(NULL, ...)` returns `EFAULT` before protocol-state errors | This proves SCTP socket creation and user-buffer error order for the LTP witness; it is not full SCTP wire behavior. |
 | `sendto03` | Refreshed b2 reports `2/2` in `target/oscomp/ltp-net-b2-after-rds-sctp.txt` after AF_PACKET `sendto(sockaddr_ll)`, `PACKET_VNET_HDR`, and packet ring setup support | Use the refreshed b2 log for split movement and `target/oscomp/ltp-sendto03-userns-after-packet-send.txt` as the focused regression witness. |
@@ -192,10 +196,10 @@ now mostly explicit unsupported, architecture-specific, or broader non-network
 surfaces:
 
 - `socketcall01..03`: legacy socketcall is not an RV64 syscall surface.
-- `accept03`: pidfd, memfd, fanotify, inotify, fsopen, fspick, and open_tree
-  fds are now implemented for generic fd classification; remaining broad
-  descriptor providers are perf, bpf, and memfd_secret, all outside TCP accept
-  dataplane.
+- `accept03`: pidfd, memfd, fanotify, inotify, fsopen, fspick, open_tree,
+  perf event, and bpf map fds are now implemented for generic fd
+  classification; the only remaining local skip is memfd_secret, whose kernel
+  arm is wired but unreachable from this prebuilt LTP image.
 - `accept4_01`: legacy `socketcall` accept4 variant is not available on RV64.
 - `recvmmsg01` musl: known userspace wrapper SIGSEGV after the raw EBADF
   subcase passes.
@@ -214,7 +218,7 @@ timeout 300s make oscomp-qemu-rv64 \
 
 timeout 600s make oscomp-qemu-rv64 \
   OSCOMP_LTP=bind01,bind02,bind03,bind04,bind05,bind06,connect01,connect02,accept01,accept02,accept03,accept4_01,getpeername01 \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-b4-after-rds-sctp.txt
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-b4-after-kernel-object-fds.txt
 
 timeout 300s make oscomp-qemu-rv64 \
   OSCOMP_LTP=setsockopt02,setsockopt03,setsockopt04,setsockopt05,setsockopt06,setsockopt07,setsockopt08,setsockopt09,setsockopt10 \

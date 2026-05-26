@@ -1102,10 +1102,44 @@ pub enum OpenFileBacking {
     /// to the target process identity; exit/readiness lives on the
     /// process side, so this adapter does not duplicate signal truth.
     Pidfd { process: Cap<ProcessIdentity> },
+    /// Minimal typed kernel-object fds for syscall surfaces whose full
+    /// subsystem semantics are intentionally staged. The fd owns enough
+    /// metadata to preserve object kind and creation parameters; later
+    /// phases can split these into dedicated subsystem caps when read,
+    /// ioctl, poll, and cross-object references land.
+    KernelObject { object: KernelObjectFile },
     /// Linux 5.2 new mount API fd (`fsopen`, `fspick`, `fsmount`,
     /// `open_tree`). The cap carries the mount-context or detached
     /// mount identity; full topology mutation remains in mount syscalls.
     MountApi { file: Cap<MountApiFile> },
+}
+
+/// Metadata carried by phase-0 kernel-object fds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelObjectFile {
+    PerfEvent(PerfEventFile),
+    BpfMap(BpfMapFile),
+}
+
+/// `perf_event_open(2)` phase-0 fd metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PerfEventFile {
+    pub attr_type: u32,
+    pub config: u64,
+    pub pid: i32,
+    pub cpu: i32,
+    pub group_fd: i32,
+    pub flags: u64,
+}
+
+/// `bpf(BPF_MAP_CREATE)` phase-0 fd metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BpfMapFile {
+    pub map_type: u32,
+    pub key_size: u32,
+    pub value_size: u32,
+    pub max_entries: u32,
+    pub map_flags: u32,
 }
 
 /// Per-fd file-position carrier.
@@ -1360,6 +1394,26 @@ impl OpenFile {
         step_engine::sign(Self::new_pidfd(process, flags))
     }
 
+    /// Construct a phase-0 kernel-object-backed `OpenFile`.
+    pub fn new_kernel_object(object: KernelObjectFile, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::KernelObject { object },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicI8::new(-1),
+            flags,
+            opendir_dentry: None,
+        }
+    }
+
+    /// Zone-sign a fresh phase-0 kernel-object-backed `OpenFile`.
+    pub fn new_kernel_object_cap(
+        object: KernelObjectFile,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_kernel_object(object, flags))
+    }
+
     /// Construct a new-mount-API-backed `OpenFile`.
     pub fn new_mount_api(file: Cap<MountApiFile>, flags: OpenFileFlags) -> Self {
         Self {
@@ -1483,6 +1537,10 @@ impl OpenFile {
                 "OpenFile::rnode() called on a pidfd-backed OpenFile; \
                  dispatch via OpenFile::backing() / OpenFile::pidfd_process() first",
             ),
+            OpenFileBacking::KernelObject { .. } => panic!(
+                "OpenFile::rnode() called on a kernel-object-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::kernel_object() first",
+            ),
             OpenFileBacking::MountApi { .. } => panic!(
                 "OpenFile::rnode() called on a mount-api-backed OpenFile; \
                  dispatch via OpenFile::backing() / OpenFile::mount_api_file() first",
@@ -1539,6 +1597,7 @@ impl OpenFile {
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
             | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
             | OpenFileBacking::MountApi { .. } => None,
         }
     }
@@ -1562,6 +1621,7 @@ impl OpenFile {
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
             | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
             | OpenFileBacking::MountApi { .. } => None,
         }
     }
@@ -1584,6 +1644,7 @@ impl OpenFile {
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
             | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
             | OpenFileBacking::MountApi { .. } => None,
         }
     }
@@ -1602,6 +1663,7 @@ impl OpenFile {
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
             | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
             | OpenFileBacking::MountApi { .. } => None,
         }
     }
@@ -1620,6 +1682,7 @@ impl OpenFile {
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
             | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
             | OpenFileBacking::MountApi { .. } => None,
         }
     }
@@ -1638,6 +1701,7 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::PosixMq { .. }
             | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
             | OpenFileBacking::MountApi { .. } => None,
         }
     }
@@ -1661,6 +1725,7 @@ impl OpenFile {
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
             | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
             | OpenFileBacking::MountApi { .. } => None,
         }
     }
@@ -1679,6 +1744,7 @@ impl OpenFile {
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::IoUring { .. }
             | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
             | OpenFileBacking::MountApi { .. } => None,
         }
     }
@@ -1696,6 +1762,26 @@ impl OpenFile {
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::IoUring { .. }
             | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::KernelObject { .. }
+            | OpenFileBacking::MountApi { .. } => None,
+        }
+    }
+
+    /// `Some(&KernelObjectFile)` iff this `OpenFile` is a phase-0
+    /// kernel-object fd.
+    pub fn kernel_object(&self) -> Option<&KernelObjectFile> {
+        match &self.backing {
+            OpenFileBacking::KernelObject { object } => Some(object),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::Ufd { .. }
+            | OpenFileBacking::AioContext { .. }
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. }
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. }
             | OpenFileBacking::MountApi { .. } => None,
         }
     }
@@ -1714,7 +1800,8 @@ impl OpenFile {
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::IoUring { .. }
             | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. } => None,
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. } => None,
         }
     }
 

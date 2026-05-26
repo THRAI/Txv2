@@ -366,7 +366,10 @@ impl OpenFile {
         // The agent-side read syscall lands in P-10.5 with its own
         // dispatch (it dequeues a fault message, not bytes from a
         // file). Surface EINVAL until then.
-        if matches!(self.backing(), OpenFileBacking::Ufd { .. }) {
+        if matches!(
+            self.backing(),
+            OpenFileBacking::Ufd { .. } | OpenFileBacking::KernelObject { .. }
+        ) {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
@@ -505,7 +508,10 @@ impl OpenFile {
         // ⑤ publish — (N/A: lseek doesn't fire signals)
         // PR-10 phase 0: userfaultfd fds have no offset semantic.
         // Linux returns ESPIPE on `lseek(uffd_fd, ...)`; match that.
-        if matches!(self.backing(), OpenFileBacking::Ufd { .. }) {
+        if matches!(
+            self.backing(),
+            OpenFileBacking::Ufd { .. } | OpenFileBacking::KernelObject { .. }
+        ) {
             return StepOutcome::Err(Errno::ESPIPE);
         }
         // Backing-driven dispatch: short-circuit non-seekable
@@ -599,7 +605,10 @@ impl OpenFile {
         // PR-10 phase 0: userfaultfd fds have no VFS-shaped write path.
         // The agent-side `UFFDIO_*` ioctls (phase P-10.5) deliver the
         // reply path, not write(2). Surface EINVAL until then.
-        if matches!(self.backing(), OpenFileBacking::Ufd { .. }) {
+        if matches!(
+            self.backing(),
+            OpenFileBacking::Ufd { .. } | OpenFileBacking::KernelObject { .. }
+        ) {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
@@ -712,7 +721,10 @@ impl OpenFile {
         // TTY-shaped; userfaultfd ioctls have their own request
         // catalog landing in P-10.2+. Return ENOTTY for ufd fds via
         // this dispatcher.
-        if matches!(self.backing(), OpenFileBacking::Ufd { .. }) {
+        if matches!(
+            self.backing(),
+            OpenFileBacking::Ufd { .. } | OpenFileBacking::KernelObject { .. }
+        ) {
             return StepOutcome::Err(Errno::ENOTTY);
         }
         match self.rnode().backing() {

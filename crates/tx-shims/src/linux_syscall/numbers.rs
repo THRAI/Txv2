@@ -1523,9 +1523,18 @@ pub const NR_TRUNCATE: u64 = 45;
 pub const NR_FTRUNCATE: u64 = 46;
 /// `NR_FALLOCATE = 47` — Linux RV64 generic ABI `__NR_fallocate`.
 pub const NR_FALLOCATE: u64 = 47;
+/// `NR_PERF_EVENT_OPEN = 241` — Linux generic ABI
+/// `__NR_perf_event_open`.
+pub const NR_PERF_EVENT_OPEN: u64 = 241;
 /// `NR_MEMFD_CREATE = 279` — Linux generic ABI `__NR_memfd_create`.
 /// Returns an anonymous PageBacked regular-file fd with no path presence.
 pub const NR_MEMFD_CREATE: u64 = 279;
+/// `NR_BPF = 280` — Linux generic ABI `__NR_bpf`.
+pub const NR_BPF: u64 = 280;
+/// `NR_MEMFD_SECRET = 447` — Linux generic ABI `__NR_memfd_secret`.
+/// This stage installs a secretmem-shaped anonymous PageBacked fd; full
+/// secret-memory isolation is deferred to the VM subsystem.
+pub const NR_MEMFD_SECRET: u64 = 447;
 /// `memfd_create(2)` flag: mark the returned fd close-on-exec.
 pub const MFD_CLOEXEC: u32 = 0x0001;
 /// `memfd_create(2)` flag: allow file seals. Currently rejected until

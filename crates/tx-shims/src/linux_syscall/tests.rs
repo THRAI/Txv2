@@ -44,26 +44,28 @@ use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::vfs::structure::{
-    DEntry, FsNotifyKind, InlineName, InodeKind, InodeMeta, OpenFileBacking, RNode, RNodeBacking,
-    StructPayload,
+    BpfMapFile, DEntry, FsNotifyKind, InlineName, InodeKind, InodeMeta, KernelObjectFile,
+    OpenFileBacking, PerfEventFile, RNode, RNodeBacking, StructPayload,
 };
 use tx_subsystems::vfs::{FsOps, OpenFile};
 use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
 use super::{
-    dispatch, SyscallCtx, SyscallResult, AT_FDCWD, CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID,
-    CLONE_PARENT_SETTID, EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENODEV_VALUE, ENOENT_VALUE,
-    ENOSYS_VALUE, FAN_CLASS_CONTENT, FAN_CLASS_NOTIF, FAN_CLOEXEC, FAN_NONBLOCK, FD_CLOEXEC,
-    FSOPEN_CLOEXEC, FSPICK_CLOEXEC, FSPICK_NO_AUTOMOUNT, F_GETFD, F_GETFL, F_SETFD, IN_CLOEXEC,
-    IN_NONBLOCK, MFD_ALLOW_SEALING, MFD_CLOEXEC, NR_ACCEPT, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT,
-    NR_EXIT_GROUP, NR_FANOTIFY_INIT, NR_FCNTL, NR_FSOPEN, NR_FSPICK, NR_GETPGID, NR_GETPGRP,
-    NR_GETPID, NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_INOTIFY_INIT1, NR_MEMBARRIER,
-    NR_MEMFD_CREATE, NR_OPEN_TREE, NR_PIDFD_OPEN, NR_PIPE2, NR_PPOLL, NR_READ, NR_RT_SIGACTION,
+    dispatch, SyscallCtx, SyscallResult, AT_FDCWD, BPF_MAP_CREATE, BPF_MAP_TYPE_ARRAY,
+    CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, EBADF_VALUE, EFAULT_VALUE,
+    EINVAL_VALUE, ENODEV_VALUE, ENOENT_VALUE, ENOSYS_VALUE, FAN_CLASS_CONTENT, FAN_CLASS_NOTIF,
+    FAN_CLOEXEC, FAN_NONBLOCK, FD_CLOEXEC, FSOPEN_CLOEXEC, FSPICK_CLOEXEC, FSPICK_NO_AUTOMOUNT,
+    F_GETFD, F_GETFL, F_SETFD, IN_CLOEXEC, IN_NONBLOCK, MFD_ALLOW_SEALING, MFD_CLOEXEC, NR_ACCEPT,
+    NR_BPF, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FANOTIFY_INIT, NR_FCNTL,
+    NR_FSOPEN, NR_FSPICK, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETSID,
+    NR_GET_ROBUST_LIST, NR_INOTIFY_INIT1, NR_MEMBARRIER, NR_MEMFD_CREATE, NR_MEMFD_SECRET,
+    NR_OPEN_TREE, NR_PERF_EVENT_OPEN, NR_PIDFD_OPEN, NR_PIPE2, NR_PPOLL, NR_READ, NR_RT_SIGACTION,
     NR_RT_SIGPROCMASK, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY,
     NR_SCHED_YIELD, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
     NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, NR_WRITEV, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE,
-    O_DIRECTORY, O_NONBLOCK, O_RDONLY, O_RDWR, PIDFD_NONBLOCK, SIGCHLD, WNOHANG,
+    O_DIRECTORY, O_NONBLOCK, O_RDONLY, O_RDWR, PERF_COUNT_SW_CPU_CLOCK, PERF_TYPE_SOFTWARE,
+    PIDFD_NONBLOCK, SIGCHLD, WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
@@ -1005,6 +1007,143 @@ fn dispatch_memfd_create_validates_name_flags_and_cloexec() {
     };
     assert!(proc_cap.fd_cloexec(fd));
     assert!(proc_cap.fd(fd).expect("memfd installed").flags().cloexec);
+}
+
+#[test]
+fn dispatch_perf_event_open_installs_non_socket_kernel_object_fd() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let mut attr = [0u8; 48];
+    let attr_len = attr.len() as u32;
+    attr[0..4].copy_from_slice(&PERF_TYPE_SOFTWARE.to_le_bytes());
+    attr[4..8].copy_from_slice(&attr_len.to_le_bytes());
+    attr[8..16].copy_from_slice(&PERF_COUNT_SW_CPU_CLOCK.to_le_bytes());
+    attr[40..48].copy_from_slice(&((1u64 << 0) | (1u64 << 5) | (1u64 << 6)).to_le_bytes());
+
+    let req = SyscallRequest::new(
+        NR_PERF_EVENT_OPEN,
+        [
+            attr.as_ptr() as u64,
+            0,
+            (-1i64) as u64,
+            (-1i64) as u64,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("perf_event_open failed: {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("perf event fd installed");
+    assert_eq!(
+        file.kernel_object(),
+        Some(&KernelObjectFile::PerfEvent(PerfEventFile {
+            attr_type: PERF_TYPE_SOFTWARE,
+            config: PERF_COUNT_SW_CPU_CLOCK,
+            pid: 0,
+            cpu: -1,
+            group_fd: -1,
+            flags: 0,
+        }))
+    );
+
+    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
+        SyscallResult::Error(88)
+    );
+}
+
+#[test]
+fn dispatch_bpf_map_create_installs_non_socket_kernel_object_fd() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let mut attr = [0u8; 20];
+    attr[0..4].copy_from_slice(&BPF_MAP_TYPE_ARRAY.to_le_bytes());
+    attr[4..8].copy_from_slice(&4u32.to_le_bytes());
+    attr[8..12].copy_from_slice(&8u32.to_le_bytes());
+    attr[12..16].copy_from_slice(&1u32.to_le_bytes());
+
+    let req = SyscallRequest::new(
+        NR_BPF,
+        [
+            BPF_MAP_CREATE as u64,
+            attr.as_ptr() as u64,
+            attr.len() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("bpf(BPF_MAP_CREATE) failed: {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("bpf map fd installed");
+    assert_eq!(
+        file.kernel_object(),
+        Some(&KernelObjectFile::BpfMap(BpfMapFile {
+            map_type: BPF_MAP_TYPE_ARRAY,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1,
+            map_flags: 0,
+        }))
+    );
+
+    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
+        SyscallResult::Error(88)
+    );
+}
+
+#[test]
+fn dispatch_memfd_secret_installs_non_socket_pagebacked_file() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let invalid_flags = SyscallRequest::new(NR_MEMFD_SECRET, [1, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(invalid_flags, &ctx)),
+        SyscallResult::Error(EINVAL_VALUE)
+    );
+
+    let req = SyscallRequest::new(NR_MEMFD_SECRET, [0, 0, 0, 0, 0, 0]);
+    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("memfd_secret failed: {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("memfd_secret fd installed");
+    let flags = file.flags();
+    assert!(flags.read);
+    assert!(flags.write);
+    assert!(!flags.cloexec);
+    match file.rnode().backing() {
+        RNodeBacking::PageBacked { pc } => {
+            assert!(matches!(
+                pc.kind(),
+                tx_subsystems::page_backed::PageContainerKind::Anon { .. }
+            ));
+            assert_eq!(pc.size_bytes(), 0);
+        }
+        other => panic!("expected PageBacked secretmem rnode, got {other:?}"),
+    }
+
+    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
+        SyscallResult::Error(88)
+    );
 }
 
 #[test]
