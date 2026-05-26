@@ -42,21 +42,26 @@ use std::sync::{LazyLock, Mutex};
 
 use tx_hal::{
     Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
-    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, UserPtr, VirtAddr,
 };
 use tx_shims::adapter::reactor_entry::SyscallRequest;
-use tx_shims::adapter::step_engine::Cap;
+use tx_shims::adapter::step_engine::{self as zone, Cap};
 use tx_subsystems::aio::{reset_context_id_counter_for_test, AioWorkerFuture, IOCB_CMD_PREAD};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
 use tx_subsystems::process::{bootstrap_init_process, ProcessIdentity};
 use tx_subsystems::thread_runtime::ThreadIdentity;
-use tx_subsystems::vm::{AddressSpace, USER_PAGE_SIZE};
+use tx_subsystems::vm::{
+    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags,
+    VmMapRequest, USER_PAGE_SIZE,
+};
 use tx_subsystems::zones;
 
 use tx_shims::linux_syscall::aio::{reset_worker_registry_for_test, take_worker_future_for_test};
-use tx_shims::linux_syscall::numbers::{NR_IO_GETEVENTS, NR_IO_SETUP, NR_IO_SUBMIT};
+use tx_shims::linux_syscall::numbers::{
+    NR_IO_GETEVENTS, NR_IO_PGETEVENTS, NR_IO_SETUP, NR_IO_SUBMIT,
+};
 use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult};
 
 // -------- Stub PMAP (mirrors v3_aio_io_submit.rs) -------------------
@@ -193,27 +198,83 @@ fn encode_iocb(
     buf
 }
 
-#[allow(clippy::vec_box)] // stable per-element heap addresses; Vec growth must not invalidate
-fn stage_iocb_array(iocbs: &[[u8; 64]]) -> (u64, alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>>) {
-    let mut heap_iocbs: alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>> =
-        iocbs.iter().map(|b| alloc::boxed::Box::new(*b)).collect();
-    let mut pointers: alloc::vec::Vec<u64> = heap_iocbs
-        .iter_mut()
-        .map(|b| b.as_mut_ptr() as u64)
-        .collect();
-    let iocbpp_ptr = pointers.as_mut_ptr() as u64;
-    let _leak = alloc::boxed::Box::leak(pointers.into_boxed_slice());
-    (iocbpp_ptr, heap_iocbs)
+const USER_AIO_IOCBPP: usize = 0x5110_0000;
+const USER_AIO_EVENTS: usize = 0x5110_3000;
+const USER_AIO_SIGSET: usize = 0x5110_5000;
+const USER_AIO_SIGMASK: usize = 0x5110_8000;
+
+fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
 }
 
-/// Heap-allocate a buffer large enough for `n` `struct io_event`
-/// records (32 bytes each) and return the raw pointer; leak it for
-/// the test's lifetime so the user-VA write stays valid across
-/// `sys_io_getevents` and the post-syscall assertion.
-fn stage_events_buffer(n: usize) -> u64 {
-    let buf: alloc::boxed::Box<[u8]> = alloc::vec![0u8; n * 32].into_boxed_slice();
-    let leak = alloc::boxed::Box::leak(buf);
-    leak.as_mut_ptr() as u64
+fn map_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, len: usize) {
+    let len = align_up(len.max(1), USER_PAGE_SIZE);
+    let range = UserRange::new_aligned(UserVirtAddr(uaddr), len).expect("aligned user range");
+    let request = VmMapRequest::fixed(
+        range,
+        MapPlacement::FixedReplace,
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    ctx.aspace
+        .try_mmap(request)
+        .expect("mmap anon for aio test");
+}
+
+fn copy_to_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, bytes: &[u8]) {
+    let guard = zone::guard();
+    let copied = ctx
+        .aspace
+        .copy_to_user(UserPtr::<u8>::new(uaddr), bytes, &guard);
+    drop(guard);
+    assert_eq!(copied, zone::StepOutcome::Done(bytes.len()));
+}
+
+fn copy_from_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, out: &mut [u8]) {
+    let guard = zone::guard();
+    let copied = ctx
+        .aspace
+        .copy_from_user(out, UserPtr::<u8>::new(uaddr), &guard);
+    drop(guard);
+    assert_eq!(copied, zone::StepOutcome::Done(out.len()));
+}
+
+fn stage_iocb_array(ctx: &SyscallCtx<'_>, iocbs: &[[u8; 64]]) -> u64 {
+    let pointer_bytes_len = iocbs.len() * core::mem::size_of::<u64>();
+    let iocb_base = USER_AIO_IOCBPP + USER_PAGE_SIZE;
+    map_user_bytes(ctx, USER_AIO_IOCBPP, pointer_bytes_len);
+    map_user_bytes(ctx, iocb_base, iocbs.len() * 64);
+
+    let mut pointer_bytes = alloc::vec![0u8; pointer_bytes_len];
+    for (i, iocb) in iocbs.iter().enumerate() {
+        let iocb_addr = iocb_base + i * 64;
+        pointer_bytes[i * 8..(i + 1) * 8].copy_from_slice(&(iocb_addr as u64).to_le_bytes());
+        copy_to_user_bytes(ctx, iocb_addr, iocb);
+    }
+    copy_to_user_bytes(ctx, USER_AIO_IOCBPP, &pointer_bytes);
+    USER_AIO_IOCBPP as u64
+}
+
+fn stage_events_buffer(ctx: &SyscallCtx<'_>, n: usize) -> u64 {
+    map_user_bytes(ctx, USER_AIO_EVENTS, n * 32);
+    USER_AIO_EVENTS as u64
+}
+
+fn stage_aio_sigset(ctx: &SyscallCtx<'_>, slot: usize, sigmask: u64, sigsetsize: u64) -> u64 {
+    let addr = USER_AIO_SIGSET + slot * USER_PAGE_SIZE;
+    map_user_bytes(ctx, addr, 16);
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&sigmask.to_le_bytes());
+    bytes[8..16].copy_from_slice(&sigsetsize.to_le_bytes());
+    copy_to_user_bytes(ctx, addr, &bytes);
+    addr as u64
+}
+
+fn stage_sigmask(ctx: &SyscallCtx<'_>, mask: u64) -> u64 {
+    map_user_bytes(ctx, USER_AIO_SIGMASK, 8);
+    copy_to_user_bytes(ctx, USER_AIO_SIGMASK, &mask.to_le_bytes());
+    USER_AIO_SIGMASK as u64
 }
 
 fn pump_worker_until<F>(mut worker: AioWorkerFuture, mut done: F, budget: u32) -> AioWorkerFuture
@@ -262,7 +323,7 @@ fn submit_dispatch_completion_round_trip() {
     // Submit one PREAD iocb. aio_fildes=99 → dispatcher will get
     // None from ctx.process.fd(99) → returns -EBADF (-9).
     let iocb = encode_iocb(0xCAFE_BABE, IOCB_CMD_PREAD, 99, 0, 16, 0);
-    let (iocbpp, _ka) = stage_iocb_array(&[iocb]);
+    let iocbpp = stage_iocb_array(&ctx, &[iocb]);
     let r = dispatch_call(
         &ctx,
         SyscallRequest::new(NR_IO_SUBMIT, [fd as u64, 1, iocbpp, 0, 0, 0]),
@@ -274,7 +335,7 @@ fn submit_dispatch_completion_round_trip() {
     assert_eq!(aio.completion_len(), 1);
 
     // Drain via sys_io_getevents.
-    let events_ptr = stage_events_buffer(2);
+    let events_ptr = stage_events_buffer(&ctx, 2);
     // timeout = 1 (any non-zero pointer) → non-blocking variant per
     // our canary semantic.
     let r = dispatch_call(
@@ -284,7 +345,8 @@ fn submit_dispatch_completion_round_trip() {
     assert_eq!(r, SyscallResult::Return(1));
 
     // Verify the event was serialised into user memory at events_ptr.
-    let event_bytes = unsafe { core::slice::from_raw_parts(events_ptr as *const u8, 32) };
+    let mut event_bytes = [0u8; 32];
+    copy_from_user_bytes(&ctx, events_ptr as usize, &mut event_bytes);
     let data = u64::from_le_bytes(event_bytes[0..8].try_into().unwrap());
     let obj = u64::from_le_bytes(event_bytes[8..16].try_into().unwrap());
     let res = i64::from_le_bytes(event_bytes[16..24].try_into().unwrap());
@@ -310,7 +372,7 @@ fn io_getevents_with_min_nr_zero_and_empty_queue_returns_zero() {
         other => panic!("expected Return, got {other:?}"),
     };
 
-    let events_ptr = stage_events_buffer(1);
+    let events_ptr = stage_events_buffer(&ctx, 1);
     // timeout = 1 (non-blocking variant) so we don't park on the
     // wait carrier even with min_nr=0.
     let r = dispatch_call(
@@ -345,7 +407,7 @@ fn io_getevents_min_nr_two_drains_two_completions() {
     // Submit two iocbs (both surface -EBADF since fd 99 absent).
     let a = encode_iocb(0xAAAA, IOCB_CMD_PREAD, 99, 0, 16, 0);
     let b = encode_iocb(0xBBBB, IOCB_CMD_PREAD, 99, 0, 16, 0);
-    let (iocbpp, _ka) = stage_iocb_array(&[a, b]);
+    let iocbpp = stage_iocb_array(&ctx, &[a, b]);
     let r = dispatch_call(
         &ctx,
         SyscallRequest::new(NR_IO_SUBMIT, [fd as u64, 2, iocbpp, 0, 0, 0]),
@@ -357,7 +419,7 @@ fn io_getevents_min_nr_two_drains_two_completions() {
     assert_eq!(aio.completion_len(), 2);
 
     // Drain via sys_io_getevents with min_nr = 2.
-    let events_ptr = stage_events_buffer(4);
+    let events_ptr = stage_events_buffer(&ctx, 4);
     let r = dispatch_call(
         &ctx,
         SyscallRequest::new(NR_IO_GETEVENTS, [fd as u64, 2, 4, events_ptr, 1, 0]),
@@ -365,8 +427,10 @@ fn io_getevents_min_nr_two_drains_two_completions() {
     assert_eq!(r, SyscallResult::Return(2));
 
     // Both events should land at offsets 0 and 32.
-    let first = unsafe { core::slice::from_raw_parts(events_ptr as *const u8, 32) };
-    let second = unsafe { core::slice::from_raw_parts((events_ptr + 32) as *const u8, 32) };
+    let mut first = [0u8; 32];
+    let mut second = [0u8; 32];
+    copy_from_user_bytes(&ctx, events_ptr as usize, &mut first);
+    copy_from_user_bytes(&ctx, events_ptr as usize + 32, &mut second);
     let data0 = u64::from_le_bytes(first[0..8].try_into().unwrap());
     let data1 = u64::from_le_bytes(second[0..8].try_into().unwrap());
     assert_eq!(data0, 0xAAAA);
@@ -382,7 +446,7 @@ fn io_getevents_against_non_aio_fd_returns_einval_or_ebadf() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let events_ptr = stage_events_buffer(1);
+    let events_ptr = stage_events_buffer(&ctx, 1);
     let r = dispatch_call(
         &ctx,
         SyscallRequest::new(NR_IO_GETEVENTS, [0, 0, 1, events_ptr, 1, 0]),
@@ -415,4 +479,56 @@ fn io_getevents_with_nr_zero_returns_zero() {
         SyscallRequest::new(NR_IO_GETEVENTS, [fd as u64, 0, 0, 0, 1, 0]),
     );
     assert_eq!(r, SyscallResult::Return(0));
+}
+
+#[test]
+fn io_pgetevents_null_sigset_aliases_io_getevents() {
+    let _g = setup();
+    let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
+        SyscallResult::Return(n) => n as u32,
+        other => panic!("expected Return, got {other:?}"),
+    };
+
+    let events_ptr = stage_events_buffer(&ctx, 1);
+    let r = dispatch_call(
+        &ctx,
+        SyscallRequest::new(NR_IO_PGETEVENTS, [fd as u64, 0, 1, events_ptr, 1, 0]),
+    );
+    assert_eq!(r, SyscallResult::Return(0));
+}
+
+#[test]
+fn io_pgetevents_validates_sigset_wrapper() {
+    let _g = setup();
+    let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
+        SyscallResult::Return(n) => n as u32,
+        other => panic!("expected Return, got {other:?}"),
+    };
+
+    let events_ptr = stage_events_buffer(&ctx, 1);
+    let sigmask = stage_sigmask(&ctx, 0);
+    let sigset = stage_aio_sigset(&ctx, 0, sigmask, 8);
+    let r = dispatch_call(
+        &ctx,
+        SyscallRequest::new(NR_IO_PGETEVENTS, [fd as u64, 0, 1, events_ptr, 1, sigset]),
+    );
+    assert_eq!(r, SyscallResult::Return(0));
+
+    let bad_sigset = stage_aio_sigset(&ctx, 1, sigmask, 7);
+    let r = dispatch_call(
+        &ctx,
+        SyscallRequest::new(
+            NR_IO_PGETEVENTS,
+            [fd as u64, 0, 1, events_ptr, 1, bad_sigset],
+        ),
+    );
+    assert_eq!(r, SyscallResult::Error(22 /* EINVAL */));
 }

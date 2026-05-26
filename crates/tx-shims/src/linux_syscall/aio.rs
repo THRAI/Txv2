@@ -750,6 +750,46 @@ pub(super) async fn sys_io_getevents<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -
     SyscallResult::Return(drained.len() as i64)
 }
 
+/// Linux `struct __aio_sigset` used by `io_pgetevents(2)`.
+///
+/// Linux stores a user sigset pointer plus its byte size here, then
+/// applies it as a temporary signal mask around `do_io_getevents`.
+/// Tx v1 validates the wrapper and pointed-to mask when present, but
+/// keeps the same deferred temporary-mask policy as `ppoll` and
+/// `epoll_pwait`.
+const AIO_SIGSET_BYTES: usize = 16;
+
+/// `io_pgetevents(ctx_fd, min_nr, nr, events, timeout, sig)`.
+///
+/// This is the signal-mask variant of `io_getevents`. The AIO data
+/// path is identical; the extra `sig` argument points at Linux's
+/// `struct __aio_sigset { const sigset_t *sigmask; size_t sigsetsize; }`.
+/// For v1, a non-NULL `sigmask` must use the existing 8-byte sigset
+/// size and must be readable, but the temporary signal-mask swap is
+/// deliberately deferred alongside `ppoll`/`epoll_pwait`.
+pub(super) async fn sys_io_pgetevents<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let sigset_ptr = args[5];
+    if sigset_ptr != 0 {
+        let mut sigset = [0u8; AIO_SIGSET_BYTES];
+        if bootstrap_copy_from_user(&ctx.aspace, &mut sigset, sigset_ptr).is_err() {
+            return SyscallResult::Error(EFAULT_VALUE);
+        }
+        let sigmask_ptr = read_u64(&sigset, 0);
+        let sigset_size = read_u64(&sigset, 8);
+        if sigmask_ptr != 0 {
+            if sigset_size != 8 {
+                return SyscallResult::Error(EINVAL_VALUE);
+            }
+            let mut mask = [0u8; 8];
+            if bootstrap_copy_from_user(&ctx.aspace, &mut mask, sigmask_ptr).is_err() {
+                return SyscallResult::Error(EFAULT_VALUE);
+            }
+        }
+    }
+
+    sys_io_getevents(args, ctx).await
+}
+
 /// `io_destroy(ctx_fd)` syscall arm.
 ///
 /// Per `man 2 io_destroy`:

@@ -46,17 +46,20 @@ use std::sync::{LazyLock, Mutex};
 
 use tx_hal::{
     Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
-    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, UserPtr, VirtAddr,
 };
 use tx_shims::adapter::reactor_entry::SyscallRequest;
-use tx_shims::adapter::step_engine::{Cap, OnBehalfOfAbort};
+use tx_shims::adapter::step_engine::{self as zone, Cap, OnBehalfOfAbort};
 use tx_subsystems::aio::{reset_context_id_counter_for_test, AioWorkerFuture, IOCB_CMD_PREAD};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
 use tx_subsystems::process::{bootstrap_init_process, ProcessIdentity};
 use tx_subsystems::thread_runtime::ThreadIdentity;
-use tx_subsystems::vm::{AddressSpace, USER_PAGE_SIZE};
+use tx_subsystems::vm::{
+    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags,
+    VmMapRequest, USER_PAGE_SIZE,
+};
 use tx_subsystems::zones;
 
 use tx_shims::linux_syscall::aio::{
@@ -208,35 +211,51 @@ fn encode_iocb(
     buf
 }
 
-/// Allocate space in the calling process's address space for a single
-/// 64-byte iocb + an 8-byte pointer-slot, write a single iocb into
-/// the iocb buffer + its pointer into the slot, and return
-/// `(iocbpp_ptr, iocb_ptr)` — the syscall arm reads `iocbpp_ptr` as
-/// the user-pointer-to-`*iocb` array head.
-///
-/// In our test stub, user-VA copies fall back to a raw memcpy (see
-/// `bootstrap_copy_from_user`). So we can stash bytes anywhere
-/// addressable in the test process's memory and pass kernel pointers
-/// as the "user VA" — the fallback path picks them up.
-#[allow(clippy::vec_box)] // stable per-element heap addresses; Vec growth must not invalidate
-fn stage_iocb_array(iocbs: &[[u8; 64]]) -> (u64, alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>>) {
-    // Heap-allocate every iocb so the pointers are stable across the
-    // syscall arm's read window.
-    let mut heap_iocbs: alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>> =
-        iocbs.iter().map(|b| alloc::boxed::Box::new(*b)).collect();
-    // The iocbpp array stores u64 pointer values.
-    let mut pointers: alloc::vec::Vec<u64> = heap_iocbs
-        .iter_mut()
-        .map(|b| b.as_mut_ptr() as u64)
-        .collect();
-    let iocbpp_ptr = pointers.as_mut_ptr() as u64;
-    // The pointer array must outlive the syscall arm's reads. We
-    // leak it for the test's duration (small constant memory) so the
-    // address stays valid for the syscall arm and any subsequent
-    // worker polls. Tests are independent of each other (TEST_LOCK
-    // serialises them); the leak is bounded by the test count.
-    let _leak = alloc::boxed::Box::leak(pointers.into_boxed_slice());
-    (iocbpp_ptr, heap_iocbs)
+const USER_AIO_IOCBPP: usize = 0x5100_0000;
+
+fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
+
+fn map_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, len: usize) {
+    let len = align_up(len.max(1), USER_PAGE_SIZE);
+    let range = UserRange::new_aligned(UserVirtAddr(uaddr), len).expect("aligned user range");
+    let request = VmMapRequest::fixed(
+        range,
+        MapPlacement::FixedReplace,
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    ctx.aspace
+        .try_mmap(request)
+        .expect("mmap anon for aio test");
+}
+
+fn copy_to_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, bytes: &[u8]) {
+    let guard = zone::guard();
+    let copied = ctx
+        .aspace
+        .copy_to_user(UserPtr::<u8>::new(uaddr), bytes, &guard);
+    drop(guard);
+    assert_eq!(copied, zone::StepOutcome::Done(bytes.len()));
+}
+
+/// Stage a Linux `struct iocb *iocbpp[]` in the process address space.
+fn stage_iocb_array(ctx: &SyscallCtx<'_>, iocbs: &[[u8; 64]]) -> u64 {
+    let pointer_bytes_len = iocbs.len() * core::mem::size_of::<u64>();
+    let iocb_base = USER_AIO_IOCBPP + USER_PAGE_SIZE;
+    map_user_bytes(ctx, USER_AIO_IOCBPP, pointer_bytes_len);
+    map_user_bytes(ctx, iocb_base, iocbs.len() * 64);
+
+    let mut pointer_bytes = alloc::vec![0u8; pointer_bytes_len];
+    for (i, iocb) in iocbs.iter().enumerate() {
+        let iocb_addr = iocb_base + i * 64;
+        pointer_bytes[i * 8..(i + 1) * 8].copy_from_slice(&(iocb_addr as u64).to_le_bytes());
+        copy_to_user_bytes(ctx, iocb_addr, iocb);
+    }
+    copy_to_user_bytes(ctx, USER_AIO_IOCBPP, &pointer_bytes);
+    USER_AIO_IOCBPP as u64
 }
 
 // -------- Tests -----------------------------------------------------
@@ -328,7 +347,7 @@ fn io_submit_admits_one_iocb_onto_the_queue() {
     // Stage one PREAD iocb. Buffer / offset are placeholders — phase
     // 2's dispatch doesn't resolve them (stub).
     let iocb = encode_iocb(0xCAFE_BABE, IOCB_CMD_PREAD, 0, 0, 0, 0);
-    let (iocbpp, _keepalive) = stage_iocb_array(&[iocb]);
+    let iocbpp = stage_iocb_array(&ctx, &[iocb]);
 
     // Drain the worker future first so the test's pump-loop below
     // observes the dispatch from a clean state.
@@ -437,7 +456,7 @@ fn io_submit_overflow_short_circuits_with_partial_admit() {
     let iocb_a = encode_iocb(0xAAAA, IOCB_CMD_PREAD, 0, 0, 0, 0);
     let iocb_b = encode_iocb(0xBBBB, IOCB_CMD_PREAD, 0, 0, 0, 0);
     let iocb_c = encode_iocb(0xCCCC, IOCB_CMD_PREAD, 0, 0, 0, 0);
-    let (iocbpp, _keepalive) = stage_iocb_array(&[iocb_a, iocb_b, iocb_c]);
+    let iocbpp = stage_iocb_array(&ctx, &[iocb_a, iocb_b, iocb_c]);
 
     let r = dispatch_call(
         &ctx,
@@ -501,7 +520,7 @@ fn io_submit_iocb_arrived_notify_drives_worker_drain() {
     // Submit two iocbs.
     let iocb_a = encode_iocb(0x1111, IOCB_CMD_PREAD, 0, 0, 0, 0);
     let iocb_b = encode_iocb(0x2222, IOCB_CMD_PREAD, 0, 0, 0, 0);
-    let (iocbpp, _keepalive) = stage_iocb_array(&[iocb_a, iocb_b]);
+    let iocbpp = stage_iocb_array(&ctx, &[iocb_a, iocb_b]);
     let r = dispatch_call(
         &ctx,
         SyscallRequest::new(NR_IO_SUBMIT, [fd as u64, 2, iocbpp, 0, 0, 0]),

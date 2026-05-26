@@ -1778,6 +1778,13 @@ pub const NR_IO_GETEVENTS: u64 = 4;
 /// the worker task spawn + `with_on_behalf_of` integration).
 pub const NR_IO_SUBMIT: u64 = 2;
 
+/// `io_pgetevents(ctx, min, max, events, timeout, sig)`. Linux RV64
+/// generic ABI `__NR_io_pgetevents = 292`. This is the signal-mask
+/// variant of [`NR_IO_GETEVENTS`]; the v1 syscall arm validates the
+/// Linux `__aio_sigset` wrapper, then reuses `sys_io_getevents` while
+/// preserving the current deferred temporary-sigmask policy.
+pub const NR_IO_PGETEVENTS: u64 = 292;
+
 // =====================================================================
 // Future PR-12 phase 0 — io_uring SQPOLL syscall numbers (second
 // `OnBehalfOf<P>` canary)

@@ -22,17 +22,18 @@ VM/mm worktree, and the timer wake follow-up: `mincore`, `mlock2`,
 `mlockall`, `munlockall`, `memfd_create`, single-node mempolicy/migration
 calls, self `process_vm_*`, shared-PageBacked `remap_file_pages`,
 pidfd-backed self `process_madvise`, `getitimer`/`setitimer`, POSIX timer id
-syscalls, `adjtimex`, `clock_adjtime`, and POSIX timer `sigev_value` delivery
-through signalfd are now wired; ext4 xattr persistence, true time discipline,
-CPU timers, and cross-process VM policy remain explicit follow-ups).
+syscalls, `adjtimex`, `clock_adjtime`, POSIX timer `sigev_value` delivery
+through signalfd, and `io_pgetevents` are now wired; ext4 xattr persistence,
+true time discipline, CPU timers, and cross-process VM policy remain explicit
+follow-ups).
 
 ## Headline counts
 
-- `pub const NR_*` defined in `numbers.rs`: **243**
-- Dispatched in `mod.rs` (per match arms): **239**
+- `pub const NR_*` defined in `numbers.rs`: **244**
+- Dispatched in `mod.rs` (per match arms): **240**
 - Defined but not dispatched: **4** (`GETPEERNAME`, `GETSOCKOPT`,
   `SHUTDOWN`, `SOCKETPAIR`).
-- True missing from local `numbers.rs` vs Linux RV64 v6.17: **77**.
+- True missing from local `numbers.rs` vs Linux RV64 v6.17: **76**.
 - Number mismatches vs Linux RV64 v6.17: **0**.
 - Local `NR_*` extras not in the Linux RV64 v6.17 reference: **0**.
 
@@ -54,7 +55,7 @@ number of additional LTP tests that move from skipped/failed to runnable.
 | Filesystem metadata depth (ext4 xattr persistence, ACLs, file capabilities, quota) | +15 fs metadata tests | L (6–10w) | VFS xattr hooks and tmpfs `user.*` storage are wired; ext4 deliberately reports `EOPNOTSUPP` until metadata transactions/journal policy can cover inode-body and external xattr blocks |
 | Modern path/mount APIs (`open_tree`, `move_mount`, `fsopen`/`fsconfig`/`fsmount`/`fspick`, `mount_setattr`) | +12 fs namespace tests | L (6–10w) | dirfd-aware path resolver, `openat2(resolve=0)`, and normal-path `execveat` are wired; modern mount object APIs still need policy decisions |
 | Event notification depth (`inotify_*`, `fanotify_*`) | +12 event-loop tests | M (3–5w) | `epoll_pwait2` is wired and inotify/fanotify numbers dispatch to scaffold validation; real queues still need VFS fsnotify sources and fanotify-permission policy |
-| `io_uring`/AIO tail (`io_uring_register`, `io_cancel`, `io_pgetevents`, user-mmapped ring depth) | +10 async I/O tests | M (3–5w) | setup, raw AIO core, and a nonblocking `io_uring_enter` scaffold exist; real user-mmapped SQ/CQ parsing and registration remain |
+| `io_uring`/AIO tail (`io_uring_register`, `io_cancel`, user-mmapped ring depth) | +10 async I/O tests | M (3–5w) | setup, raw AIO core, `io_pgetevents`, and a nonblocking `io_uring_enter` scaffold exist; real user-mmapped SQ/CQ parsing, io_uring registration, and per-iocb cancellation remain |
 | Memory policy/advice depth (cross-process policy and global mapping state) | +1 mm tests | L (6–10w) | `mincore`, `mlock2`, `mlockall` including process-local `MCL_FUTURE`, `munlockall`, `memfd_create`, memfd `F_ADD_SEALS`/`F_GET_SEALS`, single-node policy/migration compatibility, self-process `process_vm_*`, shared-PageBacked `remap_file_pages`, and self-pidfd `process_madvise` are now host-covered; cross-process ptrace/cred/target-address-space policy and global memfd mapping accounting still need design |
 | Security/observability (`capget`, `capset`, `seccomp`, `keyctl`, `landlock_*`, `bpf`, `perf_event_open`, LSM syscalls) | +15 security/tooling tests | XL (12w+) | mostly new policy engines; keep behind explicit charter |
 | `ptrace` | +20 debugger/process-control tests | XL (12w+) | parallel exec-control model; out of scope for v1 unless explicitly chartered |
@@ -291,12 +292,12 @@ When you implement or change a syscall:
 _Counts read from `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}` and checked against Linux RV64 v6.17 from `xtask/data/syscalls/riscv/64/rv64/linux-6.17-table.json` (source: https://syscalls.mebeim.net/db/riscv/64/rv64/latest/table.json). Linux file/line references point into `external/linux-rv-6.17`._
 _Run `cargo xtask syscall-status --regen` to refresh; `--check` to lint in CI._
 
-- **`NR_*` defined:** 243
+- **`NR_*` defined:** 244
 - **Linux RV64 reference syscalls:** 320
-- **Dispatched (has a match arm):** 239
+- **Dispatched (has a match arm):** 240
 - **Defined but not dispatched:** 4 — see list below
 
-- **True missing vs Linux RV64 reference:** 77
+- **True missing vs Linux RV64 reference:** 76
 - **Number mismatches vs Linux RV64 reference:** 0
 - **Local `NR_*` not in Linux RV64 reference:** 0
 
@@ -360,7 +361,6 @@ Linux RV64 v6.17 syscalls that have no local `NR_*` constant. This is the greenf
 | 275 | `sched_getattr` | `pid_t pid, struct sched_attr *uattr, unsigned int usize, unsigned int flags` | `kernel/sched/syscalls.c`:1077 |
 | 277 | `seccomp` | `unsigned int op, unsigned int flags, void *uargs` | `kernel/seccomp.c`:2110 |
 | 280 | `bpf` | `int cmd, union bpf_attr *uattr, unsigned int size` | `kernel/bpf/syscall.c`:6137 |
-| 292 | `io_pgetevents` | `aio_context_t ctx_id, long min_nr, long nr, struct io_event *events, struct __kernel_ti…` | `fs/aio.c`:2276 |
 | 293 | `rseq` | `struct rseq *rseq, u32 rseq_len, int flags, u32 sig` | `kernel/rseq.c`:474 |
 | 294 | `kexec_file_load` | `int kernel_fd, int initrd_fd, unsigned long cmdline_len, const char *cmdline_ptr, unsig…` | `kernel/kexec_file.c`:363 |
 | 427 | `io_uring_register` | `unsigned int fd, unsigned int opcode, void *arg, unsigned int nr_args` | `io_uring/register.c`:906 |
@@ -409,12 +409,12 @@ overwritten by the next `sync`. The lint variant
 
 ### Counts (from dispatch table)
 
-- `pub const NR_*` in numbers.rs: **243**
+- `pub const NR_*` in numbers.rs: **244**
 - Linux RV64 reference syscalls: **320**
-- dispatched in mod.rs: **239** (of which async: 58, likely-stub: 4)
+- dispatched in mod.rs: **240** (of which async: 59, likely-stub: 4)
 - defined but not dispatched: **4**
 
-- true missing vs Linux RV64 reference: **77**
+- true missing vs Linux RV64 reference: **76**
 - number mismatches vs Linux RV64 reference: **0**
 - local `NR_*` not in Linux RV64 reference: **0**
 
@@ -436,7 +436,7 @@ These have a syscall number constant but no match arm in `mod.rs`. Either wire t
 - `NR_SHUTDOWN` (nr=210)
 - `NR_SOCKETPAIR` (nr=199)
 
-### True missing from local `numbers.rs` (77)
+### True missing from local `numbers.rs` (76)
 
 These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the greenfield backlog; it is distinct from defined-but-not-dispatched.
 
@@ -485,7 +485,6 @@ These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the g
 | 275 | `sched_getattr` | `pid_t pid, struct sched_attr *uattr, unsigned int usize, unsigned int flags` | `kernel/sched/syscalls.c`:1077 |
 | 277 | `seccomp` | `unsigned int op, unsigned int flags, void *uargs` | `kernel/seccomp.c`:2110 |
 | 280 | `bpf` | `int cmd, union bpf_attr *uattr, unsigned int size` | `kernel/bpf/syscall.c`:6137 |
-| 292 | `io_pgetevents` | `aio_context_t ctx_id, long min_nr, long nr, struct io_event *events, struct __kernel_time…` | `fs/aio.c`:2276 |
 | 293 | `rseq` | `struct rseq *rseq, u32 rseq_len, int flags, u32 sig` | `kernel/rseq.c`:474 |
 | 294 | `kexec_file_load` | `int kernel_fd, int initrd_fd, unsigned long cmdline_len, const char *cmdline_ptr, unsigne…` | `kernel/kexec_file.c`:363 |
 | 427 | `io_uring_register` | `unsigned int fd, unsigned int opcode, void *arg, unsigned int nr_args` | `io_uring/register.c`:906 |
@@ -520,7 +519,7 @@ These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the g
 | 468 | `file_getattr` | `int dfd, const char *filename, struct file_attr *ufattr, size_t usize, unsigned int at_fl…` | `fs/file_attr.c`:382 |
 | 469 | `file_setattr` | `int dfd, const char *filename, struct file_attr *ufattr, size_t usize, unsigned int at_fl…` | `fs/file_attr.c`:437 |
 
-### Dispatched syscalls (239) — name → handler
+### Dispatched syscalls (240) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -751,6 +750,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 286 | `NR_PREADV2` | `sys_preadv2` | async |
 | 287 | `NR_PWRITEV2` | `sys_pwritev2` | async |
 | 291 | `NR_STATX` | `sys_statx` | async |
+| 292 | `NR_IO_PGETEVENTS` | `sys_io_pgetevents` | async |
 | 424 | `NR_PIDFD_SEND_SIGNAL` | `sys_pidfd_send_signal` | sync |
 | 425 | `NR_IO_URING_SETUP` | `sys_io_uring_setup` | sync |
 | 426 | `NR_IO_URING_ENTER` | `sys_io_uring_enter` | sync |

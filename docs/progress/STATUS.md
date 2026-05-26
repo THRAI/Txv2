@@ -1,3 +1,20 @@
+- 2026-05-26 **Cleared the AIO host-test drift and wired `io_pgetevents`.**
+  The older raw AIO host tests now stage `iocbpp`, `struct iocb`, and
+  `struct io_event` buffers through the process `AddressSpace`, matching the
+  current user-copy path instead of relying on stale raw host pointers. Added
+  Linux RV64 `NR_IO_PGETEVENTS = 292` and dispatch: v1 validates the
+  `__aio_sigset` wrapper and pointed-to mask, then reuses `io_getevents` while
+  keeping temporary signal-mask swapping deferred like `ppoll`/`epoll_pwait`.
+  **Verified:** `cargo test -p tx-subsystems aio -- --nocapture`; `cargo test
+  -p tx-shims --test v3_aio_io_setup --test v3_aio_io_submit --test
+  v3_aio_io_getevents --test v3_aio_io_destroy --test v3_aio_e2e --
+  --nocapture`; `cargo test -p tx-shims --lib
+  linux_syscall::tests::aio_dispatch -- --nocapture`; `cargo check -p
+  tx-shims -p tx-subsystems`.
+  **Next step:** AIO’s remaining policy-heavy tail is `io_cancel` plus real
+  per-iocb cancellation/identity; io_uring still needs user-mmapped SQ/CQ
+  parsing and registration.
+
 - 2026-05-26 **Preserved POSIX timer `sigev_value` through signalfd.**
   Expired POSIX timers now copy their configured `sigval` into the stored
   `SigInfo`, and signalfd queues carry the available siginfo prefix instead of
