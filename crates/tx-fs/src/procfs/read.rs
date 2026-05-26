@@ -3,7 +3,7 @@
 use crate::procfs::{
     pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_stat_id, PROCFS_CPUINFO_ID,
     PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID, PROCFS_SYSVIPC_MSG_ID, PROCFS_SYSVIPC_SEM_ID,
-    PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID,
+    PROCFS_SYSVIPC_SHM_ID, PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_UPTIME_ID,
 };
 use alloc::format;
 use alloc::string::String;
@@ -28,6 +28,7 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_CPUINFO_ID => render_cpuinfo(),
         PROCFS_UPTIME_ID => render_uptime(),
         PROCFS_MEMINFO_ID => render_meminfo(),
+        PROCFS_SYS_KERNEL_TAINTED_ID => "0\n".into(),
         PROCFS_SYSVIPC_MSG_ID => render_sysvipc_msg(),
         PROCFS_SYSVIPC_SEM_ID => render_sysvipc_sem(),
         PROCFS_SYSVIPC_SHM_ID => render_sysvipc_shm(),
@@ -183,7 +184,18 @@ fn fdinfo_flags(file: &tx_subsystems::vfs::OpenFile) -> u32 {
 }
 
 pub fn render_meminfo() -> String {
-    String::from("MemTotal: 0 kB\nMemFree: 0 kB\n")
+    String::from(
+        "MemTotal:       1048576 kB\n\
+         MemFree:         524288 kB\n\
+         MemAvailable:    524288 kB\n\
+         Buffers:              0 kB\n\
+         Cached:          262144 kB\n\
+         SwapCached:           0 kB\n\
+         Active:               0 kB\n\
+         Inactive:             0 kB\n\
+         SwapTotal:            0 kB\n\
+         SwapFree:             0 kB\n",
+    )
 }
 
 fn render_sysvipc_msg() -> String {

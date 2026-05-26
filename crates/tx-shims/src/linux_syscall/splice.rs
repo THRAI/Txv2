@@ -206,15 +206,16 @@ pub(super) async fn sys_splice<'a, P: tx_hal::TimeIf>(
                 return SyscallResult::Error(EBADF_VALUE);
             }
             let nonblocking = splice_nonblocking(flags, input.nonblocking, output.nonblocking);
-            let guard = step_engine::guard();
-            let outcome = tx_subsystems::pipe::step_splice_to_pipe(
-                &input.payload,
-                &output.payload,
-                len,
-                &guard,
-                nonblocking,
-            );
-            drop(guard);
+            let outcome = {
+                let guard = step_engine::guard();
+                tx_subsystems::pipe::step_splice_to_pipe(
+                    &input.payload,
+                    &output.payload,
+                    len,
+                    &guard,
+                    nonblocking,
+                )
+            };
             splice_outcome_to_result(outcome)
         }
         (Some(input), None) => {
@@ -253,10 +254,10 @@ async fn splice_pipe_to_file<'a, P: tx_hal::TimeIf>(
     }
     let mut buf = alloc::vec::Vec::new();
     buf.resize(len, 0);
-    let guard = step_engine::guard();
-    let peek =
-        tx_subsystems::pipe::step_peek(&in_pipe.payload, &mut buf, &guard, in_pipe.nonblocking);
-    drop(guard);
+    let peek = {
+        let guard = step_engine::guard();
+        tx_subsystems::pipe::step_peek(&in_pipe.payload, &mut buf, &guard, in_pipe.nonblocking)
+    };
 
     match splice_outcome_to_result(peek) {
         SyscallResult::Return(n) if n <= 0 => SyscallResult::Return(n),
@@ -334,10 +335,10 @@ fn try_splice_pipe_lease_to_file<'a>(
     if !out_offset.is_multiple_of(page_size) || len < tx_subsystems::vm::USER_PAGE_SIZE {
         return None;
     }
-    let guard = step_engine::guard();
-    let lease_outcome =
-        tx_subsystems::pipe::step_pop_page_lease(&in_pipe.payload, &guard, in_pipe.nonblocking);
-    drop(guard);
+    let lease_outcome = {
+        let guard = step_engine::guard();
+        tx_subsystems::pipe::step_pop_page_lease(&in_pipe.payload, &guard, in_pipe.nonblocking)
+    };
     let Some((lease, in_offset, lease_len)) = (match lease_outcome {
         StepOutcome::Done(value) => value,
         StepOutcome::Err(e) => return Some(splice_outcome_to_result(StepOutcome::Err(e))),
@@ -473,30 +474,27 @@ fn try_splice_file_lease_to_pipe<'a>(
     if lease_len != tx_subsystems::vm::USER_PAGE_SIZE {
         return None;
     }
-    let guard = step_engine::guard();
-    let lease = match pc.export_page_lease(
-        tx_subsystems::page_backed::PageIndex::new(in_offset / page_size),
-        &guard,
-    ) {
-        StepOutcome::Done(lease) => lease,
-        StepOutcome::Err(e) => {
-            drop(guard);
-            return Some(splice_outcome_to_result(StepOutcome::Err(e)));
-        }
-        StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-            drop(guard);
-            return Some(SyscallResult::Error(EAGAIN_VALUE));
-        }
+    let outcome = {
+        let guard = step_engine::guard();
+        let lease = match pc.export_page_lease(
+            tx_subsystems::page_backed::PageIndex::new(in_offset / page_size),
+            &guard,
+        ) {
+            StepOutcome::Done(lease) => lease,
+            StepOutcome::Err(e) => return Some(splice_outcome_to_result(StepOutcome::Err(e))),
+            StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+                return Some(SyscallResult::Error(EAGAIN_VALUE));
+            }
+        };
+        tx_subsystems::pipe::step_push_page_lease(
+            &out_pipe.payload,
+            lease,
+            0,
+            lease_len,
+            &guard,
+            out_pipe.nonblocking,
+        )
     };
-    let outcome = tx_subsystems::pipe::step_push_page_lease(
-        &out_pipe.payload,
-        lease,
-        0,
-        lease_len,
-        &guard,
-        out_pipe.nonblocking,
-    );
-    drop(guard);
     match splice_outcome_to_result(outcome) {
         SyscallResult::Return(n) if n > 0 => {
             if off_in_ptr != 0 {
@@ -521,9 +519,10 @@ async fn read_file_to_kernel<'a, P: tx_hal::TimeIf>(
     };
     if let OpenFileBacking::Rnode { rnode } = file.backing() {
         if let RNodeBacking::PageBacked { pc } = rnode.backing() {
-            let guard = step_engine::guard();
-            let outcome = tx_subsystems::page_backed::step_read_to_kernel(pc, &file, buf, &guard);
-            drop(guard);
+            let outcome = {
+                let guard = step_engine::guard();
+                tx_subsystems::page_backed::step_read_to_kernel(pc, &file, buf, &guard)
+            };
             return splice_outcome_to_result(outcome);
         }
     }
@@ -548,10 +547,10 @@ async fn write_file_from_kernel<'a>(fd: i32, buf: &[u8], ctx: &SyscallCtx<'a>) -
     };
     if let OpenFileBacking::Rnode { rnode } = file.backing() {
         if let RNodeBacking::PageBacked { pc } = rnode.backing() {
-            let guard = step_engine::guard();
-            let outcome =
-                tx_subsystems::page_backed::step_write_from_kernel(pc, &file, buf, &guard);
-            drop(guard);
+            let outcome = {
+                let guard = step_engine::guard();
+                tx_subsystems::page_backed::step_write_from_kernel(pc, &file, buf, &guard)
+            };
             return splice_outcome_to_result(outcome);
         }
     }

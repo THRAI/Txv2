@@ -17,17 +17,20 @@ inner loop; OSComp + LTP are the correctness bar. When a syscall lands,
 record which specific OSComp/LTP test(s) closed it under "Currently
 passing" below.
 
-**Last refresh:** 2026-05-25 (VFS xattr backend hooks, tmpfs `user.*`
-storage, legacy xattr syscalls, and Linux 6.17 `*xattrat` dispatch wired;
-ext4 xattr persistence remains an explicit follow-up).
+**Last refresh:** 2026-05-26 (merged the VFS xattr/`*xattrat` table with
+the LTP VM/mm worktree: `mincore`, `mlock2`, `mlockall`, `munlockall`,
+`memfd_create`, single-node mempolicy/migration calls, self `process_vm_*`,
+shared-PageBacked `remap_file_pages`, pidfd-backed self `process_madvise`,
+and `getitimer`/`setitimer` are now wired; ext4 xattr persistence and
+cross-process VM policy remain explicit follow-ups).
 
 ## Headline counts
 
-- `pub const NR_*` defined in `numbers.rs`: **220**
-- Dispatched in `mod.rs` (per match arms): **216**
+- `pub const NR_*` defined in `numbers.rs`: **236**
+- Dispatched in `mod.rs` (per match arms): **232**
 - Defined but not dispatched: **4** (`GETPEERNAME`, `GETSOCKOPT`,
   `SHUTDOWN`, `SOCKETPAIR`).
-- True missing from local `numbers.rs` vs Linux RV64 v6.17: **100**.
+- True missing from local `numbers.rs` vs Linux RV64 v6.17: **84**.
 - Number mismatches vs Linux RV64 v6.17: **0**.
 - Local `NR_*` extras not in the Linux RV64 v6.17 reference: **0**.
 
@@ -43,14 +46,14 @@ number of additional LTP tests that move from skipped/failed to runnable.
 
 | Gap | LTP impact | Effort | Substrate status |
 |---|---|---|---|
-| Timer/time tail (`timer_create` family, `getitimer`, `setitimer`, `clock_adjtime`, `adjtimex`) | +18 timer tests | M (3–4w) | wallclock set/get policy, vDSO conversion state, `timerfd`, and `nanosleep` exist; per-process timer ids/signals plus adjustment/slew policy still needed |
+| Timer/time tail (`timer_create` family, `clock_adjtime`, `adjtimex`) | +15 timer tests | M (3–4w) | wallclock set/get policy, vDSO conversion state, `timerfd`, `nanosleep`, and the LTP-observed `ITIMER_REAL` `getitimer`/`setitimer` alarm path exist; POSIX timer ids, CPU interval timers, and adjustment/slew policy still needed |
 | Lightweight process/sysinfo tail (`waitid`, `clone3`, `pidfd_getfd`, `setns`, `unshare`, `sysinfo`) | +20 process/namespace tests | M–L (4–8w) | wait/clone/pidfd scaffolding exists; namespace view and sysinfo accounting semantics need care |
 | Network completion slice (`socketpair`, `shutdown`, `getpeername`, `getsockopt`, `sendmsg`, `recvmsg`, `sendmmsg`, `recvmmsg`) | +25 socket tests | M–L (4–8w) | socket syscall skeleton exists; four constants are defined-but-no-arm, message-vector ABI still missing |
 | Filesystem metadata depth (ext4 xattr persistence, ACLs, file capabilities, quota) | +15 fs metadata tests | L (6–10w) | VFS xattr hooks and tmpfs `user.*` storage are wired; ext4 deliberately reports `EOPNOTSUPP` until metadata transactions/journal policy can cover inode-body and external xattr blocks |
 | Modern path/mount APIs (`open_tree`, `move_mount`, `fsopen`/`fsconfig`/`fsmount`/`fspick`, `mount_setattr`) | +12 fs namespace tests | L (6–10w) | dirfd-aware path resolver, `openat2(resolve=0)`, and normal-path `execveat` are wired; modern mount object APIs still need policy decisions |
 | Event notification depth (`inotify_*`, `fanotify_*`) | +12 event-loop tests | M (3–5w) | `epoll_pwait2` is wired and inotify/fanotify numbers dispatch to scaffold validation; real queues still need VFS fsnotify sources and fanotify-permission policy |
 | `io_uring`/AIO tail (`io_uring_register`, `io_cancel`, `io_pgetevents`, user-mmapped ring depth) | +10 async I/O tests | M (3–5w) | setup, raw AIO core, and a nonblocking `io_uring_enter` scaffold exist; real user-mmapped SQ/CQ parsing and registration remain |
-| Memory policy/advice tail (`mincore`, `mlock2`, `mlockall`, `process_vm_*`, `memfd_create`, memory policy syscalls) | +15 mm tests | L (6–10w) | VM/pagebacked primitives exist; policy and cross-process access need design |
+| Memory policy/advice depth (cross-process policy and global mapping state) | +1 mm tests | L (6–10w) | `mincore`, `mlock2`, `mlockall` including process-local `MCL_FUTURE`, `munlockall`, `memfd_create`, memfd `F_ADD_SEALS`/`F_GET_SEALS`, single-node policy/migration compatibility, self-process `process_vm_*`, shared-PageBacked `remap_file_pages`, and self-pidfd `process_madvise` are now host-covered; cross-process ptrace/cred/target-address-space policy and global memfd mapping accounting still need design |
 | Security/observability (`capget`, `capset`, `seccomp`, `keyctl`, `landlock_*`, `bpf`, `perf_event_open`, LSM syscalls) | +15 security/tooling tests | XL (12w+) | mostly new policy engines; keep behind explicit charter |
 | `ptrace` | +20 debugger/process-control tests | XL (12w+) | parallel exec-control model; out of scope for v1 unless explicitly chartered |
 
@@ -191,6 +194,9 @@ After the pipe/splice tail the current generated counts are `200` defined,
 `196` dispatched, `4` defined-but-no-arm, and `120` true missing.
 After the VFS at-resolver slice the current generated counts are `204`
 defined, `200` dispatched, `4` defined-but-no-arm, and `116` true missing.
+After the merged VFS xattr plus VM/mm LTP-grade host slices the current
+generated counts are `236` defined, `232` dispatched, `4` defined-but-no-arm,
+and `84` true missing.
 
 ### File I/O & VFS extras
 
@@ -282,12 +288,12 @@ When you implement or change a syscall:
 _Counts read from `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}` and checked against Linux RV64 v6.17 from `xtask/data/syscalls/riscv/64/rv64/linux-6.17-table.json` (source: https://syscalls.mebeim.net/db/riscv/64/rv64/latest/table.json). Linux file/line references point into `external/linux-rv-6.17`._
 _Run `cargo xtask syscall-status --regen` to refresh; `--check` to lint in CI._
 
-- **`NR_*` defined:** 220
+- **`NR_*` defined:** 236
 - **Linux RV64 reference syscalls:** 320
-- **Dispatched (has a match arm):** 216
+- **Dispatched (has a match arm):** 232
 - **Defined but not dispatched:** 4 — see list below
 
-- **True missing vs Linux RV64 reference:** 100
+- **True missing vs Linux RV64 reference:** 84
 - **Number mismatches vs Linux RV64 reference:** 0
 - **Local `NR_*` not in Linux RV64 reference:** 0
 
@@ -319,8 +325,6 @@ Linux RV64 v6.17 syscalls that have no local `NR_*` constant. This is the greenf
 | 91 | `capset` | `cap_user_header_t header, const cap_user_data_t data` | `kernel/capability.c`:216 |
 | 95 | `waitid` | `int which, pid_t upid, struct siginfo *infop, int options, struct rusage *ru` | `kernel/exit.c`:1797 |
 | 97 | `unshare` | `unsigned long unshare_flags` | `kernel/fork.c`:3196 |
-| 102 | `getitimer` | `int which, struct __kernel_old_itimerval *value` | `kernel/time/itimer.c`:113 |
-| 103 | `setitimer` | `int which, struct __kernel_old_itimerval *value, struct __kernel_old_itimerval *ovalue` | `kernel/time/itimer.c`:352 |
 | 104 | `kexec_load` | `unsigned long entry, unsigned long nr_segments, struct kexec_segment *segments, unsigne…` | `kernel/kexec.c`:242 |
 | 105 | `init_module` | `void *umod, unsigned long len, const char *uargs` | `kernel/module/main.c`:3569 |
 | 106 | `delete_module` | `const char *name_user, unsigned int flags` | `kernel/module/main.c`:776 |
@@ -346,15 +350,6 @@ Linux RV64 v6.17 syscalls that have no local `NR_*` constant. This is the greenf
 | 219 | `keyctl` | `int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long a…` | `security/keys/keyctl.c`:1874 |
 | 224 | `swapon` | `const char *specialfile, int swap_flags` | `mm/swapfile.c`:3259 |
 | 225 | `swapoff` | `const char *specialfile` | `mm/swapfile.c`:2674 |
-| 230 | `mlockall` | `int flags` | `mm/mlock.c`:745 |
-| 231 | `munlockall` | `` | `mm/mlock.c`:774 |
-| 232 | `mincore` | `unsigned long start, size_t len, unsigned char *vec` | `mm/mincore.c`:247 |
-| 234 | `remap_file_pages` | `unsigned long start, unsigned long size, unsigned long prot, unsigned long pgoff, unsig…` | `mm/mmap.c`:1087 |
-| 235 | `mbind` | `unsigned long start, unsigned long len, unsigned long mode, const unsigned long *nmask,…` | `mm/mempolicy.c`:1752 |
-| 236 | `get_mempolicy` | `int *policy, unsigned long *nmask, unsigned long maxnode, unsigned long addr, unsigned …` | `mm/mempolicy.c`:1909 |
-| 237 | `set_mempolicy` | `int mode, const unsigned long *nmask, unsigned long maxnode` | `mm/mempolicy.c`:1779 |
-| 238 | `migrate_pages` | `pid_t pid, unsigned long maxnode, const unsigned long *old_nodes, const unsigned long *…` | `mm/mempolicy.c`:1872 |
-| 239 | `move_pages` | `pid_t pid, unsigned long nr_pages, const void **pages, const int *nodes, int *status, i…` | `mm/migrate.c`:2590 |
 | 240 | `rt_tgsigqueueinfo` | `pid_t tgid, pid_t pid, int sig, siginfo_t *uinfo` | `kernel/signal.c`:4251 |
 | 241 | `perf_event_open` | `struct perf_event_attr *attr_uptr, pid_t pid, int cpu, int group_fd, unsigned long flags` | `kernel/events/core.c`:13360 |
 | 243 | `recvmmsg` | `int fd, struct mmsghdr *mmsg, unsigned int vlen, unsigned int flags, struct __kernel_ti…` | `net/socket.c`:3061 |
@@ -363,16 +358,12 @@ Linux RV64 v6.17 syscalls that have no local `NR_*` constant. This is the greenf
 | 266 | `clock_adjtime` | `const clockid_t which_clock, struct __kernel_timex *utx` | `kernel/time/posix-timers.c`:1165 |
 | 268 | `setns` | `int fd, int flags` | `kernel/nsproxy.c`:536 |
 | 269 | `sendmmsg` | `int fd, struct mmsghdr *mmsg, unsigned int vlen, unsigned int flags` | `net/socket.c`:2781 |
-| 270 | `process_vm_readv` | `pid_t pid, const struct iovec *lvec, unsigned long liovcnt, const struct iovec *rvec, u…` | `mm/process_vm_access.c`:292 |
-| 271 | `process_vm_writev` | `pid_t pid, const struct iovec *lvec, unsigned long liovcnt, const struct iovec *rvec, u…` | `mm/process_vm_access.c`:299 |
 | 272 | `kcmp` | `pid_t pid1, pid_t pid2, int type, unsigned long idx1, unsigned long idx2` | `kernel/kcmp.c`:135 |
 | 273 | `finit_module` | `int fd, const char *uargs, int flags` | `kernel/module/main.c`:3723 |
 | 274 | `sched_setattr` | `pid_t pid, struct sched_attr *uattr, unsigned int flags` | `kernel/sched/syscalls.c`:977 |
 | 275 | `sched_getattr` | `pid_t pid, struct sched_attr *uattr, unsigned int usize, unsigned int flags` | `kernel/sched/syscalls.c`:1077 |
 | 277 | `seccomp` | `unsigned int op, unsigned int flags, void *uargs` | `kernel/seccomp.c`:2110 |
-| 279 | `memfd_create` | `const char *uname, unsigned int flags` | `mm/memfd.c`:469 |
 | 280 | `bpf` | `int cmd, union bpf_attr *uattr, unsigned int size` | `kernel/bpf/syscall.c`:6137 |
-| 284 | `mlock2` | `unsigned long start, size_t len, int flags` | `mm/mlock.c`:664 |
 | 292 | `io_pgetevents` | `aio_context_t ctx_id, long min_nr, long nr, struct io_event *events, struct __kernel_ti…` | `fs/aio.c`:2276 |
 | 293 | `rseq` | `struct rseq *rseq, u32 rseq_len, int flags, u32 sig` | `kernel/rseq.c`:474 |
 | 294 | `kexec_file_load` | `int kernel_fd, int initrd_fd, unsigned long cmdline_len, const char *cmdline_ptr, unsig…` | `kernel/kexec_file.c`:363 |
@@ -385,7 +376,6 @@ Linux RV64 v6.17 syscalls that have no local `NR_*` constant. This is the greenf
 | 433 | `fspick` | `int dfd, const char *path, unsigned int flags` | `fs/fsopen.c`:157 |
 | 435 | `clone3` | `struct clone_args *uargs, size_t size` | `kernel/fork.c`:2888 |
 | 438 | `pidfd_getfd` | `int pidfd, int fd, unsigned int flags` | `kernel/pid.c`:903 |
-| 440 | `process_madvise` | `int pidfd, const struct iovec *vec, size_t vlen, int behavior, unsigned int flags` | `mm/madvise.c`:2057 |
 | 442 | `mount_setattr` | `int dfd, const char *path, unsigned int flags, struct mount_attr *uattr, size_t usize` | `fs/namespace.c`:5130 |
 | 443 | `quotactl_fd` | `unsigned int fd, unsigned int cmd, qid_t id, void *addr` | `fs/quota/quota.c`:973 |
 | 444 | `landlock_create_ruleset` | `const struct landlock_ruleset_attr *const attr, const size_t size, const __u32 flags` | `security/landlock/syscalls.c`:195 |
@@ -423,12 +413,12 @@ overwritten by the next `sync`. The lint variant
 
 ### Counts (from dispatch table)
 
-- `pub const NR_*` in numbers.rs: **220**
+- `pub const NR_*` in numbers.rs: **236**
 - Linux RV64 reference syscalls: **320**
-- dispatched in mod.rs: **216** (of which async: 54, likely-stub: 4)
+- dispatched in mod.rs: **232** (of which async: 58, likely-stub: 4)
 - defined but not dispatched: **4**
 
-- true missing vs Linux RV64 reference: **100**
+- true missing vs Linux RV64 reference: **84**
 - number mismatches vs Linux RV64 reference: **0**
 - local `NR_*` not in Linux RV64 reference: **0**
 
@@ -450,7 +440,7 @@ These have a syscall number constant but no match arm in `mod.rs`. Either wire t
 - `NR_SHUTDOWN` (nr=210)
 - `NR_SOCKETPAIR` (nr=199)
 
-### True missing from local `numbers.rs` (100)
+### True missing from local `numbers.rs` (84)
 
 These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the greenfield backlog; it is distinct from defined-but-not-dispatched.
 
@@ -467,8 +457,6 @@ These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the g
 | 91 | `capset` | `cap_user_header_t header, const cap_user_data_t data` | `kernel/capability.c`:216 |
 | 95 | `waitid` | `int which, pid_t upid, struct siginfo *infop, int options, struct rusage *ru` | `kernel/exit.c`:1797 |
 | 97 | `unshare` | `unsigned long unshare_flags` | `kernel/fork.c`:3196 |
-| 102 | `getitimer` | `int which, struct __kernel_old_itimerval *value` | `kernel/time/itimer.c`:113 |
-| 103 | `setitimer` | `int which, struct __kernel_old_itimerval *value, struct __kernel_old_itimerval *ovalue` | `kernel/time/itimer.c`:352 |
 | 104 | `kexec_load` | `unsigned long entry, unsigned long nr_segments, struct kexec_segment *segments, unsigned …` | `kernel/kexec.c`:242 |
 | 105 | `init_module` | `void *umod, unsigned long len, const char *uargs` | `kernel/module/main.c`:3569 |
 | 106 | `delete_module` | `const char *name_user, unsigned int flags` | `kernel/module/main.c`:776 |
@@ -494,15 +482,6 @@ These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the g
 | 219 | `keyctl` | `int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5` | `security/keys/keyctl.c`:1874 |
 | 224 | `swapon` | `const char *specialfile, int swap_flags` | `mm/swapfile.c`:3259 |
 | 225 | `swapoff` | `const char *specialfile` | `mm/swapfile.c`:2674 |
-| 230 | `mlockall` | `int flags` | `mm/mlock.c`:745 |
-| 231 | `munlockall` | `` | `mm/mlock.c`:774 |
-| 232 | `mincore` | `unsigned long start, size_t len, unsigned char *vec` | `mm/mincore.c`:247 |
-| 234 | `remap_file_pages` | `unsigned long start, unsigned long size, unsigned long prot, unsigned long pgoff, unsigne…` | `mm/mmap.c`:1087 |
-| 235 | `mbind` | `unsigned long start, unsigned long len, unsigned long mode, const unsigned long *nmask, u…` | `mm/mempolicy.c`:1752 |
-| 236 | `get_mempolicy` | `int *policy, unsigned long *nmask, unsigned long maxnode, unsigned long addr, unsigned lo…` | `mm/mempolicy.c`:1909 |
-| 237 | `set_mempolicy` | `int mode, const unsigned long *nmask, unsigned long maxnode` | `mm/mempolicy.c`:1779 |
-| 238 | `migrate_pages` | `pid_t pid, unsigned long maxnode, const unsigned long *old_nodes, const unsigned long *ne…` | `mm/mempolicy.c`:1872 |
-| 239 | `move_pages` | `pid_t pid, unsigned long nr_pages, const void **pages, const int *nodes, int *status, int…` | `mm/migrate.c`:2590 |
 | 240 | `rt_tgsigqueueinfo` | `pid_t tgid, pid_t pid, int sig, siginfo_t *uinfo` | `kernel/signal.c`:4251 |
 | 241 | `perf_event_open` | `struct perf_event_attr *attr_uptr, pid_t pid, int cpu, int group_fd, unsigned long flags` | `kernel/events/core.c`:13360 |
 | 243 | `recvmmsg` | `int fd, struct mmsghdr *mmsg, unsigned int vlen, unsigned int flags, struct __kernel_time…` | `net/socket.c`:3061 |
@@ -511,16 +490,12 @@ These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the g
 | 266 | `clock_adjtime` | `const clockid_t which_clock, struct __kernel_timex *utx` | `kernel/time/posix-timers.c`:1165 |
 | 268 | `setns` | `int fd, int flags` | `kernel/nsproxy.c`:536 |
 | 269 | `sendmmsg` | `int fd, struct mmsghdr *mmsg, unsigned int vlen, unsigned int flags` | `net/socket.c`:2781 |
-| 270 | `process_vm_readv` | `pid_t pid, const struct iovec *lvec, unsigned long liovcnt, const struct iovec *rvec, uns…` | `mm/process_vm_access.c`:292 |
-| 271 | `process_vm_writev` | `pid_t pid, const struct iovec *lvec, unsigned long liovcnt, const struct iovec *rvec, uns…` | `mm/process_vm_access.c`:299 |
 | 272 | `kcmp` | `pid_t pid1, pid_t pid2, int type, unsigned long idx1, unsigned long idx2` | `kernel/kcmp.c`:135 |
 | 273 | `finit_module` | `int fd, const char *uargs, int flags` | `kernel/module/main.c`:3723 |
 | 274 | `sched_setattr` | `pid_t pid, struct sched_attr *uattr, unsigned int flags` | `kernel/sched/syscalls.c`:977 |
 | 275 | `sched_getattr` | `pid_t pid, struct sched_attr *uattr, unsigned int usize, unsigned int flags` | `kernel/sched/syscalls.c`:1077 |
 | 277 | `seccomp` | `unsigned int op, unsigned int flags, void *uargs` | `kernel/seccomp.c`:2110 |
-| 279 | `memfd_create` | `const char *uname, unsigned int flags` | `mm/memfd.c`:469 |
 | 280 | `bpf` | `int cmd, union bpf_attr *uattr, unsigned int size` | `kernel/bpf/syscall.c`:6137 |
-| 284 | `mlock2` | `unsigned long start, size_t len, int flags` | `mm/mlock.c`:664 |
 | 292 | `io_pgetevents` | `aio_context_t ctx_id, long min_nr, long nr, struct io_event *events, struct __kernel_time…` | `fs/aio.c`:2276 |
 | 293 | `rseq` | `struct rseq *rseq, u32 rseq_len, int flags, u32 sig` | `kernel/rseq.c`:474 |
 | 294 | `kexec_file_load` | `int kernel_fd, int initrd_fd, unsigned long cmdline_len, const char *cmdline_ptr, unsigne…` | `kernel/kexec_file.c`:363 |
@@ -533,7 +508,6 @@ These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the g
 | 433 | `fspick` | `int dfd, const char *path, unsigned int flags` | `fs/fsopen.c`:157 |
 | 435 | `clone3` | `struct clone_args *uargs, size_t size` | `kernel/fork.c`:2888 |
 | 438 | `pidfd_getfd` | `int pidfd, int fd, unsigned int flags` | `kernel/pid.c`:903 |
-| 440 | `process_madvise` | `int pidfd, const struct iovec *vec, size_t vlen, int behavior, unsigned int flags` | `mm/madvise.c`:2057 |
 | 442 | `mount_setattr` | `int dfd, const char *path, unsigned int flags, struct mount_attr *uattr, size_t usize` | `fs/namespace.c`:5130 |
 | 443 | `quotactl_fd` | `unsigned int fd, unsigned int cmd, qid_t id, void *addr` | `fs/quota/quota.c`:973 |
 | 444 | `landlock_create_ruleset` | `const struct landlock_ruleset_attr *const attr, const size_t size, const __u32 flags` | `security/landlock/syscalls.c`:195 |
@@ -557,7 +531,7 @@ These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the g
 | 468 | `file_getattr` | `int dfd, const char *filename, struct file_attr *ufattr, size_t usize, unsigned int at_fl…` | `fs/file_attr.c`:382 |
 | 469 | `file_setattr` | `int dfd, const char *filename, struct file_attr *ufattr, size_t usize, unsigned int at_fl…` | `fs/file_attr.c`:437 |
 
-### Dispatched syscalls (216) — name → handler
+### Dispatched syscalls (232) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -651,6 +625,8 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 99 | `NR_SET_ROBUST_LIST` | `sys_set_robust_list` | sync |
 | 100 | `NR_GET_ROBUST_LIST` | `sys_get_robust_list` | sync |
 | 101 | `NR_NANOSLEEP` | `sys_nanosleep` | async |
+| 102 | `NR_GETITIMER` | `sys_getitimer` | sync |
+| 103 | `NR_SETITIMER` | `sys_setitimer` | sync |
 | 112 | `NR_CLOCK_SETTIME` | `sys_clock_settime` | sync |
 | 113 | `NR_CLOCK_GETTIME` | `sys_clock_gettime` | sync |
 | 114 | `NR_CLOCK_GETRES` | `sys_clock_getres` | sync |
@@ -748,7 +724,16 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 227 | `NR_MSYNC` | `sys_msync` | async |
 | 228 | `NR_MLOCK` | `sys_mlock` | async |
 | 229 | `NR_MUNLOCK` | `sys_munlock` | async |
+| 230 | `NR_MLOCKALL` | `sys_mlockall` | async |
+| 231 | `NR_MUNLOCKALL` | `sys_munlockall` | async |
+| 232 | `NR_MINCORE` | `sys_mincore` | sync |
 | 233 | `NR_MADVISE` | `sys_madvise` | sync |
+| 234 | `NR_REMAP_FILE_PAGES` | `sys_remap_file_pages` | async |
+| 235 | `NR_MBIND` | `sys_mbind` | sync |
+| 236 | `NR_GET_MEMPOLICY` | `sys_get_mempolicy` | sync |
+| 237 | `NR_SET_MEMPOLICY` | `sys_set_mempolicy` | sync |
+| 238 | `NR_MIGRATE_PAGES` | `sys_migrate_pages` | sync |
+| 239 | `NR_MOVE_PAGES` | `sys_move_pages` | sync |
 | 242 | `NR_ACCEPT4` | `sys_accept4` | sync |
 | 260 | `NR_WAIT4` | `sys_wait4` | async |
 | 261 | `NR_PRLIMIT64` | `sys_prlimit64` | sync |
@@ -757,11 +742,15 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 264 | `NR_NAME_TO_HANDLE_AT` | `sys_name_to_handle_at` | sync |
 | 265 | `NR_OPEN_BY_HANDLE_AT` | `sys_open_by_handle_at` | sync |
 | 267 | `NR_SYNCFS` | `sys_syncfs` | sync |
+| 270 | `NR_PROCESS_VM_READV` | `sys_process_vm_readv` | sync |
+| 271 | `NR_PROCESS_VM_WRITEV` | `sys_process_vm_writev` | sync |
 | 276 | `NR_RENAMEAT2` | `sys_renameat2` | async |
 | 278 | `NR_GETRANDOM` | `sys_getrandom` | sync |
+| 279 | `NR_MEMFD_CREATE` | `sys_memfd_create` | sync |
 | 281 | `NR_EXECVEAT` | `sys_execveat` | async |
 | 282 | `NR_USERFAULTFD` | `sys_userfaultfd` | sync |
 | 283 | `NR_MEMBARRIER` | `sys_membarrier` | sync |
+| 284 | `NR_MLOCK2` | `sys_mlock2` | async |
 | 285 | `NR_COPY_FILE_RANGE` | `sys_copy_file_range` | async |
 | 286 | `NR_PREADV2` | `sys_preadv2` | async |
 | 287 | `NR_PWRITEV2` | `sys_pwritev2` | async |
@@ -773,6 +762,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 436 | `NR_CLOSE_RANGE` | `sys_close_range` | sync |
 | 437 | `NR_OPENAT2` | `sys_openat2` | async |
 | 439 | `NR_FACCESSAT2` | `sys_faccessat2` | sync |
+| 440 | `NR_PROCESS_MADVISE` | `sys_process_madvise` | sync |
 | 441 | `NR_EPOLL_PWAIT2` | `sys_epoll_pwait2` | async |
 | 452 | `NR_FCHMODAT2` | `sys_fchmodat` | sync |
 | 463 | `NR_SETXATTRAT` | `sys_setxattrat` | sync |

@@ -27,20 +27,26 @@ fn uts_field(buf: &[u8; 6 * 65], index: usize) -> &[u8] {
 // F_DUPFD / F_DUPFD_CLOEXEC / F_GETFL / F_SETFL.
 // -----------------------------------------------------------------
 
-/// `pidfd_open` is numbered and dispatch-routed, but the pidfd
-/// bus-adapter fd entity is still future work.
+/// `pidfd_open` installs a non-VFS fd that carries the target process cap.
 #[test]
-fn dispatch_pidfd_open_returns_neg_enosys_until_pidfd_entity_lands() {
+fn dispatch_pidfd_open_returns_process_backed_fd() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap, thread);
+    let pid = proc_cap.pid.0;
+    let ctx = make_ctx(proc_cap.clone(), thread);
 
     let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_PIDFD_OPEN, [1, 0, 0, 0, 0, 0]),
+        SyscallRequest::new(NR_PIDFD_OPEN, [pid as u64, 0, 0, 0, 0, 0]),
         &ctx,
     ));
-    assert_eq!(r, SyscallResult::Error(E_NOSYS));
+    let fd = match r {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("expected pidfd fd, got {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("pidfd installed");
+    let target = file.pidfd_process().expect("pidfd backing");
+    assert_eq!(target.pid.0, pid);
 }
 
 /// `pidfd_send_signal` is likewise intentionally routed to the

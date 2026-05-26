@@ -538,6 +538,49 @@ fn dispatch_openat_o_cloexec_sets_fd_cloexec_bit() {
     drop(path);
 }
 
+/// `openat(.., O_PATH)` installs a path-only fd: it exists in the fd
+/// table, but does not carry read or write access. Socket operations
+/// such as `accept(2)` preserve Linux's `EBADF` behavior for this
+/// shape rather than treating it as an ordinary non-socket file.
+#[test]
+fn dispatch_openat_o_path_installs_path_only_fd() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let path = nul_terminate(b"/f");
+    let req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_PATH as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("openat O_PATH: {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("O_PATH fd installed");
+    let flags = file.flags();
+    assert!(!flags.read, "O_PATH fd must not carry read access");
+    assert!(!flags.write, "O_PATH fd must not carry write access");
+    drop(path);
+}
+
 /// `openat(AT_FDCWD, "/missing", O_RDONLY)` returns `-ENOENT` —
 /// no `O_CREAT`, file doesn't exist.
 #[test]

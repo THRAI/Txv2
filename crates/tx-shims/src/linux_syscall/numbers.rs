@@ -263,6 +263,11 @@ pub const O_APPEND: u32 = 0o2000;
 /// resulting fd. Wave 2 accepts but ignores this bit — there is no
 /// blocking-flag plumbing on `OpenFile` yet (`TODO(phase-nonblock)`).
 pub const O_NONBLOCK: u32 = 0o4000;
+/// `openat(2)` flag bit: path-only descriptor. Linux permits a narrow
+/// set of metadata operations on these fds but rejects operations that
+/// require an open file description; syscall consumers such as
+/// `accept(2)` observe `EBADF`, not `ENOTSOCK`.
+pub const O_PATH: u32 = 0o10000000;
 
 // ---------------------------------------------------------------------
 // Wave 2 of the fd-ops slice — fd-management syscall numbers.
@@ -692,9 +697,88 @@ pub const NR_MLOCK: u64 = 228;
 /// `munlock(addr, len)`. Linux RV64 generic ABI `__NR_munlock = 229`.
 /// Clears `VmEntryFlags.locked`.
 pub const NR_MUNLOCK: u64 = 229;
+/// `mlockall(flags)`. Linux RV64 generic ABI `__NR_mlockall = 230`.
+pub const NR_MLOCKALL: u64 = 230;
+/// `munlockall()`. Linux RV64 generic ABI `__NR_munlockall = 231`.
+pub const NR_MUNLOCKALL: u64 = 231;
+/// `mincore(addr, length, vec)`. Linux RV64 generic ABI
+/// `__NR_mincore = 232`. Wraps `AddressSpace::mincore` and copies one
+/// residency byte per covered page to `vec`.
+pub const NR_MINCORE: u64 = 232;
 /// `madvise(addr, length, advice)`. Linux RV64 generic ABI
 /// `__NR_madvise = 233`. Wraps `AddressSpace::madvise`.
 pub const NR_MADVISE: u64 = 233;
+/// `remap_file_pages(start, size, prot, pgoff, flags)`. Linux RV64 generic ABI.
+pub const NR_REMAP_FILE_PAGES: u64 = 234;
+/// `mbind(start, len, mode, nodemask, maxnode, flags)`. Linux RV64 generic ABI.
+pub const NR_MBIND: u64 = 235;
+/// `get_mempolicy(policy, nodemask, maxnode, addr, flags)`. Linux RV64 generic ABI.
+pub const NR_GET_MEMPOLICY: u64 = 236;
+/// `set_mempolicy(mode, nodemask, maxnode)`. Linux RV64 generic ABI.
+pub const NR_SET_MEMPOLICY: u64 = 237;
+/// `migrate_pages(pid, maxnode, old_nodes, new_nodes)`. Linux RV64 generic ABI.
+pub const NR_MIGRATE_PAGES: u64 = 238;
+/// `move_pages(pid, nr_pages, pages, nodes, status, flags)`. Linux RV64 generic ABI.
+pub const NR_MOVE_PAGES: u64 = 239;
+/// `process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)`.
+/// Linux RV64 generic ABI.
+pub const NR_PROCESS_VM_READV: u64 = 270;
+/// `process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)`.
+/// Linux RV64 generic ABI.
+pub const NR_PROCESS_VM_WRITEV: u64 = 271;
+/// `mlock2(addr, len, flags)`. Linux RV64 generic ABI `__NR_mlock2 = 284`.
+pub const NR_MLOCK2: u64 = 284;
+/// `memfd_create(name, flags)`. Linux RV64 generic ABI
+/// `__NR_memfd_create = 279`.
+pub const NR_MEMFD_CREATE: u64 = 279;
+/// `MLOCK_ONFAULT` flag for `mlock2`. Under no-swap this is accepted as an
+/// observational lock flag, same as eager `mlock`.
+pub const MLOCK_ONFAULT: u64 = 0x1;
+/// `MCL_CURRENT` flag for `mlockall`: lock all current mappings.
+pub const MCL_CURRENT: u64 = 0x1;
+/// `MCL_FUTURE` flag for `mlockall`: lock future mappings. Tx v1 accepts
+/// the bit but does not yet persist a future-lock process policy.
+pub const MCL_FUTURE: u64 = 0x2;
+/// `MCL_ONFAULT` flag for `mlockall`: lock pages on fault. Under no-swap
+/// this collapses to the same observational VMA flag as eager locking.
+pub const MCL_ONFAULT: u64 = 0x4;
+/// `MFD_CLOEXEC` for `memfd_create`.
+pub const MFD_CLOEXEC: u64 = 0x1;
+/// `MFD_ALLOW_SEALING` for `memfd_create`. Without this bit, Linux
+/// starts the memfd with `F_SEAL_SEAL` already installed.
+pub const MFD_ALLOW_SEALING: u64 = 0x2;
+/// `MFD_HUGETLB` for `memfd_create`. Tx recognises the bit but does
+/// not implement hugetlb-backed memfds.
+pub const MFD_HUGETLB: u64 = 0x4;
+/// `MFD_NOEXEC_SEAL` for `memfd_create`. Tx records no execute policy
+/// for anonymous PageBacked fds yet, so this is accepted as a no-op.
+pub const MFD_NOEXEC_SEAL: u64 = 0x8;
+/// `MFD_EXEC` for `memfd_create`. Accepted as a no-op in v1.
+pub const MFD_EXEC: u64 = 0x10;
+
+/// Linux memory policy modes from `include/uapi/linux/mempolicy.h`.
+pub const MPOL_DEFAULT: u64 = 0;
+pub const MPOL_PREFERRED: u64 = 1;
+pub const MPOL_BIND: u64 = 2;
+pub const MPOL_INTERLEAVE: u64 = 3;
+pub const MPOL_LOCAL: u64 = 4;
+pub const MPOL_PREFERRED_MANY: u64 = 5;
+/// `get_mempolicy`: return the policy for the supplied address.
+pub const MPOL_F_ADDR: u64 = 1 << 0;
+/// `get_mempolicy`: return the node where the supplied address resides.
+pub const MPOL_F_NODE: u64 = 1 << 1;
+/// `get_mempolicy`: return the task's allowed memory nodes.
+pub const MPOL_F_MEMS_ALLOWED: u64 = 1 << 2;
+/// Policy input flag: interpret nodemask against static node ids.
+pub const MPOL_F_STATIC_NODES: u64 = 1 << 15;
+/// Policy input flag: interpret nodemask relative to allowed nodes.
+pub const MPOL_F_RELATIVE_NODES: u64 = 1 << 14;
+/// `mbind` flag: apply to all pages in range.
+pub const MPOL_MF_STRICT: u64 = 1 << 0;
+/// `mbind` flag: move matching pages.
+pub const MPOL_MF_MOVE: u64 = 1 << 1;
+/// `mbind` flag: move pages owned by other tasks too.
+pub const MPOL_MF_MOVE_ALL: u64 = 1 << 2;
 
 // ---------------------------------------------------------------------
 // `PROT_*` flag bits — Linux generic uapi `<sys/mman.h>`. Slice 2 acts
@@ -858,7 +942,7 @@ pub const FUTEX_CMD_MASK: u32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 // ---------------------------------------------------------------------
 // Slice 4 of the shell-prompt roadmap — time syscalls
 // (`clock_gettime` / `gettimeofday` / `nanosleep` / `clock_nanosleep` /
-// `times`).
+// `getitimer` / `setitimer` / `times`).
 //
 // Numbers verified against Linux's RV64 generic ABI
 // (`include/uapi/asm-generic/unistd.h`). All arms read the platform
@@ -883,6 +967,11 @@ pub const FUTEX_CMD_MASK: u32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 /// uses `nanosleep` so the deferral does not block Slice 11's QEMU
 /// shell smoke.
 pub const NR_NANOSLEEP: u64 = 101;
+/// `getitimer(which, value)`. Linux RV64 generic ABI `__NR_getitimer = 102`.
+pub const NR_GETITIMER: u64 = 102;
+/// `setitimer(which, value, ovalue)`. Linux RV64 generic ABI
+/// `__NR_setitimer = 103`.
+pub const NR_SETITIMER: u64 = 103;
 /// `clock_settime(clk_id, ts)`. Linux RV64 generic ABI
 /// `__NR_clock_settime = 112`.
 pub const NR_CLOCK_SETTIME: u64 = 112;
@@ -910,6 +999,15 @@ pub const NR_GETTIMEOFDAY: u64 = 169;
 /// `__NR_settimeofday = 170`. The `tz` argument is deprecated on Linux
 /// and the arm ignores it.
 pub const NR_SETTIMEOFDAY: u64 = 170;
+
+/// `ITIMER_REAL`: wall-clock interval timer that delivers `SIGALRM`.
+pub const ITIMER_REAL: u32 = 0;
+/// `ITIMER_VIRTUAL`: process-user-CPU timer. Deferred until CPU-time
+/// accounting exists.
+pub const ITIMER_VIRTUAL: u32 = 1;
+/// `ITIMER_PROF`: process user+kernel CPU timer. Deferred until
+/// CPU-time accounting exists.
+pub const ITIMER_PROF: u32 = 2;
 
 /// `clock_gettime` clock id: `CLOCK_REALTIME = 0`. Day-1 surface
 /// aliases this to the platform monotonic clock — no boot-time RTC
@@ -1212,6 +1310,8 @@ pub const NR_PIDFD_OPEN: u64 = 434;
 /// `pidfd_send_signal(pidfd, sig, info, flags)` — Linux RV64.
 /// Phase J: returns `-ENOSYS`; TODO full implementation.
 pub const NR_PIDFD_SEND_SIGNAL: u64 = 424;
+/// `process_madvise(pidfd, vec, vlen, behavior, flags)`. Linux RV64.
+pub const NR_PROCESS_MADVISE: u64 = 440;
 /// `uname(buf)`. Linux RV64 generic ABI `__NR_uname = 160`. Writes
 /// the static utsname (`sysname` / `nodename` / `release` / `version`
 /// / `machine` / `domainname`, each `[u8; 65]`) to `buf`. Slice 7
@@ -1293,6 +1393,21 @@ pub const F_DUPFD_CLOEXEC: i32 = 1030;
 pub const F_SETPIPE_SZ: i32 = 1031;
 /// `F_GETPIPE_SZ` cmd: read a pipe's current byte capacity.
 pub const F_GETPIPE_SZ: i32 = 1032;
+/// `F_ADD_SEALS` cmd: add memfd seals to a sealable anonymous file.
+pub const F_ADD_SEALS: i32 = 1033;
+/// `F_GET_SEALS` cmd: return the current memfd seal mask.
+pub const F_GET_SEALS: i32 = 1034;
+
+/// Prevent adding any further seals.
+pub const F_SEAL_SEAL: u32 = 0x0001;
+/// Prevent shrinking the file.
+pub const F_SEAL_SHRINK: u32 = 0x0002;
+/// Prevent growing the file.
+pub const F_SEAL_GROW: u32 = 0x0004;
+/// Prevent writes.
+pub const F_SEAL_WRITE: u32 = 0x0008;
+/// Prevent future writes and future writable shared mappings.
+pub const F_SEAL_FUTURE_WRITE: u32 = 0x0010;
 
 // ---------------------------------------------------------------------
 // `RLIMIT_*` resource ids — Linux generic uapi `<sys/resource.h>`.

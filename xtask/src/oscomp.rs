@@ -265,6 +265,7 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
         .map(|path| resolve_path(root, path))
         .unwrap_or_else(|| root.join("target").join("oscomp").join("submit"));
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
+    let cmdline = oscomp_kernel_cmdline(args);
     let (kernel, sdcard, out, qemu_args) = match target {
         TxTarget::Rv64Qemu => (
             submit.join("kernel-rv"),
@@ -284,7 +285,7 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
                 "-smp".into(),
                 "1".into(),
                 "-bios".into(),
-                "default".into(),
+                rv64_oscomp_bios(root),
                 "-drive".into(),
                 format!(
                     "file={},if=none,format=raw,id=x0,file.locking=off",
@@ -299,6 +300,8 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
                 "user,id=net".into(),
                 "-rtc".into(),
                 "base=utc".into(),
+                "-append".into(),
+                cmdline,
             ],
         ),
         TxTarget::La64Qemu => (
@@ -365,6 +368,24 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
         Ok(())
     } else {
         Err(format!("OSComp qemu exited with {status}"))
+    }
+}
+
+fn oscomp_kernel_cmdline(args: &[String]) -> String {
+    let mut parts = Vec::new();
+    if let Some(suite) = optional_option_value(args, "--suite") {
+        parts.push(format!("tx.oscomp.groups={suite}"));
+    }
+    parts.push("console=ttyS0".to_string());
+    parts.join(" ")
+}
+
+fn rv64_oscomp_bios(root: &Path) -> String {
+    let silent = root.join("external/opensbi-silent/fw_dynamic.bin");
+    if silent.exists() {
+        silent.display().to_string()
+    } else {
+        "default".to_string()
     }
 }
 
@@ -668,4 +689,38 @@ fn copy_kernel_for_oscomp(root: &Path, target: TxTarget, dest: &Path) -> Result<
     fs::copy(&source, dest).map_err(|err| err.to_string())?;
     println!("copied {} -> {}", source.display(), dest.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oscomp_kernel_cmdline_selects_suite_group() {
+        let args = vec![
+            "--target".to_string(),
+            "rv64-qemu".to_string(),
+            "--suite".to_string(),
+            "ltp-musl".to_string(),
+        ];
+
+        assert_eq!(
+            oscomp_kernel_cmdline(&args),
+            "tx.oscomp.groups=ltp-musl console=ttyS0"
+        );
+    }
+
+    #[test]
+    fn oscomp_kernel_cmdline_defaults_to_console_only() {
+        let args = vec!["--target".to_string(), "rv64-qemu".to_string()];
+
+        assert_eq!(oscomp_kernel_cmdline(&args), "console=ttyS0");
+    }
+
+    #[test]
+    fn rv64_oscomp_bios_prefers_silent_opensbi_when_present() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+
+        assert!(rv64_oscomp_bios(root).ends_with("external/opensbi-silent/fw_dynamic.bin"));
+    }
 }

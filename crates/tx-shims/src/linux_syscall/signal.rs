@@ -405,8 +405,32 @@ pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
     }
 }
 
-pub(super) fn sys_pidfd_open(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+pub(super) fn sys_pidfd_open(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
+    let pid = args[0] as u32;
+    let flags = args[1];
+    if pid == 0 || flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let Some(process) = process_by_pid(Pid(pid)) else {
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+    let open_flags = OpenFileFlags {
+        read: true,
+        write: false,
+        append: false,
+        cloexec: false,
+        nonblocking: false,
+    };
+    let open_cap = match OpenFile::new_pidfd_cap(process, open_flags) {
+        Ok(file) => file,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let fd = match next_stdio_fd_below_nofile(&ctx.process) {
+        Ok(fd) => fd,
+        Err(result) => return result,
+    };
+    let _ = ctx.process.install_fd(fd, open_cap);
+    SyscallResult::Return(fd as i64)
 }
 
 pub(super) fn sys_pidfd_send_signal(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {

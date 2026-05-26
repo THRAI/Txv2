@@ -4,8 +4,9 @@ use super::*;
 
 use crate::linux_syscall::{
     CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID,
-    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLOCK_SETTIME, NR_GETTIMEOFDAY, NR_NANOSLEEP,
-    NR_SETTIMEOFDAY, NR_TIMES, TIMER_ABSTIME, TIMES_NS_PER_TICK,
+    ITIMER_PROF, ITIMER_REAL, NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLOCK_SETTIME, NR_GETITIMER,
+    NR_GETTIMEOFDAY, NR_NANOSLEEP, NR_SETITIMER, NR_SETTIMEOFDAY, NR_TIMES, TIMER_ABSTIME,
+    TIMES_NS_PER_TICK,
 };
 use tx_subsystems::cred::{step_setresuid, Uid};
 
@@ -30,6 +31,13 @@ struct TestTimespec {
 struct TestTimeval {
     tv_sec: i64,
     tv_usec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct TestItimerval {
+    it_interval: TestTimeval,
+    it_value: TestTimeval,
 }
 
 #[repr(C)]
@@ -401,6 +409,175 @@ fn dispatch_times_with_null_buffer_returns_tick_count() {
         other => panic!("expected Return, got {other:?}"),
     };
     assert!(ticks > 0);
+}
+
+/// `setitimer(ITIMER_REAL, new, old)` arms the process real timer and
+/// reports the previous remaining value. This is the ABI path musl's
+/// `alarm(2)` uses on Linux RV64.
+#[test]
+fn dispatch_setitimer_real_reports_previous_remaining_timer() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let first = TestItimerval {
+        it_interval: TestTimeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        it_value: TestTimeval {
+            tv_sec: 10,
+            tv_usec: 0,
+        },
+    };
+    let second = TestItimerval {
+        it_interval: TestTimeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        it_value: TestTimeval {
+            tv_sec: 1,
+            tv_usec: 0,
+        },
+    };
+    let mut old = TestItimerval::default();
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETITIMER,
+            [
+                ITIMER_REAL as u64,
+                &first as *const TestItimerval as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETITIMER,
+            [
+                ITIMER_REAL as u64,
+                &second as *const TestItimerval as u64,
+                &mut old as *mut TestItimerval as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(old.it_interval.tv_sec, 0);
+    assert_eq!(old.it_interval.tv_usec, 0);
+    assert_eq!(old.it_value.tv_sec, 9);
+    assert!(old.it_value.tv_usec <= 999_999);
+}
+
+/// `getitimer(ITIMER_REAL, value)` returns the currently armed process
+/// real timer in Linux's `struct itimerval` layout.
+#[test]
+fn dispatch_getitimer_real_returns_current_timer() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let new = TestItimerval {
+        it_interval: TestTimeval {
+            tv_sec: 2,
+            tv_usec: 500_000,
+        },
+        it_value: TestTimeval {
+            tv_sec: 3,
+            tv_usec: 250_000,
+        },
+    };
+    let mut current = TestItimerval::default();
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETITIMER,
+            [
+                ITIMER_REAL as u64,
+                &new as *const TestItimerval as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_GETITIMER,
+            [
+                ITIMER_REAL as u64,
+                &mut current as *mut TestItimerval as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(current.it_interval, new.it_interval);
+    assert_eq!(current.it_value.tv_sec, 3);
+    assert!(current.it_value.tv_usec <= 250_000);
+}
+
+#[test]
+fn dispatch_setitimer_rejects_cpu_timers_and_invalid_timeval() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let invalid = TestItimerval {
+        it_interval: TestTimeval {
+            tv_sec: 0,
+            tv_usec: 1_000_000,
+        },
+        it_value: TestTimeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+    };
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETITIMER,
+            [
+                ITIMER_REAL as u64,
+                &invalid as *const TestItimerval as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_INVAL));
+
+    let valid = TestItimerval::default();
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETITIMER,
+            [
+                ITIMER_PROF as u64,
+                &valid as *const TestItimerval as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_INVAL));
 }
 
 /// `nanosleep((0, 0), _)` short-circuits to `Return(0)` per the

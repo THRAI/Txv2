@@ -38,12 +38,12 @@ use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
 use super::{
-    dispatch, SyscallCtx, SyscallResult, EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_SETFD,
-    NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPID,
-    NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_MEMBARRIER, NR_READ, NR_RT_SIGACTION,
-    NR_RT_SIGPROCMASK, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SETPGID, NR_SETSID,
-    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, SIGCHLD,
-    WNOHANG,
+    dispatch, SyscallCtx, SyscallResult, EBADF_VALUE, EINVAL_VALUE, ENOSYS_VALUE, ENOTSOCK_VALUE,
+    EOPNOTSUPP_VALUE, FD_CLOEXEC, F_GETFD, F_SETFD, NR_ACCEPT, NR_BRK, NR_CLONE, NR_CLOSE,
+    NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPID, NR_GETPPID, NR_GETSID,
+    NR_GET_ROBUST_LIST, NR_MEMBARRIER, NR_PIDFD_OPEN, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK,
+    NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST,
+    NR_SET_TID_ADDRESS, NR_SOCKET, NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, O_PATH, SIGCHLD, WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
@@ -1434,3 +1434,8 @@ mod mq_dispatch;
 // Kernel-to-user layout marker registry used by the musl ABI detector.
 // ===========================================================================
 mod kernel_user_layouts;
+
+// ===========================================================================
+// Minimal socket dispatch coverage for OSComp/LTP-visible errno contracts.
+// ===========================================================================
+mod net_dispatch;
