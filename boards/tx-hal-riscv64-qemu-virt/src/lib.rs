@@ -262,7 +262,7 @@ impl PlatformConfig for Platform {
     const USER_TOP: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::SV39_USER_TOP);
     const USER_RESERVED_TOP_SIZE: usize = pmap_topology::USER_RESERVED_TOP_SIZE;
     const USER_ALLOC_TOP: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::SV39_USER_ALLOC_TOP);
-    const KERNEL_STACK_SIZE: usize = 128 * 1024;
+    const KERNEL_STACK_SIZE: usize = 512 * 1024;
     const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE;
     const PAGE_TABLE_LEVELS: u8 = 3;
     const ASID_BITS: u8 = 16;

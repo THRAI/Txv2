@@ -6,10 +6,12 @@
 // `impl<P: TxPlatform> CoreInit<P>` block in `init.rs` and
 // `init::exec`.
 //
-// The helper creates `/bin/{sh,busybox,ls,ip,ifconfig}` and `/usr/bin/env` as
+// The helper creates `/bin/{sh,busybox,ls,basename,ip,ifconfig}` and
+// `/usr/bin/env` as
 // rootfs-tmpfs symlinks pointing at `/musl/musl/busybox` so the
 // OSComp `libctest`, `lua`, and `libcbench` wrapper scripts find
-// their shebang interpreters. See the doc-comment on
+// their shebang interpreters. It also exposes the absolute dynamic
+// loader paths used by the OSComp RV64/LA64 images. See the doc-comment on
 // `populate_rootfs_shebang_shims` for the full design rationale.
 
 use super::*;
@@ -27,12 +29,15 @@ impl<P: TxPlatform> CoreInit<P> {
     /// /bin/sh         → /musl/musl/busybox  (handles `#!/bin/sh`)
     /// /bin/cat        → /musl/musl/busybox  (LTP opens it as a stable file)
     /// /bin/ls         → /musl/musl/busybox  (lets BusyBox `which ls` pass)
+    /// /bin/basename   → /musl/musl/busybox  (lets full LTP markers name cases)
     /// /bin/ip         → /musl/musl/busybox  (lets LTP setup scripts bring up lo)
     /// /bin/ifconfig   → /musl/musl/busybox  (same, for older LTP helpers)
     /// /usr/bin/env    → /musl/musl/busybox  (handles `#!/usr/bin/env …`)
     /// /lib/ld-linux-riscv64-lp64d.so.1 → /musl/glibc/lib/ld-linux-riscv64-lp64d.so.1
     /// /lib/libc.so.6  → /musl/glibc/lib/libc.so.6
     /// /lib/libm.so.6  → /musl/glibc/lib/libm.so.6
+    /// /lib64/ld-linux-loongarch-lp64d.so.1 → /musl/glibc/lib/ld-linux-loongarch-lp64d.so.1
+    /// /lib64/ld-musl-loongarch-lp64d.so.1  → /musl/musl/lib/libc.so
     /// ```
     ///
     /// The wrapper scripts (`scripts/lua/test.sh`, `run-static.sh`,
@@ -82,6 +87,7 @@ impl<P: TxPlatform> CoreInit<P> {
         let _ = symlink_into(fs_ops, bin_id, b"cat", b"/musl/musl/busybox", &cred);
         let _ = symlink_into(fs_ops, bin_id, b"true", b"/musl/musl/busybox", &cred);
         let _ = symlink_into(fs_ops, bin_id, b"ls", b"/musl/musl/busybox", &cred);
+        let _ = symlink_into(fs_ops, bin_id, b"basename", b"/musl/musl/busybox", &cred);
         let _ = symlink_into(fs_ops, bin_id, b"ip", b"/musl/musl/busybox", &cred);
         let _ = symlink_into(fs_ops, bin_id, b"ifconfig", b"/musl/musl/busybox", &cred);
 
@@ -135,6 +141,32 @@ impl<P: TxPlatform> CoreInit<P> {
             lib_id,
             b"libm.so.6",
             b"/musl/glibc/lib/libm.so.6",
+            &cred,
+        );
+
+        // LA64 OSComp user binaries request absolute /lib64 loaders:
+        // the basic/glibc payloads use glibc's ld-linux, while the musl
+        // dynamic payloads use musl's libc.so as the loader.
+        let lib64_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"lib64", 0o755, &cred) {
+            Some(id) => id,
+            None => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":shebang-shims:err:mkdir-lib64\n");
+                return;
+            }
+        };
+        let _ = symlink_into(
+            fs_ops,
+            lib64_id,
+            b"ld-linux-loongarch-lp64d.so.1",
+            b"/musl/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+            &cred,
+        );
+        let _ = symlink_into(
+            fs_ops,
+            lib64_id,
+            b"ld-musl-loongarch-lp64d.so.1",
+            b"/musl/musl/lib/libc.so",
             &cred,
         );
 

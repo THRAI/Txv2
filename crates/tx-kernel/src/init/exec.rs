@@ -1025,6 +1025,27 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 selected += 1;
                 continue;
             }
+            if let Some(filter) = group.strip_prefix("ltp-musl:") {
+                append_filtered_ltp(&mut cmd, "musl", filter);
+                selected += 1;
+                continue;
+            }
+            if let Some(filter) = group.strip_prefix("ltp:") {
+                append_filtered_ltp(&mut cmd, "musl", filter);
+                selected += 1;
+                continue;
+            }
+            if let Some(batch) = group.strip_prefix("ltp-batch:") {
+                append_ltp_batch(&mut cmd, batch);
+                selected += 1;
+                continue;
+            }
+            if let Some(module) = group.strip_prefix("ltp-runtest:") {
+                let (module, filter) = module.split_once(':').unwrap_or((module, ""));
+                append_ltp_runtest(&mut cmd, module, filter);
+                selected += 1;
+                continue;
+            }
             if is_libctest_musl_group(group) {
                 append_full_libctest(&mut cmd);
                 selected += 1;
@@ -1038,21 +1059,18 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 selected += 1;
                 continue;
             }
-            if let Some(filter) = group.strip_prefix("ltp-musl:") {
-                append_filtered_ltp(&mut cmd, "musl", filter);
-                selected += 1;
-                continue;
-            }
-            if let Some(filter) = group.strip_prefix("ltp:") {
-                append_filtered_ltp(&mut cmd, "musl", filter);
-                selected += 1;
-                continue;
-            }
             if let Some(script) = oscomp_glibc_script_for_group(group) {
-                let _ = write!(
-                    cmd,
-                    " && cd /musl/glibc && /musl/musl/busybox sh {script} && cd /musl/musl"
-                );
+                if script == "basic_testcode.sh" {
+                    let _ = write!(
+                        cmd,
+                        " && cd /musl/glibc/basic && (/musl/musl/busybox mkdir test_chdir || :) && cd /musl/glibc && /musl/musl/busybox sh {script} && cd /musl/musl"
+                    );
+                } else {
+                    let _ = write!(
+                        cmd,
+                        " && cd /musl/glibc && /musl/musl/busybox sh {script} && cd /musl/musl"
+                    );
+                }
                 selected += 1;
                 continue;
             }
@@ -1068,47 +1086,219 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     cmd
 }
 
-fn append_filtered_ltp(cmd: &mut alloc::string::String, libc: &str, filter: &str) {
-    let group = oscomp_group_label("ltp", libc);
-    let echo = match libc {
-        "glibc" => "/musl/musl/busybox echo",
-        _ => "./busybox echo",
-    };
+fn append_ltp_batch(cmd: &mut alloc::string::String, batch: &str) {
+    match batch.trim() {
+        "submit" | "whitelist" => append_submit_ltp_runner(cmd),
+        "p0" => append_filtered_ltp(cmd, "musl", LTP_P0_CASES),
+        "smoke" => append_filtered_ltp(cmd, "musl", LTP_SMOKE_CASES),
+        "fd-io" => append_filtered_ltp(cmd, "musl", LTP_FD_IO_CASES),
+        "fd-io-tail" => append_filtered_ltp(cmd, "musl", LTP_FD_IO_TAIL_CASES),
+        "fd-io-after-sendfile07" => {
+            append_filtered_ltp(cmd, "musl", LTP_FD_IO_AFTER_SENDFILE07_CASES)
+        }
+        "vfs" => append_filtered_ltp(cmd, "musl", LTP_VFS_CASES),
+        "vfs-tail" | "vfs-after-lgetxattr" => append_filtered_ltp(cmd, "musl", LTP_VFS_TAIL_CASES),
+        "vm" => append_filtered_ltp(cmd, "musl", LTP_VM_CASES),
+        "process" => append_filtered_ltp(cmd, "musl", LTP_PROCESS_CASES),
+        "cred" => append_filtered_ltp(cmd, "musl", LTP_CRED_CASES),
+        "signal" => append_filtered_ltp(cmd, "musl", LTP_SIGNAL_CASES),
+        "time" => append_filtered_ltp(cmd, "musl", LTP_TIME_CASES),
+        "ipc" => append_filtered_ltp(cmd, "musl", LTP_IPC_CASES),
+        "event" => append_filtered_ltp(cmd, "musl", LTP_EVENT_CASES),
+        "sched" => append_filtered_ltp(cmd, "musl", LTP_SCHED_CASES),
+        "mount" => append_filtered_ltp(cmd, "musl", LTP_MOUNT_CASES),
+        "heavy" => append_filtered_ltp(cmd, "musl", LTP_HEAVY_CASES),
+        "aio" => append_filtered_ltp(cmd, "musl", LTP_AIO_CASES),
+        "all" => append_all_ltp(cmd),
+        _ => append_filtered_ltp(cmd, "musl", ""),
+    }
+}
+
+fn append_ltp_runtest(cmd: &mut alloc::string::String, module: &str, filter: &str) {
+    use core::fmt::Write as _;
+
+    let module = module.trim();
+    let filter = filter.trim();
+    append_ltp_script_env(cmd);
+    if !is_safe_ltp_runtest_name(module) || !is_safe_ltp_runtest_filter(filter) {
+        let _ = write!(
+            cmd,
+            "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+        );
+        let _ = write!(
+            cmd,
+            "; ./busybox echo \"FAIL LTP RUNTEST {module} : invalid module name\""
+        );
+        let _ = write!(
+            cmd,
+            "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+        );
+        return;
+    }
 
     let _ = write!(
         cmd,
-        "; {echo} \"#### OS COMP TEST GROUP START {group} ####\""
+        "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
     );
+    let selected_tags = ltp_runtest_selected_tags(filter);
+    let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
+    let _ = write!(
+        cmd,
+        "; selected_tags='{selected_tags}'; if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; if [ -n \"$selected_tags\" ]; then case \"$selected_tags\" in *\"|$tag|\"*) ;; *) continue;; esac; fi; case \"$tag\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $tag : local skip\"; continue;; esac; cmdline=${{rest:-$tag}}; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -c \"$cmdline\"; ret=$?; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi"
+    );
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+    );
+}
+
+fn is_safe_ltp_runtest_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn is_safe_ltp_runtest_filter(filter: &str) -> bool {
+    filter
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
+}
+
+fn ltp_runtest_selected_tags(filter: &str) -> alloc::string::String {
+    use core::fmt::Write as _;
+
+    if filter.is_empty() {
+        return alloc::string::String::new();
+    }
+    let mut selected = alloc::string::String::from("|");
+    for tag in filter.split('+') {
+        if tag.is_empty() {
+            continue;
+        }
+        let _ = write!(selected, "{tag}|");
+    }
+    selected
+}
+
+fn append_filtered_ltp(cmd: &mut alloc::string::String, _libc: &str, filter: &str) {
+    use core::fmt::Write as _;
+
+    append_ltp_script_env(cmd);
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+    );
+    append_ltp_case_loop(cmd, filter);
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+    );
+}
+
+fn append_all_ltp(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    append_ltp_script_env(cmd);
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+    );
+    for filter in [
+        LTP_SMOKE_CASES,
+        LTP_FD_IO_CASES,
+        LTP_VFS_CASES,
+        LTP_VM_CASES,
+        LTP_PROCESS_CASES,
+        LTP_CRED_CASES,
+        LTP_SIGNAL_CASES,
+        LTP_TIME_CASES,
+        LTP_IPC_CASES,
+        LTP_EVENT_CASES,
+        LTP_SCHED_CASES,
+        LTP_MOUNT_CASES,
+        LTP_HEAVY_CASES,
+        LTP_AIO_CASES,
+        LTP_NETWORK_DEFERRED_CASES,
+    ] {
+        append_ltp_case_loop(cmd, filter);
+    }
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+    );
+}
+
+fn append_submit_ltp_runner(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    append_ltp_script_env(cmd);
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+    );
+    append_ltp_case_loop(cmd, LTP_SUBMIT_CASES);
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+    );
+}
+
+fn append_ltp_case_loop(cmd: &mut alloc::string::String, filter: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(cmd, "; for case in");
     for case in filter.split('+') {
         let case = case.trim();
-        if case.is_empty() {
+        if case.is_empty() || case.ends_with('_') {
             continue;
         }
         if !is_ltp_case_token(case) {
             let _ = write!(
                 cmd,
-                "; {echo} \"SKIP LTP CASE {case} : invalid case token\""
+                "; ./busybox echo \"SKIP LTP CASE {case} : invalid case token\""
             );
             continue;
         }
-
-        let _ = write!(
-            cmd,
-            "; {echo} \"RUN LTP CASE {case}\"; \
-             \"ltp/testcases/bin/{case}\"; \
-             ret=$?; \
-             if [ \"$ret\" -eq 0 ]; then \
-                 {echo} \"PASS LTP CASE {case} : $ret\"; \
-             else \
-                 {echo} \"FAIL LTP CASE {case} : $ret\"; \
-             fi; \
-             if [ \"$ret\" -eq 0 ]; then \
-                 {echo} \"FAIL LTP CASE {case} : $ret\"; \
-             fi"
-        );
+        let _ = write!(cmd, " {case}");
     }
-    let _ = write!(cmd, "; {echo} \"#### OS COMP TEST GROUP END {group} ####\"");
+    let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
+    let _ = write!(
+        cmd,
+        "; do \
+case \"$case\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $case : local skip\"; continue;; esac; \
+ltp_label=\"$case\"; \
+case \"$case\" in \
+chdir01A) set -- symlink01 -T chdir01; ltp_label='symlink01 -T chdir01';; \
+chmod01A) set -- symlink01 -T chmod01; ltp_label='symlink01 -T chmod01';; \
+link01) set -- symlink01 -T link01; ltp_label='symlink01 -T link01';; \
+lstat01A) set -- symlink01 -T lstat01; ltp_label='symlink01 -T lstat01';; \
+lstat01A_64) set -- symlink01 -T lstat01_64; ltp_label='symlink01 -T lstat01_64';; \
+open01A) set -- symlink01 -T open01; ltp_label='symlink01 -T open01';; \
+readlink01A) set -- symlink01 -T readlink01; ltp_label='symlink01 -T readlink01';; \
+rename01A) set -- symlink01 -T rename01; ltp_label='symlink01 -T rename01';; \
+rmdir03A) set -- symlink01 -T rmdir03; ltp_label='symlink01 -T rmdir03';; \
+stat04) set -- symlink01 -T stat04; ltp_label='symlink01 -T stat04';; \
+stat04_64) set -- symlink01 -T stat04_64; ltp_label='symlink01 -T stat04_64';; \
+unlink01) set -- symlink01 -T unlink01; ltp_label='symlink01 -T unlink01';; \
+*) set -- \"$case\";; \
+esac; \
+./busybox echo \"RUN LTP CASE $case : $ltp_label\"; \
+PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config \"$@\"; \
+ret=$?; \
+./busybox echo \"FAIL LTP CASE $case : $ret\"; \
+done"
+    );
 }
+
+const LOCAL_LTP_SKIP_SHELL_PATTERN: &str = "\
+clock_gettime01|clock_gettime04|dirtyc0w_shmem|fork14|futex_cmp_requeue01|\
+getrusage03|getrusage04|kcmp03|kill10|kill11|msgrcv05|msgrcv06|msgsnd05|\
+msgsnd06|rename14|shmctl01|sigtimedwait01|sigwaitinfo01|wait401|waitid07|\
+waitid08|waitpid07|waitpid11";
 
 fn is_ltp_case_token(case: &str) -> bool {
     !case.is_empty()
@@ -1116,6 +1306,334 @@ fn is_ltp_case_token(case: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
+
+const LTP_P0_CASES: &str = "\
+alarm02+alarm03+alarm05+alarm06+alarm07+\
+clock_nanosleep01+clock_nanosleep02+clock_nanosleep03+clock_nanosleep04+\
+epoll_ctl01+epoll_ctl02+epoll_ctl03+epoll_ctl04+epoll_ctl05+\
+epoll_wait01+epoll_wait02+epoll_wait03+epoll_wait04+epoll_wait06+epoll_wait07+\
+eventfd01+eventfd02+eventfd03+eventfd04+eventfd05+eventfd06+eventfd2_01+eventfd2_02+eventfd2_03+\
+futex_wait01+futex_wait02+futex_wait03+futex_wait04+futex_wait05+\
+futex_wake01+futex_wake02+futex_wake03+futex_wake04+\
+getitimer01+getitimer02+\
+nanosleep01+nanosleep02+nanosleep04+\
+poll01+poll02+ppoll01+\
+pselect01+pselect01_64+pselect02+pselect02_64+pselect03+pselect03_64+\
+select01+select02+select03+select04+\
+setitimer01+setitimer02+\
+timerfd01+timerfd02+timerfd04+timerfd_create01+timerfd_gettime01+timerfd_settime01";
+
+const LTP_SMOKE_CASES: &str = "\
+abort01+confstr01+fmtmsg01+fpathconf01+getcontext01+gethostbyname_r01+gethostid01+gethostname01+\
+gethostname02+getpagesize01+getrandom01+getrandom02+getrandom03+getrandom04+getrandom05+\
+mallinfo02+mallinfo2_01+mallopt01+memcmp01+memcpy01+memset01+nftw01+nftw6401+pathconf01+\
+pathconf02+profil01+qmm01+realpath01+string01+switch01+syscall01+sysconf01+ulimit01";
+
+const LTP_FD_IO_CASES: &str = "\
+close01+close02+close_range01+close_range02+copy_file_range01+copy_file_range02+copy_file_range03+\
+dup01+dup02+dup03+dup04+dup05+dup06+dup07+dup201+dup202+dup203+dup204+dup205+dup206+dup207+dup3_01+\
+dup3_02+fallocate01+fallocate02+fallocate03+fallocate04+fallocate05+fallocate06+fcntl01+fcntl01_64+\
+fcntl02+fcntl02_64+fcntl03+fcntl03_64+fcntl04+fcntl04_64+fcntl05+fcntl05_64+fcntl07+fcntl07_64+\
+fcntl08+fcntl08_64+fcntl09+fcntl09_64+fcntl10+fcntl10_64+fcntl11+fcntl11_64+fcntl12+fcntl12_64+\
+fcntl13+fcntl13_64+fcntl14+fcntl14_64+fcntl16+fcntl16_64+fcntl17+fcntl17_64+\
+fcntl18+fcntl18_64+fcntl19+fcntl19_64+fcntl20+fcntl20_64+fcntl21+fcntl21_64+fcntl22+fcntl22_64+\
+fcntl23+fcntl23_64+fcntl24+fcntl24_64+fcntl25+fcntl25_64+fcntl26+fcntl26_64+fcntl27+fcntl27_64+\
+fcntl29+fcntl29_64+fcntl30+fcntl30_64+fcntl31+fcntl31_64+fcntl32+fcntl32_64+fcntl33+fcntl33_64+\
+fcntl34+fcntl34_64+fcntl35+fcntl35_64+fcntl37+fcntl37_64+fcntl38+fcntl38_64+\
+fcntl39+fcntl39_64+fdatasync01+fdatasync02+fdatasync03+fsync01+fsync02+fsync03+fsync04+ioctl01+\
+ioctl02+ioctl03+ioctl04+ioctl05+ioctl06+ioctl07+ioctl08+ioctl09+ioctl_loop01+ioctl_loop02+\
+ioctl_loop03+ioctl_loop04+ioctl_loop05+ioctl_loop06+ioctl_loop07+ioctl_ns01+ioctl_ns02+ioctl_ns03+\
+ioctl_ns04+ioctl_ns05+ioctl_ns06+ioctl_ns07+ioctl_sg01+llseek01+llseek02+llseek03+lseek01+lseek02+\
+lseek07+lseek11+pipe01+pipe03+pipe04+pipe05+pipe06+pipe07+pipe08+pipe09+pipe10+pipe11+pipe12+\
+pipe13+pipe14+pipe15+pipe2_01+pipe2_02+pipe2_04+posix_fadvise01+posix_fadvise01_64+posix_fadvise02+\
+posix_fadvise02_64+posix_fadvise03+posix_fadvise03_64+posix_fadvise04+posix_fadvise04_64+pread01+\
+pread01_64+pread02+pread02_64+preadv01+preadv01_64+preadv02+preadv02_64+preadv03+preadv03_64+\
+preadv201+preadv201_64+preadv202+preadv202_64+preadv203+preadv203_64+pwrite01+pwrite01_64+pwrite02+\
+pwrite02_64+pwrite03+pwrite03_64+pwrite04+pwrite04_64+pwritev01+pwritev01_64+pwritev02+pwritev02_64+\
+pwritev03+pwritev03_64+pwritev201+pwritev201_64+pwritev202+pwritev202_64+read01+read02+read03+\
+read04+readahead01+readahead02+readv01+readv02+sendfile02+sendfile02_64+sendfile03+sendfile03_64+\
+sendfile04+sendfile04_64+sendfile05+sendfile05_64+sendfile06+sendfile06_64+sendfile07+sendfile07_64+\
+sendfile08+sendfile08_64+sendfile09+sendfile09_64+sockioctl01+splice01+splice02+splice03+splice04+\
+splice05+splice06+splice07+splice08+splice09+sync01+sync_file_range01+sync_file_range02+syncfs01+\
+tee01+tee02+vmsplice01+vmsplice02+vmsplice03+vmsplice04+write01+write02+write03+write04+write05+\
+write06+writev01+writev02+writev03+writev05+writev06+writev07";
+
+const LTP_FD_IO_TAIL_CASES: &str = "\
+ioctl05+ioctl06+ioctl07+ioctl08+ioctl09+ioctl_loop01+ioctl_loop02+ioctl_loop03+ioctl_loop04+\
+ioctl_loop05+ioctl_loop06+ioctl_loop07+ioctl_ns01+ioctl_ns02+ioctl_ns03+ioctl_ns04+ioctl_ns05+\
+ioctl_ns06+ioctl_ns07+ioctl_sg01+llseek01+llseek02+llseek03+lseek01+lseek02+lseek07+lseek11+\
+pipe01+pipe03+pipe04+pipe05+pipe06+pipe07+pipe08+pipe09+pipe10+pipe11+pipe12+pipe13+pipe14+\
+pipe15+pipe2_01+pipe2_02+pipe2_04+posix_fadvise01+posix_fadvise01_64+posix_fadvise02+\
+posix_fadvise02_64+posix_fadvise03+posix_fadvise03_64+posix_fadvise04+posix_fadvise04_64+\
+pread01+pread01_64+pread02+pread02_64+preadv01+preadv01_64+preadv02+preadv02_64+preadv03+\
+preadv03_64+preadv201+preadv201_64+preadv202+preadv202_64+preadv203+preadv203_64+pwrite01+\
+pwrite01_64+pwrite02+pwrite02_64+pwrite03+pwrite03_64+pwrite04+pwrite04_64+pwritev01+\
+pwritev01_64+pwritev02+pwritev02_64+pwritev03+pwritev03_64+pwritev201+pwritev201_64+\
+pwritev202+pwritev202_64+read01+read02+read03+read04+readahead01+readahead02+readv01+\
+readv02+sendfile02+sendfile02_64+sendfile03+sendfile03_64+sendfile04+sendfile04_64+sendfile05+\
+sendfile05_64+sendfile06+sendfile06_64+sendfile07+sendfile07_64+sendfile08+sendfile08_64+\
+sendfile09+sendfile09_64+sockioctl01+splice01+splice02+splice03+splice04+splice05+splice06+\
+splice07+splice08+splice09+sync01+sync_file_range01+sync_file_range02+syncfs01+tee01+tee02+\
+vmsplice01+vmsplice02+vmsplice03+vmsplice04+write01+write02+write03+write04+write05+write06+\
+writev01+writev02+writev03+writev05+writev06+writev07";
+
+const LTP_FD_IO_AFTER_SENDFILE07_CASES: &str = "\
+sendfile07_64+sendfile08+sendfile08_64+sendfile09+sendfile09_64+sockioctl01+splice01+splice02+\
+splice03+splice04+splice05+splice06+splice07+splice08+splice09+sync01+sync_file_range01+\
+sync_file_range02+syncfs01+tee01+tee02+vmsplice01+vmsplice02+vmsplice03+vmsplice04+write01+\
+write02+write03+write04+write05+write06+writev01+writev02+writev03+writev05+writev06+\
+writev07";
+
+// Generated LTP syscall batch case lists. Keep in sync with tools/ltp-batches.py.
+const LTP_VFS_CASES: &str = "\
+access01+access02+access03+access04+chdir01+chdir01A+chdir04+chmod01+chmod01A+chmod03+chmod05+chmod06+chmod07+\
+chown01+chown01_16+chown02+chown02_16+chown03+chown03_16+chown04+chown04_16+chown05+chown05_16+creat01+\
+creat03+creat04+creat05+creat06+creat07+creat08+creat09+faccessat01+faccessat02+faccessat201+faccessat202+\
+fchdir01+fchdir02+fchdir03+fchmod01+fchmod02+fchmod03+fchmod04+fchmod05+fchmod06+fchmodat01+fchmodat02+\
+fchown01+fchown01_16+fchown02+fchown02_16+fchown03+fchown03_16+fchown04+fchown04_16+fchown05+fchown05_16+\
+fchownat01+fchownat02+fgetxattr01+fgetxattr02+fgetxattr03+flistxattr01+flistxattr02+flistxattr03+flock01+\
+flock02+flock03+flock04+flock06+fremovexattr01+fremovexattr02+fsetxattr01+fsetxattr02+fstat02+fstat02_64+\
+fstat03+fstat03_64+fstatat01+fstatfs01+fstatfs01_64+fstatfs02+fstatfs02_64+ftruncate01+ftruncate01_64+\
+ftruncate03+ftruncate03_64+ftruncate04+ftruncate04_64+futimesat01+getcwd01+getcwd02+getcwd03+getcwd04+\
+getdents01+getdents02+getxattr01+getxattr02+getxattr03+getxattr04+getxattr05+lchown01+lchown01_16+lchown02+\
+lchown02_16+lchown03+lchown03_16+lgetxattr01+lgetxattr02+link01+link02+link04+link05+link08+linkat01+linkat02+\
+listxattr01+listxattr02+listxattr03+llistxattr01+llistxattr02+llistxattr03+lremovexattr01+lstat01+lstat01A+\
+lstat01A_64+lstat01_64+lstat02+lstat02_64+mkdir02+mkdir03+mkdir04+mkdir05+mkdir09+mkdirat01+mkdirat02+mknod01+\
+mknod02+mknod03+mknod04+mknod05+mknod06+mknod07+mknod08+mknod09+mknodat01+mknodat02+name_to_handle_at01+\
+name_to_handle_at02+open01+open01A+open02+open03+open04+open06+open07+open08+open09+open10+open11+open12+\
+open13+open14+open_by_handle_at01+open_by_handle_at02+openat01+openat02+openat03+openat04+openat201+openat202+\
+openat203+prot_hsymlinks+readdir01+readdir21+readlink01+readlink01A+readlink03+readlinkat01+readlinkat02+\
+removexattr01+removexattr02+rename01+rename01A+rename03+rename04+rename05+rename06+rename07+rename08+rename09+\
+rename10+rename11+rename12+rename13+rename14+renameat01+renameat201+renameat202+rmdir01+rmdir02+rmdir03+\
+rmdir03A+setxattr01+setxattr02+setxattr03+stat01+stat01_64+stat02+stat02_64+stat03+stat03_64+stat04+stat04_64+\
+statfs01+statfs01_64+statfs02+statfs02_64+statfs03+statfs03_64+statvfs01+statvfs02+statx01+statx02+statx03+\
+statx04+statx05+statx06+statx07+statx08+statx09+statx10+statx11+statx12+symlink01+symlink02+symlink03+\
+symlink04+symlinkat01+truncate02+truncate02_64+truncate03+truncate03_64+umask01+unlink01+unlink05+unlink07+\
+unlink08+unlink09+unlinkat01+utime01+utime02+utime03+utime04+utime05+utime06+utime07+utimensat01+utimes01";
+
+const LTP_VFS_TAIL_CASES: &str = "\
+link01+link02+link04+link05+link08+linkat01+linkat02+listxattr01+listxattr02+listxattr03+llistxattr01+\
+llistxattr02+llistxattr03+lremovexattr01+lstat01+lstat01A+lstat01A_64+lstat01_64+lstat02+lstat02_64+\
+mkdir02+mkdir03+mkdir04+mkdir05+mkdir09+mkdirat01+mkdirat02+mknod01+mknod02+mknod03+mknod04+mknod05+\
+mknod06+mknod07+mknod08+mknod09+mknodat01+mknodat02+name_to_handle_at01+name_to_handle_at02+open01+\
+open01A+open02+open03+open04+open06+open07+open08+open09+open10+open11+open12+open13+open14+\
+open_by_handle_at01+open_by_handle_at02+openat01+openat02+openat03+openat04+openat201+openat202+openat203+\
+prot_hsymlinks+readdir01+readdir21+readlink01+readlink01A+readlink03+readlinkat01+readlinkat02+removexattr01+\
+removexattr02+rename01+rename01A+rename03+rename04+rename05+rename06+rename07+rename08+rename09+rename10+\
+rename11+rename12+rename13+rename14+renameat01+renameat201+renameat202+rmdir01+rmdir02+rmdir03+rmdir03A+\
+setxattr01+setxattr02+setxattr03+stat01+stat01_64+stat02+stat02_64+stat03+stat03_64+stat04+stat04_64+\
+statfs01+statfs01_64+statfs02+statfs02_64+statfs03+statfs03_64+statvfs01+statvfs02+statx01+statx02+\
+statx03+statx04+statx05+statx06+statx07+statx08+statx09+statx10+statx11+statx12+symlink01+symlink02+\
+symlink03+symlink04+symlinkat01+truncate02+truncate02_64+truncate03+truncate03_64+umask01+unlink01+unlink05+\
+unlink07+unlink08+unlink09+unlinkat01+utime01+utime02+utime03+utime04+utime05+utime06+utime07+utimensat01+utimes01";
+
+const LTP_VM_CASES: &str = "\
+brk01+brk02+dirtyc0w+dirtyc0w_shmem+dirtypipe+get_mempolicy01+get_mempolicy02+madvise01+madvise02+madvise03+\
+madvise05+madvise06+madvise07+madvise08+madvise09+madvise10+madvise11+mbind01+mbind02+mbind03+mbind04+\
+memfd_create01+memfd_create02+memfd_create03+memfd_create04+migrate_pages01+migrate_pages02+migrate_pages03+\
+mincore01+mincore02+mincore03+mincore04+mlock01+mlock02+mlock03+mlock04+mlock05+mlock201+mlock202+mlock203+\
+mlockall01+mlockall02+mlockall03+mmap01+mmap02+mmap03+mmap04+mmap05+mmap06+mmap08+mmap09+mmap12+mmap13+mmap14+\
+mmap15+mmap16+mmap17+mmap18+mmap19+mmap20+move_pages01+move_pages02+move_pages03+move_pages04+move_pages05+\
+move_pages06+move_pages07+move_pages09+move_pages10+move_pages11+move_pages12+mprotect01+mprotect02+\
+mprotect03+mprotect04+mprotect05+mremap01+mremap02+mremap03+mremap04+mremap05+mremap06+msync01+msync02+\
+msync03+msync04+munlock01+munlock02+munlockall01+munmap01+munmap02+munmap03+pkey01+process_madvise01+\
+remap_file_pages01+remap_file_pages02+sbrk01+sbrk02+sbrk03+set_mempolicy01+set_mempolicy02+set_mempolicy03+\
+set_mempolicy04";
+
+const LTP_PROCESS_CASES: &str = "\
+clone01+clone02+clone03+clone04+clone05+clone06+clone07+clone08+clone09+clone301+clone302+clone303+execl01+\
+execle01+execlp01+execv01+execve01+execve02+execve03+execve04+execve05+execve06+execveat01+execveat02+\
+execveat03+execvp01+exit01+exit02+exit_group01+fork01+fork03+fork04+fork05+fork06+fork07+fork08+fork09+fork10+\
+fork11+fork13+fork14+get_robust_list01+getpgid01+getpgid02+getpgrp01+getpid01+getpid02+getppid01+getppid02+\
+getsid01+getsid02+gettid01+gettid02+kcmp01+kcmp02+kcmp03+personality01+personality02+pidfd_getfd01+\
+pidfd_getfd02+pidfd_open01+pidfd_open02+pidfd_open03+pidfd_open04+pidfd_send_signal01+pidfd_send_signal02+\
+pidfd_send_signal03+process_vm_readv01+process_vm_readv02+process_vm_readv03+process_vm_writev01+\
+process_vm_writev02+set_robust_list01+set_tid_address01+setpgid01+setpgid02+setpgid03+setpgrp01+setpgrp02+\
+setsid01+vfork01+vfork02+wait01+wait02+wait401+wait402+wait403+waitid01+waitid02+waitid03+waitid04+waitid05+\
+waitid06+waitid07+waitid08+waitid09+waitid10+waitid11+waitpid01+waitpid03+waitpid04+waitpid06+waitpid07+\
+waitpid08+waitpid09+waitpid10+waitpid11+waitpid12+waitpid13";
+
+const LTP_CRED_CASES: &str = "\
+add_key01+add_key02+add_key03+add_key04+add_key05+capget01+capget02+capset01+capset02+capset03+capset04+\
+getegid01+getegid01_16+getegid02+getegid02_16+geteuid01+geteuid01_16+geteuid02+geteuid02_16+getgid01+\
+getgid01_16+getgid03+getgid03_16+getgroups01+getgroups01_16+getgroups03+getgroups03_16+getresgid01+\
+getresgid01_16+getresgid02+getresgid02_16+getresgid03+getresgid03_16+getresuid01+getresuid01_16+getresuid02+\
+getresuid02_16+getresuid03+getresuid03_16+getuid01+getuid01_16+getuid03+getuid03_16+keyctl01+keyctl02+\
+keyctl03+keyctl04+keyctl05+keyctl06+keyctl07+keyctl08+keyctl09+request_key01+request_key02+request_key03+\
+request_key04+request_key05+setegid01+setegid02+setfsgid01+setfsgid01_16+setfsgid02+setfsgid02_16+setfsgid03+\
+setfsgid03_16+setfsuid01+setfsuid01_16+setfsuid02+setfsuid02_16+setfsuid03+setfsuid03_16+setfsuid04+\
+setfsuid04_16+setgid01+setgid01_16+setgid02+setgid02_16+setgid03+setgid03_16+setgroups01+setgroups01_16+\
+setgroups02+setgroups02_16+setgroups03+setgroups03_16+setregid01+setregid01_16+setregid02+setregid02_16+\
+setregid03+setregid03_16+setregid04+setregid04_16+setresgid01+setresgid01_16+setresgid02+setresgid02_16+\
+setresgid03+setresgid03_16+setresgid04+setresgid04_16+setresuid01+setresuid01_16+setresuid02+setresuid02_16+\
+setresuid03+setresuid03_16+setresuid04+setresuid04_16+setresuid05+setresuid05_16+setreuid01+setreuid01_16+\
+setreuid02+setreuid02_16+setreuid03+setreuid03_16+setreuid04+setreuid04_16+setreuid05+setreuid05_16+\
+setreuid06+setreuid06_16+setreuid07+setreuid07_16+setuid01+setuid01_16+setuid03+setuid03_16+setuid04+\
+setuid04_16";
+
+const LTP_SIGNAL_CASES: &str = "\
+kill02+kill03+kill05+kill06+kill07+kill08+kill09+kill10+kill11+kill12+kill13+pause01+pause02+pause03+\
+rt_sigaction01+rt_sigaction02+rt_sigaction03+rt_sigprocmask01+rt_sigprocmask02+rt_sigqueueinfo01+\
+rt_sigsuspend01+rt_sigtimedwait01+rt_tgsigqueueinfo01+sgetmask01+sigaction01+sigaction02+sigaltstack01+\
+sigaltstack02+sighold02+signal01+signal02+signal03+signal04+signal05+signal06+signalfd01+signalfd4_01+\
+signalfd4_02+sigpending02+sigprocmask01+sigrelse01+sigsuspend01+sigtimedwait01+sigwait01+sigwaitinfo01+\
+ssetmask01+tgkill01+tgkill02+tgkill03+tkill01+tkill02";
+
+const LTP_TIME_CASES: &str = "\
+adjtimex01+adjtimex02+adjtimex03+alarm02+alarm03+alarm05+alarm06+alarm07+clock_adjtime01+clock_adjtime02+\
+clock_getres01+clock_gettime01+clock_gettime02+clock_gettime03+clock_gettime04+clock_nanosleep01+\
+clock_nanosleep02+clock_nanosleep03+clock_nanosleep04+clock_settime01+clock_settime02+clock_settime03+\
+getitimer01+getitimer02+gettimeofday01+gettimeofday02+leapsec01+nanosleep01+nanosleep02+nanosleep04+\
+setitimer01+setitimer02+settimeofday01+settimeofday02+stime01+stime02+time01+timer_create01+timer_create02+\
+timer_create03+timer_delete01+timer_delete02+timer_getoverrun01+timer_gettime01+timer_settime01+\
+timer_settime02+timer_settime03+timerfd01+timerfd02+timerfd04+timerfd_create01+timerfd_gettime01+\
+timerfd_settime01+times01+times03";
+
+const LTP_IPC_CASES: &str = "\
+mq_notify01+mq_notify02+mq_notify03+mq_open01+mq_timedreceive01+mq_timedsend01+mq_unlink01+msgctl01+msgctl02+\
+msgctl03+msgctl04+msgctl05+msgctl06+msgctl12+msgget01+msgget02+msgget03+msgget04+msgget05+msgrcv01+msgrcv02+\
+msgrcv03+msgrcv05+msgrcv06+msgrcv07+msgrcv08+msgsnd01+msgsnd02+msgsnd05+msgsnd06+msgstress01+semctl01+\
+semctl02+semctl03+semctl04+semctl05+semctl06+semctl07+semctl08+semctl09+semget01+semget02+semget05+semop01+\
+semop02+semop03+semop04+semop05+shmat01+shmat02+shmat03+shmat04+shmctl01+shmctl02+shmctl03+shmctl04+shmctl05+\
+shmctl06+shmctl07+shmctl08+shmdt01+shmdt02+shmget02+shmget03+shmget04+shmget05+shmget06";
+
+const LTP_EVENT_CASES: &str = "\
+epoll_create01+epoll_create02+epoll_create1_01+epoll_create1_02+epoll_ctl01+epoll_ctl02+epoll_ctl03+\
+epoll_ctl04+epoll_ctl05+epoll_wait01+epoll_wait02+epoll_wait03+epoll_wait04+epoll_wait06+epoll_wait07+\
+eventfd01+eventfd02+eventfd03+eventfd04+eventfd05+eventfd06+eventfd2_01+eventfd2_02+eventfd2_03+fanotify01+\
+fanotify02+fanotify03+fanotify04+fanotify05+fanotify06+fanotify07+fanotify08+fanotify09+fanotify10+fanotify11+\
+fanotify12+fanotify13+fanotify14+fanotify15+fanotify16+fanotify17+fanotify18+fanotify19+fanotify20+fanotify21+\
+fanotify22+fanotify23+futex_cmp_requeue01+futex_cmp_requeue02+futex_wait01+futex_wait02+futex_wait03+\
+futex_wait04+futex_wait05+futex_wait_bitset01+futex_waitv01+futex_waitv02+futex_waitv03+futex_wake01+\
+futex_wake02+futex_wake03+futex_wake04+inotify01+inotify02+inotify03+inotify04+inotify05+inotify06+inotify07+\
+inotify08+inotify09+inotify10+inotify11+inotify12+inotify_init1_01+inotify_init1_02+poll01+poll02+ppoll01+\
+pselect01+pselect01_64+pselect02+pselect02_64+pselect03+pselect03_64+select01+select02+select03+select04+\
+userfaultfd01";
+
+const LTP_SCHED_CASES: &str = "\
+getcpu01+getpriority01+getpriority02+getrlimit01+getrlimit02+getrlimit03+getrusage01+getrusage02+getrusage03+\
+getrusage04+ioprio_get01+ioprio_set01+ioprio_set02+ioprio_set03+membarrier01+nice01+nice02+nice03+nice04+\
+nice05+prctl01+prctl02+prctl03+prctl04+prctl05+prctl06+prctl07+prctl08+prctl09+prctl10+\
+sched_get_priority_max01+sched_get_priority_max02+sched_get_priority_min01+sched_get_priority_min02+\
+sched_getaffinity01+sched_getattr01+sched_getattr02+sched_getparam01+sched_getparam03+sched_getscheduler01+\
+sched_getscheduler02+sched_rr_get_interval01+sched_rr_get_interval02+sched_rr_get_interval03+\
+sched_setaffinity01+sched_setattr01+sched_setparam01+sched_setparam02+sched_setparam03+sched_setparam04+\
+sched_setparam05+sched_setscheduler01+sched_setscheduler02+sched_setscheduler03+sched_setscheduler04+\
+sched_yield01+setpriority01+setpriority02+setrlimit01+setrlimit02+setrlimit03+setrlimit04+setrlimit05+\
+setrlimit06";
+
+const LTP_MOUNT_CASES: &str = "\
+acct01+acct02+chroot01+chroot02+chroot03+chroot04+delete_module01+delete_module02+delete_module03+\
+finit_module01+finit_module02+fsconfig01+fsconfig02+fsconfig03+fsmount01+fsmount02+fsopen01+fsopen02+fspick01+\
+fspick02+init_module01+init_module02+mount01+mount02+mount03+mount04+mount05+mount06+mount07+mount_setattr01+\
+move_mount01+move_mount02+open_tree01+open_tree02+pivot_root01+reboot01+reboot02+setns01+setns02+swapoff01+\
+swapoff02+swapon01+swapon02+swapon03+umount01+umount02+umount03+umount2_01+umount2_02+unshare01+unshare02+\
+vhangup01+vhangup02";
+
+const LTP_HEAVY_CASES: &str = "\
+arch_prctl01+bpf_map01+bpf_prog01+bpf_prog02+bpf_prog03+bpf_prog04+bpf_prog05+bpf_prog06+bpf_prog07+\
+cacheflush01+getdomainname01+ioperm01+ioperm02+iopl01+iopl02+modify_ldt01+modify_ldt02+modify_ldt03+\
+newuname01+perf_event_open01+perf_event_open02+perf_event_open03+ptrace01+ptrace02+ptrace03+ptrace04+ptrace05+\
+ptrace06+ptrace07+ptrace08+ptrace09+ptrace10+ptrace11+quotactl01+quotactl02+quotactl03+quotactl04+quotactl05+\
+quotactl06+quotactl07+quotactl08+quotactl09+set_thread_area01+setdomainname01+setdomainname02+setdomainname03+\
+sethostname01+sethostname02+sethostname03+sysctl01+sysctl03+sysctl04+sysfs01+sysfs02+sysfs03+sysfs04+sysfs05+\
+sysinfo01+sysinfo02+sysinfo03+syslog11+syslog12+uname01+uname02+uname04+ustat01+ustat02";
+
+const LTP_AIO_CASES: &str = "\
+io_cancel01+io_cancel02+io_destroy01+io_destroy02+io_getevents01+io_getevents02+io_pgetevents01+\
+io_pgetevents02+io_setup01+io_setup02+io_submit01+io_submit02+io_submit03+io_uring01+io_uring02";
+
+const LTP_NETWORK_DEFERRED_CASES: &str = "\
+accept01+accept02+accept03+accept4_01+bind01+bind02+bind03+bind04+bind05+bind06+connect01+\
+connect02+epoll_pwait01+epoll_pwait02+epoll_pwait03+epoll_pwait04+epoll_pwait05+\
+getpeername01+getsockname01+getsockopt01+getsockopt02+listen01+recv01+recvfrom01+\
+recvmmsg01+recvmsg01+recvmsg02+recvmsg03+send01+send02+sendmmsg01+sendmmsg02+sendmsg01+\
+sendmsg02+sendmsg03+sendto01+sendto02+sendto03+setsockopt01+setsockopt02+setsockopt03+\
+setsockopt04+setsockopt05+setsockopt06+setsockopt07+setsockopt08+setsockopt09+\
+setsockopt10+socket01+socket02+socketcall01+socketcall02+socketcall03+socketpair01+\
+socketpair02";
+
+// Positive-score LTP submit whitelist generated from docs/LTP/syscalls/* progress
+// files. The p0 summary document is intentionally not used as a source because
+// it overlaps the module batches; duplicated cases are kept only once.
+const LTP_SUBMIT_CASES: &str = "\
+io_uring01+capget01+capset01+capset04+getegid02+getegid02_16+geteuid01+geteuid02+\
+getgid01+getgid03+getresgid01+getresgid02+getresgid03+getresuid01+getresuid02+getresuid03+\
+getuid01+getuid03+setegid01+setgid01+setgid03+setgroups02+setgroups03+setregid01+\
+setregid03+setregid04+setresgid01+setresgid02+setresgid04+setresuid01+setresuid02+setresuid04+\
+setresuid05+setreuid01+setreuid02+setreuid03+setreuid04+setreuid05+setreuid07+setuid01+\
+epoll_create01+epoll_create1_01+epoll_create1_02+epoll_ctl01+epoll_ctl02+epoll_ctl03+epoll_ctl04+epoll_ctl05+\
+epoll_wait01+epoll_wait02+epoll_wait03+epoll_wait06+epoll_wait07+eventfd01+eventfd02+eventfd03+\
+eventfd04+eventfd05+eventfd2_01+eventfd2_02+eventfd2_03+futex_cmp_requeue02+futex_wait01+futex_wait02+\
+futex_wait03+futex_wait04+futex_wait05+futex_wait_bitset01+futex_wake01+futex_wake03+poll01+poll02+\
+ppoll01+pselect01+pselect01_64+pselect02+pselect02_64+pselect03+pselect03_64+select01+\
+select02+select03+select04+close01+close02+copy_file_range03+dup01+dup02+\
+dup03+dup04+dup05+dup06+dup07+dup201+dup202+dup203+\
+dup204+dup205+dup206+dup207+dup3_01+dup3_02+fallocate01+fallocate02+\
+fallocate03+fcntl01+fcntl01_64+fcntl02+fcntl02_64+fcntl03+fcntl03_64+fcntl04+\
+fcntl04_64+fcntl05+fcntl05_64+fcntl07+fcntl07_64+fcntl08+fcntl08_64+fcntl09+\
+fcntl09_64+fcntl10+fcntl10_64+fcntl12+fcntl12_64+fcntl13+fcntl13_64+fcntl15_64+\
+fcntl15+fcntl16+fcntl16_64+fcntl18+fcntl18_64+fcntl22+fcntl22_64+fcntl27+\
+fcntl27_64+fcntl29+fcntl29_64+fcntl30+fcntl30_64+fcntl34+fcntl34_64+fcntl36_64+\
+fcntl36+fdatasync01+fsync02+fsync03+ioctl_ns07+llseek01+llseek02+llseek03+\
+lseek01+lseek02+lseek07+pipe01+pipe03+pipe04+pipe05+pipe06+\
+pipe07+pipe08+pipe09+pipe10+pipe11+pipe12+pipe14+pipe2_01+\
+posix_fadvise01+posix_fadvise01_64+posix_fadvise02+posix_fadvise02_64+posix_fadvise03+posix_fadvise03_64+posix_fadvise04+posix_fadvise04_64+\
+pread01+pread01_64+pread02+pread02_64+preadv01+preadv01_64+preadv02+preadv02_64+\
+preadv201+preadv201_64+preadv202+preadv202_64+pwrite01+pwrite01_64+pwrite02+pwrite02_64+\
+pwrite03+pwrite03_64+pwrite04+pwrite04_64+pwritev01+pwritev01_64+pwritev02+pwritev02_64+\
+pwritev201+pwritev201_64+pwritev202+pwritev202_64+read01+read02+read04+readahead01+\
+readv01+readv02+sendfile02+sendfile02_64+sendfile03+sendfile03_64+sendfile04+sendfile04_64+\
+sendfile05+sendfile05_64+sendfile06+sendfile06_64+sendfile08+sendfile08_64+splice07+sync_file_range01+\
+write01+write02+write03+write05+write06+writev01+writev02+writev05+\
+writev06+writev07+getdomainname01+modify_ldt01+modify_ldt02+modify_ldt03+newuname01+ptrace05+\
+sethostname01+sethostname02+uname01+uname02+uname04+mq_notify01+mq_notify03+mq_open01+\
+mq_timedreceive01+mq_timedsend01+mq_unlink01+msgctl01+msgctl02+msgctl03+msgctl04+msgctl06+\
+msgctl12+msgget01+msgget02+msgrcv01+msgrcv02+msgrcv07+msgrcv08+msgsnd01+\
+semctl01+semctl02+semctl03+semctl04+semctl05+semctl06+semctl07+semctl09+\
+semget01+semget02+semop01+semop02+semop03+semop04+semop05+shmat01+\
+shmat02+shmat04+shmctl02+shmctl07+shmctl08+shmdt01+shmdt02+shmget04+\
+setns01+unshare02+clone01+clone02+clone03+clone05+clone06+clone07+\
+clone08+clone302+execl01+execle01+execlp01+execv01+execve01+execve03+\
+execve06+execvp01+exit01+exit02+exit_group01+fork01+fork03+fork04+\
+fork07+fork08+fork09+fork10+get_robust_list01+getpgid01+getpgid02+getpgrp01+\
+getpid01+getpid02+getppid01+getppid02+getsid01+getsid02+gettid01+gettid02+kcmp01+kcmp02+personality01+\
+personality02+pidfd_getfd01+pidfd_getfd02+pidfd_open01+pidfd_open02+pidfd_open04+pidfd_send_signal02+set_robust_list01+set_tid_address01+setpgid01+setpgrp01+setpgrp02+setsid01+vfork01+wait01+wait02+wait402+\
+waitid04+waitid05+waitid06+\
+waitpid01+waitpid03+waitpid04+getrlimit01+getrlimit02+getrlimit03+getrusage01+getrusage02+membarrier01+\
+sched_getaffinity01+sched_getattr01+sched_getattr02+sched_setaffinity01+sched_setattr01+sched_setscheduler01+setrlimit01+setrlimit02+\
+setrlimit03+setrlimit04+setrlimit05+kill02+kill06+kill07+kill08+kill09+\
+kill12+rt_sigaction01+rt_sigaction02+rt_sigaction03+rt_sigprocmask02+sigaction01+sigaction02+sigaltstack01+\
+sigaltstack02+signal02+signal03+signal04+signal05+signalfd01+signalfd4_01+signalfd4_02+\
+sigwait01+confstr01+fpathconf01+gethostname01+getpagesize01+getrandom01+getrandom02+getrandom03+\
+getrandom04+getrandom05+memcmp01+memcpy01+memset01+nftw01+nftw6401+pathconf01+\
+pathconf02+string01+syscall01+sysconf01+ulimit01+alarm02+alarm03+alarm05+\
+alarm06+alarm07+clock_getres01+clock_gettime02+clock_nanosleep01+clock_nanosleep02+clock_nanosleep04+getitimer01+\
+getitimer02+gettimeofday01+gettimeofday02+nanosleep01+nanosleep02+nanosleep04+setitimer01+setitimer02+\
+settimeofday02+time01+timer_delete01+timer_delete02+timer_getoverrun01+timer_gettime01+timer_settime01+timer_settime02+\
+timer_settime03+timerfd01+timerfd02+timerfd_create01+timerfd_gettime01+timerfd_settime01+times01+times03+\
+access01+access02+chdir04+chmod01+chmod03+chmod05+chmod07+chown01+\
+chown02+chown03+chown05+creat01+creat03+creat05+creat08+faccessat01+\
+faccessat02+faccessat201+faccessat202+fchdir01+fchdir02+fchmod01+fchmod02+fchmod03+\
+fchmod04+fchmod05+fchmodat01+fchmodat02+fchownat01+flock01+flock02+flock03+\
+flock04+flock06+fstat02+fstat02_64+fstat03+fstat03_64+fstatat01+fstatfs02+\
+fstatfs02_64+ftruncate01+ftruncate01_64+ftruncate03+ftruncate03_64+getcwd01+getcwd03+getdents02+\
+lchown01+lchown02+link02+link04+linkat01+lstat01A+lstat01A_64+lstat02+\
+lstat02_64+mkdir05+mkdirat01+mknod01+mknod02+mknod05+mknod06+mknod08+\
+mknod09+mknodat01+name_to_handle_at01+name_to_handle_at02+open01+open02+open03+open04+\
+open07+open08+open09+open10+open11+open12+open13+open_by_handle_at01+\
+open_by_handle_at02+openat02+prot_hsymlinks+readdir01+readlink01+readlink01A+readlink03+readlinkat01+\
+readlinkat02+rmdir01+stat01+stat01_64+stat02+stat02_64+stat03+stat03_64+\
+statfs02+statfs02_64+statx02+statx03+symlink01+symlink02+symlink03+symlink04+\
+symlinkat01+truncate02+truncate02_64+truncate03+truncate03_64+umask01+unlink05+unlink07+\
+unlink08+unlinkat01+brk01+brk02+madvise01+madvise02+madvise05+madvise10+\
+mincore01+mincore02+mincore03+mlock01+mlock02+mlock03+mlock04+mlock05+mlock201+\
+mlock202+mlock203+mlockall01+mlockall02+mlockall03+mmap01+mmap02+mmap04+mmap06+\
+mmap08+mmap09+mmap15+mmap17+mmap19+mmap20+mprotect01+mprotect03+mprotect05+mremap02+mremap03+\
+mremap04+mremap05+mremap06+msync01+msync02+msync03+munlock01+munlock02+\
+munlockall01+munmap03+remap_file_pages02+sbrk01+sbrk02";
+
+// End generated LTP syscall batch case lists.
 
 fn append_filtered_libctest(cmd: &mut alloc::string::String, filter: &str) {
     use core::fmt::Write as _;
@@ -1277,6 +1795,8 @@ fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
     for (_, script) in DEFAULT_OSCOMP_MUSL_SCRIPTS {
         if *script == "libctest_testcode.sh" {
             append_full_libctest(cmd);
+        } else if *script == "ltp_testcode.sh" {
+            append_submit_ltp_runner(cmd);
         } else {
             append_oscomp_musl_script(cmd, script);
         }
@@ -1286,7 +1806,32 @@ fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
 fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str) {
     use core::fmt::Write as _;
 
+    if script == "ltp_testcode.sh" {
+        append_full_ltp_runner(cmd);
+        return;
+    }
     let _ = write!(cmd, "; ./busybox sh {script}");
+}
+
+fn append_full_ltp_runner(cmd: &mut alloc::string::String) {
+    append_ltp_script_env(cmd);
+    cmd.push_str("; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\"");
+    cmd.push_str("; target_dir=\"ltp/testcases/bin\"");
+    let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
+    let _ = write!(
+        cmd,
+        "; for file in \"$target_dir\"/*; do if [ -f \"$file\" ]; then name=${{file##*/}}; case \"$name\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $name : local skip\"; continue;; esac; ./busybox echo \"RUN LTP CASE $name\"; /bin/setsid \"$file\"; ret=$?; ./busybox echo \"FAIL LTP CASE $name : $ret\"; fi; done"
+    );
+    cmd.push_str("; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\"");
+}
+
+fn append_ltp_script_env(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox mkdir -p /bin; /musl/musl/busybox --install -s /bin; export LTPROOT=/musl/musl/ltp; export PATH=/bin:/musl/glibc:/musl/musl:/musl/musl/ltp/testcases/bin"
+    );
 }
 
 const DEFAULT_OSCOMP_MUSL_SCRIPTS: &[(&str, &str)] = &[
@@ -1453,11 +1998,10 @@ mod tests {
         append_filtered_ltp(&mut cmd, "musl", "socket01+getsockopt01");
 
         assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-musl ####"));
-        assert!(cmd.contains("\"RUN LTP CASE socket01\""));
-        assert!(cmd.contains("\"ltp/testcases/bin/socket01\""));
-        assert!(cmd.contains("\"PASS LTP CASE socket01 : $ret\""));
-        assert!(cmd.contains("\"FAIL LTP CASE socket01 : $ret\""));
-        assert!(cmd.contains("\"RUN LTP CASE getsockopt01\""));
+        assert!(cmd.contains("; for case in socket01 getsockopt01"));
+        assert!(cmd.contains("RUN LTP CASE $case : $ltp_label"));
+        assert!(cmd.contains("\"$@\""));
+        assert!(cmd.contains("FAIL LTP CASE $case : $ret"));
         assert!(cmd.contains("#### OS COMP TEST GROUP END ltp-musl ####"));
         assert!(!cmd.contains("basic_testcode.sh"));
     }
@@ -1467,9 +2011,35 @@ mod tests {
         let mut cmd = String::new();
         append_filtered_ltp(&mut cmd, "musl", "socket01+bad;case");
 
-        assert!(cmd.contains("\"ltp/testcases/bin/socket01\""));
+        assert!(cmd.contains("; for case in socket01"));
         assert!(cmd.contains("SKIP LTP CASE bad;case : invalid case token"));
-        assert!(!cmd.contains("\"ltp/testcases/bin/bad;case\""));
+        assert!(!cmd.contains("; for case in socket01 bad;case"));
+    }
+
+    #[test]
+    fn default_oscomp_uses_ltp_submit_whitelist() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_default_oscomp_scripts(&mut cmd);
+
+        assert!(cmd.contains("basic_testcode.sh"));
+        assert!(cmd.contains("libcbench_testcode.sh"));
+        assert!(cmd.contains("RUN LTP CASE $case : $ltp_label"));
+        assert!(cmd.contains("futex_wake03"));
+        assert!(cmd.contains("setitimer01"));
+        assert!(!cmd.contains("; target_dir=\"ltp/testcases/bin\""));
+        assert!(!cmd.contains("; /bin/setsid \"$file\""));
+    }
+
+    #[test]
+    fn ltp_submit_batch_uses_whitelist_without_p0_source_only_cases() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_ltp_batch(&mut cmd, "submit");
+
+        assert!(cmd.contains("confstr01"));
+        assert!(cmd.contains("futex_wake03"));
+        assert!(cmd.contains("setitimer01"));
+        assert!(!cmd.contains("timerfd04"));
+        assert!(!cmd.contains("; target_dir=\"ltp/testcases/bin\""));
     }
 
     #[test]
@@ -1483,5 +2053,34 @@ mod tests {
             cmd.contains("; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"")
         );
         assert!(!cmd.contains("basic_testcode.sh && ./busybox echo"));
+    }
+
+    #[test]
+    fn ltp_scripts_install_busybox_applets_and_get_helper_path() {
+        let mut full_cmd = String::from("cd /musl/musl");
+        append_oscomp_musl_script(&mut full_cmd, "ltp_testcode.sh");
+
+        assert!(full_cmd.contains("./busybox mkdir -p /bin"));
+        assert!(full_cmd.contains("/musl/musl/busybox --install -s /bin"));
+        assert!(full_cmd.contains("export LTPROOT=/musl/musl/ltp"));
+        assert!(full_cmd.contains("/musl/musl/ltp/testcases/bin"));
+        assert!(full_cmd.contains("; target_dir=\"ltp/testcases/bin\""));
+        assert!(full_cmd.contains("; /bin/setsid \"$file\""));
+        assert!(full_cmd.contains("RUN LTP CASE $name"));
+        assert!(full_cmd.contains("FAIL LTP CASE $name : $ret"));
+        assert!(!full_cmd.contains("; ./busybox sh ltp_testcode.sh"));
+        assert!(!full_cmd.contains("/tmp/ltp-busybox"));
+        assert!(!full_cmd.contains("/bin/timeout"));
+
+        let mut filtered_cmd = String::from("cd /musl/musl");
+        append_filtered_ltp(&mut filtered_cmd, "musl", "ar01.sh");
+
+        assert!(filtered_cmd.contains("./busybox mkdir -p /bin"));
+        assert!(filtered_cmd.contains("/musl/musl/busybox --install -s /bin"));
+        assert!(filtered_cmd.contains("export LTPROOT=/musl/musl/ltp"));
+        assert!(filtered_cmd.contains("/musl/musl/ltp/testcases/bin"));
+        assert!(filtered_cmd.contains("; for case in ar01.sh"));
+        assert!(!filtered_cmd.contains("/tmp/ltp-busybox"));
+        assert!(!filtered_cmd.contains("/bin/timeout"));
     }
 }

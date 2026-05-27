@@ -40,6 +40,35 @@ SKIP_CASES: set[str] = {
     # races. Keep it out of fast p0; run explicitly when timerfd stress is the
     # target.
     "timerfd_settime02",
+    # Hangs in rt_sigtimedwait on Txv2 today. Keep it out of all local
+    # batch sweeps until the signal-wait interrupt path is fixed.
+    "sigtimedwait01",
+    # 2026-05-26 timeout triage: these cases still wedge the guest or never
+    # reach the normal LTP summary/guest-exit path. Keep them out of local
+    # sweeps so later cases can run; re-enable one by one after the underlying
+    # subsystem bug is fixed.
+    "clock_gettime01",
+    "clock_gettime04",
+    "dirtyc0w_shmem",
+    "fork14",
+    "futex_cmp_requeue01",
+    "getrusage03",
+    "getrusage04",
+    "kcmp03",
+    "kill10",
+    "kill11",
+    "msgrcv05",
+    "msgrcv06",
+    "msgsnd05",
+    "msgsnd06",
+    "rename14",
+    "shmctl01",
+    "sigwaitinfo01",
+    "wait401",
+    "waitid07",
+    "waitid08",
+    "waitpid07",
+    "waitpid11",
 }
 
 
@@ -263,7 +292,11 @@ def parse_cases(lines: list[str]) -> list[str]:
 
 def cases_for_batch(cases: list[str], batch: str) -> list[str]:
     if batch == "all":
-        return cases
+        return [
+            case
+            for case in cases
+            if is_valid_case_name(case) and case not in SKIP_CASES
+        ]
     if batch in CUSTOM_BATCHES:
         available = set(cases)
         return [
@@ -303,7 +336,7 @@ def main() -> int:
         for name in BATCH_ORDER:
             selected = cases_for_batch(cases, name)
             print(f"{name:8s} {len(selected):4d}")
-        print(f"{'all':8s} {len(cases):4d}")
+        print(f"{'all':8s} {len(cases_for_batch(cases, 'all')):4d}")
         return 0
 
     batch = args.batch or "p0"

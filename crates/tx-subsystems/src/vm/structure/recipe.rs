@@ -402,8 +402,21 @@ fn rewrite_locked(
 
     for existing in entries.values().cloned() {
         if existing.range.overlaps(range) {
-            changed_pages += existing.range.page_count();
-            push_entry(&mut rewritten, existing.with_locked(locked));
+            let overlap =
+                range_intersection(existing.range, range).ok_or(VmMapError::MissingMapping)?;
+            changed_pages += overlap.page_count();
+            let rewrite = existing
+                .split_for_protect(overlap, existing.prot)
+                .map_err(vm_entry_error)?;
+            if let Some(before) = rewrite.before {
+                push_entry(&mut rewritten, before);
+            }
+            if let Some(target) = rewrite.target {
+                push_entry(&mut rewritten, target.with_locked(locked));
+            }
+            if let Some(after) = rewrite.after {
+                push_entry(&mut rewritten, after);
+            }
         } else {
             push_entry(&mut rewritten, existing);
         }

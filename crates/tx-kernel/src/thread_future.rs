@@ -632,7 +632,9 @@ pub async fn run_thread<P: TxPlatform>(
                     ctx = ctx.with_delegate_registry(dr);
                 }
                 let sigreturn_ctx = payload.saved_user_context();
+                payload.set_proc_sleeping(true);
                 let result = tx_shims::linux_syscall::dispatch::<P>(req, &ctx).await;
+                payload.set_proc_sleeping(false);
 
                 // Threshold-based observation dump. If the boot path
                 // installed a non-zero `OBSERVE_DUMP_THRESHOLD` (see

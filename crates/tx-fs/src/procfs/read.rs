@@ -1,14 +1,16 @@
 //! Content renderers for procfs pseudo-files.
 
 use crate::procfs::{
-    pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_stat_id, task_from_stat_id,
-    PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID, PROCFS_NET_ARP_ID,
-    PROCFS_NET_DEV_ID, PROCFS_NET_IF_INET6_ID, PROCFS_NET_NETLINK_ID, PROCFS_NET_NF_CONNTRACK_ID,
-    PROCFS_NET_RAW_ID, PROCFS_NET_ROUTE_ID, PROCFS_NET_SNMP_ID, PROCFS_NET_TCP_ID,
-    PROCFS_NET_TX_NF_RULES_ID, PROCFS_NET_UDP_ID, PROCFS_SYSVIPC_MSG_ID, PROCFS_SYSVIPC_SEM_ID,
-    PROCFS_SYSVIPC_SHM_ID, PROCFS_SYS_FS_LEASE_BREAK_TIME_ID, PROCFS_SYS_FS_PIPE_MAX_SIZE_ID,
+    pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_smaps_id, pid_from_stat_id,
+    pid_from_status_id, task_from_stat_id, PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID,
+    PROCFS_MOUNTS_ID, PROCFS_NET_ARP_ID, PROCFS_NET_DEV_ID, PROCFS_NET_IF_INET6_ID,
+    PROCFS_NET_NETLINK_ID, PROCFS_NET_NF_CONNTRACK_ID, PROCFS_NET_RAW_ID, PROCFS_NET_ROUTE_ID,
+    PROCFS_NET_SNMP_ID, PROCFS_NET_TCP_ID, PROCFS_NET_TX_NF_RULES_ID, PROCFS_NET_UDP_ID,
+    PROCFS_SYSVIPC_MSG_ID, PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID,
+    PROCFS_SYS_FS_LEASE_BREAK_TIME_ID, PROCFS_SYS_FS_PIPE_MAX_SIZE_ID,
     PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID, PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID,
-    PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYS_NET_IPV4_IP_FORWARD_ID, PROCFS_UPTIME_ID,
+    PROCFS_SYS_KERNEL_PID_MAX_ID, PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYS_NET_IPV4_IP_FORWARD_ID,
+    PROCFS_UPTIME_ID,
 };
 use alloc::format;
 use alloc::string::String;
@@ -33,6 +35,12 @@ pub fn render_with_netns(
     if let Some(pid) = pid_from_maps_id(fs_object_id) {
         return render_maps(pid);
     }
+    if let Some(pid) = pid_from_smaps_id(fs_object_id) {
+        return render_smaps(pid);
+    }
+    if let Some(pid) = pid_from_status_id(fs_object_id) {
+        return render_status(pid);
+    }
     if let Some((pid, fd)) = pid_from_fdinfo_id(fs_object_id) {
         return render_fdinfo(pid, fd);
     }
@@ -43,6 +51,7 @@ pub fn render_with_netns(
         PROCFS_MEMINFO_ID => render_meminfo(),
         PROCFS_CONFIG_ID => render_config(),
         PROCFS_SYS_KERNEL_TAINTED_ID => String::from("0\n"),
+        PROCFS_SYS_KERNEL_PID_MAX_ID => String::from("4194304\n"),
         PROCFS_SYS_FS_PIPE_MAX_SIZE_ID => String::from("4096\n"),
         PROCFS_SYS_FS_LEASE_BREAK_TIME_ID => String::from("45\n"),
         PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID => {
@@ -202,6 +211,109 @@ fn render_maps(pid: Pid) -> String {
     }
 
     out
+}
+
+fn render_smaps(pid: Pid) -> String {
+    use tx_subsystems::vm::{VmBacking, USER_PAGE_SIZE};
+
+    let Some(proc) = process::process_by_pid(pid) else {
+        return String::new();
+    };
+    let Some(aspace) = proc.aspace_cap() else {
+        return String::new();
+    };
+
+    let mut entries = aspace.recipes_snapshot();
+    entries.sort_by_key(|e| e.range.start());
+
+    let mut out = String::new();
+    for entry in entries {
+        let start = entry.range.start().as_usize();
+        let end = entry.range.end().as_usize();
+
+        let r = if entry.prot.read { 'r' } else { '-' };
+        let w = if entry.prot.write { 'w' } else { '-' };
+        let x = if entry.prot.execute { 'x' } else { '-' };
+        let p = if entry.flags.shared { 's' } else { 'p' };
+
+        let (offset, backing_desc) = match &entry.backing {
+            VmBacking::None => (0u64, "[none]"),
+            VmBacking::PrivateAnon => (0u64, "[anon]"),
+            VmBacking::Page { pc, offset: off } => {
+                use tx_subsystems::page_backed::PageContainerKind;
+                let desc = match pc.kind() {
+                    PageContainerKind::Anon { .. } => "[anon]",
+                    PageContainerKind::File { .. } => "[file]",
+                    PageContainerKind::Device { .. } => "[device]",
+                };
+                (*off, desc)
+            }
+        };
+
+        let size_kb = entry.range.page_count() * (USER_PAGE_SIZE / 1024);
+        let locked_kb = if entry.flags.locked { size_kb } else { 0 };
+
+        out.push_str(&format!(
+            "{:x}-{:x} {}{}{}{} {:08x} 00:00 0 {}\n",
+            start, end, r, w, x, p, offset, backing_desc,
+        ));
+        out.push_str(&format!(
+            "Size:           {:8} kB\n\
+             Rss:            {:8} kB\n\
+             Pss:            {:8} kB\n\
+             Shared_Clean:   {:8} kB\n\
+             Shared_Dirty:   {:8} kB\n\
+             Private_Clean:  {:8} kB\n\
+             Private_Dirty:  {:8} kB\n\
+             Referenced:     {:8} kB\n\
+             Anonymous:      {:8} kB\n\
+             Locked:         {:8} kB\n",
+            size_kb, size_kb, size_kb, 0, 0, size_kb, 0, size_kb, size_kb, locked_kb,
+        ));
+    }
+
+    out
+}
+
+fn render_status(pid: Pid) -> String {
+    let Some(proc) = process::process_by_pid(pid) else {
+        return String::new();
+    };
+    let state = proc.state_char() as char;
+    let name_buf = proc.comm();
+    let name =
+        core::str::from_utf8(&name_buf[..name_buf.iter().position(|&b| b == 0).unwrap_or(16)])
+            .unwrap_or("?");
+
+    let mut vm_lck_kb = 0usize;
+    if let Some(aspace) = proc.aspace_cap() {
+        for entry in aspace.recipes_snapshot() {
+            if entry.flags.locked {
+                vm_lck_kb += entry.range.page_count() * (tx_subsystems::vm::USER_PAGE_SIZE / 1024);
+            }
+        }
+    }
+
+    format!(
+        "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nThreads:\t{}\nVmLck:\t{:8} kB\n",
+        name,
+        state,
+        state_name(state),
+        pid.0,
+        pid.0,
+        proc.parent_pid().0,
+        proc.live_thread_count(),
+        vm_lck_kb,
+    )
+}
+
+const fn state_name(state: char) -> &'static str {
+    match state {
+        'R' => "running",
+        'S' => "sleeping",
+        'Z' => "zombie",
+        _ => "unknown",
+    }
 }
 
 fn render_fdinfo(pid: Pid, fd: u32) -> String {

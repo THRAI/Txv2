@@ -105,6 +105,8 @@ pub const NR_RT_SIGPROCMASK: u64 = 135;
 pub const NR_CAPGET: u64 = 90;
 /// `capset(hdrp, datap)`. Linux generic ABI `__NR_capset = 91`.
 pub const NR_CAPSET: u64 = 91;
+/// `personality(persona)`. Linux generic ABI `__NR_personality = 92`.
+pub const NR_PERSONALITY: u64 = 92;
 /// `fcntl(fd, cmd, arg)`. Linux generic ABI `__NR_fcntl` (= `__NR3264_fcntl`).
 ///
 /// Wave 2 of the ELF loader plan ships a minimal subset:
@@ -474,6 +476,10 @@ pub const NR_GET_ROBUST_LIST: u64 = 100;
 pub const NR_SCHED_SETAFFINITY: u64 = 122;
 /// `sched_getaffinity(pid, cpusetsize, mask)`. Linux generic ABI.
 pub const NR_SCHED_GETAFFINITY: u64 = 123;
+/// `sched_setattr(pid, attr, flags)`. Linux generic ABI.
+pub const NR_SCHED_SETATTR: u64 = 274;
+/// `sched_getattr(pid, attr, size, flags)`. Linux generic ABI.
+pub const NR_SCHED_GETATTR: u64 = 275;
 
 // ---------------------------------------------------------------------
 // Wave 3 of the fork/clone/wait4 slice — Part 3 (NR_WAIT4 syscall arm
@@ -690,9 +696,21 @@ pub const NR_MLOCK: u64 = 228;
 /// `munlock(addr, len)`. Linux RV64 generic ABI `__NR_munlock = 229`.
 /// Clears `VmEntryFlags.locked`.
 pub const NR_MUNLOCK: u64 = 229;
+/// `mlockall(flags)`. Linux RV64 generic ABI `__NR_mlockall = 230`.
+pub const NR_MLOCKALL: u64 = 230;
+/// `munlockall()`. Linux RV64 generic ABI `__NR_munlockall = 231`.
+pub const NR_MUNLOCKALL: u64 = 231;
+/// `mincore(addr, length, vec)`. Linux RV64 generic ABI
+/// `__NR_mincore = 232`.
+pub const NR_MINCORE: u64 = 232;
 /// `madvise(addr, length, advice)`. Linux RV64 generic ABI
 /// `__NR_madvise = 233`. Wraps `AddressSpace::madvise`.
 pub const NR_MADVISE: u64 = 233;
+/// `remap_file_pages(start, size, prot, pgoff, flags)`. Linux generic
+/// ABI `__NR_remap_file_pages = 234`.
+pub const NR_REMAP_FILE_PAGES: u64 = 234;
+/// `mlock2(addr, len, flags)`. Linux RV64 generic ABI `__NR_mlock2 = 284`.
+pub const NR_MLOCK2: u64 = 284;
 
 // ---------------------------------------------------------------------
 // `PROT_*` flag bits — Linux generic uapi `<sys/mman.h>`. Slice 2 acts
@@ -735,6 +753,9 @@ pub const MAP_SHARED: u64 = 0x01;
 /// `MAP_PRIVATE` — copy-on-write: modifications never propagate to the
 /// backing. Mutually exclusive with `MAP_SHARED`.
 pub const MAP_PRIVATE: u64 = 0x02;
+/// `MAP_SHARED_VALIDATE` — shared mapping plus strict unknown-flag
+/// validation (`EOPNOTSUPP` instead of silently ignoring unknown bits).
+pub const MAP_SHARED_VALIDATE: u64 = 0x03;
 /// `MAP_FIXED` — interpret `addr` as the exact placement; any existing
 /// mapping in the requested range is silently replaced
 /// (`MapPlacement::FixedReplace`).
@@ -1242,6 +1263,10 @@ pub const NR_PIDFD_OPEN: u64 = 434;
 /// `pidfd_send_signal(pidfd, sig, info, flags)` — Linux RV64.
 /// Phase J: returns `-ENOSYS`; TODO full implementation.
 pub const NR_PIDFD_SEND_SIGNAL: u64 = 424;
+/// `pidfd_getfd(pidfd, targetfd, flags)` — Linux RV64.
+pub const NR_PIDFD_GETFD: u64 = 438;
+/// `kcmp(pid1, pid2, type, idx1, idx2)` — Linux RV64.
+pub const NR_KCMP: u64 = 272;
 /// `uname(buf)`. Linux RV64 generic ABI `__NR_uname = 160`. Writes
 /// the static utsname (`sysname` / `nodename` / `release` / `version`
 /// / `machine` / `domainname`, each `[u8; 65]`) to `buf`. Slice 7
@@ -1261,6 +1286,8 @@ pub const NR_SETHOSTNAME: u64 = 161;
 /// (`RLIMIT_NOFILE = 1024 / 4096`, `RLIMIT_STACK = 8 MiB`, the rest
 /// `RLIM_INFINITY`) while fd helpers enforce the soft 1024 ceiling.
 pub const NR_PRLIMIT64: u64 = 261;
+/// `getrlimit(resource, rlim)` — Linux generic ABI old rlimit syscall.
+pub const NR_GETRLIMIT: u64 = 163;
 /// `getrandom(buf, buflen, flags)`. Linux RV64 generic ABI
 /// `__NR_getrandom = 278`. Fills `buf` with `buflen` bytes from the
 /// platform entropy source via `<P as EntropyIf>::fill_random`.
@@ -1729,12 +1756,6 @@ pub const NR_EPOLL_CREATE1: u64 = 20;
 /// `epoll_ctl(epfd, op, fd, event_ptr)`. Linux generic uapi
 /// `__NR_epoll_ctl = 21`. ADD, MOD, or DEL a monitored fd.
 pub const NR_EPOLL_CTL: u64 = 21;
-
-/// `epoll_wait(epfd, events, maxevents, timeout)`. The RV64/LA64
-/// generic ABI does not expose a separate raw `epoll_wait` syscall;
-/// musl implements `epoll_wait(3)` through `epoll_pwait(2)`. Keep the
-/// x86_64 value here as an unwired cross-reference.
-pub const NR_EPOLL_WAIT: u64 = 232;
 
 /// `epoll_pwait(epfd, events, maxevents, timeout, sigmask)`.
 /// Linux generic uapi `__NR_epoll_pwait = 22`. Block until ready

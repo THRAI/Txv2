@@ -429,7 +429,7 @@ fn phys_for_ppn(ppn: Ppn) -> Result<PhysAddr, VmPmapError> {
 
 fn permissions_for_prot(prot: Prot) -> PmapPermissions {
     let mut permissions = PmapPermissions::USER;
-    if prot.read {
+    if prot.read || prot.write {
         permissions = permissions.union(PmapPermissions::READ);
     }
     if prot.write {

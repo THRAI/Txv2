@@ -21,6 +21,7 @@ use tx_subsystems::vfs::structure::{
 };
 use tx_subsystems::vfs::{FsOps, OpenFile};
 
+use crate::linux_syscall::numbers::{EFD_NONBLOCK_FLAG, NR_EVENTFD2};
 use crate::linux_syscall::{
     AT_EMPTY_PATH, AT_FDCWD, NR_CHDIR, NR_FCHDIR, NR_FSTAT, NR_FSTATFS, NR_GETCWD, NR_GETDENTS64,
     NR_NEWFSTATAT, NR_STATFS, NR_STATX, NR_UMASK,
@@ -336,6 +337,33 @@ fn dispatch_fstat_on_chardev_fd_writes_rdev() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
     assert_eq!(read_u64_at(&statbuf, STAT_RDEV_OFF), 0x103);
+}
+
+/// `fstat(eventfd)` is legal on Linux anon-inode fds. It must not try
+/// to unwrap an `OpenFile::rnode()` from the eventfd backing.
+#[test]
+fn dispatch_fstat_on_eventfd_fd_writes_anon_inode_stat() {
+    let _setup = stat_setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let req = SyscallRequest::new(NR_EVENTFD2, [0, EFD_NONBLOCK_FLAG as u64, 0, 0, 0, 0]);
+    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("eventfd2: {other:?}"),
+    };
+
+    let mut statbuf = vec![0u8; STAT_BYTES];
+    let req = SyscallRequest::new(
+        NR_FSTAT,
+        [fd as u64, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(read_u32_at(&statbuf, STAT_MODE_OFF), 0o600);
+    assert_eq!(read_u32_at(&statbuf, STAT_NLINK_OFF), 1);
+    assert_eq!(read_u64_at(&statbuf, STAT_SIZE_OFF), 0);
 }
 
 /// `fstat(unknown_fd, statbuf)` returns `-EBADF`.

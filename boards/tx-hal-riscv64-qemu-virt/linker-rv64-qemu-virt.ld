@@ -78,7 +78,7 @@ SECTIONS
 
     .bss.stack (NOLOAD) : AT(ADDR(.bss.stack) - KERNEL_VIRT_OFFSET) ALIGN(4K) {
         __tx_boot_stack_bottom = .;
-        . += 1024K;
+        . += 2M;
         . = ALIGN(16);
         __tx_boot_stack_top = .;
     }

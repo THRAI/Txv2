@@ -3,7 +3,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tx_hal::{PmapIf, UserTrapContext};
 
@@ -302,6 +302,7 @@ pub fn bootstrap_init_process(
         BTreeMap::new(),
         BTreeSet::new(),
         (1024, 4096),
+        (u64::MAX, u64::MAX),
         crate::net::initial_net_namespace_payload(),
         BOOTSTRAP_BRK_BASE,
         BOOTSTRAP_BRK_BASE,
@@ -309,6 +310,7 @@ pub fn bootstrap_init_process(
         // mask defaults to `0o022` per Linux convention; children
         // inherit through `step_fork`'s umask thread-through.
         0o022,
+        0,
         Arc::new(SigActionTable::new()),
     )?;
     *proc_cap.payload.lock() = Some(payload);
@@ -388,10 +390,12 @@ pub fn step_fork_with_options<P: PmapIf>(
         parent_fds,
         parent_fd_cloexec,
         parent_rlimit_nofile,
+        parent_rlimit_memlock,
         parent_net_namespace,
         parent_brk_base,
         parent_current_brk,
         parent_umask,
+        parent_personality,
     ) = {
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
@@ -403,10 +407,12 @@ pub fn step_fork_with_options<P: PmapIf>(
             payload.clone_fds_for_fork(),
             payload.fd_cloexec_snapshot(),
             payload.rlimit_nofile(),
+            payload.rlimit_memlock(),
             payload.net_namespace(),
             payload.brk_base(),
             payload.current_brk(),
             payload.umask(),
+            payload.personality(),
         )
     };
     let parent_pgrp = parent.pgrp.lock().clone();
@@ -463,10 +469,12 @@ pub fn step_fork_with_options<P: PmapIf>(
         parent_fds,
         parent_fd_cloexec,
         parent_rlimit_nofile,
+        parent_rlimit_memlock,
         parent_net_namespace,
         parent_brk_base,
         parent_current_brk,
         parent_umask,
+        parent_personality,
         child_sig_actions,
     )
     .map_err(ForkError::Zone)?;
@@ -1238,10 +1246,12 @@ fn sign_process_payload(
     fds: BTreeMap<u32, Cap<OpenFile>>,
     fd_cloexec: BTreeSet<u32>,
     rlimit_nofile: (u32, u32),
+    rlimit_memlock: (u64, u64),
     net_namespace: PayloadCap<crate::net::NetNamespacePayload>,
     brk_base: u64,
     current_brk: u64,
     umask: u16,
+    personality: u32,
     sig_actions: Arc<SigActionTable>,
 ) -> Result<PayloadCap<ProcessPayload>, ZoneError> {
     use crate::process::adapter::step_engine::AtomicSlot;
@@ -1308,6 +1318,8 @@ fn sign_process_payload(
         fd_cloexec: SpinMutex::new(fd_cloexec),
         rlimit_nofile_cur: AtomicU32::new(rlimit_nofile.0),
         rlimit_nofile_max: AtomicU32::new(rlimit_nofile.1),
+        rlimit_memlock_cur: AtomicU64::new(rlimit_memlock.0),
+        rlimit_memlock_max: AtomicU64::new(rlimit_memlock.1),
         brk_base: core::sync::atomic::AtomicU64::new(brk_base),
         current_brk: core::sync::atomic::AtomicU64::new(current_brk),
         // Slice 6 of the shell-prompt roadmap. Per-process
@@ -1318,6 +1330,7 @@ fn sign_process_payload(
         // per-process, copied across fork). `step_exec` preserves
         // the umask (umask survives `exec` per POSIX).
         umask: core::sync::atomic::AtomicU16::new(umask & 0o777),
+        personality: core::sync::atomic::AtomicU32::new(personality),
         sem_undos: SpinMutex::new(BTreeMap::new()),
         exit_source,
         exit_source_id,

@@ -8,11 +8,11 @@ Scoring note: local scoring follows the official `judge_ltp-musl.py` where possi
 
 | Scope | Score | Note |
 | --- | ---: | --- |
-| fd-io accumulated local score | `834/1186` | Stitched from segmented runs; not a single official full-batch run |
+| fd-io accumulated local score | `852/1208` | Stitched from segmented runs; not a single official full-batch run |
 
 Recorded through the end of the current fd-io case list. Latest changes included targeted positioned-I/O fixes, the conservative `splice` fix that raised `splice07` to `217/377`, legacy LTP scoring fallback for old no-summary cases, `fallocate` support, validation-only `readahead`/`sync_file_range`, `sendfile03/04/05` errno validation, refreshed `posix_fadvise02/04` scores, a `/bin/cat` shim that unblocks `posix_fadvise01/03`, page-backed `O_APPEND` handling for write/pwrite, basic page-backed `copy_file_range`, and `preadv2/pwritev2` support.
 
-Temporarily skipped in the guest-side broad batch to avoid hangs: `fcntl15`, `fcntl15_64`, `fcntl36`, `fcntl36_64`, and `pipe02`.
+Timeout triage on 2026-05-26 ran the broad-batch skipped cases as single cases. `fcntl15`/`fcntl15_64` and `pipe02` now fail cleanly with checkpoint timeouts; `fcntl36`/`fcntl36_64` pass as single cases and did not reproduce the broad-batch OFD lock hang.
 
 ## Case Table
 
@@ -73,8 +73,8 @@ Temporarily skipped in the guest-side broad batch to avoid hangs: `fcntl15`, `fc
 | `fcntl13_64` | 4/4 | pass |  |
 | `fcntl14` | 0/1 | fail | legacy no-summary case; return code 1 |
 | `fcntl14_64` | 0/1 | fail | legacy no-summary case; return code 1 |
-| `fcntl15_64` | 0/0 | skipped | skipped in broad batch: checkpoint hang |
-| `fcntl15` | 0/0 | skipped | skipped in broad batch: checkpoint hang |
+| `fcntl15_64` | 2/3 | partial | single-case timeout triage: lock-conflict checks pass, then `tst_checkpoint_wait(0,10000)` returns ETIMEDOUT; exits cleanly |
+| `fcntl15` | 2/3 | partial | single-case timeout triage: lock-conflict checks pass, then `tst_checkpoint_wait(0,10000)` returns ETIMEDOUT; exits cleanly |
 | `fcntl16` | 1/1 | pass | legacy no-summary case; return code 0 |
 | `fcntl16_64` | 1/1 | pass | legacy no-summary case; return code 0 |
 | `fcntl17` | 0/1 | fail | legacy no-summary case; return code 1 |
@@ -113,8 +113,8 @@ Temporarily skipped in the guest-side broad batch to avoid hangs: `fcntl15`, `fc
 | `fcntl34_64` | 1/1 | pass |  |
 | `fcntl35` | 0/1 | fail | /proc/sys/fs/pipe-max-size missing |
 | `fcntl35_64` | 0/1 | fail | /proc/sys/fs/pipe-max-size missing |
-| `fcntl36_64` | 0/0 | skipped | skipped in broad batch: OFD lock hang |
-| `fcntl36` | 0/0 | skipped | skipped in broad batch: OFD lock hang |
+| `fcntl36_64` | 7/7 | pass | single-case timeout triage: OFD/POSIX lock combinations all synchronized; broad-batch hang not reproduced |
+| `fcntl36` | 7/7 | pass | single-case timeout triage: OFD/POSIX lock combinations all synchronized; broad-batch hang not reproduced |
 | `fcntl37` | 0/1 | fail | /proc/sys/fs/pipe-max-size missing |
 | `fcntl37_64` | 0/1 | fail | /proc/sys/fs/pipe-max-size missing |
 | `fcntl38` | 0/1 | fail | CONFIG_DNOTIFY missing |
@@ -160,7 +160,7 @@ Temporarily skipped in the guest-side broad batch to avoid hangs: `fcntl15`, `fc
 | `lseek07` | 2/2 | pass |  |
 | `lseek11` | 0/1 | fail | pwrite ENOSYS |
 | `pipe01` | 1/1 | pass |  |
-| `pipe02` | 0/0 | skipped | skipped in broad batch: checkpoint timeout/trap |
+| `pipe02` | 0/2 | fail | single-case timeout triage: `tst_checkpoint_wait` and `tst_checkpoint_wake` both hit ETIMEDOUT; LTP kills case and exits cleanly |
 | `pipe03` | 2/2 | pass | fixed wrong-end read/write errno to EBADF |
 | `pipe04` | 1/1 | pass | legacy no-summary case; return code 0 |
 | `pipe05` | 1/1 | pass | legacy no-summary case; return code 0 |
