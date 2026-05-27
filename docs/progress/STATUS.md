@@ -1,3 +1,558 @@
+- 2026-05-27 **Picked up the remaining futex stabilization caveats.**
+  `make oscomp-rv64-pthread-pi-condvar` now builds the RV64 kernel before
+  submit, injects a dedicated `pthread_pi_condvar_testcode.sh`, selects
+  `tx.oscomp.groups=pthread-pi-condvar`, and scores the run with
+  `tools/guest-tests/judge_pthread-pi-condvar.py` through
+  `tools/oscomp-judge.py`. The judged guest run produced
+  `[pthread-pi-condvar] 1/1`, `userspace:exited:0`, and no decoded trap lines
+  in `target/oscomp/os_serial_out_pthread_pi_condvar_judged_20260527.txt`.
+  The LTP caveat is now a concrete discovery lane: `tools/build-slim-sdcard.py`
+  works under system Python 3.9, preserves ext4 regular-file mode bits, includes
+  the musl `lib/` directory for dynamic LTP binaries, and `make
+  oscomp-rv64-ltp-futex` records the 17-case futex/robust subset shape. Current
+  LTP evidence reaches all selected cases; most return `TBROK` on missing
+  `/proc/meminfo`, while `set_robust_list01` exits `0`, with guest userspace
+  exit `0` and no decoded trap lines in
+  `target/oscomp/os_serial_out_ltp_futex_20260527.txt`. **Next step:** fill the
+  procfs `/proc/meminfo` surface before treating LTP futex failures as futex
+  semantic failures. **Blocker:** full `SCHED_DEADLINE` remains a scheduler
+  Phase 3 EDF/admission-control item, not a futex merge blocker.
+
+- 2026-05-27 **Promoted futex Linux-compat stabilization toward merge
+  readiness.** Added a reusable `make oscomp-rv64-pthread-pi-condvar`
+  entrypoint for the branch-local PI-condvar guest helper while preserving
+  private sdcard-copy behavior; cleaned stale shim/progress wording that still
+  described implemented PI/futex2 paths as deferred; and added
+  `docs/progress/plans/2026-05-27-futex-linux-compat-stabilization.json` to
+  track merge-readiness evidence separately from implementation plans.
+  **Verified:** `make -n oscomp-rv64-pthread-pi-condvar`, `cargo test
+  -p tx-shims futex_dispatch -- --test-threads=1`, `cargo test -p
+  tx-subsystems futex -- --test-threads=1`, `cargo test -p tx-subsystems
+  --test v3_futex_waitsource -- --test-threads=1`, `cargo test -p tx-reactor
+  pi_waiter -- --test-threads=1`, `cargo test -p tx-reactor scheduler --
+  --test-threads=1`, `make oscomp-rv64-pthread-pi-condvar`, and focused
+  libctest pthread condvar/robust/cancel RV64 QEMU slices. Guest logs:
+  `target/oscomp/os_serial_out_pthread_pi_condvar_stabilize_20260527.txt`,
+  `target/oscomp/os_serial_out_futex_pthread_stabilize_20260527.txt`, and
+  `target/oscomp/os_serial_out_futex_pthread_cancel_stabilize_20260527.txt`;
+  all exited userspace with status `0`, and fault-decode found no trap lines
+  in the current pthread evidence logs. Final gates also passed: `cargo fmt
+  --check`, `cargo -q xtask unit`, `cargo xtask progress validate`, and `git
+  diff --check`. **Next step:** merge/review the futex Linux-compat branch or
+  add optional broader LTP/futex selftest coverage from a prepared canonical
+  OSComp testdata image. **Blocker:** none for classic/PI futex stabilization;
+  full `SCHED_DEADLINE`, upstream OSComp judge integration for the PI-condvar
+  helper, and broader LTP/futex selftest coverage remain follow-up work.
+
+- 2026-05-26 **Replaced futex PI's vector donation model with a Linux-style
+  `rt_mutex` priority-tree/task-`pi_waiters` model.**
+  `FutexPiTable` now maps each PI futex key to a `FutexPiLockState` with
+  stable waiter IDs, `waiters_by_order`, `waiters_by_id`, and a cached
+  `top_waiter`; `FUTEX_UNLOCK_PI` pops that cached top waiter for handoff and
+  retargets only the remaining top waiter to the new owner. The scheduler now
+  stores task-level `pi_waiters` keyed by owned-futex identity, recomputes
+  effective RT priority from base plus the highest top waiter, and exposes
+  `upsert_pi_waiter` / `remove_pi_waiter` through the reactor-priority seam.
+  Timeout/cancel/requeue cleanup updates the per-lock tree and down-propagates
+  owner-chain deboost when a top waiter's effective priority changes to zero.
+  **Verified:** red/green `cargo test -p tx-reactor pi_waiter --
+  --test-threads=1`, `cargo test -p tx-reactor scheduler --
+  --test-threads=1`, `cargo test -p tx-subsystems futex --
+  --test-threads=1`, `cargo test -p tx-subsystems --test
+  v3_futex_waitsource -- --test-threads=1`, `cargo test -p tx-shims
+  futex_dispatch -- --test-threads=1`, `cargo fmt --check`, `cargo -q xtask
+  unit`, `cargo xtask progress validate`, and `git diff --check`. Follow-up
+  guest evidence now includes the focused libctest pthread condvar/robust slice
+  and an injected static RV64 musl `PTHREAD_PRIO_INHERIT` condvar test that
+  returned status `0` under QEMU. **Next step:** turn the one-off injected
+  PI-condvar test into a reusable guest regression harness if this should stay
+  gated. **Blocker:** deadline priority remains represented by API space rather
+  than complete runtime semantics.
+
+- 2026-05-26 **Implemented explicit PI futex owner-chain deadlock detection
+  and nested donation deboost cleanup.** `FUTEX_LOCK_PI` now walks the current
+  PI waiter owner chain before publishing a new blocked edge and returns
+  Linux-compatible `EDEADLK` for A->B->A cycles without enqueueing a bogus
+  waiter. `FUTEX_CMP_REQUEUE_PI` performs the same target-owner chain check
+  before removing `WAIT_REQUEUE_PI` source rows, so cycle errors preserve the
+  source waiter and ordinary source `FUTEX_WAKE` still resumes it with
+  `EAGAIN`. PI waiter timeout/cancel cleanup now remembers the removed
+  `blocked_owner_tid`, drops the exact donation token, and re-propagates from
+  that owner so nested owners are deboosted after both direct `LOCK_PI`
+  cancellation and requeued PI timeout. **Verified:** red/green focused
+  cycle/deboost tests, `cargo test -p tx-shims futex_dispatch --
+  --test-threads=1`, `cargo test -p tx-subsystems futex -- --test-threads=1`,
+  `cargo test -p tx-subsystems --test v3_futex_waitsource --
+  --test-threads=1`, `cargo fmt --check`, `cargo -q xtask unit`, and
+  `cargo xtask progress validate`, and `git diff --check`. **Next step:**
+  gather guest pthread PI-condvar evidence or replace the current waiter-vector
+  scan with a real Linux-style priority waiter structure if that fidelity is
+  needed. **Blocker:** still not a full Linux `rt_mutex`
+  priority-tree/task-`pi_waiters` model.
+
+- 2026-05-26 **Planned the next futex PI Linux-compat slice for explicit
+  deadlock detection and nested deboost cleanup.**
+  `docs/progress/plans/2026-05-26-futex-pi-cycle-cleanup.json` now tracks the
+  TDD order for owner-chain `EDEADLK`, `CMP_REQUEUE_PI` source-row
+  preservation on cycle errors, and timeout/cancel donation down-propagation
+  for direct `LOCK_PI` and requeued PI waiters. The reference pass pins Linux
+  behavior to `rt_mutex_adjust_prio_chain()`, `remove_waiter()`, and
+  `futex_requeue()`/`rt_mutex_start_proxy_lock()` rather than treating Tx's
+  bounded donation refresh as full `rt_mutex`. **Verified:** `git diff
+  --check`; `cargo xtask progress validate` initially caught and then passed
+  after a schema-only scope entry fix in the new plan.
+  **Next step:** implement plan step 1, the red `EDEADLK` owner-chain cycle
+  test. **Blocker:** no full Linux priority-tree waiter model or guest pthread
+  PI evidence yet.
+
+- 2026-05-26 **Switched PI futex unlock handoff from FIFO to effective
+  RT-priority order.** `FUTEX_UNLOCK_PI` now selects the waiter with the
+  highest scheduler effective RT priority and falls back to FIFO sequence only
+  for ties, so a later high-priority waiter is handed the PI futex before an
+  earlier lower-priority waiter. Existing requeue-donation retarget coverage
+  was updated to assert the same priority-ordered handoff: the high-priority
+  requeued waiter becomes the new owner first, then lower-priority remaining
+  waiters donate to that new owner until their turn. **Verified:** red/green
+  `cargo test -p tx-shims hands_off_to_highest_priority_waiter --
+  --test-threads=1 --nocapture`, focused retarget regression, `cargo test -p
+  tx-shims futex_dispatch -- --test-threads=1`, `cargo test -p tx-subsystems
+  futex -- --test-threads=1`, `cargo fmt --check`, and `cargo -q xtask unit`.
+  **Next step:** explicit PI cycle/deadlock detection and nested
+  timeout/cancel down-propagation coverage. **Blocker:** this is priority
+  selection at handoff time over the current waiter vector, not a complete
+  Linux `rt_mutex` wait-queue implementation.
+
+- 2026-05-26 **Added bounded PI owner-chain priority propagation for nested
+  futex waits.** PI waiter rows now remember the owner TID they are blocked
+  behind, and futex refreshes that row's scheduler donation when the waiter
+  inherits a stronger effective RT priority. This lets a high-priority waiter
+  blocked on owner B propagate through B when B is itself blocked on owner A,
+  covering both direct `FUTEX_LOCK_PI` nesting and `FUTEX_CMP_REQUEUE_PI`
+  requeue onto a blocked target owner. The syscall futex test setup now resets
+  futex wait tables so default parallel `tx-shims` unit runs do not reuse stale
+  PI rows with recycled test TIDs. **Verified:** red/green `cargo test -p
+  tx-shims propagates_priority_through_blocked_owner_chain -- --test-threads=1
+  --nocapture`, red/green `cargo test -p tx-shims blocked_target_owner --
+  --test-threads=1 --nocapture`, then `cargo test -p tx-subsystems futex --
+  --test-threads=1`, `cargo test -p tx-shims futex_dispatch --
+  --test-threads=1`, `cargo fmt --check`, and `cargo -q xtask unit`. **Next
+  step:** add explicit PI cycle/deadlock detection and priority-ordered waiter
+  handoff. **Blocker:** chain propagation is bounded donation refresh over the
+  current FIFO waiter table, not a full Linux `rt_mutex` implementation.
+
+- 2026-05-26 **Tightened PI futex owner lookup to return Linux-compatible
+  `ESRCH`.** `FUTEX_LOCK_PI` and `FUTEX_TRYLOCK_PI` now reject a futex word
+  whose owner TID does not resolve to a live thread payload, matching Linux's
+  "thread ID in the futex word does not exist" error. `FUTEX_CMP_REQUEUE_PI`
+  performs the same live-owner check on a contended PI target before removing
+  source waiters, so the `ESRCH` path leaves `WAIT_REQUEUE_PI` waiters parked
+  on the source futex and still wakeable by ordinary `FUTEX_WAKE` with
+  `EAGAIN`. **Verified:** red/green `cargo test -p tx-shims
+  esrch_for_unknown_owner_tid -- --test-threads=1 --nocapture`, red/green
+  `cargo test -p tx-shims unknown_target_owner_tid -- --test-threads=1
+  --nocapture`, then `cargo test -p tx-subsystems futex -- --test-threads=1`,
+  `cargo test -p tx-shims futex_dispatch -- --test-threads=1`, `cargo fmt
+  --check`, and `cargo -q xtask unit`. **Next step:** bounded PI owner-chain
+  donation/deadlock detection and priority-ordered handoff. **Blocker:** this
+  is owner-existence validation only; it does not yet propagate donations
+  through nested PI futex owners.
+
+- 2026-05-26 **Extended futex PI scheduler donation through PI requeue.**
+  `FUTEX_CMP_REQUEUE_PI` now creates the same scheduler donation edge for
+  waiters moved from a source futex onto a contended PI target, and PI unlock
+  retargets remaining requeued waiter donations to the newly handed-off owner
+  instead of leaking boost state on the old owner. The focused dispatch tests
+  bind real reactor tasks for the source owner, target owner, and requeued
+  waiters: one proves a requeued RT waiter boosts a contended target owner,
+  and another proves unlock drops the old-owner boost while preserving the
+  remaining donation on the new owner. **Verified:** `cargo fmt --check`,
+  `cargo test -p tx-shims futex_dispatch -- --test-threads=1`, `cargo test
+  -p tx-subsystems futex -- --test-threads=1`, and `cargo -q xtask unit`.
+  **Next step:** implement bounded owner-chain propagation and Linux-compatible
+  PI `ESRCH`/cycle detection. **Blocker:** PI waiters are still direct
+  donation edges with FIFO handoff, not a full Linux `rt_mutex` priority queue.
+
+- 2026-05-26 **Wired direct futex PI waits into scheduler priority donation.**
+  PI waiter rows now carry optional scheduler donation tokens. When
+  `FUTEX_LOCK_PI` blocks behind a live owner and both owner/waiter TIDs have
+  bound reactor `TaskKey`s, futex donates the waiter task's effective RT
+  priority to the owner task through the `reactor_priority` seam; timeout,
+  cancel, reset, and unlock handoff revoke the exact token. Unlock handoff also
+  retargets remaining waiter donations to the newly handed-off owner. A new
+  syscall dispatch test binds real reactor tasks to owner/waiter threads and
+  proves an RT waiter boosts the owner to priority 40 while blocked, then drops
+  the owner back to 0 after `FUTEX_UNLOCK_PI` hands the word to the waiter.
+  **Verified:** red/green `cargo test -p tx-shims
+  dispatch_futex_pi_lock_donates_priority_until_unlock_handoff --
+  --test-threads=1 --nocapture`, then `cargo fmt --check`, `cargo test -p
+  tx-subsystems futex -- --test-threads=1`, `cargo test -p tx-shims
+  futex_dispatch -- --test-threads=1`, `cargo test -p tx-reactor --test
+  scheduler -- --test-threads=1`, and `cargo -q xtask unit`. **Next step:**
+  extend the same donation evidence to PI requeue and owner-chain propagation,
+  then add Linux-compatible `ESRCH`/cycle handling once owner lookup is enforced
+  for all PI paths. **Blocker:** this is direct owner donation only; it does not
+  yet propagate through nested PI owners.
+
+- 2026-05-26 **Added the thread-task and reactor-priority bridge needed before
+  futex PI can donate scheduler priority.** `ThreadPayload.task` is now a real
+  boot/clone-submission binding rather than a dormant field: thread-runtime can
+  resolve TID → `ThreadIdentity` → live payload → `TaskKey`, the kernel
+  reactor-submission path binds submitted tasks through that API, and affinity
+  lookup no longer depends on a kernel-private TID map. `tx-reactor` now exposes
+  donation/drop/effective-priority methods on `Reactor`, and `tx-subsystems`
+  has a `reactor_priority` seam installed by `tx-kernel` beside the clone and
+  affinity seams. **Verified:** red/green
+  `cargo test -p tx-subsystems
+  thread_task_lookup_tracks_payload_binding_and_zombie_clear -- --test-threads=1
+  --nocapture`, then `cargo test -p tx-subsystems thread_runtime --
+  --test-threads=1`, `cargo test -p tx-kernel
+  reactor_submission_seam_submits_child_thread_smoke -- --test-threads=1
+  --nocapture`, `cargo test -p tx-reactor reactor_priority_donation_facade --
+  --test-threads=1 --nocapture`, and `cargo test -p tx-subsystems
+  priority_donation_seam_installs_function_pointer -- --test-threads=1
+  --nocapture`. **Next step:** extend PI futex waiter rows with waiter/owner
+  `TaskKey` plus donation tokens, then donate on PI block and revoke on
+  unlock/timeout/cancel/owner death. **Blocker:** futex PI still has not wired
+  these APIs, and owner-chain propagation/deadlock detection remains open.
+
+- 2026-05-26 **Added the first scheduler priority-donation substrate for futex
+  PI follow-up.** `tx-reactor` now has explicit priority donation tokens,
+  `PriorityBoostError`, per-task active donation rows, effective RT priority
+  recomputation, and runnable selection that picks the highest effective RT
+  priority task from fair queues before ordinary FIFO fair work. This gives
+  futex PI a real scheduler API to target later instead of overloading
+  `WakeHint::PriorityBoost`; donation revocation recomputes down to the next
+  highest donation or the task's base RT priority. **Verified:** red first on
+  the new `priority_donation_*` scheduler tests while the API was missing,
+  then green with `cargo test -p tx-reactor priority_donation --
+  --test-threads=1 --nocapture`, `cargo test -p tx-reactor --test scheduler
+  -- --test-threads=1`, `cargo test -p tx-reactor -- --test-threads=1`,
+  and `cargo -q xtask unit`. **Next step:** expose a thread-runtime/kernel
+  lookup path from TID/`ThreadPayload` to reactor `TaskKey` and then connect
+  futex PI owner/waiter rows to these donation tokens. **Blocker:** futex PI
+  still does not call the scheduler donation API, and owner-chain propagation
+  is not implemented.
+
+- 2026-05-26 **Implemented the first Linux-compatible PI requeue futex
+  slice.** `FUTEX_WAIT_REQUEUE_PI` and `FUTEX_CMP_REQUEUE_PI` no longer
+  return blanket `-ENOSYS`: the futex subsystem now has a `WaitRequeuePi`
+  waiter kind, a small resume-state table so ordinary source `FUTEX_WAKE`
+  resumes waiters with `-EAGAIN`, and PI requeue movement into the existing
+  `PI_WAITERS` handoff path. The syscall layer now validates Linux-visible
+  cases (`nr_wake == 1`, source/target key mismatch, compare mismatch), lets
+  an uncontended PI target acquire for the top waiter, and lets a contended
+  PI target hand off through `FUTEX_UNLOCK_PI`. Follow-up hardening covered
+  multi-waiter `1 + nr_requeue` movement plus timeout/cancel cleanup for the
+  `FutexWaitRequeuePiOp` waiter row. **Verified:** red first on the new
+  `tx-shims` PI requeue dispatch cases while both ops still returned
+  `-ENOSYS`, then green with `cargo test -p tx-shims futex_dispatch --
+  --test-threads=1`, `cargo test -p tx-subsystems futex -- --test-threads=1`,
+  `cargo test -p tx-subsystems --test v3_futex_waitsource --
+  --test-threads=1`, `cargo fmt --check`, `cargo -q xtask unit`, and `cargo
+  xtask test smoke --target rv64-qemu --timeout-ms 30000`. **Next step:**
+  either gather guest pthread PI-condvar evidence if a suitable test corpus is
+  available, or start Track B scheduler donation APIs. **Blocker:** real
+  scheduler priority inheritance is still absent; this is futex word/waiter
+  handoff only, not full Linux rt_mutex PI.
+
+- 2026-05-26 **Planned PI requeue and real scheduler priority boosting from the
+  current futex worktree state.** Added
+  `docs/progress/research/2026-05-26-futex-pi-requeue-priority-boost-readiness.md`
+  with Linux behavior anchors for `FUTEX_WAIT_REQUEUE_PI` /
+  `FUTEX_CMP_REQUEUE_PI`, a two-track implementation order, and a readiness
+  verdict. **Finding:** txKernel is mostly ready for PI requeue
+  word/waiter semantics using the current futex tables and mailbox waits, but
+  it is not ready for real priority inheritance: the reactor has
+  `SchedClass`, `rt_priority`, and `WakeHint::PriorityBoost` scaffolding, while
+  effective-priority mutation, TID-to-task lookup, runqueue ordering, and
+  owner-chain donation are still missing. **Verified:** `cargo xtask
+  progress validate` and `git diff --check` for this documentation-only
+  planning slice. **Next step:** implement Track A PI requeue semantics
+  without claiming full scheduler PI. **Blocker:** real Linux rt_mutex
+  compatibility requires Track B scheduler / thread-runtime API work first.
+
+- 2026-05-26 **Wired `FUTEX_LOCK_PI2` into the PI handoff path.** Linux's
+  syscall dispatcher treats `FUTEX_LOCK_PI` and `FUTEX_LOCK_PI2` as the
+  same `futex_lock_pi` operation after timeout/clock handling; txKernel now
+  routes `FUTEX_LOCK_PI2` through the existing mailbox-backed PI waiter
+  handoff for the no-timeout case and validates the timeout pointer surface.
+  A contended absolute-zero timeout returns `-ETIMEDOUT`, while PI requeue
+  ops remain explicit `-ENOSYS`. **Verified:** red/green `cargo test -p
+  tx-shims futex_lock_pi2 -- --test-threads=1 --nocapture`, then `cargo
+  test -p tx-shims futex_dispatch -- --test-threads=1`, `cargo test -p
+  tx-subsystems futex -- --test-threads=1`, `cargo test -p tx-subsystems
+  --test v3_futex_waitsource -- --test-threads=1`, `cargo fmt --check`,
+  `cargo -q xtask unit`, `cargo xtask progress validate`, `git diff
+  --check`, and `cargo xtask test smoke --target rv64-qemu --timeout-ms
+  30000`. **Next step:** choose between PI requeue or priority-inheritance
+  scheduler hooks. **Blocker:** this still lacks real scheduler priority
+  boosting and the requeue-PI operations are intentionally unimplemented.
+
+- 2026-05-26 **Added blocking PI futex handoff for the classic
+  `FUTEX_LOCK_PI`/`FUTEX_UNLOCK_PI` path.** Contended `FUTEX_LOCK_PI`
+  now publishes a PI waiter row, sets `FUTEX_WAITERS` while the current
+  owner still holds the word, parks through the v3 mailbox-backed
+  wait-source driver, and `FUTEX_UNLOCK_PI` transfers the futex owner word
+  to the next waiter before waking it. `FUTEX_TRYLOCK_PI` remains
+  nonblocking and returns `-EAGAIN` for a foreign owner; owner self-lock
+  still returns `-EDEADLK`. **Verified:** red/green
+  `cargo test -p tx-shims
+  linux_syscall::tests::futex_dispatch::dispatch_futex_pi_lock_blocks_and_unlock_hands_off_to_waiter
+  -- --test-threads=1 --nocapture`, then `cargo test -p tx-shims
+  futex_dispatch -- --test-threads=1`, `cargo test -p tx-subsystems futex
+  -- --test-threads=1`, `cargo test -p tx-subsystems --test
+  v3_futex_waitsource -- --test-threads=1`, `cargo fmt --check`, and
+  `cargo -q xtask unit`, `cargo xtask progress validate`, `git diff
+  --check`, and `cargo xtask test smoke --target rv64-qemu --timeout-ms
+  30000`. **Next step:** design the real PI follow-up. **Blocker:** this is
+  FIFO PI ownership handoff only; scheduler priority boosting,
+  `FUTEX_WAIT_REQUEUE_PI`, `FUTEX_CMP_REQUEUE_PI`, and `FUTEX_LOCK_PI2`
+  remain intentionally incomplete.
+
+- 2026-05-26 **Completed the non-PI futex2 syscall surface for 32-bit
+  futex words.** Syscall `456` now parses the Linux two-entry
+  `struct futex_waitv` requeue ABI, requires syscall flags `0`, validates
+  both entries as `FUTEX_32` plus optional `FUTEX_PRIVATE_FLAG`, compares the
+  source futex against entry 0's `val`, then reuses the exact waiter-table
+  `step_futex_requeue_in` path to wake `nr_wake` and move `nr_requeue`
+  waiters to entry 1's futex key. This closes the previously deferred futex2
+  non-PI trio (`454/455/456`) for the 32-bit word subset; wider futex sizes
+  remain unsupported by validation. **Verified:** red first on `cargo test -p
+  tx-shims futex2_requeue -- --test-threads=1` while syscall `456` still
+  returned `-ENOSYS`, then green after implementation. **Next step:** rerun
+  the full futex/progress/unit/smoke gate and then start the real PI/rt_mutex
+  design slice. Follow-up gate passed: `cargo fmt --check`, `cargo test -p
+  tx-shims futex_dispatch -- --test-threads=1`, `cargo test -p tx-subsystems
+  futex -- --test-threads=1`, `cargo test -p tx-subsystems --test
+  v3_futex_waitsource -- --test-threads=1`, `cargo -q xtask unit`, and
+  `cargo xtask test smoke --target rv64-qemu --timeout-ms 30000`. **Blocker:**
+  full PI/rt_mutex blocking handoff remains intentionally deferred.
+
+- 2026-05-26 **Implemented the 32-bit futex2 `wake`/`wait` syscall slice.**
+  Syscalls `454` and `455` now follow the Linux futex2 shape where
+  `futex_wake(uaddr, mask, nr, flags)` is the futex2 form of
+  `FUTEX_WAKE_BITSET`, and `futex_wait(uaddr, val, mask, flags, timeout,
+  clockid)` is the futex2 form of `FUTEX_WAIT_BITSET` with an optional
+  absolute timeout. txKernel supports the `FUTEX_32` word-size subset plus
+  optional `FUTEX_PRIVATE_FLAG`, validates nonzero masks and aligned non-null
+  user addresses, returns `-EAGAIN` on mismatch, `-ETIMEDOUT` on immediate
+  zero timeout, and wakes only waiters whose masks overlap. **Verified:** red first on
+  `cargo test -p tx-shims futex2_ -- --test-threads=1` while `454/455`
+  returned `-ENOSYS`, then green after implementation; also `cargo test -p
+  tx-shims futex_dispatch -- --test-threads=1`, `cargo test -p tx-subsystems
+  futex -- --test-threads=1`, `cargo test -p tx-subsystems --test
+  v3_futex_waitsource -- --test-threads=1`, `cargo -q xtask unit`, and
+  `cargo xtask test smoke --target rv64-qemu --timeout-ms 30000`. **Next
+  step:** implement futex2 requeue `456` or start the full PI/rt_mutex design
+  slice. **Blocker:** full PI/rt_mutex blocking handoff and futex2 requeue
+  semantics remain intentionally deferred.
+
+- 2026-05-26 **Collected guest pthread PI-condvar evidence for the rt_mutex
+  futex worktree and made it rerunnable.** Reused the private RV64 OSComp
+  submit artifact at `target/oscomp/futex-pthread-submit/kernel-rv` and a
+  private sdcard copy under `target/oscomp/pi-condvar-data/`. First, the
+  current rt_mutex kernel passed the focused stock libctest-musl pthread
+  condvar slice
+  `pthread_cond+pthread_cond_smasher+pthread_condattr_setclock+pthread_robust_detach`
+  for static and dynamic entries, mounted the sdcard, and exited with
+  `txkernel:qemu-riscv64-virt:userspace:exited:0`. Second,
+  `tools/guest-tests/run-pthread-pi-condvar-rv64.sh` now builds the static
+  RV64 musl `PTHREAD_PRIO_INHERIT` condvar test with Zig, injects it plus a
+  wrapper `basic_testcode.sh` into a private image copy, runs bounded RV64
+  QEMU, checks the test binary's own `PASS pthread-pi-condvar` marker plus the
+  wrapper success markers, and requires `fault-decode` to report no trap lines.
+  **Verified:** `OSCOMP_OUT_RV=target/oscomp/os_serial_out_pthread_pi_condvar_write_20260526.txt
+  tools/guest-tests/run-pthread-pi-condvar-rv64.sh`; the wrapper launched
+  `./pthread_pi_condvar`, the test printed `PASS pthread-pi-condvar`, the
+  wrapper observed return status `0`, and the guest exited `0`. **Next step:**
+  decide whether this helper should graduate into a normal OSComp/slim-image
+  suite or stay as a focused branch-local evidence command. **Blocker:** no
+  guest crash remains for this slice; the helper is still a private-image
+  evidence command rather than an OSComp judge-integrated suite.
+
+- 2026-05-26 **Implemented the non-PI `futex_waitv` syscall slice.**
+  Syscall `449` now parses the Linux wait-vector layout
+  `{ val: u64, uaddr: u64, flags: u32, __reserved: u32 }`, validates
+  `nr_futexes` in `1..=128`, syscall flags `0`, `CLOCK_MONOTONIC` /
+  `CLOCK_REALTIME`, waiter `FUTEX_32` plus optional `FUTEX_PRIVATE_FLAG`,
+  zero reserved fields, and aligned non-null futex words. The futex
+  subsystem publishes one aggregate wait source across the vector, inserts
+  exact waiter rows for each entry, returns `-EAGAIN` on any mismatch,
+  `-ETIMEDOUT` for an immediate absolute zero timeout, and returns the
+  index of the woken waiter after `FUTEX_WAKE`; remaining vector wait rows
+  are cleaned up on wake/timeout. Futex2 `wake/wait/requeue` syscalls
+  `454/455/456` remain explicit `-ENOSYS`. **Verified:** red first on
+  `cargo test -p tx-shims futex_waitv -- --test-threads=1` while syscall
+  `449` was still unimplemented, then green after implementation; also
+  `cargo test -p tx-shims futex_dispatch -- --test-threads=1` and
+  `cargo test -p tx-subsystems futex -- --test-threads=1`, `cargo test -p
+  tx-subsystems --test v3_futex_waitsource -- --test-threads=1`, `cargo -q
+  xtask unit`, and `cargo xtask test smoke --target rv64-qemu --timeout-ms
+  30000`. **Next step:** either expand futex2 `wake/wait` or begin the full
+  PI/rt_mutex design slice. **Blocker:** full
+  PI/rt_mutex blocking handoff and futex2 `454/455/456` semantics remain
+  intentionally deferred.
+
+- 2026-05-26 **Expanded focused guest pthread futex evidence through
+  cancellation and semaphore-adjacent cases.** Ran a second narrowed
+  libctest-musl slice over
+  `pthread_cancel_points+pthread_cancel+pthread_tsd+pthread_cancel_sem_wait+pthread_exit_cancel+pthread_once_deadlock+pthread_rwlock_ebusy+sem_init`
+  with the same private OSComp data dir. The guest booted, selected the
+  requested group, passed 14 selected static/dynamic cases, and exited with
+  `txkernel:qemu-riscv64-virt:userspace:exited:0`; dynamic
+  `pthread_cancel_sem_wait` and static `sem_init` were skipped because they
+  are not present in this libctest table. As with the prior focused run, the
+  judge's `14/220` total reflects unselected table entries, not failures in
+  the requested slice. **Verified:** focused `/opt/homebrew/bin/gtimeout 240s
+  make oscomp-submit-rv64 oscomp-qemu-rv64 oscomp-judge-rv64` with
+  `OSCOMP_GROUPS='libctest-musl:pthread_cancel_points+pthread_cancel+pthread_tsd+pthread_cancel_sem_wait+pthread_exit_cancel+pthread_once_deadlock+pthread_rwlock_ebusy+sem_init'`
+  and serial log
+  `target/oscomp/os_serial_out_futex_pthread_cancel_sem_20260526.txt`.
+  **Next step:** inspect the remaining PI/futex2 syscall surface and choose
+  the smallest honest Linux-compatible slice. **Blocker:** full PI/rt_mutex
+  blocking handoff and futex2 semantics remain intentionally deferred.
+
+- 2026-05-26 **Focused guest/musl pthread futex evidence is now green in
+  `codex/futex-linux-compat`.** Reused the private OSComp data dir at
+  `target/oscomp/futex-pthread-data`, rebuilt the RV64 kernel artifact, and
+  reran the narrowed libctest-musl slice
+  `pthread_cond+pthread_cond_smasher+pthread_condattr_setclock+pthread_robust_detach`
+  against the sparse wait-source registry fix. The guest reached normal
+  txKernel boot, ran all selected static and dynamic pthread tests, printed
+  `txkernel:qemu-riscv64-virt:userspace:exited:0`, and the judge reported
+  the selected 8 cases as passing. The judge still prints the full libctest
+  table as `8/220` because this was a focused group/image, not a full
+  libctest-musl run. `fault-decode` found no trap lines in the retry serial
+  log. **Verified:** `cargo xtask full-build --target rv64-qemu --skip-doctor
+  --no-image`, focused `/opt/homebrew/bin/gtimeout 180s make
+  oscomp-submit-rv64 oscomp-qemu-rv64 oscomp-judge-rv64` with
+  `OSCOMP_GROUPS='libctest-musl:pthread_cond+pthread_cond_smasher+pthread_condattr_setclock+pthread_robust_detach'`
+  and serial log
+  `target/oscomp/os_serial_out_futex_pthread_linux_compat_20260526_retry.txt`,
+  plus `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_futex_pthread_linux_compat_20260526_retry.txt
+  --all --brief` returning only the expected no-trap-lines diagnostic.
+  **Next step:** expand guest evidence to more pthread/cancel/sem cases or
+  start the separate PI/futex2 compatibility slices. **Blocker:** full
+  PI/rt_mutex blocking handoff and futex2 semantics remain intentionally
+  deferred.
+
+- 2026-05-26 **Fixed the futex worktree RV64 boot blocker by making the
+  global wait-source registry sparse.** Futex boot registration allocates
+  bucket wait sources from the high notification-source id range
+  (`1 << 32`); the previous dense `Vec<Option<Arc<WaitSource>>>` registry
+  tried to grow to that id and stalled during `futex::register_zones()`.
+  The registry now uses a `BTreeMap<u64, Arc<WaitSource>>`, preserving raw
+  source ids without dense allocation, and the closed errno catalog test now
+  includes the futex compatibility errno additions. Removed the temporary RV64
+  boot breadcrumbs after confirming the root cause. **Verified:** `cargo fmt
+  --check`, `cargo test -p tx-substrate
+  wake::wait_source::tests::global_registry_stays_sparse_for_large_wait_source_ids
+  -- --test-threads=1`, `cargo test -p tx-shims futex_dispatch --
+  --test-threads=1`, `cargo test -p tx-subsystems futex -- --test-threads=1`,
+  `cargo test -p tx-subsystems --test v3_futex_waitsource --
+  --test-threads=1`, and `cargo xtask test smoke --target rv64-qemu
+  --timeout-ms 30000`. **Next step:** rerun the focused guest/musl pthread
+  slice without the boot blocker, then continue PI/futex2 as separate slices.
+  **Blocker:** full PI/rt_mutex blocking handoff and futex2 semantics remain
+  intentionally deferred; guest pthread verdict is still pending.
+
+- 2026-05-26 **Guest futex/pthread evidence is blocked before txKernel boot
+  markers in this worktree.** Built a private OSComp data dir at
+  `target/oscomp/futex-pthread-data` from the main checkout's full RV64 image,
+  then ran a bounded focused libctest slice for
+  `pthread_cond+pthread_cond_smasher+pthread_condattr_setclock+pthread_robust_detach`
+  against `codex/futex-linux-compat`. QEMU timed out after OpenSBI only:
+  `target/oscomp/os_serial_out_futex_pthread_linux_compat_20260526.txt` has
+  63 lines, no `:oscomp:`/kernel/test markers, and `cargo xtask fault-decode
+  --target rv64-qemu --serial
+  target/oscomp/os_serial_out_futex_pthread_linux_compat_20260526.txt --all
+  --brief` found no `scause`/`sepc`/`stval` lines. The standard bounded smoke
+  harness also timed out with an empty `target/qemu-rv64-qemu-smoke.serial.log`.
+  **Verified:** `cargo xtask full-build --target rv64-qemu --skip-doctor
+  --no-image`, private slim-image generation with `python3.11
+  tools/build-slim-sdcard.py --suite libctest-musl`, focused `/opt/homebrew/bin/gtimeout
+  180s make oscomp-submit-rv64 oscomp-qemu-rv64 oscomp-judge-rv64`,
+  `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_futex_pthread_linux_compat_20260526.txt --all
+  --brief`, and `cargo xtask test smoke --target rv64-qemu --timeout-ms
+  30000 --trap-trace`. **Next step:** debug the early RV64 boot/no-serial
+  blocker or compare against a known-green worktree before treating guest
+  pthread results as meaningful. **Blocker:** no guest futex verdict yet.
+
+- 2026-05-26 **Aligned futex `FUTEX_CLOCK_REALTIME` flag handling with
+  Linux and pinned the remaining PI op surface.** `FUTEX_CLOCK_REALTIME`
+  now returns `-ENOSYS` when paired with non-timed operations such as
+  `FUTEX_WAKE`, instead of being stripped unconditionally. Added named
+  constants for `FUTEX_WAIT_REQUEUE_PI=11`, `FUTEX_CMP_REQUEUE_PI=12`, and
+  `FUTEX_LOCK_PI2=13`, with explicit `-ENOSYS` dispatch until full rt_mutex
+  PI handoff semantics exist. **Verified:** red/green `cargo test -p
+  tx-shims
+  linux_syscall::tests::futex_dispatch::dispatch_futex_clock_realtime_on_wake_returns_neg_enosys
+  -- --test-threads=1 --nocapture`, focused
+  `dispatch_futex_pi_requeue_and_lock_pi2_are_pinned_unimplemented`, and
+  `cargo test -p tx-shims futex_dispatch -- --test-threads=1`, `cargo fmt
+  --check`, `cargo xtask progress validate`, `git diff --check`, and
+  `cargo -q xtask unit`. **Next step:** move to guest/musl robust-pthread
+  evidence. **Blocker:** full PI/rt_mutex and futex2 semantics remain deferred.
+
+- 2026-05-26 **Pinned the futex2 syscall-number surface as explicitly
+  deferred.** Added named Linux generic ABI constants for `futex_waitv=449`,
+  futex2 `wake=454`, `wait=455`, and `requeue=456`, plus a dispatch arm that
+  returns `-ENOSYS` deliberately until the futex2 wait-vector/size/flag ABI is
+  implemented. This keeps probes from confusing these syscalls with accidental
+  unknown-number fallthrough and keeps the branch honest: futex2 semantics are
+  still not implemented. **Verified:** red/green `cargo test -p tx-shims
+  linux_syscall::tests::futex_dispatch::dispatch_futex2_numbers_are_pinned_and_explicitly_unimplemented
+  -- --test-threads=1 --nocapture`, then `cargo fmt --check`, `cargo test
+  -p tx-shims futex_dispatch -- --test-threads=1`, `cargo test -p
+  tx-subsystems futex -- --test-threads=1`, `cargo test -p tx-subsystems
+  --test v3_futex_waitsource -- --test-threads=1`, and `cargo -q xtask
+  unit`.
+
+- 2026-05-26 **Tightened PI futex self-deadlock error behavior in
+  `codex/futex-linux-compat`.** Added `EDEADLK` to the closed substrate /
+  subsystem errno catalogs and the Linux syscall errno table, and changed the
+  partial PI futex lock path so `FUTEX_LOCK_PI` / `FUTEX_TRYLOCK_PI` by the
+  current owner returns Linux-compatible `-EDEADLK` instead of the older
+  placeholder `-EAGAIN`. This does not implement full rt_mutex PI blocking;
+  contended PI locking remains a follow-up. **Verified:** red/green
+  `cargo test -p tx-shims
+  linux_syscall::tests::futex_dispatch::dispatch_futex_pi_lock_by_owner_returns_neg_edeadlk
+  -- --test-threads=1 --nocapture`, `cargo test -p tx-shims futex_dispatch --
+  --test-threads=1`, `cargo test -p tx-subsystems futex -- --test-threads=1`,
+  `cargo test -p tx-subsystems execution::tests::from_v4_errno_round_trip --
+  --test-threads=1`, and `cargo fmt --check`.
+
+- 2026-05-25 **Implemented the Linux-compatible classic futex slice in
+  `codex/futex-linux-compat`.** Replaced syscall-facing aggregate futex
+  bucket state with explicit exact waiter rows keyed by private
+  `(AddressSpace, uaddr)` or shared page-backed `(PageContainer, byte-offset)`
+  identity, including per-waiter wait-source ids, bitsets, sequence ordering,
+  exact wake-N removal, timeout/cancel cleanup by yielded source id,
+  row-based `REQUEUE`/`CMP_REQUEUE`, and `FUTEX_WAKE_OP` read-modify-write
+  decode/dispatch. Tightened robust futex support by
+  requiring LP64 `set_robust_list` length 24 and by running the robust-list
+  owner-death walk before last-thread process teardown, covering both the
+  list and `list_op_pending` while preserving `FUTEX_WAITERS` and waking one
+  futex waiter. While clearing the broad host gate, also fixed the unrelated
+  splice async-`Send` regression, added missing syscall-wait mailboxes to
+  blocking TTY/wait4/POSIX mq tests, and made POSIX mq wake publication count
+  v3 `WaitSource` subscribers so `mq_notify` does not fire when a blocked
+  receiver consumes the arrival. **Verified:** baseline before edits had inherited
+  `tx-subsystems futex` legacy bucket/channel failures while
+  `tx-shims futex_dispatch` passed; after edits,
+  `cargo test -p tx-subsystems futex -- --test-threads=1`,
+  `cargo test -p tx-subsystems --test v3_futex_waitsource --
+  --test-threads=1`, `cargo test -p tx-shims futex_dispatch --
+  --test-threads=1`, `cargo test -p tx-shims robust_list --
+  --test-threads=1`, focused shifted-`FUTEX_WAKE_OP` and robust owner-death
+  regressions, `cargo test -p tx-shims --lib -- --test-threads=1
+  --nocapture`, `cargo fmt --check`, and `cargo -q xtask unit` pass. **Next
+  step:** continue with guest/musl robust-pthread evidence. **Blocker:** full
+  PI/rt_mutex semantics are not implemented, and futex2 syscalls
+  449/454/455/456 remain a separate follow-up slice.
+
 - 2026-05-24 **Cleaned the pipe lease wait through notification wrappers before
   merge-back.** The reactor boundary sweep found zero raw reactor references
   outside adapters, but `notification-boundary` caught one stale raw

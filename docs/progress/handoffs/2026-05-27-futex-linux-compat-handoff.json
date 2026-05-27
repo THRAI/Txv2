@@ -1,0 +1,161 @@
+{
+  "schema": "tx.progress.handoff.v1",
+  "id": "2026-05-27-futex-linux-compat-handoff",
+  "title": "Futex Linux compatibility handoff",
+  "created": "2026-05-27",
+  "from": "codex",
+  "status": "open",
+  "plan": "docs/progress/plans/2026-05-27-futex-caveat-closure.json",
+  "current_state": [
+    "Worktree: /Users/3y/.codex/worktrees/futex-linux-compat/Tx on branch codex/futex-linux-compat.",
+    "Classic non-PI futex, PI lock/requeue, robust-list, futex2 32-bit subset, and rt_mutex-shaped PI priority-tree/task-pi_waiters implementation are present in the branch.",
+    "PI-condvar guest evidence is now a judged branch-local OSComp group: make oscomp-rv64-pthread-pi-condvar produces [pthread-pi-condvar] 1/1.",
+    "LTP futex discovery has a reusable target: make oscomp-rv64-ltp-futex builds a slim 17-case futex/robust image and boots it under QEMU.",
+    "Current LTP futex discovery reaches selected cases; most return TBROK on missing /proc/meminfo, while set_robust_list01 exits 0. This is a procfs coverage blocker before LTP can isolate futex semantics.",
+    "Full SCHED_DEADLINE is not closed by this branch; it remains scheduler EDF/admission-control work and is not a futex merge blocker."
+  ],
+  "changed_files": [
+    {
+      "path": "crates/tx-subsystems/src/futex/mod.rs",
+      "reason": "Explicit waiter rows, classic futex behavior, PI lock state, priority-ordered PI waiter trees, requeue, timeout/cancel cleanup, robust futex handling, and tests."
+    },
+    {
+      "path": "crates/tx-reactor/src/scheduler.rs",
+      "reason": "Task-level pi_waiters, effective priority computation, runnable selection over boosted tasks, and PI waiter API support."
+    },
+    {
+      "path": "crates/tx-subsystems/src/reactor_priority.rs",
+      "reason": "Adapter seam for futex-owned priority donation and effective-priority lookup without reversing dependency direction."
+    },
+    {
+      "path": "crates/tx-shims/src/linux_syscall/vm.rs",
+      "reason": "Linux futex syscall dispatch for classic, PI, waitv, futex2, timeout, and requeue paths."
+    },
+    {
+      "path": "crates/tx-shims/src/linux_syscall/tests/futex_dispatch.rs",
+      "reason": "Focused syscall ABI and PI scheduling regression coverage."
+    },
+    {
+      "path": "crates/tx-kernel/src/init/exec.rs",
+      "reason": "OSComp group selection and pthread-pi-condvar branch-local group routing."
+    },
+    {
+      "path": "tools/guest-tests",
+      "reason": "Static RV64 musl pthread PI-condvar helper, runner, and judge script."
+    },
+    {
+      "path": "tools/build-slim-sdcard.py",
+      "reason": "Python 3.9 compatibility, output directory creation, ext4 inode mode preservation, musl lib inclusion for LTP, and futex subset support."
+    },
+    {
+      "path": "Makefile",
+      "reason": "Reusable PI-condvar and LTP futex RV64 evidence targets."
+    },
+    {
+      "path": "docs/progress",
+      "reason": "Plans, research, status, and this handoff for futex Linux-compat stabilization."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test -p tx-shims futex_dispatch -- --test-threads=1",
+      "status": "passed",
+      "notes": "48 futex dispatch tests passed in the focused stabilization run."
+    },
+    {
+      "command": "cargo test -p tx-subsystems futex -- --test-threads=1",
+      "status": "passed",
+      "notes": "30 futex-filtered subsystem tests passed."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --test v3_futex_waitsource -- --test-threads=1",
+      "status": "passed",
+      "notes": "8 wait-source tests passed."
+    },
+    {
+      "command": "cargo test -p tx-reactor pi_waiter -- --test-threads=1",
+      "status": "passed",
+      "notes": "2 pi_waiter scheduler tests passed."
+    },
+    {
+      "command": "cargo test -p tx-reactor scheduler -- --test-threads=1",
+      "status": "passed",
+      "notes": "4 scheduler-filtered reactor smoke tests passed."
+    },
+    {
+      "command": "make oscomp-rv64-pthread-pi-condvar OSCOMP_PI_CONDVAR_OUT=target/oscomp/os_serial_out_pthread_pi_condvar_judged_20260527.txt",
+      "status": "passed",
+      "notes": "Produced [pthread-pi-condvar] 1/1, userspace exit 0, and no decoded trap lines."
+    },
+    {
+      "command": "gtimeout 180s make oscomp-qemu-rv64 OSCOMP_DATA=target/oscomp/ltp-futex-data OSCOMP_SUBMIT=target/oscomp/futex-pthread-submit OSCOMP_OUT_RV=target/oscomp/os_serial_out_ltp_futex_20260527.txt OSCOMP_GROUPS=ltp-musl",
+      "status": "failed",
+      "notes": "Discovery run reached all 17 selected cases; most returned TBROK on missing /proc/meminfo, set_robust_list01 exited 0, userspace exited 0, and fault-decode found no trap lines."
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed",
+      "notes": "Passed after caveat-closure edits."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "passed",
+      "notes": "tx-shims 404, tx-kernel 61, tx-ext4 8, tx-scripts 56."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "31 progress files validated."
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed",
+      "notes": "Whitespace check passed."
+    }
+  ],
+  "next_actions": [
+    {
+      "id": "next-1",
+      "title": "Implement enough /proc/meminfo for LTP futex cases",
+      "paths": [
+        "crates/tx-fs",
+        "crates/tx-subsystems/src/vfs",
+        "docs/progress"
+      ],
+      "notes": "The LTP futex binaries currently TBROK before futex assertions because tst_memutils cannot parse /proc/meminfo."
+    },
+    {
+      "id": "next-2",
+      "title": "Rerun make oscomp-rv64-ltp-futex after procfs coverage",
+      "paths": [
+        "Makefile",
+        "target/oscomp/os_serial_out_ltp_futex_*.txt"
+      ],
+      "notes": "Treat any remaining case failures then as futex semantic evidence rather than environment setup."
+    },
+    {
+      "id": "next-3",
+      "title": "Plan SCHED_DEADLINE as scheduler work",
+      "paths": [
+        "crates/tx-reactor/src/scheduler.rs",
+        "docs/design/02_execution/SCHEDULER_v0.md",
+        "docs/progress"
+      ],
+      "notes": "Current futex PI uses RT PriorityKey ordering. EDF runtime and admission control are separate scheduler scope."
+    }
+  ],
+  "caveats": [
+    "LTP futex semantic status is not proven by the current LTP run because /proc/meminfo blocks most selected cases before futex assertions.",
+    "Generated target/oscomp images and serial logs are evidence artifacts and are not staged.",
+    "Do not edit /Users/3y/Downloads/Tx for this branch; continue in the futex worktree unless merging."
+  ],
+  "links": [
+    "docs/progress/plans/2026-05-26-futex-pi-cycle-cleanup.json",
+    "docs/progress/plans/2026-05-26-futex-pi-rtmutex-tree.json",
+    "docs/progress/plans/2026-05-27-futex-linux-compat-stabilization.json",
+    "docs/progress/plans/2026-05-27-futex-caveat-closure.json",
+    "docs/progress/research/2026-05-26-futex-pi-requeue-priority-boost-readiness.md",
+    "target/oscomp/os_serial_out_pthread_pi_condvar_judged_20260527.txt",
+    "target/oscomp/os_serial_out_ltp_futex_20260527.txt"
+  ]
+}

@@ -1,0 +1,211 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-05-27-futex-linux-compat-stabilization",
+  "title": "Futex Linux-compat stabilization and merge readiness",
+  "status": "complete",
+  "created": "2026-05-27",
+  "updated": "2026-05-27",
+  "owner": "codex",
+  "summary": "Move the futex Linux-compat worktree from implemented slices to a merge-ready module candidate by making guest PI-condvar evidence rerunnable, cleaning stale caveats, and running focused host/guest gates.",
+  "scope": {
+    "in": [
+      "Makefile",
+      "tools/guest-tests",
+      "crates/tx-shims/src/linux_syscall/vm.rs",
+      "crates/tx-shims/src/linux_syscall/numbers.rs",
+      "docs/progress"
+    ],
+    "out": [
+      "new-futex-semantics",
+      "full-sched-deadline-runtime-semantics",
+      "upstream-oscomp-judge-integration",
+      "main-worktree-edits"
+    ],
+    "write_sets": [
+      {
+        "owner": "codex",
+        "paths": [
+          "Makefile",
+          "tools/guest-tests",
+          "crates/tx-shims/src/linux_syscall/vm.rs",
+          "crates/tx-shims/src/linux_syscall/numbers.rs",
+          "docs/progress"
+        ],
+        "notes": "Single-agent stabilization slice in codex/futex-linux-compat; do not edit /Users/3y/Downloads/Tx."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/02_execution/SCHEDULER_v0.md",
+      "docs/design/02_execution/THREAD_RUNTIME_v1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/plans/2026-05-26-futex-pi-rtmutex-tree.json",
+      "docs/progress/plans/2026-05-26-futex-pi-cycle-cleanup.json",
+      "docs/progress/research/2026-05-26-futex-pi-requeue-priority-boost-readiness.md",
+      "docs/progress/STATUS.md"
+    ],
+    "external_refs": [
+      "https://docs.kernel.org/next/locking/rt-mutex-design.html"
+    ]
+  },
+  "steps": [
+    {
+      "id": "step-1",
+      "title": "Promote PI-condvar guest helper to a named entrypoint",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "Makefile",
+        "tools/guest-tests/run-pthread-pi-condvar-rv64.sh",
+        "tools/guest-tests/pthread_pi_condvar.c"
+      ],
+      "verification": [
+        "make -n oscomp-rv64-pthread-pi-condvar"
+      ],
+      "notes": "Added a Makefile target that rebuilds the private RV64 submit kernel, runs the existing helper with explicit private source/working image paths, and keeps official OSComp images untouched."
+    },
+    {
+      "id": "step-2",
+      "title": "Clean stale futex deferred comments",
+      "status": "complete",
+      "depends_on": [
+        "step-1"
+      ],
+      "paths": [
+        "crates/tx-shims/src/linux_syscall/vm.rs",
+        "crates/tx-shims/src/linux_syscall/numbers.rs",
+        "docs/progress/research/2026-05-26-futex-pi-requeue-priority-boost-readiness.md"
+      ],
+      "verification": [
+        "rg -n \"PI selectors remain partial|futex2 wake/wait/requeue syscalls remain explicitly deferred|WAIT_REQUEUE_PI.*unimplemented|CMP_REQUEUE_PI.*unimplemented\" crates/tx-shims/src/linux_syscall docs/progress/research/2026-05-26-futex-pi-requeue-priority-boost-readiness.md"
+      ],
+      "notes": "Updated shim docs and the PI readiness note so completed PI/futex2 surfaces are not described as deferred."
+    },
+    {
+      "id": "step-3",
+      "title": "Run focused host and guest gates",
+      "status": "complete",
+      "depends_on": [
+        "step-2"
+      ],
+      "paths": [
+        "crates/tx-shims",
+        "crates/tx-subsystems",
+        "crates/tx-reactor",
+        "target/oscomp"
+      ],
+      "verification": [
+        "cargo test -p tx-shims futex_dispatch -- --test-threads=1",
+        "cargo test -p tx-subsystems futex -- --test-threads=1",
+        "cargo test -p tx-subsystems --test v3_futex_waitsource -- --test-threads=1",
+        "cargo test -p tx-reactor pi_waiter -- --test-threads=1",
+        "cargo test -p tx-reactor scheduler -- --test-threads=1",
+        "make oscomp-rv64-pthread-pi-condvar"
+      ],
+      "notes": "Focused host gates passed. Guest PI-condvar target produced PASS pthread-pi-condvar, wrapper return 0, userspace:exited:0, and no fault-decode trap lines in target/oscomp/os_serial_out_pthread_pi_condvar_stabilize_20260527.txt. Focused libctest pthread condvar/robust and cancel slices passed with userspace:exited:0."
+    },
+    {
+      "id": "step-4",
+      "title": "Run final merge-readiness gates and progress catch-up",
+      "status": "complete",
+      "depends_on": [
+        "step-3"
+      ],
+      "paths": [
+        "docs/progress/STATUS.md",
+        "docs/progress/plans/2026-05-27-futex-linux-compat-stabilization.json"
+      ],
+      "verification": [
+        "cargo fmt --check",
+        "cargo -q xtask unit",
+        "cargo xtask progress validate",
+        "git diff --check"
+      ],
+      "notes": "Final gates passed after the progress catch-up: cargo fmt --check, cargo -q xtask unit, cargo xtask progress validate, and git diff --check."
+    }
+  ],
+  "verification": [
+    {
+      "command": "make -n oscomp-rv64-pthread-pi-condvar",
+      "status": "passed",
+      "notes": "Dry-run showed private submit rebuild, private source/working sdcard paths, and target/oscomp/os_serial_out_pthread_pi_condvar_stabilize_20260527.txt output."
+    },
+    {
+      "command": "cargo test -p tx-shims futex_dispatch -- --test-threads=1",
+      "status": "passed",
+      "notes": "48 futex dispatch tests passed."
+    },
+    {
+      "command": "cargo test -p tx-subsystems futex -- --test-threads=1",
+      "status": "passed",
+      "notes": "30 futex-filtered subsystem tests passed; filtered v3_futex_waitsource test also passed during the crate-wide filtered run."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --test v3_futex_waitsource -- --test-threads=1",
+      "status": "passed",
+      "notes": "8 wait-source tests passed."
+    },
+    {
+      "command": "cargo test -p tx-reactor pi_waiter -- --test-threads=1",
+      "status": "passed",
+      "notes": "2 pi_waiter-filtered scheduler tests passed."
+    },
+    {
+      "command": "cargo test -p tx-reactor scheduler -- --test-threads=1",
+      "status": "passed",
+      "notes": "4 scheduler-filtered reactor smoke tests passed."
+    },
+    {
+      "command": "make oscomp-rv64-pthread-pi-condvar",
+      "status": "passed",
+      "notes": "Produced target/oscomp/os_serial_out_pthread_pi_condvar_stabilize_20260527.txt with PASS pthread-pi-condvar, wrapper status 0, userspace:exited:0, and no fault-decode trap lines."
+    },
+    {
+      "command": "gtimeout 120s make oscomp-qemu-rv64 OSCOMP_DATA=target/oscomp/futex-pthread-data OSCOMP_SUBMIT=target/oscomp/futex-pthread-submit OSCOMP_OUT_RV=target/oscomp/os_serial_out_futex_pthread_stabilize_20260527.txt OSCOMP_LIBCTEST=pthread_cond,pthread_cond_smasher,pthread_condattr_setclock,pthread_robust_detach",
+      "status": "passed",
+      "notes": "Static and dynamic selected entries passed with userspace:exited:0; fault-decode found no trap lines."
+    },
+    {
+      "command": "gtimeout 120s make oscomp-qemu-rv64 OSCOMP_DATA=target/oscomp/futex-pthread-data OSCOMP_SUBMIT=target/oscomp/futex-pthread-submit OSCOMP_OUT_RV=target/oscomp/os_serial_out_futex_pthread_cancel_stabilize_20260527.txt OSCOMP_LIBCTEST=pthread_cancel_points,pthread_cancel,pthread_tsd,pthread_cancel_sem_wait,pthread_exit_cancel,pthread_once_deadlock,pthread_rwlock_ebusy,sem_init",
+      "status": "passed",
+      "notes": "Selected static/dynamic pthread cancellation entries passed with userspace:exited:0; missing libctest-table entries were skipped, not failed; fault-decode found no trap lines."
+    },
+    {
+      "command": "cargo xtask oscomp list-suites; python3.11 tools/build-slim-sdcard.py --source target/oscomp/futex-pthread-data/sdcard-rv.img --list-cases ltp-musl",
+      "status": "not-run",
+      "notes": "Small LTP/futex subset unavailable in this worktree: canonical target/oscomp/testdata is not prepared, and the private futex-pthread-data image reports ltp-musl (0 cases). Recorded as a coverage gap, not a futex regression."
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed",
+      "notes": "Formatting check passed."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "passed",
+      "notes": "Unit gate passed: tx-shims 404, tx-kernel 60, tx-ext4 8, tx-scripts 56."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Passed after changing the top-level plan status to the schema-supported complete value."
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed",
+      "notes": "Whitespace check passed."
+    }
+  ],
+  "risks": [
+    "The PI-condvar helper depends on Zig, debugfs, gtimeout or timeout, and an existing source OSComp data dir.",
+    "A small LTP/futex selftest subset is useful discovery but may expose broader userspace/env issues unrelated to this futex slice.",
+    "Full SCHED_DEADLINE runtime semantics remain out of scope."
+  ],
+  "blockers": [],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}
