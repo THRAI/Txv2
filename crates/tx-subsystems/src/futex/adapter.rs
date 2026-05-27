@@ -94,7 +94,7 @@ pub mod wait_routing {
     /// coexistence wake path (mailbox).
     ///
     /// Delegates to `tx_substrate::wake::notify`.
-    pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) {
+    pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) -> usize {
         tx_substrate::wake::notify(source, mask_bits)
     }
 }

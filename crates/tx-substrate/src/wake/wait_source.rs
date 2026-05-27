@@ -33,6 +33,7 @@
 //! cap-typed). The shape stays — only the substrate primitive
 //! changes.
 
+use alloc::collections::BTreeMap;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -322,31 +323,28 @@ use alloc::sync::Arc;
 /// needed — the id space is large enough for the system lifetime and
 /// sources are never destroyed in practice (they're embedded in
 /// long-lived semantic objects).
-static REGISTRY: SpinMutex<Vec<Option<Arc<WaitSource>>>> = SpinMutex::new(Vec::new());
+static REGISTRY: SpinMutex<BTreeMap<u64, Arc<WaitSource>>> = SpinMutex::new(BTreeMap::new());
+
+#[cfg(test)]
+fn debug_registry_slots_len() -> usize {
+    REGISTRY.lock().len()
+}
 
 /// Register a source in the global registry so the driver can find it
 /// by [`WaitSourceId`] during yield resolution.
 pub fn register_source(source: Arc<WaitSource>) {
-    let id = source.id().raw() as usize;
-    let mut reg = REGISTRY.lock();
-    while reg.len() <= id {
-        reg.push(None);
-    }
-    reg[id] = Some(source);
+    REGISTRY.lock().insert(source.id().raw(), source);
 }
 
 /// Remove a source from the global registry.
 pub fn unregister_source(id: WaitSourceId) {
-    let mut reg = REGISTRY.lock();
-    if let Some(slot) = reg.get_mut(id.raw() as usize) {
-        *slot = None;
-    }
+    REGISTRY.lock().remove(&id.raw());
 }
 
 /// Look up a source by id. Returns `None` if the id is unknown or
 /// the source was never registered.
 pub fn lookup_source(id: WaitSourceId) -> Option<Arc<WaitSource>> {
-    REGISTRY.lock().get(id.raw() as usize)?.clone()
+    REGISTRY.lock().get(&id.raw()).cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -456,6 +454,18 @@ mod tests {
 
     fn mb() -> Arc<TaskMailbox> {
         Arc::new(TaskMailbox::new())
+    }
+
+    #[test]
+    fn global_registry_stays_sparse_for_large_wait_source_ids() {
+        let id = WaitSourceId::new(4096);
+        let source = Arc::new(WaitSource::new(id));
+
+        register_source(Arc::clone(&source));
+
+        assert_eq!(lookup_source(id).expect("source registered").id(), id);
+        assert_eq!(debug_registry_slots_len(), 1);
+        unregister_source(id);
     }
 
     #[test]

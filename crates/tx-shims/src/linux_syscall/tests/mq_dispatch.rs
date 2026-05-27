@@ -719,7 +719,8 @@ fn dispatch_mq_notify_registration_is_queue_wide_across_descriptors() {
 #[test]
 fn dispatch_mq_notify_does_not_fire_while_blocked_receiver_consumes_message() {
     let (_setup, proc_cap, thread) = mq_setup();
-    let ctx = make_ctx(proc_cap.clone(), thread.clone());
+    let ctx = make_ctx(proc_cap.clone(), thread.clone())
+        .with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()));
     let name = b"tx-mq-notify-blocked-recv\0";
     let attr = MqAttrLayout {
         mq_maxmsg: 4,
@@ -917,7 +918,7 @@ fn dispatch_mq_raw_read_write_fail_cleanly_and_maxmsg_is_enforced() {
 #[test]
 fn dispatch_mq_blocking_receive_parks_until_send_wakes_queue() {
     let (_setup, proc_cap, thread) = mq_setup();
-    let ctx = make_ctx(proc_cap, thread);
+    let ctx = make_ctx(proc_cap, thread).with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()));
     let name = b"tx-mq-blocking-recv\0";
     let attr = MqAttrLayout {
         mq_maxmsg: 2,
@@ -979,7 +980,7 @@ fn dispatch_mq_blocking_receive_parks_until_send_wakes_queue() {
 #[test]
 fn dispatch_mq_blocking_send_parks_until_receive_makes_space() {
     let (_setup, proc_cap, thread) = mq_setup();
-    let ctx = make_ctx(proc_cap, thread);
+    let ctx = make_ctx(proc_cap, thread).with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()));
     let name = b"tx-mq-blocking-send\0";
     let attr = MqAttrLayout {
         mq_maxmsg: 1,

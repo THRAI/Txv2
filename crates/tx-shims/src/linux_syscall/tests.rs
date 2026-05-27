@@ -25,8 +25,10 @@ use std::sync::Mutex;
 
 use crate::adapter::reactor_entry::userspace::SyscallRequest;
 use crate::adapter::step_engine::{self as step_engine, guard, Cap, StepOutcome};
+use tx_substrate::wake::TaskMailbox;
 use tx_subsystems::cross_crate_test_support::{
-    reset_init_process, reset_pid_counter, reset_reactor_affinity_seam, reset_tid_counter,
+    reset_init_process, reset_pid_counter, reset_reactor_affinity_seam,
+    reset_reactor_priority_seam, reset_tid_counter,
 };
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
@@ -207,6 +209,7 @@ fn setup() -> TestSetup {
     reset_tid_counter();
     reset_init_process();
     reset_reactor_affinity_seam();
+    reset_reactor_priority_seam();
     tx_subsystems::wall_clock::reset_for_test();
     TestSetup { _lock: lock }
 }
@@ -469,7 +472,7 @@ fn dispatch_read_blocks_until_tty_input_then_returns_byte() {
     let console_tty = tx_subsystems::tty::project::resolve_devfs_alias(b"console")
         .expect("console alias must resolve after install_capturing_console");
 
-    let ctx = make_ctx(proc_cap, thread);
+    let ctx = make_ctx(proc_cap, thread).with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()));
     let mut buf = [0u8; 64];
     let req = SyscallRequest::new(NR_READ, [0, buf.as_mut_ptr() as u64, 64, 0, 0, 0]);
 

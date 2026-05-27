@@ -211,7 +211,8 @@ fn dispatch_wait4_blocking_resolves_when_child_zombifies() {
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
     seed_parent_trap_context(&thread);
-    let ctx = make_ctx(proc_cap.clone(), thread);
+    let ctx =
+        make_ctx(proc_cap.clone(), thread).with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()));
 
     let clone_req = SyscallRequest::new(NR_CLONE, [SIGCHLD, 0, 0, 0, 0, 0]);
     let _ = block_on(dispatch::<ShimsTestPmap>(clone_req, &ctx));

@@ -45,7 +45,8 @@ pub mod step_engine {
 pub mod boot_runtime {
     pub use tx_reactor::{
         ast, current_delegate_registry, current_task_mailbox, current_timer_wheel, hart_loop,
-        userspace, wait, yield_now, HartId, InitialSchedMeta, Reactor, RescheduleSignal,
-        SharedReactor, SliceClock, TaskKey,
+        userspace, wait, yield_now, HartId, InitialSchedMeta, PiLockToken, PriorityBoostError,
+        PriorityBoostToken, PriorityKey, Reactor, RescheduleSignal, SharedReactor, SliceClock,
+        TaskKey,
     };
 }

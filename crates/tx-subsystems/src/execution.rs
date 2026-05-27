@@ -27,6 +27,9 @@ pub enum Errno {
     /// `TFD_TIMER_CANCEL_ON_SET` after a realtime clock change.
     /// Linux value: 125.
     ECANCELED,
+    /// Resource deadlock would occur. Used by Linux PI futex lock when
+    /// the caller already owns the futex word. Linux value: 35.
+    EDEADLK,
     EDQUOT,
     EEXIST,
     /// File too large — sem_num >= nsems in semop.
@@ -92,6 +95,7 @@ impl From<Errno> for crate::adapter::step_engine::V3Errno {
             Errno::EBADF => Self::EBADF,
             Errno::EBUSY => Self::EBUSY,
             Errno::ECANCELED => Self::ECANCELED,
+            Errno::EDEADLK => Self::EDEADLK,
             Errno::EDQUOT => Self::EDQUOT,
             Errno::EEXIST => Self::EEXIST,
             Errno::EFBIG => Self::EFBIG,
@@ -140,6 +144,7 @@ impl From<crate::adapter::step_engine::V3Errno> for Errno {
             V3::EBADF => Errno::EBADF,
             V3::EBUSY => Errno::EBUSY,
             V3::ECANCELED => Errno::ECANCELED,
+            V3::EDEADLK => Errno::EDEADLK,
             V3::EDQUOT => Errno::EDQUOT,
             V3::EEXIST => Errno::EEXIST,
             V3::EFBIG => Errno::EFBIG,
@@ -219,12 +224,13 @@ mod tests {
         // `step_v3::Errno` + the From impl) fails to compile or this
         // test fails immediately.
         use crate::adapter::step_engine::V3Errno as V3;
-        let table: [(Errno, V3); 30] = [
+        let table: [(Errno, V3); 31] = [
             (Errno::E2BIG, V3::E2BIG),
             (Errno::EACCES, V3::EACCES),
             (Errno::EAGAIN, V3::EAGAIN),
             (Errno::EBADF, V3::EBADF),
             (Errno::EBUSY, V3::EBUSY),
+            (Errno::EDEADLK, V3::EDEADLK),
             (Errno::EDQUOT, V3::EDQUOT),
             (Errno::EEXIST, V3::EEXIST),
             (Errno::EFAULT, V3::EFAULT),
@@ -251,7 +257,7 @@ mod tests {
             (Errno::ESTALE, V3::ESTALE),
             (Errno::ETIMEDOUT, V3::ETIMEDOUT),
         ];
-        assert_eq!(table.len(), 30);
+        assert_eq!(table.len(), 31);
         for (v4, expected_v3) in table {
             let mapped: V3 = v4.into();
             assert_eq!(

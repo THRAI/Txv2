@@ -770,11 +770,11 @@ pub const MADV_FREE: u64 = 8;
 // musl's libc init issues `FUTEX_WAIT` / `FUTEX_WAKE` for its
 // `pthread_once`-style guards even in single-threaded programs, so
 // without this number wired the busybox shell can't get past
-// `__init_libc`. v1 supports wait/wake, bitset wait/wake, requeue /
-// cmp-requeue, wake-op, and best-effort PI lock/trylock/unlock
-// selectors. The `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME` flag
-// bits are recognised at the syscall layer; per-process isolation is
-// implicit from the per-aspace user word.
+// `__init_libc`. txKernel supports the classic non-PI selectors, PI
+// lock/requeue selectors through the rt_mutex-shaped priority-tree model,
+// and the 32-bit futex2/waitv subset. The `FUTEX_PRIVATE_FLAG` and
+// `FUTEX_CLOCK_REALTIME` flag bits are recognised at the syscall layer;
+// per-process isolation is implicit from the per-aspace user word.
 // See `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 3.
 // ---------------------------------------------------------------------
 
@@ -782,6 +782,22 @@ pub const MADV_FREE: u64 = 8;
 /// ABI `__NR_futex = 98`. Wraps `tx_subsystems::futex::step_futex_wait`
 /// / `step_futex_wake`.
 pub const NR_FUTEX: u64 = 98;
+/// `futex_waitv(waiters, nr_futexes, flags, timeout, clockid)`.
+/// Linux generic ABI `__NR_futex_waitv = 449`. txKernel implements the
+/// Linux 32-bit futex-word wait-vector surface.
+pub const NR_FUTEX_WAITV: u64 = 449;
+/// futex2 `futex_wake(...)`. Linux generic ABI `__NR_futex_wake = 454`.
+/// Named `NR_FUTEX2_WAKE` to avoid colliding with the legacy
+/// `FUTEX_WAKE` operation selector. txKernel supports the `FUTEX_32`
+/// word-size subset with optional `FUTEX_PRIVATE_FLAG`.
+pub const NR_FUTEX2_WAKE: u64 = 454;
+/// futex2 `futex_wait(...)`. Linux generic ABI `__NR_futex_wait = 455`.
+/// txKernel supports the `FUTEX_32` word-size subset with optional
+/// `FUTEX_PRIVATE_FLAG` and absolute timeout validation.
+pub const NR_FUTEX2_WAIT: u64 = 455;
+/// futex2 `futex_requeue(...)`. Linux generic ABI `__NR_futex_requeue = 456`.
+/// txKernel supports the 32-bit two-entry requeue subset.
+pub const NR_FUTEX2_REQUEUE: u64 = 456;
 
 /// `FUTEX_WAIT = 0` op selector. Park if `*uaddr == val`, otherwise
 /// return `-EAGAIN` immediately.
@@ -795,16 +811,24 @@ pub const FUTEX_REQUEUE: u32 = 3;
 pub const FUTEX_CMP_REQUEUE: u32 = 4;
 /// `FUTEX_WAKE_OP = 5`. Wake-op selector.
 pub const FUTEX_WAKE_OP: u32 = 5;
-/// `FUTEX_LOCK_PI = 6`. Best-effort PI lock selector.
+/// `FUTEX_LOCK_PI = 6`. PI lock selector backed by the rt_mutex-shaped futex
+/// priority-tree model.
 pub const FUTEX_LOCK_PI: u32 = 6;
-/// `FUTEX_UNLOCK_PI = 7`. Best-effort PI unlock selector.
+/// `FUTEX_UNLOCK_PI = 7`. PI unlock/handoff selector.
 pub const FUTEX_UNLOCK_PI: u32 = 7;
-/// `FUTEX_TRYLOCK_PI = 8`. Best-effort PI trylock selector.
+/// `FUTEX_TRYLOCK_PI = 8`. Nonblocking PI trylock selector.
 pub const FUTEX_TRYLOCK_PI: u32 = 8;
 /// `FUTEX_WAIT_BITSET = 9`. Wait selector with bitset filtering.
 pub const FUTEX_WAIT_BITSET: u32 = 9;
 /// `FUTEX_WAKE_BITSET = 10`. Wake selector with bitset filtering.
 pub const FUTEX_WAKE_BITSET: u32 = 10;
+/// `FUTEX_WAIT_REQUEUE_PI = 11`. PI wait/requeue selector for condition
+/// variable style handoff.
+pub const FUTEX_WAIT_REQUEUE_PI: u32 = 11;
+/// `FUTEX_CMP_REQUEUE_PI = 12`. PI compare/requeue selector.
+pub const FUTEX_CMP_REQUEUE_PI: u32 = 12;
+/// `FUTEX_LOCK_PI2 = 13`. Linux's newer timed PI lock selector.
+pub const FUTEX_LOCK_PI2: u32 = 13;
 
 /// `FUTEX_PRIVATE_FLAG = 0x80` flag bit OR'd into the op word.
 /// Recognised but ignored — per-process isolation falls out of the
@@ -812,8 +836,10 @@ pub const FUTEX_WAKE_BITSET: u32 = 10;
 /// (`= FUTEX_WAIT | FUTEX_PRIVATE_FLAG`) for in-process guards.
 pub const FUTEX_PRIVATE_FLAG: u32 = 0x80;
 /// `FUTEX_CLOCK_REALTIME = 0x100` flag bit OR'd into the op word.
-/// Recognised but ignored (timeout support is deferred to Slice 4).
+/// Only valid on Linux for timed wait-style ops and `FUTEX_LOCK_PI2`.
 pub const FUTEX_CLOCK_REALTIME: u32 = 0x100;
+/// `FUTEX_32 = 0x2` futex2/waitv flag selecting 32-bit futex words.
+pub const FUTEX_32: u32 = 0x2;
 /// Mask applied to the `op` argument before matching the op
 /// selector — strips `FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME`.
 pub const FUTEX_CMD_MASK: u32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);

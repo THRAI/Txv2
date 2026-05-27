@@ -7,9 +7,6 @@
 
 use super::*;
 
-static THREAD_REACTOR_TASKS: SpinMutex<alloc::vec::Vec<(u32, boot_runtime::TaskKey)>> =
-    SpinMutex::new(alloc::vec::Vec::new());
-
 struct PendingChildSubmit {
     submit_cpu: CpuId,
     child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
@@ -34,23 +31,15 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     pub(super) fn register_thread_reactor_task(tid: u32, task: boot_runtime::TaskKey) {
-        let mut tasks = THREAD_REACTOR_TASKS.lock();
-        if let Some((_, existing)) = tasks
-            .iter_mut()
-            .find(|(existing_tid, _)| *existing_tid == tid)
+        if let Some(thread) =
+            tx_subsystems::thread_runtime::thread_by_tid(tx_subsystems::thread_runtime::Tid(tid))
         {
-            *existing = task;
-        } else {
-            tasks.push((tid, task));
+            tx_subsystems::thread_runtime::bind_thread_task(&thread, task);
         }
     }
 
     fn thread_reactor_task(tid: u32) -> Option<boot_runtime::TaskKey> {
-        THREAD_REACTOR_TASKS
-            .lock()
-            .iter()
-            .find(|(existing_tid, _)| *existing_tid == tid)
-            .map(|(_, task)| *task)
+        tx_subsystems::thread_runtime::thread_task_by_tid(tx_subsystems::thread_runtime::Tid(tid))
     }
 
     pub(super) fn set_thread_reactor_affinity(
@@ -81,6 +70,60 @@ impl<P: TxPlatform> CoreInit<P> {
             .with(|reactor| reactor.task_affinity(task))
             .ok_or(tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)?
             .map_err(|_| tx_subsystems::reactor_affinity::ReactorAffinityError::NoSuchThread)
+    }
+
+    pub(super) fn donate_thread_priority(
+        owner: boot_runtime::TaskKey,
+        donor: boot_runtime::TaskKey,
+        rt_priority: u8,
+    ) -> Result<boot_runtime::PriorityBoostToken, boot_runtime::PriorityBoostError> {
+        BOOT_REACTOR
+            .with(|reactor| reactor.donate_priority(owner, donor, rt_priority))
+            .ok_or(boot_runtime::PriorityBoostError::UnknownTask)?
+    }
+
+    pub(super) fn drop_thread_priority_donation(
+        token: boot_runtime::PriorityBoostToken,
+    ) -> Result<(), boot_runtime::PriorityBoostError> {
+        BOOT_REACTOR
+            .with(|reactor| reactor.drop_priority_donation(token))
+            .ok_or(boot_runtime::PriorityBoostError::UnknownTask)?
+    }
+
+    pub(super) fn get_thread_effective_rt_priority(
+        task: boot_runtime::TaskKey,
+    ) -> Result<u8, boot_runtime::PriorityBoostError> {
+        BOOT_REACTOR
+            .with(|reactor| reactor.task_effective_rt_priority(task))
+            .ok_or(boot_runtime::PriorityBoostError::UnknownTask)?
+    }
+
+    pub(super) fn upsert_thread_pi_waiter(
+        owner: boot_runtime::TaskKey,
+        lock: boot_runtime::PiLockToken,
+        waiter: boot_runtime::TaskKey,
+        priority: boot_runtime::PriorityKey,
+    ) -> Result<(), boot_runtime::PriorityBoostError> {
+        BOOT_REACTOR
+            .with(|reactor| reactor.upsert_pi_waiter(owner, lock, waiter, priority))
+            .ok_or(boot_runtime::PriorityBoostError::UnknownTask)?
+    }
+
+    pub(super) fn remove_thread_pi_waiter(
+        owner: boot_runtime::TaskKey,
+        lock: boot_runtime::PiLockToken,
+    ) -> Result<(), boot_runtime::PriorityBoostError> {
+        BOOT_REACTOR
+            .with(|reactor| reactor.remove_pi_waiter(owner, lock))
+            .ok_or(boot_runtime::PriorityBoostError::UnknownTask)?
+    }
+
+    pub(super) fn get_thread_effective_priority_key(
+        task: boot_runtime::TaskKey,
+    ) -> Result<boot_runtime::PriorityKey, boot_runtime::PriorityBoostError> {
+        BOOT_REACTOR
+            .with(|reactor| reactor.task_effective_priority_key(task))
+            .ok_or(boot_runtime::PriorityBoostError::UnknownTask)?
     }
 
     fn queue_pending_child_submit(

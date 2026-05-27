@@ -824,12 +824,14 @@ pub(super) fn sys_set_tid_address<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
 /// calling thread's payload. The thread-exit path walks the list
 /// and marks each futex word as `FUTEX_OWNER_DIED` + wakes waiters.
 ///
-/// Returns `0` unconditionally (Linux returns `0` on success; the
-/// only failure is `-EINVAL` for `len % size_of::<usize>() != 0`
-/// which we skip — txKernel ignores `len`).
+/// Linux accepts the architecture `sizeof(struct robust_list_head)`;
+/// txKernel's current LP64 userspace ABI therefore requires 24 bytes.
 pub(super) fn sys_set_robust_list<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let head = args[0];
     let len = args[1] as usize;
+    if len != 24 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
     if let Some(payload) = ctx.thread.payload_cap() {
         let mut slot = payload.robust_list_head.lock();
         *slot = if head == 0 { None } else { Some(head) };

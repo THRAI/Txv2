@@ -82,7 +82,7 @@ pub mod wait_routing {
         tx_reactor::wait::fire_legacy(channel, mask_bits)
     }
 
-    pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) {
+    pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) -> usize {
         tx_substrate::wake::notify(source, mask_bits)
     }
 }

@@ -1,6 +1,7 @@
 use tx_reactor::{
-    HartId, InitialSchedMeta, Phase1QueueKind, Phase1Scheduler, SchedulerAffinityError,
-    SliceConfig, StopReason, TaskHandle, TaskId, TaskRunOwner, WakeHint,
+    HartId, InitialSchedMeta, Phase1QueueKind, Phase1Scheduler, PiLockToken, PriorityBoostError,
+    PriorityKey, SchedulerAffinityError, SliceConfig, StopReason, TaskHandle, TaskId, TaskRunOwner,
+    WakeHint,
 };
 
 fn submit_fair(scheduler: &mut Phase1Scheduler, raw: usize) -> TaskId {
@@ -1007,5 +1008,159 @@ fn set_affinity_rejects_unknown_and_terminal_tasks() {
     assert_eq!(
         scheduler.set_affinity(task, 0b1, HartId(0)),
         Err(SchedulerAffinityError::TerminalTask)
+    );
+}
+
+#[test]
+fn priority_donation_picks_boosted_fair_task_before_ordinary_fair_task() {
+    let mut scheduler = Phase1Scheduler::new();
+    let ordinary = submit_fair(&mut scheduler, 70);
+    let owner = submit_fair(&mut scheduler, 71);
+
+    let token = scheduler
+        .donate_priority(owner, ordinary, 50)
+        .expect("donation should install");
+
+    assert_eq!(scheduler.effective_rt_priority(owner), Some(50));
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(owner)
+    );
+
+    scheduler
+        .drop_priority_donation(token)
+        .expect("donation should revoke");
+    assert_eq!(scheduler.effective_rt_priority(owner), Some(0));
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(ordinary)
+    );
+}
+
+#[test]
+fn priority_donation_revoke_before_pick_restores_fifo_order() {
+    let mut scheduler = Phase1Scheduler::new();
+    let ordinary = submit_fair(&mut scheduler, 72);
+    let owner = submit_fair(&mut scheduler, 73);
+
+    let token = scheduler
+        .donate_priority(owner, ordinary, 50)
+        .expect("donation should install");
+    scheduler
+        .drop_priority_donation(token)
+        .expect("donation should revoke");
+
+    assert_eq!(scheduler.effective_rt_priority(owner), Some(0));
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(ordinary)
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(owner)
+    );
+}
+
+#[test]
+fn priority_donation_recomputes_to_next_highest_after_revoke() {
+    let mut scheduler = Phase1Scheduler::new();
+    let low_donor = submit_fair(&mut scheduler, 74);
+    let high_donor = submit_fair(&mut scheduler, 75);
+    let owner = submit_fair(&mut scheduler, 76);
+
+    let low = scheduler
+        .donate_priority(owner, low_donor, 20)
+        .expect("low donation should install");
+    let high = scheduler
+        .donate_priority(owner, high_donor, 70)
+        .expect("high donation should install");
+
+    assert_eq!(scheduler.effective_rt_priority(owner), Some(70));
+    scheduler
+        .drop_priority_donation(high)
+        .expect("high donation should revoke");
+    assert_eq!(scheduler.effective_rt_priority(owner), Some(20));
+    scheduler
+        .drop_priority_donation(low)
+        .expect("low donation should revoke");
+    assert_eq!(scheduler.effective_rt_priority(owner), Some(0));
+}
+
+#[test]
+fn pi_waiters_keep_only_top_waiter_per_owned_lock() {
+    let mut scheduler = Phase1Scheduler::new();
+    let owner = submit_fair(&mut scheduler, 79);
+    let low_waiter = submit_fair(&mut scheduler, 80);
+    let high_waiter = submit_fair(&mut scheduler, 81);
+    let lock_a = PiLockToken::new(0xa, 0x1000);
+    let lock_b = PiLockToken::new(0xb, 0x2000);
+
+    scheduler
+        .upsert_pi_waiter(owner, lock_a, low_waiter, PriorityKey::rt(20, 1))
+        .expect("lock A top waiter installs");
+    scheduler
+        .upsert_pi_waiter(owner, lock_b, high_waiter, PriorityKey::rt(70, 2))
+        .expect("lock B top waiter installs");
+    scheduler
+        .upsert_pi_waiter(owner, lock_a, high_waiter, PriorityKey::rt(50, 3))
+        .expect("lock A replacement stays below lock B");
+
+    assert_eq!(scheduler.effective_rt_priority(owner), Some(70));
+    assert_eq!(
+        scheduler.effective_priority_key(owner),
+        Some(PriorityKey::rt(70, 2))
+    );
+}
+
+#[test]
+fn pi_waiter_removal_deboosts_to_next_lock_then_base() {
+    let mut scheduler = Phase1Scheduler::new();
+    let owner = submit_fair(&mut scheduler, 82);
+    let low_waiter = submit_fair(&mut scheduler, 83);
+    let high_waiter = submit_fair(&mut scheduler, 84);
+    let lock_a = PiLockToken::new(0xa, 0x3000);
+    let lock_b = PiLockToken::new(0xb, 0x4000);
+
+    scheduler
+        .upsert_pi_waiter(owner, lock_a, low_waiter, PriorityKey::rt(30, 1))
+        .expect("lower waiter installs");
+    scheduler
+        .upsert_pi_waiter(owner, lock_b, high_waiter, PriorityKey::rt(80, 2))
+        .expect("higher waiter installs");
+
+    assert_eq!(scheduler.effective_rt_priority(owner), Some(80));
+    scheduler
+        .remove_pi_waiter(owner, lock_b)
+        .expect("highest waiter removed");
+    assert_eq!(scheduler.effective_rt_priority(owner), Some(30));
+    scheduler
+        .remove_pi_waiter(owner, lock_a)
+        .expect("last waiter removed");
+    assert_eq!(scheduler.effective_rt_priority(owner), Some(0));
+}
+
+#[test]
+fn priority_donation_rejects_unknown_terminal_and_zero_priority() {
+    let mut scheduler = Phase1Scheduler::new();
+    let owner = submit_fair(&mut scheduler, 77);
+    let donor = submit_fair(&mut scheduler, 78);
+
+    assert_eq!(
+        scheduler.donate_priority(TaskId(999), donor, 50),
+        Err(PriorityBoostError::UnknownTask)
+    );
+    assert_eq!(
+        scheduler.donate_priority(owner, donor, 0),
+        Err(PriorityBoostError::InvalidPriority)
+    );
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(owner)
+    );
+    scheduler.task_stopped(owner, StopReason::Completed, 0, HartId(0));
+    assert_eq!(
+        scheduler.donate_priority(owner, donor, 50),
+        Err(PriorityBoostError::TerminalTask)
     );
 }

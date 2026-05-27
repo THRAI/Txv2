@@ -1,6 +1,9 @@
 //! Scheduler policy interface and the Phase 1 round-robin policy.
 
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, VecDeque},
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::preempt::{PreemptMarker, PreemptMarkers, PreemptionPoint};
@@ -144,6 +147,7 @@ impl InitialSchedMeta {
 pub struct SchedulerShared {
     pub(crate) meta: SpinLock<Vec<Option<TaskSchedMeta>>>,
     pub(crate) stats: SpinLock<SchedulerStats>,
+    pub(crate) next_boost_sequence: AtomicU64,
 }
 
 impl SchedulerShared {
@@ -170,6 +174,7 @@ impl SchedulerShared {
     }
 
     pub fn insert_meta(&self, task: TaskId, handle: TaskHandle, initial_meta: InitialSchedMeta) {
+        let base_rt_priority = initial_effective_rt_priority(initial_meta);
         let mut meta = self.meta.lock();
         while meta.len() <= task.0 {
             meta.push(None);
@@ -177,6 +182,9 @@ impl SchedulerShared {
         meta[task.0] = Some(TaskSchedMeta {
             handle,
             class: initial_meta.class,
+            base_rt_priority,
+            effective_rt_priority: base_rt_priority,
+            pi_waiters: BTreeMap::new(),
             remaining_budget_ns: 0,
             current_slice_ns: 0,
             total_runtime_ns: 0,
@@ -212,6 +220,10 @@ impl SchedulerShared {
         let mut stats = self.stats.lock();
         stats.rebalance_moves = stats.rebalance_moves.saturating_add(1);
     }
+
+    fn next_boost_sequence(&self) -> u64 {
+        self.next_boost_sequence.fetch_add(1, Ordering::AcqRel)
+    }
 }
 
 pub struct Phase1Scheduler {
@@ -226,6 +238,76 @@ pub enum Phase1QueueKind {
     Kernel,
     New,
     Preempted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PriorityBoostToken {
+    owner: TaskId,
+    donor: TaskId,
+    sequence: u64,
+}
+
+impl PriorityBoostToken {
+    pub const fn owner(self) -> TaskId {
+        self.owner
+    }
+
+    pub const fn donor(self) -> TaskId {
+        self.donor
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PiLockToken {
+    namespace: u64,
+    object: u64,
+}
+
+impl PiLockToken {
+    pub const fn new(namespace: u64, object: u64) -> Self {
+        Self { namespace, object }
+    }
+
+    const fn legacy(sequence: u64) -> Self {
+        Self {
+            namespace: u64::MAX,
+            object: sequence,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PriorityKey {
+    rt_priority: u8,
+    sequence_rank: u64,
+}
+
+impl PriorityKey {
+    pub const fn rt(rt_priority: u8, fifo_sequence: u64) -> Self {
+        Self {
+            rt_priority,
+            sequence_rank: u64::MAX - fifo_sequence,
+        }
+    }
+
+    pub const fn base(rt_priority: u8) -> Self {
+        Self {
+            rt_priority,
+            sequence_rank: u64::MAX,
+        }
+    }
+
+    pub const fn rt_priority(self) -> u8 {
+        self.rt_priority
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PriorityBoostError {
+    UnknownTask,
+    TerminalTask,
+    InvalidPriority,
+    UnknownToken,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,6 +368,9 @@ pub struct SchedulerStats {
 pub(crate) struct TaskSchedMeta {
     handle: TaskHandle,
     class: SchedClass,
+    base_rt_priority: u8,
+    effective_rt_priority: u8,
+    pi_waiters: BTreeMap<PiLockToken, TaskPiWaiter>,
     remaining_budget_ns: u64,
     current_slice_ns: u64,
     total_runtime_ns: u64,
@@ -301,6 +386,12 @@ pub(crate) struct TaskSchedMeta {
     owner: TaskRunOwner,
 }
 
+#[derive(Clone, Debug)]
+struct TaskPiWaiter {
+    _waiter: TaskId,
+    priority: PriorityKey,
+}
+
 impl TaskSchedMeta {
     fn is_queued(&self) -> bool {
         matches!(self.owner, TaskRunOwner::Queued { .. })
@@ -308,6 +399,23 @@ impl TaskSchedMeta {
 
     fn is_queued_on(&self, hart: HartId, queue: Phase1QueueKind) -> bool {
         self.owner == TaskRunOwner::Queued { hart, queue }
+    }
+
+    fn recompute_effective_rt_priority(&mut self) {
+        self.effective_rt_priority = self
+            .pi_waiters
+            .iter()
+            .map(|(_, waiter)| waiter.priority.rt_priority())
+            .max()
+            .unwrap_or(self.base_rt_priority);
+    }
+
+    fn effective_priority_key(&self) -> PriorityKey {
+        self.pi_waiters
+            .iter()
+            .map(|(_, waiter)| waiter.priority)
+            .max()
+            .unwrap_or_else(|| PriorityKey::base(self.base_rt_priority))
     }
 }
 
@@ -412,6 +520,7 @@ impl Phase1Scheduler {
             shared: SchedulerShared {
                 meta: SpinLock::new(Vec::new()),
                 stats: SpinLock::new(SchedulerStats::default()),
+                next_boost_sequence: AtomicU64::new(1),
             },
             compat_locals: Vec::new(),
         }
@@ -509,6 +618,107 @@ impl Phase1Scheduler {
         {
             self.apply_compat_enqueue(request);
         }
+    }
+
+    pub fn donate_priority(
+        &self,
+        owner: TaskId,
+        donor: TaskId,
+        rt_priority: u8,
+    ) -> Result<PriorityBoostToken, PriorityBoostError> {
+        if rt_priority == 0 || rt_priority > 99 {
+            return Err(PriorityBoostError::InvalidPriority);
+        }
+        let sequence = self.shared.next_boost_sequence();
+        let token = PriorityBoostToken {
+            owner,
+            donor,
+            sequence,
+        };
+        self.shared
+            .with_meta_mut(owner, |meta| {
+                if meta.owner == TaskRunOwner::Terminal {
+                    return Err(PriorityBoostError::TerminalTask);
+                }
+                meta.pi_waiters.insert(
+                    PiLockToken::legacy(sequence),
+                    TaskPiWaiter {
+                        _waiter: donor,
+                        priority: PriorityKey::rt(rt_priority, sequence),
+                    },
+                );
+                meta.recompute_effective_rt_priority();
+                Ok(token)
+            })
+            .ok_or(PriorityBoostError::UnknownTask)?
+    }
+
+    pub fn drop_priority_donation(
+        &self,
+        token: PriorityBoostToken,
+    ) -> Result<(), PriorityBoostError> {
+        self.shared
+            .with_meta_mut(token.owner, |meta| {
+                if meta
+                    .pi_waiters
+                    .remove(&PiLockToken::legacy(token.sequence))
+                    .is_none()
+                {
+                    return Err(PriorityBoostError::UnknownToken);
+                }
+                meta.recompute_effective_rt_priority();
+                Ok(())
+            })
+            .ok_or(PriorityBoostError::UnknownTask)?
+    }
+
+    pub fn upsert_pi_waiter(
+        &self,
+        owner: TaskId,
+        lock: PiLockToken,
+        waiter: TaskId,
+        priority: PriorityKey,
+    ) -> Result<(), PriorityBoostError> {
+        if priority.rt_priority() == 0 || priority.rt_priority() > 99 {
+            return Err(PriorityBoostError::InvalidPriority);
+        }
+        match self.shared.meta_for(waiter).map(|meta| meta.owner) {
+            Some(TaskRunOwner::Terminal) => return Err(PriorityBoostError::TerminalTask),
+            Some(_) => {}
+            None => return Err(PriorityBoostError::UnknownTask),
+        }
+        self.shared
+            .with_meta_mut(owner, |meta| {
+                if meta.owner == TaskRunOwner::Terminal {
+                    return Err(PriorityBoostError::TerminalTask);
+                }
+                meta.pi_waiters.insert(
+                    lock,
+                    TaskPiWaiter {
+                        _waiter: waiter,
+                        priority,
+                    },
+                );
+                meta.recompute_effective_rt_priority();
+                Ok(())
+            })
+            .ok_or(PriorityBoostError::UnknownTask)?
+    }
+
+    pub fn remove_pi_waiter(
+        &self,
+        owner: TaskId,
+        lock: PiLockToken,
+    ) -> Result<(), PriorityBoostError> {
+        self.shared
+            .with_meta_mut(owner, |meta| {
+                if meta.pi_waiters.remove(&lock).is_none() {
+                    return Err(PriorityBoostError::UnknownToken);
+                }
+                meta.recompute_effective_rt_priority();
+                Ok(())
+            })
+            .ok_or(PriorityBoostError::UnknownTask)?
     }
 
     pub fn set_affinity(
@@ -811,6 +1021,18 @@ impl Phase1Scheduler {
             .meta_for(task)
             .map(|meta| meta.userspace_thread)
             .unwrap_or(false)
+    }
+
+    pub fn effective_rt_priority(&self, task: TaskId) -> Option<u8> {
+        self.shared
+            .meta_for(task)
+            .map(|meta| meta.effective_rt_priority)
+    }
+
+    pub fn effective_priority_key(&self, task: TaskId) -> Option<PriorityKey> {
+        self.shared
+            .meta_for(task)
+            .map(|meta| meta.effective_priority_key())
     }
 
     pub fn stats(&self) -> SchedulerStats {
@@ -1116,8 +1338,53 @@ impl Phase1Scheduler {
         local: &HartSchedulerLocal,
     ) -> Option<(TaskHandle, SliceConfig)> {
         self.pop_from_local_queue(hart, local, Phase1QueueKind::Kernel)
+            .or_else(|| self.pop_highest_effective_priority_from_local(hart, local))
             .or_else(|| self.pop_from_local_queue(hart, local, Phase1QueueKind::New))
             .or_else(|| self.pop_from_local_queue(hart, local, Phase1QueueKind::Preempted))
+    }
+
+    fn pop_highest_effective_priority_from_local(
+        &self,
+        hart: HartId,
+        local: &HartSchedulerLocal,
+    ) -> Option<(TaskHandle, SliceConfig)> {
+        let candidate = {
+            let queues = Self::lock_queues_from_local(local);
+            let meta_table = self.shared.meta.lock();
+            let mut best: Option<(u8, Phase1QueueKind, usize, TaskId)> = None;
+            for (queue_kind, queue) in [
+                (Phase1QueueKind::New, &queues.new_queue),
+                (Phase1QueueKind::Preempted, &queues.preempted_queue),
+            ] {
+                for (index, task) in queue.iter().copied().enumerate() {
+                    let Some(meta) = meta_table.get(task.0).and_then(Option::as_ref) else {
+                        continue;
+                    };
+                    if !meta.is_queued_on(hart, queue_kind) || meta.effective_rt_priority == 0 {
+                        continue;
+                    }
+                    match best {
+                        Some((best_priority, _, _, _))
+                            if meta.effective_rt_priority <= best_priority => {}
+                        _ => best = Some((meta.effective_rt_priority, queue_kind, index, task)),
+                    }
+                }
+            }
+            best.map(|(_, queue, index, task)| (queue, index, task))
+        }?;
+
+        let (queue, index, task) = candidate;
+        let removed = {
+            let mut queues = Self::lock_queues_from_local(local);
+            match queue {
+                Phase1QueueKind::Kernel => None,
+                Phase1QueueKind::New => queues.new_queue.remove(index),
+                Phase1QueueKind::Preempted => queues.preempted_queue.remove(index),
+            }
+        }?;
+        debug_assert_eq!(removed, task);
+        let slice = self.slice_for_popped_task(task, queue);
+        self.finish_popped_task(hart, queue, task, slice)
     }
 
     fn pop_from_local_queue(
@@ -1198,18 +1465,22 @@ impl Phase1Scheduler {
     fn task_runnable_inner_for_locals(
         &self,
         task: TaskId,
-        _hint: WakeHint,
+        hint: WakeHint,
         current_hart: HartId,
     ) -> Option<(RunnablePlacement, LocalEnqueueRequest)> {
         let meta = self.shared.meta_for(task)?;
         let hart = self.home_hart_for_meta(&meta);
         let was_queued = meta.is_queued();
+        let priority_boosted =
+            hint == WakeHint::PriorityBoost || meta.effective_rt_priority > meta.base_rt_priority;
         let (queue, front) = if meta.kernel_only {
             (Phase1QueueKind::Kernel, false)
         } else {
             match meta.class {
                 SchedClass::Fair => {
-                    if meta.remaining_budget_ns > 0 {
+                    if priority_boosted {
+                        (Phase1QueueKind::Preempted, true)
+                    } else if meta.remaining_budget_ns > 0 {
                         (Phase1QueueKind::Preempted, true)
                     } else {
                         (Phase1QueueKind::New, false)
@@ -1326,6 +1597,13 @@ fn normalize_affinity(affinity: u64) -> u64 {
         1
     } else {
         affinity
+    }
+}
+
+fn initial_effective_rt_priority(initial_meta: InitialSchedMeta) -> u8 {
+    match initial_meta.class {
+        SchedClass::RtFifo | SchedClass::RtRoundRobin => initial_meta.rt_priority.min(99),
+        SchedClass::Fair | SchedClass::Deadline | SchedClass::Idle => 0,
     }
 }
 

@@ -20,8 +20,9 @@ use crate::{
     preempt::PreemptMarkers,
     scheduler::{
         HartId, HartSchedulerLocal, InitialSchedMeta, LocalAffinityMove, LocalEnqueueRequest,
-        Phase1Scheduler, RunnablePlacement, SchedulerAffinityError, SchedulerStats, SliceConfig,
-        StopReason, TaskHandle, TaskRunOwner, WakeHint,
+        Phase1Scheduler, PiLockToken, PriorityBoostError, PriorityBoostToken, PriorityKey,
+        RunnablePlacement, SchedulerAffinityError, SchedulerStats, SliceConfig, StopReason,
+        TaskHandle, TaskRunOwner, WakeHint,
     },
     spin_lock::SpinLock,
     task::{
@@ -1236,6 +1237,84 @@ impl Reactor {
             .scheduler
             .task_affinity(task.id())
             .ok_or(SchedulerAffinityError::UnknownTask)
+    }
+
+    pub fn donate_priority(
+        &self,
+        owner: TaskKey,
+        donor: TaskKey,
+        rt_priority: u8,
+    ) -> Result<PriorityBoostToken, PriorityBoostError> {
+        self.ensure_priority_task_live(owner)?;
+        self.ensure_priority_task_live(donor)?;
+        self.shared
+            .scheduler
+            .donate_priority(owner.id(), donor.id(), rt_priority)
+    }
+
+    pub fn drop_priority_donation(
+        &self,
+        token: PriorityBoostToken,
+    ) -> Result<(), PriorityBoostError> {
+        self.shared.scheduler.drop_priority_donation(token)
+    }
+
+    pub fn upsert_pi_waiter(
+        &self,
+        owner: TaskKey,
+        lock: PiLockToken,
+        waiter: TaskKey,
+        priority: PriorityKey,
+    ) -> Result<(), PriorityBoostError> {
+        self.ensure_priority_task_live(owner)?;
+        self.ensure_priority_task_live(waiter)?;
+        self.shared
+            .scheduler
+            .upsert_pi_waiter(owner.id(), lock, waiter.id(), priority)
+    }
+
+    pub fn remove_pi_waiter(
+        &self,
+        owner: TaskKey,
+        lock: PiLockToken,
+    ) -> Result<(), PriorityBoostError> {
+        if self.shared.tasks.lock().status(owner).is_none() {
+            return Err(PriorityBoostError::UnknownTask);
+        }
+        self.shared.scheduler.remove_pi_waiter(owner.id(), lock)
+    }
+
+    pub fn task_effective_rt_priority(&self, task: TaskKey) -> Result<u8, PriorityBoostError> {
+        if self.shared.tasks.lock().status(task).is_none() {
+            return Err(PriorityBoostError::UnknownTask);
+        }
+        self.shared
+            .scheduler
+            .effective_rt_priority(task.id())
+            .ok_or(PriorityBoostError::UnknownTask)
+    }
+
+    pub fn task_effective_priority_key(
+        &self,
+        task: TaskKey,
+    ) -> Result<PriorityKey, PriorityBoostError> {
+        if self.shared.tasks.lock().status(task).is_none() {
+            return Err(PriorityBoostError::UnknownTask);
+        }
+        self.shared
+            .scheduler
+            .effective_priority_key(task.id())
+            .ok_or(PriorityBoostError::UnknownTask)
+    }
+
+    fn ensure_priority_task_live(&self, task: TaskKey) -> Result<(), PriorityBoostError> {
+        match self.shared.tasks.lock().status(task) {
+            Some(TaskStatus::Completed | TaskStatus::Cancelled) => {
+                Err(PriorityBoostError::TerminalTask)
+            }
+            Some(_) => Ok(()),
+            None => Err(PriorityBoostError::UnknownTask),
+        }
     }
 
     pub fn queue_ast_marker(

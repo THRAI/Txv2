@@ -5,7 +5,7 @@
 
 use tx_platform_adapter::notification_adapter;
 
-pub(crate) use readiness::{new_wait_point, notify_bucket, notify_exact};
+pub(crate) use readiness::{new_wait_point, notify_bucket, notify_exact, FutexWaitPoint};
 
 #[notification_adapter(
     subsystem = "futex",
