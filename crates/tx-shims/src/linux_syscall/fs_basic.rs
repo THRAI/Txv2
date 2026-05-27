@@ -191,16 +191,18 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(()) => {
                     if nonblocking {
-                        if let tx_subsystems::vfs::structure::RNodeBacking::StructBacked {
-                            payload:
-                                tx_subsystems::vfs::structure::StructPayload::Socket {
-                                    identity: socket,
-                                },
-                        } = file.rnode().backing()
-                        {
-                            socket
-                                .readiness
-                                .fire_send(tx_subsystems::net::structure::SendWireSet::SPACE);
+                        if let OpenFileBacking::Rnode { rnode } = file.backing() {
+                            if let tx_subsystems::vfs::structure::RNodeBacking::StructBacked {
+                                payload:
+                                    tx_subsystems::vfs::structure::StructPayload::Socket {
+                                        identity: socket,
+                                    },
+                            } = rnode.backing()
+                            {
+                                socket
+                                    .readiness
+                                    .fire_send(tx_subsystems::net::structure::SendWireSet::SPACE);
+                            }
                         }
                     }
                     SyscallResult::Return(0)
@@ -1806,10 +1808,13 @@ fn linux_encode_dev_t(major: u32, minor: u32) -> u64 {
 }
 
 fn stat_rdev_for_open_file(file: &Cap<OpenFile>) -> u64 {
-    match file.rnode().backing() {
-        RNodeBacking::StructBacked {
-            payload: StructPayload::CharDevice(binding),
-        } => linux_encode_dev_t(binding.devt.major(), binding.devt.minor()),
+    match file.backing() {
+        OpenFileBacking::Rnode { rnode } => match rnode.backing() {
+            RNodeBacking::StructBacked {
+                payload: StructPayload::CharDevice(binding),
+            } => linux_encode_dev_t(binding.devt.major(), binding.devt.minor()),
+            _ => 0,
+        },
         _ => 0,
     }
 }
@@ -1850,6 +1855,10 @@ fn inode_meta_to_statx(meta: &InodeMeta, ino: u64) -> StatxLayout {
 }
 
 fn stat_meta_for_open_file(file: &Cap<OpenFile>) -> InodeMeta {
+    if let Some(meta) = stat_meta_for_non_vfs_open_file(file) {
+        return meta;
+    }
+
     let rnode = file.rnode();
     let fs_object_id = rnode.fs_object_id();
     // Live size resolution: cached `rnode.meta()` is the snapshot at
@@ -1881,6 +1890,32 @@ fn stat_meta_for_open_file(file: &Cap<OpenFile>) -> InodeMeta {
     meta
 }
 
+fn stat_meta_for_non_vfs_open_file(file: &OpenFile) -> Option<InodeMeta> {
+    match file.backing() {
+        OpenFileBacking::Rnode { .. } => None,
+        OpenFileBacking::Eventfd { .. }
+        | OpenFileBacking::Timerfd { .. }
+        | OpenFileBacking::Epoll { .. }
+        | OpenFileBacking::SignalFd { .. }
+        | OpenFileBacking::Ufd { .. }
+        | OpenFileBacking::AioContext { .. }
+        | OpenFileBacking::IoUring { .. }
+        | OpenFileBacking::PosixMq { .. }
+        | OpenFileBacking::Pidfd { .. } => Some(InodeMeta {
+            mode: 0o600,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            atime: tx_subsystems::vfs::structure::Timespec::EPOCH,
+            mtime: tx_subsystems::vfs::structure::Timespec::EPOCH,
+            ctime: tx_subsystems::vfs::structure::Timespec::EPOCH,
+            nlinks: 1,
+            blocks: 0,
+            flags: 0,
+        }),
+    }
+}
+
 /// `fstat(fd, statbuf)`. Linux RV64 generic ABI `__NR_fstat = 80`.
 ///
 /// Reads `OpenFile.rnode().meta()` for the fd and writes the Linux
@@ -1906,10 +1941,13 @@ pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         None => return SyscallResult::Error(EBADF_VALUE),
     };
 
-    let rnode = file.rnode();
-    let fs_object_id = rnode.fs_object_id();
-    let meta = stat_meta_for_open_file(&file);
-    let ino = fs_object_id.as_u64();
+    let (meta, ino) = match file.backing() {
+        OpenFileBacking::Rnode { rnode } => {
+            let meta = stat_meta_for_open_file(&file);
+            (meta, rnode.fs_object_id().as_u64())
+        }
+        _ => (stat_meta_for_open_file(&file), fd as u64),
+    };
     let stat = inode_meta_to_stat(&meta, ino, stat_rdev_for_open_file(&file));
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {

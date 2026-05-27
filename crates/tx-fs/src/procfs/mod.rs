@@ -1,6 +1,7 @@
 //! procfs — minimal projected filesystem for `/proc`.
 //! Bringup scope: `/proc`, `/proc/<pid>`, `/proc/self`, `/proc/mounts`.
 
+use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -27,13 +28,35 @@ pub const PROCFS_MOUNTS_ID: FsObjectId = FsObjectId::new(0x7072_6F02);
 pub const PROCFS_CPUINFO_ID: FsObjectId = FsObjectId::new(0x7072_6F03);
 pub const PROCFS_UPTIME_ID: FsObjectId = FsObjectId::new(0x7072_6F04);
 pub const PROCFS_MEMINFO_ID: FsObjectId = FsObjectId::new(0x7072_6F05);
-pub const PROCFS_SYSVIPC_ID: FsObjectId = FsObjectId::new(0x7072_6F06);
-pub const PROCFS_SYSVIPC_MSG_ID: FsObjectId = FsObjectId::new(0x7072_6F07);
-pub const PROCFS_SYSVIPC_SEM_ID: FsObjectId = FsObjectId::new(0x7072_6F08);
-pub const PROCFS_SYSVIPC_SHM_ID: FsObjectId = FsObjectId::new(0x7072_6F09);
-pub const PROCFS_SYS_ID: FsObjectId = FsObjectId::new(0x7072_6F0A);
-pub const PROCFS_SYS_KERNEL_ID: FsObjectId = FsObjectId::new(0x7072_6F0B);
-pub const PROCFS_SYS_KERNEL_TAINTED_ID: FsObjectId = FsObjectId::new(0x7072_6F0C);
+pub const PROCFS_SYS_ID: FsObjectId = FsObjectId::new(0x7072_6F06);
+pub const PROCFS_SYS_KERNEL_ID: FsObjectId = FsObjectId::new(0x7072_6F07);
+pub const PROCFS_SYS_KERNEL_TAINTED_ID: FsObjectId = FsObjectId::new(0x7072_6F08);
+pub const PROCFS_CONFIG_ID: FsObjectId = FsObjectId::new(0x7072_6F09);
+pub const PROCFS_SYS_FS_ID: FsObjectId = FsObjectId::new(0x7072_6F0A);
+pub const PROCFS_SYS_FS_PIPE_MAX_SIZE_ID: FsObjectId = FsObjectId::new(0x7072_6F0B);
+pub const PROCFS_SYS_FS_LEASE_BREAK_TIME_ID: FsObjectId = FsObjectId::new(0x7072_6F0C);
+pub const PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F0D);
+pub const PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F0E);
+pub const PROCFS_SYSVIPC_ID: FsObjectId = FsObjectId::new(0x7072_6F0F);
+pub const PROCFS_SYSVIPC_MSG_ID: FsObjectId = FsObjectId::new(0x7072_6F10);
+pub const PROCFS_SYSVIPC_SEM_ID: FsObjectId = FsObjectId::new(0x7072_6F11);
+pub const PROCFS_SYSVIPC_SHM_ID: FsObjectId = FsObjectId::new(0x7072_6F12);
+pub const PROCFS_NET_ID: FsObjectId = FsObjectId::new(0x7072_6F13);
+pub const PROCFS_NET_ROUTE_ID: FsObjectId = FsObjectId::new(0x7072_6F14);
+pub const PROCFS_NET_ARP_ID: FsObjectId = FsObjectId::new(0x7072_6F15);
+pub const PROCFS_NET_DEV_ID: FsObjectId = FsObjectId::new(0x7072_6F16);
+pub const PROCFS_SYS_NET_ID: FsObjectId = FsObjectId::new(0x7072_6F17);
+pub const PROCFS_SYS_NET_IPV4_ID: FsObjectId = FsObjectId::new(0x7072_6F18);
+pub const PROCFS_SYS_NET_IPV4_IP_FORWARD_ID: FsObjectId = FsObjectId::new(0x7072_6F19);
+pub const PROCFS_NET_TX_NF_RULES_ID: FsObjectId = FsObjectId::new(0x7072_6F1A);
+pub const PROCFS_NET_NF_CONNTRACK_ID: FsObjectId = FsObjectId::new(0x7072_6F1B);
+pub const PROCFS_NET_TCP_ID: FsObjectId = FsObjectId::new(0x7072_6F1C);
+pub const PROCFS_NET_UDP_ID: FsObjectId = FsObjectId::new(0x7072_6F1D);
+pub const PROCFS_NET_RAW_ID: FsObjectId = FsObjectId::new(0x7072_6F1E);
+pub const PROCFS_NET_SNMP_ID: FsObjectId = FsObjectId::new(0x7072_6F1F);
+pub const PROCFS_NET_NETLINK_ID: FsObjectId = FsObjectId::new(0x7072_6F20);
+pub const PROCFS_NET_IF_INET6_ID: FsObjectId = FsObjectId::new(0x7072_6F21);
+pub const PROCFS_SYS_KERNEL_PID_MAX_ID: FsObjectId = FsObjectId::new(0x7072_6F22);
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 const PROCFS_PID_OBJECT_STRIDE: u64 = 0x100;
 const PROCFS_PID_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x10000;
@@ -54,6 +77,8 @@ const PROCFS_TAG_EXE: u64 = 4;
 const PROCFS_TAG_FD_DIR: u64 = 5;
 const PROCFS_TAG_TASK_DIR: u64 = 6;
 const PROCFS_TAG_FDINFO_DIR: u64 = 7;
+const PROCFS_TAG_STATUS: u64 = 8;
+const PROCFS_TAG_SMAPS: u64 = 9;
 const PROCFS_NS_TAG_NET: u64 = 1;
 const fn pid_dir_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64)
@@ -72,6 +97,12 @@ const fn pid_mem_id(pid: Pid) -> FsObjectId {
 }
 const fn pid_maps_id(pid: Pid) -> FsObjectId {
     pid_object_id(pid, PROCFS_TAG_MAPS)
+}
+const fn pid_smaps_id(pid: Pid) -> FsObjectId {
+    pid_object_id(pid, PROCFS_TAG_SMAPS)
+}
+const fn pid_status_id(pid: Pid) -> FsObjectId {
+    pid_object_id(pid, PROCFS_TAG_STATUS)
 }
 const fn pid_exe_id(pid: Pid) -> FsObjectId {
     pid_object_id(pid, PROCFS_TAG_EXE)
@@ -129,6 +160,12 @@ pub fn pid_from_mem_id(id: FsObjectId) -> Option<Pid> {
 pub fn pid_from_maps_id(id: FsObjectId) -> Option<Pid> {
     pid_from_object_id(id, PROCFS_TAG_MAPS)
 }
+pub fn pid_from_smaps_id(id: FsObjectId) -> Option<Pid> {
+    pid_from_object_id(id, PROCFS_TAG_SMAPS)
+}
+pub fn pid_from_status_id(id: FsObjectId) -> Option<Pid> {
+    pid_from_object_id(id, PROCFS_TAG_STATUS)
+}
 pub fn pid_from_exe_id(id: FsObjectId) -> Option<Pid> {
     pid_from_object_id(id, PROCFS_TAG_EXE)
 }
@@ -177,7 +214,7 @@ pub fn pid_from_fdinfo_id(id: FsObjectId) -> Option<(Pid, u32)> {
     Some((pid, fd))
 }
 
-fn pid_from_dir(id: FsObjectId) -> Option<Pid> {
+pub fn pid_from_dir(id: FsObjectId) -> Option<Pid> {
     match id {
         PROCFS_ROOT_ID
         | PROCFS_SELF_ID
@@ -188,6 +225,7 @@ fn pid_from_dir(id: FsObjectId) -> Option<Pid> {
         | PROCFS_SYS_ID
         | PROCFS_SYS_KERNEL_ID
         | PROCFS_SYS_KERNEL_TAINTED_ID
+        | PROCFS_SYS_KERNEL_PID_MAX_ID
         | PROCFS_CONFIG_ID
         | PROCFS_SYS_FS_ID
         | PROCFS_SYS_FS_PIPE_MAX_SIZE_ID
@@ -254,6 +292,15 @@ fn process_for_procfs_number(n: u32) -> Option<Cap<process::ProcessIdentity>> {
         Some(PidName::Thread(thread)) => thread.upgrade_owner_proc(),
         _ => None,
     }
+}
+
+fn procfs_self_target_pid() -> Pid {
+    process::all_pids()
+        .into_iter()
+        .filter(|(pid, alive)| *alive && pid.0 != 1)
+        .map(|(pid, _)| pid)
+        .max_by_key(|pid| pid.0)
+        .unwrap_or(Pid(1))
 }
 
 fn dir_entry(id: FsObjectId, kind: InodeKind, name: &[u8]) -> DirEntry {
@@ -357,6 +404,9 @@ impl FsOps for Procfs {
             if name == b"tainted" {
                 return StepOutcome::done(PROCFS_SYS_KERNEL_TAINTED_ID);
             }
+            if name == b"pid_max" {
+                return StepOutcome::done(PROCFS_SYS_KERNEL_PID_MAX_ID);
+            }
             return StepOutcome::err(Errno::ENOENT);
         }
         if parent == PROCFS_SYSVIPC_ID {
@@ -429,6 +479,12 @@ impl FsOps for Procfs {
             }
             if name == b"maps" && process_for_procfs_number(pid.0).is_some() {
                 return StepOutcome::done(pid_maps_id(pid));
+            }
+            if name == b"smaps" && process_for_procfs_number(pid.0).is_some() {
+                return StepOutcome::done(pid_smaps_id(pid));
+            }
+            if name == b"status" && process_for_procfs_number(pid.0).is_some() {
+                return StepOutcome::done(pid_status_id(pid));
             }
             if name == b"exe" && process_for_procfs_number(pid.0).is_some() {
                 return StepOutcome::done(pid_exe_id(pid));
@@ -516,6 +572,7 @@ impl FsOps for Procfs {
             | PROCFS_MEMINFO_ID
             | PROCFS_CONFIG_ID
             | PROCFS_SYS_KERNEL_TAINTED_ID
+            | PROCFS_SYS_KERNEL_PID_MAX_ID
             | PROCFS_NET_ROUTE_ID
             | PROCFS_NET_ARP_ID
             | PROCFS_NET_DEV_ID
@@ -553,6 +610,12 @@ impl FsOps for Procfs {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE | 0o600))
             }
             id if pid_from_maps_id(id).is_some() => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            }
+            id if pid_from_smaps_id(id).is_some() => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            }
+            id if pid_from_status_id(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             id if pid_from_exe_id(id).is_some() => {
@@ -682,6 +745,8 @@ impl FsOps for Procfs {
                 (b"cmdline", pid_cmdline_id(pid), InodeKind::Regular),
                 (b"mem", pid_mem_id(pid), InodeKind::Regular),
                 (b"maps", pid_maps_id(pid), InodeKind::Regular),
+                (b"smaps", pid_smaps_id(pid), InodeKind::Regular),
+                (b"status", pid_status_id(pid), InodeKind::Regular),
                 (b"exe", pid_exe_id(pid), InodeKind::Symlink),
                 (b"fd", pid_fd_dir_id(pid), InodeKind::Directory),
                 (b"task", pid_task_dir_id(pid), InodeKind::Directory),
@@ -800,10 +865,16 @@ impl FsOps for Procfs {
             if state_byte < 2 {
                 return finish_dots(state_byte, idx, id);
             }
-            if idx == 2 {
+            let files: &[(&[u8], FsObjectId, InodeKind)] = &[
+                (b"tainted", PROCFS_SYS_KERNEL_TAINTED_ID, InodeKind::Regular),
+                (b"pid_max", PROCFS_SYS_KERNEL_PID_MAX_ID, InodeKind::Regular),
+            ];
+            let fi = idx.saturating_sub(2);
+            if fi < files.len() {
+                let (name, oid, kind) = files[fi];
                 return StepOutcome::done(Some((
-                    dir_entry(PROCFS_SYS_KERNEL_TAINTED_ID, InodeKind::Regular, b"tainted"),
-                    DirCursor([2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    dir_entry(oid, kind, name),
+                    DirCursor([2, (fi + 3) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
                 )));
             }
             return StepOutcome::done(None);
@@ -984,9 +1055,8 @@ impl FsOps for Procfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
         if id == PROCFS_SELF_ID {
-            // v1: /proc/self always points to pid 1.
-            // Full implementation requires caller pid context.
-            StepOutcome::done(alloc::boxed::Box::from(&b"1"[..]))
+            let pid = procfs_self_target_pid();
+            StepOutcome::done(format!("{}", pid.0).into_bytes().into_boxed_slice())
         } else if let Some((pid, fd_num)) = pid_from_fd_id(id) {
             // /proc/<pid>/fd/N — symlink target is the path of the open file.
             let Some(proc) = process::process_by_pid(pid) else {

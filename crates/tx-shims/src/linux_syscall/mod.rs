@@ -87,7 +87,8 @@ use tx_subsystems::vfs::composite::{
     AccessOp, ChmodOp, ChownOp, MknodOp, NanosleepOp, StatOp, StatxOp, StatxResult,
 };
 use tx_subsystems::vfs::structure::{
-    Credential, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking, StructPayload, S_ISGID,
+    Credential, InodeKind, InodeMeta, OpenFileBacking, OpenFileFlags, RNodeBacking, StructPayload,
+    S_ISGID,
 };
 use tx_subsystems::vfs::{
     DEntry, FileFsyncOp, FlockOp, OpenFile, OpenFileGetFlOp, OpenFileSetFlOp, OpenOp,
@@ -521,6 +522,9 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_GETPPID => return sys_getppid(ctx),
         nr if nr == NR_GETPGID => return sys_getpgid(req.args, ctx),
         nr if nr == NR_GETSID => return sys_getsid(req.args, ctx),
+        nr if nr == NR_KCMP => return sys_kcmp(req.args, ctx),
+        nr if nr == NR_PIDFD_GETFD => return sys_pidfd_getfd(req.args, ctx),
+        nr if nr == NR_GETRLIMIT => return sys_getrlimit(req.args, ctx),
         nr if nr == NR_GETUID => return sys_getuid(ctx),
         nr if nr == NR_GETEUID => return sys_geteuid(ctx),
         nr if nr == NR_GETGID => return sys_getgid(ctx),
@@ -540,20 +544,13 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_SETHOSTNAME => return sys_sethostname(req.args, ctx),
         nr if nr == NR_GETRANDOM => return sys_getrandom(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
-        nr if nr == NR_GETRLIMIT => return sys_getrlimit(req.args, ctx),
-        nr if nr == NR_SETRLIMIT => return sys_setrlimit(req.args, ctx),
-        nr if nr == NR_GETRUSAGE => return sys_getrusage(req.args, ctx),
+        nr if nr == NR_PERSONALITY => return sys_personality(req.args, ctx),
         nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
+        nr if nr == NR_SCHED_GETATTR => return sys_sched_getattr(req.args, ctx),
+        nr if nr == NR_SCHED_SETATTR => return sys_sched_setattr(req.args, ctx),
         nr if nr == NR_SCHED_GETAFFINITY => return sys_sched_getaffinity(req.args, ctx),
         nr if nr == NR_SCHED_SETAFFINITY => return sys_sched_setaffinity(req.args, ctx),
-        nr if nr == NR_SCHED_SETSCHEDULER => return sys_sched_setscheduler(),
-        nr if nr == NR_SCHED_SETPARAM => return sys_sched_setparam(req.args, ctx),
-        nr if nr == NR_SCHED_GETSCHEDULER => return sys_sched_getscheduler(req.args, ctx),
-        nr if nr == NR_SCHED_GETPARAM => return sys_sched_getparam(req.args, ctx),
-        nr if nr == NR_SCHED_YIELD => return sys_sched_yield(),
-        nr if nr == NR_SCHED_GET_PRIORITY_MAX => return sys_sched_get_priority_max(req.args),
-        nr if nr == NR_SCHED_GET_PRIORITY_MIN => return sys_sched_get_priority_min(req.args),
-        nr if nr == NR_SCHED_RR_GET_INTERVAL => return sys_sched_rr_get_interval(req.args, ctx),
+        nr if nr == NR_SCHED_SETSCHEDULER => return sys_sched_setscheduler(req.args, ctx),
         nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
         nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args, ctx),
         nr if nr == NR_GET_ROBUST_LIST => return sys_get_robust_list(req.args, ctx),
@@ -565,16 +562,11 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_MLOCK2 => return sys_mlock2(req.args, ctx).await,
         nr if nr == NR_MLOCKALL => return sys_mlockall(req.args, ctx).await,
         nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx).await,
-        nr if nr == NR_MUNLOCKALL => return sys_munlockall(ctx).await,
-        nr if nr == NR_MEMFD_CREATE => return sys_memfd_create(req.args, ctx),
-        nr if nr == NR_GET_MEMPOLICY => return sys_get_mempolicy(req.args, ctx),
-        nr if nr == NR_SET_MEMPOLICY => return sys_set_mempolicy(req.args, ctx),
-        nr if nr == NR_MBIND => return sys_mbind(req.args, ctx),
-        nr if nr == NR_MIGRATE_PAGES => return sys_migrate_pages(req.args, ctx),
-        nr if nr == NR_MOVE_PAGES => return sys_move_pages(req.args, ctx),
-        nr if nr == NR_PROCESS_VM_READV => return sys_process_vm_readv(req.args, ctx),
-        nr if nr == NR_PROCESS_VM_WRITEV => return sys_process_vm_writev(req.args, ctx),
-        nr if nr == NR_PROCESS_MADVISE => return sys_process_madvise(req.args, ctx),
+        nr if nr == NR_MLOCKALL => return sys_mlockall(req.args, ctx).await,
+        nr if nr == NR_MUNLOCKALL => return sys_munlockall(req.args, ctx).await,
+        nr if nr == NR_MINCORE => return sys_mincore(req.args, ctx),
+        nr if nr == NR_REMAP_FILE_PAGES => return sys_remap_file_pages(req.args),
+        nr if nr == NR_MLOCK2 => return sys_mlock2(req.args, ctx).await,
         nr if nr == NR_UTIMENSAT => return sys_utimensat::<P>(req.args, ctx),
         nr if nr == NR_SHMGET => return sys_shmget(req.args, ctx),
         nr if nr == NR_SHMDT => return sys_shmdt(req.args, ctx).await,
@@ -641,9 +633,11 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
         nr if nr == NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx),
         nr if nr == NR_RT_SIGPENDING => sys_rt_sigpending(req.args, ctx),
-        nr if nr == NR_RT_SIGSUSPEND => sys_rt_sigsuspend(req.args, ctx),
+        nr if nr == NR_RT_SIGSUSPEND => sys_rt_sigsuspend::<P>(req.args, ctx).await,
         nr if nr == NR_RT_SIGQUEUEINFO => sys_rt_sigqueueinfo(req.args, ctx),
         nr if nr == NR_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait::<P>(req.args, ctx).await,
+        nr if nr == NR_PIDFD_OPEN => sys_pidfd_open(req.args, ctx),
+        nr if nr == NR_PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(req.args, ctx),
         nr if nr == NR_SIGALTSTACK => sys_sigaltstack(req.args, ctx),
         nr if nr == NR_PIDFD_OPEN => sys_pidfd_open(req.args, ctx),
         nr if nr == NR_PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(req.args, ctx),
@@ -666,8 +660,8 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_REMOVEXATTRAT => sys_removexattrat(req.args, ctx),
         nr if nr == NR_SHMCTL => sys_shmctl(req.args, ctx),
         nr if nr == NR_MSGCTL => sys_msgctl(req.args, ctx),
-        nr if nr == NR_SEMOP => sys_semop(req.args, ctx),
-        nr if nr == NR_SEMTIMEDOP => sys_semtimedop(req.args, ctx),
+        nr if nr == NR_SEMOP => sys_semop(req.args, ctx).await,
+        nr if nr == NR_SEMTIMEDOP => sys_semtimedop::<P>(req.args, ctx).await,
         nr if nr == NR_SEMCTL => sys_semctl(req.args, ctx),
         nr if nr == NR_SHMAT => sys_shmat(req.args, ctx).await,
         nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
@@ -1011,21 +1005,6 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
             )
             .await
         }
-        nr if nr == NR_EPOLL_PWAIT2 => {
-            sys_epoll_pwait2::<P>(
-                req.args[0] as u32,
-                req.args[1],
-                req.args[2] as u32,
-                req.args[3],
-                ctx,
-            )
-            .await
-        }
-        nr if nr == NR_INOTIFY_INIT1 => sys_inotify_init1(req.args[0] as u32, ctx),
-        nr if nr == NR_INOTIFY_ADD_WATCH => sys_inotify_add_watch(req.args, ctx),
-        nr if nr == NR_INOTIFY_RM_WATCH => sys_inotify_rm_watch(req.args, ctx),
-        nr if nr == NR_FANOTIFY_INIT => sys_fanotify_init(req.args, ctx),
-        nr if nr == NR_FANOTIFY_MARK => sys_fanotify_mark(req.args, ctx),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -1033,6 +1012,65 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
 // ---------------------------------------------------------------------------
 // membarrier(2)
 // ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SchedParamLayout {
+    sched_priority: i32,
+}
+
+/// `sched_setscheduler(pid, policy, param)` — validation-only shim.
+///
+/// The actual scheduler policy remains txKernel's native policy, but Linux
+/// callers expect the basic errno surface for bad pid/policy/param/priority.
+fn sys_sched_setscheduler<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    const SCHED_OTHER: u32 = 0;
+    const SCHED_FIFO: u32 = 1;
+    const SCHED_RR: u32 = 2;
+    const SCHED_BATCH: u32 = 3;
+    const SCHED_IDLE: u32 = 5;
+
+    let pid = args[0];
+    let policy = args[1] as u32;
+    let param_ptr = args[2];
+
+    if pid != 0 {
+        let Ok(pid32) = u32::try_from(pid) else {
+            return SyscallResult::Error(ESRCH_VALUE);
+        };
+        if process_by_pid(Pid(pid32)).is_none()
+            && !matches!(
+                tx_subsystems::process::numbers::resolve_pid_number(pid),
+                Some(tx_subsystems::process::numbers::PidName::Thread(_))
+            )
+        {
+            return SyscallResult::Error(ESRCH_VALUE);
+        }
+    }
+    if !matches!(
+        policy,
+        SCHED_OTHER | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE
+    ) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if param_ptr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let param = match bootstrap_read_user::<SchedParamLayout>(&ctx.aspace, param_ptr) {
+        Ok(param) => param,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    let priority = param.sched_priority;
+    let valid_priority = match policy {
+        SCHED_FIFO | SCHED_RR => (1..=99).contains(&priority),
+        _ => priority == 0,
+    };
+    if !valid_priority {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    SyscallResult::Return(0)
+}
 
 /// `membarrier(cmd, flags, cpu_id)` — issue memory-ordering barriers
 /// across all online harts.
@@ -1052,15 +1090,6 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
 ///   expedited plus instruction-fetch barrier (`fence.i` on RV64).
 /// - `MEMBARRIER_CMD_REGISTER_*` — registration is a no-op; always
 ///   returns 0.
-///   `sched_setscheduler(pid, policy, param)` — v1 stub.
-///
-/// musl calls this during `pthread_create` to set the new thread's
-/// scheduling policy. Returns 0 unconditionally (success, no-op);
-/// real priority inheritance is deferred to the scheduler slice.
-fn sys_sched_setscheduler() -> SyscallResult {
-    SyscallResult::Return(0)
-}
-
 ///
 /// `flags` and `cpu_id` are currently ignored (must be 0).
 fn sys_membarrier<P: SmpIf>(args: &[u64; 6]) -> SyscallResult {

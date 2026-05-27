@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use tx_hal::{MmioRegion, PlatformInfoIf, TxPlatform};
 use virtio_drivers::transport::{
     pci::{
@@ -11,6 +13,11 @@ use virtio_drivers::transport::{
 };
 
 use super::dma::TxVirtioHal;
+
+static PCI_MMIO32_ALLOCATOR_READY: AtomicBool = AtomicBool::new(false);
+static PCI_MMIO32_ALLOCATOR_START: AtomicU64 = AtomicU64::new(0);
+static PCI_MMIO32_ALLOCATOR_NEXT: AtomicU64 = AtomicU64::new(0);
+static PCI_MMIO32_ALLOCATOR_END: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VirtioPciError {
@@ -72,16 +79,14 @@ fn find_virtio_transport<P: TxPlatform>(
 ) -> Result<PciTransport, VirtioPciError> {
     let cam = unsafe { MmioCam::new(ecam_region.virt.start.0 as *mut u8, Cam::Ecam) };
     let mut root = PciRoot::new(cam);
-    let mut allocator = PciMemory32Allocator::new(
-        mmio32_region.phys.start.0 as u64,
-        mmio32_region.phys.size as u64,
-    )?;
+    let mut allocator = shared_pci_memory32_allocator(mmio32_region)?;
 
     for (device_function, info) in root.enumerate_bus(0) {
         if virtio_device_type(&info) != Some(device_type) {
             continue;
         }
         allocate_bars(&mut root, device_function, &mut allocator)?;
+        publish_shared_pci_memory32_next(&allocator);
         root.set_command(
             device_function,
             Command::MEMORY_SPACE | Command::BUS_MASTER | Command::IO_SPACE,
@@ -97,12 +102,53 @@ fn find_virtio_transport<P: TxPlatform>(
     }
 }
 
+fn shared_pci_memory32_allocator(
+    mmio32_region: MmioRegion,
+) -> Result<PciMemory32Allocator, VirtioPciError> {
+    let start = mmio32_region.phys.start.0 as u64;
+    let size = mmio32_region.phys.size as u64;
+    let end = start
+        .checked_add(size)
+        .ok_or(VirtioPciError::BarAddressExhausted)?;
+    if end > u32::MAX as u64 + 1 {
+        return Err(VirtioPciError::BarTooLarge);
+    }
+
+    if !PCI_MMIO32_ALLOCATOR_READY.load(Ordering::Acquire) {
+        PCI_MMIO32_ALLOCATOR_START.store(start, Ordering::Release);
+        PCI_MMIO32_ALLOCATOR_NEXT.store(start, Ordering::Release);
+        PCI_MMIO32_ALLOCATOR_END.store(end, Ordering::Release);
+        let _ = PCI_MMIO32_ALLOCATOR_READY.compare_exchange(
+            false,
+            true,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    if PCI_MMIO32_ALLOCATOR_START.load(Ordering::Acquire) != start
+        || PCI_MMIO32_ALLOCATOR_END.load(Ordering::Acquire) != end
+    {
+        return Err(VirtioPciError::BarAddressExhausted);
+    }
+
+    Ok(PciMemory32Allocator {
+        next: PCI_MMIO32_ALLOCATOR_NEXT.load(Ordering::Acquire),
+        end,
+    })
+}
+
+fn publish_shared_pci_memory32_next(allocator: &PciMemory32Allocator) {
+    PCI_MMIO32_ALLOCATOR_NEXT.store(allocator.next, Ordering::Release);
+}
+
 struct PciMemory32Allocator {
     next: u64,
     end: u64,
 }
 
 impl PciMemory32Allocator {
+    #[cfg(test)]
     fn new(start: u64, size: u64) -> Result<Self, VirtioPciError> {
         let end = start
             .checked_add(size)

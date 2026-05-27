@@ -9,7 +9,9 @@ use super::{
 use crate::adapter::step_engine::{InterestMask, WaitSourceId};
 use alloc::vec::Vec;
 use tx_hal::TimeIf;
-use tx_subsystems::execution::Errno;
+use tx_scripts::drive;
+use tx_substrate::step::{Deadline, DriveMode};
+use tx_subsystems::execution::{Errno, WaitToken};
 use tx_subsystems::ipc;
 use tx_subsystems::ipc::posix_mq::structure::MqNotification;
 use tx_subsystems::ipc::sysv_sem::structure::SemBuf;
@@ -587,18 +589,22 @@ pub(super) fn sys_semget(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
     }
 }
 
-pub(super) fn sys_semop(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let (_ns, cred) = match nsproxy_and_cred(ctx) {
-        Ok(v) => v,
-        Err(e) => return SyscallResult::Error(errno_to_i32(e)),
-    };
-    let (semid, sops) = match read_semops(args, ctx) {
-        Ok(v) => v,
-        Err(result) => return result,
-    };
-    match ipc::sysv_sem::execution::step_semop(semid, &sops, &cred, &ctx.process) {
-        Ok(applied) => SyscallResult::Return(applied as i64),
-        Err(e) => SyscallResult::Error(errno_to_i32(e)),
+fn read_semops(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Result<(u32, Vec<SemBuf>), SyscallResult> {
+    let semid = args[0] as u32;
+    let sops_ptr = args[1];
+    let nsops = args[2] as usize;
+    if nsops == 0 || nsops > 500 {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    if sops_ptr == 0 {
+        return Err(SyscallResult::Error(EFAULT_VALUE));
+    }
+    let byte_len = nsops
+        .checked_mul(core::mem::size_of::<SembufLayout>())
+        .ok_or(SyscallResult::Error(EINVAL_VALUE))?;
+    let mut bytes = alloc::vec![0; byte_len];
+    if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, sops_ptr) {
+        return Err(SyscallResult::Error(errno_to_i32(errno)));
     }
 }
 
@@ -610,18 +616,108 @@ pub(super) fn sys_semtimedop(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
     if let Err(result) = validate_sem_timeout(ctx, args[3]) {
         return result;
     }
+    Ok((semid, sops))
+}
+
+fn read_relative_timeout_ns(
+    ctx: &SyscallCtx<'_>,
+    timeout_ptr: u64,
+) -> Result<Option<u64>, SyscallResult> {
+    if timeout_ptr == 0 {
+        return Ok(None);
+    }
+    let ts: TimespecLayout = match bootstrap_read_user(&ctx.aspace, timeout_ptr) {
+        Ok(v) => v,
+        Err(errno) => return Err(SyscallResult::Error(errno_to_i32(errno))),
+    };
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    Ok(Some(
+        (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64),
+    ))
+}
+
+async fn drive_semop(
+    semid: u32,
+    sops: &[SemBuf],
+    ctx: &SyscallCtx<'_>,
+    deadline_ns: Option<u64>,
+) -> SyscallResult {
+    let (_ns, cred) = match nsproxy_and_cred(ctx) {
+        Ok(v) => v,
+        Err(e) => return SyscallResult::Error(errno_to_i32(e)),
+    };
+
+    match ipc::sysv_sem::execution::step_semop(semid, sops, &cred, &ctx.process) {
+        Ok(applied) => return SyscallResult::Return(applied as i64),
+        Err(Errno::EAGAIN)
+            if sops
+                .iter()
+                .all(|op| (op.sem_flg & ipc::sysv_sem::structure::sem_flg::IPC_NOWAIT) == 0) => {}
+        Err(e) => return SyscallResult::Error(errno_to_i32(e)),
+    }
+
+    let mut script_ctx = super::build_subject_script_ctx(ctx);
+    if let Some(deadline_ns) = deadline_ns {
+        script_ctx = script_ctx.with_deadline(Deadline::from_raw(deadline_ns));
+    }
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+
+    let op = ipc::sysv_sem::execution::SemopWaitOp::new(
+        semid,
+        sops,
+        &cred,
+        &ctx.process,
+        Some(ctx.process.pid.0),
+    );
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(applied) => SyscallResult::Return(applied as i64),
+        Err(v3errno) => {
+            let errno: Errno = v3errno.into();
+            if deadline_ns.is_some() && errno == Errno::ETIMEDOUT {
+                return SyscallResult::Error(errno_to_i32(Errno::EAGAIN));
+            }
+            SyscallResult::error_from(errno)
+        }
+    }
+}
+
+pub(super) async fn sys_semop(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let (semid, sops) = match read_semops(args, ctx) {
         Ok(v) => v,
         Err(result) => return result,
     };
-    match ipc::sysv_sem::execution::step_semop(semid, &sops, &cred, &ctx.process) {
-        Ok(applied) => SyscallResult::Return(applied as i64),
-        Err(e) => SyscallResult::Error(errno_to_i32(e)),
-    }
+    drive_semop(semid, &sops, ctx, None).await
 }
 
-pub(super) fn sys_semtimedop(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    sys_semop(args, ctx)
+pub(super) async fn sys_semtimedop<P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
+    let (semid, sops) = match read_semops(args, ctx) {
+        Ok(v) => v,
+        Err(result) => return result,
+    };
+    let timeout_ns = match read_relative_timeout_ns(ctx, args[3]) {
+        Ok(v) => v,
+        Err(result) => return result,
+    };
+    let deadline_ns = timeout_ns.map(|ns| P::read_ns().saturating_add(ns));
+    drive_semop(semid, &sops, ctx, deadline_ns).await
 }
 
 pub(super) fn sys_semctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {

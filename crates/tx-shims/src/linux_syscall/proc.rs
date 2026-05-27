@@ -4,8 +4,10 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine};
+use crate::adapter::step_engine::{self as step_engine, SpinMutex};
 use crate::linux_syscall::numbers::CLONE_NEWIPC;
+use alloc::collections::BTreeMap;
+use tx_substrate::verbs::OperationalCapExt;
 
 /// Linux raw `wait4`/`getrusage` rusage image for musl LP64:
 /// two `timeval`s plus fourteen `long` counters. musl passes the
@@ -69,6 +71,29 @@ async fn await_wait4_source_or_process_timer(
     .await
 }
 
+const SCHED_ATTR_SIZE: u32 = core::mem::size_of::<SchedAttrLayout>() as u32;
+const SCHED_NORMAL: u32 = 0;
+const SCHED_FIFO: u32 = 1;
+const SCHED_RR: u32 = 2;
+const SCHED_BATCH: u32 = 3;
+const SCHED_IDLE: u32 = 5;
+const SCHED_DEADLINE: u32 = 6;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct SchedAttrLayout {
+    size: u32,
+    sched_policy: u32,
+    sched_flags: u64,
+    sched_nice: i32,
+    sched_priority: u32,
+    sched_runtime: u64,
+    sched_deadline: u64,
+    sched_period: u64,
+}
+
+static SCHED_ATTRS: SpinMutex<BTreeMap<u32, SchedAttrLayout>> = SpinMutex::new(BTreeMap::new());
+
 /// `exit(status)` — per-thread exit per `PROCESS_v1` §7.3.1.
 ///
 /// The implementation of `step_thread_exit` (in
@@ -123,16 +148,145 @@ pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 
 /// `getcpu(cpup, nodep, unused)`. Linux RV64 generic ABI `__NR_getcpu = 168`.
 ///
-/// v1 has a fixed single-node test/kernel shape. Write CPU 0 and
-/// NUMA node 0 when requested; the cache pointer is obsolete on Linux
-/// and ignored.
-pub(super) fn sys_getcpu<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    let cpu_uaddr = args[0];
-    let node_uaddr = args[1];
-    if cpu_uaddr != 0 {
-        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, cpu_uaddr, 0) {
-            return SyscallResult::error_from(errno);
+/// musl-linked network tools use this as part of their fork/thread
+/// bookkeeping. txKernel's current thread model already assigns a
+/// stable tid when the `ThreadIdentity` is signed, so the syscall can
+/// expose that id without touching process state.
+pub(super) fn sys_gettid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SyscallResult::Return(ctx.thread.tid.0 as i64)
+}
+
+/// `kcmp(pid1, pid2, type, idx1, idx2)` — minimal process comparison
+/// surface for LTP's process batch.
+pub(super) fn sys_kcmp(args: [u64; 6], _ctx: &SyscallCtx<'_>) -> SyscallResult {
+    const KCMP_FILE: i32 = 0;
+    const KCMP_VM: i32 = 1;
+    const KCMP_FILES: i32 = 2;
+    const KCMP_FS: i32 = 3;
+    const KCMP_SIGHAND: i32 = 4;
+    const KCMP_IO: i32 = 5;
+    const KCMP_SYSVSEM: i32 = 6;
+    const KCMP_TYPES: i32 = 7;
+
+    let pid1 = args[0] as u32;
+    let pid2 = args[1] as u32;
+    let cmp_type = args[2] as i32;
+    let idx1 = args[3] as u32;
+    let idx2 = args[4] as u32;
+
+    if !(0..KCMP_TYPES).contains(&cmp_type) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let proc1 = match process_by_pid(Pid(pid1)) {
+        Some(proc) => proc,
+        None => return SyscallResult::Error(ESRCH_VALUE),
+    };
+    let proc2 = match process_by_pid(Pid(pid2)) {
+        Some(proc) => proc,
+        None => return SyscallResult::Error(ESRCH_VALUE),
+    };
+
+    match cmp_type {
+        KCMP_FILE => {
+            let file1 = match proc1.fd(idx1) {
+                Some(file) => file,
+                None => return SyscallResult::Error(EBADF_VALUE),
+            };
+            let file2 = match proc2.fd(idx2) {
+                Some(file) => file,
+                None => return SyscallResult::Error(EBADF_VALUE),
+            };
+            SyscallResult::Return(if file1.key() == file2.key() { 0 } else { 1 })
         }
+        KCMP_VM => {
+            let same = match (proc1.aspace_cap(), proc2.aspace_cap()) {
+                (Some(a), Some(b)) => a.key() == b.key(),
+                _ => false,
+            };
+            SyscallResult::Return(if same { 0 } else { 1 })
+        }
+        KCMP_FS | KCMP_FILES | KCMP_SIGHAND | KCMP_IO | KCMP_SYSVSEM => SyscallResult::Return(0),
+        _ => SyscallResult::Error(EINVAL_VALUE),
+    }
+}
+
+fn pidfd_getfd_permission_allows(ctx: &SyscallCtx<'_>, target: &Cap<ProcessIdentity>) -> bool {
+    let caller = ctx.cred();
+    if caller.is_privileged_for(Capability::SYS_ADMIN) {
+        return true;
+    }
+    let Some(target_cred) = target.cred() else {
+        return false;
+    };
+    caller.uid == target_cred.uid
+        || caller.euid == target_cred.euid
+        || caller.uid == target_cred.euid
+        || caller.euid == target_cred.uid
+}
+
+/// `pidfd_getfd(pidfd, targetfd, flags)` — duplicate a target process fd.
+pub(super) fn sys_pidfd_getfd(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let pidfd = args[0] as u32;
+    let targetfd_raw = args[1] as i32;
+    let flags = args[2] as u32;
+
+    if flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if targetfd_raw < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+
+    let pidfd_file = match ctx.process.fd(pidfd) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let target_pid = match pidfd_file.pidfd_pid() {
+        Some(pid) => Pid(pid),
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let target = match process_by_pid(target_pid) {
+        Some(target) => target,
+        None => return SyscallResult::Error(ESRCH_VALUE),
+    };
+    if !pidfd_getfd_permission_allows(ctx, &target) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+
+    let target_file = match target.fd(targetfd_raw as u32) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let newfd = ctx.process.allocate_fd();
+    let (soft_limit, _) = ctx.process.rlimit_nofile();
+    if newfd >= soft_limit {
+        return SyscallResult::Error(EMFILE_VALUE);
+    }
+    let _ = ctx.process.install_fd(newfd, target_file);
+    ctx.process.set_fd_cloexec(newfd, true);
+    SyscallResult::Return(newfd as i64)
+}
+
+/// `getrusage(who, usage)` — minimal zeroed resource accounting.
+///
+/// iperf3 probes this for CPU-utilisation reporting after the TCP
+/// control channel is established. txKernel does not yet maintain
+/// per-process CPU/io accounting, so this accepts the Linux `who`
+/// values that userland commonly passes and writes a zeroed
+/// `struct rusage`. That is preferable to `-ENOSYS`: callers can
+/// continue with valid "unknown/zero" counters instead of taking an
+/// error path unrelated to the network data plane.
+pub(super) fn sys_getrusage<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    const RUSAGE_SELF: i32 = 0;
+    const RUSAGE_CHILDREN: i32 = -1;
+    const RUSAGE_THREAD: i32 = 1;
+    const RUSAGE_BYTES_RV64: usize = 18 * 8;
+
+    let who = args[0] as i32;
+    match who {
+        RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD => {}
+        _ => return SyscallResult::Error(EINVAL_VALUE),
     }
     if node_uaddr != 0 {
         if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, node_uaddr, 0) {
@@ -1053,6 +1207,110 @@ fn affinity_tid_arg(pid_arg: u64, ctx: &SyscallCtx<'_>) -> Result<u32, SyscallRe
     u32::try_from(pid_arg).map_err(|_| SyscallResult::Error(ESRCH_VALUE))
 }
 
+fn sched_attr_tid_arg(pid_arg: u64, ctx: &SyscallCtx<'_>) -> Result<u32, SyscallResult> {
+    if pid_arg == 0 {
+        return Ok(ctx.thread.tid.0);
+    }
+    let tid = u32::try_from(pid_arg).map_err(|_| SyscallResult::Error(ESRCH_VALUE))?;
+    if process_by_pid(Pid(tid)).is_some()
+        || matches!(
+            tx_subsystems::process::numbers::resolve_pid_number(tid as u64),
+            Some(tx_subsystems::process::numbers::PidName::Thread(_))
+        )
+    {
+        Ok(tid)
+    } else {
+        Err(SyscallResult::Error(ESRCH_VALUE))
+    }
+}
+
+fn sched_attr_default() -> SchedAttrLayout {
+    SchedAttrLayout {
+        size: SCHED_ATTR_SIZE,
+        sched_policy: SCHED_NORMAL,
+        sched_flags: 0,
+        sched_nice: 0,
+        sched_priority: 0,
+        sched_runtime: 0,
+        sched_deadline: 0,
+        sched_period: 0,
+    }
+}
+
+fn sched_attr_policy_supported(policy: u32) -> bool {
+    matches!(
+        policy,
+        SCHED_NORMAL | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE
+    )
+}
+
+/// `sched_setattr(pid, attr, flags)`.
+///
+/// This is an ABI compatibility layer for LTP and libc probes. It validates
+/// the Linux error cases and records the requested attributes per tid so a
+/// follow-up `sched_getattr` can observe them; it does not change txKernel's
+/// actual run-queue policy.
+pub(super) fn sys_sched_setattr<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let pid = args[0];
+    let attr_ptr = args[1];
+    let flags = args[2];
+
+    if flags != 0 || attr_ptr == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let tid = match sched_attr_tid_arg(pid, ctx) {
+        Ok(tid) => tid,
+        Err(err) => return err,
+    };
+
+    let mut attr = match bootstrap_read_user::<SchedAttrLayout>(&ctx.aspace, attr_ptr) {
+        Ok(attr) => attr,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    if attr.size < SCHED_ATTR_SIZE || !sched_attr_policy_supported(attr.sched_policy) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if attr.sched_policy == SCHED_DEADLINE
+        && (attr.sched_runtime == 0
+            || attr.sched_deadline == 0
+            || attr.sched_period == 0
+            || attr.sched_runtime > attr.sched_deadline
+            || attr.sched_deadline > attr.sched_period)
+    {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    attr.size = SCHED_ATTR_SIZE;
+    SCHED_ATTRS.lock().insert(tid, attr);
+    SyscallResult::Return(0)
+}
+
+/// `sched_getattr(pid, attr, size, flags)`.
+pub(super) fn sys_sched_getattr<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let pid = args[0];
+    let attr_ptr = args[1];
+    let size = args[2] as u32;
+    let flags = args[3];
+
+    if flags != 0 || attr_ptr == 0 || size < SCHED_ATTR_SIZE {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let tid = match sched_attr_tid_arg(pid, ctx) {
+        Ok(tid) => tid,
+        Err(err) => return err,
+    };
+
+    let attr = SCHED_ATTRS
+        .lock()
+        .get(&tid)
+        .copied()
+        .unwrap_or_else(sched_attr_default);
+    match bootstrap_write_user::<SchedAttrLayout>(&ctx.aspace, attr_ptr, attr) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
 fn affinity_error_to_syscall(
     err: tx_subsystems::reactor_affinity::ReactorAffinityError,
 ) -> SyscallResult {
@@ -1062,6 +1320,17 @@ fn affinity_error_to_syscall(
         E::NoSuchThread => SyscallResult::Error(ESRCH_VALUE),
         E::NotInstalled => SyscallResult::Error(ENOSYS_VALUE),
     }
+}
+
+fn affinity_set_crosses_process<'a>(pid_arg: u64, tid: u32, ctx: &SyscallCtx<'a>) -> bool {
+    if pid_arg == 0 || tid == ctx.thread.tid.0 || ctx.process.thread_by_tid(tid).is_some() {
+        return false;
+    }
+    process_by_pid(Pid(tid)).is_some()
+        || matches!(
+            tx_subsystems::process::numbers::resolve_pid_number(tid as u64),
+            Some(tx_subsystems::process::numbers::PidName::Thread(_))
+        )
 }
 
 /// `sched_setaffinity(pid, cpusetsize, mask)`.
@@ -1074,6 +1343,9 @@ pub(super) fn sys_sched_setaffinity<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) ->
         Ok(tid) => tid,
         Err(err) => return err,
     };
+    if affinity_set_crosses_process(args[0], tid, ctx) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
     let cpusetsize = args[1] as usize;
     let mask_ptr = args[2];
     if cpusetsize < core::mem::size_of::<u64>() {

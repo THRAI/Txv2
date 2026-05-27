@@ -223,9 +223,11 @@ static LA64_KERNEL_PGDH_BOOTSTRAP_MAPPED: AtomicBool = AtomicBool::new(false);
 static LA64_ACTIVE_PGDL: AtomicUsize = AtomicUsize::new(0);
 static LA64_ACTIVE_PGDH: AtomicUsize = AtomicUsize::new(0);
 static LA64_ACTIVE_ASID: AtomicUsize = AtomicUsize::new(0);
+const LA64_COMMITTED_PT_NODE_REGISTRY_ENTRIES: usize = 4096;
 static LA64_COMMITTED_PT_NODE_REGISTRY_LOCK: AtomicBool = AtomicBool::new(false);
-static LA64_COMMITTED_PT_NODES: La64CommittedPtNodeRegistry =
-    La64CommittedPtNodeRegistry(UnsafeCell::new([None; 256]));
+static LA64_COMMITTED_PT_NODES: La64CommittedPtNodeRegistry = La64CommittedPtNodeRegistry(
+    UnsafeCell::new([None; LA64_COMMITTED_PT_NODE_REGISTRY_ENTRIES]),
+);
 #[cfg(target_arch = "loongarch64")]
 static LA64_KERNEL_TLS_VALID: [AtomicBool; LA64_MAX_BOOT_CPUS] = [
     AtomicBool::new(false),
@@ -382,7 +384,9 @@ pub(crate) fn la64_entry_trap_frame_ptr_for_cpu(cpu: CpuId) -> *mut La64TrapFram
     }
 }
 
-struct La64CommittedPtNodeRegistry(UnsafeCell<[Option<PtNode>; 256]>);
+struct La64CommittedPtNodeRegistry(
+    UnsafeCell<[Option<PtNode>; LA64_COMMITTED_PT_NODE_REGISTRY_ENTRIES]>,
+);
 
 unsafe impl Sync for La64CommittedPtNodeRegistry {}
 

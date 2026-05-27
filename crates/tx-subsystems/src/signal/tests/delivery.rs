@@ -1,12 +1,14 @@
 // Auto-extracted from `crates/tx-subsystems/src/signal/tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
-use crate::process::{bootstrap_init_process, ExitStatus, ProcessIdentity};
+use crate::process::{
+    bootstrap_init_process, step_fork, step_setpgid, ExitStatus, Pgid, ProcessIdentity,
+};
 use crate::signal::adapter::step_engine::{Cap, SignalRouting};
 use crate::signal::{
-    ast_check, default_action, select_next_signal, step_kill_process, step_sigaction, AstOutcome,
-    DefaultAction, InterruptSummary, KillOutcome, PendingSource, SaFlags, SigActionEntry,
-    SigDisposition, SignalTarget,
+    ast_check, default_action, script_kill_pgrp, select_next_signal, step_kill_process,
+    step_sigaction, AstOutcome, DefaultAction, InterruptSummary, KillOutcome, PendingSource,
+    SaFlags, SigActionEntry, SigDisposition, SignalTarget,
 };
 use crate::thread_runtime::execution::{post_signal, step_sigprocmask, SigmaskHow};
 use crate::thread_runtime::structure::ThreadIdentity;
@@ -817,6 +819,39 @@ fn step_kill_pgrp_does_not_mirror_gewalt_to_group_pending() {
     assert!(
         !parent_group_pending,
         "Gewalt must not be mirrored onto group_pending"
+    );
+}
+
+#[test]
+fn kill_zero_style_pgrp_fanout_reaches_in_group_child_handler() {
+    let _g = setup();
+    let parent = fresh_init();
+    let _ = step_setpgid(&parent, Pgid(parent.pid.0)).expect("parent setpgrp");
+    let sigusr1 = Signum::new(10).expect("SIGUSR1");
+
+    let child1 = step_fork::<TestPmap>(&parent, false, false).expect("fork child1");
+    let child_a = step_fork::<TestPmap>(&child1, false, false).expect("fork child A");
+    let child_b = step_fork::<TestPmap>(&child1, false, false).expect("fork child B");
+    let _ = child_a;
+    step_setpgid(&child_b, Pgid(child_b.pid.0)).expect("child B setpgrp");
+
+    let _ = step_sigaction(&parent, sigusr1, SigDisposition::Ignore);
+    let _ = step_sigaction(&child1, sigusr1, SigDisposition::Handler(0xCAFE_F00D));
+
+    let delivered = script_kill_pgrp(&parent, &parent.pgrp_cap(), sigusr1).expect("kill pgrp");
+    assert_eq!(delivered, 3, "parent, child1, and child A are in the pgrp");
+
+    assert_eq!(
+        ast_check(&leader(&child1)),
+        AstOutcome::DeliverHandler {
+            sig: sigusr1,
+            action: SigActionEntry::handler(0xCAFE_F00D),
+        }
+    );
+    assert_eq!(
+        ast_check(&leader(&child_b)),
+        AstOutcome::Continue,
+        "child B moved to another pgrp and must not receive SIGUSR1"
     );
 }
 

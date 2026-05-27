@@ -1,4 +1,5 @@
 /target/
+/target-codex/
 /tools/images/vendor/
 /.cache/
 **/.venv/
@@ -10,8 +11,8 @@ __pycache__/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 
-# generated vendor snapshot
-/third_party/
 .claude/worktrees/
 librust_out.rlib
 /target-codex-check
+/kernel-rv
+/kernel-la

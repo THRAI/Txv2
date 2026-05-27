@@ -67,18 +67,12 @@ pub(super) mod layout_descriptors {
         <SigaltstackLayout as KernelToUserLayout>::LAYOUT;
 }
 
-/// Drain `SignalDelivered` events from a thread mailbox.
+/// Drain `SignalDelivered` wake hints from a thread mailbox.
 ///
-/// The `tx-scripts::drive` inner mailbox-await re-posts any
-/// `SignalDelivered` event it consumes so the calling syscall's
-/// outer loop can re-observe the signal. For `sys_rt_sigtimedwait`,
-/// we consume signals directly from `payload.pending()` — the
-/// re-posted mailbox event is stale information that would otherwise
-/// trap every subsequent `drive(NanosleepOp)` call into returning
-/// immediately, degenerating the 5 ms poll cadence to a no-op spin.
-/// This helper drains every queued `SignalDelivered` (preserving any
-/// other events like `TimerFired` or `SourceFired` that are still
-/// genuinely informative for the next park).
+/// `sys_rt_sigtimedwait` consumes truth from the pending-signal queues,
+/// not from mailbox events. A stale signal wake hint can otherwise make
+/// the next park return immediately even though the relevant pending bit
+/// has already been consumed.
 fn drain_stale_signal_events(mailbox: &crate::adapter::reactor_entry::TaskMailbox) {
     use crate::adapter::reactor_entry::MailboxEvent;
     let mut keep = alloc::vec::Vec::new();
@@ -208,8 +202,88 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
 
 // --- Stub syscalls (deferred to post-bringup) -------------------------
 
-pub(super) fn sys_rt_sigsuspend(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+fn set_thread_signal_mask(ctx: &SyscallCtx, next: SignalMask) -> Result<SignalMask, SyscallResult> {
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = SigprocmaskOp {
+        thread: ctx.thread.clone(),
+        how: SigmaskHow::SetMask,
+        next,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(SigprocmaskChange::Replaced { prev, .. }) => Ok(prev),
+        Ok(SigprocmaskChange::ZombieIgnored) => Err(SyscallResult::Error(ESRCH_VALUE)),
+        Err(v3errno) => Err(SyscallResult::error_from(Errno::from(v3errno))),
+    }
+}
+
+pub(super) async fn sys_rt_sigsuspend<P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
+    let mask_ptr = args[0];
+    let sigset_size = args[1];
+    if mask_ptr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if sigset_size != core::mem::size_of::<u64>() as u64 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let mask_bits = match bootstrap_read_user::<u64>(&ctx.aspace, mask_ptr) {
+        Ok(bits) => bits,
+        Err(errno) => return SyscallResult::error_from(errno),
+    };
+    let old_mask = match set_thread_signal_mask(ctx, SignalMask::new(mask_bits)) {
+        Ok(mask) => mask,
+        Err(result) => return result,
+    };
+
+    let restore_and_eintr = |ctx: &SyscallCtx<'_>, old_mask: SignalMask| {
+        let _ = set_thread_signal_mask(ctx, old_mask);
+        SyscallResult::Error(EINTR_VALUE)
+    };
+
+    const CHUNK_NS: u64 = 5_000_000;
+    loop {
+        if let Some(deadline_ns) = poll_due_itimers::<P>(&ctx.process) {
+            P::set_deadline_ns(deadline_ns);
+        }
+        if tx_subsystems::signal::select_next_signal(&ctx.thread).is_some() {
+            return restore_and_eintr(ctx, old_mask);
+        }
+
+        use crate::adapter::step_engine::DriveMode;
+        use tx_scripts::drive;
+        let now_ns = <P as tx_hal::TimeIf>::read_ns();
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+        let mailbox = ctx.mailbox.clone();
+        let op = super::NanosleepOp {
+            nanos: CHUNK_NS,
+            deadline_ns: now_ns.saturating_add(CHUNK_NS),
+            started: false,
+        };
+        match drive(
+            op,
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox.as_ref(),
+            None,
+            timer_wheel_arc.as_ref(),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(v3errno) => {
+                let errno: Errno = v3errno.into();
+                if errno == Errno::EINTR {
+                    return restore_and_eintr(ctx, old_mask);
+                }
+                let _ = set_thread_signal_mask(ctx, old_mask);
+                return SyscallResult::error_from(errno);
+            }
+        }
+    }
 }
 
 /// `sigaltstack(ss, old_ss)` — Linux LP64 `stack_t` query/update.
@@ -410,35 +484,117 @@ pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
 }
 
 pub(super) fn sys_pidfd_open(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
-    let pid = args[0] as u32;
-    let flags = args[1];
-    if pid == 0 || flags != 0 {
+    const PIDFD_NONBLOCK: u32 = O_NONBLOCK;
+
+    let pid_raw = args[0];
+    let flags = args[1] as u32;
+
+    if pid_raw == 0 || pid_raw > i32::MAX as u64 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let Some(process) = process_by_pid(Pid(pid)) else {
+    if flags & !PIDFD_NONBLOCK != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let pid = Pid(pid_raw as u32);
+    if process_by_pid(pid).is_none() {
         return SyscallResult::Error(ESRCH_VALUE);
-    };
+    }
+
+    let fd = ctx.process.allocate_fd();
+    let (soft_limit, _) = ctx.process.rlimit_nofile();
+    if fd >= soft_limit {
+        return SyscallResult::Error(EMFILE_VALUE);
+    }
+
     let open_flags = OpenFileFlags {
         read: true,
         write: false,
         append: false,
-        cloexec: false,
-        nonblocking: false,
+        cloexec: true,
+        nonblocking: (flags & PIDFD_NONBLOCK) != 0,
     };
-    let open_cap = match OpenFile::new_pidfd_cap(process, open_flags) {
-        Ok(file) => file,
+    let open_cap = match OpenFile::new_pidfd_cap(pid.0, open_flags) {
+        Ok(cap) => cap,
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
-    let fd = match next_stdio_fd_below_nofile(&ctx.process) {
-        Ok(fd) => fd,
-        Err(result) => return result,
-    };
     let _ = ctx.process.install_fd(fd, open_cap);
+    ctx.process.set_fd_cloexec(fd, true);
     SyscallResult::Return(fd as i64)
 }
 
-pub(super) fn sys_pidfd_send_signal(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+fn pid_from_pidfd_like_file(file: &OpenFile) -> Option<Pid> {
+    if let Some(pid) = file.pidfd_pid() {
+        return Some(Pid(pid));
+    }
+    match file.backing() {
+        OpenFileBacking::Rnode { rnode } => tx_fs::procfs::pid_from_dir(rnode.fs_object_id()),
+        _ => None,
+    }
+}
+
+pub(super) fn sys_pidfd_send_signal(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
+    let fd = args[0] as u32;
+    let sig = args[1] as u32;
+    let info_ptr = args[2];
+    let flags = args[3] as u32;
+
+    if flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let file = match ctx.process.fd(fd) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let pid = match pid_from_pidfd_like_file(&file) {
+        Some(pid) => pid,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let target = match process_by_pid(pid) {
+        Some(target) => target,
+        None => return SyscallResult::Error(ESRCH_VALUE),
+    };
+
+    if sig > 64 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if info_ptr != 0 {
+        let mut signo_bytes = [0u8; 4];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut signo_bytes, info_ptr) {
+            return SyscallResult::error_from(errno);
+        }
+        let info_signo = u32::from_le_bytes(signo_bytes);
+        if info_signo != sig {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+    }
+    if sig == 0 {
+        return SyscallResult::Return(0);
+    }
+    let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
+        Some(signum) => signum,
+        None => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    let siginfo = Some(SigInfo {
+        si_signo: signum.raw() as u32,
+        si_code: SI_USER,
+        si_pid: ctx.process.pid.0,
+        si_uid: 0,
+    });
+
+    dispatch_errno(
+        tx_subsystems::signal::script_deliver_signal(
+            &ctx.process,
+            SignalTarget::Process(target),
+            signum,
+            siginfo,
+        ),
+        |outcome| match outcome {
+            KillOutcome::Delivered => SyscallResult::Return(0),
+            KillOutcome::NoLiveThread => SyscallResult::Error(ESRCH_VALUE),
+        },
+    )
 }
 
 /// `rt_sigaction(signum, act, oldact, sigsetsize)` per `SIGNAL_v1`
@@ -465,6 +621,10 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     }) else {
         return SyscallResult::Error(EINVAL_VALUE);
     };
+
+    if act_ptr != 0 && sig.is_uncatchable() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
 
     // Decode the new action (if any) through the canonical user-VA
     // lane (`bootstrap_copy_from_user` bridges via
@@ -564,9 +724,10 @@ pub(super) fn reset_sigaction_restorers_for_test() {
 /// - `pid > 0`: deliver `sig` to the matching process via
 ///   `tx_subsystems::signal::step_kill_process`. Resolved through
 ///   `process_by_pid`'s init-rooted tree walk.
-/// - `pid <= 0`: pgrp / all-processes targets — out of scope for v1
-///   (`-ENOSYS`; needs a global pid-to-pgrp lookup the slice does
-///   not yet wire).
+/// - `pid == 0`: deliver to the caller's process group.
+/// - `pid < -1`: deliver to process group `-pid`.
+/// - `pid == -1`: all-processes target — out of scope for v1
+///   (`-ENOSYS`).
 /// - `sig == 0`: existence probe — return `0` if the target exists
 ///   (live or zombie), `-ESRCH` otherwise. Linux semantic.
 /// - Unknown signum (outside 1..=64): `-EINVAL`.
@@ -603,11 +764,39 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             },
         );
     }
-    if pid <= 0 {
-        // TODO(phase-pgrp-kill): pgrp-targeted (`pid < 0` /
-        // `pid == 0` / `pid == -1`) kills need a global pid-to-pgrp
-        // lookup the slice does not yet wire.
+    if pid == -1 {
+        // TODO(phase-all-processes-kill): Linux `kill(-1, sig)` sends
+        // to every permitted process except implementation-specific
+        // exclusions. Keep it explicit instead of confusing it with
+        // process-group dispatch.
         return SyscallResult::Error(ENOSYS_VALUE);
+    }
+    if pid < -1 {
+        let pgid = match pid.checked_neg() {
+            Some(pgid) => pgid as u64,
+            None => return SyscallResult::Error(ESRCH_VALUE),
+        };
+        let pgrp = match resolve_pid_number_as(pgid, PidNameKind::ProcessGroup) {
+            Some(PidName::ProcessGroup(pgrp)) => pgrp,
+            _ => return SyscallResult::Error(ESRCH_VALUE),
+        };
+        if sig == 0 {
+            return SyscallResult::Return(0);
+        }
+        let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
+            Some(s) => s,
+            None => return SyscallResult::Error(EINVAL_VALUE),
+        };
+        return dispatch_errno(
+            tx_subsystems::signal::script_kill_pgrp(&ctx.process, &pgrp, signum),
+            |n| {
+                if n > 0 {
+                    SyscallResult::Return(0)
+                } else {
+                    SyscallResult::Error(EPERM_VALUE)
+                }
+            },
+        );
     }
 
     let target = match process_by_pid(Pid(pid as u32)) {

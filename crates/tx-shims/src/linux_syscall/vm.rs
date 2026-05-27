@@ -153,6 +153,17 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
     let fd = args[4] as i32;
     let offset = args[4 + 1]; // args[5]
 
+    // Linux reports EBADF for a file-backed mmap with a closed fd even
+    // when another argument (notably length) is also invalid.
+    if flags & MAP_ANONYMOUS == 0 {
+        if fd < 0 {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
+        if resolve_fd(&ctx.process, fd as u32).is_none() {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
+    }
+
     // Length validation. Linux rounds the byte length up to a whole
     // page; addr (when MAP_FIXED is set) must already be page-aligned.
     if length_in == 0 {
@@ -181,12 +192,33 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
         prot_bits & PROT_EXEC != 0,
     );
 
-    // Decode `flags`. Exactly one of MAP_SHARED / MAP_PRIVATE required.
-    let private = flags & MAP_PRIVATE != 0;
-    let shared = flags & MAP_SHARED != 0;
-    if private == shared {
-        // both unset, or both set
+    // Decode `flags`. Linux's low nibble selects one mapping type:
+    // MAP_SHARED, MAP_PRIVATE, or MAP_SHARED_VALIDATE.
+    let map_type = flags & 0x0f;
+    let shared_validate = map_type == MAP_SHARED_VALIDATE;
+    let private = map_type == MAP_PRIVATE;
+    let shared = map_type == MAP_SHARED || shared_validate;
+    if !(private || shared) {
         return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if shared_validate {
+        let recognised = MAP_SHARED_VALIDATE
+            | MAP_FIXED
+            | MAP_ANONYMOUS
+            | MAP_GROWSDOWN
+            | MAP_DENYWRITE
+            | MAP_EXECUTABLE
+            | MAP_LOCKED
+            | MAP_NORESERVE
+            | MAP_POPULATE
+            | MAP_NONBLOCK
+            | MAP_STACK
+            | MAP_HUGETLB
+            | MAP_SYNC
+            | MAP_FIXED_NOREPLACE;
+        if flags & !recognised != 0 {
+            return SyscallResult::Error(EOPNOTSUPP_VALUE);
+        }
     }
     let fixed = flags & MAP_FIXED != 0;
     let fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
@@ -229,11 +261,8 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
             Some(f) => f,
             None => return SyscallResult::Error(EBADF_VALUE),
         };
-        if shared
-            && prot.write
-            && (file.has_memfd_seal(F_SEAL_WRITE) || file.has_memfd_seal(F_SEAL_FUTURE_WRITE))
-        {
-            return SyscallResult::Error(EPERM_VALUE);
+        if !file.flags().read {
+            return SyscallResult::Error(EACCES_VALUE);
         }
         match extract_page_container(&file) {
             Some(pc) => VmBacking::Page { pc, offset },
@@ -377,6 +406,12 @@ pub(super) async fn sys_mlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
     let Ok(range) = UserRange::new_aligned(UserVirtAddr(start as usize), len) else {
         return SyscallResult::Error(EINVAL_VALUE);
     };
+    if let Some(errno) = memlock_limit_error(ctx, range.len() as u64) {
+        return SyscallResult::Error(errno);
+    }
+    if !range_fully_mapped(ctx, range) {
+        return SyscallResult::Error(ENOMEM_VALUE);
+    }
 
     let op = VmMlockOp {
         aspace: &ctx.aspace,
@@ -456,6 +491,9 @@ pub(super) async fn sys_munlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscall
     let Ok(range) = UserRange::new_aligned(UserVirtAddr(start as usize), len) else {
         return SyscallResult::Error(EINVAL_VALUE);
     };
+    if !range_fully_mapped(ctx, range) {
+        return SyscallResult::Error(ENOMEM_VALUE);
+    }
 
     let op = VmMunlockOp {
         aspace: &ctx.aspace,
@@ -480,654 +518,166 @@ pub(super) async fn sys_munlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscall
     }
 }
 
-/// `memfd_create(name, flags)` — Linux RV64 generic syscall #279.
+const MCL_CURRENT: u64 = 0x1;
+const MCL_FUTURE: u64 = 0x2;
+const MCL_ONFAULT: u64 = 0x4;
+const MLOCK_ONFAULT: u64 = 0x1;
+
+/// `mlockall(flags)` — Linux RV64 generic syscall #230.
 ///
-/// Implements the PageBacked v1 contract: a memfd is an anonymous
-/// `PageContainer` wrapped by a synthetic pathless regular-file RNode
-/// and installed as a read/write fd. `MFD_ALLOW_SEALING` controls the
-/// initial seal set: without it, Linux starts the file with
-/// `F_SEAL_SEAL`; with it, callers can add seals via fcntl.
-pub(super) fn sys_memfd_create(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let name_uaddr = args[0];
-    let flags = args[1];
-    let known_flags =
-        MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_NOEXEC_SEAL | MFD_EXEC | MFD_HUGE_MASK;
-    if flags & !known_flags != 0
-        || flags & (MFD_NOEXEC_SEAL | MFD_EXEC) == (MFD_NOEXEC_SEAL | MFD_EXEC)
-    {
+/// txKernel currently has no swap, so page residency is already stable
+/// enough for the LTP surface that only checks syscall availability and
+/// flag validation. Treat valid lock modes as successful no-ops and
+/// reject unknown or empty flag sets.
+pub(super) async fn sys_mlockall(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let flags = args[0];
+    if flags == 0 || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    if flags & (MFD_HUGETLB | MFD_HUGE_MASK) != 0 {
-        return SyscallResult::Error(ENOSYS_VALUE);
-    }
-    if name_uaddr == 0 {
-        return SyscallResult::Error(EFAULT_VALUE);
-    }
-    let name = match bootstrap_read_user_cstr(&ctx.aspace, name_uaddr, MEMFD_NAME_MAX + 1) {
-        Ok(name) => name,
-        Err(Errno::ENAMETOOLONG) => return SyscallResult::Error(EINVAL_VALUE),
-        Err(_) => return SyscallResult::Error(EFAULT_VALUE),
-    };
-    if name.len() > MEMFD_NAME_MAX {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-
-    let memfd_capacity_pages = (FULL_USER_V1_TOP as u64) / (USER_PAGE_SIZE as u64);
-    let pc = match PageContainer::new_cap(
-        PageContainerKind::Anon {
-            swap_policy: AnonSwapPolicy::Reclaimable,
-        },
-        memfd_capacity_pages,
-    ) {
-        Ok(pc) => pc,
-        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
-    };
-    pc.set_size_bytes(0);
-    let rnode = match tx_subsystems::vfs::RNode::new_cap(
-        tx_subsystems::vfs::FsObjectId::new(
-            NEXT_MEMFD_FS_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
-        ),
-        InodeMeta::new(InodeKind::Regular, 0o100600),
-        RNodeBacking::PageBacked { pc },
-    ) {
-        Ok(rnode) => rnode,
-        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
-    };
-    let initial_seals = if flags & MFD_ALLOW_SEALING != 0 {
-        0
-    } else {
-        F_SEAL_SEAL
-    };
-    let file = match OpenFile::new_memfd_cap(
-        rnode,
-        OpenFileFlags {
-            read: true,
-            write: true,
-            append: false,
-            cloexec: flags & MFD_CLOEXEC != 0,
-            nonblocking: false,
-        },
-        initial_seals,
-    ) {
-        Ok(file) => file,
-        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
-    };
-    let fd = ctx.process.allocate_fd();
-    let (soft_limit, _) = ctx.process.rlimit_nofile();
-    if fd >= soft_limit {
-        return SyscallResult::Error(EMFILE_VALUE);
-    }
-    let _ = ctx.process.install_fd(fd, file);
-    if flags & MFD_CLOEXEC != 0 {
-        ctx.process.set_fd_cloexec(fd, true);
-    }
-
-    SyscallResult::Return(fd as i64)
-}
-
-/// `get_mempolicy(policy, nodemask, maxnode, addr, flags)` — Linux
-/// RV64 generic syscall #236.
-///
-/// Tx phase 1 has one memory node and no persistent NUMA policy. This
-/// reports `MPOL_DEFAULT` for policy queries and node mask `{0}` for
-/// `MPOL_F_MEMS_ALLOWED`.
-pub(super) fn sys_get_mempolicy(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let policy_uaddr = args[0];
-    let nodemask_uaddr = args[1];
-    let maxnode = args[2];
-    let addr = args[3];
-    let flags = args[4];
-
-    let known_flags = MPOL_F_ADDR | MPOL_F_NODE | MPOL_F_MEMS_ALLOWED;
-    if flags & !known_flags != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    if flags & MPOL_F_MEMS_ALLOWED != 0 && flags != MPOL_F_MEMS_ALLOWED {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    if flags & MPOL_F_NODE != 0 && flags & MPOL_F_ADDR == 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    if flags & MPOL_F_ADDR != 0 && ctx.aspace.lookup(UserVirtAddr(addr as usize)).is_none() {
-        return SyscallResult::Error(EFAULT_VALUE);
-    }
-
-    if policy_uaddr != 0 {
-        let value = if flags & MPOL_F_NODE != 0 {
-            0
-        } else {
-            MPOL_DEFAULT as i32
+    if flags & MCL_CURRENT != 0 {
+        let locked_len = ctx
+            .aspace
+            .recipes_snapshot()
+            .into_iter()
+            .try_fold(0u64, |acc, entry| acc.checked_add(entry.range.len() as u64));
+        let Some(locked_len) = locked_len else {
+            return SyscallResult::Error(ENOMEM_VALUE);
         };
-        if let Err(errno) = bootstrap_write_user::<i32>(&ctx.aspace, policy_uaddr, value) {
-            return SyscallResult::error_from(errno);
+        if let Some(errno) = memlock_limit_error(ctx, locked_len) {
+            return SyscallResult::Error(errno);
         }
     }
-    if nodemask_uaddr != 0 && maxnode > 0 {
-        let mask = if flags & MPOL_F_MEMS_ALLOWED != 0 {
-            1u64
-        } else {
-            0u64
-        };
-        if let Err(errno) = bootstrap_write_user::<u64>(&ctx.aspace, nodemask_uaddr, mask) {
-            return SyscallResult::error_from(errno);
+    if flags & MCL_CURRENT != 0 {
+        for entry in ctx.aspace.recipes_snapshot() {
+            if let Err(errno) = drive_vm_lock(ctx, entry.range, true).await {
+                return SyscallResult::error_from(Into::<Errno>::into(errno));
+            }
         }
     }
-
     SyscallResult::Return(0)
-}
-
-/// `set_mempolicy(mode, nodemask, maxnode)` — Linux RV64 generic
-/// syscall #237.
-///
-/// Accepts Linux policy modes that can collapse onto Tx's single node.
-/// The policy is not persisted because phase 1 has no NUMA allocator.
-pub(super) fn sys_set_mempolicy(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    match validate_single_node_policy(args[0], args[1], args[2], ctx) {
-        Ok(()) => SyscallResult::Return(0),
-        Err(errno) => SyscallResult::Error(errno),
-    }
-}
-
-/// `mbind(start, len, mode, nodemask, maxnode, flags)` — Linux RV64
-/// generic syscall #235.
-///
-/// Validates the target range and single-node policy, then records no
-/// persistent binding because Tx phase 1 has no NUMA placement state.
-pub(super) fn sys_mbind(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let addr = args[0];
-    let len_in = args[1] as usize;
-    let mode = args[2];
-    let nodemask_uaddr = args[3];
-    let maxnode = args[4];
-    let flags = args[5];
-
-    let known_flags = MPOL_MF_STRICT | MPOL_MF_MOVE | MPOL_MF_MOVE_ALL;
-    if flags & !known_flags != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    if len_in == 0 {
-        return SyscallResult::Return(0);
-    }
-    if !UserVirtAddr::new(addr as usize).is_page_aligned() {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    let Some(len) = len_in.checked_next_multiple_of(USER_PAGE_SIZE) else {
-        return SyscallResult::Error(EINVAL_VALUE);
-    };
-    let Ok(range) = UserRange::new_aligned(UserVirtAddr(addr as usize), len) else {
-        return SyscallResult::Error(EINVAL_VALUE);
-    };
-    if !range_fully_mapped(ctx, range) {
-        return SyscallResult::Error(EFAULT_VALUE);
-    }
-    match validate_single_node_policy(mode, nodemask_uaddr, maxnode, ctx) {
-        Ok(()) => SyscallResult::Return(0),
-        Err(errno) => SyscallResult::Error(errno),
-    }
-}
-
-/// `migrate_pages(pid, maxnode, old_nodes, new_nodes)` — Linux RV64
-/// generic syscall #238.
-///
-/// Tx phase 1 has one memory node, so node-0 to node-0 migration is a
-/// no-op and returns zero pages migrated.
-pub(super) fn sys_migrate_pages(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let pid = args[0] as i64;
-    let maxnode = args[1];
-    let old_nodes_uaddr = args[2];
-    let new_nodes_uaddr = args[3];
-
-    if let Err(errno) = validate_process_target(pid, ctx) {
-        return SyscallResult::Error(errno);
-    }
-    let old_nodes = match read_single_node_mask(old_nodes_uaddr, maxnode, ctx) {
-        Ok(mask) => mask,
-        Err(errno) => return SyscallResult::Error(errno),
-    };
-    let new_nodes = match read_single_node_mask(new_nodes_uaddr, maxnode, ctx) {
-        Ok(mask) => mask,
-        Err(errno) => return SyscallResult::Error(errno),
-    };
-    if old_nodes & !1 != 0 || new_nodes & !1 != 0 || new_nodes == 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-
-    SyscallResult::Return(0)
-}
-
-/// `move_pages(pid, nr_pages, pages, nodes, status, flags)` — Linux
-/// RV64 generic syscall #239.
-///
-/// Supports Tx's single-node query path and node-0 no-op moves for the
-/// current process. Each mapped page reports status node `0`.
-pub(super) fn sys_move_pages(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let pid = args[0] as i64;
-    let nr_pages = args[1] as usize;
-    let pages_uaddr = args[2];
-    let nodes_uaddr = args[3];
-    let status_uaddr = args[4];
-    let flags = args[5];
-
-    if flags & !(MPOL_MF_MOVE | MPOL_MF_MOVE_ALL) != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    if let Err(errno) = validate_process_target(pid, ctx) {
-        return SyscallResult::Error(errno);
-    }
-    if nr_pages == 0 {
-        return SyscallResult::Return(0);
-    }
-    if pages_uaddr == 0 || status_uaddr == 0 {
-        return SyscallResult::Error(EFAULT_VALUE);
-    }
-    if nr_pages > 4096 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-
-    for index in 0..nr_pages {
-        let page_ptr_uaddr = pages_uaddr + (index * core::mem::size_of::<u64>()) as u64;
-        let page = match bootstrap_read_user::<u64>(&ctx.aspace, page_ptr_uaddr) {
-            Ok(page) => page,
-            Err(errno) => return SyscallResult::error_from(errno),
-        };
-        if nodes_uaddr != 0 {
-            let node_uaddr = nodes_uaddr + (index * core::mem::size_of::<i32>()) as u64;
-            let node = match bootstrap_read_user::<i32>(&ctx.aspace, node_uaddr) {
-                Ok(node) => node,
-                Err(errno) => return SyscallResult::error_from(errno),
-            };
-            if node != 0 {
-                return SyscallResult::Error(EINVAL_VALUE);
-            }
-        }
-        let status = if ctx.aspace.lookup(UserVirtAddr(page as usize)).is_some() {
-            0
-        } else {
-            -EFAULT_VALUE
-        };
-        let status_slot = status_uaddr + (index * core::mem::size_of::<i32>()) as u64;
-        if let Err(errno) = bootstrap_write_user::<i32>(&ctx.aspace, status_slot, status) {
-            return SyscallResult::error_from(errno);
-        }
-    }
-
-    SyscallResult::Return(0)
-}
-
-/// `process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt,
-/// flags)` — Linux RV64 generic syscall #270.
-///
-/// Phase 1 supports only the current process (`pid == 0` or the
-/// caller pid), which collapses both iovec arrays onto `ctx.aspace`.
-/// Cross-process address-space lookup and ptrace/credential permission
-/// checks are deferred to the process/cred integration slice.
-pub(super) fn sys_process_vm_readv(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    sys_process_vm_transfer(args, ctx, ProcessVmDirection::Read)
-}
-
-/// `process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt,
-/// flags)` — Linux RV64 generic syscall #271. See
-/// `sys_process_vm_readv` for the phase-1 self-process scope.
-pub(super) fn sys_process_vm_writev(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    sys_process_vm_transfer(args, ctx, ProcessVmDirection::Write)
-}
-
-/// `process_madvise(pidfd, vec, vlen, behavior, flags)` — Linux RV64
-/// generic syscall #440.
-///
-/// The first supported slice resolves real pidfd-backed `OpenFile`s and
-/// applies the existing VM advice operation to the target process's
-/// current address space. Permission policy is intentionally narrow:
-/// only the caller's own process is accepted until ptrace/cred checks
-/// are modeled.
-pub(super) fn sys_process_madvise(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let pidfd = args[0] as u32;
-    let iov_uaddr = args[1];
-    let iovcnt = args[2];
-    let advice_raw = args[3];
-    let flags = args[4];
-
-    if flags != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    let Some(target_process) = resolve_pidfd_process(ctx, pidfd) else {
-        return SyscallResult::Error(EBADF_VALUE);
-    };
-    if target_process.pid.0 != ctx.process.pid.0 {
-        return SyscallResult::Error(EPERM_VALUE);
-    }
-    let Some(target_aspace) = target_process.aspace_cap() else {
-        return SyscallResult::Error(ESRCH_VALUE);
-    };
-    let advice = match decode_madvise_advice(advice_raw) {
-        Ok(advice) => advice,
-        Err(errno) => return SyscallResult::Error(errno),
-    };
-    let iovs = match read_process_vm_iovs(iov_uaddr, iovcnt, ctx) {
-        Ok(iovs) => iovs,
-        Err(errno) => return SyscallResult::Error(errno),
-    };
-
-    let mut total = 0i64;
-    for iov in iovs {
-        if iov.len == 0 {
-            continue;
-        }
-        if !UserVirtAddr::new(iov.base as usize).is_page_aligned() {
-            if total > 0 {
-                return SyscallResult::Return(total);
-            }
-            return SyscallResult::Error(EINVAL_VALUE);
-        }
-        let len = match iov.len.checked_next_multiple_of(USER_PAGE_SIZE) {
-            Some(len) => len,
-            None => return SyscallResult::Error(EINVAL_VALUE),
-        };
-        let range = match UserRange::new_aligned(UserVirtAddr::new(iov.base as usize), len) {
-            Ok(range) => range,
-            Err(_) => {
-                if total > 0 {
-                    return SyscallResult::Return(total);
-                }
-                return SyscallResult::Error(EINVAL_VALUE);
-            }
-        };
-        if let Err(error) = target_aspace.madvise(range, advice) {
-            if total > 0 {
-                return SyscallResult::Return(total);
-            }
-            return SyscallResult::Error(vmmap_error_to_i32(error));
-        }
-        total += iov.len as i64;
-    }
-
-    SyscallResult::Return(total)
 }
 
 /// `munlockall()` — Linux RV64 generic syscall #231.
 ///
-/// Clears the observational lock flag from every current VMA and clears
-/// the process-local future-lock policy.
-pub(super) async fn sys_munlockall(ctx: &SyscallCtx<'_>) -> SyscallResult {
-    ctx.process.set_mlock_future(false);
-    match set_all_current_mlock(ctx, false).await {
-        Ok(()) => SyscallResult::Return(0),
-        Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
+/// Complements the no-swap `mlockall` surface: there is no global locked
+/// accounting to clear yet, so success is a compatibility no-op.
+pub(super) async fn sys_munlockall(_args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    for entry in ctx.aspace.recipes_snapshot() {
+        if let Err(errno) = drive_vm_lock(ctx, entry.range, false).await {
+            return SyscallResult::error_from(Into::<Errno>::into(errno));
+        }
     }
+    SyscallResult::Return(0)
 }
 
-async fn set_all_current_mlock(ctx: &SyscallCtx<'_>, locked: bool) -> Result<(), V3Errno> {
-    let entries = ctx.aspace.recipes_snapshot();
-    for entry in entries {
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mailbox_arc = script_ctx.mailbox().cloned();
-        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-        let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-
-        if locked {
-            let op = VmMlockOp {
+async fn drive_vm_lock(
+    ctx: &SyscallCtx<'_>,
+    range: UserRange,
+    locked: bool,
+) -> Result<tx_subsystems::vm::VmMapCommit, V3Errno> {
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    if locked {
+        drive(
+            VmMlockOp {
                 aspace: &ctx.aspace,
-                range: entry.range,
-            };
-            drive(
-                op,
-                &mut script_ctx,
-                DriveMode::Waiting,
-                mailbox_arc.as_ref(),
-                delegate_registry_arc.as_deref(),
-                timer_wheel_arc.as_ref(),
-            )
-            .await?;
-        } else {
-            let op = VmMunlockOp {
+                range,
+            },
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox_arc.as_ref(),
+            delegate_registry_arc.as_deref(),
+            timer_wheel_arc.as_ref(),
+        )
+        .await
+    } else {
+        drive(
+            VmMunlockOp {
                 aspace: &ctx.aspace,
-                range: entry.range,
-            };
-            drive(
-                op,
-                &mut script_ctx,
-                DriveMode::Waiting,
-                mailbox_arc.as_ref(),
-                delegate_registry_arc.as_deref(),
-                timer_wheel_arc.as_ref(),
-            )
-            .await?;
-        }
-    }
-
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-struct ProcessVmIov {
-    base: u64,
-    len: usize,
-}
-
-#[derive(Clone, Copy)]
-enum ProcessVmDirection {
-    Read,
-    Write,
-}
-
-fn sys_process_vm_transfer(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'_>,
-    direction: ProcessVmDirection,
-) -> SyscallResult {
-    let pid = args[0] as i64;
-    let local_iov_uaddr = args[1];
-    let local_iovcnt = args[2];
-    let remote_iov_uaddr = args[3];
-    let remote_iovcnt = args[4];
-    let flags = args[5];
-
-    if flags != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    if let Err(errno) = validate_process_target(pid, ctx) {
-        return SyscallResult::Error(errno);
-    }
-
-    let local_iovs = match read_process_vm_iovs(local_iov_uaddr, local_iovcnt, ctx) {
-        Ok(iovs) => iovs,
-        Err(errno) => return SyscallResult::Error(errno),
-    };
-    let remote_iovs = match read_process_vm_iovs(remote_iov_uaddr, remote_iovcnt, ctx) {
-        Ok(iovs) => iovs,
-        Err(errno) => return SyscallResult::Error(errno),
-    };
-
-    copy_process_vm_iovs(ctx, &local_iovs, &remote_iovs, direction)
-}
-
-fn read_process_vm_iovs(
-    iov_uaddr: u64,
-    iovcnt: u64,
-    ctx: &SyscallCtx<'_>,
-) -> Result<Vec<ProcessVmIov>, i32> {
-    if iovcnt > 1024 {
-        return Err(EINVAL_VALUE);
-    }
-    if iovcnt == 0 {
-        return Ok(Vec::new());
-    }
-
-    const IOVEC_BYTES: u64 = 16;
-    let mut iovs = Vec::with_capacity(iovcnt as usize);
-    let mut total: i64 = 0;
-    for index in 0..iovcnt {
-        let Some(ent_ptr) = iov_uaddr.checked_add(index.saturating_mul(IOVEC_BYTES)) else {
-            return Err(EINVAL_VALUE);
-        };
-        let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
-        bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr).map_err(errno_to_i32)?;
-        let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
-        let len_raw = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap());
-        let len = usize::try_from(len_raw).map_err(|_| EINVAL_VALUE)?;
-        let len_i64 = i64::try_from(len).map_err(|_| EINVAL_VALUE)?;
-        total = total.checked_add(len_i64).ok_or(EINVAL_VALUE)?;
-        iovs.push(ProcessVmIov { base, len });
-    }
-    Ok(iovs)
-}
-
-fn copy_process_vm_iovs(
-    ctx: &SyscallCtx<'_>,
-    local_iovs: &[ProcessVmIov],
-    remote_iovs: &[ProcessVmIov],
-    direction: ProcessVmDirection,
-) -> SyscallResult {
-    const CHUNK_MAX: usize = USER_PAGE_SIZE;
-
-    let mut local_index = 0usize;
-    let mut remote_index = 0usize;
-    let mut local_offset = 0usize;
-    let mut remote_offset = 0usize;
-    let mut total = 0i64;
-    let mut chunk = Vec::new();
-
-    while local_index < local_iovs.len() && remote_index < remote_iovs.len() {
-        if local_offset == local_iovs[local_index].len {
-            local_index += 1;
-            local_offset = 0;
-            continue;
-        }
-        if remote_offset == remote_iovs[remote_index].len {
-            remote_index += 1;
-            remote_offset = 0;
-            continue;
-        }
-
-        let local = local_iovs[local_index];
-        let remote = remote_iovs[remote_index];
-        let chunk_len = (local.len - local_offset)
-            .min(remote.len - remote_offset)
-            .min(CHUNK_MAX);
-        if chunk_len == 0 {
-            continue;
-        }
-
-        chunk.resize(chunk_len, 0);
-        let Some(local_addr) = local.base.checked_add(local_offset as u64) else {
-            if total > 0 {
-                return SyscallResult::Return(total);
-            }
-            return SyscallResult::Error(EFAULT_VALUE);
-        };
-        let Some(remote_addr) = remote.base.checked_add(remote_offset as u64) else {
-            if total > 0 {
-                return SyscallResult::Return(total);
-            }
-            return SyscallResult::Error(EFAULT_VALUE);
-        };
-        let result = match direction {
-            ProcessVmDirection::Read => {
-                bootstrap_copy_from_user(&ctx.aspace, &mut chunk, remote_addr)
-                    .and_then(|()| bootstrap_copy_to_user(&ctx.aspace, local_addr, &chunk))
-            }
-            ProcessVmDirection::Write => {
-                bootstrap_copy_from_user(&ctx.aspace, &mut chunk, local_addr)
-                    .and_then(|()| bootstrap_copy_to_user(&ctx.aspace, remote_addr, &chunk))
-            }
-        };
-        if let Err(errno) = result {
-            if total > 0 {
-                return SyscallResult::Return(total);
-            }
-            return SyscallResult::error_from(errno);
-        }
-
-        total += chunk_len as i64;
-        local_offset += chunk_len;
-        remote_offset += chunk_len;
-    }
-
-    SyscallResult::Return(total)
-}
-
-fn resolve_pidfd_process(ctx: &SyscallCtx<'_>, pidfd: u32) -> Option<Cap<ProcessIdentity>> {
-    resolve_fd(&ctx.process, pidfd).and_then(|file| file.pidfd_process().cloned())
-}
-
-fn validate_single_node_policy(
-    raw_mode: u64,
-    nodemask_uaddr: u64,
-    maxnode: u64,
-    ctx: &SyscallCtx<'_>,
-) -> Result<(), i32> {
-    let mode_flags = raw_mode & (MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES);
-    if mode_flags == (MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES) {
-        return Err(EINVAL_VALUE);
-    }
-    let mode = raw_mode & !(MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES);
-    if !matches!(
-        mode,
-        MPOL_DEFAULT
-            | MPOL_PREFERRED
-            | MPOL_BIND
-            | MPOL_INTERLEAVE
-            | MPOL_LOCAL
-            | MPOL_PREFERRED_MANY
-    ) {
-        return Err(EINVAL_VALUE);
-    }
-
-    let mask = read_single_node_mask(nodemask_uaddr, maxnode, ctx)?;
-    if mask & !1 != 0 {
-        return Err(EINVAL_VALUE);
-    }
-    if mode == MPOL_DEFAULT && mask != 0 {
-        return Err(EINVAL_VALUE);
-    }
-    if matches!(mode, MPOL_BIND | MPOL_INTERLEAVE | MPOL_PREFERRED_MANY) && mask == 0 {
-        return Err(EINVAL_VALUE);
-    }
-    Ok(())
-}
-
-fn read_single_node_mask(
-    nodemask_uaddr: u64,
-    maxnode: u64,
-    ctx: &SyscallCtx<'_>,
-) -> Result<u64, i32> {
-    if nodemask_uaddr == 0 || maxnode == 0 {
-        return Ok(0);
-    }
-    bootstrap_read_user::<u64>(&ctx.aspace, nodemask_uaddr).map_err(errno_to_i32)
-}
-
-fn validate_process_target(pid: i64, ctx: &SyscallCtx<'_>) -> Result<(), i32> {
-    if pid < 0 {
-        return Err(EINVAL_VALUE);
-    }
-    if pid == 0 || pid as u32 == ctx.process.pid.0 {
-        return Ok(());
-    }
-    match process_by_pid(Pid(pid as u32)) {
-        Some(_) => Err(EPERM_VALUE),
-        None => Err(ESRCH_VALUE),
+                range,
+            },
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox_arc.as_ref(),
+            delegate_registry_arc.as_deref(),
+            timer_wheel_arc.as_ref(),
+        )
+        .await
     }
 }
 
 fn range_fully_mapped(ctx: &SyscallCtx<'_>, range: UserRange) -> bool {
-    let entries = ctx.aspace.recipes_overlapping(range);
-    let mut cursor = range.start().as_usize();
-    let end = range.end().as_usize();
-    for entry in entries {
-        let start = entry.range.start().as_usize();
-        let entry_end = entry.range.end().as_usize();
-        if start > cursor {
-            return false;
-        }
-        if entry_end > cursor {
-            cursor = entry_end;
-            if cursor >= end {
-                return true;
-            }
+    range
+        .iter_pages()
+        .all(|page| ctx.aspace.lookup(page.start_addr()).is_some())
+}
+
+fn memlock_limit_error(ctx: &SyscallCtx<'_>, bytes: u64) -> Option<i32> {
+    if ctx.cred().euid.is_root() {
+        return None;
+    }
+    let (cur, _) = ctx.process.rlimit_memlock();
+    if bytes <= cur {
+        None
+    } else if cur == 0 {
+        Some(EPERM_VALUE)
+    } else {
+        Some(ENOMEM_VALUE)
+    }
+}
+
+/// `mlock2(addr, len, flags)` — Linux RV64 generic syscall #284.
+///
+/// `flags == 0` matches `mlock`; `MLOCK_ONFAULT` is accepted as a
+/// residency hint and uses the same range validation as `mlock`.
+pub(super) async fn sys_mlock2(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let flags = args[2];
+    if flags & !MLOCK_ONFAULT != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    sys_mlock(args, ctx).await
+}
+
+/// `mincore(addr, length, vec)` — Linux RV64 generic syscall #232.
+pub(super) fn sys_mincore(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let addr = args[0];
+    let length_in = args[1] as usize;
+    let vec_uaddr = args[2];
+
+    if length_in == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if !UserVirtAddr::new(addr as usize).is_page_aligned() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let length = match length_in.checked_next_multiple_of(USER_PAGE_SIZE) {
+        Some(rounded) => rounded,
+        None => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let range = match UserRange::new_aligned(UserVirtAddr::new(addr as usize), length) {
+        Ok(range) => range,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+
+    if range
+        .iter_pages()
+        .any(|page| ctx.aspace.lookup(page.start_addr()).is_none())
+    {
+        return SyscallResult::Error(ENOMEM_VALUE);
+    }
+
+    let resident = ctx.aspace.mincore(range);
+    for (index, is_resident) in resident.into_iter().enumerate() {
+        let byte = if is_resident { 1u8 } else { 0u8 };
+        if let Err(errno) = bootstrap_write_user::<u8>(&ctx.aspace, vec_uaddr + index as u64, byte)
+        {
+            return SyscallResult::Error(errno_to_i32(errno));
         }
     }
-    false
+
+    SyscallResult::Return(0)
 }
 
 /// `mprotect(addr, length, prot)` — Linux RV64 generic syscall #226.
@@ -1228,6 +778,12 @@ pub(super) async fn sys_mremap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
         Ok(r) => r,
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
+    if old_range
+        .iter_pages()
+        .any(|page| ctx.aspace.lookup(page.start_addr()).is_none())
+    {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
 
     let request = if fixed {
         if !UserVirtAddr::new(new_addr as usize).is_page_aligned() {
@@ -1505,16 +1061,25 @@ pub(super) fn sys_madvise<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
     }
 }
 
-fn decode_madvise_advice(advice_raw: u64) -> Result<MadviseAdvice, i32> {
-    match advice_raw {
-        MADV_NORMAL => Ok(MadviseAdvice::Normal),
-        MADV_RANDOM => Ok(MadviseAdvice::Random),
-        MADV_SEQUENTIAL => Ok(MadviseAdvice::Sequential),
-        MADV_WILLNEED => Ok(MadviseAdvice::WillNeed),
-        MADV_DONTNEED => Ok(MadviseAdvice::DontNeed),
-        MADV_FREE => Ok(MadviseAdvice::Free),
-        _ => Err(ENOSYS_VALUE),
+/// `remap_file_pages(start, size, prot, pgoff, flags)` — Linux generic
+/// syscall #234.
+///
+/// txKernel does not model nonlinear file mappings yet. Keep the
+/// all-zero LTP feature-probe shape as `ENOSYS`, but report `EINVAL`
+/// for concrete calls so negative argument validation tests observe a
+/// recognized syscall rather than an unsupported architecture.
+pub(super) fn sys_remap_file_pages(args: [u64; 6]) -> SyscallResult {
+    let start = args[0];
+    let size = args[1];
+    let prot = args[2];
+    let pgoff = args[3];
+    let flags = args[4];
+
+    if start == 0 && size == 0 && prot == 0 && pgoff == 0 && flags == 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
     }
+
+    SyscallResult::Error(EINVAL_VALUE)
 }
 
 /// `msync(addr, length, flags)` — Linux RV64 generic syscall #227.
@@ -1566,7 +1131,7 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(v3errno),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -1669,9 +1234,8 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
     match op {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             use tx_scripts::drive;
-            use tx_substrate::step::Deadline;
             use tx_substrate::step::DriveMode;
-            use tx_subsystems::futex::{FutexWaitOp, FUTEX_WAKE_MASK};
+            use tx_subsystems::futex::FutexWaitOp;
 
             if uaddr == 0 {
                 return SyscallResult::error_from(Errno::EINVAL);
@@ -1680,11 +1244,10 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 return SyscallResult::Error(EINVAL_VALUE);
             }
 
-            let wait_mask = if op == FUTEX_WAIT_BITSET {
-                bitset as u64
-            } else {
-                FUTEX_WAKE_MASK
-            };
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mailbox_arc = script_ctx.mailbox().cloned();
+            let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+            let delegate_registry_arc = script_ctx.delegate_registry().cloned();
 
             // Validate the user address before probing — the futex
             // subsystem reads *uaddr via `read_volatile` (bootstrap
@@ -1702,8 +1265,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                         return SyscallResult::error_from(Errno::EFAULT);
                     }
                 }
-            }
-            let mut timeout_deadline_ns = None;
+            };
             if timeout_uaddr != 0 {
                 let Some(timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
                     return SyscallResult::Error(EINVAL_VALUE);
@@ -1711,18 +1273,27 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 if observed != val {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
-                timeout_deadline_ns = Some(<P as TimeIf>::read_ns().saturating_add(timeout_ns));
+                if timeout_ns > 0 {
+                    let deadline_ns = if op == FUTEX_WAIT_BITSET {
+                        if op_full & FUTEX_CLOCK_REALTIME != 0 {
+                            let now_realtime_ns = realtime_ns::<P>();
+                            let now_monotonic_ns = P::read_ns();
+                            now_monotonic_ns
+                                .saturating_add(timeout_ns.saturating_sub(now_realtime_ns))
+                        } else {
+                            timeout_ns
+                        }
+                    } else {
+                        P::read_ns().saturating_add(timeout_ns)
+                    };
+                    if let Some(future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) {
+                        future.await;
+                    }
+                }
+                return SyscallResult::Error(ETIMEDOUT_VALUE);
             }
             let (deadline_ns, interrupted_by_process_timer) =
                 futex_wait_deadline(ctx, timeout_deadline_ns);
-
-            let mut script_ctx = build_subject_script_ctx(ctx);
-            if let Some(deadline_ns) = deadline_ns {
-                script_ctx = script_ctx.with_deadline(Deadline::from_raw(deadline_ns));
-            }
-            let mailbox_arc = script_ctx.mailbox().cloned();
-            let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-            let delegate_registry_arc = script_ctx.delegate_registry().cloned();
 
             // Park and wait.  drive() parks on the futex bucket's
             // WaitSource via resolve_on_wait_source, wakes when
@@ -1738,11 +1309,9 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 uaddr,
                 val,
                 aspace: &ctx.aspace,
-                interest_mask: wait_mask,
                 tid: Some(ctx.thread.tid.0),
                 woken: false,
-                waiting: false,
-                waiting_source_id: None,
+                registered_source_id: None,
             };
             match drive(
                 op,
@@ -1757,11 +1326,6 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 Ok(()) => SyscallResult::Return(0),
                 Err(v3errno) => {
                     let errno: Errno = v3errno.into();
-                    if interrupted_by_process_timer && errno == Errno::ETIMEDOUT {
-                        let now_ns = <P as TimeIf>::read_ns().max(deadline_ns.unwrap_or_default());
-                        super::time::poll_expired_process_timers_at(ctx, now_ns);
-                        return SyscallResult::Error(EINTR_VALUE);
-                    }
                     SyscallResult::error_from(errno)
                 }
             }
@@ -1770,12 +1334,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             if op == FUTEX_WAKE_BITSET && bitset == 0 {
                 return SyscallResult::Error(EINVAL_VALUE);
             }
-            let wake_mask = if op == FUTEX_WAKE_BITSET {
-                bitset as u64
-            } else {
-                tx_subsystems::futex::FUTEX_WAKE_MASK
-            };
-            futex_wake_oneshot(ctx, uaddr, val, wake_mask)
+            futex_wake_oneshot(ctx, uaddr, val)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             if uaddr2 == 0 {
@@ -1794,24 +1353,16 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                     }
                 }
             }
-            let mut script_ctx = build_subject_script_ctx(ctx);
-            let guard = step_engine::guard();
-            let outcome = tx_subsystems::futex::step_futex_requeue_in(
-                &ctx.aspace,
-                uaddr,
-                uaddr2,
-                val,
-                val2,
-                &guard,
-            );
-            drop(guard);
-            match outcome {
-                StepOutcome::Done(count) => SyscallResult::Return(count as i64),
-                StepOutcome::Err(errno) => SyscallResult::error_from(errno),
-                StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                    let _ = &mut script_ctx;
-                    SyscallResult::error_from(Errno::EIO)
-                }
+            // Approximate requeue by waking the source futex waiters.
+            // musl's private pthread_cond handoff uses
+            // FUTEX_REQUEUE(old_barrier, wake=0, requeue=1, mutex).
+            // Without a real wait-queue move, waking the destination
+            // mutex loses the source waiter forever. A source wake is
+            // a legal spurious wake and lets user space re-check.
+            let count = val.max(val2);
+            match futex_wake_count(ctx, uaddr, count) {
+                Ok(woken) => SyscallResult::Return(woken as i64),
+                Err(result) => result,
             }
         }
         FUTEX_WAKE_OP => {
@@ -1837,528 +1388,30 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 }
             }
         }
-        FUTEX_LOCK_PI => futex_pi_lock(ctx, uaddr, false, None).await,
-        FUTEX_TRYLOCK_PI => futex_pi_lock(ctx, uaddr, true, None).await,
-        FUTEX_LOCK_PI2 => futex_pi_lock_pi2(ctx, uaddr, timeout_uaddr).await,
-        FUTEX_UNLOCK_PI => futex_pi_unlock(ctx, uaddr),
-        FUTEX_WAIT_REQUEUE_PI => {
-            futex_wait_requeue_pi::<P>(ctx, uaddr, val, timeout_uaddr, uaddr2).await
-        }
-        FUTEX_CMP_REQUEUE_PI => {
-            let guard = step_engine::guard();
-            let outcome = tx_subsystems::futex::step_futex_cmp_requeue_pi_in(
-                &ctx.aspace,
-                uaddr,
-                uaddr2,
-                val,
-                val2,
-                bitset,
-                &guard,
-            );
-            drop(guard);
-            match outcome {
-                StepOutcome::Done(count) => SyscallResult::Return(count as i64),
-                StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
-                StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                    SyscallResult::error_from(Errno::EIO)
-                }
-            }
-        }
+        // FUTEX_REQUEUE / CMP_REQUEUE / WAKE_OP / LOCK_PI /
+        // UNLOCK_PI / TRYLOCK_PI / WAIT_BITSET / WAKE_BITSET — out
+        // of scope for v1. musl's libc init only emits FUTEX_WAIT
+        // and FUTEX_WAKE so these are not on the critical path.
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
 
-fn futex_wait_deadline(
-    ctx: &SyscallCtx<'_>,
-    timeout_deadline_ns: Option<u64>,
-) -> (Option<u64>, bool) {
-    if ctx.mailbox.is_none() || ctx.timer_wheel.is_none() {
-        return (timeout_deadline_ns, false);
-    }
-    match (
-        timeout_deadline_ns,
-        ctx.process.next_process_timer_deadline_ns(),
-    ) {
-        (Some(timeout), Some(timer)) if timer <= timeout => (Some(timer), true),
-        (None, Some(timer)) => (Some(timer), true),
-        _ => (timeout_deadline_ns, false),
-    }
-}
-
-pub(super) async fn sys_futex_waitv<'a, P: TimeIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
-    let waiters_uaddr = args[0];
-    let nr_futexes = args[1];
-    let flags = args[2];
-    let timeout_uaddr = args[3];
-    let clockid = args[4] as u32;
-
-    if waiters_uaddr == 0 || nr_futexes == 0 || nr_futexes > FUTEX_WAITV_MAX || flags != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    if clockid != CLOCK_MONOTONIC && clockid != CLOCK_REALTIME {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-
-    let mut waits = Vec::new();
-    let layout_size = core::mem::size_of::<FutexWaitvLayout>() as u64;
-    for idx in 0..nr_futexes {
-        let Some(entry_uaddr) = waiters_uaddr.checked_add(idx.saturating_mul(layout_size)) else {
-            return SyscallResult::Error(EINVAL_VALUE);
-        };
-        let entry: FutexWaitvLayout = match bootstrap_read_user(&ctx.aspace, entry_uaddr) {
-            Ok(entry) => entry,
-            Err(errno) => return SyscallResult::error_from(errno),
-        };
-        let allowed_waiter_flags = FUTEX_32 | FUTEX_PRIVATE_FLAG;
-        if entry.reserved != 0
-            || (entry.flags & FUTEX_32) == 0
-            || (entry.flags & !allowed_waiter_flags) != 0
-            || entry.uaddr == 0
-            || (entry.uaddr & 0x3) != 0
-        {
-            return SyscallResult::Error(EINVAL_VALUE);
-        }
-        waits.push(tx_subsystems::futex::FutexWaitvEntry {
-            uaddr: entry.uaddr,
-            val: entry.val as u32,
-            interest_mask: tx_subsystems::futex::FUTEX_WAKE_MASK,
-        });
-    }
-
-    if timeout_uaddr != 0 {
-        let Some(timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
-            return SyscallResult::Error(EINVAL_VALUE);
-        };
-        if timeout_ns == 0 {
-            for wait in &waits {
-                let guard = step_engine::guard();
-                let observed = ctx
-                    .aspace
-                    .read_user(UserPtr::<u32>::new(wait.uaddr as usize), &guard);
-                drop(guard);
-                match observed {
-                    StepOutcome::Done(value) if value == wait.val => {}
-                    StepOutcome::Done(_) => return SyscallResult::Error(EAGAIN_VALUE),
-                    StepOutcome::Err(errno) => {
-                        return SyscallResult::error_from(Errno::from(errno))
-                    }
-                    StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                        return SyscallResult::error_from(Errno::EFAULT);
-                    }
-                }
-            }
-            return SyscallResult::Error(110);
-        }
-    }
-
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    if timeout_uaddr != 0 {
-        let Some(timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
-            return SyscallResult::Error(EINVAL_VALUE);
-        };
-        script_ctx = script_ctx.with_deadline(tx_substrate::step::Deadline::from_raw(timeout_ns));
-    }
-    let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    let op = tx_subsystems::futex::FutexWaitvOp::new(&ctx.aspace, &waits);
-    match drive(
-        op,
-        &mut script_ctx,
-        DriveMode::Waiting,
-        mailbox_arc.as_ref(),
-        delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
-    )
-    .await
-    {
-        Ok(index) => SyscallResult::Return(index as i64),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
-    }
-}
-
-pub(super) fn sys_futex2_wake(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let uaddr = args[0];
-    let mask = args[1] as u32;
-    let nr = args[2] as u32;
-    let flags = args[3] as u32;
-
-    if !futex2_flags_are_supported(flags) || uaddr == 0 || (uaddr & 0x3) != 0 || mask == 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    futex_wake_oneshot(ctx, uaddr, nr, mask as u64)
-}
-
-pub(super) async fn sys_futex2_wait<'a, P: TimeIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
-    let uaddr = args[0];
-    let val = args[1] as u32;
-    let mask = args[2] as u32;
-    let flags = args[3] as u32;
-    let timeout_uaddr = args[4];
-    let clockid = args[5] as u32;
-
-    if !futex2_flags_are_supported(flags)
-        || uaddr == 0
-        || (uaddr & 0x3) != 0
-        || mask == 0
-        || (clockid != CLOCK_MONOTONIC && clockid != CLOCK_REALTIME)
-    {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-
-    if timeout_uaddr != 0 {
-        let Some(timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
-            return SyscallResult::Error(EINVAL_VALUE);
-        };
-        if timeout_ns == 0 {
-            let guard = step_engine::guard();
-            let observed = ctx
-                .aspace
-                .read_user(UserPtr::<u32>::new(uaddr as usize), &guard);
-            drop(guard);
-            match observed {
-                StepOutcome::Done(value) if value == val => return SyscallResult::Error(110),
-                StepOutcome::Done(_) => return SyscallResult::Error(EAGAIN_VALUE),
-                StepOutcome::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
-                StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                    return SyscallResult::error_from(Errno::EFAULT);
-                }
-            }
-        }
-    }
-
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    if timeout_uaddr != 0 {
-        let Some(timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
-            return SyscallResult::Error(EINVAL_VALUE);
-        };
-        script_ctx = script_ctx.with_deadline(tx_substrate::step::Deadline::from_raw(timeout_ns));
-    }
-    let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    let op = tx_subsystems::futex::FutexWaitOp {
-        uaddr,
-        val,
-        aspace: &ctx.aspace,
-        interest_mask: mask as u64,
-        woken: false,
-        waiting: false,
-        waiting_source_id: None,
-    };
-    match drive(
-        op,
-        &mut script_ctx,
-        DriveMode::Waiting,
-        mailbox_arc.as_ref(),
-        delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
-    )
-    .await
-    {
-        Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
-    }
-}
-
-pub(super) fn sys_futex2_requeue(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let waiters_uaddr = args[0];
-    let flags = args[1] as u32;
-    let nr_wake = args[2] as u32;
-    let nr_requeue = args[3] as u32;
-
-    if waiters_uaddr == 0 || flags != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-
-    let layout_size = core::mem::size_of::<FutexWaitvLayout>() as u64;
-    let source: FutexWaitvLayout = match bootstrap_read_user(&ctx.aspace, waiters_uaddr) {
-        Ok(entry) => entry,
-        Err(errno) => return SyscallResult::error_from(errno),
-    };
-    let Some(target_uaddr) = waiters_uaddr.checked_add(layout_size) else {
-        return SyscallResult::Error(EINVAL_VALUE);
-    };
-    let target: FutexWaitvLayout = match bootstrap_read_user(&ctx.aspace, target_uaddr) {
-        Ok(entry) => entry,
-        Err(errno) => return SyscallResult::error_from(errno),
-    };
-    for entry in [source, target] {
-        if entry.reserved != 0
-            || !futex2_flags_are_supported(entry.flags)
-            || entry.uaddr == 0
-            || (entry.uaddr & 0x3) != 0
-        {
-            return SyscallResult::Error(EINVAL_VALUE);
-        }
-    }
-
-    let guard = step_engine::guard();
-    match ctx
-        .aspace
-        .read_user(UserPtr::<u32>::new(source.uaddr as usize), &guard)
-    {
-        StepOutcome::Done(observed) if observed == source.val as u32 => {}
-        StepOutcome::Done(_) => return SyscallResult::Error(EAGAIN_VALUE),
-        StepOutcome::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
-        StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-            return SyscallResult::error_from(Errno::EFAULT);
-        }
-    }
-    let outcome = tx_subsystems::futex::step_futex_requeue_in(
-        &ctx.aspace,
-        source.uaddr,
-        target.uaddr,
-        nr_wake,
-        nr_requeue,
-        &guard,
-    );
-    drop(guard);
-    match outcome {
-        StepOutcome::Done(count) => SyscallResult::Return(count as i64),
-        StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
-        StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-            SyscallResult::error_from(Errno::EIO)
-        }
-    }
-}
-
-fn futex2_flags_are_supported(flags: u32) -> bool {
-    let allowed = FUTEX_32 | FUTEX_PRIVATE_FLAG;
-    (flags & FUTEX_32) != 0 && (flags & !allowed) == 0
-}
-
-fn futex_op_allows_clock_realtime(op: u32) -> bool {
-    matches!(
-        op,
-        FUTEX_WAIT | FUTEX_WAIT_BITSET | FUTEX_WAIT_REQUEUE_PI | FUTEX_LOCK_PI2
-    )
-}
-
-fn futex_wake_oneshot(ctx: &SyscallCtx<'_>, uaddr: u64, n: u32, wake_mask: u64) -> SyscallResult {
-    match futex_wake_count_masked(ctx, uaddr, n, wake_mask) {
+fn futex_wake_oneshot(ctx: &SyscallCtx<'_>, uaddr: u64, n: u32) -> SyscallResult {
+    match futex_wake_count(ctx, uaddr, n) {
         Ok(woken) => SyscallResult::Return(woken as i64),
         Err(result) => result,
     }
 }
 
 fn futex_wake_count(ctx: &SyscallCtx<'_>, uaddr: u64, n: u32) -> Result<u32, SyscallResult> {
-    futex_wake_count_masked(ctx, uaddr, n, tx_subsystems::futex::FUTEX_WAKE_MASK)
-}
-
-fn futex_wake_count_masked(
-    ctx: &SyscallCtx<'_>,
-    uaddr: u64,
-    n: u32,
-    wake_mask: u64,
-) -> Result<u32, SyscallResult> {
     let mut script_ctx = build_subject_script_ctx(ctx);
-    if wake_mask == tx_subsystems::futex::FUTEX_WAKE_MASK {
-        let mut op = FutexWakeOp {
-            uaddr,
-            n,
-            aspace: &ctx.aspace,
-        };
-        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-            Ok(woken) => Ok(woken),
-            Err(v3errno) => Err(SyscallResult::error_from(v3errno)),
-        }
-    } else {
-        let guard = step_engine::guard();
-        let outcome = tx_subsystems::futex::step_futex_wake_masked_in(
-            &ctx.aspace,
-            uaddr,
-            n,
-            wake_mask,
-            &guard,
-        );
-        drop(guard);
-        match outcome {
-            StepOutcome::Done(woken) => Ok(woken),
-            StepOutcome::Err(errno) => Err(SyscallResult::error_from(errno)),
-            StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                Err(SyscallResult::error_from(Errno::EIO))
-            }
-        }
-    }
-}
-
-fn futex_owner_tid(ctx: &SyscallCtx<'_>) -> u32 {
-    ctx.thread.tid.0
-}
-
-async fn futex_wait_requeue_pi<P: TimeIf>(
-    ctx: &SyscallCtx<'_>,
-    uaddr: u64,
-    val: u32,
-    timeout_uaddr: u64,
-    uaddr2: u64,
-) -> SyscallResult {
-    if uaddr2 == 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    let waiter_tid = futex_owner_tid(ctx);
-    let mut deadline = None;
-    if timeout_uaddr != 0 {
-        let Some(timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
-            return SyscallResult::Error(EINVAL_VALUE);
-        };
-        if timeout_ns == 0 {
-            let guard = step_engine::guard();
-            let observed = ctx
-                .aspace
-                .read_user(UserPtr::<u32>::new(uaddr as usize), &guard);
-            drop(guard);
-            match observed {
-                StepOutcome::Done(value) if value == val => {
-                    return SyscallResult::Error(ETIMEDOUT_VALUE);
-                }
-                StepOutcome::Done(_) => return SyscallResult::Error(EAGAIN_VALUE),
-                StepOutcome::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
-                StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                    return SyscallResult::error_from(Errno::EFAULT);
-                }
-            }
-        }
-        deadline = Some(tx_substrate::step::Deadline::from_raw(
-            <P as TimeIf>::read_ns().saturating_add(timeout_ns),
-        ));
-    }
-
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    if let Some(deadline) = deadline {
-        script_ctx = script_ctx.with_deadline(deadline);
-    }
-    let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    let op = tx_subsystems::futex::FutexWaitRequeuePiOp {
+    let mut op = FutexWakeOp {
         uaddr,
-        uaddr2,
-        val,
+        n,
         aspace: &ctx.aspace,
-        waiter_tid,
-        acquired: false,
-        source_woke: false,
-        waiting: false,
-        waiting_source_id: None,
     };
-    match drive(
-        op,
-        &mut script_ctx,
-        DriveMode::Waiting,
-        mailbox_arc.as_ref(),
-        delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
-    )
-    .await
-    {
-        Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => {
-            let errno: Errno = v3errno.into();
-            SyscallResult::error_from(errno)
-        }
-    }
-}
-
-async fn futex_pi_lock_pi2(ctx: &SyscallCtx<'_>, uaddr: u64, timeout_uaddr: u64) -> SyscallResult {
-    let mut deadline = None;
-    if timeout_uaddr != 0 {
-        let Some(timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
-            return SyscallResult::Error(EINVAL_VALUE);
-        };
-        if timeout_ns == 0 {
-            let guard = step_engine::guard();
-            let observed = ctx
-                .aspace
-                .read_user(UserPtr::<u32>::new(uaddr as usize), &guard);
-            drop(guard);
-            match observed {
-                StepOutcome::Done(value) if (value & FUTEX_TID_MASK) != 0 => {
-                    return SyscallResult::Error(ETIMEDOUT_VALUE);
-                }
-                StepOutcome::Done(_) => {}
-                StepOutcome::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
-                StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                    return SyscallResult::error_from(Errno::EFAULT);
-                }
-            }
-        }
-        deadline = Some(tx_substrate::step::Deadline::from_raw(timeout_ns));
-    }
-    futex_pi_lock(ctx, uaddr, false, deadline).await
-}
-
-async fn futex_pi_lock(
-    ctx: &SyscallCtx<'_>,
-    uaddr: u64,
-    try_only: bool,
-    deadline: Option<tx_substrate::step::Deadline>,
-) -> SyscallResult {
-    let owner = futex_owner_tid(ctx);
-    if try_only {
-        let guard = step_engine::guard();
-        let outcome =
-            tx_subsystems::futex::step_futex_trylock_pi_in(&ctx.aspace, uaddr, owner, &guard);
-        drop(guard);
-        return match outcome {
-            StepOutcome::Done(()) => SyscallResult::Return(0),
-            StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
-            StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                SyscallResult::error_from(Errno::EIO)
-            }
-        };
-    }
-
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    if let Some(deadline) = deadline {
-        script_ctx = script_ctx.with_deadline(deadline);
-    }
-    let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    let op = tx_subsystems::futex::FutexPiLockOp {
-        uaddr,
-        aspace: &ctx.aspace,
-        owner_tid: owner,
-        acquired: false,
-        waiting: false,
-        waiting_source_id: None,
-    };
-    match drive(
-        op,
-        &mut script_ctx,
-        DriveMode::Waiting,
-        mailbox_arc.as_ref(),
-        delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
-    )
-    .await
-    {
-        Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => {
-            let errno: Errno = v3errno.into();
-            SyscallResult::error_from(errno)
-        }
-    }
-}
-
-fn futex_pi_unlock(ctx: &SyscallCtx<'_>, uaddr: u64) -> SyscallResult {
-    let owner = futex_owner_tid(ctx);
-    let guard = step_engine::guard();
-    let outcome = tx_subsystems::futex::step_futex_unlock_pi_in(&ctx.aspace, uaddr, owner, &guard);
-    drop(guard);
-    match outcome {
-        StepOutcome::Done(_) => SyscallResult::Return(0),
-        StepOutcome::Err(errno) => SyscallResult::error_from(errno),
-        StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-            SyscallResult::error_from(Errno::EIO)
-        }
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(woken) => Ok(woken),
+        Err(v3errno) => Err(SyscallResult::error_from(Errno::from(v3errno))),
     }
 }

@@ -13,24 +13,21 @@ use tx_subsystems::vfs::structure::{
 use tx_subsystems::vm::{AccessMode, UserVirtAddr, VmBacking, VmFault, USER_PAGE_SIZE};
 
 use crate::linux_syscall::{
-    F_ADD_SEALS, F_GET_SEALS, F_SEAL_FUTURE_WRITE, F_SEAL_GROW, F_SEAL_SEAL, F_SEAL_SHRINK,
-    F_SEAL_WRITE, MADV_DONTNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE,
-    MAP_SHARED, MCL_CURRENT, MCL_FUTURE, MCL_ONFAULT, MFD_ALLOW_SEALING, MFD_CLOEXEC,
-    MLOCK_ONFAULT, MPOL_DEFAULT, MPOL_F_MEMS_ALLOWED, MREMAP_FIXED, MREMAP_MAYMOVE, NR_FCNTL,
-    NR_FTRUNCATE, NR_GET_MEMPOLICY, NR_MADVISE, NR_MBIND, NR_MEMFD_CREATE, NR_MIGRATE_PAGES,
-    NR_MINCORE, NR_MLOCK2, NR_MLOCKALL, NR_MMAP, NR_MOVE_PAGES, NR_MPROTECT, NR_MREMAP,
-    NR_MUNLOCKALL, NR_MUNMAP, NR_PIDFD_OPEN, NR_PROCESS_MADVISE, NR_PROCESS_VM_READV,
-    NR_PROCESS_VM_WRITEV, NR_REMAP_FILE_PAGES, NR_SET_MEMPOLICY, NR_WRITE, PROT_READ, PROT_WRITE,
+    MADV_DONTNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, MAP_SHARED,
+    MAP_SHARED_VALIDATE, MREMAP_FIXED, MREMAP_MAYMOVE, NR_MADVISE, NR_MMAP, NR_MPROTECT, NR_MREMAP,
+    NR_MUNMAP, PROT_READ, PROT_WRITE,
 };
 
+const E_ACCES: i32 = 13;
 const E_BADF: i32 = 9;
 const E_BUSY: i32 = 16;
 const E_EXIST: i32 = 17;
+const E_FAULT: i32 = 14;
 const E_INVAL: i32 = 22;
 const E_NOMEM: i32 = 12;
 const E_NODEV: i32 = 19;
 const E_NOSYS: i32 = 38;
-const E_PERM: i32 = 1;
+const E_OPNOTSUPP: i32 = 95;
 
 fn vm_setup() -> TestSetup {
     let setup = setup();
@@ -52,6 +49,24 @@ fn fresh_proc_thread() -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
 /// `page_count` pages with size `size_bytes`. Mirrors the
 /// fd-ops Wave 4 helper but local to this module.
 fn pagebacked_open_file(page_count: u64, size_bytes: u64) -> Cap<OpenFile> {
+    pagebacked_open_file_with_flags(
+        page_count,
+        size_bytes,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+        },
+    )
+}
+
+fn pagebacked_open_file_with_flags(
+    page_count: u64,
+    size_bytes: u64,
+    flags: OpenFileFlags,
+) -> Cap<OpenFile> {
     let pc = PageContainer::new_cap(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -74,17 +89,7 @@ fn pagebacked_open_file(page_count: u64, size_bytes: u64) -> Cap<OpenFile> {
         let res = reserve_for::<RNode>().expect("rnode reservation");
         sign_for(res, raw)
     };
-    OpenFile::new_cap(
-        rnode,
-        OpenFileFlags {
-            read: true,
-            write: true,
-            append: false,
-            cloexec: false,
-            nonblocking: false,
-        },
-    )
-    .expect("open file cap")
+    OpenFile::new_cap(rnode, flags).expect("open file cap")
 }
 
 /// `mmap(0, PAGE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS,
@@ -372,6 +377,29 @@ fn dispatch_mremap_fixed_maymove_replaces_destination_mapping() {
     assert!(ctx.aspace.lookup(UserVirtAddr(new_addr as usize)).is_some());
 }
 
+#[test]
+fn dispatch_mremap_missing_old_mapping_returns_neg_efault() {
+    let _setup = vm_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_MREMAP,
+            [
+                0x4000_0000,
+                USER_PAGE_SIZE as u64,
+                (USER_PAGE_SIZE * 2) as u64,
+                MREMAP_MAYMOVE,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_FAULT));
+}
+
 /// `mmap(0, PAGE, PROT_READ, MAP_PRIVATE, fd, 0)` against a fd
 /// whose rnode is `RNodeBacking::PageBacked` returns a page-aligned
 /// user VA.
@@ -544,6 +572,93 @@ fn dispatch_mmap_with_neither_shared_nor_private_returns_neg_einval() {
     );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_INVAL));
+}
+
+#[test]
+fn dispatch_mmap_shared_validate_unknown_flag_returns_neg_eopnotsupp() {
+    let _setup = vm_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    proc_cap.set_fd(3, Some(pagebacked_open_file(1, USER_PAGE_SIZE as u64)));
+    let ctx = make_ctx(proc_cap, thread);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_MMAP,
+            [
+                0,
+                USER_PAGE_SIZE as u64,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED_VALIDATE | (1 << 10),
+                3,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_OPNOTSUPP));
+}
+
+#[test]
+fn dispatch_mmap_file_backed_write_only_fd_returns_neg_eacces() {
+    let _setup = vm_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    proc_cap.set_fd(
+        3,
+        Some(pagebacked_open_file_with_flags(
+            1,
+            USER_PAGE_SIZE as u64,
+            OpenFileFlags {
+                read: false,
+                write: true,
+                append: false,
+                cloexec: false,
+                nonblocking: false,
+            },
+        )),
+    );
+    let ctx = make_ctx(proc_cap, thread);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_MMAP,
+            [
+                0,
+                USER_PAGE_SIZE as u64,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE,
+                3,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_ACCES));
+}
+
+#[test]
+fn dispatch_mmap_file_backed_closed_fd_precedes_zero_length_einval() {
+    let _setup = vm_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_MMAP, [0, 0, PROT_WRITE, MAP_SHARED, 99, 0]),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_BADF));
+}
+
+#[test]
+fn dispatch_mmap_file_backed_negative_fd_precedes_zero_length_einval() {
+    let _setup = vm_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_MMAP, [0, 0, PROT_WRITE, MAP_SHARED, u64::MAX, 0]),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_BADF));
 }
 
 /// `munmap(addr, length)` against a previously-installed mmap

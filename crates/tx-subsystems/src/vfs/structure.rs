@@ -1047,9 +1047,10 @@ pub enum OpenFileBacking {
     /// descriptor is a normal fd-table entry whose backing carries the
     /// POSIX mq identity and per-open flags.
     PosixMq { mq: Cap<PosixMqInstance> },
-    /// `pidfd_open(2)` open file. The descriptor carries the target
-    /// process identity for pidfd-consuming syscalls.
-    Pidfd { process: Cap<ProcessIdentity> },
+    /// `pidfd_open(2)` open file. The descriptor identifies a process by
+    /// pid for Linux compatibility; fuller pidfd wait/signal semantics
+    /// remain in the syscall layer.
+    Pidfd { pid: u32 },
 }
 
 /// Per-fd file-position carrier.
@@ -1350,6 +1351,23 @@ impl OpenFile {
         step_engine::sign(Self::new_posix_mq(mq, flags))
     }
 
+    /// Construct a pidfd-backed `OpenFile`.
+    pub fn new_pidfd(pid: u32, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::Pidfd { pid },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicI8::new(-1),
+            flags,
+            opendir_dentry: None,
+        }
+    }
+
+    /// Zone-sign a fresh pidfd-backed `OpenFile`.
+    pub fn new_pidfd_cap(pid: u32, flags: OpenFileFlags) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_pidfd(pid, flags))
+    }
+
     /// Construct an io_uring-backed `OpenFile` (future PR-12 phase 0 —
     /// second `OnBehalfOf<P>` canary). The resulting value carries
     /// `OpenFileBacking::IoUring { ring }` and no `Cap<RNode>` —
@@ -1454,7 +1472,7 @@ impl OpenFile {
             ),
             OpenFileBacking::Pidfd { .. } => panic!(
                 "OpenFile::rnode() called on a pidfd-backed OpenFile; \
-                 dispatch via OpenFile::backing() / OpenFile::pidfd_process() first",
+                 dispatch via OpenFile::backing() / OpenFile::pidfd_pid() first",
             ),
         }
     }
@@ -1644,10 +1662,10 @@ impl OpenFile {
         }
     }
 
-    /// `Some(&Cap<ProcessIdentity>)` iff this `OpenFile` is a pidfd.
-    pub fn pidfd_process(&self) -> Option<&Cap<ProcessIdentity>> {
+    /// Return the target pid iff this `OpenFile` is pidfd-backed.
+    pub fn pidfd_pid(&self) -> Option<u32> {
         match &self.backing {
-            OpenFileBacking::Pidfd { process } => Some(process),
+            OpenFileBacking::Pidfd { pid } => Some(*pid),
             OpenFileBacking::Rnode { .. }
             | OpenFileBacking::Ufd { .. }
             | OpenFileBacking::AioContext { .. }

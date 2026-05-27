@@ -8,6 +8,32 @@ use crate::adapter::step_engine::SpinMutex;
 
 static UTS_NODENAME: SpinMutex<[u8; UTSNAME_FIELD]> = SpinMutex::new(default_nodename());
 
+const PERSONALITY_QUERY: u32 = u32::MAX;
+const PER_MASK: u32 = 0x00ff;
+const PER_HPUX: u32 = 0x0010;
+const UNAME26: u32 = 0x0020_000;
+const ADDR_NO_RANDOMIZE: u32 = 0x0040_000;
+const FDPIC_FUNCPTRS: u32 = 0x0080_000;
+const MMAP_PAGE_ZERO: u32 = 0x0100_000;
+const ADDR_COMPAT_LAYOUT: u32 = 0x0200_000;
+const READ_IMPLIES_EXEC: u32 = 0x0400_000;
+const ADDR_LIMIT_32BIT: u32 = 0x0800_000;
+const SHORT_INODE: u32 = 0x1000_000;
+const WHOLE_SECONDS: u32 = 0x2000_000;
+const STICKY_TIMEOUTS: u32 = 0x4000_000;
+const ADDR_LIMIT_3GB: u32 = 0x8000_000;
+const PERSONALITY_KNOWN_FLAGS: u32 = UNAME26
+    | ADDR_NO_RANDOMIZE
+    | FDPIC_FUNCPTRS
+    | MMAP_PAGE_ZERO
+    | ADDR_COMPAT_LAYOUT
+    | READ_IMPLIES_EXEC
+    | ADDR_LIMIT_32BIT
+    | SHORT_INODE
+    | WHOLE_SECONDS
+    | STICKY_TIMEOUTS
+    | ADDR_LIMIT_3GB;
+
 #[cfg(test)]
 pub(crate) fn reset_uts_nodename_for_test() {
     *UTS_NODENAME.lock() = default_nodename();
@@ -24,6 +50,27 @@ const fn default_nodename() -> [u8; UTSNAME_FIELD] {
     out[6] = b'e';
     out[7] = b'l';
     out
+}
+
+/// `personality(persona)` — Linux generic ABI `__NR_personality = 92`.
+///
+/// `0xffffffff` is the read-only query sentinel; other recognised values
+/// replace the per-process personality and return the previous one. The
+/// behavioural side effects of compatibility flags are intentionally small
+/// for now, but recording the value is enough for libc and LTP readback
+/// probes such as `personality01` and `personality02`.
+pub(super) fn sys_personality<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let persona = args[0] as u32;
+    if persona == PERSONALITY_QUERY {
+        return SyscallResult::Return(ctx.process.personality() as i64);
+    }
+
+    if persona & !(PER_MASK | PERSONALITY_KNOWN_FLAGS) != 0 || (persona & PER_MASK) > PER_HPUX {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let old = ctx.process.swap_personality(persona);
+    SyscallResult::Return(old as i64)
 }
 
 /// `getrandom(buf, buflen, flags)` — Linux RV64 generic ABI
@@ -143,16 +190,23 @@ pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
         return SyscallResult::Error(EPERM_VALUE);
     }
 
-    if resource == RLIMIT_NOFILE && new_uaddr != 0 {
+    if (resource == RLIMIT_NOFILE || resource == RLIMIT_MEMLOCK) && new_uaddr != 0 {
         let new_limit = match bootstrap_read_user::<RlimitLayout>(&ctx.aspace, new_uaddr) {
             Ok(limit) => limit,
             Err(errno) => return SyscallResult::error_from(errno),
         };
-        if new_limit.rlim_cur > new_limit.rlim_max || new_limit.rlim_max > u32::MAX as u64 {
+        if new_limit.rlim_cur > new_limit.rlim_max
+            || (resource == RLIMIT_NOFILE && new_limit.rlim_max > u32::MAX as u64)
+        {
             return SyscallResult::Error(EINVAL_VALUE);
         }
-        ctx.process
-            .set_rlimit_nofile(new_limit.rlim_cur as u32, new_limit.rlim_max as u32);
+        if resource == RLIMIT_NOFILE {
+            ctx.process
+                .set_rlimit_nofile(new_limit.rlim_cur as u32, new_limit.rlim_max as u32);
+        } else {
+            ctx.process
+                .set_rlimit_memlock(new_limit.rlim_cur, new_limit.rlim_max);
+        }
     }
 
     let limit = match resource {
@@ -171,9 +225,16 @@ pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
             rlim_cur: 0,
             rlim_max: RLIM_INFINITY,
         },
-        RLIMIT_CPU | RLIMIT_FSIZE | RLIMIT_DATA | RLIMIT_RSS | RLIMIT_NPROC | RLIMIT_MEMLOCK
-        | RLIMIT_AS | RLIMIT_LOCKS | RLIMIT_SIGPENDING | RLIMIT_MSGQUEUE | RLIMIT_NICE
-        | RLIMIT_RTPRIO | RLIMIT_RTTIME => RlimitLayout {
+        RLIMIT_MEMLOCK => {
+            let (cur, max) = ctx.process.rlimit_memlock();
+            RlimitLayout {
+                rlim_cur: cur,
+                rlim_max: max,
+            }
+        }
+        RLIMIT_CPU | RLIMIT_FSIZE | RLIMIT_DATA | RLIMIT_RSS | RLIMIT_NPROC | RLIMIT_AS
+        | RLIMIT_LOCKS | RLIMIT_SIGPENDING | RLIMIT_MSGQUEUE | RLIMIT_NICE | RLIMIT_RTPRIO
+        | RLIMIT_RTTIME => RlimitLayout {
             rlim_cur: RLIM_INFINITY,
             rlim_max: RLIM_INFINITY,
         },
@@ -188,12 +249,17 @@ pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     SyscallResult::Return(0)
 }
 
+/// `getrlimit(resource, rlim)` — old generic ABI facade over the same
+/// rlimit table used by `prlimit64(pid=0, ..., old_rlim)`.
 pub(super) fn sys_getrlimit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    sys_prlimit64([0, args[0], 0, args[1], 0, 0], ctx)
-}
+    let resource = args[0] as u32;
+    let old_uaddr = args[1];
 
-pub(super) fn sys_setrlimit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    sys_prlimit64([0, args[0], args[1], 0, 0, 0], ctx)
+    if old_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    sys_prlimit64([0, resource as u64, 0, old_uaddr, 0, 0], ctx)
 }
 
 #[repr(C)]

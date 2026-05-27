@@ -154,25 +154,12 @@ pub const NR_RT_SIGACTION: u64 = 134;
 /// `thread_runtime::execution::step_sigprocmask`. Rejects
 /// `sigsetsize != 8`.
 pub const NR_RT_SIGPROCMASK: u64 = 135;
-/// `restart_syscall()`. Linux RV64 generic ABI `__NR_restart_syscall = 128`.
-/// Explicitly dispatched as `-ENOSYS` until interrupted-sleep restart state
-/// exists in the syscall ABI.
-pub const NR_RESTART_SYSCALL: u64 = 128;
-/// `ioprio_set(which, who, ioprio)`. Linux RV64 generic ABI
-/// `__NR_ioprio_set = 30`.
-pub const NR_IOPRIO_SET: u64 = 30;
-/// `ioprio_get(which, who)`. Linux RV64 generic ABI
-/// `__NR_ioprio_get = 31`.
-pub const NR_IOPRIO_GET: u64 = 31;
-/// `sched_setparam(pid, param)`. Linux RV64 generic ABI
-/// `__NR_sched_setparam = 118`.
-pub const NR_SCHED_SETPARAM: u64 = 118;
-/// `setpriority(which, who, niceval)`. Linux RV64 generic ABI
-/// `__NR_setpriority = 140`.
-pub const NR_SETPRIORITY: u64 = 140;
-/// `getpriority(which, who)`. Linux RV64 generic ABI
-/// `__NR_getpriority = 141`.
-pub const NR_GETPRIORITY: u64 = 141;
+/// `capget(hdrp, datap)`. Linux generic ABI `__NR_capget = 90`.
+pub const NR_CAPGET: u64 = 90;
+/// `capset(hdrp, datap)`. Linux generic ABI `__NR_capset = 91`.
+pub const NR_CAPSET: u64 = 91;
+/// `personality(persona)`. Linux generic ABI `__NR_personality = 92`.
+pub const NR_PERSONALITY: u64 = 92;
 /// `fcntl(fd, cmd, arg)`. Linux generic ABI `__NR_fcntl` (= `__NR3264_fcntl`).
 ///
 /// Wave 2 of the ELF loader plan ships a minimal subset:
@@ -548,18 +535,10 @@ pub const NR_GET_ROBUST_LIST: u64 = 100;
 pub const NR_SCHED_SETAFFINITY: u64 = 122;
 /// `sched_getaffinity(pid, cpusetsize, mask)`. Linux generic ABI.
 pub const NR_SCHED_GETAFFINITY: u64 = 123;
-/// `sched_getscheduler(pid)`. Linux RV64 generic ABI.
-pub const NR_SCHED_GETSCHEDULER: u64 = 120;
-/// `sched_getparam(pid, param)`. Linux RV64 generic ABI.
-pub const NR_SCHED_GETPARAM: u64 = 121;
-/// `sched_yield()`. Linux RV64 generic ABI.
-pub const NR_SCHED_YIELD: u64 = 124;
-/// `sched_get_priority_max(policy)`. Linux RV64 generic ABI.
-pub const NR_SCHED_GET_PRIORITY_MAX: u64 = 125;
-/// `sched_get_priority_min(policy)`. Linux RV64 generic ABI.
-pub const NR_SCHED_GET_PRIORITY_MIN: u64 = 126;
-/// `sched_rr_get_interval(pid, timespec)`. Linux RV64 generic ABI.
-pub const NR_SCHED_RR_GET_INTERVAL: u64 = 127;
+/// `sched_setattr(pid, attr, flags)`. Linux generic ABI.
+pub const NR_SCHED_SETATTR: u64 = 274;
+/// `sched_getattr(pid, attr, size, flags)`. Linux generic ABI.
+pub const NR_SCHED_GETATTR: u64 = 275;
 
 // ---------------------------------------------------------------------
 // Wave 3 of the fork/clone/wait4 slice — Part 3 (NR_WAIT4 syscall arm
@@ -794,83 +773,16 @@ pub const NR_MLOCKALL: u64 = 230;
 /// `munlockall()`. Linux RV64 generic ABI `__NR_munlockall = 231`.
 pub const NR_MUNLOCKALL: u64 = 231;
 /// `mincore(addr, length, vec)`. Linux RV64 generic ABI
-/// `__NR_mincore = 232`. Wraps `AddressSpace::mincore` and copies one
-/// residency byte per covered page to `vec`.
+/// `__NR_mincore = 232`.
 pub const NR_MINCORE: u64 = 232;
 /// `madvise(addr, length, advice)`. Linux RV64 generic ABI
 /// `__NR_madvise = 233`. Wraps `AddressSpace::madvise`.
 pub const NR_MADVISE: u64 = 233;
-/// `remap_file_pages(start, size, prot, pgoff, flags)`. Linux RV64 generic ABI.
+/// `remap_file_pages(start, size, prot, pgoff, flags)`. Linux generic
+/// ABI `__NR_remap_file_pages = 234`.
 pub const NR_REMAP_FILE_PAGES: u64 = 234;
-/// `mbind(start, len, mode, nodemask, maxnode, flags)`. Linux RV64 generic ABI.
-pub const NR_MBIND: u64 = 235;
-/// `get_mempolicy(policy, nodemask, maxnode, addr, flags)`. Linux RV64 generic ABI.
-pub const NR_GET_MEMPOLICY: u64 = 236;
-/// `set_mempolicy(mode, nodemask, maxnode)`. Linux RV64 generic ABI.
-pub const NR_SET_MEMPOLICY: u64 = 237;
-/// `migrate_pages(pid, maxnode, old_nodes, new_nodes)`. Linux RV64 generic ABI.
-pub const NR_MIGRATE_PAGES: u64 = 238;
-/// `move_pages(pid, nr_pages, pages, nodes, status, flags)`. Linux RV64 generic ABI.
-pub const NR_MOVE_PAGES: u64 = 239;
-/// `process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)`.
-/// Linux RV64 generic ABI.
-pub const NR_PROCESS_VM_READV: u64 = 270;
-/// `process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)`.
-/// Linux RV64 generic ABI.
-pub const NR_PROCESS_VM_WRITEV: u64 = 271;
 /// `mlock2(addr, len, flags)`. Linux RV64 generic ABI `__NR_mlock2 = 284`.
 pub const NR_MLOCK2: u64 = 284;
-/// `memfd_create(name, flags)`. Linux RV64 generic ABI
-/// `__NR_memfd_create = 279`.
-pub const NR_MEMFD_CREATE: u64 = 279;
-/// `MLOCK_ONFAULT` flag for `mlock2`. Under no-swap this is accepted as an
-/// observational lock flag, same as eager `mlock`.
-pub const MLOCK_ONFAULT: u64 = 0x1;
-/// `MCL_CURRENT` flag for `mlockall`: lock all current mappings.
-pub const MCL_CURRENT: u64 = 0x1;
-/// `MCL_FUTURE` flag for `mlockall`: lock future mappings. Tx v1 accepts
-/// the bit but does not yet persist a future-lock process policy.
-pub const MCL_FUTURE: u64 = 0x2;
-/// `MCL_ONFAULT` flag for `mlockall`: lock pages on fault. Under no-swap
-/// this collapses to the same observational VMA flag as eager locking.
-pub const MCL_ONFAULT: u64 = 0x4;
-/// `MFD_CLOEXEC` for `memfd_create`.
-pub const MFD_CLOEXEC: u64 = 0x1;
-/// `MFD_ALLOW_SEALING` for `memfd_create`. Without this bit, Linux
-/// starts the memfd with `F_SEAL_SEAL` already installed.
-pub const MFD_ALLOW_SEALING: u64 = 0x2;
-/// `MFD_HUGETLB` for `memfd_create`. Tx recognises the bit but does
-/// not implement hugetlb-backed memfds.
-pub const MFD_HUGETLB: u64 = 0x4;
-/// `MFD_NOEXEC_SEAL` for `memfd_create`. Tx records no execute policy
-/// for anonymous PageBacked fds yet, so this is accepted as a no-op.
-pub const MFD_NOEXEC_SEAL: u64 = 0x8;
-/// `MFD_EXEC` for `memfd_create`. Accepted as a no-op in v1.
-pub const MFD_EXEC: u64 = 0x10;
-
-/// Linux memory policy modes from `include/uapi/linux/mempolicy.h`.
-pub const MPOL_DEFAULT: u64 = 0;
-pub const MPOL_PREFERRED: u64 = 1;
-pub const MPOL_BIND: u64 = 2;
-pub const MPOL_INTERLEAVE: u64 = 3;
-pub const MPOL_LOCAL: u64 = 4;
-pub const MPOL_PREFERRED_MANY: u64 = 5;
-/// `get_mempolicy`: return the policy for the supplied address.
-pub const MPOL_F_ADDR: u64 = 1 << 0;
-/// `get_mempolicy`: return the node where the supplied address resides.
-pub const MPOL_F_NODE: u64 = 1 << 1;
-/// `get_mempolicy`: return the task's allowed memory nodes.
-pub const MPOL_F_MEMS_ALLOWED: u64 = 1 << 2;
-/// Policy input flag: interpret nodemask against static node ids.
-pub const MPOL_F_STATIC_NODES: u64 = 1 << 15;
-/// Policy input flag: interpret nodemask relative to allowed nodes.
-pub const MPOL_F_RELATIVE_NODES: u64 = 1 << 14;
-/// `mbind` flag: apply to all pages in range.
-pub const MPOL_MF_STRICT: u64 = 1 << 0;
-/// `mbind` flag: move matching pages.
-pub const MPOL_MF_MOVE: u64 = 1 << 1;
-/// `mbind` flag: move pages owned by other tasks too.
-pub const MPOL_MF_MOVE_ALL: u64 = 1 << 2;
 
 // ---------------------------------------------------------------------
 // `PROT_*` flag bits — Linux generic uapi `<sys/mman.h>`. Slice 2 acts
@@ -913,6 +825,9 @@ pub const MAP_SHARED: u64 = 0x01;
 /// `MAP_PRIVATE` — copy-on-write: modifications never propagate to the
 /// backing. Mutually exclusive with `MAP_SHARED`.
 pub const MAP_PRIVATE: u64 = 0x02;
+/// `MAP_SHARED_VALIDATE` — shared mapping plus strict unknown-flag
+/// validation (`EOPNOTSUPP` instead of silently ignoring unknown bits).
+pub const MAP_SHARED_VALIDATE: u64 = 0x03;
 /// `MAP_FIXED` — interpret `addr` as the exact placement; any existing
 /// mapping in the requested range is silently replaced
 /// (`MapPlacement::FixedReplace`).
@@ -1490,8 +1405,10 @@ pub const NR_PIDFD_OPEN: u64 = 434;
 /// `pidfd_send_signal(pidfd, sig, info, flags)` — Linux RV64.
 /// Phase J: returns `-ENOSYS`; TODO full implementation.
 pub const NR_PIDFD_SEND_SIGNAL: u64 = 424;
-/// `process_madvise(pidfd, vec, vlen, behavior, flags)`. Linux RV64.
-pub const NR_PROCESS_MADVISE: u64 = 440;
+/// `pidfd_getfd(pidfd, targetfd, flags)` — Linux RV64.
+pub const NR_PIDFD_GETFD: u64 = 438;
+/// `kcmp(pid1, pid2, type, idx1, idx2)` — Linux RV64.
+pub const NR_KCMP: u64 = 272;
 /// `uname(buf)`. Linux RV64 generic ABI `__NR_uname = 160`. Writes
 /// the static utsname (`sysname` / `nodename` / `release` / `version`
 /// / `machine` / `domainname`, each `[u8; 65]`) to `buf`. Slice 7
@@ -1511,6 +1428,8 @@ pub const NR_SETHOSTNAME: u64 = 161;
 /// (`RLIMIT_NOFILE = 1024 / 4096`, `RLIMIT_STACK = 8 MiB`, the rest
 /// `RLIM_INFINITY`) while fd helpers enforce the soft 1024 ceiling.
 pub const NR_PRLIMIT64: u64 = 261;
+/// `getrlimit(resource, rlim)` — Linux generic ABI old rlimit syscall.
+pub const NR_GETRLIMIT: u64 = 163;
 /// `getrandom(buf, buflen, flags)`. Linux RV64 generic ABI
 /// `__NR_getrandom = 278`. Fills `buf` with `buflen` bytes from the
 /// platform entropy source via `<P as EntropyIf>::fill_random`.

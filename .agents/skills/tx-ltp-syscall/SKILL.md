@@ -268,6 +268,102 @@ shape is the same: pick the specific test name that exercises the syscall
 you changed (`fork01`, `getrlimit02`, `sendfile02`, …) and confirm it
 passes.
 
+Current local shortcuts:
+
+```sh
+make oscomp-local-rv64-ltp-musl OSCOMP_LTP=<case>
+make oscomp-local-rv64-ltp-musl OSCOMP_LTP=<case1>,<case2>
+make oscomp-local-la64-ltp-musl OSCOMP_LTP=<case1>,<case2>
+make oscomp-local-rv64-ltp-batch LTP_BATCH=<batch>
+make oscomp-local-rv64-ltp-batch LTP_BATCH=submit
+make oscomp-local-la64-ltp-batch LTP_BATCH=submit
+python3 tools/ltp-batches.py --batch <batch>
+python3 tools/ltp-batches.py --list
+make ltp-runtests
+make ltp-runtest-cases LTP_RUNTEST=<module>
+make oscomp-local-rv64-ltp-runtest LTP_RUNTEST=<module>
+make oscomp-local-rv64-ltp-runtest LTP_RUNTEST=<module> LTP_RUNTEST_CASES=<tag1>,<tag2>
+```
+
+Current LTP bookkeeping docs:
+
+- `docs/LTP/ltp-batches.md` — syscalls batch split, suggested order, and
+  current stitched per-batch scores.
+- `docs/LTP/ltp-submit-whitelist.md` — submit whitelist score table. This is
+  the one to update when adding/removing positive-score cases or recording
+  LA64 alignment status.
+- `docs/LTP/syscalls/ltp-*-progress.md` — detailed per-module case notes.
+- `docs/LTP/runtests/` — native LTP runtest-module progress outside the
+  syscalls batch split.
+
+Submit whitelist rules:
+
+- `LTP_BATCH=submit` is the local mirror of the no-`tx.oscomp.groups`
+  submission path. Official-style no-group boot runs this same whitelist via
+  `append_default_oscomp_scripts()` in
+  `crates/tx-kernel/src/init/exec.rs`.
+- The whitelist constant is `LTP_SUBMIT_CASES` in
+  `crates/tx-kernel/src/init/exec.rs`.
+- Build the whitelist from cases with nonzero passed score in
+  `docs/LTP/syscalls/ltp-*-progress.md`.
+- Do not use `docs/LTP/syscalls/ltp-progress.md` (`p0`) as a whitelist source:
+  p0 intentionally overlaps real module batches and is only a smoke/sample
+  slice.
+- Partial-score cases belong in the submit whitelist when they add points.
+  Keep known RV-positive cases such as `futex_wake03` and `setitimer01` even
+  if LA64 is being aligned later.
+- After changing the whitelist, update `docs/LTP/ltp-submit-whitelist.md`
+  with the case count, total stitched score, module breakdown, and per-case
+  rows.
+
+Syscalls batch rules:
+
+- `tools/ltp-batches.py` splits the extracted OSComp LTP syscalls list into
+  batches such as `smoke`, `fd-io`, `vfs`, `vm`, `process`, `cred`,
+  `signal`, `ipc`, `sched`, `event`, `time`, `mount`, `heavy`, and `aio`.
+- `p0` is allowed as a quick sample/regression slice, but it overlaps the
+  real modules and should not be counted into submit totals.
+- `LTP_BATCH=all` is a diagnostic syscalls sweep, not the official full LTP
+  and not every upstream LTP runtest module.
+
+Native runtest rules:
+
+- `make ltp-runtests` lists upstream LTP runtest modules.
+- `make ltp-runtest-cases LTP_RUNTEST=<module>` lists tags in one module.
+- Guest-side execution is wired through `ltp-runtest:<module>` in
+  `exec.rs`; `LTP_RUNTEST_CASES=a,b` filters by tag inside the module.
+- Native runtest rows may overlap syscalls rows by name. Treat them as a
+  separate exploration track unless the exact same judge case is confirmed.
+
+LA64 whitelist alignment workflow:
+
+- Run LA64 submit-whitelist cases in small groups, normally five cases per
+  run:
+
+  ```sh
+  timeout 90s make oscomp-local-la64-ltp-musl OSCOMP_LTP=case1,case2,case3,case4,case5
+  ```
+
+- If the group exits normally, record each case in
+  `docs/LTP/ltp-submit-whitelist.md` using the `LA Status` and `LA Note`
+  columns. Use `pass`, `partial`, `fail`, `skip`, or `hang`.
+- If a case clearly finishes and the judge summary is printed, do not wait for
+  the outer timeout; record the result immediately and continue.
+- If the guest stops making progress past the case's own LTP timeout window,
+  stop that run, mark the case/group as `hang`, and continue after isolating
+  the next case.
+- Record concrete symptoms in `LA Note`, for example `LA 1/2; mmap SQ/CQ ring
+  returns EINVAL, exits cleanly`, `host timeout after RUN`, or `kernel panic:
+  <file>:<line>`.
+
+Known local skips live in `tools/ltp-batches.py::SKIP_CASES` and
+`crates/tx-kernel/src/init/exec.rs::LOCAL_LTP_SKIP_SHELL_PATTERN`. These are only for
+cases that currently wedge the guest or never reach the normal LTP
+summary/guest-exit path. Local command generation skips them for direct
+`OSCOMP_LTP=...`, full `ltp-musl`, native runtest loops, and
+`tools/ltp-batches.py` batch lists. Do not re-run a skipped case unless the
+user explicitly asks to reopen that specific bug.
+
 **The completion report must name at least one LTP and/or OSComp test
 that now passes because of this change.** If LTP/OSComp can't currently
 run for the affected syscall (e.g. test environment missing, dependency
