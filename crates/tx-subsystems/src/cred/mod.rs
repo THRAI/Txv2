@@ -399,6 +399,10 @@ pub fn step_setuid(target: &Cap<ProcessIdentity>, new_uid: Uid) -> CredChange {
         new.uid = new_uid;
         new.euid = new_uid;
         new.suid = new_uid;
+        if !new_uid.is_root() {
+            new.effective_caps = CapabilitySet::EMPTY;
+            new.permitted_caps = CapabilitySet::EMPTY;
+        }
     } else if new_uid == prev.uid || new_uid == prev.euid || new_uid == prev.suid {
         // Non-privileged: allowed to swap effective among existing IDs.
         // `suid` is preserved per Linux semantics.

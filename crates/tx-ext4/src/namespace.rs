@@ -263,6 +263,11 @@ where
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e),
         };
+        match self.with_pager(|pager| pager.lookup(parent_ino, name)) {
+            Ok(Some(_)) => return StepOutcome::err(Errno::EEXIST),
+            Ok(None) => {}
+            Err(e) => return StepOutcome::err(e),
+        }
         match self.with_pager(|pager| {
             pager.create_directory(parent_ino, name, mode, cred.uid, cred.gid, 0)
         }) {
@@ -330,20 +335,18 @@ where
             Ok(index) => index,
             Err(err) => return StepOutcome::err(err),
         };
-        if index >= READDIR_WINDOW_ENTRIES {
-            return StepOutcome::err(Errno::ENOSYS);
-        }
-
+        let window_start = index - (index % READDIR_WINDOW_ENTRIES);
+        let window_index = index - window_start;
         let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
-        let count = match self.read_dir_entries_cached(inode, &mut entries) {
+        let count = match self.read_dir_entries_cached(inode, window_start, &mut entries) {
             Ok(count) => count,
             Err(err) => return StepOutcome::err(err),
         };
-        if index >= count {
+        if window_index >= count {
             return StepOutcome::done(None);
         }
 
-        let entry = entries[index];
+        let entry = entries[window_index];
         let name = match InlineName::new(entry.name()) {
             Ok(name) => name,
             Err(err) => return StepOutcome::err(err),

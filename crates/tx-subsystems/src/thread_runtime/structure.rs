@@ -7,7 +7,7 @@
 //! fast-check atomic land alongside the delivery pass.
 
 use alloc::sync::Weak as ArcWeak;
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use tx_hal::UserTrapContext;
 
@@ -63,6 +63,9 @@ impl ThreadIdentity {
         };
         if payload.is_stopped() {
             return b'T';
+        }
+        if payload.proc_sleeping() {
+            return b'S';
         }
         if crate::futex::thread_has_waiter(self.tid.0) {
             return b'S';
@@ -232,6 +235,11 @@ pub struct ThreadPayload {
     /// "no alternate stack" (deliver on the normal stack).
     /// `Some((base, size))` gives the alternate stack range.
     pub(crate) alt_stack: SpinMutex<Option<(usize, usize)>>,
+    /// Best-effort procfs state hint. Set while the thread future is
+    /// awaiting syscall dispatch; long-running/blocking syscall futures
+    /// should appear as `S` to Linux tests that wait through
+    /// `/proc/<pid>/stat`.
+    pub(crate) proc_sleeping: AtomicBool,
     /// `clear_child_tid` pointer from `set_tid_address`.  Written
     /// atomically to 0 on thread exit when futex wake is supported.
     pub clear_child_tid: SpinMutex<Option<u64>>,
@@ -262,6 +270,7 @@ impl ThreadPayload {
             mailbox: SpinMutex::new(None),
             stopped: core::sync::atomic::AtomicBool::new(false),
             alt_stack: SpinMutex::new(None),
+            proc_sleeping: AtomicBool::new(false),
             clear_child_tid: SpinMutex::new(None),
             robust_list_head: SpinMutex::new(None),
             robust_list_len: SpinMutex::new(0),
@@ -294,6 +303,16 @@ impl ThreadPayload {
     /// `None` until the reactor coupling lands.
     pub fn task(&self) -> Option<TaskKey> {
         *self.task.lock()
+    }
+
+    /// Snapshot whether this thread should be shown as sleeping in procfs.
+    pub fn proc_sleeping(&self) -> bool {
+        self.proc_sleeping.load(Ordering::Acquire)
+    }
+
+    /// Update the procfs sleep-state hint for syscall dispatch.
+    pub fn set_proc_sleeping(&self, sleeping: bool) {
+        self.proc_sleeping.store(sleeping, Ordering::Release);
     }
 
     /// Borrow the userspace-run slot owned by this thread. The trap

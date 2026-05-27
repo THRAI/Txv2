@@ -114,6 +114,21 @@ fn fdset_clear(set: Option<&mut [u64]>, fd: u64) {
     }
 }
 
+fn timerfd_readable_level<P: tx_hal::TimeIf>(tfd: &tx_subsystems::timerfd::TimerFd) -> bool {
+    let deadline = tfd.deadline_ns();
+    tfd.expiration_count() > 0 || (deadline != 0 && P::read_ns() >= deadline)
+}
+
+fn include_timerfd_deadline(deadline_slot: &mut Option<u64>, deadline_ns: u64) {
+    if deadline_ns == 0 {
+        return;
+    }
+    *deadline_slot = Some(match *deadline_slot {
+        Some(current) => core::cmp::min(current, deadline_ns),
+        None => deadline_ns,
+    });
+}
+
 fn pselect_fd_ready(
     file: &OpenFile,
     want_read: bool,
@@ -548,6 +563,7 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
         let mut except_ready = alloc::vec![0u64; word_count as usize];
         let mut ready_count: i64 = 0;
         let mut wait_tokens = alloc::vec::Vec::new();
+        let mut effective_deadline_ns = timeout_deadline_ns;
 
         for fd in 0..nfds {
             let want_read = match fdset_contains(ctx, readfds, fd) {
@@ -571,7 +587,52 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
 
             let mut fd_ready = false;
             let guard = tx_substrate::epoch::guard();
-            if let Some(result) = socket_poll_mask_from_file(&file, &guard) {
+            if let Some(efd) = file.eventfd() {
+                if want_read {
+                    if efd.counter() > 0 {
+                        fdset_set(&mut read_ready, fd);
+                        fd_ready = true;
+                    } else {
+                        push_unique_wait_token(
+                            &mut wait_tokens,
+                            tx_subsystems::execution::WaitToken::new(
+                                efd.reader_source_id(),
+                                tx_subsystems::eventfd::EVENTFD_READABLE,
+                            ),
+                        );
+                    }
+                }
+                if want_write {
+                    if efd.counter() < tx_subsystems::eventfd::EVENTFD_MAX {
+                        fdset_set(&mut write_ready, fd);
+                        fd_ready = true;
+                    } else {
+                        push_unique_wait_token(
+                            &mut wait_tokens,
+                            tx_subsystems::execution::WaitToken::new(
+                                efd.writer_source_id(),
+                                tx_subsystems::eventfd::EVENTFD_WRITABLE,
+                            ),
+                        );
+                    }
+                }
+            } else if let Some(tfd) = file.timerfd() {
+                if want_read {
+                    if timerfd_readable_level::<P>(tfd) {
+                        fdset_set(&mut read_ready, fd);
+                        fd_ready = true;
+                    } else {
+                        include_timerfd_deadline(&mut effective_deadline_ns, tfd.deadline_ns());
+                        push_unique_wait_token(
+                            &mut wait_tokens,
+                            tx_subsystems::execution::WaitToken::new(
+                                tfd.source_id(),
+                                tx_subsystems::timerfd::TIMERFD_READABLE,
+                            ),
+                        );
+                    }
+                }
+            } else if let Some(result) = socket_poll_mask_from_file(&file, &guard) {
                 let mask = match result {
                     Ok(mask) => mask,
                     Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
@@ -711,7 +772,7 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
             continue;
         }
         if wait_tokens.is_empty() {
-            if let Some(deadline_ns) = timeout_deadline_ns {
+            if let Some(deadline_ns) = effective_deadline_ns {
                 wait_until_pselect_deadline::<P>(deadline_ns).await;
             } else if timeout == PselectTimeout::Infinite {
                 tx_reactor::yield_now().await;
@@ -724,7 +785,7 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
             .filter_map(wait_source::wait_on_token)
             .collect::<alloc::vec::Vec<_>>();
         if !futures.is_empty() {
-            if let Some(deadline_ns) = timeout_deadline_ns {
+            if let Some(deadline_ns) = effective_deadline_ns {
                 match wait_on_any_token_or_pselect_deadline::<P>(futures, deadline_ns).await {
                     PselectWaitWake::FdReady => {}
                     PselectWaitWake::TimedOut => {
@@ -735,7 +796,7 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
                 wait_on_any_token(futures).await;
             }
         } else {
-            if let Some(deadline_ns) = timeout_deadline_ns {
+            if let Some(deadline_ns) = effective_deadline_ns {
                 wait_until_pselect_deadline::<P>(deadline_ns).await;
             }
             break (read_ready, write_ready, except_ready, ready_count);
@@ -974,7 +1035,42 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
     if nfds == 0 {
         let result = match timeout_ns {
             Some(ns) => sleep_timeout_ns::<P>(ns, ctx).await,
-            None => SyscallResult::Return(0),
+            None => loop {
+                if tx_subsystems::signal::select_next_signal(&ctx.thread).is_some() {
+                    break SyscallResult::Error(EINTR_VALUE);
+                }
+
+                use tx_scripts::drive;
+                use tx_substrate::step::DriveMode;
+                let now_ns = P::read_ns();
+                let mut script_ctx = build_subject_script_ctx(ctx);
+                let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+                let mailbox = ctx.mailbox.clone();
+                let op = super::NanosleepOp {
+                    nanos: 5_000_000,
+                    deadline_ns: now_ns.saturating_add(5_000_000),
+                    started: false,
+                };
+                match drive(
+                    op,
+                    &mut script_ctx,
+                    DriveMode::Waiting,
+                    mailbox.as_ref(),
+                    None,
+                    timer_wheel_arc.as_ref(),
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(v3errno) => {
+                        let errno: tx_subsystems::execution::Errno = v3errno.into();
+                        if errno == tx_subsystems::execution::Errno::EINTR {
+                            break SyscallResult::Error(EINTR_VALUE);
+                        }
+                        break SyscallResult::error_from(errno);
+                    }
+                }
+            },
         };
         return restore_ppoll_sigmask(ctx, saved_mask, temporary_sigmask, result);
     }
@@ -1008,6 +1104,7 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
 
         let mut ready: i64 = 0;
         let mut wait_tokens = alloc::vec::Vec::new();
+        let mut effective_deadline_ns = timeout_deadline_ns;
         for i in 0..nfds {
             let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
             let mut ent_bytes = [0u8; POLLFD_BYTES as usize];
@@ -1025,8 +1122,25 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
             if fd >= 0 {
                 if let Some(file) = resolve_fd(&ctx.process, fd as u32) {
                     let guard = tx_substrate::epoch::guard();
-                    let socket_poll = socket_poll_mask_from_file(&file, &guard);
-                    if let Some(result) = socket_poll {
+                    if let Some(tfd) = file.timerfd() {
+                        if events & POLLIN != 0 {
+                            if timerfd_readable_level::<P>(tfd) {
+                                revents |= POLLIN;
+                            } else {
+                                include_timerfd_deadline(
+                                    &mut effective_deadline_ns,
+                                    tfd.deadline_ns(),
+                                );
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    tx_subsystems::execution::WaitToken::new(
+                                        tfd.source_id(),
+                                        tx_subsystems::timerfd::TIMERFD_READABLE,
+                                    ),
+                                );
+                            }
+                        }
+                    } else if let Some(result) = socket_poll_mask_from_file(&file, &guard) {
                         match result {
                             Ok(mask) => {
                                 let want_read = events & POLLIN != 0;
@@ -1199,7 +1313,7 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
             continue;
         }
         if wait_tokens.is_empty() {
-            if let Some(deadline_ns) = timeout_deadline_ns {
+            if let Some(deadline_ns) = effective_deadline_ns {
                 wait_until_pselect_deadline::<P>(deadline_ns).await;
             } else if timeout == PselectTimeout::Infinite {
                 tx_reactor::yield_now().await;
@@ -1221,7 +1335,7 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
             }
             break 0;
         }
-        if let Some(deadline_ns) = timeout_deadline_ns {
+        if let Some(deadline_ns) = effective_deadline_ns {
             match wait_on_any_token_or_pselect_deadline::<P>(futures, deadline_ns).await {
                 PselectWaitWake::FdReady => {}
                 PselectWaitWake::TimedOut => break 0,
@@ -1974,6 +2088,14 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         }
         Err(v3errno) => {
             let errno: tx_subsystems::execution::Errno = v3errno;
+            if file.flags().nonblocking && errno == tx_subsystems::execution::Errno::EAGAIN {
+                let deadline_ns = P::read_ns().saturating_add(1_000_000);
+                if let Some(future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) {
+                    future.await;
+                } else {
+                    tx_reactor::yield_now().await;
+                }
+            }
             SyscallResult::error_from(errno)
         }
     }
@@ -2693,7 +2815,8 @@ fn inline_io_len_for_file(file: &Cap<OpenFile>, len: usize) -> usize {
         | tx_subsystems::vfs::structure::OpenFileBacking::IoUring { .. }
         | tx_subsystems::vfs::structure::OpenFileBacking::Eventfd { .. }
         | tx_subsystems::vfs::structure::OpenFileBacking::Timerfd { .. }
-        | tx_subsystems::vfs::structure::OpenFileBacking::PosixMq { .. } => len,
+        | tx_subsystems::vfs::structure::OpenFileBacking::PosixMq { .. }
+        | tx_subsystems::vfs::structure::OpenFileBacking::Pidfd { .. } => len,
     }
 }
 
