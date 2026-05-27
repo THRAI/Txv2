@@ -1838,13 +1838,6 @@ const DEFAULT_OSCOMP_MUSL_SCRIPTS: &[(&str, &str)] = &[
     ("basic-musl", "basic_testcode.sh"),
     ("busybox-musl", "busybox_testcode.sh"),
     ("libctest-musl", "libctest_testcode.sh"),
-    ("libcbench-musl", "libcbench_testcode.sh"),
-    ("lua-musl", "lua_testcode.sh"),
-    ("lmbench-musl", "lmbench_testcode.sh"),
-    ("iozone-musl", "iozone_testcode.sh"),
-    ("netperf-musl", "netperf_testcode.sh"),
-    ("iperf-musl", "iperf_testcode.sh"),
-    ("cyclictest-musl", "cyclictest_testcode.sh"),
     ("ltp-musl", "ltp_testcode.sh"),
 ];
 
@@ -2022,10 +2015,18 @@ mod tests {
         append_default_oscomp_scripts(&mut cmd);
 
         assert!(cmd.contains("basic_testcode.sh"));
-        assert!(cmd.contains("libcbench_testcode.sh"));
+        assert!(cmd.contains("busybox_testcode.sh"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP START libctest-musl ####"));
         assert!(cmd.contains("RUN LTP CASE $case : $ltp_label"));
         assert!(cmd.contains("futex_wake03"));
         assert!(cmd.contains("setitimer01"));
+        assert!(!cmd.contains("libcbench_testcode.sh"));
+        assert!(!cmd.contains("lua_testcode.sh"));
+        assert!(!cmd.contains("lmbench_testcode.sh"));
+        assert!(!cmd.contains("iozone_testcode.sh"));
+        assert!(!cmd.contains("netperf_testcode.sh"));
+        assert!(!cmd.contains("iperf_testcode.sh"));
+        assert!(!cmd.contains("cyclictest_testcode.sh"));
         assert!(!cmd.contains("; target_dir=\"ltp/testcases/bin\""));
         assert!(!cmd.contains("; /bin/setsid \"$file\""));
     }

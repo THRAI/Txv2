@@ -12,13 +12,13 @@ DOCKER_RUN_BUILD = $(DOCKER_COMPOSE) run --rm $(DOCKER_BUILD_ENV) $(DOCKER_SERVI
 
 OSCOMP_DATA ?= target/oscomp/testdata
 OSCOMP_SUBMIT ?= target/oscomp/submit
-OSCOMP_DOCKER_IMAGE ?= zhouzhouyi/os-contest:20260104
+OSCOMP_DOCKER_IMAGE ?= zhouzhouyi/os-contest:20260510
 OSCOMP_TARGET ?= rv64-qemu
 OSCOMP_EXTRA ?=
 HOST_CARGO_TARGET_DIR ?= target/host-cargo
 
 .PHONY: docker-help docker-build docker-shell docker-ci docker-check docker-ci-slow \
-	all \
+	all setup-cargo-config \
 	docker-build-rv64 docker-build-la64 docker-image-cpio-rv64 docker-image-cpio-la64 \
 	docker-image-ext4-rv64 docker-image-ext4-la64 \
 	docker-qemu-rv64-smoke docker-qemu-rv64-busybox docker-qemu-la64-busybox \
@@ -60,7 +60,11 @@ docker-help:
 # Official OSComp entry point. The website's autotest runs `make all` in
 # /coursegrader/submit and then boots ./kernel-rv and ./kernel-la with the
 # official sdcard images.
-all:
+setup-cargo-config:
+	mkdir -p .cargo
+	cp cargo/config.toml .cargo/config.toml
+
+all: setup-cargo-config
 	cargo xtask build --target rv64-qemu
 	cargo xtask build --target la64-qemu
 	cargo xtask oscomp submit --submit .
