@@ -9,11 +9,13 @@ use smoltcp::socket::tcp;
 use smoltcp::time::Duration;
 use smoltcp::wire::{
     HardwareAddress, IpAddress, IpEndpoint as SmoltcpIpEndpoint, IpProtocol, IpRepr, Ipv4Packet,
-    Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, TcpTimestampRepr,
+    Ipv4Repr, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, TcpTimestampRepr,
 };
 
 use crate::net::packet::LoopbackIpPacket;
-use crate::net::structure::{IpEndpoint, Ipv4Address, SocketOptionSet};
+use crate::net::structure::{
+    AddressFamily, IpEndpoint, Ipv4Address, Ipv6Address as TxIpv6Address, SocketOptionSet,
+};
 use crate::sync::SpinMutex;
 
 pub const TCP_CORK_AUTO_FLUSH_BYTES: usize = 1460;
@@ -86,18 +88,7 @@ impl RawTcpSocket {
     pub fn new(options: &SocketOptionSet) -> Self {
         let recv_capacity = options.socket.recv_buf_size;
         let send_capacity = options.socket.send_buf_size;
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; recv_capacity]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; send_capacity]);
-        let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-
-        socket.set_nagle_enabled(!options.tcp.nodelay);
-        socket.set_ack_delay(None);
-        if options.socket.keep_alive {
-            socket.set_keep_alive(Some(Duration::from_secs(options.tcp.keepidle as u64)));
-        }
-        if options.ip.ttl != 0 {
-            socket.set_hop_limit(Some(options.ip.ttl));
-        }
+        let socket = new_smoltcp_tcp_socket(recv_capacity, send_capacity, options);
 
         Self {
             socket: SpinMutex::new(Box::new(socket)),
@@ -370,6 +361,19 @@ impl RawTcpSocket {
         self.socket.lock().abort();
     }
 
+    pub fn reset(&self, options: &SocketOptionSet) {
+        *self.socket.lock() = Box::new(new_smoltcp_tcp_socket(
+            self.recv_capacity,
+            self.send_capacity,
+            options,
+        ));
+        *self.protocol_state.lock() = RawTcpProtocolState::default();
+        *self.last_syn_ack.lock() = None;
+        self.rx_buffer.lock().clear();
+        self.tx_buffer.lock().clear();
+        self.corked_tx.lock().clear();
+    }
+
     pub fn mark_recv_closed_by_peer(&self) {
         self.protocol_state.lock().is_recv_shut = true;
     }
@@ -519,6 +523,26 @@ impl RawTcpSocket {
     }
 }
 
+fn new_smoltcp_tcp_socket(
+    recv_capacity: usize,
+    send_capacity: usize,
+    options: &SocketOptionSet,
+) -> tcp::Socket<'static> {
+    let rx_buf = tcp::SocketBuffer::new(vec![0u8; recv_capacity]);
+    let tx_buf = tcp::SocketBuffer::new(vec![0u8; send_capacity]);
+    let mut socket = tcp::Socket::new(rx_buf, tx_buf);
+
+    socket.set_nagle_enabled(!options.tcp.nodelay);
+    socket.set_ack_delay(None);
+    if options.socket.keep_alive {
+        socket.set_keep_alive(Some(Duration::from_secs(options.tcp.keepidle as u64)));
+    }
+    if options.ip.ttl != 0 {
+        socket.set_hop_limit(Some(options.ip.ttl));
+    }
+    socket
+}
+
 impl SmoltcpTcpSegment {
     fn from_reprs(ip_repr: IpRepr, tcp_repr: TcpRepr<'_>) -> Self {
         Self {
@@ -571,17 +595,20 @@ impl SmoltcpTcpSegment {
 
     pub fn parse_ipv4_packet(packet: &LoopbackIpPacket) -> Option<Self> {
         let checksum_caps = ChecksumCapabilities::default();
-        let ipv4 = Ipv4Packet::new_checked(packet.as_bytes()).ok()?;
-        let ipv4_repr = Ipv4Repr::parse(&ipv4, &checksum_caps).ok()?;
-        if ipv4_repr.next_header != IpProtocol::Tcp {
-            return None;
+        if let Some(segment) = parse_ipv4_tcp_packet(packet, &checksum_caps) {
+            return Some(segment);
         }
 
-        let tcp_packet = TcpPacket::new_checked(ipv4.payload()).ok()?;
-        let src = IpAddress::Ipv4(ipv4_repr.src_addr);
-        let dst = IpAddress::Ipv4(ipv4_repr.dst_addr);
+        let ipv6 = Ipv6Packet::new_checked(packet.as_bytes()).ok()?;
+        let ipv6_repr = Ipv6Repr::parse(&ipv6).ok()?;
+        if ipv6_repr.next_header != IpProtocol::Tcp {
+            return None;
+        }
+        let tcp_packet = TcpPacket::new_checked(ipv6.payload()).ok()?;
+        let src = IpAddress::Ipv6(ipv6_repr.src_addr);
+        let dst = IpAddress::Ipv6(ipv6_repr.dst_addr);
         let tcp_repr = TcpRepr::parse(&tcp_packet, &src, &dst, &checksum_caps).ok()?;
-        Some(Self::from_reprs(IpRepr::Ipv4(ipv4_repr), tcp_repr))
+        Some(Self::from_reprs(IpRepr::Ipv6(ipv6_repr), tcp_repr))
     }
 
     pub fn src_endpoint(&self) -> Option<IpEndpoint> {
@@ -589,6 +616,10 @@ impl SmoltcpTcpSegment {
             IpAddress::Ipv4(addr) => {
                 Some(IpEndpoint::new(from_smoltcp_ipv4(addr), self.tcp.src_port))
             }
+            IpAddress::Ipv6(addr) => Some(IpEndpoint::new_v6(
+                from_smoltcp_ipv6(addr),
+                self.tcp.src_port,
+            )),
         }
     }
 
@@ -597,8 +628,32 @@ impl SmoltcpTcpSegment {
             IpAddress::Ipv4(addr) => {
                 Some(IpEndpoint::new(from_smoltcp_ipv4(addr), self.tcp.dst_port))
             }
+            IpAddress::Ipv6(addr) => Some(IpEndpoint::new_v6(
+                from_smoltcp_ipv6(addr),
+                self.tcp.dst_port,
+            )),
         }
     }
+}
+
+fn parse_ipv4_tcp_packet(
+    packet: &LoopbackIpPacket,
+    checksum_caps: &ChecksumCapabilities,
+) -> Option<SmoltcpTcpSegment> {
+    let ipv4 = Ipv4Packet::new_checked(packet.as_bytes()).ok()?;
+    let ipv4_repr = Ipv4Repr::parse(&ipv4, checksum_caps).ok()?;
+    if ipv4_repr.next_header != IpProtocol::Tcp {
+        return None;
+    }
+
+    let tcp_packet = TcpPacket::new_checked(ipv4.payload()).ok()?;
+    let src = IpAddress::Ipv4(ipv4_repr.src_addr);
+    let dst = IpAddress::Ipv4(ipv4_repr.dst_addr);
+    let tcp_repr = TcpRepr::parse(&tcp_packet, &src, &dst, checksum_caps).ok()?;
+    Some(SmoltcpTcpSegment::from_reprs(
+        IpRepr::Ipv4(ipv4_repr),
+        tcp_repr,
+    ))
 }
 
 impl SmoltcpTcpRepr {
@@ -654,10 +709,11 @@ fn with_context<R>(f: impl FnOnce(&mut smoltcp::iface::Context) -> R) -> R {
 }
 
 fn to_smoltcp_endpoint(endpoint: IpEndpoint) -> SmoltcpIpEndpoint {
-    SmoltcpIpEndpoint::new(
-        IpAddress::Ipv4(to_smoltcp_ipv4(endpoint.addr)),
-        endpoint.port,
-    )
+    let addr = match endpoint.family {
+        AddressFamily::Inet6 => IpAddress::Ipv6(to_smoltcp_ipv6(endpoint.addr6)),
+        _ => IpAddress::Ipv4(to_smoltcp_ipv4(endpoint.addr)),
+    };
+    SmoltcpIpEndpoint::new(addr, endpoint.port)
 }
 
 fn to_smoltcp_ipv4(addr: Ipv4Address) -> smoltcp::wire::Ipv4Address {
@@ -667,4 +723,12 @@ fn to_smoltcp_ipv4(addr: Ipv4Address) -> smoltcp::wire::Ipv4Address {
 
 fn from_smoltcp_ipv4(addr: smoltcp::wire::Ipv4Address) -> Ipv4Address {
     Ipv4Address::new(addr.octets())
+}
+
+fn to_smoltcp_ipv6(addr: TxIpv6Address) -> smoltcp::wire::Ipv6Address {
+    smoltcp::wire::Ipv6Address::from(addr.octets())
+}
+
+fn from_smoltcp_ipv6(addr: smoltcp::wire::Ipv6Address) -> TxIpv6Address {
+    TxIpv6Address::new(addr.octets())
 }

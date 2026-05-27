@@ -7,14 +7,27 @@ use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMutex, StepOutcome};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload};
-use tx_subsystems::vfs::FsObjectId;
+use tx_subsystems::vfs::{FsObjectId, FsOps};
 
 static STAT_META_OVERRIDES: SpinMutex<BTreeMap<FsObjectId, InodeMeta>> =
     SpinMutex::new(BTreeMap::new());
 
 static FCNTL_RECORD_LOCKS: SpinMutex<BTreeMap<FsObjectId, Vec<RecordLock>>> =
     SpinMutex::new(BTreeMap::new());
+
+static PROCFS_PROJECTED_MOUNT: SpinMutex<Option<Cap<tx_subsystems::mount::MountPayload>>> =
+    SpinMutex::new(None);
+
+const MEMFD_NAME_MAX: usize = 249;
+const MEMFD_CAPACITY_BYTES: u64 = 16 * 1024 * 1024;
+const MEMFD_FS_OBJECT_ID_BASE: u64 = 0xFFFC_0000_0000_0000;
+const MEMFD_SECRET_FS_OBJECT_ID_BASE: u64 = 0xFFFA_0000_0000_0000;
+const FSNOTIFY_FS_OBJECT_ID_BASE: u64 = 0xFFFB_0000_0000_0000;
+static NEXT_MEMFD_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(MEMFD_FS_OBJECT_ID_BASE);
+static NEXT_MEMFD_SECRET_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(MEMFD_SECRET_FS_OBJECT_ID_BASE);
+static NEXT_FSNOTIFY_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(FSNOTIFY_FS_OBJECT_ID_BASE);
 
 pub(super) fn record_stat_meta_override(fs_object_id: FsObjectId, meta: InodeMeta) {
     STAT_META_OVERRIDES.lock().insert(fs_object_id, meta);
@@ -61,6 +74,61 @@ fn ensure_fd_room_under_limit<'a>(ctx: &SyscallCtx<'a>) -> Result<(), SyscallRes
     }
 }
 
+fn proc_self_userns_file_id(path: &[u8], pid: Pid) -> Option<FsObjectId> {
+    match path {
+        b"/proc/self/uid_map" => Some(tx_fs::procfs::pid_uid_map_id(pid)),
+        b"/proc/self/gid_map" => Some(tx_fs::procfs::pid_gid_map_id(pid)),
+        b"/proc/self/setgroups" => Some(tx_fs::procfs::pid_setgroups_id(pid)),
+        _ => None,
+    }
+}
+
+fn open_procfs_projected_file(
+    fs_object_id: FsObjectId,
+    flags: OpenFileFlags,
+) -> Result<Cap<OpenFile>, SyscallResult> {
+    let procfs = tx_fs::procfs::Procfs::new();
+    let mount = procfs_projected_mount()?;
+
+    let guard = step_engine::guard();
+    let meta = match procfs.load_inode_meta(fs_object_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        StepOutcome::Err(errno) => return Err(SyscallResult::error_from(errno)),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+            return Err(SyscallResult::Error(EIO_VALUE));
+        }
+    };
+    let rnode = match procfs.materialise_rnode(fs_object_id, meta, &mount, &guard) {
+        StepOutcome::Done(rnode) => rnode,
+        StepOutcome::Err(errno) => return Err(SyscallResult::error_from(errno)),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+            return Err(SyscallResult::Error(EIO_VALUE));
+        }
+    };
+    OpenFile::new_cap(rnode, flags).map_err(|_| SyscallResult::Error(ENOMEM_VALUE))
+}
+
+fn procfs_projected_mount() -> Result<Cap<tx_subsystems::mount::MountPayload>, SyscallResult> {
+    let mut cached = PROCFS_PROJECTED_MOUNT.lock();
+    if let Some(mount) = cached.as_ref() {
+        return Ok(mount.clone());
+    }
+
+    let mount = tx_subsystems::mount::MountPayload::new_cap(
+        tx_fs::procfs::Procfs::fs_ops_arc(),
+        alloc::sync::Arc::new(tx_fs::procfs::Procfs::new())
+            as alloc::sync::Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
+        None,
+        tx_subsystems::mount::allocate_dev_id(),
+        tx_subsystems::mount::MountOptions::default(),
+        "proc",
+        tx_subsystems::mount::SourceLabel::Static("proc"),
+    )
+    .map_err(|_| SyscallResult::Error(ENOMEM_VALUE))?;
+    *cached = Some(mount.clone());
+    Ok(mount)
+}
+
 fn allocate_fd_at_least_under_limit<'a>(
     ctx: &SyscallCtx<'a>,
     min: u32,
@@ -72,6 +140,233 @@ fn allocate_fd_at_least_under_limit<'a>(
     } else {
         Ok(fd)
     }
+}
+
+fn allocate_memfd_fs_object_id() -> FsObjectId {
+    FsObjectId::new(NEXT_MEMFD_FS_OBJECT_ID.fetch_add(1, Ordering::AcqRel))
+}
+
+fn allocate_memfd_secret_fs_object_id() -> FsObjectId {
+    FsObjectId::new(NEXT_MEMFD_SECRET_FS_OBJECT_ID.fetch_add(1, Ordering::AcqRel))
+}
+
+fn allocate_fsnotify_fs_object_id() -> FsObjectId {
+    FsObjectId::new(NEXT_FSNOTIFY_FS_OBJECT_ID.fetch_add(1, Ordering::AcqRel))
+}
+
+fn install_fsnotify_fd<'a>(
+    ctx: &SyscallCtx<'a>,
+    kind: FsNotifyKind,
+    cloexec: bool,
+    nonblocking: bool,
+) -> SyscallResult {
+    let instance = match FsNotifyInstance::new_cap(kind) {
+        Ok(instance) => instance,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let rnode = match tx_subsystems::vfs::RNode::new_cap(
+        allocate_fsnotify_fs_object_id(),
+        InodeMeta::new(InodeKind::Regular, 0o100600),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::FsNotify { instance },
+        },
+    ) {
+        Ok(rnode) => rnode,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let open_file = match OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: false,
+            cloexec,
+            nonblocking,
+            ..OpenFileFlags::default()
+        },
+    ) {
+        Ok(file) => file,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+
+    let fd = match allocate_fd_under_limit(ctx) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let _ = ctx.process.install_fd(fd, open_file);
+    if cloexec {
+        ctx.process.set_fd_cloexec(fd, true);
+    }
+
+    SyscallResult::Return(fd as i64)
+}
+
+/// `inotify_init1(flags)`. Linux generic ABI `__NR_inotify_init1 = 26`.
+///
+/// This is the fd-provider phase only: it creates a typed fsnotify instance
+/// fd with coherent CLOEXEC/NONBLOCK flags and a VFS wait source. Watch
+/// registration and event production remain future fsnotify work.
+pub(super) fn sys_inotify_init1<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let flags = args[0];
+    let recognised = (IN_CLOEXEC | IN_NONBLOCK) as u64;
+    if flags & !recognised != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    install_fsnotify_fd(
+        ctx,
+        FsNotifyKind::Inotify,
+        flags & IN_CLOEXEC as u64 != 0,
+        flags & IN_NONBLOCK as u64 != 0,
+    )
+}
+
+/// `fanotify_init(flags, event_f_flags)`. Linux generic ABI
+/// `__NR_fanotify_init = 262`.
+///
+/// Only the notification class is supported here. Content/pre-content and
+/// permission-event fanotify require the future `OnAgent`/fsnotify mark path.
+pub(super) fn sys_fanotify_init<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let flags = args[0];
+    let event_f_flags = args[1];
+    let recognised = (FAN_CLOEXEC | FAN_NONBLOCK | FAN_CLASS_NOTIF) as u64;
+    if flags & !recognised != 0
+        || flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT) as u64 != 0
+        || event_f_flags != O_RDONLY as u64
+    {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    install_fsnotify_fd(
+        ctx,
+        FsNotifyKind::Fanotify,
+        flags & FAN_CLOEXEC as u64 != 0,
+        flags & FAN_NONBLOCK as u64 != 0,
+    )
+}
+
+/// `memfd_create(name, flags)`. Linux generic ABI `__NR_memfd_create = 279`.
+///
+/// `PAGE_BACKED_v1` models memfd as an anonymous `PageContainerKind::Anon`
+/// wrapped in a synthetic regular-file RNode with no path-namespace presence.
+/// This first slice supports ordinary memfds plus `MFD_CLOEXEC`; it rejects
+/// `MFD_ALLOW_SEALING` until `F_ADD_SEALS`/`F_GET_SEALS` exist, and rejects
+/// hugetlb memfds because there is no huge-page PageContainer variant.
+pub(super) fn sys_memfd_create<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let name_uaddr = args[0];
+    let flags = args[1] as u32;
+
+    if name_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    let recognised = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB;
+    if flags & !recognised != 0 || flags & (MFD_ALLOW_SEALING | MFD_HUGETLB) != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    match bootstrap_read_user_cstr(&ctx.aspace, name_uaddr, MEMFD_NAME_MAX + 1) {
+        Ok(name) if name.len() <= MEMFD_NAME_MAX => {}
+        Ok(_) | Err(Errno::ENAMETOOLONG) => return SyscallResult::Error(EINVAL_VALUE),
+        Err(errno) => return SyscallResult::error_from(errno),
+    }
+
+    let page_count = MEMFD_CAPACITY_BYTES / USER_PAGE_SIZE as u64;
+    let pc = match PageContainer::new_cap(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        page_count,
+    ) {
+        Ok(pc) => pc,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    pc.set_size_bytes(0);
+
+    let rnode = match tx_subsystems::vfs::RNode::new_cap(
+        allocate_memfd_fs_object_id(),
+        InodeMeta::new(InodeKind::Regular, 0o100666),
+        RNodeBacking::PageBacked { pc },
+    ) {
+        Ok(rnode) => rnode,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let open_file = match OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            cloexec: flags & MFD_CLOEXEC != 0,
+            ..OpenFileFlags::default()
+        },
+    ) {
+        Ok(file) => file,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+
+    let fd = match allocate_fd_under_limit(ctx) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let _ = ctx.process.install_fd(fd, open_file);
+    if flags & MFD_CLOEXEC != 0 {
+        ctx.process.set_fd_cloexec(fd, true);
+    }
+
+    SyscallResult::Return(fd as i64)
+}
+
+/// `memfd_secret(flags)`. Linux generic ABI `__NR_memfd_secret = 447`.
+///
+/// This is a scoped fd-provider phase: the returned descriptor is a real
+/// anonymous PageBacked regular file, so generic fd users such as `accept(2)`
+/// see a non-socket file and return `ENOTSOCK`. Secret-memory isolation
+/// (direct-map exclusion, mlock/accounting policy, and special mmap rules)
+/// remains a VM charter; unknown flags are rejected until that charter lands.
+pub(super) fn sys_memfd_secret<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let flags = args[0];
+    if flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let page_count = MEMFD_CAPACITY_BYTES / USER_PAGE_SIZE as u64;
+    let pc = match PageContainer::new_cap(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        page_count,
+    ) {
+        Ok(pc) => pc,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    pc.set_size_bytes(0);
+
+    let rnode = match tx_subsystems::vfs::RNode::new_cap(
+        allocate_memfd_secret_fs_object_id(),
+        InodeMeta::new(InodeKind::Regular, 0o100600),
+        RNodeBacking::PageBacked { pc },
+    ) {
+        Ok(rnode) => rnode,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let open_file = match OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            ..OpenFileFlags::default()
+        },
+    ) {
+        Ok(file) => file,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+
+    let fd = match allocate_fd_under_limit(ctx) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let _ = ctx.process.install_fd(fd, open_file);
+
+    SyscallResult::Return(fd as i64)
 }
 
 /// `fcntl(fd, cmd, arg)` per the Wave 2 ELF-loader plan §"Part 2 —
@@ -504,6 +799,28 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         cloexec: want_cloexec,
         nonblocking: flags & O_NONBLOCK != 0,
     };
+
+    if let Some(fs_object_id) = proc_self_userns_file_id(path.as_slice(), ctx.process.pid) {
+        if want_directory {
+            return SyscallResult::Error(ENOTDIR_VALUE);
+        }
+        if want_create && want_excl {
+            return SyscallResult::Error(EEXIST_VALUE);
+        }
+        let openfile = match open_procfs_projected_file(fs_object_id, open_flags) {
+            Ok(file) => file,
+            Err(result) => return result,
+        };
+        let fd = match allocate_fd_under_limit(ctx) {
+            Ok(fd) => fd,
+            Err(err) => return err,
+        };
+        let _ = ctx.process.set_fd(fd, Some(openfile));
+        if want_cloexec {
+            ctx.process.set_fd_cloexec(fd, true);
+        }
+        return SyscallResult::Return(fd as i64);
+    }
 
     if path.as_slice() == b"/proc/self/ns/net" && !want_create && !want_trunc {
         if want_directory {
@@ -1320,6 +1637,18 @@ fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>) -> Syscal
     let Some(netns) = ctx.process.net_namespace() else {
         return SyscallResult::Error(ESRCH_VALUE);
     };
+    let require_net_admin = || {
+        if let Some(owner) = netns.owner_user_namespace() {
+            let current = ctx.process.nsproxy_cap().ok_or(Errno::ESRCH)?;
+            tx_subsystems::net::require_net_admin_in_user_namespace(
+                ctx.cred(),
+                &current.user_ns,
+                &owner,
+            )
+        } else {
+            tx_subsystems::net::require_net_admin(ctx.cred())
+        }
+    };
     let link = netns
         .link_snapshot()
         .into_iter()
@@ -1348,7 +1677,7 @@ fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>) -> Syscal
             let Some(link) = link else {
                 return SyscallResult::Error(ENODEV_VALUE);
             };
-            let auth = match tx_subsystems::net::require_net_admin(ctx.cred()) {
+            let auth = match require_net_admin() {
                 Ok(auth) => auth,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
@@ -1357,6 +1686,36 @@ fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>) -> Syscal
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
             match netns.set_device_up_by_ifindex(auth, link.ifindex, requested & IFF_UP != 0) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        SIOCGIFMTU => {
+            let Some(link) = link else {
+                return SyscallResult::Error(ENODEV_VALUE);
+            };
+            let mtu = i32::from(link.mtu);
+            match bootstrap_write_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET, mtu) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        SIOCSIFMTU => {
+            let Some(link) = link else {
+                return SyscallResult::Error(ENODEV_VALUE);
+            };
+            let auth = match require_net_admin() {
+                Ok(auth) => auth,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let requested: i32 = match bootstrap_read_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET) {
+                Ok(mtu) => mtu,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let Ok(requested) = u16::try_from(requested) else {
+                return SyscallResult::Error(EINVAL_VALUE);
+            };
+            match netns.set_device_mtu_by_ifindex(auth, link.ifindex, requested) {
                 Ok(()) => SyscallResult::Return(0),
                 Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
@@ -1967,7 +2326,9 @@ fn stat_meta_for_non_vfs_open_file(file: &OpenFile) -> Option<InodeMeta> {
         | OpenFileBacking::AioContext { .. }
         | OpenFileBacking::IoUring { .. }
         | OpenFileBacking::PosixMq { .. }
-        | OpenFileBacking::Pidfd { .. } => Some(InodeMeta {
+        | OpenFileBacking::Pidfd { .. }
+        | OpenFileBacking::KernelObject { .. }
+        | OpenFileBacking::MountApi { .. } => Some(InodeMeta {
             mode: 0o600,
             uid: 0,
             gid: 0,

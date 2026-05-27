@@ -42,6 +42,11 @@ Current orientation skills:
 - `tx-ltp-syscall` plans and records Linux syscall work against OSComp/LTP
   coverage, including the gold-standard pass criteria and anti-hardcoding
   discipline for test-driven syscall fixes.
+- `tx-ltp-timeout-ladder` keeps LTP/OSComp QEMU debugging on short focused
+  timeout ladders, starting at 30s and escalating only after visible progress.
+- `tx-debug-logbook` records debug conclusions, root causes, fixes,
+  verification, next steps, and blockers so rebase or CI fallout is not
+  rediscovered from scratch.
 - `tx-shell-syscall-fixup` tight observe→fix→verify loop for missing or
   broken syscalls when an interactive busybox/musl shell hangs, crashes, or
   diverges; pairs the trap-trace + fault-decode + shell-test xtask tools with

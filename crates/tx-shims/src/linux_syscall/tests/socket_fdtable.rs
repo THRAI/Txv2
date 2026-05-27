@@ -5,15 +5,18 @@ use super::*;
 
 use super::super::{errno_to_i32, Errno};
 use crate::linux_syscall::{
-    AF_INET, AF_NETLINK, AF_PACKET, AF_UNIX, EACCES_VALUE, EAGAIN_VALUE, EBADF_VALUE, EFAULT_VALUE,
-    FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP,
-    IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO, IPT_SO_SET_REPLACE, IP_RECVERR, NETLINK_EXT_ACK,
-    NETLINK_NETFILTER, NETLINK_ROUTE, NR_ACCEPT, NR_BIND, NR_CLOSE, NR_CONNECT, NR_DUP, NR_FCNTL,
-    NR_GETSOCKNAME, NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PIPE2, NR_PPOLL, NR_PSELECT6, NR_READ,
-    NR_RECVFROM, NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG, NR_SENDMSG, NR_SENDTO, NR_SETSOCKOPT,
-    NR_SOCKET, NR_SOCKETPAIR, NR_WRITE, O_CLOEXEC, O_NONBLOCK, O_RDWR, SIOCGIFFLAGS, SIOCGIFINDEX,
-    SIOCGIFTXQLEN, SIOCSIFFLAGS, SOCKET_IO_MAX_INLINE, SOL_NETLINK, SOL_SOCKET, SO_DONTROUTE,
-    SO_ERROR, SO_PEERCRED, SO_RCVTIMEO, SO_REUSEADDR, SO_SNDBUF, SO_TYPE, TCP_MAXSEG,
+    AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, EACCES_VALUE, EAGAIN_VALUE, EBADF_VALUE,
+    EFAULT_VALUE, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_IPV6,
+    IPPROTO_TCP, IPPROTO_UDP, IPPROTO_UDPLITE, IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO,
+    IPT_SO_SET_REPLACE, IPV6_ADDRFORM, IP_HDRINCL, IP_RECVERR, NETLINK_EXT_ACK, NETLINK_NETFILTER,
+    NETLINK_ROUTE, NR_ACCEPT, NR_BIND, NR_CLOSE, NR_CONNECT, NR_DUP, NR_FCNTL, NR_GETSOCKNAME,
+    NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PIPE2, NR_PPOLL, NR_PSELECT6, NR_PSELECT6_TIME64,
+    NR_READ, NR_RECVFROM, NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG, NR_SENDMSG, NR_SENDTO,
+    NR_SETSOCKOPT, NR_SOCKET, NR_SOCKETPAIR, NR_WRITE, O_CLOEXEC, O_NONBLOCK, O_RDWR,
+    PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR, SIOCGIFFLAGS, SIOCGIFINDEX,
+    SIOCGIFMTU, SIOCGIFTXQLEN, SIOCSIFFLAGS, SIOCSIFMTU, SOCKET_IO_MAX_INLINE, SOL_IPV6,
+    SOL_NETLINK, SOL_PACKET, SOL_SOCKET, SOL_TLS, SO_DONTROUTE, SO_ERROR, SO_PEERCRED, SO_RCVTIMEO,
+    SO_REUSEADDR, SO_SNDBUF, SO_SNDBUFFORCE, SO_TYPE, TCP_MAXSEG, TCP_ULP, TLS_TX, TPACKET_V3,
     TTY_WRITE_MAX_INLINE,
 };
 use alloc::boxed::Box;
@@ -32,7 +35,9 @@ use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
 const SOCK_RAW: u64 = 3;
+const SOCK_SEQPACKET: u64 = 5;
 const SOCKADDR_IN_BYTES: u32 = 16;
+const SOCKADDR_IN6_BYTES: u32 = 28;
 const SOCKADDR_UN_BYTES: u32 = 110;
 const SOCKADDR_NL_BYTES: u32 = 12;
 const SOCKADDR_LL_BYTES: u32 = 20;
@@ -95,6 +100,18 @@ struct TestTimespec {
     tv_nsec: i64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TestTPacketReq3 {
+    block_size: u32,
+    block_nr: u32,
+    frame_size: u32,
+    frame_nr: u32,
+    retire_blk_tov: u32,
+    sizeof_priv: u32,
+    feature_req_word: u32,
+}
+
 fn socket_setup() -> TestSetup {
     setup()
 }
@@ -125,6 +142,14 @@ fn sockaddr_in(addr: [u8; 4], port: u16) -> [u8; SOCKADDR_IN_BYTES as usize] {
     bytes[0..2].copy_from_slice(&AF_INET.to_le_bytes());
     bytes[2..4].copy_from_slice(&port.to_be_bytes());
     bytes[4..8].copy_from_slice(&addr);
+    bytes
+}
+
+fn sockaddr_in6(addr: [u8; 16], port: u16) -> [u8; SOCKADDR_IN6_BYTES as usize] {
+    let mut bytes = [0u8; SOCKADDR_IN6_BYTES as usize];
+    bytes[0..2].copy_from_slice(&AF_INET6.to_le_bytes());
+    bytes[2..4].copy_from_slice(&port.to_be_bytes());
+    bytes[8..24].copy_from_slice(&addr);
     bytes
 }
 
@@ -254,6 +279,17 @@ fn socket_stream(ctx: &SyscallCtx<'static>, type_flags: u64) -> i64 {
     }
 }
 
+fn socket_stream6(ctx: &SyscallCtx<'static>, type_flags: u64) -> i64 {
+    match socket_req(
+        NR_SOCKET,
+        [AF_INET6 as u64, type_flags, IPPROTO_TCP as u64, 0, 0, 0],
+        ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_INET6, STREAM) failed: {other:?}"),
+    }
+}
+
 fn socket_dgram(ctx: &SyscallCtx<'static>, type_flags: u64) -> i64 {
     match socket_req(
         NR_SOCKET,
@@ -262,6 +298,17 @@ fn socket_dgram(ctx: &SyscallCtx<'static>, type_flags: u64) -> i64 {
     ) {
         SyscallResult::Return(fd) => fd,
         other => panic!("socket(AF_INET, DGRAM) failed: {other:?}"),
+    }
+}
+
+fn socket_dgram6(ctx: &SyscallCtx<'static>, type_flags: u64, protocol: u64) -> i64 {
+    match socket_req(
+        NR_SOCKET,
+        [AF_INET6 as u64, type_flags, protocol, 0, 0, 0],
+        ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_INET6, DGRAM) failed: {other:?}"),
     }
 }
 
@@ -281,6 +328,257 @@ fn socket_unix_stream(ctx: &SyscallCtx<'static>) -> i64 {
         SyscallResult::Return(fd) => fd,
         other => panic!("socket(AF_UNIX, STREAM) failed: {other:?}"),
     }
+}
+
+fn socket_unix_seqpacket(ctx: &SyscallCtx<'static>) -> i64 {
+    match socket_req(NR_SOCKET, [AF_UNIX as u64, SOCK_SEQPACKET, 0, 0, 0, 0], ctx) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_UNIX, SEQPACKET) failed: {other:?}"),
+    }
+}
+
+#[test]
+fn dispatch_unix_seqpacket_socket_reports_so_type() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = match socket_req(
+        NR_SOCKET,
+        [AF_UNIX as u64, SOCK_SEQPACKET, 0, 0, 0, 0],
+        &ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_UNIX, SEQPACKET) failed: {other:?}"),
+    };
+
+    let mut out: i32 = 0;
+    let mut out_len: u32 = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_TYPE as u64,
+                (&mut out as *mut i32) as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out, SOCK_SEQPACKET as i32);
+}
+
+#[test]
+fn dispatch_udplite_socket_reports_datagram_type() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = match socket_req(
+        NR_SOCKET,
+        [AF_INET as u64, SOCK_DGRAM, IPPROTO_UDPLITE as u64, 0, 0, 0],
+        &ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_INET, DGRAM, UDPLITE) failed: {other:?}"),
+    };
+
+    let mut out: i32 = 0;
+    let mut out_len: u32 = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_TYPE as u64,
+                (&mut out as *mut i32) as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out, SOCK_DGRAM as i32);
+}
+
+#[test]
+fn dispatch_inet6_udp_bind_getsockname_round_trips_sockaddr_in6() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_dgram6(&ctx, SOCK_DGRAM, IPPROTO_IP as u64);
+    let loopback = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let bind_addr = sockaddr_in6(loopback, 0);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                fd as u64,
+                bind_addr.as_ptr() as u64,
+                SOCKADDR_IN6_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out = [0u8; SOCKADDR_IN6_BYTES as usize];
+    let mut out_len = SOCKADDR_IN6_BYTES;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKNAME,
+            [
+                fd as u64,
+                out.as_mut_ptr() as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out_len, SOCKADDR_IN6_BYTES);
+    assert_eq!(u16::from_le_bytes([out[0], out[1]]), AF_INET6);
+    assert_ne!(u16::from_be_bytes([out[2], out[3]]), 0);
+    assert_eq!(&out[8..24], &loopback);
+}
+
+#[test]
+fn dispatch_inet6_udplite_socket_reports_datagram_type() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_dgram6(&ctx, SOCK_DGRAM, IPPROTO_UDPLITE as u64);
+
+    let mut out: i32 = 0;
+    let mut out_len: u32 = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_TYPE as u64,
+                (&mut out as *mut i32) as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out, SOCK_DGRAM as i32);
+}
+
+#[test]
+fn dispatch_raw_icmp_ip_hdrincl_round_trips() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_icmp(&ctx, SOCK_RAW);
+
+    let enabled = 1i32;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IP_HDRINCL as u64,
+                (&enabled as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out = 0i32;
+    let mut out_len = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IP_HDRINCL as u64,
+                (&mut out as *mut i32) as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out, 1);
+}
+
+#[test]
+fn dispatch_raw_icmp_ip_hdrincl_sendmsg_is_unsupported_fast_path() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_icmp(&ctx, SOCK_RAW);
+
+    let enabled = 1i32;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IP_HDRINCL as u64,
+                (&enabled as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let addr = sockaddr_in([127, 0, 0, 1], 0);
+    let payload = [0xccu8; 64];
+    let iov = [TestIovec {
+        base: payload.as_ptr() as u64,
+        len: payload.len() as u64,
+    }];
+    let mut hdr = TestMsghdr {
+        name: addr.as_ptr() as u64,
+        namelen: SOCKADDR_IN_BYTES,
+        _pad0: 0,
+        iov: iov.as_ptr() as u64,
+        iovlen: iov.len() as u64,
+        control: 0,
+        controllen: 0,
+        flags: 0,
+        _pad1: 0,
+    };
+    assert_eq!(
+        socket_req(
+            NR_SENDMSG,
+            [fd as u64, (&mut hdr as *mut TestMsghdr) as u64, 0, 0, 0, 0,],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EOPNOTSUPP))
+    );
+
+    let bad_iov = [TestIovec { base: 1, len: 4 }];
+    hdr.iov = bad_iov.as_ptr() as u64;
+    hdr.iovlen = bad_iov.len() as u64;
+    assert_eq!(
+        socket_req(
+            NR_SENDMSG,
+            [fd as u64, (&mut hdr as *mut TestMsghdr) as u64, 0, 0, 0, 0,],
+            &ctx,
+        ),
+        SyscallResult::Error(EFAULT_VALUE)
+    );
 }
 
 fn socket_netlink(ctx: &SyscallCtx<'static>) -> i64 {
@@ -335,6 +633,276 @@ fn socket_packet(ctx: &SyscallCtx<'static>) -> i64 {
         SyscallResult::Return(fd) => fd,
         other => panic!("socket(AF_PACKET, RAW, ETH_P_ALL) failed: {other:?}"),
     }
+}
+
+#[test]
+fn dispatch_packet_ring_sockopts_validate_and_round_trip_reserve() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_packet(&ctx);
+
+    let version = TPACKET_V3;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_PACKET as u64,
+                PACKET_VERSION as u64,
+                (&version as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let reserve: i32 = 16;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_PACKET as u64,
+                PACKET_RESERVE as u64,
+                (&reserve as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    let mut out: i32 = 0;
+    let mut out_len = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                SOL_PACKET as u64,
+                PACKET_RESERVE as u64,
+                (&mut out as *mut i32) as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out, reserve);
+
+    let good = TestTPacketReq3 {
+        block_size: 4096,
+        block_nr: 2,
+        frame_size: 4096,
+        frame_nr: 2,
+        retire_blk_tov: 100,
+        sizeof_priv: 512,
+        feature_req_word: 0,
+    };
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_PACKET as u64,
+                PACKET_RX_RING as u64,
+                (&good as *const TestTPacketReq3) as u64,
+                core::mem::size_of::<TestTPacketReq3>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let bad = TestTPacketReq3 {
+        sizeof_priv: 3u32 << 30,
+        ..good
+    };
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_PACKET as u64,
+                PACKET_RX_RING as u64,
+                (&bad as *const TestTPacketReq3) as u64,
+                core::mem::size_of::<TestTPacketReq3>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EINVAL))
+    );
+}
+
+#[test]
+fn dispatch_packet_vnet_hdr_round_trips_and_accepts_rx_ring_combo() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_packet(&ctx);
+
+    let enabled: i32 = 1;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_PACKET as u64,
+                PACKET_VNET_HDR as u64,
+                (&enabled as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out = 0i32;
+    let mut out_len = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                SOL_PACKET as u64,
+                PACKET_VNET_HDR as u64,
+                (&mut out as *mut i32) as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out, 1);
+
+    let ring = TestTPacketReq3 {
+        block_size: 4096,
+        block_nr: 1,
+        frame_size: 4096,
+        frame_nr: 1,
+        retire_blk_tov: 100,
+        sizeof_priv: 0,
+        feature_req_word: 0,
+    };
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_PACKET as u64,
+                PACKET_RX_RING as u64,
+                (&ring as *const TestTPacketReq3) as u64,
+                core::mem::size_of::<TestTPacketReq3>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+}
+
+#[test]
+fn dispatch_packet_rx_ring_rejects_reserve_larger_than_block() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_packet(&ctx);
+
+    let reserve: i32 = 1 << 30;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_PACKET as u64,
+                PACKET_RESERVE as u64,
+                (&reserve as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let ring = TestTPacketReq3 {
+        block_size: 4096,
+        block_nr: 1,
+        frame_size: 4096,
+        frame_nr: 1,
+        retire_blk_tov: 100,
+        sizeof_priv: 0,
+        feature_req_word: 0,
+    };
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_PACKET as u64,
+                PACKET_RX_RING as u64,
+                (&ring as *const TestTPacketReq3) as u64,
+                core::mem::size_of::<TestTPacketReq3>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EINVAL))
+    );
+}
+
+#[test]
+fn dispatch_packet_reserve_rejects_value_larger_than_active_rx_ring_block() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_packet(&ctx);
+
+    let ring = TestTPacketReq3 {
+        block_size: 4096,
+        block_nr: 1,
+        frame_size: 4096,
+        frame_nr: 1,
+        retire_blk_tov: 100,
+        sizeof_priv: 0,
+        feature_req_word: 0,
+    };
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_PACKET as u64,
+                PACKET_RX_RING as u64,
+                (&ring as *const TestTPacketReq3) as u64,
+                core::mem::size_of::<TestTPacketReq3>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let reserve: i32 = 1 << 30;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_PACKET as u64,
+                PACKET_RESERVE as u64,
+                (&reserve as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EINVAL))
+    );
 }
 
 fn socket_unix_dgram(ctx: &SyscallCtx<'static>) -> i64 {

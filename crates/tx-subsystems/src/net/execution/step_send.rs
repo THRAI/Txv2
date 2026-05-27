@@ -7,8 +7,9 @@ use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::{socket_send_wait_token, yield_bytes_on_token, ByteStepOutcome};
 use crate::net::protocol::UDP_IPV4_MAX_PAYLOAD_BYTES;
 use crate::net::structure::{
-    ConnectionKey, IpEndpoint, RecvWireSet, SendRecvFlags, SendWireSet, SocketIdentity, SocketKind,
-    SocketPayload, SocketProtocol, TcpState, UnixDatagramState, UnixSocketPath, UnixStreamState,
+    ConnectionKey, IpEndpoint, RdsState, RecvWireSet, SendRecvFlags, SendWireSet, SocketIdentity,
+    SocketKind, SocketPayload, SocketProtocol, TcpState, UnixDatagramState, UnixSocketPath,
+    UnixStreamState,
 };
 
 pub fn step_send(
@@ -111,6 +112,9 @@ pub fn step_send_kernel_bytes(
     }
     if socket.kind == SocketKind::UnixStream {
         return send_unix_stream_bytes(socket, &payload, bytes, guard);
+    }
+    if socket.kind == SocketKind::Sctp {
+        return send_sctp_stream_bytes(socket, &payload, bytes, guard);
     }
     if socket.kind == SocketKind::UnixDatagram {
         return send_unix_datagram_connected(socket, &payload, bytes, guard);
@@ -236,6 +240,12 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
     if socket.kind == SocketKind::UnixStream {
         return send_unix_stream_bytes(socket, &payload, bytes, guard);
     }
+    if socket.kind == SocketKind::Sctp {
+        return send_sctp_stream_bytes(socket, &payload, bytes, guard);
+    }
+    if socket.kind == SocketKind::RdsSeqPacket {
+        return send_rds_packet(socket, &payload, dst, bytes, guard);
+    }
     if socket.kind == SocketKind::UnixDatagram && dst.is_none() {
         return send_unix_datagram_connected(socket, &payload, bytes, guard);
     }
@@ -289,9 +299,15 @@ fn stream_send_state_error(socket: &Cap<SocketIdentity>, payload: &SocketPayload
     match payload.protocol_snapshot() {
         SocketProtocol::Tcp(TcpState::Connected { .. }) => None,
         SocketProtocol::Tcp(TcpState::Closed) => Some(Errno::ENOTCONN),
+        SocketProtocol::Sctp(TcpState::Connected { .. }) => None,
+        SocketProtocol::Sctp(TcpState::Closed) => Some(Errno::ENOTCONN),
         SocketProtocol::UnixStream(UnixStreamState::Connected { .. }) => None,
         SocketProtocol::UnixStream(UnixStreamState::Closed) => Some(Errno::ENOTCONN),
-        _ if socket.kind == SocketKind::Tcp || socket.kind == SocketKind::UnixStream => {
+        _ if matches!(
+            socket.kind,
+            SocketKind::Tcp | SocketKind::Sctp | SocketKind::UnixStream
+        ) =>
+        {
             Some(Errno::EPIPE)
         }
         _ => None,
@@ -397,6 +413,50 @@ fn send_unix_datagram_to_path(
     StepOutcome::Done(bytes.len())
 }
 
+fn send_rds_packet(
+    socket: &Cap<SocketIdentity>,
+    payload: &SocketPayload,
+    dst: Option<IpEndpoint>,
+    bytes: &[u8],
+    guard: &Guard<'_>,
+) -> ByteStepOutcome<usize> {
+    let source = match payload.protocol_snapshot() {
+        SocketProtocol::Rds(RdsState::Bound { local }) => local,
+        SocketProtocol::Rds(RdsState::Unbound) => return StepOutcome::Err(Errno::EDESTADDRREQ),
+        SocketProtocol::Rds(RdsState::Closed) => return StepOutcome::Err(Errno::ENOTCONN),
+        _ => return StepOutcome::Err(Errno::EINVAL),
+    };
+    let Some(destination) = dst else {
+        return StepOutcome::Err(Errno::EDESTADDRREQ);
+    };
+    if destination.family != crate::net::structure::AddressFamily::Inet {
+        return StepOutcome::Err(Errno::EAFNOSUPPORT);
+    }
+    if !destination.is_loopback() && !destination.is_unspecified() {
+        return StepOutcome::Err(Errno::EOPNOTSUPP);
+    }
+
+    let table = payload.socket_table();
+    let Some(target) = table.lookup_rds_bound(destination, guard) else {
+        return StepOutcome::Err(Errno::ECONNREFUSED);
+    };
+    if target.raw() == socket.raw() || target.kind != SocketKind::RdsSeqPacket {
+        return StepOutcome::Err(Errno::ECONNREFUSED);
+    }
+    let Some(target_payload) = target.acquire_operational() else {
+        return StepOutcome::Err(Errno::ECONNREFUSED);
+    };
+    let Some(became_readable) =
+        target_payload.record_rds_packet(source, destination, bytes.to_vec())
+    else {
+        return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
+    };
+    if became_readable {
+        target.readiness.fire_recv(RecvWireSet::HAS_DATA);
+    }
+    StepOutcome::Done(bytes.len())
+}
+
 fn send_unix_stream_bytes(
     socket: &Cap<SocketIdentity>,
     payload: &SocketPayload,
@@ -414,6 +474,46 @@ fn send_unix_stream_bytes(
         return StepOutcome::Err(Errno::EPIPE);
     }
     let Some(became_readable) = peer_payload.record_unix_stream_bytes(bytes.to_vec()) else {
+        return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
+    };
+    if became_readable {
+        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+    }
+    StepOutcome::Done(bytes.len())
+}
+
+fn send_sctp_stream_bytes(
+    socket: &Cap<SocketIdentity>,
+    payload: &SocketPayload,
+    bytes: &[u8],
+    guard: &Guard<'_>,
+) -> ByteStepOutcome<usize> {
+    let (local, remote) = match payload.protocol_snapshot() {
+        SocketProtocol::Sctp(TcpState::Connected { local, remote }) => (local, remote),
+        SocketProtocol::Sctp(TcpState::Closed) => return StepOutcome::Err(Errno::ENOTCONN),
+        SocketProtocol::Sctp(_) => return StepOutcome::Err(Errno::EPIPE),
+        _ => return StepOutcome::Err(Errno::EINVAL),
+    };
+    let table = payload.socket_table();
+    let Some(peer) = table.lookup_sctp_connection(ConnectionKey::new(remote, local), guard) else {
+        return StepOutcome::Err(Errno::EPIPE);
+    };
+    let Some(peer_payload) = peer.acquire_operational() else {
+        return StepOutcome::Err(Errno::EPIPE);
+    };
+    if !matches!(
+        peer_payload.protocol_snapshot(),
+        SocketProtocol::Sctp(TcpState::Connected {
+            local: peer_local,
+            remote: peer_remote,
+        }) if peer_local == remote && peer_remote == local
+    ) {
+        return StepOutcome::Err(Errno::EPIPE);
+    }
+    if peer_payload.shutdown_rd() {
+        return StepOutcome::Err(Errno::EPIPE);
+    }
+    let Some(became_readable) = peer_payload.record_sctp_stream_bytes(bytes.to_vec()) else {
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
     if became_readable {

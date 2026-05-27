@@ -41,10 +41,18 @@ pub fn step_socket_create_in_namespace(
         Err(_) => return StepOutcome::Err(Errno::ENOMEM),
     };
 
-    let identity = zone::sign_for(identity_res, SocketIdentity::new(kind));
+    let identity = zone::sign_for(
+        identity_res,
+        SocketIdentity::new_with_family(kind, valid.domain),
+    );
     let payload = PayloadCap::from_cap(zone::sign_for(
         payload_res,
-        SocketPayload::new_in_namespace(kind, SocketOptionSet::for_kind(kind), net_namespace),
+        SocketPayload::new_in_namespace_with_family(
+            kind,
+            valid.domain,
+            SocketOptionSet::for_valid_socket_type(valid, kind),
+            net_namespace,
+        ),
     ));
     identity.install_payload(payload);
 

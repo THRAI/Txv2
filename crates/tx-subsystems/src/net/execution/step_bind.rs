@@ -5,7 +5,7 @@ use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_bind_target;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
-    IpEndpoint, Ipv4Address, KernelSockAddr, SocketIdentity, SocketKind, SocketProtocol, TcpState,
+    IpEndpoint, KernelSockAddr, RdsState, SocketIdentity, SocketKind, SocketProtocol, TcpState,
     UdpInner, UnixDatagramState, UnixStreamState,
 };
 
@@ -35,7 +35,11 @@ pub fn step_bind(
             _ => Err(IndexError::Missing),
         },
         SocketKind::Tcp => bind_tcp_no_wildcard_overlap(table, socket, witness.local, guard),
+        SocketKind::Sctp => bind_sctp_no_wildcard_overlap(table, socket, witness.local, guard),
         SocketKind::Udp => bind_udp_maybe_reuseaddr(table, socket, witness.local, guard),
+        SocketKind::RdsSeqPacket => {
+            bind_rds_no_wildcard_overlap(table, socket, witness.local, guard)
+        }
         SocketKind::RawIcmp => Ok(()),
         SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter | SocketKind::Packet => Ok(()),
     };
@@ -43,6 +47,7 @@ pub fn step_bind(
         return StepOutcome::Err(table_error_to_errno(error));
     }
 
+    let mut raw_icmp_wrong_family = false;
     let bound = payload.with_protocol_mut(|protocol| match protocol {
         SocketProtocol::UnixDatagram(UnixDatagramState::Unbound) => {
             if let KernelSockAddr::Unix(local) = witness.addr {
@@ -66,18 +71,37 @@ pub fn step_bind(
             });
             true
         }
+        SocketProtocol::Sctp(TcpState::Init) => {
+            *protocol = SocketProtocol::Sctp(TcpState::Bound {
+                local: witness.local,
+            });
+            true
+        }
         SocketProtocol::Udp(UdpInner::Unbound) => {
             *protocol = SocketProtocol::Udp(UdpInner::Bound {
                 local: witness.local,
             });
             true
         }
+        SocketProtocol::Rds(RdsState::Unbound) => {
+            *protocol = SocketProtocol::Rds(RdsState::Bound {
+                local: witness.local,
+            });
+            true
+        }
         SocketProtocol::RawIcmp(state) if state.bound_local.is_none() => {
+            if witness.local.family != crate::net::structure::AddressFamily::Inet {
+                raw_icmp_wrong_family = true;
+                return false;
+            }
             state.bound_local = Some(witness.local.addr);
             true
         }
         _ => false,
     });
+    if raw_icmp_wrong_family {
+        return StepOutcome::Err(Errno::EAFNOSUPPORT);
+    }
     if bound {
         StepOutcome::Done(())
     } else {
@@ -109,21 +133,111 @@ fn tcp_bind_conflict(
         }
     }
 
-    if local.addr == Ipv4Address::UNSPECIFIED {
+    if local.is_unspecified() {
         for existing in table.snapshot_tcp_bound(guard) {
             if existing.raw() == socket.raw() {
                 continue;
             }
-            if tcp_socket_local(&existing).is_some_and(|endpoint| endpoint.port == local.port) {
+            if tcp_socket_local(&existing)
+                .is_some_and(|endpoint| endpoint.same_family(local) && endpoint.port == local.port)
+            {
                 return Some(existing);
             }
         }
         return None;
     }
 
-    let wildcard = IpEndpoint::new(Ipv4Address::UNSPECIFIED, local.port);
+    let wildcard = IpEndpoint::unspecified_for_family(local.family, local.port);
     table
         .lookup_tcp_bound(wildcard, guard)
+        .filter(|existing| existing.raw() != socket.raw())
+}
+
+fn bind_sctp_no_wildcard_overlap(
+    table: &SocketTable,
+    socket: &Cap<SocketIdentity>,
+    local: IpEndpoint,
+    guard: &Guard<'_>,
+) -> Result<(), IndexError> {
+    if sctp_bind_conflict(table, socket, local, guard).is_some() {
+        return Err(IndexError::Duplicate);
+    }
+    table.bind_sctp(local, socket.clone())
+}
+
+fn sctp_bind_conflict(
+    table: &SocketTable,
+    socket: &Cap<SocketIdentity>,
+    local: IpEndpoint,
+    guard: &Guard<'_>,
+) -> Option<Cap<SocketIdentity>> {
+    if let Some(existing) = table.lookup_sctp_bound(local, guard) {
+        if existing.raw() != socket.raw() {
+            return Some(existing);
+        }
+    }
+
+    if local.is_unspecified() {
+        for existing in table.snapshot_sctp_bound(guard) {
+            if existing.raw() == socket.raw() {
+                continue;
+            }
+            if sctp_socket_local(&existing)
+                .is_some_and(|endpoint| endpoint.same_family(local) && endpoint.port == local.port)
+            {
+                return Some(existing);
+            }
+        }
+        return None;
+    }
+
+    let wildcard = IpEndpoint::unspecified_for_family(local.family, local.port);
+    table
+        .lookup_sctp_bound(wildcard, guard)
+        .filter(|existing| existing.raw() != socket.raw())
+}
+
+fn bind_rds_no_wildcard_overlap(
+    table: &SocketTable,
+    socket: &Cap<SocketIdentity>,
+    local: IpEndpoint,
+    guard: &Guard<'_>,
+) -> Result<(), IndexError> {
+    if rds_bind_conflict(table, socket, local, guard).is_some() {
+        return Err(IndexError::Duplicate);
+    }
+    table.bind_rds(local, socket.clone())
+}
+
+fn rds_bind_conflict(
+    table: &SocketTable,
+    socket: &Cap<SocketIdentity>,
+    local: IpEndpoint,
+    guard: &Guard<'_>,
+) -> Option<Cap<SocketIdentity>> {
+    if let Some(existing) = table.lookup_rds_bound(local, guard) {
+        if existing.raw() != socket.raw() {
+            return Some(existing);
+        }
+    }
+
+    if local.is_unspecified() {
+        for existing in table.snapshot_rds_bound(guard) {
+            if existing.raw() == socket.raw() {
+                continue;
+            }
+            if rds_socket_local(&existing)
+                .is_some_and(|endpoint| endpoint.same_family(local) && endpoint.port == local.port)
+            {
+                return Some(existing);
+            }
+        }
+        return None;
+    }
+
+    let wildcard = IpEndpoint::unspecified_for_family(local.family, local.port);
+    table
+        .lookup_rds_bound(wildcard, guard)
         .filter(|existing| existing.raw() != socket.raw())
 }
 
@@ -172,19 +286,21 @@ fn udp_bind_conflict(
         }
     }
 
-    if local.addr == Ipv4Address::UNSPECIFIED {
+    if local.is_unspecified() {
         for existing in table.snapshot_udp_bound(guard) {
             if existing.raw() == socket.raw() {
                 continue;
             }
-            if udp_socket_local(&existing).is_some_and(|endpoint| endpoint.port == local.port) {
+            if udp_socket_local(&existing)
+                .is_some_and(|endpoint| endpoint.same_family(local) && endpoint.port == local.port)
+            {
                 return Some(existing);
             }
         }
         return None;
     }
 
-    let wildcard = IpEndpoint::new(Ipv4Address::UNSPECIFIED, local.port);
+    let wildcard = IpEndpoint::unspecified_for_family(local.family, local.port);
     table
         .lookup_udp_bound_exact(wildcard, guard)
         .filter(|existing| existing.raw() != socket.raw())
@@ -198,6 +314,27 @@ fn tcp_socket_local(socket: &Cap<SocketIdentity>) -> Option<IpEndpoint> {
             | SocketProtocol::Tcp(TcpState::Listening { local, .. })
             | SocketProtocol::Tcp(TcpState::Connecting { local, .. })
             | SocketProtocol::Tcp(TcpState::Connected { local, .. }) => Some(local),
+            _ => None,
+        })
+}
+
+fn sctp_socket_local(socket: &Cap<SocketIdentity>) -> Option<IpEndpoint> {
+    socket
+        .acquire_operational()
+        .and_then(|payload| match payload.protocol_snapshot() {
+            SocketProtocol::Sctp(TcpState::Bound { local })
+            | SocketProtocol::Sctp(TcpState::Listening { local, .. })
+            | SocketProtocol::Sctp(TcpState::Connecting { local, .. })
+            | SocketProtocol::Sctp(TcpState::Connected { local, .. }) => Some(local),
+            _ => None,
+        })
+}
+
+fn rds_socket_local(socket: &Cap<SocketIdentity>) -> Option<IpEndpoint> {
+    socket
+        .acquire_operational()
+        .and_then(|payload| match payload.protocol_snapshot() {
+            SocketProtocol::Rds(RdsState::Bound { local }) => Some(local),
             _ => None,
         })
 }
