@@ -18,7 +18,7 @@ OSCOMP_EXTRA ?=
 HOST_CARGO_TARGET_DIR ?= target/host-cargo
 
 .PHONY: docker-help docker-build docker-shell docker-ci docker-check docker-ci-slow \
-	all \
+	setup all \
 	docker-build-rv64 docker-build-la64 docker-image-cpio-rv64 docker-image-cpio-la64 \
 	docker-image-ext4-rv64 docker-image-ext4-la64 \
 	docker-qemu-rv64-smoke docker-qemu-rv64-busybox docker-qemu-la64-busybox \
@@ -60,7 +60,11 @@ docker-help:
 # Official OSComp entry point. The website's autotest runs `make all` in
 # /coursegrader/submit and then boots ./kernel-rv and ./kernel-la with the
 # official sdcard images.
-all:
+setup:
+	rm -rf .cargo
+	cp -r cargo .cargo
+
+all: setup
 	cargo xtask build --target rv64-qemu
 	cargo xtask build --target la64-qemu
 	cargo xtask oscomp submit --submit .

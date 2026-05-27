@@ -1,0 +1,20 @@
+[alias]
+xtask = "run --package xtask --"
+
+[build]
+target-dir = "target"
+
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "third_party"
+
+[target.riscv64gc-unknown-none-elf]
+linker = "rust-lld"
+
+[target.loongarch64-unknown-none-softfloat]
+linker = "rust-lld"
+
+[target.loongarch64-unknown-none]
+linker = "rust-lld"
