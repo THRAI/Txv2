@@ -639,12 +639,20 @@ fn take_due_itimer_real<P: TimeIf>(pid: u32) -> bool {
     })
 }
 
-pub fn maybe_deliver_itimer_signal<P: TimeIf>(
+pub fn maybe_deliver_itimer_signal<P: TimeIf + tx_hal::PlatformConfig>(
     mut ctx: UserTrapContext,
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
     aspace: &AddressSpace,
 ) -> UserTrapContext {
+    // This compatibility path predates the generic SignalFrameIf delivery
+    // path and emits an RV64-specific frame/trampoline using x2 as sp.
+    // LoongArch uses r2 as TLS and r3 as sp, so running this path there
+    // corrupts TLS and jumps into data on handler return.
+    if !matches!(P::ARCH, tx_hal::Arch::Riscv64) {
+        return ctx;
+    }
+
     let Some(thread_payload) = thread.payload_cap() else {
         return ctx;
     };

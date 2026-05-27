@@ -1144,7 +1144,7 @@ fn append_ltp_runtest(cmd: &mut alloc::string::String, module: &str, filter: &st
     let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
     let _ = write!(
         cmd,
-        "; selected_tags='{selected_tags}'; if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; if [ -n \"$selected_tags\" ]; then case \"$selected_tags\" in *\"|$tag|\"*) ;; *) continue;; esac; fi; case \"$tag\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $tag : local skip\"; continue;; esac; cmdline=${{rest:-$tag}}; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -c \"$cmdline\"; ret=$?; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi"
+        "; selected_tags='{selected_tags}'; if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; if [ -n \"$selected_tags\" ]; then case \"$selected_tags\" in *\"|$tag|\"*) ;; *) continue;; esac; fi; case \"$tag\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $tag : local skip\"; continue;; esac; cmdline=${{rest:-$tag}}; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -c \"$cmdline\"; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $tag : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi"
     );
     let _ = write!(
         cmd,
@@ -1257,10 +1257,7 @@ fn append_ltp_case_loop(cmd: &mut alloc::string::String, filter: &str) {
             continue;
         }
         if !is_ltp_case_token(case) {
-            let _ = write!(
-                cmd,
-                "; echo \"SKIP LTP CASE {case} : invalid case token\""
-            );
+            let _ = write!(cmd, "; echo \"SKIP LTP CASE {case} : invalid case token\"");
             continue;
         }
         let _ = write!(cmd, " {case}");
@@ -1289,6 +1286,7 @@ esac; \
 echo \"RUN LTP CASE $case : $ltp_label\"; \
 PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config \"$@\"; \
 ret=$?; \
+if [ $ret = 0 ]; then echo \"PASS LTP CASE $case : $ret\"; fi; \
 echo \"FAIL LTP CASE $case : $ret\"; \
 done"
     );
@@ -1823,7 +1821,7 @@ fn append_full_ltp_runner(cmd: &mut alloc::string::String) {
     let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
     let _ = write!(
         cmd,
-        "; for file in \"$target_dir\"/*; do if [ -f \"$file\" ]; then name=${{file##*/}}; case \"$name\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $name : local skip\"; continue;; esac; ./busybox echo \"RUN LTP CASE $name\"; /bin/setsid \"$file\"; ret=$?; ./busybox echo \"FAIL LTP CASE $name : $ret\"; fi; done"
+        "; for file in \"$target_dir\"/*; do if [ -f \"$file\" ]; then name=${{file##*/}}; case \"$name\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $name : local skip\"; continue;; esac; ./busybox echo \"RUN LTP CASE $name\"; /bin/setsid \"$file\"; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $name : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $name : $ret\"; fi; done"
     );
     cmd.push_str("; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\"");
 }
