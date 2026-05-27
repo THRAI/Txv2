@@ -1,0 +1,55 @@
+[package]
+name = "tx-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tx-fs = { path = "../tx-fs" }
+tx-drivers = { path = "../tx-drivers" }
+tx-ext4 = { path = "../tx-ext4", default-features = false }
+tx-ext4-format = { path = "../tx-ext4-format" }
+tx-hal = { path = "../tx-hal" }
+tx-platform-adapter = { path = "../tx-platform-adapter" }
+tx-reactor = { path = "../tx-reactor" }
+# Phase 7 of the ELF-loader plan: `init.rs::run_bootstrap_exec_for_init`
+# drives `tx_scripts::process::exec::exec_script` synchronously to
+# load the embedded `/init` fixture binary into init's address space
+# before entering the BSP reactor loop. Mirrors `tx-shims`'s use of
+# `tx-scripts` for the NR_EXECVE arm.
+tx-scripts = { path = "../tx-scripts" }
+# Pre-ELF Phase 2: the production thread future in
+# `crates/tx-kernel/src/thread_future.rs` calls
+# `tx_shims::linux_syscall::dispatch` to drive the syscall table from
+# the reactor task wrapper. Promoted from `[dev-dependencies]` to a
+# runtime dependency.
+tx-shims = { path = "../tx-shims" }
+tx-substrate = { path = "../tx-substrate" }
+tx-test-support = { path = "../tx-test-support" }
+tx-subsystems = { path = "../tx-subsystems" }
+tx-services = { path = "../tx-services" }
+# Observation ring dump — `init/exec.rs` calls `tx_observe::dump_console_hex`
+# after the leader thread zombifies so a host-side `cargo xtask observe
+# extract` can recover the captured `.txtrace` blob from the serial log.
+tx-observe = { path = "../tx-observe" }
+smoltcp = { path = "../../external/smoltcp-asterinas", default-features = false, features = ["alloc", "medium-ip", "proto-ipv4"] }
+
+[dev-dependencies]
+# `test-support` opens `tx_subsystems::cross_crate_test_support`, which
+# the Phase 3b boot-wiring tests use to reset the global `INIT_PROCESS`
+# slot (and pid/tid counters) between runs. The same mechanism is
+# already used by Phase 2a's syscall-dispatch tests in `tx-shims`.
+tx-subsystems = { path = "../tx-subsystems", features = ["test-support"] }
+tx-shims = { path = "../tx-shims", features = ["test-support"] }
+
+
+[features]
+# Enable the per-reactor-step epoch/guard diagnostic console prints.
+# Off by default; noisy and not needed in normal test runs.
+diag-epoch-guards = []
+
+[lib]
+path = "src/lib.rs"
+test = true
+doctest = false

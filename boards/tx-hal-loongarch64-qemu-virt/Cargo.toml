@@ -1,0 +1,18 @@
+[package]
+name = "tx-hal-loongarch64-qemu-virt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fdt = "0.2.0-alpha2"
+tx-hal = { path = "../../crates/tx-hal" }
+
+[features]
+default = []
+la64-boot-trace = []
+
+[lib]
+path = "src/lib.rs"
+doctest = false

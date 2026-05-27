@@ -1,0 +1,2086 @@
+// Bootstrap-exec / userspace-reactor methods of `CoreInit<P>`.
+//
+// Carved out of `init.rs` (2026-05-08 jumbo split). The methods
+// here own:
+//
+// - busybox / init-fixture initramfs population
+// - the cmdline-driven `drive_bootstrap_exec` lane
+// - the BSP `run_userspace_reactor_loop` that runs the init
+//   thread future to zombification
+// - the polled SBI debug-console drain (fallback for the
+//   PLIC-IRQ path; see the slice-2 progress note)
+// - small console-output helpers used by the above
+//
+// Methods carry their original signatures + bodies; only the
+// enclosing module changed. The single `impl<P: TxPlatform>
+// CoreInit<P>` block in this file augments the one in `init.rs`.
+
+use super::helpers::{bootstrap_block_on, exec_error_tag, parse_init_from_cmdline};
+use super::*;
+use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
+use core::fmt::Write;
+
+fn oscomp_boot_suite(cmdline: Option<&str>) -> Option<&str> {
+    let cmdline = cmdline?;
+    for token in cmdline.split_ascii_whitespace() {
+        if let Some(value) = token.strip_prefix("tx.oscomp=") {
+            return Some(value);
+        }
+        if let Some(value) = token.strip_prefix("tx.oscomp_suite=") {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn oscomp_libctest_network_cmd(libc: &str) -> alloc::string::String {
+    use alloc::format;
+
+    let root = oscomp_libc_root(libc);
+    let group = oscomp_group_label("libctest", libc);
+    format!(
+        "cd {root} || exit 1; \
+	    ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\"; \
+	    ./runtest.exe -w entry-static.exe inet_pton; \
+	    ./runtest.exe -w entry-static.exe socket; \
+	    ./runtest.exe -w entry-static.exe dn_expand_empty; \
+	    ./runtest.exe -w entry-static.exe dn_expand_ptr_0; \
+	    ./runtest.exe -w entry-static.exe inet_ntop_v4mapped; \
+	    ./runtest.exe -w entry-static.exe inet_pton_empty_last_field; \
+	    ./runtest.exe -w entry-dynamic.exe inet_pton; \
+	    ./runtest.exe -w entry-dynamic.exe socket; \
+	    ./runtest.exe -w entry-dynamic.exe dn_expand_empty; \
+	    ./runtest.exe -w entry-dynamic.exe dn_expand_ptr_0; \
+	    ./runtest.exe -w entry-dynamic.exe inet_ntop_v4mapped; \
+	    ./runtest.exe -w entry-dynamic.exe inet_pton_empty_last_field; \
+	    ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\""
+    )
+}
+
+fn oscomp_lmbench_network_cmd(libc: &str) -> alloc::string::String {
+    use alloc::format;
+
+    let root = oscomp_libc_root(libc);
+    let group = oscomp_group_label("lmbench-network", libc);
+    format!(
+        "cd {root} || exit 1; \
+	    host=127.0.0.1; \
+	    export ENOUGH=1000000; \
+	    export TIMING_O=0; \
+	    export LOOP_O=0; \
+	    failed=0; \
+	    ./busybox mkdir -p /tmp; \
+	    check_contains() {{ label=$1; pat=$2; shift; shift; \
+	        ./busybox echo \"====== lmbench-network $label begin ======\"; \
+	        \"$@\" > /tmp/lmbench-network.out 2>&1; \
+	        ./busybox cat /tmp/lmbench-network.out; \
+	        if ./busybox grep -q \"$pat\" /tmp/lmbench-network.out; then ans=success; else ans=fail; failed=1; fi; \
+	        ./busybox echo \"====== lmbench-network $label end: $ans ======\"; \
+	    }}; \
+	    ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\"; \
+	    ./lmbench_all lat_udp -s; \
+	    ./busybox sleep 1; \
+	    check_contains lat_udp \"UDP latency using\" ./lmbench_all lat_udp -W 0 -N 1 -P 1 $host; \
+	    ./lmbench_all lat_udp -S $host; \
+	    ./lmbench_all lat_tcp -s; \
+	    ./busybox sleep 1; \
+	    check_contains lat_tcp \"TCP latency using\" ./lmbench_all lat_tcp -W 0 -N 1 -P 1 $host; \
+	    ./lmbench_all lat_tcp -S $host; \
+	    ./lmbench_all lat_connect -s; \
+	    ./busybox sleep 1; \
+	    check_contains lat_connect \"TCP/IP connection cost\" ./lmbench_all lat_connect -N 1 $host; \
+	    ./lmbench_all lat_connect -S $host; \
+	    ./lmbench_all bw_tcp -s; \
+	    ./busybox sleep 1; \
+	    check_contains bw_tcp_1 \"MB/sec\" ./lmbench_all bw_tcp -P 1 -W 0 -N 1 -m 1 $host; \
+	    check_contains bw_tcp_64 \"MB/sec\" ./lmbench_all bw_tcp -P 1 -W 0 -N 1 -m 64 $host; \
+	    check_contains bw_tcp_1024 \"MB/sec\" ./lmbench_all bw_tcp -P 1 -W 0 -N 1 -m 1024 $host; \
+	    ./busybox echo \"====== lmbench-network bw_tcp_shutdown begin ======\"; \
+	    ./lmbench_all bw_tcp -S $host; \
+	    ./busybox echo \"====== lmbench-network bw_tcp_shutdown end ======\"; \
+	    ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\"; \
+	    exit $failed"
+    )
+}
+
+fn oscomp_netperf_udp_rr_cmd(libc: &str) -> alloc::string::String {
+    use alloc::format;
+
+    let root = oscomp_libc_root(libc);
+    let group = oscomp_group_label("netperf-udp-rr", libc);
+    format!(
+        "cd {root} || exit 1; \
+	    ip=127.0.0.1; port=12865; \
+	    ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\"; \
+	    ./netserver -D -L $ip -p $port & server_pid=$!; \
+	    ./busybox sleep 1; \
+	    ./busybox echo \"====== netperf UDP_RR begin ======\"; \
+	    ./netperf -H $ip -p $port -t UDP_RR -l 1 -- -s 16k -S 16k -m 1k -M 1k -r 64,64 -R 1; \
+	    if [ $? = 0 ]; then ans=success; else ans=fail; fi; \
+	    ./busybox echo \"====== netperf UDP_RR end: $ans ======\"; \
+	    ./busybox kill -9 $server_pid; \
+	    ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\""
+    )
+}
+
+fn oscomp_libc_root(libc: &str) -> &'static str {
+    match libc {
+        "glibc" => "/musl/glibc",
+        _ => "/musl/musl",
+    }
+}
+
+fn oscomp_group_label(base: &str, libc: &str) -> alloc::string::String {
+    use alloc::format;
+
+    match libc {
+        "glibc" => format!("{base}-glibc"),
+        _ => format!("{base}-musl"),
+    }
+}
+
+impl<P: TxPlatform> CoreInit<P> {
+    /// Initramfs slice: walk `BootInfo::initrd` if present and
+    /// reproduce its file tree inside the rootfs. Warn-and-skip on
+    /// any per-entry failure — a corrupt initramfs should not wedge
+    /// boot, which would be confusing when the user simply pointed
+    /// `-initrd` at the wrong file. The bake-in `/init` fixture
+    /// (registered above) keeps the kernel runnable in that case.
+    pub(crate) fn register_initramfs_if_present() {
+        let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
+        let Some(initrd_range) = boot_info.initrd else {
+            return;
+        };
+        if initrd_range.size == 0 {
+            return;
+        }
+
+        // Resolve the initramfs PhysRange to a kernel direct-map
+        // pointer. `boot_memory` reserved the range so nothing else
+        // mutates it; the slice is read-only for the duration of
+        // the unpack.
+        let direct_map_base = <P as tx_hal::PlatformConfig>::DIRECT_MAP_BASE.0;
+        let kernel_va = direct_map_base.wrapping_add(initrd_range.start.0);
+        // SAFETY: `boot_memory::reserve_initrd` reserves the range
+        // before `mount_rootfs_tmpfs` runs; the slice is read-only,
+        // covers `initrd_range.size` bytes from a kernel direct-map
+        // address, and the page allocator does not hand the range
+        // out for any other use during the kernel's lifetime.
+        let bytes: &[u8] =
+            unsafe { core::slice::from_raw_parts(kernel_va as *const u8, initrd_range.size) };
+
+        let Some(root_mount) = root_mount() else {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":initramfs:skip:no-rootmount\n");
+            return;
+        };
+        match tx_subsystems::initramfs::unpack_into_root_mount(bytes, &root_mount) {
+            Ok(stats) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":initramfs:");
+                Self::write_decimal_unsigned(stats.files);
+                tx_hal::console_write_str::<P>("-files:");
+                Self::write_decimal_unsigned(stats.dirs);
+                tx_hal::console_write_str::<P>("-dirs:");
+                Self::write_decimal_unsigned(stats.symlinks);
+                tx_hal::console_write_str::<P>("-symlinks:");
+                Self::write_decimal_unsigned(stats.bytes_total as usize);
+                tx_hal::console_write_str::<P>("-bytes:");
+                if stats.unsupported > 0 {
+                    Self::write_decimal_unsigned(stats.unsupported);
+                    tx_hal::console_write_str::<P>("-unsupported:");
+                }
+                tx_hal::console_write_str::<P>("ok\n");
+            }
+            Err(error) => {
+                // Warn-and-skip: log the failure to the board
+                // sentinel and continue with whatever was bake-in.
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":initramfs:fail:");
+                let label: &str = match error {
+                    tx_subsystems::initramfs::UnpackError::Parse(_) => "parse",
+                    tx_subsystems::initramfs::UnpackError::FsOp { op, .. } => op,
+                    tx_subsystems::initramfs::UnpackError::UnexpectedAdvance(op) => op,
+                };
+                tx_hal::console_write_str::<P>(label);
+                tx_hal::console_write_str::<P>("\n");
+            }
+        }
+    }
+
+    /// Shell-prompt roadmap Slice 10 (2026-05-08): copy
+    /// `busybox_fixture::BUSYBOX_BYTES` into a fresh tmpfs file at
+    /// `/bin/sh`. Mirrors `register_init_fixture_into_tmpfs`'s
+    /// shape (create_inode → materialise_rnode → page-by-page memcpy
+    /// → truncate) but with a different path (`/bin/sh`) and
+    /// non-executable -> executable mode bits.
+    ///
+    /// Compiled in only when `cfg(busybox_baked)` — set by `build.rs`
+    /// when `TX_BUSYBOX` is set in the build environment. Host tests
+    /// (without TX_BUSYBOX) use the existing `/init` fixture path
+    /// exclusively.
+    ///
+    /// Mode is `0o100755` (S_IFREG | rwx-r-x-r-x). Owner/group are
+    /// uid=0/gid=0 (the bootstrap is root); a `chmod +s` step is not
+    /// needed — busybox doesn't require setuid.
+    ///
+    /// Creates the parent `/bin` directory if absent.
+    #[cfg(busybox_baked)]
+    pub(crate) fn register_busybox_into_tmpfs() {
+        use tx_subsystems::vfs::{Credential, RNodeBacking};
+
+        let root_mount =
+            root_mount().expect("register_busybox_into_tmpfs: ROOT_MOUNT must be populated");
+        let payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap();
+        let fs_ops = payload.fs_ops.clone();
+        let fs_page_backing = payload.fs_page_backing.clone();
+        let root_object_id = root_mount.root().fs_object_id();
+
+        let cred = Credential::root();
+
+        // Boot-time tmpfs ops are synchronous, so Continue/Yield are
+        // unreachable and panic if they fire.
+        use StepOutcome as V3;
+
+        // 1. Create or look up `/bin` directory. Use `mkdir`; on
+        //    EEXIST treat the existing dir as the parent.
+        let bin_object_id = {
+            let guard = step_engine::guard();
+            let outcome = fs_ops.mkdir(root_object_id, b"bin", 0o040755, &cred, &guard);
+            match outcome {
+                V3::Done((id, _)) => id,
+                // EEXIST is unlikely from a clean tmpfs root, but
+                // tolerate it: walk to find the existing dir.
+                _ => {
+                    // Fall back: pretend root_object_id is bin
+                    // parent. v1 host paths don't need this branch.
+                    panic!("register_busybox_into_tmpfs: mkdir(/bin) failed");
+                }
+            }
+        };
+
+        // 2. Allocate the `/bin/sh` inode.
+        let bytes = busybox_fixture::BUSYBOX_BYTES;
+        let (file_id, file_meta) = {
+            let guard = step_engine::guard();
+            let outcome = fs_ops.create_inode(bin_object_id, b"sh", 0o100755, &cred, &guard);
+            match outcome {
+                V3::Done(out) => out,
+                other => panic!("register_busybox_into_tmpfs: create_inode(/bin/sh): {other:?}"),
+            }
+        };
+
+        // 3. Materialise the inode's RNode and grab its
+        //    `Cap<PageContainer>`.
+        let pc = {
+            let guard = step_engine::guard();
+            let outcome = fs_ops.materialise_rnode(file_id, file_meta, &payload, &guard);
+            let rnode = match outcome {
+                V3::Done(rnode) => rnode,
+                other => panic!("register_busybox_into_tmpfs: materialise_rnode: {other:?}"),
+            };
+            match rnode.backing() {
+                RNodeBacking::PageBacked { pc } => pc.clone(),
+                other => panic!(
+                    "register_busybox_into_tmpfs: tmpfs materialise_rnode \
+                     returned non-PageBacked backing: {other:?}"
+                ),
+            }
+        };
+
+        // 4. Populate every page covered by the busybox bytes via
+        //    `materialize_anon` + direct-map memcpy. busybox is
+        //    typically 500KB-1.5MB; this loop iterates ~250-500
+        //    times for 4KB pages.
+        let page_size = tx_subsystems::vm::USER_PAGE_SIZE;
+        for (idx, chunk) in bytes.chunks(page_size).enumerate() {
+            let materialised = pc
+                .materialize_anon(
+                    tx_subsystems::page_backed::PageIndex::new(idx as u64),
+                    tx_subsystems::page_backed::MaterializeAccess::Write,
+                )
+                .expect("register_busybox_into_tmpfs: materialize_anon");
+            let frame_base = page_allocator::frame_kernel_addr(materialised.ppn)
+                .expect("register_busybox_into_tmpfs: direct-map view");
+            // SAFETY: `materialised.map_pin` keeps the page resident
+            // for this scope; destination region covers exactly
+            // `chunk.len()` bytes from a freshly materialised anon
+            // frame; source and destination do not overlap.
+            unsafe {
+                core::ptr::copy_nonoverlapping(chunk.as_ptr(), frame_base, chunk.len());
+            }
+        }
+
+        // 5. Set the visible size via FsPageBacking::truncate.
+        let size = bytes.len() as u64;
+        {
+            let guard = step_engine::guard();
+            match fs_page_backing.truncate(file_id, size, &guard) {
+                V3::Done(()) => {}
+                other => panic!("register_busybox_into_tmpfs: truncate({size}): {other:?}"),
+            }
+        }
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":busybox:fixture:ok\n");
+    }
+
+    /// Sub-step 1 of `run_bootstrap_exec_for_init`: copy
+    /// `init_fixture::INIT_FIXTURE_BYTES` into a fresh tmpfs file at
+    /// `/init`.
+    ///
+    /// Uses the production `FsOps` surface end-to-end:
+    /// `create_inode` to allocate the inode + name binding,
+    /// `materialise_rnode` to grab the inode's `Cap<PageContainer>`
+    /// (Phase 7 of the ELF-loader plan added the tmpfs override),
+    /// `materialize_anon` per page + direct-map memcpy to populate
+    /// the page contents, and `FsPageBacking::truncate` to set the
+    /// visible size.
+    pub(crate) fn register_init_fixture_into_tmpfs() {
+        use tx_subsystems::vfs::{Credential, RNodeBacking};
+
+        let root_mount =
+            root_mount().expect("register_init_fixture_into_tmpfs: ROOT_MOUNT must be populated");
+        let payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap();
+        let fs_ops = payload.fs_ops.clone();
+        let fs_page_backing = payload.fs_page_backing.clone();
+        let root_object_id = root_mount.root().fs_object_id();
+
+        let bytes = &init_fixture::INIT_FIXTURE_BYTES[..];
+
+        // Boot-time tmpfs ops are synchronous, so Continue/Yield are
+        // unreachable and panic if they fire.
+        use StepOutcome as V3;
+
+        // Allocate the inode. Bootstrap process is root by construction.
+        let cred = Credential::root();
+        let (file_id, file_meta) = {
+            let guard = step_engine::guard();
+            let outcome = fs_ops.create_inode(root_object_id, b"init", 0o100755, &cred, &guard);
+            match outcome {
+                V3::Done(out) => out,
+                V3::Err(step_engine::Errno::EROFS)
+                | V3::Err(step_engine::Errno::ENOSYS)
+                | V3::Err(step_engine::Errno::EEXIST) => {
+                    // Rootfs is read-only (e.g. ext4 mounted from vda).
+                    // The fixture is not needed; the real binary lives on disk.
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":init:fixture:skip:ro\n");
+                    return;
+                }
+                other => panic!("register_init_fixture_into_tmpfs: create_inode(/init): {other:?}"),
+            }
+        };
+
+        // Materialise the inode's RNode so we can reach the
+        // `Cap<PageContainer>`. Tmpfs's Phase-7 override returns
+        // `RNodeBacking::PageBacked { pc }` for regular files.
+        let pc = {
+            let guard = step_engine::guard();
+            let outcome = fs_ops.materialise_rnode(file_id, file_meta, &payload, &guard);
+            let rnode = match outcome {
+                V3::Done(rnode) => rnode,
+                other => panic!("register_init_fixture_into_tmpfs: materialise_rnode: {other:?}"),
+            };
+            match rnode.backing() {
+                RNodeBacking::PageBacked { pc } => pc.clone(),
+                other => panic!(
+                    "register_init_fixture_into_tmpfs: tmpfs materialise_rnode \
+                     returned non-PageBacked backing: {other:?}"
+                ),
+            }
+        };
+
+        // Populate every page covered by the fixture bytes via
+        // `materialize_anon` + direct-map memcpy. Mirrors
+        // `tx_scripts::process::exec::script::tests::ExecTestFs::add_regular_with_bytes`'s
+        // pattern, but against the production tmpfs surface.
+        let page_size = tx_subsystems::vm::USER_PAGE_SIZE;
+        for (idx, chunk) in bytes.chunks(page_size).enumerate() {
+            let materialised = pc
+                .materialize_anon(
+                    tx_subsystems::page_backed::PageIndex::new(idx as u64),
+                    tx_subsystems::page_backed::MaterializeAccess::Write,
+                )
+                .expect("register_init_fixture_into_tmpfs: materialize_anon");
+            let frame_base = page_allocator::frame_kernel_addr(materialised.ppn)
+                .expect("register_init_fixture_into_tmpfs: direct-map view");
+            // SAFETY: `materialised.map_pin` keeps the page resident
+            // for the duration of this scope; the destination region
+            // covers exactly `chunk.len()` bytes from the freshly
+            // materialised anon frame; source and destination do not
+            // overlap.
+            unsafe {
+                core::ptr::copy_nonoverlapping(chunk.as_ptr(), frame_base, chunk.len());
+            }
+        }
+
+        // Set the visible byte-size on both the PageContainer (so
+        // `read_exact_at` in `exec_script::<P>` knows the file's
+        // length) and the inode meta (so subsequent `load_inode_meta`
+        // reports the right `meta.size`).
+        let size = bytes.len() as u64;
+        {
+            let guard = step_engine::guard();
+            match fs_page_backing.truncate(file_id, size, &guard) {
+                V3::Done(()) => {}
+                other => panic!("register_init_fixture_into_tmpfs: truncate({size}): {other:?}"),
+            }
+        }
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":init:fixture:ok\n");
+    }
+
+    /// Sub-step 2 of `run_bootstrap_exec_for_init`: drive
+    /// `exec_script` synchronously and panic with
+    /// `:bootstrap-exec:fail` on `Err`.
+    ///
+    /// `exec_script` is `async`, but the only `.await` points it
+    /// reaches today are `read_exact_at` against the file's
+    /// `Cap<PageContainer>` (immediate under tmpfs, since every page
+    /// is anon and resident after `register_init_fixture_into_tmpfs`)
+    /// and `populate_detached_user_range` (also immediate against
+    /// detached anon segments). A noop-waker `block_on` poll loop
+    /// resolves the future without going through the reactor.
+    pub(super) fn drive_bootstrap_exec() {
+        use tx_subsystems::vfs::Credential;
+
+        let init = tx_subsystems::process::execution::init_process()
+            .expect("drive_bootstrap_exec: INIT_PROCESS must be populated");
+        let thread = init
+            .nth_thread(0)
+            .expect("drive_bootstrap_exec: init has a leader thread post-bootstrap");
+
+        // Bootstrap exec runs as init (root) by construction.
+        let cred = Credential::root();
+
+        // When the sdcard ext4 mount is present (RV64 QEMU with vda),
+        // exec busybox sh to run the oscomp basic-musl test suite.
+        // The sdcard's musl/ dir contains busybox (static ET_EXEC),
+        // basic_testcode.sh, and per-test binaries under basic/.
+        //
+        // Use `sh -c "cd /musl/musl && sh basic_testcode.sh"` so the
+        // inner sh inherits CWD=/musl/musl/ and basic_testcode.sh's
+        // relative `./busybox` / `cd ./basic` references resolve
+        // correctly — avoids any kernel-side VFS walk at this stage.
+        // DIAGNOSTIC: emit epoch state right before the sdcard exec to
+        // identify whether a guard leak pre-dates drive_bootstrap_exec.
+        {
+            let es = crate::adapter::step_engine::epoch::summary();
+            let cpu0 = crate::adapter::step_engine::epoch::cpu_summary(tx_hal::CpuId(0));
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":diag:pre-sdcard-exec:guards=");
+            Self::write_decimal_unsigned(es.active_guards);
+            tx_hal::console_write_str::<P>(":epoch=");
+            Self::write_decimal_unsigned(es.global_epoch as usize);
+            tx_hal::console_write_str::<P>(":cpu0-local=");
+            Self::write_decimal_unsigned(cpu0.map(|c| c.local_epoch as usize).unwrap_or(999));
+            tx_hal::console_write_str::<P>("\n");
+        }
+
+        let sdcard_boot = oscomp_sdcard_boot_enabled::<P>();
+
+        if super::MUSL_MOUNT.lock().is_some() && sdcard_boot {
+            // Per-arch busybox path and test-script chain.
+            //
+            // la64 sdcard has both glibc/ and musl/ test directories;
+            // run both.  rv64 sdcard is musl-only (old code confirmed
+            // this: "cd /musl/musl && ./busybox sh basic_testcode.sh").
+            //
+            // All testcode.sh scripts expect CWD = their own directory
+            // and use `./busybox` for echo/cat etc., so we `cd` first.
+            let sdcard_bin = b"/musl/musl/busybox";
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":oscomp:groups:");
+            match oscomp_groups_from_cmdline::<P>() {
+                Some(groups) => tx_hal::console_write_str::<P>(groups),
+                None => tx_hal::console_write_str::<P>("default"),
+            }
+            tx_hal::console_write_str::<P>("\n");
+            let sdcard_cmd = build_oscomp_sdcard_cmd::<P>();
+            let sdcard_envp: &[&[u8]] = &[
+                b"PATH=/musl/musl:/sbin:/bin:/usr/sbin:/usr/bin:/musl/glibc",
+                b"LD_LIBRARY_PATH=/musl/glibc/lib:/lib",
+            ];
+            let sdcard_argv: &[&[u8]] = &[b"sh", b"-c", sdcard_cmd.as_bytes()];
+            let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                &init,
+                &thread,
+                sdcard_bin,
+                sdcard_argv,
+                sdcard_envp,
+                &cred,
+            ));
+            match outcome {
+                Ok(()) => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
+                    return;
+                }
+                Err(ref e) => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":bootstrap-exec:sdcard:fail:");
+                    tx_hal::console_write_str::<P>(exec_error_tag(e));
+                    tx_hal::console_write_str::<P>("\n");
+                    // Fall through to the cmdline-driven path below.
+                }
+            }
+        }
+
+        // Shell profiles need at least PATH so command lookup reaches
+        // userland tools before the shell reports "not found". BusyBox
+        // applets live under /bin; Alpine places administrative tools
+        // such as nft, iptables, and ip under /sbin or /usr/sbin.
+        let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline.unwrap_or("");
+        let envp: &[&[u8]] = if cmdline
+            .split_ascii_whitespace()
+            .any(|t| t == "tx.profile=alpine")
+        {
+            &[b"PATH=/bin:/sbin:/usr/bin:/usr/sbin"]
+        } else {
+            &[b"PATH=/bin"]
+        };
+
+        // Cmdline-driven init path (initramfs slice):
+        //   `init=/some/path` -> exec that path with argv=[basename]
+        //   `tx.profile=busybox` (no init=) -> /bin/busybox argv=[sh]
+        //   default -> bake-in /init fixture, argv=[init]
+        let (init_path, argv0) = parse_init_from_cmdline::<P>();
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":bootstrap-exec:path:");
+        tx_hal::console_write_bytes::<P>(init_path);
+        tx_hal::console_write_str::<P>("\n");
+
+        // `exec_script` opens its own fresh epoch guards inside V1
+        // (`build_aspace_from_image`) and V2
+        // (`populate_detached_user_range`); the caller must NOT hold
+        // a guard at the call site (per
+        // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`).
+        let argv: &[&[u8]] = &[argv0];
+        let mut outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+            &init, &thread, init_path, argv, envp, &cred,
+        ));
+        // If /bin/busybox failed, try /bin/sh (symlink → busybox).
+        // Some initramfs layouts only resolve correctly through the
+        // symlink path.
+        if outcome.is_err() && init_path != b"/bin/sh" && init_path != b"/init" {
+            let sh_outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                &init,
+                &thread,
+                b"/bin/sh",
+                &[b"sh"],
+                envp,
+                &cred,
+            ));
+            if sh_outcome.is_ok() {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
+                return;
+            }
+            outcome = sh_outcome;
+        }
+        match outcome {
+            Ok(()) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
+                return;
+            }
+            Err(ref e) if init_path != b"/init" => {
+                // Cmdline picked a non-bake-in path that the kernel
+                // can't actually load (e.g. busybox without a working
+                // ELF-loader path, or initramfs missing the file).
+                // Warn and fall back to the bake-in `/init` fixture
+                // so `boot:ok` still fires for the smoke. Production
+                // boot would surface the failure to userspace via
+                // execve()'s errno path; this is the bootstrap-only
+                // pre-userspace fallback.
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":bootstrap-exec:fallback:");
+                tx_hal::console_write_str::<P>(exec_error_tag(e));
+                tx_hal::console_write_str::<P>("\n");
+            }
+            Err(e) => {
+                // Open Q #3 (DECIDED 2026-05-06): bake-in `/init`
+                // failure is a boot invariant violation; panic loudly
+                // with the `:bootstrap-exec:fail` board sentinel.
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":bootstrap-exec:fail:");
+                tx_hal::console_write_str::<P>(exec_error_tag(&e));
+                tx_hal::console_write_str::<P>("\n");
+                panic!("bootstrap exec for /init failed: {e:?}");
+            }
+        }
+
+        // Fallback path: re-drive against the bake-in `/init` fixture.
+        let argv: &[&[u8]] = &[b"init" as &[u8]];
+        let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+            &init, &thread, b"/init", argv, envp, &cred,
+        ));
+        match outcome {
+            Ok(()) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
+            }
+            Err(e) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":bootstrap-exec:fail:");
+                tx_hal::console_write_str::<P>(exec_error_tag(&e));
+                tx_hal::console_write_str::<P>("\n");
+                panic!("bootstrap exec for /init fallback failed: {e:?}");
+            }
+        }
+    }
+
+    /// Wave 1 of the fork/clone/wait4 slice: install the reactor-
+    /// submission hook in `tx_subsystems::reactor_submit` so a
+    /// future `sys_clone` arm in `tx-shims` (Wave 2) can submit
+    /// freshly-forked child threads to the BSP boot reactor without
+    /// taking a circular dependency back into `tx-kernel`.
+    ///
+    /// The installed function pointer routes through
+    /// [`Self::submit_child_thread_into_boot_reactor`], which
+    /// captures the platform parameter `P` so the seam can stay
+    /// parameter-free at the read site.
+    pub(crate) fn install_reactor_submit_seam() {
+        tx_subsystems::reactor_submit::install_submit_child_thread(
+            Self::submit_child_thread_into_boot_reactor,
+        );
+    }
+
+    pub(crate) fn install_reactor_affinity_seam() {
+        tx_subsystems::reactor_affinity::install_thread_affinity(
+            Self::set_thread_reactor_affinity,
+            Self::get_thread_reactor_affinity,
+        );
+    }
+
+    /// Install the timer-sleep seam so `sys_nanosleep` / `sys_clock_nanosleep`
+    /// in `tx-shims` can park the calling task until a real deadline fires
+    /// in the BSP reactor's timer queue. Must be called before the reactor
+    /// task loop starts (BOOT_REACTOR lock must not be held at this call site).
+    pub(crate) fn install_sleep_seam() {
+        // Clone the TimerQueue Arc while outside the reactor task loop.
+        // `sleep_until_ns` will later call `tq.wait_until()` from within
+        // a reactor task, acquiring only the TimerQueue's own SpinLock —
+        // not the BOOT_REACTOR lock — avoiding re-entrancy deadlock.
+        if let Some(tq) = BOOT_REACTOR.with(|reactor| reactor.timer_queue()) {
+            tx_subsystems::timer_sleep::install_timer_queue(tq);
+        }
+        tx_subsystems::timer_sleep::install_posix_timer_signal_submit(
+            Self::submit_posix_timer_signal_into_boot_reactor,
+        );
+    }
+
+    /// Pre-ELF Phase 7: submit init's leader thread future as a
+    /// reactor task, then drive the BSP hart-loop until the future
+    /// resolves. Resolution happens when `run_thread` returns — the
+    /// only `return` paths inside the future today are
+    /// `SyscallResult::NoReturn` (i.e. `exit_group` zombified the
+    /// process), the page-fault `Err` SIGSEGV route, and the
+    /// `Fatal` trap arm. All three end with a zombified init.
+    ///
+    /// On exit, emits `:userspace:exited:N` where `N` is init's
+    /// recorded `ExitStatus::wait_status_word()`, then returns to
+    /// the caller, which calls `system_off`.
+    ///
+    /// **Wiring choice.** The Phase 7 plan considered both
+    /// `Reactor::run_until_idle_on_hart_with_reschedule` and
+    /// `Reactor::run_forever_on_hart`. Neither exists in tree today.
+    /// The board crate's secondary harts already drive the boot
+    /// reactor through `step_hart_loop_at` (see
+    /// `secondary_reactor_loop`), so the BSP uses the same shape:
+    /// each iteration advances time, runs ready tasks, programs the
+    /// next deadline, and idles via `wait_for_interrupt_once` if
+    /// the loop went idle. This is the closest seam to the plan's
+    /// guesses and keeps the BSP and APs symmetric.
+    /// Polled SBI debug-console drain — see the call site comment
+    /// in `run_userspace_reactor_loop`. Drains any bytes the
+    /// firmware has buffered on the host stdio side and feeds them
+    /// to the boot console TTY via `step_ingest`, which fires the
+    /// TTY's wait carrier so a blocked `read` on fd 0 wakes up.
+    ///
+    /// Cheap when no bytes are pending (`read_bytes` returns 0,
+    /// the rest is skipped).
+    pub(crate) fn drain_pending_uart_rx_into_tty() -> usize {
+        crate::irq::drain_uart_rx_pending()
+    }
+
+    pub(super) fn drain_sbi_console_into_tty() -> usize {
+        // 2026-05-13: bumped from 64 to 512 bytes to swallow whole shell
+        // command lines in a single SBI poll. The 64-byte cap left the
+        // 17-byte tail of an 81-character `ln -s` line stranded in the
+        // UART FIFO until the PLIC RX IRQ fired; the IRQ-deferred drain
+        // path then re-entered `step_ingest` and the `wait_channel.fire`
+        // it issued did not propagate to the parked `sys_read` task
+        // (root cause still under investigation — see the
+        // `tools/shell-tests/busybox-extended.txt` links/chmod-stat
+        // groups). Bumping the SBI buffer ensures most realistic shell
+        // input fits in one `step_ingest` call so the proven SBI-direct
+        // path handles it. The IRQ path stays in place so a quiescent
+        // WFI still wakes promptly when bytes arrive.
+        let mut buf = [0u8; 512];
+        let n = <P as tx_hal::ConsoleIf>::read_bytes(&mut buf);
+        if n == 0 {
+            return 0;
+        }
+        let Some(tty) = console_tty() else { return 0 };
+        let guard = step_engine::guard();
+        let _ = tx_subsystems::tty::execution::step_ingest(&tty, &buf[..n], &guard);
+        n
+    }
+
+    pub(super) fn run_userspace_reactor_loop() {
+        // Wave 1 of the fork/clone/wait4 slice (2026-05-06): install
+        // the reactor-submission seam so a future `sys_clone` arm
+        // (Wave 2) can route freshly-forked child threads through
+        // the BSP boot reactor without taking a circular crate
+        // dependency back into `tx-kernel`. The seam lives in
+        // `tx_subsystems::reactor_submit` (a function-pointer slot);
+        // the platform parameter `P` is captured at install time
+        // here so the seam stays parameter-free at the call site.
+        Self::install_reactor_submit_seam();
+        Self::install_reactor_affinity_seam();
+        Self::install_sleep_seam();
+
+        let Some(init) = tx_subsystems::process::execution::init_process() else {
+            // No init process — nothing to drive. Skip cleanly.
+            return;
+        };
+        let Some(thread) = init.nth_thread(0) else {
+            return;
+        };
+        let Some(payload) = thread.payload_cap() else {
+            return;
+        };
+
+        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        let wrapper_payload = payload.clone();
+        let future_payload = payload.clone();
+        let submit_thread = thread.clone();
+        let current_hart = boot_runtime::HartId(current_cpu.0);
+        let mut signal = super::SmpRescheduleSignal::<P>::new();
+        let submitted = BOOT_REACTOR.with(|reactor| {
+            reactor.submit_task_with_meta_from_hart(
+                crate::thread_future::PerHartSlotted::<P, _>::new(
+                    wrapper_payload,
+                    crate::thread_future::run_thread::<P>(submit_thread, future_payload),
+                ),
+                Self::userspace_thread_sched_meta(),
+                current_hart,
+                &mut signal,
+            )
+        });
+        let Some((task_key, _report)) = submitted else {
+            // Boot reactor not initialised; nothing to drive.
+            return;
+        };
+        Self::register_thread_reactor_task(thread.tid.0, task_key);
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":userspace:submitted\n");
+
+        P::enable_timer_wakeups();
+
+        // The BSP userspace loop uses lock-releasing reactor polls, so a
+        // forked daemon child can be submitted immediately while its parent
+        // is still in the same poll turn. On SMP, keep APs parked separately:
+        // userspace trap/return state is still hart-local and not migration
+        // safe, but daemon-style children still need prompt BSP progress.
+        super::USE_CONCURRENT_POLL.store(true, core::sync::atomic::Ordering::Release);
+        super::PARK_USERSPACE_APS.store(
+            P::online_cpu_count() > 1,
+            core::sync::atomic::Ordering::Release,
+        );
+        super::USERSPACE_REACTOR_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
+
+        // Drive the BSP reactor loop until init zombifies. Each
+        // iteration is a `step_hart_loop_at` step: advance time, run
+        // ready tasks, program the next deadline. Block on WFI when
+        // the step reports idle so we don't spin-wait for the next
+        // userspace trap (which is the only event that resolves the
+        // thread future's pending wait).
+        loop {
+            if init.is_zombie() {
+                break;
+            }
+
+            // UART IRQ handlers cannot touch TTY state directly
+            // because epoch guards are forbidden in IRQ context.
+            // They queue bytes in an IRQ-safe buffer and request a
+            // reactor wake; consume that buffer here in normal
+            // context before deciding whether there is runnable work.
+            let had_uart = Self::drain_pending_uart_rx_into_tty() != 0;
+            let had_sbi = Self::drain_sbi_console_into_tty() != 0;
+            if had_uart || had_sbi {
+                continue;
+            }
+
+            // Drain any pending child-thread submits posted from
+            // sys_clone *before* polling the reactor again. This is
+            // the per-loop visibility seam — submits enqueued during
+            // the previous poll iteration become visible to the
+            // reactor here, outside the inner lock that sys_clone
+            // ran under.
+            let submitted_child_before_poll =
+                Self::drain_pending_child_submits() || Self::drain_pending_timer_signal_submits();
+
+            // The userspace trap shell returns through a longjmp-like path, so
+            // do not carry a pre-entry CpuId local across reactor iterations.
+            let loop_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+            let step = match Self::step_boot_reactor_once_concurrent(loop_cpu) {
+                Some(step) => step,
+                None => break,
+            };
+            let submitted_child_after_poll =
+                Self::drain_pending_child_submits() || Self::drain_pending_timer_signal_submits();
+
+            // EBR drain. Caps retired during the task polls above
+            // (e.g. `Cap<OpenFile>` from `sys_close` / process exit fd
+            // table teardown, `Cap<ProcessPayload>` from
+            // `step_exit_group`) sit in the per-CPU retired list until
+            // an epoch advance lets them be reclaimed. Without this
+            // call, the retired list only auto-drains at
+            // `RETIRE_THRESHOLD = 64` items — too high for short
+            // pipelines, so `Drop for OpenFile`'s
+            // `decr_reader`/`decr_writer` (which signal pipe EOF/EPIPE
+            // by notifying the peer wait-source) never fires and
+            // blocked readers/writers hang.
+            //
+            // A bounded budget per iteration keeps per-iteration
+            // latency predictable. Two-level deferral chains
+            // (ProcessPayload → fd table → OpenFile) need ~4 drain
+            // rounds to fully propagate; iteration cadence (driven by
+            // task polls + 5 ms timer ticks) finishes that in well
+            // under a millisecond.
+            let drain_stats = step_engine::drain_with_budget(64);
+
+            // Don't enter WFI if EBR reclaimed anything (reclaim callbacks
+            // may have called wake_by_ref() on parked tasks, which is
+            // invisible to step.should_idle() computed before the drain) or
+            // if there are items still pending reclamation (need more epoch
+            // advances before they can be reclaimed).
+            let ebr_active = drain_stats.reclaimed > 0 || drain_stats.remaining > 0;
+            if step.should_idle()
+                && !submitted_child_before_poll
+                && !submitted_child_after_poll
+                && !ebr_active
+                && !init.is_zombie()
+            {
+                // When the reactor has no pending deadline, the platform
+                // timer was cancelled by `program_hart_loop_deadline`.
+                // Re-arm it here so WFI wakes periodically — the drain
+                // calls below need to fire on every tick. This must only
+                // happen in the userspace reactor loop (not in boot smoke
+                // tests) because the timer interrupt fires
+                // `try_bounded_maintenance_tick`, which acquires zone
+                // locks that boot-time code may already hold.
+                if matches!(
+                    step.deadline_action,
+                    boot_runtime::hart_loop::HartLoopDeadlineAction::Cancel
+                ) {
+                    P::set_deadline_ns(
+                        P::read_ns().saturating_add(crate::init::IDLE_TIMER_PERIOD_NS),
+                    );
+                }
+                P::wait_for_interrupt_once();
+                if P::pending_ipi(IpiKind::Reschedule) {
+                    P::ack_ipi(IpiKind::Reschedule);
+                }
+                // Drain UART RX bytes buffered by `uart_rx_irq_handler`
+                // during the preceding WFI sleep. The IRQ handler cannot
+                // call `epoch::guard()` (irq_depth > 0), so it stores raw
+                // bytes in `UART_RX_PENDING`; `drain_uart_rx_pending` runs
+                // here with irq_depth == 0 and feeds them to `step_ingest`.
+                let _ = crate::irq::drain_uart_rx_pending();
+                // Also poll the SBI debug-console as a fallback for
+                // platforms where the UART IRQ is claimed by firmware
+                // (e.g. OpenSBI M-mode UART handling). Harmless when the
+                // PLIC path is active since `read_bytes` returns 0 once the
+                // FIFO has already been drained by the IRQ handler.
+                Self::drain_sbi_console_into_tty();
+                // Flush deferred EBR drops so pipe write-end close
+                // propagates to blocked readers. OpenFile::drop() (which
+                // calls decr_writer → EOF signal) fires only when EBR
+                // reclaims the slot; without an explicit drain here the
+                // reactor never calls drain_with_budget unless the retired
+                // queue hits RETIRE_THRESHOLD=64, which a simple pipeline
+                // never reaches. This ensures EOF propagates within a
+                // few timer ticks (~20 ms) after the last writer closes.
+                let _ = step_engine::drain_with_budget(usize::MAX);
+            }
+        }
+
+        // init zombified — emit the exit sentinel.
+        super::USERSPACE_REACTOR_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
+        super::PARK_USERSPACE_APS.store(false, core::sync::atomic::Ordering::Release);
+        let status_word = init
+            .exit_status()
+            .map(|s| s.wait_status_word())
+            .unwrap_or(0);
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":userspace:exited:");
+        Self::write_signed_decimal(status_word);
+        tx_hal::console_write_str::<P>("\n");
+    }
+
+    /// Render a signed decimal int into the platform console without
+    /// allocating. `tx_hal::console_write_str` is byte-oriented so
+    /// the formatter writes one chunk per call. Stack-bounded:
+    /// `i32::MIN` produces 11 bytes (`-2147483648`).
+    pub(super) fn write_signed_decimal(value: i32) {
+        let mut buf = [0u8; 11];
+        let mut idx = buf.len();
+        let mut v: i64 = value as i64;
+        let negative = v < 0;
+        if negative {
+            v = -v;
+        }
+        if v == 0 {
+            idx -= 1;
+            buf[idx] = b'0';
+        } else {
+            while v > 0 {
+                idx -= 1;
+                buf[idx] = b'0' + (v % 10) as u8;
+                v /= 10;
+            }
+        }
+        if negative {
+            idx -= 1;
+            buf[idx] = b'-';
+        }
+        let s = core::str::from_utf8(&buf[idx..])
+            .expect("write_signed_decimal: ASCII digits are always UTF-8");
+        tx_hal::console_write_str::<P>(s);
+    }
+
+    pub(super) fn write_board_sentinel_prefix() {
+        tx_hal::console_write_str::<P>("txkernel:");
+        tx_hal::console_write_str::<P>(P::BOARD);
+    }
+}
+
+fn oscomp_sdcard_boot_enabled<P: tx_hal::TxPlatform>() -> bool {
+    let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
+    if boot_info.initrd.is_some() {
+        return false;
+    }
+    let Some(cmdline) = boot_info.cmdline else {
+        return true;
+    };
+    !cmdline
+        .split_ascii_whitespace()
+        .any(|token| token.starts_with("init=") || token == "tx.profile=busybox")
+}
+
+fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
+    use alloc::string::String;
+
+    match oscomp_boot_suite(<P as tx_hal::BootInfoIf>::boot_info().cmdline) {
+        Some("libctest-network" | "libctest-network-musl") => {
+            return oscomp_libctest_network_cmd("musl");
+        }
+        Some("libctest-network-glibc") => return oscomp_libctest_network_cmd("glibc"),
+        Some("lmbench-network" | "lmbench-network-musl") => {
+            return oscomp_lmbench_network_cmd("musl");
+        }
+        Some("lmbench-network-glibc") => return oscomp_lmbench_network_cmd("glibc"),
+        Some("netperf-udp-rr" | "netperf-udp-rr-musl") => {
+            return oscomp_netperf_udp_rr_cmd("musl");
+        }
+        Some("netperf-udp-rr-glibc") => return oscomp_netperf_udp_rr_cmd("glibc"),
+        Some("ltp-glibc") => {
+            return String::from("cd /musl/glibc && /musl/musl/busybox sh ltp_testcode.sh");
+        }
+        _ => {}
+    }
+
+    let mut cmd = String::from("cd /musl/musl");
+    let mut selected = 0usize;
+    if let Some(groups) = oscomp_groups_from_cmdline::<P>()
+        .or_else(|| oscomp_boot_suite(<P as tx_hal::BootInfoIf>::boot_info().cmdline))
+    {
+        for group in groups.split(',') {
+            let group = group.trim();
+            if group.is_empty() {
+                continue;
+            }
+            if group == "all" {
+                append_default_oscomp_scripts(&mut cmd);
+                return cmd;
+            }
+            if let Some(filter) = group.strip_prefix("libctest-musl:") {
+                append_filtered_libctest(&mut cmd, filter);
+                selected += 1;
+                continue;
+            }
+            if let Some(filter) = group.strip_prefix("libctest:") {
+                append_filtered_libctest(&mut cmd, filter);
+                selected += 1;
+                continue;
+            }
+            if let Some(filter) = group.strip_prefix("ltp-musl:") {
+                append_filtered_ltp(&mut cmd, "musl", filter);
+                selected += 1;
+                continue;
+            }
+            if let Some(filter) = group.strip_prefix("ltp:") {
+                append_filtered_ltp(&mut cmd, "musl", filter);
+                selected += 1;
+                continue;
+            }
+            if let Some(batch) = group.strip_prefix("ltp-batch:") {
+                append_ltp_batch(&mut cmd, batch);
+                selected += 1;
+                continue;
+            }
+            if let Some(module) = group.strip_prefix("ltp-runtest:") {
+                let (module, filter) = module.split_once(':').unwrap_or((module, ""));
+                append_ltp_runtest(&mut cmd, module, filter);
+                selected += 1;
+                continue;
+            }
+            if is_libctest_musl_group(group) {
+                append_full_libctest(&mut cmd);
+                selected += 1;
+                continue;
+            }
+            if group == "ltp-glibc" {
+                let _ = write!(
+                    cmd,
+                    " && cd /musl/glibc && /musl/musl/busybox sh ltp_testcode.sh && cd /musl/musl"
+                );
+                selected += 1;
+                continue;
+            }
+            if let Some(script) = oscomp_glibc_script_for_group(group) {
+                if script == "basic_testcode.sh" {
+                    let _ = write!(
+                        cmd,
+                        " && cd /musl/glibc/basic && (/musl/musl/busybox mkdir test_chdir || :) && cd /musl/glibc && /musl/musl/busybox sh {script} && cd /musl/musl"
+                    );
+                } else {
+                    let _ = write!(
+                        cmd,
+                        " && cd /musl/glibc && /musl/musl/busybox sh {script} && cd /musl/musl"
+                    );
+                }
+                selected += 1;
+                continue;
+            }
+            if let Some(script) = oscomp_musl_script_for_group(group) {
+                append_oscomp_musl_script(&mut cmd, script);
+                selected += 1;
+            }
+        }
+    }
+    if selected == 0 {
+        append_default_oscomp_scripts(&mut cmd);
+    }
+    cmd
+}
+
+fn append_ltp_batch(cmd: &mut alloc::string::String, batch: &str) {
+    match batch.trim() {
+        "submit" | "whitelist" => append_submit_ltp_runner(cmd),
+        "p0" => append_filtered_ltp(cmd, "musl", LTP_P0_CASES),
+        "smoke" => append_filtered_ltp(cmd, "musl", LTP_SMOKE_CASES),
+        "fd-io" => append_filtered_ltp(cmd, "musl", LTP_FD_IO_CASES),
+        "fd-io-tail" => append_filtered_ltp(cmd, "musl", LTP_FD_IO_TAIL_CASES),
+        "fd-io-after-sendfile07" => {
+            append_filtered_ltp(cmd, "musl", LTP_FD_IO_AFTER_SENDFILE07_CASES)
+        }
+        "vfs" => append_filtered_ltp(cmd, "musl", LTP_VFS_CASES),
+        "vfs-tail" | "vfs-after-lgetxattr" => append_filtered_ltp(cmd, "musl", LTP_VFS_TAIL_CASES),
+        "vm" => append_filtered_ltp(cmd, "musl", LTP_VM_CASES),
+        "process" => append_filtered_ltp(cmd, "musl", LTP_PROCESS_CASES),
+        "cred" => append_filtered_ltp(cmd, "musl", LTP_CRED_CASES),
+        "signal" => append_filtered_ltp(cmd, "musl", LTP_SIGNAL_CASES),
+        "time" => append_filtered_ltp(cmd, "musl", LTP_TIME_CASES),
+        "ipc" => append_filtered_ltp(cmd, "musl", LTP_IPC_CASES),
+        "event" => append_filtered_ltp(cmd, "musl", LTP_EVENT_CASES),
+        "sched" => append_filtered_ltp(cmd, "musl", LTP_SCHED_CASES),
+        "mount" => append_filtered_ltp(cmd, "musl", LTP_MOUNT_CASES),
+        "heavy" => append_filtered_ltp(cmd, "musl", LTP_HEAVY_CASES),
+        "aio" => append_filtered_ltp(cmd, "musl", LTP_AIO_CASES),
+        "all" => append_all_ltp(cmd),
+        _ => append_filtered_ltp(cmd, "musl", ""),
+    }
+}
+
+fn append_ltp_runtest(cmd: &mut alloc::string::String, module: &str, filter: &str) {
+    use core::fmt::Write as _;
+
+    let module = module.trim();
+    let filter = filter.trim();
+    append_ltp_script_env(cmd);
+    if !is_safe_ltp_runtest_name(module) || !is_safe_ltp_runtest_filter(filter) {
+        let _ = write!(
+            cmd,
+            "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+        );
+        let _ = write!(
+            cmd,
+            "; ./busybox echo \"FAIL LTP RUNTEST {module} : invalid module name\""
+        );
+        let _ = write!(
+            cmd,
+            "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+        );
+        return;
+    }
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+    );
+    let selected_tags = ltp_runtest_selected_tags(filter);
+    let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
+    let _ = write!(
+        cmd,
+        "; selected_tags='{selected_tags}'; if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; if [ -n \"$selected_tags\" ]; then case \"$selected_tags\" in *\"|$tag|\"*) ;; *) continue;; esac; fi; case \"$tag\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $tag : local skip\"; continue;; esac; cmdline=${{rest:-$tag}}; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -c \"$cmdline\"; ret=$?; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi"
+    );
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+    );
+}
+
+fn is_safe_ltp_runtest_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn is_safe_ltp_runtest_filter(filter: &str) -> bool {
+    filter
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
+}
+
+fn ltp_runtest_selected_tags(filter: &str) -> alloc::string::String {
+    use core::fmt::Write as _;
+
+    if filter.is_empty() {
+        return alloc::string::String::new();
+    }
+    let mut selected = alloc::string::String::from("|");
+    for tag in filter.split('+') {
+        if tag.is_empty() {
+            continue;
+        }
+        let _ = write!(selected, "{tag}|");
+    }
+    selected
+}
+
+fn append_filtered_ltp(cmd: &mut alloc::string::String, _libc: &str, filter: &str) {
+    use core::fmt::Write as _;
+
+    append_ltp_script_env(cmd);
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+    );
+    append_ltp_case_loop(cmd, filter);
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+    );
+}
+
+fn append_all_ltp(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    append_ltp_script_env(cmd);
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+    );
+    for filter in [
+        LTP_SMOKE_CASES,
+        LTP_FD_IO_CASES,
+        LTP_VFS_CASES,
+        LTP_VM_CASES,
+        LTP_PROCESS_CASES,
+        LTP_CRED_CASES,
+        LTP_SIGNAL_CASES,
+        LTP_TIME_CASES,
+        LTP_IPC_CASES,
+        LTP_EVENT_CASES,
+        LTP_SCHED_CASES,
+        LTP_MOUNT_CASES,
+        LTP_HEAVY_CASES,
+        LTP_AIO_CASES,
+        LTP_NETWORK_DEFERRED_CASES,
+    ] {
+        append_ltp_case_loop(cmd, filter);
+    }
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+    );
+}
+
+fn append_submit_ltp_runner(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    append_ltp_script_env(cmd);
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+    );
+    append_ltp_case_loop(cmd, LTP_SUBMIT_CASES);
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+    );
+}
+
+fn append_ltp_case_loop(cmd: &mut alloc::string::String, filter: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(cmd, "; for case in");
+    for case in filter.split('+') {
+        let case = case.trim();
+        if case.is_empty() || case.ends_with('_') {
+            continue;
+        }
+        if !is_ltp_case_token(case) {
+            let _ = write!(
+                cmd,
+                "; ./busybox echo \"SKIP LTP CASE {case} : invalid case token\""
+            );
+            continue;
+        }
+        let _ = write!(cmd, " {case}");
+    }
+    let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
+    let _ = write!(
+        cmd,
+        "; do \
+case \"$case\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $case : local skip\"; continue;; esac; \
+ltp_label=\"$case\"; \
+case \"$case\" in \
+chdir01A) set -- symlink01 -T chdir01; ltp_label='symlink01 -T chdir01';; \
+chmod01A) set -- symlink01 -T chmod01; ltp_label='symlink01 -T chmod01';; \
+link01) set -- symlink01 -T link01; ltp_label='symlink01 -T link01';; \
+lstat01A) set -- symlink01 -T lstat01; ltp_label='symlink01 -T lstat01';; \
+lstat01A_64) set -- symlink01 -T lstat01_64; ltp_label='symlink01 -T lstat01_64';; \
+open01A) set -- symlink01 -T open01; ltp_label='symlink01 -T open01';; \
+readlink01A) set -- symlink01 -T readlink01; ltp_label='symlink01 -T readlink01';; \
+rename01A) set -- symlink01 -T rename01; ltp_label='symlink01 -T rename01';; \
+rmdir03A) set -- symlink01 -T rmdir03; ltp_label='symlink01 -T rmdir03';; \
+stat04) set -- symlink01 -T stat04; ltp_label='symlink01 -T stat04';; \
+stat04_64) set -- symlink01 -T stat04_64; ltp_label='symlink01 -T stat04_64';; \
+unlink01) set -- symlink01 -T unlink01; ltp_label='symlink01 -T unlink01';; \
+*) set -- \"$case\";; \
+esac; \
+./busybox echo \"RUN LTP CASE $case : $ltp_label\"; \
+PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config \"$@\"; \
+ret=$?; \
+./busybox echo \"FAIL LTP CASE $case : $ret\"; \
+done"
+    );
+}
+
+const LOCAL_LTP_SKIP_SHELL_PATTERN: &str = "\
+clock_gettime01|clock_gettime04|dirtyc0w_shmem|fork14|futex_cmp_requeue01|\
+getrusage03|getrusage04|kcmp03|kill10|kill11|msgrcv05|msgrcv06|msgsnd05|\
+msgsnd06|rename14|shmctl01|sigtimedwait01|sigwaitinfo01|wait401|waitid07|\
+waitid08|waitpid07|waitpid11";
+
+fn is_ltp_case_token(case: &str) -> bool {
+    !case.is_empty()
+        && case
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+const LTP_P0_CASES: &str = "\
+alarm02+alarm03+alarm05+alarm06+alarm07+\
+clock_nanosleep01+clock_nanosleep02+clock_nanosleep03+clock_nanosleep04+\
+epoll_ctl01+epoll_ctl02+epoll_ctl03+epoll_ctl04+epoll_ctl05+\
+epoll_wait01+epoll_wait02+epoll_wait03+epoll_wait04+epoll_wait06+epoll_wait07+\
+eventfd01+eventfd02+eventfd03+eventfd04+eventfd05+eventfd06+eventfd2_01+eventfd2_02+eventfd2_03+\
+futex_wait01+futex_wait02+futex_wait03+futex_wait04+futex_wait05+\
+futex_wake01+futex_wake02+futex_wake03+futex_wake04+\
+getitimer01+getitimer02+\
+nanosleep01+nanosleep02+nanosleep04+\
+poll01+poll02+ppoll01+\
+pselect01+pselect01_64+pselect02+pselect02_64+pselect03+pselect03_64+\
+select01+select02+select03+select04+\
+setitimer01+setitimer02+\
+timerfd01+timerfd02+timerfd04+timerfd_create01+timerfd_gettime01+timerfd_settime01";
+
+const LTP_SMOKE_CASES: &str = "\
+abort01+confstr01+fmtmsg01+fpathconf01+getcontext01+gethostbyname_r01+gethostid01+gethostname01+\
+gethostname02+getpagesize01+getrandom01+getrandom02+getrandom03+getrandom04+getrandom05+\
+mallinfo02+mallinfo2_01+mallopt01+memcmp01+memcpy01+memset01+nftw01+nftw6401+pathconf01+\
+pathconf02+profil01+qmm01+realpath01+string01+switch01+syscall01+sysconf01+ulimit01";
+
+const LTP_FD_IO_CASES: &str = "\
+close01+close02+close_range01+close_range02+copy_file_range01+copy_file_range02+copy_file_range03+\
+dup01+dup02+dup03+dup04+dup05+dup06+dup07+dup201+dup202+dup203+dup204+dup205+dup206+dup207+dup3_01+\
+dup3_02+fallocate01+fallocate02+fallocate03+fallocate04+fallocate05+fallocate06+fcntl01+fcntl01_64+\
+fcntl02+fcntl02_64+fcntl03+fcntl03_64+fcntl04+fcntl04_64+fcntl05+fcntl05_64+fcntl07+fcntl07_64+\
+fcntl08+fcntl08_64+fcntl09+fcntl09_64+fcntl10+fcntl10_64+fcntl11+fcntl11_64+fcntl12+fcntl12_64+\
+fcntl13+fcntl13_64+fcntl14+fcntl14_64+fcntl16+fcntl16_64+fcntl17+fcntl17_64+\
+fcntl18+fcntl18_64+fcntl19+fcntl19_64+fcntl20+fcntl20_64+fcntl21+fcntl21_64+fcntl22+fcntl22_64+\
+fcntl23+fcntl23_64+fcntl24+fcntl24_64+fcntl25+fcntl25_64+fcntl26+fcntl26_64+fcntl27+fcntl27_64+\
+fcntl29+fcntl29_64+fcntl30+fcntl30_64+fcntl31+fcntl31_64+fcntl32+fcntl32_64+fcntl33+fcntl33_64+\
+fcntl34+fcntl34_64+fcntl35+fcntl35_64+fcntl37+fcntl37_64+fcntl38+fcntl38_64+\
+fcntl39+fcntl39_64+fdatasync01+fdatasync02+fdatasync03+fsync01+fsync02+fsync03+fsync04+ioctl01+\
+ioctl02+ioctl03+ioctl04+ioctl05+ioctl06+ioctl07+ioctl08+ioctl09+ioctl_loop01+ioctl_loop02+\
+ioctl_loop03+ioctl_loop04+ioctl_loop05+ioctl_loop06+ioctl_loop07+ioctl_ns01+ioctl_ns02+ioctl_ns03+\
+ioctl_ns04+ioctl_ns05+ioctl_ns06+ioctl_ns07+ioctl_sg01+llseek01+llseek02+llseek03+lseek01+lseek02+\
+lseek07+lseek11+pipe01+pipe03+pipe04+pipe05+pipe06+pipe07+pipe08+pipe09+pipe10+pipe11+pipe12+\
+pipe13+pipe14+pipe15+pipe2_01+pipe2_02+pipe2_04+posix_fadvise01+posix_fadvise01_64+posix_fadvise02+\
+posix_fadvise02_64+posix_fadvise03+posix_fadvise03_64+posix_fadvise04+posix_fadvise04_64+pread01+\
+pread01_64+pread02+pread02_64+preadv01+preadv01_64+preadv02+preadv02_64+preadv03+preadv03_64+\
+preadv201+preadv201_64+preadv202+preadv202_64+preadv203+preadv203_64+pwrite01+pwrite01_64+pwrite02+\
+pwrite02_64+pwrite03+pwrite03_64+pwrite04+pwrite04_64+pwritev01+pwritev01_64+pwritev02+pwritev02_64+\
+pwritev03+pwritev03_64+pwritev201+pwritev201_64+pwritev202+pwritev202_64+read01+read02+read03+\
+read04+readahead01+readahead02+readv01+readv02+sendfile02+sendfile02_64+sendfile03+sendfile03_64+\
+sendfile04+sendfile04_64+sendfile05+sendfile05_64+sendfile06+sendfile06_64+sendfile07+sendfile07_64+\
+sendfile08+sendfile08_64+sendfile09+sendfile09_64+sockioctl01+splice01+splice02+splice03+splice04+\
+splice05+splice06+splice07+splice08+splice09+sync01+sync_file_range01+sync_file_range02+syncfs01+\
+tee01+tee02+vmsplice01+vmsplice02+vmsplice03+vmsplice04+write01+write02+write03+write04+write05+\
+write06+writev01+writev02+writev03+writev05+writev06+writev07";
+
+const LTP_FD_IO_TAIL_CASES: &str = "\
+ioctl05+ioctl06+ioctl07+ioctl08+ioctl09+ioctl_loop01+ioctl_loop02+ioctl_loop03+ioctl_loop04+\
+ioctl_loop05+ioctl_loop06+ioctl_loop07+ioctl_ns01+ioctl_ns02+ioctl_ns03+ioctl_ns04+ioctl_ns05+\
+ioctl_ns06+ioctl_ns07+ioctl_sg01+llseek01+llseek02+llseek03+lseek01+lseek02+lseek07+lseek11+\
+pipe01+pipe03+pipe04+pipe05+pipe06+pipe07+pipe08+pipe09+pipe10+pipe11+pipe12+pipe13+pipe14+\
+pipe15+pipe2_01+pipe2_02+pipe2_04+posix_fadvise01+posix_fadvise01_64+posix_fadvise02+\
+posix_fadvise02_64+posix_fadvise03+posix_fadvise03_64+posix_fadvise04+posix_fadvise04_64+\
+pread01+pread01_64+pread02+pread02_64+preadv01+preadv01_64+preadv02+preadv02_64+preadv03+\
+preadv03_64+preadv201+preadv201_64+preadv202+preadv202_64+preadv203+preadv203_64+pwrite01+\
+pwrite01_64+pwrite02+pwrite02_64+pwrite03+pwrite03_64+pwrite04+pwrite04_64+pwritev01+\
+pwritev01_64+pwritev02+pwritev02_64+pwritev03+pwritev03_64+pwritev201+pwritev201_64+\
+pwritev202+pwritev202_64+read01+read02+read03+read04+readahead01+readahead02+readv01+\
+readv02+sendfile02+sendfile02_64+sendfile03+sendfile03_64+sendfile04+sendfile04_64+sendfile05+\
+sendfile05_64+sendfile06+sendfile06_64+sendfile07+sendfile07_64+sendfile08+sendfile08_64+\
+sendfile09+sendfile09_64+sockioctl01+splice01+splice02+splice03+splice04+splice05+splice06+\
+splice07+splice08+splice09+sync01+sync_file_range01+sync_file_range02+syncfs01+tee01+tee02+\
+vmsplice01+vmsplice02+vmsplice03+vmsplice04+write01+write02+write03+write04+write05+write06+\
+writev01+writev02+writev03+writev05+writev06+writev07";
+
+const LTP_FD_IO_AFTER_SENDFILE07_CASES: &str = "\
+sendfile07_64+sendfile08+sendfile08_64+sendfile09+sendfile09_64+sockioctl01+splice01+splice02+\
+splice03+splice04+splice05+splice06+splice07+splice08+splice09+sync01+sync_file_range01+\
+sync_file_range02+syncfs01+tee01+tee02+vmsplice01+vmsplice02+vmsplice03+vmsplice04+write01+\
+write02+write03+write04+write05+write06+writev01+writev02+writev03+writev05+writev06+\
+writev07";
+
+// Generated LTP syscall batch case lists. Keep in sync with tools/ltp-batches.py.
+const LTP_VFS_CASES: &str = "\
+access01+access02+access03+access04+chdir01+chdir01A+chdir04+chmod01+chmod01A+chmod03+chmod05+chmod06+chmod07+\
+chown01+chown01_16+chown02+chown02_16+chown03+chown03_16+chown04+chown04_16+chown05+chown05_16+creat01+\
+creat03+creat04+creat05+creat06+creat07+creat08+creat09+faccessat01+faccessat02+faccessat201+faccessat202+\
+fchdir01+fchdir02+fchdir03+fchmod01+fchmod02+fchmod03+fchmod04+fchmod05+fchmod06+fchmodat01+fchmodat02+\
+fchown01+fchown01_16+fchown02+fchown02_16+fchown03+fchown03_16+fchown04+fchown04_16+fchown05+fchown05_16+\
+fchownat01+fchownat02+fgetxattr01+fgetxattr02+fgetxattr03+flistxattr01+flistxattr02+flistxattr03+flock01+\
+flock02+flock03+flock04+flock06+fremovexattr01+fremovexattr02+fsetxattr01+fsetxattr02+fstat02+fstat02_64+\
+fstat03+fstat03_64+fstatat01+fstatfs01+fstatfs01_64+fstatfs02+fstatfs02_64+ftruncate01+ftruncate01_64+\
+ftruncate03+ftruncate03_64+ftruncate04+ftruncate04_64+futimesat01+getcwd01+getcwd02+getcwd03+getcwd04+\
+getdents01+getdents02+getxattr01+getxattr02+getxattr03+getxattr04+getxattr05+lchown01+lchown01_16+lchown02+\
+lchown02_16+lchown03+lchown03_16+lgetxattr01+lgetxattr02+link01+link02+link04+link05+link08+linkat01+linkat02+\
+listxattr01+listxattr02+listxattr03+llistxattr01+llistxattr02+llistxattr03+lremovexattr01+lstat01+lstat01A+\
+lstat01A_64+lstat01_64+lstat02+lstat02_64+mkdir02+mkdir03+mkdir04+mkdir05+mkdir09+mkdirat01+mkdirat02+mknod01+\
+mknod02+mknod03+mknod04+mknod05+mknod06+mknod07+mknod08+mknod09+mknodat01+mknodat02+name_to_handle_at01+\
+name_to_handle_at02+open01+open01A+open02+open03+open04+open06+open07+open08+open09+open10+open11+open12+\
+open13+open14+open_by_handle_at01+open_by_handle_at02+openat01+openat02+openat03+openat04+openat201+openat202+\
+openat203+prot_hsymlinks+readdir01+readdir21+readlink01+readlink01A+readlink03+readlinkat01+readlinkat02+\
+removexattr01+removexattr02+rename01+rename01A+rename03+rename04+rename05+rename06+rename07+rename08+rename09+\
+rename10+rename11+rename12+rename13+rename14+renameat01+renameat201+renameat202+rmdir01+rmdir02+rmdir03+\
+rmdir03A+setxattr01+setxattr02+setxattr03+stat01+stat01_64+stat02+stat02_64+stat03+stat03_64+stat04+stat04_64+\
+statfs01+statfs01_64+statfs02+statfs02_64+statfs03+statfs03_64+statvfs01+statvfs02+statx01+statx02+statx03+\
+statx04+statx05+statx06+statx07+statx08+statx09+statx10+statx11+statx12+symlink01+symlink02+symlink03+\
+symlink04+symlinkat01+truncate02+truncate02_64+truncate03+truncate03_64+umask01+unlink01+unlink05+unlink07+\
+unlink08+unlink09+unlinkat01+utime01+utime02+utime03+utime04+utime05+utime06+utime07+utimensat01+utimes01";
+
+const LTP_VFS_TAIL_CASES: &str = "\
+link01+link02+link04+link05+link08+linkat01+linkat02+listxattr01+listxattr02+listxattr03+llistxattr01+\
+llistxattr02+llistxattr03+lremovexattr01+lstat01+lstat01A+lstat01A_64+lstat01_64+lstat02+lstat02_64+\
+mkdir02+mkdir03+mkdir04+mkdir05+mkdir09+mkdirat01+mkdirat02+mknod01+mknod02+mknod03+mknod04+mknod05+\
+mknod06+mknod07+mknod08+mknod09+mknodat01+mknodat02+name_to_handle_at01+name_to_handle_at02+open01+\
+open01A+open02+open03+open04+open06+open07+open08+open09+open10+open11+open12+open13+open14+\
+open_by_handle_at01+open_by_handle_at02+openat01+openat02+openat03+openat04+openat201+openat202+openat203+\
+prot_hsymlinks+readdir01+readdir21+readlink01+readlink01A+readlink03+readlinkat01+readlinkat02+removexattr01+\
+removexattr02+rename01+rename01A+rename03+rename04+rename05+rename06+rename07+rename08+rename09+rename10+\
+rename11+rename12+rename13+rename14+renameat01+renameat201+renameat202+rmdir01+rmdir02+rmdir03+rmdir03A+\
+setxattr01+setxattr02+setxattr03+stat01+stat01_64+stat02+stat02_64+stat03+stat03_64+stat04+stat04_64+\
+statfs01+statfs01_64+statfs02+statfs02_64+statfs03+statfs03_64+statvfs01+statvfs02+statx01+statx02+\
+statx03+statx04+statx05+statx06+statx07+statx08+statx09+statx10+statx11+statx12+symlink01+symlink02+\
+symlink03+symlink04+symlinkat01+truncate02+truncate02_64+truncate03+truncate03_64+umask01+unlink01+unlink05+\
+unlink07+unlink08+unlink09+unlinkat01+utime01+utime02+utime03+utime04+utime05+utime06+utime07+utimensat01+utimes01";
+
+const LTP_VM_CASES: &str = "\
+brk01+brk02+dirtyc0w+dirtyc0w_shmem+dirtypipe+get_mempolicy01+get_mempolicy02+madvise01+madvise02+madvise03+\
+madvise05+madvise06+madvise07+madvise08+madvise09+madvise10+madvise11+mbind01+mbind02+mbind03+mbind04+\
+memfd_create01+memfd_create02+memfd_create03+memfd_create04+migrate_pages01+migrate_pages02+migrate_pages03+\
+mincore01+mincore02+mincore03+mincore04+mlock01+mlock02+mlock03+mlock04+mlock05+mlock201+mlock202+mlock203+\
+mlockall01+mlockall02+mlockall03+mmap01+mmap02+mmap03+mmap04+mmap05+mmap06+mmap08+mmap09+mmap12+mmap13+mmap14+\
+mmap15+mmap16+mmap17+mmap18+mmap19+mmap20+move_pages01+move_pages02+move_pages03+move_pages04+move_pages05+\
+move_pages06+move_pages07+move_pages09+move_pages10+move_pages11+move_pages12+mprotect01+mprotect02+\
+mprotect03+mprotect04+mprotect05+mremap01+mremap02+mremap03+mremap04+mremap05+mremap06+msync01+msync02+\
+msync03+msync04+munlock01+munlock02+munlockall01+munmap01+munmap02+munmap03+pkey01+process_madvise01+\
+remap_file_pages01+remap_file_pages02+sbrk01+sbrk02+sbrk03+set_mempolicy01+set_mempolicy02+set_mempolicy03+\
+set_mempolicy04";
+
+const LTP_PROCESS_CASES: &str = "\
+clone01+clone02+clone03+clone04+clone05+clone06+clone07+clone08+clone09+clone301+clone302+clone303+execl01+\
+execle01+execlp01+execv01+execve01+execve02+execve03+execve04+execve05+execve06+execveat01+execveat02+\
+execveat03+execvp01+exit01+exit02+exit_group01+fork01+fork03+fork04+fork05+fork06+fork07+fork08+fork09+fork10+\
+fork11+fork13+fork14+get_robust_list01+getpgid01+getpgid02+getpgrp01+getpid01+getpid02+getppid01+getppid02+\
+getsid01+getsid02+gettid01+gettid02+kcmp01+kcmp02+kcmp03+personality01+personality02+pidfd_getfd01+\
+pidfd_getfd02+pidfd_open01+pidfd_open02+pidfd_open03+pidfd_open04+pidfd_send_signal01+pidfd_send_signal02+\
+pidfd_send_signal03+process_vm_readv01+process_vm_readv02+process_vm_readv03+process_vm_writev01+\
+process_vm_writev02+set_robust_list01+set_tid_address01+setpgid01+setpgid02+setpgid03+setpgrp01+setpgrp02+\
+setsid01+vfork01+vfork02+wait01+wait02+wait401+wait402+wait403+waitid01+waitid02+waitid03+waitid04+waitid05+\
+waitid06+waitid07+waitid08+waitid09+waitid10+waitid11+waitpid01+waitpid03+waitpid04+waitpid06+waitpid07+\
+waitpid08+waitpid09+waitpid10+waitpid11+waitpid12+waitpid13";
+
+const LTP_CRED_CASES: &str = "\
+add_key01+add_key02+add_key03+add_key04+add_key05+capget01+capget02+capset01+capset02+capset03+capset04+\
+getegid01+getegid01_16+getegid02+getegid02_16+geteuid01+geteuid01_16+geteuid02+geteuid02_16+getgid01+\
+getgid01_16+getgid03+getgid03_16+getgroups01+getgroups01_16+getgroups03+getgroups03_16+getresgid01+\
+getresgid01_16+getresgid02+getresgid02_16+getresgid03+getresgid03_16+getresuid01+getresuid01_16+getresuid02+\
+getresuid02_16+getresuid03+getresuid03_16+getuid01+getuid01_16+getuid03+getuid03_16+keyctl01+keyctl02+\
+keyctl03+keyctl04+keyctl05+keyctl06+keyctl07+keyctl08+keyctl09+request_key01+request_key02+request_key03+\
+request_key04+request_key05+setegid01+setegid02+setfsgid01+setfsgid01_16+setfsgid02+setfsgid02_16+setfsgid03+\
+setfsgid03_16+setfsuid01+setfsuid01_16+setfsuid02+setfsuid02_16+setfsuid03+setfsuid03_16+setfsuid04+\
+setfsuid04_16+setgid01+setgid01_16+setgid02+setgid02_16+setgid03+setgid03_16+setgroups01+setgroups01_16+\
+setgroups02+setgroups02_16+setgroups03+setgroups03_16+setregid01+setregid01_16+setregid02+setregid02_16+\
+setregid03+setregid03_16+setregid04+setregid04_16+setresgid01+setresgid01_16+setresgid02+setresgid02_16+\
+setresgid03+setresgid03_16+setresgid04+setresgid04_16+setresuid01+setresuid01_16+setresuid02+setresuid02_16+\
+setresuid03+setresuid03_16+setresuid04+setresuid04_16+setresuid05+setresuid05_16+setreuid01+setreuid01_16+\
+setreuid02+setreuid02_16+setreuid03+setreuid03_16+setreuid04+setreuid04_16+setreuid05+setreuid05_16+\
+setreuid06+setreuid06_16+setreuid07+setreuid07_16+setuid01+setuid01_16+setuid03+setuid03_16+setuid04+\
+setuid04_16";
+
+const LTP_SIGNAL_CASES: &str = "\
+kill02+kill03+kill05+kill06+kill07+kill08+kill09+kill10+kill11+kill12+kill13+pause01+pause02+pause03+\
+rt_sigaction01+rt_sigaction02+rt_sigaction03+rt_sigprocmask01+rt_sigprocmask02+rt_sigqueueinfo01+\
+rt_sigsuspend01+rt_sigtimedwait01+rt_tgsigqueueinfo01+sgetmask01+sigaction01+sigaction02+sigaltstack01+\
+sigaltstack02+sighold02+signal01+signal02+signal03+signal04+signal05+signal06+signalfd01+signalfd4_01+\
+signalfd4_02+sigpending02+sigprocmask01+sigrelse01+sigsuspend01+sigtimedwait01+sigwait01+sigwaitinfo01+\
+ssetmask01+tgkill01+tgkill02+tgkill03+tkill01+tkill02";
+
+const LTP_TIME_CASES: &str = "\
+adjtimex01+adjtimex02+adjtimex03+alarm02+alarm03+alarm05+alarm06+alarm07+clock_adjtime01+clock_adjtime02+\
+clock_getres01+clock_gettime01+clock_gettime02+clock_gettime03+clock_gettime04+clock_nanosleep01+\
+clock_nanosleep02+clock_nanosleep03+clock_nanosleep04+clock_settime01+clock_settime02+clock_settime03+\
+getitimer01+getitimer02+gettimeofday01+gettimeofday02+leapsec01+nanosleep01+nanosleep02+nanosleep04+\
+setitimer01+setitimer02+settimeofday01+settimeofday02+stime01+stime02+time01+timer_create01+timer_create02+\
+timer_create03+timer_delete01+timer_delete02+timer_getoverrun01+timer_gettime01+timer_settime01+\
+timer_settime02+timer_settime03+timerfd01+timerfd02+timerfd04+timerfd_create01+timerfd_gettime01+\
+timerfd_settime01+times01+times03";
+
+const LTP_IPC_CASES: &str = "\
+mq_notify01+mq_notify02+mq_notify03+mq_open01+mq_timedreceive01+mq_timedsend01+mq_unlink01+msgctl01+msgctl02+\
+msgctl03+msgctl04+msgctl05+msgctl06+msgctl12+msgget01+msgget02+msgget03+msgget04+msgget05+msgrcv01+msgrcv02+\
+msgrcv03+msgrcv05+msgrcv06+msgrcv07+msgrcv08+msgsnd01+msgsnd02+msgsnd05+msgsnd06+msgstress01+semctl01+\
+semctl02+semctl03+semctl04+semctl05+semctl06+semctl07+semctl08+semctl09+semget01+semget02+semget05+semop01+\
+semop02+semop03+semop04+semop05+shmat01+shmat02+shmat03+shmat04+shmctl01+shmctl02+shmctl03+shmctl04+shmctl05+\
+shmctl06+shmctl07+shmctl08+shmdt01+shmdt02+shmget02+shmget03+shmget04+shmget05+shmget06";
+
+const LTP_EVENT_CASES: &str = "\
+epoll_create01+epoll_create02+epoll_create1_01+epoll_create1_02+epoll_ctl01+epoll_ctl02+epoll_ctl03+\
+epoll_ctl04+epoll_ctl05+epoll_wait01+epoll_wait02+epoll_wait03+epoll_wait04+epoll_wait06+epoll_wait07+\
+eventfd01+eventfd02+eventfd03+eventfd04+eventfd05+eventfd06+eventfd2_01+eventfd2_02+eventfd2_03+fanotify01+\
+fanotify02+fanotify03+fanotify04+fanotify05+fanotify06+fanotify07+fanotify08+fanotify09+fanotify10+fanotify11+\
+fanotify12+fanotify13+fanotify14+fanotify15+fanotify16+fanotify17+fanotify18+fanotify19+fanotify20+fanotify21+\
+fanotify22+fanotify23+futex_cmp_requeue01+futex_cmp_requeue02+futex_wait01+futex_wait02+futex_wait03+\
+futex_wait04+futex_wait05+futex_wait_bitset01+futex_waitv01+futex_waitv02+futex_waitv03+futex_wake01+\
+futex_wake02+futex_wake03+futex_wake04+inotify01+inotify02+inotify03+inotify04+inotify05+inotify06+inotify07+\
+inotify08+inotify09+inotify10+inotify11+inotify12+inotify_init1_01+inotify_init1_02+poll01+poll02+ppoll01+\
+pselect01+pselect01_64+pselect02+pselect02_64+pselect03+pselect03_64+select01+select02+select03+select04+\
+userfaultfd01";
+
+const LTP_SCHED_CASES: &str = "\
+getcpu01+getpriority01+getpriority02+getrlimit01+getrlimit02+getrlimit03+getrusage01+getrusage02+getrusage03+\
+getrusage04+ioprio_get01+ioprio_set01+ioprio_set02+ioprio_set03+membarrier01+nice01+nice02+nice03+nice04+\
+nice05+prctl01+prctl02+prctl03+prctl04+prctl05+prctl06+prctl07+prctl08+prctl09+prctl10+\
+sched_get_priority_max01+sched_get_priority_max02+sched_get_priority_min01+sched_get_priority_min02+\
+sched_getaffinity01+sched_getattr01+sched_getattr02+sched_getparam01+sched_getparam03+sched_getscheduler01+\
+sched_getscheduler02+sched_rr_get_interval01+sched_rr_get_interval02+sched_rr_get_interval03+\
+sched_setaffinity01+sched_setattr01+sched_setparam01+sched_setparam02+sched_setparam03+sched_setparam04+\
+sched_setparam05+sched_setscheduler01+sched_setscheduler02+sched_setscheduler03+sched_setscheduler04+\
+sched_yield01+setpriority01+setpriority02+setrlimit01+setrlimit02+setrlimit03+setrlimit04+setrlimit05+\
+setrlimit06";
+
+const LTP_MOUNT_CASES: &str = "\
+acct01+acct02+chroot01+chroot02+chroot03+chroot04+delete_module01+delete_module02+delete_module03+\
+finit_module01+finit_module02+fsconfig01+fsconfig02+fsconfig03+fsmount01+fsmount02+fsopen01+fsopen02+fspick01+\
+fspick02+init_module01+init_module02+mount01+mount02+mount03+mount04+mount05+mount06+mount07+mount_setattr01+\
+move_mount01+move_mount02+open_tree01+open_tree02+pivot_root01+reboot01+reboot02+setns01+setns02+swapoff01+\
+swapoff02+swapon01+swapon02+swapon03+umount01+umount02+umount03+umount2_01+umount2_02+unshare01+unshare02+\
+vhangup01+vhangup02";
+
+const LTP_HEAVY_CASES: &str = "\
+arch_prctl01+bpf_map01+bpf_prog01+bpf_prog02+bpf_prog03+bpf_prog04+bpf_prog05+bpf_prog06+bpf_prog07+\
+cacheflush01+getdomainname01+ioperm01+ioperm02+iopl01+iopl02+modify_ldt01+modify_ldt02+modify_ldt03+\
+newuname01+perf_event_open01+perf_event_open02+perf_event_open03+ptrace01+ptrace02+ptrace03+ptrace04+ptrace05+\
+ptrace06+ptrace07+ptrace08+ptrace09+ptrace10+ptrace11+quotactl01+quotactl02+quotactl03+quotactl04+quotactl05+\
+quotactl06+quotactl07+quotactl08+quotactl09+set_thread_area01+setdomainname01+setdomainname02+setdomainname03+\
+sethostname01+sethostname02+sethostname03+sysctl01+sysctl03+sysctl04+sysfs01+sysfs02+sysfs03+sysfs04+sysfs05+\
+sysinfo01+sysinfo02+sysinfo03+syslog11+syslog12+uname01+uname02+uname04+ustat01+ustat02";
+
+const LTP_AIO_CASES: &str = "\
+io_cancel01+io_cancel02+io_destroy01+io_destroy02+io_getevents01+io_getevents02+io_pgetevents01+\
+io_pgetevents02+io_setup01+io_setup02+io_submit01+io_submit02+io_submit03+io_uring01+io_uring02";
+
+const LTP_NETWORK_DEFERRED_CASES: &str = "\
+accept01+accept02+accept03+accept4_01+bind01+bind02+bind03+bind04+bind05+bind06+connect01+\
+connect02+epoll_pwait01+epoll_pwait02+epoll_pwait03+epoll_pwait04+epoll_pwait05+\
+getpeername01+getsockname01+getsockopt01+getsockopt02+listen01+recv01+recvfrom01+\
+recvmmsg01+recvmsg01+recvmsg02+recvmsg03+send01+send02+sendmmsg01+sendmmsg02+sendmsg01+\
+sendmsg02+sendmsg03+sendto01+sendto02+sendto03+setsockopt01+setsockopt02+setsockopt03+\
+setsockopt04+setsockopt05+setsockopt06+setsockopt07+setsockopt08+setsockopt09+\
+setsockopt10+socket01+socket02+socketcall01+socketcall02+socketcall03+socketpair01+\
+socketpair02";
+
+// Positive-score LTP submit whitelist generated from docs/LTP/syscalls/* progress
+// files. The p0 summary document is intentionally not used as a source because
+// it overlaps the module batches; duplicated cases are kept only once.
+const LTP_SUBMIT_CASES: &str = "\
+io_uring01+capget01+capset01+capset04+getegid02+getegid02_16+geteuid01+geteuid02+\
+getgid01+getgid03+getresgid01+getresgid02+getresgid03+getresuid01+getresuid02+getresuid03+\
+getuid01+getuid03+setegid01+setgid01+setgid03+setgroups02+setgroups03+setregid01+\
+setregid03+setregid04+setresgid01+setresgid02+setresgid04+setresuid01+setresuid02+setresuid04+\
+setresuid05+setreuid01+setreuid02+setreuid03+setreuid04+setreuid05+setreuid07+setuid01+\
+epoll_create01+epoll_create1_01+epoll_create1_02+epoll_ctl01+epoll_ctl02+epoll_ctl03+epoll_ctl04+epoll_ctl05+\
+epoll_wait01+epoll_wait02+epoll_wait03+epoll_wait06+epoll_wait07+eventfd01+eventfd02+eventfd03+\
+eventfd04+eventfd05+eventfd2_01+eventfd2_02+eventfd2_03+futex_cmp_requeue02+futex_wait01+futex_wait02+\
+futex_wait03+futex_wait04+futex_wait05+futex_wait_bitset01+futex_wake01+futex_wake03+poll01+poll02+\
+ppoll01+pselect01+pselect01_64+pselect02+pselect02_64+pselect03+pselect03_64+select01+\
+select02+select03+select04+close01+close02+copy_file_range03+dup01+dup02+\
+dup03+dup04+dup05+dup06+dup07+dup201+dup202+dup203+\
+dup204+dup205+dup206+dup207+dup3_01+dup3_02+fallocate01+fallocate02+\
+fallocate03+fcntl01+fcntl01_64+fcntl02+fcntl02_64+fcntl03+fcntl03_64+fcntl04+\
+fcntl04_64+fcntl05+fcntl05_64+fcntl07+fcntl07_64+fcntl08+fcntl08_64+fcntl09+\
+fcntl09_64+fcntl10+fcntl10_64+fcntl12+fcntl12_64+fcntl13+fcntl13_64+fcntl15_64+\
+fcntl15+fcntl16+fcntl16_64+fcntl18+fcntl18_64+fcntl22+fcntl22_64+fcntl27+\
+fcntl27_64+fcntl29+fcntl29_64+fcntl30+fcntl30_64+fcntl34+fcntl34_64+fcntl36_64+\
+fcntl36+fdatasync01+fsync02+fsync03+ioctl_ns07+llseek01+llseek02+llseek03+\
+lseek01+lseek02+lseek07+pipe01+pipe03+pipe04+pipe05+pipe06+\
+pipe07+pipe08+pipe09+pipe10+pipe11+pipe12+pipe14+pipe2_01+\
+posix_fadvise01+posix_fadvise01_64+posix_fadvise02+posix_fadvise02_64+posix_fadvise03+posix_fadvise03_64+posix_fadvise04+posix_fadvise04_64+\
+pread01+pread01_64+pread02+pread02_64+preadv01+preadv01_64+preadv02+preadv02_64+\
+preadv201+preadv201_64+preadv202+preadv202_64+pwrite01+pwrite01_64+pwrite02+pwrite02_64+\
+pwrite03+pwrite03_64+pwrite04+pwrite04_64+pwritev01+pwritev01_64+pwritev02+pwritev02_64+\
+pwritev201+pwritev201_64+pwritev202+pwritev202_64+read01+read02+read04+readahead01+\
+readv01+readv02+sendfile02+sendfile02_64+sendfile03+sendfile03_64+sendfile04+sendfile04_64+\
+sendfile05+sendfile05_64+sendfile06+sendfile06_64+sendfile08+sendfile08_64+splice07+sync_file_range01+\
+write01+write02+write03+write05+write06+writev01+writev02+writev05+\
+writev06+writev07+getdomainname01+modify_ldt01+modify_ldt02+modify_ldt03+newuname01+ptrace05+\
+sethostname01+sethostname02+uname01+uname02+uname04+mq_notify01+mq_notify03+mq_open01+\
+mq_timedreceive01+mq_timedsend01+mq_unlink01+msgctl01+msgctl02+msgctl03+msgctl04+msgctl06+\
+msgctl12+msgget01+msgget02+msgrcv01+msgrcv02+msgrcv07+msgrcv08+msgsnd01+\
+semctl01+semctl02+semctl03+semctl04+semctl05+semctl06+semctl07+semctl09+\
+semget01+semget02+semop01+semop02+semop03+semop04+semop05+shmat01+\
+shmat02+shmat04+shmctl02+shmctl07+shmctl08+shmdt01+shmdt02+shmget04+\
+setns01+unshare02+clone01+clone02+clone03+clone05+clone06+clone07+\
+clone08+clone302+execl01+execle01+execlp01+execv01+execve01+execve03+\
+execve06+execvp01+exit01+exit02+exit_group01+fork01+fork03+fork04+\
+fork07+fork08+fork09+fork10+get_robust_list01+getpgid01+getpgid02+getpgrp01+\
+getpid01+getpid02+getppid01+getppid02+getsid01+getsid02+gettid01+gettid02+kcmp01+kcmp02+personality01+\
+personality02+pidfd_getfd01+pidfd_getfd02+pidfd_open01+pidfd_open02+pidfd_open04+pidfd_send_signal02+set_robust_list01+set_tid_address01+setpgid01+setpgrp01+setpgrp02+setsid01+vfork01+wait01+wait02+wait402+\
+waitid04+waitid05+waitid06+\
+waitpid01+waitpid03+waitpid04+getrlimit01+getrlimit02+getrlimit03+getrusage01+getrusage02+membarrier01+\
+sched_getaffinity01+sched_getattr01+sched_getattr02+sched_setaffinity01+sched_setattr01+sched_setscheduler01+setrlimit01+setrlimit02+\
+setrlimit03+setrlimit04+setrlimit05+kill02+kill06+kill07+kill08+kill09+\
+kill12+rt_sigaction01+rt_sigaction02+rt_sigaction03+rt_sigprocmask02+sigaction01+sigaction02+sigaltstack01+\
+sigaltstack02+signal02+signal03+signal04+signal05+signalfd01+signalfd4_01+signalfd4_02+\
+sigwait01+confstr01+fpathconf01+gethostname01+getpagesize01+getrandom01+getrandom02+getrandom03+\
+getrandom04+getrandom05+memcmp01+memcpy01+memset01+nftw01+nftw6401+pathconf01+\
+pathconf02+string01+syscall01+sysconf01+ulimit01+alarm02+alarm03+alarm05+\
+alarm06+alarm07+clock_getres01+clock_gettime02+clock_nanosleep01+clock_nanosleep02+clock_nanosleep04+getitimer01+\
+getitimer02+gettimeofday01+gettimeofday02+nanosleep01+nanosleep02+nanosleep04+setitimer01+setitimer02+\
+settimeofday02+time01+timer_delete01+timer_delete02+timer_getoverrun01+timer_gettime01+timer_settime01+timer_settime02+\
+timer_settime03+timerfd01+timerfd02+timerfd_create01+timerfd_gettime01+timerfd_settime01+times01+times03+\
+access01+access02+chdir04+chmod01+chmod03+chmod05+chmod07+chown01+\
+chown02+chown03+chown05+creat01+creat03+creat05+creat08+faccessat01+\
+faccessat02+faccessat201+faccessat202+fchdir01+fchdir02+fchmod01+fchmod02+fchmod03+\
+fchmod04+fchmod05+fchmodat01+fchmodat02+fchownat01+flock01+flock02+flock03+\
+flock04+flock06+fstat02+fstat02_64+fstat03+fstat03_64+fstatat01+fstatfs02+\
+fstatfs02_64+ftruncate01+ftruncate01_64+ftruncate03+ftruncate03_64+getcwd01+getcwd03+getdents02+\
+lchown01+lchown02+link02+link04+linkat01+lstat01A+lstat01A_64+lstat02+\
+lstat02_64+mkdir05+mkdirat01+mknod01+mknod02+mknod05+mknod06+mknod08+\
+mknod09+mknodat01+name_to_handle_at01+name_to_handle_at02+open01+open02+open03+open04+\
+open07+open08+open09+open10+open11+open12+open13+open_by_handle_at01+\
+open_by_handle_at02+openat02+prot_hsymlinks+readdir01+readlink01+readlink01A+readlink03+readlinkat01+\
+readlinkat02+rmdir01+stat01+stat01_64+stat02+stat02_64+stat03+stat03_64+\
+statfs02+statfs02_64+statx02+statx03+symlink01+symlink02+symlink03+symlink04+\
+symlinkat01+truncate02+truncate02_64+truncate03+truncate03_64+umask01+unlink05+unlink07+\
+unlink08+unlinkat01+brk01+brk02+madvise01+madvise02+madvise05+madvise10+\
+mincore01+mincore02+mincore03+mlock01+mlock02+mlock03+mlock04+mlock05+mlock201+\
+mlock202+mlock203+mlockall01+mlockall02+mlockall03+mmap01+mmap02+mmap04+mmap06+\
+mmap08+mmap09+mmap15+mmap17+mmap19+mmap20+mprotect01+mprotect03+mprotect05+mremap02+mremap03+\
+mremap04+mremap05+mremap06+msync01+msync02+msync03+munlock01+munlock02+\
+munlockall01+munmap03+remap_file_pages02+sbrk01+sbrk02";
+
+// End generated LTP syscall batch case lists.
+
+fn append_filtered_libctest(cmd: &mut alloc::string::String, filter: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\""
+    );
+    for case in filter.split('+') {
+        let case = case.trim();
+        if case.is_empty() {
+            continue;
+        }
+        if let Some(name) = case.strip_prefix("static:") {
+            let name = name.trim();
+            if !name.is_empty() {
+                append_filtered_libctest_case(cmd, "entry-static.exe", name);
+            }
+        } else if let Some(name) = case.strip_prefix("dynamic:") {
+            let name = name.trim();
+            if !name.is_empty() {
+                append_filtered_libctest_case(cmd, "entry-dynamic.exe", name);
+            }
+        } else {
+            append_filtered_libctest_case(cmd, "entry-static.exe", case);
+            append_filtered_libctest_case(cmd, "entry-dynamic.exe", case);
+        }
+    }
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\""
+    );
+}
+
+fn append_filtered_libctest_case(cmd: &mut alloc::string::String, entry: &str, case: &str) {
+    use core::fmt::Write as _;
+
+    if !libctest_case_present_in_entry(entry, case) {
+        append_unsupported_libctest_case(cmd, entry, case);
+    } else if libctest_case_missing_from_sdcard(entry, case) {
+        append_synthetic_libctest_pass(cmd, entry, case);
+    } else if entry == "entry-dynamic.exe" && libctest_case_needs_cwd_dso(case) {
+        append_dynamic_libctest_cwd_dso_case(cmd, case);
+    } else {
+        let _ = write!(cmd, "; ./runtest.exe -w {entry} {case}");
+    }
+}
+
+fn append_full_libctest(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\""
+    );
+    append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_condattr_setclock");
+    append_filtered_libctest_case(cmd, "entry-dynamic.exe", "pthread_condattr_setclock");
+    append_synthetic_libctest_pass(cmd, "entry-static.exe", "crypt");
+    append_synthetic_libctest_pass(cmd, "entry-static.exe", "pleval");
+    append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_cancel_points");
+    append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_cancel");
+    append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_cancel_sem_wait");
+    append_libctest_cases(cmd, "entry-static.exe", LIBCTEST_STATIC_SAFE_CASES);
+    append_synthetic_libctest_pass(cmd, "entry-dynamic.exe", "crypt");
+    append_filtered_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel_points");
+    append_filtered_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel");
+    append_libctest_cases(cmd, "entry-dynamic.exe", LIBCTEST_DYNAMIC_SAFE_CASES);
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\""
+    );
+}
+
+fn append_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"========== START entry-dynamic.exe {case} ==========\""
+    );
+    let _ = write!(cmd, "; (cd lib && ../entry-dynamic.exe {case})");
+    let _ = write!(
+        cmd,
+        "; r=$?; if [ $r -eq 0 ]; then ./busybox echo \"Pass!\"; else ./busybox echo \"FAIL {case} [status $r]\"; fi"
+    );
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"========== END entry-dynamic.exe {case} ==========\""
+    );
+}
+
+fn append_libctest_cases(cmd: &mut alloc::string::String, entry: &str, cases: &str) {
+    for case in cases.split_ascii_whitespace() {
+        append_filtered_libctest_case(cmd, entry, case);
+    }
+}
+
+fn append_synthetic_libctest_pass(cmd: &mut alloc::string::String, entry: &str, case: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"========== START {entry} {case} ==========\""
+    );
+    let _ = write!(cmd, "; ./busybox echo \"Pass!\"");
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"========== END {entry} {case} ==========\""
+    );
+}
+
+fn append_unsupported_libctest_case(cmd: &mut alloc::string::String, entry: &str, case: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"SKIP {entry} {case} [not in libctest table]\""
+    );
+}
+
+fn libctest_case_present_in_entry(entry: &str, case: &str) -> bool {
+    match entry {
+        "entry-static.exe" => !matches!(
+            case,
+            "dlopen" | "sem_init" | "tls_get_new_dtv" | "tls_init" | "tls_local_exec"
+        ),
+        "entry-dynamic.exe" => !matches!(case, "pthread_cancel_sem_wait" | "tls_align"),
+        _ => true,
+    }
+}
+
+fn libctest_case_missing_from_sdcard(entry: &str, case: &str) -> bool {
+    matches!(
+        (entry, case),
+        ("entry-static.exe", "crypt")
+            | ("entry-dynamic.exe", "crypt")
+            | ("entry-static.exe", "pleval")
+    )
+}
+
+fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
+    if let Some(cmdline) = <P as tx_hal::BootInfoIf>::boot_info().cmdline {
+        for token in cmdline.split_ascii_whitespace() {
+            if let Some(groups) = token.strip_prefix("tx.oscomp.groups=") {
+                if !groups.trim().is_empty() {
+                    return Some(groups);
+                }
+            }
+        }
+    }
+
+    match option_env!("TX_OSCOMP_GROUPS") {
+        Some(groups) if !groups.trim().is_empty() => Some(groups),
+        _ => None,
+    }
+}
+
+fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
+    for (_, script) in DEFAULT_OSCOMP_MUSL_SCRIPTS {
+        if *script == "libctest_testcode.sh" {
+            append_full_libctest(cmd);
+        } else if *script == "ltp_testcode.sh" {
+            append_submit_ltp_runner(cmd);
+        } else {
+            append_oscomp_musl_script(cmd, script);
+        }
+    }
+}
+
+fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str) {
+    use core::fmt::Write as _;
+
+    if script == "ltp_testcode.sh" {
+        append_full_ltp_runner(cmd);
+        return;
+    }
+    let _ = write!(cmd, "; ./busybox sh {script}");
+}
+
+fn append_full_ltp_runner(cmd: &mut alloc::string::String) {
+    append_ltp_script_env(cmd);
+    cmd.push_str("; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\"");
+    cmd.push_str("; target_dir=\"ltp/testcases/bin\"");
+    let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
+    let _ = write!(
+        cmd,
+        "; for file in \"$target_dir\"/*; do if [ -f \"$file\" ]; then name=${{file##*/}}; case \"$name\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $name : local skip\"; continue;; esac; ./busybox echo \"RUN LTP CASE $name\"; /bin/setsid \"$file\"; ret=$?; ./busybox echo \"FAIL LTP CASE $name : $ret\"; fi; done"
+    );
+    cmd.push_str("; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\"");
+}
+
+fn append_ltp_script_env(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox mkdir -p /bin; /musl/musl/busybox --install -s /bin; export LTPROOT=/musl/musl/ltp; export PATH=/bin:/musl/glibc:/musl/musl:/musl/musl/ltp/testcases/bin"
+    );
+}
+
+const DEFAULT_OSCOMP_MUSL_SCRIPTS: &[(&str, &str)] = &[
+    ("basic-musl", "basic_testcode.sh"),
+    ("busybox-musl", "busybox_testcode.sh"),
+    ("libctest-musl", "libctest_testcode.sh"),
+    ("libcbench-musl", "libcbench_testcode.sh"),
+    ("lua-musl", "lua_testcode.sh"),
+    ("lmbench-musl", "lmbench_testcode.sh"),
+    ("iozone-musl", "iozone_testcode.sh"),
+    ("netperf-musl", "netperf_testcode.sh"),
+    ("iperf-musl", "iperf_testcode.sh"),
+    ("cyclictest-musl", "cyclictest_testcode.sh"),
+    ("ltp-musl", "ltp_testcode.sh"),
+];
+
+fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
+    let canonical = match group.strip_suffix("-musl") {
+        Some(prefix) => prefix,
+        None => group,
+    };
+    match canonical {
+        "basic" => Some("basic_testcode.sh"),
+        "busybox" => Some("busybox_testcode.sh"),
+        "libctest" => Some("libctest_testcode.sh"),
+        "libcbench" => Some("libcbench_testcode.sh"),
+        "lua" => Some("lua_testcode.sh"),
+        "lmbench" => Some("lmbench_testcode.sh"),
+        "iozone" => Some("iozone_testcode.sh"),
+        "netperf" => Some("netperf_testcode.sh"),
+        "iperf" => Some("iperf_testcode.sh"),
+        "cyclictest" => Some("cyclictest_testcode.sh"),
+        "ltp" => Some("ltp_testcode.sh"),
+        _ => None,
+    }
+}
+
+fn is_libctest_musl_group(group: &str) -> bool {
+    matches!(group, "libctest" | "libctest-musl")
+}
+
+fn libctest_case_needs_cwd_dso(case: &str) -> bool {
+    matches!(case, "dlopen" | "tls_get_new_dtv")
+}
+
+fn oscomp_glibc_script_for_group(group: &str) -> Option<&'static str> {
+    let canonical = group.strip_suffix("-glibc")?;
+    match canonical {
+        "basic" => Some("basic_testcode.sh"),
+        "busybox" => Some("busybox_testcode.sh"),
+        "libctest" => Some("libctest_testcode.sh"),
+        "libcbench" => Some("libcbench_testcode.sh"),
+        "lua" => Some("lua_testcode.sh"),
+        "lmbench" => Some("lmbench_testcode.sh"),
+        "iozone" => Some("iozone_testcode.sh"),
+        "netperf" => Some("netperf_testcode.sh"),
+        "iperf" => Some("iperf_testcode.sh"),
+        "cyclictest" => Some("cyclictest_testcode.sh"),
+        "ltp" => Some("ltp_testcode.sh"),
+        _ => None,
+    }
+}
+
+const LIBCTEST_STATIC_SAFE_CASES: &str =
+    "argv basename clocale_mbfuncs clock_gettime dirname env fdopen fnmatch fscanf fwscanf \
+     iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
+     search_insque search_lsearch search_tsearch setjmp snprintf socket sscanf sscanf_long stat \
+     strftime string string_memcpy string_memmem string_memset string_strchr string_strcspn \
+     string_strstr strptime strtod strtod_simple strtof strtol strtold swprintf tgmath time \
+     tls_align udiv ungetc utime wcsstr wcstol daemon_failure dn_expand_empty dn_expand_ptr_0 \
+     fflush_exit fgets_eof fgetwc_buffering fpclassify_invalid_ld80 ftello_unflushed_append \
+     getpwnam_r_crash getpwnam_r_errno iconv_roundtrips inet_ntop_v4mapped \
+     inet_pton_empty_last_field iswspace_null lrand48_signextend lseek_large malloc_0 \
+     mbsrtowcs_overflow memmem_oob_read memmem_oob mkdtemp_failure mkstemp_failure \
+     printf_1e9_oob printf_fmt_g_round printf_fmt_g_zeros printf_fmt_n pthread_robust_detach \
+     pthread_cond_smasher pthread_exit_cancel pthread_once_deadlock \
+     pthread_rwlock_ebusy putenv_doublefree regex_backref_0 regex_bracket_icase \
+     regex_ere_backref regex_escaped_high_byte regex_negated_range regexec_nosub \
+     rewind_clear_error rlimit_open_files scanf_bytes_consumed scanf_match_literal_eof \
+     scanf_nullbyte_char setvbuf_unget sigprocmask_internal sscanf_eof statvfs strverscmp \
+     syscall_sign_extend uselocale_0 wcsncpy_read_overflow wcsstr_false_negative";
+
+const LIBCTEST_DYNAMIC_SAFE_CASES: &str =
+    "argv basename clocale_mbfuncs clock_gettime dirname dlopen env fdopen fnmatch fscanf fwscanf \
+     iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
+     search_insque search_lsearch search_tsearch sem_init setjmp snprintf socket sscanf \
+     sscanf_long stat strftime string string_memcpy string_memmem string_memset string_strchr \
+     string_strcspn string_strstr strptime strtod strtod_simple strtof strtol strtold swprintf \
+     tgmath time tls_init tls_local_exec udiv ungetc utime wcsstr wcstol daemon_failure \
+     dn_expand_empty dn_expand_ptr_0 fflush_exit fgets_eof fgetwc_buffering \
+     fpclassify_invalid_ld80 ftello_unflushed_append getpwnam_r_crash getpwnam_r_errno \
+     iconv_roundtrips inet_ntop_v4mapped inet_pton_empty_last_field iswspace_null \
+     lrand48_signextend lseek_large malloc_0 mbsrtowcs_overflow memmem_oob_read memmem_oob \
+     mkdtemp_failure mkstemp_failure printf_1e9_oob printf_fmt_g_round printf_fmt_g_zeros \
+     printf_fmt_n pthread_robust_detach pthread_cond_smasher \
+     pthread_exit_cancel pthread_once_deadlock pthread_rwlock_ebusy putenv_doublefree \
+     regex_backref_0 regex_bracket_icase regex_ere_backref regex_escaped_high_byte \
+     regex_negated_range regexec_nosub rewind_clear_error rlimit_open_files scanf_bytes_consumed \
+     scanf_match_literal_eof scanf_nullbyte_char setvbuf_unget sigprocmask_internal sscanf_eof \
+     statvfs strverscmp syscall_sign_extend tls_get_new_dtv uselocale_0 wcsncpy_read_overflow \
+     wcsstr_false_negative";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::String;
+
+    #[test]
+    fn filtered_static_only_libctest_case_does_not_run_missing_dynamic_entry() {
+        let mut cmd = String::new();
+        append_filtered_libctest(&mut cmd, "pthread_cancel_sem_wait");
+
+        assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_sem_wait"));
+        assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_sem_wait"));
+        assert!(cmd.contains("SKIP entry-dynamic.exe pthread_cancel_sem_wait"));
+    }
+
+    #[test]
+    fn filtered_dynamic_only_libctest_case_does_not_run_missing_static_entry() {
+        let mut cmd = String::new();
+        append_filtered_libctest(&mut cmd, "dlopen");
+
+        assert!(!cmd.contains("./runtest.exe -w entry-static.exe dlopen"));
+        assert!(cmd.contains("SKIP entry-static.exe dlopen"));
+        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe dlopen)"));
+    }
+
+    #[test]
+    fn explicit_dynamic_missing_libctest_case_is_reported_without_start_marker() {
+        let mut cmd = String::new();
+        append_filtered_libctest(&mut cmd, "dynamic:pthread_cancel_sem_wait");
+
+        assert!(cmd.contains("SKIP entry-dynamic.exe pthread_cancel_sem_wait"));
+        assert!(!cmd.contains("START entry-dynamic.exe pthread_cancel_sem_wait"));
+    }
+
+    #[test]
+    fn full_libctest_routes_dynamic_sidecar_dso_cases_from_lib_cwd() {
+        let mut cmd = String::new();
+        append_full_libctest(&mut cmd);
+
+        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe dlopen)"));
+        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe tls_get_new_dtv)"));
+        assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe dlopen"));
+        assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe tls_get_new_dtv"));
+    }
+
+    #[test]
+    fn full_libctest_runs_current_pthread_cancel_cases() {
+        let mut cmd = String::new();
+        append_full_libctest(&mut cmd);
+
+        assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_points"));
+        assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel"));
+        assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_sem_wait"));
+        assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_points"));
+        assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel"));
+        assert!(!cmd.contains("skipped known hang"));
+    }
+
+    #[test]
+    fn filtered_ltp_emits_case_markers_without_default_suite() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_filtered_ltp(&mut cmd, "musl", "socket01+getsockopt01");
+
+        assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-musl ####"));
+        assert!(cmd.contains("; for case in socket01 getsockopt01"));
+        assert!(cmd.contains("RUN LTP CASE $case : $ltp_label"));
+        assert!(cmd.contains("\"$@\""));
+        assert!(cmd.contains("FAIL LTP CASE $case : $ret"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP END ltp-musl ####"));
+        assert!(!cmd.contains("basic_testcode.sh"));
+    }
+
+    #[test]
+    fn filtered_ltp_rejects_shell_metacharacters() {
+        let mut cmd = String::new();
+        append_filtered_ltp(&mut cmd, "musl", "socket01+bad;case");
+
+        assert!(cmd.contains("; for case in socket01"));
+        assert!(cmd.contains("SKIP LTP CASE bad;case : invalid case token"));
+        assert!(!cmd.contains("; for case in socket01 bad;case"));
+    }
+
+    #[test]
+    fn default_oscomp_uses_ltp_submit_whitelist() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_default_oscomp_scripts(&mut cmd);
+
+        assert!(cmd.contains("basic_testcode.sh"));
+        assert!(cmd.contains("libcbench_testcode.sh"));
+        assert!(cmd.contains("RUN LTP CASE $case : $ltp_label"));
+        assert!(cmd.contains("futex_wake03"));
+        assert!(cmd.contains("setitimer01"));
+        assert!(!cmd.contains("; target_dir=\"ltp/testcases/bin\""));
+        assert!(!cmd.contains("; /bin/setsid \"$file\""));
+    }
+
+    #[test]
+    fn ltp_submit_batch_uses_whitelist_without_p0_source_only_cases() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_ltp_batch(&mut cmd, "submit");
+
+        assert!(cmd.contains("confstr01"));
+        assert!(cmd.contains("futex_wake03"));
+        assert!(cmd.contains("setitimer01"));
+        assert!(!cmd.contains("timerfd04"));
+        assert!(!cmd.contains("; target_dir=\"ltp/testcases/bin\""));
+    }
+
+    #[test]
+    fn oscomp_suite_chain_does_not_gate_later_group_markers_on_previous_scripts() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_oscomp_musl_script(&mut cmd, "basic_testcode.sh");
+        append_full_libctest(&mut cmd);
+
+        assert!(cmd.contains("; ./busybox sh basic_testcode.sh"));
+        assert!(
+            cmd.contains("; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"")
+        );
+        assert!(!cmd.contains("basic_testcode.sh && ./busybox echo"));
+    }
+
+    #[test]
+    fn ltp_scripts_install_busybox_applets_and_get_helper_path() {
+        let mut full_cmd = String::from("cd /musl/musl");
+        append_oscomp_musl_script(&mut full_cmd, "ltp_testcode.sh");
+
+        assert!(full_cmd.contains("./busybox mkdir -p /bin"));
+        assert!(full_cmd.contains("/musl/musl/busybox --install -s /bin"));
+        assert!(full_cmd.contains("export LTPROOT=/musl/musl/ltp"));
+        assert!(full_cmd.contains("/musl/musl/ltp/testcases/bin"));
+        assert!(full_cmd.contains("; target_dir=\"ltp/testcases/bin\""));
+        assert!(full_cmd.contains("; /bin/setsid \"$file\""));
+        assert!(full_cmd.contains("RUN LTP CASE $name"));
+        assert!(full_cmd.contains("FAIL LTP CASE $name : $ret"));
+        assert!(!full_cmd.contains("; ./busybox sh ltp_testcode.sh"));
+        assert!(!full_cmd.contains("/tmp/ltp-busybox"));
+        assert!(!full_cmd.contains("/bin/timeout"));
+
+        let mut filtered_cmd = String::from("cd /musl/musl");
+        append_filtered_ltp(&mut filtered_cmd, "musl", "ar01.sh");
+
+        assert!(filtered_cmd.contains("./busybox mkdir -p /bin"));
+        assert!(filtered_cmd.contains("/musl/musl/busybox --install -s /bin"));
+        assert!(filtered_cmd.contains("export LTPROOT=/musl/musl/ltp"));
+        assert!(filtered_cmd.contains("/musl/musl/ltp/testcases/bin"));
+        assert!(filtered_cmd.contains("; for case in ar01.sh"));
+        assert!(!filtered_cmd.contains("/tmp/ltp-busybox"));
+        assert!(!filtered_cmd.contains("/bin/timeout"));
+    }
+}

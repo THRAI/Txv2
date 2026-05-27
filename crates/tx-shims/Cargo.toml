@@ -1,0 +1,40 @@
+[package]
+name = "tx-shims"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+test = true
+doctest = false
+
+[dependencies]
+# `SyscallRequest` is re-exported from `tx_kernel::trap_handoff` per
+# the Trio plan's Phase 1 surface; tx-shims pulls it through the
+# reactor-level seam instead so the kernel's `HostCheckAllocator`
+# (a `not(test)` global allocator that always returns null) does not
+# pollute test binaries that link tx-shims.
+tx-reactor = { path = "../tx-reactor" }
+tx-platform-adapter = { path = "../tx-platform-adapter" }
+tx-substrate = { path = "../tx-substrate" }
+tx-test-support = { path = "../tx-test-support" }
+tx-subsystems = { path = "../tx-subsystems" }
+# Pre-ELF Phase 6 (NR_EXECVE syscall arm): `sys_execve` calls
+# `tx_scripts::process::exec::exec_script` to drive the eight-phase
+# EXEC_v1 protocol. The dependency is one-directional (tx-scripts
+# does NOT pull tx-shims), so no cycle is introduced.
+tx-hal = { path = "../tx-hal" }
+tx-observe = { path = "../tx-observe" }
+tx-observe-types = { path = "../tx-observe-types" }
+tx-scripts = { path = "../tx-scripts" }
+tx-fs = { path = "../tx-fs" }
+tx-services = { path = "../tx-services" }
+
+[dev-dependencies]
+smoltcp = { path = "../../external/smoltcp-asterinas", default-features = false, features = ["alloc", "log", "medium-ethernet", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
+tx-subsystems = { path = "../tx-subsystems", features = ["test-support"] }
+
+[features]
+test-support = []

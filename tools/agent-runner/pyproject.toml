@@ -1,0 +1,23 @@
+[project]
+name = "tx-agent-runner"
+version = "0.1.0"
+description = "Local LangGraph runner for coordinating txKernel Codex worker lanes"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2",
+    "pytest>=8",
+]
+
+[project.scripts]
+tx-agent-runner = "tx_agent_runner.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tx_agent_runner"]

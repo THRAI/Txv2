@@ -1,0 +1,24 @@
+[package]
+name = "tx-kernel-riscv64-qemu-virt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Forward the board's `trap-trace` feature so users can write
+# `cargo build -p tx-kernel-riscv64-qemu-virt --features trap-trace`
+# (or `cargo xtask qemu --target rv64-qemu --trap-trace`).
+trap-trace = ["tx-hal-riscv64-qemu-virt/trap-trace"]
+
+[dependencies]
+tx-hal = { path = "../../crates/tx-hal" }
+tx-hal-riscv64-qemu-virt = { path = "../tx-hal-riscv64-qemu-virt" }
+tx-kernel = { path = "../../crates/tx-kernel" }
+
+[[bin]]
+name = "tx-kernel-riscv64-qemu-virt"
+path = "src/main.rs"
+test = false
+doctest = false

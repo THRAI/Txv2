@@ -1,0 +1,35 @@
+# busybox-procfs-basic.txt — OSComp busybox procfs compatibility smoke.
+#
+# Covers the commands that failed when `/proc` was absent from the
+# boot rootfs: `df` needs `/proc/mounts`, `ps` needs `/proc/<pid>/stat`,
+# and `free` needs `/proc/meminfo`.
+
+wait "/ # " within 30000
+sleep 500
+
+send "cat /proc/mounts\n"
+expect "rootfs / rootfs" within 5000
+expect "/ # " within 5000
+
+sleep 500
+send "cat /proc/meminfo\n"
+expect "MemTotal:" within 5000
+expect "/ # " within 5000
+
+sleep 500
+send "/bin/busybox df\n"
+expect "Filesystem" within 8000
+expect "/ # " within 5000
+
+sleep 500
+send "/bin/busybox ps\n"
+expect "PID" within 8000
+expect "/ # " within 5000
+
+sleep 500
+send "/bin/busybox free\n"
+expect "Mem:" within 8000
+expect "/ # " within 5000
+
+sleep 500
+quit

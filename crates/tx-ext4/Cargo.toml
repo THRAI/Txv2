@@ -1,0 +1,29 @@
+[package]
+name = "tx-ext4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Enable the async host-side adapter (uses std::sync::Mutex, BTreeMap).
+# Off by default so the crate compiles for no_std kernel targets.
+host-async = []
+std = []
+
+[dependencies]
+tx-ext4-format = { path = "../tx-ext4-format" }
+tx-platform-adapter = { path = "../tx-platform-adapter" }
+tx-substrate = { path = "../tx-substrate" }
+tx-test-support = { path = "../tx-test-support" }
+tx-subsystems = { path = "../tx-subsystems" }
+
+[dev-dependencies]
+tx-subsystems = { path = "../tx-subsystems", features = ["vfs-read-test-support"] }
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
+
+[[test]]
+name = "async_adapter"
+path = "tests/async_adapter.rs"
+required-features = ["host-async"]

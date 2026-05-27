@@ -1,0 +1,85 @@
+# busybox-prompt.txt — busybox sh interactive coverage smoke.
+#
+# Run with:
+#   cargo build -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf
+#   cargo xtask image cpio --profile busybox --target rv64-qemu
+#   cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/busybox-prompt.txt
+#
+# Coverage map — each block exercises a syscall family the v3 migration
+# touched:
+#   - `echo …`              → sys_write (PR-3D-4 tty WaitSource path)
+#   - `pwd`                 → sys_getcwd  (process state)
+#   - `ls /`                → sys_openat + sys_getdents64 (PR-3D-5 vfs)
+#   - `echo a | cat`        → sys_pipe2 + sys_clone + sys_dup3 + sys_close
+#                              (PR-3D-1 pipe + W-A's sys_clone wiring)
+#   - `true && echo done`   → shell-builtin sequencing (no new syscall;
+#                              acts as a "did the prior block finish
+#                              cleanly?" gate)
+#
+# The deliberate `sleep` directives are heisenbug-catches: we don't
+# race input the instant the prompt appears, so timing-dependent
+# bugs (e.g. "what if input arrives before the read syscall
+# registers its waiter?") have a chance to surface.
+
+# Boot the kernel through to busybox sh's interactive prompt.
+# 30s budget because busybox initramfs + execve loader take a while
+# in QEMU-debug (real metal is much faster).
+wait "/ # " within 30000
+
+# Pause so any post-prompt initialisation finishes before we type.
+sleep 500
+
+# 1) No-op shell line — bare newline returns the prompt. Probes that
+#    the TTY ingest pipeline (PR-3D-4) cleanly round-trips a single
+#    LF through the line discipline back to the shell's read loop.
+send "\n"
+expect "/ # " within 5000
+
+# 2) Shell builtin that never execs a child. Sanity gate before we
+#    start exercising the pipe + fork paths.
+sleep 500
+send "true\n"
+expect "/ # " within 5000
+
+# 3) sys_write coverage — print a recognizable token and assert it
+#    echoes through the TTY before the prompt returns.
+sleep 500
+send "echo hello-v3\n"
+expect "hello-v3" within 5000
+expect "/ # " within 5000
+
+# 4) sys_getcwd coverage — `pwd` reads the process's current working
+#    directory through the cwd cap that W-E's Cap-shape reshape pinned.
+sleep 500
+send "pwd\n"
+expect "/" within 5000
+expect "/ # " within 5000
+
+# 5) sys_openat + sys_getdents64 coverage — `ls /` walks the root
+#    directory. Exercises the PR-3D-5 vfs WaitSource path indirectly
+#    (the dir read is synchronous but the walker structure is the
+#    same one D11.5 retires from Channel-pairing).
+sleep 500
+send "ls /\n"
+expect "/ # " within 8000
+
+# 6) sys_pipe2 + sys_clone + sys_dup3 + sys_close coverage — pipe a
+#    line through `cat` to round-trip it back to stdout. Exercises
+#    PR-3D-1 (pipe WaitSource) and the W-A sys_clone wiring (PR-9
+#    phase 3b's first wired syscall arm).
+sleep 800
+send "echo pipe-ok | cat\n"
+expect "pipe-ok" within 8000
+expect "/ # " within 5000
+
+# 7) Sequencing gate — shell-level `&&` ensures the prior pipeline
+#    closed cleanly (no orphaned child processes hanging the prompt).
+sleep 500
+send "true && echo done\n"
+expect "done" within 5000
+expect "/ # " within 5000
+
+# Quit cleanly — closes stdin, waits for QEMU to exit within the
+# driver's grace period.
+sleep 500
+quit

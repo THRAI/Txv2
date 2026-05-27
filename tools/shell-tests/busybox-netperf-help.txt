@@ -1,0 +1,23 @@
+# busybox-netperf-help.txt — N70b OSComp dynamic musl netperf startup smoke.
+#
+# Build image with:
+#   TX_OSCOMP_RISCV_MUSL_DIR=/home/msp/learning/rustOS/testcase/riscv/musl \
+#     cargo xtask image cpio --profile busybox --target rv64-qemu
+#
+# This proves the dynamic musl loader path is present and both netperf
+# binaries can be exec'd far enough to print help text and return to
+# the shell prompt. Client/server traffic is later N70/N71 work.
+
+wait "/ # " within 30000
+sleep 500
+
+send "/bin/netperf -h\n"
+expect "Usage: netperf" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "/bin/netserver -h\n"
+expect "Usage: netserver" within 10000
+expect "/ # " within 10000
+
+quit

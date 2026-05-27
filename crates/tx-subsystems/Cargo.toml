@@ -1,0 +1,38 @@
+[package]
+name = "tx-subsystems"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+test = true
+doctest = false
+
+[features]
+default = []
+vfs-read-test-support = []
+# Cross-crate test helpers (zone reset / pid counter reset / init slot
+# reset). Off by default; enabled by sibling crates' `[dev-dependencies]`
+# entries (e.g. `tx-shims`'s Phase 2a syscall-dispatch tests).
+test-support = []
+
+[dependencies]
+smoltcp = { path = "../../external/smoltcp-asterinas", default-features = false, features = ["alloc", "log", "medium-ethernet", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
+tx-hal = { path = "../tx-hal" }
+tx-platform-adapter = { path = "../tx-platform-adapter" }
+tx-reactor = { path = "../tx-reactor" }
+tx-substrate = { path = "../tx-substrate" }
+tx-vdso = { path = "../tx-vdso" }
+tx-test-support = { path = "../tx-test-support" }
+
+[dev-dependencies]
+tx-ext4-format = { path = "../tx-ext4-format" }
+# Self-dep with `test-support` enabled so integration tests in
+# `tests/` can reach the `_for_test` helpers gated behind
+# `feature = "test-support"` (D9-B's eligibility-scan pins and
+# D9-C's interrupt-wake pin both need multi-thread setup via
+# `process::execution::spawn_sibling_thread_for_test`).
+tx-subsystems = { path = ".", features = ["test-support"] }
+tx-test-support = { path = "../tx-test-support" }

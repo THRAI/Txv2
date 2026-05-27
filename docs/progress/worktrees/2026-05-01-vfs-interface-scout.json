@@ -1,0 +1,22 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-05-01-vfs-interface-scout",
+  "created": "2026-05-01",
+  "updated": "2026-05-02",
+  "status": "closed",
+  "branch": "codex/vfs-interface-scout",
+  "path": "/private/tmp/Tx-worktrees/codex-vfs-interface-scout",
+  "base": "main",
+  "plan": "docs/progress/plans/2026-04-29-kernel-main-long-term-checklist.json",
+  "owner": "VFS interface scout worker",
+  "write_scope": [
+    "docs/progress/research/2026-05-01-vfs-interface-scout.md",
+    "docs/progress/worktrees/2026-05-01-vfs-interface-scout.json"
+  ],
+  "verification": [
+    "cargo xtask progress validate",
+    "cargo xtask lint docs",
+    "git diff --check"
+  ],
+  "notes": "Scout lane complete. The readiness note on codex/vfs-interface-scout identified the missing VFS/Mount/PageBacked/backend interface seam and intentionally avoided implementation edits. The coordinator consumed that note on codex/vm-pagebacked-impl and landed the interface-only shells in tx-kernel: shared Errno/StepOutcome, device/block handles, VFS live-node shells, mount payload/identity/bootstrap shells, FsOps/FsPageBacking traits, and PageContainerKind::File { mount: Cap<MountPayload>, fs_object_id: FsObjectId }. Verification for the landing lane: cargo fmt --check; cargo test -p tx-kernel --lib; cargo xtask progress validate; cargo xtask lint docs; git diff --check. Next step: future implementation lanes can build real VFS walker, PageBacked file/device materialization, Mount, bdev-fs/devfs, and kernel-facing ext4 behavior against these names. Blockers/deferred work: no runtime VFS/backend behavior was implemented by the scout or seam landing."
+}

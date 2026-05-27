@@ -1,0 +1,19 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "YYYY-MM-DD-short-title",
+  "created": "YYYY-MM-DD",
+  "updated": "YYYY-MM-DD",
+  "status": "active",
+  "branch": "codex/short-title",
+  "path": "/absolute/path/to/worktree",
+  "base": "main",
+  "plan": "docs/progress/plans/YYYY-MM-DD-short-title.json",
+  "owner": "agent-or-human",
+  "write_scope": [
+    "path/prefix"
+  ],
+  "verification": [
+    "cargo xtask check"
+  ],
+  "notes": ""
+}

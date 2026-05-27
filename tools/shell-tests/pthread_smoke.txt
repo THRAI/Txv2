@@ -1,0 +1,11 @@
+# pthread_smoke.txt — run pthread_test via busybox shell
+# Requires pthread_test binary in /bin/ of the initramfs.
+# Run with:
+#   cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/pthread_smoke.txt
+
+wait "/ # " within 10000
+sleep 500
+send "/bin/pthread_test\n"
+expect "PASS" within 5000
+sleep 500
+quit

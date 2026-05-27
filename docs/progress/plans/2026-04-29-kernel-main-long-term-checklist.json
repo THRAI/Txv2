@@ -1,0 +1,460 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-04-29-kernel-main-long-term-checklist",
+  "title": "Long-term kernel_main checklist",
+  "status": "active",
+  "created": "2026-04-29",
+  "updated": "2026-05-06",
+  "owner": "codex",
+  "summary": "Track the path from the current sentinel-and-shutdown kernel_main to the design-doc target: CoreInit, trap shell, reactor/scheduler, VM, subsystem init, and first userspace.",
+  "scope": {
+    "in": [
+      "crates/tx-kernel",
+      "crates/tx-hal",
+      "crates/tx-substrate",
+      "boards/tx-hal-riscv64-qemu-virt",
+      "boards/tx-kernel-riscv64-qemu-virt",
+      "docs/design",
+      "docs/progress"
+    ],
+    "out": [
+      "crates/tx-kernel/src/syscall/full-posix-completeness",
+      "crates/tx-kernel/src/device/tier3-dynamic-discovery",
+      "crates/tx-kernel/src/scheduler/phase2-policies",
+      "crates/tx-kernel/src/fpu",
+      "boards/tx-kernel-k210"
+    ],
+    "write_sets": [
+      {
+        "owner": "future-kernel-main-workers",
+        "paths": [
+          "docs/progress/plans/2026-04-29-kernel-main-long-term-checklist.json"
+        ],
+        "notes": "Shared roadmap only. Individual implementation slices claim disjoint write sets through their worktree records before parallel work."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/INDEX.md",
+      "docs/design/00_meta-framework/MODULE_MAP_v1.md",
+      "docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md",
+      "docs/design/00_meta-framework/INVARIANTS_v4.md",
+      "docs/design/01_substrate/HAL_v1.md",
+      "docs/design/01_substrate/PAGE_SUBSTRATE_v1.md",
+      "docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md",
+      "docs/design/01_substrate/BUS_v1.md",
+      "docs/design/02_execution/STEP_MODEL_v1.md",
+      "docs/design/02_execution/REACTOR_v0.md",
+      "docs/design/02_execution/SCHEDULER_v0.md",
+      "docs/design/02_execution/THREAD_RUNTIME_v1.md",
+      "docs/design/02_execution/EXEC_v1.md",
+      "docs/design/03_memory-vm/VM_v1_2.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/design/04_process-signals/PROCESS_v1.md",
+      "docs/design/04_process-signals/SIGNAL_v1.md",
+      "docs/design/04_process-signals/SIGNAL_ATTACHMENTS_v1.md",
+      "docs/design/05_filesystem/VFS_CHECKS_V2.1.md",
+      "docs/design/06_devices/DEVICE.md",
+      "docs/design/06_devices/TTY.md"
+    ],
+    "progress_refs": [
+      "docs/progress/STATUS.md",
+      "docs/progress/decisions/2026-04-29-code-reorganization-skill-and-line-limit.md",
+      "docs/progress/decisions/2026-04-29-substrate-slab-heap-zero-frame.md",
+      "docs/progress/decisions/2026-04-29-process-root-asid-shootdown-anchors.md",
+      "docs/progress/decisions/2026-04-29-rv64-minimal-trap-vector.md",
+      "docs/progress/decisions/2026-04-29-substrate-pmap-range-wrappers.md",
+      "docs/progress/plans/2026-04-30-reactor-parallel-shards.json",
+      "docs/progress/plans/2026-04-30-reactor-third-wave-dispatch.json",
+      "docs/progress/plans/2026-05-01-reactor-runtime-dispatch.json",
+      "docs/progress/plans/2026-05-04-vm-pagebacked-v1-completion.json",
+      "docs/progress/decisions/2026-05-04-vm-pagebacked-v1-plan-closure.md",
+      "docs/progress/plans/2026-05-05-trio-trap-syscall-tmpfs-devfs.md",
+      "docs/progress/decisions/2026-05-06-trio-trap-syscall-tmpfs-devfs.md",
+      "docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md",
+      "docs/progress/decisions/2026-05-06-pre-elf-runtime-completion.md",
+      "docs/progress/plans/2026-05-06-elf-loader-and-execve.md",
+      "docs/progress/research/2026-05-06-execve-and-elf-loader-scaffolding.md",
+      "docs/progress/research/2026-05-06-musl-ltp-execve-coverage.md",
+      "docs/progress/decisions/2026-05-06-elf-loader-and-execve.md",
+      "docs/progress/plans/2026-05-06-fork-clone-wait4.md",
+      "docs/progress/research/2026-05-06-fork-clone-wait4-scaffolding.md",
+      "docs/progress/decisions/2026-05-06-fork-clone-wait4.md",
+      "docs/progress/plans/2026-05-06-dac-and-setuid.md",
+      "docs/progress/research/2026-05-06-dac-and-setuid-scaffolding.md",
+      "docs/progress/decisions/2026-05-06-dac-and-setuid.md"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "baseline-h3-sentinel-kernel-main",
+      "title": "Keep the current H3 kernel_main sentinel baseline green",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/lib.rs",
+        "boards/tx-kernel-riscv64-qemu-virt/src/main.rs",
+        "boards/tx-hal-riscv64-qemu-virt/src/lib.rs",
+        "crates/tx-substrate/src/lib.rs"
+      ],
+      "verification": [
+        "cargo xtask ci",
+        "cargo xtask ci-slow --target rv64-qemu --profile smoke --expect-sentinel"
+      ],
+      "notes": "Current kernel_main reaches P::init_early, tx_substrate::init::<P>(), P::init_later, P::install_kernel_trap_vector, prints txkernel:qemu-riscv64-virt:boot:ok, then powers off. Preserve this while replacing the tail with runtime init. Evidence: baseline maintained through subsequent slices; see docs/progress/worktrees/2026-04-29-coreinit-spine.json."
+    },
+    {
+      "id": "coreinit-spine",
+      "title": "Replace sentinel tail with an explicit CoreInit spine",
+      "status": "complete",
+      "depends_on": [
+        "baseline-h3-sentinel-kernel-main"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/lib.rs",
+        "crates/tx-kernel/src/init.rs",
+        "crates/tx-hal/src/lib.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel",
+        "cargo xtask ci"
+      ],
+      "notes": "Complete in docs/progress/worktrees/2026-04-29-coreinit-spine.json. tx_kernel::kernel_main now delegates to init::CoreInit<P>::boot, which encodes the current H3 order directly while preserving the reactor task and boot sentinels. H4 slots for post-substrate hooks, VFS/device ordering, scheduler/process/userspace init remain explicit deferred placeholders. Evidence: docs/progress/worktrees/2026-04-29-coreinit-spine.json; CoreInit smoke later upgraded to run_until_idle_with_clock under docs/progress/plans/2026-04-30-reactor-third-wave-dispatch.json (parallel-kernel-coreinit-hal-clock) and init_process_subsystem now runs in init_substrate_if_ready (commit b50a472 boot wiring; decision 2026-05-05-boot-wiring.md)."
+    },
+    {
+      "id": "zone-epoch-bus-foundation",
+      "title": "Bring up zone, epoch, index, mutation, and bus foundations before semantic subsystems",
+      "status": "complete",
+      "depends_on": [
+        "coreinit-spine"
+      ],
+      "paths": [
+        "crates/tx-substrate/src",
+        "crates/tx-kernel/src"
+      ],
+      "verification": [
+        "cargo test -p tx-substrate",
+        "cargo xtask lint arch",
+        "cargo xtask ci"
+      ],
+      "notes": "Substrate ships epoch::guard / retire_raw, zone Cap/PayloadCap/Weak/IdentRef mechanics, persistent index mutation (RecipeIndex AtomicPtr+writer mutex), and RawQueue/RawPort/RawTrace bus carriers with reactor-owned wakers. Bus wire hardening landed under the third-wave dispatch. Evidence: docs/progress/plans/2026-04-30-reactor-parallel-shards.json (parallel-wait-bus, complete) + docs/progress/plans/2026-04-30-reactor-third-wave-dispatch.json (parallel-substrate-bus-wire-hardening, complete) + docs/progress/plans/2026-05-04-vm-pagebacked-v1-completion.json persistent-epoch-recipes step which exposes tx_substrate::epoch::retire_raw publicly. Tests: cargo test -p tx-substrate (50 tests) and cargo test -p tx-reactor passing under each plan's verification gate."
+    },
+    {
+      "id": "trap-shell-and-kernel-sink",
+      "title": "Replace the panic-only vector with the full trap shell and KernelTrapSink",
+      "status": "pending",
+      "depends_on": [
+        "coreinit-spine"
+      ],
+      "paths": [
+        "crates/tx-hal/src",
+        "crates/tx-kernel/src/trap.rs",
+        "boards/tx-hal-riscv64-qemu-virt/src"
+      ],
+      "verification": [
+        "cargo test -p tx-hal",
+        "cargo test -p tx-hal-riscv64-qemu-virt",
+        "cargo xtask ci"
+      ],
+      "notes": "Implement RawTrapFrame, TrapFrameView, TrapFrameMut, classify-from-frame, user and kernel vector installation, return_to_userspace, and direct named KernelTrapSink methods for page fault, syscall, timer, external IRQ, IPI, and sync fault. Keep trap dispatch out of linkme. Trio Phase 1 (commit f2d84b7) replaced the on_syscall/on_page_fault Terminate stubs with a UserspaceRunSlot handoff via the new trap_handoff module: SyscallRequest/PageFaultInfo translators, hand_off_syscall/hand_off_user_pf, current_thread_payload per-hart slot. Pre-ELF Phase 2 (commit abc9fb8) added TrapIf::enter_userspace_with_context as the portable HAL entry hook (default-panic; RV64 board override at boards/tx-hal-riscv64-qemu-virt/src/trap.rs builds Rv64TrapFrame from UserTrapContext via existing restore_user_context+return_to_userspace). Pre-ELF Phase 5 (commit 3cb95d6) added IRQ dispatch table walked at boot via the new explicit register_irq_handler / install_irq_handlers boot step (no linkme — Open Q #4). Plan B for syscall-return writeback is locked in (the trap shell never writes the trap frame; userspace-entry shim drains pending_syscall_return and writes a0 against a fresh frame). Still pending: RawTrapFrame as a portable HAL surface, TrapFrameMut writeback (Plan B is implemented but the legacy direct-write path is not exposed), kernel vector installation, the named KernelTrapSink methods for timer/IPI/sync, and KERNEL_FIXUP_TABLE-style kernel-mode fault recovery."
+    },
+    {
+      "id": "user-access-fixups",
+      "title": "Install user-access and kernel-mode fault recovery",
+      "status": "pending",
+      "depends_on": [
+        "trap-shell-and-kernel-sink",
+        "vm-address-space-core"
+      ],
+      "paths": [
+        "crates/tx-hal/src",
+        "crates/tx-kernel/src",
+        "boards/tx-hal-riscv64-qemu-virt/src"
+      ],
+      "verification": [
+        "cargo test -p tx-hal",
+        "cargo xtask ci"
+      ],
+      "notes": "UserAccessIf copyin/copyout exists and is used by page_backed::step_read_to_user / step_write_from_user (PageBacked v1 user-buffer-byte-copy slice). The KERNEL_FIXUP_TABLE kernel-mode-fault recovery path is still pending and depends on the full trap shell to install fixups before kernel-mode dereferences run."
+    },
+    {
+      "id": "percpu-smp-gates",
+      "title": "Publish per-hart state and explicit SMP gates",
+      "status": "pending",
+      "depends_on": [
+        "coreinit-spine",
+        "trap-shell-and-kernel-sink"
+      ],
+      "paths": [
+        "crates/tx-hal/src",
+        "crates/tx-kernel/src",
+        "boards/tx-hal-riscv64-qemu-virt/src"
+      ],
+      "verification": [
+        "cargo test -p tx-hal-riscv64-qemu-virt",
+        "cargo xtask lint unused",
+        "cargo xtask ci"
+      ],
+      "notes": "Define per-hart kernel stack/scratch/TLS state, current task pointer access, AP parked/online states, and a clear single-hart gate for features that do not yet have remote coordination. AP startup may stay disabled until remote shootdown and scheduler handoff land."
+    },
+    {
+      "id": "reactor-and-round-robin-scheduler",
+      "title": "Implement reactor task table, wait-adapt, wakers, idle, and MVP scheduler",
+      "status": "complete",
+      "depends_on": [
+        "zone-epoch-bus-foundation",
+        "percpu-smp-gates"
+      ],
+      "paths": [
+        "crates/tx-reactor",
+        "crates/tx-kernel/src/reactor",
+        "crates/tx-kernel/src/scheduler",
+        "crates/tx-kernel/src/lib.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel",
+        "cargo xtask ci"
+      ],
+      "notes": "Three reactor dispatch plans landed the task table, wait/bus subscription, timer queue, scheduler shell, AST poll-boundary consumption, cooperative yield, userspace-run shell, and per-hart loop API. Evidence: docs/progress/plans/2026-04-30-reactor-parallel-shards.json (complete; 65 reactor tests, ci green) + docs/progress/plans/2026-04-30-reactor-third-wave-dispatch.json (complete; 71 reactor tests, ci green) + docs/progress/plans/2026-05-01-reactor-runtime-dispatch.json (complete; userspace-run + per-hart loop merged, ci green). Per-hart loop and userspace-run remain reactor-local shells; trap-side return_to_userspace and AST signal policy are owned by trap-shell-and-kernel-sink and process-and-thread-runtime-core."
+    },
+    {
+      "id": "vm-address-space-core",
+      "title": "Implement VM AddressSpace, recipes, RangeLock, and pmap materialization",
+      "status": "complete",
+      "depends_on": [
+        "zone-epoch-bus-foundation",
+        "baseline-h3-sentinel-kernel-main"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm",
+        "crates/tx-substrate/src",
+        "crates/tx-hal/src/pmap.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel vm",
+        "cargo test -p tx-substrate",
+        "cargo xtask ci"
+      ],
+      "notes": "AddressSpace ships with persistent (AtomicPtr+writer-mutex, EBR-retired) RecipeIndex per VM_v1_2 §1.2, ExclusiveWriter/SharedReader RangeLock acquire_step/acquire_pair_step, pmap materialization through PmapIf, fault_script_async, map/unmap/protect/remap/brk async scripts, fork_aspace + exec_aspace, mincore/madvise/msync, and a wait_carrier-backed RangeLock release channel. Trap page-fault dispatch and Process ownership of Cap<AddressSpace> remain owned by downstream steps. Evidence: docs/progress/plans/2026-05-04-vm-pagebacked-v1-completion.json (complete) + docs/progress/decisions/2026-05-04-vm-pagebacked-v1-plan-closure.md + commits cb35a62 (rename scripts to VM_v1_2 spec names), 63e72fc (reconcile VM_v1_2 with implementation surface), 83a3903 (MADV_DONTNEED + MADV_FREE), b9c7c38 (RangeLock acquire_step canonical surface)."
+    },
+    {
+      "id": "pmap-shootdown-completion",
+      "title": "Complete multi-page, superpage, ASID/global, and remote shootdown accounting",
+      "status": "pending",
+      "depends_on": [
+        "vm-address-space-core",
+        "percpu-smp-gates"
+      ],
+      "paths": [
+        "crates/tx-substrate/src",
+        "crates/tx-hal/src/pmap.rs",
+        "boards/tx-hal-riscv64-qemu-virt/src/pmap"
+      ],
+      "verification": [
+        "cargo test -p tx-substrate --test pmap",
+        "cargo test -p tx-hal-riscv64-qemu-virt",
+        "cargo xtask ci"
+      ],
+      "notes": "Generalize current page-sized local batches to multi-frame runs, superpage accounting, ASID-scoped and global invalidations, and remote-hart acknowledgment. Until this lands, keep user/VM runtime behind a single-hart gate or explicit no-remote-shootdown mode."
+    },
+    {
+      "id": "page-backed-and-reclaim",
+      "title": "Implement PageContainer, RNodeBacking, materialize_page, and reclaim policy hooks",
+      "status": "complete",
+      "depends_on": [
+        "vm-address-space-core",
+        "reactor-and-round-robin-scheduler"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/page_backed",
+        "crates/tx-kernel/src/vfs",
+        "crates/tx-kernel/src/vm"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel page_backed",
+        "cargo xtask ci"
+      ],
+      "notes": "PageContainer, FsPageBacking/RNodeBacking, materialize_page, install_shared_page + cow_replace_into_private (reflink/CoW scaffold), step_read/step_write/step_read_to_user/step_write_from_user, step_truncate (with byte-accurate partial-EOF zero), step_fallocate, step_fsync, and step_copy_file_range all shipped under PAGE_BACKED_v1. PAGE_BACKED §8 reclaim policy and §12 writeback scheduling hooks remain explicitly deferred by the design docs. Evidence: docs/progress/plans/2026-05-04-vm-pagebacked-v1-completion.json (complete) + docs/progress/decisions/2026-05-04-vm-pagebacked-v1-plan-closure.md. 43 page_backed tests + 60 vm tests pass under that plan's verification gate."
+    },
+    {
+      "id": "process-and-thread-runtime-core",
+      "title": "Implement Process, ThreadIdentity/ThreadPayload, and thread_future skeleton",
+      "status": "complete",
+      "depends_on": [
+        "reactor-and-round-robin-scheduler",
+        "vm-address-space-core",
+        "trap-shell-and-kernel-sink"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/process",
+        "crates/tx-kernel/src/thread_runtime",
+        "crates/tx-kernel/src/trap.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel thread_runtime",
+        "cargo xtask ci"
+      ],
+      "notes": "Process / ProcessGroup / Session / Thread topology, signal post-and-observe, default-terminate route via step_exit_group_with_signal, cred + kill permission check, cwd/chdir/getcwd VFS seam, and INIT_PROCESS bootstrap have all landed (commits 3652bd1, c982b81, 51d0b2a, c2bce56, 362b22a, 1f09e2a, 531c783; decisions 2026-05-05-process-topology-day1.md, signal-day1.md, cred-day1.md, ast-dispatch.md, step-exit-group-with-signal.md, cwd-vfs-integration.md). Trio Phase 1 (commit f2d84b7) added ThreadPayload's saved-user-trap-frame storage and signal-state slots (userspace_slot, active_request, saved_user_context, pending_syscall_return) plus the per-hart current_thread_payload registry. Phase 2a (abefad4) added the stub fd table on ProcessPayload with step_fork cloning. Phase 2b (119602b) added brk_base/current_brk on ProcessPayload and bootstrap_init_process seeding. Pre-ELF Phase 2 (commit abc9fb8) shipped the production thread_future skeleton: pub async fn run_thread<P>(payload) loops dispatch -> AST -> entry-shim -> divergent enter_userspace_with_context; pub struct PerHartSlotted<F> stages the per-hart slot around Future::poll; pub fn prepare_userspace_entry_payload(payload) -> UserTrapContext drains pending_syscall_return into a0 (Plan B); pub fn ThreadIdentity::payload_cap() (Phase 7 promotion from payload_cap_for_test). Pre-ELF Phase 7 (commit 69a3efd) restructured run_thread's two-request lifecycle (resolution + entry) so the AST checkpoint subject lives across the divergent call. Step delivered. Remaining for downstream: real per-task AST plumbing so checkpoint_userspace_entry (not _batch with empty AstBatch::default()) can wire signal-handler frames; this is signal-attachments / sigreturn territory."
+    },
+    {
+      "id": "syscall-dispatch-and-ast-loop",
+      "title": "Add syscall dispatch, page-fault dispatch, and AST return-to-user loop",
+      "status": "complete",
+      "depends_on": [
+        "process-and-thread-runtime-core",
+        "user-access-fixups",
+        "page-backed-and-reclaim"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/syscall",
+        "crates/tx-kernel/src/trap.rs",
+        "crates/tx-kernel/src/thread_runtime"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel syscall",
+        "cargo xtask ci"
+      ],
+      "notes": "Implement fixed syscall table dispatch, VM page-fault materializer dispatch, error/return-value writes through TrapFrameMut, and Site B AST handling before user re-entry. Timer preemption should not advance thread_future; interesting traps do. Trio Phase 2a (commit abefad4) and Phase 2b (commit 119602b) populated tx-shims with linux_syscall::dispatch covering 8 entries: NR_WRITE, NR_READ, NR_EXIT, NR_EXIT_GROUP, NR_GETPID, NR_BRK, NR_RT_SIGPROCMASK, NR_RT_SIGACTION. Each entry calls existing step_* functions; partial-success Linux semantics for write/read; brk-never-returns-negative semantics; rt_sigaction decodes the 32-byte modern struct (RV64 has no legacy sigaction). Trio Phase 6 (commit 6828b00) end-to-end fake-driver smoke verified the dispatch path through OPOST and zombie transition. Pre-ELF Phase 3 (commit b49b302) added VM page-fault async dispatch in the thread future: aspace.fault_script(VmFault).await with Ok loops back through the userspace-entry checkpoint and Err routes default-action SIGSEGV via step_exit_group_with_signal (txdoc:VM-5-1-FAULT-HANDLER + SIGNAL_v1 §15.1). Pre-ELF Phase 5 (commit 3cb95d6) added the blocking read carrier path: sys_read awaits on tx_subsystems::wait_carrier::wait_on_token, woken by the UART RX IRQ handler -> tty::execution::step_ingest -> tty.input_readable.fire(TTY_READABLE). Pre-ELF Phase 2 (commit abc9fb8) added Plan B writeback discipline (TrapIf::enter_userspace_with_context is the only site that writes a0; trap shell never writes the trap frame). Pre-ELF Phase 7 (commit 69a3efd) end-to-end production smoke (no synthesised driver) exercises the full chain: PerHartSlotted -> run_thread -> dispatch -> walker -> tty -> ConsoleIf, asserts merged regs[10]==dispatcher's encoded return. Step delivered. Remaining for downstream: real per-task AST plumbing (signal-handler frame setup beyond EnterUserspace). Empty-batch AstBatch::default() shortcut is correct for this slice because only EnterUserspace is valid; signal attachments / sigreturn is the next piece."
+    },
+    {
+      "id": "vfs-device-and-tty-init",
+      "title": "Initialize VFS, tier-1/tier-2 devices, IRQ dispatch, devfs, and console/TTY",
+      "status": "complete",
+      "depends_on": [
+        "coreinit-spine",
+        "zone-epoch-bus-foundation",
+        "trap-shell-and-kernel-sink"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vfs",
+        "crates/tx-kernel/src/device",
+        "crates/tx-kernel/src/tty",
+        "crates/tx-hal/src"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel device",
+        "cargo test -p tx-kernel vfs",
+        "cargo xtask ci"
+      ],
+      "notes": "VFS spec-reconciliation Phases 2-4 collapsed VFS/VM/TTY/page_backed into tx-subsystems and the canonical VFS surface (commits d0b2ab6, 1b91e5d; decision 2026-05-04-vfs-spec-reconciliation-phase-2-3-4.md). TTY now publishes typed Cap<Session>/Cap<ProcessGroup> and a deliver_tty_dispatch signal bridge (commits 4b68570, a50320c). Trio Phase 3a (commit 91f2175) populated tx-fs::devfs with a read-only FsOps backend that resolves /dev/console through the existing TTY alias registry (StructBacked { Tty }) and exposes open_console_for_init() for fd preopen. Phase 3b (commit ffc098c) populated tx-fs::tmpfs with a full FsOps + FsPageBacking backend over PageContainerKind::Anon { Reclaimable } and added the 5-step boot wiring in init.rs (register_console_hardware -> mount_rootfs_tmpfs -> mount_devfs_at_dev -> register_devfs_console_alias -> bind_init_cwd_and_root). ROOT_MOUNT, DEV_MOUNT, CONSOLE_TTY globals are populated; init.fd(0/1/2) are preopened to /dev/console. Pre-ELF Phase 4 (commit 04edaa6) shipped the VFS walker (step_walk + step_open with SYMLOOP_MAX=40 hop ELOOP). Pre-ELF Phase 6 (commit e757bc0) added MountId/DevId allocators, wired mount::register_mount(&rootfs_payload, dev_object_id, dev_mount) into mount_devfs_at_dev, and added FsOps::materialise_rnode override on devfs so the walker resolves /dev/console end-to-end (boot smoke boot_smoke_walker_resolves_dev_console_after_mount_registration). Pre-ELF Phase 5 (commit 3cb95d6) added the IRQ dispatch table walked at boot via crates/tx-kernel/src/irq.rs::install_irq_handlers, registers UART RX handler under <P as IrqIf>::UART_IRQ, drains via ConsoleIf::read_bytes, calls tty::execution::step_ingest. Boot trace: :process:init:ok -> :tty:console:ok -> :irq:install:ok -> :mount:rootfs:tmpfs:ok -> :mount:devfs:ok -> :devfs:console:alias:ok -> :init:cwd:ok -> :boot:ok. Step delivered."
+    },
+    {
+      "id": "exec-loader-and-detached-aspace",
+      "title": "Build exec loader and detached AddressSpace construction",
+      "status": "complete",
+      "depends_on": [
+        "vfs-device-and-tty-init",
+        "page-backed-and-reclaim",
+        "process-and-thread-runtime-core"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/exec",
+        "crates/tx-kernel/src/vm",
+        "crates/tx-kernel/src/process"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel exec",
+        "cargo xtask ci"
+      ],
+      "notes": "AddressSpace::exec_aspace teardown landed under VM/PageBacked v1. The full exec loader landed across 7 commits on feat/elf-loader-and-execve (3709750/6167898 chores; c67c970 Wave 1 = page_backed::read_exact_at + vm::scripts::build_aspace_from_image + vm::scripts::populate_detached_user_range + ImagePlan/LoadSegment/BssTail + ProcessPayload.aspace flip to AtomicSlot + build_initial_user_stack with 6-entry musl auxv + goblin parser binding; 5bdfc63 Wave 2 = CLOEXEC bitmap + fcntl(F_SETFD) arm + step_close_cloexec_fds/step_reset_signal_dispositions_for_exec/step_install_brk_for_exec; ecc1a86 Wave 3 = exec_script orchestrating EXEC_v1's 8 phases with EXEC-PONR enforced; b6fd6aa Wave 4 = NR_EXECVE=221 syscall arm + SyscallResult::ExecCommitted + thread_future handling; d9548b8 Wave 5 = tmpfs FsOps::materialise_rnode override + hand-encoded RV64 ELF fixture (218 bytes) + run_bootstrap_exec_for_init wired into init.rs). Plan B writeback discipline preserved throughout. Step delivered. Remaining for downstream: ET_DYN/PIE binaries, PT_INTERP/dynamic linking, real PT_TLS handling beyond what musl self-installs, setuid/setgid + DAC, shebang #!, ETXTBSY, fork/clone/wait4 chains, real initramfs unpack, VDSO. All explicitly out of scope for this slice."
+    },
+    {
+      "id": "first-userspace-entry",
+      "title": "Replace kernel_main shutdown with init process spawn and first return_to_userspace",
+      "status": "complete",
+      "depends_on": [
+        "syscall-dispatch-and-ast-loop",
+        "exec-loader-and-detached-aspace",
+        "reactor-and-round-robin-scheduler"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/lib.rs",
+        "crates/tx-kernel/src/init.rs",
+        "crates/tx-kernel/src/thread_runtime"
+      ],
+      "verification": [
+        "cargo xtask qemu --target rv64-qemu --profile busybox --expect-sentinel",
+        "cargo xtask ci"
+      ],
+      "notes": "Boot wiring already calls bootstrap_init_process and emits a process:init:ok sentinel (commit b50a472, decision 2026-05-05-boot-wiring.md). Pre-ELF Phase 7 (commit 69a3efd) replaced kernel_main's shutdown path with run_userspace_reactor_loop: builds PerHartSlotted::<P, _>::new(payload, run_thread::<P>(thread, payload)), submits via BOOT_REACTOR.with(|r| r.submit_task(...)), drives the BSP hart-loop via step_boot_reactor_once until init.is_zombie(), then emits :userspace:exited:N before system_off. ELF Loader Wave 5 (commit d9548b8) added run_bootstrap_exec_for_init between bind_init_cwd_and_root and boot_sentinel: registers a built-in static RV64 ELF fixture into tmpfs at /init, drives exec_script via block_on, panics with :bootstrap-exec:fail board sentinel on failure (Open Q #3 DECIDED). On Ok the production loop picks up the new image on the first enter_userspace_with_context call; the fixture issues write(1, \"hello\\n\", 6) + exit_group(0) and the kernel emits :userspace:exited:0 before system_off. Boot trace order: :process:init:ok -> :tty:console:ok -> :irq:install:ok -> :mount:rootfs:tmpfs:ok -> :mount:devfs:ok -> :devfs:console:alias:ok -> :init:cwd:ok -> [bootstrap-exec runs] -> :boot:ok -> :userspace:exited:0. Step delivered. Future work: replace the hand-encoded fixture with a real initramfs cpio unpack + a real init binary loaded from disk."
+    },
+    {
+      "id": "smp-runtime-and-remote-coordination",
+      "title": "Enable AP runtime, cross-hart wakeups, IPIs, and remote shootdown",
+      "status": "pending",
+      "depends_on": [
+        "pmap-shootdown-completion",
+        "reactor-and-round-robin-scheduler",
+        "trap-shell-and-kernel-sink"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/smp",
+        "crates/tx-kernel/src/reactor",
+        "crates/tx-substrate/src",
+        "boards/tx-hal-riscv64-qemu-virt/src"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel smp",
+        "cargo xtask ci"
+      ],
+      "notes": "Bring secondary harts online after substrate and before multi-hart scheduling. Install trap vectors on APs, initialize per-hart reactor/scheduler state, support SmpIf IPIs for wake/reschedule/shootdown, and remove the single-hart runtime gate."
+    },
+    {
+      "id": "oscomp-busybox-runtime-milestones",
+      "title": "Add long-running boot tests for shell, BusyBox, and OSComp images",
+      "status": "pending",
+      "depends_on": [
+        "first-userspace-entry"
+      ],
+      "paths": [
+        "xtask/src/qemu.rs",
+        "xtask/src/image.rs",
+        "xtask/src/oscomp.rs",
+        "docs/progress"
+      ],
+      "verification": [
+        "cargo xtask ci-slow",
+        "cargo xtask oscomp run"
+      ],
+      "notes": "Keep smoke boot separate from runtime boot. Add sentinels for first init entry, first syscall roundtrip, shell prompt, BusyBox command, and OSComp suite readiness as the syscall/VFS/device surface grows."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Re-run on 2026-05-06 after the DAC + setuid slice landed in 5 phase commits on feat/dac-and-setuid (3536366 wave 1 Cred extension: suid/sgid + 4 new step_set* helpers + Credential.effective_caps + Cred->Credential bridge; fcd9639 wave 2 SyscallCtx::cred() + 12 process-side syscall arms; 75e7556 wave 3 VFS DAC plumbing + AuxvFacts extension; b9ae7a0 wave 4 exec_script setuid handling + 4 file-mode syscall arms; bb228cb wave 5 end-to-end smoke + sibling init_setuid_fixture). No long-term-checklist step promotion — DAC+setuid is bundled into vfs-device-and-tty-init + process-and-thread-runtime-core, both already complete. Cumulative complete steps unchanged at 11 of 16. 24+ ok."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "not-run",
+      "notes": "Use after design-doc cross-reference edits."
+    },
+    {
+      "command": "cargo xtask ci",
+      "status": "not-run",
+      "notes": "Use after implementation slices, not required for pure checklist creation."
+    }
+  ],
+  "risks": [
+    "The current code is substrate-heavy but has no zone/epoch/bus/reactor implementation yet; those are prerequisites for most upper subsystems.",
+    "A full trap shell without a VM fault path can only panic or terminate; user execution should stay gated until VM and thread runtime exist.",
+    "Remote shootdown and AP scheduling can be deferred for single-hart runtime, but the gate must be explicit to avoid false SMP safety.",
+    "Design docs reference many future subsystems; individual implementation slices should refresh readiness before coding from them."
+  ],
+  "blockers": [
+    "Pre-ELF Phase 2 (commit abc9fb8) added TrapIf::enter_userspace_with_context as the portable HAL entry hook; RawTrapFrame as a portable HAL surface and TrapFrameMut direct-write are still not exposed at the trait level (they live as RV64 board internals).",
+    "ELF Loader Wave 5 (commit d9548b8) wired the full bootstrap exec; kernel_main now drives a static-musl-shape ELF fixture through write+exit_group end-to-end. First userspace entry delivered.",
+    "fork/clone/wait4 slice added NR_CLONE=220 (bare-SIGCHLD only), NR_WAIT4=260 (blocking via wait_carrier on exit_port), 5+1 introspection arms, 2 musl-startup stubs. LTP execve05 unblocked.",
+    "DAC + setuid slice (commits 3536366, fcd9639, 75e7556, b9ae7a0, bb228cb) added Cred saved-set semantics (suid/sgid + step_setresuid/setresgid/setreuid/setregid), VFS DAC predicate + step_chmod/step_chown FsOps methods, 12 cred syscall arms (getuid/geteuid/getgid/getegid/setuid/setgid/setreuid/setregid/setresuid/setresgid + getresuid/getresgid), 4 file-mode syscall arms (NR_FCHMODAT/FCHOWNAT/FACCESSAT/FACCESSAT2), exec_script Phase 3.5 setuid recompute (S_ISUID/S_ISGID -> euid change + AT_SECURE=1 in auxv), and an end-to-end Layer A setuid smoke. LTP execve02 (EACCES for non-root execing 0700 root file) + remaining EACCES sub-cases of execve03 + the full LTP getuid*/geteuid*/getgid*/getegid*/setuid*/setgid*/setreuid*/setregid*/setresuid*/setresgid*/chmod*/fchmod*/chown*/fchown*/access*/faccessat* clusters all unblocked at the kernel-surface level.",
+    "tx-shims linux_syscall::dispatch covers 33 entries (trio 8 + NR_EXECVE + NR_FCNTL + NR_CLONE + NR_WAIT4 + 5 process-introspection + 2 musl stubs + 12 cred + 4 file-mode). Remaining LTP gaps: per-task AST plumbing for signal-handler frame setup; CLONE_VFORK / CLONE_THREAD (posix_spawn + pthread_create); NR_WAITID + siginfo plumbing; CSPRNG; capabilities beyond CAP_DAC_OVERRIDE/CAP_FOWNER.",
+    "tx-scripts ships exec_script + goblin parser + stack/auxv builder + setuid recompute; ET_DYN/PIE + PT_INTERP / dynamic linking are the next-slice surface.",
+    "tmpfs/devfs mounted at boot + walker DAC predicate enforces R/W/X bits + tmpfs FsOps::step_chmod/step_chown wired (devfs returns EROFS) + AuxvFacts carries at_uid/at_euid/at_gid/at_egid/at_secure for setuid binaries."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

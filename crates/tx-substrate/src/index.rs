@@ -1,0 +1,440 @@
+//! Bounded key/value index with linear reservations.
+
+use alloc::vec::Vec;
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
+use core::ops::Deref;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use crate::epoch::Guard;
+
+// ---------------------------------------------------------------------------
+// L6 mutation emit gate (OBS-8)
+// ---------------------------------------------------------------------------
+
+/// Runtime gate for L6 `MutationIndexCommit` observation events.
+///
+/// Defaults to **off** so the change is observable on demand without
+/// perturbing existing benchmarks.  Flip to `true` at boot to enable.
+pub static INDEX_MUTATION_EMIT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+const EMPTY: u8 = 0;
+const RESERVED_EMPTY: u8 = 1;
+const COMMITTED: u8 = 2;
+const RESERVED_COMMITTED: u8 = 3;
+
+/// Index operation failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexError {
+    /// No free entry exists in this bounded index.
+    Full,
+    /// The key already has a committed or reserved entry.
+    Duplicate,
+    /// No committed entry exists for the key.
+    Missing,
+    /// The key is currently reserved by another operation.
+    Busy,
+}
+
+struct Entry<K, V> {
+    state: UnsafeCell<u8>,
+    key: UnsafeCell<MaybeUninit<K>>,
+    value: UnsafeCell<MaybeUninit<V>>,
+}
+
+impl<K, V> Entry<K, V> {
+    const fn new() -> Self {
+        Self {
+            state: UnsafeCell::new(EMPTY),
+            key: UnsafeCell::new(MaybeUninit::uninit()),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+}
+
+struct SpinLock {
+    held: AtomicBool,
+}
+
+impl SpinLock {
+    const fn new() -> Self {
+        Self {
+            held: AtomicBool::new(false),
+        }
+    }
+
+    fn lock(&self) -> SpinGuard<'_> {
+        while self
+            .held
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        SpinGuard { lock: self }
+    }
+}
+
+struct SpinGuard<'a> {
+    lock: &'a SpinLock,
+}
+
+impl Drop for SpinGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.held.store(false, Ordering::Release);
+    }
+}
+
+/// Fixed-capacity index whose writes are mediated by reservations.
+pub struct Index<K, V, const N: usize> {
+    lock: SpinLock,
+    entries: [Entry<K, V>; N],
+    scan_limit: AtomicUsize,
+}
+
+unsafe impl<K: Send, V: Send, const N: usize> Sync for Index<K, V, N> {}
+
+impl<K, V, const N: usize> Index<K, V, N> {
+    /// Construct an empty index.
+    pub const fn new() -> Self {
+        Self {
+            lock: SpinLock::new(),
+            entries: [const { Entry::new() }; N],
+            scan_limit: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl<K: Eq, V, const N: usize> Index<K, V, N> {
+    /// Reserve a key that is not currently committed or reserved.
+    pub fn reserve(&self, key: K) -> Result<IndexReservation<'_, K, V, N>, IndexError> {
+        let _guard = self.lock.lock();
+        let limit = self.scan_limit_locked();
+
+        for entry in &self.entries[..limit] {
+            let state = unsafe { *entry.state.get() };
+            if state != EMPTY && unsafe { (*entry.key.get()).assume_init_ref() == &key } {
+                return Err(IndexError::Duplicate);
+            }
+        }
+
+        let empty_in_span = self.entries[..limit]
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| unsafe { *entry.state.get() == EMPTY });
+        let (slot_index, entry) = match empty_in_span {
+            Some(slot) => slot,
+            None if limit < N => (limit, &self.entries[limit]),
+            None => return Err(IndexError::Full),
+        };
+
+        unsafe {
+            (*entry.key.get()).write(key);
+            *entry.state.get() = RESERVED_EMPTY;
+        }
+        self.extend_scan_limit_locked(slot_index + 1);
+
+        Ok(IndexReservation {
+            index: self,
+            slot_index,
+            committed: false,
+        })
+    }
+
+    /// Observe a committed value under an epoch guard.
+    pub fn lookup<'g>(&self, key: &K, _guard: &'g Guard<'_>) -> Option<IndexRef<'g, K, V>> {
+        let _lock = self.lock.lock();
+        let limit = self.scan_limit_locked();
+
+        for entry in &self.entries[..limit] {
+            let state = unsafe { *entry.state.get() };
+            if state == COMMITTED && unsafe { (*entry.key.get()).assume_init_ref() == key } {
+                let key = unsafe { &*(*entry.key.get()).as_ptr() };
+                let value = unsafe { &*(*entry.value.get()).as_ptr() };
+                return Some(IndexRef { key, value });
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn reserve_committed(
+        &self,
+        key: &K,
+    ) -> Result<CommittedReservation<'_, K, V, N>, IndexError> {
+        let _guard = self.lock.lock();
+        let limit = self.scan_limit_locked();
+
+        for (slot_index, entry) in self.entries[..limit].iter().enumerate() {
+            let state = unsafe { *entry.state.get() };
+            if state != EMPTY && unsafe { (*entry.key.get()).assume_init_ref() == key } {
+                return match state {
+                    COMMITTED => {
+                        unsafe {
+                            *entry.state.get() = RESERVED_COMMITTED;
+                        }
+                        Ok(CommittedReservation {
+                            index: self,
+                            slot_index,
+                            committed: false,
+                        })
+                    }
+                    RESERVED_EMPTY | RESERVED_COMMITTED => Err(IndexError::Busy),
+                    _ => Err(IndexError::Missing),
+                };
+            }
+        }
+
+        Err(IndexError::Missing)
+    }
+}
+
+impl<K, V, const N: usize> Index<K, V, N> {
+    fn scan_limit_locked(&self) -> usize {
+        self.scan_limit.load(Ordering::Acquire).min(N)
+    }
+
+    fn extend_scan_limit_locked(&self, candidate: usize) {
+        let current = self.scan_limit_locked();
+        if candidate > current {
+            self.scan_limit.store(candidate.min(N), Ordering::Release);
+        }
+    }
+
+    fn shrink_scan_limit_locked(&self) {
+        let mut limit = self.scan_limit_locked();
+        while limit > 0 {
+            let entry = &self.entries[limit - 1];
+            if unsafe { *entry.state.get() } != EMPTY {
+                break;
+            }
+            limit -= 1;
+        }
+        self.scan_limit.store(limit, Ordering::Release);
+    }
+
+    /// Snapshot committed values observed under an epoch guard.
+    pub fn snapshot_values(&self, _guard: &Guard<'_>) -> Vec<V>
+    where
+        V: Clone,
+    {
+        let _lock = self.lock.lock();
+        let limit = self.scan_limit_locked();
+        let mut values = Vec::new();
+
+        for entry in &self.entries[..limit] {
+            let state = unsafe { *entry.state.get() };
+            if state == COMMITTED {
+                values.push(unsafe { (*entry.value.get()).assume_init_ref().clone() });
+            }
+        }
+
+        values
+    }
+
+    /// Snapshot committed values through a caller-supplied projection.
+    ///
+    /// This is useful for indexes whose value has a fallible observation
+    /// path: stale values can be skipped without panicking while the index
+    /// remains locked against concurrent mutation.
+    pub fn snapshot_values_filter_map<R>(
+        &self,
+        _guard: &Guard<'_>,
+        mut f: impl FnMut(&V) -> Option<R>,
+    ) -> Vec<R> {
+        let _lock = self.lock.lock();
+        let limit = self.scan_limit_locked();
+        let mut values = Vec::new();
+
+        for entry in &self.entries[..limit] {
+            let state = unsafe { *entry.state.get() };
+            if state == COMMITTED {
+                let value = unsafe { (*entry.value.get()).assume_init_ref() };
+                if let Some(mapped) = f(value) {
+                    values.push(mapped);
+                }
+            }
+        }
+
+        values
+    }
+}
+
+impl<K, V, const N: usize> Default for Index<K, V, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K, V, const N: usize> Drop for Index<K, V, N> {
+    fn drop(&mut self) {
+        for entry in &mut self.entries {
+            let state = unsafe { *entry.state.get() };
+            match state {
+                RESERVED_EMPTY => unsafe {
+                    (*entry.key.get()).assume_init_drop();
+                },
+                COMMITTED | RESERVED_COMMITTED => unsafe {
+                    (*entry.key.get()).assume_init_drop();
+                    (*entry.value.get()).assume_init_drop();
+                },
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Reservation for installing an absent key. Drop rolls back the key.
+pub struct IndexReservation<'i, K, V, const N: usize> {
+    index: &'i Index<K, V, N>,
+    slot_index: usize,
+    committed: bool,
+}
+
+impl<K, V, const N: usize> IndexReservation<'_, K, V, N> {
+    /// Reserved key.
+    pub fn key(&self) -> &K {
+        let entry = &self.index.entries[self.slot_index];
+        unsafe { (*entry.key.get()).assume_init_ref() }
+    }
+
+    /// Commit the reserved key with a value.
+    pub fn commit(mut self, value: V) {
+        {
+            let _guard = self.index.lock.lock();
+            let entry = &self.index.entries[self.slot_index];
+            unsafe {
+                (*entry.value.get()).write(value);
+                *entry.state.get() = COMMITTED;
+            }
+        }
+        self.committed = true;
+
+        // L6 MutationIndexCommit emit (OBS-8).
+        //
+        // Emitted after the state transition so the entry is already
+        // observable to readers.  Gated by `INDEX_MUTATION_EMIT_ENABLED`
+        // (default off).  This is a substrate convergence point, not
+        // inside a `StepOp::step` body (OBS-A-1).
+        if INDEX_MUTATION_EMIT_ENABLED.load(Ordering::Relaxed) {
+            if let Some(em) = tx_observe::current() {
+                use tx_observe::encode::{encode_mutation_index_commit, mutation_index_commit_tag};
+                use tx_observe::{EventNameId, TxTraceLevel};
+                use tx_observe_types::PayloadMutationIndexCommit;
+
+                // `index_id` is the lower 32 bits of the index pointer —
+                // a stable per-instance discriminant within a single boot.
+                let index_id = self.index as *const _ as usize as u32;
+                let p = PayloadMutationIndexCommit {
+                    index_id,
+                    key_low: self.slot_index as u32,
+                    value_object_id: 0, // generic V; no Cap available here
+                };
+                let (payload_bytes, _) = encode_mutation_index_commit(&p);
+                em.instant(
+                    TxTraceLevel::Mutation,
+                    EventNameId::from_raw(0x4d494358u32), // "MICX" — mutation.index_commit
+                    tx_observe::SpanId::NONE,
+                    mutation_index_commit_tag(),
+                    &payload_bytes,
+                );
+            }
+        }
+    }
+}
+
+impl<K, V, const N: usize> Drop for IndexReservation<'_, K, V, N> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+
+        let _guard = self.index.lock.lock();
+        let entry = &self.index.entries[self.slot_index];
+        unsafe {
+            if *entry.state.get() == RESERVED_EMPTY {
+                (*entry.key.get()).assume_init_drop();
+                *entry.state.get() = EMPTY;
+            }
+        }
+        self.index.shrink_scan_limit_locked();
+    }
+}
+
+/// Reservation for mutating an existing committed entry.
+pub(crate) struct CommittedReservation<'i, K, V, const N: usize> {
+    index: &'i Index<K, V, N>,
+    slot_index: usize,
+    committed: bool,
+}
+
+impl<K, V, const N: usize> CommittedReservation<'_, K, V, N> {
+    pub(crate) fn withdraw(mut self) -> V {
+        let _guard = self.index.lock.lock();
+        let entry = &self.index.entries[self.slot_index];
+        let value = unsafe {
+            let value = (*entry.value.get()).assume_init_read();
+            (*entry.key.get()).assume_init_drop();
+            *entry.state.get() = EMPTY;
+            value
+        };
+        self.index.shrink_scan_limit_locked();
+        self.committed = true;
+        value
+    }
+
+    pub(crate) fn swap(mut self, replacement: V) -> V {
+        let _guard = self.index.lock.lock();
+        let entry = &self.index.entries[self.slot_index];
+        let old = unsafe {
+            let old = (*entry.value.get()).assume_init_read();
+            (*entry.value.get()).write(replacement);
+            *entry.state.get() = COMMITTED;
+            old
+        };
+        self.committed = true;
+        old
+    }
+}
+
+impl<K, V, const N: usize> Drop for CommittedReservation<'_, K, V, N> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+
+        let _guard = self.index.lock.lock();
+        let entry = &self.index.entries[self.slot_index];
+        unsafe {
+            if *entry.state.get() == RESERVED_COMMITTED {
+                *entry.state.get() = COMMITTED;
+            }
+        }
+    }
+}
+
+/// Guard-scoped committed index observation.
+pub struct IndexRef<'g, K, V> {
+    key: &'g K,
+    value: &'g V,
+}
+
+impl<K, V> IndexRef<'_, K, V> {
+    /// Observed key.
+    pub fn key(&self) -> &K {
+        self.key
+    }
+
+    /// Observed value.
+    pub fn value(&self) -> &V {
+        self.value
+    }
+}
+
+impl<K, V> Deref for IndexRef<'_, K, V> {
+    type Target = V;
+
+    fn deref(&self) -> &Self::Target {
+        self.value
+    }
+}

@@ -1,0 +1,1238 @@
+//! bdev-fs — block-device pseudo-filesystem.
+//!
+//! Per `txdoc:05-FILESYSTEM-BDEV-FS`
+//! (`docs/design/05_filesystem/BDEV_FS.md`): bdev-fs maps registered
+//! `BlockDeviceRegistration`s into page-backed RNodes so that
+//! `/dev/vda`, `/dev/sda`, etc. have file semantics — page cache,
+//! mmap, uniform `read` / `write` — without the device subsystem
+//! providing file-ops machinery of its own.
+//!
+//! bdev-fs is a tier-2 projection-shaped filesystem in the same
+//! family as procfs and devpts: entries resolve through the static
+//! block-device registry rather than an in-memory BTreeMap. The
+//! directory structure is read-only; all mutating operations reject
+//! with `EROFS`. The block-device *content* is read-write through
+//! the `FsPageBacking` path.
+//!
+//! ## Architecture
+//!
+//! `BdevFsMountPayload` is the filesystem-instance payload (per
+//! `txdoc:BDEV-FS-ZONE-DERIVED-TYPE-POLICY-1`). It holds:
+//!
+//! - `partition_table` — compile-time partition layout (v1 stub).
+//! - `coherence` — devt → `Weak<PageContainer>` index so that every
+//!   open of `/dev/vda` materialises the same PageContainer
+//!   (`txdoc:BDEV-FS-COHERENCE-1`).  If the PC has been reclaimed
+//!   (Weak upgrade fails), a fresh one is created and re-indexed.
+//!
+//! Both `FsOps` and `FsPageBacking` are implemented on
+//! `BdevFsMountPayload`.  `BdevFs` is retained as a zero-state
+//! convenience alias.
+//!
+//! Active-doc anchors:
+//! - `txdoc:BDEV-FS-MOTIVATION-1` → §1
+//! - `txdoc:BDEV-FS-ZONE-DERIVED-TYPE-POLICY-1` → type policy table
+//! - `txdoc:BDEV-FS-FSOPS-1` → §3 (FsOps surface)
+//! - `txdoc:BDEV-FS-FSPAGEBACKING-1` → §4 (FsPageBacking surface)
+//! - `txdoc:BDEV-FS-COHERENCE-1` → §5.1 (devt→PC index)
+//! - `txdoc:BDEV-FS-PARTITION-TABLE-1` → §5.3 (MBR/GPT, v1 stub)
+//! - `txdoc:BDEV-FS-MODULE-LAYOUT-1` → §9
+
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+
+pub mod adapter;
+
+use adapter::step_engine::{
+    self as step_engine, page_allocator, Cap, NoProgress, SpinMutex, StepOutcome, Weak, ZeroPolicy,
+};
+
+use tx_subsystems::device::{self, BlockDeviceHandle, DevT};
+use tx_subsystems::execution::{Errno, Guard};
+use tx_subsystems::mount::MountPayload;
+use tx_subsystems::page_backed::{
+    AnonSwapPolicy, Frame, FsPageBacking, PageContainer, PageContainerKind,
+};
+use tx_subsystems::vfs::{
+    Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, RNode, RNodeBacking,
+    S_IFBLK, S_IFDIR,
+};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Stable `FsObjectId` for the bdev-fs root directory.
+pub const BDEVFS_ROOT_ID: FsObjectId = FsObjectId::new(0x6264_6600);
+
+/// Base id-space for block-device entries.  Each entry gets
+/// `BDEVFS_ENTRY_BASE + snapshot_index`.
+const BDEVFS_ENTRY_BASE: u64 = 0x6264_6601;
+
+/// Mode for any block-device entry resolved by bdev-fs.
+pub const BDEVFS_BLOCK_MODE: u16 = S_IFBLK | 0o660;
+
+/// Mode for the bdev-fs root directory.
+pub const BDEVFS_ROOT_MODE: u16 = S_IFDIR | 0o755;
+
+// ============================================================================
+// Partition-table types (v1 stub)
+// ============================================================================
+
+/// Compile-time partition layout.
+///
+/// Per `txdoc:BDEV-FS-PARTITION-TABLE-1`: v1 has no runtime partition
+/// support.  `PartitionTable` is a marker type that future phases
+/// will populate from MBR or GPT.
+#[derive(Clone, Debug, Default)]
+pub struct PartitionTable {
+    entries: BTreeMap<u32, PartitionEntry>,
+}
+
+/// One partition row.
+#[derive(Clone, Copy, Debug)]
+pub struct PartitionEntry {
+    /// Device identifier the partition belongs to.
+    pub parent_devt: DevT,
+    /// Partition index within the parent device (1-based).
+    pub index: u32,
+    /// First LBA of the partition.
+    pub start_lba: u64,
+    /// Length in LBA units.
+    pub len_lba: u64,
+}
+
+impl PartitionTable {
+    pub const fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+
+    /// Look up a partition by its parent devt + index.
+    pub fn get(&self, parent_devt: DevT, index: u32) -> Option<&PartitionEntry> {
+        self.entries
+            .get(&index)
+            .filter(|e| e.parent_devt == parent_devt)
+    }
+}
+
+// ============================================================================
+// BdevFsMountPayload — the filesystem-instance payload
+// ============================================================================
+
+/// bdev-fs mount payload implementing `FsOps` and `FsPageBacking`.
+///
+/// Holds the devt→PC coherence index so that every materialisation
+/// of a given block device shares the same `PageContainer`.
+///
+/// Implements both trait surfaces so mount code can pass
+/// `Arc<BdevFsMountPayload>` as `Arc<dyn FsOps>` and
+/// `Arc<dyn FsPageBacking>`.
+pub struct BdevFsMountPayload {
+    /// Compile-time partition layout (v1: always empty).
+    pub partition_table: SpinMutex<PartitionTable>,
+    /// Coherence index: devt → Weak<PageContainer>.  Protected by
+    /// the same lock that guards the partition table — the index
+    /// and the partition table share a lock domain.
+    coherence: SpinMutex<BTreeMap<DevT, Weak<PageContainer>>>,
+}
+
+impl BdevFsMountPayload {
+    pub fn new() -> Self {
+        Self {
+            partition_table: SpinMutex::new(PartitionTable::new()),
+            coherence: SpinMutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Return an `Arc<dyn FsOps>` for use in `MountPayload::new_cap`.
+    pub fn fs_ops_arc(self: &Arc<Self>) -> Arc<dyn FsOps> {
+        Arc::clone(self) as Arc<dyn FsOps>
+    }
+
+    /// Return an `Arc<dyn FsPageBacking>` for use in `MountPayload::new_cap`.
+    pub fn fs_page_backing_arc(self: &Arc<Self>) -> Arc<dyn FsPageBacking> {
+        Arc::clone(self) as Arc<dyn FsPageBacking>
+    }
+
+    /// Find-or-create the `PageContainer` for a given device.
+    ///
+    /// Checks the coherence index first: if a `Weak<PageContainer>`
+    /// for `devt` exists and is still alive, returns a clone of the
+    /// upgraded `Cap`.  Otherwise creates a fresh PC, inserts a
+    /// `Weak` into the index, and returns the new `Cap`.
+    ///
+    /// Per `txdoc:BDEV-FS-COHERENCE-1`.
+    fn get_or_create_pc(
+        &self,
+        devt: DevT,
+        reg: &device::BlockDeviceRegistration,
+        guard: &Guard<'_>,
+    ) -> Result<Cap<PageContainer>, Errno> {
+        let mut index = self.coherence.lock();
+        if let Some(weak) = index.get(&devt) {
+            if let Some(cap) = weak.upgrade(guard) {
+                return Ok(cap);
+            }
+            // Weak failed — PC was reclaimed.  Fall through to
+            // create a new one.
+            index.remove(&devt);
+        }
+
+        let block_size = reg.ops.block_size() as u64;
+        let total_bytes = reg.ops.total_blocks().saturating_mul(block_size);
+        let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
+        let page_count = total_bytes.div_ceil(page_size);
+
+        let pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            page_count,
+        )
+        .map_err(|_| Errno::ENOMEM)?;
+
+        let weak = pc.downgrade();
+        index.insert(devt, weak);
+        Ok(pc)
+    }
+}
+
+impl Default for BdevFsMountPayload {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// BdevFs — zero-state convenience alias
+// ============================================================================
+
+/// Zero-state bdev-fs backend (convenience alias).
+///
+/// Prefer `BdevFsMountPayload` for production use.
+/// `BdevFs` exists so that simple standalone tests can construct
+/// `Arc<dyn FsOps>` / `Arc<dyn FsPageBacking>` without a payload
+/// allocation, but it has no coherence index: every materialisation
+/// allocates a fresh `PageContainer`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BdevFs;
+
+impl BdevFs {
+    pub const fn new() -> Self {
+        Self
+    }
+
+    pub fn fs_ops_arc() -> Arc<dyn FsOps> {
+        Arc::new(Self)
+    }
+
+    pub fn fs_page_backing_arc() -> Arc<dyn FsPageBacking> {
+        Arc::new(Self)
+    }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+fn entry_index(fs_object_id: FsObjectId) -> Option<usize> {
+    let raw = fs_object_id.as_u64();
+    raw.checked_sub(BDEVFS_ENTRY_BASE).map(|i| i as usize)
+}
+
+fn device_by_index(index: usize) -> Option<&'static device::BlockDeviceRegistration> {
+    device::block_device_snapshot().into_iter().nth(index)
+}
+
+/// Resolve a bdev-fs `FsObjectId` to its underlying
+/// `&'static BlockDeviceRegistration`.
+///
+/// Returns `None` when the id is the bdev-fs root, refers to a slot
+/// that has since been removed from the registry, or was minted by a
+/// non-bdev-fs backend. This is the helper called out as
+/// `bdev_fs::block_device_handle_for` in
+/// `docs/design/05_filesystem/BDEV_FS.md` §8.1 — the bridge a
+/// filesystem (tx-ext4) uses at mount-time to turn a userspace
+/// `/dev/block/<name>` path into a block-device handle.
+pub fn block_device_for_object_id(
+    fs_object_id: FsObjectId,
+) -> Option<&'static device::BlockDeviceRegistration> {
+    let index = entry_index(fs_object_id)?;
+    device_by_index(index)
+}
+
+fn block_device_meta(reg: &device::BlockDeviceRegistration) -> InodeMeta {
+    let block_size = reg.ops.block_size() as u64;
+    let total_bytes = reg.ops.total_blocks().saturating_mul(block_size);
+    InodeMeta {
+        mode: BDEVFS_BLOCK_MODE,
+        size: total_bytes,
+        ..InodeMeta::new(InodeKind::BlockDevice, BDEVFS_BLOCK_MODE)
+    }
+}
+
+fn devt_for_index(index: usize) -> Option<DevT> {
+    device_by_index(index).map(|r| r.devt)
+}
+
+// ============================================================================
+// FsOps for BdevFsMountPayload
+// ============================================================================
+
+impl FsOps for BdevFsMountPayload {
+    fn lookup(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<FsObjectId, NoProgress> {
+        if parent != BDEVFS_ROOT_ID {
+            return StepOutcome::err(step_engine::Errno::ENOTDIR);
+        }
+        let snapshot = device::block_device_snapshot();
+        for (idx, reg) in snapshot.into_iter().enumerate() {
+            if reg.name.as_bytes() == name {
+                let id = BDEVFS_ENTRY_BASE
+                    .checked_add(idx as u64)
+                    .map(FsObjectId::new)
+                    .unwrap_or(BDEVFS_ROOT_ID);
+                return StepOutcome::done(id);
+            }
+        }
+        StepOutcome::err(step_engine::Errno::ENOENT)
+    }
+
+    fn load_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<InodeMeta, NoProgress> {
+        if fs_object_id == BDEVFS_ROOT_ID {
+            return StepOutcome::done(InodeMeta::new(InodeKind::Directory, BDEVFS_ROOT_MODE));
+        }
+        let Some(idx) = entry_index(fs_object_id) else {
+            return StepOutcome::err(step_engine::Errno::ENOENT);
+        };
+        let Some(reg) = device_by_index(idx) else {
+            return StepOutcome::err(step_engine::Errno::ENOENT);
+        };
+        StepOutcome::done(block_device_meta(reg))
+    }
+
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        mount: &Cap<MountPayload>,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<Cap<RNode>, NoProgress> {
+        if meta.kind() != InodeKind::BlockDevice {
+            return StepOutcome::err(Errno::ENOSYS);
+        }
+        let Some(idx) = entry_index(fs_object_id) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+        let Some(reg) = device_by_index(idx) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+        let Some(devt) = devt_for_index(idx) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+
+        // Per txdoc:BDEV-FS-COHERENCE-1: reuse the existing
+        // PageContainer when one is still live for this devt.
+        let container = match self.get_or_create_pc(devt, reg, guard) {
+            Ok(pc) => pc,
+            Err(e) => return StepOutcome::err(e),
+        };
+
+        match RNode::new_cap_in_mount(
+            fs_object_id,
+            meta,
+            RNodeBacking::PageBacked { pc: container },
+            mount,
+        ) {
+            Ok(rnode) => StepOutcome::done(rnode),
+            Err(_) => StepOutcome::err(Errno::ENOMEM),
+        }
+    }
+
+    fn readdir(
+        &self,
+        fs_object_id: FsObjectId,
+        cursor: DirCursor,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
+        if fs_object_id != BDEVFS_ROOT_ID {
+            return StepOutcome::err(step_engine::Errno::ENOTDIR);
+        }
+        let index = cursor.as_u64() as usize;
+        let snapshot = device::block_device_snapshot();
+        let Some(reg) = snapshot.into_iter().nth(index) else {
+            return StepOutcome::done(None);
+        };
+        let child_id = BDEVFS_ENTRY_BASE
+            .checked_add(index as u64)
+            .map(FsObjectId::new)
+            .unwrap_or(BDEVFS_ROOT_ID);
+        let entry = match DirEntry::new(child_id, InodeKind::BlockDevice, reg.name.as_bytes()) {
+            Ok(e) => e,
+            Err(err) => return StepOutcome::err(err),
+        };
+        StepOutcome::done(Some((entry, DirCursor::from_u64(cursor.as_u64() + 1))))
+    }
+
+    // --- mutating ops reject with EROFS ---
+
+    fn serialize_inode_meta(
+        &self,
+        _fs_object_id: FsObjectId,
+        _meta: &InodeMeta,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn create_inode(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn unlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn rename(
+        &self,
+        _old_parent: FsObjectId,
+        _old_name: &[u8],
+        _new_parent: FsObjectId,
+        _new_name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn link(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn mkdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn rmdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn symlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: &[u8],
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn destroy_inode(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::done(())
+    }
+
+    fn read_link(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
+        StepOutcome::err(Errno::EINVAL)
+    }
+
+    fn step_chmod(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn step_chown(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_uid: Option<u32>,
+        _new_gid: Option<u32>,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+}
+
+// ============================================================================
+// FsPageBacking for BdevFsMountPayload
+// ============================================================================
+
+impl FsPageBacking for BdevFsMountPayload {
+    fn fetch_page(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<Frame, NoProgress> {
+        let Some(idx) = entry_index(fs_object_id) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+        let Some(reg) = device_by_index(idx) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+
+        let handle = BlockDeviceHandle::whole(reg);
+        let block_size = reg.ops.block_size() as u64;
+        let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
+
+        if !offset.is_multiple_of(page_size) {
+            return StepOutcome::err(Errno::EINVAL);
+        }
+
+        let start_lba = offset / block_size;
+        let device_blocks = handle.len_lba();
+        let blocks_per_page = page_size / block_size;
+
+        if start_lba >= device_blocks {
+            return allocate_zeroed_page();
+        }
+
+        if blocks_per_page == 1 {
+            let owned = match allocate_owned_page() {
+                Some(f) => f,
+                None => return StepOutcome::err(Errno::ENOMEM),
+            };
+            let ppn = owned.ppn();
+            let mut frames = [Frame::new(ppn)];
+
+            match handle.read_blocks(start_lba, &mut frames, guard) {
+                StepOutcome::Done(()) => {}
+                StepOutcome::Err(e) => return StepOutcome::err(e),
+                StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                    return StepOutcome::err(Errno::EIO);
+                }
+            }
+            let _cache_pin = match owned.try_cache_pin() {
+                Ok(p) => p,
+                Err(_) => return StepOutcome::err(Errno::ENOMEM),
+            };
+            drop(owned);
+            StepOutcome::done(frames[0])
+        } else {
+            let target_owned = match allocate_owned_page() {
+                Some(f) => f,
+                None => return StepOutcome::err(Errno::ENOMEM),
+            };
+            let target_ppn = target_owned.ppn();
+            let target_addr = match page_allocator::frame_kernel_addr(target_ppn) {
+                Ok(addr) => addr,
+                Err(_) => return StepOutcome::err(Errno::EFAULT),
+            };
+
+            for i in 0..blocks_per_page {
+                let lba = start_lba + i;
+                if lba >= device_blocks {
+                    break;
+                }
+
+                let temp_owned = match allocate_owned_page() {
+                    Some(f) => f,
+                    None => return StepOutcome::err(Errno::ENOMEM),
+                };
+                let temp_ppn = temp_owned.ppn();
+                let mut frames = [Frame::new(temp_ppn)];
+
+                match handle.read_blocks(lba, &mut frames, guard) {
+                    StepOutcome::Done(()) => {
+                        let src_addr = match page_allocator::frame_kernel_addr(frames[0].ppn()) {
+                            Ok(addr) => addr,
+                            Err(_) => return StepOutcome::err(Errno::EFAULT),
+                        };
+                        let byte_offset = i.saturating_mul(block_size) as usize;
+                        let bytes_to_copy =
+                            core::cmp::min(block_size as usize, page_size as usize - byte_offset);
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                src_addr,
+                                target_addr.add(byte_offset),
+                                bytes_to_copy,
+                            );
+                        }
+                    }
+                    StepOutcome::Err(e) => return StepOutcome::err(e),
+                    StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                        return StepOutcome::err(Errno::EIO);
+                    }
+                }
+                drop(temp_owned);
+            }
+
+            let _cache_pin = match target_owned.try_cache_pin() {
+                Ok(p) => p,
+                Err(_) => return StepOutcome::err(Errno::ENOMEM),
+            };
+            let target_frame = Frame::new(target_ppn);
+            drop(target_owned);
+            StepOutcome::done(target_frame)
+        }
+    }
+
+    fn flush_page(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        frame: &Frame,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        let Some(idx) = entry_index(fs_object_id) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+        let Some(reg) = device_by_index(idx) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+
+        let handle = BlockDeviceHandle::whole(reg);
+        let block_size = reg.ops.block_size() as u64;
+        let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
+
+        if !offset.is_multiple_of(page_size) {
+            return StepOutcome::err(Errno::EINVAL);
+        }
+
+        let start_lba = offset / block_size;
+        let device_blocks = handle.len_lba();
+        let blocks_per_page = page_size / block_size;
+
+        if start_lba >= device_blocks {
+            return StepOutcome::err(Errno::EINVAL);
+        }
+
+        if blocks_per_page == 1 {
+            let frames = [*frame];
+            match handle.write_blocks(start_lba, &frames, guard) {
+                StepOutcome::Done(()) => StepOutcome::done(()),
+                StepOutcome::Err(e) => StepOutcome::err(e),
+                StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                    StepOutcome::err(Errno::EIO)
+                }
+            }
+        } else {
+            let src_addr = match page_allocator::frame_kernel_addr(frame.ppn()) {
+                Ok(addr) => addr,
+                Err(_) => return StepOutcome::err(Errno::EFAULT),
+            };
+
+            for i in 0..blocks_per_page {
+                let lba = start_lba + i;
+                if lba >= device_blocks {
+                    break;
+                }
+
+                let temp_owned = match allocate_owned_page() {
+                    Some(f) => f,
+                    None => return StepOutcome::err(Errno::ENOMEM),
+                };
+                let temp_ppn = temp_owned.ppn();
+                let temp_addr = match page_allocator::frame_kernel_addr(temp_ppn) {
+                    Ok(addr) => addr,
+                    Err(_) => return StepOutcome::err(Errno::EFAULT),
+                };
+                let byte_offset = i.saturating_mul(block_size) as usize;
+                let bytes_to_copy =
+                    core::cmp::min(block_size as usize, page_size as usize - byte_offset);
+
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src_addr.add(byte_offset),
+                        temp_addr,
+                        bytes_to_copy,
+                    );
+                }
+
+                let frames = [Frame::new(temp_ppn)];
+                match handle.write_blocks(lba, &frames, guard) {
+                    StepOutcome::Done(()) => {}
+                    StepOutcome::Err(e) => return StepOutcome::err(e),
+                    StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                        return StepOutcome::err(Errno::EIO);
+                    }
+                }
+                drop(temp_owned);
+            }
+            StepOutcome::done(())
+        }
+    }
+
+    fn truncate(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_size: u64,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        // v1: block-device size is immutable (BDEV_FS.md §10.4).
+        StepOutcome::err(Errno::EINVAL)
+    }
+
+    fn fsync_file(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        let Some(idx) = entry_index(fs_object_id) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+        let Some(reg) = device_by_index(idx) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+        let handle = BlockDeviceHandle::whole(reg);
+        match handle.barrier(guard) {
+            StepOutcome::Done(()) => StepOutcome::done(()),
+            StepOutcome::Err(e) => StepOutcome::err(e),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                StepOutcome::err(Errno::EIO)
+            }
+        }
+    }
+
+    fn supports_reflink(&self, _other: &PageContainer) -> bool {
+        false
+    }
+}
+
+// ============================================================================
+// FsOps for BdevFs (zero-state convenience impl)
+// ============================================================================
+
+impl FsOps for BdevFs {
+    fn lookup(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<FsObjectId, NoProgress> {
+        if parent != BDEVFS_ROOT_ID {
+            return StepOutcome::err(step_engine::Errno::ENOTDIR);
+        }
+        let snapshot = device::block_device_snapshot();
+        for (idx, reg) in snapshot.into_iter().enumerate() {
+            if reg.name.as_bytes() == name {
+                let id = BDEVFS_ENTRY_BASE
+                    .checked_add(idx as u64)
+                    .map(FsObjectId::new)
+                    .unwrap_or(BDEVFS_ROOT_ID);
+                return StepOutcome::done(id);
+            }
+        }
+        StepOutcome::err(step_engine::Errno::ENOENT)
+    }
+
+    fn load_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<InodeMeta, NoProgress> {
+        if fs_object_id == BDEVFS_ROOT_ID {
+            return StepOutcome::done(InodeMeta::new(InodeKind::Directory, BDEVFS_ROOT_MODE));
+        }
+        let Some(idx) = entry_index(fs_object_id) else {
+            return StepOutcome::err(step_engine::Errno::ENOENT);
+        };
+        let Some(reg) = device_by_index(idx) else {
+            return StepOutcome::err(step_engine::Errno::ENOENT);
+        };
+        StepOutcome::done(block_device_meta(reg))
+    }
+
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        mount: &Cap<MountPayload>,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<Cap<RNode>, NoProgress> {
+        // No coherence index — every call allocates a fresh PC.
+        if meta.kind() != InodeKind::BlockDevice {
+            return StepOutcome::err(Errno::ENOSYS);
+        }
+        let Some(idx) = entry_index(fs_object_id) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+        let Some(reg) = device_by_index(idx) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+
+        let block_size = reg.ops.block_size() as u64;
+        let total_bytes = reg.ops.total_blocks().saturating_mul(block_size);
+        let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
+        let page_count = total_bytes.div_ceil(page_size);
+
+        let container = match PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            page_count,
+        ) {
+            Ok(c) => c,
+            Err(_) => return StepOutcome::err(Errno::ENOMEM),
+        };
+
+        match RNode::new_cap_in_mount(
+            fs_object_id,
+            meta,
+            RNodeBacking::PageBacked { pc: container },
+            mount,
+        ) {
+            Ok(rnode) => StepOutcome::done(rnode),
+            Err(_) => StepOutcome::err(Errno::ENOMEM),
+        }
+    }
+
+    fn readdir(
+        &self,
+        fs_object_id: FsObjectId,
+        cursor: DirCursor,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
+        if fs_object_id != BDEVFS_ROOT_ID {
+            return StepOutcome::err(step_engine::Errno::ENOTDIR);
+        }
+        let index = cursor.as_u64() as usize;
+        let snapshot = device::block_device_snapshot();
+        let Some(reg) = snapshot.into_iter().nth(index) else {
+            return StepOutcome::done(None);
+        };
+        let child_id = BDEVFS_ENTRY_BASE
+            .checked_add(index as u64)
+            .map(FsObjectId::new)
+            .unwrap_or(BDEVFS_ROOT_ID);
+        let entry = match DirEntry::new(child_id, InodeKind::BlockDevice, reg.name.as_bytes()) {
+            Ok(e) => e,
+            Err(err) => return StepOutcome::err(err),
+        };
+        StepOutcome::done(Some((entry, DirCursor::from_u64(cursor.as_u64() + 1))))
+    }
+
+    fn serialize_inode_meta(
+        &self,
+        _fs_object_id: FsObjectId,
+        _meta: &InodeMeta,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn create_inode(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn unlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn rename(
+        &self,
+        _old_parent: FsObjectId,
+        _old_name: &[u8],
+        _new_parent: FsObjectId,
+        _new_name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn link(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn mkdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn rmdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn symlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: &[u8],
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn destroy_inode(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::done(())
+    }
+
+    fn read_link(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
+        StepOutcome::err(Errno::EINVAL)
+    }
+
+    fn step_chmod(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn step_chown(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_uid: Option<u32>,
+        _new_gid: Option<u32>,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+}
+
+impl FsPageBacking for BdevFs {
+    fn fetch_page(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<Frame, NoProgress> {
+        let Some(idx) = entry_index(fs_object_id) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+        let Some(reg) = device_by_index(idx) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+
+        let handle = BlockDeviceHandle::whole(reg);
+        let block_size = reg.ops.block_size() as u64;
+        let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
+
+        if !offset.is_multiple_of(page_size) {
+            return StepOutcome::err(Errno::EINVAL);
+        }
+
+        let start_lba = offset / block_size;
+        let device_blocks = handle.len_lba();
+        let blocks_per_page = page_size / block_size;
+
+        if start_lba >= device_blocks {
+            return allocate_zeroed_page();
+        }
+
+        if blocks_per_page == 1 {
+            let owned = match allocate_owned_page() {
+                Some(f) => f,
+                None => return StepOutcome::err(Errno::ENOMEM),
+            };
+            let ppn = owned.ppn();
+            let mut frames = [Frame::new(ppn)];
+
+            match handle.read_blocks(start_lba, &mut frames, guard) {
+                StepOutcome::Done(()) => {}
+                StepOutcome::Err(e) => return StepOutcome::err(e),
+                StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                    return StepOutcome::err(Errno::EIO);
+                }
+            }
+            let _cache_pin = match owned.try_cache_pin() {
+                Ok(p) => p,
+                Err(_) => return StepOutcome::err(Errno::ENOMEM),
+            };
+            drop(owned);
+            StepOutcome::done(frames[0])
+        } else {
+            let target_owned = match allocate_owned_page() {
+                Some(f) => f,
+                None => return StepOutcome::err(Errno::ENOMEM),
+            };
+            let target_ppn = target_owned.ppn();
+            let target_addr = match page_allocator::frame_kernel_addr(target_ppn) {
+                Ok(addr) => addr,
+                Err(_) => return StepOutcome::err(Errno::EFAULT),
+            };
+
+            for i in 0..blocks_per_page {
+                let lba = start_lba + i;
+                if lba >= device_blocks {
+                    break;
+                }
+
+                let temp_owned = match allocate_owned_page() {
+                    Some(f) => f,
+                    None => return StepOutcome::err(Errno::ENOMEM),
+                };
+                let temp_ppn = temp_owned.ppn();
+                let mut frames = [Frame::new(temp_ppn)];
+
+                match handle.read_blocks(lba, &mut frames, guard) {
+                    StepOutcome::Done(()) => {
+                        let src_addr = match page_allocator::frame_kernel_addr(frames[0].ppn()) {
+                            Ok(addr) => addr,
+                            Err(_) => return StepOutcome::err(Errno::EFAULT),
+                        };
+                        let byte_offset = i.saturating_mul(block_size) as usize;
+                        let bytes_to_copy =
+                            core::cmp::min(block_size as usize, page_size as usize - byte_offset);
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                src_addr,
+                                target_addr.add(byte_offset),
+                                bytes_to_copy,
+                            );
+                        }
+                    }
+                    StepOutcome::Err(e) => return StepOutcome::err(e),
+                    StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                        return StepOutcome::err(Errno::EIO);
+                    }
+                }
+                drop(temp_owned);
+            }
+
+            let _cache_pin = match target_owned.try_cache_pin() {
+                Ok(p) => p,
+                Err(_) => return StepOutcome::err(Errno::ENOMEM),
+            };
+            let target_frame = Frame::new(target_ppn);
+            drop(target_owned);
+            StepOutcome::done(target_frame)
+        }
+    }
+
+    fn flush_page(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        frame: &Frame,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        let Some(idx) = entry_index(fs_object_id) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+        let Some(reg) = device_by_index(idx) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+
+        let handle = BlockDeviceHandle::whole(reg);
+        let block_size = reg.ops.block_size() as u64;
+        let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
+
+        if !offset.is_multiple_of(page_size) {
+            return StepOutcome::err(Errno::EINVAL);
+        }
+
+        let start_lba = offset / block_size;
+        let device_blocks = handle.len_lba();
+        let blocks_per_page = page_size / block_size;
+
+        if start_lba >= device_blocks {
+            return StepOutcome::err(Errno::EINVAL);
+        }
+
+        if blocks_per_page == 1 {
+            let frames = [*frame];
+            match handle.write_blocks(start_lba, &frames, guard) {
+                StepOutcome::Done(()) => StepOutcome::done(()),
+                StepOutcome::Err(e) => StepOutcome::err(e),
+                StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                    StepOutcome::err(Errno::EIO)
+                }
+            }
+        } else {
+            let src_addr = match page_allocator::frame_kernel_addr(frame.ppn()) {
+                Ok(addr) => addr,
+                Err(_) => return StepOutcome::err(Errno::EFAULT),
+            };
+
+            for i in 0..blocks_per_page {
+                let lba = start_lba + i;
+                if lba >= device_blocks {
+                    break;
+                }
+
+                let temp_owned = match allocate_owned_page() {
+                    Some(f) => f,
+                    None => return StepOutcome::err(Errno::ENOMEM),
+                };
+                let temp_ppn = temp_owned.ppn();
+                let temp_addr = match page_allocator::frame_kernel_addr(temp_ppn) {
+                    Ok(addr) => addr,
+                    Err(_) => return StepOutcome::err(Errno::EFAULT),
+                };
+                let byte_offset = i.saturating_mul(block_size) as usize;
+                let bytes_to_copy =
+                    core::cmp::min(block_size as usize, page_size as usize - byte_offset);
+
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src_addr.add(byte_offset),
+                        temp_addr,
+                        bytes_to_copy,
+                    );
+                }
+
+                let frames = [Frame::new(temp_ppn)];
+                match handle.write_blocks(lba, &frames, guard) {
+                    StepOutcome::Done(()) => {}
+                    StepOutcome::Err(e) => return StepOutcome::err(e),
+                    StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                        return StepOutcome::err(Errno::EIO);
+                    }
+                }
+                drop(temp_owned);
+            }
+            StepOutcome::done(())
+        }
+    }
+
+    fn truncate(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_size: u64,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EINVAL)
+    }
+
+    fn fsync_file(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        let Some(idx) = entry_index(fs_object_id) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+        let Some(reg) = device_by_index(idx) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+        let handle = BlockDeviceHandle::whole(reg);
+        match handle.barrier(guard) {
+            StepOutcome::Done(()) => StepOutcome::done(()),
+            StepOutcome::Err(e) => StepOutcome::err(e),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                StepOutcome::err(Errno::EIO)
+            }
+        }
+    }
+
+    fn supports_reflink(&self, _other: &PageContainer) -> bool {
+        false
+    }
+}
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+fn allocate_zeroed_page() -> StepOutcome<Frame, NoProgress> {
+    let owned = match allocate_owned_page() {
+        Some(f) => f,
+        None => return StepOutcome::err(Errno::ENOMEM),
+    };
+    let ppn = owned.ppn();
+    let _pin = match owned.try_cache_pin() {
+        Ok(p) => p,
+        Err(_) => return StepOutcome::err(Errno::ENOMEM),
+    };
+    drop(owned);
+    StepOutcome::done(Frame::new(ppn))
+}
+
+fn allocate_owned_page() -> Option<
+    tx_substrate::page_allocator::OwnedFrame<
+        'static,
+        tx_substrate::page_allocator::BitmapPageAllocator<'static>,
+    >,
+> {
+    page_allocator::reserve_frame(ZeroPolicy::Zeroed)
+        .ok()
+        .map(|r| r.commit())
+}

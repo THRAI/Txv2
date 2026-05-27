@@ -1,0 +1,205 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-05-19-pthread-shared-clone-thread",
+  "title": "pthread Shared<T> + step_clone_thread implementation",
+  "status": "complete",
+  "created": "2026-05-19",
+  "updated": "2026-05-21",
+  "owner": "agent",
+  "summary": "Implement Shared<T> infrastructure and step_clone_thread to unblock pthread_create. Two phases: Phase A ships Shared<T> + Frame refactoring (~750 LOC); Phase B ships clone_thread + thread-exit futex protocol (~730 LOC). Total ~1,480 LOC, zero framework changes.",
+  "scope": {
+    "in": [
+      "crates/tx-subsystems/src/shared.rs",
+      "crates/tx-subsystems/src/lib.rs",
+      "crates/tx-subsystems/src/process/structure.rs",
+      "crates/tx-subsystems/src/process/execution.rs",
+      "crates/tx-subsystems/src/thread_runtime/execution.rs",
+      "crates/tx-subsystems/src/thread_runtime/structure.rs",
+      "crates/tx-subsystems/src/futex/execution.rs",
+      "crates/tx-shims/src/linux_syscall/numbers.rs",
+      "crates/tx-shims/src/linux_syscall/proc.rs"
+    ],
+    "out": [],
+    "write_sets": [
+      {
+        "owner": "agent",
+        "paths": [
+          "crates/tx-subsystems/src/shared.rs",
+          "crates/tx-subsystems/src/lib.rs",
+          "crates/tx-subsystems/src/process/structure.rs",
+          "crates/tx-subsystems/src/process/execution.rs",
+          "crates/tx-subsystems/src/thread_runtime/",
+          "crates/tx-subsystems/src/futex/",
+          "crates/tx-shims/src/linux_syscall/"
+        ],
+        "notes": "Phase A and B are sequential. Phase A must pass check+unit before Phase B starts."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/04_process-signals/PROCESS_v1.md",
+      "docs/design/02_execution/THREAD_RUNTIME_v1.md",
+      "docs/Txv3/01_CONCEPTS_v5.md",
+      "docs/Txv3/02_INVARIANTS_v5.md",
+      "docs/Txv3/03_STEP_MODEL_v2.md",
+      "docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/research/2026-05-19-pthread-gap-analysis.md",
+      "docs/progress/research/2026-05-06-fork-clone-wait4-scaffolding.md",
+      "docs/progress/plans/2026-05-06-fork-clone-wait4.md",
+      "docs/progress/plans/2026-05-07-shell-prompt-roadmap.md"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "pth-a1-shared",
+      "title": "A-1: Shared<T> infrastructure",
+      "status": "in-progress",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-subsystems/src/shared.rs",
+        "crates/tx-subsystems/src/lib.rs"
+      ],
+      "verification": [
+        "cargo xtask check",
+        "cargo xtask unit -p tx-subsystems"
+      ],
+      "notes": "Shared<T> is an Arc<RwLock<T>> wrapper with share()/fork_copy()/get()/get_mut(). COW trigger on get_mut() when inner Arc::strong_count() > 1. fork_copy is semantically share for v1 (COW left to per-subsystem impl)."
+    },
+    {
+      "id": "pth-a2-frame",
+      "title": "A-2: Frame struct + ProcessPayload field migration",
+      "status": "pending",
+      "depends_on": ["pth-a1-shared"],
+      "paths": [
+        "crates/tx-subsystems/src/process/structure.rs"
+      ],
+      "verification": [
+        "cargo xtask check",
+        "cargo xtask unit -p tx-subsystems"
+      ],
+      "notes": "Define Frame with vm/aspace + sig_actions as Shared<T> fields. fds/fd_cloexec stay inline (no FdTable struct yet). cwd/root/umask stay inline. Re-wrap accessors to delegate through frame field."
+    },
+    {
+      "id": "pth-a3-fork-adapt",
+      "title": "A-3: Adapt fork/clone/exec to Frame",
+      "status": "pending",
+      "depends_on": ["pth-a2-frame"],
+      "paths": [
+        "crates/tx-subsystems/src/process/execution.rs"
+      ],
+      "verification": [
+        "cargo xtask check",
+        "cargo xtask unit -p tx-subsystems"
+      ],
+      "notes": "step_fork: when clone_vm, call frame.vm.share() instead of aspace.clone(). sign_process_payload: take Frame instead of individual fields. exec: replace_aspace via frame.vm.get_mut() COW path."
+    },
+    {
+      "id": "pth-a4-clone-flags",
+      "title": "A-4: Wire CLONE_FILES / CLONE_SIGHAND / CLONE_FS in clone syscall",
+      "status": "pending",
+      "depends_on": ["pth-a3-fork-adapt"],
+      "paths": [
+        "crates/tx-shims/src/linux_syscall/proc.rs",
+        "crates/tx-shims/src/linux_syscall/numbers.rs"
+      ],
+      "verification": [
+        "cargo xtask check",
+        "cargo xtask unit"
+      ],
+      "notes": "Remove EINVAL rejection for CLONE_FILES/CLONE_SIGHAND/CLONE_FS in the fork (non-CLONE_THREAD) path. For non-CLONE_THREAD these flags are semantically fork_copy (the child gets a snapshot). Add CLONE_THREAD to the allowed mask in the clone_thread path."
+    },
+    {
+      "id": "pth-b5-clone-thread",
+      "title": "B-5: Implement step_clone_thread",
+      "status": "pending",
+      "depends_on": ["pth-a4-clone-flags"],
+      "paths": [
+        "crates/tx-subsystems/src/process/execution.rs"
+      ],
+      "verification": [
+        "cargo xtask check",
+        "cargo xtask unit -p tx-subsystems"
+      ],
+      "notes": "New step: creates ThreadIdentity within existing ProcessIdentity. Shares Frame via Frame::share_all(). Registers new ThreadIdentity in process.threads DLL. Does NOT create a new ProcessIdentity, pid, or pgrp binding. Uses step_engine::sign for ThreadIdentity/ThreadPayload zone allocation."
+    },
+    {
+      "id": "pth-b6-tls-ctid",
+      "title": "B-6: Wire CLONE_SETTLS / CLONE_PARENT_SETTID / CLONE_CHILD_CLEARTID",
+      "status": "pending",
+      "depends_on": ["pth-b5-clone-thread"],
+      "paths": [
+        "crates/tx-subsystems/src/process/execution.rs",
+        "crates/tx-subsystems/src/thread_runtime/structure.rs",
+        "crates/tx-shims/src/linux_syscall/proc.rs"
+      ],
+      "verification": [
+        "cargo xtask check",
+        "cargo xtask unit -p tx-subsystems"
+      ],
+      "notes": "CLONE_SETTLS: store tls pointer in ThreadPayload (existing tp register field or new slot). CLONE_PARENT_SETTID: write child tid to *ptid user address. CLONE_CHILD_CLEARTID: store ctid in ThreadPayload.clear_child_tid slot."
+    },
+    {
+      "id": "pth-b7-cleartid-futex",
+      "title": "B-7: clear_child_tid futex wake on thread exit",
+      "status": "pending",
+      "depends_on": ["pth-b6-tls-ctid"],
+      "paths": [
+        "crates/tx-subsystems/src/thread_runtime/execution.rs"
+      ],
+      "verification": [
+        "cargo xtask check",
+        "cargo xtask unit -p tx-subsystems"
+      ],
+      "notes": "In step_thread_exit, after marking thread zombie: if clear_child_tid is Some(addr), atomically write 0 to *addr (via copy_to_user or equivalent), then FUTEX_WAKE on addr with count=1. Must handle the case where the user page is unmapped (best-effort, no panic)."
+    },
+    {
+      "id": "pth-b8-robust-list",
+      "title": "B-8: set_robust_list real implementation",
+      "status": "pending",
+      "depends_on": ["pth-b7-cleartid-futex"],
+      "paths": [
+        "crates/tx-subsystems/src/thread_runtime/structure.rs",
+        "crates/tx-subsystems/src/thread_runtime/execution.rs",
+        "crates/tx-subsystems/src/futex/execution.rs",
+        "crates/tx-shims/src/linux_syscall/proc.rs"
+      ],
+      "verification": [
+        "cargo xtask check",
+        "cargo xtask unit -p tx-subsystems"
+      ],
+      "notes": "Store robust_list_head + len on ThreadPayload. On thread exit, walk the robust list: for each entry, set FUTEX_OWNER_DIED bit + FUTEX_WAKE with count=1. Handle malformed lists gracefully (best-effort, no panic)."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask check",
+      "status": "not-run",
+      "notes": "Full workspace check after each step"
+    },
+    {
+      "command": "cargo xtask unit -p tx-subsystems",
+      "status": "not-run",
+      "notes": "Subsystem unit tests after structural changes"
+    },
+    {
+      "command": "cargo xtask unit",
+      "status": "not-run",
+      "notes": "Full workspace unit tests after Phase A and Phase B completion"
+    }
+  ],
+  "risks": [
+    "Frame refactoring touches every ProcessPayload accessor; risk of introducing regressions in fork/clone/exec/exit paths",
+    "step_clone_thread shares Frame across threads; risk of deadlock if two threads contend on Frame fields under different lock orders",
+    "clear_child_tid + robust list futex operations on userspace addresses require UserAccessIf; may expose gaps in current user-VA handling",
+    "Existing fork tests clone ProcessPayload fields individually; Frame migration changes constructor signature — tests need coordinated update"
+  ],
+  "blockers": [],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

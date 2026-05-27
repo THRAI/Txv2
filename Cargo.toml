@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "xtask",
+    "crates/tx-hal",
+    "crates/tx-kernel",
+    "crates/tx-platform-adapter",
+    "crates/tx-substrate",
+    "crates/tx-test-support",
+    "crates/tx-reactor",
+    "crates/tx-policy",
+    "crates/tx-drivers",
+    "crates/tx-subsystems",
+    "crates/tx-services",
+    "crates/tx-fs",
+    "crates/tx-ext4",
+    "crates/tx-ext4-format",
+    "crates/tx-fat-format",
+    "crates/tx-fat",
+    "crates/tx-scripts",
+    "crates/tx-shims",
+    "crates/tx-vdso",
+    "boards/tx-hal-riscv64-qemu-virt",
+    "boards/tx-hal-riscv64-m1dock-mock",
+    "boards/tx-hal-loongarch64-qemu-virt",
+    "boards/tx-kernel-riscv64-qemu-virt",
+    "boards/tx-kernel-riscv64-m1dock-mock",
+    "boards/tx-kernel-loongarch64-qemu-virt",
+]
+exclude = [
+    "external/smoltcp-asterinas",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/txkernel"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+codegen-units = 1

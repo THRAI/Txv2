@@ -1,0 +1,46 @@
+[package]
+name = "tx-scripts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+test = true
+doctest = false
+
+[dependencies]
+# Open Q #5 DECIDED 2026-05-06 prefers ["alloc", "endian_fd", "elf64"]
+# (RV64-only slice). However, goblin 0.10.5 has a compile-time bug:
+# `elf::dynamic::dyn32` and `elf::header::Header::new` reference
+# `crate::elf32` unconditionally without a `cfg(feature = "elf32")`
+# gate, so the crate fails to build with `elf64` alone. We add
+# `elf32` purely as a build dependency; the parser (`loader.rs`)
+# never invokes any 32-bit code path.
+# TODO(elf-loader): drop `elf32` once goblin upstream fixes the
+# dyn32 / Header::new gating (track via a goblin issue / version
+# bump in a follow-up).
+goblin = { version = "0.10", default-features = false, features = ["alloc", "endian_fd", "elf64", "elf32"] }
+# Phase 5 (exec script) integrates the loader with the kernel-side
+# subsystems: VFS walker, page-backed targeted reads, vm scripts,
+# process / thread runtime, and signal table reset. The substrate
+# pulls in zone / cap / epoch primitives transitively via tx-subsystems
+# but the exec script also calls `tx_substrate::epoch::guard()`
+# directly so we declare the dep explicitly.
+tx-hal = { path = "../tx-hal" }
+tx-observe = { path = "../tx-observe" }
+tx-observe-types = { path = "../tx-observe-types" }
+tx-platform-adapter = { path = "../tx-platform-adapter" }
+tx-substrate = { path = "../tx-substrate" }
+tx-test-support = { path = "../tx-test-support" }
+tx-subsystems = { path = "../tx-subsystems" }
+tx-services = { path = "../tx-services" }
+
+[dev-dependencies]
+# Cross-crate test helpers (zone reset / pid counter reset / init slot
+# reset) for the Phase 5 exec_script tests.
+tx-subsystems = { path = "../tx-subsystems", features = ["test-support"] }
+# Observation testing harness (`TestPlatform`) for `tests/drive_observe.rs`.
+tx-observe = { path = "../tx-observe", features = ["testing"] }
+tx-observe-types = { path = "../tx-observe-types" }

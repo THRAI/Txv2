@@ -1,0 +1,26 @@
+[package]
+name = "tx-observe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[features]
+# Exposes `tx_observe::testing` for integration tests in sibling crates.
+# Pulls in `std` for `Mutex` and `Vec`; do not enable in kernel builds.
+testing = []
+
+[dependencies]
+tx-hal          = { path = "../tx-hal" }
+tx-observe-types = { path = "../tx-observe-types" }
+
+[dev-dependencies]
+# Enable the `testing` feature for integration tests under tests/.
+# This is the standard Cargo idiom for activating a library feature
+# when running integration tests of the same crate.
+tx-observe-types = { path = "../tx-observe-types" }
+tx-observe = { path = ".", features = ["testing"] }

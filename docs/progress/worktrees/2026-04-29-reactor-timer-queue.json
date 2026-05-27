@@ -1,0 +1,28 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-04-29-reactor-timer-queue",
+  "created": "2026-04-29",
+  "updated": "2026-04-29",
+  "status": "closed",
+  "branch": "codex/reactor-task-aware",
+  "path": "/private/tmp/Tx-worktrees/codex-reactor-task-aware",
+  "base": "09a8f34",
+  "plan": "docs/progress/plans/2026-04-29-kernel-main-long-term-checklist.json",
+  "owner": "Codex reactor timer lane",
+  "write_scope": [
+    "crates/tx-reactor",
+    "docs/progress/STATUS.md",
+    "docs/progress/worktrees/2026-04-29-reactor-timer-queue.json"
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test -p tx-reactor",
+    "cargo xtask lint unused",
+    "cargo xtask lint docs",
+    "cargo xtask progress validate",
+    "cargo xtask ci",
+    "cargo xtask ci-slow",
+    "git diff --check"
+  ],
+  "notes": "Adds the first reactor-local timer/deadline queue. Reactor-created channels share a timer queue, timeout wait protocols carry absolute nanosecond deadlines, Reactor::advance_time_to(now_ns) wakes expired deadlines, and wait_event can now return TimedOut while preserving re-observation after spurious event wakes. Tests cover no early timeout, ready-before-timeout timer unregister, and spurious wake re-park before timeout. Scheduler policy and real trap/timer interrupt delivery remain later work; subagent scouts confirmed the safe next boundary is a scheduler shell plus a narrow trap-to-kernel hook after the saved-register trap shell exists."
+}

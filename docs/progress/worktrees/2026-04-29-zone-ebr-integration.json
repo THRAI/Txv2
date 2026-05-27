@@ -1,0 +1,40 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-04-29-zone-ebr-integration",
+  "created": "2026-04-29",
+  "updated": "2026-04-30",
+  "status": "merged",
+  "branch": "codex/zone-ebr-integration",
+  "path": "/private/tmp/Tx-worktrees/codex-zone-ebr-integration",
+  "base": "codex/reactor-task-aware@3017a30",
+  "plan": null,
+  "owner": "Codex zone/EBR integration",
+  "write_scope": [
+    "README.md",
+    "crates/tx-hal/src/lib.rs",
+    "crates/tx-kernel/src/lib.rs",
+    "crates/tx-kernel/src/init.rs",
+    "crates/tx-kernel/src/zones.rs",
+    "crates/tx-reactor/tests/reactor_smoke.rs",
+    "crates/tx-substrate/src/lib.rs",
+    "crates/tx-substrate/src/epoch/",
+    "crates/tx-substrate/src/zone/",
+    "crates/tx-substrate/tests/",
+    "docs/progress/STATUS.md",
+    "docs/progress/decisions/2026-04-29-ebr-zone-first-executable-slice.md"
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test -p tx-substrate",
+    "cargo test -p tx-hal-riscv64-qemu-virt",
+    "cargo check -p tx-kernel",
+    "cargo xtask lint unused",
+    "cargo xtask lint docs",
+    "cargo xtask progress validate",
+    "cargo xtask ci",
+    "cargo xtask qemu --target rv64-qemu --profile smoke --expect-sentinel",
+    "grep -a 'txkernel' target/qemu-rv64-qemu-smoke.serial.log",
+    "git diff --check"
+  ],
+  "notes": "Conflict-resolution worktree for merging remote origin/zone (e53956e) into the reactor-task-aware line. Resolution keeps the newer HAL TimeIf/trap/pmap surface, replaces old flat substrate epoch/zone placeholders with the remote directory modules, wires the kernel zone smoke into CoreInit, updates stale host tests for the static-zone API, repairs an existing README docs-lint link, and makes reactor smoke counters per-test so workspace CI is deterministic. Closed on 2026-04-30 after the recorded worktree path no longer existed and the main checkout progress/status already recorded the merge verification."
+}

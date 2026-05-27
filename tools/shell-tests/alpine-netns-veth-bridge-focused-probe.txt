@@ -1,0 +1,113 @@
+# alpine-netns-veth-bridge-focused-probe.txt - real Alpine netns control probe.
+#
+# This keeps the namespace/capability stage network-scoped. The static
+# netns-helper supplies unshare(CLONE_NEWNET), setns(CLONE_NEWNET), and
+# /proc/<pid>/ns/net fd operations; real Alpine iproute2 drives bridge/veth
+# control-plane state in the host and target network namespaces.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "m=N73C; IP=/sbin/ip; [ -x $IP ] || IP=/usr/sbin/ip; echo ${m}_TOOLS_${IP}\n"
+expect "N73C_TOOLS_" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if [ -x /bin/netns-helper ]; then echo ${m}_NETNS_HELPER_PRESENT; else echo ${m}_FAIL_NO_NETNS_HELPER; fi\n"
+expect "N73C_NETNS_HELPER_PRESENT" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "/bin/netns-helper hold &\n"
+expect "tx-netns-holder-ready" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "target=$!; echo ${m}_TARGET_${target}\n"
+expect "N73C_TARGET_" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if ls /proc/${target}/ns/net; then echo ${m}_PROC_NS_NET_VISIBLE; else echo ${m}_FAIL_PROC_NS_NET; fi\n"
+expect "N73C_PROC_NS_NET_VISIBLE" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link add name docker0 type bridge; then echo ${m}_BRIDGE_CREATED; else echo ${m}_FAIL_BRIDGE_CREATE; fi\n"
+expect "N73C_BRIDGE_CREATED" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP addr add 172.17.0.1/16 dev docker0; then echo ${m}_BRIDGE_ADDR; else echo ${m}_FAIL_BRIDGE_ADDR; fi\n"
+expect "N73C_BRIDGE_ADDR" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link set docker0 up; then echo ${m}_BRIDGE_UP; else echo ${m}_FAIL_BRIDGE_UP; fi\n"
+expect "N73C_BRIDGE_UP" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link add veth0 type veth peer name eth0; then echo ${m}_VETH_CREATED; else echo ${m}_FAIL_VETH_CREATE; fi\n"
+expect "N73C_VETH_CREATED" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link set veth0 master docker0 || /bin/netns-helper master veth0 docker0; then echo ${m}_VETH_MASTER; else echo ${m}_FAIL_VETH_MASTER; fi\n"
+expect "N73C_VETH_MASTER" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link set veth0 up; then echo ${m}_VETH_UP; else echo ${m}_FAIL_VETH_UP; fi\n"
+expect "N73C_VETH_UP" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if $IP link set eth0 netns $target || /bin/netns-helper netns eth0 $target; then echo ${m}_ETH_MOVED; else echo ${m}_FAIL_ETH_MOVE; fi\n"
+expect "N73C_ETH_MOVED" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if /bin/netns-helper exec $target $IP link set eth0 up; then echo ${m}_ETH_UP; else echo ${m}_FAIL_ETH_UP; fi\n"
+expect "N73C_ETH_UP" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "if /bin/netns-helper exec $target $IP addr add 172.17.0.2/16 dev eth0; then echo ${m}_ETH_ADDR; else echo ${m}_FAIL_ETH_ADDR; fi\n"
+expect "N73C_ETH_ADDR" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "$IP link\n"
+expect "docker0" within 10000
+expect "veth0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "/bin/netns-helper exec $target $IP link\n"
+expect "eth0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "/bin/netns-helper exec $target $IP addr\n"
+expect "172.17.0.2" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "if /bin/netns-helper exec $target $IP route add default via 172.17.0.1 dev eth0; then echo ${m}_ETH_DEFAULT_ROUTE; else echo ${m}_FAIL_ETH_DEFAULT_ROUTE; fi\n"
+expect "N73C_ETH_DEFAULT_ROUTE" within 15000
+expect "/ # " within 10000
+
+sleep 500
+send "/bin/netns-helper exec $target $IP route\n"
+expect "default via 172.17.0.1" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "kill $target; echo ${m}_NETNS_CONTROL_SUCCESS\n"
+expect "N73C_NETNS_CONTROL_SUCCESS" within 10000
+expect "/ # " within 10000
+
+sleep 500
+quit

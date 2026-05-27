@@ -1,0 +1,21 @@
+[package]
+name = "tx-drivers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+std = []
+
+[dependencies]
+tx-hal = { path = "../tx-hal" }
+tx-platform-adapter = { path = "../tx-platform-adapter" }
+tx-substrate = { path = "../tx-substrate" }
+tx-subsystems = { path = "../tx-subsystems" }
+virtio-drivers = { version = "0.11.0", default-features = false }
+
+[lib]
+path = "src/lib.rs"
+doctest = false

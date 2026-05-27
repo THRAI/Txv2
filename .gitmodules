@@ -1,0 +1,15 @@
+[submodule "external/oscomp-autotest"]
+	path = external/oscomp-autotest
+	url = https://github.com/oscomp/autotest-for-oskernel
+	ignore = untracked
+[submodule "external/humanlayer-reference"]
+	path = external/humanlayer-reference
+	url = https://github.com/humanlayer/humanlayer
+	shallow = true
+[submodule "external/rsext4"]
+	path = external/rsext4
+	url = https://github.com/Starry-OS/rsext4.git
+[submodule "external/musl"]
+	path = external/musl
+	url = https://git.musl-libc.org/git/musl
+	ignore = untracked

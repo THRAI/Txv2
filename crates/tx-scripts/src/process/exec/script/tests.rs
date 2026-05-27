@@ -1,0 +1,1324 @@
+//! Tests for `exec_script` (Phase 5 of the ELF-loader plan).
+//!
+//! These tests drive the full eight-phase EXEC_v1 protocol against a
+//! kernel-resident init process. The fixture wires up a tmpfs-shaped
+//! `FsOps` whose `materialise_rnode` produces `RNodeBacking::PageBacked`
+//! over a hand-crafted minimal RV64 ET_EXEC ELF binary, so the walker
+//! resolves `path` → `Cap<OpenFile>` → `Cap<PageContainer>` end-to-end
+//! and the script's parse + AS-build + stack-populate + Phase-6 swap
+//! lanes all run.
+//!
+//! Doc anchors: same as `script.rs`'s. The tests exercise:
+//! - Phase 6 atomic AS-replacement (`exec_script_loads_minimal_elf_seeds_saved_user_context`).
+//! - `EXEC-12-4-INSTALL-BRK` (`exec_script_resets_brk_base_from_image_plan`).
+//! - `EXEC-12-3-RESET-SIGNAL-DISPOSITIONS`.
+//! - `EXEC-12-2-RESET-FDS-WITH-CLOEXEC`.
+//! - Pre-PoNR error rollback for `ENOENT` and malformed ELF.
+
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+
+use std::collections::BTreeMap;
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
+use crate::adapter::step_engine::{
+    self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, SpinMutex, StepOutcome,
+};
+use crate::adapter::vfs_exec::{
+    Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
+};
+use tx_hal::{
+    Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
+};
+use tx_subsystems::cross_crate_test_support::{
+    reset_init_process, reset_pid_counter, reset_tid_counter,
+};
+use tx_subsystems::mount::{
+    DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
+};
+use tx_subsystems::page_backed::{
+    AnonSwapPolicy, MaterializeAccess, PageContainer, PageContainerKind, PageIndex,
+};
+use tx_subsystems::process::{bootstrap_init_process, step_chdir, ChdirOutcome, ProcessIdentity};
+use tx_subsystems::signal::{SigDisposition, Signum};
+use tx_subsystems::thread_runtime::ThreadIdentity;
+use tx_subsystems::vm::{AddressSpace, USER_PAGE_SIZE};
+use tx_subsystems::zones;
+
+use super::{exec_script, ExecError};
+
+// ---------------------------------------------------------------------------
+// Test platform — minimal `PmapIf` that satisfies `AddressSpace::new`.
+//
+// Mirrors the in-crate `tx-shims` test pmap. Simulates pmap-root
+// alloc/dealloc, reserve/commit/unmap, and tracks installed mappings
+// keyed by `(root, virt)`. The exec script only reads / publishes
+// pmap entries via the standard `vm::scripts` lane; the test pmap is
+// expressive enough to drive that path end-to-end.
+// ---------------------------------------------------------------------------
+
+struct ScriptsTestPmap;
+
+impl PlatformConfig for ScriptsTestPmap {
+    const ARCH: Arch = Arch::Riscv64;
+    const BOARD: &'static str = "scripts-test";
+}
+
+#[derive(Default)]
+struct ScriptsTestPmapState {
+    next_root: usize,
+    mappings: BTreeMap<(usize, usize), PhysAddr>,
+}
+
+static SCRIPTS_TEST_PMAP_STATE: LazyLock<Mutex<ScriptsTestPmapState>> = LazyLock::new(|| {
+    Mutex::new(ScriptsTestPmapState {
+        next_root: 1,
+        mappings: BTreeMap::new(),
+    })
+});
+
+fn root_key(root: &PmapRoot) -> usize {
+    root.phys().0
+}
+
+impl PmapIf for ScriptsTestPmap {
+    fn create_pmap_root() -> Result<PmapRoot, PmapError> {
+        let mut state = SCRIPTS_TEST_PMAP_STATE.lock().expect("scripts pmap lock");
+        let id = state.next_root;
+        state.next_root += 1;
+        Ok(PmapRoot::new(
+            PtNode::boot_pool(PhysAddr(id * USER_PAGE_SIZE)),
+            Asid(id as u16),
+        ))
+    }
+
+    fn destroy_pmap_root(root: PmapRoot) {
+        let mut state = SCRIPTS_TEST_PMAP_STATE.lock().expect("scripts pmap lock");
+        let key = root.phys().0;
+        state.mappings.retain(|(r, _), _| *r != key);
+    }
+
+    fn reserve_mapping(
+        root: &PmapRoot,
+        virt: VirtAddr,
+        phys: PhysAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapReservation>, PmapError> {
+        let state = SCRIPTS_TEST_PMAP_STATE.lock().expect("scripts pmap lock");
+        if state.mappings.contains_key(&(root_key(root), virt.0)) {
+            return Err(PmapError::AlreadyMapped);
+        }
+        Ok(Some(PmapReservation::new(virt, phys, kind)))
+    }
+
+    fn rollback_mapping(_root: &PmapRoot, _reservation: PmapReservation) {}
+
+    fn commit_mapping(
+        root: &PmapRoot,
+        reservation: PmapReservation,
+        _permissions: PmapPermissions,
+    ) {
+        let mut state = SCRIPTS_TEST_PMAP_STATE.lock().expect("scripts pmap lock");
+        state
+            .mappings
+            .insert((root_key(root), reservation.virt().0), reservation.phys());
+    }
+
+    fn unmap_mapping(
+        root: &PmapRoot,
+        virt: VirtAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapUnmapResult>, PmapError> {
+        let mut state = SCRIPTS_TEST_PMAP_STATE.lock().expect("scripts pmap lock");
+        let Some(phys) = state.mappings.remove(&(root_key(root), virt.0)) else {
+            return Ok(None);
+        };
+        Ok(Some(PmapUnmapResult::new(virt, phys, kind)))
+    }
+}
+
+impl tx_hal::ConsoleIf for ScriptsTestPmap {
+    fn write_bytes(_bytes: &[u8]) {}
+}
+
+// `exec_script::<P>` requires `P: PmapIf + EntropyIf`. The trait
+// default fills bytes from the deterministic boot-counter
+// xorshift, which is exactly what test sites want — non-zero,
+// reproducible, no hardware dependency.
+impl EntropyIf for ScriptsTestPmap {}
+
+impl tx_hal::AuxvIf for ScriptsTestPmap {}
+
+// ---------------------------------------------------------------------------
+// Minimal in-test FS that knows how to materialise regular files as
+// `RNodeBacking::PageBacked { pc }` over a kernel-built PageContainer.
+//
+// The walker tests (in `tx-subsystems`) cover directories/symlinks; the
+// exec script needs the regular-file path that tmpfs's production
+// surface will eventually plug in via a `materialise_rnode` override.
+// We build the same shape here as a self-contained fixture.
+// ---------------------------------------------------------------------------
+
+struct ExecTestFs {
+    inner: SpinMutex<ExecTestFsInner>,
+}
+
+struct ExecTestFsInner {
+    children: BTreeMap<FsObjectId, BTreeMap<Vec<u8>, FsObjectId>>,
+    inodes: BTreeMap<FsObjectId, ExecTestInode>,
+    next_id: u64,
+}
+
+enum ExecTestInode {
+    Directory,
+    Regular {
+        container: Cap<PageContainer>,
+        size: u64,
+        /// Mode bits (without S_IFMT). Wave 4 Part 5 tests vary this
+        /// to exercise the X-bit and S_ISUID/S_ISGID paths.
+        mode_bits: u16,
+        /// Owner uid stored on the inode meta. Lets tests register a
+        /// setuid binary owned by uid 1000 distinct from the caller.
+        uid: u32,
+        /// Owner gid stored on the inode meta.
+        gid: u32,
+    },
+}
+
+impl ExecTestFs {
+    fn new(root_id: FsObjectId) -> Arc<Self> {
+        let mut inner = ExecTestFsInner {
+            children: BTreeMap::new(),
+            inodes: BTreeMap::new(),
+            next_id: root_id.as_u64() + 1,
+        };
+        inner.children.insert(root_id, BTreeMap::new());
+        inner.inodes.insert(root_id, ExecTestInode::Directory);
+        Arc::new(Self {
+            inner: SpinMutex::new(inner),
+        })
+    }
+
+    fn alloc_id(&self) -> FsObjectId {
+        let mut inner = self.inner.lock();
+        let id = inner.next_id;
+        inner.next_id += 1;
+        FsObjectId::new(id)
+    }
+
+    /// Create a regular-file inode whose page-backed contents are
+    /// pre-populated with `bytes`. Returns the file's FsObjectId.
+    fn add_regular_with_bytes(&self, parent: FsObjectId, name: &[u8], bytes: &[u8]) -> FsObjectId {
+        // Default mode/uid/gid match the pre-Wave-4 fixture: 0o755,
+        // root-owned. Wave 4 Part 5 tests use
+        // `add_regular_with_bytes_meta` to override.
+        self.add_regular_with_bytes_meta(parent, name, bytes, 0o755, 0, 0)
+    }
+
+    /// Create a regular-file inode with explicit mode bits (without
+    /// `S_IFMT`) and uid/gid. Used by Wave 4 Part 5 tests to drive
+    /// the X-bit and `S_ISUID` / `S_ISGID` paths.
+    fn add_regular_with_bytes_meta(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        bytes: &[u8],
+        mode_bits: u16,
+        uid: u32,
+        gid: u32,
+    ) -> FsObjectId {
+        let pages = (bytes.len() as u64).div_ceil(USER_PAGE_SIZE as u64);
+        let pages = core::cmp::max(pages, 1);
+        let pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            pages,
+        )
+        .expect("page container reservation");
+        // Populate every page with the corresponding byte slice via
+        // `materialize_anon` + the kernel direct map.
+        for (idx, chunk) in bytes.chunks(USER_PAGE_SIZE).enumerate() {
+            let materialised = pc
+                .materialize_anon(PageIndex::new(idx as u64), MaterializeAccess::Write)
+                .expect("materialize anon page for fixture");
+            let frame_base =
+                page_allocator::frame_kernel_addr(materialised.ppn).expect("direct-map view");
+            // SAFETY: freshly materialised anon page; we hold the pin
+            // via `materialised.map_pin` for the duration of the copy.
+            unsafe {
+                core::ptr::copy_nonoverlapping(chunk.as_ptr(), frame_base, chunk.len());
+            }
+        }
+        let size = bytes.len() as u64;
+        // Truncate updates `pc.size_bytes()` to match POSIX semantics;
+        // we set it directly via a guard-scoped `step_truncate` rather
+        // than reaching into `set_size_bytes` (pub(crate)).
+        let guard = guard();
+        match tx_subsystems::page_backed::step_truncate(&pc, size, &guard) {
+            StepOutcome::Done(()) | StepOutcome::Continue { .. } => {}
+            other => panic!("step_truncate(pc, {size}) failed: {other:?}"),
+        }
+        drop(guard);
+
+        let id = self.alloc_id();
+        let mut inner = self.inner.lock();
+        inner
+            .children
+            .entry(parent)
+            .or_default()
+            .insert(name.to_vec(), id);
+        inner.inodes.insert(
+            id,
+            ExecTestInode::Regular {
+                container: pc,
+                size,
+                mode_bits,
+                uid,
+                gid,
+            },
+        );
+        id
+    }
+}
+
+// `FsOps` + `FsPageBacking` impls + tests on `ExecTestFs` live in
+// the sibling `v3` submodule (file: `script/tests/v3.rs`). The
+// submodule has full visibility into `ExecTestFs` via `super::`.
+mod v3;
+
+// ---------------------------------------------------------------------------
+// ELF fixture builder. Produces a minimal RV64 ET_EXEC binary the
+// parser accepts. Mirrors `loader/tests.rs`'s shape but inline-includes
+// only what `exec_script` needs.
+// ---------------------------------------------------------------------------
+
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+const ELFCLASS64: u8 = 2;
+const ELFDATA2LSB: u8 = 1;
+const EV_CURRENT: u8 = 1;
+const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3;
+const EM_RISCV: u16 = 243;
+const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
+const PT_PHDR: u32 = 6;
+const PF_R: u32 = 4;
+const PF_X: u32 = 1;
+
+const FIX_PAGE: u64 = 4096;
+const BASE_LOAD_VADDR: u64 = 0x1_0000;
+const ENTRY_OFFSET: u64 = 0x80;
+
+/// Emit a minimal valid RV64 ET_EXEC binary with one R+X LOAD covering
+/// the file (no BSS extension). The file fits in a single page so
+/// the exec script's 4 KiB initial read covers the entire image.
+fn minimal_elf_bytes() -> Vec<u8> {
+    fn write_u16(b: &mut [u8], at: usize, v: u16) {
+        b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    fn write_u32(b: &mut [u8], at: usize, v: u32) {
+        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn write_u64(b: &mut [u8], at: usize, v: u64) {
+        b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn write_phdr(
+        b: &mut [u8],
+        at: usize,
+        p_type: u32,
+        p_flags: u32,
+        p_offset: u64,
+        p_vaddr: u64,
+        p_filesz: u64,
+        p_memsz: u64,
+        p_align: u64,
+    ) {
+        write_u32(b, at, p_type);
+        write_u32(b, at + 4, p_flags);
+        write_u64(b, at + 8, p_offset);
+        write_u64(b, at + 16, p_vaddr);
+        write_u64(b, at + 24, p_vaddr); // paddr
+        write_u64(b, at + 32, p_filesz);
+        write_u64(b, at + 40, p_memsz);
+        write_u64(b, at + 48, p_align);
+    }
+
+    // Layout: header (64) + PT_PHDR (56) + PT_LOAD (56) = 176 bytes.
+    let phoff: u64 = 64;
+    let n_phdrs: u16 = 2;
+    let phent: u16 = 56;
+    let total_phdrs = (n_phdrs as u64) * (phent as u64);
+    let file_size: usize = (phoff + total_phdrs) as usize;
+    let mut bytes = vec![0u8; file_size];
+
+    // ----- Ehdr -----
+    bytes[0..4].copy_from_slice(&ELF_MAGIC);
+    bytes[4] = ELFCLASS64;
+    bytes[5] = ELFDATA2LSB;
+    bytes[6] = EV_CURRENT;
+    write_u16(&mut bytes, 16, ET_EXEC);
+    write_u16(&mut bytes, 18, EM_RISCV);
+    write_u32(&mut bytes, 20, 1); // e_version
+    write_u64(&mut bytes, 24, BASE_LOAD_VADDR + ENTRY_OFFSET); // e_entry
+    write_u64(&mut bytes, 32, phoff); // e_phoff
+    write_u64(&mut bytes, 40, 0); // e_shoff
+    write_u32(&mut bytes, 48, 0); // e_flags
+    write_u16(&mut bytes, 52, 64); // e_ehsize
+    write_u16(&mut bytes, 54, phent); // e_phentsize
+    write_u16(&mut bytes, 56, n_phdrs); // e_phnum
+    write_u16(&mut bytes, 58, 0); // e_shentsize
+    write_u16(&mut bytes, 60, 0); // e_shnum
+    write_u16(&mut bytes, 62, 0); // e_shstrndx
+
+    // ----- PT_PHDR -----
+    let pt_phdr_vaddr = BASE_LOAD_VADDR + phoff;
+    write_phdr(
+        &mut bytes,
+        phoff as usize,
+        PT_PHDR,
+        PF_R,
+        phoff,
+        pt_phdr_vaddr,
+        total_phdrs,
+        total_phdrs,
+        8,
+    );
+
+    // ----- PT_LOAD (R+X) -----
+    write_phdr(
+        &mut bytes,
+        (phoff + 56) as usize,
+        PT_LOAD,
+        PF_R | PF_X,
+        0,
+        BASE_LOAD_VADDR,
+        file_size as u64,
+        file_size as u64,
+        FIX_PAGE,
+    );
+
+    bytes
+}
+
+// ---------------------------------------------------------------------------
+// N69a dynamic-link fixtures: a main ET_EXEC with PT_INTERP pointing at
+// a separately-built ET_DYN interpreter.
+// ---------------------------------------------------------------------------
+
+struct PhdrFields {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
+}
+
+fn write_phdr_at(b: &mut [u8], at: usize, phdr: PhdrFields) {
+    b[at..at + 4].copy_from_slice(&phdr.p_type.to_le_bytes());
+    b[at + 4..at + 8].copy_from_slice(&phdr.p_flags.to_le_bytes());
+    b[at + 8..at + 16].copy_from_slice(&phdr.p_offset.to_le_bytes());
+    b[at + 16..at + 24].copy_from_slice(&phdr.p_vaddr.to_le_bytes());
+    b[at + 24..at + 32].copy_from_slice(&phdr.p_vaddr.to_le_bytes()); // paddr
+    b[at + 32..at + 40].copy_from_slice(&phdr.p_filesz.to_le_bytes());
+    b[at + 40..at + 48].copy_from_slice(&phdr.p_memsz.to_le_bytes());
+    b[at + 48..at + 56].copy_from_slice(&phdr.p_align.to_le_bytes());
+}
+
+/// Emit a minimal ET_EXEC main image whose `PT_INTERP` segment points
+/// at `interp_path` (NUL-terminated inline). Layout: Ehdr (64) +
+/// PT_PHDR (56) + PT_LOAD (56) + PT_INTERP (56) + interp_path bytes.
+fn minimal_elf_with_interp_bytes(interp_path: &[u8]) -> Vec<u8> {
+    let phoff: u64 = 64;
+    let n_phdrs: u16 = 3;
+    let phent: u16 = 56;
+    let total_phdrs = (n_phdrs as u64) * (phent as u64);
+    let path_offset: u64 = phoff + total_phdrs;
+    let path_len: u64 = (interp_path.len() as u64) + 1; // include NUL
+    let file_size: usize = (path_offset + path_len) as usize;
+    let mut bytes = vec![0u8; file_size];
+
+    // ----- Ehdr -----
+    bytes[0..4].copy_from_slice(&ELF_MAGIC);
+    bytes[4] = ELFCLASS64;
+    bytes[5] = ELFDATA2LSB;
+    bytes[6] = EV_CURRENT;
+    bytes[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+    bytes[18..20].copy_from_slice(&EM_RISCV.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+    bytes[24..32].copy_from_slice(&(BASE_LOAD_VADDR + ENTRY_OFFSET).to_le_bytes());
+    bytes[32..40].copy_from_slice(&phoff.to_le_bytes());
+    bytes[40..48].copy_from_slice(&0u64.to_le_bytes()); // shoff
+    bytes[48..52].copy_from_slice(&0u32.to_le_bytes()); // flags
+    bytes[52..54].copy_from_slice(&64u16.to_le_bytes()); // ehsize
+    bytes[54..56].copy_from_slice(&phent.to_le_bytes());
+    bytes[56..58].copy_from_slice(&n_phdrs.to_le_bytes());
+    bytes[58..60].copy_from_slice(&0u16.to_le_bytes());
+    bytes[60..62].copy_from_slice(&0u16.to_le_bytes());
+    bytes[62..64].copy_from_slice(&0u16.to_le_bytes());
+
+    // ----- PT_PHDR -----
+    let pt_phdr_vaddr = BASE_LOAD_VADDR + phoff;
+    write_phdr_at(
+        &mut bytes,
+        phoff as usize,
+        PhdrFields {
+            p_type: PT_PHDR,
+            p_flags: PF_R,
+            p_offset: phoff,
+            p_vaddr: pt_phdr_vaddr,
+            p_filesz: total_phdrs,
+            p_memsz: total_phdrs,
+            p_align: 8,
+        },
+    );
+
+    // ----- PT_LOAD (R+X covers everything in the file) -----
+    write_phdr_at(
+        &mut bytes,
+        (phoff + 56) as usize,
+        PhdrFields {
+            p_type: PT_LOAD,
+            p_flags: PF_R | PF_X,
+            p_offset: 0,
+            p_vaddr: BASE_LOAD_VADDR,
+            p_filesz: file_size as u64,
+            p_memsz: file_size as u64,
+            p_align: FIX_PAGE,
+        },
+    );
+
+    // ----- PT_INTERP -----
+    write_phdr_at(
+        &mut bytes,
+        (phoff + 112) as usize,
+        PhdrFields {
+            p_type: PT_INTERP,
+            p_flags: PF_R,
+            p_offset: path_offset,
+            p_vaddr: BASE_LOAD_VADDR + path_offset,
+            p_filesz: path_len,
+            p_memsz: path_len,
+            p_align: 1,
+        },
+    );
+
+    // ----- inline NUL-terminated interpreter path -----
+    let off = path_offset as usize;
+    bytes[off..off + interp_path.len()].copy_from_slice(interp_path);
+    bytes[off + interp_path.len()] = 0;
+
+    bytes
+}
+
+/// Emit a minimal ET_DYN interpreter image with one R+X LOAD at
+/// vaddr=0 (canonical ET_DYN layout — load bias is applied by the
+/// kernel). Mirrors `minimal_elf_bytes` shape but flips `e_type`.
+fn minimal_interp_elf_bytes() -> Vec<u8> {
+    let phoff: u64 = 64;
+    let n_phdrs: u16 = 2;
+    let phent: u16 = 56;
+    let total_phdrs = (n_phdrs as u64) * (phent as u64);
+    let file_size: usize = (phoff + total_phdrs) as usize;
+    let mut bytes = vec![0u8; file_size];
+
+    bytes[0..4].copy_from_slice(&ELF_MAGIC);
+    bytes[4] = ELFCLASS64;
+    bytes[5] = ELFDATA2LSB;
+    bytes[6] = EV_CURRENT;
+    bytes[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
+    bytes[18..20].copy_from_slice(&EM_RISCV.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+    // Entry near top of the file image; load_bias is added by the kernel.
+    bytes[24..32].copy_from_slice(&ENTRY_OFFSET.to_le_bytes());
+    bytes[32..40].copy_from_slice(&phoff.to_le_bytes());
+    bytes[40..48].copy_from_slice(&0u64.to_le_bytes());
+    bytes[48..52].copy_from_slice(&0u32.to_le_bytes());
+    bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+    bytes[54..56].copy_from_slice(&phent.to_le_bytes());
+    bytes[56..58].copy_from_slice(&n_phdrs.to_le_bytes());
+
+    // PT_PHDR at relative vaddr=phoff (load_bias adds 0x3000_0000 at
+    // runtime).
+    write_phdr_at(
+        &mut bytes,
+        phoff as usize,
+        PhdrFields {
+            p_type: PT_PHDR,
+            p_flags: PF_R,
+            p_offset: phoff,
+            p_vaddr: phoff,
+            p_filesz: total_phdrs,
+            p_memsz: total_phdrs,
+            p_align: 8,
+        },
+    );
+
+    // PT_LOAD covering everything; vaddr=0 (relative).
+    write_phdr_at(
+        &mut bytes,
+        (phoff + 56) as usize,
+        PhdrFields {
+            p_type: PT_LOAD,
+            p_flags: PF_R | PF_X,
+            p_offset: 0,
+            p_vaddr: 0,
+            p_filesz: file_size as u64,
+            p_memsz: file_size as u64,
+            p_align: FIX_PAGE,
+        },
+    );
+
+    bytes
+}
+
+// ---------------------------------------------------------------------------
+// Test infrastructure: shared lock + bootstrap fixture.
+// ---------------------------------------------------------------------------
+
+static SCRIPT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+struct TestSetup {
+    _lock: MutexGuard<'static, ()>,
+}
+
+fn setup() -> TestSetup {
+    let lock = SCRIPT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tx_test_support::init_host();
+    let _ = zones::register_all();
+    match page_allocator::claim_zero_frame() {
+        Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
+        Err(error) => panic!("claim zero frame for exec_script tests: {error:?}"),
+    }
+    tx_test_support::drain_to_quiescence();
+    reset_pid_counter();
+    reset_tid_counter();
+    reset_init_process();
+    TestSetup { _lock: lock }
+}
+
+/// Register a fresh `ExecTestFs` rootfs and return (root_dentry, fs).
+fn build_fs_root() -> (Cap<DEntry>, Arc<ExecTestFs>) {
+    let root_id = FsObjectId::new(2);
+    let fs = ExecTestFs::new(root_id);
+
+    let payload = MountPayload::new_cap(
+        fs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+        fs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
+        None,
+        DevId::new(99),
+        MountOptions::default(),
+        "exec-test-fs",
+        SourceLabel::Static("exec-test"),
+    )
+    .expect("mount payload");
+
+    let root_rnode = {
+        let raw = RNode::new(
+            root_id,
+            InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
+            RNodeBacking::Directory,
+        )
+        .with_containing_mount(&payload);
+        let res = reserve_for::<RNode>().expect("rnode reservation");
+        sign_for(res, raw)
+    };
+
+    let _mount = MountIdentity::new_cap(
+        MountId::new(1),
+        None,
+        root_rnode.clone(),
+        None,
+        payload,
+        MountFlags::empty(),
+    )
+    .expect("mount identity");
+
+    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
+    (root_dentry, fs)
+}
+
+fn fresh_aspace() -> Cap<AddressSpace> {
+    AddressSpace::new_cap_for_platform::<ScriptsTestPmap>().expect("fresh aspace")
+}
+
+fn block_on<F: core::future::Future>(future: F) -> F::Output {
+    use core::task::{Context, Poll, Waker};
+
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let mut pinned = Box::pin(future);
+    for _ in 0..1024 {
+        match pinned.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => continue,
+        }
+    }
+    panic!("exec_script tests block_on: future did not resolve in 1024 polls");
+}
+
+/// Bootstrap an init process whose cwd is the registered fs root, and
+/// register a regular file at `/<name>` containing `bytes`. Returns
+/// the leader thread, the process Cap, and the fs handle (for further
+/// fixture mutation if needed).
+fn bootstrap_with_file(
+    name: &[u8],
+    bytes: &[u8],
+) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>, Arc<ExecTestFs>) {
+    let (root_dentry, fs) = build_fs_root();
+    let _ = fs.add_regular_with_bytes(FsObjectId::new(2), name, bytes);
+
+    let aspace = fresh_aspace();
+    let process = bootstrap_init_process(aspace).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+
+    // Bind cwd so the walker has a search root.
+    match step_chdir(&process, root_dentry) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("init bootstrap somehow zombified"),
+    }
+
+    (process, thread, fs)
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn exec_script_loads_minimal_elf_seeds_saved_user_context() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+
+    let aspace_before = process.aspace_cap().expect("alive aspace");
+    let cred = Credential::root();
+
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+
+    let aspace_after = process.aspace_cap().expect("alive aspace post-exec");
+    assert_ne!(
+        aspace_before.key(),
+        aspace_after.key(),
+        "Phase 6 must have atomically replaced the aspace"
+    );
+
+    let payload = thread.payload_cap().expect("alive thread payload");
+    let ctx = payload
+        .saved_user_context()
+        .expect("Phase 6 must have seeded the trap context");
+    assert_eq!(
+        ctx.pc as u64,
+        BASE_LOAD_VADDR + ENTRY_OFFSET,
+        "saved_user_context.pc should match the ELF entry"
+    );
+    // Per RV64 psABI the SP lives at register x2.
+    assert_eq!(ctx.regs[2] & 0xF, 0, "initial sp must be 16-byte aligned");
+    assert_ne!(ctx.regs[2], 0, "initial sp must be populated");
+    // Other GPRs (besides x2) are zero per System V `_start` contract.
+    assert_eq!(ctx.regs[0], 0);
+    assert_eq!(ctx.regs[1], 0);
+}
+
+#[test]
+fn exec_script_collapses_sibling_threads_before_aspace_swap() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+
+    let sibling = tx_subsystems::process::execution::step_clone_thread(
+        &process,
+        &tx_hal::UserTrapContext {
+            regs: [0; 32],
+            pc: 0x4000_0000,
+            status: 0,
+            fp: tx_hal::UserFpContext::empty(),
+        },
+        0,
+        0,
+        0,
+    )
+    .expect("sibling thread");
+    assert_eq!(process.live_thread_count(), 2);
+
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+
+    assert_eq!(
+        process.live_thread_count(),
+        1,
+        "exec must leave only the initiating thread live"
+    );
+    assert!(process.thread_by_tid(thread.tid.0).is_some());
+    assert!(process.thread_by_tid(sibling.tid.0).is_none());
+    assert!(sibling.is_zombie());
+}
+
+#[test]
+fn initial_user_context_uses_arch_specific_stack_register() {
+    assert_eq!(super::initial_user_sp_reg_for_arch(Arch::Riscv64), 2);
+    assert_eq!(super::initial_user_sp_reg_for_arch(Arch::LoongArch64), 3);
+
+    let ctx = super::make_initial_user_trap_context(Arch::LoongArch64, 0x1000, 0x4000);
+    assert_eq!(ctx.regs[3], 0x4000);
+    assert_eq!(ctx.regs[2], 0);
+}
+
+#[test]
+fn exec_script_resets_brk_base_from_image_plan() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+
+    // brk_base should be page_round_up(BASE_LOAD_VADDR + memsz). The
+    // fixture's memsz == 176, so highest = 0x1_0000 + 176, rounded up
+    // to the next 4 KiB page = 0x1_1000.
+    let expected = (BASE_LOAD_VADDR + 176 + 4095) & !4095;
+    assert_eq!(process.brk_base(), expected);
+    assert_eq!(process.current_brk(), expected);
+}
+
+#[test]
+fn exec_script_invalid_elf_falls_back_to_bin_sh() {
+    let _setup = setup();
+    // 4 KiB of zeroes — fails ELF magic check immediately.
+    // The kernel now falls back to /bin/sh for ENOEXEC; /bin/sh
+    // does not exist in this test fixture, so the result is
+    // PathNotFound.
+    let bytes = vec![0u8; 4096];
+    let (process, thread, _fs) = bootstrap_with_file(b"bad", &bytes);
+
+    let aspace_before = process.aspace_cap().expect("alive aspace");
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/bad",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Err(ExecError::PathNotFound));
+
+    // Pre-PoNR error path must leave the process aspace untouched.
+    let aspace_after = process.aspace_cap().expect("alive aspace post-fail");
+    assert_eq!(aspace_before.key(), aspace_after.key());
+    // The thread's saved_user_context must remain empty (bootstrap
+    // never seeds it).
+    let payload = thread.payload_cap().expect("alive thread payload");
+    assert!(payload.saved_user_context().is_none());
+}
+
+#[test]
+fn shebang_busybox_sh_normalization_consumes_applet_arg() {
+    let header = b"#!/bin/busybox sh\n./lua $1\n";
+    let (interp, opt_arg) = super::shebang_parse(header).expect("valid shebang");
+    let original_argv: [&[u8]; 2] = [b"./test.sh", b"date.lua"];
+
+    let (interp_path, argv) =
+        super::shebang_exec_argv(interp, opt_arg, b"./test.sh", &original_argv);
+
+    assert_eq!(interp_path, b"/bin/sh");
+    let argv_refs: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        argv_refs,
+        vec![b"/bin/sh".as_slice(), b"./test.sh", b"date.lua"]
+    );
+}
+
+#[test]
+fn exec_script_path_not_found_returns_path_not_found() {
+    let _setup = setup();
+    // Register a file but exec a different path so the walker
+    // returns ENOENT before any read or parse.
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+
+    let aspace_before = process.aspace_cap().expect("alive aspace");
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/nope",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Err(ExecError::PathNotFound));
+
+    let aspace_after = process.aspace_cap().expect("alive aspace post-fail");
+    assert_eq!(aspace_before.key(), aspace_after.key());
+}
+
+#[test]
+fn exec_script_resets_signal_dispositions_to_sig_dfl() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+
+    // Pre-install a non-default disposition for SIGTERM via the
+    // existing step_sigaction step; verify it reads back as Handler
+    // before the exec.
+    use tx_subsystems::signal::step_sigaction;
+    let _ = step_sigaction(&process, Signum::SIGTERM, SigDisposition::Handler(0xdead));
+    assert_eq!(
+        process
+            .sig_disposition(Signum::SIGTERM)
+            .expect("SIGTERM disposition pre-exec"),
+        SigDisposition::Handler(0xdead),
+    );
+
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+
+    // After exec, the handler must have been collapsed back to
+    // SigDisposition::Default per EXEC-12-3-RESET-SIGNAL-DISPOSITIONS.
+    assert_eq!(
+        process
+            .sig_disposition(Signum::SIGTERM)
+            .expect("SIGTERM disposition post-exec"),
+        SigDisposition::Default,
+    );
+}
+
+#[test]
+fn exec_script_closes_cloexec_fds_keeps_others() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, fs) = bootstrap_with_file(b"init", &bytes);
+
+    // Open two distinct files at fd 3 (CLOEXEC) and fd 4 (kept). We
+    // reuse the binary itself as the file backing for each fd —
+    // the test only cares about presence/absence of the slot.
+    let _ = fs.add_regular_with_bytes(FsObjectId::new(2), b"keep", b"hello-keep-me");
+
+    use crate::adapter::vfs_exec::{OpenFile, OpenFileFlags};
+    // Build OpenFiles directly over the test fs's PageContainers via
+    // `materialise_rnode` — tx-subsystems::vfs::OpenFile::new_cap is
+    // public.
+    let open_for = |name: &[u8]| -> Cap<OpenFile> {
+        // Resolve through the walker; it will go through
+        // materialise_rnode and produce a PageBacked RNode. Use the
+        // root walker cred so the test isn't gated on tmpfs's mode
+        // bits — the slice's DAC test coverage lives elsewhere.
+        use step_engine::StepOutcome as V3;
+        let cred = Credential::root();
+        let cwd = process.cwd().expect("cwd bound");
+        let guard = guard();
+        let outcome = tx_subsystems::vfs::walker::step_open(
+            cwd,
+            name,
+            OpenFileFlags {
+                read: true,
+                write: false,
+                append: false,
+                cloexec: false,
+                nonblocking: false,
+            },
+            0,
+            &cred,
+            &guard,
+        );
+        drop(guard);
+        match outcome {
+            V3::Done(file) => file,
+            other => panic!("step_open({name:?}) failed: {other:?}"),
+        }
+    };
+
+    let cloexec_file = open_for(b"/init");
+    let kept_file = open_for(b"/keep");
+    let _ = process.set_fd(3, Some(cloexec_file));
+    let _ = process.set_fd(4, Some(kept_file));
+    process.set_fd_cloexec(3, true);
+    process.set_fd_cloexec(4, false);
+    assert!(process.fd(3).is_some());
+    assert!(process.fd(4).is_some());
+
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+
+    // fd 3 was CLOEXEC: closed.
+    assert!(process.fd(3).is_none(), "CLOEXEC fd must be closed by exec");
+    // fd 4 was NOT CLOEXEC: kept.
+    assert!(process.fd(4).is_some(), "non-CLOEXEC fd must survive exec");
+    // The CLOEXEC bitmap is cleared wholesale.
+    assert!(!process.fd_cloexec(3));
+    assert!(!process.fd_cloexec(4));
+}
+
+// ---------------------------------------------------------------------------
+// Wave 4 Part 5: pre-Phase-6 X-bit auth + Phase 3.5 setuid recompute.
+// ---------------------------------------------------------------------------
+
+/// Bootstrap an init process with a fixture file at `/<name>` whose
+/// inode mode bits (without S_IFMT) and uid/gid are configurable. Used
+/// by the Wave 4 Part 5 tests to drive the X-bit and setuid paths.
+fn bootstrap_with_file_meta(
+    name: &[u8],
+    bytes: &[u8],
+    mode_bits: u16,
+    uid: u32,
+    gid: u32,
+) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>, Arc<ExecTestFs>) {
+    let (root_dentry, fs) = build_fs_root();
+    let _ = fs.add_regular_with_bytes_meta(FsObjectId::new(2), name, bytes, mode_bits, uid, gid);
+
+    let aspace = fresh_aspace();
+    let process = bootstrap_init_process(aspace).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+
+    match step_chdir(&process, root_dentry) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("init bootstrap somehow zombified"),
+    }
+
+    (process, thread, fs)
+}
+
+/// Drop the bootstrap process from "root + FULL caps" to a chosen
+/// non-root cred. Step 1: clear effective/permitted caps via the
+/// cross-crate test seam (otherwise `is_privileged_for(CAP_SETUID)`
+/// short-circuits even after the uid swap). Step 2: drive the
+/// privileged `step_setresuid` while still root to install the new
+/// real/effective/saved uid set. Mirrors the cred/tests.rs
+/// `drop_to` helper but routed through public mutators since
+/// `payload` is `pub(crate)` to tx-scripts.
+fn set_non_root_cred(process: &Cap<ProcessIdentity>, uid: u32) {
+    use tx_subsystems::cred::{step_setresuid, CredChange, Uid as CredUid};
+    let outcome = step_setresuid(
+        process,
+        Some(CredUid(uid)),
+        Some(CredUid(uid)),
+        Some(CredUid(uid)),
+    );
+    assert!(matches!(outcome, CredChange::Replaced { .. }));
+    tx_subsystems::cross_crate_test_support::clear_caps_for_test(process);
+}
+
+/// Build a `Credential` for the walker step matching the process's
+/// post-drop cred. Used so the walker DAC checks (Wave 3) and the
+/// Wave 4 X-bit check both see the same caller identity.
+fn walker_cred_for(uid: u32, gid: u32) -> Credential {
+    Credential {
+        uid,
+        gid,
+        effective_caps: tx_subsystems::cred::CapabilitySet::EMPTY,
+    }
+}
+
+#[test]
+fn exec_script_eacces_for_non_executable_binary() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    // mode 0o600 — no X bit anywhere. Owned by uid 0; caller is uid 1001
+    // with no capabilities. Falls through to "other" triplet → no X → EACCES.
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o600, 0, 0);
+    set_non_root_cred(&process, 1001);
+
+    let cred = walker_cred_for(1001, 1001);
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Err(ExecError::PermissionDenied));
+}
+
+#[test]
+fn exec_script_eacces_for_other_user_when_no_other_x_bit() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    // mode 0o710: rwx-/--x/--- — owner+group can X, other cannot.
+    // File owned by uid 0; caller is uid 1001 (non-root, no caps),
+    // which falls through to the "other" triplet → no X → EACCES.
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o710, 0, 0);
+    set_non_root_cred(&process, 1001);
+
+    let cred = walker_cred_for(1001, 1001);
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Err(ExecError::PermissionDenied));
+}
+
+#[test]
+fn exec_script_dac_override_bypasses_with_x_bit_set() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    // mode 0o711: any X bit is set, so CAP_DAC_OVERRIDE bypasses the
+    // ownership/triplet check. File owned by uid 0; caller is root
+    // (effective_caps = FULL).
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o711, 0, 0);
+
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn exec_script_dac_override_bypasses_with_no_x_bit() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    // mode 0o600 — no X bits. CAP_DAC_OVERRIDE bypasses the x-bit
+    // requirement entirely so the kernel can attempt exec and return
+    // ENOEXEC for non-ELF content, letting shells fall back to script
+    // interpretation (oscomp compatibility).
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o600, 0, 0);
+
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn exec_script_setuid_binary_changes_euid() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    // S_ISUID | 0o755, owned by uid 1000. Caller is uid 1001 (non-
+    // root). After exec the effective uid should be 1000 and the
+    // saved-set uid should also be 1000.
+    let mode_bits = 0o4755; // S_ISUID | rwxr-xr-x
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, mode_bits, 1000, 0);
+    set_non_root_cred(&process, 1001);
+
+    let cred = walker_cred_for(1001, 1001);
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+
+    let post = process.cred().expect("alive process");
+    assert_eq!(post.uid.raw(), 1001, "real uid preserved by exec");
+    assert_eq!(post.euid.raw(), 1000, "S_ISUID applied");
+    assert_eq!(post.suid.raw(), 1000, "saved-set tracks new euid");
+}
+
+#[test]
+fn exec_script_no_setuid_at_secure_zero() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    // mode 0o755, owned by uid 0. Caller is root (default). No setuid
+    // bit → cred unchanged → at_secure should be 0 in the auxv.
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o755, 0, 0);
+
+    let pre = process.cred().expect("alive process");
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+
+    let post = process.cred().expect("alive process");
+    assert_eq!(post.uid, pre.uid);
+    assert_eq!(post.euid, pre.euid);
+    assert_eq!(post.suid, pre.suid);
+}
+
+// ---------------------------------------------------------------------------
+// N69a: dynamic-link / PT_INTERP coverage.
+// ---------------------------------------------------------------------------
+
+/// `exec_script` opens the `PT_INTERP` target, parses it as ET_DYN,
+/// registers its LOAD segments at `INTERP_LOAD_BIAS_DEFAULT`, and
+/// seeds the trap context with `interp.entry + INTERP_LOAD_BIAS_DEFAULT`
+/// rather than the main image's `e_entry`.
+#[test]
+fn exec_script_dynamic_link_jumps_into_interpreter_at_load_bias() {
+    use tx_subsystems::vm::INTERP_LOAD_BIAS_DEFAULT;
+    let _setup = setup();
+
+    // Build the interpreter image first so we know what entry the
+    // kernel should target.
+    let interp_bytes = minimal_interp_elf_bytes();
+    // Build the main image with PT_INTERP -> "/libfake.so".
+    let main_bytes = minimal_elf_with_interp_bytes(b"/libfake.so");
+
+    let (root_dentry, fs) = build_fs_root();
+    let _ = fs.add_regular_with_bytes(FsObjectId::new(2), b"init", &main_bytes);
+    let _ = fs.add_regular_with_bytes(FsObjectId::new(2), b"libfake.so", &interp_bytes);
+
+    let aspace = fresh_aspace();
+    let process = bootstrap_init_process(aspace).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+    match step_chdir(&process, root_dentry) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("init bootstrap somehow zombified"),
+    }
+
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()), "dynamic-link exec must succeed");
+
+    let payload = thread.payload_cap().expect("alive thread payload");
+    let ctx = payload
+        .saved_user_context()
+        .expect("Phase 6 must have seeded the trap context");
+
+    // Interpreter entry = ENTRY_OFFSET (0x80), load_bias =
+    // 0x3000_0000 ⇒ initial PC sits inside the interpreter image,
+    // NOT at the main program's e_entry (`0x10080`).
+    let expected_pc = INTERP_LOAD_BIAS_DEFAULT + ENTRY_OFFSET;
+    assert_eq!(
+        ctx.pc as u64, expected_pc,
+        "PC must point at interp.entry + load_bias, not the main program's e_entry"
+    );
+
+    // The main program's e_entry (0x10080) must not be the PC —
+    // defensively assert this so a future regression that forgets to
+    // swap the entry point lands here.
+    assert_ne!(ctx.pc as u64, BASE_LOAD_VADDR + ENTRY_OFFSET);
+}
+
+/// When the main image has no `PT_INTERP` the historical
+/// static-`ET_EXEC` path is preserved: PC points at the main entry,
+/// `AT_BASE = 0`. This is the regression gate for the dynamic-link
+/// slice.
+#[test]
+fn exec_script_static_path_still_jumps_to_main_entry() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+
+    let payload = thread.payload_cap().expect("alive thread payload");
+    let ctx = payload.saved_user_context().expect("seeded ctx");
+    assert_eq!(
+        ctx.pc as u64,
+        BASE_LOAD_VADDR + ENTRY_OFFSET,
+        "static path keeps PC at main e_entry"
+    );
+}
+
+/// PT_INTERP pointing at a non-existent file must fail before PoNR;
+/// the caller's address space is preserved.
+#[test]
+fn exec_script_dynamic_link_missing_interp_returns_path_not_found() {
+    let _setup = setup();
+    let main_bytes = minimal_elf_with_interp_bytes(b"/no-such-interp.so");
+
+    let (root_dentry, fs) = build_fs_root();
+    let _ = fs.add_regular_with_bytes(FsObjectId::new(2), b"init", &main_bytes);
+
+    let aspace = fresh_aspace();
+    let process = bootstrap_init_process(aspace).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+    match step_chdir(&process, root_dentry) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("init bootstrap somehow zombified"),
+    }
+
+    let aspace_before = process.aspace_cap().expect("alive aspace");
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Err(ExecError::PathNotFound));
+
+    // Pre-PoNR error path must leave the process aspace untouched.
+    let aspace_after = process.aspace_cap().expect("alive aspace post-fail");
+    assert_eq!(aspace_before.key(), aspace_after.key());
+}

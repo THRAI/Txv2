@@ -1,0 +1,561 @@
+//! TTY-facing devfs/devpts materialization helpers.
+//!
+//! These helpers are intentionally below a full filesystem implementation.
+//! They let devfs/devpts or tests materialize the RNode/OpenFile shape that
+//! PAGE_BACKED/DEVICE/TTY specify without needing path-walk or fd tables yet.
+
+use alloc::vec::Vec;
+
+use crate::tty::adapter::step_engine::StepOutcome as V3Out;
+use crate::tty::adapter::step_engine::{self as step_engine, Cap};
+
+use crate::execution::{Errno, Guard};
+use crate::mount::MountPayload;
+use crate::tty::execution;
+use crate::tty::structure::registry;
+use crate::tty::structure::TtyIdentity;
+use crate::vfs::{
+    Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags,
+    RNode, RNodeBacking, StructPayload,
+};
+
+const DEVFS_TTY_OBJECT_BASE: u64 = 0x7474_7900;
+pub const DEVPTS_ROOT_OBJECT_ID: FsObjectId = FsObjectId::new(0x7074_7300);
+pub const DEVPTS_PTMX_OBJECT_ID: FsObjectId = FsObjectId::new(0x7074_7301);
+const DEVPTS_SLAVE_OBJECT_BASE: u64 = 0x7074_7400;
+
+pub struct DevptsInstance;
+
+/// Resolve a devfs TTY entry such as `ttyS0` or `console`.
+pub fn devfs_tty_by_name(name: &[u8], _guard: &Guard<'_>) -> V3Out<Cap<TtyIdentity>, NoProgress> {
+    if name == b"ptmx" {
+        return V3Out::err(Errno::EINVAL);
+    }
+
+    if let Some(index) = parse_tty_s_index(name) {
+        if let Some(tty) = registry::hardware_tty(index) {
+            return V3Out::done(tty);
+        }
+    }
+
+    if let Some(alias) = registry::devfs_alias(name) {
+        return V3Out::done(alias);
+    }
+
+    V3Out::err(Errno::ENOENT)
+}
+
+/// Snapshot of one devfs alias entry, surfaced to consumers that want to
+/// enumerate `/dev` without poking the registry's internal storage type.
+///
+/// Returned by [`devfs_alias_entries`]; each entry is a clone of the live
+/// `Cap<TtyIdentity>` and the `name` bytes the alias was registered under.
+#[derive(Clone)]
+pub struct DevfsAliasEntry {
+    pub name: Vec<u8>,
+    pub tty: Cap<TtyIdentity>,
+}
+
+/// Snapshot the currently-registered devfs alias entries (per
+/// `txdoc:TTY-LOOKUP-1` / `txdoc:TTY-RNODE-MATERIALIZATION-1`). Used by
+/// `tx-fs::devfs::FsOps::readdir` to enumerate `/dev` without coupling to
+/// the registry's slot storage.
+pub fn devfs_alias_entries() -> Vec<DevfsAliasEntry> {
+    let mut out = Vec::new();
+    for entry in registry::devfs_alias_snapshot() {
+        let mut name = Vec::new();
+        name.extend_from_slice(entry.name.as_bytes());
+        out.push(DevfsAliasEntry {
+            name,
+            tty: entry.tty,
+        });
+    }
+    out
+}
+
+/// Thin wrapper around the devfs alias and hardware-TTY tables, exposing a
+/// single `Option<Cap<TtyIdentity>>` indirection for `tx-fs::devfs` (and any
+/// other consumer that wants alias-shape lookup without depending on the
+/// registry's internal storage type or the `StepOutcome` ladder).
+///
+/// Resolution order matches `devfs_tty_by_name` (per
+/// `txdoc:TTY-THE-HARDWARE-CONSOLE-PATH-1`):
+///
+/// 1. `ttyS<N>` parses as a hardware index and resolves to the registered
+///    hardware TTY when present.
+/// 2. Otherwise, the devfs alias table is consulted (this is where
+///    `register_console_alias("console", ...)` publishes).
+///
+/// `ptmx` is intentionally not exposed here — it materialises through the
+/// devpts projection schema, not as a static alias.
+pub fn resolve_devfs_alias(name: &[u8]) -> Option<Cap<TtyIdentity>> {
+    if name == b"ptmx" {
+        return None;
+    }
+
+    if let Some(index) = parse_tty_s_index(name) {
+        if let Some(tty) = registry::hardware_tty(index) {
+            return Some(tty);
+        }
+    }
+
+    registry::devfs_alias(name)
+}
+
+/// Materialize a devfs RNode for `ttyS<N>` or `console`.
+pub fn devfs_rnode_by_name(name: &[u8], guard: &Guard<'_>) -> V3Out<Cap<RNode>, NoProgress> {
+    let tty = match devfs_tty_by_name(name, guard) {
+        V3Out::Done(tty) => tty,
+        V3Out::Err(err) => return V3Out::Err(err),
+        _ => return V3Out::err(Errno::EIO),
+    };
+    let index = tty.index;
+    rnode_for_tty(tty, FsObjectId::new(DEVFS_TTY_OBJECT_BASE + index as u64))
+}
+
+/// Open `/dev/ptmx`-shaped pty master. Full path-walk/fd-table layers can wrap
+/// this and install `master_file` into the caller's fd table.
+pub fn open_ptmx(guard: &Guard<'_>) -> V3Out<execution::OpenPtyOutcome, NoProgress> {
+    execution::step_openpty(guard)
+}
+
+/// Open a devfs hardware/alias TTY entry such as `/dev/ttyS0` or `/dev/console`.
+pub fn open_devfs_tty_by_name(name: &[u8], guard: &Guard<'_>) -> V3Out<Cap<OpenFile>, NoProgress> {
+    let tty = match devfs_tty_by_name(name, guard) {
+        V3Out::Done(tty) => tty,
+        V3Out::Err(err) => return V3Out::Err(err),
+        _ => return V3Out::err(Errno::EIO),
+    };
+    open_file_for_tty(tty, guard)
+}
+
+/// Resolve a devpts numeric slave entry.
+pub fn devpts_slave_by_index(
+    index: u32,
+    _guard: &Guard<'_>,
+) -> V3Out<Cap<TtyIdentity>, NoProgress> {
+    match registry::pty_slave(index) {
+        Some(slave) => V3Out::done(slave),
+        None => V3Out::err(Errno::ENOENT),
+    }
+}
+
+/// Materialize `/dev/pts/<N>` as `StructBacked::Tty(slave)`.
+pub fn devpts_rnode_by_index(index: u32, guard: &Guard<'_>) -> V3Out<Cap<RNode>, NoProgress> {
+    let slave = match devpts_slave_by_index(index, guard) {
+        V3Out::Done(slave) => slave,
+        V3Out::Err(err) => return V3Out::Err(err),
+        _ => return V3Out::err(Errno::EIO),
+    };
+    rnode_for_tty(slave, devpts_object_id_for_index(index))
+}
+
+/// Build an OpenFile over a fresh StructBacked TTY RNode.
+pub fn open_file_for_tty(
+    tty: Cap<TtyIdentity>,
+    _guard: &Guard<'_>,
+) -> V3Out<Cap<OpenFile>, NoProgress> {
+    let object_id = FsObjectId::new(DEVFS_TTY_OBJECT_BASE + tty.raw() as u64);
+    let rnode = match rnode_for_tty(tty, object_id) {
+        V3Out::Done(rnode) => rnode,
+        V3Out::Err(err) => return V3Out::Err(err),
+        _ => return V3Out::err(Errno::EIO),
+    };
+
+    match OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+        },
+    ) {
+        Ok(file) => V3Out::done(file),
+        Err(_) => V3Out::err(Errno::EIO),
+    }
+}
+
+fn rnode_for_tty(tty: Cap<TtyIdentity>, object_id: FsObjectId) -> V3Out<Cap<RNode>, NoProgress> {
+    match RNode::new_cap(
+        object_id,
+        InodeMeta::new(InodeKind::CharDevice, 0o020600),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::Tty(tty),
+        },
+    ) {
+        Ok(rnode) => V3Out::done(rnode),
+        Err(_) => V3Out::err(Errno::EIO),
+    }
+}
+
+fn devpts_dir_entries() -> Result<Vec<DirEntry>, Errno> {
+    let mut entries = Vec::with_capacity(registry::MAX_PTY_SLAVES + 1);
+    entries.push(DirEntry::new(
+        DEVPTS_PTMX_OBJECT_ID,
+        InodeKind::CharDevice,
+        b"ptmx",
+    )?);
+
+    let (indices, len) = registry::list_pty_slave_indices();
+    for index in indices.into_iter().take(len) {
+        let name = PtyIndexName::new(index);
+        entries.push(DirEntry::new(
+            devpts_object_id_for_index(index),
+            InodeKind::CharDevice,
+            name.as_bytes(),
+        )?);
+    }
+
+    Ok(entries)
+}
+
+fn devpts_object_id_for_index(index: u32) -> FsObjectId {
+    FsObjectId::new(DEVPTS_SLAVE_OBJECT_BASE + index as u64)
+}
+
+fn pty_index_from_devpts_object_id(fs_object_id: FsObjectId) -> Option<u32> {
+    let raw = fs_object_id.as_u64();
+    if raw < DEVPTS_SLAVE_OBJECT_BASE {
+        return None;
+    }
+    u32::try_from(raw - DEVPTS_SLAVE_OBJECT_BASE).ok()
+}
+
+fn parse_tty_s_index(name: &[u8]) -> Option<u32> {
+    let digits = name.strip_prefix(b"ttyS")?;
+    parse_u32_decimal(digits)
+}
+
+fn parse_u32_decimal(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut value = 0u32;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add((byte - b'0') as u32)?;
+    }
+    Some(value)
+}
+
+struct PtyIndexName {
+    buf: [u8; 10],
+    len: usize,
+}
+
+impl PtyIndexName {
+    fn new(value: u32) -> Self {
+        let mut out = Self {
+            buf: [0; 10],
+            len: 0,
+        };
+        out.push_u32(value);
+        out
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    fn push_u32(&mut self, value: u32) {
+        let mut digits = [0u8; 10];
+        let mut n = value;
+        let mut len = 0;
+        loop {
+            digits[len] = b'0' + (n % 10) as u8;
+            len += 1;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        for digit in digits[..len].iter().rev() {
+            if self.len < self.buf.len() {
+                self.buf[self.len] = *digit;
+                self.len += 1;
+            }
+        }
+    }
+}
+
+// === v3 trait impls =====================================================
+//
+// `impl FsOps for DevptsInstance` and `impl FsPageBacking for
+// DevptsInstance` carry the standalone devpts filesystem logic. Devpts
+// is a PTY-side projection: every method is purely synchronous (no
+// `Continue` / `Yield` returns), so each body is a direct
+// `StepOutcome::done(...)` / `StepOutcome::err(...)` ladder. There is
+// no page cache, so the page-backing impl returns `ENOSYS` for every
+// method whose v3 trait does not provide a default. Per the wave-8
+// design doc (`docs/progress/decisions/2026-05-09-fsops-v3-design.md`).
+//
+// Fully-qualified `step_engine::*` references at the impl sites avoid
+// clashing with `crate::execution::StepOutcome` still in scope for
+// other helpers, per the wave-4/6/7/9a trait-impl convention.
+
+use crate::page_backed::{Frame, FsPageBacking, PageContainer};
+use crate::tty::adapter::step_engine::{NoProgress, StepOutcome};
+use crate::vfs::FsOps;
+
+impl FsOps for DevptsInstance {
+    fn lookup(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<FsObjectId, NoProgress> {
+        if parent != DEVPTS_ROOT_OBJECT_ID {
+            return StepOutcome::err(Errno::ENOENT);
+        }
+
+        if name == b"ptmx" {
+            return StepOutcome::done(DEVPTS_PTMX_OBJECT_ID);
+        }
+
+        let Some(index) = parse_u32_decimal(name) else {
+            return StepOutcome::err(Errno::ENOENT);
+        };
+        if registry::contains_pty_slave(index) {
+            return StepOutcome::done(devpts_object_id_for_index(index));
+        }
+
+        StepOutcome::err(Errno::ENOENT)
+    }
+
+    fn load_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<InodeMeta, NoProgress> {
+        if fs_object_id == DEVPTS_ROOT_OBJECT_ID {
+            return StepOutcome::done(InodeMeta::new(InodeKind::Directory, 0o040755));
+        }
+        if fs_object_id == DEVPTS_PTMX_OBJECT_ID {
+            return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, 0o020666));
+        }
+        if let Some(index) = pty_index_from_devpts_object_id(fs_object_id) {
+            if registry::contains_pty_slave(index) {
+                return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, 0o020620));
+            }
+        }
+        StepOutcome::err(Errno::ENOENT)
+    }
+
+    fn serialize_inode_meta(
+        &self,
+        _fs_object_id: FsObjectId,
+        _meta: &InodeMeta,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn create_inode(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn unlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn rename(
+        &self,
+        _old_parent: FsObjectId,
+        _old_name: &[u8],
+        _new_parent: FsObjectId,
+        _new_name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn link(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn mkdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn rmdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn symlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _link_target: &[u8],
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        StepOutcome::err(Errno::EROFS)
+    }
+
+    fn readdir(
+        &self,
+        fs_object_id: FsObjectId,
+        cursor: DirCursor,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
+        if fs_object_id != DEVPTS_ROOT_OBJECT_ID {
+            return StepOutcome::err(Errno::ENOTDIR);
+        }
+
+        let entries = match devpts_dir_entries() {
+            Ok(entries) => entries,
+            Err(err) => return StepOutcome::err(err),
+        };
+        let index = cursor.as_u64() as usize;
+        let Some(entry) = entries.get(index).copied() else {
+            return StepOutcome::done(None);
+        };
+        StepOutcome::done(Some((entry, DirCursor::from_u64(cursor.as_u64() + 1))))
+    }
+
+    fn destroy_inode(
+        &self,
+        fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        if fs_object_id == DEVPTS_ROOT_OBJECT_ID
+            || fs_object_id == DEVPTS_PTMX_OBJECT_ID
+            || pty_index_from_devpts_object_id(fs_object_id)
+                .is_some_and(registry::contains_pty_slave)
+        {
+            return StepOutcome::done(());
+        }
+
+        StepOutcome::err(Errno::ENOENT)
+    }
+
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        mount: &Cap<MountPayload>,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<Cap<RNode>, NoProgress> {
+        if fs_object_id == DEVPTS_PTMX_OBJECT_ID {
+            // Opening /dev/ptmx creates a fresh pty pair.  The
+            // master side is materialised as an RNode backed by
+            // the master TtyIdentity; the slave is registered in
+            // the pty-slave table so subsequent lookups under
+            // /dev/pts/<N> can resolve it.
+            let outcome = match execution::step_openpty(guard) {
+                StepOutcome::Done(o) => o,
+                StepOutcome::Err(e) => return StepOutcome::err(e),
+                StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                    return StepOutcome::err(Errno::EIO);
+                }
+            };
+            match RNode::new_cap_in_mount(
+                fs_object_id,
+                meta,
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::Tty(outcome.master),
+                },
+                mount,
+            ) {
+                Ok(rnode) => StepOutcome::done(rnode),
+                Err(_) => StepOutcome::err(Errno::ENOMEM),
+            }
+        } else if let Some(index) = pty_index_from_devpts_object_id(fs_object_id) {
+            // The devpts pty-slave path still resolves via the
+            // process-wide registry; it constructs its own RNode
+            // without a mount stamp because devpts inodes are not
+            // page-backed and have no FsOps-side operations.
+            let _ = mount;
+            devpts_rnode_by_index(index, guard)
+        } else {
+            StepOutcome::err(Errno::ENOSYS)
+        }
+    }
+
+    // `read_link`, `step_chmod`, `step_chown`: devpts does not
+    // override these. The v3 trait defaults return `ENOSYS`.
+}
+
+impl FsPageBacking for DevptsInstance {
+    // Devpts has no page cache. Every page-backing method returns
+    // `ENOSYS`. The v3 trait defaults `fallocate` to `Done(())` and
+    // `supports_reflink` to `false`; both match the desired behaviour
+    // for a projection-only filesystem, so leave them unimplemented.
+
+    fn fetch_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<Frame, NoProgress> {
+        StepOutcome::err(step_engine::Errno::ENOSYS)
+    }
+
+    fn flush_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _frame: &Frame,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(step_engine::Errno::ENOSYS)
+    }
+
+    fn truncate(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_size: u64,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(step_engine::Errno::ENOSYS)
+    }
+
+    fn fsync_file(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(step_engine::Errno::ENOSYS)
+    }
+
+    fn supports_reflink(&self, _other: &PageContainer) -> bool {
+        false
+    }
+}
