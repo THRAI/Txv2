@@ -941,9 +941,7 @@ fn write_wait4_rusage_if_requested(
 }
 
 async fn yield_after_reap() {
-    for _ in 0..4 {
-        tx_reactor::yield_now().await;
-    }
+    tx_reactor::yield_now().await;
 }
 
 /// `getppid()` — return the parent's pid, or `0` (`Pid::RESERVED`)
