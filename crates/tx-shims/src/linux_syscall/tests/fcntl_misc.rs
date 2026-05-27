@@ -9,7 +9,6 @@ use crate::linux_syscall::{
 };
 
 const E_BADF: i32 = 9;
-const E_NOSYS: i32 = 38;
 const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
 const E_PERM: i32 = 1;
@@ -153,37 +152,53 @@ fn dispatch_fcntl_f_getfl_returns_open_flag_bits() {
     assert_eq!(r, SyscallResult::Return(O_RDWR as i64));
 }
 
-// Removed: `dispatch_fcntl_f_setfl_returns_neg_enosys`.
-// `F_SETFL` is now wired (the OpenFile-flags interior-mutability hook
-// landed in a later slice); the `-ENOSYS` expectation is stale. The
-// success path is exercised by `dispatch_fcntl_f_setfl_*` tests
-// elsewhere in this file when present, and at the
-// `OpenFile::set_runtime_nonblocking` unit-test level.
+/// `fcntl(fd, F_SETFL, O_NONBLOCK)` updates the shared OpenFile status
+/// bits that `F_GETFL` reports.
+#[test]
+fn dispatch_fcntl_f_setfl_updates_nonblocking_status_bit() {
+    let _setup = setup();
+    let _ops = install_capturing_console();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
+    let ctx = make_ctx(proc_cap, thread);
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_FCNTL, [3, F_SETFL as u64, O_NONBLOCK as u64, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(0));
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_FCNTL, [3, F_GETFL as u64, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return((O_RDWR | O_NONBLOCK) as i64));
+}
 
 // -----------------------------------------------------------------
 // kill / tkill / tgkill.
 // -----------------------------------------------------------------
 
-/// `kill(self_pid, SIGTERM)` returns 0 — the post is delivered to
-/// the calling process's leader thread. The process becomes a
-/// zombie via the (separately-tested) signal-driven exit path, but
-/// the test only asserts the return value (which is what userspace
-/// sees).
+/// `kill(self_pid, SIGTERM)` returns 0 and materialises the default
+/// terminate disposition immediately. This matches blocking-server
+/// shutdown paths that rely on SIGTERM killing a target even when it
+/// is asleep inside a syscall.
 #[test]
 fn dispatch_kill_self_with_sigterm_succeeds() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
     let pid = proc_cap.pid.0 as u64;
-    let ctx = make_ctx(proc_cap, thread);
+    let ctx = make_ctx(proc_cap.clone(), thread);
 
-    // SIGTERM = 15 (catchable; routes through post_signal, no
-    // zombification side-effect on the calling thread).
+    // SIGTERM = 15 (catchable; default disposition is terminate).
     let r = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(NR_KILL, [pid, 15, 0, 0, 0, 0]),
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Return(0));
+    assert!(proc_cap.is_zombie());
 }
 
 /// `kill(target, sig)` from a non-privileged caller whose uid does
@@ -369,6 +384,25 @@ fn dispatch_getrandom_null_buffer_returns_neg_efault() {
     assert_eq!(r, SyscallResult::Error(E_FAULT));
 }
 
+/// Unsupported getrandom flag bits are rejected with `-EINVAL`.
+#[test]
+fn dispatch_getrandom_invalid_flags_returns_neg_einval() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let mut buf = [0u8; 8];
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_GETRANDOM,
+            [buf.as_mut_ptr() as u64, 8, 0x8000_0000, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(E_INVAL));
+}
+
 // -----------------------------------------------------------------
 // uname.
 // -----------------------------------------------------------------
@@ -462,12 +496,58 @@ fn dispatch_uname_null_buffer_returns_neg_efault() {
     assert_eq!(r, SyscallResult::Error(E_FAULT));
 }
 
+/// `sethostname(name, len)` updates the nodename observed through `uname`.
+#[test]
+fn dispatch_sethostname_updates_uname_nodename() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let name = b"ltp-smoke";
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETHOSTNAME,
+            [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(0));
+
+    let mut buf = [0u8; 6 * 65];
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_UNAME, [buf.as_mut_ptr() as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(0));
+    assert_eq!(uts_field(&buf, 1), name);
+}
+
+/// Linux rejects hostnames longer than `__NEW_UTS_LEN` (64 bytes).
+#[test]
+fn dispatch_sethostname_too_long_returns_neg_einval() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let name = [b'x'; 65];
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETHOSTNAME,
+            [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(E_INVAL));
+}
+
 // -----------------------------------------------------------------
 // prlimit64.
 // -----------------------------------------------------------------
 
 /// `prlimit64(0, RLIMIT_NOFILE, NULL, &old)` returns 0 and writes
-/// the static `(1024, 4096)` pair to `old`.
+/// the process default `(1024, 4096)` pair to `old`.
 #[test]
 fn dispatch_prlimit64_rlimit_nofile_returns_default() {
     let _setup = setup();
@@ -475,7 +555,7 @@ fn dispatch_prlimit64_rlimit_nofile_returns_default() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap, thread);
 
-    // Two consecutive u64s: rlim_cur (1024) then rlim_max (4096).
+    // Two consecutive u64s: rlim_cur then rlim_max.
     let mut buf = [0u64; 2];
     let buf_uaddr = buf.as_mut_ptr() as u64;
     let r = block_on(dispatch::<ShimsTestPmap>(
@@ -561,7 +641,7 @@ fn dispatch_rt_sigreturn_without_frame_returns_neg_efault() {
         SyscallRequest::new(NR_RT_SIGRETURN, [0; 6]),
         &ctx,
     ));
-    assert_eq!(r, SyscallResult::Error(14)); // EFAULT
+    assert_eq!(r, SyscallResult::Error(E_FAULT));
 }
 
 /// The syscall-layer fallback still restores the parked pre-handler
@@ -577,6 +657,7 @@ fn dispatch_rt_sigreturn_restores_parked_signal_context() {
     let mut parked = tx_hal::UserTrapContext::empty();
     parked.pc = 0x1234_5678;
     parked.regs[10] = 0xdead_beef;
+    payload.store_saved_user_context(Some(tx_hal::UserTrapContext::empty()));
     payload.store_saved_signal_context(Some(parked));
 
     let ctx = make_ctx(proc_cap, thread.clone());

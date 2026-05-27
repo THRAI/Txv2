@@ -1732,6 +1732,7 @@ pub struct FutexWaitOp<'a> {
     pub val: u32,
     pub aspace: &'a AddressSpace,
     pub interest_mask: u64,
+    pub tid: Option<u32>,
     pub woken: bool,
     pub waiting: bool,
     pub waiting_source_id: Option<u64>,
@@ -1767,6 +1768,9 @@ impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
     fn apply_resume(&mut self, resume: adapter::step_engine::ResumeOutcome) -> Result<(), Errno> {
         match resume {
             adapter::step_engine::ResumeOutcome::Retry => {
+                if self.waiting {
+                    unregister_waiting_tid(self.tid);
+                }
                 self.waiting = false;
                 self.woken = true;
                 Ok(())
@@ -3025,6 +3029,7 @@ mod tests {
                 aspace: &aspace,
                 val: 0xdead_beef,
                 interest_mask: FUTEX_WAKE_MASK,
+                tid: None,
                 woken: false,
                 waiting: false,
                 waiting_source_id: None,

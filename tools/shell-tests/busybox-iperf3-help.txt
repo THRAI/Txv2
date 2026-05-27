@@ -1,0 +1,18 @@
+# busybox-iperf3-help.txt — N70a OSComp iperf3 startup smoke.
+#
+# Build image with:
+#   TX_OSCOMP_RISCV_MUSL_DIR=/home/msp/learning/rustOS/testcase/riscv/musl \
+#     cargo xtask image cpio --profile busybox --target rv64-qemu
+#
+# This only proves the external static musl iperf3 binary is present,
+# execs from BusyBox shell, prints its help text, and returns to the
+# prompt. Throughput/client-server runs are later N70/N71 work.
+
+wait "/ # " within 30000
+sleep 500
+
+send "/bin/iperf3 --help\n"
+expect "Usage: iperf3" within 10000
+expect "/ # " within 10000
+
+quit

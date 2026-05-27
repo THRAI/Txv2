@@ -57,6 +57,20 @@ impl ThreadIdentity {
         self.payload.lock().is_none()
     }
 
+    /// Thread state character for `/proc/<pid>/task/<tid>/stat`.
+    pub fn proc_state_char(&self) -> u8 {
+        let Some(payload) = self.payload.lock().as_ref().cloned() else {
+            return b'Z';
+        };
+        if payload.is_stopped() {
+            return b'T';
+        }
+        if crate::futex::thread_has_waiter(self.tid.0) {
+            return b'S';
+        }
+        b'R'
+    }
+
     /// Snapshot the owning process via `Weak::upgrade` under a fresh
     /// guard. Returns `None` if the process identity has been dropped.
     pub fn upgrade_owner_proc(
@@ -157,6 +171,10 @@ pub struct ThreadPayload {
     /// execution state.  `None` when no handler is currently
     /// executing.
     pub(crate) saved_signal_context: SpinMutex<Option<UserTrapContext>>,
+    /// Signal mask active before the most recent handler delivery.
+    /// Restored together with `saved_signal_context` by
+    /// `rt_sigreturn`.
+    pub(crate) saved_signal_mask: SpinMutex<Option<SignalMask>>,
     /// Result of the last completed syscall, drained by the
     /// userspace-entry checkpoint and written into the (then-fresh)
     /// trap frame via `set_syscall_return` / `set_syscall_error`
@@ -242,6 +260,7 @@ impl ThreadPayload {
             active_request: SpinMutex::new(None),
             saved_user_context: SpinMutex::new(None),
             saved_signal_context: SpinMutex::new(None),
+            saved_signal_mask: SpinMutex::new(None),
             pending_syscall_return: SpinMutex::new(None),
             mailbox: SpinMutex::new(None),
             stopped: core::sync::atomic::AtomicBool::new(false),
@@ -331,12 +350,27 @@ impl ThreadPayload {
         *self.saved_signal_context.lock() = ctx;
     }
 
+    /// Return whether a signal handler is currently using the saved
+    /// pre-handler context slot. Delivery code uses this to avoid
+    /// nesting another handler on top of the single parked context.
+    pub fn has_saved_signal_context(&self) -> bool {
+        self.saved_signal_context.lock().is_some()
+    }
+
     /// Take (consume) the saved signal context. Called by
     /// `rt_sigreturn` to retrieve the pre-handler context for
     /// restoration into `saved_user_context`. Returns `None` if no
     /// signal frame is in flight (stray `rt_sigreturn` call).
     pub fn take_saved_signal_context(&self) -> Option<UserTrapContext> {
         self.saved_signal_context.lock().take()
+    }
+
+    pub fn store_saved_signal_mask(&self, mask: Option<SignalMask>) {
+        *self.saved_signal_mask.lock() = mask;
+    }
+
+    pub fn take_saved_signal_mask(&self) -> Option<SignalMask> {
+        self.saved_signal_mask.lock().take()
     }
 
     /// Push a pending syscall return into the per-thread slot. The

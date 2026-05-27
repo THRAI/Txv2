@@ -51,7 +51,7 @@ pub fn step_ingest(
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     let mut outcome = IngestOutcome::default();

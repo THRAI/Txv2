@@ -458,14 +458,14 @@ impl PageContainer {
         match &self.kind {
             PageContainerKind::Anon { .. } => match self.materialize_anon(page, access) {
                 Ok(page) => StepOutcome::Done(page),
-                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
+                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error)),
             },
             PageContainerKind::File {
                 mount,
                 fs_object_id,
             } => self.materialize_file_page(page, access, mount, *fs_object_id, guard),
             PageContainerKind::Device { .. } => {
-                StepOutcome::Err(page_cache_error_to_errno(PageCacheError::UnsupportedKind).into())
+                StepOutcome::Err(page_cache_error_to_errno(PageCacheError::UnsupportedKind))
             }
         }
     }
@@ -477,13 +477,13 @@ impl PageContainer {
         guard: &Guard<'_>,
     ) -> StepOutcome<MaterializedPage, NoProgress> {
         if let Err(error) = self.check_bounds(page) {
-            return StepOutcome::Err(page_cache_error_to_errno(error).into());
+            return StepOutcome::Err(page_cache_error_to_errno(error));
         }
 
         match &self.kind {
             PageContainerKind::Anon { .. } => match self.materialize_anon(page, access) {
                 Ok(page) => StepOutcome::Done(page),
-                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
+                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error)),
             },
             PageContainerKind::File {
                 mount,
@@ -505,7 +505,7 @@ impl PageContainer {
         use adapter::step_engine::StepOutcome as V3;
         match self.materialize_page(page, access, guard) {
             V3::Done(page) => Ok(page),
-            V3::Err(errno) => Err(PageCacheError::Backend(errno.into())),
+            V3::Err(errno) => Err(PageCacheError::Backend(errno)),
             V3::Continue { .. } => Err(PageCacheError::Backend(Errno::EAGAIN)),
             V3::Yield { shape, .. } if notification::is_wait_source(&shape) => {
                 Err(PageCacheError::Backend(Errno::EAGAIN))
@@ -576,7 +576,7 @@ impl PageContainer {
         if let Some(materialized) = self.materialize_cached_page(page, access) {
             return match materialized {
                 Ok(page) => StepOutcome::Done(page),
-                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
+                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error)),
             };
         }
 
@@ -620,7 +620,7 @@ impl PageContainer {
     ) -> StepOutcome<MaterializedPage, NoProgress> {
         let frame = match cached_frame_from_frame(frame) {
             Ok(frame) => frame,
-            Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
+            Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error)),
         };
         let mut state = self.state.lock();
         let installed = match state.pages.lookup(page) {
@@ -628,17 +628,17 @@ impl PageContainer {
             None => match state.pages.install_if_absent(page, frame) {
                 Ok(()) => true,
                 Err(PageCacheError::AlreadyPresent { .. }) => false,
-                Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
+                Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error)),
             },
         };
         if access == MaterializeAccess::Write {
             if let Err(error) = state.pages.mark_dirty(page) {
-                return StepOutcome::Err(page_cache_error_to_errno(error).into());
+                return StepOutcome::Err(page_cache_error_to_errno(error));
             }
         }
         match materialized_from_state(&state, page, newly_installed || installed) {
             Ok(page) => StepOutcome::Done(page),
-            Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
+            Err(error) => StepOutcome::Err(page_cache_error_to_errno(error)),
         }
     }
 
@@ -670,13 +670,13 @@ impl PageContainer {
                 match state.pages.install_if_absent(page, frame) {
                     Ok(()) => true,
                     Err(PageCacheError::AlreadyPresent { .. }) => false,
-                    Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
+                    Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error)),
                 }
             }
         };
         match materialized_from_state(&state, page, newly_installed) {
             Ok(page) => StepOutcome::Done(page),
-            Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
+            Err(error) => StepOutcome::Err(page_cache_error_to_errno(error)),
         }
     }
 
@@ -744,7 +744,7 @@ pub fn step_read(
         return StepOutcome::done(0);
     }
     let Some(capacity) = pc.byte_capacity() else {
-        return StepOutcome::err(Errno::EINVAL.into());
+        return StepOutcome::err(Errno::EINVAL);
     };
     let start = of.offset();
     let valid_end = core::cmp::min(pc.size_bytes(), capacity);
@@ -770,16 +770,16 @@ pub fn step_write(
         return StepOutcome::done(0);
     }
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
-        return StepOutcome::err(Errno::EINVAL.into());
+        return StepOutcome::err(Errno::EINVAL);
     }
     let Some(capacity) = pc.byte_capacity() else {
-        return StepOutcome::err(Errno::EINVAL.into());
+        return StepOutcome::err(Errno::EINVAL);
     };
     let Some(end) = of.offset().checked_add(len as u64) else {
-        return StepOutcome::err(Errno::EINVAL.into());
+        return StepOutcome::err(Errno::EINVAL);
     };
     if end > capacity {
-        return StepOutcome::err(Errno::EINVAL.into());
+        return StepOutcome::err(Errno::EINVAL);
     }
     let start = of.offset();
     let outcome = step_range(pc, of, len, PageBackedIoKind::Write, guard);

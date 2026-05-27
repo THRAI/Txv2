@@ -772,7 +772,7 @@ impl VmFaultOutcome {
                 }
             }
             step_engine::StepOutcome::Err(errno) => VmFaultMaterializationStep::Err(
-                VmFaultError::PageCache(PageCacheError::Backend(errno.into())),
+                VmFaultError::PageCache(PageCacheError::Backend(errno)),
             ),
             _ => VmFaultMaterializationStep::Err(VmFaultError::PageCache(PageCacheError::Backend(
                 crate::execution::Errno::EAGAIN,
@@ -954,7 +954,7 @@ impl VmFaultOutcome {
                     }
                     step_engine::StepOutcome::Err(errno) => {
                         return VmFaultMaterializationStep::Err(VmFaultError::PageCache(
-                            PageCacheError::Backend(errno.into()),
+                            PageCacheError::Backend(errno),
                         ));
                     }
                     _ => {
@@ -1017,7 +1017,7 @@ impl VmFaultOutcome {
                     }
                     step_engine::StepOutcome::Err(errno) => {
                         return VmFaultMaterializationStep::Err(VmFaultError::PageCache(
-                            PageCacheError::Backend(errno.into()),
+                            PageCacheError::Backend(errno),
                         ));
                     }
                     _ => {

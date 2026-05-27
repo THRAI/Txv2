@@ -187,10 +187,35 @@ fn epoll_add_would_exceed_depth(
     target_depth.saturating_add(1) >= EPOLL_MAX_NEST_DEPTH
 }
 
-fn ready_events_for_entry<P: TimeIf>(
-    entry: &epoll::EpollEntry,
-    target: &OpenFile,
-) -> Option<UserEpollEvent> {
+fn supports_epoll(file: &OpenFile) -> bool {
+    file.epoll().is_some()
+        || pipe_endpoint(file).is_some()
+        || file.eventfd().is_some()
+        || file.timerfd().is_some()
+        || file.signalfd().is_some()
+        || file.ufd().is_some()
+        || file.posix_mq().is_some()
+}
+
+fn pipe_endpoint(
+    file: &OpenFile,
+) -> Option<(
+    tx_subsystems::adapter::step_engine::Cap<tx_subsystems::pipe::PipePayload>,
+    PipeSide,
+)> {
+    let OpenFileBacking::Rnode { rnode } = file.backing() else {
+        return None;
+    };
+    let RNodeBacking::StructBacked {
+        payload: StructPayload::Pipe { payload, side },
+    } = rnode.backing()
+    else {
+        return None;
+    };
+    Some((payload.clone(), *side))
+}
+
+fn ready_mask_for_entry<P: TimeIf>(entry: &epoll::EpollEntry, target: &OpenFile) -> u32 {
     let mut ready = 0u32;
 
     if let Some(efd) = target.eventfd() {
@@ -200,6 +225,32 @@ fn ready_events_for_entry<P: TimeIf>(
         if (entry.interests & EPOLLOUT) != 0 && efd.counter() < tx_subsystems::eventfd::EVENTFD_MAX
         {
             ready |= EPOLLOUT;
+        }
+    } else if let Some((payload, side)) = pipe_endpoint(target) {
+        match side {
+            PipeSide::Reader => {
+                if (entry.interests & EPOLLIN) != 0 && payload.reader_readable_level() {
+                    ready |= EPOLLIN;
+                }
+                if (entry.interests & EPOLLHUP) != 0 && payload.reader_hup_level() {
+                    ready |= EPOLLHUP;
+                }
+            }
+            PipeSide::Writer => {
+                if (entry.interests & EPOLLOUT) != 0 {
+                    let writable = if (entry.interests & EPOLLET) != 0 {
+                        payload.writer_atomic_writable_level()
+                    } else {
+                        payload.writer_writable_level()
+                    };
+                    if writable {
+                        ready |= EPOLLOUT;
+                    }
+                }
+                if (entry.interests & EPOLLERR) != 0 && payload.writer_err_level() {
+                    ready |= EPOLLERR;
+                }
+            }
         }
     } else if let Some(tfd) = target.timerfd() {
         if (entry.interests & EPOLLIN) != 0 && tfd.deadline_ns() != 0 {
@@ -225,8 +276,26 @@ fn ready_events_for_entry<P: TimeIf>(
                 ready |= EPOLLOUT;
             }
         }
+    } else if let Some(ep) = target.epoll() {
+        if (entry.interests & EPOLLIN) != 0 && !ep.entries_snapshot().is_empty() {
+            ready |= EPOLLIN;
+        }
     }
 
+    ready
+}
+
+fn ready_events_for_socket(
+    entry: &epoll::EpollEntry,
+    ctx: &SyscallCtx<'_>,
+) -> Option<UserEpollEvent> {
+    let mut ready = 0u32;
+    if (entry.interests & EPOLLIN) != 0 && super::net::socket_readable(entry.fd, ctx) {
+        ready |= EPOLLIN;
+    }
+    if (entry.interests & EPOLLOUT) != 0 && super::net::is_socket_fd(entry.fd, ctx) {
+        ready |= EPOLLOUT;
+    }
     (ready != 0).then_some(UserEpollEvent {
         events: ready,
         data: entry.data,
@@ -447,10 +516,15 @@ pub(super) fn sys_epoll_ctl(
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
-    let target_of = match super::resolve_fd(&ctx.process, fd) {
-        Some(of) => of,
-        None => return SyscallResult::Error(EBADF_VALUE),
-    };
+    let target_of = super::resolve_fd(&ctx.process, fd);
+    if op != EPOLL_CTL_DEL {
+        match target_of.as_ref() {
+            Some(target) if supports_epoll(target) => {}
+            Some(_) => return SyscallResult::Error(EPERM_VALUE),
+            None if super::net::is_socket_fd(fd, ctx) => {}
+            None => return SyscallResult::Error(EBADF_VALUE),
+        }
+    }
 
     let source = if op == EPOLL_CTL_DEL {
         WaitSourceId::new(0)
@@ -472,15 +546,19 @@ pub(super) fn sys_epoll_ctl(
     let _guard = guard();
     let ep_ref = &*ep_cap;
     let outcome = match op {
-        EPOLL_CTL_ADD => epoll::step_epoll_ctl_add(ep_ref, fd, event.events, event.data, source),
-        EPOLL_CTL_MOD => epoll::step_epoll_ctl_mod(ep_ref, fd, event.events, event.data, source),
+        EPOLL_CTL_ADD => {
+            epoll::step_epoll_ctl_add(ep_ref, fd, event.events, event.data, source, target_epoll)
+        }
+        EPOLL_CTL_MOD => {
+            epoll::step_epoll_ctl_mod(ep_ref, fd, event.events, event.data, source, target_epoll)
+        }
         EPOLL_CTL_DEL => epoll::step_epoll_ctl_del(ep_ref, fd),
         _ => unreachable!(),
     };
 
     match outcome {
         StepOutcome::Done(()) => SyscallResult::Return(0),
-        StepOutcome::Err(e) => SyscallResult::error_from(e.into()),
+        StepOutcome::Err(e) => SyscallResult::error_from(e),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }

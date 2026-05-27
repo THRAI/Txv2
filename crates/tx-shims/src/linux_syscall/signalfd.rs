@@ -143,7 +143,7 @@ pub(super) fn sys_signalfd4<'a>(
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(Ok(cap)) => cap,
                 Ok(Err(_)) => return SyscallResult::Error(ENOMEM_VALUE),
-                Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+                Err(v3errno) => return SyscallResult::error_from(v3errno),
             }
         };
 
@@ -181,6 +181,13 @@ pub(super) fn sys_signalfd4<'a>(
     };
     sfd_cap.set_mask(mask);
     SyscallResult::Return(fd as i64)
+}
+
+/// Historical `signalfd(fd, mask, sizemask)` wrapper. Linux generic
+/// userspace normally reaches `signalfd4`, but some LTP binaries still
+/// probe the old three-argument shape.
+pub(super) fn sys_signalfd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    sys_signalfd4(args[0] as i32, args[1], args[2], 0, ctx)
 }
 
 /// signalfd-shaped `read(2)` arm. Drains one
@@ -233,7 +240,7 @@ pub(super) async fn sys_signalfd_read(
                 return SyscallResult::Return(read as i64);
             }
             V3Out::Err(v3errno) => {
-                let errno: Errno = v3errno.into();
+                let errno: Errno = v3errno;
                 if errno == Errno::EAGAIN {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }

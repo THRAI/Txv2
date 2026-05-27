@@ -1566,7 +1566,7 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -1691,11 +1691,16 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             // exemption), which traps the kernel on an unmapped page.
             // A pre-check with the safe `read_user` accessor converts
             // the trap into a graceful -EFAULT.
-            {
-                let guard = step_engine::guard();
+            let observed = {
+                let guard =
+                    tx_substrate::epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
                 let user_ptr = UserPtr::<u32>::new(uaddr as usize);
-                if let StepOutcome::Err(_) = ctx.aspace.read_user(user_ptr, &guard) {
-                    return SyscallResult::error_from(Errno::EFAULT);
+                match ctx.aspace.read_user(user_ptr, &guard) {
+                    StepOutcome::Done(value) => value,
+                    StepOutcome::Err(_) => return SyscallResult::error_from(Errno::EFAULT),
+                    StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+                        return SyscallResult::error_from(Errno::EFAULT);
+                    }
                 }
             }
             let mut timeout_deadline_ns = None;
@@ -1703,19 +1708,8 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 let Some(timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
                     return SyscallResult::Error(EINVAL_VALUE);
                 };
-                if timeout_ns == 0 {
-                    let guard = step_engine::guard();
-                    let user_ptr = UserPtr::<u32>::new(uaddr as usize);
-                    match ctx.aspace.read_user(user_ptr, &guard) {
-                        StepOutcome::Done(observed) if observed == val => {
-                            return SyscallResult::Error(110);
-                        }
-                        StepOutcome::Done(_) => return SyscallResult::Error(EAGAIN_VALUE),
-                        StepOutcome::Err(_) => return SyscallResult::error_from(Errno::EFAULT),
-                        StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                            return SyscallResult::error_from(Errno::EFAULT);
-                        }
-                    }
+                if observed != val {
+                    return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 timeout_deadline_ns = Some(<P as TimeIf>::read_ns().saturating_add(timeout_ns));
             }
@@ -1745,6 +1739,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 val,
                 aspace: &ctx.aspace,
                 interest_mask: wait_mask,
+                tid: Some(ctx.thread.tid.0),
                 woken: false,
                 waiting: false,
                 waiting_source_id: None,
@@ -1787,7 +1782,8 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 return SyscallResult::Error(EINVAL_VALUE);
             }
             if op == FUTEX_CMP_REQUEUE {
-                let guard = step_engine::guard();
+                let guard =
+                    tx_substrate::epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
                 let user_ptr = UserPtr::<u32>::new(uaddr as usize);
                 match ctx.aspace.read_user(user_ptr, &guard) {
                     StepOutcome::Done(observed) if observed == bitset => {}
@@ -1811,7 +1807,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             drop(guard);
             match outcome {
                 StepOutcome::Done(count) => SyscallResult::Return(count as i64),
-                StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+                StepOutcome::Err(errno) => SyscallResult::error_from(errno),
                 StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
                     let _ = &mut script_ctx;
                     SyscallResult::error_from(Errno::EIO)
@@ -2171,7 +2167,7 @@ fn futex_wake_count_masked(
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(woken) => Ok(woken),
-            Err(v3errno) => Err(SyscallResult::error_from(Errno::from(v3errno))),
+            Err(v3errno) => Err(SyscallResult::error_from(v3errno)),
         }
     } else {
         let guard = step_engine::guard();
@@ -2185,7 +2181,7 @@ fn futex_wake_count_masked(
         drop(guard);
         match outcome {
             StepOutcome::Done(woken) => Ok(woken),
-            StepOutcome::Err(errno) => Err(SyscallResult::error_from(Errno::from(errno))),
+            StepOutcome::Err(errno) => Err(SyscallResult::error_from(errno)),
             StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
                 Err(SyscallResult::error_from(Errno::EIO))
             }
@@ -2360,7 +2356,7 @@ fn futex_pi_unlock(ctx: &SyscallCtx<'_>, uaddr: u64) -> SyscallResult {
     drop(guard);
     match outcome {
         StepOutcome::Done(_) => SyscallResult::Return(0),
-        StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        StepOutcome::Err(errno) => SyscallResult::error_from(errno),
         StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
             SyscallResult::error_from(Errno::EIO)
         }

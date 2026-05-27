@@ -300,6 +300,21 @@ pub async fn run_thread<P: TxPlatform>(
         // (lowest first), disposition is consulted, and outcomes that
         // need materialisation (DefaultTerminate, DeliverHandler) are
         // handled inline.
+        if let Some(process) = thread.upgrade_owner_proc() {
+            let posix_deadline = tx_shims::linux_syscall::poll_due_posix_timers::<P>(&process);
+            let itimer_deadline = tx_shims::linux_syscall::poll_due_itimers::<P>(&process);
+            match (posix_deadline, itimer_deadline) {
+                (Some(left), Some(right)) => P::set_deadline_ns(left.min(right)),
+                (Some(deadline_ns), None) | (None, Some(deadline_ns)) => {
+                    P::set_deadline_ns(deadline_ns);
+                }
+                (None, None) => {}
+            }
+            if thread.payload_cap().is_none() || process.aspace_cap().is_none() {
+                return;
+            }
+        }
+
         let ast_outcome = ast_dispatch(&thread);
         match ast_outcome {
             AstOutcome::DeliverHandler { sig, action } => {
@@ -367,6 +382,7 @@ pub async fn run_thread<P: TxPlatform>(
                     // Read current mask to pass to the handler, and
                     // compute the handler-entry mask per sigaction(2).
                     let old_mask = payload.signal_mask();
+                    payload.store_saved_signal_mask(Some(old_mask));
                     let mut new_mask = old_mask.union(action.sa_mask);
                     if !action
                         .flags
@@ -491,6 +507,7 @@ pub async fn run_thread<P: TxPlatform>(
                     }
                 }
             }
+            AstOutcome::DefaultTerminate { .. } => return,
             AstOutcome::InitiateTermination => return,
             _ => {}
         }
@@ -541,12 +558,15 @@ pub async fn run_thread<P: TxPlatform>(
         // stale Cap.
         if let Some(process) = thread.upgrade_owner_proc() {
             if let Some(aspace) = process.aspace_cap() {
-                let root = aspace.pmap().root_handle();
                 let mut ctx = tx_hal::UserTrapContext::empty();
                 prepare_userspace_entry_payload_into(&payload, &mut ctx);
                 payload.set_active_userspace_request(Some(entry_token));
                 let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
                 let _prev_userspace = set_current_userspace_payload(entry_hart, payload.clone());
+                ctx = tx_shims::linux_syscall::maybe_deliver_itimer_signal::<P>(
+                    ctx, &process, &thread, &aspace,
+                );
+                let root = aspace.pmap().root_handle();
                 <P as TrapIf>::enter_userspace_with_context(&ctx, root);
             } else {
                 return;
@@ -666,6 +686,13 @@ pub async fn run_thread<P: TxPlatform>(
                         // carries (zero from the script's fresh
                         // `UserTrapContext`, per
                         // `make_initial_user_trap_context`).
+                    }
+                    tx_shims::linux_syscall::SyscallResult::SigreturnContextRestored => {
+                        // The syscall arm already restored a
+                        // syscall-layer compatibility frame (currently
+                        // the itimer/SIGALRM frame). Do not decode a
+                        // second platform frame from the same stack
+                        // pointer.
                     }
                     tx_shims::linux_syscall::SyscallResult::SigreturnRestored => {
                         // `rt_sigreturn` is special: musl cancellation

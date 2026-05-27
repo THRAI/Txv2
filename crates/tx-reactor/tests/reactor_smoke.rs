@@ -12,7 +12,7 @@ use tx_reactor::{
     RunStats, SharedReactor, SliceClock, SliceConfig, StopReason, TaskHandle, TaskId, TaskStatus,
     WakeDispatchReport, WakeHint,
 };
-use tx_substrate::step::{InterestMask, WaitSourceId};
+use tx_substrate::step::{Deadline, InterestMask, WaitSourceId};
 use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox, WaitGeneration};
 
 static PENDING_POLLS: AtomicUsize = AtomicUsize::new(0);
@@ -69,6 +69,35 @@ impl Future for PendingThenReady {
     }
 }
 
+struct SelfWakeNTimes {
+    remaining_wakes: Arc<AtomicUsize>,
+    polls: Arc<AtomicUsize>,
+}
+
+impl Future for SelfWakeNTimes {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        let mut remaining = self.remaining_wakes.load(Ordering::SeqCst);
+        while remaining > 0 {
+            match self.remaining_wakes.compare_exchange(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    cx.waker().wake_by_ref();
+                    break;
+                }
+                Err(observed) => remaining = observed,
+            }
+        }
+        Poll::Pending
+    }
+}
+
 struct ExternallyWoken {
     polls: Arc<AtomicUsize>,
     ready: Arc<AtomicUsize>,
@@ -122,6 +151,29 @@ impl Future for HartContextProbe {
         }
         self.seen.fetch_or(observed, Ordering::SeqCst);
         Poll::Ready(())
+    }
+}
+
+struct TimerWheelDeadlineProbe {
+    hart: usize,
+    deadline_ns: u64,
+    guard: Option<TimerGuard>,
+}
+
+impl Future for TimerWheelDeadlineProbe {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.guard.is_none() {
+            let wheel = tx_reactor::current_timer_wheel(this.hart)
+                .expect("reactor should expose timer wheel while polling");
+            this.guard = Some(wheel.install(
+                Deadline::from_raw(this.deadline_ns),
+                TimerGuardRole::PrimarySleep,
+            ));
+        }
+        Poll::Pending
     }
 }
 
@@ -993,9 +1045,9 @@ fn slice_clock_accounts_consumed_time_and_requeues_expired_slice() {
     assert_eq!(
         deadlines.lock().expect("deadline log poisoned").as_slice(),
         &[
-            Some(1_000 + Phase1Scheduler::NEW_QUEUE_SLICE_NS),
+            Some(1_000 + Phase1Scheduler::NEW_QUEUE_SLICE_NS * 2),
             None,
-            Some(20_000_000 + Phase1Scheduler::PREEMPTED_QUEUE_SLICE_NS),
+            Some(20_000_250 + Phase1Scheduler::PREEMPTED_QUEUE_SLICE_NS),
             None,
         ],
         "each preemptive poll arms a slice deadline and cancels it after accounting",
@@ -1433,6 +1485,89 @@ fn next_deadline_ns_reports_earliest_and_clears_after_resolution() {
     assert_eq!(first.fire(mask), 1);
     assert_eq!(reactor.run_until_idle().completed, 1);
     assert_eq!(reactor.task_status(first_task), Some(TaskStatus::Completed));
+    assert_eq!(reactor.next_deadline_ns(), None);
+}
+
+#[test]
+fn concurrent_hart_loop_advances_due_timers_between_ready_polls() {
+    let shared = SharedReactor::empty();
+    assert!(shared.init());
+
+    let timer_done = Arc::new(AtomicUsize::new(0));
+    let busy_polls = Arc::new(AtomicUsize::new(0));
+    let busy_wakes = Arc::new(AtomicUsize::new(4));
+    let timer_queue = shared
+        .with(|reactor| reactor.timer_queue())
+        .expect("shared reactor initialized");
+
+    shared
+        .with(|reactor| {
+            let timer_done = Arc::clone(&timer_done);
+            reactor.submit(async move {
+                timer_queue.wait_until(20).await;
+                timer_done.store(1, Ordering::SeqCst);
+            });
+            reactor.submit(SelfWakeNTimes {
+                remaining_wakes: Arc::clone(&busy_wakes),
+                polls: Arc::clone(&busy_polls),
+            });
+        })
+        .expect("shared reactor initialized");
+
+    let deadlines = Arc::new(Mutex::new(Vec::new()));
+    let mut clock = ScriptedSliceClock::new(
+        vec![0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50],
+        Arc::clone(&deadlines),
+    );
+    let mut signal = RecordingRescheduleSignal::default();
+    let step = shared
+        .run_hart_loop_concurrent_with_slice_clock(HartId(0), 0, &mut signal, &mut clock)
+        .expect("shared reactor initialized");
+
+    assert!(
+        step.timer_wakes >= 1,
+        "ready-loop timer advancement should fire the registered sleep"
+    );
+    assert_eq!(timer_done.load(Ordering::SeqCst), 1);
+    assert!(busy_polls.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn next_deadline_ns_includes_timer_wheel_registrations() {
+    let reactor = Reactor::new();
+    let channel = reactor.channel();
+    let mask = Mask::from_bits(0x1);
+    let queue_outcome = Arc::new(Mutex::new(None));
+
+    {
+        let queue_outcome = Arc::clone(&queue_outcome);
+        reactor.submit(async move {
+            let outcome = channel
+                .wait_event(mask, WaitProtocol::InterruptibleTimeout(50), || false)
+                .await;
+            *queue_outcome.lock().expect("queue outcome poisoned") = Some(outcome);
+        });
+    }
+    reactor.submit_task_with_meta(
+        TimerWheelDeadlineProbe {
+            hart: 0,
+            deadline_ns: 20,
+            guard: None,
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(0)).polled, 2);
+    assert_eq!(reactor.next_deadline_ns(), Some(20));
+
+    assert_eq!(reactor.advance_time_to(19), 0);
+    assert_eq!(reactor.next_deadline_ns(), Some(20));
+
+    assert_eq!(reactor.advance_time_to(20), 1);
+    assert_eq!(reactor.next_deadline_ns(), Some(50));
+
+    assert_eq!(reactor.advance_time_to(50), 1);
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(0)).completed, 1);
     assert_eq!(reactor.next_deadline_ns(), None);
 }
 

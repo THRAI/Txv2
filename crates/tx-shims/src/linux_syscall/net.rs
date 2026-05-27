@@ -22,6 +22,8 @@ const MAX_SOCKET_PAYLOAD: usize = 4096;
 struct FakeSocket {
     owner_pid: u32,
     kind: i32,
+    nonblocking: bool,
+    peer_fd: Option<u32>,
     bound_addr: Option<Vec<u8>>,
     inbox: Vec<u8>,
     listening: bool,
@@ -47,6 +49,10 @@ fn non_socket_accept_errno(ctx: &SyscallCtx<'_>, fd: u32) -> i32 {
 
 fn socket_kind(raw_type: i32) -> i32 {
     raw_type & SOCK_TYPE_MASK
+}
+
+fn socket_nonblocking(raw_type: i32) -> bool {
+    raw_type & O_NONBLOCK as i32 != 0
 }
 
 fn read_sockaddr(ctx: &SyscallCtx<'_>, addr: u64, len: u64) -> Result<Vec<u8>, i32> {
@@ -95,7 +101,8 @@ pub(super) fn close_socket_fd(fd: u32, ctx: &SyscallCtx<'_>) -> bool {
 }
 
 pub(super) fn sys_socket(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let kind = socket_kind(args[1] as i32);
+    let raw_type = args[1] as i32;
+    let kind = socket_kind(raw_type);
     if kind != SOCK_DGRAM && kind != SOCK_STREAM {
         return SyscallResult::Error(EINVAL_VALUE);
     }
@@ -106,6 +113,8 @@ pub(super) fn sys_socket(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
         FakeSocket {
             owner_pid,
             kind,
+            nonblocking: socket_nonblocking(raw_type),
+            peer_fd: None,
             bound_addr: None,
             inbox: Vec::new(),
             listening: false,
@@ -152,6 +161,28 @@ pub(super) fn sys_getsockname(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
     }
 }
 
+pub(super) fn sys_getpeername(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let fd = args[0] as u32;
+    let owner_pid = ctx.process.pid.0;
+    let addr = {
+        let sockets = SOCKETS.lock();
+        let Some(sock) = sockets.get(&fd) else {
+            return SyscallResult::Error(EBADF_VALUE);
+        };
+        if sock.owner_pid != owner_pid {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
+        if sock.kind == SOCK_STREAM && !sock.connected {
+            return SyscallResult::Error(ENOTCONN_VALUE);
+        }
+        sock.bound_addr.clone().unwrap_or_else(default_sockaddr)
+    };
+    match write_sockaddr(ctx, args[1], args[2], &addr) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno),
+    }
+}
+
 pub(super) fn sys_setsockopt(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let owner_pid = ctx.process.pid.0;
     if SOCKETS
@@ -163,6 +194,97 @@ pub(super) fn sys_setsockopt(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
     } else {
         SyscallResult::Error(EBADF_VALUE)
     }
+}
+
+pub(super) fn sys_getsockopt(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let owner_pid = ctx.process.pid.0;
+    let valid_fd = SOCKETS
+        .lock()
+        .get(&(args[0] as u32))
+        .is_some_and(|sock| sock.owner_pid == owner_pid);
+    if !valid_fd {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if args[3] == 0 || args[4] == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let user_len = match bootstrap_read_user::<u32>(&ctx.aspace, args[4]) {
+        Ok(len) => len as usize,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    let value = 0i32.to_ne_bytes();
+    let copy_len = core::cmp::min(user_len, value.len());
+    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, args[3], &value[..copy_len]) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+    if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, args[4], value.len() as u32) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+    SyscallResult::Return(0)
+}
+
+pub(super) fn sys_shutdown(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let fd = args[0] as u32;
+    let owner_pid = ctx.process.pid.0;
+    let mut sockets = SOCKETS.lock();
+    let Some(sock) = sockets.get_mut(&fd) else {
+        return SyscallResult::Error(EBADF_VALUE);
+    };
+    if sock.owner_pid != owner_pid {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    sock.connected = false;
+    SyscallResult::Return(0)
+}
+
+pub(super) fn sys_socketpair(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let raw_type = args[1] as i32;
+    let kind = socket_kind(raw_type);
+    if kind != SOCK_DGRAM && kind != SOCK_STREAM {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if args[3] == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let owner_pid = ctx.process.pid.0;
+    let fd0 = allocate_socket_fd();
+    let fd1 = allocate_socket_fd();
+    {
+        let mut sockets = SOCKETS.lock();
+        sockets.insert(
+            fd0,
+            FakeSocket {
+                owner_pid,
+                kind,
+                nonblocking: socket_nonblocking(raw_type),
+                peer_fd: Some(fd1),
+                bound_addr: Some(default_sockaddr()),
+                inbox: Vec::new(),
+                listening: false,
+                connected: true,
+            },
+        );
+        sockets.insert(
+            fd1,
+            FakeSocket {
+                owner_pid,
+                kind,
+                nonblocking: socket_nonblocking(raw_type),
+                peer_fd: Some(fd0),
+                bound_addr: Some(default_sockaddr()),
+                inbox: Vec::new(),
+                listening: false,
+                connected: true,
+            },
+        );
+    }
+    let mut pair = [0u8; 8];
+    pair[..4].copy_from_slice(&fd0.to_ne_bytes());
+    pair[4..].copy_from_slice(&fd1.to_ne_bytes());
+    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, args[3], &pair) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+    SyscallResult::Return(0)
 }
 
 pub(super) fn sys_listen(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
@@ -242,6 +364,8 @@ pub(super) fn sys_accept4(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
         FakeSocket {
             owner_pid,
             kind: SOCK_STREAM,
+            nonblocking: false,
+            peer_fd: None,
             bound_addr: Some(peer_addr),
             inbox: Vec::new(),
             listening: false,

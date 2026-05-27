@@ -16,6 +16,7 @@ const E_BADF: i32 = 9;
 const E_FAULT: i32 = 14;
 const E_INVAL: i32 = 22;
 const E_EXIST: i32 = 17;
+const E_LOOP: i32 = 40;
 const E_NOENT: i32 = 2;
 const E_PERM: i32 = 1;
 const EPOLL_CTL_ADD: u32 = 1;
@@ -716,5 +717,146 @@ fn dispatch_epoll_ctl_add_mod_del_enforce_registration_state() {
             &ctx,
         )),
         SyscallResult::Error(E_NOENT)
+    );
+}
+
+#[test]
+fn dispatch_epoll_ctl_accepts_non_read_write_masks_on_epollable_fd() {
+    let (_setup, proc_cap, thread) = epoll_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let epfd = create_epoll(&ctx);
+    let pipefd = create_pipe(&ctx);
+    let mut event = TestEpollEvent {
+        events: EPOLLIN,
+        _padding: 0,
+        data: 1,
+    };
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_EPOLL_CTL,
+                [
+                    epfd as u64,
+                    EPOLL_CTL_ADD as u64,
+                    pipefd[0] as u64,
+                    &mut event as *mut TestEpollEvent as u64,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+
+    event.events = EPOLLERR;
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_EPOLL_CTL,
+                [
+                    epfd as u64,
+                    EPOLL_CTL_MOD as u64,
+                    pipefd[0] as u64,
+                    &mut event as *mut TestEpollEvent as u64,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+}
+
+#[test]
+fn dispatch_epoll_ctl_accepts_distinct_epoll_fd_as_target() {
+    let (_setup, proc_cap, thread) = epoll_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let outer = create_epoll(&ctx);
+    let inner = create_epoll(&ctx);
+    let mut event = TestEpollEvent {
+        events: EPOLLIN,
+        _padding: 0,
+        data: 2,
+    };
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_EPOLL_CTL,
+                [
+                    outer as u64,
+                    EPOLL_CTL_ADD as u64,
+                    inner as u64,
+                    &mut event as *mut TestEpollEvent as u64,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+}
+
+#[test]
+fn dispatch_epoll_ctl_rejects_epoll_cycles() {
+    let (_setup, proc_cap, thread) = epoll_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let ep_a = create_epoll(&ctx);
+    let ep_b = create_epoll(&ctx);
+    let mut event = TestEpollEvent {
+        events: EPOLLIN,
+        _padding: 0,
+        data: 1,
+    };
+
+    assert_eq!(
+        epoll_ctl(&ctx, ep_a, EPOLL_CTL_ADD, ep_b, &mut event),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        epoll_ctl(&ctx, ep_b, EPOLL_CTL_ADD, ep_a, &mut event),
+        SyscallResult::Error(E_LOOP)
+    );
+}
+
+#[test]
+fn dispatch_epoll_ctl_rejects_too_deep_epoll_nesting() {
+    let (_setup, proc_cap, thread) = epoll_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let ep0 = create_epoll(&ctx);
+    let ep1 = create_epoll(&ctx);
+    let ep2 = create_epoll(&ctx);
+    let ep3 = create_epoll(&ctx);
+    let ep4 = create_epoll(&ctx);
+    let ep5 = create_epoll(&ctx);
+    let mut event = TestEpollEvent {
+        events: EPOLLIN,
+        _padding: 0,
+        data: 1,
+    };
+
+    assert_eq!(
+        epoll_ctl(&ctx, ep4, EPOLL_CTL_ADD, ep5, &mut event),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        epoll_ctl(&ctx, ep3, EPOLL_CTL_ADD, ep4, &mut event),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        epoll_ctl(&ctx, ep2, EPOLL_CTL_ADD, ep3, &mut event),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        epoll_ctl(&ctx, ep1, EPOLL_CTL_ADD, ep2, &mut event),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        epoll_ctl(&ctx, ep0, EPOLL_CTL_ADD, ep1, &mut event),
+        SyscallResult::Error(E_INVAL)
     );
 }

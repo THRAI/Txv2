@@ -19,6 +19,7 @@ vfs-read-test-support = []
 test-support = []
 
 [dependencies]
+smoltcp = { path = "../../external/smoltcp-asterinas", default-features = false, features = ["alloc", "log", "medium-ethernet", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
 tx-hal = { path = "../tx-hal" }
 tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-reactor = { path = "../tx-reactor" }

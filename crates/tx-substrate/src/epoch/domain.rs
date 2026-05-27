@@ -16,7 +16,7 @@ use tx_hal::{CpuId, CpuPinGuard, IrqIf, PercpuIf, SmpIf};
 const INITIAL_EPOCH: u64 = 1;
 const RETIRE_THRESHOLD: usize = 64;
 const DEFAULT_DRAIN_BATCH: usize = 32;
-const MAX_EPOCH_CPUS: usize = 64;
+const MAX_EPOCH_CPUS: usize = 8;
 
 pub use super::retired::RETIRED_NODE_POOL_CAPACITY;
 
@@ -187,6 +187,11 @@ impl EpochDomain {
             local.is_initialized(),
             "epoch::guard current CPU has not called epoch::init_on_ap/init_on_bsp"
         );
+
+        let local_epoch = local.current();
+        if local_epoch != 0 {
+            return Guard::new_borrowed(self, local, cpu_id, local_epoch, cpu_pin);
+        }
 
         let current_epoch = self.global_epoch.0.load(Ordering::Acquire);
         local.enter(current_epoch);

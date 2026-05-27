@@ -1,0 +1,21 @@
+# busybox-ping-loopback.txt — N64 BusyBox shell ICMP loopback smoke.
+#
+# Run with:
+#   cargo build -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf
+#   cargo xtask image cpio --profile busybox --target rv64-qemu
+#   cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/busybox-ping-loopback.txt
+#
+# This defends the first shell-facing ping target: BusyBox can invoke
+# the `ping` applet, create a raw/dgram ICMP socket, send one Echo
+# Request to loopback, receive the Echo Reply, and return to the prompt.
+
+wait "/ # " within 30000
+
+sleep 500
+send "ping -c 1 127.0.0.1\n"
+expect "PING 127.0.0.1" within 8000
+expect "1 packets transmitted" within 12000
+expect "/ # " within 8000
+
+sleep 500
+quit

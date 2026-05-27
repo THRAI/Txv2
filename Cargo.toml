@@ -27,6 +27,10 @@ members = [
     "boards/tx-kernel-riscv64-m1dock-mock",
     "boards/tx-kernel-loongarch64-qemu-virt",
 ]
+exclude = [
+    "external/smoltcp-asterinas",
+]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

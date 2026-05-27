@@ -32,10 +32,16 @@ Current orientation skills:
 - `tx-oscomp-musl-debug` captures the named-worktree OSComp/LTP musl debugging
   workflow, including tailored sdcard/QEMU runs, fault/trap tools, focused host
   reductions, merge catch-up, and progress recording.
+- `tx-network-test-fixup` guides OSComp/LTP/lmbench/libctest/netperf/iperf
+  network-stack test triage, enforcing semantic socket fixes instead of
+  test-specific hardcoding and requiring discussion before broad refactors.
 - `tx-process-threadruntime` covers Process, ThreadRuntime, signal, syscall,
   exec, first-userspace, and runtime integration seams.
 - `tx-progress-memory` records or resumes durable decisions, plans, handoffs,
   research, status, and task-finish catch-ups.
+- `tx-ltp-syscall` plans and records Linux syscall work against OSComp/LTP
+  coverage, including the gold-standard pass criteria and anti-hardcoding
+  discipline for test-driven syscall fixes.
 - `tx-shell-syscall-fixup` tight observe→fix→verify loop for missing or
   broken syscalls when an interactive busybox/musl shell hangs, crashes, or
   diverges; pairs the trap-trace + fault-decode + shell-test xtask tools with

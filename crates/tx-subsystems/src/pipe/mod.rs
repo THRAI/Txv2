@@ -1003,7 +1003,7 @@ impl<I: SubjectIdentity> StepOp<I> for Pipe2Op {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         match step_pipe2(self.flags) {
             Ok(pair) => StepOutcome::Done(pair),
-            Err(e) => StepOutcome::Err(e.into()),
+            Err(e) => StepOutcome::Err(e),
         }
     }
 }

@@ -33,6 +33,7 @@ use tx_subsystems::cross_crate_test_support::{
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
 use tx_subsystems::process::{bootstrap_init_process, ExitStatus, Pid, ProcessIdentity};
+use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::vfs::OpenFile;
@@ -154,6 +155,10 @@ impl PmapIf for ShimsTestPmap {
 impl EntropyIf for ShimsTestPmap {}
 
 impl tx_hal::AuxvIf for ShimsTestPmap {}
+
+impl tx_hal::ConsoleIf for ShimsTestPmap {
+    fn write_bytes(_bytes: &[u8]) {}
+}
 
 impl SmpIf for ShimsTestPmap {}
 
@@ -361,6 +366,36 @@ fn dispatch_write_one_to_console_returns_byte_count() {
     );
 }
 
+/// `writev(1, iov, 2)` uses the stdout/stderr TTY fast path. The
+/// combined buffer is kernel-owned after iovec gather, so this verifies
+/// that the fast path writes those bytes directly instead of feeding a
+/// kernel pointer back through the user-buffer `write(2)` lane.
+#[test]
+fn dispatch_writev_stdout_tty_fast_path_writes_combined_buffer() {
+    let _setup = setup();
+    let ops = install_capturing_console();
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    proc_cap.set_fd(1, Some(tx_fs::devfs::open_console_for_init()));
+
+    let ctx = make_ctx(proc_cap, thread);
+    let part1: &[u8] = b"netperf ";
+    let part2: &[u8] = b"row\n";
+    let iov = [
+        part1.as_ptr() as u64,
+        part1.len() as u64,
+        part2.as_ptr() as u64,
+        part2.len() as u64,
+    ];
+    let req = SyscallRequest::new(NR_WRITEV, [1, iov.as_ptr() as u64, 2, 0, 0, 0]);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+
+    assert_eq!(result, SyscallResult::Return(12));
+    assert_eq!(ops.snapshot(), b"netperf row\r\n");
+}
+
 /// `exit_group(0)` zombifies the process at once and records
 /// `ExitStatus::Exited(0)` per `PROCESS_v1` §7.3.2.
 #[test]
@@ -529,6 +564,97 @@ fn dispatch_read_blocks_until_tty_input_then_returns_byte() {
     panic!("dispatch did not resolve after step_ingest woke the carrier; last poll = {result:?}");
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TestPollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+#[test]
+fn dispatch_ppoll_reports_pipe_polout_only_while_space_remains() {
+    const POLLOUT: i16 = 0x0004;
+
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let mut pipefd = [-1i32; 2];
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_PIPE2, [pipefd.as_mut_ptr() as u64, 0, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+
+    let timeout = [0u64; 2];
+    let mut pfd = TestPollFd {
+        fd: pipefd[1],
+        events: POLLOUT,
+        revents: 0,
+    };
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_PPOLL,
+                [
+                    &mut pfd as *mut TestPollFd as u64,
+                    1,
+                    timeout.as_ptr() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(1)
+    );
+    assert_eq!(pfd.revents, POLLOUT);
+
+    let buf = [0x41u8; tx_subsystems::pipe::PIPE_BUF];
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_WRITE,
+                [
+                    pipefd[1] as u64,
+                    buf.as_ptr() as u64,
+                    buf.len() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(buf.len() as i64)
+    );
+
+    pfd.revents = 0;
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_PPOLL,
+                [
+                    &mut pfd as *mut TestPollFd as u64,
+                    1,
+                    timeout.as_ptr() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(pfd.revents, 0);
+}
+
 /// `brk(0)` reports the current break, then `brk(>current)` grows,
 /// then `brk(<current)` shrinks. Bootstrap init's break starts at
 /// `BOOTSTRAP_BRK_BASE = 0x6000_0000`. Page granularity: arguments
@@ -670,6 +796,76 @@ fn dispatch_rt_sigprocmask_rejects_wrong_sigsetsize() {
     assert_eq!(r, SyscallResult::Error(22));
 }
 
+/// `rt_sigtimedwait(set, info, {0,0}, 8)` is a true poll: if no
+/// matching pending signal exists, it returns `-EAGAIN`.
+#[test]
+fn dispatch_rt_sigtimedwait_zero_timeout_returns_neg_eagain() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let mut set = Signum::SIGCHLD.bit();
+    let mut timeout = [0i64, 0i64];
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_RT_SIGTIMEDWAIT,
+            [
+                &mut set as *mut u64 as u64,
+                0,
+                timeout.as_mut_ptr() as u64,
+                8,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(11));
+}
+
+/// `rt_sigtimedwait` consumes a matching pending signal and writes the
+/// leading `siginfo_t.si_signo` field. This pins the ABI shape used by
+/// the OSComp libctest runtest harness to wait for child `SIGCHLD`.
+#[test]
+fn dispatch_rt_sigtimedwait_consumes_pending_sigchld() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread.clone());
+
+    let payload = thread
+        .payload_cap()
+        .expect("bootstrap leader thread must be live");
+    payload.pending().post(Signum::SIGCHLD);
+
+    let mut set = Signum::SIGCHLD.bit();
+    let mut info = [0xa5u8; 128];
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_RT_SIGTIMEDWAIT,
+            [
+                &mut set as *mut u64 as u64,
+                info.as_mut_ptr() as u64,
+                0,
+                8,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(SIGCHLD as i64));
+    assert!(
+        !payload.pending().is_pending(Signum::SIGCHLD),
+        "sigtimedwait must dequeue the consumed signal"
+    );
+    assert_eq!(
+        u32::from_le_bytes(info[0..4].try_into().unwrap()),
+        SIGCHLD as u32
+    );
+}
+
 /// `rt_sigaction(SIGUSR1, act, oldact, 8)` round-trip: install a
 /// custom handler for SIGUSR1 (signum 10), then query it back via
 /// oldact in a follow-up call. The handler value is preserved
@@ -723,8 +919,8 @@ fn dispatch_rt_sigaction_install_then_query_round_trip() {
 }
 
 /// musl's pthread cancellation handler is installed with
-/// `SA_SIGINFO | SA_RESTART | SA_ONSTACK` and a full mask. The kernel
-/// rt_sigaction ABI must preserve those words when queried back; losing
+/// `SA_SIGINFO | SA_RESTART | SA_ONSTACK` and a full mask. RV64's
+/// rt_sigaction ABI exchanges the kernel handler/flags/mask words; losing
 /// them means AST delivery cannot distinguish the 3-argument handler
 /// shape or compute the handler-entry mask.
 #[test]
@@ -740,10 +936,9 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
     const SA_RESTART: u64 = 0x1000_0000;
     const FLAGS: u64 = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
     const MASK: u64 = u64::MAX;
-    const UNUSED: u64 = 0x4444_5555_6666_7777;
 
-    let act: [u64; 4] = [HANDLER_ADDR, FLAGS, MASK, UNUSED];
-    let mut oldact: [u64; 4] = [0xDEADu64; 4];
+    let act: [u64; 3] = [HANDLER_ADDR, FLAGS, MASK];
+    let mut oldact: [u64; 3] = [0xDEADu64; 3];
 
     let r1 = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(
@@ -760,9 +955,9 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
         &ctx,
     ));
     assert_eq!(r1, SyscallResult::Return(0));
-    assert_eq!(oldact, [0, 0, 0, 0]);
+    assert_eq!(oldact, [0, 0, 0]);
 
-    let mut observed: [u64; 4] = [0xDEADu64; 4];
+    let mut observed: [u64; 3] = [0xDEADu64; 3];
     let r2 = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(
             NR_RT_SIGACTION,
@@ -786,10 +981,6 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
     assert_ne!(
         observed[2] & tx_subsystems::signal::Signum::SIGTERM.bit(),
         0
-    );
-    assert_eq!(
-        observed[3], UNUSED,
-        "RV64 musl has no SA_RESTORER, so the last word is ABI-unused"
     );
 }
 
@@ -930,16 +1121,9 @@ fn dispatch_fcntl_setfd_clears_other_bits() {
 
 /// Unknown `cmd` values return `-ENOSYS`.
 ///
-/// Wave 2 originally treated F_DUPFD / F_GETFL / F_SETFL as unknown;
-/// Slice 7 of the shell-prompt roadmap (2026-05-07) adds real arms
-/// for F_DUPFD / F_DUPFD_CLOEXEC / F_GETFL (F_SETFL still returns
-/// ENOSYS as a documented carryover — see the dedicated
-/// `dispatch_fcntl_f_setfl_returns_neg_enosys` test in the
-/// `fcntl_misc` module). This test uses an arbitrary high `cmd` value
-/// (`F_GETLK = 5`, file locking — out of scope for v1) to exercise
-/// the catch-all unknown branch.
+/// Unknown fcntl commands return `-EINVAL` per Linux.
 #[test]
-fn dispatch_fcntl_unknown_cmd_returns_neg_enosys() {
+fn dispatch_fcntl_unknown_cmd_returns_neg_einval() {
     let _setup = setup();
     let _ops = install_capturing_console();
     let proc_cap = bootstrap();
@@ -949,12 +1133,11 @@ fn dispatch_fcntl_unknown_cmd_returns_neg_enosys() {
     proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
     let ctx = make_ctx(proc_cap, thread);
 
-    // F_GETLK = 5 (file locking) is not in any in-tree fcntl surface.
     let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_FCNTL, [3, 5, 0, 0, 0, 0]),
+        SyscallRequest::new(NR_FCNTL, [3, 9999, 0, 0, 0, 0]),
         &ctx,
     ));
-    assert_eq!(r, SyscallResult::Error(38));
+    assert_eq!(r, SyscallResult::Error(22));
 }
 
 /// `fcntl` against a closed/never-installed fd returns `-EBADF`.

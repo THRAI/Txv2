@@ -163,7 +163,7 @@ pub(super) fn read_user_cstr_vec(
 /// kernel-pointer dance on `EFAULT`.
 pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) -> Result<T, Errno> {
     use step_engine::{Errno as V3Errno, StepOutcome as V3};
-    let guard = step_engine::guard();
+    let guard = tx_substrate::epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
     match aspace.read_user(UserPtr::<T>::new(uaddr as usize), &guard) {
         V3::Done(v) => Ok(v),
         V3::Err(V3Errno::EFAULT) => {
@@ -185,7 +185,7 @@ pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) ->
                 Ok(unsafe { core::ptr::read_volatile(uaddr as *const T) })
             }
         }
-        V3::Err(e) => Err(e.into()),
+        V3::Err(e) => Err(e),
         V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
     }
 }
@@ -202,7 +202,7 @@ pub(super) fn bootstrap_write_user<T: Copy>(
     let guard = step_engine::guard();
     match aspace.write_user(UserPtr::<T>::new(uaddr as usize), value, &guard) {
         V3::Done(()) | V3::Continue { .. } => Ok(()),
-        V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
+        V3::Err(e) if e == Errno::EFAULT => {
             drop(guard);
             #[cfg(target_os = "none")]
             {
@@ -224,7 +224,7 @@ pub(super) fn bootstrap_write_user<T: Copy>(
                 Ok(())
             }
         }
-        V3::Err(e) => Err(Errno::from(e)),
+        V3::Err(e) => Err(e),
         V3::Yield { .. } => Err(Errno::EIO),
     }
 }
@@ -274,7 +274,9 @@ pub(super) fn bootstrap_copy_from_user(
 
         let guard = step_engine::guard();
         match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Done(n) if n == dst.len() => Ok(()),
+            V3::Done(_) => Err(Errno::EFAULT),
+            V3::Continue { .. } => Err(Errno::EIO),
             V3::Err(e) => Err(Errno::from(e)),
             V3::Yield { .. } => Err(Errno::EIO),
         }
@@ -286,7 +288,7 @@ pub(super) fn bootstrap_copy_from_user(
         if let Some(range) = covering_user_range(uaddr, dst.len()) {
             match aspace.reserve_user_range_for_access(range, UserAccessKind::Read) {
                 V3::Done(()) => {}
-                V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
+                V3::Err(e) if e == Errno::EFAULT => {
                     let limit = if cfg!(any(test, feature = "test-support")) {
                         0x1000
                     } else {
@@ -297,7 +299,7 @@ pub(super) fn bootstrap_copy_from_user(
                     }
                     prefault_failed_with_efault = true;
                 }
-                V3::Err(e) => return Err(Errno::from(e)),
+                V3::Err(e) => return Err(e),
                 V3::Yield { .. } | V3::Continue { .. } => return Err(Errno::EIO),
             }
         }
@@ -311,8 +313,10 @@ pub(super) fn bootstrap_copy_from_user(
 
         let guard = step_engine::guard();
         match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
-            V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
+            V3::Done(n) if n == dst.len() => Ok(()),
+            V3::Done(_) => Err(Errno::EFAULT),
+            V3::Continue { .. } => Err(Errno::EIO),
+            V3::Err(e) if e == Errno::EFAULT => {
                 drop(guard);
                 let limit = if cfg!(any(test, feature = "test-support")) {
                     0x1000
@@ -327,7 +331,7 @@ pub(super) fn bootstrap_copy_from_user(
                 }
                 Ok(())
             }
-            V3::Err(e) => Err(Errno::from(e)),
+            V3::Err(e) => Err(e),
             V3::Yield { .. } => Err(Errno::EIO),
         }
     }
@@ -358,7 +362,9 @@ pub(super) fn bootstrap_copy_to_user(
 
         let guard = step_engine::guard();
         match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Done(n) if n == src.len() => Ok(()),
+            V3::Done(_) => Err(Errno::EFAULT),
+            V3::Continue { .. } => Err(Errno::EIO),
             V3::Err(e) => Err(Errno::from(e)),
             V3::Yield { .. } => Err(Errno::EIO),
         }
@@ -370,7 +376,7 @@ pub(super) fn bootstrap_copy_to_user(
         if let Some(range) = covering_user_range(uaddr, src.len()) {
             match aspace.reserve_user_range_for_access(range, UserAccessKind::Write) {
                 V3::Done(()) => {}
-                V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
+                V3::Err(e) if e == Errno::EFAULT => {
                     let limit = if cfg!(any(test, feature = "test-support")) {
                         0x1000
                     } else {
@@ -381,7 +387,7 @@ pub(super) fn bootstrap_copy_to_user(
                     }
                     prefault_failed_with_efault = true;
                 }
-                V3::Err(e) => return Err(Errno::from(e)),
+                V3::Err(e) => return Err(e),
                 V3::Yield { .. } | V3::Continue { .. } => return Err(Errno::EIO),
             }
         }
@@ -395,8 +401,10 @@ pub(super) fn bootstrap_copy_to_user(
 
         let guard = step_engine::guard();
         match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
-            V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
+            V3::Done(n) if n == src.len() => Ok(()),
+            V3::Done(_) => Err(Errno::EFAULT),
+            V3::Continue { .. } => Err(Errno::EIO),
+            V3::Err(e) if e == Errno::EFAULT => {
                 drop(guard);
                 let limit = if cfg!(any(test, feature = "test-support")) {
                     0x1000
@@ -411,7 +419,7 @@ pub(super) fn bootstrap_copy_to_user(
                 }
                 Ok(())
             }
-            V3::Err(e) => Err(Errno::from(e)),
+            V3::Err(e) => Err(e),
             V3::Yield { .. } => Err(Errno::EIO),
         }
     }
@@ -467,7 +475,7 @@ pub(super) fn bootstrap_read_user_cstr(
                 Err(Errno::ENAMETOOLONG)
             }
         }
-        V3::Err(e) => Err(e.into()),
+        V3::Err(e) => Err(e),
         V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
     }
 }

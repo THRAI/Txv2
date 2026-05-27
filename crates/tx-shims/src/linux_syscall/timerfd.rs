@@ -15,6 +15,7 @@ use super::numbers::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME,
     TFD_CLOEXEC_FLAG, TFD_NONBLOCK_FLAG, TFD_TIMER_ABSTIME_FLAG, TFD_TIMER_CANCEL_ON_SET_FLAG,
 };
+use super::time::realtime_ns;
 use super::{
     bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user, errno_to_i32,
     next_stdio_fd_below_nofile, SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINTR_VALUE,
@@ -62,7 +63,7 @@ pub(super) fn sys_timerfd_create<'a>(
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(Ok(cap)) => cap,
             Ok(Err(_)) => return SyscallResult::Error(ENOMEM_VALUE),
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+            Err(v3errno) => return SyscallResult::error_from(v3errno),
         }
     };
 
@@ -249,7 +250,7 @@ pub(super) async fn sys_timerfd_read<P: super::TimeIf>(
                 return SyscallResult::Return(n as i64);
             }
             V3Out::Err(v3errno) => {
-                let errno: Errno = v3errno.into();
+                let errno: Errno = v3errno;
                 if errno == Errno::EAGAIN {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }

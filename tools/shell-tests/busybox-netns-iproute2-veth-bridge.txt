@@ -1,0 +1,77 @@
+# busybox-netns-iproute2-veth-bridge.txt — N71M3 Docker-style network control smoke.
+#
+# The helper supplies the namespace fd/pid side of the ABI:
+# - `netns-helper hold` unshares into a fresh network namespace and stays alive.
+# - `netns-helper exec <pid> ...` opens `/proc/<pid>/ns/net`, setns()es into it,
+#   then execve()s the requested command.
+
+wait "/ # " within 30000
+sleep 500
+
+send "/bin/netns-helper hold &\n"
+expect "tx-netns-holder-ready" within 10000
+expect "/ # " within 10000
+
+send "m=N71M3; target=$!; echo ${m}_TARGET_$target\n"
+expect "N71M3_TARGET_" within 5000
+expect "/ # " within 5000
+
+send "if /bin/busybox ip link add name docker0 type bridge; then echo ${m}_BRIDGE_CREATED; else echo ${m}_FAIL_BRIDGE_CREATE; fi\n"
+expect "N71M3_BRIDGE_CREATED" within 15000
+expect "/ # " within 10000
+
+send "/bin/busybox ip link\n"
+expect "docker0" within 10000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip addr add 172.17.0.1/16 dev docker0; then echo ${m}_BRIDGE_ADDR; else echo ${m}_FAIL_BRIDGE_ADDR; fi\n"
+expect "N71M3_BRIDGE_ADDR" within 15000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip link set docker0 up; then echo ${m}_BRIDGE_UP; else echo ${m}_FAIL_BRIDGE_UP; fi\n"
+expect "N71M3_BRIDGE_UP" within 15000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip link add veth0 type veth peer name eth0; then echo ${m}_VETH_CREATED; else echo ${m}_FAIL_VETH_CREATE; fi\n"
+expect "N71M3_VETH_CREATED" within 15000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip link set dev veth0 master docker0 || /bin/netns-helper master veth0 docker0; then echo ${m}_VETH_MASTER; else echo ${m}_FAIL_VETH_MASTER; fi\n"
+expect "N71M3_VETH_MASTER" within 15000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip link set veth0 up; then echo ${m}_VETH_UP; else echo ${m}_FAIL_VETH_UP; fi\n"
+expect "N71M3_VETH_UP" within 15000
+expect "/ # " within 10000
+
+send "if /bin/busybox ip link set eth0 netns $target || /bin/netns-helper netns eth0 $target; then echo ${m}_ETH_MOVED; else echo ${m}_FAIL_ETH_MOVE; fi\n"
+expect "N71M3_ETH_MOVED" within 15000
+expect "/ # " within 10000
+
+send "if /bin/netns-helper exec $target /bin/busybox ip link set eth0 up; then echo ${m}_ETH_UP; else echo ${m}_FAIL_ETH_UP; fi\n"
+expect "N71M3_ETH_UP" within 15000
+expect "/ # " within 10000
+
+send "if /bin/netns-helper exec $target /bin/busybox ip addr add 172.17.0.2/16 dev eth0; then echo ${m}_ETH_ADDR; else echo ${m}_FAIL_ETH_ADDR; fi\n"
+expect "N71M3_ETH_ADDR" within 15000
+expect "/ # " within 10000
+
+send "/bin/busybox ip link\n"
+expect "docker0" within 10000
+expect "veth0" within 10000
+expect "/ # " within 10000
+
+send "/bin/netns-helper exec $target /bin/busybox ip link\n"
+expect "eth0" within 10000
+expect "/ # " within 10000
+
+send "/bin/netns-helper exec $target /bin/busybox ip addr\n"
+expect "172.17.0.2" within 10000
+expect "/ # " within 10000
+
+send "kill $target; echo ${m}_NETNS_IPROUTE2_SUCCESS\n"
+expect "N71M3_NETNS_IPROUTE2_SUCCESS" within 5000
+expect "/ # " within 5000
+
+sleep 500
+quit

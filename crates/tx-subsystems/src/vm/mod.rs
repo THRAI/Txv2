@@ -30,8 +30,9 @@ pub use execution::{
 };
 pub use pmap::{PmapMappingSnapshot, PmapPublishOutcome, PmapStats, VmPmapError};
 pub use scripts::{
-    build_aspace_from_image, populate_detached_user_range, BssTail, ImagePlan, LoadSegment,
-    ScriptError, SegmentFlags, USER_STACK_INITIAL_RESERVATION, USER_STACK_TOP_DEFAULT,
+    build_aspace_from_image, populate_detached_user_range, register_interp_image, BssTail,
+    ImagePlan, LoadSegment, ScriptError, SegmentFlags, INTERP_LOAD_BIAS_DEFAULT,
+    USER_STACK_INITIAL_RESERVATION, USER_STACK_TOP_DEFAULT,
 };
 pub use structure::{
     AccessMode, AcquirePairResult, AcquireResult, AddressSpace, AddressSpaceStats, LockMode,

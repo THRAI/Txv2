@@ -36,7 +36,8 @@ use tx_subsystems::page_backed::{
 };
 use tx_subsystems::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, MountOutput,
-    RNode, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_ISGID, S_ISUID, VFS_NAME_MAX,
+    RNode, RNodeBacking, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
+    S_ISGID, S_ISUID, VFS_NAME_MAX,
 };
 
 /// Mode for the tmpfs root directory.
@@ -61,6 +62,7 @@ const TMPFS_FIRST_FREE_OBJECT_ID: u64 = 3;
 // on demand so tmpfs files are bounded only by global swap pressure
 // rather than by this static cap.
 const TMPFS_FILE_PAGE_CAP: u64 = 1024;
+const TMPFS_MAX_HARD_LINKS: u32 = 1024;
 
 /// Maximum length of an inline symlink target, in bytes.
 ///
@@ -70,8 +72,9 @@ const TMPFS_FILE_PAGE_CAP: u64 = 1024;
 pub const TMPFS_SYMLINK_MAX: usize = VFS_NAME_MAX;
 
 /// Per-inode payload. Variants line up with the inode kinds tmpfs
-/// supports today. Block-device, fifo, and socket variants are not
-/// yet in scope; `create_inode` rejects those modes with `EINVAL`.
+/// supports today. Block-device and socket variants are not yet in
+/// scope; named FIFOs are represented with an empty byte backing until
+/// full named-pipe endpoint semantics are needed.
 enum TmpfsPayload {
     /// Directory: child name → inode id.
     Directory(BTreeMap<InlineName, FsObjectId>),
@@ -227,7 +230,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let state = self.state.lock();
         let Some(parent_inode) = state.inodes.get(&parent) else {
@@ -309,16 +312,22 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
-        // Day-1 tmpfs only handles regular files via `create_inode`.
         // Directories arrive through `mkdir`, symlinks through
-        // `symlink`. Reject anything else with `EINVAL`.
+        // `symlink`. Other mknod-created leaf nodes get a simple
+        // page-backed placeholder payload; their visible type is
+        // carried by `InodeMeta::mode`.
         let kind_bits = mode & S_IFMT;
-        if kind_bits != 0 && kind_bits != S_IFREG {
-            return StepOutcome::err(step_engine::Errno::EINVAL);
-        }
-        let mode = (mode & !S_IFMT) | S_IFREG;
+        let (kind, type_bits) = match kind_bits {
+            0 | S_IFREG => (InodeKind::Regular, S_IFREG),
+            S_IFIFO => (InodeKind::Fifo, S_IFIFO),
+            S_IFCHR => (InodeKind::CharDevice, S_IFCHR),
+            S_IFBLK => (InodeKind::BlockDevice, S_IFBLK),
+            S_IFSOCK => (InodeKind::Socket, S_IFSOCK),
+            _ => return StepOutcome::err(step_engine::Errno::EINVAL),
+        };
+        let mode = (mode & !S_IFMT) | type_bits;
 
         let container = match PageContainer::new_cap(
             PageContainerKind::Anon {
@@ -343,7 +352,7 @@ impl FsOps for Tmpfs {
         container.set_size_bytes(0);
 
         let new_id = self.alloc_object_id();
-        let mut meta = InodeMeta::new(InodeKind::Regular, mode);
+        let mut meta = InodeMeta::new(kind, mode);
         meta.uid = cred.uid;
         meta.gid = cred.gid;
         meta.size = 0;
@@ -386,7 +395,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
@@ -433,38 +442,78 @@ impl FsOps for Tmpfs {
         new_name: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        // TODO(phase-vfs-rename-xdir): cross-directory rename. Day-1
-        // ships same-directory rename; cross-directory needs the
-        // walker + dentry rebinding seam to land first.
-        if old_parent != new_parent {
-            return StepOutcome::err(step_engine::Errno::ENOSYS);
-        }
         let old_key = match InlineName::new(old_name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let new_key = match InlineName::new(new_name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         if old_key == new_key {
             return StepOutcome::done(());
         }
 
         let mut state = self.state.lock();
-        let Some(parent_inode) = state.inodes.get_mut(&old_parent) else {
+        let target_id = {
+            let Some(parent_inode) = state.inodes.get(&old_parent) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let TmpfsPayload::Directory(children) = &parent_inode.payload else {
+                return StepOutcome::err(step_engine::Errno::ENOTDIR);
+            };
+            let Some(target_id) = children.get(&old_key).copied() else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            target_id
+        };
+        let Some(target_inode) = state.inodes.get(&target_id) else {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         };
-        let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
+        let target_is_dir = matches!(target_inode.payload, TmpfsPayload::Directory(_));
+        let displaced = {
+            let Some(new_parent_inode) = state.inodes.get(&new_parent) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let TmpfsPayload::Directory(children) = &new_parent_inode.payload else {
+                return StepOutcome::err(step_engine::Errno::ENOTDIR);
+            };
+            children.get(&new_key).copied()
+        };
+        if let Some(displaced_id) = displaced {
+            let Some(displaced_inode) = state.inodes.get(&displaced_id) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let displaced_is_dir = matches!(displaced_inode.payload, TmpfsPayload::Directory(_));
+            if target_is_dir != displaced_is_dir {
+                return StepOutcome::err(if target_is_dir {
+                    step_engine::Errno::ENOTDIR
+                } else {
+                    step_engine::Errno::EISDIR
+                });
+            }
+            if let TmpfsPayload::Directory(children) = &displaced_inode.payload {
+                if !children.is_empty() {
+                    return StepOutcome::err(step_engine::Errno::ENOTEMPTY);
+                }
+            }
+        }
+
+        let Some(old_parent_inode) = state.inodes.get_mut(&old_parent) else {
+            return StepOutcome::err(step_engine::Errno::ENOENT);
+        };
+        let TmpfsPayload::Directory(old_children) = &mut old_parent_inode.payload else {
             return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
-        let Some(target_id) = children.remove(&old_key) else {
+        old_children.remove(&old_key);
+
+        let Some(new_parent_inode) = state.inodes.get_mut(&new_parent) else {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         };
-        // If a file exists at the destination, replace it (POSIX
-        // rename semantics for same-type-collision; cross-type
-        // collision is left as a follow-up alongside cross-dir).
-        let displaced = children.insert(new_key, target_id);
+        let TmpfsPayload::Directory(new_children) = &mut new_parent_inode.payload else {
+            return StepOutcome::err(step_engine::Errno::ENOTDIR);
+        };
+        let displaced = new_children.insert(new_key, target_id);
         if let Some(displaced_id) = displaced {
             state.inodes.remove(&displaced_id);
         }
@@ -498,11 +547,16 @@ impl FsOps for Tmpfs {
             }
         }
         // Phase 2: mutable ops — validate target, insert link.
-        let _target_inode = match state.inodes.get_mut(&target) {
+        let target_inode = match state.inodes.get_mut(&target) {
             Some(i) if matches!(i.payload, TmpfsPayload::RegularFile { .. }) => i,
             Some(_) => return StepOutcome::err(step_engine::Errno::EPERM),
             None => return StepOutcome::err(step_engine::Errno::ENOENT),
         };
+        if target_inode.nlink >= TMPFS_MAX_HARD_LINKS {
+            return StepOutcome::err(step_engine::Errno::EMLINK);
+        }
+        target_inode.nlink = target_inode.nlink.saturating_add(1);
+        target_inode.meta.nlinks = target_inode.nlink;
         let parent_inode = match state.inodes.get_mut(&parent) {
             Some(i) => i,
             None => return StepOutcome::err(step_engine::Errno::ENOTDIR),
@@ -527,7 +581,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let mode = (mode & !S_IFMT) | S_IFDIR;
         let new_id = self.alloc_object_id();
@@ -573,7 +627,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let mut state = self.state.lock();
         let Some(target_inode) = state.inodes.get(&target) else {
@@ -620,7 +674,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let new_id = self.alloc_object_id();
         let mut meta = InodeMeta::new(InodeKind::Symlink, S_IFLNK | 0o777);
@@ -682,7 +736,7 @@ impl FsOps for Tmpfs {
             .unwrap_or(InodeKind::Regular);
         let entry = match DirEntry::new(*child_id, kind, name.as_bytes()) {
             Ok(e) => e,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         StepOutcome::done(Some((entry, DirCursor::from_u64(cursor.as_u64() + 1))))
     }
@@ -756,9 +810,12 @@ impl FsOps for Tmpfs {
     ///   arm with one of those kinds is a backend bug. Return
     ///   `EISDIR` / `EINVAL` respectively to mirror the Linux
     ///   `inode_operations.lookup` shape.
-    /// - Block / FIFO / Socket: not supported by tmpfs today; return
-    ///   `ENOSYS` so callers fall through cleanly until those kinds
-    ///   acquire concrete materialisers.
+    /// - Block / Socket: not supported by tmpfs today; return `ENOSYS`
+    ///   so callers fall through cleanly until those kinds acquire
+    ///   concrete materialisers.
+    /// - Named FIFO currently uses the same page-backed payload as a
+    ///   regular file; anonymous pipe endpoints carry the true pipe
+    ///   wait/read/write semantics.
     fn materialise_rnode(
         &self,
         fs_object_id: FsObjectId,
@@ -817,7 +874,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         if let Err(e) = tx_subsystems::vfs::predicates::check_chmod_perm(&inode.meta, cred) {
-            return StepOutcome::err(e.into());
+            return StepOutcome::err(e);
         }
         // Preserve the IFMT bits from the existing meta — kind is
         // immutable through chmod (matches `serialize_inode_meta`).
@@ -852,7 +909,7 @@ impl FsOps for Tmpfs {
         if let Err(e) =
             tx_subsystems::vfs::predicates::check_chown_perm(&inode.meta, new_uid, new_gid, cred)
         {
-            return StepOutcome::err(e.into());
+            return StepOutcome::err(e);
         }
         let privileged = cred.effective_caps.contains(Capability::FOWNER) || cred.uid == 0;
         if let Some(u) = new_uid {

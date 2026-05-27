@@ -8,12 +8,12 @@
 //! pure observation helpers belong here.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI8, AtomicU32, AtomicU64, Ordering};
 
 use crate::vfs::adapter::step_engine::{
-    self, Cap, SpinMutex, Weak, Zone, ZoneAllocated, ZoneError,
+    self, Cap, PayloadCap, SpinMutex, Weak, Zone, ZoneAllocated, ZoneError,
 };
 use crate::vfs::adapter::wait_routing::{Channel, WaitSource};
 
@@ -26,6 +26,7 @@ use crate::execution::Errno;
 use crate::io_uring::IoUring;
 use crate::ipc::posix_mq::structure::PosixMqInstance;
 use crate::mount::{MountIdentity, MountPayload};
+use crate::net::{NetNamespacePayload, SocketIdentity};
 use crate::page_backed::PageContainer;
 use crate::process::{ProcessGroup, ProcessIdentity};
 use crate::signalfd::SignalFd;
@@ -55,6 +56,13 @@ pub const VFS_NAME_MAX: usize = 255;
 static DENTRY_ZONE: Zone<DEntry> = Zone::const_new();
 static RNODE_ZONE: Zone<RNode> = Zone::const_new();
 static OPEN_FILE_ZONE: Zone<OpenFile> = Zone::const_new();
+static FLOCK_TABLE: SpinMutex<BTreeMap<FsObjectId, FlockRecord>> = SpinMutex::new(BTreeMap::new());
+
+#[derive(Default)]
+struct FlockRecord {
+    exclusive_owner: Option<u64>,
+    shared_owners: BTreeSet<u64>,
+}
 
 unsafe impl ZoneAllocated for DEntry {
     fn zone() -> &'static Zone<Self> {
@@ -484,6 +492,7 @@ pub enum RNodeBacking {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectionSchemaId {
     Procfs,
+    Sysfs,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -508,6 +517,14 @@ pub enum StructPayload {
     Pipe {
         payload: Cap<crate::pipe::PipePayload>,
         side: crate::pipe::PipeSide,
+    },
+    /// Socket-backed open file used by the network syscall facade.
+    Socket {
+        identity: Cap<SocketIdentity>,
+    },
+    /// Internal network-namespace fd used by the staged rtnetlink path.
+    NetNamespace {
+        payload: PayloadCap<NetNamespacePayload>,
     },
 }
 
@@ -617,6 +634,79 @@ impl RNode {
 
     pub const fn backing(&self) -> &RNodeBacking {
         &self.backing
+    }
+
+    pub fn flock_try_acquire(
+        &self,
+        owner: u64,
+        lock_type: u32,
+        blocking: bool,
+    ) -> Result<(), Errno> {
+        if owner == 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        loop {
+            {
+                let mut locks = FLOCK_TABLE.lock();
+                let record = locks.entry(self.fs_object_id).or_default();
+                let can_lock = match lock_type {
+                    // LOCK_SH: compatible with other shared locks; if this
+                    // owner held exclusive, downgrade to shared.
+                    1 => record.exclusive_owner.is_none() || record.exclusive_owner == Some(owner),
+                    // LOCK_EX: requires no other owner. Converting from a
+                    // shared lock held only by this owner is permitted.
+                    2 => {
+                        record.exclusive_owner.is_none()
+                            && (record.shared_owners.is_empty()
+                                || (record.shared_owners.len() == 1
+                                    && record.shared_owners.contains(&owner)))
+                            || record.exclusive_owner == Some(owner)
+                    }
+                    _ => return Err(Errno::EINVAL),
+                };
+
+                if can_lock {
+                    match lock_type {
+                        1 => {
+                            record.exclusive_owner = None;
+                            record.shared_owners.insert(owner);
+                        }
+                        2 => {
+                            record.shared_owners.remove(&owner);
+                            record.exclusive_owner = Some(owner);
+                        }
+                        _ => unreachable!(),
+                    }
+                    return Ok(());
+                }
+
+                if !blocking {
+                    return Err(Errno::EAGAIN);
+                }
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    pub fn flock_release_owner(&self, owner: u64) {
+        if owner == 0 {
+            return;
+        }
+
+        let mut locks = FLOCK_TABLE.lock();
+        let Some(record) = locks.get_mut(&self.fs_object_id) else {
+            return;
+        };
+
+        if record.exclusive_owner == Some(owner) {
+            record.exclusive_owner = None;
+        }
+        record.shared_owners.remove(&owner);
+
+        if record.exclusive_owner.is_none() && record.shared_owners.is_empty() {
+            locks.remove(&self.fs_object_id);
+        }
     }
 
     pub fn with_containing_mount(mut self, mount: &Cap<MountPayload>) -> Self {
@@ -1071,7 +1161,9 @@ impl OpenFile {
         dentry: Cap<DEntry>,
     ) -> Result<Cap<Self>, ZoneError> {
         let mut file = Self::new(rnode, flags);
-        file.opendir_dentry = Some(dentry);
+        if matches!(file.rnode().backing(), RNodeBacking::Directory) {
+            file.opendir_dentry = Some(dentry);
+        }
         step_engine::sign(file)
     }
 
@@ -1380,44 +1472,22 @@ impl OpenFile {
     /// `blocking`: `false` = `LOCK_NB`.
     pub fn flock_acquire(
         &self,
-        _lock_type: u32,
+        lock_type: u32,
         blocking: bool,
     ) -> Result<(), crate::execution::Errno> {
-        // v1: exclusive-only, per-open-file-description.
-        // Any shared lock maps to exclusive.
-        if blocking {
-            // Simple spin-wait for v1.
-            loop {
-                if self
-                    .flock_state
-                    .compare_exchange(
-                        0,
-                        1,
-                        core::sync::atomic::Ordering::Acquire,
-                        core::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    return Ok(());
-                }
-            }
-        } else {
-            self.flock_state
-                .compare_exchange(
-                    0,
-                    1,
-                    core::sync::atomic::Ordering::Acquire,
-                    core::sync::atomic::Ordering::Relaxed,
-                )
-                .map_err(|_| crate::execution::Errno::EAGAIN)?;
-            Ok(())
-        }
+        // `flock(2)` conflicts across distinct open-file descriptions of
+        // the same inode, while dup/fork clones of one OpenFile share
+        // ownership and may unlock it.
+        let owner = self as *const Self as u64;
+        self.rnode().flock_try_acquire(owner, lock_type, blocking)
     }
 
     /// Release a held advisory lock.
     pub fn flock_release(&self) {
-        self.flock_state
-            .store(0, core::sync::atomic::Ordering::Release);
+        let owner = self as *const Self as u64;
+        if let OpenFileBacking::Rnode { rnode } = &self.backing {
+            rnode.flock_release_owner(owner);
+        }
     }
 
     /// `Some(&Cap<UserfaultFd>)` iff this `OpenFile` is the

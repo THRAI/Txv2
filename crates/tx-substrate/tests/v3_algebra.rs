@@ -77,15 +77,19 @@ fn step_outcome_continue_carries_progress() {
 #[test]
 fn errno_mirrors_v4_catalog() {
     // The `step::Errno` catalog mirrors `tx_subsystems::execution
-    // ::Errno` byte-for-byte. Closed-catalog discipline:
+    // ::Errno` byte-for-byte (48 variants). Closed-catalog discipline:
     // an exhaustive match with no wildcard arm so adding a variant
     // later requires mirroring it here.
     use tx_substrate::step::Errno;
     let cases = [
         Errno::E2BIG,
         Errno::EACCES,
+        Errno::EALREADY,
         Errno::EAGAIN,
         Errno::EBADF,
+        Errno::EADDRINUSE,
+        Errno::EADDRNOTAVAIL,
+        Errno::EAFNOSUPPORT,
         Errno::EBUSY,
         Errno::ECANCELED,
         Errno::EDEADLK,
@@ -97,8 +101,11 @@ fn errno_mirrors_v4_catalog() {
         Errno::EINVAL,
         Errno::EINTR,
         Errno::EIO,
+        Errno::EISCONN,
         Errno::EISDIR,
         Errno::ELOOP,
+        Errno::EMLINK,
+        Errno::EMSGSIZE,
         Errno::ENAMETOOLONG,
         Errno::ENODEV,
         Errno::ENOEXEC,
@@ -106,6 +113,8 @@ fn errno_mirrors_v4_catalog() {
         Errno::ENODATA,
         Errno::ENOENT,
         Errno::ENOSYS,
+        Errno::ENOPROTOOPT,
+        Errno::ENOTCONN,
         Errno::ENOTDIR,
         Errno::ENOTEMPTY,
         Errno::ENOTTY,
@@ -113,9 +122,13 @@ fn errno_mirrors_v4_catalog() {
         Errno::EPERM,
         Errno::EPIPE,
         Errno::ERANGE,
+        Errno::EOPNOTSUPP,
         Errno::EROFS,
+        Errno::ENOTSOCK,
+        Errno::EPROTONOSUPPORT,
         Errno::ESPIPE,
         Errno::ESRCH,
+        Errno::ESOCKTNOSUPPORT,
         Errno::ESTALE,
         Errno::ETIMEDOUT,
     ];
@@ -124,8 +137,12 @@ fn errno_mirrors_v4_catalog() {
         match errno {
             Errno::E2BIG
             | Errno::EACCES
+            | Errno::EALREADY
             | Errno::EAGAIN
             | Errno::EBADF
+            | Errno::EADDRINUSE
+            | Errno::EADDRNOTAVAIL
+            | Errno::EAFNOSUPPORT
             | Errno::EBUSY
             | Errno::ECANCELED
             | Errno::EDEADLK
@@ -135,9 +152,13 @@ fn errno_mirrors_v4_catalog() {
             | Errno::EIDRM
             | Errno::EFAULT
             | Errno::EINVAL
+            | Errno::EINPROGRESS
             | Errno::EIO
+            | Errno::EISCONN
             | Errno::EISDIR
             | Errno::ELOOP
+            | Errno::EMLINK
+            | Errno::EMSGSIZE
             | Errno::ENAMETOOLONG
             | Errno::ENODEV
             | Errno::ENOEXEC
@@ -145,6 +166,8 @@ fn errno_mirrors_v4_catalog() {
             | Errno::ENODATA
             | Errno::ENOENT
             | Errno::ENOSYS
+            | Errno::ENOPROTOOPT
+            | Errno::ENOTCONN
             | Errno::ENOTDIR
             | Errno::ENOTEMPTY
             | Errno::ENOTTY
@@ -152,12 +175,16 @@ fn errno_mirrors_v4_catalog() {
             | Errno::EPERM
             | Errno::EPIPE
             | Errno::ERANGE
+            | Errno::EOPNOTSUPP
             | Errno::EROFS
+            | Errno::ENOTSOCK
+            | Errno::EPROTONOSUPPORT
             | Errno::ESPIPE
             | Errno::ESRCH
+            | Errno::EINTR
+            | Errno::ESOCKTNOSUPPORT
             | Errno::ESTALE
-            | Errno::ETIMEDOUT
-            | Errno::EINTR => {}
+            | Errno::ETIMEDOUT => {}
         }
     }
 }

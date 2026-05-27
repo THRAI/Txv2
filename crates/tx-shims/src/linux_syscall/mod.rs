@@ -57,8 +57,8 @@ use tx_observe_types::{
 };
 use tx_scripts::process::exec::{exec_script, exec_script_at, ExecError};
 use tx_subsystems::cred::{
-    Capability, CredChange, Gid, SetgidOp, SetregidOp, SetresgidOp, SetresuidOp, SetreuidOp,
-    SetuidOp, Uid,
+    Capability, CapabilitySet, CredChange, Gid, SetgidOp, SetregidOp, SetresgidOp, SetresuidOp,
+    SetreuidOp, SetuidOp, Uid,
 };
 use tx_subsystems::execution::Errno;
 use tx_subsystems::futex::FutexWakeOp;
@@ -84,10 +84,10 @@ use tx_subsystems::tty::execution::{
 };
 use tx_subsystems::tty::structure::{Termios, Winsize};
 use tx_subsystems::vfs::composite::{
-    AccessOp, ChmodOp, ChownOp, MknodOp, NanosleepOp, RenameOp, StatOp, StatxOp, StatxResult,
+    AccessOp, ChmodOp, ChownOp, MknodOp, NanosleepOp, StatOp, StatxOp, StatxResult,
 };
 use tx_subsystems::vfs::structure::{
-    Credential, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking, StructPayload,
+    Credential, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking, StructPayload, S_ISGID,
 };
 use tx_subsystems::vfs::{
     DEntry, FileFsyncOp, FlockOp, OpenFile, OpenFileGetFlOp, OpenFileSetFlOp, OpenOp,
@@ -102,6 +102,7 @@ pub mod numbers;
 mod cred;
 use cred::*;
 mod time;
+pub use time::poll_due_itimers;
 use time::*;
 mod signal;
 use signal::*;
@@ -111,12 +112,16 @@ mod vm;
 use vm::*;
 pub mod io;
 use io::*;
+mod socket;
+use socket::*;
 pub mod fs_basic;
 use fs_basic::*;
 mod fs_path;
 use fs_path::*;
 mod fs_mut;
 use fs_mut::*;
+mod fs_handle;
+use fs_handle::*;
 pub mod proc;
 use proc::*;
 mod misc;
@@ -142,6 +147,9 @@ mod eventfd;
 use eventfd::*;
 mod timerfd;
 use timerfd::*;
+mod posix_timer;
+pub use posix_timer::poll_due_posix_timers;
+use posix_timer::*;
 mod epoll;
 use epoll::*;
 mod event_notify;
@@ -151,7 +159,6 @@ use splice::*;
 mod xattr;
 use xattr::*;
 mod net;
-use net::*;
 
 mod ctx;
 pub use ctx::*;
@@ -168,6 +175,8 @@ mod helpers;
 pub(super) use helpers::*;
 mod wait;
 pub(super) use wait::*;
+
+pub use time::maybe_deliver_itimer_signal;
 
 #[cfg(test)]
 mod tests;
@@ -267,6 +276,17 @@ pub use numbers::{
 /// across multiple write calls until the userspace-VA copy lane lands.
 pub const TTY_WRITE_MAX_INLINE: usize = 4096;
 
+/// Maximum socket payload bytes staged by a single `read(2)`/`write(2)`
+/// call.
+///
+/// TTY and pipe writes stay capped at one page because they fan into
+/// byte-oriented console/pipe paths. Socket payloads are already
+/// backed by bounded per-socket send/receive buffers, and network
+/// workloads such as iperf naturally issue 64 KiB-ish blocks. Keeping
+/// those blocks intact avoids turning one socket transfer into dozens
+/// of tiny syscalls while still bounding the temporary staging buffer.
+pub const SOCKET_IO_MAX_INLINE: usize = 64 * 1024;
+
 /// Maximum path-name length accepted by `execve(2)` (Linux's
 /// `PATH_MAX`). Mirrors the `TTY_WRITE_MAX_INLINE = 4096` discipline
 /// for inline buffer copies. A longer path returns `-ENAMETOOLONG`
@@ -293,6 +313,10 @@ pub const EXECVE_VEC_MAX: usize = 256;
 /// Used as the `-ENOSYS` magnitude returned from `dispatch` for every
 /// syscall number not handled by Phase 2a / 2b.
 pub(super) const ENOSYS_VALUE: i32 = 38;
+/// Linux generic ABI errno value for "operation not supported" (`EOPNOTSUPP`).
+/// Used when a syscall surface exists but the requested object/clock flavor is
+/// outside txKernel's current emulation contract.
+pub(super) const EOPNOTSUPP_VALUE: i32 = 95;
 pub(super) const ENODEV_VALUE: i32 = 19;
 /// Linux generic ABI errno value for "bad file descriptor" (`EBADF`).
 pub(super) const EBADF_VALUE: i32 = 9;
@@ -306,6 +330,9 @@ pub(super) const EMFILE_VALUE: i32 = 24;
 /// addresses (the canonical `aspace.copy_*_user` lane already
 /// surfaces `Errno::EFAULT`; the dispatcher translates it here).
 pub(super) const EFAULT_VALUE: i32 = 14;
+/// Linux generic ABI errno value for "illegal seek" (`ESPIPE`).
+/// Used by positioned I/O and advice syscalls on pipes/TTY-like files.
+pub(super) const ESPIPE_VALUE: i32 = 29;
 /// Linux generic ABI errno value for "argument list too long" (`E2BIG`).
 /// Used when a syscall argument violates a Phase 2a slice bound (e.g.
 /// `write(len > TTY_WRITE_MAX_INLINE)`).
@@ -368,7 +395,7 @@ pub(super) const EROFS_VALUE: i32 = 30;
 /// cannot produce today (chmod/chown/access never block in
 /// tmpfs/devfs); matches `errno_to_i32`'s `Errno::EIO` row.
 pub(super) const EIO_VALUE: i32 = 5;
-/// Soft `RLIMIT_NOFILE` value exported by `prlimit64`.
+/// Fallback soft `RLIMIT_NOFILE` value used by legacy fd helpers.
 pub(super) const RLIMIT_NOFILE_CUR: u32 = 1024;
 
 pub(super) fn next_fd_below_nofile(
@@ -404,34 +431,31 @@ pub(super) const MINSIGSTKSZ: u64 = 2048;
 /// Size of the kernel `struct sigaction` exchanged via `rt_sigaction`
 /// on RV64 generic ABI.
 ///
-/// Layout decision: Linux's `arch/riscv/include/uapi/asm/signal.h`
-/// pulls in `asm-generic/signal.h`, which defines the kernel
-/// (uapi) `struct sigaction` as four 64-bit fields:
+/// Layout decision: Linux RV64 pulls in `asm-generic/signal.h` without
+/// defining `SA_RESTORER`, so the optional `sa_restorer` field is absent from
+/// the kernel-facing structure. The syscall therefore exchanges three 64-bit
+/// fields:
 ///
 /// ```text
 /// struct sigaction {
 ///     __sighandler_t  sa_handler;   // 8B
 ///     unsigned long   sa_flags;     // 8B
-///     __sigrestore_t  sa_restorer;  // 8B  (present under SA_RESTORER)
 ///     sigset_t        sa_mask;      // 8B  (single u64 bitset, sigsetsize=8)
 /// };
 /// ```
 ///
-/// So the rt_sigaction syscall takes a 32-byte buffer. The plan's
+/// So the rt_sigaction syscall takes a 24-byte buffer. The plan's
 /// "16 bytes" hint applied to the legacy `__OLD_SIGACTION` shape used
 /// by the (deprecated) `sigaction()` syscall — the modern
-/// `rt_sigaction` syscall uses the 32-byte form. We pin the modern
-/// shape because (a) Linux RV64 has no `sigaction()` syscall at all
-/// (it only ships `rt_sigaction`, NR_134) and (b) `__sa_restorer` is
-/// part of the ABI even when SA_RESTORER is unset (kernel reads all
-/// four words and ignores the restorer bits unless the flag is set).
+/// `rt_sigaction` syscall uses the 24-byte RV64 form. We pin the modern
+/// shape because Linux RV64 has no `sigaction()` syscall at all (it only ships
+/// `rt_sigaction`, NR_134), but unlike x86-64 the modern RV64 shape does not
+/// carry an in-struct restorer.
 ///
-/// Citation: linux/include/uapi/asm-generic/signal.h
-/// `struct sigaction { __sighandler_t sa_handler; unsigned long
-///  sa_flags; __ARCH_HAS_SA_RESTORER ? __sigrestore_t sa_restorer;
-///  sigset_t sa_mask; };` — RV64 enables `__ARCH_HAS_SA_RESTORER`
-/// transitively (the field is always emitted at the ABI level).
-pub(super) const SIGACTION_BYTES: usize = 32;
+/// Citation: linux/arch/riscv/include/uapi/asm/signal.h includes
+/// `asm-generic/signal.h`; there `sa_restorer` is guarded by
+/// `#ifdef SA_RESTORER`, and RV64 does not define that macro.
+pub(super) const SIGACTION_BYTES: usize = 24;
 
 /// Per-syscall context resolved by the trap-shell wrapper: the calling
 /// process / thread, the bound address space, and the bookkeeping the
@@ -513,6 +537,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_SETITIMER => return sys_setitimer::<P>(req.args, ctx),
         nr if nr == NR_UMASK => return sys_umask(req.args, ctx),
         nr if nr == NR_UNAME => return sys_uname::<P>(req.args, ctx),
+        nr if nr == NR_SETHOSTNAME => return sys_sethostname(req.args, ctx),
         nr if nr == NR_GETRANDOM => return sys_getrandom(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
         nr if nr == NR_GETRLIMIT => return sys_getrlimit(req.args, ctx),
@@ -591,15 +616,23 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_SPLICE => sys_splice::<P>(req.args, ctx).await,
         nr if nr == NR_TEE => sys_tee(req.args, ctx),
         nr if nr == NR_SOCKET => sys_socket(req.args, ctx),
+        nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx),
         nr if nr == NR_BIND => sys_bind(req.args, ctx),
-        nr if nr == NR_GETSOCKNAME => sys_getsockname(req.args, ctx),
-        nr if nr == NR_SETSOCKOPT => sys_setsockopt(req.args, ctx),
-        nr if nr == NR_SENDTO => sys_sendto(req.args, ctx),
-        nr if nr == NR_RECVFROM => sys_recvfrom(req.args, ctx),
         nr if nr == NR_LISTEN => sys_listen(req.args, ctx),
-        nr if nr == NR_CONNECT => sys_connect(req.args, ctx),
-        nr if nr == NR_ACCEPT => sys_accept(req.args, ctx),
-        nr if nr == NR_ACCEPT4 => sys_accept4(req.args, ctx),
+        nr if nr == NR_ACCEPT => sys_accept::<P>(req.args, ctx).await,
+        nr if nr == NR_ACCEPT4 => sys_accept4::<P>(req.args, ctx).await,
+        nr if nr == NR_CONNECT => sys_connect(req.args, ctx).await,
+        nr if nr == NR_GETSOCKNAME => sys_getsockname(req.args, ctx),
+        nr if nr == NR_GETPEERNAME => sys_getpeername(req.args, ctx),
+        nr if nr == NR_SENDTO => sys_sendto(req.args, ctx).await,
+        nr if nr == NR_RECVFROM => sys_recvfrom::<P>(req.args, ctx).await,
+        nr if nr == NR_SENDMSG => sys_sendmsg(req.args, ctx).await,
+        nr if nr == NR_RECVMSG => sys_recvmsg(req.args, ctx).await,
+        nr if nr == NR_RECVMMSG => sys_recvmmsg::<P>(req.args, ctx).await,
+        nr if nr == NR_SENDMMSG => sys_sendmmsg(req.args, ctx).await,
+        nr if nr == NR_SETSOCKOPT => sys_setsockopt(req.args, ctx),
+        nr if nr == NR_GETSOCKOPT => sys_getsockopt(req.args, ctx),
+        nr if nr == NR_SHUTDOWN => sys_shutdown(req.args, ctx),
         nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
         nr if nr == NR_PPOLL => sys_ppoll::<P>(req.args, ctx).await,
         nr if nr == NR_EXIT => sys_exit(req.args, ctx),
@@ -640,7 +673,10 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
         nr if nr == NR_EXECVEAT => sys_execveat::<P>(req.args, ctx).await,
         nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx).await,
+        nr if nr == NR_UNSHARE => sys_unshare(req.args, ctx),
+        nr if nr == NR_SETNS => sys_setns(req.args, ctx),
         nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
+        nr if nr == NR_GETRUSAGE => sys_getrusage(req.args, ctx),
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
         nr if nr == NR_SETSID => sys_setsid(ctx),
         nr if nr == NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
@@ -653,6 +689,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         // helper through the new `ctx.cred()` accessor.
         nr if nr == NR_SETUID => sys_setuid(req.args, ctx),
         nr if nr == NR_SETGID => sys_setgid(req.args, ctx),
+        nr if nr == NR_SETGROUPS => sys_setgroups(req.args, ctx),
         nr if nr == NR_SETREUID => sys_setreuid(req.args, ctx),
         nr if nr == NR_SETREGID => sys_setregid(req.args, ctx),
         nr if nr == NR_SETRESUID => sys_setresuid(req.args, ctx),
@@ -778,6 +815,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_TIMER_GETOVERRUN => sys_timer_getoverrun(req.args, ctx),
         nr if nr == NR_TIMER_DELETE => sys_timer_delete(req.args, ctx),
         nr if nr == NR_CLOCK_NANOSLEEP => sys_clock_nanosleep::<P>(req.args, ctx).await,
+        nr if nr == NR_SETITIMER => sys_setitimer::<P>(req.args, ctx),
         // Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY
         // routing. Without this, musl's `isatty(STDIN_FILENO)` check
         // returns false, the shell starts in non-interactive mode, no
@@ -799,6 +837,8 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_FSTATFS => sys_fstatfs::<P>(req.args, ctx).await,
         nr if nr == NR_SYNC => sys_sync::<P>(req.args, ctx).await,
         nr if nr == NR_SYNCFS => sys_syncfs::<P>(req.args, ctx).await,
+        nr if nr == NR_SYNC_FILE_RANGE => sys_sync_file_range(req.args, ctx),
+        nr if nr == NR_READAHEAD => sys_readahead(req.args, ctx),
         nr if nr == NR_FSYNC => sys_fsync::<P>(req.args, ctx).await,
         nr if nr == NR_FDATASYNC => sys_fdatasync::<P>(req.args, ctx).await,
         nr if nr == NR_FLOCK => sys_flock::<P>(req.args, ctx).await,
@@ -907,6 +947,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         // existing signalfd. Returns the fd. The companion
         // signalfd-shaped read(2) arm lives in sys_read after the
         // ufd discriminator.
+        nr if nr == NR_SIGNALFD => sys_signalfd(req.args, ctx),
         nr if nr == NR_SIGNALFD4 => sys_signalfd4(
             req.args[0] as i32,
             req.args[1],
@@ -932,6 +973,22 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_TIMERFD_GETTIME => {
             sys_timerfd_gettime::<P>(req.args[0] as u32, req.args[1], ctx)
         }
+        // POSIX timer syscalls.
+        nr if nr == NR_TIMER_CREATE => {
+            sys_timer_create(req.args[0] as u32, req.args[1], req.args[2], ctx)
+        }
+        nr if nr == NR_TIMER_DELETE => sys_timer_delete(req.args[0] as u32, ctx),
+        nr if nr == NR_TIMER_GETOVERRUN => sys_timer_getoverrun(req.args[0] as u32, ctx),
+        nr if nr == NR_TIMER_GETTIME => {
+            sys_timer_gettime::<P>(req.args[0] as u32, req.args[1], ctx)
+        }
+        nr if nr == NR_TIMER_SETTIME => sys_timer_settime::<P>(
+            req.args[0] as u32,
+            req.args[1] as u32,
+            req.args[2],
+            req.args[3],
+            ctx,
+        ),
         // epoll_create1 / epoll_ctl / epoll_pwait — generic Linux
         // numbers used by musl on RV64 and LoongArch64. musl's
         // epoll_wait wrapper calls epoll_pwait with a null mask on
@@ -1057,6 +1114,10 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
     match errno {
         Errno::E2BIG => 7,
         Errno::EACCES => 13,
+        Errno::EALREADY => 114,
+        Errno::EADDRINUSE => 98,
+        Errno::EADDRNOTAVAIL => 99,
+        Errno::EAFNOSUPPORT => 97,
         Errno::EAGAIN => EAGAIN_VALUE,
         Errno::EBADF => EBADF_VALUE,
         Errno::EBUSY => 16,
@@ -1068,9 +1129,13 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
         Errno::EIDRM => 43,
         Errno::EFAULT => 14,
         Errno::EINVAL => 22,
+        Errno::EINPROGRESS => 115,
         Errno::EIO => 5,
+        Errno::EISCONN => 106,
         Errno::EISDIR => 21,
         Errno::ELOOP => 40,
+        Errno::EMLINK => 31,
+        Errno::EMSGSIZE => 90,
         Errno::ENAMETOOLONG => 36,
         Errno::ENODEV => 19,
         Errno::ENODATA => 61,
@@ -1078,6 +1143,8 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
         Errno::ENOMEM => 12,
         Errno::ENOENT => 2,
         Errno::ENOSYS => ENOSYS_VALUE,
+        Errno::ENOPROTOOPT => 92,
+        Errno::ENOTCONN => 107,
         Errno::ENOTDIR => 20,
         Errno::ENOTEMPTY => 39,
         Errno::ENOTTY => 25,
@@ -1085,9 +1152,13 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
         Errno::EPERM => 1,
         Errno::EPIPE => 32,
         Errno::ERANGE => 34,
+        Errno::EOPNOTSUPP => 95,
         Errno::EROFS => 30,
+        Errno::ENOTSOCK => 88,
+        Errno::EPROTONOSUPPORT => 93,
         Errno::ESPIPE => 29,
         Errno::ESRCH => 3,
+        Errno::ESOCKTNOSUPPORT => 94,
         Errno::ESTALE => 116,
         Errno::ETIMEDOUT => 110,
         Errno::EINTR => 4,
@@ -1181,16 +1252,17 @@ fn emit_syscall_exit(span: SpanId, result: &SyscallResult) {
     };
     // result_kind: 0=Ok, 1=Err, 2=Restart, 3=Fatal, 4=NoReturn (per
     // OBSERVATION_SERIALIZATION_v0 §8.1). `ExecCommitted` and
-    // `SigreturnRestored` are kernel-internal control-flow markers that
-    // never surface as a userspace return value; classify both as NoReturn
-    // for the trace so the daemon's syscall slice closes cleanly even
-    // though no `a0` write occurs.
+    // `Sigreturn*` are kernel-internal control-flow markers that never
+    // surface as a userspace return value; classify them as NoReturn for
+    // the trace so the daemon's syscall slice closes cleanly even though
+    // no `a0` write occurs.
     let (ret, errno, result_kind) = match result {
         SyscallResult::Return(v) => (*v, 0, 0u8),
         SyscallResult::Error(e) => (0, *e, 1u8),
         SyscallResult::NoReturn => (0, 0, 4u8),
         SyscallResult::ExecCommitted => (0, 0, 4u8),
         SyscallResult::SigreturnRestored => (0, 0, 4u8),
+        SyscallResult::SigreturnContextRestored => (0, 0, 4u8),
     };
     let payload = PayloadSyscallExit {
         ret,

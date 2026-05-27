@@ -1,0 +1,10 @@
+# busybox-iperf3-reverse-tcp-oneshot.txt — isolate iperf3 TCP reverse mode.
+wait "/ # " within 20000
+sleep 500
+send "/bin/iperf3 -s -1 -p 5001 &\n"
+expect "/ # " within 10000
+sleep 500
+send "ok='N70_IPERF3_REVERSE_TCP_ONESHOT_suc''cess'; fail='N70_IPERF3_REVERSE_TCP_ONESHOT_fa''il'; if /bin/iperf3 -c 127.0.0.1 -p 5001 -t 2 -i 0 -R; then echo \"$ok\"; else echo \"$fail\"; fi\n"
+expect "N70_IPERF3_REVERSE_TCP_ONESHOT_success" within 60000
+sleep 500
+quit

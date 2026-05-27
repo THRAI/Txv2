@@ -1,0 +1,52 @@
+# busybox-iperf3-oscomp-suite.txt — OSComp iperf-musl parity probe.
+#
+# Mirrors the official iperf_testcode.sh shape with explicit success sentinels.
+
+wait "/ # " within 30000
+sleep 500
+
+send "echo \"#### OS COMP TEST GROUP START iperf-musl ####\"\n"
+expect "#### OS COMP TEST GROUP START iperf-musl ####" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "/bin/iperf3 -s -p 5001 -D\n"
+expect "/ # " within 10000
+sleep 1500
+
+send "ok='====== iperf BASIC_UDP end: suc''cess ======'; fail='====== iperf BASIC_UDP end: fa''il ======'; echo \"====== iperf BASIC_UDP begin ======\"; if /bin/iperf3 -c 127.0.0.1 -p 5001 -t 2 -i 0 -u -b 1000G; then echo \"$ok\"; else echo \"$fail\"; fi\n"
+expect "====== iperf BASIC_UDP end: success ======" within 120000
+expect "/ # " within 10000
+
+sleep 500
+send "ok='====== iperf BASIC_TCP end: suc''cess ======'; fail='====== iperf BASIC_TCP end: fa''il ======'; echo \"====== iperf BASIC_TCP begin ======\"; if /bin/iperf3 -c 127.0.0.1 -p 5001 -t 2 -i 0; then echo \"$ok\"; else echo \"$fail\"; fi\n"
+expect "====== iperf BASIC_TCP end: success ======" within 120000
+expect "/ # " within 10000
+
+sleep 500
+send "ok='====== iperf PARALLEL_UDP end: suc''cess ======'; fail='====== iperf PARALLEL_UDP end: fa''il ======'; echo \"====== iperf PARALLEL_UDP begin ======\"; if /bin/iperf3 -c 127.0.0.1 -p 5001 -t 2 -i 0 -u -P 5 -b 1000G; then echo \"$ok\"; else echo \"$fail\"; fi\n"
+expect "====== iperf PARALLEL_UDP end: success ======" within 120000
+expect "/ # " within 10000
+
+sleep 500
+send "ok='====== iperf PARALLEL_TCP end: suc''cess ======'; fail='====== iperf PARALLEL_TCP end: fa''il ======'; echo \"====== iperf PARALLEL_TCP begin ======\"; if /bin/iperf3 -c 127.0.0.1 -p 5001 -t 2 -i 0 -P 5; then echo \"$ok\"; else echo \"$fail\"; fi\n"
+expect "====== iperf PARALLEL_TCP end: success ======" within 120000
+expect "/ # " within 10000
+
+sleep 500
+send "ok='====== iperf REVERSE_UDP end: suc''cess ======'; fail='====== iperf REVERSE_UDP end: fa''il ======'; echo \"====== iperf REVERSE_UDP begin ======\"; if /bin/iperf3 -c 127.0.0.1 -p 5001 -t 2 -i 0 -u -R -b 1000G; then echo \"$ok\"; else echo \"$fail\"; fi\n"
+expect "====== iperf REVERSE_UDP end: success ======" within 120000
+expect "/ # " within 10000
+
+sleep 500
+send "ok='====== iperf REVERSE_TCP end: suc''cess ======'; fail='====== iperf REVERSE_TCP end: fa''il ======'; echo \"====== iperf REVERSE_TCP begin ======\"; if /bin/iperf3 -c 127.0.0.1 -p 5001 -t 2 -i 0 -R; then echo \"$ok\"; else echo \"$fail\"; fi\n"
+expect "====== iperf REVERSE_TCP end: success ======" within 120000
+expect "/ # " within 10000
+
+sleep 500
+send "echo \"#### OS COMP TEST GROUP END iperf-musl ####\"\n"
+expect "#### OS COMP TEST GROUP END iperf-musl ####" within 10000
+expect "/ # " within 10000
+
+sleep 500
+quit

@@ -4,6 +4,15 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use alloc::collections::{BTreeMap, BTreeSet};
+use core::mem::{offset_of, size_of};
+
+use crate::adapter::step_engine::{Cap, SpinMutex};
+use tx_subsystems::process::ProcessIdentity;
+
+use tx_hal::{UserSaFlagsAbi, UserSigInfoAbi, UserSignalMaskAbi, UserTrapContext};
+use tx_subsystems::signal::step_kill_process;
+use tx_subsystems::thread_runtime::ThreadIdentity;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -744,6 +753,43 @@ pub(super) fn sys_clock_getres<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     SyscallResult::Return(0)
 }
 
+/// `clock_getres(clk_id, res)`. Linux RV64 generic ABI
+/// `__NR_clock_getres = 114`.
+///
+/// The hardware time source can be read at nanosecond scale, but the
+/// userspace-visible sleep wakeup path is scheduler/timer-wheel driven and is
+/// currently millisecond-ish under QEMU. Report that effective resolution so
+/// timer conformance tests do not assume a high-resolution wakeup guarantee we
+/// do not actually provide yet.
+pub(super) fn sys_clock_getres<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let clk_id = args[0] as u32;
+    let res_uaddr = args[1];
+    match clk_id {
+        CLOCK_REALTIME
+        | CLOCK_REALTIME_COARSE
+        | CLOCK_REALTIME_ALARM
+        | CLOCK_TAI
+        | CLOCK_MONOTONIC
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME
+        | CLOCK_BOOTTIME_ALARM => {}
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    }
+    if res_uaddr != 0 {
+        let ts = TimespecLayout {
+            tv_sec: 0,
+            tv_nsec: CLOCK_GETRES_NS,
+        };
+        if let Err(errno) = bootstrap_write_user::<TimespecLayout>(&ctx.aspace, res_uaddr, ts) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    SyscallResult::Return(0)
+}
+
 /// `gettimeofday(tv, tz)`. Linux RV64 generic ABI
 /// `__NR_gettimeofday = 169`.
 ///
@@ -1025,6 +1071,185 @@ pub(super) fn sys_times<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     SyscallResult::Return(ticks)
 }
 
+pub(super) async fn sleep_until_deadline<'a, P: TimeIf>(
+    deadline_ns: u64,
+    original_ns: u64,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+
+    if <P as TimeIf>::read_ns() < deadline_ns {
+        let remaining_ns = deadline_ns.saturating_sub(<P as TimeIf>::read_ns());
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mailbox_arc = script_ctx.mailbox().cloned();
+        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+        let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+        let op = NanosleepOp {
+            nanos: original_ns.min(remaining_ns),
+            deadline_ns,
+            started: false,
+        };
+        match drive(
+            op,
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox_arc.as_ref(),
+            delegate_registry_arc.as_deref(),
+            timer_wheel_arc.as_ref(),
+        )
+        .await
+        {
+            Ok(()) => return SyscallResult::Return(0),
+            Err(v3errno) => {
+                let errno = v3errno;
+                if errno == Errno::EINTR {
+                    return SyscallResult::Error(EINTR_VALUE);
+                }
+                return SyscallResult::error_from(errno);
+            }
+        }
+    }
+    SyscallResult::Return(0)
+}
+
+pub(super) fn itimer_real_deadline_ns(pid: u32) -> Option<u64> {
+    with_interval_timers(|timers| {
+        timers
+            .get(&(pid, ITIMER_REAL))
+            .and_then(|timer| (timer.deadline_ns != 0).then_some(timer.deadline_ns))
+    })
+}
+
+pub(super) fn consume_itimer_real_delivered_interrupt(pid: u32) -> bool {
+    ITIMER_REAL_DELIVERED_INTERRUPTS.lock().remove(&pid)
+}
+
+fn take_due_itimer_real<P: TimeIf>(pid: u32) -> bool {
+    with_interval_timers(|timers| {
+        let key = (pid, ITIMER_REAL);
+        let Some(timer) = timers.get_mut(&key) else {
+            return false;
+        };
+        let now_ns = P::read_ns();
+        if timer.deadline_ns == 0 || timer.deadline_ns > now_ns {
+            return false;
+        }
+        if timer.interval_ns == 0 {
+            timers.remove(&key);
+        } else {
+            timer.deadline_ns = now_ns.saturating_add(timer.interval_ns);
+        }
+        true
+    })
+}
+
+pub fn maybe_deliver_itimer_signal<P: TimeIf>(
+    mut ctx: UserTrapContext,
+    process: &Cap<ProcessIdentity>,
+    thread: &Cap<ThreadIdentity>,
+    aspace: &AddressSpace,
+) -> UserTrapContext {
+    let Some(thread_payload) = thread.payload_cap() else {
+        return ctx;
+    };
+    if thread_payload.has_saved_signal_context() {
+        return ctx;
+    }
+    if !take_due_itimer_real::<P>(process.pid.0) {
+        return ctx;
+    }
+    ITIMER_REAL_DELIVERED_INTERRUPTS
+        .lock()
+        .insert(process.pid.0);
+
+    let Some(sig) = Signum::new(SIGALRM_RAW) else {
+        return ctx;
+    };
+    let Some(SigDisposition::Handler(handler)) = process.sig_disposition(sig) else {
+        let _ = step_kill_process(process, sig, None);
+        return ctx;
+    };
+
+    let Some(frame_addr) = ctx.regs[2]
+        .checked_sub(size_of::<CompatSignalFrame>())
+        .map(|addr| align_down(addr, RV64_SIGFRAME_ALIGN))
+    else {
+        return ctx;
+    };
+
+    let siginfo_addr = frame_addr + offset_of!(CompatSignalFrame, siginfo);
+    let ucontext_addr = frame_addr + offset_of!(CompatSignalFrame, user_context);
+    let trampoline_pc = frame_addr + offset_of!(CompatSignalFrame, trampoline);
+    let return_pc = sigaction_restorer(process.pid.0, sig).unwrap_or(trampoline_pc);
+    let frame = CompatSignalFrame {
+        magic: RV64_SIGFRAME_MAGIC,
+        version: RV64_SIGFRAME_VERSION,
+        frame_size: size_of::<CompatSignalFrame>() as u32,
+        sig_no: u32::from(SIGALRM_RAW),
+        _reserved0: 0,
+        flags: UserSaFlagsAbi::EMPTY.bits,
+        siginfo: UserSigInfoAbi::ZERO,
+        saved_mask: UserSignalMaskAbi {
+            bits: thread_payload.signal_mask().raw_bits(),
+        },
+        user_context: ctx,
+        trampoline: RV64_SIGRETURN_TRAMPOLINE,
+    };
+
+    if bootstrap_write_user::<CompatSignalFrame>(aspace, frame_addr as u64, frame).is_err() {
+        return ctx;
+    }
+    if return_pc == trampoline_pc {
+        let Ok(trampoline_range) = UserRange::containing_page(UserVirtAddr::new(trampoline_pc))
+        else {
+            return ctx;
+        };
+        if aspace
+            .pmap()
+            .protect_range(trampoline_range, Prot::new(true, true, true))
+            .is_err()
+        {
+            return ctx;
+        }
+    }
+
+    ctx.pc = handler;
+    ctx.regs[1] = return_pc;
+    ctx.regs[2] = frame_addr;
+    ctx.regs[10] = usize::from(SIGALRM_RAW);
+    ctx.regs[11] = siginfo_addr;
+    ctx.regs[12] = ucontext_addr;
+    thread_payload.store_saved_signal_context(Some(frame.user_context));
+    ctx
+}
+
+pub(super) fn read_compat_signal_frame(
+    aspace: &AddressSpace,
+    frame_addr: u64,
+) -> Result<CompatSignalFrame, i32> {
+    let frame =
+        bootstrap_read_user::<CompatSignalFrame>(aspace, frame_addr).map_err(errno_to_i32)?;
+    if frame.magic != RV64_SIGFRAME_MAGIC
+        || frame.version != RV64_SIGFRAME_VERSION
+        || frame.frame_size as usize != size_of::<CompatSignalFrame>()
+        || frame.trampoline != RV64_SIGRETURN_TRAMPOLINE
+    {
+        return Err(EINVAL_VALUE);
+    }
+    Ok(frame)
+}
+
+const fn align_down(value: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    value & !(align - 1)
+}
+
+#[cfg(test)]
+pub(super) fn reset_itimer_registry_for_test() {
+    with_interval_timers(|timers| timers.clear());
+    ITIMER_REAL_DELIVERED_INTERRUPTS.lock().clear();
+}
 /// `nanosleep(req, rem)`. Linux RV64 generic ABI
 /// `__NR_nanosleep = 101`.
 ///
@@ -1042,10 +1267,10 @@ pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
     let req_uaddr = args[0];
-    let req_ns = match read_timespec_at(&ctx.aspace, req_uaddr) {
-        Some(ns) => ns,
-        None if req_uaddr == 0 => return SyscallResult::Error(EFAULT_VALUE),
-        None => return SyscallResult::Error(EINVAL_VALUE),
+    let rem_uaddr = args[1];
+    let req_ns = match read_timespec_ns_checked(&ctx.aspace, req_uaddr) {
+        Ok(ns) => ns,
+        Err(result) => return result,
     };
     if req_ns == 0 {
         return SyscallResult::Return(0);
@@ -1068,25 +1293,29 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
     let clk_id = args[0] as u32;
     let flags = args[1] as u32;
     let req_uaddr = args[2];
+    let rem_uaddr = args[3];
 
     match clk_id {
         CLOCK_REALTIME
         | CLOCK_MONOTONIC
-        | CLOCK_PROCESS_CPUTIME_ID
-        | CLOCK_THREAD_CPUTIME_ID
         | CLOCK_MONOTONIC_RAW
         | CLOCK_REALTIME_COARSE
+        | CLOCK_REALTIME_ALARM
+        | CLOCK_TAI
         | CLOCK_MONOTONIC_COARSE
-        | CLOCK_BOOTTIME => {}
+        | CLOCK_BOOTTIME
+        | CLOCK_BOOTTIME_ALARM => {}
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
+            return SyscallResult::Error(EOPNOTSUPP_VALUE);
+        }
         _ => return SyscallResult::Error(EINVAL_VALUE),
     }
     if (flags & !TIMER_ABSTIME) != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let req_ns = match read_timespec_at(&ctx.aspace, req_uaddr) {
-        Some(ns) => ns,
-        None if req_uaddr == 0 => return SyscallResult::Error(EFAULT_VALUE),
-        None => return SyscallResult::Error(EINVAL_VALUE),
+    let req_ns = match read_timespec_ns_checked(&ctx.aspace, req_uaddr) {
+        Ok(ns) => ns,
+        Err(result) => return result,
     };
     if (flags & TIMER_ABSTIME) != 0 && (clk_id == CLOCK_REALTIME || clk_id == CLOCK_REALTIME_COARSE)
     {

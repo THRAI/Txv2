@@ -7,12 +7,20 @@ use crate::procfs::{
 };
 use alloc::format;
 use alloc::string::String;
+use tx_subsystems::net::NetNamespacePayload;
+use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use tx_subsystems::process::{self, Pid};
 use tx_subsystems::vfs::FsObjectId;
 
-pub fn render(fs_object_id: FsObjectId) -> String {
+pub fn render_with_netns(
+    fs_object_id: FsObjectId,
+    caller_netns: Option<&NetNamespacePayload>,
+) -> String {
     if let Some(pid) = pid_from_stat_id(fs_object_id) {
         return render_stat(pid);
+    }
+    if let Some((pid, tid)) = task_from_stat_id(fs_object_id) {
+        return render_thread_stat(pid, tid);
     }
     if let Some(pid) = pid_from_cmdline_id(fs_object_id) {
         return render_cmdline(pid);
@@ -32,13 +40,31 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_SYSVIPC_MSG_ID => render_sysvipc_msg(),
         PROCFS_SYSVIPC_SEM_ID => render_sysvipc_sem(),
         PROCFS_SYSVIPC_SHM_ID => render_sysvipc_shm(),
+        PROCFS_NET_ROUTE_ID => render_net_route(caller_netns),
+        PROCFS_NET_ARP_ID => render_net_arp(caller_netns),
+        PROCFS_NET_DEV_ID => render_net_dev(caller_netns),
+        PROCFS_NET_TX_NF_RULES_ID => render_netfilter_rules(caller_netns),
+        PROCFS_NET_NF_CONNTRACK_ID => render_nf_conntrack(caller_netns),
+        PROCFS_NET_TCP_ID => render_net_socket_table("tcp"),
+        PROCFS_NET_UDP_ID => render_net_socket_table("udp"),
+        PROCFS_NET_RAW_ID => render_net_socket_table("raw"),
+        PROCFS_NET_SNMP_ID => render_net_snmp(),
+        PROCFS_NET_NETLINK_ID => render_net_netlink(),
+        PROCFS_NET_IF_INET6_ID => String::new(),
+        PROCFS_SYS_NET_IPV4_IP_FORWARD_ID => render_ip_forward(caller_netns),
         _ => String::new(),
     }
 }
 
 fn render_stat(pid: Pid) -> String {
     let Some(proc) = process::process_by_pid(pid) else {
-        return String::new();
+        return match resolve_pid_number_as(pid.0 as u64, PidNameKind::Thread) {
+            Some(PidName::Thread(thread)) => match thread.upgrade_owner_proc() {
+                Some(owner) => render_thread_stat(owner.pid, pid.0),
+                None => render_stat_line(pid.0, "?", 'Z', 0, 0, 0),
+            },
+            _ => render_stat_line(pid.0, "?", 'Z', 0, 0, 0),
+        };
     };
     let ppid = proc.parent_pid();
     let pgrp = proc.pgrp_cap().pgid;
@@ -50,14 +76,45 @@ fn render_stat(pid: Pid) -> String {
 
     let state = proc.state_char() as char;
 
-    alloc::format!(
-        "{} ({}) {} {} {} {}\n",
-        pid.0,
+    render_stat_line(pid.0, comm, state, ppid.0, pgrp.0, session.0)
+}
+
+fn render_thread_stat(pid: Pid, tid: u32) -> String {
+    let Some(proc) = process::process_by_pid(pid) else {
+        return render_stat_line(tid, "?", 'Z', 0, 0, 0);
+    };
+    let Some(thread) = proc.thread_by_tid(tid) else {
+        return render_stat_line(tid, "?", 'Z', 0, 0, 0);
+    };
+    let ppid = proc.parent_pid();
+    let pgrp = proc.pgrp_cap().pgid;
+    let session = proc.pgrp_cap().session_cap().sid;
+
+    let buf = proc.comm();
+    let comm =
+        core::str::from_utf8(&buf[..buf.iter().position(|&b| b == 0).unwrap_or(16)]).unwrap_or("?");
+
+    render_stat_line(
+        tid,
         comm,
-        state,
+        thread.proc_state_char() as char,
         ppid.0,
         pgrp.0,
-        session.0
+        session.0,
+    )
+}
+
+fn render_stat_line(
+    pid: u32,
+    comm: &str,
+    state: char,
+    ppid: u32,
+    pgrp: u32,
+    session: u32,
+) -> String {
+    alloc::format!(
+        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        pid, comm, state, ppid, pgrp, session
     )
 }
 
@@ -246,4 +303,81 @@ fn render_sysvipc_shm() -> String {
         ));
     }
     out
+}
+
+fn render_net_route(caller_netns: Option<&NetNamespacePayload>) -> String {
+    with_proc_netns(
+        caller_netns,
+        tx_subsystems::net::proc_net_route_snapshot_text,
+    )
+}
+
+fn render_net_arp(caller_netns: Option<&NetNamespacePayload>) -> String {
+    with_proc_netns(caller_netns, |netns| {
+        tx_subsystems::net::proc_net_arp_snapshot_zero_text(&netns.ether_ifaces_snapshot())
+    })
+}
+
+fn render_net_dev(caller_netns: Option<&NetNamespacePayload>) -> String {
+    with_proc_netns(
+        caller_netns,
+        tx_subsystems::net::proc_net_dev_snapshot_text_for_namespace,
+    )
+}
+
+fn render_netfilter_rules(caller_netns: Option<&NetNamespacePayload>) -> String {
+    with_proc_netns(
+        caller_netns,
+        tx_subsystems::net::proc_net_netfilter_rules_text_for_namespace,
+    )
+}
+
+fn render_nf_conntrack(caller_netns: Option<&NetNamespacePayload>) -> String {
+    with_proc_netns(
+        caller_netns,
+        tx_subsystems::net::proc_net_nf_conntrack_text_for_namespace,
+    )
+}
+
+fn render_net_socket_table(_kind: &'static str) -> String {
+    String::from("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
+}
+
+fn render_net_snmp() -> String {
+    String::from(
+        "Ip: Forwarding DefaultTTL InReceives InHdrErrors InAddrErrors ForwDatagrams InUnknownProtos InDiscards InDelivers OutRequests OutDiscards OutNoRoutes ReasmTimeout ReasmReqds ReasmOKs ReasmFails FragOKs FragFails FragCreates\n\
+Ip: 0 64 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+Icmp: InMsgs InErrors InCsumErrors InDestUnreachs InTimeExcds InParmProbs InSrcQuenchs InRedirects InEchos InEchoReps InTimestamps InTimestampReps InAddrMasks InAddrMaskReps OutMsgs OutErrors OutDestUnreachs OutTimeExcds OutParmProbs OutSrcQuenchs OutRedirects OutEchos OutEchoReps OutTimestamps OutTimestampReps OutAddrMasks OutAddrMaskReps\n\
+Icmp: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails EstabResets CurrEstab InSegs OutSegs RetransSegs InErrs OutRsts InCsumErrors\n\
+Tcp: 1 200 120000 -1 0 0 0 0 0 0 0 0 0 0 0\n\
+Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors\n\
+Udp: 0 0 0 0 0 0 0 0 0\n",
+    )
+}
+
+fn render_net_netlink() -> String {
+    String::from("sk       Eth Pid    Groups   Rmem     Wmem     Dump  Locks    Drops    Inode\n")
+}
+
+fn render_ip_forward(caller_netns: Option<&NetNamespacePayload>) -> String {
+    let enabled = with_proc_netns(caller_netns, |netns| netns.ipv4_forwarding_enabled());
+    if enabled {
+        String::from("1\n")
+    } else {
+        String::from("0\n")
+    }
+}
+
+fn with_proc_netns<T>(
+    caller_netns: Option<&NetNamespacePayload>,
+    render: impl FnOnce(&NetNamespacePayload) -> T,
+) -> T {
+    match caller_netns {
+        Some(netns) => render(netns),
+        None => {
+            let netns = tx_subsystems::net::initial_net_namespace_payload();
+            render(&netns)
+        }
+    }
 }

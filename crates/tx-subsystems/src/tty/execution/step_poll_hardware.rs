@@ -54,12 +54,12 @@ pub fn step_poll_hardware_input(
 
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     let binding = match &payload.transport {
         TtyTransport::Hardware { binding } => *binding,
-        TtyTransport::Pty { .. } => return V3::Err(Errno::EINVAL.into()),
+        TtyTransport::Pty { .. } => return V3::Err(Errno::EINVAL),
     };
 
     // Helper: dispatch ingest's v3 outcome up into our v3 outcome.

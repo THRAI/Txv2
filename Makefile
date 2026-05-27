@@ -151,9 +151,43 @@ OSCOMP_OUT_LA ?= target/oscomp/os_serial_out_la.txt
 OSCOMP_OUT_LA_SMP4 ?= target/oscomp/os_serial_out_la_smp4.txt
 OSCOMP_GROUPS ?=
 OSCOMP_LIBCTEST ?=
+OSCOMP_LTP ?=
+
+# LTP local testing shortcuts:
+#
+# 1. Run the full ltp-musl image payload:
+#      make oscomp-local-rv64-ltp-musl
+#
+# 2. Run one or a few individual LTP cases:
+#      make oscomp-local-rv64 OSCOMP_LTP=umask01
+#      make oscomp-local-rv64 OSCOMP_LTP=open01,stat02
+#
+# 3. Run a Txv2 syscalls sub-batch. These batches split only
+#    /musl/ltp/runtest/syscalls by case prefix, and the guest expands the
+#    short "ltp-batch:<name>" selector from hard-coded lists in exec.rs.
+#      make ltp-batches
+#      make ltp-batch-cases LTP_BATCH=vfs
+#      make oscomp-local-rv64-ltp-batch LTP_BATCH=vfs
+#
+# 4. Run an LTP native runtest module outside syscalls. The guest receives
+#    "ltp-runtest:<module>", reads /musl/musl/ltp/runtest/<module>, and
+#    executes each original runtest command, preserving arguments.
+#      make ltp-runtests
+#      make ltp-runtest-cases LTP_RUNTEST=fs
+#      make oscomp-local-rv64-ltp-runtest LTP_RUNTEST=fs
+#
+# Add an outer timeout for exploratory runs, for example:
+#      timeout 1800s make oscomp-local-rv64-ltp-batch LTP_BATCH=vfs
+#      timeout 1800s make oscomp-local-rv64-ltp-runtest LTP_RUNTEST=fs
+LTP_BATCH ?= p0
+LTP_BATCH_TOOL ?= python3 tools/ltp-batches.py
+LTP_BATCH_REFRESH ?= --refresh
+LTP_RUNTEST ?= smoketest
+LTP_RUNTEST_TOOL ?= python3 tools/ltp-runtests.py
 COMMA := ,
 OSCOMP_LIBCTEST_GROUP = libctest-musl:$(subst $(COMMA),+,$(OSCOMP_LIBCTEST))
-OSCOMP_EFFECTIVE_GROUPS = $(if $(strip $(OSCOMP_LIBCTEST)),$(OSCOMP_LIBCTEST_GROUP),$(OSCOMP_GROUPS))
+OSCOMP_LTP_GROUP = $(if $(strip $(OSCOMP_LTP)),ltp-musl:$(subst $(COMMA),+,$(OSCOMP_LTP)),ltp-musl)
+OSCOMP_EFFECTIVE_GROUPS = $(if $(strip $(OSCOMP_LIBCTEST)),$(OSCOMP_LIBCTEST_GROUP),$(if $(strip $(OSCOMP_LTP)),$(OSCOMP_LTP_GROUP),$(OSCOMP_GROUPS)))
 OSCOMP_CMDLINE = $(strip $(if $(strip $(OSCOMP_EFFECTIVE_GROUPS)),tx.oscomp.groups=$(OSCOMP_EFFECTIVE_GROUPS),))
 OSCOMP_APPEND_RV = $(if $(strip $(OSCOMP_CMDLINE)),-append '$(OSCOMP_CMDLINE)',)
 OSCOMP_APPEND_LA = $(if $(strip $(OSCOMP_CMDLINE)),-fw_cfg name=opt/cmdline$(COMMA)string='$(OSCOMP_CMDLINE)',)

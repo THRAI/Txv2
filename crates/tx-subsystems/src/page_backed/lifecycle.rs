@@ -94,7 +94,7 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
     let mut pages_so_far: u32 = 0;
     for (page, ppn) in pc.dirty_pages_snapshot() {
         let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
-            return V3::err(Errno::EINVAL.into());
+            return V3::err(Errno::EINVAL);
         };
         match mount.payload().fs_page_backing.flush_page(
             *fs_object_id,
@@ -171,10 +171,11 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
 ///
 /// - `Device` / new_size > capacity → `Err(EINVAL)`
 /// - fs `Done(())` then post-fs work → `Done(())`
-/// - fs `Advanced(())` then post-fs work → `Continue { progress:
-///   PageProgress::EMPTY }` (rerun, no page count to expose — see note)
-/// - fs `Blocked(token)` → `Yield { progress: PageProgress::EMPTY, … }`
-/// - fs `AdvancedThenBlocked((), token)` → `Yield { progress:
+/// - fs progress-only completion then post-fs work → `Continue {
+///   progress: PageProgress::EMPTY }` (rerun, no page count to expose —
+///   see note)
+/// - fs carrier wait → `Yield { progress: PageProgress::EMPTY, … }`
+/// - fs progress plus carrier wait → `Yield { progress:
 ///   PageProgress::EMPTY, … }` (see note)
 /// - fs `Err(e)` → `Err(e)`
 ///
@@ -196,14 +197,14 @@ pub fn step_truncate(
     use crate::page_backed::adapter::step_engine::StepOutcome as V3;
 
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     }
 
     let Some(capacity) = pc.byte_capacity() else {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     };
     if new_size > capacity {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     }
 
     let fs_advanced = match pc.kind() {
@@ -241,7 +242,7 @@ pub fn step_truncate(
 
     if new_size < old_size {
         let Some(first_drop) = first_page_after_size(new_size) else {
-            return V3::err(Errno::EINVAL.into());
+            return V3::err(Errno::EINVAL);
         };
         pc.withdraw_cached_pages_from(first_drop);
         zero_partial_eof_tail(pc, new_size);
@@ -267,14 +268,14 @@ pub fn step_fallocate(
     use crate::page_backed::adapter::step_engine::StepOutcome as V3;
 
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     }
 
     let Some(capacity) = pc.byte_capacity() else {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     };
     if new_size > capacity {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     }
 
     if new_size <= pc.size_bytes() {
@@ -442,7 +443,7 @@ mod v3_tests {
         fn failing_truncate(errno: V4Errno) -> Self {
             use crate::page_backed::adapter::step_engine::StepOutcome as V3;
             Self {
-                truncate_outcome: V3::err(errno.into()),
+                truncate_outcome: V3::err(errno),
                 ..Self::new()
             }
         }

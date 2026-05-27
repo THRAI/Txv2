@@ -51,7 +51,7 @@ impl LifecycleFs {
 
     fn failing_fallocate(errno: Errno) -> Self {
         Self {
-            fallocate_outcome: V3Outcome::err(errno.into()),
+            fallocate_outcome: V3Outcome::err(errno),
             ..Self::new()
         }
     }
@@ -65,7 +65,7 @@ impl LifecycleFs {
 
     fn failing_truncate(errno: Errno) -> Self {
         Self {
-            truncate_outcome: V3Outcome::err(errno.into()),
+            truncate_outcome: V3Outcome::err(errno),
             ..Self::new()
         }
     }
@@ -200,7 +200,7 @@ fn pagebacked_step_truncate_leaves_state_unchanged_when_file_backing_fails() {
 
     assert_eq!(
         step_truncate(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
-        V3Out::Err(Errno::EROFS.into())
+        V3Out::Err(Errno::EROFS)
     );
 
     assert_eq!(pc.size_bytes(), original_size);
@@ -229,13 +229,10 @@ fn pagebacked_step_truncate_rejects_device_and_capacity_growth() {
         1,
     );
 
-    assert_eq!(
-        step_truncate(&device, 0, &guard),
-        V3Out::Err(Errno::EINVAL.into())
-    );
+    assert_eq!(step_truncate(&device, 0, &guard), V3Out::Err(Errno::EINVAL));
     assert_eq!(
         step_truncate(&anon, 2 * crate::vm::USER_PAGE_SIZE as u64, &guard),
-        V3Out::Err(Errno::EINVAL.into())
+        V3Out::Err(Errno::EINVAL)
     );
 }
 
@@ -469,7 +466,7 @@ fn pagebacked_step_fallocate_leaves_state_unchanged_when_file_backing_fails() {
 
     assert_eq!(
         step_fallocate(&pc, 2 * crate::vm::USER_PAGE_SIZE as u64, &guard),
-        V3Out::Err(Errno::EDQUOT.into())
+        V3Out::Err(Errno::EDQUOT)
     );
 
     assert_eq!(fs.fallocates.load(Ordering::Acquire), 1);
@@ -493,7 +490,7 @@ fn pagebacked_step_fallocate_rejects_device_and_capacity_growth() {
 
     assert_eq!(
         step_fallocate(&device, 16, &guard),
-        V3Out::Err(Errno::EINVAL.into())
+        V3Out::Err(Errno::EINVAL)
     );
 
     let anon = PageContainer::new(
@@ -505,7 +502,7 @@ fn pagebacked_step_fallocate_rejects_device_and_capacity_growth() {
     let beyond = 3 * crate::vm::USER_PAGE_SIZE as u64;
     assert_eq!(
         step_fallocate(&anon, beyond, &guard),
-        V3Out::Err(Errno::EINVAL.into())
+        V3Out::Err(Errno::EINVAL)
     );
     assert_eq!(anon.size_bytes(), 2 * crate::vm::USER_PAGE_SIZE as u64);
 }

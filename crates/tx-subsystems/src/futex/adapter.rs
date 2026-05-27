@@ -86,8 +86,8 @@ pub mod wait_routing {
     /// coexistence wake path.
     ///
     /// Delegates to `tx_reactor::wait::fire_legacy`.
-    pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) {
-        tx_reactor::wait::fire_legacy(channel, mask_bits);
+    pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) -> usize {
+        tx_reactor::wait::fire_legacy(channel, mask_bits)
     }
 
     /// Notify the v3 `WaitSource` for one futex bucket — D2

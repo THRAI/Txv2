@@ -17,7 +17,7 @@ use crate::execution::Guard;
 use crate::mount::{MountNamespace, MountPayload};
 use crate::vfs::adapter::step_engine::{self, Cap, StepOutcome};
 use crate::vfs::structure::{
-    Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking,
+    Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_ISVTX,
 };
 use crate::vfs::walker::{self, SYMLOOP_MAX};
 use crate::vfs::FsOps;
@@ -207,11 +207,7 @@ pub fn kernel_step(
                     token,
                 );
             }
-            StepOutcome::Err(e) => {
-                return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(
-                    e,
-                )))
-            }
+            StepOutcome::Err(e) => return KernelStep::Error(WalkCause::FsOpsRejected(e)),
             StepOutcome::Continue { .. } => {
                 // Re-enter lookup (v3 continue without yield).
                 return KernelStep::Continue(WalkState::Walking(WalkingState {
@@ -244,11 +240,7 @@ pub fn kernel_step(
                     token,
                 );
             }
-            StepOutcome::Err(e) => {
-                return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(
-                    e,
-                )))
-            }
+            StepOutcome::Err(e) => return KernelStep::Error(WalkCause::FsOpsRejected(e)),
             StepOutcome::Continue { .. } => {
                 return KernelStep::Continue(WalkState::Walking(WalkingState {
                     current,
@@ -324,6 +316,13 @@ pub fn kernel_step(
                 meta,
             };
             return KernelStep::Continue(WalkState::Terminal(resolved));
+        }
+        let protected_parent_meta = match fs_ops.load_inode_meta(parent_fs_object_id, guard) {
+            StepOutcome::Done(meta) => meta,
+            _ => parent_meta,
+        };
+        if protected_symlink_follow_denied(cred, &protected_parent_meta, &child_meta) {
+            return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::EACCES));
         }
         hop_count += 1;
         if hop_count > SYMLOOP_MAX {
@@ -465,9 +464,7 @@ fn materialise_child(
                     hop_count: walking.hop_count,
                 },
             )),
-            StepOutcome::Err(e) => Err(KernelStep::Error(WalkCause::FsOpsRejected(
-                crate::execution::Errno::from(e),
-            ))),
+            StepOutcome::Err(e) => Err(KernelStep::Error(WalkCause::FsOpsRejected(e))),
             StepOutcome::Continue { .. } => Err(KernelStep::Error(WalkCause::FsOpsRejected(
                 crate::execution::Errno::ENOSYS,
             ))),
@@ -496,9 +493,7 @@ fn materialise_child(
                         hop_count: walking.hop_count,
                     },
                 )),
-                StepOutcome::Err(e) => Err(KernelStep::Error(WalkCause::FsOpsRejected(
-                    crate::execution::Errno::from(e),
-                ))),
+                StepOutcome::Err(e) => Err(KernelStep::Error(WalkCause::FsOpsRejected(e))),
                 StepOutcome::Continue { .. } => Err(KernelStep::Error(WalkCause::FsOpsRejected(
                     crate::execution::Errno::ENOSYS,
                 ))),

@@ -178,7 +178,7 @@ pub struct ProcessIdentity {
 /// thread-identity view, and exit-source id). Concrete types stay
 /// here in the subsystem layer.
 ///
-/// `Restrictions` currently uses the `step_v3::RestrictionStackHandle`
+/// `Restrictions` currently uses the `step::RestrictionStackHandle`
 /// placeholder because the real append-only stack lives in
 /// `tx-policy`, which is still skeleton. PR-K wires the real type
 /// alongside the seccomp/landlock landing. The trait's
@@ -298,7 +298,25 @@ impl ProcessIdentity {
     /// Process state char for /proc/<pid>/stat.
     pub fn state_char(&self) -> u8 {
         if self.is_zombie() {
-            b'Z'
+            return b'Z';
+        }
+        if let Some(leader) = self.thread_by_tid(self.pid.0) {
+            return leader.proc_state_char();
+        }
+        let Some(threads) = self.threads_snapshot() else {
+            return b'Z';
+        };
+        let mut saw_sleeping = false;
+        for thread in threads {
+            match thread.proc_state_char() {
+                b'R' => return b'R',
+                b'T' => return b'T',
+                b'S' => saw_sleeping = true,
+                _ => {}
+            }
+        }
+        if saw_sleeping {
+            b'S'
         } else {
             b'R'
         }
@@ -333,6 +351,11 @@ impl ProcessIdentity {
     /// Find a thread by its tid within this process.
     pub fn thread_by_tid(&self, tid: u32) -> Option<Cap<ThreadIdentity>> {
         self.payload.lock().as_ref()?.threads.find_by_tid(tid)
+    }
+
+    /// Snapshot live thread identities for `/proc/<pid>/task`.
+    pub fn threads_snapshot(&self) -> Option<alloc::vec::Vec<Cap<ThreadIdentity>>> {
+        Some(self.payload.lock().as_ref()?.threads.snapshot())
     }
 
     /// Collapse all sibling threads for exec, leaving `initiator`
@@ -451,6 +474,26 @@ impl ProcessIdentity {
         payload.frame.vm.swap(Some(new))
     }
 
+    /// Snapshot the process's current network namespace. Day-1 all
+    /// processes are seeded with the initial namespace; fork inherits
+    /// the parent's namespace cap. Future `clone/unshare/setns` work
+    /// mutates this slot under the namespace/capability syscalls.
+    pub fn net_namespace(&self) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
+        self.payload.lock().as_ref().map(|p| p.net_namespace())
+    }
+
+    /// Replace the process's current network namespace, returning the
+    /// previous namespace cap. Returns `None` for zombies.
+    pub fn replace_net_namespace(
+        &self,
+        new: PayloadCap<crate::net::NetNamespacePayload>,
+    ) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.replace_net_namespace(new))
+    }
+
     /// Snapshot the `Cap<OpenFile>` registered at fd `idx` on this
     /// process's payload. Returns `None` if the process is a zombie
     /// (no payload) or the slot is empty.
@@ -541,7 +584,7 @@ impl ProcessIdentity {
             .lock()
             .as_ref()
             .map(|p| p.rlimit_nofile())
-            .unwrap_or((1024, 4096))
+            .unwrap_or((1024, 1024))
     }
 
     pub fn set_rlimit_nofile(&self, cur: u32, max: u32) {
@@ -1134,6 +1177,15 @@ pub struct ProcessPayload {
     /// Day-1: all namespace caps point at the init namespace.
     /// `mnt_ns` is deferred (`MountNamespace` bootstrap not yet wired).
     pub(crate) nsproxy: AtomicSlot<Cap<crate::process::nsproxy::NsProxy>>,
+
+    /// Current network namespace for socket/device lookup.
+    ///
+    /// N71M3 staging: `bootstrap_init_process` seeds this with
+    /// `initial_net_namespace_payload()`, `step_fork` clones the
+    /// parent's cap, and `unshare(CLONE_NEWNET)` / `setns(...,
+    /// CLONE_NEWNET)` publish a replacement cap through this slot.
+    /// Socket creation in `tx-shims` resolves through this field.
+    pub(crate) net_namespace: AtomicSlot<PayloadCap<crate::net::NetNamespacePayload>>,
     /// Current working directory as a `DEntry` `Cap`.
     ///
     /// Spec note: `PROCESS_v1` §3 declares this as `Cap<RNode>` on a
@@ -1447,6 +1499,21 @@ impl ProcessPayload {
         self.nsproxy
             .swap(Some(new))
             .expect("ProcessPayload.nsproxy slot is always populated")
+    }
+
+    pub fn net_namespace(&self) -> PayloadCap<crate::net::NetNamespacePayload> {
+        self.net_namespace
+            .load()
+            .expect("ProcessPayload.net_namespace slot is always populated")
+    }
+
+    pub fn replace_net_namespace(
+        &self,
+        new: PayloadCap<crate::net::NetNamespacePayload>,
+    ) -> PayloadCap<crate::net::NetNamespacePayload> {
+        self.net_namespace
+            .swap(Some(new))
+            .expect("ProcessPayload.net_namespace slot is always populated")
     }
 
     /// Atomically install `new` as the current cred-cap and return

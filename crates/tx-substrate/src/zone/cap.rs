@@ -158,6 +158,27 @@ impl<T: 'static> Cap<T> {
         unsafe { slot.as_ref().meta().load(Ordering::Acquire).retain() }
     }
 
+    pub fn try_clone_live(&self) -> Option<Self> {
+        let slot = self.slot()?;
+        let meta = unsafe { slot.as_ref().meta() };
+        loop {
+            let cur = meta.load(Ordering::Acquire);
+            if cur.state() != SlotState::Live {
+                return None;
+            }
+            let new = cur.inc_retain().ok()?;
+            match meta.compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    return Some(Self {
+                        raw: self.raw,
+                        _marker: PhantomData,
+                    });
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
     fn try_retire(slot: NonNull<Slot<T>>) {
         Self::try_retire_slot(slot);
     }

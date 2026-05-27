@@ -292,9 +292,7 @@ fn dispatch_fchmodat_devfs_returns_neg_erofs() {
     drop(path);
 }
 
-/// Any non-`AT_FDCWD` dirfd value returns `-EBADF`. The slice's
-/// fd table doesn't carry directory-fd semantics yet
-/// (TODO(phase-dirfd)).
+/// A relative path with an invalid dirfd returns `-EBADF`.
 #[test]
 fn dispatch_fchmodat_invalid_dirfd_returns_neg_ebadf() {
     let _setup = wave4_setup();
@@ -303,7 +301,7 @@ fn dispatch_fchmodat_invalid_dirfd_returns_neg_ebadf() {
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
     let ctx = make_ctx(proc_cap, thread);
 
-    let path = nul_terminate(b"/f");
+    let path = nul_terminate(b"f");
     // dirfd = 3 (a positive fd value); not AT_FDCWD = -100.
     let req = SyscallRequest::new(NR_FCHMODAT, [3u64, path.as_ptr() as u64, 0o600, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));

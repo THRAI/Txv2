@@ -503,6 +503,10 @@ const MAX_HARTS: usize = 8;
 static CURRENT_MAILBOX: [SpinLock<Option<Arc<TaskMailbox>>>; MAX_HARTS] =
     [const { SpinLock::new(None) }; MAX_HARTS];
 
+/// Per-hart cooperative-yield marker for the currently-polling task.
+static CURRENT_TASK_YIELDED: [SpinLock<bool>; MAX_HARTS] =
+    [const { SpinLock::new(false) }; MAX_HARTS];
+
 /// Set the current task's mailbox for `hart` (called by reactor before poll).
 pub(crate) fn set_current_mailbox(hart: usize, mailbox: Option<Arc<TaskMailbox>>) {
     if let Some(slot) = CURRENT_MAILBOX.get(hart) {
@@ -515,6 +519,26 @@ pub fn current_task_mailbox(hart: usize) -> Option<Arc<TaskMailbox>> {
     CURRENT_MAILBOX
         .get(hart)
         .and_then(|slot| slot.lock().clone())
+}
+
+pub(crate) fn clear_current_task_yielded(hart: usize) {
+    if let Some(slot) = CURRENT_TASK_YIELDED.get(hart) {
+        *slot.lock() = false;
+    }
+}
+
+pub(crate) fn take_current_task_yielded(hart: usize) -> bool {
+    CURRENT_TASK_YIELDED
+        .get(hart)
+        .is_some_and(|slot| core::mem::take(&mut *slot.lock()))
+}
+
+pub(crate) fn mark_current_task_yielded() {
+    for (hart, mailbox) in CURRENT_MAILBOX.iter().enumerate() {
+        if mailbox.lock().is_some() {
+            *CURRENT_TASK_YIELDED[hart].lock() = true;
+        }
+    }
 }
 
 // -----------------------------------------------------------------------

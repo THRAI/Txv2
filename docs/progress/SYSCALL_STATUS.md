@@ -578,8 +578,8 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 37 | `NR_LINKAT` | `sys_linkat` | async |
 | 39 | `NR_UMOUNT2` | `sys_umount2` | async |
 | 40 | `NR_MOUNT` | `sys_mount` | async |
-| 43 | `NR_STATFS` | `sys_statfs` | sync |
-| 44 | `NR_FSTATFS` | `sys_fstatfs` | sync |
+| 43 | `NR_STATFS` | `sys_statfs` | async |
+| 44 | `NR_FSTATFS` | `sys_fstatfs` | async |
 | 45 | `NR_TRUNCATE` | `sys_truncate` | async |
 | 46 | `NR_FTRUNCATE` | `sys_ftruncate` | async |
 | 47 | `NR_FALLOCATE` | `sys_fallocate` | async |
@@ -591,9 +591,9 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 54 | `NR_FCHOWNAT` | `sys_fchownat` | sync |
 | 55 | `NR_FCHOWN` | `sys_fchown` | sync |
 | 56 | `NR_OPENAT` | `sys_openat` | async |
-| 57 | `NR_CLOSE` | `sys_close` | sync |
+| 57 | `NR_CLOSE` | `sys_close` | async |
 | 59 | `NR_PIPE2` | `sys_pipe2` | sync |
-| 61 | `NR_GETDENTS64` | `sys_getdents64` | sync |
+| 61 | `NR_GETDENTS64` | `sys_getdents64` | async |
 | 62 | `NR_LSEEK` | `sys_lseek` | sync |
 | 63 | `NR_READ` | `sys_read` | sync |
 | 64 | `NR_WRITE` | `sys_write` | sync |
@@ -624,6 +624,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 93 | `NR_EXIT` | `sys_exit` | sync |
 | 94 | `NR_EXIT_GROUP` | `sys_exit_group` | sync |
 | 96 | `NR_SET_TID_ADDRESS` | `sys_set_tid_address` | sync |
+| 97 | `NR_UNSHARE` | `sys_unshare` | sync |
 | 98 | `NR_FUTEX` | `sys_futex` | async |
 | 99 | `NR_SET_ROBUST_LIST` | `sys_set_robust_list` | sync |
 | 100 | `NR_GET_ROBUST_LIST` | `sys_get_robust_list` | sync |
@@ -713,11 +714,13 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 196 | `NR_SHMAT` | `sys_shmat` | async |
 | 197 | `NR_SHMDT` | `sys_shmdt` | async |
 | 198 | `NR_SOCKET` | `sys_socket` | sync |
+| 199 | `NR_SOCKETPAIR` | `sys_socketpair` | sync |
 | 200 | `NR_BIND` | `sys_bind` | sync |
 | 201 | `NR_LISTEN` | `sys_listen` | sync |
 | 202 | `NR_ACCEPT` | `sys_accept` | sync |
 | 203 | `NR_CONNECT` | `sys_connect` | sync |
 | 204 | `NR_GETSOCKNAME` | `sys_getsockname` | sync |
+| 205 | `NR_GETPEERNAME` | `sys_getpeername` | sync |
 | 206 | `NR_SENDTO` | `sys_sendto` | sync |
 | 207 | `NR_RECVFROM` | `sys_recvfrom` | sync |
 | 208 | `NR_SETSOCKOPT` | `sys_setsockopt` | sync |
@@ -744,6 +747,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 238 | `NR_MIGRATE_PAGES` | `sys_migrate_pages` | sync |
 | 239 | `NR_MOVE_PAGES` | `sys_move_pages` | sync |
 | 242 | `NR_ACCEPT4` | `sys_accept4` | sync |
+| 243 | `NR_RECVMMSG` | `sys_recvmmsg` | sync |
 | 260 | `NR_WAIT4` | `sys_wait4` | async |
 | 261 | `NR_PRLIMIT64` | `sys_prlimit64` | sync |
 | 262 | `NR_FANOTIFY_INIT` | `sys_fanotify_init` | sync [stub] |

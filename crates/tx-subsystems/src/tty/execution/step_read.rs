@@ -40,13 +40,13 @@ pub fn step_read(
     }
 
     if let Err(err) = require_fg_pgrp(tty, guard) {
-        return V3::Err(err.into());
+        return V3::Err(err);
     }
 
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
         Err(err) => {
-            return V3::Err(err.into());
+            return V3::Err(err);
         }
     };
 
@@ -122,7 +122,7 @@ pub fn step_read_for_caller(
 
     if let Err(err) = require_fg_pgrp_for(tty, Some(caller)) {
         let _ = background_read_signal(tty, caller);
-        return V3::Err(err.into());
+        return V3::Err(err);
     }
 
     step_read(tty, out, guard)
@@ -143,7 +143,7 @@ pub fn step_read_for_process(
 
     let caller_info = match super::IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     if out.is_empty() {
@@ -155,7 +155,7 @@ pub fn step_read_for_process(
         let _ = super::step_ioctl::deliver_signal_dispatch_for_process_with_guard(
             caller, dispatch, guard,
         );
-        return V3::Err(err.into());
+        return V3::Err(err);
     }
 
     step_read(tty, out, guard)

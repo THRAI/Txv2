@@ -18,6 +18,126 @@
 use super::helpers::{bootstrap_block_on, exec_error_tag, parse_init_from_cmdline};
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
+use core::fmt::Write;
+
+fn oscomp_boot_suite(cmdline: Option<&str>) -> Option<&str> {
+    let cmdline = cmdline?;
+    for token in cmdline.split_ascii_whitespace() {
+        if let Some(value) = token.strip_prefix("tx.oscomp=") {
+            return Some(value);
+        }
+        if let Some(value) = token.strip_prefix("tx.oscomp_suite=") {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn oscomp_libctest_network_cmd(libc: &str) -> alloc::string::String {
+    use alloc::format;
+
+    let root = oscomp_libc_root(libc);
+    let group = oscomp_group_label("libctest", libc);
+    format!(
+        "cd {root} || exit 1; \
+	    ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\"; \
+	    ./runtest.exe -w entry-static.exe inet_pton; \
+	    ./runtest.exe -w entry-static.exe socket; \
+	    ./runtest.exe -w entry-static.exe dn_expand_empty; \
+	    ./runtest.exe -w entry-static.exe dn_expand_ptr_0; \
+	    ./runtest.exe -w entry-static.exe inet_ntop_v4mapped; \
+	    ./runtest.exe -w entry-static.exe inet_pton_empty_last_field; \
+	    ./runtest.exe -w entry-dynamic.exe inet_pton; \
+	    ./runtest.exe -w entry-dynamic.exe socket; \
+	    ./runtest.exe -w entry-dynamic.exe dn_expand_empty; \
+	    ./runtest.exe -w entry-dynamic.exe dn_expand_ptr_0; \
+	    ./runtest.exe -w entry-dynamic.exe inet_ntop_v4mapped; \
+	    ./runtest.exe -w entry-dynamic.exe inet_pton_empty_last_field; \
+	    ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\""
+    )
+}
+
+fn oscomp_lmbench_network_cmd(libc: &str) -> alloc::string::String {
+    use alloc::format;
+
+    let root = oscomp_libc_root(libc);
+    let group = oscomp_group_label("lmbench-network", libc);
+    format!(
+        "cd {root} || exit 1; \
+	    host=127.0.0.1; \
+	    export ENOUGH=1000000; \
+	    export TIMING_O=0; \
+	    export LOOP_O=0; \
+	    failed=0; \
+	    ./busybox mkdir -p /tmp; \
+	    check_contains() {{ label=$1; pat=$2; shift; shift; \
+	        ./busybox echo \"====== lmbench-network $label begin ======\"; \
+	        \"$@\" > /tmp/lmbench-network.out 2>&1; \
+	        ./busybox cat /tmp/lmbench-network.out; \
+	        if ./busybox grep -q \"$pat\" /tmp/lmbench-network.out; then ans=success; else ans=fail; failed=1; fi; \
+	        ./busybox echo \"====== lmbench-network $label end: $ans ======\"; \
+	    }}; \
+	    ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\"; \
+	    ./lmbench_all lat_udp -s; \
+	    ./busybox sleep 1; \
+	    check_contains lat_udp \"UDP latency using\" ./lmbench_all lat_udp -W 0 -N 1 -P 1 $host; \
+	    ./lmbench_all lat_udp -S $host; \
+	    ./lmbench_all lat_tcp -s; \
+	    ./busybox sleep 1; \
+	    check_contains lat_tcp \"TCP latency using\" ./lmbench_all lat_tcp -W 0 -N 1 -P 1 $host; \
+	    ./lmbench_all lat_tcp -S $host; \
+	    ./lmbench_all lat_connect -s; \
+	    ./busybox sleep 1; \
+	    check_contains lat_connect \"TCP/IP connection cost\" ./lmbench_all lat_connect -N 1 $host; \
+	    ./lmbench_all lat_connect -S $host; \
+	    ./lmbench_all bw_tcp -s; \
+	    ./busybox sleep 1; \
+	    check_contains bw_tcp_1 \"MB/sec\" ./lmbench_all bw_tcp -P 1 -W 0 -N 1 -m 1 $host; \
+	    check_contains bw_tcp_64 \"MB/sec\" ./lmbench_all bw_tcp -P 1 -W 0 -N 1 -m 64 $host; \
+	    check_contains bw_tcp_1024 \"MB/sec\" ./lmbench_all bw_tcp -P 1 -W 0 -N 1 -m 1024 $host; \
+	    ./busybox echo \"====== lmbench-network bw_tcp_shutdown begin ======\"; \
+	    ./lmbench_all bw_tcp -S $host; \
+	    ./busybox echo \"====== lmbench-network bw_tcp_shutdown end ======\"; \
+	    ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\"; \
+	    exit $failed"
+    )
+}
+
+fn oscomp_netperf_udp_rr_cmd(libc: &str) -> alloc::string::String {
+    use alloc::format;
+
+    let root = oscomp_libc_root(libc);
+    let group = oscomp_group_label("netperf-udp-rr", libc);
+    format!(
+        "cd {root} || exit 1; \
+	    ip=127.0.0.1; port=12865; \
+	    ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\"; \
+	    ./netserver -D -L $ip -p $port & server_pid=$!; \
+	    ./busybox sleep 1; \
+	    ./busybox echo \"====== netperf UDP_RR begin ======\"; \
+	    ./netperf -H $ip -p $port -t UDP_RR -l 1 -- -s 16k -S 16k -m 1k -M 1k -r 64,64 -R 1; \
+	    if [ $? = 0 ]; then ans=success; else ans=fail; fi; \
+	    ./busybox echo \"====== netperf UDP_RR end: $ans ======\"; \
+	    ./busybox kill -9 $server_pid; \
+	    ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\""
+    )
+}
+
+fn oscomp_libc_root(libc: &str) -> &'static str {
+    match libc {
+        "glibc" => "/musl/glibc",
+        _ => "/musl/musl",
+    }
+}
+
+fn oscomp_group_label(base: &str, libc: &str) -> alloc::string::String {
+    use alloc::format;
+
+    match libc {
+        "glibc" => format!("{base}-glibc"),
+        _ => format!("{base}-musl"),
+    }
+}
 
 impl<P: TxPlatform> CoreInit<P> {
     /// Initramfs slice: walk `BootInfo::initrd` if present and
@@ -385,7 +505,10 @@ impl<P: TxPlatform> CoreInit<P> {
             }
             tx_hal::console_write_str::<P>("\n");
             let sdcard_cmd = build_oscomp_sdcard_cmd::<P>();
-            let sdcard_envp: &[&[u8]] = &[b"PATH=/bin:/musl/glibc:/musl/musl"];
+            let sdcard_envp: &[&[u8]] = &[
+                b"PATH=/musl/musl:/sbin:/bin:/usr/sbin:/usr/bin:/musl/glibc",
+                b"LD_LIBRARY_PATH=/musl/glibc/lib:/lib",
+            ];
             let sdcard_argv: &[&[u8]] = &[b"sh", b"-c", sdcard_cmd.as_bytes()];
             let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
                 &init,
@@ -411,13 +534,19 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         }
 
-        // busybox sh needs at least PATH to find applet binaries
-        // (`ls`, `cat`, etc.) — without it, command lookup short-
-        // circuits to "not found" before the kernel's fork/exec path
-        // ever runs, and the prompt never returns from the failing
-        // command. `/bin` is where our cpio rootfs places every
-        // applet symlink.
-        let envp: &[&[u8]] = &[b"PATH=/bin"];
+        // Shell profiles need at least PATH so command lookup reaches
+        // userland tools before the shell reports "not found". BusyBox
+        // applets live under /bin; Alpine places administrative tools
+        // such as nft, iptables, and ip under /sbin or /usr/sbin.
+        let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline.unwrap_or("");
+        let envp: &[&[u8]] = if cmdline
+            .split_ascii_whitespace()
+            .any(|t| t == "tx.profile=alpine")
+        {
+            &[b"PATH=/bin:/sbin:/usr/bin:/usr/sbin"]
+        } else {
+            &[b"PATH=/bin"]
+        };
 
         // Cmdline-driven init path (initramfs slice):
         //   `init=/some/path` -> exec that path with argv=[basename]
@@ -555,6 +684,9 @@ impl<P: TxPlatform> CoreInit<P> {
         if let Some(tq) = BOOT_REACTOR.with(|reactor| reactor.timer_queue()) {
             tx_subsystems::timer_sleep::install_timer_queue(tq);
         }
+        tx_subsystems::timer_sleep::install_posix_timer_signal_submit(
+            Self::submit_posix_timer_signal_into_boot_reactor,
+        );
     }
 
     /// Pre-ELF Phase 7: submit init's leader thread future as a
@@ -667,8 +799,17 @@ impl<P: TxPlatform> CoreInit<P> {
 
         P::enable_timer_wakeups();
 
-        // Enable concurrent poll on all harts (Phase 1a poll lease).
+        // The BSP userspace loop uses lock-releasing reactor polls, so a
+        // forked daemon child can be submitted immediately while its parent
+        // is still in the same poll turn. On SMP, keep APs parked separately:
+        // userspace trap/return state is still hart-local and not migration
+        // safe, but daemon-style children still need prompt BSP progress.
         super::USE_CONCURRENT_POLL.store(true, core::sync::atomic::Ordering::Release);
+        super::PARK_USERSPACE_APS.store(
+            P::online_cpu_count() > 1,
+            core::sync::atomic::Ordering::Release,
+        );
+        super::USERSPACE_REACTOR_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
 
         // Drive the BSP reactor loop until init zombifies. Each
         // iteration is a `step_hart_loop_at` step: advance time, run
@@ -698,7 +839,8 @@ impl<P: TxPlatform> CoreInit<P> {
             // the previous poll iteration become visible to the
             // reactor here, outside the inner lock that sys_clone
             // ran under.
-            let submitted_child_before_poll = Self::drain_pending_child_submits();
+            let submitted_child_before_poll =
+                Self::drain_pending_child_submits() || Self::drain_pending_timer_signal_submits();
 
             // The userspace trap shell returns through a longjmp-like path, so
             // do not carry a pre-entry CpuId local across reactor iterations.
@@ -707,7 +849,8 @@ impl<P: TxPlatform> CoreInit<P> {
                 Some(step) => step,
                 None => break,
             };
-            let submitted_child_after_poll = Self::drain_pending_child_submits();
+            let submitted_child_after_poll =
+                Self::drain_pending_child_submits() || Self::drain_pending_timer_signal_submits();
 
             // EBR drain. Caps retired during the task polls above
             // (e.g. `Cap<OpenFile>` from `sys_close` / process exit fd
@@ -786,6 +929,8 @@ impl<P: TxPlatform> CoreInit<P> {
         }
 
         // init zombified — emit the exit sentinel.
+        super::USERSPACE_REACTOR_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
+        super::PARK_USERSPACE_APS.store(false, core::sync::atomic::Ordering::Release);
         let status_word = init
             .exit_status()
             .map(|s| s.wait_status_word())
@@ -849,9 +994,30 @@ fn oscomp_sdcard_boot_enabled<P: tx_hal::TxPlatform>() -> bool {
 fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     use alloc::string::String;
 
+    match oscomp_boot_suite(<P as tx_hal::BootInfoIf>::boot_info().cmdline) {
+        Some("libctest-network" | "libctest-network-musl") => {
+            return oscomp_libctest_network_cmd("musl");
+        }
+        Some("libctest-network-glibc") => return oscomp_libctest_network_cmd("glibc"),
+        Some("lmbench-network" | "lmbench-network-musl") => {
+            return oscomp_lmbench_network_cmd("musl");
+        }
+        Some("lmbench-network-glibc") => return oscomp_lmbench_network_cmd("glibc"),
+        Some("netperf-udp-rr" | "netperf-udp-rr-musl") => {
+            return oscomp_netperf_udp_rr_cmd("musl");
+        }
+        Some("netperf-udp-rr-glibc") => return oscomp_netperf_udp_rr_cmd("glibc"),
+        Some("ltp-glibc") => {
+            return String::from("cd /musl/glibc && /musl/musl/busybox sh ltp_testcode.sh");
+        }
+        _ => {}
+    }
+
     let mut cmd = String::from("cd /musl/musl");
     let mut selected = 0usize;
-    if let Some(groups) = oscomp_groups_from_cmdline::<P>() {
+    if let Some(groups) = oscomp_groups_from_cmdline::<P>()
+        .or_else(|| oscomp_boot_suite(<P as tx_hal::BootInfoIf>::boot_info().cmdline))
+    {
         for group in groups.split(',') {
             let group = group.trim();
             if group.is_empty() {
@@ -876,6 +1042,32 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 selected += 1;
                 continue;
             }
+            if group == "ltp-glibc" {
+                let _ = write!(
+                    cmd,
+                    " && cd /musl/glibc && /musl/musl/busybox sh ltp_testcode.sh && cd /musl/musl"
+                );
+                selected += 1;
+                continue;
+            }
+            if let Some(filter) = group.strip_prefix("ltp-musl:") {
+                append_filtered_ltp(&mut cmd, "musl", filter);
+                selected += 1;
+                continue;
+            }
+            if let Some(filter) = group.strip_prefix("ltp:") {
+                append_filtered_ltp(&mut cmd, "musl", filter);
+                selected += 1;
+                continue;
+            }
+            if let Some(script) = oscomp_glibc_script_for_group(group) {
+                let _ = write!(
+                    cmd,
+                    " && cd /musl/glibc && /musl/musl/busybox sh {script} && cd /musl/musl"
+                );
+                selected += 1;
+                continue;
+            }
             if let Some(script) = oscomp_musl_script_for_group(group) {
                 append_oscomp_musl_script(&mut cmd, script);
                 selected += 1;
@@ -886,6 +1078,55 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
         append_default_oscomp_scripts(&mut cmd);
     }
     cmd
+}
+
+fn append_filtered_ltp(cmd: &mut alloc::string::String, libc: &str, filter: &str) {
+    let group = oscomp_group_label("ltp", libc);
+    let echo = match libc {
+        "glibc" => "/musl/musl/busybox echo",
+        _ => "./busybox echo",
+    };
+
+    let _ = write!(
+        cmd,
+        "; {echo} \"#### OS COMP TEST GROUP START {group} ####\""
+    );
+    for case in filter.split('+') {
+        let case = case.trim();
+        if case.is_empty() {
+            continue;
+        }
+        if !is_ltp_case_token(case) {
+            let _ = write!(
+                cmd,
+                "; {echo} \"SKIP LTP CASE {case} : invalid case token\""
+            );
+            continue;
+        }
+
+        let _ = write!(
+            cmd,
+            "; {echo} \"RUN LTP CASE {case}\"; \
+             \"ltp/testcases/bin/{case}\"; \
+             ret=$?; \
+             if [ \"$ret\" -eq 0 ]; then \
+                 {echo} \"PASS LTP CASE {case} : $ret\"; \
+             else \
+                 {echo} \"FAIL LTP CASE {case} : $ret\"; \
+             fi; \
+             if [ \"$ret\" -eq 0 ]; then \
+                 {echo} \"FAIL LTP CASE {case} : $ret\"; \
+             fi"
+        );
+    }
+    let _ = write!(cmd, "; {echo} \"#### OS COMP TEST GROUP END {group} ####\"");
+}
+
+fn is_ltp_case_token(case: &str) -> bool {
+    !case.is_empty()
+        && case
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn append_filtered_libctest(cmd: &mut alloc::string::String, filter: &str) {
@@ -1104,6 +1345,24 @@ fn libctest_case_needs_cwd_dso(case: &str) -> bool {
     matches!(case, "dlopen" | "tls_get_new_dtv")
 }
 
+fn oscomp_glibc_script_for_group(group: &str) -> Option<&'static str> {
+    let canonical = group.strip_suffix("-glibc")?;
+    match canonical {
+        "basic" => Some("basic_testcode.sh"),
+        "busybox" => Some("busybox_testcode.sh"),
+        "libctest" => Some("libctest_testcode.sh"),
+        "libcbench" => Some("libcbench_testcode.sh"),
+        "lua" => Some("lua_testcode.sh"),
+        "lmbench" => Some("lmbench_testcode.sh"),
+        "iozone" => Some("iozone_testcode.sh"),
+        "netperf" => Some("netperf_testcode.sh"),
+        "iperf" => Some("iperf_testcode.sh"),
+        "cyclictest" => Some("cyclictest_testcode.sh"),
+        "ltp" => Some("ltp_testcode.sh"),
+        _ => None,
+    }
+}
+
 const LIBCTEST_STATIC_SAFE_CASES: &str =
     "argv basename clocale_mbfuncs clock_gettime dirname env fdopen fnmatch fscanf fwscanf \
      iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
@@ -1199,6 +1458,31 @@ mod tests {
         assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_points"));
         assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel"));
         assert!(!cmd.contains("skipped known hang"));
+    }
+
+    #[test]
+    fn filtered_ltp_emits_case_markers_without_default_suite() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_filtered_ltp(&mut cmd, "musl", "socket01+getsockopt01");
+
+        assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-musl ####"));
+        assert!(cmd.contains("\"RUN LTP CASE socket01\""));
+        assert!(cmd.contains("\"ltp/testcases/bin/socket01\""));
+        assert!(cmd.contains("\"PASS LTP CASE socket01 : $ret\""));
+        assert!(cmd.contains("\"FAIL LTP CASE socket01 : $ret\""));
+        assert!(cmd.contains("\"RUN LTP CASE getsockopt01\""));
+        assert!(cmd.contains("#### OS COMP TEST GROUP END ltp-musl ####"));
+        assert!(!cmd.contains("basic_testcode.sh"));
+    }
+
+    #[test]
+    fn filtered_ltp_rejects_shell_metacharacters() {
+        let mut cmd = String::new();
+        append_filtered_ltp(&mut cmd, "musl", "socket01+bad;case");
+
+        assert!(cmd.contains("\"ltp/testcases/bin/socket01\""));
+        assert!(cmd.contains("SKIP LTP CASE bad;case : invalid case token"));
+        assert!(!cmd.contains("\"ltp/testcases/bin/bad;case\""));
     }
 
     #[test]

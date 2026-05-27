@@ -35,7 +35,6 @@ const E_ISDIR: i32 = 21;
 const E_INVAL: i32 = 22;
 const E_PERM: i32 = 1;
 const E_ACCES: i32 = 13;
-const E_NOSYS: i32 = 38;
 const STAT_BYTES: usize = 128;
 const STAT_ATIME_SEC_OFF: usize = 72;
 const STAT_MTIME_SEC_OFF: usize = 88;
@@ -221,7 +220,8 @@ fn dispatch_mkdirat_existing_returns_neg_eexist() {
     drop(path);
 }
 
-/// `mkdirat` with a non-cwd dirfd surfaces as `-EBADF`.
+/// `mkdirat` with a closed non-cwd dirfd surfaces as `-EBADF` for a
+/// relative path.
 #[test]
 fn dispatch_mkdirat_non_cwd_dirfd_returns_neg_ebadf() {
     let _setup = fm_setup();
@@ -229,7 +229,7 @@ fn dispatch_mkdirat_non_cwd_dirfd_returns_neg_ebadf() {
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
     let ctx = make_ctx(proc_cap, thread);
 
-    let path = nul_terminate(b"/d");
+    let path = nul_terminate(b"d");
     let req = SyscallRequest::new(NR_MKDIRAT, [3, path.as_ptr() as u64, 0o755, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_BADF));
@@ -880,10 +880,9 @@ fn dispatch_renameat2_same_directory_succeeds() {
 // `dispatch_renameat2_exchange_returns_neg_enosys` plus the
 // `step_rename` tests in `tx-subsystems`.
 
-/// `renameat2(.., RENAME_EXCHANGE)` returns `-ENOSYS` (atomic swap
-/// unsupported in Slice 8).
+/// `renameat2(.., RENAME_EXCHANGE)` atomically swaps two existing entries.
 #[test]
-fn dispatch_renameat2_exchange_returns_neg_enosys() {
+fn dispatch_renameat2_exchange_swaps_existing_entries() {
     let _setup = fm_setup();
     let (root_dentry, tmpfs) = build_tmpfs_root();
     create_regular(&tmpfs, b"a");
@@ -905,7 +904,15 @@ fn dispatch_renameat2_exchange_returns_neg_enosys() {
         ],
     );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(E_NOSYS));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(
+        lookup_exists(&tmpfs, b"a"),
+        "/a should still exist after exchange"
+    );
+    assert!(
+        lookup_exists(&tmpfs, b"b"),
+        "/b should still exist after exchange"
+    );
     drop(oldpath);
     drop(newpath);
 }

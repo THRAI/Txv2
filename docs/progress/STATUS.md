@@ -1126,6 +1126,166 @@
   v6.17 submodule clone completes. **Blocker:** the shallow Linux tag clone is
   still in progress in this worktree.
 
+- 2026-05-24 **Restored OSComp netperf/iperf after the network rebase.**
+  Root cause was twofold. First, the init split lost the earlier
+  concurrent-poll behavior where `sys_clone` can submit a child userspace
+  thread immediately; every child went through the deferred queue, so
+  daemon-style benchmark servers could return control to the shell before the
+  listening child had run. The split `init/reactor_submit.rs` now restores
+  immediate child submission when `USE_CONCURRENT_POLL` is active, while
+  keeping deferred submission for the legacy single-lock reactor path. Second,
+  netperf's `SIGALRM` completion path used the small itimer compatibility
+  signal frame; `rt_sigreturn` restored it in the syscall layer, then the
+  thread future tried to decode the same stack as a platform `SignalFrameIf`
+  frame and killed the process with `SIGSEGV`. `SyscallResult` now separates
+  platform-frame sigreturn from already-restored compatibility-frame
+  sigreturn. **Verified:** `cargo fmt --check`; `cargo test -p tx-kernel
+  reactor_submission_seam_submits_child_thread_smoke -- --test-threads=1`;
+  `cargo test -p tx-kernel sigreturn -- --test-threads=1`; `cargo test -p
+  tx-shims itimer_real_sigalrm -- --test-threads=1`; `cargo build -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`; `cargo
+  xtask oscomp submit --target rv64-qemu`; `iperf-musl 6/6`,
+  `iperf-glibc 6/6`, `netperf-musl 5/5`, and `netperf-glibc 5/5` via focused
+  `cargo xtask oscomp qemu --target rv64-qemu --boot-suite ...` plus matching
+  `cargo xtask oscomp score` runs. **Next step:** keep using focused
+  benchmark suites after future rebases before drawing conclusions from the
+  broad default OSComp chain. **Blocker:** none for netperf/iperf.
+
+- 2026-05-24 **Re-ran the default OSComp RV64 serial entry after the
+  `feature-network` rebase fixes.** Prepared a fresh RV64 build with
+  `cargo xtask full-build --target rv64-qemu --skip-doctor`, then ran
+  `cargo xtask oscomp test --target rv64-qemu --skip-build` in 30-second
+  observation windows. The run completed `basic-musl`, `busybox-musl`, and
+  `libctest-musl`, then stopped making progress in `libcbench-musl` after
+  printing `b_malloc_sparse (0)` and no `time:` line. The bounded serial score
+  was `376.0/404`: `basic-musl 102/102`, `busybox-musl 54/55` with only
+  `busybox kill 10` failing, `libctest-musl 220/220`, and `libcbench-musl
+  0/27`. Because the default script blocks in `libcbench-musl`, later default
+  suites (`lua`, `lmbench`, `iozone`, `netperf`, `iperf`, `cyclictest`, `ltp`)
+  were not reached in this all-entry run. **Next step:** diagnose the
+  non-network `libc-bench` first benchmark separately, or continue using
+  focused group runs for network suites until `libcbench-musl` is unstuck.
+  **Blocker:** `libcbench-musl` currently blocks the default serial chain.
+
+- 2026-05-24 **Swept OSComp non-LTP suites individually after `libcbench`
+  blocked the default chain.** Used focused `cargo xtask oscomp qemu --target
+  rv64-qemu --boot-suite <suite>` runs with short observation windows, then
+  scored each suite with `cargo xtask oscomp score --target rv64-qemu --suite
+  <suite>`. Musl bounded results: `basic-musl 102/102`, `busybox-musl 54/55`
+  (`busybox kill 10` only), `libctest-musl 220/220`, `libcbench-musl 0/27`
+  (stops after `b_malloc_sparse (0)`), `lua-musl 9/9`, `lmbench-musl 3/36`
+  after 120s (`Simple syscall/read/write` only), `iozone-musl 0/20` (sanity
+  check failed, then throughput stopped producing result rows), `netperf-musl
+  0/5`, `iperf-musl 4/6` (BASIC UDP/TCP fail, later parallel/reverse cases
+  pass), and `cyclictest-musl 0/4`. Glibc bounded results: `basic-glibc
+  102/102`, `busybox-glibc 54/55`, `libctest-glibc 63/220` before stopping in
+  the static pthread-condattr area, `libcbench-glibc 17/27` after 120s,
+  `lua-glibc 9/9`, `lmbench-glibc 1/36` after 60s, `iozone-glibc 0/20`,
+  `netperf-glibc 0/5`, `iperf-glibc 5/6`, and `cyclictest-glibc 0/4`. The
+  current netperf failures differ from the saved May 23 passing logs: netserver
+  is not ready when the first client attempts the control connection, and later
+  netperf subtests segfault. **Next step:** investigate the network regression
+  around child/server scheduling and readiness before returning to broad
+  non-network suites. **Blocker:** official netperf/iperf suites are no longer
+  fully green despite the older saved logs.
+
+- 2026-05-24 **Compared current `main` OSComp musl behavior against the
+  network branch after the non-LTP sweep.** Created a detached main worktree at
+  `/tmp/txv2-main-musl-check` on `52ce77c6` and used main's compile-time
+  `TX_OSCOMP_GROUPS` path because that mainline `xtask oscomp qemu` does not
+  yet translate `--boot-suite` into a QEMU cmdline append. Focused main
+  results against the same sdcard/testdata: `netperf-musl 0/5`,
+  `iperf-musl 0/6`, and `libcbench-musl 0/27` (90s, only group start printed).
+  This means the current mainline is not a fully passing musl baseline outside
+  netperf/iperf, and the current netperf failure is not unique to the rebased
+  `feature-network` branch. **Next step:** compare against the saved May 23
+  passing netperf/iperf logs or the earlier known-good network commit to find
+  the real regression point. **Blocker:** current main is not the passing
+  baseline implied by the remembered status.
+
+- 2026-05-24 **Completed the missing current-main musl suite spot-checks.**
+  Still using `/tmp/txv2-main-musl-check` at `52ce77c6`, rebuilt the RV64
+  kernel per suite with `TX_OSCOMP_GROUPS=<suite>`, submitted it, and ran
+  `cargo xtask oscomp qemu --target rv64-qemu --data
+  /home/msp/learning/Txv2/target/oscomp/testdata`. Additional main results:
+  `lua-musl 9/9`, `lmbench-musl 0/36` after 120s (only group header and
+  `latency measurements` printed), `iozone-musl 0/20` after 90s (stage headers
+  but no result rows), and `cyclictest-musl 0/4`. Combined with the prior main
+  checks, current main is demonstrably not a fully passing musl baseline outside
+  netperf/iperf: `libcbench-musl`, `lmbench-musl`, `iozone-musl`, and
+  `cyclictest-musl` also fail or fail to produce scoreable output within the
+  bounded windows. **Next step:** if a passing baseline exists, identify its
+  exact commit/image pair before comparing feature-network changes. **Blocker:**
+  remembered "all but netperf/iperf" status does not match current main
+  `52ce77c6` plus the local OSComp sdcard.
+
+- 2026-05-24 **Compared OSComp against `main` and repaired the feature-branch
+  exec regression.** `main` scored `376/377` for
+  `TX_OSCOMP_GROUPS=basic-musl,busybox-musl,libctest-musl`, while the rebased
+  `feature-network` branch had dropped `basic-musl` to `0/102`. Root cause:
+  the feature branch's dynamic-ELF loader treated a `PT_INTERP` segment outside
+  the initial 4 KiB parse window as malformed, and the exec script also
+  recursively fell back to `/bin/sh` for ELF parse errors. OSComp basic PIE
+  binaries place `PT_INTERP` at offset `0x1f57`, so they were rejected with
+  `ENOEXEC` and BusyBox reported `Exec format error`. The loader now records
+  out-of-window `PT_INTERP` locators and lets the PageContainer-backed
+  interpreter-open phase read the path; the `/bin/sh` fallback is again limited
+  to non-ELF inputs. **Verified:** `cargo fmt --check`; `cargo test -p
+  tx-scripts parse_image_plan_records_pt_interp_outside_initial_window --
+  --test-threads=1`; `cargo check -p tx-scripts`; `TX_OSCOMP_GROUPS=basic-musl
+  cargo xtask oscomp test --target rv64-qemu` (`102/102`); and
+  `TX_OSCOMP_GROUPS=basic-musl,busybox-musl,libctest-musl cargo xtask oscomp
+  test --target rv64-qemu` (`376/377`: `basic-musl 102/102`,
+  `busybox-musl 54/55`, `libctest-musl 220/220`). **Next step:** keep this
+  regression pinned with the loader test before pushing the rebased network
+  branch. **Blocker:** none for the main-compared OSComp trio.
+
+- 2026-05-24 **Measured OSComp after the network rebase and fixed an RV64
+  `rt_sigaction` ABI regression exposed by the run.** The first full
+  `cargo xtask oscomp test --target rv64-qemu` boot reached userspace but
+  panicked immediately in `rt_sigaction`: the rebased branch was still decoding
+  a 32-byte handler/flags/restorer/mask layout while main pins RV64 to the
+  Linux 24-byte handler/flags/mask shape with no in-struct restorer. The shim
+  now reads and writes the 24-byte RV64 layout and records a zero restorer for
+  this ABI. **Verified:** `cargo fmt --check`; `cargo test -p tx-shims
+  itimer_real_sigalrm_ignores_rv64_sigaction_mask_as_restorer --
+  --test-threads=1`; `cargo check -p tx-shims`; `cargo build -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`. OSComp
+  observations after the fix: default local full run progressed through
+  `busybox-musl 54/55` and `libctest-musl 220/220`, then stopped making serial
+  progress in non-network `libcbench-musl b_malloc_sparse`; local partial score
+  was `274.0/404`. A focused completing run with
+  `TX_OSCOMP_GROUPS=basic-musl,busybox-musl,libctest-musl` scored `274/377`:
+  `libctest-musl 220/220`, `busybox-musl 54/55`, and `basic-musl 0/102`
+  because the basic ELF binaries were treated by the shell as scripts
+  (`execve` returned an exec-format failure path). **Next step:** investigate
+  the non-network basic ELF exec path separately if total OSComp score is the
+  priority; network/libctest coverage remained green. **Blocker:** default
+  local all-suite run still reaches a non-network libcbench hang before a
+  closed full score.
+
+- 2026-05-24 **Rebased `feature-network` onto updated `main` and repaired the
+  post-rebase interface drift.** The branch now sits on the mainline that split
+  init reactor submission, refreshed procfs/sysfs/devfs, and expanded signal
+  delivery metadata. Rebase follow-up kept the network branch's `/proc/net`,
+  `/sys/class/net`, netlink/packet, loopback UDP/TCP, and socket fd-table work
+  while adapting sysfs regular files to the newer projected-rnode schema
+  (`ProjectionSchemaId::Sysfs`), updating `kill(2)` to pass `SI_USER`
+  `SigInfo` into the new `script_deliver_signal` API, and reading interval
+  timer handlers from the current tuple-style `SigDisposition::Handler(addr)`.
+  A duplicate `EINTR` errno mapping introduced by conflict resolution was also
+  removed. The RV64 kernel build also exposed an old in-file copy of reactor
+  submit helpers that conflicted with main's new `init/reactor_submit.rs`; the
+  stale copy was removed so the split mainline implementation owns that path.
+  **Verified:** `cargo fmt --check`; `cargo check -p tx-shims`; `cargo test -p
+  tx-shims socket_fdtable -- --test-threads=1` (`56 passed`); `cargo test -p
+  tx-subsystems net::tests::loopback_tests -- --test-threads=1` (`46 passed`);
+  `cargo build -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`; `cargo xtask progress validate`. **Next step:**
+  run the OSComp/network guest regressions after this rebase before pushing the
+  rebased branch. **Blocker:** none found so far; only pre-existing
+  non-network warnings remain in `tx-subsystems`, `tx-scripts`, and `tx-fs`.
+
 - 2026-05-23 **Brought the OSComp/musl/busybox fix branch through both CI
   gates.** This branch now includes the pthread/libctest, dynamic loader/DSO,
   file-time, futex, fd-table close, non-VFS fd routing, AIO syscall-number,
@@ -2617,46 +2777,11 @@
   due to missing /proc and utimensat). No blocker on basic-musl.
 
 - 2026-05-18 **oscomp basic `test_clone` + `test_mount` unblocked.**
-  Two narrow fixes targeting two of the four reported failures in the
-  oscomp basic-musl suite. The other two (`test_mmap` segfault,
-  `test_munmap` EINVAL) still need runtime diagnosis and are tracked
-  as the next priorities.
-
-  1. **`sys_clone` now honours non-zero `newsp` (libc `clone(2)` shape).**
-     Previously rejected with `-EINVAL`
-     ([proc.rs:253 pre-fix](../../crates/tx-shims/src/linux_syscall/proc.rs)).
-     The oscomp `test_clone` calls libc-style `clone(fn, NULL, stack,
-     1024, SIGCHLD)`; basic's `__clone` asm
-     ([clone.s](https://github.com/oscomp/testsuits-for-oskernel/blob/pre-20250615/basic/user/lib/arch/riscv/clone.s))
-     pushes `fn`/`arg` to the new stack and passes `newsp` through to
-     the syscall — the child code path reads `0(sp)` and `8(sp)` to
-     find the function pointer, so it requires `sp = newsp` on
-     userspace re-entry. Fix:
-     - New `STACK_REG_INDEX` constant (RV64 `regs[2]` / LA64 `regs[3]`)
-       in
-       [execution.rs:511](../../crates/tx-subsystems/src/process/execution.rs).
-     - `seed_child_leader_context` now takes a fourth `stack: usize`
-       argument and stamps `child_ctx.regs[STACK_REG_INDEX] = stack`
-       when non-zero. Zero preserves the bare-fork convention
-       (child shares parent's sp).
-     - `sys_clone` plumbs `args[1]` through and drops the EINVAL
-       guard. Reactor seam unchanged.
-     - Existing `dispatch_clone_with_nonzero_stack_returns_neg_einval`
-       test inverted into
-       `dispatch_clone_with_nonzero_stack_seeds_child_sp`, plus a new
-       `seed_child_leader_context_overrides_sp_when_stack_nonzero`
-       unit test on the seed helper.
-
-  2. **`sys_mount("vfat", ...)` aliases to tmpfs (oscomp-compat stub).**
-     Previously returned `-ENOSYS` (`-38`)
-     ([fs_mut.rs:782 default arm](../../crates/tx-shims/src/linux_syscall/fs_mut.rs)).
-     The oscomp `test_mount` mounts `/dev/vda2` with fstype `vfat` and
-     only asserts `mount` + `umount` round-trip succeed; no FAT bytes
-     are read. A fresh tmpfs at the mount point satisfies the
-     contract without pretending to be FAT. Real FAT support tracks
-     separately. Implementation: `"vfat"` joins the `"tmpfs"` arm with
-     the `vfat` label preserved through `MountPayload.fstype` for
-     `/proc/mounts` honesty.
+  Two narrow fixes targeting the first reported basic-musl failures:
+  `sys_clone` now honours non-zero `newsp` for libc clone, and
+  `sys_mount("vfat", ...)` aliases to tmpfs for the OSComp mount/umount
+  round trip. Follow-up work in the same mainline series completed the
+  mmap/munmap and pipe-read blockers, yielding the 32/32 result above.
 
   **Verified:** `cargo -q xtask unit` — 331 tests pass (229 tx-shims,
   44 tx-kernel, 8 tx-ext4, 50 tx-scripts). `cargo xtask full-build
@@ -2664,11 +2789,69 @@
   both succeed. QEMU runtime re-check pending (the user reported the
   failures from an external run).
 
-  **Next:** runtime-diagnose `test_mmap` segfault (suspected: page
-  fault handler not materialising `VmBacking::Page` for shared
-  file-backed VMAs) and `test_munmap` EINVAL (path through
-  `try_munmap` returning `Errno::EINVAL` for a range that mmap just
-  produced — needs serial log).
+  **Next:** superseded by the 32/32 basic-musl pass above.
+
+- 2026-05-18 **N69c OSComp netperf IPv4 loopback suite passes.**
+  Added the five-test OSComp parity shell coverage under `tools/shell-tests/`
+  plus a suite runner, and recorded the result in
+  [msp/network-n69c-netperf-coverage-result.md](../../msp/network-n69c-netperf-coverage-result.md).
+  The covered tests are `UDP_STREAM`, exact-arg `TCP_STREAM`, `UDP_RR`,
+  `TCP_RR`, and `TCP_CRR` against `netserver -D -L 127.0.0.1 -p 12865`.
+
+  The implementation gap fixes were intentionally small: `SO_DONTROUTE` and
+  `IP_RECVERR` now round-trip through socket options, and blocking
+  `recvfrom`/`accept` waits now race their socket wait-source against the
+  calling process's `ITIMER_REAL` deadline. When the timer wins, the syscall
+  returns `-EINTR`; the existing kernel-to-user return path delivers SIGALRM and
+  `rt_sigreturn` restores the interrupted result. This unblocks UDP_STREAM's
+  server `recvfrom` and TCP_CRR's server `accept` at test end.
+
+  **Verification:** `cargo fmt --check`; `cargo test -p tx-shims socket_fdtable::dispatch_setsockopt_getsockopt_round_trips`; `cargo test -p tx-shims time_syscalls::itimer_real_sigalrm_handler_round_trip_restores_context`; `cargo xtask full-build --target rv64-qemu --skip-doctor --no-image`; N69c individual shell-tests for `udp-stream`, `udp-rr`, `tcp-rr`, `tcp-crr`; `cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/busybox-netperf-oscomp-suite.txt`; regressions `busybox-netperf-loopback.txt`, `busybox-netperf-help.txt`, `busybox-iperf3-loopback.txt`, and `cargo xtask test busybox-boot --target rv64-qemu`. After `busybox-boot` regenerated the plain image, the OSComp image was rebuilt with `TX_OSCOMP_RISCV_MUSL_DIR=/home/msp/learning/rustOS/testcase/riscv/musl cargo xtask image cpio --profile busybox --target rv64-qemu`.
+  **Next:** keep IPv6 and broader netperf modes out of N69c; use future
+  workloads to decide whether `connect`/`sendto`/`recvmsg` need the same
+  interruptible wait pattern. **Blockers:** none for OSComp IPv4 loopback
+  parity; UDP_RR rate can still report `0.00`, so this is a functional gate,
+  not a performance gate.
+
+- 2026-05-18 **N69c netperf coverage plan captured.**
+  Added [msp/network-n69c-netperf-coverage-plan.md](../../msp/network-n69c-netperf-coverage-plan.md)
+  after auditing the local OSComp musl `netperf_testcode.sh`, existing
+  N69b shell-test, current Txv2 socket/syscall support, and `strings` output
+  from the local `netperf`/`netserver` binaries. No local netperf C source
+  tree was found; the durable plan therefore treats the OSComp script as the
+  immediate acceptance source and separates it from optional upstream-style
+  netperf modes.
+
+  **Current state:** N69b minimal IPv4 loopback `TCP_STREAM` remains the only
+  proven netperf data-path gate. The documented N69c scope is OSComp parity:
+  exact-arg `TCP_STREAM`, `UDP_STREAM`, `UDP_RR`, `TCP_RR`, `TCP_CRR`, then a
+  suite shell-test expecting five `end: success` markers. IPv6 is explicitly
+  out of N69c because the local OSComp script uses `127.0.0.1` and the current
+  network ABI/subsystem is IPv4-only.
+
+  **Verification:** docs-only planning pass; `cargo xtask progress validate`.
+  **Next:** add the single-test shell scripts in the order documented, starting
+  with exact-arg `TCP_STREAM`, and use trap-trace to fix one syscall/socket
+  semantic per failing test. **Blockers:** none beyond unimplemented N69c test
+  slices.
+
+- 2026-05-18 **feature-network rebased on `main` c54e339; N69b netperf loopback passes after signal/TTY catch-up.**
+  After the main rebase, N69b regressed first in the parent shell after
+  `netperf -h`: SIGCHLD handler return reached the stack trampoline, but
+  the RV64 signal frame bytes had truncated the trampoline and the stack
+  page was not executable. The fix increases `SignalFrameBytes` capacity to
+  cover the full RV64 frame, marks the trampoline page executable after the
+  frame copy, and folds any pending syscall return into the signal frame's
+  saved pre-handler context before delivery so `rt_sigreturn` resumes at the
+  post-syscall state instead of replaying `wait4`.
+
+  Rebase fallout also needed one host-test catch-up: `drive_boot_wiring()`
+  now mirrors production by registering the `/dev/null` TTY before publishing
+  the devfs `null` alias. The full unit lane is back to the known pre-existing
+  single failure in
+  `init::tests::userspace_net_smoke::boot_smoke_userspace_tcp_loopback_uses_reactor_owned_delegate`.
+
+  **Verification:** `cargo fmt --check`; `cargo test -p tx-hal-riscv64-qemu-virt rv64_signal_frame_bytes_include_trampoline -- --nocapture`; `cargo test -p tx-scripts process::exec::stack -- --nocapture`; `cargo build -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf --features trap-trace`; `cargo xtask full-build --target rv64-qemu --skip-doctor --no-image`; `cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/busybox-netperf-loopback.txt` (result block observed: `262144  65536   1024    1.06        1.15`); `cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/busybox-netperf-help.txt`; `cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/busybox-iperf3-loopback.txt`; `cargo xtask test busybox-boot --target rv64-qemu`. `cargo -q xtask unit` fails only the known userspace net smoke.
 
 - 2026-05-18 **ext4 mount-time RO/RW distinction + Linux `MS_RDONLY` honoured.**
   Previously `mount_ext4_read_only` was the only entry point and its
@@ -3023,7 +3206,35 @@
   and `unlink` hit `--- Assert Fatal ! ---`; `umount` returns −38
   (ENOSYS for `mount` syscall). Commit loader changes.
 
-**Updated:** 2026-05-13
+**Updated:** 2026-05-17
+
+- 2026-05-17 **`feature-network` rebased onto `main` 96a6b60.** Created
+  `feature-network-backup-before-main-rebase-20260517` before replaying the
+  network stack over the latest main. Resolved the boot-order conflict by
+  keeping main's tmpfs-root `/` + `/musl` mount strategy while preserving
+  `init_net_devices()` / `submit_net_runtime_tasks()`. Resolved N69a exec
+  conflicts by keeping main's LA64 ELF support and architecture-specific
+  initial SP register while preserving `PT_INTERP`, `parse_interp_plan`, and
+  interpreter partial-page population. `msp/` notes remain untracked.
+  **Verified:** `cargo fmt --check`; `cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`
+  (passes with the existing `current_cpu` unused warning in `tx-kernel/src/init.rs`).
+  **Next step:** run the RV64 shell-test lanes on the rebased branch, especially
+  `busybox-iperf3-loopback`, `busybox-netperf-help`, and
+  `busybox-netperf-loopback`.
+
+- 2026-05-14 **`feature-network` rebased onto `main` 856bd3e.** Replayed the
+  network branch on top of the latest fast-forwarded main, resolving conflicts
+  in the syscall dispatcher, thread userspace-entry path, virtio exports,
+  exec ELF-loader dynamic-interpreter support, and shell-test wiring. Kept
+  main's `ET_DYN` static-PIE loader behavior while preserving N69a `PT_INTERP`
+  / `parse_interp_plan` support, and kept main's `TrapIf::enter_userspace_with_context(ctx, root)`
+  shape while inserting N69b `maybe_deliver_itimer_signal` before userspace
+  entry. Added a small rebase-fallout commit for the regenerated lockfile and
+  `VirtioPciError::NoNetDevice` string arm. `msp/` notes remain untracked.
+  **Verified:** `cargo fmt --check`; `cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`
+  (passes with the existing `current_cpu` unused warning in `tx-kernel/src/init.rs`).
+  **Next step:** run the RV64 shell-test lanes (`busybox-iperf3-loopback`,
+  `busybox-netperf-help`, `busybox-netperf-loopback`) on the rebased branch.
 
 - 2026-05-13 **OSComp `basic-musl` TEST GROUP markers now appear** in the
   oscomp RV64 QEMU serial output. Three fixes landed together:
@@ -3262,6 +3473,61 @@
   echo pipe-ok | cat → true && echo done → quit).
   **Next step:** none for this bug cluster. Shell prompt milestone
   complete.
+
+- 2026-05-14 N69b netperf loopback PASS. The target shell-test now prints the
+  TCP_STREAM result table with the `10^6bits/sec` throughput line. Fixes landed
+  locally for the observed chain: port-zero TCP bind ephemeral allocation,
+  wildcard loopback client local-address selection, large `recvfrom` short-read
+  staging, `setitimer(ITIMER_REAL)` state plus cooperative SIGALRM delivery,
+  musl `sa_restorer` capture for executable `rt_sigreturn`, pselect socket
+  `ERR/HUP/RDHUP` read readiness, mixed tty/socket fdset wait-token selection,
+  multi-read-fd pselect rescan/yield, and connected TCP peer close notification.
+  Verification: `cargo fmt --check`; targeted tx-shims/tx-subsystems tests for
+  SIGALRM restorer and TCP peer-close breakage; `cargo xtask full-build --target
+  rv64-qemu --skip-doctor --no-image`; `cargo xtask test busybox-boot --target
+  rv64-qemu`; `busybox-iperf3-loopback`; `busybox-netperf-help`; and
+  `busybox-netperf-loopback` after rebuilding the musl netperf image. No N69b
+  blocker remains; next step is review/commit cleanup. Plan:
+  `msp/network-n69b-netperf-loopback-plan.md`. Result:
+  `msp/network-n69b-netperf-loopback-result.md`.
+
+- 2026-05-13 N69a dynamic ELF loader (PT_INTERP + ET_DYN interpreter) LANDED.
+  Lifts the kernel exec contract from static-`ET_EXEC`-only to "ET_EXEC main
+  with optional ET_DYN interpreter": `parse_image_plan` now accepts
+  `PT_INTERP`/`PT_DYNAMIC` and emits an `InterpRef` locator; a new
+  `parse_interp_plan` accepts `ET_DYN`; `vm::register_interp_image` registers
+  interp LOAD segments at a kernel-chosen `INTERP_LOAD_BIAS_DEFAULT =
+  0x3000_0000`; `exec_script` opens the interp via the same VFS walker,
+  registers its segments, sets `AT_BASE = load_bias`, and seeds the initial
+  PC at `interp.entry + load_bias`. Glibc ET_DYN main programs (PIE) still
+  rejected — single-slice scope kept tight. Verified: 24 loader tests (+6
+  N69a), 9 vm scripts tests (+3 N69a), 15 exec_script tests (+3 N69a, incl.
+  end-to-end dyn-link fixture), `cargo fmt --check`, `cargo xtask test
+  busybox-boot --target rv64-qemu`, `busybox-iperf3-loopback` shell-test
+  (static binary regression), **`busybox-netperf-help` shell-test** (the
+  N69a target: musl-linked `/bin/netperf -h` + `/bin/netserver -h` both
+  print Usage and return to the shell prompt). Pre-existing failure
+  `boot_smoke_userspace_tcp_loopback_uses_reactor_owned_delegate` (kernel
+  unit test) verified to be broken on baseline `056c149` — not introduced
+  by N69a. Plan: `msp/network-n69a-pt-interp-loader-plan.md`. Result:
+  `msp/network-n69a-pt-interp-loader-result.md`. **Next:** N69b — attempt
+  netperf loopback (`netserver -4 -L 127.0.0.1 -p 12865 &` then
+  `netperf -4 -H 127.0.0.1 -p 12865 -t TCP_STREAM -l 1`), trap-trace any
+  missing syscalls musl-ld exercises beyond what static binaries hit.
+
+- 2026-05-13 N68 shell TCP/UDP smoke LANDED. The BusyBox initramfs can now
+  include freestanding RV64 `/bin/tcp-loopback-smoke` and
+  `/bin/udp-loopback-smoke` test programs. TCP proves
+  `connect -> accept -> write -> read -> close` through shell-launched
+  userspace and the reactor-owned net delegate; UDP proves
+  `bind + sendto(self) + recvfrom`. Fixes: the loopback pending step now
+  processes bound UDP sockets with pending loopback `sendto` datagrams, and
+  blocking `sys_connect` treats `EISCONN` after a delegate wait as successful
+  completion. Verified with `cargo xtask image cpio --profile busybox --target
+  rv64-qemu`, default RV64 kernel build, and both N68 shell-test scripts.
+  Result: `msp/network-n68-shell-udp-tcp-smoke-result.md`. **Next:** start
+  `iperf`/`netperf` prerequisite probing from this smaller TCP/UDP correctness
+  baseline.
 
 - 2026-05-13 xtask: `verb_ratio` column added to `boundary-report` LANDED
   (refactor #7/7, branch cc/crazy-ardinghelli-91c48e). Added `AdapterVerbStats`

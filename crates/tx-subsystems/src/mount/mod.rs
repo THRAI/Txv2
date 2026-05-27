@@ -554,6 +554,19 @@ pub fn mount_for(
     None
 }
 
+/// Look up a registered mount whose root RNode is represented by
+/// `root_dentry`. This covers syscall paths that have already walked
+/// across the mount point and therefore hold the mounted filesystem's
+/// root dentry rather than the parent-side mountpoint dentry.
+pub fn mount_for_root_dentry(root_dentry: &Cap<DEntry>) -> Option<Cap<MountIdentity>> {
+    let root_rnode_addr = cap_raw_addr(root_dentry.rnode());
+    let table = MOUNT_TABLE.lock();
+    table
+        .iter()
+        .find(|entry| cap_raw_addr(entry.mount.root()) == root_rnode_addr)
+        .map(|entry| entry.mount.clone_cap())
+}
+
 // ============================================================================
 // Mount table snapshot (for /proc/mounts)
 // ============================================================================
@@ -807,7 +820,7 @@ fn drive_step_outcome_to_done<T>(
     loop {
         match step_fn() {
             StepOutcome::Done(value) => return Ok(value),
-            StepOutcome::Err(e) => return Err(e.into()),
+            StepOutcome::Err(e) => return Err(e),
             _ => {
                 // In bootstrap context, Continue/Yield are not expected;
                 // spin once and retry.
@@ -1298,7 +1311,7 @@ mod tests {
     // - `mockfs_load_inode_meta_v3` — single `Done` outcome over a
     //   non-trivial payload (`InodeMeta`).
     // - `mockfs_fetch_page_v3` — single `Err(ENOSYS)` outcome routed
-    //   through the `From<execution::Errno> for step_v3::Errno` bridge
+    //   through the `From<execution::Errno> for step::Errno` bridge
     //   (`Errno::into()`); pins that conversion path.
 
     /// step_v3-shape sibling of [`MockFs::lookup`]. Returns
@@ -1329,17 +1342,17 @@ mod tests {
 
     /// step_v3-shape sibling of [`MockFs::fetch_page`]. Always returns
     /// `Err(ENOSYS)`, routed through the `From<execution::Errno> for
-    /// step_v3::Errno` bridge so any drift in the errno catalog fails
+    /// step::Errno` bridge so any drift in the errno catalog fails
     /// this test. Mirrors how a real mount-side step fn would surface
     /// an `execution::Errno` into a step_v3 outcome:
-    /// `let errno: step_v3::Errno = exec_err.into()`.
+    /// `let errno: step::Errno = exec_err.into()`.
     fn mockfs_fetch_page_v3(
         _fs_object_id: FsObjectId,
         _offset: u64,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Frame, NoProgress> {
         let exec_err = Errno::ENOSYS;
-        let v3_err: V3Errno = exec_err.into();
+        let v3_err: V3Errno = exec_err;
         StepOutcome::err(v3_err)
     }
 

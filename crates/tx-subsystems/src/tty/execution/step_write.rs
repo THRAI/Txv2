@@ -29,7 +29,7 @@ pub fn step_write_for_process(
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let caller_info = match super::IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     if bytes.is_empty() {
@@ -38,7 +38,7 @@ pub fn step_write_for_process(
 
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     let background = tty.session_pgrp().is_some_and(|binding| {
@@ -59,7 +59,7 @@ fn kick_transport(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<usiz
     use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3Out};
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3Out::Err(err.into()),
+        Err(err) => return V3Out::Err(err),
     };
 
     enum Kick {
@@ -139,7 +139,7 @@ fn kick_transport(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<usiz
                     V3Out::Err(err)
                 }
             },
-            TtyTransport::Pty { .. } => V3Out::Err(Errno::EIO.into()),
+            TtyTransport::Pty { .. } => V3Out::Err(Errno::EIO),
         },
         Kick::Pty(peer) => match step_ingest(&peer, &chunk, guard) {
             V3Out::Done(_) | V3Out::Continue { .. } => V3Out::Done(chunk.len()),
@@ -240,12 +240,12 @@ pub fn step_write(
     }
 
     if let Err(err) = require_fg_pgrp(tty, guard) {
-        return StepOutcome::err(err.into());
+        return StepOutcome::err(err);
     }
 
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::err(err.into()),
+        Err(err) => return StepOutcome::err(err),
     };
 
     let consumed = payload.with_termios(|termios| {
@@ -303,14 +303,14 @@ pub fn step_write_for_caller(
 
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::err(err.into()),
+        Err(err) => return StepOutcome::err(err),
     };
 
     let background = tty
         .session_pgrp()
         .is_some_and(|binding| !caller.in_foreground && caller.pgrp_id != binding.foreground_pgid);
     if background && payload.with_termios(|termios| termios.c_lflag & TOSTOP != 0) {
-        return StepOutcome::err(Errno::EIO.into());
+        return StepOutcome::err(Errno::EIO);
     }
 
     step_write(tty, bytes, guard)

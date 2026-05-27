@@ -1,10 +1,10 @@
-//! Shared step-result and error spelling for interface-only subsystem seams.
+//! Shared execution vocabulary for subsystem seams.
 //!
-//! The concrete reactor carriers are still owned by the reactor and bus work.
-//! This module gives VFS, Mount, PageBacked, and filesystem backends one public
-//! spelling to compile against until those carriers are connected.
+//! Txv3 owns the canonical step outcome and errno catalog. This module keeps
+//! the historically convenient `tx_subsystems::execution::*` import path while
+//! re-exporting/aliasing the v3 shapes directly.
 
-pub use crate::adapter::step_engine::Guard;
+pub use crate::adapter::step_engine::{Guard, V3Errno as Errno};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Errno {

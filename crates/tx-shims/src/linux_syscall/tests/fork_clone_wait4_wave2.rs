@@ -158,6 +158,91 @@ fn dispatch_clone_with_clone_newipc_publishes_fresh_ipc_namespace() {
     assert_eq!(child_nsproxy.ipc_ns.limits.lock().mq_maxmsg, 19);
 }
 
+/// glibc's `_Fork` on RV64 issues
+/// `clone(SIGCHLD | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID, 0,
+///        NULL, NULL, ctid)`. Accepting these flags is normal Linux
+/// ABI, not a test-specific bypass: the child tid is published at
+/// `ctid`, and the same pointer is recorded for the exit-time
+/// clear-child-tid futex protocol.
+#[test]
+fn dispatch_clone_with_glibc_fork_tid_flags_returns_child_pid() {
+    let _setup = setup();
+    install_capturing_seam_and_reset();
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let _ = seed_parent_trap_context(&thread);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let mut child_tid_word = 0i32;
+    let child_tid_ptr = &mut child_tid_word as *mut i32 as u64;
+    let flags = SIGCHLD | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+    let req = SyscallRequest::new(NR_CLONE, [flags, 0, 0, 0, child_tid_ptr, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    let child_pid = match result {
+        SyscallResult::Return(pid) => {
+            assert!(pid > 0);
+            pid
+        }
+        other => panic!("expected Return(pid), got {other:?}"),
+    };
+
+    let child = tx_subsystems::process::process_by_pid(tx_subsystems::process::structure::Pid(
+        child_pid as u32,
+    ))
+    .expect("child process is registered after clone");
+    let child_leader = child.nth_thread(0).expect("child has leader thread");
+    assert_eq!(
+        child_tid_word, child_leader.tid.0 as i32,
+        "CLONE_CHILD_SETTID must publish the child leader tid"
+    );
+    assert_eq!(
+        *child_leader
+            .payload_cap()
+            .expect("child leader payload")
+            .clear_child_tid
+            .lock(),
+        Some(child_tid_ptr),
+        "CLONE_CHILD_CLEARTID records the exit-time clear_child_tid pointer"
+    );
+}
+
+/// `CLONE_PARENT_SETTID` publishes the child's tid into the parent's
+/// userspace before the parent observes the successful clone return.
+#[test]
+fn dispatch_clone_with_parent_settid_writes_parent_tid_word() {
+    let _setup = setup();
+    install_capturing_seam_and_reset();
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let _ = seed_parent_trap_context(&thread);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let mut parent_tid_word = 0i32;
+    let parent_tid_ptr = &mut parent_tid_word as *mut i32 as u64;
+    let flags = SIGCHLD | CLONE_PARENT_SETTID;
+    let req = SyscallRequest::new(NR_CLONE, [flags, 0, parent_tid_ptr, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    let child_pid = match result {
+        SyscallResult::Return(pid) => {
+            assert!(pid > 0);
+            pid
+        }
+        other => panic!("expected Return(pid), got {other:?}"),
+    };
+
+    let child = tx_subsystems::process::process_by_pid(tx_subsystems::process::structure::Pid(
+        child_pid as u32,
+    ))
+    .expect("child process is registered after clone");
+    let child_leader = child.nth_thread(0).expect("child has leader thread");
+    assert_eq!(
+        parent_tid_word, child_leader.tid.0 as i32,
+        "CLONE_PARENT_SETTID must publish the child leader tid to parent memory"
+    );
+}
+
 /// flags = bare SIGCHLD, stack = `0x4000_0000` → success; the child's
 /// sp register is seeded with the supplied stack. Linux semantic:
 /// non-zero `newsp` means the libc `__clone` wrapper has staged the

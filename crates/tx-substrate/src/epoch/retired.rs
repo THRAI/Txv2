@@ -7,7 +7,12 @@
 use core::ptr;
 
 /// Fixed retired-node pool for the first EBR slice.
-pub const RETIRED_NODE_POOL_CAPACITY: usize = 128;
+///
+/// LTP fd-io includes stress cases that open close to the per-process fd
+/// limit and then tear the process down in one burst. Keep this large enough
+/// for that single-CPU burst, but remember this storage is reserved per
+/// `MAX_EPOCH_CPUS` in the global epoch domain.
+pub const RETIRED_NODE_POOL_CAPACITY: usize = 2048;
 
 pub(crate) struct RetiredNode {
     /// Raw object storage that must not be reused until the epoch window closes.

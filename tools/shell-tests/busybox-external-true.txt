@@ -1,0 +1,15 @@
+# busybox-external-true.txt — ensure busybox sh can run an external applet.
+#
+# This covers the shell path that forks/clones a child, execs a
+# separate `/bin/busybox` image, waits for it, then returns to the
+# prompt. It is deliberately separate from the builtin `true` prompt
+# smoke because builtin commands do not exercise clone/exec/wait4.
+
+wait "/ # " within 10000
+sleep 500
+
+send "/bin/busybox true\n"
+expect "/ # " within 5000
+
+sleep 500
+quit

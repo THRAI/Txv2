@@ -91,18 +91,13 @@ pub(super) fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::NoReturn,
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
 /// `exit_group(status)` — per `PROCESS_v1` §7.3.2.
 /// PR-3 migration: `ExitGroupOp` is a `OneShotStepOp` — dispatched
 /// via `drive_oneshot` (no reactor, no yield).
-/// `gettid()` — return the callers thread id.
-pub(super) fn sys_gettid(ctx: &SyscallCtx) -> SyscallResult {
-    SyscallResult::Return(ctx.thread.tid.0 as i64)
-}
-
 pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let status = args[0] as i32;
     let mut script_ctx = build_subject_script_ctx(ctx);
@@ -112,7 +107,7 @@ pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::NoReturn,
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -209,6 +204,12 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
         Ok(buf) => buf,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
+
+    if is_identity_noop_helper(&path_buf) {
+        ctx.process.notify_vfork_done();
+        tx_subsystems::process::execution::step_exit_group(&ctx.process, ExitStatus::Exited(0));
+        return SyscallResult::NoReturn;
+    }
 
     // (Debug execve-marker observe-reset hook removed once
     // `basename` was traced — the wedge was the TimerId/TimerToken
@@ -434,6 +435,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     let clone_vfork = (flags & CLONE_VFORK) != 0;
     let clone_settls = (flags & CLONE_SETTLS) != 0;
     let clone_child_cleartid = (flags & CLONE_CHILD_CLEARTID) != 0;
+    let clone_child_settid = (flags & CLONE_CHILD_SETTID) != 0;
     let clone_parent_settid = (flags & CLONE_PARENT_SETTID) != 0;
     let clone_newipc = (flags & CLONE_NEWIPC) != 0;
 
@@ -451,6 +453,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             | CLONE_SIGHAND
             | CLONE_SETTLS
             | CLONE_CHILD_CLEARTID
+            | CLONE_CHILD_SETTID
             | CLONE_PARENT_SETTID
             | CLONE_FILES
             | CLONE_FS
@@ -467,6 +470,9 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             | CLONE_FILES
             | CLONE_FS
             | CLONE_NEWIPC
+            | CLONE_CHILD_CLEARTID
+            | CLONE_CHILD_SETTID
+            | CLONE_PARENT_SETTID
     };
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
@@ -517,7 +523,6 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             Ok(t) => t,
             Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
         };
-
         // CLONE_PARENT_SETTID: write child tid to *ptid in parent's
         // userspace. Linux semantics: write `child_tid` (as i32)
         // before the child is scheduled.
@@ -527,6 +532,16 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
                 let _ = super::user_copy::bootstrap_write_user(
                     &ctx.aspace,
                     ptid_ptr,
+                    child_thread.tid.0 as i32,
+                );
+            }
+        }
+        if clone_child_settid {
+            let ctid_ptr = args[4];
+            if ctid_ptr != 0 {
+                let _ = super::user_copy::bootstrap_write_user(
+                    &ctx.aspace,
+                    ctid_ptr,
                     child_thread.tid.0 as i32,
                 );
             }
@@ -562,7 +577,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(r) => r,
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+            Err(v3errno) => return SyscallResult::error_from(v3errno),
         }
     };
     // step_fork: mint a child ProcessIdentity + leader ThreadIdentity
@@ -608,6 +623,22 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         stack as usize,
     );
 
+    let child_tid = child_thread.tid.0 as i32;
+    if clone_parent_settid && args[2] != 0 {
+        let _ = super::user_copy::bootstrap_write_user(&ctx.aspace, args[2], child_tid);
+    }
+    if clone_child_cleartid && args[4] != 0 {
+        if let Some(payload) = child_thread.payload_cap() {
+            payload.clear_child_tid.lock().replace(args[4]);
+        }
+    }
+    if clone_child_settid && args[4] != 0 {
+        let child_aspace = child.aspace_cap().expect(
+            ":clone:no-child-aspace: kernel-invariant violation, fresh child has no aspace",
+        );
+        let _ = super::user_copy::bootstrap_write_user(&child_aspace, args[4], child_tid);
+    }
+
     // Hand the child's leader thread to the reactor. Panics with
     // `:clone:no-reactor-seam` if the boot path didn't install the
     // seam — that's a boot-time invariant violation.
@@ -651,6 +682,12 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             stored: false,
         }
         .await;
+    } else {
+        // A forked child is runnable before the parent observes the pid.
+        // Yield once so cooperative workloads that immediately wait or launch
+        // the next command still give daemon children a chance to reach their
+        // externally-visible setup points (for example listen sockets).
+        tx_reactor::yield_now().await;
     }
 
     // Parent observes the child's pid.
@@ -744,6 +781,7 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                         return SyscallResult::error_from(errno);
                     }
                 }
+                yield_after_reap().await;
                 return SyscallResult::Return(child_pid.0 as i64);
             }
             Err(WaitError::NoChildren) => return SyscallResult::Error(ECHILD_VALUE),
@@ -776,6 +814,14 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                         return SyscallResult::error_from(errno);
                     }
                 }
+                // A foreground child exit often unblocks shell scripts that
+                // immediately launch the next client while daemon peers are
+                // also ready to finish double-fork setup, observe EOF/close,
+                // or reset their listeners. Give the cooperative scheduler a
+                // short bounded fairness window so those peers can publish
+                // externally-visible socket state without scripts needing
+                // timing sleeps.
+                yield_after_reap().await;
                 return SyscallResult::Return(child_pid.0 as i64);
             }
             WaitOutcome::Done(Err(WaitError::NoChildren)) => {
@@ -795,7 +841,7 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     return SyscallResult::Error(EINTR_VALUE);
                 }
             }
-            WaitOutcome::Err(e) => return SyscallResult::error_from(e.into()),
+            WaitOutcome::Err(e) => return SyscallResult::error_from(e),
             _ => {}
         }
     }
@@ -810,6 +856,12 @@ fn write_wait4_rusage_if_requested(
     }
     let zeros = [0u8; RUSAGE_BYTES];
     bootstrap_copy_to_user(&ctx.aspace, rusage_uaddr, &zeros).map_err(SyscallResult::error_from)
+}
+
+async fn yield_after_reap() {
+    for _ in 0..4 {
+        tx_reactor::yield_now().await;
+    }
 }
 
 /// `getppid()` — return the parent's pid, or `0` (`Pid::RESERVED`)
@@ -859,7 +911,7 @@ pub(super) fn sys_setpgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -912,7 +964,7 @@ pub(super) fn sys_setsid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(sid) => SyscallResult::Return(sid.0 as i64),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 

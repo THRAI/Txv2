@@ -355,6 +355,14 @@ pub struct SigActionTable {
     entries: SpinMutex<[SigActionEntry; Signum::MAX as usize]>,
 }
 
+impl Clone for SigActionTable {
+    fn clone(&self) -> Self {
+        Self {
+            entries: SpinMutex::new(*self.entries.lock()),
+        }
+    }
+}
+
 impl Default for SigActionTable {
     fn default() -> Self {
         Self::new()
@@ -1345,7 +1353,31 @@ pub fn script_deliver_signal(
     // process-directed routing can strand SIGCANCEL on a different
     // unblocked sibling.
     Ok(match target {
-        SignalTarget::Process(_) => step_kill_process(&target_proc, sig, info),
+        SignalTarget::Process(_) => {
+            let disposition = match target_proc.upgrade_operational() {
+                Ok(payload) => payload.sig_actions().get(sig),
+                Err(_) => return Ok(KillOutcome::NoLiveThread),
+            };
+            match disposition {
+                SigDisposition::Ignore => return Ok(KillOutcome::Delivered),
+                SigDisposition::Default => match default_action(sig) {
+                    DefaultAction::Ignore => return Ok(KillOutcome::Delivered),
+                    DefaultAction::Term | DefaultAction::Core => {
+                        crate::process::execution::step_exit_group_with_signal(&target_proc, sig);
+                        return Ok(KillOutcome::Delivered);
+                    }
+                    DefaultAction::Stop => {
+                        route_gewalt(&target_proc, Signum::SIGSTOP);
+                        return Ok(KillOutcome::Delivered);
+                    }
+                    DefaultAction::Cont => {
+                        route_gewalt(&target_proc, Signum::SIGCONT);
+                        return Ok(KillOutcome::Delivered);
+                    }
+                },
+                SigDisposition::Handler(_) => step_kill_process(&target_proc, sig, info),
+            }
+        }
         SignalTarget::Thread(thread) => {
             if is_gewalt(sig) {
                 return Ok(step_kill_process(&target_proc, sig, info));
