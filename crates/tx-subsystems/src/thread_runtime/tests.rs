@@ -16,20 +16,31 @@ use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
 use crate::process::{bootstrap_init_process, step_fork, ExitStatus};
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::adapter::reactor_entry::{SyscallRequest, UserspaceTrapInfo};
-use crate::thread_runtime::adapter::step_engine::{Cap, PayloadCap};
+use crate::thread_runtime::adapter::step_engine::{guard, Cap, PayloadCap, StepOutcome};
 use crate::thread_runtime::execution::prepare_userspace_entry_payload;
 use crate::thread_runtime::step_thread_exit;
 use crate::thread_runtime::structure::{
-    drain_pending_syscall_return, reset_tid_counter_for_test, ThreadIdentity,
+    bind_thread_task, current_thread_task, drain_pending_syscall_return,
+    reset_tid_counter_for_test, set_current_thread_payload, thread_by_tid, thread_payload_by_tid,
+    thread_task_by_tid, ThreadIdentity,
 };
-use crate::vm::{AddressSpace, TestPmap};
+use crate::vm::adapter::step_engine::page_allocator;
+use crate::vm::{
+    AddressSpace, MapPlacement, Prot, TestPmap, UserRange, UserVirtAddr, VmBacking, VmEntryFlags,
+    VmMapRequest, USER_PAGE_SIZE,
+};
 use crate::zones;
+use tx_hal::UserPtr;
 use tx_hal::UserTrapContext;
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tx_test_support::init_host();
     let _ = zones::register_all();
+    match page_allocator::claim_zero_frame() {
+        Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
+        Err(error) => panic!("claim zero frame for thread-runtime tests: {error:?}"),
+    }
     tx_test_support::drain_to_quiescence();
     reset_pid_counter_for_test();
     reset_tid_counter_for_test();
@@ -52,6 +63,60 @@ fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
     threads[0].clone()
 }
 
+fn process_aspace(proc_cap: &Cap<ProcessIdentity>) -> Cap<AddressSpace> {
+    proc_cap
+        .payload
+        .lock()
+        .as_ref()
+        .expect("alive process")
+        .aspace_cap()
+}
+
+fn map_user_page(aspace: &AddressSpace, page_start: usize) {
+    let range =
+        UserRange::new_aligned(UserVirtAddr(page_start), USER_PAGE_SIZE).expect("aligned range");
+    let req = VmMapRequest::fixed(
+        range,
+        MapPlacement::FixedReplace,
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    aspace.try_mmap(req).expect("mmap anon page for test");
+}
+
+fn write_user_u64(aspace: &AddressSpace, addr: u64, value: u64) {
+    let eguard = guard();
+    let copied = aspace.copy_to_user(
+        UserPtr::<u8>::new(addr as usize),
+        &value.to_ne_bytes(),
+        &eguard,
+    );
+    drop(eguard);
+    assert_eq!(copied, StepOutcome::Done(core::mem::size_of::<u64>()));
+}
+
+fn write_user_u32(aspace: &AddressSpace, addr: u64, value: u32) {
+    let eguard = guard();
+    let copied = aspace.copy_to_user(
+        UserPtr::<u8>::new(addr as usize),
+        &value.to_ne_bytes(),
+        &eguard,
+    );
+    drop(eguard);
+    assert_eq!(copied, StepOutcome::Done(core::mem::size_of::<u32>()));
+}
+
+fn read_user_u32(aspace: &AddressSpace, addr: u64) -> u32 {
+    let eguard = guard();
+    let value = match aspace.read_user(UserPtr::<u32>::new(addr as usize), &eguard) {
+        StepOutcome::Done(value) => value,
+        other => panic!("read_user_u32 failed: {other:?}"),
+    };
+    drop(eguard);
+    value
+}
+
 #[test]
 fn thread_exit_sets_status_and_drops_thread_payload() {
     let _g = setup();
@@ -66,6 +131,34 @@ fn thread_exit_sets_status_and_drops_thread_payload() {
 }
 
 #[test]
+fn thread_task_lookup_tracks_payload_binding_and_zombie_clear() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+    let tid = leader.tid;
+    let payload = leader.payload_cap().expect("leader payload");
+    let reactor = tx_reactor::Reactor::new();
+    let task = reactor.submit_task(async {});
+
+    assert_eq!(thread_by_tid(tid).map(|thread| thread.tid), Some(tid));
+    assert!(thread_payload_by_tid(tid).is_some());
+    assert_eq!(thread_task_by_tid(tid), None);
+
+    assert_eq!(bind_thread_task(&leader, task), None);
+    assert_eq!(payload.task(), Some(task));
+    assert_eq!(thread_task_by_tid(tid), Some(task));
+
+    let _prev = set_current_thread_payload(0, payload.clone());
+    assert_eq!(current_thread_task(0), Some(task));
+    let _ = crate::thread_runtime::clear_current_thread_payload(0);
+
+    step_thread_exit(leader.clone(), 0);
+    assert!(leader.is_zombie());
+    assert!(thread_payload_by_tid(tid).is_none());
+    assert_eq!(thread_task_by_tid(tid), None);
+}
+
+#[test]
 fn last_thread_exit_zombifies_owner_process() {
     let _g = setup();
     let proc_cap = bootstrap();
@@ -76,6 +169,51 @@ fn last_thread_exit_zombifies_owner_process() {
     assert!(proc_cap.is_zombie());
     assert_eq!(proc_cap.exit_status(), Some(ExitStatus::Exited(99)));
     assert_eq!(proc_cap.live_thread_count(), 0);
+}
+
+#[test]
+fn last_thread_exit_marks_robust_list_and_pending_owner_died() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+    let aspace = process_aspace(&proc_cap);
+    let page = 0x5300_0000usize;
+    let head = page as u64;
+    let entry = head + 0x20;
+    let pending = head + 0x40;
+    let futex_offset = 8u64;
+    let futex = entry + futex_offset;
+    let pending_futex = pending + futex_offset;
+    const FUTEX_WAITERS: u32 = 0x8000_0000;
+    const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+
+    map_user_page(&aspace, page);
+    write_user_u64(&aspace, head, entry);
+    write_user_u64(&aspace, head + 8, futex_offset);
+    write_user_u64(&aspace, head + 16, pending);
+    write_user_u64(&aspace, entry, head);
+    write_user_u64(&aspace, pending, 0);
+    write_user_u32(&aspace, futex, FUTEX_WAITERS | leader.tid.0);
+    write_user_u32(&aspace, pending_futex, leader.tid.0);
+    {
+        let payload_guard = leader.payload.lock();
+        let payload = payload_guard.as_ref().expect("live thread payload");
+        *payload.robust_list_head.lock() = Some(head);
+        *payload.robust_list_len.lock() = 24;
+    }
+
+    step_thread_exit(leader, 99);
+
+    assert_eq!(
+        read_user_u32(&aspace, futex),
+        FUTEX_WAITERS | FUTEX_OWNER_DIED,
+        "list entry should preserve FUTEX_WAITERS and set FUTEX_OWNER_DIED",
+    );
+    assert_eq!(
+        read_user_u32(&aspace, pending_futex),
+        FUTEX_OWNER_DIED,
+        "list_op_pending should be processed in addition to the list",
+    );
 }
 
 #[test]

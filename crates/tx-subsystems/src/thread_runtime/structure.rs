@@ -15,9 +15,10 @@ use crate::thread_runtime::adapter::reactor_entry::{
     TaskKey, UserspaceRunRequest, UserspaceRunSlot,
 };
 use crate::thread_runtime::adapter::step_engine::{
-    Dead, Entity, PayloadCap, PayloadPolicy, SpinMutex, TaskMailbox, Weak, Zone, ZoneAllocated,
+    Cap, Dead, Entity, PayloadCap, PayloadPolicy, SpinMutex, TaskMailbox, Weak, Zone, ZoneAllocated,
 };
 
+use crate::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use crate::process::ProcessIdentity;
 use crate::signal::{InterruptSummary, PendingSignalQueue, SignalMask};
 
@@ -108,8 +109,10 @@ impl Entity for ThreadIdentity {
 /// Thread payload. Dropped on `step_thread_exit`.
 ///
 /// `task` is the reactor `TaskKey` driving this thread's future. It is
-/// `None` until the reactor coupling lands (β4); for now construction
-/// paths leave it `None` and tests do not exercise reactor wiring.
+/// `None` before the thread is submitted to the reactor and after the
+/// live payload is torn down. Boot and clone submission bind it through
+/// [`bind_thread_task`], giving syscall-facing paths a TID → thread →
+/// task lookup without reaching into kernel-private reactor tables.
 ///
 /// Trap-shell hand-off fields (`userspace_slot`, `active_request`,
 /// `saved_user_context`, `pending_syscall_return`) realise the
@@ -271,10 +274,24 @@ impl ThreadPayload {
         self.mailbox.lock().clone()
     }
 
-    /// Snapshot the reactor task handle, if one has been bound. Always
-    /// `None` until the reactor coupling lands.
+    /// Snapshot the reactor task handle, if one has been bound.
     pub fn task(&self) -> Option<TaskKey> {
         *self.task.lock()
+    }
+
+    /// Bind the reactor task that drives this thread future. Returns
+    /// the previous task key if this payload was already bound.
+    pub fn bind_task(&self, task: TaskKey) -> Option<TaskKey> {
+        let mut slot = self.task.lock();
+        let previous = *slot;
+        *slot = Some(task);
+        previous
+    }
+
+    /// Clear the reactor task binding, returning the previous task key
+    /// if one was present.
+    pub fn clear_task(&self) -> Option<TaskKey> {
+        self.task.lock().take()
     }
 
     /// Borrow the userspace-run slot owned by this thread. The trap
@@ -492,6 +509,12 @@ pub fn current_thread_payload(hart: usize) -> Option<PayloadCap<ThreadPayload>> 
     CURRENT_THREAD_PAYLOAD.slots[hart].lock().clone()
 }
 
+/// Return the reactor task for the currently-polled thread payload on
+/// `hart`, if both the per-hart payload slot and task binding exist.
+pub fn current_thread_task(hart: usize) -> Option<TaskKey> {
+    current_thread_payload(hart).and_then(|payload| payload.task())
+}
+
 /// Return the payload that most recently entered userspace on `hart`.
 ///
 /// Unlike [`current_thread_payload`], this slot spans the machine userspace
@@ -571,6 +594,34 @@ pub fn clear_current_userspace_payload(hart: usize) -> Option<PayloadCap<ThreadP
     LAST_USERSPACE_CLEAR_HART.store(hart as u64, Ordering::Relaxed);
     USERSPACE_CLEAR_COUNT.fetch_add(1, Ordering::Relaxed);
     cleared
+}
+
+/// Resolve a live thread identity by TID through the process namespace's
+/// authoritative `PidName::Thread` binding.
+pub fn thread_by_tid(tid: Tid) -> Option<Cap<ThreadIdentity>> {
+    match resolve_pid_number_as(tid.0 as u64, PidNameKind::Thread) {
+        Some(PidName::Thread(thread)) => Some(thread),
+        _ => None,
+    }
+}
+
+/// Resolve a live thread payload by TID. Zombie threads may still have
+/// a retained identity, but they no longer expose an operational payload.
+pub fn thread_payload_by_tid(tid: Tid) -> Option<PayloadCap<ThreadPayload>> {
+    thread_by_tid(tid).and_then(|thread| thread.payload_cap())
+}
+
+/// Resolve the reactor task bound to a live thread TID.
+pub fn thread_task_by_tid(tid: Tid) -> Option<TaskKey> {
+    thread_payload_by_tid(tid).and_then(|payload| payload.task())
+}
+
+/// Bind a reactor task to a thread identity's live payload. Returns the
+/// previous binding, or `None` when the thread is a zombie or unbound.
+pub fn bind_thread_task(thread: &Cap<ThreadIdentity>, task: TaskKey) -> Option<TaskKey> {
+    thread
+        .payload_cap()
+        .and_then(|payload| payload.bind_task(task))
 }
 
 pub fn userspace_payload_trace_counters() -> (u64, u64, u64, u64) {

@@ -1,0 +1,224 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-05-26-futex-pi-rtmutex-tree",
+  "title": "Futex PI Linux rt_mutex priority-tree model",
+  "status": "complete",
+  "created": "2026-05-26",
+  "updated": "2026-05-26",
+  "owner": "codex",
+  "summary": "Replace Tx futex PI's vector-scan donation model with a Linux-style per-lock priority waiter tree and per-task pi_waiters top-waiter model.",
+  "scope": {
+    "in": [
+      "crates/tx-reactor/src/scheduler.rs",
+      "crates/tx-reactor/src/runtime.rs",
+      "crates/tx-reactor/src/lib.rs",
+      "crates/tx-subsystems/src/reactor_priority.rs",
+      "crates/tx-subsystems/src/futex/mod.rs",
+      "crates/tx-shims/src/linux_syscall/tests/futex_dispatch.rs",
+      "crates/tx-reactor/tests/scheduler.rs",
+      "crates/tx-kernel/src/init/exec.rs",
+      "crates/tx-kernel/src/init/reactor_submit.rs",
+      "crates/tx-kernel/src/adapter.rs",
+      "docs/progress/STATUS.md",
+      "docs/progress/research/2026-05-26-futex-pi-requeue-priority-boost-readiness.md"
+    ],
+    "out": [
+      "literal-linux-rb-node-implementation",
+      "full-sched-deadline-runtime-semantics",
+      "reusable-guest-pthread-pi-condvar-regression-harness"
+    ],
+    "write_sets": [
+      {
+        "owner": "codex",
+        "paths": [
+          "crates/tx-reactor/src/",
+          "crates/tx-reactor/tests/scheduler.rs",
+          "crates/tx-subsystems/src/reactor_priority.rs",
+          "crates/tx-subsystems/src/futex/mod.rs",
+          "crates/tx-shims/src/linux_syscall/tests/futex_dispatch.rs",
+          "crates/tx-kernel/src/init/",
+          "crates/tx-kernel/src/adapter.rs",
+          "docs/progress/"
+        ],
+        "notes": "Single-agent rt_mutex-model slice in codex/futex-linux-compat worktree."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/02_execution/SCHEDULER_v0.md",
+      "docs/design/02_execution/THREAD_RUNTIME_v1.md",
+      "docs/Txv3/03_STEP_MODEL_v2.md"
+    ],
+    "progress_refs": [
+      "docs/progress/research/2026-05-26-futex-pi-requeue-priority-boost-readiness.md",
+      "docs/progress/plans/2026-05-26-futex-pi-cycle-cleanup.json",
+      "docs/progress/STATUS.md"
+    ],
+    "external_refs": [
+      "https://docs.kernel.org/next/locking/rt-mutex-design.html",
+      "https://codebrowser.dev/linux/linux/kernel/locking/rtmutex.c.html",
+      "https://codebrowser.dev/linux/linux/include/linux/rtmutex.h.html"
+    ]
+  },
+  "steps": [
+    {
+      "id": "step-1",
+      "title": "Add scheduler task pi_waiters API and tests",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-reactor/src/scheduler.rs",
+        "crates/tx-reactor/tests/scheduler.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor pi_waiter -- --test-threads=1"
+      ],
+      "notes": "Added PiLockToken, PriorityKey, upsert/remove pi_waiter APIs, and task effective-priority-key queries. Existing donation tokens now map onto legacy pi_waiter keys rather than a separate donation vector."
+    },
+    {
+      "id": "step-2",
+      "title": "Expose task pi_waiters through reactor_priority seam",
+      "status": "complete",
+      "depends_on": [
+        "step-1"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/runtime.rs",
+        "crates/tx-subsystems/src/reactor_priority.rs",
+        "crates/tx-kernel/src/init/exec.rs",
+        "crates/tx-kernel/src/init/reactor_submit.rs",
+        "crates/tx-kernel/src/adapter.rs",
+        "crates/tx-shims/src/linux_syscall/tests/futex_dispatch.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-shims futex_dispatch -- --test-threads=1"
+      ],
+      "notes": "The seam now exposes upsert_pi_waiter, remove_pi_waiter, and task_effective_priority_key alongside the compatibility donation facade."
+    },
+    {
+      "id": "step-3",
+      "title": "Replace futex PI vector table with per-lock priority trees",
+      "status": "complete",
+      "depends_on": [
+        "step-2"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/futex/mod.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems futex -- --test-threads=1",
+        "cargo test -p tx-shims futex_dispatch -- --test-threads=1"
+      ],
+      "notes": "FutexPiTable now maps each FutexKey to FutexPiLockState with waiters_by_order, waiters_by_id, cached top_waiter, owner_tid, stable waiter IDs, waiter TaskKey, and blocked_on_key metadata."
+    },
+    {
+      "id": "step-4",
+      "title": "Retarget handoff, cancel, timeout, and requeue to top-waiter model",
+      "status": "complete",
+      "depends_on": [
+        "step-3"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/futex/mod.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-shims deboosts_owner_chain -- --test-threads=1",
+        "cargo test -p tx-shims futex_dispatch -- --test-threads=1"
+      ],
+      "notes": "Unlock pops the cached top waiter, removes the old owner's pi_waiters entry, transfers remaining top donation to the new owner, and wakes only the handed-off waiter. Cancel and timeout remove waiter rows by source id and propagate deboost through blocked-owner chains."
+    },
+    {
+      "id": "step-5",
+      "title": "Run verification and progress catch-up",
+      "status": "complete",
+      "depends_on": [
+        "step-4"
+      ],
+      "paths": [
+        "docs/progress/STATUS.md",
+        "docs/progress/research/2026-05-26-futex-pi-requeue-priority-boost-readiness.md",
+        "docs/progress/plans/2026-05-26-futex-pi-rtmutex-tree.json"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor scheduler -- --test-threads=1",
+        "cargo test -p tx-reactor pi_waiter -- --test-threads=1",
+        "cargo test -p tx-shims futex_dispatch -- --test-threads=1",
+        "cargo test -p tx-subsystems futex -- --test-threads=1",
+        "cargo test -p tx-subsystems --test v3_futex_waitsource -- --test-threads=1",
+        "cargo fmt --check",
+        "cargo -q xtask unit",
+        "cargo xtask progress validate",
+        "git diff --check"
+      ],
+      "notes": "Progress artifacts record the rt_mutex-model implementation and remaining evidence gap."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test -p tx-reactor scheduler -- --test-threads=1",
+      "status": "passed",
+      "notes": "Scheduler-filtered reactor test command passed; integration-test name filtering means the new pi_waiter tests are covered by the separate pi_waiter command."
+    },
+    {
+      "command": "cargo test -p tx-reactor pi_waiter -- --test-threads=1",
+      "status": "passed",
+      "notes": "The new scheduler pi_waiters tests passed."
+    },
+    {
+      "command": "cargo test -p tx-shims futex_dispatch -- --test-threads=1",
+      "status": "passed",
+      "notes": "48 futex dispatch tests passed after rt_mutex-model migration."
+    },
+    {
+      "command": "cargo test -p tx-subsystems futex -- --test-threads=1",
+      "status": "passed",
+      "notes": "30 futex-filtered subsystem tests plus v3_futex_waitsource filtered test passed during focused run."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --test v3_futex_waitsource -- --test-threads=1",
+      "status": "passed",
+      "notes": "8 v3 futex wait-source tests passed."
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed",
+      "notes": "Formatting check passed after applying cargo fmt."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "passed",
+      "notes": "Build plus tx-shims, tx-kernel, tx-ext4, and tx-scripts unit gates passed."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Progress records validated after replacing prose scope tokens with schema-safe tokens."
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed",
+      "notes": "Whitespace check passed."
+    },
+    {
+      "command": "OSCOMP_OUT_RV=target/oscomp/os_serial_out_pthread_pi_condvar_write_20260526.txt tools/guest-tests/run-pthread-pi-condvar-rv64.sh",
+      "status": "passed",
+      "notes": "Helper built the static RV64 musl PTHREAD_PRIO_INHERIT condvar test, injected a private sdcard copy, ran it through basic_testcode.sh, observed PASS pthread-pi-condvar, wrapper return 0, guest exit 0, and no trap lines."
+    },
+    {
+      "command": "cargo xtask fault-decode --target rv64-qemu --serial target/oscomp/os_serial_out_pthread_pi_condvar_write_20260526.txt --all --brief",
+      "status": "passed",
+      "notes": "No scause/sepc/stval trap lines found; expected negative trap evidence for the clean guest run."
+    }
+  ],
+  "risks": [
+    "PriorityKey currently models RT priority and FIFO order; SCHED_DEADLINE ordering is represented as future API space, not runtime-complete behavior.",
+    "The explicit guest pthread PI-condvar evidence is currently a private-image injected helper, not an OSComp judge-integrated suite.",
+    "Queued task ordering observes effective RT priority at pick time; this avoids stale queue order but is still Phase 1 queue scanning, not a full RT runqueue."
+  ],
+  "blockers": [],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

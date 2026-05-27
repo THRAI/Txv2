@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
 use tx_reactor::{
-    HartId, InitialSchedMeta, Phase1Scheduler, Reactor, RescheduleSignal, RunStats, SharedReactor,
-    SliceClock, SliceConfig, StopReason, TaskHandle, TaskId, TaskStatus, WakeDispatchReport,
-    WakeHint,
+    HartId, InitialSchedMeta, Phase1Scheduler, PriorityBoostError, Reactor, RescheduleSignal,
+    RunStats, SharedReactor, SliceClock, SliceConfig, StopReason, TaskHandle, TaskId, TaskStatus,
+    WakeDispatchReport, WakeHint,
 };
 use tx_substrate::step::{InterestMask, WaitSourceId};
 use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox, WaitGeneration};
@@ -668,6 +668,37 @@ fn runtime_affinity_update_moves_queued_task_and_dispatches_remote_marker() {
             .next_scheduled_task(HartId(1))
             .map(|(handle, _)| handle.id()),
         Some(task.id())
+    );
+}
+
+#[test]
+fn reactor_priority_donation_facade_updates_effective_priority() {
+    let reactor = Reactor::new();
+    let owner = reactor.submit_task_with_meta(async {}, InitialSchedMeta::fair());
+    let donor = reactor.submit_task_with_meta(async {}, InitialSchedMeta::fair());
+
+    assert_eq!(reactor.task_effective_rt_priority(owner), Ok(0));
+    let token = reactor
+        .donate_priority(owner, donor, 40)
+        .expect("live donor can boost live owner");
+    assert_eq!(reactor.task_effective_rt_priority(owner), Ok(40));
+
+    reactor
+        .drop_priority_donation(token)
+        .expect("token revokes exact donation edge");
+    assert_eq!(reactor.task_effective_rt_priority(owner), Ok(0));
+}
+
+#[test]
+fn reactor_priority_donation_facade_rejects_terminal_tasks() {
+    let reactor = Reactor::new();
+    let owner = reactor.submit_task_with_meta(async {}, InitialSchedMeta::fair());
+    let donor = reactor.submit_task_with_meta(async {}, InitialSchedMeta::fair());
+
+    reactor.cancel_task(donor).expect("cancel donor");
+    assert_eq!(
+        reactor.donate_priority(owner, donor, 40),
+        Err(PriorityBoostError::TerminalTask)
     );
 }
 

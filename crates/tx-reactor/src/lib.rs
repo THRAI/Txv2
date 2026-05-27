@@ -48,8 +48,9 @@ pub use runtime::{
 };
 pub use scheduler::{
     HartId, HartSchedulerLocal, InitialSchedMeta, LocalEnqueueRequest, MigrationPolicy,
-    Phase1QueueKind, Phase1Scheduler, RunnablePlacement, SchedClass, SchedulerAffinityError,
-    SchedulerStats, SliceConfig, StopReason, TaskHandle, TaskRunOwner, WakeHint,
+    Phase1QueueKind, Phase1Scheduler, PiLockToken, PriorityBoostError, PriorityBoostToken,
+    PriorityKey, RunnablePlacement, SchedClass, SchedulerAffinityError, SchedulerStats,
+    SliceConfig, StopReason, TaskHandle, TaskRunOwner, WakeHint,
 };
 pub use task::{
     current_delegate_registry, current_task_mailbox, current_timer_wheel, TaskDrainRecord, TaskId,

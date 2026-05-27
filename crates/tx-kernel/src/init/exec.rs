@@ -532,6 +532,17 @@ impl<P: TxPlatform> CoreInit<P> {
         );
     }
 
+    pub(crate) fn install_reactor_priority_seam() {
+        tx_subsystems::reactor_priority::install_priority_donation(
+            Self::donate_thread_priority,
+            Self::drop_thread_priority_donation,
+            Self::get_thread_effective_rt_priority,
+            Self::upsert_thread_pi_waiter,
+            Self::remove_thread_pi_waiter,
+            Self::get_thread_effective_priority_key,
+        );
+    }
+
     /// Install the timer-sleep seam so `sys_nanosleep` / `sys_clock_nanosleep`
     /// in `tx-shims` can park the calling task until a real deadline fires
     /// in the BSP reactor's timer queue. Must be called before the reactor
@@ -615,6 +626,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // here so the seam stays parameter-free at the call site.
         Self::install_reactor_submit_seam();
         Self::install_reactor_affinity_seam();
+        Self::install_reactor_priority_seam();
         Self::install_sleep_seam();
 
         let Some(init) = tx_subsystems::process::execution::init_process() else {
@@ -1079,6 +1091,7 @@ fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
         "iperf" => Some("iperf_testcode.sh"),
         "cyclictest" => Some("cyclictest_testcode.sh"),
         "ltp" => Some("ltp_testcode.sh"),
+        "pthread-pi-condvar" => Some("pthread_pi_condvar_testcode.sh"),
         _ => None,
     }
 }
@@ -1199,5 +1212,13 @@ mod tests {
             cmd.contains("; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"")
         );
         assert!(!cmd.contains("basic_testcode.sh && ./busybox echo"));
+    }
+
+    #[test]
+    fn pthread_pi_condvar_group_routes_to_branch_local_testcode() {
+        assert_eq!(
+            oscomp_musl_script_for_group("pthread-pi-condvar"),
+            Some("pthread_pi_condvar_testcode.sh")
+        );
     }
 }

@@ -62,7 +62,7 @@ pub fn new_source(id: u64) -> Arc<WaitSource> {
 /// Replaces the per-subsystem adapter pattern
 /// `source.notify(InterestMask::new(mask_bits))`.
 /// Future observation hooks attach here in one place.
-pub fn notify(source: &WaitSource, mask_bits: u64) {
+pub fn notify(source: &WaitSource, mask_bits: u64) -> usize {
     use crate::step::InterestMask;
-    source.notify(InterestMask::new(mask_bits));
+    source.notify(InterestMask::new(mask_bits))
 }

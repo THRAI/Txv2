@@ -22,14 +22,12 @@ mod readiness {
     const MQ_CAN_SEND: u64 = 1;
 
     pub(crate) fn notify_message_available(channel: &Channel, source: &Arc<WaitSource>) -> usize {
-        let legacy = channel.fire(Mask::from_bits(MQ_CAN_RECV));
-        wait_routing::notify_v3_source(source, MQ_CAN_RECV);
-        legacy.saturating_add(source.subscriber_count())
+        channel.fire(Mask::from_bits(MQ_CAN_RECV))
+            + wait_routing::notify_v3_source(source, MQ_CAN_RECV)
     }
 
     pub(crate) fn notify_space_available(channel: &Channel, source: &Arc<WaitSource>) -> usize {
-        let legacy = channel.fire(Mask::from_bits(MQ_CAN_SEND));
-        wait_routing::notify_v3_source(source, MQ_CAN_SEND);
-        legacy.saturating_add(source.subscriber_count())
+        channel.fire(Mask::from_bits(MQ_CAN_SEND))
+            + wait_routing::notify_v3_source(source, MQ_CAN_SEND)
     }
 }

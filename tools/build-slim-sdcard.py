@@ -36,7 +36,7 @@ import tempfile
 # ── config model ──────────────────────────────────────────────────────────
 
 class SuiteConfig:
-    def __init__(self, name: str, cases: list[str] | None = None):
+    def __init__(self, name: str, cases=None):
         self.name = name
         self.cases = cases
 
@@ -94,11 +94,13 @@ def _dfsdump(debugfs, image, ext4_path, local_path, *, executable=False):
 def _dfswrite(debugfs, image, local_path, ext4_path):
     d = os.path.dirname(ext4_path) or "/"
     b = os.path.basename(ext4_path)
-    # write file, then set permissions to 755 for scripts/binaries
+    # write file, then set regular-file type plus permissions.  `sif mode`
+    # replaces the full inode mode, so permission bits alone would create an
+    # ext4 inode with no file type.
     st = os.stat(local_path)
     mode = st.st_mode & 0o777
-    # debugfs sif takes decimal mode
-    cmds = f"cd {d}\nwrite {local_path} {b}\nsif {b} mode 0{oct(mode)[2:]}\n"
+    full_mode = 0o100000 | mode
+    cmds = f"cd {d}\nwrite {local_path} {b}\nsif {b} mode 0{oct(full_mode)[2:]}\n"
     r = subprocess.run([debugfs, "-w", "-f", "-", image],
                        input=cmds, capture_output=True, text=True)
     return r.returncode == 0
@@ -188,7 +190,7 @@ SUITE_DEFS = {
         "case_dir": "ltp/testcases/bin",
         # When cases specified: extract these infrastructure items instead of
         # the full ltp/ tree
-        "infra_dirs": ["ltp/bin", "ltp/libkirk", "ltp/metadata",
+        "infra_dirs": ["lib", "ltp/bin", "ltp/libkirk", "ltp/metadata",
                         "ltp/runtest", "ltp/scenario_groups",
                         "ltp/testscripts", "ltp/testcases/data"],
         "infra_files": ["ltp/kirk", "ltp/runltp-ng", "ltp/ltx",
@@ -578,8 +580,11 @@ def build_slim_sdcard(config: SlimConfig):
 
         # ── Step 3: Create ext4 ──
         print(f"Creating {output} ...")
+        parent = os.path.dirname(output)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         subprocess.run([mkfs, "-F", "-b", "4096", output, f"{needed_mb}M"],
-                       check=True, capture_output=True)
+                       check=True)
 
         # ── Step 4: Populate ──
         # Build sorted dir list

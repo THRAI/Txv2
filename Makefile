@@ -42,6 +42,8 @@ docker-help:
 	@echo "  make oscomp-local-la64-smp4"
 	@echo "  make oscomp-local-rv64-libctest-musl-smp4"
 	@echo "  make oscomp-local-la64-libctest-musl-smp4"
+	@echo "  make oscomp-rv64-pthread-pi-condvar"
+	@echo "  make oscomp-rv64-ltp-futex"
 	@echo "  make oscomp-export-testcase"
 	@echo "  make docker-busybox-la64"
 	@echo "  make docker-oscomp-prepare docker-oscomp-submit docker-oscomp-run"
@@ -158,6 +160,15 @@ OSCOMP_APPEND_LA = $(if $(strip $(OSCOMP_CMDLINE)),-fw_cfg name=opt/cmdline$(COM
 OSCOMP_TESTCASE_OUT ?= target/oscomp/testcase
 OSCOMP_SERIAL_NORMALIZE = stdbuf -o0 tr -d '\000\r'
 OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'
+OSCOMP_PI_CONDVAR_SOURCE_DATA ?= target/oscomp/futex-pthread-data
+OSCOMP_PI_CONDVAR_SUBMIT ?= target/oscomp/futex-pthread-submit
+OSCOMP_PI_CONDVAR_DATA ?= target/oscomp/pi-condvar-data
+OSCOMP_PI_CONDVAR_OUT ?= target/oscomp/os_serial_out_pthread_pi_condvar_stabilize_$(shell date +%Y%m%d).txt
+OSCOMP_LTP_FUTEX_SOURCE_DATA ?= target/oscomp/testdata
+OSCOMP_LTP_FUTEX_SUBMIT ?= target/oscomp/futex-pthread-submit
+OSCOMP_LTP_FUTEX_DATA ?= target/oscomp/ltp-futex-data
+OSCOMP_LTP_FUTEX_OUT ?= target/oscomp/os_serial_out_ltp_futex_$(shell date +%Y%m%d).txt
+OSCOMP_LTP_FUTEX_CASES ?= futex_wait01,futex_wait02,futex_wait03,futex_wait04,futex_wait05,futex_wait_bitset01,futex_waitv01,futex_waitv02,futex_waitv03,futex_wake01,futex_wake02,futex_wake03,futex_wake04,futex_cmp_requeue01,futex_cmp_requeue02,get_robust_list01,set_robust_list01
 
 .PHONY: oscomp-submit oscomp-qemu-rv64 oscomp-qemu-rv64-smp4 \
 	oscomp-qemu-la64 oscomp-qemu-la64-smp4 \
@@ -167,7 +178,7 @@ OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'
 	oscomp-local-la64 oscomp-local-la64-smp4 \
 	oscomp-local-rv64-libctest-musl oscomp-local-rv64-libctest-musl-smp4 \
 	oscomp-local-la64-libctest-musl oscomp-local-la64-libctest-musl-smp4 \
-	oscomp-export-testcase
+	oscomp-rv64-pthread-pi-condvar oscomp-rv64-ltp-futex oscomp-export-testcase
 
 oscomp-submit:
 	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --submit $(OSCOMP_SUBMIT)
@@ -273,6 +284,31 @@ oscomp-local-la64-libctest-musl:
 
 oscomp-local-la64-libctest-musl-smp4:
 	$(MAKE) oscomp-local-la64-smp4 OSCOMP_GROUPS=libctest-musl
+
+oscomp-rv64-pthread-pi-condvar:
+	cargo xtask build --target rv64-qemu
+	$(MAKE) oscomp-submit-rv64 OSCOMP_SUBMIT=$(OSCOMP_PI_CONDVAR_SUBMIT)
+	OSCOMP_SOURCE_DATA=$(OSCOMP_PI_CONDVAR_SOURCE_DATA) \
+	OSCOMP_SUBMIT=$(OSCOMP_PI_CONDVAR_SUBMIT) \
+	OSCOMP_PI_CONDVAR_DATA=$(OSCOMP_PI_CONDVAR_DATA) \
+	OSCOMP_OUT_RV=$(OSCOMP_PI_CONDVAR_OUT) \
+		tools/guest-tests/run-pthread-pi-condvar-rv64.sh
+
+oscomp-rv64-ltp-futex:
+	cargo xtask build --target rv64-qemu
+	$(MAKE) oscomp-submit-rv64 OSCOMP_SUBMIT=$(OSCOMP_LTP_FUTEX_SUBMIT)
+	python3 tools/build-slim-sdcard.py \
+		--source $(OSCOMP_LTP_FUTEX_SOURCE_DATA)/sdcard-rv.img \
+		--suite ltp-musl \
+		--ltp-cases $(OSCOMP_LTP_FUTEX_CASES) \
+		--output $(OSCOMP_LTP_FUTEX_DATA)/sdcard-rv.img \
+		--size-mb 384
+	gtimeout 180s $(MAKE) oscomp-qemu-rv64 \
+		OSCOMP_DATA=$(OSCOMP_LTP_FUTEX_DATA) \
+		OSCOMP_SUBMIT=$(OSCOMP_LTP_FUTEX_SUBMIT) \
+		OSCOMP_OUT_RV=$(OSCOMP_LTP_FUTEX_OUT) \
+		OSCOMP_GROUPS=ltp-musl
+	cargo xtask fault-decode --target rv64-qemu --serial $(OSCOMP_LTP_FUTEX_OUT) --all --brief || true
 
 oscomp-export-testcase:
 	tools/oscomp-extract-testcase.sh $(OSCOMP_DATA) $(OSCOMP_TESTCASE_OUT)

@@ -60,6 +60,7 @@ pub(crate) fn set_thread_zombie(thread: &Cap<ThreadIdentity>, status: i32) {
     // last chance to observe state.
     if let Some(payload) = thread.payload.lock().as_ref() {
         post_signal_mailbox(payload, Signum::SIGKILL, SignalRouting::ProcessDirected);
+        let _ = payload.clear_task();
     }
     *thread.exit_status.lock() = Some(status);
     *thread.payload.lock() = None;
@@ -97,6 +98,14 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
         let len = *p.robust_list_len.lock();
         head.map(|h| (h, len))
     });
+
+    // robust-list walk: mark each robust futex as FUTEX_OWNER_DIED
+    // and issue FUTEX_WAKE before thread/process payload teardown can
+    // hide the owning address space. Best-effort — if the userspace
+    // pages are unmapped or the list is malformed, skip the entry.
+    if let Some((head, _len)) = robust {
+        walk_robust_list(&thread, head, 16);
+    }
 
     // observe
     // upgrade
@@ -171,13 +180,6 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
             }
         }
         drop(guard);
-    }
-
-    // robust-list walk: mark each robust futex as FUTEX_OWNER_DIED
-    // and issue FUTEX_WAKE. Best-effort — if the userspace pages
-    // are unmapped or the list is malformed, skip the entry.
-    if let Some((head, _len)) = robust {
-        walk_robust_list(&thread, head, 16);
     }
 
     if thread

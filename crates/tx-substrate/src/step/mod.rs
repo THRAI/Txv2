@@ -53,6 +53,7 @@ pub enum Errno {
     /// `TFD_TIMER_CANCEL_ON_SET` after a realtime clock change.
     /// Linux value: 125.
     ECANCELED,
+    EDEADLK,
     EDQUOT,
     EEXIST,
     EFBIG,
@@ -119,6 +120,7 @@ impl Errno {
             Errno::EBADF => 9,
             Errno::EBUSY => 16,
             Errno::ECANCELED => 125,
+            Errno::EDEADLK => 35,
             Errno::EDQUOT => 122,
             Errno::EEXIST => 17,
             Errno::EFAULT => 14,

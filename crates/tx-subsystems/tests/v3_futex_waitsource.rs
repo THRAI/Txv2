@@ -45,10 +45,9 @@
 //!    `step_futex_wait`'s `OnWaitSource` yield is the exact
 //!    `(aspace, uaddr)` wait source, not the legacy compatibility
 //!    bucket source.
-//! 8. **D2-coexistence**. A `step_futex_wake` call fires both the
-//!    legacy `Channel` AND the new `WaitSource` on the same step.
-//!    Mirrors the pipe-side `write_fires_both_legacy_channel_and_new_wait_source`
-//!    pin from PR-3D-1.
+//! 8. **v3 publication**. A `step_futex_wake` call fires the new
+//!    `WaitSource` path. The legacy channel namespace is no longer
+//!    part of the futex syscall-facing contract.
 
 extern crate alloc;
 
@@ -75,7 +74,6 @@ use tx_subsystems::vm::{
     AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
     USER_PAGE_SIZE,
 };
-use tx_subsystems::wait_source as legacy_wait_source;
 use tx_subsystems::zones;
 
 /// Minimal `PmapIf` stub for integration tests — the futex wait-source
@@ -141,6 +139,11 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
         StepOutcome::Done(n) if n > 0
     ) {}
     drop(cleanup_guard);
+    if let Some(source) = bucket_wait_source(stale_uaddr) {
+        let mailbox = Arc::new(TaskMailbox::new());
+        let (_guard, _gen) = register(&source, &mailbox, FUTEX_WAKE_MASK);
+        while mailbox.poll().is_some() {}
+    }
     guard
 }
 
@@ -473,10 +476,10 @@ fn wait_source_id_round_trips_from_yield_shape_to_bucket_source() {
     assert_eq!(wake, StepOutcome::Done(1));
 }
 
-// === Invariant 8: D2 coexistence — both paths fire =====================
+// === Invariant 8: v3 publication path fires ============================
 
 #[test]
-fn wake_fires_both_legacy_channel_and_new_wait_source() {
+fn wake_fires_new_wait_source_publication_path() {
     let _setup = setup();
     let word: u32 = 0;
     let uaddr = &word as *const u32 as u64;
@@ -484,18 +487,6 @@ fn wake_fires_both_legacy_channel_and_new_wait_source() {
     let mailbox = Arc::new(TaskMailbox::new());
 
     let (_g, gen) = register(&source, &mailbox, FUTEX_WAKE_MASK);
-
-    // Sanity: the legacy `Channel` is still resolvable via the
-    // legacy `wait_source` registry under the same id. The legacy
-    // path's wake is `Channel::fire` — we don't directly drive a
-    // `WaitFuture` here (that requires async coordination), but we
-    // pin that the legacy id namespace is intact AND the new path
-    // is additive (mailbox receives an event in addition to whatever
-    // the legacy `Channel.fire` does).
-    assert!(
-        legacy_wait_source::lookup_wait_channel(source.id().raw()).is_some(),
-        "legacy Channel must remain resolvable under the same source_id",
-    );
 
     let guard = ebr_guard();
     let outcome = step_futex_wake(uaddr, 1, &guard);

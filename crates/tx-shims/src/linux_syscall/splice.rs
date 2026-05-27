@@ -254,12 +254,9 @@ async fn splice_pipe_to_file<'a, P: tx_hal::TimeIf>(
     }
     let mut buf = alloc::vec::Vec::new();
     buf.resize(len, 0);
-    let peek = {
-        let guard = step_engine::guard();
-        tx_subsystems::pipe::step_peek(&in_pipe.payload, &mut buf, &guard, in_pipe.nonblocking)
-    };
+    let peek = peek_pipe_to_kernel(&in_pipe, &mut buf);
 
-    match splice_outcome_to_result(peek) {
+    match peek {
         SyscallResult::Return(n) if n <= 0 => SyscallResult::Return(n),
         SyscallResult::Return(n) => {
             let n = n as usize;
@@ -307,6 +304,14 @@ async fn splice_pipe_to_file<'a, P: tx_hal::TimeIf>(
         }
         other => other,
     }
+}
+
+fn peek_pipe_to_kernel(in_pipe: &PipeEnd, buf: &mut [u8]) -> SyscallResult {
+    let guard = step_engine::guard();
+    let outcome =
+        tx_subsystems::pipe::step_peek(&in_pipe.payload, buf, &guard, in_pipe.nonblocking);
+    drop(guard);
+    splice_outcome_to_result(outcome)
 }
 
 fn try_splice_pipe_lease_to_file<'a>(
@@ -517,14 +522,8 @@ async fn read_file_to_kernel<'a, P: tx_hal::TimeIf>(
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    if let OpenFileBacking::Rnode { rnode } = file.backing() {
-        if let RNodeBacking::PageBacked { pc } = rnode.backing() {
-            let outcome = {
-                let guard = step_engine::guard();
-                tx_subsystems::page_backed::step_read_to_kernel(pc, &file, buf, &guard)
-            };
-            return splice_outcome_to_result(outcome);
-        }
+    if let Some(result) = try_read_page_backed_to_kernel(&file, buf) {
+        return result;
     }
     sys_read::<P>(
         [
@@ -540,25 +539,45 @@ async fn read_file_to_kernel<'a, P: tx_hal::TimeIf>(
     .await
 }
 
+fn try_read_page_backed_to_kernel(file: &Cap<OpenFile>, buf: &mut [u8]) -> Option<SyscallResult> {
+    let OpenFileBacking::Rnode { rnode } = file.backing() else {
+        return None;
+    };
+    let RNodeBacking::PageBacked { pc } = rnode.backing() else {
+        return None;
+    };
+    let guard = step_engine::guard();
+    let outcome = tx_subsystems::page_backed::step_read_to_kernel(pc, file, buf, &guard);
+    drop(guard);
+    Some(splice_outcome_to_result(outcome))
+}
+
 async fn write_file_from_kernel<'a>(fd: i32, buf: &[u8], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let file = match resolve_fd(&ctx.process, fd as u32) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    if let OpenFileBacking::Rnode { rnode } = file.backing() {
-        if let RNodeBacking::PageBacked { pc } = rnode.backing() {
-            let outcome = {
-                let guard = step_engine::guard();
-                tx_subsystems::page_backed::step_write_from_kernel(pc, &file, buf, &guard)
-            };
-            return splice_outcome_to_result(outcome);
-        }
+    if let Some(result) = try_write_page_backed_from_kernel(&file, buf) {
+        return result;
     }
     sys_write(
         [fd as u64, buf.as_ptr() as u64, buf.len() as u64, 0, 0, 0],
         ctx,
     )
     .await
+}
+
+fn try_write_page_backed_from_kernel(file: &Cap<OpenFile>, buf: &[u8]) -> Option<SyscallResult> {
+    let OpenFileBacking::Rnode { rnode } = file.backing() else {
+        return None;
+    };
+    let RNodeBacking::PageBacked { pc } = rnode.backing() else {
+        return None;
+    };
+    let guard = step_engine::guard();
+    let outcome = tx_subsystems::page_backed::step_write_from_kernel(pc, file, buf, &guard);
+    drop(guard);
+    Some(splice_outcome_to_result(outcome))
 }
 
 fn splice_outcome_to_result(

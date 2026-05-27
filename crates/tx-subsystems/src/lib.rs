@@ -22,6 +22,7 @@ pub mod page_backed;
 pub mod pipe;
 pub mod process;
 pub mod reactor_affinity;
+pub mod reactor_priority;
 pub mod reactor_submit;
 pub mod shared;
 pub mod signal;
@@ -120,6 +121,12 @@ pub mod cross_crate_test_support {
     /// install a process-local fake hook.
     pub fn reset_reactor_affinity_seam() {
         crate::reactor_affinity::reset_for_test();
+    }
+
+    /// Clear the reactor priority-donation seam. Used by tests that install a
+    /// process-local fake hook.
+    pub fn reset_reactor_priority_seam() {
+        crate::reactor_priority::reset_for_test();
     }
 
     /// Clear `effective_caps` and `permitted_caps` to

@@ -324,6 +324,11 @@ use alloc::sync::Arc;
 /// registering a high source id does not allocate empty slots up to that id.
 static REGISTRY: SpinMutex<BTreeMap<u64, Arc<WaitSource>>> = SpinMutex::new(BTreeMap::new());
 
+#[cfg(test)]
+fn debug_registry_slots_len() -> usize {
+    REGISTRY.lock().len()
+}
+
 /// Register a source in the global registry so the driver can find it
 /// by [`WaitSourceId`] during yield resolution.
 pub fn register_source(source: Arc<WaitSource>) {
@@ -456,8 +461,28 @@ mod tests {
     use super::*;
     use alloc::sync::Arc;
 
+    static REGISTRY_TEST_LOCK: SpinMutex<()> = SpinMutex::new(());
+
     fn mb() -> Arc<TaskMailbox> {
         Arc::new(TaskMailbox::new())
+    }
+
+    fn registry_test_lock() -> crate::SpinMutexGuard<'static, ()> {
+        REGISTRY_TEST_LOCK.lock()
+    }
+
+    #[test]
+    fn global_registry_stays_sparse_for_large_wait_source_ids() {
+        let _lock = registry_test_lock();
+        clear_registry_for_test();
+        let id = WaitSourceId::new(4096);
+        let source = Arc::new(WaitSource::new(id));
+
+        register_source(Arc::clone(&source));
+
+        assert_eq!(lookup_source(id).expect("source registered").id(), id);
+        assert_eq!(debug_registry_slots_len(), 1);
+        unregister_source(id);
     }
 
     #[test]
@@ -699,6 +724,7 @@ mod tests {
 
     #[test]
     fn global_registry_stores_sparse_source_ids_without_dense_growth() {
+        let _lock = registry_test_lock();
         clear_registry_for_test();
 
         let source = Arc::new(WaitSource::new(WaitSourceId::new(4096)));

@@ -480,7 +480,8 @@ fn dispatch_set_tid_address_returns_thread_tid() {
     assert_eq!(result, SyscallResult::Return(expected_tid));
 }
 
-/// `set_robust_list(_, _)` returns 0 unconditionally (stub).
+/// `set_robust_list(_, sizeof(struct robust_list_head))` records
+/// the current thread's robust-list head.
 #[test]
 fn dispatch_set_robust_list_returns_zero() {
     let _setup = setup();
@@ -491,6 +492,18 @@ fn dispatch_set_robust_list_returns_zero() {
     let req = SyscallRequest::new(NR_SET_ROBUST_LIST, [0xdead_beef, 24, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
+}
+
+#[test]
+fn dispatch_set_robust_list_invalid_len_returns_einval() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let req = SyscallRequest::new(NR_SET_ROBUST_LIST, [0xdead_beef, 16, 0, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(EINVAL_VALUE));
 }
 
 /// `get_robust_list(0, headp, lenp)` round-trips the current thread's

@@ -292,14 +292,14 @@ When you implement or change a syscall:
 _Counts read from `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}` and checked against Linux RV64 v6.17 from `xtask/data/syscalls/riscv/64/rv64/linux-6.17-table.json` (source: https://syscalls.mebeim.net/db/riscv/64/rv64/latest/table.json). Linux file/line references point into `external/linux-rv-6.17`._
 _Run `cargo xtask syscall-status --regen` to refresh; `--check` to lint in CI._
 
-- **`NR_*` defined:** 244
+- **`NR_*` defined:** 248
 - **Linux RV64 reference syscalls:** 320
-- **Dispatched (has a match arm):** 240
+- **Dispatched (has a match arm):** 244
 - **Defined but not dispatched:** 4 — see list below
 
-- **True missing vs Linux RV64 reference:** 76
+- **True missing vs Linux RV64 reference:** 75
 - **Number mismatches vs Linux RV64 reference:** 0
-- **Local `NR_*` not in Linux RV64 reference:** 0
+- **Local `NR_*` not in Linux RV64 reference:** 3
 
 #### Defined but not dispatched
 
@@ -379,7 +379,6 @@ Linux RV64 v6.17 syscalls that have no local `NR_*` constant. This is the greenf
 | 446 | `landlock_restrict_self` | `const int ruleset_fd, const __u32 flags` | `security/landlock/syscalls.c`:478 |
 | 447 | `memfd_secret` | `unsigned int flags` | `mm/secretmem.c`:225 |
 | 448 | `process_mrelease` | `int pidfd, unsigned int flags` | `mm/oom_kill.c`:1204 |
-| 449 | `futex_waitv` | `struct futex_waitv *waiters, unsigned int nr_futexes, unsigned int flags, struct __kern…` | `kernel/futex/syscalls.c`:290 |
 | 450 | `set_mempolicy_home_node` | `unsigned long start, unsigned long len, unsigned long home_node, unsigned long flags` | `mm/mempolicy.c`:1685 |
 | 451 | `cachestat` | `unsigned int fd, struct cachestat_range *cstat_range, struct cachestat *cstat, unsigned…` | `mm/filemap.c`:4571 |
 | 454 | `futex_wake` | `void *uaddr, unsigned long mask, int nr, unsigned int flags` | `kernel/futex/syscalls.c`:338 |
@@ -395,6 +394,15 @@ Linux RV64 v6.17 syscalls that have no local `NR_*` constant. This is the greenf
 | 468 | `file_getattr` | `int dfd, const char *filename, struct file_attr *ufattr, size_t usize, unsigned int at_…` | `fs/file_attr.c`:382 |
 | 469 | `file_setattr` | `int dfd, const char *filename, struct file_attr *ufattr, size_t usize, unsigned int at_…` | `fs/file_attr.c`:437 |
 
+#### Local `NR_*` not in Linux RV64 reference
+
+These constants are not present by syscall name in the Linux RV64 v6.17 table. They are usually compatibility aliases, stale cross-arch constants, or local scaffolding and should be justified or removed.
+
+| `NR_*` | Local # |
+|---|---:|
+| `NR_FUTEX2_REQUEUE` | 456 |
+| `NR_FUTEX2_WAIT` | 455 |
+| `NR_FUTEX2_WAKE` | 454 |
 
 <!-- END AUTOGEN: syscall-table -->
 
@@ -409,14 +417,14 @@ overwritten by the next `sync`. The lint variant
 
 ### Counts (from dispatch table)
 
-- `pub const NR_*` in numbers.rs: **244**
+- `pub const NR_*` in numbers.rs: **248**
 - Linux RV64 reference syscalls: **320**
-- dispatched in mod.rs: **240** (of which async: 59, likely-stub: 4)
+- dispatched in mod.rs: **244** (of which async: 61, likely-stub: 4)
 - defined but not dispatched: **4**
 
-- true missing vs Linux RV64 reference: **76**
+- true missing vs Linux RV64 reference: **75**
 - number mismatches vs Linux RV64 reference: **0**
-- local `NR_*` not in Linux RV64 reference: **0**
+- local `NR_*` not in Linux RV64 reference: **3**
 
 ### Likely stubs (4)
 
@@ -436,7 +444,7 @@ These have a syscall number constant but no match arm in `mod.rs`. Either wire t
 - `NR_SHUTDOWN` (nr=210)
 - `NR_SOCKETPAIR` (nr=199)
 
-### True missing from local `numbers.rs` (76)
+### True missing from local `numbers.rs` (75)
 
 These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the greenfield backlog; it is distinct from defined-but-not-dispatched.
 
@@ -503,7 +511,6 @@ These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the g
 | 446 | `landlock_restrict_self` | `const int ruleset_fd, const __u32 flags` | `security/landlock/syscalls.c`:478 |
 | 447 | `memfd_secret` | `unsigned int flags` | `mm/secretmem.c`:225 |
 | 448 | `process_mrelease` | `int pidfd, unsigned int flags` | `mm/oom_kill.c`:1204 |
-| 449 | `futex_waitv` | `struct futex_waitv *waiters, unsigned int nr_futexes, unsigned int flags, struct __kernel…` | `kernel/futex/syscalls.c`:290 |
 | 450 | `set_mempolicy_home_node` | `unsigned long start, unsigned long len, unsigned long home_node, unsigned long flags` | `mm/mempolicy.c`:1685 |
 | 451 | `cachestat` | `unsigned int fd, struct cachestat_range *cstat_range, struct cachestat *cstat, unsigned i…` | `mm/filemap.c`:4571 |
 | 454 | `futex_wake` | `void *uaddr, unsigned long mask, int nr, unsigned int flags` | `kernel/futex/syscalls.c`:338 |
@@ -519,7 +526,15 @@ These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the g
 | 468 | `file_getattr` | `int dfd, const char *filename, struct file_attr *ufattr, size_t usize, unsigned int at_fl…` | `fs/file_attr.c`:382 |
 | 469 | `file_setattr` | `int dfd, const char *filename, struct file_attr *ufattr, size_t usize, unsigned int at_fl…` | `fs/file_attr.c`:437 |
 
-### Dispatched syscalls (240) — name → handler
+### Local `NR_*` not in Linux RV64 reference (3)
+
+These constants do not match a syscall name in the Linux RV64 v6.17 reference. They are usually compatibility aliases, stale cross-arch constants, or local scaffolding and should be justified or removed.
+
+- `NR_FUTEX2_REQUEUE` (nr=456)
+- `NR_FUTEX2_WAIT` (nr=455)
+- `NR_FUTEX2_WAKE` (nr=454)
+
+### Dispatched syscalls (244) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -760,7 +775,11 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 439 | `NR_FACCESSAT2` | `sys_faccessat2` | sync |
 | 440 | `NR_PROCESS_MADVISE` | `sys_process_madvise` | sync |
 | 441 | `NR_EPOLL_PWAIT2` | `sys_epoll_pwait2` | async |
+| 449 | `NR_FUTEX_WAITV` | `sys_futex_waitv` | async |
 | 452 | `NR_FCHMODAT2` | `sys_fchmodat` | sync |
+| 454 | `NR_FUTEX2_WAKE` | `sys_futex2_wake` | sync |
+| 455 | `NR_FUTEX2_WAIT` | `sys_futex2_wait` | async |
+| 456 | `NR_FUTEX2_REQUEUE` | `sys_futex2_requeue` | sync |
 | 463 | `NR_SETXATTRAT` | `sys_setxattrat` | sync |
 | 464 | `NR_GETXATTRAT` | `sys_getxattrat` | sync |
 | 465 | `NR_LISTXATTRAT` | `sys_listxattrat` | sync |

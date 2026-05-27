@@ -1,3 +1,24 @@
+- 2026-05-27 **Merged futex Linux-compat worktree into the active branch.**
+  Integrated `codex/futex-linux-compat` from
+  `/Users/3y/.codex/worktrees/futex-linux-compat/Tx`: PI/futex2 syscall
+  constants and dispatch support, Linux-shaped PI waiter/priority donation
+  machinery, reactor-priority hooks, futex guest evidence helpers, and the
+  futex stabilization handoff/plan/research progress records. Merge conflict
+  resolution preserved the current branch's AIO/time/xattr/pipe syscall
+  exports and sparse wait-source registry while adding the futex PI/futex2
+  surfaces. **Verified:** `cargo test -p tx-shims --lib
+  linux_syscall::tests::futex_dispatch -- --nocapture`; `cargo test -p
+  tx-subsystems futex -- --nocapture`; `cargo test -p tx-subsystems --test
+  v3_futex_waitsource -- --nocapture`; `cargo test -p tx-substrate
+  wait_source -- --nocapture`; `cargo check -p tx-shims -p tx-subsystems -p
+  tx-kernel`; `cargo xtask progress validate`; `cargo xtask syscall-status
+  --check`; `cargo xtask syscall sync --check`; `cargo xtask lint
+  syscall-status`; `cargo fmt --check`. **Next step:** reapply the saved
+  pre-merge WIP stash and rerun the checks that touch the restored AIO/time
+  accounting work. **Blocker:** the active worktree still has a pre-existing
+  dirty `external/linux-rv-6.17` submodule marker and a saved WIP stash that
+  must not be dropped until reapplied.
+
 - 2026-05-26 **Cleared the AIO host-test drift and wired `io_pgetevents`.**
   The older raw AIO host tests now stage `iocbpp`, `struct iocb`, and
   `struct io_event` buffers through the process `AddressSpace`, matching the
