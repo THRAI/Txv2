@@ -42,12 +42,13 @@ pub struct NsProxy {
     pub pid_ns: Cap<PidNamespace>,
     pub pid_for_children: Cap<PidNamespace>,
     pub mnt_ns: Cap<MountNamespace>,
-    pub user_ns: Cap<UserNamespace>,
+    pub user_ns: Cap<UserNamespace>,        // Tx subject-authority mirror; see below
     pub cgroup_ns: Cap<CgroupNamespace>,
     pub uts_ns: Cap<UtsNamespace>,
     pub ipc_ns: Cap<IpcNamespace>,
     pub net_ns: Cap<NetNamespace>,
     pub time_ns: Cap<TimeNamespace>,
+    pub time_ns_for_children: Cap<TimeNamespace>,
 }
 ```
 
@@ -69,8 +70,20 @@ pub struct ProcessPayload {
 `NsProxy` is immutable after publication. `clone`, `unshare`, and `setns`
 publish a new bundle or reuse an existing compatible one.
 
-The `user_ns` member is both a rendering lens for user/group IDs and the
-authority lens for Linux capability checks. A process does not become globally
+**Linux-conformance note.** Linux's `struct nsproxy` contains UTS, IPC, mount,
+`pid_ns_for_children`, network, active time, time-for-children, and cgroup
+namespace references. Linux does not store the current user namespace in
+`nsproxy`; it stores it in `cred.user_ns`. Tx may keep `user_ns` in `NsProxy` as
+a syscall-facing mirror for resolve/render convenience, but the authoritative
+capability lens is the current `Cred` / `SubjectAuthority`. Any implementation
+that stores both must maintain this invariant:
+
+```text
+current_subject_authority.user_ns == current_nsproxy.user_ns
+```
+
+unless a step is explicitly constructing a new credential and namespace bundle
+before the point-of-no-return commit. A process does not become globally
 privileged by entering a child user namespace. It gains capabilities only in
 that user namespace, and operations on another namespace or object must check
 the user namespace that owns that operation's authority domain.
@@ -329,11 +342,14 @@ pub struct UserNamespace {
 }
 ```
 
-The exact implementation may factor this through `Cred` / `SubjectAuthority`,
-but the semantics are:
+The exact implementation must factor authority through `Cred` /
+`SubjectAuthority`. `NsProxy.user_ns`, when present, is a mirror/cache of the
+current subject's credential namespace for namespace-view code; it is not a
+second source of truth. The semantics are:
 
-- every process is a member of exactly one user namespace via
-  `ProcessPayload.nsproxy.user_ns`;
+- every subject is a member of exactly one user namespace via its credential;
+- `ProcessPayload.nsproxy.user_ns` may mirror that credential user namespace for
+  resolve/render helpers, and must be kept consistent at commit boundaries;
 - `clone(CLONE_NEWUSER)` creates a child in a new user namespace;
 - `unshare(CLONE_NEWUSER)` moves the caller into a new user namespace;
 - the child/caller receives a full capability set in the new user namespace
@@ -344,7 +360,10 @@ but the semantics are:
 - `/proc/<pid>/uid_map` and `/proc/<pid>/gid_map` are write-once projected
   files that update user-namespace map state, not process credential objects;
 - `/proc/<pid>/setgroups` gates the unprivileged `gid_map` path and cannot be
-  changed after `gid_map` is written.
+  changed after `gid_map` is written;
+- procfs map/setgroups writes validate the writer's open-file/current subject
+  authority against the target `UserNamespace`; they must not authorize by
+  borrowing the target process's own credential.
 
 All non-user namespaces carry the immutable user namespace that owned them at
 creation:
@@ -367,11 +386,21 @@ that new user namespace, which lets an unprivileged caller perform
 `unshare(CLONE_NEWUSER | CLONE_NEWNET)` without first holding `CAP_SYS_ADMIN`
 in the parent user namespace.
 
+Linux also treats user namespace creation as a credential transition. For
+`clone(CLONE_NEWUSER)` and `unshare(CLONE_NEWUSER)`, Tx must construct the new
+credential/subject authority first, then create any non-user namespaces against
+that authority, and finally publish the credential and namespace bundle
+together at the point of no return. Partial publication of `Cred` without the
+matching namespace bundle, or vice versa, is forbidden.
+
 ## 7. Namespace-changing syscalls
 
 <!-- txdoc:NAMESPACE-VIEW-CHANGING-SYSCALLS-1 -->
 
-`clone`, `unshare`, and `setns` publish a new immutable `NsProxy`.
+`clone`, `unshare`, and `setns` publish a new immutable `NsProxy` and, when
+`CLONE_NEWUSER` is involved, a matching credential/subject-authority cap. Linux
+validates the full requested namespace set before committing; Tx steps must do
+the same observe -> reserve -> validate -> commit split.
 
 ```text
 unshare(CLONE_NEWUTS):
@@ -382,22 +411,51 @@ unshare(CLONE_NEWUTS):
 unshare(CLONE_NEWUSER):
   require caller effective uid/gid mapped in current user_ns
   require single-threaded process for Linux compatibility
+  unshare filesystem root/cwd context as Linux does for CLONE_NEWUSER
+  create new Cred / SubjectAuthority with user_ns swapped
   create UserNamespace with empty uid/gid maps and inherited setgroups policy
   grant full capabilities in the new user namespace only
-  create NsProxy with user_ns swapped
-  commit ProcessPayload.nsproxy old -> new
+  create NsProxy with user_ns mirror swapped
+  commit Cred and ProcessPayload.nsproxy old -> new together
 
 unshare(CLONE_NEWUSER | CLONE_NEWNET):
-  create UserNamespace first
+  create UserNamespace / Cred first
   authorize CLONE_NEWNET against the new user namespace
   create NetNamespace owned by the new user namespace
-  create NsProxy with user_ns and net_ns swapped
-  commit ProcessPayload.nsproxy old -> new
+  create NsProxy with user_ns mirror and net_ns swapped
+  commit Cred and ProcessPayload.nsproxy old -> new together
+
+unshare(CLONE_NEWNS):
+  unshare filesystem root/cwd context as Linux does for CLONE_NEWNS
+  create/copy MountNamespace owned by the caller's current user namespace
+  create NsProxy with mnt_ns swapped
+  commit fs context and ProcessPayload.nsproxy old -> new together
 
 setns(net_fd):
   validate namespace fd and permissions
+  require CAP_SYS_ADMIN in both the target net namespace's owning user_ns
+  and the caller credential's current user_ns
   create NsProxy with net_ns swapped
   commit ProcessPayload.nsproxy old -> new
+
+setns(mnt_fd):
+  validate namespace fd and permissions
+  require CAP_SYS_ADMIN in target mnt_ns.user_ns
+  require CAP_SYS_ADMIN and CAP_SYS_CHROOT in caller credential user_ns
+  install compatible root/cwd view and create NsProxy with mnt_ns swapped
+  commit fs context and ProcessPayload.nsproxy old -> new together
+
+setns(user_fd):
+  reject re-entering the same user namespace
+  require single-threaded process and unshared filesystem context
+  require CAP_SYS_ADMIN in the target user namespace
+  create new Cred / SubjectAuthority and NsProxy user_ns mirror
+  commit Cred and ProcessPayload.nsproxy old -> new together
+
+setns(pidfd, flags):
+  snapshot the target task's namespace set
+  validate every namespace selected by flags before committing any of them
+  commit Cred, fs context, and ProcessPayload.nsproxy as one publication step
 ```
 
 PID namespaces are special:
@@ -412,8 +470,23 @@ next fork/clone:
   first child in a new pid namespace becomes init_proc / pid 1 there
 ```
 
-This matches the Linux-compatible distinction between the current task's own
-pid view and the pid namespace selected for future children.
+Active PID namespace is derived from the task's `PidName` / pid object, not
+from `pid_for_children`. `pid_for_children` controls future children only.
+Linux follows this split with `task_active_pid_ns(task)` for rendering the
+current task's pid namespace and `nsproxy.pid_ns_for_children` for the namespace
+used by the next fork/clone. Tx must preserve this distinction.
+
+Time namespaces follow the same active-vs-for-children shape:
+
+```text
+unshare(CLONE_NEWTIME) / setns(time_ns_fd):
+  current time_ns is unchanged
+  time_ns_for_children is changed
+
+next fork/clone or exec transition:
+  child/execed task observes the selected time namespace according to Linux
+  time namespace rules
+```
 
 ## 8. Commit discipline
 
@@ -558,8 +631,9 @@ kill(42):
   Projected RNode over CgroupNamespace root lens
 
 /proc/self/uid_map, /proc/self/gid_map, /proc/self/setgroups:
-  Projected RNode -> ProcessIdentity -> ProcessPayload.nsproxy.user_ns
-  -> validate Linux map/setgroups write rules -> update UserNamespace state
+  Projected RNode -> ProcessIdentity -> target UserNamespace
+  -> validate writer Cred / SubjectAuthority against Linux map/setgroups rules
+  -> update UserNamespace state
 ```
 
 Projected RNodes may retain namespace objects or carry projection keys. They do
@@ -590,12 +664,12 @@ that owner link.
 |---|---|---|
 | `PidNamespace` | pid/tid/pgid/sid numeric bindings and visibility | process tree, pgrp/session membership, thread roster |
 | `MountNamespace` | visible mount topology/rooting and propagation state | file payloads, RNode semantics, filesystem driver state |
-| `UserNamespace` | uid/gid maps, setgroups policy, namespace-relative capability interpretation | process ownership tree or credential object lifetime |
+| `UserNamespace` | uid/gid maps, setgroups policy, namespace-relative capability interpretation | process ownership tree, unrelated namespace topology, or credential object lifetime |
 | `CgroupNamespace` | root-relative cgroup rendering lens | cgroup hierarchy or controller state |
 | `UtsNamespace` | hostname/domain values | process or network topology |
 | `IpcNamespace` | IPC registry domain | unrelated process topology |
 | `NetNamespace` | network registry/stack domain and immutable owning `UserNamespace` link | process/session topology or user credential lifetime |
-| `TimeNamespace` | clock offsets/rendering | timer object graph unless timers are semantically allocated there |
+| `TimeNamespace` | clock offsets/rendering plus active/for-children lensing | timer object graph unless timers are semantically allocated there |
 
 ## 11. Blast radius estimate
 
@@ -608,14 +682,14 @@ mostly mechanical once the data model is accepted.
 | Area | Impact | Required change |
 |---|---:|---|
 | PROCESS entity docs | High | Replace direct pid/tid/pgid/sid maps with `PidNamespace.numbers -> PidName`; add `NsProxy` placement; update fork/clone/exit/wait/setpgid/setsid algorithms. |
-| Syscall scripts | High | Add `SysCtx`; route pid/path/uid/cgroup/time signifiers through `ctx.nsproxy`; split resolve/operate/render phases. |
+| Syscall scripts | High | Add `SysCtx`; route pid/path/cgroup/time signifiers through `ctx.nsproxy`, route authority through `Cred` / `SubjectAuthority`, and split resolve/operate/render phases. |
 | PID allocation substrate | Medium | Add `AllocIndex` or extend index substrate with namespace-number reservation, ordered iteration, and withdrawal. Do not require the VM page-cache XArray implementation here. |
 | PROCESS commit steps | High | Add namespace index reservations/commits/withdrawals; preserve pid names through zombie; withdraw at reap. |
 | THREAD runtime | Medium | Decide whether `nsproxy` is process-payload scoped or thread-payload scoped; update `gettid`, thread creation, and thread exit name withdrawal. |
 | VFS path resolution | Medium | Route path resolution through `ctx.nsproxy.mnt_ns`; keep canonical VFS operations unchanged after resolution. |
 | procfs/sysfs | High | Carry a projection view; enumerate `PidNamespace.numbers`; projected RNodes re-read canonical state and render through the view. |
 | TTY/job control | Medium | Resolve pgid/sid numbers through pid namespace; bind TTY to canonical `ProcessGroup`/`Session`, not leader-process caps or numbers. |
-| Cred/User namespace | High | Add user namespace lens to capability checks, uid/gid rendering, procfs map writes, setgroups gating, and non-user namespace ownership. |
+| Cred/User namespace | High | Make `Cred.user_ns` / `SubjectAuthority.user_ns` the authority source of truth; keep any `NsProxy.user_ns` mirror consistent; add namespace-relative capability checks, uid/gid rendering, procfs map writes, setgroups gating, and non-user namespace ownership. |
 | Mount namespace | Medium | Clarify which mount topology is namespace-owned and which lower VFS objects remain shared. |
 | Cgroup/time namespaces | Low to Medium | Mostly projection/root/offset rendering unless deeper namespace-local allocation is added. |
 | Invariants/lints | Medium | Enforce no direct pid maps, no namespace-owned shadow process topology, no resolver helpers mutating canon, no target identities retaining `PidName`. |
@@ -644,6 +718,10 @@ The following invariants should be treated as review blockers:
 ```text
 NSPROXY-1. NsProxy is an immutable bundle of namespace references.
 It does not own the resources exposed through those namespaces.
+
+NSPROXY-2. User namespace authority is credential-owned. If an implementation
+stores `user_ns` in `NsProxy`, it is a mirror of `Cred` / `SubjectAuthority`,
+not an independent authority source.
 
 PIDNAME-1. PidNamespace owns pid/tid/pgid/sid numeric signifier bindings.
 Canonical process/session/group/thread topology is owned by PROCESS.

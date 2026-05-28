@@ -243,7 +243,7 @@ pub struct ProcessPayload {
 
 - **Thread roster.** `threads` is a DLL of ThreadIdentity entries. `thread_count` is a denormalized atomic for cheap "is there more than one thread" checks (used by fork, exec, exit_group); maintained atomically with DLL insert/remove.
 - **Frame.** Contains the Shared<T> slots (vm, fd_table, sig_actions, fs_context) and inline scalars (cwd, root, umask). See §3.
-- **Namespace context.** `nsproxy` is an immutable bundle of namespace references used by syscall resolve/render helpers. It owns no process topology. The bundle also carries `user_ns`, which is the Linux capability/uid/gid authority lens for namespace-aware checks; PROCESS stores the active bundle but does not own user-namespace maps or capability semantics.
+- **Namespace context.** `nsproxy` is an immutable bundle of namespace references used by syscall resolve/render helpers. It owns no process topology. The bundle may carry a `user_ns` mirror for view helpers, but Linux-compatible capability/uid/gid authority is credential-owned (`Cred` / `SubjectAuthority`) and must stay consistent with any mirror at publication boundaries; PROCESS stores the active bundle but does not own user-namespace maps or capability semantics.
 - **Policy.** See §4.
 - **Group-directed pending.** Process-directed signals queue here. Thread-directed signals queue on each ThreadPayload's `thread_pending`.
 - **Group exit.** Coordinates exit_group and non-initiator exec's thread-group collapse. See §5.
