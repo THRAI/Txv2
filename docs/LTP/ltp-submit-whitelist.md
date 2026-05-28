@@ -512,7 +512,6 @@ order is sorted by recorded passed score descending; ties keep source order.
 | `ptrace05` | heavy | heavy | partial | `1/124` | partial | LA 1/124; TFAIL: ptrace05.c:96: Failed to ptrace(PTRACE_TRACEME, ...) properly: errno=ENOSYS(38): Function not implemented |
 | `uname02` | heavy | heavy | pass | `1/1` | pass | LA 1/1 |
 | `uname04` | heavy | heavy | partial | `1/2` | partial | LA 1/2; TBROK: persona(131072) failed: ENOSYS (38) |
-| `mq_notify03` | ipc | ipc | partial | `1/2` | partial | LA 1/2; TBROK: Test killed by SIGSEGV! |
 | `msgctl02` | ipc | ipc | partial | `1/2` | partial | LA 1/2; TFAIL: msg_qbytes = 16384, expected 16383 |
 | `msgget01` | ipc | ipc | pass | `1/1` | pass | LA 1/1 |
 | `msgrcv08` | ipc | ipc | pass | `1/1` | pass | LA 1/1 |

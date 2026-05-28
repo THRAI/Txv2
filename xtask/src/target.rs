@@ -74,12 +74,16 @@ impl TxTarget {
     }
 
     pub(crate) fn kernel_path(self, root: &Path) -> PathBuf {
+        self.kernel_path_for_profile(root, false)
+    }
+
+    pub(crate) fn kernel_path_for_profile(self, root: &Path, release: bool) -> PathBuf {
         root.join("target")
             .join(target_triple(self).unwrap_or_else(|_| match self {
                 Self::Rv64Qemu | Self::Rv64M1DockMock => RV64_TARGET.to_string(),
                 Self::La64Qemu => LA64_TARGET_PREFERRED.to_string(),
             }))
-            .join("debug")
+            .join(if release { "release" } else { "debug" })
             .join(self.package())
     }
 }

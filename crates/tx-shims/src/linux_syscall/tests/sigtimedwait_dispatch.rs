@@ -163,6 +163,32 @@ fn sigtimedwait_ignores_signals_outside_set_returns_neg_eagain() {
     assert!(payload.pending().is_pending(Signum::SIGTERM));
 }
 
+/// A finite `SIGCHLD` wait must still honor its timeout when no child
+/// exits. The libctest `runtest` wrapper relies on this to kill a stuck
+/// child test instead of waiting forever on the process exit wait-source.
+#[test]
+fn sigtimedwait_sigchld_finite_timeout_expires_without_child_exit() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let set: u64 = SIGCHLD_BIT;
+    let set_uaddr = &set as *const u64 as u64;
+    let timeout = TestTimespec {
+        tv_sec: 0,
+        tv_nsec: 1,
+    };
+    let timeout_uaddr = &timeout as *const TestTimespec as u64;
+
+    let req = SyscallRequest::new(
+        NR_RT_SIGTIMEDWAIT,
+        [set_uaddr, 0, timeout_uaddr, SIGSETSIZE_BYTES, 0, 0],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_AGAIN));
+}
+
 /// End-to-end libctest shape: fork a child, zombify it via
 /// `step_exit_group` (which routes through
 /// `post_sigchld_to_parent` → `step_kill_process(parent,

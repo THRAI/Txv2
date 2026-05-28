@@ -98,20 +98,31 @@ impl<I: BlockImage> Ext4FsInstance<I> {
     pub(crate) fn read_dir_entries_cached(
         &self,
         inode: InodeNo,
-        start_index: usize,
+        start_offset: u64,
         out: &mut [DirEntryLite; READDIR_WINDOW_ENTRIES],
+        next_offsets: &mut [u64; READDIR_WINDOW_ENTRIES],
     ) -> Result<usize, Errno> {
-        if let Some(count) = self.dir_cache.lock().get(inode, start_index, out) {
+        if let Some(count) = self
+            .dir_cache
+            .lock()
+            .get(inode, start_offset, out, next_offsets)
+        {
             return Ok(count);
         }
 
         let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
+        let mut cached_next_offsets = [0u64; READDIR_WINDOW_ENTRIES];
         let count = self.with_pager(|pager| {
-            pager.read_dir_entries_from(inode, start_index as u64, &mut entries)
+            pager.read_dir_entries_from_offset(
+                inode,
+                start_offset,
+                &mut entries,
+                &mut cached_next_offsets,
+            )
         })?;
         self.dir_cache
             .lock()
-            .insert(inode, start_index, &entries, count);
+            .insert(inode, start_offset, &entries, &cached_next_offsets, count);
         {
             let mut lookup_cache = self.lookup_cache.lock();
             for entry in entries.iter().take(count) {
@@ -119,6 +130,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             }
         }
         out[..count].copy_from_slice(&entries[..count]);
+        next_offsets[..count].copy_from_slice(&cached_next_offsets[..count]);
         Ok(count)
     }
 
@@ -151,17 +163,32 @@ impl DirCache {
     fn get(
         &mut self,
         inode: InodeNo,
-        start_index: usize,
+        start_offset: u64,
         out: &mut [DirEntryLite; READDIR_WINDOW_ENTRIES],
+        next_offsets: &mut [u64; READDIR_WINDOW_ENTRIES],
     ) -> Option<usize> {
-        let index = self.entries.iter().position(|entry| {
-            entry.valid && entry.inode == inode && entry.start_index == start_index
-        })?;
+        let (index, window_index) =
+            self.entries.iter().enumerate().find_map(|(index, entry)| {
+                if !entry.valid || entry.inode != inode {
+                    return None;
+                }
+                if entry.start_offset == start_offset {
+                    return Some((index, 0));
+                }
+                entry
+                    .next_offsets
+                    .iter()
+                    .take(entry.count.saturating_sub(1))
+                    .position(|offset| *offset == start_offset)
+                    .map(|offset_index| (index, offset_index + 1))
+            })?;
         self.clock = self.clock.wrapping_add(1);
         let entry = &mut self.entries[index];
         entry.last_used = self.clock;
-        out[..entry.count].copy_from_slice(&entry.entries[..entry.count]);
-        Some(entry.count)
+        let count = entry.count - window_index;
+        out[..count].copy_from_slice(&entry.entries[window_index..entry.count]);
+        next_offsets[..count].copy_from_slice(&entry.next_offsets[window_index..entry.count]);
+        Some(count)
     }
 
     fn lookup(&mut self, inode: InodeNo, name: &[u8]) -> Option<Option<InodeNo>> {
@@ -171,7 +198,7 @@ impl DirCache {
             if !entry.valid || entry.inode != inode {
                 continue;
             }
-            if entry.start_index == 0 && entry.count < READDIR_WINDOW_ENTRIES {
+            if entry.start_offset == 0 && entry.count < READDIR_WINDOW_ENTRIES {
                 complete_first_window = Some(index);
             }
             if entry
@@ -207,8 +234,9 @@ impl DirCache {
     fn insert(
         &mut self,
         inode: InodeNo,
-        start_index: usize,
+        start_offset: u64,
         entries: &[DirEntryLite; READDIR_WINDOW_ENTRIES],
+        next_offsets: &[u64; READDIR_WINDOW_ENTRIES],
         count: usize,
     ) {
         self.clock = self.clock.wrapping_add(1);
@@ -216,7 +244,7 @@ impl DirCache {
             .entries
             .iter()
             .position(|entry| {
-                !entry.valid || (entry.inode == inode && entry.start_index == start_index)
+                !entry.valid || (entry.inode == inode && entry.start_offset == start_offset)
             })
             .unwrap_or_else(|| {
                 if self.entries.len() < DIR_CACHE_ENTRIES {
@@ -234,11 +262,15 @@ impl DirCache {
         let entry = &mut self.entries[victim];
         entry.valid = true;
         entry.inode = inode;
-        entry.start_index = start_index;
+        entry.start_offset = start_offset;
         entry.count = count.min(READDIR_WINDOW_ENTRIES);
         entry.last_used = self.clock;
         entry.entries.clear();
         entry.entries.extend_from_slice(&entries[..entry.count]);
+        entry.next_offsets.clear();
+        entry
+            .next_offsets
+            .extend_from_slice(&next_offsets[..entry.count]);
     }
 
     fn invalidate(&mut self, inode: InodeNo) {
@@ -253,9 +285,10 @@ impl DirCache {
 struct DirCacheEntry {
     valid: bool,
     inode: InodeNo,
-    start_index: usize,
+    start_offset: u64,
     count: usize,
     entries: Vec<DirEntryLite>,
+    next_offsets: Vec<u64>,
     last_used: u64,
 }
 
@@ -264,9 +297,10 @@ impl DirCacheEntry {
         Self {
             valid: false,
             inode: InodeNo::new(0),
-            start_index: 0,
+            start_offset: 0,
             count: 0,
             entries: Vec::new(),
+            next_offsets: Vec::new(),
             last_used: 0,
         }
     }
@@ -532,18 +566,18 @@ pub(crate) fn map_inode_meta(meta: InodeMetaLite) -> InodeMeta {
     }
 }
 
-pub(crate) fn cursor_index(cursor: DirCursor) -> Result<usize, Errno> {
+pub(crate) fn cursor_offset(cursor: DirCursor) -> Result<u64, Errno> {
     if cursor.0[8..].iter().any(|byte| *byte != 0) {
         return Err(Errno::EINVAL);
     }
     let mut raw = [0u8; 8];
     raw.copy_from_slice(&cursor.0[..8]);
-    usize::try_from(u64::from_le_bytes(raw)).map_err(|_| Errno::EINVAL)
+    Ok(u64::from_le_bytes(raw))
 }
 
-pub(crate) fn cursor_from_index(index: usize) -> DirCursor {
+pub(crate) fn cursor_from_offset(offset: u64) -> DirCursor {
     let mut raw = [0u8; 16];
-    raw[..8].copy_from_slice(&(index as u64).to_le_bytes());
+    raw[..8].copy_from_slice(&offset.to_le_bytes());
     DirCursor(raw)
 }
 

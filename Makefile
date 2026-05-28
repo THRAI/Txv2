@@ -16,6 +16,7 @@ OSCOMP_DOCKER_IMAGE ?= zhouzhouyi/os-contest:20260510
 OSCOMP_TARGET ?= rv64-qemu
 OSCOMP_EXTRA ?=
 HOST_CARGO_TARGET_DIR ?= target/host-cargo
+OSCOMP_KERNEL_PROFILE ?= --release
 
 .PHONY: docker-help docker-build docker-shell docker-ci docker-check docker-ci-slow \
 	all setup-cargo-config \
@@ -65,9 +66,9 @@ setup-cargo-config:
 	cp cargo/config.toml .cargo/config.toml
 
 all: setup-cargo-config
-	cargo xtask build --target rv64-qemu
-	cargo xtask build --target la64-qemu
-	cargo xtask oscomp submit --submit .
+	cargo xtask build --target rv64-qemu $(OSCOMP_KERNEL_PROFILE)
+	cargo xtask build --target la64-qemu $(OSCOMP_KERNEL_PROFILE)
+	cargo xtask oscomp submit --submit . $(OSCOMP_KERNEL_PROFILE)
 
 docker-build:
 	$(DOCKER_COMPOSE) build $(DOCKER_SERVICE)
@@ -85,10 +86,10 @@ docker-ci-slow:
 	$(DOCKER_RUN) cargo xtask ci-slow
 
 docker-build-rv64:
-	$(DOCKER_RUN_BUILD) cargo xtask build --target rv64-qemu
+	$(DOCKER_RUN_BUILD) cargo xtask build --target rv64-qemu $(OSCOMP_KERNEL_PROFILE)
 
 docker-build-la64:
-	$(DOCKER_RUN_BUILD) cargo xtask build --target la64-qemu
+	$(DOCKER_RUN_BUILD) cargo xtask build --target la64-qemu $(OSCOMP_KERNEL_PROFILE)
 
 docker-image-cpio-rv64:
 	$(DOCKER_RUN) cargo xtask image cpio --profile busybox --target rv64-qemu
@@ -251,13 +252,13 @@ OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'
 	oscomp-export-testcase
 
 oscomp-submit:
-	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --submit $(OSCOMP_SUBMIT)
+	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --submit $(OSCOMP_SUBMIT) $(OSCOMP_KERNEL_PROFILE)
 
 oscomp-submit-rv64:
-	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --target rv64-qemu --submit $(OSCOMP_SUBMIT)
+	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --target rv64-qemu --submit $(OSCOMP_SUBMIT) $(OSCOMP_KERNEL_PROFILE)
 
 oscomp-submit-la64:
-	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --target la64-qemu --submit $(OSCOMP_SUBMIT)
+	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --target la64-qemu --submit $(OSCOMP_SUBMIT) $(OSCOMP_KERNEL_PROFILE)
 
 oscomp-qemu-rv64:
 	set -o pipefail; \

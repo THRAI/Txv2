@@ -7,6 +7,7 @@ use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMutex, StepOutcome};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload};
 use tx_subsystems::vfs::FsObjectId;
 
@@ -15,6 +16,8 @@ static STAT_META_OVERRIDES: SpinMutex<BTreeMap<FsObjectId, InodeMeta>> =
 
 static FCNTL_RECORD_LOCKS: SpinMutex<BTreeMap<FsObjectId, Vec<RecordLock>>> =
     SpinMutex::new(BTreeMap::new());
+
+static OPENAT_TMPFILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn record_stat_meta_override(fs_object_id: FsObjectId, meta: InodeMeta) {
     STAT_META_OVERRIDES.lock().insert(fs_object_id, meta);
@@ -72,6 +75,23 @@ fn allocate_fd_at_least_under_limit<'a>(
     } else {
         Ok(fd)
     }
+}
+
+fn openat_tmpfile_name(seq: u64) -> Vec<u8> {
+    let mut name = Vec::from(&b".tx-tmpfile-"[..]);
+    let mut digits = [0u8; 20];
+    let mut n = seq;
+    let mut idx = digits.len();
+    loop {
+        idx -= 1;
+        digits[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    name.extend_from_slice(&digits[idx..]);
+    name
 }
 
 /// `fcntl(fd, cmd, arg)` per the Wave 2 ELF-loader plan §"Part 2 —
@@ -491,8 +511,12 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     let want_excl = !want_path_only && flags & O_EXCL != 0;
     let want_trunc = !want_path_only && flags & O_TRUNC != 0;
     let want_directory = flags & O_DIRECTORY != 0;
+    let want_tmpfile = flags & __O_TMPFILE != 0;
     // O_NONBLOCK and other unrecognised bits: silently dropped.
 
+    if flags & __O_TMPFILE != 0 && flags & O_TMPFILE != O_TMPFILE {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
     if want_create && want_directory {
         return SyscallResult::Error(EINVAL_VALUE);
     }
@@ -554,6 +578,111 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     }
 
     let walker_cred = ctx.walker_cred();
+
+    if want_tmpfile {
+        if want_path_only || !want_write {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        if want_create || want_trunc {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+
+        use step_engine::{Errno as V3Errno, StepOutcome as V3};
+        let dir_dentry = {
+            let guard = step_engine::guard();
+            let outcome = step_walk(cwd.clone(), &path, &walker_cred, &guard);
+            drop(guard);
+            match outcome {
+                V3::Done(d) => d,
+                V3::Continue { .. } | V3::Yield { .. } => {
+                    return SyscallResult::Error(EIO_VALUE);
+                }
+                V3::Err(errno) => return SyscallResult::error_from(errno),
+            }
+        };
+        if dir_dentry.rnode().meta().kind() != tx_subsystems::vfs::structure::InodeKind::Directory
+        {
+            return SyscallResult::Error(ENOTDIR_VALUE);
+        }
+
+        let fs_ops = match fs_ops_for_dentry(&dir_dentry) {
+            Some(ops) => ops,
+            None => return SyscallResult::Error(EOPNOTSUPP_VALUE),
+        };
+        let parent_id = dir_dentry.rnode().fs_object_id();
+        let create_mode = (mode as u16) & !ctx.process.umask() & 0o7777;
+
+        let mut opened = None;
+        for _ in 0..16 {
+            let seq = OPENAT_TMPFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tmp_name = openat_tmpfile_name(seq);
+            let create_outcome = {
+                let guard = step_engine::guard();
+                fs_ops.create_inode(parent_id, &tmp_name, create_mode, &walker_cred, &guard)
+            };
+            match create_outcome {
+                V3::Done(_) => {
+                    dir_dentry.remove_cached_child_by_name(&tmp_name);
+                }
+                V3::Err(V3Errno::EEXIST) => continue,
+                V3::Err(errno) => return SyscallResult::error_from(errno),
+                V3::Continue { .. } | V3::Yield { .. } => {
+                    return SyscallResult::Error(EIO_VALUE);
+                }
+            }
+
+            let openfile = {
+                let guard = step_engine::guard();
+                let outcome = step_open(
+                    dir_dentry.clone(),
+                    &tmp_name,
+                    open_flags,
+                    mode as u16,
+                    &walker_cred,
+                    &guard,
+                );
+                drop(guard);
+                match outcome {
+                    V3::Done(file) => file,
+                    V3::Err(errno) => return SyscallResult::error_from(errno),
+                    V3::Continue { .. } | V3::Yield { .. } => {
+                        return SyscallResult::Error(EIO_VALUE);
+                    }
+                }
+            };
+
+            let target_id = openfile.rnode().fs_object_id();
+            let unlink_outcome = {
+                let guard = step_engine::guard();
+                fs_ops.unlink(parent_id, &tmp_name, target_id, &guard)
+            };
+            match unlink_outcome {
+                V3::Done(()) => {
+                    dir_dentry.remove_cached_child_by_name(&tmp_name);
+                    opened = Some(openfile);
+                    break;
+                }
+                V3::Err(errno) => return SyscallResult::error_from(errno),
+                V3::Continue { .. } | V3::Yield { .. } => {
+                    return SyscallResult::Error(EIO_VALUE);
+                }
+            }
+        }
+
+        let Some(openfile) = opened else {
+            return SyscallResult::Error(EEXIST_VALUE);
+        };
+        let fd = match allocate_fd_under_limit(ctx) {
+            Ok(fd) => fd,
+            Err(err) => return err,
+        };
+        let _ = ctx.process.set_fd(fd, Some(openfile));
+        if want_cloexec {
+            ctx.process.set_fd_cloexec(fd, true);
+        }
+        return SyscallResult::Return(fd as i64);
+    }
+
     // PR async migration: non-O_CREAT, non-O_TRUNC simple open
     // goes through `OpenOp + drive()` — no manual step loop.
     if !want_create && !want_trunc {

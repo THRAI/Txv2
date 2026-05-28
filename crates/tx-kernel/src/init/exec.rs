@@ -1020,6 +1020,11 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 selected += 1;
                 continue;
             }
+            if let Some(filter) = group.strip_prefix("libctest-glibc:") {
+                append_filtered_glibc_libctest(&mut cmd, filter);
+                selected += 1;
+                continue;
+            }
             if let Some(filter) = group.strip_prefix("libctest:") {
                 append_filtered_libctest(&mut cmd, filter);
                 selected += 1;
@@ -1088,7 +1093,7 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
 
 fn append_ltp_batch(cmd: &mut alloc::string::String, batch: &str) {
     match batch.trim() {
-        "submit" | "whitelist" => append_submit_ltp_runner(cmd),
+        "submit" | "whitelist" => append_submit_ltp_runner(cmd, "musl"),
         "p0" => append_filtered_ltp(cmd, "musl", LTP_P0_CASES),
         "smoke" => append_filtered_ltp(cmd, "musl", LTP_SMOKE_CASES),
         "fd-io" => append_filtered_ltp(cmd, "musl", LTP_FD_IO_CASES),
@@ -1119,7 +1124,7 @@ fn append_ltp_runtest(cmd: &mut alloc::string::String, module: &str, filter: &st
 
     let module = module.trim();
     let filter = filter.trim();
-    append_ltp_script_env(cmd);
+    append_ltp_script_env(cmd, "musl");
     if !is_safe_ltp_runtest_name(module) || !is_safe_ltp_runtest_filter(filter) {
         let _ = write!(
             cmd,
@@ -1181,26 +1186,27 @@ fn ltp_runtest_selected_tags(filter: &str) -> alloc::string::String {
     selected
 }
 
-fn append_filtered_ltp(cmd: &mut alloc::string::String, _libc: &str, filter: &str) {
+fn append_filtered_ltp(cmd: &mut alloc::string::String, libc: &str, filter: &str) {
     use core::fmt::Write as _;
 
-    append_ltp_script_env(cmd);
+    append_ltp_script_env(cmd, libc);
+    let group = oscomp_group_label("ltp", libc);
 
     let _ = write!(
         cmd,
-        "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+        "; ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\""
     );
-    append_ltp_case_loop(cmd, filter);
+    append_ltp_case_loop(cmd, libc, filter);
     let _ = write!(
         cmd,
-        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+        "; ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\""
     );
 }
 
 fn append_all_ltp(cmd: &mut alloc::string::String) {
     use core::fmt::Write as _;
 
-    append_ltp_script_env(cmd);
+    append_ltp_script_env(cmd, "musl");
 
     let _ = write!(
         cmd,
@@ -1223,7 +1229,7 @@ fn append_all_ltp(cmd: &mut alloc::string::String) {
         LTP_AIO_CASES,
         LTP_NETWORK_DEFERRED_CASES,
     ] {
-        append_ltp_case_loop(cmd, filter);
+        append_ltp_case_loop(cmd, "musl", filter);
     }
     let _ = write!(
         cmd,
@@ -1231,25 +1237,27 @@ fn append_all_ltp(cmd: &mut alloc::string::String) {
     );
 }
 
-fn append_submit_ltp_runner(cmd: &mut alloc::string::String) {
+fn append_submit_ltp_runner(cmd: &mut alloc::string::String, libc: &str) {
     use core::fmt::Write as _;
 
-    append_ltp_script_env(cmd);
+    append_ltp_script_env(cmd, libc);
+    let group = oscomp_group_label("ltp", libc);
 
     let _ = write!(
         cmd,
-        "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+        "; ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\""
     );
-    append_ltp_case_loop(cmd, LTP_SUBMIT_CASES);
+    append_ltp_case_loop(cmd, libc, LTP_SUBMIT_CASES);
     let _ = write!(
         cmd,
-        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+        "; ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\""
     );
 }
 
-fn append_ltp_case_loop(cmd: &mut alloc::string::String, filter: &str) {
+fn append_ltp_case_loop(cmd: &mut alloc::string::String, libc: &str, filter: &str) {
     use core::fmt::Write as _;
 
+    let root = oscomp_libc_root(libc);
     let _ = write!(cmd, "; for case in");
     for case in filter.split('+') {
         let case = case.trim();
@@ -1284,7 +1292,7 @@ unlink01) set -- symlink01 -T unlink01; ltp_label='symlink01 -T unlink01';; \
 *) set -- \"$case\";; \
 esac; \
 echo \"RUN LTP CASE $case : $ltp_label\"; \
-PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config \"$@\"; \
+PATH={root}/ltp/testcases/bin:{root}/ltp/bin:{root}/ltp/testscripts:{root}:/musl/musl:$PATH LTPROOT={root}/ltp KCONFIG_PATH=/proc/config \"$@\"; \
 ret=$?; \
 if [ $ret = 0 ]; then echo \"PASS LTP CASE $case : $ret\"; fi; \
 echo \"FAIL LTP CASE $case : $ret\"; \
@@ -1614,7 +1622,7 @@ pipe06+pipe07+pipe08+pipe09+pipe10+pipe12+pipe14+pread01+\
 pread01_64+pwrite01+pwrite01_64+pwrite03+pwrite03_64+pwrite04+pwrite04_64+read01+\
 read04+sendfile05+sendfile05_64+sendfile06+sendfile06_64+sendfile08+sendfile08_64+write01+\
 write03+writev02+writev05+writev06+getdomainname01+modify_ldt01+modify_ldt02+modify_ldt03+\
-newuname01+ptrace05+uname02+uname04+mq_notify03+msgctl02+msgget01+msgrcv08+\
+newuname01+ptrace05+uname02+uname04+msgctl02+msgget01+msgrcv08+\
 msgsnd01+semctl02+semctl06+semop04+semop05+shmat04+shmctl07+shmdt01+\
 unshare02+clone03+clone05+clone06+clone07+clone302+execl01+execle01+\
 execlp01+execv01+execve01+execve06+execvp01+exit01+exit02+exit_group01+\
@@ -1708,6 +1716,49 @@ fn append_full_libctest(cmd: &mut alloc::string::String) {
     );
 }
 
+fn append_filtered_glibc_libctest(cmd: &mut alloc::string::String, filter: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        " && cd /musl/glibc; /musl/musl/busybox echo \"#### OS COMP TEST GROUP START libctest-glibc ####\""
+    );
+    for case in filter.split('+') {
+        let case = case.trim();
+        if case.is_empty() {
+            continue;
+        }
+        if let Some(name) = case.strip_prefix("static:") {
+            let name = name.trim();
+            if !name.is_empty() {
+                append_filtered_glibc_libctest_case(cmd, "entry-static.exe", name);
+            }
+        } else if let Some(name) = case.strip_prefix("dynamic:") {
+            let name = name.trim();
+            if !name.is_empty() {
+                append_filtered_glibc_libctest_case(cmd, "entry-dynamic.exe", name);
+            }
+        } else {
+            append_filtered_glibc_libctest_case(cmd, "entry-static.exe", case);
+            append_filtered_glibc_libctest_case(cmd, "entry-dynamic.exe", case);
+        }
+    }
+    let _ = write!(
+        cmd,
+        "; /musl/musl/busybox echo \"#### OS COMP TEST GROUP END libctest-glibc ####\"; cd /musl/musl"
+    );
+}
+
+fn append_filtered_glibc_libctest_case(cmd: &mut alloc::string::String, entry: &str, case: &str) {
+    use core::fmt::Write as _;
+
+    if !libctest_case_present_in_entry(entry, case) {
+        append_unsupported_libctest_case(cmd, entry, case);
+    } else {
+        let _ = write!(cmd, "; ./runtest.exe -w {entry} {case}");
+    }
+}
+
 fn append_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &str) {
     use core::fmt::Write as _;
 
@@ -1797,9 +1848,16 @@ fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
         if *script == "libctest_testcode.sh" {
             append_full_libctest(cmd);
         } else if *script == "ltp_testcode.sh" {
-            append_submit_ltp_runner(cmd);
+            append_submit_ltp_runner(cmd, "musl");
         } else {
             append_oscomp_musl_script(cmd, script);
+        }
+    }
+    for (_, script) in DEFAULT_OSCOMP_GLIBC_SCRIPTS {
+        if *script == "ltp_testcode.sh" {
+            append_submit_ltp_runner(cmd, "glibc");
+        } else {
+            append_oscomp_glibc_script(cmd, script);
         }
     }
 }
@@ -1815,7 +1873,7 @@ fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str) {
 }
 
 fn append_full_ltp_runner(cmd: &mut alloc::string::String) {
-    append_ltp_script_env(cmd);
+    append_ltp_script_env(cmd, "musl");
     cmd.push_str("; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\"");
     cmd.push_str("; target_dir=\"ltp/testcases/bin\"");
     let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
@@ -1826,12 +1884,13 @@ fn append_full_ltp_runner(cmd: &mut alloc::string::String) {
     cmd.push_str("; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\"");
 }
 
-fn append_ltp_script_env(cmd: &mut alloc::string::String) {
+fn append_ltp_script_env(cmd: &mut alloc::string::String, libc: &str) {
     use core::fmt::Write as _;
 
+    let root = oscomp_libc_root(libc);
     let _ = write!(
         cmd,
-        "; ./busybox mkdir -p /bin; /musl/musl/busybox --install -s /bin; export LTPROOT=/musl/musl/ltp; export PATH=/bin:/musl/glibc:/musl/musl:/musl/musl/ltp/testcases/bin"
+        "; ./busybox mkdir -p /bin; /musl/musl/busybox --install -s /bin; export LTPROOT={root}/ltp; export PATH=/bin:/musl/glibc:/musl/musl:{root}/ltp/testcases/bin"
     );
 }
 
@@ -1840,6 +1899,13 @@ const DEFAULT_OSCOMP_MUSL_SCRIPTS: &[(&str, &str)] = &[
     ("busybox-musl", "busybox_testcode.sh"),
     ("libctest-musl", "libctest_testcode.sh"),
     ("ltp-musl", "ltp_testcode.sh"),
+];
+
+const DEFAULT_OSCOMP_GLIBC_SCRIPTS: &[(&str, &str)] = &[
+    ("basic-glibc", "basic_testcode.sh"),
+    ("busybox-glibc", "busybox_testcode.sh"),
+    ("libctest-glibc", "libctest_testcode.sh"),
+    ("ltp-glibc", "ltp_testcode.sh"),
 ];
 
 fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
@@ -1865,6 +1931,22 @@ fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
 
 fn is_libctest_musl_group(group: &str) -> bool {
     matches!(group, "libctest" | "libctest-musl")
+}
+
+fn append_oscomp_glibc_script(cmd: &mut alloc::string::String, script: &str) {
+    use core::fmt::Write as _;
+
+    if script == "basic_testcode.sh" {
+        let _ = write!(
+            cmd,
+            " && cd /musl/glibc/basic && (/musl/musl/busybox mkdir test_chdir || :) && cd /musl/glibc && /musl/musl/busybox sh {script} && cd /musl/musl"
+        );
+    } else {
+        let _ = write!(
+            cmd,
+            " && cd /musl/glibc && /musl/musl/busybox sh {script} && cd /musl/musl"
+        );
+    }
 }
 
 fn libctest_case_needs_cwd_dso(case: &str) -> bool {

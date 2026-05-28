@@ -15,6 +15,7 @@ use tx_hal::{
 core::arch::global_asm!(
     r#"
     .section .text.trap, "ax"
+    .option arch, rv64gc
     .align 2
     .equ TX_RV64_TF_X0, 0
     .equ TX_RV64_TF_X1, 8

@@ -16,14 +16,14 @@ use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::step_chdir;
 use tx_subsystems::vfs::structure::{
-    Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
+    Credential, DEntry, DirCursor, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
 };
 use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
-    AT_FDCWD, AT_REMOVEDIR, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_MKDIRAT, NR_OPENAT,
+    AT_FDCWD, AT_REMOVEDIR, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_LSEEK, NR_MKDIRAT, NR_OPENAT,
     NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT, NR_UTIMENSAT, O_RDWR,
-    RENAME_EXCHANGE, RENAME_NOREPLACE, UTIME_NOW,
+    O_TMPFILE, RENAME_EXCHANGE, RENAME_NOREPLACE, SEEK_SET, UTIME_NOW,
 };
 
 /// errno magnitudes (positive Linux RV64 generic ABI values).
@@ -1087,6 +1087,59 @@ fn dispatch_futimens_updates_unlinked_open_file() {
     assert_eq!(read_i64_at(&statbuf, STAT_ATIME_SEC_OFF), 321);
     assert_eq!(read_i64_at(&statbuf, STAT_MTIME_SEC_OFF), 987);
     drop(path);
+}
+
+#[test]
+fn dispatch_openat_o_tmpfile_returns_unlinked_regular_file() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    make_dir(&tmpfs, b"tmp");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let path = nul_terminate(b"/tmp");
+    let fd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                (O_TMPFILE | O_RDWR) as u64,
+                0o600,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat O_TMPFILE /tmp: {other:?}"),
+    };
+
+    let file = proc_cap.fd(fd as u32).expect("O_TMPFILE fd installed");
+    assert_eq!(file.rnode().meta().kind(), InodeKind::Regular);
+    assert!(file.flags().read);
+    assert!(file.flags().write);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_LSEEK, [fd, 0, SEEK_SET as u64, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    let tmp_id = {
+        let guard = guard();
+        match tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"tmp", &guard) {
+            StepOutcome::Done(id) => id,
+            other => panic!("lookup /tmp after O_TMPFILE: {other:?}"),
+        }
+    };
+    let guard = guard();
+    assert_eq!(
+        tmpfs.readdir(tmp_id, DirCursor::START, &guard),
+        StepOutcome::Done(None),
+        "O_TMPFILE helper name must be unlinked immediately"
+    );
 }
 
 #[test]

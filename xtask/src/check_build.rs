@@ -57,7 +57,11 @@ pub(crate) fn check(root: &Path) -> Result<()> {
 }
 
 pub(crate) fn build(root: &Path, target_value: &str) -> Result<()> {
-    build_with_features(root, target_value, &[])
+    build_with_features_with_profile(root, target_value, &[], false)
+}
+
+pub(crate) fn build_release(root: &Path, target_value: &str) -> Result<()> {
+    build_with_features_with_profile(root, target_value, &[], true)
 }
 
 /// Build the kernel binary for `target_value`, forwarding cargo
@@ -68,6 +72,15 @@ pub(crate) fn build_with_features(
     root: &Path,
     target_value: &str,
     features: &[&str],
+) -> Result<()> {
+    build_with_features_with_profile(root, target_value, features, false)
+}
+
+fn build_with_features_with_profile(
+    root: &Path,
+    target_value: &str,
+    features: &[&str],
+    release: bool,
 ) -> Result<()> {
     let installed = installed_targets().unwrap_or_default();
     for target in TxTarget::all_for(target_value)? {
@@ -80,7 +93,11 @@ pub(crate) fn build_with_features(
                 triple
             ));
         }
-        let mut cmd: Vec<&str> = vec!["build", "-p", target.package(), "--target", &triple];
+        let mut cmd: Vec<&str> = vec!["build"];
+        if release {
+            cmd.push("--release");
+        }
+        cmd.extend(["-p", target.package(), "--target", &triple]);
         if !features.is_empty() {
             cmd.push("--features");
             for (i, f) in features.iter().enumerate() {

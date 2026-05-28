@@ -56,7 +56,11 @@ pub fn run() -> Result<()> {
         "build" => {
             let rest: Vec<String> = args.collect();
             let target = util::option_value(&rest, "--target")?;
-            check_build::build(&root, &target)
+            if rest.iter().any(|arg| arg == "--release") {
+                check_build::build_release(&root, &target)
+            } else {
+                check_build::build(&root, &target)
+            }
         }
         "qemu" => qemu::qemu(&root, args.collect()),
         "test" => test::test(&root, args.collect()),

@@ -12,6 +12,7 @@
 core::arch::global_asm!(
     r#"
     .section .text.trampoline, "ax"
+    .option arch, rv64gc
     .equ TX_RV64_KERNEL_VIRT_OFFSET, 0xffffffff00000000
     .equ TX_RV64_QEMU_RAM_BASE, 0x80000000
     .equ TX_RV64_DIRECT_MAP_ROOT_SLOT, 258

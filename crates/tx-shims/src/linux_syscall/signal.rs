@@ -384,7 +384,7 @@ async fn park_sigtimedwait_tick<P: tx_hal::TimeIf>(
 ) {
     const SIGTIMEDWAIT_POLL_NS: u64 = 1_000_000;
 
-    if wait_bits & Signum::SIGCHLD.bit() != 0 {
+    if wait_bits & Signum::SIGCHLD.bit() != 0 && deadline_ns.is_none() {
         if let Some(token) = ctx.process.exit_source_wait_token() {
             if let Some(future) = tx_subsystems::wait_source::wait_on_token(token) {
                 future.await;

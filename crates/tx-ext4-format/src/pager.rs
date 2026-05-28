@@ -3,7 +3,7 @@ use crate::ondisk::{
     BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry, DirEntryIter, Extent, ExtentNode,
     GroupDesc, Inode, InodeLocation, InodeTableLayout, Superblock,
 };
-use crate::ondisk::{read_u16_le, write_u16_le};
+use crate::ondisk::{read_u16_le, read_u32_le, write_u16_le};
 use crate::{Ext4FormatError, Result};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -695,6 +695,91 @@ impl<I: BlockImage> Ext4Pager<I> {
                 }
             }
         }
+        Ok(written)
+    }
+
+    pub fn read_dir_entries_from_offset(
+        &mut self,
+        directory: InodeNo,
+        start_offset: u64,
+        out: &mut [DirEntryLite],
+        next_offsets: &mut [u64],
+    ) -> Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if next_offsets.len() < out.len() {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let disk_inode = self.read_inode(directory)?;
+        if !disk_inode.is_dir() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        if start_offset >= disk_inode.size {
+            return Ok(0);
+        }
+
+        let mut written = 0usize;
+        let page_count = div_ceil_u64(disk_inode.size, BLOCK_SIZE as u64);
+        let mut page_index = start_offset / BLOCK_SIZE as u64;
+        let mut offset_in_page = (start_offset % BLOCK_SIZE as u64) as usize;
+
+        while page_index < page_count {
+            let mut page = [0u8; BLOCK_SIZE];
+            match self.resolve_inode_block(&disk_inode, logical_block(page_index)?)? {
+                BlockMapping::Data(block) => self.image.read_block(block, &mut page)?,
+                BlockMapping::Hole => {
+                    page_index += 1;
+                    offset_in_page = 0;
+                    continue;
+                }
+                BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
+            }
+
+            while offset_in_page < BLOCK_SIZE {
+                let absolute_offset = page_index * BLOCK_SIZE as u64 + offset_in_page as u64;
+                if absolute_offset >= disk_inode.size {
+                    return Ok(written);
+                }
+                if BLOCK_SIZE - offset_in_page < 8 {
+                    return Err(Ext4FormatError::Truncated);
+                }
+
+                let rec_len = read_u16_le(&page, offset_in_page + 4)? as usize;
+                if rec_len == 0 {
+                    break;
+                }
+                if rec_len < 8 || offset_in_page + rec_len > BLOCK_SIZE {
+                    return Err(Ext4FormatError::Corrupt);
+                }
+
+                let next_offset = absolute_offset + rec_len as u64;
+                let inode = read_u32_le(&page, offset_in_page)?;
+                if inode != 0 {
+                    let name_len = page[offset_in_page + 6] as usize;
+                    if name_len > rec_len - 8 {
+                        return Err(Ext4FormatError::Corrupt);
+                    }
+                    let entry = DirEntry {
+                        inode,
+                        rec_len: rec_len as u16,
+                        file_type: page[offset_in_page + 7],
+                        name: &page[offset_in_page + 8..offset_in_page + 8 + name_len],
+                    };
+                    out[written] = DirEntryLite::from_ondisk(entry)?;
+                    next_offsets[written] = next_offset;
+                    written += 1;
+                    if written == out.len() {
+                        return Ok(written);
+                    }
+                }
+                offset_in_page += rec_len;
+            }
+
+            page_index += 1;
+            offset_in_page = 0;
+        }
+
         Ok(written)
     }
 

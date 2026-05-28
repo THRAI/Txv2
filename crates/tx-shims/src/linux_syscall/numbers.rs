@@ -196,6 +196,13 @@ pub const O_APPEND: u32 = 0o2000;
 /// Linux returns `ENOTDIR` when the terminal component exists but is not
 /// a directory; LTP cleanup depends on this to distinguish files from dirs.
 pub const O_DIRECTORY: u32 = 0o200000;
+/// Internal bit used by Linux to form `O_TMPFILE`. The public
+/// `O_TMPFILE` value intentionally includes `O_DIRECTORY`, so openat
+/// must recognize it before applying ordinary O_DIRECTORY handling.
+pub const __O_TMPFILE: u32 = 0o20000000;
+/// `openat(2)` flag bit: create an unnamed regular file in the
+/// directory named by the path.
+pub const O_TMPFILE: u32 = __O_TMPFILE | O_DIRECTORY;
 /// `openat(2)` flag bit: non-blocking open + non-blocking I/O on the
 /// resulting fd. Wave 2 accepts but ignores this bit — there is no
 /// blocking-flag plumbing on `OpenFile` yet (`TODO(phase-nonblock)`).

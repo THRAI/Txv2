@@ -10,8 +10,8 @@ use tx_subsystems::vfs::structure::{
 };
 
 use crate::read_backend::{
-    cursor_from_index, cursor_index, fs_object_id as inode_fs_object_id, inode_no, map_inode_meta,
-    Ext4FsInstance, READDIR_WINDOW_ENTRIES,
+    cursor_from_offset, cursor_offset, fs_object_id as inode_fs_object_id, inode_no,
+    map_inode_meta, Ext4FsInstance, READDIR_WINDOW_ENTRIES,
 };
 use tx_ext4_format::pager::InodeMetaLite;
 
@@ -331,22 +331,22 @@ where
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err),
         };
-        let index = match cursor_index(cursor) {
-            Ok(index) => index,
+        let offset = match cursor_offset(cursor) {
+            Ok(offset) => offset,
             Err(err) => return StepOutcome::err(err),
         };
-        let window_start = index - (index % READDIR_WINDOW_ENTRIES);
-        let window_index = index - window_start;
         let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
-        let count = match self.read_dir_entries_cached(inode, window_start, &mut entries) {
-            Ok(count) => count,
-            Err(err) => return StepOutcome::err(err),
-        };
-        if window_index >= count {
+        let mut next_offsets = [0u64; READDIR_WINDOW_ENTRIES];
+        let count =
+            match self.read_dir_entries_cached(inode, offset, &mut entries, &mut next_offsets) {
+                Ok(count) => count,
+                Err(err) => return StepOutcome::err(err),
+            };
+        if count == 0 {
             return StepOutcome::done(None);
         }
 
-        let entry = entries[window_index];
+        let entry = entries[0];
         let name = match InlineName::new(entry.name()) {
             Ok(name) => name,
             Err(err) => return StepOutcome::err(err),
@@ -357,7 +357,7 @@ where
                 fs_object_id: inode_fs_object_id(entry.inode),
                 kind: ext4_file_type_to_kind(entry.file_type),
             },
-            cursor_from_index(index + 1),
+            cursor_from_offset(next_offsets[0]),
         )))
     }
 
