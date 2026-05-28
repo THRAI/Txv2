@@ -559,7 +559,11 @@ impl TimeIf for Platform {
         let delta = round_up_to_tcfg_ticks(delta);
 
         write_la64_csr(LA64_CSR_TICLR, LA64_TICLR_CLEAR_TIMER);
-        write_la64_csr(LA64_CSR_TCFG, delta as usize | LA64_TCFG_ENABLE);
+        // QEMU LA64 reliably wakes from idle with PERIODIC set; the trap path cancels after firing.
+        write_la64_csr(
+            LA64_CSR_TCFG,
+            delta as usize | LA64_TCFG_ENABLE | LA64_TCFG_PERIODIC,
+        );
     }
 
     fn cancel_deadline() {

@@ -93,6 +93,13 @@ pub struct SemArrayPayload {
     pub changed_wait_source: Arc<WaitSource>,
 }
 
+impl Drop for SemArrayPayload {
+    fn drop(&mut self) {
+        crate::wait_source::release_wait_channel(self.changed_source_id);
+        wait_routing::unregister_source(self.changed_source_id);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Global sem registry
 // ---------------------------------------------------------------------------

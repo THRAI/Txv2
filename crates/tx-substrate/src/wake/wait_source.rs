@@ -324,6 +324,13 @@ use alloc::sync::Arc;
 /// long-lived semantic objects).
 static REGISTRY: SpinMutex<Vec<Option<Arc<WaitSource>>>> = SpinMutex::new(Vec::new());
 
+/// Snapshot of the global wait-source registry.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RegistrySummary {
+    pub slots: usize,
+    pub live: usize,
+}
+
 /// Register a source in the global registry so the driver can find it
 /// by [`WaitSourceId`] during yield resolution.
 pub fn register_source(source: Arc<WaitSource>) {
@@ -340,6 +347,15 @@ pub fn unregister_source(id: WaitSourceId) {
     let mut reg = REGISTRY.lock();
     if let Some(slot) = reg.get_mut(id.raw() as usize) {
         *slot = None;
+    }
+}
+
+/// Return the current registry slot count and live source count.
+pub fn registry_summary() -> RegistrySummary {
+    let reg = REGISTRY.lock();
+    RegistrySummary {
+        slots: reg.len(),
+        live: reg.iter().filter(|slot| slot.is_some()).count(),
     }
 }
 

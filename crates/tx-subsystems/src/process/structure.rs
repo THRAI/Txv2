@@ -1231,10 +1231,9 @@ pub struct ProcessPayload {
     /// [`ProcessIdentity::exit_source_wait_token`] so the syscall arm
     /// can park on the carrier without reaching the channel directly.
     ///
-    /// Carrier-lifetime cleanup (release on payload drop) is tracked
-    /// as Cross-cutting Risk #1 in the slice plan and not addressed
-    /// in Wave 1; see plan §"Cross-cutting risks #1" for the
-    /// follow-up.
+    /// Released from the global wait-source registry when the payload
+    /// drops; otherwise long-running fork/exit workloads retain a
+    /// stale channel clone per process.
     pub(crate) exit_source_id: u64,
     /// PR-3D-3 (D2/D4 coexistence). Per-process `WaitSource` minted at
     /// `sign_process_payload` time alongside the legacy
@@ -1289,6 +1288,12 @@ pub struct ProcessPayload {
     /// for this process to exec or exit.  Set by the parent before
     /// parking; taken and fired by the child's exec and exit paths.
     pub(crate) vfork_waiter: SpinMutex<Option<core::task::Waker>>,
+}
+
+impl Drop for ProcessPayload {
+    fn drop(&mut self) {
+        crate::wait_source::release_wait_channel(self.exit_source_id);
+    }
 }
 
 impl ProcessPayload {

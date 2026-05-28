@@ -1,4 +1,4 @@
-use crate::adapter::step_engine::{epoch, zone, Zone, ZoneAllocated, ZoneError};
+use crate::adapter::step_engine::{epoch, page_allocator, zone, Zone, ZoneAllocated, ZoneError};
 use tx_hal::{console_write_str, TxPlatform};
 
 use crate::{
@@ -146,6 +146,42 @@ pub(crate) fn dump_summary<P: TxPlatform>() {
     console_write_str::<P>(":zones=");
     write_usize::<P>(summary.zone_count);
     console_write_str::<P>("\n");
+
+    if let (Ok(free), Ok(total)) = (page_allocator::free_count(), page_allocator::total_count()) {
+        console_write_str::<P>("txkernel:pagealloc:free=");
+        write_usize::<P>(free);
+        console_write_str::<P>(":total=");
+        write_usize::<P>(total);
+        console_write_str::<P>("\n");
+    }
+
+    let wait_sources = crate::wait_source::registry_summary();
+    console_write_str::<P>("txkernel:wait_source:registered=");
+    write_usize::<P>(wait_sources.total);
+    console_write_str::<P>(":channels=");
+    write_usize::<P>(wait_sources.channels);
+    console_write_str::<P>(":queues=");
+    write_usize::<P>(wait_sources.raw_queues);
+    console_write_str::<P>(":ports=");
+    write_usize::<P>(wait_sources.raw_ports);
+    console_write_str::<P>("\n");
+
+    for zone in summary.zones.iter().flatten() {
+        if zone.allocated_slots == 0 && zone.slab_count == 0 {
+            continue;
+        }
+        console_write_str::<P>("txkernel:zone:detail:id=");
+        write_usize::<P>(zone.id.0);
+        console_write_str::<P>(":type=");
+        console_write_str::<P>(zone.type_name);
+        console_write_str::<P>(":alloc=");
+        write_usize::<P>(zone.allocated_slots);
+        console_write_str::<P>(":slabs=");
+        write_usize::<P>(zone.slab_count);
+        console_write_str::<P>(":empty=");
+        write_usize::<P>(zone.empty_slab_count);
+        console_write_str::<P>("\n");
+    }
 }
 
 fn write_usize<P: TxPlatform>(value: usize) {

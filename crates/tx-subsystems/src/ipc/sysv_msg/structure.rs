@@ -99,6 +99,13 @@ pub struct MsgQueuePayload {
     pub recv_source_id: u64,
 }
 
+impl Drop for MsgQueuePayload {
+    fn drop(&mut self) {
+        crate::wait_source::release_wait_channel(self.send_source_id);
+        crate::wait_source::release_wait_channel(self.recv_source_id);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Global msg registry — day-1 single-namespace
 // ---------------------------------------------------------------------------

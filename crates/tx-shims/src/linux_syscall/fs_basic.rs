@@ -600,8 +600,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
                 V3::Err(errno) => return SyscallResult::error_from(errno),
             }
         };
-        if dir_dentry.rnode().meta().kind() != tx_subsystems::vfs::structure::InodeKind::Directory
-        {
+        if dir_dentry.rnode().meta().kind() != tx_subsystems::vfs::structure::InodeKind::Directory {
             return SyscallResult::Error(ENOTDIR_VALUE);
         }
 

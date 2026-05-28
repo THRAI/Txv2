@@ -132,6 +132,7 @@ const LA64_CRMD_DATM_CC: usize = 0b01 << 7;
 const LA64_EUEN_FPE: usize = 1 << 0;
 const LA64_ASID_MASK: usize = 0x3ff;
 const LA64_TCFG_ENABLE: usize = 1 << 0;
+const LA64_TCFG_PERIODIC: usize = 1 << 1;
 const LA64_TCFG_TICK_MASK: usize = !0x3;
 const LA64_TICLR_CLEAR_TIMER: usize = 1 << 0;
 const LA64_CPUCFG2_LLFTP: u32 = 1 << 14;

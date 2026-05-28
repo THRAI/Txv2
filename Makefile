@@ -19,7 +19,7 @@ HOST_CARGO_TARGET_DIR ?= target/host-cargo
 OSCOMP_KERNEL_PROFILE ?= --release
 
 .PHONY: docker-help docker-build docker-shell docker-ci docker-check docker-ci-slow \
-	all setup-cargo-config \
+	all all-both setup-cargo-config \
 	docker-build-rv64 docker-build-la64 docker-image-cpio-rv64 docker-image-cpio-la64 \
 	docker-image-ext4-rv64 docker-image-ext4-la64 \
 	docker-qemu-rv64-smoke docker-qemu-rv64-busybox docker-qemu-la64-busybox \
@@ -58,17 +58,21 @@ docker-help:
 	@echo "  make docker-busybox-la64"
 	@echo "  make docker-oscomp-prepare docker-oscomp-submit docker-oscomp-run"
 
-# Official OSComp entry point. The website's autotest runs `make all` in
-# /coursegrader/submit and then boots ./kernel-rv and ./kernel-la with the
-# official sdcard images.
+# Default OSComp entry point for the current submit lane. Keep it RV-only
+# while LA64 is unstable under the long default LTP run. Use `make all-both`
+# when a dual-arch submit tree is needed.
 setup-cargo-config:
 	mkdir -p .cargo
 	cp cargo/config.toml .cargo/config.toml
 
 all: setup-cargo-config
+	cargo xtask build --target $(OSCOMP_TARGET) $(OSCOMP_KERNEL_PROFILE)
+	cargo xtask oscomp submit --target $(OSCOMP_TARGET) --submit . $(OSCOMP_KERNEL_PROFILE)
+
+all-both: setup-cargo-config
 	cargo xtask build --target rv64-qemu $(OSCOMP_KERNEL_PROFILE)
 	cargo xtask build --target la64-qemu $(OSCOMP_KERNEL_PROFILE)
-	cargo xtask oscomp submit --submit . $(OSCOMP_KERNEL_PROFILE)
+	cargo xtask oscomp submit --target all --submit . $(OSCOMP_KERNEL_PROFILE)
 
 docker-build:
 	$(DOCKER_COMPOSE) build $(DOCKER_SERVICE)
@@ -229,7 +233,7 @@ OSCOMP_TESTCASE_OUT ?= target/oscomp/testcase
 OSCOMP_SERIAL_NORMALIZE = stdbuf -o0 tr -d '\000\r'
 OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'
 
-.PHONY: oscomp-submit oscomp-qemu-rv64 oscomp-qemu-rv64-smp4 \
+.PHONY: oscomp-submit oscomp-submit-both oscomp-qemu-rv64 oscomp-qemu-rv64-smp4 \
 	oscomp-qemu-la64 oscomp-qemu-la64-smp4 \
 	oscomp-judge-rv64 oscomp-judge-rv64-smp4 \
 	oscomp-judge-la64 oscomp-judge-la64-smp4 \
@@ -252,7 +256,10 @@ OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'
 	oscomp-export-testcase
 
 oscomp-submit:
-	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --submit $(OSCOMP_SUBMIT) $(OSCOMP_KERNEL_PROFILE)
+	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --target $(OSCOMP_TARGET) --submit $(OSCOMP_SUBMIT) $(OSCOMP_KERNEL_PROFILE)
+
+oscomp-submit-both:
+	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --target all --submit $(OSCOMP_SUBMIT) $(OSCOMP_KERNEL_PROFILE)
 
 oscomp-submit-rv64:
 	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --target rv64-qemu --submit $(OSCOMP_SUBMIT) $(OSCOMP_KERNEL_PROFILE)

@@ -837,6 +837,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 Some(step) => step,
                 None => break,
             };
+            let drained_terminal_tasks = Self::drain_terminal_reactor_tasks();
             let submitted_child_after_poll =
                 Self::drain_pending_child_submits() || Self::drain_pending_timer_signal_submits();
 
@@ -869,6 +870,7 @@ impl<P: TxPlatform> CoreInit<P> {
             if step.should_idle()
                 && !submitted_child_before_poll
                 && !submitted_child_after_poll
+                && drained_terminal_tasks == 0
                 && !ebr_active
                 && !init.is_zombie()
             {
@@ -927,6 +929,20 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":userspace:exited:");
         Self::write_signed_decimal(status_word);
         tx_hal::console_write_str::<P>("\n");
+    }
+
+    fn drain_terminal_reactor_tasks() -> usize {
+        BOOT_REACTOR
+            .with(|reactor| {
+                let completed = reactor.drain_completed();
+                let cancelled = reactor.drain_cancelled();
+                let count = completed.len() + cancelled.len();
+                for record in completed.iter().chain(cancelled.iter()) {
+                    Self::unregister_thread_reactor_task(record.handle);
+                }
+                count
+            })
+            .unwrap_or(0)
     }
 
     /// Render a signed decimal int into the platform console without
@@ -1247,14 +1263,32 @@ fn append_submit_ltp_runner(cmd: &mut alloc::string::String, libc: &str) {
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\""
     );
-    append_ltp_case_loop(cmd, libc, LTP_SUBMIT_CASES);
+    append_ltp_submit_case_loop(cmd, libc);
     let _ = write!(
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\""
     );
 }
 
+fn append_ltp_submit_case_loop(cmd: &mut alloc::string::String, libc: &str) {
+    append_ltp_case_loop_until(
+        cmd,
+        libc,
+        LTP_SUBMIT_CASES,
+        Some(LTP_SUBMIT_ONE_POINT_FIRST_CASE),
+    );
+}
+
 fn append_ltp_case_loop(cmd: &mut alloc::string::String, libc: &str, filter: &str) {
+    append_ltp_case_loop_until(cmd, libc, filter, None);
+}
+
+fn append_ltp_case_loop_until(
+    cmd: &mut alloc::string::String,
+    libc: &str,
+    filter: &str,
+    stop_before_case: Option<&str>,
+) {
     use core::fmt::Write as _;
 
     let root = oscomp_libc_root(libc);
@@ -1263,6 +1297,9 @@ fn append_ltp_case_loop(cmd: &mut alloc::string::String, libc: &str, filter: &st
         let case = case.trim();
         if case.is_empty() || case.ends_with('_') {
             continue;
+        }
+        if stop_before_case == Some(case) {
+            break;
         }
         if !is_ltp_case_token(case) {
             let _ = write!(cmd, "; echo \"SKIP LTP CASE {case} : invalid case token\"");
@@ -1563,6 +1600,8 @@ socketpair02";
 // files. The p0 summary document is intentionally not used as a source because
 // it overlaps the module batches; duplicated cases are kept only once. Submit
 // order is descending by recorded passed score; ties keep source order.
+const LTP_SUBMIT_ONE_POINT_FIRST_CASE: &str = "io_uring01";
+
 const LTP_SUBMIT_CASES: &str = "\
 prot_hsymlinks+epoll_ctl03+splice07+rt_sigaction01+rt_sigaction02+rt_sigaction03+access01+getpid01+\
 waitpid01+pipe11+timer_settime02+clock_getres01+sysconf01+posix_fadvise03+posix_fadvise03_64+confstr01+\
@@ -1844,22 +1883,18 @@ fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
 }
 
 fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
-    for (_, script) in DEFAULT_OSCOMP_MUSL_SCRIPTS {
+    for (_, script) in DEFAULT_OSCOMP_MUSL_PRE_LTP_SCRIPTS {
         if *script == "libctest_testcode.sh" {
             append_full_libctest(cmd);
-        } else if *script == "ltp_testcode.sh" {
-            append_submit_ltp_runner(cmd, "musl");
         } else {
             append_oscomp_musl_script(cmd, script);
         }
     }
-    for (_, script) in DEFAULT_OSCOMP_GLIBC_SCRIPTS {
-        if *script == "ltp_testcode.sh" {
-            append_submit_ltp_runner(cmd, "glibc");
-        } else {
-            append_oscomp_glibc_script(cmd, script);
-        }
+    for (_, script) in DEFAULT_OSCOMP_GLIBC_PRE_LTP_SCRIPTS {
+        append_oscomp_glibc_script(cmd, script);
     }
+    append_submit_ltp_runner(cmd, "musl");
+    append_submit_ltp_runner(cmd, "glibc");
 }
 
 fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str) {
@@ -1894,18 +1929,16 @@ fn append_ltp_script_env(cmd: &mut alloc::string::String, libc: &str) {
     );
 }
 
-const DEFAULT_OSCOMP_MUSL_SCRIPTS: &[(&str, &str)] = &[
+const DEFAULT_OSCOMP_MUSL_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
     ("basic-musl", "basic_testcode.sh"),
     ("busybox-musl", "busybox_testcode.sh"),
     ("libctest-musl", "libctest_testcode.sh"),
-    ("ltp-musl", "ltp_testcode.sh"),
 ];
 
-const DEFAULT_OSCOMP_GLIBC_SCRIPTS: &[(&str, &str)] = &[
+const DEFAULT_OSCOMP_GLIBC_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
     ("basic-glibc", "basic_testcode.sh"),
     ("busybox-glibc", "busybox_testcode.sh"),
     ("libctest-glibc", "libctest_testcode.sh"),
-    ("ltp-glibc", "ltp_testcode.sh"),
 ];
 
 fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
@@ -2103,6 +2136,21 @@ mod tests {
         assert!(cmd.contains("RUN LTP CASE $case : $ltp_label"));
         assert!(cmd.contains("futex_wake03"));
         assert!(cmd.contains("setitimer01"));
+        assert!(!cmd.contains("io_uring01"));
+        assert!(
+            cmd.find("/musl/musl/busybox sh libctest_testcode.sh")
+                .unwrap()
+                < cmd
+                    .find("#### OS COMP TEST GROUP START ltp-musl ####")
+                    .unwrap()
+        );
+        assert!(
+            cmd.find("#### OS COMP TEST GROUP START ltp-musl ####")
+                .unwrap()
+                < cmd
+                    .find("#### OS COMP TEST GROUP START ltp-glibc ####")
+                    .unwrap()
+        );
         assert!(!cmd.contains("libcbench_testcode.sh"));
         assert!(!cmd.contains("lua_testcode.sh"));
         assert!(!cmd.contains("lmbench_testcode.sh"));
@@ -2122,6 +2170,7 @@ mod tests {
         assert!(cmd.contains("confstr01"));
         assert!(cmd.contains("futex_wake03"));
         assert!(cmd.contains("setitimer01"));
+        assert!(!cmd.contains("io_uring01"));
         assert!(!cmd.contains("timerfd04"));
         assert!(!cmd.contains("; target_dir=\"ltp/testcases/bin\""));
     }

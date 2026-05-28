@@ -190,24 +190,24 @@ fn oscomp_submit(root: &Path, args: &[String]) -> Result<()> {
         .map(PathBuf::from)
         .map(|path| resolve_path(root, path))
         .unwrap_or_else(|| root.join("target").join("oscomp").join("submit"));
-    let target = optional_option_value(args, "--target")
-        .map(|value| TxTarget::parse(&value))
-        .transpose()?;
+    let target = optional_option_value(args, "--target");
     let release = oscomp_release_profile(args);
     fs::create_dir_all(&submit).map_err(|err| err.to_string())?;
-    match target {
-        Some(TxTarget::Rv64Qemu) => {
+    match target.as_deref() {
+        Some("rv64-qemu") | None => {
             copy_kernel_for_oscomp(root, TxTarget::Rv64Qemu, &submit.join("kernel-rv"), release)?;
         }
-        Some(TxTarget::La64Qemu) => {
+        Some("la64-qemu") => {
             copy_kernel_for_oscomp(root, TxTarget::La64Qemu, &submit.join("kernel-la"), release)?;
         }
-        Some(TxTarget::Rv64M1DockMock) => {
-            return Err("OSComp submit supports rv64-qemu and la64-qemu".into());
-        }
-        None => {
+        Some("all") => {
             copy_kernel_for_oscomp(root, TxTarget::Rv64Qemu, &submit.join("kernel-rv"), release)?;
             copy_kernel_for_oscomp(root, TxTarget::La64Qemu, &submit.join("kernel-la"), release)?;
+        }
+        Some(other) => {
+            return Err(format!(
+                "OSComp submit supports rv64-qemu, la64-qemu, or all, not {other}"
+            ))
         }
     }
     println!("prepared OSComp submit dir at {}", submit.display());

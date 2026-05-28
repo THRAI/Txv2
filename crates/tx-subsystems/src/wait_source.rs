@@ -60,6 +60,14 @@ pub struct RawPortWaitFuture {
 static REGISTRY: SpinMutex<BTreeMap<u64, RegisteredWaitSource>> = SpinMutex::new(BTreeMap::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WaitSourceRegistrySummary {
+    pub total: usize,
+    pub channels: usize,
+    pub raw_queues: usize,
+    pub raw_ports: usize,
+}
+
 fn register_wait_source(source: RegisteredWaitSource) -> u64 {
     let id = NEXT_ID.fetch_add(1, Ordering::AcqRel);
     REGISTRY.lock().insert(id, source);
@@ -94,6 +102,27 @@ pub fn release_wait_channel(id: u64) {
 /// Drop the registry's clone of any wait source registered under `id`.
 pub fn release_wait_source(id: u64) {
     REGISTRY.lock().remove(&id);
+}
+
+/// Current number of registered wait sources.
+pub fn registered_wait_source_count() -> usize {
+    REGISTRY.lock().len()
+}
+
+pub fn registry_summary() -> WaitSourceRegistrySummary {
+    let registry = REGISTRY.lock();
+    let mut summary = WaitSourceRegistrySummary {
+        total: registry.len(),
+        ..WaitSourceRegistrySummary::default()
+    };
+    for source in registry.values() {
+        match source {
+            RegisteredWaitSource::Channel(_) => summary.channels += 1,
+            RegisteredWaitSource::RawQueue(_) => summary.raw_queues += 1,
+            RegisteredWaitSource::RawPort(_) => summary.raw_ports += 1,
+        }
+    }
+    summary
 }
 
 /// Return a clone of the channel registered under `id`, or `None` if no

@@ -85,6 +85,12 @@ impl<P: TxPlatform> CoreInit<P> {
         }
     }
 
+    pub(super) fn unregister_thread_reactor_task(task: boot_runtime::TaskKey) {
+        THREAD_REACTOR_TASKS
+            .lock()
+            .retain(|(_, existing)| *existing != task);
+    }
+
     fn thread_reactor_task(tid: u32) -> Option<boot_runtime::TaskKey> {
         THREAD_REACTOR_TASKS
             .lock()

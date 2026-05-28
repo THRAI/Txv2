@@ -97,6 +97,7 @@ impl core::fmt::Debug for SlotKey {
 pub struct ZoneInfo {
     pub id: ZoneId,
     pub type_id: TypeId,
+    pub type_name: &'static str,
     pub allocated_slots: usize,
     pub slab_count: usize,
     pub empty_slab_count: usize,
