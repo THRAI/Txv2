@@ -292,6 +292,29 @@ fn execution_listen_promotes_tcp_bound_socket() {
 }
 
 #[test]
+fn execution_listen_rejects_tcp_tls_ulp_without_clone() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let mut options = SocketOptionSet::default_tcp();
+    options.tcp.tls_ulp = Some(TcpTlsUlpState::attached());
+    let tcp = registry::create_socket_for_test_or_bootstrap(SocketKind::Tcp, options)
+        .expect("tcp socket");
+    let local = inet(40_014);
+
+    assert_eq!(step_bind(&tcp, local, &guard), StepOutcome::Done(()));
+    assert_eq!(
+        step_listen(&tcp, 1, &guard),
+        StepOutcome::Err(Errno::EINVAL)
+    );
+    assert!(SOCKET_TABLE
+        .lookup_tcp_listener(local.as_ip_endpoint(), &guard)
+        .is_none());
+}
+
+#[test]
 fn socket_table_lookup_tcp_connection_by_four_tuple() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK

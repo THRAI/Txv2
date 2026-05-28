@@ -48,6 +48,11 @@ pub fn step_accept(
                     local: pop.entry.local,
                     remote: pop.entry.peer,
                 });
+            } else if matches!(protocol, SocketProtocol::Sctp(TcpState::Connecting { .. })) {
+                *protocol = SocketProtocol::Sctp(TcpState::Connected {
+                    local: pop.entry.local,
+                    remote: pop.entry.peer,
+                });
             }
         });
     }

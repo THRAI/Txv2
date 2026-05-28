@@ -29,6 +29,7 @@ use crate::net::protocol::{
     loopback_iface, EtherIface, EtherPacketTxSink, IfaceCommon, LoopbackIface,
 };
 use crate::net::structure::{Ipv4Address, SocketTable};
+use crate::process::nsproxy::UserNamespace;
 use crate::sync::SpinMutex;
 use crate::vfs::structure::{
     FsObjectId, InodeKind, InodeMeta, OpenFileFlags, RNode, RNodeBacking, StructPayload,
@@ -56,8 +57,10 @@ pub struct NetNamespaceIdentity {
 }
 
 pub struct NetNamespacePayload {
+    owner_user_ns: SpinMutex<Option<Cap<UserNamespace>>>,
     socket_table: &'static SocketTable,
     loopback_iface: &'static LoopbackIface,
+    loopback_mtu: SpinMutex<u16>,
     host_devices_visible: bool,
     namespace_devices: SpinMutex<Vec<NetNamespaceDeviceLink>>,
     routes: SpinMutex<Vec<NetNamespaceRouteEntry>>,
@@ -150,6 +153,7 @@ struct NetNamespaceDeviceLink {
     registration: &'static NetDeviceRegistration,
     ipv4_addr: Option<Ipv4Address>,
     ipv4_prefix_len: Option<u8>,
+    mtu: Option<u16>,
     is_up: bool,
 }
 
@@ -260,17 +264,25 @@ impl Entity for NetNamespaceIdentity {
 
 impl NetNamespacePayload {
     pub fn new_initial() -> Self {
-        Self::new(initial_socket_table_for_namespace(), loopback_iface(), true)
+        Self::new(
+            None,
+            initial_socket_table_for_namespace(),
+            loopback_iface(),
+            true,
+        )
     }
 
     fn new(
+        owner_user_ns: Option<Cap<UserNamespace>>,
         socket_table: &'static SocketTable,
         loopback_iface: &'static LoopbackIface,
         host_devices_visible: bool,
     ) -> Self {
         Self {
+            owner_user_ns: SpinMutex::new(owner_user_ns),
             socket_table,
             loopback_iface,
+            loopback_mtu: SpinMutex::new(loopback_iface.mtu()),
             host_devices_visible,
             namespace_devices: SpinMutex::new(Vec::new()),
             routes: SpinMutex::new(Vec::new()),
@@ -283,6 +295,17 @@ impl NetNamespacePayload {
 
     pub fn socket_table(&self) -> &'static SocketTable {
         self.socket_table
+    }
+
+    pub fn owner_user_namespace(&self) -> Option<Cap<UserNamespace>> {
+        self.owner_user_ns.lock().clone()
+    }
+
+    pub fn install_owner_user_namespace_once(&self, owner: Cap<UserNamespace>) {
+        let mut slot = self.owner_user_ns.lock();
+        if slot.is_none() {
+            *slot = Some(owner);
+        }
     }
 
     pub fn loopback_iface(&self) -> &'static LoopbackIface {
@@ -403,6 +426,7 @@ impl NetNamespacePayload {
             registration,
             ipv4_addr,
             ipv4_prefix_len: ipv4_addr.map(|_| 32),
+            mtu: None,
             is_up: true,
         })
     }
@@ -438,7 +462,7 @@ impl NetNamespacePayload {
             ifindex: 1,
             name: "lo",
             kind: NetDeviceKind::Loopback,
-            mtu: self.loopback_iface.mtu(),
+            mtu: *self.loopback_mtu.lock(),
             mac: None,
             ipv4_addr: Some(self.loopback_iface.local_ipv4()),
             ipv4_prefix_len: Some(8),
@@ -454,7 +478,7 @@ impl NetNamespacePayload {
                 ifindex: next_ifindex,
                 name: reg.name,
                 kind: reg.ops.device_kind(),
-                mtu: reg.ops.mtu(),
+                mtu: self.mtu_for_device(reg),
                 mac: Some(reg.ops.mac_addr()),
                 ipv4_addr,
                 ipv4_prefix_len,
@@ -699,7 +723,40 @@ impl NetNamespacePayload {
             registration,
             ipv4_addr: None,
             ipv4_prefix_len: None,
+            mtu: None,
             is_up,
+        });
+        Ok(())
+    }
+
+    pub fn set_device_mtu_by_ifindex(
+        &self,
+        _authority: NetAdminAuthority,
+        ifindex: u32,
+        mtu: u16,
+    ) -> Result<(), Errno> {
+        if mtu < 68 {
+            return Err(Errno::EINVAL);
+        }
+        if ifindex == 1 {
+            *self.loopback_mtu.lock() = mtu;
+            return Ok(());
+        }
+        let registration = self.find_device_by_ifindex(ifindex).ok_or(Errno::ENODEV)?;
+        let mut devices = self.namespace_devices.lock();
+        if let Some(link) = devices
+            .iter_mut()
+            .find(|link| link.registration.devt == registration.devt)
+        {
+            link.mtu = Some(mtu);
+            return Ok(());
+        }
+        devices.push(NetNamespaceDeviceLink {
+            registration,
+            ipv4_addr: None,
+            ipv4_prefix_len: None,
+            mtu: Some(mtu),
+            is_up: true,
         });
         Ok(())
     }
@@ -728,6 +785,7 @@ impl NetNamespacePayload {
             registration,
             ipv4_addr,
             ipv4_prefix_len,
+            mtu: None,
             is_up: true,
         });
         Ok(())
@@ -750,6 +808,15 @@ impl NetNamespacePayload {
             .iter()
             .find(|link| link.registration.devt == registration.devt)
             .and_then(|link| link.ipv4_prefix_len)
+    }
+
+    fn mtu_for_device(&self, registration: &'static NetDeviceRegistration) -> u16 {
+        self.namespace_devices
+            .lock()
+            .iter()
+            .find(|link| link.registration.devt == registration.devt)
+            .and_then(|link| link.mtu)
+            .unwrap_or_else(|| registration.ops.mtu())
     }
 
     fn is_device_up(&self, registration: &'static NetDeviceRegistration) -> bool {
@@ -1450,6 +1517,14 @@ pub fn initial_net_namespace_payload() -> PayloadCap<NetNamespacePayload> {
         .expect("initial net namespace payload installed")
 }
 
+pub fn initial_net_namespace_payload_with_owner(
+    owner_user_ns: Cap<UserNamespace>,
+) -> PayloadCap<NetNamespacePayload> {
+    let payload = initial_net_namespace_payload();
+    payload.install_owner_user_namespace_once(owner_user_ns);
+    payload
+}
+
 pub const fn initial_socket_table() -> &'static SocketTable {
     &INITIAL_SOCKET_TABLE
 }
@@ -1531,10 +1606,17 @@ fn create_net_namespace(
 pub fn create_isolated_net_namespace(
     name: &'static str,
 ) -> Result<Cap<NetNamespaceIdentity>, ZoneError> {
+    create_isolated_net_namespace_with_owner(name, None)
+}
+
+pub fn create_isolated_net_namespace_with_owner(
+    name: &'static str,
+    owner_user_ns: Option<Cap<UserNamespace>>,
+) -> Result<Cap<NetNamespaceIdentity>, ZoneError> {
     let table = Box::leak(Box::new(SocketTable::new()));
     create_net_namespace(
         name,
-        NetNamespacePayload::new(table, loopback_iface(), false),
+        NetNamespacePayload::new(owner_user_ns, table, loopback_iface(), false),
     )
 }
 

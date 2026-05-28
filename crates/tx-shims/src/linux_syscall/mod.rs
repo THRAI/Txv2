@@ -87,8 +87,8 @@ use tx_subsystems::vfs::composite::{
     AccessOp, ChmodOp, ChownOp, MknodOp, NanosleepOp, StatOp, StatxOp, StatxResult,
 };
 use tx_subsystems::vfs::structure::{
-    Credential, InodeKind, InodeMeta, OpenFileBacking, OpenFileFlags, RNodeBacking, StructPayload,
-    S_ISGID,
+    Credential, FsNotifyInstance, FsNotifyKind, InodeKind, InodeMeta, OpenFileBacking,
+    OpenFileFlags, RNodeBacking, StructPayload, S_ISGID,
 };
 use tx_subsystems::vfs::{
     DEntry, FileFsyncOp, FlockOp, OpenFile, OpenFileGetFlOp, OpenFileSetFlOp, OpenOp,
@@ -159,6 +159,8 @@ mod splice;
 use splice::*;
 mod xattr;
 use xattr::*;
+mod kernel_object;
+use kernel_object::*;
 mod net;
 
 mod ctx;
@@ -627,6 +629,9 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_SHUTDOWN => sys_shutdown(req.args, ctx),
         nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
         nr if nr == NR_PPOLL => sys_ppoll::<P>(req.args, ctx).await,
+        nr if nr == NR_PSELECT6 => sys_pselect6::<P>(req.args, ctx).await,
+        nr if nr == NR_PSELECT6_TIME64 => sys_pselect6::<P>(req.args, ctx).await,
+        nr if nr == NR_SCHED_YIELD => sys_sched_yield().await,
         nr if nr == NR_EXIT => sys_exit(req.args, ctx),
         nr if nr == NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
         nr if nr == NR_BRK => sys_brk(req.args, ctx).await,
@@ -639,8 +644,6 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_PIDFD_OPEN => sys_pidfd_open(req.args, ctx),
         nr if nr == NR_PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(req.args, ctx),
         nr if nr == NR_SIGALTSTACK => sys_sigaltstack(req.args, ctx),
-        nr if nr == NR_PIDFD_OPEN => sys_pidfd_open(req.args, ctx),
-        nr if nr == NR_PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(req.args, ctx),
         nr if nr == NR_FCNTL => sys_fcntl(req.args, ctx),
         nr if nr == NR_SETXATTR => sys_setxattr_path(req.args, ctx, false),
         nr if nr == NR_LSETXATTR => sys_setxattr_path(req.args, ctx, true),
@@ -836,6 +839,9 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_FSYNC => sys_fsync::<P>(req.args, ctx).await,
         nr if nr == NR_FDATASYNC => sys_fdatasync::<P>(req.args, ctx).await,
         nr if nr == NR_FLOCK => sys_flock::<P>(req.args, ctx).await,
+        nr if nr == NR_OPEN_TREE => sys_open_tree::<P>(req.args, ctx).await,
+        nr if nr == NR_FSOPEN => sys_fsopen::<P>(req.args, ctx).await,
+        nr if nr == NR_FSPICK => sys_fspick::<P>(req.args, ctx).await,
         nr if nr == NR_MOUNT => sys_mount::<P>(req.args, ctx).await,
         nr if nr == NR_UMOUNT2 => sys_umount2::<P>(req.args, ctx).await,
         nr if nr == NR_MKNODAT => sys_mknodat::<P>(req.args, ctx).await,
@@ -847,6 +853,12 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_KILL => sys_kill(req.args, ctx),
         nr if nr == NR_TKILL => sys_tkill(req.args, ctx),
         nr if nr == NR_TGKILL => sys_tgkill(req.args, ctx),
+        nr if nr == NR_INOTIFY_INIT1 => sys_inotify_init1(req.args, ctx),
+        nr if nr == NR_FANOTIFY_INIT => sys_fanotify_init(req.args, ctx),
+        nr if nr == NR_PERF_EVENT_OPEN => sys_perf_event_open(req.args, ctx),
+        nr if nr == NR_MEMFD_CREATE => sys_memfd_create(req.args, ctx),
+        nr if nr == NR_BPF => sys_bpf(req.args, ctx),
+        nr if nr == NR_MEMFD_SECRET => sys_memfd_secret(req.args, ctx),
         // rt_sigreturn is handled in the immediate lane above. The
         // syscall layer restores the parked pre-handler context and
         // returns the SigreturnRestored control-flow marker; live trap
@@ -1090,6 +1102,15 @@ fn sys_sched_setscheduler<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
 ///   expedited plus instruction-fetch barrier (`fence.i` on RV64).
 /// - `MEMBARRIER_CMD_REGISTER_*` — registration is a no-op; always
 ///   returns 0.
+/// `sched_yield()` — cooperatively yield the current reactor task once.
+///
+/// This is not an immediate no-op: user-space race harnesses such as LTP
+/// fuzzy-sync use it to let the peer pthread run on single-CPU guests.
+async fn sys_sched_yield() -> SyscallResult {
+    tx_reactor::yield_now().await;
+    SyscallResult::Return(0)
+}
+
 ///
 /// `flags` and `cpu_id` are currently ignored (must be 0).
 fn sys_membarrier<P: SmpIf>(args: &[u64; 6]) -> SyscallResult {

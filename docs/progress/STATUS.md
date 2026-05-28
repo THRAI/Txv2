@@ -18,6 +18,638 @@
   accounting work. **Blocker:** the active worktree still has a pre-existing
   dirty `external/linux-rv-6.17` submodule marker and a saved WIP stash that
   must not be dropped until reapplied.
+- 2026-05-27 **Made `pselect6_time64(413)` visible to syscall-status as a
+  dispatched syscall.** The RV64 implementation already routed
+  `NR_PSELECT6_TIME64` through the `sys_pselect6` path because the userspace
+  timespec layout is already 64-bit; the dispatch arm used a combined guard
+  that the mechanical status parser did not count. Split it into an explicit
+  arm and added a host dispatch regression. `cargo xtask syscall-status
+  pselect6_time64` now reports `dispatched`, and `--list-missing` is down to
+  `NR_PIDFD_SEND_SIGNAL` only. **Verification:** `cargo fmt --check`; `cargo
+  test -p tx-shims --lib
+  dispatch_pselect_time64_udp_write_ready_uses_pselect6_path --
+  --test-threads=1`; `cargo xtask syscall-status --regen`; `cargo xtask
+  syscall sync`; `cargo xtask lint syscall-status`. **Next step:** the last
+  defined-but-not-dispatched syscall is `pidfd_send_signal(424)`. **Blocker:**
+  no LTP score movement claimed here; this was a status/tooling visibility
+  fix over an already-shared pselect implementation path.
+
+- 2026-05-27 **Closed the remaining non-kernel LTP network interpretations
+  with fresh witnesses.** Confirmed `socketcall01..03` and the
+  `accept4_01` socketcall variant are compiled as `syscall(-1)` on this RV64
+  LTP image because the legacy `socketcall` number exists only in non-RV64
+  LTP syscall tables. Re-ran the glibc `recvmmsg01` slim image and saved
+  `target/oscomp/ltp-glibc-recvmmsg-current.txt`: both libc and old-kernel
+  syscall variants pass all errno subcases (`10/10`), while the musl split
+  miss remains a userspace wrapper SIGSEGV before the bad-msgvec syscall
+  enters the kernel. Also re-read `setsockopt03.c`; its missing point is a
+  32-bit compat-only TCONF, while the native malformed `IPT_SO_SET_REPLACE`
+  crash-resistance subcase already passes. **Verification:** `rg` over LTP
+  syscall tables for `socketcall`; `cargo test -p tx-shims --lib
+  dispatch_sendmmsg_recvmmsg_error_order_matches_socket_abi --
+  --test-threads=1`; `cargo test -p tx-shims --lib
+  dispatch_sendmmsg_recvmmsg_udp_loopback_batch_round_trips --
+  --test-threads=1`; `timeout 180s cargo xtask oscomp qemu --target
+  rv64-qemu --data target/oscomp/ltp-glibc-recvmmsg --boot-suite
+  ltp-glibc`. **Next step:** do not add fake `syscall(-1)` handling or weaken
+  VM protections for musl; future score movement needs either a real 32-bit
+  compat ABI/userland charter, a rebuilt LTP image with current RV64
+  `memfd_secret(447)` headers, or a broader non-network syscall target.
+  **Blocker:** current split score remains `229/236` because these local
+  misses are arch/payload mismatches rather than missing socket semantics.
+
+- 2026-05-27 **Landed phase-0 kernel-object fd providers for the `accept03`
+  tail.** Added typed `OpenFileBacking::KernelObject` metadata for
+  `perf_event_open(241)` software CPU-clock events and
+  `bpf(280, BPF_MAP_CREATE)` array maps, so they install real non-socket fds
+  instead of returning `ENOSYS`. This is fd-provider scope only: perf counter
+  reads/ioctl/poll and BPF map update/lookup/program semantics remain separate
+  subsystem work. Also wired `memfd_secret(447)` as an anonymous PageBacked
+  fd provider, but the current prebuilt LTP image still calls an invalid
+  syscall number for memfd_secret, so it remains a local TCONF and is not
+  counted. Focused `accept03` is now `22/23` in
+  `target/oscomp/ltp-accept03-after-kernel-object-fds.txt`; refreshed b4 is
+  `93/95` in `target/oscomp/ltp-net-b4-after-kernel-object-fds.txt`, moving
+  the split aggregate to `229/236`. **Verification:** `cargo fmt --check`;
+  `cargo check -p tx-subsystems -p tx-shims`; `cargo test -p tx-shims
+  non_socket_kernel_object --lib`; `cargo test -p tx-shims memfd_secret
+  --lib`; `cargo xtask syscall-status perf_event_open`; `cargo xtask
+  syscall-status bpf`; `cargo xtask syscall-status memfd_secret`; `cargo
+  xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu --submit target/oscomp/submit`; focused `accept03 22/23`;
+  refreshed b4 `93/95`; local judge on both logs. **Next step:** remaining
+  score blockers are `recvmmsg01` musl SIGSEGV, RV64 legacy `socketcall`
+  / `accept4_01` socketcall interpretation, compat-only `setsockopt03`, and
+  the local-image memfd_secret syscall-number gap.
+
+- 2026-05-27 **Refreshed b2/b3/b4 LTP network split rows after the local
+  RDS/SCTP slice.** Rebuilt/submitted the RV64 kernel and reran the affected
+  aggregate batches: b2 is now `35/35` in
+  `target/oscomp/ltp-net-b2-after-rds-sctp.txt`, b3 is `37/38` in
+  `target/oscomp/ltp-net-b3-after-rds-sctp.txt`, and b4 is `91/95` in
+  `target/oscomp/ltp-net-b4-after-rds-sctp.txt`. This moves the split-batch
+  total from `208/227` to `227/236`. The denominator increased because
+  previously skipped protocol/fd-provider subcases are now real scored
+  subcases. **Verification:** `cargo xtask build --target rv64-qemu`; `cargo
+  xtask oscomp submit --target rv64-qemu --submit target/oscomp/submit`;
+  focused split runs for b2/b3/b4; local judge on all three logs. **Next
+  step:** choose a remaining blocker: RV64 legacy `socketcall` interpretation,
+  `recvmmsg01` musl bad-msgvec SIGSEGV, `accept03` heavy providers
+  (`perf_event_open`, `bpf`, `memfd_secret`), or compat-only
+  `setsockopt03`. **Blocker:** remaining aggregate misses are not RDS/SCTP:
+  b3 has `recvmmsg01 1/2`, b4 has `accept03 20/23` plus `accept4_01 8/9`,
+  b5 remains the legacy `socketcall` row, and b6 keeps the 32-bit compat-only
+  `setsockopt03` gap.
+
+- 2026-05-26 **Landed local-only RDS/SCTP protocol surfaces for the remaining
+  LTP protocol-family blockers.** `AF_RDS SOCK_SEQPACKET` now has real local
+  bind/send/recv queue semantics with source-address writeback, moving
+  focused `recvmsg03` to `1/1`; `IPPROTO_SCTP` stream sockets now have
+  separate SCTP bind/listener/connection tables, local IPv4/IPv6
+  listen/connect/accept/read/write associations, and close/readiness cleanup,
+  moving focused `sendto02,bind04` to `17/17`. Enabling SCTP exposed that the
+  later `bind04` IPv6 TCP rows had not been exercised before; RawTcp loopback
+  now supports IPv6 smoltcp endpoints/segments, with a `[::1]` TCP host
+  regression test. This remains local syscall-surface coverage, not full RDS
+  or SCTP wire protocol work. **Verification:** `cargo fmt --check`; `cargo
+  check -p tx-subsystems -p tx-shims`; `cargo test -p tx-subsystems --lib
+  tcp_loopback_ipv6_client_reaches_inet6_loopback_listener -- --test-threads=1`;
+  `cargo test -p tx-subsystems --lib rds_sctp -- --test-threads=1`; `cargo
+  xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu --submit target/oscomp/submit`; focused LTP `recvmsg03 1/1` in
+  `target/oscomp/ltp-recvmsg03-rds-after-ipv6tcp.txt`; focused LTP
+  `sendto02,bind04 17/17` in
+  `target/oscomp/ltp-sctp-sendto02-bind04-after-ipv6tcp-submit.txt`; local
+  judge on both logs. **Next step:** refresh the affected b2/b3/b4 split rows
+  when aggregate score movement is needed, or choose the next remaining
+  blocker (`socketcall` ABI interpretation, `recvmmsg01` musl SIGSEGV, or the
+  heavy `accept03` providers). **Blocker:** full RDS/SCTP external protocol
+  stacks remain out of this slice.
+
+- 2026-05-26 **Landed scoped Linux new-mount-API fd providers for the
+  `accept03` tail.** Added zone-managed `MountApiFile` descriptors and VFS
+  `OpenFileBacking::MountApi`, wired `fsopen(430)`, `fspick(433)`, and
+  `open_tree(428)` as fd providers with Linux-like flag/path validation,
+  close-on-exec plumbing, and generic socket rejection: `fsopen`/`fspick`
+  report `ENOTSOCK` through `accept()`, while O_PATH-like `open_tree` reports
+  `EBADF`. This is intentionally not full Linux 5.2 mount API support:
+  `fsconfig`, `fsmount`, `move_mount`, and `mount_setattr` topology/superblock
+  semantics remain deferred by `MOUNT_v1`. Focused LTP `accept03` now reports
+  `20/23` in `target/oscomp/ltp-accept03-after-mount-api-fds.txt`, with the
+  remaining skips limited to perf event, bpf map, and memfd_secret. **Verification:**
+  `cargo fmt`; `cargo check -p tx-subsystems -p tx-shims`; `cargo test -p
+  tx-shims --lib mount -- --test-threads=1`; `cargo test -p tx-shims --lib
+  fspick -- --test-threads=1`; `cargo xtask syscall-status fsopen`; `cargo
+  xtask syscall-status fspick`; `cargo xtask syscall-status open_tree`; `cargo
+  xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu --submit target/oscomp/submit`; focused LTP `accept03 20/23`.
+  **Next step:** choose between the remaining heavy accept03 providers
+  (`perf_event_open`, `bpf`, `memfd_secret`) or return to protocol blockers
+  (`RDS`, `SCTP`). **Blocker:** full new mount API semantics need a separate
+  mount-subsystem implementation and should not be inferred from this fd
+  provider slice.
+
+- 2026-05-26 **Landed typed `FsNotify` fds for the next `accept03`
+  provider slice.** Added `inotify_init1(26)` and `fanotify_init(262)` as
+  real VFS `StructPayload::FsNotify` descriptors with their own zone-managed
+  instance identity, read wait source, close-on-exec/nonblocking flag plumbing,
+  and generic non-socket `accept()` classification. This is intentionally the
+  notification-instance fd phase only: `inotify_add_watch`, `fanotify_mark`,
+  event queue production, and fanotify permission events remain future
+  fsnotify/OnAgent work. Focused LTP `accept03` now reports `17/23` in
+  `target/oscomp/ltp-accept03-after-fsnotify-fds.txt`, with both
+  `accept() on fanotify : ENOTSOCK` and `accept() on inotify : ENOTSOCK`.
+  The supporting LTP `inotify_init1_01,inotify_init1_02` witness reports
+  `8/8` in `target/oscomp/ltp-inotify-init1-basic.txt`. A 360s full b4
+  refresh attempt reached `bind06 1/1` and `connect01 7/7` but timed out after
+  entering the known slow `connect02`, so the split total is not updated from
+  that partial log. **Verification:**
+  `cargo fmt`; `cargo test -p tx-shims inotify_init1 --lib`; `cargo test -p
+  tx-shims fanotify_init --lib`; `cargo check -p tx-subsystems -p tx-shims`;
+  `cargo xtask syscall-status inotify_init1`; `cargo xtask syscall-status
+  fanotify_init`; `cargo xtask syscall-status --regen`; `cargo xtask syscall
+  sync`; `cargo xtask build --target rv64-qemu`; `cargo xtask oscomp submit
+  --target rv64-qemu --submit target/oscomp/submit`; focused LTP `accept03
+  17/23`; focused LTP `inotify_init1_01,inotify_init1_02 8/8`; local judge on
+  both logs. **Next step:** remaining accept03 score-effective fd providers
+  are now the heavy or design-deferred surfaces: perf event, bpf map,
+  fsopen/fspick/open_tree, and memfd_secret. **Blocker:** full inotify/fanotify
+  event semantics are not done; this slice only creates principled instance
+  fds.
+
+- 2026-05-26 **Landed basic `memfd_create` as the second `accept03`
+  fd-provider slice.** `memfd_create(279)` now dispatches on RV64, validates
+  the user name/flags, supports ordinary anonymous PageBacked memfds plus
+  `MFD_CLOEXEC`, installs a read/write regular-file fd backed by
+  `PageContainerKind::Anon`, and intentionally rejects `MFD_ALLOW_SEALING` and
+  `MFD_HUGETLB` with `EINVAL` until seal and huge-page semantics exist.
+  Focused LTP `accept03` now reports `15/23` in
+  `target/oscomp/ltp-accept03-after-memfd-create.txt`, with
+  `accept() on memfd : ENOTSOCK`; the focused `memfd_create02` ABI witness
+  reports `10/14` in `target/oscomp/ltp-memfd-create02-basic.txt`, with the
+  seal/hugetlb-only cases skipped as unsupported. **Verification:** `cargo
+  fmt --check`; `cargo check -p tx-subsystems -p tx-shims`; `cargo test -p
+  tx-shims memfd_create --lib`; `cargo xtask syscall-status memfd_create`;
+  `cargo xtask syscall-status --regen`; `cargo xtask syscall sync`; `cargo
+  xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu --submit target/oscomp/submit`; focused LTP `accept03 15/23`;
+  focused LTP `memfd_create02 10/14`; local judge on both logs. **Next step:**
+  continue `accept03` with basic inotify/fanotify instance fds, or switch to
+  the local-only RDS/SCTP protocol surfaces if the next goal is network-only.
+  **Blocker:** remaining `accept03` skips are fanotify, inotify, perf event,
+  bpf map, fsopen/fspick/open_tree, and memfd_secret; file seals and hugetlb
+  memfd remain deliberately unimplemented.
+
+- 2026-05-26 **Landed `pidfd_open` as the first `accept03` fd-provider
+  slice.** VFS now has `OpenFileBacking::Pidfd { process }`, and
+  `pidfd_open(434)` resolves the target process, installs a pidfd-backed
+  `OpenFile`, marks the fd close-on-exec, accepts `PIDFD_NONBLOCK`, and
+  rejects unknown flags with `EINVAL`. Focused LTP `accept03` now reports
+  `14/23` in `target/oscomp/ltp-accept03-after-pidfd-open-final.txt`, with
+  `accept() on pidfd : ENOTSOCK`; the previous focused baseline was `13/23`.
+  **Verification:** `cargo fmt --check`; `cargo check -p tx-subsystems -p
+  tx-shims`; `cargo test -p tx-shims pidfd_open --lib`; `cargo xtask
+  syscall-status --regen`; `cargo xtask syscall-status pidfd_open`; `cargo
+  xtask syscall-status --check`; `cargo xtask syscall sync`; `cargo xtask lint
+  syscall-status`; `cargo xtask build --target rv64-qemu`; `cargo xtask oscomp
+  submit --target rv64-qemu --submit target/oscomp/submit`; focused LTP
+  `accept03 14/23`. **Next step:** choose the next `accept03` provider, with
+  `memfd_create` or basic inotify instance fds looking lower-risk than
+  fanotify/perf/bpf/new-mount API. **Blocker:** remaining `accept03` skips are
+  fanotify, inotify, perf event, bpf map, fsopen/fspick/open_tree, memfd, and
+  memfd_secret; `pidfd_send_signal` remains separate signal semantics work.
+
+- 2026-05-26 **Landed the constrained TCP TLS ULP path for LTP
+  `setsockopt10`.** TCP sockets now track a TLS ULP metadata state when
+  `setsockopt(SOL_TCP/TCP_ULP, "tls")` is applied to a connected TCP socket,
+  accept `SOL_TLS/TLS_TX` crypto-info setup as metadata, preserve the ULP state
+  across `connect(AF_UNSPEC)`, and reject `listen()` with `EINVAL` when a
+  disconnected TCP socket still carries a TLS ULP without clone support.
+  `/boot/config-6.1.0-txkernel` now advertises `CONFIG_TLS=y` only after that
+  state and `listen()` rejection exist. This is intentionally not TLS record
+  encryption or a full kTLS data path. **Verification:** `cargo fmt --check`;
+  `cargo test -p tx-subsystems
+  execution_listen_rejects_tcp_tls_ulp_without_clone --lib`; `cargo test -p
+  tx-shims dispatch_tls_ulp_disconnect_rebind_listen_returns_einval --lib`;
+  `cargo test -p tx-fs
+  procfs_kernel_config_includes_ltp_required_surface --lib`; `cargo xtask
+  build --target rv64-qemu`; `cargo xtask oscomp submit --target rv64-qemu
+  --submit target/oscomp/submit`; focused LTP `setsockopt10 1/1` in
+  `target/oscomp/ltp-setsockopt10-tls-ulp-rebuilt.txt`; refreshed b6
+  setsockopt split `10/11` in `target/oscomp/ltp-net-b6-after-tls-ulp.txt`,
+  moving the split-batch total to `208/227`. **Next step:** choose between
+  `accept03` fd providers, local-only RDS, or local-only SCTP for the next
+  official-score-effective blocker.
+  **Blocker:** full TLS record encryption, SCTP, RDS, broad fd providers, RV64
+  `socketcall`, and the `recvmmsg01` musl wrapper fault remain separate
+  surfaces.
+
+- 2026-05-26 **Planned the remaining explicit LTP network blockers after the
+  clean `setsockopt06` witness.** Committed the small witness-doc update as
+  `6c2dc69c` (`docs: record clean setsockopt06 b6 witness`) and added the
+  proposed plan at
+  `docs/progress/plans/2026-05-26-ltp-network-remaining-blockers.json`.
+  The docs/LTP/source audit classifies the remaining items as distinct
+  surfaces: SCTP/RDS/TLS ULP need explicit network protocol-state work,
+  `accept03` needs principled non-socket fd providers rather than accept-path
+  changes, `socketcall01..03` are not RV64 generic ABI syscalls, and
+  `recvmmsg01` musl still faults in userspace before the bad-msgvec syscall
+  while raw/glibc witnesses validate kernel semantics. **Verification:** plan
+  file written from active Txv3/VFS/Process/PageBacked/Mount/Device docs and
+  local LTP source audit; implementation commands not run because this is a
+  planning step. **Next step:** choose the first implementation lane; the
+  recommended honest score path is pidfd/memfd/inotify-style `accept03`
+  providers or the constrained TCP TLS ULP `setsockopt10` lane before
+  chartering local-only SCTP/RDS. **Blocker:** full SCTP, full RDS, TLS record
+  encryption, BPF/perf fds, and RV64 compat `socketcall` remain outside the
+  current narrow network-syscall surface.
+
+- 2026-05-26 **Finished the `sendmsg03`/`setsockopt06` fuzzy timeout fix and
+  refreshed the moving network splits.**
+  Root cause was not network-stack linear scanning: `sendmsg03`'s raw
+  `IP_HDRINCL` path is fixed-size user iovec validation plus an unsupported
+  send result, and `setsockopt06`'s packet path is fixed-size
+  `PACKET_VERSION`/`PACKET_RX_RING` mutation. The timeout came from LTP
+  fuzzy-sync repeatedly using `sched_yield()` while txKernel requeued yielded
+  userspace threads into `Preempted`, behind hot userspace `New` work on the
+  same hart. Userspace yields now requeue to the `New` tail, and focused runs
+  can bound LTP's own runtime with `LTP_MAX_RUNTIME=N` (`tx.ltp.max_runtime`
+  -> LTP `-I N`). Focused witnesses now pass: `sendmsg03 1/1` in
+  `target/oscomp/ltp-sendmsg03-after-yield-queue-maxruntime10.txt` and
+  `setsockopt06 1/1` in
+  `target/oscomp/ltp-setsockopt06-after-yield-queue-maxruntime20.txt`.
+  Added `LTP_MAX_RUNTIME_CASES` so mixed split batches can apply `-I` only to
+  the fuzzy case; a diagnostic b2 run showed that applying `LTP_MAX_RUNTIME`
+  across ordinary `send01` causes long repetition, EBADF drift, and EMFILE.
+  Refreshed split rows now score b2 `34/35`
+  (`target/oscomp/ltp-net-b2-sendrecv-after-userns-packet.txt`), b3 `36/38`
+  (`target/oscomp/ltp-net-b3-msg-after-yield-queue.txt`), b4 `74/86`
+  (`target/oscomp/ltp-net-b4-after-bind06-current.txt`), and b6 `9/11`
+  (`target/oscomp/ltp-net-b6-setsockopt-tail-maxruntime30.txt`), for a current
+  split-batch total of `207/227`. The b6 `LTP_MAX_RUNTIME=30` rerun removed the
+  previous `setsockopt06` `TWARN`; the pass count stayed the same while the
+  warning-created denominator disappeared.
+  **Verification:** `cargo fmt --check`; `cargo test -p tx-kernel
+  filtered_ltp`; `cargo test -p tx-kernel
+  ltp_integer_runtime_tokens_are_positive_decimal_only`; `cargo test -p
+  tx-reactor yielded_userspace_thread_requeues_at_new_tail_behind_peer`;
+  `cargo test -p tx-reactor
+  yielded_fair_task_resets_budget_and_requeues_with_fresh_preempted_slice`;
+  `cargo test -p tx-reactor
+  two_yielding_tasks_both_make_progress_with_existing_policy`; `cargo xtask
+  build --target rv64-qemu`; `cargo xtask oscomp submit --target rv64-qemu
+  --submit target/oscomp/submit`; local judge `1/1` for both focused logs and
+  local judge on the refreshed b2/b3/b6 logs, including the b6 max-runtime-30
+  rerun. **Next step:** decide whether to charter one of the remaining explicit
+  unsupported surfaces (SCTP/RDS/TLS,
+  RV64 legacy `socketcall`, broad `accept03` fd providers, or the known
+  `recvmmsg01` musl wrapper SIGSEGV). **Blocker:** no `sendmsg03` or
+  `setsockopt06` focused blocker remains.
+
+- 2026-05-26 **Wired `sched_yield(124)` and narrowed the long fuzzy bottleneck
+  analysis.** Added the RV64 `sched_yield` syscall arm so it awaits
+  `tx_reactor::yield_now()` and returns 0, matching the scheduler design note
+  and giving LTP fzsync a real cooperative handoff. Host coverage:
+  `cargo test -p tx-shims dispatch_sched_yield_yields_before_returning_zero`.
+  Focused post-fix QEMU probes rebuilt/submitted RV64 locally because Docker
+  compose is unavailable in this environment. `sendmsg03` improved from old
+  `spins` avg 12 to avg 1 with delay range `[0, 0]` in
+  `target/oscomp/ltp-sendmsg03-after-sched-yield-180.txt`, but still timed out
+  before TPASS/TFAIL. `setsockopt06` still timed out in
+  `target/oscomp/ltp-setsockopt06-after-sched-yield-150.txt` at loop 126 with
+  `delay_bias = -1240` and `spins` avg about 1200. Root-cause classification:
+  not a network-stack linear-scan issue. `sendmsg03`'s raw `IP_HDRINCL` path is
+  fixed-size iovec validation plus `EOPNOTSUPP`; `setsockopt06`'s packet
+  sockopts are fixed-size reads/mutations, while the huge cost is LTP fzsync
+  bias turning successful `PACKET_RX_RING` samples into many single-CPU
+  `sched_yield()` delay syscalls. **Next step:** complete score movement only
+  after either a stable multi-effective-CPU userspace runner exists or a focused
+  long run reaches result markers.
+
+- 2026-05-26 **Refreshed LTP b4 with `bind06` and classified the fuzzy-runner
+  strategy.** The refreshed bind/connect/accept split now scores `74/86` in
+  `target/oscomp/ltp-net-b4-after-bind06-current.txt`, including `bind06 1/1`.
+  The two remaining long userns-gated CVE fuzzy witnesses are bounded in source
+  by LTP `max_runtime` (`sendmsg03` 150s, reported as `0h 03m 00s`;
+  `setsockopt06` 270s, reported as `0h 05m 00s`) but current host-wall QEMU
+  probes still time out before result markers. Root cause is the fzsync race
+  harness plus runner shape: the default RV64 OSComp path is `-smp 1`, so LTP
+  sees one CPU and fzsync uses `sched_yield()` in waits/delays; `-smp 4` can
+  speed sampling but remains boot-hart-3 sensitive and hit `BootStaticBag not
+  constructed`; `-smp 2` avoids that panic in probes but still did not complete
+  the long witnesses (`sendmsg03` loop 1050 in 260s, `setsockopt06` no sampling
+  by 120s). Added `make oscomp-qemu-rv64-smp2` / `oscomp-judge-rv64-smp2` as a
+  reusable focused-runner entry. **Verification:** local judge `74/86` on the
+  b4 log; focused SMP logs `target/oscomp/ltp-sendmsg03-smp4-120.txt`,
+  `target/oscomp/ltp-sendmsg03-smp4-260.txt`,
+  `target/oscomp/ltp-sendmsg03-smp2-120.txt`,
+  `target/oscomp/ltp-sendmsg03-smp2-260.txt`,
+  `target/oscomp/ltp-setsockopt06-smp4-120.txt`, and
+  `target/oscomp/ltp-setsockopt06-smp2-120.txt`; `cargo xtask fault-decode`
+  on the SMP4 panic logs; `make -n oscomp-qemu-rv64-smp2`; `make -n
+  oscomp-judge-rv64-smp2`. **Next step:** either fix the SMP4 boot-hart-3
+  `BootStaticBag` path or add a stable xtask `--smp 2`/timeout profile before
+  attempting score movement for `sendmsg03`/`setsockopt06`. **Blocker:**
+  neither long fuzzy witness has a stable TPASS/TFAIL marker yet.
+
+- 2026-05-26 **Classified LTP `sendmsg03` as the other current slow fuzzy
+  witness.** A fresh focused `sendmsg03` run rebuilt/submitted the RV64 kernel,
+  generated `target/oscomp/ltp-sendmsg03-current-data/sdcard-rv.img`, and
+  confirmed the case reaches the raw ICMP `IP_HDRINCL`/`sendmsg()` race body:
+  the 60s probe reached fzsync loop 1024, and the 300s probe reached loop 1056
+  before the outer timeout killed QEMU. No `TFAIL`, `TBROK`, trap, errno, or
+  setup/config blocker surfaced; local judge stays `0/0` because the timeout
+  cuts the log before LTP result markers. **Verification:** `cargo xtask build
+  --target rv64-qemu`; `cargo xtask oscomp submit --target rv64-qemu`;
+  focused LTP logs `target/oscomp/ltp-sendmsg03-current30.txt`,
+  `target/oscomp/ltp-sendmsg03-current60.txt`, and
+  `target/oscomp/ltp-sendmsg03-current300.txt`; local judge on the 300s log.
+  **Next step:** refresh the b4 bind/connect/accept split if aggregate score
+  movement is needed after the focused `bind06` pass, or design a runner
+  strategy for completing the long fuzzy witnesses. **Blocker:** `sendmsg03`
+  and `setsockopt06` remain incomplete under the current single-hart timeout
+  ladder despite reaching their race bodies.
+
+- 2026-05-26 **Recovered the LTP network syscall-50 context and classified the
+  next packet race witnesses.** The working ledger now records a focused
+  `bind06 1/1` pass in `target/oscomp/ltp-bind06-current330.txt`; `bind06`
+  reaches the AF_PACKET bind/ioctl race body, exits by LTP execution time, and
+  reports `TPASS`. `setsockopt06` is no longer a setup/config/errno blocker: a
+  330s focused run reached fzsync loop 198 in
+  `target/oscomp/ltp-setsockopt06-current330.txt` before the outer timeout, so
+  it remains classified as an extremely slow CVE fuzzy witness on the current
+  single-hart runner. Also fixed stale host expectations for `SO_TYPE` on
+  AF_UNIX `SOCK_SEQPACKET` and malformed `TPACKET_V3` private-size validation.
+  **Verification:** `cargo fmt --check`; `cargo check -p tx-subsystems`;
+  `cargo check -p tx-shims`; `cargo test -p tx-fs
+  procfs_kernel_config_includes_ltp_required_surface -- --test-threads=1`;
+  `cargo test -p tx-shims netns_syscalls -- --test-threads=1`; `cargo test -p
+  tx-shims packet -- --test-threads=1`; `cargo test -p tx-shims raw_icmp --
+  --test-threads=1`; `cargo xtask build --target rv64-qemu`; `cargo xtask
+  oscomp submit --target rv64-qemu`; local judge `bind06 1/1`; local judge
+  `setsockopt06 0/0` due outer-timeout truncation before result markers.
+  **Next step:** focus `sendmsg03` or refresh b4 after the `bind06` focused
+  pass; keep `setsockopt06` out of score movement until a runner/timeout
+  strategy can complete the fuzzy loop. **Blocker:** `sendmsg03` and
+  `setsockopt06` still do not produce complete focused judge rows under the
+  current timeout ladder.
+
+- 2026-05-25 **Moved LTP `setsockopt08` from netfilter TCONF to a focused
+  pass.** The kernel config now advertises the minimal legacy x_tables
+  match/target surface required by the case, and `IPT_SO_SET_REPLACE` performs
+  structural request validation: too-short/malformed replace buffers return
+  `EINVAL`, while structurally complete table replacement remains
+  `EOPNOTSUPP` because full iptables installation/filtering is not implemented.
+  Also added a host-covered raw `IP_HDRINCL` sendmsg fast path that returns
+  `EOPNOTSUPP` for unsupported full IPv4-header transmit after validating user
+  ranges; `sendmsg03` still behaves as a long fuzzy-sync witness rather than a
+  new errno failure. **Verification:** `cargo fmt --check`; `cargo check -p
+  tx-fs`; `cargo check -p tx-shims`; `cargo test -p tx-fs
+  procfs_kernel_config_includes_ltp_required_surface -- --test-threads=1`;
+  `cargo test -p tx-shims
+  dispatch_iptables_legacy_sockopt_reports_empty_tables -- --test-threads=1`;
+  `cargo test -p tx-shims
+  dispatch_raw_icmp_ip_hdrincl_sendmsg_is_unsupported_fast_path --
+  --test-threads=1`; focused LTP `setsockopt08 1/1` in
+  `target/oscomp/ltp-setsockopt08-netfilter-minimal.txt`. **Next step:** focus
+  on `setsockopt06` and `bind06` packet race witnesses, then refresh the b6
+  split. **Blocker:** full netfilter table replacement/filtering remains
+  intentionally unsupported beyond this validation surface.
+
+- 2026-05-25 **Pushed the Linux-aligned userns work into the first
+  userns-gated LTP network bodies.** Procfs now exposes writable
+  `/proc/self/{setgroups,uid_map,gid_map}` with Linux-style map validation,
+  `/proc/sys/user/max_user_namespaces`, and `CONFIG_USER_NS=y` only after the
+  map semantics exist. Network privileged checks now use namespace-relative
+  userns authority, loopback MTU ioctl supports `SIOCGIFMTU`/`SIOCSIFMTU`,
+  packet sockets support `PACKET_VNET_HDR`, AF_PACKET `sendto(sockaddr_ll)`,
+  packet reserve/ring validation, and raw ICMP `IP_HDRINCL`. Focused LTP
+  witnesses now pass: `setsockopt05 1/1`, `sendto03 2/2`,
+  `setsockopt07 1/1`, and `setsockopt09 1/1`; `sendmsg03`, `setsockopt06`,
+  and `bind06` now reach long fuzzy/race bodies instead of failing setup.
+  **Verification:** `cargo fmt --check`; `cargo check -p tx-subsystems`;
+  `cargo check -p tx-fs`; `cargo check -p tx-shims`; targeted `tx-fs` and
+  `tx-shims` host tests for userns maps, netns syscalls, packet
+  MTU/VNET/sendto/reserve/ring, and raw `IP_HDRINCL`; local judge on the four
+  focused LTP logs above. **Next step:** finish/classify the long-body witnesses with the
+  short timeout ladder, then refresh the b2/b6 split rows. **Blocker:**
+  full netfilter/TLS/SCTP/RDS and RV64 legacy socketcall remain separate
+  unsupported surfaces.
+
+- 2026-05-25 **Completed the Linux-aligned userns Phase 1 authority slice for
+  LTP network setup.** `UserNamespace` now has namespace-relative capability
+  helpers, inherited setgroups policy, and current uid/gid map checks for
+  `unshare(CLONE_NEWUSER)`. `NetNamespacePayload` records the immutable
+  owner user namespace, bootstrap assigns the initial netns owner, and
+  `sys_unshare()` now follows Linux ordering for combined
+  `CLONE_NEWUSER | CLONE_NEWNET`: create userns first, authorize netns against
+  the new userns, then publish. `setns(CLONE_NEWNET)` now checks authority
+  against the target netns owner. Added host coverage for unprivileged
+  `CLONE_NEWNET` denial, unprivileged combined `NEWUSER|NEWNET` success, and
+  owner-userns preservation. **Verification:** `cargo fmt --check`;
+  `cargo check -p tx-subsystems`; `cargo check -p tx-shims`; `cargo test -p
+  tx-shims netns_syscalls -- --test-threads=1`. **Next step:** Phase 2
+  caller-sensitive procfs map files for `/proc/self/setgroups`,
+  `/proc/self/uid_map`, and `/proc/self/gid_map`. **Blocker:** no LTP score
+  movement expected until procfs map files and `CONFIG_USER_NS=y` are enabled.
+
+- 2026-05-25 **Aligned namespace design docs with Linux user namespace
+  behavior for the LTP network setup path.** Updated `NAMESPACE_VIEW_v1` to
+  make `user_ns` the namespace-relative capability/uid/gid authority lens,
+  require immutable owner-userns links on non-user namespaces, document
+  Linux's `CLONE_NEWUSER | CLONE_NEWNET` ordering, and specify procfs
+  `uid_map`/`gid_map`/`setgroups` map-write rules. Mirrored the new NSVIEW
+  invariants in both `INVARIANTS_v4` and `Txv3/02_INVARIANTS_v5`, clarified
+  the `PROCESS_v1` `nsproxy` boundary, and added the implementation handoff
+  `msp/ltp-userns-linux-aligned-implementation-plan.md`. **Verification:**
+  `cargo xtask progress validate`; `cargo xtask lint docs`. Also attempted
+  `cargo xtask lint invariants all`, which still fails on the pre-existing
+  `syscall-no-await` ratchet (`78 > 60`) outside this doc-only change. No code
+  or LTP run in this step. **Next step:** implement the Phase 1
+  capability/owner-userns slice before procfs map files or `CONFIG_USER_NS=y`.
+  **Blocker:** current code still lacks true namespace-local capability checks
+  and netns owner-userns authorization.
+
+- 2026-05-25 **Selected user namespace setup as the next highest-value LTP
+  network direction and landed Phase A.** Compared the remaining blockers:
+  legacy `socketcall` is not an RV64 target, SCTP/RDS/TLS/netfilter are narrow
+  protocol surfaces, while user namespace setup gates `bind06`, `sendto03`,
+  `sendmsg03`, and `setsockopt05..09`. Added a real minimal
+  `process::nsproxy::UserNamespace` cap with parent/owner/map storage and wired
+  `unshare(CLONE_NEWUSER)` so it publishes a fresh namespace bundle without
+  breaking the existing `CLONE_NEWNET` path. Kernel config still must not flip
+  to `CONFIG_USER_NS=y` until `/proc/self/{setgroups,uid_map,gid_map}` exists.
+  **Verification:** `cargo check -p tx-subsystems`; `cargo test -p tx-shims
+  dispatch_unshare -- --test-threads=1`. **Next step:** procfs Phase B:
+  caller-sensitive `/proc/sys/user/max_user_namespaces`,
+  `/proc/self/setgroups`, `/proc/self/uid_map`, and `/proc/self/gid_map`
+  projected files. **Blocker:** no LTP score expected yet because the map files
+  and config enablement are intentionally deferred.
+
+- 2026-05-25 **Refreshed the complete LTP bind/connect/accept split after the
+  dual-stack TCP fix and classified the accept tail.** The complete b4 split
+  now scores `73/86` in
+  `target/oscomp/ltp-net-b4-bind-connect-accept-after-connect02-complete.txt`;
+  the focused accept tail scores `28/39` in
+  `target/oscomp/ltp-net-accept-tail-after-connect02.txt`. `accept4_01`
+  passes the libc and native `__NR_accept4` variants and only skips the legacy
+  `socketcall` variant on RV64; `getpeername01` passes `7/7`; `accept03`
+  passes all available non-socket fd errno checks and is limited by broad
+  non-network descriptor providers such as pidfd, fanotify, inotify, perf,
+  bpf, fsopen/fspick/open_tree, memfd, and memfd_secret. The current split
+  total across the six network-syscall batches is `198/226`. **Verification:**
+  30s focused accept-tail LTP run; 150s complete b4 LTP run because
+  `connect02` is a known slow/silent 1000-iteration case; local judge on both
+  logs. **Next step:** do not fake those descriptor providers for `accept03`;
+  choose either a deliberate broader fd/syscall charter or move to another
+  remaining supported network surface. **Blocker:** no small TCP/accept
+  semantic blocker remains in b4.
+
+- 2026-05-25 **Moved LTP `connect02` through the dual-stack TCP regression
+  path.** AF_INET6 wildcard TCP listeners now accept IPv4 loopback clients when
+  v6-only is disabled, accepted children preserve enough IPv6 family state for
+  `setsockopt(SOL_IPV6, IPV6_ADDRFORM, AF_INET)`, `connect(AF_UNSPEC)` resets a
+  connected TCP socket back to a reusable init state, and IPv4 TCP autobind now
+  skips ports occupied by non-v6only IPv6 wildcard listeners. Focused LTP
+  `connect02` now scores `1/1`; a 120s b4 aggregate probe reached `accept4_01`
+  after `connect02` passed but was killed by the outer timeout, so the complete
+  b4 split row is not refreshed yet. **Verification:** `cargo fmt --check`;
+  `cargo test -p tx-subsystems
+  tcp_loopback_ipv4_client_reaches_inet6_wildcard_listener -- --test-threads=1`;
+  `cargo test -p tx-shims
+  dispatch_ipv6_addrform_reset_rebinds_accepted_tcp_as_ipv4_listener --
+  --test-threads=1`; `cargo test -p tx-shims dispatch_inet6_udp --
+  --test-threads=1`; `cargo xtask build --target rv64-qemu`; `cargo xtask
+  oscomp submit --target rv64-qemu`; focused LTP log
+  `target/oscomp/ltp-net-ipv6-connect02.txt`; local judge. **Next step:** if an
+  aggregate b4 score is needed, rerun b4 with a deliberate 180s timeout because
+  `connect02` is a slow/silent 1000-iteration case; otherwise move to remaining
+  non-network blockers such as user namespace setup, broad `accept03` fd probes,
+  SCTP/RDS, TLS, or netfilter. **Blocker:** no focused `connect02` blocker
+  remains.
+
+- 2026-05-25 **Implemented the first LTP IPv6 socket slice for UDP/UDP-Lite.**
+  AF_INET6 socket creation now reaches the normal TCP/UDP paths, socket
+  identity/payload state preserves address family, sockaddr helpers decode and
+  write `sockaddr_in6`, endpoint/table matching is family-aware, and direct UDP
+  loopback delivers `::1` traffic to both exact and wildcard IPv6 receivers.
+  Focused LTP `bind05,recvmsg02` now scores `15/15`; the split scores move to
+  b3 msg/mmsg `35/38` and b4 bind/connect/accept `72/86`, for a current
+  split-batch total of `197/226`. **Verification:** `cargo fmt --check`;
+  `cargo check -p tx-shims`; `cargo test -p tx-shims dispatch_inet6_udp --
+  --test-threads=1`; `cargo test -p tx-shims
+  dispatch_sendmsg_recvmsg_udp_loopback_round_trips_source_addr --
+  --test-threads=1`; `cargo xtask build --target rv64-qemu`; `cargo xtask
+  oscomp submit --target rv64-qemu`; 30s focused LTP log
+  `target/oscomp/ltp-net-ipv6-udp.txt`; b3 log
+  `target/oscomp/ltp-net-b3-msg-after-ipv6-udp.txt`; b4 log
+  `target/oscomp/ltp-net-b4-bind-connect-accept-after-ipv6-udp.txt`; local
+  judge. **Next step:** `connect02` now fails later with IPv4 client
+  `ECONNREFUSED` against an AF_INET6 wildcard listener, so the next slice is
+  dual-stack TCP listener fallback plus `IPV6_ADDRFORM` and `connect(AF_UNSPEC)`
+  reset/rebind semantics. **Blocker:** full dual-stack TCP is not yet
+  implemented.
+
+- 2026-05-25 **Added IPv4 UDP-Lite coverage for LTP `bind05`.** Mapped
+  `AF_INET/SOCK_DGRAM/IPPROTO_UDPLITE` to the existing UDP-like datagram path
+  and added host coverage for the socket type mapping. The focused `bind05`
+  witness now scores `8/9`: AF_UNIX, IPv4 UDP, and IPv4 UDP-Lite loopback /
+  wildcard datagram communication pass; the remaining subcase is the broader
+  IPv6 `EAFNOSUPPORT` gap. The bind/connect/accept split improves from
+  `62/77` to `66/81`, and the current 50-case split total is `190/221`.
+  **Verification:** `cargo test -p tx-subsystems
+  socket_type_validation_maps_to_kind -- --test-threads=1`; `cargo test -p
+  tx-shims dispatch_udplite_socket_reports_datagram_type -- --test-threads=1`;
+  `cargo xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu`; 30s LTP `bind05` log
+  `target/oscomp/ltp-net-bind05-after-udplite.txt`; 30s b4 log
+  `target/oscomp/ltp-net-b4-bind-connect-accept-after-udplite.txt`; local
+  judge. **Next step:** choose between broader user namespace setup and
+  remaining network protocol surfaces such as IPv6/SCTP/RDS/TLS/netfilter.
+  **Blocker:** IPv6 remains unsupported and is the only remaining `bind05`
+  subcase blocker.
+
+- 2026-05-25 **Resolved the LTP kernel-config visibility blocker for
+  syscall-network cases.** Boot now creates `/boot/config-6.1.0-txkernel`
+  from shared `tx_fs::procfs::KERNEL_CONFIG_TEXT`, while `/proc/config` renders
+  the same conservative config. LTP now parses that file instead of breaking
+  with `Cannot parse kernel .config`; the affected cases become honest
+  `TCONF` skips for unsupported `CONFIG_USER_NS`, TLS, or netfilter support.
+  The main split scores stay `186/217` because those surfaces remain out of
+  scope for a small network patch: b4 remains `62/77` and b6 remains `4/11`.
+  **Verification:** `cargo test -p tx-fs
+  procfs_kernel_config_includes_ltp_required_surface -- --test-threads=1`;
+  `cargo xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu`; 30s LTP kconfig probe
+  `target/oscomp/ltp-net-kconfig-after-config-file.txt`; b4 reconfirm
+  `target/oscomp/ltp-net-b4-bind-connect-accept-after-kconfig-file.txt`; b6
+  reconfirm `target/oscomp/ltp-net-b6-setsockopt-tail-after-kconfig-file.txt`;
+  local judge. **Next step:** decide whether to charter user namespace setup as
+  a broader process/procfs/credential change, or stay in narrower network
+  protocol gaps such as IPv6/SCTP/UDP-Lite/RDS/TLS/netfilter. **Blocker:**
+  user namespace is not a small socket fix and should not be faked by flipping
+  config bits.
+
+- 2026-05-25 **Advanced the LTP syscall-network split batches past the AF_UNIX
+  and packet-option blockers.** The six focused logs now cover all 50 manual
+  socket/network syscall cases with a local judge subcase total of `186/217`:
+  b1 basic `40/40`, b2 send/recv `32/34`, b3 msg/mmsg `34/38`, b4
+  bind/connect/accept `62/77`, b5 socketpair/socketcall `14/17`, and b6
+  setsockopt tail `4/11`. The runner now preserves explicit LTP case order in
+  `tools/build-slim-sdcard.py`, AF_UNIX `SOCK_SEQPACKET` reports `SO_TYPE=5`
+  and maps to the local stream path, abstract AF_UNIX names are removed on
+  close, and packet `PACKET_VERSION`/`PACKET_RX_RING`/`PACKET_RESERVE` plus
+  `SO_SNDBUFFORCE` now satisfy `setsockopt02` and `setsockopt04`. **Verification:**
+  focused host tests for seqpacket, abstract close/rebind, pathname close
+  retention, packet-ring option validation, and send-buffer force clamping;
+  `cargo xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu`; local judge on the b4/b5/b6 logs listed in
+  `docs/LTP/ltp-network-syscall-progress.md`. **Next step:** fix or classify
+  the shared kernel `.config` visibility blocker for `bind06`, `sendto03`,
+  `sendmsg03`, and `setsockopt05..10` before spending time on IPv6/SCTP/RDS
+  protocol gaps. **Blocker:** `.config` parsing currently fails before those
+  cases exercise their socket semantics.
+
+- 2026-05-25 **Recorded the current LTP syscall-network checkpoint and debug
+  discipline.** Added `docs/LTP/ltp-network-syscall-progress.md` as the
+  handoff ledger for the 50 manual OSComp LTP socket/network syscall cases:
+  current reliable focused scores are basic `40/40`, send/recv `32/34`,
+  msg/mmsg `34/38`, socketpair/getpeername `21/21`, and AF_UNIX bind follow-up
+  `13/15`; the older full-list probe is explicitly marked non-authoritative
+  because boot arguments truncated near `send01+s`. Added
+  `tx-ltp-timeout-ladder` to force focused 30s-first LTP/OSComp runs and
+  `tx-debug-logbook` to require detailed symptom/root-cause/fix/verification
+  logs under the untracked `msp/debug-logs/` area after debugging, with only
+  concise repo-tracked summaries in progress docs. **Verification:** re-scored the saved LTP network logs
+  with `tools/oscomp-judge.py`; `cargo xtask progress validate`; checked skill
+  metadata and markdown references by grep/readback. **Next step:** rerun the
+  bind/connect/accept split with `timeout 30s` and then fix the first semantic
+  failure, likely AF_UNIX `SOCK_SEQPACKET` for `bind04` if that remains the
+  top non-environment blocker. **Blocker:** `.agents/skills` is read-only in
+  the default sandbox, so creating the new skill directories required an
+  approved scoped `mkdir -p`; `msp/` remains untracked and must not be added.
+
+- 2026-05-25 **Stabilized focused OSComp iperf/netperf after the network PR
+  update.** Reproduced the flaky `iperf-musl` behavior: runs could pass once
+  and then hang at `BASIC_TCP` or `PARALLEL_TCP`, while `iperf-glibc` advanced
+  from `BASIC_TCP` to the same `PARALLEL_TCP` hang after the first ppoll fix.
+  Root cause was readiness semantics rather than an iperf-specific input:
+  `ppoll` still collapsed socket read/write wait interests into a single token
+  and did not wait on blocking socket polls, while TCP peer close fired
+  `send_wq BROKEN` without making poll/select report `ERR`/write-ready. `ppoll`
+  now tracks multiple wait tokens and splits socket `IN`/`OUT` waits like
+  `pselect6`; TCP send-side BROKEN now contributes `PollMask::ERR|OUT`, and
+  `pselect6` treats `ERR` as write-ready so close/error wakes do not strand
+  parallel TCP teardown. **Verification:** `cargo fmt --check`; `cargo test -p
+  tx-shims --lib ppoll -- --test-threads=1`; `cargo test -p tx-shims --lib
+  pselect_socket_blocked_interests_keeps_read_and_write_distinct --
+  --test-threads=1`; `cargo test -p tx-subsystems --lib
+  tcp_socket_close_marks_connected_peer_broken -- --test-threads=1`; `cargo
+  xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu --submit target/oscomp/submit`; focused OSComp `iperf-musl 6/6`
+  twice, `iperf-glibc 6/6`, `netperf-musl 5/5`, and `netperf-glibc 5/5` using
+  the local judge. **Next step:** optionally rerun the broader non-LTP OSComp
+  set before another PR push. **Blocker:** none found for focused iperf/netperf.
 
 - 2026-05-26 **Cleared the AIO host-test drift and wired `io_pgetevents`.**
   The older raw AIO host tests now stage `iocbpp`, `struct iocb`, and

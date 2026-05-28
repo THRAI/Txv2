@@ -268,7 +268,7 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
         .unwrap_or_else(|| root.join("target").join("oscomp").join("submit"));
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
     let cmdline = oscomp_kernel_cmdline(args);
-    let (kernel, sdcard, out, qemu_args) = match target {
+    let (kernel, sdcard, out, mut qemu_args) = match target {
         TxTarget::Rv64Qemu => (
             submit.join("kernel-rv"),
             data.join("sdcard-rv.img"),

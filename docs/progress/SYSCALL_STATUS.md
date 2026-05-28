@@ -292,14 +292,14 @@ When you implement or change a syscall:
 _Counts read from `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}` and checked against Linux RV64 v6.17 from `xtask/data/syscalls/riscv/64/rv64/linux-6.17-table.json` (source: https://syscalls.mebeim.net/db/riscv/64/rv64/latest/table.json). Linux file/line references point into `external/linux-rv-6.17`._
 _Run `cargo xtask syscall-status --regen` to refresh; `--check` to lint in CI._
 
-- **`NR_*` defined:** 248
+- **`NR_*` defined:** 277
 - **Linux RV64 reference syscalls:** 320
-- **Dispatched (has a match arm):** 244
-- **Defined but not dispatched:** 4 — see list below
+- **Dispatched (has a match arm):** 270
+- **Defined but not dispatched:** 7 — see list below
 
-- **True missing vs Linux RV64 reference:** 75
+- **True missing vs Linux RV64 reference:** 73
 - **Number mismatches vs Linux RV64 reference:** 0
-- **Local `NR_*` not in Linux RV64 reference:** 3
+- **Local `NR_*` not in Linux RV64 reference:** 4
 
 #### Defined but not dispatched
 
@@ -307,10 +307,13 @@ These syscalls have a `pub const NR_*` in `numbers.rs` but no match arm in `disp
 
 | `NR_*` | # | Summary |
 |---|---:|---|
-| `NR_GETPEERNAME` | 205 | `getpeername(sockfd, addr, addrlen)`. Linux generic ABI `__NR_getpeername`. |
-| `NR_GETSOCKOPT` | 209 | `getsockopt(sockfd, level, optname, optval, optlen)`. Linux generic ABI `__NR_g… |
-| `NR_SHUTDOWN` | 210 | `shutdown(sockfd, how)`. Linux generic ABI `__NR_shutdown`. |
-| `NR_SOCKETPAIR` | 199 | `socketpair(domain, type, protocol, sv)`. Linux generic ABI `__NR_socketpair`. |
+| `NR_CAPGET` | 90 | `capget(hdrp, datap)`. Linux generic ABI `__NR_capget = 90`. |
+| `NR_CAPSET` | 91 | `capset(hdrp, datap)`. Linux generic ABI `__NR_capset = 91`. |
+| `NR_EPOLL_PWAIT2` | 441 | `epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize)`. |
+| `NR_FANOTIFY_MARK` | 263 | `fanotify_mark(fanotify_fd, flags, mask, dfd, pathname)`. Linux RV64 generic AB… |
+| `NR_INOTIFY_ADD_WATCH` | 27 | `inotify_add_watch(fd, pathname, mask)`. Linux RV64 generic ABI. |
+| `NR_INOTIFY_RM_WATCH` | 28 | `inotify_rm_watch(fd, wd)`. Linux RV64 generic ABI. |
+| `NR_SETRLIMIT` | 164 | `setrlimit(resource, new_rlim)`. Linux RV64 generic ABI. |
 
 #### True missing from local `numbers.rs`
 
@@ -319,65 +322,63 @@ Linux RV64 v6.17 syscalls that have no local `NR_*` constant. This is the greenf
 | Linux # | Name | Signature | Linux source |
 |---:|---|---|---|
 | 3 | `io_cancel` | `aio_context_t ctx_id, struct iocb *iocb, struct io_event *result` | `fs/aio.c`:2176 |
+| 30 | `ioprio_set` | `int which, int who, int ioprio` | `block/ioprio.c`:65 |
+| 31 | `ioprio_get` | `int which, int who` | `block/ioprio.c`:180 |
 | 41 | `pivot_root` | `const char *new_root, const char *put_old` | `fs/namespace.c`:4661 |
 | 51 | `chroot` | `const char *filename` | `fs/open.c`:598 |
 | 58 | `vhangup` | `` | `fs/open.c`:1606 |
 | 60 | `quotactl` | `unsigned int cmd, const char *special, qid_t id, void *addr` | `fs/quota/quota.c`:917 |
-| 72 | `pselect6` | `int n, fd_set *inp, fd_set *outp, fd_set *exp, struct __kernel_timespec *tsp, void *sig` | `fs/select.c`:793 |
 | 89 | `acct` | `const char *name` | `kernel/acct.c`:314 |
-| 90 | `capget` | `cap_user_header_t header, cap_user_data_t dataptr` | `kernel/capability.c`:137 |
-| 91 | `capset` | `cap_user_header_t header, const cap_user_data_t data` | `kernel/capability.c`:216 |
 | 95 | `waitid` | `int which, pid_t upid, struct siginfo *infop, int options, struct rusage *ru` | `kernel/exit.c`:1797 |
-| 97 | `unshare` | `unsigned long unshare_flags` | `kernel/fork.c`:3196 |
 | 104 | `kexec_load` | `unsigned long entry, unsigned long nr_segments, struct kexec_segment *segments, unsigne…` | `kernel/kexec.c`:242 |
 | 105 | `init_module` | `void *umod, unsigned long len, const char *uargs` | `kernel/module/main.c`:3569 |
 | 106 | `delete_module` | `const char *name_user, unsigned int flags` | `kernel/module/main.c`:776 |
 | 117 | `ptrace` | `long request, long pid, unsigned long addr, unsigned long data` | `kernel/ptrace.c`:1387 |
+| 118 | `sched_setparam` | `pid_t pid, struct sched_param *param` | `kernel/sched/syscalls.c`:966 |
+| 120 | `sched_getscheduler` | `pid_t pid` | `kernel/sched/syscalls.c`:1012 |
+| 121 | `sched_getparam` | `pid_t pid, struct sched_param *param` | `kernel/sched/syscalls.c`:1042 |
+| 125 | `sched_get_priority_max` | `int policy` | `kernel/sched/syscalls.c`:1479 |
+| 126 | `sched_get_priority_min` | `int policy` | `kernel/sched/syscalls.c`:1507 |
+| 127 | `sched_rr_get_interval` | `pid_t pid, struct __kernel_timespec *interval` | `kernel/sched/syscalls.c`:1565 |
+| 128 | `restart_syscall` | `` | `kernel/signal.c`:3175 |
+| 140 | `setpriority` | `int which, int who, int niceval` | `kernel/sys.c`:259 |
+| 141 | `getpriority` | `int which, int who` | `kernel/sys.c`:329 |
 | 142 | `reboot` | `int magic1, int magic2, unsigned int cmd, void *arg` | `kernel/reboot.c`:728 |
 | 151 | `setfsuid` | `uid_t uid` | `kernel/sys.c`:940 |
 | 152 | `setfsgid` | `gid_t gid` | `kernel/sys.c`:984 |
-| 159 | `setgroups` | `int gidsetsize, gid_t *grouplist` | `kernel/groups.c`:198 |
-| 161 | `sethostname` | `char *name, int len` | `kernel/sys.c`:1419 |
 | 162 | `setdomainname` | `char *name, int len` | `kernel/sys.c`:1473 |
 | 167 | `prctl` | `int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long a…` | `kernel/sys.c`:2455 |
 | 179 | `sysinfo` | `struct sysinfo *info` | `kernel/sys.c`:2896 |
-| 211 | `sendmsg` | `int fd, struct user_msghdr *msg, unsigned int flags` | `net/socket.c`:2703 |
-| 212 | `recvmsg` | `int fd, struct user_msghdr *msg, unsigned int flags` | `net/socket.c`:2912 |
 | 217 | `add_key` | `const char *_type, const char *_description, const void *_payload, size_t plen, key_ser…` | `security/keys/keyctl.c`:74 |
 | 218 | `request_key` | `const char *_type, const char *_description, const char *_callout_info, key_serial_t de…` | `security/keys/keyctl.c`:167 |
 | 219 | `keyctl` | `int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long a…` | `security/keys/keyctl.c`:1874 |
 | 224 | `swapon` | `const char *specialfile, int swap_flags` | `mm/swapfile.c`:3259 |
 | 225 | `swapoff` | `const char *specialfile` | `mm/swapfile.c`:2674 |
+| 235 | `mbind` | `unsigned long start, unsigned long len, unsigned long mode, const unsigned long *nmask,…` | `mm/mempolicy.c`:1752 |
+| 236 | `get_mempolicy` | `int *policy, unsigned long *nmask, unsigned long maxnode, unsigned long addr, unsigned …` | `mm/mempolicy.c`:1909 |
+| 237 | `set_mempolicy` | `int mode, const unsigned long *nmask, unsigned long maxnode` | `mm/mempolicy.c`:1779 |
+| 238 | `migrate_pages` | `pid_t pid, unsigned long maxnode, const unsigned long *old_nodes, const unsigned long *…` | `mm/mempolicy.c`:1872 |
+| 239 | `move_pages` | `pid_t pid, unsigned long nr_pages, const void **pages, const int *nodes, int *status, i…` | `mm/migrate.c`:2590 |
 | 240 | `rt_tgsigqueueinfo` | `pid_t tgid, pid_t pid, int sig, siginfo_t *uinfo` | `kernel/signal.c`:4251 |
-| 241 | `perf_event_open` | `struct perf_event_attr *attr_uptr, pid_t pid, int cpu, int group_fd, unsigned long flags` | `kernel/events/core.c`:13360 |
-| 243 | `recvmmsg` | `int fd, struct mmsghdr *mmsg, unsigned int vlen, unsigned int flags, struct __kernel_ti…` | `net/socket.c`:3061 |
 | 258 | `riscv_hwprobe` | `struct riscv_hwprobe *pairs, size_t pair_count, size_t cpusetsize, unsigned long *cpus,…` | `arch/riscv/kernel/sys_hwprobe.c`:511 |
 | 259 | `riscv_flush_icache` | `uintptr_t start, uintptr_t end, uintptr_t flags` | `arch/riscv/kernel/sys_riscv.c`:59 |
-| 268 | `setns` | `int fd, int flags` | `kernel/nsproxy.c`:536 |
-| 269 | `sendmmsg` | `int fd, struct mmsghdr *mmsg, unsigned int vlen, unsigned int flags` | `net/socket.c`:2781 |
-| 272 | `kcmp` | `pid_t pid1, pid_t pid2, int type, unsigned long idx1, unsigned long idx2` | `kernel/kcmp.c`:135 |
+| 270 | `process_vm_readv` | `pid_t pid, const struct iovec *lvec, unsigned long liovcnt, const struct iovec *rvec, u…` | `mm/process_vm_access.c`:292 |
+| 271 | `process_vm_writev` | `pid_t pid, const struct iovec *lvec, unsigned long liovcnt, const struct iovec *rvec, u…` | `mm/process_vm_access.c`:299 |
 | 273 | `finit_module` | `int fd, const char *uargs, int flags` | `kernel/module/main.c`:3723 |
-| 274 | `sched_setattr` | `pid_t pid, struct sched_attr *uattr, unsigned int flags` | `kernel/sched/syscalls.c`:977 |
-| 275 | `sched_getattr` | `pid_t pid, struct sched_attr *uattr, unsigned int usize, unsigned int flags` | `kernel/sched/syscalls.c`:1077 |
 | 277 | `seccomp` | `unsigned int op, unsigned int flags, void *uargs` | `kernel/seccomp.c`:2110 |
-| 280 | `bpf` | `int cmd, union bpf_attr *uattr, unsigned int size` | `kernel/bpf/syscall.c`:6137 |
 | 293 | `rseq` | `struct rseq *rseq, u32 rseq_len, int flags, u32 sig` | `kernel/rseq.c`:474 |
 | 294 | `kexec_file_load` | `int kernel_fd, int initrd_fd, unsigned long cmdline_len, const char *cmdline_ptr, unsig…` | `kernel/kexec_file.c`:363 |
 | 427 | `io_uring_register` | `unsigned int fd, unsigned int opcode, void *arg, unsigned int nr_args` | `io_uring/register.c`:906 |
-| 428 | `open_tree` | `int dfd, const char *filename, unsigned flags` | `fs/namespace.c`:3150 |
 | 429 | `move_mount` | `int from_dfd, const char *from_pathname, int to_dfd, const char *to_pathname, unsigned …` | `fs/namespace.c`:4531 |
-| 430 | `fsopen` | `const char *_fs_name, unsigned int flags` | `fs/fsopen.c`:114 |
 | 431 | `fsconfig` | `int fd, unsigned int cmd, const char *_key, const void *_value, int aux` | `fs/fsopen.c`:344 |
 | 432 | `fsmount` | `int fs_fd, unsigned int flags, unsigned int attr_flags` | `fs/namespace.c`:4392 |
-| 433 | `fspick` | `int dfd, const char *path, unsigned int flags` | `fs/fsopen.c`:157 |
 | 435 | `clone3` | `struct clone_args *uargs, size_t size` | `kernel/fork.c`:2888 |
-| 438 | `pidfd_getfd` | `int pidfd, int fd, unsigned int flags` | `kernel/pid.c`:903 |
+| 440 | `process_madvise` | `int pidfd, const struct iovec *vec, size_t vlen, int behavior, unsigned int flags` | `mm/madvise.c`:2057 |
 | 442 | `mount_setattr` | `int dfd, const char *path, unsigned int flags, struct mount_attr *uattr, size_t usize` | `fs/namespace.c`:5130 |
 | 443 | `quotactl_fd` | `unsigned int fd, unsigned int cmd, qid_t id, void *addr` | `fs/quota/quota.c`:973 |
 | 444 | `landlock_create_ruleset` | `const struct landlock_ruleset_attr *const attr, const size_t size, const __u32 flags` | `security/landlock/syscalls.c`:195 |
 | 445 | `landlock_add_rule` | `const int ruleset_fd, const enum landlock_rule_type rule_type, const void *const rule_a…` | `security/landlock/syscalls.c`:418 |
 | 446 | `landlock_restrict_self` | `const int ruleset_fd, const __u32 flags` | `security/landlock/syscalls.c`:478 |
-| 447 | `memfd_secret` | `unsigned int flags` | `mm/secretmem.c`:225 |
 | 448 | `process_mrelease` | `int pidfd, unsigned int flags` | `mm/oom_kill.c`:1204 |
 | 450 | `set_mempolicy_home_node` | `unsigned long start, unsigned long len, unsigned long home_node, unsigned long flags` | `mm/mempolicy.c`:1685 |
 | 451 | `cachestat` | `unsigned int fd, struct cachestat_range *cstat_range, struct cachestat *cstat, unsigned…` | `mm/filemap.c`:4571 |
@@ -403,6 +404,7 @@ These constants are not present by syscall name in the Linux RV64 v6.17 table. T
 | `NR_FUTEX2_REQUEUE` | 456 |
 | `NR_FUTEX2_WAIT` | 455 |
 | `NR_FUTEX2_WAKE` | 454 |
+| `NR_PSELECT6_TIME64` | 413 |
 
 <!-- END AUTOGEN: syscall-table -->
 

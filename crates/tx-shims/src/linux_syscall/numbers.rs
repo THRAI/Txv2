@@ -108,6 +108,10 @@ pub const NR_SYNC_FILE_RANGE: u64 = 84;
 /// v1 stub: returns 0 (success, no-op) — real priority
 /// inheritance deferred to the scheduler slice.
 pub const NR_SCHED_SETSCHEDULER: u64 = 119;
+/// `sched_yield()`. Linux generic ABI `__NR_sched_yield = 124`.
+/// LTP's fuzzy-sync helpers rely on this on single-CPU guests to hand
+/// execution to the peer racing thread.
+pub const NR_SCHED_YIELD: u64 = 124;
 /// `ppoll(fds, nfds, tmo_p, sigmask)`. Linux generic ABI
 /// `__NR_ppoll`. busybox sh's interactive read loop polls stdin
 /// before reading. The v1 implementation is a minimal stub: walk
@@ -379,18 +383,27 @@ pub const NR_SENDMMSG: u64 = 269;
 
 pub const AF_UNIX: u16 = 1;
 pub const AF_INET: u16 = 2;
+pub const AF_INET6: u16 = 10;
 pub const AF_NETLINK: u16 = 16;
 pub const AF_PACKET: u16 = 17;
 pub const NETLINK_ROUTE: i32 = 0;
 pub const NETLINK_NETFILTER: i32 = 12;
 pub const SOL_NETLINK: i32 = 270;
+pub const SOL_PACKET: i32 = 263;
+pub const SOL_TLS: i32 = 282;
 pub const NETLINK_EXT_ACK: i32 = 11;
 pub const SOL_SOCKET: i32 = 1;
 pub const IPPROTO_IP: i32 = 0;
 pub const IPPROTO_ICMP: i32 = 1;
 pub const IPPROTO_TCP: i32 = 6;
 pub const IPPROTO_UDP: i32 = 17;
+pub const IPPROTO_IPV6: i32 = 41;
+pub const IPPROTO_UDPLITE: i32 = 136;
+pub const SOL_IPV6: i32 = 41;
+pub const IPV6_ADDRFORM: i32 = 1;
+pub const IPV6_V6ONLY: i32 = 26;
 pub const IP_RECVERR: i32 = 11;
+pub const IP_HDRINCL: i32 = 3;
 pub const MCAST_JOIN_GROUP: i32 = 42;
 pub const MCAST_LEAVE_GROUP: i32 = 45;
 pub const SO_REUSEADDR: i32 = 2;
@@ -399,18 +412,29 @@ pub const SO_ERROR: i32 = 4;
 pub const SO_DONTROUTE: i32 = 5;
 pub const SO_KEEPALIVE: i32 = 9;
 pub const SO_OOBINLINE: i32 = 10;
+pub const SO_NO_CHECK: i32 = 11;
 pub const SO_BROADCAST: i32 = 6;
 pub const SO_LINGER: i32 = 13;
 pub const SO_REUSEPORT: i32 = 15;
 pub const SO_PEERCRED: i32 = 17;
 pub const SO_SNDBUF: i32 = 7;
 pub const SO_RCVBUF: i32 = 8;
+pub const SO_SNDBUFFORCE: i32 = 32;
 pub const SO_RCVTIMEO: i32 = 20;
 pub const SO_SNDTIMEO: i32 = 21;
+pub const PACKET_RX_RING: i32 = 5;
+pub const PACKET_VERSION: i32 = 10;
+pub const PACKET_RESERVE: i32 = 12;
+pub const PACKET_VNET_HDR: i32 = 15;
+pub const TPACKET_V1: i32 = 0;
+pub const TPACKET_V2: i32 = 1;
+pub const TPACKET_V3: i32 = 2;
 pub const TCP_NODELAY: i32 = 1;
 pub const TCP_MAXSEG: i32 = 2;
 pub const TCP_INFO: i32 = 11;
 pub const TCP_CONGESTION: i32 = 13;
+pub const TCP_ULP: i32 = 31;
+pub const TLS_TX: i32 = 1;
 pub const IPT_SO_SET_REPLACE: i32 = 64;
 pub const IPT_SO_SET_ADD_COUNTERS: i32 = 65;
 pub const IPT_SO_GET_INFO: i32 = 64;
@@ -468,12 +492,14 @@ pub const CLONE_DETACHED: u64 = 0x400000;
 /// System-V semaphore undo on exit; musl sets this in pthread_create.
 pub const CLONE_SYSVSEM: u64 = 0x40000;
 /// Namespace flags. `CLONE_NEWIPC` is wired to the process nsproxy
-/// clone path; `CLONE_NEWNET` is wired to network namespace syscalls.
+/// clone path; `CLONE_NEWUSER` and `CLONE_NEWNET` are wired to
+/// namespace syscalls.
 /// The others are still silently accepted by pthread_create
 /// compatibility paths and remain namespace stubs.
 pub const CLONE_NEWCGROUP: u64 = 0x2000000;
 pub const CLONE_NEWUTS: u64 = 0x4000000;
 pub const CLONE_NEWIPC: u64 = 0x8000000;
+pub const CLONE_NEWUSER: u64 = 0x1000_0000;
 /// `CLONE_NEWNET` — create or join a network namespace via
 /// `unshare(2)` / `setns(2)`.
 pub const CLONE_NEWNET: u64 = 0x4000_0000;
@@ -1193,6 +1219,10 @@ pub const TIOCNOTTY: u32 = 0x5422;
 pub const SIOCGIFFLAGS: u32 = 0x8913;
 /// `SIOCSIFFLAGS = 0x8914` — write `struct ifreq.ifr_flags`.
 pub const SIOCSIFFLAGS: u32 = 0x8914;
+/// `SIOCGIFMTU = 0x8921` — read `struct ifreq.ifr_mtu`.
+pub const SIOCGIFMTU: u32 = 0x8921;
+/// `SIOCSIFMTU = 0x8922` — write `struct ifreq.ifr_mtu`.
+pub const SIOCSIFMTU: u32 = 0x8922;
 /// `SIOCGIFINDEX = 0x8933` — resolve `struct ifreq.ifr_name` to ifindex.
 pub const SIOCGIFINDEX: u32 = 0x8933;
 /// `SIOCGIFTXQLEN = 0x8942` — query `struct ifreq.ifr_qlen`.
@@ -1248,6 +1278,39 @@ pub const NR_FLOCK: u64 = 32;
 pub const NR_MOUNT: u64 = 40;
 /// `umount2(target, flags)`. Linux RV64 ABI `__NR_umount2 = 39`.
 pub const NR_UMOUNT2: u64 = 39;
+/// `open_tree(dirfd, path, flags)`. Linux generic ABI `__NR_open_tree = 428`.
+///
+/// Current txKernel scope: fd-provider semantics for LTP's generic fd
+/// consumers (`accept03`) plus argument/error validation. Full detached
+/// mount topology transfer via `move_mount(2)` remains in the mount-API
+/// follow-up.
+pub const NR_OPEN_TREE: u64 = 428;
+/// `fsopen(fsname, flags)`. Linux generic ABI `__NR_fsopen = 430`.
+///
+/// Current txKernel scope: mint a mount-context fd for supported in-tree
+/// filesystem labels. `fsconfig(2)` / `fsmount(2)` superblock creation is
+/// intentionally not claimed by this constant.
+pub const NR_FSOPEN: u64 = 430;
+/// `fspick(dirfd, path, flags)`. Linux generic ABI `__NR_fspick = 433`.
+///
+/// Current txKernel scope: mint a reconfiguration-context fd for an existing
+/// resolved mount path. Full reconfiguration via `fsconfig(2)` is deferred.
+pub const NR_FSPICK: u64 = 433;
+
+/// `open_tree(2)` flag: clone the selected mount subtree.
+pub const OPEN_TREE_CLONE: u32 = 0x0000_0001;
+/// `open_tree(2)` flag: mark the returned fd close-on-exec.
+pub const OPEN_TREE_CLOEXEC: u32 = O_CLOEXEC;
+/// `fsopen(2)` flag: mark the returned fd close-on-exec.
+pub const FSOPEN_CLOEXEC: u32 = 0x0000_0001;
+/// `fspick(2)` flag: mark the returned fd close-on-exec.
+pub const FSPICK_CLOEXEC: u32 = 0x0000_0001;
+/// `fspick(2)` flag: do not follow the final symlink component.
+pub const FSPICK_SYMLINK_NOFOLLOW: u32 = 0x0000_0002;
+/// `fspick(2)` flag: do not trigger automounts.
+pub const FSPICK_NO_AUTOMOUNT: u32 = 0x0000_0004;
+/// `fspick(2)` flag: allow an empty pathname with a path-bearing fd.
+pub const FSPICK_EMPTY_PATH: u32 = 0x0000_0008;
 /// `mknodat(dirfd, path, mode, dev)`. Linux RV64 ABI `__NR_mknodat = 33`.
 pub const NR_MKNODAT: u64 = 33;
 /// `getdents64(fd, dirp, count)`. Linux RV64 generic ABI
@@ -1278,6 +1341,12 @@ pub const NR_FSTAT: u64 = 80;
 /// `__NR_statx = 291`. LA64 musl/busybox prefers this over the older
 /// stat-family calls for directory listing metadata probes.
 pub const NR_STATX: u64 = 291;
+/// `inotify_init1(flags)`. Linux generic ABI `__NR_inotify_init1 = 26`.
+pub const NR_INOTIFY_INIT1: u64 = 26;
+/// `inotify_init1(2)` flag: close-on-exec, equal to `O_CLOEXEC`.
+pub const IN_CLOEXEC: u32 = O_CLOEXEC;
+/// `inotify_init1(2)` flag: nonblocking, equal to `O_NONBLOCK`.
+pub const IN_NONBLOCK: u32 = O_NONBLOCK;
 /// `umask(mask)`. Linux RV64 generic ABI `__NR_umask = 166`. Atomic
 /// swap of the per-process file-creation mask, returning the
 /// previous value. Mask is silently truncated to the bottom 9 bits
@@ -1400,8 +1469,10 @@ pub const NR_RT_SIGQUEUEINFO: u64 = 138;
 /// Phase J: returns `-ENOSYS`; TODO full implementation.
 pub const NR_RT_SIGTIMEDWAIT: u64 = 137;
 /// `pidfd_open(pid, flags)` — Linux RV64.
-/// Phase J: returns `-ENOSYS`; TODO full implementation.
+/// Returns a pidfd-backed `OpenFile` with close-on-exec set by default.
 pub const NR_PIDFD_OPEN: u64 = 434;
+/// `pidfd_open(2)` flag: open the resulting pidfd with `O_NONBLOCK`.
+pub const PIDFD_NONBLOCK: u32 = O_NONBLOCK;
 /// `pidfd_send_signal(pidfd, sig, info, flags)` — Linux RV64.
 /// Phase J: returns `-ENOSYS`; TODO full implementation.
 pub const NR_PIDFD_SEND_SIGNAL: u64 = 424;
@@ -1635,6 +1706,25 @@ pub const NR_TRUNCATE: u64 = 45;
 pub const NR_FTRUNCATE: u64 = 46;
 /// `fallocate(fd, mode, offset, len)`. Linux RV64 generic ABI.
 pub const NR_FALLOCATE: u64 = 47;
+/// `NR_PERF_EVENT_OPEN = 241` — Linux generic ABI
+/// `__NR_perf_event_open`.
+pub const NR_PERF_EVENT_OPEN: u64 = 241;
+/// `NR_MEMFD_CREATE = 279` — Linux generic ABI `__NR_memfd_create`.
+/// Returns an anonymous PageBacked regular-file fd with no path presence.
+pub const NR_MEMFD_CREATE: u64 = 279;
+/// `NR_BPF = 280` — Linux generic ABI `__NR_bpf`.
+pub const NR_BPF: u64 = 280;
+/// `NR_MEMFD_SECRET = 447` — Linux generic ABI `__NR_memfd_secret`.
+/// This stage installs a secretmem-shaped anonymous PageBacked fd; full
+/// secret-memory isolation is deferred to the VM subsystem.
+pub const NR_MEMFD_SECRET: u64 = 447;
+/// `memfd_create(2)` flag: mark the returned fd close-on-exec.
+pub const MFD_CLOEXEC: u32 = 0x0001;
+/// `memfd_create(2)` flag: allow file seals. Currently rejected until
+/// F_ADD_SEALS/F_GET_SEALS semantics exist.
+pub const MFD_ALLOW_SEALING: u32 = 0x0002;
+/// `memfd_create(2)` flag for hugetlb-backed memfds. Unsupported.
+pub const MFD_HUGETLB: u32 = 0x0004;
 /// `NR_READLINKAT = 78` — Linux RV64 generic ABI `__NR_readlinkat`.
 /// Slice 8 walks the link's parent directory and calls
 /// `FsOps::lookup` + `read_link` directly so the symlink's target
@@ -2080,6 +2170,20 @@ pub const NR_SYSLOG: u64 = 116;
 
 /// `membarrier(cmd, flags, cpu_id)`. RISC-V generic uapi `__NR_membarrier = 283`.
 pub const NR_MEMBARRIER: u64 = 283;
+/// `fanotify_init(flags, event_f_flags)`. Linux generic ABI
+/// `__NR_fanotify_init = 262`.
+pub const NR_FANOTIFY_INIT: u64 = 262;
+/// `fanotify_init(2)` flag: close-on-exec for the notification fd.
+pub const FAN_CLOEXEC: u32 = 0x0000_0001;
+/// `fanotify_init(2)` flag: nonblocking notification fd.
+pub const FAN_NONBLOCK: u32 = 0x0000_0002;
+/// `fanotify_init(2)` notification-only class. Other classes need
+/// content/permission-event semantics and are rejected for now.
+pub const FAN_CLASS_NOTIF: u32 = 0x0000_0000;
+/// `fanotify_init(2)` content class, unsupported in the basic fd slice.
+pub const FAN_CLASS_CONTENT: u32 = 0x0000_0004;
+/// `fanotify_init(2)` pre-content class, unsupported in the basic fd slice.
+pub const FAN_CLASS_PRE_CONTENT: u32 = 0x0000_0008;
 
 /// Query supported commands. Always returns `MEMBARRIER_SUPPORTED_MASK`.
 pub const MEMBARRIER_CMD_QUERY: u64 = 0;

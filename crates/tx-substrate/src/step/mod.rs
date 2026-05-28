@@ -112,7 +112,6 @@ pub enum Errno {
     /// `getcwd(2)` arm when the user buffer is smaller than the
     /// rendered path (NUL terminator inclusive). Linux value: 34.
     ERANGE,
-    EOPNOTSUPP,
     EROFS,
     /// Socket operation on a non-socket fd.
     ENOTSOCK,
@@ -178,7 +177,6 @@ impl Errno {
             Errno::EPERM => 1,
             Errno::EPIPE => 32,
             Errno::ERANGE => 34,
-            Errno::EOPNOTSUPP => 95,
             Errno::EROFS => 30,
             Errno::ENOTSOCK => 88,
             Errno::EPROTONOSUPPORT => 93,

@@ -278,9 +278,10 @@ fn has_udp_loopback_tx_pending(socket: &Cap<SocketIdentity>, iface: &LoopbackIfa
         matches!(
             payload.protocol_snapshot(),
             SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. })
-        ) && payload
-            .peek_udp_tx_datagram()
-            .is_some_and(|datagram| datagram.dst.addr == iface.local_ipv4())
+        ) && payload.peek_udp_tx_datagram().is_some_and(|datagram| {
+            let _ = iface;
+            datagram.dst.is_loopback()
+        })
     })
 }
 

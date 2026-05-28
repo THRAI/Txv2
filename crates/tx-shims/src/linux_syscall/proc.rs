@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, SpinMutex};
-use crate::linux_syscall::numbers::CLONE_NEWIPC;
+use crate::linux_syscall::numbers::{CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWUSER};
 use alloc::collections::BTreeMap;
 use tx_substrate::verbs::OperationalCapExt;
 
@@ -242,15 +242,11 @@ pub(super) fn sys_pidfd_getfd(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    let target_pid = match pidfd_file.pidfd_pid() {
-        Some(pid) => Pid(pid),
+    let target = match pidfd_file.pidfd_process() {
+        Some(target) => target,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    let target = match process_by_pid(target_pid) {
-        Some(target) => target,
-        None => return SyscallResult::Error(ESRCH_VALUE),
-    };
-    if !pidfd_getfd_permission_allows(ctx, &target) {
+    if !pidfd_getfd_permission_allows(ctx, target) {
         return SyscallResult::Error(EPERM_VALUE);
     }
 
@@ -288,12 +284,15 @@ pub(super) fn sys_getrusage<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
         RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD => {}
         _ => return SyscallResult::Error(EINVAL_VALUE),
     }
-    if node_uaddr != 0 {
-        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, node_uaddr, 0) {
-            return SyscallResult::error_from(errno);
-        }
+    if args[1] == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
     }
-    SyscallResult::Return(0)
+
+    let usage = [0u8; RUSAGE_BYTES_RV64];
+    match bootstrap_copy_to_user(&ctx.aspace, args[1], &usage) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
 }
 
 /// `personality(persona)`. Linux RV64 generic ABI `__NR_personality = 92`.
@@ -310,6 +309,119 @@ pub(super) fn sys_personality(args: [u64; 6]) -> SyscallResult {
         }
         _ => SyscallResult::Error(EINVAL_VALUE),
     }
+}
+
+/// `unshare(CLONE_NEWUSER)` / `unshare(CLONE_NEWNET)` — move the calling
+/// process into fresh namespace views.
+///
+/// `CLONE_NEWUSER` publishes a fresh user namespace cap in the process
+/// `NsProxy`; procfs uid/gid map writes land in the next phase. `CLONE_NEWNET`
+/// creates a network namespace owned by the caller's current user namespace.
+/// If both flags are present, Linux creates the user namespace first, so the
+/// net namespace authorization uses the freshly-created user namespace.
+pub(super) fn sys_unshare<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let flags = args[0];
+    if flags == 0 {
+        return SyscallResult::Return(0);
+    }
+    if flags & !(CLONE_NEWUSER | CLONE_NEWNET) != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let Some(current) = ctx.process.nsproxy_cap() else {
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+    let cred = ctx.cred();
+    let mut replacement_nsproxy = None;
+    let mut subject_user_ns = current.user_ns.clone();
+
+    if flags & CLONE_NEWUSER != 0 {
+        if ctx.process.live_thread_count() > 1 {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        if !current.user_ns.maps_uid(cred.euid.raw()) || !current.user_ns.maps_gid(cred.egid.raw())
+        {
+            return SyscallResult::Error(EPERM_VALUE);
+        }
+        let replacement = match tx_subsystems::process::nsproxy::clone_nsproxy_with_user_namespace(
+            &current,
+            cred.euid.raw(),
+            cred.egid.raw(),
+        ) {
+            Ok(replacement) => replacement,
+            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+        };
+        subject_user_ns = replacement.user_ns.clone();
+        replacement_nsproxy = Some(replacement);
+    }
+
+    let mut replacement_netns = None;
+    if flags & CLONE_NEWNET != 0 {
+        if !tx_subsystems::process::nsproxy::has_capability_in_user_namespace(
+            cred,
+            &subject_user_ns,
+            &subject_user_ns,
+            Capability::SYS_ADMIN,
+        ) {
+            return SyscallResult::Error(EPERM_VALUE);
+        }
+        let namespace = match tx_subsystems::net::create_isolated_net_namespace_with_owner(
+            "unshare",
+            Some(subject_user_ns.clone()),
+        ) {
+            Ok(namespace) => namespace,
+            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+        };
+        let Some(payload) = namespace.payload_cap() else {
+            return SyscallResult::Error(EIO_VALUE);
+        };
+        replacement_netns = Some(payload);
+    }
+
+    if let Some(replacement) = replacement_nsproxy {
+        let _old = ctx.process.replace_nsproxy(replacement);
+    }
+    if let Some(payload) = replacement_netns {
+        let _old = ctx.process.replace_net_namespace(payload);
+    }
+
+    SyscallResult::Return(0)
+}
+
+/// `setns(fd, CLONE_NEWNET)` — join a network namespace referenced by
+/// a namespace fd such as `/proc/<pid>/ns/net`.
+pub(super) fn sys_setns<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i64;
+    let nstype = args[1];
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if nstype != 0 && nstype != CLONE_NEWNET {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
+        return SyscallResult::Error(EBADF_VALUE);
+    };
+    let Some(payload) = tx_subsystems::net::net_namespace_payload_from_file(&file) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    let Some(current) = ctx.process.nsproxy_cap() else {
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+    let authorized = payload.owner_user_namespace().is_some_and(|owner| {
+        tx_subsystems::process::nsproxy::has_capability_in_user_namespace(
+            ctx.cred(),
+            &current.user_ns,
+            &owner,
+            Capability::SYS_ADMIN,
+        )
+    });
+    if !authorized {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+    let _old = ctx.process.replace_net_namespace(payload);
+    SyscallResult::Return(0)
 }
 
 /// `execve(path, argv, envp)` — Wave 4 / Phase 6 of the ELF-loader
@@ -1013,9 +1125,7 @@ fn write_wait4_rusage_if_requested(
 }
 
 async fn yield_after_reap() {
-    for _ in 0..4 {
-        tx_reactor::yield_now().await;
-    }
+    tx_reactor::yield_now().await;
 }
 
 /// `getppid()` — return the parent's pid, or `0` (`Pid::RESERVED`)

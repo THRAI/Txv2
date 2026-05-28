@@ -241,10 +241,10 @@ pub fn step_semop_v3(
             proc_payload.record_sem_undo(semid, undo_adjustments);
         }
 
-        fire_sem_changed(payload);
-    });
+        fire_sem_changed(&payload);
+    }
 
-    Ok(sops.len())
+    StepOutcome::done(sops.len())
 }
 
 pub struct SemopWaitOp<'a> {

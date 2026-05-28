@@ -33,11 +33,11 @@ pub use execution::{
 };
 pub use notification::{VFS_READABLE, VFS_WRITABLE};
 pub use structure::{
-    render_dentry_path, Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind,
-    InodeMeta, OpenFile, OpenFileFlags, OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult,
-    ProjectionKey, ProjectionSchemaId, RNode, RNodeBacking, StructPayload, Timespec, VfsName,
-    S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_ISGID, S_ISUID,
-    S_ISVTX, VFS_NAME_MAX,
+    render_dentry_path, Credential, DEntry, DirCursor, DirEntry, FsNotifyInstance, FsNotifyKind,
+    FsObjectId, InlineName, InodeKind, InodeMeta, OpenFile, OpenFileFlags, OpenFileIoctl,
+    OpenFileIoctlCaller, OpenFileIoctlResult, ProjectionKey, ProjectionSchemaId, RNode,
+    RNodeBacking, StructPayload, Timespec, VfsName, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK,
+    S_IFMT, S_IFREG, S_IFSOCK, S_ISGID, S_ISUID, S_ISVTX, VFS_NAME_MAX,
 };
 pub use walker::{step_open, step_walk, step_walk_in_mount_namespace, SYMLOOP_MAX};
 pub use xattr::{XATTR_CREATE, XATTR_LIST_MAX, XATTR_NAME_MAX, XATTR_REPLACE, XATTR_SIZE_MAX};

@@ -12,13 +12,13 @@ DOCKER_RUN_BUILD = $(DOCKER_COMPOSE) run --rm $(DOCKER_BUILD_ENV) $(DOCKER_SERVI
 
 OSCOMP_DATA ?= target/oscomp/testdata
 OSCOMP_SUBMIT ?= target/oscomp/submit
-OSCOMP_DOCKER_IMAGE ?= zhouzhouyi/os-contest:20260104
+OSCOMP_DOCKER_IMAGE ?= zhouzhouyi/os-contest:20260510
 OSCOMP_TARGET ?= rv64-qemu
 OSCOMP_EXTRA ?=
 HOST_CARGO_TARGET_DIR ?= target/host-cargo
 
 .PHONY: docker-help docker-build docker-shell docker-ci docker-check docker-ci-slow \
-	setup all \
+	all setup-cargo-config \
 	docker-build-rv64 docker-build-la64 docker-image-cpio-rv64 docker-image-cpio-la64 \
 	docker-image-ext4-rv64 docker-image-ext4-la64 \
 	docker-qemu-rv64-smoke docker-qemu-rv64-busybox docker-qemu-la64-busybox \
@@ -60,11 +60,11 @@ docker-help:
 # Official OSComp entry point. The website's autotest runs `make all` in
 # /coursegrader/submit and then boots ./kernel-rv and ./kernel-la with the
 # official sdcard images.
-setup:
-	rm -rf .cargo
-	cp -r cargo .cargo
+setup-cargo-config:
+	mkdir -p .cargo
+	cp cargo/config.toml .cargo/config.toml
 
-all: setup
+all: setup-cargo-config
 	cargo xtask build --target rv64-qemu
 	cargo xtask build --target la64-qemu
 	cargo xtask oscomp submit --submit .
@@ -167,6 +167,7 @@ smp-smoke: smp-smoke-rv64 smp-smoke-la64
 
 # 本地评测（不需要 docker 评测镜像）
 OSCOMP_OUT_RV ?= target/oscomp/os_serial_out_rv.txt
+OSCOMP_OUT_RV_SMP2 ?= target/oscomp/os_serial_out_rv_smp2.txt
 OSCOMP_OUT_RV_SMP4 ?= target/oscomp/os_serial_out_rv_smp4.txt
 OSCOMP_OUT_LA ?= target/oscomp/os_serial_out_la.txt
 OSCOMP_OUT_LA_SMP4 ?= target/oscomp/os_serial_out_la_smp4.txt
@@ -174,6 +175,8 @@ OSCOMP_GROUPS ?=
 OSCOMP_LIBCTEST ?=
 OSCOMP_LTP ?=
 OSCOMP_SUITE ?= ltp
+LTP_MAX_RUNTIME ?=
+LTP_MAX_RUNTIME_CASES ?=
 
 # LTP local testing shortcuts:
 #
@@ -183,6 +186,8 @@ OSCOMP_SUITE ?= ltp
 # 2. Run one or a few individual LTP cases:
 #      make oscomp-local-rv64 OSCOMP_LTP=umask01
 #      make oscomp-local-rv64 OSCOMP_LTP=open01,stat02
+#      make oscomp-local-rv64 OSCOMP_LTP=sendmsg03 LTP_MAX_RUNTIME=10
+#      make oscomp-local-rv64 OSCOMP_LTP=sendmsg03,recvmsg01 LTP_MAX_RUNTIME=10 LTP_MAX_RUNTIME_CASES=sendmsg03
 #
 # 3. Run glibc LTP. Full-image glibc runs use the official group name;
 #    focused glibc case runs use a temporary slim sdcard because the guest
@@ -221,7 +226,9 @@ COMMA := ,
 OSCOMP_LIBCTEST_GROUP = libctest-musl:$(subst $(COMMA),+,$(OSCOMP_LIBCTEST))
 OSCOMP_LTP_GROUP = $(if $(strip $(OSCOMP_LTP)),ltp-musl:$(subst $(COMMA),+,$(OSCOMP_LTP)),ltp-musl)
 OSCOMP_EFFECTIVE_GROUPS = $(if $(strip $(OSCOMP_LIBCTEST)),$(OSCOMP_LIBCTEST_GROUP),$(if $(strip $(OSCOMP_LTP)),$(OSCOMP_LTP_GROUP),$(OSCOMP_GROUPS)))
-OSCOMP_CMDLINE = $(strip $(if $(strip $(OSCOMP_EFFECTIVE_GROUPS)),tx.oscomp.groups=$(OSCOMP_EFFECTIVE_GROUPS),))
+OSCOMP_LTP_MAX_RUNTIME_CMDLINE = $(if $(strip $(LTP_MAX_RUNTIME)),tx.ltp.max_runtime=$(LTP_MAX_RUNTIME),)
+OSCOMP_LTP_MAX_RUNTIME_CASES_CMDLINE = $(if $(strip $(LTP_MAX_RUNTIME_CASES)),tx.ltp.max_runtime_cases=$(subst $(COMMA),+,$(LTP_MAX_RUNTIME_CASES)),)
+OSCOMP_CMDLINE = $(strip $(if $(strip $(OSCOMP_EFFECTIVE_GROUPS)),tx.oscomp.groups=$(OSCOMP_EFFECTIVE_GROUPS),) $(OSCOMP_LTP_MAX_RUNTIME_CMDLINE) $(OSCOMP_LTP_MAX_RUNTIME_CASES_CMDLINE))
 OSCOMP_APPEND_RV = $(if $(strip $(OSCOMP_CMDLINE)),-append '$(OSCOMP_CMDLINE)',)
 OSCOMP_APPEND_LA = $(if $(strip $(OSCOMP_CMDLINE)),-fw_cfg name=opt/cmdline$(COMMA)string='$(OSCOMP_CMDLINE)',)
 OSCOMP_TESTCASE_OUT ?= target/oscomp/testcase
@@ -237,11 +244,11 @@ OSCOMP_LTP_FUTEX_DATA ?= target/oscomp/ltp-futex-data
 OSCOMP_LTP_FUTEX_OUT ?= target/oscomp/os_serial_out_ltp_futex_$(shell date +%Y%m%d).txt
 OSCOMP_LTP_FUTEX_CASES ?= futex_wait01,futex_wait02,futex_wait03,futex_wait04,futex_wait05,futex_wait_bitset01,futex_waitv01,futex_waitv02,futex_waitv03,futex_wake01,futex_wake02,futex_wake03,futex_wake04,futex_cmp_requeue01,futex_cmp_requeue02,get_robust_list01,set_robust_list01
 
-.PHONY: oscomp-submit oscomp-qemu-rv64 oscomp-qemu-rv64-smp4 \
+.PHONY: oscomp-submit oscomp-qemu-rv64 oscomp-qemu-rv64-smp2 oscomp-qemu-rv64-smp4 \
 	oscomp-qemu-la64 oscomp-qemu-la64-smp4 \
-	oscomp-judge-rv64 oscomp-judge-rv64-smp4 \
+	oscomp-judge-rv64 oscomp-judge-rv64-smp2 oscomp-judge-rv64-smp4 \
 	oscomp-judge-la64 oscomp-judge-la64-smp4 \
-	oscomp-local-rv64 oscomp-local-rv64-smp4 \
+	oscomp-local-rv64 oscomp-local-rv64-smp2 oscomp-local-rv64-smp4 \
 	oscomp-local-la64 oscomp-local-la64-smp4 \
 	oscomp-local-rv64-glibc oscomp-local-rv64-glibc-smp4 \
 	oscomp-local-la64-glibc oscomp-local-la64-glibc-smp4 \
@@ -280,6 +287,20 @@ oscomp-qemu-rv64:
 		-rtc base=utc \
 		$(OSCOMP_APPEND_RV) \
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_RV) | $(OSCOMP_CONSOLE_FILTER)
+
+oscomp-qemu-rv64-smp2:
+	mkdir -p $(dir $(OSCOMP_OUT_RV_SMP2))
+	set -o pipefail; \
+	qemu-system-riscv64 -machine virt \
+		-kernel $(OSCOMP_SUBMIT)/kernel-rv \
+		-m 1G -nographic -smp 2 -bios default \
+		-drive file=$(OSCOMP_DATA)/sdcard-rv.img,if=none,format=raw,id=x0,file.locking=off \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		-no-reboot \
+		-device virtio-net-device,netdev=net -netdev user,id=net \
+		-rtc base=utc \
+		$(OSCOMP_APPEND_RV) \
+		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_RV_SMP2) | $(OSCOMP_CONSOLE_FILTER)
 
 oscomp-qemu-rv64-smp4:
 	mkdir -p $(dir $(OSCOMP_OUT_RV_SMP4))
@@ -325,6 +346,14 @@ oscomp-qemu-la64-smp4:
 oscomp-judge-rv64:
 	python3 tools/oscomp-judge.py $(OSCOMP_OUT_RV) $(OSCOMP_DATA)
 
+oscomp-judge-rv64-smp2:
+	@test -f $(OSCOMP_OUT_RV_SMP2) || { \
+		echo "missing $(OSCOMP_OUT_RV_SMP2)"; \
+		echo "run: make oscomp-local-rv64-smp2"; \
+		exit 1; \
+	}
+	python3 tools/oscomp-judge.py $(OSCOMP_OUT_RV_SMP2) $(OSCOMP_DATA)
+
 oscomp-judge-rv64-smp4:
 	@test -f $(OSCOMP_OUT_RV_SMP4) || { \
 		echo "missing $(OSCOMP_OUT_RV_SMP4)"; \
@@ -345,6 +374,8 @@ oscomp-judge-la64-smp4:
 	python3 tools/oscomp-judge.py $(OSCOMP_OUT_LA_SMP4) $(OSCOMP_DATA)
 
 oscomp-local-rv64: docker-build-rv64 docker-oscomp-prepare oscomp-submit-rv64 oscomp-qemu-rv64 oscomp-judge-rv64
+
+oscomp-local-rv64-smp2: docker-build-rv64 docker-oscomp-prepare oscomp-submit-rv64 oscomp-qemu-rv64-smp2 oscomp-judge-rv64-smp2
 
 oscomp-local-rv64-smp4: docker-build-rv64 docker-oscomp-prepare oscomp-submit-rv64 oscomp-qemu-rv64-smp4 oscomp-judge-rv64-smp4
 

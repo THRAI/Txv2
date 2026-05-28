@@ -291,6 +291,8 @@ pub fn bootstrap_init_process(
     // Create the init namespace proxy. Day-1: all namespace caps
     // point at init-namespace stubs; mnt_ns is deferred.
     let nsproxy = crate::process::nsproxy::sign_init_nsproxy()?;
+    let init_net_namespace =
+        crate::net::initial_net_namespace_payload_with_owner(nsproxy.user_ns.clone());
     let payload = sign_process_payload(
         aspace,
         vec![leader.clone()],
@@ -301,7 +303,7 @@ pub fn bootstrap_init_process(
         BTreeSet::new(),
         (1024, 4096),
         (u64::MAX, u64::MAX),
-        crate::net::initial_net_namespace_payload(),
+        init_net_namespace,
         BOOTSTRAP_BRK_BASE,
         BOOTSTRAP_BRK_BASE,
         // Slice 6 of the shell-prompt roadmap. init's file-creation

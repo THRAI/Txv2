@@ -172,6 +172,48 @@ fn dispatch_packet_bind_getsockname_and_ioctl_round_trip_sockaddr_ll() {
 }
 
 #[test]
+fn dispatch_packet_sendto_accepts_sockaddr_ll_loopback_destination() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_packet(&ctx);
+    let addr = sockaddr_ll(ETH_P_ALL, 1);
+    let payload = [0x42u8; 64];
+
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                fd as u64,
+                payload.as_ptr() as u64,
+                payload.len() as u64,
+                0,
+                addr.as_ptr() as u64,
+                SOCKADDR_LL_BYTES as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+
+    let bad_addr = sockaddr_ll(ETH_P_ALL, 9999);
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                fd as u64,
+                payload.as_ptr() as u64,
+                payload.len() as u64,
+                0,
+                bad_addr.as_ptr() as u64,
+                SOCKADDR_LL_BYTES as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::ENODEV))
+    );
+}
+
+#[test]
 fn dispatch_unprivileged_socket_denies_net_raw_families() {
     let _setup = socket_setup();
     let process = bootstrap();
@@ -589,6 +631,75 @@ fn dispatch_socket_ioctl_reads_and_writes_interface_flags() {
         ),
         SyscallResult::Return(0)
     );
+}
+
+#[test]
+fn dispatch_socket_ioctl_reads_and_writes_loopback_mtu() {
+    let _setup = socket_setup();
+    let (process, ctx) = socket_ctx();
+    let fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let mut ifreq = [0u8; 40];
+    ifreq[0..2].copy_from_slice(b"lo");
+
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCGIFMTU as u64,
+                ifreq.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert!(i32::from_le_bytes(ifreq[16..20].try_into().unwrap()) >= 1500);
+
+    ifreq[16..20].copy_from_slice(&1500i32.to_le_bytes());
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCSIFMTU as u64,
+                ifreq.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    ifreq[16..20].fill(0);
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCGIFMTU as u64,
+                ifreq.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(i32::from_le_bytes(ifreq[16..20].try_into().unwrap()), 1500);
+
+    let netns = process.net_namespace().expect("test net namespace");
+    let lo = netns
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.name == "lo")
+        .expect("loopback link");
+    assert_eq!(lo.mtu, 1500);
 }
 
 #[test]

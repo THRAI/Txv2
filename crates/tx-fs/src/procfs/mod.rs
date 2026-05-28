@@ -57,6 +57,16 @@ pub const PROCFS_NET_SNMP_ID: FsObjectId = FsObjectId::new(0x7072_6F1F);
 pub const PROCFS_NET_NETLINK_ID: FsObjectId = FsObjectId::new(0x7072_6F20);
 pub const PROCFS_NET_IF_INET6_ID: FsObjectId = FsObjectId::new(0x7072_6F21);
 pub const PROCFS_SYS_KERNEL_PID_MAX_ID: FsObjectId = FsObjectId::new(0x7072_6F22);
+pub const PROCFS_SYS_USER_ID: FsObjectId = FsObjectId::new(0x7072_6F23);
+pub const PROCFS_SYS_USER_MAX_USER_NAMESPACES_ID: FsObjectId = FsObjectId::new(0x7072_6F24);
+pub const KERNEL_CONFIG_TEXT: &str = "CONFIG_EVENTFD=y\n\
+CONFIG_TIME_NS=y\n\
+CONFIG_HIGH_RES_TIMERS=y\n\
+CONFIG_NET_NS=y\n\
+CONFIG_USER_NS=y\n\
+CONFIG_NETFILTER_XT_MATCH_STATE=y\n\
+CONFIG_IP_NF_TARGET_REJECT=y\n\
+CONFIG_TLS=y\n";
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 const PROCFS_PID_OBJECT_STRIDE: u64 = 0x100;
 const PROCFS_PID_OBJECT_BASE: u64 = PROCFS_PID_BASE + 0x10000;
@@ -79,6 +89,9 @@ const PROCFS_TAG_TASK_DIR: u64 = 6;
 const PROCFS_TAG_FDINFO_DIR: u64 = 7;
 const PROCFS_TAG_STATUS: u64 = 8;
 const PROCFS_TAG_SMAPS: u64 = 9;
+const PROCFS_TAG_UID_MAP: u64 = 10;
+const PROCFS_TAG_GID_MAP: u64 = 11;
+const PROCFS_TAG_SETGROUPS: u64 = 12;
 const PROCFS_NS_TAG_NET: u64 = 1;
 const fn pid_dir_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64)
@@ -115,6 +128,15 @@ const fn pid_task_dir_id(pid: Pid) -> FsObjectId {
 }
 const fn pid_fdinfo_dir_id(pid: Pid) -> FsObjectId {
     pid_object_id(pid, PROCFS_TAG_FDINFO_DIR)
+}
+pub const fn pid_uid_map_id(pid: Pid) -> FsObjectId {
+    pid_object_id(pid, PROCFS_TAG_UID_MAP)
+}
+pub const fn pid_gid_map_id(pid: Pid) -> FsObjectId {
+    pid_object_id(pid, PROCFS_TAG_GID_MAP)
+}
+pub const fn pid_setgroups_id(pid: Pid) -> FsObjectId {
+    pid_object_id(pid, PROCFS_TAG_SETGROUPS)
 }
 const fn pid_fdinfo_id(pid: Pid, fd: u32) -> FsObjectId {
     FsObjectId::new(PROCFS_FDINFO_OBJECT_BASE + pid.0 as u64 * PROCFS_FD_OBJECT_STRIDE + fd as u64)
@@ -232,6 +254,8 @@ pub fn pid_from_dir(id: FsObjectId) -> Option<Pid> {
         | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID
         | PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID
         | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID
+        | PROCFS_SYS_USER_ID
+        | PROCFS_SYS_USER_MAX_USER_NAMESPACES_ID
         | PROCFS_SYSVIPC_ID
         | PROCFS_SYSVIPC_MSG_ID
         | PROCFS_SYSVIPC_SEM_ID
@@ -250,6 +274,15 @@ pub fn pid_from_stat_id(id: FsObjectId) -> Option<Pid> {
 }
 pub fn pid_from_cmdline_id(id: FsObjectId) -> Option<Pid> {
     pid_from_object_id(id, PROCFS_TAG_CMDLINE)
+}
+pub fn pid_from_uid_map_id(id: FsObjectId) -> Option<Pid> {
+    pid_from_object_id(id, PROCFS_TAG_UID_MAP)
+}
+pub fn pid_from_gid_map_id(id: FsObjectId) -> Option<Pid> {
+    pid_from_object_id(id, PROCFS_TAG_GID_MAP)
+}
+pub fn pid_from_setgroups_id(id: FsObjectId) -> Option<Pid> {
+    pid_from_object_id(id, PROCFS_TAG_SETGROUPS)
 }
 fn pid_from_task_dir(id: FsObjectId) -> Option<Pid> {
     pid_from_object_id(id, PROCFS_TAG_TASK_DIR)
@@ -315,6 +348,67 @@ fn trim_ascii_space(mut bytes: &[u8]) -> &[u8] {
         bytes = &bytes[..bytes.len() - 1];
     }
     bytes
+}
+
+fn write_userns_projection(
+    fs_object_id: FsObjectId,
+    offset: u64,
+    bytes: &[u8],
+) -> Option<StepOutcome<u64, NoProgress>> {
+    let target = if let Some(pid) = pid_from_uid_map_id(fs_object_id) {
+        Some((pid, UsernsWriteTarget::UidMap))
+    } else if let Some(pid) = pid_from_gid_map_id(fs_object_id) {
+        Some((pid, UsernsWriteTarget::GidMap))
+    } else {
+        pid_from_setgroups_id(fs_object_id).map(|pid| (pid, UsernsWriteTarget::Setgroups))
+    }?;
+
+    let Some(proc) = process_for_procfs_number(target.0 .0) else {
+        return Some(StepOutcome::err(Errno::ESRCH));
+    };
+    let Some(user_ns) = proc.user_namespace_cap() else {
+        return Some(StepOutcome::err(Errno::ESRCH));
+    };
+    let Some(writer_user_ns) = proc.user_namespace_cap() else {
+        return Some(StepOutcome::err(Errno::ESRCH));
+    };
+    let Some(writer_cred) = proc.cred() else {
+        return Some(StepOutcome::err(Errno::ESRCH));
+    };
+
+    let result = match target.1 {
+        UsernsWriteTarget::Setgroups => {
+            tx_subsystems::process::nsproxy::write_user_namespace_setgroups(&user_ns, offset, bytes)
+        }
+        UsernsWriteTarget::UidMap => tx_subsystems::process::nsproxy::write_user_namespace_id_map(
+            &user_ns,
+            writer_cred,
+            &writer_user_ns,
+            tx_subsystems::process::nsproxy::UserNsMapKind::Uid,
+            offset,
+            bytes,
+        ),
+        UsernsWriteTarget::GidMap => tx_subsystems::process::nsproxy::write_user_namespace_id_map(
+            &user_ns,
+            writer_cred,
+            &writer_user_ns,
+            tx_subsystems::process::nsproxy::UserNsMapKind::Gid,
+            offset,
+            bytes,
+        ),
+    };
+
+    Some(match result {
+        Ok(()) => StepOutcome::done(bytes.len() as u64),
+        Err(errno) => StepOutcome::err(errno),
+    })
+}
+
+#[derive(Clone, Copy)]
+enum UsernsWriteTarget {
+    UidMap,
+    GidMap,
+    Setgroups,
 }
 
 pub const PROCFS_DIR_MODE: u16 = S_IFDIR | 0o555;
@@ -383,7 +477,19 @@ impl FsOps for Procfs {
             if name == b"fs" {
                 return StepOutcome::done(PROCFS_SYS_FS_ID);
             }
+            if name == b"net" {
+                return StepOutcome::done(PROCFS_SYS_NET_ID);
+            }
+            if name == b"user" {
+                return StepOutcome::done(PROCFS_SYS_USER_ID);
+            }
             return StepOutcome::err(Errno::ENOENT);
+        }
+        if parent == PROCFS_SYS_USER_ID {
+            return match name {
+                b"max_user_namespaces" => StepOutcome::done(PROCFS_SYS_USER_MAX_USER_NAMESPACES_ID),
+                _ => StepOutcome::err(Errno::ENOENT),
+            };
         }
         if parent == PROCFS_SYS_FS_ID {
             if name == b"pipe-max-size" {
@@ -434,12 +540,6 @@ impl FsOps for Procfs {
                 b"snmp" => StepOutcome::done(PROCFS_NET_SNMP_ID),
                 b"netlink" => StepOutcome::done(PROCFS_NET_NETLINK_ID),
                 b"if_inet6" => StepOutcome::done(PROCFS_NET_IF_INET6_ID),
-                _ => StepOutcome::err(Errno::ENOENT),
-            };
-        }
-        if parent == PROCFS_SYS_ID {
-            return match name {
-                b"net" => StepOutcome::done(PROCFS_SYS_NET_ID),
                 _ => StepOutcome::err(Errno::ENOENT),
             };
         }
@@ -501,6 +601,15 @@ impl FsOps for Procfs {
             if name == b"ns" && process::process_by_pid(pid).is_some() {
                 return StepOutcome::done(pid_ns_dir_id(pid));
             }
+            if name == b"uid_map" && process_for_procfs_number(pid.0).is_some() {
+                return StepOutcome::done(pid_uid_map_id(pid));
+            }
+            if name == b"gid_map" && process_for_procfs_number(pid.0).is_some() {
+                return StepOutcome::done(pid_gid_map_id(pid));
+            }
+            if name == b"setgroups" && process_for_procfs_number(pid.0).is_some() {
+                return StepOutcome::done(pid_setgroups_id(pid));
+            }
             return StepOutcome::err(Errno::ENOENT);
         }
         if let Some(pid) = pid_from_fdinfo_dir(parent) {
@@ -560,7 +669,8 @@ impl FsOps for Procfs {
             | PROCFS_SYSVIPC_ID
             | PROCFS_NET_ID
             | PROCFS_SYS_NET_ID
-            | PROCFS_SYS_NET_IPV4_ID => {
+            | PROCFS_SYS_NET_IPV4_ID
+            | PROCFS_SYS_USER_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
             PROCFS_SELF_ID => {
@@ -587,6 +697,13 @@ impl FsOps for Procfs {
             }
             PROCFS_SYSVIPC_ID | PROCFS_SYS_ID | PROCFS_SYS_KERNEL_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
+            }
+            PROCFS_SYS_FS_PIPE_MAX_SIZE_ID
+            | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID
+            | PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID
+            | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID
+            | PROCFS_SYS_USER_MAX_USER_NAMESPACES_ID => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, S_IFREG | 0o644))
             }
             PROCFS_SYSVIPC_MSG_ID
             | PROCFS_SYSVIPC_SEM_ID
@@ -632,6 +749,12 @@ impl FsOps for Procfs {
             }
             id if pid_from_fdinfo_id(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            }
+            id if pid_from_uid_map_id(id).is_some()
+                || pid_from_gid_map_id(id).is_some()
+                || pid_from_setgroups_id(id).is_some() =>
+            {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_RW_MODE))
             }
             id if pid_from_task_dir(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
@@ -695,8 +818,28 @@ impl FsOps for Procfs {
         }
 
         if id == PROCFS_SYS_ID {
-            let files: &[(&[u8], FsObjectId, InodeKind)] =
-                &[(b"net", PROCFS_SYS_NET_ID, InodeKind::Directory)];
+            let files: &[(&[u8], FsObjectId, InodeKind)] = &[
+                (b"kernel", PROCFS_SYS_KERNEL_ID, InodeKind::Directory),
+                (b"fs", PROCFS_SYS_FS_ID, InodeKind::Directory),
+                (b"net", PROCFS_SYS_NET_ID, InodeKind::Directory),
+                (b"user", PROCFS_SYS_USER_ID, InodeKind::Directory),
+            ];
+            if idx < files.len() {
+                let (name, oid, kind) = files[idx];
+                return StepOutcome::done(Some((
+                    dir_entry(oid, kind, name),
+                    DirCursor::from_u64((idx + 1) as u64),
+                )));
+            }
+            return StepOutcome::done(None);
+        }
+
+        if id == PROCFS_SYS_USER_ID {
+            let files: &[(&[u8], FsObjectId, InodeKind)] = &[(
+                b"max_user_namespaces",
+                PROCFS_SYS_USER_MAX_USER_NAMESPACES_ID,
+                InodeKind::Regular,
+            )];
             if idx < files.len() {
                 let (name, oid, kind) = files[idx];
                 return StepOutcome::done(Some((
@@ -752,6 +895,9 @@ impl FsOps for Procfs {
                 (b"task", pid_task_dir_id(pid), InodeKind::Directory),
                 (b"fdinfo", pid_fdinfo_dir_id(pid), InodeKind::Directory),
                 (b"ns", pid_ns_dir_id(pid), InodeKind::Directory),
+                (b"uid_map", pid_uid_map_id(pid), InodeKind::Regular),
+                (b"gid_map", pid_gid_map_id(pid), InodeKind::Regular),
+                (b"setgroups", pid_setgroups_id(pid), InodeKind::Regular),
             ];
             let fi = idx.saturating_sub(2);
             if fi < files.len() {
@@ -1271,6 +1417,10 @@ impl FsOps for Procfs {
         caller_netns: Option<&tx_subsystems::net::NetNamespacePayload>,
         _guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
+        if let Some(outcome) = write_userns_projection(fs_object_id, _offset, bytes) {
+            return outcome;
+        }
+
         let default_netns;
         let netns = match caller_netns {
             Some(netns) => netns,
@@ -1293,6 +1443,7 @@ impl FsOps for Procfs {
                 | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID
                 | PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID
                 | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID
+                | PROCFS_SYS_USER_MAX_USER_NAMESPACES_ID
         ) {
             return StepOutcome::done(bytes.len() as u64);
         }
@@ -1458,7 +1609,49 @@ mod tests {
     }
 
     #[test]
-    fn procfs_fdinfo_renders_posix_mq_attributes() {
+    fn procfs_kernel_config_includes_ltp_required_surface() {
+        tx_test_support::init_host();
+        let procfs = Procfs::new();
+        let guard = adapter::step_engine::guard();
+        let mut out = [0u8; 512];
+        let read = match procfs.step_read_projected(PROCFS_CONFIG_ID, 0, &mut out, &guard) {
+            StepOutcome::Done(read) => read as usize,
+            other => panic!("procfs config read returned {other:?}"),
+        };
+        let config = core::str::from_utf8(&out[..read]).expect("config utf8");
+        assert_eq!(config, KERNEL_CONFIG_TEXT);
+        assert!(config.contains("CONFIG_NET_NS=y\n"));
+        assert!(config.contains("CONFIG_USER_NS=y\n"));
+        assert!(config.contains("CONFIG_TLS=y\n"));
+        assert!(config.contains("CONFIG_NETFILTER_XT_MATCH_STATE=y\n"));
+        assert!(config.contains("CONFIG_IP_NF_TARGET_REJECT=y\n"));
+    }
+
+    #[test]
+    fn procfs_userns_sysctl_advertises_positive_limit() {
+        tx_test_support::init_host();
+        let procfs = Procfs::new();
+        let guard = adapter::step_engine::guard();
+        let user_dir = match procfs.lookup(PROCFS_SYS_ID, b"user", &guard) {
+            StepOutcome::Done(id) => id,
+            other => panic!("lookup /proc/sys/user failed: {other:?}"),
+        };
+        let max_id = match procfs.lookup(user_dir, b"max_user_namespaces", &guard) {
+            StepOutcome::Done(id) => id,
+            other => panic!("lookup /proc/sys/user/max_user_namespaces failed: {other:?}"),
+        };
+        let mut out = [0u8; 32];
+        let read = match procfs.step_read_projected(max_id, 0, &mut out, &guard) {
+            StepOutcome::Done(read) => read as usize,
+            other => panic!("max_user_namespaces read failed: {other:?}"),
+        };
+        let text = core::str::from_utf8(&out[..read]).expect("sysctl utf8");
+
+        assert_eq!(text, "1024\n");
+    }
+
+    #[test]
+    fn procfs_net_route_renders_initial_namespace_routes() {
         let _setup = setup();
         let guard = adapter::step_engine::guard();
         let procfs = Procfs::new();

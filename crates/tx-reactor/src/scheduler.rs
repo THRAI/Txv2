@@ -1553,6 +1553,8 @@ impl Phase1Scheduler {
                     meta.owner = TaskRunOwner::Parked;
                     requeue = Some(if meta.kernel_only {
                         (Phase1QueueKind::Kernel, false)
+                    } else if meta.userspace_thread {
+                        (Phase1QueueKind::New, false)
                     } else {
                         (Phase1QueueKind::Preempted, false)
                     });

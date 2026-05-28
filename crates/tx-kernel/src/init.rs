@@ -324,6 +324,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::populate_rootfs_shebang_shims();
             Self::populate_rootfs_tmp_dirs();
             Self::populate_rootfs_identity_files();
+            Self::populate_rootfs_kernel_config();
             Self::init_csprng();
             Self::bind_init_cwd_and_root();
             Self::submit_net_runtime_tasks();
