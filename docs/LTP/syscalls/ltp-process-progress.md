@@ -8,10 +8,84 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | Item | Value | Note |
 | --- | ---: | --- |
 | cases | 109 | from `make ltp-batch-cases LTP_BATCH=process` |
-| latest local run | pidfd_getfd01/02 | 2026-05-26 RV/LA reruns after pidfd_getfd support |
-| cumulative scored | `311/494` | recorded rows in this document |
-| reached case | `waitpid13` | batch completed |
+| latest local run | focused `pidfd_getfd01+pidfd_getfd02` | 2026-05-30 direct QEMU run scored `6/6` |
+| cumulative scored | `318/491` | recorded rows in this document |
+| reached case | `fork11` | latest broad run stopped by 300s outer timeout; older per-case rows reach `waitpid13` |
 | logs | `target/oscomp/ltp-progress/process` | per-group stdout and serial snapshots |
+
+## 2026-05-30 full-image prefix run
+
+Direct non-Docker QEMU coverage with the full image reached `45/60` before the
+300s outer timeout stopped the batch while `fork11` was active. The run started
+39 cases and completed 38; serial snapshot:
+`target/oscomp/os_serial_out_ltp_process_partial_20260530_171501.txt`.
+
+- Passing prefix clusters: `clone01..03`, `clone05..07`, basic `execl*`,
+  `execv01`, `execve01`, `execve05`, `execve06`, `execvp01`, `exit*`, and
+  `fork01`, `fork03`, `fork04`, `fork07..10`.
+- Main semantic failures: `clone04` user SIGSEGV, `clone08` partial
+  `CLONE_PARENT`/clone flag behavior, `execve02`/`execve04` executing the child
+  when failure was expected, and `execve03` errno ordering for long paths, bad
+  user pointers, and non-executable files.
+- Policy/environment blockers: `clone09` still needs
+  `/proc/sys/net/ipv4/conf/lo/tag`; `clone3` remains unsupported/TCONF;
+  `clone303` now gets past `/proc/self/mounts` and reaches cgroup v2 policy;
+  `execveat01/02` still report unsupported arch syscall; `execveat03` breaks
+  on test-device acquisition; `fork06` is missing from the image.
+- Verified with:
+  `timeout 300s cargo xtask oscomp qemu --target rv64-qemu --data target/oscomp/testdata --submit target/oscomp/submit --suite ltp-batch:process`
+  and
+  `python3 tools/oscomp-judge.py target/oscomp/os_serial_out_rv.txt target/oscomp/testdata`.
+
+## 2026-05-30 focused pidfd poll fix
+
+Focused direct QEMU coverage for `pidfd_open03` now passes after pidfds gained
+process-identity-lifetime exit readiness. Earlier in the same lane,
+`target/oscomp/os_serial_out_ltp_process_tail2_20260530_200725.txt` showed a
+kernel panic when `poll(pidfd)` fell through to `OpenFile::rnode()`. The first
+fix removed that panic but returned `poll() == 0`; the final fix added a real
+pidfd exit wait source and removed the synthetic 5ms recheck timeout.
+
+- Passing evidence: `target/oscomp/os_serial_out_ltp_pidfd_open03_real_wait_20260530_210012.txt`
+- Judge: `python3 tools/oscomp-judge.py ...` scored `1/1`.
+- Fault decode: no `scause/sepc/stval` trap lines found.
+
+## 2026-05-30 focused pidfd waitid fix
+
+Focused direct QEMU coverage for `pidfd_open04` now passes after the first
+`waitid(P_PIDFD)` slice landed. The syscall now accepts pidfd-backed fds for
+`P_PIDFD + WEXITED`, returns `EAGAIN` for live nonblocking pidfds, waits on the
+pidfd exit source for blocking calls, writes a Linux-shaped `SIGCHLD` siginfo
+prefix, and reuses the existing child reap path after target exit. Broader
+`waitid` selectors (`P_ALL`, `P_PID`, `P_PGID`), stop/continue reporting, and
+full rusage accounting remain deferred.
+
+- Passing evidence: `target/oscomp/os_serial_out_ltp_pidfd_open04_waitid_real_20260530_211111.txt`
+- Judge: `python3 tools/oscomp-judge.py ...` scored `3/3`.
+- Fault decode: no `scause/sepc/stval` trap lines found.
+
+## 2026-05-30 focused pidfd signal/checkpoint fix
+
+Focused direct QEMU coverage for `pidfd_send_signal01` now passes after futex
+wait resume handling stopped treating still-registered wait rows as successful
+`FUTEX_WAKE` completions. The signal handler was already receiving the correct
+`SA_SIGINFO` payload; the remaining failure was an LTP checkpoint/pthread-join
+timeout after a stale signal wake hint made a futex wait return early.
+
+- Passing evidence: `target/oscomp/os_serial_out_ltp_pidfd_send_signal01_futex_retry_20260530_225730.txt`
+- Judge: `python3 tools/oscomp-judge.py ...` scored `2/2`.
+- Fault decode: no `scause/sepc/stval` trap lines found.
+
+## 2026-05-30 focused pidfd getfd errno fix
+
+Focused direct QEMU coverage for `pidfd_getfd01+pidfd_getfd02` now passes.
+The futex wait cleanup fixed the prior checkpoint timeout, leaving one Linux
+errno mismatch: `pidfd_getfd(valid_pidfd_to_exited_process, ...)` must return
+`ESRCH`, while non-pidfd fds and missing target fds still return `EBADF`.
+
+- Passing evidence: `target/oscomp/os_serial_out_ltp_pidfd_getfd_esrch_20260530_232521.txt`
+- Judge: `python3 tools/oscomp-judge.py ...` scored `6/6`.
+- Fault decode: no `scause/sepc/stval` trap lines found.
 
 ## 2026-05-26 failure notes
 
@@ -21,10 +95,11 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 - TFAIL: 11 recorded case(s); see per-case notes below.
 - Procfs refresh: `/proc/sys/kernel/pid_max` and `/proc/self/status` are now available; `getpid01`, `getppid01`, `getsid02`, `gettid01`, and `wait402` pass on RV/LA. `kcmp02` now reaches TCONF for missing `kcmp`; `setpgid02` reaches real setpgid errno checks.
 - `personality(2)` now records per-process personality state; `personality01` and `personality02` pass on RV/LA.
-- Minimal `pidfd_open(2)` fd support is available. `pidfd_open01` and `pidfd_open02` pass on RV/LA; `pidfd_open04` now reaches the `O_NONBLOCK` check but still fails `waitid(P_PIDFD)` with `ENOSYS` and times out in checkpoint cleanup. `pidfd_open03` still times out around checkpoint synchronization.
+- Minimal `pidfd_open(2)` fd support is available. `pidfd_open01` and `pidfd_open02` pass on RV/LA. Focused RV reruns now also pass `pidfd_open03` through pidfd poll readiness and `pidfd_open04` through the first `waitid(P_PIDFD)` slice.
 - `pidfd_send_signal02` now passes on RV/LA. The pidfd path accepts `pidfd_open` fds and `/proc/<pid>` directory fds, validates flags/siginfo signum, and root `setuid(nonroot)` drops capabilities so the init-process permission case returns `EPERM`.
+- `pidfd_send_signal01` now passes in the focused RV run: pidfd signal delivery preserves the expected siginfo payload, and futex checkpoint waits survive stale signal wake hints.
 - Minimal `kcmp(2)` support is available. `KCMP_FILE` compares open-file identity and the errno surface is wired; `kcmp01` and `kcmp02` pass on RV/LA. `kcmp03` is still locally skipped.
-- Minimal `pidfd_getfd(2)` support is available. It duplicates target-process fds with `FD_CLOEXEC`; `pidfd_getfd01` and `pidfd_getfd02` now score partial on RV/LA, with the remaining breakage in checkpoint cleanup.
+- Minimal `pidfd_getfd(2)` support is available. It duplicates target-process fds with `FD_CLOEXEC`, returns `ESRCH` for a valid pidfd whose target has exited, and focused RV reruns now pass `pidfd_getfd01` and `pidfd_getfd02`.
 
 ## Cases
 
@@ -37,11 +112,11 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `clone05` | 1/1 | pass |  |
 | `clone06` | 1/1 | pass |  |
 | `clone07` | 1/1 | pass |  |
-| `clone08` | 3/5 | partial | TBROK: CLONE_PARENT clone() failed: EINVAL (22) |
+| `clone08` | 4/5 | partial | 2026-05-30 full-image prefix still partial; previous TBROK: CLONE_PARENT clone() failed: EINVAL (22) |
 | `clone09` | 0/1 | fail | TBROK: Failed to open FILE '/proc/sys/net/ipv4/conf/lo/tag' for reading: ENOENT (2) |
 | `clone301` | 0/1 | skip | TCONF: syscall(435) __NR_clone3 not supported on your arch |
 | `clone302` | 1/2 | partial | TCONF: syscall(435) __NR_clone3 not supported on your arch |
-| `clone303` | 0/1 | fail | TBROK: Can't open /proc/self/mounts: ENOENT (2) |
+| `clone303` | 0/1 | skip | 2026-05-30 reaches cgroup policy: V2 base controller TCONF after `/proc/self/mounts` alias fix |
 | `execl01` | 1/1 | pass |  |
 | `execle01` | 1/1 | pass |  |
 | `execlp01` | 1/1 | pass |  |
@@ -49,19 +124,19 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `execve01` | 1/1 | pass |  |
 | `execve02` | 0/1 | fail | TFAIL: execve_child shouldn't be executed |
 | `execve03` | 3/6 | partial | TFAIL: execve failed unexpectedly; expected Filename too long: ENOENT (2) |
-| `execve04` | 0/1 | fail | TBROK: tst_checkpoint_wait(0, 10000) failed: ETIMEDOUT (110) |
-| `execve05` | 0/9 | fail | TBROK: tst_checkpoint_wait(0, 10000) failed: ETIMEDOUT (110) |
+| `execve04` | 0/1 | fail | 2026-05-30 TFAIL: `execve_child` executed when failure was expected |
+| `execve05` | 8/8 | pass | 2026-05-30 full-image prefix passes argv/env canary checks |
 | `execve06` | 1/1 | pass |  |
 | `execveat01` | 0/1 | skip | TCONF: syscall(281) __NR_execveat not supported on your arch |
 | `execveat02` | 0/1 | skip | single-case rerun exits cleanly; TCONF: `__NR_execveat` not supported |
-| `execveat03` | 0/2 | fail | single-case rerun exits cleanly; test device create/acquire fails with `EINVAL` |
+| `execveat03` | 0/2 | fail | 2026-05-30 full-image prefix: test device acquisition TBROK |
 | `execvp01` | 1/1 | pass |  |
 | `exit01` | 1/1 | pass |  |
 | `exit02` | 1/1 | pass |  |
 | `exit_group01` | 1/1 | pass |  |
 | `fork01` | 2/2 | pass |  |
 | `fork03` | 1/1 | pass |  |
-| `fork04` | 1/2 | partial | TBROK: tst_checkpoint_wait(0, 10000) failed: ETIMEDOUT (110) |
+| `fork04` | 3/3 | pass | 2026-05-30 full-image prefix passes environment inheritance/isolation checks |
 | `fork05` | 0/0 | skip |  |
 | `fork06` | 0/0 | skip |  |
 | `fork07` | 1/1 | pass |  |
@@ -88,13 +163,13 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `kcmp03` | 0/0 | skip | local skip after `kcmp` support; clone-sharing comparisons still deferred |
 | `personality01` | 18/18 | pass | per-process `personality(2)` read/write state; RV/LA pass |
 | `personality02` | 1/1 | pass | `STICKY_TIMEOUTS` personality read/write works; `select` keeps timeout unchanged; RV/LA pass |
-| `pidfd_getfd01` | 1/3 | partial | fd duplication and `kcmp` identity check pass; checkpoint wait/wake cleanup still times out; RV/LA 1/3 |
-| `pidfd_getfd02` | 3/5 | partial | invalid pidfd, invalid targetfd, and invalid flags pass; ESRCH/EPERM checkpoint paths still time out; RV/LA 3/5 |
+| `pidfd_getfd01` | 1/1 | pass | 2026-05-30 focused RV run: fd duplication and `kcmp` identity check pass |
+| `pidfd_getfd02` | 5/5 | pass | 2026-05-30 focused RV run: invalid pidfd/targetfd/flags, dead-target `ESRCH`, and permission `EPERM` cases pass |
 | `pidfd_open01` | 1/1 | pass | pidfd fd installs `FD_CLOEXEC`; RV/LA pass |
 | `pidfd_open02` | 3/3 | pass | expired pid, invalid pid, and invalid flags return expected errno; RV/LA pass |
-| `pidfd_open03` | 0/2 | fail | `pidfd_open` succeeds, but child checkpoint wait/wake still times out; RV 0/2 |
-| `pidfd_open04` | 1/4 | partial | `PIDFD_NONBLOCK` reflected by `F_GETFL`; `waitid(P_PIDFD)` still returns `ENOSYS` and checkpoint cleanup times out; RV/LA 1/4 |
-| `pidfd_send_signal01` | 0/1 | fail | syscall is available; remaining failure is checkpoint wait timeout after handler thread setup |
+| `pidfd_open03` | 1/1 | pass | 2026-05-30 focused RV run: `poll(pidfd)` wakes on target process exit through identity-lifetime pidfd readiness |
+| `pidfd_open04` | 3/3 | pass | 2026-05-30 focused RV run: `PIDFD_NONBLOCK` reflected by `F_GETFL`; `waitid(P_PIDFD)` returns `EAGAIN` while live and succeeds after child exit |
+| `pidfd_send_signal01` | 2/2 | pass | 2026-05-30 focused RV run: pidfd signal siginfo delivery and LTP futex checkpoint cleanup pass |
 | `pidfd_send_signal02` | 4/4 | pass | pidfd/proc-dir fd errno surface passes on RV/LA |
 | `pidfd_send_signal03` | 0/1 | skip | syscall is available; TCONF: `/proc/sys/kernel/ns_last_pid` does not exist |
 | `process_vm_readv01` | 0/0 | skip |  |

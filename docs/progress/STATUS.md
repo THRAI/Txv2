@@ -1,3 +1,541 @@
+- 2026-05-30 **Closed focused `pidfd_getfd01/02` process-tail coverage.** The
+  futex wait cleanup fixed the previous checkpoint timeout, and the remaining
+  `pidfd_getfd02` failure was a Linux errno split: a valid pidfd whose target
+  process has exited must return `ESRCH`, while a non-pidfd fd and a live
+  target missing `targetfd` still return `EBADF`. `sys_pidfd_getfd` now checks
+  the pidfd target exit status before permission and fd duplication. **Verified:**
+  `cargo fmt --check`; `cargo check -p tx-subsystems -p tx-shims -p
+  tx-kernel`; `cargo xtask build --target rv64-qemu`; `make
+  oscomp-submit-rv64`; focused direct QEMU `timeout 120s cargo xtask oscomp
+  qemu --target rv64-qemu --data target/oscomp/testdata --submit
+  target/oscomp/submit --suite ltp-musl:pidfd_getfd01+pidfd_getfd02`;
+  `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_ltp_pidfd_getfd_esrch_20260530_232521.txt
+  target/oscomp/testdata` (`6/6`); `cargo xtask fault-decode --target
+  rv64-qemu --serial
+  target/oscomp/os_serial_out_ltp_pidfd_getfd_esrch_20260530_232521.txt
+  --brief` (no trap lines). **Next step:** continue process-tail LTP with
+  wait-family selectors such as `waitid*` and checkpoint-heavy `waitpid*`.
+  **Blocker:** `cargo test -p tx-shims --lib ...` remains red from unrelated
+  lib-test import drift in timerfd/vm/epoll modules, so package `cargo check`
+  plus focused guest evidence is the reliable gate for this slice.
+
+- 2026-05-30 **Fixed the `pidfd_send_signal01` checkpoint timeout.** The
+  pidfd signal path was already delivering the expected `SA_SIGINFO` payload,
+  but a stale signal wake hint could make a classic futex wait report a
+  successful `FUTEX_WAKE` while its exact waiter row was still registered.
+  `FutexWaitOp` now cleans up outstanding wait rows on drop and treats
+  still-registered `Retry` resumes as stale hints that should re-step the wait,
+  preserving LTP checkpoint/pthread-join wake ordering. While checking the
+  focused futex test path, two stale test-only compile caveats were also
+  cleaned up: the userfaultfd fd scaffold now handles the newer
+  `OpenFileBacking` variants, and timerfd unit tests call the current
+  one-argument helper. **Verified:** `cargo fmt
+  --check`; `cargo check -p tx-subsystems -p tx-shims -p tx-kernel`; `cargo
+  test -p tx-subsystems futex -- --nocapture`; `cargo xtask build --target
+  rv64-qemu`; `make oscomp-submit-rv64`; focused direct QEMU `timeout 120s
+  cargo xtask oscomp qemu --target rv64-qemu --data target/oscomp/testdata
+  --submit target/oscomp/submit --suite ltp-musl:pidfd_send_signal01`;
+  `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_ltp_pidfd_send_signal01_futex_retry_20260530_225730.txt
+  target/oscomp/testdata` (`2/2`); `cargo xtask fault-decode --target
+  rv64-qemu --serial
+  target/oscomp/os_serial_out_ltp_pidfd_send_signal01_futex_retry_20260530_225730.txt
+  --brief` (no trap lines). **Next step:** continue process-tail LTP with the
+  remaining checkpoint-heavy pidfd/wait cases, especially `pidfd_getfd01/02`
+  and `waitid*`.
+
+- 2026-05-30 **Added the first `waitid(P_PIDFD)` slice for `pidfd_open04`.**
+  `NR_WAITID` is now numbered and dispatched for the pidfd wait path:
+  `waitid(P_PIDFD, pidfd, infop, WEXITED, rusage)` resolves pidfd-backed
+  `OpenFile`s, returns `EAGAIN` for live `O_NONBLOCK` pidfds, waits on the
+  pidfd exit wait source for blocking calls, writes a Linux-shaped `SIGCHLD`
+  siginfo prefix, and reuses the existing child reap path after target exit.
+  Full `waitid` selectors, stopped/continued reporting, and real rusage
+  accounting remain deferred. **Verified:** `cargo fmt --check`; `cargo check
+  -p tx-subsystems -p tx-shims`; `cargo xtask build --target rv64-qemu`; `make
+  oscomp-submit-rv64`; focused direct QEMU
+  `timeout 120s cargo xtask oscomp qemu --target rv64-qemu --data
+  target/oscomp/testdata --submit target/oscomp/submit --suite
+  ltp-musl:pidfd_open04`; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_ltp_pidfd_open04_waitid_real_20260530_211111.txt
+  target/oscomp/testdata` (`3/3`); `cargo xtask fault-decode --target
+  rv64-qemu --serial
+  target/oscomp/os_serial_out_ltp_pidfd_open04_waitid_real_20260530_211111.txt
+  --brief` (no trap lines). **Next step:** debug `pidfd_send_signal01`
+  siginfo/handler semantics; `pidfd_send_signal03` remains an environment
+  blocker on `/proc/sys/kernel/ns_last_pid`.
+
+- 2026-05-30 **Fixed `poll(pidfd)` readiness for `pidfd_open03`.** The earlier
+  process-tail run
+  `target/oscomp/os_serial_out_ltp_process_tail2_20260530_200725.txt` exposed a
+  kernel panic in `OpenFile::rnode()` when `poll(2)` saw a pidfd-backed
+  `OpenFile`. The first shape fix kept pidfds out of the VFS rnode fallback but
+  still returned `poll() == 0`; the final fix adds a process-identity-lifetime
+  pidfd exit wait source, fires it after `exit_status` publication, and waits on
+  that source from `ppoll`/`pselect` pidfd branches without a synthetic timeout.
+  **Verified:** `cargo fmt --check`; `cargo check -p tx-subsystems -p
+  tx-shims`; `cargo xtask build --target rv64-qemu`; `make
+  oscomp-submit-rv64`; `timeout 120s cargo xtask oscomp qemu --target
+  rv64-qemu --data target/oscomp/testdata --submit target/oscomp/submit
+  --suite ltp-musl:pidfd_open03`; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_ltp_pidfd_open03_real_wait_20260530_210012.txt
+  target/oscomp/testdata` (`1/1`); `cargo xtask fault-decode --target
+  rv64-qemu --serial
+  target/oscomp/os_serial_out_ltp_pidfd_open03_real_wait_20260530_210012.txt
+  --all --brief` (no trap lines). **Next step:** continue process-tail LTP in
+  short selectors, starting with `pidfd_open04` and `pidfd_send_signal*`.
+  **Blocker:** lib-test compilation is still red from unrelated test-import
+  drift in timerfd/vm/process test modules, so guest evidence is the useful
+  regression proof for this lane.
+
+- 2026-05-30 **Ran the LTP VM suffix from the full image.** A focused direct
+  QEMU selector for `munlockall01..set_mempolicy04` completed all 15 selected
+  cases and scored `13/22`; the serial snapshot is
+  `target/oscomp/os_serial_out_ltp_vm_tail_20260530_200054.txt`. Fault decode
+  found no kernel trap lines. The suffix confirms `munlockall01`, `munmap03`,
+  `remap_file_pages01`, `remap_file_pages02`, and `sbrk02` pass in the current
+  submitted image. Remaining VM suffix blockers are `munmap01/02` userspace
+  exit `139` without kernel trap markers, `sbrk01` grow/shrink returning
+  `ENOMEM`, and expected unsupported/environment filters for pkeys,
+  process_madvise, arch-filtered `sbrk03`, and libnuma-gated
+  `set_mempolicy*`. **Verified:** `timeout 180s cargo xtask oscomp qemu
+  --target rv64-qemu --data target/oscomp/testdata --submit
+  target/oscomp/submit --suite
+  ltp-musl:munlockall01+munmap01+munmap02+munmap03+pkey01+process_madvise01+remap_file_pages01+remap_file_pages02+sbrk01+sbrk02+sbrk03+set_mempolicy01+set_mempolicy02+set_mempolicy03+set_mempolicy04`;
+  `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_ltp_vm_tail_20260530_200054.txt
+  target/oscomp/testdata`; `cargo xtask fault-decode --target rv64-qemu
+  --serial target/oscomp/os_serial_out_ltp_vm_tail_20260530_200054.txt --all
+  --brief`. **Next step:** debug `munmap01/02` as userspace-visible VM fault
+  behavior and `sbrk01` as brk growth accounting. **Blocker:** none for suffix
+  visibility; broad VM still has earlier semantic gaps in madvise/mincore,
+  mmap/mprotect, and msync paths.
+
+- 2026-05-30 **Ran the LTP VFS tail from the full image.** The direct
+  non-Docker QEMU path for `ltp-batch:vfs-tail` reached `609/719` before the
+  300s outer timeout killed QEMU while `rename05` was active. The run started
+  78 cases and completed 77; the serial snapshot is
+  `target/oscomp/os_serial_out_ltp_vfs_tail_20260530_194342.txt`. Fault decode
+  found no kernel trap lines. The tail confirms many later VFS cases now reach
+  real behavior, including passing `lstat01_64`, `mkdirat01`, `mknod01/02/05/08/09`,
+  `mknodat01`, `name_to_handle_at01/02`, `open03/04/09`,
+  `open_by_handle_at01`, `openat01`, `readdir01`, `readlinkat02`, and
+  `removexattr01`. Remaining tail blockers cluster around xattr support and
+  `user_xattr` filtering, symlink and `O_NOFOLLOW` semantics, hard-link link
+  count accounting, bad-user-pointer errno ordering, setgid group inheritance,
+  unprivileged `O_NOATIME`, open/openat2 edge cases, old `readdir(2)`
+  unavailability on RV64, and `test_dev.img` acquisition for device-backed
+  rename/link/mknod paths. **Verified:** `timeout 300s cargo xtask oscomp qemu
+  --target rv64-qemu --data target/oscomp/testdata --submit
+  target/oscomp/submit --suite ltp-batch:vfs-tail`; `python3
+  tools/oscomp-judge.py
+  target/oscomp/os_serial_out_ltp_vfs_tail_20260530_194342.txt
+  target/oscomp/testdata`; `cargo xtask fault-decode --target rv64-qemu
+  --serial target/oscomp/os_serial_out_ltp_vfs_tail_20260530_194342.txt --all
+  --brief`. **Next step:** focus VFS on symlink/path-walk errno ordering,
+  hard-link metadata, setgid inheritance, and the test-device acquisition path
+  before another full VFS sweep. **Blocker:** broad/tail VFS still exceeds the
+  300s ladder in this environment.
+
+- 2026-05-30 **Ran full LTP heavy coverage from the full image.** The direct
+  non-Docker QEMU path completed all 67 cases in `ltp-batch:heavy`, userspace
+  exited cleanly, and the local judge scored `26/217`. The serial snapshot is
+  `target/oscomp/os_serial_out_ltp_heavy_full_20260530_192052.txt`; fault
+  decode found no kernel trap lines. The fresh run updates several stale
+  unsupported notes: `setdomainname01`, `setdomainname02`, `sysinfo01`,
+  `sysinfo02`, and `uname04` now pass in the submitted kernel/image. Remaining
+  heavy blockers are concentrated in deliberate/deferred subsystems (`ptrace`,
+  BPF, perf, quota, syslog policy), capability probe filtering through
+  unsupported `capget`, architecture/tooling TCONF cases, and missing procfs or
+  sysctl projections such as `/proc/sys/kernel/pid_max` and
+  `/proc/sys/kernel/printk`. **Verified:** `timeout 180s cargo xtask oscomp
+  qemu --target rv64-qemu --data target/oscomp/testdata --submit
+  target/oscomp/submit --suite ltp-batch:heavy`; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_ltp_heavy_full_20260530_192052.txt
+  target/oscomp/testdata`; `cargo xtask fault-decode --target rv64-qemu
+  --serial target/oscomp/os_serial_out_ltp_heavy_full_20260530_192052.txt --all
+  --brief`. **Next step:** keep ptrace/BPF/perf/quota out of the easy syscall
+  lane unless explicitly scoped; the practical early fixes are procfs/sysctl
+  projections and capability probing. **Blocker:** most heavy failures are
+  intentional policy/subsystem gaps, not simple syscall wiring.
+
+- 2026-05-30 **Ran full LTP mount coverage from the full image.** The direct
+  non-Docker QEMU path completed all 53 cases in `ltp-batch:mount`, userspace
+  exited cleanly, and the local judge scored `9/105`. The serial snapshot is
+  `target/oscomp/os_serial_out_ltp_mount_partial_20260530_191652.txt`; fault
+  decode found no kernel trap lines. `acct01` now passes all 9 checked paths.
+  Most mount/fsopen/open-tree/swap/umount cases still break before syscall
+  semantics because LTP cannot create `test_dev.img` and cannot acquire a test
+  device. Module tests are blocked by missing `/proc/cmdline`. `chroot*`,
+  `reboot*`, `pivot_root01`, `unshare*`, and `setns*` remain unsupported or
+  guest-wrapper filtered in this submitted kernel/image; notably `setns01/02`
+  are TCONF/TWARN because the LTP wrapper reports `__NR_setns` unsupported on
+  this arch path. **Verified:** `timeout 180s cargo xtask oscomp qemu --target
+  rv64-qemu --data target/oscomp/testdata --submit target/oscomp/submit
+  --suite ltp-batch:mount`; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_ltp_mount_partial_20260530_191652.txt
+  target/oscomp/testdata`; `cargo xtask fault-decode --target rv64-qemu
+  --serial target/oscomp/os_serial_out_ltp_mount_partial_20260530_191652.txt
+  --all --brief`. **Next step:** fix the `test_dev.img`/device acquisition
+  harness path before treating modern mount APIs as semantic failures, and
+  verify that the submitted kernel/image contains the intended namespace syscall
+  dispatch. **Blocker:** device setup and guest syscall-number visibility
+  dominate the current batch.
+
+- 2026-05-30 **Ran full LTP aio coverage from the full image.** The direct
+  non-Docker QEMU path completed all 15 cases in `ltp-batch:aio`, userspace
+  exited cleanly, and the local judge scored `1/16`. The serial snapshot is
+  `target/oscomp/os_serial_out_ltp_aio_full_20260530_191300.txt`; fault decode
+  found no kernel trap lines. Most raw AIO LTP cases are still gated by
+  `/proc/config` lacking `CONFIG_AIO=y` or by missing libaio development
+  packages in the image, so they do not yet exercise the raw AIO implementation.
+  `io_uring01` reaches real behavior: `io_uring_setup()` passes, then the
+  user-ring `mmap()` fails with `EINVAL`; `io_uring02` is blocked by
+  unsupported `capget` capability probing. **Verified:** `timeout 120s cargo
+  xtask oscomp qemu --target rv64-qemu --data target/oscomp/testdata --submit
+  target/oscomp/submit --suite ltp-batch:aio`; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_ltp_aio_full_20260530_191300.txt
+  target/oscomp/testdata`; `cargo xtask fault-decode --target rv64-qemu
+  --serial target/oscomp/os_serial_out_ltp_aio_full_20260530_191300.txt --all
+  --brief`. **Next step:** expose Linux-shaped AIO config/procfs or run a
+  libaio-capable tailored image before using LTP AIO as a raw-AIO semantic
+  gate. **Blocker:** current full image filters most AIO cases before syscall
+  semantics.
+
+- 2026-05-30 **Ran focused LTP time tails after the full-image prefix
+  timeout.** The tail after `time01` now has direct evidence through `times03`:
+  `target/oscomp/os_serial_out_ltp_time_tail_20260530_190324.txt` scored
+  `42/121` over `time01..timerfd_gettime01`, and
+  `target/oscomp/os_serial_out_ltp_time_tail2_20260530_190543.txt` scored
+  `12/17` over `timerfd_settime01`, `times01`, and `times03`. No kernel trap
+  lines were found in either tail log. Confirmed passing tail clusters include
+  `time01`, `timer_delete02`, `timer_getoverrun01`, `timer_gettime01`,
+  `timerfd02`, `timerfd_create01`, `timerfd_gettime01`,
+  `timerfd_settime01`, and `times01`. Remaining tail blockers are missing
+  image/selector entries for `timer_create01..03`, CPU-time POSIX timers,
+  `timer_settime` null-pointer errno ordering, `timer_settime03` cleanup
+  timeout, timerfd tick delivery/counting, time namespace unshare for
+  `timerfd04`, and child CPU accounting in `times03`. **Verified:** `timeout
+  120s cargo xtask oscomp qemu --target rv64-qemu --data
+  target/oscomp/testdata --submit target/oscomp/submit --suite
+  ltp-musl:time01+timer_create01+timer_create02+timer_create03+timer_delete01+timer_delete02+timer_getoverrun01+timer_gettime01+timer_settime01+timer_settime02+timer_settime03+timerfd01+timerfd02+timerfd04+timerfd_create01+timerfd_gettime01+timerfd_settime01+times01+times03`;
+  `timeout 90s cargo xtask oscomp qemu --target rv64-qemu --data
+  target/oscomp/testdata --submit target/oscomp/submit --suite
+  ltp-musl:timerfd_settime01+times01+times03`; `python3
+  tools/oscomp-judge.py <tail-log> target/oscomp/testdata`; `cargo xtask
+  fault-decode --target rv64-qemu --serial <tail-log> --all --brief`.
+  **Next step:** fix CPU accounting/timerfd tick semantics and the timer-create
+  image/selector gap. **Blocker:** none for tail visibility; semantic gaps
+  remain.
+
+- 2026-05-30 **Ran partial LTP time coverage from the full image.** The
+  non-Docker direct QEMU path for `ltp-batch:time` reached `176/200` before
+  the 300s outer timeout killed QEMU while `time01` was active. The run started
+  35 cases and completed 34; the serial snapshot is
+  `target/oscomp/os_serial_out_ltp_time_partial_20260530_181533.txt`. This is
+  a major refresh over the stale ENOSYS-era table: `adjtimex01/03`,
+  `clock_adjtime01/02`, `clock_settime01`, `settimeofday01`, `stime01`, and
+  `stime02` now reach real Linux-shaped behavior, and many alarm/gettime/timer
+  basics pass. Remaining blockers are time namespace procfs
+  (`/proc/self/ns/time_for_children`), `clock_nanosleep` bad-pointer and
+  restart/cleanup behavior, `clock_settime02/03` edge semantics,
+  `gettimeofday01` timezone/bad-pointer handling, nanosleep/setitimer cleanup,
+  and `settimeofday02` depending on unsupported `capget` capability probing.
+  **Verified:** `timeout 300s cargo xtask oscomp qemu --target rv64-qemu
+  --data target/oscomp/testdata --submit target/oscomp/submit --suite
+  ltp-batch:time`; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv.txt target/oscomp/testdata`; `cargo xtask
+  fault-decode --target rv64-qemu --serial target/oscomp/os_serial_out_rv.txt
+  --all --brief` reported no trap lines. **Next step:** focus time fixes on
+  `clock_nanosleep` restart/bad-pointer semantics and time namespace procfs.
+  **Blocker:** broad time still exceeds the 300s ladder, but focused tails now
+  cover the timer/times suffix.
+
+- 2026-05-30 **Ran focused LTP event tails after the full-image prefix
+  timeout.** The event suffix now has direct evidence through `userfaultfd01`.
+  Tail logs are `target/oscomp/os_serial_out_ltp_event_tail_20260530_185920.txt`
+  (`17/44`, with one long-selector truncation to bogus `inotif`),
+  `target/oscomp/os_serial_out_ltp_event_tail2_20260530_190138.txt` (`54/90`,
+  host timeout after starting `select03`), and
+  `target/oscomp/os_serial_out_ltp_event_tail3_20260530_190504.txt` (`16/42`,
+  covering `select03`, `select04`, and `userfaultfd01`). No kernel trap lines
+  were found in the final focused logs. The tail confirms `futex_wake01/03`,
+  `inotify_init1_01/02`, `poll01`, `pselect02*`, `pselect03*`, and `select03`
+  pass. Remaining suffix blockers are `futex_wait_bitset01` timing/cleanup,
+  missing inotify watch/remove syscalls and `/proc/sys/fs/inotify/*`, missing
+  `/proc/<pid>/task/<tid>/stat` for futex helper accounting,
+  poll/ppoll/pselect/select timing or signal-interrupt semantics, `select04`
+  cleanup timeout, and `UFFDIO_API` returning `EINVAL`. **Verified:** `timeout
+  120s cargo xtask oscomp qemu --target rv64-qemu --data
+  target/oscomp/testdata --submit target/oscomp/submit --suite
+  ltp-musl:futex_wait_bitset01+...+userfaultfd01`; shorter follow-up selectors
+  `ltp-musl:inotify12+...+userfaultfd01` and
+  `ltp-musl:select03+select04+userfaultfd01`; `python3 tools/oscomp-judge.py
+  <tail-log> target/oscomp/testdata`; `cargo xtask fault-decode --target
+  rv64-qemu --serial <tail-log> --all --brief`. **Next step:** fix
+  poll/select timer accuracy and userfaultfd `UFFDIO_API`, or implement the
+  missing inotify watch/remove path. **Blocker:** avoid long focused selectors;
+  they can truncate in the guest command line.
+
+- 2026-05-30 **Ran partial LTP event coverage from the full image.** The
+  non-Docker direct QEMU path for `ltp-batch:event` reached `331/385` before
+  the 300s outer timeout killed QEMU while `futex_wait_bitset01` was active.
+  The run started 54 cases and completed 53; the serial snapshot is
+  `target/oscomp/os_serial_out_ltp_event_partial_20260530_180900.txt`. The
+  fresh prefix confirms the epoll/eventfd base remains strong: most
+  `epoll_ctl*`, `epoll_wait01/03/06/07`, and all eventfd cases in the prefix
+  pass, and basic `futex_wait01..04` pass. Remaining early blockers are legacy
+  `epoll_create` semantics, nested epoll `ELOOP` vs `EINVAL`, timing-sensitive
+  epoll waits, fanotify device/policy setup, `FUTEX_CMP_REQUEUE` invalid-case
+  behavior, and `futex_wait05` cleanup timeout. **Verified:** `timeout 300s
+  cargo xtask oscomp qemu --target rv64-qemu --data target/oscomp/testdata
+  --submit target/oscomp/submit --suite ltp-batch:event`; `python3
+  tools/oscomp-judge.py target/oscomp/os_serial_out_rv.txt
+  target/oscomp/testdata`; `cargo xtask fault-decode --target rv64-qemu
+  --serial target/oscomp/os_serial_out_rv.txt --all --brief` reported no trap
+  lines. **Next step:** focus event work on epoll nested/timing semantics and
+  futex requeue/wait cleanup. **Blocker:** broad event still exceeds the 300s
+  ladder, but focused tails now cover the inotify/select/userfaultfd suffix.
+
+- 2026-05-30 **Ran full LTP sched coverage from the full image.** The
+  non-Docker direct QEMU path for `ltp-batch:sched` completed the batch,
+  userspace exited cleanly, and the local judge scored `112/219`. The run
+  started and completed 62 cases; the serial snapshot is
+  `target/oscomp/os_serial_out_ltp_sched_full_20260530_180055.txt`. The fresh
+  run updates several stale unsupported notes: `getcpu01`, `ioprio_get01`,
+  `sched_get_priority_*02`, `sched_getscheduler02`, `sched_rr_get_interval02`,
+  `sched_setparam01`, and `sched_yield01` now pass. Remaining blockers are
+  priority/nice credential semantics, ioprio setters, `PR_SET_NAME` procfs
+  `task/<tid>/comm`, timer slack `prctl`, Linux scheduler priority ranges for
+  FIFO/RR/BATCH/IDLE/DEADLINE, nonzero `sched_setparam` preservation, invalid
+  pid errno ordering, `setpriority` permission semantics, and `RLIMIT_CPU`
+  signal delivery. **Verified:** `timeout 300s cargo xtask oscomp qemu
+  --target rv64-qemu --data target/oscomp/testdata --submit
+  target/oscomp/submit --suite ltp-batch:sched`; `python3
+  tools/oscomp-judge.py target/oscomp/os_serial_out_rv.txt
+  target/oscomp/testdata`. **Next step:** continue breadth with `event` or
+  `time`, or focus scheduler work on ioprio/setpriority and Linux scheduler
+  priority range semantics. **Blocker:** no broad-run timeout for sched; the
+  remaining red cases are semantic/policy gaps or harness setup such as missing
+  `ltp_setpriority01` user and test-device acquisition.
+
+- 2026-05-30 **Fixed the IPC `msgsnd02` panic and reran the full-image IPC
+  prefix.** The first direct QEMU run for `ltp-batch:ipc` reproduced the known
+  `msgsnd02` kernel panic: `sys_msgsnd` allocated `vec![0; msgsz]` before
+  validating an oversized user `msgsz`, so the LTP negative-size case triggered
+  a Rust `capacity overflow` at `crates/tx-shims/src/linux_syscall/ipc.rs:833`.
+  The syscall shim now checks `msgsz` against the IPC namespace `MSGMAX` before
+  allocation and returns `EINVAL` for oversized messages. After rebuilding and
+  resubmitting the RV64 OSComp kernel, `msgsnd02` passed `6/6`; the rerun
+  reached `211/292` before the 300s outer timeout killed QEMU while `semop05`
+  was active. The fresh serial snapshot is
+  `target/oscomp/os_serial_out_ltp_ipc_partial_20260530_174700.txt`; the
+  pre-fix panic snapshot is
+  `target/oscomp/os_serial_out_ltp_ipc_panic_20260530_173905.txt`. Remaining
+  IPC blockers are mqueue notification/default/timeout semantics, SysV message
+  metadata and selector semantics, SysV semaphore info/counting limits, and
+  missing `/proc/sys/{fs/mqueue,kernel/msgmni,kernel/sem}` projections.
+  **Verified:** `cargo check -p tx-shims`; `cargo xtask build --target
+  rv64-qemu`; `make oscomp-submit-rv64`; `timeout 300s cargo xtask oscomp qemu
+  --target rv64-qemu --data target/oscomp/testdata --submit
+  target/oscomp/submit --suite ltp-batch:ipc`; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv.txt target/oscomp/testdata`. **Next step:**
+  continue breadth with `sched`, `event`, or `time`, or focus IPC fixes on
+  mqueue blocking/notification and SysV metadata projection. **Blocker:** broad
+  IPC still exceeds the 300s ladder before shared-memory tail coverage.
+
+- 2026-05-30 **Ran full LTP signal coverage from the full image.** The
+  non-Docker direct QEMU path for `ltp-batch:signal` completed the batch,
+  userspace exited cleanly, and the local judge scored `589/615`. The run
+  started and completed 47 cases; the serial snapshot is
+  `target/oscomp/os_serial_out_ltp_signal_full_20260530_173124.txt`. The fresh
+  run confirms the signal path is substantially healthier than the stale
+  timeout table suggested: `pause01..03`, `rt_sigaction01..03`,
+  `rt_sigsuspend01`, `sigaction02`, `sigaltstack01/02`, `signal01..04`,
+  `signalfd*`, and `tkill01` pass. Remaining blockers are concentrated in
+  mask/pending semantics (`rt_sigprocmask01`, `sigprocmask01`,
+  `sigpending02`, `sigsuspend01`), `SA_RESETHAND|SA_SIGINFO` preservation,
+  `kill`/`tgkill`/`tkill` errno and cleanup behavior, unsupported
+  `rt_sigqueueinfo`, and two missing image binaries (`rt_sigtimedwait01`,
+  `rt_tgsigqueueinfo01`). **Verified:** `timeout 300s cargo xtask oscomp qemu
+  --target rv64-qemu --data target/oscomp/testdata --submit
+  target/oscomp/submit --suite ltp-batch:signal`; `python3
+  tools/oscomp-judge.py target/oscomp/os_serial_out_rv.txt
+  target/oscomp/testdata`. **Next step:** continue breadth with `ipc`,
+  `sched`, `event`, or `time`, or focus signal fixes on mask/pending semantics
+  and invalid tgid/tid errno ordering. **Blocker:** no broad-run timeout for
+  signal; the remaining red cases are semantic or unsupported-surface gaps.
+
+- 2026-05-30 **Ran partial LTP cred coverage from the full image.** The
+  non-Docker direct QEMU path for `ltp-batch:cred` reached `20/97` before the
+  300s outer timeout killed QEMU while `setfsuid04` was active. The run started
+  72 cases and completed 71; the serial snapshot is
+  `target/oscomp/os_serial_out_ltp_cred_partial_20260530_172200.txt`. The fresh
+  run confirms basic `get*id`, `getres*id`, and `setegid01` happy paths still
+  pass. Remaining clusters are deliberate unsupported keyring/capability
+  surfaces (`add_key`, `request_key`, `keyctl`, `capget`, `capset`), thin
+  `/proc/self/status` credential reporting, `getgroups` membership semantics,
+  and missing `setfsuid`/`setfsgid`. **Verified:** `timeout 300s cargo xtask
+  oscomp qemu --target rv64-qemu --data target/oscomp/testdata --submit
+  target/oscomp/submit --suite ltp-batch:cred`; `python3
+  tools/oscomp-judge.py target/oscomp/os_serial_out_rv.txt
+  target/oscomp/testdata`. **Next step:** continue breadth with `signal`,
+  `ipc`, `sched`, `event`, or `time`, or focus credential fixes on
+  `/proc/self/status`, `getgroups`, and `setfsuid`/`setfsgid`. **Blocker:**
+  broad cred still exceeds the 300s ladder and includes policy surfaces that
+  should stay out of the mechanical lane unless explicitly scoped.
+
+- 2026-05-30 **Ran partial LTP process coverage from the full image.** The
+  non-Docker direct QEMU path for `ltp-batch:process` reached `45/60` before
+  the 300s outer timeout killed QEMU while `fork11` was active. The run started
+  39 cases and completed 38; the serial snapshot is
+  `target/oscomp/os_serial_out_ltp_process_partial_20260530_171501.txt`. The
+  fresh run confirms basic clone, exec, exit, and fork happy paths still pass,
+  including `execve05` and `fork04` which were previously stale failures in the
+  process tracking table. Remaining early blockers cluster around clone edge
+  cases, execve errno/permission ordering, unsupported `execveat`, cgroup/proc
+  setup for clone3/cgroup cases, and one missing image binary (`fork06`).
+  **Verified:** `timeout 300s cargo xtask oscomp qemu --target rv64-qemu
+  --data target/oscomp/testdata --submit target/oscomp/submit --suite
+  ltp-batch:process`; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv.txt target/oscomp/testdata`. **Next step:**
+  continue breadth with `cred`, `signal`, `ipc`, `sched`, `event`, or `time`,
+  or focus process fixes on `execve*` errno ordering and clone flag semantics.
+  **Blocker:** broad process still exceeds the 300s ladder before reaching the
+  later pidfd/wait cases.
+
+- 2026-05-30 **Ran partial LTP vm coverage from the full image.** The
+  non-Docker direct QEMU path for `ltp-batch:vm` reached `83/210` before the
+  300s outer timeout killed QEMU while `munlockall01` was active. The run
+  completed 87 of 88 started cases; the serial snapshot is
+  `target/oscomp/os_serial_out_ltp_vm_partial_20260530_170854.txt`. The fresh
+  run confirms brk, basic mlock/mlockall, many mmap, mremap, msync, and munlock
+  happy paths still execute. Remaining clusters are unsupported
+  NUMA/mempolicy, partial `madvise`, mincore/mlock residency accounting,
+  mmap/mprotect SIGSEGV semantics, and `msync`/`munlock` errno validation.
+  **Verified:** `timeout 300s cargo xtask oscomp qemu --target rv64-qemu
+  --data target/oscomp/testdata --submit target/oscomp/submit --suite
+  ltp-batch:vm`; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv.txt target/oscomp/testdata`. **Next step:**
+  run `process` for breadth or focus VM on residency/accounting and
+  mmap/mprotect fault semantics. **Blocker:** broad VM still exceeds the 300s
+  ladder near the end of the memory-locking section.
+
+- 2026-05-29 **Ran partial LTP vfs coverage from the full image.** The
+  non-Docker direct QEMU path for `ltp-batch:vfs` reached `326/375` before the
+  300s outer timeout killed QEMU while `fchown03` was active. The run completed
+  50 of 51 started cases; the serial snapshot is
+  `target/oscomp/os_serial_out_ltp_vfs_partial_20260529_205847.txt`. The fresh
+  run confirms the early `access01..04` cases now pass on the full image.
+  Remaining early VFS failures cluster around bad-pointer versus long-path errno
+  ordering, symlink alias cleanup, chmod/chown mode and ownership metadata,
+  setgid directory inheritance, and device-backed `test_dev.img` setup.
+  **Verified:** `timeout 300s cargo xtask oscomp qemu --target rv64-qemu
+  --data target/oscomp/testdata --submit target/oscomp/submit --suite
+  ltp-batch:vfs`; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv.txt target/oscomp/testdata`. **Next step:**
+  continue VFS from `fchown03` or run `vm` for breadth. **Blocker:** broad VFS
+  still exceeds the 300s ladder in this environment.
+
+- 2026-05-29 **Ran partial LTP fd-io coverage from the full image.** Using the
+  same non-Docker direct QEMU path as smoke, `ltp-batch:fd-io` reached
+  `112/1326` before the 300s outer timeout killed QEMU. The run completed 54
+  of 55 started cases and timed out inside `fcntl14_64`; the serial snapshot is
+  `target/oscomp/os_serial_out_ltp_fdio_partial_20260529_205057.txt`. Early
+  close/dup/fallocate happy paths still pass, while device-backed setup cases
+  fail as `TBROK` on `test_dev.img`, and the main semantic cliff is POSIX
+  record locking (`fcntl11`, `fcntl11_64`, `fcntl14`, `fcntl14_64`) returning
+  `ENOSYS` or wrong lock metadata. **Verified:** `timeout 300s cargo xtask
+  oscomp qemu --target rv64-qemu --data target/oscomp/testdata --submit
+  target/oscomp/submit --suite ltp-batch:fd-io`; `python3
+  tools/oscomp-judge.py target/oscomp/os_serial_out_rv.txt
+  target/oscomp/testdata`. **Next step:** run `vfs` for breadth, or focus on
+  VFS/POSIX record-locking before rerunning fd-io. **Blocker:** broad fd-io
+  still exceeds the 300s ladder once it reaches record-locking tests.
+
+- 2026-05-29 **Refreshed LTP smoke coverage from a valid full-image run.**
+  Docker was unavailable, so `make oscomp-local-rv64-ltp-batch
+  LTP_BATCH=smoke` could not prepare through the Docker wrapper. A direct QEMU
+  run using the existing `target/oscomp/submit/kernel-rv` and full
+  `target/oscomp/testdata/sdcard-rv.img` completed the 33-case smoke batch and
+  scored `ltp-musl 135/172`; the serial snapshot is
+  `target/oscomp/os_serial_out_ltp_smoke_fullimage_20260529_203658.txt`. The
+  stale slim `target/oscomp/tailor/smoke` image was also checked and rejected as
+  invalid coverage because every case returned `127` / not found. **Verified:**
+  `timeout 300s cargo xtask oscomp qemu --target rv64-qemu --data
+  target/oscomp/testdata --submit target/oscomp/submit --suite
+  ltp-batch:smoke`; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv.txt target/oscomp/testdata`. **Next step:**
+  run `fd-io` or `vfs` from the full image, or fix the Docker/slim-image
+  workflow before using the Make wrapper for fresh tailored runs. **Blocker:**
+  Docker daemon is not running in this environment.
+
+- 2026-05-29 **Merged namespace implementation into the 66-missing syscall
+  worktree without carrying back the stale syscall table.** The
+  `codex/namespace-implementation` worktree had only dirty changes and was
+  mechanically at 111 true-missing syscalls, so the integration was selective:
+  real UTS namespace state, `NsProxy` netns ownership, `unshare`/`setns`
+  UTS/IP/user/net publication, procfs `/proc/<pid>/ns/uts`, writer-context
+  procfs userns map writes, `setdomainname`, `sysinfo`, limited `prctl`,
+  RISC-V `hwprobe`/`flush_icache`, and the missing scheduler query constants
+  were ported onto the richer 66-missing worktree. The live generated syscall
+  count is now 55 true-missing, 269 defined, 262 dispatched, 7
+  defined-but-undispatched, 0 number mismatches, and 4 local extras.
+  **Verified:** `cargo check -p tx-shims -p tx-subsystems -p tx-fs`; `cargo
+  xtask syscall-status`; `cargo xtask syscall-status --regen`; `cargo xtask
+  syscall sync`. **Next step:** run the focused namespace/easy syscall host
+  tests, then the syscall-status/progress/fmt/diff gates once the remaining
+  dirty integration layers are stable. **Blocker:** broad worktree dirt remains
+  from pre-existing AIO/time/pipe/LTP layers, so this is not yet a clean
+  commit-ready state.
+
+- 2026-05-28 **Strengthened namespace-view docs against Linux namespace
+  requirements.** `NAMESPACE_VIEW_v1` now makes Linux's credential-owned
+  `user_ns` authority explicit, treats any `NsProxy.user_ns` as a Tx mirror
+  rather than a second source of truth, adds `time_ns_for_children`, and spells
+  out Linux-shaped `unshare`/`setns` validation and commit requirements for
+  user, net, mount, pidfd, pid, and time namespaces. `PROCESS_v1` was aligned
+  so namespace context remains a resolve/render lens while capability authority
+  belongs to `Cred` / `SubjectAuthority`. Also repaired two stale external
+  local-note markdown links that were blocking the active docs lint.
+  **Verified:** `cargo xtask lint docs`; `cargo xtask progress validate`; `git
+  diff --check -- docs/design/00_meta-framework/NAMESPACE_VIEW_v1.md
+  docs/design/04_process-signals/PROCESS_v1.md docs/progress/STATUS.md`.
+  **Next step:** reconnect or retire the current `NR_UNSHARE`/`NR_SETNS`
+  dispatch drift, then audit procfs userns map writes against writer
+  credentials instead of target-process credentials. **Blocker:** none for the
+  doc change; implementation remains partial.
+
+- 2026-05-28 **Repaired post-`origin/main` syscall integration drift.**
+  After merging `origin/main`, duplicate syscall ownership and stale helper
+  callsites broke the focused host check. The repair keeps the current
+  stronger implementations as owners: `misc::sys_personality`,
+  `vm::sys_memfd_create`, fd-provider fsnotify init paths, upstream
+  net/namespace process syscalls, and the restored `pselect6` wait body. The
+  stale VFS and pidfd helper callsites were retargeted to the current resolver
+  and fd-provider APIs. A second cleanup pass removed merged unused/stale
+  warning surfaces in procfs, SysV sem notification, `flock` scaffolding, and
+  sleep helpers, and the generated syscall status tables were refreshed.
+  **Verified:** `cargo check -p xtask -p tx-fs -p tx-shims -p tx-subsystems`;
+  `cargo xtask syscall-status --check`; `cargo xtask syscall sync --check`;
+  `cargo xtask lint syscall-status`; `cargo xtask lint unused`; `cargo xtask
+  progress validate`; `cargo fmt --check`; `git diff --check`. **Next step:**
+  isolate the unstaged integration-repair layer from the already-staged feature
+  batch if a cherry-pickable cleanup commit is needed. A temporary layer check
+  showed the full repair cherry-picks cleanly after the staged feature base
+  exists and still passes `cargo check -p xtask -p tx-fs -p tx-shims -p
+  tx-subsystems`. This was materialized on side branch
+  `codex/integration-drift-layered` as feature-base commit `92d5f66e` followed
+  by cherry-pickable repair commit `b68b12d6`; `git cherry-pick --no-commit
+  b68b12d6` onto `92d5f66e` plus `git diff --check` succeeded. The side branch
+  also passes `cargo xtask syscall-status --check`, `cargo xtask syscall sync
+  --check`, `cargo xtask lint syscall-status`, and `cargo xtask lint unused`. Direct
+  `origin/main` can only accept the small RV64 board unused-lint cleanup
+  without the feature base. **Blocker:** the index still
+  holds a large pre-existing staged feature batch, so blindly staging files
+  would mix unrelated work into the repair commit.
+
 - 2026-05-28 **Closed the next safe early LTP full-run blockers.**
   `abort01` now resolves forked leader TIDs for `tkill()`/`tgkill()` and stops
   re-entering userspace after a syscall-side default signal turns the process
@@ -3670,8 +4208,8 @@
 
 - 2026-05-18 **N69c OSComp netperf IPv4 loopback suite passes.**
   Added the five-test OSComp parity shell coverage under `tools/shell-tests/`
-  plus a suite runner, and recorded the result in
-  [msp/network-n69c-netperf-coverage-result.md](../../msp/network-n69c-netperf-coverage-result.md).
+  plus a suite runner, and recorded the result in the external local note
+  `msp/network-n69c-netperf-coverage-result.md`.
   The covered tests are `UDP_STREAM`, exact-arg `TCP_STREAM`, `UDP_RR`,
   `TCP_RR`, and `TCP_CRR` against `netserver -D -L 127.0.0.1 -p 12865`.
 
@@ -3691,7 +4229,7 @@
   not a performance gate.
 
 - 2026-05-18 **N69c netperf coverage plan captured.**
-  Added [msp/network-n69c-netperf-coverage-plan.md](../../msp/network-n69c-netperf-coverage-plan.md)
+  Added external local note `msp/network-n69c-netperf-coverage-plan.md`
   after auditing the local OSComp musl `netperf_testcode.sh`, existing
   N69b shell-test, current Txv2 socket/syscall support, and `strings` output
   from the local `netperf`/`netserver` binaries. No local netperf C source
