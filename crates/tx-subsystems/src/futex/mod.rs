@@ -982,6 +982,19 @@ fn step_futex_cancel_wait_source(source_id: u64) -> StepOutcome<(), NoProgress> 
     StepOutcome::Done(())
 }
 
+fn exact_waiter_source_exists(source_id: u64) -> bool {
+    EXACT_WAITERS
+        .lock()
+        .as_ref()
+        .map(|table| {
+            table
+                .entries
+                .values()
+                .any(|waiters| waiters.iter().any(|waiter| waiter.source_id == source_id))
+        })
+        .unwrap_or(false)
+}
+
 fn step_futex_pi_cancel_wait_source(source_id: u64) -> StepOutcome<(), NoProgress> {
     let _ = take_requeue_pi_resume(source_id);
     let mut affected_owners = Vec::new();
@@ -1802,6 +1815,21 @@ pub struct FutexWaitOp<'a> {
     pub waiting_source_id: Option<u64>,
 }
 
+impl Drop for FutexWaitOp<'_> {
+    fn drop(&mut self) {
+        if self.woken || !self.waiting {
+            return;
+        }
+        if let Some(source_id) = self.waiting_source_id.take() {
+            let _ = step_futex_cancel_wait_source(source_id);
+        } else {
+            let guard = adapter::step_engine::guard();
+            let _ = step_futex_cancel_wait_in(self.aspace, self.uaddr, self.interest_mask, &guard);
+        }
+        self.waiting = false;
+    }
+}
+
 impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
     type Output = ();
     type Progress = NoProgress;
@@ -1832,7 +1860,16 @@ impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
     fn apply_resume(&mut self, resume: adapter::step_engine::ResumeOutcome) -> Result<(), Errno> {
         match resume {
             adapter::step_engine::ResumeOutcome::Retry => {
+                if let Some(source_id) = self.waiting_source_id {
+                    if exact_waiter_source_exists(source_id) {
+                        let _ = step_futex_cancel_wait_source(source_id);
+                        self.waiting = false;
+                        self.waiting_source_id = None;
+                        return Ok(());
+                    }
+                }
                 self.waiting = false;
+                self.waiting_source_id = None;
                 self.woken = true;
                 Ok(())
             }

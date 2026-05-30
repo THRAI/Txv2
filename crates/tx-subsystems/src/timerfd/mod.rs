@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn create_disarmed_read_returns_eagain() {
         let _g = setup();
-        let cap = timerfd_create(1, TFD_NONBLOCK).expect("create");
+        let cap = timerfd_create(TFD_NONBLOCK).expect("create");
         let mut buf = [0u8; 8];
         match step_timerfd_read(&cap, 0, &mut buf, true) {
             StepOutcome::Err(V3Errno::EAGAIN) => {}
@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn arm_and_past_deadline_reads_one() {
         let _g = setup();
-        let cap = timerfd_create(1, 0).expect("create");
+        let cap = timerfd_create(0).expect("create");
         let now = 1_000_000_000;
         timerfd_settime(
             &cap,
@@ -475,7 +475,7 @@ mod tests {
     #[test]
     fn disarm_zero_it_value() {
         let _g = setup();
-        let cap = timerfd_create(1, 0).expect("create");
+        let cap = timerfd_create(0).expect("create");
         let now = 1_000_000_000;
         timerfd_settime(
             &cap,

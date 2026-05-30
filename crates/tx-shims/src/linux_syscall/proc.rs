@@ -305,6 +305,9 @@ pub(super) fn sys_pidfd_getfd(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
         Some(target) => target,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
+    if target.exit_status().is_some() {
+        return SyscallResult::Error(ESRCH_VALUE);
+    }
     if !pidfd_getfd_permission_allows(ctx, target) {
         return SyscallResult::Error(EPERM_VALUE);
     }

@@ -8,7 +8,7 @@ use crate::linux_syscall::{
     NR_RT_SIGRETURN, NR_SETHOSTNAME, NR_TGKILL, NR_TKILL, NR_UNAME, O_NONBLOCK, O_RDWR, RLIMIT_AS,
     RLIMIT_NOFILE, RLIM_INFINITY,
 };
-use tx_subsystems::process::Pgid;
+use tx_subsystems::process::{step_exit_group, ExitStatus, Pgid};
 
 const E_BADF: i32 = 9;
 const E_INVAL: i32 = 22;
@@ -769,6 +769,31 @@ fn dispatch_pidfd_open_current_process_installs_cloexec_fd() {
 }
 
 #[test]
+fn dispatch_close_pidfd_does_not_enter_vfs_cleanup() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let open = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_PIDFD_OPEN, [proc_cap.pid.0 as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    let fd = match open {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("pidfd_open expected Return(fd), got {other:?}"),
+    };
+    assert!(proc_cap.fd(fd).is_some());
+
+    let close = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_CLOSE, [fd as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(close, SyscallResult::Return(0));
+    assert!(proc_cap.fd(fd).is_none());
+}
+
+#[test]
 fn dispatch_pidfd_open_nonblock_reports_o_nonblock() {
     let _setup = setup();
     let proc_cap = bootstrap();
@@ -971,6 +996,33 @@ fn dispatch_pidfd_getfd_invalid_inputs_return_linux_errnos() {
         &ctx,
     ));
     assert_eq!(invalid_flags, SyscallResult::Error(E_INVAL));
+}
+
+#[test]
+fn dispatch_pidfd_getfd_exited_target_returns_esrch() {
+    let _setup = setup();
+    let _ops = install_capturing_console();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let open = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_PIDFD_OPEN, [proc_cap.pid.0 as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    let pidfd = match open {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("pidfd_open expected Return(fd), got {other:?}"),
+    };
+
+    step_exit_group(&proc_cap, ExitStatus::Exited(0));
+
+    let getfd = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_PIDFD_GETFD, [pidfd, 3, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(getfd, SyscallResult::Error(E_SRCH));
 }
 
 // -----------------------------------------------------------------
