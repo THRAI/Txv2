@@ -10,6 +10,29 @@ use crate::adapter::step_engine::SpinMutex;
 use tx_substrate::verbs::OperationalCapExt;
 use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
+
+fn read_user_siginfo_prefix(
+    ctx: &SyscallCtx<'_>,
+    info_ptr: u64,
+    expected_sig: u32,
+) -> Result<SigInfo, SyscallResult> {
+    let mut bytes = [0u8; 128];
+    bootstrap_copy_from_user(&ctx.aspace, &mut bytes, info_ptr)
+        .map_err(SyscallResult::error_from)?;
+
+    let si_signo = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    if si_signo != expected_sig {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+
+    Ok(SigInfo {
+        si_signo,
+        si_code: i32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        si_pid: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+        si_uid: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+        si_value: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+    })
+}
 use tx_subsystems::signal::{KillOutcome, SignalTarget};
 use tx_subsystems::thread_runtime::execution::step_sigprocmask;
 use tx_subsystems::vfs::structure::{OpenFile, OpenFileFlags};
@@ -599,16 +622,6 @@ pub(super) fn sys_pidfd_send_signal(args: [u64; 6], ctx: &SyscallCtx) -> Syscall
     if sig > 64 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    if info_ptr != 0 {
-        let mut signo_bytes = [0u8; 4];
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut signo_bytes, info_ptr) {
-            return SyscallResult::error_from(errno);
-        }
-        let info_signo = u32::from_le_bytes(signo_bytes);
-        if info_signo != sig {
-            return SyscallResult::Error(EINVAL_VALUE);
-        }
-    }
     if sig == 0 {
         return SyscallResult::Return(0);
     }
@@ -616,13 +629,20 @@ pub(super) fn sys_pidfd_send_signal(args: [u64; 6], ctx: &SyscallCtx) -> Syscall
         Some(signum) => signum,
         None => return SyscallResult::Error(EINVAL_VALUE),
     };
-    let siginfo = Some(SigInfo {
-        si_signo: signum.raw() as u32,
-        si_code: SI_USER,
-        si_pid: ctx.process.pid.0,
-        si_uid: 0,
-        si_value: 0,
-    });
+    let siginfo = if info_ptr != 0 {
+        match read_user_siginfo_prefix(ctx, info_ptr, sig) {
+            Ok(info) => Some(info),
+            Err(result) => return result,
+        }
+    } else {
+        Some(SigInfo {
+            si_signo: signum.raw() as u32,
+            si_code: SI_USER,
+            si_pid: ctx.process.pid.0,
+            si_uid: 0,
+            si_value: 0,
+        })
+    };
 
     dispatch_errno(
         tx_subsystems::signal::script_deliver_signal(

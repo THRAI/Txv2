@@ -1130,7 +1130,7 @@ fn thread_future_siginfo_to_user_abi_matches_musl_siginfo_prefix() {
         si_code: tx_subsystems::signal::SI_USER,
         si_pid: 123,
         si_uid: 456,
-        si_value: 0,
+        si_value: 777,
     };
 
     let abi = siginfo_to_user_abi(info);
@@ -1143,5 +1143,9 @@ fn thread_future_siginfo_to_user_abi_matches_musl_siginfo_prefix() {
     assert_eq!(
         u32::from_le_bytes(abi.bytes[20..24].try_into().unwrap()),
         456
+    );
+    assert_eq!(
+        u64::from_le_bytes(abi.bytes[24..32].try_into().unwrap()),
+        777
     );
 }

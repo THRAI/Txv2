@@ -953,6 +953,7 @@ fn siginfo_to_user_abi(info: tx_subsystems::signal::SigInfo) -> tx_hal::UserSigI
     abi.bytes[8..12].copy_from_slice(&info.si_code.to_ne_bytes());
     abi.bytes[16..20].copy_from_slice(&info.si_pid.to_ne_bytes());
     abi.bytes[20..24].copy_from_slice(&info.si_uid.to_ne_bytes());
+    abi.bytes[24..32].copy_from_slice(&info.si_value.to_ne_bytes());
     abi
 }
 
