@@ -19,7 +19,7 @@ HOST_CARGO_TARGET_DIR ?= target/host-cargo
 OSCOMP_KERNEL_PROFILE ?= --release
 
 .PHONY: docker-help docker-build docker-shell docker-ci docker-check docker-ci-slow \
-	all all-both setup-cargo-config \
+	all all-rv all-both setup-cargo-config \
 	docker-build-rv64 docker-build-la64 docker-image-cpio-rv64 docker-image-cpio-la64 \
 	docker-image-ext4-rv64 docker-image-ext4-la64 \
 	docker-qemu-rv64-smoke docker-qemu-rv64-busybox docker-qemu-la64-busybox \
@@ -60,14 +60,16 @@ docker-help:
 	@echo "  make docker-busybox-la64"
 	@echo "  make docker-oscomp-prepare docker-oscomp-submit docker-oscomp-run"
 
-# Default OSComp entry point for the current submit lane. Keep it RV-only
-# while LA64 is unstable under the long default LTP run. Use `make all-both`
-# when a dual-arch submit tree is needed.
+# Default OSComp entry point for submit builds. Match the official autotest
+# expectation by preparing both RV64 and LA64 kernels from `make all`.
+# Use `make all-rv` to keep the historical single-arch lane locally.
 setup-cargo-config:
 	mkdir -p .cargo
 	cp cargo/config.toml .cargo/config.toml
 
-all: setup-cargo-config
+all: all-both
+
+all-rv: setup-cargo-config
 	cargo xtask build --target $(OSCOMP_TARGET) $(OSCOMP_KERNEL_PROFILE)
 	cargo xtask oscomp submit --target $(OSCOMP_TARGET) --submit . $(OSCOMP_KERNEL_PROFILE)
 
