@@ -8,10 +8,48 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | Item | Value | Note |
 | --- | ---: | --- |
 | cases | 103 | from `make ltp-batch-cases LTP_BATCH=vm` |
-| latest local run | mremap missing old range errno | 2026-05-26 targeted RV/LA reruns for `mremap03` |
+| latest local run | focused full-image tail | 2026-05-30 direct QEMU tail covered `munlockall01..set_mempolicy04` |
 | cumulative scored | `113/253` | recorded rows in this document |
+| 2026-05-30 full-image partial run | `83/210` | completed 87/88 started cases; serial `target/oscomp/os_serial_out_ltp_vm_partial_20260530_170854.txt` |
+| 2026-05-30 full-image tail run | `13/22` | completed all 15 selected suffix cases; serial `target/oscomp/os_serial_out_ltp_vm_tail_20260530_200054.txt` |
 | reached case | `set_mempolicy04` | batch completed |
 | logs | `target/oscomp/ltp-progress/vm` | per-group stdout and serial snapshots |
+
+2026-05-30 focused full-image tail command:
+
+```bash
+timeout 180s cargo xtask oscomp qemu --target rv64-qemu \
+  --data target/oscomp/testdata --submit target/oscomp/submit \
+  --suite ltp-musl:munlockall01+munmap01+munmap02+munmap03+pkey01+process_madvise01+remap_file_pages01+remap_file_pages02+sbrk01+sbrk02+sbrk03+set_mempolicy01+set_mempolicy02+set_mempolicy03+set_mempolicy04
+python3 tools/oscomp-judge.py \
+  target/oscomp/os_serial_out_ltp_vm_tail_20260530_200054.txt \
+  target/oscomp/testdata
+cargo xtask fault-decode --target rv64-qemu \
+  --serial target/oscomp/os_serial_out_ltp_vm_tail_20260530_200054.txt \
+  --all --brief
+```
+
+The focused suffix completed without kernel trap lines. It confirms
+`munlockall01`, `munmap03`, `remap_file_pages01`, `remap_file_pages02`, and
+`sbrk02` pass. `munmap01` and `munmap02` exit 139 without a kernel trap marker,
+so they need userspace-visible fault/exit triage. Remaining tail skips are
+expected pkey, process_madvise, sbrk03 arch filtering, and libnuma-gated
+`set_mempolicy*`; `sbrk01` still reports `ENOMEM` on grow/shrink subcases.
+
+2026-05-30 direct full-image run command:
+
+```bash
+timeout 300s cargo xtask oscomp qemu --target rv64-qemu \
+  --data target/oscomp/testdata --submit target/oscomp/submit \
+  --suite ltp-batch:vm
+python3 tools/oscomp-judge.py target/oscomp/os_serial_out_rv.txt target/oscomp/testdata
+```
+
+The fresh partial run confirms the brk, basic mlock/mlockall, many mmap,
+mremap, msync, and munlock happy paths still execute on the full image. The
+main remaining clusters are unsupported NUMA/mempolicy cases, partial `madvise`
+coverage, mincore/mlock residency accounting, mmap/mprotect SIGSEGV semantics,
+and `msync`/`munlock` errno validation.
 
 ## 2026-05-26 failure notes
 
@@ -138,7 +176,7 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `munmap03` | 3/3 | pass | EINVAL observed |
 | `pkey01` | 0/1 | skip | TCONF: syscall(289) __NR_pkey_alloc not supported on your arch |
 | `process_madvise01` | 0/1 | skip | TCONF: Aborting due to unsuitable kernel config, see above! |
-| `remap_file_pages01` | 0/15 | fail | TFAIL: remap_file_pages01.c:174: remap_file_pages error for page=0x402000, remap_sz=8192, window_pages=14: errno=ENOSYS(38): Function not implemented |
+| `remap_file_pages01` | 2/2 | pass | 2026-05-30 focused tail: current image reports the two scored compatibility checks passing |
 | `remap_file_pages02` | 4/4 | pass | invalid argument cases return `EINVAL`; all-zero probe remains `ENOSYS`; RV/LA pass |
 | `sbrk01` | 1/3 | partial | TFAIL: sbrk(8192) failed: ENOMEM (12) |
 | `sbrk02` | 1/1 | pass |  |

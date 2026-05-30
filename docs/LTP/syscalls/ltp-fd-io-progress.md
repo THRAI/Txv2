@@ -9,10 +9,27 @@ Scoring note: local scoring follows the official `judge_ltp-musl.py` where possi
 | Scope | Score | Note |
 | --- | ---: | --- |
 | fd-io accumulated local score | `852/1208` | Stitched from segmented runs; not a single official full-batch run |
+| 2026-05-29 full-image partial run | `112/1326` | 300s direct QEMU run from `target/oscomp/testdata`; completed 54/55 started cases, timed out in `fcntl14_64`; serial `target/oscomp/os_serial_out_ltp_fdio_partial_20260529_205057.txt` |
 
 Recorded through the end of the current fd-io case list. Latest changes included targeted positioned-I/O fixes, the conservative `splice` fix that raised `splice07` to `217/377`, legacy LTP scoring fallback for old no-summary cases, `fallocate` support, validation-only `readahead`/`sync_file_range`, `sendfile03/04/05` errno validation, refreshed `posix_fadvise02/04` scores, a `/bin/cat` shim that unblocks `posix_fadvise01/03`, page-backed `O_APPEND` handling for write/pwrite, basic page-backed `copy_file_range`, and `preadv2/pwritev2` support.
 
 Timeout triage on 2026-05-26 ran the broad-batch skipped cases as single cases. `fcntl15`/`fcntl15_64` and `pipe02` now fail cleanly with checkpoint timeouts; `fcntl36`/`fcntl36_64` pass as single cases and did not reproduce the broad-batch OFD lock hang.
+
+2026-05-29 direct full-image run command:
+
+```bash
+timeout 300s cargo xtask oscomp qemu --target rv64-qemu \
+  --data target/oscomp/testdata --submit target/oscomp/submit \
+  --suite ltp-batch:fd-io
+python3 tools/oscomp-judge.py target/oscomp/os_serial_out_rv.txt target/oscomp/testdata
+```
+
+The partial run confirms the early fd/dup/fallocate happy paths still execute,
+but the first large score cliff is POSIX record locking: `fcntl11`,
+`fcntl11_64`, `fcntl14`, and the in-progress `fcntl14_64` repeatedly return
+`ENOSYS` for lock operations or publish wrong lock metadata. Device-backed setup
+cases (`close_range01`, `copy_file_range01/02`, `fallocate04/05/06`) still fail
+as `TBROK` while trying to create/acquire `test_dev.img`.
 
 ## Case Table
 

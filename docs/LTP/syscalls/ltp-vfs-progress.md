@@ -8,10 +8,49 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | Item | Value | Note |
 | --- | ---: | --- |
 | cases | 258 | from `make ltp-batch-cases LTP_BATCH=vfs` |
-| latest local run | timeout triage | 2026-05-26 single-case reruns for previously hung VFS cases |
+| latest local run | full-image tail partial | 2026-05-30 direct QEMU run covered `link01..rename05` and timed out at `rename05` |
 | cumulative scored | `1023/1451` | recorded rows in this document |
-| reached case | `utimes01` | batch completed |
+| 2026-05-29 full-image partial run | `326/375` | completed 50/51 started cases; serial `target/oscomp/os_serial_out_ltp_vfs_partial_20260529_205847.txt` |
+| 2026-05-30 full-image tail run | `609/719` | started 78 cases, completed 77; serial `target/oscomp/os_serial_out_ltp_vfs_tail_20260530_194342.txt` |
+| reached case | `rename05` | killed by 300s outer timeout while active |
 | logs | `target/oscomp/ltp-progress/vfs` | per-group stdout and serial snapshots |
+
+2026-05-30 direct full-image tail run command:
+
+```bash
+timeout 300s cargo xtask oscomp qemu --target rv64-qemu \
+  --data target/oscomp/testdata --submit target/oscomp/submit \
+  --suite ltp-batch:vfs-tail
+python3 tools/oscomp-judge.py \
+  target/oscomp/os_serial_out_ltp_vfs_tail_20260530_194342.txt \
+  target/oscomp/testdata
+cargo xtask fault-decode --target rv64-qemu \
+  --serial target/oscomp/os_serial_out_ltp_vfs_tail_20260530_194342.txt \
+  --all --brief
+```
+
+The tail run did not emit kernel trap lines. It confirms the later VFS suffix is
+mostly blocked by known semantic/environment clusters rather than a fresh
+panic: xattr support/user_xattr filtering, symlink and `O_NOFOLLOW` semantics,
+hard-link link-count accounting, bad-user-pointer errno ordering, setgid group
+inheritance, unprivileged `O_NOATIME`, open/openat2 edge cases, old
+`readdir(2)` being unavailable on RV64, and `test_dev.img` acquisition for
+device-backed rename/link/mknod paths.
+
+2026-05-29 direct full-image run command:
+
+```bash
+timeout 300s cargo xtask oscomp qemu --target rv64-qemu \
+  --data target/oscomp/testdata --submit target/oscomp/submit \
+  --suite ltp-batch:vfs
+python3 tools/oscomp-judge.py target/oscomp/os_serial_out_rv.txt target/oscomp/testdata
+```
+
+The fresh partial run confirms the `access01..04` fixes now pass on the full
+image. Remaining early VFS failures cluster around bad-pointer versus
+long-path errno ordering, symlink alias cleanup, chmod/chown mode and ownership
+metadata, setgid directory inheritance, and device-backed setup cases that need
+`test_dev.img`.
 
 ## 2026-05-26 failure notes
 

@@ -8,10 +8,41 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | Item | Value | Note |
 | --- | ---: | --- |
 | cases | 67 | from `make ltp-batch-cases LTP_BATCH=ipc` |
-| latest local run | timeout triage | 2026-05-26 single-case reruns for previously hung IPC cases |
-| cumulative scored | `245/343` | recorded rows in this document |
-| reached case | `shmget06` | batch completed |
+| latest local run | full-image IPC prefix | 2026-05-30 direct QEMU rerun scored `211/292` after `msgsnd02` panic guard |
+| cumulative scored | `211/292` | latest full-image prefix score; older per-case rows reach later shm cases |
+| reached case | `semop05` | latest broad run stopped by 300s outer timeout; older per-case rows reach `shmget06` |
 | logs | `target/oscomp/ltp-progress/ipc`, `target/oscomp/ltp-timeout-triage/ipc` | per-group stdout, single-case timeout triage logs, and serial snapshots |
+
+## 2026-05-30 full-image prefix rerun
+
+Direct non-Docker QEMU coverage with the full image initially reproduced the
+known `msgsnd02` kernel panic at
+`crates/tx-shims/src/linux_syscall/ipc.rs:833` (`capacity overflow`) when the
+syscall shim allocated before validating an oversized `msgsz`. A syscall-boundary
+`MSGMAX` guard was added, the RV64 OSComp kernel was rebuilt and resubmitted,
+and the rerun passed `msgsnd02` (`6/6`) instead of panicking. The rerun reached
+`211/292` before the 300s outer timeout stopped while `semop05` was active.
+The run started 44 cases and completed 43; serial snapshot:
+`target/oscomp/os_serial_out_ltp_ipc_partial_20260530_174700.txt`.
+
+- Passing clusters in the fresh prefix: `msgget01/02`, `msgrcv08`,
+  `msgsnd02`, `semctl02..07`, `semget01/02`, and `semop01/03/04`.
+- Remaining mqueue failures are notification registration, queue default/cap
+  mismatches, missing `/proc/sys/fs/mqueue/queues_max`, permission checks, and
+  timeout/interruption cases returning `EAGAIN` instead of `EINVAL`,
+  `ETIMEDOUT`, or `EINTR`.
+- SysV message queue gaps are mostly metadata and selector semantics:
+  `msg_lspid`/`msg_lrpid`/time fields, `MSG_STAT`/`MSG_INFO`, `MSG_EXCEPT`,
+  `MSG_COPY`, and `/proc/sys/kernel/msgmni` projection.
+- Semaphore gaps are metadata/accounting and limit details: sleeping-process
+  counts, `SEM_INFO`, `SEM_STAT`, `semop02` `E2BIG`/unexpected-success cases,
+  and `/proc/sys/kernel/sem`.
+- Verified with:
+  `cargo check -p tx-shims`;
+  `cargo xtask build --target rv64-qemu`;
+  `make oscomp-submit-rv64`;
+  `timeout 300s cargo xtask oscomp qemu --target rv64-qemu --data target/oscomp/testdata --submit target/oscomp/submit --suite ltp-batch:ipc`;
+  `python3 tools/oscomp-judge.py target/oscomp/os_serial_out_rv.txt target/oscomp/testdata`.
 
 ## 2026-05-26 failure notes
 
@@ -53,7 +84,7 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `msgrcv07` | 11/13 | partial | single-case rerun exits cleanly; `MSG_EXCEPT`/`MSG_COPY` cases mismatch |
 | `msgrcv08` | 1/1 | pass |  |
 | `msgsnd01` | 1/3 | partial | TFAIL: PID of last msgsnd(2) mismatched |
-| `msgsnd02` | 0/0 | panic | single-case rerun panics after five TPASS lines: `capacity overflow` in alloc raw_vec |
+| `msgsnd02` | 6/6 | pass | 2026-05-30 full-image rerun passes after syscall shim validates oversized `msgsz` before allocation |
 | `msgsnd05` | 0/0 | hang | single-case rerun still host-times out after `msgsnd(..., 0)` returns `EAGAIN` instead of expected `EINTR` |
 | `msgsnd06` | 0/0 | hang | single-case rerun still host-times out after `msgsnd(..., 0)` returns `EAGAIN` instead of expected `EIDRM` |
 | `msgstress01` | 0/1 | fail | TBROK: Failed to open FILE '/proc/sys/kernel/msgmni' for reading: ENOENT (2) |

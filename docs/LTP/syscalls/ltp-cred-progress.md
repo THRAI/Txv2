@@ -8,10 +8,33 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | Item | Value | Note |
 | --- | ---: | --- |
 | cases | 131 | from `make ltp-batch-cases LTP_BATCH=cred` |
-| latest local run | `[ltp-musl] 0/1` | 2026-05-26 latest 5-case group |
+| latest local run | full-image cred prefix | 2026-05-30 direct QEMU run scored `20/97` |
 | cumulative scored | `125/290` | recorded rows in this document |
-| reached case | `setuid04_16` | batch completed |
+| reached case | `setfsuid04` | latest broad run stopped by 300s outer timeout; older per-case rows reach `setuid04_16` |
 | logs | `target/oscomp/ltp-progress/cred` | per-group stdout and serial snapshots |
+
+## 2026-05-30 full-image prefix run
+
+Direct non-Docker QEMU coverage with the full image reached `20/97` before the
+300s outer timeout stopped the batch while `setfsuid04` was active. The run
+started 72 cases and completed 71; serial snapshot:
+`target/oscomp/os_serial_out_ltp_cred_partial_20260530_172200.txt`.
+
+- Passing prefix clusters: basic `get*id`, `getres*id`, and `setegid01` happy
+  paths still work.
+- Deliberate unsupported policy surfaces dominate early failures:
+  `add_key`/`request_key`/`keyctl` and `capget`/`capset` report unsupported
+  syscall TCONF in this full-image run.
+- Procfs credential reporting is still too thin for LTP: `getegid01`,
+  `geteuid02`, and related cases parse `/proc/self/status` but find zero
+  matching credential conversions.
+- Credential mutation gaps remain: `getgroups01` partially works but misses
+  gid `0`, `setegid02` incorrectly allows switching to `65534`, and
+  `setfsuid`/`setfsgid` still return `ENOSYS`.
+- Verified with:
+  `timeout 300s cargo xtask oscomp qemu --target rv64-qemu --data target/oscomp/testdata --submit target/oscomp/submit --suite ltp-batch:cred`
+  and
+  `python3 tools/oscomp-judge.py target/oscomp/os_serial_out_rv.txt target/oscomp/testdata`.
 
 ## 2026-05-26 failure notes
 
@@ -28,14 +51,14 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `add_key03` | 0/1 | skip | TCONF: syscall(217) __NR_add_key not supported on your arch |
 | `add_key04` | 0/1 | skip | TCONF: syscall(219) __NR_keyctl not supported on your arch |
 | `add_key05` | 0/1 | skip | TCONF: Couldn't find 'groupdel' in $PATH |
-| `capget01` | 6/6 | pass |  |
-| `capget02` | 0/1 | fail | TBROK: Failed to open FILE '/proc/sys/kernel/pid_max' for reading: ENOENT (2) |
-| `capset01` | 3/3 | pass |  |
-| `capset02` | 0/1 | fail | TBROK: capset data failed: EPERM (1) |
-| `capset03` | 0/1 | fail | TBROK: capset data failed: EPERM (1) |
-| `capset04` | 1/1 | pass |  |
-| `getegid01` | 0/1 | fail | TBROK: Failed to open FILE '/proc/self/status' for reading: ENOENT (2) |
-| `getegid01_16` | 0/1 | fail | TBROK: Failed to open FILE '/proc/self/status' for reading: ENOENT (2) |
+| `capget01` | 0/1 | skip | 2026-05-30 full-image prefix: TCONF `__NR_capget` unsupported |
+| `capget02` | 0/1 | skip | 2026-05-30 full-image prefix: TCONF `__NR_capget` unsupported |
+| `capset01` | 0/1 | skip | 2026-05-30 full-image prefix: TCONF `__NR_capget` unsupported |
+| `capset02` | 0/1 | skip | 2026-05-30 full-image prefix: TCONF `__NR_capset` unsupported |
+| `capset03` | 0/1 | skip | 2026-05-30 full-image prefix: TCONF `__NR_capset` unsupported |
+| `capset04` | 0/1 | skip | 2026-05-30 full-image prefix: TCONF `__NR_capget` unsupported |
+| `getegid01` | 0/1 | fail | 2026-05-30 full-image prefix: `/proc/self/status` exists but lacks expected credential conversions |
+| `getegid01_16` | 0/1 | fail | 2026-05-30 full-image prefix: `/proc/self/status` exists but lacks expected credential conversions |
 | `getegid02` | 1/1 | pass |  |
 | `getegid02_16` | 1/1 | pass |  |
 | `geteuid01` | 1/1 | pass |  |
@@ -46,7 +69,7 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `getgid01_16` | 0/1 | skip | TCONF: 16-bit version of getgid() is not supported on your platform |
 | `getgid03` | 1/1 | pass |  |
 | `getgid03_16` | 0/1 | skip | TCONF: 16-bit version of getgid() is not supported on your platform |
-| `getgroups01` | 0/4 | fail | TFAIL: getgroups01.c:97: getgroups didn't fail as expected with EINVAL: TEST_ERRNO=ENOSYS(38): Function not implemented |
+| `getgroups01` | 2/4 | partial | 2026-05-30 full-image prefix: bad-size checks pass; full list misses gid `0` |
 | `getgroups01_16` | 0/2 | skip | TCONF: /code/ltp-full-20240524/testcases/kernel/syscalls/getgroups/../utils/compat_16.h:82: 16-bit version of getgroups() is not supported on your platform |
 | `getgroups03` | 0/1 | fail | TFAIL: getgroups03.c:79: getgroups failed: TEST_ERRNO=ENOSYS(38): Function not implemented |
 | `getgroups03_16` | 0/2 | skip | TCONF: /code/ltp-full-20240524/testcases/kernel/syscalls/getgroups/../utils/compat_16.h:77: 16-bit version of setgroups() is not supported on your platform |
