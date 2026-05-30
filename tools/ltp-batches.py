@@ -10,6 +10,7 @@ files live under `target/codex-tmp` so runs stay inside the Txv2 tree.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import subprocess
@@ -19,7 +20,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE_DIR = ROOT / "target" / "codex-tmp"
-CACHE_FILE = CACHE_DIR / "ltp-cases.txt"
+
+
+def cache_file_for(source: str | None) -> Path:
+    if not source:
+        return CACHE_DIR / "ltp-cases.txt"
+    digest = hashlib.sha1(source.encode()).hexdigest()[:12]
+    return CACHE_DIR / f"ltp-cases-{digest}.txt"
 
 
 def is_valid_case_name(case: str) -> bool:
@@ -255,26 +262,31 @@ def case_prefix(case: str) -> str:
     return case
 
 
-def refresh_cases() -> list[str]:
+def refresh_cases(source: str | None) -> list[str]:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["TMPDIR"] = str(CACHE_DIR)
+    cmd = [sys.executable, "tools/build-slim-sdcard.py"]
+    if source:
+        cmd.extend(["--source", source])
+    cmd.extend(["--list-cases", "ltp-musl"])
     result = subprocess.run(
-        [sys.executable, "tools/build-slim-sdcard.py", "--list-cases", "ltp-musl"],
+        cmd,
         cwd=ROOT,
         env=env,
         check=True,
         text=True,
         stdout=subprocess.PIPE,
     )
-    CACHE_FILE.write_text(result.stdout)
+    cache_file_for(source).write_text(result.stdout)
     return parse_cases(result.stdout.splitlines())
 
 
-def load_cases(refresh: bool) -> list[str]:
-    if refresh or not CACHE_FILE.exists():
-        return refresh_cases()
-    return parse_cases(CACHE_FILE.read_text().splitlines())
+def load_cases(refresh: bool, source: str | None) -> list[str]:
+    cache_file = cache_file_for(source)
+    if refresh or not cache_file.exists():
+        return refresh_cases(source)
+    return parse_cases(cache_file.read_text().splitlines())
 
 
 def parse_cases(lines: list[str]) -> list[str]:
@@ -328,9 +340,14 @@ def main() -> int:
     parser.add_argument("--csv", action="store_true", help="print comma-separated cases")
     parser.add_argument("--list", action="store_true", help="list batch names and counts")
     parser.add_argument("--refresh", action="store_true", help="refresh case cache from sdcard")
+    parser.add_argument(
+        "--source",
+        default=os.environ.get("LTP_SDCARD"),
+        help="sdcard image to inspect; defaults to target/oscomp/testdata/sdcard-rv.img",
+    )
     args = parser.parse_args()
 
-    cases = load_cases(args.refresh)
+    cases = load_cases(args.refresh, args.source)
 
     if args.list:
         for name in BATCH_ORDER:

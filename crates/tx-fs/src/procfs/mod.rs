@@ -568,6 +568,9 @@ impl FsOps for Procfs {
             return StepOutcome::err(Errno::ENOENT.into());
         }
         if let Some(pid) = pid_from_dir(parent) {
+            if name == b"mounts" && process_for_procfs_number(pid.0).is_some() {
+                return StepOutcome::done(PROCFS_MOUNTS_ID);
+            }
             if name == b"stat" && process_for_procfs_number(pid.0).is_some() {
                 return StepOutcome::done(pid_stat_id(pid));
             }
@@ -884,6 +887,7 @@ impl FsOps for Procfs {
                 return finish_dots(state_byte, idx, id);
             }
             let files: &[(&[u8], FsObjectId, InodeKind)] = &[
+                (b"mounts", PROCFS_MOUNTS_ID, InodeKind::Regular),
                 (b"stat", pid_stat_id(pid), InodeKind::Regular),
                 (b"cmdline", pid_cmdline_id(pid), InodeKind::Regular),
                 (b"mem", pid_mem_id(pid), InodeKind::Regular),
@@ -1554,6 +1558,14 @@ mod tests {
         }
     }
 
+    fn lookup(fs: &Procfs, parent: FsObjectId, name: &[u8]) -> FsObjectId {
+        let guard = adapter::step_engine::guard();
+        match fs.lookup(parent, name, &guard) {
+            StepOutcome::Done(id) => id,
+            other => panic!("procfs lookup failed for {name:?}: {other:?}"),
+        }
+    }
+
     #[test]
     fn root_readdir_cursor_advances_through_static_entries() {
         tx_test_support::init_host();
@@ -1568,6 +1580,21 @@ mod tests {
         assert_eq!(mounts_entry.name.as_bytes(), b"mounts");
         let (cpuinfo_entry, _) = read_one(&fs, PROCFS_ROOT_ID, cursor);
         assert_eq!(cpuinfo_entry.name.as_bytes(), b"cpuinfo");
+    }
+
+    #[test]
+    fn procfs_pid_readdir_includes_mounts_alias() {
+        let _setup = setup();
+        let fs = Procfs::new();
+        let (dot, cursor) = read_one(&fs, pid_dir_id(Pid(1)), DirCursor::START);
+        assert_eq!(dot.name.as_bytes(), b".");
+        let (dotdot, cursor) = read_one(&fs, pid_dir_id(Pid(1)), cursor);
+        assert_eq!(dotdot.name.as_bytes(), b"..");
+        let (mounts_entry, _) = read_one(&fs, pid_dir_id(Pid(1)), cursor);
+
+        assert_eq!(mounts_entry.name.as_bytes(), b"mounts");
+        assert_eq!(mounts_entry.fs_object_id, PROCFS_MOUNTS_ID);
+        assert_eq!(mounts_entry.kind, InodeKind::Regular);
     }
 
     #[test]

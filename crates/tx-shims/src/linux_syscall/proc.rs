@@ -146,14 +146,73 @@ pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.process.pid.0 as i64)
 }
 
-/// `getcpu(cpup, nodep, unused)`. Linux RV64 generic ABI `__NR_getcpu = 168`.
-///
-/// musl-linked network tools use this as part of their fork/thread
-/// bookkeeping. txKernel's current thread model already assigns a
-/// stable tid when the `ThreadIdentity` is signed, so the syscall can
-/// expose that id without touching process state.
 pub(super) fn sys_gettid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.thread.tid.0 as i64)
+}
+
+/// `getcpu(cpup, nodep, unused)`. Linux RV64 generic ABI `__NR_getcpu = 168`.
+///
+/// v1 has a fixed single-node test/kernel shape. Write CPU 0 and NUMA node 0
+/// when requested; the cache pointer is obsolete on Linux and ignored.
+pub(super) fn sys_getcpu<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let cpu_uaddr = args[0];
+    let node_uaddr = args[1];
+    if cpu_uaddr != 0 {
+        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, cpu_uaddr, 0) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    if node_uaddr != 0 {
+        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, node_uaddr, 0) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    SyscallResult::Return(0)
+}
+
+/// `acct(name)`. Linux RV64 generic ABI `__NR_acct = 89`.
+///
+/// v1 validates Linux-visible path and permission outcomes but does not write
+/// process accounting records. `acct(NULL)` disables the no-op accounting
+/// state; a valid regular file enables it. The real Linux privilege is
+/// `CAP_SYS_PACCT`; Tx has no dedicated capability bit yet, so this slice uses
+/// the existing root/init credential gate instead of adding capability policy.
+pub(super) fn sys_acct(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let name_uaddr = args[0];
+    let cred = ctx.cred();
+    if cred.euid.raw() != 0 {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+
+    if name_uaddr == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    let path = match bootstrap_read_user_cstr(&ctx.aspace, name_uaddr, EXECVE_PATH_MAX) {
+        Ok(path) => path,
+        Err(Errno::ENAMETOOLONG) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(_) => return SyscallResult::Error(EFAULT_VALUE),
+    };
+
+    let walker_cred = ctx.walker_cred();
+    let resolved = match drive_resolve(ctx, ResolveRequest::entity(AT_FDCWD, &path, &walker_cred)) {
+        Ok(resolved) => resolved,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+
+    if dentry_mount_is_read_only(ctx, &resolved.dentry) {
+        return SyscallResult::Error(EROFS_VALUE);
+    }
+
+    match resolved.meta.kind() {
+        InodeKind::Regular => SyscallResult::Return(0),
+        InodeKind::Directory => SyscallResult::Error(EISDIR_VALUE),
+        _ => SyscallResult::Error(EACCES_VALUE),
+    }
+}
+
+fn is_identity_noop_helper(path: &[u8]) -> bool {
+    matches!(path, b"/bin/true" | b"/usr/bin/true" | b"true")
 }
 
 /// `kcmp(pid1, pid2, type, idx1, idx2)` — minimal process comparison
@@ -1128,6 +1187,13 @@ async fn yield_after_reap() {
     tx_reactor::yield_now().await;
 }
 
+fn write_timeval_prefix(buf: &mut [u8; RUSAGE_BYTES], offset: usize, ns: u64) {
+    let sec = (ns / 1_000_000_000) as i64;
+    let usec = ((ns % 1_000_000_000) / 1_000) as i64;
+    buf[offset..offset + 8].copy_from_slice(&sec.to_le_bytes());
+    buf[offset + 8..offset + 16].copy_from_slice(&usec.to_le_bytes());
+}
+
 /// `getppid()` — return the parent's pid, or `0` (`Pid::RESERVED`)
 /// for orphans.
 ///
@@ -1507,7 +1573,21 @@ pub(super) fn sys_getrusage<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     if usage == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
-    let raw = [0u8; RUSAGE_BYTES];
+    let mut raw = [0u8; RUSAGE_BYTES];
+    match who {
+        RUSAGE_SELF => {
+            write_timeval_prefix(&mut raw, 0, ctx.process.user_cpu_time_ns().unwrap_or(0));
+            write_timeval_prefix(&mut raw, 16, ctx.process.system_cpu_time_ns().unwrap_or(0));
+        }
+        RUSAGE_THREAD => {
+            if let Some(payload) = ctx.thread.payload_cap() {
+                write_timeval_prefix(&mut raw, 0, payload.user_cpu_time_ns());
+                write_timeval_prefix(&mut raw, 16, payload.system_cpu_time_ns());
+            }
+        }
+        RUSAGE_CHILDREN => {}
+        _ => unreachable!("validated above"),
+    }
     match bootstrap_copy_to_user(&ctx.aspace, usage, &raw) {
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(errno)),

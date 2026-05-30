@@ -40,3 +40,10 @@ fn exit_status_wait_status_word_terminated_by_sigkill_encodes_0x09() {
     // WTERMSIG extractor.
     assert_eq!(s & 0x7f, 9, "WTERMSIG extractor");
 }
+
+#[test]
+fn exit_status_wait_status_word_core_signal_sets_core_bit() {
+    let s = ExitStatus::Signaled(Signum::SIGABRT).wait_status_word();
+    assert_eq!(s & 0x7f, 6, "WTERMSIG extractor");
+    assert_ne!(s & 0x80, 0, "WCOREDUMP predicate");
+}

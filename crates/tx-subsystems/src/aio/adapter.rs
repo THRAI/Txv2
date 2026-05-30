@@ -13,7 +13,7 @@ pub mod step_engine {
         with_on_behalf_of, AbortSignal, CancelReason, InterestMask, OnBehalfOfAbort, ScriptCtx,
         SubjectContext, SubjectIdentity, WaitSourceId,
     };
-    pub use tx_substrate::wake::WaitSource;
+    pub use tx_substrate::wake::{ActiveWait, WaitSource};
     pub use tx_substrate::zone::{
         reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity, Dead, Entity,
         IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy, OperationalCapExt,
@@ -36,7 +36,7 @@ pub mod wait_routing {
     use alloc::sync::Arc;
 
     pub use tx_reactor::wait::Channel;
-    pub use tx_substrate::wake::WaitSource;
+    pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitSource};
 
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
         let source = tx_substrate::wake::new_source(source_id);

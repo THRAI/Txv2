@@ -14,6 +14,8 @@ struct PendingChildSubmit {
 
 static PENDING_CHILD_SUBMITS: SpinMutex<alloc::vec::Vec<PendingChildSubmit>> =
     SpinMutex::new(alloc::vec::Vec::new());
+static PENDING_AIO_WORKERS: SpinMutex<alloc::vec::Vec<tx_subsystems::aio::AioWorkerFuture>> =
+    SpinMutex::new(alloc::vec::Vec::new());
 
 struct PendingTimerSignalSubmit {
     submit_cpu: CpuId,
@@ -68,6 +70,12 @@ impl<P: TxPlatform> CoreInit<P> {
                 target,
                 sig,
             });
+    }
+
+    pub(crate) fn submit_aio_worker_into_boot_reactor(worker: tx_subsystems::aio::AioWorkerFuture) {
+        // Mirror child-thread submission: syscalls may run while the boot
+        // reactor is polling, so queue and drain between reactor steps.
+        Self::queue_pending_aio_worker(worker);
     }
 
     pub(super) fn register_thread_reactor_task(tid: u32, task: boot_runtime::TaskKey) {
@@ -206,6 +214,10 @@ impl<P: TxPlatform> CoreInit<P> {
         }
     }
 
+    fn queue_pending_aio_worker(worker: tx_subsystems::aio::AioWorkerFuture) {
+        PENDING_AIO_WORKERS.lock().push(worker);
+    }
+
     pub(super) fn drain_pending_child_submits() -> bool {
         let mut submitted_any = false;
         loop {
@@ -263,6 +275,32 @@ impl<P: TxPlatform> CoreInit<P> {
                     },
                     boot_runtime::InitialSchedMeta::kernel()
                         .with_affinity(CpuMask::single(submit_cpu).bits()),
+                    submit_hart,
+                    &mut signal,
+                )
+            });
+            if submitted.is_some() {
+                submitted_any = true;
+            }
+        }
+        submitted_any
+    }
+
+    pub(super) fn drain_pending_aio_workers() -> bool {
+        let mut submitted_any = false;
+        loop {
+            let Some(worker) = PENDING_AIO_WORKERS.lock().pop() else {
+                break;
+            };
+            let submit_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+            let submit_hart = boot_runtime::HartId(submit_cpu.0);
+            let mut signal = SmpRescheduleSignal::<P>::new();
+            let submitted = BOOT_REACTOR.with(|reactor| {
+                reactor.submit_task_with_meta_from_hart(
+                    async move {
+                        let _ = worker.await;
+                    },
+                    boot_runtime::InitialSchedMeta::kernel(),
                     submit_hart,
                     &mut signal,
                 )

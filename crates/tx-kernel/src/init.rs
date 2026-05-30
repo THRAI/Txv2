@@ -1742,8 +1742,9 @@ impl<P: TxPlatform> CoreInit<P> {
         // poll lease is active. sys_clone defers child submission in that
         // case; make those children visible before the AP decides to WFI.
         let submitted_child = Self::drain_pending_child_submits();
+        let submitted_aio = Self::drain_pending_aio_workers();
 
-        submitted_child || step.is_some_and(|step| !step.should_idle())
+        submitted_child || submitted_aio || step.is_some_and(|step| !step.should_idle())
     }
 
     fn step_boot_reactor_once(cpu_id: CpuId) -> Option<boot_runtime::hart_loop::HartLoopStep> {

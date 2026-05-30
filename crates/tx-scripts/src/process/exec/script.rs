@@ -474,9 +474,11 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // worth of program headers (≈ 3.6 KiB), comfortably within one
     // 4 KiB page.
     let read_len = core::cmp::min(file_size as usize, INITIAL_PARSE_READ);
-    if read_len < 64 {
-        // ELF64 header alone is 64 bytes — anything smaller cannot be
-        // a valid binary.
+    if read_len == 0 {
+        // Empty files cannot carry either a shebang line or an ELF
+        // header. Short non-empty files still need to pass through
+        // the script probes below, matching Linux's binfmt_script
+        // ordering before ELF validation.
         return Err(ExecError::NotExecutable);
     }
     let mut header_bytes: Vec<u8> = alloc::vec![0u8; read_len];

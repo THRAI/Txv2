@@ -22,6 +22,12 @@ use crate::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use crate::process::ProcessIdentity;
 use crate::signal::{InterruptSummary, PendingSignalQueue, SignalMask};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CpuAccountingMode {
+    User,
+    Kernel,
+}
+
 /// Thread identifier. TID 0 is reserved.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct Tid(pub u32);
@@ -253,6 +259,10 @@ pub struct ThreadPayload {
     pub robust_list_head: SpinMutex<Option<u64>>,
     /// Length of the robust list in bytes (Linux's `len` parameter).
     pub robust_list_len: SpinMutex<usize>,
+    /// CPU time charged while this thread executes userspace.
+    user_cpu_ns: AtomicU64,
+    /// CPU time charged while this thread executes kernel work.
+    system_cpu_ns: AtomicU64,
 }
 
 impl ThreadPayload {
@@ -277,6 +287,8 @@ impl ThreadPayload {
             clear_child_tid: SpinMutex::new(None),
             robust_list_head: SpinMutex::new(None),
             robust_list_len: SpinMutex::new(0),
+            user_cpu_ns: AtomicU64::new(0),
+            system_cpu_ns: AtomicU64::new(0),
         }
     }
 
@@ -305,6 +317,19 @@ impl ThreadPayload {
     /// Snapshot the reactor task handle, if one has been bound.
     pub fn task(&self) -> Option<TaskKey> {
         *self.task.lock()
+    }
+
+    /// Bind the reactor task handle that owns this thread's userspace run.
+    pub fn bind_task(&self, task: TaskKey) -> Option<TaskKey> {
+        let mut slot = self.task.lock();
+        let previous = *slot;
+        *slot = Some(task);
+        previous
+    }
+
+    /// Clear the bound reactor task handle, returning the previous binding.
+    pub fn clear_task(&self) -> Option<TaskKey> {
+        self.task.lock().take()
     }
 
     /// Snapshot whether this thread should be shown as sleeping in procfs.
@@ -424,6 +449,27 @@ impl ThreadPayload {
     /// Borrow the per-thread pending-signal queue.
     pub fn pending(&self) -> &PendingSignalQueue {
         &self.thread_pending
+    }
+
+    pub fn charge_cpu_time(&self, mode: CpuAccountingMode, delta_ns: u64) {
+        let target = match mode {
+            CpuAccountingMode::User => &self.user_cpu_ns,
+            CpuAccountingMode::Kernel => &self.system_cpu_ns,
+        };
+        target.fetch_add(delta_ns, Ordering::AcqRel);
+    }
+
+    pub fn user_cpu_time_ns(&self) -> u64 {
+        self.user_cpu_ns.load(Ordering::Acquire)
+    }
+
+    pub fn system_cpu_time_ns(&self) -> u64 {
+        self.system_cpu_ns.load(Ordering::Acquire)
+    }
+
+    pub fn cpu_time_ns(&self) -> u64 {
+        self.user_cpu_time_ns()
+            .saturating_add(self.system_cpu_time_ns())
     }
 
     /// Snapshot the current interrupt summary.

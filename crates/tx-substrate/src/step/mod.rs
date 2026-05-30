@@ -59,6 +59,10 @@ pub enum Errno {
     /// `TFD_TIMER_CANCEL_ON_SET` after a realtime clock change.
     /// Linux value: 125.
     ECANCELED,
+    ECONNREFUSED,
+    EDESTADDRREQ,
+    /// Resource deadlock would occur. Used by Linux PI futex lock when
+    /// the caller already owns the futex word. Linux value: 35.
     EDEADLK,
     EDQUOT,
     EEXIST,
@@ -100,8 +104,7 @@ pub enum Errno {
     /// or the request code is not one of the eight TTY ioctls v1
     /// implements. Linux value: 25.
     ENOTTY,
-    /// Operation not supported on this object/filesystem. Used by
-    /// backend-default xattr methods. Linux value: 95.
+    /// Operation not supported on this object/filesystem. Linux value: 95.
     EOPNOTSUPP,
     EPERM,
     /// Broken pipe: write to a pipe with all readers closed. The
@@ -146,6 +149,8 @@ impl Errno {
             Errno::EAFNOSUPPORT => 97,
             Errno::EBUSY => 16,
             Errno::ECANCELED => 125,
+            Errno::ECONNREFUSED => 111,
+            Errno::EDESTADDRREQ => 89,
             Errno::EDEADLK => 35,
             Errno::EDQUOT => 122,
             Errno::EEXIST => 17,

@@ -12,6 +12,7 @@ use tx_fs;
 // silently bypass the gate.
 use tx_subsystems::cred::checks as cred_checks;
 use tx_subsystems::mount::{self};
+use tx_subsystems::net::UnixSocketPath;
 use tx_subsystems::vfs::resolution::state::{FinalSymlinkPolicy, WalkMode};
 
 /// Split a path into `(parent, basename)` for the `O_CREAT`-on-missing
@@ -42,6 +43,22 @@ pub(super) fn split_path(path: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
+fn strip_trailing_slashes_for_mkdir(mut path: &[u8]) -> &[u8] {
+    while path.len() > 1 && path.last() == Some(&b'/') {
+        path = &path[..path.len() - 1];
+    }
+    path
+}
+
+fn split_mkdir_path(path: &[u8]) -> (&[u8], &[u8]) {
+    let path = strip_trailing_slashes_for_mkdir(path);
+    match path.iter().rposition(|b| *b == b'/') {
+        None => (&[], path),
+        Some(0) => (&path[..1], &path[1..]),
+        Some(idx) => (&path[..idx], &path[idx + 1..]),
+    }
+}
+
 fn resolve_entity_from_anchor(
     ctx: &SyscallCtx<'_>,
     rooted_at: &Cap<DEntry>,
@@ -66,6 +83,22 @@ fn resolve_entity_at(
     cred: &Credential,
 ) -> Result<Cap<DEntry>, i32> {
     drive_resolve(ctx, ResolveRequest::entity(dirfd, path, cred)).map(|resolved| resolved.dentry)
+}
+
+fn mount_is_read_only(dentry: &Cap<DEntry>) -> bool {
+    dentry
+        .rnode()
+        .containing_mount_weak()
+        .and_then(|weak| {
+            let guard = step_engine::guard();
+            weak.upgrade(&guard)
+        })
+        .is_some_and(|payload| {
+            payload
+                .options
+                .flags
+                .contains(tx_subsystems::mount::MountFlags::READ_ONLY)
+        })
 }
 
 /// Helper for the `O_CREAT`-on-missing path inside `sys_openat`.
@@ -201,7 +234,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         Err(e) => return SyscallResult::Error(e),
     };
     let cred = ctx.walker_cred();
-    let (parent_path, basename) = split_path(&path);
+    let (parent_path, basename) = split_mkdir_path(&path);
     if basename.is_empty() {
         // Trailing-slash-only basename, e.g. `mkdir("/")` — the FsOps
         // layer rejects an empty `InlineName`. Linux's behaviour for
@@ -483,18 +516,6 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
-    let new_root = match resolve_cwd_for_path(newdirfd, &newpath, ctx) {
-        Ok(d) => d,
-        Err(e) => return SyscallResult::Error(e),
-    };
-    let cred = ctx.walker_cred();
-    // Walk source → target FsObjectId. Linux rejects directories
-    // as `-EPERM`, but a read-only destination mount takes
-    // precedence once the new parent has been resolved.
-    let source_dentry = match walk_from(old_root, &oldpath, &cred) {
-        Ok(d) => d,
-        Err(e) => return SyscallResult::Error(e),
-    };
     let source_fs_ops = match fs_ops_for_dentry(&source_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
@@ -711,53 +732,6 @@ pub(super) fn sys_fallocate(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
         V3::Done(()) | V3::Continue { .. } => SyscallResult::Return(0),
         V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
         V3::Err(v3_errno) => SyscallResult::error_from(v3_errno),
-    }
-}
-
-pub(super) async fn sys_fallocate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    let fd = args[0] as i32;
-    let mode = args[1] as u32;
-    let offset = args[2] as i64;
-    let len = args[3] as i64;
-    if fd < 0 {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
-    if mode != 0 {
-        return SyscallResult::Error(ENOSYS_VALUE);
-    }
-    if offset < 0 || len < 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    let Some(new_size) = (offset as u64).checked_add(len as u64) else {
-        return SyscallResult::Error(EINVAL_VALUE);
-    };
-    let file = match resolve_fd(&ctx.process, fd as u32) {
-        Some(f) => f,
-        None => return SyscallResult::Error(EBADF_VALUE),
-    };
-    let pc = match file.rnode().backing() {
-        RNodeBacking::PageBacked { pc } => pc.clone(),
-        RNodeBacking::Directory => return SyscallResult::Error(EISDIR_VALUE),
-        _ => return SyscallResult::Error(EINVAL_VALUE),
-    };
-    use tx_scripts::drive;
-    use tx_substrate::step::DriveMode;
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let op = tx_subsystems::page_backed::FallocateOp { pc: &pc, new_size };
-    match drive(
-        op,
-        &mut script_ctx,
-        DriveMode::Waiting,
-        mailbox_arc.as_ref(),
-        None,
-        timer_wheel_arc.as_ref(),
-    )
-    .await
-    {
-        Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -1161,7 +1135,12 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         if (flags & MS_RDONLY) != 0 {
             mount_flags = mount_flags.union(mount::MountFlags::READ_ONLY);
         }
-        let mount = match mount::mount_for_root_dentry(&target_dentry) {
+        let mount = ctx
+            .process
+            .mount_namespace_cap()
+            .and_then(|ns| ns.mount_for_root_dentry(&target_dentry))
+            .or_else(|| mount::mount_for_root_dentry(&target_dentry));
+        let mount = match mount {
             Some(mount) => mount,
             None => return SyscallResult::Error(EINVAL_VALUE),
         };
@@ -1239,8 +1218,11 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
             (
                 tmpfs.clone().fs_ops_arc(),
                 tmpfs.fs_page_backing_arc(),
-                tx_subsystems::vfs::FsObjectId::ROOT,
-                tx_subsystems::vfs::InodeMeta::new(tx_subsystems::vfs::InodeKind::Directory, 0o755),
+                tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
+                tx_subsystems::vfs::InodeMeta::new(
+                    tx_subsystems::vfs::InodeKind::Directory,
+                    tx_fs::tmpfs::TMPFS_ROOT_MODE,
+                ),
                 label,
             )
         }
@@ -1490,7 +1472,7 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     let parent_dentry = if parent_path.is_empty() {
         rooted_at.clone()
     } else {
-        match walk_from(rooted_at.clone(), parent_path, &cred) {
+        match resolve_entity_from_anchor(ctx, &rooted_at, parent_path, &cred) {
             Ok(dentry) => dentry,
             Err(errno) => return SyscallResult::Error(errno),
         }

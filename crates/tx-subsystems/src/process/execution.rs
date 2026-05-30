@@ -446,6 +446,7 @@ pub fn step_fork_with_options<P: PmapIf>(
 
     // Leader thread.
     let leader = sign_thread(child_proc.downgrade(), Tid(child_pid.0)).map_err(ForkError::Zone)?;
+    register_tid(leader.tid, leader.clone());
 
     // Wire up payload — child inherits parent credentials, cwd, and
     // a per-slot clone of the parent's fd table. POSIX: fork copies
@@ -1329,6 +1330,8 @@ fn sign_process_payload(
         personality: core::sync::atomic::AtomicU32::new(personality),
         sem_undos: SpinMutex::new(BTreeMap::new()),
         itimer_real: SpinMutex::new(crate::timekeeping::ProcessIntervalTimer::default()),
+        itimer_virtual: SpinMutex::new(crate::timekeeping::ProcessIntervalTimer::default()),
+        itimer_prof: SpinMutex::new(crate::timekeeping::ProcessIntervalTimer::default()),
         posix_timers: SpinMutex::new(crate::timekeeping::ProcessPosixTimers::default()),
         exit_source: exit_wait_point.channel,
         exit_source_id: exit_wait_point.source_id,

@@ -12,6 +12,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod adapter;
 pub mod notification;
 
+pub use notification::TIMERFD_READABLE;
+
 use adapter::step_engine::V3Errno;
 use adapter::step_engine::{
     eagain, guard, sign, ByteOutcome, Cap, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp,

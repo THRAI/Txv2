@@ -1197,6 +1197,11 @@ fn bootstrap_and_topology_steps_register_role_capable_names() {
     }
 
     let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
+    let child_leader = first_thread(&child);
+    match resolve_pid_number_as(child_leader.tid.0 as u64, PidNameKind::Thread) {
+        Some(PidName::Thread(thread)) => assert_eq!(thread.tid, child_leader.tid),
+        other => panic!("fork child leader tid should resolve to thread name, got {other:?}"),
+    }
     step_setpgid(&child, Pgid(child.pid.0)).expect("setpgid");
     match resolve_pid_number_as(child.pgrp_cap().pgid.0 as u64, PidNameKind::ProcessGroup) {
         Some(PidName::ProcessGroup(pgrp)) => assert_eq!(pgrp.pgid, child.pgrp_cap().pgid),

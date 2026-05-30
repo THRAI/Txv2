@@ -33,6 +33,7 @@ use crate::linux_syscall::{
 const E_PERM: i32 = 1;
 const E_BADF: i32 = 9;
 const E_ACCES: i32 = 13;
+const E_FAULT: i32 = 14;
 const E_ROFS: i32 = 30;
 const E_NAMETOOLONG: i32 = 36;
 
@@ -774,6 +775,23 @@ fn dispatch_faccessat_no_read_bit_returns_neg_eacces() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_ACCES));
     drop(path);
+}
+
+/// `access03` passes an invalid user path pointer and expects the
+/// string-copy fault to win over the bounded-string length check.
+#[test]
+fn dispatch_faccessat_invalid_user_pointer_returns_neg_efault() {
+    let _setup = wave4_setup();
+    let root = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root.dentry.clone());
+    let ctx = make_ctx(proc_cap, thread);
+
+    let req = SyscallRequest::new(
+        NR_FACCESSAT,
+        [AT_FDCWD as i64 as u64, 1, F_OK as u64, 0, 0, 0],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_FAULT));
 }
 
 /// `faccessat(.., R_OK | W_OK)` from a non-owner caller carrying

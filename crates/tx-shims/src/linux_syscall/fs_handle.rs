@@ -8,6 +8,7 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 use tx_subsystems::mount::MountPayload;
+use tx_subsystems::vfs::resolution::state::{FinalSymlinkPolicy, WalkMode};
 use tx_subsystems::vfs::structure::RNode;
 use tx_subsystems::vfs::FsObjectId;
 
@@ -156,6 +157,7 @@ fn resolve_empty_path_target(
 }
 
 fn resolve_nofollow_target(
+    ctx: &SyscallCtx<'_>,
     root: Cap<DEntry>,
     path: &[u8],
     cred: &Credential,
@@ -167,7 +169,16 @@ fn resolve_nofollow_target(
     let parent = if parent_path.is_empty() {
         root
     } else {
-        walk_from(root, parent_path, cred).map_err(SyscallResult::Error)?
+        try_resolve_from_root_now(
+            ctx,
+            root,
+            parent_path,
+            WalkMode::Entity,
+            FinalSymlinkPolicy::Follow,
+            cred,
+        )
+        .map_err(SyscallResult::Error)?
+        .dentry
     };
     let fs_ops = fs_ops_for_dentry(&parent).ok_or(SyscallResult::Error(EROFS_VALUE))?;
     let parent_id = parent.rnode().fs_object_id();
@@ -205,10 +216,19 @@ fn resolve_path_target(
     let root = resolve_cwd_for_path(dfd, path, ctx).map_err(SyscallResult::Error)?;
     let cred = ctx.walker_cred();
     if flags & AT_SYMLINK_FOLLOW_U32 != 0 {
-        let dentry = walk_from(root, path, &cred).map_err(SyscallResult::Error)?;
+        let dentry = try_resolve_from_root_now(
+            ctx,
+            root,
+            path,
+            WalkMode::Entity,
+            FinalSymlinkPolicy::Follow,
+            &cred,
+        )
+        .map_err(SyscallResult::Error)?
+        .dentry;
         Ok((dentry.rnode().fs_object_id(), dentry.rnode().meta()))
     } else {
-        resolve_nofollow_target(root, path, &cred)
+        resolve_nofollow_target(ctx, root, path, &cred)
     }
 }
 

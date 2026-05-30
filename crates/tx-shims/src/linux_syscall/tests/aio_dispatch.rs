@@ -3,7 +3,12 @@ use super::*;
 use crate::linux_syscall::{
     CLOCK_MONOTONIC, NR_IO_GETEVENTS, NR_IO_SETUP, NR_TIMER_CREATE, NR_TIMER_SETTIME,
 };
+use tx_hal::UserPtr;
 use tx_subsystems::signal::{step_sigaction, SigDisposition, Signum};
+use tx_subsystems::vm::{
+    MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmMapRequest,
+    USER_PAGE_SIZE,
+};
 
 const E_INTR: i32 = 4;
 const SIGALRM_RAW: u8 = 14;
@@ -37,13 +42,47 @@ fn create_posix_timer(ctx: &SyscallCtx<'_>, clock: u32) -> i32 {
 }
 
 fn create_aio_context(ctx: &SyscallCtx<'_>) -> i32 {
+    let ctxp = map_user_bytes(ctx, 0x5300_0000, &0u64.to_le_bytes());
     match block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_IO_SETUP, [1, 0, 0, 0, 0, 0]),
+        SyscallRequest::new(NR_IO_SETUP, [1, ctxp, 0, 0, 0, 0]),
         ctx,
     )) {
-        SyscallResult::Return(fd) => fd as i32,
+        SyscallResult::Return(0) => read_user_u64(ctx, ctxp) as i32,
         other => panic!("io_setup failed: {other:?}"),
     }
+}
+
+fn map_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, bytes: &[u8]) -> u64 {
+    let len = (bytes.len().max(1) + USER_PAGE_SIZE - 1) & !(USER_PAGE_SIZE - 1);
+    let range = UserRange::new_aligned(UserVirtAddr(uaddr), len).expect("aligned range");
+    let map_req = VmMapRequest::fixed(
+        range,
+        MapPlacement::FixedReplace,
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    ctx.aspace.try_mmap(map_req).expect("map user bytes");
+    if !bytes.is_empty() {
+        let guard = step_engine::guard();
+        let copied = ctx
+            .aspace
+            .copy_to_user(UserPtr::<u8>::new(uaddr), bytes, &guard);
+        drop(guard);
+        assert_eq!(copied, StepOutcome::Done(bytes.len()));
+    }
+    uaddr as u64
+}
+
+fn read_user_u64(ctx: &SyscallCtx<'_>, uaddr: u64) -> u64 {
+    let mut bytes = [0u8; 8];
+    let guard = step_engine::guard();
+    let copied = ctx
+        .aspace
+        .copy_from_user(&mut bytes, UserPtr::<u8>::new(uaddr as usize), &guard);
+    drop(guard);
+    assert_eq!(copied, StepOutcome::Done(8));
+    u64::from_le_bytes(bytes)
 }
 
 #[test]
@@ -85,12 +124,13 @@ fn dispatch_io_getevents_wakes_for_process_timer_signal_deadline() {
         SyscallResult::Return(0)
     );
 
-    let aio_fd = create_aio_context(&ctx);
-    let mut event = [0u8; tx_subsystems::aio::IO_EVENT_BYTES];
-    let req = SyscallRequest::new(
-        NR_IO_GETEVENTS,
-        [aio_fd as u64, 1, 1, event.as_mut_ptr() as u64, 0, 0],
+    let aio_ctx = create_aio_context(&ctx) as u64;
+    let event = map_user_bytes(
+        &ctx,
+        0x5301_0000,
+        &[0u8; tx_subsystems::aio::IO_EVENT_BYTES],
     );
+    let req = SyscallRequest::new(NR_IO_GETEVENTS, [aio_ctx, 1, 1, event, 0, 0]);
     let waker = Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);
     let fut = dispatch::<ShimsTestPmap>(req, &ctx);

@@ -69,43 +69,49 @@ pub fn kernel_step(
         remaining.remove(0);
     }
 
-    if rules.mode == WalkMode::ParentAndName && is_single_remaining_component(&remaining) {
-        if current.rnode().meta().kind() != InodeKind::Directory {
-            return KernelStep::Error(WalkCause::NotADirectory);
-        }
-        let parent_meta = current.rnode().meta();
-        if let Err(_err) =
-            crate::cred::checks::require_path_search_with_walker_cred(cred, &parent_meta, guard)
-        {
-            return KernelStep::Error(WalkCause::Permission(
-                super::state::NonTerminalDenial::SearchDenied,
-            ));
-        }
-        let rnode = current.rnode().clone();
-        let meta = rnode.meta();
-        let fs_object_id = rnode.fs_object_id();
-        let resolved = PathResolution {
-            dentry: current,
-            rnode,
-            fs_object_id,
-            meta,
-        };
-        return KernelStep::Continue(WalkState::Terminal(resolved));
-    }
-
     // --- end of input ---
     if remaining.is_empty() {
-        if must_be_directory && current.rnode().meta().kind() != InodeKind::Directory {
+        let current_meta = match fs_ops.load_inode_meta(current.rnode().fs_object_id(), guard) {
+            StepOutcome::Done(meta) => meta,
+            StepOutcome::Yield { .. } => {
+                let token = ResumeToken {
+                    walking: WalkingState {
+                        current,
+                        remaining,
+                        hop_count,
+                        mount_root,
+                        must_be_directory,
+                    },
+                    hop_count,
+                };
+                return KernelStep::NeedIO(
+                    IORequest::LoadInodeMeta {
+                        fs_object_id: token.walking.current.rnode().fs_object_id(),
+                    },
+                    token,
+                );
+            }
+            StepOutcome::Err(e) => return KernelStep::Error(WalkCause::FsOpsRejected(e)),
+            StepOutcome::Continue { .. } => {
+                return KernelStep::Continue(WalkState::Walking(WalkingState {
+                    current,
+                    remaining,
+                    hop_count,
+                    mount_root,
+                    must_be_directory,
+                }));
+            }
+        };
+        if must_be_directory && current_meta.kind() != InodeKind::Directory {
             return KernelStep::Error(WalkCause::NotADirectory);
         }
         let rnode = current.rnode().clone();
-        let meta = rnode.meta();
         let fs_object_id = rnode.fs_object_id();
         let resolved = PathResolution {
             dentry: current,
             rnode,
             fs_object_id,
-            meta,
+            meta: current_meta,
         };
         if terminal::accepts(&WalkState::Terminal(resolved.clone()), rules.mode) {
             return KernelStep::Continue(WalkState::Terminal(resolved));
@@ -149,9 +155,41 @@ pub fn kernel_step(
         }));
     }
 
+    let current_fs_object_id = current.rnode().fs_object_id();
+    let current_meta = match fs_ops.load_inode_meta(current_fs_object_id, guard) {
+        StepOutcome::Done(meta) => meta,
+        StepOutcome::Yield { .. } => {
+            let token = ResumeToken {
+                walking: WalkingState {
+                    current,
+                    remaining,
+                    hop_count,
+                    mount_root,
+                    must_be_directory,
+                },
+                hop_count,
+            };
+            return KernelStep::NeedIO(
+                IORequest::LoadInodeMeta {
+                    fs_object_id: current_fs_object_id,
+                },
+                token,
+            );
+        }
+        StepOutcome::Err(e) => return KernelStep::Error(WalkCause::FsOpsRejected(e)),
+        StepOutcome::Continue { .. } => {
+            return KernelStep::Continue(WalkState::Walking(WalkingState {
+                current,
+                remaining,
+                hop_count,
+                mount_root,
+                must_be_directory,
+            }));
+        }
+    };
+
     // --- directory check ---
-    let current_kind = current.rnode().meta().kind();
-    if current_kind != InodeKind::Directory {
+    if current_meta.kind() != InodeKind::Directory {
         return KernelStep::Error(WalkCause::NotADirectory);
     }
 
@@ -160,7 +198,7 @@ pub fn kernel_step(
     // the cred seam; the witness is discarded because the per-
     // component walk does not yet thread a SearchAuthorized<'g>
     // token to a downstream publication site.
-    let parent_meta = current.rnode().meta();
+    let parent_meta = current_meta;
     if let Err(_err) =
         crate::cred::checks::require_path_search_with_walker_cred(cred, &parent_meta, guard)
     {
@@ -175,7 +213,7 @@ pub fn kernel_step(
     };
 
     // --- lookup / materialise, with parent-local dentry cache ---
-    let parent_fs_object_id = current.rnode().fs_object_id();
+    let parent_fs_object_id = current_fs_object_id;
     let (child_dentry, child_rnode_cap, child_fs_object_id, child_meta) = if let Some(cached) =
         current
             .cached_child(child_inline)
@@ -183,7 +221,37 @@ pub fn kernel_step(
     {
         let rnode = cached.rnode().clone();
         let fs_object_id = rnode.fs_object_id();
-        let meta = rnode.meta();
+        let meta = match fs_ops.load_inode_meta(fs_object_id, guard) {
+            StepOutcome::Done(meta) => meta,
+            StepOutcome::Yield { .. } => {
+                let token = ResumeToken {
+                    walking: WalkingState {
+                        current,
+                        remaining,
+                        hop_count,
+                        mount_root,
+                        must_be_directory,
+                    },
+                    hop_count,
+                };
+                return KernelStep::NeedIO(
+                    IORequest::LoadInodeMeta {
+                        fs_object_id: fs_object_id,
+                    },
+                    token,
+                );
+            }
+            StepOutcome::Err(e) => return KernelStep::Error(WalkCause::FsOpsRejected(e)),
+            StepOutcome::Continue { .. } => {
+                return KernelStep::Continue(WalkState::Walking(WalkingState {
+                    current,
+                    remaining,
+                    hop_count,
+                    mount_root,
+                    must_be_directory,
+                }));
+            }
+        };
         (cached, rnode, fs_object_id, meta)
     } else {
         let child_fs_object_id = match fs_ops.lookup(parent_fs_object_id, &component, guard) {
@@ -402,8 +470,14 @@ pub fn kernel_step(
     }))
 }
 
-fn is_single_remaining_component(remaining: &[u8]) -> bool {
-    !remaining.is_empty() && !remaining.contains(&b'/')
+fn protected_symlink_follow_denied(
+    cred: &Credential,
+    parent_meta: &InodeMeta,
+    link_meta: &InodeMeta,
+) -> bool {
+    let sticky_world_writable =
+        (parent_meta.mode & S_ISVTX) != 0 && (parent_meta.mode & 0o002) != 0;
+    sticky_world_writable && cred.uid != link_meta.uid && parent_meta.uid != link_meta.uid
 }
 
 // ---------------------------------------------------------------------------

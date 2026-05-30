@@ -1,3 +1,184 @@
+- 2026-05-28 **Closed the next safe early LTP full-run blockers.**
+  `abort01` now resolves forked leader TIDs for `tkill()`/`tgkill()` and stops
+  re-entering userspace after a syscall-side default signal turns the process
+  zombie, so abort terminates as `SIGABRT|WCOREDUMP` instead of falling through
+  to musl's SIGSEGV fallback. Procfs now aliases `/proc/<pid>/mounts` to
+  `/proc/mounts`, which lets cgroup probes pass the previous
+  `/proc/self/mounts` `ENOENT` setup blocker and reach deliberate cgroup
+  mount/controller policy (`ENOSYS`/`TCONF`). **Verified:** `cargo test -p
+  tx-kernel thread_future::tests::syscall_side_effect_zombie_does_not_reenter_userspace
+  -- --nocapture`; `cargo test -p tx-fs procfs_ -- --nocapture`; `cargo check
+  -p tx-fs -p tx-kernel -p tx-shims -p tx-subsystems`; `cargo xtask build
+  --target rv64-qemu`; `make oscomp-submit-rv64`; focused guest
+  `abort01` reported `ltp-musl 2/2`; the consolidated early sweep
+  `abort01+access01+access02+access03+access04+acct01+adjtimex01+adjtimex03+cgroup_core01+cgroup_core02+cgroup_core03`
+  reported `ltp-musl 249/252`, with only the three cgroup `TCONF` policy cases
+  still scored as failures by the local judge. **Next step:** keep cgroup,
+  capability/key/BPF/module, and network policy out of the mechanical lane;
+  the next non-policy full-run failure observed is `atof01`, which reproduces
+  without kernel trap lines and needs a separate RV64 FP/libc state audit.
+  **Blocker:** unfiltered full `ltp-musl` still cannot be called green while
+  cgroup/module-heavy cases and `atof01` remain unresolved.
+
+- 2026-05-28 **Fixed the first safe early LTP `access03`/`adjtimex`
+  failures.** `faccessat`/`faccessat2` now preserve user C-string `EFAULT`
+  for invalid path pointers instead of collapsing the fault into
+  `ENAMETOOLONG`, matching `access03`. `adjtimex` now treats the exact
+  Linux singleshot composite modes `0x8001`/`0xa001` as accepted v1
+  bookkeeping/readback shapes, rejects the bare `0x8000` high bit as
+  `EINVAL`, and masks read-only `status` bits such as `STA_NANO` on
+  `ADJ_STATUS` updates instead of rejecting Linux readback structs.
+  **Verified:** `cargo check -p tx-shims -p tx-subsystems`; `cargo xtask build
+  --target rv64-qemu`; `make oscomp-submit-rv64`; `gtimeout 240s make
+  oscomp-qemu-rv64
+  OSCOMP_GROUPS='ltp-musl:access03+adjtimex01+adjtimex03'
+  OSCOMP_OUT_RV=target/oscomp/os_serial_out_ltp_early_20260528.txt`; `python3
+  tools/oscomp-judge.py target/oscomp/os_serial_out_ltp_early_20260528.txt
+  target/oscomp/testdata` reported `ltp-musl 11/11`; `cargo xtask fault-decode
+  --target rv64-qemu --serial
+  target/oscomp/os_serial_out_ltp_early_20260528.txt --all --brief` reported no
+  trap lines; `cargo fmt --check`; `git diff --check`. **Next step:** continue
+  early LTP with `access01`/`access02` DAC/identity behavior, then decide
+  whether `abort01` core-dump semantics or `/proc/self/mounts` should be the
+  next non-namespace blocker. **Blocker:** `cargo test -p tx-shims --lib ...`
+  is currently blocked by pre-existing unrelated staged lib-test import drift
+  (`timerfd_dispatch`, `high_stakes_syscalls`, `vm_syscalls`, `epoll_dispatch`,
+  etc.), so focused host tests could not be executed in this dirty worktree.
+
+- 2026-05-27 **Added `cargo xtask tailor ltp` for focused LTP image
+  creation.** The new top-level xtask command wraps the existing
+  `tools/build-slim-sdcard.py` path with a simpler interface:
+  `cargo xtask tailor ltp --library musl|glibc --arch rv64|la64 --tests
+  CASE[,CASE...]`. Defaults are deterministic by libc/arch: musl images use
+  256 MiB, glibc images use 512 MiB, rv64 musl prefers
+  `target/oscomp/testdata/sdcard-ltp-cases-rv.img` when present, and output
+  defaults under `target/oscomp/tailor/ltp-{library}-{arch}/`. The command is
+  build-only and prints the follow-up `cargo xtask oscomp qemu ...` command
+  instead of running QEMU. **Verified:** `cargo test -p xtask tailor --
+  --nocapture`; `cargo xtask tailor ltp --library musl --arch rv64
+  --list-cases`; `cargo xtask tailor ltp --library musl --arch rv64 --tests
+  access01 --output target/oscomp/tailor/smoke/sdcard-rv.img --size-mb 128`;
+  `cargo check -p xtask`. **Next step:** use the tailored image command for
+  focused `access*` / `adjtimex*` reruns. **Blocker:** the current preferred
+  local rv64 case source listed `access01` in runtest inventory but the helper
+  reported that case binary as `NOT FOUND`; use a full-source image override
+  if a focused run needs that binary before the source artifact is refreshed.
+
+- 2026-05-27 **Ran bounded full RV64 `ltp-musl` probe against the prepared
+  full image.** Built and submitted the current RV64 kernel, then ran
+  `gtimeout 1800s make oscomp-qemu-rv64 OSCOMP_DATA=target/oscomp/testdata
+  OSCOMP_SUBMIT=target/oscomp/submit
+  OSCOMP_OUT_RV=target/oscomp/os_serial_out_ltp_full_20260527.txt
+  OSCOMP_GROUPS=ltp-musl`. The run entered the full `ltp-musl` suite and
+  timed out after 30 minutes while stuck at `RUN LTP CASE cgroup_fj_proc`;
+  there was no `userspace:exited` sentinel because QEMU was externally
+  terminated. Partial score over the completed prefix is `ltp-musl 253/418`:
+  107 cases started, 106 completed, 16 completed with exit status `0`, and the
+  early clean passes include `abs01`, `accept01`, `accept02`, `bind01`,
+  `bind02`, `bind03`, `alarm02`, `alarm03`, `alarm05`, `alarm06`, and
+  `alarm07`. Major observed blocker classes: missing core-dump behavior
+  (`abort01`), DAC/identity/path permission gaps (`access01/02`), bad
+  user-pointer errno ordering (`access03`), time-discipline mode semantics
+  (`adjtimex01/03`), unsupported key/capability/BPF surfaces, module/cgroup
+  metadata gaps (`/proc/self/mounts`, `/lib/modules/...`), and AF_UNIX cleanup
+  semantics in `bind04/05`. **Verified:** `cargo xtask oscomp score --target
+  rv64-qemu --input target/oscomp/os_serial_out_ltp_full_20260527.txt --data
+  target/oscomp/testdata --suite ltp-musl`; `cargo xtask fault-decode --target
+  rv64-qemu --serial target/oscomp/os_serial_out_ltp_full_20260527.txt --all
+  --brief` reported no trap lines. **Next step:** add a skip/filter lane or a
+  focused rerun that excludes cgroup/module-heavy tests so the full syscall
+  prefix can advance past `cgroup_fj_proc`, then attack the high-yield semantic
+  failures (`access*`, `adjtimex*`, `/proc/self/mounts`). **Blocker:** full
+  unfiltered `ltp-musl` does not currently complete because `cgroup_fj_proc`
+  hangs/overruns the outer timeout.
+
+- 2026-05-27 **Prepared local OSComp images for full-run attempts.** Linked
+  the active worktree's `target/oscomp/testdata/sdcard-rv.img` to the existing
+  sibling RV full image and `sdcard-la.img` to the existing sibling LA image,
+  then reran `cargo xtask oscomp prepare --data target/oscomp/testdata` until
+  both images reported `ok`. Added a local `sdcard-ltp-cases-rv.img` symlink to
+  the case-capable slim LTP image and made `LTP_SDCARD` prefer it when present,
+  so `make ltp-batches` / `make ltp-runtests` stay useful while full-run QEMU
+  uses the full RV image. **Verified:** `cargo xtask oscomp list-suites --data
+  target/oscomp/testdata`; `make ltp-batches`; `make ltp-runtests`; `cargo
+  xtask oscomp qemu --target rv64-qemu --data target/oscomp/testdata --submit
+  target/oscomp/submit --suite ltp-musl --dry-run`; `make -n
+  oscomp-local-rv64-ltp-musl`. **Next step:** run a bounded full
+  `ltp-musl` probe with `make oscomp-local-rv64-ltp-musl` or the equivalent
+  `cargo xtask oscomp qemu ... --suite ltp-musl`. **Blocker:** none for image
+  preparation; the images are symlinked to existing local artifacts rather than
+  duplicated into this worktree.
+
+- 2026-05-27 **Fixed local LTP status harness caveats before a full run.**
+  Added the missing `make oscomp-local-rv64-ltp-musl` recipe, introduced
+  `LTP_SDCARD` so batch/runtest inventory can point at a prepared local or
+  sibling sdcard image, split the recursive Make invocations so
+  `make -n oscomp-local-rv64-ltp-batch ...` no longer executes the count shell
+  block, and taught `tools/ltp-runtests.py` to fall back to reading
+  `/musl/ltp/runtest` directly from the sdcard when
+  `target/sources/ltp-20240524/runtest` is absent. **Verified:** `python3 -m
+  py_compile tools/ltp-batches.py tools/ltp-runtests.py`; `make -n
+  oscomp-local-rv64-ltp-musl`; `make -n oscomp-local-rv64-ltp-batch
+  LTP_BATCH=p0 LTP_SDCARD=/Users/3y/Downloads/Tx/target/oscomp/ltp-slim-run/sdcard-rv.img`;
+  `make ltp-batches LTP_SDCARD=/Users/3y/Downloads/Tx/target/oscomp/ltp-slim-run/sdcard-rv.img`;
+  `make ltp-runtests LTP_SDCARD=/Users/3y/Downloads/Tx/target/oscomp/ltp-slim-run/sdcard-rv.img`;
+  `make ltp-runtest-cases LTP_RUNTEST=fs
+  LTP_SDCARD=/Users/3y/Downloads/Tx/target/oscomp/ltp-slim-run/sdcard-rv.img`.
+  **Next step:** use these stable inventory targets to select the next bounded
+  LTP batch, then prepare/download official local sdcard images before a true
+  full `ltp-musl` run. **Blocker:** the worktree still has no official
+  `target/oscomp/testdata/sdcard-{rv,la}.img` payloads; current full-run prep
+  relies on explicit `LTP_SDCARD=...` pointing at an existing sibling image.
+
+- 2026-05-27 **Merged force-updated `origin/main` into
+  `codex/pipe-lease-ring-merge`.**  `git fetch origin main` advanced
+  `origin/main` from `8fb35948` to `238c8d41` by forced update. Preserved the
+  staged local WIP in stash `pre-origin-main-forced-update-merge-20260527`,
+  merged `origin/main` as commit `eec7d6ff`, resolved the add/add
+  `cargo/config.toml` conflict with the new remote-main config, and re-applied
+  the WIP. The WIP replay conflicted in `linux_syscall/vm.rs` and
+  `futex/mod.rs`; resolution kept the richer local futex/PI/futex2 implementation
+  that already contains the masked-wake/requeue machinery and still compiles on
+  top of the new mainline futex bug-fix merge. **Verified:** `cargo check -p
+  tx-shims -p tx-subsystems -p tx-kernel`; `cargo xtask progress validate`;
+  `cargo xtask syscall-status --check`; `cargo xtask syscall sync --check`;
+  `cargo xtask lint syscall-status`; `cargo fmt --check`; `git diff --check`.
+  **Next step:** manual staged-scope review before committing or dropping any
+  retained stashes. **Blocker/retained state:** `external/linux-rv-6.17` remains
+  a dirty submodule marker, and all safety stashes are retained until the user
+  confirms they can be dropped.
+
+- 2026-05-27 **Checked current LTP pass evidence on the active branch.**
+  Built the current RV64 kernel with `cargo xtask full-build --target
+  rv64-qemu --skip-doctor --no-image`, then ran the prepared two-case slim
+  `ltp-musl` image from `/Users/3y/Downloads/Tx/target/oscomp/ltp-slim-run`.
+  Fresh evidence: `writev01` and `accept01` both exit `0` with 11 total
+  `TPASS` subchecks, no `TFAIL`/`TBROK`, and userspace exit `0`; the judge is
+  `0/0` because that slim image is zero-weight. A bounded 180s full-image
+  probe against `/Users/3y/Downloads/Tx/target/oscomp/testdata-full` reached
+  LTP and completed 15 case exits before timeout: named clean passes are
+  `accept03`, `alarm05`, `brk01`, `brk02`, `dup201`, `epoll_ctl02`, and
+  `epoll_ctl04`; `clock_adjtime01` still has failing subcases, `chroot01`
+  breaks on missing `nobody` image identity data, `connect02` still ends in a
+  user fault after an initial `TPASS`, and the run timed out in a later case
+  with a user-mode illegal-instruction trap. **Verified:** `cargo xtask
+  fault-decode --target rv64-qemu --serial target/oscomp/os_serial_out_rv.txt
+  --all --brief` identified the final trap as U-mode illegal instruction at
+  `0x40579bfa`. **Next step:** make the harness print case names reliably for
+  full-image runs, then fix `clock_adjtime01` and the post-`connect02` user
+  fault before claiming a broader LTP pass count.
+
+- 2026-05-27 **Regenerated syscall status and aligned the manual headline.**
+  `cargo xtask syscall-status --regen` and `cargo xtask syscall sync`
+  reported `docs/progress/SYSCALL_STATUS.md` already current; the hand-written
+  headline now matches the autogenerated Linux RV64 v6.17 table at 249 defined,
+  245 dispatched, 4 defined-but-not-dispatched, 74 true missing, 0 number
+  mismatches, and 3 local futex2-only entries. **Verified:** `cargo xtask
+  syscall-status --check`; `cargo xtask syscall sync --check`; `cargo xtask
+  lint syscall-status`. **Next step:** use the high-stakes table to choose
+  between lightweight process/sysinfo, network completion, residual time
+  discipline, ext4 metadata depth, or event notification depth.
+
 - 2026-05-27 **Merged futex Linux-compat worktree into the active branch.**
   Integrated `codex/futex-linux-compat` from
   `/Users/3y/.codex/worktrees/futex-linux-compat/Tx`: PI/futex2 syscall
@@ -650,6 +831,70 @@
   twice, `iperf-glibc 6/6`, `netperf-musl 5/5`, and `netperf-glibc 5/5` using
   the local judge. **Next step:** optionally rerun the broader non-LTP OSComp
   set before another PR push. **Blocker:** none found for focused iperf/netperf.
+  syscall-status`; `cargo fmt --check`. The saved pre-merge WIP stash was then
+  reapplied and the restored AIO/time-accounting work was rechecked with
+  `cargo test -p tx-shims --test v3_aio_raw_abi -- --nocapture`, `cargo test
+  -p tx-shims --lib linux_syscall::tests::time_syscalls -- --nocapture`,
+  `cargo test -p tx-subsystems cpu_accounting_charges_thread_and_process_totals
+  -- --nocapture`, `cargo check -p tx-shims -p tx-subsystems -p tx-kernel`,
+  `cargo xtask progress validate`, the syscall status/sync/lint checks,
+  `cargo fmt --check`, and `git diff --check`. **Next step:** continue the
+  restored AIO/time-accounting WIP or drop the retained safety stash after a
+  final manual scope review. **Blocker:** the active worktree still has a
+  pre-existing dirty `external/linux-rv-6.17` submodule marker.
+
+- 2026-05-27 **Started CPU accounting and time-discipline integration.**
+  Thread payloads now expose passive user/system CPU counters, process CPU time
+  sums live thread payloads, and `clock_gettime(CLOCK_THREAD_CPUTIME_ID /
+  CLOCK_PROCESS_CPUTIME_ID)` plus `getrusage(RUSAGE_SELF/THREAD)` report those
+  charged values instead of aliasing to monotonic/zero. `setitimer` now accepts
+  `ITIMER_VIRTUAL` and `ITIMER_PROF` state against the accounted user and
+  user+system clocks; actual signal delivery remains a safe-boundary follow-up
+  rather than an IRQ-forced coroutine unwind. `adjtimex` now stores/reports
+  `ADJ_OFFSET` and `ADJ_FREQUENCY` discipline inputs, with true gradual
+  conversion-path slew still deferred.
+  **Verified:** `cargo test -p tx-subsystems
+  cpu_accounting_charges_thread_and_process_totals -- --nocapture`; `cargo
+  test -p tx-shims --lib linux_syscall::tests::time_syscalls -- --nocapture`;
+  `cargo test -p tx-shims --lib
+  linux_syscall::tests::high_stakes_syscalls::dispatch_getrusage --
+  --nocapture`.
+  **Next step:** wire scheduler/trap transition hooks to charge CPU
+  automatically, deliver CPU timer expiry at safe runtime boundaries, and turn
+  stored `ADJ_OFFSET`/`ADJ_FREQUENCY` into real gradual clock conversion.
+
+- 2026-05-27 **Integrated raw AIO with shared PageBacked ring mapping.**
+  `io_setup` now backs the Linux `aio_context_t` ring with an anonymous
+  PageBacked container mapped `SHARED`, so ring header/event publication uses
+  the same VM shared-page path as other PageBacked user mappings instead of the
+  temporary private-anon host ring. Added a kernel boot-seam smoke for the AIO
+  worker hook alongside the existing child-thread seam check.
+  **Verified:** `cargo test -p tx-shims --test v3_aio_raw_abi --
+  --nocapture`; `cargo test -p tx-kernel
+  reactor_submission_seam_installs_aio_worker_hook_smoke -- --nocapture`.
+  **Next step:** deepen running-request cancellation and finish the `io_uring`
+  registration/ring-depth work.
+
+- 2026-05-26 **Switched AIO to raw Linux `aio_context_t` plus reactor
+  worker completion.**
+  The earlier fd-shaped AIO canary is superseded: `io_setup` now validates
+  and writes a Linux-style user context handle, initializes a Linux-shaped
+  AIO ring header, and `io_submit`/`io_getevents`/`io_pgetevents`/`io_cancel`/
+  `io_destroy` look up that raw handle directly. `io_submit` is now
+  admission-only; a per-context AIO worker reactor task drains IOCBs under
+  `OnBehalfOf<P>`, publishes Linux ring events, signals `IOCB_FLAG_RESFD`
+  eventfds, and wakes `io_getevents`. Queued `io_cancel` now publishes a
+  canceled completion; running cancellation remains cooperative best-effort.
+  **Verified:** `cargo test -p tx-shims --test v3_aio_raw_abi -- --nocapture
+  --test-threads=1`; `cargo test -p tx-subsystems aio -- --nocapture`; `cargo
+  test -p tx-reactor --test reactor_smoke -- --nocapture`; `cargo test -p
+  tx-shims --test
+  v3_aio_io_setup --test v3_aio_io_submit --test v3_aio_io_getevents --test
+  v3_aio_io_destroy --test v3_aio_e2e -- --nocapture`; `cargo test -p
+  tx-shims --lib linux_syscall::tests::aio_dispatch -- --nocapture`; `cargo
+  check -p tx-shims -p tx-subsystems -p tx-kernel`.
+  **Next step:** deepen cancellation for long-running backend operations and
+  continue `io_uring` registration/ring-depth work.
 
 - 2026-05-26 **Cleared the AIO host-test drift and wired `io_pgetevents`.**
   The older raw AIO host tests now stage `iocbpp`, `struct iocb`, and

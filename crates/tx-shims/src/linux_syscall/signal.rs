@@ -198,7 +198,50 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         }
     }
 
+    if how.is_some() {
+        materialize_unblocked_default_termination(ctx);
+    }
+
     SyscallResult::Return(0)
+}
+
+fn materialize_unblocked_default_termination(ctx: &SyscallCtx<'_>) {
+    let thread_payload = match ctx.thread.upgrade_operational() {
+        Ok(payload) => payload,
+        Err(_) => return,
+    };
+    let process_payload = match ctx.process.upgrade_operational() {
+        Ok(payload) => payload,
+        Err(_) => return,
+    };
+    let mask = thread_payload.signal_mask();
+    let deliverable = thread_payload.pending().deliverable_bits(mask)
+        | process_payload.group_pending().deliverable_bits(mask);
+    for raw in 1u8..=64 {
+        let Some(sig) = Signum::new(raw) else {
+            continue;
+        };
+        if deliverable & sig.bit() == 0 {
+            continue;
+        }
+        match process_payload.sig_actions().get(sig) {
+            SigDisposition::Ignore => continue,
+            SigDisposition::Default => match tx_subsystems::signal::default_action(sig) {
+                tx_subsystems::signal::DefaultAction::Ignore => continue,
+                tx_subsystems::signal::DefaultAction::Term
+                | tx_subsystems::signal::DefaultAction::Core => {
+                    tx_subsystems::process::execution::step_exit_group_with_signal(
+                        &ctx.process,
+                        sig,
+                    );
+                }
+                tx_subsystems::signal::DefaultAction::Stop
+                | tx_subsystems::signal::DefaultAction::Cont => {}
+            },
+            SigDisposition::Handler(_) => {}
+        }
+        return;
+    }
 }
 
 // --- Stub syscalls (deferred to post-bringup) -------------------------
@@ -578,6 +621,7 @@ pub(super) fn sys_pidfd_send_signal(args: [u64; 6], ctx: &SyscallCtx) -> Syscall
         si_code: SI_USER,
         si_pid: ctx.process.pid.0,
         si_uid: 0,
+        si_value: 0,
     });
 
     dispatch_errno(
@@ -945,16 +989,18 @@ pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             si_uid: 0,
             si_value: 0,
         });
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = ThreadKillOp {
-            thread,
-            sig: signum,
-            info: siginfo,
+        return match tx_subsystems::signal::script_deliver_signal(
+            &ctx.process,
+            SignalTarget::Thread(thread),
+            signum,
+            siginfo,
+        ) {
+            Ok(tx_subsystems::signal::KillOutcome::Delivered) => SyscallResult::Return(0),
+            Ok(tx_subsystems::signal::KillOutcome::NoLiveThread) => {
+                SyscallResult::Error(ESRCH_VALUE)
+            }
+            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
         };
-        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-            Ok(()) => return SyscallResult::Return(0),
-            Err(v3errno) => return SyscallResult::error_from(v3errno),
-        }
     }
     SyscallResult::Error(ESRCH_VALUE)
 }

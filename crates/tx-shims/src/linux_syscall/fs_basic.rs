@@ -6,6 +6,7 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMutex, StepOutcome};
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use tx_subsystems::cred::checks as cred_checks;
@@ -559,6 +560,24 @@ fn has_current_writable_shared_mapping(ctx: &SyscallCtx<'_>, file: &Cap<OpenFile
     })
 }
 
+fn fcntl_release_process_locks_for_file(_owner: u32, _file: &OpenFile) {}
+
+fn mount_is_read_only(dentry: &Cap<DEntry>) -> bool {
+    dentry
+        .rnode()
+        .containing_mount_weak()
+        .and_then(|weak| {
+            let guard = step_engine::guard();
+            weak.upgrade(&guard)
+        })
+        .is_some_and(|payload| {
+            payload
+                .options
+                .flags
+                .contains(tx_subsystems::mount::MountFlags::READ_ONLY)
+        })
+}
+
 fn pipe_payload_for_fcntl(file: &Cap<OpenFile>) -> Option<Cap<tx_subsystems::pipe::PipePayload>> {
     let OpenFileBacking::Rnode { rnode } = file.backing() else {
         return None;
@@ -689,6 +708,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     };
     let want_append = flags & O_APPEND != 0;
     let want_cloexec = flags & O_CLOEXEC != 0;
+    let want_path_only = flags & O_PATH != 0;
     let want_create = !want_path_only && flags & O_CREAT != 0;
     let want_excl = !want_path_only && flags & O_EXCL != 0;
     let want_trunc = !want_path_only && flags & O_TRUNC != 0;
@@ -1012,9 +1032,10 @@ pub(super) fn sys_open_by_handle_at(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Sys
 /// PR-3 migration: `CloseOp` is a `OneShotStepOp` — dispatched via
 /// `drive_oneshot` (no reactor, no yield).
 pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
-    if close_socket_fd(fd, ctx) {
+    if net::close_socket_fd(fd, ctx) {
         return SyscallResult::Return(0);
     }
+    let file_to_close = ctx.process.fd(fd);
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = CloseOp {
         process: ctx.process.clone(),

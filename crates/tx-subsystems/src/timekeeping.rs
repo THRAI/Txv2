@@ -51,9 +51,8 @@ const BOOKKEEPING_MODES: u32 = ADJ_MAXERROR
     | ADJ_NANO
     | ADJ_TICK;
 const STEP_MODES: u32 = ADJ_SETOFFSET;
-const UNSUPPORTED_DISCIPLINE_MODES: u32 =
-    ADJ_OFFSET | ADJ_FREQUENCY | ADJ_OFFSET_SINGLESHOT | ADJ_OFFSET_SS_READ;
-const KNOWN_MODES: u32 = BOOKKEEPING_MODES | STEP_MODES | UNSUPPORTED_DISCIPLINE_MODES;
+const DISCIPLINE_MODES: u32 = ADJ_OFFSET | ADJ_FREQUENCY;
+const KNOWN_MODES: u32 = BOOKKEEPING_MODES | STEP_MODES | DISCIPLINE_MODES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClockId {
@@ -332,6 +331,8 @@ pub struct Timekeeper {
     esterror_us: AtomicI64,
     time_constant: AtomicI64,
     tick_us: AtomicI64,
+    offset_ns: AtomicI64,
+    freq_scaled_ppm: AtomicI64,
 }
 
 impl Timekeeper {
@@ -343,6 +344,8 @@ impl Timekeeper {
             esterror_us: AtomicI64::new(0),
             time_constant: AtomicI64::new(0),
             tick_us: AtomicI64::new(USER_TICK_USEC),
+            offset_ns: AtomicI64::new(0),
+            freq_scaled_ppm: AtomicI64::new(0),
         }
     }
 
@@ -389,11 +392,25 @@ impl Timekeeper {
         if modes != 0 && !privileged {
             return Err(TimekeepingError::Permission);
         }
-        if modes & UNSUPPORTED_DISCIPLINE_MODES != 0 {
-            return Err(TimekeepingError::Unsupported);
+        if modes == ADJ_OFFSET_SINGLESHOT || modes == ADJ_OFFSET_SS_READ {
+            self.fill_timex::<P>(tx);
+            return Ok(TIME_OK);
         }
-        if modes & ADJ_STATUS != 0 && (tx.status & STA_RONLY) != 0 {
-            return Err(TimekeepingError::Invalid);
+        if modes & DISCIPLINE_MODES != 0 {
+            // v1 records Linux-shaped discipline inputs and reports them back
+            // through adjtimex. Applying gradual slew/frequency correction to
+            // the clock conversion path is the next time-discipline slice.
+            if modes & ADJ_OFFSET != 0 {
+                let scale = if modes & ADJ_NANO != 0 { 1 } else { 1_000 };
+                let offset = (tx.offset as i128).saturating_mul(scale);
+                if offset < i64::MIN as i128 || offset > i64::MAX as i128 {
+                    return Err(TimekeepingError::Range);
+                }
+                self.offset_ns.store(offset as i64, Ordering::Release);
+            }
+            if modes & ADJ_FREQUENCY != 0 {
+                self.freq_scaled_ppm.store(tx.freq, Ordering::Release);
+            }
         }
         if modes & ADJ_TICK != 0 && (tx.tick < MIN_TICK_USEC || tx.tick > MAX_TICK_USEC) {
             return Err(TimekeepingError::Invalid);
@@ -459,8 +476,12 @@ impl Timekeeper {
         let realtime = wall_clock::realtime_now_ns::<P>();
         let status = self.status.load(Ordering::Acquire);
         tx.modes = 0;
-        tx.offset = 0;
-        tx.freq = 0;
+        tx.offset = if status & STA_NANO != 0 {
+            self.offset_ns.load(Ordering::Acquire)
+        } else {
+            self.offset_ns.load(Ordering::Acquire) / 1_000
+        };
+        tx.freq = self.freq_scaled_ppm.load(Ordering::Acquire);
         tx.maxerror = self.maxerror_us.load(Ordering::Acquire);
         tx.esterror = self.esterror_us.load(Ordering::Acquire);
         tx.status = status;
@@ -494,6 +515,8 @@ impl Timekeeper {
         self.esterror_us.store(0, Ordering::Release);
         self.time_constant.store(0, Ordering::Release);
         self.tick_us.store(USER_TICK_USEC, Ordering::Release);
+        self.offset_ns.store(0, Ordering::Release);
+        self.freq_scaled_ppm.store(0, Ordering::Release);
     }
 }
 
@@ -529,6 +552,9 @@ pub fn reset_for_test() {
 }
 
 fn validate_modes(modes: u32) -> Result<(), TimekeepingError> {
+    if modes == ADJ_OFFSET_SINGLESHOT || modes == ADJ_OFFSET_SS_READ {
+        return Ok(());
+    }
     if modes & !KNOWN_MODES != 0 {
         return Err(TimekeepingError::Invalid);
     }

@@ -589,36 +589,6 @@ pub(super) fn sys_semget(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
     }
 }
 
-fn read_semops(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Result<(u32, Vec<SemBuf>), SyscallResult> {
-    let semid = args[0] as u32;
-    let sops_ptr = args[1];
-    let nsops = args[2] as usize;
-    if nsops == 0 || nsops > 500 {
-        return Err(SyscallResult::Error(EINVAL_VALUE));
-    }
-    if sops_ptr == 0 {
-        return Err(SyscallResult::Error(EFAULT_VALUE));
-    }
-    let byte_len = nsops
-        .checked_mul(core::mem::size_of::<SembufLayout>())
-        .ok_or(SyscallResult::Error(EINVAL_VALUE))?;
-    let mut bytes = alloc::vec![0; byte_len];
-    if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, sops_ptr) {
-        return Err(SyscallResult::Error(errno_to_i32(errno)));
-    }
-}
-
-pub(super) fn sys_semtimedop(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let (_ns, cred) = match nsproxy_and_cred(ctx) {
-        Ok(v) => v,
-        Err(e) => return SyscallResult::Error(errno_to_i32(e)),
-    };
-    if let Err(result) = validate_sem_timeout(ctx, args[3]) {
-        return result;
-    }
-    Ok((semid, sops))
-}
-
 fn read_relative_timeout_ns(
     ctx: &SyscallCtx<'_>,
     timeout_ptr: u64,

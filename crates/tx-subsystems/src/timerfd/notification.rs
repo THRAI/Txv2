@@ -6,6 +6,7 @@
 
 use tx_platform_adapter::notification_adapter;
 
+pub use readiness::TIMERFD_READABLE;
 pub(crate) use readiness::{new_wait_point, notify_readable, wait_until_readable};
 
 #[notification_adapter(

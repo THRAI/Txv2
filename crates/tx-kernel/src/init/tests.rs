@@ -1319,6 +1319,30 @@ fn reactor_submission_seam_submits_child_thread_smoke() {
     // exercised once the BSP reactor loop runs at boot.
 }
 
+#[test]
+fn reactor_submission_seam_installs_aio_worker_hook_smoke() {
+    use tx_subsystems::reactor_submit;
+
+    let _serial = setup();
+    bootstrap_init();
+
+    assert!(
+        reactor_submit::submit_aio_worker_fn().is_none(),
+        "fresh setup must leave the AIO worker seam slot empty",
+    );
+
+    crate::init::CoreInit::<TestPlatform>::install_reactor_submit_seam();
+
+    let installed =
+        reactor_submit::submit_aio_worker_fn().expect("install_reactor_submit_seam populates AIO");
+    let expected = crate::init::CoreInit::<TestPlatform>::submit_aio_worker_into_boot_reactor
+        as reactor_submit::SubmitAioWorkerFn;
+    assert_eq!(
+        installed as *const () as usize, expected as *const () as usize,
+        "installed AIO fn pointer must equal the platform-typed routing helper",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Wave 4 fork/clone/wait4 slice — Part 7 end-to-end smoke (Layer A).
 // ---------------------------------------------------------------------------

@@ -220,6 +220,36 @@ fn dispatch_mkdirat_existing_returns_neg_eexist() {
     drop(path);
 }
 
+#[test]
+fn dispatch_mkdirat_trailing_slash_creates_final_component() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    make_dir(&tmpfs, b"mntpoint");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/mntpoint/dir/");
+    let req = SyscallRequest::new(
+        NR_MKDIRAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0o755, 0, 0, 0],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let mntpoint_id = match tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"mntpoint", &guard()) {
+        StepOutcome::Done(id) => id,
+        other => panic!("lookup mntpoint: {other:?}"),
+    };
+    assert!(
+        matches!(
+            tmpfs.lookup(mntpoint_id, b"dir", &guard()),
+            StepOutcome::Done(_)
+        ),
+        "mkdirat should create the final component before trailing slashes"
+    );
+    drop(path);
+}
+
 /// `mkdirat` with a closed non-cwd dirfd surfaces as `-EBADF` for a
 /// relative path.
 #[test]

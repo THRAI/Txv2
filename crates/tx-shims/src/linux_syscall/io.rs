@@ -537,334 +537,6 @@ pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(
 /// pattern (single fd, POLLIN, blocking wait). For each pollfd we
 /// peek at the fd's TTY backing readability; if no fd is currently
 /// ready and the timeout is non-zero, we park on the first TTY fd's
-/// wait source and re-poll on wake. Returns the number of fds with
-/// non-zero `revents`.
-///
-/// Behaviour gaps (called out so a future caller doesn't trip on
-/// them):
-/// - Only POLLIN is honoured; POLLOUT / POLLERR / etc. are reported
-///   verbatim from `events` if any fd is found to be ready, otherwise
-///   suppressed. POLLOUT-only polls on TTY backings still return
-///   "ready" eagerly to match the legacy stub semantics.
-/// - Multi-fd waits park on the FIRST TTY POLLIN fd only. If a
-///   different fd becomes readable while we're parked on the first,
-///   we wake on the next ingest event regardless (the wait_source
-///   carrier fires from any TTY ingest path); the re-check loop then
-///   notices the other fd. Cross-fd starvation is theoretically
-///   possible but not observed in practice for the busybox flows.
-/// - The `timeout_ptr` is read but a non-NULL timeout uses the
-///   timeout-elapsed branch only as an upper bound. Process POSIX/interval
-///   timer deadlines are composed into the blocking wait so signal expiry can
-///   interrupt an otherwise indefinite poll.
-/// - The signal mask is ignored.
-pub(super) async fn sys_ppoll<'a, P: TimeIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
-    use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
-
-    let nfds = args[0];
-    let readfds = args[1];
-    let writefds = args[2];
-    let exceptfds = args[3];
-    let timeout_ptr = args[4];
-
-    if nfds > 1024 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    if nfds == 0 {
-        return SyscallResult::Return(0);
-    }
-
-    let timeout = match pselect_timeout_policy(ctx, timeout_ptr) {
-        Ok(wait) => wait,
-        Err(errno) => return SyscallResult::Error(errno),
-    };
-    let timeout_deadline_ns = match timeout {
-        PselectTimeout::FiniteWait(duration_ns) => {
-            Some(<P as tx_hal::TimeIf>::read_ns().saturating_add(duration_ns))
-        }
-        PselectTimeout::Infinite | PselectTimeout::Poll => None,
-    };
-    let word_count = fdset_word_count(nfds);
-    let mut yielded_before_wait = false;
-    let (read_ready, write_ready, except_ready, ready_count) = loop {
-        drive_loopback_pending();
-        if let Some(deadline_ns) = timeout_deadline_ns {
-            if <P as tx_hal::TimeIf>::read_ns() >= deadline_ns {
-                break (
-                    alloc::vec![0u64; word_count as usize],
-                    alloc::vec![0u64; word_count as usize],
-                    alloc::vec![0u64; word_count as usize],
-                    0,
-                );
-            }
-        }
-        let mut read_ready = alloc::vec![0u64; word_count as usize];
-        let mut write_ready = alloc::vec![0u64; word_count as usize];
-        let mut except_ready = alloc::vec![0u64; word_count as usize];
-        let mut ready_count: i64 = 0;
-        let mut wait_tokens = alloc::vec::Vec::new();
-        let mut effective_deadline_ns = timeout_deadline_ns;
-
-        for fd in 0..nfds {
-            let want_read = match fdset_contains(ctx, readfds, fd) {
-                Ok(v) => v,
-                Err(errno) => return SyscallResult::Error(errno),
-            };
-            let want_write = match fdset_contains(ctx, writefds, fd) {
-                Ok(v) => v,
-                Err(errno) => return SyscallResult::Error(errno),
-            };
-            let want_except = match fdset_contains(ctx, exceptfds, fd) {
-                Ok(v) => v,
-                Err(errno) => return SyscallResult::Error(errno),
-            };
-            if !want_read && !want_write && !want_except {
-                continue;
-            }
-            let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
-                return SyscallResult::Error(EBADF_VALUE);
-            };
-
-            let mut fd_ready = false;
-            let guard = tx_substrate::epoch::guard();
-            if let Some(efd) = file.eventfd() {
-                if want_read {
-                    if efd.counter() > 0 {
-                        fdset_set(&mut read_ready, fd);
-                        fd_ready = true;
-                    } else {
-                        push_unique_wait_token(
-                            &mut wait_tokens,
-                            tx_subsystems::execution::WaitToken::new(
-                                efd.reader_source_id(),
-                                tx_subsystems::eventfd::EVENTFD_READABLE,
-                            ),
-                        );
-                    }
-                }
-                if want_write {
-                    if efd.counter() < tx_subsystems::eventfd::EVENTFD_MAX {
-                        fdset_set(&mut write_ready, fd);
-                        fd_ready = true;
-                    } else {
-                        push_unique_wait_token(
-                            &mut wait_tokens,
-                            tx_subsystems::execution::WaitToken::new(
-                                efd.writer_source_id(),
-                                tx_subsystems::eventfd::EVENTFD_WRITABLE,
-                            ),
-                        );
-                    }
-                }
-            } else if let Some(tfd) = file.timerfd() {
-                if want_read {
-                    if timerfd_readable_level::<P>(tfd) {
-                        fdset_set(&mut read_ready, fd);
-                        fd_ready = true;
-                    } else {
-                        include_timerfd_deadline(&mut effective_deadline_ns, tfd.deadline_ns());
-                        push_unique_wait_token(
-                            &mut wait_tokens,
-                            tx_subsystems::execution::WaitToken::new(
-                                tfd.source_id(),
-                                tx_subsystems::timerfd::TIMERFD_READABLE,
-                            ),
-                        );
-                    }
-                }
-            } else if let Some(result) = socket_poll_mask_from_file(&file, &guard) {
-                let mask = match result {
-                    Ok(mask) => mask,
-                    Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
-                };
-                if pselect_socket_read_ready(want_read, mask) {
-                    fdset_set(&mut read_ready, fd);
-                    fd_ready = true;
-                }
-                if pselect_socket_write_ready(want_write, mask) {
-                    fdset_set(&mut write_ready, fd);
-                    fd_ready = true;
-                }
-                if want_except && mask.intersects(tx_subsystems::net::PollMask::ERR) {
-                    fdset_set(&mut except_ready, fd);
-                    fd_ready = true;
-                }
-                let (read_blocked, write_blocked) =
-                    pselect_socket_blocked_interests(want_read, want_write, mask);
-                if read_blocked {
-                    match socket_poll_wait_token_from_file(
-                        &file,
-                        tx_subsystems::net::PollMask::IN,
-                        &guard,
-                    ) {
-                        Some(Ok(Some(token))) => {
-                            push_unique_wait_token(&mut wait_tokens, token);
-                        }
-                        Some(Ok(None)) | None => {}
-                        Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
-                    }
-                }
-                if write_blocked {
-                    match socket_poll_wait_token_from_file(
-                        &file,
-                        tx_subsystems::net::PollMask::OUT,
-                        &guard,
-                    ) {
-                        Some(Ok(Some(token))) => {
-                            push_unique_wait_token(&mut wait_tokens, token);
-                        }
-                        Some(Ok(None)) | None => {}
-                        Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
-                    }
-                }
-            } else {
-                if want_read {
-                    let readable = match file.rnode().backing() {
-                        RNodeBacking::StructBacked {
-                            payload: StructPayload::Tty(tty),
-                        } => {
-                            use tx_subsystems::tty::execution::TTY_READABLE;
-                            if tty.input_readable.peek() & TTY_READABLE != 0 {
-                                true
-                            } else {
-                                push_unique_wait_token(
-                                    &mut wait_tokens,
-                                    tx_subsystems::execution::WaitToken::new(
-                                        tty.wait_source_id(),
-                                        TTY_READABLE,
-                                    ),
-                                );
-                                false
-                            }
-                        }
-                        RNodeBacking::StructBacked {
-                            payload:
-                                StructPayload::Pipe {
-                                    payload,
-                                    side: tx_subsystems::pipe::PipeSide::Reader,
-                                },
-                        } => {
-                            if payload.readable_level() {
-                                true
-                            } else {
-                                push_unique_wait_token(
-                                    &mut wait_tokens,
-                                    tx_subsystems::execution::WaitToken::new(
-                                        payload.reader_source_id(),
-                                        tx_subsystems::pipe::PIPE_READABLE,
-                                    ),
-                                );
-                                false
-                            }
-                        }
-                        _ => false,
-                    };
-                    if readable {
-                        fdset_set(&mut read_ready, fd);
-                        fd_ready = true;
-                    }
-                }
-                if want_write {
-                    let writable = match file.rnode().backing() {
-                        RNodeBacking::StructBacked {
-                            payload:
-                                StructPayload::Pipe {
-                                    payload,
-                                    side: tx_subsystems::pipe::PipeSide::Writer,
-                                },
-                        } => {
-                            if payload.writable_level() {
-                                true
-                            } else {
-                                push_unique_wait_token(
-                                    &mut wait_tokens,
-                                    tx_subsystems::execution::WaitToken::new(
-                                        payload.writer_source_id(),
-                                        tx_subsystems::pipe::PIPE_WRITABLE,
-                                    ),
-                                );
-                                false
-                            }
-                        }
-                        _ => false,
-                    };
-                    if writable {
-                        fdset_set(&mut write_ready, fd);
-                        fd_ready = true;
-                    }
-                }
-            }
-
-            if fd_ready {
-                ready_count += 1;
-            }
-        }
-
-        if ready_count != 0 || timeout == PselectTimeout::Poll {
-            break (read_ready, write_ready, except_ready, ready_count);
-        }
-        // Socket peers often make progress in another userspace task after this
-        // scan. Give that task one turn before parking on the selected token,
-        // then rescan so level-triggered readiness is observed directly.
-        if !yielded_before_wait && !wait_tokens.is_empty() {
-            yielded_before_wait = true;
-            tx_reactor::yield_now().await;
-            continue;
-        }
-        if wait_tokens.is_empty() {
-            if let Some(deadline_ns) = effective_deadline_ns {
-                wait_until_pselect_deadline::<P>(deadline_ns).await;
-            } else if timeout == PselectTimeout::Infinite {
-                tx_reactor::yield_now().await;
-                continue;
-            }
-            break (read_ready, write_ready, except_ready, ready_count);
-        };
-        let futures = wait_tokens
-            .into_iter()
-            .filter_map(wait_source::wait_on_token)
-            .collect::<alloc::vec::Vec<_>>();
-        if !futures.is_empty() {
-            if let Some(deadline_ns) = effective_deadline_ns {
-                match wait_on_any_token_or_pselect_deadline::<P>(futures, deadline_ns).await {
-                    PselectWaitWake::FdReady => {}
-                    PselectWaitWake::TimedOut => {
-                        break (read_ready, write_ready, except_ready, ready_count);
-                    }
-                }
-            } else {
-                wait_on_any_token(futures).await;
-            }
-        } else {
-            if let Some(deadline_ns) = effective_deadline_ns {
-                wait_until_pselect_deadline::<P>(deadline_ns).await;
-            }
-            break (read_ready, write_ready, except_ready, ready_count);
-        }
-    };
-
-    if ready_count != 0 && pselect_ready_return_should_yield() {
-        tx_reactor::yield_now().await;
-    }
-    if ready_count == 0 && timeout == PselectTimeout::Poll && pselect_empty_poll_should_yield() {
-        tx_reactor::yield_now().await;
-    }
-
-    if let Err(errno) = fdset_write(ctx, readfds, &read_ready) {
-        return SyscallResult::Error(errno);
-    }
-    if let Err(errno) = fdset_write(ctx, writefds, &write_ready) {
-        return SyscallResult::Error(errno);
-    }
-    if let Err(errno) = fdset_write(ctx, exceptfds, &except_ready) {
-        return SyscallResult::Error(errno);
-    }
-
-    SyscallResult::Return(ready_count)
-}
-
 fn pselect_ready_return_should_yield() -> bool {
     PSELECT_READY_RETURNS
         .fetch_add(1, Ordering::Relaxed)
@@ -1364,16 +1036,17 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
             break 0;
         }
 
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let process_timer_deadline = ctx.process.next_process_timer_deadline_ns();
-        if let Some(deadline_ns) = process_timer_deadline {
-            script_ctx = script_ctx.with_deadline(Deadline::from_raw(deadline_ns));
-        }
+        let futures = wait_tokens
+            .into_iter()
+            .filter_map(wait_source::wait_on_token)
+            .collect::<alloc::vec::Vec<_>>();
         if let Some(deadline_ns) = effective_deadline_ns {
             match wait_on_any_token_or_pselect_deadline::<P>(futures, deadline_ns).await {
                 PselectWaitWake::FdReady => {}
                 PselectWaitWake::TimedOut => break 0,
             }
+        } else if !futures.is_empty() {
+            wait_on_any_token(futures).await;
         }
     };
 
@@ -1918,6 +1591,121 @@ async fn yield_after_socket_write_if_needed(
         )
     {
         tx_reactor::yield_now().await;
+    }
+}
+
+async fn sys_read_socket<'a>(
+    file: &Cap<OpenFile>,
+    socket: Cap<tx_subsystems::net::SocketIdentity>,
+    buf_ptr: u64,
+    len: usize,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let mut flags = tx_subsystems::net::SendRecvFlags::empty();
+    if file.flags().nonblocking {
+        flags |= tx_subsystems::net::SendRecvFlags::MSG_DONTWAIT;
+    }
+    let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len.min(SOCKET_IO_MAX_INLINE)];
+
+    if matches!(
+        socket.kind,
+        tx_subsystems::net::SocketKind::NetlinkRoute
+            | tx_subsystems::net::SocketKind::NetlinkNetfilter
+    ) {
+        loop {
+            let result = match socket.kind {
+                tx_subsystems::net::SocketKind::NetlinkRoute => {
+                    tx_subsystems::net::netlink_route_recv(&socket, &mut staging, flags)
+                }
+                tx_subsystems::net::SocketKind::NetlinkNetfilter => {
+                    tx_subsystems::net::netlink_netfilter_recv(&socket, &mut staging, flags)
+                }
+                _ => unreachable!(),
+            };
+            match result {
+                Ok(recv) => {
+                    if recv > 0 {
+                        if let Err(errno) =
+                            bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..recv])
+                        {
+                            return SyscallResult::Error(errno_to_i32(errno));
+                        }
+                    }
+                    return SyscallResult::Return(recv as i64);
+                }
+                Err(tx_subsystems::execution::Errno::EAGAIN) if !flags.is_nonblocking() => {
+                    let wait_token = {
+                        let guard = tx_substrate::epoch::guard();
+                        socket_poll_wait_token_from_file(
+                            file,
+                            tx_subsystems::net::PollMask::IN,
+                            &guard,
+                        )
+                    };
+                    match wait_token {
+                        Some(Ok(Some(token))) => {
+                            if let Some(future) = wait_source::wait_on_token(token) {
+                                let _ = future.await;
+                            } else {
+                                return SyscallResult::Error(EIO_VALUE);
+                            }
+                        }
+                        Some(Ok(None)) | None => return SyscallResult::Error(EAGAIN_VALUE),
+                        Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
+                    }
+                }
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+    }
+
+    loop {
+        drive_loopback_pending();
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            tx_subsystems::net::execution::step_recv_kernel_bytes(
+                &socket,
+                &mut staging,
+                flags,
+                &guard,
+            )
+        };
+        match outcome {
+            tx_substrate::step::StepOutcome::Done(recv) => {
+                if recv.bytes > 0 {
+                    if let Err(errno) =
+                        bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..recv.bytes])
+                    {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                }
+                yield_after_socket_read_if_needed(&socket, recv.bytes).await;
+                return SyscallResult::Return(recv.bytes as i64);
+            }
+            tx_substrate::step::StepOutcome::Yield { shape, .. } => {
+                if flags.is_nonblocking() {
+                    return SyscallResult::Error(EAGAIN_VALUE);
+                }
+                match shape {
+                    tx_substrate::step::YieldShape::OnWaitSource { source, interests }
+                    | tx_substrate::step::YieldShape::OnEdge { source, interests } => {
+                        let token =
+                            tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
+                        if let Some(future) = wait_source::wait_on_token(token) {
+                            let _ = future.await;
+                        }
+                    }
+                    tx_substrate::step::YieldShape::OnAgent { .. }
+                    | tx_substrate::step::YieldShape::OnTimer { .. } => {
+                        return SyscallResult::Error(errno_to_i32(Errno::EIO));
+                    }
+                }
+            }
+            tx_substrate::step::StepOutcome::Continue { .. } => {}
+            tx_substrate::step::StepOutcome::Err(errno) => {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
     }
 }
 
@@ -2550,54 +2338,7 @@ pub(super) async fn sys_copy_file_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>
         }
     }
 
-    loop {
-        drive_loopback_pending();
-        let outcome = {
-            let guard = tx_substrate::epoch::guard();
-            tx_subsystems::net::execution::step_recv_kernel_bytes(
-                &socket,
-                &mut staging,
-                flags,
-                &guard,
-            )
-        };
-        match outcome {
-            tx_substrate::step::StepOutcome::Done(recv) => {
-                if recv.bytes > 0 {
-                    if let Err(errno) =
-                        bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..recv.bytes])
-                    {
-                        return SyscallResult::Error(errno_to_i32(errno));
-                    }
-                }
-                yield_after_socket_read_if_needed(&socket, recv.bytes).await;
-                return SyscallResult::Return(recv.bytes as i64);
-            }
-            tx_substrate::step::StepOutcome::Yield { shape, .. } => {
-                if flags.is_nonblocking() {
-                    return SyscallResult::Error(EAGAIN_VALUE);
-                }
-                match shape {
-                    tx_substrate::step::YieldShape::OnWaitSource { source, interests }
-                    | tx_substrate::step::YieldShape::OnEdge { source, interests } => {
-                        let token =
-                            tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
-                        if let Some(future) = wait_source::wait_on_token(token) {
-                            let _ = future.await;
-                        }
-                    }
-                    tx_substrate::step::YieldShape::OnAgent { .. }
-                    | tx_substrate::step::YieldShape::OnTimer { .. } => {
-                        return SyscallResult::Error(errno_to_i32(Errno::EIO));
-                    }
-                }
-            }
-            tx_substrate::step::StepOutcome::Continue { .. } => {}
-            tx_substrate::step::StepOutcome::Err(errno) => {
-                return SyscallResult::Error(errno_to_i32(errno));
-            }
-        }
-    }
+    SyscallResult::Return(transferred as i64)
 }
 
 fn inline_io_len_for_file(file: &Cap<OpenFile>, len: usize) -> usize {

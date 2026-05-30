@@ -507,6 +507,44 @@ impl MountNamespace {
         None
     }
 
+    pub fn mount_for_root_dentry(&self, root_dentry: &Cap<DEntry>) -> Option<Cap<MountIdentity>> {
+        let target_rnode_cap_addr = cap_raw_addr(root_dentry.rnode());
+        for e in self.mounts.lock().iter() {
+            let root = e.mount.root();
+            if cap_raw_addr(root) == target_rnode_cap_addr {
+                return Some(e.mount.clone_cap());
+            }
+        }
+        None
+    }
+
+    pub fn mount_for_containing_dentry(
+        &self,
+        dentry: &Cap<DEntry>,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<MountIdentity>> {
+        let payload = dentry.rnode().containing_mount_weak()?.upgrade(guard)?;
+        let payload_key = payload.key();
+        if self
+            .root
+            .payload_cap()
+            .ok()
+            .is_some_and(|root_payload| root_payload.key() == payload_key)
+        {
+            return Some(self.root.clone());
+        }
+        for e in self.mounts.lock().iter() {
+            if e.mount
+                .payload_cap()
+                .ok()
+                .is_some_and(|mount_payload| mount_payload.key() == payload_key)
+            {
+                return Some(e.mount.clone_cap());
+            }
+        }
+        None
+    }
+
     pub fn snapshot_mounts(&self) -> alloc::vec::Vec<MountSnapshot> {
         let _guard = crate::vfs::adapter::step_engine::guard();
         self.mounts
@@ -538,7 +576,7 @@ impl MountNamespace {
             .or_else(|| {
                 t.iter().position(|e| {
                     let root = e.mount.root();
-                    cap_raw_addr(root) == target_rnode_cap_addr || root.fs_object_id() == id
+                    cap_raw_addr(root) == target_rnode_cap_addr
                 })
             });
         if let Some(i) = pos {
@@ -706,6 +744,27 @@ pub fn mount_for_root_dentry(root_dentry: &Cap<DEntry>) -> Option<Cap<MountIdent
         .map(|entry| entry.mount.clone_cap())
 }
 
+/// Look up the registered mount identity that owns `dentry`, using the
+/// `MountPayload` stamped on the dentry's RNode.
+pub fn mount_for_containing_dentry(
+    dentry: &Cap<DEntry>,
+    guard: &Guard<'_>,
+) -> Option<Cap<MountIdentity>> {
+    let payload = dentry.rnode().containing_mount_weak()?.upgrade(guard)?;
+    let payload_key = payload.key();
+    let table = MOUNT_TABLE.lock();
+    table
+        .iter()
+        .find(|entry| {
+            entry
+                .mount
+                .payload_cap()
+                .ok()
+                .is_some_and(|mount_payload| mount_payload.key() == payload_key)
+        })
+        .map(|entry| entry.mount.clone_cap())
+}
+
 // ============================================================================
 // Mount table snapshot (for /proc/mounts)
 // ============================================================================
@@ -801,7 +860,6 @@ pub fn umount(
 
     let parent_payload_ptr = cap_payload_ptr(parent_payload);
     let child_fs_object_id = target_dentry.rnode().fs_object_id();
-    let target_rnode_id = target_dentry.rnode().fs_object_id();
     let target_rnode_cap_addr = cap_raw_addr(target_dentry.rnode());
 
     let mut table = MOUNT_TABLE.lock();
@@ -817,7 +875,7 @@ pub fn umount(
     let pos = pos.or_else(|| {
         table.iter().position(|entry| {
             let root = entry.mount.root();
-            cap_raw_addr(root) == target_rnode_cap_addr || root.fs_object_id() == target_rnode_id
+            cap_raw_addr(root) == target_rnode_cap_addr
         })
     });
 
@@ -1428,6 +1486,93 @@ mod tests {
         assert!(
             mount_for(&child_payload, mountpoint_id).is_none(),
             "child/source payload must not be used as the mountpoint lookup key"
+        );
+    }
+
+    #[test]
+    fn namespace_root_dentry_lookup_uses_rnode_identity_not_fs_object_id() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+
+        let parent_fs = Arc::new(MockFs);
+        let parent_payload = MountPayload::new_cap(
+            parent_fs.clone() as Arc<dyn FsOps>,
+            parent_fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(21),
+            MountOptions::default(),
+            "parentfs",
+            SourceLabel::Static("parent"),
+        )
+        .expect("parent mount payload");
+        let parent_root = RNode::new_cap_in_mount(
+            FsObjectId::ROOT,
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &parent_payload,
+        )
+        .expect("parent root rnode");
+        let parent_mount = MountIdentity::new_cap(
+            MountId::new(21),
+            None,
+            parent_root,
+            None,
+            parent_payload.clone(),
+            MountFlags::empty(),
+        )
+        .expect("parent mount");
+        let namespace = MountNamespace::new_cap(parent_mount).expect("mount namespace");
+
+        let make_child_mount = |dev: u32, mount_id: u64, source: &'static str| {
+            let fs = Arc::new(MockFs);
+            let payload = MountPayload::new_cap(
+                fs.clone() as Arc<dyn FsOps>,
+                fs as Arc<dyn FsPageBacking>,
+                None,
+                DevId::new(dev),
+                MountOptions::default(),
+                "tmpfs",
+                SourceLabel::Static(source),
+            )
+            .expect("child payload");
+            let root = RNode::new_cap_in_mount(
+                FsObjectId::new(2),
+                InodeMeta::new(InodeKind::Directory, 0o040755),
+                RNodeBacking::Directory,
+                &payload,
+            )
+            .expect("child root rnode");
+            let dentry = DEntry::new_cap(
+                crate::vfs::InlineName::new(source.as_bytes()).expect("inline name"),
+                root.clone(),
+            )
+            .expect("child root dentry");
+            let mount = MountIdentity::new_cap(
+                MountId::new(mount_id),
+                None,
+                root,
+                None,
+                payload,
+                MountFlags::empty(),
+            )
+            .expect("child mount");
+            (mount, dentry)
+        };
+
+        let (first_mount, _first_root_dentry) = make_child_mount(22, 22, "first");
+        let (second_mount, second_root_dentry) = make_child_mount(23, 23, "second");
+        namespace.register_mount(&parent_payload, FsObjectId::new(41), first_mount);
+        namespace.register_mount(&parent_payload, FsObjectId::new(42), second_mount.clone());
+
+        assert_eq!(
+            namespace
+                .mount_for_root_dentry(&second_root_dentry)
+                .expect("second root mount")
+                .id(),
+            second_mount.id()
         );
     }
 

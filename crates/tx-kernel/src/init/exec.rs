@@ -652,6 +652,9 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_subsystems::reactor_submit::install_submit_child_thread(
             Self::submit_child_thread_into_boot_reactor,
         );
+        tx_subsystems::reactor_submit::install_submit_aio_worker(
+            Self::submit_aio_worker_into_boot_reactor,
+        );
     }
 
     pub(crate) fn install_reactor_affinity_seam() {
@@ -841,6 +844,7 @@ impl<P: TxPlatform> CoreInit<P> {
             // ran under.
             let submitted_child_before_poll =
                 Self::drain_pending_child_submits() || Self::drain_pending_timer_signal_submits();
+            let submitted_aio_before_poll = Self::drain_pending_aio_workers();
 
             // The userspace trap shell returns through a longjmp-like path, so
             // do not carry a pre-entry CpuId local across reactor iterations.
@@ -851,6 +855,7 @@ impl<P: TxPlatform> CoreInit<P> {
             };
             let submitted_child_after_poll =
                 Self::drain_pending_child_submits() || Self::drain_pending_timer_signal_submits();
+            let submitted_aio_after_poll = Self::drain_pending_aio_workers();
 
             // EBR drain. Caps retired during the task polls above
             // (e.g. `Cap<OpenFile>` from `sys_close` / process exit fd
@@ -881,6 +886,8 @@ impl<P: TxPlatform> CoreInit<P> {
             if step.should_idle()
                 && !submitted_child_before_poll
                 && !submitted_child_after_poll
+                && !submitted_aio_before_poll
+                && !submitted_aio_after_poll
                 && !ebr_active
                 && !init.is_zombie()
             {

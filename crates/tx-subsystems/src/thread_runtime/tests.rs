@@ -22,7 +22,7 @@ use crate::thread_runtime::step_thread_exit;
 use crate::thread_runtime::structure::{
     bind_thread_task, current_thread_task, drain_pending_syscall_return,
     reset_tid_counter_for_test, set_current_thread_payload, thread_by_tid, thread_payload_by_tid,
-    thread_task_by_tid, ThreadIdentity,
+    thread_task_by_tid, CpuAccountingMode, ThreadIdentity,
 };
 use crate::vm::adapter::step_engine::page_allocator;
 use crate::vm::{
@@ -115,6 +115,25 @@ fn read_user_u32(aspace: &AddressSpace, addr: u64) -> u32 {
     };
     drop(eguard);
     value
+}
+
+#[test]
+fn cpu_accounting_charges_thread_and_process_totals() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+    let payload = leader.payload_cap().expect("alive thread payload");
+
+    assert_eq!(payload.cpu_time_ns(), 0);
+    assert_eq!(proc_cap.cpu_time_ns(), Some(0));
+
+    payload.charge_cpu_time(CpuAccountingMode::User, 11_000);
+    payload.charge_cpu_time(CpuAccountingMode::Kernel, 7_000);
+
+    assert_eq!(payload.user_cpu_time_ns(), 11_000);
+    assert_eq!(payload.system_cpu_time_ns(), 7_000);
+    assert_eq!(payload.cpu_time_ns(), 18_000);
+    assert_eq!(proc_cap.cpu_time_ns(), Some(18_000));
 }
 
 #[test]

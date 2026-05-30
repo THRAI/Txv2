@@ -14,6 +14,26 @@ use tx_hal::{UserSaFlagsAbi, UserSigInfoAbi, UserSignalMaskAbi, UserTrapContext}
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 
+// Cooperative SIGALRM delivery can land at a syscall boundary instead of
+// inside the following blocking syscall. Keep one interrupt token so that wait
+// paths still observe the signal as `-EINTR`.
+static ITIMER_REAL_DELIVERED_INTERRUPTS: SpinMutex<BTreeSet<u32>> = SpinMutex::new(BTreeSet::new());
+
+const SIGALRM_RAW: u8 = 14;
+const RV64_SIGFRAME_ALIGN: usize = 16;
+const RV64_SIGFRAME_MAGIC: u64 = 0x5458_5632_5349_4731; // "TXV2SIG1"
+const RV64_SIGFRAME_VERSION: u32 = 1;
+const RV64_RT_SIGRETURN_SYSCALL: u32 = 139;
+const RV64_ECALL: u32 = 0x0000_0073;
+const CLOCK_GETRES_NS: i64 = 2_000_000;
+
+const fn rv64_addi(rd: u32, rs1: u32, imm: u32) -> u32 {
+    ((imm & 0x0fff) << 20) | (rs1 << 15) | (rd << 7) | 0x13
+}
+
+const RV64_SIGRETURN_TRAMPOLINE: [u32; 2] =
+    [rv64_addi(17, 0, RV64_RT_SIGRETURN_SYSCALL), RV64_ECALL];
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct TimespecLayout {
@@ -40,6 +60,21 @@ pub(super) struct ItimervalLayout {
 pub(super) struct ItimerspecLayout {
     pub(super) it_interval: TimespecLayout,
     pub(super) it_value: TimespecLayout,
+}
+
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub(super) struct CompatSignalFrame {
+    pub(super) magic: u64,
+    pub(super) version: u32,
+    pub(super) frame_size: u32,
+    pub(super) sig_no: u32,
+    pub(super) _reserved0: u32,
+    pub(super) flags: u64,
+    pub(super) siginfo: UserSigInfoAbi,
+    pub(super) saved_mask: UserSignalMaskAbi,
+    pub(super) user_context: UserTrapContext,
+    pub(super) trampoline: [u32; 2],
 }
 
 #[repr(C)]
@@ -383,6 +418,13 @@ pub(super) fn read_timespec_at(aspace: &AddressSpace, uaddr: u64) -> Option<u64>
     Some((ts.tv_sec as u64).saturating_mul(1_000_000_000) + (ts.tv_nsec as u64))
 }
 
+fn read_timespec_ns_checked(aspace: &AddressSpace, uaddr: u64) -> Result<u64, SyscallResult> {
+    if uaddr == 0 {
+        return Err(SyscallResult::Error(EFAULT_VALUE));
+    }
+    read_timespec_at(aspace, uaddr).ok_or(SyscallResult::Error(EINVAL_VALUE))
+}
+
 fn read_timeval_at(aspace: &AddressSpace, uaddr: u64) -> Option<u64> {
     if uaddr == 0 {
         return None;
@@ -680,7 +722,17 @@ pub(super) fn sys_clock_gettime<'a, P: TimeIf>(
     let Some(clock) = decode_clock_id(clk_id) else {
         return SyscallResult::Error(EINVAL_VALUE);
     };
-    let ns = tx_subsystems::timekeeping::clock_now_ns::<P>(clock);
+    let ns = match clock {
+        tx_subsystems::timekeeping::ClockId::ThreadCpuTime => ctx
+            .thread
+            .payload_cap()
+            .map(|payload| payload.cpu_time_ns())
+            .unwrap_or(0),
+        tx_subsystems::timekeeping::ClockId::ProcessCpuTime => {
+            ctx.process.cpu_time_ns().unwrap_or(0)
+        }
+        _ => tx_subsystems::timekeeping::clock_now_ns::<P>(clock),
+    };
     let ts = ns_to_timespec(ns);
     if let Err(errno) = bootstrap_write_user::<TimespecLayout>(&ctx.aspace, ts_uaddr, ts) {
         return SyscallResult::error_from(errno);
@@ -716,41 +768,6 @@ pub(super) fn sys_clock_settime<'a, P: TimeIf>(
         Ok(_) => SyscallResult::Return(0),
         Err(_) => SyscallResult::Error(EINVAL_VALUE),
     }
-}
-
-/// `clock_getres(clk_id, res)`. Linux RV64 generic ABI
-/// `__NR_clock_getres = 114`.
-///
-/// Mirrors `clock_gettime`'s v1 clock-id surface. The platform time
-/// source is nanosecond-shaped, so the fixed reported resolution is
-/// one nanosecond. Linux permits a null `res` pointer; it still
-/// validates the clock id first.
-pub(super) fn sys_clock_getres<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    let clk_id = args[0] as u32;
-    match clk_id {
-        CLOCK_REALTIME
-        | CLOCK_REALTIME_COARSE
-        | CLOCK_MONOTONIC
-        | CLOCK_PROCESS_CPUTIME_ID
-        | CLOCK_THREAD_CPUTIME_ID
-        | CLOCK_MONOTONIC_RAW
-        | CLOCK_MONOTONIC_COARSE
-        | CLOCK_BOOTTIME
-        | CLOCK_TAI => {}
-        _ => return SyscallResult::Error(EINVAL_VALUE),
-    }
-
-    let res_uaddr = args[1];
-    if res_uaddr != 0 {
-        let res = TimespecLayout {
-            tv_sec: 0,
-            tv_nsec: 1,
-        };
-        if let Err(errno) = bootstrap_write_user::<TimespecLayout>(&ctx.aspace, res_uaddr, res) {
-            return SyscallResult::error_from(errno);
-        }
-    }
-    SyscallResult::Return(0)
 }
 
 /// `clock_getres(clk_id, res)`. Linux RV64 generic ABI
@@ -847,7 +864,16 @@ pub(super) fn sys_getitimer<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>)
     );
     let spec = match which {
         ITIMER_REAL => ctx.process.itimer_real(now_ns).unwrap_or_default(),
-        ITIMER_VIRTUAL | ITIMER_PROF => return SyscallResult::error_from(Errno::EOPNOTSUPP),
+        ITIMER_VIRTUAL => ctx
+            .process
+            .user_cpu_time_ns()
+            .and_then(|now| ctx.process.itimer_virtual(now))
+            .unwrap_or_default(),
+        ITIMER_PROF => ctx
+            .process
+            .cpu_time_ns()
+            .and_then(|now| ctx.process.itimer_prof(now))
+            .unwrap_or_default(),
         _ => return SyscallResult::Error(EINVAL_VALUE),
     };
     if let Err(errno) =
@@ -874,7 +900,16 @@ pub(super) fn sys_setitimer<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>)
             .process
             .set_itimer_real(now_ns, new_value)
             .unwrap_or_default(),
-        ITIMER_VIRTUAL | ITIMER_PROF => return SyscallResult::error_from(Errno::EOPNOTSUPP),
+        ITIMER_VIRTUAL => ctx
+            .process
+            .user_cpu_time_ns()
+            .and_then(|now| ctx.process.set_itimer_virtual(now, new_value))
+            .unwrap_or_default(),
+        ITIMER_PROF => ctx
+            .process
+            .cpu_time_ns()
+            .and_then(|now| ctx.process.set_itimer_prof(now, new_value))
+            .unwrap_or_default(),
         _ => return SyscallResult::Error(EINVAL_VALUE),
     };
     if old_uaddr != 0 {
@@ -1114,11 +1149,45 @@ pub(super) async fn sleep_until_deadline<'a, P: TimeIf>(
 }
 
 pub(super) fn itimer_real_deadline_ns(pid: u32) -> Option<u64> {
-    with_interval_timers(|timers| {
-        timers
-            .get(&(pid, ITIMER_REAL))
-            .and_then(|timer| (timer.deadline_ns != 0).then_some(timer.deadline_ns))
+    tx_subsystems::process::numbers::resolve_pid_number_as(
+        pid as u64,
+        tx_subsystems::process::numbers::PidNameKind::Process,
+    )
+    .and_then(|name| match name {
+        tx_subsystems::process::numbers::PidName::Process(process) => {
+            process.next_process_timer_deadline_ns()
+        }
+        _ => None,
     })
+}
+
+pub fn poll_due_itimers<P: TimeIf>(process: &Cap<ProcessIdentity>) -> Option<u64> {
+    let now_ns = tx_subsystems::timekeeping::clock_now_ns::<P>(
+        tx_subsystems::timekeeping::ClockId::Monotonic,
+    );
+    let Some(expired) = process.consume_expired_timers(now_ns) else {
+        return None;
+    };
+    for signal in expired {
+        if signal.signum != tx_subsystems::signal::Signum::SIGALRM.raw() as u32 {
+            continue;
+        }
+        let Some(signum) = u8::try_from(signal.signum)
+            .ok()
+            .and_then(tx_subsystems::signal::Signum::new)
+        else {
+            continue;
+        };
+        let info = tx_subsystems::signal::SigInfo {
+            si_signo: signum.raw() as u32,
+            si_code: SI_TIMER_VALUE,
+            si_pid: 0,
+            si_uid: 0,
+            si_value: signal.sigval,
+        };
+        let _ = tx_subsystems::signal::step_kill_process(process, signum, Some(info));
+    }
+    process.next_process_timer_deadline_ns()
 }
 
 pub(super) fn consume_itimer_real_delivered_interrupt(pid: u32) -> bool {
@@ -1126,22 +1195,24 @@ pub(super) fn consume_itimer_real_delivered_interrupt(pid: u32) -> bool {
 }
 
 fn take_due_itimer_real<P: TimeIf>(pid: u32) -> bool {
-    with_interval_timers(|timers| {
-        let key = (pid, ITIMER_REAL);
-        let Some(timer) = timers.get_mut(&key) else {
-            return false;
-        };
-        let now_ns = P::read_ns();
-        if timer.deadline_ns == 0 || timer.deadline_ns > now_ns {
-            return false;
+    tx_subsystems::process::numbers::resolve_pid_number_as(
+        pid as u64,
+        tx_subsystems::process::numbers::PidNameKind::Process,
+    )
+    .and_then(|name| match name {
+        tx_subsystems::process::numbers::PidName::Process(process) => {
+            let now_ns = tx_subsystems::timekeeping::clock_now_ns::<P>(
+                tx_subsystems::timekeeping::ClockId::Monotonic,
+            );
+            process.consume_expired_timers(now_ns).map(|expired| {
+                expired.into_iter().any(|signal| {
+                    signal.signum == tx_subsystems::signal::Signum::SIGALRM.raw() as u32
+                })
+            })
         }
-        if timer.interval_ns == 0 {
-            timers.remove(&key);
-        } else {
-            timer.deadline_ns = now_ns.saturating_add(timer.interval_ns);
-        }
-        true
+        _ => None,
     })
+    .unwrap_or(false)
 }
 
 pub fn maybe_deliver_itimer_signal<P: TimeIf + tx_hal::PlatformConfig>(
@@ -1255,7 +1326,6 @@ const fn align_down(value: usize, align: usize) -> usize {
 
 #[cfg(test)]
 pub(super) fn reset_itimer_registry_for_test() {
-    with_interval_timers(|timers| timers.clear());
     ITIMER_REAL_DELIVERED_INTERRUPTS.lock().clear();
 }
 /// `nanosleep(req, rem)`. Linux RV64 generic ABI

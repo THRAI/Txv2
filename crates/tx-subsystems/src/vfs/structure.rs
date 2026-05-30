@@ -1210,27 +1210,6 @@ impl OpenFile {
         step_engine::sign(file)
     }
 
-    pub fn new_pidfd(process: Cap<ProcessIdentity>, flags: OpenFileFlags) -> Self {
-        Self {
-            backing: OpenFileBacking::Pidfd { process },
-            offset: AtomicU64::new(0),
-            readdir_cursor: AtomicU64::new(0),
-            nonblocking_override: AtomicI8::new(-1),
-            flags,
-            opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
-            sealable: false,
-            seal_state: AtomicU32::new(0),
-        }
-    }
-
-    pub fn new_pidfd_cap(
-        process: Cap<ProcessIdentity>,
-        flags: OpenFileFlags,
-    ) -> Result<Cap<Self>, ZoneError> {
-        step_engine::sign(Self::new_pidfd(process, flags))
-    }
-
     /// Like [`Self::new_cap`] but also records the DEntry that
     /// `step_open` resolved so `fchdir` can recover it later.
     pub fn new_cap_with_dentry(
@@ -1437,6 +1416,9 @@ impl OpenFile {
             nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
+            sealable: false,
+            seal_state: AtomicU32::new(0),
         }
     }
 
@@ -1457,6 +1439,9 @@ impl OpenFile {
             nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
+            sealable: false,
+            seal_state: AtomicU32::new(0),
         }
     }
 
@@ -1477,6 +1462,9 @@ impl OpenFile {
             nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
+            sealable: false,
+            seal_state: AtomicU32::new(0),
         }
     }
 

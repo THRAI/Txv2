@@ -12,11 +12,11 @@ use crate::linux_syscall::{
 };
 use tx_subsystems::cred::{step_setresuid, Uid};
 use tx_subsystems::signal::{step_sigaction, SigDisposition, Signum};
+use tx_subsystems::thread_runtime::structure::CpuAccountingMode;
 
 const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
 const E_INTR: i32 = 4;
-const E_OPNOTSUPP: i32 = 95;
 const E_PERM: i32 = 1;
 const OSCOMP_IMAGE_TIMESTAMP_FLOOR_SEC: i64 = 1_779_473_960;
 const SIGALRM_RAW: u8 = 14;
@@ -155,7 +155,7 @@ fn dispatch_setitimer_real_sets_timer_and_returns_old_value() {
 }
 
 #[test]
-fn dispatch_setitimer_rejects_cpu_timer_until_cpu_accounting_lands() {
+fn dispatch_setitimer_accepts_prof_cpu_timer() {
     let (_setup, proc_cap, thread) = time_setup();
     let ctx = make_ctx(proc_cap, thread);
     let new_timer = TestItimerval::default();
@@ -175,7 +175,7 @@ fn dispatch_setitimer_rejects_cpu_timer_until_cpu_accounting_lands() {
         &ctx,
     ));
 
-    assert_eq!(result, SyscallResult::Error(95));
+    assert_eq!(result, SyscallResult::Return(0));
 }
 
 #[test]
@@ -599,12 +599,13 @@ fn dispatch_adjtimex_readonly_fills_timex_and_returns_time_ok() {
 }
 
 #[test]
-fn dispatch_adjtimex_unsupported_slew_mode_returns_eopnotsupp() {
+fn dispatch_adjtimex_offset_and_frequency_bookkeeping_round_trip() {
     let (_setup, proc_cap, thread) = time_setup();
     let ctx = make_ctx(proc_cap, thread);
     let mut tx = TestTimex {
-        modes: ADJ_OFFSET,
+        modes: ADJ_OFFSET | crate::linux_syscall::ADJ_FREQUENCY,
         offset: 42,
+        freq: 123,
         ..TestTimex::default()
     };
 
@@ -616,7 +617,78 @@ fn dispatch_adjtimex_unsupported_slew_mode_returns_eopnotsupp() {
         &ctx,
     ));
 
-    assert_eq!(result, SyscallResult::Error(95));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(tx.offset, 42_000);
+    assert_eq!(tx.freq, 123);
+}
+
+#[test]
+fn dispatch_adjtimex_ltp_bookkeeping_mask_accepts_linux_tick() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let mut tx = TestTimex {
+        modes: ADJ_OFFSET
+            | crate::linux_syscall::ADJ_FREQUENCY
+            | crate::linux_syscall::ADJ_MAXERROR
+            | crate::linux_syscall::ADJ_ESTERROR
+            | crate::linux_syscall::ADJ_STATUS
+            | ADJ_TIMECONST
+            | ADJ_TICK,
+        status: 0x2000,
+        tick: 10_000,
+        ..TestTimex::default()
+    };
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_ADJTIMEX,
+            [&mut tx as *mut TestTimex as u64, 0, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Return(0));
+}
+
+#[test]
+fn dispatch_adjtimex_rejects_bare_single_shot_high_bit() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let mut tx = TestTimex {
+        modes: 0x8000,
+        ..TestTimex::default()
+    };
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_ADJTIMEX,
+            [&mut tx as *mut TestTimex as u64, 0, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_INVAL));
+}
+
+#[test]
+fn dispatch_adjtimex_accepts_single_shot_as_bookkeeping_noop() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let mut tx = TestTimex {
+        modes: 0x8001,
+        offset: 123,
+        ..TestTimex::default()
+    };
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_ADJTIMEX,
+            [&mut tx as *mut TestTimex as u64, 0, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Return(0));
 }
 
 #[test]
@@ -786,23 +858,34 @@ fn dispatch_clock_gettime_monotonic_writes_timespec_to_user() {
     );
 }
 
-/// CPU-time clock ids alias to the platform monotonic in v1 and
-/// must succeed.
 #[test]
-fn dispatch_clock_gettime_cputime_aliases_to_monotonic() {
+fn dispatch_clock_gettime_cputime_reads_accounted_thread_and_process_time() {
     let (_setup, proc_cap, thread) = time_setup();
+    let payload = thread.payload_cap().expect("alive thread payload");
+    payload.charge_cpu_time(CpuAccountingMode::User, 2_500_000_000);
+    payload.charge_cpu_time(CpuAccountingMode::Kernel, 750_000_000);
     let ctx = make_ctx(proc_cap, thread);
     let mut ts = TestTimespec::default();
     let ts_uaddr = &mut ts as *mut TestTimespec as u64;
-    for clk in [
-        CLOCK_REALTIME,
-        CLOCK_PROCESS_CPUTIME_ID,
-        CLOCK_THREAD_CPUTIME_ID,
-    ] {
-        let req = SyscallRequest::new(NR_CLOCK_GETTIME, [clk as u64, ts_uaddr, 0, 0, 0, 0]);
-        let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-        assert_eq!(result, SyscallResult::Return(0), "clk_id {clk}");
-    }
+
+    let req = SyscallRequest::new(
+        NR_CLOCK_GETTIME,
+        [CLOCK_THREAD_CPUTIME_ID as u64, ts_uaddr, 0, 0, 0, 0],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(ts.tv_sec, 3);
+    assert_eq!(ts.tv_nsec, 250_000_000);
+
+    ts = TestTimespec::default();
+    let req = SyscallRequest::new(
+        NR_CLOCK_GETTIME,
+        [CLOCK_PROCESS_CPUTIME_ID as u64, ts_uaddr, 0, 0, 0, 0],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(ts.tv_sec, 3);
+    assert_eq!(ts.tv_nsec, 250_000_000);
 }
 
 /// Unrecognised clock ids return `-EINVAL`.
@@ -1235,7 +1318,7 @@ fn dispatch_getitimer_real_returns_current_timer() {
 }
 
 #[test]
-fn dispatch_setitimer_rejects_invalid_timeval_and_defers_cpu_timers() {
+fn dispatch_setitimer_rejects_invalid_timeval_and_accepts_cpu_timers() {
     let (_setup, proc_cap, thread) = time_setup();
     let ctx = make_ctx(proc_cap, thread);
     let invalid = TestItimerval {
@@ -1280,7 +1363,7 @@ fn dispatch_setitimer_rejects_invalid_timeval_and_defers_cpu_timers() {
         ),
         &ctx,
     ));
-    assert_eq!(result, SyscallResult::Error(E_OPNOTSUPP));
+    assert_eq!(result, SyscallResult::Return(0));
 }
 
 /// `nanosleep((0, 0), _)` short-circuits to `Return(0)` per the

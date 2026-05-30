@@ -5,17 +5,24 @@ use super::*;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
 use tx_subsystems::mount::{
-    DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
+    DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
+    SourceLabel,
 };
-use tx_subsystems::process::step_chdir;
-use tx_subsystems::vfs::structure::{DEntry, InlineName, RNodeBacking, StructPayload, S_IFREG};
+use tx_subsystems::page_backed::FsPageBacking;
+use tx_subsystems::process::{step_chdir, step_set_mount_namespace};
+use tx_subsystems::vfs::structure::{
+    Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, StructPayload,
+    S_IFDIR, S_IFREG,
+};
 use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
-    AT_FDCWD, CLONE_NEWNET, CLONE_NEWUSER, EPERM_VALUE, NR_OPENAT, NR_SETNS, NR_UNSHARE, NR_WRITE,
-    O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY,
+    AT_FDCWD, CLONE_NEWNET, CLONE_NEWUSER, CLONE_NEWUTS, EFAULT_VALUE, EINVAL_VALUE, EPERM_VALUE,
+    NR_OPENAT, NR_SETDOMAINNAME, NR_SETHOSTNAME, NR_SETNS, NR_UNAME, NR_UNSHARE, NR_WRITE, O_CREAT,
+    O_RDONLY, O_TRUNC, O_WRONLY,
 };
 
 fn netns_req(nr: u64, args: [u64; 6], ctx: &SyscallCtx<'static>) -> SyscallResult {
@@ -76,6 +83,36 @@ fn path_display(path: &[u8]) -> alloc::string::String {
     alloc::string::String::from_utf8_lossy(without_nul).into_owned()
 }
 
+fn uts_field(buf: &[u8; 6 * 65], idx: usize) -> &[u8] {
+    let start = idx * 65;
+    let field = &buf[start..start + 65];
+    let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+    &field[..end]
+}
+
+fn uname_fields(ctx: &SyscallCtx<'static>) -> [u8; 6 * 65] {
+    let mut buf = [0u8; 6 * 65];
+    let result = netns_req(NR_UNAME, [buf.as_mut_ptr() as u64, 0, 0, 0, 0, 0], ctx);
+    assert_eq!(result, SyscallResult::Return(0));
+    buf
+}
+
+fn set_hostname(ctx: &SyscallCtx<'static>, name: &[u8]) -> SyscallResult {
+    netns_req(
+        NR_SETHOSTNAME,
+        [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0],
+        ctx,
+    )
+}
+
+fn set_domainname(ctx: &SyscallCtx<'static>, name: &[u8]) -> SyscallResult {
+    netns_req(
+        NR_SETDOMAINNAME,
+        [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0],
+        ctx,
+    )
+}
+
 fn build_procfs_root(dev_id: u32, mount_id: u64) -> Cap<DEntry> {
     let procfs = tx_fs::procfs::Procfs::new();
     let fs_ops = tx_fs::procfs::Procfs::fs_ops_arc();
@@ -112,6 +149,108 @@ fn build_procfs_root(dev_id: u32, mount_id: u64) -> Cap<DEntry> {
     .expect("procfs mount identity");
 
     DEntry::new_cap(InlineName::ROOT, root_rnode).expect("procfs root dentry")
+}
+
+fn chdir_to_root_with_procfs_mount(
+    process: &Cap<tx_subsystems::process::ProcessIdentity>,
+    dev_id: u32,
+) {
+    tx_subsystems::cross_crate_test_support::reset_mount_table();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let root_payload = MountPayload::new_cap(
+        tmpfs.clone() as Arc<dyn FsOps>,
+        tmpfs.clone() as Arc<dyn FsPageBacking>,
+        None,
+        DevId::new(dev_id),
+        MountOptions::default(),
+        "netns-test-rootfs",
+        SourceLabel::Static("netns-test-rootfs"),
+    )
+    .expect("rootfs mount payload");
+    let root_rnode = RNode::new_cap_in_mount(
+        TMPFS_ROOT_OBJECT_ID,
+        InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
+        RNodeBacking::Directory,
+        &root_payload,
+    )
+    .expect("rootfs root rnode");
+    let root_mount = MountIdentity::new_cap(
+        MountId::new(dev_id as u64),
+        None,
+        root_rnode.clone(),
+        None,
+        root_payload.clone(),
+        MountFlags::empty(),
+    )
+    .expect("rootfs mount identity");
+    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
+
+    let guard = guard();
+    let (proc_id, proc_meta) = match tmpfs.mkdir(
+        TMPFS_ROOT_OBJECT_ID,
+        b"proc",
+        0o555,
+        &Credential::root(),
+        &guard,
+    ) {
+        StepOutcome::Done(created) => created,
+        other => panic!("mkdir /proc failed: {other:?}"),
+    };
+    let proc_mountpoint_rnode =
+        RNode::new_cap_in_mount(proc_id, proc_meta, RNodeBacking::Directory, &root_payload)
+            .expect("/proc mountpoint rnode");
+    let proc_mountpoint = DEntry::new_cap(
+        InlineName::new(b"proc").expect("proc name"),
+        proc_mountpoint_rnode,
+    )
+    .expect("/proc mountpoint dentry");
+
+    let procfs = tx_fs::procfs::Procfs::new();
+    let proc_payload = MountPayload::new_cap(
+        tx_fs::procfs::Procfs::fs_ops_arc(),
+        Arc::new(tx_fs::procfs::Procfs::new()) as Arc<dyn FsPageBacking>,
+        None,
+        DevId::new(dev_id + 1000),
+        MountOptions::default(),
+        "proc",
+        SourceLabel::Static("proc"),
+    )
+    .expect("procfs mount payload");
+    let proc_root_meta = match procfs.load_inode_meta(tx_fs::procfs::PROCFS_ROOT_ID, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load procfs root meta failed: {other:?}"),
+    };
+    let proc_root_rnode = match procfs.materialise_rnode(
+        tx_fs::procfs::PROCFS_ROOT_ID,
+        proc_root_meta,
+        &proc_payload,
+        &guard,
+    ) {
+        StepOutcome::Done(rnode) => rnode,
+        other => panic!("materialise procfs root failed: {other:?}"),
+    };
+    let proc_mount = MountIdentity::new_cap(
+        MountId::new(dev_id as u64 + 1000),
+        Some(proc_mountpoint),
+        proc_root_rnode,
+        None,
+        proc_payload,
+        MountFlags::empty(),
+    )
+    .expect("procfs mount identity");
+    tx_subsystems::mount::register_mount(&root_payload, proc_id, proc_mount.clone());
+
+    let mnt_ns = MountNamespace::new_cap(root_mount).expect("mount namespace");
+    mnt_ns.register_mount(&root_payload, proc_id, proc_mount);
+    step_set_mount_namespace(process, mnt_ns).expect("publish test mount namespace");
+
+    match step_chdir(process, root_dentry) {
+        tx_subsystems::process::ChdirOutcome::Replaced { .. } => {}
+        tx_subsystems::process::ChdirOutcome::ZombieIgnored => {
+            panic!("process zombified while installing rootfs")
+        }
+    }
 }
 
 #[test]
@@ -304,9 +443,105 @@ fn dispatch_unprivileged_newuser_newnet_combined_uses_new_userns_authority() {
 }
 
 #[test]
+fn dispatch_sethostname_and_setdomainname_update_current_uts_uname() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process.clone(), thread);
+
+    assert_eq!(set_hostname(&ctx, b"tx-uts-a"), SyscallResult::Return(0));
+    assert_eq!(
+        set_domainname(&ctx, b"lab.example"),
+        SyscallResult::Return(0)
+    );
+
+    let uts = uname_fields(&ctx);
+    assert_eq!(uts_field(&uts, 1), b"tx-uts-a");
+    assert_eq!(uts_field(&uts, 5), b"lab.example");
+}
+
+#[test]
+fn dispatch_unshare_clone_newuts_copies_then_isolates_hostname() {
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    let parent_ctx = make_ctx(parent.clone(), parent_thread);
+    assert_eq!(
+        set_hostname(&parent_ctx, b"parent-host"),
+        SyscallResult::Return(0)
+    );
+
+    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false)
+        .expect("fork child process");
+    let child_thread = first_thread(&child);
+    let child_ctx = make_ctx(child.clone(), child_thread);
+    let inherited = uname_fields(&child_ctx);
+    assert_eq!(uts_field(&inherited, 1), b"parent-host");
+
+    assert_eq!(
+        netns_req(NR_UNSHARE, [CLONE_NEWUTS, 0, 0, 0, 0, 0], &child_ctx),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        set_hostname(&child_ctx, b"child-host"),
+        SyscallResult::Return(0)
+    );
+
+    let parent_uts = uname_fields(&parent_ctx);
+    let child_uts = uname_fields(&child_ctx);
+    assert_eq!(uts_field(&parent_uts, 1), b"parent-host");
+    assert_eq!(uts_field(&child_uts, 1), b"child-host");
+}
+
+#[test]
+fn dispatch_unprivileged_newuser_newuts_combined_allows_uts_mutation() {
+    let _setup = setup();
+    let process = bootstrap();
+    make_unprivileged(&process);
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process.clone(), thread);
+
+    assert_eq!(
+        set_hostname(&ctx, b"denied"),
+        SyscallResult::Error(EPERM_VALUE)
+    );
+    assert_eq!(
+        netns_req(
+            NR_UNSHARE,
+            [CLONE_NEWUSER | CLONE_NEWUTS, 0, 0, 0, 0, 0],
+            &ctx
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(set_hostname(&ctx, b"user-uts"), SyscallResult::Return(0));
+
+    let uts = uname_fields(&ctx);
+    assert_eq!(uts_field(&uts, 1), b"user-uts");
+}
+
+#[test]
+fn dispatch_sethostname_validates_pointer_and_length() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process.clone(), thread);
+    let too_long = [b'x'; 65];
+
+    assert_eq!(
+        netns_req(NR_SETHOSTNAME, [0, 1, 0, 0, 0, 0], &ctx),
+        SyscallResult::Error(EFAULT_VALUE)
+    );
+    assert_eq!(
+        set_hostname(&ctx, &too_long),
+        SyscallResult::Error(EINVAL_VALUE)
+    );
+}
+
+#[test]
 fn dispatch_proc_self_userns_maps_accept_ltp_setup_sequence() {
     let _setup = setup();
     let process = bootstrap();
+    chdir_to_root_with_procfs_mount(&process, 74);
     make_unprivileged(&process);
     let thread = first_thread(&process);
     let ctx = make_ctx(process.clone(), thread);
@@ -366,6 +601,7 @@ fn dispatch_proc_self_userns_maps_accept_ltp_setup_sequence() {
 fn dispatch_proc_self_userns_maps_reject_rewrites_and_gid_before_deny() {
     let _setup = setup();
     let process = bootstrap();
+    chdir_to_root_with_procfs_mount(&process, 75);
     make_unprivileged(&process);
     let thread = first_thread(&process);
     let ctx = make_ctx(process.clone(), thread);
@@ -431,9 +667,80 @@ fn dispatch_setns_clone_newnet_joins_namespace_fd_payload() {
 }
 
 #[test]
+fn dispatch_setns_clone_newuts_joins_procfs_namespace_fd_payload() {
+    let _setup = setup();
+    let parent = bootstrap();
+    chdir_to_root_with_procfs_mount(&parent, 77);
+    let parent_thread = first_thread(&parent);
+    let parent_ctx = make_ctx(parent.clone(), parent_thread);
+    assert_eq!(
+        set_hostname(&parent_ctx, b"parent-host"),
+        SyscallResult::Return(0)
+    );
+
+    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false)
+        .expect("fork child process");
+    let child_thread = first_thread(&child);
+    let child_ctx = make_ctx(child.clone(), child_thread);
+    assert_eq!(
+        netns_req(NR_UNSHARE, [CLONE_NEWUTS, 0, 0, 0, 0, 0], &child_ctx),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        set_hostname(&child_ctx, b"child-host"),
+        SyscallResult::Return(0)
+    );
+
+    let path = nul_terminate(alloc::format!("/proc/{}/ns/uts", child.pid.0).as_bytes());
+    let fd = match netns_req(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDONLY as u64,
+            0,
+            0,
+            0,
+        ],
+        &parent_ctx,
+    ) {
+        SyscallResult::Return(fd) if fd >= 0 => fd as u32,
+        other => panic!("openat(/proc/<child>/ns/uts) failed: {other:?}"),
+    };
+
+    assert_eq!(
+        netns_req(NR_SETNS, [fd as u64, CLONE_NEWUTS, 0, 0, 0, 0], &parent_ctx),
+        SyscallResult::Return(0)
+    );
+    let parent_uts = uname_fields(&parent_ctx);
+    assert_eq!(uts_field(&parent_uts, 1), b"child-host");
+}
+
+#[test]
+fn dispatch_setns_clone_newuts_rejects_net_namespace_fd_type() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process.clone(), thread);
+    let owner = process.user_namespace_cap().expect("setns target owner");
+    let target =
+        tx_subsystems::net::create_isolated_net_namespace_with_owner("setns-target", Some(owner))
+            .expect("target namespace")
+            .payload_cap()
+            .expect("target namespace payload");
+    let file = tx_subsystems::net::net_namespace_open_file_from_payload(target).expect("netns fd");
+    process.set_fd(8, Some(file));
+
+    let result = netns_req(NR_SETNS, [8, CLONE_NEWUTS, 0, 0, 0, 0], &ctx);
+
+    assert_eq!(result, SyscallResult::Error(EINVAL_VALUE));
+}
+
+#[test]
 fn dispatch_openat_proc_self_ns_net_installs_calling_namespace_fd_payload() {
     let _setup = setup();
     let process = bootstrap();
+    chdir_to_root_with_procfs_mount(&process, 76);
     let thread = first_thread(&process);
     let ctx = make_ctx(process.clone(), thread);
     let netns = process.net_namespace().expect("process net namespace");

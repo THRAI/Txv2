@@ -37,6 +37,7 @@ mod submit;
 mod syscall;
 mod syscall_ref;
 mod syscall_status;
+mod tailor;
 mod target;
 mod test;
 mod trap_trace;
@@ -79,6 +80,7 @@ pub fn run() -> Result<()> {
         "observe" => observe::observe(&root, args.collect()),
         "observe-discipline" => observe_discipline::observe_discipline(&root),
         "syscall-status" => syscall_status::syscall_status(&root, args.collect()),
+        "tailor" => tailor::tailor(&root, args.collect()),
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
@@ -111,6 +113,7 @@ fn print_usage() {
            cargo xtask oscomp list-suites [--target rv64-qemu|la64-qemu] [--data DIR]\n\
            cargo xtask oscomp test --target rv64-qemu|la64-qemu [--suite SUITE] [--skip-build] [--data DIR] [--dry-run]\n\
            cargo xtask oscomp slim-sdcard [--suite SUITE]... [--ltp-cases CASE1,CASE2] [--source IMG] [-o IMG] [--size-mb N]\n\
+           cargo xtask tailor ltp --library musl|glibc --arch rv64|la64 --tests CASE1,CASE2 [--data DIR] [--source IMG] [--output IMG] [--size-mb N] [--list-cases]\n\
            cargo xtask submit k210 [--out target/submit/k210]\n\
            cargo xtask syscall status|list|info|sync|pick — query/maintain the syscall map (SSoT: numbers.rs + mod.rs)\n\
            cargo xtask progress validate\n\

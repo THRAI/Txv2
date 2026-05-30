@@ -66,12 +66,26 @@ fn register_wait_source(source: RegisteredWaitSource) -> u64 {
     id
 }
 
+fn register_wait_source_with_id(id: u64, source: RegisteredWaitSource) {
+    let old = REGISTRY.lock().insert(id, source);
+    debug_assert!(old.is_none(), "wait-source id {id} was already registered");
+}
+
 /// Register `channel` for carrier-based wait resolution. Returns the
 /// carrier id that consumers should embed in their `WaitToken` values. The
 /// registry holds an internal clone; the caller's channel handle remains
 /// independent. Carrier ids are non-zero and monotonically increasing.
 pub fn register_wait_channel(channel: Channel) -> u64 {
     register_wait_source(RegisteredWaitSource::Channel(channel))
+}
+
+/// Register `channel` under an externally allocated carrier id.
+///
+/// Notification adapters that publish both a legacy `WaitToken` channel and
+/// a v3 `WaitSource` allocate one shared id up front, then register that id
+/// here so both wait paths resolve the same readiness source.
+pub(crate) fn register_wait_channel_with_id(id: u64, channel: Channel) {
+    register_wait_source_with_id(id, RegisteredWaitSource::Channel(channel));
 }
 
 /// Register a level-triggered readiness queue for wait-source resolution.

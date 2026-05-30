@@ -60,8 +60,6 @@ pub const SIGNAL_GENERATED: u64 = 0x1;
 /// counterpart in `PROCESS_v1` §6.2 ("priority of process exit
 /// status"): both shapes feed into the future `wait(2)` status word.
 ///
-/// Day-1 deliberately omits the core-dump bit — `Signaled` carries
-/// only the signum until the fatal-Core action lands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExitStatus {
     /// Explicit `step_exit_group(int)` exit.
@@ -79,10 +77,9 @@ impl ExitStatus {
     /// - `Signaled(sig)` → `sig.raw() & 0x7f` — `WIFSIGNALED(s)` is
     ///   `(((s & 0x7f) + 1) >> 1) > 0` and `WTERMSIG(s) == s & 0x7f`.
     ///
-    /// Out of slice: the core-dump bit (`s & 0x80`) is not computed —
-    /// txKernel doesn't track core-dump state. Stop/continue encoding
-    /// (`(sig << 8) | 0x7f` / `0xffff`) lands with the stop/cont
-    /// signal infrastructure slice.
+    /// Core-default signals set the Linux wait-status core bit (`0x80`).
+    /// Stop/continue encoding (`(sig << 8) | 0x7f` / `0xffff`) lands with
+    /// the stop/cont signal infrastructure slice.
     ///
     /// **Migration note (fork/clone/wait4 slice, 2026-05-06).**
     /// Previously this returned the day-1 shell-convention `128 + sig`
@@ -94,7 +91,13 @@ impl ExitStatus {
     pub fn wait_status_word(self) -> i32 {
         match self {
             ExitStatus::Exited(code) => (code & 0xff) << 8,
-            ExitStatus::Signaled(sig) => (sig.raw() as i32) & 0x7f,
+            ExitStatus::Signaled(sig) => {
+                let core_bit = match sig.raw() {
+                    3 | 4 | 6 | 11 => 0x80,
+                    _ => 0,
+                };
+                ((sig.raw() as i32) & 0x7f) | core_bit
+            }
         }
     }
 
@@ -864,6 +867,18 @@ impl ProcessIdentity {
         payload.threads.nth(idx)
     }
 
+    pub fn cpu_time_ns(&self) -> Option<u64> {
+        self.payload.lock().as_ref().map(|p| p.cpu_time_ns())
+    }
+
+    pub fn user_cpu_time_ns(&self) -> Option<u64> {
+        self.payload.lock().as_ref().map(|p| p.user_cpu_time_ns())
+    }
+
+    pub fn system_cpu_time_ns(&self) -> Option<u64> {
+        self.payload.lock().as_ref().map(|p| p.system_cpu_time_ns())
+    }
+
     /// Carrier id under which this process's `exit_source` channel is
     /// registered with the global wait-source resolver. Returns
     /// `None` for zombies (no payload — the channel is unreachable
@@ -1007,6 +1022,39 @@ impl ProcessIdentity {
             .lock()
             .as_ref()
             .map(|p| p.set_itimer_real(now_ns, new_value))
+    }
+
+    pub fn itimer_virtual(&self, now_ns: u64) -> Option<IntervalTimerSpec> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.itimer_virtual(now_ns))
+    }
+
+    pub fn set_itimer_virtual(
+        &self,
+        now_ns: u64,
+        new_value: IntervalTimerSpec,
+    ) -> Option<IntervalTimerSpec> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.set_itimer_virtual(now_ns, new_value))
+    }
+
+    pub fn itimer_prof(&self, now_ns: u64) -> Option<IntervalTimerSpec> {
+        self.payload.lock().as_ref().map(|p| p.itimer_prof(now_ns))
+    }
+
+    pub fn set_itimer_prof(
+        &self,
+        now_ns: u64,
+        new_value: IntervalTimerSpec,
+    ) -> Option<IntervalTimerSpec> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.set_itimer_prof(now_ns, new_value))
     }
 
     pub fn create_posix_timer(
@@ -1357,10 +1405,13 @@ pub struct ProcessPayload {
     /// Per `docs/Txv3/08_SYSV_IPC_v1.md` §4.4 / IPC-3, `SEM_UNDO`
     /// state is process-local and process exit drains only this list.
     pub(crate) sem_undos: SpinMutex<BTreeMap<u32, SemUndo>>,
-    /// Per-process `ITIMER_REAL` state used by `getitimer(2)` /
-    /// `setitimer(2)`. CPU interval timers (`ITIMER_VIRTUAL` /
-    /// `ITIMER_PROF`) wait for scheduler CPU-time accounting.
+    /// Per-process interval timer state used by `getitimer(2)` /
+    /// `setitimer(2)`. `ITIMER_REAL` is wall/monotonic-backed;
+    /// CPU timers use explicit scheduler/trap accounting charges and
+    /// are delivered only at safe runtime boundaries.
     pub(crate) itimer_real: SpinMutex<ProcessIntervalTimer>,
+    pub(crate) itimer_virtual: SpinMutex<ProcessIntervalTimer>,
+    pub(crate) itimer_prof: SpinMutex<ProcessIntervalTimer>,
     /// Per-process POSIX timer id table. Expiry-to-signal production
     /// is a follow-up; v1 stores create/set/get/delete state here so
     /// the syscall ABI does not invent a side table outside Process.
@@ -1680,6 +1731,26 @@ impl ProcessPayload {
         self.itimer_real.lock().replace(now_ns, new_value)
     }
 
+    pub fn itimer_virtual(&self, now_ns: u64) -> IntervalTimerSpec {
+        self.itimer_virtual.lock().snapshot(now_ns)
+    }
+
+    pub fn set_itimer_virtual(
+        &self,
+        now_ns: u64,
+        new_value: IntervalTimerSpec,
+    ) -> IntervalTimerSpec {
+        self.itimer_virtual.lock().replace(now_ns, new_value)
+    }
+
+    pub fn itimer_prof(&self, now_ns: u64) -> IntervalTimerSpec {
+        self.itimer_prof.lock().snapshot(now_ns)
+    }
+
+    pub fn set_itimer_prof(&self, now_ns: u64, new_value: IntervalTimerSpec) -> IntervalTimerSpec {
+        self.itimer_prof.lock().replace(now_ns, new_value)
+    }
+
     pub fn create_posix_timer(
         &self,
         clock: crate::timekeeping::PosixTimerClock,
@@ -1732,6 +1803,33 @@ impl ProcessPayload {
         timer_id: u32,
     ) -> Result<(), crate::timekeeping::TimekeepingError> {
         self.posix_timers.lock().delete(timer_id)
+    }
+
+    pub fn cpu_time_ns(&self) -> u64 {
+        self.threads
+            .snapshot()
+            .iter()
+            .filter_map(|thread| thread.payload_cap())
+            .map(|payload| payload.cpu_time_ns())
+            .fold(0u64, u64::saturating_add)
+    }
+
+    pub fn user_cpu_time_ns(&self) -> u64 {
+        self.threads
+            .snapshot()
+            .iter()
+            .filter_map(|thread| thread.payload_cap())
+            .map(|payload| payload.user_cpu_time_ns())
+            .fold(0u64, u64::saturating_add)
+    }
+
+    pub fn system_cpu_time_ns(&self) -> u64 {
+        self.threads
+            .snapshot()
+            .iter()
+            .filter_map(|thread| thread.payload_cap())
+            .map(|payload| payload.system_cpu_time_ns())
+            .fold(0u64, u64::saturating_add)
     }
 
     pub fn consume_expired_timers(&self, now_mono_ns: u64) -> Vec<ExpiredTimerSignal> {

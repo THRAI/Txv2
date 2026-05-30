@@ -16,6 +16,7 @@ use alloc::vec;
 use tx_subsystems::page_backed::{
     step_read_to_kernel, step_truncate, AnonSwapPolicy, PageContainer, PageContainerKind,
 };
+use tx_subsystems::thread_runtime::structure::CpuAccountingMode;
 use tx_subsystems::vfs::structure::{
     FsObjectId, InodeKind, InodeMeta, OpenFileFlags, RNode, RNodeBacking,
 };
@@ -305,6 +306,29 @@ fn dispatch_getrusage_writes_144_zero_bytes_and_preserves_tail() {
         &ctx,
     ));
     assert_eq!(invalid, SyscallResult::Error(E_INVAL));
+}
+
+#[test]
+fn dispatch_getrusage_self_and_thread_report_cpu_accounting_prefix() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let payload = thread.payload_cap().expect("alive thread payload");
+    payload.charge_cpu_time(CpuAccountingMode::User, 1_250_000_000);
+    payload.charge_cpu_time(CpuAccountingMode::Kernel, 500_000_000);
+    let ctx = make_ctx(proc_cap, thread);
+    let mut buf = [0u8; 144];
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_GETRUSAGE, [0, buf.as_mut_ptr() as u64, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(r, SyscallResult::Return(0));
+    assert_eq!(i64::from_le_bytes(buf[0..8].try_into().unwrap()), 1);
+    assert_eq!(i64::from_le_bytes(buf[8..16].try_into().unwrap()), 250_000);
+    assert_eq!(i64::from_le_bytes(buf[16..24].try_into().unwrap()), 0);
+    assert_eq!(i64::from_le_bytes(buf[24..32].try_into().unwrap()), 500_000);
 }
 
 #[test]

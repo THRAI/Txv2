@@ -15,7 +15,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::cred::{Capability, Cred};
 use crate::execution::Errno;
@@ -24,7 +24,19 @@ use crate::ipc::sysv_msg::structure::MsgQueueIdentity;
 use crate::ipc::sysv_sem::structure::SemArrayIdentity;
 use crate::ipc::sysv_shm::structure::ShmSegmentIdentity;
 use crate::mount::MountNamespace;
-use crate::process::adapter::step_engine::{sign, Cap, SpinMutex, Zone, ZoneAllocated, ZoneError};
+use crate::process::adapter::step_engine::{
+    sign, Cap, PayloadCap, SpinMutex, Zone, ZoneAllocated, ZoneError,
+};
+use crate::vfs::structure::{
+    FsObjectId, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking, StructPayload,
+};
+use crate::vfs::{OpenFile, RNode};
+
+pub const UTS_NAME_MAX: usize = 64;
+const INIT_HOSTNAME: &[u8] = b"txkernel";
+const INIT_DOMAINNAME: &[u8] = b"(none)";
+const UTSNS_FS_OBJECT_ID_BASE: u64 = 0xFFFC_0000_0000_0000;
+static NEXT_UTSNS_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(UTSNS_FS_OBJECT_ID_BASE);
 
 // ---------------------------------------------------------------------------
 // SysV IPC key types
@@ -546,11 +558,74 @@ fn trim_ascii_space(mut bytes: &[u8]) -> &[u8] {
 /// Cgroup namespace stub. Real impl arrives with cgroup-v2 subsystem.
 pub struct CgroupNamespaceStub;
 
-/// UTS namespace stub. Real impl arrives with `sethostname` / `uname`.
-pub struct UtsNamespaceStub;
+/// UTS namespace — hostname/domainname values plus owning user namespace.
+///
+/// Linux gates `sethostname(2)` and `setdomainname(2)` on `CAP_SYS_ADMIN`
+/// in the UTS namespace's owning user namespace. Tx keeps that owner link here
+/// while `Cred` remains a POD and `NsProxy.user_ns` is the caller mirror.
+pub struct UtsNamespace {
+    owner_user_ns: Cap<UserNamespace>,
+    hostname: SpinMutex<([u8; UTS_NAME_MAX], usize)>,
+    domainname: SpinMutex<([u8; UTS_NAME_MAX], usize)>,
+}
 
-/// Network namespace stub. Real impl arrives with socket subsystem.
-pub struct NetNamespaceStub;
+impl UtsNamespace {
+    pub fn init(owner_user_ns: Cap<UserNamespace>) -> Self {
+        Self::new(owner_user_ns, INIT_HOSTNAME, INIT_DOMAINNAME)
+    }
+
+    pub fn copy_from(current: &Cap<UtsNamespace>, owner_user_ns: Cap<UserNamespace>) -> Self {
+        let hostname = current.hostname();
+        let domainname = current.domainname();
+        Self::new(owner_user_ns, &hostname, &domainname)
+    }
+
+    pub fn owner_user_namespace(&self) -> Cap<UserNamespace> {
+        self.owner_user_ns.clone()
+    }
+
+    pub fn hostname(&self) -> Vec<u8> {
+        let (bytes, len) = *self.hostname.lock();
+        bytes[..len].to_vec()
+    }
+
+    pub fn domainname(&self) -> Vec<u8> {
+        let (bytes, len) = *self.domainname.lock();
+        bytes[..len].to_vec()
+    }
+
+    pub fn set_hostname(&self, name: &[u8]) -> Result<(), Errno> {
+        set_uts_name(&self.hostname, name)
+    }
+
+    pub fn set_domainname(&self, name: &[u8]) -> Result<(), Errno> {
+        set_uts_name(&self.domainname, name)
+    }
+
+    fn new(owner_user_ns: Cap<UserNamespace>, hostname: &[u8], domainname: &[u8]) -> Self {
+        Self {
+            owner_user_ns,
+            hostname: SpinMutex::new(make_uts_name(hostname)),
+            domainname: SpinMutex::new(make_uts_name(domainname)),
+        }
+    }
+}
+
+fn make_uts_name(name: &[u8]) -> ([u8; UTS_NAME_MAX], usize) {
+    debug_assert!(name.len() <= UTS_NAME_MAX);
+    let mut out = [0u8; UTS_NAME_MAX];
+    let len = core::cmp::min(name.len(), UTS_NAME_MAX);
+    out[..len].copy_from_slice(&name[..len]);
+    (out, len)
+}
+
+fn set_uts_name(slot: &SpinMutex<([u8; UTS_NAME_MAX], usize)>, name: &[u8]) -> Result<(), Errno> {
+    if name.len() > UTS_NAME_MAX {
+        return Err(Errno::EINVAL);
+    }
+    *slot.lock() = make_uts_name(name);
+    Ok(())
+}
 
 /// Time namespace stub. Real impl arrives with `clock_settime` per-ns offsets.
 pub struct TimeNamespaceStub;
@@ -574,9 +649,9 @@ pub struct NsProxy {
     pub mnt_ns: Option<Cap<MountNamespace>>,
     pub user_ns: Cap<UserNamespace>,
     pub cgroup_ns: Cap<CgroupNamespaceStub>,
-    pub uts_ns: Cap<UtsNamespaceStub>,
+    pub uts_ns: Cap<UtsNamespace>,
     pub ipc_ns: Cap<IpcNamespace>,
-    pub net_ns: Cap<NetNamespaceStub>,
+    pub net_ns: PayloadCap<crate::net::NetNamespacePayload>,
     pub time_ns: Cap<TimeNamespaceStub>,
 }
 
@@ -590,8 +665,7 @@ static IPC_NAMESPACE_ZONE: Zone<IpcNamespace> = Zone::const_new();
 static PID_NS_STUB_ZONE: Zone<PidNamespaceStub> = Zone::const_new();
 static USER_NAMESPACE_ZONE: Zone<UserNamespace> = Zone::const_new();
 static CGROUP_NS_STUB_ZONE: Zone<CgroupNamespaceStub> = Zone::const_new();
-static UTS_NS_STUB_ZONE: Zone<UtsNamespaceStub> = Zone::const_new();
-static NET_NS_STUB_ZONE: Zone<NetNamespaceStub> = Zone::const_new();
+static UTS_NAMESPACE_ZONE: Zone<UtsNamespace> = Zone::const_new();
 static TIME_NS_STUB_ZONE: Zone<TimeNamespaceStub> = Zone::const_new();
 
 unsafe impl ZoneAllocated for NsProxy {
@@ -624,8 +698,11 @@ unsafe impl ZoneAllocated for UserNamespace {
 }
 
 stub_zone!(CgroupNamespaceStub, CGROUP_NS_STUB_ZONE);
-stub_zone!(UtsNamespaceStub, UTS_NS_STUB_ZONE);
-stub_zone!(NetNamespaceStub, NET_NS_STUB_ZONE);
+unsafe impl ZoneAllocated for UtsNamespace {
+    fn zone() -> &'static Zone<Self> {
+        &UTS_NAMESPACE_ZONE
+    }
+}
 stub_zone!(TimeNamespaceStub, TIME_NS_STUB_ZONE);
 
 pub(crate) fn register_zones() -> Result<(), ZoneError> {
@@ -635,8 +712,7 @@ pub(crate) fn register_zones() -> Result<(), ZoneError> {
     register_zone_for::<PidNamespaceStub>()?;
     register_zone_for::<UserNamespace>()?;
     register_zone_for::<CgroupNamespaceStub>()?;
-    register_zone_for::<UtsNamespaceStub>()?;
-    register_zone_for::<NetNamespaceStub>()?;
+    register_zone_for::<UtsNamespace>()?;
     register_zone_for::<TimeNamespaceStub>()?;
     Ok(())
 }
@@ -661,9 +737,9 @@ pub fn sign_init_nsproxy() -> Result<Cap<NsProxy>, ZoneError> {
     let pid_for_children = sign(PidNamespaceStub)?;
     let user_ns = sign(UserNamespace::init())?;
     let cgroup_ns = sign(CgroupNamespaceStub)?;
-    let uts_ns = sign(UtsNamespaceStub)?;
+    let uts_ns = sign(UtsNamespace::init(user_ns.clone()))?;
     let ipc_ns = sign(IpcNamespace::default())?;
-    let net_ns = sign(NetNamespaceStub)?;
+    let net_ns = crate::net::initial_net_namespace_payload_with_owner(user_ns.clone());
     let time_ns = sign(TimeNamespaceStub)?;
 
     sign(NsProxy {
@@ -741,11 +817,7 @@ pub fn clone_nsproxy_with_user_namespace(
     owner_uid: u32,
     owner_gid: u32,
 ) -> Result<Cap<NsProxy>, ZoneError> {
-    let user_ns = sign(UserNamespace::child(
-        nsproxy.user_ns.clone(),
-        owner_uid,
-        owner_gid,
-    ))?;
+    let user_ns = create_child_user_namespace(nsproxy, owner_uid, owner_gid)?;
 
     sign(NsProxy {
         pid_ns: nsproxy.pid_ns.clone(),
@@ -758,4 +830,120 @@ pub fn clone_nsproxy_with_user_namespace(
         net_ns: nsproxy.net_ns.clone(),
         time_ns: nsproxy.time_ns.clone(),
     })
+}
+
+/// Create the child user namespace used by `clone(CLONE_NEWUSER)` /
+/// `unshare(CLONE_NEWUSER)` before any combined namespace authorization.
+pub fn create_child_user_namespace(
+    nsproxy: &Cap<NsProxy>,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<Cap<UserNamespace>, ZoneError> {
+    sign(UserNamespace::child(
+        nsproxy.user_ns.clone(),
+        owner_uid,
+        owner_gid,
+    ))
+}
+
+/// Return a replacement namespace bundle with `net_ns` installed.
+pub fn clone_nsproxy_with_net_namespace(
+    nsproxy: &Cap<NsProxy>,
+    net_ns: PayloadCap<crate::net::NetNamespacePayload>,
+) -> Result<Cap<NsProxy>, ZoneError> {
+    clone_nsproxy_with_replacements(nsproxy, None, None, None, Some(net_ns))
+}
+
+/// Clone the current UTS namespace values into a fresh namespace.
+pub fn clone_uts_namespace_from(
+    nsproxy: &Cap<NsProxy>,
+    owner_user_ns: Cap<UserNamespace>,
+) -> Result<Cap<UtsNamespace>, ZoneError> {
+    sign(UtsNamespace::copy_from(&nsproxy.uts_ns, owner_user_ns))
+}
+
+pub fn uts_namespace_open_file_from_cap(
+    namespace: Cap<UtsNamespace>,
+) -> Result<Cap<OpenFile>, Errno> {
+    let rnode = RNode::new_cap(
+        allocate_utsns_fs_object_id(),
+        InodeMeta::new(InodeKind::Regular, 0o400),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::UtsNamespace {
+                namespace: namespace.clone(),
+            },
+        },
+    )
+    .map_err(|_| Errno::ENOMEM)?;
+
+    OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: false,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+        },
+    )
+    .map_err(|_| Errno::ENOMEM)
+}
+
+pub fn uts_namespace_from_file(file: &Cap<OpenFile>) -> Option<Cap<UtsNamespace>> {
+    match file.rnode().backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::UtsNamespace { namespace },
+        } => Some(namespace.clone()),
+        _ => None,
+    }
+}
+
+fn allocate_utsns_fs_object_id() -> FsObjectId {
+    FsObjectId::new(NEXT_UTSNS_FS_OBJECT_ID.fetch_add(1, Ordering::AcqRel))
+}
+
+/// Return a replacement namespace bundle with selected namespace caps changed.
+///
+/// This keeps `unshare(2)` and `setns(2)` publication all-or-nothing:
+/// callers validate and allocate every replacement first, then publish one
+/// immutable `NsProxy` cap on the process payload.
+pub fn clone_nsproxy_with_replacements(
+    nsproxy: &Cap<NsProxy>,
+    user_ns: Option<Cap<UserNamespace>>,
+    ipc_ns: Option<Cap<IpcNamespace>>,
+    uts_ns: Option<Cap<UtsNamespace>>,
+    net_ns: Option<PayloadCap<crate::net::NetNamespacePayload>>,
+) -> Result<Cap<NsProxy>, ZoneError> {
+    sign(NsProxy {
+        pid_ns: nsproxy.pid_ns.clone(),
+        pid_for_children: nsproxy.pid_for_children.clone(),
+        mnt_ns: nsproxy.mnt_ns.clone(),
+        user_ns: user_ns.unwrap_or_else(|| nsproxy.user_ns.clone()),
+        cgroup_ns: nsproxy.cgroup_ns.clone(),
+        uts_ns: uts_ns.unwrap_or_else(|| nsproxy.uts_ns.clone()),
+        ipc_ns: ipc_ns.unwrap_or_else(|| nsproxy.ipc_ns.clone()),
+        net_ns: net_ns.unwrap_or_else(|| nsproxy.net_ns.clone()),
+        time_ns: nsproxy.time_ns.clone(),
+    })
+}
+
+/// Clone the current IPC namespace limits into a fresh namespace.
+pub fn clone_ipc_namespace_from(nsproxy: &Cap<NsProxy>) -> Result<Cap<IpcNamespace>, ZoneError> {
+    let ipc_limits = *nsproxy.ipc_ns.limits.lock();
+    sign(IpcNamespace::with_limits(ipc_limits))
+}
+
+/// Transitional Linux user-namespace capability check.
+///
+/// Linux stores `user_ns` on `cred`; Tx's current `Cred` remains a `Copy`
+/// scalar, so syscall paths pass the caller's `NsProxy.user_ns` mirror here.
+/// Future credential namespace ownership should replace this helper's source
+/// of `subject_user_ns`, not each call site.
+pub fn has_capability_in_subject_user_namespace(
+    cred: Cred,
+    subject_user_ns: &Cap<UserNamespace>,
+    target_user_ns: &Cap<UserNamespace>,
+    cap: Capability,
+) -> bool {
+    has_capability_in_user_namespace(cred, subject_user_ns, target_user_ns, cap)
 }

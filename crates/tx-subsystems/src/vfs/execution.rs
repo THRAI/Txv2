@@ -355,9 +355,11 @@ pub trait FsOps: Send + Sync + 'static {
         offset: u64,
         bytes: &[u8],
         caller_netns: Option<&crate::net::NetNamespacePayload>,
+        writer_cred: Option<crate::cred::Cred>,
+        writer_user_ns: Option<&Cap<crate::process::nsproxy::UserNamespace>>,
         guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
-        let _ = caller_netns;
+        let _ = (caller_netns, writer_cred, writer_user_ns);
         self.step_write_projected(fs_object_id, offset, bytes, guard)
     }
 }
@@ -476,7 +478,9 @@ impl OpenFile {
                         StepOutcome::Err(errno) => StepOutcome::Err(errno),
                     }
                 }
-                StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::ENOSYS),
+                StructPayload::NetNamespace { .. } | StructPayload::UtsNamespace { .. } => {
+                    StepOutcome::Err(Errno::ENOSYS)
+                }
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             // PR-11 follow-up (W-KK, closing the ENOSYS gap W-JJ flagged
@@ -583,7 +587,8 @@ impl OpenFile {
                 | StructPayload::FsNotify { .. }
                 | StructPayload::Pipe { .. }
                 | StructPayload::Socket { .. }
-                | StructPayload::NetNamespace { .. } => return StepOutcome::Err(Errno::ESPIPE),
+                | StructPayload::NetNamespace { .. }
+                | StructPayload::UtsNamespace { .. } => return StepOutcome::Err(Errno::ESPIPE),
             },
             RNodeBacking::Directory => return StepOutcome::Err(Errno::EISDIR),
             RNodeBacking::Symlink { .. } | RNodeBacking::Projected { .. } => {
@@ -639,6 +644,19 @@ impl OpenFile {
         &self,
         bytes: &[u8],
         caller_netns: Option<&crate::net::NetNamespacePayload>,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<usize, ByteProgress> {
+        self.step_write_with_context(bytes, caller_netns, None, None, guard)
+    }
+
+    /// Dispatch a write with caller namespace and credential context for
+    /// namespace-sensitive projected files such as procfs userns maps.
+    pub fn step_write_with_context(
+        &self,
+        bytes: &[u8],
+        caller_netns: Option<&crate::net::NetNamespacePayload>,
+        writer_cred: Option<crate::cred::Cred>,
+        writer_user_ns: Option<&Cap<crate::process::nsproxy::UserNamespace>>,
         guard: &Guard<'_>,
     ) -> StepOutcome<usize, ByteProgress> {
         let file_flags = self.flags();
@@ -703,7 +721,9 @@ impl OpenFile {
                         StepOutcome::Err(errno) => StepOutcome::Err(errno),
                     }
                 }
-                StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::ENOSYS),
+                StructPayload::NetNamespace { .. } | StructPayload::UtsNamespace { .. } => {
+                    StepOutcome::Err(Errno::ENOSYS)
+                }
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             // Symmetric to the PageBacked step_read arm above — route
@@ -733,6 +753,8 @@ impl OpenFile {
                         off,
                         bytes,
                         caller_netns,
+                        writer_cred,
+                        writer_user_ns,
                         guard,
                     ) {
                         StepOutcome::Done(n) => {
@@ -792,7 +814,8 @@ impl OpenFile {
                 StructPayload::FsNotify { .. }
                 | StructPayload::Pipe { .. }
                 | StructPayload::Socket { .. }
-                | StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::ENOTTY),
+                | StructPayload::NetNamespace { .. }
+                | StructPayload::UtsNamespace { .. } => StepOutcome::Err(Errno::ENOTTY),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             RNodeBacking::PageBacked { .. }
@@ -960,6 +983,8 @@ pub struct OpenFileWriteOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub bytes: &'a [u8],
     pub caller_netns: Option<PayloadCap<crate::net::NetNamespacePayload>>,
+    pub writer_cred: Option<crate::cred::Cred>,
+    pub writer_user_ns: Option<Cap<crate::process::nsproxy::UserNamespace>>,
     /// Internal write cursor: each `step()` call consumes bytes starting
     /// at `bytes[cursor..]`. Mirrors `OpenFileReadOp::cursor`.
     pub cursor: usize,
@@ -974,9 +999,13 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteOp<'a> {
             .caller_netns
             .as_ref()
             .map(|netns| &**netns as &crate::net::NetNamespacePayload);
-        let result =
-            self.file
-                .step_write_with_netns(&self.bytes[self.cursor..], caller_netns, &guard);
+        let result = self.file.step_write_with_context(
+            &self.bytes[self.cursor..],
+            caller_netns,
+            self.writer_cred,
+            self.writer_user_ns.as_ref(),
+            &guard,
+        );
         match &result {
             StepOutcome::Done(n) => {
                 self.cursor += *n;
@@ -1448,6 +1477,8 @@ mod step_op_wraps {
             file: &file,
             bytes: b"hello",
             caller_netns: None,
+            writer_cred: None,
+            writer_user_ns: None,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1465,6 +1496,8 @@ mod step_op_wraps {
             file: &file,
             bytes: b"hi",
             caller_netns: None,
+            writer_cred: None,
+            writer_user_ns: None,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();

@@ -9,7 +9,7 @@ use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 // `xtask lint invariants cred-check` — see CRED_CHECK_SIGNALS in
 // xtask/src/lint_invariants_cred_check.rs.
 use tx_subsystems::cred::checks as cred_checks;
-use tx_subsystems::mount::MountPayload;
+use tx_subsystems::mount::{self, MountPayload};
 use tx_subsystems::vfs::resolution::state::{FinalSymlinkPolicy, PathResolution, WalkMode};
 use tx_subsystems::vfs::structure::OpenFileBacking;
 
@@ -421,39 +421,6 @@ fn chmod_mode_after_linux_fsetid_clear(
     }
 }
 
-/// `fchmod(fd, mode)`. Linux RV64 generic ABI.
-///
-/// Resolves the fd's rnode and applies the same authorization and
-/// `FsOps::step_chmod` mutation path as `fchmodat`, without adding
-/// any path or symlink policy.
-pub(super) fn sys_fchmod(fd: u32, mode: u32, ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let open_file = match ctx.process.fd(fd) {
-        Some(file) => file,
-        None => return SyscallResult::Error(EBADF_VALUE),
-    };
-    let rnode = match open_file.backing() {
-        OpenFileBacking::Rnode { rnode } => rnode.clone(),
-        _ => return SyscallResult::Error(EBADF_VALUE),
-    };
-    let new_mode = (mode & 0o7777) as u16;
-    let target_meta = rnode.meta();
-    if let Err(e) = cred_checks::authorize_chmod(ctx.cred_snapshot(), &target_meta, new_mode) {
-        return SyscallResult::error_from(e);
-    }
-    let fs_ops = match crate::linux_syscall::fs_basic::fs_ops_for_rnode(&rnode) {
-        Some(fs_ops) => fs_ops,
-        None => return SyscallResult::Error(ENOSYS_VALUE),
-    };
-    let guard = step_engine::guard();
-    match fs_ops.step_chmod(rnode.fs_object_id(), new_mode, &ctx.walker_cred(), &guard) {
-        StepOutcome::Done(()) => SyscallResult::Return(0),
-        StepOutcome::Err(errno) => {
-            SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno)))
-        }
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-    }
-}
-
 /// `fchownat(dirfd, path, uid, gid, flags)`. Linux RV64 generic ABI.
 ///
 /// Wraps `FsOps::step_chown` (Wave 3 Part 2). Each of `uid` / `gid`
@@ -615,10 +582,22 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
     flags: i32,
     ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match bootstrap_read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
-        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(Errno::ENAMETOOLONG) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(_) => return SyscallResult::Error(EFAULT_VALUE),
     };
+
+    if mode & !(R_OK | W_OK | X_OK) != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let known_flags = AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH as i32;
+    if flags & !known_flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if path.is_empty() && flags & AT_EMPTY_PATH as i32 == 0 {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
 
     // Pick which uid/gid to check against per POSIX: `access(2)` and
     // `faccessat(2)` use the caller's real ids; `faccessat2` honours
@@ -635,24 +614,18 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
         effective_caps: cred.effective_caps,
     };
 
-    // Resolve the path via AccessOp + drive_oneshot. Returns InodeMeta
-    // for the DAC checks below.
-    let rooted_at = match resolve_cwd(dirfd, ctx) {
-        Ok(d) => d,
-        Err(e) => return SyscallResult::Error(e),
+    let mut request = ResolveRequest::entity(dirfd, &path, &walker_cred);
+    if flags & AT_SYMLINK_NOFOLLOW != 0 {
+        request = request.nofollow();
+    }
+    if flags & AT_EMPTY_PATH as i32 != 0 {
+        request = request.allow_empty();
+    }
+    let resolved = match drive_resolve(ctx, request) {
+        Ok(resolved) => resolved,
+        Err(errno) => return SyscallResult::Error(errno),
     };
-    let inode_meta = {
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = AccessOp {
-            rooted_at: &rooted_at,
-            path: &path,
-            cred: &walker_cred,
-        };
-        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-            Ok(m) => m,
-            Err(v3errno) => return SyscallResult::error_from(v3errno),
-        }
-    };
+    let inode_meta = resolved.meta;
     let mode_bits = inode_meta.mode as u32;
 
     // F_OK: existence check only. Path resolution succeeded; return 0
@@ -660,6 +633,10 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
     // §RETURN VALUE.
     if mode == F_OK {
         return SyscallResult::Return(0);
+    }
+
+    if mode & W_OK != 0 && dentry_mount_is_read_only(ctx, &resolved.dentry) {
+        return SyscallResult::Error(EROFS_VALUE);
     }
 
     // Compose the `want` mask out of the requested R/W/X bits, mapped
@@ -704,6 +681,30 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
     } else {
         SyscallResult::Error(EACCES_VALUE)
     }
+}
+
+pub(super) fn dentry_mount_is_read_only(ctx: &SyscallCtx<'_>, dentry: &Cap<DEntry>) -> bool {
+    let guard = step_engine::guard();
+    let mount = ctx
+        .process
+        .mount_namespace_cap()
+        .and_then(|namespace| {
+            namespace
+                .mount_for_containing_dentry(dentry, &guard)
+                .or_else(|| namespace.mount_for_root_dentry(dentry))
+        })
+        .or_else(|| {
+            mount::mount_for_containing_dentry(dentry, &guard)
+                .or_else(|| mount::mount_for_root_dentry(dentry))
+        });
+    if let Some(mount) = mount {
+        return mount.flags().contains(mount::MountFlags::READ_ONLY);
+    }
+    dentry
+        .rnode()
+        .containing_mount_weak()
+        .and_then(|weak| weak.upgrade(&guard))
+        .is_some_and(|payload| payload.options.flags.contains(mount::MountFlags::READ_ONLY))
 }
 
 /// Decode the access-mode bits (`O_RDONLY`/`O_WRONLY`/`O_RDWR`) of an

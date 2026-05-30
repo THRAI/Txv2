@@ -214,11 +214,12 @@ LTP_MAX_RUNTIME_CASES ?=
 #      timeout 1800s make oscomp-local-rv64-ltp-batch LTP_BATCH=vfs
 #      timeout 1800s make oscomp-local-rv64-ltp-runtest LTP_RUNTEST=fs
 LTP_BATCH ?= p0
-LTP_BATCH_TOOL ?= python3 tools/ltp-batches.py
+LTP_SDCARD ?= $(if $(wildcard $(OSCOMP_DATA)/sdcard-ltp-cases-rv.img),$(OSCOMP_DATA)/sdcard-ltp-cases-rv.img,$(OSCOMP_DATA)/sdcard-rv.img)
+LTP_BATCH_TOOL ?= python3 tools/ltp-batches.py --source $(LTP_SDCARD)
 LTP_BATCH_REFRESH ?= --refresh
 LTP_RUNTEST ?= smoketest
 LTP_RUNTEST_CASES ?=
-LTP_RUNTEST_TOOL ?= python3 tools/ltp-runtests.py
+LTP_RUNTEST_TOOL ?= python3 tools/ltp-runtests.py --source $(LTP_SDCARD)
 OSCOMP_LTP_GLIBC_SIZE_MB ?= 512
 OSCOMP_LTP_GLIBC_RV_DATA ?= target/oscomp/ltp-glibc-rv-focus
 OSCOMP_LTP_GLIBC_LA_DATA ?= target/oscomp/ltp-glibc-la-focus
@@ -416,6 +417,9 @@ oscomp-rv64-pthread-pi-condvar:
 	OSCOMP_OUT_RV=$(OSCOMP_PI_CONDVAR_OUT) \
 		tools/guest-tests/run-pthread-pi-condvar-rv64.sh
 
+oscomp-local-rv64-ltp-musl:
+	$(MAKE) oscomp-local-rv64 OSCOMP_GROUPS=$(OSCOMP_LTP_GROUP)
+
 oscomp-local-rv64-ltp-musl-smp4:
 	$(MAKE) oscomp-local-rv64-smp4 OSCOMP_GROUPS=$(OSCOMP_LTP_GROUP)
 
@@ -508,64 +512,56 @@ oscomp-local-rv64-ltp-batch:
 	@cases="$$($(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --batch $(LTP_BATCH) --csv)"; \
 	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
 	echo "LTP batch $(LTP_BATCH): $$count cases"; \
-	test "$$count" != 0; \
+	test "$$count" != 0
 	$(MAKE) oscomp-local-rv64 OSCOMP_GROUPS=ltp-batch:$(LTP_BATCH)
 
 oscomp-local-rv64-ltp-runtest:
 	@cases="$$($(LTP_RUNTEST_TOOL) --module $(LTP_RUNTEST) --csv)"; \
 	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
 	echo "LTP runtest $(LTP_RUNTEST): $$count entries"; \
-	test "$$count" != 0; \
-	group="ltp-runtest:$(LTP_RUNTEST)"; \
-	if [ -n "$(strip $(LTP_RUNTEST_CASES))" ]; then group="$$group:$(subst $(COMMA),+,$(LTP_RUNTEST_CASES))"; fi; \
-	$(MAKE) oscomp-local-rv64 OSCOMP_GROUPS=$$group
+	test "$$count" != 0
+	$(MAKE) oscomp-local-rv64 OSCOMP_GROUPS=ltp-runtest:$(LTP_RUNTEST)$(if $(strip $(LTP_RUNTEST_CASES)),:$(subst $(COMMA),+,$(LTP_RUNTEST_CASES)))
 
 oscomp-local-rv64-ltp-runtest-smp4:
 	@cases="$$($(LTP_RUNTEST_TOOL) --module $(LTP_RUNTEST) --csv)"; \
 	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
 	echo "LTP runtest $(LTP_RUNTEST): $$count entries"; \
-	test "$$count" != 0; \
-	group="ltp-runtest:$(LTP_RUNTEST)"; \
-	if [ -n "$(strip $(LTP_RUNTEST_CASES))" ]; then group="$$group:$(subst $(COMMA),+,$(LTP_RUNTEST_CASES))"; fi; \
-	$(MAKE) oscomp-local-rv64-smp4 OSCOMP_GROUPS=$$group
+	test "$$count" != 0
+	$(MAKE) oscomp-local-rv64-smp4 OSCOMP_GROUPS=ltp-runtest:$(LTP_RUNTEST)$(if $(strip $(LTP_RUNTEST_CASES)),:$(subst $(COMMA),+,$(LTP_RUNTEST_CASES)))
 
 oscomp-local-rv64-ltp-batch-smp4:
 	@cases="$$($(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --batch $(LTP_BATCH) --csv)"; \
 	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
 	echo "LTP batch $(LTP_BATCH): $$count cases"; \
-	test "$$count" != 0; \
+	test "$$count" != 0
 	$(MAKE) oscomp-local-rv64-smp4 OSCOMP_GROUPS=ltp-batch:$(LTP_BATCH)
 
 oscomp-local-la64-ltp-batch:
 	@cases="$$($(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --batch $(LTP_BATCH) --csv)"; \
 	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
 	echo "LTP batch $(LTP_BATCH): $$count cases"; \
-	test "$$count" != 0; \
+	test "$$count" != 0
 	$(MAKE) oscomp-local-la64 OSCOMP_GROUPS=ltp-batch:$(LTP_BATCH)
 
 oscomp-local-la64-ltp-runtest:
 	@cases="$$($(LTP_RUNTEST_TOOL) --module $(LTP_RUNTEST) --csv)"; \
 	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
 	echo "LTP runtest $(LTP_RUNTEST): $$count entries"; \
-	test "$$count" != 0; \
-	group="ltp-runtest:$(LTP_RUNTEST)"; \
-	if [ -n "$(strip $(LTP_RUNTEST_CASES))" ]; then group="$$group:$(subst $(COMMA),+,$(LTP_RUNTEST_CASES))"; fi; \
-	$(MAKE) oscomp-local-la64 OSCOMP_GROUPS=$$group
+	test "$$count" != 0
+	$(MAKE) oscomp-local-la64 OSCOMP_GROUPS=ltp-runtest:$(LTP_RUNTEST)$(if $(strip $(LTP_RUNTEST_CASES)),:$(subst $(COMMA),+,$(LTP_RUNTEST_CASES)))
 
 oscomp-local-la64-ltp-runtest-smp4:
 	@cases="$$($(LTP_RUNTEST_TOOL) --module $(LTP_RUNTEST) --csv)"; \
 	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
 	echo "LTP runtest $(LTP_RUNTEST): $$count entries"; \
-	test "$$count" != 0; \
-	group="ltp-runtest:$(LTP_RUNTEST)"; \
-	if [ -n "$(strip $(LTP_RUNTEST_CASES))" ]; then group="$$group:$(subst $(COMMA),+,$(LTP_RUNTEST_CASES))"; fi; \
-	$(MAKE) oscomp-local-la64-smp4 OSCOMP_GROUPS=$$group
+	test "$$count" != 0
+	$(MAKE) oscomp-local-la64-smp4 OSCOMP_GROUPS=ltp-runtest:$(LTP_RUNTEST)$(if $(strip $(LTP_RUNTEST_CASES)),:$(subst $(COMMA),+,$(LTP_RUNTEST_CASES)))
 
 oscomp-local-la64-ltp-batch-smp4:
 	@cases="$$($(LTP_BATCH_TOOL) $(LTP_BATCH_REFRESH) --batch $(LTP_BATCH) --csv)"; \
 	count="$$(case "$$cases" in "") echo 0 ;; *) printf '%s\n' "$$cases" | awk -F, '{ print NF }' ;; esac)"; \
 	echo "LTP batch $(LTP_BATCH): $$count cases"; \
-	test "$$count" != 0; \
+	test "$$count" != 0
 	$(MAKE) oscomp-local-la64-smp4 OSCOMP_GROUPS=ltp-batch:$(LTP_BATCH)
 
 oscomp-export-testcase:

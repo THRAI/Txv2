@@ -1,5 +1,5 @@
-//! AIO — `aio_context_t` fd-table scaffold + iocb submission queue +
-//! worker dispatch + completion ring (PR-11 phases 1–5).
+//! AIO — raw Linux `aio_context_t` state, iocb submission queue, and
+//! reactor worker completion path.
 //!
 //! Spec:
 //! - `docs/Txv3/06_EXECUTION_SCOPE_v1.md` (`OnBehalfOf<P>` execution scope)
@@ -57,21 +57,13 @@
 //! 14. [`AioContext::push_completion`] / [`AioContext::pop_completion`]
 //!     for the worker-side push and the `sys_io_getevents` drain.
 //!
-//! # Linux-divergence note
+//! # Linux ABI note
 //!
-//! Linux's `io_setup(nr_events, &aio_context_t)` writes back an opaque
-//! `u64`-pointer-shape value into the user's `aio_context_t *`
-//! out-parameter (the user-virtual address of the ring buffer the
-//! kernel maps into the caller's address space). **We diverge
-//! intentionally.** Per D8 §4.1, `aio_context_t` is normalized to a
-//! real fd via [`crate::vfs::structure::OpenFileBacking::AioContext`]
-//! — joining the Rnode/Ufd pattern from W-Q's PR-10 phase 0 landing.
-//! Userspace glibc shims that expect the pointer-shape bridge the
-//! returned fd into the legacy `aio_context_t` slot (a 5-line shim);
-//! the divergence is acknowledged at the userspace boundary, and
-//! `io_destroy` becomes structurally identical to `close(2)` on the
-//! AIO fd (cap-zone drop drives endpoint abandonment via the same
-//! `exit_source` mechanism that phase 4 wires).
+//! The syscall-visible handle is Linux-shaped: `io_setup(nr_events,
+//! ctxp)` writes an opaque user `aio_context_t` value and later AIO
+//! syscalls look that value up directly. The internal [`AioContext`]
+//! cap, worker future, and request state are Tx-private implementation
+//! details.
 //!
 //! # Drop semantics
 //!
@@ -90,7 +82,7 @@
 //! `VecDeque` and the `Arc<WaitSource>` clean up through normal
 //! `Drop`.
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use core::future::Future;
 use core::pin::Pin;
@@ -102,9 +94,11 @@ pub mod notification;
 pub use notification::{EVENTS_AVAILABLE_MASK, IOCB_ARRIVED_MASK};
 
 use adapter::step_engine::{
-    sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, OnBehalfOfAbort, ScriptCtx, SpinMutex,
-    SubjectContext, SubjectIdentity, WaitSource, Zone, ZoneAllocated, ZoneError,
+    sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, InterestMask, OnBehalfOfAbort,
+    ScriptCtx, SpinMutex, SubjectContext, SubjectIdentity, WaitSource, WaitSourceId, Zone,
+    ZoneAllocated, ZoneError,
 };
+use adapter::wait_routing::{MailboxEvent, TaskMailbox};
 
 // === iocb opcodes ====================================================
 //
@@ -122,6 +116,10 @@ pub const IOCB_CMD_PWRITE: u16 = 1;
 pub const IOCB_CMD_FSYNC: u16 = 2;
 /// Linux `IOCB_CMD_FDSYNC`. Phase 2 stubs the dispatch.
 pub const IOCB_CMD_FDSYNC: u16 = 3;
+/// Linux `IOCB_CMD_POLL`. v1 recognizes the opcode but the syscall
+/// dispatcher returns a deliberate unsupported completion until the
+/// fd-readiness wait-source bridge is shared with epoll.
+pub const IOCB_CMD_POLL: u16 = 5;
 /// Linux `IOCB_CMD_NOOP`. Reserved; kept here so the validation set is
 /// the same shape Linux exposes.
 pub const IOCB_CMD_NOOP: u16 = 6;
@@ -141,6 +139,7 @@ pub fn is_valid_iocb_opcode(opcode: u16) -> bool {
             | IOCB_CMD_PWRITE
             | IOCB_CMD_FSYNC
             | IOCB_CMD_FDSYNC
+            | IOCB_CMD_POLL
             | IOCB_CMD_NOOP
             | IOCB_CMD_PREADV
             | IOCB_CMD_PWRITEV
@@ -172,10 +171,22 @@ pub fn is_valid_iocb_opcode(opcode: u16) -> bool {
 pub struct Iocb {
     pub aio_fildes: u32,
     pub aio_lio_opcode: u16,
+    pub aio_rw_flags: u32,
     pub aio_buf: u64,
     pub aio_nbytes: u64,
     pub aio_offset: i64,
     pub aio_data: u64,
+    pub aio_user_ptr: u64,
+    pub aio_flags: u32,
+    pub aio_resfd: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AioRequestState {
+    Queued,
+    Running,
+    CancelRequested,
+    Completed,
 }
 
 impl Iocb {
@@ -195,11 +206,31 @@ impl Iocb {
         Self {
             aio_fildes,
             aio_lio_opcode,
+            aio_rw_flags: 0,
             aio_buf,
             aio_nbytes,
             aio_offset,
             aio_data,
+            aio_user_ptr: aio_data,
+            aio_flags: 0,
+            aio_resfd: 0,
         }
+    }
+
+    /// Fill the Linux-only tail fields parsed from the full 64-byte
+    /// `struct iocb` wire image.
+    pub const fn with_linux_tail(
+        mut self,
+        user_ptr: u64,
+        rw_flags: u32,
+        aio_flags: u32,
+        aio_resfd: u32,
+    ) -> Self {
+        self.aio_user_ptr = user_ptr;
+        self.aio_rw_flags = rw_flags;
+        self.aio_flags = aio_flags;
+        self.aio_resfd = aio_resfd;
+        self
     }
 }
 
@@ -315,6 +346,7 @@ pub struct AioContext {
     /// `MpscQueue` once the contention shape across multiple
     /// submitters is measured.
     submit_queue: SpinMutex<VecDeque<Iocb>>,
+    requests: SpinMutex<BTreeMap<u64, AioRequestState>>,
     /// Wait source notified on every `push_iocb`. The worker future
     /// parks on this between iocbs; the production wiring binds the
     /// worker's `TaskMailbox` to this source via
@@ -351,6 +383,8 @@ pub struct AioContext {
     events_available: Arc<WaitSource>,
     /// Cached id for [`Self::events_available`].
     events_available_id: u64,
+    ring_space_available: Arc<WaitSource>,
+    ring_space_available_id: u64,
 }
 
 impl core::fmt::Debug for AioContext {
@@ -383,6 +417,7 @@ impl AioContext {
             nr_events,
             _pad: 0,
             submit_queue: SpinMutex::new(VecDeque::new()),
+            requests: SpinMutex::new(BTreeMap::new()),
             iocb_arrived: wait_points.iocb_arrived,
             iocb_arrived_id: wait_points.iocb_arrived_id,
             worker_abort: Arc::new(AbortSignal::new()),
@@ -390,6 +425,8 @@ impl AioContext {
             completion_queue: SpinMutex::new(VecDeque::new()),
             events_available: wait_points.events_available,
             events_available_id: wait_points.events_available_id,
+            ring_space_available: wait_points.ring_space_available,
+            ring_space_available_id: wait_points.ring_space_available_id,
         }
     }
 
@@ -468,6 +505,9 @@ impl AioContext {
         if queue.len() >= self.nr_events as usize {
             return Err(iocb);
         }
+        self.requests
+            .lock()
+            .insert(iocb.aio_user_ptr, AioRequestState::Queued);
         queue.push_back(iocb);
         drop(queue);
         notification::notify_iocb_arrived(&self.iocb_arrived);
@@ -477,7 +517,45 @@ impl AioContext {
     /// Pop the front of the submission queue. Used by the worker
     /// body. Returns `None` when the queue is empty.
     pub fn pop_iocb(&self) -> Option<Iocb> {
-        self.submit_queue.lock().pop_front()
+        let iocb = self.submit_queue.lock().pop_front()?;
+        self.requests
+            .lock()
+            .insert(iocb.aio_user_ptr, AioRequestState::Running);
+        Some(iocb)
+    }
+
+    pub fn request_state(&self, user_ptr: u64) -> Option<AioRequestState> {
+        self.requests.lock().get(&user_ptr).copied()
+    }
+
+    pub fn mark_cancel_requested(&self, user_ptr: u64) -> bool {
+        let mut requests = self.requests.lock();
+        match requests.get_mut(&user_ptr) {
+            Some(state @ AioRequestState::Running) => {
+                *state = AioRequestState::CancelRequested;
+                true
+            }
+            Some(AioRequestState::CancelRequested) => true,
+            _ => false,
+        }
+    }
+
+    pub fn cancel_queued(&self, user_ptr: u64) -> Option<Iocb> {
+        let mut queue = self.submit_queue.lock();
+        let pos = queue
+            .iter()
+            .position(|iocb| iocb.aio_user_ptr == user_ptr)?;
+        let iocb = queue.remove(pos)?;
+        self.requests
+            .lock()
+            .insert(user_ptr, AioRequestState::Completed);
+        Some(iocb)
+    }
+
+    pub fn finish_request(&self, user_ptr: u64) {
+        self.requests
+            .lock()
+            .insert(user_ptr, AioRequestState::Completed);
     }
 
     /// Borrow the worker abort signal. The `io_destroy` arm (phase 4)
@@ -521,6 +599,18 @@ impl AioContext {
     /// Borrow the events-available wait source.
     pub fn events_available_source(&self) -> &Arc<WaitSource> {
         &self.events_available
+    }
+
+    pub const fn ring_space_available_id(&self) -> u64 {
+        self.ring_space_available_id
+    }
+
+    pub fn ring_space_available_source(&self) -> &Arc<WaitSource> {
+        &self.ring_space_available
+    }
+
+    pub fn notify_ring_space_available(&self) {
+        notification::notify_ring_space_available(&self.ring_space_available);
     }
 
     /// Push a completion onto the per-context queue and notify any
@@ -574,7 +664,11 @@ impl Drop for AioContext {
         self.worker_abort.trip(OnBehalfOfAbort::CooperativeCancel(
             CancelReason::OwnerRequested,
         ));
-        notification::release_wait_points(self.iocb_arrived_id, self.events_available_id);
+        notification::release_wait_points(
+            self.iocb_arrived_id,
+            self.events_available_id,
+            self.ring_space_available_id,
+        );
     }
 }
 
@@ -612,13 +706,22 @@ pub(crate) fn register_zones() -> Result<(), ZoneError> {
 /// itself `Send + 'static` (matching `AioWorkerFuture`'s bound).
 pub type IocbDispatcher = Arc<dyn Fn(&Iocb) -> IoEvent + Send + Sync + 'static>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletionPublish {
+    Published,
+    WouldBlock,
+}
+
+pub type CompletionPublisher =
+    Arc<dyn Fn(&Iocb, IoEvent) -> CompletionPublish + Send + Sync + 'static>;
+
 /// Default dispatcher: every iocb completes with `-EINVAL` (i.e. the
 /// kernel rejects the op). Used by the framework / unit tests that
 /// don't want to wire a real fd-table resolver.
 pub fn default_einval_dispatcher() -> IocbDispatcher {
     Arc::new(|iocb: &Iocb| {
         // Linux negative-errno convention: EINVAL = 22.
-        IoEvent::new(iocb.aio_data, iocb.aio_data, -22, 0)
+        IoEvent::new(iocb.aio_data, iocb.aio_user_ptr, -22, 0)
     })
 }
 
@@ -650,6 +753,7 @@ pub fn spawn_worker_for_context<I>(
     owner_principal: Cap<I>,
     owner_subject: SubjectContext<I>,
     dispatcher: IocbDispatcher,
+    publisher: CompletionPublisher,
 ) -> AioWorkerFuture
 where
     I: SubjectIdentity + Send + Sync,
@@ -666,6 +770,7 @@ where
     let helper = async move {
         let aio_cap_inner = aio_cap_for_body;
         let dispatcher_inner = dispatcher;
+        let publisher_inner = publisher;
         let helper_result = with_on_behalf_of(
             owner_principal,
             &owner_subject,
@@ -678,15 +783,25 @@ where
                 loop {
                     if let Some(iocb) = aio_cap_inner.pop_iocb() {
                         let event = dispatcher_inner(&iocb);
+                        while publisher_inner(&iocb, event) == CompletionPublish::WouldBlock {
+                            wait_on_source(
+                                aio_cap_inner.ring_space_available_source().clone(),
+                                WaitSourceId::new(aio_cap_inner.ring_space_available_id()),
+                                InterestMask::new(notification::RING_SPACE_AVAILABLE_MASK),
+                            )
+                            .await;
+                        }
+                        aio_cap_inner.finish_request(iocb.aio_user_ptr);
                         aio_cap_inner.push_completion(event);
                         aio_cap_inner.dispatched.fetch_add(1, Ordering::AcqRel);
                         continue;
                     }
-                    // Queue drained — yield so the outer racer
-                    // re-checks the abort signal. Phase 6+ replaces
-                    // this with a real `WaitSource`-based park
-                    // bound to `iocb_arrived`.
-                    NoopPending.await;
+                    wait_on_source(
+                        aio_cap_inner.iocb_arrived_source().clone(),
+                        WaitSourceId::new(aio_cap_inner.iocb_arrived_id()),
+                        InterestMask::new(notification::IOCB_ARRIVED_MASK),
+                    )
+                    .await;
                 }
                 // Unreachable from inside the loop above, but
                 // satisfies the return-type checker.
@@ -709,16 +824,14 @@ where
 /// Erased worker future returned by [`spawn_worker_for_context`]. The
 /// concrete shape is `with_on_behalf_of(...) -> impl Future<Output=...>`
 /// wrapped in a [`WorkerOuter`] race against the context's
-/// `worker_abort` signal — phase 2 returns a hand-rolled future so the
-/// syscall arm / test harness can spawn / poll it. Production code
-/// (phase 3+) will submit this future to the reactor via the
-/// boot-reactor seam.
+/// `worker_abort` signal. Production code submits this future to the reactor
+/// via the boot-reactor seam; host tests may poll it explicitly.
 pub struct AioWorkerFuture {
     /// Inner state machine.
     inner: AioWorkerState,
     /// The AIO context cap the worker drains; held across the future's
     /// lifetime so the queue / wait source stay live even if userspace
-    /// closes the AIO fd in the same poll cycle. Prefixed with `_` to
+    /// destroys the raw AIO context in the same poll cycle. Prefixed with `_` to
     /// suppress unused-field warnings — the cap clone's job is the
     /// EBR retain, not direct use from outside.
     _aio_cap: Cap<AioContext>,
@@ -800,20 +913,36 @@ impl Future for WorkerOuter {
     }
 }
 
-/// A `Future` that always returns `Pending`. Used inside the worker
-/// body's drain-then-park loop: when the queue is empty we return
-/// `Pending` once so the outer racer re-checks the abort signal.
-/// Phase 3+ replaces this with a real `WaitSource`-based park.
-struct NoopPending;
+async fn wait_on_source(source: Arc<WaitSource>, source_id: WaitSourceId, interests: InterestMask) {
+    let mailbox = Arc::new(TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let active = adapter::step_engine::ActiveWait::new(generation, source_id, interests);
+    let subscriber = source.register(Arc::downgrade(&mailbox), generation, interests);
+    MailboxSourceFuture {
+        mailbox: &mailbox,
+        active,
+    }
+    .await;
+    source.unregister(subscriber);
+}
 
-impl Future for NoopPending {
+struct MailboxSourceFuture<'a> {
+    mailbox: &'a TaskMailbox,
+    active: adapter::step_engine::ActiveWait,
+}
+
+impl Future for MailboxSourceFuture<'_> {
     type Output = ();
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        // Re-arm via cooperative yield. The outer racer will re-check
-        // the abort signal on its next poll, and the iocb-arrived
-        // wait-source notify wakes whichever waker the production
-        // wiring installed. Phase 2 tests poll the worker directly
-        // after pushing an iocb so the wake path is the test loop.
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.mailbox.register_waker(cx.waker().clone());
+        while let Some(event) = self.mailbox.poll() {
+            if self.active.matches(&event) || matches!(event, MailboxEvent::SignalDelivered { .. })
+            {
+                self.mailbox.clear_waker();
+                return Poll::Ready(());
+            }
+        }
         Poll::Pending
     }
 }
@@ -908,6 +1037,7 @@ mod tests {
         assert!(is_valid_iocb_opcode(IOCB_CMD_PWRITE));
         assert!(is_valid_iocb_opcode(IOCB_CMD_FSYNC));
         assert!(is_valid_iocb_opcode(IOCB_CMD_FDSYNC));
+        assert!(is_valid_iocb_opcode(IOCB_CMD_POLL));
         assert!(is_valid_iocb_opcode(IOCB_CMD_NOOP));
         assert!(is_valid_iocb_opcode(IOCB_CMD_PREADV));
         assert!(is_valid_iocb_opcode(IOCB_CMD_PWRITEV));

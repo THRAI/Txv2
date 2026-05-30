@@ -8,6 +8,7 @@ use tx_platform_adapter::notification_adapter;
 pub(crate) use readiness::{
     new_wait_points, notify_readable, notify_writable, wait_until_readable, wait_until_writable,
 };
+pub use readiness::{EVENTFD_READABLE, EVENTFD_WRITABLE};
 
 #[notification_adapter(
     subsystem = "eventfd",

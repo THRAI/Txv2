@@ -652,9 +652,15 @@ pub async fn run_thread<P: TxPlatform>(
 
                 match result {
                     tx_shims::linux_syscall::SyscallResult::Return(v) => {
+                        if process.is_zombie() {
+                            return;
+                        }
                         payload.store_pending_syscall_return(Some(Ok(v)));
                     }
                     tx_shims::linux_syscall::SyscallResult::Error(e) => {
+                        if process.is_zombie() {
+                            return;
+                        }
                         payload.store_pending_syscall_return(Some(Err(e)));
                     }
                     tx_shims::linux_syscall::SyscallResult::NoReturn => {

@@ -36,6 +36,7 @@ mod adapter;
 
 use adapter::step_engine::Cap;
 
+use crate::aio::AioWorkerFuture;
 use crate::process::ProcessIdentity;
 use crate::thread_runtime::ThreadIdentity;
 
@@ -49,12 +50,14 @@ use crate::thread_runtime::ThreadIdentity;
 /// parameter-free.
 pub type SubmitChildThreadFn =
     fn(child_process: Cap<ProcessIdentity>, child_thread: Cap<ThreadIdentity>);
+pub type SubmitAioWorkerFn = fn(worker: AioWorkerFuture);
 
 /// Slot holding the installed [`SubmitChildThreadFn`]. `AtomicPtr`
 /// is used (over `SpinMutex<Option<...>>`) so the read path
 /// (`sys_clone` in Wave 2) is lock-free; the install path runs
 /// once at boot before any user syscall fires.
 static SUBMIT_CHILD_THREAD_FN: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+static SUBMIT_AIO_WORKER_FN: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Install the reactor-submission hook. Called once at boot from
 /// `tx-kernel`'s `init.rs` before the BSP reactor loop is entered
@@ -66,6 +69,10 @@ static SUBMIT_CHILD_THREAD_FN: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mu
 /// runs via [`reset_for_test`].
 pub fn install_submit_child_thread(f: SubmitChildThreadFn) {
     SUBMIT_CHILD_THREAD_FN.store(f as *mut (), Ordering::Release);
+}
+
+pub fn install_submit_aio_worker(f: SubmitAioWorkerFn) {
+    SUBMIT_AIO_WORKER_FN.store(f as *mut (), Ordering::Release);
 }
 
 /// Read the installed hook, if any. Wave 2 of the fork/clone/wait4
@@ -87,6 +94,16 @@ pub fn submit_child_thread_fn() -> Option<SubmitChildThreadFn> {
     }
 }
 
+pub fn submit_aio_worker_fn() -> Option<SubmitAioWorkerFn> {
+    let raw = SUBMIT_AIO_WORKER_FN.load(Ordering::Acquire);
+    if raw.is_null() {
+        None
+    } else {
+        // SAFETY: the only writer stores an `fn(AioWorkerFuture)`.
+        Some(unsafe { core::mem::transmute::<*mut (), SubmitAioWorkerFn>(raw) })
+    }
+}
+
 /// Convenience wrapper that submits a child thread through the
 /// installed hook, panicking with a stable sentinel string if no
 /// hook is installed.
@@ -100,12 +117,19 @@ pub fn submit_child_thread(child_process: Cap<ProcessIdentity>, child_thread: Ca
     f(child_process, child_thread);
 }
 
+pub fn submit_aio_worker(worker: AioWorkerFuture) {
+    let f = submit_aio_worker_fn()
+        .expect("reactor_submit: SUBMIT_AIO_WORKER_FN not installed before io_setup fired");
+    f(worker);
+}
+
 /// Test-only: clear the installed hook so a subsequent
 /// [`install_submit_child_thread`] call sees an empty slot. Used by
 /// `tx-kernel`'s init tests to verify the install seam.
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_for_test() {
     SUBMIT_CHILD_THREAD_FN.store(core::ptr::null_mut(), Ordering::Release);
+    SUBMIT_AIO_WORKER_FN.store(core::ptr::null_mut(), Ordering::Release);
 }
 
 #[cfg(test)]

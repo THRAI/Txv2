@@ -13,6 +13,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod adapter;
 pub mod notification;
 
+pub use notification::{EVENTFD_READABLE, EVENTFD_WRITABLE};
+
 use adapter::step_engine::{
     eagain, eagain_no_progress, sign, ByteOutcome, ByteProgress, Cap, NoProgress, OneShotStepOp,
     ScriptCtx, StepOp, StepOutcome, SubjectIdentity, V3Errno, WaitSource, Zone, ZoneAllocated,

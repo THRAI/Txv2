@@ -812,6 +812,28 @@ fn exec_script_resets_brk_base_from_image_plan() {
 }
 
 #[test]
+fn exec_script_small_shebang_attempts_interpreter() {
+    let _setup = setup();
+    let bytes = b"#!/bin/sh\n";
+    let (process, thread, _fs) = bootstrap_with_file(b"script", bytes);
+
+    let aspace_before = process.aspace_cap().expect("alive aspace");
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/script",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Err(ExecError::PathNotFound));
+
+    let aspace_after = process.aspace_cap().expect("alive aspace post-fail");
+    assert_eq!(aspace_before.key(), aspace_after.key());
+}
+
+#[test]
 fn exec_script_invalid_elf_falls_back_to_bin_sh() {
     let _setup = setup();
     // 4 KiB of zeroes — fails ELF magic check immediately.

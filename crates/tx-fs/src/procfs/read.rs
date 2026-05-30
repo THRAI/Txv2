@@ -132,6 +132,11 @@ fn render_userns_setgroups(pid: Pid) -> String {
     }
 }
 
+#[cfg(test)]
+pub fn render(fs_object_id: FsObjectId) -> String {
+    render_with_netns(fs_object_id, None)
+}
+
 fn render_stat(pid: Pid) -> String {
     let Some(proc) = process::process_by_pid(pid) else {
         return match resolve_pid_number_as(pid.0 as u64, PidNameKind::Thread) {

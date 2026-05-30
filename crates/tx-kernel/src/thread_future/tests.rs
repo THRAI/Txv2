@@ -27,7 +27,7 @@ use tx_hal::{
 };
 use tx_shims::linux_syscall::{
     dispatch, SyscallCtx, SyscallResult, FUTEX_PRIVATE_FLAG, FUTEX_WAKE, NR_EXIT_GROUP, NR_FUTEX,
-    NR_WRITE,
+    NR_TGKILL, NR_WRITE,
 };
 use tx_subsystems::process::ExitStatus;
 use tx_subsystems::signal::{SigDisposition, Signum};
@@ -299,6 +299,71 @@ fn futex_wake_return_reenters_userspace_without_mailbox_event() {
         *USERSPACE_A0_LOG.lock().unwrap_or_else(|e| e.into_inner()),
         std::vec![99, 0],
         "FUTEX_WAKE return must be written back and immediately re-enter userspace"
+    );
+}
+
+/// A syscall can terminate the current process as a side effect,
+/// notably `tgkill(getpid(), gettid(), SIGABRT)` with the default
+/// fatal disposition. In that case the thread future must stop rather
+/// than publish a normal syscall return and re-enter userspace.
+#[test]
+fn syscall_side_effect_zombie_does_not_reenter_userspace() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
+
+    let mut initial_ctx = tx_hal::UserTrapContext {
+        regs: [0; 32],
+        pc: 0,
+        status: 0,
+        fp: tx_hal::UserFpContext::empty(),
+    };
+    initial_ctx.regs[10] = 99;
+    payload.store_saved_user_context(Some(initial_ctx));
+
+    let future = run_thread::<TestPlatform>(leader.clone(), payload.clone());
+    let wrapped = PerHartSlotted::<TestPlatform, _>::new(payload.clone(), future);
+    let reactor = crate::adapter::boot_runtime::Reactor::new();
+    let _task = reactor.submit_task(wrapped);
+
+    let first = reactor.run_until_idle();
+    assert_eq!(first.completed, 0);
+
+    let active = payload
+        .active_userspace_request()
+        .expect("run_thread published a userspace wait");
+    let tgkill_self = UserspaceTrapInfo::Syscall(SyscallRequest::new(
+        NR_TGKILL,
+        [
+            init.pid.0 as u64,
+            leader.tid.0 as u64,
+            Signum::SIGABRT.raw() as u64,
+            0,
+            0,
+            0,
+        ],
+    ));
+    payload
+        .userspace_slot()
+        .complete_interesting_trap(active, tgkill_self)
+        .expect("resolve wait with tgkill self");
+
+    let second = reactor.run_until_idle();
+    assert_eq!(second.completed, 1);
+    assert_eq!(
+        *USERSPACE_A0_LOG.lock().unwrap_or_else(|e| e.into_inner()),
+        std::vec![99],
+        "fatal self-signal must not return to userspace with tgkill's 0"
+    );
+    assert_eq!(
+        init.exit_status(),
+        Some(ExitStatus::Signaled(Signum::SIGABRT))
+    );
+    assert!(
+        drain_pending_syscall_return(&payload).is_none(),
+        "fatal self-signal must not publish a syscall return"
     );
 }
 

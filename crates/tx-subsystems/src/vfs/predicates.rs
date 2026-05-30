@@ -105,6 +105,26 @@ pub fn check_descend_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), Err
     Ok(())
 }
 
+/// Linux-style protected symlink predicate for sticky world-writable
+/// directories. This is the pure policy side used by the path walker before
+/// following a symlink.
+pub fn protected_symlink_follow_denied(
+    cred: &Credential,
+    parent_meta: &InodeMeta,
+    child_meta: &InodeMeta,
+) -> bool {
+    let sticky_world_writable =
+        (parent_meta.mode & S_ISVTX) != 0 && (parent_meta.mode & 0o002) != 0;
+    if !sticky_world_writable {
+        return false;
+    }
+    let owns_parent = cred.uid == parent_meta.uid;
+    let owns_child = cred.uid == child_meta.uid;
+    let has_fowner = cred.effective_caps.contains(Capability::FOWNER);
+    let is_root = cred.uid == 0;
+    !(owns_parent || owns_child || has_fowner || is_root)
+}
+
 /// DAC remove-entry check for `unlink(2)` / `unlinkat(2)` /
 /// `rmdir(2)`. Pure POSIX rule, applied against the *parent* directory:
 ///

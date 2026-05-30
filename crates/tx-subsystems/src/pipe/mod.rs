@@ -516,6 +516,27 @@ impl PipePayload {
         self.ring.lock().pipe_size_bytes()
     }
 
+    pub fn reader_readable_level(&self) -> bool {
+        !self.ring.lock().is_empty()
+    }
+
+    pub fn reader_hup_level(&self) -> bool {
+        self.writer_count.load(Ordering::Acquire) == 0
+    }
+
+    pub fn writer_writable_level(&self) -> bool {
+        self.reader_count.load(Ordering::Acquire) > 0
+            && self.ring.lock().available_write_capacity() > 0
+    }
+
+    pub fn writer_atomic_writable_level(&self) -> bool {
+        self.reader_count.load(Ordering::Acquire) > 0 && self.ring.lock().can_write_atomic(PIPE_BUF)
+    }
+
+    pub fn writer_err_level(&self) -> bool {
+        self.reader_count.load(Ordering::Acquire) == 0
+    }
+
     pub fn set_pipe_size_bytes(&self, requested: usize) -> Result<usize, Errno> {
         let mut ring = self.ring.lock();
         let size = ring.set_pipe_size_bytes(requested)?;

@@ -10,7 +10,6 @@ use crate::adapter::step_engine::SpinMutex;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
-use tx_subsystems::vfs::structure::OpenFileBacking;
 
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
@@ -32,20 +31,6 @@ struct FakeSocket {
 
 static NEXT_SOCKET_FD: AtomicU32 = AtomicU32::new(10_000);
 static SOCKETS: SpinMutex<BTreeMap<u32, FakeSocket>> = SpinMutex::new(BTreeMap::new());
-
-fn non_socket_accept_errno(ctx: &SyscallCtx<'_>, fd: u32) -> i32 {
-    let Some(file) = ctx.process.fd(fd) else {
-        return EBADF_VALUE;
-    };
-    if matches!(file.backing(), OpenFileBacking::Rnode { .. })
-        && !file.flags().read
-        && !file.flags().write
-    {
-        EBADF_VALUE
-    } else {
-        ENOTSOCK_VALUE
-    }
-}
 
 fn socket_kind(raw_type: i32) -> i32 {
     raw_type & SOCK_TYPE_MASK
@@ -86,18 +71,97 @@ fn allocate_socket_fd() -> u32 {
     NEXT_SOCKET_FD.fetch_add(1, Ordering::Relaxed)
 }
 
-pub(super) fn close_socket_fd(fd: u32, ctx: &SyscallCtx<'_>) -> bool {
-    let owner_pid = ctx.process.pid.0;
-    let mut sockets = SOCKETS.lock();
-    if sockets
+pub(super) fn is_socket_fd(fd: u32, _ctx: &SyscallCtx<'_>) -> bool {
+    SOCKETS.lock().contains_key(&fd)
+}
+
+pub(super) fn socket_readable(fd: u32, _ctx: &SyscallCtx<'_>) -> bool {
+    SOCKETS
+        .lock()
         .get(&fd)
-        .is_some_and(|sock| sock.owner_pid == owner_pid)
-    {
-        sockets.remove(&fd);
-        true
-    } else {
-        false
+        .is_some_and(|sock| !sock.inbox.is_empty())
+}
+
+pub(super) fn close_socket_fd(fd: u32, _ctx: &SyscallCtx<'_>) -> bool {
+    let mut sockets = SOCKETS.lock();
+    let Some(sock) = sockets.get(&fd) else {
+        return false;
+    };
+    let peer_fd = sock.peer_fd;
+    sockets.remove(&fd);
+    if let Some(peer) = peer_fd.and_then(|peer| sockets.get_mut(&peer)) {
+        peer.peer_fd = None;
+        peer.connected = false;
     }
+    true
+}
+
+pub(super) fn sys_socket_write(
+    fd: u32,
+    buf: u64,
+    len: usize,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    let mut payload = alloc::vec![0u8; len];
+    if len > 0 {
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut payload, buf) {
+            return Some(SyscallResult::error_from(errno));
+        }
+    }
+
+    let mut sockets = SOCKETS.lock();
+    let (peer_fd, nonblocking) = {
+        let sock = sockets.get(&fd)?;
+        (sock.peer_fd, sock.nonblocking)
+    };
+    if let Some(peer) = peer_fd.and_then(|peer_fd| sockets.get_mut(&peer_fd)) {
+        if peer.inbox.len().saturating_add(payload.len()) > MAX_SOCKET_PAYLOAD {
+            let _ = nonblocking;
+            return Some(SyscallResult::Error(EAGAIN_VALUE));
+        }
+        peer.inbox.extend_from_slice(&payload);
+    }
+    Some(SyscallResult::Return(len as i64))
+}
+
+pub(super) fn sys_socket_sendfile(
+    fd: u32,
+    count: usize,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    let _ = ctx;
+    let sockets = SOCKETS.lock();
+    let sock = sockets.get(&fd)?;
+    let Some(peer_fd) = sock.peer_fd else {
+        return Some(SyscallResult::Error(ENOTCONN_VALUE));
+    };
+    let Some(peer) = sockets.get(&peer_fd) else {
+        return Some(SyscallResult::Error(ENOTCONN_VALUE));
+    };
+    if peer.inbox.len().saturating_add(count) > MAX_SOCKET_PAYLOAD {
+        return Some(SyscallResult::Error(EAGAIN_VALUE));
+    }
+    Some(SyscallResult::Error(EINVAL_VALUE))
+}
+
+pub(super) fn sys_socket_read(
+    fd: u32,
+    buf: u64,
+    len: usize,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    let payload = {
+        let mut sockets = SOCKETS.lock();
+        let sock = sockets.get_mut(&fd)?;
+        let take_len = core::cmp::min(len, sock.inbox.len());
+        sock.inbox.drain(..take_len).collect::<Vec<u8>>()
+    };
+    if !payload.is_empty() {
+        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf, &payload) {
+            return Some(SyscallResult::error_from(errno));
+        }
+    }
+    Some(SyscallResult::Return(payload.len() as i64))
 }
 
 pub(super) fn sys_socket(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
@@ -340,15 +404,12 @@ pub(super) fn sys_accept4(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
     let peer_addr = {
         let sockets = SOCKETS.lock();
         let Some(listener) = sockets.get(&fd) else {
-            return SyscallResult::Error(non_socket_accept_errno(ctx, fd));
+            return SyscallResult::Error(EBADF_VALUE);
         };
         if listener.owner_pid != owner_pid {
             return SyscallResult::Error(EBADF_VALUE);
         }
-        if listener.kind != SOCK_STREAM {
-            return SyscallResult::Error(EOPNOTSUPP_VALUE);
-        }
-        if !listener.listening {
+        if listener.kind != SOCK_STREAM || !listener.listening {
             return SyscallResult::Error(EINVAL_VALUE);
         }
         listener.bound_addr.clone().unwrap_or_else(default_sockaddr)

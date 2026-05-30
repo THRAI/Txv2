@@ -54,34 +54,6 @@ pub const NR_READV: u64 = 65;
 pub const NR_PREADV: u64 = 69;
 /// `pwritev(fd, iov, iovcnt, offset_lo, offset_hi)`. Linux RV64 generic ABI.
 pub const NR_PWRITEV: u64 = 70;
-/// `socket(domain, type, protocol)`. Linux generic ABI `__NR_socket`.
-pub const NR_SOCKET: u64 = 198;
-/// `socketpair(domain, type, protocol, sv)`. Linux generic ABI `__NR_socketpair`.
-pub const NR_SOCKETPAIR: u64 = 199;
-/// `bind(sockfd, addr, addrlen)`. Linux generic ABI `__NR_bind`.
-pub const NR_BIND: u64 = 200;
-/// `listen(sockfd, backlog)`. Linux generic ABI `__NR_listen`.
-pub const NR_LISTEN: u64 = 201;
-/// `accept(sockfd, addr, addrlen)`. Linux generic ABI `__NR_accept`.
-pub const NR_ACCEPT: u64 = 202;
-/// `connect(sockfd, addr, addrlen)`. Linux generic ABI `__NR_connect`.
-pub const NR_CONNECT: u64 = 203;
-/// `getsockname(sockfd, addr, addrlen)`. Linux generic ABI `__NR_getsockname`.
-pub const NR_GETSOCKNAME: u64 = 204;
-/// `getpeername(sockfd, addr, addrlen)`. Linux generic ABI `__NR_getpeername`.
-pub const NR_GETPEERNAME: u64 = 205;
-/// `sendto(sockfd, buf, len, flags, dest_addr, addrlen)`. Linux generic ABI `__NR_sendto`.
-pub const NR_SENDTO: u64 = 206;
-/// `recvfrom(sockfd, buf, len, flags, src_addr, addrlen)`. Linux generic ABI `__NR_recvfrom`.
-pub const NR_RECVFROM: u64 = 207;
-/// `setsockopt(sockfd, level, optname, optval, optlen)`. Linux generic ABI `__NR_setsockopt`.
-pub const NR_SETSOCKOPT: u64 = 208;
-/// `getsockopt(sockfd, level, optname, optval, optlen)`. Linux generic ABI `__NR_getsockopt`.
-pub const NR_GETSOCKOPT: u64 = 209;
-/// `shutdown(sockfd, how)`. Linux generic ABI `__NR_shutdown`.
-pub const NR_SHUTDOWN: u64 = 210;
-/// `accept4(sockfd, addr, addrlen, flags)`. Linux generic ABI `__NR_accept4`.
-pub const NR_ACCEPT4: u64 = 242;
 /// `fanotify_init(flags, event_f_flags)`. Linux RV64 generic ABI.
 pub const NR_FANOTIFY_INIT: u64 = 262;
 /// `fanotify_mark(fanotify_fd, flags, mask, dfd, pathname)`. Linux RV64 generic ABI.
@@ -134,6 +106,17 @@ pub const NR_PSELECT6_TIME64: u64 = 413;
 pub const NR_EXIT: u64 = 93;
 /// `personality(persona)`. Linux RV64 generic ABI `__NR_personality = 92`.
 pub const NR_PERSONALITY: u64 = 92;
+/// Explicitly dispatched as `-ENOSYS` until interrupted-sleep restart state
+/// exists in the syscall ABI.
+pub const NR_RESTART_SYSCALL: u64 = 128;
+/// `ioprio_set(which, who, ioprio)`. Linux RV64 generic ABI.
+pub const NR_IOPRIO_SET: u64 = 30;
+/// `ioprio_get(which, who)`. Linux RV64 generic ABI.
+pub const NR_IOPRIO_GET: u64 = 31;
+/// `setpriority(which, who, niceval)`. Linux RV64 generic ABI.
+pub const NR_SETPRIORITY: u64 = 140;
+/// `getpriority(which, who)`. Linux RV64 generic ABI.
+pub const NR_GETPRIORITY: u64 = 141;
 /// `exit_group(status)`. Linux generic ABI `__NR_exit_group`. Routes
 /// through `step_exit_group` per `PROCESS_v1` §7.3.2.
 pub const NR_EXIT_GROUP: u64 = 94;
@@ -160,10 +143,10 @@ pub const NR_RT_SIGACTION: u64 = 134;
 pub const NR_RT_SIGPROCMASK: u64 = 135;
 /// `capget(hdrp, datap)`. Linux generic ABI `__NR_capget = 90`.
 pub const NR_CAPGET: u64 = 90;
+/// `acct(name)`. Linux RV64 generic ABI `__NR_acct = 89`.
+pub const NR_ACCT: u64 = 89;
 /// `capset(hdrp, datap)`. Linux generic ABI `__NR_capset = 91`.
 pub const NR_CAPSET: u64 = 91;
-/// `personality(persona)`. Linux generic ABI `__NR_personality = 92`.
-pub const NR_PERSONALITY: u64 = 92;
 /// `fcntl(fd, cmd, arg)`. Linux generic ABI `__NR_fcntl` (= `__NR3264_fcntl`).
 ///
 /// Wave 2 of the ELF loader plan ships a minimal subset:
@@ -692,7 +675,6 @@ pub const NR_FCHMOD: u64 = 52;
 /// `flags` (`AT_SYMLINK_NOFOLLOW`) is accepted but ignored — the slice
 /// doesn't follow symlinks at chmod time anyway. LTP cluster:
 /// `fchmodat01..02`.
-pub const NR_FCHMOD: u64 = 52;
 pub const NR_FCHMODAT: u64 = 53;
 /// `fchownat(dirfd, path, uid, gid, flags)`. Linux RV64 generic ABI
 /// `__NR_fchownat = 54`. Wraps `FsOps::step_chown` (Wave 3 Part 2).
@@ -809,6 +791,44 @@ pub const NR_MADVISE: u64 = 233;
 pub const NR_REMAP_FILE_PAGES: u64 = 234;
 /// `mlock2(addr, len, flags)`. Linux RV64 generic ABI `__NR_mlock2 = 284`.
 pub const NR_MLOCK2: u64 = 284;
+
+/// `MLOCK_ONFAULT` flag for `mlock2`. Under no-swap this is accepted as an
+/// observational lock flag, same as eager `mlock`.
+pub const MLOCK_ONFAULT: u64 = 0x1;
+/// `MCL_CURRENT` flag for `mlockall`: lock all current mappings.
+pub const MCL_CURRENT: u64 = 0x1;
+/// `MCL_FUTURE` flag for `mlockall`: lock future mappings.
+pub const MCL_FUTURE: u64 = 0x2;
+/// `MCL_ONFAULT` flag for `mlockall`.
+pub const MCL_ONFAULT: u64 = 0x4;
+/// `MFD_CLOEXEC` for `memfd_create`.
+pub const MFD_CLOEXEC: u64 = 0x1;
+/// `MFD_ALLOW_SEALING` for `memfd_create`.
+pub const MFD_ALLOW_SEALING: u64 = 0x2;
+/// `MFD_HUGETLB` for `memfd_create`.
+pub const MFD_HUGETLB: u64 = 0x4;
+/// `MFD_NOEXEC_SEAL` for `memfd_create`.
+pub const MFD_NOEXEC_SEAL: u64 = 0x8;
+/// `MFD_EXEC` for `memfd_create`.
+pub const MFD_EXEC: u64 = 0x10;
+/// Encoded hugepage-size field for `memfd_create`.
+pub const MFD_HUGE_MASK: u64 = 0x3f << 26;
+
+/// Linux memory policy modes from `include/uapi/linux/mempolicy.h`.
+pub const MPOL_DEFAULT: u64 = 0;
+pub const MPOL_PREFERRED: u64 = 1;
+pub const MPOL_BIND: u64 = 2;
+pub const MPOL_INTERLEAVE: u64 = 3;
+pub const MPOL_LOCAL: u64 = 4;
+pub const MPOL_PREFERRED_MANY: u64 = 5;
+pub const MPOL_F_ADDR: u64 = 1 << 0;
+pub const MPOL_F_NODE: u64 = 1 << 1;
+pub const MPOL_F_MEMS_ALLOWED: u64 = 1 << 2;
+pub const MPOL_F_STATIC_NODES: u64 = 1 << 15;
+pub const MPOL_F_RELATIVE_NODES: u64 = 1 << 14;
+pub const MPOL_MF_STRICT: u64 = 1 << 0;
+pub const MPOL_MF_MOVE: u64 = 1 << 1;
+pub const MPOL_MF_MOVE_ALL: u64 = 1 << 2;
 
 // ---------------------------------------------------------------------
 // `PROT_*` flag bits — Linux generic uapi `<sys/mman.h>`. Slice 2 acts
@@ -1117,6 +1137,10 @@ pub const CLOCK_MONOTONIC_COARSE: u32 = 6;
 /// `CLOCK_MONOTONIC` — txKernel's monotonic clock starts at boot, so
 /// "boot time" and "monotonic" are equivalent.
 pub const CLOCK_BOOTTIME: u32 = 7;
+/// `clock_gettime` clock id: `CLOCK_REALTIME_ALARM = 8`.
+pub const CLOCK_REALTIME_ALARM: u32 = 8;
+/// `clock_gettime` clock id: `CLOCK_BOOTTIME_ALARM = 9`.
+pub const CLOCK_BOOTTIME_ALARM: u32 = 9;
 /// `clock_gettime` clock id: `CLOCK_TAI = 11`. v1 reports realtime
 /// plus the stored TAI offset from the timekeeping service.
 pub const CLOCK_TAI: u32 = 11;
@@ -1128,13 +1152,6 @@ pub const CLOCK_TAI: u32 = 11;
 /// (which is independent of relative-vs-absolute interpretation —
 /// already-past deadlines short-circuit either way).
 pub const TIMER_ABSTIME: u32 = 0x1;
-
-/// `setitimer` selector: wall-clock timer delivering SIGALRM.
-pub const ITIMER_REAL: i32 = 0;
-/// `setitimer` selector: user CPU timer delivering SIGVTALRM.
-pub const ITIMER_VIRTUAL: i32 = 1;
-/// `setitimer` selector: process CPU timer delivering SIGPROF.
-pub const ITIMER_PROF: i32 = 2;
 
 /// Tick frequency for `times(2)`'s return value (Linux's
 /// `_SC_CLK_TCK`). Linux's RV64 generic ABI ships this as 100Hz —
@@ -1638,13 +1655,8 @@ pub const RLIMIT_RTPRIO: u32 = 14;
 /// blocking.
 pub const RLIMIT_RTTIME: u32 = 15;
 
-/// `getrlimit(resource, old_rlim)`. Linux RV64 generic ABI.
-pub const NR_GETRLIMIT: u64 = 163;
 /// `setrlimit(resource, new_rlim)`. Linux RV64 generic ABI.
 pub const NR_SETRLIMIT: u64 = 164;
-/// `getrusage(who, usage)`. Linux RV64 generic ABI.
-pub const NR_GETRUSAGE: u64 = 165;
-
 /// `close_range(first, last, flags)`. Linux RV64 generic ABI.
 pub const NR_CLOSE_RANGE: u64 = 436;
 /// Linux `close_range` flag: unshare fd table before applying range.
@@ -1730,9 +1742,6 @@ pub const MFD_HUGETLB: u32 = 0x0004;
 /// `FsOps::lookup` + `read_link` directly so the symlink's target
 /// bytes are returned without the walker following the link.
 pub const NR_READLINKAT: u64 = 78;
-/// `NR_SYNC_FILE_RANGE = 84` — Linux RV64 generic ABI
-/// `__NR_sync_file_range`.
-pub const NR_SYNC_FILE_RANGE: u64 = 84;
 /// `NR_UTIMENSAT = 88` — Linux RV64 generic ABI `__NR_utimensat`.
 /// Updates `InodeMeta` timestamps through `FsOps::serialize_inode_meta`
 /// for the bringup path used by busybox `touch`.
@@ -1925,6 +1934,10 @@ pub const NR_IO_SETUP: u64 = 0;
 /// arm lands in phase 4 (close + worker abandonment via the borrow's
 /// `exit_source`).
 pub const NR_IO_DESTROY: u64 = 1;
+
+/// `io_cancel(ctx, iocb, result)`. Linux RV64 generic ABI
+/// `__NR_io_cancel = 3`.
+pub const NR_IO_CANCEL: u64 = 3;
 
 /// `io_getevents(ctx, min, max, events, timeout)`. Linux RV64 generic
 /// ABI `__NR_io_getevents = 4`. Phase 1 defines the constant for
@@ -2125,25 +2138,6 @@ pub const NR_TIMERFD_SETTIME: u64 = 86;
 /// `timerfd_gettime(fd, curr_value)`. Linux generic uapi
 /// `__NR_timerfd_gettime = 87`. Returns the current timer state.
 pub const NR_TIMERFD_GETTIME: u64 = 87;
-
-/// `timer_create(clockid, sevp, timerid)`. Linux generic uapi
-/// `__NR_timer_create = 107`.
-pub const NR_TIMER_CREATE: u64 = 107;
-
-/// `timer_gettime(timerid, curr_value)`. Linux generic uapi
-/// `__NR_timer_gettime = 108`.
-pub const NR_TIMER_GETTIME: u64 = 108;
-
-/// `timer_getoverrun(timerid)`. Linux generic uapi
-/// `__NR_timer_getoverrun = 109`.
-pub const NR_TIMER_GETOVERRUN: u64 = 109;
-
-/// `timer_settime(timerid, flags, new_value, old_value)`. Linux generic
-/// uapi `__NR_timer_settime = 110`.
-pub const NR_TIMER_SETTIME: u64 = 110;
-
-/// `timer_delete(timerid)`. Linux generic uapi `__NR_timer_delete = 111`.
-pub const NR_TIMER_DELETE: u64 = 111;
 
 /// Recognised `timerfd_create` flags. TFD_CLOEXEC / TFD_NONBLOCK are
 /// translated to OpenFileFlags.
