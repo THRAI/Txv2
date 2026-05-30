@@ -194,13 +194,13 @@ fn oscomp_submit(root: &Path, args: &[String]) -> Result<()> {
     let release = oscomp_release_profile(args);
     fs::create_dir_all(&submit).map_err(|err| err.to_string())?;
     match target.as_deref() {
-        Some("rv64-qemu") | None => {
+        Some("rv64-qemu") => {
             copy_kernel_for_oscomp(root, TxTarget::Rv64Qemu, &submit.join("kernel-rv"), release)?;
         }
         Some("la64-qemu") => {
             copy_kernel_for_oscomp(root, TxTarget::La64Qemu, &submit.join("kernel-la"), release)?;
         }
-        Some("all") => {
+        Some("all") | None => {
             copy_kernel_for_oscomp(root, TxTarget::Rv64Qemu, &submit.join("kernel-rv"), release)?;
             copy_kernel_for_oscomp(root, TxTarget::La64Qemu, &submit.join("kernel-la"), release)?;
         }

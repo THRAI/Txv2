@@ -1155,8 +1155,9 @@ fn append_ltp_runtest(cmd: &mut alloc::string::String, module: &str, filter: &st
     let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
     let _ = write!(
         cmd,
-        "; selected_tags='{selected_tags}'; if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; if [ -n \"$selected_tags\" ]; then case \"$selected_tags\" in *\"|$tag|\"*) ;; *) continue;; esac; fi; case \"$tag\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $tag : local skip\"; continue;; esac; cmdline=${{rest:-$tag}}; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; summary_seen=0; passed=0; failed=0; broken=0; skipped=0; warnings=0; {{ PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -c \"$cmdline\"; echo \"__TX_LTP_CASE_RET__:$?\"; }} 2>&1 | while IFS= read -r ltp_line; do case \"$ltp_line\" in __TX_LTP_CASE_RET__:*) ret=${{ltp_line#__TX_LTP_CASE_RET__:}}; {summary_shell}exit \"$ret\";; esac; {print_line_shell}case \"$ltp_line\" in Summary:) summary_seen=1;; *TPASS*) passed=$((passed + 1));; *TFAIL*) failed=$((failed + 1));; *TBROK*) broken=$((broken + 1));; *TCONF*) skipped=$((skipped + 1));; *TWARN*) warnings=$((warnings + 1));; esac; done; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $tag : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi",
+        "; selected_tags='{selected_tags}'; if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; if [ -n \"$selected_tags\" ]; then case \"$selected_tags\" in *\"|$tag|\"*) ;; *) continue;; esac; fi; case \"$tag\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $tag : local skip\"; continue;; esac; cmdline=${{rest:-$tag}}; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; summary_seen=0; passed=0; failed=0; broken=0; skipped=0; warnings=0; tx_cr=$(printf '\\r'); {{ PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -c \"$cmdline\"; echo \"__TX_LTP_CASE_RET__:$?\"; }} 2>&1 | while IFS= read -r ltp_line; do {normalize_line_shell}case \"$ltp_line\" in __TX_LTP_CASE_RET__:*) ret=${{ltp_line#__TX_LTP_CASE_RET__:}}; {summary_shell}exit \"$ret\";; esac; {print_line_shell}case \"$ltp_line\" in Summary:) summary_seen=1;; *TPASS*) passed=$((passed + 1));; *TFAIL*) failed=$((failed + 1));; *TBROK*) broken=$((broken + 1));; *TCONF*) skipped=$((skipped + 1));; *TWARN*) warnings=$((warnings + 1));; esac; done; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $tag : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi",
         summary_shell = LTP_SYNTH_SUMMARY_SHELL,
+        normalize_line_shell = LTP_NORMALIZE_LINE_SHELL,
         print_line_shell = LTP_PRINT_LINE_SHELL,
     );
     let _ = write!(
@@ -1195,6 +1196,8 @@ fn ltp_runtest_selected_tags(filter: &str) -> alloc::string::String {
 }
 
 const LTP_SYNTH_SUMMARY_SHELL: &str = r#"if [ "$summary_seen" = 0 ] && [ $((passed + failed + broken + skipped + warnings)) -gt 0 ]; then printf 'Summary:\npassed   %s\nfailed   %s\nbroken   %s\nskipped  %s\nwarnings %s\n' "$passed" "$failed" "$broken" "$skipped" "$warnings"; fi; "#;
+
+const LTP_NORMALIZE_LINE_SHELL: &str = r#"ltp_line=${ltp_line%"$tx_cr"}; "#;
 
 const LTP_PRINT_LINE_SHELL: &str = r#"case "$ltp_line" in *TPASS:*) prefix=${ltp_line%%TPASS:*}; suffix=${ltp_line#*TPASS:}; printf '%s\033[1;32mTPASS: \033[0m%s\n' "$prefix" "$suffix";; *TFAIL:*) prefix=${ltp_line%%TFAIL:*}; suffix=${ltp_line#*TFAIL:}; printf '%s\033[1;31mTFAIL: \033[0m%s\n' "$prefix" "$suffix";; *TBROK:*) prefix=${ltp_line%%TBROK:*}; suffix=${ltp_line#*TBROK:}; printf '%s\033[1;31mTBROK: \033[0m%s\n' "$prefix" "$suffix";; *TCONF:*) prefix=${ltp_line%%TCONF:*}; suffix=${ltp_line#*TCONF:}; printf '%s\033[1;33mTCONF: \033[0m%s\n' "$prefix" "$suffix";; *TWARN:*) prefix=${ltp_line%%TWARN:*}; suffix=${ltp_line#*TWARN:}; printf '%s\033[1;35mTWARN: \033[0m%s\n' "$prefix" "$suffix";; *) echo "$ltp_line";; esac; "#;
 
@@ -1340,12 +1343,14 @@ unlink01) set -- symlink01 -T unlink01; ltp_label='symlink01 -T unlink01';; \
 esac; \
 echo \"RUN LTP CASE $case : $ltp_label\"; \
 summary_seen=0; passed=0; failed=0; broken=0; skipped=0; warnings=0; \
-{{ PATH={root}/ltp/testcases/bin:{root}/ltp/bin:{root}/ltp/testscripts:{root}:/musl/musl:$PATH LTPROOT={root}/ltp KCONFIG_PATH=/proc/config \"$@\"; echo \"__TX_LTP_CASE_RET__:$?\"; }} 2>&1 | while IFS= read -r ltp_line; do case \"$ltp_line\" in __TX_LTP_CASE_RET__:*) ret=${{ltp_line#__TX_LTP_CASE_RET__:}}; {summary_shell}exit \"$ret\";; esac; {print_line_shell}case \"$ltp_line\" in Summary:) summary_seen=1;; *TPASS*) passed=$((passed + 1));; *TFAIL*) failed=$((failed + 1));; *TBROK*) broken=$((broken + 1));; *TCONF*) skipped=$((skipped + 1));; *TWARN*) warnings=$((warnings + 1));; esac; done; \
+tx_cr=$(printf '\\r'); \
+{{ PATH={root}/ltp/testcases/bin:{root}/ltp/bin:{root}/ltp/testscripts:{root}:/musl/musl:$PATH LTPROOT={root}/ltp KCONFIG_PATH=/proc/config \"$@\"; echo \"__TX_LTP_CASE_RET__:$?\"; }} 2>&1 | while IFS= read -r ltp_line; do {normalize_line_shell}case \"$ltp_line\" in __TX_LTP_CASE_RET__:*) ret=${{ltp_line#__TX_LTP_CASE_RET__:}}; {summary_shell}exit \"$ret\";; esac; {print_line_shell}case \"$ltp_line\" in Summary:) summary_seen=1;; *TPASS*) passed=$((passed + 1));; *TFAIL*) failed=$((failed + 1));; *TBROK*) broken=$((broken + 1));; *TCONF*) skipped=$((skipped + 1));; *TWARN*) warnings=$((warnings + 1));; esac; done; \
 ret=$?; \
 if [ $ret = 0 ]; then echo \"PASS LTP CASE $case : $ret\"; fi; \
 echo \"FAIL LTP CASE $case : $ret\"; \
 done",
         summary_shell = LTP_SYNTH_SUMMARY_SHELL,
+        normalize_line_shell = LTP_NORMALIZE_LINE_SHELL,
         print_line_shell = LTP_PRINT_LINE_SHELL,
     );
 }
@@ -2035,8 +2040,9 @@ fn append_full_ltp_runner(cmd: &mut alloc::string::String) {
     let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
     let _ = write!(
         cmd,
-        "; for file in \"$target_dir\"/*; do if [ -f \"$file\" ]; then name=${{file##*/}}; case \"$name\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $name : local skip\"; continue;; esac; ./busybox echo \"RUN LTP CASE $name\"; summary_seen=0; passed=0; failed=0; broken=0; skipped=0; warnings=0; {{ /bin/setsid \"$file\"; echo \"__TX_LTP_CASE_RET__:$?\"; }} 2>&1 | while IFS= read -r ltp_line; do case \"$ltp_line\" in __TX_LTP_CASE_RET__:*) ret=${{ltp_line#__TX_LTP_CASE_RET__:}}; {summary_shell}exit \"$ret\";; esac; {print_line_shell}case \"$ltp_line\" in Summary:) summary_seen=1;; *TPASS*) passed=$((passed + 1));; *TFAIL*) failed=$((failed + 1));; *TBROK*) broken=$((broken + 1));; *TCONF*) skipped=$((skipped + 1));; *TWARN*) warnings=$((warnings + 1));; esac; done; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $name : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $name : $ret\"; fi; done",
+        "; for file in \"$target_dir\"/*; do if [ -f \"$file\" ]; then name=${{file##*/}}; case \"$name\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $name : local skip\"; continue;; esac; ./busybox echo \"RUN LTP CASE $name\"; summary_seen=0; passed=0; failed=0; broken=0; skipped=0; warnings=0; tx_cr=$(printf '\\r'); {{ /bin/setsid \"$file\"; echo \"__TX_LTP_CASE_RET__:$?\"; }} 2>&1 | while IFS= read -r ltp_line; do {normalize_line_shell}case \"$ltp_line\" in __TX_LTP_CASE_RET__:*) ret=${{ltp_line#__TX_LTP_CASE_RET__:}}; {summary_shell}exit \"$ret\";; esac; {print_line_shell}case \"$ltp_line\" in Summary:) summary_seen=1;; *TPASS*) passed=$((passed + 1));; *TFAIL*) failed=$((failed + 1));; *TBROK*) broken=$((broken + 1));; *TCONF*) skipped=$((skipped + 1));; *TWARN*) warnings=$((warnings + 1));; esac; done; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $name : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $name : $ret\"; fi; done",
         summary_shell = LTP_SYNTH_SUMMARY_SHELL,
+        normalize_line_shell = LTP_NORMALIZE_LINE_SHELL,
         print_line_shell = LTP_PRINT_LINE_SHELL,
     );
     cmd.push_str("; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\"");
@@ -2372,6 +2378,8 @@ mod tests {
         assert!(full_cmd.contains("; target_dir=\"ltp/testcases/bin\""));
         assert!(full_cmd.contains("/bin/setsid \"$file\""));
         assert!(full_cmd.contains("__TX_LTP_CASE_RET__:$?"));
+        assert!(full_cmd.contains("tx_cr=$(printf '\\r')"));
+        assert!(full_cmd.contains("ltp_line=${ltp_line%\"$tx_cr\"};"));
         assert!(full_cmd.contains("printf 'Summary:\\npassed   %s\\nfailed   %s\\nbroken   %s\\nskipped  %s\\nwarnings %s\\n'"));
         assert!(full_cmd.contains("\\033[1;32mTPASS: \\033[0m"));
         assert!(!full_cmd.contains("ltp_out=/tmp"));
@@ -2390,6 +2398,8 @@ mod tests {
         assert!(filtered_cmd.contains("/musl/musl/ltp/testcases/bin"));
         assert!(filtered_cmd.contains("; for case in ar01.sh"));
         assert!(filtered_cmd.contains("__TX_LTP_CASE_RET__:$?"));
+        assert!(filtered_cmd.contains("tx_cr=$(printf '\\r')"));
+        assert!(filtered_cmd.contains("ltp_line=${ltp_line%\"$tx_cr\"};"));
         assert!(filtered_cmd.contains("printf 'Summary:\\npassed   %s\\nfailed   %s\\nbroken   %s\\nskipped  %s\\nwarnings %s\\n'"));
         assert!(filtered_cmd.contains("\\033[1;32mTPASS: \\033[0m"));
         assert!(!filtered_cmd.contains("ltp_out=/tmp"));

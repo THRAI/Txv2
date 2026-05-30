@@ -5,7 +5,7 @@ use tx_hal::{
 };
 
 use crate::{
-    dispatch_trap_frame, enter_irq_context, mark_ipi_ack, percpu_tls_for_cpu,
+    dispatch_trap_frame, enter_irq_context, for_each_console_byte_for_sbi, mark_ipi_ack, percpu_tls_for_cpu,
     remote_sfence_targets_from, trap::classify_rv64_trap, Platform, Rv64TrapFrame,
     RV64_PERCPU_AREAS,
 };
@@ -747,4 +747,18 @@ fn trap_frame_fp_context_zeroed_when_restored_without_valid_fp() {
         "FP regs must be zeroed when fp not valid"
     );
     assert_eq!(frame2.fcsr, 0, "fcsr must be zeroed when fp not valid");
+}
+
+#[test]
+fn sbi_console_helper_collapses_crlf_pairs() {
+    let mut out = std::vec::Vec::new();
+    for_each_console_byte_for_sbi(b"hi\r\nthere\r\n", |byte| out.push(byte));
+    assert_eq!(out, b"hi\nthere\n");
+}
+
+#[test]
+fn sbi_console_helper_preserves_non_crlf_bytes() {
+    let mut out = std::vec::Vec::new();
+    for_each_console_byte_for_sbi(b"\rlead\nmid\rtrail", |byte| out.push(byte));
+    assert_eq!(out, b"\rlead\nmid\rtrail");
 }
