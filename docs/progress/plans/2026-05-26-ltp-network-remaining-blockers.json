@@ -4,7 +4,7 @@
   "title": "Remaining LTP network syscall blockers",
   "status": "active",
   "created": "2026-05-26",
-  "updated": "2026-05-27",
+  "updated": "2026-05-30",
   "owner": "agent",
   "summary": "Track the remaining explicit blockers after the LTP network syscall split: SCTP, RDS, TCP TLS ULP, RV64 socketcall interpretation, accept03 fd providers, and the recvmmsg01 musl wrapper SIGSEGV. The constrained TLS ULP setsockopt10 phase is complete and refreshed b6 to 10/11. Local-only RDS and SCTP protocol-surface phases are complete. Phase-0 typed kernel-object fd providers for perf_event_open and bpf plus a kernel memfd_secret(447) fd provider are wired; focused accept03 is now 22/23 and refreshed b4 is 93/95, moving the split aggregate to 229/236. The remaining local accept03 skip is memfd_secret because the current prebuilt LTP image calls an invalid syscall number instead of 447. The remaining socketcall, recvmmsg01-musl, and setsockopt03 misses are now classified with fresh evidence as RV64 ABI, musl payload, or 32-bit compat-surface issues rather than missing network-stack semantics.",
   "scope": {
@@ -182,7 +182,7 @@
         "timeout 240s make oscomp-qemu-rv64 OSCOMP_LTP=accept03 OSCOMP_OUT_RV=target/oscomp/ltp-accept03-after-pidfd-open-final.txt",
         "timeout 180s make oscomp-qemu-rv64 OSCOMP_LTP=pidfd_open01,pidfd_send_signal01 OSCOMP_OUT_RV=target/oscomp/ltp-pidfd-remaining.txt"
       ],
-      "notes": "pidfd_open sub-slice complete: NR_PIDFD_OPEN now dispatches, resolves ProcessIdentity, installs OpenFileBacking::Pidfd, sets FD_CLOEXEC, accepts PIDFD_NONBLOCK, and makes accept03 pass pidfd as ENOTSOCK. Focused accept03 is 14/23 in target/oscomp/ltp-accept03-after-pidfd-open-final.txt. pidfd_send_signal and pidfd wait/readiness semantics remain pending; SIGNAL_v1 still points to ProcessIdentity exit publication for the later readiness path."
+      "notes": "pidfd_open sub-slice complete: NR_PIDFD_OPEN now dispatches, resolves ProcessIdentity, installs OpenFileBacking::Pidfd, sets FD_CLOEXEC, accepts PIDFD_NONBLOCK, and makes accept03 pass pidfd as ENOTSOCK. Focused accept03 is 14/23 in target/oscomp/ltp-accept03-after-pidfd-open-final.txt. NR_PIDFD_SEND_SIGNAL is now wired and host-tested for the sig=0 probe and fd validation path; this step remains pending for the focused LTP pidfd_send_signal witness and any later pidfd readiness/wait semantics."
     },
     {
       "id": "accept03-2-memfd",

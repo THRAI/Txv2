@@ -1174,7 +1174,8 @@ pub const NR_RT_SIGTIMEDWAIT: u64 = 137;
 /// Phase J: returns `-ENOSYS`; TODO full implementation.
 pub const NR_PIDFD_OPEN: u64 = 434;
 /// `pidfd_send_signal(pidfd, sig, info, flags)` — Linux RV64.
-/// Phase J: returns `-ENOSYS`; TODO full implementation.
+/// Sends a signal through a pidfd-backed open file; `sig == 0` is an
+/// existence probe.
 pub const NR_PIDFD_SEND_SIGNAL: u64 = 424;
 /// `uname(buf)`. Linux RV64 generic ABI `__NR_uname = 160`. Writes
 /// the static utsname (`sysname` / `nodename` / `release` / `version`
