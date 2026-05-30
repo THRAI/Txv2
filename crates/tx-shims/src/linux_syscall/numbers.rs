@@ -80,10 +80,22 @@ pub const NR_SYNC_FILE_RANGE: u64 = 84;
 /// v1 stub: returns 0 (success, no-op) — real priority
 /// inheritance deferred to the scheduler slice.
 pub const NR_SCHED_SETSCHEDULER: u64 = 119;
+/// `sched_setparam(pid, param)`. Linux RV64 generic ABI.
+pub const NR_SCHED_SETPARAM: u64 = 118;
+/// `sched_getscheduler(pid)`. Linux RV64 generic ABI.
+pub const NR_SCHED_GETSCHEDULER: u64 = 120;
+/// `sched_getparam(pid, param)`. Linux RV64 generic ABI.
+pub const NR_SCHED_GETPARAM: u64 = 121;
 /// `sched_yield()`. Linux generic ABI `__NR_sched_yield = 124`.
 /// LTP's fuzzy-sync helpers rely on this on single-CPU guests to hand
 /// execution to the peer racing thread.
 pub const NR_SCHED_YIELD: u64 = 124;
+/// `sched_get_priority_max(policy)`. Linux RV64 generic ABI.
+pub const NR_SCHED_GET_PRIORITY_MAX: u64 = 125;
+/// `sched_get_priority_min(policy)`. Linux RV64 generic ABI.
+pub const NR_SCHED_GET_PRIORITY_MIN: u64 = 126;
+/// `sched_rr_get_interval(pid, timespec)`. Linux RV64 generic ABI.
+pub const NR_SCHED_RR_GET_INTERVAL: u64 = 127;
 /// `ppoll(fds, nfds, tmo_p, sigmask)`. Linux generic ABI
 /// `__NR_ppoll`. busybox sh's interactive read loop polls stdin
 /// before reading. The v1 implementation is a minimal stub: walk
@@ -157,6 +169,10 @@ pub const NR_CAPSET: u64 = 91;
 pub const NR_FCNTL: u64 = 25;
 /// `inotify_init1(flags)`. Linux RV64 generic ABI.
 pub const NR_INOTIFY_INIT1: u64 = 26;
+/// `inotify_init1(2)` flag: close-on-exec, equal to `O_CLOEXEC`.
+pub const IN_CLOEXEC: u32 = O_CLOEXEC;
+/// `inotify_init1(2)` flag: nonblocking, equal to `O_NONBLOCK`.
+pub const IN_NONBLOCK: u32 = O_NONBLOCK;
 /// `inotify_add_watch(fd, pathname, mask)`. Linux RV64 generic ABI.
 pub const NR_INOTIFY_ADD_WATCH: u64 = 27;
 /// `inotify_rm_watch(fd, wd)`. Linux RV64 generic ABI.
@@ -552,8 +568,8 @@ pub const NR_SCHED_GETATTR: u64 = 275;
 // ---------------------------------------------------------------------
 // Wave 3 of the fork/clone/wait4 slice — Part 3 (NR_WAIT4 syscall arm
 // with blocking-wait via the per-process `exit_source` carrier wired in
-// Wave 1). NR_WAITID is intentionally absent — deferred per the slice
-// plan's Open Q #2 (DECIDED 2026-05-06: NR_WAITID deferred).
+// Wave 1). NR_WAITID is present for the first LTP-facing pidfd slice:
+// `waitid(P_PIDFD, pidfd, ..., WEXITED)`.
 // ---------------------------------------------------------------------
 
 /// `wait4(pid, status, options, rusage)`. Linux RV64 generic ABI
@@ -567,12 +583,17 @@ pub const NR_SCHED_GETATTR: u64 = 275;
 /// child of this process zombifies. See
 /// `txdoc:PROCESS-WAIT-FAMILY-1`.
 pub const NR_WAIT4: u64 = 260;
+/// `waitid(idtype, id, infop, options, rusage)`. Linux RV64 generic ABI
+/// `__NR_waitid`.
+pub const NR_WAITID: u64 = 95;
 
 /// `WNOHANG` — only options bit Wave 3 acts on. Other defined bits
 /// (`WUNTRACED = 0x2`, `WCONTINUED = 0x8`) are accepted but ignored;
 /// they need stop/cont signal infrastructure to surface
 /// `Stopped`/`Continued` `ExitStatus` values, which is a deferred slice.
 pub const WNOHANG: i32 = 0x1;
+pub const WEXITED: i32 = 0x4;
+pub const WNOWAIT: i32 = 0x0100_0000;
 
 // ---------------------------------------------------------------------
 // Wave 2 of the DAC + setuid slice — Part 7 (`SyscallCtx::cred()`
@@ -626,6 +647,48 @@ pub const NR_SETRESGID: u64 = 149;
 /// syscall validates privilege/pointer shape and records success as a
 /// compatibility no-op.
 pub const NR_SETGROUPS: u64 = 159;
+/// `setdomainname(name, len)`. Linux RV64 generic ABI.
+pub const NR_SETDOMAINNAME: u64 = 162;
+/// `prctl(option, arg2, arg3, arg4, arg5)`. Linux RV64 generic ABI.
+pub const NR_PRCTL: u64 = 167;
+/// `sysinfo(info)`. Linux RV64 generic ABI.
+pub const NR_SYSINFO: u64 = 179;
+/// `riscv_hwprobe(pairs, pair_count, cpusetsize, cpus, flags)`. Linux RV64 arch ABI.
+pub const NR_RISCV_HWPROBE: u64 = 258;
+/// `riscv_flush_icache(start, end, flags)`. Linux RV64 arch ABI.
+pub const NR_RISCV_FLUSH_ICACHE: u64 = 259;
+
+pub const PR_GET_DUMPABLE: u64 = 3;
+pub const PR_SET_DUMPABLE: u64 = 4;
+pub const PR_GET_TIMING: u64 = 13;
+pub const PR_SET_TIMING: u64 = 14;
+pub const PR_TIMING_STATISTICAL: u64 = 0;
+pub const PR_SET_NAME: u64 = 15;
+pub const PR_GET_NAME: u64 = 16;
+pub const PR_SET_NO_NEW_PRIVS: u64 = 38;
+pub const PR_GET_NO_NEW_PRIVS: u64 = 39;
+
+pub const RISCV_HWPROBE_KEY_MVENDORID: i64 = 0;
+pub const RISCV_HWPROBE_KEY_MARCHID: i64 = 1;
+pub const RISCV_HWPROBE_KEY_MIMPID: i64 = 2;
+pub const RISCV_HWPROBE_KEY_BASE_BEHAVIOR: i64 = 3;
+pub const RISCV_HWPROBE_BASE_BEHAVIOR_IMA: u64 = 1;
+pub const RISCV_HWPROBE_KEY_IMA_EXT_0: i64 = 4;
+pub const RISCV_HWPROBE_KEY_CPUPERF_0: i64 = 5;
+pub const RISCV_HWPROBE_KEY_ZICBOZ_BLOCK_SIZE: i64 = 6;
+pub const RISCV_HWPROBE_KEY_HIGHEST_VIRT_ADDRESS: i64 = 7;
+pub const RISCV_HWPROBE_KEY_TIME_CSR_FREQ: i64 = 8;
+pub const RISCV_HWPROBE_KEY_MISALIGNED_SCALAR_PERF: i64 = 9;
+pub const RISCV_HWPROBE_KEY_MISALIGNED_VECTOR_PERF: i64 = 10;
+pub const RISCV_HWPROBE_KEY_VENDOR_EXT_THEAD_0: i64 = 11;
+pub const RISCV_HWPROBE_KEY_ZICBOM_BLOCK_SIZE: i64 = 12;
+pub const RISCV_HWPROBE_KEY_VENDOR_EXT_SIFIVE_0: i64 = 13;
+pub const RISCV_HWPROBE_MISALIGNED_SLOW: u64 = 2;
+pub const RISCV_HWPROBE_MISALIGNED_SCALAR_SLOW: u64 = 2;
+pub const RISCV_HWPROBE_MISALIGNED_VECTOR_UNKNOWN: u64 = 0;
+pub const RISCV_HWPROBE_WHICH_CPUS: u64 = 1;
+pub const SYS_RISCV_FLUSH_ICACHE_LOCAL: u64 = 1;
+pub const SYS_RISCV_FLUSH_ICACHE_ALL: u64 = SYS_RISCV_FLUSH_ICACHE_LOCAL;
 /// `getresgid(rgid_uaddr, egid_uaddr, sgid_uaddr)`. Linux RV64
 /// generic ABI `__NR_getresgid = 150`. Companion of `getresuid`;
 /// writes the three gids to user pointers. Same Wave 2 bootstrap
@@ -1358,12 +1421,6 @@ pub const NR_FSTAT: u64 = 80;
 /// `__NR_statx = 291`. LA64 musl/busybox prefers this over the older
 /// stat-family calls for directory listing metadata probes.
 pub const NR_STATX: u64 = 291;
-/// `inotify_init1(flags)`. Linux generic ABI `__NR_inotify_init1 = 26`.
-pub const NR_INOTIFY_INIT1: u64 = 26;
-/// `inotify_init1(2)` flag: close-on-exec, equal to `O_CLOEXEC`.
-pub const IN_CLOEXEC: u32 = O_CLOEXEC;
-/// `inotify_init1(2)` flag: nonblocking, equal to `O_NONBLOCK`.
-pub const IN_NONBLOCK: u32 = O_NONBLOCK;
 /// `umask(mask)`. Linux RV64 generic ABI `__NR_umask = 166`. Atomic
 /// swap of the per-process file-creation mask, returning the
 /// previous value. Mask is silently truncated to the bottom 9 bits
@@ -1730,13 +1787,6 @@ pub const NR_BPF: u64 = 280;
 /// This stage installs a secretmem-shaped anonymous PageBacked fd; full
 /// secret-memory isolation is deferred to the VM subsystem.
 pub const NR_MEMFD_SECRET: u64 = 447;
-/// `memfd_create(2)` flag: mark the returned fd close-on-exec.
-pub const MFD_CLOEXEC: u32 = 0x0001;
-/// `memfd_create(2)` flag: allow file seals. Currently rejected until
-/// F_ADD_SEALS/F_GET_SEALS semantics exist.
-pub const MFD_ALLOW_SEALING: u32 = 0x0002;
-/// `memfd_create(2)` flag for hugetlb-backed memfds. Unsupported.
-pub const MFD_HUGETLB: u32 = 0x0004;
 /// `NR_READLINKAT = 78` — Linux RV64 generic ABI `__NR_readlinkat`.
 /// Slice 8 walks the link's parent directory and calls
 /// `FsOps::lookup` + `read_link` directly so the symlink's target
@@ -2164,9 +2214,6 @@ pub const NR_SYSLOG: u64 = 116;
 
 /// `membarrier(cmd, flags, cpu_id)`. RISC-V generic uapi `__NR_membarrier = 283`.
 pub const NR_MEMBARRIER: u64 = 283;
-/// `fanotify_init(flags, event_f_flags)`. Linux generic ABI
-/// `__NR_fanotify_init = 262`.
-pub const NR_FANOTIFY_INIT: u64 = 262;
 /// `fanotify_init(2)` flag: close-on-exec for the notification fd.
 pub const FAN_CLOEXEC: u32 = 0x0000_0001;
 /// `fanotify_init(2)` flag: nonblocking notification fd.

@@ -27,8 +27,8 @@ use std::sync::Mutex;
 use crate::adapter::reactor_entry::userspace::SyscallRequest;
 use crate::adapter::step_engine::{self as step_engine, guard, Cap, StepOutcome};
 use crate::linux_syscall::reset_uts_nodename_for_test;
-use tx_substrate::wake::TaskMailbox;
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
+use tx_substrate::wake::TaskMailbox;
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_reactor_affinity_seam,
     reset_reactor_priority_seam, reset_tid_counter,
@@ -56,19 +56,19 @@ use tx_subsystems::zones;
 use super::{
     dispatch, SyscallCtx, SyscallResult, AT_FDCWD, BPF_MAP_CREATE, BPF_MAP_TYPE_ARRAY,
     CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, EBADF_VALUE, EFAULT_VALUE,
-    EINVAL_VALUE, ENODEV_VALUE, ENOENT_VALUE, ENOSYS_VALUE, FAN_CLASS_CONTENT, FAN_CLASS_NOTIF,
-    FAN_CLOEXEC, FAN_NONBLOCK, FD_CLOEXEC, FSOPEN_CLOEXEC, FSPICK_CLOEXEC, FSPICK_NO_AUTOMOUNT,
-    F_GETFD, F_GETFL, F_SETFD, IN_CLOEXEC, IN_NONBLOCK, MFD_ALLOW_SEALING, MFD_CLOEXEC, NR_ACCEPT,
-    NR_BPF, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FANOTIFY_INIT, NR_FCNTL,
-    NR_FSOPEN, NR_FSPICK, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETSID,
-    NR_GET_ROBUST_LIST, NR_INOTIFY_INIT1, NR_MEMBARRIER, NR_MEMFD_CREATE, NR_MEMFD_SECRET,
-    NR_OPEN_TREE, NR_PERF_EVENT_OPEN, NR_PIDFD_OPEN, NR_PIPE2, NR_PPOLL, NR_READ, NR_RT_SIGACTION,
-    NR_RT_SIGPROCMASK, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY,
-    NR_SCHED_YIELD, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
-    NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, NR_WRITEV, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE,
-    O_DIRECTORY, O_NONBLOCK, O_RDONLY, O_RDWR, PERF_COUNT_SW_CPU_CLOCK, PERF_TYPE_SOFTWARE,
-    PIDFD_NONBLOCK, SIGCHLD, WNOHANG, ENOTSOCK_VALUE, EOPNOTSUPP_VALUE, NR_CLOSE, NR_SOCKET,
-    O_PATH,
+    EINVAL_VALUE, ENODEV_VALUE, ENOENT_VALUE, ENOSYS_VALUE, ENOTSOCK_VALUE, EOPNOTSUPP_VALUE,
+    FAN_CLASS_CONTENT, FAN_CLASS_NOTIF, FAN_CLOEXEC, FAN_NONBLOCK, FD_CLOEXEC, FSOPEN_CLOEXEC,
+    FSPICK_CLOEXEC, FSPICK_NO_AUTOMOUNT, F_GETFD, F_GETFL, F_SETFD, IN_CLOEXEC, IN_NONBLOCK,
+    MFD_ALLOW_SEALING, MFD_CLOEXEC, NR_ACCEPT, NR_BPF, NR_BRK, NR_CLONE, NR_CLOSE, NR_EXECVE,
+    NR_EXIT, NR_EXIT_GROUP, NR_FANOTIFY_INIT, NR_FCNTL, NR_FSOPEN, NR_FSPICK, NR_GETPGID,
+    NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_INOTIFY_INIT1,
+    NR_MEMBARRIER, NR_MEMFD_CREATE, NR_MEMFD_SECRET, NR_OPEN_TREE, NR_PERF_EVENT_OPEN,
+    NR_PIDFD_OPEN, NR_PIPE2, NR_PPOLL, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK,
+    NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SCHED_YIELD, NR_SETPGID,
+    NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SOCKET, NR_TIMERFD_CREATE, NR_WAIT4,
+    NR_WRITE, NR_WRITEV, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE, O_DIRECTORY, O_NONBLOCK, O_PATH,
+    O_RDONLY, O_RDWR, PERF_COUNT_SW_CPU_CLOCK, PERF_TYPE_SOFTWARE, PIDFD_NONBLOCK, SIGCHLD,
+    WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
@@ -84,7 +84,7 @@ use super::{
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use tx_hal::{
-    Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
+    Arch, Asid, CacheIf, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
     PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, SmpIf, VirtAddr,
 };
 use tx_subsystems::vm::USER_PAGE_SIZE;
@@ -183,6 +183,8 @@ impl tx_hal::ConsoleIf for ShimsTestPmap {
 }
 
 impl SmpIf for ShimsTestPmap {}
+
+impl CacheIf for ShimsTestPmap {}
 
 impl tx_hal::TrapIf for ShimsTestPmap {}
 impl tx_hal::SignalFrameIf for ShimsTestPmap {}

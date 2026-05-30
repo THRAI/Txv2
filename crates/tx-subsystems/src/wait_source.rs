@@ -93,6 +93,12 @@ pub fn register_wait_queue(queue: RawQueue) -> u64 {
     register_wait_source(RegisteredWaitSource::RawQueue(queue))
 }
 
+/// Register a level-triggered readiness queue under an externally allocated
+/// carrier id.
+pub(crate) fn register_wait_queue_with_id(id: u64, queue: RawQueue) {
+    register_wait_source_with_id(id, RegisteredWaitSource::RawQueue(queue));
+}
+
 /// Register an edge-triggered port for wait-source resolution.
 pub fn register_wait_port(port: RawPort) -> u64 {
     register_wait_source(RegisteredWaitSource::RawPort(port))

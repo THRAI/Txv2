@@ -132,16 +132,12 @@ pub struct KernelResumeCtx {
 }
 
 // These offsets are referenced by literal byte offset in the trap-vector
-// asm (`TX_RV64_RCTX_SP`, `TX_RV64_RCTX_RA`, `TX_RV64_RCTX_S0`). The
-// Rust constants below pin the layout from the Rust side so a struct
-// reorder triggers a compile-time mismatch with the static_assert.
-const KERNEL_RESUME_CTX_SP_OFFSET: usize = 0;
-const KERNEL_RESUME_CTX_RA_OFFSET: usize = 8;
-const KERNEL_RESUME_CTX_S0_OFFSET: usize = 16;
+// asm (`TX_RV64_RCTX_SP`, `TX_RV64_RCTX_RA`, `TX_RV64_RCTX_S0`). Keep the
+// assertions in sync with the assembly literals.
 const _: () = assert!(core::mem::size_of::<KernelResumeCtx>() == 14 * 8);
-const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, sp) == KERNEL_RESUME_CTX_SP_OFFSET);
-const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, ra) == KERNEL_RESUME_CTX_RA_OFFSET);
-const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, s) == KERNEL_RESUME_CTX_S0_OFFSET);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, sp) == 0);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, ra) == 8);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, s) == 16);
 
 /// Per-hart cell with `Sync` because the only writer/reader is the
 /// local hart's trap-vector / userspace-entry shim. Cross-hart

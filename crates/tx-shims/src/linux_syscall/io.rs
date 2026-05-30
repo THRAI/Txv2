@@ -119,6 +119,10 @@ fn timerfd_readable_level<P: tx_hal::TimeIf>(tfd: &tx_subsystems::timerfd::Timer
     tfd.expiration_count() > 0 || (deadline != 0 && P::read_ns() >= deadline)
 }
 
+fn pidfd_readable_level(process: &tx_subsystems::process::ProcessIdentity) -> bool {
+    process.exit_status().is_some()
+}
+
 fn include_timerfd_deadline(deadline_slot: &mut Option<u64>, deadline_ns: u64) {
     if deadline_ns == 0 {
         return;
@@ -421,6 +425,8 @@ async fn sys_write_kernel_bytes_to_file<'a>(
         file,
         bytes,
         caller_netns: ctx.process.net_namespace(),
+        writer_cred: ctx.process.cred(),
+        writer_user_ns: ctx.process.user_namespace_cap(),
         cursor: 0,
     };
 
@@ -537,6 +543,316 @@ pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(
 /// pattern (single fd, POLLIN, blocking wait). For each pollfd we
 /// peek at the fd's TTY backing readability; if no fd is currently
 /// ready and the timeout is non-zero, we park on the first TTY fd's
+pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
+
+    let nfds = args[0];
+    let readfds = args[1];
+    let writefds = args[2];
+    let exceptfds = args[3];
+    let timeout_ptr = args[4];
+
+    if nfds > 1024 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if nfds == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    let timeout = match pselect_timeout_policy(ctx, timeout_ptr) {
+        Ok(wait) => wait,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let timeout_deadline_ns = match timeout {
+        PselectTimeout::FiniteWait(duration_ns) => {
+            Some(<P as tx_hal::TimeIf>::read_ns().saturating_add(duration_ns))
+        }
+        PselectTimeout::Infinite | PselectTimeout::Poll => None,
+    };
+    let word_count = fdset_word_count(nfds);
+    let mut yielded_before_wait = false;
+    let (read_ready, write_ready, except_ready, ready_count) = loop {
+        drive_loopback_pending();
+        if let Some(deadline_ns) = timeout_deadline_ns {
+            if <P as tx_hal::TimeIf>::read_ns() >= deadline_ns {
+                break (
+                    alloc::vec![0u64; word_count as usize],
+                    alloc::vec![0u64; word_count as usize],
+                    alloc::vec![0u64; word_count as usize],
+                    0,
+                );
+            }
+        }
+        let mut read_ready = alloc::vec![0u64; word_count as usize];
+        let mut write_ready = alloc::vec![0u64; word_count as usize];
+        let mut except_ready = alloc::vec![0u64; word_count as usize];
+        let mut ready_count: i64 = 0;
+        let mut wait_tokens = alloc::vec::Vec::new();
+        let mut effective_deadline_ns = timeout_deadline_ns;
+
+        for fd in 0..nfds {
+            let want_read = match fdset_contains(ctx, readfds, fd) {
+                Ok(v) => v,
+                Err(errno) => return SyscallResult::Error(errno),
+            };
+            let want_write = match fdset_contains(ctx, writefds, fd) {
+                Ok(v) => v,
+                Err(errno) => return SyscallResult::Error(errno),
+            };
+            let want_except = match fdset_contains(ctx, exceptfds, fd) {
+                Ok(v) => v,
+                Err(errno) => return SyscallResult::Error(errno),
+            };
+            if !want_read && !want_write && !want_except {
+                continue;
+            }
+            let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
+                return SyscallResult::Error(EBADF_VALUE);
+            };
+
+            let mut fd_ready = false;
+            let guard = tx_substrate::epoch::guard();
+            if let Some(efd) = file.eventfd() {
+                if want_read {
+                    if efd.counter() > 0 {
+                        fdset_set(&mut read_ready, fd);
+                        fd_ready = true;
+                    } else {
+                        push_unique_wait_token(
+                            &mut wait_tokens,
+                            tx_subsystems::execution::WaitToken::new(
+                                efd.reader_source_id(),
+                                tx_subsystems::eventfd::EVENTFD_READABLE,
+                            ),
+                        );
+                    }
+                }
+                if want_write {
+                    if efd.counter() < tx_subsystems::eventfd::EVENTFD_MAX {
+                        fdset_set(&mut write_ready, fd);
+                        fd_ready = true;
+                    } else {
+                        push_unique_wait_token(
+                            &mut wait_tokens,
+                            tx_subsystems::execution::WaitToken::new(
+                                efd.writer_source_id(),
+                                tx_subsystems::eventfd::EVENTFD_WRITABLE,
+                            ),
+                        );
+                    }
+                }
+            } else if let Some(tfd) = file.timerfd() {
+                if want_read {
+                    if timerfd_readable_level::<P>(tfd) {
+                        fdset_set(&mut read_ready, fd);
+                        fd_ready = true;
+                    } else {
+                        include_timerfd_deadline(&mut effective_deadline_ns, tfd.deadline_ns());
+                        push_unique_wait_token(
+                            &mut wait_tokens,
+                            tx_subsystems::execution::WaitToken::new(
+                                tfd.source_id(),
+                                tx_subsystems::timerfd::TIMERFD_READABLE,
+                            ),
+                        );
+                    }
+                }
+            } else if let Some(process) = file.pidfd_process() {
+                if want_read {
+                    if pidfd_readable_level(process) {
+                        fdset_set(&mut read_ready, fd);
+                        fd_ready = true;
+                    } else if timeout != PselectTimeout::Poll {
+                        push_unique_wait_token(&mut wait_tokens, process.pidfd_exit_wait_token());
+                    }
+                }
+            } else if let Some(result) = socket_poll_mask_from_file(&file, &guard) {
+                let mask = match result {
+                    Ok(mask) => mask,
+                    Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                };
+                if pselect_socket_read_ready(want_read, mask) {
+                    fdset_set(&mut read_ready, fd);
+                    fd_ready = true;
+                }
+                if pselect_socket_write_ready(want_write, mask) {
+                    fdset_set(&mut write_ready, fd);
+                    fd_ready = true;
+                }
+                if want_except && mask.intersects(tx_subsystems::net::PollMask::ERR) {
+                    fdset_set(&mut except_ready, fd);
+                    fd_ready = true;
+                }
+                let (read_blocked, write_blocked) =
+                    pselect_socket_blocked_interests(want_read, want_write, mask);
+                if read_blocked {
+                    match socket_poll_wait_token_from_file(
+                        &file,
+                        tx_subsystems::net::PollMask::IN,
+                        &guard,
+                    ) {
+                        Some(Ok(Some(token))) => push_unique_wait_token(&mut wait_tokens, token),
+                        Some(Ok(None)) | None => {}
+                        Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
+                    }
+                }
+                if write_blocked {
+                    match socket_poll_wait_token_from_file(
+                        &file,
+                        tx_subsystems::net::PollMask::OUT,
+                        &guard,
+                    ) {
+                        Some(Ok(Some(token))) => push_unique_wait_token(&mut wait_tokens, token),
+                        Some(Ok(None)) | None => {}
+                        Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
+                    }
+                }
+            } else {
+                if want_read {
+                    let readable = match file.rnode().backing() {
+                        RNodeBacking::StructBacked {
+                            payload: StructPayload::Tty(tty),
+                        } => {
+                            use tx_subsystems::tty::execution::TTY_READABLE;
+                            if tty.input_readable.peek() & TTY_READABLE != 0 {
+                                true
+                            } else {
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    tx_subsystems::execution::WaitToken::new(
+                                        tty.wait_source_id(),
+                                        TTY_READABLE,
+                                    ),
+                                );
+                                false
+                            }
+                        }
+                        RNodeBacking::StructBacked {
+                            payload:
+                                StructPayload::Pipe {
+                                    payload,
+                                    side: tx_subsystems::pipe::PipeSide::Reader,
+                                },
+                        } => {
+                            if payload.reader_readable_level() {
+                                true
+                            } else {
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    tx_subsystems::execution::WaitToken::new(
+                                        payload.reader_source_id(),
+                                        tx_subsystems::pipe::PIPE_READABLE,
+                                    ),
+                                );
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    if readable {
+                        fdset_set(&mut read_ready, fd);
+                        fd_ready = true;
+                    }
+                }
+                if want_write {
+                    let writable = match file.rnode().backing() {
+                        RNodeBacking::StructBacked {
+                            payload:
+                                StructPayload::Pipe {
+                                    payload,
+                                    side: tx_subsystems::pipe::PipeSide::Writer,
+                                },
+                        } => {
+                            if payload.writer_writable_level() {
+                                true
+                            } else {
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    tx_subsystems::execution::WaitToken::new(
+                                        payload.writer_source_id(),
+                                        tx_subsystems::pipe::PIPE_WRITABLE,
+                                    ),
+                                );
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    if writable {
+                        fdset_set(&mut write_ready, fd);
+                        fd_ready = true;
+                    }
+                }
+            }
+
+            if fd_ready {
+                ready_count += 1;
+            }
+        }
+
+        if ready_count != 0 || timeout == PselectTimeout::Poll {
+            break (read_ready, write_ready, except_ready, ready_count);
+        }
+        if !yielded_before_wait && !wait_tokens.is_empty() {
+            yielded_before_wait = true;
+            tx_reactor::yield_now().await;
+            continue;
+        }
+        if wait_tokens.is_empty() {
+            if let Some(deadline_ns) = effective_deadline_ns {
+                wait_until_pselect_deadline::<P>(deadline_ns).await;
+            } else if timeout == PselectTimeout::Infinite {
+                tx_reactor::yield_now().await;
+                continue;
+            }
+            break (read_ready, write_ready, except_ready, ready_count);
+        };
+        let futures = wait_tokens
+            .into_iter()
+            .filter_map(wait_source::wait_on_token)
+            .collect::<alloc::vec::Vec<_>>();
+        if !futures.is_empty() {
+            if let Some(deadline_ns) = effective_deadline_ns {
+                match wait_on_any_token_or_pselect_deadline::<P>(futures, deadline_ns).await {
+                    PselectWaitWake::FdReady => {}
+                    PselectWaitWake::TimedOut => {
+                        break (read_ready, write_ready, except_ready, ready_count);
+                    }
+                }
+            } else {
+                wait_on_any_token(futures).await;
+            }
+        } else {
+            if let Some(deadline_ns) = effective_deadline_ns {
+                wait_until_pselect_deadline::<P>(deadline_ns).await;
+            }
+            break (read_ready, write_ready, except_ready, ready_count);
+        }
+    };
+
+    if ready_count != 0 && pselect_ready_return_should_yield() {
+        tx_reactor::yield_now().await;
+    }
+    if ready_count == 0 && timeout == PselectTimeout::Poll && pselect_empty_poll_should_yield() {
+        tx_reactor::yield_now().await;
+    }
+
+    if let Err(errno) = fdset_write(ctx, readfds, &read_ready) {
+        return SyscallResult::Error(errno);
+    }
+    if let Err(errno) = fdset_write(ctx, writefds, &write_ready) {
+        return SyscallResult::Error(errno);
+    }
+    if let Err(errno) = fdset_write(ctx, exceptfds, &except_ready) {
+        return SyscallResult::Error(errno);
+    }
+
+    SyscallResult::Return(ready_count)
+}
+
 fn pselect_ready_return_should_yield() -> bool {
     PSELECT_READY_RETURNS
         .fetch_add(1, Ordering::Relaxed)
@@ -851,6 +1167,17 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
                                         tfd.source_id(),
                                         tx_subsystems::timerfd::TIMERFD_READABLE,
                                     ),
+                                );
+                            }
+                        }
+                    } else if let Some(process) = file.pidfd_process() {
+                        if events & POLLIN != 0 {
+                            if pidfd_readable_level(process) {
+                                revents |= POLLIN;
+                            } else if timeout != PselectTimeout::Poll {
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    process.pidfd_exit_wait_token(),
                                 );
                             }
                         }
@@ -1254,6 +1581,8 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         file: &file,
         bytes: &bytes,
         caller_netns: ctx.process.net_namespace(),
+        writer_cred: ctx.process.cred(),
+        writer_user_ns: ctx.process.user_namespace_cap(),
         cursor: 0,
     };
     match drive(

@@ -93,6 +93,7 @@ const PROCFS_TAG_UID_MAP: u64 = 10;
 const PROCFS_TAG_GID_MAP: u64 = 11;
 const PROCFS_TAG_SETGROUPS: u64 = 12;
 const PROCFS_NS_TAG_NET: u64 = 1;
+const PROCFS_NS_TAG_UTS: u64 = 2;
 const fn pid_dir_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64)
 }
@@ -164,6 +165,11 @@ const fn pid_netns_id(pid: Pid) -> FsObjectId {
         PROCFS_NS_OBJECT_BASE + pid.0 as u64 * PROCFS_NS_OBJECT_STRIDE + PROCFS_NS_TAG_NET,
     )
 }
+const fn pid_utsns_id(pid: Pid) -> FsObjectId {
+    FsObjectId::new(
+        PROCFS_NS_OBJECT_BASE + pid.0 as u64 * PROCFS_NS_OBJECT_STRIDE + PROCFS_NS_TAG_UTS,
+    )
+}
 fn pid_from_object_id(id: FsObjectId, tag: u64) -> Option<Pid> {
     let r = id.as_u64();
     if !(PROCFS_PID_OBJECT_BASE..PROCFS_FD_OBJECT_BASE).contains(&r) {
@@ -221,6 +227,9 @@ fn pid_from_ns_dir(id: FsObjectId) -> Option<Pid> {
 }
 fn pid_from_netns_id(id: FsObjectId) -> Option<Pid> {
     pid_from_ns_object_id(id, PROCFS_NS_TAG_NET)
+}
+fn pid_from_utsns_id(id: FsObjectId) -> Option<Pid> {
+    pid_from_ns_object_id(id, PROCFS_NS_TAG_UTS)
 }
 fn pid_from_fdinfo_dir(id: FsObjectId) -> Option<Pid> {
     pid_from_object_id(id, PROCFS_TAG_FDINFO_DIR)
@@ -354,6 +363,8 @@ fn write_userns_projection(
     fs_object_id: FsObjectId,
     offset: u64,
     bytes: &[u8],
+    writer_cred: Option<tx_subsystems::cred::Cred>,
+    writer_user_ns: Option<&Cap<tx_subsystems::process::nsproxy::UserNamespace>>,
 ) -> Option<StepOutcome<u64, NoProgress>> {
     let target = if let Some(pid) = pid_from_uid_map_id(fs_object_id) {
         Some((pid, UsernsWriteTarget::UidMap))
@@ -369,11 +380,11 @@ fn write_userns_projection(
     let Some(user_ns) = proc.user_namespace_cap() else {
         return Some(StepOutcome::err(Errno::ESRCH));
     };
-    let Some(writer_user_ns) = proc.user_namespace_cap() else {
-        return Some(StepOutcome::err(Errno::ESRCH));
+    let Some(writer_user_ns) = writer_user_ns else {
+        return Some(StepOutcome::err(Errno::EPERM));
     };
-    let Some(writer_cred) = proc.cred() else {
-        return Some(StepOutcome::err(Errno::ESRCH));
+    let Some(writer_cred) = writer_cred else {
+        return Some(StepOutcome::err(Errno::EPERM));
     };
 
     let result = match target.1 {
@@ -652,6 +663,9 @@ impl FsOps for Procfs {
             if name == b"net" && process::process_by_pid(pid).is_some() {
                 return StepOutcome::done(pid_netns_id(pid));
             }
+            if name == b"uts" && process::process_by_pid(pid).is_some() {
+                return StepOutcome::done(pid_utsns_id(pid));
+            }
             return StepOutcome::err(Errno::ENOENT);
         }
         StepOutcome::err(Errno::ENOENT)
@@ -698,9 +712,6 @@ impl FsOps for Procfs {
             | PROCFS_NET_IF_INET6_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
-            PROCFS_SYSVIPC_ID | PROCFS_SYS_ID | PROCFS_SYS_KERNEL_ID => {
-                StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
-            }
             PROCFS_SYS_FS_PIPE_MAX_SIZE_ID
             | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID
             | PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID
@@ -708,10 +719,7 @@ impl FsOps for Procfs {
             | PROCFS_SYS_USER_MAX_USER_NAMESPACES_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, S_IFREG | 0o644))
             }
-            PROCFS_SYSVIPC_MSG_ID
-            | PROCFS_SYSVIPC_SEM_ID
-            | PROCFS_SYSVIPC_SHM_ID
-            | PROCFS_SYS_KERNEL_TAINTED_ID => {
+            PROCFS_SYSVIPC_MSG_ID | PROCFS_SYSVIPC_SEM_ID | PROCFS_SYSVIPC_SHM_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             PROCFS_SYS_NET_IPV4_IP_FORWARD_ID | PROCFS_NET_TX_NF_RULES_ID => {
@@ -772,6 +780,9 @@ impl FsOps for Procfs {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
             id if pid_from_netns_id(id).is_some() => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            }
+            id if pid_from_utsns_id(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             _ => StepOutcome::err(Errno::ENOENT),
@@ -1076,8 +1087,10 @@ impl FsOps for Procfs {
         }
 
         if let Some(pid) = pid_from_ns_dir(id) {
-            let files: &[(&[u8], FsObjectId, InodeKind)] =
-                &[(b"net", pid_netns_id(pid), InodeKind::Regular)];
+            let files: &[(&[u8], FsObjectId, InodeKind)] = &[
+                (b"net", pid_netns_id(pid), InodeKind::Regular),
+                (b"uts", pid_utsns_id(pid), InodeKind::Regular),
+            ];
             if idx < files.len() {
                 let (name, oid, kind) = files[idx];
                 return StepOutcome::done(Some((
@@ -1338,6 +1351,27 @@ impl FsOps for Procfs {
                 Err(_) => StepOutcome::err(Errno::ENOMEM),
             };
         }
+        if let Some(pid) = pid_from_utsns_id(id) {
+            let Some(proc) = process::process_by_pid(pid) else {
+                return StepOutcome::err(Errno::ENOENT);
+            };
+            let Some(nsproxy) = proc.nsproxy_cap() else {
+                return StepOutcome::err(Errno::ESRCH);
+            };
+            return match RNode::new_cap_in_mount(
+                id,
+                meta,
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::UtsNamespace {
+                        namespace: nsproxy.uts_ns.clone(),
+                    },
+                },
+                mount,
+            ) {
+                Ok(cap) => StepOutcome::done(cap),
+                Err(_) => StepOutcome::err(Errno::ENOMEM),
+            };
+        }
 
         match RNode::new_cap_in_mount(
             id,
@@ -1410,7 +1444,7 @@ impl FsOps for Procfs {
         bytes: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
-        self.step_write_projected_with_netns(fs_object_id, _offset, bytes, None, _guard)
+        self.step_write_projected_with_netns(fs_object_id, _offset, bytes, None, None, None, _guard)
     }
 
     fn step_write_projected_with_netns(
@@ -1419,9 +1453,13 @@ impl FsOps for Procfs {
         _offset: u64,
         bytes: &[u8],
         caller_netns: Option<&tx_subsystems::net::NetNamespacePayload>,
+        writer_cred: Option<tx_subsystems::cred::Cred>,
+        writer_user_ns: Option<&Cap<tx_subsystems::process::nsproxy::UserNamespace>>,
         _guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
-        if let Some(outcome) = write_userns_projection(fs_object_id, _offset, bytes) {
+        if let Some(outcome) =
+            write_userns_projection(fs_object_id, _offset, bytes, writer_cred, writer_user_ns)
+        {
             return outcome;
         }
 
@@ -1961,6 +1999,8 @@ mod tests {
                 0,
                 b"1\n",
                 Some(&isolated),
+                None,
+                None,
                 &guard,
             ),
             StepOutcome::Done(2)
@@ -1975,6 +2015,8 @@ mod tests {
                 0,
                 command,
                 Some(&isolated),
+                None,
+                None,
                 &guard,
             ),
             StepOutcome::Done(command.len() as u64)

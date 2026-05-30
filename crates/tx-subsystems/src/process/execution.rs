@@ -3,14 +3,14 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use tx_hal::{PmapIf, UserTrapContext};
 
 use crate::cred::Cred;
 use crate::process::adapter::step_engine::{
-    self, Cap, IdentRef, NoProgress, OneShotStepOp, OperationalCapExt, PayloadCap, ScriptCtx,
-    SpinMutex, StepOp, StepOutcome, SubjectIdentity, Weak, YieldShape, ZoneError,
+    self, Cap, IdentRef, NoProgress, OneShotStepOp, OperationalCapExt, PayloadCap, RawQueue,
+    ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity, Weak, YieldShape, ZoneError,
 };
 use crate::process::structure::{
     ExitStatus, Frame, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session, Sid,
@@ -291,8 +291,6 @@ pub fn bootstrap_init_process(
     // Create the init namespace proxy. Day-1: all namespace caps
     // point at init-namespace stubs; mnt_ns is deferred.
     let nsproxy = crate::process::nsproxy::sign_init_nsproxy()?;
-    let init_net_namespace =
-        crate::net::initial_net_namespace_payload_with_owner(nsproxy.user_ns.clone());
     let payload = sign_process_payload(
         aspace,
         vec![leader.clone()],
@@ -303,7 +301,6 @@ pub fn bootstrap_init_process(
         BTreeSet::new(),
         (1024, 4096),
         (u64::MAX, u64::MAX),
-        init_net_namespace,
         BOOTSTRAP_BRK_BASE,
         BOOTSTRAP_BRK_BASE,
         // Slice 6 of the shell-prompt roadmap. init's file-creation
@@ -391,7 +388,6 @@ pub fn step_fork_with_options<P: PmapIf>(
         parent_fd_cloexec,
         parent_rlimit_nofile,
         parent_rlimit_memlock,
-        parent_net_namespace,
         parent_brk_base,
         parent_current_brk,
         parent_umask,
@@ -408,7 +404,6 @@ pub fn step_fork_with_options<P: PmapIf>(
             payload.fd_cloexec_snapshot(),
             payload.rlimit_nofile(),
             payload.rlimit_memlock(),
-            payload.net_namespace(),
             payload.brk_base(),
             payload.current_brk(),
             payload.umask(),
@@ -471,7 +466,6 @@ pub fn step_fork_with_options<P: PmapIf>(
         parent_fd_cloexec,
         parent_rlimit_nofile,
         parent_rlimit_memlock,
-        parent_net_namespace,
         parent_brk_base,
         parent_current_brk,
         parent_umask,
@@ -729,6 +723,7 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     *payload_guard = None;
     drop(payload_guard);
     *process.exit_status.lock() = Some(status);
+    process.fire_pidfd_exit_source();
 
     // §7.3.3 phase 5: notify the parent. Posted after zombification so
     // the parent observes a complete zombie when it acts on SIGCHLD.
@@ -759,6 +754,7 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
     session_leader_hangup_cascade(process);
     sever_children(process);
     *process.exit_status.lock() = Some(status);
+    process.fire_pidfd_exit_source();
     crate::ipc::sysv_sem::execution::step_sem_undo(process);
     let mut payload_guard = process.payload.lock();
     if let Some(payload) = payload_guard.as_ref() {
@@ -1225,12 +1221,20 @@ fn sign_process_identity(
     parent: Option<Weak<ProcessIdentity>>,
     pgrp: Cap<ProcessGroup>,
 ) -> Result<Cap<ProcessIdentity>, ZoneError> {
+    let pidfd_exit_source_id = crate::allocate_notification_source_id();
+    let mut pidfd_exit_queue = RawQueue::new();
+    pidfd_exit_queue.set_source_id(crate::process::adapter::step_engine::WaitSourceId::new(
+        pidfd_exit_source_id,
+    ));
+    crate::wait_source::register_wait_queue_with_id(pidfd_exit_source_id, pidfd_exit_queue.clone());
     step_engine::sign(ProcessIdentity {
         pid,
         parent: SpinMutex::new(parent),
         children: ProcessChildren::new(),
         pgrp: SpinMutex::new(pgrp),
         exit_status: SpinMutex::new(None),
+        pidfd_exit_source_id,
+        pidfd_exit_queue,
         payload: SpinMutex::new(None),
     })
 }
@@ -1246,7 +1250,6 @@ fn sign_process_payload(
     fd_cloexec: BTreeSet<u32>,
     rlimit_nofile: (u32, u32),
     rlimit_memlock: (u64, u64),
-    net_namespace: PayloadCap<crate::net::NetNamespacePayload>,
     brk_base: u64,
     current_brk: u64,
     umask: u16,
@@ -1277,10 +1280,6 @@ fn sign_process_payload(
     let nsproxy_slot: AtomicSlot<Cap<crate::process::nsproxy::NsProxy>> = AtomicSlot::empty();
     nsproxy_slot.store(Some(nsproxy));
 
-    let net_namespace_slot: AtomicSlot<PayloadCap<crate::net::NetNamespacePayload>> =
-        AtomicSlot::empty();
-    net_namespace_slot.store(Some(net_namespace));
-
     // Allocate a fresh `exit_source` Channel per `ProcessPayload` and
     // register it with the global wait-source resolver so async
     // awaiters can `wait_on_token` against the returned id without
@@ -1308,7 +1307,6 @@ fn sign_process_payload(
         signal_port: RawPort::new(),
         cred: cred_slot,
         nsproxy: nsproxy_slot,
-        net_namespace: net_namespace_slot,
         cwd: SpinMutex::new(cwd),
         fds: SpinMutex::new(fds),
         fd_cloexec: SpinMutex::new(fd_cloexec),
@@ -1340,6 +1338,7 @@ fn sign_process_payload(
         _cmdline: SpinMutex::new(None),
         _exe_file: SpinMutex::new(None),
         _comm: SpinMutex::new([0u8; 16]),
+        dumpable: AtomicU8::new(1),
         thread_count: AtomicU32::new(1), // leader thread
         group_exit: SpinMutex::new(None),
         vfork_done: AtomicBool::new(false),

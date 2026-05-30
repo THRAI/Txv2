@@ -350,6 +350,8 @@ fn run_write(file: &Cap<OpenFile>, bytes: &[u8]) -> Result<usize, i64> {
                 file,
                 bytes: remaining,
                 caller_netns: None,
+                writer_cred: None,
+                writer_user_ns: None,
                 cursor: 0,
             };
             op.step(&mut script_ctx)

@@ -17,7 +17,6 @@ use crate::process::adapter::step_engine::{
     Cap, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, WaitSourceId,
     YieldShape,
 };
-use crate::process::adapter::wait_routing::{self, Mask};
 use crate::process::nsproxy::SysvKey;
 use crate::process::structure::ProcessIdentity;
 use tx_substrate::step::{Errno as StepErrno, ResumeOutcome};
@@ -26,10 +25,7 @@ const SEM_CHANGED_MASK: u64 = 1;
 
 fn fire_sem_changed(payload: &structure::SemArrayPayload) {
     payload.changed_seq.fetch_add(1, Ordering::Release);
-    payload
-        .changed_channel
-        .fire(Mask::from_bits(SEM_CHANGED_MASK));
-    wait_routing::notify_v3_source(&payload.changed_wait_source, SEM_CHANGED_MASK);
+    notification::notify_changed(&payload.changed_channel, &payload.changed_wait_source);
 }
 
 // semctl commands

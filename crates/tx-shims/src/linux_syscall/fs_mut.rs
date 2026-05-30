@@ -321,7 +321,7 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
             Err(e) => return SyscallResult::Error(e),
         }
     };
-    let target_dentry = match resolve_entity_from_anchor(ctx, &rooted_at, &path, &cred) {
+    let _target_dentry = match resolve_entity_from_anchor(ctx, &rooted_at, &path, &cred) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
@@ -1000,7 +1000,7 @@ pub(super) async fn sys_fspick<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
     let target = if path == b"/" {
         mount_api_root_dentry(rooted_at)
     } else {
-        match walk_from_process(rooted_at, &path, &cred, &ctx.process) {
+        match resolve_entity_from_anchor(ctx, &rooted_at, &path, &cred) {
             Ok(dentry) => dentry,
             Err(errno) => return SyscallResult::Error(errno),
         }
@@ -1065,7 +1065,7 @@ pub(super) async fn sys_open_tree<P: PmapIf>(
     let target = if path == b"/" {
         mount_api_root_dentry(rooted_at)
     } else {
-        match walk_from_process(rooted_at, &path, &cred, &ctx.process) {
+        match resolve_entity_from_anchor(ctx, &rooted_at, &path, &cred) {
             Ok(dentry) => dentry,
             Err(errno) => return SyscallResult::Error(errno),
         }

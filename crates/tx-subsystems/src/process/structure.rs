@@ -12,11 +12,11 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use crate::process::adapter::step_engine::{
     self, AtomicSlot, Cap, Dead, Entity, PayloadCap, PayloadPolicy, RawPort, RawQueue, SpinMutex,
-    Weak, Zone, ZoneAllocated,
+    Weak, Zone, ZoneAllocated, ZoneError,
 };
 use crate::process::adapter::wait_routing::{self, Channel, Mask, WaitSource};
 
@@ -43,6 +43,13 @@ use crate::vm::AddressSpace;
 /// (`docs/design/04_process-signals/PROCESS_v1.md` §7.4); plan
 /// `docs/progress/plans/2026-05-06-fork-clone-wait4.md` Open Q #1.
 pub const EXIT_SOURCE_CHILD_ZOMBIFIED: u64 = 0x1;
+
+/// Event bit for the target process's own exit transition.
+///
+/// Unlike [`EXIT_SOURCE_CHILD_ZOMBIFIED`], this is identity-lifetime
+/// readiness: pidfds keep a `ProcessIdentity` observable after payload
+/// teardown, and `poll(pidfd)` becomes readable when this bit is set.
+pub const PROCESS_EXITED: u64 = 0x1;
 
 /// Event bit for `signal_port` (RawPort) fire.
 ///
@@ -170,6 +177,8 @@ pub struct ProcessIdentity {
     /// explicit-int exits from signal-driven termination per
     /// `PROCESS_v1` §6.2.
     pub(crate) exit_status: SpinMutex<Option<ExitStatus>>,
+    pub(crate) pidfd_exit_source_id: u64,
+    pub(crate) pidfd_exit_queue: RawQueue,
     pub(crate) payload: SpinMutex<Option<PayloadCap<ProcessPayload>>>,
 }
 
@@ -282,6 +291,14 @@ impl ProcessIdentity {
     /// (or last-thread `step_thread_exit`) has run; otherwise `None`.
     pub fn exit_status(&self) -> Option<ExitStatus> {
         *self.exit_status.lock()
+    }
+
+    pub fn pidfd_exit_wait_token(&self) -> WaitToken {
+        WaitToken::new(self.pidfd_exit_source_id, PROCESS_EXITED)
+    }
+
+    pub fn fire_pidfd_exit_source(&self) -> usize {
+        self.pidfd_exit_queue.fire(PROCESS_EXITED)
     }
 
     /// Read the terminating signal, if any. `Some(sig)` if the recorded
@@ -470,6 +487,31 @@ impl ProcessIdentity {
             .unwrap_or([b'?', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
     }
 
+    /// Replace the process short name. Returns `false` for zombies.
+    pub fn set_comm(&self, comm: [u8; 16]) -> bool {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.set_comm(comm);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Snapshot the Linux dumpability prctl state. Returns `None` for zombies.
+    pub fn dumpable(&self) -> Option<u8> {
+        self.payload.lock().as_ref().map(|p| p.dumpable())
+    }
+
+    /// Replace the Linux dumpability prctl state. Returns `false` for zombies.
+    pub fn set_dumpable(&self, value: u8) -> bool {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.set_dumpable(value);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Process command-line (for `/proc/<pid>/cmdline`). Returns
     /// `None` for zombies (no payload) or when no cmdline was set.
     pub fn cmdline(&self) -> Option<alloc::vec::Vec<u8>> {
@@ -495,20 +537,17 @@ impl ProcessIdentity {
         payload.frame.vm.swap(Some(new))
     }
 
-    /// Snapshot the process's current network namespace. Day-1 all
-    /// processes are seeded with the initial namespace; fork inherits
-    /// the parent's namespace cap. Future `clone/unshare/setns` work
-    /// mutates this slot under the namespace/capability syscalls.
+    /// Snapshot the process's current network namespace from its `NsProxy`.
     pub fn net_namespace(&self) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
         self.payload.lock().as_ref().map(|p| p.net_namespace())
     }
 
-    /// Replace the process's current network namespace, returning the
-    /// previous namespace cap. Returns `None` for zombies.
+    /// Compatibility wrapper for callers that still think in terms of a
+    /// direct process netns slot. The real source of truth is `NsProxy`.
     pub fn replace_net_namespace(
         &self,
         new: PayloadCap<crate::net::NetNamespacePayload>,
-    ) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
+    ) -> Option<Result<Cap<crate::process::nsproxy::NsProxy>, ZoneError>> {
         self.payload
             .lock()
             .as_ref()
@@ -1278,14 +1317,6 @@ pub struct ProcessPayload {
     /// `mnt_ns` is deferred (`MountNamespace` bootstrap not yet wired).
     pub(crate) nsproxy: AtomicSlot<Cap<crate::process::nsproxy::NsProxy>>,
 
-    /// Current network namespace for socket/device lookup.
-    ///
-    /// N71M3 staging: `bootstrap_init_process` seeds this with
-    /// `initial_net_namespace_payload()`, `step_fork` clones the
-    /// parent's cap, and `unshare(CLONE_NEWNET)` / `setns(...,
-    /// CLONE_NEWNET)` publish a replacement cap through this slot.
-    /// Socket creation in `tx-shims` resolves through this field.
-    pub(crate) net_namespace: AtomicSlot<PayloadCap<crate::net::NetNamespacePayload>>,
     /// Current working directory as a `DEntry` `Cap`.
     ///
     /// Spec note: `PROCESS_v1` §3 declares this as `Cap<RNode>` on a
@@ -1494,6 +1525,11 @@ pub struct ProcessPayload {
     /// from the executable basename at `execve`; can be changed via
     /// `prctl(PR_SET_NAME)`. Read by procfs `/proc/<pid>/stat`.
     pub _comm: SpinMutex<[u8; 16]>,
+    /// Linux dumpability mode for `prctl(PR_GET/SET_DUMPABLE)`.
+    ///
+    /// v1 stores only the user-visible prctl state. Core dumps and
+    /// ptrace permission integration are deferred to those subsystems.
+    pub(crate) dumpable: AtomicU8,
     pub(crate) thread_count: AtomicU32,
     pub(crate) group_exit: SpinMutex<Option<GroupExitState>>,
     pub vfork_done: AtomicBool,
@@ -1618,18 +1654,16 @@ impl ProcessPayload {
     }
 
     pub fn net_namespace(&self) -> PayloadCap<crate::net::NetNamespacePayload> {
-        self.net_namespace
-            .load()
-            .expect("ProcessPayload.net_namespace slot is always populated")
+        self.nsproxy_cap().net_ns.clone()
     }
 
     pub fn replace_net_namespace(
         &self,
         new: PayloadCap<crate::net::NetNamespacePayload>,
-    ) -> PayloadCap<crate::net::NetNamespacePayload> {
-        self.net_namespace
-            .swap(Some(new))
-            .expect("ProcessPayload.net_namespace slot is always populated")
+    ) -> Result<Cap<crate::process::nsproxy::NsProxy>, ZoneError> {
+        let current = self.nsproxy_cap();
+        let replacement = crate::process::nsproxy::clone_nsproxy_with_net_namespace(&current, new)?;
+        Ok(self.replace_nsproxy(replacement))
     }
 
     /// Atomically install `new` as the current cred-cap and return
@@ -1955,6 +1989,18 @@ impl ProcessPayload {
     /// Process short name comm (for `/proc/<pid>/stat`).
     pub fn comm(&self) -> [u8; 16] {
         *self._comm.lock()
+    }
+
+    pub fn set_comm(&self, comm: [u8; 16]) {
+        *self._comm.lock() = comm;
+    }
+
+    pub fn dumpable(&self) -> u8 {
+        self.dumpable.load(Ordering::Acquire)
+    }
+
+    pub fn set_dumpable(&self, value: u8) {
+        self.dumpable.store(value, Ordering::Release);
     }
 
     /// Allocate the lowest unused fd ≥ `min` without installing

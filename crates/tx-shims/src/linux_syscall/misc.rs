@@ -111,30 +111,12 @@ pub(super) fn sys_getrandom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     SyscallResult::Return(buf_len as i64)
 }
 
-/// `sethostname(name, len)` — Linux generic ABI `__NR_sethostname = 161`.
-///
-/// txKernel has a single global UTS nodename for now. This is enough for
-/// libc/LTP `gethostname()` probes, which update the hostname and then
-/// read it back through `uname().nodename`.
 pub(super) fn sys_sethostname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    let name_uaddr = args[0];
-    let len = args[1] as usize;
+    set_uts_name_from_user(ctx, args[0], args[1] as usize, UtsNameKind::Host)
+}
 
-    if len > UTSNAME_FIELD - 1 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    if len != 0 && name_uaddr == 0 {
-        return SyscallResult::Error(EFAULT_VALUE);
-    }
-
-    let mut next = [0u8; UTSNAME_FIELD];
-    if len != 0 {
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut next[..len], name_uaddr) {
-            return SyscallResult::error_from(errno);
-        }
-    }
-    *UTS_NODENAME.lock() = next;
-    SyscallResult::Return(0)
+pub(super) fn sys_setdomainname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    set_uts_name_from_user(ctx, args[0], args[1] as usize, UtsNameKind::Domain)
 }
 
 /// `uname(buf)` — Linux generic ABI `__NR_uname = 160`.
@@ -157,11 +139,393 @@ pub(super) fn sys_uname<'a, P: AuxvIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     if buf_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
-    let utsname = build_utsname_for_machine(P::arch_auxv_facts().platform);
+    let Some(nsproxy) = ctx.process.nsproxy_cap() else {
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+    let hostname = nsproxy.uts_ns.hostname();
+    let domainname = nsproxy.uts_ns.domainname();
+    let utsname = build_utsname_for_machine(P::arch_auxv_facts().platform, &hostname, &domainname);
     if let Err(errno) = bootstrap_write_user::<UtsnameLayout>(&ctx.aspace, buf_uaddr, utsname) {
         return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SysinfoLayout {
+    pub(super) uptime: i64,
+    pub(super) loads: [u64; 3],
+    pub(super) totalram: u64,
+    pub(super) freeram: u64,
+    pub(super) sharedram: u64,
+    pub(super) bufferram: u64,
+    pub(super) totalswap: u64,
+    pub(super) freeswap: u64,
+    pub(super) procs: u16,
+    pub(super) pad: u16,
+    pub(super) totalhigh: u64,
+    pub(super) freehigh: u64,
+    pub(super) mem_unit: u32,
+    pub(super) _f: [u8; 0],
+}
+
+const _: () = assert!(core::mem::size_of::<SysinfoLayout>() == 112);
+const SYSINFO_TOTAL_RAM_BYTES: u64 = 256 * 1024 * 1024;
+const SYSINFO_FREE_RAM_BYTES: u64 = 128 * 1024 * 1024;
+
+pub(super) fn sys_sysinfo<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let info_uaddr = args[0];
+    if info_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    let ns = <P as TimeIf>::read_ns();
+    let uptime = ns.saturating_add(999_999_999) / 1_000_000_000;
+    let procs = core::cmp::max(ctx.process.live_thread_count(), 1).min(u16::MAX as usize) as u16;
+    let info = SysinfoLayout {
+        uptime: uptime as i64,
+        loads: [0; 3],
+        totalram: SYSINFO_TOTAL_RAM_BYTES,
+        freeram: SYSINFO_FREE_RAM_BYTES,
+        sharedram: 0,
+        bufferram: 0,
+        totalswap: 0,
+        freeswap: 0,
+        procs,
+        pad: 0,
+        totalhigh: 0,
+        freehigh: 0,
+        mem_unit: 1,
+        _f: [],
+    };
+    if let Err(errno) = bootstrap_write_user::<SysinfoLayout>(&ctx.aspace, info_uaddr, info) {
+        return SyscallResult::error_from(errno);
+    }
+    SyscallResult::Return(0)
+}
+
+pub(super) fn sys_prctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    match args[0] {
+        PR_GET_DUMPABLE => match ctx.process.dumpable() {
+            Some(value) => SyscallResult::Return(value as i64),
+            None => SyscallResult::Error(ESRCH_VALUE),
+        },
+        PR_SET_DUMPABLE => {
+            let value = args[1];
+            if value > 1 {
+                return SyscallResult::Error(EINVAL_VALUE);
+            }
+            if ctx.process.set_dumpable(value as u8) {
+                SyscallResult::Return(0)
+            } else {
+                SyscallResult::Error(ESRCH_VALUE)
+            }
+        }
+        PR_GET_TIMING => SyscallResult::Return(PR_TIMING_STATISTICAL as i64),
+        PR_SET_TIMING => {
+            if args[1] == PR_TIMING_STATISTICAL {
+                SyscallResult::Return(0)
+            } else {
+                SyscallResult::Error(EINVAL_VALUE)
+            }
+        }
+        PR_SET_NAME => set_prctl_name(ctx, args[1]),
+        PR_GET_NAME => {
+            let comm = ctx.process.comm();
+            match bootstrap_copy_to_user(&ctx.aspace, args[1], &comm) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::error_from(errno),
+            }
+        }
+        PR_SET_NO_NEW_PRIVS | PR_GET_NO_NEW_PRIVS => SyscallResult::Error(ENOSYS_VALUE),
+        _ => SyscallResult::Error(EINVAL_VALUE),
+    }
+}
+
+fn set_prctl_name<'a>(ctx: &SyscallCtx<'a>, name_uaddr: u64) -> SyscallResult {
+    let mut comm = [0u8; 16];
+    for (idx, slot) in comm.iter_mut().take(15).enumerate() {
+        let Some(addr) = name_uaddr.checked_add(idx as u64) else {
+            return SyscallResult::Error(EFAULT_VALUE);
+        };
+        match bootstrap_read_user::<u8>(&ctx.aspace, addr) {
+            Ok(0) => break,
+            Ok(byte) => *slot = byte,
+            Err(errno) => return SyscallResult::error_from(errno),
+        }
+    }
+    if ctx.process.set_comm(comm) {
+        SyscallResult::Return(0)
+    } else {
+        SyscallResult::Error(ESRCH_VALUE)
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RiscvHwprobePair {
+    key: i64,
+    value: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<RiscvHwprobePair>() == 16);
+const RISCV_HWPROBE_MAX_KEY: i64 = RISCV_HWPROBE_KEY_VENDOR_EXT_SIFIVE_0;
+
+pub(super) fn sys_riscv_hwprobe<P: TimeIf + SmpIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
+    let pairs_uaddr = args[0];
+    let pair_count = args[1] as usize;
+    let cpusetsize = args[2] as usize;
+    let cpus_uaddr = args[3];
+    let flags = args[4];
+
+    match flags {
+        0 => riscv_hwprobe_get_values::<P>(ctx, pairs_uaddr, pair_count, cpusetsize, cpus_uaddr),
+        RISCV_HWPROBE_WHICH_CPUS => {
+            riscv_hwprobe_which_cpus::<P>(ctx, pairs_uaddr, pair_count, cpusetsize, cpus_uaddr)
+        }
+        _ => SyscallResult::Error(EINVAL_VALUE),
+    }
+}
+
+fn riscv_hwprobe_get_values<P: TimeIf + SmpIf>(
+    ctx: &SyscallCtx<'_>,
+    pairs_uaddr: u64,
+    pair_count: usize,
+    cpusetsize: usize,
+    cpus_uaddr: u64,
+) -> SyscallResult {
+    let online = P::online_cpus().bits();
+    let mask = match read_hwprobe_cpuset(ctx, cpusetsize, cpus_uaddr, online, false) {
+        Ok(mask) => mask,
+        Err(result) => return result,
+    };
+    if mask == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    for idx in 0..pair_count {
+        let pair_addr = match hwprobe_pair_addr(pairs_uaddr, idx) {
+            Some(addr) => addr,
+            None => return SyscallResult::Error(EFAULT_VALUE),
+        };
+        let mut pair = match bootstrap_read_user::<RiscvHwprobePair>(&ctx.aspace, pair_addr) {
+            Ok(pair) => pair,
+            Err(errno) => return SyscallResult::error_from(errno),
+        };
+        match riscv_hwprobe_value::<P>(pair.key) {
+            Some(value) => pair.value = value,
+            None => {
+                pair.key = -1;
+                pair.value = 0;
+            }
+        }
+        if let Err(errno) = bootstrap_write_user::<RiscvHwprobePair>(&ctx.aspace, pair_addr, pair) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    SyscallResult::Return(0)
+}
+
+fn riscv_hwprobe_which_cpus<P: TimeIf + SmpIf>(
+    ctx: &SyscallCtx<'_>,
+    pairs_uaddr: u64,
+    pair_count: usize,
+    cpusetsize: usize,
+    cpus_uaddr: u64,
+) -> SyscallResult {
+    if cpusetsize == 0 || cpus_uaddr == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let online = P::online_cpus().bits();
+    let mut candidate_mask = match read_hwprobe_cpuset(ctx, cpusetsize, cpus_uaddr, online, true) {
+        Ok(mask) => mask,
+        Err(result) => return result,
+    };
+
+    for idx in 0..pair_count {
+        let pair_addr = match hwprobe_pair_addr(pairs_uaddr, idx) {
+            Some(addr) => addr,
+            None => return SyscallResult::Error(EFAULT_VALUE),
+        };
+        let mut pair = match bootstrap_read_user::<RiscvHwprobePair>(&ctx.aspace, pair_addr) {
+            Ok(pair) => pair,
+            Err(errno) => return SyscallResult::error_from(errno),
+        };
+        if !riscv_hwprobe_key_is_valid(pair.key) {
+            pair.key = -1;
+            pair.value = 0;
+            if let Err(errno) =
+                bootstrap_write_user::<RiscvHwprobePair>(&ctx.aspace, pair_addr, pair)
+            {
+                return SyscallResult::error_from(errno);
+            }
+            candidate_mask = 0;
+            break;
+        }
+
+        let Some(value) = riscv_hwprobe_value::<P>(pair.key) else {
+            candidate_mask = 0;
+            break;
+        };
+        if !riscv_hwprobe_pair_matches(pair.key, value, pair.value) {
+            candidate_mask = 0;
+        }
+    }
+
+    match write_hwprobe_cpuset(ctx, cpusetsize, cpus_uaddr, candidate_mask & online) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::error_from(errno),
+    }
+}
+
+fn hwprobe_pair_addr(base: u64, idx: usize) -> Option<u64> {
+    base.checked_add((idx * core::mem::size_of::<RiscvHwprobePair>()) as u64)
+}
+
+fn read_hwprobe_cpuset(
+    ctx: &SyscallCtx<'_>,
+    cpusetsize: usize,
+    cpus_uaddr: u64,
+    online: u64,
+    empty_means_online: bool,
+) -> Result<u64, SyscallResult> {
+    if cpusetsize == 0 && cpus_uaddr == 0 {
+        return Ok(online);
+    }
+    if cpusetsize != 0 && cpus_uaddr == 0 {
+        return Err(SyscallResult::Error(EFAULT_VALUE));
+    }
+
+    let mut bytes = [0u8; 8];
+    let n = core::cmp::min(cpusetsize, bytes.len());
+    if n != 0 {
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes[..n], cpus_uaddr) {
+            return Err(SyscallResult::error_from(errno));
+        }
+    }
+    let requested = u64::from_ne_bytes(bytes);
+    if requested == 0 && empty_means_online {
+        Ok(online)
+    } else {
+        Ok(requested & online)
+    }
+}
+
+fn write_hwprobe_cpuset(
+    ctx: &SyscallCtx<'_>,
+    cpusetsize: usize,
+    cpus_uaddr: u64,
+    mask: u64,
+) -> Result<(), tx_subsystems::execution::Errno> {
+    let bytes = mask.to_ne_bytes();
+    let n = core::cmp::min(cpusetsize, bytes.len());
+    bootstrap_copy_to_user(&ctx.aspace, cpus_uaddr, &bytes[..n])
+}
+
+fn riscv_hwprobe_key_is_valid(key: i64) -> bool {
+    (0..=RISCV_HWPROBE_MAX_KEY).contains(&key)
+}
+
+fn riscv_hwprobe_key_is_bitmask(key: i64) -> bool {
+    matches!(
+        key,
+        RISCV_HWPROBE_KEY_BASE_BEHAVIOR
+            | RISCV_HWPROBE_KEY_IMA_EXT_0
+            | RISCV_HWPROBE_KEY_CPUPERF_0
+            | RISCV_HWPROBE_KEY_VENDOR_EXT_THEAD_0
+            | RISCV_HWPROBE_KEY_VENDOR_EXT_SIFIVE_0
+    )
+}
+
+fn riscv_hwprobe_pair_matches(key: i64, actual: u64, requested: u64) -> bool {
+    if riscv_hwprobe_key_is_bitmask(key) {
+        (actual & requested) == requested
+    } else {
+        actual == requested
+    }
+}
+
+fn riscv_hwprobe_value<P: TimeIf>(key: i64) -> Option<u64> {
+    match key {
+        RISCV_HWPROBE_KEY_MVENDORID | RISCV_HWPROBE_KEY_MARCHID | RISCV_HWPROBE_KEY_MIMPID => {
+            Some(0)
+        }
+        RISCV_HWPROBE_KEY_BASE_BEHAVIOR => Some(RISCV_HWPROBE_BASE_BEHAVIOR_IMA),
+        RISCV_HWPROBE_KEY_IMA_EXT_0 => Some(0),
+        RISCV_HWPROBE_KEY_CPUPERF_0 => Some(RISCV_HWPROBE_MISALIGNED_SLOW),
+        RISCV_HWPROBE_KEY_ZICBOZ_BLOCK_SIZE | RISCV_HWPROBE_KEY_ZICBOM_BLOCK_SIZE => Some(0),
+        RISCV_HWPROBE_KEY_HIGHEST_VIRT_ADDRESS => {
+            Some(tx_subsystems::vm::FULL_USER_V1_TOP as u64 - 1)
+        }
+        RISCV_HWPROBE_KEY_TIME_CSR_FREQ => Some(P::frequency_hz()),
+        RISCV_HWPROBE_KEY_MISALIGNED_SCALAR_PERF => Some(RISCV_HWPROBE_MISALIGNED_SCALAR_SLOW),
+        RISCV_HWPROBE_KEY_MISALIGNED_VECTOR_PERF => Some(RISCV_HWPROBE_MISALIGNED_VECTOR_UNKNOWN),
+        RISCV_HWPROBE_KEY_VENDOR_EXT_THEAD_0 | RISCV_HWPROBE_KEY_VENDOR_EXT_SIFIVE_0 => Some(0),
+        _ => None,
+    }
+}
+
+pub(super) fn sys_riscv_flush_icache<P: CacheIf>(args: [u64; 6]) -> SyscallResult {
+    let flags = args[2];
+    if flags & !SYS_RISCV_FLUSH_ICACHE_ALL != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    if flags & SYS_RISCV_FLUSH_ICACHE_LOCAL != 0 {
+        P::fence_i_local();
+    } else {
+        P::fence_i_all();
+    }
+    SyscallResult::Return(0)
+}
+
+#[derive(Clone, Copy)]
+enum UtsNameKind {
+    Host,
+    Domain,
+}
+
+fn set_uts_name_from_user<'a>(
+    ctx: &SyscallCtx<'a>,
+    name_uaddr: u64,
+    len: usize,
+    kind: UtsNameKind,
+) -> SyscallResult {
+    if len > tx_subsystems::process::nsproxy::UTS_NAME_MAX {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let Some(nsproxy) = ctx.process.nsproxy_cap() else {
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+    let owner_user_ns = nsproxy.uts_ns.owner_user_namespace();
+    if !tx_subsystems::process::nsproxy::has_capability_in_subject_user_namespace(
+        ctx.cred(),
+        &nsproxy.user_ns,
+        &owner_user_ns,
+        Capability::SYS_ADMIN,
+    ) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+
+    let mut name = alloc::vec![0u8; len];
+    if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut name, name_uaddr) {
+        return SyscallResult::error_from(errno);
+    }
+
+    let result = match kind {
+        UtsNameKind::Host => nsproxy.uts_ns.set_hostname(&name),
+        UtsNameKind::Domain => nsproxy.uts_ns.set_domainname(&name),
+    };
+    match result {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::error_from(errno),
+    }
 }
 
 /// `prlimit64(pid, resource, new_rlim, old_rlim)` — Linux RV64
@@ -273,10 +637,13 @@ pub(super) struct UtsnameLayout {
     pub(super) domainname: [u8; UTSNAME_FIELD],
 }
 
-pub(super) fn build_utsname_for_machine(machine: &str) -> UtsnameLayout {
-    fn pad(s: &str) -> [u8; UTSNAME_FIELD] {
+pub(super) fn build_utsname_for_machine(
+    machine: &str,
+    hostname: &[u8],
+    domainname: &[u8],
+) -> UtsnameLayout {
+    fn pad_bytes(bytes: &[u8]) -> [u8; UTSNAME_FIELD] {
         let mut out = [0u8; UTSNAME_FIELD];
-        let bytes = s.as_bytes();
         // Reserve the trailing NUL byte. `min(len, 64)` clamps the
         // copy so `out[64] = 0` always.
         let n = core::cmp::min(bytes.len(), UTSNAME_FIELD - 1);
@@ -284,16 +651,18 @@ pub(super) fn build_utsname_for_machine(machine: &str) -> UtsnameLayout {
         head.copy_from_slice(&bytes[..n]);
         out
     }
-    let nodename = *UTS_NODENAME.lock();
+    fn pad(s: &str) -> [u8; UTSNAME_FIELD] {
+        pad_bytes(s.as_bytes())
+    }
     UtsnameLayout {
         sysname: pad("Linux"),
-        nodename,
+        nodename: pad_bytes(hostname),
         // Linux 6.1.0 is the LTS line musl 1.2.x runtime probes treat
         // as fully featured.
         release: pad("6.1.0-txkernel"),
         version: pad("#1 SMP txkernel"),
         machine: pad(machine),
-        domainname: pad("(none)"),
+        domainname: pad_bytes(domainname),
     }
 }
 
@@ -307,7 +676,7 @@ struct RlimitLayout {
 pub(super) mod layout_descriptors {
     use core::mem::{align_of, offset_of, size_of};
 
-    pub(super) use super::{RlimitLayout, UtsnameLayout};
+    pub(super) use super::{RlimitLayout, SysinfoLayout, UtsnameLayout};
     use crate::linux_syscall::{KernelToUserLayout, KernelUserField, KernelUserLayout};
 
     impl KernelToUserLayout for UtsnameLayout {

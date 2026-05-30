@@ -1047,8 +1047,7 @@ fn copy_process_vm_iovs(
 }
 
 fn resolve_pidfd_process(ctx: &SyscallCtx<'_>, pidfd: u32) -> Option<Cap<ProcessIdentity>> {
-    let pid = resolve_fd(&ctx.process, pidfd)?.pidfd_pid()?;
-    process_by_pid(Pid(pid))
+    resolve_fd(&ctx.process, pidfd)?.pidfd_process().cloned()
 }
 
 fn validate_single_node_policy(

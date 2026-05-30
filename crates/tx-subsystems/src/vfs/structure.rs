@@ -28,6 +28,7 @@ use crate::ipc::posix_mq::structure::PosixMqInstance;
 use crate::mount::{MountApiFile, MountIdentity, MountPayload};
 use crate::net::{NetNamespacePayload, SocketIdentity};
 use crate::page_backed::PageContainer;
+use crate::process::nsproxy::UtsNamespace;
 use crate::process::{ProcessGroup, ProcessIdentity};
 use crate::signalfd::SignalFd;
 use crate::timerfd::TimerFd;
@@ -564,6 +565,10 @@ pub enum StructPayload {
     /// Internal network-namespace fd used by the staged rtnetlink path.
     NetNamespace {
         payload: PayloadCap<NetNamespacePayload>,
+    },
+    /// Internal UTS namespace fd for `/proc/<pid>/ns/uts` and `setns`.
+    UtsNamespace {
+        namespace: Cap<UtsNamespace>,
     },
 }
 
@@ -1169,9 +1174,6 @@ pub struct OpenFile {
     /// non-VFS shapes (ufd, aio, etc.). Used by `fchdir`.
     opendir_dentry: Option<Cap<DEntry>>,
 
-    /// Advisory file lock state: 0 = unlocked, non-zero = exclusive-locked.
-    /// Per open-file-description, not per-inode (POSIX flock semantics).
-    flock_state: core::sync::atomic::AtomicU64,
     /// Whether `fcntl(F_ADD_SEALS/F_GET_SEALS)` is meaningful for this
     /// open file description. Today this is true only for memfd fds.
     sealable: bool,
@@ -1189,7 +1191,6 @@ impl OpenFile {
             nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
             sealable: false,
             seal_state: AtomicU32::new(0),
         }
@@ -1238,7 +1239,6 @@ impl OpenFile {
             nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
             sealable: false,
             seal_state: AtomicU32::new(0),
         }
@@ -1270,7 +1270,6 @@ impl OpenFile {
             nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
             sealable: false,
             seal_state: AtomicU32::new(0),
         }
@@ -1298,7 +1297,6 @@ impl OpenFile {
             nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
             sealable: false,
             seal_state: AtomicU32::new(0),
         }
@@ -1323,7 +1321,6 @@ impl OpenFile {
             nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
             sealable: false,
             seal_state: AtomicU32::new(0),
         }
@@ -1345,7 +1342,6 @@ impl OpenFile {
             nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
             sealable: false,
             seal_state: AtomicU32::new(0),
         }
@@ -1370,7 +1366,6 @@ impl OpenFile {
             nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
             sealable: false,
             seal_state: AtomicU32::new(0),
         }
@@ -1393,7 +1388,6 @@ impl OpenFile {
             nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
             sealable: false,
             seal_state: AtomicU32::new(0),
         }
@@ -1416,7 +1410,6 @@ impl OpenFile {
             nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
             sealable: false,
             seal_state: AtomicU32::new(0),
         }
@@ -1439,7 +1432,6 @@ impl OpenFile {
             nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
             sealable: false,
             seal_state: AtomicU32::new(0),
         }
@@ -1462,7 +1454,6 @@ impl OpenFile {
             nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
             sealable: false,
             seal_state: AtomicU32::new(0),
         }
@@ -1490,7 +1481,6 @@ impl OpenFile {
             nonblocking_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
             sealable: false,
             seal_state: AtomicU32::new(0),
         }

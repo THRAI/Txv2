@@ -46,7 +46,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use reactor_entry::userspace::SyscallRequest;
-use tx_hal::{AuxvIf, EntropyIf, IpiKind, PmapIf, SmpIf, TimeIf};
+use tx_hal::{AuxvIf, CacheIf, EntropyIf, IpiKind, PmapIf, SmpIf, TimeIf};
 use tx_observe::encode::{
     arg_value_tag, encode_arg_value, encode_syscall_enter, encode_syscall_exit, syscall_enter_tag,
     syscall_exit_tag,
@@ -395,7 +395,7 @@ pub(super) const SIGACTION_BYTES: usize = 24;
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
-pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
+pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + CacheIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -422,7 +422,7 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
     result
 }
 
-async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
+async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + CacheIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -459,7 +459,12 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_UMASK => return sys_umask(req.args, ctx),
         nr if nr == NR_UNAME => return sys_uname::<P>(req.args, ctx),
         nr if nr == NR_SETHOSTNAME => return sys_sethostname(req.args, ctx),
+        nr if nr == NR_SETDOMAINNAME => return sys_setdomainname(req.args, ctx),
         nr if nr == NR_GETRANDOM => return sys_getrandom(req.args, ctx),
+        nr if nr == NR_SYSINFO => return sys_sysinfo::<P>(req.args, ctx),
+        nr if nr == NR_PRCTL => return sys_prctl(req.args, ctx),
+        nr if nr == NR_RISCV_HWPROBE => return sys_riscv_hwprobe::<P>(req.args, ctx),
+        nr if nr == NR_RISCV_FLUSH_ICACHE => return sys_riscv_flush_icache::<P>(req.args),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
         nr if nr == NR_PERSONALITY => return sys_personality(req.args, ctx),
         nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
@@ -468,6 +473,12 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_SCHED_GETAFFINITY => return sys_sched_getaffinity(req.args, ctx),
         nr if nr == NR_SCHED_SETAFFINITY => return sys_sched_setaffinity(req.args, ctx),
         nr if nr == NR_SCHED_SETSCHEDULER => return sys_sched_setscheduler(req.args, ctx),
+        nr if nr == NR_SCHED_SETPARAM => return sys_sched_setparam(req.args, ctx),
+        nr if nr == NR_SCHED_GETSCHEDULER => return sys_sched_getscheduler(req.args, ctx),
+        nr if nr == NR_SCHED_GETPARAM => return sys_sched_getparam(req.args, ctx),
+        nr if nr == NR_SCHED_GET_PRIORITY_MAX => return sys_sched_get_priority_max(req.args),
+        nr if nr == NR_SCHED_GET_PRIORITY_MIN => return sys_sched_get_priority_min(req.args),
+        nr if nr == NR_SCHED_RR_GET_INTERVAL => return sys_sched_rr_get_interval(req.args, ctx),
         nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
         nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args, ctx),
         nr if nr == NR_GET_ROBUST_LIST => return sys_get_robust_list(req.args, ctx),
@@ -600,6 +611,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_UNSHARE => SyscallResult::Error(ENOSYS_VALUE),
         nr if nr == NR_SETNS => SyscallResult::Error(ENOSYS_VALUE),
         nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
+        nr if nr == NR_WAITID => sys_waitid(req.args, ctx).await,
         nr if nr == NR_GETRUSAGE => sys_getrusage(req.args, ctx),
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
         nr if nr == NR_SETSID => sys_setsid(ctx),

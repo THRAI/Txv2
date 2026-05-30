@@ -1354,7 +1354,7 @@ pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
         return SyscallResult::Return(0);
     }
     let deadline_ns = <P as TimeIf>::read_ns().saturating_add(req_ns);
-    drive_nanosleep_until::<P>(ctx, req_ns, deadline_ns, args[1]).await
+    drive_nanosleep_until::<P>(ctx, req_ns, deadline_ns, rem_uaddr).await
 }
 
 /// `clock_nanosleep(clk_id, flags, req, rem)`. Linux RV64 generic ABI
@@ -1371,7 +1371,6 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
     let clk_id = args[0] as u32;
     let flags = args[1] as u32;
     let req_uaddr = args[2];
-    let rem_uaddr = args[3];
 
     match clk_id {
         CLOCK_REALTIME

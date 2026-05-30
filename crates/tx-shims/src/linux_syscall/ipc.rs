@@ -815,17 +815,22 @@ pub(super) fn sys_semctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
 }
 
 pub(super) fn sys_msgsnd(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let (_ns, cred) = match nsproxy_and_cred(ctx) {
+    let (ns, cred) = match nsproxy_and_cred(ctx) {
         Ok(v) => v,
         Err(e) => return SyscallResult::Error(errno_to_i32(e)),
     };
     let msqid = args[0] as u32;
     let msgp = args[1];
-    let msgsz = args[2] as usize;
+    let msgsz_raw = args[2];
     let msgflg = args[3] as i32;
     if msgp == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
+    let msgmax = ns.ipc_ns.limits.lock().msgmax as u64;
+    if msgsz_raw > msgmax {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let msgsz = msgsz_raw as usize;
     let mtype: i64 = match bootstrap_read_user(&ctx.aspace, msgp) {
         Ok(v) => v,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
