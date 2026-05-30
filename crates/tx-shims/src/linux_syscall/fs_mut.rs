@@ -196,6 +196,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
@@ -274,6 +275,7 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
@@ -386,6 +388,7 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if target.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
@@ -393,6 +396,7 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let linkpath = match read_user_cstr(&ctx.aspace, linkpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if linkpath.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
@@ -467,6 +471,7 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     let oldpath = match read_user_cstr(&ctx.aspace, oldpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if oldpath.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
@@ -474,6 +479,7 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     let newpath = match read_user_cstr(&ctx.aspace, newpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if newpath.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
@@ -566,6 +572,7 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
@@ -739,6 +746,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() {
         if dirfd == AT_FDCWD {
@@ -861,6 +869,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
     let cwd = match ctx.process.cwd() {
@@ -906,6 +915,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+            Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
         };
         let source_dentry = match walk_from_process(cwd, &source, &cred, &ctx.process) {
             Ok(d) => d,
@@ -922,6 +932,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     let fstype = match read_user_cstr(&ctx.aspace, fstype_uaddr, 64) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     let fstype_str = match core::str::from_utf8(&fstype) {
         Ok(s) => s,
@@ -941,6 +952,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+            Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
         };
         Some(source)
     } else {
@@ -1146,6 +1158,7 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
     let cwd = match ctx.process.cwd() {
@@ -1197,6 +1210,7 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
     let S_IFREG: u32 = 0o100000;
@@ -1318,6 +1332,7 @@ pub(super) fn sys_utimensat<'a, P: tx_hal::TimeIf>(
         let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
             Ok(path) => path,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+            Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
         };
         if path.is_empty() {
             if flags & AT_EMPTY_PATH == 0 {
@@ -1424,6 +1439,7 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let oldpath = match read_user_cstr(&ctx.aspace, oldpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if oldpath.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
@@ -1431,6 +1447,7 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let newpath = match read_user_cstr(&ctx.aspace, newpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if newpath.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);

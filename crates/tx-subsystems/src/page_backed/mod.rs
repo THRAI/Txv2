@@ -13,8 +13,8 @@ pub mod adapter;
 
 use adapter::step_engine::{
     self as step_engine, page_allocator, AllocError, BitmapPageAllocator, ByteProgress, CachePin,
-    Cap, DeviceFrame, MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
-    YieldShape, ZeroPolicy, Zone, ZoneAllocated, ZoneError,
+    Cap, DeviceFrame, MapPin, NoProgress, OwnedFrame, ScriptCtx, StepOp, StepOutcome,
+    SubjectIdentity, Weak, YieldShape, ZeroPolicy, Zone, ZoneAllocated, ZoneError,
 };
 
 use crate::execution::{Errno, Guard};
@@ -43,6 +43,11 @@ pub use user_buffer::{
 use crate::test_support::EPOCH_TEST_LOCK;
 
 static PAGE_CONTAINER_ZONE: Zone<PageContainer> = Zone::const_new();
+static PAGE_CONTAINER_RECLAIM_REGISTRY: SpinMutex<alloc::vec::Vec<Weak<PageContainer>>> =
+    SpinMutex::new(alloc::vec::Vec::new());
+
+const PAGE_CACHE_RECLAIM_BATCH: usize = 256;
+const PAGE_CACHE_RECLAIM_LOW_WATERMARK: usize = 1024;
 
 unsafe impl ZoneAllocated for PageContainer {
     fn zone() -> &'static Zone<Self> {
@@ -63,20 +68,45 @@ impl PageIndex {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Frame {
     ppn: Ppn,
+    owner: Option<OwnedFrame<'static, BitmapPageAllocator<'static>>>,
 }
 
 impl Frame {
     pub const fn new(ppn: Ppn) -> Self {
-        Self { ppn }
+        Self { ppn, owner: None }
     }
 
-    pub const fn ppn(self) -> Ppn {
+    pub fn from_owned(owner: OwnedFrame<'static, BitmapPageAllocator<'static>>) -> Self {
+        let ppn = owner.ppn();
+        Self {
+            ppn,
+            owner: Some(owner),
+        }
+    }
+
+    pub const fn ppn(&self) -> Ppn {
         self.ppn
     }
 }
+
+impl core::fmt::Debug for Frame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Frame")
+            .field("ppn", &self.ppn)
+            .field("owned", &self.owner.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for Frame {
+    fn eq(&self, other: &Self) -> bool {
+        self.ppn == other.ppn
+    }
+}
+
+impl Eq for Frame {}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PageMarks {
@@ -222,6 +252,26 @@ impl PageCacheIndex {
         entry.marks.referenced = true;
         Ok(())
     }
+
+    fn reclaim_clean_pages(&mut self, budget: usize) -> usize {
+        if budget == 0 {
+            return 0;
+        }
+
+        let mut reclaimed = 0usize;
+        self.pages.retain(|_, entry| {
+            if reclaimed >= budget {
+                return true;
+            }
+            let reclaimable =
+                !entry.marks.dirty && !entry.marks.writeback && !entry.marks.no_reclaim;
+            if reclaimable {
+                reclaimed += 1;
+            }
+            !reclaimable
+        });
+        reclaimed
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -311,7 +361,11 @@ impl PageContainer {
         kind: PageContainerKind,
         page_count: u64,
     ) -> Result<Cap<PageContainer>, ZoneError> {
-        step_engine::sign(Self::new(kind, page_count))
+        let cap = step_engine::sign(Self::new(kind, page_count))?;
+        if matches!(cap.kind(), PageContainerKind::File { .. }) {
+            PAGE_CONTAINER_RECLAIM_REGISTRY.lock().push(cap.downgrade());
+        }
+        Ok(cap)
     }
 
     pub fn new_file_cap(
@@ -374,6 +428,7 @@ impl PageContainer {
         let newly_installed = match state.pages.lookup(page) {
             Some(_) => false,
             None => {
+                reclaim_clean_file_pages_if_low();
                 let frame = allocate_cached_frame()?;
                 state.pages.install_if_absent(page, frame)?;
                 true
@@ -491,6 +546,8 @@ impl PageContainer {
                 Err(error) => StepOutcome::Err(page_cache_error_to_errno(error)),
             };
         }
+
+        reclaim_clean_file_pages_if_low();
 
         let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
             return StepOutcome::Err(V3Errno::EINVAL);
@@ -844,7 +901,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
 }
 
 fn allocate_cached_frame() -> Result<CachedFrame, PageCacheError> {
-    let frame = page_allocator::reserve_frame(ZeroPolicy::Zeroed)
+    let frame = reserve_frame_with_reclaim(ZeroPolicy::Zeroed)
         .map_err(PageCacheError::Alloc)?
         .commit();
     let ppn = frame.ppn();
@@ -858,11 +915,72 @@ fn allocate_cached_frame() -> Result<CachedFrame, PageCacheError> {
 
 fn cached_frame_from_frame(frame: Frame) -> Result<CachedFrame, PageCacheError> {
     let ppn = frame.ppn();
-    let cache_pin = page_allocator::acquire_cache_pin(ppn).map_err(PageCacheError::Alloc)?;
+    let cache_pin = match frame.owner {
+        Some(owner) => {
+            let cache_pin = owner.try_cache_pin().map_err(PageCacheError::Alloc)?;
+            drop(owner);
+            cache_pin
+        }
+        None => page_allocator::acquire_cache_pin(ppn).map_err(PageCacheError::Alloc)?,
+    };
     Ok(CachedFrame {
         ppn,
         pin: PageCachePin::Allocated(cache_pin),
     })
+}
+
+pub fn reserve_frame_with_reclaim(
+    policy: ZeroPolicy,
+) -> Result<
+    page_allocator::FrameReservation<'static, BitmapPageAllocator<'static>>,
+    AllocError,
+> {
+    match page_allocator::reserve_frame(policy) {
+        Ok(frame) => Ok(frame),
+        Err(AllocError::Exhausted) => {
+            reclaim_clean_file_pages(PAGE_CACHE_RECLAIM_BATCH);
+            page_allocator::reserve_frame(policy)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn reclaim_clean_file_pages_if_low() -> usize {
+    match page_allocator::free_count() {
+        Ok(free) if free <= PAGE_CACHE_RECLAIM_LOW_WATERMARK => {
+            reclaim_clean_file_pages(PAGE_CACHE_RECLAIM_BATCH)
+        }
+        _ => 0,
+    }
+}
+
+pub fn reclaim_clean_file_pages(budget: usize) -> usize {
+    if budget == 0 {
+        return 0;
+    }
+
+    let guard = step_engine::guard();
+    let mut reclaimed = 0usize;
+    let mut registry = PAGE_CONTAINER_RECLAIM_REGISTRY.lock();
+    registry.retain(|weak| {
+        let Some(pc) = weak.upgrade(&guard) else {
+            return false;
+        };
+        if reclaimed < budget {
+            reclaimed += pc.reclaim_clean_file_pages(budget - reclaimed);
+        }
+        true
+    });
+    reclaimed
+}
+
+impl PageContainer {
+    fn reclaim_clean_file_pages(&self, budget: usize) -> usize {
+        if !matches!(self.kind(), PageContainerKind::File { .. }) {
+            return 0;
+        }
+        self.state.lock().pages.reclaim_clean_pages(budget)
+    }
 }
 
 fn materialized_from_state(

@@ -94,6 +94,15 @@ impl EventFd {
     }
 }
 
+impl Drop for EventFd {
+    fn drop(&mut self) {
+        wait_source::release_wait_channel(self.reader_source_id);
+        wait_source::release_wait_channel(self.writer_source_id);
+        wait_routing::unregister_source(self.reader_source_id);
+        wait_routing::unregister_source(self.writer_source_id);
+    }
+}
+
 static EVENTFD_ZONE: Zone<EventFd> = Zone::const_new();
 
 unsafe impl ZoneAllocated for EventFd {

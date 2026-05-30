@@ -183,6 +183,13 @@ impl TimerFd {
     }
 }
 
+impl Drop for TimerFd {
+    fn drop(&mut self) {
+        wait_source::release_wait_channel(self.source_id);
+        wait_routing::unregister_source(self.source_id);
+    }
+}
+
 static TIMERFD_ZONE: Zone<TimerFd> = Zone::const_new();
 
 unsafe impl ZoneAllocated for TimerFd {

@@ -19,7 +19,8 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     pub use tx_substrate::epoch::{self as epoch, borrow_current_guard, guard, Guard};
     pub use tx_substrate::page_allocator::{
-        self, AllocError, BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy,
+        self, AllocError, BitmapPageAllocator, CachePin, DeviceFrame, MapPin, OwnedFrame,
+        ZeroPolicy,
     };
     pub use tx_substrate::step::{
         ByteProgress, Errno, InterestMask, NoProgress, PageProgress,

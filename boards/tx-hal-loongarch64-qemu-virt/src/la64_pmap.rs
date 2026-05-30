@@ -998,7 +998,10 @@ pub(crate) fn encode_la64_leaf_pte(phys: PhysAddr, permissions: PmapPermissions)
         flags |= LA64_PTE_NX;
     }
     if permissions.contains(PmapPermissions::USER) {
-        flags |= LA64_PTE_PLV_USER | LA64_PTE_RPLV;
+        // Keep user leaves at PLV3 without RPLV restriction. Matching the
+        // common Linux/LoongArch setup here avoids over-constraining user
+        // accesses on pages that must participate in musl's ll/sc atomics.
+        flags |= LA64_PTE_PLV_USER;
     }
     if permissions.contains(PmapPermissions::GLOBAL) {
         flags |= LA64_PTE_G;

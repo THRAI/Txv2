@@ -119,7 +119,7 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioMmioBlock<P> {
             else {
                 return StepOutcome::Err(Errno::EINVAL);
             };
-            let Some(buf) = frame_slice_mut(*frame) else {
+            let Some(buf) = frame_slice_mut(frame) else {
                 return StepOutcome::Err(Errno::EIO);
             };
             if blk.read_blocks(lba as usize, buf).is_err() {
@@ -151,7 +151,7 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioMmioBlock<P> {
             else {
                 return StepOutcome::Err(Errno::EINVAL);
             };
-            let Some(buf) = frame_slice(*frame) else {
+            let Some(buf) = frame_slice(frame) else {
                 return StepOutcome::Err(Errno::EIO);
             };
             if blk.write_blocks(lba as usize, buf).is_err() {
@@ -190,12 +190,12 @@ fn sectors_per_page(block_size: u32) -> u32 {
     (PAGE_SIZE / block_size as usize) as u32
 }
 
-fn frame_slice_mut(frame: Frame) -> Option<&'static mut [u8]> {
+fn frame_slice_mut(frame: &Frame) -> Option<&'static mut [u8]> {
     let ptr = page_allocator::frame_kernel_addr(frame.ppn()).ok()?;
     Some(unsafe { core::slice::from_raw_parts_mut(ptr, PAGE_SIZE) })
 }
 
-fn frame_slice(frame: Frame) -> Option<&'static [u8]> {
+fn frame_slice(frame: &Frame) -> Option<&'static [u8]> {
     let ptr = page_allocator::frame_kernel_addr(frame.ppn()).ok()?;
     Some(unsafe { core::slice::from_raw_parts(ptr, PAGE_SIZE) })
 }

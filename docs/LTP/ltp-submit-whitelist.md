@@ -17,8 +17,29 @@ order is sorted by recorded passed score descending; ties keep source order.
 | stitched score | `4156/4987` | local documented score, not a single official full-run result |
 | LA recorded cases | 610 | all whitelist cases have `LA Status` / `LA Note` recorded |
 | LA stitched score | `4107/4956` | local LA documented score, not a single official full-run result |
+| LA submit whitelist cases | 594 | shared whitelist minus LA zero-score/hang/panic cases in `LTP_LA_SUBMIT_EXCLUDED_CASES` |
+| LA filtered stitched score | `4100/4915` | subtracts the excluded LA case totals |
+| active submit runner cases | RV 369 / LA 361 | runner stops before `io_uring01`; LA additionally removes active bad cases |
 | p0 source | excluded | p0 overlaps module batches |
 | local command | `make oscomp-local-rv64-ltp-batch LTP_BATCH=submit` | mirrors the no-`tx.oscomp.groups` submit path |
+| local LA command | `make oscomp-local-la64-ltp-batch LTP_BATCH=submit` | uses `tools/ltp-batches.py --arch la64` for the local count |
+| latest local LA submit run | `3879/4302` | 2026-05-30 before `truncate03_64` exclusion; 362 active cases completed with `#### OS COMP TEST GROUP END ltp-musl` |
+
+## LA Submit Delta
+
+LA keeps the shared `LTP_SUBMIT_CASES` order but filters out cases listed in
+`crates/tx-kernel/src/init/exec.rs::LTP_LA_SUBMIT_EXCLUDED_CASES`. The immediate
+blockers observed locally are `gettid02`, `mq_notify01`, and `truncate03_64`:
+the first two can print partial progress and then fail to return to the runner;
+`truncate03_64` can trigger a kernel panic during the LA glibc default run after
+long submit accumulation. The rest of this list is the current zero-score
+`LA Status = fail` set from the table below.
+
+Excluded from LA submit:
+
+`gettid02`, `fcntl36_64`, `fcntl36`, `creat08`, `open10`, `sched_setattr01`,
+`futex_wait03`, `pselect01`, `pselect01_64`, `fcntl34`, `fcntl34_64`,
+`mq_notify01`, `semop05`, `chmod05`, `mknod05`, `truncate03_64`.
 
 ## By Module
 
@@ -205,7 +226,7 @@ order is sorted by recorded passed score descending; ties keep source order.
 | `mknodat01` | vfs | vfs | pass | `5/5` | pass | LA 5/5 |
 | `statx03` | vfs | vfs | partial | `5/7` | partial | LA 5/7; TFAIL: statx() should fail with EFAULT: ENAMETOOLONG (36) |
 | `truncate03` | vfs | vfs | partial | `5/8` | partial | LA 5/8; TFAIL: truncate(tc->pathname, tc->length) succeeded |
-| `truncate03_64` | vfs | vfs | partial | `5/8` | partial | LA 5/8; TFAIL: truncate(tc->pathname, tc->length) succeeded |
+| `truncate03_64` | vfs | vfs | partial | `5/8` | excluded | LA glibc default run panics here after long submit accumulation; single-case score was LA 5/8 |
 | `unlink07` | vfs | vfs | partial | `5/6` | partial | LA 5/6; TFAIL: invalid address expected EFAULT: ENAMETOOLONG (36) |
 | `setegid01` | cred | cred | pass | `4/4` | pass | LA 4/4 |
 | `setresuid02` | cred | cred | pass | `4/4` | pass | LA 4/4 |

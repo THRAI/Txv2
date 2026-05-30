@@ -824,6 +824,8 @@ impl Drop for RNode {
     fn drop(&mut self) {
         wait_source::release_wait_channel(self.read_wait_source_id);
         wait_source::release_wait_channel(self.write_wait_source_id);
+        wait_routing::unregister_source(self.read_wait_source_id);
+        wait_routing::unregister_source(self.write_wait_source_id);
     }
 }
 
@@ -853,7 +855,7 @@ pub struct DEntry {
     parent: Option<Cap<DEntry>>,
     rnode: Cap<RNode>,
     mounted: Option<Weak<MountIdentity>>,
-    children: SpinMutex<BTreeMap<InlineName, Cap<DEntry>>>,
+    children: SpinMutex<BTreeMap<InlineName, Weak<DEntry>>>,
 }
 
 impl DEntry {
@@ -888,7 +890,9 @@ impl DEntry {
     }
 
     /// Return the parent-hint `Cap<DEntry>` if installed. The parent is held
-    /// by strong reference so the chain remains valid after any `chdir`.
+    /// strongly so live cwd/path dentries keep their ancestor chain renderable;
+    /// the child cache is weak, so parent/child cache cycles do not retain
+    /// removed directory subtrees.
     pub fn parent_hint(&self) -> Option<Cap<DEntry>> {
         self.parent.clone()
     }
@@ -904,11 +908,20 @@ impl DEntry {
     }
 
     pub fn cached_child(&self, name: InlineName) -> Option<Cap<DEntry>> {
-        self.children.lock().get(&name).cloned()
+        let mut children = self.children.lock();
+        let child = children.get(&name).copied()?;
+        let guard = step_engine::guard();
+        match child.upgrade(&guard) {
+            Some(cap) => Some(cap),
+            None => {
+                children.remove(&name);
+                None
+            }
+        }
     }
 
     pub fn cache_child(&self, child: Cap<DEntry>) {
-        self.children.lock().insert(child.name(), child);
+        self.children.lock().insert(child.name(), child.downgrade());
     }
 
     pub fn remove_cached_child(&self, name: InlineName) {

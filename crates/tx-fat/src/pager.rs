@@ -8,7 +8,7 @@ use page_allocator::ZeroPolicy;
 use tx_fat_format::ondisk;
 use tx_fat_format::pager::{BlockImage, FatFormatError};
 use tx_subsystems::execution::Errno;
-use tx_subsystems::page_backed::{Frame, FsPageBacking};
+use tx_subsystems::page_backed::{reserve_frame_with_reclaim, Frame, FsPageBacking};
 use tx_subsystems::vfs::structure::FsObjectId;
 
 // ====================================================================
@@ -109,7 +109,7 @@ where
 
         match result {
             Ok(page_buf) => {
-                let owned = match page_allocator::reserve_frame(ZeroPolicy::Zeroed) {
+                let owned = match reserve_frame_with_reclaim(ZeroPolicy::Zeroed) {
                     Ok(reservation) => reservation.commit(),
                     Err(_) => return StepOutcome::err(Errno::EBUSY),
                 };
@@ -130,8 +130,7 @@ where
                     }
                 }
 
-                let _permanent = owned.into_permanent_frame();
-                StepOutcome::done(Frame::new(ppn))
+                StepOutcome::done(Frame::from_owned(owned))
             }
             Err(err) => StepOutcome::err(err),
         }

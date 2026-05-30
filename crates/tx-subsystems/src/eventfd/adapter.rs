@@ -78,6 +78,10 @@ pub mod wait_routing {
         source
     }
 
+    pub fn unregister_source(source_id: u64) {
+        tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
+    }
+
     pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) -> usize {
         tx_reactor::wait::fire_legacy(channel, mask_bits)
     }

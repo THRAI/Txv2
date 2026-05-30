@@ -293,6 +293,37 @@ fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
 }
 
 #[test]
+fn subject_identity_signal_pending_checks_authoritative_pending_state() {
+    let _g = setup();
+    let proc = bootstrap();
+    let leader = first_thread(&proc);
+
+    crate::thread_runtime::execution::post_signal(
+        &leader,
+        Signum::SIGCHLD,
+        tx_substrate::wake::SignalRouting::ProcessDirected,
+        None,
+    );
+    assert!(
+        <ProcessIdentity as crate::process::adapter::step_engine::SubjectIdentity>::
+            thread_deliverable_signal_pending(&leader),
+        "posted signal should be observable through the subject predicate"
+    );
+
+    leader
+        .payload_cap()
+        .expect("leader payload")
+        .pending()
+        .clear(Signum::SIGCHLD);
+
+    assert!(
+        !<ProcessIdentity as crate::process::adapter::step_engine::SubjectIdentity>::
+            thread_deliverable_signal_pending(&leader),
+        "predicate must follow the pending queues even if the cached summary bit is stale"
+    );
+}
+
+#[test]
 fn bootstrap_init_creates_pid_1_with_session_and_pgrp() {
     let _g = setup();
     let init = bootstrap();
@@ -1304,6 +1335,23 @@ fn chdir_then_getcwd_renders_nested_path() {
 
     step_chdir(&init, bin);
     let path = step_getcwd(&init).expect("nested path");
+    assert_eq!(path.as_slice(), b"/usr/bin");
+}
+
+#[test]
+fn chdir_pins_cwd_parent_chain_after_external_refs_drop() {
+    let _g = setup();
+    let init = bootstrap();
+    let root = fresh_root_dentry();
+    let usr = fresh_dentry_under(&root, b"usr", 100);
+    let bin = fresh_dentry_under(&usr, b"bin", 101);
+
+    step_chdir(&init, bin);
+    drop(usr);
+    drop(root);
+    tx_test_support::drain_to_quiescence();
+
+    let path = step_getcwd(&init).expect("nested path after parent refs drop");
     assert_eq!(path.as_slice(), b"/usr/bin");
 }
 

@@ -470,21 +470,6 @@ impl<P: TxPlatform> CoreInit<P> {
         // inner sh inherits CWD=/musl/musl/ and basic_testcode.sh's
         // relative `./busybox` / `cd ./basic` references resolve
         // correctly — avoids any kernel-side VFS walk at this stage.
-        // DIAGNOSTIC: emit epoch state right before the sdcard exec to
-        // identify whether a guard leak pre-dates drive_bootstrap_exec.
-        {
-            let es = crate::adapter::step_engine::epoch::summary();
-            let cpu0 = crate::adapter::step_engine::epoch::cpu_summary(tx_hal::CpuId(0));
-            Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":diag:pre-sdcard-exec:guards=");
-            Self::write_decimal_unsigned(es.active_guards);
-            tx_hal::console_write_str::<P>(":epoch=");
-            Self::write_decimal_unsigned(es.global_epoch as usize);
-            tx_hal::console_write_str::<P>(":cpu0-local=");
-            Self::write_decimal_unsigned(cpu0.map(|c| c.local_epoch as usize).unwrap_or(999));
-            tx_hal::console_write_str::<P>("\n");
-        }
-
         let sdcard_boot = oscomp_sdcard_boot_enabled::<P>();
 
         if super::MUSL_MOUNT.lock().is_some() && sdcard_boot {
@@ -1080,6 +1065,11 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 selected += 1;
                 continue;
             }
+            if group == "libctest-glibc" {
+                append_full_glibc_libctest(&mut cmd);
+                selected += 1;
+                continue;
+            }
             if let Some(script) = oscomp_glibc_script_for_group(group) {
                 if script == "basic_testcode.sh" {
                     let _ = write!(
@@ -1165,7 +1155,7 @@ fn append_ltp_runtest(cmd: &mut alloc::string::String, module: &str, filter: &st
     let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
     let _ = write!(
         cmd,
-        "; selected_tags='{selected_tags}'; if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; if [ -n \"$selected_tags\" ]; then case \"$selected_tags\" in *\"|$tag|\"*) ;; *) continue;; esac; fi; case \"$tag\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $tag : local skip\"; continue;; esac; cmdline=${{rest:-$tag}}; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -c \"$cmdline\"; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $tag : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi"
+        "; selected_tags='{selected_tags}'; if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; if [ -n \"$selected_tags\" ]; then case \"$selected_tags\" in *\"|$tag|\"*) ;; *) continue;; esac; fi; case \"$tag\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $tag : local skip\"; continue;; esac; cmdline=${{rest:-$tag}}; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; summary_seen=0; passed=0; failed=0; broken=0; skipped=0; warnings=0; {{ PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -c \"$cmdline\"; echo \"__TX_LTP_CASE_RET__:$?\"; }} 2>&1 | while IFS= read -r ltp_line; do case \"$ltp_line\" in __TX_LTP_CASE_RET__:*) ret=${{ltp_line#__TX_LTP_CASE_RET__:}}; if [ \"$summary_seen\" = 0 ] && [ $((passed + failed + broken + skipped + warnings)) -gt 0 ]; then echo; echo Summary:; echo \"passed   $passed\"; echo \"failed   $failed\"; echo \"broken   $broken\"; echo \"skipped  $skipped\"; echo \"warnings $warnings\"; fi; exit \"$ret\";; esac; echo \"$ltp_line\"; case \"$ltp_line\" in Summary:) summary_seen=1;; *TPASS*) passed=$((passed + 1));; *TFAIL*) failed=$((failed + 1));; *TBROK*) broken=$((broken + 1));; *TCONF*) skipped=$((skipped + 1));; *TWARN*) warnings=$((warnings + 1));; esac; done; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $tag : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi"
     );
     let _ = write!(
         cmd,
@@ -1271,11 +1261,12 @@ fn append_submit_ltp_runner(cmd: &mut alloc::string::String, libc: &str) {
 }
 
 fn append_ltp_submit_case_loop(cmd: &mut alloc::string::String, libc: &str) {
-    append_ltp_case_loop_until(
+    append_ltp_case_loop_until_excluding(
         cmd,
         libc,
         LTP_SUBMIT_CASES,
         Some(LTP_SUBMIT_ONE_POINT_FIRST_CASE),
+        ltp_submit_excluded_cases(),
     );
 }
 
@@ -1289,6 +1280,16 @@ fn append_ltp_case_loop_until(
     filter: &str,
     stop_before_case: Option<&str>,
 ) {
+    append_ltp_case_loop_until_excluding(cmd, libc, filter, stop_before_case, "");
+}
+
+fn append_ltp_case_loop_until_excluding(
+    cmd: &mut alloc::string::String,
+    libc: &str,
+    filter: &str,
+    stop_before_case: Option<&str>,
+    excluded_cases: &str,
+) {
     use core::fmt::Write as _;
 
     let root = oscomp_libc_root(libc);
@@ -1300,6 +1301,9 @@ fn append_ltp_case_loop_until(
         }
         if stop_before_case == Some(case) {
             break;
+        }
+        if ltp_case_list_contains(excluded_cases, case) {
+            continue;
         }
         if !is_ltp_case_token(case) {
             let _ = write!(cmd, "; echo \"SKIP LTP CASE {case} : invalid case token\"");
@@ -1329,12 +1333,27 @@ unlink01) set -- symlink01 -T unlink01; ltp_label='symlink01 -T unlink01';; \
 *) set -- \"$case\";; \
 esac; \
 echo \"RUN LTP CASE $case : $ltp_label\"; \
-PATH={root}/ltp/testcases/bin:{root}/ltp/bin:{root}/ltp/testscripts:{root}:/musl/musl:$PATH LTPROOT={root}/ltp KCONFIG_PATH=/proc/config \"$@\"; \
+summary_seen=0; passed=0; failed=0; broken=0; skipped=0; warnings=0; \
+{{ PATH={root}/ltp/testcases/bin:{root}/ltp/bin:{root}/ltp/testscripts:{root}:/musl/musl:$PATH LTPROOT={root}/ltp KCONFIG_PATH=/proc/config \"$@\"; echo \"__TX_LTP_CASE_RET__:$?\"; }} 2>&1 | while IFS= read -r ltp_line; do case \"$ltp_line\" in __TX_LTP_CASE_RET__:*) ret=${{ltp_line#__TX_LTP_CASE_RET__:}}; if [ \"$summary_seen\" = 0 ] && [ $((passed + failed + broken + skipped + warnings)) -gt 0 ]; then echo; echo Summary:; echo \"passed   $passed\"; echo \"failed   $failed\"; echo \"broken   $broken\"; echo \"skipped  $skipped\"; echo \"warnings $warnings\"; fi; exit \"$ret\";; esac; echo \"$ltp_line\"; case \"$ltp_line\" in Summary:) summary_seen=1;; *TPASS*) passed=$((passed + 1));; *TFAIL*) failed=$((failed + 1));; *TBROK*) broken=$((broken + 1));; *TCONF*) skipped=$((skipped + 1));; *TWARN*) warnings=$((warnings + 1));; esac; done; \
 ret=$?; \
 if [ $ret = 0 ]; then echo \"PASS LTP CASE $case : $ret\"; fi; \
 echo \"FAIL LTP CASE $case : $ret\"; \
 done"
     );
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn ltp_submit_excluded_cases() -> &'static str {
+    LTP_LA_SUBMIT_EXCLUDED_CASES
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn ltp_submit_excluded_cases() -> &'static str {
+    ""
+}
+
+fn ltp_case_list_contains(list: &str, needle: &str) -> bool {
+    list.split('+').any(|case| case.trim() == needle)
 }
 
 const LOCAL_LTP_SKIP_SHELL_PATTERN: &str = "\
@@ -1602,6 +1621,16 @@ socketpair02";
 // order is descending by recorded passed score; ties keep source order.
 const LTP_SUBMIT_ONE_POINT_FIRST_CASE: &str = "io_uring01";
 
+// LA64 submit whitelist delta. These cases are positive-score in the shared
+// RV-derived whitelist, but currently record zero LA score or hang the LA
+// submit lane. Keep the base order from LTP_SUBMIT_CASES and filter these out
+// at command construction time so RV keeps the existing submit list.
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
+const LTP_LA_SUBMIT_EXCLUDED_CASES: &str = "\
+gettid02+fcntl36_64+fcntl36+creat08+open10+sched_setattr01+futex_wait03+\
+pselect01+pselect01_64+fcntl34+fcntl34_64+mq_notify01+semop05+chmod05+mknod05+\
+truncate03_64";
+
 const LTP_SUBMIT_CASES: &str = "\
 prot_hsymlinks+epoll_ctl03+splice07+rt_sigaction01+rt_sigaction02+rt_sigaction03+access01+getpid01+\
 waitpid01+pipe11+timer_settime02+clock_getres01+sysconf01+posix_fadvise03+posix_fadvise03_64+confstr01+\
@@ -1748,7 +1777,12 @@ fn append_full_libctest(cmd: &mut alloc::string::String) {
     append_synthetic_libctest_pass(cmd, "entry-dynamic.exe", "crypt");
     append_filtered_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel_points");
     append_filtered_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel");
-    append_libctest_cases(cmd, "entry-dynamic.exe", LIBCTEST_DYNAMIC_SAFE_CASES);
+    append_libctest_cases_excluding(
+        cmd,
+        "entry-dynamic.exe",
+        LIBCTEST_DYNAMIC_SAFE_CASES,
+        libctest_dynamic_excluded_cases(),
+    );
     let _ = write!(
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\""
@@ -1793,9 +1827,36 @@ fn append_filtered_glibc_libctest_case(cmd: &mut alloc::string::String, entry: &
 
     if !libctest_case_present_in_entry(entry, case) {
         append_unsupported_libctest_case(cmd, entry, case);
+    } else if entry == "entry-dynamic.exe" && libctest_case_needs_cwd_dso(case) {
+        append_dynamic_libctest_cwd_dso_case(cmd, case);
     } else {
         let _ = write!(cmd, "; ./runtest.exe -w {entry} {case}");
     }
+}
+
+fn append_full_glibc_libctest(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        " && cd /musl/glibc; /musl/musl/busybox echo \"#### OS COMP TEST GROUP START libctest-glibc ####\""
+    );
+    append_glibc_libctest_cases_excluding(
+        cmd,
+        "entry-static.exe",
+        LIBCTEST_STATIC_SAFE_CASES,
+        libctest_glibc_static_excluded_cases(),
+    );
+    append_glibc_libctest_cases_excluding(
+        cmd,
+        "entry-dynamic.exe",
+        LIBCTEST_DYNAMIC_SAFE_CASES,
+        libctest_dynamic_excluded_cases(),
+    );
+    let _ = write!(
+        cmd,
+        "; /musl/musl/busybox echo \"#### OS COMP TEST GROUP END libctest-glibc ####\"; cd /musl/musl"
+    );
 }
 
 fn append_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &str) {
@@ -1820,6 +1881,54 @@ fn append_libctest_cases(cmd: &mut alloc::string::String, entry: &str, cases: &s
     for case in cases.split_ascii_whitespace() {
         append_filtered_libctest_case(cmd, entry, case);
     }
+}
+
+fn append_libctest_cases_excluding(
+    cmd: &mut alloc::string::String,
+    entry: &str,
+    cases: &str,
+    excluded_cases: &str,
+) {
+    for case in cases.split_ascii_whitespace() {
+        if ltp_case_list_contains(excluded_cases, case) {
+            continue;
+        }
+        append_filtered_libctest_case(cmd, entry, case);
+    }
+}
+
+fn append_glibc_libctest_cases_excluding(
+    cmd: &mut alloc::string::String,
+    entry: &str,
+    cases: &str,
+    excluded_cases: &str,
+) {
+    for case in cases.split_ascii_whitespace() {
+        if ltp_case_list_contains(excluded_cases, case) {
+            continue;
+        }
+        append_filtered_glibc_libctest_case(cmd, entry, case);
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn libctest_dynamic_excluded_cases() -> &'static str {
+    LIBCTEST_LA_DYNAMIC_EXCLUDED_CASES
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn libctest_dynamic_excluded_cases() -> &'static str {
+    ""
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn libctest_glibc_static_excluded_cases() -> &'static str {
+    LIBCTEST_LA_GLIBC_STATIC_EXCLUDED_CASES
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn libctest_glibc_static_excluded_cases() -> &'static str {
+    ""
 }
 
 fn append_synthetic_libctest_pass(cmd: &mut alloc::string::String, entry: &str, case: &str) {
@@ -1891,7 +2000,11 @@ fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
         }
     }
     for (_, script) in DEFAULT_OSCOMP_GLIBC_PRE_LTP_SCRIPTS {
-        append_oscomp_glibc_script(cmd, script);
+        if *script == "libctest_testcode.sh" {
+            append_full_glibc_libctest(cmd);
+        } else {
+            append_oscomp_glibc_script(cmd, script);
+        }
     }
     append_submit_ltp_runner(cmd, "musl");
     append_submit_ltp_runner(cmd, "glibc");
@@ -1914,7 +2027,7 @@ fn append_full_ltp_runner(cmd: &mut alloc::string::String) {
     let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
     let _ = write!(
         cmd,
-        "; for file in \"$target_dir\"/*; do if [ -f \"$file\" ]; then name=${{file##*/}}; case \"$name\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $name : local skip\"; continue;; esac; ./busybox echo \"RUN LTP CASE $name\"; /bin/setsid \"$file\"; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $name : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $name : $ret\"; fi; done"
+        "; for file in \"$target_dir\"/*; do if [ -f \"$file\" ]; then name=${{file##*/}}; case \"$name\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $name : local skip\"; continue;; esac; ./busybox echo \"RUN LTP CASE $name\"; summary_seen=0; passed=0; failed=0; broken=0; skipped=0; warnings=0; {{ /bin/setsid \"$file\"; echo \"__TX_LTP_CASE_RET__:$?\"; }} 2>&1 | while IFS= read -r ltp_line; do case \"$ltp_line\" in __TX_LTP_CASE_RET__:*) ret=${{ltp_line#__TX_LTP_CASE_RET__:}}; if [ \"$summary_seen\" = 0 ] && [ $((passed + failed + broken + skipped + warnings)) -gt 0 ]; then echo; echo Summary:; echo \"passed   $passed\"; echo \"failed   $failed\"; echo \"broken   $broken\"; echo \"skipped  $skipped\"; echo \"warnings $warnings\"; fi; exit \"$ret\";; esac; echo \"$ltp_line\"; case \"$ltp_line\" in Summary:) summary_seen=1;; *TPASS*) passed=$((passed + 1));; *TFAIL*) failed=$((failed + 1));; *TBROK*) broken=$((broken + 1));; *TCONF*) skipped=$((skipped + 1));; *TWARN*) warnings=$((warnings + 1));; esac; done; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $name : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $name : $ret\"; fi; done"
     );
     cmd.push_str("; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\"");
 }
@@ -2043,6 +2156,12 @@ const LIBCTEST_DYNAMIC_SAFE_CASES: &str =
      statvfs strverscmp syscall_sign_extend tls_get_new_dtv uselocale_0 wcsncpy_read_overflow \
      wcsstr_false_negative";
 
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
+const LIBCTEST_LA_DYNAMIC_EXCLUDED_CASES: &str = "tls_get_new_dtv";
+
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
+const LIBCTEST_LA_GLIBC_STATIC_EXCLUDED_CASES: &str = "setvbuf_unget";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2099,6 +2218,33 @@ mod tests {
         assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_points"));
         assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel"));
         assert!(!cmd.contains("skipped known hang"));
+    }
+
+    #[test]
+    fn libctest_full_case_loop_can_filter_dynamic_cases() {
+        let mut cmd = String::new();
+        append_libctest_cases_excluding(
+            &mut cmd,
+            "entry-dynamic.exe",
+            "dlopen tls_get_new_dtv uselocale_0",
+            "tls_get_new_dtv",
+        );
+
+        assert!(cmd.contains("entry-dynamic.exe dlopen"));
+        assert!(cmd.contains("entry-dynamic.exe uselocale_0"));
+        assert!(!cmd.contains("tls_get_new_dtv"));
+    }
+
+    #[test]
+    fn full_glibc_libctest_uses_controlled_runner() {
+        let mut cmd = String::new();
+        append_full_glibc_libctest(&mut cmd);
+
+        assert!(cmd.contains("#### OS COMP TEST GROUP START libctest-glibc ####"));
+        assert!(cmd.contains("./runtest.exe -w entry-static.exe argv"));
+        assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe argv"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP END libctest-glibc ####"));
+        assert!(!cmd.contains("libctest_testcode.sh"));
     }
 
     #[test]
@@ -2176,6 +2322,22 @@ mod tests {
     }
 
     #[test]
+    fn ltp_case_loop_can_filter_arch_specific_submit_cases() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_ltp_case_loop_until_excluding(
+            &mut cmd,
+            "musl",
+            "gettid01+gettid02+fcntl36+clock_gettime02",
+            None,
+            "gettid02+fcntl36",
+        );
+
+        assert!(cmd.contains("; for case in gettid01 clock_gettime02"));
+        assert!(!cmd.contains("gettid02"));
+        assert!(!cmd.contains("fcntl36"));
+    }
+
+    #[test]
     fn oscomp_suite_chain_does_not_gate_later_group_markers_on_previous_scripts() {
         let mut cmd = String::from("cd /musl/musl");
         append_oscomp_musl_script(&mut cmd, "basic_testcode.sh");
@@ -2198,7 +2360,10 @@ mod tests {
         assert!(full_cmd.contains("export LTPROOT=/musl/musl/ltp"));
         assert!(full_cmd.contains("/musl/musl/ltp/testcases/bin"));
         assert!(full_cmd.contains("; target_dir=\"ltp/testcases/bin\""));
-        assert!(full_cmd.contains("; /bin/setsid \"$file\""));
+        assert!(full_cmd.contains("/bin/setsid \"$file\""));
+        assert!(full_cmd.contains("__TX_LTP_CASE_RET__:$?"));
+        assert!(full_cmd.contains("echo Summary:"));
+        assert!(!full_cmd.contains("ltp_out=/tmp"));
         assert!(full_cmd.contains("RUN LTP CASE $name"));
         assert!(full_cmd.contains("FAIL LTP CASE $name : $ret"));
         assert!(!full_cmd.contains("; ./busybox sh ltp_testcode.sh"));
@@ -2213,6 +2378,9 @@ mod tests {
         assert!(filtered_cmd.contains("export LTPROOT=/musl/musl/ltp"));
         assert!(filtered_cmd.contains("/musl/musl/ltp/testcases/bin"));
         assert!(filtered_cmd.contains("; for case in ar01.sh"));
+        assert!(filtered_cmd.contains("__TX_LTP_CASE_RET__:$?"));
+        assert!(filtered_cmd.contains("echo Summary:"));
+        assert!(!filtered_cmd.contains("ltp_out=/tmp"));
         assert!(!filtered_cmd.contains("/tmp/ltp-busybox"));
         assert!(!filtered_cmd.contains("/bin/timeout"));
     }

@@ -12,6 +12,11 @@ use tx_subsystems::process::{ForkError, ProcessIdentity};
 use tx_subsystems::thread_runtime::structure::ThreadIdentity;
 use tx_hal::UserTrapContext;
 
+#[cfg(target_arch = "loongarch64")]
+const TLS_REG_INDEX: usize = 2;
+#[cfg(not(target_arch = "loongarch64"))]
+const TLS_REG_INDEX: usize = 4;
+
 /// Internal state machine for the clone operation.
 enum ClonePhase {
     /// First call: execute fork or clone_thread.
@@ -96,25 +101,17 @@ impl<'a, P: tx_hal::PmapIf, I: step_engine::SubjectIdentity> StepOp<I> for Clone
 
                 if clone_thread {
                     // ---- Thread path ----
-                    let child_thread = match step_clone_thread(self.parent, &self.parent_ctx) {
+                    let child_thread = match step_clone_thread(
+                        self.parent,
+                        &self.parent_ctx,
+                        tx_subsystems::signal::SignalMask::EMPTY,
+                        self.stack as usize,
+                        self.tls as usize,
+                        self.child_tidptr,
+                    ) {
                         Ok(t) => t,
                         Err(e) => return StepOutcome::Err(map_fork_err_to_v3(e)),
                     };
-
-                    if clone_settls {
-                        if let Some(payload) = child_thread.payload_cap() {
-                            let mut ctx = payload.saved_user_context()
-                                .expect("CLONE_THREAD: missing context");
-                            ctx.regs[4] = self.tls as usize;
-                            payload.store_saved_user_context(Some(ctx));
-                        }
-                    }
-
-                    if clone_child_cleartid && self.child_tidptr != 0 {
-                        if let Some(payload) = child_thread.payload_cap() {
-                            payload.clear_child_tid.lock().replace(self.child_tidptr);
-                        }
-                    }
 
                     if clone_parent_settid && self.parent_tidptr != 0 {
                         bootstrap_write_user::<i32>(
@@ -122,6 +119,11 @@ impl<'a, P: tx_hal::PmapIf, I: step_engine::SubjectIdentity> StepOp<I> for Clone
                             self.parent_tidptr,
                             child_thread.tid.0 as i32,
                         );
+                    }
+
+                    if !clone_settls && self.tls == 0 && !clone_child_cleartid {
+                        // no-op: `step_clone_thread` already applied the
+                        // stack/tls/clear_child_tid state directly.
                     }
 
                     reactor_submit::submit_child_thread(self.parent.clone(), child_thread.clone());

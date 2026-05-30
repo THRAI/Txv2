@@ -344,6 +344,7 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
     let path_buf = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(buf) => buf,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
     if is_identity_noop_helper(&path_buf) {
@@ -580,12 +581,21 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         .saved_user_context()
         .expect(":clone:no-context: kernel-invariant violation, parent thread had no saved_user_context");
 
-    // Txv2's Linux syscall shim receives clone arguments in the
-    // asm-generic order used by the current userspace test images:
+    // Raw `clone(2)` argument ordering is arch-specific at the syscall layer.
+    //
+    // RV64 uses the asm-generic shape:
     //   clone(flags, stack, ptid, tls, ctid)
-    // Treating LoongArch64 as ctid/tls here seeds the child thread
-    // pointer with the clear_child_tid address; pthread children then
-    // spin or fault after the first futex wake.
+    //
+    // LoongArch64 musl's `__clone(func, stack, flags, arg, ptid, tls, ctid)`
+    // wrapper marshals that into:
+    //   clone(flags, stack, ptid, ctid, tls)
+    //
+    // Keep every `ctid` user below on this decoded slot instead of touching
+    // `args[4]` directly, otherwise LA64 either writes tids into the TLS
+    // pointer field or enters the child with `tp = clear_child_tid`.
+    #[cfg(target_arch = "loongarch64")]
+    let (tls_arg, ctid_arg) = (args[4], args[3]);
+    #[cfg(not(target_arch = "loongarch64"))]
     let (tls_arg, ctid_arg) = (args[3], args[4]);
 
     let tls = if clone_settls { tls_arg } else { 0 };
@@ -595,9 +605,15 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     // ProcessIdentity is created.
     if clone_thread {
         let ctid_ptr = if clone_child_cleartid { ctid_arg } else { 0 };
+        let parent_signal_mask = ctx
+            .thread
+            .payload_cap()
+            .map(|payload| payload.signal_mask())
+            .unwrap_or(tx_subsystems::signal::SignalMask::EMPTY);
         let child_thread = tx_subsystems::process::execution::step_clone_thread(
             &ctx.process,
             &parent_user_ctx,
+            parent_signal_mask,
             stack as usize,
             tls as usize,
             ctid_ptr,
@@ -620,7 +636,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             }
         }
         if clone_child_settid {
-            let ctid_ptr = args[4];
+            let ctid_ptr = ctid_arg;
             if ctid_ptr != 0 {
                 let _ = super::user_copy::bootstrap_write_user(
                     &ctx.aspace,
@@ -632,6 +648,13 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
 
         // Hand the child thread to the reactor.
         reactor_submit::submit_child_thread(ctx.process.clone(), child_thread.clone());
+
+        // Match the fork path's bounded fairness window. On LoongArch64,
+        // musl keeps the thread-list lock held across the raw clone return and
+        // releases it in the parent-side pthread_create path, so let the parent
+        // return to userspace before giving the child an eager startup slice.
+        #[cfg(not(target_arch = "loongarch64"))]
+        tx_reactor::yield_now().await;
 
         return SyscallResult::Return(child_thread.tid.0 as i64);
     }
@@ -710,16 +733,16 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     if clone_parent_settid && args[2] != 0 {
         let _ = super::user_copy::bootstrap_write_user(&ctx.aspace, args[2], child_tid);
     }
-    if clone_child_cleartid && args[4] != 0 {
+    if clone_child_cleartid && ctid_arg != 0 {
         if let Some(payload) = child_thread.payload_cap() {
-            payload.clear_child_tid.lock().replace(args[4]);
+            payload.clear_child_tid.lock().replace(ctid_arg);
         }
     }
-    if clone_child_settid && args[4] != 0 {
+    if clone_child_settid && ctid_arg != 0 {
         let child_aspace = child.aspace_cap().expect(
             ":clone:no-child-aspace: kernel-invariant violation, fresh child has no aspace",
         );
-        let _ = super::user_copy::bootstrap_write_user(&child_aspace, args[4], child_tid);
+        let _ = super::user_copy::bootstrap_write_user(&child_aspace, ctid_arg, child_tid);
     }
 
     // Hand the child's leader thread to the reactor. Panics with

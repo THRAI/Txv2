@@ -750,6 +750,7 @@ impl FutexWaitOp<'_> {
         if let Some(source_id) = self.registered_source_id.take() {
             unregister_exact_waiter(self.aspace, self.uaddr, source_id);
             wait_source::release_wait_channel(source_id);
+            wait_routing::unregister_source(source_id);
         }
     }
 }

@@ -231,13 +231,18 @@ fn clear_thread_pending_signals(ctx: &SyscallCtx<'_>, mask_bits: u64) {
     let Some(payload) = ctx.thread.payload_cap() else {
         return;
     };
+    let mut cleared_any = false;
     for raw in 1..=Signum::MAX {
         let Some(sig) = Signum::new(raw) else {
             continue;
         };
         if mask_bits & sig.bit() != 0 {
             payload.pending().clear(sig);
+            cleared_any = true;
         }
+    }
+    if cleared_any {
+        tx_subsystems::signal::refresh_deliverable_signal_summary(&ctx.thread);
     }
 }
 

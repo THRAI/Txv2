@@ -979,6 +979,8 @@ fn la64_user_page_mapping_reserve_commit_protect_and_unmap() {
     let leaf = l0[la64_l0_index(virt.0)];
     assert!(la64_pte_is_leaf(leaf));
     assert_eq!(la64_pte_phys(leaf), phys);
+    assert_eq!(leaf & LA64_PTE_PLV_USER, LA64_PTE_PLV_USER);
+    assert_eq!(leaf & LA64_PTE_RPLV, 0);
     assert_eq!(
         Platform::reserve_mapping(&root, virt, phys, PmapReserveKind::Page4K),
         Err(PmapError::AlreadyMapped)

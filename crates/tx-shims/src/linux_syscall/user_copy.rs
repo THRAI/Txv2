@@ -29,6 +29,8 @@ use tx_subsystems::vm::{
 pub(super) enum ReadCStrError {
     /// No NUL within `max_len` — surface as `-ENAMETOOLONG`.
     TooLong,
+    /// Canonical user copy fault (for example, `NULL`/bad pathname).
+    Fault(Errno),
 }
 
 /// Outcome of `read_user_cstr_vec`. `TooBig` covers both
@@ -39,28 +41,27 @@ pub(super) enum ReadVecError {
 }
 
 /// Bounded copy of a NUL-terminated user string into a kernel-owned
-/// `Vec<u8>` (NUL terminator stripped). `uaddr == 0` produces an empty
-/// vector — matches Linux's "execve(NULL, ...)" lenience for path =
-/// NULL (which would actually surface as `EFAULT` in real Linux; the
-/// trio Phase 2a bootstrap exemption pre-dates the EFAULT plumbing,
-/// so we treat NULL as "empty").
+/// `Vec<u8>` (NUL terminator stripped).
 ///
-/// Bridges through `bootstrap_read_user_cstr` (which delegates to
-/// `aspace.read_user_cstr` and falls back to a kernel-pointer scan on
-/// `EFAULT`).
+/// Normal pathname-bearing syscalls expect Linux semantics here:
+/// `uaddr == 0` is `-EFAULT`, a missing NUL within `max_len` is
+/// `-ENAMETOOLONG`, and other canonical user-copy failures preserve
+/// their original errno.
 pub(super) fn read_user_cstr(
     aspace: &AddressSpace,
     uaddr: u64,
     max_len: usize,
 ) -> Result<Vec<u8>, ReadCStrError> {
+    if uaddr == 0 {
+        return Err(ReadCStrError::Fault(Errno::EFAULT));
+    }
+    if max_len == 0 {
+        return Err(ReadCStrError::TooLong);
+    }
     match bootstrap_read_user_cstr(aspace, uaddr, max_len) {
         Ok(v) => Ok(v),
         Err(Errno::ENAMETOOLONG) => Err(ReadCStrError::TooLong),
-        // Other errnos collapse to TooLong defensively — the caller's
-        // Result shape only carries the "too long" axis. Production
-        // paths surface clean Done; the EFAULT fallback inside
-        // `bootstrap_read_user_cstr` covers test scaffolding pointers.
-        Err(_) => Err(ReadCStrError::TooLong),
+        Err(errno) => Err(ReadCStrError::Fault(errno)),
     }
 }
 
@@ -102,7 +103,9 @@ pub(super) fn read_user_cstr_vec(
         let cap = *byte_budget;
         let s = match read_user_cstr(aspace, ptr, cap) {
             Ok(s) => s,
-            Err(ReadCStrError::TooLong) => return Err(ReadVecError::TooBig),
+            Err(ReadCStrError::TooLong | ReadCStrError::Fault(_)) => {
+                return Err(ReadVecError::TooBig);
+            }
         };
         // Account `s.len() + 1` for the implicit NUL byte we read but
         // did not store, matching Linux's `ARG_MAX` accounting.

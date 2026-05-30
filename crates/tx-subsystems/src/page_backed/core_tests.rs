@@ -470,6 +470,48 @@ fn page_cache_index_install_if_match_replaces_or_withdraws_exact_frame() {
 }
 
 #[test]
+fn owned_frame_handoff_releases_temporary_owner_on_cache_drop() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let owned = reserve_frame_with_reclaim(ZeroPolicy::Zeroed)
+        .expect("reserve frame")
+        .commit();
+    let ppn = owned.ppn();
+
+    let cached = cached_frame_from_frame(Frame::from_owned(owned)).expect("cache handoff");
+
+    assert_eq!(cached.ppn, ppn);
+    let map_pin = page_allocator::acquire_map_pin(ppn).expect("cache keeps frame live");
+    drop(map_pin);
+    drop(cached);
+    assert!(page_allocator::acquire_map_pin(ppn).is_err());
+}
+
+#[test]
+fn reclaim_clean_file_pages_drops_clean_cache_entries() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(56), 4);
+    let cached = cached_frame_for_test();
+    let ppn = cached.ppn;
+    let page = PageIndex::new(1);
+
+    pc.state
+        .lock()
+        .pages
+        .install_if_absent(page, cached)
+        .expect("install clean page");
+
+    assert_eq!(pc.resident_pages(), 1);
+    let map_pin = page_allocator::acquire_map_pin(ppn).expect("cache keeps frame live");
+    drop(map_pin);
+    assert_eq!(pc.reclaim_clean_file_pages(1), 1);
+    assert_eq!(pc.resident_pages(), 0);
+    assert!(page_allocator::acquire_map_pin(ppn).is_err());
+}
+
+#[test]
 fn anon_page_container_materializes_once_and_tracks_dirty_writes() {
     setup_host_substrate();
     let pc = PageContainer::new(

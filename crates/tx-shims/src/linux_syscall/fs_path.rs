@@ -225,6 +225,7 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
@@ -343,6 +344,7 @@ pub(super) fn sys_fchownat<P: PmapIf>(
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() && flags & AT_EMPTY_PATH as i32 == 0 {
         return SyscallResult::Error(ENOENT_VALUE);
@@ -438,6 +440,7 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
     // Pick which uid/gid to check against per POSIX: `access(2)` and
@@ -557,6 +560,7 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);

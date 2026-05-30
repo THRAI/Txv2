@@ -20,8 +20,8 @@ use crate::process::structure::{
 use crate::process::topology::{
     ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers,
 };
-use crate::signal::{PendingSignalQueue, SigActionTable};
-use crate::thread_runtime::execution::set_thread_zombie;
+use crate::signal::{PendingSignalQueue, SigActionTable, SignalMask};
+use crate::thread_runtime::execution::{notify_thread_exit_userspace_in_aspace, set_thread_zombie};
 use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload, Tid};
 use crate::vfs::OpenFile;
 use crate::vm::{AddressSpace, VmMapError};
@@ -620,15 +620,23 @@ pub fn seed_child_leader_context(
     //     that stack); a zero `newsp` means "the child shares the
     //     parent's sp" (bare fork convention).
     //
-    //     Also seed the ABI frame pointer to the same value. Some libc
-    //     clone wrappers use fp-relative addressing in the post-syscall
-    //     path shared by parent and child. fp inherits the parent's
-    //     frame pointer from the trap context; if the child stack is
-    //     smaller, the fp-relative store/load can land outside the
-    //     child's allocation and turn into a userspace SIGSEGV.
+    //     On LoongArch64, musl's clone child path now explicitly clears
+    //     `$fp` before it starts consuming the new stack. Mirroring that
+    //     shape here avoids inheriting a parent frame chain into the child.
+    //
+    //     RV64 keeps the old "fp follows sp" workaround for now because the
+    //     current pthread regressions are LA-specific and we do not want to
+    //     perturb the working RV path.
     if stack != 0 {
         child_ctx.regs[STACK_REG_INDEX] = stack;
-        child_ctx.regs[FRAME_REG_INDEX] = stack;
+        #[cfg(target_arch = "loongarch64")]
+        {
+            child_ctx.regs[FRAME_REG_INDEX] = 0;
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            child_ctx.regs[FRAME_REG_INDEX] = stack;
+        }
     }
     // (4) PC already points past `ecall`: the trap shell
     // (`tx-kernel::trap_handoff::hand_off_syscall`) added the 4-byte
@@ -660,6 +668,7 @@ pub fn seed_child_leader_context(
 pub fn step_clone_thread(
     process: &Cap<ProcessIdentity>,
     parent_user_ctx: &UserTrapContext,
+    parent_signal_mask: SignalMask,
     stack: usize,
     tls: usize,
     ctid_ptr: u64,
@@ -673,6 +682,11 @@ pub fn step_clone_thread(
     let child = sign_thread(process.downgrade(), tid)?;
     register_tid(child.tid, child.clone());
     seed_child_leader_context(&child, parent_user_ctx, tls, stack);
+    if let Some(payload) = child.payload_cap() {
+        payload
+            .signal_mask
+            .store(parent_signal_mask.raw_bits(), Ordering::Release);
+    }
     if ctid_ptr != 0 {
         let payload = child
             .payload_cap()
@@ -715,8 +729,10 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
             crate::ipc::sysv_shm::execution::detach_all_for_aspace(&payload.aspace_cap());
         let closed_fds = payload.drain_fds();
         close_socket_files_for_process_exit(&closed_fds);
+        let aspace = payload.aspace_cap();
         let drained: Vec<Cap<ThreadIdentity>> = payload.threads.drain();
         for thread in &drained {
+            notify_thread_exit_userspace_in_aspace(thread, &aspace);
             set_thread_zombie(thread, status.wait_status_word());
             if thread.tid.0 != process.pid.0 {
                 unregister_pid_number(thread.tid.0 as u64);

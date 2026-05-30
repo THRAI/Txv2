@@ -16,6 +16,50 @@ use crate::thread_runtime::structure::{
 };
 // UserAccessIf trait not needed — copy_to_user is inherent on AddressSpace
 
+#[derive(Clone, Copy)]
+struct ThreadExitUserCleanup {
+    ctid: Option<u64>,
+    robust: Option<(u64, usize)>,
+}
+
+fn snapshot_thread_exit_user_cleanup(thread: &Cap<ThreadIdentity>) -> ThreadExitUserCleanup {
+    let payload_guard = thread.payload.lock();
+    let Some(payload) = payload_guard.as_ref() else {
+        return ThreadExitUserCleanup {
+            ctid: None,
+            robust: None,
+        };
+    };
+    let ctid = *payload.clear_child_tid.lock();
+    let robust = {
+        let head = *payload.robust_list_head.lock();
+        let len = *payload.robust_list_len.lock();
+        head.map(|h| (h, len))
+    };
+    ThreadExitUserCleanup { ctid, robust }
+}
+
+fn apply_thread_exit_user_cleanup(
+    aspace: &crate::vm::AddressSpace,
+    cleanup: ThreadExitUserCleanup,
+) {
+    let guard = crate::thread_runtime::adapter::step_engine::guard();
+    if let Some(ctid_ptr) = cleanup.ctid {
+        clear_and_wake_child_tid(aspace, ctid_ptr, &guard);
+    }
+    if let Some((head, len)) = cleanup.robust {
+        walk_robust_list_in_aspace(aspace, head, len, &guard);
+    }
+}
+
+pub(crate) fn notify_thread_exit_userspace_in_aspace(
+    thread: &Cap<ThreadIdentity>,
+    aspace: &crate::vm::AddressSpace,
+) {
+    let cleanup = snapshot_thread_exit_user_cleanup(thread);
+    apply_thread_exit_user_cleanup(aspace, cleanup);
+}
+
 /// Best-effort `MailboxEvent::SignalDelivered` post to a thread
 /// payload's bound mailbox per D9-A.
 ///
@@ -87,16 +131,7 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     let mut group_exit_completed = false;
     // Snapshot clear_child_tid and robust-list BEFORE
     // set_thread_zombie drops the thread payload.
-    let ctid = thread
-        .payload
-        .lock()
-        .as_ref()
-        .and_then(|p| *p.clear_child_tid.lock());
-    let robust = thread.payload.lock().as_ref().and_then(|p| {
-        let head = *p.robust_list_head.lock();
-        let len = *p.robust_list_len.lock();
-        head.map(|h| (h, len))
-    });
+    let exit_cleanup = snapshot_thread_exit_user_cleanup(&thread);
 
     // observe
     // upgrade
@@ -115,6 +150,7 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     let Some(payload) = payload_guard.as_ref() else {
         return;
     };
+    let aspace = payload.aspace_cap();
 
     payload.threads.retain(|t| t.key() != thread.key());
     let prev = payload
@@ -138,6 +174,12 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     let was_last = new_count == 0;
     drop(payload_guard);
 
+    // clear_child_tid and robust-list futex protocol must run while
+    // the exiting thread's address space is still available. In
+    // particular, the last thread cannot wait until step_process_exit
+    // drops the process payload.
+    apply_thread_exit_user_cleanup(&aspace, exit_cleanup);
+
     if was_last {
         // Thread side carries `i32` per `THREAD_RUNTIME_v1` §7.2;
         // the cascade promotes that to `ExitStatus::Exited` because
@@ -154,30 +196,6 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
         if let Some(payload) = parent.payload.lock().as_ref() {
             *payload.group_exit.lock() = None;
         }
-    }
-
-    // clear_child_tid futex protocol (CLONE_CHILD_CLEARTID).
-    // Linux semantics: atomically write 0 to *ctid, then
-    // FUTEX_WAKE on the same address. We do both best-effort —
-    // if the userspace page is unmapped, skip the write but
-    // still fire the wake (hash-bucket wake is unconditional).
-    if let Some(ctid_ptr) = ctid {
-        let guard = crate::thread_runtime::adapter::step_engine::guard();
-        // Zero the word at *ctid_ptr in userspace.
-        if let Some(proc) = thread.owner_proc.upgrade(&guard) {
-            if let Some(payload) = proc.payload.lock().as_ref() {
-                let aspace = payload.aspace_cap();
-                clear_and_wake_child_tid(&aspace, ctid_ptr, &guard);
-            }
-        }
-        drop(guard);
-    }
-
-    // robust-list walk: mark each robust futex as FUTEX_OWNER_DIED
-    // and issue FUTEX_WAKE. Best-effort — if the userspace pages
-    // are unmapped or the list is malformed, skip the entry.
-    if let Some((head, _len)) = robust {
-        walk_robust_list(&thread, head, 16);
     }
 
     if thread
@@ -212,24 +230,19 @@ fn clear_and_wake_child_tid(
 ///
 /// Walk the list plus `list_op_pending`. Malformed lists are bounded
 /// so a corrupt userspace pointer cannot trap the kernel in a loop.
-fn walk_robust_list(thread: &Cap<ThreadIdentity>, head: u64, _offset: u64) {
-    let guard = step_engine::guard();
-    let Some(proc) = thread.owner_proc.upgrade(&guard) else {
+fn walk_robust_list_in_aspace(
+    aspace: &crate::vm::AddressSpace,
+    head: u64,
+    _len: usize,
+    guard: &step_engine::Guard<'_>,
+) {
+    let Some(first) = read_user_u64(aspace, head, guard) else {
         return;
     };
-    let proc_guard = proc.payload.lock();
-    let Some(payload) = proc_guard.as_ref() else {
+    let Some(futex_offset) = read_user_i64(aspace, head + 8, guard) else {
         return;
     };
-    let aspace = payload.aspace_cap();
-
-    let Some(first) = read_user_u64(&aspace, head, &guard) else {
-        return;
-    };
-    let Some(futex_offset) = read_user_i64(&aspace, head + 8, &guard) else {
-        return;
-    };
-    let Some(pending) = read_user_u64(&aspace, head + 16, &guard) else {
+    let Some(pending) = read_user_u64(aspace, head + 16, guard) else {
         return;
     };
 
@@ -238,8 +251,8 @@ fn walk_robust_list(thread: &Cap<ThreadIdentity>, head: u64, _offset: u64) {
         if entry == 0 || entry == head {
             break;
         }
-        mark_robust_entry_owner_died(&aspace, entry, futex_offset, &guard);
-        let Some(next) = read_user_u64(&aspace, entry, &guard) else {
+        mark_robust_entry_owner_died(aspace, entry, futex_offset, guard);
+        let Some(next) = read_user_u64(aspace, entry, guard) else {
             break;
         };
         if next == entry {
@@ -249,10 +262,8 @@ fn walk_robust_list(thread: &Cap<ThreadIdentity>, head: u64, _offset: u64) {
     }
 
     if pending != 0 {
-        mark_robust_entry_owner_died(&aspace, pending, futex_offset, &guard);
+        mark_robust_entry_owner_died(aspace, pending, futex_offset, guard);
     }
-
-    drop(guard);
 }
 
 fn read_user_u64(

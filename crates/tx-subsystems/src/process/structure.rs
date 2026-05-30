@@ -204,10 +204,7 @@ impl step_engine::SubjectIdentity for ProcessIdentity {
     }
 
     fn thread_deliverable_signal_pending(thread: &Cap<Self::ThreadIdentity>) -> bool {
-        thread
-            .payload_cap()
-            .map(|payload| payload.interrupt_summary().deliverable_signal)
-            .unwrap_or(false)
+        crate::signal::select_next_signal(thread).is_some()
     }
 
     fn thread_termination_in_force(thread: &Cap<Self::ThreadIdentity>) -> bool {
@@ -1293,6 +1290,7 @@ pub struct ProcessPayload {
 impl Drop for ProcessPayload {
     fn drop(&mut self) {
         crate::wait_source::release_wait_channel(self.exit_source_id);
+        wait_routing::unregister_source(self.exit_source_id);
     }
 }
 

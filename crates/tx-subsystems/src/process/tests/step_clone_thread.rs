@@ -3,6 +3,7 @@
 use super::*;
 
 use crate::process::execution::step_clone_thread;
+use crate::signal::SignalMask;
 use crate::thread_runtime::step_thread_exit;
 use crate::thread_runtime::structure::ThreadIdentity;
 use tx_hal::UserTrapContext;
@@ -41,8 +42,8 @@ fn clone_thread_creates_sibling_in_same_process() {
     let tls: usize = 0x6000_0000;
     let ctid: u64 = 0x8000_0000;
 
-    let child =
-        step_clone_thread(&parent, &parent_ctx, stack, tls, ctid).expect("step_clone_thread");
+    let child = step_clone_thread(&parent, &parent_ctx, SignalMask::EMPTY, stack, tls, ctid)
+        .expect("step_clone_thread");
 
     // After: two threads.
     assert_eq!(parent.live_thread_count(), 2);
@@ -92,7 +93,8 @@ fn clone_thread_zero_ctid_is_no_op() {
     let parent = bootstrap();
     let parent_ctx = synthetic_parent_ctx();
 
-    let child = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("step_clone_thread");
+    let child = step_clone_thread(&parent, &parent_ctx, SignalMask::EMPTY, 0, 0, 0)
+        .expect("step_clone_thread");
 
     let ctid_stored = *child
         .payload_cap()
@@ -109,9 +111,9 @@ fn clone_thread_increments_thread_count() {
     let parent_ctx = synthetic_parent_ctx();
 
     assert_eq!(parent.live_thread_count(), 1);
-    let _t2 = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("t2");
+    let _t2 = step_clone_thread(&parent, &parent_ctx, SignalMask::EMPTY, 0, 0, 0).expect("t2");
     assert_eq!(parent.live_thread_count(), 2);
-    let _t3 = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("t3");
+    let _t3 = step_clone_thread(&parent, &parent_ctx, SignalMask::EMPTY, 0, 0, 0).expect("t3");
     assert_eq!(parent.live_thread_count(), 3);
 }
 
@@ -121,8 +123,8 @@ fn clone_thread_children_appear_in_thread_snapshot() {
     let parent = bootstrap();
     let parent_ctx = synthetic_parent_ctx();
 
-    let t2 = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("t2");
-    let t3 = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("t3");
+    let t2 = step_clone_thread(&parent, &parent_ctx, SignalMask::EMPTY, 0, 0, 0).expect("t2");
+    let t3 = step_clone_thread(&parent, &parent_ctx, SignalMask::EMPTY, 0, 0, 0).expect("t3");
 
     let snapshot = {
         let pg = parent.payload.lock();
@@ -142,7 +144,8 @@ fn clone_thread_preserves_parent_pc_and_status() {
     let parent = bootstrap();
     let parent_ctx = synthetic_parent_ctx();
 
-    let child = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("step_clone_thread");
+    let child = step_clone_thread(&parent, &parent_ctx, SignalMask::EMPTY, 0, 0, 0)
+        .expect("step_clone_thread");
 
     let saved = child
         .payload_cap()
@@ -160,7 +163,8 @@ fn clone_thread_zero_stack_inherits_parent_sp() {
     let parent = bootstrap();
     let parent_ctx = synthetic_parent_ctx();
 
-    let child = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("step_clone_thread");
+    let child = step_clone_thread(&parent, &parent_ctx, SignalMask::EMPTY, 0, 0, 0)
+        .expect("step_clone_thread");
 
     let saved = child
         .payload_cap()
@@ -181,7 +185,8 @@ fn clone_thread_zero_tls_inherits_parent_tp() {
     let parent = bootstrap();
     let parent_ctx = synthetic_parent_ctx();
 
-    let child = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("step_clone_thread");
+    let child = step_clone_thread(&parent, &parent_ctx, SignalMask::EMPTY, 0, 0, 0)
+        .expect("step_clone_thread");
 
     let saved = child
         .payload_cap()
@@ -197,11 +202,33 @@ fn clone_thread_zero_tls_inherits_parent_tp() {
 }
 
 #[test]
+fn clone_thread_inherits_parent_signal_mask() {
+    let _g = setup();
+    let parent = bootstrap();
+    let parent_ctx = synthetic_parent_ctx();
+    let inherited_mask = SignalMask::new((1u64 << (2 - 1)) | (1u64 << (17 - 1)));
+
+    let child = step_clone_thread(&parent, &parent_ctx, inherited_mask, 0, 0, 0)
+        .expect("step_clone_thread");
+
+    let child_mask = child
+        .payload_cap()
+        .expect("fresh child has payload")
+        .signal_mask();
+    assert_eq!(
+        child_mask.raw_bits(),
+        inherited_mask.raw_bits(),
+        "clone thread must inherit the caller's blocked-signal mask"
+    );
+}
+
+#[test]
 fn ordinary_thread_exit_decrements_live_thread_count() {
     let _g = setup();
     let parent = bootstrap();
     let parent_ctx = synthetic_parent_ctx();
-    let child = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("step_clone_thread");
+    let child = step_clone_thread(&parent, &parent_ctx, SignalMask::EMPTY, 0, 0, 0)
+        .expect("step_clone_thread");
 
     assert_eq!(parent.live_thread_count(), 2);
 
@@ -220,7 +247,8 @@ fn exec_group_collapse_keeps_initiator_and_clears_episode() {
     let parent = bootstrap();
     let leader = first_thread(&parent);
     let parent_ctx = synthetic_parent_ctx();
-    let sibling = step_clone_thread(&parent, &parent_ctx, 0, 0, 0).expect("step_clone_thread");
+    let sibling = step_clone_thread(&parent, &parent_ctx, SignalMask::EMPTY, 0, 0, 0)
+        .expect("step_clone_thread");
 
     let collapsed = parent
         .collapse_threads_for_exec(&leader)

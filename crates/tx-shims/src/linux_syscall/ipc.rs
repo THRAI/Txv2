@@ -2,7 +2,7 @@
 
 use super::{
     bootstrap_copy_from_user, bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user,
-    errno_to_i32, read_user_cstr, SyscallCtx, SyscallResult, EBADF_VALUE, EFAULT_VALUE,
+    errno_to_i32, read_user_cstr, ReadCStrError, SyscallCtx, SyscallResult, EBADF_VALUE, EFAULT_VALUE,
     EINVAL_VALUE, ENAMETOOLONG_VALUE, ENOENT_VALUE, ENOMEM_VALUE, ENOSYS_VALUE, O_ACCMODE,
     O_CLOEXEC, O_CREAT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
 };
@@ -195,7 +195,8 @@ fn read_mq_name(ctx: &SyscallCtx<'_>, name_ptr: u64) -> Result<Vec<u8>, SyscallR
     }
     let name = match read_user_cstr(&ctx.aspace, name_ptr, MQ_NAME_MAX + 1) {
         Ok(name) => name,
-        Err(_) => return Err(SyscallResult::Error(ENAMETOOLONG_VALUE)),
+        Err(ReadCStrError::TooLong) => return Err(SyscallResult::Error(ENAMETOOLONG_VALUE)),
+        Err(ReadCStrError::Fault(errno)) => return Err(SyscallResult::error_from(errno)),
     };
     if name.is_empty() || name.contains(&b'/') {
         return Err(SyscallResult::Error(ENOENT_VALUE));

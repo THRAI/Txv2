@@ -51,7 +51,8 @@ use tx_subsystems::device::{self, BlockDeviceHandle, DevT};
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::{
-    AnonSwapPolicy, Frame, FsPageBacking, PageContainer, PageContainerKind,
+    reserve_frame_with_reclaim, AnonSwapPolicy, Frame, FsPageBacking, PageContainer,
+    PageContainerKind,
 };
 use tx_subsystems::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, RNode, RNodeBacking,
@@ -556,12 +557,7 @@ impl FsPageBacking for BdevFsMountPayload {
                     return StepOutcome::err(Errno::EIO);
                 }
             }
-            let _cache_pin = match owned.try_cache_pin() {
-                Ok(p) => p,
-                Err(_) => return StepOutcome::err(Errno::ENOMEM),
-            };
-            drop(owned);
-            StepOutcome::done(frames[0])
+            StepOutcome::done(Frame::from_owned(owned))
         } else {
             let target_owned = match allocate_owned_page() {
                 Some(f) => f,
@@ -611,12 +607,7 @@ impl FsPageBacking for BdevFsMountPayload {
                 drop(temp_owned);
             }
 
-            let _cache_pin = match target_owned.try_cache_pin() {
-                Ok(p) => p,
-                Err(_) => return StepOutcome::err(Errno::ENOMEM),
-            };
-            let target_frame = Frame::new(target_ppn);
-            drop(target_owned);
+            let target_frame = Frame::from_owned(target_owned);
             StepOutcome::done(target_frame)
         }
     }
@@ -652,7 +643,7 @@ impl FsPageBacking for BdevFsMountPayload {
         }
 
         if blocks_per_page == 1 {
-            let frames = [*frame];
+            let frames = [Frame::new(frame.ppn())];
             match handle.write_blocks(start_lba, &frames, guard) {
                 StepOutcome::Done(()) => StepOutcome::done(()),
                 StepOutcome::Err(e) => StepOutcome::err(e),
@@ -1022,12 +1013,7 @@ impl FsPageBacking for BdevFs {
                     return StepOutcome::err(Errno::EIO);
                 }
             }
-            let _cache_pin = match owned.try_cache_pin() {
-                Ok(p) => p,
-                Err(_) => return StepOutcome::err(Errno::ENOMEM),
-            };
-            drop(owned);
-            StepOutcome::done(frames[0])
+            StepOutcome::done(Frame::from_owned(owned))
         } else {
             let target_owned = match allocate_owned_page() {
                 Some(f) => f,
@@ -1077,12 +1063,7 @@ impl FsPageBacking for BdevFs {
                 drop(temp_owned);
             }
 
-            let _cache_pin = match target_owned.try_cache_pin() {
-                Ok(p) => p,
-                Err(_) => return StepOutcome::err(Errno::ENOMEM),
-            };
-            let target_frame = Frame::new(target_ppn);
-            drop(target_owned);
+            let target_frame = Frame::from_owned(target_owned);
             StepOutcome::done(target_frame)
         }
     }
@@ -1118,7 +1099,7 @@ impl FsPageBacking for BdevFs {
         }
 
         if blocks_per_page == 1 {
-            let frames = [*frame];
+            let frames = [Frame::new(frame.ppn())];
             match handle.write_blocks(start_lba, &frames, guard) {
                 StepOutcome::Done(()) => StepOutcome::done(()),
                 StepOutcome::Err(e) => StepOutcome::err(e),
@@ -1217,13 +1198,7 @@ fn allocate_zeroed_page() -> StepOutcome<Frame, NoProgress> {
         Some(f) => f,
         None => return StepOutcome::err(Errno::ENOMEM),
     };
-    let ppn = owned.ppn();
-    let _pin = match owned.try_cache_pin() {
-        Ok(p) => p,
-        Err(_) => return StepOutcome::err(Errno::ENOMEM),
-    };
-    drop(owned);
-    StepOutcome::done(Frame::new(ppn))
+    StepOutcome::done(Frame::from_owned(owned))
 }
 
 fn allocate_owned_page() -> Option<
@@ -1232,7 +1207,7 @@ fn allocate_owned_page() -> Option<
         tx_substrate::page_allocator::BitmapPageAllocator<'static>,
     >,
 > {
-    page_allocator::reserve_frame(ZeroPolicy::Zeroed)
+    reserve_frame_with_reclaim(ZeroPolicy::Zeroed)
         .ok()
         .map(|r| r.commit())
 }

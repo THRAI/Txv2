@@ -356,6 +356,7 @@ fn take_matching_pending_signal(ctx: &SyscallCtx<'_>, wait_bits: u64) -> Option<
     let thread_match = thread_payload.pending().snapshot() & wait_bits;
     if let Some(sig) = lowest_sigtimedwait_bit(thread_match) {
         thread_payload.pending().clear(sig);
+        tx_subsystems::signal::refresh_deliverable_signal_summary(&ctx.thread);
         return Some(sig);
     }
 
@@ -363,6 +364,7 @@ fn take_matching_pending_signal(ctx: &SyscallCtx<'_>, wait_bits: u64) -> Option<
     let group_match = proc_payload.group_pending().snapshot() & wait_bits;
     let sig = lowest_sigtimedwait_bit(group_match)?;
     proc_payload.group_pending().clear(sig);
+    tx_subsystems::signal::refresh_deliverable_signal_summary(&ctx.thread);
     Some(sig)
 }
 

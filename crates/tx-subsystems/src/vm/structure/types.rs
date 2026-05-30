@@ -1229,7 +1229,8 @@ fn materialize_zero_frame() -> Result<MaterializedPage, VmFaultError> {
 }
 
 fn allocate_private_materialized_page(dirty: bool) -> Result<MaterializedPage, VmFaultError> {
-    let frame = page_allocator::reserve_frame(ZeroPolicy::Zeroed)
+    crate::page_backed::reclaim_clean_file_pages_if_low();
+    let frame = crate::page_backed::reserve_frame_with_reclaim(ZeroPolicy::Zeroed)
         .map_err(page_alloc_error)?
         .commit();
     let ppn = frame.ppn();
@@ -1251,7 +1252,8 @@ fn allocate_private_materialized_page(dirty: bool) -> Result<MaterializedPage, V
 fn allocate_private_materialized_page_unzeroed(
     dirty: bool,
 ) -> Result<MaterializedPage, VmFaultError> {
-    let frame = page_allocator::reserve_frame(ZeroPolicy::UninitFullOverwrite)
+    crate::page_backed::reclaim_clean_file_pages_if_low();
+    let frame = crate::page_backed::reserve_frame_with_reclaim(ZeroPolicy::UninitFullOverwrite)
         .map_err(page_alloc_error)?
         .commit();
     let ppn = frame.ppn();
@@ -1269,8 +1271,11 @@ fn allocate_private_materialized_page_from_source(
     source: tx_hal::Ppn,
     dirty: bool,
 ) -> Result<MaterializedPage, VmFaultError> {
-    let reservation =
-        page_allocator::reserve_frame(ZeroPolicy::UninitFullOverwrite).map_err(page_alloc_error)?;
+    crate::page_backed::reclaim_clean_file_pages_if_low();
+    let reservation = crate::page_backed::reserve_frame_with_reclaim(
+        ZeroPolicy::UninitFullOverwrite,
+    )
+    .map_err(page_alloc_error)?;
     page_allocator::copy_frame_contents(source, reservation.ppn()).map_err(page_alloc_error)?;
     let frame = reservation.commit();
     let ppn = frame.ppn();
