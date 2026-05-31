@@ -117,6 +117,7 @@ static GETLINK_DUMP_TEMPLATE_CACHE: SpinMutex<Vec<GetlinkDumpTemplateCacheEntry>
 const GETADDR_DUMP_TEMPLATE_CACHE_LIMIT: usize = 16;
 static GETADDR_DUMP_TEMPLATE_CACHE: SpinMutex<Vec<GetaddrDumpTemplateCacheEntry>> =
     SpinMutex::new(Vec::new());
+const NETLINK_ROUTE_INLINE_RESPONSE_MAX: usize = 192;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NetlinkRouteState;
@@ -133,8 +134,76 @@ struct GetaddrDumpTemplateCacheEntry {
     template: Vec<u8>,
 }
 
+#[derive(Clone)]
+pub struct NetlinkRoutePacket {
+    inner: NetlinkRoutePacketInner,
+}
+
+#[derive(Clone)]
+enum NetlinkRoutePacketInner {
+    Inline {
+        len: usize,
+        bytes: [u8; NETLINK_ROUTE_INLINE_RESPONSE_MAX],
+    },
+    Heap(Vec<u8>),
+}
+
+impl NetlinkRoutePacket {
+    fn from_vec(bytes: Vec<u8>) -> Self {
+        if bytes.len() <= NETLINK_ROUTE_INLINE_RESPONSE_MAX {
+            let mut inline = [0u8; NETLINK_ROUTE_INLINE_RESPONSE_MAX];
+            inline[..bytes.len()].copy_from_slice(&bytes);
+            Self {
+                inner: NetlinkRoutePacketInner::Inline {
+                    len: bytes.len(),
+                    bytes: inline,
+                },
+            }
+        } else {
+            Self {
+                inner: NetlinkRoutePacketInner::Heap(bytes),
+            }
+        }
+    }
+
+    fn from_template_patched(template: &[u8], seq: u32, pid: u32) -> Self {
+        if template.len() <= NETLINK_ROUTE_INLINE_RESPONSE_MAX {
+            let mut inline = [0u8; NETLINK_ROUTE_INLINE_RESPONSE_MAX];
+            inline[..template.len()].copy_from_slice(template);
+            patch_dump_seq_pid(&mut inline[..template.len()], seq, pid);
+            Self {
+                inner: NetlinkRoutePacketInner::Inline {
+                    len: template.len(),
+                    bytes: inline,
+                },
+            }
+        } else {
+            let mut out = template.to_vec();
+            patch_dump_seq_pid(&mut out, seq, pid);
+            Self {
+                inner: NetlinkRoutePacketInner::Heap(out),
+            }
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match &self.inner {
+            NetlinkRoutePacketInner::Inline { len, bytes } => &bytes[..*len],
+            NetlinkRoutePacketInner::Heap(bytes) => bytes,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 pub struct RawNetlinkRouteSocket {
-    rx: SpinMutex<VecDeque<Vec<u8>>>,
+    rx: SpinMutex<VecDeque<NetlinkRoutePacket>>,
 }
 
 impl Default for RawNetlinkRouteSocket {
@@ -151,10 +220,20 @@ impl RawNetlinkRouteSocket {
     }
 
     pub fn queue_response(&self, bytes: Vec<u8>) {
-        self.rx.lock().push_back(bytes);
+        self.rx
+            .lock()
+            .push_back(NetlinkRoutePacket::from_vec(bytes));
     }
 
-    pub fn pop_response(&self, peek: bool) -> Option<Vec<u8>> {
+    fn queue_response_from_template(&self, template: &[u8], seq: u32, pid: u32) {
+        self.rx
+            .lock()
+            .push_back(NetlinkRoutePacket::from_template_patched(
+                template, seq, pid,
+            ));
+    }
+
+    pub fn pop_response(&self, peek: bool) -> Option<NetlinkRoutePacket> {
         let mut rx = self.rx.lock();
         if peek {
             rx.front().cloned()
@@ -174,7 +253,7 @@ impl RawNetlinkRouteSocket {
     }
 
     pub fn recv_available(&self) -> usize {
-        self.rx.lock().front().map_or(0, Vec::len)
+        self.rx.lock().front().map_or(0, NetlinkRoutePacket::len)
     }
 
     pub const fn send_available(&self) -> usize {
@@ -236,8 +315,7 @@ where
         .raw_netlink_route_socket()
         .ok_or(Errno::EOPNOTSUPP)?;
 
-    if let Some(response) = try_render_fast_dump(&payload.net_namespace(), bytes) {
-        raw.queue_response(response);
+    if try_queue_fast_dump(raw, &payload.net_namespace(), bytes) {
         payload.refresh_io_from_raw();
         socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
         return Ok(bytes.len());
@@ -276,7 +354,7 @@ pub fn netlink_route_recv(
 ) -> Result<usize, Errno> {
     let response = netlink_route_recv_packet(socket, flags)?;
     let copied = core::cmp::min(out.len(), response.len());
-    out[..copied].copy_from_slice(&response[..copied]);
+    out[..copied].copy_from_slice(&response.as_slice()[..copied]);
     let reported = if flags.contains(SendRecvFlags::MSG_TRUNC) {
         response.len()
     } else {
@@ -288,7 +366,7 @@ pub fn netlink_route_recv(
 pub fn netlink_route_recv_packet(
     socket: &Cap<SocketIdentity>,
     flags: SendRecvFlags,
-) -> Result<Vec<u8>, Errno> {
+) -> Result<NetlinkRoutePacket, Errno> {
     if socket.kind != SocketKind::NetlinkRoute {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -508,15 +586,27 @@ fn render_getlink_dump(netns: &NetNamespacePayload, header: NlMsgHeader) -> Vec<
     out
 }
 
-fn try_render_fast_dump(netns: &NetNamespacePayload, request: &[u8]) -> Option<Vec<u8>> {
-    let header = parse_single_nlmsg_header(request)?;
+fn try_queue_fast_dump(
+    raw: &RawNetlinkRouteSocket,
+    netns: &NetNamespacePayload,
+    request: &[u8],
+) -> bool {
+    let Some(header) = parse_single_nlmsg_header(request) else {
+        return false;
+    };
     if header.flags & NLM_F_DUMP != NLM_F_DUMP {
-        return None;
+        return false;
     }
     match header.kind {
-        RTM_GETLINK => Some(render_getlink_dump_cached_combined(netns, header)),
-        RTM_GETADDR => Some(render_getaddr_dump_cached_combined(netns, header)),
-        _ => None,
+        RTM_GETLINK => {
+            queue_getlink_dump_cached_combined(raw, netns, header);
+            true
+        }
+        RTM_GETADDR => {
+            queue_getaddr_dump_cached_combined(raw, netns, header);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -532,32 +622,25 @@ fn parse_single_nlmsg_header(request: &[u8]) -> Option<NlMsgHeader> {
     Some(header)
 }
 
-fn render_getlink_dump_cached_combined(
+fn queue_getlink_dump_cached_combined(
+    raw: &RawNetlinkRouteSocket,
     netns: &NetNamespacePayload,
     header: NlMsgHeader,
-) -> Vec<u8> {
+) {
     let netns_key = netns as *const NetNamespacePayload as usize;
     let generation = netns.link_snapshot_generation();
-    let template = cached_getlink_dump_template(netns_key, generation).unwrap_or_else(|| {
-        let template = build_getlink_dump_template(netns);
-        store_getlink_dump_template(netns_key, generation, template.clone());
-        template
-    });
-    let mut out = template;
-    patch_dump_seq_pid(&mut out, header.seq, header.pid);
-    out
-}
-
-fn cached_getlink_dump_template(netns_key: usize, generation: u64) -> Option<Vec<u8>> {
-    GETLINK_DUMP_TEMPLATE_CACHE
-        .lock()
+    let mut cache = GETLINK_DUMP_TEMPLATE_CACHE.lock();
+    if let Some(entry) = cache
         .iter()
         .find(|entry| entry.netns_key == netns_key && entry.generation == generation)
-        .map(|entry| entry.template.clone())
-}
+    {
+        raw.queue_response_from_template(&entry.template, header.seq, header.pid);
+        return;
+    }
 
-fn store_getlink_dump_template(netns_key: usize, generation: u64, template: Vec<u8>) {
-    let mut cache = GETLINK_DUMP_TEMPLATE_CACHE.lock();
+    let template = build_getlink_dump_template(netns);
+    raw.queue_response_from_template(&template, header.seq, header.pid);
+
     if let Some(entry) = cache.iter_mut().find(|entry| entry.netns_key == netns_key) {
         entry.generation = generation;
         entry.template = template;
@@ -613,32 +696,25 @@ fn render_getaddr_dump(netns: &NetNamespacePayload, header: NlMsgHeader) -> Vec<
     out
 }
 
-fn render_getaddr_dump_cached_combined(
+fn queue_getaddr_dump_cached_combined(
+    raw: &RawNetlinkRouteSocket,
     netns: &NetNamespacePayload,
     header: NlMsgHeader,
-) -> Vec<u8> {
+) {
     let netns_key = netns as *const NetNamespacePayload as usize;
     let generation = netns.link_snapshot_generation();
-    let template = cached_getaddr_dump_template(netns_key, generation).unwrap_or_else(|| {
-        let template = build_getaddr_dump_template(netns);
-        store_getaddr_dump_template(netns_key, generation, template.clone());
-        template
-    });
-    let mut out = template;
-    patch_dump_seq_pid(&mut out, header.seq, header.pid);
-    out
-}
-
-fn cached_getaddr_dump_template(netns_key: usize, generation: u64) -> Option<Vec<u8>> {
-    GETADDR_DUMP_TEMPLATE_CACHE
-        .lock()
+    let mut cache = GETADDR_DUMP_TEMPLATE_CACHE.lock();
+    if let Some(entry) = cache
         .iter()
         .find(|entry| entry.netns_key == netns_key && entry.generation == generation)
-        .map(|entry| entry.template.clone())
-}
+    {
+        raw.queue_response_from_template(&entry.template, header.seq, header.pid);
+        return;
+    }
 
-fn store_getaddr_dump_template(netns_key: usize, generation: u64, template: Vec<u8>) {
-    let mut cache = GETADDR_DUMP_TEMPLATE_CACHE.lock();
+    let template = build_getaddr_dump_template(netns);
+    raw.queue_response_from_template(&template, header.seq, header.pid);
+
     if let Some(entry) = cache.iter_mut().find(|entry| entry.netns_key == netns_key) {
         entry.generation = generation;
         entry.template = template;

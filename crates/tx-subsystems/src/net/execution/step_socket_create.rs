@@ -3,7 +3,7 @@ use tx_substrate::zone::{self, Cap, PayloadCap};
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::structure::{
-    SocketIdentity, SocketKind, SocketOptionSet, SocketPayload, ValidSocketType,
+    ProtocolNumber, SocketIdentity, SocketKind, SocketOptionSet, SocketPayload, ValidSocketType,
 };
 
 pub fn step_socket_create(
@@ -66,6 +66,13 @@ pub fn step_socket_create_in_namespace(
             .is_err()
     {
         return StepOutcome::Err(Errno::ENOMEM);
+    }
+    if kind == SocketKind::RawIcmp
+        && payload
+            .set_raw_icmp_protocol(ProtocolNumber(valid.protocol))
+            .is_err()
+    {
+        return StepOutcome::Err(Errno::EINVAL);
     }
     if kind == SocketKind::Packet {
         let protocol =

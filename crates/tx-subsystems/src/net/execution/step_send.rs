@@ -5,11 +5,11 @@ use crate::execution::{Errno, Guard};
 use crate::net::checks::require::require_socket_write_target;
 use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::{socket_send_wait_token, yield_bytes_on_token, ByteStepOutcome};
-use crate::net::protocol::UDP_IPV4_MAX_PAYLOAD_BYTES;
+use crate::net::protocol::{RawIpv6Packet, UDP_IPV4_MAX_PAYLOAD_BYTES};
 use crate::net::structure::{
-    ConnectionKey, IpEndpoint, RdsState, RecvWireSet, SendRecvFlags, SendWireSet, SocketIdentity,
-    SocketKind, SocketPayload, SocketProtocol, TcpState, UnixDatagramState, UnixSocketPath,
-    UnixStreamState,
+    AddressFamily, ConnectionKey, IpEndpoint, Ipv6Address, ProtocolNumber, RdsState, RecvWireSet,
+    SendRecvFlags, SendWireSet, SocketIdentity, SocketKind, SocketPayload, SocketProtocol,
+    TcpState, UnixDatagramState, UnixSocketPath, UnixStreamState,
 };
 
 pub fn step_send(
@@ -237,6 +237,9 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
     if bytes.is_empty() {
         return StepOutcome::Done(0);
     }
+    if socket.kind == SocketKind::RawIcmp && payload.family() == AddressFamily::Inet6 {
+        return send_raw_ipv6_loopback(socket, &payload, dst, bytes, guard);
+    }
     if socket.kind == SocketKind::UnixStream {
         return send_unix_stream_bytes(socket, &payload, bytes, guard);
     }
@@ -455,6 +458,95 @@ fn send_rds_packet(
         target.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
     StepOutcome::Done(bytes.len())
+}
+
+fn send_raw_ipv6_loopback(
+    _socket: &Cap<SocketIdentity>,
+    payload: &SocketPayload,
+    dst: Option<IpEndpoint>,
+    bytes: &[u8],
+    guard: &Guard<'_>,
+) -> ByteStepOutcome<usize> {
+    let Some(destination) = dst else {
+        return StepOutcome::Err(Errno::EDESTADDRREQ);
+    };
+    if destination.family != AddressFamily::Inet6 {
+        return StepOutcome::Err(Errno::EAFNOSUPPORT);
+    }
+    if !destination.is_loopback() && !destination.is_unspecified() {
+        return StepOutcome::Err(Errno::EOPNOTSUPP);
+    }
+
+    let checksum_offset = payload.with_options(|options| options.ip.ipv6_checksum);
+    if checksum_offset >= 0 {
+        let offset = checksum_offset as usize;
+        if offset.checked_add(2).is_none_or(|end| end > bytes.len()) {
+            return StepOutcome::Err(Errno::EINVAL);
+        }
+    }
+
+    let protocol = payload.raw_icmp_protocol().unwrap_or(ProtocolNumber(58));
+    let dst_addr = if destination.addr6.is_unspecified() {
+        Ipv6Address::LOOPBACK
+    } else {
+        destination.addr6
+    };
+    let src_addr = payload
+        .raw_icmp_bound_local6()
+        .filter(|addr| !addr.is_unspecified())
+        .unwrap_or(Ipv6Address::LOOPBACK);
+    let packet = RawIpv6Packet {
+        src: src_addr,
+        dst: dst_addr,
+        next_header: protocol,
+        payload: bytes.to_vec(),
+    };
+
+    for target in payload.socket_table().snapshot_raw_icmp(guard) {
+        if target.kind != SocketKind::RawIcmp {
+            continue;
+        }
+        let Some(target_payload) = target.acquire_operational() else {
+            continue;
+        };
+        if target_payload.family() != AddressFamily::Inet6 {
+            continue;
+        }
+        if target_payload.raw_icmp_protocol() != Some(protocol) {
+            continue;
+        }
+        let accepts_destination = target_payload
+            .raw_icmp_bound_local6()
+            .is_none_or(|local| local.is_unspecified() || local == dst_addr);
+        if !accepts_destination {
+            continue;
+        }
+        if protocol == ProtocolNumber(58)
+            && !icmp6_filter_accepts(
+                target_payload.raw_icmp6_filter().unwrap_or([0; 8]),
+                bytes.first().copied(),
+            )
+        {
+            continue;
+        }
+        if target_payload.record_raw_ipv6_packet(packet.clone()) {
+            target.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        }
+    }
+
+    StepOutcome::Done(bytes.len())
+}
+
+fn icmp6_filter_accepts(filter: [u32; 8], packet_type: Option<u8>) -> bool {
+    let Some(packet_type) = packet_type else {
+        return true;
+    };
+    let bit = packet_type as usize;
+    let word = bit / 32;
+    let shift = bit % 32;
+    filter
+        .get(word)
+        .is_none_or(|word| (word & (1u32 << shift)) == 0)
 }
 
 fn send_unix_stream_bytes(

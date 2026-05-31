@@ -249,7 +249,9 @@ fn raw_icmp_bind_records_local_addr_without_port() {
             .protocol_snapshot(),
         SocketProtocol::RawIcmp(RawIcmpState {
             bound_local: Some(Ipv4Address::LOOPBACK),
+            bound_local6: None,
             protocol: ProtocolNumber(1),
+            icmp6_filter: [0; 8],
         })
     );
 }

@@ -47,7 +47,6 @@ pub fn step_bind(
         return StepOutcome::Err(table_error_to_errno(error));
     }
 
-    let mut raw_icmp_wrong_family = false;
     let bound = payload.with_protocol_mut(|protocol| match protocol {
         SocketProtocol::UnixDatagram(UnixDatagramState::Unbound) => {
             if let KernelSockAddr::Unix(local) = witness.addr {
@@ -89,19 +88,29 @@ pub fn step_bind(
             });
             true
         }
-        SocketProtocol::RawIcmp(state) if state.bound_local.is_none() => {
-            if witness.local.family != crate::net::structure::AddressFamily::Inet {
-                raw_icmp_wrong_family = true;
-                return false;
+        SocketProtocol::RawIcmp(state) => match witness.local.family {
+            crate::net::structure::AddressFamily::Inet
+                if state
+                    .bound_local
+                    .is_none_or(|local| local == witness.local.addr) =>
+            {
+                state.bound_local = Some(witness.local.addr);
+                true
             }
-            state.bound_local = Some(witness.local.addr);
-            true
-        }
+            crate::net::structure::AddressFamily::Inet6
+                if state
+                    .bound_local6
+                    .is_none_or(|local| local == witness.local.addr6) =>
+            {
+                state.bound_local6 = Some(witness.local.addr6);
+                true
+            }
+            crate::net::structure::AddressFamily::Inet
+            | crate::net::structure::AddressFamily::Inet6 => false,
+            _ => false,
+        },
         _ => false,
     });
-    if raw_icmp_wrong_family {
-        return StepOutcome::Err(Errno::EAFNOSUPPORT);
-    }
     if bound {
         StepOutcome::Done(())
     } else {

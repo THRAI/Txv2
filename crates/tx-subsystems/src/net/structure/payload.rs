@@ -13,15 +13,15 @@ use crate::net::structure::SocketTable;
 use crate::sync::SpinMutex;
 
 use super::super::protocol::{
-    parse_icmpv4_payload, Icmpv4EchoPacket, Icmpv4Event, RawIcmpSocket, RawTcpSocket, RawUdpSocket,
-    UdpTxDatagram,
+    parse_icmpv4_payload, Icmpv4EchoPacket, Icmpv4Event, RawIcmpSocket, RawIpAddress,
+    RawIpv6Packet, RawTcpSocket, RawUdpSocket, UdpTxDatagram,
 };
 use super::identity::SocketIdentity;
 use super::multicast::{Ipv4MulticastGroup, Ipv4MulticastMemberships};
 use super::types::{
-    AddressFamily, IpEndpoint, Ipv4Address, PacketSocketState, ProtocolNumber, RawIcmpState,
-    RdsState, SockAddrLl, SockShutdownCmd, SocketKind, SocketOptionSet, TcpState, UdpInner,
-    UnixSocketPath,
+    AddressFamily, IpEndpoint, Ipv4Address, Ipv6Address, PacketSocketState, ProtocolNumber,
+    RawIcmpState, RdsState, SockAddrLl, SockShutdownCmd, SocketKind, SocketOptionSet, TcpState,
+    UdpInner, UnixSocketPath,
 };
 
 pub type SocketOperationalEvidence = PayloadCap<SocketPayload>;
@@ -593,12 +593,20 @@ impl SocketPayload {
                 }
             }
             (None, None, Some(raw_icmp), None, None, None) => {
-                let drain = raw_icmp.recv_echo_reply_bytes(out, peek)?;
+                let drain = raw_icmp.recv_bytes(out, peek)?;
+                let source = match drain.source {
+                    RawIpAddress::V4(addr) => IpEndpoint::new(addr, 0),
+                    RawIpAddress::V6(addr) => IpEndpoint::new_v6(addr, 0),
+                };
+                let destination = match drain.destination {
+                    RawIpAddress::V4(addr) => IpEndpoint::new(addr, 0),
+                    RawIpAddress::V6(addr) => IpEndpoint::new_v6(addr, 0),
+                };
                 SocketRecvBytesOutcome {
                     bytes: drain.bytes,
-                    source: Some(IpEndpoint::new(drain.source, 0)),
+                    source: Some(source),
                     unix_source: None,
-                    destination: Some(IpEndpoint::new(drain.destination, 0)),
+                    destination: Some(destination),
                     truncated: drain.truncated,
                     became_empty: drain.became_empty,
                 }
@@ -759,6 +767,9 @@ impl SocketPayload {
                         Some(dst) => dst,
                         None => return Err(crate::execution::Errno::EDESTADDRREQ),
                     };
+                    if dst.family != AddressFamily::Inet {
+                        return Err(crate::execution::Errno::EAFNOSUPPORT);
+                    }
                     let local = self.raw_icmp_bound_local().unwrap_or(Ipv4Address::LOOPBACK);
                     let packet = match parse_icmpv4_payload(local, dst.addr, bytes) {
                         Icmpv4Event::EchoRequest(packet) | Icmpv4Event::EchoReply(packet) => packet,
@@ -833,6 +844,63 @@ impl SocketPayload {
             .is_some_and(|raw_icmp| raw_icmp.ingest_rx_echo_reply(packet));
         self.refresh_io_from_raw();
         became_readable
+    }
+
+    pub(crate) fn record_raw_ipv6_packet(&self, packet: RawIpv6Packet) -> bool {
+        let became_readable = self
+            .raw_icmp
+            .as_ref()
+            .is_some_and(|raw_icmp| raw_icmp.ingest_rx_ipv6_packet(packet));
+        self.refresh_io_from_raw();
+        became_readable
+    }
+
+    pub(crate) fn set_raw_icmp_protocol(
+        &self,
+        protocol: ProtocolNumber,
+    ) -> Result<(), crate::execution::Errno> {
+        self.with_protocol_mut(|socket_protocol| match socket_protocol {
+            SocketProtocol::RawIcmp(state) => {
+                state.protocol = protocol;
+                true
+            }
+            _ => false,
+        })
+        .then_some(())
+        .ok_or(crate::execution::Errno::EINVAL)
+    }
+
+    pub fn raw_icmp_protocol(&self) -> Option<ProtocolNumber> {
+        match &*self.protocol.lock() {
+            SocketProtocol::RawIcmp(state) => Some(state.protocol),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn raw_icmp_bound_local6(&self) -> Option<Ipv6Address> {
+        match &*self.protocol.lock() {
+            SocketProtocol::RawIcmp(state) => state.bound_local6,
+            _ => None,
+        }
+    }
+
+    pub fn raw_icmp6_filter(&self) -> Option<[u32; 8]> {
+        match &*self.protocol.lock() {
+            SocketProtocol::RawIcmp(state) => Some(state.icmp6_filter),
+            _ => None,
+        }
+    }
+
+    pub fn set_raw_icmp6_filter(&self, filter: [u32; 8]) -> Result<(), crate::execution::Errno> {
+        self.with_protocol_mut(|socket_protocol| match socket_protocol {
+            SocketProtocol::RawIcmp(state) => {
+                state.icmp6_filter = filter;
+                true
+            }
+            _ => false,
+        })
+        .then_some(())
+        .ok_or(crate::execution::Errno::EINVAL)
     }
 
     pub(crate) fn peek_udp_tx_datagram(&self) -> Option<UdpTxDatagram> {

@@ -127,6 +127,7 @@ impl SocketKind {
             (AddressFamily::Inet6, SocketType::Stream, 0 | 6) => Ok(Self::Tcp),
             (AddressFamily::Inet6, SocketType::Stream, 132) => Ok(Self::Sctp),
             (AddressFamily::Inet6, SocketType::Dgram, 0 | 17 | 136) => Ok(Self::Udp),
+            (AddressFamily::Inet6, SocketType::Raw, 58 | 159) => Ok(Self::RawIcmp),
             (AddressFamily::Inet6, _, _) => Err(Errno::EPROTONOSUPPORT),
             (AddressFamily::Netlink, SocketType::Raw | SocketType::Dgram, 0) => {
                 Ok(Self::NetlinkRoute)
@@ -568,6 +569,18 @@ pub struct IpLevelOptions {
     pub recv_err: bool,
     pub hdr_incl: bool,
     pub ipv6_v6only: bool,
+    pub ipv6_checksum: i32,
+    pub ipv6_recv_pktinfo: bool,
+    pub ipv6_recv_hoplimit: bool,
+    pub ipv6_recv_rthdr: bool,
+    pub ipv6_recv_hopopts: bool,
+    pub ipv6_recv_dstopts: bool,
+    pub ipv6_recv_tclass: bool,
+    pub ipv6_2292_pktinfo: bool,
+    pub ipv6_2292_hoplimit: bool,
+    pub ipv6_2292_rthdr: bool,
+    pub ipv6_2292_hopopts: bool,
+    pub ipv6_2292_dstopts: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -624,6 +637,18 @@ impl SocketOptionSet {
                 recv_err: false,
                 hdr_incl: false,
                 ipv6_v6only: false,
+                ipv6_checksum: -1,
+                ipv6_recv_pktinfo: false,
+                ipv6_recv_hoplimit: false,
+                ipv6_recv_rthdr: false,
+                ipv6_recv_hopopts: false,
+                ipv6_recv_dstopts: false,
+                ipv6_recv_tclass: false,
+                ipv6_2292_pktinfo: false,
+                ipv6_2292_hoplimit: false,
+                ipv6_2292_rthdr: false,
+                ipv6_2292_hopopts: false,
+                ipv6_2292_dstopts: false,
             },
             tcp: TcpLevelOptions {
                 nodelay: false,
@@ -660,6 +685,18 @@ impl SocketOptionSet {
                 recv_err: false,
                 hdr_incl: false,
                 ipv6_v6only: false,
+                ipv6_checksum: -1,
+                ipv6_recv_pktinfo: false,
+                ipv6_recv_hoplimit: false,
+                ipv6_recv_rthdr: false,
+                ipv6_recv_hopopts: false,
+                ipv6_recv_dstopts: false,
+                ipv6_recv_tclass: false,
+                ipv6_2292_pktinfo: false,
+                ipv6_2292_hoplimit: false,
+                ipv6_2292_rthdr: false,
+                ipv6_2292_hopopts: false,
+                ipv6_2292_dstopts: false,
             },
             tcp: TcpLevelOptions {
                 nodelay: false,
@@ -798,14 +835,18 @@ pub enum RdsState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawIcmpState {
     pub bound_local: Option<Ipv4Address>,
+    pub bound_local6: Option<Ipv6Address>,
     pub protocol: ProtocolNumber,
+    pub icmp6_filter: [u32; 8],
 }
 
 impl RawIcmpState {
     pub const fn new(protocol: ProtocolNumber) -> Self {
         Self {
             bound_local: None,
+            bound_local6: None,
             protocol,
+            icmp6_filter: [0; 8],
         }
     }
 }

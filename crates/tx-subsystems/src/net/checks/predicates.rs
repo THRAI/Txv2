@@ -140,12 +140,30 @@ pub(crate) fn socket_can_bind(
                 }
                 require_local_bind_addr(payload, endpoint)
             }
-            (SocketKind::RawIcmp, SocketProtocol::RawIcmp(state))
-                if state.bound_local.is_none() =>
-            {
+            (SocketKind::RawIcmp, SocketProtocol::RawIcmp(state)) => {
                 let endpoint = raw_bind_endpoint(addr)?;
                 let endpoint = require_socket_family(payload, endpoint)?;
-                require_local_bind_addr(payload, endpoint)
+                let endpoint = require_local_bind_addr(payload, endpoint)?;
+                match endpoint.family {
+                    AddressFamily::Inet => {
+                        if state.bound_local.is_none_or(|local| local == endpoint.addr) {
+                            Ok(endpoint)
+                        } else {
+                            Err(Errno::EINVAL)
+                        }
+                    }
+                    AddressFamily::Inet6 => {
+                        if state
+                            .bound_local6
+                            .is_none_or(|local| local == endpoint.addr6)
+                        {
+                            Ok(endpoint)
+                        } else {
+                            Err(Errno::EINVAL)
+                        }
+                    }
+                    _ => Err(Errno::EAFNOSUPPORT),
+                }
             }
             _ => Err(Errno::EINVAL),
         }

@@ -46,10 +46,12 @@ const MSGHDR_FLAGS_OFFSET: u64 = 48;
 const MMSGHDR_BYTES: u64 = 64;
 const MMSGHDR_LEN_OFFSET: u64 = MSGHDR_BYTES;
 const CMSGHDR_BYTES: u64 = 16;
+const MSG_CTRUNC_BITS: u32 = 0x08;
 const SCM_RIGHTS: i32 = 1;
 const MAX_MSG_IOV: u64 = 1024;
 const SOCKET_MSG_MAX_BYTES: usize = 1024 * 1024;
 const NETLINK_RECVMSG_MAX: usize = 1024 * 1024;
+const NETLINK_INLINE_SEND_MAX: usize = 256;
 const IPT_GETINFO_BYTES: usize = 84;
 const IPT_GET_ENTRIES_EMPTY_BYTES: usize = 36;
 const IPT_REPLACE_HEADER_BYTES: usize = 96;
@@ -119,7 +121,7 @@ fn socket_requires_net_raw(kind: SocketKind, valid: ValidSocketType) -> bool {
         || (kind == SocketKind::RawIcmp
             && matches!(
                 (valid.domain, valid.sock_type),
-                (AddressFamily::Inet, SocketType::Raw)
+                (AddressFamily::Inet | AddressFamily::Inet6, SocketType::Raw)
             ))
 }
 
@@ -549,6 +551,35 @@ pub(super) fn sys_sendto<'a>(
     sendto_impl(args, ctx)
 }
 
+fn dispatch_netlink_send(
+    ctx: &SyscallCtx<'_>,
+    socket: &Cap<SocketIdentity>,
+    bytes: &[u8],
+) -> Result<usize, Errno> {
+    let mut resolve_netns_fd = |fd: i32| {
+        if fd < 0 {
+            return None;
+        }
+        let file = resolve_fd(&ctx.process, fd as u32)?;
+        net_namespace_payload_from_file(&file)
+    };
+    let mut resolve_netns_pid = |pid: u32| {
+        let process = process_by_pid(Pid(pid))?;
+        process.net_namespace()
+    };
+    match socket.kind {
+        SocketKind::NetlinkRoute => netlink_route_send_with_netns_resolvers(
+            socket,
+            bytes,
+            ctx.cred(),
+            &mut resolve_netns_fd,
+            &mut resolve_netns_pid,
+        ),
+        SocketKind::NetlinkNetfilter => netlink_netfilter_send(socket, bytes, ctx.cred()),
+        _ => unreachable!(),
+    }
+}
+
 async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let (file, socket) = match resolve_socket_fd(ctx, args[0] as i32) {
         Ok(pair) => pair,
@@ -573,32 +604,23 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
                 return SyscallResult::Error(errno_to_i32(errno));
             }
         }
+        if len <= NETLINK_INLINE_SEND_MAX {
+            let mut inline = [0u8; NETLINK_INLINE_SEND_MAX];
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut inline[..len], args[1]) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            let result = dispatch_netlink_send(ctx, &socket, &inline[..len]);
+            return match result {
+                Ok(sent) => SyscallResult::Return(sent as i64),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            };
+        }
+
         let mut bytes = alloc::vec![0; len];
         if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, args[1]) {
             return SyscallResult::Error(errno_to_i32(errno));
         }
-        let mut resolve_netns_fd = |fd: i32| {
-            if fd < 0 {
-                return None;
-            }
-            let file = resolve_fd(&ctx.process, fd as u32)?;
-            net_namespace_payload_from_file(&file)
-        };
-        let mut resolve_netns_pid = |pid: u32| {
-            let process = process_by_pid(Pid(pid))?;
-            process.net_namespace()
-        };
-        let result = match socket.kind {
-            SocketKind::NetlinkRoute => netlink_route_send_with_netns_resolvers(
-                &socket,
-                &bytes,
-                ctx.cred(),
-                &mut resolve_netns_fd,
-                &mut resolve_netns_pid,
-            ),
-            SocketKind::NetlinkNetfilter => netlink_netfilter_send(&socket, &bytes, ctx.cred()),
-            _ => unreachable!(),
-        };
+        let result = dispatch_netlink_send(ctx, &socket, &bytes);
         return match result {
             Ok(sent) => SyscallResult::Return(sent as i64),
             Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
@@ -828,7 +850,7 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
             let copied = core::cmp::min(len.min(NETLINK_RECVMSG_MAX), response.len());
             if copied > 0 {
                 if let Err(errno) =
-                    bootstrap_copy_to_user(&ctx.aspace, args[1], &response[..copied])
+                    bootstrap_copy_to_user(&ctx.aspace, args[1], &response.as_slice()[..copied])
                 {
                     return SyscallResult::Error(errno_to_i32(errno));
                 }
@@ -1013,6 +1035,28 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         if total_len == 0 {
             return SyscallResult::Return(0);
         }
+        if total_len <= NETLINK_INLINE_SEND_MAX {
+            let mut inline = [0u8; NETLINK_INLINE_SEND_MAX];
+            let mut offset = 0usize;
+            for iov in &iovecs {
+                if iov.len == 0 {
+                    continue;
+                }
+                let end = offset + iov.len;
+                if let Err(errno) =
+                    bootstrap_copy_from_user(&ctx.aspace, &mut inline[offset..end], iov.base)
+                {
+                    return SyscallResult::Error(errno_to_i32(errno));
+                }
+                offset = end;
+            }
+            let result = dispatch_netlink_send(ctx, &socket, &inline[..total_len]);
+            return match result {
+                Ok(sent) => SyscallResult::Return(sent as i64),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            };
+        }
+
         let mut bytes = alloc::vec::Vec::with_capacity(total_len);
         for iov in &iovecs {
             if iov.len == 0 {
@@ -1025,28 +1069,7 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                 return SyscallResult::Error(errno_to_i32(errno));
             }
         }
-        let mut resolve_netns_fd = |fd: i32| {
-            if fd < 0 {
-                return None;
-            }
-            let file = resolve_fd(&ctx.process, fd as u32)?;
-            net_namespace_payload_from_file(&file)
-        };
-        let mut resolve_netns_pid = |pid: u32| {
-            let process = process_by_pid(Pid(pid))?;
-            process.net_namespace()
-        };
-        let result = match socket.kind {
-            SocketKind::NetlinkRoute => netlink_route_send_with_netns_resolvers(
-                &socket,
-                &bytes,
-                ctx.cred(),
-                &mut resolve_netns_fd,
-                &mut resolve_netns_pid,
-            ),
-            SocketKind::NetlinkNetfilter => netlink_netfilter_send(&socket, &bytes, ctx.cred()),
-            _ => unreachable!(),
-        };
+        let result = dispatch_netlink_send(ctx, &socket, &bytes);
         return match result {
             Ok(sent) => SyscallResult::Return(sent as i64),
             Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
@@ -1186,6 +1209,117 @@ fn raw_icmp_hdrincl_enabled(socket: &Cap<SocketIdentity>) -> bool {
         .is_some_and(|payload| payload.with_options(|options| options.ip.hdr_incl))
 }
 
+fn write_raw_ipv6_recvmsg_control<'a>(
+    ctx: &SyscallCtx<'a>,
+    msghdr_ptr: u64,
+    header: UserMsghdr,
+    socket: &Cap<SocketIdentity>,
+    destination: Option<IpEndpoint>,
+) -> Result<u32, Errno> {
+    if socket.kind != SocketKind::RawIcmp || header.control == 0 || header.controllen == 0 {
+        return Ok(0);
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return Ok(0);
+    };
+    if payload.family() != AddressFamily::Inet6 {
+        return Ok(0);
+    }
+
+    let options = payload.with_options(|options| options.ip);
+    let dst_addr = destination
+        .filter(|endpoint| endpoint.family == AddressFamily::Inet6)
+        .map(|endpoint| endpoint.addr6)
+        .filter(|addr| !addr.is_unspecified())
+        .unwrap_or(Ipv6Address::LOOPBACK);
+    let mut offset = 0u64;
+    let mut flags = 0u32;
+
+    if options.ipv6_recv_pktinfo {
+        let pktinfo = ipv6_pktinfo_bytes(dst_addr);
+        if !write_cmsg(ctx, header, &mut offset, SOL_IPV6, IPV6_PKTINFO, &pktinfo)? {
+            flags |= MSG_CTRUNC_BITS;
+        }
+    }
+    if options.ipv6_recv_hoplimit {
+        let hoplimit = 64i32.to_le_bytes();
+        if !write_cmsg(ctx, header, &mut offset, SOL_IPV6, IPV6_HOPLIMIT, &hoplimit)? {
+            flags |= MSG_CTRUNC_BITS;
+        }
+    }
+    if options.ipv6_recv_tclass {
+        let tclass = 0i32.to_le_bytes();
+        if !write_cmsg(ctx, header, &mut offset, SOL_IPV6, IPV6_TCLASS, &tclass)? {
+            flags |= MSG_CTRUNC_BITS;
+        }
+    }
+    if options.ipv6_2292_pktinfo {
+        let pktinfo = ipv6_pktinfo_bytes(dst_addr);
+        if !write_cmsg(
+            ctx,
+            header,
+            &mut offset,
+            SOL_IPV6,
+            IPV6_2292PKTINFO,
+            &pktinfo,
+        )? {
+            flags |= MSG_CTRUNC_BITS;
+        }
+    }
+    if options.ipv6_2292_hoplimit {
+        let hoplimit = 64i32.to_le_bytes();
+        if !write_cmsg(
+            ctx,
+            header,
+            &mut offset,
+            SOL_IPV6,
+            IPV6_2292HOPLIMIT,
+            &hoplimit,
+        )? {
+            flags |= MSG_CTRUNC_BITS;
+        }
+    }
+
+    write_msghdr_controllen(ctx, msghdr_ptr, offset)?;
+    Ok(flags)
+}
+
+fn ipv6_pktinfo_bytes(addr: Ipv6Address) -> [u8; 20] {
+    let mut bytes = [0u8; 20];
+    bytes[..16].copy_from_slice(&addr.octets());
+    bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
+    bytes
+}
+
+fn write_cmsg<'a>(
+    ctx: &SyscallCtx<'a>,
+    header: UserMsghdr,
+    offset: &mut u64,
+    level: i32,
+    ty: i32,
+    data: &[u8],
+) -> Result<bool, Errno> {
+    let data_len = data.len() as u64;
+    let cmsg_len = CMSGHDR_BYTES.checked_add(data_len).ok_or(Errno::EINVAL)?;
+    let cmsg_space = align_cmsg_len(cmsg_len);
+    let end = offset.checked_add(cmsg_space).ok_or(Errno::EINVAL)?;
+    if end > header.controllen {
+        return Ok(false);
+    }
+
+    let base = header.control.checked_add(*offset).ok_or(Errno::EINVAL)?;
+    bootstrap_write_user(&ctx.aspace, base, cmsg_len)?;
+    bootstrap_write_user(&ctx.aspace, base + 8, level)?;
+    bootstrap_write_user(&ctx.aspace, base + 12, ty)?;
+    bootstrap_copy_to_user(&ctx.aspace, base + CMSGHDR_BYTES, data)?;
+    *offset = end;
+    Ok(true)
+}
+
+fn align_cmsg_len(len: u64) -> u64 {
+    (len + 7) & !7
+}
+
 fn validate_iovec_read_ranges<'a>(ctx: &SyscallCtx<'a>, iovecs: &[UserIovec]) -> Result<(), Errno> {
     for iov in iovecs {
         if iov.len == 0 {
@@ -1309,6 +1443,21 @@ async fn recvmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                     {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
+                }
+                match write_raw_ipv6_recvmsg_control(
+                    ctx,
+                    args[1],
+                    header,
+                    &socket,
+                    recv.destination,
+                ) {
+                    Ok(msg_flags) if msg_flags != 0 => {
+                        if let Err(errno) = write_msghdr_flags(ctx, args[1], msg_flags) {
+                            return SyscallResult::Error(errno_to_i32(errno));
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
                 }
                 return SyscallResult::Return(recv.bytes as i64);
             }
@@ -1593,7 +1742,21 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.ip.ipv6_v6only = on);
             Ok(())
         }
+        (SOL_IPV6, IPV6_CHECKSUM) => set_ipv6_checksum(&socket, &payload, ctx, optval, optlen),
+        (
+            SOL_IPV6,
+            IPV6_RECVPKTINFO | IPV6_RECVHOPLIMIT | IPV6_RECVRTHDR | IPV6_RECVHOPOPTS
+            | IPV6_RECVDSTOPTS | IPV6_RECVTCLASS | IPV6_2292PKTINFO | IPV6_2292HOPLIMIT
+            | IPV6_2292RTHDR | IPV6_2292HOPOPTS | IPV6_2292DSTOPTS,
+        ) => {
+            let on = match read_sockopt_bool(ctx, optval, optlen) {
+                Ok(on) => on,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            set_ipv6_recv_option(&payload, optname, on)
+        }
         (SOL_IPV6, IPV6_ADDRFORM) => set_ipv6_addrform(&socket, &payload, ctx, optval, optlen),
+        (IPPROTO_ICMPV6, ICMP6_FILTER) => set_icmp6_filter(&socket, &payload, ctx, optval, optlen),
         (IPPROTO_IP, MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP) => {
             if !matches!(
                 socket.kind,
@@ -1716,6 +1879,113 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
+}
+
+fn set_ipv6_checksum<'a>(
+    socket: &Cap<SocketIdentity>,
+    payload: &tx_subsystems::net::SocketOperationalEvidence,
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<(), Errno> {
+    if socket.kind != SocketKind::RawIcmp || payload.family() != AddressFamily::Inet6 {
+        return Err(Errno::ENOPROTOOPT);
+    }
+    let offset = read_sockopt_i32(ctx, optval, optlen)?;
+    if offset >= 0 && offset % 2 != 0 {
+        return Err(Errno::EINVAL);
+    }
+    payload.with_options_mut(|opts| opts.ip.ipv6_checksum = offset);
+    Ok(())
+}
+
+fn set_ipv6_recv_option(
+    payload: &tx_subsystems::net::SocketOperationalEvidence,
+    optname: i32,
+    on: bool,
+) -> Result<(), Errno> {
+    if payload.family() != AddressFamily::Inet6 {
+        return Err(Errno::ENOPROTOOPT);
+    }
+    let updated = payload.with_options_mut(|opts| match optname {
+        IPV6_RECVPKTINFO => {
+            opts.ip.ipv6_recv_pktinfo = on;
+            true
+        }
+        IPV6_RECVHOPLIMIT => {
+            opts.ip.ipv6_recv_hoplimit = on;
+            true
+        }
+        IPV6_RECVRTHDR => {
+            opts.ip.ipv6_recv_rthdr = on;
+            true
+        }
+        IPV6_RECVHOPOPTS => {
+            opts.ip.ipv6_recv_hopopts = on;
+            true
+        }
+        IPV6_RECVDSTOPTS => {
+            opts.ip.ipv6_recv_dstopts = on;
+            true
+        }
+        IPV6_RECVTCLASS => {
+            opts.ip.ipv6_recv_tclass = on;
+            true
+        }
+        IPV6_2292PKTINFO => {
+            opts.ip.ipv6_2292_pktinfo = on;
+            true
+        }
+        IPV6_2292HOPLIMIT => {
+            opts.ip.ipv6_2292_hoplimit = on;
+            true
+        }
+        IPV6_2292RTHDR => {
+            opts.ip.ipv6_2292_rthdr = on;
+            true
+        }
+        IPV6_2292HOPOPTS => {
+            opts.ip.ipv6_2292_hopopts = on;
+            true
+        }
+        IPV6_2292DSTOPTS => {
+            opts.ip.ipv6_2292_dstopts = on;
+            true
+        }
+        _ => false,
+    });
+    updated.then_some(()).ok_or(Errno::ENOPROTOOPT)
+}
+
+fn set_icmp6_filter<'a>(
+    socket: &Cap<SocketIdentity>,
+    payload: &tx_subsystems::net::SocketOperationalEvidence,
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<(), Errno> {
+    if socket.kind != SocketKind::RawIcmp
+        || payload.family() != AddressFamily::Inet6
+        || payload
+            .raw_icmp_protocol()
+            .is_none_or(|protocol| protocol.0 != IPPROTO_ICMPV6 as u16)
+    {
+        return Err(Errno::ENOPROTOOPT);
+    }
+    if optval == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if optlen < 32 {
+        return Err(Errno::EINVAL);
+    }
+    let mut bytes = [0u8; 32];
+    bootstrap_copy_from_user(&ctx.aspace, &mut bytes, optval)?;
+    let mut filter = [0u32; 8];
+    for (idx, slot) in filter.iter_mut().enumerate() {
+        let start = idx * 4;
+        *slot = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
+    }
+    payload.set_raw_icmp6_filter(filter)
 }
 
 fn set_tcp_ulp<'a>(
@@ -1945,6 +2215,38 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             optlen_ptr,
             payload.with_options(|o| o.ip.hdr_incl as i32),
         ),
+        (SOL_IPV6, IPV6_V6ONLY) if payload.family() == AddressFamily::Inet6 => write_sockopt_i32(
+            ctx,
+            optval,
+            optlen_ptr,
+            payload.with_options(|o| o.ip.ipv6_v6only as i32),
+        ),
+        (SOL_IPV6, IPV6_CHECKSUM)
+            if socket.kind == SocketKind::RawIcmp && payload.family() == AddressFamily::Inet6 =>
+        {
+            write_sockopt_i32(
+                ctx,
+                optval,
+                optlen_ptr,
+                payload.with_options(|o| o.ip.ipv6_checksum),
+            )
+        }
+        (
+            SOL_IPV6,
+            IPV6_RECVPKTINFO | IPV6_RECVHOPLIMIT | IPV6_RECVRTHDR | IPV6_RECVHOPOPTS
+            | IPV6_RECVDSTOPTS | IPV6_RECVTCLASS | IPV6_2292PKTINFO | IPV6_2292HOPLIMIT
+            | IPV6_2292RTHDR | IPV6_2292HOPOPTS | IPV6_2292DSTOPTS,
+        ) if payload.family() == AddressFamily::Inet6 => write_sockopt_i32(
+            ctx,
+            optval,
+            optlen_ptr,
+            ipv6_recv_option_value(&payload, optname),
+        ),
+        (IPPROTO_ICMPV6, ICMP6_FILTER)
+            if socket.kind == SocketKind::RawIcmp && payload.family() == AddressFamily::Inet6 =>
+        {
+            write_icmp6_filter(ctx, optval, optlen_ptr, &payload)
+        }
         (IPPROTO_TCP, TCP_NODELAY) => write_sockopt_i32(
             ctx,
             optval,
@@ -1985,9 +2287,11 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             }
         }
         (IPPROTO_UDP, _) => Err(Errno::EOPNOTSUPP),
-        (SOL_SOCKET | IPPROTO_IP | IPPROTO_TCP | SOL_NETLINK | SOL_PACKET, _) => {
-            Err(Errno::ENOPROTOOPT)
-        }
+        (
+            SOL_SOCKET | IPPROTO_IP | IPPROTO_TCP | SOL_IPV6 | IPPROTO_ICMPV6 | SOL_NETLINK
+            | SOL_PACKET,
+            _,
+        ) => Err(Errno::ENOPROTOOPT),
         _ => Err(Errno::EOPNOTSUPP),
     };
 
@@ -1995,6 +2299,41 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
+}
+
+fn ipv6_recv_option_value(
+    payload: &tx_subsystems::net::SocketOperationalEvidence,
+    optname: i32,
+) -> i32 {
+    payload.with_options(|opts| match optname {
+        IPV6_RECVPKTINFO => opts.ip.ipv6_recv_pktinfo as i32,
+        IPV6_RECVHOPLIMIT => opts.ip.ipv6_recv_hoplimit as i32,
+        IPV6_RECVRTHDR => opts.ip.ipv6_recv_rthdr as i32,
+        IPV6_RECVHOPOPTS => opts.ip.ipv6_recv_hopopts as i32,
+        IPV6_RECVDSTOPTS => opts.ip.ipv6_recv_dstopts as i32,
+        IPV6_RECVTCLASS => opts.ip.ipv6_recv_tclass as i32,
+        IPV6_2292PKTINFO => opts.ip.ipv6_2292_pktinfo as i32,
+        IPV6_2292HOPLIMIT => opts.ip.ipv6_2292_hoplimit as i32,
+        IPV6_2292RTHDR => opts.ip.ipv6_2292_rthdr as i32,
+        IPV6_2292HOPOPTS => opts.ip.ipv6_2292_hopopts as i32,
+        IPV6_2292DSTOPTS => opts.ip.ipv6_2292_dstopts as i32,
+        _ => 0,
+    })
+}
+
+fn write_icmp6_filter<'a>(
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen_ptr: u64,
+    payload: &tx_subsystems::net::SocketOperationalEvidence,
+) -> Result<(), Errno> {
+    let filter = payload.raw_icmp6_filter().ok_or(Errno::ENOPROTOOPT)?;
+    let mut bytes = [0u8; 32];
+    for (idx, word) in filter.iter().enumerate() {
+        let start = idx * 4;
+        bytes[start..start + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    write_sockopt_bytes(ctx, optval, optlen_ptr, &bytes)
 }
 
 fn write_sockopt_unix_peer_cred<'a>(

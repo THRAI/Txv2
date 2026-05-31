@@ -9,7 +9,7 @@ use smoltcp::wire::{
 };
 
 use crate::net::packet::LoopbackIpPacket;
-use crate::net::structure::{Ipv4Address, SocketOptionSet};
+use crate::net::structure::{Ipv4Address, Ipv6Address, ProtocolNumber, SocketOptionSet};
 use crate::sync::SpinMutex;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,14 +38,29 @@ pub struct RawIcmpTxDrain {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawIcmpRecvDrain {
     pub bytes: usize,
-    pub source: Ipv4Address,
-    pub destination: Ipv4Address,
+    pub source: RawIpAddress,
+    pub destination: RawIpAddress,
     pub truncated: bool,
     pub became_empty: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawIpAddress {
+    V4(Ipv4Address),
+    V6(Ipv6Address),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawIpv6Packet {
+    pub src: Ipv6Address,
+    pub dst: Ipv6Address,
+    pub next_header: ProtocolNumber,
+    pub payload: Vec<u8>,
+}
+
 pub struct RawIcmpSocket {
     rx_queue: SpinMutex<VecDeque<Icmpv4EchoPacket>>,
+    rx_ipv6_queue: SpinMutex<VecDeque<RawIpv6Packet>>,
     tx_queue: SpinMutex<VecDeque<Icmpv4EchoPacket>>,
     recv_capacity: usize,
     send_capacity: usize,
@@ -67,6 +82,7 @@ impl RawIcmpSocket {
     pub fn new(options: &SocketOptionSet) -> Self {
         Self {
             rx_queue: SpinMutex::new(VecDeque::new()),
+            rx_ipv6_queue: SpinMutex::new(VecDeque::new()),
             tx_queue: SpinMutex::new(VecDeque::new()),
             recv_capacity: options.socket.recv_buf_size,
             send_capacity: options.socket.send_buf_size,
@@ -74,11 +90,19 @@ impl RawIcmpSocket {
     }
 
     pub fn recv_available(&self) -> usize {
-        self.rx_queue
+        let echo_bytes: usize = self
+            .rx_queue
             .lock()
             .iter()
             .map(icmpv4_echo_message_len)
-            .sum()
+            .sum();
+        let raw_ipv6_bytes: usize = self
+            .rx_ipv6_queue
+            .lock()
+            .iter()
+            .map(|packet| packet.payload.len())
+            .sum();
+        echo_bytes + raw_ipv6_bytes
     }
 
     pub fn recv_capacity(&self) -> usize {
@@ -138,48 +162,111 @@ impl RawIcmpSocket {
         was_empty
     }
 
+    pub fn ingest_rx_ipv6_packet(&self, packet: RawIpv6Packet) -> bool {
+        let bytes = packet.payload.len();
+        let echo_bytes = self
+            .rx_queue
+            .lock()
+            .iter()
+            .map(icmpv4_echo_message_len)
+            .sum::<usize>();
+        let mut rx = self.rx_ipv6_queue.lock();
+        let was_empty = echo_bytes == 0 && rx.is_empty();
+        let available = self
+            .recv_capacity
+            .saturating_sub(echo_bytes + raw_ipv6_queue_len(&rx));
+        if bytes > available {
+            return false;
+        }
+
+        rx.push_back(packet);
+        was_empty
+    }
+
     pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
         if len == 0 {
             return Some((0, false));
         }
 
-        let mut rx = self.rx_queue.lock();
+        {
+            let mut rx = self.rx_queue.lock();
+            if let Some(packet) = rx.front() {
+                let bytes = core::cmp::min(icmpv4_echo_message_len(packet), len);
+                if !peek {
+                    let _ = rx.pop_front();
+                }
+                let became_empty = !peek && rx.is_empty() && self.rx_ipv6_queue.lock().is_empty();
+                return Some((bytes, became_empty));
+            }
+        }
+
+        let mut rx = self.rx_ipv6_queue.lock();
         let packet = rx.front()?;
-        let bytes = core::cmp::min(icmpv4_echo_message_len(packet), len);
+        let bytes = core::cmp::min(packet.payload.len(), len);
         if !peek {
             let _ = rx.pop_front();
         }
-        Some((bytes, !peek && rx.is_empty()))
+        let raw_ipv6_empty = rx.is_empty();
+        drop(rx);
+        Some((
+            bytes,
+            !peek && raw_ipv6_empty && self.rx_queue.lock().is_empty(),
+        ))
     }
 
-    pub fn recv_echo_reply_bytes(&self, out: &mut [u8], peek: bool) -> Option<RawIcmpRecvDrain> {
+    pub fn recv_bytes(&self, out: &mut [u8], peek: bool) -> Option<RawIcmpRecvDrain> {
         if out.is_empty() {
             return Some(RawIcmpRecvDrain {
                 bytes: 0,
-                source: Ipv4Address::UNSPECIFIED,
-                destination: Ipv4Address::UNSPECIFIED,
+                source: RawIpAddress::V4(Ipv4Address::UNSPECIFIED),
+                destination: RawIpAddress::V4(Ipv4Address::UNSPECIFIED),
                 truncated: false,
                 became_empty: false,
             });
         }
 
-        let mut rx = self.rx_queue.lock();
+        {
+            let mut rx = self.rx_queue.lock();
+            if let Some(packet) = rx.front() {
+                let message = build_icmpv4_echo_reply_message(packet);
+                let bytes = core::cmp::min(message.len(), out.len());
+                out[..bytes].copy_from_slice(&message[..bytes]);
+                let source = packet.src;
+                let destination = packet.dst;
+                let truncated = bytes < message.len();
+                if !peek {
+                    let _ = rx.pop_front();
+                }
+                let became_empty = !peek && rx.is_empty() && self.rx_ipv6_queue.lock().is_empty();
+                return Some(RawIcmpRecvDrain {
+                    bytes,
+                    source: RawIpAddress::V4(source),
+                    destination: RawIpAddress::V4(destination),
+                    truncated,
+                    became_empty,
+                });
+            }
+        }
+
+        let mut rx = self.rx_ipv6_queue.lock();
         let packet = rx.front()?;
-        let message = build_icmpv4_echo_reply_message(packet);
-        let bytes = core::cmp::min(message.len(), out.len());
-        out[..bytes].copy_from_slice(&message[..bytes]);
+        let bytes = core::cmp::min(packet.payload.len(), out.len());
+        out[..bytes].copy_from_slice(&packet.payload[..bytes]);
         let source = packet.src;
         let destination = packet.dst;
-        let truncated = bytes < message.len();
+        let truncated = bytes < packet.payload.len();
         if !peek {
             let _ = rx.pop_front();
         }
+        let raw_ipv6_empty = rx.is_empty();
+        drop(rx);
+
         Some(RawIcmpRecvDrain {
             bytes,
-            source,
-            destination,
+            source: RawIpAddress::V6(source),
+            destination: RawIpAddress::V6(destination),
             truncated,
-            became_empty: !peek && rx.is_empty(),
+            became_empty: !peek && raw_ipv6_empty && self.rx_queue.lock().is_empty(),
         })
     }
 }
@@ -306,6 +393,10 @@ fn build_icmpv4_echo_message(packet: &Icmpv4EchoPacket, request: bool) -> Vec<u8
 
 fn echo_queue_len(queue: &VecDeque<Icmpv4EchoPacket>) -> usize {
     queue.iter().map(icmpv4_echo_message_len).sum()
+}
+
+fn raw_ipv6_queue_len(queue: &VecDeque<RawIpv6Packet>) -> usize {
+    queue.iter().map(|packet| packet.payload.len()).sum()
 }
 
 fn to_smoltcp_ipv4(addr: Ipv4Address) -> SmoltcpIpv4Address {
