@@ -356,6 +356,16 @@ tests prove ARP delete/relearn and `RTM_GETNEIGH` projection complete quickly,
 while the native QEMU witnesses spend minutes in shell setup and then time out
 inside a loop that repeatedly runs `ping`, `arp`/`ip neigh`, and `grep`.
 
+Follow-up speed probe: the native LTP runner now stages BusyBox into tmpfs as
+`/bin/busybox`, installs `/bin` applet symlinks from that copy, and the
+`/tx-ltp/bin/{ip,netstat}` shims prefer `/bin/busybox` when present. Focused
+`ipneigh01_ip` still reaches the 50-loop stress body and times out under the
+default LTP 5 minute case timeout:
+`target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-tmpfs-busybox-del-540s.txt`.
+So repeated ext4 reads of the BusyBox binary are not the only bottleneck; the
+next speed work needs per-command/syscall timing around process creation,
+shell pipelines, and fd cleanup.
+
 Optimization direction: keep semantic fixes in the kernel, but measure speed at
 the LTP setup subprocess/syscall layer first. The next useful speed work is a
 small timestamped runner/trap-trace pass or a focused reduction in repeated
