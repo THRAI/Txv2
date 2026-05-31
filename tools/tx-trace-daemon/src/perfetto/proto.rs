@@ -65,7 +65,6 @@ pub struct TracePacket {
     pub sequence_flags: Option<u32>,
 
     // ── oneof data ────────────────────────────────────────────────────────────
-
     /// TrackDescriptor packet (field 60).
     #[prost(message, optional, tag = "60")]
     pub track_descriptor: Option<TrackDescriptor>,
@@ -179,10 +178,10 @@ pub struct TrackEvent {
 #[repr(i32)]
 pub enum TrackEventType {
     Unspecified = 0,
-    SliceBegin  = 1,
-    SliceEnd    = 2,
-    Instant     = 3,
-    Counter     = 4,
+    SliceBegin = 1,
+    SliceEnd = 2,
+    Instant = 3,
+    Counter = 4,
 }
 
 // ── DebugAnnotation ───────────────────────────────────────────────────────────

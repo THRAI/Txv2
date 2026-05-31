@@ -6,13 +6,14 @@
 //! - `validate` — parse header + walk slots, print a one-line summary.
 //! - `demo` — generate a small synthetic `.txtrace` file for testing.
 
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use object::{Object, ObjectSymbol};
 
-use crate::util::optional_option_value;
+use crate::util::{command_exists, optional_option_value, run_cmd_owned};
 use crate::Result;
 
 /// Packed demo-record descriptor: (kind, level, name, span, parent, payload_tag, payload_len, payload).
@@ -21,27 +22,33 @@ type DemoRecord = (u8, u8, u32, u64, u64, u16, u16, [u8; 16]);
 pub(crate) fn observe(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(subcmd) = args.first() else {
         return Err(
-            "observe command needs replay, pftrace, validate, demo, or extract\n\
+            "observe command needs replay, pftrace, validate, demo, extract, bundle, or live-guest-mem\n\
              usage:\n\
              \tcargo xtask observe replay --file <path> [--out json|pftrace] [--output <out>] [--filter level=N]\n\
+             \tcargo xtask observe analyze (--file <txtrace>|--ndjson <replay.ndjson>) [--names <names.json>] [--top N] [--roundtrip-sysno N]\n\
              \tcargo xtask observe pftrace --file <path> --output <pftrace>\n\
              \tcargo xtask observe validate --file <path>\n\
              \tcargo xtask observe demo --output <path> [--records N] [--with-yields]\n\
              \tcargo xtask observe extract --serial <log> --output <txtrace>\n\
+             \tcargo xtask observe bundle (--file <txtrace>|--serial <log>) --output-dir <dir> [--names <names.json>] [--kernel <elf>]\n\
+             \tcargo xtask observe live-guest-mem --guest-mem <ram-file> --kernel <elf> --output-dir <dir> [--stop-file <path>]\n\
              \tcargo xtask observe names --kernel <elf> [--output <names.json>]"
                 .into(),
         );
     };
     match subcmd.as_str() {
         "replay" => observe_replay(root, &args[1..]),
+        "analyze" => observe_analyze(root, &args[1..]),
         "pftrace" => observe_pftrace(root, &args[1..]),
         "validate" => observe_validate(&args[1..]),
         "demo" => observe_demo(&args[1..]),
         "extract" => observe_extract(&args[1..]),
+        "bundle" => observe_bundle(root, &args[1..]),
+        "live-guest-mem" => observe_live_guest_mem(root, &args[1..]),
         "names" => observe_names(&args[1..]),
         other => Err(format!(
             "unknown observe subcommand '{other}'; \
-             expected replay, pftrace, validate, demo, extract, or names"
+             expected replay, analyze, pftrace, validate, demo, extract, bundle, live-guest-mem, or names"
         )),
     }
 }
@@ -287,12 +294,465 @@ fn short_type(full: &str) -> String {
 }
 
 const KERNEL_FNV1A_STABLE_NAMES: &[(&str, &str)] = &[
+    ("debug.alloc.zone.slab", "debug.alloc.zone.slab"),
+    ("debug.alloc.zone.slab.id", "debug.alloc.zone.slab.id"),
+    ("debug.alloc.zone.slab.slots", "debug.alloc.zone.slab.slots"),
+    ("debug.alloc.page_frame", "debug.alloc.page_frame"),
+    ("debug.alloc.page_frame.ppn", "debug.alloc.page_frame.ppn"),
+    ("debug.alloc.page_run", "debug.alloc.page_run"),
+    ("debug.alloc.page_run.base", "debug.alloc.page_run.base"),
+    ("debug.alloc.page_run.count", "debug.alloc.page_run.count"),
+    ("debug.alloc.vm.recipe_node", "debug.alloc.vm.recipe_node"),
+    (
+        "debug.alloc.vm.recipe_node.subtree_len",
+        "debug.alloc.vm.recipe_node.subtree_len",
+    ),
+    (
+        "debug.alloc.vm.private_page_node",
+        "debug.alloc.vm.private_page_node",
+    ),
+    (
+        "debug.alloc.vm.private_page_node.subtree_len",
+        "debug.alloc.vm.private_page_node.subtree_len",
+    ),
+    (
+        "debug.alloc.pagebacked.cache",
+        "debug.alloc.pagebacked.cache",
+    ),
+    (
+        "debug.alloc.pagebacked.cache.page",
+        "debug.alloc.pagebacked.cache.page",
+    ),
+    (
+        "debug.alloc.pagebacked.cache.len",
+        "debug.alloc.pagebacked.cache.len",
+    ),
+    (
+        "debug.alloc.vm.address_space",
+        "debug.alloc.vm.address_space",
+    ),
+    (
+        "debug.alloc.vm.address_space.cap",
+        "debug.alloc.vm.address_space.cap",
+    ),
+    (
+        "debug.alloc.pagebacked.container",
+        "debug.alloc.pagebacked.container",
+    ),
+    (
+        "debug.alloc.pagebacked.container.pages",
+        "debug.alloc.pagebacked.container.pages",
+    ),
     ("resume", "resume"),
     ("step", "step"),
     ("yield.OnWaitSource", "yield.OnWaitSource"),
     ("yield.OnAgent", "yield.OnAgent"),
     ("yield.OnTimer", "yield.OnTimer"),
     ("wake.notify", "wake.notify"),
+    ("debug.trap.syscall", "debug.trap.syscall"),
+    ("debug.trap.timer_user", "debug.trap.timer_user"),
+    ("debug.trap.handoff.payload", "debug.trap.handoff.payload"),
+    ("debug.trap.handoff.active", "debug.trap.handoff.active"),
+    ("debug.trap.handoff.capture", "debug.trap.handoff.capture"),
+    ("debug.trap.handoff.store", "debug.trap.handoff.store"),
+    ("debug.trap.handoff.complete", "debug.trap.handoff.complete"),
+    (
+        "debug.thread.entry.prepare.before",
+        "debug.thread.entry.prepare.before",
+    ),
+    (
+        "debug.thread.entry.prepare.after",
+        "debug.thread.entry.prepare.after",
+    ),
+    ("debug.thread.loop.top", "debug.thread.loop.top"),
+    (
+        "debug.thread.start_request.after",
+        "debug.thread.start_request.after",
+    ),
+    (
+        "debug.thread.active_request.after",
+        "debug.thread.active_request.after",
+    ),
+    ("debug.thread.ast.before", "debug.thread.ast.before"),
+    ("debug.thread.ast.after", "debug.thread.ast.after"),
+    (
+        "debug.thread.checkpoint.after",
+        "debug.thread.checkpoint.after",
+    ),
+    ("debug.thread.enter.before", "debug.thread.enter.before"),
+    ("debug.thread.trap.consumed", "debug.thread.trap.consumed"),
+    ("debug.thread.await.ready", "debug.thread.await.ready"),
+    ("debug.thread.process.after", "debug.thread.process.after"),
+    ("debug.thread.aspace.after", "debug.thread.aspace.after"),
+    (
+        "debug.thread.ctx.process_clone.after",
+        "debug.thread.ctx.process_clone.after",
+    ),
+    (
+        "debug.thread.ctx.thread_clone.after",
+        "debug.thread.ctx.thread_clone.after",
+    ),
+    (
+        "debug.thread.ctx.aspace_clone.after",
+        "debug.thread.ctx.aspace_clone.after",
+    ),
+    (
+        "debug.thread.ctx.cred_snapshot.after",
+        "debug.thread.ctx.cred_snapshot.after",
+    ),
+    ("debug.thread.ctx.after", "debug.thread.ctx.after"),
+    ("debug.thread.mailbox.after", "debug.thread.mailbox.after"),
+    ("debug.thread.timer.after", "debug.thread.timer.after"),
+    ("debug.thread.delegate.after", "debug.thread.delegate.after"),
+    (
+        "debug.thread.saved_ctx.after",
+        "debug.thread.saved_ctx.after",
+    ),
+    (
+        "debug.thread.dispatch.before",
+        "debug.thread.dispatch.before",
+    ),
+    ("debug.thread.dispatch.after", "debug.thread.dispatch.after"),
+    (
+        "debug.thread.immediate.after",
+        "debug.thread.immediate.after",
+    ),
+    ("debug.thread.oneshot.after", "debug.thread.oneshot.after"),
+    ("debug.thread.return.stored", "debug.thread.return.stored"),
+    ("debug.clone.enter", "debug.clone.enter"),
+    ("debug.clone_thread.enter", "debug.clone_thread.enter"),
+    (
+        "debug.clone_thread.allocate_tid.after",
+        "debug.clone_thread.allocate_tid.after",
+    ),
+    (
+        "debug.clone_thread.sign_thread.after",
+        "debug.clone_thread.sign_thread.after",
+    ),
+    (
+        "debug.clone_thread.payload_fresh.after",
+        "debug.clone_thread.payload_fresh.after",
+    ),
+    (
+        "debug.clone_thread.payload_sign.after",
+        "debug.clone_thread.payload_sign.after",
+    ),
+    (
+        "debug.clone_thread.payload_cap.after",
+        "debug.clone_thread.payload_cap.after",
+    ),
+    (
+        "debug.clone_thread.identity_sign.after",
+        "debug.clone_thread.identity_sign.after",
+    ),
+    (
+        "debug.clone_thread.register_tid.after",
+        "debug.clone_thread.register_tid.after",
+    ),
+    (
+        "debug.clone_thread.seed_context.after",
+        "debug.clone_thread.seed_context.after",
+    ),
+    (
+        "debug.clone_thread.clear_ctid.after",
+        "debug.clone_thread.clear_ctid.after",
+    ),
+    (
+        "debug.clone_thread.attach.after",
+        "debug.clone_thread.attach.after",
+    ),
+    (
+        "debug.clone.parent_ctx.after",
+        "debug.clone.parent_ctx.after",
+    ),
+    (
+        "debug.clone.step_thread.after",
+        "debug.clone.step_thread.after",
+    ),
+    (
+        "debug.clone.parent_settid.after",
+        "debug.clone.parent_settid.after",
+    ),
+    (
+        "debug.clone.reactor_submit.before",
+        "debug.clone.reactor_submit.before",
+    ),
+    (
+        "debug.clone.reactor_submit.after",
+        "debug.clone.reactor_submit.after",
+    ),
+    ("debug.clone.return", "debug.clone.return"),
+    ("debug.child_submit.enter", "debug.child_submit.enter"),
+    (
+        "debug.child_submit.payload.after",
+        "debug.child_submit.payload.after",
+    ),
+    (
+        "debug.child_submit.payload_clone.after",
+        "debug.child_submit.payload_clone.after",
+    ),
+    (
+        "debug.child_submit.reactor.with.before",
+        "debug.child_submit.reactor.with.before",
+    ),
+    (
+        "debug.child_submit.submit_call.before",
+        "debug.child_submit.submit_call.before",
+    ),
+    (
+        "debug.child_submit.reactor.with.after",
+        "debug.child_submit.reactor.with.after",
+    ),
+    (
+        "debug.child_submit.register.after",
+        "debug.child_submit.register.after",
+    ),
+    (
+        "debug.task.submit.slot.after",
+        "debug.task.submit.slot.after",
+    ),
+    (
+        "debug.task.submit.future_size",
+        "debug.task.submit.future_size",
+    ),
+    (
+        "debug.task.submit.future_box.after",
+        "debug.task.submit.future_box.after",
+    ),
+    (
+        "debug.task.submit.wake_state.after",
+        "debug.task.submit.wake_state.after",
+    ),
+    (
+        "debug.task.submit.mailbox.after",
+        "debug.task.submit.mailbox.after",
+    ),
+    (
+        "debug.task.submit.construct.after",
+        "debug.task.submit.construct.after",
+    ),
+    (
+        "debug.task.submit.store.after",
+        "debug.task.submit.store.after",
+    ),
+    (
+        "debug.reactor.submit.task_table.after",
+        "debug.reactor.submit.task_table.after",
+    ),
+    (
+        "debug.reactor.submit.scheduler.after",
+        "debug.reactor.submit.scheduler.after",
+    ),
+    (
+        "debug.reactor.submit.enqueue.after",
+        "debug.reactor.submit.enqueue.after",
+    ),
+    (
+        "debug.reactor.submit.from_hart.after",
+        "debug.reactor.submit.from_hart.after",
+    ),
+    (
+        "debug.reactor.submit.dispatch.after",
+        "debug.reactor.submit.dispatch.after",
+    ),
+    ("debug.write.enter", "debug.write.enter"),
+    ("debug.write.len", "debug.write.len"),
+    ("debug.writev.enter", "debug.writev.enter"),
+    ("debug.writev.iovcnt", "debug.writev.iovcnt"),
+    (
+        "debug.futex.step_wait_publish",
+        "debug.futex.step_wait_publish",
+    ),
+    (
+        "debug.futex.step_wait_eagain",
+        "debug.futex.step_wait_eagain",
+    ),
+    ("debug.futex.step_wake_hit", "debug.futex.step_wake_hit"),
+    ("debug.futex.step_wake_miss", "debug.futex.step_wake_miss"),
+    (
+        "debug.futex.wait_table.entries",
+        "debug.futex.wait_table.entries",
+    ),
+    (
+        "debug.futex.wait_table.waiters_total",
+        "debug.futex.wait_table.waiters_total",
+    ),
+    (
+        "debug.futex.wait_table.sample.uaddr",
+        "debug.futex.wait_table.sample.uaddr",
+    ),
+    (
+        "debug.futex.wait_table.sample.waiters",
+        "debug.futex.wait_table.sample.waiters",
+    ),
+    (
+        "debug.futex.wait_table.sample.mask",
+        "debug.futex.wait_table.sample.mask",
+    ),
+    (
+        "debug.futex.wait_table.sample.source",
+        "debug.futex.wait_table.sample.source",
+    ),
+    (
+        "debug.futex.wait_table.sample.subscribers",
+        "debug.futex.wait_table.sample.subscribers",
+    ),
+    (
+        "debug.futex.wait_table.target_uaddr",
+        "debug.futex.wait_table.target_uaddr",
+    ),
+    (
+        "debug.futex.wake_table.entries",
+        "debug.futex.wake_table.entries",
+    ),
+    (
+        "debug.futex.wake_table.waiters_total",
+        "debug.futex.wake_table.waiters_total",
+    ),
+    (
+        "debug.futex.wake_table.sample.uaddr",
+        "debug.futex.wake_table.sample.uaddr",
+    ),
+    (
+        "debug.futex.wake_table.sample.waiters",
+        "debug.futex.wake_table.sample.waiters",
+    ),
+    (
+        "debug.futex.wake_table.sample.mask",
+        "debug.futex.wake_table.sample.mask",
+    ),
+    (
+        "debug.futex.wake_table.sample.source",
+        "debug.futex.wake_table.sample.source",
+    ),
+    (
+        "debug.futex.wake_table.sample.subscribers",
+        "debug.futex.wake_table.sample.subscribers",
+    ),
+    (
+        "debug.futex.wake_table.target_uaddr",
+        "debug.futex.wake_table.target_uaddr",
+    ),
+    (
+        "debug.futex.cancel_table.entries",
+        "debug.futex.cancel_table.entries",
+    ),
+    (
+        "debug.futex.cancel_table.waiters_total",
+        "debug.futex.cancel_table.waiters_total",
+    ),
+    (
+        "debug.futex.cancel_table.sample.uaddr",
+        "debug.futex.cancel_table.sample.uaddr",
+    ),
+    (
+        "debug.futex.cancel_table.sample.waiters",
+        "debug.futex.cancel_table.sample.waiters",
+    ),
+    (
+        "debug.futex.cancel_table.sample.mask",
+        "debug.futex.cancel_table.sample.mask",
+    ),
+    (
+        "debug.futex.cancel_table.sample.source",
+        "debug.futex.cancel_table.sample.source",
+    ),
+    (
+        "debug.futex.cancel_table.sample.subscribers",
+        "debug.futex.cancel_table.sample.subscribers",
+    ),
+    (
+        "debug.futex.cancel_table.target_uaddr",
+        "debug.futex.cancel_table.target_uaddr",
+    ),
+    (
+        "debug.futex.requeue_table.entries",
+        "debug.futex.requeue_table.entries",
+    ),
+    (
+        "debug.futex.requeue_table.waiters_total",
+        "debug.futex.requeue_table.waiters_total",
+    ),
+    (
+        "debug.futex.requeue_table.sample.uaddr",
+        "debug.futex.requeue_table.sample.uaddr",
+    ),
+    (
+        "debug.futex.requeue_table.sample.waiters",
+        "debug.futex.requeue_table.sample.waiters",
+    ),
+    (
+        "debug.futex.requeue_table.sample.mask",
+        "debug.futex.requeue_table.sample.mask",
+    ),
+    (
+        "debug.futex.requeue_table.sample.source",
+        "debug.futex.requeue_table.sample.source",
+    ),
+    (
+        "debug.futex.requeue_table.sample.subscribers",
+        "debug.futex.requeue_table.sample.subscribers",
+    ),
+    (
+        "debug.futex.requeue_table.target_uaddr",
+        "debug.futex.requeue_table.target_uaddr",
+    ),
+    (
+        "debug.futex.wake_decision.uaddr",
+        "debug.futex.wake_decision.uaddr",
+    ),
+    (
+        "debug.futex.wake_decision.requested",
+        "debug.futex.wake_decision.requested",
+    ),
+    (
+        "debug.futex.wake_decision.waiters_before",
+        "debug.futex.wake_decision.waiters_before",
+    ),
+    (
+        "debug.futex.wake_decision.fired_mask",
+        "debug.futex.wake_decision.fired_mask",
+    ),
+    (
+        "debug.futex.wake_decision.woken",
+        "debug.futex.wake_decision.woken",
+    ),
+    (
+        "debug.futex.wake_decision.posted",
+        "debug.futex.wake_decision.posted",
+    ),
+    (
+        "debug.futex.wake_decision.subscribers_before",
+        "debug.futex.wake_decision.subscribers_before",
+    ),
+    (
+        "debug.futex.wake_decision.subscribers_after",
+        "debug.futex.wake_decision.subscribers_after",
+    ),
+    (
+        "debug.futex.clear_child_tid.uaddr",
+        "debug.futex.clear_child_tid.uaddr",
+    ),
+    (
+        "debug.futex.clear_child_tid.woken",
+        "debug.futex.clear_child_tid.woken",
+    ),
+    (
+        "debug.futex.clear_child_tid.err",
+        "debug.futex.clear_child_tid.err",
+    ),
+    (
+        "debug.futex.clear_child_tid.pending",
+        "debug.futex.clear_child_tid.pending",
+    ),
+    ("debug.sched.submit.queue", "debug.sched.submit.queue"),
+    ("debug.sched.pick.queue", "debug.sched.pick.queue"),
+    ("debug.sched.runnable.queue", "debug.sched.runnable.queue"),
+    ("debug.sched.runnable.front", "debug.sched.runnable.front"),
+    ("debug.sched.runnable.hint", "debug.sched.runnable.hint"),
+    ("debug.sched.stop.reason", "debug.sched.stop.reason"),
+    ("debug.wake.pending_hint", "debug.wake.pending_hint"),
+    ("debug.wake.drain_hint", "debug.wake.drain_hint"),
 ];
 
 /// Linux RV64 generic ABI syscall number → kernel-name table. Picked from
@@ -324,6 +784,7 @@ fn linux_rv64_syscalls() -> &'static [(u16, &'static str)] {
         (64, "write"),
         (66, "writev"),
         (71, "sendfile"),
+        (72, "pselect6"),
         (73, "ppoll"),
         (78, "readlinkat"),
         (79, "fstatat"),
@@ -382,13 +843,13 @@ fn linux_rv64_syscalls() -> &'static [(u16, &'static str)] {
 
 /// Recover a `.txtrace` blob from a kernel serial log.
 ///
-/// The kernel-side `tx_observe::dump_console_hex::<P>` helper emits the
-/// full observation ring (plus a synthesised `TxTraceHeader`) over the
-/// console as hex bytes framed by `TXTRACE-BEGIN ... TXTRACE-END`
-/// sentinels right before `:userspace:exited:`. This subcommand greps
-/// the framed hex out of the captured serial log, hex-decodes it, and
-/// writes a standalone `.txtrace` file the rest of the pipeline
-/// (`validate` / `replay` / `pftrace`) consumes unchanged.
+/// The kernel-side `tx_observe::dump_console_hex*::<P>` helpers emit a
+/// compact txtrace snapshot (a synthesised `TxTraceHeader` plus one or more
+/// hart rings) over the console as hex bytes framed by
+/// `TXTRACE-BEGIN ... TXTRACE-END` sentinels. This subcommand greps the framed
+/// hex out of the captured serial log, hex-decodes it, and writes a standalone
+/// `.txtrace` file the rest of the pipeline (`validate` / `replay` /
+/// `pftrace`) consumes unchanged.
 ///
 /// Usage: `cargo xtask observe extract --serial <log> --output <txtrace>`
 fn observe_extract(args: &[String]) -> Result<()> {
@@ -481,7 +942,11 @@ fn daemon_dir(root: &Path) -> PathBuf {
 /// places outputs in the *root* workspace `target/` directory, not in a
 /// `tools/tx-trace-daemon/target/` subdirectory.
 fn daemon_bin(root: &Path) -> PathBuf {
-    root.join("target/debug/tx-trace-daemon")
+    let target_dir = env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|p| if p.is_absolute() { p } else { root.join(p) })
+        .unwrap_or_else(|| root.join("target"));
+    target_dir.join("debug/tx-trace-daemon")
 }
 
 /// Ensure `tx-trace-daemon` binary is built.
@@ -564,6 +1029,78 @@ fn observe_replay(root: &Path, args: &[String]) -> Result<()> {
     }
 }
 
+// ── analyze ──────────────────────────────────────────────────────────────────
+
+fn observe_analyze(root: &Path, args: &[String]) -> Result<()> {
+    if !command_exists("python3") {
+        return Err("python3 is required for observe analyze".into());
+    }
+
+    let ndjson = if let Some(path) = optional_option_value(args, "--ndjson") {
+        PathBuf::from(path)
+    } else {
+        let file = require_file_arg(args)?;
+        ensure_daemon_built(root)?;
+        let out_dir = root.join("target").join("observe-analyze");
+        fs::create_dir_all(&out_dir)
+            .map_err(|e| format!("failed to create {}: {e}", out_dir.display()))?;
+        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("trace");
+        let ndjson = out_dir.join(format!("{stem}.ndjson"));
+        eprintln!(
+            "observe: replaying {} to {} for analysis",
+            file.display(),
+            ndjson.display()
+        );
+        let output = Command::new(daemon_bin(root))
+            .args(["replay", "--file", &file.to_string_lossy(), "--out", "json"])
+            .output()
+            .map_err(|err| format!("failed to run tx-trace-daemon: {err}"))?;
+        if !output.status.success() {
+            return Err(format!("tx-trace-daemon exited with {}", output.status));
+        }
+        fs::write(&ndjson, output.stdout)
+            .map_err(|e| format!("failed to write {}: {e}", ndjson.display()))?;
+        ndjson
+    };
+
+    if !ndjson.exists() {
+        return Err(format!("ndjson input not found: {}", ndjson.display()));
+    }
+
+    let names = optional_option_value(args, "--names")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let sibling = ndjson.with_extension("names.json");
+            sibling.exists().then_some(sibling)
+        })
+        .or_else(|| {
+            optional_option_value(args, "--file").and_then(|file| {
+                let sibling = PathBuf::from(file).with_extension("names.json");
+                sibling.exists().then_some(sibling)
+            })
+        });
+
+    let top = optional_option_value(args, "--top").unwrap_or_else(|| "20".to_string());
+    let roundtrip_sysno = optional_option_value(args, "--roundtrip-sysno");
+    let script = root.join("tools").join("tx-observe-analyze.py");
+    let mut py_args = vec![
+        script.display().to_string(),
+        "--ndjson".to_string(),
+        ndjson.display().to_string(),
+        "--top".to_string(),
+        top,
+    ];
+    if let Some(names) = names {
+        py_args.push("--names".to_string());
+        py_args.push(names.display().to_string());
+    }
+    if let Some(roundtrip_sysno) = roundtrip_sysno {
+        py_args.push("--roundtrip-sysno".to_string());
+        py_args.push(roundtrip_sysno);
+    }
+    run_cmd_owned(root, "python3", &py_args)
+}
+
 // ── pftrace ───────────────────────────────────────────────────────────────────
 
 fn observe_pftrace(root: &Path, args: &[String]) -> Result<()> {
@@ -638,6 +1175,157 @@ fn observe_pftrace(root: &Path, args: &[String]) -> Result<()> {
         Ok(())
     } else {
         Err(format!("tx-trace-daemon exited with {status}"))
+    }
+}
+
+// ── bundle ───────────────────────────────────────────────────────────────────
+
+fn observe_bundle(root: &Path, args: &[String]) -> Result<()> {
+    let out_dir = optional_option_value(args, "--output-dir")
+        .map(PathBuf::from)
+        .ok_or("--output-dir <dir> is required for bundle subcommand")?;
+    fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("failed to create {}: {e}", out_dir.display()))?;
+
+    let file_arg = optional_option_value(args, "--file").map(PathBuf::from);
+    let serial_arg = optional_option_value(args, "--serial").map(PathBuf::from);
+    let file = match (file_arg, serial_arg) {
+        (Some(file), None) => file,
+        (None, Some(serial)) => {
+            let serial_copy = out_dir.join("serial.txt");
+            if serial != serial_copy {
+                fs::copy(&serial, &serial_copy).map_err(|e| {
+                    format!(
+                        "failed to copy serial log {} -> {}: {e}",
+                        serial.display(),
+                        serial_copy.display()
+                    )
+                })?;
+            }
+            let trace = out_dir.join("trace.txtrace");
+            let extract_args = vec![
+                "--serial".to_string(),
+                serial_copy.display().to_string(),
+                "--output".to_string(),
+                trace.display().to_string(),
+            ];
+            observe_extract(&extract_args)?;
+            trace
+        }
+        (Some(_), Some(_)) => {
+            return Err("bundle accepts either --file or --serial, not both".into());
+        }
+        (None, None) => {
+            return Err("bundle requires --file <txtrace> or --serial <log>".into());
+        }
+    };
+
+    ensure_daemon_built(root)?;
+
+    let explicit_names = optional_option_value(args, "--names");
+    let sibling_names = file.with_extension("names.json");
+    let out_names = out_dir.join("names.json");
+    let names_path = if let Some(p) = explicit_names {
+        Some(PathBuf::from(p))
+    } else if sibling_names.exists() {
+        Some(sibling_names)
+    } else if let Some(kernel) = resolve_names_kernel_elf(root, args) {
+        eprintln!(
+            "observe: auto-generating names.json from {} -> {}",
+            kernel.display(),
+            out_names.display(),
+        );
+        let gen_args = vec![
+            "--kernel".to_string(),
+            kernel.display().to_string(),
+            "--output".to_string(),
+            out_names.display().to_string(),
+        ];
+        observe_names(&gen_args)?;
+        Some(out_names)
+    } else {
+        None
+    };
+
+    let mut cmd = Command::new(daemon_bin(root));
+    cmd.args([
+        "bundle",
+        "--file",
+        &file.to_string_lossy(),
+        "--out-dir",
+        &out_dir.to_string_lossy(),
+    ]);
+    if let Some(names) = names_path.as_deref() {
+        cmd.args(["--names", &names.to_string_lossy()]);
+    }
+
+    eprintln!(
+        "observe: tx-trace-daemon bundle --file {} --out-dir {}{} ...",
+        file.display(),
+        out_dir.display(),
+        names_path
+            .as_deref()
+            .map(|p| format!(" --names {}", p.display()))
+            .unwrap_or_default(),
+    );
+
+    let status = cmd
+        .status()
+        .map_err(|err| format!("failed to run tx-trace-daemon: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("tx-trace-daemon exited with {status}"))
+    }
+}
+
+// ── live guest memory ─────────────────────────────────────────────────────────
+
+fn observe_live_guest_mem(root: &Path, args: &[String]) -> Result<()> {
+    let guest_mem = optional_option_value(args, "--guest-mem")
+        .ok_or("--guest-mem <ram-file> is required for live-guest-mem")?;
+    let kernel = optional_option_value(args, "--kernel")
+        .ok_or("--kernel <elf> is required for live-guest-mem")?;
+    let out_dir = optional_option_value(args, "--output-dir")
+        .ok_or("--output-dir <dir> is required for live-guest-mem")?;
+
+    ensure_daemon_built(root)?;
+
+    let mut cmd = Command::new(daemon_bin(root));
+    cmd.args([
+        "live-guest-mem",
+        "--guest-mem",
+        &guest_mem,
+        "--kernel",
+        &kernel,
+        "--out-dir",
+        &out_dir,
+    ]);
+    pass_optional_arg(args, &mut cmd, "--symbol");
+    pass_optional_arg(args, &mut cmd, "--hart-count");
+    pass_optional_arg(args, &mut cmd, "--ring-bytes");
+    pass_optional_arg(args, &mut cmd, "--poll-ms");
+    pass_optional_arg(args, &mut cmd, "--stop-file");
+    pass_optional_arg(args, &mut cmd, "--max-duration-ms");
+    pass_optional_arg(args, &mut cmd, "--names");
+
+    eprintln!(
+        "observe: tx-trace-daemon live-guest-mem --guest-mem {} --kernel {} --out-dir {} ...",
+        guest_mem, kernel, out_dir
+    );
+    let status = cmd
+        .status()
+        .map_err(|err| format!("failed to run tx-trace-daemon: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("tx-trace-daemon exited with {status}"))
+    }
+}
+
+fn pass_optional_arg(args: &[String], cmd: &mut Command, name: &str) {
+    if let Some(value) = optional_option_value(args, name) {
+        cmd.args([name, &value]);
     }
 }
 

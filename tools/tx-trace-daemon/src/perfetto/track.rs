@@ -7,9 +7,7 @@
 
 use std::collections::HashMap;
 
-use crate::perfetto::proto::{
-    ProcessDescriptor, ThreadDescriptor, TrackDescriptor,
-};
+use crate::perfetto::proto::{ProcessDescriptor, ThreadDescriptor, TrackDescriptor};
 
 /// Discriminant for different kinds of kernel tracks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -71,7 +69,11 @@ impl TrackRegistry {
         let name = format!("hart-{hart}");
         self.map.insert(
             key,
-            TrackEntry { uuid, parent_uuid: self.harts_process_uuid, name: name.clone() },
+            TrackEntry {
+                uuid,
+                parent_uuid: self.harts_process_uuid,
+                name: name.clone(),
+            },
         );
         let desc = TrackDescriptor {
             uuid: Some(uuid),
@@ -122,7 +124,11 @@ impl TrackRegistry {
 
         self.map.insert(
             key,
-            TrackEntry { uuid, parent_uuid, name: name_str.clone() },
+            TrackEntry {
+                uuid,
+                parent_uuid,
+                name: name_str.clone(),
+            },
         );
 
         let desc = build_descriptor(uuid, parent_uuid, name_str, track_kind);
@@ -175,7 +181,11 @@ impl TrackRegistry {
         let uuid = entry.uuid;
         let process_desc = TrackDescriptor {
             uuid: Some(uuid),
-            parent_uuid: if pgrp_uuid != 0 { Some(pgrp_uuid) } else { None },
+            parent_uuid: if pgrp_uuid != 0 {
+                Some(pgrp_uuid)
+            } else {
+                None
+            },
             name: Some(display_name.clone()),
             process: Some(ProcessDescriptor {
                 pid: Some(pid as i32),
@@ -199,11 +209,7 @@ impl TrackRegistry {
     /// poll of the child. Without this the track would keep the
     /// pre-execve `comm` (often the parent's name) for the rest of
     /// the trace.
-    pub fn rename_process_track(
-        &mut self,
-        pid: u32,
-        comm: &str,
-    ) -> Option<TrackDescriptor> {
+    pub fn rename_process_track(&mut self, pid: u32, comm: &str) -> Option<TrackDescriptor> {
         let track_id = 0xF000_0000_0000_0000u64 | pid as u64;
         let key = TrackKey::KernelTrackId(track_id);
         let entry = self.map.get_mut(&key)?;
@@ -222,7 +228,11 @@ impl TrackRegistry {
         let uuid = entry.uuid;
         Some(TrackDescriptor {
             uuid: Some(uuid),
-            parent_uuid: if original_parent != 0 { Some(original_parent) } else { None },
+            parent_uuid: if original_parent != 0 {
+                Some(original_parent)
+            } else {
+                None
+            },
             name: Some(comm.to_string()),
             process: Some(ProcessDescriptor {
                 pid: Some(pid as i32),
@@ -266,7 +276,9 @@ impl TrackRegistry {
         }
         let uuid = self.alloc_uuid();
         let synthetic = format!("pid-{pid}");
-        let display_name = comm.map(|c| c.to_string()).unwrap_or_else(|| synthetic.clone());
+        let display_name = comm
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| synthetic.clone());
         // Parent under the pgrp swimlane (must exist already — caller
         // emits its TrackDescriptor before invoking this method); fall
         // through to top-level when no pgid is known.
@@ -277,10 +289,18 @@ impl TrackRegistry {
                     .map(|e| e.uuid)
             })
             .unwrap_or(0);
-        let parent = if parent_uuid != 0 { Some(parent_uuid) } else { None };
+        let parent = if parent_uuid != 0 {
+            Some(parent_uuid)
+        } else {
+            None
+        };
         self.map.insert(
             key,
-            TrackEntry { uuid, parent_uuid, name: display_name.clone() },
+            TrackEntry {
+                uuid,
+                parent_uuid,
+                name: display_name.clone(),
+            },
         );
         let desc = TrackDescriptor {
             uuid: Some(uuid),
@@ -320,7 +340,11 @@ impl TrackRegistry {
         let name = format!("pgroup-{pgid} (sid={sid})");
         self.map.insert(
             key,
-            TrackEntry { uuid, parent_uuid: 0, name: name.clone() },
+            TrackEntry {
+                uuid,
+                parent_uuid: 0,
+                name: name.clone(),
+            },
         );
         // Render the pgrp as a generic top-level NAMED track — no
         // `ProcessDescriptor` and no `ThreadDescriptor`. Setting
@@ -362,8 +386,7 @@ impl TrackRegistry {
         // task tracks (which use `(hart<<32) | tid` directly) by setting
         // the top bit. Embedding `hart` keeps two harts' views of the
         // same TID distinct.
-        let track_id =
-            0x8000_0000_0000_0000u64 | ((hart as u64) << 32) | tid as u64;
+        let track_id = 0x8000_0000_0000_0000u64 | ((hart as u64) << 32) | tid as u64;
         let key = TrackKey::KernelTrackId(track_id);
         if let Some(e) = self.map.get(&key) {
             return (e.uuid, process_desc, None);
@@ -372,7 +395,11 @@ impl TrackRegistry {
         let name = format!("tid-{tid}");
         self.map.insert(
             key,
-            TrackEntry { uuid, parent_uuid: process_uuid, name: name.clone() },
+            TrackEntry {
+                uuid,
+                parent_uuid: process_uuid,
+                name: name.clone(),
+            },
         );
         let desc = TrackDescriptor {
             uuid: Some(uuid),
@@ -417,13 +444,12 @@ fn pgrp_track_id(pgid: u32) -> u64 {
     0xE000_0000_0000_0000u64 | pgid as u64
 }
 
-fn build_descriptor(
-    uuid: u64,
-    parent_uuid: u64,
-    name: String,
-    track_kind: u8,
-) -> TrackDescriptor {
-    let parent = if parent_uuid != 0 { Some(parent_uuid) } else { None };
+fn build_descriptor(uuid: u64, parent_uuid: u64, name: String, track_kind: u8) -> TrackDescriptor {
+    let parent = if parent_uuid != 0 {
+        Some(parent_uuid)
+    } else {
+        None
+    };
     match track_kind {
         // Hart (kind=0) — thread-shaped track.
         0 => TrackDescriptor {

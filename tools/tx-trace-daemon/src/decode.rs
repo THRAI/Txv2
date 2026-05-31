@@ -17,9 +17,7 @@
 
 use serde::Serialize;
 use std::mem::size_of;
-use tx_observe_types::{
-    payload::*, TxTraceKind, TxTraceLevel, TxTraceRecord,
-};
+use tx_observe_types::{payload::*, TxTraceKind, TxTraceLevel, TxTraceRecord};
 
 /// The record-magic constant per the spec (§5).
 pub const RECORD_MAGIC: u16 = 0x5254;
@@ -128,9 +126,7 @@ pub fn decode_slot(hart: u16, slot_bytes: &[u8]) -> DecodedEvent {
 
     // Version check.
     if rec.version != SUPPORTED_VERSION {
-        return DecodedEvent::Repair(RepairRecord::version_mismatch(
-            hart, rec.seq, rec.version,
-        ));
+        return DecodedEvent::Repair(RepairRecord::version_mismatch(hart, rec.seq, rec.version));
     }
 
     // Payload len bound.
@@ -381,8 +377,19 @@ mod tests {
     #[test]
     fn decode_bad_magic_yields_repair() {
         let bytes = make_record(
-            0xDEAD, 0, TxTraceKind::SpanBegin as u8, 0, 1, 99, 0, 0, 0, 0,
-            TxPayloadTag::None as u16, 0, [0u8; 16],
+            0xDEAD,
+            0,
+            TxTraceKind::SpanBegin as u8,
+            0,
+            1,
+            99,
+            0,
+            0,
+            0,
+            0,
+            TxPayloadTag::None as u16,
+            0,
+            [0u8; 16],
         );
         let ev = decode_slot(1, &bytes);
         match ev {
@@ -396,7 +403,16 @@ mod tests {
     #[test]
     fn decode_payload_len_exceeded_yields_repair() {
         let bytes = make_record(
-            RECORD_MAGIC, 0, TxTraceKind::SpanBegin as u8, 0, 0, 5, 0, 0, 0, 0,
+            RECORD_MAGIC,
+            0,
+            TxTraceKind::SpanBegin as u8,
+            0,
+            0,
+            5,
+            0,
+            0,
+            0,
+            0,
             TxPayloadTag::None as u16,
             17, // > 16 — invalid
             [0u8; 16],

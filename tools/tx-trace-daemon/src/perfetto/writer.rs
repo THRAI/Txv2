@@ -9,8 +9,8 @@
 //! reconstruction), §9 (flow reconstruction), §10 (repair markers), §F
 //! (interned event names), §G (ClockSnapshot) from OBS-6.
 
-use std::path::Path;
 use prost::Message;
+use std::path::Path;
 
 use crate::decode::{DecodedEvent, DecodedRecord, RepairRecord};
 use crate::perfetto::interned::InternTable;
@@ -24,7 +24,13 @@ use crate::perfetto::proto::{
 use crate::perfetto::span::{SpanEntry, SpanTable};
 use crate::perfetto::track::TrackRegistry;
 
-use tx_observe_types::{TxPayloadTag, TxTraceKind, TxTraceLevel};
+use tx_observe_types::payload::{
+    ALLOC_TRACK_PAGE_FRAME, ALLOC_TRACK_PAGE_RUN, ALLOC_TRACK_PAGEBACKED_CACHE,
+    ALLOC_TRACK_PAGEBACKED_CONTAINER, ALLOC_TRACK_VM_ADDRESS_SPACE, ALLOC_TRACK_VM_PRIVATE_PAGE_NODE,
+    ALLOC_TRACK_VM_RECIPE_NODE, ALLOC_TRACK_ZONE_SLAB, EXPLICIT_TRACK_ID_MASK,
+    EXPLICIT_TRACK_ID_PREFIX,
+};
+use tx_observe_types::{TxPayloadTag, TxTraceKind};
 
 /// The single trusted packet sequence id for this producer.
 const SEQ_ID: u32 = TRUSTED_SEQ_ID;
@@ -351,15 +357,13 @@ impl PftraceWriter {
                         });
                     }
                 }
-                let (uuid, proc_desc, thread_desc) = self
-                    .tracks
-                    .ensure_thread_track_under_process(
-                        pid,
-                        r.hart,
-                        tid,
-                        proc_name.as_deref(),
-                        pgrp.map(|(pgid, _)| pgid),
-                    );
+                let (uuid, proc_desc, thread_desc) = self.tracks.ensure_thread_track_under_process(
+                    pid,
+                    r.hart,
+                    tid,
+                    proc_name.as_deref(),
+                    pgrp.map(|(pgid, _)| pgid),
+                );
                 if let Some(d) = proc_desc {
                     self.packets.push(TracePacket {
                         trusted_packet_sequence_id: Some(SEQ_ID),
@@ -406,12 +410,19 @@ impl PftraceWriter {
                 let span_id = parse_hex_u64(&r.span);
                 let name_id = parse_hex_u32(&r.name_id);
                 let (iid, new_name) = self.names.intern(name_id);
-                let entry = SpanEntry { name_iid: iid, begin_ts: r.ts, track_uuid: slice_track_uuid };
+                let entry = SpanEntry {
+                    name_iid: iid,
+                    begin_ts: r.ts,
+                    track_uuid: slice_track_uuid,
+                };
                 self.spans.begin(r.hart, span_id, entry);
                 // Emit the begin event; we'll emit the end when SpanEnd arrives.
                 // Per Perfetto convention we emit TYPE_SLICE_BEGIN now and TYPE_SLICE_END on End.
                 let interned_data = new_name.map(|n| InternedData {
-                    event_names: vec![EventName { iid: Some(iid), name: Some(n) }],
+                    event_names: vec![EventName {
+                        iid: Some(iid),
+                        name: Some(n),
+                    }],
                     debug_annotation_names: vec![],
                 });
                 let mut pkt = TracePacket {
@@ -502,9 +513,8 @@ impl PftraceWriter {
                     //      the structured value reachable from the
                     //      "Current Selection" panel so tooling can
                     //      diff/filter on it without parsing the label.
-                    let arg_value =
-                        (r.payload_tag == TxPayloadTag::ArgValue as u16)
-                            .then(|| extract_arg_value_field(r));
+                    let arg_value = (r.payload_tag == TxPayloadTag::ArgValue as u16)
+                        .then(|| extract_arg_value_field(r));
 
                     let (iid, new_name) = if let Some(v) = arg_value {
                         // Resolve the arg's base name (`a0`, `a1`, …)
@@ -538,13 +548,15 @@ impl PftraceWriter {
                         });
                     }
 
-                    let interned_data = if new_name.is_some()
-                        || !debug_annotation_names.is_empty()
+                    let interned_data = if new_name.is_some() || !debug_annotation_names.is_empty()
                     {
                         Some(InternedData {
                             event_names: new_name
                                 .map(|n| {
-                                    vec![EventName { iid: Some(iid), name: Some(n) }]
+                                    vec![EventName {
+                                        iid: Some(iid),
+                                        name: Some(n),
+                                    }]
                                 })
                                 .unwrap_or_default(),
                             debug_annotation_names,
@@ -553,12 +565,13 @@ impl PftraceWriter {
                         None
                     };
 
+                    let track_uuid = self.explicit_track_uuid(r).unwrap_or(slice_track_uuid);
                     let pkt = TracePacket {
                         timestamp: Some(r.ts),
                         timestamp_clock_id: Some(self.perfetto_clock_id()),
                         trusted_packet_sequence_id: Some(SEQ_ID),
                         track_event: Some(TrackEvent {
-                            track_uuid: Some(slice_track_uuid),
+                            track_uuid: Some(track_uuid),
                             r#type: Some(TrackEventType::Instant as i32),
                             name_iid: Some(iid),
                             debug_annotations,
@@ -605,12 +618,7 @@ impl PftraceWriter {
     /// process's first run.
     fn emit_fork_flow(&mut self, parent_pid: u32, child_pid: u32, ts: u64, hart: u16) {
         use crate::perfetto::flow::{compute_flow_id, FlowKind};
-        let fid = compute_flow_id(
-            parent_pid,
-            child_pid as u64,
-            FlowKind::Fork,
-            self.boot_id,
-        );
+        let fid = compute_flow_id(parent_pid, child_pid as u64, FlowKind::Fork, self.boot_id);
 
         // Resolve parent's process track. Materialise it under the
         // right pgrp swimlane if we have the cached metadata.
@@ -733,13 +741,7 @@ impl PftraceWriter {
     /// Handle a Resume record — close the terminating flow.
     ///
     /// Called from push_record when the record's payload tag is `Resume`.
-    pub fn push_resume(
-        &mut self,
-        ts: u64,
-        track_uuid: u64,
-        task_id_low: u32,
-        wait_gen: u64,
-    ) {
+    pub fn push_resume(&mut self, ts: u64, track_uuid: u64, task_id_low: u32, wait_gen: u64) {
         use crate::perfetto::flow::{compute_flow_id, FlowKind};
         let fid = compute_flow_id(task_id_low, wait_gen, FlowKind::SourceWake, self.boot_id);
         let pkt = TracePacket {
@@ -760,15 +762,14 @@ impl PftraceWriter {
 
     fn handle_track_descriptor(&mut self, r: &DecodedRecord, hart: u16) {
         // Parse payload.track_id and track_kind from the JSON payload.
-        let (track_id, track_kind, name_id) =
-            if let Some(p) = &r.payload {
-                let track_id = p["track_id"].as_u64().unwrap_or(0);
-                let track_kind = p["track_kind"].as_u64().unwrap_or(0) as u8;
-                let name_id = p["name"].as_u64().unwrap_or(0) as u32;
-                (track_id, track_kind, name_id)
-            } else {
-                return;
-            };
+        let (track_id, track_kind, name_id) = if let Some(p) = &r.payload {
+            let track_id = p["track_id"].as_u64().unwrap_or(0);
+            let track_kind = p["track_kind"].as_u64().unwrap_or(0) as u8;
+            let name_id = p["name"].as_u64().unwrap_or(0) as u32;
+            (track_id, track_kind, name_id)
+        } else {
+            return;
+        };
 
         let name_str = {
             let (_, new_name) = self.names.intern(name_id);
@@ -782,7 +783,8 @@ impl PftraceWriter {
         };
 
         let (_, maybe_desc) =
-            self.tracks.ensure_kernel_track(track_id, name_str, track_kind, Some(hart));
+            self.tracks
+                .ensure_kernel_track(track_id, name_str, track_kind, Some(hart));
         if let Some(desc) = maybe_desc {
             self.packets.push(TracePacket {
                 trusted_packet_sequence_id: Some(SEQ_ID),
@@ -790,6 +792,28 @@ impl PftraceWriter {
                 ..Default::default()
             });
         }
+    }
+
+    fn explicit_track_uuid(&mut self, r: &DecodedRecord) -> Option<u64> {
+        let track_id = parse_hex_u64(&r.parent);
+        if (track_id & EXPLICIT_TRACK_ID_MASK) != EXPLICIT_TRACK_ID_PREFIX {
+            return None;
+        }
+        let (name, track_kind) = explicit_track_descriptor(track_id)?;
+        let (uuid, maybe_desc) = self.tracks.ensure_kernel_track(
+            track_id,
+            name.to_string(),
+            track_kind,
+            Some(r.hart),
+        );
+        if let Some(desc) = maybe_desc {
+            self.packets.push(TracePacket {
+                trusted_packet_sequence_id: Some(SEQ_ID),
+                track_descriptor: Some(desc),
+                ..Default::default()
+            });
+        }
+        Some(uuid)
     }
 
     fn push_framing_repair(&mut self, rep: &RepairRecord) {
@@ -894,7 +918,9 @@ impl PftraceWriter {
             self.emit_unbalanced_begin_repair(&cs);
         }
 
-        let trace = Trace { packet: self.packets };
+        let trace = Trace {
+            packet: self.packets,
+        };
         let mut buf = Vec::with_capacity(trace.encoded_len());
         trace.encode(&mut buf).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::Other, format!("prost encode: {e}"))
@@ -927,19 +953,35 @@ impl PftraceWriter {
 
 fn kind_byte(kind_str: &str) -> u8 {
     match kind_str {
-        "Nop"             => TxTraceKind::Nop as u8,
-        "ClockSnapshot"   => TxTraceKind::ClockSnapshot as u8,
+        "Nop" => TxTraceKind::Nop as u8,
+        "ClockSnapshot" => TxTraceKind::ClockSnapshot as u8,
         "TrackDescriptor" => TxTraceKind::TrackDescriptor as u8,
-        "StringDescriptor"=> TxTraceKind::StringDescriptor as u8,
-        "SpanBegin"       => TxTraceKind::SpanBegin as u8,
-        "SpanEnd"         => TxTraceKind::SpanEnd as u8,
-        "Instant"         => TxTraceKind::Instant as u8,
-        "Counter"         => TxTraceKind::Counter as u8,
-        "TrackTombstone"  => TxTraceKind::TrackTombstone as u8,
-        "PanicMarker"     => TxTraceKind::PanicMarker as u8,
+        "StringDescriptor" => TxTraceKind::StringDescriptor as u8,
+        "SpanBegin" => TxTraceKind::SpanBegin as u8,
+        "SpanEnd" => TxTraceKind::SpanEnd as u8,
+        "Instant" => TxTraceKind::Instant as u8,
+        "Counter" => TxTraceKind::Counter as u8,
+        "TrackTombstone" => TxTraceKind::TrackTombstone as u8,
+        "PanicMarker" => TxTraceKind::PanicMarker as u8,
         "ArgContinuation" => TxTraceKind::ArgContinuation as u8,
-        _                 => 0xFF, // unknown
+        _ => 0xFF, // unknown
     }
+}
+
+fn explicit_track_descriptor(track_id: u64) -> Option<(&'static str, u8)> {
+    let name = match track_id {
+        ALLOC_TRACK_ZONE_SLAB => "debug.alloc.zone.slab",
+        ALLOC_TRACK_PAGE_FRAME => "debug.alloc.page_frame",
+        ALLOC_TRACK_PAGE_RUN => "debug.alloc.page_run",
+        ALLOC_TRACK_VM_RECIPE_NODE => "debug.alloc.vm.recipe_node",
+        ALLOC_TRACK_VM_PRIVATE_PAGE_NODE => "debug.alloc.vm.private_page_node",
+        ALLOC_TRACK_PAGEBACKED_CACHE => "debug.alloc.pagebacked.cache",
+        ALLOC_TRACK_VM_ADDRESS_SPACE => "debug.alloc.vm.address_space",
+        ALLOC_TRACK_PAGEBACKED_CONTAINER => "debug.alloc.pagebacked.container",
+        _ => return None,
+    };
+    // Scope-shaped generic track.
+    Some((name, 3))
 }
 
 fn parse_hex_u64(s: &str) -> u64 {
