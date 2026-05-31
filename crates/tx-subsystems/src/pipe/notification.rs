@@ -45,6 +45,8 @@ mod readiness {
 
         let reader_source = wait_routing::new_wait_source(reader_source_id);
         let writer_source = wait_routing::new_wait_source(writer_source_id);
+        crate::wait_source::register_wait_channel_with_id(reader_source_id, reader_channel.clone());
+        crate::wait_source::register_wait_channel_with_id(writer_source_id, writer_channel.clone());
 
         PipeWaitPoints {
             reader_channel,
@@ -57,6 +59,8 @@ mod readiness {
     }
 
     pub(crate) fn release_wait_points(reader_source_id: u64, writer_source_id: u64) {
+        crate::wait_source::release_wait_channel(reader_source_id);
+        crate::wait_source::release_wait_channel(writer_source_id);
         wait_routing::unregister_source(reader_source_id);
         wait_routing::unregister_source(writer_source_id);
     }

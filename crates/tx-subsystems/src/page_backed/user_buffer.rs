@@ -70,32 +70,47 @@ pub fn step_write_from_user(
     // commit
     // publish
     use crate::page_backed::adapter::step_engine::StepOutcome as V3;
+    emit_pagebacked_trace(b"debug.pagebacked.write_user.len", len as i64);
+    emit_pagebacked_trace(b"debug.pagebacked.write_user.offset", of.offset() as i64);
+    emit_pagebacked_trace(b"debug.pagebacked.write_user.phase", 0);
     if len == 0 {
         return V3::done(0);
     }
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
+        emit_pagebacked_trace(b"debug.pagebacked.write_user.err", 1);
         return V3::err(Errno::EINVAL.into());
     }
     let Some(capacity) = pc.byte_capacity() else {
+        emit_pagebacked_trace(b"debug.pagebacked.write_user.err", 2);
         return V3::err(Errno::EINVAL.into());
     };
     let Some(end) = of.offset().checked_add(len as u64) else {
+        emit_pagebacked_trace(b"debug.pagebacked.write_user.err", 3);
         return V3::err(Errno::EINVAL.into());
     };
     if end > capacity {
+        emit_pagebacked_trace(b"debug.pagebacked.write_user.err", 4);
         return V3::err(Errno::EINVAL.into());
     }
     let start = of.offset();
+    emit_pagebacked_trace(b"debug.pagebacked.write_user.phase", 1);
     let outcome =
         step_range_with_user_buffer(pc, of, aspace, len, UserBuffer::Write { src }, guard);
+    emit_pagebacked_trace(b"debug.pagebacked.write_user.phase", 2);
     let advanced_bytes = match &outcome {
         V3::Done(n) => *n,
         V3::Continue { progress } => progress.bytes(),
         V3::Yield { progress, .. } => progress.bytes(),
         V3::Err(_) => 0,
     };
+    emit_pagebacked_trace(
+        b"debug.pagebacked.write_user.advanced",
+        advanced_bytes as i64,
+    );
     if advanced_bytes > 0 {
+        emit_pagebacked_trace(b"debug.pagebacked.write_user.phase", 3);
         pc.grow_size_to(start + advanced_bytes as u64);
+        emit_pagebacked_trace(b"debug.pagebacked.write_user.phase", 4);
     }
     outcome
 }
@@ -138,10 +153,14 @@ fn step_range_with_user_buffer(
     use crate::page_backed::adapter::step_engine::{ByteProgress, StepOutcome as V3};
     let mut advanced = 0usize;
     let mut offset = of.offset();
+    emit_pagebacked_trace(b"debug.pagebacked.user_range.len", len as i64);
+    emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 0);
     while advanced < len {
         let page_index = PageIndex::new(offset / crate::vm::USER_PAGE_SIZE as u64);
         let within_page = (offset % crate::vm::USER_PAGE_SIZE as u64) as usize;
         let chunk = core::cmp::min(len - advanced, crate::vm::USER_PAGE_SIZE - within_page);
+        emit_pagebacked_trace(b"debug.pagebacked.user_range.chunk", chunk as i64);
+        emit_pagebacked_trace(b"debug.pagebacked.user_range.advanced", advanced as i64);
         let access = match buffer.io_kind() {
             PageBackedIoKind::Read => MaterializeAccess::Read,
             PageBackedIoKind::Write => MaterializeAccess::Write,
@@ -158,8 +177,10 @@ fn step_range_with_user_buffer(
         //   if no progress yet, else partial `Done`.
         // - `Err(errno)` with `advanced == 0` → v3 `Err(errno)`.
         //   Otherwise return v3 `Done(advanced)` (partial-success).
+        emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 1);
         match pc.materialize_page(page_index, access, guard) {
             StepOutcome::Done(materialized) => {
+                emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 2);
                 match copy_chunk_user(
                     materialized.ppn,
                     within_page,
@@ -170,17 +191,24 @@ fn step_range_with_user_buffer(
                     guard,
                 ) {
                     UserChunkOutcome::Copied => {
+                        emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 3);
                         advanced += chunk;
                         offset += chunk as u64;
                     }
                     UserChunkOutcome::Fault(errno) => {
+                        emit_pagebacked_trace(b"debug.pagebacked.user_range.err", 1);
                         if advanced == 0 {
                             return V3::err(errno.into());
                         }
+                        emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 4);
                         of.set_offset(offset);
                         return V3::done(advanced);
                     }
                     UserChunkOutcome::Blocked { source, interests } => {
+                        emit_pagebacked_trace(
+                            b"debug.pagebacked.user_range.blocked",
+                            source as i64,
+                        );
                         if advanced == 0 {
                             return crate::page_backed::notification::yield_on_wait_source(
                                 ByteProgress::EMPTY,
@@ -188,6 +216,7 @@ fn step_range_with_user_buffer(
                                 interests,
                             );
                         }
+                        emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 4);
                         of.set_offset(offset);
                         return crate::page_backed::notification::yield_on_wait_source(
                             ByteProgress::new(advanced),
@@ -201,19 +230,23 @@ fn step_range_with_user_buffer(
                 // NoProgress wait source: no materialized frame; treat as
                 // EAGAIN-like and surface partial progress (or EIO if
                 // none) — page allocation rarely emits this.
+                emit_pagebacked_trace(b"debug.pagebacked.user_range.err", 2);
                 if advanced == 0 {
                     return V3::err(step_engine::Errno::EAGAIN);
                 }
+                emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 4);
                 of.set_offset(offset);
                 return V3::done(advanced);
             }
             StepOutcome::Yield { shape, .. } => {
+                emit_pagebacked_trace(b"debug.pagebacked.user_range.err", 3);
                 let Some((carrier, interests)) =
                     crate::page_backed::notification::wait_source_parts(&shape)
                 else {
                     if advanced == 0 {
                         return V3::err(step_engine::Errno::EIO);
                     }
+                    emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 4);
                     of.set_offset(offset);
                     return V3::done(advanced);
                 };
@@ -224,6 +257,7 @@ fn step_range_with_user_buffer(
                         interests,
                     );
                 }
+                emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 4);
                 of.set_offset(offset);
                 return crate::page_backed::notification::yield_on_wait_source(
                     ByteProgress::new(advanced),
@@ -232,15 +266,18 @@ fn step_range_with_user_buffer(
                 );
             }
             StepOutcome::Err(errno) => {
+                emit_pagebacked_trace(b"debug.pagebacked.user_range.err", 4);
                 if advanced == 0 {
                     return V3::err(errno);
                 }
+                emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 4);
                 of.set_offset(offset);
                 return V3::done(advanced);
             }
         }
     }
 
+    emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 5);
     of.set_offset(offset);
     V3::done(advanced)
 }
@@ -254,10 +291,16 @@ fn copy_chunk_user(
     aspace: &AddressSpace,
     guard: &Guard<'_>,
 ) -> UserChunkOutcome {
+    emit_pagebacked_trace(b"debug.pagebacked.user_copy.chunk", chunk as i64);
+    emit_pagebacked_trace(b"debug.pagebacked.user_copy.phase", 0);
     let frame_base = match page_allocator::frame_kernel_addr(ppn) {
         Ok(p) => p,
-        Err(_) => return UserChunkOutcome::Fault(Errno::EIO),
+        Err(_) => {
+            emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 1);
+            return UserChunkOutcome::Fault(Errno::EIO);
+        }
     };
+    emit_pagebacked_trace(b"debug.pagebacked.user_copy.phase", 1);
     // SAFETY: frame_base is the kernel direct-map view of the
     // materialised PC frame. We hold the materialisation pin via the
     // caller's `MaterializedPage`. `within_page + chunk <= USER_PAGE_SIZE`
@@ -273,16 +316,29 @@ fn copy_chunk_user(
             let kernel_slice = unsafe { core::slice::from_raw_parts(kernel_byte, chunk) };
             let user_dst = UserPtr::<u8>::new(dst.addr() + already_advanced);
             use crate::page_backed::adapter::step_engine::StepOutcome as V3;
+            emit_pagebacked_trace(b"debug.pagebacked.user_copy.kind", 0);
+            emit_pagebacked_trace(b"debug.pagebacked.user_copy.phase", 2);
             match aspace.copy_to_user(user_dst, kernel_slice, guard) {
-                V3::Done(n) if n == chunk => UserChunkOutcome::Copied,
-                V3::Done(_) | V3::Continue { .. } => UserChunkOutcome::Fault(Errno::EFAULT),
-                V3::Err(e) => UserChunkOutcome::Fault(Errno::from(e)),
+                V3::Done(n) if n == chunk => {
+                    emit_pagebacked_trace(b"debug.pagebacked.user_copy.phase", 3);
+                    UserChunkOutcome::Copied
+                }
+                V3::Done(_) | V3::Continue { .. } => {
+                    emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 2);
+                    UserChunkOutcome::Fault(Errno::EFAULT)
+                }
+                V3::Err(e) => {
+                    emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 3);
+                    UserChunkOutcome::Fault(Errno::from(e))
+                }
                 V3::Yield { shape, .. } => {
                     if let Some((source, interests)) =
                         crate::page_backed::notification::wait_source_parts(&shape)
                     {
+                        emit_pagebacked_trace(b"debug.pagebacked.user_copy.blocked", source as i64);
                         UserChunkOutcome::Blocked { source, interests }
                     } else {
+                        emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 4);
                         UserChunkOutcome::Fault(Errno::EFAULT)
                     }
                 }
@@ -297,21 +353,43 @@ fn copy_chunk_user(
             let kernel_slice = unsafe { core::slice::from_raw_parts_mut(kernel_byte, chunk) };
             let user_src = UserPtr::<u8>::new(src.addr() + already_advanced);
             use crate::page_backed::adapter::step_engine::StepOutcome as V3;
+            emit_pagebacked_trace(b"debug.pagebacked.user_copy.kind", 1);
+            emit_pagebacked_trace(b"debug.pagebacked.user_copy.phase", 2);
             match aspace.copy_from_user(kernel_slice, user_src, guard) {
-                V3::Done(n) if n == chunk => UserChunkOutcome::Copied,
-                V3::Done(_) | V3::Continue { .. } => UserChunkOutcome::Fault(Errno::EFAULT),
-                V3::Err(e) => UserChunkOutcome::Fault(Errno::from(e)),
+                V3::Done(n) if n == chunk => {
+                    emit_pagebacked_trace(b"debug.pagebacked.user_copy.phase", 3);
+                    UserChunkOutcome::Copied
+                }
+                V3::Done(_) | V3::Continue { .. } => {
+                    emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 5);
+                    UserChunkOutcome::Fault(Errno::EFAULT)
+                }
+                V3::Err(e) => {
+                    emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 6);
+                    UserChunkOutcome::Fault(Errno::from(e))
+                }
                 V3::Yield { shape, .. } => {
                     if let Some((source, interests)) =
                         crate::page_backed::notification::wait_source_parts(&shape)
                     {
+                        emit_pagebacked_trace(b"debug.pagebacked.user_copy.blocked", source as i64);
                         UserChunkOutcome::Blocked { source, interests }
                     } else {
+                        emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 7);
                         UserChunkOutcome::Fault(Errno::EFAULT)
                     }
                 }
             }
         }
+    }
+}
+
+fn emit_pagebacked_trace(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
     }
 }
 

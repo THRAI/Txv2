@@ -785,11 +785,14 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteFromUserOp<'a> {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let guard = step_engine::guard();
         let remaining = self.len - self.cursor;
+        emit_vfs_trace(b"debug.vfs.write_from_user_op.remaining", remaining as i64);
+        emit_vfs_trace(b"debug.vfs.write_from_user_op.cursor", self.cursor as i64);
         if remaining == 0 {
             return StepOutcome::Done(self.cursor);
         }
         match self.file.rnode().backing() {
             RNodeBacking::PageBacked { pc } => {
+                emit_vfs_trace(b"debug.vfs.write_from_user_op.phase", 0);
                 let result = crate::page_backed::step_write_from_user(
                     pc,
                     self.file,
@@ -799,11 +802,29 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteFromUserOp<'a> {
                     &guard,
                 );
                 match &result {
-                    StepOutcome::Done(n) => self.cursor += *n,
-                    StepOutcome::Continue { progress } => self.cursor += progress.bytes(),
-                    StepOutcome::Yield { progress, .. } => self.cursor += progress.bytes(),
-                    StepOutcome::Err(_) => {}
+                    StepOutcome::Done(n) => {
+                        emit_vfs_trace(b"debug.vfs.write_from_user_op.done", *n as i64);
+                        self.cursor += *n;
+                    }
+                    StepOutcome::Continue { progress } => {
+                        emit_vfs_trace(
+                            b"debug.vfs.write_from_user_op.progress",
+                            progress.bytes() as i64,
+                        );
+                        self.cursor += progress.bytes();
+                    }
+                    StepOutcome::Yield { progress, .. } => {
+                        emit_vfs_trace(
+                            b"debug.vfs.write_from_user_op.yield_progress",
+                            progress.bytes() as i64,
+                        );
+                        self.cursor += progress.bytes();
+                    }
+                    StepOutcome::Err(_) => {
+                        emit_vfs_trace(b"debug.vfs.write_from_user_op.err", 1);
+                    }
                 }
+                emit_vfs_trace(b"debug.vfs.write_from_user_op.phase", 1);
                 result
             }
             _ => StepOutcome::Err(Errno::ENOSYS),
@@ -853,6 +874,15 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileReadToUserOp<'a> {
             }
             _ => StepOutcome::Err(Errno::ENOSYS),
         }
+    }
+}
+
+fn emit_vfs_trace(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
     }
 }
 

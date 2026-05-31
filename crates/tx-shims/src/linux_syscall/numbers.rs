@@ -88,6 +88,11 @@ pub const NR_SCHED_SETSCHEDULER: u64 = 119;
 /// empty — busybox observes the same external behaviour as on
 /// Linux (poll says ready, read either returns bytes or blocks).
 pub const NR_PPOLL: u64 = 73;
+/// `pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)`.
+/// Linux generic ABI `__NR_pselect6 = 72`. musl's `select(3)`
+/// wrapper routes through this syscall on RISC-V, and lmbench's
+/// `benchmp` pipe handshake depends on fd-set readiness.
+pub const NR_PSELECT6: u64 = 72;
 /// `exit(status)`. Linux generic ABI `__NR_exit`. Per-thread exit per
 /// `PROCESS_v1` §7.3.1 — for a single-threaded process, the
 /// `step_thread_exit` chain triggers `step_process_exit` internally.
@@ -1526,6 +1531,36 @@ pub const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 /// `UFFDIO_CONTINUE`. Phase 5 grows the bitmap to include
 /// `UFFDIO_CONTINUE` now that the handler is wired.
 pub const UFFDIO_REGISTER_REPLY_IOCTLS: u64 = (1u64 << 0x03) | (1u64 << 0x04) | (1u64 << 0x07);
+
+// =====================================================================
+// txKernel private debug syscalls
+//
+// These are intentionally outside the Linux generic ABI surface. The
+// current RV64/generic constants wired in this file jump from 291
+// (`statx`) to 424 (`pidfd_send_signal`), leaving the local 3xx range
+// available for in-tree diagnostic hooks.
+// =====================================================================
+
+/// `tx_observe_begin(threshold)` — private txKernel debug hook.
+///
+/// Enables `tx-observe`, clears the current hart's ring, and arms a bounded
+/// console dump after `threshold` subsequently emitted records. This is used
+/// by benchmark wrappers to start a trace inside a specific phase instead of
+/// relying on a boot- or suite-level threshold.
+pub const NR_TX_OBSERVE_BEGIN: u64 = 333;
+
+/// `tx_observe_trace_on()` — private txKernel debug hook.
+///
+/// Enables `tx-observe`, clears the current hart's ring, and leaves threshold
+/// dumping disabled. Pair with [`NR_TX_OBSERVE_TRACE_OFF`] to bracket a guest
+/// benchmark region and dump the ring after the region completes.
+pub const NR_TX_OBSERVE_TRACE_ON: u64 = 334;
+
+/// `tx_observe_trace_off()` — private txKernel debug hook.
+///
+/// Disables subsequent `tx-observe` emission and requests a one-shot console
+/// dump at the next kernel boundary.
+pub const NR_TX_OBSERVE_TRACE_OFF: u64 = 335;
 
 // =====================================================================
 // PR-11 phase 1 — AIO syscall numbers

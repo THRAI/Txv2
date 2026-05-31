@@ -68,6 +68,20 @@ impl<'a> SyscallCtx<'a> {
         // `CredSnapshot::root()` fallback is purely defensive and
         // mirrors today's `Cred::root()` fallback in `Self::cred`.
         let cred_snapshot = process.cred_snapshot().unwrap_or_else(CredSnapshot::root);
+        Self::from_parts_with_cred_snapshot(process, thread, aspace, cred_snapshot)
+    }
+
+    /// Construct from an already-captured syscall-entry credential snapshot.
+    ///
+    /// This keeps the same in-flight credential contract as [`Self::new`],
+    /// while letting the thread runtime instrument or batch the individual
+    /// setup steps without paying for a second credential snapshot.
+    pub fn from_parts_with_cred_snapshot(
+        process: Cap<ProcessIdentity>,
+        thread: Cap<ThreadIdentity>,
+        aspace: Cap<AddressSpace>,
+        cred_snapshot: CredSnapshot,
+    ) -> Self {
         Self {
             process,
             thread,

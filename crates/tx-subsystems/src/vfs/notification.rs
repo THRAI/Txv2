@@ -42,6 +42,8 @@ mod readiness {
         let write_channel = Channel::new();
         let write_source_id = crate::allocate_notification_source_id();
         let write_source = wait_routing::new_wait_source(write_source_id);
+        crate::wait_source::register_wait_channel_with_id(read_source_id, read_channel.clone());
+        crate::wait_source::register_wait_channel_with_id(write_source_id, write_channel.clone());
         RNodeWaitPoints {
             read_channel,
             read_source_id,
@@ -53,6 +55,8 @@ mod readiness {
     }
 
     pub(crate) fn release_rnode_wait_points(read_source_id: u64, write_source_id: u64) {
+        crate::wait_source::release_wait_channel(read_source_id);
+        crate::wait_source::release_wait_channel(write_source_id);
         wait_routing::unregister_source(read_source_id);
         wait_routing::unregister_source(write_source_id);
     }

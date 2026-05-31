@@ -31,6 +31,13 @@ pub fn register_wait_channel(channel: Channel) -> u64 {
     id
 }
 
+/// Register `channel` under an id minted by the v3 notification-source
+/// namespace. This keeps `YieldShape::OnWaitSource { source }` and legacy
+/// `WaitToken(source)` resolution aligned during the coexistence window.
+pub fn register_wait_channel_with_id(id: u64, channel: Channel) {
+    REGISTRY.lock().insert(id, channel);
+}
+
 /// Drop the registry's clone of the channel registered under `id`.
 /// Subsequent `lookup_wait_channel` and `wait_on_token` calls for `id`
 /// return `None`. Idempotent: releasing an unregistered id is a no-op.
@@ -70,6 +77,15 @@ mod tests {
     #[test]
     fn wait_source_lookup_returns_some_for_registered_id_and_none_after_release() {
         let id = register_wait_channel(Channel::new());
+        assert!(lookup_wait_channel(id).is_some());
+        release_wait_channel(id);
+        assert!(lookup_wait_channel(id).is_none());
+    }
+
+    #[test]
+    fn wait_source_can_register_already_minted_notification_id() {
+        let id = u64::from(u32::MAX) + 17;
+        register_wait_channel_with_id(id, Channel::new());
         assert!(lookup_wait_channel(id).is_some());
         release_wait_channel(id);
         assert!(lookup_wait_channel(id).is_none());

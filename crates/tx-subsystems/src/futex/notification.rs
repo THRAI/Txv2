@@ -5,7 +5,7 @@
 
 use tx_platform_adapter::notification_adapter;
 
-pub(crate) use readiness::{new_wait_point, notify_bucket, notify_exact};
+pub(crate) use readiness::{new_wait_point, notify_bucket_with_hint, notify_exact_limit_with_hint};
 
 #[notification_adapter(
     subsystem = "futex",
@@ -17,6 +17,7 @@ mod readiness {
 
     use crate::futex::adapter::step_engine::InterestMask;
     use crate::futex::adapter::wait_routing::{self, Channel, WaitSource};
+    use tx_substrate::wake::MailboxSchedulerHint;
 
     pub(crate) struct FutexWaitPoint {
         pub(crate) channel: Channel,
@@ -28,6 +29,7 @@ mod readiness {
         let channel = Channel::new();
         let source_id = crate::allocate_notification_source_id();
         let wait_source = wait_routing::new_wait_source(source_id);
+        crate::wait_source::register_wait_channel_with_id(source_id, channel.clone());
         FutexWaitPoint {
             channel,
             source_id,
@@ -35,13 +37,24 @@ mod readiness {
         }
     }
 
-    pub(crate) fn notify_exact(channel: &Channel, source: &Arc<WaitSource>, mask: u64) {
+    pub(crate) fn notify_exact_limit_with_hint(
+        channel: &Channel,
+        source: &Arc<WaitSource>,
+        mask: u64,
+        limit: usize,
+        hint: MailboxSchedulerHint,
+    ) -> u32 {
         wait_routing::fire_legacy_channel(channel, mask);
-        wait_routing::notify_v3_source(source, mask);
+        source.notify_limit_emit_with_hint(InterestMask::new(mask), limit, hint) as u32
     }
 
-    pub(crate) fn notify_bucket(channel: &Channel, source: &Arc<WaitSource>, mask: u64) -> u32 {
+    pub(crate) fn notify_bucket_with_hint(
+        channel: &Channel,
+        source: &Arc<WaitSource>,
+        mask: u64,
+        hint: MailboxSchedulerHint,
+    ) -> u32 {
         wait_routing::fire_legacy_channel(channel, mask);
-        source.notify(InterestMask::new(mask)) as u32
+        source.notify_with_hint(InterestMask::new(mask), hint) as u32
     }
 }

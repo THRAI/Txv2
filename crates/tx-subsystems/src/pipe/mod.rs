@@ -516,6 +516,24 @@ impl PipePayload {
         self.ring.lock().pipe_size_bytes()
     }
 
+    /// Level predicate for read-side polling. A pipe reader is
+    /// readable when bytes are buffered, or when all writers are gone
+    /// and a read would complete with EOF.
+    pub fn readable_level(&self) -> bool {
+        let has_bytes = !self.ring.lock().is_empty();
+        has_bytes || self.writer_count.load(Ordering::Acquire) == 0
+    }
+
+    /// Level predicate for write-side polling. A pipe writer is
+    /// writable when a write can make progress, or when all readers
+    /// are gone and a write would complete immediately with EPIPE.
+    pub fn writable_level(&self) -> bool {
+        if self.reader_count.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        self.ring.lock().available_write_capacity() > 0
+    }
+
     pub fn set_pipe_size_bytes(&self, requested: usize) -> Result<usize, Errno> {
         let mut ring = self.ring.lock();
         let size = ring.set_pipe_size_bytes(requested)?;

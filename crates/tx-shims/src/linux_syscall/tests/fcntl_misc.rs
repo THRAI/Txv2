@@ -406,6 +406,9 @@ impl PmapIf for LoongArchUnamePmap {
 
 impl EntropyIf for LoongArchUnamePmap {}
 impl tx_hal::AuxvIf for LoongArchUnamePmap {}
+impl tx_hal::ConsoleIf for LoongArchUnamePmap {
+    fn write_bytes(_bytes: &[u8]) {}
+}
 impl SmpIf for LoongArchUnamePmap {}
 impl tx_hal::TimeIf for LoongArchUnamePmap {
     fn read_ns() -> u64 {

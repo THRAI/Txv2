@@ -630,6 +630,9 @@ pub fn ast_check(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstOutc
     if summary.termination {
         return AstOutcome::InitiateTermination;
     }
+    if !summary.deliverable_signal && !summary.stop_requested {
+        return AstOutcome::Continue;
+    }
 
     let guard = step_engine::guard();
     let Some(proc) = thread.owner_proc.upgrade(&guard) else {

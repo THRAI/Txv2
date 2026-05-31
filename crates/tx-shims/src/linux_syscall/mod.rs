@@ -61,7 +61,6 @@ use tx_subsystems::cred::{
     SetuidOp, Uid,
 };
 use tx_subsystems::execution::Errno;
-use tx_subsystems::futex::FutexWakeOp;
 use tx_subsystems::page_backed::{
     AnonSwapPolicy, PageContainer, PageContainerKind, TruncateOp as FdTruncateOp,
 };
@@ -75,8 +74,8 @@ use tx_subsystems::signal::{
     DeliverSignalOp, KillProcessOp, SaFlags, SigActionEntry, SigDisposition, SigDispositionChange,
     SigactionOp, SignalMask, Signum,
 };
-use tx_subsystems::thread_runtime::execution::{SigmaskHow, SigprocmaskChange};
-use tx_subsystems::thread_runtime::{SigprocmaskOp, ThreadExitOp, ThreadKillOp};
+use tx_subsystems::thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange};
+use tx_subsystems::thread_runtime::{step_thread_exit, ThreadExitOp, ThreadIdentity, ThreadKillOp};
 use tx_subsystems::tty::execution::{
     step_ioctl_tcgets, step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz,
     step_ioctl_tiocnotty, step_ioctl_tiocsctty_for_process, step_ioctl_tiocspgrp,
@@ -203,27 +202,28 @@ pub use numbers::{
     NR_MQ_NOTIFY, NR_MQ_OPEN, NR_MQ_TIMEDRECEIVE, NR_MQ_TIMEDSEND, NR_MQ_UNLINK, NR_MREMAP,
     NR_MSGCTL, NR_MSGGET, NR_MSGRCV, NR_MSGSND, NR_MSYNC, NR_MUNLOCK, NR_MUNMAP, NR_NANOSLEEP,
     NR_NEWFSTATAT, NR_OPENAT, NR_PERSONALITY, NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL, NR_PIPE2,
-    NR_PPOLL, NR_PREAD64, NR_PREADV, NR_PREADV2, NR_PRLIMIT64, NR_PWRITE64, NR_PWRITEV,
-    NR_PWRITEV2, NR_READ, NR_READAHEAD, NR_READLINKAT, NR_READV, NR_RECVFROM, NR_RENAMEAT2,
-    NR_RESTART_SYSCALL, NR_RT_SIGACTION, NR_RT_SIGPENDING, NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO,
-    NR_RT_SIGRETURN, NR_RT_SIGSUSPEND, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY, NR_SCHED_GETPARAM,
-    NR_SCHED_GETSCHEDULER, NR_SCHED_GET_PRIORITY_MAX, NR_SCHED_GET_PRIORITY_MIN,
-    NR_SCHED_RR_GET_INTERVAL, NR_SCHED_SETAFFINITY, NR_SCHED_SETPARAM, NR_SCHED_SETSCHEDULER,
-    NR_SCHED_YIELD, NR_SEMCTL, NR_SEMGET, NR_SEMOP, NR_SEMTIMEDOP, NR_SENDTO, NR_SETGID,
-    NR_SETPGID, NR_SETPRIORITY, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETRLIMIT,
-    NR_SETSID, NR_SETSOCKOPT, NR_SETTIMEOFDAY, NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
-    NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET, NR_SHUTDOWN, NR_SIGALTSTACK, NR_SIGNALFD4, NR_SOCKET,
-    NR_SOCKETPAIR, NR_SPLICE, NR_STATFS, NR_STATX, NR_SYMLINKAT, NR_SYNC, NR_SYNCFS,
-    NR_SYNC_FILE_RANGE, NR_SYSLOG, NR_TEE, NR_TGKILL, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME,
-    NR_TIMERFD_SETTIME, NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UMOUNT2, NR_UNAME,
-    NR_UNLINKAT, NR_USERFAULTFD, NR_UTIMENSAT, NR_VMSPLICE, NR_WAIT4, NR_WRITE, NR_WRITEV,
-    O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR,
-    O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE,
-    RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU,
-    RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS, RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE, RLIMIT_NICE,
-    RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_RSS, RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIMIT_SIGPENDING,
-    RLIMIT_STACK, RLIM_INFINITY, R_OK, SEEK_CUR, SEEK_END, SEEK_SET, SFD_CLOEXEC, SFD_NONBLOCK,
-    SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW, TFD_TIMER_ABSTIME_FLAG,
+    NR_PPOLL, NR_PREAD64, NR_PREADV, NR_PREADV2, NR_PRLIMIT64, NR_PSELECT6, NR_PWRITE64,
+    NR_PWRITEV, NR_PWRITEV2, NR_READ, NR_READAHEAD, NR_READLINKAT, NR_READV, NR_RECVFROM,
+    NR_RENAMEAT2, NR_RESTART_SYSCALL, NR_RT_SIGACTION, NR_RT_SIGPENDING, NR_RT_SIGPROCMASK,
+    NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN, NR_RT_SIGSUSPEND, NR_RT_SIGTIMEDWAIT,
+    NR_SCHED_GETAFFINITY, NR_SCHED_GETPARAM, NR_SCHED_GETSCHEDULER, NR_SCHED_GET_PRIORITY_MAX,
+    NR_SCHED_GET_PRIORITY_MIN, NR_SCHED_RR_GET_INTERVAL, NR_SCHED_SETAFFINITY, NR_SCHED_SETPARAM,
+    NR_SCHED_SETSCHEDULER, NR_SCHED_YIELD, NR_SEMCTL, NR_SEMGET, NR_SEMOP, NR_SEMTIMEDOP,
+    NR_SENDTO, NR_SETGID, NR_SETPGID, NR_SETPRIORITY, NR_SETREGID, NR_SETRESGID, NR_SETRESUID,
+    NR_SETREUID, NR_SETRLIMIT, NR_SETSID, NR_SETSOCKOPT, NR_SETTIMEOFDAY, NR_SETUID,
+    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET, NR_SHUTDOWN,
+    NR_SIGALTSTACK, NR_SIGNALFD4, NR_SOCKET, NR_SOCKETPAIR, NR_SPLICE, NR_STATFS, NR_STATX,
+    NR_SYMLINKAT, NR_SYNC, NR_SYNCFS, NR_SYNC_FILE_RANGE, NR_SYSLOG, NR_TEE, NR_TGKILL,
+    NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME, NR_TIMES, NR_TKILL, NR_TRUNCATE,
+    NR_TX_OBSERVE_BEGIN, NR_TX_OBSERVE_TRACE_OFF, NR_TX_OBSERVE_TRACE_ON, NR_UMASK, NR_UMOUNT2,
+    NR_UNAME, NR_UNLINKAT, NR_USERFAULTFD, NR_UTIMENSAT, NR_VMSPLICE, NR_WAIT4, NR_WRITE,
+    NR_WRITEV, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY,
+    O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ,
+    PROT_WRITE, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE,
+    RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS, RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE,
+    RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_RSS, RLIMIT_RTPRIO, RLIMIT_RTTIME,
+    RLIMIT_SIGPENDING, RLIMIT_STACK, RLIM_INFINITY, R_OK, SEEK_CUR, SEEK_END, SEEK_SET,
+    SFD_CLOEXEC, SFD_NONBLOCK, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW, TFD_TIMER_ABSTIME_FLAG,
     TFD_TIMER_CANCEL_ON_SET_FLAG, TIMER_ABSTIME, TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ,
     TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ, UTIME_NOW, UTIME_OMIT, WNOHANG, W_OK, X_OK,
 };
@@ -425,7 +425,7 @@ pub(super) const SIGACTION_BYTES: usize = 32;
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
-pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
+pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_hal::ConsoleIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -452,7 +452,286 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
     result
 }
 
-async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
+/// Narrow unboxed lane for the pthread create/join hot path.
+///
+/// `thread_future::run_thread` uses this before falling back to the broad
+/// dispatcher so cloned thread-task futures do not carry the full generic
+/// syscall dispatch state machine. Keep this list restricted to syscalls that
+/// are both frequent in pthread lifecycle loops and already implemented by
+/// compact direct arms here.
+pub fn dispatch_pthread_hot_oneshot(
+    req: SyscallRequest,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    match req.nr {
+        NR_FUTEX | NR_RT_SIGPROCMASK | NR_EXIT | NR_SET_TID_ADDRESS => {}
+        _ => return None,
+    }
+
+    let l0_span = emit_syscall_enter(&req);
+    let prev = tx_observe::set_current_parent_span(l0_span);
+    let result = match req.nr {
+        NR_FUTEX => sys_futex_oneshot(req.args, ctx)?,
+        NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
+        NR_EXIT => sys_exit(req.args, ctx),
+        NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
+        _ => unreachable!("pthread hot dispatch prefilter covers all arms"),
+    };
+    tx_observe::set_current_parent_span(prev);
+    emit_syscall_exit(l0_span, &result);
+    Some(result)
+}
+
+/// One-shot syscall lane for non-vfork `clone`.
+///
+/// This keeps pthread `CLONE_THREAD` and regular non-vfork fork out of the
+/// broad async dispatcher carried by `run_thread`. `CLONE_VFORK` is excluded
+/// because it intentionally parks the parent until child exec/exit.
+pub fn dispatch_clone_oneshot<P: PmapIf>(
+    req: &SyscallRequest,
+    process: &Cap<ProcessIdentity>,
+    thread: &Cap<ThreadIdentity>,
+    aspace: &Cap<AddressSpace>,
+) -> Option<SyscallResult> {
+    if req.nr != NR_CLONE {
+        return None;
+    }
+    let flags = req.args[0];
+    if (flags & CLONE_VFORK) != 0 && (flags & CLONE_THREAD) == 0 {
+        return None;
+    }
+
+    let l0_span = emit_syscall_enter(req);
+    let prev = tx_observe::set_current_parent_span(l0_span);
+    let ctx = SyscallCtx::new(process.clone(), thread.clone(), aspace.clone());
+    let result = sys_clone_oneshot::<P>(req.args, &ctx)
+        .expect("dispatch_clone_oneshot prefilters vfork-only async clone");
+    tx_observe::set_current_parent_span(prev);
+    emit_syscall_exit(l0_span, &result);
+    Some(result)
+}
+
+/// One-shot lane for `exit(2)` from an already-resolved thread identity.
+///
+/// `exit` never returns to userspace and does not need a Linux syscall context:
+/// `step_thread_exit` resolves the owning process and `clear_child_tid` state
+/// through the thread identity. Keeping this before `SyscallCtx` construction
+/// trims the pthread child teardown path without changing the no-return
+/// contract.
+pub fn dispatch_thread_exit_oneshot(
+    req: &SyscallRequest,
+    thread: &Cap<ThreadIdentity>,
+) -> Option<SyscallResult> {
+    if req.nr != NR_EXIT {
+        return None;
+    }
+    let l0_span = emit_syscall_enter(req);
+    step_thread_exit(thread.clone(), req.args[0] as i32);
+    let result = SyscallResult::NoReturn;
+    emit_syscall_exit(l0_span, &result);
+    Some(result)
+}
+
+/// Fast dispatch for immediate syscalls that can be answered from the
+/// already-resolved thread/process identity before building a full
+/// [`SyscallCtx`].
+///
+/// This preserves the normal L0 syscall observe span. It is deliberately
+/// narrow: only add syscalls whose implementation does not need an address
+/// space, credential snapshot, mailbox, timer wheel, delegate registry, or
+/// subject context.
+pub fn dispatch_cap_only_immediate(
+    req: &SyscallRequest,
+    process: &Cap<ProcessIdentity>,
+) -> Option<SyscallResult> {
+    let result = match req.nr {
+        NR_GETPPID => SyscallResult::Return(process.parent_pid().0 as i64),
+        _ => dispatch_static_chardev_cap_immediate(req, process)?,
+    };
+    let l0_span = emit_syscall_enter(req);
+    emit_syscall_exit(l0_span, &result);
+    Some(result)
+}
+
+/// Fast dispatch for immediate syscalls that need the already-resolved
+/// process plus address space, but still do not need a full [`SyscallCtx`].
+///
+/// Keep this lane narrow. It is for non-blocking operations whose complete
+/// semantics can be expressed from fd table state plus direct user copy.
+pub fn dispatch_process_aspace_immediate(
+    req: &SyscallRequest,
+    process: &Cap<ProcessIdentity>,
+    aspace: &Cap<AddressSpace>,
+) -> Option<SyscallResult> {
+    let result = dispatch_static_chardev_immediate(req, process, aspace)?;
+    let l0_span = emit_syscall_enter(req);
+    emit_syscall_exit(l0_span, &result);
+    Some(result)
+}
+
+/// Fast one-shot lane for syscalls that need only the current thread and
+/// address space, avoiding full [`SyscallCtx`] construction.
+pub fn dispatch_thread_aspace_oneshot(
+    req: &SyscallRequest,
+    thread: &Cap<ThreadIdentity>,
+    aspace: &Cap<AddressSpace>,
+) -> Option<SyscallResult> {
+    if req.nr != NR_RT_SIGPROCMASK {
+        return None;
+    }
+    let l0_span = emit_syscall_enter(req);
+    let prev = tx_observe::set_current_parent_span(l0_span);
+    let result = sys_rt_sigprocmask_thread_aspace(req.args, thread, aspace);
+    tx_observe::set_current_parent_span(prev);
+    emit_syscall_exit(l0_span, &result);
+    Some(result)
+}
+
+/// Fast one-shot lane for anonymous private `mmap` that can commit without
+/// parking on the VM range lock.
+pub fn dispatch_vm_try_oneshot(
+    req: &SyscallRequest,
+    aspace: &Cap<AddressSpace>,
+) -> Option<SyscallResult> {
+    if req.nr != NR_MMAP {
+        return None;
+    }
+    let l0_span = emit_syscall_enter(req);
+    let result = sys_mmap_private_anon_try(req.args, aspace)?;
+    emit_syscall_exit(l0_span, &result);
+    Some(result)
+}
+
+/// Direct trap-resume lane for strictly synchronous syscalls.
+///
+/// These arms can complete inside the platform trap handler without resolving
+/// the userspace-run wait. The caller is responsible for proving any
+/// syscall-specific safety preconditions, such as signal quiescence for
+/// `rt_sigprocmask`.
+pub fn dispatch_direct_trap_oneshot(
+    req: &SyscallRequest,
+    process: &Cap<ProcessIdentity>,
+    thread: &Cap<ThreadIdentity>,
+    aspace: &Cap<AddressSpace>,
+) -> Option<SyscallResult> {
+    match req.nr {
+        NR_GETPPID => dispatch_cap_only_immediate(req, process),
+        NR_FUTEX => {
+            let l0_span = emit_syscall_enter(req);
+            let prev = tx_observe::set_current_parent_span(l0_span);
+            let ctx = SyscallCtx::new(process.clone(), thread.clone(), aspace.clone());
+            let result = sys_futex_oneshot_with_wake_hint(
+                req.args,
+                &ctx,
+                tx_substrate::wake::MailboxSchedulerHint::WakeHandoff,
+            )?;
+            tx_observe::set_current_parent_span(prev);
+            emit_syscall_exit(l0_span, &result);
+            Some(result)
+        }
+        NR_RT_SIGPROCMASK => dispatch_thread_aspace_oneshot(req, thread, aspace),
+        NR_SET_TID_ADDRESS => {
+            let l0_span = emit_syscall_enter(req);
+            let prev = tx_observe::set_current_parent_span(l0_span);
+            let ctx = SyscallCtx::new(process.clone(), thread.clone(), aspace.clone());
+            let result = sys_set_tid_address(req.args, &ctx);
+            tx_observe::set_current_parent_span(prev);
+            emit_syscall_exit(l0_span, &result);
+            Some(result)
+        }
+        _ => None,
+    }
+}
+
+/// Narrow async lane for VM lifecycle syscalls that are hot in pthread stack
+/// setup/teardown.
+///
+/// This keeps `mmap` / `mprotect` / `munmap` out of the broad generic async
+/// dispatcher while preserving their existing RangeLock wait/retry semantics.
+/// The lane still emits the normal L0 syscall span; it only shrinks the future
+/// allocated by `thread_future::run_thread` before that span opens.
+pub async fn dispatch_vm_hot(req: SyscallRequest, ctx: &SyscallCtx<'_>) -> Option<SyscallResult> {
+    match req.nr {
+        NR_MMAP | NR_MUNMAP | NR_MPROTECT => {}
+        _ => return None,
+    }
+
+    let l0_span = emit_syscall_enter(&req);
+    let prev = tx_observe::set_current_parent_span(l0_span);
+    let result = match req.nr {
+        NR_MMAP => sys_mmap(req.args, ctx).await,
+        NR_MUNMAP => sys_munmap(req.args, ctx).await,
+        NR_MPROTECT => sys_mprotect(req.args, ctx).await,
+        _ => unreachable!("VM hot dispatch prefilter covers all arms"),
+    };
+    tx_observe::set_current_parent_span(prev);
+    emit_syscall_exit(l0_span, &result);
+    Some(result)
+}
+
+/// Narrow async lane for `writev(2)` hot in musl stdio.
+///
+/// This preserves `sys_writev` semantics and the normal L0 syscall observe
+/// span, while keeping repeated buffered stdio writes out of the broad generic
+/// dispatch future carried by `thread_future::run_thread`.
+pub async fn dispatch_writev_hot(
+    req: SyscallRequest,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    emit_writev_hot_trace(b"debug.writev.hot.enter", req.nr as i64);
+    if req.nr != NR_WRITEV {
+        emit_writev_hot_trace(b"debug.writev.hot.reject", req.nr as i64);
+        return None;
+    }
+
+    emit_writev_hot_trace(b"debug.writev.hot.before_enter", req.nr as i64);
+    let l0_span = emit_syscall_enter(&req);
+    emit_writev_hot_trace(b"debug.writev.hot.after_enter", req.nr as i64);
+    let prev = tx_observe::set_current_parent_span(l0_span);
+    emit_writev_hot_trace(b"debug.writev.hot.after_parent", req.nr as i64);
+    let result = sys_writev(req.args, ctx).await;
+    emit_writev_hot_trace(b"debug.writev.hot.after_body", req.nr as i64);
+    tx_observe::set_current_parent_span(prev);
+    emit_syscall_exit(l0_span, &result);
+    emit_writev_hot_trace(b"debug.writev.hot.after_exit", req.nr as i64);
+    Some(result)
+}
+
+fn emit_writev_hot_trace(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(EventNameId::from_raw(tx_observe::fnv1a32(name)), value);
+    }
+}
+
+/// Synchronous `writev(2)` lane for PageBacked files.
+///
+/// This handles the libcbench tmpfile shape without allocating and polling the
+/// broad async `sys_writev` future. It is deliberately a narrow prefilter:
+/// non-PageBacked fds return `None` and continue through the existing async
+/// dispatcher. PageBacked writes that unexpectedly need to yield surface
+/// `EAGAIN`; the current PageBacked user-buffer path materializes
+/// synchronously, so that is a defensive future-backend branch rather than the
+/// libcbench path.
+pub fn dispatch_writev_pagebacked_oneshot(
+    req: &SyscallRequest,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    if req.nr != NR_WRITEV || !sys_writev_pagebacked_candidate(req.args, ctx) {
+        return None;
+    }
+
+    let l0_span = emit_syscall_enter(req);
+    let prev = tx_observe::set_current_parent_span(l0_span);
+    emit_writev_hot_trace(b"debug.writev.pagebacked_dispatch.enter", req.nr as i64);
+    let result =
+        sys_writev_pagebacked_oneshot(req.args, ctx).unwrap_or(SyscallResult::Error(EAGAIN_VALUE));
+    emit_writev_hot_trace(b"debug.writev.pagebacked_dispatch.after", req.nr as i64);
+    tx_observe::set_current_parent_span(prev);
+    emit_syscall_exit(l0_span, &result);
+    Some(result)
+}
+
+async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_hal::ConsoleIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -517,6 +796,9 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_MQ_GETSETATTR => return sys_mq_getsetattr(req.args, ctx),
         nr if nr == NR_MQ_NOTIFY => return sys_mq_notify(req.args, ctx),
         nr if nr == NR_MEMBARRIER => return sys_membarrier::<P>(&req.args),
+        nr if nr == NR_TX_OBSERVE_BEGIN => return sys_tx_observe_begin(req.args),
+        nr if nr == NR_TX_OBSERVE_TRACE_ON => return sys_tx_observe_trace_on(),
+        nr if nr == NR_TX_OBSERVE_TRACE_OFF => return sys_tx_observe_trace_off(),
         _ => {} // fall through to script lanes
     }
 
@@ -553,6 +835,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_ACCEPT4 => sys_accept4(req.args, ctx),
         nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
         nr if nr == NR_PPOLL => sys_ppoll(req.args, ctx).await,
+        nr if nr == NR_PSELECT6 => sys_pselect6::<P>(req.args, ctx).await,
         nr if nr == NR_EXIT => sys_exit(req.args, ctx),
         nr if nr == NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
         nr if nr == NR_BRK => sys_brk(req.args, ctx).await,
@@ -1099,6 +1382,7 @@ fn emit_syscall_exit(span: SpanId, result: &SyscallResult) {
     // though no `a0` write occurs.
     let (ret, errno, result_kind) = match result {
         SyscallResult::Return(v) => (*v, 0, 0u8),
+        SyscallResult::CloneReturn { value, .. } => (*value, 0, 0u8),
         SyscallResult::Error(e) => (0, *e, 1u8),
         SyscallResult::NoReturn => (0, 0, 4u8),
         SyscallResult::ExecCommitted => (0, 0, 4u8),

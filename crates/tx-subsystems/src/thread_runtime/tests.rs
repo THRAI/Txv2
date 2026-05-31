@@ -10,17 +10,19 @@ use core::task::{Context, Poll, Waker};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::Wake;
+use std::vec::Vec;
 
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
 use crate::process::{bootstrap_init_process, step_fork, ExitStatus};
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::adapter::reactor_entry::{SyscallRequest, UserspaceTrapInfo};
-use crate::thread_runtime::adapter::step_engine::{Cap, PayloadCap};
+use crate::thread_runtime::adapter::step_engine::{sign, Cap, PayloadCap, ZoneAllocated};
 use crate::thread_runtime::execution::prepare_userspace_entry_payload;
 use crate::thread_runtime::step_thread_exit;
 use crate::thread_runtime::structure::{
-    drain_pending_syscall_return, reset_tid_counter_for_test, ThreadIdentity,
+    drain_pending_syscall_return, prewarm_thread_payload_slots, reset_tid_counter_for_test,
+    ThreadIdentity, ThreadPayload,
 };
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
@@ -50,6 +52,31 @@ fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
     let payload = payload_guard.as_ref().expect("alive");
     let threads = payload.threads.snapshot();
     threads[0].clone()
+}
+
+#[test]
+fn prewarm_thread_payload_slots_keeps_next_batch_off_slab_allocator() {
+    let _g = setup();
+
+    let zone = <ThreadPayload as ZoneAllocated>::zone();
+    let before = zone.allocated_slots();
+    let warmed = prewarm_thread_payload_slots(33);
+    assert_eq!(warmed, 33);
+    let after_prewarm = zone.allocated_slots();
+    assert!(
+        after_prewarm > before,
+        "prewarm should allocate reusable payload storage"
+    );
+
+    let mut caps = Vec::new();
+    for _ in 0..33 {
+        caps.push(sign(ThreadPayload::fresh()).expect("payload sign"));
+    }
+    assert_eq!(
+        zone.allocated_slots(),
+        after_prewarm,
+        "prewarmed payload slots should satisfy the next pthread-sized batch"
+    );
 }
 
 #[test]

@@ -29,4 +29,8 @@ pub use types::{
     USER_PAGE_SIZE,
 };
 
+pub(in crate::vm) use private::{
+    private_page_debug_samples, private_page_debug_totals, reset_private_page_debug_totals,
+};
 pub(in crate::vm) use recipe::{AddressSpaceStatsCell, RecipeIndex};
+pub(in crate::vm) use types::AddressSpaceStatsDelta;

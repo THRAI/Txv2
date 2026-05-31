@@ -113,6 +113,9 @@ impl PmapIf for StubPmap {
 
 impl EntropyIf for StubPmap {}
 impl tx_hal::AuxvIf for StubPmap {}
+impl tx_hal::ConsoleIf for StubPmap {
+    fn write_bytes(_bytes: &[u8]) {}
+}
 impl tx_hal::SmpIf for StubPmap {}
 
 impl TimeIf for StubPmap {

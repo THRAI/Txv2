@@ -4,6 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use core::sync::atomic::{AtomicU64, Ordering};
 use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
 use tx_subsystems::signal::{KillOutcome, SignalTarget};
@@ -11,6 +12,7 @@ use tx_subsystems::signal::{KillOutcome, SignalTarget};
 #[cfg(target_arch = "loongarch64")]
 const MUSL_SIGCANCEL: u8 = 33;
 const SI_TKILL: i32 = -6;
+static SIGPROCMASK_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
@@ -87,6 +89,21 @@ fn drain_stale_signal_events(mailbox: &crate::adapter::reactor_entry::TaskMailbo
     }
 }
 
+fn sigprocmask_trace_sample() -> Option<i64> {
+    let seq = SIGPROCMASK_TRACE_SAMPLE.fetch_add(1, Ordering::Relaxed);
+    (seq < 64 || seq.is_power_of_two()).then_some(seq as i64)
+}
+
+fn emit_sigprocmask_debug(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
+
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)` per `SIGNAL_v1` §3.
 ///
 /// `sigsetsize` is rejected with `-EINVAL` for any value other than
@@ -94,12 +111,33 @@ fn drain_stale_signal_events(mailbox: &crate::adapter::reactor_entry::TaskMailbo
 /// `u64` bitset). `set_ptr == 0` means "query only"; `oldset_ptr == 0`
 /// means "don't return the previous mask".
 pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    sys_rt_sigprocmask_thread_aspace(args, &ctx.thread, &ctx.aspace)
+}
+
+pub(super) fn sys_rt_sigprocmask_thread_aspace(
+    args: [u64; 6],
+    thread: &Cap<ThreadIdentity>,
+    aspace: &Cap<AddressSpace>,
+) -> SyscallResult {
     let how_raw = args[0] as i32;
     let set_ptr = args[1] as usize;
     let oldset_ptr = args[2] as usize;
     let sigsetsize = args[3];
+    let trace_seq = sigprocmask_trace_sample();
+    if let Some(seq) = trace_seq {
+        emit_sigprocmask_debug(b"debug.sigprocmask.enter", seq);
+        emit_sigprocmask_debug(
+            b"debug.sigprocmask.args",
+            (how_raw as i64 & 0xff)
+                | (i64::from(set_ptr != 0) << 8)
+                | (i64::from(oldset_ptr != 0) << 9),
+        );
+    }
 
     if sigsetsize != SIGSETSIZE_BYTES {
+        if let Some(seq) = trace_seq {
+            emit_sigprocmask_debug(b"debug.sigprocmask.bad_size", seq);
+        }
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
@@ -123,65 +161,71 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let next_mask = if set_ptr == 0 {
         SignalMask::EMPTY
     } else {
-        match bootstrap_read_user::<u64>(&ctx.aspace, set_ptr as u64) {
+        match bootstrap_read_user::<u64>(aspace, set_ptr as u64) {
             Ok(bits) => SignalMask::new(bits),
-            Err(errno) => return SyscallResult::error_from(errno),
+            Err(errno) => {
+                if let Some(seq) = trace_seq {
+                    emit_sigprocmask_debug(b"debug.sigprocmask.read.err", seq);
+                }
+                return SyscallResult::error_from(errno);
+            }
         }
     };
+    if let Some(seq) = trace_seq {
+        emit_sigprocmask_debug(b"debug.sigprocmask.read.after", seq);
+    }
 
-    // If `set` is null we still need the previous mask to satisfy
-    // `oldset_ptr`. `step_sigprocmask` returns `prev` from the
-    // change record, so call it with `SetMask` of the *current* bits
-    // (a no-op, plus it uniformly produces a `Replaced` record). The
-    // simpler approach: skip the call and read the mask directly via
-    // `step_sigprocmask` invoked with a no-op `SetMask` of `prev`...
-    // but the cleanest shape is to call `step_sigprocmask` always
-    // when `how` is Some, and for the query-only branch bypass it.
+    // If `set` is null, this is query-only. Read the current mask directly
+    // instead of driving a no-op SigprocmaskOp: the no-op path still refreshes
+    // signal deliverability, which is unnecessary work on pthread lifecycle
+    // probes.
     let prev_mask: SignalMask = match how {
-        Some(how) => {
-            let mut script_ctx = build_subject_script_ctx(ctx);
-            let mut op = SigprocmaskOp {
-                thread: ctx.thread.clone(),
-                how,
-                next: next_mask,
-            };
-            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-                Ok(SigprocmaskChange::Replaced { prev, .. }) => prev,
-                Ok(SigprocmaskChange::ZombieIgnored) => {
-                    return SyscallResult::Error(ESRCH_VALUE);
+        Some(how) => match step_sigprocmask(thread, how, next_mask) {
+            SigprocmaskChange::Replaced { prev, .. } => {
+                if let Some(seq) = trace_seq {
+                    emit_sigprocmask_debug(b"debug.sigprocmask.step.after", seq);
                 }
-                Err(v3errno) => {
-                    return SyscallResult::error_from(Errno::from(v3errno));
-                }
+                prev
             }
-        }
+            SigprocmaskChange::ZombieIgnored => {
+                if let Some(seq) = trace_seq {
+                    emit_sigprocmask_debug(b"debug.sigprocmask.step.zombie", seq);
+                }
+                return SyscallResult::Error(ESRCH_VALUE);
+            }
+        },
         None => {
-            let mut script_ctx = build_subject_script_ctx(ctx);
-            let mut op = SigprocmaskOp {
-                thread: ctx.thread.clone(),
-                how: SigmaskHow::Block,
-                next: SignalMask::EMPTY,
+            let Some(payload) = thread.payload_cap() else {
+                if let Some(seq) = trace_seq {
+                    emit_sigprocmask_debug(b"debug.sigprocmask.mask.zombie", seq);
+                }
+                return SyscallResult::Error(ESRCH_VALUE);
             };
-            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-                Ok(SigprocmaskChange::Replaced { prev, .. }) => prev,
-                Ok(SigprocmaskChange::ZombieIgnored) => {
-                    return SyscallResult::Error(ESRCH_VALUE);
-                }
-                Err(v3errno) => {
-                    return SyscallResult::error_from(Errno::from(v3errno));
-                }
+            let mask = payload.signal_mask();
+            if let Some(seq) = trace_seq {
+                emit_sigprocmask_debug(b"debug.sigprocmask.mask.after", seq);
             }
+            mask
         }
     };
 
     if oldset_ptr != 0 {
         if let Err(errno) =
-            bootstrap_write_user::<u64>(&ctx.aspace, oldset_ptr as u64, prev_mask.raw_bits())
+            bootstrap_write_user::<u64>(aspace, oldset_ptr as u64, prev_mask.raw_bits())
         {
+            if let Some(seq) = trace_seq {
+                emit_sigprocmask_debug(b"debug.sigprocmask.write.err", seq);
+            }
             return SyscallResult::error_from(errno);
+        }
+        if let Some(seq) = trace_seq {
+            emit_sigprocmask_debug(b"debug.sigprocmask.write.after", seq);
         }
     }
 
+    if let Some(seq) = trace_seq {
+        emit_sigprocmask_debug(b"debug.sigprocmask.return", seq);
+    }
     SyscallResult::Return(0)
 }
 

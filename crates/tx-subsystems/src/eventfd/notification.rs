@@ -43,6 +43,8 @@ mod readiness {
         let writer_source_id = crate::allocate_notification_source_id();
         let reader_source = wait_routing::new_wait_source(reader_source_id);
         let writer_source = wait_routing::new_wait_source(writer_source_id);
+        crate::wait_source::register_wait_channel_with_id(reader_source_id, reader_channel.clone());
+        crate::wait_source::register_wait_channel_with_id(writer_source_id, writer_channel.clone());
         EventfdWaitPoints {
             reader_channel,
             reader_source_id,

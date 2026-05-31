@@ -12,6 +12,197 @@ fn tty_readable_level(tty: &Cap<tx_subsystems::tty::structure::TtyIdentity>) -> 
     tty.input_readable.peek() & TTY_READABLE != 0
 }
 
+#[derive(Clone, Copy)]
+enum SelectDir {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StaticCharDevice {
+    Null,
+    Zero,
+}
+
+static STATIC_ZERO_READ_BUF: [u8; TTY_WRITE_MAX_INLINE] = [0u8; TTY_WRITE_MAX_INLINE];
+
+fn static_char_device(file: &Cap<OpenFile>) -> Option<StaticCharDevice> {
+    use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload};
+
+    let OpenFileBacking::Rnode { rnode } = file.backing() else {
+        return None;
+    };
+    let RNodeBacking::StructBacked {
+        payload: StructPayload::CharDevice(binding),
+    } = rnode.backing()
+    else {
+        return None;
+    };
+
+    match (binding.name, binding.devt.major(), binding.devt.minor()) {
+        ("null", 1, 3) => Some(StaticCharDevice::Null),
+        ("zero", 1, 5) => Some(StaticCharDevice::Zero),
+        _ => None,
+    }
+}
+
+pub(super) fn dispatch_static_chardev_immediate(
+    req: &SyscallRequest,
+    process: &Cap<ProcessIdentity>,
+    aspace: &Cap<AddressSpace>,
+) -> Option<SyscallResult> {
+    match req.nr {
+        NR_READ => read_static_chardev_immediate(req.args, process, aspace),
+        NR_WRITE => write_static_chardev_immediate(req.args, process),
+        _ => None,
+    }
+}
+
+pub(super) fn dispatch_static_chardev_cap_immediate(
+    req: &SyscallRequest,
+    process: &Cap<ProcessIdentity>,
+) -> Option<SyscallResult> {
+    match req.nr {
+        NR_WRITE => write_static_chardev_immediate(req.args, process),
+        _ => None,
+    }
+}
+
+fn write_static_chardev_immediate(
+    args: [u64; 6],
+    process: &Cap<ProcessIdentity>,
+) -> Option<SyscallResult> {
+    let fd = args[0] as i32;
+    let len = args[2] as usize;
+    if fd < 0 {
+        return None;
+    }
+
+    let file = match resolve_fd(process, fd as u32) {
+        Some(file) => file,
+        None => return None,
+    };
+    if static_char_device(&file) != Some(StaticCharDevice::Null) {
+        return None;
+    }
+    if !file.flags().write {
+        return Some(SyscallResult::Error(EINVAL_VALUE));
+    }
+
+    let len = core::cmp::min(len, TTY_WRITE_MAX_INLINE);
+    Some(SyscallResult::Return(len as i64))
+}
+
+fn read_static_chardev_immediate(
+    args: [u64; 6],
+    process: &Cap<ProcessIdentity>,
+    aspace: &Cap<AddressSpace>,
+) -> Option<SyscallResult> {
+    let fd = args[0] as i32;
+    let buf_ptr = args[1] as usize;
+    let len = args[2] as usize;
+    if fd < 0 {
+        return None;
+    }
+
+    let file = match resolve_fd(process, fd as u32) {
+        Some(file) => file,
+        None => return None,
+    };
+    if static_char_device(&file) != Some(StaticCharDevice::Zero) {
+        return None;
+    }
+    if !file.flags().read {
+        return Some(SyscallResult::Error(EINVAL_VALUE));
+    }
+
+    let len = core::cmp::min(len, TTY_WRITE_MAX_INLINE);
+    if len == 0 {
+        return Some(SyscallResult::Return(0));
+    }
+    if let Err(errno) = bootstrap_copy_to_user(aspace, buf_ptr as u64, &STATIC_ZERO_READ_BUF[..len])
+    {
+        return Some(SyscallResult::error_from(errno));
+    }
+    Some(SyscallResult::Return(len as i64))
+}
+
+fn fdset_bytes(nfds: u64) -> Result<usize, SyscallResult> {
+    if nfds > 1024 {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    Ok(nfds.div_ceil(64).saturating_mul(8) as usize)
+}
+
+fn fdset_get(bits: &[u8], fd: u64) -> bool {
+    let byte = (fd / 8) as usize;
+    let bit = (fd % 8) as u8;
+    bits.get(byte)
+        .map(|b| (b & (1u8 << bit)) != 0)
+        .unwrap_or(false)
+}
+
+fn fdset_clear(bits: &mut [u8], fd: u64) {
+    let byte = (fd / 8) as usize;
+    let bit = (fd % 8) as u8;
+    if let Some(b) = bits.get_mut(byte) {
+        *b &= !(1u8 << bit);
+    }
+}
+
+fn select_fd_ready(
+    file: &Cap<OpenFile>,
+    dir: SelectDir,
+) -> (
+    bool,
+    Option<(
+        crate::adapter::step_engine::WaitSourceId,
+        crate::adapter::step_engine::InterestMask,
+    )>,
+) {
+    use crate::adapter::step_engine::{InterestMask, WaitSourceId};
+    use tx_subsystems::pipe::PipeSide;
+    use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
+
+    if let Some((pipe, side)) = file.pipe_endpoint() {
+        return match (dir, side) {
+            (SelectDir::Read, PipeSide::Reader) => (
+                pipe.readable_level(),
+                Some((
+                    WaitSourceId::new(pipe.reader_source_id()),
+                    InterestMask::new(0x1),
+                )),
+            ),
+            (SelectDir::Write, PipeSide::Writer) => (
+                pipe.writable_level(),
+                Some((
+                    WaitSourceId::new(pipe.writer_source_id()),
+                    InterestMask::new(0x2),
+                )),
+            ),
+            // Linux reports the wrong-direction end as not ready for
+            // the requested operation; there is no useful wait source.
+            _ => (false, None),
+        };
+    }
+
+    match file.rnode().backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::Tty(tty),
+        } => match dir {
+            SelectDir::Read => (
+                tty_readable_level(tty),
+                Some((
+                    WaitSourceId::new(tty.wait_source_id()),
+                    InterestMask::new(0x1),
+                )),
+            ),
+            SelectDir::Write => (true, None),
+        },
+        _ => (true, None),
+    }
+}
+
 async fn wait_for_tty_readable(tty: Cap<tx_subsystems::tty::structure::TtyIdentity>) {
     use reactor_entry::{Mask, WaitProtocol};
     use tx_subsystems::tty::execution::TTY_READABLE;
@@ -52,6 +243,8 @@ async fn wait_for_tty_readable(tty: Cap<tx_subsystems::tty::structure::TtyIdenti
 pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let iov_ptr = args[1];
     let iovcnt = args[2] as i32;
+    emit_debug_counter(b"debug.writev.enter", args[0] as i64);
+    emit_debug_counter(b"debug.writev.iovcnt", iovcnt as i64);
 
     if !(0..=1024).contains(&iovcnt) {
         return SyscallResult::Error(EINVAL_VALUE);
@@ -62,18 +255,19 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
 
     const IOVEC_BYTES: u64 = 16;
     let fd = args[0] as i32;
-    let stdio_tty_fast_path = (fd == 1 || fd == 2)
-        && resolve_fd(&ctx.process, fd as u32)
-            .map(|file| {
-                matches!(
-                    file.rnode().backing(),
-                    tx_subsystems::vfs::RNodeBacking::StructBacked {
-                        payload: tx_subsystems::vfs::StructPayload::Tty(_)
-                    }
-                )
-            })
-            .unwrap_or(false);
-    if stdio_tty_fast_path {
+    let stdio_tty_file = if fd == 1 || fd == 2 {
+        resolve_fd(&ctx.process, fd as u32).filter(|file| {
+            matches!(
+                file.rnode().backing(),
+                tx_subsystems::vfs::RNodeBacking::StructBacked {
+                    payload: tx_subsystems::vfs::StructPayload::Tty(_)
+                }
+            )
+        })
+    } else {
+        None
+    };
+    if let Some(file) = stdio_tty_file {
         let mut combined = alloc::vec::Vec::new();
         for i in 0..iovcnt as u64 {
             let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
@@ -96,15 +290,7 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             }
         }
 
-        let write_args = [
-            args[0],
-            combined.as_ptr() as u64,
-            combined.len() as u64,
-            0,
-            0,
-            0,
-        ];
-        return sys_write(write_args, ctx).await;
+        return sys_write_buffered(&file, &combined, ctx).await;
     }
 
     let mut total: i64 = 0;
@@ -149,6 +335,159 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         drop(step_engine::guard());
     }
     SyscallResult::Return(total)
+}
+
+/// PageBacked-only synchronous `writev(2)` lane.
+///
+/// This is intentionally narrower than [`sys_writev`]: it claims only regular
+/// PageBacked fds and only when each PageBacked write completes without a
+/// `Yield`. Other fd kinds, and future PageBacked backends that need to park,
+/// return `None` so the async `sys_writev` path remains the semantic fallback.
+pub(super) fn sys_writev_pagebacked_oneshot<'a>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> Option<SyscallResult> {
+    use tx_subsystems::vfs::structure::RNodeBacking;
+
+    let fd = args[0] as i32;
+    let iov_ptr = args[1];
+    let iovcnt = args[2] as i32;
+    emit_debug_counter(b"debug.writev.pagebacked_oneshot.enter", fd as i64);
+    emit_debug_counter(b"debug.writev.pagebacked_oneshot.iovcnt", iovcnt as i64);
+
+    if !(0..=1024).contains(&iovcnt) {
+        return Some(SyscallResult::Error(EINVAL_VALUE));
+    }
+    if iovcnt == 0 {
+        return Some(SyscallResult::Return(0));
+    }
+    if fd < 0 {
+        return Some(SyscallResult::Error(EBADF_VALUE));
+    }
+
+    let file = match resolve_fd(&ctx.process, fd as u32) {
+        Some(file) => file,
+        None => return Some(SyscallResult::Error(EBADF_VALUE)),
+    };
+
+    if file.posix_mq().is_some() || file.eventfd().is_some() {
+        return None;
+    }
+
+    let pc = match file.rnode().backing() {
+        RNodeBacking::PageBacked { pc } => pc.clone(),
+        _ => return None,
+    };
+    if !file.flags().write {
+        return Some(SyscallResult::Error(EINVAL_VALUE));
+    }
+
+    const IOVEC_BYTES: u64 = 16;
+    let mut total: i64 = 0;
+    for i in 0..iovcnt as u64 {
+        let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
+        let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
+            if total > 0 {
+                return Some(SyscallResult::Return(total));
+            }
+            return Some(SyscallResult::error_from(errno));
+        }
+        let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
+        let len = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap()) as usize;
+        if len == 0 {
+            continue;
+        }
+
+        emit_debug_counter(b"debug.write.enter", fd as i64);
+        emit_debug_counter(b"debug.write.len", len as i64);
+        emit_debug_counter(b"debug.write.pagebacked.len", len as i64);
+
+        if let Some(range) = super::user_copy::covering_user_range(base, len) {
+            use crate::adapter::step_engine::StepOutcome as V3;
+            use tx_subsystems::vm::UserAccessKind;
+            match ctx
+                .aspace
+                .reserve_user_range_for_access(range, UserAccessKind::Read)
+            {
+                V3::Done(()) => {}
+                V3::Err(e) => {
+                    if total > 0 {
+                        return Some(SyscallResult::Return(total));
+                    }
+                    let errno: tx_subsystems::execution::Errno = e.into();
+                    return Some(SyscallResult::error_from(errno));
+                }
+                V3::Yield { .. } | V3::Continue { .. } => {
+                    if total > 0 {
+                        return Some(SyscallResult::Return(total));
+                    }
+                    return None;
+                }
+            }
+        }
+
+        let guard = crate::adapter::step_engine::guard();
+        match tx_subsystems::page_backed::step_write_from_user(
+            &pc,
+            &file,
+            &ctx.aspace,
+            tx_hal::UserPtr::<u8>::new(base as usize),
+            len,
+            &guard,
+        ) {
+            tx_substrate::step::StepOutcome::Done(n) => {
+                total += n as i64;
+                if n < len {
+                    return Some(SyscallResult::Return(total));
+                }
+            }
+            tx_substrate::step::StepOutcome::Continue { progress } => {
+                total += progress.bytes() as i64;
+                return Some(SyscallResult::Return(total));
+            }
+            tx_substrate::step::StepOutcome::Err(e) => {
+                if total > 0 {
+                    return Some(SyscallResult::Return(total));
+                }
+                let errno: tx_subsystems::execution::Errno = e.into();
+                if errno == tx_subsystems::execution::Errno::EPIPE {
+                    let _ = tx_subsystems::signal::step_kill_process(
+                        &ctx.process,
+                        tx_subsystems::signal::Signum::SIGPIPE,
+                        None,
+                    );
+                }
+                return Some(SyscallResult::error_from(errno));
+            }
+            tx_substrate::step::StepOutcome::Yield { .. } => {
+                if total > 0 {
+                    return Some(SyscallResult::Return(total));
+                }
+                return None;
+            }
+        }
+        drop(guard);
+        drop(step_engine::guard());
+    }
+
+    Some(SyscallResult::Return(total))
+}
+
+pub(super) fn sys_writev_pagebacked_candidate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> bool {
+    use tx_subsystems::vfs::structure::RNodeBacking;
+
+    let fd = args[0] as i32;
+    if fd < 0 {
+        return false;
+    }
+    let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
+        return false;
+    };
+    if file.posix_mq().is_some() || file.eventfd().is_some() {
+        return false;
+    }
+    matches!(file.rnode().backing(), RNodeBacking::PageBacked { .. })
 }
 
 /// `readv(fd, iov, iovcnt)` — scatter-read counterpart of `sys_writev`.
@@ -374,6 +713,168 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     SyscallResult::Return(ready)
 }
 
+/// `pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)`.
+///
+/// This is the Linux generic syscall used by musl's `select(3)`
+/// wrapper on RV64. The implementation is intentionally narrow but
+/// real: it rewrites fd_set outputs, reports pipe/TTY readiness by
+/// level, and parks on the first pipe/TTY wait source when no fd is
+/// ready and the timeout is not the zero timeout. Signal-mask handling
+/// is deferred, matching the existing `ppoll` surface.
+pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let nfds = args[0];
+    let readfds_ptr = args[1];
+    let writefds_ptr = args[2];
+    let exceptfds_ptr = args[3];
+    let timeout_ptr = args[4];
+
+    let bytes = match fdset_bytes(nfds) {
+        Ok(bytes) => bytes,
+        Err(result) => return result,
+    };
+
+    if nfds == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    let timeout_ns = if timeout_ptr == 0 {
+        None
+    } else {
+        let mut ts = [0u8; 16];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ts, timeout_ptr) {
+            return SyscallResult::error_from(errno);
+        }
+        let sec = i64::from_le_bytes(ts[0..8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(ts[8..16].try_into().unwrap());
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        Some(
+            (sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(nsec as u64),
+        )
+    };
+    let wait_allowed = timeout_ns != Some(0);
+
+    let mut readfds = alloc::vec![0u8; bytes];
+    let mut writefds = alloc::vec![0u8; bytes];
+    let mut exceptfds = alloc::vec![0u8; bytes];
+    if readfds_ptr != 0 {
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut readfds, readfds_ptr) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    if writefds_ptr != 0 {
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut writefds, writefds_ptr) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    if exceptfds_ptr != 0 {
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut exceptfds, exceptfds_ptr) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    loop {
+        let mut out_read = readfds.clone();
+        let mut out_write = writefds.clone();
+        let mut out_except = exceptfds.clone();
+        let mut ready = 0i64;
+        let mut park_source = None;
+
+        for fd in 0..nfds {
+            if readfds_ptr != 0 && fdset_get(&readfds, fd) {
+                let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
+                    return SyscallResult::Error(EBADF_VALUE);
+                };
+                let (is_ready, source) = select_fd_ready(&file, SelectDir::Read);
+                if is_ready {
+                    ready += 1;
+                } else {
+                    fdset_clear(&mut out_read, fd);
+                    if park_source.is_none() {
+                        park_source = source;
+                    }
+                }
+            }
+            if writefds_ptr != 0 && fdset_get(&writefds, fd) {
+                let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
+                    return SyscallResult::Error(EBADF_VALUE);
+                };
+                let (is_ready, source) = select_fd_ready(&file, SelectDir::Write);
+                if is_ready {
+                    ready += 1;
+                } else {
+                    fdset_clear(&mut out_write, fd);
+                    if park_source.is_none() {
+                        park_source = source;
+                    }
+                }
+            }
+            if exceptfds_ptr != 0 && fdset_get(&exceptfds, fd) {
+                // No exceptional conditions are modelled yet.
+                fdset_clear(&mut out_except, fd);
+            }
+        }
+
+        if ready > 0 || !wait_allowed || park_source.is_none() {
+            if readfds_ptr != 0 {
+                if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, readfds_ptr, &out_read) {
+                    return SyscallResult::error_from(errno);
+                }
+            }
+            if writefds_ptr != 0 {
+                if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, writefds_ptr, &out_write) {
+                    return SyscallResult::error_from(errno);
+                }
+            }
+            if exceptfds_ptr != 0 {
+                if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, exceptfds_ptr, &out_except)
+                {
+                    return SyscallResult::error_from(errno);
+                }
+            }
+            return SyscallResult::Return(ready);
+        }
+
+        let Some((source, interests)) = park_source else {
+            if let Some(ns) = timeout_ns {
+                if ns != 0 {
+                    sleep_for_select_timeout::<P>(ctx, ns).await;
+                }
+            }
+            return SyscallResult::Return(0);
+        };
+        super::await_wait_source(ctx, source, interests).await;
+    }
+}
+
+async fn sleep_for_select_timeout<'a, P: tx_hal::TimeIf>(ctx: &SyscallCtx<'a>, ns: u64) {
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = tx_subsystems::vfs::composite::NanosleepOp {
+        nanos: ns,
+        deadline_ns: <P as tx_hal::TimeIf>::read_ns().saturating_add(ns),
+        started: false,
+    };
+    let _ = drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await;
+}
+
 /// PageBacked `write(2)` — direct user-buffer path.
 ///
 /// Prefaults the user buffer through `reserve_user_range_for_access`,
@@ -386,9 +887,11 @@ async fn sys_write_pagebacked<'a>(
     len: usize,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
+    emit_debug_counter(b"debug.write.pagebacked.len", len as i64);
     if len == 0 {
         return SyscallResult::Return(0);
     }
+    emit_debug_counter(b"debug.write.pagebacked.phase", 0);
 
     // Prefault: eagerly materialise every user page and publish to
     // the pmap so the step loop below finds every page in the cache.
@@ -398,19 +901,26 @@ async fn sys_write_pagebacked<'a>(
         use crate::adapter::step_engine::StepOutcome as V3;
         use tx_subsystems::vm::UserAccessKind;
         let _guard = crate::adapter::step_engine::guard();
+        emit_debug_counter(b"debug.write.pagebacked.phase", 1);
         match ctx
             .aspace
             .reserve_user_range_for_access(range, UserAccessKind::Read)
         {
-            V3::Done(()) => {}
+            V3::Done(()) => {
+                emit_debug_counter(b"debug.write.pagebacked.phase", 2);
+            }
             V3::Err(e) => {
+                emit_debug_counter(b"debug.write.pagebacked.err", 1);
                 let errno: tx_subsystems::execution::Errno = e.into();
                 return SyscallResult::error_from(errno);
             }
             V3::Yield { .. } | V3::Continue { .. } => {
+                emit_debug_counter(b"debug.write.pagebacked.err", 2);
                 return SyscallResult::error_from(tx_subsystems::execution::Errno::EIO);
             }
         }
+    } else {
+        emit_debug_counter(b"debug.write.pagebacked.phase", 2);
     }
 
     // Drive the write-from-user step loop.
@@ -433,6 +943,7 @@ async fn sys_write_pagebacked<'a>(
         len,
         cursor: 0,
     };
+    emit_debug_counter(b"debug.write.pagebacked.phase", 3);
     match drive(
         op,
         &mut script_ctx,
@@ -443,8 +954,13 @@ async fn sys_write_pagebacked<'a>(
     )
     .await
     {
-        Ok(total) => SyscallResult::Return(total as i64),
+        Ok(total) => {
+            emit_debug_counter(b"debug.write.pagebacked.done", total as i64);
+            emit_debug_counter(b"debug.write.pagebacked.phase", 4);
+            SyscallResult::Return(total as i64)
+        }
         Err(v3errno) => {
+            emit_debug_counter(b"debug.write.pagebacked.err", 3);
             let errno: tx_subsystems::execution::Errno = v3errno.into();
             if errno == tx_subsystems::execution::Errno::EPIPE {
                 let _ = tx_subsystems::signal::step_kill_process(
@@ -462,6 +978,8 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let fd = args[0] as i32;
     let buf_ptr = args[1] as usize;
     let len = args[2] as usize;
+    emit_debug_counter(b"debug.write.enter", fd as i64);
+    emit_debug_counter(b"debug.write.len", len as i64);
 
     if fd < 0 {
         return SyscallResult::Error(EBADF_VALUE);
@@ -499,6 +1017,44 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         core::cmp::min(len, TTY_WRITE_MAX_INLINE)
     };
 
+    if static_char_device(&file) == Some(StaticCharDevice::Null) {
+        if !file.flags().write {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        return SyscallResult::Return(len as i64);
+    }
+
+    if let Some((pipe, tx_subsystems::pipe::PipeSide::Writer)) = file.pipe_endpoint() {
+        if len == 0 {
+            return SyscallResult::Return(0);
+        }
+        let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
+            return SyscallResult::error_from(errno);
+        }
+        let guard = crate::adapter::step_engine::guard();
+        match tx_subsystems::pipe::step_write(&pipe, &bytes, &guard, file.flags().nonblocking) {
+            crate::adapter::step_engine::StepOutcome::Done(n) => {
+                return SyscallResult::Return(n as i64);
+            }
+            crate::adapter::step_engine::StepOutcome::Continue { progress } => {
+                return SyscallResult::Return(progress.bytes() as i64);
+            }
+            crate::adapter::step_engine::StepOutcome::Err(errno) => {
+                let errno: tx_subsystems::execution::Errno = errno.into();
+                if errno == tx_subsystems::execution::Errno::EPIPE {
+                    let _ = tx_subsystems::signal::step_kill_process(
+                        &ctx.process,
+                        tx_subsystems::signal::Signum::SIGPIPE,
+                        None,
+                    );
+                }
+                return SyscallResult::error_from(errno);
+            }
+            crate::adapter::step_engine::StepOutcome::Yield { .. } => {}
+        }
+    }
+
     // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).
     // Prefault the user buffer in the observe phase, then drive the
     // write through the pmap without kernel-buffer staging.
@@ -523,15 +1079,14 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         }
     }
 
-    // PR-9 phase 3b: drive `OpenFile::step_write` via the
-    // `OpenFileWriteOp` StepOp wrap and the v3 `drive()` loop
-    // (per `docs/Txv3/03_STEP_MODEL_v2.md` §8).
-    //
-    // The source buffer (`bytes`) is consumed by successive
-    // `step()` calls (cursor tracked internally by
-    // `OpenFileWriteOp`). After `drive()` returns, the return
-    // value is the total bytes written.
+    sys_write_buffered(&file, &bytes, ctx).await
+}
 
+async fn sys_write_buffered<'a>(
+    file: &Cap<OpenFile>,
+    bytes: &[u8],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
     use tx_subsystems::vfs::execution::OpenFileWriteOp;
@@ -548,8 +1103,8 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = OpenFileWriteOp {
-        file: &file,
-        bytes: &bytes,
+        file,
+        bytes,
         cursor: 0,
     };
     match drive(
@@ -577,6 +1132,16 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             }
             SyscallResult::error_from(errno)
         }
+    }
+}
+
+fn emit_debug_counter(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+        tx_observe::dump_registered_if_requested();
     }
 }
 
@@ -723,6 +1288,18 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
 
     if len == 0 {
         return SyscallResult::Return(0);
+    }
+
+    if static_char_device(&file) == Some(StaticCharDevice::Zero) {
+        if !file.flags().read {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        if let Err(errno) =
+            bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &STATIC_ZERO_READ_BUF[..len])
+        {
+            return SyscallResult::error_from(errno);
+        }
+        return SyscallResult::Return(len as i64);
     }
 
     // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).

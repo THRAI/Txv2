@@ -693,11 +693,14 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
         ctx.process.set_fd_cloexec(writer_fd, true);
     }
 
-    // Write the (reader_fd, writer_fd) pair back to userspace
-    // through the canonical user-VA lane.
-    if let Err(errno) =
-        bootstrap_write_user::<[u32; 2]>(&ctx.aspace, pipefd_uaddr, [reader_fd, writer_fd])
-    {
+    // Write the (reader_fd, writer_fd) pair back to userspace as the
+    // Linux ABI's two adjacent little-endian `int` slots. Keep this
+    // byte-explicit instead of relying on a typed `[u32; 2]` write so
+    // fd publication is independent of Rust aggregate layout details.
+    let mut pipefd_bytes = [0u8; 8];
+    pipefd_bytes[0..4].copy_from_slice(&reader_fd.to_le_bytes());
+    pipefd_bytes[4..8].copy_from_slice(&writer_fd.to_le_bytes());
+    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, pipefd_uaddr, &pipefd_bytes) {
         return SyscallResult::error_from(errno);
     }
 

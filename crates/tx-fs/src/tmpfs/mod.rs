@@ -53,14 +53,13 @@ const TMPFS_FIRST_FREE_OBJECT_ID: u64 = 3;
 /// `PageContainer::new` requires a fixed `page_count` capacity at
 /// allocation time (see `PageContainer::check_bounds`); tmpfs files
 /// are created with this cap and `size_bytes` grows lazily through
-/// `step_write` / `step_truncate`. 4 MiB ÷ 4 KiB pages is enough for
-/// every Phase 3b workload (init's preopened fds plus the test fixtures);
-/// raising the cap is a backward-compatible follow-up once a sparse
-/// page-count growth shape lands.
+/// `step_write` / `step_truncate`. 8 MiB ÷ 4 KiB pages covers the
+/// musl libcbench `tmpfile()` stdio path, which writes 5,000,000
+/// bytes before reading the same file back.
 // TODO(phase-vfs-tmpfs-grow): teach `PageContainer` to grow `page_count`
 // on demand so tmpfs files are bounded only by global swap pressure
 // rather than by this static cap.
-const TMPFS_FILE_PAGE_CAP: u64 = 1024;
+const TMPFS_FILE_PAGE_CAP: u64 = 2048;
 
 /// Maximum length of an inline symlink target, in bytes.
 ///

@@ -10,7 +10,8 @@ use super::adapter::step_engine::{self as step_engine, guard, page_allocator, Er
 use tx_subsystems::cred::{Capability, CapabilitySet};
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::{
-    Credential, DirCursor, FsObjectId, FsOps, InodeKind, RNodeBacking, S_IFMT, S_ISGID, S_ISUID,
+    Credential, DirCursor, FsObjectId, FsOps, InodeKind, OpenFile, OpenFileFlags, RNodeBacking,
+    S_IFMT, S_ISGID, S_ISUID,
 };
 
 use super::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
@@ -421,7 +422,7 @@ fn tmpfs_materialise_rnode_for_regular_file_returns_page_backed() {
     match rnode.backing() {
         RNodeBacking::PageBacked { pc } => {
             // Sanity: the container's `page_count` matches tmpfs's
-            // static cap (`TMPFS_FILE_PAGE_CAP = 1024`). `size_bytes`
+            // static cap (`TMPFS_FILE_PAGE_CAP = 2048`). `size_bytes`
             // initialises to `page_count * USER_PAGE_SIZE` (the
             // PageContainer's capacity); inode-visible size lives on
             // `InodeMeta::size`, not the container, so we don't pin
@@ -430,13 +431,80 @@ fn tmpfs_materialise_rnode_for_regular_file_returns_page_backed() {
             // RNode means writes via `FsPageBacking` and reads via
             // `OpenFile::step_read` / `read_exact_at` see the same
             // underlying pages.
-            assert_eq!(pc.page_count(), 1024, "tmpfs file page-cap shape");
+            assert_eq!(pc.page_count(), 2048, "tmpfs file page-cap shape");
         }
         other => panic!("expected PageBacked backing for regular file, got {other:?}"),
     }
     // RNode meta round-trips the input meta.
     assert_eq!(rnode.fs_object_id(), file_id);
     assert_eq!(rnode.meta().kind(), InodeKind::Regular);
+}
+
+#[test]
+fn tmpfs_tmpfile_shape_read_after_write_survives_unlink() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (file_id, file_meta) = match tmpfs.create_inode(
+        TMPFS_ROOT_OBJECT_ID,
+        b"tmpfile_probe",
+        0o100600,
+        &cred,
+        &guard,
+    ) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create_inode failed: {other:?}"),
+    };
+    let rnode = match <Tmpfs as FsOps>::materialise_rnode(
+        &*tmpfs,
+        file_id,
+        file_meta,
+        &test_mount_payload(&tmpfs),
+        &guard,
+    ) {
+        StepOutcome::Done(rnode) => rnode,
+        other => panic!("materialise_rnode failed: {other:?}"),
+    };
+    let file = OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+        },
+    )
+    .expect("open tmpfile-shaped file");
+
+    let payload: alloc::vec::Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+    assert_eq!(
+        file.step_write(&payload, &guard),
+        StepOutcome::Done(payload.len())
+    );
+
+    assert_eq!(
+        tmpfs.unlink(TMPFS_ROOT_OBJECT_ID, b"tmpfile_probe", file_id, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"tmpfile_probe", &guard),
+        StepOutcome::Err(Errno::ENOENT)
+    );
+
+    assert_eq!(file.step_lseek(0, 0, &guard), StepOutcome::Done(0));
+    let mut readback = alloc::vec![0u8; payload.len()];
+    assert_eq!(
+        file.step_read(&mut readback, &guard),
+        StepOutcome::Done(payload.len())
+    );
+    assert_eq!(readback, payload);
 }
 
 #[test]

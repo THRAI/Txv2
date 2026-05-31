@@ -455,16 +455,52 @@ impl PageContainer {
         access: MaterializeAccess,
         guard: &Guard<'_>,
     ) -> StepOutcome<MaterializedPage, NoProgress> {
+        emit_pagebacked_trace(
+            b"debug.pagebacked.fault_step.enter",
+            access_trace_id(access),
+        );
+        emit_pagebacked_trace(b"debug.pagebacked.fault_step.page", page.as_u64() as i64);
         match &self.kind {
-            PageContainerKind::Anon { .. } => match self.materialize_anon(page, access) {
-                Ok(page) => StepOutcome::Done(page),
-                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
-            },
+            PageContainerKind::Anon { .. } => {
+                emit_pagebacked_trace(b"debug.pagebacked.fault_step.kind", 1);
+                match self.materialize_anon(page, access) {
+                    Ok(page) => {
+                        emit_pagebacked_trace(b"debug.pagebacked.fault_step.done", 1);
+                        StepOutcome::Done(page)
+                    }
+                    Err(error) => {
+                        emit_pagebacked_trace(b"debug.pagebacked.fault_step.err", 1);
+                        StepOutcome::Err(page_cache_error_to_errno(error).into())
+                    }
+                }
+            }
             PageContainerKind::File {
                 mount,
                 fs_object_id,
-            } => self.materialize_file_page(page, access, mount, *fs_object_id, guard),
+            } => {
+                emit_pagebacked_trace(b"debug.pagebacked.fault_step.kind", 2);
+                match self.materialize_file_page(page, access, mount, *fs_object_id, guard) {
+                    StepOutcome::Done(page) => {
+                        emit_pagebacked_trace(b"debug.pagebacked.fault_step.done", 2);
+                        StepOutcome::Done(page)
+                    }
+                    StepOutcome::Yield { progress, shape } => {
+                        emit_pagebacked_trace(b"debug.pagebacked.fault_step.yield", 2);
+                        StepOutcome::Yield { progress, shape }
+                    }
+                    StepOutcome::Err(errno) => {
+                        emit_pagebacked_trace(b"debug.pagebacked.fault_step.err", 2);
+                        StepOutcome::Err(errno)
+                    }
+                    StepOutcome::Continue { progress } => {
+                        emit_pagebacked_trace(b"debug.pagebacked.fault_step.continue", 2);
+                        StepOutcome::Continue { progress }
+                    }
+                }
+            }
             PageContainerKind::Device { .. } => {
+                emit_pagebacked_trace(b"debug.pagebacked.fault_step.kind", 3);
+                emit_pagebacked_trace(b"debug.pagebacked.fault_step.err", 3);
                 StepOutcome::Err(page_cache_error_to_errno(PageCacheError::UnsupportedKind).into())
             }
         }
@@ -968,6 +1004,22 @@ const fn page_cache_error_to_errno(error: PageCacheError) -> Errno {
         PageCacheError::OutOfBounds | PageCacheError::UnsupportedKind => Errno::EINVAL,
         PageCacheError::Backend(errno) => errno,
         PageCacheError::Alloc(_) => Errno::ENOMEM,
+    }
+}
+
+fn emit_pagebacked_trace(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+    }
+}
+
+const fn access_trace_id(access: MaterializeAccess) -> i64 {
+    match access {
+        MaterializeAccess::Read => 1,
+        MaterializeAccess::Write => 2,
     }
 }
 

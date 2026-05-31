@@ -35,6 +35,8 @@ struct CountingPmapCounters {
     commits: usize,
     unmaps: usize,
     shoots: usize,
+    shoot_batches: usize,
+    shoot_invalidations: usize,
     last_asid: Option<Asid>,
 }
 
@@ -167,6 +169,16 @@ impl PmapIf for CountingPmap {
     fn shootdown_mapping(asid: Asid, _invalidation: PmapInvalidation) {
         let mut state = COUNTING_PMAP_STATE.lock().expect("counting pmap lock");
         state.counters.shoots += 1;
+        state.counters.shoot_batches += 1;
+        state.counters.shoot_invalidations += 1;
+        state.counters.last_asid = Some(asid);
+    }
+
+    fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+        let mut state = COUNTING_PMAP_STATE.lock().expect("counting pmap lock");
+        state.counters.shoots += invalidations.len();
+        state.counters.shoot_batches += 1;
+        state.counters.shoot_invalidations += invalidations.len();
         state.counters.last_asid = Some(asid);
     }
 }
@@ -401,6 +413,132 @@ fn vm_address_space_rejects_nonfixed_overlap() {
 }
 
 #[test]
+fn vm_recipe_disjoint_publish_touches_bounded_path() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+
+    for i in 0..2048 {
+        let entry = VmEntry::new(
+            range(0x1000 + i * 0x4000, 1),
+            Prot::NONE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        );
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("disjoint map commit");
+    }
+
+    assert_eq!(aspace.stats().recipe_count, 2048);
+    assert!(
+        aspace.recipes.debug_last_publish_touched_entries() <= 64,
+        "disjoint immutable recipe publication must path-copy, not clone every existing recipe"
+    );
+}
+
+#[test]
+fn vm_recipe_wide_sparse_unmap_uses_batched_persistent_tree_splice() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+
+    for i in 0..2048 {
+        let entry = VmEntry::new(
+            range(0x1000 + i * 0x4000, 1),
+            Prot::NONE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        );
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("disjoint map commit");
+    }
+
+    let full_sparse_window = range(0x1000, (2047 * 4) + 1);
+    let commit = aspace
+        .try_munmap(full_sparse_window)
+        .expect("wide sparse unmap");
+
+    assert_eq!(commit.changed_pages, 2048);
+    assert_eq!(aspace.stats().recipe_count, 0);
+    assert!(
+        aspace.recipes.debug_last_publish_touched_entries() <= 64,
+        "wide sparse munmap should split/splice the persistent tree, not remove every VMA separately"
+    );
+}
+
+#[test]
+fn vm_recipe_sparse_unmap_splice_preserves_boundary_survivors() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+
+    let entries = [
+        VmEntry::new(
+            range(0x1000, 4),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        VmEntry::new(
+            range(0x7000, 1),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        VmEntry::new(
+            range(0x9000, 1),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        VmEntry::new(
+            range(0xc000, 4),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+    ];
+    for entry in entries {
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("sparse map commit");
+    }
+
+    let commit = aspace
+        .try_munmap(range(0x3000, 11))
+        .expect("sparse boundary unmap");
+
+    assert_eq!(commit.changed_pages, 6);
+    assert_eq!(
+        aspace.recipes_snapshot(),
+        alloc::vec![
+            VmEntry::new(
+                range(0x1000, 2),
+                Prot::READ,
+                VmEntryFlags::PRIVATE,
+                VmBacking::PrivateAnon,
+            ),
+            VmEntry::new(
+                range(0xe000, 2),
+                Prot::READ,
+                VmEntryFlags::PRIVATE,
+                VmBacking::PrivateAnon,
+            ),
+        ]
+    );
+    assert_eq!(
+        aspace.stats(),
+        AddressSpaceStats {
+            recipe_count: 2,
+            vm_size: 4 * USER_PAGE_SIZE,
+        }
+    );
+    assert!(
+        aspace.recipes.debug_last_publish_touched_entries() <= 64,
+        "sparse boundary munmap should splice by persistent subtree metadata"
+    );
+}
+
+#[test]
 fn vm_address_space_fixed_map_replaces_overlap_and_preserves_survivors() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
@@ -544,6 +682,55 @@ fn vm_address_space_unmap_splits_recipe_and_updates_stats() {
 }
 
 #[test]
+fn vm_address_space_unmap_sparse_large_range_tears_down_resident_pmap_entries() {
+    let _guard = COUNTING_PMAP_TEST_LOCK.lock().expect("counting test lock");
+    setup_host_substrate();
+    reset_counting_pmap();
+    let aspace =
+        AddressSpace::new_for_platform::<CountingPmap>().expect("counting pmap address space");
+    let mapped = range(0x1000_0000, 65_536);
+    let entry = VmEntry::new(
+        mapped,
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+        .commit()
+        .expect("large map");
+
+    for fault_addr in [0x1000_0000, 0x1200_0000, 0x1fff_f000] {
+        let outcome = aspace
+            .resolve_fault(VmFault::new(UserVirtAddr(fault_addr), AccessMode::Write))
+            .expect("fault resolves");
+        let materialized = outcome.materialize_pagebacked().expect("materialize");
+        aspace
+            .publish_fault_materialization(outcome, materialized)
+            .expect("publish");
+    }
+    assert_eq!(aspace.pmap().stats().mapped_pages, 3);
+
+    let commit = aspace.try_munmap(mapped).expect("unmap large sparse range");
+
+    assert_eq!(commit.changed_pages, 65_536);
+    assert_eq!(aspace.pmap().stats().mapped_pages, 0);
+    assert_eq!(
+        counting_pmap_counters(),
+        CountingPmapCounters {
+            creates: 1,
+            reserves: 3,
+            commits: 3,
+            unmaps: 3,
+            shoots: 3,
+            shoot_batches: 1,
+            shoot_invalidations: 3,
+            last_asid: Some(Asid(1)),
+            ..CountingPmapCounters::default()
+        }
+    );
+}
+
+#[test]
 fn vm_address_space_protect_rewrites_only_declared_range() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
@@ -581,6 +768,60 @@ fn vm_address_space_protect_rewrites_only_declared_range() {
 }
 
 #[test]
+fn vm_private_anon_prot_none_allocates_private_set_only_when_made_writable() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let original = VmEntry::new(
+        range(0x1000, 4),
+        Prot::NONE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    map_reserved(aspace.reserve_map(original, MapPlacement::RequireFree))
+        .commit()
+        .expect("prot-none map");
+
+    assert!(
+        aspace
+            .lookup(UserVirtAddr(0x1000))
+            .expect("prot-none entry")
+            .private
+            .is_none(),
+        "PROT_NONE private anon mappings should not allocate an empty private set"
+    );
+
+    let commit = aspace
+        .try_mprotect(range(0x2000, 2), Prot::READ_WRITE)
+        .expect("make stack body writable");
+
+    assert_eq!(commit.changed_pages, 2);
+    assert!(
+        aspace
+            .lookup(UserVirtAddr(0x1000))
+            .expect("left guard")
+            .private
+            .is_none(),
+        "left guard remains set-less"
+    );
+    assert!(
+        aspace
+            .lookup(UserVirtAddr(0x2000))
+            .expect("writable body")
+            .private
+            .is_some(),
+        "writable private anon body gets a private set before write faults"
+    );
+    assert!(
+        aspace
+            .lookup(UserVirtAddr(0x4000))
+            .expect("right guard")
+            .private
+            .is_none(),
+        "right guard remains set-less"
+    );
+}
+
+#[test]
 fn vm_address_space_finds_first_gap_inside_search_window() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
@@ -608,6 +849,35 @@ fn vm_address_space_finds_first_gap_inside_search_window() {
         Some(range(0x3000, 2))
     );
     assert_eq!(aspace.find_free_range(range(0x1000, 6), 3), None);
+}
+
+#[test]
+fn vm_try_mmap_anywhere_continues_from_recent_success_hint() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let window = range(0x1000, 8);
+    let request = || {
+        VmMapRequest::anywhere(
+            window,
+            1,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        )
+    };
+
+    let first = aspace.try_mmap(request()).expect("first mmap");
+    let second = aspace.try_mmap(request()).expect("second mmap");
+    aspace.try_munmap(first.range).expect("free first mapping");
+    let third = aspace.try_mmap(request()).expect("third mmap");
+
+    assert_eq!(first.range, range(0x1000, 1));
+    assert_eq!(second.range, range(0x2000, 1));
+    assert_eq!(
+        third.range,
+        range(0x3000, 1),
+        "non-fixed mmap should continue forward instead of rescanning low freed gaps first"
+    );
 }
 
 #[test]
@@ -1105,7 +1375,7 @@ fn vm_pmap_reserve_failure_is_reported_without_shadow_mapping() {
 }
 
 #[test]
-fn address_space_cap_drop_tears_down_pmap_before_destroying_root() {
+fn address_space_cap_drop_destroys_dead_pmap_without_per_page_unmap() {
     let _guard = COUNTING_PMAP_TEST_LOCK.lock().expect("counting test lock");
     setup_host_substrate();
     reset_counting_pmap();
@@ -1128,6 +1398,7 @@ fn address_space_cap_drop_tears_down_pmap_before_destroying_root() {
         aspace
             .publish_fault_materialization(outcome, materialized)
             .expect("publish");
+        assert_eq!(aspace.pmap().stats().mapped_pages, 1);
     }
 
     wait_for_counting_pmap_counters(CountingPmapCounters {
@@ -1136,9 +1407,11 @@ fn address_space_cap_drop_tears_down_pmap_before_destroying_root() {
         activates: 0,
         reserves: 1,
         commits: 1,
-        unmaps: 1,
-        shoots: 1,
-        last_asid: Some(Asid(1)),
+        unmaps: 0,
+        shoots: 0,
+        shoot_batches: 0,
+        shoot_invalidations: 0,
+        last_asid: None,
     });
 }
 

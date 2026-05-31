@@ -323,10 +323,13 @@ fn copy_in(
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
     use step_engine::{ByteProgress, StepOutcome as V3};
+    emit_vm_user_trace(b"debug.vm.user.copy_in.len", dst.len() as i64);
     if dst.is_empty() {
+        emit_vm_user_trace(b"debug.vm.user.copy_in.phase", 9);
         return V3::Done(0);
     }
     if src.addr() == 0 {
+        emit_vm_user_trace(b"debug.vm.user.copy_in.err", 1);
         return V3::Err(Errno::EFAULT.into());
     }
     let mut copied = 0usize;
@@ -342,8 +345,11 @@ fn copy_in(
         let page_addr = user_addr & !(USER_PAGE_SIZE - 1);
         let within = user_addr - page_addr;
         let chunk = core::cmp::min(total - copied, USER_PAGE_SIZE - within);
+        emit_vm_user_trace(b"debug.vm.user.copy_in.chunk", chunk as i64);
+        emit_vm_user_trace(b"debug.vm.user.copy_in.phase", 0);
         match resolve_user_page_addr(aspace, page_addr, UserAccessKind::Read, guard) {
             ResolveOutcome::Done(frame_base) => {
+                emit_vm_user_trace(b"debug.vm.user.copy_in.phase", 1);
                 // SAFETY: `frame_base.add(within)` is a valid kernel
                 // direct-map pointer to the requested user byte; we
                 // copy exactly `chunk <= USER_PAGE_SIZE - within`
@@ -359,19 +365,24 @@ fn copy_in(
                         chunk,
                     );
                 }
+                emit_vm_user_trace(b"debug.vm.user.copy_in.phase", 2);
                 copied += chunk;
+                emit_vm_user_trace(b"debug.vm.user.copy_in.copied", copied as i64);
             }
             ResolveOutcome::Err(e) => {
+                emit_vm_user_trace(b"debug.vm.user.copy_in.err", 2);
                 if copied > 0 {
                     return V3::Done(copied);
                 }
                 return V3::Err(e.into());
             }
             ResolveOutcome::Blocked(t) => {
+                emit_vm_user_trace(b"debug.vm.user.copy_in.blocked", 1);
                 return crate::vm::notification::yield_wait_token(ByteProgress::new(copied), t);
             }
         }
     }
+    emit_vm_user_trace(b"debug.vm.user.copy_in.phase", 3);
     V3::Done(copied)
 }
 
@@ -470,35 +481,64 @@ fn resolve_user_page_addr(
     kind: UserAccessKind,
     guard: &Guard<'_>,
 ) -> ResolveOutcome {
-    // Use the in-vm `recipes.lookup(addr, guard)` directly rather
-    // than `aspace.lookup(addr)` so the caller's existing epoch
-    // guard is reused. Allocating a nested `epoch::guard()` here
-    // panics on the host test harness.
-    let entry = match aspace.recipes.lookup(UserVirtAddr(page_addr), guard) {
-        Some(e) => e,
-        None => return ResolveOutcome::Err(Errno::EFAULT),
+    let user_page = UserVirtAddr(page_addr).containing_page();
+    let kind_id = match kind {
+        UserAccessKind::Read => 0,
+        UserAccessKind::Write => 1,
     };
-    if !entry.prot.permits(kind.required_prot()) {
-        return ResolveOutcome::Err(Errno::EFAULT);
-    }
+    emit_vm_user_trace(b"debug.vm.user.resolve.kind", kind_id);
+    emit_vm_user_trace(b"debug.vm.user.resolve.phase", 0);
 
     // Pmap-first lookup. The published mapping pins the frame; we
     // borrow the kernel direct-map pointer for the synchronous copy
     // and release it before returning, matching `ResolveOutcome::Done`'s
-    // existing contract (no MapPin threaded out).
-    let user_page = UserVirtAddr(page_addr).containing_page();
+    // existing contract (no MapPin threaded out). This is the hot path
+    // for repeated user copies from pthread stack/TLS pages that are
+    // already resident.
+    emit_vm_user_trace(b"debug.vm.user.resolve.phase", 1);
     if let Some(snapshot) = aspace.pmap.lookup(user_page) {
         if snapshot.prot.permits(kind.required_prot()) {
+            emit_vm_user_trace(b"debug.vm.user.resolve.phase", 2);
             return match page_allocator::frame_kernel_addr(snapshot.ppn) {
-                Ok(p) => ResolveOutcome::Done(p),
-                Err(_) => ResolveOutcome::Err(Errno::EFAULT),
+                Ok(p) => {
+                    emit_vm_user_trace(b"debug.vm.user.resolve.phase", 3);
+                    ResolveOutcome::Done(p)
+                }
+                Err(_) => {
+                    emit_vm_user_trace(b"debug.vm.user.resolve.err", 1);
+                    ResolveOutcome::Err(Errno::EFAULT)
+                }
             };
         }
-        // Cached mapping rejects this access. The recipe permits it
-        // (we checked above), so the cached prot must be a stricter
-        // demotion (e.g. read-only PTE published for a private-anon
-        // first-touch read; the next write fault would refault and
-        // republish). Fall through to materialise + publish.
+        emit_vm_user_trace(b"debug.vm.user.resolve.phase", 4);
+        // Cached mapping rejects this access. The recipe may still
+        // permit it (for example, a read-only PTE published for a
+        // private-anon first-touch read followed by a write), so fall
+        // through to recipe validation and materialise + publish.
+    } else {
+        emit_vm_user_trace(b"debug.vm.user.resolve.phase", 5);
+    }
+
+    // Use the in-vm `recipes.lookup(addr, guard)` directly rather
+    // than `aspace.lookup(addr)` so the caller's existing epoch
+    // guard is reused. Allocating a nested `epoch::guard()` here
+    // panics on the host test harness.
+    emit_vm_user_trace(b"debug.vm.user.resolve.phase", 6);
+    let entry = match aspace.recipes.lookup(UserVirtAddr(page_addr), guard) {
+        Some(e) => e,
+        None => {
+            emit_vm_user_trace(b"debug.vm.user.resolve.err", 2);
+            return ResolveOutcome::Err(Errno::EFAULT);
+        }
+    };
+    emit_vm_user_trace(b"debug.vm.user.resolve.phase", 7);
+    emit_vm_user_trace(
+        b"debug.vm.user.resolve.backing",
+        vm_backing_trace_id(&entry.backing),
+    );
+    if !entry.prot.permits(kind.required_prot()) {
+        emit_vm_user_trace(b"debug.vm.user.resolve.err", 3);
+        return ResolveOutcome::Err(Errno::EFAULT);
     }
 
     // Pmap miss (or insufficient cached prot). Materialise via the
@@ -509,10 +549,20 @@ fn resolve_user_page_addr(
     // Without the publish, `VmBacking::PrivateAnon` would re-zero on
     // every call (each materialisation allocates a fresh frame),
     // breaking write-then-read consistency of brk-backed heap pages.
+    emit_vm_user_trace(b"debug.vm.user.resolve.phase", 8);
     let materialised = match resolve_user_page(&entry, page_addr, kind, guard) {
-        ResolvePageOutcome::Done(m) => m,
-        ResolvePageOutcome::Err(e) => return ResolveOutcome::Err(e),
-        ResolvePageOutcome::Blocked(t) => return ResolveOutcome::Blocked(t),
+        ResolvePageOutcome::Done(m) => {
+            emit_vm_user_trace(b"debug.vm.user.resolve.phase", 9);
+            m
+        }
+        ResolvePageOutcome::Err(e) => {
+            emit_vm_user_trace(b"debug.vm.user.resolve.err", 4);
+            return ResolveOutcome::Err(e);
+        }
+        ResolvePageOutcome::Blocked(t) => {
+            emit_vm_user_trace(b"debug.vm.user.resolve.blocked", 1);
+            return ResolveOutcome::Blocked(t);
+        }
     };
     // Publish via pmap so the next call hits the cache. The
     // `publish_prot` mirrors `fault_script`: read access on a
@@ -528,17 +578,47 @@ fn resolve_user_page_addr(
         }
         _ => entry.prot,
     };
-    let user_page = UserVirtAddr(page_addr).containing_page();
-    let _ = aspace.pmap.publish_page_with_replacement(
-        user_page,
-        materialised.ppn,
-        publish_prot,
-        materialised.map_pin,
-        true,
-    );
+    emit_vm_user_trace(b"debug.vm.user.resolve.phase", 10);
+    if aspace
+        .pmap
+        .publish_page_with_replacement(
+            user_page,
+            materialised.ppn,
+            publish_prot,
+            materialised.map_pin,
+            true,
+        )
+        .is_err()
+    {
+        emit_vm_user_trace(b"debug.vm.user.resolve.err", 5);
+    }
+    emit_vm_user_trace(b"debug.vm.user.resolve.phase", 11);
     match page_allocator::frame_kernel_addr(materialised.ppn) {
-        Ok(p) => ResolveOutcome::Done(p),
-        Err(_) => ResolveOutcome::Err(Errno::EFAULT),
+        Ok(p) => {
+            emit_vm_user_trace(b"debug.vm.user.resolve.phase", 12);
+            ResolveOutcome::Done(p)
+        }
+        Err(_) => {
+            emit_vm_user_trace(b"debug.vm.user.resolve.err", 6);
+            ResolveOutcome::Err(Errno::EFAULT)
+        }
+    }
+}
+
+fn vm_backing_trace_id(backing: &VmBacking) -> i64 {
+    match backing {
+        VmBacking::None => 0,
+        VmBacking::PrivateAnon => 1,
+        VmBacking::Page { .. } => 2,
+    }
+}
+
+fn emit_vm_user_trace(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
     }
 }
 
@@ -554,9 +634,17 @@ fn resolve_user_page(
     kind: UserAccessKind,
     guard: &Guard<'_>,
 ) -> ResolvePageOutcome {
+    emit_vm_user_trace(
+        b"debug.vm.user.resolve_page.backing",
+        vm_backing_trace_id(&entry.backing),
+    );
     match &entry.backing {
-        VmBacking::None => ResolvePageOutcome::Err(Errno::EFAULT),
+        VmBacking::None => {
+            emit_vm_user_trace(b"debug.vm.user.resolve_page.err", 1);
+            ResolvePageOutcome::Err(Errno::EFAULT)
+        }
         VmBacking::PrivateAnon => {
+            emit_vm_user_trace(b"debug.vm.user.resolve_page.phase", 0);
             // Reuse the VM fault path's private-anon materialisation
             // for consistency: a fresh zeroed frame for read access,
             // a private writable frame for write access. Today this
@@ -570,7 +658,10 @@ fn resolve_user_page(
                 USER_PAGE_SIZE,
             ) {
                 Ok(r) => r,
-                Err(_) => return ResolvePageOutcome::Err(Errno::EFAULT),
+                Err(_) => {
+                    emit_vm_user_trace(b"debug.vm.user.resolve_page.err", 2);
+                    return ResolvePageOutcome::Err(Errno::EFAULT);
+                }
             };
             let outcome = crate::vm::structure::VmFaultOutcome {
                 page_range,
@@ -579,25 +670,42 @@ fn resolve_user_page(
                 access: kind.required_prot(),
                 pmap_materialization_deferred: true,
             };
+            emit_vm_user_trace(b"debug.vm.user.resolve_page.phase", 1);
             match outcome.materialize_pagebacked() {
-                Ok(materialization) => ResolvePageOutcome::Done(materialization.page),
-                Err(_) => ResolvePageOutcome::Err(Errno::EFAULT),
+                Ok(materialization) => {
+                    emit_vm_user_trace(b"debug.vm.user.resolve_page.phase", 2);
+                    ResolvePageOutcome::Done(materialization.page)
+                }
+                Err(_) => {
+                    emit_vm_user_trace(b"debug.vm.user.resolve_page.err", 3);
+                    ResolvePageOutcome::Err(Errno::EFAULT)
+                }
             }
         }
         VmBacking::Page { pc, offset } => {
+            emit_vm_user_trace(b"debug.vm.user.resolve_page.phase", 3);
             let entry_start = entry.range.start().as_usize();
             let delta = match page_addr.checked_sub(entry_start) {
                 Some(v) => v,
-                None => return ResolvePageOutcome::Err(Errno::EFAULT),
+                None => {
+                    emit_vm_user_trace(b"debug.vm.user.resolve_page.err", 4);
+                    return ResolvePageOutcome::Err(Errno::EFAULT);
+                }
             };
             let backing_offset = match (delta as u64).checked_add(*offset) {
                 Some(v) => v,
-                None => return ResolvePageOutcome::Err(Errno::EFAULT),
+                None => {
+                    emit_vm_user_trace(b"debug.vm.user.resolve_page.err", 5);
+                    return ResolvePageOutcome::Err(Errno::EFAULT);
+                }
             };
             if !backing_offset.is_multiple_of(USER_PAGE_SIZE as u64) {
+                emit_vm_user_trace(b"debug.vm.user.resolve_page.err", 6);
                 return ResolvePageOutcome::Err(Errno::EFAULT);
             }
             let page_index = PageIndex::new(backing_offset / USER_PAGE_SIZE as u64);
+            emit_vm_user_trace(b"debug.vm.user.resolve_page.phase", 4);
+            emit_vm_user_trace(b"debug.vm.user.pagebacked.phase", 0);
             // `materialize_page` is now v3
             // (`StepOutcome<MaterializedPage, NoProgress>`); translate
             // per outcome variant onto the v4 `ResolvePageOutcome`:
@@ -611,16 +719,27 @@ fn resolve_user_page(
             // - v3 `Err(_)` → `Err(EFAULT)`.
             use step_engine::StepOutcome as V3;
             match pc.materialize_page(page_index, kind.materialize_access(), guard) {
-                V3::Done(m) => ResolvePageOutcome::Done(m),
-                V3::Continue { .. } => ResolvePageOutcome::Err(Errno::EFAULT),
+                V3::Done(m) => {
+                    emit_vm_user_trace(b"debug.vm.user.pagebacked.phase", 1);
+                    ResolvePageOutcome::Done(m)
+                }
+                V3::Continue { .. } => {
+                    emit_vm_user_trace(b"debug.vm.user.pagebacked.err", 1);
+                    ResolvePageOutcome::Err(Errno::EFAULT)
+                }
                 V3::Yield { shape, .. } => {
                     if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) {
+                        emit_vm_user_trace(b"debug.vm.user.pagebacked.blocked", 1);
                         ResolvePageOutcome::Blocked(token)
                     } else {
+                        emit_vm_user_trace(b"debug.vm.user.pagebacked.err", 2);
                         ResolvePageOutcome::Err(Errno::EFAULT)
                     }
                 }
-                V3::Err(_) => ResolvePageOutcome::Err(Errno::EFAULT),
+                V3::Err(_) => {
+                    emit_vm_user_trace(b"debug.vm.user.pagebacked.err", 3);
+                    ResolvePageOutcome::Err(Errno::EFAULT)
+                }
             }
         }
     }

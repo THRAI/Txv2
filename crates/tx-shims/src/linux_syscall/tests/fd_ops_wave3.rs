@@ -4,7 +4,8 @@ use super::*;
 use tx_subsystems::process::bootstrap_init_process;
 
 use crate::linux_syscall::{
-    F_GETPIPE_SZ, F_SETPIPE_SZ, NR_FCNTL, NR_PIPE2, NR_WRITE, O_CLOEXEC, O_DIRECT, O_NONBLOCK,
+    F_GETPIPE_SZ, F_SETPIPE_SZ, NR_FCNTL, NR_PIPE2, NR_PSELECT6, NR_WRITE, O_CLOEXEC, O_DIRECT,
+    O_NONBLOCK,
 };
 
 const E_INVAL: i32 = 22;
@@ -20,6 +21,16 @@ fn fresh_proc_thread() -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
     let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init for pipe2 tests");
     let thread = process.nth_thread(0).expect("leader thread");
     (process, thread)
+}
+
+fn fdset_with(fd: u32) -> [u8; 128] {
+    let mut set = [0u8; 128];
+    set[(fd / 8) as usize] |= 1u8 << (fd % 8);
+    set
+}
+
+fn fdset_has(set: &[u8; 128], fd: u32) -> bool {
+    (set[(fd / 8) as usize] & (1u8 << (fd % 8))) != 0
 }
 
 /// `pipe2(uaddr, 0)` succeeds, writes `(reader_fd, writer_fd)` to
@@ -44,6 +55,86 @@ fn dispatch_pipe2_allocates_two_fds_and_writes_pair_to_userspace() {
     // Default flags: cloexec clear, nonblocking clear.
     assert!(!proc_cap.fd_cloexec(reader_fd));
     assert!(!proc_cap.fd_cloexec(writer_fd));
+}
+
+#[test]
+fn dispatch_pselect6_zero_timeout_clears_unready_pipe_reader() {
+    let _setup = pipe2_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let mut pipefd: [u32; 2] = [u32::MAX, u32::MAX];
+    let req = SyscallRequest::new(NR_PIPE2, [pipefd.as_mut_ptr() as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+
+    let mut readfds = fdset_with(pipefd[0]);
+    let timeout = [0u64, 0u64];
+    let req = SyscallRequest::new(
+        NR_PSELECT6,
+        [
+            pipefd[0] as u64 + 1,
+            readfds.as_mut_ptr() as u64,
+            0,
+            0,
+            timeout.as_ptr() as u64,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(
+        !fdset_has(&readfds, pipefd[0]),
+        "unready reader bit cleared"
+    );
+}
+
+#[test]
+fn dispatch_pselect6_reports_pipe_reader_after_write() {
+    let _setup = pipe2_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let mut pipefd: [u32; 2] = [u32::MAX, u32::MAX];
+    let req = SyscallRequest::new(NR_PIPE2, [pipefd.as_mut_ptr() as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+
+    let byte = [b'x'];
+    let req = SyscallRequest::new(
+        NR_WRITE,
+        [pipefd[1] as u64, byte.as_ptr() as u64, 1, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(1)
+    );
+
+    let mut readfds = fdset_with(pipefd[0]);
+    let timeout = [0u64, 0u64];
+    let req = SyscallRequest::new(
+        NR_PSELECT6,
+        [
+            pipefd[0] as u64 + 1,
+            readfds.as_mut_ptr() as u64,
+            0,
+            0,
+            timeout.as_ptr() as u64,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(1)
+    );
+    assert!(
+        fdset_has(&readfds, pipefd[0]),
+        "ready reader bit remains set"
+    );
 }
 
 /// `pipe2(uaddr, O_CLOEXEC)` sets the cloexec bit on both fds.

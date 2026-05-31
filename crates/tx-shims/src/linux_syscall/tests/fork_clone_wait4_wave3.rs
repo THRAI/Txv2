@@ -4,13 +4,15 @@ use super::*;
 
 use tx_hal::UserTrapContext;
 use tx_subsystems::process::{step_exit_group, ExitStatus};
-use tx_subsystems::reactor_submit;
+use tx_subsystems::reactor_submit::{self, SubmitChildThreadStatus};
 
 /// No-op reactor-submit seam for tests that fork via `sys_clone`.
 /// The blocking-wait tests just need the seam to not panic; they
 /// don't poll the child, so a trivial seam is enough.
 fn install_noop_submit_seam() {
-    fn noop(_p: Cap<ProcessIdentity>, _t: Cap<ThreadIdentity>) {}
+    fn noop(_p: Cap<ProcessIdentity>, _t: Cap<ThreadIdentity>) -> SubmitChildThreadStatus {
+        SubmitChildThreadStatus::QueuedFallback
+    }
     reactor_submit::install_submit_child_thread(noop);
 }
 

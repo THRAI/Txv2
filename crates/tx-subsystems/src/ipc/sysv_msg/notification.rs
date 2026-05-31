@@ -35,6 +35,8 @@ mod readiness {
         let recv_source_id = crate::allocate_notification_source_id();
         let send_source = wait_routing::new_wait_source(send_source_id);
         let recv_source = wait_routing::new_wait_source(recv_source_id);
+        crate::wait_source::register_wait_channel_with_id(send_source_id, send_channel.clone());
+        crate::wait_source::register_wait_channel_with_id(recv_source_id, recv_channel.clone());
         (
             send_channel,
             recv_channel,

@@ -93,6 +93,11 @@ pub fn unregister_pid_number(number: u64) {
     PID_NS.lock().retain(|(key, _), _| *key != number);
 }
 
+/// Unregister only the thread-level TID binding for a raw number.
+pub fn unregister_tid_number(number: u64) {
+    PID_NS.lock().remove(&(number, PidNameKind::Thread));
+}
+
 /// Resolve a number to its preferred `PidName`.
 ///
 /// Compatibility helper for older call sites. New code should prefer

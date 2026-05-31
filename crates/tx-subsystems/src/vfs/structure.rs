@@ -1241,9 +1241,7 @@ impl OpenFile {
     /// update pipe reader/writer counts synchronously. That keeps pipe
     /// EOF/EPIPE visible at fd-close time instead of waiting for EBR to
     /// eventually retire the shared `OpenFile`.
-    pub(crate) fn pipe_endpoint(
-        &self,
-    ) -> Option<(Cap<crate::pipe::PipePayload>, crate::pipe::PipeSide)> {
+    pub fn pipe_endpoint(&self) -> Option<(Cap<crate::pipe::PipePayload>, crate::pipe::PipeSide)> {
         let OpenFileBacking::Rnode { rnode } = &self.backing else {
             return None;
         };

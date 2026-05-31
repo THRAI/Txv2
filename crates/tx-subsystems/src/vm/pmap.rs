@@ -1,11 +1,13 @@
 use crate::vm::adapter::step_engine::{SpinMutex, ZoneError};
+#[cfg(test)]
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::{LazyLock, Mutex};
 use tx_hal::{
-    Asid, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot,
-    Ppn, VirtAddr,
+    Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+    PmapReserveKind, PmapRoot, Ppn, VirtAddr,
 };
 
 use crate::page_backed::MaterializedPagePin;
@@ -26,6 +28,18 @@ type ProtectMappingFn = fn(
     PmapReserveKind,
     PmapPermissions,
 ) -> Result<Option<tx_hal::PmapInvalidation>, PmapError>;
+
+static PMAP_DROP_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
+static PMAP_BATCH_INSERT_COUNT: AtomicU64 = AtomicU64::new(0);
+static PMAP_BATCH_INSERT_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static PMAP_BATCH_INSERT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::vm) struct PmapDebugTotals {
+    pub batch_insert_count: u64,
+    pub batch_insert_total_ns: u64,
+    pub batch_insert_max_ns: u64,
+}
 
 #[derive(Clone, Copy)]
 struct VmPmapOps {
@@ -118,6 +132,13 @@ pub struct PmapPublishOutcome {
     pub replaced: bool,
 }
 
+pub(in crate::vm) struct PmapBatchPage {
+    pub page: UserPage,
+    pub ppn: Ppn,
+    pub prot: Prot,
+    pub map_pin: MaterializedPagePin,
+}
+
 pub struct VmPmap {
     root: Option<PmapRoot>,
     ops: VmPmapOps,
@@ -163,10 +184,8 @@ impl VmPmap {
     /// publishes after the call returns are the caller's concern.
     pub fn walk_range(&self, range: UserRange) -> Vec<(UserPage, PmapMappingSnapshot)> {
         let state = self.state.lock();
-        range
-            .iter_pages()
-            .filter_map(|page| state.mappings.get(&page).map(|m| (page, m.snapshot())))
-            .collect()
+        let (start, end) = page_bounds_for_range(range);
+        state.mappings.snapshots_in_range(start, end)
     }
 
     pub fn stats(&self) -> PmapStats {
@@ -255,6 +274,9 @@ impl VmPmap {
             };
 
         (self.ops.commit_mapping)(root, reservation, permissions);
+        if !replaced {
+            state.mappings.reserve_additional(1);
+        }
         state
             .mappings
             .insert(page, PmapMapping::new(ppn, prot, map_pin));
@@ -262,8 +284,72 @@ impl VmPmap {
         Ok(PmapPublishOutcome { page, replaced })
     }
 
+    /// Best-effort publication for speculative contiguous prefault pages.
+    ///
+    /// The leading fault has already completed through the canonical
+    /// single-page path. Tail prefaults may stop early on allocation,
+    /// shadow-state drift, or a racing publish; dropping the remaining pins is
+    /// correct because these pages are only an optimization.
+    pub(in crate::vm) fn publish_new_pages_best_effort(&self, pages: Vec<PmapBatchPage>) -> usize {
+        emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.pages", pages.len() as i64);
+        emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.phase", 0);
+        let root = self.root();
+        let mut state = self.state.lock();
+        emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.phase", 1);
+        state.mappings.reserve_additional(pages.len());
+        let mut published = 0usize;
+
+        for page in pages {
+            emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.phase", 2);
+            let virt = match virt_for_page(page.page) {
+                Ok(virt) => virt,
+                Err(_) => break,
+            };
+            let phys = match phys_for_ppn(page.ppn) {
+                Ok(phys) => phys,
+                Err(_) => break,
+            };
+            if let Some(existing) = state.mappings.get(&page.page) {
+                if existing.ppn == page.ppn && existing.prot == page.prot {
+                    continue;
+                }
+                break;
+            }
+
+            emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.phase", 3);
+            state.reservations += 1;
+            let reservation =
+                match (self.ops.reserve_mapping)(root, virt, phys, PmapReserveKind::Page4K) {
+                    Ok(Some(reservation)) => reservation,
+                    _ => break,
+                };
+
+            emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.phase", 4);
+            (self.ops.commit_mapping)(root, reservation, permissions_for_prot(page.prot));
+            emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.phase", 5);
+            emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.insert.phase", 0);
+            let mapping = PmapMapping::new(page.ppn, page.prot, page.map_pin);
+            emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.insert.phase", 1);
+            let insert_start_ns = tx_observe::clock_now_ns();
+            state.mappings.insert(page.page, mapping);
+            record_pmap_batch_insert_debug(
+                tx_observe::clock_now_ns().saturating_sub(insert_start_ns),
+            );
+            emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.insert.phase", 2);
+            emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.phase", 6);
+            state.commits += 1;
+            published += 1;
+        }
+
+        emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.published", published as i64);
+        emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.phase", 7);
+        published
+    }
+
     /// Tears down every published pmap entry in `range`, releasing the
-    /// associated `MapPin` and issuing the ASID-scoped shootdown.
+    /// associated `MapPin` and issuing the ASID-scoped shootdown. The pmap is
+    /// indexed by resident pages, so sparse VMAs enumerate resident mappings
+    /// in the range rather than scanning every virtual page.
     ///
     /// Used by `unmap` to remove mappings entirely, and by `mprotect` /
     /// fork CoW demotion to demote permissions through tear-down + refault
@@ -271,24 +357,40 @@ impl VmPmap {
     /// next access to the affected pages refaults, observes the new recipe
     /// protection, and republishes with the demoted permissions.
     pub fn teardown_range(&self, range: UserRange) -> Result<usize, VmPmapError> {
+        emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 0);
         let mut removed = 0;
+        let pages = {
+            let state = self.state.lock();
+            mapped_pages_in_range(&state, range)
+        };
+        emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 1);
+        emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.pages", pages.len() as i64);
 
-        for page in range.iter_pages() {
+        let mut invalidations = Vec::new();
+        let mut pins = Vec::new();
+        for page in pages {
+            emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 2);
             let Some(mapping) = self.state.lock().mappings.remove(&page) else {
                 continue;
             };
+            emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 3);
 
             let result = match self.unmap_tracked_page(page, mapping.ppn) {
                 Ok(result) => result,
                 Err(error) => {
                     self.state.lock().mappings.insert(page, mapping);
+                    self.issue_unmap_batch(&mut invalidations, &mut pins);
                     return Err(error);
                 }
             };
-            self.issue_single_unmap_result(result, mapping.into_pin());
-            self.state.lock().shootdowns += 1;
+            emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 4);
+            invalidations.push(result.invalidation());
+            pins.push(mapping.into_pin());
+            emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 5);
             removed += 1;
         }
+        self.issue_unmap_batch(&mut invalidations, &mut pins);
+        emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 6);
         Ok(removed)
     }
 
@@ -301,8 +403,12 @@ impl VmPmap {
     pub fn protect_range(&self, range: UserRange, prot: Prot) -> Result<usize, VmPmapError> {
         let permissions = permissions_for_prot(prot);
         let mut protected = 0;
+        let pages = {
+            let state = self.state.lock();
+            mapped_pages_in_range(&state, range)
+        };
 
-        for page in range.iter_pages() {
+        for page in pages {
             let Some(current) = self
                 .state
                 .lock()
@@ -371,31 +477,60 @@ impl VmPmap {
             drop(map_pin);
         }
     }
+
+    fn issue_unmap_batch(
+        &self,
+        invalidations: &mut Vec<PmapInvalidation>,
+        pins: &mut Vec<MaterializedPagePin>,
+    ) {
+        if invalidations.is_empty() {
+            return;
+        }
+        emit_pmap_teardown_trace(
+            b"debug.vm.pmap.teardown.invalidations",
+            invalidations.len() as i64,
+        );
+        (self.ops.shootdown_mappings)(self.asid(), invalidations);
+        self.state.lock().shootdowns += 1;
+        invalidations.clear();
+        pins.clear();
+    }
 }
 
 impl Drop for VmPmap {
     fn drop(&mut self) {
-        let pages: alloc::vec::Vec<UserPage> = self.state.lock().mappings.keys().copied().collect();
-        for page in pages {
-            let Ok(range) = UserRange::containing_page(page.start_addr()) else {
-                continue;
-            };
-            if self.teardown_range(range).is_err() {
-                let leaked = core::mem::take(&mut self.state.lock().mappings);
-                core::mem::forget(leaked);
-                break;
-            }
+        let mapped_pages = self.state.lock().mappings.len();
+        let trace_seq = pmap_drop_trace_sample();
+        if let Some(seq) = trace_seq {
+            emit_pmap_teardown_trace(b"debug.vm.pmap.drop.begin", seq);
+            emit_pmap_teardown_trace(b"debug.vm.pmap.drop.mapped_pages", mapped_pages as i64);
         }
 
         if let Some(root) = self.root.take() {
+            if let Some(seq) = trace_seq {
+                emit_pmap_teardown_trace(b"debug.vm.pmap.drop.destroy_root", seq);
+            }
             (self.ops.destroy_root)(root);
+        }
+
+        let released = {
+            let mut state = self.state.lock();
+            core::mem::take(&mut state.mappings)
+        };
+        if let Some(_seq) = trace_seq {
+            emit_pmap_teardown_trace(b"debug.vm.pmap.drop.release_pins", released.len() as i64);
+        }
+        drop(released);
+
+        if let Some(seq) = trace_seq {
+            emit_pmap_teardown_trace(b"debug.vm.pmap.drop.end", seq);
         }
     }
 }
 
 #[derive(Debug)]
 struct VmPmapState {
-    mappings: BTreeMap<UserPage, PmapMapping>,
+    mappings: PmapResidentStore,
     reservations: usize,
     commits: usize,
     rollbacks: usize,
@@ -405,13 +540,153 @@ struct VmPmapState {
 impl VmPmapState {
     fn new() -> Self {
         Self {
-            mappings: BTreeMap::new(),
+            mappings: PmapResidentStore::new(),
             reservations: 0,
             commits: 0,
             rollbacks: 0,
             shootdowns: 0,
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct PmapResidentStore {
+    entries: Vec<(UserPage, PmapMapping)>,
+}
+
+impl PmapResidentStore {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn reserve_additional(&mut self, additional: usize) {
+        self.entries.reserve(additional);
+    }
+
+    fn get(&self, page: &UserPage) -> Option<&PmapMapping> {
+        self.search(*page).ok().map(|index| &self.entries[index].1)
+    }
+
+    fn get_mut(&mut self, page: &UserPage) -> Option<&mut PmapMapping> {
+        self.search(*page)
+            .ok()
+            .map(|index| &mut self.entries[index].1)
+    }
+
+    fn insert(&mut self, page: UserPage, mapping: PmapMapping) -> Option<PmapMapping> {
+        match self.search(page) {
+            Ok(index) => Some(core::mem::replace(&mut self.entries[index].1, mapping)),
+            Err(index) if index == self.entries.len() => {
+                self.entries.push((page, mapping));
+                None
+            }
+            Err(index) => {
+                self.entries.insert(index, (page, mapping));
+                None
+            }
+        }
+    }
+
+    fn remove(&mut self, page: &UserPage) -> Option<PmapMapping> {
+        self.search(*page)
+            .ok()
+            .map(|index| self.entries.remove(index).1)
+    }
+
+    fn snapshots_in_range(
+        &self,
+        start: UserPage,
+        end: UserPage,
+    ) -> Vec<(UserPage, PmapMappingSnapshot)> {
+        let mut snapshots = Vec::new();
+        let start_index = self.search(start).unwrap_or_else(|index| index);
+        for (page, mapping) in self.entries[start_index..].iter() {
+            if *page >= end {
+                break;
+            }
+            snapshots.push((*page, mapping.snapshot()));
+        }
+        snapshots
+    }
+
+    fn pages_in_range(&self, start: UserPage, end: UserPage) -> Vec<UserPage> {
+        let mut pages = Vec::new();
+        let start_index = self.search(start).unwrap_or_else(|index| index);
+        for (page, _) in self.entries[start_index..].iter() {
+            if *page >= end {
+                break;
+            }
+            pages.push(*page);
+        }
+        pages
+    }
+
+    fn search(&self, page: UserPage) -> Result<usize, usize> {
+        self.entries
+            .binary_search_by_key(&page, |(entry_page, _)| *entry_page)
+    }
+}
+
+fn page_bounds_for_range(range: UserRange) -> (UserPage, UserPage) {
+    (
+        range.start().containing_page(),
+        range.end().containing_page(),
+    )
+}
+
+fn emit_pmap_teardown_trace(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+    }
+}
+
+fn atomic_max(slot: &AtomicU64, value: u64) {
+    let mut current = slot.load(Ordering::Relaxed);
+    while value > current {
+        match slot.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
+pub(in crate::vm) fn reset_pmap_debug_totals() {
+    PMAP_BATCH_INSERT_COUNT.store(0, Ordering::Relaxed);
+    PMAP_BATCH_INSERT_TOTAL_NS.store(0, Ordering::Relaxed);
+    PMAP_BATCH_INSERT_MAX_NS.store(0, Ordering::Relaxed);
+}
+
+pub(in crate::vm) fn pmap_debug_totals() -> PmapDebugTotals {
+    PmapDebugTotals {
+        batch_insert_count: PMAP_BATCH_INSERT_COUNT.load(Ordering::Relaxed),
+        batch_insert_total_ns: PMAP_BATCH_INSERT_TOTAL_NS.load(Ordering::Relaxed),
+        batch_insert_max_ns: PMAP_BATCH_INSERT_MAX_NS.load(Ordering::Relaxed),
+    }
+}
+
+fn record_pmap_batch_insert_debug(duration_ns: u64) {
+    PMAP_BATCH_INSERT_COUNT.fetch_add(1, Ordering::Relaxed);
+    PMAP_BATCH_INSERT_TOTAL_NS.fetch_add(duration_ns, Ordering::Relaxed);
+    atomic_max(&PMAP_BATCH_INSERT_MAX_NS, duration_ns);
+}
+
+fn pmap_drop_trace_sample() -> Option<i64> {
+    let seq = PMAP_DROP_TRACE_SAMPLE.fetch_add(1, Ordering::Relaxed);
+    (seq < 64 || seq.is_power_of_two()).then_some(seq as i64)
+}
+
+fn mapped_pages_in_range(state: &VmPmapState, range: UserRange) -> Vec<UserPage> {
+    let (start, end) = page_bounds_for_range(range);
+    state.mappings.pages_in_range(start, end)
 }
 
 fn virt_for_page(page: UserPage) -> Result<VirtAddr, VmPmapError> {

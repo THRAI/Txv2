@@ -5,6 +5,33 @@
 
 use super::*;
 
+/// Private txKernel debug syscall: enable and start a bounded observe trace.
+pub(super) fn sys_tx_observe_begin(args: [u64; 6]) -> SyscallResult {
+    let threshold = args[0];
+    if threshold == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    tx_subsystems::vm::reset_debug_phase_totals();
+    tx_observe::set_enabled(true);
+    tx_observe::reset_ring_and_arm(threshold);
+    SyscallResult::Return(0)
+}
+
+/// Private txKernel debug syscall: start an unbounded observe trace window.
+pub(super) fn sys_tx_observe_trace_on() -> SyscallResult {
+    tx_subsystems::vm::reset_debug_phase_totals();
+    tx_observe::set_enabled(true);
+    tx_observe::reset_ring_and_arm(0);
+    SyscallResult::Return(0)
+}
+
+/// Private txKernel debug syscall: stop tracing and request a trace dump.
+pub(super) fn sys_tx_observe_trace_off() -> SyscallResult {
+    tx_observe::set_enabled(false);
+    tx_observe::request_dump();
+    SyscallResult::Return(0)
+}
+
 /// `getrandom(buf, buflen, flags)` — Linux RV64 generic ABI
 /// `__NR_getrandom = 278`.
 ///

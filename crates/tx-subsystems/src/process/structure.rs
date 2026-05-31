@@ -357,6 +357,14 @@ impl ProcessIdentity {
         self.payload.lock().as_ref().map(|p| p.aspace_cap())
     }
 
+    pub fn group_pending_snapshot(&self) -> u64 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.group_pending_snapshot())
+            .unwrap_or(0)
+    }
+
     /// Snapshot the per-process credential. Returns `None` for zombies
     /// (payload dropped — cred is unobservable).
     ///
@@ -1243,6 +1251,10 @@ impl ProcessPayload {
     /// Borrow the per-process group-pending queue.
     pub fn group_pending(&self) -> &PendingSignalQueue {
         &self.group_pending
+    }
+
+    pub fn group_pending_snapshot(&self) -> u64 {
+        self.group_pending.snapshot()
     }
 
     /// Snapshot the current credential value. Returns a `Copy` so

@@ -36,6 +36,7 @@ mod readiness {
         let channel = Channel::new();
         let source_id = crate::allocate_notification_source_id();
         let source = wait_routing::new_wait_source(source_id);
+        crate::wait_source::register_wait_channel_with_id(source_id, channel.clone());
         SignalfdWaitPoint {
             channel,
             source_id,
@@ -44,6 +45,7 @@ mod readiness {
     }
 
     pub(crate) fn release_wait_point(source_id: u64) {
+        crate::wait_source::release_wait_channel(source_id);
         wait_routing::unregister_source(source_id);
     }
 

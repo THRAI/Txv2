@@ -25,6 +25,10 @@ mod readiness {
         let changed_channel = Channel::new();
         let changed_source_id = crate::allocate_notification_source_id();
         let changed_source = wait_routing::new_wait_source(changed_source_id);
+        crate::wait_source::register_wait_channel_with_id(
+            changed_source_id,
+            changed_channel.clone(),
+        );
         (changed_channel, changed_source_id, changed_source)
     }
 

@@ -18,8 +18,8 @@ use crate::vm::adapter::step_engine::{
     self, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
 use crate::vm::{
-    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags,
-    VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmRemapOutcome, VmRemapRequest,
+    AddressSpace, Prot, UserRange, UserVirtAddr, VmMapCommit, VmMapError, VmMapOutcome,
+    VmMapRequest, VmRemapOutcome, VmRemapRequest,
 };
 
 /// Translate a [`VmMapError`] into a substrate [`Errno`] for
@@ -166,76 +166,13 @@ impl<'a, I: SubjectIdentity> StepOp<I> for VmBrkOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        use crate::vm::UserRange;
-
-        if self.requested_brk.0 < self.brk_base.0 {
-            return StepOutcome::Err(Errno::EINVAL);
-        }
-        if self.requested_brk.0 == self.current_brk.0 {
-            return StepOutcome::Done(self.current_brk);
-        }
-
-        if self.requested_brk.0 > self.current_brk.0 {
-            // Grow: mmap the new pages.
-            let Some(old_committed) =
-                crate::vm::execution::checked_page_align_up(self.current_brk.0)
-            else {
-                return StepOutcome::Err(Errno::EINVAL);
-            };
-            let Some(new_committed) =
-                crate::vm::execution::checked_page_align_up(self.requested_brk.0)
-            else {
-                return StepOutcome::Err(Errno::EINVAL);
-            };
-            if new_committed <= old_committed {
-                return StepOutcome::Done(self.requested_brk);
-            }
-            let range = match UserRange::new_aligned(
-                UserVirtAddr(old_committed),
-                new_committed - old_committed,
-            ) {
-                Ok(r) => r,
-                Err(_) => return StepOutcome::Err(Errno::EINVAL),
-            };
-            let request = VmMapRequest::fixed(
-                range,
-                MapPlacement::RequireFree,
-                Prot::READ_WRITE,
-                VmEntryFlags::PRIVATE,
-                VmBacking::PrivateAnon,
-            );
-            match self.aspace.try_mmap(request) {
-                Ok(_outcome) => StepOutcome::Done(self.requested_brk),
-                Err(VmMapError::WouldBlock) => range_lock_blocked(self.aspace),
-                Err(error) => StepOutcome::Err(vmmap_error_to_errno(error)),
-            }
-        } else {
-            // Shrink: munmap the excess pages.
-            let Some(old_committed) =
-                crate::vm::execution::checked_page_align_up(self.current_brk.0)
-            else {
-                return StepOutcome::Err(Errno::EINVAL);
-            };
-            let Some(new_committed) =
-                crate::vm::execution::checked_page_align_up(self.requested_brk.0)
-            else {
-                return StepOutcome::Err(Errno::EINVAL);
-            };
-            if new_committed >= old_committed {
-                return StepOutcome::Done(self.requested_brk);
-            }
-            let range = match UserRange::new_aligned(
-                UserVirtAddr(new_committed),
-                old_committed - new_committed,
-            ) {
-                Ok(r) => r,
-                Err(_) => return StepOutcome::Err(Errno::EINVAL),
-            };
-            match self.aspace.try_munmap(range) {
-                Ok(_commit) => StepOutcome::Done(self.requested_brk),
-                Err(VmMapError::WouldBlock) => range_lock_blocked(self.aspace),
-                Err(error) => StepOutcome::Err(vmmap_error_to_errno(error)),
-            }
+        match self
+            .aspace
+            .try_brk(self.brk_base, self.current_brk, self.requested_brk)
+        {
+            Ok(new_brk) => StepOutcome::Done(new_brk),
+            Err(VmMapError::WouldBlock) => range_lock_blocked(self.aspace),
+            Err(error) => StepOutcome::Err(vmmap_error_to_errno(error)),
         }
     }
 }

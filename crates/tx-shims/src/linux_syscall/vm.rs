@@ -3,14 +3,96 @@
 //! enclosing module changed. Helpers and constants used here live
 //! either in this submodule or in the shared parent (`super::*`).
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, Errno as V3Errno, StepOutcome};
 use tx_hal::UserPtr;
 use tx_scripts::drive;
 use tx_substrate::step::DriveMode;
+use tx_substrate::wake::MailboxSchedulerHint;
 use tx_subsystems::vm::step_ops::{
     VmBrkOp, VmMapOp, VmMlockOp, VmMsyncOp, VmMunlockOp, VmProtectOp, VmRemapOp, VmUnmapOp,
 };
+
+/// Soft budget for the linear `brk` heap before callers are asked to fall
+/// back to `mmap`.
+///
+/// Linux `brk(2)` is allowed to fail by returning the unchanged break. The
+/// OSComp musl image uses oldmalloc, whose small-allocation path otherwise
+/// grows `brk` one page at a time; on the current VM substrate that turns
+/// libcbench malloc into tens of thousands of tiny syscall/VM operations.
+/// Keeping a small budget preserves simple `sbrk` compatibility (including
+/// basic-musl's 64-byte checks) while nudging allocator-scale growth onto
+/// musl's exponentially growing mmap fallback.
+pub(super) const BRK_LINEAR_HEAP_SOFT_LIMIT_BYTES: usize = USER_PAGE_SIZE * 64;
+
+static FUTEX_WAIT_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
+static FUTEX_WAKE_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
+static VM_RECIPE_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
+
+fn futex_trace_sample(counter: &AtomicU64) -> bool {
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    n == 1 || n % 256 == 0
+}
+
+fn emit_futex_trace(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+    }
+}
+
+fn emit_futex_wait_entry(uaddr: u64, val: u32, op: u32, wait_mask: u64) {
+    emit_futex_trace(b"debug.futex.wait.uaddr", uaddr as i64);
+    emit_futex_trace(b"debug.futex.wait.val", i64::from(val));
+    emit_futex_trace(b"debug.futex.wait.op", i64::from(op));
+    emit_futex_trace(b"debug.futex.wait.mask", wait_mask as i64);
+}
+
+fn emit_futex_wake_entry(uaddr: u64, n: u32, op: u32, wake_mask: u64) {
+    emit_futex_trace(b"debug.futex.wake.uaddr", uaddr as i64);
+    emit_futex_trace(b"debug.futex.wake.n", i64::from(n));
+    emit_futex_trace(b"debug.futex.wake.op", i64::from(op));
+    emit_futex_trace(b"debug.futex.wake.mask", wake_mask as i64);
+}
+
+fn emit_futex_result(name: &[u8], result: &SyscallResult) {
+    let code = match result {
+        SyscallResult::Return(v) => *v,
+        SyscallResult::CloneReturn { value, .. } => *value,
+        SyscallResult::Error(e) => -i64::from(*e),
+        SyscallResult::NoReturn => i64::MIN + 1,
+        SyscallResult::ExecCommitted => i64::MIN + 2,
+        SyscallResult::SigreturnRestored => i64::MIN + 3,
+    };
+    emit_futex_trace(name, code);
+    tx_observe::dump_registered_if_requested();
+}
+
+fn brk_growth_exceeds_soft_limit(brk_base: u64, current_brk: u64, requested: u64) -> bool {
+    if requested <= current_brk {
+        return false;
+    }
+    let Some(limit) = brk_base.checked_add(BRK_LINEAR_HEAP_SOFT_LIMIT_BYTES as u64) else {
+        return false;
+    };
+    requested > limit
+}
+
+fn emit_vm_recipe_summary(name: &[u8], ctx: &SyscallCtx<'_>) {
+    let n = VM_RECIPE_TRACE_SAMPLE.fetch_add(1, Ordering::Relaxed) + 1;
+    if n != 1 && n % 512 != 0 {
+        return;
+    }
+    emit_futex_trace(name, n as i64);
+    let stats = ctx.aspace.stats();
+    emit_futex_trace(b"debug.vm.recipe.count", stats.recipe_count as i64);
+    emit_futex_trace(b"debug.vm.recipe.vm_size", stats.vm_size as i64);
+    tx_observe::dump_registered_if_requested();
+}
 
 /// `brk(requested)` per `txdoc:VM-5-8-BRK`.
 ///
@@ -37,6 +119,19 @@ pub(super) async fn sys_brk(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
     let base = UserVirtAddr(brk_base as usize);
     let cur = UserVirtAddr(current_brk as usize);
     let req = UserVirtAddr(requested as usize);
+
+    if brk_growth_exceeds_soft_limit(brk_base, current_brk, requested) {
+        return SyscallResult::Return(current_brk as i64);
+    }
+
+    match ctx.aspace.try_brk(base, cur, req) {
+        Ok(new_brk) => {
+            ctx.process.set_current_brk(new_brk.0 as u64);
+            return SyscallResult::Return(new_brk.0 as i64);
+        }
+        Err(VmMapError::WouldBlock) => {}
+        Err(_) => return SyscallResult::Return(current_brk as i64),
+    }
 
     let op = VmBrkOp {
         aspace: &ctx.aspace,
@@ -245,6 +340,22 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
         VmMapRequest::anywhere(window, page_count, prot, entry_flags, backing)
     };
 
+    match ctx.aspace.try_mmap(request.clone()) {
+        Ok(outcome) => {
+            emit_vm_recipe_summary(b"debug.vm.recipe.mmap", ctx);
+            return SyscallResult::Return(outcome.range.start().as_usize() as i64);
+        }
+        Err(VmMapError::WouldBlock) => {}
+        Err(error) => {
+            let code = if fixed_noreplace && error == VmMapError::AlreadyMapped {
+                errno_to_i32(Errno::EEXIST)
+            } else {
+                vmmap_error_to_i32(error)
+            };
+            return SyscallResult::Error(code);
+        }
+    }
+
     let op = VmMapOp {
         aspace: &ctx.aspace,
         request,
@@ -263,7 +374,10 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
     )
     .await
     {
-        Ok(outcome) => SyscallResult::Return(outcome.range.start().as_usize() as i64),
+        Ok(outcome) => {
+            emit_vm_recipe_summary(b"debug.vm.recipe.mmap", ctx);
+            SyscallResult::Return(outcome.range.start().as_usize() as i64)
+        }
         Err(errno) => {
             // MAP_FIXED_NOREPLACE → AlreadyMapped maps to EEXIST per
             // Linux's distinct semantic for that flag.
@@ -273,6 +387,96 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
                 errno_to_i32(Into::<Errno>::into(errno))
             };
             SyscallResult::Error(code)
+        }
+    }
+}
+
+pub(super) fn sys_mmap_private_anon_try(
+    args: [u64; 6],
+    aspace: &Cap<AddressSpace>,
+) -> Option<SyscallResult> {
+    let addr = args[0];
+    let length_in = args[1] as usize;
+    let prot_bits = args[2];
+    let flags = args[3];
+    let fd = args[4] as i32;
+    let offset = args[5];
+
+    if flags & MAP_ANONYMOUS == 0 || flags & MAP_PRIVATE == 0 || flags & MAP_SHARED != 0 {
+        return None;
+    }
+    if fd != -1 || offset != 0 {
+        return None;
+    }
+
+    if length_in == 0 {
+        return Some(SyscallResult::Error(EINVAL_VALUE));
+    }
+    let length = match length_in.checked_next_multiple_of(USER_PAGE_SIZE) {
+        Some(rounded) => rounded,
+        None => return Some(SyscallResult::Error(EINVAL_VALUE)),
+    };
+
+    let prot_recognised =
+        PROT_READ | PROT_WRITE | PROT_EXEC | PROT_NONE | PROT_GROWSDOWN | PROT_GROWSUP;
+    if prot_bits & !prot_recognised != 0 {
+        return Some(SyscallResult::Error(EINVAL_VALUE));
+    }
+    if prot_bits & (PROT_GROWSDOWN | PROT_GROWSUP) != 0 {
+        return Some(SyscallResult::Error(ENOSYS_VALUE));
+    }
+    if flags & MAP_GROWSDOWN != 0 {
+        return Some(SyscallResult::Error(EINVAL_VALUE));
+    }
+
+    let prot = Prot::new(
+        prot_bits & PROT_READ != 0,
+        prot_bits & PROT_WRITE != 0,
+        prot_bits & PROT_EXEC != 0,
+    );
+    let entry_flags = VmEntryFlags::new(false, flags & MAP_GROWSDOWN != 0, flags & MAP_LOCKED != 0);
+    let backing = VmBacking::PrivateAnon;
+    let fixed = flags & MAP_FIXED != 0;
+    let fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
+
+    let request = if fixed || fixed_noreplace {
+        if !UserVirtAddr::new(addr as usize).is_page_aligned() {
+            return Some(SyscallResult::Error(EINVAL_VALUE));
+        }
+        let range = match UserRange::new_aligned(UserVirtAddr::new(addr as usize), length) {
+            Ok(r) => r,
+            Err(_) => return Some(SyscallResult::Error(EINVAL_VALUE)),
+        };
+        let placement = if fixed_noreplace {
+            MapPlacement::RequireFree
+        } else {
+            MapPlacement::FixedReplace
+        };
+        VmMapRequest::fixed(range, placement, prot, entry_flags, backing)
+    } else {
+        let window = match UserRange::new_aligned(
+            UserVirtAddr(USER_PAGE_SIZE),
+            UserRange::full_user_v1().len() - USER_PAGE_SIZE,
+        ) {
+            Ok(range) => range,
+            Err(_) => return Some(SyscallResult::Error(EINVAL_VALUE)),
+        };
+        let page_count = length / USER_PAGE_SIZE;
+        VmMapRequest::anywhere(window, page_count, prot, entry_flags, backing)
+    };
+
+    match aspace.try_mmap(request) {
+        Ok(outcome) => Some(SyscallResult::Return(
+            outcome.range.start().as_usize() as i64
+        )),
+        Err(VmMapError::WouldBlock) => None,
+        Err(error) => {
+            let code = if fixed_noreplace && error == VmMapError::AlreadyMapped {
+                errno_to_i32(Errno::EEXIST)
+            } else {
+                vmmap_error_to_i32(error)
+            };
+            Some(SyscallResult::Error(code))
         }
     }
 }
@@ -299,6 +503,12 @@ pub(super) async fn sys_munmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
         Ok(r) => r,
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
+
+    match ctx.aspace.try_munmap(range) {
+        Ok(_commit) => return SyscallResult::Return(0),
+        Err(VmMapError::WouldBlock) => {}
+        Err(error) => return SyscallResult::Error(vmmap_error_to_i32(error)),
+    }
 
     let op = VmUnmapOp {
         aspace: &ctx.aspace,
@@ -451,6 +661,15 @@ pub(super) async fn sys_mprotect(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscal
         Ok(r) => r,
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
+    match ctx.aspace.try_mprotect(range, prot) {
+        Ok(_) => {
+            emit_vm_recipe_summary(b"debug.vm.recipe.mprotect", ctx);
+            return SyscallResult::Return(0);
+        }
+        Err(VmMapError::WouldBlock) => {}
+        Err(error) => return SyscallResult::Error(vmmap_error_to_i32(error)),
+    }
+
     let op = VmProtectOp {
         aspace: &ctx.aspace,
         range,
@@ -470,7 +689,10 @@ pub(super) async fn sys_mprotect(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscal
     )
     .await
     {
-        Ok(_commit) => SyscallResult::Return(0),
+        Ok(_commit) => {
+            emit_vm_recipe_summary(b"debug.vm.recipe.mprotect", ctx);
+            SyscallResult::Return(0)
+        }
         Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
     }
 }
@@ -793,6 +1015,10 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             } else {
                 FUTEX_WAKE_MASK
             };
+            let trace_wait = futex_trace_sample(&FUTEX_WAIT_TRACE_SAMPLE);
+            if trace_wait {
+                emit_futex_wait_entry(uaddr, val, op, wait_mask);
+            }
 
             // Validate the user address before probing — the futex
             // subsystem reads *uaddr via `read_volatile` (bootstrap
@@ -803,7 +1029,11 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 let guard = step_engine::guard();
                 let user_ptr = UserPtr::<u32>::new(uaddr as usize);
                 if let StepOutcome::Err(_) = ctx.aspace.read_user(user_ptr, &guard) {
-                    return SyscallResult::error_from(Errno::EFAULT);
+                    let result = SyscallResult::error_from(Errno::EFAULT);
+                    if trace_wait {
+                        emit_futex_result(b"debug.futex.wait.result", &result);
+                    }
+                    return result;
                 }
             }
             let mut deadline_ns = None;
@@ -816,12 +1046,32 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                     let user_ptr = UserPtr::<u32>::new(uaddr as usize);
                     match ctx.aspace.read_user(user_ptr, &guard) {
                         StepOutcome::Done(observed) if observed == val => {
-                            return SyscallResult::Error(110);
+                            let result = SyscallResult::Error(110);
+                            if trace_wait {
+                                emit_futex_result(b"debug.futex.wait.result", &result);
+                            }
+                            return result;
                         }
-                        StepOutcome::Done(_) => return SyscallResult::Error(EAGAIN_VALUE),
-                        StepOutcome::Err(_) => return SyscallResult::error_from(Errno::EFAULT),
+                        StepOutcome::Done(_) => {
+                            let result = SyscallResult::Error(EAGAIN_VALUE);
+                            if trace_wait {
+                                emit_futex_result(b"debug.futex.wait.result", &result);
+                            }
+                            return result;
+                        }
+                        StepOutcome::Err(_) => {
+                            let result = SyscallResult::error_from(Errno::EFAULT);
+                            if trace_wait {
+                                emit_futex_result(b"debug.futex.wait.result", &result);
+                            }
+                            return result;
+                        }
                         StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                            return SyscallResult::error_from(Errno::EFAULT);
+                            let result = SyscallResult::error_from(Errno::EFAULT);
+                            if trace_wait {
+                                emit_futex_result(b"debug.futex.wait.result", &result);
+                            }
+                            return result;
                         }
                     }
                 }
@@ -864,10 +1114,20 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             )
             .await
             {
-                Ok(()) => SyscallResult::Return(0),
+                Ok(()) => {
+                    let result = SyscallResult::Return(0);
+                    if trace_wait {
+                        emit_futex_result(b"debug.futex.wait.result", &result);
+                    }
+                    result
+                }
                 Err(v3errno) => {
                     let errno: Errno = v3errno.into();
-                    SyscallResult::error_from(errno)
+                    let result = SyscallResult::error_from(errno);
+                    if trace_wait {
+                        emit_futex_result(b"debug.futex.wait.result", &result);
+                    }
+                    result
                 }
             }
         }
@@ -880,7 +1140,21 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             } else {
                 tx_subsystems::futex::FUTEX_WAKE_MASK
             };
-            futex_wake_oneshot(ctx, uaddr, val, wake_mask)
+            let trace_wake = futex_trace_sample(&FUTEX_WAKE_TRACE_SAMPLE);
+            if trace_wake {
+                emit_futex_wake_entry(uaddr, val, op, wake_mask);
+            }
+            let result = futex_wake_oneshot(
+                ctx,
+                uaddr,
+                val,
+                wake_mask,
+                MailboxSchedulerHint::WakeHandoff,
+            );
+            if trace_wake {
+                emit_futex_result(b"debug.futex.wake.result", &result);
+            }
+            result
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             if uaddr2 == 0 {
@@ -943,8 +1217,53 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
     }
 }
 
-fn futex_wake_oneshot(ctx: &SyscallCtx<'_>, uaddr: u64, n: u32, wake_mask: u64) -> SyscallResult {
-    match futex_wake_count_masked(ctx, uaddr, n, wake_mask) {
+pub(super) fn sys_futex_oneshot(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Option<SyscallResult> {
+    sys_futex_oneshot_with_wake_hint(args, ctx, MailboxSchedulerHint::WakeHandoff)
+}
+
+pub(super) fn sys_futex_oneshot_with_wake_hint(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+    wake_hint: MailboxSchedulerHint,
+) -> Option<SyscallResult> {
+    let uaddr = args[0];
+    let op_full = args[1] as u32;
+    let val = args[2] as u32;
+    let bitset = args[5] as u32;
+    let op = op_full & FUTEX_CMD_MASK;
+
+    match op {
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            if op == FUTEX_WAKE_BITSET && bitset == 0 {
+                return Some(SyscallResult::Error(EINVAL_VALUE));
+            }
+            let wake_mask = if op == FUTEX_WAKE_BITSET {
+                bitset as u64
+            } else {
+                tx_subsystems::futex::FUTEX_WAKE_MASK
+            };
+            let trace_wake = futex_trace_sample(&FUTEX_WAKE_TRACE_SAMPLE);
+            if trace_wake {
+                emit_futex_wake_entry(uaddr, val, op, wake_mask);
+            }
+            let result = futex_wake_oneshot(ctx, uaddr, val, wake_mask, wake_hint);
+            if trace_wake {
+                emit_futex_result(b"debug.futex.wake.result", &result);
+            }
+            Some(result)
+        }
+        _ => None,
+    }
+}
+
+fn futex_wake_oneshot(
+    ctx: &SyscallCtx<'_>,
+    uaddr: u64,
+    n: u32,
+    wake_mask: u64,
+    wake_hint: MailboxSchedulerHint,
+) -> SyscallResult {
+    match futex_wake_count_masked_with_hint(ctx, uaddr, n, wake_mask, wake_hint) {
         Ok(woken) => SyscallResult::Return(woken as i64),
         Err(result) => result,
     }
@@ -960,33 +1279,31 @@ fn futex_wake_count_masked(
     n: u32,
     wake_mask: u64,
 ) -> Result<u32, SyscallResult> {
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    if wake_mask == tx_subsystems::futex::FUTEX_WAKE_MASK {
-        let mut op = FutexWakeOp {
-            uaddr,
-            n,
-            aspace: &ctx.aspace,
-        };
-        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-            Ok(woken) => Ok(woken),
-            Err(v3errno) => Err(SyscallResult::error_from(Errno::from(v3errno))),
-        }
-    } else {
-        let guard = step_engine::guard();
-        let outcome = tx_subsystems::futex::step_futex_wake_masked_in(
-            &ctx.aspace,
-            uaddr,
-            n,
-            wake_mask,
-            &guard,
-        );
-        drop(guard);
-        match outcome {
-            StepOutcome::Done(woken) => Ok(woken),
-            StepOutcome::Err(errno) => Err(SyscallResult::error_from(Errno::from(errno))),
-            StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                Err(SyscallResult::error_from(Errno::EIO))
-            }
+    futex_wake_count_masked_with_hint(ctx, uaddr, n, wake_mask, MailboxSchedulerHint::WakeHandoff)
+}
+
+fn futex_wake_count_masked_with_hint(
+    ctx: &SyscallCtx<'_>,
+    uaddr: u64,
+    n: u32,
+    wake_mask: u64,
+    wake_hint: MailboxSchedulerHint,
+) -> Result<u32, SyscallResult> {
+    let guard = step_engine::guard();
+    let outcome = tx_subsystems::futex::step_futex_wake_masked_with_hint_in(
+        &ctx.aspace,
+        uaddr,
+        n,
+        wake_mask,
+        wake_hint,
+        &guard,
+    );
+    drop(guard);
+    match outcome {
+        StepOutcome::Done(woken) => Ok(woken),
+        StepOutcome::Err(errno) => Err(SyscallResult::error_from(Errno::from(errno))),
+        StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+            Err(SyscallResult::error_from(Errno::EIO))
         }
     }
 }

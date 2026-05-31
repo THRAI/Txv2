@@ -2,6 +2,7 @@
 
 use crate::vm::adapter::step_engine::{epoch_mod as epoch, Cap, Zone, ZoneAllocated};
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicUsize;
 use tx_hal::PmapIf;
 
 #[cfg(test)]
@@ -41,6 +42,8 @@ pub struct AddressSpace {
     pub(in crate::vm) pmap: VmPmap,
     pub(in crate::vm) range_lock: RangeLock,
     pub(in crate::vm) stats: AddressSpaceStatsCell,
+    pub(in crate::vm) next_private_anon_write_fault_page: AtomicUsize,
+    pub(in crate::vm) next_mmap_search_start: AtomicUsize,
 }
 
 impl AddressSpace {
@@ -49,11 +52,19 @@ impl AddressSpace {
     }
 
     pub fn new_for_platform<P: PmapIf>() -> Result<Self, VmPmapError> {
+        Self::new_with_recipes_for_platform::<P>(RecipeIndex::new())
+    }
+
+    pub(in crate::vm) fn new_with_recipes_for_platform<P: PmapIf>(
+        recipes: RecipeIndex,
+    ) -> Result<Self, VmPmapError> {
         Ok(Self {
-            recipes: RecipeIndex::new(),
+            recipes,
             pmap: VmPmap::new_for_platform::<P>()?,
             range_lock: RangeLock::new(),
             stats: AddressSpaceStatsCell::new(),
+            next_private_anon_write_fault_page: AtomicUsize::new(0),
+            next_mmap_search_start: AtomicUsize::new(0),
         })
     }
 

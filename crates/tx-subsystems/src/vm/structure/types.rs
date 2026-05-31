@@ -455,6 +455,17 @@ impl VmEntry {
         // recipe rewriters drop the parent VmEntry after publishing
         // the sub-entries, which releases the parent Cap.
         let private = match &self.private {
+            Some(parent_set) if parent_set.is_empty() => {
+                if prot.write {
+                    Some(
+                        PrivatePageSet::new_cap()
+                            .map_err(PrivatePageError::Zone)
+                            .map_err(VmEntryError::Private)?,
+                    )
+                } else {
+                    None
+                }
+            }
             Some(parent_set) => {
                 let parent_start_page = self.range.start.0 / USER_PAGE_SIZE;
                 let sub_start_page = start.0 / USER_PAGE_SIZE;
@@ -469,7 +480,17 @@ impl VmEntry {
                     .map_err(VmEntryError::Private)?;
                 Some(sliced)
             }
-            None => None,
+            None => {
+                if prot.write && !self.flags.shared {
+                    Some(
+                        PrivatePageSet::new_cap()
+                            .map_err(PrivatePageError::Zone)
+                            .map_err(VmEntryError::Private)?,
+                    )
+                } else {
+                    None
+                }
+            }
         };
         Ok(Self {
             range,
@@ -532,9 +553,16 @@ pub struct AddressSpaceStats {
     pub vm_size: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::vm) struct AddressSpaceStatsDelta {
+    pub recipe_count: isize,
+    pub vm_size: isize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VmMapCommit {
     pub changed_pages: usize,
+    pub(in crate::vm) stats_delta: AddressSpaceStatsDelta,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -931,19 +959,27 @@ impl VmFaultOutcome {
         page_index: PageIndex,
         guard: &crate::execution::Guard<'_>,
     ) -> VmFaultMaterializationStep {
+        emit_vm_materialize_trace(b"debug.vm.private_read_miss.phase", 0);
         let page = match (&self.entry.backing, backing_kind) {
             (VmBacking::Page { pc, .. }, VmFaultMaterializationBacking::PageBacked) => {
+                emit_vm_materialize_trace(b"debug.vm.private_read_miss.backing", 2);
                 let Some(access_byte) = page_index.as_u64().checked_mul(USER_PAGE_SIZE as u64)
                 else {
                     return VmFaultMaterializationStep::Err(VmFaultError::BackingOffsetOverflow);
                 };
+                emit_vm_materialize_trace(b"debug.vm.private_read_miss.phase", 1);
                 if access_byte >= pc.size_bytes() {
                     return VmFaultMaterializationStep::Err(VmFaultError::PageBeyondSize);
                 }
+                emit_vm_materialize_trace(b"debug.vm.private_read_miss.phase", 2);
                 match pc.materialize_page_for_fault_step(page_index, MaterializeAccess::Read, guard)
                 {
-                    step_engine::StepOutcome::Done(page) => page,
+                    step_engine::StepOutcome::Done(page) => {
+                        emit_vm_materialize_trace(b"debug.vm.private_read_miss.phase", 3);
+                        page
+                    }
                     step_engine::StepOutcome::Yield { shape, .. } => {
+                        emit_vm_materialize_trace(b"debug.vm.private_read_miss.yield", 1);
                         if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape)
                         {
                             return VmFaultMaterializationStep::Blocked(token);
@@ -953,11 +989,13 @@ impl VmFaultOutcome {
                         ));
                     }
                     step_engine::StepOutcome::Err(errno) => {
+                        emit_vm_materialize_trace(b"debug.vm.private_read_miss.err", 1);
                         return VmFaultMaterializationStep::Err(VmFaultError::PageCache(
                             PageCacheError::Backend(errno.into()),
                         ));
                     }
                     _ => {
+                        emit_vm_materialize_trace(b"debug.vm.private_read_miss.err", 2);
                         return VmFaultMaterializationStep::Err(VmFaultError::PageCache(
                             PageCacheError::Backend(crate::execution::Errno::EAGAIN),
                         ));
@@ -965,13 +1003,19 @@ impl VmFaultOutcome {
                 }
             }
             (VmBacking::PrivateAnon, VmFaultMaterializationBacking::PrivateAnon) => {
+                emit_vm_materialize_trace(b"debug.vm.private_read_miss.backing", 1);
+                emit_vm_materialize_trace(b"debug.vm.private_read_miss.phase", 4);
                 match materialize_zero_frame() {
-                    Ok(page) => page,
+                    Ok(page) => {
+                        emit_vm_materialize_trace(b"debug.vm.private_read_miss.phase", 5);
+                        page
+                    }
                     Err(error) => return VmFaultMaterializationStep::Err(error),
                 }
             }
             _ => return VmFaultMaterializationStep::Err(VmFaultError::BackingMismatch),
         };
+        emit_vm_materialize_trace(b"debug.vm.private_read_miss.phase", 6);
         VmFaultMaterializationStep::Done(VmFaultMaterialization {
             backing: backing_kind,
             page_index,
@@ -1034,8 +1078,12 @@ impl VmFaultOutcome {
                 new
             }
             (VmBacking::PrivateAnon, VmFaultMaterializationBacking::PrivateAnon) => {
+                emit_vm_materialize_trace(b"debug.vm.private_anon.write_miss.phase", 0);
                 match allocate_private_materialized_page(true) {
-                    Ok(page) => page,
+                    Ok(page) => {
+                        emit_vm_materialize_trace(b"debug.vm.private_anon.write_miss.phase", 1);
+                        page
+                    }
                     Err(error) => return VmFaultMaterializationStep::Err(error),
                 }
             }
@@ -1045,6 +1093,7 @@ impl VmFaultOutcome {
         // failure (someone raced and published), drop our new page and
         // ask the script to retry.
         if let Some(set) = &self.entry.private {
+            emit_vm_materialize_trace(b"debug.vm.private_anon.write_miss.phase", 2);
             let cache_pin = match page_allocator::acquire_cache_pin(new_page.ppn) {
                 Ok(pin) => pin,
                 Err(error) => {
@@ -1052,10 +1101,19 @@ impl VmFaultOutcome {
                     return VmFaultMaterializationStep::Err(page_alloc_error(error));
                 }
             };
+            emit_vm_materialize_trace(b"debug.vm.private_anon.write_miss.phase", 3);
             let frame = PrivateFrame::new(new_page.ppn, PrivateFrameState::Exclusive, cache_pin);
+            emit_vm_materialize_trace(b"debug.vm.private_anon.write_miss.phase", 4);
+            emit_vm_materialize_trace(
+                b"debug.vm.private_anon.write_miss.install",
+                page_off.0 as i64,
+            );
             match set.install_if_absent(page_off, frame) {
-                Ok(_) => {}
+                Ok(_) => {
+                    emit_vm_materialize_trace(b"debug.vm.private_anon.write_miss.phase", 5);
+                }
                 Err(_) => {
+                    emit_vm_materialize_trace(b"debug.vm.private_anon.write_miss.conflict", 1);
                     drop(new_page);
                     return VmFaultMaterializationStep::Err(VmFaultError::WouldBlock);
                 }
@@ -1220,12 +1278,18 @@ fn materialize_zero_frame() -> Result<MaterializedPage, VmFaultError> {
 }
 
 fn allocate_private_materialized_page(dirty: bool) -> Result<MaterializedPage, VmFaultError> {
-    let frame = page_allocator::reserve_frame(ZeroPolicy::Zeroed)
-        .map_err(page_alloc_error)?
-        .commit();
+    emit_vm_materialize_trace(b"debug.vm.private_anon.allocate.phase", 0);
+    let reservation =
+        page_allocator::reserve_frame(ZeroPolicy::Zeroed).map_err(page_alloc_error)?;
+    emit_vm_materialize_trace(b"debug.vm.private_anon.allocate.phase", 1);
+    let frame = reservation.commit();
+    emit_vm_materialize_trace(b"debug.vm.private_anon.allocate.phase", 2);
     let ppn = frame.ppn();
+    emit_vm_materialize_trace(b"debug.vm.private_anon.allocate.ppn", ppn.0 as i64);
     let map_pin = frame.try_map_pin().map_err(page_alloc_error)?;
+    emit_vm_materialize_trace(b"debug.vm.private_anon.allocate.phase", 3);
     drop(frame);
+    emit_vm_materialize_trace(b"debug.vm.private_anon.allocate.phase", 4);
     Ok(MaterializedPage {
         ppn,
         map_pin: MaterializedPagePin::Allocated(map_pin),
@@ -1277,4 +1341,13 @@ fn allocate_private_materialized_page_from_source(
 
 const fn page_alloc_error(error: step_engine::page_allocator::AllocError) -> VmFaultError {
     VmFaultError::PageCache(PageCacheError::Alloc(error))
+}
+
+fn emit_vm_materialize_trace(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+    }
 }

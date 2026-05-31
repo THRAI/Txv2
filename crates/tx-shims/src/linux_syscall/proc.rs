@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine};
-use crate::linux_syscall::numbers::CLONE_NEWIPC;
+use crate::linux_syscall::numbers::{CLONE_NEWIPC, NR_CLONE};
 
 /// Linux raw `wait4`/`getrusage` rusage image for musl LP64:
 /// two `timeval`s plus fourteen `long` counters. musl passes the
@@ -27,6 +27,16 @@ const RUSAGE_SELF: i32 = 0;
 const RUSAGE_THREAD: i32 = 1;
 const LINUX_DEFAULT_PERSONALITY: u32 = 0;
 const PERSONALITY_QUERY: u32 = u32::MAX;
+
+fn emit_clone_marker(name: &[u8]) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            NR_CLONE as i64,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
 
 /// `exit(status)` — per-thread exit per `PROCESS_v1` §7.3.1.
 ///
@@ -297,12 +307,17 @@ pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
 /// Wave 1's surface (`fork_aspace`'s `WouldBlock` cannot fire under
 /// v1's single-thread-per-process model). The function is non-`async`
 /// to keep the seam minimal.
-pub(super) async fn sys_clone<'a, P: PmapIf>(
+pub(super) fn sys_clone_oneshot<P: PmapIf>(
     args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    emit_clone_marker(b"debug.clone.enter");
     let flags = args[0];
     let stack = args[1];
+
+    if (flags & CLONE_VFORK) != 0 && (flags & CLONE_THREAD) == 0 {
+        return None;
+    }
 
     // Validation: the lower byte specifies the exit signal.
     // CLONE_THREAD threads don't generate an exit signal (the
@@ -312,11 +327,10 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     // sets the lower byte to zero when CLONE_THREAD is set).
     let clone_thread = (flags & CLONE_THREAD) != 0;
     if !clone_thread && flags & SIGCHLD == 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
+        return Some(SyscallResult::Error(EINVAL_VALUE));
     }
     let clone_vm = (flags & CLONE_VM) != 0;
     let clone_sighand = (flags & CLONE_SIGHAND) != 0;
-    let clone_vfork = (flags & CLONE_VFORK) != 0;
     let clone_settls = (flags & CLONE_SETTLS) != 0;
     let clone_child_cleartid = (flags & CLONE_CHILD_CLEARTID) != 0;
     let clone_parent_settid = (flags & CLONE_PARENT_SETTID) != 0;
@@ -325,10 +339,10 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     let allowed_mask = if clone_thread {
         // CLONE_THREAD requires CLONE_SIGHAND per Linux semantics.
         if flags & CLONE_SIGHAND == 0 {
-            return SyscallResult::Error(EINVAL_VALUE);
+            return Some(SyscallResult::Error(EINVAL_VALUE));
         }
         if clone_newipc {
-            return SyscallResult::Error(EINVAL_VALUE);
+            return Some(SyscallResult::Error(EINVAL_VALUE));
         }
         SIGCHLD
             | CLONE_THREAD
@@ -354,7 +368,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             | CLONE_NEWIPC
     };
     if flags & !allowed_mask != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
+        return Some(SyscallResult::Error(EINVAL_VALUE));
     }
     // `stack` (newsp) — Linux semantic: zero means the child shares the
     // parent's sp (bare fork). Non-zero means the libc clone wrapper has
@@ -375,6 +389,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         .expect(":clone:no-payload: kernel-invariant violation, calling thread had no payload")
         .saved_user_context()
         .expect(":clone:no-context: kernel-invariant violation, parent thread had no saved_user_context");
+    emit_clone_marker(b"debug.clone.parent_ctx.after");
 
     // Txv2's Linux syscall shim receives clone arguments in the
     // asm-generic order used by the current userspace test images:
@@ -391,16 +406,22 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     // ProcessIdentity is created.
     if clone_thread {
         let ctid_ptr = if clone_child_cleartid { ctid_arg } else { 0 };
-        let child_thread = tx_subsystems::process::execution::step_clone_thread(
-            &ctx.process,
-            &parent_user_ctx,
-            stack as usize,
-            tls as usize,
+        let mut script_ctx = crate::KernelScriptCtx::new();
+        let mut op = tx_subsystems::process::CloneThreadOp {
+            process: &ctx.process,
+            parent_user_ctx: &parent_user_ctx,
+            stack: stack as usize,
+            tls: tls as usize,
             ctid_ptr,
-        );
+        };
+        let child_thread = match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(result) => result,
+            Err(v3errno) => return Some(SyscallResult::error_from(Errno::from(v3errno))),
+        };
+        emit_clone_marker(b"debug.clone.step_thread.after");
         let child_thread = match child_thread {
             Ok(t) => t,
-            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+            Err(_) => return Some(SyscallResult::Error(ENOMEM_VALUE)),
         };
 
         // CLONE_PARENT_SETTID: write child tid to *ptid in parent's
@@ -416,11 +437,19 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
                 );
             }
         }
+        emit_clone_marker(b"debug.clone.parent_settid.after");
 
         // Hand the child thread to the reactor.
-        reactor_submit::submit_child_thread(ctx.process.clone(), child_thread.clone());
+        emit_clone_marker(b"debug.clone.reactor_submit.before");
+        let child_submit =
+            reactor_submit::submit_child_thread(ctx.process.clone(), child_thread.clone());
+        emit_clone_marker(b"debug.clone.reactor_submit.after");
 
-        return SyscallResult::Return(child_thread.tid.0 as i64);
+        emit_clone_marker(b"debug.clone.return");
+        return Some(SyscallResult::CloneReturn {
+            value: child_thread.tid.0 as i64,
+            child_submit,
+        });
     }
 
     // ── Non-CLONE_THREAD (fork) path ────────────────────────────
@@ -447,7 +476,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(r) => r,
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+            Err(v3errno) => return Some(SyscallResult::error_from(Errno::from(v3errno))),
         }
     };
     // step_fork: mint a child ProcessIdentity + leader ThreadIdentity
@@ -458,22 +487,22 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             // Impossible by construction — the calling process is the
             // parent and is alive (we're servicing its syscall). Map
             // to ESRCH defensively.
-            return SyscallResult::Error(ESRCH_VALUE);
+            return Some(SyscallResult::Error(ESRCH_VALUE));
         }
         Err(tx_subsystems::process::ForkError::Vm(_)) => {
             // VmMapError (e.g. a transient WouldBlock or OOM during
             // fork_aspace). Map to EAGAIN — Linux's canonical
             // transient-fork-failure errno.
-            return SyscallResult::Error(EAGAIN_VALUE);
+            return Some(SyscallResult::Error(EAGAIN_VALUE));
         }
         Err(tx_subsystems::process::ForkError::Zone(_)) => {
-            return SyscallResult::Error(ENOMEM_VALUE);
+            return Some(SyscallResult::Error(ENOMEM_VALUE));
         }
         Err(tx_subsystems::process::ForkError::Busy) => {
-            return SyscallResult::Error(EAGAIN_VALUE);
+            return Some(SyscallResult::Error(EAGAIN_VALUE));
         }
         Err(tx_subsystems::process::ForkError::PidNamespace) => {
-            return SyscallResult::Error(ENOMEM_VALUE);
+            return Some(SyscallResult::Error(ENOMEM_VALUE));
         }
     };
 
@@ -496,11 +525,116 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     // Hand the child's leader thread to the reactor. Panics with
     // `:clone:no-reactor-seam` if the boot path didn't install the
     // seam — that's a boot-time invariant violation.
-    reactor_submit::submit_child_thread(child.clone(), child_thread.clone());
+    let child_submit = reactor_submit::submit_child_thread(child.clone(), child_thread.clone());
 
-    // vfork: parent blocks until the child execs or exits.  The
-    // child's exec and exit paths both call notify_vfork_done(),
-    // which fires the waker we store here.
+    Some(SyscallResult::CloneReturn {
+        value: child.pid.0 as i64,
+        child_submit,
+    })
+}
+
+pub(super) async fn sys_clone<'a, P: PmapIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    if let Some(result) = sys_clone_oneshot::<P>(args, ctx) {
+        return result;
+    }
+
+    emit_clone_marker(b"debug.clone.enter");
+    let flags = args[0];
+    let stack = args[1];
+
+    // Validation: the lower byte specifies the exit signal.
+    // CLONE_THREAD threads don't generate an exit signal (the
+    // thread-group leader's exit signal governs process-wide
+    // SIGCHLD).  For fork-like clones we require SIGCHLD; for
+    // thread clones we accept any signal (including zero — musl
+    // sets the lower byte to zero when CLONE_THREAD is set).
+    let clone_thread = (flags & CLONE_THREAD) != 0;
+    if !clone_thread && flags & SIGCHLD == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let clone_vm = (flags & CLONE_VM) != 0;
+    let clone_sighand = (flags & CLONE_SIGHAND) != 0;
+    let clone_vfork = (flags & CLONE_VFORK) != 0;
+    let clone_settls = (flags & CLONE_SETTLS) != 0;
+    let clone_newipc = (flags & CLONE_NEWIPC) != 0;
+
+    let allowed_mask = SIGCHLD
+        | CLONE_SETTLS
+        | CLONE_VM
+        | CLONE_VFORK
+        | CLONE_SIGHAND
+        | CLONE_FILES
+        | CLONE_FS
+        | CLONE_NEWIPC;
+    if flags & !allowed_mask != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    // Snapshot parent's saved trap context. Plan B discipline: the
+    // trap shell stored this at trap entry. `None` here means the
+    // shell never stored it — a kernel-invariant violation.
+    let parent_user_ctx = ctx
+        .thread
+        .payload_cap()
+        .expect(":clone:no-payload: kernel-invariant violation, calling thread had no payload")
+        .saved_user_context()
+        .expect(":clone:no-context: kernel-invariant violation, parent thread had no saved_user_context");
+    emit_clone_marker(b"debug.clone.parent_ctx.after");
+
+    // Txv2's Linux syscall shim receives clone arguments in the
+    // asm-generic order used by the current userspace test images:
+    //   clone(flags, stack, ptid, tls, ctid)
+    let tls = if clone_settls { args[3] } else { 0 };
+
+    // ── Non-CLONE_THREAD (fork) path with CLONE_VFORK ─────────────
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let fork_result = {
+        let mut op = tx_subsystems::process::execution::ForkOp::<P> {
+            parent: &ctx.process,
+            clone_vm,
+            clone_sighand,
+            clone_newipc,
+            _pmap: core::marker::PhantomData,
+        };
+        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(r) => r,
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+        }
+    };
+    let child = match fork_result {
+        Ok(c) => c,
+        Err(tx_subsystems::process::ForkError::ParentZombie) => {
+            return SyscallResult::Error(ESRCH_VALUE);
+        }
+        Err(tx_subsystems::process::ForkError::Vm(_)) => {
+            return SyscallResult::Error(EAGAIN_VALUE);
+        }
+        Err(tx_subsystems::process::ForkError::Zone(_)) => {
+            return SyscallResult::Error(ENOMEM_VALUE);
+        }
+        Err(tx_subsystems::process::ForkError::Busy) => {
+            return SyscallResult::Error(EAGAIN_VALUE);
+        }
+        Err(tx_subsystems::process::ForkError::PidNamespace) => {
+            return SyscallResult::Error(ENOMEM_VALUE);
+        }
+    };
+
+    let child_thread = child
+        .nth_thread(0)
+        .expect(":clone:no-leader: kernel-invariant violation, fresh child has no leader thread");
+
+    seed_child_leader_context(
+        &child_thread,
+        &parent_user_ctx,
+        tls as usize,
+        stack as usize,
+    );
+    let child_submit = reactor_submit::submit_child_thread(child.clone(), child_thread.clone());
+
     if clone_vfork {
         use core::future::Future;
         use core::pin::Pin;
@@ -539,7 +673,10 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     }
 
     // Parent observes the child's pid.
-    SyscallResult::Return(child.pid.0 as i64)
+    SyscallResult::CloneReturn {
+        value: child.pid.0 as i64,
+        child_submit,
+    }
 }
 
 /// `wait4(pid, status, options, rusage)` — Wave 3 of the fork/clone/wait4
