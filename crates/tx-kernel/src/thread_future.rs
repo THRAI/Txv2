@@ -81,6 +81,7 @@
 
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 use alloc::sync::Arc;
@@ -105,6 +106,20 @@ use tx_subsystems::vm::{
     AccessMode, AddressSpace, Prot, UserAccessKind, UserRange, UserVirtAddr, VmBacking, VmEntry,
     VmFault, USER_PAGE_SIZE,
 };
+
+static THREAD_DEBUG_MARKERS: AtomicUsize = AtomicUsize::new(0);
+const THREAD_DEBUG_MARKER_LIMIT: usize = 64;
+
+fn trace_thread_debug<P: TxPlatform>(marker: &str) {
+    if THREAD_DEBUG_MARKERS.fetch_add(1, Ordering::Relaxed) >= THREAD_DEBUG_MARKER_LIMIT {
+        return;
+    }
+    tx_hal::console_write_str::<P>("txkernel:");
+    tx_hal::console_write_str::<P>(P::BOARD);
+    tx_hal::console_write_str::<P>(":debug:thread:");
+    tx_hal::console_write_str::<P>(marker);
+    tx_hal::console_write_str::<P>("\n");
+}
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's
 /// `AccessMode`, which is what `VmFault` consumes. The two enums do
@@ -250,6 +265,7 @@ pub async fn run_thread<P: TxPlatform>(
     payload: PayloadCap<ThreadPayload>,
 ) {
     loop {
+        trace_thread_debug::<P>("poll-enter");
         // ----------------------------------------------------------------
         // (1) ENTRY-SIDE WAIT + AST CHECKPOINT.
         //
@@ -280,11 +296,15 @@ pub async fn run_thread<P: TxPlatform>(
             }
         };
         let entry_token = entry_wait.request();
+        trace_thread_debug::<P>("start-request-ok");
 
         // Phase E (stop-state): before entering userspace, check
         // whether the thread is stopped (SIGSTOP / default-Stop
         // disposition). A stopped thread must park until SIGCONT
         // clears the flag.
+        if payload.is_stopped() {
+            trace_thread_debug::<P>("stopped-spin");
+        }
         while payload.is_stopped() {
             // Busy-wait placeholder.  On real hardware this spins
             // until route_gewalt(SIGCONT) clears the flag.  TODO:
@@ -305,6 +325,7 @@ pub async fn run_thread<P: TxPlatform>(
         // need materialisation (DefaultTerminate, DeliverHandler) are
         // handled inline.
         if let Some(process) = thread.upgrade_owner_proc() {
+            trace_thread_debug::<P>("before-timer-poll");
             let posix_deadline = tx_shims::linux_syscall::poll_due_posix_timers::<P>(&process);
             let itimer_deadline = tx_shims::linux_syscall::poll_due_itimers::<P>(&process);
             match (posix_deadline, itimer_deadline) {
@@ -315,11 +336,17 @@ pub async fn run_thread<P: TxPlatform>(
                 (None, None) => {}
             }
             if thread.payload_cap().is_none() || process.aspace_cap().is_none() {
+                trace_thread_debug::<P>("owner-gone-before-ast");
                 return;
             }
+            trace_thread_debug::<P>("after-timer-poll");
+        } else {
+            trace_thread_debug::<P>("no-owner-before-ast");
         }
 
+        trace_thread_debug::<P>("before-ast");
         let ast_outcome = ast_dispatch(&thread);
+        trace_thread_debug::<P>("after-ast");
         match ast_outcome {
             AstOutcome::DeliverHandler { sig, action } => {
                 // Phase D: full signal-frame delivery via
@@ -516,6 +543,7 @@ pub async fn run_thread<P: TxPlatform>(
             _ => {}
         }
 
+        trace_thread_debug::<P>("before-checkpoint");
         let decision = payload.userspace_slot().checkpoint_userspace_entry_batch(
             entry_token,
             AstBatch::default(),
@@ -526,6 +554,7 @@ pub async fn run_thread<P: TxPlatform>(
             "checkpoint_userspace_entry_batch must succeed with the freshly-started \
              entry-side request"
         );
+        trace_thread_debug::<P>("after-checkpoint");
 
         // ----------------------------------------------------------------
         // (2) BUILD MERGED CONTEXT AND DIVE INTO USERSPACE.
@@ -564,19 +593,25 @@ pub async fn run_thread<P: TxPlatform>(
         if let Some(process) = thread.upgrade_owner_proc() {
             if let Some(aspace) = process.aspace_cap() {
                 let mut ctx = tx_hal::UserTrapContext::empty();
+                trace_thread_debug::<P>("before-prepare-context");
                 prepare_userspace_entry_payload_into(&payload, &mut ctx);
+                trace_thread_debug::<P>("after-prepare-context");
                 payload.set_active_userspace_request(Some(entry_token));
                 let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
                 let _prev_userspace = set_current_userspace_payload(entry_hart, payload.clone());
+                trace_thread_debug::<P>("before-itimer-delivery");
                 ctx = tx_shims::linux_syscall::maybe_deliver_itimer_signal::<P>(
                     ctx, &process, &thread, &aspace,
                 );
+                trace_thread_debug::<P>("before-enter-userspace");
                 let root = aspace.pmap().root_handle();
                 <P as TrapIf>::enter_userspace_with_context(&ctx, root);
             } else {
+                trace_thread_debug::<P>("no-aspace-before-entry");
                 return;
             }
         } else {
+            trace_thread_debug::<P>("no-owner-before-entry");
             return;
         }
 

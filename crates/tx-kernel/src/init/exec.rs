@@ -769,6 +769,8 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::register_thread_reactor_task(thread.tid.0, task_key);
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:submitted\n");
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":debug:build:la-userloop-20260531-1\n");
 
         // The BSP userspace loop uses lock-releasing reactor polls, so a
         // forked daemon child can be submitted immediately while its parent
@@ -781,8 +783,14 @@ impl<P: TxPlatform> CoreInit<P> {
             core::sync::atomic::Ordering::Release,
         );
         super::USERSPACE_REACTOR_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":debug:userspace:state-set\n");
         P::cancel_deadline();
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":debug:userspace:deadline-cancelled\n");
         P::enable_timer_wakeups();
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":debug:userspace:timer-enabled\n");
 
         // Drive the BSP reactor loop until init zombifies. Each
         // iteration is a `step_hart_loop_at` step: advance time, run
@@ -790,9 +798,17 @@ impl<P: TxPlatform> CoreInit<P> {
         // the step reports idle so we don't spin-wait for the next
         // userspace trap (which is the only event that resolves the
         // thread future's pending wait).
+        let mut debug_loop_iters = 0usize;
         loop {
             if init.is_zombie() {
                 break;
+            }
+            let log_loop = debug_loop_iters < 8;
+            if log_loop {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":debug:loop:top:i=");
+                Self::write_signed_decimal(debug_loop_iters as i32);
+                tx_hal::console_write_str::<P>("\n");
             }
 
             // UART IRQ handlers cannot touch TTY state directly
@@ -803,6 +819,14 @@ impl<P: TxPlatform> CoreInit<P> {
             let had_uart = Self::drain_pending_uart_rx_into_tty() != 0;
             let had_sbi = Self::drain_sbi_console_into_tty() != 0;
             let drained_console_input = had_uart || had_sbi;
+            if log_loop {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":debug:loop:input:uart=");
+                Self::write_signed_decimal(had_uart as i32);
+                tx_hal::console_write_str::<P>(":sbi=");
+                Self::write_signed_decimal(had_sbi as i32);
+                tx_hal::console_write_str::<P>("\n");
+            }
 
             // Drain any pending child-thread submits posted from
             // sys_clone *before* polling the reactor again. This is
@@ -816,13 +840,36 @@ impl<P: TxPlatform> CoreInit<P> {
             // The userspace trap shell returns through a longjmp-like path, so
             // do not carry a pre-entry CpuId local across reactor iterations.
             let loop_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+            if log_loop {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":debug:loop:before-step:i=");
+                Self::write_signed_decimal(debug_loop_iters as i32);
+                tx_hal::console_write_str::<P>("\n");
+            }
             let step = match Self::step_boot_reactor_once_concurrent(loop_cpu) {
                 Some(step) => step,
-                None => break,
+                None => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":debug:loop:step-none\n");
+                    break;
+                }
             };
+            if log_loop {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":debug:loop:after-step:i=");
+                Self::write_signed_decimal(debug_loop_iters as i32);
+                tx_hal::console_write_str::<P>(":polled=");
+                Self::write_signed_decimal(step.stats.polled as i32);
+                tx_hal::console_write_str::<P>(":completed=");
+                Self::write_signed_decimal(step.stats.completed as i32);
+                tx_hal::console_write_str::<P>(":idle=");
+                Self::write_signed_decimal(step.should_idle() as i32);
+                tx_hal::console_write_str::<P>("\n");
+            }
             let drained_terminal_tasks = Self::drain_terminal_reactor_tasks();
             let submitted_child_after_poll =
                 Self::drain_pending_child_submits() || Self::drain_pending_timer_signal_submits();
+            debug_loop_iters = debug_loop_iters.saturating_add(1);
 
             // EBR drain. Caps retired during the task polls above
             // (e.g. `Cap<OpenFile>` from `sys_close` / process exit fd
