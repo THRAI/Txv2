@@ -383,6 +383,13 @@ impl EtherIface {
         self.arp_table.lock().remove(&ip).is_some()
     }
 
+    pub fn copy_arp_cache_from(&self, other: &EtherIface) {
+        let arp_entries = other.arp_table.lock().clone();
+        let pending_entries = other.pending_arp.lock().clone();
+        self.arp_table.lock().extend(arp_entries);
+        self.pending_arp.lock().extend(pending_entries);
+    }
+
     pub fn pending_arp_len(&self) -> usize {
         self.pending_arp.lock().len()
     }

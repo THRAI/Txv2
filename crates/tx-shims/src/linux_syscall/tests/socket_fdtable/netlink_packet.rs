@@ -1035,6 +1035,116 @@ fn dispatch_socket_ioctl_reads_and_writes_loopback_mtu() {
 }
 
 #[test]
+fn dispatch_socket_ioctl_sets_deletes_arp_entry_and_reads_hwaddr() {
+    let _setup = socket_setup();
+    let (process, ctx) = socket_ctx();
+    let local_mac = EthernetAddress::new([0x02, 0, 0, 0x8b, 0, 1]);
+    let peer_mac = EthernetAddress::new([0x02, 0, 0, 0x8b, 0, 2]);
+    let peer_ip = Ipv4Address::new([10, 0, 1, 1]);
+    let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+        left: VethEndpointConfig {
+            name: "arpio0",
+            devt: DevT::new(120, 1),
+            mac: local_mac,
+        },
+        right: VethEndpointConfig {
+            name: "arpio1",
+            devt: DevT::new(120, 2),
+            mac: peer_mac,
+        },
+        mtu: VETH_DEFAULT_MTU,
+    });
+    let netns = process.net_namespace().expect("test net namespace");
+    netns
+        .attach_device_for_test_or_bootstrap(pair.left, None)
+        .expect("attach arpio0");
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    let local = netns
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.name == "arpio0")
+        .expect("local veth");
+    netns
+        .set_device_ipv4_addr_by_ifindex(
+            auth,
+            local.ifindex,
+            Some(Ipv4Address::new([10, 0, 1, 2])),
+            Some(24),
+        )
+        .expect("set local addr");
+
+    let fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let mut ifreq = [0u8; 40];
+    ifreq[0..6].copy_from_slice(b"arpio0");
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCGIFHWADDR as u64,
+                ifreq.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(u16::from_le_bytes(ifreq[16..18].try_into().unwrap()), 1);
+    assert_eq!(&ifreq[18..24], &local_mac.octets());
+
+    let mut set_req = arpreq(peer_ip.octets(), "arpio0", Some(peer_mac));
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCSARP as u64,
+                set_req.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    let iface = netns
+        .ether_ifaces_snapshot()
+        .into_iter()
+        .find(|iface| iface.name == "arpio0")
+        .expect("ether iface");
+    assert_eq!(
+        iface
+            .arp_entry(peer_ip, smoltcp::time::Instant::ZERO)
+            .expect("installed arp")
+            .mac,
+        peer_mac
+    );
+
+    let mut del_req = arpreq(peer_ip.octets(), "arpio0", None);
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCDARP as u64,
+                del_req.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert!(iface
+        .arp_entry(peer_ip, smoltcp::time::Instant::ZERO)
+        .is_none());
+}
+
+#[test]
 fn dispatch_unix_dgram_socket_ioctl_resolves_loopback_ifindex() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();

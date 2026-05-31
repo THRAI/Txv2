@@ -13,11 +13,12 @@ use crate::linux_syscall::{
     NR_GETSOCKNAME, NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PIPE2, NR_PPOLL, NR_PSELECT6,
     NR_PSELECT6_TIME64, NR_READ, NR_RECVFROM, NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG, NR_SENDMSG,
     NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET, NR_SOCKETPAIR, NR_WRITE, O_CLOEXEC, O_NONBLOCK, O_RDWR,
-    PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR, SIOCGIFCONF, SIOCGIFFLAGS,
-    SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNAME, SIOCGIFTXQLEN, SIOCSIFFLAGS, SIOCSIFMTU,
-    SOCKET_IO_MAX_INLINE, SOL_IPV6, SOL_NETLINK, SOL_PACKET, SOL_SOCKET, SOL_TLS, SO_BINDTODEVICE,
-    SO_DONTROUTE, SO_ERROR, SO_PEERCRED, SO_RCVTIMEO, SO_REUSEADDR, SO_SNDBUF, SO_SNDBUFFORCE,
-    SO_TYPE, TCP_MAXSEG, TCP_ULP, TLS_TX, TPACKET_V3, TTY_WRITE_MAX_INLINE,
+    PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR, SIOCDARP, SIOCGIFCONF,
+    SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNAME, SIOCGIFTXQLEN, SIOCSARP,
+    SIOCSIFFLAGS, SIOCSIFMTU, SOCKET_IO_MAX_INLINE, SOL_IPV6, SOL_NETLINK, SOL_PACKET, SOL_SOCKET,
+    SOL_TLS, SO_BINDTODEVICE, SO_DONTROUTE, SO_ERROR, SO_PEERCRED, SO_RCVTIMEO, SO_REUSEADDR,
+    SO_SNDBUF, SO_SNDBUFFORCE, SO_TYPE, TCP_MAXSEG, TCP_ULP, TLS_TX, TPACKET_V3,
+    TTY_WRITE_MAX_INLINE,
 };
 use alloc::boxed::Box;
 use alloc::vec;
@@ -50,6 +51,9 @@ const TEST_POLLOUT: i16 = 0x0004;
 const ETH_P_ALL: u16 = 0x0003;
 const ETH_P_ARP: u16 = 0x0806;
 const ETH_P_ALL_NET: u16 = 0x0300;
+const ARPHRD_ETHER: u16 = 1;
+const ATF_COM: i32 = 0x02;
+const ATF_PERM: i32 = 0x04;
 const MSG_DONTWAIT: u64 = 0x40;
 const MSG_MORE: u64 = 0x8000;
 const E_PERM: i32 = 1;
@@ -179,6 +183,21 @@ fn sockaddr_ll(protocol: u16, ifindex: i32) -> [u8; SOCKADDR_LL_BYTES as usize] 
     bytes[0..2].copy_from_slice(&AF_PACKET.to_le_bytes());
     bytes[2..4].copy_from_slice(&protocol.to_be_bytes());
     bytes[4..8].copy_from_slice(&ifindex.to_le_bytes());
+    bytes
+}
+
+fn arpreq(ip: [u8; 4], dev: &str, mac: Option<EthernetAddress>) -> [u8; 68] {
+    let mut bytes = [0u8; 68];
+    bytes[0..2].copy_from_slice(&AF_INET.to_le_bytes());
+    bytes[4..8].copy_from_slice(&ip);
+    if let Some(mac) = mac {
+        bytes[16..18].copy_from_slice(&ARPHRD_ETHER.to_le_bytes());
+        bytes[18..24].copy_from_slice(&mac.octets());
+        bytes[32..36].copy_from_slice(&(ATF_COM | ATF_PERM).to_le_bytes());
+    }
+    let name = dev.as_bytes();
+    let copy_len = core::cmp::min(name.len(), 15);
+    bytes[52..52 + copy_len].copy_from_slice(&name[..copy_len]);
     bytes
 }
 

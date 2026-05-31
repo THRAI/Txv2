@@ -1172,6 +1172,7 @@ impl NetNamespacePayload {
             .iter_mut()
             .find(|entry| entry.registration.devt == registration.devt)
         {
+            iface.copy_arp_cache_from(entry.iface);
             *entry = NetNamespaceIfaceRuntime {
                 registration,
                 ipv4_addr,

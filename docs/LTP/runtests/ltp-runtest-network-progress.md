@@ -15,7 +15,7 @@ syscall cases from `runtest/syscalls`.
 | Module | Entries | Latest judge | Kernel-side status | Latest log |
 | --- | ---: | ---: | --- | --- |
 | `net.ipv6_lib` | 6 | `76/77` | Phase 1 kernel-side baseline complete; only `hopopt` is a musl test-image/libc table miss | `target/oscomp/ltp-net-ipv6-lib-final-lhost-hopopt-known-120s.txt` |
-| `net.tcp_cmds` | 17 | filtered `netstat`: `5/5`; filtered `iproute`: `6/6`; grouped `ping01+ping02`: `20/20`; filtered `arping01`: `1/1` | command/procfs/netns baseline has clean witnesses, IPv4 ICMP over native netns/veth passes ordinary and `-I <iface>` ping matrices through large fragmented payloads, continuous setup cleanup is clean between cases, and cooked AF_PACKET ARP request/reply is sufficient for `arping01` | `target/oscomp/ltp-net-tcp-cmds-arping01-global-arp-420s.txt` |
+| `net.tcp_cmds` | 17 | filtered `netstat`: `5/5`; filtered `iproute`: `6/6`; grouped `ping01+ping02`: `20/20`; filtered `arping01`: `1/1`; filtered `ipneigh01_{arp,ip}`: semantic blockers closed, now runtime timeout in 50-loop stress | command/procfs/netns baseline has clean witnesses; IPv4 ICMP and cooked AF_PACKET ARP pass; legacy ARP ioctls and `ip neigh` projection now reach the repeated delete/relearn loop, but native helper/process runtime exceeds LTP's 5 minute per-case timeout | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-proc-neigh-show-660s.txt` |
 | other `net.*` / `net_stress.*` / `can` | many | not started | defer until command/procfs/rtnetlink/netns baseline is stable | - |
 
 Latest full IPv6 command:
@@ -144,6 +144,47 @@ Note: the native runner may still print a trailing
 `FAIL LTP CASE arping01 : 0` marker after the pass marker. Treat the per-case
 summary and zero-status pass marker as authoritative.
 
+Latest filtered `net.tcp_cmds:ipneigh01_arp` command:
+
+```sh
+timeout 900s make oscomp-qemu-rv64 \
+  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:ipneigh01_arp \
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-ipneigh01-arp-siocdarp-900s.txt
+```
+
+Latest `ipneigh01_arp` result:
+
+```text
+ipneigh01 1  TINFO: stress auto-creation ARP cache entry deleted with 'arp' 50 times
+Test timed out, sending SIGTERM!
+If you are running on slow machine, try exporting LTP_TIMEOUT_MUL > 1
+```
+
+Interpretation: the former `arp: SIOCDARP(priv): Not a tty` blocker is closed.
+The test now reaches the 50-iteration delete/relearn stress loop and times out
+inside the LTP per-case 5 minute timer.
+
+Latest filtered `net.tcp_cmds:ipneigh01_ip` command:
+
+```sh
+timeout 660s make oscomp-qemu-rv64 \
+  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:ipneigh01_ip \
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-proc-neigh-show-660s.txt
+```
+
+Latest `ipneigh01_ip` result:
+
+```text
+ipneigh01 1  TINFO: stress auto-creation ARP cache entry deleted with 'ip' 50 times
+Test timed out, sending SIGTERM!
+If you are running on slow machine, try exporting LTP_TIMEOUT_MUL > 1
+```
+
+Interpretation: the former `TFAIL: ARP entry '10.0.0.1' not listed` blocker is
+closed. `/tx-ltp/bin/ip neigh show` now reports the dynamic ARP state from
+`/proc/net/arp`, and `ip neigh del` delegates deletion into the same ARP state
+via the BusyBox `arp` applet before returning success.
+
 ## `net.ipv6_lib` case ledger
 
 | Case | Score | Status | What it proves / why it matters | Evidence |
@@ -219,7 +260,9 @@ boot-environment surfaces:
 | `ping02` | pass, `10/10` inside `ping02.sh`; clean setup | `ping -I eth0` now works across the same payload matrix. The first failure was not routing or fragmentation: BusyBox `-p aa` leaves the ICMP code byte as `0xaa`, and raw ICMP send now accepts echo-shaped user payloads instead of rejecting strict-parser `Malformed` as `EINVAL`. The follow-up cleanup removed the BusyBox `ip ... nodad` setup warning and the IPv6 prefix lookup warning by pairing a rootfs `ip addr` compatibility filter with real AF_INET6 rtnetlink address add/dump/delete state. | `target/oscomp/ltp-net-tcp-cmds-ping02-nodad-ipv6addr-420s.txt` |
 | `ping01+ping02` | pass, grouped `20/20`; clean continuous setup | Exact-tag grouped execution proves `ping02` can run after `ping01` without stale route/address state. The grouped blocker was `tst_init_iface()` cleanup: BusyBox `ip route flush dev <iface>` generated `RTM_DELROUTE` messages without `NLM_F_ACK`, while txKernel returned unsolicited success acks and could not delete connected routes projected from interface addresses. Connected route deletion is now suppressible until address/link changes, and rtnetlink success acks are only sent when requested. Note: `ltp-runtest:net.tcp_cmds:ping` is not a prefix filter and selects no cases; use exact tags joined by `+`. | `target/oscomp/ltp-net-tcp-cmds-ping01-ping02-routeflush-noack-900s.txt` |
 | `arping01` | pass, `1/1` inside `arping01.sh` | BusyBox `arping -w 10 <remote> -I eth0 -fq` now gets a usable `sockaddr_ll` from `AF_PACKET` `getsockname()` and receives a cooked ARP reply for the remote veth IPv4 address. This covers link-layer address projection, packet socket bind/getname, and the minimal cooked ARP request/reply path needed by the command witness. | `target/oscomp/ltp-net-tcp-cmds-arping01-global-arp-420s.txt` |
-| remaining entries | not started | With command/control-plane probes, grouped IPv4 ping witnesses, and `arping01` clean, move next to a small neighbor/ARP exact filter such as `ipneigh01_arp+ipneigh01_ip` before attempting the full module. | - |
+| `ipneigh01_arp` | partial, semantic blockers closed; timeout | Legacy `arp` command ioctl compatibility now exists for `SIOCGIFHWADDR`, `SIOCSARP`, and `SIOCDARP`, backed by namespace ARP state. The witness no longer breaks on ENOTTY and reaches the 50-loop ARP auto-creation/delete stress section. Remaining blocker is runtime: the loop exceeds LTP's 5 minute per-case timeout. | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-arp-siocdarp-900s.txt` |
+| `ipneigh01_ip` | partial, semantic blockers closed; timeout | `ip neigh show` now reflects dynamic `/proc/net/arp` entries and `ip neigh del` removes the corresponding ARP entry. The former `ARP entry '10.0.0.1' not listed` failure is gone; the witness reaches the same 50-loop delete/relearn stress section and times out. | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-proc-neigh-show-660s.txt` |
+| remaining entries | not started | With command/control-plane probes, grouped IPv4 ping witnesses, `arping01`, and the `ipneigh01` semantic path understood, the next correctness target should stay small, but the immediate shared blocker is native LTP runtime rather than a new network semantic. | - |
 
 Implemented prerequisites observed during the `netstat` climb:
 
@@ -286,17 +329,32 @@ Implemented prerequisites observed during the `netstat` climb:
   request targets an IPv4 link in the current or registered peer namespace.
   This is sufficient for `arping01`; it is not yet a complete AF_PACKET raw
   tap/transmit implementation.
+- Legacy ARP ioctls `SIOCGIFHWADDR`, `SIOCSARP`, and `SIOCDARP` are wired
+  through the socket ioctl path. They read/write namespace link-layer metadata
+  and ARP entries, which is required by BusyBox `arp -an/-s/-d`.
+- `RTM_GETNEIGH` neighbor messages now set `ndm_type=RTN_UNICAST`, and
+  `EtherIface` ARP and pending-ARP state is preserved when interface runtime
+  entries are refreshed after link/address/route changes.
+- `/tx-ltp/bin/ip neigh add|replace|show|del` bridges the bundled BusyBox
+  grammar gap while keeping state in kernel-visible ARP surfaces: add/replace
+  first try `arp -s`, show prints both shim fallback state and `/proc/net/arp`,
+  and del removes the fallback entry plus the real ARP entry through `arp -d`.
 
 ## Native setup runtime note
 
-The slow `ping02` setup is not currently explained by a network-stack linear
-scan or packet datapath cost. The existing trap-trace witness
-`target/oscomp/ltp-net-tcp-cmds-ping02-traptrace-600s.txt` shows the setup is
-dominated by shell/process/file churn: 256 `execve`, 233 `clone`, 1959 `close`,
-and 1025 `prlimit64` syscalls overall, compared with only 34 `socket`, 3
-`sendmsg`, and 14 `recvmsg` syscalls. The heaviest setup segment observed was
-`rhost init -> add remote IPv4`, with 1568 syscalls including 80 `execve` and
-60 `clone`.
+The slow `ping02` and `ipneigh01` runs are not currently explained by a
+network-stack linear scan or packet datapath cost. The existing `ping02`
+trap-trace witness `target/oscomp/ltp-net-tcp-cmds-ping02-traptrace-600s.txt`
+shows setup dominated by shell/process/file churn: 256 `execve`, 233 `clone`,
+1959 `close`, and 1025 `prlimit64` syscalls overall, compared with only 34
+`socket`, 3 `sendmsg`, and 14 `recvmsg` syscalls. The heaviest setup segment
+observed was `rhost init -> add remote IPv4`, with 1568 syscalls including 80
+`execve` and 60 `clone`.
+
+The `ipneigh01_{arp,ip}` witnesses reinforce the same conclusion. Host unit
+tests prove ARP delete/relearn and `RTM_GETNEIGH` projection complete quickly,
+while the native QEMU witnesses spend minutes in shell setup and then time out
+inside a loop that repeatedly runs `ping`, `arp`/`ip neigh`, and `grep`.
 
 Optimization direction: keep semantic fixes in the kernel, but measure speed at
 the LTP setup subprocess/syscall layer first. The next useful speed work is a
@@ -307,22 +365,24 @@ not justified by the current evidence.
 ## Next native network step
 
 The focused command/control probes, grouped ping witnesses, and `arping01` are
-now clean. Move to the next exact `net.tcp_cmds` neighbor/ARP tag; do not jump
-straight to the whole module until the next command family is understood.
+clean, and `ipneigh01_{arp,ip}` now reaches its stress loop. The immediate next
+step is a speed pass around native LTP setup/helper churn, then rerun the same
+two neighbor witnesses.
 
-Recommended next target:
+Recommended confirmation target after a speed change:
 
 ```sh
 timeout 420s make oscomp-qemu-rv64 \
   OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:ipneigh01_arp+ipneigh01_ip \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-ipneigh01-420s.txt
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-ipneigh01-speed-pass-420s.txt
 ```
 
 Expected purpose:
 
-- Exercise neighbor command/procfs/rtnetlink behavior after the ICMP, ARP, and
-  route cleanup witnesses.
-- If this fails, classify whether the blocker is IPv6 setup, BusyBox command
-  option compatibility, neighbor/procfs projection, or another datapath gap.
-- If this passes, try a broader but still filtered `net.tcp_cmds` run before
-  the full module.
+- Check whether the repeated ARP delete/relearn loop can finish inside LTP's
+  default 5 minute timeout without relying on `LTP_TIMEOUT_MUL`.
+- If the loop still times out, collect per-command or syscall timing for the
+  `ping` + `arp`/`ip neigh` + `grep` loop before starting a broader network
+  refactor.
+- If both variants pass, try a broader but still filtered `net.tcp_cmds` run
+  before the full module.

@@ -523,6 +523,15 @@ fn rtnetlink_getroute_and_getneigh_dump_configured_namespace_iface() {
 
     let neigh_req = nlmsg(RTM_GETNEIGH, NLM_F_REQUEST | NLM_F_DUMP, 31, &ndmsg(0));
     let neigh = rtnetlink_handle_request(&ns, crate::cred::Cred::root(), &neigh_req);
+    let neigh_msg = neigh
+        .iter()
+        .find(|msg| {
+            nlmsg_type(msg) == RTM_NEWNEIGH
+                && contains_bytes(msg, &peer_ip.octets())
+                && contains_bytes(msg, &peer_mac.octets())
+        })
+        .expect("neighbor dump entry");
+    assert_eq!(neigh_msg[27], 1, "ndm_type should be RTN_UNICAST");
     assert!(neigh.iter().any(|msg| {
         nlmsg_type(msg) == RTM_NEWNEIGH
             && contains_bytes(msg, &peer_ip.octets())

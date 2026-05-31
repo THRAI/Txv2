@@ -1351,7 +1351,7 @@ fn build_neigh_message(
     payload.extend_from_slice(&(ifindex as i32).to_le_bytes());
     payload.extend_from_slice(&neigh_state(state).to_le_bytes());
     payload.push(0);
-    payload.push(0);
+    payload.push(RTN_UNICAST);
     push_attr(&mut payload, NDA_DST, &ip.octets());
     if let Some(mac) = mac {
         push_attr(&mut payload, NDA_LLADDR, &mac.octets());
