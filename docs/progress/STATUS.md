@@ -1,3 +1,2266 @@
+- 2026-05-31 **Cherry-picked tx-observe SMP/host-drain updates from
+  `/Users/3y/.codex/worktrees/tx-observe-smp-host`.** Ported the
+  observe-related dirty worktree changes only: `tx-observe-types` allocation
+  track payload constants, `tx-observe` allocation markers plus SMP/all-hart
+  compact serial dumps, `tx-trace-daemon` bundle/live guest-memory drain and
+  Perfetto allocation-track handling, `cargo xtask observe bundle` /
+  `live-guest-mem`, updated observation docs, and the new generated
+  `.agents/skills/tx-observe` entry. Preserved the local `tx_observe`
+  `clock_now_ns` and pre-dump aggregate hook while merging the source
+  worktree's all-hart dump path. Verification: `cargo fmt --check`,
+  `cargo test -p tx-observe -- --nocapture`, `cargo check -p xtask`,
+  `cargo test --manifest-path tools/tx-trace-daemon/Cargo.toml --
+  --nocapture`, and `cargo check -p tx-kernel --target
+  riscv64gc-unknown-none-elf`. Next step: run a live-drain QEMU smoke before
+  relying on `runtime.json` completeness for long OSComp windows.
+
+- 2026-05-31 **PrivatePageSet install now measures treap node allocation
+  churn directly; `malloc-sparse` allocates about 10.7 immutable treap nodes
+  per installed page.** Added `treap_node_alloc_total` /
+  `treap_node_alloc_max` to the VM debug phase dump and a retained trace
+  counter `debug.vm.private_set.install.node_allocs`, counting only
+  `PrivatePageNode` allocations made by the immutable insert path, not the
+  one `Arc<PrivateFrame>` entry that any in-place store would still need. The
+  refreshed body-only run saved at
+  `target/oscomp/custom-run/malloc-sparse-bodyonly-nodealloc-serial.txt`
+  reported `private_set.install count=10023`, `treap_touched_total=87497`,
+  `treap_node_alloc_total=107459`, and `treap_node_alloc_max=48`; the
+  prefault split remained healthy at `private_installs=10023`,
+  `batch_pmap_publishes=9337`, `non_batch_private_installs=686`. This confirms
+  the reducible install cost is real immutable-node churn, and the next
+  structural candidate is in-place private-tree mutation or copy-on-fork
+  snapshotting, not a fault-around window reduction. The absolute install time
+  in this run (`1.340s`, `p50=60us`) is attribution-only because the new
+  counter adds per-install trace/atomic work. Verification: `cargo fmt
+  --check`, `cargo check -p tx-subsystems --lib`, RV64 kernel build, refreshed
+  OSComp submit from this checkout, focused body-only guest run, `observe
+  extract/validate/names/analyze`, and fault-decode with no trap lines.
+
+- 2026-05-31 **Private-anon fault-around is paying off in body-only
+  `malloc-sparse`; the earlier `touched_total` field was treap path work, not
+  pages prefetched.** Renamed the VM debug dump fields to
+  `treap_touched_total` / `treap_touched_max` and added a derived
+  `:vm:phase-total:private_anon.prefault` line. The refreshed body-only run
+  saved at `target/oscomp/custom-run/malloc-sparse-bodyonly-prefault-serial.txt`
+  reported `private_installs=10023`, `batch_pmap_publishes=9337`, and
+  `non_batch_private_installs=686`; this means the 16-page private-anon
+  prefault window is suppressing most leading faults rather than installing an
+  8x unused tail. `private_set.install` remained in the same range
+  (`1.194s`, `p50=52us`, `p95=115us`, `p99=308us`), and the retained trace
+  still showed only `sys_mmap`/`sys_brk` syscall spans plus no futex activity.
+  Verification: `cargo fmt --check`, `cargo check -p tx-subsystems --lib`,
+  RV64 kernel build, refreshed OSComp submit from this checkout, focused
+  body-only guest run, `observe extract/validate/names/analyze`, and
+  fault-decode with no trap lines. Next step: do not shrink the fault-around
+  window for `malloc-sparse`; rank the remaining true per-installed-page costs
+  such as frame allocation/zeroing and treap insert.
+
+- 2026-05-31 **Body-only `malloc-sparse` tracing separates benchmark-body VM
+  cost from libc-bench setup and `smaps` tail noise.** Added
+  `--observe-body-bracket` to `tools/oscomp-custom-run.py`, which patches a
+  single selected libc-bench `run_bench()` body as
+  `clock_gettime(); trace_on; bench(params); trace_off; print_stats(tv0)`.
+  The corrected body-only rerun after refreshing
+  `target/oscomp/custom-run/malloc-vm-submit/kernel-rv` saved
+  `target/oscomp/custom-run/malloc-sparse-bodyonly-batch-serial.txt` and
+  produced no normal `time:` line because trace-off dumps/powers off before
+  `print_stats`, as intended for attribution. Full body aggregates:
+  `private_set.install count=10023 total_ns=1045909000 avg_ns=104350
+  p50_ns=48000 p95_ns=103000 p99_ns=268000 max_ns=10543000`;
+  `pmap.publish_batch.insert count=9337 total_ns=50337000 avg_ns=5391
+  max_ns=76000`. The retained body trace window has `sys_mmap n=34
+  total=30.124ms`, `sys_brk n=2 total=1.491ms`, and no `rt_sigprocmask`,
+  `clone`, or futex spans; one PageBacked cold-fault gap remains
+  (`13.343ms`) but the earlier `94ms` setup/`smaps` red herring is gone.
+  Verification: `python3 -m unittest tools/tests/test_oscomp_custom_run.py`,
+  RV64 kernel build, refreshed OSComp submit, focused body-only guest run,
+  `observe extract/validate/names/analyze`, and fault-decode with no trap
+  lines. Next step for score work: rank only body-internal VM phases; keep
+  setup/PageBacked/`smaps` spans on a separate wall-time axis.
+
+- 2026-05-31 **Slab refill policy cuts the `malloc-sparse`
+  `PrivatePageSet` tail without replacing the treap.** Full-run install
+  distribution showed flat-ish medians (`p50=52us`, `p95=183us`) but a
+  millisecond p99/max, pointing at allocation refill tails rather than treap
+  degeneration. Added bounded small-slab reuse and medium-class batched refills;
+  the focused `malloc-sparse` run improved to `5.892056s`, with
+  `private_set.install count=10023 total_ns=1015781000 avg_ns=101345
+  p99_ns=220000 max_ns=10022000` and pmap insert still flat at `47.723ms`
+  total. Updated
+  `docs/progress/research/2026-05-31-libcbench-vm-only-trace.md`. Verification:
+  `cargo fmt --check`, `cargo check -p tx-substrate --lib`, `cargo check -p
+  tx-subsystems --lib`, `cargo test -p tx-substrate --test slab --
+  --nocapture --test-threads=1`, RV64 kernel build, refreshed OSComp submit,
+  focused guest run, observe extract/validate/names/analyze, and fault-decode
+  with no trap lines. Residual: rare 8-10ms private-set maxes remain, but the
+  dominant p99 tail is gone. Follow-up independent-page refill probe regressed
+  (`malloc-sparse` `10.706895s`, install total `2.842s`, max `55.272ms`), so it
+  was reverted; current evidence favors the contiguous batched refill until the
+  page allocator has a real bulk-noncontiguous API. The retained post-fix
+  window now points at PageBacked fault-step gaps, `rt_sigprocmask`, and
+  `mmap` as the next attribution targets.
+
+- 2026-05-31 **Full-run VM aggregates confirm `PrivatePageSet` dominates
+  `malloc-sparse` after the pmap reserve.** Added observe-window aggregate
+  counters that reset at `tx_observe_trace_on` / `tx_observe_begin` and print
+  before `TXTRACE-BEGIN`, avoiding the 16,384-record ring retention limit.
+  After refreshing `target/oscomp/custom-run/malloc-vm-submit/kernel-rv`,
+  focused `malloc-sparse` produced `private_set.install count=10023
+  total_ns=3041188000 avg_ns=303420 max_ns=16575000` versus
+  `pmap.publish_batch.insert count=9337 total_ns=56857000 avg_ns=6089
+  max_ns=1359000`; trace validation passed and fault-decode found no trap
+  lines. Updated
+  `docs/progress/research/2026-05-31-libcbench-vm-only-trace.md`. Next step:
+  decide the `PrivatePageSet` structural change (reserved sorted store for the
+  monotonic private-anon path vs. in-place treap with path-copy deferred to
+  fork/snapshot).
+
+- 2026-05-31 **Pmap resident-store reserve removes the sampled
+  `publish_batch.insert` tail; remaining VM malloc tail is now private-set
+  insertion.** Confirmed `malloc-sparse` already has effective fault-around in
+  the retained window (`30` publish-batch calls for `314` pages, avg `10.47`
+  pages/call), then reserved `PmapResidentStore` backing capacity before single
+  and batched pmap publication. Post-reserve trace kept the same batch shape and
+  validated as `1 hart, 16384 slots/hart, 16384 records, 0 framing errors`;
+  fault-decode found no trap lines. `pmap.publish_batch.insert 1->2` dropped
+  from `16.094ms` total / `3.642ms` max to `2.635ms` total / `16us` max.
+  Updated `docs/progress/research/2026-05-31-libcbench-vm-only-trace.md`.
+  Verification so far: `cargo fmt --check`, `cargo test -p tx-subsystems
+  vm_pmap -- --nocapture --test-threads=1`, `cargo xtask build --target
+  rv64-qemu`, focused `malloc-sparse` trace, `observe extract/validate/names/analyze`.
+  Next step: target `PrivatePageSet` path-copy allocation tails; pmap resident
+  batching is no longer the first malloc-sparse VM lever.
+
+- 2026-05-31 **VM malloc phase totals now rank `private_set.install` ahead
+  of publication-check work, and the sampled `fault.publish 2->3` path does
+  not show a clear size slope.** Added `debug.vm.fault.publish.pmap_mapped_pages`
+  and `debug.vm.fault.publish.private_len` counters plus analyzer totals/buckets,
+  then reran `malloc-sparse` (`11.000302s`, attribution-only). The trace
+  validates as `1 hart, 16384 slots/hart, 16384 records, 0 framing errors`.
+  Retained-window totals: `private_set.install 2->3` `60.536ms` over `368`
+  samples, `pmap.publish_batch.insert 1->2` `16.094ms` over `314`,
+  `fault.publish 3->4` `6.424ms` over `57`, and `fault.publish 2->3`
+  `3.457ms` over `57`. `fault.publish 2->3` buckets stayed roughly flat from
+  `1-16` through `65-256` mapped pages, with one `270us` sample in the
+  `257-1024` bucket but median still `54us`. Updated
+  `docs/progress/research/2026-05-31-libcbench-vm-only-trace.md`. Next step:
+  optimize `PrivatePageSet` insertion/common-case private-anon growth first;
+  use a larger synthetic heap probe before treating publication-check O(n) risk
+  as fully closed.
+
+- 2026-05-31 **VM malloc residual attribution now distinguishes same-poll
+  work from scheduler handoff latency for the sampled private-anon fault
+  phases.** Added reactor poll markers (`debug.reactor.poll.*`) and extended
+  `tools/tx-observe-analyze.py` with a VM poll-attribution section, then reran
+  `malloc-sparse` with the instrumented kernel. The trace validates as `1 hart,
+  16384 slots/hart, 16384 records, 0 framing errors`; fault-decode found no
+  trap lines. The instrumented timing was `14.891245s` and is attribution-only
+  because poll markers add trace traffic. In the retained window,
+  `fault.resolve 0->1` and `fault.publish 0->1` were tens of microseconds,
+  no VM wait markers appeared, and the residual slow pairs were overwhelmingly
+  same-poll work: `fault.publish 2->3` max `23.532ms`,
+  `private_set.install 2->3` max `4.793ms`, `fault.publish 3->4` max
+  `4.350ms`, and `pmap.publish_batch.insert 1->2` max `4.705ms`. Updated
+  `docs/progress/research/2026-05-31-libcbench-vm-only-trace.md`. Next step:
+  optimize synchronous per-page mutation/publication cost, starting with
+  private-anon monotonic-growth specialization or range batching rather than an
+  inline trap fast path. Blocker: current ring samples remain tail windows, not
+  lossless full-run traces.
+
+- 2026-05-31 **Focused VM-only libcbench traces now cover sparse, bubble,
+  big1, and big2, but they are phase samples rather than lossless whole-run
+  totals.** Added durable analysis in
+  `docs/progress/research/2026-05-31-libcbench-vm-only-trace.md`. The four
+  bracketed runs all completed with no trap lines and structurally valid
+  `.txtrace` files (`1 hart, 16384 slots/hart, 16384 records, 0 framing
+  errors`). Timings: sparse `9.276908s`, bubble `10.412752s`, big1
+  `17.645432s`, big2 `8.741431s`. The retained windows are only
+  `491-608ms`, but they consistently show intrinsic VM time in private-anon
+  fault/pmap publish/private-set install phases plus PageBacked executable or
+  `smaps`-tail faults; sampled `mmap` totals are `36-56ms` and sampled `brk`
+  totals are `0.9-2.2ms`. Next step: use a reduced malloc probe with trace
+  bracketed around only the allocation/free loop, or live observe draining, to
+  get lossless whole-body VM totals.
+
+- 2026-05-31 **libcbench stdio `tmpfile()` is rootfs-tmpfs/PageBacked, not
+  ext4-backed, and tmpfs now covers the benchmark's 5,000,000-byte file.**
+  Verified the actual musl path (`external/musl/src/stdio/tmpfile.c`) hardcodes
+  `/tmp/tmpfile_XXXXXX`; boot creates `/tmp` on the rootfs tmpfs before userland
+  (`:tmp-dirs:ok`); tmpfs regular files materialise one shared
+  `PageContainer`; and `unlink` removes only the name while the open inode and
+  PageBacked storage remain live. Added
+  `tmpfs_tmpfile_shape_read_after_write_survives_unlink` to pin the exact
+  create/open/write/unlink/seek/readback shape. Also raised tmpfs's fixed
+  regular-file staging cap from 4 MiB to 8 MiB so libcbench's 5 MB stdio write
+  no longer exceeds `PageContainer` capacity before the readback phase.
+  Verification: `cargo fmt --check`, `cargo test -p tx-fs
+  tmpfs_tmpfile_shape_read_after_write_survives_unlink -- --nocapture
+  --test-threads=1`. Next step: rerun the stdio slice under observe after the
+  existing ring-capacity issue is addressed, then attribute the remaining
+  9-11s to libc stdio buffering/syscall cadence versus PageBacked copy and
+  materialisation cost. Blocker: current tx-observe whole-window traces are
+  still lossy at the combined mm/io/pthread scale.
+
+- 2026-05-31 **SMP1 pthread create/join now breaks polling idle on posted task
+  wakes instead of waiting for the timer edge.** Added
+  `Reactor::should_leave_polling_idle`, which treats a posted-but-not-yet-drained
+  task wake (`!reactor.is_idle()`) as work alongside `NeedResched`, and wired the
+  BSP/AP idle polling window through that helper. The host regression
+  `pending_task_wake_breaks_polling_idle_before_marker_drain` pins the exact
+  missed edge: `Waker::wake()` can leave `NeedResched` clear while the shared
+  wake queue already makes the reactor non-idle. Verification:
+  `cargo fmt --check`, `cargo test -p tx-reactor
+  pending_task_wake_breaks_polling_idle_before_marker_drain -- --nocapture
+  --test-threads=1`, local `xtask` rebuild after detecting a stale
+  `CARGO_MANIFEST_DIR`, and `cargo xtask build --target rv64-qemu`. Guest
+  evidence: isolated SMP1 `pthread-minimal1` improved from the prior
+  `67.475093s` baseline to `31.430938s`; isolated `pthread-serial1` improved
+  from `78.453659s` to `34.867666s`; full pthread-only SMP1 run at
+  `target/oscomp/custom-run/pthread-idle-edge-serial.txt` completed with
+  `serial1=33.765952s`, `serial2=36.669263s`, `create_serial1=24.100627s`,
+  `uselesslock=0.122160s`, `minimal1=31.178197s`, and
+  `minimal2=26.494345s`. Next step: use observe on a reduced pthread window to
+  separate the remaining VM/syscall body cost from the now-smaller scheduler
+  handoff cost.
+
+- 2026-05-31 **A bracketed tx-observe libcbench run now covers the selected
+  mm/io/pthread function set without threshold-killing the guest, but the
+  current ring transport is still too small for a lossless whole-window
+  report.** Added the `mm-io-pthread` libcbench selector in
+  `tools/oscomp-custom-run.py` and regression coverage in
+  `tools/tests/test_oscomp_custom_run.py`, then ran the default selected suite
+  with `--observe-bracket` and a reduced-pthread calibration run
+  (`--libcbench-serial-repeat 10 --libcbench-outer-repeat 1
+  --libcbench-inner-repeat 10`). Both runs reached every selected malloc,
+  stdio, and pthread benchmark, emitted `TXTRACE-END` after trace-off, and had
+  no trap lines for fault-decode. The generated report is
+  `target/oscomp/custom-run/mm-io-pthread-full-observe-report.md`; companion
+  artifacts include serial logs, `.txtrace` files, names JSON, analyzer output,
+  NDJSON replay files, and
+  `target/oscomp/custom-run/mm-io-pthread-full-observe-ring-summary.txt`.
+  **Finding:** both traces validate structurally, but both saturate the current
+  65,536-slot dump (`lost=8681954` for the default run, `lost=3265000` for the
+  reduced-pthread run), so they are completed bracketed tail samples rather than
+  lossless full-window traces. **Verified so far:** `cargo fmt --check`,
+  `python3 -m unittest tools/tests/test_oscomp_custom_run.py`, `cargo xtask
+  build --target rv64-qemu`, smoke QEMU sentinel, `cargo xtask observe
+  extract/validate/names/analyze`, and fault-decode on both serials. **Next
+  step:** implement streaming/draining or per-benchmark dump/reset support for
+  observe; simply growing the static ring enough for the default combined run
+  would imply roughly 700 MiB of binary records and about 1.4 GiB of serial hex.
+  **Blocker:** no lossless full-window report is possible with the current
+  single dump ring capacity.
+
+- 2026-05-31 **The pthread SMP advisory is now implemented end-to-end for the
+  kernel-side VM/TLB and lifecycle-wake levers, and the SMP4 libcbench probe
+  improved `pthread_createjoin_minimal1` to `29.313554s` after refreshing the
+  OSComp submit kernel.** The completed set is
+  A1 dynamic ASID residency filtering for remote RV64 RFENCE targets with
+  clear-on-user-deschedule/ASID-free, A2 batched VM teardown invalidations, A3
+  local range+ASID fences, B1 `LifecycleWake` sync-affine same-hart placement,
+  and B2 bounded polling-idle wake suppression that avoids a reschedule IPI only
+  while the target hart is actively polling `need_resched`. The first measured
+  run used `target/oscomp/custom-run/pthread-minimal1-advisory-smp4-data` and
+  saved serial output to
+  `target/oscomp/custom-run/pthread-minimal1-advisory-smp4-serial.txt`, but that
+  OSComp run still reported `reactor:ap-loop:WARN-skipped`. A follow-up
+  `make smp-smoke-rv64` proved the current kernel emits `reactor:ap-loop:ok` /
+  `reactor:ap-runqueue:ok`; after refreshing `target/oscomp/submit/kernel-rv`
+  with `cargo xtask oscomp submit --target rv64-qemu --submit
+  target/oscomp/submit`, the same SMP4 OSComp path saved
+  `target/oscomp/custom-run/pthread-minimal1-apfix-smp4-serial.txt` with healthy
+  AP markers, reached `#### OS COMP TEST GROUP END libcbench-musl ####` and
+  `userspace:exited:0`, and had no trap lines for `cargo xtask fault-decode
+  --target rv64-qemu --serial ... --all --brief` to decode. Compared with the
+  earlier SMP4 pthread-only `minimal1=39.805734s` and full-suite
+  `minimal1=37.910496s` records, the refreshed-submit result is about a 26% /
+  23% reduction on the same QEMU virt class of workload. **Verified:** `cargo
+  fmt --check`, `cargo check -p tx-reactor --tests`, `cargo check -p tx-kernel
+  --target riscv64gc-unknown-none-elf`, `cargo test -p tx-reactor
+  lifecycle_wake_on_waker_hart_dispatches_without_remote_ipi --
+  --nocapture --test-threads=1`, `cargo test -p tx-hal-riscv64-qemu-virt
+  remote_sfence_targets_are_limited_to_asid_residency -- --nocapture
+  --test-threads=1`, `cargo test -p tx-hal-riscv64-qemu-virt
+  pmap::tests::shootdown_batch_coalesces_contiguous_invalidations --
+  --nocapture --test-threads=1`, `make smp-smoke-rv64`, the refreshed private
+  `pthread-minimal1` SMP4 QEMU run, and `git diff --check`. **Next step:** add
+  lightweight counters for
+  RFENCE target counts and skipped-vs-sent lifecycle wake IPIs so future benches
+  can separate A1/A2/A3 from B1/B2. **Blocker:** none for the AP-loop warning;
+  the stale-warning path was an unrefreshed OSComp submit artifact, not a live
+  AP dispatcher failure.
+
+- 2026-05-31 **VM teardown now batches pmap invalidations once per `munmap`,
+  and the RV64 board backend coalesces contiguous ranges behind a single
+  plural shootdown entry point.** Implemented the A2 slice from the pthread
+  SMP advisory: `VmPmap::teardown_range` now accumulates invalidations until
+  the end of the range teardown, then issues one `PmapIf::shootdown_mappings`
+  call; the RV64 QEMU board now exposes a plural shootdown backend that
+  coalesces adjacent invalidations before issuing the local fence and remote
+  SBI RFENCE path, so later Option 1 can swap the backend without changing VM
+  call sites. **Verified:** `cargo test -p tx-subsystems
+  vm_address_space_unmap_sparse_large_range_tears_down_resident_pmap_entries
+  -- --nocapture --test-threads=1`, `cargo test -p tx-hal-riscv64-qemu-virt
+  pmap::tests::shootdown_batch_coalesces_contiguous_invalidations -- --nocapture
+  --test-threads=1`, `cargo xtask progress validate`, and `git diff --check`.
+  **Next step:** add the ASID/residency and range+ASID local-fence refinements
+  from the audit once we want the serial musl `munmap` path to shed the remote
+  round-trip entirely. **Blocker:** the broader SMP/QEMU benchmark rerun has not
+  been performed yet, so the absolute timing impact is still inferred from the
+  policy shape rather than measured in this turn.
+
+- 2026-05-31 **Lifecycle futex wakes now use a sync-affine same-hart handoff
+  when the joiner can migrate to the exiting thread's hart.** Implemented the B1
+  scheduler slice from the pthread SMP advisory in `tx-reactor`: `LifecycleWake`
+  placement now targets the current/waker hart when the task is movable and
+  affinity allows it, preserving pinned affinity behavior. The reactor wake-drain
+  path now consumes the mailbox scheduler hint before placement instead of
+  pre-routing wake IDs to the task's old home hart, so a clear-child-tid wake can
+  report `local_reschedules=1, remote_ipis=0` on the waker hart. **Verified:**
+  TDD red/green for focused scheduler and reactor smoke tests, `cargo test -p
+  tx-reactor -- --nocapture --test-threads=1`, `cargo fmt --check`, `cargo
+  xtask progress validate`, and `git diff --check` for the touched
+  reactor/progress files. **Next step:** run a bounded SMP4
+  `pthread-minimal1`/`createjoin` guest probe to quantify remote IPI reduction,
+  then instrument/patch pmap shootdown batching. **Blocker:** the parallel
+  `cargo test -p tx-reactor -- --nocapture` run exposed an existing global
+  per-hart context test-isolation race; the same suite passes with
+  `--test-threads=1`. A broader `cargo -q xtask unit` gate was stopped after it
+  sat for about nine minutes in the unrelated `tx-shims` lib test binary with no
+  harness output.
+
+- 2026-05-30 **pthread lifecycle Linux-optimization audit ranks pmap
+  shootdown and remote wake IPI ahead of clone or sigprocmask shortcuts.**
+  Compared Linux/glibc/musl pthread create→run→exit→join policy with the live Tx
+  paths and recorded the findings in
+  `docs/progress/research/2026-05-30-pthread-lifecycle-linux-optimization-audit.md`.
+  Tx already avoids fork-style address-space construction for `CLONE_THREAD`, and
+  clear-child-tid uses an address-space-scoped lifecycle futex wake. The major
+  musl-specific cost is that each pthread create/join stack cycle still drives
+  stack `mmap`/`munmap`; Tx currently tears down pmap entries page-by-page,
+  issues singleton shootdowns, targets all online remote harts rather than an
+  AddressSpace/ASID residency mask, and sends remote reschedule IPIs whenever
+  `target_hart != current_hart` with no Linux-style polling-idle suppression.
+  **Verified:** read-only code audit plus `cargo xtask progress validate` and
+  `git diff --check`. **Next step:** add VM/RFENCE/wake counters, then prototype
+  batched ASID/range shootdown before adding idle-polling wake suppression.
+  **Blocker:** no benchmark rerun was performed after this audit because it made
+  no kernel code changes.
+
+- 2026-05-30 **PageBacked is the intended home for Linux-style file-data
+  readahead; ext4 should stay the byte-pager/metadata owner.** Dispatched
+  read-only VM/PageBacked, tx-ext4, and progress-memory workers after comparing
+  Linux ext4/MM policy with the live Tx implementation. All lanes agree the
+  current path is demand-only: exec LOAD segments fault through
+  `VmBacking::Page -> PageContainer::materialize_file_page ->
+  FsPageBacking::fetch_page`, and tx-ext4 reads one requested 4 KiB page/block
+  via `Ext4Pager::read_page`. No neighboring-page readahead exists for
+  file-backed faults; `MADV_WILLNEED`/`SEQUENTIAL` and `sys_readahead` are
+  accepted as no-op hints today. Recorded the policy boundary and draft plan in
+  `docs/progress/research/2026-05-30-pagebacked-ext4-readahead-policy.md`.
+  **Next step:** add ext4/pagebacked subphase counters, then prototype a small
+  PageBacked-owned sequential window that installs adjacent pages into the PC
+  but does not publish extra PTEs. **Blocker:** no architecture decision has
+  locked the final readahead API or hint semantics yet.
+
+- 2026-05-30 **pthread-minimal1 page-fault phase tracing isolates the slow
+  first-touch faults to cold ext4-backed executable page fetches.** Added
+  narrow VM/PageBacked fault-phase counters and reran a single-core
+  10-iteration `pthread-minimal1` bracket to avoid the prior SMP AP-loop
+  warning. The first trace at
+  `target/oscomp/custom-run/pthread-minimal1-10-pagefault-phases-serial.txt`
+  completed in `0.176617s`, validated as `4096` records with `0` framing
+  errors, and had no decodable trap lines. Its grouped windows showed 23 page
+  faults: access `3` execute faults were all page-backed (`12` faults,
+  `72.403ms` total, max `17.859ms`), while private-anon write faults were much
+  smaller (`10` faults, `5.821ms` total). A deeper trace at
+  `target/oscomp/custom-run/pthread-minimal1-10-pagefault-deep-serial.txt`
+  completed in `0.192500s`, also validated as `4096` records with `0` framing
+  errors and no trap lines. The five worst execute-fault windows spend
+  `12.3-16.1ms` between `debug.pagebacked.fault_step.kind=2` and
+  `debug.pagebacked.fault_step.done=2`, i.e. inside
+  `PageContainerKind::File -> materialize_file_page -> FsPageBacking::fetch_page`
+  for the sdcard ext4 executable pages; VM resolve, private-anon write
+  materialization, and pmap publication are sub-ms in comparison. **Verified:**
+  `cargo fmt --check`, `cargo test -p tx-subsystems vm -- --nocapture`,
+  `cargo xtask build --target rv64-qemu`, `cargo xtask oscomp submit --target
+  rv64-qemu --submit target/oscomp/submit`, both bounded QEMU runs, observe
+  extract/validate/analyze, fault-decode no-trap checks, and `git diff
+  --check`. **Next step:** split `Ext4FsInstance::fetch_page` /
+  `Ext4Pager::read_page` into cache/metadata/block-read/frame-copy counters
+  or add a prefetch/cache path for executable load pages before chasing another
+  `sigprocmask` fast path. **Blocker:** pthread lifecycle remains
+  throughput-heavy; this pass identified the page-fault owner but did not
+  implement an ext4/page-cache optimization.
+
+- 2026-05-30 **pthread-minimal1 lifecycle tracing points at VM/user-page
+  materialization and stack map/unmap cost, not a raw `sigprocmask` state-store
+  blocker.** Fixed the SMP observe backing to four 1 MiB per-hart rings so
+  bracketed SMP4 dumps work when QEMU boots or dumps from a nonzero hart, and
+  added `tools/oscomp-custom-run.py --libcbench-serial-repeat` so fixed
+  `pthread.c` `i<2500` serial loops can be shrunk for complete lifecycle
+  traces. A 50-iteration SMP4 `pthread-minimal1` run at
+  `target/oscomp/custom-run/pthread-minimal1-50-smp4-observe-serial.txt`
+  completed in `0.945423s`, emitted a valid `8192`-record trace with no
+  framing errors, and had no decodable trap lines. A smaller 10-iteration
+  bracket at
+  `target/oscomp/custom-run/pthread-minimal1-10-smp4-observe-serial.txt`
+  completed in `0.222168s`, emitted a valid `4096`-record trace with no
+  framing errors, and also had no decodable trap lines; this run reported
+  `reactor:ap-loop:WARN-skipped`, so use it for lifecycle shape rather than AP
+  parallelism evidence. The 10-iteration analysis shows top span totals of
+  `sys_futex=28.487ms`, `sys_rt_sigprocmask=27.843ms`, `sys_clone=21.114ms`,
+  `sys_munmap=18.506ms`, and `sys_mmap=10.369ms`; the single worst
+  `rt_sigprocmask` is `14.247ms`, but raw events place the large gap in
+  user-page/pagebacked resolution before mask writeback, while most later
+  `rt_sigprocmask` calls are a few hundred microseconds. Largest inter-record
+  gaps remain `debug.thread.page_fault.access=3 -> ok=1` at about
+  `13-17ms`, plus `debug.vm.unmap.phase=1 ->
+  debug.vm.recipe.publish.touched_entries` at about `3.4-4.7ms`.
+  **Verified:** `cargo fmt --check`, `python3 -m unittest
+  tools/tests/test_oscomp_custom_run.py`, `cargo xtask build --target
+  rv64-qemu`, `cargo xtask oscomp submit --target rv64-qemu --submit
+  target/oscomp/submit`, bracketed SMP4 QEMU probes, observe
+  extract/validate/analyze for the 50- and 10-iteration traces, and
+  fault-decode no-trap checks on both serials. **Next step:** chase VM
+  user-page materialization and stack `munmap` recipe/pmap publication before
+  another `sigprocmask` shortcut; direct mask writes are already cheap compared
+  with the user-copy/page-fault envelope. **Blocker:** pthread lifecycle is
+  semantically green but still throughput-heavy, and the cleanest 10-iteration
+  trace did not have a fully healthy AP loop.
+
+- 2026-05-30 **libcbench SMP4 improves the post-writev full-suite runtime, but
+  does not remove the serial pthread lifecycle cost.** Rebuilt the custom
+  `libcbench-musl` image and ran both pthread-only and full-suite probes through
+  `make ... oscomp-qemu-rv64-smp4` with `tx.oscomp.observe=0`. SMP boot markers
+  (`smp:aps:online`, `reactor:ap-runqueue:ok`) appeared in both logs; both runs
+  reached `userspace:exited:0`, and `fault-decode --all --brief` found no trap
+  lines. Pthread-only SMP4 at
+  `target/oscomp/custom-run/libcbench-pthread-only-smp4-after-writev-oneshot-serial.txt`
+  changed the previous single-core timings from
+  `36.226766/34.352216/63.297696/53.364108/27.449239s` to
+  `40.113108/23.988273/20.226109/39.805734/20.146469s` for
+  `serial1/serial2/create_serial1/minimal1/minimal2`. Full-suite SMP4 at
+  `target/oscomp/custom-run/libcbench-full-smp4-after-writev-oneshot-serial.txt`
+  scored `27.817993659734583/27`, with long poles reduced from
+  `pthread_createjoin_serial1=85.902965s`,
+  `pthread_createjoin_serial2=39.326915s`,
+  `pthread_create_serial1=40.115729s`,
+  `pthread_createjoin_minimal1=45.806089s`,
+  `pthread_createjoin_minimal2=33.385800s`,
+  `stdio_putcgetc=9.651879s`, and `regex_compile=20.695216s` to
+  `39.550705s`, `23.583054s`, `20.576924s`, `37.910496s`, `20.347226s`,
+  `6.482566s`, and `14.649655s` respectively. **Verified:** custom image
+  rebuilds, `cargo xtask build --target rv64-qemu`,
+  `cargo xtask oscomp submit --target rv64-qemu --submit target/oscomp/submit`,
+  SMP4 pthread-only/full QEMU runs, `tools/oscomp-judge.py`, and fault-decode on
+  both saved serials. **Next step:** trace a bracketed SMP4 `pthread-minimal1`
+  or `serial1` window if we want to distinguish true AP execution overlap from
+  reduced scheduler/VM contention. **Blocker:** SMP4 is a useful throughput mode,
+  but serial1/minimal1 remain too expensive, so the direct lifecycle/syscall
+  fast-path lane is still relevant.
+
+- 2026-05-30 **libcbench stdio writev boxed-allocation blocker is resolved for
+  the PageBacked tmpfile lane.** Added a narrow synchronous
+  `writev(fd=PageBacked, iovcnt=2)` one-shot path before the boxed async
+  fallback, preserving the existing async `writev` lane for non-PageBacked
+  fds. The trace
+  `target/oscomp/custom-run/libcbench-stdio-putcgetc-writev-pagebacked-oneshot-trace.txtrace`
+  validates with `4096` records and `0` framing errors; analysis shows
+  `debug.writev.pagebacked_dispatch.enter=22`,
+  `debug.thread.dispatch.writev_pagebacked.after=21`, and only one remaining
+  boxed fallback (`debug.thread.dispatch.writev_future.after ->
+  debug.thread.dispatch.writev_box.after`), so the repeated multi-ms
+  `Box::pin(dispatch_writev_hot(...))` gap is gone from the sampled tmpfile
+  writes. A no-observe isolated stdio run at
+  `target/oscomp/custom-run/libcbench-stdio-only-writev-pagebacked-oneshot-serial.txt`
+  completed cleanly with `b_stdio_putcgetc=6.525488s`,
+  `b_stdio_putcgetc_unlocked=6.692102s`, `userspace:exited:0`, and no
+  decodable trap lines. **Verified:** `cargo fmt --check`, focused
+  `tx-shims` writev dispatch test, `tx-kernel thread_future::tests`,
+  `cargo xtask build --target rv64-qemu`, observe extract/validate/analyze,
+  no-observe RV64 stdio run, and fault-decode on the saved serial. A broader
+  no-observe full libcbench run at
+  `target/oscomp/custom-run/libcbench-full-writev-pagebacked-oneshot-serial.txt`
+  completed with `userspace:exited:0`, no decodable trap lines, and judge score
+  `27.76360314008035/27`; full-suite stdio is now
+  `b_stdio_putcgetc=9.651879s` and
+  `b_stdio_putcgetc_unlocked=9.714694s`. **Next step:** keep the boxed
+  fallback marker until the remaining non-PageBacked/fallback case is
+  classified, then move the libcbench throughput lane back to thread lifecycle
+  and regex compile (`pthread_createjoin_serial1=85.902965s`,
+  `pthread_createjoin_minimal1=45.806089s`,
+  `regex_compile=20.695216s`). **Blocker:** the sampled PageBacked stdio
+  writev hot-lane allocation blocker is closed, but full-suite runtime is still
+  dominated by pthread lifecycle and regex compile.
+
+- 2026-05-30 **libcbench stdio now has PageBacked write phase counters; the
+  next target is VM/user-copy fault latency, not another `writev` combine.**
+  Added diagnostic counters at `sys_write_pagebacked`,
+  `OpenFileWriteFromUserOp`, `step_write_from_user`,
+  `step_range_with_user_buffer`, and `copy_chunk_user`, plus fixed the
+  PageBacked user-buffer test fixture to register subsystem zones before
+  allocating `PageContainer` caps. A first RV64 retry panicked before userspace
+  at the BSP timer-smoke deadline assertion
+  (`target/oscomp/custom-run/libcbench-stdio-putcgetc-pagebacked-trace-serial.txt`);
+  a clean retry passed timer smoke, reached `b_stdio_putcgetc`, dumped at the
+  observe threshold, and had no decodable trap lines:
+  `target/oscomp/custom-run/libcbench-stdio-putcgetc-pagebacked-trace-retry-serial.txt`.
+  The extracted trace
+  `target/oscomp/custom-run/libcbench-stdio-putcgetc-pagebacked-trace-retry.txtrace`
+  validates with `4096` records and `0` framing errors. Under the extra
+  counters, the active window shows `sys_66/writev n=35`, all fd `3` with
+  `iovcnt=2`, and paired PageBacked writes of `1024` and `1` byte. The slowest
+  gaps still sit around write-side page faults and scheduler return to the
+  syscall (`debug.thread.page_fault.access=3 -> ok=1` up to about `16.6ms`,
+  plus multi-ms `trap.kind=2 -> sys_66` gaps); PageBacked phase histograms
+  confirm the write path reaches `write_user phase 0..4`, `user_range phase
+  0..5`, and `user_copy phase 0..3` for the sampled writes. **Verified:**
+  `cargo fmt --check`, `python3 -m unittest tools/tests/test_oscomp_custom_run.py`,
+  `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems
+  pagebacked_step_write_from_user_propagates_efault_without_advance --
+  --nocapture --test-threads=1`, `CARGO_INCREMENTAL=0 cargo test -p
+  tx-subsystems write_from_user_op_round_trip_one_page -- --nocapture
+  --test-threads=1`, `cargo xtask build --target rv64-qemu`, bounded RV64
+  retry, observe extract/validate/analyze, and fault-decode no-trap check on
+  the retry serial. **Next step:** split VM/user-access page-fault materialize
+  and `AddressSpace::copy_from_user` pmap walk phases for PageBacked writes;
+  also treat the first timer-smoke panic as a transient to watch, not the
+  current stdio blocker unless it reproduces. **Blocker:** no clean benchmark
+  completion timing was collected with the new counters because the trace
+  intentionally stops at the threshold.
+
+- 2026-05-30 **libcbench stdio/regex isolation confirms the next blocker is
+  tmpfile writev/PageBacked throughput, not pmap resident rows.** Extended the
+  custom OSComp runner with `--libcbench-only` selections for `malloc`,
+  `malloc-sparse`, `stdio`, `stdio-putcgetc`,
+  `stdio-putcgetc-unlocked`, `regex`, and `regex-compile`, with unit coverage
+  for the new selection rewriting. Fresh RV64 runs after the kept pmap
+  resident-vector change show `stdio` still slow in isolation:
+  `b_stdio_putcgetc=24.938529s` and
+  `b_stdio_putcgetc_unlocked=23.982173s` in
+  `target/oscomp/custom-run/libcbench-stdio-only-pmap-vec-serial.txt`.
+  Regex isolation shows `b_regex_compile=12.411429s` while both regex searches
+  remain sub-250ms in
+  `target/oscomp/custom-run/libcbench-regex-only-pmap-vec-serial.txt`.
+  A cleaner threshold trace for `stdio-putcgetc` retained `4096` valid records
+  and shows the active tmpfile phase as repeated `writev(fd=3, iovcnt=2)`
+  calls returning `1025` bytes, split into `1024` and `1` byte `write`
+  bodies; `sys_66/writev` averaged about `1033us`. A PageBacked experiment
+  that gathered the two iovecs and called `sys_write_buffered` once preserved
+  a focused host test but regressed isolated stdio to
+  `42.435648s/46.354763s`, so it was backed out. **Verified:**
+  `python3 -m unittest tools/tests/test_oscomp_custom_run.py`,
+  `cargo fmt --check`, bounded RV64 libcbench-only runs, observe
+  extract/validate/analyze on
+  `target/oscomp/custom-run/libcbench-stdio-putcgetc-threshold8k-pmap-vec.txtrace`,
+  and fault-decode no-trap checks on the saved serials. **Next step:** add
+  phase counters inside PageBacked/tmpfile `write` and user-copy/VFS dispatch
+  for the 1024-byte writes before selecting a new stdio fix. **Blocker:**
+  libcbench is semantically green, but stdio and regex-compile throughput
+  remain reference-far.
+
+- 2026-05-30 **libcbench malloc-sparse pmap resident rows now use a
+  sorted resident vector; private-set rewrites remain rejected.** The pmap
+  insert-phase trace confirmed the old batch-publish `phase 5 -> 6` gap sat
+  inside resident `state.mappings.insert(...)`, not `PmapMapping::new`.
+  Replaced the VM pmap shadow resident `BTreeMap<UserPage, PmapMapping>` with
+  an ordered `Vec` wrapper that preserves binary lookup, ordered range walks,
+  resident-only teardown/protect enumeration, and replacement semantics. The
+  kept simple vector shape reports `malloc_sparse_probe 10000 4000 0` at
+  `11.267564s` in
+  `target/oscomp/custom-run/malloc-sparse-pmap-resident-vec-simple-final-noobserve-serial.txt`,
+  improving over the restored private-tree state (`19.059378s`) and the
+  earlier batch-prefault baseline (`11.950883s`); fault-decode found no trap
+  lines. A batch `Vec::reserve` micro-path and a known-absent append fast path
+  were tested and backed out after no-observe runs regressed to `14.644637s`
+  and `14.911925s`, and the reserve trace moved the largest gap to
+  `publish_batch.phase=1 -> phase=2`. **Verified:** `cargo fmt --check`,
+  `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems vm_pmap_publish --
+  --nocapture`, `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems
+  fault_script_prefaults_adjacent_private_anon_write_pages -- --nocapture`,
+  `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems vm -- --nocapture`,
+  repeated RV64 sparse probes, observe extract/validate/analyze, and
+  fault-decode on the final serial. **Next step:** keep the simple resident
+  vector and retest broader libcbench malloc/stdio/regex; remaining observed
+  outliers are now recipe publication (`mmap.commit.phase=0 ->
+  recipe.publish.touched_entries`) and private-set install, not a proven pmap
+  resident-row blocker. **Blocker:** throughput is better, but still
+  reference-far and needs full-suite validation.
+
+- 2026-05-30 **libcbench malloc-sparse private-set alternatives were rejected;
+  current blocker moves back to pmap/materialization body cost.** Added
+  private-anon/private-set subphase counters around private page allocation and
+  `PrivatePageSet::install_if_absent`, then tested three implementation
+  alternatives against the real RV64 sparse probe. Disabling the private-anon
+  prefault gate regressed `malloc_sparse_probe 10000 4000 0` to `36.750522s`;
+  a `BTreeMap<VmPageOff, Arc<PrivateFrame>>` resident-store compromise
+  regressed to `113.620097s`; and an in-place `Arc::make_mut` treap insert
+  regressed to `25.518800s`. Those experiments were backed out. The restored
+  persistent-tree state now reports `19.059378s` at
+  `target/oscomp/custom-run/malloc-sparse-restored-private-tree-noobserve-serial.txt`
+  with no decodable trap lines, but it is still not back to the earlier
+  `11.950883s` prefault baseline. **Verified:** `cargo fmt --check`,
+  `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems vm -- --nocapture`,
+  focused prefault host test, repeated RV64 custom sparse probes, and
+  `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/custom-run/malloc-sparse-restored-private-tree-noobserve-serial.txt
+  --all --brief`. **Next step:** stop tuning private-set shape until a new
+  trace proves it; focus on pmap batch publish phase `5 -> 6`, frame/map-pin
+  materialization, and full-suite malloc/stdio/regex validation. **Blocker:**
+  score remains semantically green, but malloc throughput is unstable and still
+  reference-far.
+
+- 2026-05-30 **Private-anon prefault tail now batches publication, but the
+  remaining VM cost is inside materialization/pmap publish.** Added a
+  best-effort `VmPmap` batch helper for speculative prefault tails and changed
+  the private-anon write-prefault path to hold one `Materializer` reservation
+  across the contiguous tail. The leading fault still uses the canonical
+  single-page path; failed tail publication only means later refault. Guest
+  evidence: `malloc_sparse_probe 10000 4000 0` improved from the prior
+  post-fence `12.535930s` to `11.950883s`, with no trap lines. Bracketed
+  `malloc_sparse_probe 100 4000 1` produced a valid txtrace (`2048` records,
+  `0` framing errors) and still shows `25` page-fault traps, but prefault
+  tails now publish up to `15` pages at a time. Full custom `libcbench-musl`
+  saved at `target/oscomp/custom-run/libcbench-batchprefault-serial.txt`
+  completed and scored `28.169479468902836/27`; fault-decode found no trap
+  lines. **Verified:** `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems
+  fault_script_prefaults_adjacent_private_anon_write_pages -- --nocapture`,
+  `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems vm -- --nocapture`,
+  `cargo xtask build --target rv64-qemu`, refreshed `cargo xtask oscomp
+  submit --target rv64-qemu --submit target/oscomp/submit`, focused malloc
+  probes, full libcbench, judge score, and fault-decode. **Next step:** trace
+  or batch the private-frame materialization plus pmap resident-row/PTE commit
+  body; the largest trace gap is now the batch itself
+  (`prefault.limit_pages=15 -> prefault.published_pages=15`, about `7.7ms`).
+  **Blocker:** throughput remains reference-far even though the score gate is
+  green.
+
+- 2026-05-30 **VM fault/pmap fence mitigation removes a broad libcbench
+  throughput tax.** Added a focused `malloc_sparse_probe` reproducer and
+  bracketed page-fault tracing in `thread_future`: the `100x4000` trace showed
+  `102` successful write page faults, with the largest gaps inside
+  `fault_script`. Lowered the existing private-anon write-prefault gate from
+  256 pages to 2 pages and added `debug.vm.fault.prefault.*` counters; this
+  reduced visible page-fault traps to `25` in the small trace but did not move
+  the full no-observe probe by itself. The decisive fix was removing the
+  redundant RV64 user-pmap commit `sfence.vma`: userspace entry already writes
+  `satp` and fences before `sret`, while unmap/protect invalidation fences stay
+  in place. Guest validation: `malloc-sparse-probe 10000 4000 0` improved from
+  `13.454211s` to `12.535930s`, and full `libcbench-musl` saved at
+  `target/oscomp/custom-run/libcbench-prefault2-no-commit-sfence-serial.txt`
+  completes with score `27.96149967877003/27` and no decodable trap lines.
+  Important full-suite deltas: `b_malloc_sparse 15.105796s -> 11.914281s`,
+  `b_malloc_bubble 13.201719s -> 10.031123s`, `b_malloc_big1 14.249863s ->
+  11.414609s`, `b_malloc_big2 15.109048s -> 12.114183s`,
+  `b_pthread_createjoin_serial1 34.854431s -> 24.082311s`,
+  `b_pthread_createjoin_serial2 31.220515s -> 21.452642s`,
+  `b_pthread_create_serial1 31.706098s -> 18.490959s`, and
+  `b_pthread_createjoin_minimal2 24.551947s -> 14.072427s`. **Verified:**
+  `cargo fmt --check`, `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems vm --
+  --nocapture`, `CARGO_INCREMENTAL=0 cargo test -p tx-hal-riscv64-qemu-virt
+  pmap -- --nocapture`, `cargo xtask build --target rv64-qemu`,
+  `cargo xtask oscomp submit --target rv64-qemu --submit target/oscomp/submit`,
+  focused malloc probes, full libcbench, judge score, and fault-decode no-trap
+  check. **Next step:** implement a real pmap batch-publish path for resolved
+  private-anon fault runs and keep chasing stdio/regex/user-copy overhead.
+  **Blocker:** throughput is materially better but still far from reference
+  scale; pmap publication is still one page at a time under the VM pmap lock.
+
+- 2026-05-29 **Terminal EBR drain plus retained clone handoff gets full
+  libcbench through the 300s bound.** The child-submit path now drains terminal
+  reactor tasks and performs bounded EBR reclaim after removing completed task
+  mappings, so pthread storms no longer wait for idle reactor turns to recycle
+  retired thread/task slots. `thread_future::syscall_return_needs_handoff`
+  also keeps one deferred child-publish handoff for every successful clone,
+  including directly published children; submit publish acknowledgement proves
+  scheduler visibility, but current evidence still needs one next-syscall
+  scheduling handoff until bounded clone handoff credit exists. Guest
+  validation: current full `libcbench-musl` serial
+  `target/oscomp/custom-run/os_serial_out_rv.txt` reaches
+  `#### OS COMP TEST GROUP END libcbench-musl ####` and scores
+  `27.88892195361034/27` with
+  `python3 tools/oscomp-judge.py target/oscomp/custom-run/os_serial_out_rv.txt
+  target/oscomp/custom-run/testdata`; `cargo xtask fault-decode --target
+  rv64-qemu --serial target/oscomp/custom-run/os_serial_out_rv.txt --all
+  --brief` finds no trap lines. Focused evidence: static-stack `50x50`
+  improved from `22695049000 ns` to `20961523000 ns`, `pthread-minimal2
+  50x50` improved from about `27.287651s` to `23.395502s`, and post-EBR
+  observe analysis reduced `sys_clone` avg from about `2138us` to `1170us`.
+  **Verified:** `cargo xtask build --target rv64-qemu`,
+  `CARGO_INCREMENTAL=0 cargo test -p tx-kernel
+  thread_future::tests -- --nocapture`, `CARGO_INCREMENTAL=0 cargo test -p
+  tx-kernel init -- --nocapture`, full guest libcbench score, and
+  fault-decode no-trap check. **Next step:** investigate the remaining
+  libcbench throughput families separately: malloc/VM (`b_malloc_sparse`
+  `15.105796000s`, bubble `13.201719000s`, big1/big2 about `14-15s`),
+  stdio putc/getc (`27-28s`), regex compile (`10.551844000s`), and the still
+  slow pthread lifecycle cases. **Blocker:** score gate is green, but reference
+  throughput remains far away.
+
+- 2026-05-29 **WakeHandoff now fronts remaining-budget waiters inside
+  `Preempted`, fixing the measured futex wake-pick tail.** Aligned
+  `crates/tx-reactor/src/scheduler.rs` with the active reactor scheduling doc:
+  `WakeHandoff` still does not enter `Boosted`, but a remaining-budget waiter
+  is enqueued at the front of `Preempted`; `Normal` userspace wakes still stay
+  behind already-preempted peers. Updated the focused scheduler test to
+  `wake_handoff_fronts_userspace_waiter_without_boosting` and kept the normal
+  wake ordering test green. Guest evidence: `pthread-minimal2 10x50`
+  no-observe improved from the earlier `6.699286000s` scale point to
+  `6.077050000s`; bracketed observe improved from `6.641901000s` to
+  `6.372112000s`, with corrected `drain->pick avg=76us max=246us` instead of
+  `avg=7905us max=17063us`. `50x50` no-observe moved only slightly
+  (`27.501891000s` -> `27.287651000s`), so the remaining pthread cost is now
+  syscall/lifecycle body work, not wake-pick placement. **Verified:**
+  `cargo test -p tx-reactor --test scheduler -- --nocapture`,
+  focused reactor smoke wake-handoff test, `cargo xtask build --target
+  rv64-qemu`, custom RV64 1x50/10x50/50x50 no-observe runs, 10x50 observe
+  extract/validate/analyze, and fault-decode on saved serials. **Next step:**
+  target the remaining body costs: thread-list futex wait duration,
+  stack `munmap`/`mmap`, `clone`, and `rt_sigprocmask`/trap framing.
+  **Blocker:** pthread lifecycle remains far above reference despite fixed
+  wake-pick latency.
+
+- 2026-05-29 **pthread-minimal2 10x50 trace now points to wake-pick lock
+  handoff, not wake-drain starvation.** Corrected
+  `tools/tx-observe-analyze.py` so futex wake latency does not destructively
+  pair a later same-task drain with a notification that was already picked
+  before that drain. Re-analyzed
+  `target/oscomp/custom-run/pthread-minimal2-10x50-observe-steady.txtrace`:
+  the previous `notify->drain=277337us` / `79227us` outliers were analyzer
+  artifacts. Corrected wake latency is `notify->drain avg=499us max=2061us`,
+  while `drain->pick avg=7905us max=17063us`; intermediate picks before the
+  waiter are dominated by task 0 (`task=0:31`). Source review and futex address
+  grouping identify the hot futex as musl's shared `__thread_list_lock`, not
+  per-thread join `detach_state`. Updated
+  `docs/research/2026-05-29-libcbench-throughput-suspects.md` with the revised
+  ranking. **Verified:** raw txtrace replay, corrected observe analysis, musl
+  source review. **Next step:** test a targeted lock-handoff wake-pick policy
+  for `WakeHandoff` waiters without reintroducing global short slices or
+  futex overboost. **Blocker:** pthread lifecycle remains linearly slow; no
+  semantic futex loss or child-roster loss is indicated.
+
+- 2026-05-29 **pthread-minimal2 probe isolated a negative scheduler slice
+  experiment and kept the clone prewarm mitigation.** Added a focused probe
+  update to `docs/research/2026-05-29-libcbench-throughput-suspects.md`.
+  `ThreadPayload` prewarm removed the clone allocation/signing tail in observe
+  (`payload_fresh -> payload_sign` max fell from `47643us`/`52274us` to
+  `1342us`), but futex wait and scheduler pick latency remained visible. A
+  temporary userspace-preempted 1 ms slice cap was tested and reverted:
+  no-observe regressed to `1.085854000s`, observe regressed to `1.139232000s`,
+  and trace churn rose to `pick:Preempted=327`, `UserspaceTrap=175`,
+  `SliceExpired=69`. After reverting that experiment and rebuilding,
+  `pthread-minimal2 1x50` completed in `0.606153000s` with
+  `thread-runtime:prewarm:payload=64` and no trap lines. **Verified:** focused
+  scheduler contract test, `cargo xtask build --target rv64-qemu`, custom RV64
+  no-observe/observe probes, txtrace extract/validate/analyze, and
+  fault-decode on saved serials. **Next step:** design a targeted futex
+  lock/wake handoff policy instead of reducing the global preempted-userspace
+  slice. **Blocker:** full libcbench remains throughput-bound; the current
+  focused probe only proves the blanket slice cap is the wrong scheduler fix.
+
+- 2026-05-29 **libcbench throughput suspect sweep recorded.** Added
+  `docs/research/2026-05-29-libcbench-throughput-suspects.md` after sweeping
+  guest serial evidence, focused tx-observe analyses, libc-bench source, musl
+  pthread create/join, syscall dispatch, clone/thread publish, futex, scheduler,
+  VM recipe publication, and observe tooling. Extended it with executable probe
+  recipes, a suspect-to-signal matrix, required pre-fix counters, and fix
+  selection rules. Current finding: full libcbench is still throughput-bound,
+  but the leading suspects are scheduler wake-drain/pick latency, clone
+  allocation/signing/task-publish outliers, VM map/unmap recipe publication plus
+  EBR retirement, signal-mask/thread-list-lock syscall density, and possible
+  trace/timer amplification. **Verified:** doc/source sweep, custom-run/observe
+  CLI check, `cargo xtask progress validate`, and `git diff --check`.
+  **Next step:** run the paired `pthread-minimal2 1x50` observe/noobserve probe
+  and instrument the largest stable bucket. **Blocker:** no throughput fix
+  selected until the trace-regime mismatch is resolved.
+
+- 2026-05-29 **Reactor scheduling update now enforces WakeHandoff instead of
+  futex overboost.** Removed the remaining `thread_future` futex-wake
+  `yield_now`/boot-reactor drain path so futex wake scheduling is carried by
+  runtime `UserspacePreempt`, not an immediate syscall yield. Also corrected
+  the direct-trap futex one-shot path to pass `MailboxSchedulerHint::WakeHandoff`
+  instead of `PriorityBoost`, and added
+  `direct_trap_futex_wake_uses_wake_handoff_hint` to pin that producer. The
+  active reactor scheduling doc now explicitly includes the direct-trap futex
+  producer in the `WakeHandoff` contract. **Verified:** `cargo fmt --check`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-shims futex_dispatch -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-kernel thread_future::tests --
+  --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p tx-reactor --
+  --test-threads=1 --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p
+  tx-substrate --lib wake:: -- --nocapture`; `CARGO_INCREMENTAL=0 cargo test
+  -p tx-subsystems futex -- --nocapture`; process roster/thread-exit focused
+  regressions; and `cargo xtask build --target rv64-qemu`. Guest validation:
+  focused `pthread-minimal2` 1x50 completed in `0.896477000s`, fault-decode
+  found no trap lines, txtrace validation reported `8192 records, 0 framing
+  errors`, and observe analysis showed `hint hist: WakeHandoff=8 Normal=5
+  LifecycleWake=1` with futex wake no longer entering `PriorityBoost`. Bounded
+  full libcbench still timed out at 300s during
+  `b_pthread_createjoin_minimal1`, but scored `20.761311860355192/27` before
+  timeout and had no decodable trap lines; completed pthread timings were
+  serial1 `78.996193000s`, serial2 `50.833705000s`, create_serial1
+  `54.028709000s`, and uselesslock `0.125738000s`. **Next step:** continue
+  profiling pthread lifecycle throughput and task/VM syscall body cost; do not
+  retarget futex wake class or child roster correctness without new evidence.
+  **Blocker:** scheduler contract is implemented, but full libcbench remains
+  throughput-bound beyond the 300s cap.
+
+- 2026-05-29 **Clone child submit now carries a publish acknowledgement back
+  to `thread_future`.** Added the dependency-neutral
+  `SubmitChildThreadStatus::{Published, QueuedFallback}` seam result in
+  `tx-subsystems::reactor_submit`, returned `Published` from the live
+  `CoreInit` direct child-submit path, and carried that status through
+  `SyscallResult::CloneReturn` for clone/fork returns. `thread_future` now
+  treats direct-published clone children as already having the child-publish
+  acknowledgement, while queued fallback clone returns still request the
+  transitional child-publish handoff. Userspace ABI is unchanged: trap and
+  syscall writeback encode `CloneReturn.value` exactly like a normal
+  successful return. **Verified:** `cargo fmt --check`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems reactor_submit -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-shims dispatch_clone -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-kernel thread_future::tests -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-kernel init -- --nocapture`; and
+  `CARGO_INCREMENTAL=0 cargo test -p tx-reactor -- --test-threads=1 --nocapture`.
+  Guest validation: focused `pthread-minimal2` 1x50 completed in
+  `0.695656000s` with no trap lines, and tx-observe analysis showed the former
+  broad clone-handoff gap replaced by about `15us` from
+  `debug.thread.return.stored` to `debug.thread.loop.top`; full custom
+  libcbench reached `20.74776170611849/27` before the 300s timeout, with
+  pthread serial1/serial2/create-serial1 scored and no trap lines. **Next
+  step:** chase the remaining pthread tail now visible in full libcbench,
+  especially the high-volume lifecycle/minimal benchmark path after
+  `b_pthread_uselesslock`. **Blocker:** full libcbench still exceeds the 300s
+  bound, so score completion remains blocked by later pthread lifecycle cost.
+
+- 2026-05-29 **Reactor scheduling contract folded into the active design doc.**
+  Updated `docs/design/02_execution/reactor_scheduling.md` to make the contract
+  explicit: reactor mechanism vs scheduler policy, wakes as advisory
+  re-observation hints, userspace-entry no-yield window, submit publish
+  acknowledgement as distinct from wake delivery, and successful clone requiring
+  child publication rather than child execution. Added ASCII diagrams for the
+  reactor/scheduler/subsystem ownership lanes, wait-source wake path vs submit
+  publish path, parent/child pthread lifetime scheduling target, and a
+  comparison of Tx Phase 1 scheduling against Linux EEVDF, Fuchsia/Zircon,
+  seL4 MCS, Tokio-style executors, and Managarm-like coroutine kernels. The doc
+  now marks the current next-syscall clone `yield_now` as a transitional
+  correctness boundary and names the target replacement: a submit-side publish
+  report with task id, target hart, queue, queued turn, and dispatch action,
+  plus tests proving the child was not polled. **Verified:** `cargo xtask
+  progress validate` and `git diff --check`. **Next step:** implement the
+  publish report in
+  `tx-reactor`/`CoreInit` clone submit and use host tests before changing guest
+  pthread behavior. **Blocker:** design is now explicit, but code still uses
+  the broad clone handoff. Also ran `cargo xtask lint docs`; it passed with the
+  existing stale-vocabulary warning mode.
+
+- 2026-05-29 **Reactor scheduling interface audit drafted under
+  `docs/research/`.** Added
+  `docs/research/2026-05-29-reactor-scheduling-interface-audit.md` to answer
+  whether the current reactor interfaces can support the pthread lifecycle
+  scheduling model. Finding: the implemented wake-class policy is sufficient
+  for Phase 1 wake placement, but the next pthread fix needs a submit-side
+  child publish-ack report, not another wake hint or broad `yield_now`
+  handoff. The same audit keeps fair virtual-time accounting and
+  scheduling-context donation as later scheduler work, not prerequisites for
+  the immediate clone long-tail fix. **Verified:** source/doc audit,
+  `cargo xtask progress validate`, and `git diff --check`. **Next step:**
+  implement a publish report on child submission, prove it does not poll the
+  child, then test whether it can replace the current next-syscall clone
+  handoff. **Blocker:** guest pthread runtime is still expected to remain slow
+  until the publish-ack interface is implemented and validated.
+
+- 2026-05-29 **Clone child-publish handoff blocker narrowed to over-running
+  the child, not clone construction.** Source and trace review pins the hot path
+  at `thread_future::run_thread`: successful `NR_CLONE` sets
+  `syscall_handoff_pending`, then the next syscall boundary pays
+  `debug.thread.clone_handoff.yield` before dispatch. In the saved 1x50 trace,
+  that yield-to-next-`mmap` path averaged about `599.5us` (`p50=472us`,
+  `p95=743us`), while clone semantic work averaged `113.2us`, reactor submit
+  averaged `69.2us`, and `sys_mmap` itself averaged `165.6us`. The current
+  handoff is therefore semantically valid but too broad: it turns "child task is
+  published" into "child gets enough scheduler time to run a meaningful
+  userspace lifecycle slice." Rechecked the rejected first-direct-syscall child
+  preempt shortcut: direct trap writes return/pc into the live trap frame, then
+  `hand_off_timer_preempt` captures it as transparent preemption instead of a
+  syscall handoff, bypassing the Plan-B pending-return merge path; this explains
+  the earlier high-kernel-address userspace SIGSEGV and makes that boundary
+  unsafe without a deeper trap-context redesign. **Verified:** read-only source
+  audit plus existing tx-observe reports
+  `target/oscomp/custom-run/libcbench-minimal2-exact-tid-unregister-observe-1x50.*`.
+  **Next step:** replace the clone handoff with a narrower publish-ack/scheduler
+  policy that proves child task visibility without letting the child consume a
+  full userspace slice; do not remove the handoff or reintroduce direct-trap
+  child preempt as currently shaped. **Blocker:** pthread-minimal2 correctness
+  is green, but 2500-thread runtime remains dominated by this handoff/lifecycle
+  scheduling cost.
+
+- 2026-05-28 **Pthread lifecycle trace now pins the largest repeatable tax to
+  clone child-publish handoff, not namespace cleanup.** Dispatched read-only
+  subagents over scheduler/reactor, VM/epoch, syscall dispatch, and
+  process/thread lifecycle paths. Their results converged on the current
+  1x50 trace:
+  `target/oscomp/custom-run/libcbench-minimal2-exact-tid-unregister-observe-1x50.txtrace`
+  / `.analysis.txt`, where `debug.thread.clone_handoff.yield ->
+  debug.thread.await.ready` before the next `mmap` averaged about `599.5us`
+  while `sys_mmap` averaged `165.6us`, clone semantic work averaged
+  `113.2us`, and reactor submit averaged `69.2us`. Added two retained narrow
+  cleanups: non-leader pthread exit unregisters only the thread namespace role
+  instead of retaining over every pid role, and `NR_EXIT` now has an
+  already-resolved thread-identity oneshot lane before full `SyscallCtx`
+  construction. Tested and rejected a child first-direct-syscall preempt
+  shortcut: it caused an early userspace SIGSEGV at
+  `pc=0xffffffff8035e80c`, so direct-trap child slices are not a safe
+  handoff boundary with the current saved-context discipline. **Verified:**
+  `cargo fmt --check`; `CARGO_INCREMENTAL=0 cargo test -p tx-kernel
+  thread_future::tests -- --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p
+  tx-subsystems ordinary_thread_exit_unregisters_only_thread_namespace_role --
+  --nocapture`; `CARGO_PROFILE_DEV_OPT_LEVEL=1 cargo xtask build --target
+  rv64-qemu`; retained-fix guest
+  `pthread-minimal2` 50x50 completed in `3.762491000s` with no trap lines
+  (`target/oscomp/custom-run/libcbench-minimal2-retained-fixes-50x50-serial.txt`).
+  **Next step:** redesign the clone handoff itself so it proves child
+  publication without running unsafe partial direct-trap context or the full
+  child exit path. **Blocker:** correctness remains green, but retained
+  cleanups do not materially improve the high-3s 2500-thread runtime.
+
+- 2026-05-28 **Rejected two pthread lifecycle shortcuts; current blocker
+  remains steady-state child/VM lifecycle cost.** Fresh current tailored
+  `pthread-minimal2` evidence: 1x50 bracketed observe completed in
+  `0.296289000s`, emitted a valid `8192`-record trace at
+  `target/oscomp/custom-run/libcbench-minimal2-current-go-1x50.txtrace`, and
+  `fault-decode --all --brief` found no trap lines. The matching no-observe
+  50x50 run completed in `3.468145000s` with terminal child drain keeping up at
+  each 256-task checkpoint
+  (`target/oscomp/custom-run/libcbench-minimal2-current-go-50x50-serial.txt`).
+  Trace analysis shows direct `rt_sigprocmask` is already on the trap fast
+  path (`debug.trap.direct_syscall: 135:129`), while remaining repeated costs
+  are clone body/submit, stack `mmap`, exit, and clone child-publish handoff.
+  Tested and rejected a direct-trap `mmap` shortcut: it panicked under 50x50 at
+  `zone::Cap::try_retire_slot` with `RetiredNodePoolExhausted`, proving
+  synchronous VM recipe/zone retirement still depends on the reactor/EBR
+  maintenance cadence. Tested and rejected disabling the clone child-publish
+  handoff: it panicked early with `BootStaticBag not constructed`, preserving
+  the correctness boundary pinned by
+  `successful_clone_return_needs_child_publish_handoff`. **Verified:**
+  `cargo fmt --check`; `CARGO_INCREMENTAL=0 cargo test -p tx-shims mmap --
+  --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p tx-kernel
+  successful_clone_return_needs_child_publish_handoff -- --nocapture`; custom
+  current 1x50/50x50 guest runs; rejected direct-`mmap` and no-clone-handoff
+  guest experiments. **Next step:** optimize inside the valid reactor path:
+  reduce VM recipe publish/reclaim churn or child task construction/submit
+  cost, rather than direct-trapping VM syscalls or weakening clone handoff.
+  **Blocker:** `pthread-minimal2` is correct and drains children promptly, but
+  steady-state 2500-thread cost remains about `3.47s`.
+
+- 2026-05-28 **Pthread wake placement is fixed for waited joins, but libcbench
+  minimal2 is now lifecycle/VM dominated.** Tested the direct-trap futex wake
+  experiment that posts positive direct futex wakes with `PriorityBoost` while
+  leaving ordinary futex wakes at `WakeHandoff`. The small static-stack observe
+  run
+  `target/oscomp/custom-run/pthread-static-stack-8-prioboost.txtrace`
+  validated as `2048 records, 0 framing errors`; analysis
+  `target/oscomp/custom-run/pthread-static-stack-8-prioboost-analyze-98.txt`
+  shows positive wake notifications enter `Boosted`, with woken joiner
+  `runnable->pick` delays of `4-18us` after drain. A no-observe static-stack
+  run reached `81865000ns`, though later no-observe static-stack runs varied,
+  so the trace is the stronger causality evidence. Full `pthread-minimal2`
+  50x50 remains in the `3.3-3.4s` band
+  (`target/oscomp/custom-run/libcbench-pthread-minimal2-prioboost-serial.txt`,
+  `target/oscomp/custom-run/libcbench-pthread-minimal2-restored-handoff-serial.txt`),
+  with no trap lines. A bracketed 2x50 libcbench trace
+  `target/oscomp/custom-run/libcbench-pthread-minimal2-prioboost-r2-observe.txtrace`
+  validated as `16384 records, 0 framing errors`; the analyzer shows no
+  wait-source notifications in that window, mostly zero-wake futex misses plus
+  `sys_clone avg=245.3us`, `sys_mmap avg=176.2us`, `sys_munmap avg=181.9us`,
+  `sys_exit avg=157.4us`, and `sys_rt_sigprocmask avg=35.7us`. Rejected a
+  narrower clone-handoff variant that only yielded before the next `clone`:
+  it regressed `pthread-minimal2` to `4.280651000s` and left terminal child
+  drain one task behind, proving the existing post-clone child-publish handoff
+  must stay before the next syscall boundary. **Verified:** `cargo fmt
+  --check`; `CARGO_INCREMENTAL=0 cargo test -p tx-shims futex -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-kernel
+  successful_clone_return_needs_child_publish_handoff -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-kernel
+  positive_direct_futex_wake_needs_wake_handoff_boundary -- --nocapture`;
+  `CARGO_PROFILE_DEV_OPT_LEVEL=1 cargo xtask build --target rv64-qemu`;
+  custom RV64 static-stack and pthread-minimal2 runs; observe
+  extract/validate/replay/analyze; and `fault-decode --all --brief` on saved
+  serials (no trap lines). **Next step:** optimize the syscall/lifecycle cost
+  of mmap/clone/exit/munmap and required child-publish handoff; do not retarget
+  futex keying or defer the clone handoff. **Blocker:** reference scale is
+  still sub-second, while current 2500-thread minimal2 remains about 3.4s.
+
+- 2026-05-28 **libcbench pthread residual cost is child lifecycle, not futex
+  keying or VM stack allocation.** Refreshed the current optimized RV64 kernel
+  and reran focused custom slices. `pthread-minimal2` 50x50 now completes in
+  `3.345374000s` with no trap lines
+  (`target/oscomp/custom-run/libcbench-pthread-minimal2-current-opt1-serial.txt`).
+  A bracketed 1x50 trace completed in `0.081403000s`, extracted
+  `1179080` bytes, validated as `8192 records, 0 framing errors`, and the
+  updated analyzer report
+  `target/oscomp/custom-run/libcbench-pthread-minimal2-current-1x50-bracket-analyze-v2.txt`
+  shows `sys_clone n=33 avg=225.3us`, `sys_mmap n=33 avg=168.8us`,
+  `sys_exit n=32 avg=148.6us`, `sys_rt_sigprocmask n=136 avg=32.2us`,
+  and `sys_futex n=32 avg=35.9us`. Futex table samples are all zero-waiter
+  wake misses, so this slice is not blocked on futex waiter accounting. The
+  dominant residual gap is scheduler/lifecycle: clone-return-to-next-normal
+  trap averages `1295.8us`, and mmap-side child-publish handoff averages
+  `571.8us`. A static-stack control still took `109135000ns` for 50 threads,
+  confirming pthread stack `mmap` is not the primary residual blocker. Updated
+  `tools/tx-observe-analyze.py` to harvest in-tree `debug.*` counter names so
+  future trace reports decode scheduler/futex/thread counters without manual
+  hash tables. **Verified:** `python3 -m py_compile tools/tx-observe-analyze.py`,
+  `CARGO_INCREMENTAL=0 cargo test -p tx-kernel thread_future::tests --
+  --nocapture`, `CARGO_PROFILE_DEV_OPT_LEVEL=1 cargo xtask build --target
+  rv64-qemu`, custom pthread-minimal2 50x50/1x50 runs, observe
+  extract/validate/analyze, and `fault-decode --all --brief` on the saved
+  serial logs. **Next step:** optimize the child lifecycle slice itself
+  (`clone_handoff.yield` through child sigmask/exit/re-pick), not futex
+  semantics or sparse VM teardown. **Blocker:** per-child lifecycle remains
+  around millisecond scale versus the sub-millisecond reference target.
+
+- 2026-05-28 **Dead AddressSpace pmap teardown no longer runs per-page
+  unmap/shootdown from EBR reclaim.** Trace evidence showed old
+  `AddressSpace` / `VmPmap::drop` work being charged inside unrelated pthread
+  `mmap` spans when EBR threshold drains ran reclaim callbacks. Replaced
+  `VmPmap::drop` with a dead-root destroy path: destroy the pmap root once
+  (root-wide invalidation/ASID release), then release tracked
+  `MaterializedPagePin`s without calling `teardown_range` for each resident
+  page. Live `munmap`/`mprotect`/replacement paths still use
+  `teardown_range`, and EBR threshold drain behavior is restored after the
+  discarded soft-limit experiment. Kept sampled EBR/zone/pmap trace counters
+  and updated the observe analyzer names. **Verified:** `cargo fmt --check`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems
+  address_space_cap_drop_destroys_dead_pmap_without_per_page_unmap --
+  --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems
+  vm_address_space_unmap_sparse_large_range_tears_down_resident_pmap_entries
+  -- --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p tx-substrate --test epoch
+  -- --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems
+  vm_recipe_ -- --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems
+  brk_growth_after_private_fault_keeps_single_recipe_with_structural_private_split
+  -- --nocapture`; `cargo xtask build --target rv64-qemu`. Guest evidence:
+  bracketed custom `pthread-minimal2` completed in `0.227073000s`, extracted
+  `4096` txtrace records with `0` framing errors, and analysis shows live
+  `teardown_range` only for the eight `munmap` calls; observe-off
+  `pthread-minimal2` completed in `0.167691000s`. Full custom libcbench now
+  completes with no trap lines and scores `27.859402335485623/27`
+  (`target/oscomp/custom-run/libcbench-full-pmapdrop-serial.txt`). **Next
+  step:** continue profiling residual full-scale pthread cost
+  (`serial1=22.374690s`, `serial2=29.157999s`, `create_serial1=25.389279s`,
+  `minimal1=23.567310s`, `minimal2=21.830678s`) and stdio/regex latency.
+  **Blocker:** libcbench is green, but pthread lifecycle is still much slower
+  than normal scale.
+
+- 2026-05-28 **Pthread task lifecycle drain moved into clone submit, with
+  bounded terminal-slot evidence.** Added explicit terminal queues in
+  `tx-reactor`'s `TaskTable` so `drain_completed`/`drain_cancelled` no longer
+  scan every historical task slot, and wired boot userspace/AP loops to drain
+  terminal thread tasks before idle decisions. The key finding was that outer
+  loop drains are too late for libcbench pthread hot loops: `serial1` drained
+  all `2505` terminal tasks only after the benchmark ended and regressed to
+  `33.970308000s`. Moving terminal drain into the clone submit critical section
+  interleaves `terminal_drained` with child submission and reuses task slots
+  during the hot reactor step. The final integrated drain avoids an extra
+  `BOOT_REACTOR.with` round-trip by draining terminal records and submitting
+  the child under one reactor access. Rejected variants: outer-loop-only drain
+  (`28.632711000s` on `serial1` before terminal queues), per-clone separate
+  drain (`serial1=26.223322000s` but `serial2=36.704739000s`), and periodic
+  32-clone drain (`serial1=29.960079000s`). **Verified:**
+  `CARGO_INCREMENTAL=0 cargo test -p tx-reactor --test task_lifecycle --
+  --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p tx-kernel
+  thread_future::tests -- --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p
+  tx-reactor -- --nocapture`; `cargo fmt --check`; `cargo xtask build --target
+  rv64-qemu`; `git diff --check`. Guest evidence for the final integrated
+  drain: custom `pthread-serial1=26.957416000s`,
+  `pthread-serial2=31.755897000s`, both with interleaved
+  `bench:child_submit:terminal_drained` counters and no trap lines from
+  `fault-decode --all --brief`. **Next step:** continue profiling the remaining
+  ~26-32s pthread lifecycle cost in syscall body work (`rt_sigprocmask`, VM
+  mappings, futex waits, child exit) rather than more task-slot cleanup.
+  **Blocker:** task lifecycle churn is now bounded and modestly faster, but
+  pthread throughput is still far from normal scale.
+
+- 2026-05-28 **Pthread lifecycle follow-up isolated futex issuer yielding from
+  the remaining throughput cost.** Tightened the thread-future pthread wake
+  contract so a successful `FUTEX_WAKE` return reaches the next userspace entry
+  in the same poll; the explicit scheduler handoff remains limited to
+  successful `clone` child publication, now with a low-volume
+  `debug.thread.clone_handoff.yield` observe marker. A trial bounded syscall
+  checkpoint reduced sampled futex notify-to-pick latency but added normal
+  self-wake overhead and regressed `pthread-serial2`, so it was not kept.
+  Current evidence says futex keying and wake delivery are correct; the
+  remaining libcbench lag is per-syscall/per-thread lifecycle cost in VM,
+  sigmask, clone/task setup, and child exit paths rather than a lost waiter.
+  **Verified:** `CARGO_INCREMENTAL=0 cargo test -p tx-kernel
+  thread_future::tests -- --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p
+  tx-reactor wake_handoff_same_hart_marks_userspace_preempt_without_remote_ipi
+  -- --nocapture`; `cargo fmt --check`; `git diff --check`; `cargo xtask build
+  --target rv64-qemu`; `cargo xtask progress validate`. Guest evidence:
+  final custom `pthread-serial1` completed in `27.414850000s`, final
+  `pthread-serial2` completed in `32.113191000s`, and `fault-decode --all
+  --brief` found no trap lines in either serial log. Intermediate observe
+  evidence showed the discarded budget checkpoint could reduce sampled futex
+  notify-to-pick to `avg=4277us`/`max=6845us`, but the no-observe batch timing
+  did not justify keeping the policy. **Next step:** profile per-syscall body
+  cost and task construction outliers; do not chase futex table semantics or a
+  lost-child roster bug for this blocker. **Blocker:** pthread lifecycle is
+  correct and no longer hangs, but still runs in the high-tens-of-seconds band.
+
+- 2026-05-28 **Reactor wake classes split pthread lifecycle scheduling from
+  ordinary readiness.** Added `WakeHandoff` and `LifecycleWake` across
+  mailbox/reactor hints, kept default `SourceFired` notifications at `Normal`,
+  routed futex syscall wakes through `WakeHandoff`, and routed `clear_child_tid`
+  plus robust-list exit wakes through `LifecycleWake`. Phase 1 scheduling now
+  has a `Boosted` queue for lifecycle/priority/signal wakes, preserves
+  `WakeHandoff` in normal/preempted placement while marking same-hart
+  `UserspacePreempt`, and promotes aged preempted work before `New` after 8
+  scheduler turns. Removed the futex-wake immediate syscall yield and narrowed
+  `syscall_return_needs_handoff` to the clone child-publish handoff. Added
+  `docs/design/02_execution/reactor_scheduling.md` and indexed it. **Verified:**
+  `CARGO_INCREMENTAL=0 cargo test -p tx-substrate --lib
+  source_fired_latches_normal_scheduler_hint_by_default -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-substrate --lib
+  hinted_notify_limit_emit_latches_wake_handoff -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-reactor
+  wake_handoff_keeps_preempted_placement_without_boosting -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-reactor
+  lifecycle_priority_and_signal_wakes_enter_boosted_queue -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-reactor
+  wake_handoff_same_hart_marks_userspace_preempt_without_remote_ipi --
+  --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p tx-reactor
+  source_fired_pending_commit_keeps_userspace_task_behind_preempted_peer --
+  --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p tx-reactor
+  aged_preempted_task_beats_new_after_eight_scheduler_turns -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems
+  step_futex_lifecycle_wake_in_latches_lifecycle_hint -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-kernel
+  successful_clone_return_needs_child_publish_handoff -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-kernel
+  futex_wake_return_reenters_userspace_without_mailbox_event -- --nocapture`.
+  Broader gates also passed: `CARGO_INCREMENTAL=0 cargo test -p tx-substrate
+  --lib wake:: -- --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p tx-reactor
+  -- --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems futex --
+  --nocapture`; `CARGO_INCREMENTAL=0 cargo test -p tx-kernel
+  thread_future::tests -- --nocapture`; process roster/thread-exit host
+  regressions; `cargo fmt --check`; `git diff --check`; `cargo xtask progress
+  validate`; `cargo xtask lint docs`; `cargo xtask build --target rv64-qemu`.
+  Guest evidence: bracketed custom `pthread-minimal2` completed in
+  `1.183813000s`, emitted a valid `8192`-record trace with `0` framing errors,
+  and `fault-decode --all --brief` found no trap lines. The partial full custom
+  libcbench run timed out at `420s` after reaching `b_stdio_putcgetc`, but
+  scored `22.837872207033715/27` and advanced past all pthread benches
+  (`serial1=58.206681s`, `serial2=76.559421s`,
+  `create_serial1=67.611055s`, `minimal1=58.169531s`,
+  `minimal2=59.565469s`). **Next step:** profile why pthread lifecycle still
+  costs roughly one minute per full bench and why the full run now times out in
+  stdio after pthread, rather than treating this as a futex lost-wake hang.
+  **Blocker:** scheduler wake classes remove the hang/roster hypothesis, but
+  pthread lifecycle throughput remains too slow.
+
+- 2026-05-28 **libcbench malloc-free fix moved private residency to structural
+  sharing.** Replaced `PrivatePageSet`'s per-mapping `BTreeMap` clone path with
+  a structurally shared treap of `Arc<PrivateFrame>` nodes and atomic
+  `PrivateFrameState`, so `split`, `drain_range`, and `fork_share` can publish
+  sliced metadata without reacquiring every resident page pin. Restored
+  Linux-like adjacent private recipe coalescing for clean heap growth while
+  keeping resident private pages cheap to split independently. Added host
+  coverage that fault-populated `brk` growth remains a single recipe under the
+  structural private split contract. Guest evidence: traced `free(p[1])`
+  `drive.VmUnmapOp` is `2460us`; the 1500 allocation/free probe is `2.811s`
+  (from `18.692s` before VM fixes and `4.265s` under the fragmentation
+  stopgap); the 10k sparse probe is `13.898s` (from `26.408s` under the
+  stopgap); full custom libcbench improves to `20.86647369877533/27` with
+  `b_malloc_sparse=13.386099s` and no trap lines, then times out at 240s in
+  `b_pthread_createjoin_minimal2`. **Verified:**
+  `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems
+  brk_growth_after_private_fault_keeps_single_recipe_with_structural_private_split -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems brk_script_ -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems fork_aspace -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems vm_fault_private -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems vm_recipe_ -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems vm_address_space_unmap -- --nocapture`;
+  `cargo xtask build --target rv64-qemu`; custom free-one, 1500-detail, 10k
+  sparse, and full libcbench runs via `tools/oscomp-custom-run.py`;
+  `python3 tools/oscomp-judge.py
+  target/oscomp/custom-run/libcbench-full-private-tree-serial.txt
+  target/oscomp/testdata`; `cargo xtask observe extract/validate/names/analyze`
+  for the free-one trace; `cargo xtask fault-decode --target rv64-qemu
+  --serial target/oscomp/custom-run/libcbench-full-private-tree-serial.txt
+  --all --brief` found no trap lines. **Next step:** chase the remaining
+  pthread lifecycle cost. **Blocker:** libcbench is no longer malloc-free
+  blocked, but the full custom run remains pthread-lifecycle limited.
+
+- 2026-05-27 **Clone moved to a one-shot syscall lane; pthread task future
+  shrank back to the cheap-submit size.** Split non-vfork `clone` out of the
+  broad async syscall dispatcher: `dispatch_clone_oneshot` handles
+  `CLONE_THREAD` and regular non-vfork fork synchronously, while `CLONE_VFORK`
+  stays on the async path because it intentionally parks the parent. Converted
+  the pthread hot lane from an inline async future into synchronous one-shot
+  handling for futex wake plus pthread lifecycle syscalls; futex wait still
+  falls through to the boxed async dispatcher. Type-size evidence now shows
+  `PerHartSlotted<run_thread>` at `936 bytes` (`run_thread` body `928 bytes`),
+  down from the prior `1776 bytes` state that still carried
+  `dispatch_pthread_hot`. Fresh bracketed pthread trace
+  `target/oscomp/custom-run/libcbench-minimal2-clone-oneshot-sync-hot.txtrace`
+  validates at `8192 records, 0 framing errors`; `sys_clone` is now
+  `28 spans / 1684us total / 60.1us avg`, while the remaining trace costs are
+  `sys_rt_sigprocmask`, futex waits, and mmap. Observe-off tailored
+  `pthread-minimal2` completed in `1.006834000s`; bracketed observe completed
+  in `1.208821000s`; both had no trap lines. **Verified:**
+  `CARGO_INCREMENTAL=0 cargo test -p tx-shims
+  dispatch_clone_oneshot_handles_non_vfork_and_defers_vfork -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-kernel
+  run_thread_future_stays_within_clone_submit_budget -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-kernel
+  successful_clone_return_needs_child_publish_handoff -- --nocapture`;
+  `CARGO_INCREMENTAL=0 cargo test -p tx-kernel
+  futex_wake_return_reenters_userspace_without_mailbox_event -- --nocapture`;
+  `cargo fmt --check`; `cargo xtask build --target rv64-qemu`; custom
+  no-observe and bracketed `tools/oscomp-custom-run.py` libcbench
+  `pthread-minimal2` runs; `cargo xtask observe extract/validate/names/analyze`.
+  **Next step:** chase the remaining pthread runtime cost in
+  `sys_rt_sigprocmask` and futex wait scheduling; clone publish is no longer
+  the primary bottleneck. **Blocker:** full libcbench performance is still
+  pthread-lifecycle bound, but this pass removes the millisecond-scale clone
+  submit-boxing cause.
+
+- 2026-05-27 **Pthread futex wake latency moved below clone/sigmask cost.**
+  Added a futex-wake-specific scheduler handoff in the thread future:
+  successful `futex(..., FUTEX_WAKE/FUTEX_WAKE_BITSET, ...)` calls that wake
+  at least one waiter now store the syscall return, then make one cooperative
+  reactor handoff so same-hart waiters do not sit behind a full userspace timer
+  slice before their mailbox wake is drained. Kept the existing deferred
+  handoff helper for successful `clone` and zero-ready `pselect`, and added
+  `syscall_return_needs_immediate_handoff` coverage for futex wake/bitset
+  positive, zero-wake, and WAIT cases. Fresh bracketed pthread trace
+  `target/oscomp/custom-run/libcbench-minimal2-1batch-futex-immediate.txtrace`
+  validates at `4096 records, 0 framing errors`; futex source correlation still
+  reports `registered=5 notified=5 matched=5`, while `futex wake latency`
+  reports `notify->drain avg=1129.0us max=3713.0us` and `notify->pick
+  avg=1240.2us max=3810.0us`, down from the earlier `notify->drain
+  avg=9180.3us max=9744.0us`. The trace's leading costs are now
+  `sys_clone` (`180.503ms` total in-window) and `sys_rt_sigprocmask`
+  (`125.527ms` total in-window), not futex table lookup or wake delivery.
+  **Verified:** `cargo test -p tx-kernel
+  successful_clone_return_needs_child_publish_handoff -- --nocapture`;
+  `cargo test -p tx-kernel
+  futex_wake_return_reenters_userspace_without_mailbox_event -- --nocapture`;
+  `cargo xtask build --target rv64-qemu`; bracketed custom run `python3
+  tools/oscomp-custom-run.py --libcbench --libcbench-only pthread-minimal2
+  --libcbench-outer-repeat 1 --observe-bracket --run --skip-build --serial
+  target/oscomp/custom-run/libcbench-minimal2-1batch-futex-immediate-serial.txt
+  --timeout 90 --fault-decode` printed `time: 1.048274000`, emitted
+  `TXTRACE-BEGIN/END`, and had no trap lines; `cargo xtask observe
+  extract/validate/names/analyze` on the trace above. **Next step:** instrument
+  `sys_clone` and `rt_sigprocmask` sub-stages before changing those paths.
+  **Blocker:** pthread slice still runs around one second in the local
+  Zig/musl custom image, so the remaining bottleneck is clone/sigmask
+  per-syscall overhead rather than futex wake matching.
+
+- 2026-05-27 **Futex wake notifications now carry reactor task ids.**
+  Reactor-owned `TaskMailbox` instances now attach the reactor `TaskId` via
+  `TaskMailbox::with_task_id` at submission time, so `wake.notify` records name
+  the woken task instead of reporting the default `task=0`. Added
+  `submitted_task_mailbox_carries_reactor_task_id` to pin this trace contract.
+  Extended `tools/tx-observe-analyze.py` with a `futex source correlation`
+  section that reconstructs sampled futex registration rows, compares their
+  low wait-source ids against delivered `wake.notify` events, and prints
+  registered-without-notify / notify-without-registration mismatches. Fresh
+  bracketed pthread trace
+  `target/oscomp/custom-run/libcbench-minimal2-1batch-taskids.txtrace`
+  validates at `4096 records, 0 framing errors`; analysis reports
+  `registered=3 notified=3 matched=3`, and `wake.notify` now names
+  `task=8`, `task=32`, and `task=34`, matching the futex WAIT task list and
+  the scheduler `PriorityBoost` wake-hint tasks. **Verified:** `cargo test -p
+  tx-reactor submitted_task_mailbox_carries_reactor_task_id -- --nocapture`;
+  `cargo test -p tx-substrate --lib wait_source -- --nocapture`; `cargo test
+  -p tx-subsystems futex -- --nocapture`; `cargo xtask build --target
+  rv64-qemu`; bracketed custom run `python3 tools/oscomp-custom-run.py
+  --libcbench --libcbench-only pthread-minimal2 --libcbench-outer-repeat 1
+  --observe-bracket --run --skip-build --serial
+  target/oscomp/custom-run/libcbench-minimal2-1batch-taskids-serial.txt
+  --timeout 90 --fault-decode` printed `time: 1.029368000`, emitted
+  `TXTRACE-BEGIN/END`, and had no trap lines; `cargo xtask observe
+  extract/validate/names/analyze` on the trace above. **Next step:** use the
+  same correlation report on longer pthread slices to measure wake-to-pick
+  delay per task. **Blocker:** none for the wake-list identity/correlation
+  surface.
+
+- 2026-05-27 **Futex wait-table and wake-list observe attribution.**
+  Added bounded futex table snapshots for exact waiter registration, wake
+  lookup, cancellation, requeue, and wake decisions. The snapshots report
+  entry count, total waiters, target futex address, sampled registered futex
+  address, waiter count, interest mask, wait-source id, and subscriber count.
+  `WaitSource::notify_limit_emit` now emits one `wake.notify` record per
+  delivered limited wake, so futex wake decisions can be matched against the
+  actual wait-source notification list. `cargo xtask observe analyze` now
+  prints `futex table snapshots` and `wait-source notify list`, and
+  `cargo xtask observe names` knows the new futex table/decision debug names.
+  Fresh bracketed pthread trace
+  `target/oscomp/custom-run/libcbench-minimal2-1batch-futextrace.txtrace`
+  validates at `4096 records, 0 framing errors`; analysis shows non-empty
+  registration snapshots at `uaddr=0x1039448`, wake decisions with
+  `requested=1`, `woken=1`, `posted=1`, and matching `wake.notify` source ids
+  `0x13d..0x140`. The same run shows no exact-table mismatch in this window:
+  waits are published, wakes post to subscribers, and remaining lag is visible
+  as scheduler/runqueue delay around the woken tasks. **Verified:**
+  `cargo test -p tx-substrate --lib wait_source -- --nocapture`; `cargo test
+  -p tx-subsystems futex -- --nocapture`; `python3
+  tools/tests/test_oscomp_custom_run.py`; `cargo fmt --check`; `cargo xtask
+  observe extract/validate/names/analyze` on the trace above;
+  `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/custom-run/libcbench-minimal2-1batch-futextrace-serial.txt
+  --all --brief` found no trap lines. **Next step:** use this richer trace on
+  the longer pthread slices to separate wake-delivery latency from scheduler
+  fairness cost. **Blocker:** none for the tracing surface; pthread lifecycle
+  speed remains the optimization target.
+
+- 2026-05-27 **Private observe trace on/off syscalls and bracketed custom-run traces.**
+  Added `NR_TX_OBSERVE_TRACE_ON = 334` and
+  `NR_TX_OBSERVE_TRACE_OFF = 335` beside the existing private
+  `NR_TX_OBSERVE_BEGIN = 333`. Syscall `334` enables `tx-observe`, clears the
+  current hart ring, and disables threshold dumping so a guest benchmark can
+  start a clean trace window. Syscall `335` disables further emission and
+  requests the registered one-shot dump path, so the trace is dumped after the
+  benchmark finishes instead of cutting off at a record threshold. Added
+  `tx_observe::is_enabled()` and `tx_observe::request_dump()` as small internal
+  helpers for that control surface. Extended `tools/oscomp-custom-run.py` with
+  `--observe-bracket`, which wraps the selected rebuilt libc-bench `RUN(...)`
+  calls with `syscall(334)` / `syscall(335)` while keeping the older
+  `syscall(333, threshold)` mode available for threshold-trigger traces.
+  **Verified:** red tests first failed on the missing 334/335 constants and
+  `tx_observe::is_enabled`; then `python3 tools/tests/test_oscomp_custom_run.py`;
+  `cargo test -p tx-shims tx_observe -- --nocapture`; `cargo fmt --check`;
+  `cargo xtask build --target rv64-qemu`; bracketed custom run
+  `python3 tools/oscomp-custom-run.py --libcbench --libcbench-only
+  pthread-minimal2 --libcbench-outer-repeat 1 --observe-bracket --run
+  --skip-build --serial
+  target/oscomp/custom-run/libcbench-minimal2-1batch-bracket-serial.txt
+  --timeout 90 --fault-decode` printed `time: 1.030657000`, emitted
+  `TXTRACE-BEGIN/END`, and had no trap lines; `cargo xtask observe
+  extract/validate/analyze` on
+  `target/oscomp/custom-run/libcbench-minimal2-1batch-bracket.txtrace`
+  reported `4096 records, 0 framing errors`. **Next step:** use
+  `--observe-bracket` for full-batch pthread traces where threshold mode stops
+  too early. **Blocker:** none for the trace-control surface; benchmark
+  performance attribution remains the active follow-up.
+
+- 2026-05-27 **Custom OSComp ELF/image runner and tailored libc-bench slices.**
+  Added `tools/oscomp-custom-run.py`, a standalone RV64 helper that compiles a
+  C source or accepts an existing ELF, builds a private ext4 sdcard under
+  `target/oscomp/custom-run/`, injects BusyBox plus a generated test script,
+  and can boot the kernel through `make oscomp-qemu-rv64` with private
+  `OSCOMP_DATA`/serial paths. The generic path uses the known `basic-musl`
+  script slot so no kernel dispatch change is needed. The libc-bench path
+  copies `external/libc-bench`, injects `syscall(333, threshold)` before the
+  selected pthread benchmark window, builds with the local `zig cc -target
+  riscv64-linux-musl` cross path, and supports focused slices:
+  `pthread`, `pthread-serial1`, `pthread-serial2`, and
+  `pthread-create-serial1`. Kept the guest probe threshold separate from the
+  optional boot/script-level observe threshold to avoid tracing malloc/setup
+  by accident. **Verified:** `python3 tools/tests/test_oscomp_custom_run.py`;
+  `python3 tools/oscomp-custom-run.py --help`; generic hello image build with
+  `zig cc`; private hello QEMU run printed `hello world`, `custom-run:status:0`,
+  and `userspace:exited:0`; `cargo xtask oscomp submit --target rv64-qemu`;
+  tailored `pthread-serial1` run emitted `TXTRACE-BEGIN` from the injected
+  syscall and `cargo xtask observe extract/validate --file
+  target/oscomp/custom-run/libcbench-serial1.txtrace` reported `4096 records,
+  0 framing errors`; `cargo xtask observe analyze --file
+  target/oscomp/custom-run/libcbench-serial1.txtrace` produced the pthread
+  syscall timing summary. **Next step:** use the narrow slices for scheduler
+  and futex attribution, and prefer a contest-matching libc-bench toolchain
+  when comparing absolute benchmark times. **Blocker:** the locally rebuilt
+  Zig/musl full libc-bench is not timing-equivalent to the OSComp prebuilt
+  binary (`b_malloc_sparse` exceeded the previous full-image envelope), so full
+  score comparisons should still use the official image binary.
+
+- 2026-05-27 **Private observe-begin syscall for phase-local traces.**
+  Added `NR_TX_OBSERVE_BEGIN = 333` in the local txKernel private-debug
+  syscall range between the wired Linux generic `statx`/`pidfd` numbers. The
+  syscall takes `a0 = threshold`, rejects zero with `EINVAL`, enables
+  `tx-observe`, clears the current hart ring, and arms
+  `tx_observe::reset_ring_and_arm(threshold)`. This gives guest-side benchmark
+  probes a precise way to begin a bounded trace inside a target phase, e.g.
+  before `b_pthread_createjoin_serial1`, instead of relying on boot- or
+  suite-level thresholds that include malloc/setup noise. **Verified:** red
+  test first returned `ENOSYS`; then `cargo test -p tx-shims
+  dispatch_tx_observe_begin -- --nocapture`; `cargo test -p tx-shims
+  dispatch_unknown_nr_returns_neg_enosys -- --nocapture`; `cargo fmt
+  --check`; `cargo xtask build --target rv64-qemu`. **Next step:** add or
+  inject a tiny guest caller (`syscall(333, threshold)`) at the desired
+  libcbench/lmbench phase and rerun `cargo xtask observe extract/validate`.
+  **Blocker:** the full OSComp sdcard's prebuilt `libc-bench` will not call
+  this hook until we rebuild or inject a guest-side helper.
+
+- 2026-05-27 **libcbench lag recheck and pthread trace window.**
+  Fresh full-image `libcbench-musl` observe-off serial
+  `target/oscomp/os_serial_out_rv_libcbench_lag_observe0_20260527.txt` now
+  scores `27.0/27`, reaches `userspace:exited:0`, and has no trap lines.
+  The old first-test stall is not present: `b_malloc_sparse` is about
+  `11.144011s` observe-off (`11.760061s` in the 30k trace run, `13.178346s`
+  in the 50k observe-on full run), while the remaining lag is bounded thread
+  lifecycle throughput: observe-off `b_pthread_createjoin_serial1`
+  `34.589334s`, `b_pthread_createjoin_serial2` `36.884792s`, and
+  `b_pthread_create_serial1` `48.289220s`. Made
+  `libcbench_testcode.sh` honor `tx.oscomp.observe_threshold=N`, matching the
+  lmbench debug knob, then captured
+  `target/oscomp/libcbench_lag_trace30k_20260527.txtrace` from
+  `target/oscomp/os_serial_out_rv_libcbench_lag_trace30k_20260527.txt`
+  (`16384` records, `0` framing errors). The trace fires just after entering
+  `b_pthread_createjoin_serial1`: the largest spans are benchmark-parent
+  `wait4` calls waiting for forked bench children, while the pthread slice
+  shows `sys_clone` at `48` spans averaging about `8.6ms` and `sys_futex` at
+  `179` spans averaging about `4.9ms` with a few `50-310ms` wake/wait
+  outliers. A 50k threshold run completed the whole suite green without a
+  trace dump, proving total emitted observe volume stayed below that bound.
+  **Verified:** `cargo fmt --check`; `cargo test -p tx-kernel
+  oscomp_bench_observe_threshold_accepts_positive_cmdline_value --
+  --nocapture`; `cargo xtask build --target rv64-qemu`; `cargo xtask oscomp
+  submit --target rv64-qemu`; `python3 tools/oscomp-judge.py` on observe-off,
+  30k, and 50k libcbench serials; `cargo xtask observe extract/validate`;
+  `cargo xtask observe names`; `cargo xtask observe analyze`; `cargo xtask
+  fault-decode --target rv64-qemu --serial ... --all --brief` found no trap
+  lines. **Next step:** if we optimize libcbench further, target the
+  thread-create path (`clone` setup, exit wake, futex join) with a trace window
+  that starts inside `b_pthread_createjoin_serial1`, not malloc or the bench
+  harness `wait4`. **Blocker:** no functional blocker remains for libcbench;
+  the lag is performance-only and concentrated in pthread lifecycle cost.
+
+- 2026-05-27 **Lmbench syscall round-trip bottleneck split and AST fast path.**
+  Added targeted `tx-observe` round-trip markers for the repeated `getppid`
+  lmbench window plus `cargo xtask observe analyze` round-trip delta reporting.
+  Fresh bounded traces
+  `target/oscomp/lmbench_roundtrip2_20260527.txtrace` and
+  `target/oscomp/lmbench_astfast_20260527.txtrace` both validate with `16384`
+  records and `0` framing errors. The split showed the tight syscall body is
+  still small (`sys_getppid` about `70us`), while the steady-state overhead was
+  dominated by `run_thread` entry/dispatch work: pre-fix `ast_dispatch` was
+  about `102us` median even with no pending signal; `SyscallCtx::new`/credential
+  snapshot remains about `61us` median. Fixed the first confirmed source by
+  making `ast_check` return `Continue` directly when the thread's denormalised
+  interrupt summary has no termination, deliverable signal, or stop request.
+  Post-fix trace shows `debug.thread.ast.before -> debug.thread.ast.after`
+  dropped to about `29us` median under instrumentation. Observe-off lmbench
+  latency moved in the expected direction before the run was manually stopped:
+  `Simple syscall 407.1462us`, `Simple read 739.8488us`, `Simple write
+  751.3708us`, `Simple stat 1880.8919us`, `Simple fstat 631.7280us`, `Simple
+  open/close 2638.6447us`, and `Select on 100 fd's 3697.8925us` versus the
+  prior roughly `630us/993us/1050us/2743us/874us/4043us/5258us` early-latency
+  profile. **Verified:** `cargo fmt --check`; `cargo test -p tx-subsystems
+  ast_dispatch -- --nocapture`; `cargo xtask build --target rv64-qemu`; `cargo
+  xtask oscomp submit --target rv64-qemu`; bounded lmbench observe traces;
+  observe-off lmbench early-latency sample; `cargo xtask fault-decode --target
+  rv64-qemu --serial target/oscomp/os_serial_out_rv_lmbench_astfast_20260527.txt
+  --all --brief` and the observe-off serial both found no trap lines. **Next
+  step:** attack the remaining per-syscall overhead in `SyscallCtx::new`
+  (credential snapshot/cap cloning) and the reactor/userspace-wait handoff, then
+  rerun a longer observe-off lmbench sample past process and bandwidth sections.
+  **Blocker:** full lmbench still runs slowly; this slice improves the latency
+  baseline but does not yet make the full suite comfortable.
+
+- 2026-05-27 **Lmbench tiny-wrapper exec unblock.**
+  Root-caused the `/tmp/hello: Exec format error` blocker with a gated
+  `tx.oscomp.groups=lmbench-probe` guest probe. BusyBox `cp` was byte-perfect:
+  `hello` and `/tmp/hello` were both 51-byte wrapper scripts containing
+  `/code/lmbench_src/bin/build/lmbench_all hello "$@"`. The full local OSComp
+  image has the real multiplexer at `/musl/musl/lmbench_all` but no `/code`
+  path, and the exec loader rejected sub-64-byte non-ELF files before reaching
+  the no-shebang `/bin/sh` fallback. Fixed both sides: the OSComp sdcard mount
+  path now publishes `/code/lmbench_src/bin/build/lmbench_all` as a rootfs
+  symlink to `/musl/musl/lmbench_all`, and `exec_script` now reads short
+  non-empty files so tiny non-ELF wrapper scripts can fall through to the
+  shell fallback instead of returning `ENOEXEC` at the ELF64 minimum-header
+  gate. Fresh probe log
+  `target/oscomp/os_serial_out_rv_lmbench_probe_execfix_20260527.txt` shows
+  explicit `sh /tmp/hello` and direct `/tmp/hello` both print `Hello world`
+  with `exec-status:0`. A real `lmbench-musl` observe-off run advanced through
+  `Process fork+/bin/sh -c: 423127.3333 microseconds`, file write bandwidth,
+  pagefaults, and the file-latency table into `Bandwidth measurements`; it was
+  manually stopped there to avoid spending the session on the slow full tail.
+  **Verified:** `cargo fmt --check`; `cargo test -p tx-shims
+  dispatch_execve_short_non_elf_non_shebang_falls_back_to_bin_sh --
+  --nocapture`; `cargo test -p tx-kernel
+  append_lmbench_probe_builds_copy_integrity_probe -- --nocapture`; `cargo
+  xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu`; bounded `lmbench-probe`; partial full-image `lmbench-musl`;
+  `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_lmbench_execfix_20260527.txt --all --brief`
+  found no trap lines. **Next step:** use low-overhead `tx-observe` timing
+  around trap entry, syscall dispatch start, return writeback, and
+  enter-userspace to attack the remaining performance problem (`getppid`
+  hundreds of microseconds; read/write around 1ms; process-shell around
+  423ms). **Blocker:** lmbench is now functionally past the process-shell
+  wrapper failure, but runtime is still far too slow to complete the full
+  bandwidth/context-switch tail comfortably.
+
+- 2026-05-26 **Lmbench observe analyzer and early latency attribution.**
+  Added BusyBox applet aliases in the OSComp sdcard mount path (`/bin/cp`,
+  `/bin/rm`, `/bin/expr`, `/bin/date`, and other bare utilities used by
+  upstream lmbench) so `PATH=/bin:/musl/glibc:/musl/musl` can resolve
+  lmbench's `cp hello /tmp/hello` command. This changes the proc-test symptom
+  from `cp: not found` / `/tmp/hello: not found` to `/tmp/hello: Exec format
+  error`, which proves the alias reaches BusyBox but leaves a separate
+  tmpfs-copy or exec-loader integrity issue for the copied `hello` binary.
+  Added `tx.oscomp.observe_threshold=N` so lmbench windows can be moved past
+  the default 5k startup trace, and added `cargo xtask observe analyze`
+  backed by `tools/tx-observe-analyze.py` to summarize replay NDJSON by span
+  totals, slowest spans, inter-record gaps, and debug-counter histograms.
+  Fresh traces:
+  `target/oscomp/lmbench_appaliases_5k_20260526.txtrace` (`4096` records) and
+  `target/oscomp/lmbench_appaliases_25k_20260526.txtrace` (`16384` records),
+  both with `0` framing errors. The 25k timing window shows the syscall body
+  for `getppid(173)` is not the main cost (`194` spans, average `75.6us`);
+  the large cost is outside the syscall body: `debug.trap.syscall -> SpanBegin`
+  averages about `254us` for repeated `getppid`, and syscall return to the
+  next trap averages about `294us`. The dominant long gaps are
+  `debug.trap.timer_user` at repeated userspace PCs, matching lmbench's
+  `benchmp`/`lib_timing` calibration loops rather than a blocked kernel
+  syscall. **Verified:** `cargo fmt --check`; `cargo test -p tx-kernel
+  oscomp_bench_observe -- --nocapture`; `cargo xtask build --target
+  rv64-qemu`; `cargo xtask oscomp submit --target rv64-qemu`; bounded
+  lmbench observe runs at 5k and 25k; `cargo xtask observe extract/validate`;
+  `cargo xtask observe names`; `cargo xtask observe analyze`; `cargo xtask
+  fault-decode --target rv64-qemu --serial ... --all --brief` found no trap
+  lines. **Next step:** trace the trap handoff/return-to-user boundary with
+  lower-overhead counters (or a targeted host model) to separate real
+  non-observe trap cost from observation overhead, and debug why BusyBox `cp`
+  produces an exec-format `/tmp/hello`. **Blocker:** lmbench still does not
+  complete; the current blocker is syscall round-trip/handoff cost plus the
+  copied-hello integrity issue before the bandwidth tail can be trusted.
+
+- 2026-05-26 **libcbench scheduler cleanup and lmbench bandwidth split.**
+  Kept the scheduler fix that classifies userspace timer-preempted pending
+  polls as `UserspaceTrap`, so remaining-budget userspace tasks requeue behind
+  peers instead of immediately dominating the local front. Trimmed the temporary
+  `thread_future` signal/timer/page-fault syscall serial probes and the
+  `tx-shims` `pselect_detail` probe after the trace established the handoff
+  behavior. Fresh full-image RV64 `libcbench-musl` evidence in
+  `target/oscomp/os_serial_out_rv_libcbench_schedfix_clean_20260526.txt`
+  scores `27.0/27`, reaches `userspace:exited:0`, and has no trap lines; key
+  timings include `b_malloc_sparse 12.495603s`,
+  `b_pthread_createjoin_serial1 46.732827s`,
+  `b_pthread_createjoin_serial2 38.708595s`, and
+  `b_pthread_create_serial1 53.532471s`. `lmbench-musl` with observe enabled
+  intentionally dumped early at the 5k trace threshold; extracted
+  `target/oscomp/lmbench_schedfix_clean_20260526.txtrace` validates as
+  `4096 records, 0 framing errors` and shows repeated successful syscalls, not
+  a scheduler stop. With `tx.oscomp.observe=0`, saved
+  `target/oscomp/os_serial_out_rv_lmbench_observe_off_20260526.txt` advanced
+  through latency, pipe latency, fork, pagefault, mmap, and filesystem latency
+  to `Bandwidth measurements`, then was manually stopped after a long
+  CPU-bound quiet period in the first bandwidth stage; partial score is
+  `23.845335410411753/36`, no trap lines. Notable environment gap:
+  `lmbench_testcode.sh` calls `cp hello /tmp/hello`, but `cp` is not found, so
+  the fork+/bin/sh case prints repeated `/tmp/hello: not found` despite still
+  receiving partial judge credit. **Verified:** `cargo fmt --check`; `git diff
+  --check`; `cargo test -p tx-shims pselect -- --nocapture`; `cargo test -p
+  tx-kernel successful_clone_return_needs_child_publish_handoff --
+  --nocapture`; `cargo test -p tx-reactor
+  userspace_thread_trap_with_budget_yields_to_new_peers -- --nocapture`;
+  `cargo test -p tx-reactor
+  userspace_thread_normal_wake_with_budget_queues_behind_preempted_peers --
+  --nocapture`; `cargo xtask build --target rv64-qemu`; full-image
+  `libcbench-musl` and partial `lmbench-musl` runs above; `cargo xtask
+  fault-decode --target rv64-qemu --serial ... --all --brief` (no trap lines
+  for both saved logs). **Next step:** focus `lmbench` on `bw_pipe -P
+  $SYNC_MAX` with observe around pipe read/write wake/resume, and decide
+  whether to provide a `/bin/cp`/busybox `cp` alias before scoring the
+  fork+/bin/sh case. **Blocker:** `lmbench-musl` now reaches bandwidth
+  measurement, but does not complete the bandwidth/context-switch tail in a
+  reasonable bounded run.
+
+- 2026-05-26 **Wait-source coexistence registration sweep.**
+  While validating the persistent recipe-tree patch through the full
+  `tx-subsystems` suite, the first red tests exposed a broader D2
+  coexistence drift: several notification constructors minted a shared
+  `source_id` and v3 `WaitSource` but did not register the paired legacy
+  `Channel` under the same id. That made `YieldShape::OnWaitSource` look
+  valid to the v3 registry while the legacy `wait_source` resolver returned
+  `None`, causing futex/process/TTY wait-source invariant tests to fail and
+  poison later global-lock tests. Fixed the shared constructor contract across
+  futex, process exit sources, eventfd, pipe, signalfd, timerfd, TTY,
+  userfaultfd, VFS, SysV msg, and SysV sem; release paths that own teardown now
+  unregister both the legacy channel and v3 source. **Verified:** `cargo test
+  -p tx-subsystems futex_step_wait_observes_match_returns_blocked_with_source_id
+  -- --nocapture --test-threads=1`; `cargo test -p tx-subsystems
+  futex_step_wake_fires_channel_observed_by_waiter -- --nocapture
+  --test-threads=1`; `cargo test -p tx-subsystems process::tests::exit_source
+  -- --nocapture --test-threads=1`; `cargo test -p tx-subsystems
+  --test v3_tty_waitsource -- --nocapture`; `cargo test -p tx-subsystems
+  --test v3_pipe_waitsource -- --nocapture`; `cargo test -p tx-subsystems --
+  --test-threads=1` (`772 passed, 11 ignored` in lib plus all integration tests
+  green). **Next step:** keep this as the named wait-source construction
+  contract when adding new notification points. **Blocker:** none for host
+  wait-source registration.
+
+- 2026-05-26 **RangeLock async wait bridge restored.**
+  Fixed the VM async `RangeLock` wait path that was spinning inside a single
+  poll when `acquire_step` yielded. `await_range_lock()` now resolves the
+  `WaitToken` through the shared `wait_source` compatibility registry and
+  awaits the registered channel; `RangeLock` wait-point creation registers its
+  already-minted notification source id under the same legacy channel id, and
+  releases unregister both surfaces. This keeps `YieldShape::OnWaitSource`
+  and `WaitToken(source_id)` aligned during the legacy/v3 wake coexistence
+  window. A stale `try_brk` recipe-count assertion was updated to the current
+  coalesced brk contract. **Verified:** `cargo test -p tx-subsystems --lib
+  writer_conflict -- --nocapture`; `cargo test -p tx-subsystems --lib
+  range_lock_release_fires_registered_channel_for_external_subscribers --
+  --nocapture`; `cargo test -p tx-subsystems --lib
+  wait_source_can_register_already_minted_notification_id -- --nocapture`;
+  `cargo test -p tx-subsystems --lib
+  try_brk_many_unaligned_grows_map_requested_pages -- --nocapture`; `timeout
+  90s cargo test -p tx-subsystems --lib vm -- --nocapture --test-threads=1`
+  (`117 passed`). **Next step:** rerun the RV64 build and then refresh
+  libcbench/lmbench guest evidence if no cleanup gate regresses. **Blocker:**
+  none for the host VM async wait spin.
+
+- 2026-05-26 **Post-RangeLock OSComp refresh.**
+  Rebuilt RV64 and reran the benchmark pair on the explicit full image.
+  `libcbench-musl` remains green in
+  `target/oscomp/os_serial_out_rv_libcbench_rangelock_full_20260526.txt`:
+  `python3 tools/oscomp-judge.py ... target/oscomp/testdata` scored
+  `27.0/27`, the run reached `userspace:exited:0`, and fault-decode found no
+  trap lines. Key timings from that log: `b_malloc_sparse 11.786165s`,
+  `b_malloc_bubble 6.681026s`, `b_pthread_createjoin_serial1 40.034754s`,
+  `b_pthread_createjoin_serial2 74.338041s`, and
+  `b_pthread_create_serial1 52.618631s`. The paired `lmbench-musl` run first
+  hit the observe dump threshold in
+  `target/oscomp/os_serial_out_rv_lmbench_rangelock_full_20260526.txt`; rerun
+  with `tx.oscomp.observe=0` saved
+  `target/oscomp/os_serial_out_rv_lmbench_noobserve_full_20260526.txt` and
+  timed out at the 620s host bound with score `0.0/36`. It gets through boot,
+  `/var/tmp` setup, and the `latency measurements` banner, then enters the
+  first `lat_syscall -P $SYNC_MAX null` benchmp worker path. The last sampled
+  shape is repeated handled page faults at `0x407d1a60`
+  (`page_fault:enter/done` through 5632) with no `Simple syscall` result line
+  and no trap lines. **Verified:** `cargo xtask build --target rv64-qemu`;
+  saved full-image QEMU runs above; `python3 tools/oscomp-judge.py` for both
+  logs; `cargo xtask fault-decode --target rv64-qemu --serial ... --all
+  --brief` for both logs. **Next step:** instrument the page-fault boundary
+  for access kind, existing PTE state, and recipe/protection at `0x407d1a60`
+  during `lat_syscall null`, or build a tiny image/script override that runs
+  just `lat_syscall -P $SYNC_MAX null` with fixed iterations. **Blocker:**
+  lmbench still times out before its first result line; not trap-shaped.
+
+- 2026-05-26 **VM recipes persistent sharing implementation.**
+  Replaced the VM recipe index's whole-tree `BTreeMap` copy-on-write staging
+  with a structurally shared immutable tree published through the existing
+  EBR `AtomicPtr` root. `mmap`/`mprotect`/`munmap` localized rewrites now
+  path-copy affected nodes instead of cloning every visible recipe; a focused
+  host regression asserts that 2,048 disjoint recipe publishes touch a bounded
+  path rather than the whole tree. The insert path also coalesces adjacent
+  compatible anonymous ranges when private-page-set ownership can be preserved,
+  restoring the brk contract that page-at-a-time heap growth remains one
+  recipe even after write faults. Fork now uses an explicit shared-root
+  recipe clone and path-copies only child entries whose private CoW metadata
+  must diverge, matching the VM spec's O(1) persistent-tree clone contract for
+  unchanged recipes. Updated `VM_v1_2.md`'s implementation note from the old
+  COW `BTreeMap` staging text to the current persistent sharing surface.
+  **Verified:** `cargo test -p tx-subsystems
+  vm_recipe_disjoint_publish_touches_bounded_path -- --nocapture`; `cargo
+  test -p tx-subsystems fork_aspace_ -- --nocapture`; `cargo
+  test -p tx-subsystems brk_script_ -- --nocapture`; `cargo test -p
+  tx-subsystems vm_address_space_ -- --nocapture`; `cargo test -p
+  tx-subsystems vm_recipe_snapshot_reader_survives_split_rewrite_publication
+  -- --nocapture`; `cargo test -p tx-shims
+  dispatch_mmap_anonymous_private_returns_aligned_user_va -- --nocapture`.
+  Full-image RV64 guest validation:
+  `target/oscomp/os_serial_out_rv_libcbench_persistent_recipe_full_20260526.txt`
+  scores `libcbench-musl 27.0/27`, completes the former blocker
+  `b_pthread_create_serial1` in `40.386393000s`, and advances through the
+  remaining libcbench cases to `userspace:exited:0`; fault-decode found no
+  trap lines. Other key timings: `malloc_sparse 10.800806000s`,
+  `malloc_bubble 6.314206000s`, `pthread_createjoin_serial1 37.920024000s`,
+  and `pthread_createjoin_serial2 36.733827000s`. **Verified:** `cargo test
+  -p tx-subsystems vm_recipe_disjoint_publish_touches_bounded_path --
+  --nocapture`; `cargo test -p tx-subsystems brk_script_ -- --nocapture`;
+  `cargo test -p tx-subsystems vm_address_space_ -- --nocapture`; `cargo
+  test -p tx-subsystems
+  vm_recipe_snapshot_reader_survives_split_rewrite_publication --
+  --nocapture`; `cargo test -p tx-shims
+  dispatch_mmap_anonymous_private_returns_aligned_user_va -- --nocapture`;
+  `cargo fmt --check`; `cargo xtask build --target rv64-qemu`; `cargo xtask
+  oscomp submit --target rv64-qemu --submit target/oscomp/submit`; bounded
+  QEMU run against `target/oscomp/testdata/sdcard-rv-full.img`; `python3
+  tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv_libcbench_persistent_recipe_full_20260526.txt
+  target/oscomp/testdata`; `cargo xtask fault-decode --target rv64-qemu
+  --serial
+  target/oscomp/os_serial_out_rv_libcbench_persistent_recipe_full_20260526.txt
+  --all --brief` reported no trap lines. **Next step:** run lmbench with the
+  same full-image discipline and fix the existing async RangeLock wait-token
+  no-op that makes broad conflict-script host tests spin when filtered through
+  `cargo test -p tx-subsystems vm`. **Blocker:** none for libcbench-musl; the
+  prior `18.0/27` pthread create-only timeout is cleared.
+
+- 2026-05-26 **libcbench guarded-stack private-set laziness.**
+  Reduced another confirmed pthread stack cost without changing Linux ABI:
+  private mappings now allocate a `PrivatePageSet` only when the mapping is
+  writable, and `mprotect` attaches a fresh set to private writable subranges
+  that were split out of a previously set-less `PROT_NONE` mapping. Source
+  review shows this matches musl's guarded pthread stack path: each thread
+  first calls `mmap(PROT_NONE, MAP_PRIVATE|MAP_ANON)`, then
+  `mprotect(map+guard, size-guard, PROT_READ|PROT_WRITE)`. The old path
+  allocated an empty set for the guard mapping and then split that empty set
+  during `mprotect`; the new path leaves guard VMAs set-less while preserving
+  an authoritative set for the writable stack body before any write fault.
+  Fresh full-image RV64 evidence:
+  `target/oscomp/os_serial_out_rv_libcbench_lazypriv_full_20260526.txt` still
+  scores `libcbench-musl 18.0/27`, but improves the pthread joined cases:
+  `b_pthread_createjoin_serial1` from `37.697577000s` in the VM-fastmap run
+  to `31.489840000s`, and `b_pthread_createjoin_serial2` from
+  `80.118798000s` to `74.820649000s`. The run still timed out in
+  `b_pthread_create_serial1`; the tail had balanced progress through
+  `clone:enter/return=6208`, `exit:enter=6208`, and no trap lines, so the
+  remaining blocker is slow per-thread create-only VM/thread lifecycle work,
+  not a lost child. **Verified:** `cargo test -p tx-subsystems
+  vm_private_anon_prot_none_allocates_private_set_only_when_made_writable --
+  --nocapture`; `cargo test -p tx-subsystems
+  vm_address_space_protect_rewrites_only_declared_range -- --nocapture`;
+  `cargo test -p tx-subsystems
+  fault_script_prefaults_adjacent_private_anon_write_pages -- --nocapture`;
+  `cargo test -p tx-shims dispatch_mprotect_flips_existing_mapping_protection
+  -- --nocapture`; `cargo fmt --check`; `cargo xtask build --target
+  rv64-qemu`; `cargo xtask oscomp submit --target rv64-qemu --submit
+  target/oscomp/submit`; bounded QEMU run against
+  `target/oscomp/testdata/sdcard-rv-full.img`; `python3
+  tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv_libcbench_lazypriv_full_20260526.txt
+  target/oscomp/testdata`; `cargo xtask fault-decode --target rv64-qemu
+  --serial target/oscomp/os_serial_out_rv_libcbench_lazypriv_full_20260526.txt
+  --all --brief` found no trap lines. **Next step:** attack the remaining
+  O(n) recipe-tree publication/stat recomputation for thousands of live
+  unjoined stack VMAs, or add a narrower recipe publication counter around
+  `commit_map`/`protect` to quantify clone entries per syscall. **Blocker:**
+  create-only pthread churn still does not finish inside the bounded guest
+  run.
+
+- 2026-05-26 **libcbench pthread stack-map fast path.**
+  Followed the create-only pthread blocker into the benchmark and libc
+  sources. `external/libc-bench/pthread.c` confirms
+  `b_pthread_create_serial1` creates 2,500 joinable threads with 16 KiB
+  stacks and does not join them, while musl's pthread create path maps a
+  guarded stack with `mmap(PROT_NONE)` and then `mprotect(..., RW)` for each
+  thread. Added a synchronous syscall fast path for uncontended `mmap` and
+  `mprotect`, plus an `AddressSpace` hint so `MAP_ANONYMOUS`/`Anywhere`
+  allocation continues searching from the previous successful mapping instead
+  of rescanning from the bottom as stack VMAs accumulate. Kept a bounded
+  `tx-observe` recipe-size tracker (`debug.vm.recipe.*`) for the remaining
+  recipe-index cost without making the syscall functions platform-generic.
+  Fresh full-image RV64 evidence:
+  `target/oscomp/os_serial_out_rv_libcbench_vmfastmap_full_20260526.txt`
+  still scores `libcbench-musl 18.0/27` and times out in
+  `b_pthread_create_serial1`, but `b_pthread_createjoin_serial2` improved from
+  `89.019323000s` in the private-anon-prefault run to `80.118798000s`;
+  malloc stayed at the improved scale (`sparse 11.205335000s`, `bubble
+  9.352650000s`), and fault-decode found no trap lines. **Verified:** `cargo
+  test -p tx-shims dispatch_mmap_anonymous_private_returns_aligned_user_va --
+  --nocapture`; `cargo test -p tx-shims
+  dispatch_mprotect_flips_existing_mapping_protection -- --nocapture`; `cargo
+  test -p tx-subsystems
+  vm_try_mmap_anywhere_continues_from_recent_success_hint -- --nocapture`.
+  **Next step:** use the recipe-size tracker to quantify `RecipeIndex`
+  publication/search cost in the 2,500 unjoined-stack case; a likely structural
+  follow-up is making the recipe index less clone-heavy for append-like stack
+  mappings. **Blocker:** this is a partial throughput win only; create-only
+  pthread churn still exceeds the bounded guest window.
+
+- 2026-05-26 **libcbench malloc sparse private-anon prefault.**
+  Followed up the malloc regression with source-level evidence from
+  `external/libc-bench/malloc.c`: `b_malloc_sparse`/`bubble` allocate 10,000
+  4000-byte chunks and immediately `memset` them, so after the brk soft-cap
+  moves oldmalloc onto anonymous mmap arenas the remaining cost is first-touch
+  private-anon fault throughput rather than a malloc hang. Added a bounded VM
+  optimization in `AddressSpace::fault_script`: after two sequential write
+  faults prove a large private-anon VMA is being touched linearly, the fault
+  path opportunistically materializes up to 16 adjacent pages in the same VMA.
+  The first page remains lazy and the batch only applies to large VMAs
+  (`>= 256 * USER_PAGE_SIZE`) to avoid oldmalloc's direct large-allocation
+  metadata path. A broader mprotect-add-permission experiment was tested and
+  backed out after a full-image run worsened `b_pthread_createjoin_serial2`
+  (`108.402902000s`) and did not improve malloc enough to justify the semantic
+  surface. Fresh full-image RV64 evidence:
+  `target/oscomp/os_serial_out_rv_libcbench_prefault16_seq_full_20260526.txt`
+  has `user-segv count 0`, no trap lines, and scores `libcbench-musl 18.0/27`.
+  Malloc timings improved to `sparse 11.334866000s`, `bubble 11.284619000s`,
+  while direct large allocations stayed near the prior good scale
+  (`big1 2.171562000s`, `big2 1.872334000s`). Pthread remains the suite
+  blocker: `serial1 37.561533000s`, `serial2 89.019323000s`, then the bounded
+  run times out in `b_pthread_create_serial1` with balanced clone/exit counts.
+  **Verified:** `cargo test -p tx-subsystems
+  fault_script_prefaults_adjacent_private_anon_write_pages -- --nocapture`;
+  `cargo test -p tx-subsystems fault_materialization -- --nocapture`; `cargo
+  test -p tx-subsystems vm_aspace_reserve_user_range_for_access_ --
+  --nocapture`; `cargo test -p tx-kernel
+  successful_clone_return_needs_child_publish_handoff -- --nocapture`; `cargo
+  test -p tx-shims dispatch_mprotect_flips_existing_mapping_protection --
+  --nocapture`; `cargo xtask build --target rv64-qemu`; `cargo xtask oscomp
+  submit --target rv64-qemu --submit target/oscomp/submit`; bounded full-image
+  QEMU log named above; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv_libcbench_prefault16_seq_full_20260526.txt
+  target/oscomp/testdata` (`18.0/27`); `cargo xtask fault-decode --target
+  rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_libcbench_prefault16_seq_full_20260526.txt
+  --all --brief` found no trap lines. **Next step:** continue from
+  `b_pthread_create_serial1`; source review says it is 2,500 create-only
+  joinable threads with 16 KiB stacks, so the likely hot surface is thread
+  stack mmap/mprotect plus scheduler lifecycle throughput, not malloc.
+  **Blocker:** libcbench score remains 18/27 because the run still times out
+  before `b_pthread_uselesslock`.
+
+- 2026-05-26 **libcbench malloc soft-cap without hidden brk capacity.**
+  Completed the malloc-floor pass by keeping the synchronous `sys_brk` fast
+  path but adding a bounded linear-heap policy: growth past
+  `64 * USER_PAGE_SIZE` returns the unchanged current break, which makes
+  OSComp's old musl allocator switch to its exponential `mmap` fallback after
+  preserving small `sbrk`/`brk` compatibility. A first version combined this
+  with hidden batched brk recipe capacity, but a longer full-image run proved
+  that was semantically wrong: later string benchmark children could receive
+  low anonymous `mmap` addresses inside the hidden brk-capacity band and hit
+  `user-segv:pf:err=no-recipe` at `addr=0x2d018`. The final version removes
+  the hidden capacity and its page-fault guard, so `try_brk` maps only the
+  committed range it reports to userspace. Fresh full-image RV64 evidence:
+  `target/oscomp/os_serial_out_rv_libcbench_brksoftcap_exactbrk_full_20260526.txt`
+  has `user-segv count 0`, passes all malloc and string cases, and scores
+  `libcbench-musl 18.0/27`. Malloc timings are now near the forced-brk-failure
+  diagnostic shape (`sparse 17.013145000s`, `bubble 15.325003000s`,
+  `big1 2.170919000s`, `big2 1.843130000s`) with only sampled
+  `bench:brk:enter=384` rather than the earlier roughly 23k brk calls. The
+  remaining blocker is back to pthread throughput:
+  `b_pthread_createjoin_serial2` completes in `91.124164000s`, and the
+  bounded run times out in `b_pthread_create_serial1` with continuing
+  clone/futex churn. **Verified:** `cargo test -p tx-shims dispatch_brk --
+  --nocapture`; `cargo test -p tx-subsystems try_brk_ -- --nocapture`;
+  `cargo test -p tx-subsystems
+  brk_script_many_unaligned_grows_with_faults_do_not_block -- --nocapture`;
+  `cargo xtask build --target rv64-qemu`; `cargo xtask oscomp submit --target
+  rv64-qemu --submit target/oscomp/submit`; bounded full-image QEMU log named
+  above; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv_libcbench_brksoftcap_exactbrk_full_20260526.txt
+  target/oscomp/testdata` (`18.0/27`); `cargo xtask fault-decode --target
+  rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_libcbench_brksoftcap_exactbrk_full_20260526.txt
+  --all --brief` found no trap lines. **Next step:** continue the pthread lane
+  at `b_pthread_create_serial1`/thread lifecycle throughput; malloc is no
+  longer the first libcbench blocker. **Blocker:** libcbench still cannot
+  complete within the bounded window because create-only pthread churn remains
+  slow.
+
+- 2026-05-26 **libcbench exact futex wake bounding.** Implemented the
+  confirmed futex half of the pthread scheduler plan: `FUTEX_WAKE(n=1)` on an
+  exact futex wait source now publishes to at most one v3 mailbox subscriber
+  instead of broadcasting every exact waiter. The semantic exact waiter table
+  still owns the syscall-visible wake count, so a wake racing ahead of mailbox
+  registration can keep using the wait-source pending-mask path. Added
+  `WaitSource::notify_limit` coverage in `tx-substrate` and a focused futex
+  unit test with three exact waiters proving two `step_futex_wake_in(..., 1)`
+  calls deliver one mailbox event at a time while leaving the remaining waiter
+  count intact. Fresh full-image RV64 evidence:
+  `target/oscomp/os_serial_out_rv_libcbench_boundedwake_full_20260526.txt`
+  still scores `libcbench-musl 18.0/27` and times out at 420s in
+  `b_pthread_create_serial1`, but `b_pthread_createjoin_serial2` now completes
+  (`150.894042000s`, down from the earlier `188.717752000s` sample), and the
+  sampled `uaddr=0x2c258,val=2525` wait storm drops from roughly 52k to 10k
+  before advancing to create-only churn (`uaddr=0x2c258,val=5026`). `malloc`
+  sparse/bubble remain slow (`38.897176000s` / `30.583607000s`) and are a
+  separate blocker from the exact futex broadcast fix. **Verified:** `cargo
+  test -p tx-substrate --lib
+  notify_limit_posts_at_most_requested_matching_subscribers -- --nocapture`;
+  `cargo test -p tx-subsystems
+  step_futex_wake_in_limits_exact_wait_source_posts -- --nocapture`; `cargo
+  test -p tx-subsystems step_futex_ -- --nocapture`; `cargo test -p tx-kernel
+  successful_clone_return_needs_child_publish_handoff -- --nocapture`; `cargo
+  test -p tx-subsystems
+  repeated_clone_thread_and_exit_keeps_process_roster_consistent --
+  --nocapture`; `cargo test -p tx-subsystems
+  ordinary_thread_exit_decrements_live_thread_count -- --nocapture`; `cargo
+  test -p tx-reactor
+  userspace_thread_normal_wake_with_budget_queues_behind_preempted_peers --
+  --nocapture`; `cargo fmt --check`; `git diff --check`; `cargo xtask build
+  --target rv64-qemu`; `cargo xtask oscomp submit --target rv64-qemu --submit
+  target/oscomp/submit`; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv_libcbench_boundedwake_full_20260526.txt
+  target/oscomp/testdata` (`18.0/27`); `cargo xtask fault-decode --target
+  rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_libcbench_boundedwake_full_20260526.txt --all
+  --brief` (`no scause/sepc/stval trap lines found`). **Next step:** chase
+  `b_pthread_create_serial1` as create-only thread-list-lock contention and
+  keep the malloc sparse/bubble regression separate; likely surfaces are
+  scheduler fairness around clone/exit and stack mmap/munmap cost, not a
+  process-roster loss. **Blocker:** libcbench still stops before
+  `b_pthread_uselesslock`; exact futex broadcast is reduced but overall pthread
+  throughput remains too slow.
+
+- 2026-05-26 **libcbench pthread process-roster audit.** Audited the
+  `clone(CLONE_THREAD)` process path for the suspected "lost child" failure.
+  `step_clone_thread` allocates/registers a tid, seeds the child context,
+  attaches the child to `ProcessPayload.threads`, and increments
+  `thread_count`; `step_thread_exit` removes that same tid from the process
+  roster and decrements `thread_count` before the last-thread cascade. Added a
+  focused host regression,
+  `repeated_clone_thread_and_exit_keeps_process_roster_consistent`, covering
+  128 pthread-like clone siblings: every fresh clone is findable by tid, every
+  exited sibling disappears from the roster, and the leader remains the sole
+  live thread. Removed the ineffective diagnostic yield-after-`clone` and kept
+  the direct child-submit/fallback path as the current diagnostic fix for the
+  earlier queued-without-drain blocker. Fresh bounded RV64 libcbench evidence
+  saved at
+  `target/oscomp/os_serial_out_rv_libcbench_process_audit_20260526.txt` still
+  times out at 300s in `b_pthread_createjoin_serial2`, but `clone:return`,
+  `child_submit:submitted/direct`, `run_thread:start`, and `exit:enter` keep
+  advancing together through the tail (`clone:return=4752`,
+  `exit:enter=4720`, `futex:return=7168`), so the current signature is not a
+  lost process child; it is slow pthread lifecycle/futex throughput. **Verified:**
+  `cargo test -p tx-subsystems
+  repeated_clone_thread_and_exit_keeps_process_roster_consistent --
+  --nocapture`; `cargo test -p tx-subsystems
+  ordinary_thread_exit_decrements_live_thread_count -- --nocapture`;
+  `cargo test -p tx-reactor
+  userspace_thread_normal_wake_with_budget_queues_behind_preempted_peers --
+  --nocapture`; `cargo fmt --check`; `git diff --check`; `cargo xtask build
+  --target rv64-qemu`; `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv_libcbench_process_audit_20260526.txt
+  target/oscomp/testdata` (`libcbench-musl 17.0/27`); `cargo xtask
+  fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_libcbench_process_audit_20260526.txt --all
+  --brief` (`no scause/sepc/stval trap lines found`). **Next step:** add a
+  low-volume futex operation tracker (WAIT vs WAKE, return value, and whether
+  the address is a clear-child-tid wake) around `b_pthread_createjoin_serial2`
+  to decide whether the remaining cost is futex wake/recheck churn, scheduler
+  fairness, or expensive thread-exit bookkeeping. **Blocker:** no kernel trap
+  and no process-roster loss; pthread throughput remains far above the
+  libcbench source/judge baseline.
+
+- 2026-05-26 **libcbench scheduler ineffectiveness split.** Investigated why
+  the scheduler/wake fixes proved liveness but did not clear pthread
+  throughput. The ineffective spot is the synchronous syscall loop boundary:
+  scheduler placement changes only take effect when `run_thread` returns
+  `Poll::Pending`, but a fast `clone` syscall can store the return value and
+  re-enter userspace in the same poll. That lets the parent issue more clones
+  before the newly runnable child receives a turn. Restored the explicit
+  post-`NR_CLONE` `yield_now().await` as a named scheduling boundary after
+  child publication. Negative experiment: no-oping per-poll timer
+  `set_deadline/cancel_deadline` did not explain the slowdown; the diagnostic
+  log `target/oscomp/os_serial_out_rv_libcbench_notimerdiag_20260526.txt`
+  remained red (`libcbench-musl 17.0/27`) and completed
+  `b_pthread_createjoin_serial1` in `79.174196000s`. With the clone boundary
+  restored, `target/oscomp/os_serial_out_rv_libcbench_cloneboundary_20260526.txt`
+  completed `b_pthread_createjoin_serial1` in `61.980363000s`, improving over
+  the no-boundary `85.475393000s` process-audit run but still timing out in
+  `b_pthread_createjoin_serial2`. The remaining signature in serial2 is futex
+  churn (`futex:return=19200` by only `clone:return=2912`), not missing child
+  submission. **Verified:** `cargo fmt --check`; `cargo test -p tx-reactor
+  userspace_thread_normal_wake_with_budget_queues_behind_preempted_peers --
+  --nocapture`; `cargo xtask build --target rv64-qemu`; bounded RV64 QEMU
+  logs `target/oscomp/os_serial_out_rv_libcbench_notimerdiag_20260526.txt` and
+  `target/oscomp/os_serial_out_rv_libcbench_cloneboundary_20260526.txt`;
+  `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv_libcbench_cloneboundary_20260526.txt
+  target/oscomp/testdata` (`libcbench-musl 17.0/27`); `cargo xtask
+  fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_libcbench_cloneboundary_20260526.txt --all
+  --brief` (`no scause/sepc/stval trap lines found`). **Next step:** trace
+  futex WAIT/WAKE operation kind, address, and return count during
+  `b_pthread_createjoin_serial2`; the scheduler boundary is real but not
+  sufficient because prompt child execution exposes the join futex storm.
+  **Blocker:** synchronous syscall return needs an explicit handoff point for
+  clone storms, and the next throughput wall is futex/join churn.
+
+- 2026-05-25 **libcbench pthread lifecycle blocker split.** Source review of
+  `external/libc-bench/pthread.c` confirms `b_pthread_create_serial1` is only
+  2500 unjoined `pthread_create` calls with 16 KiB stacks, and the OSComp
+  judge baseline is under one second, so multi-minute runtime is not normal
+  benchmark behavior. The latest tracker pass separated two issues. First, the
+  production runtime does not normally use `StopReason::UserspaceTrap` for
+  syscall continuations; it requeues through `PendingPollCommit::Woken`, so
+  userspace threads with remaining budget could still front-run preempted
+  child threads. `task_runnable` now puts normal userspace-thread wakes with
+  remaining budget at the back of `Preempted`, while signal/priority wakes keep
+  the boost behavior. Second, `b_pthread_create_serial1` still showed
+  `child_submit:queued` advancing without `drain/submitted/exit`: clone queued
+  children, but the concurrent hart loop kept polling the parent internally and
+  the boot-loop-only drain seam never ran. A diagnostic direct-submit path now
+  proves that boundary by advancing `child_submit:submitted/direct`, but the
+  next red sample regresses to futex-heavy throughput inside
+  `b_pthread_createjoin_serial2` rather than clearing the suite. **Verified:**
+  `cargo test -p tx-reactor
+  userspace_thread_normal_wake_with_budget_queues_behind_preempted_peers --
+  --nocapture`; `cargo test -p tx-reactor userspace_trap -- --nocapture`;
+  `cargo xtask build --target rv64-qemu`; bounded RV64 QEMU logs
+  `target/oscomp/os_serial_out_rv_libcbench_wakefix_20260525.txt`,
+  `target/oscomp/os_serial_out_rv_libcbench_cloneyield_20260525.txt`, and
+  `target/oscomp/os_serial_out_rv_libcbench_directsubmit_20260525.txt`;
+  `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv_libcbench_directsubmit_20260525.txt
+  target/oscomp/testdata` (`libcbench-musl 17.0/27`);
+  `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_libcbench_directsubmit_20260525.txt --all
+  --brief` (`no scause/sepc/stval trap lines found`). **Next step:** make
+  child submission visible to the concurrent hart loop through a first-class
+  reactor-local drain/hook instead of the boot-loop fallback, then reduce the
+  futex wake storm exposed by immediate child execution. **Blocker:** no trap;
+  pthread benchmark throughput remains red, with direct submit turning the
+  blocker from queued child tasks into excessive futex churn in the joined
+  batch case.
+
+- 2026-05-26 **Reduced libcbench malloc brk churn and separated the remaining
+  floor.** `b_malloc_sparse`/`bubble` are not normal multi-minute tests:
+  `external/libc-bench/malloc.c` does 10,000 `malloc(4000)` plus `memset`.
+  Fresh full-image RV64 runs showed the malloc lane is separate from the
+  pthread/futex blocker: the real run made roughly 23k `brk(214)` calls and
+  28k page faults before pthreads, while a diagnostic "brk growth fails"
+  experiment cut sparse/bubble to about 16-18s without reducing page faults.
+  The production fix now gives `sys_brk` an uncontended synchronous VM fast
+  path, batches internal heap recipe capacity in 64-page chunks, and rejects
+  page faults into batched-but-uncommitted heap capacity at the thread-future
+  fault boundary. Low-volume serial counters remain; the unbounded
+  `debug.*` observe probes around every brk/mremap/syscall loop were removed.
+  Result: `b_malloc_sparse` improved from `40.542046s` in
+  `target/oscomp/os_serial_out_rv_libcbench_malloctrace_full_20260526.txt`
+  to `22.485623s` in
+  `target/oscomp/os_serial_out_rv_libcbench_brkbatch_full_20260526.txt`;
+  `b_malloc_bubble` improved from `33.707025s` to `24.089828s`, and
+  `big1/big2` improved from `10.468581s`/`11.992014s` to
+  `4.535607s`/`4.275624s`. A 256-page batch did not help further, so the
+  safer 64-page batch stayed. **Verified:** red-then-green host tests for
+  `try_brk` batching and the brk-capacity fault guard; `cargo test -p
+  tx-subsystems try_brk_ -- --nocapture`; `cargo test -p tx-subsystems
+  brk_capacity_fault_guard_rejects_pages_beyond_current_break -- --nocapture`;
+  `cargo test -p tx-shims dispatch_brk -- --nocapture`; `cargo test -p
+  tx-kernel successful_clone_return_needs_child_publish_handoff --
+  --nocapture`; `cargo xtask build --target rv64-qemu`; bounded full-image
+  QEMU runs saved as `target/oscomp/os_serial_out_rv_libcbench_brkfast_full_20260526.txt`,
+  `..._brkbatch_full_20260526.txt`, and `..._brkbatch256_full_20260526.txt`;
+  `python3 tools/oscomp-judge.py
+  target/oscomp/os_serial_out_rv_libcbench_brkbatch256_full_20260526.txt
+  target/oscomp/testdata` (`libcbench-musl 9.0/27`, timeout before later
+  cases); `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_libcbench_brkbatch256_full_20260526.txt
+  --all --brief` found no trap lines. **Next step:** attack the remaining
+  floor: page-fault materialization is still about 16-18s for this workload,
+  and the successful-brk path still pays tens of thousands of syscall-boundary
+  observation records. **Blocker:** malloc is faster but still far above the
+  sub-second baseline; no trap lines.
+
+- 2026-05-26 **Classified the remaining libcbench malloc floor.** Added a
+  diagnostic `tx.oscomp.observe=0` cmdline gate that disables producer-side
+  `tx-observe` emission while leaving the low-volume serial `bench:*`
+  counters alive. A same-kernel full-image comparison showed observation
+  record writes are not the primary malloc blocker:
+  `target/oscomp/os_serial_out_rv_libcbench_observecompare_full_20260526.txt`
+  completed sparse/bubble at `24.191591s`/`25.482035s`, while
+  `..._noobserve_full_20260526.txt` was slower at
+  `35.192940s`/`30.687885s`. A separate eager-brk-prefault experiment cut
+  page-fault counters from roughly 30k to 2k, but sparse/bubble/big cases did
+  not improve (`..._brkprefault_full_20260526.txt`, sparse `22.849691s`,
+  bubble `33.846298s`, big1 `12.764180s`), so that optimization was
+  reverted. **Verified:** `cargo test -p tx-observe
+  disabled_observation_hides_current_emitter_without_clearing_ring --
+  --nocapture`; `cargo test -p tx-kernel
+  oscomp_bench_observe_cmdline_flag_defaults_on_and_accepts_off_values --
+  --nocapture`; `cargo test -p tx-subsystems
+  brk_prefault_materializes_requested_pages_without_capacity_tail --
+  --nocapture` during the reverted negative experiment; `cargo test -p
+  tx-shims dispatch_brk -- --nocapture`; bounded full-image QEMU logs named
+  above; `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_libcbench_brkprefault_full_20260526.txt
+  --all --brief` found no trap lines. **Next step:** optimize the remaining
+  brk/syscall and per-page zero/map cost directly, or deliberately test a
+  musl-visible mmap fallback policy; do not spend more time on observe
+  overhead or raw page-fault trap count as the primary malloc explanation.
+  **Blocker:** malloc remains seconds-scale and the suite still times out in
+  pthread churn after the malloc/string cases.
+
+- 2026-05-25 **libcbench pthread-create tracker pass.** Added a low-volume
+  syscall-boundary benchmark tracker for `clone`, `futex`, `exit`,
+  `wait4`, `rt_sigprocmask`, and `set_tid_address` while keeping the
+  OSComp benchmark observe threshold high enough for a long run. The fresh
+  full-image RV64 `libcbench-musl` run stayed at `18.0/27`, but it resolved
+  the liveness question: malloc, string, `b_pthread_createjoin_serial1`, and
+  `b_pthread_createjoin_serial2` all completed; `b_pthread_create_serial1`
+  printed its label and was still making progress when the 700s host timeout
+  killed QEMU. The tail shows `clone:enter` and `clone:return` advancing in
+  lockstep through `5792`, with periodic `rt_sigprocmask` progress and no
+  trap lines. Source review of `external/libc-bench/pthread.c` shows this
+  case creates 2500 unjoined threads with a 16 KiB stack, so reactor-level
+  logging alone would only prove scheduler motion; the syscall tracker is the
+  useful discriminator because it proves the blocker is slow pthread-create
+  throughput rather than a stuck `clone`/`futex` syscall or kernel trap.
+  **Verified:** `cargo xtask build --target rv64-qemu`; bounded QEMU run
+  saved at
+  `target/oscomp/os_serial_out_rv_libcbench_tracker_20260525.txt`;
+  `python3 tools/oscomp-judge.py ...` (`libcbench-musl 18.0/27`);
+  `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_libcbench_tracker_20260525.txt --all
+  --brief` (`no scause/sepc/stval trap lines found`). **Next step:** reduce
+  `b_pthread_create_serial1` directly with a small guest test or add a
+  narrower lifecycle tracker around detached-thread exit/reaping and stack/TLS
+  teardown to find why unjoined thread creation is orders of magnitude slower
+  than the joined cases. **Blocker:** timeout inside
+  `b_pthread_create_serial1`; not a hard hang, and not currently
+  trap-shaped.
+
+- 2026-05-25 **OSComp benchmark blocker update after source/trace pass.**
+  The pulled sources and fresh full-image RV64 runs change the current
+  diagnosis. `libcbench-musl` is no longer hung in the first test on the
+  current brk/remap diagnostic branch: `b_malloc_sparse (0)` completed and
+  printed stats after `39.648397000s`; the same bounded 150s run continued
+  through `b_malloc_bubble`, `b_malloc_tiny1`, `b_malloc_tiny2`,
+  `b_malloc_big1`, `b_malloc_big2`, and `b_malloc_thread_stress` before the
+  host timeout killed QEMU. The valid 20k trace
+  `target/oscomp/libcbench_full_current20k.txtrace` stops earlier but shows
+  successful one-page `brk` growth through `try_mremap`: each sampled cycle
+  reaches `debug.mremap.after_stats` and `debug.brk.step.after_mremap`.
+  `lmbench-musl` still does not print a benchmark result within a 90s bound,
+  but a 5k threshold trace
+  `target/oscomp/lmbench_full_5k.txtrace` shows it is past the
+  `latency measurements` banner and cycling inside lmbench timing overhead /
+  calibration, dominated by `getrusage(165)` and `clock_gettime(113)`, not
+  trapped and not stuck in `msleep`. **Verified:** `cargo xtask build --target
+  rv64-qemu`; full-image bounded QEMU runs saved at
+  `target/oscomp/os_serial_out_rv_libcbench_full_current60k_20260525.txt` and
+  `target/oscomp/os_serial_out_rv_lmbench_full_5k_20260525.txt`; `cargo xtask
+  observe extract/validate/replay`; `cargo xtask fault-decode --target
+  rv64-qemu --serial ... --all --brief` (no trap lines); `cargo test -p
+  tx-subsystems brk_script_many_unaligned_grows_with_faults_do_not_block --
+  --nocapture`. **Next step:** let libcbench run with a longer host bound to
+  find the next actual failing case, and reduce lmbench by running just
+  `lat_syscall null` / timing calibration with fixed `ENOUGH`, `TIMING_O`, and
+  `LOOP_O` to distinguish slow calibration from a pipe/select handshake
+  failure. **Blocker:** no benchmark suite score yet; traces are still
+  diagnostic threshold exits or host-timeout samples.
+
+- 2026-05-25 **Pulled benchmark sources for OSComp blocker debugging.**
+  Added upstream benchmark source submodules so the tx-observe traces can be
+  read against the actual programs: `external/libc-bench` at
+  `b6b2ce5f9f87a09b14499cb00c600c601f022634` and `external/lmbench` at
+  `a78317972e9a938245b67d046012ab1db23b7f87`. Source review refines the
+  next trace target. `libc-bench` forks once per case, the child calls
+  `puts(label)` before `clock_gettime()` and before `b_malloc_sparse`, and
+  `b_malloc_sparse` itself is a 10,000-iteration `malloc(4000)` plus
+  `memset()` loop. Because the serial never prints `b_malloc_sparse`, the
+  current silent window after the successful `brk(7278592)` is before or
+  inside the first child label write/stdout setup, not necessarily inside the
+  benchmark allocation loop. `lmbench` front-loads `lat_syscall` via
+  `benchmp`, which allocates four control pipes, installs `SIGTERM`/`SIGCHLD`
+  handlers, forks workers, uses one-second `select()` polling for ready/done
+  handshakes, then waits/results through pipe traffic. **Verified:** `git
+  submodule status -- external/libc-bench external/lmbench`; source reads of
+  `external/libc-bench/main.c`, `external/libc-bench/malloc.c`,
+  `external/lmbench/scripts/lmbench`, `external/lmbench/src/lat_syscall.c`,
+  and `external/lmbench/src/lib_timing.c`. **Next step:** instrument the
+  libcbench fork-child return-to-user/stdout write path and lmbench
+  `benchmp` pipe/select/signal handshake boundary rather than adding more
+  broad brk tracing. **Blocker:** source confirms the suites are still
+  diagnostic-only; no benchmark score yet.
+
+- 2026-05-25 **Narrowed the post-fix OSComp benchmark stalls.** After sparse
+  `WaitSource` registration and brk coalescing, bounded RV64 OSComp runs still
+  do not score either benchmark suite, but the blockers are sharper. Current
+  libcbench observe artifacts:
+  `target/oscomp/libcbench_brkfix_15k.txtrace`,
+  `target/oscomp/libcbench_pftrace_30k.txtrace`,
+  `target/oscomp/libcbench_32k.txtrace`, and
+  `target/oscomp/libcbench_32500.txtrace` (all validate with `0` framing
+  errors). The 15k trace shows brk average latency dropping from roughly
+  `46.6 ms` pre-fix to under `1 ms`; host brk tests now cover repeated
+  unaligned growth staying in one recipe. The 32k/32.5k traces still show the
+  first libcbench case stuck before `b_malloc_sparse`, looping through
+  one-page `brk(214)` growth and page faults around a 4.6 MiB heap; a 33k
+  threshold run timed out after 100s without a dump, so the next blocker is
+  after the brk-coalescing win, at the brk/page-fault convergence point rather
+  than a trap. Current lmbench no longer reproduces the older `/var/tmp`
+  setup failure because boot now prints `:tmp-dirs:ok`; the fresh
+  `target/oscomp/os_serial_out_rv_lmbench_current_20260525.txt` reaches
+  `latency measurements` and then times out silently before scoring.
+  **Verified:** `cargo xtask build --target rv64-qemu`; bounded
+  `make oscomp-submit-rv64 oscomp-qemu-rv64` runs for libcbench thresholds
+  32k/32.5k/33k/35k and lmbench current; `cargo xtask observe
+  extract/validate/replay`; `cargo xtask fault-decode --target rv64-qemu
+  --serial ... --all --brief` found no trap lines for the fresh libcbench and
+  lmbench serial logs. **Next step:** instrument the successful-fault and
+  brk-return boundary with values after the 32.5k window, then decide whether
+  heap growth is stuck in kernel fault materialization, a timer/preempt return
+  path, or userspace compute with no syscalls. **Blocker:** no benchmark score
+  yet; current traces are diagnostic threshold exits or timeout serial logs.
+
+- 2026-05-25 **Pinned libcbench's next silent point after brk coalescing.**
+  Added narrow `tx-observe` counters around `brk(214)` request/current/return
+  and page-fault entry/done, plus a threshold check immediately after page
+  fault entry for the diagnostic run. With
+  `OSCOMP_BENCH_OBSERVE_DUMP_THRESHOLD=32760`, the fresh
+  `target/oscomp/libcbench_32760_brkpre.txtrace` validates as
+  `32768` records / `0` framing errors and shows `1741` completed brk calls,
+  `1949` page-fault entries, and `1949` matching page-fault completions. The
+  tail is clean: `brk.request=7278592`, `brk.current=7274496`, the syscall
+  exits with `brk.return=7278592`. Raising the threshold to `32780` times out
+  even after adding the post-page-fault-entry dump check, and fault-decode
+  still reports no trap lines. That narrows the remaining libcbench silence to
+  after a successful `brk(7278592)` return and before any subsequent observed
+  syscall, page fault, or timer-preempt counter reaches the ring. **Verified:**
+  `cargo xtask build --target rv64-qemu`; bounded `make
+  oscomp-submit-rv64 oscomp-qemu-rv64` runs for
+  `target/oscomp/os_serial_out_rv_libcbench_32760_brkpre_20260525.txt` and
+  `target/oscomp/os_serial_out_rv_libcbench_32780_pfentry_20260525.txt`;
+  `cargo xtask observe extract/validate/replay`; `cargo xtask fault-decode
+  --target rv64-qemu --serial ... --all --brief`. **Next step:** trace the
+  return-to-user/timer path or add a short guest-side progress marker around
+  the libcbench allocation loop, because the kernel no longer observes a
+  trap-shaped event after that brk return. **Blocker:** the run is silent, not
+  trap-shaped, after heap growth reaches roughly 7.28 MiB.
+
+- 2026-05-25 **Traced OSComp benchmark blockers with tx-observe.** Found and
+  fixed an early observe-bringup blocker first: the global `WaitSource`
+  registry used dense `Vec` indexing while subsystem notification ids start at
+  `1 << 32`, so futex zone registration tried to grow billions of empty slots.
+  The registry is now sparse, and the kernel reaches OSComp with observation
+  armed from `drive_bootstrap_exec`. Saved valid traces:
+  `target/oscomp/libcbench_observe_10k.txtrace`,
+  `target/oscomp/libcbench_observe_15k.txtrace`, and
+  `target/oscomp/lmbench_observe_15k.txtrace` (all `8192` records, `0`
+  framing errors). The libcbench traces are dominated by `brk(214)` one-page
+  heap growth and no traps before `b_malloc_sparse` prints; a 20k-threshold run
+  timed out without a dump, so the first blocker is VM/heap-growth cost or an
+  eventual `brk`/VM-map stall rather than a trap. The lmbench trace reaches
+  `latency measurements` and actively loops over `clock_gettime(113)` and
+  `getrusage(165)` before the threshold dump; the earlier unobserved run still
+  shows the separate `/var/tmp` setup failure when allowed past that phase.
+  **Verified:** `cargo xtask build --target rv64-qemu`; `cargo xtask observe
+  extract/validate` on the three saved logs; `cargo xtask fault-decode
+  --target rv64-qemu --serial ... --all --brief` found no trap lines for the
+  observed libcbench/lmbench logs. **Next step:** add focused `brk`/VM-map
+  latency counters or coalesce brk growth mappings before rerunning
+  libcbench; create `/var`/`/var/tmp` in the OSComp init path before trusting
+  later lmbench results. **Blocker:** benchmark traces are diagnostic and still
+  stop via threshold before scores are possible.
+
+- 2026-05-25 **Reproduced OSComp libcbench/lmbench RV64 blockers.** Fresh
+  targeted OSComp runs against `target/oscomp/full-run/sdcard-rv.img` confirm
+  both benchmark suites are still blocked before scoring any cases.
+  `OSCOMP_GROUPS=libcbench-musl OSCOMP_DATA=target/oscomp/full-run
+  OSCOMP_SUBMIT=target/oscomp/submit
+  OSCOMP_OUT_RV=target/oscomp/os_serial_out_rv_libcbench_musl_20260525.txt
+  make oscomp-submit-rv64 oscomp-qemu-rv64` printed the group marker and then
+  hung inside `./libc-bench` before the first expected `b_malloc_sparse`
+  result; `cargo xtask oscomp score --target rv64-qemu --suite
+  libcbench-musl --input
+  target/oscomp/os_serial_out_rv_libcbench_musl_20260525.txt --data
+  target/oscomp/full-run` scored `0.0/27`; `cargo xtask fault-decode --target
+  rv64-qemu --serial
+  target/oscomp/os_serial_out_rv_libcbench_musl_20260525.txt --all --brief`
+  found no trap lines. `OSCOMP_GROUPS=lmbench-musl ...` saved
+  `target/oscomp/os_serial_out_rv_lmbench_musl_20260525.txt`; that run reached
+  `latency measurements`, then `mkdir -p /var/tmp` failed because `/var` is
+  absent and `touch /var/tmp/lmbench` returned `ENOENT`, after which the suite
+  went silent before any `Simple syscall`/`Simple read` result; score was
+  `0.0/36`, and fault-decode again found no trap lines. **Next step:** add a
+  focused bench probe path or temporary script/image override that brackets
+  `libc-bench` startup and the individual `lmbench_all lat_syscall ...`
+  commands with markers/syscall tracing. **Blocker:** current host lacks
+  `debugfs`/`7z`, and `tools/build-slim-sdcard.py` does not yet generate
+  custom libcbench/lmbench testcodes, so the exact syscall boundary is not
+  isolated from the official image alone.
+
 - 2026-05-24 **Cleaned the pipe lease wait through notification wrappers before
   merge-back.** The reactor boundary sweep found zero raw reactor references
   outside adapters, but `notification-boundary` caught one stale raw
@@ -9083,6 +11346,125 @@
   aligned. Verification: `git diff --check`, `cargo xtask lint docs`, and
   `cargo xtask progress validate`. Next step: continue using stage vocabulary
   when touching step examples; no blocker.
+- 2026-05-25 OSComp benchmark triage: `libcbench-musl` still times out before
+  the first benchmark line, but `tx-observe` now brackets the blocker. Valid
+  trace `target/oscomp/libcbench_32760_looptrace.txtrace` replays cleanly and
+  shows healthy `brk.return -> syscall.stored -> loop.bottom -> loop.start ->
+  ast -> user.enter -> page_fault_done` cycles until the last dumpable window;
+  thresholds `32800`, `33000`, `34000`, `36000`, `40000`, `50000`, `75000`,
+  and `137000` all time out with no trap lines. The last decoded event window
+  reaches `brk.request=1863680/current=1859584` and enters the driven
+  `VmBrkOp`; the next threshold is never reached, so the current blocker is
+  inside that driven VM brk/mremap step window rather than after syscall return.
+  A host regression reproducing the guest shape,
+  `brk_script_many_unaligned_grows_with_faults_do_not_block`, passes for 512
+  unaligned grows plus heap faults, so the remaining evidence points at a
+  guest-only drive/RangeLock/VM-step interaction. Negative experiment:
+  `DriveMode::Nonblocking` for `sys_brk` did not clear the hang and was
+  reverted. `lmbench-musl` no longer hits the old `/var/tmp` setup failure and
+  now reaches `latency measurements` before silence. Verification:
+  `cargo test -p tx-subsystems brk_script_many_unaligned_grows_with_faults_do_not_block -- --nocapture`,
+  `cargo xtask build --target rv64-qemu`, repeated bounded OSComp QEMU runs,
+  and `cargo xtask fault-decode --target rv64-qemu --serial ... --all --brief`
+  (no trap lines). Next step: instrument inside `VmBrkOp::step` /
+  `AddressSpace::try_mremap` or the drive L4 step body to distinguish
+  RangeLock acquire, recipe rewrite, pmap teardown, and stats publication.
+- 2026-05-27 lmbench read/write latency follow-up: source review confirmed
+  `lat_syscall` measures 1-byte `read(/dev/zero)` and `write(/dev/null)`.
+  The syscall layer now recognizes static devfs char devices by
+  `(name, major, minor)` and short-circuits `/dev/null` write and `/dev/zero`
+  read before the generic VFS drive; `/dev/null` write also uses the existing
+  cap-only immediate lane because it does not need an address space, and
+  `/dev/zero` read uses a process+aspace immediate lane plus a static zero
+  buffer to avoid per-call allocation. Verification:
+  `cargo fmt --check`, `cargo test -p tx-shims dev_ -- --nocapture`,
+  `cargo test -p tx-kernel getppid_uses_cap_only_immediate_fast_path -- --nocapture`,
+  `cargo test -p tx-kernel successful_clone_return_needs_child_publish_handoff -- --nocapture`,
+  `cargo xtask build --target rv64-qemu`, `cargo xtask oscomp submit --target rv64-qemu`,
+  bounded `lmbench-musl` QEMU runs using `target/oscomp/testdata-full`, and
+  `cargo xtask fault-decode --target rv64-qemu --serial ... --all --brief`
+  on the saved serials (no trap lines). Observe-off timing moved from the
+  earlier `Simple read/write` ~912/916 us to post-device-fast-path ~742/644 us,
+  then to resolved-immediate samples around `Simple read` 501-544 us and
+  `Simple write` 357-423 us, with `Simple syscall` in the same samples
+  346-431 us. Next blocker: `/dev/zero` read remains above null syscall
+  because it still needs address-space lookup plus user-buffer writeback;
+  further reduction needs user-copy/pmap timing evidence rather than more VFS
+  bypassing.
+- 2026-05-27 libcbench pthread clone trace follow-up: `CLONE_THREAD` now
+  travels through the one-shot `CloneThreadOp`/`drive_oneshot` path and the
+  observe analyzer reports child clone sub-phases by tid. Corrected span
+  placement and the sign-split trace show clone is not a lost-child/process
+  roster failure: futex source registration/wake correlation matched
+  `23/23`, and wake delivery was generally sub-millisecond after notify.
+  In `target/oscomp/custom-run/libcbench-minimal2-sign-split.txtrace`
+  (`32768 records, 0 framing errors`), clone still costs
+  `sys_clone avg=1955.5us` under observe, with `reactor_submit` averaging
+  `773.3us` and `step_clone_thread` averaging `692.3us`. Inside
+  `step_clone_thread`, the dominant synchronous work is zone-signing a fresh
+  `ThreadPayload`: `payload_fresh.after -> payload_sign.after` averaged
+  `233.8us` (`p50=95us`) with a scheduler/trace outlier at `16.743ms`;
+  identity sign averaged `85.2us`. The same run shows the broader pthread
+  cost has moved to VM cleanup once more iterations execute:
+  `sys_munmap n=100 avg=5075.3us`, `drive.VmUnmapOp n=100 avg=4555.6us`.
+  Verification: `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems
+  clone_thread_op_delegates_to_step_clone_thread -- --nocapture`,
+  `CARGO_INCREMENTAL=0 cargo test -p tx-shims
+  dispatch_clone_oneshot_handles_non_vfork_and_defers_vfork -- --nocapture`,
+  `cargo xtask build --target rv64-qemu`, bounded custom libcbench pthread
+  run with observe bracketing, `cargo xtask observe validate --file
+  target/oscomp/custom-run/libcbench-minimal2-sign-split.txtrace`, and
+  `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/custom-run/libcbench-minimal2-sign-split-observe-serial.txt
+  --all --brief` (no trap lines found). Next step: treat clone as structurally
+  stepped already; chase `VmUnmapOp` phase timing and parent task scheduling
+  gaps before changing clone semantics.
+- 2026-05-28 VM sparse pmap teardown cleanup: `VmPmap::walk_range`,
+  `teardown_range`, and `protect_range` now enumerate resident
+  `BTreeMap<UserPage, PmapMapping>` entries in the queried range instead of
+  scanning every virtual page in sparse VMAs. Added
+  `vm_address_space_unmap_sparse_large_range_tears_down_resident_pmap_entries`
+  to pin the sparse recipe-vs-pmap contract: a 65,536-page mapping with three
+  resident pages withdraws the full recipe range but only performs three pmap
+  unmaps/shootdowns. Verification:
+  `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems
+  vm_address_space_unmap_sparse_large_range_tears_down_resident_pmap_entries
+  -- --nocapture`, `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems vm_pmap
+  -- --nocapture`, `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems
+  vm_address_space_unmap -- --nocapture`, `cargo xtask build --target
+  rv64-qemu`, and custom RV64 `vm-sparse-munmap` trace
+  `target/oscomp/custom-run/vm-sparse-munmap.txtrace` (`16 records, 0 framing
+  errors`, `sys_munmap n=1 avg=2918us`, `drive.VmUnmapOp n=1 avg=1769us`,
+  no trap lines in the serial). A one-repeat pthread trace
+  `target/oscomp/custom-run/libcbench-minimal2-vmcleanup-r1.txtrace` was valid
+  (`8192 records, 0 framing errors`) but did not retain `munmap`; it shows the
+  next pthread blocker is futex/scheduler wake latency again rather than VM
+  teardown. A six-repeat pthread observe run timed out during trace dump and is
+  not usable for timing because it lacks `TXTRACE-END`. Next step: continue
+  with futex wake delivery/scheduler latency; no VM pmap scan blocker remains
+  for sparse `munmap`.
+- 2026-05-28 VM recipe persistent-tree aggregate cleanup: the recipe index now
+  stores an immutable, structurally shared treap with subtree `len` and
+  `vm_size` aggregates. `munmap` uses persistent split/discard/merge around the
+  requested range and reconstructs only boundary survivor fragments, so wide
+  sparse unmaps no longer remove every covered VMA one by one. Added
+  `vm_recipe_wide_sparse_unmap_uses_batched_persistent_tree_splice` and
+  `vm_recipe_sparse_unmap_splice_preserves_boundary_survivors` to pin both the
+  bounded-touch behavior and first/last partial-VMA correctness. Guest probe
+  evidence on a 2048-entry sparse mapping:
+  `target/oscomp/custom-run/vm-many-recipe-munmap.txtrace` before aggregate
+  discard showed `sys_munmap=37853us`, `drive.VmUnmapOp=36678us`,
+  `step=36507us`; after the aggregate discard,
+  `target/oscomp/custom-run/vm-many-recipe-munmap-agg.txtrace` shows
+  `sys_munmap=3262us`, `drive.VmUnmapOp=1608us`, `step=1464us`, with valid
+  txtrace framing and no trap lines in the serial. Verification:
+  `cargo fmt --check`, `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems
+  vm_recipe_ -- --nocapture`, `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems
+  vm_address_space_unmap -- --nocapture`, `cargo xtask build --target
+  rv64-qemu`, custom RV64 many-recipe probe, `cargo xtask observe
+  extract/validate/analyze`. Next step: re-run bounded libcbench malloc/pthread
+  slices; remaining per-`munmap` floor now appears to be trap/syscall framing
+  and scheduler/observe overhead rather than recipe tree churn.
 - This foundational workspace snapshot is ready to publish to the Txv2 remote:
   it captures the Rust skeleton, xtask tooling, docs/progress memory, OSComp and
   HumanLayer references, RV64 QEMU smoke boot, BootInfo v1, and bootstrap pmap.
