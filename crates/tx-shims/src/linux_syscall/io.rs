@@ -1375,6 +1375,10 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         return sys_pipe_read_buffered(&rx, buf_ptr, len, file.flags().nonblocking, ctx).await;
     }
 
+    if let Some(result) = try_pipe_read_ready_fast(&file, buf_ptr as u64, len, ctx) {
+        return result;
+    }
+
     let len = if matches!(
         file.rnode().backing(),
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
@@ -1469,6 +1473,44 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
             let errno: tx_subsystems::execution::Errno = v3errno.into();
             SyscallResult::error_from(errno)
         }
+    }
+}
+
+fn try_pipe_read_ready_fast(
+    file: &Cap<OpenFile>,
+    buf_ptr: u64,
+    len: usize,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    let tx_subsystems::vfs::structure::RNodeBacking::StructBacked {
+        payload: tx_subsystems::vfs::structure::StructPayload::Pipe { payload, .. },
+    } = file.rnode().backing()
+    else {
+        return None;
+    };
+
+    let len = len.min(TTY_WRITE_MAX_INLINE);
+    if len == 0 {
+        return Some(SyscallResult::Return(0));
+    }
+    let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
+    let outcome = {
+        let guard = tx_substrate::epoch::guard();
+        tx_subsystems::pipe::step_read(payload, &mut staging, &guard, file.flags().nonblocking)
+    };
+    match outcome {
+        tx_substrate::step::StepOutcome::Done(total) => {
+            if total > 0 {
+                if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..total])
+                {
+                    return Some(SyscallResult::error_from(errno));
+                }
+            }
+            Some(SyscallResult::Return(total as i64))
+        }
+        tx_substrate::step::StepOutcome::Err(errno) => Some(SyscallResult::error_from(errno)),
+        tx_substrate::step::StepOutcome::Yield { .. }
+        | tx_substrate::step::StepOutcome::Continue { .. } => None,
     }
 }
 

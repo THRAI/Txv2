@@ -504,6 +504,15 @@ impl ProcessIdentity {
             .and_then(|p| p.set_fd(idx, file))
     }
 
+    /// Close fd `idx`, returning the detached `OpenFile` when the fd
+    /// existed. Unlike the low-level [`Self::set_fd`] remove form,
+    /// this also clears the matching close-on-exec bit after a
+    /// successful close. Missing fds leave CLOEXEC state untouched so
+    /// callers can preserve Linux's `close(2) -> EBADF` behavior.
+    pub fn close_fd(&self, idx: u32) -> Option<Cap<crate::vfs::OpenFile>> {
+        self.payload.lock().as_ref().and_then(|p| p.close_fd(idx))
+    }
+
     /// Allocate the lowest unused fd ≥ 0 without installing anything.
     /// Returns `0` for zombies (no payload) — the caller must not
     /// install against a zombie regardless.
@@ -1376,6 +1385,20 @@ impl ProcessPayload {
         drop(slot);
         if let Some(file) = &previous {
             decr_pipe_fd_ref(file);
+        }
+        previous
+    }
+
+    /// Close fd `idx` and clear its CLOEXEC bit only when an fd was
+    /// actually present. This is the semantic close path used by
+    /// `close(2)` and exec's CLOEXEC sweep; `set_fd(idx, None)`
+    /// remains a lower-level table mutation for tests and replacement
+    /// operations.
+    pub fn close_fd(&self, idx: u32) -> Option<Cap<OpenFile>> {
+        let previous = self.fds.lock().remove(&idx);
+        if let Some(file) = &previous {
+            decr_pipe_fd_ref(file);
+            self.fd_cloexec.lock().remove(&idx);
         }
         previous
     }

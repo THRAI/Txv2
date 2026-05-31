@@ -383,12 +383,45 @@ small timestamped runner/trap-trace pass or a focused reduction in repeated
 rootfs helper forks/procfs probes; broad socket-table or datapath refactors are
 not justified by the current evidence.
 
+2026-06-01 follow-up speed pass: three general optimizations landed or were
+tested against the same focused witness. First, `Process::close_fd()` now
+combines fd removal and successful-close CLOEXEC cleanup for `close(2)`,
+CLOEXEC exec cleanup, AIO teardown, and the stateless netlink close path.
+Second, `/tx-ltp/bin` now answers the stable LTP network helper queries
+`tst_net_ip_prefix`, `tst_net_iface_prefix`, and `tst_net_vars` without
+executing the large helper binaries for the default Tx/LTP veth addresses, and
+IPv4 `ip neigh del <addr> dev <iface>` skips an extra failing BusyBox
+`ip neigh del` subprocess before using the ARP ioctl-backed delete path. Third,
+ready pipe reads now have a synchronous `read(2)` fast path, aimed at the
+shell's tiny command-substitution pipe reads.
+
+The optimizations are correct locally but still do not close
+`ipneigh01_ip`: `target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-fastdel-420s.txt`
+and `target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-pipefast-420s.txt` both reach
+`stress auto-creation ARP cache entry deleted with 'ip' 50 times` and then hit
+the 420s host timeout without a PASS. An executable-page prefault experiment
+was also tried, but it regressed the witness before the stress line and was
+reverted. The next runtime pass should capture argv-aware or timestamped loop
+evidence before changing more kernel code.
+
+2026-06-01 PATH precedence follow-up: each per-case LTP execution now keeps
+`/tx-ltp/bin` first via a shared `LTP_CASE_PATH`, so the local helper shims are
+not shadowed by upstream LTP helper binaries. The fix is correct runner hygiene,
+but it is not enough to close `ipneigh01_ip`: the focused normal-build witness
+`target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-txpath-420s.txt` still reaches the
+same stress marker and then host-times out. A fresh trace witness,
+`target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-pipefast-traptrace-240s.txt`,
+showed about `3251` syscalls after the stress marker in the 240s window, led by
+`read`, `ppoll`, `close`, signal-mask/action calls, `wait4`, `dup3`, `clone`,
+and `execve`; post-stress page faults were also high. This keeps the blocker in
+process/shell/exec runtime, not network neighbor semantics.
+
 ## Next native network step
 
 The focused command/control probes, grouped ping witnesses, and `arping01` are
 clean, and `ipneigh01_{arp,ip}` now reaches its stress loop. The immediate next
-step is a speed pass around native LTP setup/helper churn, then rerun the same
-two neighbor witnesses.
+step is a small design for native LTP process/runtime reduction around BusyBox
+shell pipelines and exec fault cost, then rerun the same two neighbor witnesses.
 
 Recommended confirmation target after a speed change:
 
