@@ -3,10 +3,11 @@
 #[cfg(target_arch = "loongarch64")]
 core::arch::global_asm!(
     r#"
-    .section .text.boot, "ax"
+    .section .text.boot.phys, "ax"
     .equ TX_LA64_DMW_CACHED,   0x9000000000000011
     .equ TX_LA64_DMW_UNCACHED, 0x8000000000000001
     .equ TX_LA64_DMW_CACHED_BASE, 0x9000000000000000
+    .equ TX_LA64_HIGH_START,   0x9000000000201000
     .equ TX_LA64_PHYS_ADDR_MASK, 0x0000ffffffffffff
     .equ TX_LA64_CSR_DMW0, 0x180
     .equ TX_LA64_CSR_DMW1, 0x181
@@ -34,6 +35,11 @@ _start:
     csrwr   $t0, TX_LA64_CSR_DMW3
     invtlb  0x0, $zero, $zero
 
+    li.d    $t0, TX_LA64_HIGH_START
+    jirl    $zero, $t0, 0
+
+    .section .text.boot.high, "ax"
+tx_la64_high_start:
     bnez    $s0, .Ltx_la64_secondary_wait
     la.local $sp, __tx_boot_stack_top
     li.d    $t2, 4

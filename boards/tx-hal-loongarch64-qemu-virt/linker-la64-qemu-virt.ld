@@ -3,15 +3,22 @@ ENTRY(_start)
 
 KERNEL_LOAD_BASE = 0x00200000;
 KERNEL_LINK_BASE = 0x9000000000200000;
+KERNEL_BOOT_PHYS_SIZE = 0x1000;
 KERNEL_LINK_OFFSET = KERNEL_LINK_BASE - KERNEL_LOAD_BASE;
 
 SECTIONS
 {
+    . = KERNEL_LOAD_BASE;
+    .text.boot.phys : AT(KERNEL_LOAD_BASE) ALIGN(4K) {
+        KEEP(*(.text.boot.phys))
+    }
+
     . = KERNEL_LINK_BASE;
     __kernel_start = .;
 
+    . = KERNEL_LINK_BASE + KERNEL_BOOT_PHYS_SIZE;
     .text : AT(ADDR(.text) - KERNEL_LINK_OFFSET) ALIGN(4K) {
-        KEEP(*(.text.boot))
+        KEEP(*(.text.boot.high))
         *(.text .text.*)
     }
     __text_end = .;

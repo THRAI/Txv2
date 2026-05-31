@@ -2004,7 +2004,7 @@ fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
     }
 }
 
-fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
+fn append_default_oscomp_scripts_impl(cmd: &mut alloc::string::String) {
     for (_, script) in DEFAULT_OSCOMP_MUSL_PRE_LTP_SCRIPTS {
         if *script == "libctest_testcode.sh" {
             append_full_libctest(cmd);
@@ -2022,6 +2022,14 @@ fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
     append_submit_ltp_runner(cmd, "musl");
     append_submit_ltp_runner(cmd, "glibc");
 }
+
+#[cfg(target_arch = "loongarch64")]
+fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
+    append_default_oscomp_scripts_impl(cmd);
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn append_default_oscomp_scripts(_cmd: &mut alloc::string::String) {}
 
 fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str) {
     use core::fmt::Write as _;
@@ -2290,7 +2298,7 @@ mod tests {
     #[test]
     fn default_oscomp_uses_ltp_submit_whitelist() {
         let mut cmd = String::from("cd /musl/musl");
-        append_default_oscomp_scripts(&mut cmd);
+        append_default_oscomp_scripts_impl(&mut cmd);
 
         assert!(cmd.contains("basic_testcode.sh"));
         assert!(cmd.contains("busybox_testcode.sh"));
@@ -2322,6 +2330,15 @@ mod tests {
         assert!(!cmd.contains("cyclictest_testcode.sh"));
         assert!(!cmd.contains("; target_dir=\"ltp/testcases/bin\""));
         assert!(!cmd.contains("; /bin/setsid \"$file\""));
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    #[test]
+    fn default_oscomp_is_noop_off_loongarch64() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_default_oscomp_scripts(&mut cmd);
+
+        assert_eq!(cmd, "cd /musl/musl");
     }
 
     #[test]
