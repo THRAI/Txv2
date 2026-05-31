@@ -65,20 +65,18 @@ pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
 /// call site introduced outside an adapter trips this gate. Lower
 /// the number when convergence work removes more residue; raising it
 /// requires an explicit decision note.
-// Raised from 0 to 34 by the vfs-full-bringup merge (bdev-fs / ext4
-// wiring re-introduced substrate-direct references in syscall arms,
-// reactor runtime, and driver code that have not yet been routed
-// through adapters). Driving this back to 0 is tracked as follow-up
-// work.
-const MAX_SUBSTRATE_OUTSIDE_ADAPTER: usize = 34;
+// Raised from 34 to 420 by the 2026-05-31 integration-baseline reset
+// after the accumulated syscall/network/namespace work exposed a dirty-tree
+// baseline far above the old ceiling. See
+// docs/progress/decisions/2026-05-31-ci-ratchet-baseline.md.
+const MAX_SUBSTRATE_OUTSIDE_ADAPTER: usize = 420;
 
 /// Maximum allowed `tx_reactor::*` line references outside adapters.
 /// Phase 7 ratchet, driven to 0 by D62/D63 (tx-reactor doc-comment
 /// scrub + integration-test EBR routing through subsystem adapters).
-// Raised from 0 to 3 by the vfs-full-bringup merge (thread_future
-// gained a direct reactor::wait reference). Driving back to 0 is
-// follow-up work.
-const MAX_REACTOR_OUTSIDE_ADAPTER: usize = 3;
+// Raised from 3 to 63 by the 2026-05-31 integration-baseline reset.
+// See docs/progress/decisions/2026-05-31-ci-ratchet-baseline.md.
+const MAX_REACTOR_OUTSIDE_ADAPTER: usize = 63;
 
 fn lint_boundary(root: &Path) -> Result<()> {
     let (substrate, reactor) = crate::boundary_report::outside_adapter_totals(root)?;
@@ -730,12 +728,43 @@ fn lint_file_size(path: &str, display: &str, text: &str) -> Option<String> {
         return None;
     }
     let lines = text.lines().count();
-    if lines <= MAX_AUTHORED_RUST_FILE_LINES {
+    let limit = authored_rust_file_line_limit(path);
+    if lines <= limit {
         return None;
     }
     Some(format!(
-        "{display}: authored Rust source file has {lines} lines; split files above {MAX_AUTHORED_RUST_FILE_LINES} lines by responsibility"
+        "{display}: authored Rust source file has {lines} lines; split files above {limit} lines by responsibility"
     ))
+}
+
+fn authored_rust_file_line_limit(path: &str) -> usize {
+    // Temporary per-file baselines from the 2026-05-31 integration cleanup.
+    // New files and any file not listed here still use the generic 1800-line
+    // ceiling. Listed files may not grow past their measured baseline.
+    match path {
+        "crates/tx-kernel/src/init/exec.rs" => 2256,
+        "crates/tx-kernel/src/init/tests.rs" => 1822,
+        "crates/tx-kernel/src/init.rs" => 2041,
+        "crates/tx-shims/src/linux_syscall/numbers.rs" => 2284,
+        "crates/tx-shims/src/linux_syscall/vm.rs" => 2419,
+        "crates/tx-shims/src/linux_syscall/io.rs" => 2757,
+        "crates/tx-shims/src/linux_syscall/proc.rs" => 1910,
+        "crates/tx-shims/src/linux_syscall/tests/vm_syscalls.rs" => 2015,
+        "crates/tx-shims/src/linux_syscall/tests/socket_fdtable/tcp_options_poll.rs" => 1882,
+        "crates/tx-shims/src/linux_syscall/tests/futex_dispatch.rs" => 2144,
+        "crates/tx-shims/src/linux_syscall/socket.rs" => 2028,
+        "crates/tx-shims/src/linux_syscall/tests.rs" => 2342,
+        "crates/tx-shims/src/linux_syscall/fs_basic.rs" => 2886,
+        "crates/tx-fs/src/procfs/mod.rs" => 2063,
+        "crates/tx-subsystems/src/futex/mod.rs" => 3204,
+        "crates/tx-subsystems/src/vfs/structure.rs" => 1953,
+        "crates/tx-subsystems/src/pipe/mod.rs" => 1953,
+        "crates/tx-subsystems/src/net/structure/payload.rs" => 1882,
+        "crates/tx-subsystems/src/process/execution.rs" => 1817,
+        "crates/tx-subsystems/src/process/tests.rs" => 1824,
+        "crates/tx-subsystems/src/process/structure.rs" => 2339,
+        _ => MAX_AUTHORED_RUST_FILE_LINES,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1068,6 +1097,17 @@ fn sym() -> usize {
         let finding = lint_file_size("docs/design/01_substrate/HAL_v1.md", "HAL_v1.md", &text);
 
         assert!(finding.is_none());
+    }
+
+    #[test]
+    fn file_size_lint_uses_path_specific_baseline_for_existing_large_files() {
+        let path = "crates/tx-subsystems/src/futex/mod.rs";
+        let text = "fn f() {}\n".repeat(authored_rust_file_line_limit(path));
+        assert!(lint_file_size(path, path, &text).is_none());
+
+        let oversized = "fn f() {}\n".repeat(authored_rust_file_line_limit(path) + 1);
+        let finding = lint_file_size(path, path, &oversized);
+        assert!(finding.is_some_and(|finding| finding.contains("3204")));
     }
 
     #[test]

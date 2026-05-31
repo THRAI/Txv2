@@ -542,7 +542,7 @@ mod tests {
             image.initial_sp
         );
         let off = (ptr - image.initial_sp) as usize;
-        assert!(off < image.bytes.len(), "ptr {:#x} past stack image", ptr);
+        assert!(off < image.bytes.len(), "ptr {ptr:#x} past stack image");
         off
     }
 
@@ -713,7 +713,7 @@ mod tests {
 
         let off = ptr_to_off(&image, at_random_ptr);
         for i in 0..AT_RANDOM_REGION_SIZE {
-            assert_eq!(image.bytes[off + i], 0, "AT_RANDOM byte {} non-zero", i);
+            assert_eq!(image.bytes[off + i], 0, "AT_RANDOM byte {i} non-zero");
         }
     }
 
@@ -915,8 +915,7 @@ mod tests {
             assert_eq!(
                 image.bytes[off + i],
                 0xab,
-                "AT_RANDOM byte {} did not round-trip from auxv_facts",
-                i
+                "AT_RANDOM byte {i} did not round-trip from auxv_facts"
             );
         }
     }

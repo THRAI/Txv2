@@ -143,7 +143,7 @@ fn timer_guard_role_is_copy_and_eq() {
     let r: TimerGuardRole = TimerGuardRole::DeadlineAbort;
     let r2 = r;
     assert_eq!(r, r2);
-    let _ = format!("{:?}", r);
+    let _ = format!("{r:?}");
 }
 
 #[test]

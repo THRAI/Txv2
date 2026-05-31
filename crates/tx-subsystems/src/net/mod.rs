@@ -14,6 +14,7 @@ pub mod facade;
 pub mod namespace;
 pub mod netfilter;
 pub mod nfnetlink;
+pub mod notification;
 pub mod packet;
 pub mod project;
 pub mod protocol;

@@ -81,7 +81,7 @@ pub fn read_exact_at(
         // - v3 `Err(e)` → `Err(e)`.
         let materialized = match pc.materialize_page(page_index, MaterializeAccess::Read, guard) {
             V3::Done(m) => m,
-            V3::Continue { .. } => return V3::err(Errno::EAGAIN.into()),
+            V3::Continue { .. } => return V3::err(Errno::EAGAIN),
             V3::Yield { shape, .. } => {
                 if let Some((carrier, interests)) =
                     crate::page_backed::notification::wait_source_parts(&shape)
@@ -92,7 +92,7 @@ pub fn read_exact_at(
                         interests,
                     );
                 }
-                return V3::err(Errno::EIO.into());
+                return V3::err(Errno::EIO);
             }
             V3::Err(errno) => return V3::err(errno),
         };

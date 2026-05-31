@@ -485,7 +485,7 @@ fn tcp_recv_kicks_loopback_after_freeing_peer_window() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let guard = tx_substrate::epoch::guard();
     let mut listener_options = SocketOptionSet::default_tcp();
     listener_options.socket.recv_buf_size = 5;
@@ -609,7 +609,7 @@ fn tcp_msg_more_auto_flushes_full_segment_for_stream_progress() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let (client, listener, _local, _remote) = prepare_loopback_connect_with_client_send_buf(
         40_190,
         50_190,
@@ -670,7 +670,7 @@ fn tcp_loopback_pending_moves_multiple_msg_more_streams() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let guard = tx_substrate::epoch::guard();
     let listener = registry::create_socket_for_test_or_bootstrap(
         SocketKind::Tcp,

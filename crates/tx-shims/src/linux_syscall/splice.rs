@@ -252,8 +252,7 @@ async fn splice_pipe_to_file<'a, P: tx_hal::TimeIf>(
     if let Some(result) = try_splice_pipe_lease_to_file(fd_out, off_out_ptr, &in_pipe, len, ctx) {
         return result;
     }
-    let mut buf = alloc::vec::Vec::new();
-    buf.resize(len, 0);
+    let mut buf = alloc::vec![0; len];
     let peek = peek_pipe_to_kernel(&in_pipe, &mut buf);
 
     match peek {
@@ -292,8 +291,7 @@ async fn splice_pipe_to_file<'a, P: tx_hal::TimeIf>(
             }
 
             if let Some(n) = written_len {
-                let mut discard = alloc::vec::Vec::new();
-                discard.resize(n, 0);
+                let mut discard = alloc::vec![0; n];
                 let _ = sys_read::<P>(
                     [fd_in as u64, discard.as_mut_ptr() as u64, n as u64, 0, 0, 0],
                     ctx,
@@ -344,15 +342,13 @@ fn try_splice_pipe_lease_to_file<'a>(
         let guard = step_engine::guard();
         tx_subsystems::pipe::step_pop_page_lease(&in_pipe.payload, &guard, in_pipe.nonblocking)
     };
-    let Some((lease, in_offset, lease_len)) = (match lease_outcome {
+    let (lease, in_offset, lease_len) = (match lease_outcome {
         StepOutcome::Done(value) => value,
         StepOutcome::Err(e) => return Some(splice_outcome_to_result(StepOutcome::Err(e))),
         StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
             return Some(SyscallResult::Error(EAGAIN_VALUE));
         }
-    }) else {
-        return None;
-    };
+    })?;
     if in_offset != 0 || lease_len != tx_subsystems::vm::USER_PAGE_SIZE || lease_len > len {
         return None;
     }
@@ -385,8 +381,7 @@ async fn splice_file_to_pipe<'a, P: tx_hal::TimeIf>(
     if let Some(result) = try_splice_file_lease_to_pipe(fd_in, off_in_ptr, fd_out, len, ctx) {
         return result;
     }
-    let mut buf = alloc::vec::Vec::new();
-    buf.resize(len, 0);
+    let mut buf = alloc::vec![0; len];
     let saved = if off_in_ptr != 0 {
         let in_file = match resolve_fd(&ctx.process, fd_in as u32) {
             Some(file) => file,
@@ -585,10 +580,7 @@ fn splice_outcome_to_result(
 ) -> SyscallResult {
     match outcome {
         StepOutcome::Done(n) => SyscallResult::Return(n as i64),
-        StepOutcome::Err(e) => {
-            let errno: tx_subsystems::execution::Errno = e.into();
-            SyscallResult::error_from(errno)
-        }
+        StepOutcome::Err(e) => SyscallResult::error_from(e),
         StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
             SyscallResult::Error(EAGAIN_VALUE)
         }

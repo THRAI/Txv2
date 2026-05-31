@@ -35,7 +35,7 @@ pub(crate) fn lint_invariants_vfs_path_interface(root: &Path) -> Result<()> {
         if should_skip_file(&rel) {
             continue;
         }
-        let text = fs::read_to_string(&file).map_err(|err| format!("{}: {err}", rel))?;
+        let text = fs::read_to_string(&file).map_err(|err| format!("{rel}: {err}"))?;
         for (line_idx, line) in text.lines().enumerate() {
             let trimmed = line.trim();
             if is_comment(trimmed) {

@@ -144,8 +144,7 @@ fn copy_xattr_value_from_user(
     if size > 0 && value_uaddr == 0 {
         return Err(SyscallResult::Error(EFAULT_VALUE));
     }
-    let mut value = Vec::new();
-    value.resize(size, 0);
+    let mut value = alloc::vec![0; size];
     if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut value, value_uaddr) {
         return Err(SyscallResult::error_from(errno));
     }
@@ -161,8 +160,7 @@ fn stage_xattr_output(size: usize, is_list: bool) -> Result<Vec<u8>, SyscallResu
     if let Err(errno) = validation {
         return Err(SyscallResult::error_from(errno));
     }
-    let mut buf = Vec::new();
-    buf.resize(size, 0);
+    let buf = alloc::vec![0; size];
     Ok(buf)
 }
 
@@ -189,7 +187,7 @@ fn sys_setxattr_common(
         &guard,
     ) {
         step_engine::StepOutcome::Done(()) => SyscallResult::Return(0),
-        step_engine::StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        step_engine::StepOutcome::Err(errno) => SyscallResult::error_from(errno),
         step_engine::StepOutcome::Continue { .. } | step_engine::StepOutcome::Yield { .. } => {
             SyscallResult::Error(EIO_VALUE)
         }
@@ -223,7 +221,7 @@ fn sys_getxattr_common(
             }
             SyscallResult::Return(required as i64)
         }
-        step_engine::StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        step_engine::StepOutcome::Err(errno) => SyscallResult::error_from(errno),
         step_engine::StepOutcome::Continue { .. } | step_engine::StepOutcome::Yield { .. } => {
             SyscallResult::Error(EIO_VALUE)
         }
@@ -256,7 +254,7 @@ fn sys_listxattr_common(
             }
             SyscallResult::Return(required as i64)
         }
-        step_engine::StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        step_engine::StepOutcome::Err(errno) => SyscallResult::error_from(errno),
         step_engine::StepOutcome::Continue { .. } | step_engine::StepOutcome::Yield { .. } => {
             SyscallResult::Error(EIO_VALUE)
         }
@@ -272,7 +270,7 @@ fn sys_removexattr_common(
     let guard = step_engine::guard();
     match fs_ops.remove_xattr(fs_object_id, name, &ctx.walker_cred(), &guard) {
         step_engine::StepOutcome::Done(()) => SyscallResult::Return(0),
-        step_engine::StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        step_engine::StepOutcome::Err(errno) => SyscallResult::error_from(errno),
         step_engine::StepOutcome::Continue { .. } | step_engine::StepOutcome::Yield { .. } => {
             SyscallResult::Error(EIO_VALUE)
         }

@@ -18,8 +18,8 @@ use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKin
 use tx_subsystems::process::{self, Pid};
 use tx_subsystems::vfs::{
     render_dentry_path, Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta,
-    ProjectionKey, ProjectionSchemaId, RNode, RNodeBacking, StructPayload, S_IFDIR, S_IFLNK,
-    S_IFREG,
+    ProjectedWriteContext, ProjectionKey, ProjectionSchemaId, RNode, RNodeBacking, StructPayload,
+    S_IFDIR, S_IFLNK, S_IFREG,
 };
 
 pub const PROCFS_ROOT_ID: FsObjectId = FsObjectId::new(0x7072_6F00);
@@ -394,7 +394,7 @@ fn write_userns_projection(
         UsernsWriteTarget::UidMap => tx_subsystems::process::nsproxy::write_user_namespace_id_map(
             &user_ns,
             writer_cred,
-            &writer_user_ns,
+            writer_user_ns,
             tx_subsystems::process::nsproxy::UserNsMapKind::Uid,
             offset,
             bytes,
@@ -402,7 +402,7 @@ fn write_userns_projection(
         UsernsWriteTarget::GidMap => tx_subsystems::process::nsproxy::write_user_namespace_id_map(
             &user_ns,
             writer_cred,
-            &writer_user_ns,
+            writer_user_ns,
             tx_subsystems::process::nsproxy::UserNsMapKind::Gid,
             offset,
             bytes,
@@ -570,13 +570,13 @@ impl FsOps for Procfs {
             if name == b"kernel" {
                 return StepOutcome::done(PROCFS_SYS_KERNEL_ID);
             }
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
         if parent == PROCFS_SYS_KERNEL_ID {
             if name == b"tainted" {
                 return StepOutcome::done(PROCFS_SYS_KERNEL_TAINTED_ID);
             }
-            return StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT);
         }
         if let Some(pid) = pid_from_dir(parent) {
             if name == b"mounts" && process_for_procfs_number(pid.0).is_some() {
@@ -935,7 +935,7 @@ impl FsOps for Procfs {
                 let ti = idx.saturating_sub(2);
                 if let Some(thread) = threads.get(ti) {
                     let tid = thread.tid.0;
-                    let s = alloc::format!("{}", tid);
+                    let s = alloc::format!("{tid}");
                     return StepOutcome::done(Some((
                         dir_entry(
                             task_tid_dir_id(pid, tid),
@@ -1057,7 +1057,7 @@ impl FsOps for Procfs {
             let fi = idx.saturating_sub(2);
             if fi < fds.len() {
                 let fd = fds[fi];
-                let name = alloc::format!("{}", fd);
+                let name = alloc::format!("{fd}");
                 return StepOutcome::done(Some((
                     dir_entry(pid_fdinfo_id(pid, fd), InodeKind::Regular, name.as_bytes()),
                     DirCursor([2, (fi + 3) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
@@ -1118,7 +1118,7 @@ impl FsOps for Procfs {
                 let fi = idx.saturating_sub(2);
                 if fi < fds.len() {
                     let fd = fds[fi];
-                    let name = alloc::format!("{}", fd);
+                    let name = alloc::format!("{fd}");
                     return StepOutcome::done(Some((
                         dir_entry(pid_fdinfo_id(pid, fd), InodeKind::Regular, name.as_bytes()),
                         DirCursor([2, (fi + 1) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
@@ -1229,7 +1229,7 @@ impl FsOps for Procfs {
                 return StepOutcome::err(Errno::ENOENT);
             };
             // v1: render as "fd:N" since we don't have reverse-path from OpenFile.
-            let target = alloc::format!("anon_inode:[{}]", fd_num);
+            let target = alloc::format!("anon_inode:[{fd_num}]");
             StepOutcome::done(target.into_bytes().into_boxed_slice())
         } else if let Some(pid) = pid_from_exe_id(id) {
             let Some(proc) = process::process_by_pid(pid) else {
@@ -1444,7 +1444,13 @@ impl FsOps for Procfs {
         bytes: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
-        self.step_write_projected_with_netns(fs_object_id, _offset, bytes, None, None, None, _guard)
+        self.step_write_projected_with_netns(
+            fs_object_id,
+            _offset,
+            bytes,
+            ProjectedWriteContext::default(),
+            _guard,
+        )
     }
 
     fn step_write_projected_with_netns(
@@ -1452,19 +1458,21 @@ impl FsOps for Procfs {
         fs_object_id: FsObjectId,
         _offset: u64,
         bytes: &[u8],
-        caller_netns: Option<&tx_subsystems::net::NetNamespacePayload>,
-        writer_cred: Option<tx_subsystems::cred::Cred>,
-        writer_user_ns: Option<&Cap<tx_subsystems::process::nsproxy::UserNamespace>>,
+        context: ProjectedWriteContext<'_>,
         _guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
-        if let Some(outcome) =
-            write_userns_projection(fs_object_id, _offset, bytes, writer_cred, writer_user_ns)
-        {
+        if let Some(outcome) = write_userns_projection(
+            fs_object_id,
+            _offset,
+            bytes,
+            context.writer_cred,
+            context.writer_user_ns,
+        ) {
             return outcome;
         }
 
         let default_netns;
-        let netns = match caller_netns {
+        let netns = match context.caller_netns {
             Some(netns) => netns,
             None => {
                 default_netns = tx_subsystems::net::initial_net_namespace_payload();
@@ -1998,9 +2006,11 @@ mod tests {
                 PROCFS_SYS_NET_IPV4_IP_FORWARD_ID,
                 0,
                 b"1\n",
-                Some(&isolated),
-                None,
-                None,
+                ProjectedWriteContext {
+                    caller_netns: Some(&isolated),
+                    writer_cred: None,
+                    writer_user_ns: None,
+                },
                 &guard,
             ),
             StepOutcome::Done(2)
@@ -2014,9 +2024,11 @@ mod tests {
                 PROCFS_NET_TX_NF_RULES_ID,
                 0,
                 command,
-                Some(&isolated),
-                None,
-                None,
+                ProjectedWriteContext {
+                    caller_netns: Some(&isolated),
+                    writer_cred: None,
+                    writer_user_ns: None,
+                },
                 &guard,
             ),
             StepOutcome::Done(command.len() as u64)

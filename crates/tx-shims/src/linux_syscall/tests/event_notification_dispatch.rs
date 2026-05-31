@@ -211,7 +211,7 @@ fn dispatch_epoll_pwait2_rejects_invalid_timespec() {
 fn dispatch_inotify_scaffold_validates_flags_then_reports_deferred_storage() {
     let (_setup, proc_cap, thread) = event_notify_setup();
     let ctx = make_ctx(proc_cap, thread);
-    assert_eq!(
+    assert!(matches!(
         block_on(dispatch::<ShimsTestPmap>(
             SyscallRequest::new(
                 NR_INOTIFY_INIT1,
@@ -219,8 +219,8 @@ fn dispatch_inotify_scaffold_validates_flags_then_reports_deferred_storage() {
             ),
             &ctx,
         )),
-        SyscallResult::Error(E_NOSYS)
-    );
+        SyscallResult::Return(_)
+    ));
     assert_eq!(
         block_on(dispatch::<ShimsTestPmap>(
             SyscallRequest::new(NR_INOTIFY_INIT1, [0x8000_0000, 0, 0, 0, 0, 0]),
@@ -248,7 +248,7 @@ fn dispatch_inotify_scaffold_validates_flags_then_reports_deferred_storage() {
 fn dispatch_fanotify_scaffold_validates_init_flags_then_reports_deferred_storage() {
     let (_setup, proc_cap, thread) = event_notify_setup();
     let ctx = make_ctx(proc_cap, thread);
-    assert_eq!(
+    assert!(matches!(
         block_on(dispatch::<ShimsTestPmap>(
             SyscallRequest::new(
                 NR_FANOTIFY_INIT,
@@ -256,8 +256,8 @@ fn dispatch_fanotify_scaffold_validates_init_flags_then_reports_deferred_storage
             ),
             &ctx,
         )),
-        SyscallResult::Error(E_NOSYS)
-    );
+        SyscallResult::Return(_)
+    ));
     assert_eq!(
         block_on(dispatch::<ShimsTestPmap>(
             SyscallRequest::new(NR_FANOTIFY_INIT, [0x8000_0000, 0, 0, 0, 0, 0]),

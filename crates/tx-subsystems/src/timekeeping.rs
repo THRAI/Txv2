@@ -520,6 +520,12 @@ impl Timekeeper {
     }
 }
 
+impl Default for Timekeeper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 static TIMEKEEPER: Timekeeper = Timekeeper::new();
 
 pub fn clock_now_ns<P: TimeIf>(clock: ClockId) -> u64 {

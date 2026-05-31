@@ -104,7 +104,7 @@ fn net_delegate_step_once_rekicks_after_loopback_progress() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let (client, listener, _local, _remote) = prepare_loopback_connect_with_client_send_buf(
         40_192,
         50_192,

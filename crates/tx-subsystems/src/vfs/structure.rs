@@ -41,17 +41,11 @@ pub use crate::vfs::notification::{VFS_READABLE, VFS_WRITABLE};
 
 pub const VFS_NAME_MAX: usize = 255;
 
-/// Per-RNode wait-source interest mask: bytes are available to read.
-///
-/// PR-3D-5: VFS lands the per-inode read/write wait-source primitive
-/// in the same shape pipe/tty/exit_source use: one `Arc<WaitSource>`
-/// per direction per inode, sharing the legacy `wait_source` registry
-/// `u64` namespace with a paired reactor `Channel`. The bit lives on
-/// VFS rather than on a backing because the wake-publication shape is
-/// VFS-uniform (every inode has read/write semantics with the same
-/// blocking-IO contract); per-backing helpers (`pipe`, `tty`, future
-/// `socket`) layer their own bit allocations on top of this shape if
-/// they need them.
+// Per-RNode wait-source interest masks live in `vfs::notification`.
+// PR-3D-5 placed the per-inode read/write wait-source primitive in the same
+// shape pipe/tty/exit_source use: one `Arc<WaitSource>` per direction per
+// inode, sharing the legacy `wait_source` registry `u64` namespace with a
+// paired reactor `Channel`.
 // === zone statics =====================================================
 
 static DENTRY_ZONE: Zone<DEntry> = Zone::const_new();

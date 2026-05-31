@@ -152,7 +152,7 @@ mod tests {
     fn debug_format_includes_refcount_and_value() {
         let a = Shared::new(5u32);
         let b = a.share();
-        let debug_str = format!("{:?}", a);
+        let debug_str = format!("{a:?}");
         assert!(debug_str.contains("refcount"));
         assert!(debug_str.contains("5"));
         drop(b);

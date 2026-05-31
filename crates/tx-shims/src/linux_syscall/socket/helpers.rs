@@ -1,5 +1,4 @@
 use super::*;
-use tx_subsystems::vfs::step_walk;
 
 pub(super) fn connect_sockaddr_for_local_stack(
     kind: SocketKind,
@@ -572,17 +571,12 @@ pub(super) fn read_sockaddr_un_path<'a>(
 pub(super) fn unix_pathname_bind_precheck<'a>(
     ctx: &SyscallCtx<'a>,
     path: &[u8],
-) -> Result<(), Errno> {
-    let Some(cwd) = ctx.process.cwd() else {
-        return Ok(());
-    };
+) -> Result<(), i32> {
     let cred = ctx.walker_cred();
-    let guard = tx_substrate::epoch::guard();
-    match step_walk(cwd, path, &cred, &guard) {
-        StepOutcome::Done(_) => Err(Errno::EADDRINUSE),
-        StepOutcome::Err(Errno::ENOENT) => Ok(()),
-        StepOutcome::Err(errno) => Err(errno),
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Err(Errno::EIO),
+    match drive_resolve(ctx, ResolveRequest::entity(AT_FDCWD, path, &cred)) {
+        Ok(_) => Err(errno_to_i32(Errno::EADDRINUSE)),
+        Err(ENOENT_VALUE) => Ok(()),
+        Err(errno) => Err(errno),
     }
 }
 
@@ -1511,13 +1505,13 @@ pub(super) fn step_unit_result(outcome: StepOutcome<(), NoProgress>) -> SyscallR
     }
 }
 
-pub(super) fn wait_on_yield_shape(shape: YieldShape) -> Option<wait_source::RegisteredWaitFuture> {
+pub(super) fn wait_on_yield_shape<'a>(
+    ctx: &'a SyscallCtx<'_>,
+    shape: YieldShape,
+) -> Option<MailboxSourceFuture<'a>> {
     match shape {
         YieldShape::OnWaitSource { source, interests }
-        | YieldShape::OnEdge { source, interests } => {
-            let token = tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
-            wait_source::wait_on_token(token)
-        }
+        | YieldShape::OnEdge { source, interests } => wait_source_future(ctx, source, interests),
         YieldShape::OnAgent { .. } | YieldShape::OnTimer { .. } => None,
     }
 }
@@ -1529,7 +1523,7 @@ pub(super) enum SocketWaitWake {
 }
 
 pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
-    mut socket_future: wait_source::RegisteredWaitFuture,
+    mut socket_future: MailboxSourceFuture<'_>,
     pid: u32,
 ) -> SocketWaitWake {
     if super::time::consume_itimer_real_delivered_interrupt(pid) {

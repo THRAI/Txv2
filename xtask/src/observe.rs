@@ -436,8 +436,7 @@ fn observe_extract(args: &[String]) -> Result<()> {
             'A'..='F' => c as u8 - b'A' + 10,
             _ => {
                 return Err(format!(
-                    "unexpected non-hex character '{}' inside TXTRACE frame",
-                    c
+                    "unexpected non-hex character '{c}' inside TXTRACE frame"
                 ));
             }
         };
@@ -1057,7 +1056,7 @@ fn observe_demo(args: &[String]) -> Result<()> {
     let mut json = String::from("{\n  \"name_table\": {\n");
     for (i, (id, name)) in names_table.iter().enumerate() {
         let sep = if i + 1 == names_table.len() { "" } else { "," };
-        json.push_str(&format!("    \"{}\": \"{}\"{}\n", id, name, sep));
+        json.push_str(&format!("    \"{id}\": \"{name}\"{sep}\n"));
     }
     json.push_str("  }\n}\n");
     fs::write(&names_path, &json)

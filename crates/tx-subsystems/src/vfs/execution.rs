@@ -354,14 +354,19 @@ pub trait FsOps: Send + Sync + 'static {
         fs_object_id: FsObjectId,
         offset: u64,
         bytes: &[u8],
-        caller_netns: Option<&crate::net::NetNamespacePayload>,
-        writer_cred: Option<crate::cred::Cred>,
-        writer_user_ns: Option<&Cap<crate::process::nsproxy::UserNamespace>>,
+        context: ProjectedWriteContext<'_>,
         guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
-        let _ = (caller_netns, writer_cred, writer_user_ns);
+        let _ = context;
         self.step_write_projected(fs_object_id, offset, bytes, guard)
     }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ProjectedWriteContext<'a> {
+    pub caller_netns: Option<&'a crate::net::NetNamespacePayload>,
+    pub writer_cred: Option<crate::cred::Cred>,
+    pub writer_user_ns: Option<&'a Cap<crate::process::nsproxy::UserNamespace>>,
 }
 
 /// Filesystem driver output produced at mount time and consumed by Mount
@@ -390,6 +395,11 @@ pub struct MountOutput {
 impl OpenFile {
     /// Dispatch a read against this file's RNode backing.
     pub fn step_read(&self, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        // observe: delegated to `step_read_with_netns`.
+        // upgrade: delegated to `step_read_with_netns`.
+        // reserve: delegated to `step_read_with_netns`.
+        // commit: delegated to `step_read_with_netns`.
+        // publish: delegated to `step_read_with_netns`.
         self.step_read_with_netns(out, None, guard)
     }
 
@@ -440,11 +450,7 @@ impl OpenFile {
                     if file_flags.nonblocking {
                         StepOutcome::Err(Errno::EAGAIN)
                     } else {
-                        StepOutcome::yield_on_wait_source(
-                            ByteProgress::EMPTY,
-                            rnode.read_wait_source_id(),
-                            super::structure::VFS_READABLE,
-                        )
+                        crate::vfs::notification::read_wait(rnode.read_wait_source_id())
                     }
                 }
                 StructPayload::Pipe {
@@ -635,6 +641,11 @@ impl OpenFile {
 
     /// Dispatch a write against this file's RNode backing.
     pub fn step_write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        // observe: delegated to `step_write_with_netns`.
+        // upgrade: delegated to `step_write_with_netns`.
+        // reserve: delegated to `step_write_with_netns`.
+        // commit: delegated to `step_write_with_netns`.
+        // publish: delegated to `step_write_with_netns`.
         self.step_write_with_netns(bytes, None, guard)
     }
 
@@ -646,7 +657,20 @@ impl OpenFile {
         caller_netns: Option<&crate::net::NetNamespacePayload>,
         guard: &Guard<'_>,
     ) -> StepOutcome<usize, ByteProgress> {
-        self.step_write_with_context(bytes, caller_netns, None, None, guard)
+        // observe: delegated to `step_write_with_context`.
+        // upgrade: delegated to `step_write_with_context`.
+        // reserve: delegated to `step_write_with_context`.
+        // commit: delegated to `step_write_with_context`.
+        // publish: delegated to `step_write_with_context`.
+        self.step_write_with_context(
+            bytes,
+            ProjectedWriteContext {
+                caller_netns,
+                writer_cred: None,
+                writer_user_ns: None,
+            },
+            guard,
+        )
     }
 
     /// Dispatch a write with caller namespace and credential context for
@@ -654,9 +678,7 @@ impl OpenFile {
     pub fn step_write_with_context(
         &self,
         bytes: &[u8],
-        caller_netns: Option<&crate::net::NetNamespacePayload>,
-        writer_cred: Option<crate::cred::Cred>,
-        writer_user_ns: Option<&Cap<crate::process::nsproxy::UserNamespace>>,
+        context: ProjectedWriteContext<'_>,
         guard: &Guard<'_>,
     ) -> StepOutcome<usize, ByteProgress> {
         let file_flags = self.flags();
@@ -752,9 +774,7 @@ impl OpenFile {
                         rnode.fs_object_id(),
                         off,
                         bytes,
-                        caller_netns,
-                        writer_cred,
-                        writer_user_ns,
+                        context,
                         guard,
                     ) {
                         StepOutcome::Done(n) => {
@@ -1001,9 +1021,11 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteOp<'a> {
             .map(|netns| &**netns as &crate::net::NetNamespacePayload);
         let result = self.file.step_write_with_context(
             &self.bytes[self.cursor..],
-            caller_netns,
-            self.writer_cred,
-            self.writer_user_ns.as_ref(),
+            ProjectedWriteContext {
+                caller_netns,
+                writer_cred: self.writer_cred,
+                writer_user_ns: self.writer_user_ns.as_ref(),
+            },
             &guard,
         );
         match &result {

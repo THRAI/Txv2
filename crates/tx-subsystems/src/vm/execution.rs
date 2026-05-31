@@ -967,7 +967,9 @@ impl MapReservation<'_> {
 /// token's channel has been retired the await is a no-op and the caller's
 /// retry loop runs immediately.
 async fn await_range_lock(token: WaitToken) {
-    let _ = token;
+    if let Some(wait) = crate::wait_source::wait_on_source(token.source_id(), token.interest()) {
+        wait.await;
+    }
 }
 
 /// `RangeLock::acquire_step` only ever produces `V3StepOutcome::Done`

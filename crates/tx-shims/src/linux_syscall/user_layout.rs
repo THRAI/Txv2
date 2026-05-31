@@ -523,7 +523,7 @@ pub const KERNEL_USER_LAYOUT_CANDIDATES: &[KernelUserCandidate] = &[
             KernelUserField {
                 rust: "ssi_int",
                 musl: "ssi_int",
-                offset: 20,
+                offset: 44,
             },
             KernelUserField {
                 rust: "ssi_ptr",

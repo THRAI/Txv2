@@ -4,7 +4,7 @@
 //! Execution code calls `notify_changed` / `wait_for_change` instead of
 //! constructing raw masks or wait-source yields directly.
 
-pub(crate) use readiness::{notify_changed, wait_for_change};
+pub(crate) use readiness::{new_changed_wait_point, notify_changed, wait_for_change};
 
 use tx_platform_adapter::notification_adapter;
 
@@ -20,6 +20,24 @@ mod readiness {
     use crate::process::adapter::wait_routing::{self, Channel, Mask, WaitSource};
 
     pub const SEM_CHANGED: u64 = 1;
+
+    pub(crate) struct SemChangedWaitPoint {
+        pub(crate) channel: Channel,
+        pub(crate) source_id: u64,
+        pub(crate) source: Arc<WaitSource>,
+    }
+
+    pub(crate) fn new_changed_wait_point() -> SemChangedWaitPoint {
+        let channel = Channel::new();
+        let source_id = crate::allocate_notification_source_id();
+        crate::wait_source::register_wait_channel_with_id(source_id, channel.clone());
+        let source = wait_routing::new_wait_source(source_id);
+        SemChangedWaitPoint {
+            channel,
+            source_id,
+            source,
+        }
+    }
 
     pub(crate) fn wait_for_change(source_id: u64) -> StepOutcome<usize, NoProgress> {
         StepOutcome::yield_on_wait_source(NoProgress, source_id, SEM_CHANGED)

@@ -569,7 +569,7 @@ impl<State> BootStaticBag<State> {
     }
 
     pub(crate) fn bootstrap_pmap_info_ref(&self) -> Option<&'static BootstrapPmapInfo> {
-        unsafe { (&*BOOTSTRAP_PMAP_INFO.0.get()).as_ref() }
+        unsafe { (*BOOTSTRAP_PMAP_INFO.0.get()).as_ref() }
     }
 
     pub(crate) unsafe fn bootstrap_pmap_info_mut(&self) -> &'static mut Option<BootstrapPmapInfo> {

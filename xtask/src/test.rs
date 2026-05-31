@@ -46,8 +46,7 @@ pub(crate) fn test(root: &Path, args: Vec<String>) -> Result<()> {
     let target = TxTarget::parse(&target_value)?;
     if target != TxTarget::Rv64Qemu {
         return Err(format!(
-            "test lanes currently support --target rv64-qemu only, got {}",
-            target_value
+            "test lanes currently support --target rv64-qemu only, got {target_value}"
         ));
     }
 

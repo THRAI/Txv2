@@ -1,5 +1,5 @@
 use smoltcp::time::Instant;
-use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
+use tx_reactor::wait::{Channel, WaitOutcome, WaitProtocol};
 
 use super::net_delegate_kick_tick;
 
@@ -25,7 +25,7 @@ pub async fn net_delegate_wait_tick_deadline(
 ) -> WaitOutcome {
     let outcome = timer_channel
         .wait_event(
-            Mask::from_bits(0),
+            crate::net::notification::empty_mask(),
             WaitProtocol::InterruptibleTimeout(deadline_ns),
             || false,
         )

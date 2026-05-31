@@ -5,7 +5,9 @@
 
 use tx_platform_adapter::notification_adapter;
 
-pub(crate) use readiness::{new_wait_point, notify_bucket, notify_exact, FutexWaitPoint};
+pub(crate) use readiness::{
+    new_wait_point, notify_bucket, notify_exact, wait_bucket, yielded_source_id, FutexWaitPoint,
+};
 
 #[notification_adapter(
     subsystem = "futex",
@@ -15,8 +17,11 @@ pub(crate) use readiness::{new_wait_point, notify_bucket, notify_exact, FutexWai
 mod readiness {
     use alloc::sync::Arc;
 
-    use crate::futex::adapter::step_engine::InterestMask;
+    use crate::futex::adapter::step_engine::{
+        InterestMask, NoProgress, StepOutcome, StepProgress, YieldShape,
+    };
     use crate::futex::adapter::wait_routing::{self, Channel, WaitSource};
+    use crate::futex::FUTEX_WAKE_MASK;
 
     pub(crate) struct FutexWaitPoint {
         pub(crate) channel: Channel,
@@ -43,5 +48,21 @@ mod readiness {
     pub(crate) fn notify_bucket(channel: &Channel, source: &Arc<WaitSource>, mask: u64) -> u32 {
         wait_routing::fire_legacy_channel(channel, mask);
         source.notify(InterestMask::new(mask)) as u32
+    }
+
+    pub(crate) fn yielded_source_id<T, P: StepProgress>(
+        outcome: &StepOutcome<T, P>,
+    ) -> Option<u64> {
+        match outcome {
+            StepOutcome::Yield {
+                shape: YieldShape::OnWaitSource { source, .. },
+                ..
+            } => Some(source.raw()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn wait_bucket<T>(source_id: u64) -> StepOutcome<T, NoProgress> {
+        StepOutcome::yield_on_wait_source(NoProgress, source_id, FUTEX_WAKE_MASK)
     }
 }

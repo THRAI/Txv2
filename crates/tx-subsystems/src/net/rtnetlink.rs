@@ -731,7 +731,7 @@ fn default_veth_peer_name(
     }
 
     for idx in 1..256 {
-        let candidate = format!("eth{}", idx);
+        let candidate = format!("eth{idx}");
         if candidate != left_name && netns.find_device_by_name(&candidate).is_none() {
             return Ok(leak_ifname(&candidate));
         }

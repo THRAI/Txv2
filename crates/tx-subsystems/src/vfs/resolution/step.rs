@@ -207,6 +207,17 @@ pub fn kernel_step(
         ));
     }
 
+    if rules.mode == WalkMode::ParentAndName && remaining.is_empty() {
+        let rnode = current.rnode().clone();
+        let fs_object_id = rnode.fs_object_id();
+        return KernelStep::Continue(WalkState::Terminal(PathResolution {
+            dentry: current,
+            rnode,
+            fs_object_id,
+            meta: parent_meta,
+        }));
+    }
+
     let child_inline = match InlineName::new(&component) {
         Ok(n) => n,
         Err(_) => return KernelStep::Error(WalkCause::ComponentNotFound),
@@ -234,12 +245,7 @@ pub fn kernel_step(
                     },
                     hop_count,
                 };
-                return KernelStep::NeedIO(
-                    IORequest::LoadInodeMeta {
-                        fs_object_id: fs_object_id,
-                    },
-                    token,
-                );
+                return KernelStep::NeedIO(IORequest::LoadInodeMeta { fs_object_id }, token);
             }
             StepOutcome::Err(e) => return KernelStep::Error(WalkCause::FsOpsRejected(e)),
             StepOutcome::Continue { .. } => {

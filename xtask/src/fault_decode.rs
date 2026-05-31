@@ -1916,7 +1916,7 @@ fn print_address_details(
         println!("  section: {section}");
     }
     if let Some((name, offset)) = &analysis.nearest {
-        println!("  symbol: {name} + {:#x}", offset);
+        println!("  symbol: {name} + {offset:#x}");
     }
     if analysis.frames.is_empty() {
         println!("  source: <unavailable>");
@@ -2129,14 +2129,12 @@ fn decode_rv64_insn(b: [u8; 4]) -> String {
                     } else {
                         format!("compressed (op={op} f3={f3} bits={w:#018b})")
                     }
+                } else if rs2_5 == 0 && rd5 == 0 {
+                    "c.ebreak".to_string()
+                } else if rs2_5 == 0 && rd5 != 0 {
+                    format!("c.jalr {}", RV64_REG_NAMES[rd5])
                 } else {
-                    if rs2_5 == 0 && rd5 == 0 {
-                        "c.ebreak".to_string()
-                    } else if rs2_5 == 0 && rd5 != 0 {
-                        format!("c.jalr {}", RV64_REG_NAMES[rd5])
-                    } else {
-                        format!("c.add {}, {}", RV64_REG_NAMES[rd5], RV64_REG_NAMES[rs2_5])
-                    }
+                    format!("c.add {}, {}", RV64_REG_NAMES[rd5], RV64_REG_NAMES[rs2_5])
                 }
             }
             (2, 6) => {

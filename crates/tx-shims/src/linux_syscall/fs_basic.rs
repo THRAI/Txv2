@@ -317,7 +317,7 @@ pub(super) fn sys_memfd_secret<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
 /// open?" rather than the retired `FD_TABLE_SIZE = 8` ceiling — Linux
 /// returns `-EBADF` for `F_GETFD`/`F_SETFD` against a closed fd):
 /// - fd not currently open → `-EBADF`.
-/// - Unknown `cmd` → `-ENOSYS`.
+/// - Unknown `cmd` → `-EINVAL`.
 pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as u32;
     let cmd = args[1] as i32;
@@ -468,7 +468,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 Err(errno) => SyscallResult::error_from(errno),
             }
         }
-        _ => SyscallResult::Error(ENOSYS_VALUE),
+        _ => SyscallResult::Error(EINVAL_VALUE),
     }
 }
 

@@ -10,7 +10,7 @@ use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
 use tx_reactor::{
     HartId, InitialSchedMeta, Phase1Scheduler, PriorityBoostError, Reactor, RescheduleSignal,
     RunStats, SharedReactor, SliceClock, SliceConfig, StopReason, TaskHandle, TaskId, TaskStatus,
-    WakeDispatchReport, WakeHint,
+    TimerGuard, TimerGuardRole, WakeDispatchReport, WakeHint,
 };
 use tx_substrate::step::{Deadline, InterestMask, WaitSourceId};
 use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox, WaitGeneration};

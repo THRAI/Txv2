@@ -121,8 +121,7 @@ pub(crate) fn lint_invariants_step_discipline(root: &Path) -> Result<()> {
         "ok"
     };
     println!(
-        "missing ≥1 stage comment: {:>4}  (ceiling {})  {}",
-        missing_count, MAX_STEPS_WITHOUT_5_STAGE, status
+        "missing ≥1 stage comment: {missing_count:>4}  (ceiling {MAX_STEPS_WITHOUT_5_STAGE})  {status}"
     );
 
     for m in &missing_stages {

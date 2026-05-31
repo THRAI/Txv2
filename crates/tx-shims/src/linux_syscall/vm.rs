@@ -16,6 +16,7 @@ use tx_subsystems::vm::step_ops::{
 
 const MEMFD_NAME_MAX: usize = 249;
 const MFD_HUGE_MASK: u64 = 0x3f << 26;
+const MMAP_TYPE_MASK: u64 = 0x03;
 
 static NEXT_MEMFD_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(0x6d66_6400);
 
@@ -153,6 +154,48 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
     let fd = args[4] as i32;
     let offset = args[4 + 1]; // args[5]
 
+    let map_type = flags & MMAP_TYPE_MASK;
+    let private = map_type == MAP_PRIVATE;
+    let shared = map_type == MAP_SHARED || map_type == MAP_SHARED_VALIDATE;
+    let shared_validate = map_type == MAP_SHARED_VALIDATE;
+    if !private && !shared {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let known_flags = MAP_SHARED_VALIDATE
+        | MAP_PRIVATE
+        | MAP_FIXED
+        | MAP_ANONYMOUS
+        | MAP_GROWSDOWN
+        | MAP_DENYWRITE
+        | MAP_EXECUTABLE
+        | MAP_LOCKED
+        | MAP_NORESERVE
+        | MAP_POPULATE
+        | MAP_NONBLOCK
+        | MAP_STACK
+        | MAP_HUGETLB
+        | MAP_SYNC
+        | MAP_FIXED_NOREPLACE;
+    if flags & !known_flags != 0 {
+        return SyscallResult::Error(if shared_validate {
+            errno_to_i32(Errno::EOPNOTSUPP)
+        } else {
+            EINVAL_VALUE
+        });
+    }
+
+    let file = if flags & MAP_ANONYMOUS == 0 {
+        if fd < 0 {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
+        match resolve_fd(&ctx.process, fd as u32) {
+            Some(f) => Some(f),
+            None => return SyscallResult::Error(EBADF_VALUE),
+        }
+    } else {
+        None
+    };
+
     // Length validation. Linux rounds the byte length up to a whole
     // page; addr (when MAP_FIXED is set) must already be page-aligned.
     if length_in == 0 {
@@ -181,13 +224,6 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
         prot_bits & PROT_EXEC != 0,
     );
 
-    // Decode `flags`. Exactly one of MAP_SHARED / MAP_PRIVATE required.
-    let private = flags & MAP_PRIVATE != 0;
-    let shared = flags & MAP_SHARED != 0;
-    if private == shared {
-        // both unset, or both set
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
     let fixed = flags & MAP_FIXED != 0;
     let fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
     let anonymous = flags & MAP_ANONYMOUS != 0;
@@ -222,13 +258,10 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
             VmBacking::PrivateAnon
         }
     } else {
-        if fd < 0 {
-            return SyscallResult::Error(EBADF_VALUE);
+        let file = file.expect("file-backed mmap resolved fd before length validation");
+        if !file.flags().read {
+            return SyscallResult::Error(errno_to_i32(Errno::EACCES));
         }
-        let file = match resolve_fd(&ctx.process, fd as u32) {
-            Some(f) => f,
-            None => return SyscallResult::Error(EBADF_VALUE),
-        };
         if shared
             && prot.write
             && (file.has_memfd_seal(F_SEAL_WRITE) || file.has_memfd_seal(F_SEAL_FUTURE_WRITE))
@@ -1274,6 +1307,9 @@ pub(super) async fn sys_mremap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
 
     match result {
         Ok(outcome) => SyscallResult::Return(outcome.new_range.start().as_usize() as i64),
+        Err(V3Errno::EINVAL) if !range_is_fully_mapped(&ctx.aspace, old_range) => {
+            SyscallResult::Error(EFAULT_VALUE)
+        }
         Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
     }
 }
@@ -1417,6 +1453,22 @@ fn remap_file_pages_target(
     None
 }
 
+fn range_is_fully_mapped(aspace: &AddressSpace, range: UserRange) -> bool {
+    let mut cursor = range.start().as_usize();
+    let end = range.end().as_usize();
+    for entry in aspace.recipes_overlapping(range) {
+        let entry_start = entry.range.start().as_usize();
+        if entry_start > cursor {
+            return false;
+        }
+        cursor = cursor.max(entry.range.end().as_usize());
+        if cursor >= end {
+            return true;
+        }
+    }
+    false
+}
+
 /// `mincore(addr, length, vec)` — Linux RV64 generic syscall #232.
 ///
 /// Copies one byte per covered page to `vec`; bit 0 is set when the page
@@ -1446,7 +1498,7 @@ pub(super) fn sys_mincore<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
 
     let residency = ctx.aspace.mincore(range);
     let mut vec = Vec::with_capacity(residency.len());
-    vec.extend(residency.into_iter().map(|resident| u8::from(resident)));
+    vec.extend(residency.into_iter().map(u8::from));
     match bootstrap_copy_to_user(&ctx.aspace, vec_uaddr, &vec) {
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::error_from(errno),
@@ -1712,6 +1764,10 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 timeout_deadline_ns = Some(<P as TimeIf>::read_ns().saturating_add(timeout_ns));
+                if timeout_deadline_ns.is_some_and(|deadline| <P as TimeIf>::read_ns() >= deadline)
+                {
+                    return SyscallResult::error_from(Errno::ETIMEDOUT);
+                }
             }
             let (deadline_ns, interrupted_by_process_timer) =
                 futex_wait_deadline(ctx, timeout_deadline_ns);
@@ -1756,7 +1812,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             {
                 Ok(()) => SyscallResult::Return(0),
                 Err(v3errno) => {
-                    let errno: Errno = v3errno.into();
+                    let errno = v3errno;
                     if interrupted_by_process_timer && errno == Errno::ETIMEDOUT {
                         let now_ns = <P as TimeIf>::read_ns().max(deadline_ns.unwrap_or_default());
                         super::time::poll_expired_process_timers_at(ctx, now_ns);
@@ -1831,7 +1887,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             drop(guard);
             match outcome {
                 StepOutcome::Done(woken) => SyscallResult::Return(woken as i64),
-                StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+                StepOutcome::Err(errno) => SyscallResult::error_from(errno),
                 StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
                     SyscallResult::error_from(Errno::EIO)
                 }
@@ -1858,7 +1914,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             drop(guard);
             match outcome {
                 StepOutcome::Done(count) => SyscallResult::Return(count as i64),
-                StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+                StepOutcome::Err(errno) => SyscallResult::error_from(errno),
                 StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
                     SyscallResult::error_from(Errno::EIO)
                 }
@@ -1942,9 +1998,7 @@ pub(super) async fn sys_futex_waitv<'a, P: TimeIf>(
                 match observed {
                     StepOutcome::Done(value) if value == wait.val => {}
                     StepOutcome::Done(_) => return SyscallResult::Error(EAGAIN_VALUE),
-                    StepOutcome::Err(errno) => {
-                        return SyscallResult::error_from(Errno::from(errno))
-                    }
+                    StepOutcome::Err(errno) => return SyscallResult::error_from(errno),
                     StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
                         return SyscallResult::error_from(Errno::EFAULT);
                     }
@@ -1976,7 +2030,7 @@ pub(super) async fn sys_futex_waitv<'a, P: TimeIf>(
     .await
     {
         Ok(index) => SyscallResult::Return(index as i64),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -2025,7 +2079,7 @@ pub(super) async fn sys_futex2_wait<'a, P: TimeIf>(
             match observed {
                 StepOutcome::Done(value) if value == val => return SyscallResult::Error(110),
                 StepOutcome::Done(_) => return SyscallResult::Error(EAGAIN_VALUE),
-                StepOutcome::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+                StepOutcome::Err(errno) => return SyscallResult::error_from(errno),
                 StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
                     return SyscallResult::error_from(Errno::EFAULT);
                 }
@@ -2064,7 +2118,7 @@ pub(super) async fn sys_futex2_wait<'a, P: TimeIf>(
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
@@ -2107,7 +2161,7 @@ pub(super) fn sys_futex2_requeue(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscal
     {
         StepOutcome::Done(observed) if observed == source.val as u32 => {}
         StepOutcome::Done(_) => return SyscallResult::Error(EAGAIN_VALUE),
-        StepOutcome::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        StepOutcome::Err(errno) => return SyscallResult::error_from(errno),
         StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
             return SyscallResult::error_from(Errno::EFAULT);
         }
@@ -2123,7 +2177,7 @@ pub(super) fn sys_futex2_requeue(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscal
     drop(guard);
     match outcome {
         StepOutcome::Done(count) => SyscallResult::Return(count as i64),
-        StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        StepOutcome::Err(errno) => SyscallResult::error_from(errno),
         StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
             SyscallResult::error_from(Errno::EIO)
         }
@@ -2221,7 +2275,7 @@ async fn futex_wait_requeue_pi<P: TimeIf>(
                     return SyscallResult::Error(ETIMEDOUT_VALUE);
                 }
                 StepOutcome::Done(_) => return SyscallResult::Error(EAGAIN_VALUE),
-                StepOutcome::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+                StepOutcome::Err(errno) => return SyscallResult::error_from(errno),
                 StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
                     return SyscallResult::error_from(Errno::EFAULT);
                 }
@@ -2262,7 +2316,7 @@ async fn futex_wait_requeue_pi<P: TimeIf>(
     {
         Ok(()) => SyscallResult::Return(0),
         Err(v3errno) => {
-            let errno: Errno = v3errno.into();
+            let errno = v3errno;
             SyscallResult::error_from(errno)
         }
     }
@@ -2285,7 +2339,7 @@ async fn futex_pi_lock_pi2(ctx: &SyscallCtx<'_>, uaddr: u64, timeout_uaddr: u64)
                     return SyscallResult::Error(ETIMEDOUT_VALUE);
                 }
                 StepOutcome::Done(_) => {}
-                StepOutcome::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+                StepOutcome::Err(errno) => return SyscallResult::error_from(errno),
                 StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
                     return SyscallResult::error_from(Errno::EFAULT);
                 }
@@ -2310,7 +2364,7 @@ async fn futex_pi_lock(
         drop(guard);
         return match outcome {
             StepOutcome::Done(()) => SyscallResult::Return(0),
-            StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+            StepOutcome::Err(errno) => SyscallResult::error_from(errno),
             StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
                 SyscallResult::error_from(Errno::EIO)
             }
@@ -2344,7 +2398,7 @@ async fn futex_pi_lock(
     {
         Ok(()) => SyscallResult::Return(0),
         Err(v3errno) => {
-            let errno: Errno = v3errno.into();
+            let errno = v3errno;
             SyscallResult::error_from(errno)
         }
     }

@@ -15,7 +15,6 @@ use crate::net::namespace::{
 };
 use crate::net::packet::{PacketSource, PacketTxSink};
 use crate::net::protocol::{EtherIface, LoopbackIface};
-use crate::wait_source;
 
 use super::{
     net_delegate_clear, net_delegate_kick_poll, net_delegate_queue, net_delegate_wait_token,
@@ -131,7 +130,9 @@ where
         .max_ready_steps
         .is_none_or(|max_ready_steps| report.ready_steps < max_ready_steps)
     {
-        let Some(wait) = wait_source::wait_on_token(net_delegate_wait_token()) else {
+        let token = net_delegate_wait_token();
+        let Some(wait) = crate::wait_source::wait_on_source(token.source_id(), token.interest())
+        else {
             report.waits_failed += 1;
             break;
         };
@@ -162,7 +163,9 @@ pub async fn net_delegate_task_loop_with_deadline_hook(
         .max_ready_steps
         .is_none_or(|max_ready_steps| report.ready_steps < max_ready_steps)
     {
-        let Some(wait) = wait_source::wait_on_token(net_delegate_wait_token()) else {
+        let token = net_delegate_wait_token();
+        let Some(wait) = crate::wait_source::wait_on_source(token.source_id(), token.interest())
+        else {
             report.waits_failed += 1;
             break;
         };

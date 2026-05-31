@@ -6,7 +6,8 @@
 use tx_platform_adapter::notification_adapter;
 
 pub(crate) use readiness::{
-    new_rnode_wait_points, notify_readable, notify_writable, ppoll_wait, release_rnode_wait_points,
+    new_rnode_wait_points, notify_readable, notify_writable, ppoll_wait, read_wait,
+    release_rnode_wait_points,
 };
 pub use readiness::{VFS_READABLE, VFS_WRITABLE};
 
@@ -18,7 +19,9 @@ pub use readiness::{VFS_READABLE, VFS_WRITABLE};
 mod readiness {
     use alloc::sync::Arc;
 
-    use crate::vfs::adapter::step_engine::{InterestMask, NoProgress, StepOutcome, WaitSourceId};
+    use crate::vfs::adapter::step_engine::{
+        ByteProgress, InterestMask, NoProgress, StepOutcome, WaitSourceId,
+    };
     use crate::vfs::adapter::wait_routing::{self, Channel, WaitSource};
 
     /// Per-RNode wait-source interest mask: bytes are available to read.
@@ -74,5 +77,9 @@ mod readiness {
         interests: InterestMask,
     ) -> StepOutcome<usize, NoProgress> {
         StepOutcome::yield_on_wait_source(NoProgress, source.raw(), interests.raw())
+    }
+
+    pub(crate) fn read_wait<T>(source_id: u64) -> StepOutcome<T, ByteProgress> {
+        StepOutcome::yield_on_wait_source(ByteProgress::EMPTY, source_id, VFS_READABLE)
     }
 }

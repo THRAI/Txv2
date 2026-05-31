@@ -234,10 +234,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         });
         let failed_count = ordered.iter().filter(|(_, r)| r.is_err()).count();
         let passed = ordered.len() - failed_count;
-        println!(
-            "shell-test: groups: {} passed, {} failed",
-            passed, failed_count,
-        );
+        println!("shell-test: groups: {passed} passed, {failed_count} failed",);
         for (name, result) in &ordered {
             match result {
                 Ok(()) => println!("  ok    {name}"),
@@ -546,7 +543,7 @@ impl Directive {
                 format!("wait {:?} within {} ms", needle, timeout.as_millis())
             }
             Self::Sleep(ms) => format!("sleep {ms} ms"),
-            Self::Send(text) => format!("send {:?}", text),
+            Self::Send(text) => format!("send {text:?}"),
             Self::Expect { needle, timeout } => {
                 format!("expect {:?} within {} ms", needle, timeout.as_millis())
             }
@@ -673,7 +670,7 @@ fn parse_pattern_with_timeout(rest: &str) -> std::result::Result<(String, Durati
 fn parse_quoted(s: &str) -> std::result::Result<String, String> {
     let (parsed, rest) = split_quoted_prefix(s)?;
     if !rest.trim().is_empty() {
-        return Err(format!("trailing garbage after quoted string: {:?}", rest));
+        return Err(format!("trailing garbage after quoted string: {rest:?}"));
     }
     Ok(parsed)
 }

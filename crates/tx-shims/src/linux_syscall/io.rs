@@ -810,25 +810,14 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
             }
             break (read_ready, write_ready, except_ready, ready_count);
         };
-        let futures = wait_tokens
-            .into_iter()
-            .filter_map(wait_source::wait_on_token)
-            .collect::<alloc::vec::Vec<_>>();
-        if !futures.is_empty() {
-            if let Some(deadline_ns) = effective_deadline_ns {
-                match wait_on_any_token_or_pselect_deadline::<P>(futures, deadline_ns).await {
-                    PselectWaitWake::FdReady => {}
-                    PselectWaitWake::TimedOut => {
-                        break (read_ready, write_ready, except_ready, ready_count);
-                    }
+        if let Some(deadline_ns) = effective_deadline_ns {
+            match wait_on_any_token_or_pselect_deadline::<P>(ctx, &wait_tokens, deadline_ns).await {
+                PselectWaitWake::FdReady => {}
+                PselectWaitWake::TimedOut => {
+                    break (read_ready, write_ready, except_ready, ready_count);
                 }
-            } else {
-                wait_on_any_token(futures).await;
             }
-        } else {
-            if let Some(deadline_ns) = effective_deadline_ns {
-                wait_until_pselect_deadline::<P>(deadline_ns).await;
-            }
+        } else if !wait_on_any_token(ctx, &wait_tokens).await {
             break (read_ready, write_ready, except_ready, ready_count);
         }
     };
@@ -914,20 +903,30 @@ fn push_unique_wait_token(
     }
 }
 
-async fn wait_on_any_token(mut futures: alloc::vec::Vec<wait_source::RegisteredWaitFuture>) {
-    core::future::poll_fn(|cx| {
-        for future in futures.iter_mut() {
-            if core::future::Future::poll(core::pin::Pin::new(future), cx).is_ready() {
-                return core::task::Poll::Ready(());
-            }
-        }
-        core::task::Poll::Pending
-    })
-    .await
+fn wait_token_sources(
+    tokens: &[tx_subsystems::execution::WaitToken],
+) -> alloc::vec::Vec<(
+    crate::adapter::step_engine::WaitSourceId,
+    crate::adapter::step_engine::InterestMask,
+)> {
+    tokens
+        .iter()
+        .copied()
+        .map(wait_token_source)
+        .collect::<alloc::vec::Vec<_>>()
+}
+
+async fn wait_on_any_token(
+    ctx: &SyscallCtx<'_>,
+    tokens: &[tx_subsystems::execution::WaitToken],
+) -> bool {
+    let sources = wait_token_sources(tokens);
+    await_any_wait_source(ctx, &sources).await
 }
 
 async fn wait_on_any_token_or_pselect_deadline<P: tx_hal::TimeIf>(
-    mut fd_futures: alloc::vec::Vec<wait_source::RegisteredWaitFuture>,
+    ctx: &SyscallCtx<'_>,
+    tokens: &[tx_subsystems::execution::WaitToken],
     deadline_ns: u64,
 ) -> PselectWaitWake {
     if <P as tx_hal::TimeIf>::read_ns() >= deadline_ns {
@@ -937,11 +936,15 @@ async fn wait_on_any_token_or_pselect_deadline<P: tx_hal::TimeIf>(
         return PselectWaitWake::TimedOut;
     };
 
+    let sources = wait_token_sources(tokens);
+    let Some(mut fd_future) = any_wait_source_future(ctx, &sources) else {
+        let _ = timer_future.await;
+        return PselectWaitWake::TimedOut;
+    };
+
     core::future::poll_fn(|cx| {
-        for future in fd_futures.iter_mut() {
-            if core::future::Future::poll(core::pin::Pin::new(future), cx).is_ready() {
-                return core::task::Poll::Ready(PselectWaitWake::FdReady);
-            }
+        if core::future::Future::poll(core::pin::Pin::new(&mut fd_future), cx).is_ready() {
+            return core::task::Poll::Ready(PselectWaitWake::FdReady);
         }
         if core::future::Future::poll(core::pin::Pin::new(&mut timer_future), cx).is_ready() {
             return core::task::Poll::Ready(PselectWaitWake::TimedOut);
@@ -1093,7 +1096,7 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
                 {
                     Ok(()) => {}
                     Err(v3errno) => {
-                        let errno: tx_subsystems::execution::Errno = v3errno.into();
+                        let errno = v3errno;
                         if errno == tx_subsystems::execution::Errno::EINTR {
                             break SyscallResult::Error(EINTR_VALUE);
                         }
@@ -1131,10 +1134,20 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
                 break 0;
             }
         }
+        if tx_subsystems::signal::select_next_signal(&ctx.thread).is_some() {
+            return restore_ppoll_sigmask(
+                ctx,
+                saved_mask,
+                temporary_sigmask,
+                SyscallResult::Error(EINTR_VALUE),
+            );
+        }
 
         let mut ready: i64 = 0;
         let mut wait_tokens = alloc::vec::Vec::new();
-        let mut effective_deadline_ns = timeout_deadline_ns;
+        let process_timer_deadline = ctx.process.next_process_timer_deadline_ns();
+        let (mut effective_deadline_ns, mut deadline_reason) =
+            earliest_pselect_wake_deadline(timeout_deadline_ns, process_timer_deadline);
         for i in 0..nfds {
             let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
             let mut ent_bytes = [0u8; POLLFD_BYTES as usize];
@@ -1161,6 +1174,12 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
                                     &mut effective_deadline_ns,
                                     tfd.deadline_ns(),
                                 );
+                                if matches!(
+                                    (effective_deadline_ns, tfd.deadline_ns()),
+                                    (Some(effective), timerfd) if effective == timerfd
+                                ) {
+                                    deadline_reason = PselectDeadlineReason::Timeout;
+                                }
                                 push_unique_wait_token(
                                     &mut wait_tokens,
                                     tx_subsystems::execution::WaitToken::new(
@@ -1356,6 +1375,18 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
         if wait_tokens.is_empty() {
             if let Some(deadline_ns) = effective_deadline_ns {
                 wait_until_pselect_deadline::<P>(deadline_ns).await;
+                if deadline_reason == PselectDeadlineReason::ProcessTimer {
+                    let now_ns = <P as tx_hal::TimeIf>::read_ns().max(deadline_ns);
+                    super::time::poll_expired_process_timers_at(ctx, now_ns);
+                    if tx_subsystems::signal::select_next_signal(&ctx.thread).is_some() {
+                        return restore_ppoll_sigmask(
+                            ctx,
+                            saved_mask,
+                            temporary_sigmask,
+                            SyscallResult::Error(EINTR_VALUE),
+                        );
+                    }
+                }
             } else if timeout == PselectTimeout::Infinite {
                 tx_reactor::yield_now().await;
                 continue;
@@ -1363,17 +1394,28 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
             break 0;
         }
 
-        let futures = wait_tokens
-            .into_iter()
-            .filter_map(wait_source::wait_on_token)
-            .collect::<alloc::vec::Vec<_>>();
         if let Some(deadline_ns) = effective_deadline_ns {
-            match wait_on_any_token_or_pselect_deadline::<P>(futures, deadline_ns).await {
+            match wait_on_any_token_or_pselect_deadline::<P>(ctx, &wait_tokens, deadline_ns).await {
                 PselectWaitWake::FdReady => {}
-                PselectWaitWake::TimedOut => break 0,
+                PselectWaitWake::TimedOut => {
+                    if deadline_reason == PselectDeadlineReason::ProcessTimer {
+                        let now_ns = <P as tx_hal::TimeIf>::read_ns().max(deadline_ns);
+                        super::time::poll_expired_process_timers_at(ctx, now_ns);
+                        if tx_subsystems::signal::select_next_signal(&ctx.thread).is_some() {
+                            return restore_ppoll_sigmask(
+                                ctx,
+                                saved_mask,
+                                temporary_sigmask,
+                                SyscallResult::Error(EINTR_VALUE),
+                            );
+                        }
+                    } else {
+                        break 0;
+                    }
+                }
             }
-        } else if !futures.is_empty() {
-            wait_on_any_token(futures).await;
+        } else if !wait_on_any_token(ctx, &wait_tokens).await {
+            break 0;
         }
     };
 
@@ -1387,6 +1429,26 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
         temporary_sigmask,
         SyscallResult::Return(ready),
     )
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PselectDeadlineReason {
+    Timeout,
+    ProcessTimer,
+}
+
+fn earliest_pselect_wake_deadline(
+    timeout_deadline: Option<u64>,
+    process_timer_deadline: Option<u64>,
+) -> (Option<u64>, PselectDeadlineReason) {
+    match (timeout_deadline, process_timer_deadline) {
+        (Some(timeout), Some(timer)) if timer <= timeout => {
+            (Some(timer), PselectDeadlineReason::ProcessTimer)
+        }
+        (Some(timeout), _) => (Some(timeout), PselectDeadlineReason::Timeout),
+        (None, Some(timer)) => (Some(timer), PselectDeadlineReason::ProcessTimer),
+        (None, None) => (None, PselectDeadlineReason::Timeout),
+    }
 }
 
 /// PageBacked `write(2)` — direct user-buffer path.
@@ -1722,7 +1784,7 @@ async fn sys_write_socket(
     }
 
     if udp_write_can_drive_loopback_inline(&socket) {
-        return sys_write_udp_loopback_socket(&socket, bytes, flags).await;
+        return sys_write_udp_loopback_socket(&socket, bytes, flags, ctx).await;
     }
 
     if matches!(
@@ -1812,11 +1874,7 @@ async fn sys_write_socket(
                 match shape {
                     tx_substrate::step::YieldShape::OnWaitSource { source, interests }
                     | tx_substrate::step::YieldShape::OnEdge { source, interests } => {
-                        let token =
-                            tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
-                        if let Some(future) = wait_source::wait_on_token(token) {
-                            let _ = future.await;
-                        }
+                        await_wait_source(ctx, source, interests).await;
                     }
                     tx_substrate::step::YieldShape::OnAgent { .. }
                     | tx_substrate::step::YieldShape::OnTimer { .. } => {
@@ -1841,6 +1899,7 @@ async fn sys_write_udp_loopback_socket(
     socket: &Cap<tx_subsystems::net::SocketIdentity>,
     bytes: &[u8],
     flags: tx_subsystems::net::SendRecvFlags,
+    ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
     loop {
         let outcome = {
@@ -1866,11 +1925,7 @@ async fn sys_write_udp_loopback_socket(
                 match shape {
                     tx_substrate::step::YieldShape::OnWaitSource { source, interests }
                     | tx_substrate::step::YieldShape::OnEdge { source, interests } => {
-                        let token =
-                            tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
-                        if let Some(future) = wait_source::wait_on_token(token) {
-                            let _ = future.await;
-                        }
+                        await_wait_source(ctx, source, interests).await;
                     }
                     tx_substrate::step::YieldShape::OnAgent { .. }
                     | tx_substrate::step::YieldShape::OnTimer { .. } => {
@@ -1973,9 +2028,7 @@ async fn sys_read_socket<'a>(
                     };
                     match wait_token {
                         Some(Ok(Some(token))) => {
-                            if let Some(future) = wait_source::wait_on_token(token) {
-                                let _ = future.await;
-                            } else {
+                            if !await_wait_token(ctx, token).await {
                                 return SyscallResult::Error(EIO_VALUE);
                             }
                         }
@@ -2018,11 +2071,7 @@ async fn sys_read_socket<'a>(
                 match shape {
                     tx_substrate::step::YieldShape::OnWaitSource { source, interests }
                     | tx_substrate::step::YieldShape::OnEdge { source, interests } => {
-                        let token =
-                            tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
-                        if let Some(future) = wait_source::wait_on_token(token) {
-                            let _ = future.await;
-                        }
+                        await_wait_source(ctx, source, interests).await;
                     }
                     tx_substrate::step::YieldShape::OnAgent { .. }
                     | tx_substrate::step::YieldShape::OnTimer { .. } => {
@@ -2642,7 +2691,7 @@ pub(super) async fn sys_copy_file_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>
     let transferred = match outcome {
         tx_substrate::step::StepOutcome::Done(n) => n,
         tx_substrate::step::StepOutcome::Err(e) => {
-            let errno: tx_subsystems::execution::Errno = e.into();
+            let errno = e;
             return SyscallResult::error_from(errno);
         }
         _ => return SyscallResult::Error(EAGAIN_VALUE),

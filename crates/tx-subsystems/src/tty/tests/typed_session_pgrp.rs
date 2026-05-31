@@ -15,7 +15,9 @@ use crate::process::structure::{reset_pid_counter_for_test, ExitStatus, Pgid};
 use crate::process::{
     bootstrap_init_process, step_exit_group, step_fork, step_setpgid, step_setsid, ProcessIdentity,
 };
-use crate::signal::{deliver_tty_dispatch, step_kill_pgrp, DispatchOutcome, Signum};
+use crate::signal::{
+    deliver_tty_dispatch, step_kill_pgrp, step_sigaction, DispatchOutcome, SigDisposition, Signum,
+};
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::structure::reset_tid_counter_for_test;
 use crate::tty::execution::{
@@ -327,6 +329,7 @@ fn step_read_for_process_posts_sigttin_to_background_caller_pgrp() {
     let init = fresh_init();
     let child = step_fork::<TestPmap>(&init, false, false).expect("fork");
     step_setpgid(&child, Pgid(child.pid.0)).expect("child pgrp");
+    let _ = step_sigaction(&child, Signum::SIGTTIN, SigDisposition::Handler(0xCAFE));
 
     let tty = fresh_tty("ttyS-bg-read");
     let guard = guard();
@@ -346,6 +349,7 @@ fn step_write_for_process_posts_sigttou_to_background_caller_pgrp() {
     let init = fresh_init();
     let child = step_fork::<TestPmap>(&init, false, false).expect("fork");
     step_setpgid(&child, Pgid(child.pid.0)).expect("child pgrp");
+    let _ = step_sigaction(&child, Signum::SIGTTOU, SigDisposition::Handler(0xCAFE));
 
     let tty = fresh_tty("ttyS-bg-write");
     let guard = guard();
@@ -535,6 +539,7 @@ fn step_hangup_exposes_typed_session_leader_pgrp_dispatch() {
     let pgrp = init.pgrp_cap();
     let guard = guard();
 
+    let _ = step_sigaction(&init, Signum::SIGHUP, SigDisposition::Handler(0xCAFE));
     tty.bind_session_pgrp_typed(&session, &pgrp);
 
     let outcome = match crate::tty::execution::step_hangup(&tty, &guard) {

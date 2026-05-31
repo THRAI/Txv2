@@ -279,7 +279,7 @@ fn set_thread_signal_mask(ctx: &SyscallCtx, next: SignalMask) -> Result<SignalMa
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(SigprocmaskChange::Replaced { prev, .. }) => Ok(prev),
         Ok(SigprocmaskChange::ZombieIgnored) => Err(SyscallResult::Error(ESRCH_VALUE)),
-        Err(v3errno) => Err(SyscallResult::error_from(Errno::from(v3errno))),
+        Err(v3errno) => Err(SyscallResult::error_from(v3errno)),
     }
 }
 
@@ -342,7 +342,7 @@ pub(super) async fn sys_rt_sigsuspend<P: tx_hal::TimeIf>(
         {
             Ok(()) => {}
             Err(v3errno) => {
-                let errno: Errno = v3errno.into();
+                let errno = v3errno;
                 if errno == Errno::EINTR {
                     return restore_and_eintr(ctx, old_mask);
                 }
@@ -453,8 +453,7 @@ async fn park_sigtimedwait_tick<P: tx_hal::TimeIf>(
 
     if wait_bits & Signum::SIGCHLD.bit() != 0 {
         if let Some(token) = ctx.process.exit_source_wait_token() {
-            if let Some(future) = tx_subsystems::wait_source::wait_on_token(token) {
-                future.await;
+            if await_wait_token(ctx, token).await {
                 return;
             }
         }

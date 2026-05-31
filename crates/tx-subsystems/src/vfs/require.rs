@@ -107,11 +107,10 @@ pub fn require_parent_and_name<'g>(
 
     let name = InlineName::new(name_bytes).map_err(|_| Errno::ENAMETOOLONG)?;
 
-    let _ = parent_path;
     let resolved = driver::walk_to_completion(
         rooted_at,
-        path,
-        WalkMode::ParentAndName,
+        parent_path,
+        WalkMode::Entity,
         FinalSymlinkPolicy::Follow,
         cred,
         guard,

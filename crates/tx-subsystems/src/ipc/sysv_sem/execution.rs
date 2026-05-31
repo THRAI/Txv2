@@ -14,14 +14,11 @@ use crate::ipc::sysv_sem::structure::{self, sem_flg, SemBuf};
 use crate::ipc::sysv_shm::execution::{IPC_CREAT, IPC_EXCL, IPC_PRIVATE};
 use crate::ipc::sysv_shm::structure::IpcPerm;
 use crate::process::adapter::step_engine::{
-    Cap, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, WaitSourceId,
-    YieldShape,
+    Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
 use crate::process::nsproxy::SysvKey;
 use crate::process::structure::ProcessIdentity;
 use tx_substrate::step::{Errno as StepErrno, ResumeOutcome};
-
-const SEM_CHANGED_MASK: u64 = 1;
 
 fn fire_sem_changed(payload: &structure::SemArrayPayload) {
     payload.changed_seq.fetch_add(1, Ordering::Release);
@@ -130,7 +127,7 @@ pub fn step_semop(
     // non-blocking Result shape by surfacing a yielded wait as EAGAIN.
     match step_semop_v3(semid, sops, cred, process) {
         StepOutcome::Done(applied) => Ok(applied),
-        StepOutcome::Err(errno) => Err(errno.into()),
+        StepOutcome::Err(errno) => Err(errno),
         StepOutcome::Yield { .. } => Err(Errno::EAGAIN),
         StepOutcome::Continue { .. } => Err(Errno::EIO),
     }
@@ -148,25 +145,25 @@ pub fn step_semop_v3(
     // commit: apply the state transition.
     // publish: emit readiness, signal, or observable outcome.
     if sops.is_empty() {
-        return StepOutcome::err(Errno::EINVAL.into());
+        return StepOutcome::err(Errno::EINVAL);
     }
 
     let array = match checks::require_sem_exists(semid) {
         Ok(array) => array,
-        Err(errno) => return StepOutcome::err(errno.into()),
+        Err(errno) => return StepOutcome::err(errno),
     };
     if array.destroyed.load(Ordering::Acquire) {
-        return StepOutcome::err(Errno::EIDRM.into());
+        return StepOutcome::err(Errno::EIDRM);
     }
     if let Err(errno) = checks::require_can_write_sem(&array, cred) {
-        return StepOutcome::err(errno.into());
+        return StepOutcome::err(errno);
     }
 
     let nowait = sops.iter().any(|s| (s.sem_flg & sem_flg::IPC_NOWAIT) != 0);
 
     let payload = match array.payload.lock().as_ref().cloned() {
         Some(payload) => payload,
-        None => return StepOutcome::err(Errno::EIDRM.into()),
+        None => return StepOutcome::err(Errno::EIDRM),
     };
 
     {
@@ -175,7 +172,7 @@ pub fn step_semop_v3(
         // Validate all ops can fit.
         for s in sops {
             if s.sem_num >= array.nsems {
-                return StepOutcome::err(Errno::EFBIG.into());
+                return StepOutcome::err(Errno::EFBIG);
             }
         }
 
@@ -196,7 +193,7 @@ pub fn step_semop_v3(
 
         if would_block {
             if nowait {
-                return StepOutcome::err(Errno::EAGAIN.into());
+                return StepOutcome::err(Errno::EAGAIN);
             }
             return notification::wait_for_change(payload.changed_source_id);
         }
@@ -232,7 +229,7 @@ pub fn step_semop_v3(
                 .ok_or(Errno::ESRCH);
             let proc_payload = match proc_payload {
                 Ok(proc_payload) => proc_payload,
-                Err(errno) => return StepOutcome::err(errno.into()),
+                Err(errno) => return StepOutcome::err(errno),
             };
             proc_payload.record_sem_undo(semid, undo_adjustments);
         }
@@ -301,15 +298,9 @@ impl<I: SubjectIdentity> StepOp<I> for SemopWaitOp<'_> {
                         crate::futex::register_waiting_tid(self.tid);
                     }
                     self.waiting = true;
-                    StepOutcome::Yield {
-                        progress: NoProgress,
-                        shape: YieldShape::OnWaitSource {
-                            source: WaitSourceId::new(source_id),
-                            interests: InterestMask::new(SEM_CHANGED_MASK),
-                        },
-                    }
+                    notification::wait_for_change(source_id)
                 }
-                Err(errno) => StepOutcome::Err(errno.into()),
+                Err(errno) => StepOutcome::Err(errno),
             },
             Err(Errno::EINVAL)
                 if self
@@ -317,9 +308,9 @@ impl<I: SubjectIdentity> StepOp<I> for SemopWaitOp<'_> {
                     .as_ref()
                     .is_some_and(|array| array.destroyed.load(Ordering::Acquire)) =>
             {
-                StepOutcome::Err(Errno::EIDRM.into())
+                StepOutcome::Err(Errno::EIDRM)
             }
-            Err(errno) => StepOutcome::Err(errno.into()),
+            Err(errno) => StepOutcome::Err(errno),
         }
     }
 

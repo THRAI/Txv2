@@ -118,7 +118,7 @@ pub(crate) fn run_cmd_owned_in(cwd: &Path, program: &str, args: &[String]) -> Re
 }
 
 pub(crate) fn run_shell(root: &Path, script: &str) -> Result<()> {
-    println!("$ sh -c {}", script);
+    println!("$ sh -c {script}");
     let status = Command::new("sh")
         .arg("-c")
         .arg(script)

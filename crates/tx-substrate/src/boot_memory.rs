@@ -575,7 +575,7 @@ unsafe fn install_allocator_from_plan<P: TxPlatform>(
         let bitmap = core::slice::from_raw_parts(bitmap_ptr, plan.bitmap_word_count());
 
         let allocator =
-            (&mut *BOOT_ALLOCATOR.0.get()).write(BitmapPageAllocator::new_with_base_and_zeroer(
+            (*BOOT_ALLOCATOR.0.get()).write(BitmapPageAllocator::new_with_base_and_zeroer(
                 metas,
                 bitmap,
                 plan.base_ppn,

@@ -70,8 +70,7 @@ fn write_all(ctx: &SyscallCtx<'_>, fd: u32, bytes: &[u8]) {
 }
 
 fn read_exact(ctx: &SyscallCtx<'_>, fd: u32, len: usize) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.resize(len, 0);
+    let mut out = alloc::vec![0; len];
     let result = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(
             NR_READ,

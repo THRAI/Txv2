@@ -651,7 +651,7 @@ fn dispatch_futex_wake_op_applies_encoded_operation_to_uaddr2() {
     // atomically add 3 to *uaddr2, then because old == 5, perform
     // the second wake. No waiters are registered here, so the return
     // count is 0; the externally visible contract is the RMW.
-    let encoded = (1u64 << 28) | (0u64 << 24) | (3u64 << 12) | 5u64;
+    let encoded = (1u64 << 28) | (3u64 << 12) | 5u64;
     let req = SyscallRequest::new(
         NR_FUTEX,
         [uaddr, FUTEX_WAKE_OP as u64, 1, 1, uaddr2, encoded],
@@ -673,7 +673,7 @@ fn dispatch_futex_wake_op_shifted_set_uses_shifted_operand() {
 
     // FUTEX_OP(FUTEX_OP_SET | FUTEX_OP_OPARG_SHIFT, 4, FUTEX_OP_CMP_EQ, 5):
     // Linux shifts oparg before applying every operation, including SET.
-    let encoded = (8u64 << 28) | (0u64 << 24) | (4u64 << 12) | 5u64;
+    let encoded = (8u64 << 28) | (4u64 << 12) | 5u64;
     let req = SyscallRequest::new(
         NR_FUTEX,
         [uaddr, FUTEX_WAKE_OP as u64, 1, 1, uaddr2, encoded],

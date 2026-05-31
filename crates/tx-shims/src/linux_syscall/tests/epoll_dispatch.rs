@@ -23,6 +23,7 @@ const EPOLL_CTL_ADD: u32 = 1;
 const EPOLL_CTL_DEL: u32 = 2;
 const EPOLL_CTL_MOD: u32 = 3;
 const EPOLLIN: u32 = 0x001;
+const EPOLLERR: u32 = 0x008;
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 const SIGALRM_RAW: u8 = 14;
 
@@ -110,6 +111,29 @@ fn epoll_add(ctx: &SyscallCtx<'_>, epfd: i64, fd: i64) -> SyscallResult {
                 EPOLL_CTL_ADD as u64,
                 fd as u64,
                 &mut event as *mut TestEpollEvent as u64,
+                0,
+                0,
+            ],
+        ),
+        ctx,
+    ))
+}
+
+fn epoll_ctl(
+    ctx: &SyscallCtx<'_>,
+    epfd: i64,
+    op: u32,
+    fd: i64,
+    event: &mut TestEpollEvent,
+) -> SyscallResult {
+    block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_EPOLL_CTL,
+            [
+                epfd as u64,
+                op as u64,
+                fd as u64,
+                event as *mut TestEpollEvent as u64,
                 0,
                 0,
             ],

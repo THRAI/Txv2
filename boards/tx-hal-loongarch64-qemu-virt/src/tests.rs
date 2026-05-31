@@ -630,9 +630,7 @@ fn la64_signal_frame_restore_uses_saved_user_context() {
 
 #[test]
 fn la64_fpsimdif_initial_state_is_signal_frame_compatible() {
-    const {
-        assert!(<Platform as FpSimdIf>::SUPPORTED);
-    }
+    assert!(core::hint::black_box(<Platform as FpSimdIf>::SUPPORTED));
     let state = <Platform as FpSimdIf>::init_state();
     assert!(state.is_valid());
     assert_eq!(state.flags & tx_hal::UserFpContext::FLAG_DIRTY, 0);
@@ -1084,8 +1082,10 @@ fn pmap_shootdown_paths_are_host_noops() {
 #[test]
 #[cfg(not(target_arch = "loongarch64"))]
 fn cache_and_dma_paths_publish_qemu_coherent_defaults() {
-    const { assert!(<Platform as PlatformConfig>::DMA_COHERENT) };
-    const { assert!(<Platform as DmaIf>::DMA_COHERENT) };
+    assert!(core::hint::black_box(
+        <Platform as PlatformConfig>::DMA_COHERENT
+    ));
+    assert!(core::hint::black_box(<Platform as DmaIf>::DMA_COHERENT));
     assert_eq!(
         <Platform as DmaIf>::phys_to_dma(PhysAddr(0x1234)),
         DmaAddr(0x1234)

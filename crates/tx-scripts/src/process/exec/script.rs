@@ -331,7 +331,13 @@ pub async fn exec_script<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     envp: &[&[u8]],
     cred: &Credential,
 ) -> Result<(), ExecError> {
-    exec_script_inner::<P>(0, process, thread, None, path, argv, envp, cred).await
+    let ctx = ExecScriptContext {
+        process,
+        thread,
+        envp,
+        cred,
+    };
+    exec_script_inner::<P>(&ctx, 0, None, path, argv).await
 }
 
 /// Variant of [`exec_script`] whose initial program path is resolved relative
@@ -347,19 +353,33 @@ pub async fn exec_script_at<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     envp: &[&[u8]],
     cred: &Credential,
 ) -> Result<(), ExecError> {
-    exec_script_inner::<P>(0, process, thread, Some(rooted_at), path, argv, envp, cred).await
+    let ctx = ExecScriptContext {
+        process,
+        thread,
+        envp,
+        cred,
+    };
+    exec_script_inner::<P>(&ctx, 0, Some(rooted_at), path, argv).await
+}
+
+struct ExecScriptContext<'a> {
+    process: &'a Cap<ProcessIdentity>,
+    thread: &'a Cap<ThreadIdentity>,
+    envp: &'a [&'a [u8]],
+    cred: &'a Credential,
 }
 
 async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
+    ctx: &ExecScriptContext<'_>,
     depth: usize,
-    process: &Cap<ProcessIdentity>,
-    thread: &Cap<ThreadIdentity>,
     rooted_at_override: Option<Cap<DEntry>>,
     path: &[u8],
     argv: &[&[u8]],
-    envp: &[&[u8]],
-    cred: &Credential,
 ) -> Result<(), ExecError> {
+    let process = ctx.process;
+    let thread = ctx.thread;
+    let envp = ctx.envp;
+    let cred = ctx.cred;
     // Shebang recursion guard (Linux limit: 4).
     if depth > SHEBANG_MAX_DEPTH {
         return Err(ExecError::IoError); // maps to ELOOP
@@ -523,14 +543,11 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             let (interp_path, new_argv) = shebang_exec_argv(interp, opt_arg, path, argv);
             let new_argv_refs: Vec<&[u8]> = new_argv.iter().map(|v| v.as_slice()).collect();
             return alloc::boxed::Box::pin(exec_script_inner::<P>(
+                ctx,
                 depth + 1,
-                process,
-                thread,
                 None,
                 &interp_path,
                 &new_argv_refs,
-                envp,
-                cred,
             ))
             .await;
         }
@@ -548,14 +565,11 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         }
         let new_argv_refs: Vec<&[u8]> = new_argv.iter().map(|v| v.as_slice()).collect();
         return alloc::boxed::Box::pin(exec_script_inner::<P>(
+            ctx,
             depth + 1,
-            process,
-            thread,
             None,
             DEFAULT_SHELL,
             &new_argv_refs,
-            envp,
-            cred,
         ))
         .await;
     }
@@ -584,14 +598,11 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 }
                 let new_argv_refs: Vec<&[u8]> = new_argv.iter().map(|v| v.as_slice()).collect();
                 return alloc::boxed::Box::pin(exec_script_inner::<P>(
+                    ctx,
                     depth + 1,
-                    process,
-                    thread,
                     None,
                     &interp_path,
                     &new_argv_refs,
-                    envp,
-                    cred,
                 ))
                 .await;
             }

@@ -125,7 +125,7 @@ pub fn step_msgsnd(
     // non-blocking Result shape by surfacing a yielded wait as EAGAIN.
     match step_msgsnd_v3(msqid, mtype, mtext, msgflg, cred) {
         StepOutcome::Done(sent) => Ok(sent),
-        StepOutcome::Err(errno) => Err(errno.into()),
+        StepOutcome::Err(errno) => Err(errno),
         StepOutcome::Yield { .. } => Err(Errno::EAGAIN),
         StepOutcome::Continue { .. } => Err(Errno::EIO),
     }
@@ -144,18 +144,18 @@ pub fn step_msgsnd_v3(
     // commit: apply the state transition.
     // publish: emit readiness, signal, or observable outcome.
     if mtype <= 0 {
-        return StepOutcome::err(Errno::EINVAL.into());
+        return StepOutcome::err(Errno::EINVAL);
     }
 
     let queue = match checks::require_msg_exists(msqid) {
         Ok(queue) => queue,
-        Err(errno) => return StepOutcome::err(errno.into()),
+        Err(errno) => return StepOutcome::err(errno),
     };
     if queue.destroyed.load(Ordering::Acquire) {
-        return StepOutcome::err(Errno::EIDRM.into());
+        return StepOutcome::err(Errno::EIDRM);
     }
     if let Err(errno) = checks::require_can_write_msg(&queue, cred) {
-        return StepOutcome::err(errno.into());
+        return StepOutcome::err(errno);
     }
 
     let msg = Msg { mtype, mtext };
@@ -163,18 +163,18 @@ pub fn step_msgsnd_v3(
 
     let payload = match queue.payload.lock().as_ref().cloned() {
         Some(payload) => payload,
-        None => return StepOutcome::err(Errno::EIDRM.into()),
+        None => return StepOutcome::err(Errno::EIDRM),
     };
 
     {
         if msg_len > payload.max_msg_size {
-            return StepOutcome::err(Errno::EINVAL.into());
+            return StepOutcome::err(Errno::EINVAL);
         }
 
         let current_bytes = payload.current_bytes.load(Ordering::Acquire);
         if current_bytes + (msg_len as u64) > payload.max_bytes as u64 {
             if (msgflg & IPC_NOWAIT) != 0 {
-                return StepOutcome::err(Errno::EAGAIN.into());
+                return StepOutcome::err(Errno::EAGAIN);
             }
             return notification::wait_for_send_space(payload.send_source_id);
         }
@@ -209,7 +209,7 @@ pub fn step_msgrcv(
     // non-blocking Result shape by surfacing a yielded wait as EAGAIN.
     match step_msgrcv_v3(msqid, msgsz, msgtyp, msgflg, cred) {
         StepOutcome::Done(message) => Ok(message),
-        StepOutcome::Err(errno) => Err(errno.into()),
+        StepOutcome::Err(errno) => Err(errno),
         StepOutcome::Yield { .. } => Err(Errno::EAGAIN),
         StepOutcome::Continue { .. } => Err(Errno::EIO),
     }
@@ -229,28 +229,28 @@ pub fn step_msgrcv_v3(
     // publish: emit readiness, signal, or observable outcome.
     let queue = match checks::require_msg_exists(msqid) {
         Ok(queue) => queue,
-        Err(errno) => return StepOutcome::err(errno.into()),
+        Err(errno) => return StepOutcome::err(errno),
     };
     if queue.destroyed.load(Ordering::Acquire) {
-        return StepOutcome::err(Errno::EIDRM.into());
+        return StepOutcome::err(Errno::EIDRM);
     }
     if let Err(errno) = checks::require_can_read_msg(&queue, cred) {
-        return StepOutcome::err(errno.into());
+        return StepOutcome::err(errno);
     }
 
     let payload = match queue.payload.lock().as_ref().cloned() {
         Some(payload) => payload,
-        None => return StepOutcome::err(Errno::EIDRM.into()),
+        None => return StepOutcome::err(Errno::EIDRM),
     };
 
     {
         let msg_count = payload.msg_count.load(Ordering::Acquire);
         if msg_count == 0 {
             if (msgflg & IPC_NOWAIT) != 0 {
-                return StepOutcome::err(Errno::EAGAIN.into());
+                return StepOutcome::err(Errno::EAGAIN);
             }
             if queue.destroyed.load(Ordering::Acquire) {
-                return StepOutcome::err(Errno::EIDRM.into());
+                return StepOutcome::err(Errno::EIDRM);
             }
             return notification::wait_for_message(payload.recv_source_id);
         }
@@ -258,13 +258,13 @@ pub fn step_msgrcv_v3(
         let mut messages = payload.messages.lock();
         let pos = match find_msg(&messages, msgtyp) {
             Some(pos) => pos,
-            None if (msgflg & IPC_NOWAIT) != 0 => return StepOutcome::err(Errno::EAGAIN.into()),
+            None if (msgflg & IPC_NOWAIT) != 0 => return StepOutcome::err(Errno::EAGAIN),
             None => {
                 return notification::wait_for_message(payload.recv_source_id);
             }
         };
         if messages[pos].mtext.len() > msgsz && (msgflg & MSG_NOERROR) == 0 {
-            return StepOutcome::err(Errno::E2BIG.into());
+            return StepOutcome::err(Errno::E2BIG);
         }
         let msg = messages.remove(pos);
         let mlen = msg.mtext.len();

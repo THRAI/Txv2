@@ -77,7 +77,7 @@ fn step_outcome_continue_carries_progress() {
 #[test]
 fn errno_mirrors_v4_catalog() {
     // The `step::Errno` catalog mirrors `tx_subsystems::execution
-    // ::Errno` byte-for-byte (48 variants). Closed-catalog discipline:
+    // ::Errno` byte-for-byte (50 variants). Closed-catalog discipline:
     // an exhaustive match with no wildcard arm so adding a variant
     // later requires mirroring it here.
     use tx_substrate::step::Errno;
@@ -92,7 +92,9 @@ fn errno_mirrors_v4_catalog() {
         Errno::EAFNOSUPPORT,
         Errno::EBUSY,
         Errno::ECANCELED,
+        Errno::ECONNREFUSED,
         Errno::EDEADLK,
+        Errno::EDESTADDRREQ,
         Errno::EDQUOT,
         Errno::EEXIST,
         Errno::EFBIG,
@@ -122,7 +124,6 @@ fn errno_mirrors_v4_catalog() {
         Errno::EPERM,
         Errno::EPIPE,
         Errno::ERANGE,
-        Errno::EOPNOTSUPP,
         Errno::EROFS,
         Errno::ENOTSOCK,
         Errno::EPROTONOSUPPORT,
@@ -132,7 +133,7 @@ fn errno_mirrors_v4_catalog() {
         Errno::ESTALE,
         Errno::ETIMEDOUT,
     ];
-    assert_eq!(cases.len(), 36);
+    assert_eq!(cases.len(), 50);
     for errno in cases {
         match errno {
             Errno::E2BIG
@@ -145,7 +146,9 @@ fn errno_mirrors_v4_catalog() {
             | Errno::EAFNOSUPPORT
             | Errno::EBUSY
             | Errno::ECANCELED
+            | Errno::ECONNREFUSED
             | Errno::EDEADLK
+            | Errno::EDESTADDRREQ
             | Errno::EDQUOT
             | Errno::EEXIST
             | Errno::EFBIG
@@ -175,7 +178,6 @@ fn errno_mirrors_v4_catalog() {
             | Errno::EPERM
             | Errno::EPIPE
             | Errno::ERANGE
-            | Errno::EOPNOTSUPP
             | Errno::EROFS
             | Errno::ENOTSOCK
             | Errno::EPROTONOSUPPORT

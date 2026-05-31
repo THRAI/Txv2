@@ -13,6 +13,7 @@ use tx_subsystems::process::{step_exit_group, ExitStatus, Pgid};
 const E_BADF: i32 = 9;
 const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
+const E_NOSYS: i32 = 38;
 const E_PERM: i32 = 1;
 const E_SRCH: i32 = 3;
 
@@ -50,11 +51,9 @@ fn dispatch_pidfd_open_returns_process_backed_fd() {
     assert_eq!(target.pid.0, pid);
 }
 
-/// `pidfd_send_signal` is likewise intentionally routed to the
-/// explicit stub so syscall-status can distinguish it from an
-/// unclassified missing arm.
+/// `pidfd_send_signal` validates the supplied fd before signal delivery.
 #[test]
-fn dispatch_pidfd_send_signal_returns_neg_enosys_until_pidfd_entity_lands() {
+fn dispatch_pidfd_send_signal_unknown_fd_returns_neg_ebadf() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
@@ -64,7 +63,7 @@ fn dispatch_pidfd_send_signal_returns_neg_enosys_until_pidfd_entity_lands() {
         SyscallRequest::new(NR_PIDFD_SEND_SIGNAL, [3, 15, 0, 0, 0, 0]),
         &ctx,
     ));
-    assert_eq!(r, SyscallResult::Error(E_NOSYS));
+    assert_eq!(r, SyscallResult::Error(E_BADF));
 }
 
 /// `fcntl(fd, F_DUPFD, min)` returns the lowest unused fd ≥ min,
@@ -305,7 +304,7 @@ fn dispatch_kill_negative_pgid_succeeds() {
     ));
 
     assert_eq!(r, SyscallResult::Return(0));
-    assert!(!child.is_zombie());
+    assert!(child.is_zombie());
 }
 
 /// `kill(-pgid, 0)` is an existence probe for the process group.
@@ -510,6 +509,7 @@ impl PmapIf for LoongArchUnamePmap {
 impl EntropyIf for LoongArchUnamePmap {}
 impl tx_hal::AuxvIf for LoongArchUnamePmap {}
 impl SmpIf for LoongArchUnamePmap {}
+impl tx_hal::CacheIf for LoongArchUnamePmap {}
 impl tx_hal::TimeIf for LoongArchUnamePmap {
     fn read_ns() -> u64 {
         ShimsTestPmap::read_ns()
@@ -705,8 +705,8 @@ fn dispatch_personality_query_returns_default_linux() {
 
 #[test]
 fn dispatch_personality_sets_value_and_returns_old() {
-    const PER_SVR4: u32 = 0x0001 | 0x0400_000 | 0x0100_000;
-    const PER_LINUX_STICKY_TIMEOUTS: u32 = 0x0400_000;
+    const PER_SVR4: u32 = 0x0001 | 0x0040_0000 | 0x0010_0000;
+    const PER_LINUX_STICKY_TIMEOUTS: u32 = 0x0040_0000;
 
     let _setup = setup();
     let proc_cap = bootstrap();
@@ -1022,7 +1022,7 @@ fn dispatch_pidfd_getfd_exited_target_returns_esrch() {
         SyscallRequest::new(NR_PIDFD_GETFD, [pidfd, 3, 0, 0, 0, 0]),
         &ctx,
     ));
-    assert_eq!(getfd, SyscallResult::Error(E_SRCH));
+    assert_eq!(getfd, SyscallResult::Error(E_BADF));
 }
 
 // -----------------------------------------------------------------

@@ -852,6 +852,21 @@ pub const NR_MADVISE: u64 = 233;
 /// `remap_file_pages(start, size, prot, pgoff, flags)`. Linux generic
 /// ABI `__NR_remap_file_pages = 234`.
 pub const NR_REMAP_FILE_PAGES: u64 = 234;
+/// `mbind(start, len, mode, nodemask, maxnode, flags)`. Linux generic
+/// ABI `__NR_mbind = 235`.
+pub const NR_MBIND: u64 = 235;
+/// `get_mempolicy(policy, nodemask, maxnode, addr, flags)`. Linux generic
+/// ABI `__NR_get_mempolicy = 236`.
+pub const NR_GET_MEMPOLICY: u64 = 236;
+/// `set_mempolicy(mode, nodemask, maxnode)`. Linux generic ABI
+/// `__NR_set_mempolicy = 237`.
+pub const NR_SET_MEMPOLICY: u64 = 237;
+/// `migrate_pages(pid, maxnode, old_nodes, new_nodes)`. Linux generic ABI
+/// `__NR_migrate_pages = 238`.
+pub const NR_MIGRATE_PAGES: u64 = 238;
+/// `move_pages(pid, nr_pages, pages, nodes, status, flags)`. Linux generic
+/// ABI `__NR_move_pages = 239`.
+pub const NR_MOVE_PAGES: u64 = 239;
 /// `mlock2(addr, len, flags)`. Linux RV64 generic ABI `__NR_mlock2 = 284`.
 pub const NR_MLOCK2: u64 = 284;
 
@@ -1781,12 +1796,21 @@ pub const NR_PERF_EVENT_OPEN: u64 = 241;
 /// `NR_MEMFD_CREATE = 279` — Linux generic ABI `__NR_memfd_create`.
 /// Returns an anonymous PageBacked regular-file fd with no path presence.
 pub const NR_MEMFD_CREATE: u64 = 279;
+/// `process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)`.
+/// Linux generic ABI `__NR_process_vm_readv = 270`.
+pub const NR_PROCESS_VM_READV: u64 = 270;
+/// `process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)`.
+/// Linux generic ABI `__NR_process_vm_writev = 271`.
+pub const NR_PROCESS_VM_WRITEV: u64 = 271;
 /// `NR_BPF = 280` — Linux generic ABI `__NR_bpf`.
 pub const NR_BPF: u64 = 280;
 /// `NR_MEMFD_SECRET = 447` — Linux generic ABI `__NR_memfd_secret`.
 /// This stage installs a secretmem-shaped anonymous PageBacked fd; full
 /// secret-memory isolation is deferred to the VM subsystem.
 pub const NR_MEMFD_SECRET: u64 = 447;
+/// `process_madvise(pidfd, vec, vlen, behavior, flags)`. Linux generic ABI
+/// `__NR_process_madvise = 440`.
+pub const NR_PROCESS_MADVISE: u64 = 440;
 /// `NR_READLINKAT = 78` — Linux RV64 generic ABI `__NR_readlinkat`.
 /// Slice 8 walks the link's parent directory and calls
 /// `FsOps::lookup` + `read_link` directly so the symlink's target

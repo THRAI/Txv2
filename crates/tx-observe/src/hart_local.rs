@@ -60,7 +60,7 @@ impl<T, const N: usize> HartLocalArray<T, N> {
     /// `idx >= N`.
     #[inline]
     pub(crate) fn get(&self, idx: usize) -> &T {
-        debug_assert!(idx < N, "HartLocalArray: idx {} out of range {}", idx, N);
+        debug_assert!(idx < N, "HartLocalArray: idx {idx} out of range {N}");
         // SAFETY: per the contract, the slot is initialised and only accessed
         // by one hart at a time.
         unsafe { (*self.slots[idx].get()).assume_init_ref() }

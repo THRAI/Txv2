@@ -38,7 +38,7 @@ fn tcp_shutdown_write_calls_raw_close_and_kicks_delegate_poll() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     clear_delegate_queue();
 
     let (client, _accepted) = prepare_connected_loopback_pair(40_197, 50_197);
@@ -74,7 +74,7 @@ fn net_delegate_poll_drives_tcp_fin_to_peer_eof() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     clear_delegate_queue();
 
     let (client, accepted) = prepare_connected_loopback_pair(40_198, 50_198);

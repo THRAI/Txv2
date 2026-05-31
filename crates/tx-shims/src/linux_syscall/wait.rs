@@ -16,6 +16,7 @@ use crate::adapter::reactor_entry::{
     lookup_source, ActiveWait, MailboxEvent, SubscriberId, TaskMailbox, WaitSource,
 };
 use crate::adapter::step_engine::{InterestMask, WaitSourceId};
+use tx_subsystems::execution::WaitToken;
 
 use super::SyscallCtx;
 
@@ -30,14 +31,51 @@ pub(super) async fn await_wait_source(
     await_wait_source_on_mailbox(mailbox, source, interests).await;
 }
 
+pub(super) async fn await_wait_token(ctx: &SyscallCtx<'_>, token: WaitToken) -> bool {
+    let (source, interests) = wait_token_source(token);
+    await_any_wait_source(ctx, &[(source, interests)]).await
+}
+
 pub(super) async fn await_any_wait_source(
     ctx: &SyscallCtx<'_>,
     sources: &[(WaitSourceId, InterestMask)],
 ) -> bool {
-    let Some(mailbox) = ctx.mailbox.as_ref() else {
+    let Some(future) = any_wait_source_future(ctx, sources) else {
         return false;
     };
+    future.await;
+    true
+}
 
+pub(super) fn wait_token_source(token: WaitToken) -> (WaitSourceId, InterestMask) {
+    (
+        WaitSourceId::new(token.source_id()),
+        InterestMask::new(token.interest()),
+    )
+}
+
+pub(super) fn wait_token_future<'a>(
+    ctx: &'a SyscallCtx<'_>,
+    token: WaitToken,
+) -> Option<MailboxSourceFuture<'a>> {
+    let (source, interests) = wait_token_source(token);
+    wait_source_future(ctx, source, interests)
+}
+
+pub(super) fn wait_source_future<'a>(
+    ctx: &'a SyscallCtx<'_>,
+    source: WaitSourceId,
+    interests: InterestMask,
+) -> Option<MailboxSourceFuture<'a>> {
+    let mailbox = ctx.mailbox.as_ref()?;
+    wait_source_future_on_mailbox(mailbox, source, interests)
+}
+
+pub(super) fn any_wait_source_future<'a>(
+    ctx: &'a SyscallCtx<'_>,
+    sources: &[(WaitSourceId, InterestMask)],
+) -> Option<MailboxAnySourceFuture<'a>> {
+    let mailbox = ctx.mailbox.as_ref()?;
     let generation = mailbox.next_generation();
     let mut registrations = Vec::new();
     let mut active = Vec::new();
@@ -57,17 +95,15 @@ pub(super) async fn await_any_wait_source(
     }
 
     if active.is_empty() {
-        return false;
+        return None;
     }
 
-    MailboxAnySourceFuture {
+    Some(MailboxAnySourceFuture {
         mailbox,
         generation,
-        active: &active,
-    }
-    .await;
-    drop(registrations);
-    true
+        active,
+        _registrations: registrations,
+    })
 }
 
 async fn await_wait_source_on_mailbox(
@@ -75,14 +111,28 @@ async fn await_wait_source_on_mailbox(
     source: WaitSourceId,
     interests: InterestMask,
 ) {
+    if let Some(future) = wait_source_future_on_mailbox(mailbox, source, interests) {
+        future.await;
+    }
+}
+
+fn wait_source_future_on_mailbox(
+    mailbox: &Arc<TaskMailbox>,
+    source: WaitSourceId,
+    interests: InterestMask,
+) -> Option<MailboxSourceFuture<'_>> {
     let generation = mailbox.next_generation();
     let active = ActiveWait::new(generation, source, interests);
-    let Some(wait_source) = lookup_source(source) else {
-        return;
-    };
+    let wait_source = lookup_source(source)?;
     let subscriber = wait_source.register(Arc::downgrade(mailbox), generation, interests);
-    MailboxSourceFuture { mailbox, active }.await;
-    wait_source.unregister(subscriber);
+    Some(MailboxSourceFuture {
+        mailbox,
+        active,
+        _registration: SourceRegistration {
+            source: wait_source,
+            subscriber,
+        },
+    })
 }
 
 struct SourceRegistration {
@@ -96,9 +146,10 @@ impl Drop for SourceRegistration {
     }
 }
 
-struct MailboxSourceFuture<'a> {
+pub(super) struct MailboxSourceFuture<'a> {
     mailbox: &'a TaskMailbox,
     active: ActiveWait,
+    _registration: SourceRegistration,
 }
 
 impl Future for MailboxSourceFuture<'_> {
@@ -120,10 +171,11 @@ impl Future for MailboxSourceFuture<'_> {
     }
 }
 
-struct MailboxAnySourceFuture<'a> {
+pub(super) struct MailboxAnySourceFuture<'a> {
     mailbox: &'a TaskMailbox,
     generation: crate::adapter::reactor_entry::WaitGeneration,
-    active: &'a [(WaitSourceId, InterestMask)],
+    active: Vec<(WaitSourceId, InterestMask)>,
+    _registrations: Vec<SourceRegistration>,
 }
 
 impl Future for MailboxAnySourceFuture<'_> {
@@ -132,7 +184,7 @@ impl Future for MailboxAnySourceFuture<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         self.mailbox.register_waker(cx.waker().clone());
         while let Some(event) = self.mailbox.poll() {
-            if matches_any_wait(self.generation, self.active, &event)
+            if matches_any_wait(self.generation, &self.active, &event)
                 || matches!(event, MailboxEvent::SignalDelivered { .. })
             {
                 self.mailbox.clear_waker();

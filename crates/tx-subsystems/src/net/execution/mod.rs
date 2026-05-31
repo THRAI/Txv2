@@ -1,8 +1,9 @@
 //! Network net-only execution steps.
 
 use crate::execution::WaitToken;
+use crate::net::notification;
 use crate::net::structure::{AcceptWireSet, RecvWireSet, SendWireSet, SocketIdentity, UrgentEvent};
-use tx_substrate::step::{ByteProgress, NoProgress, StepOutcome as V3StepOutcome};
+use tx_substrate::step::ByteProgress;
 
 mod step_accept;
 mod step_bind;
@@ -91,17 +92,17 @@ pub use step_udp_loopback::{
 
 pub const SOMAXCONN_STAGING: usize = 128;
 
-pub type ByteStepOutcome<T> = V3StepOutcome<T, ByteProgress>;
+pub type ByteStepOutcome<T> = tx_substrate::step::StepOutcome<T, ByteProgress>;
 
 pub(crate) fn yield_on_token<T>(token: WaitToken) -> crate::execution::StepOutcome<T> {
-    V3StepOutcome::yield_on_wait_source(NoProgress, token.source_id(), token.interest())
+    notification::yield_on_token(token)
 }
 
 pub(crate) fn yield_bytes_on_token<T>(
     progress: ByteProgress,
     token: WaitToken,
 ) -> ByteStepOutcome<T> {
-    V3StepOutcome::yield_on_wait_source(progress, token.source_id(), token.interest())
+    notification::yield_bytes_on_token(progress, token)
 }
 
 pub fn socket_recv_wait_token(socket: &SocketIdentity) -> WaitToken {

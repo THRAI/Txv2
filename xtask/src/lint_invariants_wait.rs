@@ -49,7 +49,7 @@ pub(crate) fn lint_invariants_legacy_wait_channel(root: &Path) -> Result<()> {
                 continue;
             }
 
-            let text = fs::read_to_string(&file).map_err(|err| format!("{}: {err}", rel))?;
+            let text = fs::read_to_string(&file).map_err(|err| format!("{rel}: {err}"))?;
             for (line_idx, line) in text.lines().enumerate() {
                 let Some(code) = code_before_comment(line) else {
                     continue;

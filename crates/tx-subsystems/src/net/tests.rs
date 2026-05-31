@@ -128,6 +128,14 @@ fn init_zones() {
     let _ = crate::zones::register_all();
 }
 
+fn reset_loopback_test_state() {
+    crate::net::reset_initial_net_namespace_for_test();
+    loopback_iface().clear_for_test_or_bootstrap();
+    crate::net::delegate::net_delegate_clear(
+        crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
+    );
+}
+
 fn inet(port: u16) -> KernelSockAddr {
     KernelSockAddr::V4(SockAddrIn::new(port, Ipv4Address::LOOPBACK))
 }

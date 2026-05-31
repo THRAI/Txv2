@@ -26,7 +26,6 @@ use tx_subsystems::net::{
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::vfs::structure::OpenFileBacking;
 use tx_subsystems::vm::UserAccessKind;
-use tx_subsystems::wait_source;
 
 const SOCKADDR_IN_BYTES: u32 = 16;
 const SOCKADDR_IN6_BYTES: u32 = 28;
@@ -232,7 +231,7 @@ pub(super) fn sys_bind<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
         };
         if !path.is_abstract() {
             if let Err(errno) = unix_pathname_bind_precheck(ctx, path.as_bytes()) {
-                return SyscallResult::Error(errno_to_i32(errno));
+                return SyscallResult::Error(errno);
             }
         }
         let outcome = {
@@ -343,7 +342,7 @@ async fn accept_impl<'a, P: TimeIf>(
                 if nonblocking {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
-                if let Some(future) = wait_on_yield_shape(shape) {
+                if let Some(future) = wait_on_yield_shape(ctx, shape) {
                     if matches!(
                         wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0).await,
                         SocketWaitWake::ItimerExpired
@@ -420,7 +419,7 @@ async fn connect_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                 if connected {
                     return SyscallResult::Return(0);
                 }
-                if let Some(future) = wait_on_yield_shape(shape) {
+                if let Some(future) = wait_on_yield_shape(ctx, shape) {
                     waited_for_connect = true;
                     let _ = future.await;
                 } else {
@@ -707,7 +706,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
                     if flags.is_nonblocking() {
                         return SyscallResult::Error(EAGAIN_VALUE);
                     }
-                    if let Some(future) = wait_on_yield_shape(shape) {
+                    if let Some(future) = wait_on_yield_shape(ctx, shape) {
                         let _ = future.await;
                     } else {
                         return SyscallResult::Error(EIO_VALUE);
@@ -764,7 +763,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
                 if flags.is_nonblocking() {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
-                if let Some(future) = wait_on_yield_shape(shape) {
+                if let Some(future) = wait_on_yield_shape(ctx, shape) {
                     let _ = future.await;
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
@@ -876,7 +875,7 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                 let Some(wait_token) = wait_token else {
                     return SyscallResult::Error(EIO_VALUE);
                 };
-                let Some(future) = wait_source::wait_on_token(wait_token) else {
+                let Some(future) = wait_token_future(ctx, wait_token) else {
                     return SyscallResult::Error(EIO_VALUE);
                 };
                 if matches!(
@@ -927,7 +926,7 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                 if flags.is_nonblocking() {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
-                if let Some(future) = wait_on_yield_shape(shape) {
+                if let Some(future) = wait_on_yield_shape(ctx, shape) {
                     if matches!(
                         wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0).await,
                         SocketWaitWake::ItimerExpired
@@ -1140,7 +1139,7 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                 if flags.is_nonblocking() {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
-                if let Some(future) = wait_on_yield_shape(shape) {
+                if let Some(future) = wait_on_yield_shape(ctx, shape) {
                     let _ = future.await;
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
@@ -1297,7 +1296,7 @@ async fn recvmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                 if flags.is_nonblocking() {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
-                if let Some(future) = wait_on_yield_shape(shape) {
+                if let Some(future) = wait_on_yield_shape(ctx, shape) {
                     let _ = future.await;
                 } else {
                     return SyscallResult::Error(EIO_VALUE);

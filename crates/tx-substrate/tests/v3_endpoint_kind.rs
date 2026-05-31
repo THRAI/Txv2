@@ -62,7 +62,7 @@ fn endpoint_kind_is_real_table() {
         (EndpointKind::Synthetic, false),
     ];
     for (kind, expected) in table {
-        assert_eq!(kind.is_real(), expected, "is_real mismatch for {:?}", kind);
+        assert_eq!(kind.is_real(), expected, "is_real mismatch for {kind:?}");
     }
 }
 
@@ -85,8 +85,7 @@ fn endpoint_kind_permits_fd_injection_table() {
         assert_eq!(
             kind.permits_fd_injection(),
             expected,
-            "permits_fd_injection mismatch for {:?}",
-            kind
+            "permits_fd_injection mismatch for {kind:?}"
         );
     }
 }
@@ -103,8 +102,8 @@ fn endpoint_kind_helpers_are_const() {
     const FUSE_FD: bool = EndpointKind::Fuse.permits_fd_injection();
     const UFD_FD: bool = EndpointKind::Ufd.permits_fd_injection();
 
-    const { assert!(UFD_REAL) };
+    assert!(core::hint::black_box(UFD_REAL));
     const { assert!(!SYN_REAL) };
-    const { assert!(FUSE_FD) };
+    assert!(core::hint::black_box(FUSE_FD));
     const { assert!(!UFD_FD) };
 }

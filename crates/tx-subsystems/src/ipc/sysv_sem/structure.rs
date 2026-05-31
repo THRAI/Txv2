@@ -10,11 +10,12 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
+use crate::ipc::sysv_sem::notification;
 use crate::ipc::sysv_shm::structure::IpcPerm;
 use crate::process::adapter::step_engine::{
     Cap, PayloadCap, SpinMutex, Zone, ZoneAllocated, ZoneError,
 };
-use crate::process::adapter::wait_routing::{self, Channel, WaitSource};
+use crate::process::adapter::wait_routing::{Channel, WaitSource};
 use crate::process::nsproxy::SysvKey;
 
 // ---------------------------------------------------------------------------
@@ -151,9 +152,7 @@ pub(crate) fn register_sem(
     use crate::process::adapter::step_engine::sign;
     let semid = NEXT_SEMID.fetch_add(1, Ordering::Relaxed);
 
-    let changed_channel = Channel::new();
-    let changed_source_id = crate::wait_source::register_wait_channel(changed_channel.clone());
-    let changed_wait_source = wait_routing::new_wait_source(changed_source_id);
+    let changed_wait_point = notification::new_changed_wait_point();
 
     let identity = sign(SemArrayIdentity {
         key,
@@ -171,9 +170,9 @@ pub(crate) fn register_sem(
     let payload = sign(SemArrayPayload {
         values: SpinMutex::new(alloc::vec![SemValue::default(); nsems as usize]),
         changed_seq: AtomicU64::new(0),
-        changed_channel,
-        changed_source_id,
-        changed_wait_source,
+        changed_channel: changed_wait_point.channel,
+        changed_source_id: changed_wait_point.source_id,
+        changed_wait_source: changed_wait_point.source,
     })?;
     *identity.payload.lock() = Some(PayloadCap::from_cap(payload));
     SEM_TABLE.lock().insert(semid, identity.clone());

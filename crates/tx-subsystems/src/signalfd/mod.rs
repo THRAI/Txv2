@@ -42,7 +42,7 @@
 //!   8    4     ssi_code   (i32, zero)
 //!   12   4     ssi_pid    (u32, zero)
 //!   16   4     ssi_uid    (u32, zero)
-//!   20   4     ssi_int    (low 32 bits of `si_value`)
+//!   44   4     ssi_int    (low 32 bits of `si_value`)
 //!   48   8     ssi_ptr    (`si_value`)
 //!   ...        reserved / zero
 //! ```
@@ -494,7 +494,7 @@ fn serialize_signalfd_siginfo(
         out[8..12].copy_from_slice(&info.si_code.to_le_bytes());
         out[12..16].copy_from_slice(&info.si_pid.to_le_bytes());
         out[16..20].copy_from_slice(&info.si_uid.to_le_bytes());
-        out[20..24].copy_from_slice(&(info.si_value as u32).to_le_bytes());
+        out[44..48].copy_from_slice(&(info.si_value as u32).to_le_bytes());
         out[48..56].copy_from_slice(&info.si_value.to_le_bytes());
     }
     out
@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 14);
         assert_eq!(i32::from_le_bytes(buf[8..12].try_into().unwrap()), -2);
         assert_eq!(
-            u32::from_le_bytes(buf[20..24].try_into().unwrap()),
+            u32::from_le_bytes(buf[44..48].try_into().unwrap()),
             0x5566_7788,
         );
         assert_eq!(

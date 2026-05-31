@@ -520,18 +520,16 @@ impl PageContainer {
         guard: &Guard<'_>,
     ) -> StepOutcome<PageLease, NoProgress> {
         if matches!(self.kind(), PageContainerKind::Device { .. }) {
-            return StepOutcome::Err(
-                page_cache_error_to_errno(PageCacheError::UnsupportedKind).into(),
-            );
+            return StepOutcome::Err(page_cache_error_to_errno(PageCacheError::UnsupportedKind));
         }
         match self.materialize_page(page, MaterializeAccess::Read, guard) {
             StepOutcome::Done(materialized) => {
                 let cache_pin = match page_allocator::acquire_cache_pin(materialized.ppn) {
                     Ok(pin) => pin,
                     Err(error) => {
-                        return StepOutcome::Err(
-                            page_cache_error_to_errno(PageCacheError::Alloc(error)).into(),
-                        );
+                        return StepOutcome::Err(page_cache_error_to_errno(PageCacheError::Alloc(
+                            error,
+                        )));
                     }
                 };
                 StepOutcome::Done(PageLease {

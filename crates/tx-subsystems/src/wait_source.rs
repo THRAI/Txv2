@@ -145,8 +145,16 @@ pub fn lookup_wait_port(id: u64) -> Option<RawPort> {
 /// `None` if `token.source_id()` is not a currently-registered id (typical
 /// for test placeholder tokens constructed via raw `WaitToken::new`).
 pub fn wait_on_token(token: WaitToken) -> Option<RegisteredWaitFuture> {
-    let mask = Mask::from_bits(token.interest());
-    let source = REGISTRY.lock().get(&token.source_id()).cloned()?;
+    wait_on_source(token.source_id(), token.interest())
+}
+
+/// Convert a registered source id and mask into an awaitable wait.
+///
+/// This remains the standalone-mailbox compatibility path for subsystem
+/// driver tasks that are not running inside a syscall `ScriptCtx`.
+pub fn wait_on_source(source_id: u64, interest: u64) -> Option<RegisteredWaitFuture> {
+    let mask = Mask::from_bits(interest);
+    let source = REGISTRY.lock().get(&source_id).cloned()?;
     match source {
         RegisteredWaitSource::Channel(channel) => {
             Some(RegisteredWaitFuture::Channel(Box::new(channel.wait(mask))))

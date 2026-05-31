@@ -294,8 +294,7 @@ pub(crate) fn ci_slow(root: &Path) -> Result<()> {
             reference: "txdoc:CI-GATE-QEMU-BUSYBOX-BOOT",
             command: "cargo xtask test busybox-boot --target rv64-qemu".to_string(),
             outcome: CiOutcome::Skipped(format!(
-                "vendored busybox missing at {}; run tools/images/fetch-busybox.sh",
-                rv64_busybox
+                "vendored busybox missing at {rv64_busybox}; run tools/images/fetch-busybox.sh"
             )),
         });
     }

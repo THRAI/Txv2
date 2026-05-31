@@ -431,30 +431,30 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<usize, NoProgress> {
         if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_name(name) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
         if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_value_len(value.len()) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         match self.xattrs(inode) {
             Ok(attrs) => {
                 let Some(attr) = attrs.iter().find(|attr| attr.name == name) else {
-                    return StepOutcome::err(Errno::ENODATA.into());
+                    return StepOutcome::err(Errno::ENODATA);
                 };
                 if value.is_empty() {
                     return StepOutcome::done(attr.value.len());
                 }
                 if value.len() < attr.value.len() {
-                    return StepOutcome::err(Errno::ERANGE.into());
+                    return StepOutcome::err(Errno::ERANGE);
                 }
                 value[..attr.value.len()].copy_from_slice(&attr.value);
                 StepOutcome::done(attr.value.len())
             }
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
@@ -466,11 +466,11 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<usize, NoProgress> {
         if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_list_len(list.len()) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         match self.xattrs(inode) {
             Ok(attrs) => {
@@ -478,16 +478,16 @@ where
                     .iter()
                     .try_fold(0usize, |acc, attr| acc.checked_add(attr.name.len() + 1));
                 let Some(required) = required else {
-                    return StepOutcome::err(Errno::E2BIG.into());
+                    return StepOutcome::err(Errno::E2BIG);
                 };
                 if required > tx_subsystems::vfs::xattr::XATTR_LIST_MAX {
-                    return StepOutcome::err(Errno::E2BIG.into());
+                    return StepOutcome::err(Errno::E2BIG);
                 }
                 if list.is_empty() {
                     return StepOutcome::done(required);
                 }
                 if list.len() < required {
-                    return StepOutcome::err(Errno::ERANGE.into());
+                    return StepOutcome::err(Errno::ERANGE);
                 }
                 let mut cursor = 0usize;
                 for attr in attrs {
@@ -498,7 +498,7 @@ where
                 }
                 StepOutcome::done(required)
             }
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
@@ -512,27 +512,27 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+            return StepOutcome::err(Errno::EROFS);
         }
         if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_name(name) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
         if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_value_len(value.len()) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
         if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_set_flags(flags) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let meta = match self.inode_meta_cached(inode) {
             Ok(meta) => map_inode_meta(meta),
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         if let Err(errno) = tx_subsystems::vfs::xattr::check_xattr_write_perm(&meta, cred) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
 
         let create = flags & tx_subsystems::vfs::xattr::XATTR_CREATE != 0;
@@ -542,9 +542,9 @@ where
                 self.invalidate_inode_meta(inode);
                 StepOutcome::done(())
             }
-            Ok(false) if create => StepOutcome::err(Errno::EEXIST.into()),
-            Ok(false) => StepOutcome::err(Errno::ENODATA.into()),
-            Err(err) => StepOutcome::err(err.into()),
+            Ok(false) if create => StepOutcome::err(Errno::EEXIST),
+            Ok(false) => StepOutcome::err(Errno::ENODATA),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
@@ -556,21 +556,21 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+            return StepOutcome::err(Errno::EROFS);
         }
         if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_name(name) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let meta = match self.inode_meta_cached(inode) {
             Ok(meta) => map_inode_meta(meta),
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         if let Err(errno) = tx_subsystems::vfs::xattr::check_xattr_write_perm(&meta, cred) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
 
         match self.remove_xattr_on_disk(inode, name) {
@@ -578,8 +578,8 @@ where
                 self.invalidate_inode_meta(inode);
                 StepOutcome::done(())
             }
-            Ok(false) => StepOutcome::err(Errno::ENODATA.into()),
-            Err(err) => StepOutcome::err(err.into()),
+            Ok(false) => StepOutcome::err(Errno::ENODATA),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
@@ -591,19 +591,19 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+            return StepOutcome::err(Errno::EROFS);
         }
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let meta = match self.inode_meta_cached(inode) {
             Ok(meta) => meta,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let inode_meta = map_inode_meta(meta);
         if let Err(errno) = tx_subsystems::vfs::predicates::check_chmod_perm(&inode_meta, cred) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
         let mut updated = meta;
         updated.mode = (meta.mode & 0xF000) | (new_mode & 0o7777);
@@ -612,7 +612,7 @@ where
                 self.invalidate_inode_meta(inode);
                 StepOutcome::done(())
             }
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
@@ -625,21 +625,21 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+            return StepOutcome::err(Errno::EROFS);
         }
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let meta = match self.inode_meta_cached(inode) {
             Ok(meta) => meta,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let inode_meta = map_inode_meta(meta);
         if let Err(errno) =
             tx_subsystems::vfs::predicates::check_chown_perm(&inode_meta, new_uid, new_gid, cred)
         {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
         let mut updated = meta;
         if let Some(uid) = new_uid {
@@ -660,7 +660,7 @@ where
                 self.invalidate_inode_meta(inode);
                 StepOutcome::done(())
             }
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(err),
         }
     }
 }

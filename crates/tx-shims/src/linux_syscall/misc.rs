@@ -11,17 +11,17 @@ static UTS_NODENAME: SpinMutex<[u8; UTSNAME_FIELD]> = SpinMutex::new(default_nod
 const PERSONALITY_QUERY: u32 = u32::MAX;
 const PER_MASK: u32 = 0x00ff;
 const PER_HPUX: u32 = 0x0010;
-const UNAME26: u32 = 0x0020_000;
-const ADDR_NO_RANDOMIZE: u32 = 0x0040_000;
-const FDPIC_FUNCPTRS: u32 = 0x0080_000;
-const MMAP_PAGE_ZERO: u32 = 0x0100_000;
-const ADDR_COMPAT_LAYOUT: u32 = 0x0200_000;
-const READ_IMPLIES_EXEC: u32 = 0x0400_000;
-const ADDR_LIMIT_32BIT: u32 = 0x0800_000;
-const SHORT_INODE: u32 = 0x1000_000;
-const WHOLE_SECONDS: u32 = 0x2000_000;
-const STICKY_TIMEOUTS: u32 = 0x4000_000;
-const ADDR_LIMIT_3GB: u32 = 0x8000_000;
+const UNAME26: u32 = 0x0002_0000;
+const ADDR_NO_RANDOMIZE: u32 = 0x0004_0000;
+const FDPIC_FUNCPTRS: u32 = 0x0008_0000;
+const MMAP_PAGE_ZERO: u32 = 0x0010_0000;
+const ADDR_COMPAT_LAYOUT: u32 = 0x0020_0000;
+const READ_IMPLIES_EXEC: u32 = 0x0040_0000;
+const ADDR_LIMIT_32BIT: u32 = 0x0080_0000;
+const SHORT_INODE: u32 = 0x0100_0000;
+const WHOLE_SECONDS: u32 = 0x0200_0000;
+const STICKY_TIMEOUTS: u32 = 0x0400_0000;
+const ADDR_LIMIT_3GB: u32 = 0x0800_0000;
 const PERSONALITY_KNOWN_FLAGS: u32 = UNAME26
     | ADDR_NO_RANDOMIZE
     | FDPIC_FUNCPTRS
@@ -624,6 +624,19 @@ pub(super) fn sys_getrlimit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     }
 
     sys_prlimit64([0, resource as u64, 0, old_uaddr, 0, 0], ctx)
+}
+
+/// `setrlimit(resource, rlim)` — old generic ABI facade over the same
+/// rlimit table used by `prlimit64(pid=0, ..., new_rlim, NULL)`.
+pub(super) fn sys_setrlimit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let resource = args[0] as u32;
+    let new_uaddr = args[1];
+
+    if new_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    sys_prlimit64([0, resource as u64, new_uaddr, 0, 0, 0], ctx)
 }
 
 #[repr(C)]

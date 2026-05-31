@@ -134,7 +134,7 @@ pub fn step_poll_hardware_input(
                 bytes.truncate(read);
                 drive_ingest(&bytes, read, guard)
             } else {
-                V3::Err(Errno::EIO.into())
+                V3::Err(Errno::EIO)
             }
         }
         V3::Err(err) => V3::Err(err),

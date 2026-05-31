@@ -226,6 +226,11 @@ pub fn step_set_capability_sets(
     effective_caps: CapabilitySet,
     permitted_caps: CapabilitySet,
 ) -> CredChange {
+    // observe: inspect the target process payload and previous credential.
+    // upgrade: clone credential state into a replacement value.
+    // reserve: allocate a new credential cap.
+    // commit: swap the process credential cap.
+    // publish: return previous/new credential snapshots to the caller.
     let payload_guard = target.payload.lock();
     let Some(payload) = payload_guard.as_ref() else {
         return CredChange::Zombie;

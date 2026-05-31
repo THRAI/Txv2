@@ -2,7 +2,7 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
 
-use crate::linux_syscall::numbers::TFD_TIMER_ABSTIME_FLAG;
+use crate::linux_syscall::time::realtime_ns;
 use crate::linux_syscall::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, NR_READ, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME,
     NR_TIMERFD_SETTIME, NR_TIMER_CREATE, NR_TIMER_SETTIME, TFD_TIMER_ABSTIME_FLAG,

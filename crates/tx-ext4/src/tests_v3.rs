@@ -12,9 +12,6 @@
 //! (wave 8/9 design); `txdoc:STEP-V2-OUTCOME-ALGEBRA-1` (closed
 //! four-variant outcome); `tmpfs/tests.rs` (canonical wave-9a
 //! reference).
-
-#![cfg(test)]
-
 extern crate alloc;
 
 use alloc::format;

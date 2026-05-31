@@ -404,16 +404,16 @@ impl TaskSchedMeta {
     fn recompute_effective_rt_priority(&mut self) {
         self.effective_rt_priority = self
             .pi_waiters
-            .iter()
-            .map(|(_, waiter)| waiter.priority.rt_priority())
+            .values()
+            .map(|waiter| waiter.priority.rt_priority())
             .max()
             .unwrap_or(self.base_rt_priority);
     }
 
     fn effective_priority_key(&self) -> PriorityKey {
         self.pi_waiters
-            .iter()
-            .map(|(_, waiter)| waiter.priority)
+            .values()
+            .map(|waiter| waiter.priority)
             .max()
             .unwrap_or_else(|| PriorityKey::base(self.base_rt_priority))
     }
@@ -1480,6 +1480,8 @@ impl Phase1Scheduler {
                 SchedClass::Fair => {
                     if priority_boosted {
                         (Phase1QueueKind::Preempted, true)
+                    } else if meta.userspace_thread {
+                        (Phase1QueueKind::New, false)
                     } else if meta.remaining_budget_ns > 0 {
                         (Phase1QueueKind::Preempted, true)
                     } else {

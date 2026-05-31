@@ -421,14 +421,14 @@ fn mark_endpoint_died_routes_abort_to_each_bound_mailbox() {
             assert_eq!(token_id, g_a.id());
             assert_eq!(reason, AbortReason::AgentDied);
         }
-        other => panic!("expected Abort, got {:?}", other),
+        other => panic!("expected Abort, got {other:?}"),
     }
     match e_b {
         MailboxEvent::Abort { token_id, reason } => {
             assert_eq!(token_id, g_b.id());
             assert_eq!(reason, AbortReason::AgentDied);
         }
-        other => panic!("expected Abort, got {:?}", other),
+        other => panic!("expected Abort, got {other:?}"),
     }
     let _ = g_a.forget();
     let _ = g_b.forget();

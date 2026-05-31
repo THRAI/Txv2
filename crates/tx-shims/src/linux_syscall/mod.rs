@@ -442,6 +442,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + Ca
         nr if nr == NR_KCMP => return sys_kcmp(req.args, ctx),
         nr if nr == NR_PIDFD_GETFD => return sys_pidfd_getfd(req.args, ctx),
         nr if nr == NR_GETRLIMIT => return sys_getrlimit(req.args, ctx),
+        nr if nr == NR_SETRLIMIT => return sys_setrlimit(req.args, ctx),
         nr if nr == NR_GETUID => return sys_getuid(ctx),
         nr if nr == NR_GETEUID => return sys_geteuid(ctx),
         nr if nr == NR_GETGID => return sys_getgid(ctx),
@@ -491,6 +492,14 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + Ca
         nr if nr == NR_MLOCKALL => return sys_mlockall(req.args, ctx).await,
         nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx).await,
         nr if nr == NR_MUNLOCKALL => return sys_munlockall(ctx).await,
+        nr if nr == NR_GET_MEMPOLICY => return sys_get_mempolicy(req.args, ctx),
+        nr if nr == NR_SET_MEMPOLICY => return sys_set_mempolicy(req.args, ctx),
+        nr if nr == NR_MBIND => return sys_mbind(req.args, ctx),
+        nr if nr == NR_MIGRATE_PAGES => return sys_migrate_pages(req.args, ctx),
+        nr if nr == NR_MOVE_PAGES => return sys_move_pages(req.args, ctx),
+        nr if nr == NR_PROCESS_VM_READV => return sys_process_vm_readv(req.args, ctx),
+        nr if nr == NR_PROCESS_VM_WRITEV => return sys_process_vm_writev(req.args, ctx),
+        nr if nr == NR_PROCESS_MADVISE => return sys_process_madvise(req.args, ctx),
         nr if nr == NR_UTIMENSAT => return sys_utimensat::<P>(req.args, ctx),
         nr if nr == NR_SHMGET => return sys_shmget(req.args, ctx),
         nr if nr == NR_SHMDT => return sys_shmdt(req.args, ctx).await,
@@ -940,6 +949,16 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + Ca
             )
             .await
         }
+        nr if nr == NR_EPOLL_PWAIT2 => {
+            sys_epoll_pwait2::<P>(
+                req.args[0] as u32,
+                req.args[1],
+                req.args[2] as u32,
+                req.args[3],
+                ctx,
+            )
+            .await
+        }
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -1025,6 +1044,7 @@ fn sys_sched_setscheduler<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
 ///   expedited plus instruction-fetch barrier (`fence.i` on RV64).
 /// - `MEMBARRIER_CMD_REGISTER_*` — registration is a no-op; always
 ///   returns 0.
+///
 /// `sched_yield()` — cooperatively yield the current reactor task once.
 ///
 /// This is not an immediate no-op: user-space race harnesses such as LTP

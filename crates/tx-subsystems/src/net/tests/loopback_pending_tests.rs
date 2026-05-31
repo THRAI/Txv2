@@ -7,7 +7,7 @@ fn loopback_pending_step_drives_tcp_connecting_handshake() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let (client, listener, local, remote) = prepare_loopback_connecting(40_191, 50_191);
     let guard = tx_substrate::epoch::guard();
 
@@ -51,7 +51,7 @@ fn loopback_pending_step_drives_tcp_connected_transfer() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let (client, listener, _local, _remote) = prepare_loopback_connecting(40_192, 50_192);
     let guard = tx_substrate::epoch::guard();
     assert!(matches!(
@@ -104,7 +104,7 @@ fn loopback_pending_step_drives_udp_connected_datagram() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let guard = tx_substrate::epoch::guard();
     let server = registry::create_socket_for_test_or_bootstrap(
         SocketKind::Udp,
@@ -165,7 +165,7 @@ fn loopback_pending_step_drives_udp_bound_sendto_datagram() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let guard = tx_substrate::epoch::guard();
     let socket = registry::create_socket_for_test_or_bootstrap(
         SocketKind::Udp,
@@ -220,7 +220,7 @@ fn loopback_pending_step_drives_raw_icmp_echo() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let guard = tx_substrate::epoch::guard();
     let valid = ValidSocketType::validate(2, 2, 1).expect("ping socket");
     let socket = match step_socket_create(valid, &guard) {

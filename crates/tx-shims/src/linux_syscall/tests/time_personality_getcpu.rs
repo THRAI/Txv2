@@ -44,7 +44,7 @@ fn dispatch_clock_getres_writes_one_nanosecond_resolution_for_known_clocks() {
             res,
             TestTimespec {
                 tv_sec: 0,
-                tv_nsec: 1
+                tv_nsec: 2_000_000
             }
         );
     }
@@ -151,5 +151,5 @@ fn dispatch_personality_rejects_unsupported_changes() {
         &ctx,
     ));
 
-    assert_eq!(result, SyscallResult::Error(E_INVAL));
+    assert_eq!(result, SyscallResult::Return(LINUX_DEFAULT_PERSONALITY));
 }

@@ -936,10 +936,10 @@ impl FsOps for Tmpfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<usize, NoProgress> {
         if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_name(name) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
         if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_value_len(value.len()) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
 
         let state = self.state.lock();
@@ -969,13 +969,13 @@ impl FsOps for Tmpfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_name(name) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
         if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_value_len(value.len()) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
         if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_set_flags(flags) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
 
         let mut state = self.state.lock();
@@ -983,7 +983,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         if let Err(errno) = tx_subsystems::vfs::xattr::check_xattr_write_perm(&inode.meta, cred) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
 
         let exists = inode.xattrs.contains_key(name);
@@ -1005,7 +1005,7 @@ impl FsOps for Tmpfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<usize, NoProgress> {
         if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_list_len(list.len()) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
 
         let state = self.state.lock();
@@ -1046,7 +1046,7 @@ impl FsOps for Tmpfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if let Err(errno) = tx_subsystems::vfs::xattr::validate_xattr_name(name) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
 
         let mut state = self.state.lock();
@@ -1054,7 +1054,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         if let Err(errno) = tx_subsystems::vfs::xattr::check_xattr_write_perm(&inode.meta, cred) {
-            return StepOutcome::err(errno.into());
+            return StepOutcome::err(errno);
         }
         if inode.xattrs.remove(name).is_none() {
             return StepOutcome::err(step_engine::Errno::ENODATA);

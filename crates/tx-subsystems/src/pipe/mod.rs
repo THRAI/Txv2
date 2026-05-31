@@ -150,8 +150,6 @@ impl core::fmt::Debug for PipePayload {
 #[derive(Debug)]
 enum PipeMode {
     ByteStream,
-    #[allow(dead_code)]
-    Notification,
 }
 
 #[derive(Debug)]
@@ -833,6 +831,11 @@ pub fn step_peek(
     _guard: &Guard<'_>,
     nonblocking: bool,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe: inspect requested size, ring contents, and writer count.
+    // upgrade: borrow the pipe ring for a non-consuming snapshot.
+    // reserve: bound the copy to readable bytes and output capacity.
+    // commit: copy bytes without advancing descriptor offsets.
+    // publish: return byte count or readiness wait with no wake side effects.
     if out.is_empty() {
         return step_engine::done_bytes(0);
     }
@@ -858,6 +861,11 @@ pub fn step_push_page_lease(
     _guard: &Guard<'_>,
     nonblocking: bool,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe: validate requested length and reader presence.
+    // upgrade: move the page-backed lease into pipe-owned storage.
+    // reserve: reserve descriptor capacity in the pipe ring.
+    // commit: enqueue the lease descriptor.
+    // publish: notify readers or yield for writer capacity.
     if len == 0 {
         return step_engine::done_bytes(0);
     }
@@ -884,6 +892,11 @@ pub fn step_pop_page_lease(
     _guard: &Guard<'_>,
     nonblocking: bool,
 ) -> StepOutcome<Option<(PageLease, usize, usize)>, ByteProgress> {
+    // observe: inspect the next descriptor and writer count.
+    // upgrade: distinguish lease storage from anonymous pipe pages.
+    // reserve: no external reservation is required for descriptor removal.
+    // commit: pop one descriptor from the ring.
+    // publish: notify writers or yield for reader readiness.
     let mut ring = payload.ring.lock();
     if let Some(buf) = ring.pop_front_lease() {
         drop(ring);
@@ -914,11 +927,16 @@ pub fn step_splice_to_pipe(
     _guard: &Guard<'_>,
     nonblocking: bool,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe: validate endpoints, length, and destination reader presence.
+    // upgrade: borrow source and destination rings in stable order.
+    // reserve: require destination descriptor capacity before moving bytes.
+    // commit: drain descriptors from source into destination.
+    // publish: notify source writers and destination readers.
     if len == 0 {
         return step_engine::done_bytes(0);
     }
     if src == dst {
-        return StepOutcome::Err(Errno::EINVAL.into());
+        return StepOutcome::Err(Errno::EINVAL);
     }
     if dst.reader_count.load(Ordering::Acquire) == 0 {
         return step_engine::epipe();
@@ -955,11 +973,16 @@ pub fn step_tee_to_pipe(
     _guard: &Guard<'_>,
     nonblocking: bool,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe: validate endpoints, length, and destination reader presence.
+    // upgrade: borrow source and destination rings in stable order.
+    // reserve: require destination descriptor capacity before cloning bytes.
+    // commit: retain source storage into destination descriptors.
+    // publish: notify destination readers.
     if len == 0 {
         return step_engine::done_bytes(0);
     }
     if src == dst {
-        return StepOutcome::Err(Errno::EINVAL.into());
+        return StepOutcome::Err(Errno::EINVAL);
     }
     if dst.reader_count.load(Ordering::Acquire) == 0 {
         return step_engine::epipe();
@@ -1042,7 +1065,8 @@ pub struct ReadOp<'a> {
 impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
         let __guard = step_engine::guard();
         step_read(self.payload, self.out, &__guard, self.nonblocking)
     }
@@ -1058,7 +1082,8 @@ pub struct WriteOp<'a> {
 impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
         let __guard = step_engine::guard();
         step_write(self.payload, self.bytes, &__guard, self.nonblocking)
     }

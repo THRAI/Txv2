@@ -826,7 +826,7 @@ fn step_kill_pgrp_does_not_mirror_gewalt_to_group_pending() {
 fn kill_zero_style_pgrp_fanout_reaches_in_group_child_handler() {
     let _g = setup();
     let parent = fresh_init();
-    let _ = step_setpgid(&parent, Pgid(parent.pid.0)).expect("parent setpgrp");
+    step_setpgid(&parent, Pgid(parent.pid.0)).expect("parent setpgrp");
     let sigusr1 = Signum::new(10).expect("SIGUSR1");
 
     let child1 = step_fork::<TestPmap>(&parent, false, false).expect("fork child1");

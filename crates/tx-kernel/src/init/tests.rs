@@ -620,8 +620,7 @@ fn boot_smoke_dev_shm_accepts_posix_shm_and_named_sem_files() {
 
         assert!(
             matches!(file.rnode().backing(), RNodeBacking::PageBacked { .. }),
-            "{:?} must resolve as a tmpfs page-backed regular file",
-            path
+            "{path:?} must resolve as a tmpfs page-backed regular file",
         );
     }
 }
@@ -971,8 +970,7 @@ fn boot_smoke_production_userspace_loop_writes_console_then_exits() {
     let new_bytes = &captured[baseline_bytes_len..];
     assert!(
         new_bytes.windows(b"hi\r\n".len()).any(|w| w == b"hi\r\n"),
-        "post-OPOST console bytes must contain b\"hi\\r\\n\"; got {:?}",
-        new_bytes,
+        "post-OPOST console bytes must contain b\"hi\\r\\n\"; got {new_bytes:?}",
     );
 
     // ------------------------------------------------------------------
@@ -1623,8 +1621,7 @@ fn boot_smoke_setuid_exec_seeds_post_setuid_euid_and_at_secure() {
     assert!(
         result.is_ok(),
         "exec_script(/setuid-target) must succeed for a 0o4755 \
-         binary executed by uid 1001 — got {:?}",
-        result,
+         binary executed by uid 1001 — got {result:?}",
     );
 
     // ----- Post-exec invariants ---------------------------------

@@ -29,7 +29,7 @@ pub use crate::cred::CapabilitySet;
 pub use checks::{DirectoryAtPath, EntityAtPath, ParentAndName, ResolveCtx, RootCtx};
 pub use execution::{
     FileFsyncOp, FlockOp, FsOps, InodeStatOp, MountOutput, OpenFileGetFlOp, OpenFileIoctlOp,
-    OpenFileLseekOp, OpenFileSetFlOp, OpenOp, PathWalkOp,
+    OpenFileLseekOp, OpenFileSetFlOp, OpenOp, PathWalkOp, ProjectedWriteContext,
 };
 pub use notification::{VFS_READABLE, VFS_WRITABLE};
 pub use structure::{

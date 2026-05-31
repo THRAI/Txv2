@@ -277,7 +277,7 @@ fn copy_chunk_user(
                 V3::Done(n) if n == chunk => UserChunkOutcome::Copied,
                 V3::Continue { progress } if progress.bytes() == chunk => UserChunkOutcome::Copied,
                 V3::Done(_) | V3::Continue { .. } => UserChunkOutcome::Fault(Errno::EFAULT),
-                V3::Err(e) => UserChunkOutcome::Fault(Errno::from(e)),
+                V3::Err(e) => UserChunkOutcome::Fault(e),
                 V3::Yield { shape, .. } => {
                     if let Some((source, interests)) =
                         crate::page_backed::notification::wait_source_parts(&shape)
@@ -302,7 +302,7 @@ fn copy_chunk_user(
                 V3::Done(n) if n == chunk => UserChunkOutcome::Copied,
                 V3::Continue { progress } if progress.bytes() == chunk => UserChunkOutcome::Copied,
                 V3::Done(_) | V3::Continue { .. } => UserChunkOutcome::Fault(Errno::EFAULT),
-                V3::Err(e) => UserChunkOutcome::Fault(Errno::from(e)),
+                V3::Err(e) => UserChunkOutcome::Fault(e),
                 V3::Yield { shape, .. } => {
                     if let Some((source, interests)) =
                         crate::page_backed::notification::wait_source_parts(&shape)

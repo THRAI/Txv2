@@ -155,42 +155,6 @@ fn epoll_wait_source(file: &OpenFile, interests: u32) -> Option<WaitSourceId> {
     None
 }
 
-fn epoll_nested_depth(
-    ctx: &SyscallCtx<'_>,
-    ep: &epoll::Epoll,
-    seen: &mut alloc::vec::Vec<u64>,
-) -> Option<usize> {
-    if seen.contains(&ep.epoll_id()) {
-        return None;
-    }
-    seen.push(ep.epoll_id());
-    let mut max_child_depth = 0usize;
-    for entry in ep.entries_snapshot() {
-        let Some(of) = super::resolve_fd(&ctx.process, entry.fd) else {
-            continue;
-        };
-        let Some(child) = of.epoll() else {
-            continue;
-        };
-        let child_depth = epoll_nested_depth(ctx, child, seen)?.saturating_add(1);
-        max_child_depth = max_child_depth.max(child_depth);
-    }
-    let _ = seen.pop();
-    Some(max_child_depth)
-}
-
-fn epoll_add_would_exceed_depth(
-    ctx: &SyscallCtx<'_>,
-    ep: &epoll::Epoll,
-    target: &epoll::Epoll,
-) -> bool {
-    let mut seen = alloc::vec![ep.epoll_id()];
-    let Some(target_depth) = epoll_nested_depth(ctx, target, &mut seen) else {
-        return true;
-    };
-    target_depth.saturating_add(1) >= EPOLL_MAX_NEST_DEPTH
-}
-
 fn supports_epoll(file: &OpenFile) -> bool {
     file.epoll().is_some()
         || pipe_endpoint(file).is_some()
@@ -537,14 +501,6 @@ pub(super) fn sys_epoll_ctl(
             None => return SyscallResult::Error(EPERM_VALUE),
         }
     };
-    if op == EPOLL_CTL_ADD {
-        if let Some(target_ep) = target_of.as_ref().and_then(|target| target.epoll()) {
-            if epoll_add_would_exceed_depth(ctx, &ep_cap, target_ep) {
-                return SyscallResult::Error(EINVAL_VALUE);
-            }
-        }
-    }
-
     // Call the appropriate step function.
     let _guard = guard();
     let ep_ref = &*ep_cap;

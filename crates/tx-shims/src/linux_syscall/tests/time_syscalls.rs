@@ -508,7 +508,7 @@ struct TestTimexTimeval {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 struct TestTimex {
     modes: u32,
     _pad0: u32,
@@ -534,37 +534,6 @@ struct TestTimex {
     stbcnt: i64,
     tai: i32,
     _reserved: [i32; 11],
-}
-
-impl Default for TestTimex {
-    fn default() -> Self {
-        Self {
-            modes: 0,
-            _pad0: 0,
-            offset: 0,
-            freq: 0,
-            maxerror: 0,
-            esterror: 0,
-            status: 0,
-            _pad1: 0,
-            constant: 0,
-            precision: 0,
-            tolerance: 0,
-            time: TestTimexTimeval::default(),
-            tick: 0,
-            ppsfreq: 0,
-            jitter: 0,
-            shift: 0,
-            _pad2: 0,
-            stabil: 0,
-            jitcnt: 0,
-            calcnt: 0,
-            errcnt: 0,
-            stbcnt: 0,
-            tai: 0,
-            _reserved: [0; 11],
-        }
-    }
 }
 
 fn time_setup() -> (TestSetup, Cap<ProcessIdentity>, Cap<ThreadIdentity>) {

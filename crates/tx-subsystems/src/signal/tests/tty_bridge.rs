@@ -8,7 +8,9 @@ use crate::process::{bootstrap_init_process, step_fork, ProcessIdentity};
 use crate::signal::adapter::step_engine::{
     reserve_for, sign_for, ByteProgress, PayloadCap, StepOutcome,
 };
-use crate::signal::{deliver_tty_dispatch, signum_for_job_control, DispatchOutcome};
+use crate::signal::{
+    deliver_tty_dispatch, signum_for_job_control, step_sigaction, DispatchOutcome, SigDisposition,
+};
 use crate::tty::execution::{JobControlSignal, SignalDispatch, SignalTarget};
 use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
 use crate::vm::{AddressSpace, TestPmap};
@@ -110,6 +112,8 @@ fn typed_tty_vintr_routes_sigint_to_foreground_pgrp() {
     let _g = setup();
     let parent = fresh_init();
     let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
+    step_sigaction(&parent, Signum::SIGINT, SigDisposition::Handler(0xCAFE));
+    step_sigaction(&child, Signum::SIGINT, SigDisposition::Handler(0xCAFE));
 
     // Bind the TTY's foreground pgrp typed-style to parent's pgrp
     // (which has both parent and child as members).
@@ -154,6 +158,8 @@ fn deliver_tty_dispatch_skips_members_when_source_lacks_permission() {
     let _g = setup();
     let parent = fresh_init();
     let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
+    step_sigaction(&parent, Signum::SIGINT, SigDisposition::Handler(0xCAFE));
+    step_sigaction(&child, Signum::SIGINT, SigDisposition::Handler(0xCAFE));
 
     // Make parent unprivileged and at uid=1000; child stays root.
     // parent attempts SIGINT to its own pgrp via the typed dispatch;

@@ -10,6 +10,11 @@ pub fn step_unix_socketpair_connect(
     second: &Cap<SocketIdentity>,
     _guard: &Guard<'_>,
 ) -> StepOutcome<()> {
+    // observe: validate live payloads and compatible socket kinds.
+    // upgrade: borrow each socket's protocol state.
+    // reserve: install peer-table rows before publishing protocol state.
+    // commit: transition both sockets into connected protocol states.
+    // publish: socket readiness is observed by later net readiness paths.
     let Some(first_payload) = first.acquire_operational() else {
         return StepOutcome::Err(Errno::ENOTCONN);
     };

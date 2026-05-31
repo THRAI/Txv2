@@ -51,12 +51,11 @@ fn dispatch_ppoll_wakes_for_process_timer_signal_deadline() {
     let thread = first_thread(&proc_cap);
     proc_cap.set_fd(0, Some(tx_fs::devfs::open_console_for_init()));
 
-    let wheel = tx_substrate::wake::TimerWheel::new();
-    let ctx = make_ctx(proc_cap.clone(), thread.clone())
-        .with_mailbox(alloc::sync::Arc::new(
-            tx_subsystems::signal::adapter::step_engine::TaskMailbox::new(),
-        ))
-        .with_timer_wheel(wheel.clone());
+    let timer_queue = tx_reactor::timer::TimerQueue::new();
+    tx_subsystems::timer_sleep::install_timer_queue(timer_queue.clone());
+    let ctx = make_ctx(proc_cap.clone(), thread.clone()).with_mailbox(alloc::sync::Arc::new(
+        tx_subsystems::signal::adapter::step_engine::TaskMailbox::new(),
+    ));
     let sigalrm = Signum::new(SIGALRM_RAW).expect("SIGALRM signum");
     let _ = step_sigaction(&proc_cap, sigalrm, SigDisposition::Handler(0xCAFE));
 
@@ -101,8 +100,7 @@ fn dispatch_ppoll_wakes_for_process_timer_signal_deadline() {
     let mut pinned = Box::pin(fut);
 
     assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Pending));
-
-    assert_eq!(wheel.fire_due(5_001_000_000), 1);
+    timer_queue.advance_time_to(u64::MAX);
 
     let result = pinned.as_mut().poll(&mut cx).map(|result| {
         assert_eq!(result, SyscallResult::Error(E_INTR));

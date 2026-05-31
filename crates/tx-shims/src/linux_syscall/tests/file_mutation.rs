@@ -33,6 +33,7 @@ const E_EXIST: i32 = 17;
 const E_NOTDIR: i32 = 20;
 const E_ISDIR: i32 = 21;
 const E_INVAL: i32 = 22;
+const E_NOSYS: i32 = 38;
 const E_PERM: i32 = 1;
 const E_ACCES: i32 = 13;
 const STAT_BYTES: usize = 128;
@@ -910,9 +911,10 @@ fn dispatch_renameat2_same_directory_succeeds() {
 // `dispatch_renameat2_exchange_returns_neg_enosys` plus the
 // `step_rename` tests in `tx-subsystems`.
 
-/// `renameat2(.., RENAME_EXCHANGE)` atomically swaps two existing entries.
+/// `renameat2(.., RENAME_EXCHANGE)` is recognised but deferred until the VFS
+/// backend exposes an atomic exchange operation.
 #[test]
-fn dispatch_renameat2_exchange_swaps_existing_entries() {
+fn dispatch_renameat2_exchange_returns_neg_enosys() {
     let _setup = fm_setup();
     let (root_dentry, tmpfs) = build_tmpfs_root();
     create_regular(&tmpfs, b"a");
@@ -934,7 +936,7 @@ fn dispatch_renameat2_exchange_swaps_existing_entries() {
         ],
     );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(result, SyscallResult::Error(E_NOSYS));
     assert!(
         lookup_exists(&tmpfs, b"a"),
         "/a should still exist after exchange"

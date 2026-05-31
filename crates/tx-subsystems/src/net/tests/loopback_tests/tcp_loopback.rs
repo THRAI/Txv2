@@ -53,7 +53,7 @@ fn tcp_loopback_default_steps_use_persistent_loopback_iface() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let (client, listener, _local, _remote) =
         prepare_loopback_connect_with_client_send_buf(41_168, 51_168, 5);
     let guard = tx_substrate::epoch::guard();
@@ -94,7 +94,7 @@ fn tcp_loopback_ipv4_client_reaches_inet6_wildcard_listener() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let guard = tx_substrate::epoch::guard();
     let server_port = 41_180;
     let client_port = 51_180;
@@ -156,7 +156,7 @@ fn tcp_loopback_ipv6_client_reaches_inet6_loopback_listener() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let guard = tx_substrate::epoch::guard();
     let server_port = 41_181;
     let client_port = 51_181;
@@ -230,7 +230,7 @@ fn tcp_loopback_transfer_moves_large_write_within_one_budgeted_step() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let (client, listener, _local, _remote) =
         prepare_loopback_connect_with_client_send_buf(41_169, 51_169, 64 * 1024);
     let guard = tx_substrate::epoch::guard();
@@ -272,7 +272,7 @@ fn tcp_loopback_accepted_recv_without_payload_waits() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let (client, listener, _local, _remote) = prepare_loopback_connect(41_170, 51_170);
     let guard = tx_substrate::epoch::guard();
 
@@ -301,7 +301,7 @@ fn tcp_loopback_iperf_like_control_exchange_moves_both_directions() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let (client, listener, _local, _remote) = prepare_loopback_connect(41_171, 51_171);
     let guard = tx_substrate::epoch::guard();
 
@@ -350,7 +350,7 @@ fn tcp_loopback_handshake_creates_child_from_listener_first_syn() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     let (client, listener, local, remote) = prepare_loopback_connect(41_269, 51_269);
     let guard = tx_substrate::epoch::guard();
 

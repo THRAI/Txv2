@@ -168,7 +168,7 @@ pub(super) fn try_resolve_from_root_now(
         )
     };
     drop(guard);
-    outcome.map_err(|errno| errno_to_i32(Errno::from(errno)))
+    outcome.map_err(errno_to_i32)
 }
 
 /// Translate a dirfd into the root dentry for path resolution.
@@ -525,9 +525,7 @@ pub(super) fn sys_fchown(
     let guard = step_engine::guard();
     match fs_ops.step_chown(rnode.fs_object_id(), uid, gid, &ctx.walker_cred(), &guard) {
         StepOutcome::Done(()) => SyscallResult::Return(0),
-        StepOutcome::Err(errno) => {
-            SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno)))
-        }
+        StepOutcome::Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(errno)),
         StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),
     }
 }

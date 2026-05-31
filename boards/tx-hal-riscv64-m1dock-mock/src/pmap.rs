@@ -176,7 +176,7 @@ pub(crate) fn boot_info() -> &'static BootInfo {
 pub(crate) fn bootstrap_pmap_info() -> Option<&'static BootstrapPmapInfo> {
     ensure_static_boot_facts();
 
-    unsafe { (&*BOOTSTRAP_PMAP_INFO.0.get()).as_ref() }
+    unsafe { (*BOOTSTRAP_PMAP_INFO.0.get()).as_ref() }
 }
 
 pub(crate) fn alloc_pt_node() -> Result<PtNode, AllocError> {

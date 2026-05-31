@@ -229,7 +229,7 @@ fn dispatch_signalfd_read_preserves_posix_timer_sigval() {
         SI_TIMER_VALUE
     );
     assert_eq!(
-        u32::from_le_bytes(siginfo[20..24].try_into().unwrap()),
+        u32::from_le_bytes(siginfo[44..48].try_into().unwrap()),
         0x5566_7788
     );
     assert_eq!(

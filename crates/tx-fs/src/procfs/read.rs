@@ -194,8 +194,7 @@ fn render_stat_line(
     session: u32,
 ) -> String {
     alloc::format!(
-        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-        pid, comm, state, ppid, pgrp, session
+        "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
     )
 }
 
@@ -266,8 +265,7 @@ fn render_maps(pid: Pid) -> String {
 
         use alloc::format;
         out.push_str(&format!(
-            "{:x}-{:x} {}{}{}{} {:08x} 00:00 0 {}{}\n",
-            start, end, r, w, x, p, offset, backing_desc, locked,
+            "{start:x}-{end:x} {r}{w}{x}{p} {offset:08x} 00:00 0 {backing_desc}{locked}\n",
         ));
     }
 
@@ -315,8 +313,7 @@ fn render_smaps(pid: Pid) -> String {
         let locked_kb = if entry.flags.locked { size_kb } else { 0 };
 
         out.push_str(&format!(
-            "{:x}-{:x} {}{}{}{} {:08x} 00:00 0 {}\n",
-            start, end, r, w, x, p, offset, backing_desc,
+            "{start:x}-{end:x} {r}{w}{x}{p} {offset:08x} 00:00 0 {backing_desc}\n",
         ));
         out.push_str(&format!(
             "Size:           {:8} kB\n\

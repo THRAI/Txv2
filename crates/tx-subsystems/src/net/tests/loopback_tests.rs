@@ -78,6 +78,7 @@ fn prepare_loopback_connect_with_client_send_buf(
     IpEndpoint,
     IpEndpoint,
 ) {
+    crate::net::reset_initial_net_namespace_for_test();
     let guard = tx_substrate::epoch::guard();
 
     let listener = registry::create_socket_for_test_or_bootstrap(

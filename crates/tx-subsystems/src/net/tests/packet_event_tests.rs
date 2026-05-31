@@ -5,8 +5,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     let lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    crate::net::reset_initial_net_namespace_for_test();
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     lock
 }
 

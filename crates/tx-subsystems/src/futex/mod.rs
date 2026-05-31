@@ -64,7 +64,7 @@ pub mod notification;
 
 use adapter::step_engine::{
     self, Errno, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp, StepOutcome,
-    SubjectIdentity, YieldShape, ZoneError,
+    SubjectIdentity, ZoneError,
 };
 use adapter::wait_routing::{Channel, WaitSource};
 
@@ -702,11 +702,45 @@ pub fn reset_for_test() {
     *EXACT_WAITERS.lock() = None;
     *PI_WAITERS.lock() = None;
     *REQUEUE_PI_RESUMES.lock() = None;
+    drain_bucket_wait_sources_for_test();
 }
 
 #[cfg(test)]
 fn reset_exact_waiters_for_tests() {
     reset_for_test();
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn drain_bucket_wait_sources_for_test() {
+    use alloc::sync::Arc;
+
+    use adapter::step_engine::InterestMask;
+    use adapter::wait_routing::TaskMailbox;
+
+    let sources: Vec<Arc<WaitSource>> = BUCKETS
+        .lock()
+        .as_ref()
+        .map(|buckets| {
+            buckets
+                .iter()
+                .map(|bucket| bucket.wait_source.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for source in sources {
+        let mailbox = Arc::new(TaskMailbox::new());
+        let generation = mailbox.next_generation();
+        let prepared = source.prepare(
+            Arc::downgrade(&mailbox),
+            generation,
+            InterestMask::new(FUTEX_WAKE_MASK),
+        );
+        if let Some(registration) = prepared.install_if(|| true) {
+            drop(registration);
+        }
+        while mailbox.poll().is_some() {}
+    }
 }
 
 /// Initialise the bucket table. Idempotent: a second call is a
@@ -1125,6 +1159,11 @@ pub fn step_futex_wait_requeue_pi_in(
     waiter_tid: u32,
     guard: &Guard<'_>,
 ) -> StepOutcome<(), NoProgress> {
+    // observe: validate addresses, waiter tid, and the source futex word.
+    // upgrade: derive source and target futex keys.
+    // reserve: allocate an exact PI requeue waiter if the word still matches.
+    // commit: publish the waiter in the exact waiter table.
+    // publish: yield on the waiter source for later wake/requeue completion.
     if uaddr == 0
         || uaddr2 == 0
         || (uaddr & 0x3) != 0
@@ -1185,6 +1224,11 @@ pub fn step_futex_cmp_requeue_pi_in(
     cmpval: u32,
     guard: &Guard<'_>,
 ) -> StepOutcome<u32, NoProgress> {
+    // observe: validate arguments and compare the source futex word.
+    // upgrade: derive source/target keys and inspect compatible waiters.
+    // reserve: select wake/requeue candidates and validate PI ownership.
+    // commit: move selected waiters from source to target state.
+    // publish: wake the selected source waiter and update donation state.
     if uaddr == 0 || uaddr2 == 0 || (uaddr & 0x3) != 0 || (uaddr2 & 0x3) != 0 {
         return StepOutcome::Err(Errno::EINVAL);
     }
@@ -1415,6 +1459,11 @@ pub fn step_futex_wake_op_in(
     encoded_op: u32,
     guard: &Guard<'_>,
 ) -> StepOutcome<u32, NoProgress> {
+    // observe: validate addresses and read the operation target word.
+    // upgrade: decode Linux FUTEX_WAKE_OP fields.
+    // reserve: compute the replacement word and wake counts.
+    // commit: write the operation target word.
+    // publish: wake the source futex and conditionally wake the target futex.
     if uaddr == 0 || uaddr2 == 0 || (uaddr & 0x3) != 0 || (uaddr2 & 0x3) != 0 {
         return StepOutcome::Err(Errno::EINVAL);
     }
@@ -1698,7 +1747,7 @@ pub fn step_futex_unlock_pi_in(
     let key = key_for(aspace, uaddr);
     let handoff = {
         let mut table_guard = PI_WAITERS.lock();
-        match table_guard.as_mut().and_then(|table| {
+        table_guard.as_mut().and_then(|table| {
             let state = table.entries.get_mut(&key)?;
             if state.is_empty() {
                 return None;
@@ -1718,10 +1767,7 @@ pub fn step_futex_unlock_pi_in(
                 table.entries.remove(&key);
             }
             Some((waiter, more_waiters))
-        }) {
-            Some(handoff) => Some(handoff),
-            None => None,
-        }
+        })
     };
     if let Some((waiter, more_waiters)) = handoff {
         let mut new = waiter.waiter_tid & FUTEX_TID_MASK;
@@ -1846,13 +1892,9 @@ impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
             self.interest_mask,
             &guard,
         );
-        if let StepOutcome::Yield {
-            shape: YieldShape::OnWaitSource { source, .. },
-            ..
-        } = &outcome
-        {
+        if let Some(source_id) = notification::yielded_source_id(&outcome) {
             self.waiting = true;
-            self.waiting_source_id = Some(source.raw());
+            self.waiting_source_id = Some(source_id);
         }
         outcome
     }
@@ -1969,7 +2011,7 @@ impl<'a> FutexWaitvOp<'a> {
         }
         self.waiting_source_id = Some(source_id);
         self.sequences = sequences;
-        StepOutcome::yield_on_wait_source(NoProgress, source_id, FUTEX_WAKE_MASK)
+        notification::wait_bucket(source_id)
     }
 }
 
@@ -2034,13 +2076,9 @@ impl<I: SubjectIdentity> StepOp<I> for FutexPiLockOp<'_> {
         }
         let guard = adapter::step_engine::guard();
         let outcome = step_futex_lock_pi_in(self.aspace, self.uaddr, self.owner_tid, false, &guard);
-        if let StepOutcome::Yield {
-            shape: YieldShape::OnWaitSource { source, .. },
-            ..
-        } = &outcome
-        {
+        if let Some(source_id) = notification::yielded_source_id(&outcome) {
             self.waiting = true;
-            self.waiting_source_id = Some(source.raw());
+            self.waiting_source_id = Some(source_id);
         }
         outcome
     }
@@ -2124,13 +2162,9 @@ impl<I: SubjectIdentity> StepOp<I> for FutexWaitRequeuePiOp<'_> {
             self.waiter_tid,
             &guard,
         );
-        if let StepOutcome::Yield {
-            shape: YieldShape::OnWaitSource { source, .. },
-            ..
-        } = &outcome
-        {
+        if let Some(source_id) = notification::yielded_source_id(&outcome) {
             self.waiting = true;
-            self.waiting_source_id = Some(source.raw());
+            self.waiting_source_id = Some(source_id);
         }
         outcome
     }

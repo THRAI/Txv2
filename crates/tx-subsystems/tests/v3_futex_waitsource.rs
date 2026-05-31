@@ -67,8 +67,8 @@ use tx_hal::{
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, UserPtr, VirtAddr,
 };
 use tx_subsystems::futex::{
-    bucket_index, bucket_wait_source, bucket_wait_source_for_source_id, step_futex_wait,
-    step_futex_wake, step_futex_wake_in, FUTEX_WAKE_MASK,
+    bucket_index, bucket_wait_source, bucket_wait_source_for_source_id, reset_for_test,
+    step_futex_wait, step_futex_wake, step_futex_wake_in, FUTEX_WAKE_MASK,
 };
 use tx_subsystems::vm::{
     AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
@@ -132,6 +132,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tx_test_support::init_host();
     let _ = zones::register_all();
+    reset_for_test();
     let stale_uaddr = 0x4_u64;
     let cleanup_guard = ebr_guard();
     while matches!(

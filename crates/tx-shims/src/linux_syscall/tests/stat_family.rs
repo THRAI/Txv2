@@ -585,7 +585,7 @@ fn dispatch_statx_on_root_writes_statx_struct() {
         crate::linux_syscall::numbers::STATX_BASIC_STATS
     );
     assert_eq!(read_u32_at(&statxbuf, STATX_BLKSIZE_OFF), 4096);
-    assert_eq!(read_u32_at(&statxbuf, STATX_NLINK_OFF), 1);
+    assert_eq!(read_u32_at(&statxbuf, STATX_NLINK_OFF), 2);
     let mode = read_u16_at(&statxbuf, STATX_MODE_OFF);
     assert_eq!(mode & 0o170000, 0o040000, "expected S_IFDIR; got {mode:#o}");
     assert_eq!(

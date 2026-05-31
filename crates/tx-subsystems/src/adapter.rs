@@ -25,7 +25,7 @@ pub mod step_engine {
     pub use tx_substrate::epoch::{self as epoch, guard, EpochSummary, Guard};
     pub use tx_substrate::page_allocator;
     pub use tx_substrate::step::{
-        ByteProgress, Errno as V3Errno, NoProgress, RestrictionStackHandle, StepOutcome,
+        ByteProgress, Errno as V3Errno, NoProgress, RestrictionStackHandle, StepOutcome, YieldShape,
     };
     pub use tx_substrate::zone::{
         self as zone, register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy,

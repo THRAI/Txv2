@@ -234,6 +234,11 @@ pub fn step_epoll_note_ready(
     ready: u32,
     disable_after_delivery: bool,
 ) -> StepOutcome<(), NoProgress> {
+    // observe: find the watched fd entry.
+    // upgrade: borrow the epoll fd map for mutation.
+    // reserve: no allocation is required for readiness publication.
+    // commit: record readiness and optional one-shot disable state.
+    // publish: readiness is observed by later epoll wait/drain calls.
     let mut fds = ep.fds.lock();
     let Some(entry) = fds.get_mut(&fd) else {
         return StepOutcome::Err(V3Errno::ENOENT);

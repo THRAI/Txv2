@@ -674,11 +674,9 @@ pub(super) async fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
 /// `__NR_fallocate = 47`.
 ///
 /// Supports the fd-io/LTP surface: `mode == 0` grows visible file size via
-/// `step_fallocate`; `FALLOC_FL_KEEP_SIZE` validates the range but does not
-/// publish a larger size. Other range-manipulation modes are intentionally
-/// rejected until hole-punch/zero-range backing exists.
+/// `step_fallocate`. Other range-manipulation modes are intentionally rejected
+/// until hole-punch/zero-range backing exists.
 pub(super) fn sys_fallocate(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
     const EFBIG_VALUE: i32 = 27;
 
     let fd = args[0] as i32;
@@ -692,8 +690,8 @@ pub(super) fn sys_fallocate(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
     if offset < 0 || len <= 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    if mode != 0 && mode != FALLOC_FL_KEEP_SIZE {
-        return SyscallResult::Error(EOPNOTSUPP_VALUE);
+    if mode != 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
     }
 
     let file = match resolve_fd(&ctx.process, fd as u32) {
@@ -715,13 +713,6 @@ pub(super) fn sys_fallocate(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
         Some(end) if end <= i64::MAX as u64 => end,
         _ => return SyscallResult::Error(EFBIG_VALUE),
     };
-
-    if mode == FALLOC_FL_KEEP_SIZE && end <= pc.size_bytes() {
-        return SyscallResult::Return(0);
-    }
-    if mode == FALLOC_FL_KEEP_SIZE {
-        return SyscallResult::Return(0);
-    }
 
     let outcome = {
         let guard = step_engine::guard();
@@ -1769,7 +1760,7 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
             SyscallResult::Return(0)
         }
         StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        StepOutcome::Err(errno) => SyscallResult::error_from(errno),
     }
 }
 

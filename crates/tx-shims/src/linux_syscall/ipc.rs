@@ -615,6 +615,7 @@ async fn drive_semop(
     sops: &[SemBuf],
     ctx: &SyscallCtx<'_>,
     deadline_ns: Option<u64>,
+    deadline_elapsed: bool,
 ) -> SyscallResult {
     let (_ns, cred) = match nsproxy_and_cred(ctx) {
         Ok(v) => v,
@@ -628,6 +629,9 @@ async fn drive_semop(
                 .iter()
                 .all(|op| (op.sem_flg & ipc::sysv_sem::structure::sem_flg::IPC_NOWAIT) == 0) => {}
         Err(e) => return SyscallResult::Error(errno_to_i32(e)),
+    }
+    if deadline_elapsed {
+        return SyscallResult::Error(errno_to_i32(Errno::EAGAIN));
     }
 
     let mut script_ctx = super::build_subject_script_ctx(ctx);
@@ -657,7 +661,7 @@ async fn drive_semop(
     {
         Ok(applied) => SyscallResult::Return(applied as i64),
         Err(v3errno) => {
-            let errno: Errno = v3errno.into();
+            let errno = v3errno;
             if deadline_ns.is_some() && errno == Errno::ETIMEDOUT {
                 return SyscallResult::Error(errno_to_i32(Errno::EAGAIN));
             }
@@ -671,7 +675,7 @@ pub(super) async fn sys_semop(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
         Ok(v) => v,
         Err(result) => return result,
     };
-    drive_semop(semid, &sops, ctx, None).await
+    drive_semop(semid, &sops, ctx, None, false).await
 }
 
 pub(super) async fn sys_semtimedop<P: TimeIf>(
@@ -687,7 +691,8 @@ pub(super) async fn sys_semtimedop<P: TimeIf>(
         Err(result) => return result,
     };
     let deadline_ns = timeout_ns.map(|ns| P::read_ns().saturating_add(ns));
-    drive_semop(semid, &sops, ctx, deadline_ns).await
+    let deadline_elapsed = deadline_ns.is_some_and(|deadline| P::read_ns() >= deadline);
+    drive_semop(semid, &sops, ctx, deadline_ns, deadline_elapsed).await
 }
 
 pub(super) fn sys_semctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {

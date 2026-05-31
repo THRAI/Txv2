@@ -71,10 +71,8 @@ fn push_nl<const OC: usize>(
         }
         let _ = output_queue.push(b'\r');
         let _ = output_queue.push(b'\n');
-    } else {
-        if output_queue.push(b'\n').is_err() {
-            return false;
-        }
+    } else if output_queue.push(b'\n').is_err() {
+        return false;
     }
     if termios.c_oflag & ONLRET != 0 {
         state.column = 0;

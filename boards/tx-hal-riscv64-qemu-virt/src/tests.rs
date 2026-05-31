@@ -376,7 +376,7 @@ fn cache_methods_are_callable_on_qemu_coherent_platform() {
 
 #[test]
 fn dma_identity_mapping_and_sync_are_qemu_coherent() {
-    const { assert!(<Platform as DmaIf>::DMA_COHERENT) };
+    assert!(core::hint::black_box(<Platform as DmaIf>::DMA_COHERENT));
     assert_eq!(
         <Platform as DmaIf>::phys_to_dma(PhysAddr(0x8020_1000)),
         DmaAddr(0x8020_1000)

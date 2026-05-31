@@ -233,9 +233,13 @@ fn script_kill_pgrp_partial_permission_returns_count_of_permitted() {
     set_cred(&parent, limited_cred(1000));
     set_cred(&child_a, limited_cred(1000));
     set_cred(&child_b, limited_cred(2000));
+    let sigusr1 = Signum::new(10).expect("SIGUSR1");
+    step_sigaction(&parent, sigusr1, SigDisposition::Handler(0xCAFE));
+    step_sigaction(&child_a, sigusr1, SigDisposition::Handler(0xCAFE));
+    step_sigaction(&child_b, sigusr1, SigDisposition::Handler(0xCAFE));
 
     let pgrp = parent.pgrp_cap();
-    let delivered = script_kill_pgrp(&parent, &pgrp, Signum::SIGTERM).expect("not zombie");
+    let delivered = script_kill_pgrp(&parent, &pgrp, sigusr1).expect("not zombie");
     assert_eq!(delivered, 2);
 
     let pending_on = |proc: &Cap<ProcessIdentity>| {
@@ -247,7 +251,7 @@ fn script_kill_pgrp_partial_permission_returns_count_of_permitted() {
             .payload
             .lock()
             .as_ref()
-            .map(|tp| tp.pending().is_pending(Signum::SIGTERM))
+            .map(|tp| tp.pending().is_pending(sigusr1))
             .unwrap()
     };
     assert!(pending_on(&parent), "parent received the post");

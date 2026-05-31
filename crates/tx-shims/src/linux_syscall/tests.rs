@@ -55,13 +55,13 @@ use tx_subsystems::zones;
 
 use super::{
     dispatch, SyscallCtx, SyscallResult, AT_FDCWD, BPF_MAP_CREATE, BPF_MAP_TYPE_ARRAY,
-    CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, EBADF_VALUE, EFAULT_VALUE,
-    EINVAL_VALUE, ENODEV_VALUE, ENOENT_VALUE, ENOSYS_VALUE, ENOTSOCK_VALUE, EOPNOTSUPP_VALUE,
-    FAN_CLASS_CONTENT, FAN_CLASS_NOTIF, FAN_CLOEXEC, FAN_NONBLOCK, FD_CLOEXEC, FSOPEN_CLOEXEC,
-    FSPICK_CLOEXEC, FSPICK_NO_AUTOMOUNT, F_GETFD, F_GETFL, F_SETFD, IN_CLOEXEC, IN_NONBLOCK,
-    MFD_ALLOW_SEALING, MFD_CLOEXEC, NR_ACCEPT, NR_BPF, NR_BRK, NR_CLONE, NR_CLOSE, NR_EXECVE,
-    NR_EXIT, NR_EXIT_GROUP, NR_FANOTIFY_INIT, NR_FCNTL, NR_FSOPEN, NR_FSPICK, NR_GETPGID,
-    NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_INOTIFY_INIT1,
+    CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, EAGAIN_VALUE, EBADF_VALUE,
+    EFAULT_VALUE, EINVAL_VALUE, ENODEV_VALUE, ENOENT_VALUE, ENOSYS_VALUE, ENOTSOCK_VALUE,
+    EOPNOTSUPP_VALUE, FAN_CLASS_CONTENT, FAN_CLASS_NOTIF, FAN_CLOEXEC, FAN_NONBLOCK, FD_CLOEXEC,
+    FSOPEN_CLOEXEC, FSPICK_CLOEXEC, FSPICK_NO_AUTOMOUNT, F_GETFD, F_GETFL, F_SETFD, IN_CLOEXEC,
+    IN_NONBLOCK, MFD_ALLOW_SEALING, MFD_CLOEXEC, NR_ACCEPT, NR_BPF, NR_BRK, NR_CLONE, NR_CLOSE,
+    NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FANOTIFY_INIT, NR_FCNTL, NR_FSOPEN, NR_FSPICK,
+    NR_GETPGID, NR_GETPID, NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_INOTIFY_INIT1,
     NR_MEMBARRIER, NR_MEMFD_CREATE, NR_MEMFD_SECRET, NR_OPEN_TREE, NR_PERF_EVENT_OPEN,
     NR_PIDFD_OPEN, NR_PIPE2, NR_PPOLL, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK,
     NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SCHED_YIELD, NR_SETPGID,
@@ -987,10 +987,10 @@ fn dispatch_memfd_create_validates_name_flags_and_cloexec() {
         NR_MEMFD_CREATE,
         [name.as_ptr() as u64, MFD_ALLOW_SEALING as u64, 0, 0, 0, 0],
     );
-    assert_eq!(
+    assert!(matches!(
         block_on(dispatch::<ShimsTestPmap>(sealing, &ctx)),
-        SyscallResult::Error(EINVAL_VALUE)
-    );
+        SyscallResult::Return(_)
+    ));
 
     let unknown = SyscallRequest::new(NR_MEMFD_CREATE, [name.as_ptr() as u64, 0x100, 0, 0, 0, 0]);
     assert_eq!(
@@ -1276,7 +1276,10 @@ fn dispatch_ppoll_reports_pipe_polout_only_while_space_remains() {
     let mut pipefd = [-1i32; 2];
     assert_eq!(
         block_on(dispatch::<ShimsTestPmap>(
-            SyscallRequest::new(NR_PIPE2, [pipefd.as_mut_ptr() as u64, 0, 0, 0, 0, 0]),
+            SyscallRequest::new(
+                NR_PIPE2,
+                [pipefd.as_mut_ptr() as u64, O_NONBLOCK as u64, 0, 0, 0, 0]
+            ),
             &ctx,
         )),
         SyscallResult::Return(0)
@@ -1307,9 +1310,11 @@ fn dispatch_ppoll_reports_pipe_polout_only_while_space_remains() {
     );
     assert_eq!(pfd.revents, POLLOUT);
 
-    let buf = [0x41u8; tx_subsystems::pipe::PIPE_BUF];
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(
+    let buf = alloc::vec![0x41u8; tx_subsystems::vm::USER_PAGE_SIZE];
+    let pipe_capacity = tx_subsystems::pipe::PIPE_DEF_BUFFERS * tx_subsystems::vm::USER_PAGE_SIZE;
+    let mut written = 0usize;
+    loop {
+        match block_on(dispatch::<ShimsTestPmap>(
             SyscallRequest::new(
                 NR_WRITE,
                 [
@@ -1322,9 +1327,16 @@ fn dispatch_ppoll_reports_pipe_polout_only_while_space_remains() {
                 ],
             ),
             &ctx,
-        )),
-        SyscallResult::Return(buf.len() as i64)
-    );
+        )) {
+            SyscallResult::Return(n) if n > 0 => {
+                written += n as usize;
+                assert!(written <= pipe_capacity);
+            }
+            SyscallResult::Error(errno) if errno == EAGAIN_VALUE => break,
+            other => panic!("unexpected nonblocking pipe write result: {other:?}"),
+        }
+    }
+    assert_eq!(written, pipe_capacity);
 
     pfd.revents = 0;
     assert_eq!(

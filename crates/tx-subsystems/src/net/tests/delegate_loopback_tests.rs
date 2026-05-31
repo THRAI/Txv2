@@ -38,7 +38,7 @@ fn net_delegate_poll_drives_tcp_loopback_connect() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     clear_delegate_queue();
     let (client, listener, local, remote) = prepare_loopback_connecting(40_194, 50_194);
     let source = ScriptedPacketSource::new(std::vec::Vec::new());
@@ -86,7 +86,7 @@ fn net_delegate_poll_drives_tcp_loopback_send_recv() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     clear_delegate_queue();
     let (client, listener, _local, _remote) = prepare_loopback_connecting(40_195, 50_195);
     let source = ScriptedPacketSource::new(std::vec::Vec::new());
@@ -135,7 +135,7 @@ fn net_delegate_poll_drives_udp_loopback_send_recv() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    loopback_iface().clear_for_test_or_bootstrap();
+    reset_loopback_test_state();
     clear_delegate_queue();
     let (server, _client) = {
         let guard = tx_substrate::epoch::guard();

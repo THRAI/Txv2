@@ -1165,9 +1165,7 @@ pub fn poll_due_itimers<P: TimeIf>(process: &Cap<ProcessIdentity>) -> Option<u64
     let now_ns = tx_subsystems::timekeeping::clock_now_ns::<P>(
         tx_subsystems::timekeeping::ClockId::Monotonic,
     );
-    let Some(expired) = process.consume_expired_timers(now_ns) else {
-        return None;
-    };
+    let expired = process.consume_expired_timers(now_ns)?;
     for signal in expired {
         if signal.signum != tx_subsystems::signal::Signum::SIGALRM.raw() as u32 {
             continue;
@@ -1475,7 +1473,7 @@ async fn drive_nanosleep_until<'a, P: TimeIf>(
             SyscallResult::Error(EINTR_VALUE)
         }
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        Err(v3errno) => SyscallResult::error_from(v3errno),
     }
 }
 
