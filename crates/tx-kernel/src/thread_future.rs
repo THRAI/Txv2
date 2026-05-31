@@ -5,9 +5,12 @@
 //! "thread future" of `txdoc:THREAD-4-1-SHAPE`. It owns the userspace
 //! round-trip:
 //!
-//! 1. Open a `UserspaceRunSlot::start_request` and record the token on
-//!    the thread payload (`set_active_userspace_request`). The trap
-//!    shell consults this token to resolve the wait via
+//! 1. Open a `UserspaceRunSlot::start_request` and keep the token local
+//!    while the kernel finishes AST / signal / context preparation.
+//!    Publish it to the thread payload (`set_active_userspace_request`)
+//!    only at the final userspace handoff point, so kernel-side
+//!    bookkeeping cannot be mistaken for an in-flight userspace run.
+//!    The trap shell consults this token to resolve the wait via
 //!    `complete_interesting_trap` per
 //!    `txdoc:REACTOR-USERSPACE-RUN-AS-A-WAIT`.
 //! 2. `.await` the wait. The future yields `Pending` until a userspace
@@ -38,14 +41,16 @@
 //!
 //! Shape used: **divergent-call inside the future** (the brief's
 //! "Shape B" framing, but tempered against the actual slot API). The
-//! future first issues `start_request` so the trap shell has a token
-//! to resolve, then `await`s the wait — that yields `Pending`, the
-//! adapter clears the per-hart slot, the reactor returns control. The
-//! trap arrives, the shell calls `complete_interesting_trap`, the
-//! reactor re-polls, the future runs the syscall dispatch and then
-//! calls `enter_userspace_with_context(ctx)` which diverges into the
-//! trap vector. Control never returns to this future call site; the
-//! next iteration is a fresh poll triggered by the next trap.
+//! future first issues `start_request`, keeps the request token local
+//! while it finishes kernel-side preparation, publishes that token
+//! immediately before `enter_userspace_with_context(ctx)`, and then
+//! `await`s the wait. That yields `Pending`, the adapter clears the
+//! per-hart slot, the reactor returns control. The trap arrives, the
+//! shell calls `complete_interesting_trap`, the reactor re-polls, the
+//! future runs the syscall dispatch and then re-enters userspace on the
+//! next iteration. Control never returns to this future call site from
+//! the userspace transfer itself; the next iteration is a fresh poll
+//! triggered by the next trap.
 //!
 //! `PerHartSlotted<F>` is the task wrapper: it sets
 //! `set_current_thread_payload(hart, payload)` synchronously inside
@@ -275,7 +280,6 @@ pub async fn run_thread<P: TxPlatform>(
             }
         };
         let entry_token = entry_wait.request();
-        payload.set_active_userspace_request(Some(entry_token));
 
         // Phase E (stop-state): before entering userspace, check
         // whether the thread is stopped (SIGSTOP / default-Stop
@@ -531,10 +535,11 @@ pub async fn run_thread<P: TxPlatform>(
         // drains `pending_syscall_return` and overlays it into the
         // ctx's `a0` slot, then clears `active_userspace_request`.
         //
-        // We re-set `active_userspace_request` after `prepare_*` to
-        // keep the trap-shell hand-off pointing at our `entry_wait`
-        // token: `prepare_*` cleared it as part of its writeback
-        // discipline; the upcoming user trap needs it published.
+        // Publish `active_userspace_request` only at the final machine
+        // handoff point. `prepare_*` clears the slot as part of its
+        // writeback discipline; more importantly, delaying publication
+        // keeps kernel-side traps during AST / signal / context prep
+        // from overwriting `saved_user_context` with a kernel frame.
         //
         // `enter_userspace_with_context` is `()`-typed but its
         // platform impl on a real board diverges via `sret` and

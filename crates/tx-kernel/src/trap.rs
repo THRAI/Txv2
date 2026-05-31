@@ -34,6 +34,12 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
     }
 
     fn on_syscall(view: TrapFrameMut<'_>) -> TrapAction {
+        // Only a trap that came from user mode may consume the active
+        // userspace-run token and overwrite `saved_user_context`.
+        if view.view().previous_mode != tx_hal::TrapPreviousMode::User {
+            return TrapAction::Terminate;
+        }
+
         // Phase 1: translate, snapshot context into the active
         // payload, resolve the userspace-run wait, and reschedule.
         // No trap-frame writeback (Plan B); the userspace-entry
