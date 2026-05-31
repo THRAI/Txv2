@@ -366,6 +366,17 @@ So repeated ext4 reads of the BusyBox binary are not the only bottleneck; the
 next speed work needs per-command/syscall timing around process creation,
 shell pipelines, and fd cleanup.
 
+Trap-trace follow-up:
+`target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-traptrace-240s.txt` reached the
+stress body under a trace build before the 240s host timeout. Parsed syscall
+counts show about `10530` syscalls before the stress line and `1863` after it.
+The top whole-run syscalls are `close` `2142`, `read` `1381`, `prlimit64`
+`1025`, `rt_sigprocmask` `812`, `rt_sigaction` `634`, `ppoll` `590`,
+`newfstatat` `497`, `brk` `497`, `wait4` `487`, `write` `474`, `dup3` `429`,
+`symlinkat` `399`, `fcntl` `380`, `execve` `293`, and `clone` `276`; socket
+syscalls are only `43` `socket`, `18` `recvmsg`, and `7` `sendto` in this
+window.
+
 Optimization direction: keep semantic fixes in the kernel, but measure speed at
 the LTP setup subprocess/syscall layer first. The next useful speed work is a
 small timestamped runner/trap-trace pass or a focused reduction in repeated
