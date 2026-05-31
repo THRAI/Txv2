@@ -770,8 +770,6 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:submitted\n");
 
-        P::enable_timer_wakeups();
-
         // The BSP userspace loop uses lock-releasing reactor polls, so a
         // forked daemon child can be submitted immediately while its parent
         // is still in the same poll turn. On SMP, keep APs parked separately:
@@ -783,6 +781,8 @@ impl<P: TxPlatform> CoreInit<P> {
             core::sync::atomic::Ordering::Release,
         );
         super::USERSPACE_REACTOR_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
+        P::cancel_deadline();
+        P::enable_timer_wakeups();
 
         // Drive the BSP reactor loop until init zombifies. Each
         // iteration is a `step_hart_loop_at` step: advance time, run
@@ -802,9 +802,7 @@ impl<P: TxPlatform> CoreInit<P> {
             // context before deciding whether there is runnable work.
             let had_uart = Self::drain_pending_uart_rx_into_tty() != 0;
             let had_sbi = Self::drain_sbi_console_into_tty() != 0;
-            if had_uart || had_sbi {
-                continue;
-            }
+            let drained_console_input = had_uart || had_sbi;
 
             // Drain any pending child-thread submits posted from
             // sys_clone *before* polling the reactor again. This is
@@ -855,6 +853,7 @@ impl<P: TxPlatform> CoreInit<P> {
             if step.should_idle()
                 && !submitted_child_before_poll
                 && !submitted_child_after_poll
+                && !drained_console_input
                 && drained_terminal_tasks == 0
                 && !ebr_active
                 && !init.is_zombie()
