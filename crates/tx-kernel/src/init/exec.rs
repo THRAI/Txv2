@@ -2069,13 +2069,9 @@ fn append_default_oscomp_scripts_impl(cmd: &mut alloc::string::String) {
     append_submit_ltp_runner(cmd, "glibc");
 }
 
-#[cfg(target_arch = "loongarch64")]
 fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
     append_default_oscomp_scripts_impl(cmd);
 }
-
-#[cfg(not(target_arch = "loongarch64"))]
-fn append_default_oscomp_scripts(_cmd: &mut alloc::string::String) {}
 
 fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str) {
     use core::fmt::Write as _;
@@ -2378,13 +2374,17 @@ mod tests {
         assert!(!cmd.contains("; /bin/setsid \"$file\""));
     }
 
-    #[cfg(not(target_arch = "loongarch64"))]
     #[test]
-    fn default_oscomp_is_noop_off_loongarch64() {
+    fn default_oscomp_runs_full_submit_suite_on_all_arches() {
         let mut cmd = String::from("cd /musl/musl");
         append_default_oscomp_scripts(&mut cmd);
 
-        assert_eq!(cmd, "cd /musl/musl");
+        assert!(cmd.contains("basic_testcode.sh"));
+        assert!(cmd.contains("busybox_testcode.sh"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP START libctest-musl ####"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP START libctest-glibc ####"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-musl ####"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-glibc ####"));
     }
 
     #[test]
