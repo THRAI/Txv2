@@ -51,6 +51,14 @@ use tx_subsystems::thread_runtime::{
     current_thread_payload, current_userspace_payload, ThreadPayload,
 };
 
+const DEBUG_SYSCALL_GETPPID: u64 = 173;
+const DEBUG_SYSCALL_RT_SIGPROCMASK: u64 = 135;
+const DEBUG_SYSCALL_CLONE: u64 = 220;
+const DEBUG_SYSCALL_MMAP: u64 = 222;
+const DEBUG_SYSCALL_MUNMAP: u64 = 215;
+const DEBUG_SYSCALL_MPROTECT: u64 = 226;
+const DEBUG_SYSCALL_WRITEV: u64 = 66;
+
 /// Re-export of the reactor's [`PageFaultAccess`] for the trap-shell
 /// surface. Phase 1 uses the reactor enum unchanged; the plan's
 /// "AccessKind" naming is honoured by this alias.
@@ -199,10 +207,12 @@ pub fn hand_off_syscall(
     let Some(payload) = current_payload_for_hart(hart) else {
         return HandoffOutcome::NoActivePayload;
     };
+    emit_syscall_roundtrip_marker(req.nr, b"debug.trap.handoff.payload");
 
     let Some(active) = payload.active_userspace_request() else {
         return HandoffOutcome::NoActiveRequest;
     };
+    emit_syscall_roundtrip_marker(req.nr, b"debug.trap.handoff.active");
 
     // Capture the user context and advance pc past the trapping
     // ecall so the eventual sret resumes at the instruction after,
@@ -215,14 +225,41 @@ pub fn hand_off_syscall(
     // intentionally re-execute the faulting instruction after the
     // fault is resolved, so that path keeps pc unchanged).
     let mut ctx = view.capture_user_context();
+    emit_syscall_roundtrip_marker(req.nr, b"debug.trap.handoff.capture");
     const RV64_ECALL_INSN_BYTES: usize = 4;
     ctx.pc = ctx.pc.wrapping_add(RV64_ECALL_INSN_BYTES);
     payload.store_saved_user_context(Some(ctx));
+    emit_syscall_roundtrip_marker(req.nr, b"debug.trap.handoff.store");
 
     let slot: UserspaceRunSlot = payload.userspace_slot().clone();
     match slot.complete_interesting_trap(active, UserspaceTrapInfo::Syscall(req)) {
-        Ok(_status) => HandoffOutcome::Resolved,
+        Ok(_status) => {
+            emit_syscall_roundtrip_marker(req.nr, b"debug.trap.handoff.complete");
+            HandoffOutcome::Resolved
+        }
         Err(err) => HandoffOutcome::SlotError(err),
+    }
+}
+
+fn emit_syscall_roundtrip_marker(sysno: u64, name: &[u8]) {
+    if !matches!(
+        sysno,
+        DEBUG_SYSCALL_GETPPID
+            | DEBUG_SYSCALL_RT_SIGPROCMASK
+            | DEBUG_SYSCALL_CLONE
+            | DEBUG_SYSCALL_MMAP
+            | DEBUG_SYSCALL_MUNMAP
+            | DEBUG_SYSCALL_MPROTECT
+            | DEBUG_SYSCALL_WRITEV
+    ) {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            sysno as i64,
+        );
+        tx_observe::dump_registered_if_requested();
     }
 }
 

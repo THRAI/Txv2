@@ -1,7 +1,9 @@
 use tx_hal::{
     CpuId, FaultInfo, IpiKind, IrqHandled, KernelTrapSink, PercpuIf, TrapAction, TrapFrameMut,
-    TxPlatform,
+    TxPlatform, VirtAddr,
 };
+use tx_shims::linux_syscall::numbers::{NR_RT_SIGPROCMASK, NR_SET_TID_ADDRESS};
+use tx_shims::linux_syscall::SyscallResult;
 
 use crate::{adapter::boot_runtime, trap_handoff};
 
@@ -30,7 +32,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         action
     }
 
-    fn on_syscall(view: TrapFrameMut<'_>) -> TrapAction {
+    fn on_syscall(mut view: TrapFrameMut<'_>) -> TrapAction {
         // Phase 1: translate, snapshot context into the active
         // payload, resolve the userspace-run wait, and reschedule.
         // No trap-frame writeback (Plan B); the userspace-entry
@@ -38,6 +40,10 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         // `set_syscall_return` / `set_syscall_error` into the
         // *fresh* trap frame before `enter_userspace`.
         let req = trap_handoff::translate_syscall::<P>(&view.view());
+        if let Some(action) = try_direct_trap_syscall::<P>(&mut view, &req) {
+            return action;
+        }
+        emit_debug_counter(b"debug.trap.syscall", req.nr as i64);
         let hart = <P as PercpuIf>::current_cpu_id().0;
         let outcome = trap_handoff::hand_off_syscall(hart, &view, req);
         trap_handoff::outcome_to_trap_action(&outcome)
@@ -46,6 +52,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
     fn on_timer_interrupt(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
         P::cancel_deadline();
         if view.view().previous_mode == tx_hal::TrapPreviousMode::User {
+            emit_debug_counter(b"debug.trap.timer_user", view.view().pc.0 as i64);
             let hart = <P as PercpuIf>::current_cpu_id().0;
             let outcome = trap_handoff::hand_off_timer_preempt(hart, &view);
             if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {
@@ -88,6 +95,98 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
 
     fn on_illegal_or_sync_fault(_view: TrapFrameMut<'_>, _fault: FaultInfo) -> TrapAction {
         TrapAction::Terminate
+    }
+}
+
+fn try_direct_trap_syscall<P: TxPlatform>(
+    view: &mut TrapFrameMut<'_>,
+    req: &trap_handoff::SyscallRequest,
+) -> Option<TrapAction> {
+    let hart = <P as PercpuIf>::current_cpu_id().0;
+    let Some(payload) = tx_subsystems::thread_runtime::current_userspace_payload(hart) else {
+        return None;
+    };
+    if payload.active_userspace_request().is_none() {
+        return None;
+    }
+
+    let Some(thread) = tx_subsystems::thread_runtime::current_userspace_thread_identity(hart)
+    else {
+        return None;
+    };
+    let Some(process) = thread.upgrade_owner_proc() else {
+        return None;
+    };
+    let Some(aspace) = process.aspace_cap() else {
+        return None;
+    };
+
+    if !direct_syscall_preconditions(req.nr, &payload, &process) {
+        return None;
+    }
+
+    let Some(result) =
+        tx_shims::linux_syscall::dispatch_direct_trap_oneshot(req, &process, &thread, &aspace)
+    else {
+        return None;
+    };
+
+    let needs_reschedule = direct_trap_syscall_needs_wake_handoff(req, &result);
+
+    match result {
+        SyscallResult::Return(value) => view.set_syscall_return(value),
+        SyscallResult::CloneReturn { value, .. } => view.set_syscall_return(value),
+        SyscallResult::Error(errno) => view.set_syscall_error(errno),
+        SyscallResult::NoReturn
+        | SyscallResult::ExecCommitted
+        | SyscallResult::SigreturnRestored => return None,
+    }
+
+    const RV64_ECALL_INSN_BYTES: usize = 4;
+    view.set_pc(VirtAddr(
+        view.view().pc.0.wrapping_add(RV64_ECALL_INSN_BYTES),
+    ));
+    emit_debug_counter(b"debug.trap.direct_syscall", req.nr as i64);
+    if needs_reschedule {
+        emit_debug_counter(b"debug.trap.direct_wake_handoff", req.nr as i64);
+        let outcome = trap_handoff::hand_off_timer_preempt(hart, view);
+        return Some(trap_handoff::timer_preempt_outcome_to_trap_action(&outcome));
+    }
+    Some(TrapAction::Resume)
+}
+
+pub(crate) fn direct_trap_syscall_needs_wake_handoff(
+    req: &trap_handoff::SyscallRequest,
+    result: &SyscallResult,
+) -> bool {
+    crate::thread_future::syscall_return_may_publish_wake_handoff(req, result)
+}
+
+fn direct_syscall_preconditions(
+    nr: u64,
+    payload: &tx_subsystems::thread_runtime::ThreadPayload,
+    process: &tx_subsystems::process::ProcessIdentity,
+) -> bool {
+    match nr {
+        NR_RT_SIGPROCMASK => {
+            payload.pending().snapshot() == 0
+                && process.group_pending_snapshot() == 0
+                && payload.interrupt_summary() == tx_subsystems::signal::InterruptSummary::EMPTY
+        }
+        NR_SET_TID_ADDRESS => {
+            payload.interrupt_summary() == tx_subsystems::signal::InterruptSummary::EMPTY
+        }
+        _ => true,
+    }
+}
+
+fn emit_debug_counter(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+        tx_observe::dump_registered_if_requested();
     }
 }
 

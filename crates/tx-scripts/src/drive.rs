@@ -90,6 +90,7 @@ where
     let parent_span = tx_observe::current_parent_span();
     let drive_span =
         emit_drive_begin::<S, I>(mode, timer_wheel.is_some(), ctx.task_id_low(), parent_span);
+    tx_observe::dump_registered_if_requested();
     // Install the L2 drive span as the new "current parent" so nested
     // L3/L4 records attach to it; restored at the end of drive() below.
     let prev_parent = tx_observe::set_current_parent_span(drive_span);
@@ -100,16 +101,19 @@ where
     let result: Result<S::Output, Errno> = 'drive: loop {
         // L4: step begin — opens a step span attached to the drive span.
         let step_span = emit_step_begin(iteration, drive_span);
+        tx_observe::dump_registered_if_requested();
 
         match op.step(ctx) {
             StepOutcome::Continue { progress } => {
                 emit_step_end(step_span, 0, &progress, 0, 0);
+                tx_observe::dump_registered_if_requested();
                 accumulated.extend(progress);
                 iteration = iteration.saturating_add(1);
             }
             StepOutcome::Yield { progress, shape } => {
                 let shape_kind = yield_shape_kind(&shape);
                 emit_step_end(step_span, 1, &progress, shape_kind, 0);
+                tx_observe::dump_registered_if_requested();
                 accumulated.extend(progress);
                 let progress_empty = accumulated.is_empty();
                 match mode.classify(&shape, progress_empty) {
@@ -143,6 +147,7 @@ where
                         // L3: yield begin — opens a yield span attached to the drive span.
                         let yield_span =
                             emit_yield_begin(drive_span, ctx.task_id_low(), shape_kind);
+                        tx_observe::dump_registered_if_requested();
 
                         let interrupt_state = InterruptView::<I>::from_ctx(ctx);
                         let (resume, wait_gen) = resolve_yield(
@@ -163,6 +168,7 @@ where
                         // daemon's flow-id hash converges and Perfetto
                         // draws the wake.notify → Resume arrow.
                         emit_resume_end(yield_span, &resume, wait_gen);
+                        tx_observe::dump_registered_if_requested();
 
                         // D9-A: translate Aborted(Interrupted/Killed) to
                         // the appropriate errno without calling
@@ -197,10 +203,12 @@ where
             }
             StepOutcome::Done(t) => {
                 emit_step_end::<S::Progress>(step_span, 2, &S::Progress::EMPTY, 0, 0);
+                tx_observe::dump_registered_if_requested();
                 break 'drive Ok(t);
             }
             StepOutcome::Err(e) => {
                 emit_step_end::<S::Progress>(step_span, 3, &S::Progress::EMPTY, 0, e.linux_i32());
+                tx_observe::dump_registered_if_requested();
                 break 'drive Err(e);
             }
         }
@@ -208,6 +216,7 @@ where
 
     // L2: drive end — closes the drive span with final outcome.
     emit_drive_end(drive_span, &result);
+    tx_observe::dump_registered_if_requested();
     // Restore the prior parent-span slot so an outer drive (or the
     // syscall dispatcher) sees the same value it installed.
     tx_observe::set_current_parent_span(prev_parent);

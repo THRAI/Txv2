@@ -484,7 +484,7 @@ impl Hasher for Fnv1aHasher {
 /// payloads — the full (slot, generation, kind) triple is used for
 /// disambiguation by the daemon.
 #[inline]
-fn cap_kind_byte<T: 'static>() -> u8 {
+pub(super) fn cap_kind_byte<T: 'static>() -> u8 {
     let mut h = Fnv1aHasher(0);
     core::any::TypeId::of::<T>().hash(&mut h);
     h.finish() as u8

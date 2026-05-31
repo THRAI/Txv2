@@ -36,6 +36,14 @@ use tx_hal::{BootHandoff, TxPlatform};
 /// `tx_observe::set_dump_threshold`.
 pub const OBSERVE_DUMP_THRESHOLD: u64 = 0;
 
+/// Bounded trace budget for OSComp benchmark debug runs.
+///
+/// The OSComp benchmark suites can hang before init exits, so the normal
+/// exit-time trace dump is unreachable. Re-arm the ring at the benchmark
+/// boundary and dump after enough syscall/drive records to cover the shell
+/// handoff plus the first benchmark process.
+pub const OSCOMP_BENCH_OBSERVE_DUMP_THRESHOLD: u64 = 1_000_000;
+
 #[cfg(all(not(target_os = "none"), not(test)))]
 mod host_check_allocator {
     use core::alloc::{GlobalAlloc, Layout};

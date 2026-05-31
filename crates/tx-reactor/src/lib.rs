@@ -44,12 +44,13 @@ pub use mailbox::{
 };
 pub use runtime::{
     HartRunStats, HartRuntimeView, Reactor, ReactorObservability, RunIdleReport, RunStats,
-    SharedReactor, SliceClock,
+    SharedReactor, SliceClock, TaskPublishReport,
 };
 pub use scheduler::{
     HartId, HartSchedulerLocal, InitialSchedMeta, LocalEnqueueRequest, MigrationPolicy,
-    Phase1QueueKind, Phase1Scheduler, RunnablePlacement, SchedClass, SchedulerAffinityError,
-    SchedulerStats, SliceConfig, StopReason, TaskHandle, TaskRunOwner, WakeHint,
+    Phase1QueueKind, Phase1Scheduler, QueuedTaskReport, RunnablePlacement, SchedClass,
+    SchedulerAffinityError, SchedulerStats, SliceConfig, StopReason, TaskHandle, TaskRunOwner,
+    WakeHint,
 };
 pub use task::{
     current_delegate_registry, current_task_mailbox, current_timer_wheel, TaskDrainRecord, TaskId,

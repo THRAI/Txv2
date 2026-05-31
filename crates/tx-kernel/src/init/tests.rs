@@ -853,8 +853,11 @@ fn boot_smoke_production_userspace_loop_writes_console_then_exits() {
     let mut cx = Context::from_waker(&waker);
 
     let future = crate::thread_future::run_thread::<TestPlatform>(leader.clone(), payload.clone());
-    let wrapped =
-        crate::thread_future::PerHartSlotted::<TestPlatform, _>::new(payload.clone(), future);
+    let wrapped = crate::thread_future::PerHartSlotted::<TestPlatform, _>::new(
+        leader.clone(),
+        payload.clone(),
+        future,
+    );
     let mut boxed = std::boxed::Box::new(wrapped);
     // SAFETY: `boxed` is owned for the duration of this test and
     // never moved after pinning.
@@ -1012,8 +1015,11 @@ fn run_thread_timer_preempt_yields_and_reenters_without_resolving_wait() {
     let waker = Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);
     let future = crate::thread_future::run_thread::<TestPlatform>(leader.clone(), payload.clone());
-    let wrapped =
-        crate::thread_future::PerHartSlotted::<TestPlatform, _>::new(payload.clone(), future);
+    let wrapped = crate::thread_future::PerHartSlotted::<TestPlatform, _>::new(
+        leader.clone(),
+        payload.clone(),
+        future,
+    );
     let mut boxed = std::boxed::Box::new(wrapped);
     // SAFETY: `boxed` is owned for the duration of this test and is not moved
     // after pinning.
@@ -1264,7 +1270,11 @@ fn reactor_submission_seam_submits_child_thread_smoke() {
     let leader = child
         .nth_thread(0)
         .expect("fresh child has a leader thread");
-    reactor_submit::submit_child_thread(child.clone(), leader);
+    assert_eq!(
+        reactor_submit::submit_child_thread(child.clone(), leader),
+        reactor_submit::SubmitChildThreadStatus::QueuedFallback,
+        "uninitialised boot reactor path must report fallback queueing"
+    );
     // No assertion on reactor side-effects — the BOOT_REACTOR slot
     // is not initialised in the test scaffolding (init_boot_reactor
     // is gated behind init_substrate_if_ready). The smoke covers

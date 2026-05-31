@@ -33,6 +33,7 @@
 //! cap-typed). The shape stays — only the substrate primitive
 //! changes.
 
+use alloc::collections::BTreeMap;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -40,7 +41,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::step::{InterestMask, WaitSourceId};
 use crate::SpinMutex;
 
-use crate::wake::mailbox::{MailboxEvent, TaskMailbox, WaitGeneration};
+use crate::wake::mailbox::{MailboxEvent, MailboxSchedulerHint, TaskMailbox, WaitGeneration};
 
 use tx_observe_types::{PayloadWaitSourceNotify, TxTraceLevel};
 
@@ -178,6 +179,11 @@ impl WaitSource {
     ///
     /// Returns the number of events successfully posted.
     pub fn notify(&self, mask: InterestMask) -> usize {
+        self.notify_with_hint(mask, MailboxSchedulerHint::Normal)
+    }
+
+    /// Fire `mask` with an explicit scheduler hint for delivered events.
+    pub fn notify_with_hint(&self, mask: InterestMask, hint: MailboxSchedulerHint) -> usize {
         self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
         let mut subs = self.subscribers.lock();
         let mut posted = 0usize;
@@ -195,7 +201,7 @@ impl WaitSource {
                     source: self.id,
                     interests: InterestMask::new(overlap),
                 };
-                if mailbox.post(evt) {
+                if mailbox.post_with_scheduler_hint(evt, hint) {
                     posted += 1;
                 }
                 // Note: on overflow the mailbox latches its flag;
@@ -203,6 +209,114 @@ impl WaitSource {
             }
             true
         });
+        posted
+    }
+
+    /// Fire `mask` on this source, posting to at most `limit` live
+    /// matching subscribers. If no live subscriber receives the event,
+    /// keep the mask pending so a waiter that already published the
+    /// semantic wait but has not yet committed its mailbox registration
+    /// can still observe the wake.
+    pub fn notify_limit(&self, mask: InterestMask, limit: usize) -> usize {
+        self.notify_limit_with_hint(mask, limit, MailboxSchedulerHint::Normal)
+    }
+
+    /// Fire `mask` with an explicit scheduler hint, posting to at most
+    /// `limit` live matching subscribers.
+    pub fn notify_limit_with_hint(
+        &self,
+        mask: InterestMask,
+        limit: usize,
+        hint: MailboxSchedulerHint,
+    ) -> usize {
+        if limit == 0 || mask.raw() == 0 {
+            return 0;
+        }
+        let mut subs = self.subscribers.lock();
+        let mut posted = 0usize;
+        subs.retain(|sub| {
+            let Some(mailbox) = sub.mailbox.upgrade() else {
+                return false;
+            };
+            let overlap = sub.interests.raw() & mask.raw();
+            if overlap != 0 && posted < limit {
+                let evt = MailboxEvent::SourceFired {
+                    generation: sub.generation,
+                    source: self.id,
+                    interests: InterestMask::new(overlap),
+                };
+                if mailbox.post_with_scheduler_hint(evt, hint) {
+                    posted += 1;
+                }
+            }
+            true
+        });
+        if posted == 0 {
+            self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
+        }
+        posted
+    }
+
+    /// Fire `mask` on this source, posting to at most `limit` live matching
+    /// subscribers, and emit one `WaitSourceNotify` observation record per
+    /// delivered mailbox event.
+    pub fn notify_limit_emit(&self, mask: InterestMask, limit: usize) -> usize {
+        self.notify_limit_emit_with_hint(mask, limit, MailboxSchedulerHint::Normal)
+    }
+
+    /// Fire `mask` with an explicit scheduler hint, posting to at most
+    /// `limit` live matching subscribers and emitting one observation record
+    /// per delivered mailbox event.
+    pub fn notify_limit_emit_with_hint(
+        &self,
+        mask: InterestMask,
+        limit: usize,
+        hint: MailboxSchedulerHint,
+    ) -> usize {
+        use tx_observe::encode::{encode_wait_source_notify, wait_source_notify_tag};
+        use tx_observe::EventNameId;
+
+        if limit == 0 || mask.raw() == 0 {
+            return 0;
+        }
+        let mut subs = self.subscribers.lock();
+        let mut posted = 0usize;
+        subs.retain(|sub| {
+            let Some(mailbox) = sub.mailbox.upgrade() else {
+                return false;
+            };
+            let overlap = sub.interests.raw() & mask.raw();
+            if overlap != 0 && posted < limit {
+                let evt = MailboxEvent::SourceFired {
+                    generation: sub.generation,
+                    source: self.id,
+                    interests: InterestMask::new(overlap),
+                };
+                if mailbox.post_with_scheduler_hint(evt, hint) {
+                    posted += 1;
+                    if let Some(em) = tx_observe::current() {
+                        let payload = PayloadWaitSourceNotify {
+                            source_id_low: self.id.raw() as u32,
+                            mask_bits: overlap as u32,
+                            task_id_low: mailbox.task_id_low(),
+                            wait_generation_low: sub.generation.raw() as u32,
+                        };
+                        let (payload_bytes, _) = encode_wait_source_notify(&payload);
+                        em.instant(
+                            TxTraceLevel::Yield,
+                            EventNameId::from_raw(tx_observe::fnv1a32(b"wake.notify")),
+                            tx_observe::SpanId::NONE,
+                            wait_source_notify_tag(),
+                            &payload_bytes,
+                        );
+                    }
+                }
+            }
+            true
+        });
+        if posted == 0 {
+            self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
+        }
         posted
     }
 
@@ -227,6 +341,12 @@ impl WaitSource {
     /// `decr_writer`, etc.). It is **never** called from inside a
     /// `StepOp::step()` body.
     pub fn notify_emit(&self, mask: InterestMask) -> usize {
+        self.notify_emit_with_hint(mask, MailboxSchedulerHint::Normal)
+    }
+
+    /// Fire `mask` with an explicit scheduler hint and emit one
+    /// `WaitSourceNotify` observation record per woken task.
+    pub fn notify_emit_with_hint(&self, mask: InterestMask, hint: MailboxSchedulerHint) -> usize {
         use tx_observe::encode::{encode_wait_source_notify, wait_source_notify_tag};
         use tx_observe::EventNameId;
 
@@ -245,7 +365,7 @@ impl WaitSource {
                     source: self.id,
                     interests: InterestMask::new(overlap),
                 };
-                if mailbox.post(evt) {
+                if mailbox.post_with_scheduler_hint(evt, hint) {
                     posted += 1;
                     // Emit one Instant record per woken task (OBS-4 / γ-fix).
                     if let Some(em) = tx_observe::current() {
@@ -318,35 +438,26 @@ use alloc::sync::Arc;
 
 /// Global registry mapping [`WaitSourceId`] → [`WaitSource`].
 ///
-/// Indexed by `WaitSourceId::raw()` for O(1) lookup. Slot reuse is not
-/// needed — the id space is large enough for the system lifetime and
-/// sources are never destroyed in practice (they're embedded in
-/// long-lived semantic objects).
-static REGISTRY: SpinMutex<Vec<Option<Arc<WaitSource>>>> = SpinMutex::new(Vec::new());
+/// Indexed sparsely by `WaitSourceId::raw()`. Notification source ids are
+/// allocated from a high subsystem-owned range, so dense slot indexing would
+/// try to materialize billions of empty entries during early boot.
+static REGISTRY: SpinMutex<BTreeMap<u64, Arc<WaitSource>>> = SpinMutex::new(BTreeMap::new());
 
 /// Register a source in the global registry so the driver can find it
 /// by [`WaitSourceId`] during yield resolution.
 pub fn register_source(source: Arc<WaitSource>) {
-    let id = source.id().raw() as usize;
-    let mut reg = REGISTRY.lock();
-    while reg.len() <= id {
-        reg.push(None);
-    }
-    reg[id] = Some(source);
+    REGISTRY.lock().insert(source.id().raw(), source);
 }
 
 /// Remove a source from the global registry.
 pub fn unregister_source(id: WaitSourceId) {
-    let mut reg = REGISTRY.lock();
-    if let Some(slot) = reg.get_mut(id.raw() as usize) {
-        *slot = None;
-    }
+    REGISTRY.lock().remove(&id.raw());
 }
 
 /// Look up a source by id. Returns `None` if the id is unknown or
 /// the source was never registered.
 pub fn lookup_source(id: WaitSourceId) -> Option<Arc<WaitSource>> {
-    REGISTRY.lock().get(id.raw() as usize)?.clone()
+    REGISTRY.lock().get(&id.raw()).cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -539,6 +650,99 @@ mod tests {
             }
             other => panic!("expected SourceFired, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_notify_latches_normal_scheduler_hint() {
+        let src = WaitSource::new(WaitSourceId::new(42));
+        let m = mb();
+        let _ = src.register(
+            Arc::downgrade(&m),
+            WaitGeneration::new(1),
+            InterestMask::new(0b1),
+        );
+
+        assert_eq!(src.notify(InterestMask::new(0b1)), 1);
+        assert_eq!(m.take_scheduler_hint(), MailboxSchedulerHint::Normal);
+    }
+
+    #[test]
+    fn hinted_notify_limit_emit_latches_wake_handoff() {
+        let src = WaitSource::new(WaitSourceId::new(43));
+        let m = mb();
+        let _ = src.register(
+            Arc::downgrade(&m),
+            WaitGeneration::new(1),
+            InterestMask::new(0b1),
+        );
+
+        assert_eq!(
+            src.notify_limit_emit_with_hint(
+                InterestMask::new(0b1),
+                1,
+                MailboxSchedulerHint::WakeHandoff,
+            ),
+            1
+        );
+        assert_eq!(m.take_scheduler_hint(), MailboxSchedulerHint::WakeHandoff);
+    }
+
+    #[test]
+    fn notify_limit_posts_at_most_requested_matching_subscribers() {
+        let src = WaitSource::new(WaitSourceId::new(42));
+        let m1 = mb();
+        let m2 = mb();
+        let m3 = mb();
+        let _ = src.register(
+            Arc::downgrade(&m1),
+            WaitGeneration::new(1),
+            InterestMask::new(0b1),
+        );
+        let _ = src.register(
+            Arc::downgrade(&m2),
+            WaitGeneration::new(2),
+            InterestMask::new(0b1),
+        );
+        let _ = src.register(
+            Arc::downgrade(&m3),
+            WaitGeneration::new(3),
+            InterestMask::new(0b1),
+        );
+
+        let posted = src.notify_limit(InterestMask::new(0b1), 1);
+        assert_eq!(posted, 1);
+
+        let delivered = [!m1.is_empty(), !m2.is_empty(), !m3.is_empty()]
+            .into_iter()
+            .filter(|ready| *ready)
+            .count();
+        assert_eq!(delivered, 1, "only one matching waiter should wake");
+    }
+
+    #[test]
+    fn notify_limit_emit_posts_at_most_requested_matching_subscribers() {
+        let src = WaitSource::new(WaitSourceId::new(45));
+        let m1 = mb();
+        let m2 = mb();
+        let _ = src.register(
+            Arc::downgrade(&m1),
+            WaitGeneration::new(1),
+            InterestMask::new(0b1),
+        );
+        let _ = src.register(
+            Arc::downgrade(&m2),
+            WaitGeneration::new(2),
+            InterestMask::new(0b1),
+        );
+
+        let posted = src.notify_limit_emit(InterestMask::new(0b1), 1);
+
+        assert_eq!(posted, 1);
+        let delivered = [!m1.is_empty(), !m2.is_empty()]
+            .into_iter()
+            .filter(|ready| *ready)
+            .count();
+        assert_eq!(delivered, 1, "only one matching waiter should wake");
     }
 
     #[test]

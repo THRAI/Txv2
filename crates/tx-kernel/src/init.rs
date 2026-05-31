@@ -39,6 +39,7 @@ const BSP_REACTOR_TIMER_WAIT_SPINS: usize = 20_000;
 /// loop), NOT in `step_boot_reactor_once` which is also called from boot
 /// smoke tests that may run during critical sections.
 pub(crate) const IDLE_TIMER_PERIOD_NS: u64 = 5_000_000; // 5 ms
+const POLLING_IDLE_SPINS: usize = 256;
 
 static BOOT_REACTOR: boot_runtime::SharedReactor = boot_runtime::SharedReactor::empty();
 /// Switched to true when the userspace reactor phase begins, enabling
@@ -121,6 +122,12 @@ pub(crate) fn mark_boot_reactor_userspace_preempt(cpu_id: CpuId) {
     let _ = BOOT_REACTOR.with(|reactor| {
         reactor.mark_userspace_preempt(boot_runtime::HartId(cpu_id.0));
     });
+}
+
+pub(crate) fn boot_reactor_hart_is_polling_idle(hart: boot_runtime::HartId) -> bool {
+    BOOT_REACTOR
+        .with(|reactor| reactor.is_polling_idle(hart))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -251,6 +258,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::run_bsp_reactor_timer_idle_smoke();
             Self::report_reactor_sched_observability();
             Self::init_process_subsystem();
+            Self::prewarm_thread_runtime_caches();
 
             // ---- Phase 3b boot wiring ----
             //
@@ -327,6 +335,18 @@ impl<P: TxPlatform> CoreInit<P> {
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":process:init:ok\n");
+    }
+
+    fn prewarm_thread_runtime_caches() {
+        const THREAD_PAYLOAD_PREWARM_SLOTS: usize = 64;
+
+        let warmed = tx_subsystems::thread_runtime::prewarm_thread_payload_slots(
+            THREAD_PAYLOAD_PREWARM_SLOTS,
+        );
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":thread-runtime:prewarm:payload=");
+        Self::write_usize(warmed);
+        tx_hal::console_write_str::<P>("\n");
     }
 
     /// Register the boot console as a hardware TTY and stash its cap
@@ -1125,8 +1145,11 @@ impl<P: TxPlatform> CoreInit<P> {
         // #!/bin/busybox sh) resolve correctly when no initramfs is
         // loaded.  RV64 OSComp images place busybox under /musl/musl;
         // the LA64 busybox-root image built by xtask places it under
-        // /bin inside the mounted image.  Both steps tolerate EEXIST
-        // so a baked initramfs or busybox_baked path that ran first wins.
+        // /bin inside the mounted image.  The OSComp scripts usually invoke
+        // applets through `./busybox`, but lmbench's upstream driver also
+        // calls a handful of utilities by bare name (for example `cp hello
+        // /tmp/hello`).  Publish those names as BusyBox symlinks so PATH
+        // lookup observes the same applet contract as a normal BusyBox rootfs.
         {
             let guard = step_engine::guard();
             let bin_id = match rootfs_payload.fs_ops.mkdir(
@@ -1151,10 +1174,76 @@ impl<P: TxPlatform> CoreInit<P> {
                 }
                 other => panic!("mount_sdcard_at_musl: mkdir /bin: {other:?}"),
             };
-            let _ =
-                rootfs_payload
+            for name in [
+                b"sh".as_slice(),
+                b"cp".as_slice(),
+                b"rm".as_slice(),
+                b"expr".as_slice(),
+                b"date".as_slice(),
+                b"uname".as_slice(),
+                b"hostname".as_slice(),
+                b"uptime".as_slice(),
+                b"netstat".as_slice(),
+                b"ifconfig".as_slice(),
+                b"mount".as_slice(),
+                b"mkdir".as_slice(),
+                b"touch".as_slice(),
+                b"sync".as_slice(),
+                b"sleep".as_slice(),
+                b"tar".as_slice(),
+            ] {
+                match rootfs_payload.fs_ops.symlink(
+                    bin_id,
+                    name,
+                    b"/musl/musl/busybox",
+                    &cred,
+                    &guard,
+                ) {
+                    V3::Done(_) | V3::Err(step_engine::Errno::EEXIST) => {}
+                    other => panic!("mount_sdcard_at_musl: busybox applet symlink: {other:?}"),
+                }
+            }
+
+            // The OSComp lmbench image ships tiny wrapper scripts such as
+            // `hello` that exec `/code/lmbench_src/bin/build/lmbench_all`.
+            // The local full sdcard does not contain `/code`, but it does
+            // contain the real multiplexer at `/musl/musl/lmbench_all`.
+            // Publish the expected build path in rootfs so those wrappers
+            // execute the in-image binary instead of failing at process-shell
+            // latency time.
+            let mut parent = tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID;
+            for name in [
+                b"code".as_slice(),
+                b"lmbench_src".as_slice(),
+                b"bin".as_slice(),
+                b"build".as_slice(),
+            ] {
+                parent = match rootfs_payload
                     .fs_ops
-                    .symlink(bin_id, b"sh", b"/musl/musl/busybox", &cred, &guard);
+                    .mkdir(parent, name, 0o755, &cred, &guard)
+                {
+                    V3::Done((id, _)) => id,
+                    V3::Err(step_engine::Errno::EEXIST) => {
+                        match rootfs_payload.fs_ops.lookup(parent, name, &guard) {
+                            V3::Done(id) => id,
+                            other => panic!(
+                                "mount_sdcard_at_musl: lmbench /code lookup after EEXIST: {other:?}"
+                            ),
+                        }
+                    }
+                    other => panic!("mount_sdcard_at_musl: mkdir lmbench /code path: {other:?}"),
+                };
+            }
+            match rootfs_payload.fs_ops.symlink(
+                parent,
+                b"lmbench_all",
+                b"/musl/musl/lmbench_all",
+                &cred,
+                &guard,
+            ) {
+                V3::Done(_) | V3::Err(step_engine::Errno::EEXIST) => {}
+                other => panic!("mount_sdcard_at_musl: lmbench_all symlink: {other:?}"),
+            }
         }
 
         Self::write_board_sentinel_prefix();
@@ -1489,6 +1578,10 @@ impl<P: TxPlatform> CoreInit<P> {
                 continue;
             }
             crate::zones::try_bounded_maintenance_tick();
+            let hart = boot_runtime::HartId(cpu_id.0);
+            if Self::poll_boot_reactor_idle_window(hart) {
+                continue;
+            }
             P::wait_for_interrupt_once();
             if P::pending_ipi(IpiKind::Reschedule) {
                 P::ack_ipi(IpiKind::Reschedule);
@@ -1503,12 +1596,20 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::step_boot_reactor_once(cpu_id)
         };
 
+        // Reclaim terminal child tasks before publishing queued children so
+        // hot pthread create/join loops reuse reactor task slots promptly.
+        let drained_terminal_before_submit = Self::drain_terminal_thread_reactor_tasks();
+
         // A userspace task polled on this AP may fork while the reactor
         // poll lease is active. sys_clone defers child submission in that
         // case; make those children visible before the AP decides to WFI.
         let submitted_child = Self::drain_pending_child_submits();
+        let drained_terminal_after_poll = Self::drain_terminal_thread_reactor_tasks();
 
-        submitted_child || step.is_some_and(|step| !step.should_idle())
+        drained_terminal_before_submit
+            || submitted_child
+            || drained_terminal_after_poll
+            || step.is_some_and(|step| !step.should_idle())
     }
 
     fn step_boot_reactor_once(cpu_id: CpuId) -> Option<boot_runtime::hart_loop::HartLoopStep> {
@@ -1566,6 +1667,23 @@ impl<P: TxPlatform> CoreInit<P> {
             }
             boot_runtime::hart_loop::HartLoopDeadlineAction::Cancel => P::cancel_deadline(),
         }
+    }
+
+    pub(super) fn poll_boot_reactor_idle_window(hart: boot_runtime::HartId) -> bool {
+        let mut observed = false;
+        let _ = BOOT_REACTOR.with(|reactor| reactor.begin_polling_idle(hart));
+        for _ in 0..POLLING_IDLE_SPINS {
+            if BOOT_REACTOR
+                .with(|reactor| reactor.should_leave_polling_idle(hart))
+                .unwrap_or(false)
+            {
+                observed = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        let _ = BOOT_REACTOR.with(|reactor| reactor.end_polling_idle(hart));
+        observed
     }
 
     fn clear_ap_reactor_task_done(cpus: CpuMask) {

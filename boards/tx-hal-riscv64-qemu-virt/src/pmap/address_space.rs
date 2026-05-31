@@ -28,6 +28,7 @@
 //! See `docs/progress/decisions/2026-04-29-process-root-asid-shootdown-anchors.md`
 //! and `docs/progress/decisions/2026-04-29-rv64-pmap-module-extraction.md`.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use tx_hal::{
@@ -45,8 +46,9 @@ use super::pt_node::{
 use super::{
     encode_branch_pte, encode_leaf_pte_with_permissions, ensure_l0_table_for_reservation,
     l0_table_mut, page_table_mut_from_phys, pte_is_branch, pte_phys, rv64_1g_leaf_index,
-    rv64_2m_leaf_index, rv64_4k_leaf_index, sfence_vma_all, validate_aligned_mapping,
-    validate_aligned_virt, validate_rv64_leaf_permissions, validate_user_mapping_virt,
+    rv64_2m_leaf_index, rv64_4k_leaf_index, sfence_vma_all, sfence_vma_range_asid,
+    validate_aligned_mapping, validate_aligned_virt, validate_rv64_leaf_permissions,
+    validate_user_mapping_virt,
 };
 
 static ALLOCATED_ASIDS: AtomicU64 = AtomicU64::new(1);
@@ -273,7 +275,9 @@ pub(super) fn commit_mapping_from_root(
             l0.0[rv64_4k_leaf_index(reservation.virt().0)] = pte;
         }
     }
-    sfence_vma_all();
+    // User pmap commits are consumed at the next userspace entry, where
+    // `activate_user_pmap` writes `satp` and issues `sfence.vma`. Avoid a
+    // second per-PTE fence here; unmap/protect still fence at invalidation.
 }
 
 pub(crate) fn unmap_mapping(
@@ -397,6 +401,18 @@ pub(crate) fn shootdown_mapping(_asid: Asid, _invalidation: PmapInvalidation) {
     sfence_vma_all();
 }
 
+pub(crate) fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+    if invalidations.is_empty() {
+        return;
+    }
+
+    let coalesced = coalesce_invalidation_ranges(invalidations);
+    for invalidation in &coalesced {
+        sfence_vma_range_asid(invalidation.virt(), invalidation.size(), asid);
+    }
+    crate::remote_sfence_vma_asid_batch(asid, &coalesced);
+}
+
 fn alloc_asid() -> Result<Asid, PmapError> {
     loop {
         let allocated = ALLOCATED_ASIDS.load(Ordering::Acquire);
@@ -437,7 +453,25 @@ fn invalidate_destroyed_root() -> RootInvalidated {
 }
 
 fn free_asid_after_invalidation(asid: Asid, _invalidated: RootInvalidated) {
+    crate::clear_asid_residency(asid);
     free_asid(asid);
+}
+
+pub(crate) fn coalesce_invalidation_ranges(
+    invalidations: &[PmapInvalidation],
+) -> Vec<PmapInvalidation> {
+    let mut coalesced: Vec<PmapInvalidation> = Vec::with_capacity(invalidations.len());
+    for invalidation in invalidations {
+        if let Some(last) = coalesced.last_mut() {
+            let last_end = last.virt().0 + last.size();
+            if last_end == invalidation.virt().0 {
+                *last = PmapInvalidation::new(last.virt(), last.size() + invalidation.size());
+                continue;
+            }
+        }
+        coalesced.push(*invalidation);
+    }
+    coalesced
 }
 
 // Root-relative intermediate table management mirrors the kernel-bootstrap

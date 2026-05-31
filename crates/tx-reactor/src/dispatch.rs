@@ -45,7 +45,7 @@ impl WakeDispatchReport {
 }
 
 pub trait RescheduleSignal {
-    fn send_reschedule_ipi(&mut self, target_hart: HartId);
+    fn send_reschedule_ipi(&mut self, target_hart: HartId) -> bool;
 }
 
 #[derive(Default)]
@@ -58,7 +58,9 @@ impl NoopRescheduleSignal {
 }
 
 impl RescheduleSignal for NoopRescheduleSignal {
-    fn send_reschedule_ipi(&mut self, _target_hart: HartId) {}
+    fn send_reschedule_ipi(&mut self, _target_hart: HartId) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Default)]
@@ -82,13 +84,12 @@ impl DispatchState {
         S: RescheduleSignal,
     {
         self.mark_need_resched(placement.target_hart);
-        if placement.wake_remote {
-            signal.send_reschedule_ipi(placement.target_hart);
-        }
+        let wake_remote =
+            placement.wake_remote && signal.send_reschedule_ipi(placement.target_hart);
 
         WakeDispatchAction {
             target_hart: placement.target_hart,
-            wake_remote: placement.wake_remote,
+            wake_remote,
         }
     }
 

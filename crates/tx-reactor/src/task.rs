@@ -3,7 +3,7 @@
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 use core::{future::Future, pin::Pin, task::Waker};
 
-use tx_substrate::wake::mailbox::TaskMailbox;
+use tx_substrate::wake::mailbox::{MailboxSchedulerHint, TaskMailbox};
 
 use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect, AstSlot},
@@ -103,7 +103,7 @@ pub(crate) enum TakeRunnableError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PendingPollCommit {
-    Woken,
+    Woken(MailboxSchedulerHint),
     Parked,
 }
 
@@ -130,14 +130,20 @@ impl Task {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let future: TaskFuture = Box::pin(future);
+        emit_task_submit_debug(b"debug.task.submit.future_box.after", handle.id);
+        let wake_state = Arc::new(TaskWakeState::new(handle.id, wake_queue));
+        emit_task_submit_debug(b"debug.task.submit.wake_state.after", handle.id);
+        let mailbox = Arc::new(TaskMailbox::new().with_task_id(handle.id.0 as u32));
+        emit_task_submit_debug(b"debug.task.submit.mailbox.after", handle.id);
         Self {
             id: handle.id,
             generation: handle.generation,
-            future: Some(Box::pin(future)),
+            future: Some(future),
             status: TaskStatus::Runnable,
-            wake_state: Arc::new(TaskWakeState::new(handle.id, wake_queue)),
+            wake_state,
             ast: AstSlot::new(),
-            mailbox: Arc::new(TaskMailbox::new()),
+            mailbox,
             last_ast_batch: AstBatch::default(),
             last_stop_reason: None,
         }
@@ -157,6 +163,8 @@ impl Task {
 pub struct TaskTable {
     slots: Vec<TaskSlot>,
     free: Vec<TaskId>,
+    completed: Vec<TaskId>,
+    cancelled: Vec<TaskId>,
     wake_queue: Arc<SpinLock<VecDeque<TaskId>>>,
 }
 
@@ -170,6 +178,8 @@ impl TaskTable {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
+            completed: Vec::new(),
+            cancelled: Vec::new(),
             wake_queue: Arc::new(SpinLock::new(VecDeque::new())),
         }
     }
@@ -181,12 +191,16 @@ impl TaskTable {
         let (id, generation) = self
             .take_reusable_slot()
             .unwrap_or_else(|| self.push_fresh_slot());
+        emit_task_submit_debug(b"debug.task.submit.slot.after", id);
+        emit_task_submit_value(
+            b"debug.task.submit.future_size",
+            core::mem::size_of::<F>() as i64,
+        );
         let handle = TaskKey::new(id, generation);
-        self.slots[id.index()].task = Some(Task::new_for_handle(
-            handle,
-            future,
-            Arc::clone(&self.wake_queue),
-        ));
+        let task = Task::new_for_handle(handle, future, Arc::clone(&self.wake_queue));
+        emit_task_submit_debug(b"debug.task.submit.construct.after", id);
+        self.slots[id.index()].task = Some(task);
+        emit_task_submit_debug(b"debug.task.submit.store.after", id);
         handle
     }
 
@@ -270,12 +284,15 @@ impl TaskTable {
     }
 
     pub fn complete_task(&mut self, handle: TaskKey) -> Result<(), TaskLifecycleError> {
-        let task = self.live_nonterminal_task_mut(handle)?;
-        task.future = None;
-        task.ast.clear();
-        task.status = TaskStatus::Completed;
-        task.wake_state.clear();
-        task.last_stop_reason = Some(StopReason::Completed);
+        {
+            let task = self.live_nonterminal_task_mut(handle)?;
+            task.future = None;
+            task.ast.clear();
+            task.status = TaskStatus::Completed;
+            task.wake_state.clear();
+            task.last_stop_reason = Some(StopReason::Completed);
+        }
+        self.completed.push(handle.id);
         Ok(())
     }
 
@@ -309,7 +326,7 @@ impl TaskTable {
         let task = self.live_nonterminal_task_mut(handle)?;
         task.future = Some(future);
         if task.wake_state.take_wake() {
-            Ok(PendingPollCommit::Woken)
+            Ok(PendingPollCommit::Woken(task.mailbox.take_scheduler_hint()))
         } else {
             task.status = TaskStatus::Parked;
             task.last_stop_reason = Some(StopReason::Blocked);
@@ -318,12 +335,15 @@ impl TaskTable {
     }
 
     pub fn cancel_task(&mut self, handle: TaskKey) -> Result<(), TaskLifecycleError> {
-        let task = self.live_nonterminal_task_mut(handle)?;
-        task.future = None;
-        task.ast.clear();
-        task.status = TaskStatus::Cancelled;
-        task.wake_state.clear();
-        task.last_stop_reason = None;
+        {
+            let task = self.live_nonterminal_task_mut(handle)?;
+            task.future = None;
+            task.ast.clear();
+            task.status = TaskStatus::Cancelled;
+            task.wake_state.clear();
+            task.last_stop_reason = None;
+        }
+        self.cancelled.push(handle.id);
         Ok(())
     }
 
@@ -362,13 +382,22 @@ impl TaskTable {
     }
 
     pub(crate) fn take_wake_if_parked_by_id(&mut self, id: TaskId) -> Option<TaskKey> {
+        self.take_wake_if_parked_by_id_with_hint(id)
+            .map(|(key, _hint)| key)
+    }
+
+    pub(crate) fn take_wake_if_parked_by_id_with_hint(
+        &mut self,
+        id: TaskId,
+    ) -> Option<(TaskKey, MailboxSchedulerHint)> {
         let task = self.slots.get_mut(id.index())?.task.as_mut()?;
         if !task.wake_state.take_wake() {
             return None;
         }
         if task.status == TaskStatus::Parked {
             task.status = TaskStatus::Runnable;
-            Some(task.handle())
+            let hint = task.mailbox.take_scheduler_hint();
+            Some((task.handle(), hint))
         } else {
             None
         }
@@ -458,8 +487,16 @@ impl TaskTable {
     fn drain_status(&mut self, status: TaskStatus) -> Vec<TaskDrainRecord> {
         let mut drained = Vec::new();
         let mut freed = Vec::new();
+        let terminal_ids = match status {
+            TaskStatus::Completed => core::mem::take(&mut self.completed),
+            TaskStatus::Cancelled => core::mem::take(&mut self.cancelled),
+            TaskStatus::Runnable | TaskStatus::Polling | TaskStatus::Parked => Vec::new(),
+        };
 
-        for (index, slot) in self.slots.iter_mut().enumerate() {
+        for id in terminal_ids {
+            let Some(slot) = self.slots.get_mut(id.index()) else {
+                continue;
+            };
             if slot.task.as_ref().map(|task| task.status) != Some(status) {
                 continue;
             }
@@ -472,11 +509,25 @@ impl TaskTable {
                 status,
                 last_stop_reason: task.last_stop_reason,
             });
-            freed.push(TaskId(index));
+            freed.push(id);
         }
 
         self.free.extend(freed);
         drained
+    }
+}
+
+fn emit_task_submit_debug(name: &[u8], task: TaskId) {
+    emit_task_submit_value(name, task.0 as i64);
+}
+
+fn emit_task_submit_value(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+        tx_observe::dump_registered_if_requested();
     }
 }
 

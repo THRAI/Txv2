@@ -463,9 +463,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // worth of program headers (≈ 3.6 KiB), comfortably within one
     // 4 KiB page.
     let read_len = core::cmp::min(file_size as usize, INITIAL_PARSE_READ);
-    if read_len < 64 {
-        // ELF64 header alone is 64 bytes — anything smaller cannot be
-        // a valid binary.
+    if read_len == 0 {
         return Err(ExecError::NotExecutable);
     }
     let mut header_bytes: Vec<u8> = alloc::vec![0u8; read_len];
@@ -543,6 +541,9 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             cred,
         ))
         .await;
+    }
+    if read_len < 64 {
+        return Err(ExecError::NotExecutable);
     }
 
     // ===== Phase 3 — parse + validate (pure CPU) =====================

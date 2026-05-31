@@ -4,7 +4,7 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     future::Future,
     ptr,
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 
@@ -12,6 +12,7 @@ use crate::adapter::bus_wire::{
     DeclaredPort, DeclaredQueue, DelegateRegistry, TaskMailbox, TimerWheel, WireDeclaration,
     WireDeclarationError, WireEventSet,
 };
+use tx_substrate::wake::mailbox::MailboxSchedulerHint;
 
 use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect},
@@ -20,8 +21,8 @@ use crate::{
     preempt::PreemptMarkers,
     scheduler::{
         HartId, HartSchedulerLocal, InitialSchedMeta, LocalAffinityMove, LocalEnqueueRequest,
-        Phase1Scheduler, RunnablePlacement, SchedulerAffinityError, SchedulerStats, SliceConfig,
-        StopReason, TaskHandle, TaskRunOwner, WakeHint,
+        Phase1Scheduler, QueuedTaskReport, RunnablePlacement, SchedulerAffinityError,
+        SchedulerStats, SliceConfig, StopReason, TaskHandle, TaskRunOwner, WakeHint,
     },
     spin_lock::SpinLock,
     task::{
@@ -42,6 +43,13 @@ use crate::{
 pub struct RunStats {
     pub polled: usize,
     pub completed: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskPublishReport {
+    pub task: TaskKey,
+    pub publish: QueuedTaskReport,
+    pub dispatch: WakeDispatchReport,
 }
 
 impl RunStats {
@@ -176,6 +184,69 @@ pub struct Reactor {
     locals: ReactorLocals,
 }
 
+fn mailbox_scheduler_hint_to_reactor(hint: MailboxSchedulerHint) -> WakeHint {
+    match hint {
+        MailboxSchedulerHint::Normal => WakeHint::Normal,
+        MailboxSchedulerHint::WakeHandoff => WakeHint::WakeHandoff,
+        MailboxSchedulerHint::LifecycleWake => WakeHint::LifecycleWake,
+        MailboxSchedulerHint::PriorityBoost => WakeHint::PriorityBoost,
+        MailboxSchedulerHint::SignalDelivery => WakeHint::SignalDelivery,
+    }
+}
+
+fn mailbox_scheduler_hint_code(hint: MailboxSchedulerHint) -> i64 {
+    match hint {
+        MailboxSchedulerHint::Normal => 0,
+        MailboxSchedulerHint::WakeHandoff => 1,
+        MailboxSchedulerHint::LifecycleWake => 2,
+        MailboxSchedulerHint::PriorityBoost => 3,
+        MailboxSchedulerHint::SignalDelivery => 4,
+    }
+}
+
+fn emit_wake_debug(name: &[u8], task: TaskId, value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            ((task.0 as i64) << 8) | value,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
+
+fn emit_submit_debug(name: &[u8], task: TaskId) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            task.0 as i64,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
+
+fn emit_poll_task_debug(name: &[u8], task: TaskId) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            task.0 as i64,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
+
+fn emit_poll_duration_debug(task: TaskId, consumed_ns: u64) {
+    if let Some(observer) = tx_observe::current() {
+        let consumed_us = (consumed_ns / 1_000).min(u32::MAX as u64) as i64;
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(
+                b"debug.reactor.poll.consumed_us",
+            )),
+            ((task.0 as i64) << 32) | consumed_us,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
+
 pub struct ReactorShared {
     tasks: SpinLock<TaskTable>,
     scheduler: Phase1Scheduler,
@@ -247,13 +318,14 @@ impl ReactorLocals {
             return 0;
         };
         let depths = local.scheduler().queue_depths();
-        depths.kernel + depths.new + depths.preempted
+        depths.kernel + depths.boosted + depths.new + depths.preempted
     }
 }
 
 pub struct HartReactorLocal {
     hart: HartId,
     scheduler: HartSchedulerLocal,
+    polling_idle: AtomicBool,
 }
 
 impl HartReactorLocal {
@@ -261,6 +333,7 @@ impl HartReactorLocal {
         Self {
             hart,
             scheduler: HartSchedulerLocal::new(),
+            polling_idle: AtomicBool::new(false),
         }
     }
 
@@ -270,6 +343,18 @@ impl HartReactorLocal {
 
     pub(crate) fn scheduler(&self) -> &HartSchedulerLocal {
         &self.scheduler
+    }
+
+    pub fn begin_polling_idle(&self) {
+        self.polling_idle.store(true, Ordering::Release);
+    }
+
+    pub fn end_polling_idle(&self) {
+        self.polling_idle.store(false, Ordering::Release);
+    }
+
+    pub fn is_polling_idle(&self) -> bool {
+        self.polling_idle.load(Ordering::Acquire)
     }
 }
 
@@ -462,8 +547,11 @@ impl SharedReactor {
             let mut cx = Context::from_waker(&waker);
             stats.polled += 1;
             let timing = PollTiming::start(slice, slice_clock);
+            emit_poll_task_debug(b"debug.reactor.poll.begin", key.id());
             let result = future.as_mut().poll(&mut cx);
             let accounting = timing.finish(slice_clock);
+            emit_poll_duration_debug(key.id(), accounting.consumed_ns);
+            emit_poll_task_debug(b"debug.reactor.poll.end", key.id());
 
             crate::task::set_current_mailbox(hart.0, None);
             crate::task::set_current_timer_wheel(hart.0, None);
@@ -498,12 +586,12 @@ impl SharedReactor {
                                 .shared
                                 .tasks
                                 .lock()
-                                .finish_polled_runnable(key, future, StopReason::PreemptedExternal)
+                                .finish_polled_runnable(key, future, StopReason::UserspaceTrap)
                                 .is_ok()
                             {
                                 view.task_stopped_local(
                                     key.id(),
-                                    StopReason::PreemptedExternal,
+                                    StopReason::UserspaceTrap,
                                     accounting.consumed_ns,
                                     hart,
                                 );
@@ -529,13 +617,14 @@ impl SharedReactor {
                             let pending_commit =
                                 { view.shared.tasks.lock().finish_polled_pending(key, future) };
                             match pending_commit {
-                                Ok(PendingPollCommit::Woken) => {
-                                    view.mark_runnable_from_hart(
-                                        key,
-                                        WakeHint::Normal,
-                                        hart,
-                                        signal,
+                                Ok(PendingPollCommit::Woken(hint)) => {
+                                    emit_wake_debug(
+                                        b"debug.wake.pending_hint",
+                                        key.id(),
+                                        mailbox_scheduler_hint_code(hint),
                                     );
+                                    let hint = mailbox_scheduler_hint_to_reactor(hint);
+                                    view.mark_runnable_from_hart(key, hint, hart, signal);
                                 }
                                 Ok(PendingPollCommit::Parked) => {
                                     view.task_stopped_local(
@@ -599,48 +688,40 @@ impl HartRuntimeView<'_> {
         S: RescheduleSignal,
     {
         let mut report = WakeDispatchReport::empty();
-        for id in self.shared.tasks.lock().drain_wake_ids() {
-            let Some(target_hart) = self.shared.scheduler.target_hart_for_wake(id) else {
-                continue;
-            };
-            self.locals.ensure_hart(target_hart);
-            if let Some(target_local) = self.locals.get(target_hart) {
-                Phase1Scheduler::push_wake_inbox_to_local(target_local.scheduler(), id);
-            }
-            if target_hart != current_hart {
-                signal.send_reschedule_ipi(target_hart);
-                report.record(WakeDispatchAction {
-                    target_hart,
-                    wake_remote: true,
-                });
-            }
+        self.locals.ensure_hart(current_hart);
+        let mut drained = self.shared.tasks.lock().drain_wake_ids();
+        if let Some(local) = self.locals.get(current_hart) {
+            drained.extend(Phase1Scheduler::drain_wake_inbox_from_local(
+                local.scheduler(),
+                Reactor::WAKE_INBOX_DRAIN_LIMIT,
+            ));
         }
 
-        self.locals.ensure_hart(current_hart);
-        let drained = self
-            .locals
-            .get(current_hart)
-            .map(|local| {
-                Phase1Scheduler::drain_wake_inbox_from_local(
-                    local.scheduler(),
-                    Reactor::WAKE_INBOX_DRAIN_LIMIT,
-                )
-            })
-            .unwrap_or_default();
-
         for id in drained {
-            let Some(key) = self.shared.tasks.lock().take_wake_if_parked_by_id(id) else {
+            let Some((key, hint)) = self
+                .shared
+                .tasks
+                .lock()
+                .take_wake_if_parked_by_id_with_hint(id)
+            else {
                 continue;
             };
-            if let Some((placement, request)) = self.shared.scheduler.task_runnable_from_for_locals(
+            emit_wake_debug(
+                b"debug.wake.drain_hint",
                 key.id(),
-                WakeHint::Normal,
-                current_hart,
-            ) {
+                mailbox_scheduler_hint_code(hint),
+            );
+            let hint = mailbox_scheduler_hint_to_reactor(hint);
+            if let Some((placement, request)) =
+                self.shared
+                    .scheduler
+                    .task_runnable_from_for_locals(key.id(), hint, current_hart)
+            {
                 self.apply_local_enqueue(request);
                 if placement.target_hart != current_hart {
                     report.record(self.apply_runnable_placement(placement, signal));
                 } else {
+                    self.mark_userspace_preempt_for_wake(placement, current_hart, hint);
                     report.record(WakeDispatchAction {
                         target_hart: placement.target_hart,
                         wake_remote: false,
@@ -655,6 +736,13 @@ impl HartRuntimeView<'_> {
         self.locals
             .get(hart)
             .map(|local| Phase1Scheduler::consume_markers_from_local(local.scheduler()))
+            .unwrap_or_else(PreemptMarkers::empty)
+    }
+
+    pub fn dispatch_markers(&self, hart: HartId) -> PreemptMarkers {
+        self.locals
+            .get(hart)
+            .map(|local| Phase1Scheduler::snapshot_markers_from_local(local.scheduler()))
             .unwrap_or_else(PreemptMarkers::empty)
     }
 
@@ -735,8 +823,11 @@ impl HartRuntimeView<'_> {
             let mut cx = Context::from_waker(&waker);
             stats.polled += 1;
             let timing = PollTiming::start(slice, slice_clock);
+            emit_poll_task_debug(b"debug.reactor.poll.begin", key.id());
             let result = future.as_mut().poll(&mut cx);
             let accounting = timing.finish(slice_clock);
+            emit_poll_duration_debug(key.id(), accounting.consumed_ns);
+            emit_poll_task_debug(b"debug.reactor.poll.end", key.id());
             crate::task::set_current_mailbox(hart.0, None);
             crate::task::set_current_timer_wheel(hart.0, None);
             crate::task::set_current_delegate_registry(hart.0, None);
@@ -767,12 +858,12 @@ impl HartRuntimeView<'_> {
                             .shared
                             .tasks
                             .lock()
-                            .finish_polled_runnable(key, future, StopReason::PreemptedExternal)
+                            .finish_polled_runnable(key, future, StopReason::UserspaceTrap)
                             .is_ok()
                         {
                             self.task_stopped_local(
                                 key.id(),
-                                StopReason::PreemptedExternal,
+                                StopReason::UserspaceTrap,
                                 accounting.consumed_ns,
                                 hart,
                             );
@@ -798,8 +889,14 @@ impl HartRuntimeView<'_> {
                         let pending_commit =
                             { self.shared.tasks.lock().finish_polled_pending(key, future) };
                         match pending_commit {
-                            Ok(PendingPollCommit::Woken) => {
-                                self.mark_runnable_from_hart(key, WakeHint::Normal, hart, signal);
+                            Ok(PendingPollCommit::Woken(hint)) => {
+                                emit_wake_debug(
+                                    b"debug.wake.pending_hint",
+                                    key.id(),
+                                    mailbox_scheduler_hint_code(hint),
+                                );
+                                let hint = mailbox_scheduler_hint_to_reactor(hint);
+                                self.mark_runnable_from_hart(key, hint, hart, signal);
                             }
                             Ok(PendingPollCommit::Parked) => {
                                 self.task_stopped_local(
@@ -897,7 +994,7 @@ impl HartRuntimeView<'_> {
                 .get(victim)
                 .map(|local| {
                     let depths = local.scheduler().queue_depths();
-                    depths.new + depths.preempted
+                    depths.boosted + depths.new + depths.preempted
                 })
                 .unwrap_or(0);
             if depth > best_depth {
@@ -929,7 +1026,7 @@ impl HartRuntimeView<'_> {
                     .get(victim)
                     .map(|local| {
                         let depths = local.scheduler().queue_depths();
-                        depths.new + depths.preempted
+                        depths.boosted + depths.new + depths.preempted
                     })
                     .unwrap_or(0)
             },
@@ -941,7 +1038,7 @@ impl HartRuntimeView<'_> {
         stolen
     }
 
-    fn take_userspace_preempt_marker(&self, hart: HartId) -> bool {
+    pub fn take_userspace_preempt_marker(&self, hart: HartId) -> bool {
         self.locals
             .get(hart)
             .is_some_and(|local| Phase1Scheduler::take_userspace_preempt_local(local.scheduler()))
@@ -965,10 +1062,26 @@ impl HartRuntimeView<'_> {
                     .task_runnable_from_for_locals(key.id(), hint, current_hart)
             {
                 self.apply_local_enqueue(request);
-                report.record(self.apply_runnable_placement(placement, signal));
+                let action = self.apply_runnable_placement(placement, signal);
+                self.mark_userspace_preempt_for_wake(placement, current_hart, hint);
+                report.record(action);
             }
         }
         report
+    }
+
+    fn mark_userspace_preempt_for_wake(
+        &self,
+        placement: RunnablePlacement,
+        current_hart: HartId,
+        hint: WakeHint,
+    ) {
+        if placement.target_hart == current_hart && hint.requests_userspace_preempt() {
+            self.locals.ensure_hart(current_hart);
+            if let Some(local) = self.locals.get(current_hart) {
+                Phase1Scheduler::mark_userspace_preempt_local(local.scheduler());
+            }
+        }
     }
 
     fn apply_runnable_placement<S>(
@@ -983,13 +1096,12 @@ impl HartRuntimeView<'_> {
         if let Some(local) = self.locals.get(placement.target_hart) {
             Phase1Scheduler::mark_need_resched_local(local.scheduler());
         }
-        if placement.wake_remote {
-            signal.send_reschedule_ipi(placement.target_hart);
-        }
+        let wake_remote =
+            placement.wake_remote && signal.send_reschedule_ipi(placement.target_hart);
 
         WakeDispatchAction {
             target_hart: placement.target_hart,
-            wake_remote: placement.wake_remote,
+            wake_remote,
         }
     }
 
@@ -1162,9 +1274,12 @@ impl Reactor {
         F: Future<Output = ()> + Send + 'static,
     {
         let key = self.shared.tasks.lock().submit(future);
+        emit_submit_debug(b"debug.reactor.submit.task_table.after", key.id());
         let request =
             self.scheduler_submit_request(key.id(), TaskHandle::new(key.id()), initial_meta);
+        emit_submit_debug(b"debug.reactor.submit.scheduler.after", key.id());
         self.apply_local_enqueue(request);
+        emit_submit_debug(b"debug.reactor.submit.enqueue.after", key.id());
         key
     }
 
@@ -1181,19 +1296,45 @@ impl Reactor {
         F: Future<Output = ()> + Send + 'static,
         S: RescheduleSignal,
     {
-        let key = self.submit_task_with_meta(future, initial_meta);
-        let mut report = WakeDispatchReport::empty();
-        if let Some(TaskRunOwner::Queued { hart, .. }) = self.shared.scheduler.task_owner(key.id())
-        {
-            report.record(self.apply_runnable_placement(
-                RunnablePlacement {
-                    target_hart: hart,
-                    wake_remote: hart != current_hart,
-                },
-                signal,
-            ));
+        let report = self.submit_task_publish_ack(future, initial_meta, current_hart, signal);
+        (report.task, report.dispatch)
+    }
+
+    pub fn submit_task_publish_ack<F, S>(
+        &self,
+        future: F,
+        initial_meta: InitialSchedMeta,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> TaskPublishReport
+    where
+        F: Future<Output = ()> + Send + 'static,
+        S: RescheduleSignal,
+    {
+        let key = self.shared.tasks.lock().submit(future);
+        emit_submit_debug(b"debug.reactor.submit.task_table.after", key.id());
+        let (request, publish) =
+            self.scheduler_submit_report(key.id(), TaskHandle::new(key.id()), initial_meta);
+        emit_submit_debug(b"debug.reactor.submit.scheduler.after", key.id());
+        self.apply_local_enqueue(request);
+        emit_submit_debug(b"debug.reactor.submit.enqueue.after", key.id());
+        emit_submit_debug(b"debug.reactor.submit.from_hart.after", key.id());
+
+        let mut dispatch = WakeDispatchReport::empty();
+        dispatch.record(self.apply_runnable_placement(
+            RunnablePlacement {
+                target_hart: publish.hart,
+                wake_remote: publish.hart != current_hart,
+            },
+            signal,
+        ));
+        emit_submit_debug(b"debug.reactor.submit.dispatch.after", key.id());
+
+        TaskPublishReport {
+            task: key,
+            publish,
+            dispatch,
         }
-        (key, report)
     }
 
     pub fn cancel_task(&self, task: TaskKey) -> Result<(), TaskLifecycleError> {
@@ -1449,6 +1590,29 @@ impl Reactor {
             .unwrap_or_else(PreemptMarkers::empty)
     }
 
+    pub fn begin_polling_idle(&self, hart: HartId) {
+        self.locals.ensure_hart(hart);
+        if let Some(local) = self.locals.get(hart) {
+            local.begin_polling_idle();
+        }
+    }
+
+    pub fn end_polling_idle(&self, hart: HartId) {
+        if let Some(local) = self.locals.get(hart) {
+            local.end_polling_idle();
+        }
+    }
+
+    pub fn is_polling_idle(&self, hart: HartId) -> bool {
+        self.locals
+            .get(hart)
+            .is_some_and(HartReactorLocal::is_polling_idle)
+    }
+
+    pub fn should_leave_polling_idle(&self, hart: HartId) -> bool {
+        self.dispatch_markers(hart).need_resched() || !self.is_idle()
+    }
+
     pub fn scheduler_stats(&self) -> SchedulerStats {
         self.shared.scheduler.stats()
     }
@@ -1463,12 +1627,21 @@ impl Reactor {
         handle: TaskHandle,
         initial_meta: InitialSchedMeta,
     ) -> LocalEnqueueRequest {
+        self.scheduler_submit_report(task, handle, initial_meta).0
+    }
+
+    fn scheduler_submit_report(
+        &self,
+        task: TaskId,
+        handle: TaskHandle,
+        initial_meta: InitialSchedMeta,
+    ) -> (LocalEnqueueRequest, QueuedTaskReport) {
         let affinity = initial_meta.affinity;
         let max_hart = max_hart_in_affinity(affinity);
         self.ensure_local_harts_through(max_hart);
         self.shared
             .scheduler
-            .task_submitted_for_locals(task, handle, initial_meta, |hart| {
+            .task_submitted_report_for_locals(task, handle, initial_meta, |hart| {
                 self.locals.total_queue_depth(hart)
             })
     }
@@ -1534,13 +1707,12 @@ impl Reactor {
         if let Some(local) = self.locals.get(placement.target_hart) {
             Phase1Scheduler::mark_need_resched_local(local.scheduler());
         }
-        if placement.wake_remote {
-            signal.send_reschedule_ipi(placement.target_hart);
-        }
+        let wake_remote =
+            placement.wake_remote && signal.send_reschedule_ipi(placement.target_hart);
 
         WakeDispatchAction {
             target_hart: placement.target_hart,
-            wake_remote: placement.wake_remote,
+            wake_remote,
         }
     }
 
