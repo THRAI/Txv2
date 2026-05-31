@@ -626,7 +626,14 @@ pub(super) fn read_sockaddr_ll<'a>(
     }
     let protocol = u16::from_be_bytes([bytes[2], bytes[3]]);
     let ifindex = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
-    Ok(SockAddrLl::new(protocol, ifindex))
+    let hatype = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
+    let pkttype = bytes[10];
+    let halen = bytes[11];
+    let mut addr = [0u8; 8];
+    addr.copy_from_slice(&bytes[12..20]);
+    Ok(SockAddrLl::with_link_layer_addr(
+        protocol, ifindex, hatype, pkttype, addr, halen,
+    ))
 }
 
 pub(super) fn read_msghdr<'a>(ctx: &SyscallCtx<'a>, msghdr_ptr: u64) -> Result<UserMsghdr, Errno> {
@@ -913,6 +920,31 @@ pub(super) fn write_sockaddr_nl_into_msghdr<'a>(
     bootstrap_copy_to_user(&ctx.aspace, header.name, &bytes)
 }
 
+pub(super) fn write_sockaddr_ll_into_msghdr<'a>(
+    ctx: &SyscallCtx<'a>,
+    msghdr_ptr: u64,
+    header: UserMsghdr,
+    sockaddr: SockAddrLl,
+) -> Result<(), Errno> {
+    if header.name == 0 {
+        return Ok(());
+    }
+    write_msghdr_namelen(ctx, msghdr_ptr, SOCKADDR_LL_BYTES)?;
+    if header.namelen < SOCKADDR_LL_BYTES {
+        return Err(Errno::EINVAL);
+    }
+
+    let mut bytes = [0u8; SOCKADDR_LL_BYTES as usize];
+    bytes[0..2].copy_from_slice(&AF_PACKET.to_le_bytes());
+    bytes[2..4].copy_from_slice(&sockaddr.protocol.to_be_bytes());
+    bytes[4..8].copy_from_slice(&sockaddr.ifindex.to_le_bytes());
+    bytes[8..10].copy_from_slice(&sockaddr.hatype.to_le_bytes());
+    bytes[10] = sockaddr.pkttype;
+    bytes[11] = sockaddr.halen;
+    bytes[12..20].copy_from_slice(&sockaddr.addr);
+    bootstrap_copy_to_user(&ctx.aspace, header.name, &bytes)
+}
+
 pub(super) fn write_sockaddr_un_into_msghdr<'a>(
     ctx: &SyscallCtx<'a>,
     msghdr_ptr: u64,
@@ -983,6 +1015,10 @@ pub(super) fn write_sockaddr_ll<'a>(
     bytes[0..2].copy_from_slice(&AF_PACKET.to_le_bytes());
     bytes[2..4].copy_from_slice(&sockaddr.protocol.to_be_bytes());
     bytes[4..8].copy_from_slice(&sockaddr.ifindex.to_le_bytes());
+    bytes[8..10].copy_from_slice(&sockaddr.hatype.to_le_bytes());
+    bytes[10] = sockaddr.pkttype;
+    bytes[11] = sockaddr.halen;
+    bytes[12..20].copy_from_slice(&sockaddr.addr);
     bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes)
 }
 
@@ -1498,7 +1534,10 @@ pub(super) fn socket_type_i32(socket: &Cap<SocketIdentity>) -> i32 {
         SocketKind::Udp => 2,
         SocketKind::RdsSeqPacket => 5,
         SocketKind::RawIcmp => 3,
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter | SocketKind::Packet => 3,
+        SocketKind::NetlinkRoute
+        | SocketKind::NetlinkXfrm
+        | SocketKind::NetlinkNetfilter
+        | SocketKind::Packet => 3,
     }
 }
 

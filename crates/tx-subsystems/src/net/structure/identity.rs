@@ -79,7 +79,9 @@ const fn default_family_for_kind(kind: SocketKind) -> AddressFamily {
         SocketKind::Tcp | SocketKind::Udp | SocketKind::Sctp | SocketKind::RawIcmp => {
             AddressFamily::Inet
         }
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter => AddressFamily::Netlink,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkXfrm | SocketKind::NetlinkNetfilter => {
+            AddressFamily::Netlink
+        }
         SocketKind::Packet => AddressFamily::Packet,
         SocketKind::RdsSeqPacket => AddressFamily::Rds,
     }

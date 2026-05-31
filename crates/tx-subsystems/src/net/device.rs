@@ -9,12 +9,16 @@ use crate::net::admin::NetAdminAuthority;
 use crate::net::packet::{PacketTxReadiness, RxFrame};
 
 mod bridge;
+mod dummy;
 mod veth;
 mod virtio;
 
 pub use bridge::{
     create_bridge_for_test_or_bootstrap, BridgeConfig, BridgeDevice, BridgeForwardOutcome,
     BridgeInstance, BridgePortSnapshot, BridgeSnapshot, BRIDGE_FORWARD_BUDGET_DEFAULT,
+};
+pub use dummy::{
+    create_dummy_for_test_or_bootstrap, DummyConfig, DummyDevice, DummyInstance, DUMMY_DEFAULT_MTU,
 };
 pub use veth::{
     create_veth_pair_for_test_or_bootstrap, VethDevice, VethEndpointConfig, VethPair,
@@ -56,6 +60,7 @@ impl EthernetAddress {
 pub enum NetDeviceKind {
     Loopback,
     Ethernet,
+    Dummy,
     Veth,
     Bridge,
 }

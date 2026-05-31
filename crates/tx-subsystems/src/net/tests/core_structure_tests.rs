@@ -122,6 +122,7 @@ fn socket_type_validation_maps_to_kind() {
     let dgram_udplite = ValidSocketType::validate(2, 2, 136).expect("udplite socket");
     let dgram_icmp = ValidSocketType::validate(2, 2, 1).expect("ping socket");
     let raw_icmp = ValidSocketType::validate(2, 3, 1).expect("raw icmp socket");
+    let xfrm = ValidSocketType::validate(16, 3, 6).expect("netlink xfrm socket");
     let nft = ValidSocketType::validate(16, 3, 12).expect("netlink netfilter socket");
     let packet = ValidSocketType::validate(17, 3, 0x0300).expect("packet socket");
     let default_stream = ValidSocketType::validate(2, 1, 0).expect("default tcp socket");
@@ -166,6 +167,10 @@ fn socket_type_validation_maps_to_kind() {
     assert_eq!(
         SocketKind::from_valid_socket_type(nft),
         Ok(SocketKind::NetlinkNetfilter)
+    );
+    assert_eq!(
+        SocketKind::from_valid_socket_type(xfrm),
+        Ok(SocketKind::NetlinkXfrm)
     );
     assert_eq!(packet.domain, AddressFamily::Packet);
     assert_eq!(
@@ -259,13 +264,17 @@ fn raw_icmp_bind_records_local_addr_without_port() {
 #[test]
 fn send_recv_flags_validate_mask() {
     let flags = SendRecvFlags::validate(
-        (SendRecvFlags::MSG_DONTWAIT | SendRecvFlags::MSG_PEEK | SendRecvFlags::MSG_ERRQUEUE)
+        (SendRecvFlags::MSG_DONTWAIT
+            | SendRecvFlags::MSG_PEEK
+            | SendRecvFlags::MSG_CONFIRM
+            | SendRecvFlags::MSG_ERRQUEUE)
             .bits(),
     )
     .expect("known flags");
 
     assert!(flags.is_nonblocking());
     assert!(flags.contains(SendRecvFlags::MSG_PEEK));
+    assert!(flags.contains(SendRecvFlags::MSG_CONFIRM));
     assert!(flags.contains(SendRecvFlags::MSG_ERRQUEUE));
     assert!(SendRecvFlags::empty().is_empty());
     assert_eq!(SendRecvFlags::validate(0x4000_0000), Err(Errno::EINVAL));

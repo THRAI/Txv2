@@ -109,6 +109,8 @@ pub struct EtherIface {
     pub ether_addr: EthernetAddress,
     arp_table: SpinMutex<BTreeMap<Ipv4Address, ArpEntry>>,
     pending_arp: SpinMutex<BTreeMap<Ipv4Address, ArpPendingEntry>>,
+    ipv4_fragments: SpinMutex<BTreeMap<Ipv4FragmentKey, Ipv4ReassemblyEntry>>,
+    next_ipv4_ident: AtomicU64,
     pub name: &'static str,
     pub stats: NetStats,
     pub arp_stats: ArpStats,
@@ -121,6 +123,60 @@ pub struct EtherPacketSource<'a> {
 pub struct EtherPacketTxSink<'a> {
     pub iface: &'a EtherIface,
 }
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct Ipv4FragmentKey {
+    src: Ipv4Address,
+    dst: Ipv4Address,
+    ident: u16,
+    protocol: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Ipv4PacketMeta {
+    src: Ipv4Address,
+    dst: Ipv4Address,
+    ident: u16,
+    protocol: u8,
+    header_len: usize,
+    total_len: usize,
+    flags_fragment: u16,
+    fragment_offset: usize,
+    more_fragments: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Ipv4FragmentRange {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Default)]
+struct Ipv4ReassemblyEntry {
+    header: Option<Vec<u8>>,
+    payload: Vec<u8>,
+    ranges: Vec<Ipv4FragmentRange>,
+    total_payload_len: Option<usize>,
+}
+
+enum Ipv4IngressPacket<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+enum Ipv4IngressOutcome<'a> {
+    Complete(Ipv4IngressPacket<'a>),
+    Pending,
+    Malformed,
+}
+
+const IPV4_MIN_HEADER_LEN: usize = 20;
+const IPV4_MAX_PACKET_LEN: usize = 65_535;
+const IPV4_FLAG_RESERVED: u16 = 0x8000;
+const IPV4_FLAG_DONT_FRAGMENT: u16 = 0x4000;
+const IPV4_FLAG_MORE_FRAGMENTS: u16 = 0x2000;
+const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
+const IPV4_REASSEMBLY_FLOW_LIMIT: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ArpFlushOutcome {
@@ -145,6 +201,8 @@ impl EtherIface {
             ether_addr,
             arp_table: SpinMutex::new(BTreeMap::new()),
             pending_arp: SpinMutex::new(BTreeMap::new()),
+            ipv4_fragments: SpinMutex::new(BTreeMap::new()),
+            next_ipv4_ident: AtomicU64::new(1),
             name,
             stats: NetStats::new(),
             arp_stats: ArpStats::new(),
@@ -177,7 +235,26 @@ impl EtherIface {
 
         match ethernet.ethertype() {
             EthernetProtocol::Ipv4 => {
-                let dispatch = demux_rx_frame_with_smoltcp(&frame);
+                let packet = match self.prepare_ipv4_ingress(ethernet.payload()) {
+                    Ipv4IngressOutcome::Complete(packet) => packet,
+                    Ipv4IngressOutcome::Pending => return PacketDispatch::Unsupported,
+                    Ipv4IngressOutcome::Malformed => {
+                        self.stats.rx_errors.fetch_add(1, Ordering::Relaxed);
+                        return PacketDispatch::Malformed;
+                    }
+                };
+                let frame = match packet.as_slice() {
+                    Some(packet) => build_ipv4_ethernet_frame(
+                        from_smoltcp_ether(ethernet.src_addr()),
+                        from_smoltcp_ether(ethernet.dst_addr()),
+                        packet,
+                    ),
+                    None => {
+                        self.stats.rx_errors.fetch_add(1, Ordering::Relaxed);
+                        return PacketDispatch::Malformed;
+                    }
+                };
+                let dispatch = demux_rx_frame_with_smoltcp(&RxFrame::new(frame));
                 self.maybe_reply_icmpv4(&dispatch, now, guard);
                 dispatch
             }
@@ -187,7 +264,7 @@ impl EtherIface {
     }
 
     pub fn dispatch_ip_at(&self, packet: &[u8], now: Instant, guard: &Guard<'_>) -> PacketTxResult {
-        if packet.len() > usize::from(self.common.mtu()) {
+        if packet.len() > IPV4_MAX_PACKET_LEN {
             self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
             return PacketTxResult::Failed {
                 errno: Errno::EINVAL,
@@ -225,8 +302,7 @@ impl EtherIface {
             }
         };
 
-        let frame = build_ipv4_ethernet_frame(self.ether_addr, dst_mac, packet);
-        self.transmit_frame(&frame, guard)
+        self.transmit_ipv4_packet(dst_mac, packet, guard)
     }
 
     pub fn flush_pending_arp_at(
@@ -291,6 +367,22 @@ impl EtherIface {
         self.pending_arp.lock().remove(&ip);
     }
 
+    pub fn install_static_arp(&self, ip: Ipv4Address, mac: EthernetAddress) {
+        self.arp_table.lock().insert(
+            ip,
+            ArpEntry {
+                mac,
+                expires_at: Instant::from_secs(10 * 365 * 24 * 60 * 60),
+            },
+        );
+        self.pending_arp.lock().remove(&ip);
+    }
+
+    pub fn remove_static_arp(&self, ip: Ipv4Address) -> bool {
+        self.pending_arp.lock().remove(&ip);
+        self.arp_table.lock().remove(&ip).is_some()
+    }
+
     pub fn pending_arp_len(&self) -> usize {
         self.pending_arp.lock().len()
     }
@@ -350,6 +442,7 @@ impl EtherIface {
     pub fn clear_for_test_or_bootstrap(&self) {
         self.arp_table.lock().clear();
         self.pending_arp.lock().clear();
+        self.ipv4_fragments.lock().clear();
     }
 
     pub fn accepts_ethernet_destination_addr(&self, dst: EthernetAddress) -> bool {
@@ -603,6 +696,164 @@ impl EtherIface {
             }
         }
     }
+
+    fn prepare_ipv4_ingress<'a>(&self, packet: &'a [u8]) -> Ipv4IngressOutcome<'a> {
+        let Some(meta) = parse_ipv4_meta(packet) else {
+            return Ipv4IngressOutcome::Malformed;
+        };
+        if !meta.is_fragmented() {
+            return Ipv4IngressOutcome::Complete(Ipv4IngressPacket::Borrowed(
+                &packet[..meta.total_len],
+            ));
+        }
+        if meta.more_fragments && meta.payload_len() % 8 != 0 {
+            return Ipv4IngressOutcome::Malformed;
+        }
+        if meta.fragment_end() > IPV4_MAX_PACKET_LEN {
+            return Ipv4IngressOutcome::Malformed;
+        }
+
+        match self.ingest_ipv4_fragment(packet, meta) {
+            Some(packet) => Ipv4IngressOutcome::Complete(Ipv4IngressPacket::Owned(packet)),
+            None => Ipv4IngressOutcome::Pending,
+        }
+    }
+
+    fn ingest_ipv4_fragment(&self, packet: &[u8], meta: Ipv4PacketMeta) -> Option<Vec<u8>> {
+        let key = Ipv4FragmentKey {
+            src: meta.src,
+            dst: meta.dst,
+            ident: meta.ident,
+            protocol: meta.protocol,
+        };
+
+        let mut fragments = self.ipv4_fragments.lock();
+        if !fragments.contains_key(&key) && fragments.len() >= IPV4_REASSEMBLY_FLOW_LIMIT {
+            fragments.clear();
+        }
+        fragments.entry(key).or_default();
+
+        let entry = fragments.get_mut(&key)?;
+        if meta.fragment_offset == 0 {
+            entry.header = Some(packet[..meta.header_len].to_vec());
+        }
+
+        let payload = &packet[meta.header_len..meta.total_len];
+        let end = meta.fragment_offset + payload.len();
+        if entry.payload.len() < end {
+            entry.payload.resize(end, 0);
+        }
+        entry.payload[meta.fragment_offset..end].copy_from_slice(payload);
+        entry.record_range(meta.fragment_offset, end);
+        if !meta.more_fragments {
+            entry.total_payload_len = Some(end);
+        }
+
+        if !entry.is_complete() {
+            return None;
+        }
+
+        let entry = fragments.remove(&key)?;
+        assemble_ipv4_packet(entry)
+    }
+
+    fn transmit_ipv4_packet(
+        &self,
+        dst_mac: EthernetAddress,
+        packet: &[u8],
+        guard: &Guard<'_>,
+    ) -> PacketTxResult {
+        if packet.len() <= usize::from(self.common.mtu()) {
+            let frame = build_ipv4_ethernet_frame(self.ether_addr, dst_mac, packet);
+            return self.transmit_frame(&frame, guard);
+        }
+        self.transmit_ipv4_fragments(dst_mac, packet, guard)
+    }
+
+    fn transmit_ipv4_fragments(
+        &self,
+        dst_mac: EthernetAddress,
+        packet: &[u8],
+        guard: &Guard<'_>,
+    ) -> PacketTxResult {
+        let Some(meta) = parse_ipv4_meta(packet) else {
+            self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+            return PacketTxResult::Failed {
+                errno: Errno::EINVAL,
+            };
+        };
+        // smoltcp-emitted local packets carry DF with identification zero because
+        // smoltcp does not fragment; once txKernel fragments here, that internal
+        // default must not make ordinary large ping payloads fail.
+        if meta.flags_fragment & IPV4_FLAG_DONT_FRAGMENT != 0 && meta.ident != 0 {
+            self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+            return PacketTxResult::Failed {
+                errno: Errno::EMSGSIZE,
+            };
+        }
+
+        let mtu = usize::from(self.common.mtu());
+        if mtu <= meta.header_len + 8 {
+            self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+            return PacketTxResult::Failed {
+                errno: Errno::EMSGSIZE,
+            };
+        }
+        let fragment_payload_limit = ((mtu - meta.header_len) / 8) * 8;
+        if fragment_payload_limit == 0 {
+            self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+            return PacketTxResult::Failed {
+                errno: Errno::EMSGSIZE,
+            };
+        }
+
+        let payload = &packet[meta.header_len..meta.total_len];
+        let ident = if meta.ident == 0 {
+            self.allocate_ipv4_ident()
+        } else {
+            meta.ident
+        };
+        let base_fragment_offset = meta.fragment_offset;
+        let mut offset = 0usize;
+        let mut tx_bytes = 0usize;
+
+        while offset < payload.len() {
+            let remaining = payload.len() - offset;
+            let chunk_len = remaining.min(fragment_payload_limit);
+            let more_fragments = offset + chunk_len < payload.len() || meta.more_fragments;
+            let mut fragment = packet[..meta.header_len + chunk_len.min(remaining)].to_vec();
+            fragment[..meta.header_len].copy_from_slice(&packet[..meta.header_len]);
+            fragment[meta.header_len..].copy_from_slice(&payload[offset..offset + chunk_len]);
+
+            let total_len = meta.header_len + chunk_len;
+            write_u16(&mut fragment, 2, total_len as u16);
+            write_u16(&mut fragment, 4, ident);
+            let offset_units = ((base_fragment_offset + offset) / 8) as u16;
+            let mut flags_fragment = meta.flags_fragment & IPV4_FLAG_RESERVED;
+            if more_fragments {
+                flags_fragment |= IPV4_FLAG_MORE_FRAGMENTS;
+            }
+            flags_fragment |= offset_units & IPV4_FRAGMENT_OFFSET_MASK;
+            write_u16(&mut fragment, 6, flags_fragment);
+            fill_ipv4_header_checksum(&mut fragment);
+
+            let frame = build_ipv4_ethernet_frame(self.ether_addr, dst_mac, &fragment);
+            match self.transmit_frame(&frame, guard) {
+                PacketTxResult::Accepted { frame_len } => tx_bytes += frame_len,
+                other => return other,
+            }
+            offset += chunk_len;
+        }
+
+        PacketTxResult::Accepted {
+            frame_len: tx_bytes,
+        }
+    }
+
+    fn allocate_ipv4_ident(&self) -> u16 {
+        let next = self.next_ipv4_ident.fetch_add(1, Ordering::Relaxed);
+        (next as u16).max(1)
+    }
 }
 
 impl Ipv4RouteDecision {
@@ -728,6 +979,164 @@ fn build_arp_frame(repr: &ArpRepr) -> Vec<u8> {
     let mut arp = ArpPacket::new_unchecked(ethernet.payload_mut());
     repr.emit(&mut arp);
     frame
+}
+
+impl Ipv4PacketMeta {
+    const fn is_fragmented(self) -> bool {
+        self.more_fragments || self.fragment_offset != 0
+    }
+
+    const fn payload_len(self) -> usize {
+        self.total_len - self.header_len
+    }
+
+    const fn fragment_end(self) -> usize {
+        self.fragment_offset + self.payload_len()
+    }
+}
+
+impl Ipv4IngressPacket<'_> {
+    fn as_slice(&self) -> Option<&[u8]> {
+        match self {
+            Self::Borrowed(bytes) => Some(bytes),
+            Self::Owned(bytes) => Some(bytes.as_slice()),
+        }
+    }
+}
+
+impl Ipv4ReassemblyEntry {
+    fn record_range(&mut self, start: usize, end: usize) {
+        if start == end {
+            return;
+        }
+        self.ranges.push(Ipv4FragmentRange { start, end });
+        self.ranges.sort_by_key(|range| range.start);
+
+        let mut merged: Vec<Ipv4FragmentRange> = Vec::new();
+        for range in self.ranges.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                if range.start <= last.end {
+                    last.end = last.end.max(range.end);
+                    continue;
+                }
+            }
+            merged.push(range);
+        }
+        self.ranges = merged;
+    }
+
+    fn is_complete(&self) -> bool {
+        if self.header.is_none() {
+            return false;
+        }
+        let Some(total) = self.total_payload_len else {
+            return false;
+        };
+
+        let mut covered = 0usize;
+        for range in &self.ranges {
+            if range.start > covered {
+                return false;
+            }
+            covered = covered.max(range.end);
+            if covered >= total {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn parse_ipv4_meta(packet: &[u8]) -> Option<Ipv4PacketMeta> {
+    if packet.len() < IPV4_MIN_HEADER_LEN || packet.len() > IPV4_MAX_PACKET_LEN {
+        return None;
+    }
+    if packet[0] >> 4 != 4 {
+        return None;
+    }
+    let header_len = usize::from(packet[0] & 0x0f) * 4;
+    if header_len < IPV4_MIN_HEADER_LEN || packet.len() < header_len {
+        return None;
+    }
+    let total_len = usize::from(read_u16(packet, 2));
+    if total_len < header_len || total_len > packet.len() {
+        return None;
+    }
+    let flags_fragment = read_u16(packet, 6);
+    let fragment_offset = usize::from(flags_fragment & IPV4_FRAGMENT_OFFSET_MASK) * 8;
+    let more_fragments = flags_fragment & IPV4_FLAG_MORE_FRAGMENTS != 0;
+    let payload_len = total_len - header_len;
+    if more_fragments && payload_len % 8 != 0 {
+        return None;
+    }
+    let fragment_end = fragment_offset.checked_add(payload_len)?;
+    if fragment_end > IPV4_MAX_PACKET_LEN {
+        return None;
+    }
+
+    Some(Ipv4PacketMeta {
+        src: Ipv4Address::new([packet[12], packet[13], packet[14], packet[15]]),
+        dst: Ipv4Address::new([packet[16], packet[17], packet[18], packet[19]]),
+        ident: read_u16(packet, 4),
+        protocol: packet[9],
+        header_len,
+        total_len,
+        flags_fragment,
+        fragment_offset,
+        more_fragments,
+    })
+}
+
+fn assemble_ipv4_packet(entry: Ipv4ReassemblyEntry) -> Option<Vec<u8>> {
+    let mut packet = entry.header?;
+    let header_len = usize::from(packet[0] & 0x0f) * 4;
+    let total_payload_len = entry.total_payload_len?;
+    let total_len = header_len.checked_add(total_payload_len)?;
+    if total_len > IPV4_MAX_PACKET_LEN || entry.payload.len() < total_payload_len {
+        return None;
+    }
+    packet.resize(total_len, 0);
+    packet[header_len..].copy_from_slice(&entry.payload[..total_payload_len]);
+    write_u16(&mut packet, 2, total_len as u16);
+    write_u16(&mut packet, 6, 0);
+    fill_ipv4_header_checksum(&mut packet);
+    Some(packet)
+}
+
+fn fill_ipv4_header_checksum(packet: &mut [u8]) {
+    let header_len = usize::from(packet[0] & 0x0f) * 4;
+    if packet.len() < header_len || header_len < IPV4_MIN_HEADER_LEN {
+        return;
+    }
+    packet[10] = 0;
+    packet[11] = 0;
+    let checksum = ipv4_header_checksum(&packet[..header_len]);
+    write_u16(packet, 10, checksum);
+}
+
+fn ipv4_header_checksum(header: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut chunks = header.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+    if let Some(&last) = chunks.remainder().first() {
+        sum += u32::from(last) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    let [hi, lo] = value.to_be_bytes();
+    bytes[offset] = hi;
+    bytes[offset + 1] = lo;
 }
 
 fn to_smoltcp_ether(addr: EthernetAddress) -> SmoltcpEthernetAddress {

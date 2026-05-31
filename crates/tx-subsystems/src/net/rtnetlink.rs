@@ -21,15 +21,18 @@ use crate::device::DevT;
 use crate::execution::Errno;
 use crate::net::admin::{require_net_admin, NetAdminAuthority};
 use crate::net::device::{
-    create_bridge_for_test_or_bootstrap, create_veth_pair_for_test_or_bootstrap, BridgeConfig,
-    EthernetAddress, NetDeviceKind, VethEndpointConfig, VethPairConfig, VETH_DEFAULT_MTU,
+    create_bridge_for_test_or_bootstrap, create_dummy_for_test_or_bootstrap,
+    create_veth_pair_for_test_or_bootstrap, BridgeConfig, DummyConfig, EthernetAddress,
+    NetDeviceKind, VethEndpointConfig, VethPairConfig, DUMMY_DEFAULT_MTU, VETH_DEFAULT_MTU,
 };
 use crate::net::namespace::{
     NetNamespaceLinkInfo, NetNamespacePayload, NetNamespaceRouteConfig, NetNamespaceRouteInfo,
     NetNamespaceRouteSelector,
 };
 use crate::net::protocol::ArpSnapshotState;
-use crate::net::structure::{Ipv4Address, RecvWireSet, SendRecvFlags, SocketIdentity, SocketKind};
+use crate::net::structure::{
+    Ipv4Address, Ipv6Address, RecvWireSet, SendRecvFlags, SocketIdentity, SocketKind,
+};
 use crate::sync::SpinMutex;
 
 pub const AF_NETLINK: i32 = 16;
@@ -51,22 +54,26 @@ pub const RTM_DELLINK: u16 = 17;
 pub const RTM_GETLINK: u16 = 18;
 pub const RTM_SETLINK: u16 = 19;
 pub const RTM_NEWADDR: u16 = 20;
+pub const RTM_DELADDR: u16 = 21;
 pub const RTM_GETADDR: u16 = 22;
 pub const RTM_NEWROUTE: u16 = 24;
 pub const RTM_DELROUTE: u16 = 25;
 pub const RTM_GETROUTE: u16 = 26;
 pub const RTM_NEWNEIGH: u16 = 28;
+pub const RTM_DELNEIGH: u16 = 29;
 pub const RTM_GETNEIGH: u16 = 30;
 
 const NLMSG_HDR_LEN: usize = 16;
 const IFINFO_MSG_LEN: usize = 16;
 const IFADDR_MSG_LEN: usize = 8;
 const RTMSG_LEN: usize = 12;
+const NDMSG_LEN: usize = 12;
 const NLA_HDR_LEN: usize = 4;
 const NLA_TYPE_MASK: u16 = 0x3fff;
 const NLA_F_NESTED: u16 = 0x8000;
 
 const AF_INET: u8 = 2;
+const AF_INET6: u8 = 10;
 const AF_UNSPEC: u8 = 0;
 const IFF_UP: u32 = 0x1;
 const IFF_BROADCAST: u32 = 0x2;
@@ -494,7 +501,7 @@ fn handle_one_message<F>(
             }
         }
         RTM_GETADDR => {
-            for msg in render_getaddr_dump(netns, header) {
+            for msg in render_getaddr_dump(netns, header, payload) {
                 responses.push(msg);
             }
         }
@@ -517,27 +524,39 @@ fn handle_one_message<F>(
                 resolve_netns_fd,
                 resolve_netns_pid,
             );
-            responses.push(ack_or_error(header, result));
+            push_ack_or_error(responses, header, result);
         }
         RTM_DELLINK => {
             let result = handle_dellink(netns, cred, payload);
-            responses.push(ack_or_error(header, result));
+            push_ack_or_error(responses, header, result);
         }
         RTM_SETLINK => {
             let result = handle_setlink(netns, cred, payload, resolve_netns_fd, resolve_netns_pid);
-            responses.push(ack_or_error(header, result));
+            push_ack_or_error(responses, header, result);
         }
         RTM_NEWADDR => {
             let result = handle_newaddr(netns, cred, payload);
-            responses.push(ack_or_error(header, result));
+            push_ack_or_error(responses, header, result);
+        }
+        RTM_DELADDR => {
+            let result = handle_deladdr(netns, cred, payload);
+            push_ack_or_error(responses, header, result);
         }
         RTM_NEWROUTE => {
             let result = handle_newroute(netns, cred, payload);
-            responses.push(ack_or_error(header, result));
+            push_ack_or_error(responses, header, result);
         }
         RTM_DELROUTE => {
             let result = handle_delroute(netns, cred, payload);
-            responses.push(ack_or_error(header, result));
+            push_ack_or_error(responses, header, result);
+        }
+        RTM_NEWNEIGH => {
+            let result = handle_newneigh(netns, cred, payload);
+            push_ack_or_error(responses, header, result);
+        }
+        RTM_DELNEIGH => {
+            let result = handle_delneigh(netns, cred, payload);
+            push_ack_or_error(responses, header, result);
         }
         _ => responses.push(build_error_response(Some(header), Errno::EOPNOTSUPP)),
     }
@@ -603,6 +622,14 @@ fn try_queue_fast_dump(
             true
         }
         RTM_GETADDR => {
+            let msg_len = header.len as usize;
+            if request.len() < msg_len || msg_len < NLMSG_HDR_LEN {
+                return false;
+            }
+            let payload = &request[NLMSG_HDR_LEN..msg_len];
+            if getaddr_dump_family(payload) != AF_UNSPEC {
+                return false;
+            }
             queue_getaddr_dump_cached_combined(raw, netns, header);
             true
         }
@@ -679,18 +706,20 @@ fn patch_dump_seq_pid(out: &mut [u8], seq: u32, pid: u32) {
     }
 }
 
-fn render_getaddr_dump(netns: &NetNamespacePayload, header: NlMsgHeader) -> Vec<Vec<u8>> {
+fn getaddr_dump_family(payload: &[u8]) -> u8 {
+    payload.first().copied().unwrap_or(AF_UNSPEC)
+}
+
+fn render_getaddr_dump(
+    netns: &NetNamespacePayload,
+    header: NlMsgHeader,
+    payload: &[u8],
+) -> Vec<Vec<u8>> {
+    let family = getaddr_dump_family(payload);
     let links = netns.link_snapshot();
     let mut out = Vec::new();
     for link in &links {
-        if link.ipv4_addr.is_some() {
-            out.push(build_addr_message(
-                header.seq,
-                header.pid,
-                NLM_F_MULTI,
-                link,
-            ));
-        }
+        append_addr_messages_as_vec(&mut out, header.seq, header.pid, NLM_F_MULTI, link, family);
     }
     out.push(build_done_message(header.seq, header.pid));
     out
@@ -734,7 +763,7 @@ fn build_getaddr_dump_template(netns: &NetNamespacePayload) -> Vec<u8> {
     let links = netns.link_snapshot();
     let mut out = Vec::with_capacity(links.len() * 80 + align4(NLMSG_HDR_LEN + 4));
     for link in &links {
-        append_addr_message(&mut out, 0, 0, NLM_F_MULTI, link);
+        append_addr_messages(&mut out, 0, 0, NLM_F_MULTI, link, AF_UNSPEC);
     }
     append_done_message(&mut out, 0, 0);
     out
@@ -802,6 +831,7 @@ where
 
     match link_info.kind {
         Some("bridge") => create_bridge_link(netns, auth, name),
+        Some("dummy") => create_dummy_link(netns, auth, name),
         Some("veth") => {
             let peer_name = match link_info.peer_name {
                 Some(peer_name) => peer_name,
@@ -853,6 +883,15 @@ where
         netns.set_device_up_by_ifindex(auth, target.ifindex, info.flags & IFF_UP != 0)?;
     }
 
+    if let Some(mtu_attr) = attr_by_kind(&info.attrs, IFLA_MTU) {
+        if mtu_attr.payload.len() < 4 {
+            return Err(Errno::EINVAL);
+        }
+        let mtu = read_u32(mtu_attr.payload, 0);
+        let mtu = u16::try_from(mtu).map_err(|_| Errno::EINVAL)?;
+        netns.set_device_mtu_by_ifindex(auth, target.ifindex, mtu)?;
+    }
+
     if let Some(master_attr) = attr_by_kind(&info.attrs, IFLA_MASTER) {
         if master_attr.payload.len() < 4 {
             return Err(Errno::EINVAL);
@@ -902,34 +941,102 @@ where
 fn handle_newaddr(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Result<(), Errno> {
     let auth = require_net_admin(cred)?;
     let info = parse_ifaddrmsg(payload)?;
-    if info.family != AF_INET {
-        return Err(Errno::EAFNOSUPPORT);
-    }
     let attrs = parse_attrs(&payload[IFADDR_MSG_LEN..])?;
     let addr_attr = attr_by_kind(&attrs, IFA_LOCAL)
         .or_else(|| attr_by_kind(&attrs, IFA_ADDRESS))
         .ok_or(Errno::EINVAL)?;
-    if addr_attr.payload.len() < 4 {
+    let ifindex = resolve_ifaddr_ifindex(netns, &info, &attrs)?;
+    match info.family {
+        AF_INET => {
+            let addr = ipv4_addr_from_payload(addr_attr.payload)?;
+            netns.set_device_ipv4_addr_by_ifindex(auth, ifindex, Some(addr), Some(info.prefix_len))
+        }
+        AF_INET6 => {
+            let addr = ipv6_addr_from_payload(addr_attr.payload)?;
+            netns.set_device_ipv6_addr_by_ifindex(auth, ifindex, Some(addr), Some(info.prefix_len))
+        }
+        _ => Err(Errno::EAFNOSUPPORT),
+    }
+}
+
+fn handle_deladdr(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Result<(), Errno> {
+    let auth = require_net_admin(cred)?;
+    let info = parse_ifaddrmsg(payload)?;
+    let attrs = parse_attrs(&payload[IFADDR_MSG_LEN..])?;
+    let addr_attr = attr_by_kind(&attrs, IFA_LOCAL).or_else(|| attr_by_kind(&attrs, IFA_ADDRESS));
+    let ifindex = resolve_ifaddr_ifindex(netns, &info, &attrs)?;
+    let current = netns
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.ifindex == ifindex)
+        .ok_or(Errno::ENODEV)?;
+    match info.family {
+        AF_INET => {
+            if let Some(addr_attr) = addr_attr {
+                let requested = ipv4_addr_from_payload(addr_attr.payload)?;
+                if current.ipv4_addr != Some(requested) {
+                    return Ok(());
+                }
+            } else if current.ipv4_addr.is_none() {
+                return Ok(());
+            }
+            netns.set_device_ipv4_addr_by_ifindex(auth, ifindex, None, None)
+        }
+        AF_INET6 => {
+            if let Some(addr_attr) = addr_attr {
+                let requested = ipv6_addr_from_payload(addr_attr.payload)?;
+                if current.ipv6_addr != Some(requested) {
+                    return Ok(());
+                }
+            } else if current.ipv6_addr.is_none() {
+                return Ok(());
+            }
+            netns.set_device_ipv6_addr_by_ifindex(auth, ifindex, None, None)
+        }
+        AF_UNSPEC => {
+            if addr_attr.is_none() && current.ipv4_addr.is_none() && current.ipv6_addr.is_none() {
+                return Ok(());
+            }
+            netns.set_device_ipv4_addr_by_ifindex(auth, ifindex, None, None)?;
+            netns.set_device_ipv6_addr_by_ifindex(auth, ifindex, None, None)
+        }
+        _ => Err(Errno::EAFNOSUPPORT),
+    }
+}
+
+fn resolve_ifaddr_ifindex(
+    netns: &NetNamespacePayload,
+    info: &IfAddrMsg,
+    attrs: &[NlAttr<'_>],
+) -> Result<u32, Errno> {
+    if info.index != 0 {
+        return Ok(info.index);
+    }
+    let label = attr_string(attrs, IFA_LABEL).ok_or(Errno::ENODEV)?;
+    netns
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.name == label)
+        .map(|link| link.ifindex)
+        .ok_or(Errno::ENODEV)
+}
+
+fn ipv4_addr_from_payload(payload: &[u8]) -> Result<Ipv4Address, Errno> {
+    if payload.len() < 4 {
         return Err(Errno::EINVAL);
     }
-    let addr = Ipv4Address::new([
-        addr_attr.payload[0],
-        addr_attr.payload[1],
-        addr_attr.payload[2],
-        addr_attr.payload[3],
-    ]);
-    let ifindex = if info.index != 0 {
-        info.index
-    } else {
-        let label = attr_string(&attrs, IFA_LABEL).ok_or(Errno::ENODEV)?;
-        netns
-            .link_snapshot()
-            .into_iter()
-            .find(|link| link.name == label)
-            .map(|link| link.ifindex)
-            .ok_or(Errno::ENODEV)?
-    };
-    netns.set_device_ipv4_addr_by_ifindex(auth, ifindex, Some(addr), Some(info.prefix_len))
+    Ok(Ipv4Address::new([
+        payload[0], payload[1], payload[2], payload[3],
+    ]))
+}
+
+fn ipv6_addr_from_payload(payload: &[u8]) -> Result<Ipv6Address, Errno> {
+    if payload.len() < 16 {
+        return Err(Errno::EINVAL);
+    }
+    let mut octets = [0u8; 16];
+    octets.copy_from_slice(&payload[..16]);
+    Ok(Ipv6Address::new(octets))
 }
 
 fn handle_newroute(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Result<(), Errno> {
@@ -942,6 +1049,44 @@ fn handle_delroute(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> R
     let auth = require_net_admin(cred)?;
     let selector = parse_route_selector(netns, payload)?;
     netns.delete_ipv4_route(auth, selector)
+}
+
+fn handle_newneigh(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Result<(), Errno> {
+    let auth = require_net_admin(cred)?;
+    let msg = parse_ndmsg(payload)?;
+    if msg.family != AF_INET {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    if msg.ifindex == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let ip = ipv4_attr(&msg.attrs, NDA_DST)?.ok_or(Errno::EINVAL)?;
+    let mac_attr = attr_by_kind(&msg.attrs, NDA_LLADDR).ok_or(Errno::EINVAL)?;
+    if mac_attr.payload.len() < 6 {
+        return Err(Errno::EINVAL);
+    }
+    let mac = EthernetAddress::new([
+        mac_attr.payload[0],
+        mac_attr.payload[1],
+        mac_attr.payload[2],
+        mac_attr.payload[3],
+        mac_attr.payload[4],
+        mac_attr.payload[5],
+    ]);
+    netns.install_static_neighbor_by_ifindex(auth, msg.ifindex, ip, mac)
+}
+
+fn handle_delneigh(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Result<(), Errno> {
+    let auth = require_net_admin(cred)?;
+    let msg = parse_ndmsg(payload)?;
+    if msg.family != AF_INET && msg.family != AF_UNSPEC {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    if msg.ifindex == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let ip = ipv4_attr(&msg.attrs, NDA_DST)?.ok_or(Errno::EINVAL)?;
+    netns.delete_static_neighbor_by_ifindex(auth, msg.ifindex, ip)
 }
 
 fn create_bridge_link(
@@ -958,6 +1103,24 @@ fn create_bridge_link(
         devt: allocate_dynamic_devt(),
         mac: allocate_dynamic_mac(0x71),
         mtu: VETH_DEFAULT_MTU,
+    });
+    netns.attach_device(auth, instance.registration, None)
+}
+
+fn create_dummy_link(
+    netns: &NetNamespacePayload,
+    auth: NetAdminAuthority,
+    name: &str,
+) -> Result<(), Errno> {
+    if netns.find_device_by_name(name).is_some() {
+        return Err(Errno::EEXIST);
+    }
+    let leaked_name = leak_ifname(name);
+    let instance = create_dummy_for_test_or_bootstrap(DummyConfig {
+        name: leaked_name,
+        devt: allocate_dynamic_devt(),
+        mac: allocate_dynamic_mac(0x73),
+        mtu: DUMMY_DEFAULT_MTU,
     });
     netns.attach_device(auth, instance.registration, None)
 }
@@ -1062,28 +1225,51 @@ fn append_link_message(
     append_nlmsg(out, kind, flags, seq, pid, &payload);
 }
 
-fn build_addr_message(seq: u32, pid: u32, flags: u16, link: &NetNamespaceLinkInfo) -> Vec<u8> {
-    let Some(addr) = link.ipv4_addr else {
-        return build_done_message(seq, pid);
-    };
-    let mut out = Vec::new();
-    append_addr_message_with_addr(&mut out, seq, pid, flags, link, addr);
-    out
+fn append_addr_messages_as_vec(
+    out: &mut Vec<Vec<u8>>,
+    seq: u32,
+    pid: u32,
+    flags: u16,
+    link: &NetNamespaceLinkInfo,
+    family: u8,
+) {
+    if family == AF_UNSPEC || family == AF_INET {
+        if let Some(addr) = link.ipv4_addr {
+            let mut message = Vec::new();
+            append_addr_message_with_ipv4_addr(&mut message, seq, pid, flags, link, addr);
+            out.push(message);
+        }
+    }
+    if family == AF_UNSPEC || family == AF_INET6 {
+        if let Some(addr) = link.ipv6_addr {
+            let mut message = Vec::new();
+            append_addr_message_with_ipv6_addr(&mut message, seq, pid, flags, link, addr);
+            out.push(message);
+        }
+    }
 }
 
-fn append_addr_message(
+fn append_addr_messages(
     out: &mut Vec<u8>,
     seq: u32,
     pid: u32,
     flags: u16,
     link: &NetNamespaceLinkInfo,
+    family: u8,
 ) {
-    if let Some(addr) = link.ipv4_addr {
-        append_addr_message_with_addr(out, seq, pid, flags, link, addr);
+    if family == AF_UNSPEC || family == AF_INET {
+        if let Some(addr) = link.ipv4_addr {
+            append_addr_message_with_ipv4_addr(out, seq, pid, flags, link, addr);
+        }
+    }
+    if family == AF_UNSPEC || family == AF_INET6 {
+        if let Some(addr) = link.ipv6_addr {
+            append_addr_message_with_ipv6_addr(out, seq, pid, flags, link, addr);
+        }
     }
 }
 
-fn append_addr_message_with_addr(
+fn append_addr_message_with_ipv4_addr(
     out: &mut Vec<u8>,
     seq: u32,
     pid: u32,
@@ -1092,6 +1278,22 @@ fn append_addr_message_with_addr(
     addr: Ipv4Address,
 ) {
     let mut payload = vec![AF_INET, link.ipv4_prefix_len.unwrap_or(32), 0, 0];
+    payload.extend_from_slice(&link.ifindex.to_le_bytes());
+    push_attr(&mut payload, IFA_ADDRESS, &addr.octets());
+    push_attr(&mut payload, IFA_LOCAL, &addr.octets());
+    push_attr_string(&mut payload, IFA_LABEL, link.name);
+    append_nlmsg(out, RTM_NEWADDR, flags, seq, pid, &payload);
+}
+
+fn append_addr_message_with_ipv6_addr(
+    out: &mut Vec<u8>,
+    seq: u32,
+    pid: u32,
+    flags: u16,
+    link: &NetNamespaceLinkInfo,
+    addr: Ipv6Address,
+) {
+    let mut payload = vec![AF_INET6, link.ipv6_prefix_len.unwrap_or(128), 0, 0];
     payload.extend_from_slice(&link.ifindex.to_le_bytes());
     push_attr(&mut payload, IFA_ADDRESS, &addr.octets());
     push_attr(&mut payload, IFA_LOCAL, &addr.octets());
@@ -1190,6 +1392,7 @@ fn link_kind_name(kind: NetDeviceKind) -> &'static str {
     match kind {
         NetDeviceKind::Loopback => "loopback",
         NetDeviceKind::Ethernet => "ether",
+        NetDeviceKind::Dummy => "dummy",
         NetDeviceKind::Veth => "veth",
         NetDeviceKind::Bridge => "bridge",
     }
@@ -1209,12 +1412,24 @@ fn parse_linkinfo<'a>(attrs: &'a [NlAttr<'a>]) -> Result<LinkInfoAttrs<'a>, Errn
     if let Some(info_data) = attr_by_kind(&nested, IFLA_INFO_DATA) {
         let data_attrs = parse_attrs(info_data.payload)?;
         if let Some(peer) = attr_by_kind(&data_attrs, VETH_INFO_PEER) {
-            let peer_info = parse_ifinfomsg(peer.payload)?;
-            peer_name = attr_string(&peer_info.attrs, IFLA_IFNAME);
+            peer_name = parse_veth_peer_name(peer.payload)?;
         }
     }
 
     Ok(LinkInfoAttrs { kind, peer_name })
+}
+
+fn parse_veth_peer_name(payload: &[u8]) -> Result<Option<&str>, Errno> {
+    if payload.len() >= IFINFO_MSG_LEN {
+        if let Ok(peer_info) = parse_ifinfomsg(payload) {
+            if let Some(name) = attr_string(&peer_info.attrs, IFLA_IFNAME) {
+                return Ok(Some(name));
+            }
+        }
+    }
+
+    let attrs = parse_attrs(payload)?;
+    Ok(attr_string(&attrs, IFLA_IFNAME))
 }
 
 fn link_target_from_info_or_attrs<'a>(
@@ -1276,6 +1491,17 @@ fn parse_rtmsg(payload: &[u8]) -> Result<RtMsg<'_>, Errno> {
     })
 }
 
+fn parse_ndmsg(payload: &[u8]) -> Result<NdMsg<'_>, Errno> {
+    if payload.len() < NDMSG_LEN {
+        return Err(Errno::EINVAL);
+    }
+    Ok(NdMsg {
+        family: payload[0],
+        ifindex: parse_ifindex(payload, 4)?,
+        attrs: parse_attrs(&payload[NDMSG_LEN..])?,
+    })
+}
+
 fn parse_route_config(
     netns: &NetNamespacePayload,
     payload: &[u8],
@@ -1290,7 +1516,8 @@ fn parse_route_config(
     let dst = ipv4_attr(&msg.attrs, RTA_DST)?.unwrap_or(Ipv4Address::UNSPECIFIED);
     let gateway = ipv4_attr(&msg.attrs, RTA_GATEWAY)?;
     let preferred_src = ipv4_attr(&msg.attrs, RTA_PREFSRC)?;
-    let oif_name = route_oif_name(netns, &msg.attrs)?;
+    let oif_name =
+        route_oif_name(netns, &msg.attrs)?.or_else(|| infer_route_oif_name(netns, gateway));
     Ok(NetNamespaceRouteConfig {
         dst,
         prefix_len: msg.dst_len,
@@ -1360,6 +1587,32 @@ fn route_oif_name(
         .map(|link| link.name)
         .ok_or(Errno::ENODEV)?;
     Ok(Some(name))
+}
+
+fn infer_route_oif_name(
+    netns: &NetNamespacePayload,
+    gateway: Option<Ipv4Address>,
+) -> Option<&'static str> {
+    let gateway = gateway?;
+    netns.link_snapshot().into_iter().find_map(|link| {
+        let addr = link.ipv4_addr?;
+        let prefix_len = link.ipv4_prefix_len.unwrap_or(32);
+        ipv4_in_prefix(gateway, addr, prefix_len).then_some(link.name)
+    })
+}
+
+fn ipv4_in_prefix(addr: Ipv4Address, base: Ipv4Address, prefix_len: u8) -> bool {
+    let prefix_len = prefix_len.min(32);
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    (ipv4_to_u32(addr) & mask) == (ipv4_to_u32(base) & mask)
+}
+
+fn ipv4_to_u32(addr: Ipv4Address) -> u32 {
+    u32::from_be_bytes(addr.octets())
 }
 
 fn normalize_route_table(table: u8) -> u8 {
@@ -1470,10 +1723,11 @@ fn append_done_message(out: &mut Vec<u8>, seq: u32, pid: u32) {
     append_nlmsg(out, NLMSG_DONE, NLM_F_MULTI, seq, pid, &0i32.to_le_bytes());
 }
 
-fn ack_or_error(header: NlMsgHeader, result: Result<(), Errno>) -> Vec<u8> {
+fn push_ack_or_error(responses: &mut Vec<Vec<u8>>, header: NlMsgHeader, result: Result<(), Errno>) {
     match result {
-        Ok(()) => build_ack_response(header),
-        Err(errno) => build_error_response(Some(header), errno),
+        Ok(()) if header.flags & NLM_F_ACK != 0 => responses.push(build_ack_response(header)),
+        Ok(()) => {}
+        Err(errno) => responses.push(build_error_response(Some(header), errno)),
     }
 }
 
@@ -1668,6 +1922,12 @@ struct RtMsg<'a> {
     protocol: u8,
     scope: u8,
     route_type: u8,
+    attrs: Vec<NlAttr<'a>>,
+}
+
+struct NdMsg<'a> {
+    family: u8,
+    ifindex: u32,
     attrs: Vec<NlAttr<'a>>,
 }
 

@@ -49,6 +49,7 @@ fn assert_tcp_payload_round_trip(
             source: None,
             destination: None,
             unix_source: None,
+            packet_source: None,
             truncated: false,
             became_empty: true,
         })

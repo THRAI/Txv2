@@ -10,18 +10,20 @@ use super::*;
 use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
 use tx_subsystems::net::protocol::loopback_iface;
 use tx_subsystems::net::{
-    net_namespace_payload_from_file, netlink_netfilter_recv, netlink_netfilter_send,
-    netlink_route_recv, netlink_route_recv_packet, netlink_route_send_with_netns_resolvers,
-    require_net_raw, socket_open_file_from_identity, step_accept, step_bind, step_connect,
-    step_listen, step_poll_ready, step_poll_wait_token, step_process_loopback_udp,
-    step_recv_kernel_bytes, step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
+    net_namespace_payload_from_file, net_namespace_payloads_snapshot, netlink_netfilter_recv,
+    netlink_netfilter_send, netlink_route_recv, netlink_route_recv_packet,
+    netlink_route_send_with_netns_resolvers, netlink_xfrm_recv, netlink_xfrm_send, require_net_raw,
+    socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
+    step_poll_ready, step_poll_wait_token, step_process_loopback_udp, step_recv_kernel_bytes,
+    step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
     step_send_udp_loopback_kernel_bytes, step_shutdown, step_socket_close,
     step_socket_open_file_in_namespace, step_tcp_loopback_handshake, step_tcp_loopback_transfer,
     step_unix_socketpair_connect, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address,
-    Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, LingerOption, PollMask, SendRecvFlags,
-    SockAddrIn, SockAddrIn6, SockAddrLl, SockShutdownCmd, SocketHandleFlags, SocketIdentity,
-    SocketKind, SocketProtocol, SocketType, TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState,
-    UnixPeerCred, UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
+    Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, LingerOption, NetNamespacePayload, PollMask,
+    RecvWireSet, SendRecvFlags, SockAddrIn, SockAddrIn6, SockAddrLl, SockShutdownCmd,
+    SocketHandleFlags, SocketIdentity, SocketKind, SocketOperationalEvidence, SocketProtocol,
+    SocketType, TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState, UnixPeerCred,
+    UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
 };
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::vfs::structure::OpenFileBacking;
@@ -59,6 +61,22 @@ const IPT_REPLACE_SIZE_OFFSET: usize = 40;
 const GROUP_REQ_BYTES: u32 = 136;
 const GROUP_REQ_GROUP_OFFSET: usize = 8;
 const IPV4_TCP_HEADER_BYTES: u16 = 40;
+const IFNAMSIZ: usize = 16;
+const ARPHRD_ETHER: u16 = 1;
+const ARPHRD_LOOPBACK: u16 = 772;
+const PACKET_HOST: u8 = 0;
+const ETH_P_IP: u16 = 0x0800;
+const ETH_P_ARP: u16 = 0x0806;
+const ARPOP_REQUEST: u16 = 1;
+const ARPOP_REPLY: u16 = 2;
+const ARP_ETH_IPV4_PACKET_BYTES: usize = 28;
+
+fn is_netlink_socket_kind(kind: SocketKind) -> bool {
+    matches!(
+        kind,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkXfrm | SocketKind::NetlinkNetfilter
+    )
+}
 
 #[derive(Clone, Copy)]
 struct UserIovec {
@@ -205,10 +223,7 @@ pub(super) fn sys_bind<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
         Ok((_, socket)) => socket,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
-    if matches!(
-        socket.kind,
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
-    ) {
+    if is_netlink_socket_kind(socket.kind) {
         return match read_sockaddr_nl(ctx, args[1], args[2]) {
             Ok(()) => SyscallResult::Return(0),
             Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
@@ -472,10 +487,7 @@ pub(super) fn sys_getsockname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         Ok((_, socket)) => socket,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
-    if matches!(
-        socket.kind,
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
-    ) {
+    if is_netlink_socket_kind(socket.kind) {
         return match write_sockaddr_nl(ctx, args[1], args[2]) {
             Ok(()) => SyscallResult::Return(0),
             Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
@@ -485,9 +497,30 @@ pub(super) fn sys_getsockname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         let Some(payload) = socket.acquire_operational() else {
             return SyscallResult::Error(errno_to_i32(Errno::ENOTCONN));
         };
-        let Some(sockaddr) = payload.packet_sockaddr() else {
+        let Some(mut sockaddr) = payload.packet_sockaddr() else {
             return SyscallResult::Error(EINVAL_VALUE);
         };
+        if sockaddr.ifindex > 0 {
+            let ifindex = sockaddr.ifindex as u32;
+            if let Some(link) = payload
+                .net_namespace()
+                .link_snapshot()
+                .into_iter()
+                .find(|link| link.ifindex == ifindex)
+            {
+                sockaddr.hatype = if link.is_loopback {
+                    ARPHRD_LOOPBACK
+                } else {
+                    ARPHRD_ETHER
+                };
+                sockaddr.pkttype = PACKET_HOST;
+                if let Some(mac) = link.mac {
+                    let octets = mac.octets();
+                    sockaddr.halen = octets.len() as u8;
+                    sockaddr.addr[..octets.len()].copy_from_slice(&octets);
+                }
+            }
+        }
         return match write_sockaddr_ll(ctx, args[1], args[2], sockaddr) {
             Ok(()) => SyscallResult::Return(0),
             Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
@@ -575,6 +608,7 @@ fn dispatch_netlink_send(
             &mut resolve_netns_fd,
             &mut resolve_netns_pid,
         ),
+        SocketKind::NetlinkXfrm => netlink_xfrm_send(socket, bytes, ctx.cred()),
         SocketKind::NetlinkNetfilter => netlink_netfilter_send(socket, bytes, ctx.cred()),
         _ => unreachable!(),
     }
@@ -595,10 +629,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
         flags |= SendRecvFlags::MSG_DONTWAIT;
     }
 
-    if matches!(
-        socket.kind,
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
-    ) {
+    if is_netlink_socket_kind(socket.kind) {
         if args[4] != 0 {
             if let Err(errno) = read_sockaddr_nl(ctx, args[4], args[5]) {
                 return SyscallResult::Error(errno_to_i32(errno));
@@ -657,6 +688,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
         if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, args[1]) {
             return SyscallResult::Error(errno_to_i32(errno));
         }
+        maybe_queue_packet_arp_reply(&socket, &payload, &netns, sockaddr, &bytes);
         return SyscallResult::Return(len as i64);
     }
 
@@ -825,10 +857,7 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     if file.flags().nonblocking {
         flags |= SendRecvFlags::MSG_DONTWAIT;
     }
-    let is_netlink_socket = matches!(
-        socket.kind,
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
-    );
+    let is_netlink_socket = is_netlink_socket_kind(socket.kind);
     if !is_netlink_socket {
         if let Some(errno) = recv_special_flags_errno(flags) {
             return SyscallResult::Error(errno);
@@ -867,7 +896,12 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         }
 
         let mut staging = alloc::vec![0; len.min(NETLINK_RECVMSG_MAX)];
-        let recv = match netlink_netfilter_recv(&socket, &mut staging, flags) {
+        let recv_result = match socket.kind {
+            SocketKind::NetlinkXfrm => netlink_xfrm_recv(&socket, &mut staging, flags),
+            SocketKind::NetlinkNetfilter => netlink_netfilter_recv(&socket, &mut staging, flags),
+            _ => unreachable!(),
+        };
+        let recv = match recv_result {
             Ok(recv) => recv,
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         };
@@ -958,6 +992,10 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                     if let Err(errno) = write_sockaddr_un(ctx, args[4], args[5], Some(source)) {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
+                } else if let Some(source) = recv.packet_source {
+                    if let Err(errno) = write_sockaddr_ll(ctx, args[4], args[5], source) {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
                 }
                 if socket_recv_should_yield_after_success(&socket, recv.bytes) {
                     tx_reactor::yield_now().await;
@@ -988,6 +1026,90 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     }
 }
 
+fn maybe_queue_packet_arp_reply(
+    socket: &Cap<SocketIdentity>,
+    payload: &SocketOperationalEvidence,
+    netns: &NetNamespacePayload,
+    sockaddr: SockAddrLl,
+    bytes: &[u8],
+) {
+    if sockaddr.protocol != ETH_P_ARP || bytes.len() < ARP_ETH_IPV4_PACKET_BYTES {
+        return;
+    }
+    if u16::from_be_bytes([bytes[0], bytes[1]]) != ARPHRD_ETHER
+        || u16::from_be_bytes([bytes[2], bytes[3]]) != ETH_P_IP
+        || bytes[4] != 6
+        || bytes[5] != 4
+        || u16::from_be_bytes([bytes[6], bytes[7]]) != ARPOP_REQUEST
+    {
+        return;
+    }
+
+    let sender_mac = match <[u8; 6]>::try_from(&bytes[8..14]) {
+        Ok(mac) => mac,
+        Err(_) => return,
+    };
+    let sender_ip = match <[u8; 4]>::try_from(&bytes[14..18]) {
+        Ok(ip) => ip,
+        Err(_) => return,
+    };
+    let target_ip = match <[u8; 4]>::try_from(&bytes[24..28]) {
+        Ok(ip) => Ipv4Address::new(ip),
+        Err(_) => return,
+    };
+
+    let Some(target_mac) = packet_arp_target_mac(netns, target_ip) else {
+        return;
+    };
+    let target_ip = target_ip.octets();
+
+    let mut reply = alloc::vec![0u8; ARP_ETH_IPV4_PACKET_BYTES];
+    reply[0..2].copy_from_slice(&ARPHRD_ETHER.to_be_bytes());
+    reply[2..4].copy_from_slice(&ETH_P_IP.to_be_bytes());
+    reply[4] = 6;
+    reply[5] = 4;
+    reply[6..8].copy_from_slice(&ARPOP_REPLY.to_be_bytes());
+    reply[8..14].copy_from_slice(&target_mac);
+    reply[14..18].copy_from_slice(&target_ip);
+    reply[18..24].copy_from_slice(&sender_mac);
+    reply[24..28].copy_from_slice(&sender_ip);
+
+    let mut source_addr = [0u8; 8];
+    source_addr[..target_mac.len()].copy_from_slice(&target_mac);
+    let source = SockAddrLl::with_link_layer_addr(
+        ETH_P_ARP,
+        sockaddr.ifindex,
+        ARPHRD_ETHER,
+        PACKET_HOST,
+        source_addr,
+        target_mac.len() as u8,
+    );
+    if payload.record_packet_frame(source, reply).unwrap_or(false) {
+        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+    }
+}
+
+fn packet_arp_target_mac(netns: &NetNamespacePayload, target_ip: Ipv4Address) -> Option<[u8; 6]> {
+    find_packet_arp_target_mac_in_netns(netns, target_ip).or_else(|| {
+        net_namespace_payloads_snapshot()
+            .into_iter()
+            .find_map(|candidate| find_packet_arp_target_mac_in_netns(&candidate, target_ip))
+    })
+}
+
+fn find_packet_arp_target_mac_in_netns(
+    netns: &NetNamespacePayload,
+    target_ip: Ipv4Address,
+) -> Option<[u8; 6]> {
+    netns.link_snapshot().into_iter().find_map(|link| {
+        if link.ipv4_addr == Some(target_ip) && !link.is_loopback {
+            link.mac.map(|mac| mac.octets())
+        } else {
+            None
+        }
+    })
+}
+
 pub(super) fn sys_sendmsg<'a>(
     args: [u64; 6],
     ctx: &'a SyscallCtx<'a>,
@@ -1015,10 +1137,7 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         return SyscallResult::Error(errno_to_i32(errno));
     }
 
-    if matches!(
-        socket.kind,
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
-    ) {
+    if is_netlink_socket_kind(socket.kind) {
         if header.name != 0 {
             if let Err(errno) = read_sockaddr_nl(ctx, header.name, header.namelen as u64) {
                 return SyscallResult::Error(errno_to_i32(errno));
@@ -1104,10 +1223,7 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         Ok(iovecs) => iovecs,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
-    let total_len = match if matches!(
-        socket.kind,
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
-    ) {
+    let total_len = match if is_netlink_socket_kind(socket.kind) {
         iov_total_len_with_limit(&iovecs, NETLINK_RECVMSG_MAX)
     } else {
         iov_total_len_with_limit(&iovecs, SOCKET_MSG_MAX_BYTES)
@@ -1359,10 +1475,7 @@ async fn recvmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         Ok(iovecs) => iovecs,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
-    let total_len = match if matches!(
-        socket.kind,
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
-    ) {
+    let total_len = match if is_netlink_socket_kind(socket.kind) {
         iov_total_len_with_limit(&iovecs, NETLINK_RECVMSG_MAX)
     } else {
         iov_total_len_with_limit(&iovecs, SOCKET_MSG_MAX_BYTES)
@@ -1376,10 +1489,7 @@ async fn recvmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
     if let Err(errno) = write_msghdr_controllen(ctx, args[1], 0) {
         return SyscallResult::Error(errno_to_i32(errno));
     }
-    let is_netlink_socket = matches!(
-        socket.kind,
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
-    );
+    let is_netlink_socket = is_netlink_socket_kind(socket.kind);
     if !is_netlink_socket {
         if let Some(errno) = recv_special_flags_errno(flags) {
             return SyscallResult::Error(errno);
@@ -1393,6 +1503,7 @@ async fn recvmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         let mut staging = alloc::vec![0; total_len];
         let result = match socket.kind {
             SocketKind::NetlinkRoute => netlink_route_recv(&socket, &mut staging, flags),
+            SocketKind::NetlinkXfrm => netlink_xfrm_recv(&socket, &mut staging, flags),
             SocketKind::NetlinkNetfilter => netlink_netfilter_recv(&socket, &mut staging, flags),
             _ => unreachable!(),
         };
@@ -1440,6 +1551,12 @@ async fn recvmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                 if let Some(source) = recv.unix_source {
                     if let Err(errno) =
                         write_sockaddr_un_into_msghdr(ctx, args[1], header, Some(source))
+                    {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                }
+                if let Some(source) = recv.packet_source {
+                    if let Err(errno) = write_sockaddr_ll_into_msghdr(ctx, args[1], header, source)
                     {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
@@ -1712,6 +1829,7 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             };
             Err(Errno::ENOPROTOOPT)
         }
+        (SOL_SOCKET, SO_BINDTODEVICE) => set_so_bindtodevice(&payload, ctx, optval, optlen),
         (IPPROTO_IP, IP_RECVERR) => {
             let on = match read_sockopt_bool(ctx, optval, optlen) {
                 Ok(on) => on,
@@ -1795,12 +1913,7 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         }
         (IPPROTO_TCP, TCP_ULP) => set_tcp_ulp(&socket, &payload, ctx, optval, optlen),
         (SOL_TLS, TLS_TX) => set_tls_tx(&socket, &payload, ctx, optval, optlen),
-        (SOL_NETLINK, NETLINK_EXT_ACK)
-            if matches!(
-                socket.kind,
-                SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
-            ) =>
-        {
+        (SOL_NETLINK, NETLINK_EXT_ACK) if is_netlink_socket_kind(socket.kind) => {
             let _ = match read_sockopt_bool(ctx, optval, optlen) {
                 Ok(on) => on,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
@@ -2203,6 +2316,7 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         (SOL_SOCKET, SO_OOBINLINE) => {
             validate_getsockopt_i32_args(ctx, optval, optlen_ptr).and(Err(Errno::ENOPROTOOPT))
         }
+        (SOL_SOCKET, SO_BINDTODEVICE) => write_so_bindtodevice(ctx, optval, optlen_ptr, &payload),
         (IPPROTO_IP, IP_RECVERR) => write_sockopt_i32(
             ctx,
             optval,
@@ -2258,12 +2372,7 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         }
         (IPPROTO_TCP, TCP_INFO) => write_sockopt_bytes(ctx, optval, optlen_ptr, &[0u8; 104]),
         (IPPROTO_TCP, TCP_CONGESTION) => write_sockopt_bytes(ctx, optval, optlen_ptr, b"reno\0"),
-        (SOL_NETLINK, NETLINK_EXT_ACK)
-            if matches!(
-                socket.kind,
-                SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
-            ) =>
-        {
+        (SOL_NETLINK, NETLINK_EXT_ACK) if is_netlink_socket_kind(socket.kind) => {
             write_sockopt_i32(ctx, optval, optlen_ptr, 1)
         }
         (IPPROTO_IP, IPT_SO_GET_INFO) => {
@@ -2319,6 +2428,71 @@ fn ipv6_recv_option_value(
         IPV6_2292DSTOPTS => opts.ip.ipv6_2292_dstopts as i32,
         _ => 0,
     })
+}
+
+fn set_so_bindtodevice<'a>(
+    payload: &tx_subsystems::net::SocketOperationalEvidence,
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<(), Errno> {
+    if optlen == 0 {
+        payload.with_options_mut(|opts| opts.socket.bind_to_device_ifindex = None);
+        return Ok(());
+    }
+    if optval == 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    let len = core::cmp::min(optlen as usize, IFNAMSIZ);
+    let mut name = [0u8; IFNAMSIZ];
+    bootstrap_copy_from_user(&ctx.aspace, &mut name[..len], optval)?;
+    let end = name[..len]
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(len);
+    if end == 0 {
+        payload.with_options_mut(|opts| opts.socket.bind_to_device_ifindex = None);
+        return Ok(());
+    }
+
+    let name = core::str::from_utf8(&name[..end]).map_err(|_| Errno::EINVAL)?;
+    let Some(ifindex) = link_ifindex_by_name(ctx, name) else {
+        return Err(Errno::ENODEV);
+    };
+    payload.with_options_mut(|opts| opts.socket.bind_to_device_ifindex = Some(ifindex));
+    Ok(())
+}
+
+fn write_so_bindtodevice<'a>(
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen_ptr: u64,
+    payload: &tx_subsystems::net::SocketOperationalEvidence,
+) -> Result<(), Errno> {
+    let ifindex = payload.with_options(|opts| opts.socket.bind_to_device_ifindex);
+    let mut value = alloc::vec::Vec::new();
+    if let Some(name) = ifindex.and_then(|ifindex| link_name_by_ifindex(ctx, ifindex)) {
+        value.extend_from_slice(name.as_bytes());
+    }
+    value.push(0);
+    write_sockopt_bytes(ctx, optval, optlen_ptr, &value)
+}
+
+fn link_ifindex_by_name(ctx: &SyscallCtx<'_>, name: &str) -> Option<u32> {
+    ctx.process
+        .net_namespace()?
+        .link_snapshot()
+        .into_iter()
+        .find_map(|link| (link.name == name).then_some(link.ifindex))
+}
+
+fn link_name_by_ifindex(ctx: &SyscallCtx<'_>, ifindex: u32) -> Option<&'static str> {
+    ctx.process
+        .net_namespace()?
+        .link_snapshot()
+        .into_iter()
+        .find_map(|link| (link.ifindex == ifindex).then_some(link.name))
 }
 
 fn write_icmp6_filter<'a>(
@@ -2390,12 +2564,7 @@ pub(super) fn can_fast_close_stateless_netlink_socket(file: &Cap<OpenFile>) -> b
     if file.retain_count() > 2 {
         return false;
     }
-    socket_identity_from_file(file).is_ok_and(|socket| {
-        matches!(
-            socket.kind,
-            SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
-        )
-    })
+    socket_identity_from_file(file).is_ok_and(|socket| is_netlink_socket_kind(socket.kind))
 }
 
 pub(super) fn fast_close_stateless_netlink_socket_file(file: &Cap<OpenFile>) {

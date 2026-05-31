@@ -107,6 +107,7 @@ pub enum SocketKind {
     RdsSeqPacket,
     RawIcmp,
     NetlinkRoute,
+    NetlinkXfrm,
     NetlinkNetfilter,
     Packet,
 }
@@ -131,6 +132,9 @@ impl SocketKind {
             (AddressFamily::Inet6, _, _) => Err(Errno::EPROTONOSUPPORT),
             (AddressFamily::Netlink, SocketType::Raw | SocketType::Dgram, 0) => {
                 Ok(Self::NetlinkRoute)
+            }
+            (AddressFamily::Netlink, SocketType::Raw | SocketType::Dgram, 6) => {
+                Ok(Self::NetlinkXfrm)
             }
             (AddressFamily::Netlink, SocketType::Raw | SocketType::Dgram, 12) => {
                 Ok(Self::NetlinkNetfilter)
@@ -419,6 +423,10 @@ pub struct SockAddrLl {
     pub family: u16,
     pub protocol: u16,
     pub ifindex: i32,
+    pub hatype: u16,
+    pub pkttype: u8,
+    pub halen: u8,
+    pub addr: [u8; 8],
 }
 
 impl SockAddrLl {
@@ -429,6 +437,29 @@ impl SockAddrLl {
             family: Self::AF_PACKET,
             protocol,
             ifindex,
+            hatype: 0,
+            pkttype: 0,
+            halen: 0,
+            addr: [0; 8],
+        }
+    }
+
+    pub const fn with_link_layer_addr(
+        protocol: u16,
+        ifindex: i32,
+        hatype: u16,
+        pkttype: u8,
+        addr: [u8; 8],
+        halen: u8,
+    ) -> Self {
+        Self {
+            family: Self::AF_PACKET,
+            protocol,
+            ifindex,
+            hatype,
+            pkttype,
+            halen,
+            addr,
         }
     }
 }
@@ -458,12 +489,15 @@ pub struct SendRecvFlags {
 
 impl SendRecvFlags {
     pub const MSG_OOB: Self = Self { bits: 0x01 };
-    pub const MSG_DONTWAIT: Self = Self { bits: 0x40 };
     pub const MSG_PEEK: Self = Self { bits: 0x02 };
-    pub const MSG_ERRQUEUE: Self = Self { bits: 0x2000 };
-    pub const MSG_WAITALL: Self = Self { bits: 0x100 };
-    pub const MSG_NOSIGNAL: Self = Self { bits: 0x4000 };
+    pub const MSG_DONTROUTE: Self = Self { bits: 0x04 };
+    pub const MSG_PROBE: Self = Self { bits: 0x10 };
     pub const MSG_TRUNC: Self = Self { bits: 0x20 };
+    pub const MSG_DONTWAIT: Self = Self { bits: 0x40 };
+    pub const MSG_WAITALL: Self = Self { bits: 0x100 };
+    pub const MSG_CONFIRM: Self = Self { bits: 0x800 };
+    pub const MSG_ERRQUEUE: Self = Self { bits: 0x2000 };
+    pub const MSG_NOSIGNAL: Self = Self { bits: 0x4000 };
     pub const MSG_MORE: Self = Self { bits: 0x8000 };
 
     pub const fn empty() -> Self {
@@ -475,8 +509,11 @@ impl SendRecvFlags {
             bits: Self::MSG_OOB.bits
                 | Self::MSG_DONTWAIT.bits
                 | Self::MSG_PEEK.bits
+                | Self::MSG_DONTROUTE.bits
+                | Self::MSG_PROBE.bits
                 | Self::MSG_ERRQUEUE.bits
                 | Self::MSG_WAITALL.bits
+                | Self::MSG_CONFIRM.bits
                 | Self::MSG_NOSIGNAL.bits
                 | Self::MSG_TRUNC.bits
                 | Self::MSG_MORE.bits,
@@ -559,6 +596,7 @@ pub struct SocketLevelOptions {
     pub send_buf_size: usize,
     pub recv_timeout: Option<Duration>,
     pub send_timeout: Option<Duration>,
+    pub bind_to_device_ifindex: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -629,6 +667,7 @@ impl SocketOptionSet {
                 send_buf_size: 65_536,
                 recv_timeout: None,
                 send_timeout: None,
+                bind_to_device_ifindex: None,
             },
             ip: IpLevelOptions {
                 tos: 0,
@@ -677,6 +716,7 @@ impl SocketOptionSet {
                 send_buf_size: 262_144,
                 recv_timeout: None,
                 send_timeout: None,
+                bind_to_device_ifindex: None,
             },
             ip: IpLevelOptions {
                 tos: 0,
@@ -719,6 +759,7 @@ impl SocketOptionSet {
             | SocketKind::RdsSeqPacket
             | SocketKind::RawIcmp
             | SocketKind::NetlinkRoute
+            | SocketKind::NetlinkXfrm
             | SocketKind::NetlinkNetfilter
             | SocketKind::Packet => Self::default_udp(),
         };
@@ -728,6 +769,7 @@ impl SocketOptionSet {
             SocketKind::RdsSeqPacket => SocketType::SeqPacket,
             SocketKind::RawIcmp
             | SocketKind::NetlinkRoute
+            | SocketKind::NetlinkXfrm
             | SocketKind::NetlinkNetfilter
             | SocketKind::Packet => SocketType::Raw,
         };

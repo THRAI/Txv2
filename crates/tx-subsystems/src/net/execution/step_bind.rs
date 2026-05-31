@@ -41,7 +41,10 @@ pub fn step_bind(
             bind_rds_no_wildcard_overlap(table, socket, witness.local, guard)
         }
         SocketKind::RawIcmp => Ok(()),
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter | SocketKind::Packet => Ok(()),
+        SocketKind::NetlinkRoute
+        | SocketKind::NetlinkXfrm
+        | SocketKind::NetlinkNetfilter
+        | SocketKind::Packet => Ok(()),
     };
     if let Err(error) = table_result {
         return StepOutcome::Err(table_error_to_errno(error));

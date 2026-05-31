@@ -34,7 +34,7 @@ pub(super) fn build_nlmsg(kind: u16, flags: u16, seq: u32, pid: u32, payload: &[
 }
 
 pub(super) fn build_done_message(seq: u32, pid: u32) -> Vec<u8> {
-    build_nlmsg(NLMSG_DONE, 0, seq, pid, &0i32.to_le_bytes())
+    build_nlmsg(NLMSG_DONE, NLM_F_MULTI, seq, pid, &0i32.to_le_bytes())
 }
 
 pub(super) fn ack_or_error(header: NlMsgHeader, result: Result<(), Errno>) -> Vec<u8> {

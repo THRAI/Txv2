@@ -25,14 +25,15 @@ pub use admin::{
     require_net_raw_in_user_namespace, NetAdminAuthority, NetRawAuthority,
 };
 pub use device::{
-    create_bridge_for_test_or_bootstrap, create_veth_pair_for_test_or_bootstrap,
-    net_device_by_devt, net_device_by_name, net_device_snapshot, register_net_devices,
-    BridgeConfig, BridgeDevice, BridgeForwardOutcome, BridgeInstance, BridgePortSnapshot,
-    BridgeSnapshot, EthernetAddress, NetDeviceKind, NetDeviceOps, NetDeviceRegistration,
-    VethDevice, VethEndpointConfig, VethPair, VethPairConfig, VethStatsSnapshot, VirtioNetConfig,
+    create_bridge_for_test_or_bootstrap, create_dummy_for_test_or_bootstrap,
+    create_veth_pair_for_test_or_bootstrap, net_device_by_devt, net_device_by_name,
+    net_device_snapshot, register_net_devices, BridgeConfig, BridgeDevice, BridgeForwardOutcome,
+    BridgeInstance, BridgePortSnapshot, BridgeSnapshot, DummyConfig, DummyDevice, DummyInstance,
+    EthernetAddress, NetDeviceKind, NetDeviceOps, NetDeviceRegistration, VethDevice,
+    VethEndpointConfig, VethPair, VethPairConfig, VethStatsSnapshot, VirtioNetConfig,
     VirtioNetDevice, VirtioNetFeatureSet, VirtioNetIrqEvent, VirtioNetIrqOutcome,
     VirtioNetQueueConfig, VirtioNetRxInjectOutcome, VirtioNetStats, VirtioNetStatsSnapshot,
-    VirtioNetTxCompleteOutcome, BRIDGE_FORWARD_BUDGET_DEFAULT, VETH_DEFAULT_MTU,
+    VirtioNetTxCompleteOutcome, BRIDGE_FORWARD_BUDGET_DEFAULT, DUMMY_DEFAULT_MTU, VETH_DEFAULT_MTU,
     VIRTIO_NET0_DEVICE, VIRTIO_NET0_REGISTRATION, VIRTIO_NET_DEFAULT_MTU, VIRTIO_NET_STAGING_MAJOR,
 };
 pub use execution::{
@@ -67,11 +68,11 @@ pub use namespace::{
     create_isolated_net_namespace, create_isolated_net_namespace_with_owner,
     drive_all_net_namespace_runtimes_at, drive_net_namespace_runtime_at, initial_loopback_iface,
     initial_net_namespace, initial_net_namespace_payload, initial_net_namespace_payload_with_owner,
-    net_namespace_open_file_from_payload, net_namespace_payload_from_file, NetNamespaceBridgeInfo,
-    NetNamespaceForwardOutcome, NetNamespaceIdentity, NetNamespaceLinkInfo, NetNamespacePayload,
-    NetNamespaceRouteConfig, NetNamespaceRouteDecision, NetNamespaceRouteInfo,
-    NetNamespaceRouteKind, NetNamespaceRouteSelector, NetNamespaceRuntimeOutcome,
-    NetNamespaceSnapshot,
+    net_namespace_open_file_from_payload, net_namespace_payload_from_file,
+    net_namespace_payloads_snapshot, NetNamespaceBridgeInfo, NetNamespaceForwardOutcome,
+    NetNamespaceIdentity, NetNamespaceLinkInfo, NetNamespacePayload, NetNamespaceRouteConfig,
+    NetNamespaceRouteDecision, NetNamespaceRouteInfo, NetNamespaceRouteKind,
+    NetNamespaceRouteSelector, NetNamespaceRuntimeOutcome, NetNamespaceSnapshot,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use namespace::{create_isolated_net_namespace_for_test, reset_initial_net_namespace_for_test};
@@ -95,13 +96,13 @@ pub use netfilter::{
     NetfilterVerdict,
 };
 pub use nfnetlink::{
-    netlink_netfilter_recv, netlink_netfilter_send, nfnetlink_handle_request,
-    nfnetlink_handle_request_in_namespace, nfnetlink_handle_request_in_namespace_with_cred,
-    nfnetlink_handle_request_with_cred, NetlinkNetfilterState, RawNetlinkNetfilterSocket,
-    NETLINK_NETFILTER, NFNL_MSG_BATCH_BEGIN, NFNL_MSG_BATCH_END, NFNL_SUBSYS_NFTABLES,
-    NFPROTO_IPV4, NFT_MSG_DELCHAIN, NFT_MSG_DELRULE, NFT_MSG_DELTABLE, NFT_MSG_GETCHAIN,
-    NFT_MSG_GETGEN, NFT_MSG_GETRULE, NFT_MSG_GETTABLE, NFT_MSG_NEWCHAIN, NFT_MSG_NEWGEN,
-    NFT_MSG_NEWRULE, NFT_MSG_NEWTABLE,
+    netlink_netfilter_recv, netlink_netfilter_send, netlink_xfrm_recv, netlink_xfrm_send,
+    nfnetlink_handle_request, nfnetlink_handle_request_in_namespace,
+    nfnetlink_handle_request_in_namespace_with_cred, nfnetlink_handle_request_with_cred,
+    NetlinkNetfilterState, RawNetlinkNetfilterSocket, NETLINK_NETFILTER, NETLINK_XFRM,
+    NFNL_MSG_BATCH_BEGIN, NFNL_MSG_BATCH_END, NFNL_SUBSYS_NFTABLES, NFPROTO_IPV4, NFT_MSG_DELCHAIN,
+    NFT_MSG_DELRULE, NFT_MSG_DELTABLE, NFT_MSG_GETCHAIN, NFT_MSG_GETGEN, NFT_MSG_GETRULE,
+    NFT_MSG_GETTABLE, NFT_MSG_NEWCHAIN, NFT_MSG_NEWGEN, NFT_MSG_NEWRULE, NFT_MSG_NEWTABLE,
 };
 pub use packet::{
     demux_rx_frame_with_smoltcp, NetworkPublish, PacketDispatch, PacketSource, PacketTxReadiness,

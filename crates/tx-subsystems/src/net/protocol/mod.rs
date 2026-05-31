@@ -16,9 +16,10 @@ pub use ether::{
 };
 pub use icmp::{
     build_icmpv4_echo_reply, build_icmpv4_echo_reply_message, build_icmpv4_echo_request,
-    build_icmpv4_echo_request_message, icmpv4_echo_message_len, parse_icmpv4_from_ipv4_bytes,
-    parse_icmpv4_loopback_packet, parse_icmpv4_payload, Icmpv4EchoPacket, Icmpv4Event,
-    RawIcmpSocket, RawIcmpTxDrain, RawIpAddress, RawIpv6Packet,
+    build_icmpv4_echo_request_message, icmpv4_echo_message_len,
+    parse_icmpv4_echo_payload_unchecked, parse_icmpv4_from_ipv4_bytes,
+    parse_icmpv4_loopback_packet, parse_icmpv4_payload, parse_raw_icmpv4_echo_payload_unchecked,
+    Icmpv4EchoPacket, Icmpv4Event, RawIcmpSocket, RawIcmpTxDrain, RawIpAddress, RawIpv6Packet,
 };
 pub use loopback::{loopback_iface, IfaceCommon, LoopbackIface};
 pub use poll_context::{PollContext, PollContextOutcome};

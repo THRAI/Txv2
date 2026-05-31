@@ -7,11 +7,13 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::fmt::Write;
 
 pub mod adapter;
 
 use adapter::step_engine::{Cap, NoProgress, StepOutcome};
+use tx_substrate::zone::PayloadCap;
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::mount::MountPayload;
 use tx_subsystems::net::{EthernetAddress, NetNamespaceLinkInfo, NetNamespacePayload};
@@ -27,6 +29,7 @@ const SYSFS_CLASS_NET_ID: FsObjectId = FsObjectId::new(0x7379_7302);
 
 const SYSFS_NETDEV_ID_TAG: u64 = 0x7379_6E00_0000_0000;
 const SYSFS_NETDEV_ID_MASK: u64 = 0xFFFF_FF00_0000_0000;
+const SYSFS_NETDEV_NS_SHIFT: u64 = 32;
 const SYSFS_NETDEV_IFINDEX_SHIFT: u64 = 16;
 const SYSFS_NETDEV_KIND_MASK: u64 = 0xFFFF;
 
@@ -160,27 +163,32 @@ impl FsOps for Sysfs {
             };
         }
         if parent == SYSFS_CLASS_NET_ID {
-            let netns = initial_netns();
-            let Some(link) = link_by_name(&netns, name) else {
+            let Some((ns_slot, link)) = link_by_name_any(name) else {
                 return StepOutcome::err(Errno::ENOENT);
             };
-            return StepOutcome::done(netdev_node_id(link.ifindex, NetdevNodeKind::DeviceDir));
+            return StepOutcome::done(netdev_node_id(
+                ns_slot,
+                link.ifindex,
+                NetdevNodeKind::DeviceDir,
+            ));
         }
-        if let Some((ifindex, NetdevNodeKind::DeviceDir)) = parse_netdev_node_id(parent) {
-            if link_by_ifindex(&initial_netns(), ifindex).is_none() {
+        if let Some((ns_slot, ifindex, NetdevNodeKind::DeviceDir)) = parse_netdev_node_id(parent) {
+            if link_by_node(ns_slot, ifindex).is_none() {
                 return StepOutcome::err(Errno::ENOENT);
             }
             if let Some(entry) = NETDEV_FILES.iter().find(|entry| entry.name == name) {
-                return StepOutcome::done(netdev_node_id(ifindex, entry.node));
+                return StepOutcome::done(netdev_node_id(ns_slot, ifindex, entry.node));
             }
             return StepOutcome::err(Errno::ENOENT);
         }
-        if let Some((ifindex, NetdevNodeKind::StatisticsDir)) = parse_netdev_node_id(parent) {
-            if link_by_ifindex(&initial_netns(), ifindex).is_none() {
+        if let Some((ns_slot, ifindex, NetdevNodeKind::StatisticsDir)) =
+            parse_netdev_node_id(parent)
+        {
+            if link_by_node(ns_slot, ifindex).is_none() {
                 return StepOutcome::err(Errno::ENOENT);
             }
             if let Some(entry) = NETDEV_STAT_FILES.iter().find(|entry| entry.name == name) {
-                return StepOutcome::done(netdev_node_id(ifindex, entry.node));
+                return StepOutcome::done(netdev_node_id(ns_slot, ifindex, entry.node));
             }
             return StepOutcome::err(Errno::ENOENT);
         }
@@ -198,8 +206,8 @@ impl FsOps for Sysfs {
         ) {
             return StepOutcome::done(InodeMeta::new(InodeKind::Directory, SYSFS_DIR_MODE));
         }
-        if let Some((ifindex, node)) = parse_netdev_node_id(fs_object_id) {
-            if link_by_ifindex(&initial_netns(), ifindex).is_none() {
+        if let Some((ns_slot, ifindex, node)) = parse_netdev_node_id(fs_object_id) {
+            if link_by_node(ns_slot, ifindex).is_none() {
                 return StepOutcome::err(Errno::ENOENT);
             }
             let kind = if matches!(
@@ -317,12 +325,12 @@ impl FsOps for Sysfs {
             return emit_static_entry(idx, &[(b"net", SYSFS_CLASS_NET_ID, InodeKind::Directory)]);
         }
         if fs_object_id == SYSFS_CLASS_NET_ID {
-            let links = initial_netns().link_snapshot();
-            let Some(link) = links.get(idx) else {
+            let links = all_netdev_links();
+            let Some((ns_slot, link)) = links.get(idx).copied() else {
                 return StepOutcome::done(None);
             };
             return match DirEntry::new(
-                netdev_node_id(link.ifindex, NetdevNodeKind::DeviceDir),
+                netdev_node_id(ns_slot, link.ifindex, NetdevNodeKind::DeviceDir),
                 InodeKind::Directory,
                 link.name.as_bytes(),
             ) {
@@ -332,17 +340,21 @@ impl FsOps for Sysfs {
                 Err(errno) => StepOutcome::err(errno),
             };
         }
-        if let Some((ifindex, NetdevNodeKind::DeviceDir)) = parse_netdev_node_id(fs_object_id) {
-            if link_by_ifindex(&initial_netns(), ifindex).is_none() {
+        if let Some((ns_slot, ifindex, NetdevNodeKind::DeviceDir)) =
+            parse_netdev_node_id(fs_object_id)
+        {
+            if link_by_node(ns_slot, ifindex).is_none() {
                 return StepOutcome::err(Errno::ENOENT);
             }
-            return emit_netdev_entry(idx, ifindex, NETDEV_FILES);
+            return emit_netdev_entry(idx, ns_slot, ifindex, NETDEV_FILES);
         }
-        if let Some((ifindex, NetdevNodeKind::StatisticsDir)) = parse_netdev_node_id(fs_object_id) {
-            if link_by_ifindex(&initial_netns(), ifindex).is_none() {
+        if let Some((ns_slot, ifindex, NetdevNodeKind::StatisticsDir)) =
+            parse_netdev_node_id(fs_object_id)
+        {
+            if link_by_node(ns_slot, ifindex).is_none() {
                 return StepOutcome::err(Errno::ENOENT);
             }
-            return emit_netdev_entry(idx, ifindex, NETDEV_STAT_FILES);
+            return emit_netdev_entry(idx, ns_slot, ifindex, NETDEV_STAT_FILES);
         }
         StepOutcome::err(Errno::ENOTDIR)
     }
@@ -502,13 +514,18 @@ fn emit_static_entry(
 
 fn emit_netdev_entry(
     idx: usize,
+    ns_slot: u16,
     ifindex: u32,
     entries: &[NetdevEntry],
 ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
     let Some(entry) = entries.get(idx).copied() else {
         return StepOutcome::done(None);
     };
-    match DirEntry::new(netdev_node_id(ifindex, entry.node), entry.kind, entry.name) {
+    match DirEntry::new(
+        netdev_node_id(ns_slot, ifindex, entry.node),
+        entry.kind,
+        entry.name,
+    ) {
         Ok(dir_entry) => {
             StepOutcome::done(Some((dir_entry, DirCursor::from_u64((idx + 1) as u64))))
         }
@@ -518,12 +535,12 @@ fn emit_netdev_entry(
 
 fn render_projected(
     fs_object_id: FsObjectId,
-    netns: &NetNamespacePayload,
+    _netns: &NetNamespacePayload,
 ) -> Result<String, Errno> {
-    let Some((ifindex, node)) = parse_netdev_node_id(fs_object_id) else {
+    let Some((ns_slot, ifindex, node)) = parse_netdev_node_id(fs_object_id) else {
         return Err(Errno::ENOENT);
     };
-    let Some(link) = link_by_ifindex(netns, ifindex) else {
+    let Some((netns, link)) = link_by_node(ns_slot, ifindex) else {
         return Err(Errno::ENOENT);
     };
     if matches!(
@@ -559,13 +576,17 @@ fn render_projected(
             }
         }
         NetdevNodeKind::RxPackets => {
-            format!("{}\n", iface_stat(netns, link.name, StatKind::RxPackets))
+            format!("{}\n", iface_stat(&netns, link.name, StatKind::RxPackets))
         }
         NetdevNodeKind::TxPackets => {
-            format!("{}\n", iface_stat(netns, link.name, StatKind::TxPackets))
+            format!("{}\n", iface_stat(&netns, link.name, StatKind::TxPackets))
         }
-        NetdevNodeKind::RxBytes => format!("{}\n", iface_stat(netns, link.name, StatKind::RxBytes)),
-        NetdevNodeKind::TxBytes => format!("{}\n", iface_stat(netns, link.name, StatKind::TxBytes)),
+        NetdevNodeKind::RxBytes => {
+            format!("{}\n", iface_stat(&netns, link.name, StatKind::RxBytes))
+        }
+        NetdevNodeKind::TxBytes => {
+            format!("{}\n", iface_stat(&netns, link.name, StatKind::TxBytes))
+        }
         NetdevNodeKind::DeviceDir | NetdevNodeKind::StatisticsDir => unreachable!(),
     })
 }
@@ -634,31 +655,61 @@ fn initial_netns() -> tx_substrate::zone::PayloadCap<NetNamespacePayload> {
     tx_subsystems::net::initial_net_namespace_payload()
 }
 
-fn link_by_name(netns: &NetNamespacePayload, name: &[u8]) -> Option<NetNamespaceLinkInfo> {
-    netns
-        .link_snapshot()
-        .into_iter()
-        .find(|link| link.name.as_bytes() == name)
+fn netns_snapshot() -> Vec<PayloadCap<NetNamespacePayload>> {
+    let _ = initial_netns();
+    tx_subsystems::net::net_namespace_payloads_snapshot()
 }
 
-fn link_by_ifindex(netns: &NetNamespacePayload, ifindex: u32) -> Option<NetNamespaceLinkInfo> {
-    netns
-        .link_snapshot()
-        .into_iter()
-        .find(|link| link.ifindex == ifindex)
+fn all_netdev_links() -> Vec<(u16, NetNamespaceLinkInfo)> {
+    let mut links = Vec::new();
+    for (idx, netns) in netns_snapshot().into_iter().enumerate() {
+        let Ok(ns_slot) = u8::try_from(idx) else {
+            continue;
+        };
+        let ns_slot = u16::from(ns_slot);
+        links.extend(
+            netns
+                .link_snapshot()
+                .into_iter()
+                .map(|link| (ns_slot, link)),
+        );
+    }
+    links
 }
 
-fn netdev_node_id(ifindex: u32, kind: NetdevNodeKind) -> FsObjectId {
+fn link_by_name_any(name: &[u8]) -> Option<(u16, NetNamespaceLinkInfo)> {
+    all_netdev_links()
+        .into_iter()
+        .find(|(_, link)| link.name.as_bytes() == name)
+}
+
+fn link_by_node(
+    ns_slot: u16,
+    ifindex: u32,
+) -> Option<(PayloadCap<NetNamespacePayload>, NetNamespaceLinkInfo)> {
+    let netns = netns_snapshot().into_iter().nth(usize::from(ns_slot))?;
+    let link = netns
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.ifindex == ifindex)?;
+    Some((netns, link))
+}
+
+fn netdev_node_id(ns_slot: u16, ifindex: u32, kind: NetdevNodeKind) -> FsObjectId {
     FsObjectId::new(
-        SYSFS_NETDEV_ID_TAG | ((ifindex as u64) << SYSFS_NETDEV_IFINDEX_SHIFT) | (kind as u64),
+        SYSFS_NETDEV_ID_TAG
+            | ((ns_slot as u64) << SYSFS_NETDEV_NS_SHIFT)
+            | ((ifindex as u64) << SYSFS_NETDEV_IFINDEX_SHIFT)
+            | (kind as u64),
     )
 }
 
-fn parse_netdev_node_id(id: FsObjectId) -> Option<(u32, NetdevNodeKind)> {
+fn parse_netdev_node_id(id: FsObjectId) -> Option<(u16, u32, NetdevNodeKind)> {
     let raw = id.as_u64();
     if raw & SYSFS_NETDEV_ID_MASK != SYSFS_NETDEV_ID_TAG {
         return None;
     }
+    let ns_slot = ((raw >> SYSFS_NETDEV_NS_SHIFT) & 0xFF) as u16;
     let ifindex = ((raw >> SYSFS_NETDEV_IFINDEX_SHIFT) & 0xFFFF) as u32;
     if ifindex == 0 {
         return None;
@@ -679,7 +730,7 @@ fn parse_netdev_node_id(id: FsObjectId) -> Option<(u32, NetdevNodeKind)> {
         12 => NetdevNodeKind::TxBytes,
         _ => return None,
     };
-    Some((ifindex, kind))
+    Some((ns_slot, ifindex, kind))
 }
 
 #[cfg(test)]
@@ -774,5 +825,56 @@ mod tests {
             other => panic!("read sys-veth0/address failed: {other:?}"),
         };
         assert_eq!(&out[..read], b"02:00:00:72:03:01\n");
+    }
+
+    #[test]
+    fn sysfs_class_net_projects_isolated_namespace_veth_address() {
+        let _lock = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .expect("fs test lock");
+        init_sysfs_test();
+        let guard = tx_substrate::epoch::guard();
+        let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+            left: VethEndpointConfig {
+                name: "sys-host0",
+                devt: DevT::new(101, 3),
+                mac: EthernetAddress::new([0x02, 0, 0, 0x72, 3, 3]),
+            },
+            right: VethEndpointConfig {
+                name: "sys-remote0",
+                devt: DevT::new(101, 4),
+                mac: EthernetAddress::new([0x02, 0, 0, 0x72, 3, 4]),
+            },
+            mtu: VETH_DEFAULT_MTU,
+        });
+        let initial = tx_subsystems::net::initial_net_namespace_payload();
+        initial
+            .attach_device(NetAdminAuthority::for_test_or_bootstrap(), pair.left, None)
+            .expect("attach sys-host0");
+        let remote = tx_subsystems::net::create_isolated_net_namespace_for_test("sysfs-remote")
+            .expect("remote netns")
+            .payload_cap()
+            .expect("remote payload");
+        remote
+            .attach_device(NetAdminAuthority::for_test_or_bootstrap(), pair.right, None)
+            .expect("attach sys-remote0");
+
+        let sysfs = Sysfs::new();
+        let veth =
+            match <Sysfs as FsOps>::lookup(&sysfs, SYSFS_CLASS_NET_ID, b"sys-remote0", &guard) {
+                StepOutcome::Done(id) => id,
+                other => panic!("lookup sys-remote0 failed: {other:?}"),
+            };
+        let address = match <Sysfs as FsOps>::lookup(&sysfs, veth, b"address", &guard) {
+            StepOutcome::Done(id) => id,
+            other => panic!("lookup sys-remote0/address failed: {other:?}"),
+        };
+
+        let mut out = [0u8; 64];
+        let read = match sysfs.step_read_projected(address, 0, &mut out, &guard) {
+            StepOutcome::Done(read) => read as usize,
+            other => panic!("read sys-remote0/address failed: {other:?}"),
+        };
+        assert_eq!(&out[..read], b"02:00:00:72:03:04\n");
     }
 }

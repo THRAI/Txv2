@@ -312,6 +312,70 @@ fn ether_iface_replies_to_icmp_echo_request_for_local_ip() {
 }
 
 #[test]
+fn ether_iface_fragments_and_reassembles_large_icmp_echo() {
+    let _lock = setup();
+
+    let local_ip = Ipv4Address::new([10, 0, 0, 1]);
+    let remote_ip = Ipv4Address::new([10, 0, 0, 2]);
+    let local_mac = EthernetAddress::new([0x02, 0, 0, 0, 0, 1]);
+    let remote_mac = EthernetAddress::new([0x02, 0, 0, 0, 0, 2]);
+    let local_device = leak_ether_device(local_mac, 49);
+    let remote_device = leak_ether_device(remote_mac, 50);
+    let local_iface =
+        leak_ether_iface_without_attach(local_device.registration, local_ip, local_mac);
+    let remote_iface =
+        leak_ether_iface_without_attach(remote_device.registration, remote_ip, remote_mac);
+    let now = smoltcp::time::Instant::ZERO;
+    let arp_expires = smoltcp::time::Instant::from_secs(60);
+    let guard = tx_substrate::epoch::guard();
+
+    local_iface.install_arp_for_test_or_bootstrap(local_ip, local_mac, arp_expires);
+    local_iface.install_arp_for_test_or_bootstrap(remote_ip, remote_mac, arp_expires);
+    remote_iface.install_arp_for_test_or_bootstrap(local_ip, local_mac, arp_expires);
+
+    let echo = crate::net::protocol::Icmpv4EchoPacket {
+        src: local_ip,
+        dst: remote_ip,
+        ident: 0x5151,
+        seq_no: 7,
+        payload: std::vec![0x5a; 2048],
+    };
+    let request = crate::net::protocol::build_icmpv4_echo_request(&echo);
+
+    let tx_result = local_iface.dispatch_ip_at(request.as_bytes(), now, &guard);
+    assert!(
+        matches!(tx_result, PacketTxResult::Accepted { .. }),
+        "unexpected dispatch result: {tx_result:?}"
+    );
+    let outbound = local_device.ops.tx_frames();
+    assert_eq!(outbound.len(), 2);
+    assert_ipv4_fragment(&outbound[0], true, 0);
+    assert_ipv4_fragment(&outbound[1], false, 1480);
+
+    assert_eq!(
+        remote_iface.process_frame_at(RxFrame::new(outbound[0].clone()), now, Some(&guard)),
+        PacketDispatch::Unsupported
+    );
+    assert_eq!(
+        remote_iface.process_frame_at(RxFrame::new(outbound[1].clone()), now, Some(&guard)),
+        PacketDispatch::Icmp(Icmpv4Event::EchoRequest(echo.clone()))
+    );
+
+    let replies = remote_device.ops.tx_frames();
+    assert_eq!(replies.len(), 2);
+    assert_ipv4_fragment(&replies[0], true, 0);
+    assert_ipv4_fragment(&replies[1], false, 1480);
+    assert_eq!(
+        local_iface.process_frame_at(RxFrame::new(replies[0].clone()), now, Some(&guard)),
+        PacketDispatch::Unsupported
+    );
+    assert_eq!(
+        local_iface.process_frame_at(RxFrame::new(replies[1].clone()), now, Some(&guard)),
+        PacketDispatch::Icmp(Icmpv4Event::EchoReply(echo.reply_packet()))
+    );
+}
+
+#[test]
 fn ether_iface_arp_request_is_rate_limited_by_pending_deadline() {
     let _lock = setup();
 
@@ -523,6 +587,19 @@ fn leak_ether_iface(
     )))
 }
 
+fn leak_ether_iface_without_attach(
+    registration: &'static NetDeviceRegistration,
+    local_ip: Ipv4Address,
+    local_mac: EthernetAddress,
+) -> &'static EtherIface {
+    Box::leak(Box::new(EtherIface::new(
+        registration,
+        IfaceCommon::new(local_ip, Ipv4Address::new([255, 255, 255, 0]), 1500),
+        local_mac,
+        "eth-test",
+    )))
+}
+
 fn connected_udp_client_on(
     local_ip: Ipv4Address,
     local_port: u16,
@@ -645,6 +722,16 @@ fn ipv4_ethernet_frame(
     ether.emit(&mut ethernet);
     ethernet.payload_mut().copy_from_slice(ipv4_packet);
     frame
+}
+
+fn assert_ipv4_fragment(frame: &[u8], more_fragments: bool, offset: usize) {
+    let ethernet = EthernetFrame::new_checked(frame).expect("ethernet frame");
+    assert_eq!(ethernet.ethertype(), EthernetProtocol::Ipv4);
+    let ipv4 = ethernet.payload();
+    let flags_fragment = u16::from_be_bytes([ipv4[6], ipv4[7]]);
+    assert_eq!(flags_fragment & 0x2000 != 0, more_fragments);
+    assert_eq!(usize::from(flags_fragment & 0x1fff) * 8, offset);
+    assert!(usize::from(u16::from_be_bytes([ipv4[2], ipv4[3]])) <= 1500);
 }
 
 fn to_smoltcp_ether(addr: EthernetAddress) -> SmoltcpEthernetAddress {

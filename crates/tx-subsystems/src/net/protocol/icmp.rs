@@ -334,6 +334,51 @@ pub fn parse_icmpv4_payload(src: Ipv4Address, dst: Ipv4Address, payload: &[u8]) 
     }
 }
 
+pub fn parse_icmpv4_echo_payload_unchecked(
+    src: Ipv4Address,
+    dst: Ipv4Address,
+    payload: &[u8],
+) -> Icmpv4Event {
+    parse_icmpv4_echo_payload_unchecked_inner(src, dst, payload, false)
+}
+
+pub fn parse_raw_icmpv4_echo_payload_unchecked(
+    src: Ipv4Address,
+    dst: Ipv4Address,
+    payload: &[u8],
+) -> Icmpv4Event {
+    parse_icmpv4_echo_payload_unchecked_inner(src, dst, payload, true)
+}
+
+fn parse_icmpv4_echo_payload_unchecked_inner(
+    src: Ipv4Address,
+    dst: Ipv4Address,
+    payload: &[u8],
+    allow_nonzero_code: bool,
+) -> Icmpv4Event {
+    if payload.len() < ICMPV4_ECHO_HEADER_LEN {
+        return Icmpv4Event::Malformed;
+    }
+    if payload[1] != 0 && !allow_nonzero_code {
+        return Icmpv4Event::Unsupported;
+    }
+
+    let ident = u16::from_be_bytes([payload[4], payload[5]]);
+    let seq_no = u16::from_be_bytes([payload[6], payload[7]]);
+    let packet = Icmpv4EchoPacket {
+        src,
+        dst,
+        ident,
+        seq_no,
+        payload: payload[ICMPV4_ECHO_HEADER_LEN..].to_vec(),
+    };
+    match payload[0] {
+        8 => Icmpv4Event::EchoRequest(packet),
+        0 => Icmpv4Event::EchoReply(packet),
+        _ => Icmpv4Event::Unsupported,
+    }
+}
+
 pub fn build_icmpv4_echo_request(packet: &Icmpv4EchoPacket) -> LoopbackIpPacket {
     build_icmpv4_echo_packet(packet, true)
 }

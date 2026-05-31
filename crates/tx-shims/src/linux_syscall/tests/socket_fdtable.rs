@@ -9,15 +9,15 @@ use crate::linux_syscall::{
     EFAULT_VALUE, ENXIO_VALUE, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_IP,
     IPPROTO_IPV6, IPPROTO_TCP, IPPROTO_UDP, IPPROTO_UDPLITE, IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO,
     IPT_SO_SET_REPLACE, IPV6_ADDRFORM, IP_HDRINCL, IP_RECVERR, NETLINK_EXT_ACK, NETLINK_NETFILTER,
-    NETLINK_ROUTE, NR_ACCEPT, NR_BIND, NR_CLOSE, NR_CONNECT, NR_DUP, NR_FCNTL, NR_GETSOCKNAME,
-    NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PIPE2, NR_PPOLL, NR_PSELECT6, NR_PSELECT6_TIME64,
-    NR_READ, NR_RECVFROM, NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG, NR_SENDMSG, NR_SENDTO,
-    NR_SETSOCKOPT, NR_SOCKET, NR_SOCKETPAIR, NR_WRITE, O_CLOEXEC, O_NONBLOCK, O_RDWR,
+    NETLINK_ROUTE, NETLINK_XFRM, NR_ACCEPT, NR_BIND, NR_CLOSE, NR_CONNECT, NR_DUP, NR_FCNTL,
+    NR_GETSOCKNAME, NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PIPE2, NR_PPOLL, NR_PSELECT6,
+    NR_PSELECT6_TIME64, NR_READ, NR_RECVFROM, NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG, NR_SENDMSG,
+    NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET, NR_SOCKETPAIR, NR_WRITE, O_CLOEXEC, O_NONBLOCK, O_RDWR,
     PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR, SIOCGIFCONF, SIOCGIFFLAGS,
     SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNAME, SIOCGIFTXQLEN, SIOCSIFFLAGS, SIOCSIFMTU,
-    SOCKET_IO_MAX_INLINE, SOL_IPV6, SOL_NETLINK, SOL_PACKET, SOL_SOCKET, SOL_TLS, SO_DONTROUTE,
-    SO_ERROR, SO_PEERCRED, SO_RCVTIMEO, SO_REUSEADDR, SO_SNDBUF, SO_SNDBUFFORCE, SO_TYPE,
-    TCP_MAXSEG, TCP_ULP, TLS_TX, TPACKET_V3, TTY_WRITE_MAX_INLINE,
+    SOCKET_IO_MAX_INLINE, SOL_IPV6, SOL_NETLINK, SOL_PACKET, SOL_SOCKET, SOL_TLS, SO_BINDTODEVICE,
+    SO_DONTROUTE, SO_ERROR, SO_PEERCRED, SO_RCVTIMEO, SO_REUSEADDR, SO_SNDBUF, SO_SNDBUFFORCE,
+    SO_TYPE, TCP_MAXSEG, TCP_ULP, TLS_TX, TPACKET_V3, TTY_WRITE_MAX_INLINE,
 };
 use alloc::boxed::Box;
 use alloc::vec;
@@ -29,7 +29,11 @@ use tx_subsystems::net::protocol::{
     build_icmpv4_echo_request_message, loopback_iface, parse_icmpv4_payload,
 };
 use tx_subsystems::net::PollMask;
-use tx_subsystems::net::{Icmpv4EchoPacket, Icmpv4Event, Ipv4Address, UnixSocketPath};
+use tx_subsystems::net::{
+    create_veth_pair_for_test_or_bootstrap, EthernetAddress, Icmpv4EchoPacket, Icmpv4Event,
+    Ipv4Address, NetAdminAuthority, UnixSocketPath, VethEndpointConfig, VethPairConfig,
+    VETH_DEFAULT_MTU,
+};
 use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
 
 const SOCK_STREAM: u64 = 1;
@@ -44,17 +48,20 @@ const SOCKADDR_LL_BYTES: u32 = 20;
 const TEST_POLLIN: i16 = 0x0001;
 const TEST_POLLOUT: i16 = 0x0004;
 const ETH_P_ALL: u16 = 0x0003;
+const ETH_P_ARP: u16 = 0x0806;
 const ETH_P_ALL_NET: u16 = 0x0300;
 const MSG_DONTWAIT: u64 = 0x40;
 const MSG_MORE: u64 = 0x8000;
 const E_PERM: i32 = 1;
 const NLM_F_REQUEST: u16 = 0x0001;
+const NLM_F_MULTI: u16 = 0x0002;
 const NLM_F_DUMP: u16 = 0x0300;
 const MSG_PEEK: u64 = 0x02;
 const MSG_TRUNC: u64 = 0x20;
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const NLMSG_DONE: u16 = 3;
+const XFRM_MSG_GETSA: u16 = 0x12;
 const NFNL_SUBSYS_NFTABLES: u16 = 10;
 const NFT_MSG_GETTABLE: u16 = 1;
 const NFT_MSG_NEWTABLE: u16 = 0;
@@ -239,12 +246,27 @@ fn nft_table_request(seq: u32, op: u16, name: &str) -> Vec<u8> {
     out
 }
 
+fn xfrm_dump_request(seq: u32) -> Vec<u8> {
+    let len = 16u32;
+    let mut out = Vec::new();
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&XFRM_MSG_GETSA.to_le_bytes());
+    out.extend_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_le_bytes());
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out
+}
+
 fn nft_msg(op: u16) -> u16 {
     (NFNL_SUBSYS_NFTABLES << 8) | op
 }
 
 fn nlmsg_type(msg: &[u8]) -> u16 {
     u16::from_le_bytes([msg[4], msg[5]])
+}
+
+fn nlmsg_flags(msg: &[u8]) -> u16 {
+    u16::from_le_bytes([msg[6], msg[7]])
 }
 
 fn nlmsg_error_code(msg: &[u8]) -> i32 {
@@ -420,6 +442,74 @@ fn dispatch_udplite_socket_reports_datagram_type() {
         SyscallResult::Return(0)
     );
     assert_eq!(out, SOCK_DGRAM as i32);
+}
+
+#[test]
+fn dispatch_setsockopt_so_bindtodevice_accepts_existing_link() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = match socket_req(
+        NR_SOCKET,
+        [AF_INET as u64, SOCK_DGRAM, IPPROTO_ICMP as u64, 0, 0, 0],
+        &ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_INET, DGRAM, ICMP) failed: {other:?}"),
+    };
+
+    let iface = b"lo\0";
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_BINDTODEVICE as u64,
+                iface.as_ptr() as u64,
+                iface.len() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out = [0u8; 16];
+    let mut out_len = out.len() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_BINDTODEVICE as u64,
+                out.as_mut_ptr() as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out_len, iface.len() as u32);
+    assert_eq!(&out[..iface.len()], iface);
+
+    let missing = b"missing0\0";
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_BINDTODEVICE as u64,
+                missing.as_ptr() as u64,
+                missing.len() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::ENODEV))
+    );
 }
 
 #[test]
@@ -633,6 +723,24 @@ fn socket_netfilter(ctx: &SyscallCtx<'static>) -> i64 {
     ) {
         SyscallResult::Return(fd) => fd,
         other => panic!("socket(AF_NETLINK, RAW, NETLINK_NETFILTER) failed: {other:?}"),
+    }
+}
+
+fn socket_xfrm(ctx: &SyscallCtx<'static>) -> i64 {
+    match socket_req(
+        NR_SOCKET,
+        [
+            AF_NETLINK as u64,
+            SOCK_RAW | O_CLOEXEC as u64,
+            NETLINK_XFRM as u64,
+            0,
+            0,
+            0,
+        ],
+        ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_NETLINK, RAW, NETLINK_XFRM) failed: {other:?}"),
     }
 }
 

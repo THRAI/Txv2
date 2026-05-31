@@ -327,20 +327,34 @@ pub fn clone_nsproxy(nsproxy: &Cap<NsProxy>) -> Cap<NsProxy> {
 /// Default fork inherits the parent's immutable bundle. `CLONE_NEWIPC`
 /// publishes a replacement bundle with all non-IPC namespace caps shared
 /// and a fresh IPC namespace whose limits are copied from the parent.
+/// `CLONE_NEWNS` clones the current mount namespace table.
 pub fn clone_nsproxy_for_fork(
     nsproxy: &Cap<NsProxy>,
     clone_newipc: bool,
+    clone_newns: bool,
 ) -> Result<Cap<NsProxy>, ZoneError> {
-    if !clone_newipc {
+    if !clone_newipc && !clone_newns {
         return Ok(clone_nsproxy(nsproxy));
     }
 
     let ipc_limits = *nsproxy.ipc_ns.limits.lock();
-    let ipc_ns = sign(IpcNamespace::with_limits(ipc_limits))?;
+    let ipc_ns = if clone_newipc {
+        sign(IpcNamespace::with_limits(ipc_limits))?
+    } else {
+        nsproxy.ipc_ns.clone()
+    };
+    let mnt_ns = if clone_newns {
+        match &nsproxy.mnt_ns {
+            Some(mnt_ns) => Some(mnt_ns.clone_ns()?),
+            None => None,
+        }
+    } else {
+        nsproxy.mnt_ns.clone()
+    };
     sign(NsProxy {
         pid_ns: nsproxy.pid_ns.clone(),
         pid_for_children: nsproxy.pid_for_children.clone(),
-        mnt_ns: nsproxy.mnt_ns.clone(),
+        mnt_ns,
         user_ns: nsproxy.user_ns.clone(),
         cgroup_ns: nsproxy.cgroup_ns.clone(),
         uts_ns: nsproxy.uts_ns.clone(),

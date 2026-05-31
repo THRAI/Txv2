@@ -29,6 +29,7 @@ use crate::net::structure::{Ipv4Address, RecvWireSet, SendRecvFlags, SocketIdent
 use crate::sync::SpinMutex;
 
 pub const NETLINK_NETFILTER: i32 = 12;
+pub const NETLINK_XFRM: i32 = 6;
 
 pub const NLM_F_REQUEST: u16 = 0x0001;
 pub const NLM_F_MULTI: u16 = 0x0002;
@@ -295,6 +296,98 @@ pub fn netlink_netfilter_recv(
         socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
     }
     Ok(reported)
+}
+
+pub fn netlink_xfrm_send(
+    socket: &Cap<SocketIdentity>,
+    bytes: &[u8],
+    cred: Cred,
+) -> Result<usize, Errno> {
+    if socket.kind != SocketKind::NetlinkXfrm {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let payload = socket.acquire_operational().ok_or(Errno::ENOTCONN)?;
+    let raw = payload
+        .raw_netlink_netfilter_socket()
+        .ok_or(Errno::EOPNOTSUPP)?;
+
+    let responses = xfrmnetlink_handle_request(bytes, cred);
+    let mut packet = Vec::new();
+    for response in responses {
+        packet.extend_from_slice(&response);
+    }
+    if !packet.is_empty() {
+        raw.queue_response(packet);
+    }
+    payload.refresh_io_from_raw();
+    if !raw.is_empty() {
+        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+    }
+    Ok(bytes.len())
+}
+
+pub fn netlink_xfrm_recv(
+    socket: &Cap<SocketIdentity>,
+    out: &mut [u8],
+    flags: SendRecvFlags,
+) -> Result<usize, Errno> {
+    if socket.kind != SocketKind::NetlinkXfrm {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let payload = socket.acquire_operational().ok_or(Errno::ENOTCONN)?;
+    let raw = payload
+        .raw_netlink_netfilter_socket()
+        .ok_or(Errno::EOPNOTSUPP)?;
+    let peek = flags.contains(SendRecvFlags::MSG_PEEK);
+    let response = raw.pop_response(peek).ok_or(Errno::EAGAIN)?;
+    let copied = core::cmp::min(out.len(), response.len());
+    out[..copied].copy_from_slice(&response[..copied]);
+    let reported = if flags.contains(SendRecvFlags::MSG_TRUNC) {
+        response.len()
+    } else {
+        copied
+    };
+    payload.refresh_io_from_raw();
+    if !peek && raw.is_empty() {
+        socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
+    }
+    Ok(reported)
+}
+
+fn xfrmnetlink_handle_request(request: &[u8], cred: Cred) -> Vec<Vec<u8>> {
+    const XFRM_MSG_GETSA: u16 = 0x12;
+    const XFRM_MSG_GETPOLICY: u16 = 0x15;
+    const XFRM_MSG_FLUSHSA: u16 = 0x1c;
+    const XFRM_MSG_FLUSHPOLICY: u16 = 0x1d;
+
+    let mut responses = Vec::new();
+    let mut offset = 0usize;
+    while offset < request.len() {
+        if request.len() - offset < NLMSG_HDR_LEN {
+            responses.push(build_error_response(None, Errno::EINVAL));
+            break;
+        }
+        let Some(header) = parse_nlmsg_header(&request[offset..]) else {
+            responses.push(build_error_response(None, Errno::EINVAL));
+            break;
+        };
+        let msg_len = header.len as usize;
+        if msg_len < NLMSG_HDR_LEN || offset.saturating_add(msg_len) > request.len() {
+            responses.push(build_error_response(Some(header), Errno::EINVAL));
+            break;
+        }
+
+        let is_dump = header.flags & NLM_F_DUMP == NLM_F_DUMP;
+        if is_dump || matches!(header.kind, XFRM_MSG_GETSA | XFRM_MSG_GETPOLICY) {
+            responses.push(build_done_message(header.seq, header.pid));
+        } else if matches!(header.kind, XFRM_MSG_FLUSHSA | XFRM_MSG_FLUSHPOLICY) {
+            responses.push(ack_or_error(header, require_net_admin(cred).map(|_| ())));
+        } else {
+            responses.push(build_error_response(Some(header), Errno::EOPNOTSUPP));
+        }
+        offset += align4(msg_len);
+    }
+    responses
 }
 
 pub fn nfnetlink_handle_request(request: &[u8]) -> Vec<Vec<u8>> {
