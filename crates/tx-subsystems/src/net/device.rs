@@ -168,6 +168,10 @@ pub fn net_device_snapshot() -> Vec<&'static NetDeviceRegistration> {
     out
 }
 
+pub fn net_device_registry_len() -> usize {
+    NET_REGISTRY_LEN.load(Ordering::Acquire)
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_net_registry_for_test() {
     let mut idx = 0;

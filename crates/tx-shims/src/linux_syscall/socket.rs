@@ -11,10 +11,10 @@ use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
 use tx_subsystems::net::protocol::loopback_iface;
 use tx_subsystems::net::{
     net_namespace_payload_from_file, netlink_netfilter_recv, netlink_netfilter_send,
-    netlink_route_recv, netlink_route_send_with_netns_resolvers, require_net_raw,
-    socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
-    step_poll_ready, step_poll_wait_token, step_process_loopback_udp, step_recv_kernel_bytes,
-    step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
+    netlink_route_recv, netlink_route_recv_packet, netlink_route_send_with_netns_resolvers,
+    require_net_raw, socket_open_file_from_identity, step_accept, step_bind, step_connect,
+    step_listen, step_poll_ready, step_poll_wait_token, step_process_loopback_udp,
+    step_recv_kernel_bytes, step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
     step_send_udp_loopback_kernel_bytes, step_shutdown, step_socket_close,
     step_socket_open_file_in_namespace, step_tcp_loopback_handshake, step_tcp_loopback_transfer,
     step_unix_socketpair_connect, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address,
@@ -820,13 +820,32 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     }
 
     if is_netlink_socket {
+        if socket.kind == SocketKind::NetlinkRoute {
+            let response = match netlink_route_recv_packet(&socket, flags) {
+                Ok(response) => response,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let copied = core::cmp::min(len.min(NETLINK_RECVMSG_MAX), response.len());
+            if copied > 0 {
+                if let Err(errno) =
+                    bootstrap_copy_to_user(&ctx.aspace, args[1], &response[..copied])
+                {
+                    return SyscallResult::Error(errno_to_i32(errno));
+                }
+            }
+            if let Err(errno) = write_sockaddr_nl(ctx, args[4], args[5]) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            let reported = if flags.contains(SendRecvFlags::MSG_TRUNC) {
+                response.len()
+            } else {
+                copied
+            };
+            return SyscallResult::Return(reported as i64);
+        }
+
         let mut staging = alloc::vec![0; len.min(NETLINK_RECVMSG_MAX)];
-        let result = match socket.kind {
-            SocketKind::NetlinkRoute => netlink_route_recv(&socket, &mut staging, flags),
-            SocketKind::NetlinkNetfilter => netlink_netfilter_recv(&socket, &mut staging, flags),
-            _ => unreachable!(),
-        };
-        let recv = match result {
+        let recv = match netlink_netfilter_recv(&socket, &mut staging, flags) {
             Ok(recv) => recv,
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         };
@@ -2026,4 +2045,22 @@ pub(super) fn maybe_close_socket_file_after_fd_remove(file: &Cap<OpenFile>) {
     };
     let guard = tx_substrate::epoch::guard();
     let _ = step_socket_close(&socket, &guard);
+}
+
+pub(super) fn can_fast_close_stateless_netlink_socket(file: &Cap<OpenFile>) -> bool {
+    if file.retain_count() > 2 {
+        return false;
+    }
+    socket_identity_from_file(file).is_ok_and(|socket| {
+        matches!(
+            socket.kind,
+            SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter
+        )
+    })
+}
+
+pub(super) fn fast_close_stateless_netlink_socket_file(file: &Cap<OpenFile>) {
+    if let Ok(socket) = socket_identity_from_file(file) {
+        let _ = socket.take_payload();
+    }
 }

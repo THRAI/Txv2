@@ -6,18 +6,18 @@ use super::*;
 use super::super::{errno_to_i32, Errno};
 use crate::linux_syscall::{
     AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, EACCES_VALUE, EAGAIN_VALUE, EBADF_VALUE,
-    EFAULT_VALUE, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_IPV6,
-    IPPROTO_TCP, IPPROTO_UDP, IPPROTO_UDPLITE, IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO,
+    EFAULT_VALUE, ENXIO_VALUE, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_IP,
+    IPPROTO_IPV6, IPPROTO_TCP, IPPROTO_UDP, IPPROTO_UDPLITE, IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO,
     IPT_SO_SET_REPLACE, IPV6_ADDRFORM, IP_HDRINCL, IP_RECVERR, NETLINK_EXT_ACK, NETLINK_NETFILTER,
     NETLINK_ROUTE, NR_ACCEPT, NR_BIND, NR_CLOSE, NR_CONNECT, NR_DUP, NR_FCNTL, NR_GETSOCKNAME,
     NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PIPE2, NR_PPOLL, NR_PSELECT6, NR_PSELECT6_TIME64,
     NR_READ, NR_RECVFROM, NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG, NR_SENDMSG, NR_SENDTO,
     NR_SETSOCKOPT, NR_SOCKET, NR_SOCKETPAIR, NR_WRITE, O_CLOEXEC, O_NONBLOCK, O_RDWR,
-    PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR, SIOCGIFFLAGS, SIOCGIFINDEX,
-    SIOCGIFMTU, SIOCGIFTXQLEN, SIOCSIFFLAGS, SIOCSIFMTU, SOCKET_IO_MAX_INLINE, SOL_IPV6,
-    SOL_NETLINK, SOL_PACKET, SOL_SOCKET, SOL_TLS, SO_DONTROUTE, SO_ERROR, SO_PEERCRED, SO_RCVTIMEO,
-    SO_REUSEADDR, SO_SNDBUF, SO_SNDBUFFORCE, SO_TYPE, TCP_MAXSEG, TCP_ULP, TLS_TX, TPACKET_V3,
-    TTY_WRITE_MAX_INLINE,
+    PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR, SIOCGIFCONF, SIOCGIFFLAGS,
+    SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNAME, SIOCGIFTXQLEN, SIOCSIFFLAGS, SIOCSIFMTU,
+    SOCKET_IO_MAX_INLINE, SOL_IPV6, SOL_NETLINK, SOL_PACKET, SOL_SOCKET, SOL_TLS, SO_DONTROUTE,
+    SO_ERROR, SO_PEERCRED, SO_RCVTIMEO, SO_REUSEADDR, SO_SNDBUF, SO_SNDBUFFORCE, SO_TYPE,
+    TCP_MAXSEG, TCP_ULP, TLS_TX, TPACKET_V3, TTY_WRITE_MAX_INLINE,
 };
 use alloc::boxed::Box;
 use alloc::vec;
@@ -54,6 +54,7 @@ const MSG_PEEK: u64 = 0x02;
 const MSG_TRUNC: u64 = 0x20;
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
+const NLMSG_DONE: u16 = 3;
 const NFNL_SUBSYS_NFTABLES: u16 = 10;
 const NFT_MSG_GETTABLE: u16 = 1;
 const NFT_MSG_NEWTABLE: u16 = 0;
@@ -270,6 +271,24 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+fn contains_nlmsg_type(mut bytes: &[u8], kind: u16) -> bool {
+    while bytes.len() >= 16 {
+        let len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        if len < 16 || len > bytes.len() {
+            return false;
+        }
+        if u16::from_le_bytes(bytes[4..6].try_into().unwrap()) == kind {
+            return true;
+        }
+        let aligned = (len + 3) & !3;
+        if aligned > bytes.len() {
+            return false;
+        }
+        bytes = &bytes[aligned..];
+    }
+    false
 }
 
 fn socket_stream(ctx: &SyscallCtx<'static>, type_flags: u64) -> i64 {

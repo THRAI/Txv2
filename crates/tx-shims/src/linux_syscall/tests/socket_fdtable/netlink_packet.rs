@@ -311,7 +311,7 @@ fn dispatch_netlink_route_sendto_recvfrom_returns_dump() {
         SyscallResult::Return(request.len() as i64)
     );
 
-    let recv = socket_req(
+    let recv_len = match socket_req(
         NR_RECVFROM,
         [
             fd as u64,
@@ -322,9 +322,13 @@ fn dispatch_netlink_route_sendto_recvfrom_returns_dump() {
             (&mut recv_addr_len as *mut u32) as u64,
         ],
         &ctx,
-    );
+    ) {
+        SyscallResult::Return(n) if n > 0 => n as usize,
+        other => panic!("recvfrom netlink failed: {other:?}"),
+    };
 
-    assert!(matches!(recv, SyscallResult::Return(n) if n > 0));
+    assert!(contains_bytes(&recv_buf[..recv_len], b"lo\0"));
+    assert!(contains_nlmsg_type(&recv_buf[..recv_len], NLMSG_DONE));
     assert_eq!(
         u16::from_le_bytes([recv_addr[0], recv_addr[1]]),
         AF_NETLINK as u16
@@ -583,6 +587,102 @@ fn dispatch_socket_ioctl_resolves_loopback_ifindex_and_txqlen() {
         SyscallResult::Return(0)
     );
     assert_eq!(i32::from_le_bytes(ifreq[16..20].try_into().unwrap()), 0);
+}
+
+#[test]
+fn dispatch_socket_ioctl_resolves_loopback_ifname_from_index() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let mut ifreq = [0u8; 40];
+    ifreq[16..20].copy_from_slice(&1i32.to_le_bytes());
+
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCGIFNAME as u64,
+                ifreq.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(&ifreq[..3], b"lo\0");
+
+    ifreq.fill(0);
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCGIFNAME as u64,
+                ifreq.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(ENXIO_VALUE)
+    );
+}
+
+#[test]
+fn dispatch_socket_ioctl_enumerates_interfaces_with_siocgifconf() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let mut ifconf = [0u8; 16];
+    let mut ifreqs = [0u8; 80];
+
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCGIFCONF as u64,
+                ifconf.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert!(i32::from_le_bytes(ifconf[0..4].try_into().unwrap()) >= 40);
+
+    ifconf[0..4].copy_from_slice(&(ifreqs.len() as i32).to_le_bytes());
+    ifconf[8..16].copy_from_slice(&(ifreqs.as_mut_ptr() as u64).to_le_bytes());
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCGIFCONF as u64,
+                ifconf.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let written = i32::from_le_bytes(ifconf[0..4].try_into().unwrap()) as usize;
+    assert!(written >= 40);
+    assert_eq!(&ifreqs[..3], b"lo\0");
+    assert_eq!(
+        u16::from_le_bytes(ifreqs[16..18].try_into().unwrap()),
+        AF_INET as u16
+    );
+    assert_eq!(&ifreqs[20..24], &[127, 0, 0, 1]);
 }
 
 #[test]

@@ -119,7 +119,8 @@ pub use protocol::{
     SmoltcpPacketSource, SmoltcpPacketTxSink,
 };
 pub use rtnetlink::{
-    netlink_route_recv, netlink_route_send, netlink_route_send_with_netns_resolver,
+    netlink_route_recv, netlink_route_recv_available, netlink_route_recv_packet,
+    netlink_route_send, netlink_route_send_with_netns_resolver,
     netlink_route_send_with_netns_resolvers, rtnetlink_handle_request,
     rtnetlink_handle_request_with_netns_resolver, rtnetlink_handle_request_with_netns_resolvers,
     NetlinkRouteState, RawNetlinkRouteSocket, AF_NETLINK, NETLINK_ROUTE, NLMSG_DONE, NLMSG_ERROR,

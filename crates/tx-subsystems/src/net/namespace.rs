@@ -12,8 +12,8 @@ use tx_substrate::zone::{
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::admin::NetAdminAuthority;
 use crate::net::device::{
-    net_device_snapshot, BridgeForwardOutcome, BridgeSnapshot, EthernetAddress, NetDeviceKind,
-    NetDeviceRegistration,
+    net_device_registry_len, net_device_snapshot, BridgeForwardOutcome, BridgeSnapshot,
+    EthernetAddress, NetDeviceKind, NetDeviceRegistration,
 };
 use crate::net::execution::{
     step_flush_pending_arp, step_process_device_tx_pending_in_namespace_at,
@@ -68,6 +68,8 @@ pub struct NetNamespacePayload {
     netfilter: SpinMutex<NetfilterState>,
     ipv4_forwarding: AtomicBool,
     pending_ipv4_forwards: SpinMutex<Vec<PendingIpv4Forward>>,
+    link_snapshot_generation: AtomicU64,
+    link_snapshot_cache: SpinMutex<Option<LinkSnapshotCache>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -185,6 +187,13 @@ struct PendingIpv4Forward {
     attempts: u8,
 }
 
+#[derive(Clone)]
+struct LinkSnapshotCache {
+    generation: u64,
+    host_device_count: usize,
+    links: Vec<NetNamespaceLinkInfo>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NetNamespaceForwardOutcome {
     pub forwarded: usize,
@@ -290,6 +299,8 @@ impl NetNamespacePayload {
             netfilter: SpinMutex::new(NetfilterState::new()),
             ipv4_forwarding: AtomicBool::new(false),
             pending_ipv4_forwards: SpinMutex::new(Vec::new()),
+            link_snapshot_generation: AtomicU64::new(0),
+            link_snapshot_cache: SpinMutex::new(None),
         }
     }
 
@@ -314,6 +325,15 @@ impl NetNamespacePayload {
 
     pub(crate) fn netfilter_state(&self) -> &SpinMutex<NetfilterState> {
         &self.netfilter
+    }
+
+    pub(crate) fn invalidate_link_snapshot_cache(&self) {
+        self.link_snapshot_generation.fetch_add(1, Ordering::AcqRel);
+        *self.link_snapshot_cache.lock() = None;
+    }
+
+    pub(crate) fn link_snapshot_generation(&self) -> u64 {
+        self.link_snapshot_generation.load(Ordering::Acquire)
     }
 
     pub fn attach_device(
@@ -363,6 +383,7 @@ impl NetNamespacePayload {
         };
 
         self.remove_device_from_local_bridges(authority, registration);
+        self.invalidate_link_snapshot_cache();
         target.attach_device_link_inner(link)
     }
 
@@ -376,6 +397,7 @@ impl NetNamespacePayload {
         }
         let registration = self.find_device_by_ifindex(ifindex).ok_or(Errno::ENODEV)?;
         self.remove_device_from_local_bridges(authority, registration);
+        self.invalidate_link_snapshot_cache();
         Ok(())
     }
 
@@ -399,6 +421,7 @@ impl NetNamespacePayload {
             devices.remove(idx)
         };
         self.remove_device_from_local_bridges(authority, registration);
+        self.invalidate_link_snapshot_cache();
         self.routes
             .lock()
             .retain(|route| route.oif_name != Some(registration.name));
@@ -436,6 +459,7 @@ impl NetNamespacePayload {
             return Err(Errno::EEXIST);
         }
         self.namespace_devices.lock().push(link);
+        self.invalidate_link_snapshot_cache();
         Ok(())
     }
 
@@ -455,6 +479,21 @@ impl NetNamespacePayload {
     }
 
     pub fn link_snapshot(&self) -> Vec<NetNamespaceLinkInfo> {
+        let generation = self.link_snapshot_generation.load(Ordering::Acquire);
+        let host_device_count = if self.host_devices_visible {
+            net_device_registry_len()
+        } else {
+            0
+        };
+        {
+            let cache = self.link_snapshot_cache.lock();
+            if let Some(cache) = cache.as_ref() {
+                if cache.generation == generation && cache.host_device_count == host_device_count {
+                    return cache.links.clone();
+                }
+            }
+        }
+
         let mut links = Vec::new();
         let devices = self.device_snapshot();
         let bridges = bridge_snapshot_from_devices(&devices);
@@ -488,6 +527,13 @@ impl NetNamespacePayload {
             });
         }
 
+        if self.link_snapshot_generation.load(Ordering::Acquire) == generation {
+            *self.link_snapshot_cache.lock() = Some(LinkSnapshotCache {
+                generation,
+                host_device_count,
+                links: links.clone(),
+            });
+        }
         links
     }
 
@@ -717,6 +763,7 @@ impl NetNamespacePayload {
             .find(|link| link.registration.devt == registration.devt)
         {
             link.is_up = is_up;
+            self.invalidate_link_snapshot_cache();
             return Ok(());
         }
         devices.push(NetNamespaceDeviceLink {
@@ -726,6 +773,7 @@ impl NetNamespacePayload {
             mtu: None,
             is_up,
         });
+        self.invalidate_link_snapshot_cache();
         Ok(())
     }
 
@@ -740,6 +788,7 @@ impl NetNamespacePayload {
         }
         if ifindex == 1 {
             *self.loopback_mtu.lock() = mtu;
+            self.invalidate_link_snapshot_cache();
             return Ok(());
         }
         let registration = self.find_device_by_ifindex(ifindex).ok_or(Errno::ENODEV)?;
@@ -749,6 +798,7 @@ impl NetNamespacePayload {
             .find(|link| link.registration.devt == registration.devt)
         {
             link.mtu = Some(mtu);
+            self.invalidate_link_snapshot_cache();
             return Ok(());
         }
         devices.push(NetNamespaceDeviceLink {
@@ -758,6 +808,7 @@ impl NetNamespacePayload {
             mtu: Some(mtu),
             is_up: true,
         });
+        self.invalidate_link_snapshot_cache();
         Ok(())
     }
 
@@ -779,6 +830,7 @@ impl NetNamespacePayload {
         {
             link.ipv4_addr = ipv4_addr;
             link.ipv4_prefix_len = ipv4_prefix_len;
+            self.invalidate_link_snapshot_cache();
             return Ok(());
         }
         devices.push(NetNamespaceDeviceLink {
@@ -788,6 +840,7 @@ impl NetNamespacePayload {
             mtu: None,
             is_up: true,
         });
+        self.invalidate_link_snapshot_cache();
         Ok(())
     }
 

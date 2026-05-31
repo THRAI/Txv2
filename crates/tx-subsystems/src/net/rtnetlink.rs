@@ -111,9 +111,27 @@ const NUD_FAILED: u16 = 0x20;
 
 const RTNL_DYNAMIC_NET_MAJOR: u32 = 94;
 static NEXT_RTNL_DYNAMIC_MINOR: AtomicU32 = AtomicU32::new(1);
+const GETLINK_DUMP_TEMPLATE_CACHE_LIMIT: usize = 16;
+static GETLINK_DUMP_TEMPLATE_CACHE: SpinMutex<Vec<GetlinkDumpTemplateCacheEntry>> =
+    SpinMutex::new(Vec::new());
+const GETADDR_DUMP_TEMPLATE_CACHE_LIMIT: usize = 16;
+static GETADDR_DUMP_TEMPLATE_CACHE: SpinMutex<Vec<GetaddrDumpTemplateCacheEntry>> =
+    SpinMutex::new(Vec::new());
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NetlinkRouteState;
+
+struct GetlinkDumpTemplateCacheEntry {
+    netns_key: usize,
+    generation: u64,
+    template: Vec<u8>,
+}
+
+struct GetaddrDumpTemplateCacheEntry {
+    netns_key: usize,
+    generation: u64,
+    template: Vec<u8>,
+}
 
 pub struct RawNetlinkRouteSocket {
     rx: SpinMutex<VecDeque<Vec<u8>>>,
@@ -218,14 +236,31 @@ where
         .raw_netlink_route_socket()
         .ok_or(Errno::EOPNOTSUPP)?;
 
-    for response in rtnetlink_handle_request_with_netns_resolvers(
+    if let Some(response) = try_render_fast_dump(&payload.net_namespace(), bytes) {
+        raw.queue_response(response);
+        payload.refresh_io_from_raw();
+        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        return Ok(bytes.len());
+    }
+
+    let responses = rtnetlink_handle_request_with_netns_resolvers(
         &payload.net_namespace(),
         cred,
         bytes,
         resolve_netns_fd,
         resolve_netns_pid,
-    ) {
-        raw.queue_response(response);
+    );
+    if responses.len() == 1 {
+        for response in responses {
+            raw.queue_response(response);
+        }
+    } else if !responses.is_empty() {
+        let len = responses.iter().map(Vec::len).sum();
+        let mut combined = Vec::with_capacity(len);
+        for response in responses {
+            combined.extend_from_slice(&response);
+        }
+        raw.queue_response(combined);
     }
     payload.refresh_io_from_raw();
     if !raw.is_empty() {
@@ -239,6 +274,21 @@ pub fn netlink_route_recv(
     out: &mut [u8],
     flags: SendRecvFlags,
 ) -> Result<usize, Errno> {
+    let response = netlink_route_recv_packet(socket, flags)?;
+    let copied = core::cmp::min(out.len(), response.len());
+    out[..copied].copy_from_slice(&response[..copied]);
+    let reported = if flags.contains(SendRecvFlags::MSG_TRUNC) {
+        response.len()
+    } else {
+        copied
+    };
+    Ok(reported)
+}
+
+pub fn netlink_route_recv_packet(
+    socket: &Cap<SocketIdentity>,
+    flags: SendRecvFlags,
+) -> Result<Vec<u8>, Errno> {
     if socket.kind != SocketKind::NetlinkRoute {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -248,18 +298,25 @@ pub fn netlink_route_recv(
         .ok_or(Errno::EOPNOTSUPP)?;
     let peek = flags.contains(SendRecvFlags::MSG_PEEK);
     let response = raw.pop_response(peek).ok_or(Errno::EAGAIN)?;
-    let copied = core::cmp::min(out.len(), response.len());
-    out[..copied].copy_from_slice(&response[..copied]);
-    let reported = if flags.contains(SendRecvFlags::MSG_TRUNC) {
-        response.len()
-    } else {
-        copied
-    };
     payload.refresh_io_from_raw();
     if !peek && raw.is_empty() {
         socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
     }
-    Ok(reported)
+    Ok(response)
+}
+
+pub fn netlink_route_recv_available(socket: &Cap<SocketIdentity>) -> Result<usize, Errno> {
+    if socket.kind != SocketKind::NetlinkRoute {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let payload = socket.acquire_operational().ok_or(Errno::ENOTCONN)?;
+    let raw = payload
+        .raw_netlink_route_socket()
+        .ok_or(Errno::EOPNOTSUPP)?;
+    if raw.is_empty() {
+        return Err(Errno::EAGAIN);
+    }
+    Ok(raw.recv_available())
 }
 
 pub fn rtnetlink_handle_request(
@@ -417,44 +474,132 @@ fn render_getlink(
         return render_getlink_dump(netns, header);
     }
 
-    let snapshot = netns.network_snapshot();
     let target = match parse_ifinfomsg(payload)
         .and_then(|info| link_target_from_info_or_attrs(netns, &info, &info.attrs))
     {
         Ok(target) => target,
         Err(errno) => return alloc::vec![build_error_response(Some(header), errno)],
     };
+    let links = netns.link_snapshot();
     alloc::vec![build_link_message(
         header.seq,
         header.pid,
         RTM_NEWLINK,
         0,
         &target,
-        &snapshot.links,
+        &links,
     )]
 }
 
 fn render_getlink_dump(netns: &NetNamespacePayload, header: NlMsgHeader) -> Vec<Vec<u8>> {
-    let snapshot = netns.network_snapshot();
-    let mut out = Vec::new();
-    for link in &snapshot.links {
+    let links = netns.link_snapshot();
+    let mut out = Vec::with_capacity(links.len() + 1);
+    for link in &links {
         out.push(build_link_message(
             header.seq,
             header.pid,
             RTM_NEWLINK,
             NLM_F_MULTI,
             link,
-            &snapshot.links,
+            &links,
         ));
     }
     out.push(build_done_message(header.seq, header.pid));
     out
 }
 
+fn try_render_fast_dump(netns: &NetNamespacePayload, request: &[u8]) -> Option<Vec<u8>> {
+    let header = parse_single_nlmsg_header(request)?;
+    if header.flags & NLM_F_DUMP != NLM_F_DUMP {
+        return None;
+    }
+    match header.kind {
+        RTM_GETLINK => Some(render_getlink_dump_cached_combined(netns, header)),
+        RTM_GETADDR => Some(render_getaddr_dump_cached_combined(netns, header)),
+        _ => None,
+    }
+}
+
+fn parse_single_nlmsg_header(request: &[u8]) -> Option<NlMsgHeader> {
+    let header = parse_nlmsg_header(request)?;
+    let msg_len = header.len as usize;
+    if msg_len < NLMSG_HDR_LEN || msg_len > request.len() {
+        return None;
+    }
+    if align4(msg_len) != request.len() {
+        return None;
+    }
+    Some(header)
+}
+
+fn render_getlink_dump_cached_combined(
+    netns: &NetNamespacePayload,
+    header: NlMsgHeader,
+) -> Vec<u8> {
+    let netns_key = netns as *const NetNamespacePayload as usize;
+    let generation = netns.link_snapshot_generation();
+    let template = cached_getlink_dump_template(netns_key, generation).unwrap_or_else(|| {
+        let template = build_getlink_dump_template(netns);
+        store_getlink_dump_template(netns_key, generation, template.clone());
+        template
+    });
+    let mut out = template;
+    patch_dump_seq_pid(&mut out, header.seq, header.pid);
+    out
+}
+
+fn cached_getlink_dump_template(netns_key: usize, generation: u64) -> Option<Vec<u8>> {
+    GETLINK_DUMP_TEMPLATE_CACHE
+        .lock()
+        .iter()
+        .find(|entry| entry.netns_key == netns_key && entry.generation == generation)
+        .map(|entry| entry.template.clone())
+}
+
+fn store_getlink_dump_template(netns_key: usize, generation: u64, template: Vec<u8>) {
+    let mut cache = GETLINK_DUMP_TEMPLATE_CACHE.lock();
+    if let Some(entry) = cache.iter_mut().find(|entry| entry.netns_key == netns_key) {
+        entry.generation = generation;
+        entry.template = template;
+        return;
+    }
+    if cache.len() >= GETLINK_DUMP_TEMPLATE_CACHE_LIMIT {
+        cache.remove(0);
+    }
+    cache.push(GetlinkDumpTemplateCacheEntry {
+        netns_key,
+        generation,
+        template,
+    });
+}
+
+fn build_getlink_dump_template(netns: &NetNamespacePayload) -> Vec<u8> {
+    let links = netns.link_snapshot();
+    let mut out = Vec::with_capacity(links.len() * 128 + align4(NLMSG_HDR_LEN + 4));
+    for link in &links {
+        append_link_message(&mut out, 0, 0, RTM_NEWLINK, NLM_F_MULTI, link, &links);
+    }
+    append_done_message(&mut out, 0, 0);
+    out
+}
+
+fn patch_dump_seq_pid(out: &mut [u8], seq: u32, pid: u32) {
+    let mut offset = 0usize;
+    while out.len().saturating_sub(offset) >= NLMSG_HDR_LEN {
+        let len = read_u32(out, offset) as usize;
+        if len < NLMSG_HDR_LEN || offset.saturating_add(len) > out.len() {
+            return;
+        }
+        out[offset + 8..offset + 12].copy_from_slice(&seq.to_le_bytes());
+        out[offset + 12..offset + 16].copy_from_slice(&pid.to_le_bytes());
+        offset += align4(len);
+    }
+}
+
 fn render_getaddr_dump(netns: &NetNamespacePayload, header: NlMsgHeader) -> Vec<Vec<u8>> {
-    let snapshot = netns.network_snapshot();
+    let links = netns.link_snapshot();
     let mut out = Vec::new();
-    for link in &snapshot.links {
+    for link in &links {
         if link.ipv4_addr.is_some() {
             out.push(build_addr_message(
                 header.seq,
@@ -465,6 +610,57 @@ fn render_getaddr_dump(netns: &NetNamespacePayload, header: NlMsgHeader) -> Vec<
         }
     }
     out.push(build_done_message(header.seq, header.pid));
+    out
+}
+
+fn render_getaddr_dump_cached_combined(
+    netns: &NetNamespacePayload,
+    header: NlMsgHeader,
+) -> Vec<u8> {
+    let netns_key = netns as *const NetNamespacePayload as usize;
+    let generation = netns.link_snapshot_generation();
+    let template = cached_getaddr_dump_template(netns_key, generation).unwrap_or_else(|| {
+        let template = build_getaddr_dump_template(netns);
+        store_getaddr_dump_template(netns_key, generation, template.clone());
+        template
+    });
+    let mut out = template;
+    patch_dump_seq_pid(&mut out, header.seq, header.pid);
+    out
+}
+
+fn cached_getaddr_dump_template(netns_key: usize, generation: u64) -> Option<Vec<u8>> {
+    GETADDR_DUMP_TEMPLATE_CACHE
+        .lock()
+        .iter()
+        .find(|entry| entry.netns_key == netns_key && entry.generation == generation)
+        .map(|entry| entry.template.clone())
+}
+
+fn store_getaddr_dump_template(netns_key: usize, generation: u64, template: Vec<u8>) {
+    let mut cache = GETADDR_DUMP_TEMPLATE_CACHE.lock();
+    if let Some(entry) = cache.iter_mut().find(|entry| entry.netns_key == netns_key) {
+        entry.generation = generation;
+        entry.template = template;
+        return;
+    }
+    if cache.len() >= GETADDR_DUMP_TEMPLATE_CACHE_LIMIT {
+        cache.remove(0);
+    }
+    cache.push(GetaddrDumpTemplateCacheEntry {
+        netns_key,
+        generation,
+        template,
+    });
+}
+
+fn build_getaddr_dump_template(netns: &NetNamespacePayload) -> Vec<u8> {
+    let links = netns.link_snapshot();
+    let mut out = Vec::with_capacity(links.len() * 80 + align4(NLMSG_HDR_LEN + 4));
+    for link in &links {
+        append_addr_message(&mut out, 0, 0, NLM_F_MULTI, link);
+    }
+    append_done_message(&mut out, 0, 0);
     out
 }
 
@@ -596,6 +792,7 @@ where
                 .find_device_by_ifindex(master_ifindex)
                 .ok_or(Errno::ENODEV)?;
             master.ops.bridge_add_port(auth, port)?;
+            netns.invalidate_link_snapshot_cache();
         }
     }
 
@@ -747,7 +944,21 @@ fn build_link_message(
     link: &NetNamespaceLinkInfo,
     all_links: &[NetNamespaceLinkInfo],
 ) -> Vec<u8> {
-    let mut payload = Vec::new();
+    let mut out = Vec::new();
+    append_link_message(&mut out, seq, pid, kind, flags, link, all_links);
+    out
+}
+
+fn append_link_message(
+    out: &mut Vec<u8>,
+    seq: u32,
+    pid: u32,
+    kind: u16,
+    flags: u16,
+    link: &NetNamespaceLinkInfo,
+    all_links: &[NetNamespaceLinkInfo],
+) {
+    let mut payload = Vec::with_capacity(IFINFO_MSG_LEN + 72 + link.name.len());
     payload.push(AF_UNSPEC);
     payload.push(0);
     payload.extend_from_slice(&arphrd_for_link(link).to_le_bytes());
@@ -772,19 +983,44 @@ fn build_link_message(
         push_attr_string(nested, IFLA_INFO_KIND, link_kind_name(link.kind));
     });
 
-    build_nlmsg(kind, flags, seq, pid, &payload)
+    append_nlmsg(out, kind, flags, seq, pid, &payload);
 }
 
 fn build_addr_message(seq: u32, pid: u32, flags: u16, link: &NetNamespaceLinkInfo) -> Vec<u8> {
     let Some(addr) = link.ipv4_addr else {
         return build_done_message(seq, pid);
     };
+    let mut out = Vec::new();
+    append_addr_message_with_addr(&mut out, seq, pid, flags, link, addr);
+    out
+}
+
+fn append_addr_message(
+    out: &mut Vec<u8>,
+    seq: u32,
+    pid: u32,
+    flags: u16,
+    link: &NetNamespaceLinkInfo,
+) {
+    if let Some(addr) = link.ipv4_addr {
+        append_addr_message_with_addr(out, seq, pid, flags, link, addr);
+    }
+}
+
+fn append_addr_message_with_addr(
+    out: &mut Vec<u8>,
+    seq: u32,
+    pid: u32,
+    flags: u16,
+    link: &NetNamespaceLinkInfo,
+    addr: Ipv4Address,
+) {
     let mut payload = vec![AF_INET, link.ipv4_prefix_len.unwrap_or(32), 0, 0];
     payload.extend_from_slice(&link.ifindex.to_le_bytes());
     push_attr(&mut payload, IFA_ADDRESS, &addr.octets());
     push_attr(&mut payload, IFA_LOCAL, &addr.octets());
     push_attr_string(&mut payload, IFA_LABEL, link.name);
-    build_nlmsg(RTM_NEWADDR, flags, seq, pid, &payload)
+    append_nlmsg(out, RTM_NEWADDR, flags, seq, pid, &payload);
 }
 
 fn build_route_message(
@@ -1135,18 +1371,27 @@ fn validate_ifname(name: &str) -> Result<(), Errno> {
 fn build_nlmsg(kind: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) -> Vec<u8> {
     let msg_len = NLMSG_HDR_LEN + payload.len();
     let mut out = Vec::with_capacity(align4(msg_len));
+    append_nlmsg(&mut out, kind, flags, seq, pid, payload);
+    out
+}
+
+fn append_nlmsg(out: &mut Vec<u8>, kind: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) {
+    let msg_len = NLMSG_HDR_LEN + payload.len();
     out.extend_from_slice(&(msg_len as u32).to_le_bytes());
     out.extend_from_slice(&kind.to_le_bytes());
     out.extend_from_slice(&flags.to_le_bytes());
     out.extend_from_slice(&seq.to_le_bytes());
     out.extend_from_slice(&pid.to_le_bytes());
     out.extend_from_slice(payload);
-    pad_to_align4(&mut out);
-    out
+    pad_to_align4(out);
 }
 
 fn build_done_message(seq: u32, pid: u32) -> Vec<u8> {
     build_nlmsg(NLMSG_DONE, NLM_F_MULTI, seq, pid, &0i32.to_le_bytes())
+}
+
+fn append_done_message(out: &mut Vec<u8>, seq: u32, pid: u32) {
+    append_nlmsg(out, NLMSG_DONE, NLM_F_MULTI, seq, pid, &0i32.to_le_bytes());
 }
 
 fn ack_or_error(header: NlMsgHeader, result: Result<(), Errno>) -> Vec<u8> {
@@ -1198,10 +1443,12 @@ fn push_nested_attr(out: &mut Vec<u8>, kind: u16, build: impl FnOnce(&mut Vec<u8
 }
 
 fn push_attr_string(out: &mut Vec<u8>, kind: u16, value: &str) {
-    let mut bytes = Vec::with_capacity(value.len() + 1);
-    bytes.extend_from_slice(value.as_bytes());
-    bytes.push(0);
-    push_attr(out, kind, &bytes);
+    let len = NLA_HDR_LEN + value.len() + 1;
+    out.extend_from_slice(&(len as u16).to_le_bytes());
+    out.extend_from_slice(&kind.to_le_bytes());
+    out.extend_from_slice(value.as_bytes());
+    out.push(0);
+    pad_to_align4(out);
 }
 
 fn push_attr_u32(out: &mut Vec<u8>, kind: u16, value: u32) {
