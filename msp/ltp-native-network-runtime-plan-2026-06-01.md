@@ -173,3 +173,55 @@ tmpfs regular file 的 `materialise_rnode` 会复用 inode 内已有的
 PPN 更保守。预期收益是减少重复 ext4 读盘和 interpreter/helper 的 ELF/header
 读取成本；如果 focused witness 仍慢，再继续看 stack/partial-page population
 和 exec 后缺页数量。
+
+## 2026-06-01 ext4 cache 执行结果
+
+已实现两层通用 ext4 热路径优化：
+
+- `Ext4FsInstance` 现在有固定容量 file-page byte cache；`fetch_page` 先查
+  `(inode, page_index)`，miss 才走 `Ext4Pager::read_page`。
+- ext4 regular file `materialise_rnode` 现在复用 inode 级
+  `PageContainer`，同一个 executable/interpreter 多次 materialise 后能共享
+  已驻留页。
+- `create_inode`、`mkdir`、`unlink`、`rmdir`、`rename` 覆盖目标、以及
+  `serialize_inode_meta` 对相关 inode 做保守 cache 失效。
+
+主机侧验证：
+
+```sh
+cargo fmt --check
+cargo test -p tx-ext4 --lib -- --test-threads=1
+cargo check -p tx-ext4
+cargo check -p tx-shims
+cargo xtask build --target rv64-qemu
+cargo xtask oscomp submit --target rv64-qemu --submit target/oscomp/submit
+```
+
+focused QEMU 结果：
+
+```sh
+timeout 240s make oscomp-qemu-rv64 \
+  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:ipneigh01_ip \
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-ext4-pagecache-240s.txt
+
+timeout 300s make oscomp-qemu-rv64 \
+  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:ipneigh01_ip \
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-ext4-pc-cache-300s.txt
+```
+
+两次都正常启动、进入 native LTP、完成 network setup 并到达：
+
+```text
+stress auto-creation ARP cache entry deleted with 'ip' 50 times
+```
+
+但仍在 stress loop 后 host timeout，没有 PASS。结论：ext4 hot page/cache
+是值得保留的通用运行时优化，但不是 `ipneigh01_ip` 的决定性瓶颈。当前 blocker
+仍然是 BusyBox shell pipeline / repeated exec / wait-pipe-fd churn，下一步应该
+做更大的 argv-aware `execve`/shell pipeline runtime 设计，而不是继续猜 ext4
+读路径。
+
+另一个验证情况：`cargo -q xtask unit` 目前仍有两个 `tx-shims` host-test 红项，
+分别是 `dispatch_kill_negative_pgid_succeeds` 的 zombie 断言和
+`dispatch_ping_socket_sendto_recvfrom_loopback_echo_reply` 的 1024 poll 未完成；
+这两个单测单独重跑也失败，和本次 ext4 改动没有直接交集。

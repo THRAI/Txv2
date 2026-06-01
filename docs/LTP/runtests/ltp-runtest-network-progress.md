@@ -416,6 +416,18 @@ showed about `3251` syscalls after the stress marker in the 240s window, led by
 and `execve`; post-stress page faults were also high. This keeps the blocker in
 process/shell/exec runtime, not network neighbor semantics.
 
+2026-06-01 ext4 hot-cache follow-up: the sync ext4 backend now has a hot
+file-page byte cache and reuses regular-file `PageContainer`s per inode. This
+is a general runtime improvement for repeated exec/interpreter page faults, and
+host tests pin both the byte-cache hit and shared-container behavior. It still
+does not close `ipneigh01_ip`: focused witnesses
+`target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-ext4-pagecache-240s.txt` and
+`target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-ext4-pc-cache-300s.txt` reach the
+same `stress auto-creation ARP cache entry deleted with 'ip' 50 times` marker
+and then host-time out. The remaining blocker stays in BusyBox shell pipelines,
+repeated exec/page-fault cost, and wait/pipe/fd churn rather than ext4 cold
+read or network neighbor semantics.
+
 ## Next native network step
 
 The focused command/control probes, grouped ping witnesses, and `arping01` are

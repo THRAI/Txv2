@@ -6,10 +6,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::adapter::step_engine::{Cap, PayloadCap, SpinMutex};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use tx_ext4_format::pager::{BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo};
+use tx_ext4_format::pager::{
+    BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, Page4K, BLOCK_SIZE,
+};
 use tx_ext4_format::Ext4FormatError;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
+use tx_subsystems::page_backed::{PageContainer, PageContainerKind};
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
@@ -21,6 +24,8 @@ pub(crate) struct Ext4FsInstance<I> {
     lookup_cache: SpinMutex<LookupCache>,
     dir_cache: SpinMutex<DirCache>,
     inode_meta_cache: SpinMutex<InodeMetaCache>,
+    file_page_cache: SpinMutex<FilePageCache>,
+    file_container_cache: SpinMutex<FileContainerCache>,
     pub(crate) mount_pin: SpinMutex<Option<MountPayloadPin>>,
     /// Per-mount read-only flag. When `true`, every mutating
     /// `FsOps` method (`create_inode`, `mkdir`, `unlink`, …) and
@@ -38,6 +43,8 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             lookup_cache: SpinMutex::new(LookupCache::empty()),
             dir_cache: SpinMutex::new(DirCache::empty()),
             inode_meta_cache: SpinMutex::new(InodeMetaCache::empty()),
+            file_page_cache: SpinMutex::new(FilePageCache::empty()),
+            file_container_cache: SpinMutex::new(FileContainerCache::empty()),
             mount_pin: SpinMutex::new(None),
             read_only: AtomicBool::new(read_only),
         }))
@@ -115,6 +122,68 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         }
         out[..count].copy_from_slice(&entries[..count]);
         Ok(count)
+    }
+
+    pub(crate) fn read_page_cached(
+        &self,
+        inode: InodeNo,
+        file_page_index: u64,
+        out: &mut Page4K,
+    ) -> Result<(), Errno> {
+        if self.file_page_cache.lock().get(inode, file_page_index, out) {
+            return Ok(());
+        }
+
+        let mut page: Page4K = [0; BLOCK_SIZE];
+        self.with_pager(|pager| {
+            pager.read_page(inode, file_page_index, &mut page)?;
+            Ok(())
+        })?;
+        self.file_page_cache
+            .lock()
+            .insert(inode, file_page_index, &page);
+        out.copy_from_slice(&page);
+        Ok(())
+    }
+
+    pub(crate) fn invalidate_file_page_cache_for(&self, inode: InodeNo) {
+        self.file_page_cache.lock().invalidate_inode(inode);
+        self.file_container_cache
+            .lock()
+            .invalidate(fs_object_id(inode));
+    }
+
+    pub(crate) fn regular_file_container_cached(
+        &self,
+        fs_object_id: FsObjectId,
+        size_bytes: u64,
+        mount: MountPayloadPin,
+    ) -> Result<Cap<PageContainer>, Errno> {
+        const PAGE_SIZE: u64 = 4096;
+        // Keep the long-standing ext4 behavior: empty files get one
+        // page of write capacity even though their visible size is 0.
+        let page_count = size_bytes.div_ceil(PAGE_SIZE).max(1);
+        if let Some(pc) = self
+            .file_container_cache
+            .lock()
+            .get(fs_object_id, page_count, size_bytes)
+        {
+            return Ok(pc);
+        }
+
+        let pc = PageContainer::new_cap(
+            PageContainerKind::File {
+                mount,
+                fs_object_id,
+            },
+            page_count,
+        )
+        .map_err(|_| Errno::ENOMEM)?;
+        pc.set_size_bytes(size_bytes);
+        self.file_container_cache
+            .lock()
+            .insert(fs_object_id, page_count, size_bytes, pc.clone());
+        Ok(pc)
     }
 
     pub(crate) fn invalidate_lookup_cache_for(&self, parent: InodeNo) {
@@ -325,6 +394,174 @@ impl InodeMetaCacheEntry {
             last_used: 0,
         }
     }
+}
+
+const FILE_PAGE_CACHE_ENTRIES: usize = 128;
+
+struct FilePageCache {
+    clock: u64,
+    entries: Vec<FilePageCacheEntry>,
+}
+
+impl FilePageCache {
+    fn empty() -> Self {
+        Self {
+            clock: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    fn get(&mut self, inode: InodeNo, page_index: u64, out: &mut Page4K) -> bool {
+        let Some(index) = self.entries.iter().position(|entry| {
+            entry.valid && entry.inode == inode && entry.page_index == page_index
+        }) else {
+            return false;
+        };
+        self.clock = self.clock.wrapping_add(1);
+        let entry = &mut self.entries[index];
+        entry.last_used = self.clock;
+        out.copy_from_slice(&entry.page);
+        true
+    }
+
+    fn insert(&mut self, inode: InodeNo, page_index: u64, page: &Page4K) {
+        self.clock = self.clock.wrapping_add(1);
+        let victim = self
+            .entries
+            .iter()
+            .position(|entry| {
+                !entry.valid || (entry.inode == inode && entry.page_index == page_index)
+            })
+            .unwrap_or_else(|| {
+                if self.entries.len() < FILE_PAGE_CACHE_ENTRIES {
+                    self.entries.push(FilePageCacheEntry::empty());
+                    self.entries.len() - 1
+                } else {
+                    self.entries
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, entry)| entry.last_used)
+                        .map(|(index, _)| index)
+                        .unwrap_or(0)
+                }
+            });
+        self.entries[victim] = FilePageCacheEntry {
+            valid: true,
+            inode,
+            page_index,
+            page: *page,
+            last_used: self.clock,
+        };
+    }
+
+    fn invalidate_inode(&mut self, inode: InodeNo) {
+        for entry in &mut self.entries {
+            if entry.valid && entry.inode == inode {
+                entry.valid = false;
+            }
+        }
+    }
+}
+
+struct FilePageCacheEntry {
+    valid: bool,
+    inode: InodeNo,
+    page_index: u64,
+    page: Page4K,
+    last_used: u64,
+}
+
+impl FilePageCacheEntry {
+    fn empty() -> Self {
+        Self {
+            valid: false,
+            inode: InodeNo::new(0),
+            page_index: 0,
+            page: [0; BLOCK_SIZE],
+            last_used: 0,
+        }
+    }
+}
+
+const FILE_CONTAINER_CACHE_ENTRIES: usize = 128;
+
+struct FileContainerCache {
+    clock: u64,
+    entries: Vec<FileContainerCacheEntry>,
+}
+
+impl FileContainerCache {
+    fn empty() -> Self {
+        Self {
+            clock: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    fn get(
+        &mut self,
+        fs_object_id: FsObjectId,
+        page_count: u64,
+        size_bytes: u64,
+    ) -> Option<Cap<PageContainer>> {
+        let index = self.entries.iter().position(|entry| {
+            entry.fs_object_id == fs_object_id && entry.page_count == page_count
+        })?;
+        self.clock = self.clock.wrapping_add(1);
+        let entry = &mut self.entries[index];
+        entry.last_used = self.clock;
+        entry.pc.set_size_bytes(size_bytes);
+        Some(entry.pc.clone())
+    }
+
+    fn insert(
+        &mut self,
+        fs_object_id: FsObjectId,
+        page_count: u64,
+        size_bytes: u64,
+        pc: Cap<PageContainer>,
+    ) {
+        self.clock = self.clock.wrapping_add(1);
+        pc.set_size_bytes(size_bytes);
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.fs_object_id == fs_object_id)
+        {
+            entry.page_count = page_count;
+            entry.pc = pc;
+            entry.last_used = self.clock;
+            return;
+        }
+        if self.entries.len() >= FILE_CONTAINER_CACHE_ENTRIES {
+            if let Some((victim, _)) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+            {
+                self.entries.remove(victim);
+            }
+        }
+        self.entries.push(FileContainerCacheEntry {
+            fs_object_id,
+            page_count,
+            pc,
+            last_used: self.clock,
+        });
+    }
+
+    fn invalidate(&mut self, fs_object_id: FsObjectId) {
+        self.entries
+            .retain(|entry| entry.fs_object_id != fs_object_id);
+    }
+}
+
+struct FileContainerCacheEntry {
+    fs_object_id: FsObjectId,
+    page_count: u64,
+    pc: Cap<PageContainer>,
+    last_used: u64,
 }
 
 const LOOKUP_CACHE_ENTRIES: usize = 64;
