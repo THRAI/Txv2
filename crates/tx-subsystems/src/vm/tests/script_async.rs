@@ -811,7 +811,7 @@ fn fork_aspace_demotes_parent_pmap_for_private_entries_only() {
         .lookup(crate::vm::UserVirtAddr(0x26000).containing_page())
         .is_some());
 
-    let _child =
+    let child =
         crate::vm::AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent).expect("fork");
 
     assert_eq!(
@@ -831,6 +831,22 @@ fn fork_aspace_demotes_parent_pmap_for_private_entries_only() {
             .prot,
         Prot::READ_WRITE,
         "MAP_SHARED PTE should keep its original protection"
+    );
+    assert_eq!(
+        child
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x24000).containing_page())
+            .expect("child should inherit demoted private resident PTE")
+            .prot,
+        Prot::READ,
+        "child inherited private PTE must be read-only for CoW"
+    );
+    assert!(
+        child
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x26000).containing_page())
+            .is_none(),
+        "shared writable PTEs should still refault through the recipe path"
     );
 }
 
@@ -952,9 +968,18 @@ fn fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow() {
         Prot::READ,
         "fork must demote parent private PTE to read-only"
     );
+    assert_eq!(
+        child
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x40000).containing_page())
+            .expect("child should inherit the demoted private PTE")
+            .prot,
+        Prot::READ,
+        "child inherited private PTE must be read-only"
+    );
 
     // Parent re-reads after fork: read fault should consult vme.private
-    // (SharedCow hit) and install RO PTE pointing at the shared frame.
+    // (SharedCow hit if a refault is needed) and observe the pre-fork frame.
     // Result: parent must still see its own pattern.
     let guard = crate::vm::adapter::step_engine::guard();
     let mut parent_post_fork = [0u8; 16];
@@ -974,9 +999,8 @@ fn fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow() {
     );
 
     // Child reads at the same VA: child's vme.private got the SharedCow
-    // entry via fork_share, so the read fault should HIT and install
-    // RO PTE pointing at the same shared frame. Result: child must see
-    // parent's pre-fork pattern.
+    // entry via fork_share, and fork copied the resident RO PTE into the
+    // child pmap. Result: child must see parent's pre-fork pattern.
     let mut child_read = [0u8; 16];
     let copied = child.copy_from_user(&mut child_read, tx_hal::UserPtr::new(user_addr), &guard);
     assert_eq!(

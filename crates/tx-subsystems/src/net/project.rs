@@ -52,6 +52,36 @@ pub fn proc_net_arp_snapshot_zero_text(ifaces: &[&EtherIface]) -> String {
     proc_net_arp_snapshot_text(ifaces, Instant::ZERO)
 }
 
+pub fn proc_net_neigh_snapshot_text(ifaces: &[&EtherIface], now: Instant) -> String {
+    let mut out = String::new();
+    for iface in ifaces {
+        for entry in iface.arp_snapshot(now) {
+            let mac = entry
+                .mac
+                .map(format_mac)
+                .unwrap_or_else(|| String::from("00:00:00:00:00:00"));
+            let nud = match entry.state {
+                ArpSnapshotState::Resolved => "REACHABLE",
+                ArpSnapshotState::Pending => "INCOMPLETE",
+                ArpSnapshotState::Failed => "FAILED",
+            };
+            let _ = writeln!(
+                out,
+                "{} dev {} lladdr {} {}",
+                format_ipv4(entry.ip),
+                entry.iface_name,
+                mac,
+                nud
+            );
+        }
+    }
+    out
+}
+
+pub fn proc_net_neigh_snapshot_text_for_namespace(netns: &NetNamespacePayload) -> String {
+    proc_net_neigh_snapshot_text(&netns.ether_ifaces_snapshot(), Instant::ZERO)
+}
+
 pub fn proc_net_dev_snapshot_text(ifaces: &[&EtherIface]) -> String {
     let mut out = String::new();
     push_proc_net_dev_header(&mut out);

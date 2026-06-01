@@ -23,6 +23,7 @@ pub mod pipe;
 pub mod process;
 pub mod reactor_affinity;
 pub mod reactor_submit;
+pub mod runtime_profile;
 pub mod shared;
 pub mod signal;
 pub mod signalfd;

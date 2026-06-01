@@ -51,6 +51,11 @@ fn proc_net_arp_projection_renders_resolved_pending_and_failed_entries() {
     assert!(text.contains("192.0.2.30"));
     assert!(text.contains("failed"));
     assert!(text.contains("virtp0"));
+
+    let neigh = crate::net::proc_net_neigh_snapshot_text(&[&iface], now);
+    assert!(neigh.contains("192.0.2.10 dev virtp0 lladdr 02:00:00:00:00:10 REACHABLE"));
+    assert!(neigh.contains("192.0.2.20 dev virtp0 lladdr 00:00:00:00:00:00 INCOMPLETE"));
+    assert!(neigh.contains("192.0.2.30 dev virtp0 lladdr 00:00:00:00:00:00 FAILED"));
 }
 
 #[test]
