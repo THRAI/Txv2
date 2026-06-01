@@ -25,6 +25,9 @@ Use this skill when test runtime itself is part of the problem. Pair it with
 - For long timeout investigations, maintain an ordered operation ledger before
   running more experiments. Put scratch ledgers under `msp/debug-logs/` unless
   the user asks for a tracked artifact.
+- After each code/config/harness experiment, append one compact modification
+  row to the ledger before starting the next experiment. Keep it short enough
+  to scan: change, evidence, decision, and next owner.
 - Commit or otherwise isolate useful evidence-backed changes before starting a
   broader experiment. Stage explicit paths only; do not include local `msp/`
   debug notes unless the user asks.
@@ -58,6 +61,9 @@ than one experiment:
   `msp/debug-logs/YYYY-MM-DD-<case>-operation-ledger.md`.
 - Record each significant action as one numbered row:
   `time/order`, `action`, `files/logs`, `result`, `decision`, `next`.
+- Record attempted modifications separately from evidence anchors when the
+  investigation has many patches. Use one row per tried modification, including
+  reverted or rejected experiments.
 - Mark each experiment as `keep`, `revert`, `reject`, or `needs one more
   measurement` before starting another experiment in the same area.
 - Preserve same-metric comparisons: phase, timeout, trace mode, loop count,
@@ -74,6 +80,14 @@ Minimal row shape:
 | # | Action | Evidence | Result | Decision | Next |
 | - | ------ | -------- | ------ | -------- | ---- |
 | 1 | Ran focused witness | `target/oscomp/foo.txt` | timed out after marker | reject current hypothesis | trace post-stress |
+```
+
+Compact modification row shape:
+
+```md
+| # | Modification | Evidence | Decision |
+| - | ------------ | -------- | -------- |
+| M1 | Removed unconditional fork yield | `target/oscomp/foo.txt`: still timed out | reject/revert |
 ```
 
 ## Stop Rules
