@@ -124,6 +124,19 @@ trace 覆盖到了 stress loop。循环内的粗略统计是：
 小进程执行成本。一个 `wait4` post-reap yield batching 实验在 host wait4 tests
 中通过，但 300s/420s focused witness 仍没有 PASS，因此没有保留。
 
+后续又试了一个更窄的 `pselect`/`ppoll` 实验：socket wait token 继续保留
+pre-wait yield，纯 pipe/eventfd/timerfd wait token 直接进入 wait，目标是减少
+`ip neigh show | grep` 管道里的额外调度轮。host 侧 `tcp_options_poll` 和
+`fd_ops_wave3` 都通过，但 focused witness：
+
+```sh
+timeout 420s make oscomp-qemu-rv64 \
+  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:ipneigh01_ip \
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-pipewait-420s.txt
+```
+
+仍然进入 stress loop 后 host timeout。这个改动没有保留。
+
 下一步不要继续堆 timeout。要么设计更通用的 shell/exec/page-fault 优化，要么
 明确做“IPv4-only native network setup 不跑无关 IPv6 初始化”的开发加速路径，
 但 IPv6 覆盖必须继续由 `net.ipv6*` 单独证明。
