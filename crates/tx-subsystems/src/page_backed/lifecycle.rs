@@ -260,6 +260,9 @@ pub fn step_truncate(
         pc.withdraw_cached_pages_from(first_drop);
         zero_partial_eof_tail(pc, new_size);
     }
+    if new_size != old_size {
+        pc.bump_content_epoch();
+    }
 
     if fs_advanced {
         V3::continue_with(PageProgress::EMPTY)
@@ -326,6 +329,7 @@ pub fn step_fallocate(
     };
 
     pc.set_size_bytes(new_size);
+    pc.bump_content_epoch();
 
     if fs_advanced {
         V3::continue_with(PageProgress::EMPTY)

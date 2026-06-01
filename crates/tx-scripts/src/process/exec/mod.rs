@@ -6,6 +6,7 @@
 //! (`script.rs::exec_script`, Phase 5) that wires them with the
 //! kernel-side VM / process / VFS / signal seams.
 
+mod exec_cache;
 pub mod loader;
 pub mod script;
 pub mod stack;

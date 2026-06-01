@@ -15,7 +15,7 @@ syscall cases from `runtest/syscalls`.
 | Module | Entries | Latest judge | Kernel-side status | Latest log |
 | --- | ---: | ---: | --- | --- |
 | `net.ipv6_lib` | 6 | `76/77` | Phase 1 kernel-side baseline complete; only `hopopt` is a musl test-image/libc table miss | `target/oscomp/ltp-net-ipv6-lib-final-lhost-hopopt-known-120s.txt` |
-| `net.tcp_cmds` | 17 | filtered `netstat`: `5/5`; filtered `iproute`: `6/6`; grouped `ping01+ping02`: `20/20`; filtered `arping01`: `1/1`; filtered `ipneigh01_{arp,ip}`: semantic blockers closed, now runtime timeout in 50-loop stress | command/procfs/netns baseline has clean witnesses; IPv4 ICMP and cooked AF_PACKET ARP pass; legacy ARP ioctls and `ip neigh` projection now reach the repeated delete/relearn loop, but native helper/process runtime exceeds LTP's 5 minute per-case timeout | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-proc-neigh-show-660s.txt` |
+| `net.tcp_cmds` | 17 | filtered `netstat`: `5/5`; filtered `iproute`: `6/6`; grouped `ping01+ping02`: `20/20`; filtered `arping01`: `1/1`; filtered `ipneigh01_{arp,ip}`: semantic blockers closed, now runtime timeout in 50-loop stress | command/procfs/netns baseline has clean witnesses; IPv4 ICMP and cooked AF_PACKET ARP pass; legacy ARP ioctls and `ip neigh` projection now reach the repeated delete/relearn loop. `/proc/net/tx_neigh` removes the former `/proc/net/arp` shell parsing hotspot, and `/proc/net/tx_neigh_ctl` removes the `ip neigh del` -> BusyBox `arp -d` fallback, but native helper/process runtime still exceeds the useful focused timeout | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-tx-neigh-ctl-openok-profile-285s.txt` |
 | other `net.*` / `net_stress.*` / `can` | many | not started | defer until command/procfs/rtnetlink/netns baseline is stable | - |
 
 Latest full IPv6 command:
@@ -172,6 +172,15 @@ timeout 660s make oscomp-qemu-rv64 \
   OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-proc-neigh-show-660s.txt
 ```
 
+Latest focused runtime profile:
+
+```sh
+timeout 285s make oscomp-qemu-rv64 \
+  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:ipneigh01_ip \
+  LTP_TRACE_RUNTIME=1 \
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-tx-neigh-ctl-openok-profile-285s.txt
+```
+
 Latest `ipneigh01_ip` result:
 
 ```text
@@ -181,9 +190,10 @@ If you are running on slow machine, try exporting LTP_TIMEOUT_MUL > 1
 ```
 
 Interpretation: the former `TFAIL: ARP entry '10.0.0.1' not listed` blocker is
-closed. `/tx-ltp/bin/ip neigh show` now reports the dynamic ARP state from
-`/proc/net/arp`, and `ip neigh del` delegates deletion into the same ARP state
-via the BusyBox `arp` applet before returning success.
+closed. `/tx-ltp/bin/ip neigh show` now reports dynamic neighbor state from the
+kernel-owned `/proc/net/tx_neigh` projection, and `ip neigh del` deletes IPv4
+neighbor state through `/proc/net/tx_neigh_ctl` before returning success. The
+latest profile shows no `neigh-del arp-d-begin` fallback markers.
 
 ## `net.ipv6_lib` case ledger
 
@@ -428,12 +438,51 @@ and then host-time out. The remaining blocker stays in BusyBox shell pipelines,
 repeated exec/page-fault cost, and wait/pipe/fd churn rather than ext4 cold
 read or network neighbor semantics.
 
+2026-06-01 argv-aware runtime follow-up: added
+`tools/ltp-runtime-trace-summary.py` and trace-only `/tx-ltp/bin/ip` phase
+markers for `neigh show` and `neigh del`. A refreshed focused trace,
+`target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-phase-argvtrace-240s.txt`, reached
+the stress loop and split the post-stress command costs by argv. In that window
+`ping` was effectively 0s, while `ip neigh show` was 3 calls / 12s total,
+`grep` was 7s total, `ip neigh del` was 3s, and the loop's `seq` helpers were
+visible as 1s applet invocations. The internal `ip` phase markers show
+`/tmp/tx-ip-neigh` state reading and `/proc/net/arp` reading each at roughly
+1s granularity; there is no evidence of a large ARP/neigh table scan. A generic
+exec/ELF parse cache, resident PageBacked read fast path, socket-only loopback
+drive in `ppoll`/`pselect6`, and non-vfork clone no-yield improvement are in
+place, but the witness still host-times out. The remaining blocker is repeated
+shell/BusyBox applet startup plus pipe/grep/wait/read scheduling cost.
+
+2026-06-01 neighbor projection/control follow-up: added `/proc/net/tx_neigh`
+as a kernel-owned, one-line-per-neighbor projection in the current caller
+network namespace, and changed `/tx-ltp/bin/ip neigh show` to prefer it over
+the previous shell `while read` parsing of `/proc/net/arp`. This removes the
+trace-proven hot span that had `+426` syscalls and `+168`
+`ppoll`/one-byte-read events inside a single `ip neigh show`. Added
+`/proc/net/tx_neigh_ctl` as a small write control file for IPv4 neighbor
+deletion, and changed `ip neigh del <addr> dev <iface>` to use it without
+falling back to BusyBox `arp -d` when the control file opens successfully.
+
+The focused profile
+`target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-tx-neigh-ctl-openok-profile-285s.txt`
+still host-times out after entering the stress loop, but the shape has changed:
+post-stress `ip neigh show` reports `read<=1=0`, `ip neigh del` emits
+`tx-ctl-begin/end` without `arp-d-begin`, and two measured stress iterations
+take about 20s then 11s. By the stress marker, setup has already spent about
+22.9k syscalls, 48.0k faults, 527 `execve`, 967 `wait4`, and 300 `pipe2`
+calls. This is enough to rule out a neighbor-table linear scan as the current
+dominant bottleneck. The next speed work must target general userspace process
+startup/page-fault/wait/pipe churn.
+
 ## Next native network step
 
 The focused command/control probes, grouped ping witnesses, and `arping01` are
 clean, and `ipneigh01_{arp,ip}` now reaches its stress loop. The immediate next
-step is a small design for native LTP process/runtime reduction around BusyBox
-shell pipelines and exec fault cost, then rerun the same two neighbor witnesses.
+step is a targeted native LTP runtime reduction around repeated BusyBox/shell
+`execve`, page faults, `wait4`, `pipe2`, `dup3`, `close`, and remaining grep
+pipeline churn, then rerun the same two neighbor witnesses. Network datapath or
+neighbor-table refactors are not the right next move unless a later trace
+contradicts the current counter data.
 
 Recommended confirmation target after a speed change:
 
