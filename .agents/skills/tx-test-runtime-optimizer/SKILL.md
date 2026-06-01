@@ -1,6 +1,6 @@
 ---
 name: tx-test-runtime-optimizer
-description: Use when txKernel tests, LTP/OSComp/QEMU runs, cargo tests, or benchmark witnesses are slow, timing out, silently hanging, taking much longer than expected, or when the user asks whether a timeout is caused by kernel code, network/filesystem/process structure, harness setup, cold reads, linear scans, or other performance bottlenecks. Guides Codex to bound the run, preserve logs, measure where time is spent, classify the bottleneck, optimize only evidence-backed general behavior, and record the result.
+description: Use when txKernel tests, LTP/OSComp/QEMU runs, cargo tests, or benchmark witnesses are slow, timing out, silently hanging, taking much longer than expected, or when the user asks whether a timeout is caused by kernel code, network/filesystem/process structure, harness setup, cold reads, linear scans, userspace helper churn, or other performance bottlenecks. Also use when resuming prior timeout debugging with existing logs or when the user is worried Codex is rerunning low-value experiments. Guides Codex to read prior evidence first, bound the run, preserve logs, measure where time is spent, classify the bottleneck, optimize only evidence-backed general behavior, commit useful work before risky experiments, and record the result.
 ---
 
 # tx-test-runtime-optimizer
@@ -13,6 +13,8 @@ Use this skill when test runtime itself is part of the problem. Pair it with
 
 - Treat "make it pass by waiting longer" as diagnostic only, not a fix.
 - Do not assume the subsystem under test is the bottleneck. Measure first.
+- When resuming, read user-named debug logs and progress notes before any new
+  experiment. Carry forward accepted and rejected hypotheses explicitly.
 - Preserve the exact command, wall timeout, serial/log path, last progress line,
   and whether the test timed out internally or by host `timeout`.
 - Prefer focused witnesses over full suites while diagnosing runtime.
@@ -20,8 +22,42 @@ Use this skill when test runtime itself is part of the problem. Pair it with
 - Optimize general behavior: cache repeated immutable work, reduce repeated
   helper/procfs/sysfs probes, fix measured linear scans, or improve process/fd
   paths when evidence points there.
+- Commit or otherwise isolate useful evidence-backed changes before starting a
+  broader experiment. Stage explicit paths only; do not include local `msp/`
+  debug notes unless the user asks.
 - If a trace build is used, restore the ordinary non-trace build and submit
   artifact before finishing.
+
+## Resume Protocol
+
+Before running or editing anything in an existing timeout investigation:
+
+1. Check `git status --short` and identify unrelated dirty files.
+2. Read every log or progress file named by the user, especially
+   `msp/debug-logs/*.md`; these are local memory and usually not committed.
+3. Extract four lines into the working update:
+   - latest witness command/log and whether it passed or timed out
+   - last accepted bottleneck
+   - hypotheses already rejected
+   - next measurement that can change the decision
+4. If the next action would revisit a rejected hypothesis, stop and explain what
+   new evidence would justify reopening it.
+
+## Stop Rules
+
+- Do not run more than one new trace for the same hypothesis without making a
+  keep/revert/next-target decision from the numbers.
+- If a change improves one command but the case still times out, compare the
+  full phase budget before continuing. Do not keep optimizing the same command
+  after another phase dominates.
+- If a profile shows userland control-plane churn (`execve`, `clone`, `wait4`,
+  `pipe2`, `dup3`, `fcntl`, short `read`/`ppoll`) dominates, do not refactor the
+  kernel datapath unless a fresh trace contradicts it.
+- Treat no-fork or standalone userspace experiments as oracles unless they are
+  acceptable product direction. Do not present them as the fix after the user
+  rejects that path.
+- When the user asks for a pass/fail answer, answer with the latest witness
+  result before proposing more work.
 
 ## Runtime Triage
 
@@ -48,6 +84,30 @@ Use this skill when test runtime itself is part of the problem. Pair it with
    - unsupported surface: protocol, driver, module, or external dependency
 5. Optimize only after classification. A good fix should reduce a measured hot
    path and preserve existing witnesses.
+
+## Evidence Ladder
+
+Use the smallest evidence that can decide the next step:
+
+- Plain focused witness: answers "does it pass now?"
+- Trace window: answers "which phase and command owns the remaining budget?"
+- Counter summary: answers "is the cost kernel datapath or userspace control
+  plane?"
+- Oracle experiment: answers "would removing this class of work be enough?"
+  Mark it as an oracle and keep it out of the submitted fix unless accepted.
+
+Compare only like with like:
+
+- same phase (`setup`, `stress`, `post-stress`, or `all`)
+- same trace mode when using `total_s`
+- same command labels and loop count
+- both wall progress and counters (`syscalls`, `faults`, `clone`, `execve`,
+  `wait4`, `pipe2`, `ppoll`, `read<=1`)
+
+For LTP shell/network timeouts, split setup from the loop body. A setup chain
+such as `tst_ns_exec ... sh -c "... || echo RTERR"` is not the same owner as a
+post-stress `ip neigh show | grep` pipeline. Fix or measure the phase that
+actually owns the remaining wall budget.
 
 ## Useful Commands
 
