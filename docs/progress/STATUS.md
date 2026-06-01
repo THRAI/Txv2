@@ -1,3 +1,475 @@
+- 2026-06-01 **OSComp live observe workflow is unified behind one command.**
+  Added `tools/oscomp-observe-live.py` plus `cargo xtask observe oscomp-live`
+  to seal the private libc-bench image prep, names generation, shared
+  guest-RAM file creation, SMP4 QEMU invocation, raw-only `live-guest-mem`
+  drain, and Parquet export into one workflow. Routine use now only needs an
+  optional `--output-dir` and optional `--python-file`; lower-level knobs remain
+  as explicit debugging overrides (`--name`, `--only`, `--timeout`, `--smp`,
+  `--dry-run`, and skip flags). A follow-up added the public `--test <name>`
+  selector for routine focused captures (`pthread`, `vm`, `stdio`, `regex`,
+  and existing single-benchmark libc-bench names), keeping hidden `--only` as a
+  debug alias. Verification: test-first `tools.tests.test_oscomp_observe_live`,
+  `python3 -m py_compile
+  tools/oscomp-observe-live.py tools/oscomp-custom-run.py
+  tools/tx-observe-analyze.py tools/tests/test_oscomp_observe_live.py`,
+  `python3 -m unittest tools.tests.test_oscomp_observe_live
+  tools.tests.test_oscomp_custom_run tools.tests.test_tx_observe_analyze`,
+  `cargo fmt --check`, `cargo check -p xtask -q`, `cargo xtask observe
+  oscomp-live --name smoke --python-file tools/tests/test_tx_observe_analyze.py
+  --skip-build --skip-submit --dry-run`, `cargo xtask progress validate`,
+  `cargo xtask lint docs`, and `git diff --check` on touched files. Next step:
+  run a real focused pthread capture through `cargo xtask observe oscomp-live`
+  and consume `analysis/parquet` directly.
+
+- 2026-06-01 **Live observe drain is rawrecords-only by default.** Changed
+  `tx-trace-daemon live-guest-mem` and the `cargo xtask observe
+  live-guest-mem` wrapper so live capture writes `trace.rawrecords` plus
+  `runtime.json` and stops there; the old post-stop decode into
+  `replay.ndjson` and `trace.pftrace` is now behind explicit `--finalize`.
+  `runtime.json` marks `finalized=false` for the default path and reports the
+  authoritative stream length in `drained.raw_records`; decoded
+  `drained.records`/`repairs` are populated only when `--finalize` runs. This
+  keeps long pthread/VM captures from spending the end of the run materializing
+  formats we do not use for Parquet analysis. Verification: `cargo fmt
+  --check`, `cargo test -q` in `tools/tx-trace-daemon`, `cargo check -p xtask
+  -q`, daemon `live-guest-mem --help`, a short sparse guest-RAM raw-only smoke
+  under `target/oscomp/custom-run/live-raw-default-smoke-host` that produced
+  only `runtime.json` and `trace.rawrecords`, `python3 -m py_compile
+  tools/tx-observe-analyze.py tools/tests/test_tx_observe_analyze.py`, `cargo
+  xtask progress validate`, `cargo xtask lint docs`, and `git diff --check` on
+  touched files. Next step: rerun the focused pthread VM payload trace with
+  the raw-only workflow and generate Parquet directly from `trace.rawrecords`.
+
+- 2026-06-01 **Process/thread identity tree audit corrected the pthread DS
+  interpretation.** A read-only audit of process/thread identity containers and
+  pthread observe artifacts found that
+  `2026-06-01-libcbench-pthread-ds-observe.md` does not show pid/tid or
+  identity allocation p95 at 10ms: the cited trace has `thread.identity`
+  `p95=166us`, `pidns.tid p95=85us`, and the 10ms-class rows are VM recipe
+  publish/reclaim maxima. A newer
+  `pthread-vm-threadpayload-20260601-164450` rawrecords artifact has heavier
+  thread identity/payload tails (`thread.identity p95=416us, p99=1.871ms,
+  max=20.791ms`; `thread.payload p95=710us, p99=1.970ms, max=15.299ms`) while
+  whole `sys_clone` reaches `p99=10.672ms`. Implementation risks remain real:
+  global `SpinMutex<BTreeMap<...>>` pid namespace registration, Vec-backed
+  `ProcessThreads`/`ProcessChildren`, cap-clone churn, and zone signing tails.
+  Record:
+  `docs/progress/research/2026-06-01-process-thread-identity-tree-audit.md`.
+  Next step: split whole-clone latency across zone signing, pid namespace
+  register/unregister, and thread-roster attach/detach/snapshot before changing
+  PID number allocation.
+
+- 2026-06-01 **tx-observe cleanup now has same-day evidence guardrails.**
+  A custom-run cleanup dry-run with `--older-than-days 0` found that the
+  cutoff means "older than this instant", so same-day libcbench and pthread DS
+  evidence would be included unless explicitly preserved. Updated
+  `cargo xtask observe cleanup` with repeatable `--keep-glob PATTERN` filters
+  and a fail-closed rule: `--yes --older-than-days 0` now requires at least one
+  keep glob unless `--all` is used intentionally. Verified that keep globs for
+  `*full-libcbench-newworkflow*`, `wall-profile*`, and `*pthread-ds-smp4*`
+  remove those families from the candidate list. No custom-run artifacts were
+  removed during this follow-up; the cleanup logic and operator notes were
+  updated instead. Verification: `cargo test -p xtask cleanup_` and
+  `cargo xtask observe cleanup --dry-run --older-than-days 0 --keep-glob
+  '*full-libcbench-newworkflow*' --keep-glob 'wall-profile*' --keep-glob
+  '*pthread-ds-smp4*'`. Next step: run the real cleanup with reviewed keep
+  globs after deciding whether additional same-day smoke evidence should also
+  be preserved.
+
+- 2026-06-01 **Zone allocator hierarchy is now trace-attributable.** Added
+  observer-gated allocation-row probes across the zone allocation hierarchy:
+  `Zone::pop_free_slot` records reserve count, per-CPU bucket hit/miss, bucket
+  length, refill size, CPU, and reserve/refill duration; `Keg` records bucket
+  refill, partial-vs-empty source selection, new-slab creation, claim timing,
+  free-slot count before claim/return, return duration, and slab retirement
+  attempts; `ZoneSlab` records bitmap scan depth on the traced claim path.
+  Analyzer static names now include the new `debug.alloc.zone.*` rows so
+  reports can distinguish bucket/cache policy, slab reuse/search, and backing
+  slab allocation. Observer-off paths keep the old hot slot-claim path and skip
+  trace clocks. Verification: `cargo fmt --check`, `cargo check -p
+  tx-substrate -q`, `cargo check -p tx-kernel -q`, `cargo test -p
+  tx-substrate --lib -q`, `python3 -m py_compile
+  tools/tx-observe-analyze.py tools/tests/test_tx_observe_analyze.py`,
+  `python3 -m unittest tools.tests.test_tx_observe_analyze`, and `cargo xtask
+  build --target rv64-qemu`. A short SMP4 shared-RAM smoke trace drained
+  `1,482` raw records with zero lost/repairs and decoded the new zone rows:
+  19 reserves, 17 bucket hits, 2 bucket misses/refills, 2 new slabs, 64 keg
+  claims, and bitmap scan depths up to 31. `fault-decode` found no trap lines
+  in the smoke serial log. Caveat: `cargo test -p tx-substrate zone -q` is
+  blocked by an unrelated existing `Errno::ECANCELED` exhaustiveness failure in
+  `crates/tx-substrate/tests/v3_algebra.rs`. Next step: rerun the focused
+  pthread lifecycle trace and compare zone bucket/refill/new-slab policy
+  against VM recipe/process-thread DS leaf allocation totals.
+
+- 2026-06-01 **RV64 observe rings now safely cover SMP4 harts.** Changed the
+  rv64-qemu board from one 8 MiB observe ring to four 2 MiB per-hart rings in
+  an explicit `.bss.observe.rings` linker section exported as
+  `TX_OBSERVE_RINGS`, and initialized `tx_observe` from
+  `secondary_cpu_entry` before APs enter the reactor. The rebuilt ELF places
+  `TX_OBSERVE_RINGS`/`__observe_rings` at `0xffffffff8082c000`,
+  `__observe_rings_end` at `0xffffffff8102c000`, and
+  `__kernel_end_load=0x81118000`, keeping the image inside the 16 MiB
+  bootstrap alias budget. Verification: `cargo fmt --check`, `cargo check -p
+  tx-kernel -q`, `cargo test -p tx-observe -q`, `cargo test -q` in
+  `tools/tx-trace-daemon`, `cargo xtask build --target rv64-qemu`, and
+  `cargo xtask qemu --target rv64-qemu --profile smoke --timeout-ms 30000
+  --expect-sentinel`. A short shared-RAM live-drain smoke produced
+  `target/oscomp/custom-run/observe-rings-smoke-host/runtime.json` with
+  `hart_count=4`, `ring_bytes=2097152`, `raw_records=955`, zero lost/repairs,
+  and per-hart producer counts h0=895, h1=24, h2=18, h3=18; fault-decode found
+  no trap lines in the serial log. Next step: rerun the focused pthread
+  lifecycle trace with `--hart-count 4 --ring-bytes 2097152` so AP-local
+  scheduler and process/thread DS records are included.
+
+- 2026-06-01 **Focused pthread DS observe trace now covers process/thread
+  allocation tracks.** Added explicit `tx-observe` allocation tracks for
+  `ThreadPayload`, `ThreadIdentity`, `ProcessPayload`, `ProcessIdentity`,
+  `ProcessThreads`, and PID namespace TID insert/remove paths, with
+  observer-gated duration counters. Exported the RV64 live-drain ring symbol as
+  `TX_OBSERVE_RINGS`. A focused SMP4 pthread-only libc-bench run produced
+  `target/oscomp/custom-run/pthread-ds-smp4-host/trace.rawrecords`
+  (`6,512,021` decoded records, `205.315s` window) and
+  `target/oscomp/custom-run/pthread-ds-smp4-live-report.md`; fault-decode found
+  no trap lines. The run is hart-0-only because the board currently exposes one
+  8 MiB observe ring, and `runtime.json` is absent because the legacy daemon
+  post-stop NDJSON/pftrace path was stopped after rawrecords analysis. The new
+  DS tracks show thread payload + identity signing at about `3.25s` combined,
+  while VM recipe publish remains larger (`17.521s` publish-duration samples,
+  `318,928` recipe-node allocation records). Record:
+  `docs/progress/research/2026-06-01-libcbench-pthread-ds-observe.md`. Next
+  step: fix safe multi-hart observe ring backing, then keep pthread lifecycle
+  attribution on rawrecords/Parquet and target VM recipe publish/reclaim before
+  smaller process/thread container paths.
+
+- 2026-06-01 **tx-observe cleanup command added for obsolete run artifacts.**
+  Added `cargo xtask observe cleanup` to clean known observe/custom-run outputs
+  without touching source-controlled progress notes. The command defaults to
+  `target/oscomp/custom-run`, `--older-than-days 7`, and dry-run behavior; it
+  deletes only with `--yes`. It recognizes generated observe/custom-run shapes
+  such as `*-host`, `*-analysis`, `build-*`, `*-data`, `*-submit`, `.txtrace`,
+  `.ndjson`, `.pftrace`, `.rawrecords`, `*-serial.txt`, `*-analyze.txt`,
+  `*-report.md`, `*-names.json`, and `latest-*` pointers. Derived cache
+  directories named `cache` or `*-cache` are skipped unless `--include-cache`
+  is passed. Updated `.agents/skills/tx-observe/SKILL.md` with the cleanup
+  workflow and safety notes. A dry-run over the current custom-run tree found
+  `63` candidates totaling `13,051,524,531` bytes and did not delete anything.
+  Verification: `cargo fmt --check`, `cargo test -p xtask cleanup_`,
+  `cargo xtask observe cleanup --dry-run --older-than-days 0`, `cargo check -p
+  xtask`, `cargo xtask progress validate`, `cargo xtask lint docs`, and
+  `git diff --check -- xtask/src/observe.rs
+  .agents/skills/tx-observe/SKILL.md docs/progress/STATUS.md`.
+
+- 2026-06-01 **Legacy tx-observe text summary now uses derived Parquet.**
+  Updated `tools/tx-observe-analyze.py` so the default text-summary path with
+  `--parquet-dir` exports derived Parquet and prints a DuckDB-backed
+  `derived parquet summary` instead of falling through to the old raw-record
+  domain analyzers. The fast path first checks a Parquet manifest keyed by
+  input `sha256`, `ANALYZER_DECODER_VERSION`, and dangling-span policy; on a
+  hit it queries existing `spans`, `counters`, `allocation_rows`, and
+  `sched_intervals` Parquet files directly. On a miss it can still load the
+  derived-table JSON cache before decoding `trace.rawrecords`, then refreshes
+  the Parquet manifest. Regression coverage now includes cache-before-records
+  behavior and manifest reuse. Measured on the full libcbench rawrecords
+  artifact: manifest-writing run took `real 25.17s`; the repeat manifest-hit
+  run took `real 1.08s` and produced
+  `parquet-fast-report-repeat.txt` with `spans=180457`, `counters=8473618`,
+  `allocation_rows=1445414`, and `sched_intervals=0`. Verification:
+  `python3 -m py_compile
+  tools/tx-observe-analyze.py tools/tests/test_tx_observe_analyze.py`,
+  `python3 -m unittest tools.tests.test_tx_observe_analyze`, cached
+  full-libcbench `cargo xtask observe analyze --rawrecords ... --cache-dir
+  ... --parquet-dir ...` twice, `cargo check -p xtask`, `cargo xtask
+  progress validate`, and `git diff --check --
+  tools/tx-observe-analyze.py tools/tests/test_tx_observe_analyze.py
+  docs/progress/STATUS.md`.
+
+- 2026-06-01 **Full libcbench trace now uses rawrecords-first analysis.**
+  Captured a fresh RV64 SMP4 `libcbench-musl` run with shared QEMU guest RAM,
+  `tx.oscomp.observe_dump=0`, and `cargo xtask observe live-guest-mem`. The
+  serial log reached `#### OS COMP TEST GROUP END libcbench-musl ####` and
+  userspace exited 0; fault-decode found no trap lines. Artifacts live under
+  `target/oscomp/custom-run/full-libcbench-newworkflow-20260601-123914*`.
+  The new workflow analyzed
+  `full-libcbench-newworkflow-20260601-123914-host/trace.rawrecords` directly
+  and produced derived Parquet in
+  `full-libcbench-newworkflow-20260601-123914-analysis/parquet`: `spans`
+  180,457 rows, `counters` 8,473,618 rows, `allocation_rows` 1,445,414 rows,
+  and `sched_intervals` 0 rows. The span window was 212.614s, while serial
+  libcbench body totals summed to 210.472s (`pthread` 133.909s, `stdio`
+  32.156s, `malloc` 28.134s, `regex` 15.441s, `string` 0.513s, `utf8`
+  0.318s). Saved SQL summaries at
+  `full-libcbench-newworkflow-20260601-123914-analysis/summary.md`,
+  `span-tail.csv`, `allocation-tail.csv`, and `span-window.csv`. The first
+  export attempt exposed a DuckDB JSON-staging bug for wide unsigned counter
+  values, so `tools/tx-observe-analyze.py` now reads staged JSON columns as
+  strings and casts explicitly; added a regression for a near-`u64::MAX`
+  counter. Verification: `python3 -m py_compile
+  tools/tx-observe-analyze.py tools/tests/test_tx_observe_analyze.py`,
+  `python3 -m unittest tools.tests.test_tx_observe_analyze`, `cargo check -p
+  xtask`, `cargo xtask progress validate`, and `git diff --check --
+  tools/tx-observe-analyze.py tools/tests/test_tx_observe_analyze.py
+  docs/progress/STATUS.md`. Note: the legacy daemon post-stop NDJSON/pftrace
+  finalization and the legacy full text analyzer were stopped after rawrecords
+  and derived Parquet were complete, because this run was intentionally
+  validating the new rawrecords/SQL path.
+
+- 2026-06-01 **tx-observe skill now reflects binary-first SQL/Python
+  analysis.** Updated `.agents/skills/tx-observe/SKILL.md` so future observe
+  work points agents at direct `.txtrace` and live-drain `trace.rawrecords`
+  analysis, derived-table cache semantics, SQL views, Python-script Parquet
+  environment variables, and the analyzer unit-test check. Verification:
+  `cargo xtask progress validate`, `cargo xtask lint docs`, and
+  `git diff --check -- .agents/skills/tx-observe/SKILL.md docs/progress/STATUS.md`.
+
+- 2026-06-01 **tx-observe analyzer gains rawrecords, SQL, and Python-script
+  analysis modes.** Extended `cargo xtask observe analyze` and
+  `tools/tx-observe-analyze.py` so the preferred aggregation path can read
+  either `.txtrace` or live-drain `trace.rawrecords` directly, with NDJSON kept
+  as the compatibility/debug input. Derived tables now persist
+  `sched_intervals` beside `spans`, `counters`, and `allocation_rows`, and the
+  Parquet export writes `sched_intervals.parquet` without adding a wide
+  timeline Parquet. Added DuckDB-backed `--sql` / `--sql-file` modes over
+  typed analyzer views (`records`, `repairs`, `spans`, `counters`,
+  `allocation_rows`, `sched_intervals`, `names`) plus `--python-file` mode,
+  which runs a user script with `TX_OBSERVE_*` environment variables pointing
+  at derived Parquet tables. Verification pending final sweep: focused Python
+  analyzer tests cover rawrecords decode/repair preservation, SQL
+  `quantile_disc` aggregation, Python environment handoff, and mutually
+  exclusive action flags. Next step: run the full command/docs verification
+  set and update this entry with final results.
+
+- 2026-06-01 **Pthread lifecycle follow-up now traces VM recipe churn directly.**
+  The full wall profile showed pthread time dominated by lifecycle
+  create/teardown spans, while join wake was rarely exercised
+  (`clear_child_tid.woken=176`, `LifecycleWake=1`). Added observer-gated recipe
+  publish/reclaim totals so the next SMP4 trace can quantify recipe operation
+  kind, touched path length, node allocations per publish, and EBR tree reclaim
+  size/time beside the existing private-page and pmap summaries. Verification:
+  `cargo fmt --check`, `cargo check -p tx-kernel -q`, `cargo test -p tx-kernel
+  vm -- --nocapture`, `cargo xtask progress validate`, and `git diff --check`.
+  Next step: rerun the focused pthread/full wall trace and decide whether the
+  recipe fix is allocator refill, bulk reclaim, or reducing VMA rewrite count.
+
+- 2026-06-01 **tx-observe analyzer exports derived tables as Parquet.**
+  Added `--parquet-dir <dir>` to `tools/tx-observe-analyze.py` and forwarded
+  it through `cargo xtask observe analyze`, producing `spans.parquet`,
+  `counters.parquet`, and `allocation_rows.parquet` from the derived-table
+  cache surface. The export deliberately stays derived-table only: raw
+  `.txtrace` direct ingest remains the source of truth and the local hot path
+  still avoids materializing a wide timeline Parquet. The exporter shells out
+  to the DuckDB CLI with explicit schemas, removes temporary JSONL staging
+  files, and handles empty derived tables as valid zero-row Parquet outputs.
+  Added readback tests that query the files with DuckDB instead of only
+  checking `PAR1` magic. Verification: `python3 -m py_compile
+  tools/tx-observe-analyze.py tools/tests/test_tx_observe_analyze.py`,
+  `python3 -m unittest tools.tests.test_tx_observe_analyze`, manual analyzer
+  `--parquet-dir` export with DuckDB readback, `cargo check -p xtask`, `cargo
+  xtask progress validate`, `cargo xtask lint docs`, and `git diff --check`.
+  Next step: keep Parquet as a derived-table interchange surface unless a
+  cross-arch archival workflow explicitly needs a persisted wide timeline.
+
+- 2026-06-01 **tx-observe analyzer now mirrors daemon repair semantics on raw ingest.** Tightened `tools/tx-observe-analyze.py` so raw `.txtrace` decode emits first-class repair records for `bad_magic`, `version_mismatch`, and `payload_len_exceeded`, preserves forward-compatible unknown payload tags without payload data, and treats repair-only NDJSON streams as visible summary input instead of dropping them from the top line. The analyzer now excludes repairs from span/gap materialization while still keeping them in the record-count and kind summary, and the raw per-hart merge uses the analyzer event-order key so repair records stay sorted deterministically. Added focused regressions for malformed raw slots, repair-only streams, and the unknown-tag skip path. Verification: `python3 -m py_compile tools/tx-observe-analyze.py tools/tests/test_tx_observe_analyze.py`, `python3 -m unittest tools.tests.test_tx_observe_analyze`, `cargo check -p xtask`, and `cargo xtask progress validate`. Next step: decide whether to mirror the remaining daemon repair flavors in the Python tool or keep the analyzer limited to the current framing-parity slice.
+
+- 2026-06-01 **tx-observe Phase 0 decode/analyzer correctness fixes and
+  direct analyzer ingest landed.** Fixed NDJSON wide-integer safety by serializing decoded `seq`,
+  `ts`, repair `seq_around`, and wide `u64` payload values as strings, then
+  taught `tools/tx-observe-analyze.py` to parse stringified timestamps,
+  counters, instant payload values, and wait-source fields. Span pairing in
+  the Perfetto writer now keys on the raw globally self-namespaced `u64` span
+  id instead of `(hart, span)`, and thread tracks are keyed by `(pid, tid)` so
+  migrated task slices stay on the task track rather than splitting by CPU.
+  The analyzer's largest-gap view now partitions by hart before taking
+  timestamp deltas, avoiding plausible but meaningless gaps from the merged
+  cross-hart timeline. `cargo xtask observe analyze --file <trace.txtrace>`
+  now passes the binary trace straight to `tools/tx-observe-analyze.py`
+  instead of replaying the full trace to NDJSON first; the Python analyzer does
+  a dependency-free txtrace-v0 read, treats each hart ring as an already-sorted
+  run, and k-way merges the per-hart runs for timestamp-ordered analysis.
+  The analyzer now also materializes explicit derived tables for spans,
+  counters, and allocation rows in one pass, with a cache keyed by input
+  `sha256` plus analyzer decoder version and an explicit dangling-span policy
+  (`exclude` or `synthetic-end`). Span rows record both cheap net migration
+  (`begin_hart/end_hart`) and sched-interval migration attribution so a span
+  that returns to its opener hart still reports the intervening hart hops.
+  Added focused regressions for cross-hart raw-span pairing, stable thread
+  tracks across harts, wide JSON serialization, analyzer string
+  timestamp/value parsing, hart-local gap reporting, multi-hart binary
+  ingest, explicit dangling-span policy, cache reuse/invalidation, and the
+  sched-interval migration false-negative case. Verification: `python3 -m
+  py_compile tools/tx-observe-analyze.py tools/tests/test_tx_observe_analyze.py`,
+  `python3 -m unittest tools.tests.test_tx_observe_analyze`, `cargo test --test
+  pftrace_integration migrated_span_closes_on_original_thread_track --
+  --nocapture`, and `cargo check -p xtask`. Next step: finish binary-ingest
+  parity with daemon decode behavior and decide whether the derived-table cache
+  should remain Python-side or move into a Rust host-side cache; no txtrace ABI
+  or kernel producer change was made.
+
+- 2026-06-01 **Full libc-bench wall profile shifts the next lever back to
+  pthread/stdio body paths, not setup FS.** Added `tx.oscomp.observe_dump=0`
+  so live-drained OSComp observation can reset rings and keep records enabled
+  without arming the serial threshold dump/shutdown path. A full
+  `libcbench-musl` QEMU `-smp 4` run completed with
+  `11,150,944` drained records, `complete=true`, and zero lost, overwritten, or
+  repaired records. Trace window was `282.168s`; serial benchmark bodies summed
+  to `279.198s`, leaving only about `3s` for shell/script setup, exec/program
+  load, and teardown in this single-program libc-bench group. Body totals:
+  pthread `182.173s`, stdio `44.860s`, malloc `33.739s`, regex `17.339s`.
+  Next step: keep the cold PageBacked/program-load lane for multi-program
+  suites, but for libc-bench score work return to pthread lifecycle
+  scheduler/VM costs first and stdio PageBacked read/write/copy second. Report:
+  `target/oscomp/custom-run/wall-profile-full-smp4-nodump-report.md`; research
+  note:
+  `docs/progress/research/2026-06-01-libcbench-full-wall-profile.md`.
+
+- 2026-05-31 **Malloc VM free-side caveat is closed.** Instrumented pmap
+  teardown removal and confirmed the sorted-Vec front-removal cost:
+  `malloc-big1` shifted `63,005,332` entries and spent `570.689ms` in resident
+  removal before the fix. `VmPmap::teardown_range` now drains the contiguous
+  resident slice once and then unmaps/shoots down the drained pages; guarded
+  pmap clocks behind active observer checks so normal `tx.oscomp.observe=0`
+  body timings stay probe-clean. Post-fix body-bracket removal totals:
+  `malloc-big1 41.034ms`, `malloc-big2 7.435ms`. Same-boot low-probe
+  `malloc-vm` body times improved from sparse `3.645656s`, bubble
+  `3.701150s`, big1 `5.097459s`, big2 `4.309262s` to sparse `2.940566s`,
+  bubble `2.798554s`, big1 `4.298212s`, big2 `3.776314s`; fault-decode found
+  no trap lines. Updated
+  `docs/progress/research/2026-05-31-libcbench-vm-only-trace.md`. Next step:
+  stop mining malloc VM micro-levers unless a new wall-time profile points back
+  here; shift to aggregate wall-time FS/PageBacked setup or pthread/SMP
+  scheduler-shootdown work.
+
+- 2026-05-31 **Page-frame split trace shows zeroing is not the main VM malloc
+  residual.** Added page-frame allocation subtracks for bitmap reservation,
+  zero-scrub time, and `Zeroed` vs `UninitFullOverwrite` policy counts. Four
+  body-only VM malloc `frameprobe` live-drain runs completed with zero
+  lost/overwritten/repaired/framing records (`544100`, `552536`, `644495`,
+  `583435`). All body-internal `reserve_frame` calls were `Zeroed`:
+  `10044`, `10044`, `11328`, and `11328` frames. Direct-map zero scrub totals
+  were only `59.413ms`, `48.115ms`, `59.742ms`, and `58.266ms`; bitmap
+  reservation totals were `80.497ms`, `62.145ms`, `81.242ms`, and
+  `102.342ms`. The larger `page_frame.duration_ns` totals
+  (`304.471ms`, `257.750ms`, `359.904ms`, `335.066ms`) include extra
+  instrumentation overhead from multiple allocation records per frame. Updated
+  `docs/progress/research/2026-05-31-libcbench-vm-only-trace.md`. Next step:
+  keep page-frame prezero/magazine ideas as secondary; the remaining primary
+  score-facing work is private-page traversal/install cost.
+
+- 2026-05-31 **Refreshed VM malloc full-suite totals after the page-node fast
+  path.** The pagenode live-drain suite is still complete with zero
+  lost/overwritten/repaired records. Refreshed allocation-track ranking:
+  `PrivatePageNode` remains largest but is now `360.035ms`, `462.425ms`,
+  `587.192ms`, and `575.710ms`; page-frame allocation/zeroing is next at
+  `189.167ms`, `259.833ms`, `277.964ms`, and `262.983ms`; recipe nodes are
+  `183.399ms`, `143.687ms`, `87.258ms`, and `49.889ms`; page-run search is
+  down to `32.521ms`, `38.068ms`, `43.780ms`, and `30.150ms`. Full phase
+  totals agree: `private_set.install` is `358.138ms`, `460.383ms`,
+  `584.909ms`, and `573.864ms`, with exactly one `PrivatePageNode` allocation
+  per install. Updated
+  `docs/progress/research/2026-05-31-libcbench-vm-only-trace.md`. Next step:
+  inspect the residual page-frame/frame-zeroing path before spending more time
+  on page-run search.
+
+- 2026-05-31 **PrivatePageSet unshared installs now mutate treap paths in
+  place.** Added an Arc-uniqueness-gated insert fast path for
+  `PrivatePageTree`: ordinary private-anon growth mutates unique path nodes and
+  allocates only the new leaf, while shared trees from fork/split still fall
+  back to immutable path-copy. Pinning tests:
+  `unshared_private_installs_allocate_only_leaf_nodes` and
+  `shared_private_tree_falls_back_to_path_copy_insert`; fork CoW smoke
+  `fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow`
+  still passes. Full VM malloc live-drain rerun stayed complete with zero
+  lost/overwritten/repaired records (`516528`, `526546`, `613483`, `551469`).
+  `debug.alloc.vm.private_page_node` allocation count collapsed from sparse
+  `107,501` -> `10,040`, bubble `107,501` -> `10,040`, big1 `168,223` ->
+  `11,300`, and big2 `168,223` -> `11,300`; max allocation per install is now
+  `1` in all cases. PrivatePageNode timing fell from `573.539ms` ->
+  `360.035ms`, `776.558ms` -> `462.425ms`, `1.271s` -> `587.192ms`, and
+  `1.405s` -> `575.710ms`. Summary:
+  `target/oscomp/custom-run/malloc-vm-pagenode-suite-summary.md`. Next step:
+  re-rank the body-only allocation tracks; remaining install cost is traversal
+  plus frame/page allocator work, not immutable node churn.
+
+- 2026-05-31 **Bitmap allocator run-search policy now has a moving
+  contiguous-run hint.** Added a `BitmapPageAllocator::run_hint` for
+  multi-page `reserve_run` calls, kept `reserve_run(1, 1)` on the existing
+  single-frame hint path, and pinned both behaviors in `page_allocator` tests.
+  Full VM malloc live-drain rerun stayed complete with zero lost/overwritten
+  records (`515579`, `526884`, `616156`, `555350`). Page-run scan candidates
+  collapsed from sparse `1,732,571` -> `10,785`, bubble `1,651,405` ->
+  `10,782`, big1 `3,089,667` -> `12,333`, and big2 `1,208,050` -> `12,026`;
+  page-run reservation time fell from `1.269s` -> `28.545ms`, `1.171s` ->
+  `34.416ms`, `2.097s` -> `49.119ms`, and `887.935ms` -> `35.633ms`.
+  Summary: `target/oscomp/custom-run/malloc-vm-runhint-suite-summary.md`.
+  Verification: `cargo fmt --check`, `cargo test -p tx-substrate --test
+  page_allocator -- --nocapture`, `cargo check -p tx-substrate --lib`,
+  `cargo check -p tx-subsystems --lib`, `cargo check -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`, kernel
+  build, OSComp submit refresh, names refresh, and four live-drained QEMU
+  malloc VM traces. Next step: leave page-run search alone unless wall-score
+  data says otherwise; the dominant remaining allocation track is still
+  `debug.alloc.vm.private_page_node.duration_ns`.
+
+- 2026-05-31 **Allocator-policy trace confirms contiguous page-run search is
+  the VM malloc suite's page-run cost.** Added
+  `debug.alloc.page_run.scan_candidates` and reran the four body-only VM malloc
+  cases under complete live guest-memory drain. The contiguous run allocator
+  starts each `reserve_run` at the allocator base instead of a moving run hint,
+  so small slab refills repeatedly rescan the allocated prefix. Full-suite scan
+  totals: sparse `169` runs scanned `1,732,571` candidate bases in `1.269s`
+  (`corr(scan,duration)=0.815`); bubble `167` / `1,651,405` / `1.171s`
+  (`0.983`); big1 `433` / `3,089,667` / `2.097s` (`0.993`); big2 `130` /
+  `1,208,050` / `887.935ms` (`0.990`). The dominant class is 4-page slab
+  refills: sparse `146` four-page runs scanned `1,591,288` candidates and cost
+  `1.158s`; big1 `131` four-page runs scanned `1,427,354` candidates and cost
+  `1.011s`. Impact: fix allocator run-search policy before retuning slab
+  refill sizes; a moving per-run hint or free-run/buddy structure should remove
+  the repeated prefix scan that QEMU is amplifying.
+
+- 2026-05-31 **Full VM malloc suite now has complete live-drained
+  DS-allocation timing traces.** Ran body-only `malloc-sparse`,
+  `malloc-bubble`, `malloc-big1`, and `malloc-big2` under QEMU
+  `memory-backend-file` plus `cargo xtask observe live-guest-mem`; all four
+  `runtime.json` files report `complete=true` with zero lost, overwritten, or
+  repaired records (`503650`, `512833`, `599991`, and `537929` drained records
+  respectively). The full-suite summary at
+  `target/oscomp/custom-run/malloc-vm-dsalloc-suite-summary.md` shows
+  `PrivatePageSet` allocation time at `1.054s`, `1.055s`, `1.500s`, and
+  `1.428s`; page-run reservation time at `1.104s`, `1.044s`, `2.126s`, and
+  `743.685ms`; and recipe-node allocation time at `533.311ms`, `454.363ms`,
+  `358.646ms`, and `147.634ms`. The counts confirm sparse/bubble install
+  `10023` private pages / `107459` immutable nodes, while big1/big2 install
+  `11283` private pages / `168181` immutable nodes. Verification: per-case
+  QEMU exit `0`, daemon exit `0`, analyzer over full drained NDJSON streams,
+  and serial logs with no `scause=`/`sepc=`/`stval=`/panic fault lines.
+
+- 2026-05-31 **Important VM/PageBacked allocation sites now emit explicit
+  allocation-track markers, and the analyzer reports allocation totals from
+  trace records.** Added allocation emits for `PrivatePageSet` immutable-node
+  batches, recipe-tree node builds, AddressSpace caps, PageContainer caps,
+  PageBacked cache entries, bitmap page-frame/page-run reservations, and
+  zone-slab growth using the existing `debug.alloc.*` explicit tracks. Extended
+  `tools/tx-observe-analyze.py` with an `allocation tracks:` section that
+  groups by explicit track/name and prints count, summed value or time,
+  average, p50/p95/p99, max, and recent markers. A follow-up timing pass adds
+  sibling `.duration_ns` markers on the same allocation tracks. Focused
+  body-only `malloc-sparse` verification now uses live guest-memory drain at
+  `target/oscomp/custom-run/malloc-sparse-bodyonly-dsalloc-live2-out/`; its
+  `runtime.json` reports `complete=true`, `records=503458`, `lost_records=0`,
+  `overwritten_records=0`, and `repairs=0`. The complete drained body trace
+  reports `debug.alloc.vm.private_page_node.duration_ns n=10023
+  total=1.100516s`, `debug.alloc.page_run.duration_ns n=169 total=1.098748s`,
+  `debug.alloc.vm.recipe_node.duration_ns n=10637 total=512.664ms`, and
+  `debug.alloc.page_frame.duration_ns n=10044 total=166.475ms`, with matching
+  count markers (`private_page_node sum=107459`, `page_run.count sum=982`).
+  Verification: `cargo fmt --check`, `cargo check -p
+  tx-substrate --lib`, `cargo check -p tx-subsystems --lib`, `cargo test -p
+  tx-observe -- --nocapture`, `python3 -m py_compile
+  tools/tx-observe-analyze.py`, synthetic analyzer allocation-row/time check,
+  `cargo check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`, RV64 kernel build, focused body-only guest run,
+  `observe live-guest-mem`, analyzer over `replay.ndjson`, and fault-decode
+  with no trap lines.
+
 - 2026-05-31 **Cherry-picked tx-observe SMP/host-drain updates from
   `/Users/3y/.codex/worktrees/tx-observe-smp-host`.** Ported the
   observe-related dirty worktree changes only: `tx-observe-types` allocation
@@ -11489,6 +11961,35 @@
 
 ## Open Blockers
 
+- 2026-06-01 lock-metric observe scaffolding is in progress. The substrate
+  `SpinMutex` now has a wrapped type-level metrics gate
+  (`SpinMutex<T, LockMetricsOn>` under global `cfg(tx_lock_metrics)`) and the
+  analyzer now derives `lock_rows` for SQL/Python/Parquet aggregation.
+  VM locks now route through `VmSpinMutex`, with local `cfg(tx_lock_metrics_vm)`
+  selecting `LockMetricsOn` for pmap state, range-lock state, recipe mutation,
+  and private-page tree locks. Use both `--cfg tx_lock_metrics` and
+  `--cfg tx_lock_metrics_vm` to emit VM lock rows; using only the VM cfg changes
+  the local type selection but the global gate still compiles emission out.
+  Verification in progress: focused analyzer lock-row tests, focused
+  `tx-substrate` sync tests, xtask arch lint unit test, normal
+  `tx-subsystems` check, VM-local-only cfg check, and global+VM cfg check have
+  passed; final docs/progress/diff checks still need to finish before closeout.
+  Next step: run a VM/libcbench capture with both cfgs and query `lock_rows`
+  for wait/service/response percentiles plus rho estimates.
+- 2026-06-01 VM lock-metric observe run completed with
+  `RUSTFLAGS="--cfg tx_lock_metrics --cfg tx_lock_metrics_vm"` via
+  `cargo xtask observe oscomp-live`. Output:
+  `target/oscomp/custom-run/observe-live-20260601-190724`. Runtime summary:
+  `complete=true`, `raw_records=8506748`, `lost_records=0`,
+  `overwritten_records=0`, `repairs=0`. Derived Parquet contains
+  `lock_rows=1053972`. VM lock summary from `lock_rows`: recipe mutation
+  `n=30044 wait_p99=7us service_p99=2145us response_p99=2147us rho=0.1046`;
+  pmap state `n=164839 wait_p99=6us service_p99=236us response_p99=238us
+  rho=0.0236`; private-page-set pages `n=45093 wait_p99=6us
+  service_p99=197us response_p99=201us rho=0.0096`; range-lock state
+  `n=111348 wait_p99=6us service_p99=59us response_p99=65us rho=0.0097`.
+  No `spins`/`contended` rows were emitted, so this pthread-libcbench trace
+  shows long service tails but not actual spin contention on these VM locks.
 - Real K210 boot, linker, and hardware path are not implemented yet.
 - OSComp FAT32 image/test runner integration is not yet a passing boot test.
 - LA64 target availability depends on local rustup support.
