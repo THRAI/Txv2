@@ -140,3 +140,36 @@ timeout 420s make oscomp-qemu-rv64 \
 下一步不要继续堆 timeout。要么设计更通用的 shell/exec/page-fault 优化，要么
 明确做“IPv4-only native network setup 不跑无关 IPv6 初始化”的开发加速路径，
 但 IPv6 覆盖必须继续由 `net.ipv6*` 单独证明。
+
+## 2026-06-01 下一步实现计划：ext4 热页缓存
+
+当前更细的代码审计显示，`exec_script` 的真实路径不是未启用的
+`exec_op.rs`，而是 `tx-scripts/src/process/exec/script.rs`。这个路径每次
+`execve` 都会：
+
+- 通过 VFS walker 打开目标文件；
+- 对目标 ELF 做一次 `read_exact_at(..., INITIAL_PARSE_READ)`；
+- 如果有 `PT_INTERP`，再打开并读取 interpreter 的 ELF 头；
+- 后续用户态缺页按 LOAD segment 从 `PageContainer` 取页。
+
+tmpfs regular file 的 `materialise_rnode` 会复用 inode 内已有的
+`PageContainer`，所以 `/bin/busybox` 这类被复制到 tmpfs 的文件已经能共享页缓存。
+但是 ext4 regular file 每次 materialise 都会创建新的 `PageContainer`；同步
+`tx-ext4` 后端当前只有目录项和目录 inode metadata cache，没有普通文件页 cache。
+这会让动态解释器、LTP helper/test binary 的重复读取继续落到 ext4 pager。
+
+先做一个通用、低风险的 ext4 byte-cache：
+
+- 在 `Ext4FsInstance` 里增加固定容量 LRU-ish file page cache，key 为
+  `(InodeNo, file_page_index)`，value 为一页 `Page4K` 字节。
+- `FsPageBacking::fetch_page` 先查这个 cache；miss 时走现有
+  `Ext4Pager::read_page`，成功后写入 cache，再按原路径 materialize frame。
+- ext4 mutating namespace 操作在会移除或复用 inode 的地方做保守失效：
+  `create_inode` 对新 inode 失效，`unlink` 对 removed inode 失效，
+  `serialize_inode_meta` 对目标 inode 失效；`rename` 不改内容，但覆盖目标时
+  后续可再补更精确失效。
+
+这个优化不会共享可写 frame，只缓存只读字节，因此比跨 `PageContainer` 共享同一
+PPN 更保守。预期收益是减少重复 ext4 读盘和 interpreter/helper 的 ELF/header
+读取成本；如果 focused witness 仍慢，再继续看 stack/partial-page population
+和 exec 后缺页数量。
