@@ -337,6 +337,7 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_observe::register_dump_shutdown::<P>();
         tx_observe::register_pre_dump_hook(tx_subsystems::vm::dump_debug_phase_totals::<P>);
         tx_observe::set_dump_threshold(crate::OBSERVE_DUMP_THRESHOLD);
+        tx_observe::set_trace_off_requests_dump(!oscomp_bench_observe_live_drain::<P>());
 
         let init = tx_subsystems::process::execution::init_process()
             .expect("drive_bootstrap_exec: INIT_PROCESS must be populated");
@@ -1084,11 +1085,30 @@ fn oscomp_bench_observe_enabled_from_cmdline(cmdline: Option<&str>) -> bool {
 fn oscomp_bench_observe_threshold_from_cmdline(cmdline: Option<&str>) -> Option<u64> {
     let cmdline = cmdline?;
     for token in cmdline.split_ascii_whitespace() {
+        if let Some(value) = token.strip_prefix("tx.oscomp.observe_dump=") {
+            if matches!(value, "0" | "false" | "off" | "no") {
+                return Some(0);
+            }
+        }
+    }
+    for token in cmdline.split_ascii_whitespace() {
         if let Some(value) = token.strip_prefix("tx.oscomp.observe_threshold=") {
             return value.parse::<u64>().ok().filter(|threshold| *threshold > 0);
         }
     }
     None
+}
+
+pub fn oscomp_bench_observe_live_drain_from_cmdline(cmdline: Option<&str>) -> bool {
+    let Some(cmdline) = cmdline else {
+        return false;
+    };
+    for token in cmdline.split_ascii_whitespace() {
+        if let Some(value) = token.strip_prefix("tx.oscomp.observe_live_drain=") {
+            return matches!(value, "1" | "true" | "on" | "yes");
+        }
+    }
+    false
 }
 
 fn oscomp_bench_observe_enabled<P: tx_hal::TxPlatform>() -> bool {
@@ -1097,6 +1117,10 @@ fn oscomp_bench_observe_enabled<P: tx_hal::TxPlatform>() -> bool {
 
 fn oscomp_bench_observe_threshold<P: tx_hal::TxPlatform>() -> Option<u64> {
     oscomp_bench_observe_threshold_from_cmdline(<P as tx_hal::BootInfoIf>::boot_info().cmdline)
+}
+
+pub fn oscomp_bench_observe_live_drain<P: tx_hal::TxPlatform>() -> bool {
+    oscomp_bench_observe_live_drain_from_cmdline(<P as tx_hal::BootInfoIf>::boot_info().cmdline)
 }
 
 fn append_default_oscomp_scripts(
@@ -1352,6 +1376,29 @@ mod tests {
             oscomp_bench_observe_threshold_from_cmdline(Some("tx.oscomp.observe_threshold=nope")),
             None
         );
+        assert_eq!(
+            oscomp_bench_observe_threshold_from_cmdline(Some(
+                "tx.oscomp.observe_dump=0 tx.oscomp.observe_threshold=12000"
+            )),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn oscomp_bench_observe_live_drain_cmdline_flag_is_explicit() {
+        assert!(!oscomp_bench_observe_live_drain_from_cmdline(None));
+        assert!(!oscomp_bench_observe_live_drain_from_cmdline(Some(
+            "tx.oscomp.observe_dump=0"
+        )));
+        assert!(oscomp_bench_observe_live_drain_from_cmdline(Some(
+            "tx.oscomp.observe_live_drain=1 tx.oscomp.observe=0"
+        )));
+        assert!(oscomp_bench_observe_live_drain_from_cmdline(Some(
+            "tx.oscomp.observe_live_drain=yes"
+        )));
+        assert!(!oscomp_bench_observe_live_drain_from_cmdline(Some(
+            "tx.oscomp.observe_live_drain=0"
+        )));
     }
 
     #[test]

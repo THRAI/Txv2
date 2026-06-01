@@ -25,13 +25,14 @@ pub(crate) fn observe(root: &Path, args: Vec<String>) -> Result<()> {
             "observe command needs replay, pftrace, validate, demo, extract, bundle, or live-guest-mem\n\
              usage:\n\
              \tcargo xtask observe replay --file <path> [--out json|pftrace] [--output <out>] [--filter level=N]\n\
-             \tcargo xtask observe analyze (--file <txtrace>|--ndjson <replay.ndjson>) [--names <names.json>] [--top N] [--roundtrip-sysno N]\n\
+            \tcargo xtask observe analyze (--file <txtrace>|--rawrecords <trace.rawrecords>|--ndjson <replay.ndjson>) [--names <names.json>] [--top N] [--roundtrip-sysno N] [--cache-dir <dir>] [--parquet-dir <dir>] [--sql <query>|--sql-file <query.sql>|--python-file <script.py>]\n\
              \tcargo xtask observe pftrace --file <path> --output <pftrace>\n\
              \tcargo xtask observe validate --file <path>\n\
              \tcargo xtask observe demo --output <path> [--records N] [--with-yields]\n\
              \tcargo xtask observe extract --serial <log> --output <txtrace>\n\
              \tcargo xtask observe bundle (--file <txtrace>|--serial <log>) --output-dir <dir> [--names <names.json>] [--kernel <elf>]\n\
-             \tcargo xtask observe live-guest-mem --guest-mem <ram-file> --kernel <elf> --output-dir <dir> [--stop-file <path>]\n\
+             \tcargo xtask observe live-guest-mem --guest-mem <ram-file> --kernel <elf> --output-dir <dir> [--stop-file <path>] [--finalize]\n\
+             \tcargo xtask observe oscomp-live [--test pthread|vm|stdio|regex|...] [--output-dir <dir>] [--python-file <script.py>]\n\
              \tcargo xtask observe names --kernel <elf> [--output <names.json>]"
                 .into(),
         );
@@ -45,10 +46,11 @@ pub(crate) fn observe(root: &Path, args: Vec<String>) -> Result<()> {
         "extract" => observe_extract(&args[1..]),
         "bundle" => observe_bundle(root, &args[1..]),
         "live-guest-mem" => observe_live_guest_mem(root, &args[1..]),
+        "oscomp-live" => observe_oscomp_live(root, &args[1..]),
         "names" => observe_names(&args[1..]),
         other => Err(format!(
             "unknown observe subcommand '{other}'; \
-             expected replay, analyze, pftrace, validate, demo, extract, bundle, live-guest-mem, or names"
+             expected replay, analyze, pftrace, validate, demo, extract, bundle, live-guest-mem, oscomp-live, or names"
         )),
     }
 }
@@ -1036,68 +1038,12 @@ fn observe_analyze(root: &Path, args: &[String]) -> Result<()> {
         return Err("python3 is required for observe analyze".into());
     }
 
-    let ndjson = if let Some(path) = optional_option_value(args, "--ndjson") {
-        PathBuf::from(path)
-    } else {
-        let file = require_file_arg(args)?;
-        ensure_daemon_built(root)?;
-        let out_dir = root.join("target").join("observe-analyze");
-        fs::create_dir_all(&out_dir)
-            .map_err(|e| format!("failed to create {}: {e}", out_dir.display()))?;
-        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("trace");
-        let ndjson = out_dir.join(format!("{stem}.ndjson"));
-        eprintln!(
-            "observe: replaying {} to {} for analysis",
-            file.display(),
-            ndjson.display()
-        );
-        let output = Command::new(daemon_bin(root))
-            .args(["replay", "--file", &file.to_string_lossy(), "--out", "json"])
-            .output()
-            .map_err(|err| format!("failed to run tx-trace-daemon: {err}"))?;
-        if !output.status.success() {
-            return Err(format!("tx-trace-daemon exited with {}", output.status));
-        }
-        fs::write(&ndjson, output.stdout)
-            .map_err(|e| format!("failed to write {}: {e}", ndjson.display()))?;
-        ndjson
-    };
-
-    if !ndjson.exists() {
-        return Err(format!("ndjson input not found: {}", ndjson.display()));
-    }
-
-    let names = optional_option_value(args, "--names")
-        .map(PathBuf::from)
-        .or_else(|| {
-            let sibling = ndjson.with_extension("names.json");
-            sibling.exists().then_some(sibling)
-        })
-        .or_else(|| {
-            optional_option_value(args, "--file").and_then(|file| {
-                let sibling = PathBuf::from(file).with_extension("names.json");
-                sibling.exists().then_some(sibling)
-            })
-        });
-
-    let top = optional_option_value(args, "--top").unwrap_or_else(|| "20".to_string());
-    let roundtrip_sysno = optional_option_value(args, "--roundtrip-sysno");
     let script = root.join("tools").join("tx-observe-analyze.py");
-    let mut py_args = vec![
-        script.display().to_string(),
-        "--ndjson".to_string(),
-        ndjson.display().to_string(),
-        "--top".to_string(),
-        top,
-    ];
-    if let Some(names) = names {
-        py_args.push("--names".to_string());
-        py_args.push(names.display().to_string());
+    if !script.exists() {
+        return Err(format!("analyzer script not found: {}", script.display()));
     }
-    if let Some(roundtrip_sysno) = roundtrip_sysno {
-        py_args.push("--roundtrip-sysno".to_string());
-        py_args.push(roundtrip_sysno);
-    }
+    let mut py_args = vec![script.display().to_string()];
+    py_args.extend(args.iter().cloned());
     run_cmd_owned(root, "python3", &py_args)
 }
 
@@ -1308,6 +1254,7 @@ fn observe_live_guest_mem(root: &Path, args: &[String]) -> Result<()> {
     pass_optional_arg(args, &mut cmd, "--stop-file");
     pass_optional_arg(args, &mut cmd, "--max-duration-ms");
     pass_optional_arg(args, &mut cmd, "--names");
+    pass_optional_flag(args, &mut cmd, "--finalize");
 
     eprintln!(
         "observe: tx-trace-daemon live-guest-mem --guest-mem {} --kernel {} --out-dir {} ...",

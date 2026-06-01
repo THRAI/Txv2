@@ -659,6 +659,7 @@ fn dispatch_tx_observe_trace_on_private_syscall_enables_tracing() {
 fn dispatch_tx_observe_trace_off_private_syscall_disables_and_requests_dump() {
     let _setup = setup();
     tx_observe::set_enabled(true);
+    tx_observe::set_trace_off_requests_dump(true);
     let _ = tx_observe::should_dump_now();
 
     let proc_cap = bootstrap();
@@ -671,6 +672,27 @@ fn dispatch_tx_observe_trace_off_private_syscall_disables_and_requests_dump() {
     assert_eq!(result, SyscallResult::Return(0));
     assert!(!tx_observe::is_enabled());
     assert!(tx_observe::should_dump_now());
+    tx_observe::set_enabled(true);
+}
+
+#[test]
+fn dispatch_tx_observe_trace_off_can_disable_dump_for_live_drain() {
+    let _setup = setup();
+    tx_observe::set_enabled(true);
+    tx_observe::set_trace_off_requests_dump(false);
+    let _ = tx_observe::should_dump_now();
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let req = SyscallRequest::new(NR_TX_OBSERVE_TRACE_OFF, [0; 6]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(!tx_observe::is_enabled());
+    assert!(!tx_observe::should_dump_now());
+    tx_observe::set_trace_off_requests_dump(true);
     tx_observe::set_enabled(true);
 }
 

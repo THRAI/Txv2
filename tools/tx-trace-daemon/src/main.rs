@@ -104,6 +104,10 @@ enum Command {
         #[arg(long)]
         max_duration_ms: Option<u64>,
 
+        /// Also materialize replay.ndjson and trace.pftrace after raw drain.
+        #[arg(long)]
+        finalize: bool,
+
         /// Optional path to a `names.json` file for EventNameId resolution.
         #[arg(long)]
         names: Option<std::path::PathBuf>,
@@ -166,6 +170,7 @@ fn main() {
             poll_ms,
             stop_file,
             max_duration_ms,
+            finalize,
             names,
         } => {
             let names_map = names.as_deref().and_then(|p| load_names_json(p));
@@ -179,6 +184,7 @@ fn main() {
                 stop_file: stop_file.as_deref(),
                 poll_ms,
                 max_duration_ms,
+                finalize,
                 names_map,
             };
             match replay::run_live_guest_mem(config) {

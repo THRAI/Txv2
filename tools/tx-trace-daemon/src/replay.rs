@@ -63,6 +63,7 @@ const SUPPORTED_RECORD_SIZE: u16 = 80;
 const RING_PRODUCER_OFF: usize = 64;
 const RING_CONSUMER_OFF: usize = 128;
 pub(crate) const RING_LOST_OFF: usize = 192;
+const RING_SEQ_OFF: usize = 200;
 
 const RECORD_MAGIC: u16 = 0x5254;
 const RV64_QEMU_RAM_BASE: u64 = 0x8000_0000;
@@ -107,6 +108,7 @@ pub struct LiveDrainConfig<'a> {
     pub stop_file: Option<&'a Path>,
     pub poll_ms: u64,
     pub max_duration_ms: Option<u64>,
+    pub finalize: bool,
     pub names_map: Option<HashMap<u32, String>>,
 }
 
@@ -288,15 +290,17 @@ pub fn run_live_guest_mem(config: LiveDrainConfig<'_>) -> std::io::Result<TraceS
     }
     raw.flush()?;
 
-    let ndjson_path = config.out_dir.join("replay.ndjson");
-    let pftrace_path = config.out_dir.join("trace.pftrace");
-    finalize_live_raw_records(
-        &raw_path,
-        &ndjson_path,
-        &pftrace_path,
-        config.names_map,
-        &mut totals,
-    )?;
+    if config.finalize {
+        let ndjson_path = config.out_dir.join("replay.ndjson");
+        let pftrace_path = config.out_dir.join("trace.pftrace");
+        finalize_live_raw_records(
+            &raw_path,
+            &ndjson_path,
+            &pftrace_path,
+            config.names_map,
+            &mut totals,
+        )?;
+    }
 
     let stats = ring_layout.stats_from_mmap(&mmap)?;
     let runtime_path = config.out_dir.join("runtime.json");
@@ -315,10 +319,11 @@ pub fn run_live_guest_mem(config: LiveDrainConfig<'_>) -> std::io::Result<TraceS
         "ring_offset": ring_offset,
         "ring_bytes": config.ring_bytes,
         "hart_count": config.hart_count,
+        "finalized": config.finalize,
         "files": {
             "raw_records": "trace.rawrecords",
-            "replay_ndjson": "replay.ndjson",
-            "pftrace": "trace.pftrace",
+            "replay_ndjson": if config.finalize { Some("replay.ndjson") } else { None },
+            "pftrace": if config.finalize { Some("trace.pftrace") } else { None },
         },
         "drained": totals,
         "stats": stats,
@@ -412,6 +417,19 @@ impl LiveRingLayout {
             let producer = read_u64_le(ring, RING_PRODUCER_OFF);
             let consumer = read_u64_le(ring, RING_CONSUMER_OFF);
             let lost = read_u64_le(ring, RING_LOST_OFF);
+            if !self.ring_header_ready(h, ring) {
+                rings.push(RingStats {
+                    hart: h as u16,
+                    producer,
+                    consumer,
+                    effective_consumer: consumer,
+                    visible_records: 0,
+                    overwritten_records: 0,
+                    lost: 0,
+                    framing_errors: 0,
+                });
+                continue;
+            }
             let produced_window = producer.wrapping_sub(consumer);
             let overwritten = produced_window.saturating_sub(self.slot_count as u64);
             let effective_consumer = if overwritten > 0 {
@@ -447,6 +465,29 @@ impl LiveRingLayout {
             rings,
         })
     }
+
+    fn ring_header_ready(&self, hart_index: usize, ring: &[u8]) -> bool {
+        if ring.len() < size_of::<TxTraceHartRing>() {
+            return false;
+        }
+        let ring_hart = u16::from_le_bytes(ring[0..2].try_into().unwrap());
+        let flags = u16::from_le_bytes(ring[2..4].try_into().unwrap());
+        if usize::from(ring_hart) != hart_index || flags != 0 {
+            return false;
+        }
+
+        let producer = read_u64_le(ring, RING_PRODUCER_OFF);
+        let consumer = read_u64_le(ring, RING_CONSUMER_OFF);
+        let seq = read_u64_le(ring, RING_SEQ_OFF);
+        if consumer > producer || producer - consumer > self.slot_count as u64 {
+            return false;
+        }
+
+        // In a valid initialized ring, seq tracks successful record
+        // publication. A concurrent producer may have reserved the next seq
+        // before publishing producer+1, so allow that one-record transient.
+        seq == producer || seq == producer.saturating_add(1)
+    }
 }
 
 fn drain_live_once(
@@ -460,6 +501,9 @@ fn drain_live_once(
         let ring_base = layout.ring_base(h);
         let ring_end = ring_base + size_of::<TxTraceHartRing>();
         let ring = &mmap[ring_base..ring_end];
+        if !layout.ring_header_ready(h, ring) {
+            continue;
+        }
         let ring_hart = u16::from_le_bytes(ring[0..2].try_into().unwrap());
         let producer = read_u64_le(ring, RING_PRODUCER_OFF);
         let consumer = read_u64_le(ring, RING_CONSUMER_OFF);
@@ -1320,6 +1364,7 @@ mod tests {
         let ring_base = ring_offset;
         write_u16_le(&mut mem, ring_base, 0);
         write_u64_le(&mut mem, ring_base + RING_PRODUCER_OFF, 1);
+        write_u64_le(&mut mem, ring_base + RING_SEQ_OFF, 1);
 
         let record = make_record_bytes(
             RECORD_MAGIC,
@@ -1361,6 +1406,38 @@ mod tests {
         assert_eq!(&raw[0..2], &0u16.to_le_bytes());
         let decoded = decode_slot(0, &raw[LIVE_RAW_RECORD_HEADER_BYTES..]);
         assert!(matches!(decoded, DecodedEvent::Record(_)));
+    }
+
+    #[test]
+    fn live_drain_ignores_uninitialized_ring_header() {
+        let ring_order: u8 = 4;
+        let slot_count = 1usize << ring_order;
+        let ring_bytes = size_of::<TxTraceHartRing>() + slot_count * size_of::<TxTraceRecord>();
+        let ring_offset = 128usize;
+        let mut mem = vec![0u8; ring_offset + ring_bytes];
+        let ring_base = ring_offset;
+
+        write_u16_le(&mut mem, ring_base, 0);
+        write_u64_le(&mut mem, ring_base + RING_PRODUCER_OFF, 8);
+        write_u64_le(&mut mem, ring_base + RING_CONSUMER_OFF, 3);
+        write_u64_le(&mut mem, ring_base + RING_SEQ_OFF, 0xfeed_beef);
+
+        let layout = LiveRingLayout::new(ring_offset, 1, ring_bytes).expect("layout");
+        let mut raw = Vec::new();
+        let mut totals = LiveDrainTotals::default();
+
+        let drained = drain_live_once(&mut mem, &layout, &mut raw, &mut totals).expect("live drain");
+
+        assert_eq!(drained, 0);
+        assert_eq!(totals.raw_records, 0);
+        assert!(raw.is_empty());
+        assert_eq!(
+            read_u64_le(
+                &mem[ring_base..ring_base + size_of::<TxTraceHartRing>()],
+                RING_CONSUMER_OFF
+            ),
+            3
+        );
     }
 
     #[test]

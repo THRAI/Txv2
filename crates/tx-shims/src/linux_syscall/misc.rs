@@ -28,7 +28,11 @@ pub(super) fn sys_tx_observe_trace_on() -> SyscallResult {
 /// Private txKernel debug syscall: stop tracing and request a trace dump.
 pub(super) fn sys_tx_observe_trace_off() -> SyscallResult {
     tx_observe::set_enabled(false);
-    tx_observe::request_dump();
+    if tx_observe::trace_off_requests_dump() {
+        tx_observe::request_dump();
+    } else {
+        tx_observe::clear_dump_request();
+    }
     SyscallResult::Return(0)
 }
 

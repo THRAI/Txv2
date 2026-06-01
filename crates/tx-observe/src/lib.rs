@@ -803,6 +803,8 @@ static DUMP_THRESHOLD: AtomicU64 = AtomicU64::new(0);
 static DUMP_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static DUMP_SHUTDOWN_FN: AtomicU64 = AtomicU64::new(0);
 
+static TRACE_OFF_REQUESTS_DUMP: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
 /// Configure a "bounded dump" threshold for the current run.
 ///
 /// Once the global emitted-record counter exceeds `n`, the next call to
@@ -829,6 +831,32 @@ pub fn should_dump_now() -> bool {
 #[inline]
 pub fn request_dump() {
     DUMP_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Clear a pending trace dump request.
+///
+/// Live host-drain workflows use the same guest bracketing syscalls as the
+/// serial dump path, but they drain the shared rings out-of-band and must not
+/// let trace-off request a serial dump/shutdown.
+#[inline]
+pub fn clear_dump_request() {
+    DUMP_REQUESTED.store(false, Ordering::Release);
+}
+
+/// Configure whether a private trace-off syscall should request a serial dump.
+///
+/// Serial-bracket traces keep the default `true`. Live shared-memory drains set
+/// this to `false` so the bracket only gates producer emission and the host
+/// owns final artifact generation.
+#[inline]
+pub fn set_trace_off_requests_dump(enabled: bool) {
+    TRACE_OFF_REQUESTS_DUMP.store(enabled, Ordering::Relaxed);
+}
+
+/// Return whether trace-off should request a serial dump.
+#[inline]
+pub fn trace_off_requests_dump() -> bool {
+    TRACE_OFF_REQUESTS_DUMP.load(Ordering::Relaxed)
 }
 
 type DumpShutdownFn = fn() -> !;
