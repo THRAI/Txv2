@@ -24,7 +24,8 @@
 //! it; pmap `MapPin`s are acquired separately on PTE install.
 
 use crate::vm::adapter::step_engine::{self as step_engine};
-use crate::vm::adapter::step_engine::{Cap, SpinMutex, Zone, ZoneAllocated, ZoneError};
+use crate::vm::adapter::step_engine::{Cap, Zone, ZoneAllocated, ZoneError};
+use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use step_engine::page_allocator::{BitmapPageAllocator, CachePin};
@@ -193,7 +194,7 @@ unsafe impl ZoneAllocated for PrivatePageSet {
 /// fork operations publish new Caps whose internal trees structurally share
 /// unchanged resident entries, so VMA surgery does not reacquire every page pin.
 pub struct PrivatePageSet {
-    pages: SpinMutex<PrivatePageTree>,
+    pages: VmSpinMutex<PrivatePageTree>,
     key_base: u64,
 }
 
@@ -228,15 +229,27 @@ impl PrivatePageTree {
     }
 
     fn insert_if_absent(
-        &self,
+        &mut self,
         key: VmPageOff,
         frame: PrivateFrame,
-    ) -> Result<(Self, usize, usize), Arc<PrivateFrame>> {
+    ) -> Result<(usize, usize), Arc<PrivateFrame>> {
         if let Some(existing) = self.lookup(key) {
             return Err(existing);
         }
         let mut touched = 0usize;
         let mut node_allocs = 0usize;
+        if private_insert_path_is_unique(&self.root, key) {
+            insert_private_node_in_place(
+                &mut self.root,
+                key,
+                Arc::new(frame),
+                &mut touched,
+                &mut node_allocs,
+            );
+            self.len += 1;
+            return Ok((touched, node_allocs));
+        }
+
         let root = Some(insert_private_node_counted(
             self.root.clone(),
             key,
@@ -244,14 +257,9 @@ impl PrivatePageTree {
             &mut touched,
             &mut node_allocs,
         ));
-        Ok((
-            Self {
-                root,
-                len: self.len + 1,
-            },
-            touched,
-            node_allocs,
-        ))
+        self.root = root;
+        self.len += 1;
+        Ok((touched, node_allocs))
     }
 
     fn replace_exact(
@@ -391,10 +399,30 @@ fn record_private_install_debug(
         PRIVATE_INSTALL_SAMPLES[sample_index as usize]
             .store((clamped_len << 32) | clamped_duration, Ordering::Relaxed);
     }
+    emit_private_page_allocation(b"debug.alloc.vm.private_page_node", node_allocs as u64);
+    emit_private_page_allocation(b"debug.alloc.vm.private_page_node.duration_ns", duration_ns);
 }
 
 fn private_node_len(root: &Option<Arc<PrivatePageNode>>) -> usize {
     root.as_ref().map_or(0, |node| node.subtree_len)
+}
+
+fn private_node_recompute_len(node: &mut PrivatePageNode) {
+    node.subtree_len = 1 + private_node_len(&node.left) + private_node_len(&node.right);
+}
+
+fn private_insert_path_is_unique(root: &Option<Arc<PrivatePageNode>>, key: VmPageOff) -> bool {
+    let Some(node) = root else {
+        return true;
+    };
+    if Arc::strong_count(node) != 1 {
+        return false;
+    }
+    if key < node.key {
+        private_insert_path_is_unique(&node.left, key)
+    } else {
+        private_insert_path_is_unique(&node.right, key)
+    }
 }
 
 fn build_private_node(
@@ -517,6 +545,45 @@ fn insert_private_node_counted(
             ),
             node_allocs,
         )
+    }
+}
+
+fn insert_private_node_in_place(
+    root: &mut Option<Arc<PrivatePageNode>>,
+    key: VmPageOff,
+    frame: Arc<PrivateFrame>,
+    touched: &mut usize,
+    node_allocs: &mut usize,
+) {
+    let Some(node) = root else {
+        *touched += 1;
+        *node_allocs += 1;
+        *root = Some(build_private_node(
+            key,
+            private_page_priority(key),
+            frame,
+            None,
+            None,
+        ));
+        return;
+    };
+
+    *touched += 1;
+    let inserted_left = key < node.key;
+    {
+        let node = Arc::get_mut(node).expect("in-place private insert path must be unique");
+        if inserted_left {
+            insert_private_node_in_place(&mut node.left, key, frame, touched, node_allocs);
+        } else {
+            insert_private_node_in_place(&mut node.right, key, frame, touched, node_allocs);
+        }
+        private_node_recompute_len(node);
+    }
+
+    if inserted_left {
+        rotate_private_right_in_place_if_needed(root);
+    } else {
+        rotate_private_left_in_place_if_needed(root);
     }
 }
 
@@ -712,6 +779,72 @@ fn rotate_private_left_if_needed_counted(
     )
 }
 
+fn rotate_private_right_in_place_if_needed(root: &mut Option<Arc<PrivatePageNode>>) {
+    let should_rotate = root
+        .as_ref()
+        .and_then(|node| {
+            node.left
+                .as_ref()
+                .map(|left| left.priority <= node.priority)
+        })
+        .unwrap_or(false);
+    if !should_rotate {
+        return;
+    }
+
+    let mut old_root = root.take().expect("rotation requires a root");
+    let mut new_root = Arc::get_mut(&mut old_root)
+        .expect("in-place private rotation root must be unique")
+        .left
+        .take()
+        .expect("right rotation requires a left child");
+    {
+        let old = Arc::get_mut(&mut old_root).expect("old root must remain unique");
+        let new = Arc::get_mut(&mut new_root).expect("new root must be unique");
+        old.left = new.right.take();
+        private_node_recompute_len(old);
+    }
+    {
+        let new = Arc::get_mut(&mut new_root).expect("new root must remain unique");
+        new.right = Some(old_root);
+        private_node_recompute_len(new);
+    }
+    *root = Some(new_root);
+}
+
+fn rotate_private_left_in_place_if_needed(root: &mut Option<Arc<PrivatePageNode>>) {
+    let should_rotate = root
+        .as_ref()
+        .and_then(|node| {
+            node.right
+                .as_ref()
+                .map(|right| right.priority <= node.priority)
+        })
+        .unwrap_or(false);
+    if !should_rotate {
+        return;
+    }
+
+    let mut old_root = root.take().expect("rotation requires a root");
+    let mut new_root = Arc::get_mut(&mut old_root)
+        .expect("in-place private rotation root must be unique")
+        .right
+        .take()
+        .expect("left rotation requires a right child");
+    {
+        let old = Arc::get_mut(&mut old_root).expect("old root must remain unique");
+        let new = Arc::get_mut(&mut new_root).expect("new root must be unique");
+        old.right = new.left.take();
+        private_node_recompute_len(old);
+    }
+    {
+        let new = Arc::get_mut(&mut new_root).expect("new root must remain unique");
+        new.left = Some(old_root);
+        private_node_recompute_len(new);
+    }
+    *root = Some(new_root);
+}
+
 fn private_page_priority(key: VmPageOff) -> u64 {
     let mut x = key.0;
     x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -739,7 +872,10 @@ unsafe impl Sync for PrivatePageSet {}
 impl PrivatePageSet {
     pub fn new() -> Self {
         Self {
-            pages: SpinMutex::new(PrivatePageTree::default()),
+            pages: vm_spin_mutex(
+                PrivatePageTree::default(),
+                b"debug.lock.vm.private_page_set.pages",
+            ),
             key_base: 0,
         }
     }
@@ -754,7 +890,7 @@ impl PrivatePageSet {
         Ok(step_engine::sign_for(
             reservation,
             Self {
-                pages: SpinMutex::new(tree),
+                pages: vm_spin_mutex(tree, b"debug.lock.vm.private_page_set.pages"),
                 key_base,
             },
         ))
@@ -780,6 +916,21 @@ impl PrivatePageSet {
         off: VmPageOff,
         frame: PrivateFrame,
     ) -> Result<PrivateFrameSnapshot, PrivatePageError> {
+        if tx_observe::current().is_none() {
+            let mut pages = self.pages.lock();
+            let snap = PrivateFrameSnapshot {
+                ppn: frame.ppn,
+                state: frame.state(),
+            };
+            let key = self.key_for(off);
+            return pages
+                .insert_if_absent(key, frame)
+                .map(|_| snap)
+                .map_err(|existing| PrivatePageError::Conflict {
+                    current: snapshot_from_frame(&existing),
+                });
+        }
+
         emit_private_page_trace(b"debug.vm.private_set.install.phase", 0);
         let mut pages = self.pages.lock();
         emit_private_page_trace(b"debug.vm.private_set.install.phase", 1);
@@ -794,7 +945,7 @@ impl PrivatePageSet {
         let len_before = pages.len;
         let install_start_ns = tx_observe::clock_now_ns();
         match pages.insert_if_absent(key, frame) {
-            Ok((next, touched, node_allocs)) => {
+            Ok((touched, node_allocs)) => {
                 let install_duration_ns =
                     tx_observe::clock_now_ns().saturating_sub(install_start_ns);
                 record_private_install_debug(install_duration_ns, touched, node_allocs, len_before);
@@ -804,7 +955,6 @@ impl PrivatePageSet {
                     b"debug.vm.private_set.install.node_allocs",
                     node_allocs as i64,
                 );
-                *pages = next;
                 emit_private_page_trace(b"debug.vm.private_set.install.phase", 4);
                 Ok(snap)
             }
@@ -907,10 +1057,82 @@ fn emit_private_page_trace(name: &[u8], value: i64) {
     }
 }
 
+fn emit_private_page_allocation(name: &[u8], value: u64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.allocation(
+            tx_observe::AllocationTrack::VmPrivatePageNode,
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+    }
+}
+
 impl core::fmt::Debug for PrivatePageSet {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PrivatePageSet")
             .field("len", &self.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::adapter::step_engine::page_allocator::{self, ZeroPolicy};
+
+    fn test_private_frame() -> PrivateFrame {
+        tx_substrate::testing::init_host_for_test_once();
+        let owned = page_allocator::reserve_frame(ZeroPolicy::UninitFullOverwrite)
+            .expect("test frame reservation")
+            .commit();
+        let ppn = owned.ppn();
+        let cache_pin = owned.try_cache_pin().expect("cache pin");
+        drop(owned);
+        PrivateFrame::new(ppn, PrivateFrameState::Exclusive, cache_pin)
+    }
+
+    #[test]
+    fn unshared_private_installs_allocate_only_leaf_nodes() {
+        reset_private_page_debug_totals();
+        let set = PrivatePageSet::new();
+
+        for off in 0..64 {
+            set.install_if_absent(VmPageOff(off), test_private_frame())
+                .expect("private install");
+        }
+
+        let totals = private_page_debug_totals();
+        assert_eq!(set.len(), 64);
+        assert_eq!(totals.count, 64);
+        assert_eq!(
+            totals.node_alloc_total, 64,
+            "unshared inserts should mutate existing path nodes in place"
+        );
+        assert_eq!(totals.node_alloc_max, 1);
+        assert!(set.lookup(VmPageOff(0)).is_some());
+        assert!(set.lookup(VmPageOff(63)).is_some());
+    }
+
+    #[test]
+    fn shared_private_tree_falls_back_to_path_copy_insert() {
+        let set = PrivatePageSet::new();
+        for off in 0..16 {
+            set.install_if_absent(VmPageOff(off), test_private_frame())
+                .expect("private install");
+        }
+        let shared_snapshot = set.pages.lock().clone();
+
+        reset_private_page_debug_totals();
+        set.install_if_absent(VmPageOff(64), test_private_frame())
+            .expect("private install into shared tree");
+
+        let totals = private_page_debug_totals();
+        assert_eq!(totals.count, 1);
+        assert!(
+            totals.node_alloc_total > 1,
+            "shared roots must preserve structural sharing by path-copying"
+        );
+        assert_eq!(shared_snapshot.len, 16);
+        assert_eq!(set.len(), 17);
     }
 }

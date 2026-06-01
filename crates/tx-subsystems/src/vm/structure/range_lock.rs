@@ -9,8 +9,9 @@
 //! `RANGE_LOCK_RELEASE_MASK` bit so async script wrappers can convert a
 //! `WouldBlock` outcome into an awaitable wait via `WouldBlock::wait_token`.
 
-use crate::vm::adapter::step_engine::{NoProgress, SpinMutex, StepOutcome as V3StepOutcome};
+use crate::vm::adapter::step_engine::{NoProgress, StepOutcome as V3StepOutcome};
 use crate::vm::adapter::wait_routing::{Channel, WaitSource};
+use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
 use alloc::sync::Arc;
 
 use crate::execution::WaitToken;
@@ -111,7 +112,7 @@ impl Drop for PendingWriter<'_> {
 /// This type preserves the declared overlap semantics and writer preference,
 /// but it is not the final optimized segment tree/concurrent interval index.
 pub struct RangeLock {
-    state: SpinMutex<RangeLockState>,
+    state: VmSpinMutex<RangeLockState>,
     wait_channel: Channel,
     wait_source: Arc<WaitSource>,
     wait_source_id: u64,
@@ -121,7 +122,7 @@ impl RangeLock {
     pub fn new() -> Self {
         let wait_point = crate::vm::notification::new_range_lock_wait_point();
         Self {
-            state: SpinMutex::new(RangeLockState::new()),
+            state: vm_spin_mutex(RangeLockState::new(), b"debug.lock.vm.range_lock.state"),
             wait_channel: wait_point.channel,
             wait_source: wait_point.source,
             wait_source_id: wait_point.source_id,

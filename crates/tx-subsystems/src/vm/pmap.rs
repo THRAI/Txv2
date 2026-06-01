@@ -1,4 +1,5 @@
-use crate::vm::adapter::step_engine::{SpinMutex, ZoneError};
+use crate::vm::adapter::step_engine::ZoneError;
+use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
 #[cfg(test)]
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -33,12 +34,22 @@ static PMAP_DROP_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static PMAP_BATCH_INSERT_COUNT: AtomicU64 = AtomicU64::new(0);
 static PMAP_BATCH_INSERT_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 static PMAP_BATCH_INSERT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+static PMAP_TEARDOWN_REMOVE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PMAP_TEARDOWN_REMOVE_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static PMAP_TEARDOWN_REMOVE_MAX_NS: AtomicU64 = AtomicU64::new(0);
+static PMAP_TEARDOWN_REMOVE_SHIFTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PMAP_TEARDOWN_REMOVE_SHIFTED_MAX: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::vm) struct PmapDebugTotals {
     pub batch_insert_count: u64,
     pub batch_insert_total_ns: u64,
     pub batch_insert_max_ns: u64,
+    pub teardown_remove_count: u64,
+    pub teardown_remove_total_ns: u64,
+    pub teardown_remove_max_ns: u64,
+    pub teardown_remove_shifted_total: u64,
+    pub teardown_remove_shifted_max: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -142,7 +153,7 @@ pub(in crate::vm) struct PmapBatchPage {
 pub struct VmPmap {
     root: Option<PmapRoot>,
     ops: VmPmapOps,
-    state: SpinMutex<VmPmapState>,
+    state: VmSpinMutex<VmPmapState>,
 }
 
 impl VmPmap {
@@ -151,7 +162,7 @@ impl VmPmap {
         Ok(Self {
             root: Some(root),
             ops: VmPmapOps::for_platform::<P>(),
-            state: SpinMutex::new(VmPmapState::new()),
+            state: vm_spin_mutex(VmPmapState::new(), b"debug.lock.vm.pmap.state"),
         })
     }
 
@@ -330,11 +341,15 @@ impl VmPmap {
             emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.insert.phase", 0);
             let mapping = PmapMapping::new(page.ppn, page.prot, page.map_pin);
             emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.insert.phase", 1);
-            let insert_start_ns = tx_observe::clock_now_ns();
+            let insert_start_ns = tx_observe::current()
+                .is_some()
+                .then(tx_observe::clock_now_ns);
             state.mappings.insert(page.page, mapping);
-            record_pmap_batch_insert_debug(
-                tx_observe::clock_now_ns().saturating_sub(insert_start_ns),
-            );
+            if let Some(insert_start_ns) = insert_start_ns {
+                record_pmap_batch_insert_debug(
+                    tx_observe::clock_now_ns().saturating_sub(insert_start_ns),
+                );
+            }
             emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.insert.phase", 2);
             emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.phase", 6);
             state.commits += 1;
@@ -359,26 +374,40 @@ impl VmPmap {
     pub fn teardown_range(&self, range: UserRange) -> Result<usize, VmPmapError> {
         emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 0);
         let mut removed = 0;
-        let pages = {
-            let state = self.state.lock();
-            mapped_pages_in_range(&state, range)
+        let (start, end) = page_bounds_for_range(range);
+        let remove_start_ns = tx_observe::current()
+            .is_some()
+            .then(tx_observe::clock_now_ns);
+        let (mappings, shifted) = {
+            let mut state = self.state.lock();
+            state.mappings.drain_range(start, end)
         };
+        if let Some(remove_start_ns) = remove_start_ns {
+            record_pmap_teardown_remove_debug(
+                tx_observe::clock_now_ns().saturating_sub(remove_start_ns),
+                shifted,
+                mappings.len(),
+            );
+        }
         emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 1);
-        emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.pages", pages.len() as i64);
+        emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.pages", mappings.len() as i64);
 
         let mut invalidations = Vec::new();
         let mut pins = Vec::new();
-        for page in pages {
+        let mut mappings = mappings.into_iter();
+        while let Some((page, mapping)) = mappings.next() {
             emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 2);
-            let Some(mapping) = self.state.lock().mappings.remove(&page) else {
-                continue;
-            };
             emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 3);
 
             let result = match self.unmap_tracked_page(page, mapping.ppn) {
                 Ok(result) => result,
                 Err(error) => {
-                    self.state.lock().mappings.insert(page, mapping);
+                    let mut state = self.state.lock();
+                    state.mappings.insert(page, mapping);
+                    for (remaining_page, remaining_mapping) in mappings {
+                        state.mappings.insert(remaining_page, remaining_mapping);
+                    }
+                    drop(state);
                     self.issue_unmap_batch(&mut invalidations, &mut pins);
                     return Err(error);
                 }
@@ -594,9 +623,30 @@ impl PmapResidentStore {
     }
 
     fn remove(&mut self, page: &UserPage) -> Option<PmapMapping> {
-        self.search(*page)
-            .ok()
-            .map(|index| self.entries.remove(index).1)
+        self.remove_with_shift(page).map(|(mapping, _)| mapping)
+    }
+
+    fn remove_with_shift(&mut self, page: &UserPage) -> Option<(PmapMapping, usize)> {
+        self.search(*page).ok().map(|index| {
+            let shifted = self.entries.len().saturating_sub(index + 1);
+            (self.entries.remove(index).1, shifted)
+        })
+    }
+
+    fn drain_range(
+        &mut self,
+        start: UserPage,
+        end: UserPage,
+    ) -> (Vec<(UserPage, PmapMapping)>, usize) {
+        let start_index = self.search(start).unwrap_or_else(|index| index);
+        let end_index = self.search(end).unwrap_or_else(|index| index);
+        if start_index >= end_index {
+            return (Vec::new(), 0);
+        }
+
+        let shifted = self.entries.len().saturating_sub(end_index);
+        let removed = self.entries.drain(start_index..end_index).collect();
+        (removed, shifted)
     }
 
     fn snapshots_in_range(
@@ -663,6 +713,11 @@ pub(in crate::vm) fn reset_pmap_debug_totals() {
     PMAP_BATCH_INSERT_COUNT.store(0, Ordering::Relaxed);
     PMAP_BATCH_INSERT_TOTAL_NS.store(0, Ordering::Relaxed);
     PMAP_BATCH_INSERT_MAX_NS.store(0, Ordering::Relaxed);
+    PMAP_TEARDOWN_REMOVE_COUNT.store(0, Ordering::Relaxed);
+    PMAP_TEARDOWN_REMOVE_TOTAL_NS.store(0, Ordering::Relaxed);
+    PMAP_TEARDOWN_REMOVE_MAX_NS.store(0, Ordering::Relaxed);
+    PMAP_TEARDOWN_REMOVE_SHIFTED_TOTAL.store(0, Ordering::Relaxed);
+    PMAP_TEARDOWN_REMOVE_SHIFTED_MAX.store(0, Ordering::Relaxed);
 }
 
 pub(in crate::vm) fn pmap_debug_totals() -> PmapDebugTotals {
@@ -670,6 +725,11 @@ pub(in crate::vm) fn pmap_debug_totals() -> PmapDebugTotals {
         batch_insert_count: PMAP_BATCH_INSERT_COUNT.load(Ordering::Relaxed),
         batch_insert_total_ns: PMAP_BATCH_INSERT_TOTAL_NS.load(Ordering::Relaxed),
         batch_insert_max_ns: PMAP_BATCH_INSERT_MAX_NS.load(Ordering::Relaxed),
+        teardown_remove_count: PMAP_TEARDOWN_REMOVE_COUNT.load(Ordering::Relaxed),
+        teardown_remove_total_ns: PMAP_TEARDOWN_REMOVE_TOTAL_NS.load(Ordering::Relaxed),
+        teardown_remove_max_ns: PMAP_TEARDOWN_REMOVE_MAX_NS.load(Ordering::Relaxed),
+        teardown_remove_shifted_total: PMAP_TEARDOWN_REMOVE_SHIFTED_TOTAL.load(Ordering::Relaxed),
+        teardown_remove_shifted_max: PMAP_TEARDOWN_REMOVE_SHIFTED_MAX.load(Ordering::Relaxed),
     }
 }
 
@@ -677,6 +737,17 @@ fn record_pmap_batch_insert_debug(duration_ns: u64) {
     PMAP_BATCH_INSERT_COUNT.fetch_add(1, Ordering::Relaxed);
     PMAP_BATCH_INSERT_TOTAL_NS.fetch_add(duration_ns, Ordering::Relaxed);
     atomic_max(&PMAP_BATCH_INSERT_MAX_NS, duration_ns);
+}
+
+fn record_pmap_teardown_remove_debug(duration_ns: u64, shifted: usize, removed: usize) {
+    if removed == 0 {
+        return;
+    }
+    PMAP_TEARDOWN_REMOVE_COUNT.fetch_add(removed as u64, Ordering::Relaxed);
+    PMAP_TEARDOWN_REMOVE_TOTAL_NS.fetch_add(duration_ns, Ordering::Relaxed);
+    atomic_max(&PMAP_TEARDOWN_REMOVE_MAX_NS, duration_ns);
+    PMAP_TEARDOWN_REMOVE_SHIFTED_TOTAL.fetch_add(shifted as u64, Ordering::Relaxed);
+    atomic_max(&PMAP_TEARDOWN_REMOVE_SHIFTED_MAX, shifted as u64);
 }
 
 fn pmap_drop_trace_sample() -> Option<i64> {

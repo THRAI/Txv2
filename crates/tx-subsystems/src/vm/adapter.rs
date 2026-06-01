@@ -46,7 +46,7 @@ pub mod step_engine {
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::SpinMutex;
+    pub use tx_substrate::{LockMetricsOff, LockMetricsOn, SpinMutex};
 }
 
 #[platform_adapter(

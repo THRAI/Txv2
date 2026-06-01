@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 pub mod adapter;
 pub mod checks;
 pub mod execution;
+mod lock_metrics;
 pub mod notification;
 mod pmap;
 pub mod project;
@@ -50,6 +51,7 @@ pub use user_access::UserAccessKind;
 
 pub fn reset_debug_phase_totals() {
     structure::reset_private_page_debug_totals();
+    structure::reset_recipe_debug_totals();
     pmap::reset_pmap_debug_totals();
 }
 
@@ -78,6 +80,42 @@ pub fn dump_debug_phase_totals<P: tx_hal::ConsoleIf>() {
     );
     dump_private_install_distribution::<P>();
 
+    let recipe = structure::recipe_debug_totals();
+    let recipe_avg_ns = if recipe.op_count == 0 {
+        0
+    } else {
+        recipe.op_total_ns / recipe.op_count
+    };
+    write_debug_line::<P>(
+        ":vm:phase-total:recipe.publish",
+        &[
+            ("count", recipe.op_count),
+            ("total_ns", recipe.op_total_ns),
+            ("avg_ns", recipe_avg_ns),
+            ("max_ns", recipe.op_max_ns),
+            ("touched_total", recipe.op_touched_total),
+            ("node_alloc_total", recipe.op_node_alloc_total),
+            ("node_alloc_max", recipe.op_node_alloc_max),
+            ("node_alloc_count", recipe.node_alloc_count),
+        ],
+    );
+    let recipe_reclaim_avg_ns = if recipe.reclaim_count == 0 {
+        0
+    } else {
+        recipe.reclaim_total_ns / recipe.reclaim_count
+    };
+    write_debug_line::<P>(
+        ":vm:phase-total:recipe.reclaim_tree",
+        &[
+            ("count", recipe.reclaim_count),
+            ("total_ns", recipe.reclaim_total_ns),
+            ("avg_ns", recipe_reclaim_avg_ns),
+            ("max_ns", recipe.reclaim_max_ns),
+            ("node_total", recipe.reclaim_node_total),
+            ("node_max", recipe.reclaim_node_max),
+        ],
+    );
+
     let pmap = pmap::pmap_debug_totals();
     let pmap_avg_ns = if pmap.batch_insert_count == 0 {
         0
@@ -91,6 +129,22 @@ pub fn dump_debug_phase_totals<P: tx_hal::ConsoleIf>() {
             ("total_ns", pmap.batch_insert_total_ns),
             ("avg_ns", pmap_avg_ns),
             ("max_ns", pmap.batch_insert_max_ns),
+        ],
+    );
+    let pmap_remove_avg_ns = if pmap.teardown_remove_count == 0 {
+        0
+    } else {
+        pmap.teardown_remove_total_ns / pmap.teardown_remove_count
+    };
+    write_debug_line::<P>(
+        ":vm:phase-total:pmap.teardown.remove",
+        &[
+            ("count", pmap.teardown_remove_count),
+            ("total_ns", pmap.teardown_remove_total_ns),
+            ("avg_ns", pmap_remove_avg_ns),
+            ("max_ns", pmap.teardown_remove_max_ns),
+            ("shifted_total", pmap.teardown_remove_shifted_total),
+            ("shifted_max", pmap.teardown_remove_shifted_max),
         ],
     );
     write_debug_line::<P>(

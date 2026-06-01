@@ -5,7 +5,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use crate::vm::adapter::step_engine::{epoch_mod as epoch, SpinMutex};
+use crate::vm::adapter::step_engine::epoch_mod as epoch;
+use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
 
 use crate::execution::Guard;
 
@@ -14,6 +15,58 @@ use super::{
     UserVirtAddr, VmBacking, VmEntry, VmEntryError, VmEntryFlags, VmMapCommit, VmMapError,
     VmRemapPlacement, USER_PAGE_SIZE,
 };
+
+static RECIPE_OP_COUNT: AtomicUsize = AtomicUsize::new(0);
+static RECIPE_OP_TOTAL_NS: AtomicUsize = AtomicUsize::new(0);
+static RECIPE_OP_MAX_NS: AtomicUsize = AtomicUsize::new(0);
+static RECIPE_OP_TOUCHED_TOTAL: AtomicUsize = AtomicUsize::new(0);
+static RECIPE_OP_NODE_ALLOC_TOTAL: AtomicUsize = AtomicUsize::new(0);
+static RECIPE_OP_NODE_ALLOC_MAX: AtomicUsize = AtomicUsize::new(0);
+static RECIPE_NODE_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+static RECIPE_RECLAIM_COUNT: AtomicUsize = AtomicUsize::new(0);
+static RECIPE_RECLAIM_TOTAL_NS: AtomicUsize = AtomicUsize::new(0);
+static RECIPE_RECLAIM_MAX_NS: AtomicUsize = AtomicUsize::new(0);
+static RECIPE_RECLAIM_NODE_TOTAL: AtomicUsize = AtomicUsize::new(0);
+static RECIPE_RECLAIM_NODE_MAX: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::vm) struct RecipeDebugTotals {
+    pub op_count: u64,
+    pub op_total_ns: u64,
+    pub op_max_ns: u64,
+    pub op_touched_total: u64,
+    pub op_node_alloc_total: u64,
+    pub op_node_alloc_max: u64,
+    pub node_alloc_count: u64,
+    pub reclaim_count: u64,
+    pub reclaim_total_ns: u64,
+    pub reclaim_max_ns: u64,
+    pub reclaim_node_total: u64,
+    pub reclaim_node_max: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RecipePublishOp {
+    MapRequireFree = 0,
+    MapFixedReplace = 1,
+    Unmap = 2,
+    Protect = 3,
+    Locked = 4,
+    RemapMove = 5,
+    RemapInPlace = 6,
+    ReplaceEntry = 7,
+    UfdTag = 8,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RecipePublishDebug {
+    op: RecipePublishOp,
+    before_len: usize,
+    changed_pages: usize,
+    touched_entries: usize,
+    node_allocs: usize,
+    duration_ns: u64,
+}
 
 #[derive(Clone, Default)]
 struct RecipeTree {
@@ -194,7 +247,21 @@ fn build_node(
 ) -> Arc<RecipeNode> {
     let subtree_len = 1 + node_len(&left) + node_len(&right);
     let subtree_vm_size = entry.range.len() + node_vm_size(&left) + node_vm_size(&right);
-    Arc::new(RecipeNode {
+    if tx_observe::current().is_none() {
+        return Arc::new(RecipeNode {
+            key,
+            priority,
+            entry,
+            left,
+            right,
+            subtree_len,
+            subtree_vm_size,
+        });
+    }
+
+    RECIPE_NODE_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+    let alloc_start_ns = tx_observe::clock_now_ns();
+    let node = Arc::new(RecipeNode {
         key,
         priority,
         entry,
@@ -202,7 +269,13 @@ fn build_node(
         right,
         subtree_len,
         subtree_vm_size,
-    })
+    });
+    emit_vm_recipe_allocation(b"debug.alloc.vm.recipe_node", 1);
+    emit_vm_recipe_allocation(
+        b"debug.alloc.vm.recipe_node.duration_ns",
+        tx_observe::clock_now_ns().saturating_sub(alloc_start_ns),
+    );
+    node
 }
 
 fn insert_node(
@@ -403,7 +476,7 @@ fn recipe_priority(key: UserVirtAddr) -> u64 {
 /// lifetimes.
 pub(in crate::vm) struct RecipeIndex {
     current: AtomicPtr<RecipeTree>,
-    mutation: SpinMutex<()>,
+    mutation: VmSpinMutex<()>,
     #[cfg(test)]
     last_publish_touched_entries: AtomicUsize,
 }
@@ -440,17 +513,79 @@ impl RecipeIndex {
         let initial = Box::into_raw(Box::new(RecipeTree::new()));
         Self {
             current: AtomicPtr::new(initial),
-            mutation: SpinMutex::new(()),
+            mutation: vm_spin_mutex((), b"debug.lock.vm.recipe_index.mutation"),
             #[cfg(test)]
             last_publish_touched_entries: AtomicUsize::new(0),
         }
+    }
+
+    fn rewrite_with_debug<F>(
+        &self,
+        op: RecipePublishOp,
+        current: &RecipeTree,
+        rewrite: F,
+    ) -> Result<(VmMapCommit, usize), VmMapError>
+    where
+        F: FnOnce(
+            &RecipeTree,
+        )
+            -> Result<(RecipeTree, usize, AddressSpaceStatsDelta, usize), VmMapError>,
+    {
+        if tx_observe::current().is_none() {
+            let (rewritten, changed_pages, stats_delta, touched_entries) = rewrite(current)?;
+            self.publish(
+                rewritten,
+                RecipePublishDebug {
+                    op,
+                    before_len: current.len,
+                    changed_pages,
+                    touched_entries,
+                    node_allocs: 0,
+                    duration_ns: 0,
+                },
+            );
+            return Ok((
+                VmMapCommit {
+                    changed_pages,
+                    stats_delta,
+                },
+                touched_entries,
+            ));
+        }
+
+        let before_len = current.len;
+        let before_allocs = RECIPE_NODE_ALLOC_COUNT.load(Ordering::Relaxed);
+        let start_ns = tx_observe::clock_now_ns();
+        let (rewritten, changed_pages, stats_delta, touched_entries) = rewrite(current)?;
+        let duration_ns = tx_observe::clock_now_ns().saturating_sub(start_ns);
+        let node_allocs = RECIPE_NODE_ALLOC_COUNT
+            .load(Ordering::Relaxed)
+            .saturating_sub(before_allocs);
+        self.publish(
+            rewritten,
+            RecipePublishDebug {
+                op,
+                before_len,
+                changed_pages,
+                touched_entries,
+                node_allocs,
+                duration_ns,
+            },
+        );
+        Ok((
+            VmMapCommit {
+                changed_pages,
+                stats_delta,
+            },
+            touched_entries,
+        ))
     }
 
     pub(in crate::vm) fn clone_shared(&self, guard: &Guard<'_>) -> Self {
         let initial = Box::into_raw(Box::new(self.pinned(guard).clone()));
         Self {
             current: AtomicPtr::new(initial),
-            mutation: SpinMutex::new(()),
+            mutation: vm_spin_mutex((), b"debug.lock.vm.recipe_index.mutation"),
             #[cfg(test)]
             last_publish_touched_entries: AtomicUsize::new(0),
         }
@@ -515,16 +650,37 @@ impl RecipeIndex {
 
     /// Replace the published tree with `next` and retire the old one through
     /// EBR. Requires the writer mutation lock to already be held.
-    fn publish(&self, next: RecipeTree, touched_entries: usize) {
+    fn publish(&self, next: RecipeTree, debug: RecipePublishDebug) {
         #[cfg(test)]
         self.last_publish_touched_entries
-            .store(touched_entries, Ordering::Release);
+            .store(debug.touched_entries, Ordering::Release);
         #[cfg(not(test))]
-        let _ = touched_entries;
-        emit_vm_recipe_trace(
-            b"debug.vm.recipe.publish.touched_entries",
-            touched_entries as i64,
-        );
+        let _ = debug.touched_entries;
+        if tx_observe::current().is_some() {
+            record_recipe_publish_debug(&debug, next.len);
+            emit_vm_recipe_trace(
+                b"debug.vm.recipe.publish.touched_entries",
+                debug.touched_entries as i64,
+            );
+            emit_vm_recipe_trace(b"debug.vm.recipe.publish.op", debug.op as i64);
+            emit_vm_recipe_trace(
+                b"debug.vm.recipe.publish.before_len",
+                debug.before_len as i64,
+            );
+            emit_vm_recipe_trace(b"debug.vm.recipe.publish.after_len", next.len as i64);
+            emit_vm_recipe_trace(
+                b"debug.vm.recipe.publish.changed_pages",
+                debug.changed_pages as i64,
+            );
+            emit_vm_recipe_trace(
+                b"debug.vm.recipe.publish.node_allocs",
+                debug.node_allocs as i64,
+            );
+            emit_vm_recipe_trace(
+                b"debug.vm.recipe.publish.duration_ns",
+                debug.duration_ns as i64,
+            );
+        }
         let new_ptr = Box::into_raw(Box::new(next));
         let old_ptr = self.current.swap(new_ptr, Ordering::AcqRel);
         if !old_ptr.is_null() {
@@ -566,37 +722,29 @@ impl RecipeIndex {
         match placement {
             MapPlacement::RequireFree => {
                 validate_insert_free(current, &entry)?;
-                let changed_pages = entry.range.page_count();
-                let (rewritten, stats_delta, touched_entries) =
-                    insert_coalescing_adjacent(current, entry)?;
-                self.publish(rewritten, touched_entries);
-                Ok(VmMapCommit {
-                    changed_pages,
-                    stats_delta,
+                self.rewrite_with_debug(RecipePublishOp::MapRequireFree, current, |current| {
+                    let changed_pages = entry.range.page_count();
+                    let (rewritten, stats_delta, touched_entries) =
+                        insert_coalescing_adjacent(current, entry)?;
+                    Ok((rewritten, changed_pages, stats_delta, touched_entries))
                 })
+                .map(|(commit, _)| commit)
             }
-            MapPlacement::FixedReplace => {
-                let (rewritten, changed_pages, stats_delta, touched_entries) =
-                    rewrite_fixed(current, &entry)?;
-                self.publish(rewritten, touched_entries);
-                Ok(VmMapCommit {
-                    changed_pages,
-                    stats_delta,
+            MapPlacement::FixedReplace => self
+                .rewrite_with_debug(RecipePublishOp::MapFixedReplace, current, |current| {
+                    rewrite_fixed(current, &entry)
                 })
-            }
+                .map(|(commit, _)| commit),
         }
     }
 
     pub(in crate::vm) fn unmap(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
         let _writer = self.mutation.lock();
         let current = unsafe { self.under_writer_lock() };
-        let (rewritten, changed_pages, stats_delta, touched_entries) =
-            rewrite_unmap(current, range)?;
-        self.publish(rewritten, touched_entries);
-        Ok(VmMapCommit {
-            changed_pages,
-            stats_delta,
+        self.rewrite_with_debug(RecipePublishOp::Unmap, current, |current| {
+            rewrite_unmap(current, range)
         })
+        .map(|(commit, _)| commit)
     }
 
     pub(in crate::vm) fn protect(
@@ -608,23 +756,21 @@ impl RecipeIndex {
         let _writer = self.mutation.lock();
         emit_vm_recipe_trace(b"debug.vm.recipe.protect.phase", 1);
         let current = unsafe { self.under_writer_lock() };
-        let (rewritten, changed_pages, stats_delta, touched_entries) =
-            rewrite_protect(current, range, prot)?;
+        let (commit, touched_entries) =
+            self.rewrite_with_debug(RecipePublishOp::Protect, current, |current| {
+                rewrite_protect(current, range, prot)
+            })?;
         emit_vm_recipe_trace(b"debug.vm.recipe.protect.phase", 2);
         emit_vm_recipe_trace(
             b"debug.vm.recipe.protect.changed_pages",
-            changed_pages as i64,
+            commit.changed_pages as i64,
         );
         emit_vm_recipe_trace(
             b"debug.vm.recipe.protect.touched_entries",
             touched_entries as i64,
         );
-        self.publish(rewritten, touched_entries);
         emit_vm_recipe_trace(b"debug.vm.recipe.protect.phase", 3);
-        Ok(VmMapCommit {
-            changed_pages,
-            stats_delta,
-        })
+        Ok(commit)
     }
 
     pub(in crate::vm) fn set_locked(
@@ -634,13 +780,10 @@ impl RecipeIndex {
     ) -> Result<VmMapCommit, VmMapError> {
         let _writer = self.mutation.lock();
         let current = unsafe { self.under_writer_lock() };
-        let (rewritten, changed_pages, stats_delta, touched_entries) =
-            rewrite_locked(current, range, locked)?;
-        self.publish(rewritten, touched_entries);
-        Ok(VmMapCommit {
-            changed_pages,
-            stats_delta,
+        self.rewrite_with_debug(RecipePublishOp::Locked, current, |current| {
+            rewrite_locked(current, range, locked)
         })
+        .map(|(commit, _)| commit)
     }
 
     pub(in crate::vm) fn remap(
@@ -652,29 +795,28 @@ impl RecipeIndex {
     ) -> Result<VmMapCommit, VmMapError> {
         let _writer = self.mutation.lock();
         let current = unsafe { self.under_writer_lock() };
-        let (rewritten, changed_pages, stats_delta, touched_entries) = match placement {
-            VmRemapPlacement::Move => {
-                rewrite_remap_disjoint(current, old_range, new_range, destination)?
-            }
-            VmRemapPlacement::InPlace => rewrite_remap_in_place(current, old_range, new_range)?,
+        let op = match placement {
+            VmRemapPlacement::Move => RecipePublishOp::RemapMove,
+            VmRemapPlacement::InPlace => RecipePublishOp::RemapInPlace,
         };
-        self.publish(rewritten, touched_entries);
-        Ok(VmMapCommit {
-            changed_pages,
-            stats_delta,
+        self.rewrite_with_debug(op, current, |current| match placement {
+            VmRemapPlacement::Move => {
+                rewrite_remap_disjoint(current, old_range, new_range, destination)
+            }
+            VmRemapPlacement::InPlace => rewrite_remap_in_place(current, old_range, new_range),
         })
+        .map(|(commit, _)| commit)
     }
 
     pub(in crate::vm) fn replace_entry(&self, entry: VmEntry) -> Result<VmMapCommit, VmMapError> {
         let _writer = self.mutation.lock();
         let current = unsafe { self.under_writer_lock() };
-        let (rewritten, touched_entries) = current.replace_exact(entry)?;
-        let stats_delta = stats_delta_between(current, &rewritten);
-        self.publish(rewritten, touched_entries);
-        Ok(VmMapCommit {
-            changed_pages: 0,
-            stats_delta,
+        self.rewrite_with_debug(RecipePublishOp::ReplaceEntry, current, |current| {
+            let (rewritten, touched_entries) = current.replace_exact(entry)?;
+            let stats_delta = stats_delta_between(current, &rewritten);
+            Ok((rewritten, 0, stats_delta, touched_entries))
         })
+        .map(|(commit, _)| commit)
     }
 
     /// PR-10 phase 3: stamp `tag` on every VMA whose range is fully
@@ -700,20 +842,33 @@ impl RecipeIndex {
     ) -> Result<VmMapCommit, VmMapError> {
         let _writer = self.mutation.lock();
         let current = unsafe { self.under_writer_lock() };
-        let (rewritten, changed_pages, stats_delta, touched_entries) =
-            rewrite_tag_ufd_registration(current, range, tag)?;
-        self.publish(rewritten, touched_entries);
-        Ok(VmMapCommit {
-            changed_pages,
-            stats_delta,
+        self.rewrite_with_debug(RecipePublishOp::UfdTag, current, |current| {
+            rewrite_tag_ufd_registration(current, range, tag)
         })
+        .map(|(commit, _)| commit)
     }
 }
 
 unsafe fn reclaim_recipe_tree(ptr: *mut u8) {
+    if tx_observe::current().is_none() {
+        // SAFETY: `ptr` was last published from `Box::into_raw(Box::new(_))`.
+        let _ = unsafe { Box::from_raw(ptr as *mut RecipeTree) };
+        return;
+    }
+
+    let start_ns = tx_observe::clock_now_ns();
+    let tree = unsafe { &*(ptr as *mut RecipeTree) };
+    let node_count = tree.len;
     emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_tree.begin", 1);
+    emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_tree.nodes", node_count as i64);
     // SAFETY: `ptr` was last published from `Box::into_raw(Box::new(_))`.
     let _ = unsafe { Box::from_raw(ptr as *mut RecipeTree) };
+    let duration_ns = tx_observe::clock_now_ns().saturating_sub(start_ns);
+    record_recipe_reclaim_debug(duration_ns, node_count);
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.duration_ns",
+        duration_ns as i64,
+    );
     emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_tree.end", 1);
 }
 
@@ -754,6 +909,93 @@ fn apply_signed_delta(cell: &AtomicUsize, delta: isize) {
         cell.fetch_add(delta as usize, Ordering::AcqRel);
     } else {
         cell.fetch_sub(delta.unsigned_abs(), Ordering::AcqRel);
+    }
+}
+
+pub(in crate::vm) fn reset_recipe_debug_totals() {
+    for cell in [
+        &RECIPE_OP_COUNT,
+        &RECIPE_OP_TOTAL_NS,
+        &RECIPE_OP_MAX_NS,
+        &RECIPE_OP_TOUCHED_TOTAL,
+        &RECIPE_OP_NODE_ALLOC_TOTAL,
+        &RECIPE_OP_NODE_ALLOC_MAX,
+        &RECIPE_NODE_ALLOC_COUNT,
+        &RECIPE_RECLAIM_COUNT,
+        &RECIPE_RECLAIM_TOTAL_NS,
+        &RECIPE_RECLAIM_MAX_NS,
+        &RECIPE_RECLAIM_NODE_TOTAL,
+        &RECIPE_RECLAIM_NODE_MAX,
+    ] {
+        cell.store(0, Ordering::Relaxed);
+    }
+}
+
+pub(in crate::vm) fn recipe_debug_totals() -> RecipeDebugTotals {
+    RecipeDebugTotals {
+        op_count: RECIPE_OP_COUNT.load(Ordering::Relaxed) as u64,
+        op_total_ns: RECIPE_OP_TOTAL_NS.load(Ordering::Relaxed) as u64,
+        op_max_ns: RECIPE_OP_MAX_NS.load(Ordering::Relaxed) as u64,
+        op_touched_total: RECIPE_OP_TOUCHED_TOTAL.load(Ordering::Relaxed) as u64,
+        op_node_alloc_total: RECIPE_OP_NODE_ALLOC_TOTAL.load(Ordering::Relaxed) as u64,
+        op_node_alloc_max: RECIPE_OP_NODE_ALLOC_MAX.load(Ordering::Relaxed) as u64,
+        node_alloc_count: RECIPE_NODE_ALLOC_COUNT.load(Ordering::Relaxed) as u64,
+        reclaim_count: RECIPE_RECLAIM_COUNT.load(Ordering::Relaxed) as u64,
+        reclaim_total_ns: RECIPE_RECLAIM_TOTAL_NS.load(Ordering::Relaxed) as u64,
+        reclaim_max_ns: RECIPE_RECLAIM_MAX_NS.load(Ordering::Relaxed) as u64,
+        reclaim_node_total: RECIPE_RECLAIM_NODE_TOTAL.load(Ordering::Relaxed) as u64,
+        reclaim_node_max: RECIPE_RECLAIM_NODE_MAX.load(Ordering::Relaxed) as u64,
+    }
+}
+
+fn record_recipe_publish_debug(debug: &RecipePublishDebug, after_len: usize) {
+    RECIPE_OP_COUNT.fetch_add(1, Ordering::Relaxed);
+    saturating_fetch_add_usize(&RECIPE_OP_TOTAL_NS, debug.duration_ns as usize);
+    saturating_fetch_add_usize(&RECIPE_OP_TOUCHED_TOTAL, debug.touched_entries);
+    saturating_fetch_add_usize(&RECIPE_OP_NODE_ALLOC_TOTAL, debug.node_allocs);
+    atomic_max_usize(&RECIPE_OP_MAX_NS, debug.duration_ns as usize);
+    atomic_max_usize(&RECIPE_OP_NODE_ALLOC_MAX, debug.node_allocs);
+
+    emit_vm_recipe_trace(b"debug.vm.recipe.publish.len_delta", {
+        let delta = after_len as isize - debug.before_len as isize;
+        delta as i64
+    });
+    emit_vm_recipe_allocation(
+        b"debug.alloc.vm.recipe_node.per_publish",
+        debug.node_allocs as u64,
+    );
+    emit_vm_recipe_allocation(
+        b"debug.alloc.vm.recipe_node.publish_duration_ns",
+        debug.duration_ns,
+    );
+}
+
+fn record_recipe_reclaim_debug(duration_ns: u64, node_count: usize) {
+    RECIPE_RECLAIM_COUNT.fetch_add(1, Ordering::Relaxed);
+    saturating_fetch_add_usize(&RECIPE_RECLAIM_TOTAL_NS, duration_ns as usize);
+    saturating_fetch_add_usize(&RECIPE_RECLAIM_NODE_TOTAL, node_count);
+    atomic_max_usize(&RECIPE_RECLAIM_MAX_NS, duration_ns as usize);
+    atomic_max_usize(&RECIPE_RECLAIM_NODE_MAX, node_count);
+}
+
+fn saturating_fetch_add_usize(cell: &AtomicUsize, delta: usize) {
+    let mut current = cell.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(delta);
+        match cell.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn atomic_max_usize(cell: &AtomicUsize, value: usize) {
+    let mut current = cell.load(Ordering::Relaxed);
+    while value > current {
+        match cell.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
     }
 }
 
@@ -1393,6 +1635,16 @@ fn stats_delta_between(before: &RecipeTree, after: &RecipeTree) -> AddressSpaceS
 fn emit_vm_recipe_trace(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
         observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+    }
+}
+
+fn emit_vm_recipe_allocation(name: &[u8], value: u64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.allocation(
+            tx_observe::AllocationTrack::VmRecipeNode,
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
             value,
         );
