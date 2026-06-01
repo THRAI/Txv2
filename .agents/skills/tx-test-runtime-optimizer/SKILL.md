@@ -28,6 +28,11 @@ Use this skill when test runtime itself is part of the problem. Pair it with
 - After each code/config/harness experiment, append one compact modification
   row to the ledger before starting the next experiment. Keep it short enough
   to scan: change, evidence, decision, and next owner.
+- When a trace or debug log becomes reusable evidence for later decisions,
+  record it once in a "reusable evidence" or "completed attribution" section
+  with the log path, the decisive numbers, and the condition for rerunning it.
+  Check that section before starting another trace so the same attribution is
+  not rediscovered slowly.
 - Commit or otherwise isolate useful evidence-backed changes before starting a
   broader experiment. Stage explicit paths only; do not include local `msp/`
   debug notes unless the user asks.
@@ -49,7 +54,10 @@ Before running or editing anything in an existing timeout investigation:
 4. Open or create the operation ledger for this investigation. It must list
    accepted evidence, rejected hypotheses, committed changes, reverted
    experiments, and the one next action that can change the decision.
-5. If the next action would revisit a rejected hypothesis, stop and explain what
+5. Read the ledger's reusable evidence/completed attribution section before any
+   trace run. If an existing log already answers the question, use that number
+   as the baseline and move to a patch or a narrower measurement.
+6. If the next action would revisit a rejected hypothesis, stop and explain what
    new evidence would justify reopening it.
 
 ## Operation Ledger Protocol
@@ -64,6 +72,9 @@ than one experiment:
 - Record attempted modifications separately from evidence anchors when the
   investigation has many patches. Use one row per tried modification, including
   reverted or rejected experiments.
+- Record reusable debug logs separately from attempted modifications when the
+  log will be consulted more than once. Use one row per log: `path`, `decisive
+  numbers`, `decision guard`, and `rerun only if`.
 - Mark each experiment as `keep`, `revert`, `reject`, or `needs one more
   measurement` before starting another experiment in the same area.
 - Preserve same-metric comparisons: phase, timeout, trace mode, loop count,
@@ -90,10 +101,21 @@ Compact modification row shape:
 | M1 | Removed unconditional fork yield | `target/oscomp/foo.txt`: still timed out | reject/revert |
 ```
 
+Reusable evidence row shape:
+
+```md
+| Log | Decisive Numbers | Decision Guard | Rerun Only If |
+| --- | ---------------- | -------------- | ------------- |
+| `target/oscomp/foo-trace.txt` | `grep`: 12 calls / 5s / 300 faults | pipe/fd churn, not datapath | a patch changes pipe/fd/readiness code |
+```
+
 ## Stop Rules
 
 - Do not run more than one new trace for the same hypothesis without making a
   keep/revert/next-target decision from the numbers.
+- Do not rerun a generic trace when a reusable evidence row already contains
+  the same phase, labels, and counters needed for the decision. Patch the next
+  owner first, then collect one same-metric before/after trace.
 - If a change improves one command but the case still times out, compare the
   full phase budget before continuing. Do not keep optimizing the same command
   after another phase dominates.
