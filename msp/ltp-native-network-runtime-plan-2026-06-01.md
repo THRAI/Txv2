@@ -31,7 +31,9 @@ native `network.sh` 初始化和后续 stress loop。新的 120 秒 trace 证明
 - 新增仅 trace 模式使用的 wrapper 路径，例如 `/tx-ltp/trace-bin`，默认
   `PATH` 不包含它。
 - 在 trace 模式下包装这些命令：
-  `tst_ns_create`、`tst_ns_exec`、`tst_ns_ifmove`、`sysctl`、`ping`、`grep`。
+  `tst_check_drivers`、`tst_ns_create`、`tst_ns_exec`、`tst_ns_ifmove`、
+  `cat`、`cut`、`grep`、`id`、`ln`、`mkdir`、`mount`、`ping`、`readlink`、
+  `sysctl`。
 - 每个 wrapper 只打印 begin/end、退出码和 `date +%s`，然后 exec 原命令。
 
 验证：
@@ -92,3 +94,36 @@ timeout 120s make oscomp-qemu-rv64 \
 先实现 Phase 1 的 trace-only command wrapper，不动默认 runner 行为。拿到
 `commandtrace-120s` 后，再决定是做局部 helper 加速，还是进入通用 `execve`
 /page-fault 路径优化。
+
+## 2026-06-01 执行结果
+
+Phase 1 已实现，默认路径不包含 `/tx-ltp/trace-bin`，只有
+`LTP_TRACE_RUNTIME=1` 时才包装命令。新增 wrapper 覆盖
+`tst_check_drivers`、`tst_ns_create`、`tst_ns_exec`、`tst_ns_ifmove`、
+`cat`、`cut`、`grep`、`id`、`ln`、`mkdir`、`mount`、`ping`、`ping6`、
+`readlink`、`sysctl`。同时默认 `/tx-ltp/bin/tst_check_drivers` 对
+`bridge`、`dummy`、`veth` 快速返回成功，其他 driver 仍走 LTP 原 helper。
+
+关键 witness：
+
+```sh
+timeout 300s make oscomp-qemu-rv64 \
+  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:ipneigh01_ip \
+  LTP_TRACE_RUNTIME=1 \
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-commandtrace-loop-300s.txt
+```
+
+trace 覆盖到了 stress loop。循环内的粗略统计是：
+
+- `ping`: 7 次，总计约 1 秒。
+- `ip`: loop 内 18 次，总计约 39 秒，单次最多约 4 秒。
+- `grep`: loop 内 12 次，总计约 15 秒，单次最多约 2 秒。
+
+所以当前瓶颈不是 ARP/neighbor 表线性扫描，也不是 ping/ICMP/ARP 数据面慢；
+它主要是 `ip neigh show | grep`、`ip neigh del` 这类 shell pipeline 和重复
+小进程执行成本。一个 `wait4` post-reap yield batching 实验在 host wait4 tests
+中通过，但 300s/420s focused witness 仍没有 PASS，因此没有保留。
+
+下一步不要继续堆 timeout。要么设计更通用的 shell/exec/page-fault 优化，要么
+明确做“IPv4-only native network setup 不跑无关 IPv6 初始化”的开发加速路径，
+但 IPv6 覆盖必须继续由 `net.ipv6*` 单独证明。
