@@ -506,6 +506,13 @@ fn lint_arch_text(path: &str, display: &str, text: &str) -> Vec<String> {
                 "{display}:{line_no}: tx-kernel must not cfg on target_arch"
             ));
         }
+        if path != "crates/tx-substrate/src/sync.rs"
+            && (line.contains("struct SpinMutex") || line.contains("pub(crate) struct SpinMutex"))
+        {
+            findings.push(format!(
+                "{display}:{line_no}: private SpinMutex implementation; route through tx_substrate::SpinMutex so lock metrics stay behind the wrapped lock type"
+            ));
+        }
         if path.starts_with("crates/tx-kernel/")
             && (line.contains("BootArg")
                 || line.contains("firmware_arg")
@@ -886,6 +893,18 @@ mod tests {
         assert!(findings
             .iter()
             .any(|finding| finding.contains("must consume BootHandoff")));
+    }
+
+    #[test]
+    fn arch_lint_rejects_private_spinmutex_implementations() {
+        let findings = lint_arch_text(
+            "crates/tx-subsystems/src/sync.rs",
+            "crates/tx-subsystems/src/sync.rs",
+            "pub(crate) struct SpinMutex<T> { locked: AtomicBool, value: UnsafeCell<T> }",
+        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("private SpinMutex implementation")));
     }
 
     #[test]

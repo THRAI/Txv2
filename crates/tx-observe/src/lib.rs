@@ -208,6 +208,13 @@ pub enum AllocationTrack {
     PageBackedCache,
     VmAddressSpace,
     PageBackedContainer,
+    ThreadPayload,
+    ThreadIdentity,
+    ProcessPayload,
+    ProcessIdentity,
+    ProcessThreads,
+    PidNamespace,
+    Lock,
 }
 
 impl AllocationTrack {
@@ -224,6 +231,13 @@ impl AllocationTrack {
             Self::PageBackedContainer => {
                 tx_observe_types::payload::ALLOC_TRACK_PAGEBACKED_CONTAINER
             }
+            Self::ThreadPayload => tx_observe_types::payload::ALLOC_TRACK_THREAD_PAYLOAD,
+            Self::ThreadIdentity => tx_observe_types::payload::ALLOC_TRACK_THREAD_IDENTITY,
+            Self::ProcessPayload => tx_observe_types::payload::ALLOC_TRACK_PROCESS_PAYLOAD,
+            Self::ProcessIdentity => tx_observe_types::payload::ALLOC_TRACK_PROCESS_IDENTITY,
+            Self::ProcessThreads => tx_observe_types::payload::ALLOC_TRACK_PROCESS_THREADS,
+            Self::PidNamespace => tx_observe_types::payload::ALLOC_TRACK_PID_NAMESPACE,
+            Self::Lock => tx_observe_types::payload::ALLOC_TRACK_LOCK,
         }
     }
 }
@@ -457,8 +471,32 @@ impl HartEmitter {
     /// (for example PPN, page index, touched-node count, slab slot count).
     pub fn allocation(&self, track: AllocationTrack, name: EventNameId, value: u64) {
         const VALUE_KEY: EventNameId = EventNameId::from_raw(fnv1a32(b"value"));
+        self.arg_value(TxTraceLevel::Mutation, track, name, VALUE_KEY, value);
+    }
+
+    /// Emit a lock metric marker. The explicit lock track lives in `parent`,
+    /// `name` carries the lock identity, and `metric` carries the sample kind
+    /// (`debug.lock.wait_ns`, `debug.lock.service_ns`, ...).
+    pub fn lock_metric(&self, lock: EventNameId, metric: EventNameId, value: u64) {
+        self.arg_value(
+            TxTraceLevel::Mutation,
+            AllocationTrack::Lock,
+            lock,
+            metric,
+            value,
+        );
+    }
+
+    fn arg_value(
+        &self,
+        level: TxTraceLevel,
+        track: AllocationTrack,
+        name: EventNameId,
+        key: EventNameId,
+        value: u64,
+    ) {
         let payload = PayloadArgValue {
-            key: VALUE_KEY.raw(),
+            key: key.raw(),
             value_kind: TxValueKind::U64 as u8,
             _pad: [0; 3],
             value0: value,
@@ -473,7 +511,7 @@ impl HartEmitter {
         self.emit(
             slot,
             TxTraceKind::Instant,
-            TxTraceLevel::Mutation,
+            level,
             name,
             SpanId::NONE,
             SpanId::from_raw_or_none(track.track_id()),

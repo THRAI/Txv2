@@ -32,7 +32,7 @@ pub mod wake;
 pub mod zone;
 
 pub use slot::AtomicSlot;
-pub use sync::{SpinMutex, SpinMutexGuard};
+pub use sync::{LockMetricsOff, LockMetricsOn, SpinMutex, SpinMutexGuard};
 
 #[doc(hidden)]
 pub mod testing {

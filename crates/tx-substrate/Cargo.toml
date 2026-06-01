@@ -14,3 +14,6 @@ tx-observe-types = { path = "../tx-observe-types" }
 path = "src/lib.rs"
 test = false
 doctest = false
+
+[lints]
+workspace = true
